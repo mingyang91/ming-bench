@@ -1,0 +1,9 @@
+[package]
+name = "cs61a-bench"
+version = "0.1.0"
+edition = "2021"
+description = "CS 61A Scheme interpreter benchmark for evaluating coding agents"
+
+[lib]
+name = "cs61a_bench"
+path = "src/lib.rs"
