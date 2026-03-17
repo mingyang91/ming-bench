@@ -15,6 +15,16 @@ cargo test test_l01           # run Level 1 tests only
 cargo test test_l05           # run Level 5 tests only
 ```
 
+## Development Strategy
+- **Implement levels in order (L1 → L16).** Each level builds on the previous.
+- **After implementing each level, run its tests before moving on:**
+  ```
+  cargo test test_l01   # must pass before starting L2
+  cargo test test_l02   # must pass before starting L3
+  ```
+- **Do not skip ahead.** Later levels depend on earlier ones being correct.
+- **If a level's tests fail, fix them before proceeding.** Do not accumulate broken levels.
+
 ## Levels (implement in order)
 1. **Atoms** — self-evaluating: integers, booleans, strings
 2. **Arithmetic** — `+`, `-`, `*`, `/` (variadic, nested)
