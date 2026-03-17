@@ -6,7 +6,7 @@ A benchmark for evaluating coding agents by having them build a Scheme interpret
 
 The agent receives:
 - A single function signature: `eval_str(input: &str) -> Result<String, String>`
-- 60 test cases across 10 difficulty levels
+- 92 test cases across 16 difficulty levels
 - Instructions in `CLAUDE.md`
 
 The agent's job: implement a working Scheme interpreter that passes the tests, level by level. The agent designs all internal architecture (lexer, parser, AST, evaluator) from scratch.
@@ -33,12 +33,23 @@ cargo test test_l05           # run Level 5 only
 | 8 | Let/begin/cond | 6 | Local bindings, sequencing, multi-branch |
 | 9 | Type predicates | 5 | `string?`, `number?`, `boolean?`, `pair?`, `symbol?` |
 | 10 | Tail call opt. | 3 | Deep recursion without stack overflow |
+| 11 | set! & mutation | 5 | Mutable bindings, shared state in closures |
+| 12 | Variadic & apply | 5 | Rest args, `apply` with prefix args |
+| 13 | Tail position (all) | 5 | TCO in `cond`, named `let`, `and`/`or`, `begin` |
+| 14 | **call/cc** | 7 | First-class continuations, non-local exit, reentrant |
+| 15 | **Macros** | 5 | `define-syntax`, `syntax-rules`, hygiene, ellipsis |
+| 16 | **Integration** | 5 | call/cc + macros + mutation + TCO combined |
 
 ## Scoring
 
-- **Raw score**: tests passed / 60
+- **Raw score**: tests passed / 92
 - **Watermark**: highest level where ALL tests pass
-- **Weighted**: Level 1 tests = 1 pt each, Level 10 = 5 pts each
+- **Weighted**:
+  - L1–L10: 1–5 pts/test (foundational)
+  - L11–L13: 3 pts/test (mutation, apply, advanced TCO)
+  - L14: 8 pts/test (call/cc — architectural)
+  - L15: 8 pts/test (macros — new subsystem)
+  - L16: 10 pts/test (integration — everything together)
 
 ## Structure
 
