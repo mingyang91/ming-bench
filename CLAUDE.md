@@ -6,7 +6,7 @@ Implement a Scheme interpreter in Rust.
 - Implement `eval_str` in `src/scheme/mod.rs`
 - You may create any additional modules/files under `src/scheme/`
 - Do NOT modify test functions
-- Do NOT add external dependencies to Cargo.toml
+- Do NOT add external dependencies to Cargo.toml (thiserror, log, env_logger are pre-included)
 
 ## Build & Test
 ```
@@ -26,6 +26,12 @@ cargo test test_l05           # run Level 5 tests only
 8. **Let, begin, cond** — local bindings, sequencing, multi-branch conditionals
 9. **Type predicates** — `string?`, `number?`, `boolean?`, `pair?`, `symbol?`
 10. **Tail call optimization** — no stack overflow on deep tail recursion
+11. **set! and mutation** — `set!`, mutable closures, shared state
+12. **Variadic & apply** — rest args `(define (f x . rest) ...)`, `apply`
+13. **Tail position in all forms** — TCO through `cond`, named `let`, `and`/`or`, `begin`
+14. **First-class continuations** — `call/cc`, non-local exits, saved/reentrant continuations
+15. **Hygienic macros** — `define-syntax`, `syntax-rules`, ellipsis patterns
+16. **Comprehensive integration** — call/cc + macros + mutation + TCO combined
 
 ## Notes
 - `eval_str` receives one or more expressions separated by spaces (e.g. `"(define x 5) x"`)

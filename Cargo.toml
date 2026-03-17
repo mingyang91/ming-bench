@@ -7,3 +7,8 @@ description = "CS 61A Scheme interpreter benchmark for evaluating coding agents"
 [lib]
 name = "cs61a_bench"
 path = "src/lib.rs"
+
+[dependencies]
+env_logger = "0.11"
+log = "0.4"
+thiserror = "2"
