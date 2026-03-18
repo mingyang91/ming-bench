@@ -124,6 +124,12 @@ No hidden side effects.
   - Tail call trampoline — recursion depth doesn't silently overflow
 - **Where NOT to assert:** User input validation (use typed errors), hot eval loops (use errors).
 
+### Compiler Discipline
+
+- `#![deny(warnings)]` and `#![deny(clippy::unwrap_used)]` are set in `src/lib.rs`. Do not remove them.
+- **All code must pass `cargo clippy` with zero warnings before testing.** Run `cargo clippy -- -D warnings` after each level.
+- No `.unwrap()` in non-test code — use `?`, `.ok_or(...)`, or `match`.
+
 ### Development Workflow
 
 - **Fix code smells immediately.** AI-agent-driven codebase — fix on the spot, don't track for later.
