@@ -9,21 +9,26 @@ Implement a Scheme interpreter in Rust.
 - Do NOT add external dependencies to Cargo.toml (thiserror, log, env_logger are pre-included)
 
 ## Build & Test
-```
-timeout 30s cargo test test_l01   # run Level 1 tests (30s limit)
-timeout 30s cargo test test_l05   # run Level 5 tests (30s limit)
-timeout 30s cargo test            # run all tests (30s limit)
+
+**Build on host, test in container.** This prevents infinite loops or memory leaks from crashing the host.
+
+```bash
+./scripts/test-level.sh 01   # test level 1
+./scripts/test-level.sh 05   # test level 5
+./scripts/test-level.sh      # test all levels
 ```
 
-**IMPORTANT:** Always prefix `cargo test` with `timeout 30s` to prevent infinite loops
-from consuming all resources. Tests that exceed 30 seconds are considered failing.
+**IMPORTANT:**
+- Always use `./scripts/test-level.sh` — never bare `cargo test`
+- Tests that exceed 30 seconds or OOM (1GB limit) are considered failing
+- Build the container image first if not already built: `sudo podman build -t bench-runner -f Dockerfile.bench .`
 
 ## Development Strategy
 - **Implement levels in order (L1 → L16).** Each level builds on the previous.
 - **After implementing each level, run its tests before moving on:**
-  ```
-  timeout 30s cargo test test_l01   # must pass before starting L2
-  timeout 30s cargo test test_l02   # must pass before starting L3
+  ```bash
+  ./scripts/test-level.sh 01   # must pass before starting L2
+  ./scripts/test-level.sh 02   # must pass before starting L3
   ```
 - **Do not skip ahead.** Later levels depend on earlier ones being correct.
 - **If a level's tests fail, fix them before proceeding.** Do not accumulate broken levels.
