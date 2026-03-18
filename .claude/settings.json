@@ -1,18 +1,33 @@
 {
   "permissions": {
     "allow": [
-      "Bash(cargo *)",
+      "Bash(cargo build *)",
+      "Bash(cargo check *)",
+      "Bash(cargo clippy *)",
+      "Bash(cargo fmt *)",
       "Bash(timeout *)",
       "Bash(git *)",
       "Bash(ls *)",
       "Bash(grep *)",
       "Bash(mkdir *)",
       "Bash(rm *)",
+      "Bash(cat *)",
+      "Bash(./scripts/test-level.sh *)",
+      "Bash(./scripts/bench.sh *)",
+      "Bash(./scripts/setup.sh *)",
+      "Bash(./scripts/test_cases.sh *)",
+      "Bash(sudo podman *)",
       "Read",
       "Edit",
       "Write",
       "Glob",
-      "Grep"
+      "Grep",
+      "WebSearch",
+      "WebFetch"
+    ],
+    "deny": [
+      "Bash(cargo test *)",
+      "Bash(cargo test)"
     ]
   }
 }
