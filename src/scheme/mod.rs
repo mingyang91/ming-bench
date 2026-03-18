@@ -494,6 +494,14 @@ mod tests {
         );
     }
 
+    #[test]
+    fn test_l12_apply_as_value() {
+        assert_eq!(
+            eval_str("(define f apply) (f + '(1 2 3))"),
+            Ok("6".into())
+        );
+    }
+
     // ===== Level 13: Tail Position in All Forms =====
 
     #[test]
@@ -614,6 +622,34 @@ mod tests {
         );
     }
 
+    #[test]
+    fn test_l14_callcc_is_first_class() {
+        assert_eq!(
+            eval_str("((lambda (cc) (cc (lambda (k) (k 7)))) call/cc)"),
+            Ok("7".into())
+        );
+    }
+
+    #[test]
+    fn test_l14_callcc_resumes_lambda_body() {
+        assert_eq!(
+            eval_str(
+                "(define saved #f) (define first? #t) (define result ((lambda () (call/cc (lambda (k) (set! saved k) 1)) (if first? (begin (set! first? #f) 2) 3)))) (if (= result 2) (saved 99) result)"
+            ),
+            Ok("3".into())
+        );
+    }
+
+    #[test]
+    fn test_l14_callcc_resumes_pending_application() {
+        assert_eq!(
+            eval_str(
+                "(define saved #f) (define first? #t) (define result ((lambda (a b) (+ b 1)) 1 (call/cc (lambda (k) (set! saved k) 2)))) (if first? (begin (set! first? #f) (saved 42)) result)"
+            ),
+            Ok("43".into())
+        );
+    }
+
     // ===== Level 15: define-syntax / syntax-rules =====
 
     #[test]
@@ -663,6 +699,16 @@ mod tests {
                 "(define-syntax when (syntax-rules () ((when test body ...) (if test (begin body ...) #f)))) (define x 0) (when #t (set! x 1) (set! x (+ x 1))) x"
             ),
             Ok("2".into())
+        );
+    }
+
+    #[test]
+    fn test_l15_macro_keeps_definition_site_binding() {
+        assert_eq!(
+            eval_str(
+                "(define x 10) (define-syntax get-x (syntax-rules () ((get-x) x))) (let ((x 20)) (get-x))"
+            ),
+            Ok("10".into())
         );
     }
 
