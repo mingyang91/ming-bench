@@ -54,7 +54,7 @@ while [[ $# -gt 0 ]]; do
         --prompt)     PROMPT="$2"; shift 2 ;;
         --model)      MODEL="$2"; shift 2 ;;
         --agent)      AGENT="$2"; shift 2 ;;
-        --mode)       MODE="$2"; shift 2 ;;
+        --mode)       MODE="$2"; MODE_EXPLICIT=1; shift 2 ;;
         --max-turns)  MAX_TURNS="$2"; shift 2 ;;
         --skip-bench) SKIP_BENCH=true; shift ;;
         --keep-worktree) KEEP_WORKTREE=true; shift ;;
@@ -63,6 +63,12 @@ while [[ $# -gt 0 ]]; do
         *) echo "Unknown option: $1"; exit 1 ;;
     esac
 done
+
+# Default non-Claude agents to levels mode (they don't self-regulate sequencing well)
+if [[ "$AGENT" != "claude" && "$MODE" == "full" && -z "${MODE_EXPLICIT:-}" ]]; then
+    echo "NOTE: Defaulting to --mode levels for $AGENT (override with explicit --mode full)"
+    MODE="levels"
+fi
 
 if [[ -z "$BASE" || -z "$NAME" ]]; then
     echo "Usage: $0 --base <branch> --name <run-name> [options]"
@@ -174,6 +180,14 @@ if [[ "$RESUME" == "false" ]]; then
     echo "Worktree created."
 fi
 
+# --- Warm dependency cache ---
+echo "Pre-building dependencies in worktree..."
+if (cd "$WORKTREE_DIR" && cargo build 2>&1); then
+    echo "Pre-build complete."
+else
+    echo "WARNING: Pre-build failed. Agent may hit cold cache issues."
+fi
+
 # --- Lockfile to prevent duplicate agents ---
 LOCKFILE="$RESULTS_DIR/.run.lock"
 
@@ -272,8 +286,8 @@ launch_codex() {
     local _session_id="$3"
     local output_file="$4"
 
-    # codex requires a TTY — use script(1) to provide a PTY wrapper
-    script -qec "cd '$workdir' && codex --full-auto '$prompt'" "$output_file"
+    # codex exec = non-interactive mode; script(1) provides required PTY
+    script -qec "cd '$workdir' && codex exec --full-auto '$prompt'" "$output_file"
 }
 
 launch_opencode() {
