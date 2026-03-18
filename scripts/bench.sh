@@ -11,7 +11,7 @@ set -euo pipefail
 #   - Copies test binary into a minimal container (debian:bookworm-slim)
 #   - Runs each level with resource limits (memory, CPU, PID, timeout)
 #
-# Per-level: timeout 30s, memory 2GB, 2 CPUs, 256 PIDs
+# Per-level: timeout 30s, memory 1GB, 1 CPU, 256 PIDs
 # Results saved to results/<branch>_<run-id>_<timestamp>.log
 # ============================================================================
 
@@ -92,8 +92,8 @@ for LEVEL in "${LEVELS[@]}"; do
 
     set +e
     OUTPUT=$(sudo podman run --rm \
-        --memory=2g \
-        --cpus=2 \
+        --memory=1g \
+        --cpus=1 \
         --pids-limit=256 \
         -v "$TEST_BIN:/bench/test_bin:ro,Z" \
         "$IMAGE_NAME" \
