@@ -7,6 +7,7 @@ Implement a Scheme interpreter in Rust.
 - You may create any additional modules/files under `src/scheme/`
 - Do NOT modify test functions
 - Do NOT add external dependencies to Cargo.toml (thiserror, log, env_logger are pre-included)
+- **NEVER run `cargo test` directly on the host.** Always use `./scripts/test-level.sh`. Bare `cargo test` risks infinite loops and OOM that crash the host. This rule has NO exceptions.
 
 ## Build & Test
 
