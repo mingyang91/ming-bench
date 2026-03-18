@@ -10,17 +10,20 @@ Implement a Scheme interpreter in Rust.
 
 ## Build & Test
 ```
-cargo test                    # run all tests
-cargo test test_l01           # run Level 1 tests only
-cargo test test_l05           # run Level 5 tests only
+timeout 30s cargo test test_l01   # run Level 1 tests (30s limit)
+timeout 30s cargo test test_l05   # run Level 5 tests (30s limit)
+timeout 30s cargo test            # run all tests (30s limit)
 ```
+
+**IMPORTANT:** Always prefix `cargo test` with `timeout 30s` to prevent infinite loops
+from consuming all resources. Tests that exceed 30 seconds are considered failing.
 
 ## Development Strategy
 - **Implement levels in order (L1 → L16).** Each level builds on the previous.
 - **After implementing each level, run its tests before moving on:**
   ```
-  cargo test test_l01   # must pass before starting L2
-  cargo test test_l02   # must pass before starting L3
+  timeout 30s cargo test test_l01   # must pass before starting L2
+  timeout 30s cargo test test_l02   # must pass before starting L3
   ```
 - **Do not skip ahead.** Later levels depend on earlier ones being correct.
 - **If a level's tests fail, fix them before proceeding.** Do not accumulate broken levels.
