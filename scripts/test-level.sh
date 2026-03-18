@@ -4,9 +4,9 @@ set -euo pipefail
 # Run tests for a single level inside a container.
 # Usage: ./scripts/test-level.sh 01      # test level 1
 #        ./scripts/test-level.sh 05      # test level 5
-#        ./scripts/test-level.sh         # test all levels
+#        ./scripts/test-level.sh all     # test all levels (300s timeout)
 
-IMAGE_NAME="bench-runner"
+IMAGE_NAME="cs61a-bench"
 TIMEOUT=30
 
 # Run clippy when the codebase has clippy discipline enabled (strategy branch and its descendants).
@@ -25,18 +25,23 @@ if [[ "$RUN_CLIPPY" == "true" ]]; then
     fi
 fi
 
-# Build test binary on host
-BIN=$(cargo test --no-run 2>&1 | grep -oP 'target/debug/deps/cs61a_bench-[a-f0-9]+' | head -1)
+# Build test binary on host (release mode for realistic perf)
+BIN=$(cargo test --no-run --release 2>&1 | grep -oP 'target/release/deps/cs61a_bench-[a-f0-9]+' | head -1)
 if [[ -z "$BIN" ]]; then
     echo "ERROR: Failed to build test binary"
     exit 1
 fi
 
 # Build filter
-if [[ -n "${1:-}" ]]; then
-    FILTER="test_l${1}"
-else
+if [[ -z "${1:-}" ]]; then
+    echo "Usage: test-level.sh <level>   # e.g., 01, 05, 16"
+    echo "       test-level.sh all       # run all levels (300s timeout)"
+    exit 1
+elif [[ "$1" == "all" ]]; then
     FILTER=""
+    TIMEOUT=300
+else
+    FILTER="test_l${1}"
 fi
 
 # Run inside container

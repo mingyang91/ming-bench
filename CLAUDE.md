@@ -16,13 +16,15 @@ Implement a Scheme interpreter in Rust.
 ```bash
 ./scripts/test-level.sh 01   # test level 1
 ./scripts/test-level.sh 05   # test level 5
-./scripts/test-level.sh      # test all levels
+./scripts/test-level.sh all  # test all levels (300s timeout)
 ```
 
 **IMPORTANT:**
-- Always use `./scripts/test-level.sh` — never bare `cargo test`
-- Tests that exceed 30 seconds or OOM (1GB limit) are considered failing
-- Build the container image first if not already built: `sudo podman build -t bench-runner -f Dockerfile.bench .`
+- Always use `./scripts/test-level.sh <level>` — never bare `cargo test`
+- A level argument is required (e.g., `01`, `16`, or `all`)
+- Tests are built in release mode and run in a container with 1GB memory, 1 CPU
+- Per-level timeout: 30s. Full suite (`all`): 300s. Exceeding these or OOM = failing
+- Build the container image first if not already built: `sudo podman build -t cs61a-bench -f Dockerfile.bench .`
 
 ## Development Strategy
 - **Implement levels in order (L1 → L16).** Each level builds on the previous.
@@ -127,7 +129,7 @@ No hidden side effects.
 ### Compiler Discipline
 
 - `#![deny(warnings)]` and `#![deny(clippy::unwrap_used)]` are set in `src/lib.rs`. Do not remove them.
-- **All code must pass `cargo clippy` with zero warnings before testing.** Run `cargo clippy -- -D warnings` after each level.
+- `./scripts/test-level.sh` automatically runs clippy before testing — no need to run it separately.
 - No `.unwrap()` in non-test code — use `?`, `.ok_or(...)`, or `match`.
 
 ### Development Workflow

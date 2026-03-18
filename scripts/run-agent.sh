@@ -181,8 +181,8 @@ if [[ "$RESUME" == "false" ]]; then
 fi
 
 # --- Warm dependency cache ---
-echo "Pre-building dependencies in worktree..."
-if (cd "$WORKTREE_DIR" && cargo build 2>&1); then
+echo "Pre-building dependencies in worktree (release mode)..."
+if (cd "$WORKTREE_DIR" && cargo build --release 2>&1); then
     echo "Pre-build complete."
 else
     echo "WARNING: Pre-build failed. Agent may hit cold cache issues."
@@ -366,6 +366,8 @@ capture_session() {
 # Execution paths
 # ============================================================================
 
+LEVEL_TIMES_JSON=""  # accumulates per-level timing entries for meta.json
+
 if [[ "$MODE" == "levels" ]]; then
     # --- Path 2: Level-by-level orchestration ---
     echo "=== Level-by-level mode ==="
@@ -413,12 +415,20 @@ if [[ "$MODE" == "levels" ]]; then
 Read CLAUDE.md for full instructions.
 Run ./scripts/test-level.sh $level to verify. Do not work on other levels."
         else
-            # Generate context summary from previous work
-            SUMMARY=""
-            if command -v claude &>/dev/null; then
-                SUMMARY=$( (cd "$WORKTREE_DIR" && claude -p --max-turns 1 \
-                    "List the files under src/scheme/, their purpose, and which levels are implemented so far. Be brief, 5-10 lines." 2>/dev/null) || true)
-            fi
+            # Generate context summary from previous work (deterministic, no LLM call)
+            SUMMARY=$(
+                cd "$WORKTREE_DIR"
+                echo "Files under src/scheme/:"
+                find src/scheme/ -name '*.rs' -exec wc -l {} + 2>/dev/null | sort -n || true
+                echo ""
+                echo "Levels already passing:"
+                for prev in $(seq -w 1 $((10#$level - 1))); do
+                    prev_dir="$RESULTS_DIR/L${prev}"
+                    if [[ -f "$prev_dir/status.txt" ]] && grep -q "PASSED" "$prev_dir/status.txt"; then
+                        echo "  L${prev}: PASSED"
+                    fi
+                done
+            )
 
             LEVEL_PROMPT="Context from previous levels:
 ${SUMMARY:-See src/scheme/ for current implementation.}
@@ -447,6 +457,16 @@ Run ./scripts/test-level.sh $level to verify. Do not work on other levels."
         (cd "$WORKTREE_DIR" && ./scripts/test-level.sh "$level") > "$LEVEL_DIR/test-result.txt" 2>&1
         TEST_EXIT=$?
         set -e
+
+        # Accumulate per-level timing for meta.json
+        status_label="FAILED"
+        [[ $TEST_EXIT -eq 0 ]] && status_label="PASSED"
+        entry="\"L${level}\": {\"duration_s\": ${LEVEL_DURATION}, \"status\": \"${status_label}\"}"
+        if [[ -n "$LEVEL_TIMES_JSON" ]]; then
+            LEVEL_TIMES_JSON="${LEVEL_TIMES_JSON}, ${entry}"
+        else
+            LEVEL_TIMES_JSON="$entry"
+        fi
 
         if [[ $TEST_EXIT -eq 0 ]]; then
             echo "Level $level PASSED (${LEVEL_DURATION}s)" | tee "$LEVEL_DIR/status.txt"
@@ -479,6 +499,12 @@ elif [[ "$MODE" == "full" ]]; then
     echo ""
     echo "Agent exited with code: $AGENT_EXIT"
 
+    # --- Git checkpoint: commit agent's work so bench.sh can score from the branch ---
+    echo "Committing agent work to branch..."
+    (cd "$WORKTREE_DIR" && git add -A && git commit -m "agent: full run complete" --allow-empty) \
+        >> "$RESULTS_DIR/git-checkpoint.log" 2>&1 || true
+    echo "Checkpoint committed."
+
     # Capture session
     capture_session "$SESSION_UUID" "$RESULTS_DIR"
 
@@ -505,11 +531,17 @@ fi
 
 # --- Update meta.json with final state ---
 END_TIME="$(date -Iseconds)"
+LEVEL_TIMES_FIELD=""
+if [[ -n "$LEVEL_TIMES_JSON" ]]; then
+    LEVEL_TIMES_FIELD=",
+  \"level_times\": {${LEVEL_TIMES_JSON}}"
+fi
+
 write_meta ",
   \"end_time\": \"$END_TIME\",
   \"exit_code\": ${AGENT_EXIT:-0},
   \"bench_exit_code\": $BENCH_EXIT,
-  \"score\": \"$SCORE\""
+  \"score\": \"$SCORE\"${LEVEL_TIMES_FIELD}"
 
 echo ""
 echo "=== Run complete ==="

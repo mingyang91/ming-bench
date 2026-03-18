@@ -55,19 +55,19 @@ fi
 
 # --- Compile tests on host ---
 echo "Compiling tests on host..."
-TEST_BIN=$(cd "$WORKTREE_DIR" && cargo test --no-run --message-format=json 2>/dev/null \
+TEST_BIN=$(cd "$WORKTREE_DIR" && cargo test --no-run --release --message-format=json 2>/dev/null \
     | jq -r 'select(.reason == "compiler-artifact") | select(.target.kind[] == "lib") | .executable // empty' \
     | tail -1)
 
 if [ -z "$TEST_BIN" ]; then
     # Fallback: find the test binary by name
-    TEST_BIN=$(cd "$WORKTREE_DIR" && cargo test --no-run 2>&1 \
+    TEST_BIN=$(cd "$WORKTREE_DIR" && cargo test --no-run --release 2>&1 \
         | grep -oP 'Executable.*\(\K[^)]+' | tail -1)
 fi
 
 if [ -z "$TEST_BIN" ] || [ ! -f "$TEST_BIN" ]; then
     echo "ERROR: Failed to locate test binary. Compilation output:"
-    (cd "$WORKTREE_DIR" && cargo test --no-run 2>&1) | tee -a "$RESULT_FILE"
+    (cd "$WORKTREE_DIR" && cargo test --no-run --release 2>&1) | tee -a "$RESULT_FILE"
     exit 1
 fi
 
