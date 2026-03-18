@@ -35,6 +35,7 @@ Implement a Scheme interpreter in Rust.
   ```
 - **Do not skip ahead.** Later levels depend on earlier ones being correct.
 - **If a level's tests fail, fix them before proceeding.** Do not accumulate broken levels.
+- **Rely on the provided level tests as the source of truth.** Do not write additional unit tests unless debugging a specific internal module. The level tests are comprehensive — passing them means the implementation is correct.
 
 ## Levels (implement in order)
 1. **Atoms** — self-evaluating: integers, booleans, strings
@@ -106,10 +107,177 @@ No hidden side effects.
 ### Code Style
 
 - **Flat control flow.** Prefer early returns and `?` over deeply nested `match`.
-- **No premature helpers (<10 ops).** If logic is < 10 composed operators/steps, inline at call site.
-- **Extract helpers at >= 10 ops.** Register in [helpers.md](helpers.md) — future agent sessions must check it before writing new helpers and must reuse existing ones.
+- **No premature helpers (<5 ops).** If logic is < 5 composed operators/steps, inline at call site.
+- **Extract helpers at >= 5 ops.** Register in [helpers.md](helpers.md) — future agent sessions must check it before writing new helpers and must reuse existing ones. **After creating any new helper, immediately update helpers.md with its name, location, and purpose.** This is not optional.
 - **No premature abstractions.** Three similar lines > one abstraction used once.
 - **Proactive naming review.** Fix misleading/stale names when modifying code.
+
+### Functional Style
+
+- **Prefer immutable-first data flow.** Build new values from inputs instead of mutating temporary state, unless mutation is required by semantics.
+
+  ```rust
+  // Bad
+  let mut total = 0;
+  for val in values {
+      total += transform(val);
+  }
+
+  // Good
+  let total: i64 = values.iter().map(transform).sum();
+  ```
+
+- **Prefer iterator pipelines for collection transforms.** Use `map`, `filter`, `fold`, `try_fold`, `collect` instead of manual `Vec::push` loops when the logic is a pure transformation.
+
+  ```rust
+  // Bad
+  let mut results = Vec::new();
+  for item in items {
+      results.push(process(item));
+  }
+
+  // Good
+  let results: Vec<_> = items.iter().map(process).collect();
+  ```
+
+- **Prefer `collect::<Result<Vec<_>, _>>()?` for fallible transforms.** Transform whole collections functionally instead of filling a mutable vector by hand.
+
+  ```rust
+  // Bad
+  let mut parsed = Vec::new();
+  for raw in inputs {
+      parsed.push(parse(raw)?);
+  }
+
+  // Good
+  let parsed: Vec<_> = inputs.iter().map(parse).collect::<Result<_, _>>()?;
+  ```
+
+- **Prefer structural recursion or slice-pattern matching over index-driven loops.** For tree/list traversal, match on structure instead of manually advancing indices.
+
+  ```rust
+  // Bad
+  let mut i = 0;
+  while i < nodes.len() {
+      match &nodes[i] {
+          Node::Leaf(v) => handle(v),
+          Node::Branch(children) => { /* recurse somehow */ }
+      }
+      i += 1;
+  }
+
+  // Good
+  fn walk(nodes: &[Node]) -> Result<()> {
+      match nodes {
+          [] => Ok(()),
+          [Node::Leaf(v), rest @ ..] => { handle(v); walk(rest) }
+          [Node::Branch(children), rest @ ..] => { walk(children)?; walk(rest) }
+      }
+  }
+  ```
+
+- **Prefer `split_first()`, `split_last()`, and slice patterns over indexing.** Avoid `args[0]`, `v[v.len()-1]` when matching can encode the invariant directly.
+
+  ```rust
+  // Bad
+  let first = args[0];
+  let rest = &args[1..];
+
+  // Good
+  let [first, rest @ ..] = args else {
+      return Err(Error::NotEnoughArgs);
+  };
+  ```
+
+- **Prefer folds for recursive data construction.** Build recursive structures from slices with folds, destructure them with recursive helpers or `try_fold`.
+
+  ```rust
+  // Bad
+  let mut list = Node::Empty;
+  for item in items.iter().rev() {
+      list = Node::Pair(Box::new(item.clone()), Box::new(list));
+  }
+
+  // Good
+  let list = items.iter().rev().fold(Node::Empty, |acc, item| {
+      Node::Pair(Box::new(item.clone()), Box::new(acc))
+  });
+  ```
+
+- **Prefer declarative matching over flag variables.** Replace mutable `found = true` state with return-oriented control flow, `find_map`, or `try_fold`.
+
+  ```rust
+  // Bad
+  let mut found = None;
+  for entry in entries {
+      if entry.matches(key) {
+          found = Some(entry.value());
+          break;
+      }
+  }
+
+  // Good
+  let found = entries.iter().find_map(|e| e.matches(key).then(|| e.value()));
+  ```
+
+- **Keep mutation at semantic boundaries only.** Accept local mutation when modeling runtime semantics (e.g., shared mutable state, in-place update), but avoid incidental mutation used only for bookkeeping.
+
+- **Refactor repeated imperative patterns immediately.** Same hand-written loop or mutable accumulator in multiple places → extract a functional helper. Extract when duplicated across call sites, regardless of size.
+
+### Structural Limits
+
+- **`mod.rs` stays thin: exports + entry point.** Implementation logic goes in dedicated submodules. Soft cap: 200 lines for any `mod.rs`.
+
+- **Split by subsystem into dedicated submodules.** Each distinct responsibility gets its own file. Don't pile unrelated logic into one file just because it's convenient.
+
+- **Function soft cap: 40–60 lines. Hard cap: 100 lines.** Exception: parser/state-machine code with inherently sequential logic. If a function needs scrolling, extract helpers.
+
+- **Max nesting: 3 levels.** Use `let else`, early `return`, `?`, and extracted helpers to reduce brace depth.
+
+  ```rust
+  // Bad — 4+ levels deep
+  match config {
+      Config::A(inner) => {
+          if inner.enabled {
+              for item in inner.items {
+                  if item.valid() {
+                      process(item);
+                  }
+              }
+          }
+      }
+      _ => {}
+  }
+
+  // Good — flat with early returns and helpers
+  fn handle_config_a(inner: &Inner) -> Result<()> {
+      if !inner.enabled { return Ok(()); }
+      inner.items.iter().filter(|i| i.valid()).for_each(process);
+      Ok(())
+  }
+  ```
+
+- **Match arms dispatch to helpers.** A `match` arm should call a function, not inline multi-line logic. If a branch needs scrolling, extract it.
+
+  ```rust
+  // Bad — inline logic in match arms
+  match command {
+      Command::Create(args) => {
+          // 30 lines of creation logic...
+      }
+      Command::Delete(args) => {
+          // 25 lines of deletion logic...
+      }
+  }
+
+  // Good — dispatch to handlers
+  match command {
+      Command::Create(args) => handle_create(args, state),
+      Command::Delete(args) => handle_delete(args, state),
+  }
+  ```
+
+- **`cargo fmt --check` must pass.** Format before committing. `cargo clippy -- -D warnings` is already enforced by `test-level.sh`.
 
 ### Logging (agent debugging)
 
@@ -136,3 +304,6 @@ No hidden side effects.
 
 - **Fix code smells immediately.** AI-agent-driven codebase — fix on the spot, don't track for later.
 - **Resolve rule ambiguities immediately.** No human in the loop — make the best judgment call and move on.
+- **Blast radius is not a concern — rule compliance is.** If existing code violates structural limits or functional style rules, refactor aggressively. Split oversized files into modules, extract bloated functions into helpers, rewrite imperative loops as pipelines. A 500-line diff that brings the codebase into compliance is better than a 5-line patch that leaves violations in place.
+- **Never be conservative to minimize diff size.** AI writes code near-instantly — there is zero cost to rewriting an entire file if the result is cleaner, more modular, and rule-compliant. "Don't touch what isn't broken" does not apply here; if it violates the rules, it *is* broken.
+- **Proactive refactoring is mandatory, not optional.** When implementing a new feature, if you notice surrounding code that violates nesting limits, function size caps, or functional style rules — fix it in the same pass. Do not defer. Do not leave TODOs.
