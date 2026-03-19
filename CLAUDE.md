@@ -94,10 +94,6 @@ These rules are NOT enforced by tooling. They represent style expectations that 
 - Use `?` operator for error propagation.
 - Use `thiserror` for typed error enums. Do not flatten all errors to `String`.
 
-### Style
-- **Match arms > 3 lines → extract to a helper function.** A match arm may contain a 1–3 line expression inline; anything longer must be a function call.
-- **Register helpers in `helpers.md`** — a "helper" is any function extracted to reduce another function's length OR shared across 2+ call sites. Update `helpers.md` with name, file, and one-line purpose after creating one. Check `helpers.md` before creating new helpers to avoid duplicates.
-
 ### Functional Style (beyond what clippy enforces)
 - **Immutable-first.** Build new values from inputs instead of mutating temporaries.
 - **`collect::<Result<Vec<_>, _>>()?`** for fallible collection transforms.
