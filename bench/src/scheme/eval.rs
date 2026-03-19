@@ -24,6 +24,7 @@ fn eval_list(elems: &[Value], env: &Env) -> Result<Value, String> {
             "and" => return eval_and(&elems[1..], env),
             "or" => return eval_or(&elems[1..], env),
             "lambda" => return eval_lambda(&elems[1..], env),
+            "begin" => return eval_begin(&elems[1..], env),
             _ => {}
         }
     }
@@ -73,8 +74,8 @@ fn apply(proc: &Value, args: &[Value]) -> Result<Value, String> {
 // ── Special forms ────────────────────────────────────────────────────
 
 fn eval_define(args: &[Value], env: &Env) -> Result<Value, String> {
-    if args.len() != 2 {
-        return Err(format!("define requires 2 arguments, got {}", args.len()));
+    if args.len() < 2 {
+        return Err(format!("define requires at least 2 arguments, got {}", args.len()));
     }
     match &args[0] {
         Value::Symbol(name) => {
@@ -83,15 +84,16 @@ fn eval_define(args: &[Value], env: &Env) -> Result<Value, String> {
             Ok(Value::Void)
         }
         Value::List(elems) if !elems.is_empty() => {
-            // (define (name params...) body) sugar
+            // (define (name params...) body...) sugar
             let name = match &elems[0] {
                 Value::Symbol(s) => s.clone(),
                 other => return Err(format!("define: expected symbol, got {other}")),
             };
             let params = extract_params(&elems[1..])?;
+            let body = wrap_body(&args[1..]);
             let lambda = Value::Lambda {
                 params,
-                body: Box::new(args[1].clone()),
+                body: Box::new(body),
                 env: env.clone(),
             };
             env.set(name, lambda);
@@ -102,18 +104,30 @@ fn eval_define(args: &[Value], env: &Env) -> Result<Value, String> {
 }
 
 fn eval_lambda(args: &[Value], env: &Env) -> Result<Value, String> {
-    if args.len() != 2 {
-        return Err(format!("lambda requires 2 arguments, got {}", args.len()));
+    if args.len() < 2 {
+        return Err(format!("lambda requires at least 2 arguments, got {}", args.len()));
     }
     let params = match &args[0] {
         Value::List(elems) => extract_params(elems)?,
         other => return Err(format!("lambda: expected parameter list, got {other}")),
     };
+    let body = wrap_body(&args[1..]);
     Ok(Value::Lambda {
         params,
-        body: Box::new(args[1].clone()),
+        body: Box::new(body),
         env: env.clone(),
     })
+}
+
+/// Wrap multiple body expressions into a single `(begin ...)` form if needed.
+fn wrap_body(exprs: &[Value]) -> Value {
+    if exprs.len() == 1 {
+        exprs[0].clone()
+    } else {
+        let mut elems = vec![Value::Symbol("begin".into())];
+        elems.extend(exprs.iter().cloned());
+        Value::List(elems)
+    }
 }
 
 fn extract_params(elems: &[Value]) -> Result<Vec<String>, String> {
@@ -165,6 +179,14 @@ fn eval_or(exprs: &[Value], env: &Env) -> Result<Value, String> {
         if is_truthy(&result) {
             return Ok(result);
         }
+    }
+    Ok(result)
+}
+
+fn eval_begin(exprs: &[Value], env: &Env) -> Result<Value, String> {
+    let mut result = Value::Void;
+    for expr in exprs {
+        result = eval(expr, env)?;
     }
     Ok(result)
 }
