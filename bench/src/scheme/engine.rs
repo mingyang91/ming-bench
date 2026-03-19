@@ -177,9 +177,14 @@ impl Builtin {
 
 #[derive(Clone)]
 pub(super) struct Procedure {
-    params: Vec<String>,
-    body: Vec<Expr>,
+    params: Rc<[String]>,
+    body: Rc<[Expr]>,
     environment: Environment,
+}
+
+enum EvalOutcome {
+    Value(Value),
+    TailCall(Procedure, Vec<Value>),
 }
 
 type Environment = Rc<RefCell<Frame>>;
@@ -255,47 +260,84 @@ fn lookup_binding(environment: &Environment, name: &str) -> Option<Value> {
 }
 
 fn eval_sequence(expressions: &[Expr], environment: &Environment) -> Result<Value, String> {
-    let mut last_value = Value::Void;
-    for expr in expressions {
-        last_value = eval_expr(expr, environment)?;
+    resolve_outcome(eval_sequence_outcome(expressions, environment, false)?)
+}
+
+fn eval_sequence_outcome(
+    expressions: &[Expr],
+    environment: &Environment,
+    tail_position: bool,
+) -> Result<EvalOutcome, String> {
+    let Some((last, initial)) = expressions.split_last() else {
+        return Ok(EvalOutcome::Value(Value::Void));
+    };
+
+    for expr in initial {
+        eval_expr(expr, environment)?;
     }
 
-    Ok(last_value)
+    eval_expr_outcome(last, environment, tail_position)
 }
 
 fn eval_expr(expr: &Expr, environment: &Environment) -> Result<Value, String> {
+    resolve_outcome(eval_expr_outcome(expr, environment, false)?)
+}
+
+fn eval_expr_outcome(
+    expr: &Expr,
+    environment: &Environment,
+    tail_position: bool,
+) -> Result<EvalOutcome, String> {
     match expr {
-        Expr::Literal(value) => Ok(value.clone()),
-        Expr::Symbol(name) => {
-            lookup_binding(environment, name).ok_or_else(|| format!("unbound symbol: {name}"))
-        }
-        Expr::Application(parts) => eval_application(parts, environment),
+        Expr::Literal(value) => Ok(EvalOutcome::Value(value.clone())),
+        Expr::Symbol(name) => lookup_binding(environment, name)
+            .map(EvalOutcome::Value)
+            .ok_or_else(|| format!("unbound symbol: {name}")),
+        Expr::Application(parts) => eval_application_outcome(parts, environment, tail_position),
     }
 }
 
-fn eval_application(parts: &[Expr], environment: &Environment) -> Result<Value, String> {
+fn eval_application_outcome(
+    parts: &[Expr],
+    environment: &Environment,
+    tail_position: bool,
+) -> Result<EvalOutcome, String> {
     let (operator, arguments) = parts
         .split_first()
         .ok_or_else(|| "cannot evaluate empty application".to_string())?;
 
     if let Some(name) = symbol_name(operator) {
         match name {
-            "and" => return eval_and(arguments, environment),
-            "or" => return eval_or(arguments, environment),
-            "begin" => return eval_begin(arguments, environment),
-            "cond" => return eval_cond(arguments, environment),
-            "if" => return eval_if(arguments, environment),
-            "define" => return eval_define(arguments, environment),
-            "let" => return eval_let(arguments, environment),
-            "quote" => return eval_quote(arguments),
-            "lambda" => return eval_lambda(arguments, environment),
+            "and" => return eval_and(arguments, environment).map(EvalOutcome::Value),
+            "or" => return eval_or(arguments, environment).map(EvalOutcome::Value),
+            "begin" => return eval_begin(arguments, environment).map(EvalOutcome::Value),
+            "cond" => return eval_cond(arguments, environment).map(EvalOutcome::Value),
+            "if" => return eval_if(arguments, environment, tail_position),
+            "define" => return eval_define(arguments, environment).map(EvalOutcome::Value),
+            "let" => return eval_let(arguments, environment).map(EvalOutcome::Value),
+            "quote" => return eval_quote(arguments).map(EvalOutcome::Value),
+            "lambda" => return eval_lambda(arguments, environment).map(EvalOutcome::Value),
             _ => {}
         }
     }
 
     let operator = eval_expr(operator, environment)?;
     let arguments = eval_arguments(arguments, environment)?;
-    apply_callable(&operator, &arguments)
+
+    if tail_position {
+        if let Value::Procedure(procedure) = operator {
+            return Ok(EvalOutcome::TailCall(procedure, arguments));
+        }
+    }
+
+    apply_callable(&operator, &arguments).map(EvalOutcome::Value)
+}
+
+fn resolve_outcome(outcome: EvalOutcome) -> Result<Value, String> {
+    match outcome {
+        EvalOutcome::Value(value) => Ok(value),
+        EvalOutcome::TailCall(procedure, arguments) => apply_procedure(procedure, arguments),
+    }
 }
 
 fn symbol_name(expr: &Expr) -> Option<&str> {
@@ -316,26 +358,34 @@ fn eval_arguments(arguments: &[Expr], environment: &Environment) -> Result<Vec<V
 fn apply_callable(callable: &Value, arguments: &[Value]) -> Result<Value, String> {
     match callable {
         Value::Builtin(builtin) => builtin.apply(arguments),
-        Value::Procedure(procedure) => apply_procedure(procedure, arguments),
+        Value::Procedure(procedure) => apply_procedure(procedure.clone(), arguments.to_vec()),
         _ => Err("attempted to call a non-procedure".into()),
     }
 }
 
-fn apply_procedure(procedure: &Procedure, arguments: &[Value]) -> Result<Value, String> {
-    if procedure.params.len() != arguments.len() {
-        return Err(format!(
-            "procedure expected {} arguments, got {}",
-            procedure.params.len(),
-            arguments.len()
-        ));
-    }
+fn apply_procedure(mut procedure: Procedure, mut arguments: Vec<Value>) -> Result<Value, String> {
+    loop {
+        if procedure.params.len() != arguments.len() {
+            return Err(format!(
+                "procedure expected {} arguments, got {}",
+                procedure.params.len(),
+                arguments.len()
+            ));
+        }
 
-    let call_environment = new_environment(Some(procedure.environment.clone()));
-    for (param, argument) in procedure.params.iter().zip(arguments) {
-        define_binding(&call_environment, param.clone(), argument.clone());
-    }
+        let call_environment = new_environment(Some(procedure.environment.clone()));
+        for (param, argument) in procedure.params.iter().zip(&arguments) {
+            define_binding(&call_environment, param.clone(), argument.clone());
+        }
 
-    eval_sequence(&procedure.body, &call_environment)
+        match eval_sequence_outcome(procedure.body.as_ref(), &call_environment, true)? {
+            EvalOutcome::Value(value) => return Ok(value),
+            EvalOutcome::TailCall(next_procedure, next_arguments) => {
+                procedure = next_procedure;
+                arguments = next_arguments;
+            }
+        }
+    }
 }
 
 fn eval_define(arguments: &[Expr], environment: &Environment) -> Result<Value, String> {
@@ -378,8 +428,8 @@ fn define_function(
 
     let params = parse_parameters(params)?;
     let procedure = Procedure {
-        params,
-        body: body.to_vec(),
+        params: params.into(),
+        body: body.to_vec().into(),
         environment: environment.clone(),
     };
     define_binding(environment, name.clone(), Value::Procedure(procedure));
@@ -402,8 +452,8 @@ fn eval_lambda(arguments: &[Expr], environment: &Environment) -> Result<Value, S
     let params = parse_parameters(params)?;
 
     Ok(Value::Procedure(Procedure {
-        params,
-        body: body.to_vec(),
+        params: params.into(),
+        body: body.to_vec().into(),
         environment: environment.clone(),
     }))
 }
@@ -469,16 +519,20 @@ fn parse_parameters(parameters: &[Expr]) -> Result<Vec<String>, String> {
     Ok(names)
 }
 
-fn eval_if(arguments: &[Expr], environment: &Environment) -> Result<Value, String> {
+fn eval_if(
+    arguments: &[Expr],
+    environment: &Environment,
+    tail_position: bool,
+) -> Result<EvalOutcome, String> {
     let [condition, consequent, alternative] = arguments else {
         return Err("`if` expects exactly 3 arguments".into());
     };
 
     let condition = eval_expr(condition, environment)?;
     if is_truthy(&condition) {
-        eval_expr(consequent, environment)
+        eval_expr_outcome(consequent, environment, tail_position)
     } else {
-        eval_expr(alternative, environment)
+        eval_expr_outcome(alternative, environment, tail_position)
     }
 }
 
