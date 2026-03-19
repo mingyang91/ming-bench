@@ -91,40 +91,7 @@ pub fn eval_define(args: &[Expr], env: &Env) -> Result<Expr, String> {
     }
 }
 
-pub fn eval_if(args: &[Expr], env: &Env) -> Result<Expr, String> {
-    if args.len() < 2 || args.len() > 3 {
-        return Err("if requires 2 or 3 arguments".into());
-    }
-    let cond = eval(&args[0], env)?;
-    if !is_false(&cond) {
-        eval(&args[1], env)
-    } else if args.len() == 3 {
-        eval(&args[2], env)
-    } else {
-        Ok(Expr::Void)
-    }
-}
-
-pub fn eval_let(args: &[Expr], env: &Env) -> Result<Expr, String> {
-    if args.len() < 2 {
-        return Err("let requires bindings and body".into());
-    }
-    let Expr::List(bindings) = &args[0] else {
-        return Err("let bindings must be a list".into());
-    };
-    let let_env = env.child();
-    for binding in bindings {
-        let (name, val) = parse_let_binding(binding, env)?;
-        let_env.insert(name, val);
-    }
-    let mut result = Expr::Void;
-    for body_expr in &args[1..] {
-        result = eval(body_expr, &let_env)?;
-    }
-    Ok(result)
-}
-
-fn parse_let_binding(binding: &Expr, env: &Env) -> Result<(String, Expr), String> {
+pub fn parse_let_binding(binding: &Expr, env: &Env) -> Result<(String, Expr), String> {
     let Expr::List(pair) = binding else {
         return Err("let binding must be (name value)".into());
     };
@@ -162,26 +129,3 @@ fn eval_body(exprs: &[Expr], env: &Env) -> Result<Expr, String> {
     Ok(result)
 }
 
-pub fn apply(proc: &Expr, args: &[Expr]) -> Result<Expr, String> {
-    match proc {
-        Expr::Lambda {
-            params,
-            body,
-            env: captured_env,
-        } => {
-            if args.len() != params.len() {
-                return Err(format!(
-                    "expected {} arguments, got {}",
-                    params.len(),
-                    args.len()
-                ));
-            }
-            let call_env = captured_env.child();
-            for (param, arg) in params.iter().zip(args.iter()) {
-                call_env.insert(param.clone(), arg.clone());
-            }
-            eval(body, &call_env)
-        }
-        _ => Err(format!("not a procedure: {}", proc.to_display())),
-    }
-}
