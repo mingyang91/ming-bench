@@ -47,6 +47,7 @@ fn eval_list(elems: &[Value], env: &Env) -> Result<Trampoline, String> {
             "begin" => return eval_begin(&elems[1..], env),
             "let" => return eval_let(&elems[1..], env),
             "cond" => return eval_cond(&elems[1..], env),
+            "set!" => return eval_set(&elems[1..], env).map(Trampoline::Done),
             _ => {}
         }
     }
@@ -259,6 +260,22 @@ fn eval_let(args: &[Value], env: &Env) -> Result<Trampoline, String> {
         expr: body,
         env: child,
     })
+}
+
+fn eval_set(args: &[Value], env: &Env) -> Result<Value, String> {
+    if args.len() != 2 {
+        return Err(format!("set! requires 2 arguments, got {}", args.len()));
+    }
+    let name = match &args[0] {
+        Value::Symbol(s) => s,
+        other => return Err(format!("set!: expected symbol, got {other}")),
+    };
+    let val = eval(&args[1], env)?;
+    if env.update(name, val) {
+        Ok(Value::Void)
+    } else {
+        Err(format!("set!: unbound variable: {name}"))
+    }
 }
 
 fn eval_cond(clauses: &[Value], env: &Env) -> Result<Trampoline, String> {

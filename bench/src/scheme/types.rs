@@ -44,6 +44,19 @@ impl Env {
     pub fn set(&self, name: String, val: Value) {
         self.0.borrow_mut().bindings.insert(name, val);
     }
+
+    /// Mutate an existing binding, walking up the chain. Returns false if unbound.
+    pub fn update(&self, name: &str, val: Value) -> bool {
+        let mut frame = self.0.borrow_mut();
+        if frame.bindings.contains_key(name) {
+            frame.bindings.insert(name.to_string(), val);
+            true
+        } else if let Some(ref parent) = frame.parent {
+            parent.update(name, val)
+        } else {
+            false
+        }
+    }
 }
 
 // ── Value ────────────────────────────────────────────────────────────
