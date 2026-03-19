@@ -41,10 +41,7 @@ fn eval_expr(expression: &Expr, environment: &Environment) -> Result<Value, Sche
     }
 }
 
-fn eval_application(
-    expressions: &[Expr],
-    environment: &Environment,
-) -> Result<Value, SchemeError> {
+fn eval_application(expressions: &[Expr], environment: &Environment) -> Result<Value, SchemeError> {
     let (operator, operands) = expressions
         .split_first()
         .ok_or(SchemeError::EmptyApplication)?;
@@ -168,7 +165,11 @@ fn eval_lambda(operands: &[Expr], environment: &Environment) -> Result<Value, Sc
     match operands {
         [parameters, body @ ..] if !body.is_empty() => {
             let parameters = parse_parameter_list(parameters, "lambda")?;
-            Ok(Value::procedure(parameters, body.to_vec(), environment.clone()))
+            Ok(Value::procedure(
+                parameters,
+                body.to_vec(),
+                environment.clone(),
+            ))
         }
         _ => Err(SchemeError::TooFewArguments {
             operator: "lambda",
@@ -254,7 +255,10 @@ fn validate_cond_clause(clause: &Expr, is_last: bool) -> Result<(), SchemeError>
     Ok(())
 }
 
-fn eval_cond_clause(clause: &Expr, environment: &Environment) -> Result<Option<Value>, SchemeError> {
+fn eval_cond_clause(
+    clause: &Expr,
+    environment: &Environment,
+) -> Result<Option<Value>, SchemeError> {
     let Expr::List(parts) = clause else {
         unreachable!("cond clauses are validated before evaluation");
     };
@@ -442,6 +446,11 @@ fn apply_builtin(
         "null?" => eval_null(operands, environment),
         "list" => eval_list(operands, environment),
         "length" => eval_length(operands, environment),
+        "string?" => eval_string_predicate(operands, environment),
+        "number?" => eval_number_predicate(operands, environment),
+        "boolean?" => eval_boolean_predicate(operands, environment),
+        "pair?" => eval_pair_predicate(operands, environment),
+        "symbol?" => eval_symbol_predicate(operands, environment),
         _ => Err(SchemeError::UnboundSymbol {
             name: operator.to_owned(),
         }),
@@ -489,10 +498,7 @@ fn eval_addition(operands: &[Expr], environment: &Environment) -> Result<Value, 
     Ok(Value::Integer(sum))
 }
 
-fn eval_subtraction(
-    operands: &[Expr],
-    environment: &Environment,
-) -> Result<Value, SchemeError> {
+fn eval_subtraction(operands: &[Expr], environment: &Environment) -> Result<Value, SchemeError> {
     let numbers = eval_numbers("-", operands, environment)?;
 
     match numbers.as_slice() {
@@ -508,10 +514,7 @@ fn eval_subtraction(
     }
 }
 
-fn eval_multiplication(
-    operands: &[Expr],
-    environment: &Environment,
-) -> Result<Value, SchemeError> {
+fn eval_multiplication(operands: &[Expr], environment: &Environment) -> Result<Value, SchemeError> {
     let product = eval_numbers("*", operands, environment)?
         .into_iter()
         .product();
@@ -672,14 +675,67 @@ fn eval_length(operands: &[Expr], environment: &Environment) -> Result<Value, Sc
     match operands {
         [operand] => {
             let value = eval_expr(operand, environment)?;
-            let length = value.list_length().map_err(|found| SchemeError::ExpectedList {
-                operator: "length",
-                found,
-            })?;
+            let length = value
+                .list_length()
+                .map_err(|found| SchemeError::ExpectedList {
+                    operator: "length",
+                    found,
+                })?;
             Ok(Value::Integer(length as i64))
         }
         _ => Err(SchemeError::WrongArgumentCount {
             operator: "length",
+            expected: 1,
+            actual: operands.len(),
+        }),
+    }
+}
+
+fn eval_string_predicate(
+    operands: &[Expr],
+    environment: &Environment,
+) -> Result<Value, SchemeError> {
+    eval_type_predicate("string?", operands, environment, Value::is_string)
+}
+
+fn eval_number_predicate(
+    operands: &[Expr],
+    environment: &Environment,
+) -> Result<Value, SchemeError> {
+    eval_type_predicate("number?", operands, environment, Value::is_number)
+}
+
+fn eval_boolean_predicate(
+    operands: &[Expr],
+    environment: &Environment,
+) -> Result<Value, SchemeError> {
+    eval_type_predicate("boolean?", operands, environment, Value::is_boolean)
+}
+
+fn eval_pair_predicate(operands: &[Expr], environment: &Environment) -> Result<Value, SchemeError> {
+    eval_type_predicate("pair?", operands, environment, Value::is_pair)
+}
+
+fn eval_symbol_predicate(
+    operands: &[Expr],
+    environment: &Environment,
+) -> Result<Value, SchemeError> {
+    eval_type_predicate("symbol?", operands, environment, Value::is_symbol)
+}
+
+fn eval_type_predicate(
+    operator: &'static str,
+    operands: &[Expr],
+    environment: &Environment,
+    predicate: fn(&Value) -> bool,
+) -> Result<Value, SchemeError> {
+    match operands {
+        [operand] => {
+            let value = eval_expr(operand, environment)?;
+            Ok(Value::Boolean(predicate(&value)))
+        }
+        _ => Err(SchemeError::WrongArgumentCount {
+            operator,
             expected: 1,
             actual: operands.len(),
         }),
@@ -728,8 +784,7 @@ fn divide_numbers(lhs: i64, rhs: i64) -> Result<i64, SchemeError> {
 fn is_builtin(operator: &str) -> bool {
     matches!(
         operator,
-        "+"
-            | "-"
+        "+" | "-"
             | "*"
             | "/"
             | "<"
@@ -745,6 +800,11 @@ fn is_builtin(operator: &str) -> bool {
             | "null?"
             | "list"
             | "length"
+            | "string?"
+            | "number?"
+            | "boolean?"
+            | "pair?"
+            | "symbol?"
     )
 }
 

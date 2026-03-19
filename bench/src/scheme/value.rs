@@ -67,6 +67,26 @@ impl Value {
         matches!(self, Self::EmptyList)
     }
 
+    pub(crate) fn is_string(&self) -> bool {
+        matches!(self, Self::String(_))
+    }
+
+    pub(crate) fn is_number(&self) -> bool {
+        matches!(self, Self::Integer(_))
+    }
+
+    pub(crate) fn is_boolean(&self) -> bool {
+        matches!(self, Self::Boolean(_))
+    }
+
+    pub(crate) fn is_pair(&self) -> bool {
+        matches!(self, Self::Pair(_))
+    }
+
+    pub(crate) fn is_symbol(&self) -> bool {
+        matches!(self, Self::Symbol(_))
+    }
+
     pub(crate) fn is_truthy(&self) -> bool {
         !matches!(self, Self::Boolean(false))
     }
