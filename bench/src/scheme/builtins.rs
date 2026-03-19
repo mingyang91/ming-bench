@@ -6,6 +6,7 @@ pub fn is_builtin(name: &str) -> bool {
         name,
         "+" | "-" | "*" | "/" | "<" | ">" | "=" | "<=" | "not" | "and" | "or"
             | "cons" | "car" | "cdr" | "null?" | "list" | "length"
+            | "string?" | "number?" | "boolean?" | "pair?" | "symbol?"
     )
 }
 
@@ -32,6 +33,7 @@ pub fn eval_builtin(op: &str, args: &[Expr], env: &Env) -> Result<Expr, String> 
         "null?" => eval_null(args, env),
         "list" => eval_list_builtin(args, env),
         "length" => eval_length(args, env),
+        "string?" | "number?" | "boolean?" | "pair?" | "symbol?" => eval_type_pred(op, args, env),
         _ => Err(format!("unknown procedure: {op}")),
     }
 }
@@ -178,6 +180,22 @@ fn eval_list_builtin(args: &[Expr], env: &Env) -> Result<Expr, String> {
         .map(|a| eval(a, env))
         .collect::<Result<_, _>>()?;
     Ok(Expr::List(elems))
+}
+
+fn eval_type_pred(op: &str, args: &[Expr], env: &Env) -> Result<Expr, String> {
+    if args.len() != 1 {
+        return Err(format!("{op} requires exactly one argument"));
+    }
+    let val = eval(&args[0], env)?;
+    let result = match op {
+        "string?" => matches!(val, Expr::Str(_)),
+        "number?" => matches!(val, Expr::Integer(_)),
+        "boolean?" => matches!(val, Expr::Boolean(_)),
+        "pair?" => matches!(val, Expr::List(ref elems) if !elems.is_empty()),
+        "symbol?" => matches!(val, Expr::Symbol(_)),
+        _ => unreachable!(),
+    };
+    Ok(Expr::Boolean(result))
 }
 
 fn eval_length(args: &[Expr], env: &Env) -> Result<Expr, String> {
