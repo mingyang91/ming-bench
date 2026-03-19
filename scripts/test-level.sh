@@ -86,9 +86,9 @@ check_mod_size() {
     local level="$1"
 
     # Leveled ramp:
-    #   L01-L03: 300 (bootstrapping parser + basic eval)
-    #   L04-L06: 200 (must split: builtins/special_forms out)
-    #   L07+:    100 (mod.rs is thin: just entry point + reexports)
+    #   L01-L03: 300 (bootstrapping)
+    #   L04-L06: 200 (time to split into submodules)
+    #   L07+:    100 (entry point + reexports only)
     local mod_limit=100
     if [[ "$level" -le 3 ]]; then
         mod_limit=300
@@ -113,7 +113,7 @@ if [[ "${1:-}" != "all" && -n "${1:-}" ]]; then
     LN=$((10#$1))
     if ! check_mod_size "$LN"; then
         echo ""
-        echo "Fix structural violations before testing. See CLAUDE.md 'File Structure'."
+        echo "Fix structural violations before testing."
         exit 1
     fi
 fi
