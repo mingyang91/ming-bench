@@ -1,8 +1,70 @@
 use super::types::{Env, Value};
+use std::cell::RefCell;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 enum Trampoline {
     Done(Value),
     Bounce { expr: Value, env: Env },
+}
+
+// ── Continuation support ─────────────────────────────────────────────
+
+static NEXT_CONT_ID: AtomicU64 = AtomicU64::new(1);
+
+struct ContJump {
+    value: Value,
+    replay_expr: Value,
+    remaining_exprs: Vec<Value>,
+    env: Env,
+}
+
+#[derive(Clone)]
+struct TopLevelCtx {
+    current_expr: Value,
+    remaining_exprs: Vec<Value>,
+    env: Env,
+}
+
+thread_local! {
+    static CONT_JUMP: RefCell<Option<ContJump>> = const { RefCell::new(None) };
+    static CALLCC_RETURN: RefCell<Option<Value>> = const { RefCell::new(None) };
+    static TOP_LEVEL_CTX: RefCell<Option<TopLevelCtx>> = const { RefCell::new(None) };
+}
+
+const CONT_SENTINEL: &str = "\x00cont_jump_";
+
+fn make_cont_jump(id: u64) -> String {
+    format!("{CONT_SENTINEL}{id}")
+}
+
+fn parse_cont_jump(err: &str) -> Option<u64> {
+    err.strip_prefix(CONT_SENTINEL).and_then(|s| s.parse().ok())
+}
+
+pub fn is_continuation_jump(err: &str) -> bool {
+    err.starts_with(CONT_SENTINEL)
+}
+
+pub fn set_top_level_ctx(expr: Value, remaining: Vec<Value>, env: Env) {
+    TOP_LEVEL_CTX.with(|c| {
+        *c.borrow_mut() = Some(TopLevelCtx {
+            current_expr: expr,
+            remaining_exprs: remaining,
+            env,
+        });
+    });
+}
+
+pub fn take_cont_jump() -> Option<(Value, Value, Vec<Value>, Env)> {
+    CONT_JUMP.with(|c| {
+        c.borrow_mut()
+            .take()
+            .map(|j| (j.value, j.replay_expr, j.remaining_exprs, j.env))
+    })
+}
+
+pub fn set_callcc_return(val: Value) {
+    CALLCC_RETURN.with(|c| *c.borrow_mut() = Some(val));
 }
 
 pub fn eval(expr: &Value, env: &Env) -> Result<Value, String> {
@@ -89,6 +151,28 @@ fn apply_tco(proc: &Value, args: &[Value]) -> Result<Trampoline, String> {
             })
         }
         Value::Builtin { name } => apply_builtin(name, args),
+        Value::Continuation {
+            id,
+            replay_expr,
+            remaining_exprs,
+            env,
+        } => {
+            if args.len() != 1 {
+                return Err(format!(
+                    "continuation requires 1 argument, got {}",
+                    args.len()
+                ));
+            }
+            CONT_JUMP.with(|c| {
+                *c.borrow_mut() = Some(ContJump {
+                    value: args[0].clone(),
+                    replay_expr: *replay_expr.clone(),
+                    remaining_exprs: remaining_exprs.clone(),
+                    env: env.clone(),
+                });
+            });
+            Err(make_cont_jump(*id))
+        }
         other => Err(format!("not a procedure: {other}")),
     }
 }
@@ -493,7 +577,7 @@ fn apply_list_primitive(op: &str, args: &[Value]) -> Result<Value, String> {
 
 const BUILTINS: &[&str] = &[
     "+", "-", "*", "/", "<", ">", "=", "<=", ">=", "cons", "car", "cdr", "null?", "list",
-    "length", "boolean?", "number?", "pair?", "string?", "symbol?", "not", "apply",
+    "length", "boolean?", "number?", "pair?", "string?", "symbol?", "not", "apply", "call/cc",
 ];
 
 fn resolve_builtin(name: &str) -> Option<Value> {
@@ -507,10 +591,58 @@ fn resolve_builtin(name: &str) -> Option<Value> {
 }
 
 fn apply_builtin(name: &str, args: &[Value]) -> Result<Trampoline, String> {
-    if name == "apply" {
-        return builtin_apply(args);
+    match name {
+        "apply" => builtin_apply(args),
+        "call/cc" => builtin_callcc(args),
+        _ => apply_primitive(name, args).map(Trampoline::Done),
     }
-    apply_primitive(name, args).map(Trampoline::Done)
+}
+
+fn builtin_callcc(args: &[Value]) -> Result<Trampoline, String> {
+    if args.len() != 1 {
+        return Err(format!(
+            "call/cc requires 1 argument, got {}",
+            args.len()
+        ));
+    }
+
+    // Replay mode: a saved continuation was invoked, return the override value
+    let override_val = CALLCC_RETURN.with(|c| c.borrow_mut().take());
+    if let Some(val) = override_val {
+        return Ok(Trampoline::Done(val));
+    }
+
+    let id = NEXT_CONT_ID.fetch_add(1, Ordering::Relaxed);
+
+    let ctx = TOP_LEVEL_CTX
+        .with(|c| c.borrow().clone())
+        .expect("call/cc: no top-level context");
+
+    let cont = Value::Continuation {
+        id,
+        replay_expr: Box::new(ctx.current_expr),
+        remaining_exprs: ctx.remaining_exprs,
+        env: ctx.env,
+    };
+
+    // Fully evaluate: apply the user's function with the continuation
+    let result = match apply_tco(&args[0], &[cont])? {
+        Trampoline::Done(val) => Ok(val),
+        Trampoline::Bounce { expr, env } => eval(&expr, &env),
+    };
+
+    match result {
+        Ok(val) => Ok(Trampoline::Done(val)),
+        Err(e) => match parse_cont_jump(&e) {
+            Some(jump_id) if jump_id == id => {
+                // Escape: our continuation was invoked within dynamic extent
+                let jump = CONT_JUMP.with(|c| c.borrow_mut().take())
+                    .expect("continuation jump value missing");
+                Ok(Trampoline::Done(jump.value))
+            }
+            _ => Err(e),
+        },
+    }
 }
 
 fn builtin_apply(args: &[Value]) -> Result<Trampoline, String> {

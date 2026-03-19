@@ -77,6 +77,12 @@ pub enum Value {
     Builtin {
         name: String,
     },
+    Continuation {
+        id: u64,
+        replay_expr: Box<Value>,
+        remaining_exprs: Vec<Value>,
+        env: Env,
+    },
     Void,
 }
 
@@ -89,6 +95,7 @@ impl PartialEq for Value {
             (Self::Symbol(a), Self::Symbol(b)) => a == b,
             (Self::List(a), Self::List(b)) => a == b,
             (Self::Builtin { name: a }, Self::Builtin { name: b }) => a == b,
+            (Self::Continuation { id: a, .. }, Self::Continuation { id: b, .. }) => a == b,
             (Self::Void, Self::Void) => true,
             _ => false,
         }
@@ -105,6 +112,7 @@ impl fmt::Debug for Value {
             Self::List(elems) => write!(f, "List({elems:?})"),
             Self::Lambda { params, .. } => write!(f, "Lambda({params:?})"),
             Self::Builtin { name } => write!(f, "Builtin({name:?})"),
+            Self::Continuation { id, .. } => write!(f, "Continuation({id})"),
             Self::Void => write!(f, "Void"),
         }
     }
@@ -119,7 +127,9 @@ impl fmt::Display for Value {
             Value::String(s) => write!(f, "\"{s}\""),
             Value::Symbol(s) => write!(f, "{s}"),
             Value::List(elems) => write_list(f, elems),
-            Value::Lambda { .. } | Value::Builtin { .. } => write!(f, "#<procedure>"),
+            Value::Lambda { .. } | Value::Builtin { .. } | Value::Continuation { .. } => {
+                write!(f, "#<procedure>")
+            }
             Value::Void => write!(f, ""),
         }
     }
