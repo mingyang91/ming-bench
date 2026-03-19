@@ -2,33 +2,50 @@ use super::eval;
 use crate::scheme::builtins::is_false;
 use crate::scheme::expr::{Env, Expr};
 
+pub fn parse_params_with_rest(elems: &[Expr]) -> Result<(Vec<String>, Option<String>), String> {
+    let dot_pos = elems.iter().position(|e| matches!(e, Expr::Symbol(s) if s == "."));
+    let Some(dp) = dot_pos else {
+        return collect_symbol_params(elems).map(|p| (p, None));
+    };
+    if dp + 2 != elems.len() {
+        return Err("invalid dot notation in parameters".into());
+    }
+    let fixed = collect_symbol_params(&elems[..dp])?;
+    let rest = match &elems[dp + 1] {
+        Expr::Symbol(r) => r.clone(),
+        _ => return Err("rest parameter must be a symbol".into()),
+    };
+    Ok((fixed, Some(rest)))
+}
+
+fn collect_symbol_params(elems: &[Expr]) -> Result<Vec<String>, String> {
+    elems
+        .iter()
+        .map(|e| match e {
+            Expr::Symbol(s) => Ok(s.clone()),
+            _ => Err("parameters must be symbols".into()),
+        })
+        .collect()
+}
+
 pub fn eval_lambda(args: &[Expr], env: &Env) -> Result<Expr, String> {
     if args.len() < 2 {
         return Err("lambda requires params and body".into());
     }
-    let params = match &args[0] {
-        Expr::List(elems) => {
-            let mut params = Vec::new();
-            for e in elems {
-                match e {
-                    Expr::Symbol(s) => params.push(s.clone()),
-                    _ => return Err("lambda params must be symbols".into()),
-                }
-            }
-            params
-        }
+    let (params, rest) = match &args[0] {
+        Expr::List(elems) => parse_params_with_rest(elems)?,
         _ => return Err("lambda requires a parameter list".into()),
     };
     let body = if args.len() == 2 {
         args[1].clone()
     } else {
-        // Implicit begin for multiple body expressions
         let mut begin_elems = vec![Expr::Symbol("begin".into())];
         begin_elems.extend_from_slice(&args[1..]);
         Expr::List(begin_elems)
     };
     Ok(Expr::Lambda {
         params,
+        rest,
         body: Box::new(body),
         env: env.clone(),
     })
@@ -62,13 +79,7 @@ pub fn eval_define(args: &[Expr], env: &Env) -> Result<Expr, String> {
                 Expr::Symbol(s) => s.clone(),
                 _ => return Err("define: function name must be a symbol".into()),
             };
-            let params: Vec<String> = elems[1..]
-                .iter()
-                .map(|e| match e {
-                    Expr::Symbol(s) => Ok(s.clone()),
-                    _ => Err("define: params must be symbols".to_string()),
-                })
-                .collect::<Result<_, String>>()?;
+            let (params, rest) = parse_params_with_rest(&elems[1..])?;
             let body = if args.len() == 2 {
                 args[1].clone()
             } else {
@@ -78,6 +89,7 @@ pub fn eval_define(args: &[Expr], env: &Env) -> Result<Expr, String> {
             };
             let lambda = Expr::Lambda {
                 params,
+                rest,
                 body: Box::new(body),
                 env: env.clone(),
             };

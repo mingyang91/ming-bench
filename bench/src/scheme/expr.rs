@@ -63,9 +63,11 @@ pub enum Expr {
     List(Vec<Expr>),
     Lambda {
         params: Vec<String>,
+        rest: Option<String>,
         body: Box<Expr>,
         env: Env,
     },
+    Builtin(String),
     Void,
 }
 
@@ -77,6 +79,7 @@ impl PartialEq for Expr {
             (Expr::Str(a), Expr::Str(b)) => a == b,
             (Expr::Symbol(a), Expr::Symbol(b)) => a == b,
             (Expr::List(a), Expr::List(b)) => a == b,
+            (Expr::Builtin(a), Expr::Builtin(b)) => a == b,
             (Expr::Void, Expr::Void) => true,
             _ => false,
         }
@@ -96,6 +99,7 @@ impl Expr {
                 format!("({})", inner.join(" "))
             }
             Expr::Lambda { .. } => "#<procedure>".into(),
+            Expr::Builtin(_) => "#<procedure>".into(),
             Expr::Void => "".into(),
         }
     }

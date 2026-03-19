@@ -4,6 +4,7 @@ mod forms;
 mod parser;
 mod trampoline;
 
+use builtins::BUILTIN_NAMES;
 use expr::{Env, Expr};
 use parser::Parser;
 use trampoline::{eval_step, Bounce};
@@ -18,6 +19,9 @@ pub fn eval_str(input: &str) -> Result<String, String> {
     }
 
     let env = Env::new();
+    for &name in BUILTIN_NAMES {
+        env.insert(name.to_string(), Expr::Builtin(name.to_string()));
+    }
     let mut result = Expr::Void;
     for expr in exprs {
         result = eval(&expr, &env)?;

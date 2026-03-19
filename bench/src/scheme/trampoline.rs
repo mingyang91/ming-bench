@@ -1,4 +1,4 @@
-use super::builtins::{eval_builtin, is_builtin, is_false};
+use super::builtins::{call_builtin_on_values, eval_builtin, is_builtin, is_false};
 use super::eval;
 use super::expr::{Env, Expr};
 use super::forms::{eval_cond, eval_define, eval_lambda, eval_quote, parse_let_binding};
@@ -16,7 +16,7 @@ pub fn eval_step(expr: &Expr, env: &Env) -> Result<Bounce, String> {
             .get(name)
             .map(Bounce::Done)
             .ok_or_else(|| format!("unbound variable: {name}")),
-        Expr::Lambda { .. } => Ok(Bounce::Done(expr.clone())),
+        Expr::Lambda { .. } | Expr::Builtin(_) => Ok(Bounce::Done(expr.clone())),
         Expr::List(elems) => eval_list_step(elems, env),
         _ => Err(format!("cannot evaluate: {}", expr.to_display())),
     }
@@ -111,15 +111,53 @@ fn bounce_let(args: &[Expr], env: &Env) -> Result<Bounce, String> {
 }
 
 pub fn apply_proc(proc: &Expr, args: &[Expr]) -> Result<Bounce, String> {
-    let Expr::Lambda { params, body, env: captured_env } = proc else {
-        return Err(format!("not a procedure: {}", proc.to_display()));
-    };
-    if args.len() != params.len() {
+    match proc {
+        Expr::Lambda { params, rest, body, env: captured_env } => {
+            apply_lambda(params, rest.as_deref(), body, captured_env, args)
+        }
+        Expr::Builtin(name) if name == "apply" => eval_apply_values(args),
+        Expr::Builtin(name) => {
+            let result = call_builtin_on_values(name, args.to_vec())?;
+            Ok(Bounce::Done(result))
+        }
+        _ => Err(format!("not a procedure: {}", proc.to_display())),
+    }
+}
+
+fn apply_lambda(
+    params: &[String],
+    rest: Option<&str>,
+    body: &Expr,
+    captured_env: &Env,
+    args: &[Expr],
+) -> Result<Bounce, String> {
+    if rest.is_some() {
+        if args.len() < params.len() {
+            return Err(format!("expected at least {} args, got {}", params.len(), args.len()));
+        }
+    } else if args.len() != params.len() {
         return Err(format!("expected {} arguments, got {}", params.len(), args.len()));
     }
     let call_env = captured_env.child();
     for (param, arg) in params.iter().zip(args.iter()) {
         call_env.insert(param.clone(), arg.clone());
     }
-    Ok(Bounce::TailCall { expr: *body.clone(), env: call_env })
+    if let Some(rest_name) = rest {
+        call_env.insert(rest_name.to_string(), Expr::List(args[params.len()..].to_vec()));
+    }
+    Ok(Bounce::TailCall { expr: body.clone(), env: call_env })
+}
+
+fn eval_apply_values(args: &[Expr]) -> Result<Bounce, String> {
+    if args.len() < 2 {
+        return Err("apply requires at least two arguments".into());
+    }
+    let proc = &args[0];
+    let last = &args[args.len() - 1];
+    let Expr::List(tail_args) = last else {
+        return Err(format!("apply: last argument must be a list, got {}", last.to_display()));
+    };
+    let mut all_args: Vec<Expr> = args[1..args.len() - 1].to_vec();
+    all_args.extend_from_slice(tail_args);
+    apply_proc(proc, &all_args)
 }
