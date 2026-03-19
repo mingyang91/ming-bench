@@ -8,22 +8,22 @@ Implement a Scheme interpreter in Rust.
 - You may create any additional modules/files under `src/scheme/`
 - Do NOT modify test functions
 - Allowed external crates: `thiserror`, `log`, `env_logger` (already in Cargo.toml). Do NOT add any others.
-- **NEVER run `cargo test` directly on the host.** Always use `./scripts/test-level.sh`. Bare `cargo test` risks infinite loops and OOM that crash the host. This rule has NO exceptions.
+- **NEVER run `cargo test` directly on the host.** Always use `cargo xtask test`. Bare `cargo test` risks infinite loops and OOM that crash the host. This rule has NO exceptions.
 
 ## Build & Test
 
-`test-level.sh` handles everything: release build and containerized test execution. Just run it.
+`cargo xtask test` handles everything: release build and containerized test execution. Just run it.
 
 ```bash
-./scripts/test-level.sh 01   # test level 1
-./scripts/test-level.sh 05   # test level 5
-./scripts/test-level.sh all  # test all levels (300s timeout)
+cargo xtask test 01   # test level 1
+cargo xtask test 05   # test level 5
+cargo xtask test all  # test all levels (300s timeout)
 ```
 
 - A level argument is required (e.g., `01`, `16`, or `all`)
 - Tests run in a container with 1GB memory, 1 CPU
 - Per-level timeout: 30s. Full suite (`all`): 300s. Exceeding these or OOM = failing
-- Build the container image first if not already built: `sudo podman build -t cs61a-bench -f Dockerfile.bench .`
+- Build the container image first if not already built: `cargo xtask setup`
 
 ## Development Strategy
 
