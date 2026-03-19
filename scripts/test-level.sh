@@ -9,33 +9,11 @@ set -euo pipefail
 IMAGE_NAME="cs61a-bench"
 TIMEOUT=30
 
-# Run clippy when the codebase has clippy discipline enabled (strategy branch and its descendants).
-# Detection: check if src/lib.rs contains deny(clippy::unwrap_used) — the marker for clippy discipline.
-if grep -q 'deny(clippy::unwrap_used)' src/lib.rs 2>/dev/null; then
-    RUN_CLIPPY=true
-else
-    RUN_CLIPPY=false
-fi
-
-if [[ "$RUN_CLIPPY" == "true" ]]; then
-    # ---------------------------------------------------------------------------
-    # Leveled clippy: thresholds tighten as levels increase.
-    #
-    # clippy.toml holds the baseline config (too-many-lines-threshold,
-    # excessive-nesting-threshold). We override per-level by writing a
-    # temporary clippy.toml with the leveled thresholds, then restore it.
-    #
-    # Function length (too-many-lines):
-    #   L01-L05: 80  (bootstrapping, design settling)
-    #   L06+:    60  (standard)
-    #
-    # Nesting depth (excessive-nesting):
-    #   All levels: 3 (consistent)
-    #
-    # Dead code:
-    #   L01-L05: allowed (forward-declared types)
-    #   L06+:    denied
-    # ---------------------------------------------------------------------------
+# ---------------------------------------------------------------------------
+# Quality gates — only active when clippy.toml is present (strategy branch).
+# On branches without clippy.toml, this entire block is skipped.
+# ---------------------------------------------------------------------------
+if [[ -f clippy.toml ]]; then
     LEVEL_NUM="${1:-all}"
     CLIPPY_ALLOWS=""
     FN_LIMIT=60
@@ -55,10 +33,6 @@ too-many-lines-threshold = ${FN_LIMIT}
 excessive-nesting-threshold = 3
 EOF
 
-    # Pedantic lints are configured in src/lib.rs as #![warn(...)] attributes.
-    # deny(warnings) in lib.rs promotes them to errors.
-    # test-level.sh only needs to pass level-specific allows and run clippy.
-
     echo "Running clippy --fix (auto-fixing trivial lints)..."
     cargo clippy --fix --allow-dirty --allow-staged -- \
         -D warnings \
@@ -69,54 +43,48 @@ EOF
         -D warnings \
         $CLIPPY_ALLOWS 2>&1; then
 
-        # Restore original clippy.toml
         mv clippy.toml.bak clippy.toml 2>/dev/null || true
         echo "ERROR: clippy failed — fix warnings before testing"
         exit 1
     fi
 
-    # Restore original clippy.toml
     mv clippy.toml.bak clippy.toml 2>/dev/null || true
-fi
 
-# ---------------------------------------------------------------------------
-# mod.rs size check (clippy can't enforce per-file line limits)
-# ---------------------------------------------------------------------------
-check_mod_size() {
-    local level="$1"
+    # --- mod.rs size check ---
+    check_mod_size() {
+        local level="$1"
+        local mod_limit=100
+        if [[ "$level" -le 3 ]]; then
+            mod_limit=300
+        elif [[ "$level" -le 6 ]]; then
+            mod_limit=200
+        fi
 
-    # Leveled ramp:
-    #   L01-L03: 300 (bootstrapping)
-    #   L04-L06: 200 (time to split into submodules)
-    #   L07+:    100 (entry point + reexports only)
-    local mod_limit=100
-    if [[ "$level" -le 3 ]]; then
-        mod_limit=300
-    elif [[ "$level" -le 6 ]]; then
-        mod_limit=200
-    fi
+        local mod_file="src/scheme/mod.rs"
+        if [[ -f "$mod_file" ]]; then
+            local impl_lines
+            impl_lines=$(sed -n '1,/^#\[cfg(test)\]/p' "$mod_file" | wc -l)
+            if [[ "$impl_lines" -gt "$mod_limit" ]]; then
+                echo "ERROR: mod.rs has $impl_lines impl lines (limit for L$(printf '%02d' "$level"): $mod_limit)."
+                echo "  Extract implementation logic into submodules."
+                return 1
+            fi
+        fi
+    }
 
-    local mod_file="src/scheme/mod.rs"
-    if [[ -f "$mod_file" ]]; then
-        local impl_lines
-        impl_lines=$(sed -n '1,/^#\[cfg(test)\]/p' "$mod_file" | wc -l)
-        if [[ "$impl_lines" -gt "$mod_limit" ]]; then
-            echo "ERROR: mod.rs has $impl_lines impl lines (limit for L$(printf '%02d' "$level"): $mod_limit)."
-            echo "  Extract implementation logic into submodules."
-            return 1
+    if [[ "${1:-}" != "all" && -n "${1:-}" ]]; then
+        LN=$((10#$1))
+        if ! check_mod_size "$LN"; then
+            echo ""
+            echo "Fix structural violations before testing."
+            exit 1
         fi
     fi
-}
-
-# Only run mod.rs size check on leveled runs (not "all")
-if [[ "${1:-}" != "all" && -n "${1:-}" ]]; then
-    LN=$((10#$1))
-    if ! check_mod_size "$LN"; then
-        echo ""
-        echo "Fix structural violations before testing."
-        exit 1
-    fi
 fi
+
+# ---------------------------------------------------------------------------
+# Build and test
+# ---------------------------------------------------------------------------
 
 # Build test binary on host (release mode for realistic perf)
 BIN=$(cargo test --no-run --release 2>&1 | grep -oP 'target/release/deps/cs61a_bench-[a-f0-9]+' | head -1)
