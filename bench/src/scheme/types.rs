@@ -1,13 +1,94 @@
+use std::cell::RefCell;
+use std::collections::HashMap;
 use std::fmt;
+use std::rc::Rc;
 
-#[derive(Debug, Clone, PartialEq)]
+// ── Environment ──────────────────────────────────────────────────────
+
+struct EnvFrame {
+    bindings: HashMap<String, Value>,
+    parent: Option<Env>,
+}
+
+/// Lexically-scoped environment built from linked frames.
+#[derive(Clone)]
+pub struct Env(Rc<RefCell<EnvFrame>>);
+
+impl Env {
+    pub fn new() -> Self {
+        Self(Rc::new(RefCell::new(EnvFrame {
+            bindings: HashMap::new(),
+            parent: None,
+        })))
+    }
+
+    /// Create a child frame whose parent is `self`.
+    pub fn child(&self) -> Self {
+        Self(Rc::new(RefCell::new(EnvFrame {
+            bindings: HashMap::new(),
+            parent: Some(self.clone()),
+        })))
+    }
+
+    pub fn get(&self, name: &str) -> Option<Value> {
+        let frame = self.0.borrow();
+        if let Some(val) = frame.bindings.get(name) {
+            Some(val.clone())
+        } else if let Some(ref parent) = frame.parent {
+            parent.get(name)
+        } else {
+            None
+        }
+    }
+
+    pub fn set(&self, name: String, val: Value) {
+        self.0.borrow_mut().bindings.insert(name, val);
+    }
+}
+
+// ── Value ────────────────────────────────────────────────────────────
+
+#[derive(Clone)]
 pub enum Value {
     Integer(i64),
     Boolean(bool),
     String(String),
     Symbol(String),
     List(Vec<Value>),
+    Lambda {
+        params: Vec<String>,
+        body: Box<Value>,
+        env: Env,
+    },
     Void,
+}
+
+impl PartialEq for Value {
+    fn eq(&self, other: &Self) -> bool {
+        match (self, other) {
+            (Self::Integer(a), Self::Integer(b)) => a == b,
+            (Self::Boolean(a), Self::Boolean(b)) => a == b,
+            (Self::String(a), Self::String(b)) => a == b,
+            (Self::Symbol(a), Self::Symbol(b)) => a == b,
+            (Self::List(a), Self::List(b)) => a == b,
+            (Self::Void, Self::Void) => true,
+            _ => false,
+        }
+    }
+}
+
+impl fmt::Debug for Value {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Integer(n) => write!(f, "Integer({n})"),
+            Self::Boolean(b) => write!(f, "Boolean({b})"),
+            Self::String(s) => write!(f, "String({s:?})"),
+            Self::Symbol(s) => write!(f, "Symbol({s:?})"),
+            Self::List(elems) => write!(f, "List({elems:?})"),
+            Self::Lambda { params, .. } => write!(f, "Lambda({params:?})"),
+            Self::Void => write!(f, "Void"),
+        }
+    }
 }
 
 impl fmt::Display for Value {
@@ -19,6 +100,7 @@ impl fmt::Display for Value {
             Value::String(s) => write!(f, "\"{s}\""),
             Value::Symbol(s) => write!(f, "{s}"),
             Value::List(elems) => write_list(f, elems),
+            Value::Lambda { .. } => write!(f, "#<procedure>"),
             Value::Void => write!(f, ""),
         }
     }
