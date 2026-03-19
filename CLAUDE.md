@@ -4,7 +4,7 @@ This is the benchmark framework that orchestrates coding agent evaluation. The a
 
 ## Architecture
 
-- **`bench/`** — Agent playground. Contains the Scheme interpreter crate, test suite, and agent-facing `CLAUDE.md`. Agents only see this directory.
+- **`bench/`** — Agent playground. Contains `SPEC.md` (task definition), `strategies/` (instruction variants), and the interpreter crate. Agents only see this directory.
 - **`xtask/`** — CLI tooling for orchestration, scoring, token analysis, and monitoring.
 - **`Dockerfile.bench`** — Container image for sandboxed test execution.
 - **`results/`** — Run data (gitignored). Each run gets a timestamped directory.
@@ -32,12 +32,16 @@ cargo xtask verify           # ground-truth check against Guile
 
 Shared types and helpers live in `xtask/src/model.rs`.
 
-## Two-Branch Experiment
+## Strategy System
 
-- **`main`** — Minimal agent instructions in `bench/CLAUDE.md`
-- **`strategy`** — Enhanced instructions with quality gates and code style rules
+Strategies live in `bench/strategies/`. Each is a `.md` file that becomes the agent's `CLAUDE.md` at launch via symlink.
 
-Only `bench/CLAUDE.md` differs between branches. Framework code (xtask, Dockerfile) is identical. When making framework changes, commit to one branch and cherry-pick to the other.
+- **`default.md`** — Minimal: build the interpreter, test each level
+- **`quality-gate.md`** — Adds: clippy enforcement, mod.rs size limits, code style rules
+
+`bench/SPEC.md` is the shared task spec (identical for all strategies). `bench/CLAUDE.md` and `bench/AGENTS.md` are gitignored — created as symlinks by `run-agent --strategy <name>`.
+
+To add a new strategy: create `bench/strategies/<name>.md` and use `--strategy <name>`.
 
 ## Key Conventions
 

@@ -60,8 +60,11 @@ enum Commands {
     /// Run an agent on the benchmark
     RunAgent {
         /// Base branch to fork from
-        #[arg(long)]
+        #[arg(long, default_value = "main")]
         base: String,
+        /// Strategy file name (default, quality-gate)
+        #[arg(long, default_value = "default")]
+        strategy: String,
         /// Unique run name
         #[arg(long)]
         name: String,
@@ -119,6 +122,7 @@ fn main() {
         } => cmd::bench::run(branch, run_id.as_deref()),
         Commands::RunAgent {
             base,
+            strategy,
             name,
             prompt,
             model,
@@ -131,6 +135,7 @@ fn main() {
             clean,
         } => cmd::run_agent::run(cmd::run_agent::RunAgentArgs {
             base,
+            strategy,
             name,
             prompt,
             model,

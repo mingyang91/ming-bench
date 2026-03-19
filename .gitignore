@@ -5,3 +5,5 @@ Cargo.lock
 .DS_Store
 results/
 !results/.gitkeep
+bench/CLAUDE.md
+bench/AGENTS.md
