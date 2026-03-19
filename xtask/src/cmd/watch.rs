@@ -1,6 +1,6 @@
 use crate::model::{
-    colored, discover_runs, elapsed_secs, fmt_duration, fmt_size, now_epoch,
-    parse_iso_epoch, project_results_dir, score_display, Color, Error, MetaJson, Result,
+    colored, discover_runs, elapsed_secs, fmt_duration, fmt_size, now_epoch, parse_iso_epoch,
+    project_results_dir, score_display, Color, Error, MetaJson, Result,
 };
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -45,7 +45,10 @@ pub fn run(once: bool, ts: Option<String>, all: bool) -> Result<()> {
             let now = chrono_hms();
             println!(
                 "{}Agent Monitor{}  {}  (refresh {}s, Ctrl-C to quit)\n",
-                Color::BOLD, Color::RESET, now, REFRESH_SECS,
+                Color::BOLD,
+                Color::RESET,
+                now,
+                REFRESH_SECS,
             );
             render(ts.as_deref(), all)?;
             thread::sleep(Duration::from_secs(REFRESH_SECS));
@@ -84,7 +87,7 @@ fn render(ts_filter: Option<&str>, show_all: bool) -> Result<()> {
 
     // Header
     println!(
-        "{}{:<28}  {:<9}  {:<8}  {:<10}  {:<8}  {:<8}  {}{}",
+        "{}{:<28}  {:<9}  {:<8}  {:<10}  {:<8}  {:<8}  DETAIL{}",
         Color::BOLD,
         "NAME",
         "STATUS",
@@ -92,7 +95,6 @@ fn render(ts_filter: Option<&str>, show_all: bool) -> Result<()> {
         "IDLE",
         "ELAPSED",
         "OUTPUT",
-        "DETAIL",
         Color::RESET,
     );
     println!("{}", "─".repeat(100));
@@ -112,10 +114,7 @@ fn render(ts_filter: Option<&str>, show_all: bool) -> Result<()> {
             }
         }
 
-        let name = meta
-            .name
-            .as_deref()
-            .unwrap_or(&dirname);
+        let name = meta.name.as_deref().unwrap_or(&dirname);
         let agent = meta.agent.as_deref().unwrap_or("?");
         let mode = meta.mode.as_deref().unwrap_or("?");
 
@@ -251,12 +250,7 @@ fn level_progress(run_dir: &Path) -> String {
 
     let mut level_dirs: Vec<PathBuf> = entries
         .flatten()
-        .filter(|e| {
-            e.file_name()
-                .to_string_lossy()
-                .starts_with('L')
-                && e.path().is_dir()
-        })
+        .filter(|e| e.file_name().to_string_lossy().starts_with('L') && e.path().is_dir())
         .map(|e| e.path())
         .collect();
     level_dirs.sort();
@@ -299,7 +293,7 @@ fn find_latest_output(run_dir: &Path, mode: &str) -> Option<PathBuf> {
     let mut check = |path: PathBuf| {
         if path.is_file() {
             let mt = file_mtime(&path);
-            if best.as_ref().map_or(true, |(_, prev)| mt > *prev) {
+            if best.as_ref().is_none_or(|(_, prev)| mt > *prev) {
                 best = Some((path, mt));
             }
         }
@@ -432,7 +426,9 @@ fn find_live_session(name: &str, meta: &MetaJson) -> Option<PathBuf> {
     if let Some(ws) = workspace_dir {
         if let Ok(real) = fs::canonicalize(&ws) {
             let proj_dir_name = derive_claude_project_name(&real);
-            let proj_dir = PathBuf::from(&home).join(".claude/projects").join(&proj_dir_name);
+            let proj_dir = PathBuf::from(&home)
+                .join(".claude/projects")
+                .join(&proj_dir_name);
             if proj_dir.is_dir() {
                 if let Some(live) = newest_jsonl(&proj_dir) {
                     return Some(live);
@@ -481,7 +477,7 @@ fn newest_jsonl(dir: &Path) -> Option<PathBuf> {
         let path = entry.path();
         if path.extension().and_then(|e| e.to_str()) == Some("jsonl") {
             let mt = file_mtime(&path);
-            if best.as_ref().map_or(true, |(_, prev)| mt > *prev) {
+            if best.as_ref().is_none_or(|(_, prev)| mt > *prev) {
                 best = Some((path, mt));
             }
         }

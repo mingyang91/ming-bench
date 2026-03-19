@@ -31,9 +31,7 @@ fn test_l05_closure() {
 #[test]
 fn test_l05_higher_order() {
     assert_eq!(
-        eval_str(
-            "(define (apply-twice f x) (f (f x))) (apply-twice (lambda (x) (+ x 1)) 0)"
-        ),
+        eval_str("(define (apply-twice f x) (f (f x))) (apply-twice (lambda (x) (+ x 1)) 0)"),
         Ok("2".into())
     );
 }
@@ -41,9 +39,7 @@ fn test_l05_higher_order() {
 #[test]
 fn test_l05_factorial() {
     assert_eq!(
-        eval_str(
-            "(define (fact n) (if (= n 0) 1 (* n (fact (- n 1))))) (fact 5)"
-        ),
+        eval_str("(define (fact n) (if (= n 0) 1 (* n (fact (- n 1))))) (fact 5)"),
         Ok("120".into())
     );
 }
@@ -51,9 +47,7 @@ fn test_l05_factorial() {
 #[test]
 fn test_l05_fibonacci() {
     assert_eq!(
-        eval_str(
-            "(define (fib n) (if (< n 2) n (+ (fib (- n 1)) (fib (- n 2))))) (fib 10)"
-        ),
+        eval_str("(define (fib n) (if (< n 2) n (+ (fib (- n 1)) (fib (- n 2))))) (fib 10)"),
         Ok("55".into())
     );
 }

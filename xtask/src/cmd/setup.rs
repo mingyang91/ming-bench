@@ -22,8 +22,13 @@ pub fn run() -> Result<()> {
     let exit = run_cmd(
         "sudo",
         &[
-            "podman", "build", "-t", "cs61a-bench",
-            "-f", "Dockerfile.bench", ".",
+            "podman",
+            "build",
+            "-t",
+            "cs61a-bench",
+            "-f",
+            "Dockerfile.bench",
+            ".",
         ],
         &proj,
     )?;

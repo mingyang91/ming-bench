@@ -1,6 +1,6 @@
 use crate::model::{
-    discover_runs, fmt_comma, project_results_dir, Error, Result, TokenUsage,
-    PRICE_CACHE_READ, PRICE_CACHE_WRITE, PRICE_INPUT, PRICE_OUTPUT,
+    discover_runs, fmt_comma, project_results_dir, Error, Result, TokenUsage, PRICE_CACHE_READ,
+    PRICE_CACHE_WRITE, PRICE_INPUT, PRICE_OUTPUT,
 };
 use std::collections::{HashMap, HashSet};
 use std::fs;
@@ -53,11 +53,16 @@ impl RequestMetrics {
         self.usage_rows += 1;
 
         if self.timestamp.is_none() {
-            self.timestamp = entry.get("timestamp").and_then(|t| t.as_str()).map(|s| s.to_string());
+            self.timestamp = entry
+                .get("timestamp")
+                .and_then(|t| t.as_str())
+                .map(|s| s.to_string());
         }
 
         let message = entry.get("message").and_then(|m| m.as_object());
-        let stop_reason = message.and_then(|m| m.get("stop_reason")).and_then(|s| s.as_str());
+        let stop_reason = message
+            .and_then(|m| m.get("stop_reason"))
+            .and_then(|s| s.as_str());
         let content = message
             .and_then(|m| m.get("content"))
             .and_then(|c| c.as_array());
@@ -74,7 +79,10 @@ impl RequestMetrics {
                     Some(o) => o,
                     None => continue,
                 };
-                let content_type = item.get("type").and_then(|t| t.as_str()).unwrap_or("unknown");
+                let content_type = item
+                    .get("type")
+                    .and_then(|t| t.as_str())
+                    .unwrap_or("unknown");
                 content_items += 1;
 
                 match content_type {
@@ -91,11 +99,19 @@ impl RequestMetrics {
                     }
                     "text" => {
                         text_items += 1;
-                        text_chars += item.get("text").and_then(|t| t.as_str()).map(|s| s.len()).unwrap_or(0);
+                        text_chars += item
+                            .get("text")
+                            .and_then(|t| t.as_str())
+                            .map(|s| s.len())
+                            .unwrap_or(0);
                     }
                     "thinking" => {
                         thinking_items += 1;
-                        thinking_chars += item.get("thinking").and_then(|t| t.as_str()).map(|s| s.len()).unwrap_or(0);
+                        thinking_chars += item
+                            .get("thinking")
+                            .and_then(|t| t.as_str())
+                            .map(|s| s.len())
+                            .unwrap_or(0);
                     }
                     _ => {}
                 }
@@ -110,9 +126,9 @@ impl RequestMetrics {
         self.content_items = self.content_items.max(content_items);
 
         // Snapshot replacement: keep the usage with highest output_tokens
-        let replace = if self.usage_rows == 1 {
-            true
-        } else if usage.output_tokens > self.usage.output_tokens {
+        let replace = if self.usage_rows == 1
+            || usage.output_tokens > self.usage.output_tokens
+        {
             true
         } else if usage.output_tokens == self.usage.output_tokens {
             (self.stop_reason.is_none() && stop_reason.is_some())
@@ -268,10 +284,7 @@ fn build_run_summary(results_dir: &Path) -> Result<RunSummary> {
     })
 }
 
-fn parse_session(
-    jsonl_path: &Path,
-    session_label: &str,
-) -> Result<(Vec<RequestMetrics>, u32)> {
+fn parse_session(jsonl_path: &Path, session_label: &str) -> Result<(Vec<RequestMetrics>, u32)> {
     let content = fs::read_to_string(jsonl_path).map_err(|e| Error::io(jsonl_path, e))?;
     let mut per_request: HashMap<String, RequestMetrics> = HashMap::new();
     let mut usage_rows: u32 = 0;
@@ -305,16 +318,13 @@ fn parse_session(
 
 fn extract_usage(entry: &serde_json::Value) -> Option<(String, TokenUsage)> {
     // Find usage: try top-level, then message.usage
-    let usage_obj = entry
-        .get("usage")
-        .and_then(|u| u.as_object())
-        .or_else(|| {
-            entry
-                .get("message")
-                .and_then(|m| m.as_object())
-                .and_then(|m| m.get("usage"))
-                .and_then(|u| u.as_object())
-        })?;
+    let usage_obj = entry.get("usage").and_then(|u| u.as_object()).or_else(|| {
+        entry
+            .get("message")
+            .and_then(|m| m.as_object())
+            .and_then(|m| m.get("usage"))
+            .and_then(|u| u.as_object())
+    })?;
 
     // Find request key: requestId || message.id || uuid
     let request_key = entry
@@ -330,10 +340,22 @@ fn extract_usage(entry: &serde_json::Value) -> Option<(String, TokenUsage)> {
         .or_else(|| entry.get("uuid").and_then(|u| u.as_str()))?;
 
     let usage = TokenUsage {
-        input_tokens: usage_obj.get("input_tokens").and_then(|v| v.as_u64()).unwrap_or(0),
-        output_tokens: usage_obj.get("output_tokens").and_then(|v| v.as_u64()).unwrap_or(0),
-        cache_creation_input_tokens: usage_obj.get("cache_creation_input_tokens").and_then(|v| v.as_u64()).unwrap_or(0),
-        cache_read_input_tokens: usage_obj.get("cache_read_input_tokens").and_then(|v| v.as_u64()).unwrap_or(0),
+        input_tokens: usage_obj
+            .get("input_tokens")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(0),
+        output_tokens: usage_obj
+            .get("output_tokens")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(0),
+        cache_creation_input_tokens: usage_obj
+            .get("cache_creation_input_tokens")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(0),
+        cache_read_input_tokens: usage_obj
+            .get("cache_read_input_tokens")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(0),
     };
 
     Some((request_key.to_string(), usage))
@@ -384,7 +406,10 @@ fn print_run_summary(summary: &RunSummary) {
     }
     let mut stop_sorted: Vec<_> = stop_counts.into_iter().collect();
     stop_sorted.sort_by(|a, b| b.1.cmp(&a.1));
-    let stop_str: Vec<String> = stop_sorted.iter().map(|(k, v)| format!("{k}={v}")).collect();
+    let stop_str: Vec<String> = stop_sorted
+        .iter()
+        .map(|(k, v)| format!("{k}={v}"))
+        .collect();
     println!("Stop reasons: {}", stop_str.join(", "));
 
     // Tool mix
@@ -396,8 +421,18 @@ fn print_run_summary(summary: &RunSummary) {
     }
     let mut tool_sorted: Vec<_> = tool_counts.into_iter().collect();
     tool_sorted.sort_by(|a, b| b.1.cmp(&a.1));
-    let tool_str: Vec<String> = tool_sorted.iter().map(|(k, v)| format!("{k}={v}")).collect();
-    println!("Tool mix: {}", if tool_str.is_empty() { "none".to_string() } else { tool_str.join(", ") });
+    let tool_str: Vec<String> = tool_sorted
+        .iter()
+        .map(|(k, v)| format!("{k}={v}"))
+        .collect();
+    println!(
+        "Tool mix: {}",
+        if tool_str.is_empty() {
+            "none".to_string()
+        } else {
+            tool_str.join(", ")
+        }
+    );
 
     // Turn shape
     let no_tool = requests.iter().filter(|r| r.tool_count() == 0).count();
@@ -409,12 +444,23 @@ fn print_run_summary(summary: &RunSummary) {
     );
 
     // Output buckets
-    let small = requests.iter().filter(|r| r.usage.output_tokens <= 300).count();
-    let medium = requests.iter().filter(|r| (301..=2000).contains(&r.usage.output_tokens)).count();
-    let large = requests.iter().filter(|r| r.usage.output_tokens > 2000).count();
+    let small = requests
+        .iter()
+        .filter(|r| r.usage.output_tokens <= 300)
+        .count();
+    let medium = requests
+        .iter()
+        .filter(|r| (301..=2000).contains(&r.usage.output_tokens))
+        .count();
+    let large = requests
+        .iter()
+        .filter(|r| r.usage.output_tokens > 2000)
+        .count();
     println!(
         "Output buckets: <=300={small} ({}), 301-2000={medium} ({}), >2000={large} ({})",
-        pct(small, n), pct(medium, n), pct(large, n),
+        pct(small, n),
+        pct(medium, n),
+        pct(large, n),
     );
 
     // Text/thinking stats
@@ -443,13 +489,15 @@ fn print_run_summary(summary: &RunSummary) {
     }
 
     // Top requests
-    print_top_requests("Top cache-read requests:", requests, |r| r.usage.cache_read_input_tokens);
+    print_top_requests("Top cache-read requests:", requests, |r| {
+        r.usage.cache_read_input_tokens
+    });
     print_top_requests("Top output requests:", requests, |r| r.usage.output_tokens);
 }
 
 fn print_top_requests(title: &str, requests: &[RequestMetrics], key: fn(&RequestMetrics) -> u64) {
     let mut ranked: Vec<&RequestMetrics> = requests.iter().filter(|r| key(r) > 0).collect();
-    ranked.sort_by(|a, b| key(b).cmp(&key(a)));
+    ranked.sort_by_key(|r| std::cmp::Reverse(key(r)));
     ranked.truncate(3);
 
     if ranked.is_empty() {
@@ -487,7 +535,10 @@ fn likely_drivers(summary: &RunSummary) -> Vec<String> {
     let cache_read_cost = cost_parts[3].1;
 
     let single_tool = requests.iter().filter(|r| r.tool_count() == 1).count();
-    let small_output = requests.iter().filter(|r| r.usage.output_tokens <= 300).count();
+    let small_output = requests
+        .iter()
+        .filter(|r| r.usage.output_tokens <= 300)
+        .count();
     let text_reqs = requests.iter().filter(|r| r.text_items > 0).count();
     let text_chars: usize = requests.iter().map(|r| r.text_chars).sum();
     let max_token_reqs: Vec<&RequestMetrics> = requests
@@ -558,16 +609,39 @@ fn print_comparison(left: &RunSummary, right: &RunSummary) {
     let rn = right.billed_requests().max(1) as f64;
 
     let rows: Vec<(&str, f64, f64, &str)> = vec![
-        ("Requests", left.billed_requests() as f64, right.billed_requests() as f64, "count"),
+        (
+            "Requests",
+            left.billed_requests() as f64,
+            right.billed_requests() as f64,
+            "count",
+        ),
         ("Total cost", left_cost, right_cost, "money"),
-        ("Cache read tokens", left.totals.cache_read_input_tokens as f64, right.totals.cache_read_input_tokens as f64, "count"),
+        (
+            "Cache read tokens",
+            left.totals.cache_read_input_tokens as f64,
+            right.totals.cache_read_input_tokens as f64,
+            "count",
+        ),
         (
             "Cache read cost share",
-            if left_cost > 0.0 { left_parts[3].1 / left_cost } else { 0.0 },
-            if right_cost > 0.0 { right_parts[3].1 / right_cost } else { 0.0 },
+            if left_cost > 0.0 {
+                left_parts[3].1 / left_cost
+            } else {
+                0.0
+            },
+            if right_cost > 0.0 {
+                right_parts[3].1 / right_cost
+            } else {
+                0.0
+            },
             "ratio",
         ),
-        ("Avg cache read/request", left.totals.cache_read_input_tokens as f64 / ln, right.totals.cache_read_input_tokens as f64 / rn, "count"),
+        (
+            "Avg cache read/request",
+            left.totals.cache_read_input_tokens as f64 / ln,
+            right.totals.cache_read_input_tokens as f64 / rn,
+            "count",
+        ),
         (
             "Avg tools/request",
             left.requests.iter().map(|r| r.tool_count()).sum::<usize>() as f64 / ln,
@@ -577,13 +651,27 @@ fn print_comparison(left: &RunSummary, right: &RunSummary) {
         (
             "Single-tool ratio",
             left.requests.iter().filter(|r| r.tool_count() == 1).count() as f64 / ln,
-            right.requests.iter().filter(|r| r.tool_count() == 1).count() as f64 / rn,
+            right
+                .requests
+                .iter()
+                .filter(|r| r.tool_count() == 1)
+                .count() as f64
+                / rn,
             "ratio",
         ),
         (
             "Small-output ratio",
-            left.requests.iter().filter(|r| r.usage.output_tokens <= 300).count() as f64 / ln,
-            right.requests.iter().filter(|r| r.usage.output_tokens <= 300).count() as f64 / rn,
+            left.requests
+                .iter()
+                .filter(|r| r.usage.output_tokens <= 300)
+                .count() as f64
+                / ln,
+            right
+                .requests
+                .iter()
+                .filter(|r| r.usage.output_tokens <= 300)
+                .count() as f64
+                / rn,
             "ratio",
         ),
         (
@@ -594,8 +682,15 @@ fn print_comparison(left: &RunSummary, right: &RunSummary) {
         ),
         (
             "Max-tokens requests",
-            left.requests.iter().filter(|r| r.stop_reason.as_deref() == Some("max_tokens")).count() as f64,
-            right.requests.iter().filter(|r| r.stop_reason.as_deref() == Some("max_tokens")).count() as f64,
+            left.requests
+                .iter()
+                .filter(|r| r.stop_reason.as_deref() == Some("max_tokens"))
+                .count() as f64,
+            right
+                .requests
+                .iter()
+                .filter(|r| r.stop_reason.as_deref() == Some("max_tokens"))
+                .count() as f64,
             "count",
         ),
     ];
@@ -604,7 +699,10 @@ fn print_comparison(left: &RunSummary, right: &RunSummary) {
     println!("\n{sep}");
     println!("  Comparison: {} vs {}", right.name, left.name);
     println!("{sep}");
-    println!("{:<24} {:>18} {:>18} {:>18}", "Metric", left.name, right.name, "Diff");
+    println!(
+        "{:<24} {:>18} {:>18} {:>18}",
+        "Metric", left.name, right.name, "Diff"
+    );
     println!("{}", "-".repeat(96));
 
     for (label, lv, rv, kind) in &rows {
@@ -613,24 +711,56 @@ fn print_comparison(left: &RunSummary, right: &RunSummary) {
         let diff = rv - lv;
         match *kind {
             "money" => {
-                let pct_diff = if lv > 0.0 { format!(" ({:+.1}%)", diff / lv * 100.0) } else { String::new() };
-                println!("{:<24} {:>17}$ {:>17}$ {:>17}",
-                    label, format!("{lv:.2}"), format!("{rv:.2}"), format!("{diff:+.2}{pct_diff}"));
+                let pct_diff = if lv > 0.0 {
+                    format!(" ({:+.1}%)", diff / lv * 100.0)
+                } else {
+                    String::new()
+                };
+                println!(
+                    "{:<24} {:>17}$ {:>17}$ {:>17}",
+                    label,
+                    format!("{lv:.2}"),
+                    format!("{rv:.2}"),
+                    format!("{diff:+.2}{pct_diff}")
+                );
             }
             "ratio" => {
                 let pp = (rv - lv) * 100.0;
-                println!("{:<24} {:>17}% {:>17}% {:>17}",
-                    label, format!("{:.1}", lv * 100.0), format!("{:.1}", rv * 100.0), format!("{pp:+.1}pp"));
+                println!(
+                    "{:<24} {:>17}% {:>17}% {:>17}",
+                    label,
+                    format!("{:.1}", lv * 100.0),
+                    format!("{:.1}", rv * 100.0),
+                    format!("{pp:+.1}pp")
+                );
             }
             "float" => {
-                let pct_diff = if lv > 0.0 { format!(" ({:+.1}%)", diff / lv * 100.0) } else { String::new() };
-                println!("{:<24} {:>18.2} {:>18.2} {:>17}",
-                    label, lv, rv, format!("{diff:+.2}{pct_diff}"));
+                let pct_diff = if lv > 0.0 {
+                    format!(" ({:+.1}%)", diff / lv * 100.0)
+                } else {
+                    String::new()
+                };
+                println!(
+                    "{:<24} {:>18.2} {:>18.2} {:>17}",
+                    label,
+                    lv,
+                    rv,
+                    format!("{diff:+.2}{pct_diff}")
+                );
             }
             _ => {
-                let pct_diff = if lv > 0.0 { format!(" ({:+.1}%)", diff / lv * 100.0) } else { String::new() };
-                println!("{:<24} {:>18} {:>18} {:>17}",
-                    label, fmt_comma(lv as u64), fmt_comma(rv as u64), format!("{:+}{pct_diff}", diff as i64));
+                let pct_diff = if lv > 0.0 {
+                    format!(" ({:+.1}%)", diff / lv * 100.0)
+                } else {
+                    String::new()
+                };
+                println!(
+                    "{:<24} {:>18} {:>18} {:>17}",
+                    label,
+                    fmt_comma(lv as u64),
+                    fmt_comma(rv as u64),
+                    format!("{:+}{pct_diff}", diff as i64)
+                );
             }
         }
     }
@@ -644,8 +774,14 @@ fn cost_breakdown(t: &TokenUsage) -> Vec<(&'static str, f64)> {
     vec![
         ("input", t.input_tokens as f64 * PRICE_INPUT),
         ("output", t.output_tokens as f64 * PRICE_OUTPUT),
-        ("cache_write", t.cache_creation_input_tokens as f64 * PRICE_CACHE_WRITE),
-        ("cache_read", t.cache_read_input_tokens as f64 * PRICE_CACHE_READ),
+        (
+            "cache_write",
+            t.cache_creation_input_tokens as f64 * PRICE_CACHE_WRITE,
+        ),
+        (
+            "cache_read",
+            t.cache_read_input_tokens as f64 * PRICE_CACHE_READ,
+        ),
     ]
 }
 

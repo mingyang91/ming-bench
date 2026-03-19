@@ -5,9 +5,7 @@ use crate::scheme::eval_str;
 #[test]
 fn test_l10_tco_loop() {
     assert_eq!(
-        eval_str(
-            "(define (loop n) (if (= n 0) (quote done) (loop (- n 1)))) (loop 1000000)"
-        ),
+        eval_str("(define (loop n) (if (= n 0) (quote done) (loop (- n 1)))) (loop 1000000)"),
         Ok("done".into())
     );
 }

@@ -1,6 +1,6 @@
 use crate::model::{
-    compact_timestamp, iso_now, project_dir, run_cmd, run_cmd_capture,
-    uuid_v4, write_meta, Error, Result, LEVELS,
+    compact_timestamp, iso_now, project_dir, run_cmd, run_cmd_capture, uuid_v4, write_meta, Error,
+    Result, LEVELS,
 };
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -41,14 +41,18 @@ pub fn run(args: RunAgentArgs) -> Result<()> {
 
     // Default non-Claude agents to levels mode
     let mode = if args.agent != "claude" && args.mode == "full" {
-        println!("NOTE: Defaulting to --mode levels for {} (override with explicit --mode full)", args.agent);
+        println!(
+            "NOTE: Defaulting to --mode levels for {} (override with explicit --mode full)",
+            args.agent
+        );
         "levels".to_string()
     } else {
         args.mode.clone()
     };
 
     // --- Worktree path ---
-    let worktree_dir = proj.parent()
+    let worktree_dir = proj
+        .parent()
         .expect("project has no parent dir")
         .join("workspace")
         .join(&args.name);
@@ -93,9 +97,13 @@ pub fn run(args: RunAgentArgs) -> Result<()> {
         let exit = run_cmd(
             "git",
             &[
-                "worktree", "add", "-b", &args.name,
+                "worktree",
+                "add",
+                "-b",
+                &args.name,
                 worktree_dir.to_str().expect("worktree path not utf8"),
-                &args.base, "--quiet",
+                &args.base,
+                "--quiet",
             ],
             &proj,
         )?;
@@ -134,7 +142,8 @@ pub fn run(args: RunAgentArgs) -> Result<()> {
     if mode == "levels" {
         println!("=== Level-by-level mode ===");
 
-        let start_level: u32 = args.from_level
+        let start_level: u32 = args
+            .from_level
             .as_ref()
             .and_then(|s| s.parse().ok())
             .unwrap_or(1);
@@ -199,14 +208,14 @@ pub fn run(args: RunAgentArgs) -> Result<()> {
             capture_session(&args.agent, &level_uuid, &level_dir);
 
             // Test this level
-            let test_exit = run_cmd(
-                "cargo",
-                &["xtask", "test", level],
-                &worktree_dir,
-            ).unwrap_or(1);
+            let test_exit = run_cmd("cargo", &["xtask", "test", level], &worktree_dir).unwrap_or(1);
 
             let status_label = if test_exit == 0 { "PASSED" } else { "FAILED" };
-            level_times.push((format!("L{level}"), level_duration, status_label.to_string()));
+            level_times.push((
+                format!("L{level}"),
+                level_duration,
+                status_label.to_string(),
+            ));
 
             let status_msg = format!("Level {level} {status_label} ({level_duration}s)");
             println!("{status_msg}");
@@ -216,7 +225,11 @@ pub fn run(args: RunAgentArgs) -> Result<()> {
             println!("Committing checkpoint for L{level}...");
             let commit_msg = format!("checkpoint: L{level} {status_label} ({level_duration}s)");
             let _ = run_cmd("git", &["add", "-A"], &worktree_dir);
-            let _ = run_cmd("git", &["commit", "-m", &commit_msg, "--allow-empty"], &worktree_dir);
+            let _ = run_cmd(
+                "git",
+                &["commit", "-m", &commit_msg, "--allow-empty"],
+                &worktree_dir,
+            );
 
             if test_exit != 0 {
                 println!("Level {level} FAILED — stopping");
@@ -241,7 +254,11 @@ pub fn run(args: RunAgentArgs) -> Result<()> {
 
         // Git checkpoint
         let _ = run_cmd("git", &["add", "-A"], &worktree_dir);
-        let _ = run_cmd("git", &["commit", "-m", "agent: full run complete", "--allow-empty"], &worktree_dir);
+        let _ = run_cmd(
+            "git",
+            &["commit", "-m", "agent: full run complete", "--allow-empty"],
+            &worktree_dir,
+        );
 
         // Capture session
         capture_session(&args.agent, &session_uuid, &results_dir);
@@ -262,13 +279,18 @@ pub fn run(args: RunAgentArgs) -> Result<()> {
             "cargo",
             &["xtask", "bench", &args.name, "--run-id", "bench"],
             &proj,
-        ).unwrap_or(1);
+        )
+        .unwrap_or(1);
 
         // Try to extract score from bench output
         if bench_log.is_file() {
             extract_score_from_log(&bench_log)
         } else {
-            if bench_exit == 0 { "completed".to_string() } else { "unknown".to_string() }
+            if bench_exit == 0 {
+                "completed".to_string()
+            } else {
+                "unknown".to_string()
+            }
         }
     } else {
         "skipped".to_string()
@@ -303,11 +325,7 @@ pub fn run(args: RunAgentArgs) -> Result<()> {
 
     // --- Push branch ---
     println!("Pushing branch to origin...");
-    let push_exit = run_cmd(
-        "git",
-        &["push", "-u", "origin", &args.name],
-        &worktree_dir,
-    );
+    let push_exit = run_cmd("git", &["push", "-u", "origin", &args.name], &worktree_dir);
     match push_exit {
         Ok(0) => println!("Branch pushed: origin/{}", args.name),
         _ => println!("WARNING: Push to origin failed (no remote or auth issue)"),
@@ -365,7 +383,7 @@ fn setup_fresh_run(proj: &Path, args: &RunAgentArgs, worktree_dir: &Path) -> Res
     let timestamp = compact_timestamp();
     let results_dir = proj
         .join("results")
-        .join(format!("{}_{}_{}",args.base, args.name, timestamp));
+        .join(format!("{}_{}_{}", args.base, args.name, timestamp));
     fs::create_dir_all(&results_dir).map_err(|e| Error::io(&results_dir, e))?;
     Ok(results_dir)
 }
@@ -390,8 +408,7 @@ fn acquire_lock(lockfile: &Path) -> Result<()> {
         println!("WARNING: Stale lockfile found. Removing.");
         let _ = fs::remove_file(lockfile);
     }
-    fs::write(lockfile, format!("{}", std::process::id()))
-        .map_err(|e| Error::io(lockfile, e))
+    fs::write(lockfile, format!("{}", std::process::id())).map_err(|e| Error::io(lockfile, e))
 }
 
 // ---------------------------------------------------------------------------
@@ -454,11 +471,7 @@ fn launch_claude(
     run_agent_with_tee("claude", &args_ref, workdir, output_file)
 }
 
-fn launch_codex(
-    workdir: &Path,
-    prompt: &str,
-    output_file: &Path,
-) -> Result<i32> {
+fn launch_codex(workdir: &Path, prompt: &str, output_file: &Path) -> Result<i32> {
     let script_cmd = format!(
         "cd '{}' && codex exec --full-auto '{}'",
         workdir.display(),
@@ -468,11 +481,7 @@ fn launch_codex(
     run_cmd("script", &["-qec", &script_cmd, out_str], workdir)
 }
 
-fn launch_opencode(
-    workdir: &Path,
-    prompt: &str,
-    output_file: &Path,
-) -> Result<i32> {
+fn launch_opencode(workdir: &Path, prompt: &str, output_file: &Path) -> Result<i32> {
     let script_cmd = format!(
         "cd '{}' && echo '{}' | opencode",
         workdir.display(),
@@ -482,12 +491,7 @@ fn launch_opencode(
     run_cmd("script", &["-qec", &script_cmd, out_str], workdir)
 }
 
-fn run_agent_with_tee(
-    cmd: &str,
-    args: &[&str],
-    workdir: &Path,
-    output_file: &Path,
-) -> Result<i32> {
+fn run_agent_with_tee(cmd: &str, args: &[&str], workdir: &Path, output_file: &Path) -> Result<i32> {
     // Pipe through tee to capture output while showing it
     let mut child = Command::new(cmd)
         .args(args)
@@ -513,10 +517,9 @@ fn run_agent_with_tee(
         if let Some(stdout) = stdout {
             let reader = BufReader::new(stdout);
             for line in reader.lines() {
-                if let Ok(line) = line {
-                    println!("{line}");
-                    let _ = writeln!(file, "{line}");
-                }
+                let Ok(line) = line else { break };
+                println!("{line}");
+                let _ = writeln!(file, "{line}");
             }
         }
     });
@@ -526,9 +529,8 @@ fn run_agent_with_tee(
         if let Some(stderr) = stderr {
             let reader = BufReader::new(stderr);
             for line in reader.lines() {
-                if let Ok(line) = line {
-                    eprintln!("{line}");
-                }
+                let Ok(line) = line else { break };
+                eprintln!("{line}");
             }
         }
     });
@@ -684,7 +686,7 @@ fn newest_file(dir: &Path, extension: &str) -> Option<PathBuf> {
         if path.extension().and_then(|e| e.to_str()) == Some(extension) {
             if let Ok(meta) = path.metadata() {
                 if let Ok(modified) = meta.modified() {
-                    if best.as_ref().map_or(true, |(_, prev)| modified > *prev) {
+                    if best.as_ref().is_none_or(|(_, prev)| modified > *prev) {
                         best = Some((path, modified));
                     }
                 }
@@ -763,7 +765,12 @@ impl Drop for CleanupContext {
                 let _ = run_cmd("git", &["add", "-A"], &self.worktree_dir);
                 let _ = run_cmd(
                     "git",
-                    &["commit", "-m", "checkpoint: interrupted/cleanup", "--allow-empty"],
+                    &[
+                        "commit",
+                        "-m",
+                        "checkpoint: interrupted/cleanup",
+                        "--allow-empty",
+                    ],
                     &self.worktree_dir,
                 );
                 let _ = run_cmd(

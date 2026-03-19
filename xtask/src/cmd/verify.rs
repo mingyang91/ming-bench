@@ -118,11 +118,7 @@ pub fn run() -> Result<()> {
             println!("=== {level_name} ===");
         }
 
-        let result = run_cmd_capture(
-            "guile",
-            &["--no-auto-compile", "-c", expr],
-            &cwd,
-        );
+        let result = run_cmd_capture("guile", &["--no-auto-compile", "-c", expr], &cwd);
 
         match result {
             Ok((exit_code, actual)) => {

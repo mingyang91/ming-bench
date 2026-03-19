@@ -22,12 +22,12 @@ pub fn run(json: bool) -> Result<()> {
 
 fn print_table(runs: &[(std::path::PathBuf, model::MetaJson)]) {
     println!(
-        "{:<40} {:<10} {:<8} {:<10} {:<8} {}",
-        "RUN", "BASE", "AGENT", "SCORE", "DURATION", "MODE"
+        "{:<40} {:<10} {:<8} {:<10} {:<8} MODE",
+        "RUN", "BASE", "AGENT", "SCORE", "DURATION"
     );
     println!(
-        "{:<40} {:<10} {:<8} {:<10} {:<8} {}",
-        "---", "----", "-----", "-----", "--------", "----"
+        "{:<40} {:<10} {:<8} {:<10} {:<8} ----",
+        "---", "----", "-----", "-----", "--------"
     );
 
     for (run_dir, meta) in runs {
@@ -98,7 +98,10 @@ fn bench_log_score(run_dir: &std::path::Path) -> Option<String> {
     for line in content.lines() {
         if let Some(pos) = line.find("Score: ") {
             let rest = &line[pos + 7..];
-            let score: String = rest.chars().take_while(|c| c.is_ascii_digit() || *c == '/').collect();
+            let score: String = rest
+                .chars()
+                .take_while(|c| c.is_ascii_digit() || *c == '/')
+                .collect();
             if !score.is_empty() {
                 return Some(score);
             }
