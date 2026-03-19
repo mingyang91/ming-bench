@@ -42,7 +42,6 @@ AGENT="claude"
 MODE="full"
 MAX_TURNS=""
 SKIP_BENCH=false
-KEEP_WORKTREE=false
 RESUME=false
 FROM_LEVEL=""
 
@@ -57,7 +56,6 @@ while [[ $# -gt 0 ]]; do
         --mode)       MODE="$2"; MODE_EXPLICIT=1; shift 2 ;;
         --max-turns)  MAX_TURNS="$2"; shift 2 ;;
         --skip-bench) SKIP_BENCH=true; shift ;;
-        --keep-worktree) KEEP_WORKTREE=true; shift ;;
         --resume)     RESUME=true; shift ;;
         --from-level) FROM_LEVEL="$2"; shift 2 ;;
         *) echo "Unknown option: $1"; exit 1 ;;
@@ -80,7 +78,6 @@ if [[ -z "$BASE" || -z "$NAME" ]]; then
     echo "  --mode <mode>         Mode: full (default) or levels"
     echo "  --max-turns <n>       Max turns per session"
     echo "  --skip-bench          Skip scoring"
-    echo "  --keep-worktree       Keep worktree after run"
     echo "  --resume              Resume a previous run (skip passed levels)"
     echo "  --from-level <NN>     Start from a specific level (e.g. 13)"
     exit 1
@@ -181,8 +178,8 @@ if [[ "$RESUME" == "false" ]]; then
 fi
 
 # --- Warm dependency cache ---
-echo "Pre-building dependencies in worktree..."
-if (cd "$WORKTREE_DIR" && cargo build 2>&1); then
+echo "Pre-building dependencies in worktree (release mode)..."
+if (cd "$WORKTREE_DIR" && cargo build --release 2>&1); then
     echo "Pre-build complete."
 else
     echo "WARNING: Pre-build failed. Agent may hit cold cache issues."
@@ -231,16 +228,15 @@ cleanup() {
         wait "$CHILD_PID" 2>/dev/null || true
     fi
 
+    # Commit any uncommitted agent work before exit
+    if [[ -d "$WORKTREE_DIR" ]]; then
+        echo "Committing agent work before exit..."
+        (cd "$WORKTREE_DIR" && git add -A && git commit -m "checkpoint: interrupted/cleanup" --allow-empty) 2>/dev/null || true
+        git -C "$WORKTREE_DIR" push -u origin "$NAME" 2>/dev/null || true
+    fi
+
     # Release lockfile
     release_lock
-
-    # Remove worktree if not keeping
-    # In levels mode or resume mode, always preserve worktree (it has checkpoints)
-    if [[ "$KEEP_WORKTREE" == "false" && "$RESUME" == "false" && "$MODE" != "levels" && -d "$WORKTREE_DIR" ]]; then
-        echo "Cleaning up worktree..."
-        git -C "$PROJECT_DIR" worktree remove --force "$WORKTREE_DIR" 2>/dev/null || true
-        git -C "$PROJECT_DIR" branch -D "$NAME" 2>/dev/null || true
-    fi
 }
 trap cleanup EXIT INT TERM
 
@@ -307,18 +303,25 @@ launch_agent() {
     local output_file="$4"
     local turns="${5:-}"
 
+    local agent_func
     case "$AGENT" in
-        claude)   launch_claude "$workdir" "$prompt" "$session_id" "$output_file" "$turns" &
-                  CHILD_PID=$!
-                  wait "$CHILD_PID"
-                  local exit_code=$?
-                  CHILD_PID=""
-                  return $exit_code
-                  ;;
-        codex)    launch_codex "$workdir" "$prompt" "$session_id" "$output_file" ;;
-        opencode) launch_opencode "$workdir" "$prompt" "$session_id" "$output_file" ;;
+        claude)   agent_func="launch_claude" ;;
+        codex)    agent_func="launch_codex" ;;
+        opencode) agent_func="launch_opencode" ;;
         *)        echo "ERROR: Unknown agent '$AGENT'"; exit 1 ;;
     esac
+
+    # Background + wait pattern for all agents (enables cleanup trap to kill child)
+    if [[ "$AGENT" == "claude" ]]; then
+        $agent_func "$workdir" "$prompt" "$session_id" "$output_file" "$turns" &
+    else
+        $agent_func "$workdir" "$prompt" "$session_id" "$output_file" &
+    fi
+    CHILD_PID=$!
+    wait "$CHILD_PID"
+    local exit_code=$?
+    CHILD_PID=""
+    return $exit_code
 }
 
 # --- Capture session data ---
@@ -341,7 +344,14 @@ capture_session() {
             local codex_dir="$HOME/.codex"
             if [[ -d "$codex_dir" ]]; then
                 local latest
-                latest=$(find "$codex_dir" -name "*.log" -newer "$dest/meta.json" -type f 2>/dev/null | head -1)
+                # Use -newer on a file that exists; fall back to recent files if meta.json not found
+                local ref_file="$dest/meta.json"
+                [[ -f "$ref_file" ]] || ref_file="$dest/agent-output.txt"
+                if [[ -f "$ref_file" ]]; then
+                    latest=$(find "$codex_dir" -name "*.log" -newer "$ref_file" -type f 2>/dev/null | head -1) || true
+                else
+                    latest=$(find "$codex_dir" -name "*.log" -type f -printf '%T@ %p\n' 2>/dev/null | sort -rn | head -1 | cut -d' ' -f2-) || true
+                fi
                 if [[ -n "$latest" ]]; then
                     cp "$latest" "$dest/session.log"
                     echo "Codex session captured: $dest/session.log"
@@ -365,6 +375,8 @@ capture_session() {
 # ============================================================================
 # Execution paths
 # ============================================================================
+
+LEVEL_TIMES_JSON=""  # accumulates per-level timing entries for meta.json
 
 if [[ "$MODE" == "levels" ]]; then
     # --- Path 2: Level-by-level orchestration ---
@@ -413,12 +425,20 @@ if [[ "$MODE" == "levels" ]]; then
 Read CLAUDE.md for full instructions.
 Run ./scripts/test-level.sh $level to verify. Do not work on other levels."
         else
-            # Generate context summary from previous work
-            SUMMARY=""
-            if command -v claude &>/dev/null; then
-                SUMMARY=$( (cd "$WORKTREE_DIR" && claude -p --max-turns 1 \
-                    "List the files under src/scheme/, their purpose, and which levels are implemented so far. Be brief, 5-10 lines." 2>/dev/null) || true)
-            fi
+            # Generate context summary from previous work (deterministic, no LLM call)
+            SUMMARY=$(
+                cd "$WORKTREE_DIR"
+                echo "Files under src/scheme/:"
+                find src/scheme/ -name '*.rs' -exec wc -l {} + 2>/dev/null | sort -n || true
+                echo ""
+                echo "Levels already passing:"
+                for prev in $(seq -w 1 $((10#$level - 1))); do
+                    prev_dir="$RESULTS_DIR/L${prev}"
+                    if [[ -f "$prev_dir/status.txt" ]] && grep -q "PASSED" "$prev_dir/status.txt"; then
+                        echo "  L${prev}: PASSED"
+                    fi
+                done
+            )
 
             LEVEL_PROMPT="Context from previous levels:
 ${SUMMARY:-See src/scheme/ for current implementation.}
@@ -448,6 +468,16 @@ Run ./scripts/test-level.sh $level to verify. Do not work on other levels."
         TEST_EXIT=$?
         set -e
 
+        # Accumulate per-level timing for meta.json
+        status_label="FAILED"
+        [[ $TEST_EXIT -eq 0 ]] && status_label="PASSED"
+        entry="\"L${level}\": {\"duration_s\": ${LEVEL_DURATION}, \"status\": \"${status_label}\"}"
+        if [[ -n "$LEVEL_TIMES_JSON" ]]; then
+            LEVEL_TIMES_JSON="${LEVEL_TIMES_JSON}, ${entry}"
+        else
+            LEVEL_TIMES_JSON="$entry"
+        fi
+
         if [[ $TEST_EXIT -eq 0 ]]; then
             echo "Level $level PASSED (${LEVEL_DURATION}s)" | tee "$LEVEL_DIR/status.txt"
 
@@ -458,6 +488,12 @@ Run ./scripts/test-level.sh $level to verify. Do not work on other levels."
             echo "Checkpoint committed."
         else
             echo "Level $level FAILED (${LEVEL_DURATION}s) — stopping" | tee "$LEVEL_DIR/status.txt"
+
+            # Commit failed state for review
+            echo "Committing checkpoint for L${level} (FAILED)..."
+            (cd "$WORKTREE_DIR" && git add -A && git commit -m "checkpoint: L${level} failed (${LEVEL_DURATION}s)" --allow-empty) \
+                >> "$LEVEL_DIR/git-checkpoint.log" 2>&1 || true
+
             break
         fi
     done
@@ -478,6 +514,12 @@ elif [[ "$MODE" == "full" ]]; then
 
     echo ""
     echo "Agent exited with code: $AGENT_EXIT"
+
+    # --- Git checkpoint: commit agent's work so bench.sh can score from the branch ---
+    echo "Committing agent work to branch..."
+    (cd "$WORKTREE_DIR" && git add -A && git commit -m "agent: full run complete" --allow-empty) \
+        >> "$RESULTS_DIR/git-checkpoint.log" 2>&1 || true
+    echo "Checkpoint committed."
 
     # Capture session
     capture_session "$SESSION_UUID" "$RESULTS_DIR"
@@ -505,11 +547,25 @@ fi
 
 # --- Update meta.json with final state ---
 END_TIME="$(date -Iseconds)"
+LEVEL_TIMES_FIELD=""
+if [[ -n "$LEVEL_TIMES_JSON" ]]; then
+    LEVEL_TIMES_FIELD=",
+  \"level_times\": {${LEVEL_TIMES_JSON}}"
+fi
+
 write_meta ",
   \"end_time\": \"$END_TIME\",
   \"exit_code\": ${AGENT_EXIT:-0},
   \"bench_exit_code\": $BENCH_EXIT,
-  \"score\": \"$SCORE\""
+  \"score\": \"$SCORE\"${LEVEL_TIMES_FIELD}"
+
+# --- Push branch to origin as backup ---
+echo "Pushing branch to origin..."
+if git -C "$WORKTREE_DIR" push -u origin "$NAME" 2>&1; then
+    echo "Branch pushed: origin/$NAME"
+else
+    echo "WARNING: Push to origin failed (no remote or auth issue)"
+fi
 
 echo ""
 echo "=== Run complete ==="
