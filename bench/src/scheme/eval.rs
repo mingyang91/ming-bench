@@ -280,6 +280,10 @@ fn eval_let(args: &[Value], env: &Env) -> Result<Trampoline, String> {
     if args.len() < 2 {
         return Err(format!("let requires at least 2 arguments, got {}", args.len()));
     }
+    // Named let: (let name ((var init) ...) body ...)
+    if let Value::Symbol(name) = &args[0] {
+        return eval_named_let(name, &args[1..], env);
+    }
     let bindings = match &args[0] {
         Value::List(elems) => elems,
         other => return Err(format!("let: expected bindings list, got {other}")),
@@ -301,6 +305,48 @@ fn eval_let(args: &[Value], env: &Env) -> Result<Trampoline, String> {
     Ok(Trampoline::Bounce {
         expr: body,
         env: child,
+    })
+}
+
+fn eval_named_let(name: &str, args: &[Value], env: &Env) -> Result<Trampoline, String> {
+    if args.len() < 2 {
+        return Err(format!("named let requires bindings and body, got {} args", args.len()));
+    }
+    let binding_list = match &args[0] {
+        Value::List(elems) => elems,
+        other => return Err(format!("named let: expected bindings list, got {other}")),
+    };
+    let mut params = Vec::new();
+    let mut init_vals = Vec::new();
+    for binding in binding_list {
+        let pair = match binding {
+            Value::List(elems) if elems.len() == 2 => elems,
+            _ => return Err(format!("named let: invalid binding: {binding}")),
+        };
+        match &pair[0] {
+            Value::Symbol(s) => params.push(s.clone()),
+            other => return Err(format!("named let: expected symbol, got {other}")),
+        }
+        init_vals.push(eval(&pair[1], env)?);
+    }
+    let body = wrap_body(&args[1..]);
+    // Create env where the lambda can see itself for recursion
+    let loop_env = env.child();
+    let lambda = Value::Lambda {
+        params: params.clone(),
+        rest_param: None,
+        body: Box::new(body.clone()),
+        env: loop_env.clone(),
+    };
+    loop_env.set(name.to_string(), lambda);
+    // Bind initial values and bounce into the body
+    let call_env = loop_env.child();
+    for (param, val) in params.iter().zip(init_vals) {
+        call_env.set(param.clone(), val);
+    }
+    Ok(Trampoline::Bounce {
+        expr: body,
+        env: call_env,
     })
 }
 
