@@ -78,6 +78,7 @@ pub enum Expr {
 }
 
 pub struct ContData {
+    pub id: usize,
     pub remaining_exprs: Vec<Expr>,
     pub env: Env,
 }
@@ -91,6 +92,7 @@ impl std::fmt::Debug for ContData {
 impl Clone for ContData {
     fn clone(&self) -> Self {
         ContData {
+            id: self.id,
             remaining_exprs: self.remaining_exprs.clone(),
             env: self.env.clone(),
         }

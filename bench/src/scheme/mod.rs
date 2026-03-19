@@ -9,7 +9,8 @@ use builtins::BUILTIN_NAMES;
 use expr::{Env, Expr};
 use parser::Parser;
 use trampoline::{
-    clear_continuation_state, eval_step, run_top_level, Bounce,
+    clear_continuation_state, eval_step, inc_eval_depth, dec_eval_depth,
+    run_top_level, Bounce,
 };
 
 pub fn eval_str(input: &str) -> Result<String, String> {
@@ -33,6 +34,13 @@ pub fn eval_str(input: &str) -> Result<String, String> {
 }
 
 pub(crate) fn eval(expr: &Expr, env: &Env) -> Result<Expr, String> {
+    inc_eval_depth();
+    let result = eval_inner(expr, env);
+    dec_eval_depth();
+    result
+}
+
+fn eval_inner(expr: &Expr, env: &Env) -> Result<Expr, String> {
     let mut current_expr = expr.clone();
     let mut current_env = env.clone();
 

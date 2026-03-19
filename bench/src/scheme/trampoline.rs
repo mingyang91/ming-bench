@@ -1,5 +1,6 @@
 use std::cell::RefCell;
 use std::rc::Rc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 use super::builtins::{call_builtin_on_values, eval_builtin, is_builtin, is_false};
 use super::eval;
@@ -7,6 +8,8 @@ use super::expr::{ContData, Env, Expr};
 use super::forms::{eval_define, eval_lambda, eval_quote, parse_let_binding};
 
 // Thread-local state for continuation support.
+
+static CONT_ID_COUNTER: AtomicUsize = AtomicUsize::new(0);
 
 pub(super) struct ContSignal {
     pub value: Expr,
@@ -22,6 +25,9 @@ thread_local! {
     static CONT_SIGNAL: RefCell<Option<ContSignal>> = const { RefCell::new(None) };
     static CALLCC_REPLAY: RefCell<Option<Expr>> = const { RefCell::new(None) };
     static TOP_LEVEL_CONTEXT: RefCell<Option<TopLevelContext>> = const { RefCell::new(None) };
+    static ACTIVE_CALLCC_IDS: RefCell<Vec<usize>> = const { RefCell::new(Vec::new()) };
+    static EVAL_DEPTH: RefCell<usize> = const { RefCell::new(0) };
+    static ESCAPE_VALUE: RefCell<Option<Expr>> = const { RefCell::new(None) };
 }
 
 pub(super) fn take_cont_signal() -> Option<ContSignal> {
@@ -36,10 +42,21 @@ pub(super) fn set_top_level_context(ctx: TopLevelContext) {
     TOP_LEVEL_CONTEXT.with(|c| *c.borrow_mut() = Some(ctx));
 }
 
+pub(super) fn inc_eval_depth() {
+    EVAL_DEPTH.with(|d| *d.borrow_mut() += 1);
+}
+
+pub(super) fn dec_eval_depth() {
+    EVAL_DEPTH.with(|d| *d.borrow_mut() -= 1);
+}
+
 pub(super) fn clear_continuation_state() {
     CONT_SIGNAL.with(|s| *s.borrow_mut() = None);
     CALLCC_REPLAY.with(|r| *r.borrow_mut() = None);
     TOP_LEVEL_CONTEXT.with(|c| *c.borrow_mut() = None);
+    ACTIVE_CALLCC_IDS.with(|ids| ids.borrow_mut().clear());
+    EVAL_DEPTH.with(|d| *d.borrow_mut() = 0);
+    ESCAPE_VALUE.with(|v| *v.borrow_mut() = None);
 }
 
 /// Trampoline result: either a final value or a tail call to continue.
@@ -313,13 +330,7 @@ pub fn apply_proc(proc: &Expr, args: &[Expr]) -> Result<Bounce, String> {
             if args.len() != 1 {
                 return Err("continuation requires exactly one argument".into());
             }
-            CONT_SIGNAL.with(|s| {
-                *s.borrow_mut() = Some(ContSignal {
-                    value: args[0].clone(),
-                    remaining_exprs: data.remaining_exprs.clone(),
-                });
-            });
-            Err("__CONTINUATION_INVOKED__".into())
+            invoke_continuation(data, args[0].clone())
         }
         Expr::Builtin(name) if name == "call/cc" => {
             if args.len() != 1 {
@@ -360,6 +371,25 @@ fn apply_lambda(
     Ok(Bounce::TailCall { expr: body.clone(), env: call_env })
 }
 
+fn invoke_continuation(data: &Rc<ContData>, value: Expr) -> Result<Bounce, String> {
+    let is_active = ACTIVE_CALLCC_IDS.with(|ids| ids.borrow().contains(&data.id));
+    if is_active {
+        ESCAPE_VALUE.with(|v| *v.borrow_mut() = Some(value));
+        return Err(format!("__CONT_ESCAPE_{}", data.id));
+    }
+    let depth = EVAL_DEPTH.with(|d| *d.borrow());
+    if depth <= 1 {
+        CONT_SIGNAL.with(|s| {
+            *s.borrow_mut() = Some(ContSignal {
+                value,
+                remaining_exprs: data.remaining_exprs.clone(),
+            });
+        });
+        return Err("__CONTINUATION_INVOKED__".into());
+    }
+    Ok(Bounce::Done(value))
+}
+
 fn handle_callcc(func: &Expr) -> Result<Bounce, String> {
     // Check if this is a replay (continuation was invoked and we're re-executing).
     let replay_val = CALLCC_REPLAY.with(|r| r.borrow_mut().take());
@@ -373,12 +403,45 @@ fn handle_callcc(func: &Expr) -> Result<Bounce, String> {
     });
     let (remaining_exprs, ctx_env) = ctx.unwrap_or_else(|| (vec![], Env::new()));
 
+    let id = CONT_ID_COUNTER.fetch_add(1, Ordering::Relaxed);
     let cont = Expr::Continuation(Rc::new(ContData {
+        id,
         remaining_exprs,
         env: ctx_env,
     }));
 
-    apply_proc(func, &[cont])
+    // Push our ID so escape continuations can find us.
+    ACTIVE_CALLCC_IDS.with(|ids| ids.borrow_mut().push(id));
+
+    // Fully evaluate the function call (blocking) so we can catch escapes.
+    let result = run_callcc_body(func, &cont);
+
+    // Pop our ID (must happen regardless of result).
+    ACTIVE_CALLCC_IDS.with(|ids| ids.borrow_mut().pop());
+
+    let escape_tag = format!("__CONT_ESCAPE_{id}");
+    match result {
+        Ok(val) => Ok(Bounce::Done(val)),
+        Err(ref e) if *e == escape_tag => {
+            let val = ESCAPE_VALUE.with(|v| v.borrow_mut().take())
+                .ok_or("internal error: missing escape value")?;
+            Ok(Bounce::Done(val))
+        }
+        Err(e) => Err(e),
+    }
+}
+
+/// Fully evaluate applying func to arg, running the trampoline to completion.
+fn run_callcc_body(func: &Expr, arg: &Expr) -> Result<Expr, String> {
+    let mut bounce = apply_proc(func, std::slice::from_ref(arg))?;
+    loop {
+        match bounce {
+            Bounce::Done(val) => return Ok(val),
+            Bounce::TailCall { expr, env } => {
+                bounce = eval_step(&expr, &env)?;
+            }
+        }
+    }
 }
 
 fn eval_apply_values(args: &[Expr]) -> Result<Bounce, String> {
