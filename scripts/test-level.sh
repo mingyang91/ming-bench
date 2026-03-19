@@ -1,9 +1,10 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# Run tests for a single level inside a container.
+# Run tests inside a container with regression coverage.
+# When given a level N, runs levels 1..N (not just N) to catch regressions.
 # Usage: ./scripts/test-level.sh 01      # test level 1
-#        ./scripts/test-level.sh 05      # test level 5
+#        ./scripts/test-level.sh 05      # test levels 1-5
 #        ./scripts/test-level.sh all     # test all levels (300s timeout)
 
 IMAGE_NAME="cs61a-bench"
@@ -93,23 +94,54 @@ if [[ -z "$BIN" ]]; then
     exit 1
 fi
 
-# Build filter
+# Build level list — when testing level N, run levels 1..N for regression coverage
 if [[ -z "${1:-}" ]]; then
     echo "Usage: test-level.sh <level>   # e.g., 01, 05, 16"
     echo "       test-level.sh all       # run all levels (300s timeout)"
     exit 1
 elif [[ "$1" == "all" ]]; then
-    FILTER=""
+    LEVELS=()
     TIMEOUT=300
 else
-    FILTER="test_l${1}"
+    TARGET=$((10#$1))
+    LEVELS=()
+    for ((i=1; i<=TARGET; i++)); do
+        LEVELS+=("$(printf '%02d' "$i")")
+    done
+    # Scale timeout: 30s per level
+    TIMEOUT=$(( TARGET * 30 ))
 fi
 
-# Run inside container
-sudo podman run --rm \
-    --memory=1g \
-    --cpus=1 \
-    --pids-limit=256 \
-    -v "./$BIN:/bench/test_bin:ro,Z" \
-    "$IMAGE_NAME" \
-    "timeout ${TIMEOUT}s /bench/test_bin ${FILTER} --test-threads=1 2>&1"
+# Run inside container — one invocation per level for clear pass/fail reporting
+if [[ ${#LEVELS[@]} -eq 0 ]]; then
+    # "all" mode: single run, no filter
+    sudo podman run --rm \
+        --memory=1g \
+        --cpus=1 \
+        --pids-limit=256 \
+        -v "./$BIN:/bench/test_bin:ro,Z" \
+        "$IMAGE_NAME" \
+        "timeout ${TIMEOUT}s /bench/test_bin --test-threads=1 2>&1"
+else
+    FAILED=0
+    for LVL in "${LEVELS[@]}"; do
+        echo ""
+        echo "===== Level $LVL ====="
+        if ! sudo podman run --rm \
+            --memory=1g \
+            --cpus=1 \
+            --pids-limit=256 \
+            -v "./$BIN:/bench/test_bin:ro,Z" \
+            "$IMAGE_NAME" \
+            "timeout 30s /bench/test_bin test_l${LVL} --test-threads=1 2>&1"; then
+            echo "FAIL: Level $LVL"
+            FAILED=1
+            break
+        fi
+    done
+    if [[ $FAILED -ne 0 ]]; then
+        exit 1
+    fi
+    echo ""
+    echo "All levels 01..${LEVELS[-1]} passed."
+fi

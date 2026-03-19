@@ -71,7 +71,7 @@ Implement a Scheme interpreter in Rust.
 
 Write clean, idiomatic Rust. The quality gate enforces structure mechanically; these are additional expectations:
 
-- **Use `thiserror`** for typed error enums. Do not flatten all errors to `String`.
+- **Use `thiserror` with structurally typed variants.** Each variant must carry domain-specific fields (e.g., `NotFound { key: String }`, `LimitExceeded { max: usize, actual: usize }`). Variants that wrap a formatted `String` message (e.g., `Other(String)`) are prohibited — they defeat pattern matching and are just `String` with extra steps.
 - **Immutable-first.** Build new values from inputs instead of mutating temporaries.
 - **Keep `mod.rs` thin.** Entry point and re-exports only; implementation goes in submodules.
 - **When touching a file, fix violations in that file.** Do not defer. Do not rewrite unrelated files unprompted.
