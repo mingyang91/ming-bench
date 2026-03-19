@@ -36,37 +36,96 @@ fn eval(expr: &Value) -> Result<Value, String> {
                 Value::Symbol(s) => s.as_str(),
                 other => return Err(format!("not a procedure: {other}")),
             };
-            let args: Vec<Value> = elems[1..]
-                .iter()
-                .map(eval)
-                .collect::<Result<_, _>>()?;
-            apply_primitive(op, &args)
+            match op {
+                "and" => eval_and(&elems[1..]),
+                "or" => eval_or(&elems[1..]),
+                _ => {
+                    let args: Vec<Value> = elems[1..]
+                        .iter()
+                        .map(eval)
+                        .collect::<Result<_, _>>()?;
+                    apply_primitive(op, &args)
+                }
+            }
         }
         _ => Err(format!("cannot evaluate: {expr}")),
     }
 }
 
-fn apply_primitive(op: &str, args: &[Value]) -> Result<Value, String> {
-    let nums: Vec<i64> = args
-        .iter()
+fn is_truthy(v: &Value) -> bool {
+    !matches!(v, Value::Boolean(false))
+}
+
+fn eval_and(exprs: &[Value]) -> Result<Value, String> {
+    let mut result = Value::Boolean(true);
+    for expr in exprs {
+        result = eval(expr)?;
+        if !is_truthy(&result) {
+            return Ok(result);
+        }
+    }
+    Ok(result)
+}
+
+fn eval_or(exprs: &[Value]) -> Result<Value, String> {
+    let mut result = Value::Boolean(false);
+    for expr in exprs {
+        result = eval(expr)?;
+        if is_truthy(&result) {
+            return Ok(result);
+        }
+    }
+    Ok(result)
+}
+
+fn require_nums(args: &[Value]) -> Result<Vec<i64>, String> {
+    args.iter()
         .map(|v| match v {
             Value::Integer(n) => Ok(*n),
             other => Err(format!("expected number, got: {other}")),
         })
-        .collect::<Result<_, _>>()?;
+        .collect()
+}
 
+fn apply_primitive(op: &str, args: &[Value]) -> Result<Value, String> {
     match op {
-        "+" => Ok(Value::Integer(nums.iter().sum())),
-        "-" => match nums.len() {
-            0 => Err("- requires at least 1 argument".into()),
-            1 => Ok(Value::Integer(-nums[0])),
-            _ => Ok(Value::Integer(
-                nums[0] - nums[1..].iter().sum::<i64>(),
-            )),
-        },
-        "*" => Ok(Value::Integer(nums.iter().product())),
-        "/" => checked_div(&nums),
-        _ => Err(format!("unknown procedure: {op}")),
+        "not" => {
+            if args.len() != 1 {
+                return Err(format!("not requires 1 argument, got {}", args.len()));
+            }
+            Ok(Value::Boolean(!is_truthy(&args[0])))
+        }
+        "<" | ">" | "=" | "<=" | ">=" => {
+            let nums = require_nums(args)?;
+            if nums.len() != 2 {
+                return Err(format!("{op} requires 2 arguments, got {}", nums.len()));
+            }
+            let result = match op {
+                "<" => nums[0] < nums[1],
+                ">" => nums[0] > nums[1],
+                "=" => nums[0] == nums[1],
+                "<=" => nums[0] <= nums[1],
+                ">=" => nums[0] >= nums[1],
+                _ => unreachable!(),
+            };
+            Ok(Value::Boolean(result))
+        }
+        _ => {
+            let nums = require_nums(args)?;
+            match op {
+                "+" => Ok(Value::Integer(nums.iter().sum())),
+                "-" => match nums.len() {
+                    0 => Err("- requires at least 1 argument".into()),
+                    1 => Ok(Value::Integer(-nums[0])),
+                    _ => Ok(Value::Integer(
+                        nums[0] - nums[1..].iter().sum::<i64>(),
+                    )),
+                },
+                "*" => Ok(Value::Integer(nums.iter().product())),
+                "/" => checked_div(&nums),
+                _ => Err(format!("unknown procedure: {op}")),
+            }
+        }
     }
 }
 
