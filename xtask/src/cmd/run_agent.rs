@@ -13,6 +13,7 @@ static CHILD_PID: AtomicU32 = AtomicU32::new(0);
 
 pub struct RunAgentArgs {
     pub base: String,
+    pub strategy: String,
     pub name: String,
     pub prompt: Option<String>,
     pub model: Option<String>,
@@ -62,7 +63,7 @@ pub fn run(args: RunAgentArgs) -> Result<()> {
 
     // --- Results dir ---
     let results_dir = if args.resume {
-        find_resume_dir(&proj, &args.base, &args.name)?
+        find_resume_dir(&proj, &args.strategy, &args.name)?
     } else {
         setup_fresh_run(&proj, &args, &worktree_dir)?
     };
@@ -71,6 +72,7 @@ pub fn run(args: RunAgentArgs) -> Result<()> {
     if !args.resume {
         let meta = serde_json::json!({
             "base": args.base,
+            "strategy": args.strategy,
             "name": args.name,
             "session_id": session_uuid,
             "agent": args.agent,
@@ -85,6 +87,7 @@ pub fn run(args: RunAgentArgs) -> Result<()> {
 
     println!("=== Agent Run: {} ===", args.name);
     println!("Base:       {}", args.base);
+    println!("Strategy:   {}", args.strategy);
     println!("Agent:      {}", args.agent);
     println!("Mode:       {mode}");
     println!("Model:      {}", args.model.as_deref().unwrap_or("default"));
@@ -117,6 +120,26 @@ pub fn run(args: RunAgentArgs) -> Result<()> {
             });
         }
         println!("Worktree created.");
+
+        // --- Symlink strategy file as CLAUDE.md ---
+        let strategy_src = format!("strategies/{}.md", args.strategy);
+        let strategy_path = agent_workdir.join(&strategy_src);
+        if !strategy_path.is_file() {
+            return Err(Error::CommandFailed {
+                cmd: format!(
+                    "strategy file not found: {} (available: ls bench/strategies/)",
+                    strategy_path.display()
+                ),
+                exit_code: 1,
+            });
+        }
+        let claude_md = agent_workdir.join("CLAUDE.md");
+        std::os::unix::fs::symlink(&strategy_src, &claude_md)
+            .map_err(|e| Error::io(&claude_md, e))?;
+        let agents_md = agent_workdir.join("AGENTS.md");
+        std::os::unix::fs::symlink("CLAUDE.md", &agents_md)
+            .map_err(|e| Error::io(&agents_md, e))?;
+        println!("Strategy:   {} → CLAUDE.md", strategy_src);
     }
 
     // --- Warm dependency cache ---
@@ -349,9 +372,9 @@ pub fn run(args: RunAgentArgs) -> Result<()> {
 // Setup helpers
 // ---------------------------------------------------------------------------
 
-fn find_resume_dir(proj: &Path, base: &str, name: &str) -> Result<PathBuf> {
+fn find_resume_dir(proj: &Path, strategy: &str, name: &str) -> Result<PathBuf> {
     let results_dir = proj.join("results");
-    let prefix = format!("{base}_{name}_");
+    let prefix = format!("{strategy}_{name}_");
 
     let mut matching: Vec<PathBuf> = Vec::new();
     if let Ok(entries) = fs::read_dir(&results_dir) {
@@ -403,7 +426,7 @@ fn setup_fresh_run(proj: &Path, args: &RunAgentArgs, worktree_dir: &Path) -> Res
     let timestamp = compact_timestamp();
     let results_dir = proj
         .join("results")
-        .join(format!("{}_{}_{}", args.base, args.name, timestamp));
+        .join(format!("{}_{}_{}", args.strategy, args.name, timestamp));
     fs::create_dir_all(&results_dir).map_err(|e| Error::io(&results_dir, e))?;
     Ok(results_dir)
 }

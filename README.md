@@ -30,7 +30,11 @@ cs61a-bench/              # framework ("jug") — orchestration & analysis
   CLAUDE.md               # framework maintainer instructions
 
   bench/                  # agent playground — what the agent sees
-    CLAUDE.md             # agent instructions (branch-specific)
+    SPEC.md               # interpreter specification (shared, all strategies)
+    strategies/
+      default.md          # group 1: minimal instructions
+      quality-gate.md     # group 2: quality gates + code style rules
+    CLAUDE.md             # ← symlink to strategy file, created at launch
     src/scheme/           # agent implements here
     src/scheme/tests/     # test suite (read-only to agent)
     src/scheme/tests/fixtures/  # .scm files loaded by tests
@@ -38,14 +42,14 @@ cs61a-bench/              # framework ("jug") — orchestration & analysis
 
 Agents are launched with `cwd = bench/` and only interact with files there. Framework code (xtask, Dockerfile) lives above the agent's working directory.
 
-### The Experiment: Two Branches
+### The Experiment: Strategies
 
-| Branch | CLAUDE.md | What it tests |
-|--------|-----------|---------------|
-| `main` | Minimal instructions: implement levels in order, run tests, fix failures | Baseline — how agents perform with standard guidance |
-| `strategy` | Adds: quality gate (clippy + size limits), code style rules (typed errors, immutable-first, thin mod.rs) | Whether structural enforcement improves agent code quality and completion rate |
+| Strategy | CLAUDE.md | What it tests |
+|----------|-----------|---------------|
+| `default` | Minimal: implement the spec, test each level, fix failures | Baseline — how agents perform with standard guidance |
+| `quality-gate` | Adds: clippy enforcement, mod.rs size limits, code style rules | Whether structural enforcement improves agent code quality and completion rate |
 
-Both branches share identical test suites and infrastructure. The only difference is `bench/CLAUDE.md` — the instructions the agent sees.
+Both strategies share `SPEC.md` (identical task definition) and the same test suite. The only difference is the instructions in `CLAUDE.md`. Strategy selection happens at runtime via `--strategy`.
 
 ### Execution Modes
 
@@ -143,8 +147,8 @@ Without `--clean`, you'll get distinct errors for stale directories vs stale bra
 
 ```
 results/
-  main_claude-r1_20260318T120000/
-    meta.json             # run metadata (base, agent, mode, score, timing)
+  default_claude-r1_20260319T120000/
+    meta.json             # run metadata (strategy, agent, mode, score, timing)
     agent-output.txt      # agent stdout
     session.jsonl         # full session transcript
     bench.log             # scoring output
@@ -163,17 +167,17 @@ results/
 # One-time setup
 cargo xtask setup
 
-# Run an agent against the main branch
-cargo xtask run-agent --base main --name claude-r1 --agent claude --mode levels
+# Run with default strategy (minimal instructions)
+cargo xtask run-agent --strategy default --name claude-r1 --agent claude --mode levels
 
-# Run the same agent against the strategy branch
-cargo xtask run-agent --base strategy --name claude-s1 --agent claude --mode levels
+# Run with quality-gate strategy (clippy + code style)
+cargo xtask run-agent --strategy quality-gate --name claude-q1 --agent claude --mode levels
 
 # Compare results
 cargo xtask results
 cargo xtask analyze \
-  results/main_claude-r1_* \
-  results/strategy_claude-s1_*
+  results/default_claude-r1_* \
+  results/quality-gate_claude-q1_*
 ```
 
 See [BENCH_GUIDE.md](BENCH_GUIDE.md) for the full supervisor reference.
