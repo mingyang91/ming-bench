@@ -88,6 +88,14 @@ enum Commands {
         #[arg(long)]
         from_level: Option<String>,
     },
+    /// Analyze session request patterns and cost drivers
+    Analyze {
+        /// Run directories to analyze
+        runs: Vec<PathBuf>,
+        /// Analyze all runs in results/
+        #[arg(long)]
+        all: bool,
+    },
     /// Verify test cases against Guile ground truth
     Verify,
 }
@@ -127,6 +135,7 @@ fn main() {
             resume,
             from_level,
         }),
+        Commands::Analyze { runs, all } => cmd::analyze::run(runs, all),
         Commands::Verify => cmd::verify::run(),
     };
     if let Err(e) = result {
