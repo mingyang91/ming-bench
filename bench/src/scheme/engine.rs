@@ -1,6 +1,7 @@
+use std::cell::RefCell;
 use std::collections::HashMap;
+use std::rc::Rc;
 
-#[derive(Debug, Clone, PartialEq, Eq)]
 pub(super) enum Value {
     Integer(i64),
     Boolean(bool),
@@ -8,7 +9,25 @@ pub(super) enum Value {
     Symbol(String),
     Pair(Box<Value>, Box<Value>),
     Nil,
+    Builtin(Builtin),
+    Procedure(Procedure),
     Void,
+}
+
+impl Clone for Value {
+    fn clone(&self) -> Self {
+        match self {
+            Self::Integer(value) => Self::Integer(*value),
+            Self::Boolean(value) => Self::Boolean(*value),
+            Self::String(value) => Self::String(value.clone()),
+            Self::Symbol(value) => Self::Symbol(value.clone()),
+            Self::Pair(car, cdr) => Self::Pair(car.clone(), cdr.clone()),
+            Self::Nil => Self::Nil,
+            Self::Builtin(builtin) => Self::Builtin(*builtin),
+            Self::Procedure(procedure) => Self::Procedure(procedure.clone()),
+            Self::Void => Self::Void,
+        }
+    }
 }
 
 impl std::fmt::Display for Value {
@@ -25,6 +44,8 @@ impl std::fmt::Display for Value {
                 formatter.write_str(")")
             }
             Self::Nil => formatter.write_str("()"),
+            Self::Builtin(builtin) => write!(formatter, "#<procedure:{}>", builtin.name()),
+            Self::Procedure(_) => formatter.write_str("#<procedure>"),
             Self::Void => Ok(()),
         }
     }
@@ -43,92 +64,289 @@ fn fmt_pair(car: &Value, cdr: &Value, formatter: &mut std::fmt::Formatter<'_>) -
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Clone)]
 enum Expr {
     Literal(Value),
     Symbol(String),
     Application(Vec<Expr>),
 }
 
-type Environment = HashMap<String, Value>;
+#[derive(Clone, Copy)]
+pub(super) enum Builtin {
+    Add,
+    Subtract,
+    Multiply,
+    Divide,
+    LessThan,
+    GreaterThan,
+    Equal,
+    LessEqual,
+    Not,
+}
+
+impl Builtin {
+    fn name(self) -> &'static str {
+        match self {
+            Self::Add => "+",
+            Self::Subtract => "-",
+            Self::Multiply => "*",
+            Self::Divide => "/",
+            Self::LessThan => "<",
+            Self::GreaterThan => ">",
+            Self::Equal => "=",
+            Self::LessEqual => "<=",
+            Self::Not => "not",
+        }
+    }
+
+    fn apply(self, arguments: &[Value]) -> Result<Value, String> {
+        match self {
+            Self::Add => eval_add(arguments),
+            Self::Subtract => eval_subtract(arguments),
+            Self::Multiply => eval_multiply(arguments),
+            Self::Divide => eval_divide(arguments),
+            Self::LessThan => eval_less_than(arguments),
+            Self::GreaterThan => eval_greater_than(arguments),
+            Self::Equal => eval_equal(arguments),
+            Self::LessEqual => eval_less_equal(arguments),
+            Self::Not => eval_not(arguments),
+        }
+    }
+}
+
+#[derive(Clone)]
+pub(super) struct Procedure {
+    params: Vec<String>,
+    body: Vec<Expr>,
+    environment: Environment,
+}
+
+type Environment = Rc<RefCell<Frame>>;
+
+struct Frame {
+    bindings: HashMap<String, Value>,
+    parent: Option<Environment>,
+}
 
 pub(super) fn eval_program(input: &str) -> Result<Value, String> {
     let mut parser = Parser::new(input);
     let program = parser.parse_program()?;
-    let mut environment = Environment::new();
+    let environment = global_environment();
+    eval_sequence(&program, &environment)
+}
 
+fn global_environment() -> Environment {
+    let environment = new_environment(None);
+
+    for builtin in [
+        Builtin::Add,
+        Builtin::Subtract,
+        Builtin::Multiply,
+        Builtin::Divide,
+        Builtin::LessThan,
+        Builtin::GreaterThan,
+        Builtin::Equal,
+        Builtin::LessEqual,
+        Builtin::Not,
+    ] {
+        define_binding(
+            &environment,
+            builtin.name().to_string(),
+            Value::Builtin(builtin),
+        );
+    }
+
+    environment
+}
+
+fn new_environment(parent: Option<Environment>) -> Environment {
+    Rc::new(RefCell::new(Frame {
+        bindings: HashMap::new(),
+        parent,
+    }))
+}
+
+fn define_binding(environment: &Environment, name: String, value: Value) {
+    environment.borrow_mut().bindings.insert(name, value);
+}
+
+fn lookup_binding(environment: &Environment, name: &str) -> Option<Value> {
+    let parent = {
+        let frame = environment.borrow();
+        if let Some(value) = frame.bindings.get(name) {
+            return Some(value.clone());
+        }
+        frame.parent.clone()
+    };
+
+    parent.and_then(|parent| lookup_binding(&parent, name))
+}
+
+fn eval_sequence(expressions: &[Expr], environment: &Environment) -> Result<Value, String> {
     let mut last_value = Value::Void;
-    for expr in &program {
-        last_value = eval_expr(expr, &mut environment)?;
+    for expr in expressions {
+        last_value = eval_expr(expr, environment)?;
     }
 
     Ok(last_value)
 }
 
-fn eval_expr(expr: &Expr, environment: &mut Environment) -> Result<Value, String> {
+fn eval_expr(expr: &Expr, environment: &Environment) -> Result<Value, String> {
     match expr {
         Expr::Literal(value) => Ok(value.clone()),
-        Expr::Symbol(name) => environment
-            .get(name)
-            .cloned()
-            .ok_or_else(|| format!("unbound symbol: {name}")),
+        Expr::Symbol(name) => {
+            lookup_binding(environment, name).ok_or_else(|| format!("unbound symbol: {name}"))
+        }
         Expr::Application(parts) => eval_application(parts, environment),
     }
 }
 
-fn eval_application(parts: &[Expr], environment: &mut Environment) -> Result<Value, String> {
+fn eval_application(parts: &[Expr], environment: &Environment) -> Result<Value, String> {
     let (operator, arguments) = parts
         .split_first()
         .ok_or_else(|| "cannot evaluate empty application".to_string())?;
-    let operator = match operator {
-        Expr::Symbol(name) => name.as_str(),
-        _ => return Err("operator must be a symbol".into()),
-    };
 
-    match operator {
-        "and" => return eval_and(arguments, environment),
-        "or" => return eval_or(arguments, environment),
-        "if" => return eval_if(arguments, environment),
-        "define" => return eval_define(arguments, environment),
-        "quote" => return eval_quote(arguments),
-        _ => {}
+    if let Some(name) = symbol_name(operator) {
+        match name {
+            "and" => return eval_and(arguments, environment),
+            "or" => return eval_or(arguments, environment),
+            "if" => return eval_if(arguments, environment),
+            "define" => return eval_define(arguments, environment),
+            "quote" => return eval_quote(arguments),
+            "lambda" => return eval_lambda(arguments, environment),
+            _ => {}
+        }
     }
 
+    let operator = eval_expr(operator, environment)?;
+    let arguments = eval_arguments(arguments, environment)?;
+    apply_callable(&operator, &arguments)
+}
+
+fn symbol_name(expr: &Expr) -> Option<&str> {
+    match expr {
+        Expr::Symbol(name) => Some(name.as_str()),
+        _ => None,
+    }
+}
+
+fn eval_arguments(arguments: &[Expr], environment: &Environment) -> Result<Vec<Value>, String> {
     let mut values = Vec::with_capacity(arguments.len());
     for argument in arguments {
         values.push(eval_expr(argument, environment)?);
     }
+    Ok(values)
+}
 
-    match operator {
-        "+" => eval_add(&values),
-        "-" => eval_subtract(&values),
-        "*" => eval_multiply(&values),
-        "/" => eval_divide(&values),
-        "<" => eval_less_than(&values),
-        ">" => eval_greater_than(&values),
-        "=" => eval_equal(&values),
-        "<=" => eval_less_equal(&values),
-        "not" => eval_not(&values),
-        _ => Err(format!("unknown procedure: {operator}")),
+fn apply_callable(callable: &Value, arguments: &[Value]) -> Result<Value, String> {
+    match callable {
+        Value::Builtin(builtin) => builtin.apply(arguments),
+        Value::Procedure(procedure) => apply_procedure(procedure, arguments),
+        _ => Err("attempted to call a non-procedure".into()),
     }
 }
 
-fn eval_define(arguments: &[Expr], environment: &mut Environment) -> Result<Value, String> {
-    let [name, value] = arguments else {
+fn apply_procedure(procedure: &Procedure, arguments: &[Value]) -> Result<Value, String> {
+    if procedure.params.len() != arguments.len() {
+        return Err(format!(
+            "procedure expected {} arguments, got {}",
+            procedure.params.len(),
+            arguments.len()
+        ));
+    }
+
+    let call_environment = new_environment(Some(procedure.environment.clone()));
+    for (param, argument) in procedure.params.iter().zip(arguments) {
+        define_binding(&call_environment, param.clone(), argument.clone());
+    }
+
+    eval_sequence(&procedure.body, &call_environment)
+}
+
+fn eval_define(arguments: &[Expr], environment: &Environment) -> Result<Value, String> {
+    let (target, body) = arguments
+        .split_first()
+        .ok_or_else(|| "`define` expects at least 2 arguments".to_string())?;
+
+    match target {
+        Expr::Symbol(name) => define_value(name, body, environment),
+        Expr::Application(signature) => define_function(signature, body, environment),
+        _ => Err("`define` expects a symbol name".into()),
+    }
+}
+
+fn define_value(name: &str, body: &[Expr], environment: &Environment) -> Result<Value, String> {
+    let [value_expr] = body else {
         return Err("`define` expects exactly 2 arguments".into());
     };
 
+    let value = eval_expr(value_expr, environment)?;
+    define_binding(environment, name.to_string(), value);
+    Ok(Value::Void)
+}
+
+fn define_function(
+    signature: &[Expr],
+    body: &[Expr],
+    environment: &Environment,
+) -> Result<Value, String> {
+    let (name, params) = signature
+        .split_first()
+        .ok_or_else(|| "`define` expects a function name".to_string())?;
     let Expr::Symbol(name) = name else {
         return Err("`define` expects a symbol name".into());
     };
 
-    let value = eval_expr(value, environment)?;
-    environment.insert(name.clone(), value);
+    if body.is_empty() {
+        return Err("`define` expects a function body".into());
+    }
+
+    let params = parse_parameters(params)?;
+    let procedure = Procedure {
+        params,
+        body: body.to_vec(),
+        environment: environment.clone(),
+    };
+    define_binding(environment, name.clone(), Value::Procedure(procedure));
 
     Ok(Value::Void)
 }
 
-fn eval_if(arguments: &[Expr], environment: &mut Environment) -> Result<Value, String> {
+fn eval_lambda(arguments: &[Expr], environment: &Environment) -> Result<Value, String> {
+    let (params, body) = arguments
+        .split_first()
+        .ok_or_else(|| "`lambda` expects a parameter list and body".to_string())?;
+
+    if body.is_empty() {
+        return Err("`lambda` expects a body".into());
+    }
+
+    let Expr::Application(params) = params else {
+        return Err("`lambda` expects a parameter list".into());
+    };
+    let params = parse_parameters(params)?;
+
+    Ok(Value::Procedure(Procedure {
+        params,
+        body: body.to_vec(),
+        environment: environment.clone(),
+    }))
+}
+
+fn parse_parameters(parameters: &[Expr]) -> Result<Vec<String>, String> {
+    let mut names = Vec::with_capacity(parameters.len());
+
+    for parameter in parameters {
+        let Expr::Symbol(name) = parameter else {
+            return Err("parameter names must be symbols".into());
+        };
+        names.push(name.clone());
+    }
+
+    Ok(names)
+}
+
+fn eval_if(arguments: &[Expr], environment: &Environment) -> Result<Value, String> {
     let [condition, consequent, alternative] = arguments else {
         return Err("`if` expects exactly 3 arguments".into());
     };
@@ -287,7 +505,7 @@ fn eval_not(arguments: &[Value]) -> Result<Value, String> {
     Ok(Value::Boolean(!is_truthy(value)))
 }
 
-fn eval_and(arguments: &[Expr], environment: &mut Environment) -> Result<Value, String> {
+fn eval_and(arguments: &[Expr], environment: &Environment) -> Result<Value, String> {
     let mut last_value = Value::Boolean(true);
 
     for argument in arguments {
@@ -301,7 +519,7 @@ fn eval_and(arguments: &[Expr], environment: &mut Environment) -> Result<Value, 
     Ok(last_value)
 }
 
-fn eval_or(arguments: &[Expr], environment: &mut Environment) -> Result<Value, String> {
+fn eval_or(arguments: &[Expr], environment: &Environment) -> Result<Value, String> {
     for argument in arguments {
         let value = eval_expr(argument, environment)?;
         if is_truthy(&value) {
