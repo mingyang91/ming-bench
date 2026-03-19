@@ -2,22 +2,9 @@
 
 Implement a Scheme interpreter in Rust.
 
-## MANDATORY — Quality Gate (enforced by `test-level.sh`)
+## Quality Gate
 
-These checks run automatically before every test. The script will **reject your code** if any check fails. You do not need to run them manually — but you should be aware of the limits so you don't waste a test cycle.
-
-1. **`mod.rs` impl line count** (bash check in `test-level.sh`):
-   - L01–L03: ≤ 300 lines (bootstrapping)
-   - L04–L06: ≤ 200 lines (time to split into submodules)
-   - L07+: ≤ 100 lines (mod.rs should only contain entry point + reexports)
-2. **Function body length** (`clippy::too-many-lines` via leveled `clippy.toml`):
-   - L01–L05: ≤ 80 lines
-   - L06+: ≤ 60 lines
-3. **Nesting depth** (`clippy::excessive-nesting` via `clippy.toml`):
-   - All levels: ≤ 3 levels
-4. **No `.unwrap()` or `.expect()` in non-test code** (`clippy::unwrap_used` — denied in `src/lib.rs`). Use `?`, `.ok_or(...)`, or `match`.
-5. **Idiomatic Rust** — pedantic clippy lints are enabled in `src/lib.rs` (e.g. `manual_filter_map`, `needless_range_loop`, `explicit_counter_loop`, `vec_init_then_push`, `manual_let_else`). Combined with `#![deny(warnings)]`, these are errors. Many are auto-fixed by `clippy --fix`; the rest you must fix manually.
-6. **Dead code allowance.** L01–L05: `dead_code` lint is suppressed (forward-declared types are OK). L06+: all dead code is denied.
+`test-level.sh` enforces code quality checks (clippy lints, mod.rs size limits, etc.) **before** running tests. Violations block testing. Write clean, modular, idiomatic Rust from the start to avoid rework. Read `src/lib.rs` for the active lint configuration.
 
 ## Contract
 
@@ -80,35 +67,11 @@ These checks run automatically before every test. The script will **reject your 
 - The empty list prints as `()`
 - Strings print with surrounding quotes: `"hello"`
 
-## File Structure
+## Code Style
 
-`mod.rs` should only contain module declarations, re-exports, and the `eval_str` entry point. Split implementation logic into submodules organized by responsibility. The mod.rs line limit (see Quality Gate item 1) enforces this — when you hit the limit, extract a submodule.
+Write clean, idiomatic Rust. The quality gate enforces structure mechanically; these are additional expectations:
 
-How you organize submodules is up to you. Choose a structure that groups related logic and keeps each file focused on one responsibility.
-
-## Code Rules
-
-These rules are NOT enforced by tooling. They represent style expectations that clippy cannot check.
-
-### Error Handling
-- Use `?` operator for error propagation.
-- Use `thiserror` for typed error enums. Do not flatten all errors to `String`.
-
-### Functional Style (beyond what clippy enforces)
+- **Use `thiserror`** for typed error enums. Do not flatten all errors to `String`.
 - **Immutable-first.** Build new values from inputs instead of mutating temporaries.
-- **`collect::<Result<Vec<_>, _>>()?`** for fallible collection transforms.
-- **Slice patterns** (`[first, rest @ ..]`) over indexing (`args[0]`, `&args[1..]`) when the length is statically known.
-- **No `vec.insert(0, x)` or `vec.remove(0)`** — build new vecs instead.
-
-### Observability
-- **`log::debug!`** at key decision points (e.g. dispatch, error paths).
-- **`debug_assert!`** on structural invariants after operations that establish them.
-
-### Compiler Discipline
-- `#![deny(warnings)]` and `#![deny(clippy::unwrap_used)]` in `src/lib.rs`. Do not remove.
-- Pedantic clippy lints are also configured as `#![warn(...)]` in `src/lib.rs`. Do not remove them.
-- `cargo fmt --check` must pass.
-
-### Development Workflow
-- **Fix violations immediately.** Do not defer to later levels.
-- **When touching a file, fix violations in that file.** Do not leave rule violations in code you're editing. Do not rewrite unrelated files unprompted.
+- **Keep `mod.rs` thin.** Entry point and re-exports only; implementation goes in submodules.
+- **When touching a file, fix violations in that file.** Do not defer. Do not rewrite unrelated files unprompted.
