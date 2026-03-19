@@ -37,6 +37,12 @@ pub(crate) enum SchemeError {
         min: usize,
         actual: usize,
     },
+    #[error("`{operator}` expected exactly {expected} argument(s) but got {actual}")]
+    WrongArgumentCount {
+        operator: &'static str,
+        expected: usize,
+        actual: usize,
+    },
     #[error("cannot divide by zero")]
     DivisionByZero,
 }

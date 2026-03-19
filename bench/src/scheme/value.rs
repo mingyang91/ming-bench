@@ -19,6 +19,10 @@ impl Value {
         }
     }
 
+    pub(crate) fn is_truthy(&self) -> bool {
+        !matches!(self, Self::Boolean(false))
+    }
+
     pub(crate) fn kind(&self) -> &'static str {
         match self {
             Self::Integer(_) => "number",

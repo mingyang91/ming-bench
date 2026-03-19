@@ -48,6 +48,13 @@ fn apply_builtin(operator: &str, operands: &[Expr]) -> Result<Value, SchemeError
         "-" => eval_subtraction(operands),
         "*" => eval_multiplication(operands),
         "/" => eval_division(operands),
+        "<" => eval_comparison("<", operands, |lhs, rhs| lhs < rhs),
+        ">" => eval_comparison(">", operands, |lhs, rhs| lhs > rhs),
+        "=" => eval_comparison("=", operands, |lhs, rhs| lhs == rhs),
+        "<=" => eval_comparison("<=", operands, |lhs, rhs| lhs <= rhs),
+        "not" => eval_not(operands),
+        "and" => eval_and(operands),
+        "or" => eval_or(operands),
         _ => Err(SchemeError::UnboundSymbol {
             name: operator.to_owned(),
         }),
@@ -96,6 +103,70 @@ fn eval_division(operands: &[Expr]) -> Result<Value, SchemeError> {
             Ok(Value::Integer(quotient))
         }
     }
+}
+
+fn eval_comparison<F>(
+    operator: &'static str,
+    operands: &[Expr],
+    compare: F,
+) -> Result<Value, SchemeError>
+where
+    F: Fn(i64, i64) -> bool,
+{
+    let numbers = eval_numbers(operator, operands)?;
+
+    match numbers.as_slice() {
+        [] | [_] => Err(SchemeError::TooFewArguments {
+            operator,
+            min: 2,
+            actual: numbers.len(),
+        }),
+        _ => Ok(Value::Boolean(
+            numbers.windows(2).all(|pair| compare(pair[0], pair[1])),
+        )),
+    }
+}
+
+fn eval_not(operands: &[Expr]) -> Result<Value, SchemeError> {
+    match operands {
+        [operand] => {
+            let value = eval_expr(operand)?;
+            Ok(Value::Boolean(!value.is_truthy()))
+        }
+        _ => Err(SchemeError::WrongArgumentCount {
+            operator: "not",
+            expected: 1,
+            actual: operands.len(),
+        }),
+    }
+}
+
+fn eval_and(operands: &[Expr]) -> Result<Value, SchemeError> {
+    let mut last_value = Value::Boolean(true);
+
+    for operand in operands {
+        let value = eval_expr(operand)?;
+
+        if !value.is_truthy() {
+            return Ok(value);
+        }
+
+        last_value = value;
+    }
+
+    Ok(last_value)
+}
+
+fn eval_or(operands: &[Expr]) -> Result<Value, SchemeError> {
+    for operand in operands {
+        let value = eval_expr(operand)?;
+
+        if value.is_truthy() {
+            return Ok(value);
+        }
+    }
+
+    Ok(Value::Boolean(false))
 }
 
 fn eval_numbers(operator: &'static str, operands: &[Expr]) -> Result<Vec<i64>, SchemeError> {
