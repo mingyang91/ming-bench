@@ -517,9 +517,12 @@ fn run_agent_with_tee(cmd: &str, args: &[&str], workdir: &Path, output_file: &Pa
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
-        .map_err(|e| Error::Io {
-            path: PathBuf::from(cmd),
-            source: e,
+        .map_err(|e| {
+            if e.kind() == std::io::ErrorKind::NotFound {
+                Error::BinaryNotFound { name: cmd.to_string() }
+            } else {
+                Error::Io { path: PathBuf::from(cmd), source: e }
+            }
         })?;
 
     CHILD_PID.store(child.id(), Ordering::Relaxed);
