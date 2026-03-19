@@ -334,13 +334,13 @@ fn eval_application_outcome(
 
     if let Some(name) = symbol_name(operator) {
         match name {
-            "and" => return eval_and(arguments, environment).map(EvalOutcome::Value),
-            "or" => return eval_or(arguments, environment).map(EvalOutcome::Value),
-            "begin" => return eval_begin(arguments, environment).map(EvalOutcome::Value),
-            "cond" => return eval_cond(arguments, environment).map(EvalOutcome::Value),
+            "and" => return eval_and(arguments, environment, tail_position),
+            "or" => return eval_or(arguments, environment, tail_position),
+            "begin" => return eval_begin(arguments, environment, tail_position),
+            "cond" => return eval_cond(arguments, environment, tail_position),
             "if" => return eval_if(arguments, environment, tail_position),
             "define" => return eval_define(arguments, environment).map(EvalOutcome::Value),
-            "let" => return eval_let(arguments, environment).map(EvalOutcome::Value),
+            "let" => return eval_let(arguments, environment, tail_position),
             "quote" => return eval_quote(arguments).map(EvalOutcome::Value),
             "lambda" => return eval_lambda(arguments, environment).map(EvalOutcome::Value),
             "set!" => return eval_set(arguments, environment).map(EvalOutcome::Value),
@@ -526,11 +526,54 @@ fn eval_set(arguments: &[Expr], environment: &Environment) -> Result<Value, Stri
     Ok(Value::Void)
 }
 
-fn eval_begin(arguments: &[Expr], environment: &Environment) -> Result<Value, String> {
-    eval_sequence(arguments, environment)
+fn eval_begin(
+    arguments: &[Expr],
+    environment: &Environment,
+    tail_position: bool,
+) -> Result<EvalOutcome, String> {
+    eval_sequence_outcome(arguments, environment, tail_position)
 }
 
-fn eval_let(arguments: &[Expr], environment: &Environment) -> Result<Value, String> {
+fn eval_let(
+    arguments: &[Expr],
+    environment: &Environment,
+    tail_position: bool,
+) -> Result<EvalOutcome, String> {
+    let (first, rest) = arguments
+        .split_first()
+        .ok_or_else(|| "`let` expects bindings and a body".to_string())?;
+
+    match first {
+        Expr::Symbol(name) => eval_named_let(name, rest, environment, tail_position),
+        Expr::Application(bindings) => eval_regular_let(bindings, rest, environment, tail_position),
+        _ => Err("`let` expects a binding list".into()),
+    }
+}
+
+fn eval_regular_let(
+    bindings: &[Expr],
+    body: &[Expr],
+    environment: &Environment,
+    tail_position: bool,
+) -> Result<EvalOutcome, String> {
+    if body.is_empty() {
+        return Err("`let` expects a body".into());
+    }
+
+    let let_environment = new_environment(Some(environment.clone()));
+    for (name, value) in eval_let_bindings(bindings, environment)? {
+        define_binding(&let_environment, name, value);
+    }
+
+    eval_sequence_outcome(body, &let_environment, tail_position)
+}
+
+fn eval_named_let(
+    name: &str,
+    arguments: &[Expr],
+    environment: &Environment,
+    tail_position: bool,
+) -> Result<EvalOutcome, String> {
     let (bindings, body) = arguments
         .split_first()
         .ok_or_else(|| "`let` expects bindings and a body".to_string())?;
@@ -543,18 +586,39 @@ fn eval_let(arguments: &[Expr], environment: &Environment) -> Result<Value, Stri
         return Err("`let` expects a binding list".into());
     };
 
-    let mut evaluated_bindings = Vec::with_capacity(bindings.len());
-    for binding in bindings {
-        let (name, value) = eval_let_binding(binding, environment)?;
-        evaluated_bindings.push((name, value));
-    }
+    let (params, arguments): (Vec<_>, Vec<_>) = eval_let_bindings(bindings, environment)?
+        .into_iter()
+        .unzip();
 
     let let_environment = new_environment(Some(environment.clone()));
-    for (name, value) in evaluated_bindings {
-        define_binding(&let_environment, name, value);
-    }
+    let procedure = Procedure {
+        params: params.into(),
+        rest_param: None,
+        body: body.to_vec().into(),
+        environment: let_environment.clone(),
+    };
+    define_binding(
+        &let_environment,
+        name.to_string(),
+        Value::Procedure(procedure.clone()),
+    );
 
-    eval_sequence(body, &let_environment)
+    if tail_position {
+        Ok(EvalOutcome::TailCall(procedure, arguments))
+    } else {
+        apply_procedure(procedure, arguments).map(EvalOutcome::Value)
+    }
+}
+
+fn eval_let_bindings(
+    bindings: &[Expr],
+    environment: &Environment,
+) -> Result<Vec<(String, Value)>, String> {
+    let mut evaluated_bindings = Vec::with_capacity(bindings.len());
+    for binding in bindings {
+        evaluated_bindings.push(eval_let_binding(binding, environment)?);
+    }
+    Ok(evaluated_bindings)
 }
 
 fn eval_let_binding(binding: &Expr, environment: &Environment) -> Result<(String, Value), String> {
@@ -626,21 +690,31 @@ fn eval_if(
     }
 }
 
-fn eval_cond(arguments: &[Expr], environment: &Environment) -> Result<Value, String> {
+fn eval_cond(
+    arguments: &[Expr],
+    environment: &Environment,
+    tail_position: bool,
+) -> Result<EvalOutcome, String> {
     for (index, clause) in arguments.iter().enumerate() {
-        if let Some(value) = eval_cond_clause(clause, index + 1 == arguments.len(), environment)? {
-            return Ok(value);
+        if let Some(outcome) = eval_cond_clause(
+            clause,
+            index + 1 == arguments.len(),
+            environment,
+            tail_position,
+        )? {
+            return Ok(outcome);
         }
     }
 
-    Ok(Value::Void)
+    Ok(EvalOutcome::Value(Value::Void))
 }
 
 fn eval_cond_clause(
     clause: &Expr,
     is_last: bool,
     environment: &Environment,
-) -> Result<Option<Value>, String> {
+    tail_position: bool,
+) -> Result<Option<EvalOutcome>, String> {
     let Expr::Application(clause_parts) = clause else {
         return Err("`cond` clauses must be lists".into());
     };
@@ -650,7 +724,7 @@ fn eval_cond_clause(
         .ok_or_else(|| "`cond` clauses must not be empty".to_string())?;
 
     if matches!(test, Expr::Symbol(name) if name == "else") {
-        return eval_else_clause(body, is_last, environment).map(Some);
+        return eval_else_clause(body, is_last, environment, tail_position).map(Some);
     }
 
     let test_value = eval_expr(test, environment)?;
@@ -658,19 +732,20 @@ fn eval_cond_clause(
         return Ok(None);
     }
 
-    let value = if body.is_empty() {
-        test_value
+    let outcome = if body.is_empty() {
+        EvalOutcome::Value(test_value)
     } else {
-        eval_sequence(body, environment)?
+        eval_sequence_outcome(body, environment, tail_position)?
     };
-    Ok(Some(value))
+    Ok(Some(outcome))
 }
 
 fn eval_else_clause(
     body: &[Expr],
     is_last: bool,
     environment: &Environment,
-) -> Result<Value, String> {
+    tail_position: bool,
+) -> Result<EvalOutcome, String> {
     if !is_last {
         return Err("`cond` `else` clause must be last".into());
     }
@@ -678,7 +753,7 @@ fn eval_else_clause(
         return Err("`cond` `else` clause must have a body".into());
     }
 
-    eval_sequence(body, environment)
+    eval_sequence_outcome(body, environment, tail_position)
 }
 
 fn eval_quote(arguments: &[Expr]) -> Result<Value, String> {
@@ -945,29 +1020,42 @@ fn list_to_vec(list: &Value) -> Result<Vec<Value>, String> {
     }
 }
 
-fn eval_and(arguments: &[Expr], environment: &Environment) -> Result<Value, String> {
-    let mut last_value = Value::Boolean(true);
+fn eval_and(
+    arguments: &[Expr],
+    environment: &Environment,
+    tail_position: bool,
+) -> Result<EvalOutcome, String> {
+    let Some((last, initial)) = arguments.split_last() else {
+        return Ok(EvalOutcome::Value(Value::Boolean(true)));
+    };
 
-    for argument in arguments {
+    for argument in initial {
         let value = eval_expr(argument, environment)?;
         if !is_truthy(&value) {
-            return Ok(value);
+            return Ok(EvalOutcome::Value(value));
         }
-        last_value = value;
     }
 
-    Ok(last_value)
+    eval_expr_outcome(last, environment, tail_position)
 }
 
-fn eval_or(arguments: &[Expr], environment: &Environment) -> Result<Value, String> {
-    for argument in arguments {
+fn eval_or(
+    arguments: &[Expr],
+    environment: &Environment,
+    tail_position: bool,
+) -> Result<EvalOutcome, String> {
+    let Some((last, initial)) = arguments.split_last() else {
+        return Ok(EvalOutcome::Value(Value::Boolean(false)));
+    };
+
+    for argument in initial {
         let value = eval_expr(argument, environment)?;
         if is_truthy(&value) {
-            return Ok(value);
+            return Ok(EvalOutcome::Value(value));
         }
     }
 
-    Ok(Value::Boolean(false))
+    eval_expr_outcome(last, environment, tail_position)
 }
 
 fn expect_integer(value: &Value, operator: &str) -> Result<i64, String> {
