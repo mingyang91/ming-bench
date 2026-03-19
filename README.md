@@ -88,7 +88,7 @@ This prevents agent-written infinite loops or memory bombs from crashing the ben
 | 15 | **Macros** | 5 | `define-syntax`, `syntax-rules`, hygiene, ellipsis |
 | 16 | **Integration** | 5 | call/cc + macros + mutation + TCO combined |
 
-Levels 1-9 are foundational. Level 10 requires a fundamental architectural change (trampoline or CPS). Levels 14-16 are where most agents struggle — continuations and macros demand non-obvious design decisions.
+Levels 1-9 are foundational. Level 10 requires rethinking evaluation to support deep recursion. Levels 14-16 are where most agents struggle — continuations and macros demand non-obvious design decisions.
 
 ## Tooling
 
@@ -112,13 +112,14 @@ cargo xtask verify          # ground-truth check against Guile Scheme
 
 `cargo xtask run-agent` handles the full lifecycle:
 
-1. Creates an isolated git worktree from the target branch
-2. Pre-builds dependencies (warm cache)
-3. Launches the agent (Claude, Codex, or OpenCode)
-4. Captures session transcripts
-5. Runs the benchmark scorer
-6. Records results with metadata (timing, tokens, scores)
-7. Commits checkpoints and pushes to origin
+1. Creates an isolated git worktree
+2. Symlinks the selected strategy file as `bench/CLAUDE.md`
+3. Pre-builds dependencies (warm cache)
+4. Launches the agent (Claude, Codex, or OpenCode)
+5. Captures session transcripts
+6. Runs the benchmark scorer
+7. Records results with metadata (timing, tokens, scores)
+8. Commits checkpoints and pushes to origin
 
 Each run is self-contained — unique worktree, UUID, results directory. Multiple runs execute in parallel without interference.
 
@@ -127,7 +128,7 @@ Each run is self-contained — unique worktree, UUID, results directory. Multipl
 **Cleanup:** If a previous run left a stale worktree or branch, use `--clean` to auto-remove them:
 
 ```bash
-cargo xtask run-agent --base main --name claude-r1 --clean --agent claude --mode levels
+cargo xtask run-agent --strategy default --name claude-r1 --clean --agent claude --mode levels
 ```
 
 Without `--clean`, you'll get distinct errors for stale directories vs stale branches, with instructions on how to fix each.
