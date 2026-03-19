@@ -1,59 +1,77 @@
 use super::types::{Env, Value};
 
+enum Trampoline {
+    Done(Value),
+    Bounce { expr: Value, env: Env },
+}
+
 pub fn eval(expr: &Value, env: &Env) -> Result<Value, String> {
+    let mut current_expr = expr.clone();
+    let mut current_env = env.clone();
+
+    loop {
+        match eval_inner(&current_expr, &current_env)? {
+            Trampoline::Done(val) => return Ok(val),
+            Trampoline::Bounce { expr, env } => {
+                current_expr = expr;
+                current_env = env;
+            }
+        }
+    }
+}
+
+fn eval_inner(expr: &Value, env: &Env) -> Result<Trampoline, String> {
     match expr {
-        Value::Integer(_) | Value::Boolean(_) | Value::String(_) => Ok(expr.clone()),
+        Value::Integer(_) | Value::Boolean(_) | Value::String(_) => Ok(Trampoline::Done(expr.clone())),
         Value::Symbol(name) => env
             .get(name)
+            .map(Trampoline::Done)
             .ok_or_else(|| format!("unbound variable: {name}")),
         Value::List(elems) => eval_list(elems, env),
         _ => Err(format!("cannot evaluate: {expr}")),
     }
 }
 
-fn eval_list(elems: &[Value], env: &Env) -> Result<Value, String> {
+fn eval_list(elems: &[Value], env: &Env) -> Result<Trampoline, String> {
     if elems.is_empty() {
         return Err("empty application".into());
     }
-    // Check for special forms
     if let Value::Symbol(s) = &elems[0] {
         match s.as_str() {
-            "define" => return eval_define(&elems[1..], env),
+            "define" => return eval_define(&elems[1..], env).map(Trampoline::Done),
             "if" => return eval_if(&elems[1..], env),
-            "quote" => return eval_quote(&elems[1..]),
+            "quote" => return eval_quote(&elems[1..]).map(Trampoline::Done),
             "and" => return eval_and(&elems[1..], env),
             "or" => return eval_or(&elems[1..], env),
-            "lambda" => return eval_lambda(&elems[1..], env),
+            "lambda" => return eval_lambda(&elems[1..], env).map(Trampoline::Done),
             "begin" => return eval_begin(&elems[1..], env),
             "let" => return eval_let(&elems[1..], env),
             "cond" => return eval_cond(&elems[1..], env),
             _ => {}
         }
     }
-    // Procedure call
     eval_call(elems, env)
 }
 
-fn eval_call(elems: &[Value], env: &Env) -> Result<Value, String> {
-    // If operator is a symbol, try env first, then primitive fallback
+fn eval_call(elems: &[Value], env: &Env) -> Result<Trampoline, String> {
     if let Value::Symbol(name) = &elems[0] {
         let args = eval_args(&elems[1..], env)?;
         return match env.get(name) {
-            Some(proc) => apply(&proc, &args),
-            None => apply_primitive(name, &args),
+            Some(proc) => apply_tco(&proc, &args),
+            None => apply_primitive(name, &args).map(Trampoline::Done),
         };
     }
-    // Operator is an expression (e.g. a lambda form) — evaluate it
     let proc = eval(&elems[0], env)?;
     let args = eval_args(&elems[1..], env)?;
-    apply(&proc, &args)
+    apply_tco(&proc, &args)
 }
 
 fn eval_args(exprs: &[Value], env: &Env) -> Result<Vec<Value>, String> {
     exprs.iter().map(|e| eval(e, env)).collect()
 }
 
-fn apply(proc: &Value, args: &[Value]) -> Result<Value, String> {
+/// TCO apply: returns Bounce for the lambda body instead of evaluating it.
+fn apply_tco(proc: &Value, args: &[Value]) -> Result<Trampoline, String> {
     match proc {
         Value::Lambda { params, body, env } => {
             if params.len() != args.len() {
@@ -67,7 +85,10 @@ fn apply(proc: &Value, args: &[Value]) -> Result<Value, String> {
             for (param, arg) in params.iter().zip(args) {
                 child.set(param.clone(), arg.clone());
             }
-            eval(body, &child)
+            Ok(Trampoline::Bounce {
+                expr: *body.clone(),
+                env: child,
+            })
         }
         other => Err(format!("not a procedure: {other}")),
     }
@@ -86,7 +107,6 @@ fn eval_define(args: &[Value], env: &Env) -> Result<Value, String> {
             Ok(Value::Void)
         }
         Value::List(elems) if !elems.is_empty() => {
-            // (define (name params...) body...) sugar
             let name = match &elems[0] {
                 Value::Symbol(s) => s.clone(),
                 other => return Err(format!("define: expected symbol, got {other}")),
@@ -121,7 +141,6 @@ fn eval_lambda(args: &[Value], env: &Env) -> Result<Value, String> {
     })
 }
 
-/// Wrap multiple body expressions into a single `(begin ...)` form if needed.
 fn wrap_body(exprs: &[Value]) -> Value {
     if exprs.len() == 1 {
         exprs[0].clone()
@@ -142,17 +161,23 @@ fn extract_params(elems: &[Value]) -> Result<Vec<String>, String> {
         .collect()
 }
 
-fn eval_if(args: &[Value], env: &Env) -> Result<Value, String> {
+fn eval_if(args: &[Value], env: &Env) -> Result<Trampoline, String> {
     if args.len() < 2 || args.len() > 3 {
         return Err(format!("if requires 2-3 arguments, got {}", args.len()));
     }
     let cond = eval(&args[0], env)?;
     if is_truthy(&cond) {
-        eval(&args[1], env)
+        Ok(Trampoline::Bounce {
+            expr: args[1].clone(),
+            env: env.clone(),
+        })
     } else if args.len() == 3 {
-        eval(&args[2], env)
+        Ok(Trampoline::Bounce {
+            expr: args[2].clone(),
+            env: env.clone(),
+        })
     } else {
-        Ok(Value::Void)
+        Ok(Trampoline::Done(Value::Void))
     }
 }
 
@@ -163,37 +188,52 @@ fn eval_quote(args: &[Value]) -> Result<Value, String> {
     Ok(args[0].clone())
 }
 
-fn eval_and(exprs: &[Value], env: &Env) -> Result<Value, String> {
-    let mut result = Value::Boolean(true);
-    for expr in exprs {
-        result = eval(expr, env)?;
+fn eval_and(exprs: &[Value], env: &Env) -> Result<Trampoline, String> {
+    if exprs.is_empty() {
+        return Ok(Trampoline::Done(Value::Boolean(true)));
+    }
+    for expr in &exprs[..exprs.len() - 1] {
+        let result = eval(expr, env)?;
         if !is_truthy(&result) {
-            return Ok(result);
+            return Ok(Trampoline::Done(result));
         }
     }
-    Ok(result)
+    Ok(Trampoline::Bounce {
+        expr: exprs[exprs.len() - 1].clone(),
+        env: env.clone(),
+    })
 }
 
-fn eval_or(exprs: &[Value], env: &Env) -> Result<Value, String> {
-    let mut result = Value::Boolean(false);
-    for expr in exprs {
-        result = eval(expr, env)?;
+fn eval_or(exprs: &[Value], env: &Env) -> Result<Trampoline, String> {
+    if exprs.is_empty() {
+        return Ok(Trampoline::Done(Value::Boolean(false)));
+    }
+    for expr in &exprs[..exprs.len() - 1] {
+        let result = eval(expr, env)?;
         if is_truthy(&result) {
-            return Ok(result);
+            return Ok(Trampoline::Done(result));
         }
     }
-    Ok(result)
+    Ok(Trampoline::Bounce {
+        expr: exprs[exprs.len() - 1].clone(),
+        env: env.clone(),
+    })
 }
 
-fn eval_begin(exprs: &[Value], env: &Env) -> Result<Value, String> {
-    let mut result = Value::Void;
-    for expr in exprs {
-        result = eval(expr, env)?;
+fn eval_begin(exprs: &[Value], env: &Env) -> Result<Trampoline, String> {
+    if exprs.is_empty() {
+        return Ok(Trampoline::Done(Value::Void));
     }
-    Ok(result)
+    for expr in &exprs[..exprs.len() - 1] {
+        eval(expr, env)?;
+    }
+    Ok(Trampoline::Bounce {
+        expr: exprs[exprs.len() - 1].clone(),
+        env: env.clone(),
+    })
 }
 
-fn eval_let(args: &[Value], env: &Env) -> Result<Value, String> {
+fn eval_let(args: &[Value], env: &Env) -> Result<Trampoline, String> {
     if args.len() < 2 {
         return Err(format!("let requires at least 2 arguments, got {}", args.len()));
     }
@@ -215,10 +255,13 @@ fn eval_let(args: &[Value], env: &Env) -> Result<Value, String> {
         child.set(name, val);
     }
     let body = wrap_body(&args[1..]);
-    eval(&body, &child)
+    Ok(Trampoline::Bounce {
+        expr: body,
+        env: child,
+    })
 }
 
-fn eval_cond(clauses: &[Value], env: &Env) -> Result<Value, String> {
+fn eval_cond(clauses: &[Value], env: &Env) -> Result<Trampoline, String> {
     for clause in clauses {
         let elems = match clause {
             Value::List(elems) if !elems.is_empty() => elems,
@@ -231,17 +274,12 @@ fn eval_cond(clauses: &[Value], env: &Env) -> Result<Value, String> {
         if !is_truthy(&test) {
             continue;
         }
-        return eval_cond_branch(&test, &elems[1..], env);
+        if elems[1..].is_empty() {
+            return Ok(Trampoline::Done(test));
+        }
+        return eval_begin(&elems[1..], env);
     }
-    Ok(Value::Void)
-}
-
-fn eval_cond_branch(test: &Value, body: &[Value], env: &Env) -> Result<Value, String> {
-    if body.is_empty() {
-        Ok(test.clone())
-    } else {
-        eval_begin(body, env)
-    }
+    Ok(Trampoline::Done(Value::Void))
 }
 
 fn is_truthy(v: &Value) -> bool {
