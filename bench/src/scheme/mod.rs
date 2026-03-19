@@ -51,8 +51,66 @@ fn eval(expr: &Expr) -> Result<Expr, String> {
 fn eval_builtin(op: &str, args: &[Expr]) -> Result<Expr, String> {
     match op {
         "+" | "-" | "*" | "/" => eval_arithmetic(op, args),
+        "<" | ">" | "=" | "<=" => eval_comparison(op, args),
+        "not" => {
+            if args.len() != 1 {
+                return Err("not requires exactly one argument".into());
+            }
+            let val = eval(&args[0])?;
+            Ok(Expr::Boolean(is_false(&val)))
+        }
+        "and" => eval_and(args),
+        "or" => eval_or(args),
         _ => Err(format!("unknown procedure: {op}")),
     }
+}
+
+fn is_false(expr: &Expr) -> bool {
+    matches!(expr, Expr::Boolean(false))
+}
+
+fn eval_comparison(op: &str, args: &[Expr]) -> Result<Expr, String> {
+    if args.len() != 2 {
+        return Err(format!("{op} requires exactly two arguments"));
+    }
+    let a = match eval(&args[0])? {
+        Expr::Integer(n) => n,
+        other => return Err(format!("expected number, got {}", other.to_display())),
+    };
+    let b = match eval(&args[1])? {
+        Expr::Integer(n) => n,
+        other => return Err(format!("expected number, got {}", other.to_display())),
+    };
+    let result = match op {
+        "<" => a < b,
+        ">" => a > b,
+        "=" => a == b,
+        "<=" => a <= b,
+        _ => unreachable!(),
+    };
+    Ok(Expr::Boolean(result))
+}
+
+fn eval_and(args: &[Expr]) -> Result<Expr, String> {
+    let mut result = Expr::Boolean(true);
+    for arg in args {
+        result = eval(arg)?;
+        if is_false(&result) {
+            return Ok(result);
+        }
+    }
+    Ok(result)
+}
+
+fn eval_or(args: &[Expr]) -> Result<Expr, String> {
+    let mut result = Expr::Boolean(false);
+    for arg in args {
+        result = eval(arg)?;
+        if !is_false(&result) {
+            return Ok(result);
+        }
+    }
+    Ok(result)
 }
 
 fn eval_arithmetic(op: &str, args: &[Expr]) -> Result<Expr, String> {
