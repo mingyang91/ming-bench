@@ -177,6 +177,7 @@ fn is_truthy(v: &Value) -> bool {
 
 fn apply_primitive(op: &str, args: &[Value]) -> Result<Value, String> {
     match op {
+        "cons" | "car" | "cdr" | "null?" | "list" | "length" => apply_list_primitive(op, args),
         "not" => {
             if args.len() != 1 {
                 return Err(format!("not requires 1 argument, got {}", args.len()));
@@ -222,6 +223,41 @@ fn require_nums(args: &[Value]) -> Result<Vec<i64>, String> {
             other => Err(format!("expected number, got: {other}")),
         })
         .collect()
+}
+
+fn apply_list_primitive(op: &str, args: &[Value]) -> Result<Value, String> {
+    match op {
+        "cons" => {
+            if args.len() != 2 {
+                return Err(format!("cons requires 2 arguments, got {}", args.len()));
+            }
+            match &args[1] {
+                Value::List(elems) => {
+                    let mut new = vec![args[0].clone()];
+                    new.extend(elems.iter().cloned());
+                    Ok(Value::List(new))
+                }
+                _ => Err(format!("cons: second argument must be a list, got {}", args[1])),
+            }
+        }
+        "car" => match &args[0] {
+            Value::List(elems) if !elems.is_empty() => Ok(elems[0].clone()),
+            _ => Err(format!("car: expected non-empty list, got {}", args[0])),
+        },
+        "cdr" => match &args[0] {
+            Value::List(elems) if !elems.is_empty() => Ok(Value::List(elems[1..].to_vec())),
+            _ => Err(format!("cdr: expected non-empty list, got {}", args[0])),
+        },
+        "null?" => {
+            Ok(Value::Boolean(matches!(&args[0], Value::List(elems) if elems.is_empty())))
+        }
+        "list" => Ok(Value::List(args.to_vec())),
+        "length" => match &args[0] {
+            Value::List(elems) => Ok(Value::Integer(elems.len() as i64)),
+            _ => Err(format!("length: expected list, got {}", args[0])),
+        },
+        _ => unreachable!(),
+    }
 }
 
 fn checked_div(nums: &[i64]) -> Result<Value, String> {

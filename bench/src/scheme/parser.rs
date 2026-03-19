@@ -35,6 +35,7 @@ impl<'a> Parser<'a> {
         self.skip_whitespace();
         let ch = self.peek().ok_or(ParseError::UnexpectedEof)?;
         match ch {
+            '\'' => self.parse_quote(),
             '(' => self.parse_list(),
             '"' => self.parse_string(),
             '#' => self.parse_boolean(),
@@ -100,6 +101,12 @@ impl<'a> Parser<'a> {
         self.input[self.pos..].chars().next()
     }
 
+    fn parse_quote(&mut self) -> Result<Value, ParseError> {
+        self.pos += 1; // skip '\''
+        let inner = self.parse_expr()?;
+        Ok(Value::List(vec![Value::Symbol("quote".into()), inner]))
+    }
+
     fn parse_list(&mut self) -> Result<Value, ParseError> {
         self.pos += 1; // skip '('
         let mut elems = Vec::new();
@@ -126,5 +133,5 @@ impl<'a> Parser<'a> {
 }
 
 fn is_symbol_char(ch: char) -> bool {
-    !ch.is_whitespace() && !matches!(ch, '(' | ')' | '"' | ';')
+    !ch.is_whitespace() && !matches!(ch, '(' | ')' | '"' | ';' | '\'')
 }
