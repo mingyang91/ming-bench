@@ -1,9 +1,10 @@
 use std::fmt::{self, Display, Formatter};
 use std::rc::Rc;
 
+use crate::scheme::builtin::Builtin;
 use crate::scheme::environment::Environment;
 use crate::scheme::parser::Expr;
-use crate::scheme::procedure::Procedure;
+use crate::scheme::procedure::{Parameters, Procedure};
 
 #[derive(Debug, Clone)]
 pub(crate) enum Value {
@@ -13,6 +14,7 @@ pub(crate) enum Value {
     Symbol(String),
     EmptyList,
     Pair(Box<Pair>),
+    Builtin(Builtin),
     Procedure(Rc<Procedure>),
     Void,
 }
@@ -38,7 +40,7 @@ impl Value {
     }
 
     pub(crate) fn procedure(
-        parameters: Vec<String>,
+        parameters: Parameters,
         body: Vec<Expr>,
         environment: Environment,
     ) -> Self {
@@ -100,6 +102,23 @@ impl Value {
         }
     }
 
+    pub(crate) fn into_list_elements(self) -> Result<Vec<Self>, Self> {
+        let mut elements = Vec::new();
+        let mut rest = self;
+
+        while let Self::Pair(pair) = rest {
+            let Pair { car, cdr } = *pair;
+            elements.push(car);
+            rest = cdr;
+        }
+
+        if matches!(rest, Self::EmptyList) {
+            Ok(elements)
+        } else {
+            Err(rest)
+        }
+    }
+
     pub(crate) fn kind(&self) -> &'static str {
         match self {
             Self::Integer(_) => "number",
@@ -108,6 +127,7 @@ impl Value {
             Self::Symbol(_) => "symbol",
             Self::EmptyList => "empty list",
             Self::Pair(_) => "pair",
+            Self::Builtin(_) => "procedure",
             Self::Procedure(_) => "procedure",
             Self::Void => "void",
         }
@@ -143,6 +163,7 @@ impl Display for Value {
             Self::Symbol(value) => f.write_str(value),
             Self::EmptyList => f.write_str("()"),
             Self::Pair(pair) => write_pair(pair, f),
+            Self::Builtin(_) => f.write_str("#<procedure>"),
             Self::Procedure(_) => f.write_str("#<procedure>"),
             Self::Void => f.write_str("#<void>"),
         }

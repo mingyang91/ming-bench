@@ -82,6 +82,8 @@ pub(crate) enum SchemeError {
         operator: &'static str,
         found: &'static str,
     },
+    #[error("`{operator}` has an invalid dotted parameter list")]
+    InvalidDottedParameterList { operator: &'static str },
     #[error("`{operator}` parameter expected a symbol but got {found}")]
     InvalidParameterName {
         operator: &'static str,
@@ -92,6 +94,8 @@ pub(crate) enum SchemeError {
         operator: &'static str,
         name: String,
     },
+    #[error("procedure expected at least {min} argument(s) but got {actual}")]
+    TooFewProcedureArguments { min: usize, actual: usize },
     #[error("procedure expected exactly {expected} argument(s) but got {actual}")]
     WrongProcedureArgumentCount { expected: usize, actual: usize },
     #[error("`cond` expected a clause list but got {found}")]
