@@ -46,6 +46,7 @@ impl<'a> Parser<'a> {
 
         match self.peek_char() {
             Some('(') => self.parse_list(),
+            Some('\'') => self.parse_quote(),
             Some('"') => self.parse_string(),
             Some('#') => self.parse_boolean(),
             Some(')') => Err(SchemeError::UnexpectedCloseParen { index: self.index }),
@@ -73,6 +74,12 @@ impl<'a> Parser<'a> {
         } else {
             Err(SchemeError::UnexpectedEndOfInput { context: "list" })
         }
+    }
+
+    fn parse_quote(&mut self) -> Result<Expr, SchemeError> {
+        let _ = self.advance_char();
+        let quoted = self.parse_expr()?;
+        Ok(Expr::List(vec![Expr::Symbol("quote".to_owned()), quoted]))
     }
 
     fn parse_boolean(&mut self) -> Result<Expr, SchemeError> {
@@ -108,9 +115,7 @@ impl<'a> Parser<'a> {
         if token.is_empty() {
             match self.peek_char() {
                 Some(ch) => Err(SchemeError::InvalidTokenStart { ch, index: start }),
-                None => Err(SchemeError::UnexpectedEndOfInput {
-                    context: "symbol",
-                }),
+                None => Err(SchemeError::UnexpectedEndOfInput { context: "symbol" }),
             }
         } else {
             Ok(Expr::Symbol(token.to_owned()))

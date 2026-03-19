@@ -43,6 +43,8 @@ pub(crate) enum SchemeError {
         expected: usize,
         actual: usize,
     },
+    #[error("`define` expected a symbol name but got {found}")]
+    InvalidDefinitionTarget { found: &'static str },
     #[error("cannot divide by zero")]
     DivisionByZero,
 }

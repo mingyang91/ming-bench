@@ -7,6 +7,9 @@ pub(crate) enum Value {
     Integer(i64),
     Boolean(bool),
     String(String),
+    Symbol(String),
+    List(Vec<Value>),
+    Void,
 }
 
 impl Value {
@@ -19,6 +22,16 @@ impl Value {
         }
     }
 
+    pub(crate) fn from_quoted_expr(expression: &Expr) -> Self {
+        match expression {
+            Expr::Integer(value) => Self::Integer(*value),
+            Expr::Boolean(value) => Self::Boolean(*value),
+            Expr::String(value) => Self::String(value.clone()),
+            Expr::Symbol(value) => Self::Symbol(value.clone()),
+            Expr::List(values) => Self::List(values.iter().map(Self::from_quoted_expr).collect()),
+        }
+    }
+
     pub(crate) fn is_truthy(&self) -> bool {
         !matches!(self, Self::Boolean(false))
     }
@@ -28,6 +41,9 @@ impl Value {
             Self::Integer(_) => "number",
             Self::Boolean(_) => "boolean",
             Self::String(_) => "string",
+            Self::Symbol(_) => "symbol",
+            Self::List(_) => "list",
+            Self::Void => "void",
         }
     }
 }
@@ -38,8 +54,25 @@ impl Display for Value {
             Self::Integer(value) => write!(f, "{value}"),
             Self::Boolean(value) => f.write_str(if *value { "#t" } else { "#f" }),
             Self::String(value) => write_string(value, f),
+            Self::Symbol(value) => f.write_str(value),
+            Self::List(values) => write_list(values, f),
+            Self::Void => f.write_str("#<void>"),
         }
     }
+}
+
+fn write_list(values: &[Value], f: &mut Formatter<'_>) -> fmt::Result {
+    f.write_str("(")?;
+
+    for (index, value) in values.iter().enumerate() {
+        if index > 0 {
+            f.write_str(" ")?;
+        }
+
+        write!(f, "{value}")?;
+    }
+
+    f.write_str(")")
 }
 
 fn write_string(value: &str, f: &mut Formatter<'_>) -> fmt::Result {
