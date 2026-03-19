@@ -253,6 +253,19 @@ fn is_truthy(v: &Value) -> bool {
 fn apply_primitive(op: &str, args: &[Value]) -> Result<Value, String> {
     match op {
         "cons" | "car" | "cdr" | "null?" | "list" | "length" => apply_list_primitive(op, args),
+        "boolean?" | "number?" | "pair?" | "string?" | "symbol?" => {
+            if args.len() != 1 {
+                return Err(format!("{op} requires 1 argument, got {}", args.len()));
+            }
+            Ok(Value::Boolean(match op {
+                "boolean?" => matches!(args[0], Value::Boolean(_)),
+                "number?" => matches!(args[0], Value::Integer(_)),
+                "pair?" => matches!(&args[0], Value::List(e) if !e.is_empty()),
+                "string?" => matches!(args[0], Value::String(_)),
+                "symbol?" => matches!(args[0], Value::Symbol(_)),
+                _ => unreachable!(),
+            }))
+        }
         "not" => {
             if args.len() != 1 {
                 return Err(format!("not requires 1 argument, got {}", args.len()));
