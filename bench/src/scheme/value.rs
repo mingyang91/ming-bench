@@ -56,13 +56,6 @@ impl Value {
             .fold(Self::EmptyList, |cdr, car| Self::pair(car, cdr))
     }
 
-    pub(crate) fn as_procedure(&self) -> Option<&Procedure> {
-        match self {
-            Self::Procedure(procedure) => Some(procedure.as_ref()),
-            _ => None,
-        }
-    }
-
     pub(crate) fn is_null(&self) -> bool {
         matches!(self, Self::EmptyList)
     }

@@ -1,10 +1,17 @@
 use std::collections::HashSet;
+use std::rc::Rc;
 
 use crate::scheme::environment::Environment;
 use crate::scheme::error::SchemeError;
 use crate::scheme::parser::{self, Expr};
 use crate::scheme::procedure::Procedure;
 use crate::scheme::value::Value;
+
+enum EvalStep<'expr> {
+    Value(Value),
+    Expression(&'expr Expr, Environment),
+    Procedure(Rc<Procedure>, Environment),
+}
 
 pub(crate) fn eval_str(input: &str) -> Result<String, SchemeError> {
     let program = parser::parse_program(input)?;
@@ -28,20 +35,55 @@ fn eval_sequence(expressions: &[Expr], environment: &Environment) -> Result<Valu
 }
 
 fn eval_expr(expression: &Expr, environment: &Environment) -> Result<Value, SchemeError> {
-    if let Some(value) = Value::from_literal(expression) {
-        return Ok(value);
-    }
+    let mut current_expression = expression;
+    let mut current_environment = environment.clone();
+    let mut procedure_anchor = Vec::new();
 
-    match expression {
-        Expr::Symbol(name) => environment
-            .get(name)
-            .ok_or_else(|| SchemeError::UnboundSymbol { name: name.clone() }),
-        Expr::List(expressions) => eval_application(expressions, environment),
-        Expr::Integer(_) | Expr::Boolean(_) | Expr::String(_) => unreachable!(),
+    loop {
+        if let Some(value) = Value::from_literal(current_expression) {
+            return Ok(value);
+        }
+
+        let step = match current_expression {
+            Expr::Symbol(name) => EvalStep::Value(
+                current_environment
+                    .get(name)
+                    .ok_or_else(|| SchemeError::UnboundSymbol { name: name.clone() })?,
+            ),
+            Expr::List(expressions) => eval_application(expressions, &current_environment)?,
+            Expr::Integer(_) | Expr::Boolean(_) | Expr::String(_) => unreachable!(),
+        };
+
+        match step {
+            EvalStep::Value(value) => return Ok(value),
+            EvalStep::Expression(expression, environment) => {
+                current_expression = expression;
+                current_environment = environment;
+            }
+            EvalStep::Procedure(procedure, environment) => {
+                current_environment = environment;
+                procedure_anchor.clear();
+                procedure_anchor.push(procedure);
+                current_expression = current_procedure_expression(&procedure_anchor);
+            }
+        }
     }
 }
 
-fn eval_application(expressions: &[Expr], environment: &Environment) -> Result<Value, SchemeError> {
+fn current_procedure_expression(procedures: &[Rc<Procedure>]) -> &Expr {
+    let Some(procedure) = procedures.last() else {
+        unreachable!("procedure anchors are stored before use");
+    };
+    let Some(expression) = procedure.body().last() else {
+        unreachable!("procedures are created with non-empty bodies");
+    };
+    expression
+}
+
+fn eval_application<'expr>(
+    expressions: &'expr [Expr],
+    environment: &Environment,
+) -> Result<EvalStep<'expr>, SchemeError> {
     let (operator, operands) = expressions
         .split_first()
         .ok_or(SchemeError::EmptyApplication)?;
@@ -52,7 +94,7 @@ fn eval_application(expressions: &[Expr], environment: &Environment) -> Result<V
         }
 
         if is_builtin(name) {
-            return apply_builtin(name, operands, environment);
+            return apply_builtin(name, operands, environment).map(EvalStep::Value);
         }
     }
 
@@ -60,19 +102,19 @@ fn eval_application(expressions: &[Expr], environment: &Environment) -> Result<V
     apply_callable(callable, operands, environment)
 }
 
-fn eval_special_form(
+fn eval_special_form<'expr>(
     operator: &str,
-    operands: &[Expr],
+    operands: &'expr [Expr],
     environment: &Environment,
-) -> Result<Option<Value>, SchemeError> {
+) -> Result<Option<EvalStep<'expr>>, SchemeError> {
     match operator {
-        "define" => eval_define(operands, environment).map(Some),
+        "define" => eval_define(operands, environment).map(|value| Some(EvalStep::Value(value))),
         "if" => eval_if(operands, environment).map(Some),
-        "quote" => eval_quote(operands).map(Some),
-        "lambda" => eval_lambda(operands, environment).map(Some),
-        "begin" => eval_begin(operands, environment).map(Some),
-        "cond" => eval_cond(operands, environment).map(Some),
-        "let" => eval_let(operands, environment).map(Some),
+        "quote" => eval_quote(operands).map(|value| Some(EvalStep::Value(value))),
+        "lambda" => eval_lambda(operands, environment).map(|value| Some(EvalStep::Value(value))),
+        "begin" => eval_begin(operands, environment).map(|value| Some(EvalStep::Value(value))),
+        "cond" => eval_cond(operands, environment).map(|value| Some(EvalStep::Value(value))),
+        "let" => eval_let(operands, environment).map(|value| Some(EvalStep::Value(value))),
         _ => Ok(None),
     }
 }
@@ -132,14 +174,17 @@ fn define_function(
     Ok(Value::Void)
 }
 
-fn eval_if(operands: &[Expr], environment: &Environment) -> Result<Value, SchemeError> {
+fn eval_if<'expr>(
+    operands: &'expr [Expr],
+    environment: &Environment,
+) -> Result<EvalStep<'expr>, SchemeError> {
     match operands {
         [condition, consequent, alternative] => {
             let value = eval_expr(condition, environment)?;
             if value.is_truthy() {
-                eval_expr(consequent, environment)
+                Ok(EvalStep::Expression(consequent, environment.clone()))
             } else {
-                eval_expr(alternative, environment)
+                Ok(EvalStep::Expression(alternative, environment.clone()))
             }
         }
         _ => Err(SchemeError::WrongArgumentCount {
@@ -457,25 +502,22 @@ fn apply_builtin(
     }
 }
 
-fn apply_callable(
+fn apply_callable<'expr>(
     callable: Value,
-    operands: &[Expr],
+    operands: &'expr [Expr],
     environment: &Environment,
-) -> Result<Value, SchemeError> {
-    if let Some(procedure) = callable.as_procedure() {
-        return apply_procedure(procedure, operands, environment);
+) -> Result<EvalStep<'expr>, SchemeError> {
+    match callable {
+        Value::Procedure(procedure) => apply_procedure(procedure, operands, environment),
+        value => Err(SchemeError::NonCallable { kind: value.kind() }),
     }
-
-    Err(SchemeError::NonCallable {
-        kind: callable.kind(),
-    })
 }
 
-fn apply_procedure(
-    procedure: &Procedure,
-    operands: &[Expr],
+fn apply_procedure<'expr>(
+    procedure: Rc<Procedure>,
+    operands: &'expr [Expr],
     environment: &Environment,
-) -> Result<Value, SchemeError> {
+) -> Result<EvalStep<'expr>, SchemeError> {
     if operands.len() != procedure.parameters().len() {
         return Err(SchemeError::WrongProcedureArgumentCount {
             expected: procedure.parameters().len(),
@@ -490,7 +532,23 @@ fn apply_procedure(
         call_environment.define(parameter, argument);
     }
 
-    eval_sequence(procedure.body(), &call_environment)
+    eval_leading_expressions(procedure.body(), &call_environment)?;
+    Ok(EvalStep::Procedure(procedure, call_environment))
+}
+
+fn eval_leading_expressions(
+    expressions: &[Expr],
+    environment: &Environment,
+) -> Result<(), SchemeError> {
+    let Some((_, leading_expressions)) = expressions.split_last() else {
+        unreachable!("procedures are created with non-empty bodies");
+    };
+
+    for expression in leading_expressions {
+        let _ = eval_expr(expression, environment)?;
+    }
+
+    Ok(())
 }
 
 fn eval_addition(operands: &[Expr], environment: &Environment) -> Result<Value, SchemeError> {
