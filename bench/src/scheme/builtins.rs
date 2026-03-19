@@ -1,15 +1,18 @@
-use std::collections::HashMap;
-
-use super::expr::Expr;
+use super::expr::{Env, Expr};
 use super::eval;
 
-pub type Env = HashMap<String, Expr>;
+pub fn is_builtin(name: &str) -> bool {
+    matches!(
+        name,
+        "+" | "-" | "*" | "/" | "<" | ">" | "=" | "<=" | "not" | "and" | "or"
+    )
+}
 
 pub fn is_false(expr: &Expr) -> bool {
     matches!(expr, Expr::Boolean(false))
 }
 
-pub fn eval_builtin(op: &str, args: &[Expr], env: &mut Env) -> Result<Expr, String> {
+pub fn eval_builtin(op: &str, args: &[Expr], env: &Env) -> Result<Expr, String> {
     match op {
         "+" | "-" | "*" | "/" => eval_arithmetic(op, args, env),
         "<" | ">" | "=" | "<=" => eval_comparison(op, args, env),
@@ -26,7 +29,7 @@ pub fn eval_builtin(op: &str, args: &[Expr], env: &mut Env) -> Result<Expr, Stri
     }
 }
 
-fn eval_comparison(op: &str, args: &[Expr], env: &mut Env) -> Result<Expr, String> {
+fn eval_comparison(op: &str, args: &[Expr], env: &Env) -> Result<Expr, String> {
     if args.len() != 2 {
         return Err(format!("{op} requires exactly two arguments"));
     }
@@ -48,7 +51,7 @@ fn eval_comparison(op: &str, args: &[Expr], env: &mut Env) -> Result<Expr, Strin
     Ok(Expr::Boolean(result))
 }
 
-fn eval_and(args: &[Expr], env: &mut Env) -> Result<Expr, String> {
+pub fn eval_and(args: &[Expr], env: &Env) -> Result<Expr, String> {
     let mut result = Expr::Boolean(true);
     for arg in args {
         result = eval(arg, env)?;
@@ -59,7 +62,7 @@ fn eval_and(args: &[Expr], env: &mut Env) -> Result<Expr, String> {
     Ok(result)
 }
 
-fn eval_or(args: &[Expr], env: &mut Env) -> Result<Expr, String> {
+pub fn eval_or(args: &[Expr], env: &Env) -> Result<Expr, String> {
     let mut result = Expr::Boolean(false);
     for arg in args {
         result = eval(arg, env)?;
@@ -70,7 +73,7 @@ fn eval_or(args: &[Expr], env: &mut Env) -> Result<Expr, String> {
     Ok(result)
 }
 
-fn eval_arithmetic(op: &str, args: &[Expr], env: &mut Env) -> Result<Expr, String> {
+fn eval_arithmetic(op: &str, args: &[Expr], env: &Env) -> Result<Expr, String> {
     let vals: Vec<i64> = args
         .iter()
         .map(|a| match eval(a, env)? {
