@@ -55,18 +55,18 @@ too-many-lines-threshold = ${FN_LIMIT}
 excessive-nesting-threshold = 3
 EOF
 
+    # Pedantic lints are configured in src/lib.rs as #![warn(...)] attributes.
+    # deny(warnings) in lib.rs promotes them to errors.
+    # test-level.sh only needs to pass level-specific allows and run clippy.
+
     echo "Running clippy --fix (auto-fixing trivial lints)..."
     cargo clippy --fix --allow-dirty --allow-staged -- \
         -D warnings \
-        -W clippy::too-many-lines \
-        -W clippy::excessive-nesting \
         $CLIPPY_ALLOWS 2>&1 || true
 
     echo "Running clippy (verify, fn limit=${FN_LIMIT})..."
     if ! cargo clippy -- \
         -D warnings \
-        -W clippy::too-many-lines \
-        -W clippy::excessive-nesting \
         $CLIPPY_ALLOWS 2>&1; then
 
         # Restore original clippy.toml
@@ -102,7 +102,7 @@ check_mod_size() {
         impl_lines=$(sed -n '1,/^#\[cfg(test)\]/p' "$mod_file" | wc -l)
         if [[ "$impl_lines" -gt "$mod_limit" ]]; then
             echo "ERROR: mod.rs has $impl_lines impl lines (limit for L$(printf '%02d' "$level"): $mod_limit)."
-            echo "  Extract implementation into submodules (eval.rs, builtins.rs, special_forms.rs, etc.)."
+            echo "  Extract implementation logic into submodules."
             return 1
         fi
     fi

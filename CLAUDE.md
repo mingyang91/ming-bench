@@ -15,8 +15,8 @@ These checks run automatically before every test. The script will **reject your 
    - L06+: ≤ 60 lines
 3. **Nesting depth** (`clippy::excessive-nesting` via `clippy.toml`):
    - All levels: ≤ 3 levels
-4. **No `.unwrap()` or `.expect()` in non-test code.** (`clippy::unwrap_used` — denied in `src/lib.rs`). Use `?`, `.ok_or(...)`, or `match`.
-5. **Clippy auto-fix.** `test-level.sh` runs `cargo clippy --fix --allow-dirty` before verification. Auto-fixed: needless borrows, collapsible ifs, const initializers. NOT auto-fixed (you must fix manually): dead code, too-many-lines, excessive-nesting, type errors.
+4. **No `.unwrap()` or `.expect()` in non-test code** (`clippy::unwrap_used` — denied in `src/lib.rs`). Use `?`, `.ok_or(...)`, or `match`.
+5. **Idiomatic Rust** — pedantic clippy lints are enabled in `src/lib.rs` (e.g. `manual_filter_map`, `needless_range_loop`, `explicit_counter_loop`, `vec_init_then_push`, `manual_let_else`). Combined with `#![deny(warnings)]`, these are errors. Many are auto-fixed by `clippy --fix`; the rest you must fix manually.
 6. **Dead code allowance.** L01–L05: `dead_code` lint is suppressed (forward-declared types are OK). L06+: all dead code is denied.
 
 ## Contract
@@ -86,23 +86,22 @@ These checks run automatically before every test. The script will **reject your 
 
 How you organize submodules is up to you. Choose a structure that groups related logic and keeps each file focused on one responsibility.
 
-## Code Rules (MANDATORY)
+## Code Rules
+
+These rules are NOT enforced by tooling. They represent style expectations that clippy cannot check.
 
 ### Error Handling
-- Use `?` operator. No `.unwrap()` / `.expect()` in non-test code.
+- Use `?` operator for error propagation.
 - Use `thiserror` for typed error enums. Do not flatten all errors to `String`.
 
 ### Style
-- **Flat control flow.** Early returns, `?`, max 3 nesting levels (enforced by clippy).
-- **Function body length** is enforced by clippy (see Quality Gate item 2). No separate hard cap.
 - **Match arms > 3 lines → extract to a helper function.** A match arm may contain a 1–3 line expression inline; anything longer must be a function call.
 - **Register helpers in `helpers.md`** — a "helper" is any function extracted to reduce another function's length OR shared across 2+ call sites. Update `helpers.md` with name, file, and one-line purpose after creating one. Check `helpers.md` before creating new helpers to avoid duplicates.
 
-### Functional Style
-- **Immutable-first.** Build new values, don't mutate temporaries.
-- **Iterator pipelines** (`map`, `filter`, `fold`, `collect`) over manual loops.
-- **`collect::<Result<Vec<_>, _>>()?`** for fallible transforms.
-- **Slice patterns** (`[first, rest @ ..]`) over indexing (`args[0]`, `&args[1..]`).
+### Functional Style (beyond what clippy enforces)
+- **Immutable-first.** Build new values from inputs instead of mutating temporaries.
+- **`collect::<Result<Vec<_>, _>>()?`** for fallible collection transforms.
+- **Slice patterns** (`[first, rest @ ..]`) over indexing (`args[0]`, `&args[1..]`) when the length is statically known.
 - **No `vec.insert(0, x)` or `vec.remove(0)`** — build new vecs instead.
 
 ### Observability
@@ -111,6 +110,7 @@ How you organize submodules is up to you. Choose a structure that groups related
 
 ### Compiler Discipline
 - `#![deny(warnings)]` and `#![deny(clippy::unwrap_used)]` in `src/lib.rs`. Do not remove.
+- Pedantic clippy lints are also configured as `#![warn(...)]` in `src/lib.rs`. Do not remove them.
 - `cargo fmt --check` must pass.
 
 ### Development Workflow
