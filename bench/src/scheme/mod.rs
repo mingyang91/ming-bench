@@ -1,4 +1,5 @@
 mod eval;
+mod macros;
 mod parser;
 mod types;
 

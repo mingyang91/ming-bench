@@ -83,6 +83,12 @@ pub enum Value {
         remaining_exprs: Vec<Value>,
         env: Env,
     },
+    Macro {
+        name: String,
+        literals: Vec<String>,
+        rules: Vec<(Value, Value)>,
+        def_env: Env,
+    },
     Void,
 }
 
@@ -96,6 +102,7 @@ impl PartialEq for Value {
             (Self::List(a), Self::List(b)) => a == b,
             (Self::Builtin { name: a }, Self::Builtin { name: b }) => a == b,
             (Self::Continuation { id: a, .. }, Self::Continuation { id: b, .. }) => a == b,
+            (Self::Macro { name: a, .. }, Self::Macro { name: b, .. }) => a == b,
             (Self::Void, Self::Void) => true,
             _ => false,
         }
@@ -113,6 +120,7 @@ impl fmt::Debug for Value {
             Self::Lambda { params, .. } => write!(f, "Lambda({params:?})"),
             Self::Builtin { name } => write!(f, "Builtin({name:?})"),
             Self::Continuation { id, .. } => write!(f, "Continuation({id})"),
+            Self::Macro { name, .. } => write!(f, "Macro({name:?})"),
             Self::Void => write!(f, "Void"),
         }
     }
@@ -127,7 +135,8 @@ impl fmt::Display for Value {
             Value::String(s) => write!(f, "\"{s}\""),
             Value::Symbol(s) => write!(f, "{s}"),
             Value::List(elems) => write_list(f, elems),
-            Value::Lambda { .. } | Value::Builtin { .. } | Value::Continuation { .. } => {
+            Value::Lambda { .. } | Value::Builtin { .. } | Value::Continuation { .. }
+            | Value::Macro { .. } => {
                 write!(f, "#<procedure>")
             }
             Value::Void => write!(f, ""),

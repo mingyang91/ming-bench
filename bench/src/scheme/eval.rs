@@ -1,3 +1,4 @@
+use super::macros;
 use super::types::{Env, Value};
 use std::cell::RefCell;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -102,6 +103,9 @@ fn eval_list(elems: &[Value], env: &Env) -> Result<Trampoline, String> {
     if let Value::Symbol(s) = &elems[0] {
         match s.as_str() {
             "define" => return eval_define(&elems[1..], env).map(Trampoline::Done),
+            "define-syntax" => {
+                return eval_define_syntax(&elems[1..], env).map(Trampoline::Done)
+            }
             "if" => return eval_if(&elems[1..], env),
             "quote" => return eval_quote(&elems[1..]).map(Trampoline::Done),
             "and" => return eval_and(&elems[1..], env),
@@ -113,8 +117,30 @@ fn eval_list(elems: &[Value], env: &Env) -> Result<Trampoline, String> {
             "set!" => return eval_set(&elems[1..], env).map(Trampoline::Done),
             _ => {}
         }
+        if let Some(result) = macros::try_expand(s, elems, env) {
+            return expand_macro(result?, env);
+        }
     }
     eval_call(elems, env)
+}
+
+fn expand_macro(
+    expansion: macros::Expansion,
+    env: &Env,
+) -> Result<Trampoline, String> {
+    let eval_env = if expansion.def_bindings.is_empty() {
+        env.clone()
+    } else {
+        let child = env.child();
+        for (k, v) in expansion.def_bindings {
+            child.set(k, v);
+        }
+        child
+    };
+    Ok(Trampoline::Bounce {
+        expr: expansion.form,
+        env: eval_env,
+    })
 }
 
 fn eval_call(elems: &[Value], env: &Env) -> Result<Trampoline, String> {
@@ -229,6 +255,60 @@ fn eval_define(args: &[Value], env: &Env) -> Result<Value, String> {
         }
         other => Err(format!("define: expected symbol or list, got {other}")),
     }
+}
+
+fn eval_define_syntax(args: &[Value], env: &Env) -> Result<Value, String> {
+    if args.len() != 2 {
+        return Err(format!(
+            "define-syntax requires 2 arguments, got {}",
+            args.len()
+        ));
+    }
+    let name = match &args[0] {
+        Value::Symbol(s) => s.clone(),
+        other => return Err(format!("define-syntax: expected symbol, got {other}")),
+    };
+    let sr = match &args[1] {
+        Value::List(elems) => elems,
+        other => return Err(format!("define-syntax: expected syntax-rules, got {other}")),
+    };
+    if sr.is_empty() || !matches!(&sr[0], Value::Symbol(s) if s == "syntax-rules") {
+        return Err("define-syntax: expected syntax-rules".into());
+    }
+    let literals = match &sr[1] {
+        Value::List(elems) => elems
+            .iter()
+            .map(|e| match e {
+                Value::Symbol(s) => Ok(s.clone()),
+                other => Err(format!(
+                    "syntax-rules: expected literal symbol, got {other}"
+                )),
+            })
+            .collect::<Result<Vec<_>, _>>()?,
+        other => {
+            return Err(format!(
+                "syntax-rules: expected literals list, got {other}"
+            ))
+        }
+    };
+    let mut rules = Vec::new();
+    for rule in &sr[2..] {
+        let pair = match rule {
+            Value::List(elems) if elems.len() == 2 => elems,
+            _ => return Err(format!("syntax-rules: invalid rule: {rule}")),
+        };
+        rules.push((pair[0].clone(), pair[1].clone()));
+    }
+    env.set(
+        name.clone(),
+        Value::Macro {
+            name,
+            literals,
+            rules,
+            def_env: env.clone(),
+        },
+    );
+    Ok(Value::Void)
 }
 
 fn eval_lambda(args: &[Value], env: &Env) -> Result<Value, String> {
