@@ -2,7 +2,7 @@ use thiserror::Error;
 
 use crate::scheme::value::Value;
 
-#[derive(Debug, Error, Clone, PartialEq, Eq)]
+#[derive(Debug, Error, Clone)]
 pub(crate) enum SchemeError {
     #[error("input did not contain any expressions")]
     EmptyInput,
@@ -45,6 +45,23 @@ pub(crate) enum SchemeError {
     },
     #[error("`define` expected a symbol name but got {found}")]
     InvalidDefinitionTarget { found: &'static str },
+    #[error("`{operator}` expected a parameter list but got {found}")]
+    InvalidParameterList {
+        operator: &'static str,
+        found: &'static str,
+    },
+    #[error("`{operator}` parameter expected a symbol but got {found}")]
+    InvalidParameterName {
+        operator: &'static str,
+        found: &'static str,
+    },
+    #[error("`{operator}` has duplicate parameter `{name}`")]
+    DuplicateParameter {
+        operator: &'static str,
+        name: String,
+    },
+    #[error("procedure expected exactly {expected} argument(s) but got {actual}")]
+    WrongProcedureArgumentCount { expected: usize, actual: usize },
     #[error("cannot divide by zero")]
     DivisionByZero,
 }

@@ -2,6 +2,7 @@ mod environment;
 mod error;
 mod evaluator;
 mod parser;
+mod procedure;
 mod value;
 
 /// Evaluate one or more Scheme expressions and return the string

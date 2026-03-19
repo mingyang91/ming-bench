@@ -1,14 +1,18 @@
 use std::fmt::{self, Display, Formatter};
+use std::rc::Rc;
 
+use crate::scheme::environment::Environment;
 use crate::scheme::parser::Expr;
+use crate::scheme::procedure::Procedure;
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone)]
 pub(crate) enum Value {
     Integer(i64),
     Boolean(bool),
     String(String),
     Symbol(String),
     List(Vec<Value>),
+    Procedure(Rc<Procedure>),
     Void,
 }
 
@@ -32,6 +36,21 @@ impl Value {
         }
     }
 
+    pub(crate) fn procedure(
+        parameters: Vec<String>,
+        body: Vec<Expr>,
+        environment: Environment,
+    ) -> Self {
+        Self::Procedure(Rc::new(Procedure::new(parameters, body, environment)))
+    }
+
+    pub(crate) fn as_procedure(&self) -> Option<&Procedure> {
+        match self {
+            Self::Procedure(procedure) => Some(procedure.as_ref()),
+            _ => None,
+        }
+    }
+
     pub(crate) fn is_truthy(&self) -> bool {
         !matches!(self, Self::Boolean(false))
     }
@@ -43,6 +62,7 @@ impl Value {
             Self::String(_) => "string",
             Self::Symbol(_) => "symbol",
             Self::List(_) => "list",
+            Self::Procedure(_) => "procedure",
             Self::Void => "void",
         }
     }
@@ -56,6 +76,7 @@ impl Display for Value {
             Self::String(value) => write_string(value, f),
             Self::Symbol(value) => f.write_str(value),
             Self::List(values) => write_list(values, f),
+            Self::Procedure(_) => f.write_str("#<procedure>"),
             Self::Void => f.write_str("#<void>"),
         }
     }

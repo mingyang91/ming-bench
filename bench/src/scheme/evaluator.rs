@@ -1,6 +1,9 @@
+use std::collections::HashSet;
+
 use crate::scheme::environment::Environment;
 use crate::scheme::error::SchemeError;
 use crate::scheme::parser::{self, Expr};
+use crate::scheme::procedure::Procedure;
 use crate::scheme::value::Value;
 
 pub(crate) fn eval_str(input: &str) -> Result<String, SchemeError> {
@@ -10,31 +13,37 @@ pub(crate) fn eval_str(input: &str) -> Result<String, SchemeError> {
 }
 
 fn eval_program(program: &[Expr]) -> Result<Value, SchemeError> {
-    let mut environment = Environment::new();
+    let environment = Environment::new();
+    eval_sequence(program, &environment)
+}
+
+fn eval_sequence(expressions: &[Expr], environment: &Environment) -> Result<Value, SchemeError> {
     let mut last_value = None;
 
-    for expression in program {
-        last_value = Some(eval_expr(expression, &mut environment)?);
+    for expression in expressions {
+        last_value = Some(eval_expr(expression, environment)?);
     }
 
     last_value.ok_or(SchemeError::EmptyInput)
 }
 
-fn eval_expr(expression: &Expr, environment: &mut Environment) -> Result<Value, SchemeError> {
+fn eval_expr(expression: &Expr, environment: &Environment) -> Result<Value, SchemeError> {
+    if let Some(value) = Value::from_literal(expression) {
+        return Ok(value);
+    }
+
     match expression {
         Expr::Symbol(name) => environment
             .get(name)
             .ok_or_else(|| SchemeError::UnboundSymbol { name: name.clone() }),
         Expr::List(expressions) => eval_application(expressions, environment),
-        _ => Value::from_literal(expression).ok_or(SchemeError::NonCallable {
-            kind: expression_kind(expression),
-        }),
+        Expr::Integer(_) | Expr::Boolean(_) | Expr::String(_) => unreachable!(),
     }
 }
 
 fn eval_application(
     expressions: &[Expr],
-    environment: &mut Environment,
+    environment: &Environment,
 ) -> Result<Value, SchemeError> {
     let (operator, operands) = expressions
         .split_first()
@@ -50,42 +59,80 @@ fn eval_application(
         }
     }
 
-    let value = eval_expr(operator, environment)?;
-    Err(SchemeError::NonCallable { kind: value.kind() })
+    let callable = eval_expr(operator, environment)?;
+    apply_callable(callable, operands, environment)
 }
 
 fn eval_special_form(
     operator: &str,
     operands: &[Expr],
-    environment: &mut Environment,
+    environment: &Environment,
 ) -> Result<Option<Value>, SchemeError> {
     match operator {
         "define" => eval_define(operands, environment).map(Some),
         "if" => eval_if(operands, environment).map(Some),
         "quote" => eval_quote(operands).map(Some),
+        "lambda" => eval_lambda(operands, environment).map(Some),
         _ => Ok(None),
     }
 }
 
-fn eval_define(operands: &[Expr], environment: &mut Environment) -> Result<Value, SchemeError> {
+fn eval_define(operands: &[Expr], environment: &Environment) -> Result<Value, SchemeError> {
     match operands {
         [Expr::Symbol(name), value_expression] => {
             let value = eval_expr(value_expression, environment)?;
             environment.define(name, value);
             Ok(Value::Void)
         }
+        [Expr::Symbol(_), ..] => Err(SchemeError::WrongArgumentCount {
+            operator: "define",
+            expected: 2,
+            actual: operands.len(),
+        }),
+        [Expr::List(signature), body @ ..] if !body.is_empty() => {
+            define_function(signature, body, environment)
+        }
+        [Expr::List(_)] => Err(SchemeError::TooFewArguments {
+            operator: "define",
+            min: 2,
+            actual: operands.len(),
+        }),
         [target, _] => Err(SchemeError::InvalidDefinitionTarget {
             found: expression_kind(target),
         }),
-        _ => Err(SchemeError::WrongArgumentCount {
+        [target, ..] => Err(SchemeError::InvalidDefinitionTarget {
+            found: expression_kind(target),
+        }),
+        _ => Err(SchemeError::TooFewArguments {
             operator: "define",
-            expected: 2,
+            min: 2,
             actual: operands.len(),
         }),
     }
 }
 
-fn eval_if(operands: &[Expr], environment: &mut Environment) -> Result<Value, SchemeError> {
+fn define_function(
+    signature: &[Expr],
+    body: &[Expr],
+    environment: &Environment,
+) -> Result<Value, SchemeError> {
+    let (name, parameters) = signature
+        .split_first()
+        .ok_or(SchemeError::InvalidDefinitionTarget { found: "list" })?;
+
+    let Expr::Symbol(name) = name else {
+        return Err(SchemeError::InvalidDefinitionTarget {
+            found: expression_kind(name),
+        });
+    };
+
+    let parameters = parse_parameter_names(parameters, "define")?;
+    let procedure = Value::procedure(parameters, body.to_vec(), environment.clone());
+    environment.define(name, procedure);
+    Ok(Value::Void)
+}
+
+fn eval_if(operands: &[Expr], environment: &Environment) -> Result<Value, SchemeError> {
     match operands {
         [condition, consequent, alternative] => {
             let value = eval_expr(condition, environment)?;
@@ -114,10 +161,65 @@ fn eval_quote(operands: &[Expr]) -> Result<Value, SchemeError> {
     }
 }
 
+fn eval_lambda(operands: &[Expr], environment: &Environment) -> Result<Value, SchemeError> {
+    match operands {
+        [parameters, body @ ..] if !body.is_empty() => {
+            let parameters = parse_parameter_list(parameters, "lambda")?;
+            Ok(Value::procedure(parameters, body.to_vec(), environment.clone()))
+        }
+        _ => Err(SchemeError::TooFewArguments {
+            operator: "lambda",
+            min: 2,
+            actual: operands.len(),
+        }),
+    }
+}
+
+fn parse_parameter_list(
+    parameters: &Expr,
+    operator: &'static str,
+) -> Result<Vec<String>, SchemeError> {
+    match parameters {
+        Expr::List(parameters) => parse_parameter_names(parameters, operator),
+        _ => Err(SchemeError::InvalidParameterList {
+            operator,
+            found: expression_kind(parameters),
+        }),
+    }
+}
+
+fn parse_parameter_names(
+    parameters: &[Expr],
+    operator: &'static str,
+) -> Result<Vec<String>, SchemeError> {
+    let mut names = Vec::with_capacity(parameters.len());
+    let mut seen = HashSet::with_capacity(parameters.len());
+
+    for parameter in parameters {
+        let Expr::Symbol(name) = parameter else {
+            return Err(SchemeError::InvalidParameterName {
+                operator,
+                found: expression_kind(parameter),
+            });
+        };
+
+        if !seen.insert(name.clone()) {
+            return Err(SchemeError::DuplicateParameter {
+                operator,
+                name: name.clone(),
+            });
+        }
+
+        names.push(name.clone());
+    }
+
+    Ok(names)
+}
+
 fn apply_builtin(
     operator: &str,
     operands: &[Expr],
-    environment: &mut Environment,
+    environment: &Environment,
 ) -> Result<Value, SchemeError> {
     match operator {
         "+" => eval_addition(operands, environment),
@@ -137,14 +239,50 @@ fn apply_builtin(
     }
 }
 
-fn eval_addition(operands: &[Expr], environment: &mut Environment) -> Result<Value, SchemeError> {
+fn apply_callable(
+    callable: Value,
+    operands: &[Expr],
+    environment: &Environment,
+) -> Result<Value, SchemeError> {
+    if let Some(procedure) = callable.as_procedure() {
+        return apply_procedure(procedure, operands, environment);
+    }
+
+    Err(SchemeError::NonCallable {
+        kind: callable.kind(),
+    })
+}
+
+fn apply_procedure(
+    procedure: &Procedure,
+    operands: &[Expr],
+    environment: &Environment,
+) -> Result<Value, SchemeError> {
+    if operands.len() != procedure.parameters().len() {
+        return Err(SchemeError::WrongProcedureArgumentCount {
+            expected: procedure.parameters().len(),
+            actual: operands.len(),
+        });
+    }
+
+    let arguments = eval_values(operands, environment)?;
+    let call_environment = procedure.environment().child();
+
+    for (parameter, argument) in procedure.parameters().iter().zip(arguments) {
+        call_environment.define(parameter, argument);
+    }
+
+    eval_sequence(procedure.body(), &call_environment)
+}
+
+fn eval_addition(operands: &[Expr], environment: &Environment) -> Result<Value, SchemeError> {
     let sum = eval_numbers("+", operands, environment)?.into_iter().sum();
     Ok(Value::Integer(sum))
 }
 
 fn eval_subtraction(
     operands: &[Expr],
-    environment: &mut Environment,
+    environment: &Environment,
 ) -> Result<Value, SchemeError> {
     let numbers = eval_numbers("-", operands, environment)?;
 
@@ -163,7 +301,7 @@ fn eval_subtraction(
 
 fn eval_multiplication(
     operands: &[Expr],
-    environment: &mut Environment,
+    environment: &Environment,
 ) -> Result<Value, SchemeError> {
     let product = eval_numbers("*", operands, environment)?
         .into_iter()
@@ -171,7 +309,7 @@ fn eval_multiplication(
     Ok(Value::Integer(product))
 }
 
-fn eval_division(operands: &[Expr], environment: &mut Environment) -> Result<Value, SchemeError> {
+fn eval_division(operands: &[Expr], environment: &Environment) -> Result<Value, SchemeError> {
     let numbers = eval_numbers("/", operands, environment)?;
 
     match numbers.as_slice() {
@@ -192,7 +330,7 @@ fn eval_division(operands: &[Expr], environment: &mut Environment) -> Result<Val
 fn eval_comparison<F>(
     operator: &'static str,
     operands: &[Expr],
-    environment: &mut Environment,
+    environment: &Environment,
     compare: F,
 ) -> Result<Value, SchemeError>
 where
@@ -212,7 +350,7 @@ where
     }
 }
 
-fn eval_not(operands: &[Expr], environment: &mut Environment) -> Result<Value, SchemeError> {
+fn eval_not(operands: &[Expr], environment: &Environment) -> Result<Value, SchemeError> {
     match operands {
         [operand] => {
             let value = eval_expr(operand, environment)?;
@@ -226,7 +364,7 @@ fn eval_not(operands: &[Expr], environment: &mut Environment) -> Result<Value, S
     }
 }
 
-fn eval_and(operands: &[Expr], environment: &mut Environment) -> Result<Value, SchemeError> {
+fn eval_and(operands: &[Expr], environment: &Environment) -> Result<Value, SchemeError> {
     let mut last_value = Value::Boolean(true);
 
     for operand in operands {
@@ -242,7 +380,7 @@ fn eval_and(operands: &[Expr], environment: &mut Environment) -> Result<Value, S
     Ok(last_value)
 }
 
-fn eval_or(operands: &[Expr], environment: &mut Environment) -> Result<Value, SchemeError> {
+fn eval_or(operands: &[Expr], environment: &Environment) -> Result<Value, SchemeError> {
     for operand in operands {
         let value = eval_expr(operand, environment)?;
 
@@ -254,19 +392,25 @@ fn eval_or(operands: &[Expr], environment: &mut Environment) -> Result<Value, Sc
     Ok(Value::Boolean(false))
 }
 
+fn eval_values(operands: &[Expr], environment: &Environment) -> Result<Vec<Value>, SchemeError> {
+    let mut values = Vec::with_capacity(operands.len());
+
+    for operand in operands {
+        values.push(eval_expr(operand, environment)?);
+    }
+
+    Ok(values)
+}
+
 fn eval_numbers(
     operator: &'static str,
     operands: &[Expr],
-    environment: &mut Environment,
+    environment: &Environment,
 ) -> Result<Vec<i64>, SchemeError> {
-    let mut numbers = Vec::with_capacity(operands.len());
-
-    for operand in operands {
-        let value = eval_expr(operand, environment)?;
-        numbers.push(expect_number(operator, value)?);
-    }
-
-    Ok(numbers)
+    eval_values(operands, environment)?
+        .into_iter()
+        .map(|value| expect_number(operator, value))
+        .collect()
 }
 
 fn expect_number(operator: &'static str, value: Value) -> Result<i64, SchemeError> {
