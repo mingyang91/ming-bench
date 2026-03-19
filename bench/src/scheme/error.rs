@@ -55,6 +55,8 @@ pub(crate) enum SchemeError {
     },
     #[error("`define` expected a symbol name but got {found}")]
     InvalidDefinitionTarget { found: &'static str },
+    #[error("`set!` expected a symbol name but got {found}")]
+    InvalidAssignmentTarget { found: &'static str },
     #[error("`{operator}` expected a binding list but got {found}")]
     InvalidBindingList {
         operator: &'static str,

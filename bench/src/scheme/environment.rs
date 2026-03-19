@@ -30,15 +30,30 @@ impl Environment {
     }
 
     pub(crate) fn get(&self, name: &str) -> Option<Value> {
+        self.binding_environment(name)
+            .and_then(|environment| environment.0.borrow().bindings.get(name).cloned())
+    }
+
+    pub(crate) fn set(&self, name: &str, value: Value) -> bool {
+        match self.binding_environment(name) {
+            Some(environment) => {
+                environment.define(name, value);
+                true
+            }
+            None => false,
+        }
+    }
+
+    fn binding_environment(&self, name: &str) -> Option<Self> {
         let frame = self.0.borrow();
 
-        if let Some(value) = frame.bindings.get(name) {
-            return Some(value.clone());
+        if frame.bindings.contains_key(name) {
+            return Some(self.clone());
         }
 
         let parent = frame.parent.clone();
         drop(frame);
 
-        parent.and_then(|environment| environment.get(name))
+        parent.and_then(|environment| environment.binding_environment(name))
     }
 }

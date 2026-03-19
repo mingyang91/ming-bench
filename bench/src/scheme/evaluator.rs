@@ -109,6 +109,7 @@ fn eval_special_form<'expr>(
 ) -> Result<Option<EvalStep<'expr>>, SchemeError> {
     match operator {
         "define" => eval_define(operands, environment).map(|value| Some(EvalStep::Value(value))),
+        "set!" => eval_set(operands, environment).map(|value| Some(EvalStep::Value(value))),
         "if" => eval_if(operands, environment).map(Some),
         "quote" => eval_quote(operands).map(|value| Some(EvalStep::Value(value))),
         "lambda" => eval_lambda(operands, environment).map(|value| Some(EvalStep::Value(value))),
@@ -149,6 +150,33 @@ fn eval_define(operands: &[Expr], environment: &Environment) -> Result<Value, Sc
             operator: "define",
             min: 2,
             actual: operands.len(),
+        }),
+    }
+}
+
+fn eval_set(operands: &[Expr], environment: &Environment) -> Result<Value, SchemeError> {
+    match operands {
+        [Expr::Symbol(name), value_expression] => {
+            let value = eval_expr(value_expression, environment)?;
+
+            if environment.set(name, value) {
+                Ok(Value::Void)
+            } else {
+                Err(SchemeError::UnboundSymbol { name: name.clone() })
+            }
+        }
+        [Expr::Symbol(_), ..] => Err(SchemeError::WrongArgumentCount {
+            operator: "set!",
+            expected: 2,
+            actual: operands.len(),
+        }),
+        [target, ..] => Err(SchemeError::InvalidAssignmentTarget {
+            found: expression_kind(target),
+        }),
+        [] => Err(SchemeError::WrongArgumentCount {
+            operator: "set!",
+            expected: 2,
+            actual: 0,
         }),
     }
 }
