@@ -1,8 +1,14 @@
+use std::collections::HashMap;
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(super) enum Value {
     Integer(i64),
     Boolean(bool),
     String(String),
+    Symbol(String),
+    Pair(Box<Value>, Box<Value>),
+    Nil,
+    Void,
 }
 
 impl std::fmt::Display for Value {
@@ -12,7 +18,28 @@ impl std::fmt::Display for Value {
             Self::Boolean(true) => formatter.write_str("#t"),
             Self::Boolean(false) => formatter.write_str("#f"),
             Self::String(value) => write!(formatter, "\"{value}\""),
+            Self::Symbol(value) => formatter.write_str(value),
+            Self::Pair(car, cdr) => {
+                formatter.write_str("(")?;
+                fmt_pair(car, cdr, formatter)?;
+                formatter.write_str(")")
+            }
+            Self::Nil => formatter.write_str("()"),
+            Self::Void => Ok(()),
         }
+    }
+}
+
+fn fmt_pair(car: &Value, cdr: &Value, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+    write!(formatter, "{car}")?;
+
+    match cdr {
+        Value::Nil => Ok(()),
+        Value::Pair(next_car, next_cdr) => {
+            formatter.write_str(" ")?;
+            fmt_pair(next_car, next_cdr, formatter)
+        }
+        value => write!(formatter, " . {value}"),
     }
 }
 
@@ -23,27 +50,33 @@ enum Expr {
     Application(Vec<Expr>),
 }
 
+type Environment = HashMap<String, Value>;
+
 pub(super) fn eval_program(input: &str) -> Result<Value, String> {
     let mut parser = Parser::new(input);
     let program = parser.parse_program()?;
+    let mut environment = Environment::new();
 
-    let mut last_value = None;
+    let mut last_value = Value::Void;
     for expr in &program {
-        last_value = Some(eval_expr(expr)?);
+        last_value = eval_expr(expr, &mut environment)?;
     }
 
-    last_value.ok_or_else(|| "empty program".into())
+    Ok(last_value)
 }
 
-fn eval_expr(expr: &Expr) -> Result<Value, String> {
+fn eval_expr(expr: &Expr, environment: &mut Environment) -> Result<Value, String> {
     match expr {
         Expr::Literal(value) => Ok(value.clone()),
-        Expr::Symbol(name) => Err(format!("unbound symbol: {name}")),
-        Expr::Application(parts) => eval_application(parts),
+        Expr::Symbol(name) => environment
+            .get(name)
+            .cloned()
+            .ok_or_else(|| format!("unbound symbol: {name}")),
+        Expr::Application(parts) => eval_application(parts, environment),
     }
 }
 
-fn eval_application(parts: &[Expr]) -> Result<Value, String> {
+fn eval_application(parts: &[Expr], environment: &mut Environment) -> Result<Value, String> {
     let (operator, arguments) = parts
         .split_first()
         .ok_or_else(|| "cannot evaluate empty application".to_string())?;
@@ -53,13 +86,18 @@ fn eval_application(parts: &[Expr]) -> Result<Value, String> {
     };
 
     match operator {
-        "and" => return eval_and(arguments),
-        "or" => return eval_or(arguments),
+        "and" => return eval_and(arguments, environment),
+        "or" => return eval_or(arguments, environment),
+        "if" => return eval_if(arguments, environment),
+        "define" => return eval_define(arguments, environment),
+        "quote" => return eval_quote(arguments),
         _ => {}
     }
 
-    let values: Result<Vec<_>, _> = arguments.iter().map(eval_expr).collect();
-    let values = values?;
+    let mut values = Vec::with_capacity(arguments.len());
+    for argument in arguments {
+        values.push(eval_expr(argument, environment)?);
+    }
 
     match operator {
         "+" => eval_add(&values),
@@ -72,6 +110,56 @@ fn eval_application(parts: &[Expr]) -> Result<Value, String> {
         "<=" => eval_less_equal(&values),
         "not" => eval_not(&values),
         _ => Err(format!("unknown procedure: {operator}")),
+    }
+}
+
+fn eval_define(arguments: &[Expr], environment: &mut Environment) -> Result<Value, String> {
+    let [name, value] = arguments else {
+        return Err("`define` expects exactly 2 arguments".into());
+    };
+
+    let Expr::Symbol(name) = name else {
+        return Err("`define` expects a symbol name".into());
+    };
+
+    let value = eval_expr(value, environment)?;
+    environment.insert(name.clone(), value);
+
+    Ok(Value::Void)
+}
+
+fn eval_if(arguments: &[Expr], environment: &mut Environment) -> Result<Value, String> {
+    let [condition, consequent, alternative] = arguments else {
+        return Err("`if` expects exactly 3 arguments".into());
+    };
+
+    let condition = eval_expr(condition, environment)?;
+    if is_truthy(&condition) {
+        eval_expr(consequent, environment)
+    } else {
+        eval_expr(alternative, environment)
+    }
+}
+
+fn eval_quote(arguments: &[Expr]) -> Result<Value, String> {
+    let [value] = arguments else {
+        return Err("`quote` expects exactly 1 argument".into());
+    };
+
+    quote_expr(value)
+}
+
+fn quote_expr(expr: &Expr) -> Result<Value, String> {
+    match expr {
+        Expr::Literal(value) => Ok(value.clone()),
+        Expr::Symbol(value) => Ok(Value::Symbol(value.clone())),
+        Expr::Application(values) => {
+            let mut list = Value::Nil;
+            for value in values.iter().rev() {
+                list = Value::Pair(Box::new(quote_expr(value)?), Box::new(list));
+            }
+            Ok(list)
+        }
     }
 }
 
@@ -199,11 +287,11 @@ fn eval_not(arguments: &[Value]) -> Result<Value, String> {
     Ok(Value::Boolean(!is_truthy(value)))
 }
 
-fn eval_and(arguments: &[Expr]) -> Result<Value, String> {
+fn eval_and(arguments: &[Expr], environment: &mut Environment) -> Result<Value, String> {
     let mut last_value = Value::Boolean(true);
 
     for argument in arguments {
-        let value = eval_expr(argument)?;
+        let value = eval_expr(argument, environment)?;
         if !is_truthy(&value) {
             return Ok(value);
         }
@@ -213,9 +301,9 @@ fn eval_and(arguments: &[Expr]) -> Result<Value, String> {
     Ok(last_value)
 }
 
-fn eval_or(arguments: &[Expr]) -> Result<Value, String> {
+fn eval_or(arguments: &[Expr], environment: &mut Environment) -> Result<Value, String> {
     for argument in arguments {
-        let value = eval_expr(argument)?;
+        let value = eval_expr(argument, environment)?;
         if is_truthy(&value) {
             return Ok(value);
         }
