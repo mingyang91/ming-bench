@@ -90,7 +90,7 @@ pub enum Error {
     #[error("command `{cmd}` failed with exit code {exit_code}")]
     CommandFailed { cmd: String, exit_code: i32 },
 
-    #[error("required binary not found: {name}")]
+    #[error("{name} not found in PATH — ensure ~/.local/bin and ~/.cargo/bin are in PATH")]
     BinaryNotFound { name: String },
 
     #[error("worktree directory already exists: {path}")]
