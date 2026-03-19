@@ -25,6 +25,8 @@ fn eval_list(elems: &[Value], env: &Env) -> Result<Value, String> {
             "or" => return eval_or(&elems[1..], env),
             "lambda" => return eval_lambda(&elems[1..], env),
             "begin" => return eval_begin(&elems[1..], env),
+            "let" => return eval_let(&elems[1..], env),
+            "cond" => return eval_cond(&elems[1..], env),
             _ => {}
         }
     }
@@ -189,6 +191,57 @@ fn eval_begin(exprs: &[Value], env: &Env) -> Result<Value, String> {
         result = eval(expr, env)?;
     }
     Ok(result)
+}
+
+fn eval_let(args: &[Value], env: &Env) -> Result<Value, String> {
+    if args.len() < 2 {
+        return Err(format!("let requires at least 2 arguments, got {}", args.len()));
+    }
+    let bindings = match &args[0] {
+        Value::List(elems) => elems,
+        other => return Err(format!("let: expected bindings list, got {other}")),
+    };
+    let child = env.child();
+    for binding in bindings {
+        let pair = match binding {
+            Value::List(elems) if elems.len() == 2 => elems,
+            _ => return Err(format!("let: invalid binding: {binding}")),
+        };
+        let name = match &pair[0] {
+            Value::Symbol(s) => s.clone(),
+            other => return Err(format!("let: expected symbol, got {other}")),
+        };
+        let val = eval(&pair[1], env)?;
+        child.set(name, val);
+    }
+    let body = wrap_body(&args[1..]);
+    eval(&body, &child)
+}
+
+fn eval_cond(clauses: &[Value], env: &Env) -> Result<Value, String> {
+    for clause in clauses {
+        let elems = match clause {
+            Value::List(elems) if !elems.is_empty() => elems,
+            _ => return Err(format!("cond: invalid clause: {clause}")),
+        };
+        if matches!(&elems[0], Value::Symbol(s) if s == "else") {
+            return eval_begin(&elems[1..], env);
+        }
+        let test = eval(&elems[0], env)?;
+        if !is_truthy(&test) {
+            continue;
+        }
+        return eval_cond_branch(&test, &elems[1..], env);
+    }
+    Ok(Value::Void)
+}
+
+fn eval_cond_branch(test: &Value, body: &[Value], env: &Env) -> Result<Value, String> {
+    if body.is_empty() {
+        Ok(test.clone())
+    } else {
+        eval_begin(body, env)
+    }
 }
 
 fn is_truthy(v: &Value) -> bool {
