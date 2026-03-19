@@ -44,6 +44,18 @@ fn try_special_form(elems: &[Expr], env: &Env) -> Result<Option<Bounce>, String>
     let args = &elems[1..];
     match op.as_str() {
         "define" => eval_define(args, env).map(|v| Some(Bounce::Done(v))),
+        "set!" => {
+            if args.len() != 2 {
+                return Err("set! requires exactly two arguments".into());
+            }
+            let name = match &args[0] {
+                Expr::Symbol(s) => s.clone(),
+                _ => return Err("set!: first argument must be a symbol".into()),
+            };
+            let val = eval(&args[1], env)?;
+            env.set(&name, val)?;
+            Ok(Some(Bounce::Done(Expr::Void)))
+        }
         "quote" => eval_quote(args).map(|v| Some(Bounce::Done(v))),
         "lambda" => eval_lambda(args, env).map(|v| Some(Bounce::Done(v))),
         "if" => bounce_if(args, env).map(Some),

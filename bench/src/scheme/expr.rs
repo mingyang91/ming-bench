@@ -40,6 +40,18 @@ impl Env {
     pub fn insert(&self, name: String, val: Expr) {
         self.0.borrow_mut().bindings.insert(name, val);
     }
+
+    pub fn set(&self, name: &str, val: Expr) -> Result<(), String> {
+        let mut inner = self.0.borrow_mut();
+        if inner.bindings.contains_key(name) {
+            inner.bindings.insert(name.to_string(), val);
+            Ok(())
+        } else if let Some(ref parent) = inner.parent {
+            parent.set(name, val)
+        } else {
+            Err(format!("set!: unbound variable: {name}"))
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
