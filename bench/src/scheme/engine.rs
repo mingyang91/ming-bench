@@ -52,6 +52,12 @@ fn eval_application(parts: &[Expr]) -> Result<Value, String> {
         _ => return Err("operator must be a symbol".into()),
     };
 
+    match operator {
+        "and" => return eval_and(arguments),
+        "or" => return eval_or(arguments),
+        _ => {}
+    }
+
     let values: Result<Vec<_>, _> = arguments.iter().map(eval_expr).collect();
     let values = values?;
 
@@ -60,6 +66,11 @@ fn eval_application(parts: &[Expr]) -> Result<Value, String> {
         "-" => eval_subtract(&values),
         "*" => eval_multiply(&values),
         "/" => eval_divide(&values),
+        "<" => eval_less_than(&values),
+        ">" => eval_greater_than(&values),
+        "=" => eval_equal(&values),
+        "<=" => eval_less_equal(&values),
+        "not" => eval_not(&values),
         _ => Err(format!("unknown procedure: {operator}")),
     }
 }
@@ -133,11 +144,95 @@ fn eval_divide(arguments: &[Value]) -> Result<Value, String> {
         .map(Value::Integer)
 }
 
+fn eval_less_than(arguments: &[Value]) -> Result<Value, String> {
+    eval_numeric_comparison(arguments, "<", |left, right| left < right)
+}
+
+fn eval_greater_than(arguments: &[Value]) -> Result<Value, String> {
+    eval_numeric_comparison(arguments, ">", |left, right| left > right)
+}
+
+fn eval_equal(arguments: &[Value]) -> Result<Value, String> {
+    eval_numeric_comparison(arguments, "=", |left, right| left == right)
+}
+
+fn eval_less_equal(arguments: &[Value]) -> Result<Value, String> {
+    eval_numeric_comparison(arguments, "<=", |left, right| left <= right)
+}
+
+fn eval_numeric_comparison<F>(
+    arguments: &[Value],
+    operator: &str,
+    compare: F,
+) -> Result<Value, String>
+where
+    F: Fn(i64, i64) -> bool,
+{
+    let mut numbers = arguments.iter();
+    let first = numbers
+        .next()
+        .ok_or_else(|| format!("`{operator}` expects at least 2 arguments"))?;
+    let mut previous = expect_integer(first, operator)?;
+    let mut saw_pair = false;
+
+    for value in numbers {
+        saw_pair = true;
+        let current = expect_integer(value, operator)?;
+        if !compare(previous, current) {
+            return Ok(Value::Boolean(false));
+        }
+        previous = current;
+    }
+
+    if !saw_pair {
+        return Err(format!("`{operator}` expects at least 2 arguments"));
+    }
+
+    Ok(Value::Boolean(true))
+}
+
+fn eval_not(arguments: &[Value]) -> Result<Value, String> {
+    let [value] = arguments else {
+        return Err("`not` expects exactly 1 argument".into());
+    };
+
+    Ok(Value::Boolean(!is_truthy(value)))
+}
+
+fn eval_and(arguments: &[Expr]) -> Result<Value, String> {
+    let mut last_value = Value::Boolean(true);
+
+    for argument in arguments {
+        let value = eval_expr(argument)?;
+        if !is_truthy(&value) {
+            return Ok(value);
+        }
+        last_value = value;
+    }
+
+    Ok(last_value)
+}
+
+fn eval_or(arguments: &[Expr]) -> Result<Value, String> {
+    for argument in arguments {
+        let value = eval_expr(argument)?;
+        if is_truthy(&value) {
+            return Ok(value);
+        }
+    }
+
+    Ok(Value::Boolean(false))
+}
+
 fn expect_integer(value: &Value, operator: &str) -> Result<i64, String> {
     match value {
         Value::Integer(number) => Ok(*number),
         _ => Err(format!("`{operator}` expects integer arguments")),
     }
+}
+
+fn is_truthy(value: &Value) -> bool {
+    !matches!(value, Value::Boolean(false))
 }
 
 struct Parser<'a> {
