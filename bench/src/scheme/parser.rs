@@ -35,12 +35,14 @@ impl<'a> Parser<'a> {
         self.skip_whitespace();
         let ch = self.peek().ok_or(ParseError::UnexpectedEof)?;
         match ch {
+            '(' => self.parse_list(),
             '"' => self.parse_string(),
             '#' => self.parse_boolean(),
             '-' if self.peek_at(1).is_some_and(|c: char| c.is_ascii_digit()) => {
                 self.parse_integer()
             }
             '0'..='9' => self.parse_integer(),
+            _ if is_symbol_char(ch) => self.parse_symbol(),
             _ => Err(ParseError::UnexpectedChar { ch }),
         }
     }
@@ -98,7 +100,31 @@ impl<'a> Parser<'a> {
         self.input[self.pos..].chars().next()
     }
 
+    fn parse_list(&mut self) -> Result<Value, ParseError> {
+        self.pos += 1; // skip '('
+        let mut elems = Vec::new();
+        self.skip_whitespace();
+        while self.peek().ok_or(ParseError::UnexpectedEof)? != ')' {
+            elems.push(self.parse_expr()?);
+            self.skip_whitespace();
+        }
+        self.pos += 1; // skip ')'
+        Ok(Value::List(elems))
+    }
+
+    fn parse_symbol(&mut self) -> Result<Value, ParseError> {
+        let start = self.pos;
+        while self.peek().is_some_and(is_symbol_char) {
+            self.pos += 1;
+        }
+        Ok(Value::Symbol(self.input[start..self.pos].to_string()))
+    }
+
     fn peek_at(&self, offset: usize) -> Option<char> {
         self.input.get(self.pos + offset..)?.chars().next()
     }
+}
+
+fn is_symbol_char(ch: char) -> bool {
+    !ch.is_whitespace() && !matches!(ch, '(' | ')' | '"' | ';')
 }
