@@ -9,12 +9,21 @@ pub(crate) enum Value {
     String(String),
 }
 
-impl From<Expr> for Value {
-    fn from(expression: Expr) -> Self {
+impl Value {
+    pub(crate) fn from_literal(expression: &Expr) -> Option<Self> {
         match expression {
-            Expr::Integer(value) => Self::Integer(value),
-            Expr::Boolean(value) => Self::Boolean(value),
-            Expr::String(value) => Self::String(value),
+            Expr::Integer(value) => Some(Self::Integer(*value)),
+            Expr::Boolean(value) => Some(Self::Boolean(*value)),
+            Expr::String(value) => Some(Self::String(value.clone())),
+            Expr::Symbol(_) | Expr::List(_) => None,
+        }
+    }
+
+    pub(crate) fn kind(&self) -> &'static str {
+        match self {
+            Self::Integer(_) => "number",
+            Self::Boolean(_) => "boolean",
+            Self::String(_) => "string",
         }
     }
 }

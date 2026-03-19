@@ -5,6 +5,8 @@ pub(crate) enum Expr {
     Integer(i64),
     Boolean(bool),
     String(String),
+    Symbol(String),
+    List(Vec<Expr>),
 }
 
 pub(crate) fn parse_program(input: &str) -> Result<Vec<Expr>, SchemeError> {
@@ -43,16 +45,33 @@ impl<'a> Parser<'a> {
         self.skip_ignored();
 
         match self.peek_char() {
+            Some('(') => self.parse_list(),
             Some('"') => self.parse_string(),
             Some('#') => self.parse_boolean(),
-            Some(ch) if ch == '+' || ch == '-' || ch.is_ascii_digit() => self.parse_integer(),
-            Some(ch) => Err(SchemeError::InvalidTokenStart {
-                ch,
-                index: self.index,
-            }),
+            Some(')') => Err(SchemeError::UnexpectedCloseParen { index: self.index }),
+            Some(_) if self.starts_integer() => self.parse_integer(),
+            Some(_) => self.parse_symbol(),
             None => Err(SchemeError::UnexpectedEndOfInput {
                 context: "expression",
             }),
+        }
+    }
+
+    fn parse_list(&mut self) -> Result<Expr, SchemeError> {
+        let _ = self.advance_char();
+        let mut expressions = Vec::new();
+        self.skip_ignored();
+
+        while self.peek_char().is_some_and(|ch| ch != ')') {
+            expressions.push(self.parse_expr()?);
+            self.skip_ignored();
+        }
+
+        if self.peek_char() == Some(')') {
+            let _ = self.advance_char();
+            Ok(Expr::List(expressions))
+        } else {
+            Err(SchemeError::UnexpectedEndOfInput { context: "list" })
         }
     }
 
@@ -80,6 +99,22 @@ impl<'a> Parser<'a> {
                 literal: token.to_owned(),
                 index: start,
             })
+    }
+
+    fn parse_symbol(&mut self) -> Result<Expr, SchemeError> {
+        let start = self.index;
+        let token = self.read_token();
+
+        if token.is_empty() {
+            match self.peek_char() {
+                Some(ch) => Err(SchemeError::InvalidTokenStart { ch, index: start }),
+                None => Err(SchemeError::UnexpectedEndOfInput {
+                    context: "symbol",
+                }),
+            }
+        } else {
+            Ok(Expr::Symbol(token.to_owned()))
+        }
     }
 
     fn parse_string(&mut self) -> Result<Expr, SchemeError> {
@@ -154,6 +189,18 @@ impl<'a> Parser<'a> {
 
     fn is_eof(&self) -> bool {
         self.index >= self.input.len()
+    }
+
+    fn starts_integer(&self) -> bool {
+        match self.peek_char() {
+            Some(ch) if ch.is_ascii_digit() => true,
+            Some('+') | Some('-') => self.peek_next_char().is_some_and(|ch| ch.is_ascii_digit()),
+            _ => false,
+        }
+    }
+
+    fn peek_next_char(&self) -> Option<char> {
+        self.input[self.index..].chars().nth(1)
     }
 }
 
