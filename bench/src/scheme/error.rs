@@ -31,6 +31,16 @@ pub(crate) enum SchemeError {
         operator: &'static str,
         found: Value,
     },
+    #[error("`{operator}` expected a pair but got {found}")]
+    ExpectedPair {
+        operator: &'static str,
+        found: Value,
+    },
+    #[error("`{operator}` expected a list but got {found}")]
+    ExpectedList {
+        operator: &'static str,
+        found: Value,
+    },
     #[error("`{operator}` expected at least {min} argument(s) but got {actual}")]
     TooFewArguments {
         operator: &'static str,

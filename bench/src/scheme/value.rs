@@ -11,7 +11,8 @@ pub(crate) enum Value {
     Boolean(bool),
     String(String),
     Symbol(String),
-    List(Vec<Value>),
+    EmptyList,
+    Pair(Box<Pair>),
     Procedure(Rc<Procedure>),
     Void,
 }
@@ -32,7 +33,7 @@ impl Value {
             Expr::Boolean(value) => Self::Boolean(*value),
             Expr::String(value) => Self::String(value.clone()),
             Expr::Symbol(value) => Self::Symbol(value.clone()),
-            Expr::List(values) => Self::List(values.iter().map(Self::from_quoted_expr).collect()),
+            Expr::List(values) => Self::list(values.iter().map(Self::from_quoted_expr).collect()),
         }
     }
 
@@ -44,6 +45,17 @@ impl Value {
         Self::Procedure(Rc::new(Procedure::new(parameters, body, environment)))
     }
 
+    pub(crate) fn pair(car: Value, cdr: Value) -> Self {
+        Self::Pair(Box::new(Pair::new(car, cdr)))
+    }
+
+    pub(crate) fn list(values: Vec<Value>) -> Self {
+        values
+            .into_iter()
+            .rev()
+            .fold(Self::EmptyList, |cdr, car| Self::pair(car, cdr))
+    }
+
     pub(crate) fn as_procedure(&self) -> Option<&Procedure> {
         match self {
             Self::Procedure(procedure) => Some(procedure.as_ref()),
@@ -51,8 +63,28 @@ impl Value {
         }
     }
 
+    pub(crate) fn is_null(&self) -> bool {
+        matches!(self, Self::EmptyList)
+    }
+
     pub(crate) fn is_truthy(&self) -> bool {
         !matches!(self, Self::Boolean(false))
+    }
+
+    pub(crate) fn list_length(&self) -> Result<usize, Self> {
+        let mut length = 0;
+        let mut rest = self;
+
+        while let Self::Pair(pair) = rest {
+            length += 1;
+            rest = pair.cdr();
+        }
+
+        if matches!(rest, Self::EmptyList) {
+            Ok(length)
+        } else {
+            Err(rest.clone())
+        }
     }
 
     pub(crate) fn kind(&self) -> &'static str {
@@ -61,10 +93,31 @@ impl Value {
             Self::Boolean(_) => "boolean",
             Self::String(_) => "string",
             Self::Symbol(_) => "symbol",
-            Self::List(_) => "list",
+            Self::EmptyList => "empty list",
+            Self::Pair(_) => "pair",
             Self::Procedure(_) => "procedure",
             Self::Void => "void",
         }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct Pair {
+    car: Value,
+    cdr: Value,
+}
+
+impl Pair {
+    fn new(car: Value, cdr: Value) -> Self {
+        Self { car, cdr }
+    }
+
+    pub(crate) fn car(&self) -> &Value {
+        &self.car
+    }
+
+    pub(crate) fn cdr(&self) -> &Value {
+        &self.cdr
     }
 }
 
@@ -75,25 +128,32 @@ impl Display for Value {
             Self::Boolean(value) => f.write_str(if *value { "#t" } else { "#f" }),
             Self::String(value) => write_string(value, f),
             Self::Symbol(value) => f.write_str(value),
-            Self::List(values) => write_list(values, f),
+            Self::EmptyList => f.write_str("()"),
+            Self::Pair(pair) => write_pair(pair, f),
             Self::Procedure(_) => f.write_str("#<procedure>"),
             Self::Void => f.write_str("#<void>"),
         }
     }
 }
 
-fn write_list(values: &[Value], f: &mut Formatter<'_>) -> fmt::Result {
+fn write_pair(pair: &Pair, f: &mut Formatter<'_>) -> fmt::Result {
     f.write_str("(")?;
+    write!(f, "{}", pair.car())?;
 
-    for (index, value) in values.iter().enumerate() {
-        if index > 0 {
-            f.write_str(" ")?;
+    let mut rest = pair.cdr();
+    loop {
+        match rest {
+            Value::EmptyList => return f.write_str(")"),
+            Value::Pair(next_pair) => {
+                write!(f, " {}", next_pair.car())?;
+                rest = next_pair.cdr();
+            }
+            value => {
+                write!(f, " . {value})")?;
+                return Ok(());
+            }
         }
-
-        write!(f, "{value}")?;
     }
-
-    f.write_str(")")
 }
 
 fn write_string(value: &str, f: &mut Formatter<'_>) -> fmt::Result {

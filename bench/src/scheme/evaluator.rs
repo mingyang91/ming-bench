@@ -233,6 +233,12 @@ fn apply_builtin(
         "not" => eval_not(operands, environment),
         "and" => eval_and(operands, environment),
         "or" => eval_or(operands, environment),
+        "cons" => eval_cons(operands, environment),
+        "car" => eval_car(operands, environment),
+        "cdr" => eval_cdr(operands, environment),
+        "null?" => eval_null(operands, environment),
+        "list" => eval_list(operands, environment),
+        "length" => eval_length(operands, environment),
         _ => Err(SchemeError::UnboundSymbol {
             name: operator.to_owned(),
         }),
@@ -392,6 +398,91 @@ fn eval_or(operands: &[Expr], environment: &Environment) -> Result<Value, Scheme
     Ok(Value::Boolean(false))
 }
 
+fn eval_cons(operands: &[Expr], environment: &Environment) -> Result<Value, SchemeError> {
+    match operands {
+        [car_expression, cdr_expression] => {
+            let car = eval_expr(car_expression, environment)?;
+            let cdr = eval_expr(cdr_expression, environment)?;
+            Ok(Value::pair(car, cdr))
+        }
+        _ => Err(SchemeError::WrongArgumentCount {
+            operator: "cons",
+            expected: 2,
+            actual: operands.len(),
+        }),
+    }
+}
+
+fn eval_car(operands: &[Expr], environment: &Environment) -> Result<Value, SchemeError> {
+    match operands {
+        [operand] => match eval_expr(operand, environment)? {
+            Value::Pair(pair) => Ok(pair.car().clone()),
+            found => Err(SchemeError::ExpectedPair {
+                operator: "car",
+                found,
+            }),
+        },
+        _ => Err(SchemeError::WrongArgumentCount {
+            operator: "car",
+            expected: 1,
+            actual: operands.len(),
+        }),
+    }
+}
+
+fn eval_cdr(operands: &[Expr], environment: &Environment) -> Result<Value, SchemeError> {
+    match operands {
+        [operand] => match eval_expr(operand, environment)? {
+            Value::Pair(pair) => Ok(pair.cdr().clone()),
+            found => Err(SchemeError::ExpectedPair {
+                operator: "cdr",
+                found,
+            }),
+        },
+        _ => Err(SchemeError::WrongArgumentCount {
+            operator: "cdr",
+            expected: 1,
+            actual: operands.len(),
+        }),
+    }
+}
+
+fn eval_null(operands: &[Expr], environment: &Environment) -> Result<Value, SchemeError> {
+    match operands {
+        [operand] => {
+            let value = eval_expr(operand, environment)?;
+            Ok(Value::Boolean(value.is_null()))
+        }
+        _ => Err(SchemeError::WrongArgumentCount {
+            operator: "null?",
+            expected: 1,
+            actual: operands.len(),
+        }),
+    }
+}
+
+fn eval_list(operands: &[Expr], environment: &Environment) -> Result<Value, SchemeError> {
+    Ok(Value::list(eval_values(operands, environment)?))
+}
+
+fn eval_length(operands: &[Expr], environment: &Environment) -> Result<Value, SchemeError> {
+    match operands {
+        [operand] => {
+            let value = eval_expr(operand, environment)?;
+            let length = value.list_length().map_err(|found| SchemeError::ExpectedList {
+                operator: "length",
+                found,
+            })?;
+            Ok(Value::Integer(length as i64))
+        }
+        _ => Err(SchemeError::WrongArgumentCount {
+            operator: "length",
+            expected: 1,
+            actual: operands.len(),
+        }),
+    }
+}
+
 fn eval_values(operands: &[Expr], environment: &Environment) -> Result<Vec<Value>, SchemeError> {
     let mut values = Vec::with_capacity(operands.len());
 
@@ -434,7 +525,23 @@ fn divide_numbers(lhs: i64, rhs: i64) -> Result<i64, SchemeError> {
 fn is_builtin(operator: &str) -> bool {
     matches!(
         operator,
-        "+" | "-" | "*" | "/" | "<" | ">" | "=" | "<=" | "not" | "and" | "or"
+        "+"
+            | "-"
+            | "*"
+            | "/"
+            | "<"
+            | ">"
+            | "="
+            | "<="
+            | "not"
+            | "and"
+            | "or"
+            | "cons"
+            | "car"
+            | "cdr"
+            | "null?"
+            | "list"
+            | "length"
     )
 }
 
