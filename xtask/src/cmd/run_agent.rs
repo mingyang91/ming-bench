@@ -22,6 +22,7 @@ pub struct RunAgentArgs {
     pub skip_bench: bool,
     pub resume: bool,
     pub from_level: Option<String>,
+    pub clean: bool,
 }
 
 const DEFAULT_PROMPT: &str = "Implement the Scheme interpreter by following CLAUDE.md exactly.
@@ -366,17 +367,34 @@ fn find_resume_dir(proj: &Path, base: &str, name: &str) -> Result<PathBuf> {
 }
 
 fn setup_fresh_run(proj: &Path, args: &RunAgentArgs, worktree_dir: &Path) -> Result<PathBuf> {
+    if args.clean {
+        // Remove stale worktree directory
+        if worktree_dir.is_dir() {
+            println!("--clean: removing worktree dir {}", worktree_dir.display());
+            let _ = run_cmd("git", &["worktree", "remove", "--force", &worktree_dir.to_string_lossy()], proj);
+            if worktree_dir.is_dir() {
+                fs::remove_dir_all(worktree_dir).map_err(|e| Error::io(worktree_dir, e))?;
+            }
+        }
+        // Prune stale worktree refs and delete branch
+        let _ = run_cmd("git", &["worktree", "prune"], proj);
+        let _ = run_cmd("git", &["branch", "-D", &args.name], proj);
+    }
+
     if worktree_dir.is_dir() {
-        return Err(Error::WorktreeExists {
+        return Err(Error::WorktreeDirExists {
             path: worktree_dir.to_path_buf(),
         });
     }
 
+    // Prune stale worktree refs before checking branch
+    let _ = run_cmd("git", &["worktree", "prune"], proj);
+
     // Check branch doesn't already exist
     let (_, branches) = run_cmd_capture("git", &["branch", "--list", &args.name], proj)?;
     if !branches.trim().is_empty() {
-        return Err(Error::WorktreeExists {
-            path: worktree_dir.to_path_buf(),
+        return Err(Error::BranchExists {
+            branch: args.name.clone(),
         });
     }
 

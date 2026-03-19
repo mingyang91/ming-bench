@@ -87,6 +87,8 @@ cargo xtask verify          # ground-truth check against Guile Scheme
 
 ### Agent Orchestration
 
+> **Note:** Shell scripts under `scripts/` are deprecated launch helpers. `cargo xtask` is the only supported interface for running agents and benchmarks.
+
 `cargo xtask run-agent` handles the full lifecycle:
 
 1. Creates an isolated git worktree from the target branch
@@ -98,6 +100,16 @@ cargo xtask verify          # ground-truth check against Guile Scheme
 7. Commits checkpoints and pushes to origin
 
 Each run is self-contained — unique worktree, UUID, results directory. Multiple runs execute in parallel without interference.
+
+**Worktree path convention:** Worktrees are created at `<repo>/../workspace/<name>`. For a repo at `/home/user/workspace/cs61a-bench`, the worktree for run `claude-r1` goes to `/home/user/workspace/workspace/claude-r1` (the repo's parent is `workspace/`, so sibling `workspace/` is created).
+
+**Cleanup:** If a previous run left a stale worktree or branch, use `--clean` to auto-remove them:
+
+```bash
+cargo xtask run-agent --base main --name claude-r1 --clean --agent claude --mode levels
+```
+
+Without `--clean`, you'll get distinct errors for stale directories vs stale branches, with instructions on how to fix each.
 
 ### Cost Analysis
 

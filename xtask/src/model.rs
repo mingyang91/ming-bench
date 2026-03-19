@@ -93,8 +93,11 @@ pub enum Error {
     #[error("required binary not found: {name}")]
     BinaryNotFound { name: String },
 
-    #[error("worktree already exists: {path}")]
-    WorktreeExists { path: PathBuf },
+    #[error("worktree directory already exists: {path}")]
+    WorktreeDirExists { path: PathBuf },
+
+    #[error("git branch already exists: {branch} (remove with `git branch -D {branch}` and `git worktree prune`)")]
+    BranchExists { branch: String },
 
     #[error("lock conflict: {path} held by PID {pid}")]
     LockConflict { path: PathBuf, pid: u32 },
