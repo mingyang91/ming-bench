@@ -69,6 +69,11 @@ pub enum Expr {
     },
     Builtin(String),
     Continuation(Rc<ContData>),
+    Macro {
+        literals: Vec<String>,
+        rules: Vec<(Expr, Expr)>,
+        env: Env,
+    },
     Void,
 }
 
@@ -102,6 +107,7 @@ impl PartialEq for Expr {
             (Expr::List(a), Expr::List(b)) => a == b,
             (Expr::Builtin(a), Expr::Builtin(b)) => a == b,
             (Expr::Continuation(_), Expr::Continuation(_)) => false,
+            (Expr::Macro { .. }, Expr::Macro { .. }) => false,
             (Expr::Void, Expr::Void) => true,
             _ => false,
         }
@@ -123,6 +129,7 @@ impl Expr {
             Expr::Lambda { .. } => "#<procedure>".into(),
             Expr::Builtin(_) => "#<procedure>".into(),
             Expr::Continuation(_) => "#<continuation>".into(),
+            Expr::Macro { .. } => "#<macro>".into(),
             Expr::Void => "".into(),
         }
     }

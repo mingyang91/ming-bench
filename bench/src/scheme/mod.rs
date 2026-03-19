@@ -1,6 +1,7 @@
 mod builtins;
 mod expr;
 mod forms;
+mod macros;
 mod parser;
 mod trampoline;
 

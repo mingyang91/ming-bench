@@ -55,7 +55,7 @@ pub fn eval_step(expr: &Expr, env: &Env) -> Result<Bounce, String> {
             .get(name)
             .map(Bounce::Done)
             .ok_or_else(|| format!("unbound variable: {name}")),
-        Expr::Lambda { .. } | Expr::Builtin(_) | Expr::Continuation(_) => {
+        Expr::Lambda { .. } | Expr::Builtin(_) | Expr::Continuation(_) | Expr::Macro { .. } => {
             Ok(Bounce::Done(expr.clone()))
         }
         Expr::List(elems) => eval_list_step(elems, env),
@@ -71,6 +71,12 @@ fn eval_list_step(elems: &[Expr], env: &Env) -> Result<Bounce, String> {
         return Ok(bounce);
     }
     let proc = eval(&elems[0], env)?;
+    // If operator is a macro, expand it (don't evaluate args)
+    if let Expr::Macro { ref literals, ref rules, env: ref def_env } = proc {
+        let (expanded, eval_env) =
+            super::macros::expand_macro(rules, literals, &elems[1..], def_env, env)?;
+        return Ok(Bounce::TailCall { expr: expanded, env: eval_env });
+    }
     let args: Vec<Expr> = elems[1..]
         .iter()
         .map(|a| eval(a, env))
@@ -85,6 +91,7 @@ fn try_special_form(elems: &[Expr], env: &Env) -> Result<Option<Bounce>, String>
     let args = &elems[1..];
     match op.as_str() {
         "define" => eval_define(args, env).map(|v| Some(Bounce::Done(v))),
+        "define-syntax" => eval_define_syntax(args, env).map(|v| Some(Bounce::Done(v))),
         "set!" => {
             if args.len() != 2 {
                 return Err("set! requires exactly two arguments".into());
@@ -115,6 +122,55 @@ fn try_special_form(elems: &[Expr], env: &Env) -> Result<Option<Bounce>, String>
         name if is_builtin(name) => eval_builtin(name, args, env).map(|v| Some(Bounce::Done(v))),
         _ => Ok(None),
     }
+}
+
+fn eval_define_syntax(args: &[Expr], env: &Env) -> Result<Expr, String> {
+    if args.len() != 2 {
+        return Err("define-syntax requires a name and a transformer".into());
+    }
+    let name = match &args[0] {
+        Expr::Symbol(s) => s.clone(),
+        _ => return Err("define-syntax: first argument must be a symbol".into()),
+    };
+    // Parse (syntax-rules (literals...) (pattern template) ...)
+    let Expr::List(ref sr) = args[1] else {
+        return Err("define-syntax: expected syntax-rules".into());
+    };
+    if sr.is_empty() || !matches!(&sr[0], Expr::Symbol(s) if s == "syntax-rules") {
+        return Err("define-syntax: expected syntax-rules".into());
+    }
+    if sr.len() < 2 {
+        return Err("syntax-rules requires a literal list".into());
+    }
+    let literals: Vec<String> = match &sr[1] {
+        Expr::List(lits) => lits
+            .iter()
+            .map(|l| match l {
+                Expr::Symbol(s) => Ok(s.clone()),
+                _ => Err("syntax-rules: literals must be symbols".into()),
+            })
+            .collect::<Result<_, String>>()?,
+        _ => return Err("syntax-rules: expected literal list".into()),
+    };
+    let mut rules = Vec::new();
+    for rule in &sr[2..] {
+        let Expr::List(ref pair) = rule else {
+            return Err("syntax-rules: each rule must be a list".into());
+        };
+        if pair.len() != 2 {
+            return Err("syntax-rules: each rule must be (pattern template)".into());
+        }
+        rules.push((pair[0].clone(), pair[1].clone()));
+    }
+    env.insert(
+        name,
+        Expr::Macro {
+            literals,
+            rules,
+            env: env.clone(),
+        },
+    );
+    Ok(Expr::Void)
 }
 
 fn bounce_if(args: &[Expr], env: &Env) -> Result<Bounce, String> {
