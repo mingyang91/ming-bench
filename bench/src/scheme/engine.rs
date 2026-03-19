@@ -259,6 +259,22 @@ fn lookup_binding(environment: &Environment, name: &str) -> Option<Value> {
     parent.and_then(|parent| lookup_binding(&parent, name))
 }
 
+fn set_binding(environment: &Environment, name: &str, value: Value) -> Result<(), String> {
+    let parent = {
+        let mut frame = environment.borrow_mut();
+        if let Some(binding) = frame.bindings.get_mut(name) {
+            *binding = value;
+            return Ok(());
+        }
+        frame.parent.clone()
+    };
+
+    match parent {
+        Some(parent) => set_binding(&parent, name, value),
+        None => Err(format!("unbound symbol: {name}")),
+    }
+}
+
 fn eval_sequence(expressions: &[Expr], environment: &Environment) -> Result<Value, String> {
     resolve_outcome(eval_sequence_outcome(expressions, environment, false)?)
 }
@@ -317,6 +333,7 @@ fn eval_application_outcome(
             "let" => return eval_let(arguments, environment).map(EvalOutcome::Value),
             "quote" => return eval_quote(arguments).map(EvalOutcome::Value),
             "lambda" => return eval_lambda(arguments, environment).map(EvalOutcome::Value),
+            "set!" => return eval_set(arguments, environment).map(EvalOutcome::Value),
             _ => {}
         }
     }
@@ -456,6 +473,20 @@ fn eval_lambda(arguments: &[Expr], environment: &Environment) -> Result<Value, S
         body: body.to_vec().into(),
         environment: environment.clone(),
     }))
+}
+
+fn eval_set(arguments: &[Expr], environment: &Environment) -> Result<Value, String> {
+    let [target, value_expr] = arguments else {
+        return Err("`set!` expects exactly 2 arguments".into());
+    };
+
+    let Expr::Symbol(name) = target else {
+        return Err("`set!` expects a symbol name".into());
+    };
+
+    let value = eval_expr(value_expr, environment)?;
+    set_binding(environment, name, value)?;
+    Ok(Value::Void)
 }
 
 fn eval_begin(arguments: &[Expr], environment: &Environment) -> Result<Value, String> {
