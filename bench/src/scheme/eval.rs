@@ -25,6 +25,7 @@ fn eval_inner(expr: &Value, env: &Env) -> Result<Trampoline, String> {
         Value::Integer(_) | Value::Boolean(_) | Value::String(_) => Ok(Trampoline::Done(expr.clone())),
         Value::Symbol(name) => env
             .get(name)
+            .or_else(|| resolve_builtin(name))
             .map(Trampoline::Done)
             .ok_or_else(|| format!("unbound variable: {name}")),
         Value::List(elems) => eval_list(elems, env),
@@ -59,7 +60,7 @@ fn eval_call(elems: &[Value], env: &Env) -> Result<Trampoline, String> {
         let args = eval_args(&elems[1..], env)?;
         return match env.get(name) {
             Some(proc) => apply_tco(&proc, &args),
-            None => apply_primitive(name, &args).map(Trampoline::Done),
+            None => apply_builtin(name, &args),
         };
     }
     let proc = eval(&elems[0], env)?;
@@ -74,25 +75,44 @@ fn eval_args(exprs: &[Value], env: &Env) -> Result<Vec<Value>, String> {
 /// TCO apply: returns Bounce for the lambda body instead of evaluating it.
 fn apply_tco(proc: &Value, args: &[Value]) -> Result<Trampoline, String> {
     match proc {
-        Value::Lambda { params, body, env } => {
-            if params.len() != args.len() {
-                return Err(format!(
-                    "expected {} arguments, got {}",
-                    params.len(),
-                    args.len()
-                ));
-            }
-            let child = env.child();
-            for (param, arg) in params.iter().zip(args) {
-                child.set(param.clone(), arg.clone());
-            }
+        Value::Lambda {
+            params,
+            rest_param,
+            body,
+            env,
+        } => {
+            validate_arity(params.len(), rest_param.is_some(), args.len())?;
+            let child = bind_args(env, params, rest_param.as_deref(), args);
             Ok(Trampoline::Bounce {
                 expr: *body.clone(),
                 env: child,
             })
         }
+        Value::Builtin { name } => apply_builtin(name, args),
         other => Err(format!("not a procedure: {other}")),
     }
+}
+
+fn validate_arity(expected: usize, variadic: bool, actual: usize) -> Result<(), String> {
+    if variadic {
+        if actual < expected {
+            return Err(format!("expected at least {expected} arguments, got {actual}"));
+        }
+    } else if expected != actual {
+        return Err(format!("expected {expected} arguments, got {actual}"));
+    }
+    Ok(())
+}
+
+fn bind_args(env: &Env, params: &[String], rest_param: Option<&str>, args: &[Value]) -> Env {
+    let child = env.child();
+    for (param, arg) in params.iter().zip(args) {
+        child.set(param.clone(), arg.clone());
+    }
+    if let Some(rest_name) = rest_param {
+        child.set(rest_name.to_string(), Value::List(args[params.len()..].to_vec()));
+    }
+    child
 }
 
 // ── Special forms ────────────────────────────────────────────────────
@@ -112,10 +132,11 @@ fn eval_define(args: &[Value], env: &Env) -> Result<Value, String> {
                 Value::Symbol(s) => s.clone(),
                 other => return Err(format!("define: expected symbol, got {other}")),
             };
-            let params = extract_params(&elems[1..])?;
+            let (params, rest_param) = extract_params(&elems[1..])?;
             let body = wrap_body(&args[1..]);
             let lambda = Value::Lambda {
                 params,
+                rest_param,
                 body: Box::new(body),
                 env: env.clone(),
             };
@@ -130,13 +151,14 @@ fn eval_lambda(args: &[Value], env: &Env) -> Result<Value, String> {
     if args.len() < 2 {
         return Err(format!("lambda requires at least 2 arguments, got {}", args.len()));
     }
-    let params = match &args[0] {
+    let (params, rest_param) = match &args[0] {
         Value::List(elems) => extract_params(elems)?,
         other => return Err(format!("lambda: expected parameter list, got {other}")),
     };
     let body = wrap_body(&args[1..]);
     Ok(Value::Lambda {
         params,
+        rest_param,
         body: Box::new(body),
         env: env.clone(),
     })
@@ -152,14 +174,34 @@ fn wrap_body(exprs: &[Value]) -> Value {
     }
 }
 
-fn extract_params(elems: &[Value]) -> Result<Vec<String>, String> {
-    elems
-        .iter()
-        .map(|e| match e {
-            Value::Symbol(s) => Ok(s.clone()),
-            other => Err(format!("expected parameter name, got {other}")),
-        })
-        .collect()
+fn extract_params(elems: &[Value]) -> Result<(Vec<String>, Option<String>), String> {
+    // Look for dot notation: (a b . rest)
+    if let Some(dot_pos) = elems.iter().position(|e| matches!(e, Value::Symbol(s) if s == ".")) {
+        if dot_pos + 2 != elems.len() {
+            return Err("malformed dotted parameter list".into());
+        }
+        let params = elems[..dot_pos]
+            .iter()
+            .map(|e| match e {
+                Value::Symbol(s) => Ok(s.clone()),
+                other => Err(format!("expected parameter name, got {other}")),
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        let rest = match &elems[dot_pos + 1] {
+            Value::Symbol(s) => s.clone(),
+            other => return Err(format!("expected parameter name, got {other}")),
+        };
+        Ok((params, Some(rest)))
+    } else {
+        let params = elems
+            .iter()
+            .map(|e| match e {
+                Value::Symbol(s) => Ok(s.clone()),
+                other => Err(format!("expected parameter name, got {other}")),
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok((params, None))
+    }
 }
 
 fn eval_if(args: &[Value], env: &Env) -> Result<Trampoline, String> {
@@ -401,6 +443,42 @@ fn apply_list_primitive(op: &str, args: &[Value]) -> Result<Value, String> {
         },
         _ => unreachable!(),
     }
+}
+
+const BUILTINS: &[&str] = &[
+    "+", "-", "*", "/", "<", ">", "=", "<=", ">=", "cons", "car", "cdr", "null?", "list",
+    "length", "boolean?", "number?", "pair?", "string?", "symbol?", "not", "apply",
+];
+
+fn resolve_builtin(name: &str) -> Option<Value> {
+    if BUILTINS.contains(&name) {
+        Some(Value::Builtin {
+            name: name.to_string(),
+        })
+    } else {
+        None
+    }
+}
+
+fn apply_builtin(name: &str, args: &[Value]) -> Result<Trampoline, String> {
+    if name == "apply" {
+        return builtin_apply(args);
+    }
+    apply_primitive(name, args).map(Trampoline::Done)
+}
+
+fn builtin_apply(args: &[Value]) -> Result<Trampoline, String> {
+    if args.len() < 2 {
+        return Err(format!("apply requires at least 2 arguments, got {}", args.len()));
+    }
+    let proc = &args[0];
+    let last = match &args[args.len() - 1] {
+        Value::List(elems) => elems.clone(),
+        other => return Err(format!("apply: last argument must be a list, got {other}")),
+    };
+    let mut combined = args[1..args.len() - 1].to_vec();
+    combined.extend(last);
+    apply_tco(proc, &combined)
 }
 
 fn checked_div(nums: &[i64]) -> Result<Value, String> {

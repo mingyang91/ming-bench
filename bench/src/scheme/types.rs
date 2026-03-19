@@ -70,8 +70,12 @@ pub enum Value {
     List(Vec<Value>),
     Lambda {
         params: Vec<String>,
+        rest_param: Option<String>,
         body: Box<Value>,
         env: Env,
+    },
+    Builtin {
+        name: String,
     },
     Void,
 }
@@ -84,6 +88,7 @@ impl PartialEq for Value {
             (Self::String(a), Self::String(b)) => a == b,
             (Self::Symbol(a), Self::Symbol(b)) => a == b,
             (Self::List(a), Self::List(b)) => a == b,
+            (Self::Builtin { name: a }, Self::Builtin { name: b }) => a == b,
             (Self::Void, Self::Void) => true,
             _ => false,
         }
@@ -99,6 +104,7 @@ impl fmt::Debug for Value {
             Self::Symbol(s) => write!(f, "Symbol({s:?})"),
             Self::List(elems) => write!(f, "List({elems:?})"),
             Self::Lambda { params, .. } => write!(f, "Lambda({params:?})"),
+            Self::Builtin { name } => write!(f, "Builtin({name:?})"),
             Self::Void => write!(f, "Void"),
         }
     }
@@ -113,7 +119,7 @@ impl fmt::Display for Value {
             Value::String(s) => write!(f, "\"{s}\""),
             Value::Symbol(s) => write!(f, "{s}"),
             Value::List(elems) => write_list(f, elems),
-            Value::Lambda { .. } => write!(f, "#<procedure>"),
+            Value::Lambda { .. } | Value::Builtin { .. } => write!(f, "#<procedure>"),
             Value::Void => write!(f, ""),
         }
     }
