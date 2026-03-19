@@ -1,0 +1,5 @@
+(define k-save #f)
+(define count 0)
+(define (run) (set! count (+ count (call/cc (lambda (k) (set! k-save k) 1)))))
+(run)
+(if (< count 3) (k-save 1) count)

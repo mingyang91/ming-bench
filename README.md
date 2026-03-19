@@ -16,10 +16,27 @@ The task is deliberately chosen to stress-test this: a Scheme interpreter requir
 
 The agent receives:
 - A function signature: `eval_str(input: &str) -> Result<String, String>`
-- 97 test cases across 16 levels
-- Instructions in `CLAUDE.md` (the only file the agent reads for guidance)
+- 97 test cases across 16 levels (each test loads Scheme code from a `.scm` fixture file)
+- Instructions in `bench/CLAUDE.md` (the only file the agent reads for guidance)
 
 The agent implements a complete Scheme interpreter from scratch — lexer, parser, environment, evaluator, tail-call optimization, continuations, and hygienic macros. No starter code. No libraries beyond `thiserror` for error types.
+
+### Project Structure
+
+```
+cs61a-bench/              # framework ("jug") — orchestration & analysis
+  xtask/                  # CLI: run-agent, test, bench, tokens, analyze, watch
+  Dockerfile.bench        # container image for sandboxed testing
+  CLAUDE.md               # framework maintainer instructions
+
+  bench/                  # agent playground — what the agent sees
+    CLAUDE.md             # agent instructions (branch-specific)
+    src/scheme/           # agent implements here
+    src/scheme/tests/     # test suite (read-only to agent)
+    src/scheme/tests/fixtures/  # .scm files loaded by tests
+```
+
+Agents are launched with `cwd = bench/` and only interact with files there. Framework code (xtask, Dockerfile) lives above the agent's working directory.
 
 ### The Experiment: Two Branches
 
@@ -28,7 +45,7 @@ The agent implements a complete Scheme interpreter from scratch — lexer, parse
 | `main` | Minimal instructions: implement levels in order, run tests, fix failures | Baseline — how agents perform with standard guidance |
 | `strategy` | Adds: quality gate (clippy + size limits), code style rules (typed errors, immutable-first, thin mod.rs) | Whether structural enforcement improves agent code quality and completion rate |
 
-Both branches share identical test suites and infrastructure. The only difference is the instructions the agent sees.
+Both branches share identical test suites and infrastructure. The only difference is `bench/CLAUDE.md` — the instructions the agent sees.
 
 ### Execution Modes
 
@@ -101,7 +118,7 @@ cargo xtask verify          # ground-truth check against Guile Scheme
 
 Each run is self-contained — unique worktree, UUID, results directory. Multiple runs execute in parallel without interference.
 
-**Worktree path convention:** Worktrees are created at `<repo>/../workspace/<name>`. For a repo at `/home/user/workspace/cs61a-bench`, the worktree for run `claude-r1` goes to `/home/user/workspace/workspace/claude-r1` (the repo's parent is `workspace/`, so sibling `workspace/` is created).
+**Worktree path convention:** Worktrees are created at `<repo>/../workspace/<name>`. The agent's working directory is set to `<worktree>/bench/`, so it only sees the playground contents.
 
 **Cleanup:** If a previous run left a stale worktree or branch, use `--clean` to auto-remove them:
 
