@@ -82,6 +82,12 @@ pub(super) enum Builtin {
     Equal,
     LessEqual,
     Not,
+    Cons,
+    Car,
+    Cdr,
+    IsNull,
+    List,
+    Length,
 }
 
 impl Builtin {
@@ -96,6 +102,12 @@ impl Builtin {
             Self::Equal => "=",
             Self::LessEqual => "<=",
             Self::Not => "not",
+            Self::Cons => "cons",
+            Self::Car => "car",
+            Self::Cdr => "cdr",
+            Self::IsNull => "null?",
+            Self::List => "list",
+            Self::Length => "length",
         }
     }
 
@@ -110,6 +122,12 @@ impl Builtin {
             Self::Equal => eval_equal(arguments),
             Self::LessEqual => eval_less_equal(arguments),
             Self::Not => eval_not(arguments),
+            Self::Cons => eval_cons(arguments),
+            Self::Car => eval_car(arguments),
+            Self::Cdr => eval_cdr(arguments),
+            Self::IsNull => eval_is_null(arguments),
+            Self::List => eval_list(arguments),
+            Self::Length => eval_length(arguments),
         }
     }
 }
@@ -148,6 +166,12 @@ fn global_environment() -> Environment {
         Builtin::Equal,
         Builtin::LessEqual,
         Builtin::Not,
+        Builtin::Cons,
+        Builtin::Car,
+        Builtin::Cdr,
+        Builtin::IsNull,
+        Builtin::List,
+        Builtin::Length,
     ] {
         define_binding(
             &environment,
@@ -505,6 +529,84 @@ fn eval_not(arguments: &[Value]) -> Result<Value, String> {
     Ok(Value::Boolean(!is_truthy(value)))
 }
 
+fn eval_cons(arguments: &[Value]) -> Result<Value, String> {
+    let [car, cdr] = arguments else {
+        return Err("`cons` expects exactly 2 arguments".into());
+    };
+
+    Ok(Value::Pair(Box::new(car.clone()), Box::new(cdr.clone())))
+}
+
+fn eval_car(arguments: &[Value]) -> Result<Value, String> {
+    let [pair] = arguments else {
+        return Err("`car` expects exactly 1 argument".into());
+    };
+
+    let Value::Pair(car, _) = pair else {
+        return Err("`car` expects a pair".into());
+    };
+
+    Ok((**car).clone())
+}
+
+fn eval_cdr(arguments: &[Value]) -> Result<Value, String> {
+    let [pair] = arguments else {
+        return Err("`cdr` expects exactly 1 argument".into());
+    };
+
+    let Value::Pair(_, cdr) = pair else {
+        return Err("`cdr` expects a pair".into());
+    };
+
+    Ok((**cdr).clone())
+}
+
+fn eval_is_null(arguments: &[Value]) -> Result<Value, String> {
+    let [value] = arguments else {
+        return Err("`null?` expects exactly 1 argument".into());
+    };
+
+    Ok(Value::Boolean(matches!(value, Value::Nil)))
+}
+
+fn eval_list(arguments: &[Value]) -> Result<Value, String> {
+    Ok(build_list(arguments))
+}
+
+fn eval_length(arguments: &[Value]) -> Result<Value, String> {
+    let [list] = arguments else {
+        return Err("`length` expects exactly 1 argument".into());
+    };
+
+    list_length(list).map(Value::Integer)
+}
+
+fn build_list(values: &[Value]) -> Value {
+    let mut list = Value::Nil;
+    for value in values.iter().rev() {
+        list = Value::Pair(Box::new(value.clone()), Box::new(list));
+    }
+    list
+}
+
+fn list_length(list: &Value) -> Result<i64, String> {
+    let mut length = 0_i64;
+    let mut current = list;
+
+    loop {
+        match current {
+            Value::Nil => return Ok(length),
+            Value::Pair(_, cdr) => {
+                length = length
+                    .checked_add(1)
+                    .ok_or_else(|| "integer overflow".to_string())?;
+                current = cdr.as_ref();
+            }
+            _ => return Err("`length` expects a proper list".into()),
+        }
+    }
+}
+
 fn eval_and(arguments: &[Expr], environment: &Environment) -> Result<Value, String> {
     let mut last_value = Value::Boolean(true);
 
@@ -571,6 +673,7 @@ impl<'a> Parser<'a> {
         match self.peek_char() {
             Some('(') => self.parse_application(),
             Some(')') => Err("unexpected `)`".into()),
+            Some('\'') => self.parse_quote(),
             Some('"') => self.parse_string().map(Expr::Literal),
             Some('#') => self.parse_boolean().map(Expr::Literal),
             Some('-') if self.peek_next_is_digit() => self.parse_integer().map(Expr::Literal),
@@ -578,6 +681,16 @@ impl<'a> Parser<'a> {
             Some(_) => self.parse_symbol().map(Expr::Symbol),
             None => Err("unexpected end of input".into()),
         }
+    }
+
+    fn parse_quote(&mut self) -> Result<Expr, String> {
+        self.bump_char();
+        self.skip_whitespace();
+
+        Ok(Expr::Application(vec![
+            Expr::Symbol("quote".to_string()),
+            self.parse_expr()?,
+        ]))
     }
 
     fn parse_application(&mut self) -> Result<Expr, String> {
