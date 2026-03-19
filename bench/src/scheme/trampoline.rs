@@ -1,7 +1,7 @@
 use super::builtins::{call_builtin_on_values, eval_builtin, is_builtin, is_false};
 use super::eval;
 use super::expr::{Env, Expr};
-use super::forms::{eval_cond, eval_define, eval_lambda, eval_quote, parse_let_binding};
+use super::forms::{eval_define, eval_lambda, eval_quote, parse_let_binding};
 
 /// Trampoline result: either a final value or a tail call to continue.
 pub enum Bounce {
@@ -61,7 +61,9 @@ fn try_special_form(elems: &[Expr], env: &Env) -> Result<Option<Bounce>, String>
         "if" => bounce_if(args, env).map(Some),
         "begin" => bounce_begin(args, env).map(Some),
         "let" => bounce_let(args, env).map(Some),
-        "cond" => eval_cond(args, env).map(|v| Some(Bounce::Done(v))),
+        "cond" => bounce_cond(args, env).map(Some),
+        "and" => bounce_and(args, env).map(Some),
+        "or" => bounce_or(args, env).map(Some),
         name if is_builtin(name) => eval_builtin(name, args, env).map(|v| Some(Bounce::Done(v))),
         _ => Ok(None),
     }
@@ -95,6 +97,10 @@ fn bounce_let(args: &[Expr], env: &Env) -> Result<Bounce, String> {
     if args.len() < 2 {
         return Err("let requires bindings and body".into());
     }
+    // Named let: (let name ((var val) ...) body ...)
+    if let Expr::Symbol(ref name) = args[0] {
+        return bounce_named_let(name, &args[1..], env);
+    }
     let Expr::List(ref bindings) = args[0] else {
         return Err("let bindings must be a list".into());
     };
@@ -108,6 +114,90 @@ fn bounce_let(args: &[Expr], env: &Env) -> Result<Bounce, String> {
         eval(body_expr, &let_env)?;
     }
     Ok(Bounce::TailCall { expr: body[body.len() - 1].clone(), env: let_env })
+}
+
+fn bounce_named_let(name: &str, args: &[Expr], env: &Env) -> Result<Bounce, String> {
+    if args.len() < 2 {
+        return Err("named let requires bindings and body".into());
+    }
+    let Expr::List(ref bindings) = args[0] else {
+        return Err("let bindings must be a list".into());
+    };
+    let mut params = Vec::new();
+    let mut init_vals = Vec::new();
+    for binding in bindings {
+        let (p, v) = parse_let_binding(binding, env)?;
+        params.push(p);
+        init_vals.push(v);
+    }
+    let body = if args[1..].len() == 1 {
+        args[1].clone()
+    } else {
+        let mut begin_elems = vec![Expr::Symbol("begin".into())];
+        begin_elems.extend_from_slice(&args[1..]);
+        Expr::List(begin_elems)
+    };
+    let let_env = env.child();
+    let lambda = Expr::Lambda {
+        params: params.clone(),
+        rest: None,
+        body: Box::new(body.clone()),
+        env: let_env.clone(),
+    };
+    let_env.insert(name.to_string(), lambda);
+    for (p, v) in params.iter().zip(init_vals.iter()) {
+        let_env.insert(p.clone(), v.clone());
+    }
+    Ok(Bounce::TailCall { expr: body, env: let_env })
+}
+
+fn bounce_cond(args: &[Expr], env: &Env) -> Result<Bounce, String> {
+    for clause in args {
+        let Expr::List(elems) = clause else {
+            return Err("cond clause must be a list".into());
+        };
+        if elems.len() < 2 {
+            return Err("cond clause must have test and expression".into());
+        }
+        let is_else = matches!(&elems[0], Expr::Symbol(s) if s == "else");
+        if is_else || !is_false(&eval(&elems[0], env)?) {
+            return bounce_cond_body(&elems[1..], env);
+        }
+    }
+    Ok(Bounce::Done(Expr::Void))
+}
+
+fn bounce_cond_body(exprs: &[Expr], env: &Env) -> Result<Bounce, String> {
+    for expr in &exprs[..exprs.len() - 1] {
+        eval(expr, env)?;
+    }
+    Ok(Bounce::TailCall { expr: exprs[exprs.len() - 1].clone(), env: env.clone() })
+}
+
+fn bounce_and(args: &[Expr], env: &Env) -> Result<Bounce, String> {
+    if args.is_empty() {
+        return Ok(Bounce::Done(Expr::Boolean(true)));
+    }
+    for arg in &args[..args.len() - 1] {
+        let val = eval(arg, env)?;
+        if is_false(&val) {
+            return Ok(Bounce::Done(val));
+        }
+    }
+    Ok(Bounce::TailCall { expr: args[args.len() - 1].clone(), env: env.clone() })
+}
+
+fn bounce_or(args: &[Expr], env: &Env) -> Result<Bounce, String> {
+    if args.is_empty() {
+        return Ok(Bounce::Done(Expr::Boolean(false)));
+    }
+    for arg in &args[..args.len() - 1] {
+        let val = eval(arg, env)?;
+        if !is_false(&val) {
+            return Ok(Bounce::Done(val));
+        }
+    }
+    Ok(Bounce::TailCall { expr: args[args.len() - 1].clone(), env: env.clone() })
 }
 
 pub fn apply_proc(proc: &Expr, args: &[Expr]) -> Result<Bounce, String> {

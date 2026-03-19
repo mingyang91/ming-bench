@@ -1,5 +1,4 @@
 use super::eval;
-use crate::scheme::builtins::is_false;
 use crate::scheme::expr::{Env, Expr};
 
 pub fn parse_params_with_rest(elems: &[Expr]) -> Result<(Vec<String>, Option<String>), String> {
@@ -117,27 +116,4 @@ pub fn parse_let_binding(binding: &Expr, env: &Env) -> Result<(String, Expr), St
     Ok((name.clone(), val))
 }
 
-pub fn eval_cond(args: &[Expr], env: &Env) -> Result<Expr, String> {
-    for clause in args {
-        let Expr::List(elems) = clause else {
-            return Err("cond clause must be a list".into());
-        };
-        if elems.len() < 2 {
-            return Err("cond clause must have test and expression".into());
-        }
-        let is_else = matches!(&elems[0], Expr::Symbol(s) if s == "else");
-        if is_else || !is_false(&eval(&elems[0], env)?) {
-            return eval_body(&elems[1..], env);
-        }
-    }
-    Ok(Expr::Void)
-}
-
-fn eval_body(exprs: &[Expr], env: &Env) -> Result<Expr, String> {
-    let mut result = Expr::Void;
-    for expr in exprs {
-        result = eval(expr, env)?;
-    }
-    Ok(result)
-}
 

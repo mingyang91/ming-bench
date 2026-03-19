@@ -11,7 +11,7 @@ pub const BUILTIN_NAMES: &[&str] = &[
 pub fn is_builtin(name: &str) -> bool {
     matches!(
         name,
-        "+" | "-" | "*" | "/" | "<" | ">" | "=" | "<=" | "not" | "and" | "or"
+        "+" | "-" | "*" | "/" | "<" | ">" | "=" | "<=" | "not"
             | "cons" | "car" | "cdr" | "null?" | "list" | "length"
             | "string?" | "number?" | "boolean?" | "pair?" | "symbol?"
     )
@@ -32,8 +32,6 @@ pub fn eval_builtin(op: &str, args: &[Expr], env: &Env) -> Result<Expr, String> 
             let val = eval(&args[0], env)?;
             Ok(Expr::Boolean(is_false(&val)))
         }
-        "and" => eval_and(args, env),
-        "or" => eval_or(args, env),
         "cons" => eval_cons(args, env),
         "car" => eval_car(args, env),
         "cdr" => eval_cdr(args, env),
@@ -67,27 +65,6 @@ fn eval_comparison(op: &str, args: &[Expr], env: &Env) -> Result<Expr, String> {
     Ok(Expr::Boolean(result))
 }
 
-pub fn eval_and(args: &[Expr], env: &Env) -> Result<Expr, String> {
-    let mut result = Expr::Boolean(true);
-    for arg in args {
-        result = eval(arg, env)?;
-        if is_false(&result) {
-            return Ok(result);
-        }
-    }
-    Ok(result)
-}
-
-pub fn eval_or(args: &[Expr], env: &Env) -> Result<Expr, String> {
-    let mut result = Expr::Boolean(false);
-    for arg in args {
-        result = eval(arg, env)?;
-        if !is_false(&result) {
-            return Ok(result);
-        }
-    }
-    Ok(result)
-}
 
 fn eval_arithmetic(op: &str, args: &[Expr], env: &Env) -> Result<Expr, String> {
     let vals: Vec<i64> = args
