@@ -33,13 +33,12 @@ fn define_builtins(environment: &Environment) {
 }
 
 fn eval_sequence(expressions: &[Expr], environment: &Environment) -> Result<Value, SchemeError> {
-    let mut last_value = None;
+    let Some((last_expression, _)) = expressions.split_last() else {
+        return Err(SchemeError::EmptyInput);
+    };
 
-    for expression in expressions {
-        last_value = Some(eval_expr(expression, environment)?);
-    }
-
-    last_value.ok_or(SchemeError::EmptyInput)
+    eval_leading_expressions(expressions, environment)?;
+    eval_expr(last_expression, environment)
 }
 
 fn eval_expr(expression: &Expr, environment: &Environment) -> Result<Value, SchemeError> {
@@ -117,11 +116,11 @@ fn eval_special_form<'expr>(
         "if" => eval_if(operands, environment).map(Some),
         "quote" => eval_quote(operands).map(|value| Some(EvalStep::Value(value))),
         "lambda" => eval_lambda(operands, environment).map(|value| Some(EvalStep::Value(value))),
-        "and" => eval_and(operands, environment).map(|value| Some(EvalStep::Value(value))),
-        "or" => eval_or(operands, environment).map(|value| Some(EvalStep::Value(value))),
-        "begin" => eval_begin(operands, environment).map(|value| Some(EvalStep::Value(value))),
-        "cond" => eval_cond(operands, environment).map(|value| Some(EvalStep::Value(value))),
-        "let" => eval_let(operands, environment).map(|value| Some(EvalStep::Value(value))),
+        "and" => eval_and(operands, environment).map(Some),
+        "or" => eval_or(operands, environment).map(Some),
+        "begin" => eval_begin(operands, environment).map(Some),
+        "cond" => eval_cond(operands, environment).map(Some),
+        "let" => eval_let(operands, environment).map(Some),
         _ => Ok(None),
     }
 }
@@ -258,7 +257,10 @@ fn eval_lambda(operands: &[Expr], environment: &Environment) -> Result<Value, Sc
     }
 }
 
-fn eval_begin(operands: &[Expr], environment: &Environment) -> Result<Value, SchemeError> {
+fn eval_begin<'expr>(
+    operands: &'expr [Expr],
+    environment: &Environment,
+) -> Result<EvalStep<'expr>, SchemeError> {
     if operands.is_empty() {
         Err(SchemeError::TooFewArguments {
             operator: "begin",
@@ -266,11 +268,14 @@ fn eval_begin(operands: &[Expr], environment: &Environment) -> Result<Value, Sch
             actual: 0,
         })
     } else {
-        eval_sequence(operands, environment)
+        eval_tail_sequence(operands, environment)
     }
 }
 
-fn eval_cond(operands: &[Expr], environment: &Environment) -> Result<Value, SchemeError> {
+fn eval_cond<'expr>(
+    operands: &'expr [Expr],
+    environment: &Environment,
+) -> Result<EvalStep<'expr>, SchemeError> {
     if operands.is_empty() {
         return Err(SchemeError::TooFewArguments {
             operator: "cond",
@@ -287,7 +292,7 @@ fn eval_cond(operands: &[Expr], environment: &Environment) -> Result<Value, Sche
         }
     }
 
-    Ok(Value::Void)
+    Ok(EvalStep::Value(Value::Void))
 }
 
 fn validate_cond_clauses(clauses: &[Expr]) -> Result<(), SchemeError> {
@@ -334,10 +339,10 @@ fn validate_cond_clause(clause: &Expr, is_last: bool) -> Result<(), SchemeError>
     Ok(())
 }
 
-fn eval_cond_clause(
-    clause: &Expr,
+fn eval_cond_clause<'expr>(
+    clause: &'expr Expr,
     environment: &Environment,
-) -> Result<Option<Value>, SchemeError> {
+) -> Result<Option<EvalStep<'expr>>, SchemeError> {
     let Expr::List(parts) = clause else {
         unreachable!("cond clauses are validated before evaluation");
     };
@@ -355,13 +360,16 @@ fn eval_cond_clause(
     }
 
     if body.is_empty() {
-        Ok(Some(predicate_value))
+        Ok(Some(EvalStep::Value(predicate_value)))
     } else {
-        eval_sequence(body, environment).map(Some)
+        eval_tail_sequence(body, environment).map(Some)
     }
 }
 
-fn eval_cond_else(body: &[Expr], environment: &Environment) -> Result<Value, SchemeError> {
+fn eval_cond_else<'expr>(
+    body: &'expr [Expr],
+    environment: &Environment,
+) -> Result<EvalStep<'expr>, SchemeError> {
     if body.is_empty() {
         return Err(SchemeError::TooFewArguments {
             operator: "cond else",
@@ -370,27 +378,80 @@ fn eval_cond_else(body: &[Expr], environment: &Environment) -> Result<Value, Sch
         });
     }
 
-    eval_sequence(body, environment)
+    eval_tail_sequence(body, environment)
 }
 
-fn eval_let(operands: &[Expr], environment: &Environment) -> Result<Value, SchemeError> {
+fn eval_let<'expr>(
+    operands: &'expr [Expr],
+    environment: &Environment,
+) -> Result<EvalStep<'expr>, SchemeError> {
     match operands {
-        [bindings_expression, body @ ..] if !body.is_empty() => {
-            let bindings = eval_let_bindings(bindings_expression, environment)?;
-            let let_environment = environment.child();
-
-            for (name, value) in bindings {
-                let_environment.define(&name, value);
-            }
-
-            eval_sequence(body, &let_environment)
+        [Expr::Symbol(name), bindings_expression, body @ ..] if !body.is_empty() => {
+            eval_named_let(name, bindings_expression, body, environment)
         }
+        [bindings_expression, body @ ..] if !body.is_empty() => {
+            eval_let_body(bindings_expression, body, environment)
+        }
+        [Expr::Symbol(_), ..] => Err(SchemeError::TooFewArguments {
+            operator: "let",
+            min: 3,
+            actual: operands.len(),
+        }),
         _ => Err(SchemeError::TooFewArguments {
             operator: "let",
             min: 2,
             actual: operands.len(),
         }),
     }
+}
+
+fn eval_let_body<'expr>(
+    bindings_expression: &Expr,
+    body: &'expr [Expr],
+    environment: &Environment,
+) -> Result<EvalStep<'expr>, SchemeError> {
+    let bindings = eval_let_bindings(bindings_expression, environment)?;
+    let let_environment = environment.child();
+
+    for (name, value) in bindings {
+        let_environment.define(&name, value);
+    }
+
+    eval_tail_sequence(body, &let_environment)
+}
+
+fn eval_named_let<'expr>(
+    name: &str,
+    bindings_expression: &Expr,
+    body: &'expr [Expr],
+    environment: &Environment,
+) -> Result<EvalStep<'expr>, SchemeError> {
+    let bindings = parse_let_bindings(bindings_expression)?;
+    let (parameters, arguments) = eval_named_let_bindings(bindings, environment)?;
+    let let_environment = environment.child();
+    let procedure = Value::procedure(
+        Parameters::new(parameters, None),
+        body.to_vec(),
+        let_environment.clone(),
+    );
+
+    let_environment.define(name, procedure.clone());
+    apply_value_callable(procedure, arguments)
+}
+
+fn eval_named_let_bindings(
+    bindings: Vec<(&str, &Expr)>,
+    environment: &Environment,
+) -> Result<(Vec<String>, Vec<Value>), SchemeError> {
+    let mut parameters = Vec::with_capacity(bindings.len());
+    let mut arguments = Vec::with_capacity(bindings.len());
+
+    for (name, value_expression) in bindings {
+        parameters.push(name.to_owned());
+        arguments.push(eval_expr(value_expression, environment)?);
+    }
+
+    Ok((parameters, arguments))
 }
 
 fn eval_let_bindings(
@@ -700,6 +761,18 @@ fn eval_leading_expressions(
     Ok(())
 }
 
+fn eval_tail_sequence<'expr>(
+    expressions: &'expr [Expr],
+    environment: &Environment,
+) -> Result<EvalStep<'expr>, SchemeError> {
+    let Some((last_expression, _)) = expressions.split_last() else {
+        unreachable!("tail sequences are validated before evaluation");
+    };
+
+    eval_leading_expressions(expressions, environment)?;
+    Ok(EvalStep::Expression(last_expression, environment.clone()))
+}
+
 fn apply_builtin_value(builtin: Builtin, arguments: Vec<Value>) -> Result<Value, SchemeError> {
     match builtin {
         Builtin::Add => eval_addition(&arguments),
@@ -803,32 +876,42 @@ fn eval_not(arguments: &[Value]) -> Result<Value, SchemeError> {
     }
 }
 
-fn eval_and(operands: &[Expr], environment: &Environment) -> Result<Value, SchemeError> {
-    let mut last_value = Value::Boolean(true);
+fn eval_and<'expr>(
+    operands: &'expr [Expr],
+    environment: &Environment,
+) -> Result<EvalStep<'expr>, SchemeError> {
+    let Some((last_operand, leading_operands)) = operands.split_last() else {
+        return Ok(EvalStep::Value(Value::Boolean(true)));
+    };
 
-    for operand in operands {
+    for operand in leading_operands {
         let value = eval_expr(operand, environment)?;
 
         if !value.is_truthy() {
-            return Ok(value);
+            return Ok(EvalStep::Value(value));
         }
-
-        last_value = value;
     }
 
-    Ok(last_value)
+    Ok(EvalStep::Expression(last_operand, environment.clone()))
 }
 
-fn eval_or(operands: &[Expr], environment: &Environment) -> Result<Value, SchemeError> {
-    for operand in operands {
+fn eval_or<'expr>(
+    operands: &'expr [Expr],
+    environment: &Environment,
+) -> Result<EvalStep<'expr>, SchemeError> {
+    let Some((last_operand, leading_operands)) = operands.split_last() else {
+        return Ok(EvalStep::Value(Value::Boolean(false)));
+    };
+
+    for operand in leading_operands {
         let value = eval_expr(operand, environment)?;
 
         if value.is_truthy() {
-            return Ok(value);
+            return Ok(EvalStep::Value(value));
         }
     }
 
-    Ok(Value::Boolean(false))
+    Ok(EvalStep::Expression(last_operand, environment.clone()))
 }
 
 fn eval_cons(arguments: &[Value]) -> Result<Value, SchemeError> {
