@@ -5,6 +5,7 @@ pub fn is_builtin(name: &str) -> bool {
     matches!(
         name,
         "+" | "-" | "*" | "/" | "<" | ">" | "=" | "<=" | "not" | "and" | "or"
+            | "cons" | "car" | "cdr" | "null?" | "list" | "length"
     )
 }
 
@@ -25,6 +26,12 @@ pub fn eval_builtin(op: &str, args: &[Expr], env: &Env) -> Result<Expr, String> 
         }
         "and" => eval_and(args, env),
         "or" => eval_or(args, env),
+        "cons" => eval_cons(args, env),
+        "car" => eval_car(args, env),
+        "cdr" => eval_cdr(args, env),
+        "null?" => eval_null(args, env),
+        "list" => eval_list_builtin(args, env),
+        "length" => eval_length(args, env),
         _ => Err(format!("unknown procedure: {op}")),
     }
 }
@@ -118,4 +125,67 @@ fn checked_div(vals: &[i64]) -> Result<i64, String> {
         }
         Ok(acc / v)
     })
+}
+
+fn eval_cons(args: &[Expr], env: &Env) -> Result<Expr, String> {
+    if args.len() != 2 {
+        return Err("cons requires exactly two arguments".into());
+    }
+    let car = eval(&args[0], env)?;
+    let cdr = eval(&args[1], env)?;
+    match cdr {
+        Expr::List(mut elems) => {
+            elems.insert(0, car);
+            Ok(Expr::List(elems))
+        }
+        _ => Err(format!("cons: second argument must be a list, got {}", cdr.to_display())),
+    }
+}
+
+fn eval_car(args: &[Expr], env: &Env) -> Result<Expr, String> {
+    if args.len() != 1 {
+        return Err("car requires exactly one argument".into());
+    }
+    match eval(&args[0], env)? {
+        Expr::List(elems) if !elems.is_empty() => Ok(elems[0].clone()),
+        Expr::List(_) => Err("car: empty list".into()),
+        other => Err(format!("car: expected pair, got {}", other.to_display())),
+    }
+}
+
+fn eval_cdr(args: &[Expr], env: &Env) -> Result<Expr, String> {
+    if args.len() != 1 {
+        return Err("cdr requires exactly one argument".into());
+    }
+    match eval(&args[0], env)? {
+        Expr::List(elems) if !elems.is_empty() => Ok(Expr::List(elems[1..].to_vec())),
+        Expr::List(_) => Err("cdr: empty list".into()),
+        other => Err(format!("cdr: expected pair, got {}", other.to_display())),
+    }
+}
+
+fn eval_null(args: &[Expr], env: &Env) -> Result<Expr, String> {
+    if args.len() != 1 {
+        return Err("null? requires exactly one argument".into());
+    }
+    let val = eval(&args[0], env)?;
+    Ok(Expr::Boolean(matches!(val, Expr::List(ref elems) if elems.is_empty())))
+}
+
+fn eval_list_builtin(args: &[Expr], env: &Env) -> Result<Expr, String> {
+    let elems: Vec<Expr> = args
+        .iter()
+        .map(|a| eval(a, env))
+        .collect::<Result<_, _>>()?;
+    Ok(Expr::List(elems))
+}
+
+fn eval_length(args: &[Expr], env: &Env) -> Result<Expr, String> {
+    if args.len() != 1 {
+        return Err("length requires exactly one argument".into());
+    }
+    match eval(&args[0], env)? {
+        Expr::List(elems) => Ok(Expr::Integer(elems.len() as i64)),
+        other => Err(format!("length: expected list, got {}", other.to_display())),
+    }
 }
