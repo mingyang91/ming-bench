@@ -82,6 +82,7 @@ pub enum Value {
         replay_expr: Box<Value>,
         remaining_exprs: Vec<Value>,
         env: Env,
+        in_begin: bool,
     },
     Macro {
         name: String,

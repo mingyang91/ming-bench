@@ -17,6 +17,7 @@ struct ContJump {
     replay_expr: Value,
     remaining_exprs: Vec<Value>,
     env: Env,
+    in_begin: bool,
 }
 
 #[derive(Clone)]
@@ -30,6 +31,7 @@ thread_local! {
     static CONT_JUMP: RefCell<Option<ContJump>> = const { RefCell::new(None) };
     static CALLCC_RETURN: RefCell<Option<Value>> = const { RefCell::new(None) };
     static TOP_LEVEL_CTX: RefCell<Option<TopLevelCtx>> = const { RefCell::new(None) };
+    static BEGIN_DEPTH: RefCell<u32> = const { RefCell::new(0) };
 }
 
 const CONT_SENTINEL: &str = "\x00cont_jump_";
@@ -56,16 +58,74 @@ pub fn set_top_level_ctx(expr: Value, remaining: Vec<Value>, env: Env) {
     });
 }
 
-pub fn take_cont_jump() -> Option<(Value, Value, Vec<Value>, Env)> {
+struct ContJumpResult {
+    value: Value,
+    replay_expr: Value,
+    remaining_exprs: Vec<Value>,
+    env: Env,
+    in_begin: bool,
+}
+
+fn take_cont_jump() -> Option<ContJumpResult> {
     CONT_JUMP.with(|c| {
-        c.borrow_mut()
-            .take()
-            .map(|j| (j.value, j.replay_expr, j.remaining_exprs, j.env))
+        c.borrow_mut().take().map(|j| ContJumpResult {
+            value: j.value,
+            replay_expr: j.replay_expr,
+            remaining_exprs: j.remaining_exprs,
+            env: j.env,
+            in_begin: j.in_begin,
+        })
     })
 }
 
-pub fn set_callcc_return(val: Value) {
+// ── Begin-depth tracking ─────────────────────────────────────────────
+
+pub struct BeginDepthGuard;
+
+impl Drop for BeginDepthGuard {
+    fn drop(&mut self) {
+        BEGIN_DEPTH.with(|d| *d.borrow_mut() -= 1);
+    }
+}
+
+fn push_begin_depth() -> BeginDepthGuard {
+    BEGIN_DEPTH.with(|d| *d.borrow_mut() += 1);
+    BeginDepthGuard
+}
+
+fn in_begin_block() -> bool {
+    BEGIN_DEPTH.with(|d| *d.borrow() > 0)
+}
+
+fn set_callcc_return(val: Value) {
     CALLCC_RETURN.with(|c| *c.borrow_mut() = Some(val));
+}
+
+fn replay_eval_seq(exprs: &[Value], env: &Env) -> Result<Value, String> {
+    let mut result = Value::Void;
+    for i in 0..exprs.len() {
+        set_top_level_ctx(exprs[i].clone(), exprs[i + 1..].to_vec(), env.clone());
+        match eval(&exprs[i], env) {
+            Ok(val) => result = val,
+            Err(e) if is_continuation_jump(&e) => return dispatch_and_resolve(e),
+            Err(e) => return Err(e),
+        }
+    }
+    Ok(result)
+}
+
+pub fn dispatch_and_resolve(err: String) -> Result<Value, String> {
+    let j = take_cont_jump().ok_or(err)?;
+    // Only inject a return value into call/cc when the continuation was NOT
+    // captured inside a begin block. When in_begin is true, call/cc's result
+    // is an intermediate value that gets discarded, so replaying without
+    // CALLCC_RETURN lets the code re-execute naturally.
+    if !j.in_begin {
+        set_callcc_return(j.value);
+    }
+    let mut exprs = vec![j.replay_expr];
+    exprs.extend(j.remaining_exprs);
+    replay_eval_seq(&exprs, &j.env)
 }
 
 pub fn eval(expr: &Value, env: &Env) -> Result<Value, String> {
@@ -182,6 +242,7 @@ fn apply_tco(proc: &Value, args: &[Value]) -> Result<Trampoline, String> {
             replay_expr,
             remaining_exprs,
             env,
+            in_begin,
         } => {
             if args.len() != 1 {
                 return Err(format!(
@@ -195,6 +256,7 @@ fn apply_tco(proc: &Value, args: &[Value]) -> Result<Trampoline, String> {
                     replay_expr: *replay_expr.clone(),
                     remaining_exprs: remaining_exprs.clone(),
                     env: env.clone(),
+                    in_begin: *in_begin,
                 });
             });
             Err(make_cont_jump(*id))
@@ -432,6 +494,7 @@ fn eval_begin(exprs: &[Value], env: &Env) -> Result<Trampoline, String> {
         return Ok(Trampoline::Done(Value::Void));
     }
     for expr in &exprs[..exprs.len() - 1] {
+        let _guard = push_begin_depth();
         eval(expr, env)?;
     }
     Ok(Trampoline::Bounce {
@@ -703,6 +766,7 @@ fn builtin_callcc(args: &[Value]) -> Result<Trampoline, String> {
         replay_expr: Box::new(ctx.current_expr),
         remaining_exprs: ctx.remaining_exprs,
         env: ctx.env,
+        in_begin: in_begin_block(),
     };
 
     // Fully evaluate: apply the user's function with the continuation
