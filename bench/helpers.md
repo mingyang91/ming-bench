@@ -10,7 +10,10 @@ Canonical registry of extracted helpers (>= 5 ops).
 
 ## Rust Helpers (src/scheme/)
 
-(none yet)
+### fmt_string_contents (src/scheme/engine.rs:71) — Render Scheme string contents with escapes preserved in output
+### skip_ignored (src/scheme/engine.rs:819) — Skip parser whitespace and line comments until the next Scheme token
+### skip_whitespace (src/scheme/engine.rs:823) — Consume a contiguous run of whitespace and report whether input advanced
+### skip_line_comment (src/scheme/engine.rs:833) — Consume one `;` line comment and report whether a comment was skipped
 
 ## Python Helpers (scripts/)
 

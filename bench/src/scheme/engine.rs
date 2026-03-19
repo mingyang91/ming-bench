@@ -36,7 +36,11 @@ impl std::fmt::Display for Value {
             Self::Integer(value) => write!(formatter, "{value}"),
             Self::Boolean(true) => formatter.write_str("#t"),
             Self::Boolean(false) => formatter.write_str("#f"),
-            Self::String(value) => write!(formatter, "\"{value}\""),
+            Self::String(value) => {
+                formatter.write_str("\"")?;
+                fmt_string_contents(value, formatter)?;
+                formatter.write_str("\"")
+            }
             Self::Symbol(value) => formatter.write_str(value),
             Self::Pair(car, cdr) => {
                 formatter.write_str("(")?;
@@ -62,6 +66,20 @@ fn fmt_pair(car: &Value, cdr: &Value, formatter: &mut std::fmt::Formatter<'_>) -
         }
         value => write!(formatter, " . {value}"),
     }
+}
+
+fn fmt_string_contents(value: &str, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+    for character in value.chars() {
+        match character {
+            '"' => formatter.write_str("\\\"")?,
+            '\\' => formatter.write_str("\\\\")?,
+            '\n' => formatter.write_str("\\n")?,
+            '\t' => formatter.write_str("\\t")?,
+            _ => write!(formatter, "{character}")?,
+        }
+    }
+
+    Ok(())
 }
 
 #[derive(Clone)]
@@ -655,11 +673,11 @@ impl<'a> Parser<'a> {
 
     fn parse_program(&mut self) -> Result<Vec<Expr>, String> {
         let mut expressions = Vec::new();
-        self.skip_whitespace();
+        self.skip_ignored();
 
         while !self.is_eof() {
             expressions.push(self.parse_expr()?);
-            self.skip_whitespace();
+            self.skip_ignored();
         }
 
         if expressions.is_empty() {
@@ -685,7 +703,7 @@ impl<'a> Parser<'a> {
 
     fn parse_quote(&mut self) -> Result<Expr, String> {
         self.bump_char();
-        self.skip_whitespace();
+        self.skip_ignored();
 
         Ok(Expr::Application(vec![
             Expr::Symbol("quote".to_string()),
@@ -695,12 +713,12 @@ impl<'a> Parser<'a> {
 
     fn parse_application(&mut self) -> Result<Expr, String> {
         self.bump_char();
-        self.skip_whitespace();
+        self.skip_ignored();
 
         let mut expressions = Vec::new();
         while matches!(self.peek_char(), Some(character) if character != ')') {
             expressions.push(self.parse_expr()?);
-            self.skip_whitespace();
+            self.skip_ignored();
         }
 
         if self.peek_char().is_none() {
@@ -798,10 +816,30 @@ impl<'a> Parser<'a> {
         }
     }
 
-    fn skip_whitespace(&mut self) {
+    fn skip_ignored(&mut self) {
+        while self.skip_whitespace() || self.skip_line_comment() {}
+    }
+
+    fn skip_whitespace(&mut self) -> bool {
+        let start = self.cursor;
+
         while matches!(self.peek_char(), Some(character) if character.is_whitespace()) {
             self.bump_char();
         }
+
+        self.cursor != start
+    }
+
+    fn skip_line_comment(&mut self) -> bool {
+        if self.peek_char() != Some(';') {
+            return false;
+        }
+
+        while !matches!(self.peek_char(), None | Some('\n')) {
+            self.bump_char();
+        }
+
+        true
     }
 
     fn remaining(&self) -> &'a str {
@@ -830,6 +868,6 @@ impl<'a> Parser<'a> {
     }
 
     fn is_delimiter(character: char) -> bool {
-        character.is_whitespace() || matches!(character, '(' | ')')
+        character.is_whitespace() || matches!(character, '(' | ')' | ';')
     }
 }
