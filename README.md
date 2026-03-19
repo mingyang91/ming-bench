@@ -64,4 +64,4 @@ The agent creates any additional files/modules they need under `src/scheme/`.
 
 ## Ground Truth
 
-Test expected values are verified against Chez Scheme. Run `scripts/verify.sh` to re-check.
+Test expected values are verified against Guile Scheme. Run `cargo xtask verify` to re-check.
