@@ -89,6 +89,9 @@ enum Commands {
         /// Start from a specific level (levels mode)
         #[arg(long)]
         from_level: Option<String>,
+        /// Clean stale worktree + branch before creating fresh
+        #[arg(long)]
+        clean: bool,
     },
     /// Analyze session request patterns and cost drivers
     Analyze {
@@ -125,6 +128,7 @@ fn main() {
             skip_bench,
             resume,
             from_level,
+            clean,
         } => cmd::run_agent::run(cmd::run_agent::RunAgentArgs {
             base,
             name,
@@ -136,6 +140,7 @@ fn main() {
             skip_bench,
             resume,
             from_level,
+            clean,
         }),
         Commands::Analyze { runs, all } => cmd::analyze::run(runs, all),
         Commands::Verify => cmd::verify::run(),
