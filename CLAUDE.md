@@ -2,39 +2,34 @@
 
 Implement a Scheme interpreter in Rust.
 
-## MANDATORY — Quality Gate (run before EVERY test)
+## MANDATORY — Quality Gate (enforced by `test-level.sh`)
 
-Before running `./scripts/test-level.sh`, you MUST verify ALL of these. If any check fails, fix it BEFORE testing.
+These checks run automatically before every test. The script will **reject your code** if any check fails. You do not need to run them manually — but you should be aware of the limits so you don't waste a test cycle.
 
-1. **`mod.rs` impl lines are enforced by `test-level.sh`** (auto-checked, script will reject if over limit):
+1. **`mod.rs` impl line count** (bash check in `test-level.sh`):
    - L01–L03: ≤ 300 lines (bootstrapping)
    - L04–L06: ≤ 200 lines (must split builtins/special_forms out)
    - L07+: ≤ 100 lines (mod.rs is thin: entry point + reexports only)
-2. **Function body length enforced by `clippy::too-many-lines`** (via `clippy.toml`):
+2. **Function body length** (`clippy::too-many-lines` via leveled `clippy.toml`):
    - L01–L05: ≤ 80 lines
    - L06+: ≤ 60 lines
-3. **Nesting depth enforced by `clippy::excessive-nesting`** (via `clippy.toml`):
+3. **Nesting depth** (`clippy::excessive-nesting` via `clippy.toml`):
    - All levels: ≤ 3 levels
-3. **No duplicated logic.** If two functions do the same thing with a trivial wrapper (e.g. "evaluate args then call the other version"), delete the wrapper.
-4. **`helpers.md` is up to date.** Every extracted helper function is registered with name, file, purpose.
-5. **`log::debug!` at dispatch points.** At minimum: one in `eval_inner` (or equivalent), one in special-form dispatch, one in `call/cc` path.
-6. **`debug_assert!` on invariants.** At minimum: after env define, after bind_params, in trampoline loop.
-7. **No `.unwrap()` or `.expect()` in non-test code.** Use `?`, `.ok_or(...)`, or `match`.
-8. **Immutable-first.** No `vec.insert(0, x)` or `vec.remove(0)` — build new collections instead.
-
-**This gate is not optional.** Passing tests with style violations is a failure. Fix violations even if it means rewriting working code.
+4. **No `.unwrap()` or `.expect()` in non-test code.** (`clippy::unwrap_used` — denied in `src/lib.rs`). Use `?`, `.ok_or(...)`, or `match`.
+5. **Clippy auto-fix.** `test-level.sh` runs `cargo clippy --fix --allow-dirty` before verification. Auto-fixed: needless borrows, collapsible ifs, const initializers. NOT auto-fixed (you must fix manually): dead code, too-many-lines, excessive-nesting, type errors.
+6. **Dead code allowance.** L01–L05: `dead_code` lint is suppressed (forward-declared types are OK). L06+: all dead code is denied.
 
 ## Contract
 
 - Implement `eval_str` in `src/scheme/mod.rs`
 - You may create any additional modules/files under `src/scheme/`
 - Do NOT modify test functions
-- Do NOT add external dependencies to Cargo.toml (thiserror, log, env_logger are pre-included)
+- Allowed external crates: `thiserror`, `log`, `env_logger` (already in Cargo.toml). Do NOT add any others.
 - **NEVER run `cargo test` directly on the host.** Always use `./scripts/test-level.sh`. Bare `cargo test` risks infinite loops and OOM that crash the host. This rule has NO exceptions.
 
 ## Build & Test
 
-**Build on host, test in container.**
+`test-level.sh` handles everything: clippy auto-fix, clippy verification, mod.rs size check, release build, and containerized test execution. Just run it.
 
 ```bash
 ./scripts/test-level.sh 01   # test level 1
@@ -42,12 +37,10 @@ Before running `./scripts/test-level.sh`, you MUST verify ALL of these. If any c
 ./scripts/test-level.sh all  # test all levels (300s timeout)
 ```
 
-- Always use `./scripts/test-level.sh <level>` — never bare `cargo test`
 - A level argument is required (e.g., `01`, `16`, or `all`)
-- Tests are built in release mode and run in a container with 1GB memory, 1 CPU
+- Tests run in a container with 1GB memory, 1 CPU
 - Per-level timeout: 30s. Full suite (`all`): 300s. Exceeding these or OOM = failing
 - Build the container image first if not already built: `sudo podman build -t cs61a-bench -f Dockerfile.bench .`
-- `test-level.sh` auto-runs `cargo clippy --fix --allow-dirty` before verification. Trivial lints (needless borrows, collapsible ifs, const initializers) are fixed automatically. You only need to fix structural clippy errors (dead code, wrong types).
 
 ## Development Strategy
 
@@ -80,6 +73,7 @@ Before running `./scripts/test-level.sh`, you MUST verify ALL of these. If any c
 
 - `eval_str` receives one or more expressions separated by spaces (e.g. `"(define x 5) x"`)
 - It should return the string representation of the **last** expression's result
+- Side-effect-only forms (`define`, `set!`) return a void/nil value — the tests only check the result of the final expression, so `"(define x 5) x"` → `"5"`
 - Return `Err(...)` for evaluation errors (unbound variable, wrong arg count, etc.)
 - Booleans print as `#t` / `#f`
 - Lists print as `(1 2 3)` with spaces between elements
@@ -88,11 +82,11 @@ Before running `./scripts/test-level.sh`, you MUST verify ALL of these. If any c
 
 ## File Structure (REQUIRED)
 
-`mod.rs` is ONLY for: module declarations, re-exports, `eval_str` entry point, and the `Trampoline` enum. ALL implementation logic MUST go in submodules:
+`mod.rs` is ONLY for: module declarations, re-exports, `eval_str` entry point, and the `Trampoline` enum. ALL implementation logic MUST go in submodules. Line limit for `mod.rs` is enforced by `test-level.sh` (see Quality Gate item 1).
 
 | File | Responsibility |
 |------|---------------|
-| `mod.rs` | Exports + `eval_str` + `Trampoline` (≤ 200 lines) |
+| `mod.rs` | Exports + `eval_str` + `Trampoline` (limit: see Quality Gate) |
 | `types.rs` | `Value` enum, `Display`, `PartialEq` |
 | `parser.rs` | Tokenizer, parser |
 | `env.rs` | Environment / scoping |
@@ -111,10 +105,10 @@ Create files as needed when you reach the relevant level. Do NOT put evaluator, 
 - Use `thiserror` for typed error enums. Do not flatten all errors to `String`.
 
 ### Style
-- **Flat control flow.** Early returns, `?`, max 3 levels of nesting.
-- **Functions ≤ 60 lines** (hard cap: 100). Extract helpers if longer.
-- **Match arms dispatch to helpers** — no multi-line inline logic in match arms.
-- **Register helpers in `helpers.md`** after creating them. Check it before creating new ones.
+- **Flat control flow.** Early returns, `?`, max 3 nesting levels (enforced by clippy).
+- **Function body length** is enforced by clippy (see Quality Gate item 2). No separate hard cap.
+- **Match arms > 3 lines → extract to a helper function.** A match arm may contain a 1–3 line expression inline; anything longer must be a function call.
+- **Register helpers in `helpers.md`** — a "helper" is any function extracted to reduce another function's length OR shared across 2+ call sites. Update `helpers.md` with name, file, and one-line purpose after creating one. Check `helpers.md` before creating new helpers to avoid duplicates.
 
 ### Functional Style
 - **Immutable-first.** Build new values, don't mutate temporaries.
@@ -134,5 +128,4 @@ Create files as needed when you reach the relevant level. Do NOT put evaluator, 
 
 ### Development Workflow
 - **Fix violations immediately.** Do not defer to later levels.
-- **Proactive refactoring is mandatory.** If surrounding code violates rules, fix it now.
-- **Blast radius is not a concern — rule compliance is.** Rewrite entire files if needed.
+- **When touching a file, fix violations in that file.** Do not leave rule violations in code you're editing. Do not rewrite unrelated files unprompted.
