@@ -35,9 +35,14 @@ pub fn run(level: &str) -> Result<()> {
     let exit = run_cmd(
         "sudo",
         &[
-            "podman", "run", "--rm",
-            "--memory=1g", "--cpus=1", "--pids-limit=256",
-            "-v", &mount_spec,
+            "podman",
+            "run",
+            "--rm",
+            "--memory=1g",
+            "--cpus=1",
+            "--pids-limit=256",
+            "-v",
+            &mount_spec,
             IMAGE_NAME,
             &bash_cmd,
         ],
@@ -76,9 +81,7 @@ fn quality_gates(proj: &Path, level: &str) -> Result<()> {
     }
     fs::write(
         &clippy_toml,
-        format!(
-            "too-many-lines-threshold = {fn_limit}\nexcessive-nesting-threshold = 3\n"
-        ),
+        format!("too-many-lines-threshold = {fn_limit}\nexcessive-nesting-threshold = 3\n"),
     )
     .map_err(|e| Error::io(&clippy_toml, e))?;
 
@@ -91,8 +94,13 @@ fn quality_gates(proj: &Path, level: &str) -> Result<()> {
     // Run clippy --fix
     println!("Running clippy --fix (auto-fixing trivial lints)...");
     let mut clippy_args = vec![
-        "clippy", "--fix", "--allow-dirty", "--allow-staged", "--",
-        "-D", "warnings",
+        "clippy",
+        "--fix",
+        "--allow-dirty",
+        "--allow-staged",
+        "--",
+        "-D",
+        "warnings",
     ];
     if allow_dead_code {
         clippy_args.extend_from_slice(&["-A", "dead_code"]);
@@ -168,11 +176,7 @@ fn check_mod_size(proj: &Path, level: u32) -> Result<()> {
 
 fn find_test_binary(proj: &Path) -> Result<String> {
     // Build test binary in release mode
-    let (exit, output) = run_cmd_capture_all(
-        "cargo",
-        &["test", "--no-run", "--release"],
-        proj,
-    )?;
+    let (exit, output) = run_cmd_capture_all("cargo", &["test", "--no-run", "--release"], proj)?;
 
     // Parse output for binary path
     for line in output.lines() {
@@ -181,7 +185,9 @@ fn find_test_binary(proj: &Path) -> Result<String> {
             // Take until non-path character
             let bin: String = bin
                 .chars()
-                .take_while(|c| c.is_alphanumeric() || *c == '/' || *c == '-' || *c == '_' || *c == '.')
+                .take_while(|c| {
+                    c.is_alphanumeric() || *c == '/' || *c == '-' || *c == '_' || *c == '.'
+                })
                 .collect();
             if proj.join(&bin).is_file() {
                 return Ok(bin);

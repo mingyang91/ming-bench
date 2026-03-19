@@ -15,9 +15,7 @@ fn test_l13_tco_cond() {
 #[test]
 fn test_l13_tco_named_let() {
     assert_eq!(
-        eval_str(
-            "(let loop ((n 1000000)) (if (= n 0) (quote done) (loop (- n 1))))"
-        ),
+        eval_str("(let loop ((n 1000000)) (if (= n 0) (quote done) (loop (- n 1))))"),
         Ok("done".into())
     );
 }
@@ -25,9 +23,7 @@ fn test_l13_tco_named_let() {
 #[test]
 fn test_l13_tco_and_or() {
     assert_eq!(
-        eval_str(
-            "(define (loop n) (if (= n 0) #t (and #t (loop (- n 1))))) (loop 1000000)"
-        ),
+        eval_str("(define (loop n) (if (= n 0) #t (and #t (loop (- n 1))))) (loop 1000000)"),
         Ok("#t".into())
     );
 }

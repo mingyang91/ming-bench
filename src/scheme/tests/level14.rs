@@ -12,10 +12,7 @@ fn test_l14_callcc_nonlocal_exit() {
 
 #[test]
 fn test_l14_callcc_no_escape() {
-    assert_eq!(
-        eval_str("(call/cc (lambda (k) 7))"),
-        Ok("7".into())
-    );
+    assert_eq!(eval_str("(call/cc (lambda (k) 7))"), Ok("7".into()));
 }
 
 #[test]

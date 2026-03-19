@@ -1,6 +1,4 @@
-use crate::model::{
-    compact_timestamp, project_dir, run_cmd_capture_all, Error, Result, LEVELS,
-};
+use crate::model::{compact_timestamp, project_dir, run_cmd_capture_all, Error, Result, LEVELS};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::Instant;
@@ -21,7 +19,8 @@ pub fn run(branch: &str, run_id: Option<&str>) -> Result<()> {
     let result_file = results_dir.join(format!("{branch}_{run_id}_{timestamp}.log"));
 
     // --- Create temp worktree ---
-    let worktree_dir = std::env::temp_dir().join(format!("bench-{}-{}", run_id, std::process::id()));
+    let worktree_dir =
+        std::env::temp_dir().join(format!("bench-{}-{}", run_id, std::process::id()));
     let worktree_branch = format!("bench-{}-{}", run_id, std::process::id());
 
     // Cleanup guard
@@ -36,9 +35,15 @@ pub fn run(branch: &str, run_id: Option<&str>) -> Result<()> {
 
     let exit = crate::model::run_cmd(
         "git",
-        &["worktree", "add", "-b", &worktree_branch,
-          worktree_dir.to_str().expect("worktree path not utf8"),
-          branch, "--quiet"],
+        &[
+            "worktree",
+            "add",
+            "-b",
+            &worktree_branch,
+            worktree_dir.to_str().expect("worktree path not utf8"),
+            branch,
+            "--quiet",
+        ],
         &proj,
     )?;
     if exit != 0 {
@@ -49,11 +54,8 @@ pub fn run(branch: &str, run_id: Option<&str>) -> Result<()> {
     }
 
     // --- Check image exists ---
-    let (img_exit, _) = run_cmd_capture_all(
-        "sudo",
-        &["podman", "image", "exists", IMAGE_NAME],
-        &proj,
-    )?;
+    let (img_exit, _) =
+        run_cmd_capture_all("sudo", &["podman", "image", "exists", IMAGE_NAME], &proj)?;
     if img_exit != 0 {
         eprintln!("Image '{IMAGE_NAME}' not found. Run `cargo xtask setup` first.");
         return Err(Error::CommandFailed {
@@ -68,7 +70,8 @@ pub fn run(branch: &str, run_id: Option<&str>) -> Result<()> {
     println!("Test binary: {}", test_bin.display());
 
     // --- Run tests level by level ---
-    let mut log = format!("Branch: {branch}\nRun ID: {run_id}\nTimeout: {TIMEOUT}s per level\n---\n");
+    let mut log =
+        format!("Branch: {branch}\nRun ID: {run_id}\nTimeout: {TIMEOUT}s per level\n---\n");
     println!("Branch: {branch}");
     println!("Run ID: {run_id}");
     println!("Timeout: {TIMEOUT}s per level");
@@ -91,9 +94,14 @@ pub fn run(branch: &str, run_id: Option<&str>) -> Result<()> {
         let (exit_code, output) = run_cmd_capture_all(
             "sudo",
             &[
-                "podman", "run", "--rm",
-                "--memory=1g", "--cpus=1", "--pids-limit=256",
-                "-v", &mount_spec,
+                "podman",
+                "run",
+                "--rm",
+                "--memory=1g",
+                "--cpus=1",
+                "--pids-limit=256",
+                "-v",
+                &mount_spec,
                 IMAGE_NAME,
                 &bash_cmd,
             ],
@@ -119,9 +127,8 @@ pub fn run(branch: &str, run_id: Option<&str>) -> Result<()> {
         total_tests += level_total;
         passed_tests += level_passed;
 
-        let result_line = format!(
-            "L{level}: {status} ({duration}s) [{level_passed}/{level_total} tests]"
-        );
+        let result_line =
+            format!("L{level}: {status} ({duration}s) [{level_passed}/{level_total} tests]");
         println!("{result_line}");
         log.push_str(&result_line);
         log.push('\n');
@@ -227,18 +234,16 @@ fn find_test_binary(worktree_dir: &Path) -> Result<PathBuf> {
     }
 
     // Fallback: build and grep for binary path
-    let (_, fallback_output) = run_cmd_capture_all(
-        "cargo",
-        &["test", "--no-run"],
-        worktree_dir,
-    )?;
+    let (_, fallback_output) = run_cmd_capture_all("cargo", &["test", "--no-run"], worktree_dir)?;
 
     for line in fallback_output.lines() {
         if let Some(start) = line.find("target/") {
             let bin = &line[start..];
             let bin: String = bin
                 .chars()
-                .take_while(|c| c.is_alphanumeric() || *c == '/' || *c == '-' || *c == '_' || *c == '.')
+                .take_while(|c| {
+                    c.is_alphanumeric() || *c == '/' || *c == '-' || *c == '_' || *c == '.'
+                })
                 .collect();
             let path = worktree_dir.join(&bin);
             if path.is_file() {

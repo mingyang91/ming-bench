@@ -12,10 +12,7 @@ fn test_l12_rest_args() {
 
 #[test]
 fn test_l12_rest_args_empty() {
-    assert_eq!(
-        eval_str("(define (f . all) all) (f)"),
-        Ok("()".into())
-    );
+    assert_eq!(eval_str("(define (f . all) all) (f)"), Ok("()".into()));
 }
 
 #[test]
@@ -40,8 +37,5 @@ fn test_l12_apply_user_fn() {
 
 #[test]
 fn test_l12_apply_as_value() {
-    assert_eq!(
-        eval_str("(define f apply) (f + '(1 2 3))"),
-        Ok("6".into())
-    );
+    assert_eq!(eval_str("(define f apply) (f + '(1 2 3))"), Ok("6".into()));
 }

@@ -154,7 +154,7 @@ pub fn fmt_comma(n: u64) -> String {
     let s = n.to_string();
     let mut result = String::with_capacity(s.len() + s.len() / 3);
     for (i, ch) in s.chars().enumerate() {
-        if i > 0 && (s.len() - i) % 3 == 0 {
+        if i > 0 && (s.len() - i).is_multiple_of(3) {
             result.push(',');
         }
         result.push(ch);
@@ -195,9 +195,22 @@ pub fn parse_iso_epoch(s: &str) -> Option<i64> {
     for y in 1970..year {
         days += if is_leap(y) { 366 } else { 365 };
     }
-    let month_days = [31, 28 + if is_leap(year) { 1 } else { 0 }, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31];
-    for m in 0..(month - 1) as usize {
-        days += month_days[m] as i64;
+    let month_days = [
+        31,
+        28 + if is_leap(year) { 1 } else { 0 },
+        31,
+        30,
+        31,
+        30,
+        31,
+        31,
+        30,
+        31,
+        30,
+        31,
+    ];
+    for md in month_days.iter().take((month - 1) as usize) {
+        days += *md as i64;
     }
     days += day - 1;
 
@@ -318,8 +331,7 @@ pub fn elapsed_secs(meta: &MetaJson) -> Option<u64> {
 // ---------------------------------------------------------------------------
 
 pub const LEVELS: [&str; 16] = [
-    "01", "02", "03", "04", "05", "06", "07", "08",
-    "09", "10", "11", "12", "13", "14", "15", "16",
+    "01", "02", "03", "04", "05", "06", "07", "08", "09", "10", "11", "12", "13", "14", "15", "16",
 ];
 
 // ---------------------------------------------------------------------------
@@ -422,7 +434,20 @@ pub fn iso_now() -> String {
         remaining_days -= year_days;
         year += 1;
     }
-    let month_days = [31, 28 + if is_leap(year) { 1 } else { 0 }, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31];
+    let month_days = [
+        31,
+        28 + if is_leap(year) { 1 } else { 0 },
+        31,
+        30,
+        31,
+        30,
+        31,
+        31,
+        30,
+        31,
+        30,
+        31,
+    ];
     let mut month = 1;
     for md in &month_days {
         if remaining_days < *md {
@@ -435,7 +460,9 @@ pub fn iso_now() -> String {
 
     format!(
         "{:04}-{:02}-{:02}T{:02}:{:02}:{:02}+00:00",
-        year, month, day,
+        year,
+        month,
+        day,
         secs_in_day / 3600,
         (secs_in_day % 3600) / 60,
         secs_in_day % 60,

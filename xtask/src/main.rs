@@ -1,3 +1,5 @@
+#![allow(clippy::excessive_nesting)]
+
 mod cmd;
 mod model;
 

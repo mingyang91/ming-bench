@@ -29,7 +29,10 @@ fn test_l04_define_use() {
 
 #[test]
 fn test_l04_define_multi() {
-    assert_eq!(eval_str("(define x 10) (define y 20) (+ x y)"), Ok("30".into()));
+    assert_eq!(
+        eval_str("(define x 10) (define y 20) (+ x y)"),
+        Ok("30".into())
+    );
 }
 
 #[test]
