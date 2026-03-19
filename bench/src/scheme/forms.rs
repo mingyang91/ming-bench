@@ -105,6 +105,63 @@ pub fn eval_if(args: &[Expr], env: &Env) -> Result<Expr, String> {
     }
 }
 
+pub fn eval_let(args: &[Expr], env: &Env) -> Result<Expr, String> {
+    if args.len() < 2 {
+        return Err("let requires bindings and body".into());
+    }
+    let Expr::List(bindings) = &args[0] else {
+        return Err("let bindings must be a list".into());
+    };
+    let let_env = env.child();
+    for binding in bindings {
+        let (name, val) = parse_let_binding(binding, env)?;
+        let_env.insert(name, val);
+    }
+    let mut result = Expr::Void;
+    for body_expr in &args[1..] {
+        result = eval(body_expr, &let_env)?;
+    }
+    Ok(result)
+}
+
+fn parse_let_binding(binding: &Expr, env: &Env) -> Result<(String, Expr), String> {
+    let Expr::List(pair) = binding else {
+        return Err("let binding must be (name value)".into());
+    };
+    if pair.len() != 2 {
+        return Err("let binding must be (name value)".into());
+    }
+    let Expr::Symbol(name) = &pair[0] else {
+        return Err("let binding name must be a symbol".into());
+    };
+    let val = eval(&pair[1], env)?;
+    Ok((name.clone(), val))
+}
+
+pub fn eval_cond(args: &[Expr], env: &Env) -> Result<Expr, String> {
+    for clause in args {
+        let Expr::List(elems) = clause else {
+            return Err("cond clause must be a list".into());
+        };
+        if elems.len() < 2 {
+            return Err("cond clause must have test and expression".into());
+        }
+        let is_else = matches!(&elems[0], Expr::Symbol(s) if s == "else");
+        if is_else || !is_false(&eval(&elems[0], env)?) {
+            return eval_body(&elems[1..], env);
+        }
+    }
+    Ok(Expr::Void)
+}
+
+fn eval_body(exprs: &[Expr], env: &Env) -> Result<Expr, String> {
+    let mut result = Expr::Void;
+    for expr in exprs {
+        result = eval(expr, env)?;
+    }
+    Ok(result)
+}
+
 pub fn apply(proc: &Expr, args: &[Expr]) -> Result<Expr, String> {
     match proc {
         Expr::Lambda {
