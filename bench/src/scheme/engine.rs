@@ -2,6 +2,8 @@ use std::cell::RefCell;
 use std::collections::HashMap;
 use std::rc::Rc;
 
+type Continuation = Rc<Kont>;
+
 pub(super) enum Value {
     Integer(i64),
     Boolean(bool),
@@ -11,6 +13,7 @@ pub(super) enum Value {
     Nil,
     Builtin(Builtin),
     Procedure(Procedure),
+    Continuation(Continuation),
     Void,
 }
 
@@ -25,6 +28,7 @@ impl Clone for Value {
             Self::Nil => Self::Nil,
             Self::Builtin(builtin) => Self::Builtin(*builtin),
             Self::Procedure(procedure) => Self::Procedure(procedure.clone()),
+            Self::Continuation(continuation) => Self::Continuation(continuation.clone()),
             Self::Void => Self::Void,
         }
     }
@@ -50,6 +54,7 @@ impl std::fmt::Display for Value {
             Self::Nil => formatter.write_str("()"),
             Self::Builtin(builtin) => write!(formatter, "#<procedure:{}>", builtin.name()),
             Self::Procedure(_) => formatter.write_str("#<procedure>"),
+            Self::Continuation(_) => formatter.write_str("#<continuation>"),
             Self::Void => Ok(()),
         }
     }
@@ -83,7 +88,7 @@ fn fmt_string_contents(value: &str, formatter: &mut std::fmt::Formatter<'_>) -> 
 }
 
 #[derive(Clone)]
-enum Expr {
+pub(super) enum Expr {
     Literal(Value),
     Symbol(String),
     Application(Vec<Expr>),
@@ -112,6 +117,7 @@ pub(super) enum Builtin {
     IsPair,
     IsSymbol,
     Apply,
+    CallCc,
 }
 
 impl Builtin {
@@ -138,6 +144,7 @@ impl Builtin {
             Self::IsPair => "pair?",
             Self::IsSymbol => "symbol?",
             Self::Apply => "apply",
+            Self::CallCc => "call/cc",
         }
     }
 
@@ -173,7 +180,8 @@ impl Builtin {
             Self::IsSymbol => eval_type_predicate(arguments, "symbol?", |value| {
                 matches!(value, Value::Symbol(_))
             }),
-            Self::Apply => eval_apply(arguments),
+            Self::Apply => Err("internal error: `apply` needs the evaluator".into()),
+            Self::CallCc => Err("internal error: `call/cc` needs the evaluator".into()),
         }
     }
 }
@@ -186,11 +194,6 @@ pub(super) struct Procedure {
     environment: Environment,
 }
 
-enum EvalOutcome {
-    Value(Value),
-    TailCall(Procedure, Vec<Value>),
-}
-
 struct ParameterSpec {
     fixed: Vec<String>,
     rest: Option<String>,
@@ -198,16 +201,84 @@ struct ParameterSpec {
 
 type Environment = Rc<RefCell<Frame>>;
 
-struct Frame {
+pub(super) struct Frame {
     bindings: HashMap<String, Value>,
     parent: Option<Environment>,
+}
+
+pub(super) enum Kont {
+    Done,
+    Sequence {
+        remaining: Vec<Expr>,
+        environment: Environment,
+        next: Continuation,
+    },
+    DefineValue {
+        name: String,
+        environment: Environment,
+        next: Continuation,
+    },
+    SetValue {
+        name: String,
+        environment: Environment,
+        next: Continuation,
+    },
+    If {
+        consequent: Expr,
+        alternative: Expr,
+        environment: Environment,
+        next: Continuation,
+    },
+    And {
+        remaining: Vec<Expr>,
+        environment: Environment,
+        next: Continuation,
+    },
+    Or {
+        remaining: Vec<Expr>,
+        environment: Environment,
+        next: Continuation,
+    },
+    CondTest {
+        body: Vec<Expr>,
+        remaining_clauses: Vec<Expr>,
+        environment: Environment,
+        next: Continuation,
+    },
+    ApplyOperator {
+        arguments: Vec<Expr>,
+        environment: Environment,
+        next: Continuation,
+    },
+    ApplyArgument {
+        operator: Value,
+        remaining: Vec<Expr>,
+        evaluated_suffix: Vec<Value>,
+        environment: Environment,
+        next: Continuation,
+    },
+}
+
+enum Control {
+    Eval(Expr, Environment),
+    Value(Value),
+}
+
+struct Machine {
+    control: Control,
+    continuation: Continuation,
+}
+
+enum Step {
+    Continue(Machine),
+    Done(Value),
 }
 
 pub(super) fn eval_program(input: &str) -> Result<Value, String> {
     let mut parser = Parser::new(input);
     let program = parser.parse_program()?;
     let environment = global_environment();
-    eval_sequence(&program, &environment)
+    schedule_sequence(program, environment, Rc::new(Kont::Done))?.run()
 }
 
 fn global_environment() -> Environment {
@@ -235,6 +306,7 @@ fn global_environment() -> Environment {
         Builtin::IsPair,
         Builtin::IsSymbol,
         Builtin::Apply,
+        Builtin::CallCc,
     ] {
         define_binding(
             &environment,
@@ -285,125 +357,690 @@ fn set_binding(environment: &Environment, name: &str, value: Value) -> Result<()
     }
 }
 
-fn eval_sequence(expressions: &[Expr], environment: &Environment) -> Result<Value, String> {
-    resolve_outcome(eval_sequence_outcome(expressions, environment, false)?)
-}
-
-fn eval_sequence_outcome(
-    expressions: &[Expr],
-    environment: &Environment,
-    tail_position: bool,
-) -> Result<EvalOutcome, String> {
-    let Some((last, initial)) = expressions.split_last() else {
-        return Ok(EvalOutcome::Value(Value::Void));
-    };
-
-    for expr in initial {
-        eval_expr(expr, environment)?;
+impl Machine {
+    fn eval(expr: Expr, environment: Environment, continuation: Continuation) -> Self {
+        Self {
+            control: Control::Eval(expr, environment),
+            continuation,
+        }
     }
 
-    eval_expr_outcome(last, environment, tail_position)
+    fn value(value: Value, continuation: Continuation) -> Self {
+        Self {
+            control: Control::Value(value),
+            continuation,
+        }
+    }
+
+    fn run(self) -> Result<Value, String> {
+        let mut machine = self;
+
+        loop {
+            machine = match drive(machine)? {
+                Step::Continue(next) => next,
+                Step::Done(value) => return Ok(value),
+            };
+        }
+    }
 }
 
-fn eval_expr(expr: &Expr, environment: &Environment) -> Result<Value, String> {
-    resolve_outcome(eval_expr_outcome(expr, environment, false)?)
+fn drive(machine: Machine) -> Result<Step, String> {
+    let Machine {
+        control,
+        continuation,
+    } = machine;
+
+    match control {
+        Control::Eval(expr, environment) => {
+            Ok(Step::Continue(step_eval(expr, environment, continuation)?))
+        }
+        Control::Value(value) => resume(value, continuation),
+    }
 }
 
-fn eval_expr_outcome(
-    expr: &Expr,
-    environment: &Environment,
-    tail_position: bool,
-) -> Result<EvalOutcome, String> {
+fn step_eval(
+    expr: Expr,
+    environment: Environment,
+    continuation: Continuation,
+) -> Result<Machine, String> {
     match expr {
-        Expr::Literal(value) => Ok(EvalOutcome::Value(value.clone())),
-        Expr::Symbol(name) => lookup_binding(environment, name)
-            .map(EvalOutcome::Value)
+        Expr::Literal(value) => Ok(Machine::value(value, continuation)),
+        Expr::Symbol(name) => lookup_binding(&environment, &name)
+            .map(|value| Machine::value(value, continuation))
             .ok_or_else(|| format!("unbound symbol: {name}")),
-        Expr::Application(parts) => eval_application_outcome(parts, environment, tail_position),
+        Expr::Application(parts) => eval_application(parts, environment, continuation),
     }
 }
 
-fn eval_application_outcome(
-    parts: &[Expr],
-    environment: &Environment,
-    tail_position: bool,
-) -> Result<EvalOutcome, String> {
-    let (operator, arguments) = parts
-        .split_first()
-        .ok_or_else(|| "cannot evaluate empty application".to_string())?;
+fn resume(value: Value, continuation: Continuation) -> Result<Step, String> {
+    match continuation.as_ref() {
+        Kont::Done => Ok(Step::Done(value)),
+        Kont::Sequence {
+            remaining,
+            environment,
+            next,
+        } => resume_sequence(remaining, environment, next),
+        Kont::DefineValue {
+            name,
+            environment,
+            next,
+        } => resume_define(value, name, environment, next),
+        Kont::SetValue {
+            name,
+            environment,
+            next,
+        } => resume_set(value, name, environment, next),
+        Kont::If {
+            consequent,
+            alternative,
+            environment,
+            next,
+        } => resume_if(value, consequent, alternative, environment, next),
+        Kont::And {
+            remaining,
+            environment,
+            next,
+        } => resume_and(value, remaining, environment, next),
+        Kont::Or {
+            remaining,
+            environment,
+            next,
+        } => resume_or(value, remaining, environment, next),
+        Kont::CondTest {
+            body,
+            remaining_clauses,
+            environment,
+            next,
+        } => resume_cond(value, body, remaining_clauses, environment, next),
+        Kont::ApplyOperator {
+            arguments,
+            environment,
+            next,
+        } => resume_apply_operator(value, arguments, environment, next),
+        Kont::ApplyArgument {
+            operator,
+            remaining,
+            evaluated_suffix,
+            environment,
+            next,
+        } => resume_apply_argument(
+            value,
+            operator,
+            remaining,
+            evaluated_suffix,
+            environment,
+            next,
+        ),
+    }
+}
 
-    if let Some(name) = symbol_name(operator) {
+fn resume_sequence(
+    remaining: &[Expr],
+    environment: &Environment,
+    next: &Continuation,
+) -> Result<Step, String> {
+    Ok(Step::Continue(schedule_sequence(
+        remaining.to_vec(),
+        environment.clone(),
+        next.clone(),
+    )?))
+}
+
+fn resume_define(
+    value: Value,
+    name: &str,
+    environment: &Environment,
+    next: &Continuation,
+) -> Result<Step, String> {
+    define_binding(environment, name.to_string(), value);
+    Ok(Step::Continue(Machine::value(Value::Void, next.clone())))
+}
+
+fn resume_set(
+    value: Value,
+    name: &str,
+    environment: &Environment,
+    next: &Continuation,
+) -> Result<Step, String> {
+    set_binding(environment, name, value)?;
+    Ok(Step::Continue(Machine::value(Value::Void, next.clone())))
+}
+
+fn resume_if(
+    value: Value,
+    consequent: &Expr,
+    alternative: &Expr,
+    environment: &Environment,
+    next: &Continuation,
+) -> Result<Step, String> {
+    let branch = if is_truthy(&value) {
+        consequent.clone()
+    } else {
+        alternative.clone()
+    };
+    Ok(Step::Continue(Machine::eval(
+        branch,
+        environment.clone(),
+        next.clone(),
+    )))
+}
+
+fn resume_and(
+    value: Value,
+    remaining: &[Expr],
+    environment: &Environment,
+    next: &Continuation,
+) -> Result<Step, String> {
+    if !is_truthy(&value) {
+        return Ok(Step::Continue(Machine::value(value, next.clone())));
+    }
+
+    Ok(Step::Continue(schedule_and(
+        remaining.to_vec(),
+        environment.clone(),
+        next.clone(),
+    )?))
+}
+
+fn resume_or(
+    value: Value,
+    remaining: &[Expr],
+    environment: &Environment,
+    next: &Continuation,
+) -> Result<Step, String> {
+    if is_truthy(&value) {
+        return Ok(Step::Continue(Machine::value(value, next.clone())));
+    }
+
+    Ok(Step::Continue(schedule_or(
+        remaining.to_vec(),
+        environment.clone(),
+        next.clone(),
+    )?))
+}
+
+fn resume_cond(
+    value: Value,
+    body: &[Expr],
+    remaining_clauses: &[Expr],
+    environment: &Environment,
+    next: &Continuation,
+) -> Result<Step, String> {
+    if !is_truthy(&value) {
+        return Ok(Step::Continue(schedule_cond(
+            remaining_clauses.to_vec(),
+            environment.clone(),
+            next.clone(),
+        )?));
+    }
+
+    if body.is_empty() {
+        return Ok(Step::Continue(Machine::value(value, next.clone())));
+    }
+
+    Ok(Step::Continue(schedule_sequence(
+        body.to_vec(),
+        environment.clone(),
+        next.clone(),
+    )?))
+}
+
+fn resume_apply_operator(
+    value: Value,
+    arguments: &[Expr],
+    environment: &Environment,
+    next: &Continuation,
+) -> Result<Step, String> {
+    Ok(Step::Continue(schedule_argument_evaluation(
+        value,
+        arguments.to_vec(),
+        environment.clone(),
+        next.clone(),
+    )?))
+}
+
+fn resume_apply_argument(
+    value: Value,
+    operator: &Value,
+    remaining: &[Expr],
+    evaluated_suffix: &[Value],
+    environment: &Environment,
+    next: &Continuation,
+) -> Result<Step, String> {
+    Ok(Step::Continue(continue_argument_evaluation(
+        operator.clone(),
+        remaining.to_vec(),
+        evaluated_suffix.to_vec(),
+        value,
+        environment.clone(),
+        next.clone(),
+    )?))
+}
+
+fn eval_application(
+    parts: Vec<Expr>,
+    environment: Environment,
+    continuation: Continuation,
+) -> Result<Machine, String> {
+    let mut parts = parts.into_iter();
+    let operator = parts
+        .next()
+        .ok_or_else(|| "cannot evaluate empty application".to_string())?;
+    let arguments: Vec<_> = parts.collect();
+
+    if let Some(name) = symbol_name(&operator) {
         match name {
-            "and" => return eval_and(arguments, environment, tail_position),
-            "or" => return eval_or(arguments, environment, tail_position),
-            "begin" => return eval_begin(arguments, environment, tail_position),
-            "cond" => return eval_cond(arguments, environment, tail_position),
-            "if" => return eval_if(arguments, environment, tail_position),
-            "define" => return eval_define(arguments, environment).map(EvalOutcome::Value),
-            "let" => return eval_let(arguments, environment, tail_position),
-            "quote" => return eval_quote(arguments).map(EvalOutcome::Value),
-            "lambda" => return eval_lambda(arguments, environment).map(EvalOutcome::Value),
-            "set!" => return eval_set(arguments, environment).map(EvalOutcome::Value),
+            "and" => return schedule_and(arguments, environment, continuation),
+            "or" => return schedule_or(arguments, environment, continuation),
+            "begin" => return schedule_sequence(arguments, environment, continuation),
+            "cond" => return schedule_cond(arguments, environment, continuation),
+            "if" => return schedule_if(&arguments, environment, continuation),
+            "define" => return schedule_define(&arguments, environment, continuation),
+            "let" => return schedule_let(&arguments, environment, continuation),
+            "quote" => return schedule_quote(&arguments, continuation),
+            "lambda" => return schedule_lambda(&arguments, environment, continuation),
+            "set!" => return schedule_set(&arguments, environment, continuation),
             _ => {}
         }
     }
 
-    let operator = eval_expr(operator, environment)?;
-    let arguments = eval_arguments(arguments, environment)?;
+    let frame = Kont::ApplyOperator {
+        arguments,
+        environment: environment.clone(),
+        next: continuation,
+    };
+    Ok(Machine::eval(operator, environment, Rc::new(frame)))
+}
 
-    if tail_position {
-        if let Value::Procedure(procedure) = operator {
-            return Ok(EvalOutcome::TailCall(procedure, arguments));
+fn schedule_if(
+    arguments: &[Expr],
+    environment: Environment,
+    continuation: Continuation,
+) -> Result<Machine, String> {
+    let [condition, consequent, alternative] = arguments else {
+        return Err("`if` expects exactly 3 arguments".into());
+    };
+
+    let frame = Kont::If {
+        consequent: consequent.clone(),
+        alternative: alternative.clone(),
+        environment: environment.clone(),
+        next: continuation,
+    };
+    Ok(Machine::eval(condition.clone(), environment, Rc::new(frame)))
+}
+
+fn schedule_define(
+    arguments: &[Expr],
+    environment: Environment,
+    continuation: Continuation,
+) -> Result<Machine, String> {
+    let (target, body) = arguments
+        .split_first()
+        .ok_or_else(|| "`define` expects at least 2 arguments".to_string())?;
+
+    match target {
+        Expr::Symbol(name) => define_value(name, body, environment, continuation),
+        Expr::Application(signature) => define_function(signature, body, environment, continuation),
+        _ => Err("`define` expects a symbol name".into()),
+    }
+}
+
+fn define_value(
+    name: &str,
+    body: &[Expr],
+    environment: Environment,
+    continuation: Continuation,
+) -> Result<Machine, String> {
+    let [value_expr] = body else {
+        return Err("`define` expects exactly 2 arguments".into());
+    };
+
+    let frame = Kont::DefineValue {
+        name: name.to_string(),
+        environment: environment.clone(),
+        next: continuation,
+    };
+    Ok(Machine::eval(value_expr.clone(), environment, Rc::new(frame)))
+}
+
+fn define_function(
+    signature: &[Expr],
+    body: &[Expr],
+    environment: Environment,
+    continuation: Continuation,
+) -> Result<Machine, String> {
+    let (name, params) = signature
+        .split_first()
+        .ok_or_else(|| "`define` expects a function name".to_string())?;
+    let Expr::Symbol(name) = name else {
+        return Err("`define` expects a symbol name".into());
+    };
+
+    if body.is_empty() {
+        return Err("`define` expects a function body".into());
+    }
+
+    let params = parse_parameters(params)?;
+    let procedure = Procedure {
+        params: params.fixed.into(),
+        rest_param: params.rest,
+        body: body.to_vec().into(),
+        environment: environment.clone(),
+    };
+    define_binding(&environment, name.clone(), Value::Procedure(procedure));
+
+    Ok(Machine::value(Value::Void, continuation))
+}
+
+fn schedule_let(
+    arguments: &[Expr],
+    environment: Environment,
+    continuation: Continuation,
+) -> Result<Machine, String> {
+    let (first, rest) = arguments
+        .split_first()
+        .ok_or_else(|| "`let` expects bindings and a body".to_string())?;
+
+    match first {
+        Expr::Symbol(name) => schedule_named_let(name, rest, environment, continuation),
+        Expr::Application(bindings) => schedule_regular_let(bindings, rest, environment, continuation),
+        _ => Err("`let` expects a binding list".into()),
+    }
+}
+
+fn schedule_regular_let(
+    bindings: &[Expr],
+    body: &[Expr],
+    environment: Environment,
+    continuation: Continuation,
+) -> Result<Machine, String> {
+    if body.is_empty() {
+        return Err("`let` expects a body".into());
+    }
+
+    let (params, arguments) = parse_let_bindings(bindings)?;
+    let procedure = Procedure {
+        params: params.into(),
+        rest_param: None,
+        body: body.to_vec().into(),
+        environment: environment.clone(),
+    };
+    schedule_argument_evaluation(Value::Procedure(procedure), arguments, environment, continuation)
+}
+
+fn schedule_named_let(
+    name: &str,
+    arguments: &[Expr],
+    environment: Environment,
+    continuation: Continuation,
+) -> Result<Machine, String> {
+    let (bindings, body) = arguments
+        .split_first()
+        .ok_or_else(|| "`let` expects bindings and a body".to_string())?;
+
+    if body.is_empty() {
+        return Err("`let` expects a body".into());
+    }
+
+    let Expr::Application(bindings) = bindings else {
+        return Err("`let` expects a binding list".into());
+    };
+
+    let (params, arguments) = parse_let_bindings(bindings)?;
+    let let_environment = new_environment(Some(environment.clone()));
+    let procedure = Procedure {
+        params: params.into(),
+        rest_param: None,
+        body: body.to_vec().into(),
+        environment: let_environment.clone(),
+    };
+    define_binding(
+        &let_environment,
+        name.to_string(),
+        Value::Procedure(procedure.clone()),
+    );
+
+    schedule_argument_evaluation(Value::Procedure(procedure), arguments, environment, continuation)
+}
+
+fn schedule_quote(arguments: &[Expr], continuation: Continuation) -> Result<Machine, String> {
+    Ok(Machine::value(eval_quote(arguments)?, continuation))
+}
+
+fn schedule_lambda(
+    arguments: &[Expr],
+    environment: Environment,
+    continuation: Continuation,
+) -> Result<Machine, String> {
+    Ok(Machine::value(eval_lambda(arguments, &environment)?, continuation))
+}
+
+fn schedule_set(
+    arguments: &[Expr],
+    environment: Environment,
+    continuation: Continuation,
+) -> Result<Machine, String> {
+    let [target, value_expr] = arguments else {
+        return Err("`set!` expects exactly 2 arguments".into());
+    };
+
+    let Expr::Symbol(name) = target else {
+        return Err("`set!` expects a symbol name".into());
+    };
+
+    let frame = Kont::SetValue {
+        name: name.clone(),
+        environment: environment.clone(),
+        next: continuation,
+    };
+    Ok(Machine::eval(value_expr.clone(), environment, Rc::new(frame)))
+}
+
+fn schedule_sequence(
+    expressions: Vec<Expr>,
+    environment: Environment,
+    continuation: Continuation,
+) -> Result<Machine, String> {
+    match expressions.as_slice() {
+        [] => Ok(Machine::value(Value::Void, continuation)),
+        [expr] => Ok(Machine::eval(expr.clone(), environment, continuation)),
+        [first, rest @ ..] => {
+            let frame = Kont::Sequence {
+                remaining: rest.to_vec(),
+                environment: environment.clone(),
+                next: continuation,
+            };
+            Ok(Machine::eval(first.clone(), environment, Rc::new(frame)))
         }
     }
-
-    apply_callable(&operator, &arguments).map(EvalOutcome::Value)
 }
 
-fn resolve_outcome(outcome: EvalOutcome) -> Result<Value, String> {
-    match outcome {
-        EvalOutcome::Value(value) => Ok(value),
-        EvalOutcome::TailCall(procedure, arguments) => apply_procedure(procedure, arguments),
+fn schedule_and(
+    arguments: Vec<Expr>,
+    environment: Environment,
+    continuation: Continuation,
+) -> Result<Machine, String> {
+    match arguments.as_slice() {
+        [] => Ok(Machine::value(Value::Boolean(true), continuation)),
+        [expr] => Ok(Machine::eval(expr.clone(), environment, continuation)),
+        [first, rest @ ..] => {
+            let frame = Kont::And {
+                remaining: rest.to_vec(),
+                environment: environment.clone(),
+                next: continuation,
+            };
+            Ok(Machine::eval(first.clone(), environment, Rc::new(frame)))
+        }
     }
 }
 
-fn symbol_name(expr: &Expr) -> Option<&str> {
-    match expr {
-        Expr::Symbol(name) => Some(name.as_str()),
-        _ => None,
+fn schedule_or(
+    arguments: Vec<Expr>,
+    environment: Environment,
+    continuation: Continuation,
+) -> Result<Machine, String> {
+    match arguments.as_slice() {
+        [] => Ok(Machine::value(Value::Boolean(false), continuation)),
+        [expr] => Ok(Machine::eval(expr.clone(), environment, continuation)),
+        [first, rest @ ..] => {
+            let frame = Kont::Or {
+                remaining: rest.to_vec(),
+                environment: environment.clone(),
+                next: continuation,
+            };
+            Ok(Machine::eval(first.clone(), environment, Rc::new(frame)))
+        }
     }
 }
 
-fn eval_arguments(arguments: &[Expr], environment: &Environment) -> Result<Vec<Value>, String> {
-    let mut values = Vec::with_capacity(arguments.len());
-    for argument in arguments {
-        values.push(eval_expr(argument, environment)?);
+fn schedule_cond(
+    clauses: Vec<Expr>,
+    environment: Environment,
+    continuation: Continuation,
+) -> Result<Machine, String> {
+    let mut clauses = clauses.into_iter();
+    let Some(clause) = clauses.next() else {
+        return Ok(Machine::value(Value::Void, continuation));
+    };
+    let remaining_clauses: Vec<_> = clauses.collect();
+
+    let Expr::Application(parts) = clause else {
+        return Err("`cond` clauses must be lists".into());
+    };
+    let (test, body) = parts
+        .split_first()
+        .ok_or_else(|| "`cond` clauses must not be empty".to_string())?;
+
+    if matches!(test, Expr::Symbol(name) if name == "else") {
+        if !remaining_clauses.is_empty() {
+            return Err("`cond` `else` clause must be last".into());
+        }
+        if body.is_empty() {
+            return Err("`cond` `else` clause must have a body".into());
+        }
+
+        return schedule_sequence(body.to_vec(), environment, continuation);
     }
-    Ok(values)
+
+    let frame = Kont::CondTest {
+        body: body.to_vec(),
+        remaining_clauses,
+        environment: environment.clone(),
+        next: continuation,
+    };
+    Ok(Machine::eval(test.clone(), environment, Rc::new(frame)))
 }
 
-fn apply_callable(callable: &Value, arguments: &[Value]) -> Result<Value, String> {
+fn schedule_argument_evaluation(
+    operator: Value,
+    arguments: Vec<Expr>,
+    environment: Environment,
+    continuation: Continuation,
+) -> Result<Machine, String> {
+    let Some((current, remaining)) = split_last_argument(arguments) else {
+        return continue_call(operator, Vec::new(), continuation);
+    };
+
+    let frame = Kont::ApplyArgument {
+        operator,
+        remaining,
+        evaluated_suffix: Vec::new(),
+        environment: environment.clone(),
+        next: continuation,
+    };
+    Ok(Machine::eval(current, environment, Rc::new(frame)))
+}
+
+fn continue_argument_evaluation(
+    operator: Value,
+    remaining: Vec<Expr>,
+    mut evaluated_suffix: Vec<Value>,
+    value: Value,
+    environment: Environment,
+    continuation: Continuation,
+) -> Result<Machine, String> {
+    evaluated_suffix.insert(0, value);
+
+    let Some((next_expr, next_remaining)) = split_last_argument(remaining) else {
+        return continue_call(operator, evaluated_suffix, continuation);
+    };
+
+    let frame = Kont::ApplyArgument {
+        operator,
+        remaining: next_remaining,
+        evaluated_suffix,
+        environment: environment.clone(),
+        next: continuation,
+    };
+    Ok(Machine::eval(next_expr, environment, Rc::new(frame)))
+}
+
+fn split_last_argument(mut arguments: Vec<Expr>) -> Option<(Expr, Vec<Expr>)> {
+    let current = arguments.pop()?;
+    Some((current, arguments))
+}
+
+fn continue_call(
+    callable: Value,
+    arguments: Vec<Value>,
+    continuation: Continuation,
+) -> Result<Machine, String> {
     match callable {
-        Value::Builtin(builtin) => builtin.apply(arguments),
-        Value::Procedure(procedure) => apply_procedure(procedure.clone(), arguments.to_vec()),
+        Value::Builtin(builtin) => call_builtin(builtin, arguments, continuation),
+        Value::Procedure(procedure) => call_procedure(procedure, arguments, continuation),
+        Value::Continuation(saved) => {
+            let [value] = arguments.as_slice() else {
+                return Err("continuation expected exactly 1 argument".into());
+            };
+            Ok(Machine::value(value.clone(), saved))
+        }
         _ => Err("attempted to call a non-procedure".into()),
     }
 }
 
-fn apply_procedure(mut procedure: Procedure, mut arguments: Vec<Value>) -> Result<Value, String> {
-    loop {
-        validate_procedure_arity(&procedure, arguments.len())?;
-        let call_environment = new_environment(Some(procedure.environment.clone()));
-        bind_procedure_arguments(&call_environment, &procedure, &arguments);
+fn call_builtin(
+    builtin: Builtin,
+    arguments: Vec<Value>,
+    continuation: Continuation,
+) -> Result<Machine, String> {
+    match builtin {
+        Builtin::Apply => {
+            let (callable, rest) = arguments
+                .split_first()
+                .ok_or_else(|| "`apply` expects at least 2 arguments".to_string())?;
+            let (list, prefix) = rest
+                .split_last()
+                .ok_or_else(|| "`apply` expects at least 2 arguments".to_string())?;
 
-        match eval_sequence_outcome(procedure.body.as_ref(), &call_environment, true)? {
-            EvalOutcome::Value(value) => return Ok(value),
-            EvalOutcome::TailCall(next_procedure, next_arguments) => {
-                procedure = next_procedure;
-                arguments = next_arguments;
-            }
+            let mut applied_arguments = prefix.to_vec();
+            applied_arguments.extend(list_to_vec(list)?);
+            continue_call(callable.clone(), applied_arguments, continuation)
         }
+        Builtin::CallCc => {
+            let [callable] = arguments.as_slice() else {
+                return Err("`call/cc` expects exactly 1 argument".into());
+            };
+
+            continue_call(
+                callable.clone(),
+                vec![Value::Continuation(continuation.clone())],
+                continuation,
+            )
+        }
+        _ => Ok(Machine::value(builtin.apply(&arguments)?, continuation)),
     }
+}
+
+fn call_procedure(
+    procedure: Procedure,
+    arguments: Vec<Value>,
+    continuation: Continuation,
+) -> Result<Machine, String> {
+    validate_procedure_arity(&procedure, arguments.len())?;
+    let call_environment = new_environment(Some(procedure.environment.clone()));
+    bind_procedure_arguments(&call_environment, &procedure, &arguments);
+    schedule_sequence(procedure.body.as_ref().to_vec(), call_environment, continuation)
 }
 
 fn validate_procedure_arity(procedure: &Procedure, actual: usize) -> Result<(), String> {
@@ -440,188 +1077,20 @@ fn bind_procedure_arguments(environment: &Environment, procedure: &Procedure, ar
     }
 }
 
-fn eval_define(arguments: &[Expr], environment: &Environment) -> Result<Value, String> {
-    let (target, body) = arguments
-        .split_first()
-        .ok_or_else(|| "`define` expects at least 2 arguments".to_string())?;
+fn parse_let_bindings(bindings: &[Expr]) -> Result<(Vec<String>, Vec<Expr>), String> {
+    let mut params = Vec::with_capacity(bindings.len());
+    let mut arguments = Vec::with_capacity(bindings.len());
 
-    match target {
-        Expr::Symbol(name) => define_value(name, body, environment),
-        Expr::Application(signature) => define_function(signature, body, environment),
-        _ => Err("`define` expects a symbol name".into()),
-    }
-}
-
-fn define_value(name: &str, body: &[Expr], environment: &Environment) -> Result<Value, String> {
-    let [value_expr] = body else {
-        return Err("`define` expects exactly 2 arguments".into());
-    };
-
-    let value = eval_expr(value_expr, environment)?;
-    define_binding(environment, name.to_string(), value);
-    Ok(Value::Void)
-}
-
-fn define_function(
-    signature: &[Expr],
-    body: &[Expr],
-    environment: &Environment,
-) -> Result<Value, String> {
-    let (name, params) = signature
-        .split_first()
-        .ok_or_else(|| "`define` expects a function name".to_string())?;
-    let Expr::Symbol(name) = name else {
-        return Err("`define` expects a symbol name".into());
-    };
-
-    if body.is_empty() {
-        return Err("`define` expects a function body".into());
-    }
-
-    let params = parse_parameters(params)?;
-    let procedure = Procedure {
-        params: params.fixed.into(),
-        rest_param: params.rest,
-        body: body.to_vec().into(),
-        environment: environment.clone(),
-    };
-    define_binding(environment, name.clone(), Value::Procedure(procedure));
-
-    Ok(Value::Void)
-}
-
-fn eval_lambda(arguments: &[Expr], environment: &Environment) -> Result<Value, String> {
-    let (params, body) = arguments
-        .split_first()
-        .ok_or_else(|| "`lambda` expects a parameter list and body".to_string())?;
-
-    if body.is_empty() {
-        return Err("`lambda` expects a body".into());
-    }
-
-    let Expr::Application(params) = params else {
-        return Err("`lambda` expects a parameter list".into());
-    };
-    let params = parse_parameters(params)?;
-
-    Ok(Value::Procedure(Procedure {
-        params: params.fixed.into(),
-        rest_param: params.rest,
-        body: body.to_vec().into(),
-        environment: environment.clone(),
-    }))
-}
-
-fn eval_set(arguments: &[Expr], environment: &Environment) -> Result<Value, String> {
-    let [target, value_expr] = arguments else {
-        return Err("`set!` expects exactly 2 arguments".into());
-    };
-
-    let Expr::Symbol(name) = target else {
-        return Err("`set!` expects a symbol name".into());
-    };
-
-    let value = eval_expr(value_expr, environment)?;
-    set_binding(environment, name, value)?;
-    Ok(Value::Void)
-}
-
-fn eval_begin(
-    arguments: &[Expr],
-    environment: &Environment,
-    tail_position: bool,
-) -> Result<EvalOutcome, String> {
-    eval_sequence_outcome(arguments, environment, tail_position)
-}
-
-fn eval_let(
-    arguments: &[Expr],
-    environment: &Environment,
-    tail_position: bool,
-) -> Result<EvalOutcome, String> {
-    let (first, rest) = arguments
-        .split_first()
-        .ok_or_else(|| "`let` expects bindings and a body".to_string())?;
-
-    match first {
-        Expr::Symbol(name) => eval_named_let(name, rest, environment, tail_position),
-        Expr::Application(bindings) => eval_regular_let(bindings, rest, environment, tail_position),
-        _ => Err("`let` expects a binding list".into()),
-    }
-}
-
-fn eval_regular_let(
-    bindings: &[Expr],
-    body: &[Expr],
-    environment: &Environment,
-    tail_position: bool,
-) -> Result<EvalOutcome, String> {
-    if body.is_empty() {
-        return Err("`let` expects a body".into());
-    }
-
-    let let_environment = new_environment(Some(environment.clone()));
-    for (name, value) in eval_let_bindings(bindings, environment)? {
-        define_binding(&let_environment, name, value);
-    }
-
-    eval_sequence_outcome(body, &let_environment, tail_position)
-}
-
-fn eval_named_let(
-    name: &str,
-    arguments: &[Expr],
-    environment: &Environment,
-    tail_position: bool,
-) -> Result<EvalOutcome, String> {
-    let (bindings, body) = arguments
-        .split_first()
-        .ok_or_else(|| "`let` expects bindings and a body".to_string())?;
-
-    if body.is_empty() {
-        return Err("`let` expects a body".into());
-    }
-
-    let Expr::Application(bindings) = bindings else {
-        return Err("`let` expects a binding list".into());
-    };
-
-    let (params, arguments): (Vec<_>, Vec<_>) = eval_let_bindings(bindings, environment)?
-        .into_iter()
-        .unzip();
-
-    let let_environment = new_environment(Some(environment.clone()));
-    let procedure = Procedure {
-        params: params.into(),
-        rest_param: None,
-        body: body.to_vec().into(),
-        environment: let_environment.clone(),
-    };
-    define_binding(
-        &let_environment,
-        name.to_string(),
-        Value::Procedure(procedure.clone()),
-    );
-
-    if tail_position {
-        Ok(EvalOutcome::TailCall(procedure, arguments))
-    } else {
-        apply_procedure(procedure, arguments).map(EvalOutcome::Value)
-    }
-}
-
-fn eval_let_bindings(
-    bindings: &[Expr],
-    environment: &Environment,
-) -> Result<Vec<(String, Value)>, String> {
-    let mut evaluated_bindings = Vec::with_capacity(bindings.len());
     for binding in bindings {
-        evaluated_bindings.push(eval_let_binding(binding, environment)?);
+        let (name, value) = parse_let_binding(binding)?;
+        params.push(name);
+        arguments.push(value);
     }
-    Ok(evaluated_bindings)
+
+    Ok((params, arguments))
 }
 
-fn eval_let_binding(binding: &Expr, environment: &Environment) -> Result<(String, Value), String> {
+fn parse_let_binding(binding: &Expr) -> Result<(String, Expr), String> {
     let Expr::Application(binding) = binding else {
         return Err("`let` bindings must be pairs".into());
     };
@@ -634,8 +1103,7 @@ fn eval_let_binding(binding: &Expr, environment: &Environment) -> Result<(String
         return Err("`let` binding names must be symbols".into());
     };
 
-    let value = eval_expr(value_expr, environment)?;
-    Ok((name.clone(), value))
+    Ok((name.clone(), value_expr.clone()))
 }
 
 fn parse_parameters(parameters: &[Expr]) -> Result<ParameterSpec, String> {
@@ -673,87 +1141,26 @@ fn parse_rest_parameter(parameters: &[Expr], fixed: Vec<String>) -> Result<Param
     })
 }
 
-fn eval_if(
-    arguments: &[Expr],
-    environment: &Environment,
-    tail_position: bool,
-) -> Result<EvalOutcome, String> {
-    let [condition, consequent, alternative] = arguments else {
-        return Err("`if` expects exactly 3 arguments".into());
-    };
-
-    let condition = eval_expr(condition, environment)?;
-    if is_truthy(&condition) {
-        eval_expr_outcome(consequent, environment, tail_position)
-    } else {
-        eval_expr_outcome(alternative, environment, tail_position)
-    }
-}
-
-fn eval_cond(
-    arguments: &[Expr],
-    environment: &Environment,
-    tail_position: bool,
-) -> Result<EvalOutcome, String> {
-    for (index, clause) in arguments.iter().enumerate() {
-        if let Some(outcome) = eval_cond_clause(
-            clause,
-            index + 1 == arguments.len(),
-            environment,
-            tail_position,
-        )? {
-            return Ok(outcome);
-        }
-    }
-
-    Ok(EvalOutcome::Value(Value::Void))
-}
-
-fn eval_cond_clause(
-    clause: &Expr,
-    is_last: bool,
-    environment: &Environment,
-    tail_position: bool,
-) -> Result<Option<EvalOutcome>, String> {
-    let Expr::Application(clause_parts) = clause else {
-        return Err("`cond` clauses must be lists".into());
-    };
-
-    let (test, body) = clause_parts
+fn eval_lambda(arguments: &[Expr], environment: &Environment) -> Result<Value, String> {
+    let (params, body) = arguments
         .split_first()
-        .ok_or_else(|| "`cond` clauses must not be empty".to_string())?;
+        .ok_or_else(|| "`lambda` expects a parameter list and body".to_string())?;
 
-    if matches!(test, Expr::Symbol(name) if name == "else") {
-        return eval_else_clause(body, is_last, environment, tail_position).map(Some);
-    }
-
-    let test_value = eval_expr(test, environment)?;
-    if !is_truthy(&test_value) {
-        return Ok(None);
-    }
-
-    let outcome = if body.is_empty() {
-        EvalOutcome::Value(test_value)
-    } else {
-        eval_sequence_outcome(body, environment, tail_position)?
-    };
-    Ok(Some(outcome))
-}
-
-fn eval_else_clause(
-    body: &[Expr],
-    is_last: bool,
-    environment: &Environment,
-    tail_position: bool,
-) -> Result<EvalOutcome, String> {
-    if !is_last {
-        return Err("`cond` `else` clause must be last".into());
-    }
     if body.is_empty() {
-        return Err("`cond` `else` clause must have a body".into());
+        return Err("`lambda` expects a body".into());
     }
 
-    eval_sequence_outcome(body, environment, tail_position)
+    let Expr::Application(params) = params else {
+        return Err("`lambda` expects a parameter list".into());
+    };
+    let params = parse_parameters(params)?;
+
+    Ok(Value::Procedure(Procedure {
+        params: params.fixed.into(),
+        rest_param: params.rest,
+        body: body.to_vec().into(),
+        environment: environment.clone(),
+    }))
 }
 
 fn eval_quote(arguments: &[Expr]) -> Result<Value, String> {
@@ -954,19 +1361,6 @@ fn eval_length(arguments: &[Value]) -> Result<Value, String> {
     list_length(list).map(Value::Integer)
 }
 
-fn eval_apply(arguments: &[Value]) -> Result<Value, String> {
-    let (callable, arguments) = arguments
-        .split_first()
-        .ok_or_else(|| "`apply` expects at least 2 arguments".to_string())?;
-    let (list, prefix) = arguments
-        .split_last()
-        .ok_or_else(|| "`apply` expects at least 2 arguments".to_string())?;
-
-    let mut applied_arguments = prefix.to_vec();
-    applied_arguments.extend(list_to_vec(list)?);
-    apply_callable(callable, &applied_arguments)
-}
-
 fn eval_type_predicate<F>(arguments: &[Value], name: &str, predicate: F) -> Result<Value, String>
 where
     F: FnOnce(&Value) -> bool,
@@ -1020,42 +1414,11 @@ fn list_to_vec(list: &Value) -> Result<Vec<Value>, String> {
     }
 }
 
-fn eval_and(
-    arguments: &[Expr],
-    environment: &Environment,
-    tail_position: bool,
-) -> Result<EvalOutcome, String> {
-    let Some((last, initial)) = arguments.split_last() else {
-        return Ok(EvalOutcome::Value(Value::Boolean(true)));
-    };
-
-    for argument in initial {
-        let value = eval_expr(argument, environment)?;
-        if !is_truthy(&value) {
-            return Ok(EvalOutcome::Value(value));
-        }
+fn symbol_name(expr: &Expr) -> Option<&str> {
+    match expr {
+        Expr::Symbol(name) => Some(name.as_str()),
+        _ => None,
     }
-
-    eval_expr_outcome(last, environment, tail_position)
-}
-
-fn eval_or(
-    arguments: &[Expr],
-    environment: &Environment,
-    tail_position: bool,
-) -> Result<EvalOutcome, String> {
-    let Some((last, initial)) = arguments.split_last() else {
-        return Ok(EvalOutcome::Value(Value::Boolean(false)));
-    };
-
-    for argument in initial {
-        let value = eval_expr(argument, environment)?;
-        if is_truthy(&value) {
-            return Ok(EvalOutcome::Value(value));
-        }
-    }
-
-    eval_expr_outcome(last, environment, tail_position)
 }
 
 fn expect_integer(value: &Value, operator: &str) -> Result<i64, String> {
