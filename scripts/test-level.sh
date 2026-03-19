@@ -18,9 +18,102 @@ else
 fi
 
 if [[ "$RUN_CLIPPY" == "true" ]]; then
-    echo "Running clippy..."
-    if ! cargo clippy -- -D warnings 2>&1; then
+    # ---------------------------------------------------------------------------
+    # Leveled clippy: thresholds tighten as levels increase.
+    #
+    # clippy.toml holds the baseline config (too-many-lines-threshold,
+    # excessive-nesting-threshold). We override per-level by writing a
+    # temporary clippy.toml with the leveled thresholds, then restore it.
+    #
+    # Function length (too-many-lines):
+    #   L01-L05: 80  (bootstrapping, design settling)
+    #   L06+:    60  (standard)
+    #
+    # Nesting depth (excessive-nesting):
+    #   All levels: 3 (consistent)
+    #
+    # Dead code:
+    #   L01-L05: allowed (forward-declared types)
+    #   L06+:    denied
+    # ---------------------------------------------------------------------------
+    LEVEL_NUM="${1:-all}"
+    CLIPPY_ALLOWS=""
+    FN_LIMIT=60
+
+    if [[ "$LEVEL_NUM" != "all" ]]; then
+        LN=$((10#$LEVEL_NUM))  # strip leading zero
+        if [[ "$LN" -le 5 ]]; then
+            CLIPPY_ALLOWS="-A dead_code"
+            FN_LIMIT=80
+        fi
+    fi
+
+    # Write leveled clippy.toml (backup and restore original)
+    cp clippy.toml clippy.toml.bak 2>/dev/null || true
+    cat > clippy.toml <<EOF
+too-many-lines-threshold = ${FN_LIMIT}
+excessive-nesting-threshold = 3
+EOF
+
+    echo "Running clippy --fix (auto-fixing trivial lints)..."
+    cargo clippy --fix --allow-dirty --allow-staged -- \
+        -D warnings \
+        -W clippy::too-many-lines \
+        -W clippy::excessive-nesting \
+        $CLIPPY_ALLOWS 2>&1 || true
+
+    echo "Running clippy (verify, fn limit=${FN_LIMIT})..."
+    if ! cargo clippy -- \
+        -D warnings \
+        -W clippy::too-many-lines \
+        -W clippy::excessive-nesting \
+        $CLIPPY_ALLOWS 2>&1; then
+
+        # Restore original clippy.toml
+        mv clippy.toml.bak clippy.toml 2>/dev/null || true
         echo "ERROR: clippy failed — fix warnings before testing"
+        exit 1
+    fi
+
+    # Restore original clippy.toml
+    mv clippy.toml.bak clippy.toml 2>/dev/null || true
+fi
+
+# ---------------------------------------------------------------------------
+# mod.rs size check (clippy can't enforce per-file line limits)
+# ---------------------------------------------------------------------------
+check_mod_size() {
+    local level="$1"
+
+    # Leveled ramp:
+    #   L01-L03: 300 (bootstrapping parser + basic eval)
+    #   L04-L06: 200 (must split: builtins/special_forms out)
+    #   L07+:    100 (mod.rs is thin: just entry point + reexports)
+    local mod_limit=100
+    if [[ "$level" -le 3 ]]; then
+        mod_limit=300
+    elif [[ "$level" -le 6 ]]; then
+        mod_limit=200
+    fi
+
+    local mod_file="src/scheme/mod.rs"
+    if [[ -f "$mod_file" ]]; then
+        local impl_lines
+        impl_lines=$(sed -n '1,/^#\[cfg(test)\]/p' "$mod_file" | wc -l)
+        if [[ "$impl_lines" -gt "$mod_limit" ]]; then
+            echo "ERROR: mod.rs has $impl_lines impl lines (limit for L$(printf '%02d' "$level"): $mod_limit)."
+            echo "  Extract implementation into submodules (eval.rs, builtins.rs, special_forms.rs, etc.)."
+            return 1
+        fi
+    fi
+}
+
+# Only run mod.rs size check on leveled runs (not "all")
+if [[ "${1:-}" != "all" && -n "${1:-}" ]]; then
+    LN=$((10#$1))
+    if ! check_mod_size "$LN"; then
+        echo ""
+        echo "Fix structural violations before testing. See CLAUDE.md 'File Structure'."
         exit 1
     fi
 fi
