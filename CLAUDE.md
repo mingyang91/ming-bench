@@ -8,8 +8,8 @@ These checks run automatically before every test. The script will **reject your 
 
 1. **`mod.rs` impl line count** (bash check in `test-level.sh`):
    - L01–L03: ≤ 300 lines (bootstrapping)
-   - L04–L06: ≤ 200 lines (must split builtins/special_forms out)
-   - L07+: ≤ 100 lines (mod.rs is thin: entry point + reexports only)
+   - L04–L06: ≤ 200 lines (time to split into submodules)
+   - L07+: ≤ 100 lines (mod.rs should only contain entry point + reexports)
 2. **Function body length** (`clippy::too-many-lines` via leveled `clippy.toml`):
    - L01–L05: ≤ 80 lines
    - L06+: ≤ 60 lines
@@ -80,23 +80,11 @@ These checks run automatically before every test. The script will **reject your 
 - The empty list prints as `()`
 - Strings print with surrounding quotes: `"hello"`
 
-## File Structure (REQUIRED)
+## File Structure
 
-`mod.rs` is ONLY for: module declarations, re-exports, `eval_str` entry point, and the `Trampoline` enum. ALL implementation logic MUST go in submodules. Line limit for `mod.rs` is enforced by `test-level.sh` (see Quality Gate item 1).
+`mod.rs` should only contain module declarations, re-exports, and the `eval_str` entry point. Split implementation logic into submodules organized by responsibility. The mod.rs line limit (see Quality Gate item 1) enforces this — when you hit the limit, extract a submodule.
 
-| File | Responsibility |
-|------|---------------|
-| `mod.rs` | Exports + `eval_str` + `Trampoline` (limit: see Quality Gate) |
-| `types.rs` | `Value` enum, `Display`, `PartialEq` |
-| `parser.rs` | Tokenizer, parser |
-| `env.rs` | Environment / scoping |
-| `eval.rs` | `eval`, `eval_inner`, `eval_list_tco`, apply, bind_params |
-| `special_forms.rs` | `define`, `if`, `lambda`, `let`, `cond`, `and`, `or`, `set!`, `quote` |
-| `builtins.rs` | Arithmetic, comparisons, list ops, type predicates |
-| `continuations.rs` | `call/cc`, continuation capture/invoke, eval context |
-| `macros.rs` | `syntax-rules`, macro expansion |
-
-Create files as needed when you reach the relevant level. Do NOT put evaluator, builtins, or special forms in `mod.rs`.
+How you organize submodules is up to you. Choose a structure that groups related logic and keeps each file focused on one responsibility.
 
 ## Code Rules (MANDATORY)
 
@@ -116,11 +104,10 @@ Create files as needed when you reach the relevant level. Do NOT put evaluator, 
 - **`collect::<Result<Vec<_>, _>>()?`** for fallible transforms.
 - **Slice patterns** (`[first, rest @ ..]`) over indexing (`args[0]`, `&args[1..]`).
 - **No `vec.insert(0, x)` or `vec.remove(0)`** — build new vecs instead.
-- **No duplicated dispatch tables.** One builtin dispatch function, not two.
 
 ### Observability
-- **`log::debug!`** at eval dispatch, special form dispatch, call/cc paths.
-- **`debug_assert!`** after env operations, after param binding, on structural invariants.
+- **`log::debug!`** at key decision points (e.g. dispatch, error paths).
+- **`debug_assert!`** on structural invariants after operations that establish them.
 
 ### Compiler Discipline
 - `#![deny(warnings)]` and `#![deny(clippy::unwrap_used)]` in `src/lib.rs`. Do not remove.
