@@ -106,6 +106,11 @@ pub(super) enum Builtin {
     IsNull,
     List,
     Length,
+    IsString,
+    IsNumber,
+    IsBoolean,
+    IsPair,
+    IsSymbol,
 }
 
 impl Builtin {
@@ -126,6 +131,11 @@ impl Builtin {
             Self::IsNull => "null?",
             Self::List => "list",
             Self::Length => "length",
+            Self::IsString => "string?",
+            Self::IsNumber => "number?",
+            Self::IsBoolean => "boolean?",
+            Self::IsPair => "pair?",
+            Self::IsSymbol => "symbol?",
         }
     }
 
@@ -146,6 +156,21 @@ impl Builtin {
             Self::IsNull => eval_is_null(arguments),
             Self::List => eval_list(arguments),
             Self::Length => eval_length(arguments),
+            Self::IsString => eval_type_predicate(arguments, "string?", |value| {
+                matches!(value, Value::String(_))
+            }),
+            Self::IsNumber => eval_type_predicate(arguments, "number?", |value| {
+                matches!(value, Value::Integer(_))
+            }),
+            Self::IsBoolean => eval_type_predicate(arguments, "boolean?", |value| {
+                matches!(value, Value::Boolean(_))
+            }),
+            Self::IsPair => eval_type_predicate(arguments, "pair?", |value| {
+                matches!(value, Value::Pair(_, _))
+            }),
+            Self::IsSymbol => eval_type_predicate(arguments, "symbol?", |value| {
+                matches!(value, Value::Symbol(_))
+            }),
         }
     }
 }
@@ -190,6 +215,11 @@ fn global_environment() -> Environment {
         Builtin::IsNull,
         Builtin::List,
         Builtin::Length,
+        Builtin::IsString,
+        Builtin::IsNumber,
+        Builtin::IsBoolean,
+        Builtin::IsPair,
+        Builtin::IsSymbol,
     ] {
         define_binding(
             &environment,
@@ -703,6 +733,17 @@ fn eval_length(arguments: &[Value]) -> Result<Value, String> {
     };
 
     list_length(list).map(Value::Integer)
+}
+
+fn eval_type_predicate<F>(arguments: &[Value], name: &str, predicate: F) -> Result<Value, String>
+where
+    F: FnOnce(&Value) -> bool,
+{
+    let [value] = arguments else {
+        return Err(format!("`{name}` expects exactly 1 argument"));
+    };
+
+    Ok(Value::Boolean(predicate(value)))
 }
 
 fn build_list(values: &[Value]) -> Value {
