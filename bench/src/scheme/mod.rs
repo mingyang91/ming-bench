@@ -1,8 +1,12 @@
 mod parser;
 mod types;
 
+use std::collections::HashMap;
+
 use parser::Parser;
 use types::Value;
+
+type Env = HashMap<String, Value>;
 
 /// Evaluate one or more Scheme expressions and return the string
 /// representation of the last result.
@@ -14,9 +18,10 @@ use types::Value;
 /// ```
 pub fn eval_str(input: &str) -> Result<String, String> {
     let exprs = Parser::new(input).parse_all().map_err(|e| e.to_string())?;
+    let mut env = Env::new();
     let mut result = Value::Void;
     for expr in exprs {
-        result = eval(&expr)?;
+        result = eval(&expr, &mut env)?;
     }
     match result {
         Value::Void => Err("no expression to evaluate".into()),
@@ -24,10 +29,13 @@ pub fn eval_str(input: &str) -> Result<String, String> {
     }
 }
 
-fn eval(expr: &Value) -> Result<Value, String> {
+fn eval(expr: &Value, env: &mut Env) -> Result<Value, String> {
     match expr {
         Value::Integer(_) | Value::Boolean(_) | Value::String(_) => Ok(expr.clone()),
-        Value::Symbol(name) => Err(format!("unbound variable: {name}")),
+        Value::Symbol(name) => env
+            .get(name)
+            .cloned()
+            .ok_or_else(|| format!("unbound variable: {name}")),
         Value::List(elems) => {
             if elems.is_empty() {
                 return Err("empty application".into());
@@ -37,12 +45,15 @@ fn eval(expr: &Value) -> Result<Value, String> {
                 other => return Err(format!("not a procedure: {other}")),
             };
             match op {
-                "and" => eval_and(&elems[1..]),
-                "or" => eval_or(&elems[1..]),
+                "define" => eval_define(&elems[1..], env),
+                "if" => eval_if(&elems[1..], env),
+                "quote" => eval_quote(&elems[1..]),
+                "and" => eval_and(&elems[1..], env),
+                "or" => eval_or(&elems[1..], env),
                 _ => {
                     let args: Vec<Value> = elems[1..]
                         .iter()
-                        .map(eval)
+                        .map(|e| eval(e, env))
                         .collect::<Result<_, _>>()?;
                     apply_primitive(op, &args)
                 }
@@ -56,10 +67,44 @@ fn is_truthy(v: &Value) -> bool {
     !matches!(v, Value::Boolean(false))
 }
 
-fn eval_and(exprs: &[Value]) -> Result<Value, String> {
+fn eval_define(args: &[Value], env: &mut Env) -> Result<Value, String> {
+    if args.len() != 2 {
+        return Err(format!("define requires 2 arguments, got {}", args.len()));
+    }
+    let name = match &args[0] {
+        Value::Symbol(s) => s.clone(),
+        other => return Err(format!("define: expected symbol, got {other}")),
+    };
+    let val = eval(&args[1], env)?;
+    env.insert(name, val);
+    Ok(Value::Void)
+}
+
+fn eval_if(args: &[Value], env: &mut Env) -> Result<Value, String> {
+    if args.len() < 2 || args.len() > 3 {
+        return Err(format!("if requires 2-3 arguments, got {}", args.len()));
+    }
+    let cond = eval(&args[0], env)?;
+    if is_truthy(&cond) {
+        eval(&args[1], env)
+    } else if args.len() == 3 {
+        eval(&args[2], env)
+    } else {
+        Ok(Value::Void)
+    }
+}
+
+fn eval_quote(args: &[Value]) -> Result<Value, String> {
+    if args.len() != 1 {
+        return Err(format!("quote requires 1 argument, got {}", args.len()));
+    }
+    Ok(args[0].clone())
+}
+
+fn eval_and(exprs: &[Value], env: &mut Env) -> Result<Value, String> {
     let mut result = Value::Boolean(true);
     for expr in exprs {
-        result = eval(expr)?;
+        result = eval(expr, env)?;
         if !is_truthy(&result) {
             return Ok(result);
         }
@@ -67,10 +112,10 @@ fn eval_and(exprs: &[Value]) -> Result<Value, String> {
     Ok(result)
 }
 
-fn eval_or(exprs: &[Value]) -> Result<Value, String> {
+fn eval_or(exprs: &[Value], env: &mut Env) -> Result<Value, String> {
     let mut result = Value::Boolean(false);
     for expr in exprs {
-        result = eval(expr)?;
+        result = eval(expr, env)?;
         if is_truthy(&result) {
             return Ok(result);
         }
