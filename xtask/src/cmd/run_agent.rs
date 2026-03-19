@@ -134,9 +134,11 @@ pub fn run(args: RunAgentArgs) -> Result<()> {
             });
         }
         let claude_md = agent_workdir.join("CLAUDE.md");
+        let _ = fs::remove_file(&claude_md);
         std::os::unix::fs::symlink(&strategy_src, &claude_md)
             .map_err(|e| Error::io(&claude_md, e))?;
         let agents_md = agent_workdir.join("AGENTS.md");
+        let _ = fs::remove_file(&agents_md);
         std::os::unix::fs::symlink("CLAUDE.md", &agents_md)
             .map_err(|e| Error::io(&agents_md, e))?;
         println!("Strategy:   {} → CLAUDE.md", strategy_src);
