@@ -73,6 +73,9 @@ fn eval_special_form(
         "if" => eval_if(operands, environment).map(Some),
         "quote" => eval_quote(operands).map(Some),
         "lambda" => eval_lambda(operands, environment).map(Some),
+        "begin" => eval_begin(operands, environment).map(Some),
+        "cond" => eval_cond(operands, environment).map(Some),
+        "let" => eval_let(operands, environment).map(Some),
         _ => Ok(None),
     }
 }
@@ -171,6 +174,206 @@ fn eval_lambda(operands: &[Expr], environment: &Environment) -> Result<Value, Sc
             operator: "lambda",
             min: 2,
             actual: operands.len(),
+        }),
+    }
+}
+
+fn eval_begin(operands: &[Expr], environment: &Environment) -> Result<Value, SchemeError> {
+    if operands.is_empty() {
+        Err(SchemeError::TooFewArguments {
+            operator: "begin",
+            min: 1,
+            actual: 0,
+        })
+    } else {
+        eval_sequence(operands, environment)
+    }
+}
+
+fn eval_cond(operands: &[Expr], environment: &Environment) -> Result<Value, SchemeError> {
+    if operands.is_empty() {
+        return Err(SchemeError::TooFewArguments {
+            operator: "cond",
+            min: 1,
+            actual: 0,
+        });
+    }
+
+    validate_cond_clauses(operands)?;
+
+    for clause in operands {
+        if let Some(value) = eval_cond_clause(clause, environment)? {
+            return Ok(value);
+        }
+    }
+
+    Ok(Value::Void)
+}
+
+fn validate_cond_clauses(clauses: &[Expr]) -> Result<(), SchemeError> {
+    let Some((last_clause, preceding_clauses)) = clauses.split_last() else {
+        return Ok(());
+    };
+
+    for clause in preceding_clauses {
+        validate_cond_clause(clause, false)?;
+    }
+
+    validate_cond_clause(last_clause, true)
+}
+
+fn validate_cond_clause(clause: &Expr, is_last: bool) -> Result<(), SchemeError> {
+    let Expr::List(parts) = clause else {
+        return Err(SchemeError::InvalidCondClause {
+            found: expression_kind(clause),
+        });
+    };
+
+    let Some((predicate, body)) = parts.split_first() else {
+        return Err(SchemeError::TooFewArguments {
+            operator: "cond clause",
+            min: 1,
+            actual: 0,
+        });
+    };
+
+    if is_else_symbol(predicate) {
+        if !is_last {
+            return Err(SchemeError::CondElseNotLast);
+        }
+
+        if body.is_empty() {
+            return Err(SchemeError::TooFewArguments {
+                operator: "cond else",
+                min: 1,
+                actual: 0,
+            });
+        }
+    }
+
+    Ok(())
+}
+
+fn eval_cond_clause(clause: &Expr, environment: &Environment) -> Result<Option<Value>, SchemeError> {
+    let Expr::List(parts) = clause else {
+        unreachable!("cond clauses are validated before evaluation");
+    };
+    let Some((predicate, body)) = parts.split_first() else {
+        unreachable!("cond clauses are validated before evaluation");
+    };
+
+    if is_else_symbol(predicate) {
+        return eval_cond_else(body, environment).map(Some);
+    }
+
+    let predicate_value = eval_expr(predicate, environment)?;
+    if !predicate_value.is_truthy() {
+        return Ok(None);
+    }
+
+    if body.is_empty() {
+        Ok(Some(predicate_value))
+    } else {
+        eval_sequence(body, environment).map(Some)
+    }
+}
+
+fn eval_cond_else(body: &[Expr], environment: &Environment) -> Result<Value, SchemeError> {
+    if body.is_empty() {
+        return Err(SchemeError::TooFewArguments {
+            operator: "cond else",
+            min: 1,
+            actual: 0,
+        });
+    }
+
+    eval_sequence(body, environment)
+}
+
+fn eval_let(operands: &[Expr], environment: &Environment) -> Result<Value, SchemeError> {
+    match operands {
+        [bindings_expression, body @ ..] if !body.is_empty() => {
+            let bindings = eval_let_bindings(bindings_expression, environment)?;
+            let let_environment = environment.child();
+
+            for (name, value) in bindings {
+                let_environment.define(&name, value);
+            }
+
+            eval_sequence(body, &let_environment)
+        }
+        _ => Err(SchemeError::TooFewArguments {
+            operator: "let",
+            min: 2,
+            actual: operands.len(),
+        }),
+    }
+}
+
+fn eval_let_bindings(
+    bindings_expression: &Expr,
+    environment: &Environment,
+) -> Result<Vec<(String, Value)>, SchemeError> {
+    let bindings = parse_let_bindings(bindings_expression)?;
+
+    bindings
+        .into_iter()
+        .map(|(name, value_expression)| {
+            eval_expr(value_expression, environment).map(|value| (name.to_owned(), value))
+        })
+        .collect()
+}
+
+fn parse_let_bindings(bindings_expression: &Expr) -> Result<Vec<(&str, &Expr)>, SchemeError> {
+    let Expr::List(bindings) = bindings_expression else {
+        return Err(SchemeError::InvalidBindingList {
+            operator: "let",
+            found: expression_kind(bindings_expression),
+        });
+    };
+
+    let mut parsed_bindings = Vec::with_capacity(bindings.len());
+    let mut seen = HashSet::with_capacity(bindings.len());
+
+    for binding in bindings {
+        let (name, value_expression) = parse_let_binding(binding)?;
+
+        if !seen.insert(name.to_owned()) {
+            return Err(SchemeError::DuplicateBinding {
+                operator: "let",
+                name: name.to_owned(),
+            });
+        }
+
+        parsed_bindings.push((name, value_expression));
+    }
+
+    Ok(parsed_bindings)
+}
+
+fn parse_let_binding(binding: &Expr) -> Result<(&str, &Expr), SchemeError> {
+    let Expr::List(parts) = binding else {
+        return Err(SchemeError::InvalidBinding {
+            operator: "let",
+            found: expression_kind(binding),
+        });
+    };
+
+    match parts.as_slice() {
+        [Expr::Symbol(name), value_expression] => Ok((name.as_str(), value_expression)),
+        [Expr::Symbol(_), ..] => Err(SchemeError::WrongArgumentCount {
+            operator: "let binding",
+            expected: 2,
+            actual: parts.len(),
+        }),
+        [name, ..] => Err(SchemeError::InvalidBindingName {
+            operator: "let",
+            found: expression_kind(name),
+        }),
+        [] => Err(SchemeError::WrongArgumentCount {
+            operator: "let binding",
+            expected: 2,
+            actual: 0,
         }),
     }
 }
@@ -543,6 +746,10 @@ fn is_builtin(operator: &str) -> bool {
             | "list"
             | "length"
     )
+}
+
+fn is_else_symbol(expression: &Expr) -> bool {
+    matches!(expression, Expr::Symbol(symbol) if symbol == "else")
 }
 
 fn expression_kind(expression: &Expr) -> &'static str {

@@ -55,6 +55,26 @@ pub(crate) enum SchemeError {
     },
     #[error("`define` expected a symbol name but got {found}")]
     InvalidDefinitionTarget { found: &'static str },
+    #[error("`{operator}` expected a binding list but got {found}")]
+    InvalidBindingList {
+        operator: &'static str,
+        found: &'static str,
+    },
+    #[error("`{operator}` expected a binding pair but got {found}")]
+    InvalidBinding {
+        operator: &'static str,
+        found: &'static str,
+    },
+    #[error("`{operator}` binding expected a symbol name but got {found}")]
+    InvalidBindingName {
+        operator: &'static str,
+        found: &'static str,
+    },
+    #[error("`{operator}` has duplicate binding `{name}`")]
+    DuplicateBinding {
+        operator: &'static str,
+        name: String,
+    },
     #[error("`{operator}` expected a parameter list but got {found}")]
     InvalidParameterList {
         operator: &'static str,
@@ -72,6 +92,10 @@ pub(crate) enum SchemeError {
     },
     #[error("procedure expected exactly {expected} argument(s) but got {actual}")]
     WrongProcedureArgumentCount { expected: usize, actual: usize },
+    #[error("`cond` expected a clause list but got {found}")]
+    InvalidCondClause { found: &'static str },
+    #[error("`cond` else clause must be last")]
+    CondElseNotLast,
     #[error("cannot divide by zero")]
     DivisionByZero,
 }
