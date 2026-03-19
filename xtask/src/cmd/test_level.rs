@@ -8,7 +8,7 @@ pub fn run(level: &str) -> Result<()> {
     let proj = project_dir();
 
     // --- Quality gates (only when clippy.toml exists) ---
-    let clippy_toml = proj.join("clippy.toml");
+    let clippy_toml = proj.join("bench/clippy.toml");
     if clippy_toml.is_file() {
         quality_gates(&proj, level)?;
     }
@@ -60,8 +60,8 @@ pub fn run(level: &str) -> Result<()> {
 }
 
 fn quality_gates(proj: &Path, level: &str) -> Result<()> {
-    let clippy_toml = proj.join("clippy.toml");
-    let clippy_bak = proj.join("clippy.toml.bak");
+    let clippy_toml = proj.join("bench/clippy.toml");
+    let clippy_bak = proj.join("bench/clippy.toml.bak");
 
     // Determine limits based on level
     let (fn_limit, allow_dead_code) = if level != "all" {
@@ -143,7 +143,7 @@ fn check_mod_size(proj: &Path, level: u32) -> Result<()> {
         100
     };
 
-    let mod_file = proj.join("src/scheme/mod.rs");
+    let mod_file = proj.join("bench/src/scheme/mod.rs");
     if !mod_file.is_file() {
         return Ok(());
     }

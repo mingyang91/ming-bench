@@ -57,6 +57,8 @@ pub fn run(args: RunAgentArgs) -> Result<()> {
         .expect("project has no parent dir")
         .join("workspace")
         .join(&args.name);
+    // Agent sees bench/ as its working directory
+    let agent_workdir = worktree_dir.join("bench");
 
     // --- Results dir ---
     let results_dir = if args.resume {
@@ -196,7 +198,7 @@ pub fn run(args: RunAgentArgs) -> Result<()> {
             let level_start = Instant::now();
             agent_exit = launch_agent(
                 &args.agent,
-                &worktree_dir,
+                &agent_workdir,
                 &level_prompt,
                 &level_uuid,
                 &level_dir.join("agent-output.txt"),
@@ -242,7 +244,7 @@ pub fn run(args: RunAgentArgs) -> Result<()> {
 
         agent_exit = launch_agent(
             &args.agent,
-            &worktree_dir,
+            &agent_workdir,
             prompt,
             &session_uuid,
             &results_dir.join("agent-output.txt"),
@@ -599,7 +601,7 @@ fn build_level_prompt(level: &str, worktree_dir: &Path, results_dir: &Path) -> S
     summary.push_str("Files under src/scheme/:\n");
 
     // List .rs files with line counts
-    if let Ok(entries) = fs::read_dir(worktree_dir.join("src/scheme")) {
+    if let Ok(entries) = fs::read_dir(worktree_dir.join("bench/src/scheme")) {
         let mut files: Vec<(String, usize)> = entries
             .flatten()
             .filter_map(|e| {

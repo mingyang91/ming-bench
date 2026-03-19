@@ -1,64 +1,47 @@
-# CS 61A Scheme Interpreter Benchmark
+# CS 61A Benchmark Framework (Jug)
 
-Implement a Scheme interpreter in Rust.
+This is the benchmark framework that orchestrates coding agent evaluation. The agent workspace lives in `bench/` — do NOT modify test cases or agent instructions without understanding the experimental design.
 
-## Contract
+## Architecture
 
-- Implement `eval_str` in `src/scheme/mod.rs`
-- You may create any additional modules/files under `src/scheme/`
-- Do NOT modify test functions
-- Allowed external crates: `thiserror`, `log`, `env_logger` (already in Cargo.toml). Do NOT add any others.
-- **NEVER run `cargo test` directly on the host.** Always use `cargo xtask test`. Bare `cargo test` risks infinite loops and OOM that crash the host. This rule has NO exceptions.
+- **`bench/`** — Agent playground. Contains the Scheme interpreter crate, test suite, and agent-facing `CLAUDE.md`. Agents only see this directory.
+- **`xtask/`** — CLI tooling for orchestration, scoring, token analysis, and monitoring.
+- **`Dockerfile.bench`** — Container image for sandboxed test execution.
+- **`results/`** — Run data (gitignored). Each run gets a timestamped directory.
 
 ## Build & Test
 
-`cargo xtask test` handles everything: release build and containerized test execution. Just run it.
-
 ```bash
-cargo xtask test 01   # test level 1
-cargo xtask test 05   # test level 5
-cargo xtask test all  # test all levels (300s timeout)
+cargo xtask setup            # install podman, build container image
+cargo xtask test 01          # run level 1 tests (containerized)
+cargo xtask test all         # run all levels
+cargo xtask run-agent ...    # orchestrate a full agent run
+cargo xtask results          # tabular summary of all runs
+cargo xtask tokens --all     # token usage and cost estimates
+cargo xtask analyze --all    # request-level cost analysis
+cargo xtask watch            # live dashboard of running agents
+cargo xtask verify           # ground-truth check against Guile
 ```
 
-- A level argument is required (e.g., `01`, `16`, or `all`)
-- Tests run in a container with 1GB memory, 1 CPU
-- Per-level timeout: 30s. Full suite (`all`): 300s. Exceeding these or OOM = failing
-- Build the container image first if not already built: `cargo xtask setup`
+## Adding an xtask Command
 
-## Development Strategy
+1. Create `xtask/src/cmd/<name>.rs` with a `pub fn run(...) -> Result<()>`
+2. Add `pub mod <name>;` to `xtask/src/cmd/mod.rs`
+3. Add a variant to `Commands` enum in `xtask/src/main.rs`
+4. Wire it in the `match` block in `main()`
 
-- **Implement levels in order (L1 → L16).** Each level builds on the previous.
-- **After implementing each level, run its tests before moving on.**
-- **Do not skip ahead.** Later levels depend on earlier ones being correct.
-- **If a level's tests fail, fix them before proceeding.**
-- **Rely on the provided level tests as the source of truth.**
+Shared types and helpers live in `xtask/src/model.rs`.
 
-## Levels (implement in order)
+## Two-Branch Experiment
 
-1. **Atoms** — self-evaluating: integers, booleans, strings
-2. **Arithmetic** — `+`, `-`, `*`, `/` (variadic, nested)
-3. **Comparisons** — `<`, `>`, `=`, `<=`, `not`, `and`, `or`
-4. **Define & If** — variable binding, conditionals, `quote`
-5. **Lambda** — closures, define shorthand `(define (f x) ...)`, recursion
-6. **Lists** — `cons`, `car`, `cdr`, `null?`, `list`, `length`
-7. **Recursive list programs** — user-defined `map`, `filter`, `append`, `reverse`
-8. **Let, begin, cond** — local bindings, sequencing, multi-branch conditionals
-9. **Type predicates** — `string?`, `number?`, `boolean?`, `pair?`, `symbol?`
-10. **Tail call optimization** — no stack overflow on deep tail recursion
-11. **set! and mutation** — `set!`, mutable closures, shared state
-12. **Variadic & apply** — rest args `(define (f x . rest) ...)`, `apply`
-13. **Tail position in all forms** — TCO through `cond`, named `let`, `and`/`or`, `begin`
-14. **First-class continuations** — `call/cc`, non-local exits, saved/reentrant continuations
-15. **Hygienic macros** — `define-syntax`, `syntax-rules`, ellipsis patterns
-16. **Comprehensive integration** — call/cc + macros + mutation + TCO combined
+- **`main`** — Minimal agent instructions in `bench/CLAUDE.md`
+- **`strategy`** — Enhanced instructions with quality gates and code style rules
 
-## Notes
+Only `bench/CLAUDE.md` differs between branches. Framework code (xtask, Dockerfile) is identical. When making framework changes, commit to one branch and cherry-pick to the other.
 
-- `eval_str` receives one or more expressions separated by spaces (e.g. `"(define x 5) x"`)
-- It should return the string representation of the **last** expression's result
-- Side-effect-only forms (`define`, `set!`) return a void/nil value — the tests only check the result of the final expression, so `"(define x 5) x"` → `"5"`
-- Return `Err(...)` for evaluation errors (unbound variable, wrong arg count, etc.)
-- Booleans print as `#t` / `#f`
-- Lists print as `(1 2 3)` with spaces between elements
-- The empty list prints as `()`
-- Strings print with surrounding quotes: `"hello"`
+## Key Conventions
+
+- Tests NEVER run on the host — always containerized via `cargo xtask test`
+- Agent worktrees are created at `<repo>/../workspace/<name>`
+- Agent cwd is set to `<worktree>/bench/` so agents only see the playground
+- `project_dir()` in `model.rs` finds the workspace root by walking up for `[workspace]` in Cargo.toml
