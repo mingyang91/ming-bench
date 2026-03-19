@@ -1,7 +1,46 @@
+use std::cell::RefCell;
+use std::rc::Rc;
+
 use super::builtins::{call_builtin_on_values, eval_builtin, is_builtin, is_false};
 use super::eval;
-use super::expr::{Env, Expr};
+use super::expr::{ContData, Env, Expr};
 use super::forms::{eval_define, eval_lambda, eval_quote, parse_let_binding};
+
+// Thread-local state for continuation support.
+
+pub(super) struct ContSignal {
+    pub value: Expr,
+    pub remaining_exprs: Vec<Expr>,
+}
+
+pub(super) struct TopLevelContext {
+    pub remaining_exprs: Vec<Expr>,
+    pub env: Env,
+}
+
+thread_local! {
+    static CONT_SIGNAL: RefCell<Option<ContSignal>> = const { RefCell::new(None) };
+    static CALLCC_REPLAY: RefCell<Option<Expr>> = const { RefCell::new(None) };
+    static TOP_LEVEL_CONTEXT: RefCell<Option<TopLevelContext>> = const { RefCell::new(None) };
+}
+
+pub(super) fn take_cont_signal() -> Option<ContSignal> {
+    CONT_SIGNAL.with(|s| s.borrow_mut().take())
+}
+
+pub(super) fn set_callcc_replay(val: Expr) {
+    CALLCC_REPLAY.with(|r| *r.borrow_mut() = Some(val));
+}
+
+pub(super) fn set_top_level_context(ctx: TopLevelContext) {
+    TOP_LEVEL_CONTEXT.with(|c| *c.borrow_mut() = Some(ctx));
+}
+
+pub(super) fn clear_continuation_state() {
+    CONT_SIGNAL.with(|s| *s.borrow_mut() = None);
+    CALLCC_REPLAY.with(|r| *r.borrow_mut() = None);
+    TOP_LEVEL_CONTEXT.with(|c| *c.borrow_mut() = None);
+}
 
 /// Trampoline result: either a final value or a tail call to continue.
 pub enum Bounce {
@@ -16,7 +55,9 @@ pub fn eval_step(expr: &Expr, env: &Env) -> Result<Bounce, String> {
             .get(name)
             .map(Bounce::Done)
             .ok_or_else(|| format!("unbound variable: {name}")),
-        Expr::Lambda { .. } | Expr::Builtin(_) => Ok(Bounce::Done(expr.clone())),
+        Expr::Lambda { .. } | Expr::Builtin(_) | Expr::Continuation(_) => {
+            Ok(Bounce::Done(expr.clone()))
+        }
         Expr::List(elems) => eval_list_step(elems, env),
         _ => Err(format!("cannot evaluate: {}", expr.to_display())),
     }
@@ -64,6 +105,13 @@ fn try_special_form(elems: &[Expr], env: &Env) -> Result<Option<Bounce>, String>
         "cond" => bounce_cond(args, env).map(Some),
         "and" => bounce_and(args, env).map(Some),
         "or" => bounce_or(args, env).map(Some),
+        "call/cc" | "call-with-current-continuation" => {
+            if args.len() != 1 {
+                return Err("call/cc requires exactly one argument".into());
+            }
+            let func = eval(&args[0], env)?;
+            handle_callcc(&func).map(Some)
+        }
         name if is_builtin(name) => eval_builtin(name, args, env).map(|v| Some(Bounce::Done(v))),
         _ => Ok(None),
     }
@@ -205,6 +253,24 @@ pub fn apply_proc(proc: &Expr, args: &[Expr]) -> Result<Bounce, String> {
         Expr::Lambda { params, rest, body, env: captured_env } => {
             apply_lambda(params, rest.as_deref(), body, captured_env, args)
         }
+        Expr::Continuation(data) => {
+            if args.len() != 1 {
+                return Err("continuation requires exactly one argument".into());
+            }
+            CONT_SIGNAL.with(|s| {
+                *s.borrow_mut() = Some(ContSignal {
+                    value: args[0].clone(),
+                    remaining_exprs: data.remaining_exprs.clone(),
+                });
+            });
+            Err("__CONTINUATION_INVOKED__".into())
+        }
+        Expr::Builtin(name) if name == "call/cc" => {
+            if args.len() != 1 {
+                return Err("call/cc requires one argument".into());
+            }
+            handle_callcc(&args[0])
+        }
         Expr::Builtin(name) if name == "apply" => eval_apply_values(args),
         Expr::Builtin(name) => {
             let result = call_builtin_on_values(name, args.to_vec())?;
@@ -238,6 +304,27 @@ fn apply_lambda(
     Ok(Bounce::TailCall { expr: body.clone(), env: call_env })
 }
 
+fn handle_callcc(func: &Expr) -> Result<Bounce, String> {
+    // Check if this is a replay (continuation was invoked and we're re-executing).
+    let replay_val = CALLCC_REPLAY.with(|r| r.borrow_mut().take());
+    if let Some(val) = replay_val {
+        return Ok(Bounce::Done(val));
+    }
+
+    // Read the current top-level context to capture in the continuation.
+    let ctx = TOP_LEVEL_CONTEXT.with(|c| {
+        c.borrow().as_ref().map(|ctx| (ctx.remaining_exprs.clone(), ctx.env.clone()))
+    });
+    let (remaining_exprs, ctx_env) = ctx.unwrap_or_else(|| (vec![], Env::new()));
+
+    let cont = Expr::Continuation(Rc::new(ContData {
+        remaining_exprs,
+        env: ctx_env,
+    }));
+
+    apply_proc(func, &[cont])
+}
+
 fn eval_apply_values(args: &[Expr]) -> Result<Bounce, String> {
     if args.len() < 2 {
         return Err("apply requires at least two arguments".into());
@@ -250,4 +337,33 @@ fn eval_apply_values(args: &[Expr]) -> Result<Bounce, String> {
     let mut all_args: Vec<Expr> = args[1..args.len() - 1].to_vec();
     all_args.extend_from_slice(tail_args);
     apply_proc(proc, &all_args)
+}
+
+pub(super) fn run_top_level(exprs: &[Expr], env: &Env) -> Result<String, String> {
+    let mut current = exprs.to_vec();
+    loop {
+        match eval_sequence(&current, env) {
+            Ok(Expr::Void) => return Err("no displayable value".into()),
+            Ok(val) => return Ok(val.to_display()),
+            Err(e) => match take_cont_signal() {
+                Some(sig) => {
+                    set_callcc_replay(sig.value);
+                    current = sig.remaining_exprs;
+                }
+                None => return Err(e),
+            },
+        }
+    }
+}
+
+fn eval_sequence(exprs: &[Expr], env: &Env) -> Result<Expr, String> {
+    let mut result = Expr::Void;
+    for i in 0..exprs.len() {
+        set_top_level_context(TopLevelContext {
+            remaining_exprs: exprs[i..].to_vec(),
+            env: env.clone(),
+        });
+        result = eval(&exprs[i], env)?;
+    }
+    Ok(result)
 }

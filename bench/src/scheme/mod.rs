@@ -7,30 +7,28 @@ mod trampoline;
 use builtins::BUILTIN_NAMES;
 use expr::{Env, Expr};
 use parser::Parser;
-use trampoline::{eval_step, Bounce};
+use trampoline::{
+    clear_continuation_state, eval_step, run_top_level, Bounce,
+};
 
 pub fn eval_str(input: &str) -> Result<String, String> {
     let tokens = parser::tokenize(input)?;
     let mut parser = Parser::new(&tokens);
     let exprs = parser.parse_all()?;
-
     if exprs.is_empty() {
         return Err("no expression".into());
     }
-
     let env = Env::new();
     for &name in BUILTIN_NAMES {
         env.insert(name.to_string(), Expr::Builtin(name.to_string()));
     }
-    let mut result = Expr::Void;
-    for expr in exprs {
-        result = eval(&expr, &env)?;
-    }
-
-    match result {
-        Expr::Void => Err("no displayable value".into()),
-        _ => Ok(result.to_display()),
-    }
+    env.insert("call/cc".to_string(), Expr::Builtin("call/cc".to_string()));
+    env.insert(
+        "call-with-current-continuation".to_string(),
+        Expr::Builtin("call/cc".to_string()),
+    );
+    clear_continuation_state();
+    run_top_level(&exprs, &env)
 }
 
 pub(crate) fn eval(expr: &Expr, env: &Env) -> Result<Expr, String> {

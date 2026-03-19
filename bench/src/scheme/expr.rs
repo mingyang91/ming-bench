@@ -68,7 +68,28 @@ pub enum Expr {
         env: Env,
     },
     Builtin(String),
+    Continuation(Rc<ContData>),
     Void,
+}
+
+pub struct ContData {
+    pub remaining_exprs: Vec<Expr>,
+    pub env: Env,
+}
+
+impl std::fmt::Debug for ContData {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("#<continuation>")
+    }
+}
+
+impl Clone for ContData {
+    fn clone(&self) -> Self {
+        ContData {
+            remaining_exprs: self.remaining_exprs.clone(),
+            env: self.env.clone(),
+        }
+    }
 }
 
 impl PartialEq for Expr {
@@ -80,6 +101,7 @@ impl PartialEq for Expr {
             (Expr::Symbol(a), Expr::Symbol(b)) => a == b,
             (Expr::List(a), Expr::List(b)) => a == b,
             (Expr::Builtin(a), Expr::Builtin(b)) => a == b,
+            (Expr::Continuation(_), Expr::Continuation(_)) => false,
             (Expr::Void, Expr::Void) => true,
             _ => false,
         }
@@ -100,6 +122,7 @@ impl Expr {
             }
             Expr::Lambda { .. } => "#<procedure>".into(),
             Expr::Builtin(_) => "#<procedure>".into(),
+            Expr::Continuation(_) => "#<continuation>".into(),
             Expr::Void => "".into(),
         }
     }
