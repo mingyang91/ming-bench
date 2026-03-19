@@ -1,3 +1,4 @@
+pub mod analyze;
 pub mod bench;
 pub mod results;
 pub mod run_agent;
