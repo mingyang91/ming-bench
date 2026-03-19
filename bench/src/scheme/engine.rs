@@ -252,8 +252,11 @@ fn eval_application(parts: &[Expr], environment: &Environment) -> Result<Value, 
         match name {
             "and" => return eval_and(arguments, environment),
             "or" => return eval_or(arguments, environment),
+            "begin" => return eval_begin(arguments, environment),
+            "cond" => return eval_cond(arguments, environment),
             "if" => return eval_if(arguments, environment),
             "define" => return eval_define(arguments, environment),
+            "let" => return eval_let(arguments, environment),
             "quote" => return eval_quote(arguments),
             "lambda" => return eval_lambda(arguments, environment),
             _ => {}
@@ -375,6 +378,54 @@ fn eval_lambda(arguments: &[Expr], environment: &Environment) -> Result<Value, S
     }))
 }
 
+fn eval_begin(arguments: &[Expr], environment: &Environment) -> Result<Value, String> {
+    eval_sequence(arguments, environment)
+}
+
+fn eval_let(arguments: &[Expr], environment: &Environment) -> Result<Value, String> {
+    let (bindings, body) = arguments
+        .split_first()
+        .ok_or_else(|| "`let` expects bindings and a body".to_string())?;
+
+    if body.is_empty() {
+        return Err("`let` expects a body".into());
+    }
+
+    let Expr::Application(bindings) = bindings else {
+        return Err("`let` expects a binding list".into());
+    };
+
+    let mut evaluated_bindings = Vec::with_capacity(bindings.len());
+    for binding in bindings {
+        let (name, value) = eval_let_binding(binding, environment)?;
+        evaluated_bindings.push((name, value));
+    }
+
+    let let_environment = new_environment(Some(environment.clone()));
+    for (name, value) in evaluated_bindings {
+        define_binding(&let_environment, name, value);
+    }
+
+    eval_sequence(body, &let_environment)
+}
+
+fn eval_let_binding(binding: &Expr, environment: &Environment) -> Result<(String, Value), String> {
+    let Expr::Application(binding) = binding else {
+        return Err("`let` bindings must be pairs".into());
+    };
+
+    let [name, value_expr] = binding.as_slice() else {
+        return Err("`let` bindings must contain exactly 2 forms".into());
+    };
+
+    let Expr::Symbol(name) = name else {
+        return Err("`let` binding names must be symbols".into());
+    };
+
+    let value = eval_expr(value_expr, environment)?;
+    Ok((name.clone(), value))
+}
+
 fn parse_parameters(parameters: &[Expr]) -> Result<Vec<String>, String> {
     let mut names = Vec::with_capacity(parameters.len());
 
@@ -399,6 +450,61 @@ fn eval_if(arguments: &[Expr], environment: &Environment) -> Result<Value, Strin
     } else {
         eval_expr(alternative, environment)
     }
+}
+
+fn eval_cond(arguments: &[Expr], environment: &Environment) -> Result<Value, String> {
+    for (index, clause) in arguments.iter().enumerate() {
+        if let Some(value) = eval_cond_clause(clause, index + 1 == arguments.len(), environment)? {
+            return Ok(value);
+        }
+    }
+
+    Ok(Value::Void)
+}
+
+fn eval_cond_clause(
+    clause: &Expr,
+    is_last: bool,
+    environment: &Environment,
+) -> Result<Option<Value>, String> {
+    let Expr::Application(clause_parts) = clause else {
+        return Err("`cond` clauses must be lists".into());
+    };
+
+    let (test, body) = clause_parts
+        .split_first()
+        .ok_or_else(|| "`cond` clauses must not be empty".to_string())?;
+
+    if matches!(test, Expr::Symbol(name) if name == "else") {
+        return eval_else_clause(body, is_last, environment).map(Some);
+    }
+
+    let test_value = eval_expr(test, environment)?;
+    if !is_truthy(&test_value) {
+        return Ok(None);
+    }
+
+    let value = if body.is_empty() {
+        test_value
+    } else {
+        eval_sequence(body, environment)?
+    };
+    Ok(Some(value))
+}
+
+fn eval_else_clause(
+    body: &[Expr],
+    is_last: bool,
+    environment: &Environment,
+) -> Result<Value, String> {
+    if !is_last {
+        return Err("`cond` `else` clause must be last".into());
+    }
+    if body.is_empty() {
+        return Err("`cond` `else` clause must have a body".into());
+    }
+
+    eval_sequence(body, environment)
 }
 
 fn eval_quote(arguments: &[Expr]) -> Result<Value, String> {
