@@ -111,6 +111,7 @@ pub(super) enum Builtin {
     IsBoolean,
     IsPair,
     IsSymbol,
+    Apply,
 }
 
 impl Builtin {
@@ -136,6 +137,7 @@ impl Builtin {
             Self::IsBoolean => "boolean?",
             Self::IsPair => "pair?",
             Self::IsSymbol => "symbol?",
+            Self::Apply => "apply",
         }
     }
 
@@ -171,6 +173,7 @@ impl Builtin {
             Self::IsSymbol => eval_type_predicate(arguments, "symbol?", |value| {
                 matches!(value, Value::Symbol(_))
             }),
+            Self::Apply => eval_apply(arguments),
         }
     }
 }
@@ -178,6 +181,7 @@ impl Builtin {
 #[derive(Clone)]
 pub(super) struct Procedure {
     params: Rc<[String]>,
+    rest_param: Option<String>,
     body: Rc<[Expr]>,
     environment: Environment,
 }
@@ -185,6 +189,11 @@ pub(super) struct Procedure {
 enum EvalOutcome {
     Value(Value),
     TailCall(Procedure, Vec<Value>),
+}
+
+struct ParameterSpec {
+    fixed: Vec<String>,
+    rest: Option<String>,
 }
 
 type Environment = Rc<RefCell<Frame>>;
@@ -225,6 +234,7 @@ fn global_environment() -> Environment {
         Builtin::IsBoolean,
         Builtin::IsPair,
         Builtin::IsSymbol,
+        Builtin::Apply,
     ] {
         define_binding(
             &environment,
@@ -382,18 +392,9 @@ fn apply_callable(callable: &Value, arguments: &[Value]) -> Result<Value, String
 
 fn apply_procedure(mut procedure: Procedure, mut arguments: Vec<Value>) -> Result<Value, String> {
     loop {
-        if procedure.params.len() != arguments.len() {
-            return Err(format!(
-                "procedure expected {} arguments, got {}",
-                procedure.params.len(),
-                arguments.len()
-            ));
-        }
-
+        validate_procedure_arity(&procedure, arguments.len())?;
         let call_environment = new_environment(Some(procedure.environment.clone()));
-        for (param, argument) in procedure.params.iter().zip(&arguments) {
-            define_binding(&call_environment, param.clone(), argument.clone());
-        }
+        bind_procedure_arguments(&call_environment, &procedure, &arguments);
 
         match eval_sequence_outcome(procedure.body.as_ref(), &call_environment, true)? {
             EvalOutcome::Value(value) => return Ok(value),
@@ -402,6 +403,40 @@ fn apply_procedure(mut procedure: Procedure, mut arguments: Vec<Value>) -> Resul
                 arguments = next_arguments;
             }
         }
+    }
+}
+
+fn validate_procedure_arity(procedure: &Procedure, actual: usize) -> Result<(), String> {
+    let expected = procedure.params.len();
+    let valid = if procedure.rest_param.is_some() {
+        actual >= expected
+    } else {
+        actual == expected
+    };
+
+    if valid {
+        return Ok(());
+    }
+
+    let expected = if procedure.rest_param.is_some() {
+        format!("at least {expected}")
+    } else {
+        expected.to_string()
+    };
+    Err(format!(
+        "procedure expected {expected} arguments, got {actual}"
+    ))
+}
+
+fn bind_procedure_arguments(environment: &Environment, procedure: &Procedure, arguments: &[Value]) {
+    let (fixed_arguments, rest_arguments) = arguments.split_at(procedure.params.len());
+
+    for (param, argument) in procedure.params.iter().zip(fixed_arguments) {
+        define_binding(environment, param.clone(), argument.clone());
+    }
+
+    if let Some(rest_param) = &procedure.rest_param {
+        define_binding(environment, rest_param.clone(), build_list(rest_arguments));
     }
 }
 
@@ -445,7 +480,8 @@ fn define_function(
 
     let params = parse_parameters(params)?;
     let procedure = Procedure {
-        params: params.into(),
+        params: params.fixed.into(),
+        rest_param: params.rest,
         body: body.to_vec().into(),
         environment: environment.clone(),
     };
@@ -469,7 +505,8 @@ fn eval_lambda(arguments: &[Expr], environment: &Environment) -> Result<Value, S
     let params = parse_parameters(params)?;
 
     Ok(Value::Procedure(Procedure {
-        params: params.into(),
+        params: params.fixed.into(),
+        rest_param: params.rest,
         body: body.to_vec().into(),
         environment: environment.clone(),
     }))
@@ -537,17 +574,39 @@ fn eval_let_binding(binding: &Expr, environment: &Environment) -> Result<(String
     Ok((name.clone(), value))
 }
 
-fn parse_parameters(parameters: &[Expr]) -> Result<Vec<String>, String> {
-    let mut names = Vec::with_capacity(parameters.len());
+fn parse_parameters(parameters: &[Expr]) -> Result<ParameterSpec, String> {
+    let mut fixed = Vec::with_capacity(parameters.len());
 
-    for parameter in parameters {
+    for (index, parameter) in parameters.iter().enumerate() {
         let Expr::Symbol(name) = parameter else {
             return Err("parameter names must be symbols".into());
         };
-        names.push(name.clone());
+
+        if name == "." {
+            return parse_rest_parameter(&parameters[index + 1..], fixed);
+        }
+
+        fixed.push(name.clone());
     }
 
-    Ok(names)
+    Ok(ParameterSpec { fixed, rest: None })
+}
+
+fn parse_rest_parameter(parameters: &[Expr], fixed: Vec<String>) -> Result<ParameterSpec, String> {
+    let [rest] = parameters else {
+        return Err("rest parameter must be the final name".into());
+    };
+    let Expr::Symbol(rest) = rest else {
+        return Err("parameter names must be symbols".into());
+    };
+    if rest == "." {
+        return Err("parameter names must be symbols".into());
+    }
+
+    Ok(ParameterSpec {
+        fixed,
+        rest: Some(rest.clone()),
+    })
 }
 
 fn eval_if(
@@ -820,6 +879,19 @@ fn eval_length(arguments: &[Value]) -> Result<Value, String> {
     list_length(list).map(Value::Integer)
 }
 
+fn eval_apply(arguments: &[Value]) -> Result<Value, String> {
+    let (callable, arguments) = arguments
+        .split_first()
+        .ok_or_else(|| "`apply` expects at least 2 arguments".to_string())?;
+    let (list, prefix) = arguments
+        .split_last()
+        .ok_or_else(|| "`apply` expects at least 2 arguments".to_string())?;
+
+    let mut applied_arguments = prefix.to_vec();
+    applied_arguments.extend(list_to_vec(list)?);
+    apply_callable(callable, &applied_arguments)
+}
+
 fn eval_type_predicate<F>(arguments: &[Value], name: &str, predicate: F) -> Result<Value, String>
 where
     F: FnOnce(&Value) -> bool,
@@ -853,6 +925,22 @@ fn list_length(list: &Value) -> Result<i64, String> {
                 current = cdr.as_ref();
             }
             _ => return Err("`length` expects a proper list".into()),
+        }
+    }
+}
+
+fn list_to_vec(list: &Value) -> Result<Vec<Value>, String> {
+    let mut values = Vec::new();
+    let mut current = list;
+
+    loop {
+        match current {
+            Value::Nil => return Ok(values),
+            Value::Pair(car, cdr) => {
+                values.push((**car).clone());
+                current = cdr.as_ref();
+            }
+            _ => return Err("`apply` expects a proper list as its last argument".into()),
         }
     }
 }
