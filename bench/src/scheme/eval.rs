@@ -1,6 +1,6 @@
 use super::{Env, EvalError, Value};
 
-pub(super) fn eval(value: &Value, env: &mut Env) -> Result<Value, EvalError> {
+pub(super) fn eval(value: &Value, env: &mut Env, out: &mut String) -> Result<Value, EvalError> {
     match value {
         Value::Integer(_) | Value::Boolean(_) | Value::String(_) | Value::Lambda { .. } => {
             Ok(value.clone())
@@ -12,11 +12,11 @@ pub(super) fn eval(value: &Value, env: &mut Env) -> Result<Value, EvalError> {
             .ok_or_else(|| EvalError::UnboundVariable {
                 name: name.clone(),
             }),
-        Value::Pair(..) => eval_pair(value, env),
+        Value::Pair(..) => eval_pair(value, env, out),
     }
 }
 
-fn eval_pair(value: &Value, env: &mut Env) -> Result<Value, EvalError> {
+fn eval_pair(value: &Value, env: &mut Env, out: &mut String) -> Result<Value, EvalError> {
     let items = value.to_list_vec().ok_or_else(|| EvalError::TypeError {
         expected: "proper list".to_string(),
         got: value.display(),
@@ -29,26 +29,32 @@ fn eval_pair(value: &Value, env: &mut Env) -> Result<Value, EvalError> {
     // Special forms
     if let Value::Symbol(name) = operator {
         return match name.as_str() {
-            "define" => eval_define(args, env),
-            "if" => eval_if(args, env),
+            "define" => eval_define(args, env, out),
+            "if" => eval_if(args, env, out),
             "quote" => eval_quote(args),
             "lambda" => eval_lambda(args, env),
-            "begin" => eval_begin(args, env),
-            "let" => eval_let(args, env),
-            "cond" => eval_cond(args, env),
-            _ => return eval_symbol_call(name, args, env),
+            "begin" => eval_begin(args, env, out),
+            "let" => eval_let(args, env, out),
+            "cond" => eval_cond(args, env, out),
+            _ => eval_symbol_call(name, args, env, out),
         };
     }
 
     // Evaluate operator and apply
-    let proc = eval(operator, env)?;
-    let evaled_args: Vec<Value> = args.iter().map(|a| eval(a, env)).collect::<Result<_, _>>()?;
-    apply(&proc, &evaled_args, env)
+    let proc = eval(operator, env, out)?;
+    let evaled_args: Vec<Value> =
+        args.iter().map(|a| eval(a, env, out)).collect::<Result<_, _>>()?;
+    apply(&proc, &evaled_args, env, out)
 }
 
-fn eval_symbol_call(name: &str, args: &[Value], env: &mut Env) -> Result<Value, EvalError> {
+fn eval_symbol_call(
+    name: &str,
+    args: &[Value],
+    env: &mut Env,
+    out: &mut String,
+) -> Result<Value, EvalError> {
     if is_builtin(name) {
-        return eval_builtin(name, args, env);
+        return eval_builtin(name, args, env, out);
     }
     let proc = env
         .get(name)
@@ -56,11 +62,17 @@ fn eval_symbol_call(name: &str, args: &[Value], env: &mut Env) -> Result<Value, 
         .ok_or_else(|| EvalError::UnboundVariable {
             name: name.to_string(),
         })?;
-    let evaled_args: Vec<Value> = args.iter().map(|a| eval(a, env)).collect::<Result<_, _>>()?;
-    apply(&proc, &evaled_args, env)
+    let evaled_args: Vec<Value> =
+        args.iter().map(|a| eval(a, env, out)).collect::<Result<_, _>>()?;
+    apply(&proc, &evaled_args, env, out)
 }
 
-fn apply(proc: &Value, args: &[Value], caller_env: &Env) -> Result<Value, EvalError> {
+fn apply(
+    proc: &Value,
+    args: &[Value],
+    caller_env: &Env,
+    out: &mut String,
+) -> Result<Value, EvalError> {
     let Value::Lambda {
         params,
         body,
@@ -88,14 +100,14 @@ fn apply(proc: &Value, args: &[Value], caller_env: &Env) -> Result<Value, EvalEr
         call_env.insert(param.clone(), arg.clone());
     }
 
-    eval(body, &mut call_env)
+    eval(body, &mut call_env, out)
 }
 
-fn eval_define(args: &[Value], env: &mut Env) -> Result<Value, EvalError> {
+fn eval_define(args: &[Value], env: &mut Env, out: &mut String) -> Result<Value, EvalError> {
     match args {
         // (define x expr)
         [Value::Symbol(name), expr] => {
-            let val = eval(expr, env)?;
+            let val = eval(expr, env, out)?;
             env.insert(name.clone(), val);
             Ok(Value::Symbol(name.clone()))
         }
@@ -139,7 +151,7 @@ fn eval_define(args: &[Value], env: &mut Env) -> Result<Value, EvalError> {
     }
 }
 
-fn eval_if(args: &[Value], env: &mut Env) -> Result<Value, EvalError> {
+fn eval_if(args: &[Value], env: &mut Env, out: &mut String) -> Result<Value, EvalError> {
     let (condition, consequent, alternative) = match args {
         [cond, cons, alt] => (cond, cons, Some(alt)),
         [cond, cons] => (cond, cons, None),
@@ -150,11 +162,11 @@ fn eval_if(args: &[Value], env: &mut Env) -> Result<Value, EvalError> {
             })
         }
     };
-    let test = eval(condition, env)?;
+    let test = eval(condition, env, out)?;
     if test != Value::Boolean(false) {
-        eval(consequent, env)
+        eval(consequent, env, out)
     } else {
-        alternative.map_or(Ok(Value::Nil), |alt| eval(alt, env))
+        alternative.map_or(Ok(Value::Nil), |alt| eval(alt, env, out))
     }
 }
 
@@ -168,7 +180,7 @@ fn eval_quote(args: &[Value]) -> Result<Value, EvalError> {
     Ok(datum.clone())
 }
 
-fn eval_let(args: &[Value], env: &mut Env) -> Result<Value, EvalError> {
+fn eval_let(args: &[Value], env: &mut Env, out: &mut String) -> Result<Value, EvalError> {
     let [bindings_val, body @ ..] = args else {
         return Err(EvalError::WrongArgCount {
             expected: 2,
@@ -197,7 +209,7 @@ fn eval_let(args: &[Value], env: &mut Env) -> Result<Value, EvalError> {
             });
         };
         params.push(name.clone());
-        values.push(eval(expr, env)?);
+        values.push(eval(expr, env, out)?);
     }
 
     let func_body = wrap_body(body)?;
@@ -207,10 +219,10 @@ fn eval_let(args: &[Value], env: &mut Env) -> Result<Value, EvalError> {
         closure: env.clone(),
     };
 
-    apply(&lambda, &values, env)
+    apply(&lambda, &values, env, out)
 }
 
-fn eval_cond(args: &[Value], env: &mut Env) -> Result<Value, EvalError> {
+fn eval_cond(args: &[Value], env: &mut Env, out: &mut String) -> Result<Value, EvalError> {
     for clause_val in args {
         let clause = clause_val
             .to_list_vec()
@@ -229,23 +241,23 @@ fn eval_cond(args: &[Value], env: &mut Env) -> Result<Value, EvalError> {
         if matches!(test, Value::Symbol(s) if s == "else") {
             return body
                 .iter()
-                .try_fold(Value::Nil, |_, expr| eval(expr, env));
+                .try_fold(Value::Nil, |_, expr| eval(expr, env, out));
         }
 
-        let result = eval(test, env)?;
+        let result = eval(test, env, out)?;
         if result != Value::Boolean(false) {
             return body
                 .iter()
-                .try_fold(Value::Nil, |_, expr| eval(expr, env));
+                .try_fold(Value::Nil, |_, expr| eval(expr, env, out));
         }
     }
 
     Ok(Value::Nil)
 }
 
-fn eval_begin(args: &[Value], env: &mut Env) -> Result<Value, EvalError> {
+fn eval_begin(args: &[Value], env: &mut Env, out: &mut String) -> Result<Value, EvalError> {
     args.iter()
-        .try_fold(Value::Nil, |_, expr| eval(expr, env))
+        .try_fold(Value::Nil, |_, expr| eval(expr, env, out))
 }
 
 fn wrap_body(body: &[Value]) -> Result<Value, EvalError> {
@@ -253,12 +265,9 @@ fn wrap_body(body: &[Value]) -> Result<Value, EvalError> {
         [single] => Ok(single.clone()),
         [_, ..] => {
             let begin_sym = Value::Symbol("begin".to_string());
-            let list = body
-                .iter()
-                .rev()
-                .fold(Value::Nil, |acc, expr| {
-                    Value::Pair(Box::new(expr.clone()), Box::new(acc))
-                });
+            let list = body.iter().rev().fold(Value::Nil, |acc, expr| {
+                Value::Pair(Box::new(expr.clone()), Box::new(acc))
+            });
             Ok(Value::Pair(Box::new(begin_sym), Box::new(list)))
         }
         [] => Err(EvalError::WrongArgCount {
@@ -309,18 +318,31 @@ fn is_builtin(name: &str) -> bool {
         "+" | "-" | "*" | "/" | "<" | ">" | "=" | "<=" | ">=" | "not" | "and" | "or"
             | "cons" | "car" | "cdr" | "null?" | "list" | "length"
             | "string?" | "number?" | "boolean?" | "pair?" | "symbol?"
+            | "display" | "write" | "newline"
     )
 }
 
-fn eval_builtin(name: &str, args: &[Value], env: &mut Env) -> Result<Value, EvalError> {
+fn eval_builtin(
+    name: &str,
+    args: &[Value],
+    env: &mut Env,
+    out: &mut String,
+) -> Result<Value, EvalError> {
     match name {
-        "+" | "-" | "*" | "/" => eval_arithmetic(name, args, env),
-        "<" | ">" | "=" | "<=" | ">=" => eval_comparison(name, args, env),
-        "not" => eval_not(args, env),
-        "and" => eval_and(args, env),
-        "or" => eval_or(args, env),
-        "cons" | "car" | "cdr" | "null?" | "list" | "length" => eval_list_builtin(name, args, env),
-        "string?" | "number?" | "boolean?" | "pair?" | "symbol?" => eval_type_pred(name, args, env),
+        "+" | "-" | "*" | "/" => eval_arithmetic(name, args, env, out),
+        "<" | ">" | "=" | "<=" | ">=" => eval_comparison(name, args, env, out),
+        "not" => eval_not(args, env, out),
+        "and" => eval_and(args, env, out),
+        "or" => eval_or(args, env, out),
+        "cons" | "car" | "cdr" | "null?" | "list" | "length" => {
+            eval_list_builtin(name, args, env, out)
+        }
+        "string?" | "number?" | "boolean?" | "pair?" | "symbol?" => {
+            eval_type_pred(name, args, env, out)
+        }
+        "display" => eval_display(args, env, out),
+        "write" => eval_write(args, env, out),
+        "newline" => eval_newline(args, out),
         _ => Err(EvalError::UnboundVariable {
             name: name.to_string(),
         }),
@@ -335,11 +357,16 @@ fn checked_div(acc: i64, v: i64) -> Result<i64, EvalError> {
     }
 }
 
-fn eval_arithmetic(op: &str, args: &[Value], env: &mut Env) -> Result<Value, EvalError> {
+fn eval_arithmetic(
+    op: &str,
+    args: &[Value],
+    env: &mut Env,
+    out: &mut String,
+) -> Result<Value, EvalError> {
     let values: Vec<i64> = args
         .iter()
         .map(|a| {
-            let evaled = eval(a, env)?;
+            let evaled = eval(a, env, out)?;
             match evaled {
                 Value::Integer(n) => Ok(n),
                 other => Err(EvalError::TypeError {
@@ -382,14 +409,19 @@ fn eval_arithmetic(op: &str, args: &[Value], env: &mut Env) -> Result<Value, Eva
     Ok(Value::Integer(result))
 }
 
-fn eval_comparison(op: &str, args: &[Value], env: &mut Env) -> Result<Value, EvalError> {
+fn eval_comparison(
+    op: &str,
+    args: &[Value],
+    env: &mut Env,
+    out: &mut String,
+) -> Result<Value, EvalError> {
     let [lhs, rhs] = args else {
         return Err(EvalError::WrongArgCount {
             expected: 2,
             got: args.len(),
         });
     };
-    let lhs = match eval(lhs, env)? {
+    let lhs = match eval(lhs, env, out)? {
         Value::Integer(n) => n,
         other => {
             return Err(EvalError::TypeError {
@@ -398,7 +430,7 @@ fn eval_comparison(op: &str, args: &[Value], env: &mut Env) -> Result<Value, Eva
             })
         }
     };
-    let rhs = match eval(rhs, env)? {
+    let rhs = match eval(rhs, env, out)? {
         Value::Integer(n) => n,
         other => {
             return Err(EvalError::TypeError {
@@ -418,21 +450,21 @@ fn eval_comparison(op: &str, args: &[Value], env: &mut Env) -> Result<Value, Eva
     Ok(Value::Boolean(result))
 }
 
-fn eval_not(args: &[Value], env: &mut Env) -> Result<Value, EvalError> {
+fn eval_not(args: &[Value], env: &mut Env, out: &mut String) -> Result<Value, EvalError> {
     let [arg] = args else {
         return Err(EvalError::WrongArgCount {
             expected: 1,
             got: args.len(),
         });
     };
-    let val = eval(arg, env)?;
+    let val = eval(arg, env, out)?;
     Ok(Value::Boolean(val == Value::Boolean(false)))
 }
 
-fn eval_and(args: &[Value], env: &mut Env) -> Result<Value, EvalError> {
+fn eval_and(args: &[Value], env: &mut Env, out: &mut String) -> Result<Value, EvalError> {
     let mut result = Value::Boolean(true);
     for arg in args {
-        result = eval(arg, env)?;
+        result = eval(arg, env, out)?;
         if result == Value::Boolean(false) {
             return Ok(Value::Boolean(false));
         }
@@ -440,10 +472,10 @@ fn eval_and(args: &[Value], env: &mut Env) -> Result<Value, EvalError> {
     Ok(result)
 }
 
-fn eval_or(args: &[Value], env: &mut Env) -> Result<Value, EvalError> {
+fn eval_or(args: &[Value], env: &mut Env, out: &mut String) -> Result<Value, EvalError> {
     let mut result = Value::Boolean(false);
     for arg in args {
-        result = eval(arg, env)?;
+        result = eval(arg, env, out)?;
         if result != Value::Boolean(false) {
             return Ok(result);
         }
@@ -451,54 +483,81 @@ fn eval_or(args: &[Value], env: &mut Env) -> Result<Value, EvalError> {
     Ok(result)
 }
 
-fn eval_list_builtin(name: &str, args: &[Value], env: &mut Env) -> Result<Value, EvalError> {
+fn eval_list_builtin(
+    name: &str,
+    args: &[Value],
+    env: &mut Env,
+    out: &mut String,
+) -> Result<Value, EvalError> {
     match name {
         "cons" => {
             let [a, b] = args else {
-                return Err(EvalError::WrongArgCount { expected: 2, got: args.len() });
+                return Err(EvalError::WrongArgCount {
+                    expected: 2,
+                    got: args.len(),
+                });
             };
-            let car = eval(a, env)?;
-            let cdr = eval(b, env)?;
+            let car = eval(a, env, out)?;
+            let cdr = eval(b, env, out)?;
             Ok(Value::Pair(Box::new(car), Box::new(cdr)))
         }
         "car" => {
             let [a] = args else {
-                return Err(EvalError::WrongArgCount { expected: 1, got: args.len() });
+                return Err(EvalError::WrongArgCount {
+                    expected: 1,
+                    got: args.len(),
+                });
             };
-            let val = eval(a, env)?;
+            let val = eval(a, env, out)?;
             let Value::Pair(car, _) = val else {
-                return Err(EvalError::TypeError { expected: "pair".to_string(), got: val.display() });
+                return Err(EvalError::TypeError {
+                    expected: "pair".to_string(),
+                    got: val.display(),
+                });
             };
             Ok(*car)
         }
         "cdr" => {
             let [a] = args else {
-                return Err(EvalError::WrongArgCount { expected: 1, got: args.len() });
+                return Err(EvalError::WrongArgCount {
+                    expected: 1,
+                    got: args.len(),
+                });
             };
-            let val = eval(a, env)?;
+            let val = eval(a, env, out)?;
             let Value::Pair(_, cdr) = val else {
-                return Err(EvalError::TypeError { expected: "pair".to_string(), got: val.display() });
+                return Err(EvalError::TypeError {
+                    expected: "pair".to_string(),
+                    got: val.display(),
+                });
             };
             Ok(*cdr)
         }
         "null?" => {
             let [a] = args else {
-                return Err(EvalError::WrongArgCount { expected: 1, got: args.len() });
+                return Err(EvalError::WrongArgCount {
+                    expected: 1,
+                    got: args.len(),
+                });
             };
-            let val = eval(a, env)?;
+            let val = eval(a, env, out)?;
             Ok(Value::Boolean(matches!(val, Value::Nil)))
         }
         "list" => {
-            let vals: Vec<Value> = args.iter().map(|a| eval(a, env)).collect::<Result<_, _>>()?;
+            let vals: Vec<Value> =
+                args.iter().map(|a| eval(a, env, out)).collect::<Result<_, _>>()?;
             Ok(vals.into_iter().rev().fold(Value::Nil, |acc, v| {
                 Value::Pair(Box::new(v), Box::new(acc))
             }))
         }
         "length" => {
             let [a] = args else {
-                return Err(EvalError::WrongArgCount { expected: 1, got: args.len() });
+                return Err(EvalError::WrongArgCount {
+                    expected: 1,
+                    got: args.len(),
+                });
             };
-            let val = eval(a, env)?;
+            let val = eval(a, env, out)?;
             let items = val.to_list_vec().ok_or_else(|| EvalError::TypeError {
                 expected: "proper list".to_string(),
                 got: val.display(),
@@ -509,11 +568,19 @@ fn eval_list_builtin(name: &str, args: &[Value], env: &mut Env) -> Result<Value,
     }
 }
 
-fn eval_type_pred(name: &str, args: &[Value], env: &mut Env) -> Result<Value, EvalError> {
+fn eval_type_pred(
+    name: &str,
+    args: &[Value],
+    env: &mut Env,
+    out: &mut String,
+) -> Result<Value, EvalError> {
     let [arg] = args else {
-        return Err(EvalError::WrongArgCount { expected: 1, got: args.len() });
+        return Err(EvalError::WrongArgCount {
+            expected: 1,
+            got: args.len(),
+        });
     };
-    let val = eval(arg, env)?;
+    let val = eval(arg, env, out)?;
     let result = match name {
         "string?" => matches!(val, Value::String(_)),
         "number?" => matches!(val, Value::Integer(_)),
@@ -523,4 +590,39 @@ fn eval_type_pred(name: &str, args: &[Value], env: &mut Env) -> Result<Value, Ev
         _ => unreachable!("unexpected type predicate: {name}"),
     };
     Ok(Value::Boolean(result))
+}
+
+fn eval_display(args: &[Value], env: &mut Env, out: &mut String) -> Result<Value, EvalError> {
+    let [arg] = args else {
+        return Err(EvalError::WrongArgCount {
+            expected: 1,
+            got: args.len(),
+        });
+    };
+    let val = eval(arg, env, out)?;
+    out.push_str(&val.display_human());
+    Ok(Value::Nil)
+}
+
+fn eval_write(args: &[Value], env: &mut Env, out: &mut String) -> Result<Value, EvalError> {
+    let [arg] = args else {
+        return Err(EvalError::WrongArgCount {
+            expected: 1,
+            got: args.len(),
+        });
+    };
+    let val = eval(arg, env, out)?;
+    out.push_str(&val.display());
+    Ok(Value::Nil)
+}
+
+fn eval_newline(args: &[Value], out: &mut String) -> Result<Value, EvalError> {
+    if !args.is_empty() {
+        return Err(EvalError::WrongArgCount {
+            expected: 0,
+            got: args.len(),
+        });
+    }
+    out.push('\n');
+    Ok(Value::Nil)
 }
