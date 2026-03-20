@@ -1,6 +1,14 @@
 use crate::scheme::error::EvalError;
 use crate::scheme::value::Value;
 
+/// Integer division that rejects zero divisors.
+fn checked_div(a: i64, b: i64) -> Result<i64, EvalError> {
+    if b == 0 {
+        return Err(EvalError::DivisionByZero);
+    }
+    Ok(a / b)
+}
+
 /// Extract an integer from a Value, returning a TypeError if not an integer.
 pub fn expect_integer(val: &Value) -> Result<i64, EvalError> {
     match val {
@@ -29,8 +37,10 @@ pub fn apply_arithmetic(op: &str, args: &[Value]) -> Result<Value, EvalError> {
             expected: "at least 1".into(),
             got: 0,
         }),
-        ("/", [x]) => Ok(Value::Integer(1 / x)),
-        ("/", [first, rest @ ..]) => Ok(Value::Integer(rest.iter().fold(*first, |a, b| a / b))),
+        ("/", [x]) => checked_div(1, *x).map(Value::Integer),
+        ("/", [first, rest @ ..]) => {
+            rest.iter().try_fold(*first, |a, b| checked_div(a, *b)).map(Value::Integer)
+        }
         _ => Err(EvalError::UnboundVariable { name: op.into() }),
     }
 }

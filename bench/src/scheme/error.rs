@@ -1,3 +1,10 @@
+/// Source position (1-indexed line and column).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Span {
+    pub line: usize,
+    pub col: usize,
+}
+
 /// Evaluation error type for the Scheme interpreter.
 ///
 /// Agents must add domain-specific variants here. Using `String` as the
@@ -27,4 +34,14 @@ pub enum EvalError {
 
     #[error("bad syntax in {form}")]
     BadSyntax { form: String },
+
+    #[error("division by zero")]
+    DivisionByZero,
+
+    #[error("{error} at {line}:{col}")]
+    AtPosition {
+        error: Box<EvalError>,
+        line: usize,
+        col: usize,
+    },
 }

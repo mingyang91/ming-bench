@@ -127,12 +127,19 @@ pub(crate) fn eval(expr: &Value, env: &Rc<Env>) -> Result<Value, EvalError> {
 /// Evaluate one or more Scheme expressions and return the string
 /// representation of the last result.
 pub fn eval_str(input: &str) -> Result<String, EvalError> {
-    let expressions = parser::parse(input)?;
+    let expressions = parser::parse_spanned(input)?;
     if expressions.is_empty() {
         return Err(EvalError::EmptyInput);
     }
     let env = Env::new();
-    let last = eval_body(&expressions, &env)?;
+    let mut last = Value::Void;
+    for (expr, span) in &expressions {
+        last = eval(expr, &env).map_err(|e| EvalError::AtPosition {
+            error: Box::new(e),
+            line: span.line,
+            col: span.col,
+        })?;
+    }
     match last {
         Value::Void => Err(EvalError::EmptyInput),
         val => Ok(val.to_string()),
