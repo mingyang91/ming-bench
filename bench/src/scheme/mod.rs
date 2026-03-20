@@ -88,6 +88,22 @@ fn parse_atom(input: &str) -> Value {
     if input == "#f" {
         return Value::Boolean(false);
     }
+    if input.starts_with("#\\") && input.len() > 2 {
+        let rest = &input[2..];
+        match rest {
+            "space" => return Value::Char(' '),
+            "newline" => return Value::Char('\n'),
+            "tab" => return Value::Char('\t'),
+            _ => {
+                let mut chars = rest.chars();
+                if let Some(c) = chars.next() {
+                    if chars.next().is_none() {
+                        return Value::Char(c);
+                    }
+                }
+            }
+        }
+    }
     Value::Symbol(input.to_string())
 }
 
@@ -215,6 +231,7 @@ fn eval(expr: &Expr, env: &mut Env, output: &mut String) -> Result<Value, EvalEr
                     "cond" => eval_cond(items, expr, env, output),
                     "and" => eval_and(&items[1..], env, output),
                     "or" => eval_or(&items[1..], env, output),
+                    "string-set!" => eval_string_set(items, expr, env, output),
                     "display" => {
                         if items.len() != 2 {
                             return Err(err_at("display requires 1 argument", expr.line, expr.col));
@@ -470,6 +487,33 @@ fn eval_cond(items: &[Expr], expr: &Expr, env: &mut Env, output: &mut String) ->
             }
         }
     }
+    Ok(Value::Symbol("".to_string()))
+}
+
+fn eval_string_set(items: &[Expr], expr: &Expr, env: &mut Env, output: &mut String) -> Result<Value, EvalError> {
+    if items.len() != 4 {
+        return Err(err_at("string-set! requires 3 arguments", expr.line, expr.col));
+    }
+    let var_name = match &items[1].kind {
+        ExprKind::Value(Value::Symbol(s)) => s.clone(),
+        _ => return Err(err_at("string-set!: first argument must be a variable", expr.line, expr.col)),
+    };
+    let idx = expect_integer(&eval(&items[2], env, output)?, expr.line, expr.col)? as usize;
+    let ch = match eval(&items[3], env, output)? {
+        Value::Char(c) => c,
+        _ => return Err(err_at("string-set!: third argument must be a char", expr.line, expr.col)),
+    };
+    let s = match env.get(&var_name) {
+        Some(Value::Str(s)) => s.clone(),
+        _ => return Err(err_at("string-set!: variable must contain a string", expr.line, expr.col)),
+    };
+    let mut chars: Vec<char> = s.chars().collect();
+    if idx >= chars.len() {
+        return Err(err_at("string-set!: index out of range", expr.line, expr.col));
+    }
+    chars[idx] = ch;
+    let new_s: String = chars.into_iter().collect();
+    env.insert(var_name, Value::Str(new_s));
     Ok(Value::Symbol("".to_string()))
 }
 
@@ -806,6 +850,15 @@ fn apply_builtin(
             match &eval_args[0] {
                 Value::Str(s) => Ok(Value::Symbol(s.clone())),
                 _ => Err(err_at("string->symbol: expected string", call_line, call_col)),
+            }
+        }
+        "string-copy" => {
+            if eval_args.len() != 1 {
+                return Err(err_at("string-copy requires 1 argument", call_line, call_col));
+            }
+            match &eval_args[0] {
+                Value::Str(s) => Ok(Value::Str(s.clone())),
+                _ => Err(err_at("string-copy: expected string", call_line, call_col)),
             }
         }
         "string-ref" => {
