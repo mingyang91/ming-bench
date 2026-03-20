@@ -63,6 +63,7 @@ enum Value {
     Integer(i64),
     Boolean(bool),
     Str(String),
+    Char(char),
     Symbol(String),
     List(Vec<Value>),
     Lambda(Vec<String>, Vec<SExpr>, EnvRef),
@@ -75,6 +76,7 @@ impl PartialEq for Value {
             (Value::Integer(a), Value::Integer(b)) => a == b,
             (Value::Boolean(a), Value::Boolean(b)) => a == b,
             (Value::Str(a), Value::Str(b)) => a == b,
+            (Value::Char(a), Value::Char(b)) => a == b,
             (Value::Symbol(a), Value::Symbol(b)) => a == b,
             (Value::List(a), Value::List(b)) => a == b,
             (Value::Void, Value::Void) => true,
@@ -88,6 +90,7 @@ impl Value {
     fn display_string(&self) -> String {
         match self {
             Value::Str(s) => s.clone(),
+            Value::Char(c) => c.to_string(),
             other => other.to_scheme_string(),
         }
     }
@@ -98,6 +101,7 @@ impl Value {
             Value::Boolean(true) => "#t".to_string(),
             Value::Boolean(false) => "#f".to_string(),
             Value::Str(s) => format!("\"{}\"", s),
+            Value::Char(c) => format!("#\\{}", c),
             Value::Symbol(s) => s.clone(),
             Value::List(elems) => {
                 let inner: Vec<String> = elems.iter().map(|v| v.to_scheme_string()).collect();
@@ -723,6 +727,100 @@ fn eval_expr(se: &SExpr, env: &EnvRef, out: &OutputBuf) -> Result<Value, EvalErr
                         }
                         out.borrow_mut().push('\n');
                         Ok(Value::Void)
+                    }
+                    "string-append" => {
+                        let mut result = String::new();
+                        for arg in &elems[1..] {
+                            match eval_expr(arg, env, out)? {
+                                Value::Str(s) => result.push_str(&s),
+                                _ => return Err(err_at(arg.span, "string-append: expected string")),
+                            }
+                        }
+                        Ok(Value::Str(result))
+                    }
+                    "string-length" => {
+                        if elems.len() != 2 {
+                            return Err(err_at(span, "string-length requires exactly 1 argument"));
+                        }
+                        match eval_expr(&elems[1], env, out)? {
+                            Value::Str(s) => Ok(Value::Integer(s.chars().count() as i64)),
+                            _ => Err(err_at(elems[1].span, "string-length: expected string")),
+                        }
+                    }
+                    "substring" => {
+                        if elems.len() != 4 {
+                            return Err(err_at(span, "substring requires 3 arguments"));
+                        }
+                        let s = match eval_expr(&elems[1], env, out)? {
+                            Value::Str(s) => s,
+                            _ => return Err(err_at(elems[1].span, "substring: expected string")),
+                        };
+                        let start = require_int(&eval_expr(&elems[2], env, out)?, elems[2].span)? as usize;
+                        let end = require_int(&eval_expr(&elems[3], env, out)?, elems[3].span)? as usize;
+                        let chars: Vec<char> = s.chars().collect();
+                        if end > chars.len() || start > end {
+                            return Err(err_at(span, "substring: index out of range"));
+                        }
+                        Ok(Value::Str(chars[start..end].iter().collect()))
+                    }
+                    "string->number" => {
+                        if elems.len() != 2 {
+                            return Err(err_at(span, "string->number requires exactly 1 argument"));
+                        }
+                        match eval_expr(&elems[1], env, out)? {
+                            Value::Str(s) => match s.parse::<i64>() {
+                                Ok(n) => Ok(Value::Integer(n)),
+                                Err(_) => Ok(Value::Boolean(false)),
+                            },
+                            _ => Err(err_at(elems[1].span, "string->number: expected string")),
+                        }
+                    }
+                    "number->string" => {
+                        if elems.len() != 2 {
+                            return Err(err_at(span, "number->string requires exactly 1 argument"));
+                        }
+                        let n = require_int(&eval_expr(&elems[1], env, out)?, elems[1].span)?;
+                        Ok(Value::Str(n.to_string()))
+                    }
+                    "symbol->string" => {
+                        if elems.len() != 2 {
+                            return Err(err_at(span, "symbol->string requires exactly 1 argument"));
+                        }
+                        match eval_expr(&elems[1], env, out)? {
+                            Value::Symbol(s) => Ok(Value::Str(s)),
+                            _ => Err(err_at(elems[1].span, "symbol->string: expected symbol")),
+                        }
+                    }
+                    "string->symbol" => {
+                        if elems.len() != 2 {
+                            return Err(err_at(span, "string->symbol requires exactly 1 argument"));
+                        }
+                        match eval_expr(&elems[1], env, out)? {
+                            Value::Str(s) => Ok(Value::Symbol(s)),
+                            _ => Err(err_at(elems[1].span, "string->symbol: expected string")),
+                        }
+                    }
+                    "string-ref" => {
+                        if elems.len() != 3 {
+                            return Err(err_at(span, "string-ref requires exactly 2 arguments"));
+                        }
+                        let s = match eval_expr(&elems[1], env, out)? {
+                            Value::Str(s) => s,
+                            _ => return Err(err_at(elems[1].span, "string-ref: expected string")),
+                        };
+                        let idx = require_int(&eval_expr(&elems[2], env, out)?, elems[2].span)? as usize;
+                        let chars: Vec<char> = s.chars().collect();
+                        if idx >= chars.len() {
+                            return Err(err_at(span, "string-ref: index out of range"));
+                        }
+                        Ok(Value::Char(chars[idx]))
+                    }
+                    "char?" => {
+                        if elems.len() != 2 {
+                            return Err(err_at(span, "char? requires exactly 1 argument"));
+                        }
+                        let val = eval_expr(&elems[1], env, out)?;
+                        Ok(Value::Boolean(matches!(val, Value::Char(_))))
                     }
                     _ => apply_proc(elems, span, env, out),
                 }
