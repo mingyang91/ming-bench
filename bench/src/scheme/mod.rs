@@ -15,6 +15,11 @@ enum Value {
     Symbol(String),
     Pair(Box<Value>, Box<Value>),
     Nil,
+    Lambda {
+        params: Vec<String>,
+        body: Box<Value>,
+        closure: Env,
+    },
 }
 
 impl Value {
@@ -26,6 +31,7 @@ impl Value {
             Value::String(s) => format!("\"{s}\""),
             Value::Symbol(s) => s.clone(),
             Value::Nil => "()".to_string(),
+            Value::Lambda { .. } => "#<procedure>".to_string(),
             Value::Pair(..) => {
                 let mut out = String::from("(");
                 self.display_list_inner(&mut out);
@@ -37,8 +43,7 @@ impl Value {
 
     fn display_list_inner(&self, out: &mut String) {
         let Value::Pair(car, cdr) = self else {
-            out.push_str(&self.display());
-            return;
+            unreachable!("display_list_inner called on non-pair");
         };
         out.push_str(&car.display());
         match cdr.as_ref() {
