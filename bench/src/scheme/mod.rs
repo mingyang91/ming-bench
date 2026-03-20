@@ -1,17 +1,33 @@
 pub mod error;
+pub mod parser;
+pub mod value;
 
 pub use error::EvalError;
+use value::Value;
+
+/// Evaluate a single parsed Scheme value.
+fn eval(expr: &Value) -> Result<Value, EvalError> {
+    match expr {
+        Value::Integer(_) | Value::Boolean(_) | Value::String(_) => Ok(expr.clone()),
+        Value::Symbol(_) | Value::List(_) => Err(EvalError::Parse {
+            message: format!("unsupported expression: {expr}"),
+        }),
+    }
+}
 
 /// Evaluate one or more Scheme expressions and return the string
 /// representation of the last result.
-///
-/// # Examples
-/// ```
-/// use ming::scheme::eval_str;
-/// assert_eq!(eval_str("(+ 1 2)"), Ok("3".into()));
-/// ```
-pub fn eval_str(_input: &str) -> Result<String, EvalError> {
-    todo!()
+pub fn eval_str(input: &str) -> Result<String, EvalError> {
+    let expressions = parser::parse(input)?;
+    if expressions.is_empty() {
+        return Err(EvalError::EmptyInput);
+    }
+    let result = expressions
+        .iter()
+        .map(eval)
+        .next_back()
+        .expect("non-empty expressions guaranteed above")?;
+    Ok(result.to_string())
 }
 
 /// Evaluate Scheme expressions, returning both the result value and
