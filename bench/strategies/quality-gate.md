@@ -34,14 +34,232 @@ cargo xtask test all  # test all levels (300s timeout)
 - **If a level's tests fail, fix them before proceeding.**
 - **Rely on the provided level tests as the source of truth.**
 
+## Code Philosophy
+
+The quality gate enforces structure mechanically; these rules are the design intent behind those checks. Follow them proactively — the gate is a safety net, not a substitute for judgment.
+
+### Type Safety
+
+- **Maximize type safety over minimal diffs.** The compiler is the last line of defense. If it compiles, it's correct. Prefer type-level refactors even if they touch many files.
+- **Type precision is not over-engineering.** Newtypes, enums, `NonEmpty` wrappers — these remove runtime checks, not add complexity.
+- **Newtypes for domain values** where it prevents confusion. Propagate constraints through signatures — don't downgrade and re-validate internally.
+
+### Error Handling
+
+- **No `.unwrap()`.** Use `.expect("reason")` for trusted invariants, `?` or typed errors for untrusted paths.
+- **No silent error swallowing.** Forbidden: `.unwrap_or_default()`, `.ok()` to discard errors, `.unwrap_or(fallback)` hiding parse failures.
+- **Trusted vs untrusted paths:**
+  - **Trusted** (internal data, AST nodes, env lookups): bugs → `panic!` / `unreachable!`
+  - **Untrusted** (user Scheme source code): errors → `Err(...)`
+
+### Typed Error Model (`thiserror`)
+
+Use `thiserror` for `enum` error types with named variants carrying structured context. Compose errors via wrapping, don't flatten to strings.
+
+```rust
+enum ParseError { UnexpectedToken(String), UnmatchedParen, ... }
+enum EvalError { Parse(ParseError), UnboundVariable(String), WrongArgCount { expected: usize, got: usize }, ... }
+impl From<ParseError> for EvalError { ... }  // enables ? propagation
+```
+
+- Each variant must carry domain-specific fields (e.g., `NotFound { key: String }`).
+- Variants that wrap a formatted `String` message (e.g., `Other(String)`) are prohibited — they defeat pattern matching and are just `String` with extra steps.
+- Exhaustive `match` — compiler enforces handling every variant.
+
+### Effect Marking (visible signatures)
+
+Make capabilities visible in function signatures — callers see exactly what a function does:
+- Mutation: `&mut Env` (not hidden behind `&self`)
+- Fallibility: `-> Result<T, EvalError>` (not panic)
+- Allocation: `&Arena` or lifetime params
+
+No hidden side effects.
+
 ## Code Style
 
-Write clean, idiomatic Rust. The quality gate enforces structure mechanically; these are additional expectations:
+### Flat Control Flow
 
-- **Use `thiserror` with structurally typed variants.** Each variant must carry domain-specific fields (e.g., `NotFound { key: String }`, `LimitExceeded { max: usize, actual: usize }`). Variants that wrap a formatted `String` message (e.g., `Other(String)`) are prohibited — they defeat pattern matching and are just `String` with extra steps.
-- **Immutable-first.** Build new values from inputs instead of mutating temporaries.
-- **Keep `mod.rs` thin.** Entry point and re-exports only; implementation goes in submodules.
+- **Flat control flow.** Prefer early returns and `?` over deeply nested `match`.
+- **No premature helpers (<5 ops).** If logic is < 5 composed operators/steps, inline at call site.
+- **Extract helpers at >= 5 ops.** Reuse existing helpers before writing new ones.
+- **No premature abstractions.** Three similar lines > one abstraction used once.
+- **Proactive naming review.** Fix misleading/stale names when modifying code.
+
+### Functional Style
+
+- **Prefer immutable-first data flow.** Build new values from inputs instead of mutating temporary state, unless mutation is required by semantics.
+
+  ```rust
+  // Bad
+  let mut total = 0;
+  for val in values {
+      total += transform(val);
+  }
+
+  // Good
+  let total: i64 = values.iter().map(transform).sum();
+  ```
+
+- **Prefer iterator pipelines for collection transforms.** Use `map`, `filter`, `fold`, `try_fold`, `collect` instead of manual `Vec::push` loops when the logic is a pure transformation.
+
+  ```rust
+  // Bad
+  let mut results = Vec::new();
+  for item in items {
+      results.push(process(item));
+  }
+
+  // Good
+  let results: Vec<_> = items.iter().map(process).collect();
+  ```
+
+- **Prefer `collect::<Result<Vec<_>, _>>()?` for fallible transforms.**
+
+  ```rust
+  // Bad
+  let mut parsed = Vec::new();
+  for raw in inputs {
+      parsed.push(parse(raw)?);
+  }
+
+  // Good
+  let parsed: Vec<_> = inputs.iter().map(parse).collect::<Result<_, _>>()?;
+  ```
+
+- **Prefer structural recursion or slice-pattern matching over index-driven loops.**
+
+  ```rust
+  // Bad
+  let mut i = 0;
+  while i < nodes.len() {
+      match &nodes[i] { ... }
+      i += 1;
+  }
+
+  // Good
+  fn walk(nodes: &[Node]) -> Result<()> {
+      match nodes {
+          [] => Ok(()),
+          [Node::Leaf(v), rest @ ..] => { handle(v); walk(rest) }
+          [Node::Branch(children), rest @ ..] => { walk(children)?; walk(rest) }
+      }
+  }
+  ```
+
+- **Prefer `split_first()`, `split_last()`, and slice patterns over indexing.**
+
+  ```rust
+  // Bad
+  let first = args[0];
+  let rest = &args[1..];
+
+  // Good
+  let [first, rest @ ..] = args else {
+      return Err(Error::NotEnoughArgs);
+  };
+  ```
+
+- **Prefer folds for recursive data construction.**
+
+  ```rust
+  // Bad
+  let mut list = Node::Empty;
+  for item in items.iter().rev() {
+      list = Node::Pair(Box::new(item.clone()), Box::new(list));
+  }
+
+  // Good
+  let list = items.iter().rev().fold(Node::Empty, |acc, item| {
+      Node::Pair(Box::new(item.clone()), Box::new(acc))
+  });
+  ```
+
+- **Prefer declarative matching over flag variables.** Replace mutable `found = true` state with return-oriented control flow, `find_map`, or `try_fold`.
+
+  ```rust
+  // Bad
+  let mut found = None;
+  for entry in entries {
+      if entry.matches(key) {
+          found = Some(entry.value());
+          break;
+      }
+  }
+
+  // Good
+  let found = entries.iter().find_map(|e| e.matches(key).then(|| e.value()));
+  ```
+
+- **Keep mutation at semantic boundaries only.** Accept local mutation when modeling runtime semantics (e.g., shared mutable state, in-place update), but avoid incidental mutation used only for bookkeeping.
+
+## Structural Limits
+
+- **`mod.rs` stays thin: exports + entry point.** Implementation logic goes in dedicated submodules. Hard cap: 300 lines.
+- **Split by subsystem into dedicated submodules.** Each distinct responsibility gets its own file.
+- **Function hard cap: 150 lines.** Exception: parser/state-machine code with inherently sequential logic. If a function needs scrolling, extract helpers.
+- **Max nesting: 3 levels.** Use `let else`, early `return`, `?`, and extracted helpers to reduce brace depth.
+
+  ```rust
+  // Bad — 4+ levels deep
+  match config {
+      Config::A(inner) => {
+          if inner.enabled {
+              for item in inner.items {
+                  if item.valid() {
+                      process(item);
+                  }
+              }
+          }
+      }
+      _ => {}
+  }
+
+  // Good — flat with early returns and helpers
+  fn handle_config_a(inner: &Inner) -> Result<()> {
+      if !inner.enabled { return Ok(()); }
+      inner.items.iter().filter(|i| i.valid()).for_each(process);
+      Ok(())
+  }
+  ```
+
+- **Match arms with >3 lines dispatch to helpers.** A `match` arm should call a function, not inline multi-line logic.
+
+  ```rust
+  // Bad — inline logic in match arms
+  match command {
+      Command::Create(args) => {
+          // 30 lines of creation logic...
+      }
+  }
+
+  // Good — dispatch to handlers
+  match command {
+      Command::Create(args) => handle_create(args, state),
+      Command::Delete(args) => handle_delete(args, state),
+  }
+  ```
+
+## Logging
+
+- Use `log` crate (`debug!`, `info!`, `warn!`, `error!`) with `env_logger`. Control verbosity via `RUST_LOG` env var.
+- **Log at decision points** — special form dispatch, error paths. Helps trace failures.
+- Default level: `info`. Set `RUST_LOG=debug` or `RUST_LOG=trace` when debugging.
+
+## Runtime Assertion Checks
+
+- **Use `debug_assert!` on invariants.** Catch broken assumptions before corrupt state propagates.
+- **Where to assert:**
+  - After environment operations — variable was actually bound
+  - After list operations — structural invariants (`car`/`cdr` on non-pair)
+  - Tail call trampoline — recursion depth doesn't silently overflow
+- **Where NOT to assert:** User input validation (use typed errors), hot eval loops (use errors).
+
+## Development Workflow
+
+- **Fix code smells immediately.** Fix on the spot, don't track for later.
 - **When touching a file, fix violations in that file.** Do not defer. Do not rewrite unrelated files unprompted.
+- **Proactive refactoring is mandatory.** When implementing a new feature, if you notice surrounding code that violates nesting limits, function size caps, or functional style rules — fix it in the same pass.
+- **Blast radius is not a concern — rule compliance is.** If existing code violates structural limits or functional style rules, refactor aggressively. Split oversized files into modules, extract bloated functions into helpers, rewrite imperative loops as pipelines.
 
 ## Lint Reference
 
