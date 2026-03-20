@@ -118,6 +118,7 @@ enum Expr {
     Integer(i64),
     Boolean(bool),
     Str(String),
+    Char(char),
     Symbol(String),
     List(Vec<SExpr>),
 }
@@ -275,6 +276,17 @@ fn parse_atom(token: &str) -> Result<Expr, EvalError> {
         let inner = &token[1..token.len() - 1];
         return Ok(Expr::Str(inner.to_string()));
     }
+    if token.starts_with("#\\") {
+        let rest = &token[2..];
+        let c = match rest {
+            "space" => ' ',
+            "newline" => '\n',
+            "tab" => '\t',
+            s if s.len() == 1 => s.chars().next().unwrap(),
+            _ => return Err(EvalError::Parse(format!("unknown character literal: {}", token))),
+        };
+        return Ok(Expr::Char(c));
+    }
     Ok(Expr::Symbol(token.to_string()))
 }
 
@@ -295,6 +307,7 @@ fn sexpr_to_value(se: &SExpr) -> Value {
         Expr::Integer(n) => Value::Integer(*n),
         Expr::Boolean(b) => Value::Boolean(*b),
         Expr::Str(s) => Value::Str(s.clone()),
+        Expr::Char(c) => Value::Char(*c),
         Expr::Symbol(s) => Value::Symbol(s.clone()),
         Expr::List(elems) => Value::List(elems.iter().map(sexpr_to_value).collect()),
     }
@@ -306,6 +319,7 @@ fn eval_expr(se: &SExpr, env: &EnvRef, out: &OutputBuf) -> Result<Value, EvalErr
         Expr::Integer(n) => Ok(Value::Integer(*n)),
         Expr::Boolean(b) => Ok(Value::Boolean(*b)),
         Expr::Str(s) => Ok(Value::Str(s.clone())),
+        Expr::Char(c) => Ok(Value::Char(*c)),
         Expr::Symbol(s) => EnvFrame::get(env, s)
             .ok_or_else(|| err_at(span, format!("unbound variable: {}", s))),
         Expr::List(elems) => {
@@ -814,6 +828,43 @@ fn eval_expr(se: &SExpr, env: &EnvRef, out: &OutputBuf) -> Result<Value, EvalErr
                             return Err(err_at(span, "string-ref: index out of range"));
                         }
                         Ok(Value::Char(chars[idx]))
+                    }
+                    "string-copy" => {
+                        if elems.len() != 2 {
+                            return Err(err_at(span, "string-copy requires exactly 1 argument"));
+                        }
+                        let s = match eval_expr(&elems[1], env, out)? {
+                            Value::Str(s) => s,
+                            _ => return Err(err_at(elems[1].span, "string-copy: expected string")),
+                        };
+                        Ok(Value::Str(s))
+                    }
+                    "string-set!" => {
+                        if elems.len() != 4 {
+                            return Err(err_at(span, "string-set! requires exactly 3 arguments"));
+                        }
+                        let var_name = match &elems[1].expr {
+                            Expr::Symbol(name) => name.clone(),
+                            _ => return Err(err_at(elems[1].span, "string-set!: first argument must be a variable")),
+                        };
+                        let s = match EnvFrame::get(env, &var_name) {
+                            Some(Value::Str(s)) => s,
+                            Some(_) => return Err(err_at(elems[1].span, "string-set!: expected string")),
+                            None => return Err(err_at(elems[1].span, format!("unbound variable: {}", var_name))),
+                        };
+                        let idx = require_int(&eval_expr(&elems[2], env, out)?, elems[2].span)? as usize;
+                        let c = match eval_expr(&elems[3], env, out)? {
+                            Value::Char(c) => c,
+                            _ => return Err(err_at(elems[3].span, "string-set!: expected char")),
+                        };
+                        let mut chars: Vec<char> = s.chars().collect();
+                        if idx >= chars.len() {
+                            return Err(err_at(span, "string-set!: index out of range"));
+                        }
+                        chars[idx] = c;
+                        let new_s: String = chars.into_iter().collect();
+                        EnvFrame::set(env, var_name, Value::Str(new_s));
+                        Ok(Value::Void)
                     }
                     "char?" => {
                         if elems.len() != 2 {
