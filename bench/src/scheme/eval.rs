@@ -121,7 +121,8 @@ fn eval_lambda(args: &[Value], env: &Env) -> Result<Value, EvalError> {
 fn is_builtin(name: &str) -> bool {
     matches!(
         name,
-        "+" | "-" | "*" | "/" | "<" | ">" | "=" | "<=" | "not"
+        "+" | "-" | "*" | "/" | "<" | ">" | "=" | "<=" | "not" | "cons" | "car" | "cdr"
+            | "null?" | "list" | "length"
     )
 }
 
@@ -136,6 +137,12 @@ fn call_builtin(name: &str, args: &[Value]) -> Result<Value, EvalError> {
         "=" => cmp_eq(args),
         "<=" => cmp_le(args),
         "not" => eval_not(name, args),
+        "cons" => builtin_cons(name, args),
+        "car" => builtin_car(name, args),
+        "cdr" => builtin_cdr(name, args),
+        "null?" => builtin_null(name, args),
+        "list" => Ok(Value::List(args.to_vec())),
+        "length" => builtin_length(name, args),
         _ => unreachable!(),
     }
 }
@@ -349,4 +356,95 @@ fn eval_or(exprs: &[Value], env: &Env) -> Result<Value, EvalError> {
         }
     }
     Ok(result)
+}
+
+fn builtin_cons(name: &str, args: &[Value]) -> Result<Value, EvalError> {
+    if args.len() != 2 {
+        return Err(EvalError::ArityError {
+            name: name.into(),
+            expected: 2,
+            actual: args.len(),
+        });
+    }
+    match &args[1] {
+        Value::List(elems) => {
+            let mut new_list = vec![args[0].clone()];
+            new_list.extend(elems.iter().cloned());
+            Ok(Value::List(new_list))
+        }
+        _ => Err(EvalError::TypeError {
+            expected: "list".into(),
+            got: args[1].to_string(),
+        }),
+    }
+}
+
+fn builtin_car(name: &str, args: &[Value]) -> Result<Value, EvalError> {
+    if args.len() != 1 {
+        return Err(EvalError::ArityError {
+            name: name.into(),
+            expected: 1,
+            actual: args.len(),
+        });
+    }
+    match &args[0] {
+        Value::List(elems) if !elems.is_empty() => Ok(elems[0].clone()),
+        Value::List(_) => Err(EvalError::TypeError {
+            expected: "pair".into(),
+            got: "()".into(),
+        }),
+        other => Err(EvalError::TypeError {
+            expected: "pair".into(),
+            got: other.to_string(),
+        }),
+    }
+}
+
+fn builtin_cdr(name: &str, args: &[Value]) -> Result<Value, EvalError> {
+    if args.len() != 1 {
+        return Err(EvalError::ArityError {
+            name: name.into(),
+            expected: 1,
+            actual: args.len(),
+        });
+    }
+    match &args[0] {
+        Value::List(elems) if !elems.is_empty() => Ok(Value::List(elems[1..].to_vec())),
+        Value::List(_) => Err(EvalError::TypeError {
+            expected: "pair".into(),
+            got: "()".into(),
+        }),
+        other => Err(EvalError::TypeError {
+            expected: "pair".into(),
+            got: other.to_string(),
+        }),
+    }
+}
+
+fn builtin_null(name: &str, args: &[Value]) -> Result<Value, EvalError> {
+    if args.len() != 1 {
+        return Err(EvalError::ArityError {
+            name: name.into(),
+            expected: 1,
+            actual: args.len(),
+        });
+    }
+    Ok(Value::Boolean(matches!(&args[0], Value::List(elems) if elems.is_empty())))
+}
+
+fn builtin_length(name: &str, args: &[Value]) -> Result<Value, EvalError> {
+    if args.len() != 1 {
+        return Err(EvalError::ArityError {
+            name: name.into(),
+            expected: 1,
+            actual: args.len(),
+        });
+    }
+    match &args[0] {
+        Value::List(elems) => Ok(Value::Integer(elems.len() as i64)),
+        other => Err(EvalError::TypeError {
+            expected: "list".into(),
+            got: other.to_string(),
+        }),
+    }
 }

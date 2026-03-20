@@ -36,6 +36,7 @@ fn parse_expr(
         None => Err(EvalError::Parse {
             msg: "unexpected end of input".into(),
         }),
+        Some('\'') => parse_quote_shorthand(chars),
         Some('"') => parse_string(chars),
         Some('#') => parse_boolean(chars),
         Some('(') => parse_list(chars),
@@ -110,6 +111,14 @@ fn parse_boolean(
             msg: "expected #t or #f".into(),
         }),
     }
+}
+
+fn parse_quote_shorthand(
+    chars: &mut std::iter::Peekable<std::str::Chars<'_>>,
+) -> Result<Value, EvalError> {
+    chars.next(); // consume '
+    let inner = parse_expr(chars)?;
+    Ok(Value::List(vec![Value::Symbol("quote".into()), inner]))
 }
 
 fn is_symbol_char(c: char) -> bool {
