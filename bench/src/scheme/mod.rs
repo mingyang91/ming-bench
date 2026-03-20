@@ -7,6 +7,8 @@ enum Value {
     Integer(i64),
     Boolean(bool),
     Str(String),
+    Symbol(String),
+    List(Vec<Value>),
 }
 
 impl Value {
@@ -16,37 +18,192 @@ impl Value {
             Value::Boolean(true) => "#t".to_string(),
             Value::Boolean(false) => "#f".to_string(),
             Value::Str(s) => format!("\"{}\"", s),
+            Value::Symbol(s) => s.clone(),
+            Value::List(elems) => {
+                let inner: Vec<String> = elems.iter().map(|v| v.to_scheme_string()).collect();
+                format!("({})", inner.join(" "))
+            }
         }
     }
 }
 
-fn parse_expr(input: &str) -> Result<Value, EvalError> {
-    let input = input.trim();
-
-    if input == "#t" {
-        return Ok(Value::Boolean(true));
-    }
-    if input == "#f" {
-        return Ok(Value::Boolean(false));
-    }
-    if let Ok(n) = input.parse::<i64>() {
-        return Ok(Value::Integer(n));
-    }
-    if input.starts_with('"') && input.ends_with('"') && input.len() >= 2 {
-        let inner = &input[1..input.len() - 1];
-        return Ok(Value::Str(inner.to_string()));
-    }
-
-    Err(EvalError::Parse(format!("unexpected input: {}", input)))
+#[derive(Debug, Clone, PartialEq)]
+enum Expr {
+    Integer(i64),
+    Boolean(bool),
+    Str(String),
+    Symbol(String),
+    List(Vec<Expr>),
 }
 
-fn eval(input: &str) -> Result<Value, EvalError> {
-    let input = input.trim();
-    if input.is_empty() {
-        return Err(EvalError::Parse("empty input".to_string()));
+fn tokenize(input: &str) -> Vec<String> {
+    let mut tokens = Vec::new();
+    let chars: Vec<char> = input.chars().collect();
+    let mut i = 0;
+    while i < chars.len() {
+        match chars[i] {
+            ' ' | '\t' | '\n' | '\r' => i += 1,
+            '(' => { tokens.push("(".to_string()); i += 1; }
+            ')' => { tokens.push(")".to_string()); i += 1; }
+            '"' => {
+                let mut s = String::from('"');
+                i += 1;
+                while i < chars.len() && chars[i] != '"' {
+                    if chars[i] == '\\' && i + 1 < chars.len() {
+                        s.push(chars[i]);
+                        s.push(chars[i + 1]);
+                        i += 2;
+                    } else {
+                        s.push(chars[i]);
+                        i += 1;
+                    }
+                }
+                if i < chars.len() {
+                    s.push('"');
+                    i += 1;
+                }
+                tokens.push(s);
+            }
+            ';' => {
+                while i < chars.len() && chars[i] != '\n' {
+                    i += 1;
+                }
+            }
+            _ => {
+                let mut s = String::new();
+                while i < chars.len() && !matches!(chars[i], ' ' | '\t' | '\n' | '\r' | '(' | ')' | ';') {
+                    s.push(chars[i]);
+                    i += 1;
+                }
+                tokens.push(s);
+            }
+        }
     }
-    // For now, just parse a single atom
-    parse_expr(input)
+    tokens
+}
+
+fn parse(tokens: &[String], pos: usize) -> Result<(Expr, usize), EvalError> {
+    if pos >= tokens.len() {
+        return Err(EvalError::Parse("unexpected end of input".to_string()));
+    }
+    let token = &tokens[pos];
+    if token == "(" {
+        let mut elems = Vec::new();
+        let mut i = pos + 1;
+        while i < tokens.len() && tokens[i] != ")" {
+            let (expr, next) = parse(tokens, i)?;
+            elems.push(expr);
+            i = next;
+        }
+        if i >= tokens.len() {
+            return Err(EvalError::Parse("missing closing paren".to_string()));
+        }
+        Ok((Expr::List(elems), i + 1))
+    } else if token == ")" {
+        Err(EvalError::Parse("unexpected )".to_string()))
+    } else {
+        Ok((parse_atom(token)?, pos + 1))
+    }
+}
+
+fn parse_atom(token: &str) -> Result<Expr, EvalError> {
+    if token == "#t" {
+        return Ok(Expr::Boolean(true));
+    }
+    if token == "#f" {
+        return Ok(Expr::Boolean(false));
+    }
+    if let Ok(n) = token.parse::<i64>() {
+        return Ok(Expr::Integer(n));
+    }
+    if token.starts_with('"') && token.ends_with('"') && token.len() >= 2 {
+        let inner = &token[1..token.len() - 1];
+        return Ok(Expr::Str(inner.to_string()));
+    }
+    Ok(Expr::Symbol(token.to_string()))
+}
+
+fn parse_all(input: &str) -> Result<Vec<Expr>, EvalError> {
+    let tokens = tokenize(input);
+    let mut exprs = Vec::new();
+    let mut pos = 0;
+    while pos < tokens.len() {
+        let (expr, next) = parse(&tokens, pos)?;
+        exprs.push(expr);
+        pos = next;
+    }
+    Ok(exprs)
+}
+
+fn eval_expr(expr: &Expr) -> Result<Value, EvalError> {
+    match expr {
+        Expr::Integer(n) => Ok(Value::Integer(*n)),
+        Expr::Boolean(b) => Ok(Value::Boolean(*b)),
+        Expr::Str(s) => Ok(Value::Str(s.clone())),
+        Expr::Symbol(s) => Err(EvalError::Parse(format!("unbound variable: {}", s))),
+        Expr::List(elems) => {
+            if elems.is_empty() {
+                return Err(EvalError::Parse("empty application".to_string()));
+            }
+            if let Expr::Symbol(op) = &elems[0] {
+                match op.as_str() {
+                    "+" => {
+                        let mut sum: i64 = 0;
+                        for arg in &elems[1..] {
+                            sum += require_int(&eval_expr(arg)?)?;
+                        }
+                        Ok(Value::Integer(sum))
+                    }
+                    "-" => {
+                        if elems.len() < 2 {
+                            return Err(EvalError::Parse("- requires at least one argument".to_string()));
+                        }
+                        let first = require_int(&eval_expr(&elems[1])?)?;
+                        if elems.len() == 2 {
+                            Ok(Value::Integer(-first))
+                        } else {
+                            let mut result = first;
+                            for arg in &elems[2..] {
+                                result -= require_int(&eval_expr(arg)?)?;
+                            }
+                            Ok(Value::Integer(result))
+                        }
+                    }
+                    "*" => {
+                        let mut product: i64 = 1;
+                        for arg in &elems[1..] {
+                            product *= require_int(&eval_expr(arg)?)?;
+                        }
+                        Ok(Value::Integer(product))
+                    }
+                    "/" => {
+                        if elems.len() < 3 {
+                            return Err(EvalError::Parse("/ requires at least two arguments".to_string()));
+                        }
+                        let mut result = require_int(&eval_expr(&elems[1])?)?;
+                        for arg in &elems[2..] {
+                            let divisor = require_int(&eval_expr(arg)?)?;
+                            if divisor == 0 {
+                                return Err(EvalError::Parse("division by zero".to_string()));
+                            }
+                            result /= divisor;
+                        }
+                        Ok(Value::Integer(result))
+                    }
+                    _ => Err(EvalError::Parse(format!("unknown procedure: {}", op))),
+                }
+            } else {
+                Err(EvalError::Parse("not a procedure".to_string()))
+            }
+        }
+    }
+}
+
+fn require_int(val: &Value) -> Result<i64, EvalError> {
+    match val {
+        Value::Integer(n) => Ok(*n),
+        _ => Err(EvalError::Parse("expected integer".to_string())),
+    }
 }
 
 /// Evaluate one or more Scheme expressions and return the string
@@ -58,7 +215,14 @@ fn eval(input: &str) -> Result<Value, EvalError> {
 /// assert_eq!(eval_str("42"), Ok("42".into()));
 /// ```
 pub fn eval_str(input: &str) -> Result<String, EvalError> {
-    let result = eval(input)?;
+    let exprs = parse_all(input)?;
+    if exprs.is_empty() {
+        return Err(EvalError::Parse("empty input".to_string()));
+    }
+    let mut result = Value::Boolean(false);
+    for expr in &exprs {
+        result = eval_expr(expr)?;
+    }
     Ok(result.to_scheme_string())
 }
 
