@@ -104,6 +104,7 @@ enum Value {
     Builtin(String),
     Continuation(u64),
     Macro(Vec<String>, Vec<(SExpr, SExpr)>, EnvRef),
+    Vector(Rc<RefCell<Vec<Value>>>),
     Void,
 }
 
@@ -116,6 +117,7 @@ impl PartialEq for Value {
             (Value::Char(a), Value::Char(b)) => a == b,
             (Value::Symbol(a), Value::Symbol(b)) => a == b,
             (Value::List(a), Value::List(b)) => a == b,
+            (Value::Vector(a), Value::Vector(b)) => *a.borrow() == *b.borrow(),
             (Value::Void, Value::Void) => true,
             (Value::Lambda(..), Value::Lambda(..)) => false,
             (Value::Macro(..), Value::Macro(..)) => false,
@@ -151,6 +153,10 @@ impl Value {
             Value::Macro(..) => "#<macro>".to_string(),
             Value::Builtin(_) => "#<procedure>".to_string(),
             Value::Continuation(_) => "#<continuation>".to_string(),
+            Value::Vector(v) => {
+                let inner: Vec<String> = v.borrow().iter().map(|e| e.to_scheme_string()).collect();
+                format!("#({})", inner.join(" "))
+            }
             Value::Void => String::new(),
         }
     }
@@ -1657,6 +1663,48 @@ fn apply_builtin(name: &str, args: &[Value], span: Span, out: &OutputBuf) -> Res
             let n = require_int(&args[0], span)?;
             match char::from_u32(n as u32) { Some(c) => Ok(Value::Char(c)), None => Err(err_at(span, "integer->char: invalid code point")) }
         }
+        "vector" => Ok(Value::Vector(Rc::new(RefCell::new(args.to_vec())))),
+        "make-vector" => {
+            let len = require_int(&args[0], span)? as usize;
+            let fill = if args.len() > 1 { args[1].clone() } else { Value::Integer(0) };
+            Ok(Value::Vector(Rc::new(RefCell::new(vec![fill; len]))))
+        }
+        "vector-ref" => {
+            match &args[0] {
+                Value::Vector(v) => {
+                    let idx = require_int(&args[1], span)? as usize;
+                    let vec = v.borrow();
+                    if idx >= vec.len() { return Err(err_at(span, "vector-ref: index out of range")); }
+                    Ok(vec[idx].clone())
+                }
+                _ => Err(err_at(span, "vector-ref: expected vector")),
+            }
+        }
+        "vector-set!" => {
+            match &args[0] {
+                Value::Vector(v) => {
+                    let idx = require_int(&args[1], span)? as usize;
+                    let mut vec = v.borrow_mut();
+                    if idx >= vec.len() { return Err(err_at(span, "vector-set!: index out of range")); }
+                    vec[idx] = args[2].clone();
+                    Ok(Value::Void)
+                }
+                _ => Err(err_at(span, "vector-set!: expected vector")),
+            }
+        }
+        "vector?" => Ok(Value::Boolean(matches!(&args[0], Value::Vector(_)))),
+        "vector-length" => {
+            match &args[0] {
+                Value::Vector(v) => Ok(Value::Integer(v.borrow().len() as i64)),
+                _ => Err(err_at(span, "vector-length: expected vector")),
+            }
+        }
+        "vector->list" => {
+            match &args[0] {
+                Value::Vector(v) => Ok(Value::List(v.borrow().clone())),
+                _ => Err(err_at(span, "vector->list: expected vector")),
+            }
+        }
         _ => Err(err_at(span, format!("unknown builtin: {}", name))),
     }
 }
@@ -1786,6 +1834,7 @@ fn init_builtins(env: &EnvRef) {
         "char->integer", "integer->char",
         "equal?", "eqv?", "eq?",
         "call/cc", "call-with-current-continuation",
+        "vector", "make-vector", "vector-ref", "vector-set!", "vector?", "vector-length", "vector->list",
     ] {
         EnvFrame::set(env, name.to_string(), Value::Builtin(name.to_string()));
     }
