@@ -4,6 +4,7 @@ use crate::scheme::continuation;
 use crate::scheme::env::Env;
 use crate::scheme::error::EvalError;
 use crate::scheme::list_ops::{eval_car_values, eval_cdr_values, eval_cons_values, eval_length_values, eval_null_q_values};
+use crate::scheme::vector_ops;
 use crate::scheme::value::Value;
 use crate::scheme::{eval, Trampoline};
 use std::rc::Rc;
@@ -109,6 +110,14 @@ fn dispatch_builtin(name: &str, args: &[Value]) -> Result<Value, EvalError> {
             };
             continuation::eval_callcc(proc.clone())
         }
+        "vector" => vector_ops::vector_new(args),
+        "make-vector" => vector_ops::make_vector(args),
+        "vector-ref" => vector_ops::vector_ref(args),
+        "vector-set!" => vector_ops::vector_set(args),
+        "vector-length" => vector_ops::vector_length(args),
+        "vector?" => vector_ops::vector_pred(args),
+        "vector->list" => vector_ops::vector_to_list(args),
+        "list->vector" => vector_ops::list_to_vector(args),
         "apply" => {
             if args.len() < 2 {
                 return Err(EvalError::WrongArgCount {
@@ -141,6 +150,8 @@ pub(super) fn register_builtins(env: &Rc<Env>) {
         "+", "-", "*", "/", "<", ">", "=", "<=", ">=", "cons", "car", "cdr", "null?", "list",
         "length", "not", "equal?", "eq?", "eqv?", "apply", "call/cc",
         "call-with-current-continuation",
+        "vector", "make-vector", "vector-ref", "vector-set!", "vector-length",
+        "vector?", "vector->list", "list->vector",
     ] {
         env.set(name.into(), Value::Builtin(name.into()));
     }

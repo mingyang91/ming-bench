@@ -1,3 +1,4 @@
+use std::cell::RefCell;
 use std::fmt;
 use std::rc::Rc;
 
@@ -23,6 +24,7 @@ pub enum Value {
         rules: Vec<(Value, Value)>,
         env: Rc<Env>,
     },
+    Vector(Rc<RefCell<Vec<Value>>>),
     Builtin(String),
     Continuation(u64),
     Void,
@@ -37,11 +39,23 @@ impl PartialEq for Value {
             (Value::Symbol(a), Value::Symbol(b)) => a == b,
             (Value::Char(a), Value::Char(b)) => a == b,
             (Value::List(a), Value::List(b)) => a == b,
+            (Value::Vector(a), Value::Vector(b)) => Rc::ptr_eq(a, b),
             (Value::Continuation(a), Value::Continuation(b)) => a == b,
             (Value::Void, Value::Void) => true,
             _ => false,
         }
     }
+}
+
+fn fmt_vector(elements: &[Value], f: &mut fmt::Formatter<'_>) -> fmt::Result {
+    write!(f, "#(")?;
+    for (i, elem) in elements.iter().enumerate() {
+        if i > 0 {
+            write!(f, " ")?;
+        }
+        write!(f, "{elem}")?;
+    }
+    write!(f, ")")
 }
 
 fn fmt_list(elements: &[Value], f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -62,6 +76,7 @@ impl Value {
             Value::String(s) => s.clone(),
             Value::Char(c) => c.to_string(),
             Value::Continuation(_) | Value::Macro { .. } => "#<continuation>".to_string(),
+            Value::Vector(_) => self.to_string(),
             other => other.to_string(),
         }
     }
@@ -82,6 +97,7 @@ impl fmt::Display for Value {
             Value::Symbol(s) => write!(f, "{s}"),
             Value::Char(c) => write!(f, "#\\{c}"),
             Value::List(elements) => fmt_list(elements, f),
+            Value::Vector(cells) => fmt_vector(&cells.borrow(), f),
             Value::Lambda { .. } | Value::Builtin(_) | Value::Continuation(_) | Value::Macro { .. } => write!(f, "#<procedure>"),
             Value::Void => write!(f, ""),
         }
