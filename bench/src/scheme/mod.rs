@@ -131,9 +131,10 @@ fn tokenize(input: &str) -> Vec<String> {
                     i += 1;
                 }
             }
+            '\'' => { tokens.push("'".to_string()); i += 1; }
             _ => {
                 let mut s = String::new();
-                while i < chars.len() && !matches!(chars[i], ' ' | '\t' | '\n' | '\r' | '(' | ')' | ';') {
+                while i < chars.len() && !matches!(chars[i], ' ' | '\t' | '\n' | '\r' | '(' | ')' | ';' | '\'') {
                     s.push(chars[i]);
                     i += 1;
                 }
@@ -163,6 +164,9 @@ fn parse(tokens: &[String], pos: usize) -> Result<(Expr, usize), EvalError> {
         Ok((Expr::List(elems), i + 1))
     } else if token == ")" {
         Err(EvalError::Parse("unexpected )".to_string()))
+    } else if token == "'" {
+        let (inner, next) = parse(tokens, pos + 1)?;
+        Ok((Expr::List(vec![Expr::Symbol("quote".to_string()), inner]), next))
     } else {
         Ok((parse_atom(token)?, pos + 1))
     }
@@ -397,6 +401,64 @@ fn eval_expr(expr: &Expr, env: &EnvRef) -> Result<Value, EvalError> {
                             }
                         }
                         Ok(result)
+                    }
+                    "cons" => {
+                        if elems.len() != 3 {
+                            return Err(EvalError::Parse("cons requires exactly 2 arguments".to_string()));
+                        }
+                        let head = eval_expr(&elems[1], env)?;
+                        let tail = eval_expr(&elems[2], env)?;
+                        match tail {
+                            Value::List(mut v) => {
+                                v.insert(0, head);
+                                Ok(Value::List(v))
+                            }
+                            _ => Err(EvalError::Parse("cons: second argument must be a list".to_string())),
+                        }
+                    }
+                    "car" => {
+                        if elems.len() != 2 {
+                            return Err(EvalError::Parse("car requires exactly 1 argument".to_string()));
+                        }
+                        let val = eval_expr(&elems[1], env)?;
+                        match val {
+                            Value::List(v) if !v.is_empty() => Ok(v[0].clone()),
+                            _ => Err(EvalError::Parse("car: argument must be a non-empty list".to_string())),
+                        }
+                    }
+                    "cdr" => {
+                        if elems.len() != 2 {
+                            return Err(EvalError::Parse("cdr requires exactly 1 argument".to_string()));
+                        }
+                        let val = eval_expr(&elems[1], env)?;
+                        match val {
+                            Value::List(v) if !v.is_empty() => Ok(Value::List(v[1..].to_vec())),
+                            _ => Err(EvalError::Parse("cdr: argument must be a non-empty list".to_string())),
+                        }
+                    }
+                    "null?" => {
+                        if elems.len() != 2 {
+                            return Err(EvalError::Parse("null? requires exactly 1 argument".to_string()));
+                        }
+                        let val = eval_expr(&elems[1], env)?;
+                        Ok(Value::Boolean(matches!(val, Value::List(ref v) if v.is_empty())))
+                    }
+                    "list" => {
+                        let mut items = Vec::new();
+                        for arg in &elems[1..] {
+                            items.push(eval_expr(arg, env)?);
+                        }
+                        Ok(Value::List(items))
+                    }
+                    "length" => {
+                        if elems.len() != 2 {
+                            return Err(EvalError::Parse("length requires exactly 1 argument".to_string()));
+                        }
+                        let val = eval_expr(&elems[1], env)?;
+                        match val {
+                            Value::List(v) => Ok(Value::Integer(v.len() as i64)),
+                            _ => Err(EvalError::Parse("length: argument must be a list".to_string())),
+                        }
                     }
                     _ => {
                         // Not a special form, try as procedure call
