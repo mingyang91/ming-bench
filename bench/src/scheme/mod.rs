@@ -1286,6 +1286,7 @@ fn is_builtin_name(name: &str) -> bool {
             | "char-alphabetic?" | "char-numeric?" | "char-whitespace?"
             | "char-upper-case?" | "char-lower-case?"
             | "char-upcase" | "char-downcase"
+            | "char=?" | "char<?"
             | "make-string" | "string"
             | "vector" | "make-vector" | "vector-ref" | "vector-set!" | "vector?" | "vector-length" | "vector->list"
             | "display" | "write" | "newline"
@@ -1555,6 +1556,87 @@ fn call_builtin_values(
                 return Err(err_at("char? requires 1 argument", call_line, call_col));
             }
             Ok(Value::Boolean(matches!(&eval_args[0], Value::Char(_))))
+        }
+        "char=?" => {
+            if eval_args.len() != 2 {
+                return Err(err_at("char=? requires 2 arguments", call_line, call_col));
+            }
+            match (&eval_args[0], &eval_args[1]) {
+                (Value::Char(a), Value::Char(b)) => Ok(Value::Boolean(a == b)),
+                _ => Err(err_at("char=? requires char arguments", call_line, call_col)),
+            }
+        }
+        "char<?" => {
+            if eval_args.len() != 2 {
+                return Err(err_at("char<? requires 2 arguments", call_line, call_col));
+            }
+            match (&eval_args[0], &eval_args[1]) {
+                (Value::Char(a), Value::Char(b)) => Ok(Value::Boolean(a < b)),
+                _ => Err(err_at("char<? requires char arguments", call_line, call_col)),
+            }
+        }
+        "char-alphabetic?" => {
+            if eval_args.len() != 1 {
+                return Err(err_at("char-alphabetic? requires 1 argument", call_line, call_col));
+            }
+            match &eval_args[0] {
+                Value::Char(c) => Ok(Value::Boolean(c.is_alphabetic())),
+                _ => Err(err_at("char-alphabetic? requires a char", call_line, call_col)),
+            }
+        }
+        "char-numeric?" => {
+            if eval_args.len() != 1 {
+                return Err(err_at("char-numeric? requires 1 argument", call_line, call_col));
+            }
+            match &eval_args[0] {
+                Value::Char(c) => Ok(Value::Boolean(c.is_ascii_digit())),
+                _ => Err(err_at("char-numeric? requires a char", call_line, call_col)),
+            }
+        }
+        "char-whitespace?" => {
+            if eval_args.len() != 1 {
+                return Err(err_at("char-whitespace? requires 1 argument", call_line, call_col));
+            }
+            match &eval_args[0] {
+                Value::Char(c) => Ok(Value::Boolean(c.is_whitespace())),
+                _ => Err(err_at("char-whitespace? requires a char", call_line, call_col)),
+            }
+        }
+        "char-upper-case?" => {
+            if eval_args.len() != 1 {
+                return Err(err_at("char-upper-case? requires 1 argument", call_line, call_col));
+            }
+            match &eval_args[0] {
+                Value::Char(c) => Ok(Value::Boolean(c.is_uppercase())),
+                _ => Err(err_at("char-upper-case? requires a char", call_line, call_col)),
+            }
+        }
+        "char-lower-case?" => {
+            if eval_args.len() != 1 {
+                return Err(err_at("char-lower-case? requires 1 argument", call_line, call_col));
+            }
+            match &eval_args[0] {
+                Value::Char(c) => Ok(Value::Boolean(c.is_lowercase())),
+                _ => Err(err_at("char-lower-case? requires a char", call_line, call_col)),
+            }
+        }
+        "char-upcase" => {
+            if eval_args.len() != 1 {
+                return Err(err_at("char-upcase requires 1 argument", call_line, call_col));
+            }
+            match &eval_args[0] {
+                Value::Char(c) => Ok(Value::Char(c.to_ascii_uppercase())),
+                _ => Err(err_at("char-upcase requires a char", call_line, call_col)),
+            }
+        }
+        "char-downcase" => {
+            if eval_args.len() != 1 {
+                return Err(err_at("char-downcase requires 1 argument", call_line, call_col));
+            }
+            match &eval_args[0] {
+                Value::Char(c) => Ok(Value::Char(c.to_ascii_lowercase())),
+                _ => Err(err_at("char-downcase requires a char", call_line, call_col)),
+            }
         }
         "zero?" => {
             if eval_args.len() != 1 {
