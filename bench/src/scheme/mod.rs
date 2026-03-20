@@ -333,6 +333,7 @@ fn eval(expr: &Expr, env: &Env, output: &mut String) -> Result<Value, EvalError>
                     "letrec" => eval_letrec(items, expr, env, output),
                     "letrec*" => eval_letrec_star(items, expr, env, output),
                     "cond" => eval_cond(items, expr, env, output),
+                    "case" => eval_case(items, expr, env, output),
                     "and" => eval_and(&items[1..], env, output),
                     "or" => eval_or(&items[1..], env, output),
                     "string-set!" => eval_string_set(items, expr, env, output),
@@ -800,6 +801,44 @@ fn eval_cond(items: &[Expr], expr: &Expr, env: &Env, output: &mut String) -> Res
     Ok(Value::Symbol("".to_string()))
 }
 
+fn eval_case(items: &[Expr], expr: &Expr, env: &Env, output: &mut String) -> Result<Value, EvalError> {
+    if items.len() < 3 {
+        return Err(err_at("case requires at least a key and one clause", expr.line, expr.col));
+    }
+    let key = eval(&items[1], env, output)?;
+    for clause in &items[2..] {
+        match &clause.kind {
+            ExprKind::List(parts) if parts.len() >= 2 => {
+                if matches!(&parts[0].kind, ExprKind::Value(Value::Symbol(s)) if s == "else") {
+                    let mut result = Value::Symbol("".to_string());
+                    for e in &parts[1..] {
+                        result = eval(e, env, output)?;
+                    }
+                    return Ok(result);
+                }
+                match &parts[0].kind {
+                    ExprKind::List(datums) => {
+                        for datum in datums {
+                            if let ExprKind::Value(v) = &datum.kind {
+                                if key == *v {
+                                    let mut result = Value::Symbol("".to_string());
+                                    for e in &parts[1..] {
+                                        result = eval(e, env, output)?;
+                                    }
+                                    return Ok(result);
+                                }
+                            }
+                        }
+                    }
+                    _ => return Err(err_at("case: invalid clause", clause.line, clause.col)),
+                }
+            }
+            _ => return Err(err_at("case: invalid clause", clause.line, clause.col)),
+        }
+    }
+    Ok(Value::Symbol("".to_string()))
+}
+
 fn eval_string_set(items: &[Expr], expr: &Expr, env: &Env, output: &mut String) -> Result<Value, EvalError> {
     if items.len() != 4 {
         return Err(err_at("string-set! requires 3 arguments", expr.line, expr.col));
@@ -885,6 +924,41 @@ fn eval_tail(expr: &Expr, env: &Env, output: &mut String) -> Result<EvalResult, 
                                         clause.col,
                                     ))
                                 }
+                            }
+                        }
+                        Ok(EvalResult::Done(Value::Symbol("".to_string())))
+                    }
+                    "case" => {
+                        if items.len() < 3 {
+                            return Err(err_at("case requires at least a key and one clause", expr.line, expr.col));
+                        }
+                        let key = eval(&items[1], env, output)?;
+                        for clause in &items[2..] {
+                            match &clause.kind {
+                                ExprKind::List(parts) if parts.len() >= 2 => {
+                                    if matches!(&parts[0].kind, ExprKind::Value(Value::Symbol(s)) if s == "else") {
+                                        for e in &parts[1..parts.len() - 1] {
+                                            eval(e, env, output)?;
+                                        }
+                                        return eval_tail(&parts[parts.len() - 1], env, output);
+                                    }
+                                    match &parts[0].kind {
+                                        ExprKind::List(datums) => {
+                                            for datum in datums {
+                                                if let ExprKind::Value(v) = &datum.kind {
+                                                    if key == *v {
+                                                        for e in &parts[1..parts.len() - 1] {
+                                                            eval(e, env, output)?;
+                                                        }
+                                                        return eval_tail(&parts[parts.len() - 1], env, output);
+                                                    }
+                                                }
+                                            }
+                                        }
+                                        _ => return Err(err_at("case: invalid clause", clause.line, clause.col)),
+                                    }
+                                }
+                                _ => return Err(err_at("case: invalid clause", clause.line, clause.col)),
                             }
                         }
                         Ok(EvalResult::Done(Value::Symbol("".to_string())))
@@ -1822,7 +1896,7 @@ fn is_ellipsis(expr: &Expr) -> bool {
 
 fn is_special_keyword(name: &str) -> bool {
     matches!(name, "define" | "define-syntax" | "set!" | "if" | "quote" | "lambda"
-        | "begin" | "let" | "letrec" | "letrec*" | "cond" | "and" | "or" | "display" | "write" | "newline"
+        | "begin" | "let" | "letrec" | "letrec*" | "cond" | "case" | "and" | "or" | "display" | "write" | "newline"
         | "call/cc" | "call-with-current-continuation" | "string-set!" | "...")
 }
 
