@@ -1276,6 +1276,7 @@ fn is_builtin_name(name: &str) -> bool {
             | "string-copy" | "string-ref" | "string->list" | "list->string"
             | "char->integer" | "integer->char"
             | "apply" | "equal?" | "eq?" | "abs" | "modulo" | "remainder"
+            | "quotient" | "expt"
             | "append" | "reverse" | "list-ref" | "filter" | "for-each"
             | "zero?" | "positive?" | "negative?" | "even?" | "odd?"
             | "min" | "max" | "list?" | "procedure?"
@@ -1780,6 +1781,85 @@ fn call_builtin_values(
                 Value::Vector(v) => Ok(Value::List(v.borrow().clone())),
                 _ => Err(err_at("vector->list: argument must be a vector", call_line, call_col)),
             }
+        }
+        "abs" => {
+            if eval_args.len() != 1 {
+                return Err(err_at("abs: expected 1 argument", call_line, call_col));
+            }
+            let n = expect_integer(&eval_args[0], call_line, call_col)?;
+            Ok(Value::Integer(n.abs()))
+        }
+        "modulo" => {
+            if eval_args.len() != 2 {
+                return Err(err_at("modulo: expected 2 arguments", call_line, call_col));
+            }
+            let a = expect_integer(&eval_args[0], call_line, call_col)?;
+            let b = expect_integer(&eval_args[1], call_line, call_col)?;
+            if b == 0 {
+                return Err(err_at("modulo: division by zero", call_line, call_col));
+            }
+            let r = a % b;
+            let result = if r != 0 && (r > 0) != (b > 0) { r + b } else { r };
+            Ok(Value::Integer(result))
+        }
+        "remainder" => {
+            if eval_args.len() != 2 {
+                return Err(err_at("remainder: expected 2 arguments", call_line, call_col));
+            }
+            let a = expect_integer(&eval_args[0], call_line, call_col)?;
+            let b = expect_integer(&eval_args[1], call_line, call_col)?;
+            if b == 0 {
+                return Err(err_at("remainder: division by zero", call_line, call_col));
+            }
+            Ok(Value::Integer(a % b))
+        }
+        "quotient" => {
+            if eval_args.len() != 2 {
+                return Err(err_at("quotient: expected 2 arguments", call_line, call_col));
+            }
+            let a = expect_integer(&eval_args[0], call_line, call_col)?;
+            let b = expect_integer(&eval_args[1], call_line, call_col)?;
+            if b == 0 {
+                return Err(err_at("quotient: division by zero", call_line, call_col));
+            }
+            Ok(Value::Integer(a / b))
+        }
+        "min" => {
+            if eval_args.is_empty() {
+                return Err(err_at("min: expected at least 1 argument", call_line, call_col));
+            }
+            let mut result = expect_integer(&eval_args[0], call_line, call_col)?;
+            for a in &eval_args[1..] {
+                let v = expect_integer(a, call_line, call_col)?;
+                if v < result {
+                    result = v;
+                }
+            }
+            Ok(Value::Integer(result))
+        }
+        "max" => {
+            if eval_args.is_empty() {
+                return Err(err_at("max: expected at least 1 argument", call_line, call_col));
+            }
+            let mut result = expect_integer(&eval_args[0], call_line, call_col)?;
+            for a in &eval_args[1..] {
+                let v = expect_integer(a, call_line, call_col)?;
+                if v > result {
+                    result = v;
+                }
+            }
+            Ok(Value::Integer(result))
+        }
+        "expt" => {
+            if eval_args.len() != 2 {
+                return Err(err_at("expt: expected 2 arguments", call_line, call_col));
+            }
+            let base = expect_integer(&eval_args[0], call_line, call_col)?;
+            let exp = expect_integer(&eval_args[1], call_line, call_col)?;
+            if exp < 0 {
+                return Err(err_at("expt: negative exponent not supported for integers", call_line, call_col));
+            }
+            Ok(Value::Integer(base.pow(exp as u32)))
         }
         _ => Err(err_at(
             format!("unknown procedure: {}", name),
