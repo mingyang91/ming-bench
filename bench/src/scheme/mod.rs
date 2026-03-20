@@ -1060,6 +1060,67 @@ fn eval_step(se: &SExpr, env: &EnvRef, out: &OutputBuf) -> Result<Step, EvalErro
                         }
                         Ok(Step::Tail(elems[elems.len() - 1].clone(), let_env))
                     }
+                    "case" => {
+                        if elems.len() < 2 {
+                            return Err(err_at(span, "case requires a key expression"));
+                        }
+                        let key = eval_expr(&elems[1], env, out)?;
+                        for clause in &elems[2..] {
+                            match &clause.expr {
+                                Expr::List(parts) if !parts.is_empty() => {
+                                    if let Expr::Symbol(s) = &parts[0].expr {
+                                        if s == "else" {
+                                            if parts.len() <= 1 {
+                                                return Ok(Step::Done(Value::Void));
+                                            }
+                                            for expr in &parts[1..parts.len() - 1] {
+                                                eval_expr(expr, env, out)?;
+                                            }
+                                            return Ok(Step::Tail(
+                                                parts[parts.len() - 1].clone(),
+                                                Rc::clone(env),
+                                            ));
+                                        }
+                                    }
+                                    // parts[0] should be a list of datums
+                                    match &parts[0].expr {
+                                        Expr::List(datums) => {
+                                            let mut matched = false;
+                                            for datum in datums {
+                                                let dval = match &datum.expr {
+                                                    Expr::Integer(n) => Value::Integer(*n),
+                                                    Expr::Boolean(b) => Value::Boolean(*b),
+                                                    Expr::Str(s) => Value::Str(s.clone()),
+                                                    Expr::Char(c) => Value::Char(*c),
+                                                    Expr::Symbol(s) => Value::Symbol(s.clone()),
+                                                    _ => continue,
+                                                };
+                                                if eqv(&key, &dval) {
+                                                    matched = true;
+                                                    break;
+                                                }
+                                            }
+                                            if matched {
+                                                if parts.len() <= 1 {
+                                                    return Ok(Step::Done(Value::Void));
+                                                }
+                                                for expr in &parts[1..parts.len() - 1] {
+                                                    eval_expr(expr, env, out)?;
+                                                }
+                                                return Ok(Step::Tail(
+                                                    parts[parts.len() - 1].clone(),
+                                                    Rc::clone(env),
+                                                ));
+                                            }
+                                        }
+                                        _ => return Err(err_at(parts[0].span, "case clause datums must be a list")),
+                                    }
+                                }
+                                _ => return Err(err_at(clause.span, "case clause must be a list")),
+                            }
+                        }
+                        Ok(Step::Done(Value::Void))
+                    }
                     "cond" => {
                         for clause in &elems[1..] {
                             match &clause.expr {
@@ -1532,6 +1593,8 @@ fn apply_builtin(name: &str, args: &[Value], span: Span, out: &OutputBuf) -> Res
         "symbol?" => Ok(Value::Boolean(matches!(&args[0], Value::Symbol(_)))),
         "char?" => Ok(Value::Boolean(matches!(&args[0], Value::Char(_)))),
         "equal?" => Ok(Value::Boolean(args[0] == args[1])),
+        "eqv?" => Ok(Value::Boolean(eqv(&args[0], &args[1]))),
+        "eq?" => Ok(Value::Boolean(eqv(&args[0], &args[1]))),
         "string-append" => {
             let mut result = String::new();
             for arg in args {
@@ -1666,6 +1729,18 @@ fn is_false(val: &Value) -> bool {
     matches!(val, Value::Boolean(false))
 }
 
+fn eqv(a: &Value, b: &Value) -> bool {
+    match (a, b) {
+        (Value::Integer(x), Value::Integer(y)) => x == y,
+        (Value::Boolean(x), Value::Boolean(y)) => x == y,
+        (Value::Char(x), Value::Char(y)) => x == y,
+        (Value::Symbol(x), Value::Symbol(y)) => x == y,
+        (Value::Void, Value::Void) => true,
+        (Value::List(x), Value::List(y)) if x.is_empty() && y.is_empty() => true,
+        _ => std::ptr::eq(a as *const Value, b as *const Value),
+    }
+}
+
 fn require_two_ints(
     args: &[SExpr],
     op: &str,
@@ -1709,7 +1784,7 @@ fn init_builtins(env: &EnvRef) {
         "number->string", "symbol->string", "string->symbol",
         "string-ref", "string-copy", "string-set!", "string->list", "list->string",
         "char->integer", "integer->char",
-        "equal?",
+        "equal?", "eqv?", "eq?",
         "call/cc", "call-with-current-continuation",
     ] {
         EnvFrame::set(env, name.to_string(), Value::Builtin(name.to_string()));
