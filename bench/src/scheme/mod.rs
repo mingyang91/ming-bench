@@ -997,6 +997,69 @@ fn eval_step(se: &SExpr, env: &EnvRef, out: &OutputBuf) -> Result<Step, EvalErro
                         }
                         Ok(Step::Tail(elems[elems.len() - 1].clone(), let_env))
                     }
+                    "letrec" => {
+                        if elems.len() < 3 {
+                            return Err(err_at(span, "letrec requires bindings and body"));
+                        }
+                        let bindings = match &elems[1].expr {
+                            Expr::List(b) => b,
+                            _ => return Err(err_at(elems[1].span, "letrec bindings must be a list")),
+                        };
+                        let let_env = EnvFrame::child(env);
+                        // First pass: bind all names to Void
+                        let mut names = Vec::new();
+                        for binding in bindings {
+                            match &binding.expr {
+                                Expr::List(pair) if pair.len() == 2 => {
+                                    if let Expr::Symbol(name) = &pair[0].expr {
+                                        names.push(name.clone());
+                                        EnvFrame::set(&let_env, name.clone(), Value::Void);
+                                    } else {
+                                        return Err(err_at(pair[0].span, "letrec binding name must be a symbol"));
+                                    }
+                                }
+                                _ => return Err(err_at(binding.span, "letrec binding must be a pair")),
+                            }
+                        }
+                        // Second pass: evaluate init exprs in the letrec env and assign
+                        for (i, binding) in bindings.iter().enumerate() {
+                            if let Expr::List(pair) = &binding.expr {
+                                let val = eval_expr(&pair[1], &let_env, out)?;
+                                EnvFrame::set(&let_env, names[i].clone(), val);
+                            }
+                        }
+                        for expr in &elems[2..elems.len() - 1] {
+                            eval_expr(expr, &let_env, out)?;
+                        }
+                        Ok(Step::Tail(elems[elems.len() - 1].clone(), let_env))
+                    }
+                    "letrec*" => {
+                        if elems.len() < 3 {
+                            return Err(err_at(span, "letrec* requires bindings and body"));
+                        }
+                        let bindings = match &elems[1].expr {
+                            Expr::List(b) => b,
+                            _ => return Err(err_at(elems[1].span, "letrec* bindings must be a list")),
+                        };
+                        let let_env = EnvFrame::child(env);
+                        for binding in bindings {
+                            match &binding.expr {
+                                Expr::List(pair) if pair.len() == 2 => {
+                                    if let Expr::Symbol(name) = &pair[0].expr {
+                                        let val = eval_expr(&pair[1], &let_env, out)?;
+                                        EnvFrame::set(&let_env, name.clone(), val);
+                                    } else {
+                                        return Err(err_at(pair[0].span, "letrec* binding name must be a symbol"));
+                                    }
+                                }
+                                _ => return Err(err_at(binding.span, "letrec* binding must be a pair")),
+                            }
+                        }
+                        for expr in &elems[2..elems.len() - 1] {
+                            eval_expr(expr, &let_env, out)?;
+                        }
+                        Ok(Step::Tail(elems[elems.len() - 1].clone(), let_env))
+                    }
                     "cond" => {
                         for clause in &elems[1..] {
                             match &clause.expr {
