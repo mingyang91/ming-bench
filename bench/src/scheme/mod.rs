@@ -190,6 +190,53 @@ fn eval_expr(expr: &Expr) -> Result<Value, EvalError> {
                         }
                         Ok(Value::Integer(result))
                     }
+                    "<" => {
+                        let (a, b) = require_two_ints(&elems[1..], "<")?;
+                        Ok(Value::Boolean(a < b))
+                    }
+                    ">" => {
+                        let (a, b) = require_two_ints(&elems[1..], ">")?;
+                        Ok(Value::Boolean(a > b))
+                    }
+                    "=" => {
+                        let (a, b) = require_two_ints(&elems[1..], "=")?;
+                        Ok(Value::Boolean(a == b))
+                    }
+                    "<=" => {
+                        let (a, b) = require_two_ints(&elems[1..], "<=")?;
+                        Ok(Value::Boolean(a <= b))
+                    }
+                    ">=" => {
+                        let (a, b) = require_two_ints(&elems[1..], ">=")?;
+                        Ok(Value::Boolean(a >= b))
+                    }
+                    "not" => {
+                        if elems.len() != 2 {
+                            return Err(EvalError::Parse("not requires exactly one argument".to_string()));
+                        }
+                        let val = eval_expr(&elems[1])?;
+                        Ok(Value::Boolean(is_false(&val)))
+                    }
+                    "and" => {
+                        let mut result = Value::Boolean(true);
+                        for arg in &elems[1..] {
+                            result = eval_expr(arg)?;
+                            if is_false(&result) {
+                                return Ok(result);
+                            }
+                        }
+                        Ok(result)
+                    }
+                    "or" => {
+                        let mut result = Value::Boolean(false);
+                        for arg in &elems[1..] {
+                            result = eval_expr(arg)?;
+                            if !is_false(&result) {
+                                return Ok(result);
+                            }
+                        }
+                        Ok(result)
+                    }
                     _ => Err(EvalError::Parse(format!("unknown procedure: {}", op))),
                 }
             } else {
@@ -197,6 +244,19 @@ fn eval_expr(expr: &Expr) -> Result<Value, EvalError> {
             }
         }
     }
+}
+
+fn is_false(val: &Value) -> bool {
+    matches!(val, Value::Boolean(false))
+}
+
+fn require_two_ints(args: &[Expr], op: &str) -> Result<(i64, i64), EvalError> {
+    if args.len() != 2 {
+        return Err(EvalError::Parse(format!("{} requires exactly two arguments", op)));
+    }
+    let a = require_int(&eval_expr(&args[0])?)?;
+    let b = require_int(&eval_expr(&args[1])?)?;
+    Ok((a, b))
 }
 
 fn require_int(val: &Value) -> Result<i64, EvalError> {
