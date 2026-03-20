@@ -3,7 +3,8 @@ use std::rc::Rc;
 use crate::scheme::env::Env;
 use crate::scheme::error::EvalError;
 use crate::scheme::value::Value;
-use crate::scheme::{apply_lambda, eval};
+use crate::scheme::apply::apply_lambda;
+use crate::scheme::eval;
 
 pub(crate) fn eval_map(args: &[Value], env: &Rc<Env>) -> Result<Value, EvalError> {
     let [func_expr, list_expr] = args else {

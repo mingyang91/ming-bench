@@ -3,7 +3,8 @@ use std::rc::Rc;
 use crate::scheme::env::Env;
 use crate::scheme::error::EvalError;
 use crate::scheme::value::Value;
-use crate::scheme::{eval, eval_body_tco, extract_params, is_truthy, Trampoline};
+use crate::scheme::apply::{extract_params, is_truthy};
+use crate::scheme::{eval, eval_body_tco, Trampoline};
 
 /// Evaluate `(not expr)` — returns #t if expr is falsy, #f otherwise.
 pub(crate) fn eval_not(args: &[Value], env: &Rc<Env>) -> Result<Value, EvalError> {
