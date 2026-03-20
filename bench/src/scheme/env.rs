@@ -57,4 +57,19 @@ impl Env {
     pub fn set(&self, name: String, val: Value) {
         self.bindings.borrow_mut().insert(name, val);
     }
+
+    /// Update an existing binding in the frame where it is defined.
+    /// Returns `true` if the binding was found and updated.
+    pub fn set_existing(&self, name: &str, val: Value) -> bool {
+        let mut bindings = self.bindings.borrow_mut();
+        if bindings.contains_key(name) {
+            bindings.insert(name.to_string(), val);
+            true
+        } else {
+            drop(bindings);
+            self.parent
+                .as_ref()
+                .is_some_and(|p| p.set_existing(name, val))
+        }
+    }
 }

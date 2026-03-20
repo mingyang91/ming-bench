@@ -192,6 +192,16 @@ fn parse_atom(token: &str) -> Value {
     if token == "#f" {
         return Value::Boolean(false);
     }
+    if let Some(rest) = token.strip_prefix("#\\") {
+        let ch = match rest {
+            "space" => ' ',
+            "newline" => '\n',
+            "tab" => '\t',
+            s if s.len() == 1 => s.chars().next().expect("single char"),
+            _ => return Value::Symbol(token.to_string()),
+        };
+        return Value::Char(ch);
+    }
     if token.starts_with('"') && token.ends_with('"') {
         let inner = &token[1..token.len() - 1];
         return Value::String(inner.to_string());

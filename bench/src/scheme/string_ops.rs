@@ -121,6 +121,59 @@ pub fn eval_string_to_symbol(args: &[Value], env: &Rc<Env>) -> Result<Value, Eva
     Ok(Value::Symbol(s.to_string()))
 }
 
+/// Evaluate `(string-copy s)` — return a copy of the string.
+pub fn eval_string_copy(args: &[Value], env: &Rc<Env>) -> Result<Value, EvalError> {
+    let [arg] = args else {
+        return Err(EvalError::WrongArgCount {
+            expected: "1".into(),
+            got: args.len(),
+        });
+    };
+    let val = eval(arg, env)?;
+    let s = expect_string(&val)?;
+    Ok(Value::String(s.to_string()))
+}
+
+/// Evaluate `(string-set! var k ch)` — mutate string at index k.
+/// Implemented as a special form: first arg must be a symbol naming a variable.
+pub fn eval_string_set(args: &[Value], env: &Rc<Env>) -> Result<Value, EvalError> {
+    let [name_expr, k_expr, ch_expr] = args else {
+        return Err(EvalError::WrongArgCount {
+            expected: "3".into(),
+            got: args.len(),
+        });
+    };
+    let Value::Symbol(name) = name_expr else {
+        return Err(EvalError::TypeError {
+            expected: "symbol".into(),
+            got: format!("{name_expr}"),
+        });
+    };
+    let val = env.get(name).ok_or_else(|| EvalError::UnboundVariable {
+        name: name.clone(),
+    })?;
+    let s = expect_string(&val)?.to_string();
+    let k = expect_integer(&eval(k_expr, env)?)? as usize;
+    let ch_val = eval(ch_expr, env)?;
+    let Value::Char(ch) = ch_val else {
+        return Err(EvalError::TypeError {
+            expected: "char".into(),
+            got: format!("{ch_val}"),
+        });
+    };
+    let mut chars: Vec<char> = s.chars().collect();
+    if k >= chars.len() {
+        return Err(EvalError::TypeError {
+            expected: format!("index < {}", chars.len()),
+            got: format!("{k}"),
+        });
+    }
+    chars[k] = ch;
+    let new_s: String = chars.into_iter().collect();
+    env.set_existing(name, Value::String(new_s));
+    Ok(Value::Void)
+}
+
 /// Evaluate `(string-ref s k)` — character at index k.
 pub fn eval_string_ref(args: &[Value], env: &Rc<Env>) -> Result<Value, EvalError> {
     let [s_expr, k_expr] = args else {

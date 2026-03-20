@@ -12,8 +12,9 @@ use builtins::{apply_arithmetic, apply_comparison};
 use env::Env;
 use list_ops::{eval_car, eval_cdr, eval_cons, eval_length, eval_list, eval_null_q, eval_type_pred};
 use string_ops::{
-    eval_number_to_string, eval_string_append, eval_string_length, eval_string_ref,
-    eval_string_to_number, eval_string_to_symbol, eval_substring, eval_symbol_to_string,
+    eval_number_to_string, eval_string_append, eval_string_copy, eval_string_length,
+    eval_string_ref, eval_string_set, eval_string_to_number, eval_string_to_symbol,
+    eval_substring, eval_symbol_to_string,
 };
 use special_forms::{
     eval_and, eval_cond, eval_define, eval_if, eval_lambda, eval_let, eval_not, eval_or,
@@ -126,6 +127,8 @@ pub(crate) fn eval(expr: &Value, env: &Rc<Env>) -> Result<Value, EvalError> {
                 Value::Symbol(op) if op == "symbol->string" => eval_symbol_to_string(args, env),
                 Value::Symbol(op) if op == "string->symbol" => eval_string_to_symbol(args, env),
                 Value::Symbol(op) if op == "string-ref" => eval_string_ref(args, env),
+                Value::Symbol(op) if op == "string-copy" => eval_string_copy(args, env),
+                Value::Symbol(op) if op == "string-set!" => eval_string_set(args, env),
                 Value::Symbol(op) if op == "display" => eval_display(args, env),
                 Value::Symbol(op) if op == "write" => eval_write(args, env),
                 Value::Symbol(op) if op == "newline" => eval_newline(args, env),
