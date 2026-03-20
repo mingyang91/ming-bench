@@ -26,8 +26,8 @@ use string_ops::{
 };
 use io_ops::{eval_display, eval_map, eval_newline, eval_write};
 use special_forms::{
-    eval_and, eval_cond_tco, eval_define, eval_if_tco, eval_lambda, eval_let_tco, eval_not,
-    eval_or, eval_set,
+    eval_and_tco, eval_cond_tco, eval_define, eval_if_tco, eval_lambda, eval_let_tco, eval_not,
+    eval_or_tco, eval_set,
 };
 use std::rc::Rc;
 use value::Value;
@@ -117,8 +117,8 @@ fn eval_list_form(elements: &[Value], env: &Rc<Env>) -> Result<Trampoline, EvalE
         Value::Symbol(op) if op == "begin" => eval_body_tco(args, env),
         Value::Symbol(op) if op == "cond" => eval_cond_tco(args, env),
         Value::Symbol(op) if op == "not" => eval_not(args, env).map(Trampoline::Done),
-        Value::Symbol(op) if op == "and" => eval_and(args, env).map(Trampoline::Done),
-        Value::Symbol(op) if op == "or" => eval_or(args, env).map(Trampoline::Done),
+        Value::Symbol(op) if op == "and" => eval_and_tco(args, env),
+        Value::Symbol(op) if op == "or" => eval_or_tco(args, env),
         Value::Symbol(op) if op == "cons" => eval_cons(args, env).map(Trampoline::Done),
         Value::Symbol(op) if op == "car" => eval_car(args, env).map(Trampoline::Done),
         Value::Symbol(op) if op == "cdr" => eval_cdr(args, env).map(Trampoline::Done),

@@ -19,27 +19,45 @@ pub(crate) fn eval_not(args: &[Value], env: &Rc<Env>) -> Result<Value, EvalError
 }
 
 /// Evaluate `(and expr ...)` — short-circuit, returns last truthy or first falsy.
-pub(crate) fn eval_and(args: &[Value], env: &Rc<Env>) -> Result<Value, EvalError> {
-    let mut result = Value::Boolean(true);
-    for arg in args {
-        result = eval(arg, env)?;
+/// TCO: the last expression is returned as a Bounce.
+pub(crate) fn eval_and_tco(args: &[Value], env: &Rc<Env>) -> Result<Trampoline, EvalError> {
+    if args.is_empty() {
+        return Ok(Trampoline::Done(Value::Boolean(true)));
+    }
+    let [init @ .., last] = args else {
+        unreachable!();
+    };
+    for arg in init {
+        let result = eval(arg, env)?;
         if !is_truthy(&result) {
-            return Ok(result);
+            return Ok(Trampoline::Done(result));
         }
     }
-    Ok(result)
+    Ok(Trampoline::Bounce {
+        expr: last.clone(),
+        env: Rc::clone(env),
+    })
 }
 
 /// Evaluate `(or expr ...)` — short-circuit, returns first truthy or last falsy.
-pub(crate) fn eval_or(args: &[Value], env: &Rc<Env>) -> Result<Value, EvalError> {
-    let mut result = Value::Boolean(false);
-    for arg in args {
-        result = eval(arg, env)?;
+/// TCO: the last expression is returned as a Bounce.
+pub(crate) fn eval_or_tco(args: &[Value], env: &Rc<Env>) -> Result<Trampoline, EvalError> {
+    if args.is_empty() {
+        return Ok(Trampoline::Done(Value::Boolean(false)));
+    }
+    let [init @ .., last] = args else {
+        unreachable!();
+    };
+    for arg in init {
+        let result = eval(arg, env)?;
         if is_truthy(&result) {
-            return Ok(result);
+            return Ok(Trampoline::Done(result));
         }
     }
-    Ok(result)
+    Ok(Trampoline::Bounce {
+        expr: last.clone(),
+        env: Rc::clone(env),
+    })
 }
 
 /// Evaluate `(define ...)` — supports both `(define name expr)` and `(define (name params...) body...)`.
@@ -122,17 +140,28 @@ pub(crate) fn eval_if_tco(args: &[Value], env: &Rc<Env>) -> Result<Trampoline, E
 }
 
 /// Evaluate `(let ...) ` — TCO: last body expression is a Bounce.
+/// Supports both plain `(let ((bindings...)) body...)` and named `(let name ((bindings...)) body...)`.
 pub(crate) fn eval_let_tco(args: &[Value], env: &Rc<Env>) -> Result<Trampoline, EvalError> {
-    let [Value::List(bindings), body @ ..] = args else {
-        return Err(EvalError::BadSyntax {
+    match args {
+        // Named let: (let name ((var init) ...) body ...)
+        [Value::Symbol(name), Value::List(bindings), body @ ..] if !body.is_empty() => {
+            eval_named_let(name, bindings, body, env)
+        }
+        // Plain let: (let ((var init) ...) body ...)
+        [Value::List(bindings), body @ ..] if !body.is_empty() => {
+            eval_plain_let(bindings, body, env)
+        }
+        _ => Err(EvalError::BadSyntax {
             form: "let".into(),
-        });
-    };
-    if body.is_empty() {
-        return Err(EvalError::BadSyntax {
-            form: "let".into(),
-        });
+        }),
     }
+}
+
+fn eval_plain_let(
+    bindings: &[Value],
+    body: &[Value],
+    env: &Rc<Env>,
+) -> Result<Trampoline, EvalError> {
     let child = Env::child(env);
     for binding in bindings {
         let Value::List(pair) = binding else {
@@ -147,6 +176,46 @@ pub(crate) fn eval_let_tco(args: &[Value], env: &Rc<Env>) -> Result<Trampoline, 
         };
         let val = eval(expr, env)?;
         child.set(name.clone(), val);
+    }
+    eval_body_tco(body, &child)
+}
+
+fn eval_named_let(
+    name: &str,
+    bindings: &[Value],
+    body: &[Value],
+    env: &Rc<Env>,
+) -> Result<Trampoline, EvalError> {
+    let mut param_names = Vec::with_capacity(bindings.len());
+    let mut init_vals = Vec::with_capacity(bindings.len());
+    for binding in bindings {
+        let Value::List(pair) = binding else {
+            return Err(EvalError::BadSyntax {
+                form: "let".into(),
+            });
+        };
+        let [Value::Symbol(var), expr] = pair.as_slice() else {
+            return Err(EvalError::BadSyntax {
+                form: "let".into(),
+            });
+        };
+        param_names.push(var.clone());
+        init_vals.push(eval(expr, env)?);
+    }
+    // Create a child env and bind the loop procedure
+    let child = Env::child(env);
+    let lambda = Value::Lambda {
+        params: param_names,
+        rest_param: None,
+        body: body.to_vec(),
+        env: Rc::clone(&child),
+    };
+    child.set(name.to_string(), lambda);
+    // Bind initial values
+    for (binding, val) in bindings.iter().zip(init_vals) {
+        let Value::List(pair) = binding else { unreachable!() };
+        let Value::Symbol(var) = &pair[0] else { unreachable!() };
+        child.set(var.clone(), val);
     }
     eval_body_tco(body, &child)
 }
