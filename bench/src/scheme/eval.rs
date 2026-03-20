@@ -33,6 +33,7 @@ fn eval_pair(value: &Value, env: &mut Env) -> Result<Value, EvalError> {
             "if" => eval_if(args, env),
             "quote" => eval_quote(args),
             "lambda" => eval_lambda(args, env),
+            "begin" => eval_begin(args, env),
             _ => return eval_symbol_call(name, args, env),
         };
     }
@@ -119,18 +120,7 @@ fn eval_define(args: &[Value], env: &mut Env) -> Result<Value, EvalError> {
                 })
                 .collect::<Result<_, _>>()?;
 
-            let func_body = if body.len() == 1 {
-                body[0].clone()
-            } else {
-                // Wrap multiple body exprs in (begin ...)
-                // For now just use last expression since we don't have begin yet
-                body.last()
-                    .ok_or(EvalError::WrongArgCount {
-                        expected: 1,
-                        got: 0,
-                    })?
-                    .clone()
-            };
+            let func_body = wrap_body(body)?;
 
             let lambda = Value::Lambda {
                 params,
@@ -176,6 +166,31 @@ fn eval_quote(args: &[Value]) -> Result<Value, EvalError> {
     Ok(datum.clone())
 }
 
+fn eval_begin(args: &[Value], env: &mut Env) -> Result<Value, EvalError> {
+    args.iter()
+        .try_fold(Value::Nil, |_, expr| eval(expr, env))
+}
+
+fn wrap_body(body: &[Value]) -> Result<Value, EvalError> {
+    match body {
+        [single] => Ok(single.clone()),
+        [_, ..] => {
+            let begin_sym = Value::Symbol("begin".to_string());
+            let list = body
+                .iter()
+                .rev()
+                .fold(Value::Nil, |acc, expr| {
+                    Value::Pair(Box::new(expr.clone()), Box::new(acc))
+                });
+            Ok(Value::Pair(Box::new(begin_sym), Box::new(list)))
+        }
+        [] => Err(EvalError::WrongArgCount {
+            expected: 1,
+            got: 0,
+        }),
+    }
+}
+
 fn eval_lambda(args: &[Value], env: &Env) -> Result<Value, EvalError> {
     let [param_list, body @ ..] = args else {
         return Err(EvalError::WrongArgCount {
@@ -202,16 +217,7 @@ fn eval_lambda(args: &[Value], env: &Env) -> Result<Value, EvalError> {
         })
         .collect::<Result<_, _>>()?;
 
-    let func_body = if body.len() == 1 {
-        body[0].clone()
-    } else {
-        body.last()
-            .ok_or(EvalError::WrongArgCount {
-                expected: 2,
-                got: 1,
-            })?
-            .clone()
-    };
+    let func_body = wrap_body(body)?;
 
     Ok(Value::Lambda {
         params,
