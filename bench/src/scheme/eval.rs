@@ -10,12 +10,13 @@ struct ContinuationState {
     env: Env,
     current_expr: Value,
     remaining_exprs: Vec<Value>,
+    callcc_arg_expr: Value,
 }
 
 thread_local! {
     static CONT_COUNTER: Cell<u64> = const { Cell::new(0) };
     static CONT_STORE: RefCell<HashMap<u64, ContinuationState>> = RefCell::new(HashMap::new());
-    static CONT_REPLAY: RefCell<Option<Value>> = const { RefCell::new(None) };
+    static CONT_REPLAY: RefCell<Option<(Value, Value)>> = const { RefCell::new(None) };
     static TOP_LEVEL_CTX: RefCell<Option<(Value, Vec<Value>, Env)>> = const { RefCell::new(None) };
 }
 
@@ -35,12 +36,17 @@ fn lookup_continuation(id: u64) -> Option<ContinuationState> {
     CONT_STORE.with(|s| s.borrow().get(&id).cloned())
 }
 
-fn save_continuation_state(id: u64) {
+fn set_cont_replay(arg_expr: Value, value: Value) {
+    CONT_REPLAY.with(|r| *r.borrow_mut() = Some((arg_expr, value)));
+}
+
+fn save_continuation_state(id: u64, callcc_arg_expr: &Value) {
     if let Some((expr, remaining, env)) = read_top_level_ctx() {
         let state = ContinuationState {
             env,
             current_expr: expr,
             remaining_exprs: remaining,
+            callcc_arg_expr: callcc_arg_expr.clone(),
         };
         CONT_STORE.with(|s| {
             s.borrow_mut().insert(id, state);
@@ -48,13 +54,21 @@ fn save_continuation_state(id: u64) {
     }
 }
 
-fn handle_callcc(proc: &Value) -> Result<Value, EvalError> {
-    let replay = CONT_REPLAY.with(|r| r.borrow_mut().take());
+fn handle_callcc(proc: &Value, raw_arg: &Value) -> Result<Value, EvalError> {
+    let replay = CONT_REPLAY.with(|r| {
+        let mut opt = r.borrow_mut();
+        match opt.as_ref() {
+            Some((target_expr, _)) if target_expr == raw_arg => {
+                opt.take().map(|(_, v)| v)
+            }
+            _ => None,
+        }
+    });
     if let Some(value) = replay {
         return Ok(value);
     }
     let id = next_cont_id();
-    save_continuation_state(id);
+    save_continuation_state(id, raw_arg);
     let k = Value::Continuation { id };
     let result = match apply_value_tail(proc, &[k])? {
         TailAction::Return(val) => Ok(val),
@@ -90,7 +104,7 @@ pub fn eval_program(exprs: Vec<Value>, env: Env) -> Result<String, EvalError> {
                 let state = state.ok_or(EvalError::Parse {
                     msg: "invalid continuation".into(),
                 })?;
-                CONT_REPLAY.with(|r| *r.borrow_mut() = Some(*value));
+                set_cont_replay(state.callcc_arg_expr.clone(), *value);
                 let mut new_exprs = vec![state.current_expr];
                 new_exprs.extend(state.remaining_exprs);
                 current_exprs = new_exprs;
@@ -208,8 +222,9 @@ fn eval_special_form(
                     actual: args.len(),
                 });
             }
+            let raw_arg = args[0].clone();
             let proc = eval(&args[0], env)?;
-            TailAction::Return(handle_callcc(&proc)?)
+            TailAction::Return(handle_callcc(&proc, &raw_arg)?)
         }
         _ => return Ok(None),
     };
@@ -235,7 +250,7 @@ fn apply_callcc_builtin(args: &[Value]) -> Result<TailAction, EvalError> {
             actual: args.len(),
         });
     }
-    Ok(TailAction::Return(handle_callcc(&args[0])?))
+    Ok(TailAction::Return(handle_callcc(&args[0], &args[0])?))
 }
 
 fn invoke_continuation(id: u64, args: &[Value]) -> Result<TailAction, EvalError> {
