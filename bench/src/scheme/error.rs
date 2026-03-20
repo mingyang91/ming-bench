@@ -9,4 +9,19 @@ pub enum EvalError {
 
     #[error("empty input")]
     EmptyInput,
+
+    #[error("type error: expected {expected}, got {got}")]
+    TypeError { expected: String, got: String },
+
+    #[error("wrong number of arguments: expected {expected}, got {got}")]
+    WrongArgCount { expected: String, got: usize },
+
+    #[error("unbound variable: {name}")]
+    UnboundVariable { name: String },
+
+    #[error("empty list in application position")]
+    EmptyList,
+
+    #[error("not a procedure: {value}")]
+    NotAProcedure { value: String },
 }
