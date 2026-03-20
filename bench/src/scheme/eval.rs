@@ -224,6 +224,7 @@ fn is_builtin(name: &str) -> bool {
     matches!(
         name,
         "+" | "-" | "*" | "/" | "<" | ">" | "=" | "<=" | ">=" | "not" | "and" | "or"
+            | "cons" | "car" | "cdr" | "null?" | "list" | "length"
     )
 }
 
@@ -234,6 +235,7 @@ fn eval_builtin(name: &str, args: &[Value], env: &mut Env) -> Result<Value, Eval
         "not" => eval_not(args, env),
         "and" => eval_and(args, env),
         "or" => eval_or(args, env),
+        "cons" | "car" | "cdr" | "null?" | "list" | "length" => eval_list_builtin(name, args, env),
         _ => Err(EvalError::UnboundVariable {
             name: name.to_string(),
         }),
@@ -362,4 +364,62 @@ fn eval_or(args: &[Value], env: &mut Env) -> Result<Value, EvalError> {
         }
     }
     Ok(result)
+}
+
+fn eval_list_builtin(name: &str, args: &[Value], env: &mut Env) -> Result<Value, EvalError> {
+    match name {
+        "cons" => {
+            let [a, b] = args else {
+                return Err(EvalError::WrongArgCount { expected: 2, got: args.len() });
+            };
+            let car = eval(a, env)?;
+            let cdr = eval(b, env)?;
+            Ok(Value::Pair(Box::new(car), Box::new(cdr)))
+        }
+        "car" => {
+            let [a] = args else {
+                return Err(EvalError::WrongArgCount { expected: 1, got: args.len() });
+            };
+            let val = eval(a, env)?;
+            let Value::Pair(car, _) = val else {
+                return Err(EvalError::TypeError { expected: "pair".to_string(), got: val.display() });
+            };
+            Ok(*car)
+        }
+        "cdr" => {
+            let [a] = args else {
+                return Err(EvalError::WrongArgCount { expected: 1, got: args.len() });
+            };
+            let val = eval(a, env)?;
+            let Value::Pair(_, cdr) = val else {
+                return Err(EvalError::TypeError { expected: "pair".to_string(), got: val.display() });
+            };
+            Ok(*cdr)
+        }
+        "null?" => {
+            let [a] = args else {
+                return Err(EvalError::WrongArgCount { expected: 1, got: args.len() });
+            };
+            let val = eval(a, env)?;
+            Ok(Value::Boolean(matches!(val, Value::Nil)))
+        }
+        "list" => {
+            let vals: Vec<Value> = args.iter().map(|a| eval(a, env)).collect::<Result<_, _>>()?;
+            Ok(vals.into_iter().rev().fold(Value::Nil, |acc, v| {
+                Value::Pair(Box::new(v), Box::new(acc))
+            }))
+        }
+        "length" => {
+            let [a] = args else {
+                return Err(EvalError::WrongArgCount { expected: 1, got: args.len() });
+            };
+            let val = eval(a, env)?;
+            let items = val.to_list_vec().ok_or_else(|| EvalError::TypeError {
+                expected: "proper list".to_string(),
+                got: val.display(),
+            })?;
+            Ok(Value::Integer(items.len() as i64))
+        }
+        _ => unreachable!("unexpected list builtin: {name}"),
+    }
 }

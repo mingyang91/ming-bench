@@ -7,6 +7,7 @@ use super::Value;
 enum Token {
     LParen,
     RParen,
+    Quote,
     Atom(String),
 }
 
@@ -58,6 +59,10 @@ fn tokenize(input: &str) -> Vec<Token> {
                 tokens.push(Token::RParen);
                 chars.next();
             }
+            '\'' => {
+                tokens.push(Token::Quote);
+                chars.next();
+            }
             '"' => {
                 chars.next();
                 tokens.push(Token::Atom(read_string_literal(&mut chars)));
@@ -104,6 +109,14 @@ fn parse_tokens(tokens: &[Token], pos: usize) -> Result<(Value, usize), EvalErro
         Token::RParen => Err(EvalError::UnexpectedToken {
             token: ")".to_string(),
         }),
+        Token::Quote => {
+            let (datum, next) = parse_tokens(tokens, pos + 1)?;
+            let quoted = Value::Pair(
+                Box::new(Value::Symbol("quote".to_string())),
+                Box::new(Value::Pair(Box::new(datum), Box::new(Value::Nil))),
+            );
+            Ok((quoted, next))
+        }
         Token::Atom(s) => {
             let val = parse_atom(s)?;
             Ok((val, pos + 1))
