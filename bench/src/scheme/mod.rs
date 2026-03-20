@@ -69,6 +69,10 @@ fn parse_expr(input: &str) -> Result<(Value, &str), EvalError> {
     if input.is_empty() {
         return Err(EvalError::Parse("unexpected end of input".to_string()));
     }
+    if input.starts_with('\'') {
+        let (inner, rest) = parse_expr(&input[1..])?;
+        return Ok((Value::List(vec![Value::Symbol("quote".to_string()), inner]), rest));
+    }
     if input.starts_with('"') {
         return parse_string(&input[1..]);
     }
@@ -77,7 +81,7 @@ fn parse_expr(input: &str) -> Result<(Value, &str), EvalError> {
     }
     // Read a token up to whitespace or end
     let end = input
-        .find(|c: char| c.is_whitespace() || c == '(' || c == ')' || c == '"')
+        .find(|c: char| c.is_whitespace() || c == '(' || c == ')' || c == '"' || c == '\'')
         .unwrap_or(input.len());
     let token = &input[..end];
     let rest = &input[end..];
@@ -327,6 +331,55 @@ fn apply_builtin(name: &str, args: &[Value], env: &mut Env) -> Result<Value, Eva
                 return Err(EvalError::Parse("not requires 1 argument".to_string()));
             }
             Ok(Value::Boolean(is_falsy(&eval_args[0])))
+        }
+        "cons" => {
+            if eval_args.len() != 2 {
+                return Err(EvalError::Parse("cons requires 2 arguments".to_string()));
+            }
+            match &eval_args[1] {
+                Value::List(items) => {
+                    let mut new_list = vec![eval_args[0].clone()];
+                    new_list.extend(items.iter().cloned());
+                    Ok(Value::List(new_list))
+                }
+                _ => Err(EvalError::Parse("cons: second argument must be a list".to_string())),
+            }
+        }
+        "car" => {
+            if eval_args.len() != 1 {
+                return Err(EvalError::Parse("car requires 1 argument".to_string()));
+            }
+            match &eval_args[0] {
+                Value::List(items) if !items.is_empty() => Ok(items[0].clone()),
+                _ => Err(EvalError::Parse("car: argument must be a non-empty list".to_string())),
+            }
+        }
+        "cdr" => {
+            if eval_args.len() != 1 {
+                return Err(EvalError::Parse("cdr requires 1 argument".to_string()));
+            }
+            match &eval_args[0] {
+                Value::List(items) if !items.is_empty() => Ok(Value::List(items[1..].to_vec())),
+                _ => Err(EvalError::Parse("cdr: argument must be a non-empty list".to_string())),
+            }
+        }
+        "null?" => {
+            if eval_args.len() != 1 {
+                return Err(EvalError::Parse("null? requires 1 argument".to_string()));
+            }
+            Ok(Value::Boolean(matches!(&eval_args[0], Value::List(items) if items.is_empty())))
+        }
+        "list" => {
+            Ok(Value::List(eval_args))
+        }
+        "length" => {
+            if eval_args.len() != 1 {
+                return Err(EvalError::Parse("length requires 1 argument".to_string()));
+            }
+            match &eval_args[0] {
+                Value::List(items) => Ok(Value::Integer(items.len() as i64)),
+                _ => Err(EvalError::Parse("length: argument must be a list".to_string())),
+            }
         }
         _ => Err(EvalError::Parse(format!("unknown procedure: {}", name))),
     }
