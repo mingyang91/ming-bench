@@ -34,6 +34,8 @@ fn eval_pair(value: &Value, env: &mut Env) -> Result<Value, EvalError> {
             "quote" => eval_quote(args),
             "lambda" => eval_lambda(args, env),
             "begin" => eval_begin(args, env),
+            "let" => eval_let(args, env),
+            "cond" => eval_cond(args, env),
             _ => return eval_symbol_call(name, args, env),
         };
     }
@@ -164,6 +166,81 @@ fn eval_quote(args: &[Value]) -> Result<Value, EvalError> {
         });
     };
     Ok(datum.clone())
+}
+
+fn eval_let(args: &[Value], env: &mut Env) -> Result<Value, EvalError> {
+    let [bindings_val, body @ ..] = args else {
+        return Err(EvalError::WrongArgCount {
+            expected: 2,
+            got: args.len(),
+        });
+    };
+
+    let binding_list = bindings_val
+        .to_list_vec()
+        .ok_or_else(|| EvalError::TypeError {
+            expected: "binding list".to_string(),
+            got: bindings_val.display(),
+        })?;
+
+    let mut params = Vec::new();
+    let mut values = Vec::new();
+    for binding in &binding_list {
+        let pair = binding.to_list_vec().ok_or_else(|| EvalError::TypeError {
+            expected: "binding pair".to_string(),
+            got: binding.display(),
+        })?;
+        let [Value::Symbol(name), expr] = pair.as_slice() else {
+            return Err(EvalError::TypeError {
+                expected: "(symbol expr)".to_string(),
+                got: binding.display(),
+            });
+        };
+        params.push(name.clone());
+        values.push(eval(expr, env)?);
+    }
+
+    let func_body = wrap_body(body)?;
+    let lambda = Value::Lambda {
+        params,
+        body: Box::new(func_body),
+        closure: env.clone(),
+    };
+
+    apply(&lambda, &values, env)
+}
+
+fn eval_cond(args: &[Value], env: &mut Env) -> Result<Value, EvalError> {
+    for clause_val in args {
+        let clause = clause_val
+            .to_list_vec()
+            .ok_or_else(|| EvalError::TypeError {
+                expected: "cond clause".to_string(),
+                got: clause_val.display(),
+            })?;
+
+        let [test, body @ ..] = clause.as_slice() else {
+            return Err(EvalError::WrongArgCount {
+                expected: 1,
+                got: 0,
+            });
+        };
+
+        if matches!(test, Value::Symbol(s) if s == "else") {
+            return body
+                .iter()
+                .try_fold(Value::Nil, |_, expr| eval(expr, env));
+        }
+
+        let result = eval(test, env)?;
+        if result != Value::Boolean(false) {
+            return body
+                .iter()
+                .try_fold(Value::Nil, |_, expr| eval(expr, env));
+        }
+    }
+
+    Ok(Value::Nil)
 }
 
 fn eval_begin(args: &[Value], env: &mut Env) -> Result<Value, EvalError> {
