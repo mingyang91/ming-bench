@@ -81,6 +81,47 @@ const TEST_CASES: &[(&str, &str, &str)] = &[
     ("l10_loop",        "(define (loop n) (if (= n 0) (quote done) (loop (- n 1)))) (display (loop 1000000)) (newline)", "done"),
     ("l10_fact_iter",   "(define (fact-iter n acc) (if (= n 0) acc (fact-iter (- n 1) (* n acc)))) (display (fact-iter 20 1)) (newline)", "2432902008176640000"),
     ("l10_mutual",      "(define (my-even? n) (if (= n 0) #t (my-odd? (- n 1)))) (define (my-odd? n) (if (= n 0) #f (my-even? (- n 1)))) (display (my-even? 100000)) (newline)", "#t"),
+
+    // Level 26: Numeric Utilities
+    ("l26_abs",         "(display (abs -5)) (newline)",               "5"),
+    ("l26_modulo",      "(display (modulo 10 3)) (newline)",          "1"),
+    ("l26_modulo_neg",  "(display (modulo -10 3)) (newline)",         "2"),
+    ("l26_remainder",   "(display (remainder -10 3)) (newline)",      "-1"),
+    ("l26_quotient",    "(display (quotient 10 3)) (newline)",        "3"),
+    ("l26_min",         "(display (min 3 1 4 1 5)) (newline)",        "1"),
+    ("l26_max",         "(display (max 3 1 4 1 5)) (newline)",        "5"),
+    ("l26_expt",        "(display (expt 2 10)) (newline)",            "1024"),
+
+    // Level 27: Numeric Predicates
+    ("l27_zero_t",      "(display (zero? 0)) (newline)",              "#t"),
+    ("l27_zero_f",      "(display (zero? 1)) (newline)",              "#f"),
+    ("l27_positive",    "(display (positive? 5)) (newline)",          "#t"),
+    ("l27_negative",    "(display (negative? -3)) (newline)",         "#t"),
+    ("l27_odd",         "(display (odd? 3)) (newline)",               "#t"),
+    ("l27_even",        "(display (even? 4)) (newline)",              "#t"),
+
+    // Level 28: List Utilities
+    ("l28_list_ref",    "(display (list-ref '(a b c d) 2)) (newline)", "c"),
+    ("l28_list_tail",   "(display (list-tail '(a b c d) 2)) (newline)", "(c d)"),
+    ("l28_list_pred_t", "(display (list? '(1 2 3))) (newline)",       "#t"),
+    ("l28_list_pred_f", "(display (list? (cons 1 2))) (newline)",     "#f"),
+    ("l28_assoc",       "(display (assoc 'b '((a 1) (b 2) (c 3)))) (newline)", "(b 2)"),
+    ("l28_map_multi",   "(display (map + '(1 2 3) '(10 20 30))) (newline)", "(11 22 33)"),
+
+    // Level 29: Character Operations
+    ("l29_char_alpha",  "(display (char-alphabetic? #\\a)) (newline)", "#t"),
+    ("l29_char_num",    "(display (char-numeric? #\\5)) (newline)",   "#t"),
+    ("l29_char_up",     "(display (char-upcase #\\a)) (newline)",     "A"),
+    ("l29_char_down",   "(display (char-downcase #\\A)) (newline)",   "a"),
+    ("l29_char_eq",     "(display (char=? #\\a #\\a)) (newline)",     "#t"),
+    ("l29_char_lt",     "(display (char<? #\\a #\\b)) (newline)",     "#t"),
+
+    // Level 30: String Comparison
+    ("l30_str_eq",      "(display (string=? \"abc\" \"abc\")) (newline)", "#t"),
+    ("l30_str_lt",      "(display (string<? \"abc\" \"abd\")) (newline)", "#t"),
+    ("l30_str_ci",      "(display (string-ci=? \"ABC\" \"abc\")) (newline)", "#t"),
+    ("l30_str_up",      "(write (string-upcase \"hello\")) (newline)", "\"HELLO\""),
+    ("l30_str_down",    "(write (string-downcase \"HELLO\")) (newline)", "\"hello\""),
 ];
 
 pub fn run() -> Result<()> {
@@ -113,6 +154,11 @@ pub fn run() -> Result<()> {
                 "l08" => "Level 8: Let, Begin, Cond",
                 "l09" => "Level 9: Type Predicates",
                 "l10" => "Level 10: Tail Call Optimization",
+                "l26" => "Level 26: Numeric Utilities",
+                "l27" => "Level 27: Numeric Predicates",
+                "l28" => "Level 28: List Utilities",
+                "l29" => "Level 29: Character Operations",
+                "l30" => "Level 30: String Comparison",
                 _ => section,
             };
             println!("=== {level_name} ===");

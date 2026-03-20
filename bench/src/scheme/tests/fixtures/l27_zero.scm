@@ -1,0 +1,1 @@
+(and (zero? 0) (not (zero? 1)) (not (zero? -1)))

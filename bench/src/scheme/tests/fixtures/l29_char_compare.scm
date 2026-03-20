@@ -1,0 +1,5 @@
+(and (char=? #\a #\a)
+     (not (char=? #\a #\b))
+     (char<? #\a #\b)
+     (not (char<? #\b #\a))
+     (not (char<? #\a #\a)))

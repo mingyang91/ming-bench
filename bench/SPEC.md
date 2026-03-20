@@ -103,3 +103,18 @@ Combined use of continuations, macros, mutation, and tail calls.
 
 ### Level 25 — Vectors
 `vector`, `make-vector`, `vector-ref`, `vector-set!`, `vector-length`, `vector?`. Fixed-size mutable arrays. `vector->list` and `list->vector` for conversion.
+
+### Level 26 — Numeric Utilities
+`abs` returns absolute value. `modulo` and `remainder` compute division remainders (they differ in sign for negative operands — `modulo` takes the sign of the divisor, `remainder` takes the sign of the dividend). `quotient` returns integer division truncated toward zero. `min` and `max` are variadic. `expt` computes integer exponentiation.
+
+### Level 27 — Numeric Predicates
+`zero?`, `positive?`, `negative?` test the sign of a number. `odd?`, `even?` test integer parity. All take a single numeric argument and return `#t` or `#f`.
+
+### Level 28 — List Utilities
+`list-ref` returns the element at a given index. `list-tail` returns the sublist starting at a given index. `list?` returns `#t` for proper lists (including `'()`), `#f` for dotted pairs and non-pairs. `assoc` searches an association list using `equal?`. Built-in `map` supports multiple list arguments: `(map + '(1 2) '(3 4))` → `(4 6)`.
+
+### Level 29 — Character Operations
+Character literals: `#\a`, `#\Z`, `#\5`, `#\space`, `#\newline`. `char-alphabetic?` and `char-numeric?` are character class predicates. `char-upcase` and `char-downcase` convert case. `char=?` and `char<?` compare characters by code point.
+
+### Level 30 — String Comparison
+`string=?` tests string equality. `string<?` compares lexicographically. `string-ci=?` is case-insensitive equality. `string-upcase` and `string-downcase` return a new string with all characters converted.
