@@ -1,67 +1,16 @@
+mod builtins;
 pub mod env;
 pub mod error;
+mod list_ops;
 pub mod parser;
 pub mod value;
 
 pub use error::EvalError;
+use builtins::{apply_arithmetic, apply_comparison};
 use env::Env;
+use list_ops::{eval_car, eval_cdr, eval_cons, eval_length, eval_list, eval_null_q};
 use std::rc::Rc;
 use value::Value;
-
-/// Extract an integer from a Value, returning a TypeError if not an integer.
-fn expect_integer(val: &Value) -> Result<i64, EvalError> {
-    match val {
-        Value::Integer(n) => Ok(*n),
-        other => Err(EvalError::TypeError {
-            expected: "number".into(),
-            got: format!("{other}"),
-        }),
-    }
-}
-
-/// Apply an arithmetic operator to evaluated arguments.
-fn apply_arithmetic(op: &str, args: &[Value]) -> Result<Value, EvalError> {
-    let nums: Vec<i64> = args.iter().map(expect_integer).collect::<Result<_, _>>()?;
-
-    match (op, nums.as_slice()) {
-        ("+", ns) => Ok(Value::Integer(ns.iter().sum())),
-        ("*", ns) => Ok(Value::Integer(ns.iter().product())),
-        ("-", []) => Err(EvalError::WrongArgCount {
-            expected: "at least 1".into(),
-            got: 0,
-        }),
-        ("-", [x]) => Ok(Value::Integer(-x)),
-        ("-", [first, rest @ ..]) => Ok(Value::Integer(rest.iter().fold(*first, |a, b| a - b))),
-        ("/", []) => Err(EvalError::WrongArgCount {
-            expected: "at least 1".into(),
-            got: 0,
-        }),
-        ("/", [x]) => Ok(Value::Integer(1 / x)),
-        ("/", [first, rest @ ..]) => Ok(Value::Integer(rest.iter().fold(*first, |a, b| a / b))),
-        _ => Err(EvalError::UnboundVariable { name: op.into() }),
-    }
-}
-
-/// Apply a comparison operator to evaluated arguments.
-fn apply_comparison(op: &str, args: &[Value]) -> Result<Value, EvalError> {
-    if args.len() != 2 {
-        return Err(EvalError::WrongArgCount {
-            expected: "2".into(),
-            got: args.len(),
-        });
-    }
-    let a = expect_integer(&args[0])?;
-    let b = expect_integer(&args[1])?;
-    let result = match op {
-        "<" => a < b,
-        ">" => a > b,
-        "=" => a == b,
-        "<=" => a <= b,
-        ">=" => a >= b,
-        _ => unreachable!("invalid comparison op: {op}"),
-    };
-    Ok(Value::Boolean(result))
-}
 
 /// Check if a value is truthy (everything except #f is truthy in Scheme).
 fn is_truthy(val: &Value) -> bool {
@@ -213,7 +162,7 @@ fn eval_body(exprs: &[Value], env: &Rc<Env>) -> Result<Value, EvalError> {
 }
 
 /// Evaluate a single parsed Scheme value.
-fn eval(expr: &Value, env: &Rc<Env>) -> Result<Value, EvalError> {
+pub(crate) fn eval(expr: &Value, env: &Rc<Env>) -> Result<Value, EvalError> {
     match expr {
         Value::Integer(_) | Value::Boolean(_) | Value::String(_) | Value::Void => Ok(expr.clone()),
         Value::Lambda { .. } => Ok(expr.clone()),
@@ -249,6 +198,12 @@ fn eval(expr: &Value, env: &Rc<Env>) -> Result<Value, EvalError> {
                 Value::Symbol(op) if op == "not" => eval_not(args, env),
                 Value::Symbol(op) if op == "and" => eval_and(args, env),
                 Value::Symbol(op) if op == "or" => eval_or(args, env),
+                Value::Symbol(op) if op == "cons" => eval_cons(args, env),
+                Value::Symbol(op) if op == "car" => eval_car(args, env),
+                Value::Symbol(op) if op == "cdr" => eval_cdr(args, env),
+                Value::Symbol(op) if op == "null?" => eval_null_q(args, env),
+                Value::Symbol(op) if op == "list" => eval_list(args, env),
+                Value::Symbol(op) if op == "length" => eval_length(args, env),
                 _ => {
                     let func = eval(operator, env)?;
                     let evaluated_args: Vec<Value> =
