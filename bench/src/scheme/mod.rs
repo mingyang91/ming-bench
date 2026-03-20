@@ -29,8 +29,8 @@ use string_ops::{
 };
 use io_ops::{eval_display, eval_map, eval_newline, eval_write};
 use special_forms::{
-    eval_and_tco, eval_cond_tco, eval_define, eval_if_tco, eval_lambda, eval_let_tco, eval_not,
-    eval_or_tco, eval_set,
+    eval_and_tco, eval_cond_tco, eval_define, eval_if_tco, eval_lambda, eval_let_tco,
+    eval_letrec_star_tco, eval_letrec_tco, eval_not, eval_or_tco, eval_set,
 };
 use std::rc::Rc;
 use value::Value;
@@ -118,6 +118,8 @@ fn eval_list_form(elements: &[Value], env: &Rc<Env>) -> Result<Trampoline, EvalE
             apply_comparison(op, &evaluated).map(Trampoline::Done)
         }
         Value::Symbol(op) if op == "let" => eval_let_tco(args, env),
+        Value::Symbol(op) if op == "letrec" => eval_letrec_tco(args, env),
+        Value::Symbol(op) if op == "letrec*" => eval_letrec_star_tco(args, env),
         Value::Symbol(op) if op == "set!" => eval_set(args, env).map(Trampoline::Done),
         Value::Symbol(op) if op == "begin" => eval_body_tco(args, env),
         Value::Symbol(op) if op == "cond" => eval_cond_tco(args, env),

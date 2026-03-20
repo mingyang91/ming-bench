@@ -220,6 +220,76 @@ fn eval_named_let(
     eval_body_tco(body, &child)
 }
 
+/// Evaluate `(letrec ((var init) ...) body ...)` — all bindings are mutually visible.
+pub(crate) fn eval_letrec_tco(args: &[Value], env: &Rc<Env>) -> Result<Trampoline, EvalError> {
+    let [Value::List(bindings), body @ ..] = args else {
+        return Err(EvalError::BadSyntax {
+            form: "letrec".into(),
+        });
+    };
+    if body.is_empty() {
+        return Err(EvalError::BadSyntax {
+            form: "letrec".into(),
+        });
+    }
+    let child = Env::child(env);
+    // First pass: bind all names to Void (placeholder)
+    let names: Vec<String> = bindings
+        .iter()
+        .map(|b| {
+            let Value::List(pair) = b else {
+                return Err(EvalError::BadSyntax {
+                    form: "letrec".into(),
+                });
+            };
+            let [Value::Symbol(name), _] = pair.as_slice() else {
+                return Err(EvalError::BadSyntax {
+                    form: "letrec".into(),
+                });
+            };
+            child.set(name.clone(), Value::Void);
+            Ok(name.clone())
+        })
+        .collect::<Result<_, _>>()?;
+    // Second pass: evaluate inits in the child env and update bindings
+    for (name, binding) in names.iter().zip(bindings) {
+        let Value::List(pair) = binding else { unreachable!() };
+        let val = eval(&pair[1], &child)?;
+        child.set(name.clone(), val);
+    }
+    eval_body_tco(body, &child)
+}
+
+/// Evaluate `(letrec* ((var init) ...) body ...)` — sequential binding visibility.
+pub(crate) fn eval_letrec_star_tco(args: &[Value], env: &Rc<Env>) -> Result<Trampoline, EvalError> {
+    let [Value::List(bindings), body @ ..] = args else {
+        return Err(EvalError::BadSyntax {
+            form: "letrec*".into(),
+        });
+    };
+    if body.is_empty() {
+        return Err(EvalError::BadSyntax {
+            form: "letrec*".into(),
+        });
+    }
+    let child = Env::child(env);
+    for binding in bindings {
+        let Value::List(pair) = binding else {
+            return Err(EvalError::BadSyntax {
+                form: "letrec*".into(),
+            });
+        };
+        let [Value::Symbol(name), expr] = pair.as_slice() else {
+            return Err(EvalError::BadSyntax {
+                form: "letrec*".into(),
+            });
+        };
+        let val = eval(expr, &child)?;
+        child.set(name.clone(), val);
+    }
+    eval_body_tco(body, &child)
+}
+
 /// Evaluate `(set! name expr)` — mutate an existing binding.
 pub(crate) fn eval_set(args: &[Value], env: &Rc<Env>) -> Result<Value, EvalError> {
     let [Value::Symbol(name), expr] = args else {
