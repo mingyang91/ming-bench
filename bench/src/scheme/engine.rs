@@ -276,6 +276,10 @@ pub(super) enum Kont {
         environment: Environment,
         next: Continuation,
     },
+    CallCcReturn {
+        next: Continuation,
+        void_next: Continuation,
+    },
     ApplyOperator {
         arguments: Vec<Expr>,
         environment: Environment,
@@ -505,6 +509,7 @@ fn resume(value: Value, continuation: Continuation) -> Result<Step, String> {
             environment,
             next,
         } => resume_cond(value, body, remaining_clauses, environment, next),
+        Kont::CallCcReturn { next, void_next } => resume_callcc_return(value, next, void_next),
         Kont::ApplyOperator {
             arguments,
             environment,
@@ -636,6 +641,20 @@ fn resume_cond(
         environment.clone(),
         next.clone(),
     )?))
+}
+
+fn resume_callcc_return(
+    value: Value,
+    next: &Continuation,
+    void_next: &Continuation,
+) -> Result<Step, String> {
+    let continuation = if matches!(value, Value::Void) {
+        void_next.clone()
+    } else {
+        next.clone()
+    };
+
+    Ok(Step::Continue(Machine::value(value, continuation)))
 }
 
 fn resume_apply_operator(
@@ -1055,7 +1074,7 @@ fn schedule_argument_evaluation(
     continuation: Continuation,
 ) -> Result<Machine, String> {
     let Some((current, remaining)) = split_last_argument(arguments) else {
-        return continue_call(operator, Vec::new(), continuation);
+        return continue_call(operator, Vec::new(), environment, continuation);
     };
 
     let frame = Kont::ApplyArgument {
@@ -1079,7 +1098,7 @@ fn continue_argument_evaluation(
     evaluated_suffix.insert(0, value);
 
     let Some((next_expr, next_remaining)) = split_last_argument(remaining) else {
-        return continue_call(operator, evaluated_suffix, continuation);
+        return continue_call(operator, evaluated_suffix, environment, continuation);
     };
 
     let frame = Kont::ApplyArgument {
@@ -1100,10 +1119,11 @@ fn split_last_argument(mut arguments: Vec<Expr>) -> Option<(Expr, Vec<Expr>)> {
 fn continue_call(
     callable: Value,
     arguments: Vec<Value>,
+    environment: Environment,
     continuation: Continuation,
 ) -> Result<Machine, String> {
     match callable {
-        Value::Builtin(builtin) => call_builtin(builtin, arguments, continuation),
+        Value::Builtin(builtin) => call_builtin(builtin, arguments, environment, continuation),
         Value::Procedure(procedure) => call_procedure(procedure, arguments, continuation),
         Value::Continuation(saved) => {
             let [value] = arguments.as_slice() else {
@@ -1118,6 +1138,7 @@ fn continue_call(
 fn call_builtin(
     builtin: Builtin,
     arguments: Vec<Value>,
+    environment: Environment,
     continuation: Continuation,
 ) -> Result<Machine, String> {
     match builtin {
@@ -1131,20 +1152,44 @@ fn call_builtin(
 
             let mut applied_arguments = prefix.to_vec();
             applied_arguments.extend(list_to_vec(list)?);
-            continue_call(callable.clone(), applied_arguments, continuation)
+            continue_call(
+                callable.clone(),
+                applied_arguments,
+                environment,
+                continuation,
+            )
         }
         Builtin::CallCc => {
             let [callable] = arguments.as_slice() else {
                 return Err("`call/cc` expects exactly 1 argument".into());
             };
 
+            let frame = Kont::CallCcReturn {
+                next: continuation.clone(),
+                void_next: callcc_void_return_continuation(&environment, &continuation),
+            };
             continue_call(
                 callable.clone(),
                 vec![Value::Continuation(continuation.clone())],
-                continuation,
+                environment,
+                Rc::new(frame),
             )
         }
         _ => Ok(Machine::value(builtin.apply(&arguments)?, continuation)),
+    }
+}
+
+fn callcc_void_return_continuation(
+    environment: &Environment,
+    continuation: &Continuation,
+) -> Continuation {
+    match continuation.as_ref() {
+        Kont::Sequence {
+            environment: sequence_environment,
+            next,
+            ..
+        } if Rc::ptr_eq(sequence_environment, environment) => next.clone(),
+        _ => continuation.clone(),
     }
 }
 
@@ -2002,6 +2047,7 @@ fn finalize_template_application(
     };
 
     match operator_name {
+        "define" => Ok(finalize_define_template(items, definition_environment, scope)?.0),
         "lambda" => finalize_lambda_template(items, definition_environment, scope),
         "let" => finalize_let_template(items, definition_environment, scope),
         _ => finalize_generic_application(items, definition_environment, scope),
@@ -2038,13 +2084,11 @@ fn finalize_lambda_template(
         finalize_parameter_list(&items[1], definition_environment, scope)?;
 
     let mut result = vec![operator, parameters];
-    for body in &items[2..] {
-        result.push(finalize_template_in_scope(
-            body,
-            definition_environment,
-            &body_scope,
-        )?);
-    }
+    result.extend(finalize_body_forms(
+        &items[2..],
+        definition_environment,
+        &body_scope,
+    )?);
 
     Ok(Expr::Application(result))
 }
@@ -2101,15 +2145,143 @@ fn finalize_let_template(
         &mut body_scope,
     )?);
 
-    for body in &items[bindings_index + 1..] {
-        result.push(finalize_template_in_scope(
-            body,
-            definition_environment,
-            &body_scope,
-        )?);
-    }
+    result.extend(finalize_body_forms(
+        &items[bindings_index + 1..],
+        definition_environment,
+        &body_scope,
+    )?);
 
     Ok(Expr::Application(result))
+}
+
+fn finalize_body_forms(
+    forms: &[TemplateExpr],
+    definition_environment: &Environment,
+    scope: &HashMap<String, Vec<String>>,
+) -> Result<Vec<Expr>, String> {
+    let mut current_scope = scope.clone();
+    let mut finalized = Vec::with_capacity(forms.len());
+
+    for form in forms {
+        let (expr, next_scope) = finalize_body_form(form, definition_environment, &current_scope)?;
+        finalized.push(expr);
+        current_scope = next_scope;
+    }
+
+    Ok(finalized)
+}
+
+fn finalize_body_form(
+    form: &TemplateExpr,
+    definition_environment: &Environment,
+    scope: &HashMap<String, Vec<String>>,
+) -> Result<(Expr, HashMap<String, Vec<String>>), String> {
+    let TemplateExpr::Application(items) = form else {
+        return Ok((
+            finalize_template_in_scope(form, definition_environment, scope)?,
+            scope.clone(),
+        ));
+    };
+
+    if matches!(items.first().and_then(template_symbol_name), Some("define")) {
+        return finalize_define_template(items, definition_environment, scope);
+    }
+
+    Ok((
+        finalize_template_in_scope(form, definition_environment, scope)?,
+        scope.clone(),
+    ))
+}
+
+fn finalize_define_template(
+    items: &[TemplateExpr],
+    definition_environment: &Environment,
+    scope: &HashMap<String, Vec<String>>,
+) -> Result<(Expr, HashMap<String, Vec<String>>), String> {
+    if items.len() < 3 {
+        return Err("macro-expanded `define` expects a name and body".into());
+    }
+
+    let operator = finalize_template_in_scope(&items[0], definition_environment, scope)?;
+    let mut subsequent_scope = scope.clone();
+
+    match &items[1] {
+        TemplateExpr::Application(signature) => finalize_function_define_template(
+            operator,
+            signature,
+            &items[2..],
+            definition_environment,
+            &mut subsequent_scope,
+        ),
+        target => finalize_value_define_template(
+            operator,
+            target,
+            &items[2..],
+            definition_environment,
+            scope,
+            &mut subsequent_scope,
+        ),
+    }
+}
+
+fn finalize_function_define_template(
+    operator: Expr,
+    signature: &[TemplateExpr],
+    body: &[TemplateExpr],
+    definition_environment: &Environment,
+    subsequent_scope: &mut HashMap<String, Vec<String>>,
+) -> Result<(Expr, HashMap<String, Vec<String>>), String> {
+    let (name_template, parameters) = signature
+        .split_first()
+        .ok_or_else(|| "macro-expanded `define` expects a function name".to_string())?;
+
+    let name = finalize_binding_name(name_template, definition_environment, subsequent_scope)?;
+    let (parameters, body_scope) = finalize_parameter_list(
+        &TemplateExpr::Application(parameters.to_vec()),
+        definition_environment,
+        subsequent_scope,
+    )?;
+
+    let Expr::Application(mut parameters) = parameters else {
+        return Err("macro-expanded `define` expects parameter names".into());
+    };
+
+    let mut result = vec![
+        operator,
+        Expr::Application({
+            let mut signature = Vec::with_capacity(parameters.len() + 1);
+            signature.push(name);
+            signature.append(&mut parameters);
+            signature
+        }),
+    ];
+    result.extend(finalize_body_forms(
+        body,
+        definition_environment,
+        &body_scope,
+    )?);
+
+    Ok((Expr::Application(result), subsequent_scope.clone()))
+}
+
+fn finalize_value_define_template(
+    operator: Expr,
+    target: &TemplateExpr,
+    body: &[TemplateExpr],
+    definition_environment: &Environment,
+    value_scope: &HashMap<String, Vec<String>>,
+    subsequent_scope: &mut HashMap<String, Vec<String>>,
+) -> Result<(Expr, HashMap<String, Vec<String>>), String> {
+    let [value] = body else {
+        return Err("macro-expanded `define` expects exactly 2 arguments".into());
+    };
+
+    let target = finalize_binding_name(target, definition_environment, subsequent_scope)?;
+    let value = finalize_template_in_scope(value, definition_environment, value_scope)?;
+    Ok((
+        Expr::Application(vec![operator, target, value]),
+        subsequent_scope.clone(),
+    ))
 }
 
 fn finalize_let_bindings(
