@@ -55,6 +55,7 @@ fn eval_special_form(
 ) -> Result<Option<TailAction>, EvalError> {
     let action = match name {
         "define" => TailAction::Return(eval_define(args, env)?),
+        "set!" => TailAction::Return(eval_set(args, env)?),
         "quote" => TailAction::Return(eval_quote(args)?),
         "lambda" => TailAction::Return(eval_lambda(args, env)?),
         "if" => eval_if_tail(args, env)?,
@@ -330,6 +331,26 @@ fn eval_define(args: &[Value], env: &Env) -> Result<Value, EvalError> {
                 msg: format!("define target must be a symbol or list, got {other}"),
             });
         }
+    }
+    Ok(Value::Symbol("void".into()))
+}
+
+fn eval_set(args: &[Value], env: &Env) -> Result<Value, EvalError> {
+    if args.len() != 2 {
+        return Err(EvalError::Parse {
+            msg: "set! requires exactly 2 arguments".into(),
+        });
+    }
+    let Value::Symbol(name) = &args[0] else {
+        return Err(EvalError::Parse {
+            msg: "set! target must be a symbol".into(),
+        });
+    };
+    let val = eval(&args[1], env)?;
+    if !env.set(name, val) {
+        return Err(EvalError::UnboundVariable {
+            name: name.clone(),
+        });
     }
     Ok(Value::Symbol("void".into()))
 }

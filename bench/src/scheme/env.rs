@@ -48,4 +48,18 @@ impl Env {
     pub fn define(&self, name: String, value: Value) {
         self.inner.borrow_mut().bindings.insert(name, value);
     }
+
+    /// Mutate an existing binding in the nearest enclosing scope.
+    /// Returns `false` if the variable is not bound in any scope.
+    pub fn set(&self, name: &str, value: Value) -> bool {
+        let mut inner = self.inner.borrow_mut();
+        if inner.bindings.contains_key(name) {
+            inner.bindings.insert(name.to_owned(), value);
+            true
+        } else if let Some(parent) = &inner.parent {
+            parent.set(name, value)
+        } else {
+            false
+        }
+    }
 }
