@@ -204,7 +204,8 @@ fn is_builtin(name: &str) -> bool {
     matches!(
         name,
         "+" | "-" | "*" | "/" | "<" | ">" | "=" | "<=" | "not" | "cons" | "car" | "cdr"
-            | "null?" | "list" | "length"
+            | "null?" | "list" | "length" | "string?" | "number?" | "boolean?" | "pair?"
+            | "symbol?"
     )
 }
 
@@ -225,6 +226,15 @@ fn call_builtin(name: &str, args: &[Value]) -> Result<Value, EvalError> {
         "null?" => builtin_null(name, args),
         "list" => Ok(Value::List(args.to_vec())),
         "length" => builtin_length(name, args),
+        "string?" => builtin_type_pred(name, args, |v| matches!(v, Value::Str(_))),
+        "number?" => builtin_type_pred(name, args, |v| matches!(v, Value::Integer(_))),
+        "boolean?" => builtin_type_pred(name, args, |v| matches!(v, Value::Boolean(_))),
+        "pair?" => {
+            builtin_type_pred(name, args, |v| {
+                matches!(v, Value::List(elems) if !elems.is_empty())
+            })
+        }
+        "symbol?" => builtin_type_pred(name, args, |v| matches!(v, Value::Symbol(_))),
         _ => unreachable!(),
     }
 }
@@ -512,6 +522,21 @@ fn builtin_null(name: &str, args: &[Value]) -> Result<Value, EvalError> {
         });
     }
     Ok(Value::Boolean(matches!(&args[0], Value::List(elems) if elems.is_empty())))
+}
+
+fn builtin_type_pred(
+    name: &str,
+    args: &[Value],
+    pred: impl Fn(&Value) -> bool,
+) -> Result<Value, EvalError> {
+    if args.len() != 1 {
+        return Err(EvalError::ArityError {
+            name: name.into(),
+            expected: 1,
+            actual: args.len(),
+        });
+    }
+    Ok(Value::Boolean(pred(&args[0])))
 }
 
 fn builtin_length(name: &str, args: &[Value]) -> Result<Value, EvalError> {
