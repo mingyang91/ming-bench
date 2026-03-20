@@ -38,6 +38,9 @@ pub enum EvalError {
     #[error("division by zero")]
     DivisionByZero,
 
+    #[error("strings are immutable")]
+    ImmutableString,
+
     #[error("{error} at {line}:{col}")]
     AtPosition {
         error: Box<EvalError>,

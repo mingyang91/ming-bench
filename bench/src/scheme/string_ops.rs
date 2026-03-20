@@ -134,44 +134,92 @@ pub fn eval_string_copy(args: &[Value], env: &Rc<Env>) -> Result<Value, EvalErro
     Ok(Value::String(s.to_string()))
 }
 
-/// Evaluate `(string-set! var k ch)` — mutate string at index k.
-/// Implemented as a special form: first arg must be a symbol naming a variable.
-pub fn eval_string_set(args: &[Value], env: &Rc<Env>) -> Result<Value, EvalError> {
-    let [name_expr, k_expr, ch_expr] = args else {
+/// Evaluate `(string-set! ...)` — R7RS: strings are immutable, always errors.
+pub fn eval_string_set(args: &[Value], _env: &Rc<Env>) -> Result<Value, EvalError> {
+    let [_, _, _] = args else {
         return Err(EvalError::WrongArgCount {
             expected: "3".into(),
             got: args.len(),
         });
     };
-    let Value::Symbol(name) = name_expr else {
-        return Err(EvalError::TypeError {
-            expected: "symbol".into(),
-            got: format!("{name_expr}"),
+    Err(EvalError::ImmutableString)
+}
+
+/// Evaluate `(string->list s)` — convert string to list of characters.
+pub fn eval_string_to_list(args: &[Value], env: &Rc<Env>) -> Result<Value, EvalError> {
+    let [arg] = args else {
+        return Err(EvalError::WrongArgCount {
+            expected: "1".into(),
+            got: args.len(),
         });
     };
-    let val = env.get(name).ok_or_else(|| EvalError::UnboundVariable {
-        name: name.clone(),
-    })?;
-    let s = expect_string(&val)?.to_string();
-    let k = expect_integer(&eval(k_expr, env)?)? as usize;
-    let ch_val = eval(ch_expr, env)?;
-    let Value::Char(ch) = ch_val else {
+    let val = eval(arg, env)?;
+    let s = expect_string(&val)?;
+    let chars = s.chars().map(Value::Char).collect();
+    Ok(Value::List(chars))
+}
+
+/// Evaluate `(list->string lst)` — convert list of characters to string.
+pub fn eval_list_to_string(args: &[Value], env: &Rc<Env>) -> Result<Value, EvalError> {
+    let [arg] = args else {
+        return Err(EvalError::WrongArgCount {
+            expected: "1".into(),
+            got: args.len(),
+        });
+    };
+    let val = eval(arg, env)?;
+    let Value::List(elems) = val else {
+        return Err(EvalError::TypeError {
+            expected: "list".into(),
+            got: format!("{val}"),
+        });
+    };
+    let s: String = elems
+        .iter()
+        .map(|v| match v {
+            Value::Char(c) => Ok(*c),
+            other => Err(EvalError::TypeError {
+                expected: "char".into(),
+                got: format!("{other}"),
+            }),
+        })
+        .collect::<Result<_, _>>()?;
+    Ok(Value::String(s))
+}
+
+/// Evaluate `(char->integer c)` — character to integer code point.
+pub fn eval_char_to_integer(args: &[Value], env: &Rc<Env>) -> Result<Value, EvalError> {
+    let [arg] = args else {
+        return Err(EvalError::WrongArgCount {
+            expected: "1".into(),
+            got: args.len(),
+        });
+    };
+    let val = eval(arg, env)?;
+    let Value::Char(c) = val else {
         return Err(EvalError::TypeError {
             expected: "char".into(),
-            got: format!("{ch_val}"),
+            got: format!("{val}"),
         });
     };
-    let mut chars: Vec<char> = s.chars().collect();
-    if k >= chars.len() {
-        return Err(EvalError::TypeError {
-            expected: format!("index < {}", chars.len()),
-            got: format!("{k}"),
+    Ok(Value::Integer(c as i64))
+}
+
+/// Evaluate `(integer->char n)` — integer code point to character.
+pub fn eval_integer_to_char(args: &[Value], env: &Rc<Env>) -> Result<Value, EvalError> {
+    let [arg] = args else {
+        return Err(EvalError::WrongArgCount {
+            expected: "1".into(),
+            got: args.len(),
         });
-    }
-    chars[k] = ch;
-    let new_s: String = chars.into_iter().collect();
-    env.set_existing(name, Value::String(new_s));
-    Ok(Value::Void)
+    };
+    let val = eval(arg, env)?;
+    let n = expect_integer(&val)?;
+    let c = char::from_u32(n as u32).ok_or_else(|| EvalError::TypeError {
+        expected: "valid Unicode code point".into(),
+        got: format!("{n}"),
+    })?;
+    Ok(Value::Char(c))
 }
 
 /// Evaluate `(string-ref s k)` — character at index k.

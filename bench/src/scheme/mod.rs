@@ -12,9 +12,10 @@ use builtins::{apply_arithmetic, apply_comparison};
 use env::Env;
 use list_ops::{eval_car, eval_cdr, eval_cons, eval_length, eval_list, eval_null_q, eval_type_pred};
 use string_ops::{
-    eval_number_to_string, eval_string_append, eval_string_copy, eval_string_length,
-    eval_string_ref, eval_string_set, eval_string_to_number, eval_string_to_symbol,
-    eval_substring, eval_symbol_to_string,
+    eval_char_to_integer, eval_integer_to_char, eval_list_to_string, eval_number_to_string,
+    eval_string_append, eval_string_copy, eval_string_length, eval_string_ref, eval_string_set,
+    eval_string_to_list, eval_string_to_number, eval_string_to_symbol, eval_substring,
+    eval_symbol_to_string,
 };
 use special_forms::{
     eval_and, eval_cond, eval_define, eval_if, eval_lambda, eval_let, eval_not, eval_or,
@@ -129,6 +130,11 @@ pub(crate) fn eval(expr: &Value, env: &Rc<Env>) -> Result<Value, EvalError> {
                 Value::Symbol(op) if op == "string-ref" => eval_string_ref(args, env),
                 Value::Symbol(op) if op == "string-copy" => eval_string_copy(args, env),
                 Value::Symbol(op) if op == "string-set!" => eval_string_set(args, env),
+                Value::Symbol(op) if op == "string->list" => eval_string_to_list(args, env),
+                Value::Symbol(op) if op == "list->string" => eval_list_to_string(args, env),
+                Value::Symbol(op) if op == "char->integer" => eval_char_to_integer(args, env),
+                Value::Symbol(op) if op == "integer->char" => eval_integer_to_char(args, env),
+                Value::Symbol(op) if op == "map" => eval_map(args, env),
                 Value::Symbol(op) if op == "display" => eval_display(args, env),
                 Value::Symbol(op) if op == "write" => eval_write(args, env),
                 Value::Symbol(op) if op == "newline" => eval_newline(args, env),
@@ -141,6 +147,28 @@ pub(crate) fn eval(expr: &Value, env: &Rc<Env>) -> Result<Value, EvalError> {
             }
         }
     }
+}
+
+fn eval_map(args: &[Value], env: &Rc<Env>) -> Result<Value, EvalError> {
+    let [func_expr, list_expr] = args else {
+        return Err(EvalError::WrongArgCount {
+            expected: "2".into(),
+            got: args.len(),
+        });
+    };
+    let func = eval(func_expr, env)?;
+    let list_val = eval(list_expr, env)?;
+    let Value::List(elems) = list_val else {
+        return Err(EvalError::TypeError {
+            expected: "list".into(),
+            got: format!("{list_val}"),
+        });
+    };
+    let results: Vec<Value> = elems
+        .iter()
+        .map(|e| apply_lambda(func.clone(), std::slice::from_ref(e)))
+        .collect::<Result<_, _>>()?;
+    Ok(Value::List(results))
 }
 
 fn eval_display(args: &[Value], env: &Rc<Env>) -> Result<Value, EvalError> {
