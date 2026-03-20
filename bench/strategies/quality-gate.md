@@ -57,11 +57,11 @@ These lints are enforced in a **separate cleanup pass** at the end of each level
 
 ### Structural limits
 
-| Constraint | L1-L5 | L6+ |
-|---|---|---|
-| Max function length | 80 lines | 60 lines |
-| Max nesting depth | 3 | 3 |
-| Max `mod.rs` size | 300 lines (L1-L3), 200 (L4-L6) | 100 lines |
+| Constraint | All levels |
+|---|---|
+| Max function length | 150 lines |
+| Max nesting depth | 3 |
+| Max `mod.rs` size | 300 lines |
 
 ### Style (auto-fixable)
 

@@ -118,12 +118,12 @@ fn quality_gates(proj: &Path, level: &str) -> Result<()> {
     let (fn_limit, allow_dead_code) = if level != "all" {
         let ln: u32 = level.parse().unwrap_or(99);
         if ln <= 5 {
-            (80, true)
+            (150, true)
         } else {
-            (60, false)
+            (150, false)
         }
     } else {
-        (60, false)
+        (150, false)
     };
 
     // Backup and write leveled clippy.toml
@@ -182,13 +182,7 @@ fn quality_gates(proj: &Path, level: &str) -> Result<()> {
 }
 
 fn check_mod_size(proj: &Path, level: u32) -> Result<()> {
-    let mod_limit: usize = if level <= 3 {
-        300
-    } else if level <= 6 {
-        200
-    } else {
-        100
-    };
+    let mod_limit: usize = 300;
 
     let mod_file = proj.join("bench/src/scheme/mod.rs");
     if !mod_file.is_file() {

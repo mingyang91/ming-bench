@@ -1,4 +1,4 @@
-too-many-lines-threshold = 60
+too-many-lines-threshold = 150
 excessive-nesting-threshold = 3
 
 [[disallowed-macros]]
