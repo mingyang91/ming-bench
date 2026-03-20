@@ -2,7 +2,7 @@ pub mod error;
 
 pub use error::EvalError;
 
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
 use std::rc::Rc;
 
@@ -21,6 +21,17 @@ enum Value {
         env: Env,
     },
     Builtin(String),
+    Continuation {
+        line: usize,
+        col: usize,
+        expr_index: usize,
+    },
+}
+
+thread_local! {
+    static CONT_RETURN_VALUE: RefCell<Option<Value>> = RefCell::new(None);
+    static CALLCC_REPLAY: RefCell<Option<(usize, usize, Value)>> = RefCell::new(None);
+    static CURRENT_EXPR_INDEX: Cell<usize> = Cell::new(0);
 }
 
 impl PartialEq for Value {
@@ -36,6 +47,9 @@ impl PartialEq for Value {
                 p1 == p2 && b1 == b2
             }
             (Value::Builtin(a), Value::Builtin(b)) => a == b,
+            (Value::Continuation { line: l1, col: c1, .. }, Value::Continuation { line: l2, col: c2, .. }) => {
+                l1 == l2 && c1 == c2
+            }
             _ => false,
         }
     }
@@ -131,6 +145,7 @@ impl Value {
             }
             Value::Lambda { .. } => "#<procedure>".to_string(),
             Value::Builtin(name) => format!("#<builtin:{}>", name),
+            Value::Continuation { .. } => "#<continuation>".to_string(),
         }
     }
 
@@ -139,6 +154,7 @@ impl Value {
             Value::Str(s) => s.clone(),
             Value::Char(c) => c.to_string(),
             Value::Builtin(name) => format!("#<builtin:{}>", name),
+            Value::Continuation { .. } => "#<continuation>".to_string(),
             other => other.to_scheme_string(),
         }
     }
@@ -324,6 +340,13 @@ fn eval(expr: &Expr, env: &Env, output: &mut String) -> Result<Value, EvalError>
                         output.push('\n');
                         Ok(Value::Symbol("".to_string()))
                     }
+                    "call/cc" | "call-with-current-continuation" => {
+                        if items.len() != 2 {
+                            return Err(err_at("call/cc requires 1 argument", expr.line, expr.col));
+                        }
+                        let func = eval(&items[1], env, output)?;
+                        eval_callcc(&func, expr.line, expr.col, output)
+                    }
                     _ => {
                         if let Some(func_val) = env.get(name) {
                             match &func_val {
@@ -346,6 +369,19 @@ fn eval(expr: &Expr, env: &Env, output: &mut String) -> Result<Value, EvalError>
                                         &bname,
                                         &items[1..],
                                         env,
+                                        expr.line,
+                                        expr.col,
+                                        output,
+                                    );
+                                }
+                                Value::Continuation { .. } => {
+                                    let mut eval_args = Vec::new();
+                                    for a in &items[1..] {
+                                        eval_args.push(eval(a, env, output)?);
+                                    }
+                                    return call_value(
+                                        &func_val,
+                                        eval_args,
                                         expr.line,
                                         expr.col,
                                         output,
@@ -843,7 +879,9 @@ fn eval_tail(expr: &Expr, env: &Env, output: &mut String) -> Result<EvalResult, 
                         eval_tail(&items[items.len() - 1], env, output)
                     }
                     "define" | "set!" | "quote" | "lambda" | "string-set!" | "display"
-                    | "write" | "newline" => Ok(EvalResult::Done(eval(expr, env, output)?)),
+                    | "write" | "newline" | "call/cc" | "call-with-current-continuation" => {
+                        Ok(EvalResult::Done(eval(expr, env, output)?))
+                    }
                     _ => {
                         if let Some(func_val) = env.get(name) {
                             match &func_val {
@@ -863,6 +901,19 @@ fn eval_tail(expr: &Expr, env: &Env, output: &mut String) -> Result<EvalResult, 
                                         &bname,
                                         &items[1..],
                                         env,
+                                        expr.line,
+                                        expr.col,
+                                        output,
+                                    )?));
+                                }
+                                Value::Continuation { .. } => {
+                                    let mut eval_args = Vec::new();
+                                    for a in &items[1..] {
+                                        eval_args.push(eval(a, env, output)?);
+                                    }
+                                    return Ok(EvalResult::Done(call_value(
+                                        &func_val,
+                                        eval_args,
                                         expr.line,
                                         expr.col,
                                         output,
@@ -998,6 +1049,7 @@ fn is_builtin_name(name: &str) -> bool {
             | "char-upcase" | "char-downcase"
             | "make-string" | "string"
             | "display" | "write" | "newline"
+            | "call/cc" | "call-with-current-continuation"
     )
 }
 
@@ -1407,11 +1459,57 @@ fn call_builtin_values(
             final_args.extend(tail_list);
             call_value(&func, final_args, call_line, call_col, output)
         }
+        "call/cc" | "call-with-current-continuation" => {
+            if eval_args.len() != 1 {
+                return Err(err_at("call/cc requires 1 argument", call_line, call_col));
+            }
+            eval_callcc(&eval_args[0], call_line, call_col, output)
+        }
         _ => Err(err_at(
             format!("unknown procedure: {}", name),
             call_line,
             call_col,
         )),
+    }
+}
+
+fn eval_callcc(
+    func: &Value,
+    line: usize,
+    col: usize,
+    output: &mut String,
+) -> Result<Value, EvalError> {
+    // Check if we're in replay mode for this call/cc position
+    let replay = CALLCC_REPLAY.with(|r| {
+        let r = r.borrow();
+        if let Some((rl, rc, ref v)) = *r {
+            if rl == line && rc == col {
+                Some(v.clone())
+            } else {
+                None
+            }
+        } else {
+            None
+        }
+    });
+    if let Some(v) = replay {
+        CALLCC_REPLAY.with(|r| *r.borrow_mut() = None);
+        return Ok(v);
+    }
+
+    let expr_idx = CURRENT_EXPR_INDEX.with(|c| c.get());
+    let cont = Value::Continuation { line, col, expr_index: expr_idx };
+
+    match call_value(func, vec![cont], line, col, output) {
+        Ok(v) => Ok(v),
+        Err(EvalError::ContinuationReturn { line: l, col: c, .. })
+            if l == line && c == col =>
+        {
+            let val = CONT_RETURN_VALUE.with(|v| v.borrow_mut().take())
+                .expect("continuation value missing");
+            Ok(val)
+        }
+        Err(e) => Err(e),
     }
 }
 
@@ -1425,6 +1523,17 @@ fn call_value(
     match func {
         Value::Lambda { .. } => apply_lambda(func, &args, call_line, call_col, output),
         Value::Builtin(name) => call_builtin_values(name, args, call_line, call_col, output),
+        Value::Continuation { line, col, expr_index } => {
+            if args.len() != 1 {
+                return Err(err_at("continuation requires 1 argument", call_line, call_col));
+            }
+            CONT_RETURN_VALUE.with(|v| *v.borrow_mut() = Some(args[0].clone()));
+            Err(EvalError::ContinuationReturn {
+                line: *line,
+                col: *col,
+                expr_index: *expr_index,
+            })
+        }
         _ => Err(err_at(
             format!("not a procedure: {}", func.to_scheme_string()),
             call_line,
@@ -1491,40 +1600,53 @@ fn expect_integer(val: &Value, line: usize, col: usize) -> Result<i64, EvalError
     }
 }
 
+fn eval_exprs(input: &str) -> Result<(Value, String), EvalError> {
+    let mut remaining = input;
+    let mut exprs = Vec::new();
+    while !remaining.trim().is_empty() {
+        let (expr, rest) = parse_expr(remaining, input)?;
+        exprs.push(expr);
+        remaining = rest;
+    }
+    if exprs.is_empty() {
+        return Err(EvalError::Parse("empty input".to_string()));
+    }
+
+    let env = Env::new();
+    let mut output = String::new();
+    let mut last_value = Value::Symbol("".to_string());
+    let mut i = 0;
+    while i < exprs.len() {
+        CURRENT_EXPR_INDEX.with(|c| c.set(i));
+        match eval(&exprs[i], &env, &mut output) {
+            Ok(v) => {
+                last_value = v;
+                i += 1;
+            }
+            Err(EvalError::ContinuationReturn { line, col, expr_index }) => {
+                let value = CONT_RETURN_VALUE.with(|v| v.borrow_mut().take())
+                    .expect("continuation value missing");
+                CALLCC_REPLAY.with(|r| *r.borrow_mut() = Some((line, col, value)));
+                i = expr_index;
+            }
+            Err(e) => return Err(e),
+        }
+    }
+    Ok((last_value, output))
+}
+
 /// Evaluate one or more Scheme expressions and return the string
 /// representation of the last result.
 pub fn eval_str(input: &str) -> Result<String, EvalError> {
-    let mut remaining = input;
-    let mut last_value = None;
-    let env = Env::new();
-    let mut output = String::new();
-    while !remaining.trim().is_empty() {
-        let (expr, rest) = parse_expr(remaining, input)?;
-        last_value = Some(eval(&expr, &env, &mut output)?);
-        remaining = rest;
-    }
-    match last_value {
-        Some(v) => Ok(v.to_scheme_string()),
-        None => Err(EvalError::Parse("empty input".to_string())),
-    }
+    let (v, _) = eval_exprs(input)?;
+    Ok(v.to_scheme_string())
 }
 
 /// Evaluate Scheme expressions, returning both the result value and
 /// any output produced by `display`, `write`, or `newline`.
 pub fn eval_str_with_output(input: &str) -> Result<(String, String), EvalError> {
-    let mut remaining = input;
-    let mut last_value = None;
-    let env = Env::new();
-    let mut output = String::new();
-    while !remaining.trim().is_empty() {
-        let (expr, rest) = parse_expr(remaining, input)?;
-        last_value = Some(eval(&expr, &env, &mut output)?);
-        remaining = rest;
-    }
-    match last_value {
-        Some(v) => Ok((v.to_scheme_string(), output)),
-        None => Err(EvalError::Parse("empty input".to_string())),
-    }
+    let (v, output) = eval_exprs(input)?;
+    Ok((v.to_scheme_string(), output))
 }
 
 #[cfg(test)]
