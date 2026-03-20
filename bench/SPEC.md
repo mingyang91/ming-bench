@@ -91,3 +91,15 @@ TCO must work through `cond`, named `let`, `and`, `or`, `begin`, and `let` body 
 
 ### Level 21 — Integration
 Combined use of continuations, macros, mutation, and tail calls.
+
+### Level 22 — Deep Equality
+`equal?` compares values recursively. Works on numbers, strings, booleans, symbols, lists, and nested structures.
+
+### Level 23 — Recursive Local Bindings
+`letrec` and `letrec*`. All bindings in `letrec` are mutually visible. `letrec*` bindings are visible sequentially.
+
+### Level 24 — Case Expression
+`case` dispatches on datum equality (`eqv?`). Also requires `eqv?` builtin for value equivalence on numbers, chars, symbols, and booleans.
+
+### Level 25 — Vectors
+`vector`, `make-vector`, `vector-ref`, `vector-set!`, `vector-length`, `vector?`. Fixed-size mutable arrays. `vector->list` and `list->vector` for conversion.

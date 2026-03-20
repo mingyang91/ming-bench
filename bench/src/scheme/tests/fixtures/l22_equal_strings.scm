@@ -1,0 +1,1 @@
+(equal? "hello" "hello")

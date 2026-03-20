@@ -1,6 +1,6 @@
 # CS 61A Scheme Interpreter Benchmark
 
-A benchmark framework for measuring how **prompt engineering strategies** affect coding agent performance. Agents build a Scheme interpreter in Rust from scratch — 100+ tests across 21 difficulty levels, from basic arithmetic to first-class continuations and hygienic macros.
+A benchmark framework for measuring how **prompt engineering strategies** affect coding agent performance. Agents build a Scheme interpreter in Rust from scratch — 100+ tests across 25 difficulty levels, from basic arithmetic to first-class continuations, hygienic macros, and data structure extensions.
 
 ## Why This Exists
 
@@ -8,7 +8,7 @@ Coding agents (Claude Code, Codex, OpenCode, etc.) can write working software, b
 
 > **Does adding structure to agent instructions — quality gates, code style rules, modular architecture enforcement — improve outcomes compared to minimal "just do it" prompts?**
 
-The task is deliberately chosen to stress-test this: a Scheme interpreter requires the agent to make hundreds of architectural decisions (data representation, evaluation strategy, environment model, continuation implementation) over 21 progressively harder levels. Bad early decisions compound. Good structure should help.
+The task is deliberately chosen to stress-test this: a Scheme interpreter requires the agent to make hundreds of architectural decisions (data representation, evaluation strategy, environment model, continuation implementation) over 25 progressively harder levels. Bad early decisions compound. Good structure should help.
 
 ## How It Works
 
@@ -16,7 +16,7 @@ The task is deliberately chosen to stress-test this: a Scheme interpreter requir
 
 The agent receives:
 - A function signature: `eval_str(input: &str) -> Result<String, EvalError>`
-- 100+ test cases across 21 levels (each test loads Scheme code from a `.scm` fixture file)
+- 100+ test cases across 25 levels (each test loads Scheme code from a `.scm` fixture file)
 - Instructions in `bench/CLAUDE.md` (the only file the agent reads for guidance)
 
 The agent implements a complete Scheme interpreter from scratch — lexer, parser, environment, evaluator, tail-call optimization, continuations, and hygienic macros. No starter code. No libraries beyond `thiserror` for error types.
@@ -55,7 +55,7 @@ Both strategies share `SPEC.md` (identical task definition) and the same test su
 
 Each agent run uses one of two modes:
 
-- **Full mode** — one agent session tackles all 21 levels. Simpler, but if the agent gets stuck it burns budget.
+- **Full mode** — one agent session tackles all 25 levels. Simpler, but if the agent gets stuck it burns budget.
 - **Levels mode** — orchestrator runs a fresh agent per level. Fail-fast: stops on first failure. Per-level session data for granular analysis.
 
 ### Sandboxed Testing
@@ -92,8 +92,12 @@ This prevents agent-written infinite loops or memory bombs from crashing the ben
 | 19 | **call/cc** | 10 | First-class continuations, non-local exit, reentrant |
 | 20 | **Macros** | 6 | `define-syntax`, `syntax-rules`, hygiene, ellipsis |
 | 21 | **Integration** | 5 | call/cc + macros + mutation + TCO combined |
+| 22 | Deep equality | 4 | `equal?` recursive structural comparison |
+| 23 | Recursive bindings | 4 | `letrec`, `letrec*`, mutual recursion |
+| 24 | Case expression | 4 | `case`, `eqv?`, datum dispatch |
+| 25 | Vectors | 5 | `vector`, `vector-ref`, `vector-set!`, conversion |
 
-Levels 1-9 are foundational. Levels 10-12 are **maintenance levels** — cross-cutting refactors on existing code (error quality, I/O, string ops). Levels 13-14 test **requirement changes** — the agent implements mutable strings (R5RS), then must refactor to immutable strings (R7RS). Levels 15-18 add architectural complexity (TCO, mutation, variadic). Levels 19-21 are where most agents struggle — continuations and macros demand non-obvious design decisions.
+Levels 1-9 are foundational. Levels 10-12 are **maintenance levels** — cross-cutting refactors on existing code (error quality, I/O, string ops). Levels 13-14 test **requirement changes** — the agent implements mutable strings (R5RS), then must refactor to immutable strings (R7RS). Levels 15-18 add architectural complexity (TCO, mutation, variadic). Levels 19-21 are where most agents struggle — continuations and macros demand non-obvious design decisions. Levels 22-25 are **maintenance extensions** — straightforward feature additions that test whether agents can cleanly extend a complex, mature codebase.
 
 ## Tooling
 
@@ -102,7 +106,7 @@ All benchmark infrastructure lives in a single Rust CLI: `cargo xtask`.
 ```
 cargo xtask setup           # install podman, build container image
 cargo xtask test 01         # run level 1 tests (containerized)
-cargo xtask bench main      # score a branch (all 21 levels)
+cargo xtask bench main      # score a branch (all 25 levels)
 cargo xtask run-agent ...   # orchestrate an agent run (worktree + agent + scoring)
 cargo xtask results         # tabular summary of all runs
 cargo xtask tokens --all    # per-level token usage and cost estimates
