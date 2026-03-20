@@ -217,11 +217,66 @@ fn eval_or_tail(args: &[Value], env: &Env) -> Result<TailAction, EvalError> {
     })
 }
 
+fn parse_let_binding(binding: &Value) -> Result<(&str, &Value), EvalError> {
+    let Value::List(pair) = binding else {
+        return Err(EvalError::Parse {
+            msg: "let binding must be a list".into(),
+        });
+    };
+    if pair.len() != 2 {
+        return Err(EvalError::Parse {
+            msg: "let binding must have exactly 2 elements".into(),
+        });
+    }
+    let Value::Symbol(name) = &pair[0] else {
+        return Err(EvalError::Parse {
+            msg: "let binding name must be a symbol".into(),
+        });
+    };
+    Ok((name, &pair[1]))
+}
+
+fn eval_named_let_tail(name: &str, args: &[Value], env: &Env) -> Result<TailAction, EvalError> {
+    if args.len() < 2 {
+        return Err(EvalError::Parse {
+            msg: "named let requires bindings and body".into(),
+        });
+    }
+    let Value::List(bindings) = &args[0] else {
+        return Err(EvalError::Parse {
+            msg: "let bindings must be a list".into(),
+        });
+    };
+    let mut params = Vec::new();
+    let mut init_vals = Vec::new();
+    for binding in bindings {
+        let (bname, init_expr) = parse_let_binding(binding)?;
+        params.push(bname.to_owned());
+        init_vals.push(eval(init_expr, env)?);
+    }
+    let let_env = env.child();
+    let body = args[1..].to_vec();
+    let lambda = Value::Lambda {
+        params: params.clone(),
+        rest_param: None,
+        body,
+        env: let_env.clone(),
+    };
+    let_env.define(name.to_owned(), lambda);
+    for (param, val) in params.iter().zip(init_vals.iter()) {
+        let_env.define(param.clone(), val.clone());
+    }
+    tail_from_body(&args[1..], &let_env)
+}
+
 fn eval_let_tail(args: &[Value], env: &Env) -> Result<TailAction, EvalError> {
     if args.len() < 2 {
         return Err(EvalError::Parse {
             msg: "let requires bindings and body".into(),
         });
+    }
+    if let Value::Symbol(name) = &args[0] {
+        return eval_named_let_tail(name, &args[1..], env);
     }
     let Value::List(bindings) = &args[0] else {
         return Err(EvalError::Parse {
@@ -230,23 +285,9 @@ fn eval_let_tail(args: &[Value], env: &Env) -> Result<TailAction, EvalError> {
     };
     let let_env = env.child();
     for binding in bindings {
-        let Value::List(pair) = binding else {
-            return Err(EvalError::Parse {
-                msg: "let binding must be a list".into(),
-            });
-        };
-        if pair.len() != 2 {
-            return Err(EvalError::Parse {
-                msg: "let binding must have exactly 2 elements".into(),
-            });
-        }
-        let Value::Symbol(bname) = &pair[0] else {
-            return Err(EvalError::Parse {
-                msg: "let binding name must be a symbol".into(),
-            });
-        };
-        let val = eval(&pair[1], env)?;
-        let_env.define(bname.clone(), val);
+        let (bname, init_expr) = parse_let_binding(binding)?;
+        let val = eval(init_expr, env)?;
+        let_env.define(bname.to_owned(), val);
     }
     tail_from_body(&args[1..], &let_env)
 }
