@@ -2,10 +2,6 @@
 
 Implement a Scheme interpreter in Rust. Read `SPEC.md` for the full specification.
 
-## Quality Gate
-
-`cargo xtask test` enforces code quality checks (clippy lints, mod.rs size limits) after running tests. Violations block the level from passing. Focus on making tests pass first — the gate runs at the end.
-
 ## Contract
 
 - Implement `eval_str` in `src/scheme/mod.rs`
@@ -17,7 +13,7 @@ Implement a Scheme interpreter in Rust. Read `SPEC.md` for the full specificatio
 
 ## Build & Test
 
-`cargo xtask test` handles everything: clippy auto-fix, clippy verification, mod.rs size check, release build, and containerized test execution. Just run it.
+`cargo xtask test` handles everything: release build and containerized test execution. Just run it.
 
 ```bash
 cargo xtask test 01   # test level 1
@@ -25,7 +21,7 @@ cargo xtask test 05   # test level 5
 cargo xtask test all  # test all levels (300s timeout)
 ```
 
-- A level argument is required (e.g., `01`, `21`, or `all`)
+- A level argument is required (e.g., `01`, `25`, or `all`)
 - Tests run in a container with 1GB memory, 1 CPU
 - Per-level timeout: 30s. Full suite (`all`): 300s. Exceeding these or OOM = failing
 - Build the container image first if not already built: `cargo xtask setup`

@@ -4,7 +4,7 @@ use std::path::Path;
 
 const IMAGE_NAME: &str = "ming";
 
-pub fn run(level: &str, no_gate: bool) -> Result<()> {
+pub fn run(level: &str, gate: bool) -> Result<()> {
     let proj = project_dir();
 
     // --- AST rules (always enforced) ---
@@ -21,9 +21,9 @@ pub fn run(level: &str, no_gate: bool) -> Result<()> {
         });
     }
 
-    // --- Quality gates (only when clippy.toml exists and --no-gate not set) ---
+    // --- Quality gates (only when --gate is set and clippy.toml exists) ---
     let clippy_toml = proj.join("bench/clippy.toml");
-    if !no_gate && clippy_toml.is_file() {
+    if gate && clippy_toml.is_file() {
         quality_gates(&proj, level)?;
     }
 

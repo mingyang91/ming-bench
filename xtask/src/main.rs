@@ -65,9 +65,9 @@ enum Commands {
     Test {
         /// Level number (01-21) or "all"
         level: String,
-        /// Skip quality gates (clippy, mod.rs size) — run tests only
+        /// Enable quality gates (clippy, mod.rs size) — off by default
         #[arg(long)]
-        no_gate: bool,
+        gate: bool,
     },
     /// Run full benchmark scoring pass
     Bench {
@@ -204,7 +204,7 @@ fn dispatch(command: Commands) -> model::Result<()> {
         Commands::Tokens { runs, all } => cmd::tokens::run(runs, all),
         Commands::Watch { once, ts, all } => cmd::watch::run(once, ts, all),
         Commands::Setup => cmd::setup::run(),
-        Commands::Test { ref level, no_gate } => cmd::test_level::run(level, no_gate),
+        Commands::Test { ref level, gate } => cmd::test_level::run(level, gate),
         Commands::Bench {
             ref branch,
             ref run_id,

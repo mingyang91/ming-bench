@@ -358,12 +358,8 @@ fn run_single_level(
 }
 
 fn run_level_tests(worktree_dir: &Path, level: &str) -> i32 {
-    let has_gate = worktree_dir.join("bench/clippy.toml").is_file();
-    if has_gate {
-        run_cmd("cargo", &["xtask", "test", level, "--no-gate"], worktree_dir).unwrap_or(1)
-    } else {
-        run_cmd("cargo", &["xtask", "test", level], worktree_dir).unwrap_or(1)
-    }
+    // Tests only — no quality gate. Gate is enforced in the cleanup pass.
+    run_cmd("cargo", &["xtask", "test", level], worktree_dir).unwrap_or(1)
 }
 
 fn run_quality_gate_cleanup(
@@ -374,7 +370,7 @@ fn run_quality_gate_cleanup(
     let cleanup_uuid = uuid_v4();
     let cleanup_prompt = format!(
         "Level {level} tests pass. Fix any clippy/quality-gate warnings.\n\
-         Run `cargo xtask test {level}` to verify. Do not change test behavior."
+         Run `cargo xtask test {level} --gate` to verify. Do not change test behavior."
     );
     let _cleanup_exit = launch_agent(
         &args.agent, agent_workdir, &cleanup_prompt, &cleanup_uuid,
@@ -382,7 +378,7 @@ fn run_quality_gate_cleanup(
     );
     capture_session_as(&args.agent, &cleanup_uuid, level_dir, "session-cleanup.jsonl");
 
-    run_cmd("cargo", &["xtask", "test", level], worktree_dir).unwrap_or(1)
+    run_cmd("cargo", &["xtask", "test", level, "--gate"], worktree_dir).unwrap_or(1)
 }
 
 fn commit_checkpoint(level: &str, status: &str, duration: i64, worktree_dir: &Path) {

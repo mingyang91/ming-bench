@@ -14,7 +14,7 @@ This is the benchmark framework that orchestrates coding agent evaluation. The a
 ```bash
 cargo xtask setup            # install podman, build container image
 cargo xtask test 01          # run level 1 tests (containerized)
-cargo xtask test 01 --no-gate # skip quality gates (clippy/mod.rs), tests only
+cargo xtask test 01 --gate   # run with quality gates (clippy/mod.rs)
 cargo xtask test all         # run all levels
 cargo xtask run-agent ...    # orchestrate a full agent run
 cargo xtask results          # tabular summary of all runs
@@ -44,15 +44,15 @@ Shared types and helpers live in `xtask/src/model.rs`.
 Strategies live in `bench/strategies/`. Each is a `.md` file that becomes the agent's `CLAUDE.md` at launch via symlink.
 
 - **`default.md`** — Minimal: build the interpreter, test each level. No lint enforcement.
-- **`quality-gate.md`** — Adds: clippy enforcement, mod.rs size limits, code style rules. Uses two-pass testing: coding pass (tests only), then cleanup pass (clippy/gate, fresh session, 15 turns).
+- **`quality-gate.md`** — Adds: code style rules (thiserror, immutable-first, thin mod.rs). Uses two-pass testing: coding pass (tests only), then cleanup pass (`--gate`, fresh session, 15 turns). The agent never sees clippy during coding.
 
 `bench/SPEC.md` is the shared task spec (identical for all strategies). `bench/CLAUDE.md` and `bench/AGENTS.md` are gitignored — created as symlinks by `run-agent --strategy <name>`.
 
-**Lint enforcement via xtask:** All clippy lint flags live in `GATE_LINT_FLAGS` in `xtask/src/cmd/test_level.rs`. When a strategy includes a `clippy.toml` (thresholds for `too-many-lines`, `excessive-nesting`, etc.), `cargo xtask test` runs clippy with these flags. The agent's normal `cargo build`/`cargo check` is lint-free — lints only fire during `cargo xtask test`.
+**Lint enforcement via xtask:** All clippy lint flags live in `GATE_LINT_FLAGS` in `xtask/src/cmd/test_level.rs`. The `--gate` flag on `cargo xtask test` activates clippy + mod.rs size checks. Without `--gate`, tests run without any lint enforcement. The agent's `cargo xtask test` is lint-free by default — lints only fire with `--gate`.
 
 To add a new strategy: create `bench/strategies/<name>.md` and use `--strategy <name>`. To enable lint enforcement, also add a `<name>.clippy.toml` in `bench/strategies/`.
 
-**Two-pass testing (quality-gate):** In levels mode, `run-agent` splits each quality-gate level into two agent invocations: (1) coding pass with `--no-gate` tests (same turn budget as default), (2) cleanup pass with full gate (fresh session, 15 turns). This separates correctness work from style work. The `--no-gate` flag on `cargo xtask test` skips clippy/mod.rs checks. Default strategy uses a single pass (no gate to skip).
+**Two-pass testing (quality-gate):** In levels mode, `run-agent` splits each quality-gate level into two agent invocations: (1) coding pass with plain `cargo xtask test` (no gate, same turn budget as default), (2) cleanup pass with `cargo xtask test --gate` (fresh session, 15 turns). The agent never sees clippy during coding — the orchestrator controls when quality checks run. Default strategy uses a single pass (no gate).
 
 ## Session Analysis
 
