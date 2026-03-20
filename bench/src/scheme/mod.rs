@@ -2,9 +2,11 @@ pub mod error;
 
 pub use error::EvalError;
 
+use std::cell::RefCell;
 use std::collections::HashMap;
+use std::rc::Rc;
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone)]
 enum Value {
     Integer(i64),
     Boolean(bool),
@@ -17,6 +19,23 @@ enum Value {
         body: Vec<Expr>,
         env: Env,
     },
+}
+
+impl PartialEq for Value {
+    fn eq(&self, other: &Self) -> bool {
+        match (self, other) {
+            (Value::Integer(a), Value::Integer(b)) => a == b,
+            (Value::Boolean(a), Value::Boolean(b)) => a == b,
+            (Value::Str(a), Value::Str(b)) => a == b,
+            (Value::Symbol(a), Value::Symbol(b)) => a == b,
+            (Value::Char(a), Value::Char(b)) => a == b,
+            (Value::List(a), Value::List(b)) => a == b,
+            (Value::Lambda { params: p1, body: b1, .. }, Value::Lambda { params: p2, body: b2, .. }) => {
+                p1 == p2 && b1 == b2
+            }
+            _ => false,
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -32,7 +51,49 @@ enum ExprKind {
     List(Vec<Expr>),
 }
 
-type Env = HashMap<String, Value>;
+#[derive(Debug, Clone)]
+struct Env {
+    bindings: Rc<RefCell<HashMap<String, Value>>>,
+    parent: Option<Box<Env>>,
+}
+
+impl Env {
+    fn new() -> Self {
+        Env {
+            bindings: Rc::new(RefCell::new(HashMap::new())),
+            parent: None,
+        }
+    }
+
+    fn child(&self) -> Self {
+        Env {
+            bindings: Rc::new(RefCell::new(HashMap::new())),
+            parent: Some(Box::new(self.clone())),
+        }
+    }
+
+    fn get(&self, name: &str) -> Option<Value> {
+        if let Some(v) = self.bindings.borrow().get(name).cloned() {
+            return Some(v);
+        }
+        self.parent.as_ref().and_then(|p| p.get(name))
+    }
+
+    fn define(&self, name: String, val: Value) {
+        self.bindings.borrow_mut().insert(name, val);
+    }
+
+    fn set(&self, name: &str, val: Value) -> bool {
+        if self.bindings.borrow().contains_key(name) {
+            self.bindings.borrow_mut().insert(name.to_string(), val);
+            true
+        } else if let Some(ref parent) = self.parent {
+            parent.set(name, val)
+        } else {
+            false
+        }
+    }
+}
 
 fn slice_offset(original: &str, slice: &str) -> usize {
     slice.as_ptr() as usize - original.as_ptr() as usize
@@ -195,11 +256,11 @@ fn expr_to_value(expr: &Expr) -> Value {
     }
 }
 
-fn eval(expr: &Expr, env: &mut Env, output: &mut String) -> Result<Value, EvalError> {
+fn eval(expr: &Expr, env: &Env, output: &mut String) -> Result<Value, EvalError> {
     match &expr.kind {
         ExprKind::Value(Value::Symbol(name)) => {
             if let Some(v) = env.get(name) {
-                Ok(v.clone())
+                Ok(v)
             } else {
                 Err(err_at(format!("undefined variable: {}", name), expr.line, expr.col))
             }
@@ -212,6 +273,7 @@ fn eval(expr: &Expr, env: &mut Env, output: &mut String) -> Result<Value, EvalEr
             if let ExprKind::Value(Value::Symbol(name)) = &items[0].kind {
                 match name.as_str() {
                     "define" => eval_define(items, expr, env, output),
+                    "set!" => eval_set(items, expr, env, output),
                     "if" => eval_if(items, expr, env, output),
                     "quote" => {
                         if items.len() != 2 {
@@ -256,7 +318,7 @@ fn eval(expr: &Expr, env: &mut Env, output: &mut String) -> Result<Value, EvalEr
                         Ok(Value::Symbol("".to_string()))
                     }
                     _ => {
-                        if let Some(func_val) = env.get(name).cloned() {
+                        if let Some(func_val) = env.get(name) {
                             if let Value::Lambda { .. } = &func_val {
                                 let mut eval_args = Vec::new();
                                 for a in &items[1..] {
@@ -265,7 +327,6 @@ fn eval(expr: &Expr, env: &mut Env, output: &mut String) -> Result<Value, EvalEr
                                 return apply_lambda(
                                     &func_val,
                                     &eval_args,
-                                    Some(&*env),
                                     expr.line,
                                     expr.col,
                                     output,
@@ -283,7 +344,7 @@ fn eval(expr: &Expr, env: &mut Env, output: &mut String) -> Result<Value, EvalEr
                         for a in &items[1..] {
                             eval_args.push(eval(a, env, output)?);
                         }
-                        apply_lambda(&func_val, &eval_args, None, expr.line, expr.col, output)
+                        apply_lambda(&func_val, &eval_args, expr.line, expr.col, output)
                     }
                     _ => Err(err_at(
                         format!("not a procedure: {}", func_val.to_scheme_string()),
@@ -296,7 +357,22 @@ fn eval(expr: &Expr, env: &mut Env, output: &mut String) -> Result<Value, EvalEr
     }
 }
 
-fn eval_define(items: &[Expr], expr: &Expr, env: &mut Env, output: &mut String) -> Result<Value, EvalError> {
+fn eval_set(items: &[Expr], expr: &Expr, env: &Env, output: &mut String) -> Result<Value, EvalError> {
+    if items.len() != 3 {
+        return Err(err_at("set! requires 2 arguments", expr.line, expr.col));
+    }
+    let name = match &items[1].kind {
+        ExprKind::Value(Value::Symbol(s)) => s.clone(),
+        _ => return Err(err_at("set!: first argument must be a symbol", expr.line, expr.col)),
+    };
+    let val = eval(&items[2], env, output)?;
+    if !env.set(&name, val) {
+        return Err(err_at(format!("set!: unbound variable: {}", name), expr.line, expr.col));
+    }
+    Ok(Value::Symbol("".to_string()))
+}
+
+fn eval_define(items: &[Expr], expr: &Expr, env: &Env, output: &mut String) -> Result<Value, EvalError> {
     if items.len() < 3 {
         return Err(err_at("define requires 2 arguments", expr.line, expr.col));
     }
@@ -306,7 +382,7 @@ fn eval_define(items: &[Expr], expr: &Expr, env: &mut Env, output: &mut String) 
                 return Err(err_at("define requires 2 arguments", expr.line, expr.col));
             }
             let val = eval(&items[2], env, output)?;
-            env.insert(s.clone(), val);
+            env.define(s.clone(), val);
         }
         ExprKind::List(sig) => {
             if sig.is_empty() {
@@ -339,7 +415,7 @@ fn eval_define(items: &[Expr], expr: &Expr, env: &mut Env, output: &mut String) 
                 body,
                 env: env.clone(),
             };
-            env.insert(fname, lambda);
+            env.define(fname, lambda);
         }
         _ => {
             return Err(err_at(
@@ -352,7 +428,7 @@ fn eval_define(items: &[Expr], expr: &Expr, env: &mut Env, output: &mut String) 
     Ok(Value::Symbol("".to_string()))
 }
 
-fn eval_if(items: &[Expr], expr: &Expr, env: &mut Env, output: &mut String) -> Result<Value, EvalError> {
+fn eval_if(items: &[Expr], expr: &Expr, env: &Env, output: &mut String) -> Result<Value, EvalError> {
     if items.len() < 3 || items.len() > 4 {
         return Err(err_at(
             "if requires 2 or 3 arguments",
@@ -370,7 +446,7 @@ fn eval_if(items: &[Expr], expr: &Expr, env: &mut Env, output: &mut String) -> R
     }
 }
 
-fn eval_lambda(items: &[Expr], expr: &Expr, env: &mut Env) -> Result<Value, EvalError> {
+fn eval_lambda(items: &[Expr], expr: &Expr, env: &Env) -> Result<Value, EvalError> {
     if items.len() < 3 {
         return Err(err_at(
             "lambda requires params and body",
@@ -406,7 +482,7 @@ fn eval_lambda(items: &[Expr], expr: &Expr, env: &mut Env) -> Result<Value, Eval
     })
 }
 
-fn eval_let(items: &[Expr], expr: &Expr, env: &mut Env, output: &mut String) -> Result<Value, EvalError> {
+fn eval_let(items: &[Expr], expr: &Expr, env: &Env, output: &mut String) -> Result<Value, EvalError> {
     if items.len() < 3 {
         return Err(err_at(
             "let requires bindings and body",
@@ -424,7 +500,7 @@ fn eval_let(items: &[Expr], expr: &Expr, env: &mut Env, output: &mut String) -> 
             ))
         }
     };
-    let mut local_env = env.clone();
+    let local_env = env.child();
     for binding in bindings {
         match &binding.kind {
             ExprKind::List(pair) if pair.len() == 2 => {
@@ -439,7 +515,7 @@ fn eval_let(items: &[Expr], expr: &Expr, env: &mut Env, output: &mut String) -> 
                     }
                 };
                 let val = eval(&pair[1], env, output)?;
-                local_env.insert(bname, val);
+                local_env.define(bname, val);
             }
             _ => {
                 return Err(err_at(
@@ -452,13 +528,13 @@ fn eval_let(items: &[Expr], expr: &Expr, env: &mut Env, output: &mut String) -> 
     }
     let mut result = Value::Symbol("".to_string());
     for e in &items[2..] {
-        result = eval(e, &mut local_env, output)?;
+        result = eval(e, &local_env, output)?;
     }
     Ok(result)
 }
 
-fn eval_cond(items: &[Expr], expr: &Expr, env: &mut Env, output: &mut String) -> Result<Value, EvalError> {
-    let _ = expr; // position available if needed
+fn eval_cond(items: &[Expr], expr: &Expr, env: &Env, output: &mut String) -> Result<Value, EvalError> {
+    let _ = expr;
     for clause in &items[1..] {
         match &clause.kind {
             ExprKind::List(parts) if parts.len() >= 2 => {
@@ -490,7 +566,7 @@ fn eval_cond(items: &[Expr], expr: &Expr, env: &mut Env, output: &mut String) ->
     Ok(Value::Symbol("".to_string()))
 }
 
-fn eval_string_set(items: &[Expr], expr: &Expr, env: &mut Env, output: &mut String) -> Result<Value, EvalError> {
+fn eval_string_set(items: &[Expr], expr: &Expr, env: &Env, output: &mut String) -> Result<Value, EvalError> {
     if items.len() != 4 {
         return Err(err_at("string-set! requires 3 arguments", expr.line, expr.col));
     }
@@ -504,7 +580,7 @@ fn eval_string_set(items: &[Expr], expr: &Expr, env: &mut Env, output: &mut Stri
         _ => return Err(err_at("string-set!: third argument must be a char", expr.line, expr.col)),
     };
     let s = match env.get(&var_name) {
-        Some(Value::Str(s)) => s.clone(),
+        Some(Value::Str(s)) => s,
         _ => return Err(err_at("string-set!: variable must contain a string", expr.line, expr.col)),
     };
     let mut chars: Vec<char> = s.chars().collect();
@@ -513,7 +589,7 @@ fn eval_string_set(items: &[Expr], expr: &Expr, env: &mut Env, output: &mut Stri
     }
     chars[idx] = ch;
     let new_s: String = chars.into_iter().collect();
-    env.insert(var_name, Value::Str(new_s));
+    env.set(&var_name, Value::Str(new_s));
     Ok(Value::Symbol("".to_string()))
 }
 
@@ -522,7 +598,7 @@ enum EvalResult {
     TailCall { func: Value, args: Vec<Value> },
 }
 
-fn eval_tail(expr: &Expr, env: &mut Env, output: &mut String) -> Result<EvalResult, EvalError> {
+fn eval_tail(expr: &Expr, env: &Env, output: &mut String) -> Result<EvalResult, EvalError> {
     match &expr.kind {
         ExprKind::List(items) if !items.is_empty() => {
             if let ExprKind::Value(Value::Symbol(name)) = &items[0].kind {
@@ -597,7 +673,7 @@ fn eval_tail(expr: &Expr, env: &mut Env, output: &mut String) -> Result<EvalResu
                                 ))
                             }
                         };
-                        let mut local_env = env.clone();
+                        let local_env = env.child();
                         for binding in bindings {
                             match &binding.kind {
                                 ExprKind::List(pair) if pair.len() == 2 => {
@@ -612,7 +688,7 @@ fn eval_tail(expr: &Expr, env: &mut Env, output: &mut String) -> Result<EvalResu
                                         }
                                     };
                                     let val = eval(&pair[1], env, output)?;
-                                    local_env.insert(bname, val);
+                                    local_env.define(bname, val);
                                 }
                                 _ => {
                                     return Err(err_at(
@@ -624,14 +700,14 @@ fn eval_tail(expr: &Expr, env: &mut Env, output: &mut String) -> Result<EvalResu
                             }
                         }
                         for e in &items[2..items.len() - 1] {
-                            eval(e, &mut local_env, output)?;
+                            eval(e, &local_env, output)?;
                         }
-                        eval_tail(&items[items.len() - 1], &mut local_env, output)
+                        eval_tail(&items[items.len() - 1], &local_env, output)
                     }
-                    "define" | "quote" | "lambda" | "and" | "or" | "string-set!" | "display"
+                    "define" | "set!" | "quote" | "lambda" | "and" | "or" | "string-set!" | "display"
                     | "write" | "newline" => Ok(EvalResult::Done(eval(expr, env, output)?)),
                     _ => {
-                        if let Some(func_val) = env.get(name).cloned() {
+                        if let Some(func_val) = env.get(name) {
                             if let Value::Lambda { .. } = &func_val {
                                 let mut eval_args = Vec::new();
                                 for a in &items[1..] {
@@ -675,14 +751,12 @@ fn eval_tail(expr: &Expr, env: &mut Env, output: &mut String) -> Result<EvalResu
 fn apply_lambda(
     func: &Value,
     args: &[Value],
-    caller_env: Option<&Env>,
     call_line: usize,
     call_col: usize,
     output: &mut String,
 ) -> Result<Value, EvalError> {
     let mut current_func = func.clone();
     let mut current_args = args.to_vec();
-    let mut owned_caller_env = caller_env.cloned();
 
     loop {
         if let Value::Lambda { params, body, env } = &current_func {
@@ -697,16 +771,9 @@ fn apply_lambda(
                     call_col,
                 ));
             }
-            let mut local_env = env.clone();
-            if let Some(ref ce) = owned_caller_env {
-                for (k, v) in ce {
-                    if !local_env.contains_key(k) {
-                        local_env.insert(k.clone(), v.clone());
-                    }
-                }
-            }
+            let local_env = env.child();
             for (p, a) in params.iter().zip(current_args.iter()) {
-                local_env.insert(p.clone(), a.clone());
+                local_env.define(p.clone(), a.clone());
             }
 
             if body.is_empty() {
@@ -714,16 +781,15 @@ fn apply_lambda(
             }
 
             for expr in &body[..body.len() - 1] {
-                eval(expr, &mut local_env, output)?;
+                eval(expr, &local_env, output)?;
             }
 
-            match eval_tail(&body[body.len() - 1], &mut local_env, output)? {
+            match eval_tail(&body[body.len() - 1], &local_env, output)? {
                 EvalResult::Done(v) => return Ok(v),
                 EvalResult::TailCall {
                     func: next_func,
                     args: next_args,
                 } => {
-                    owned_caller_env = Some(local_env);
                     current_func = next_func;
                     current_args = next_args;
                 }
@@ -737,7 +803,7 @@ fn apply_lambda(
 fn apply_builtin(
     name: &str,
     args: &[Expr],
-    env: &mut Env,
+    env: &Env,
     call_line: usize,
     call_col: usize,
     output: &mut String,
@@ -912,7 +978,7 @@ fn apply_builtin(
                 Value::List(items) => {
                     let mut result = Vec::new();
                     for item in items {
-                        let val = apply_lambda(&func, &[item.clone()], Some(&*env), call_line, call_col, output)?;
+                        let val = apply_lambda(&func, &[item.clone()], call_line, call_col, output)?;
                         result.push(val);
                     }
                     Ok(Value::List(result))
@@ -1143,7 +1209,7 @@ fn is_falsy(val: &Value) -> bool {
     matches!(val, Value::Boolean(false))
 }
 
-fn eval_and(args: &[Expr], env: &mut Env, output: &mut String) -> Result<Value, EvalError> {
+fn eval_and(args: &[Expr], env: &Env, output: &mut String) -> Result<Value, EvalError> {
     if args.is_empty() {
         return Ok(Value::Boolean(true));
     }
@@ -1157,7 +1223,7 @@ fn eval_and(args: &[Expr], env: &mut Env, output: &mut String) -> Result<Value, 
     Ok(result)
 }
 
-fn eval_or(args: &[Expr], env: &mut Env, output: &mut String) -> Result<Value, EvalError> {
+fn eval_or(args: &[Expr], env: &Env, output: &mut String) -> Result<Value, EvalError> {
     if args.is_empty() {
         return Ok(Value::Boolean(false));
     }
@@ -1187,11 +1253,11 @@ fn expect_integer(val: &Value, line: usize, col: usize) -> Result<i64, EvalError
 pub fn eval_str(input: &str) -> Result<String, EvalError> {
     let mut remaining = input;
     let mut last_value = None;
-    let mut env = Env::new();
+    let env = Env::new();
     let mut output = String::new();
     while !remaining.trim().is_empty() {
         let (expr, rest) = parse_expr(remaining, input)?;
-        last_value = Some(eval(&expr, &mut env, &mut output)?);
+        last_value = Some(eval(&expr, &env, &mut output)?);
         remaining = rest;
     }
     match last_value {
@@ -1205,11 +1271,11 @@ pub fn eval_str(input: &str) -> Result<String, EvalError> {
 pub fn eval_str_with_output(input: &str) -> Result<(String, String), EvalError> {
     let mut remaining = input;
     let mut last_value = None;
-    let mut env = Env::new();
+    let env = Env::new();
     let mut output = String::new();
     while !remaining.trim().is_empty() {
         let (expr, rest) = parse_expr(remaining, input)?;
-        last_value = Some(eval(&expr, &mut env, &mut output)?);
+        last_value = Some(eval(&expr, &env, &mut output)?);
         remaining = rest;
     }
     match last_value {
