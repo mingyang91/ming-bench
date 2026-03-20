@@ -2,18 +2,73 @@ pub mod error;
 
 pub use error::EvalError;
 
+use std::cell::RefCell;
 use std::collections::HashMap;
+use std::rc::Rc;
 
-type Env = HashMap<String, Value>;
+type EnvRef = Rc<RefCell<EnvFrame>>;
 
 #[derive(Debug, Clone, PartialEq)]
+struct EnvFrame {
+    bindings: HashMap<String, Value>,
+    parent: Option<EnvRef>,
+}
+
+impl EnvFrame {
+    fn new() -> EnvRef {
+        Rc::new(RefCell::new(EnvFrame {
+            bindings: HashMap::new(),
+            parent: None,
+        }))
+    }
+
+    fn child(parent: &EnvRef) -> EnvRef {
+        Rc::new(RefCell::new(EnvFrame {
+            bindings: HashMap::new(),
+            parent: Some(Rc::clone(parent)),
+        }))
+    }
+
+    fn get(env: &EnvRef, name: &str) -> Option<Value> {
+        let frame = env.borrow();
+        if let Some(val) = frame.bindings.get(name) {
+            Some(val.clone())
+        } else if let Some(ref parent) = frame.parent {
+            Self::get(parent, name)
+        } else {
+            None
+        }
+    }
+
+    fn set(env: &EnvRef, name: String, val: Value) {
+        env.borrow_mut().bindings.insert(name, val);
+    }
+}
+
+#[derive(Debug, Clone)]
 enum Value {
     Integer(i64),
     Boolean(bool),
     Str(String),
     Symbol(String),
     List(Vec<Value>),
+    Lambda(Vec<String>, Vec<Expr>, EnvRef),
     Void,
+}
+
+impl PartialEq for Value {
+    fn eq(&self, other: &Self) -> bool {
+        match (self, other) {
+            (Value::Integer(a), Value::Integer(b)) => a == b,
+            (Value::Boolean(a), Value::Boolean(b)) => a == b,
+            (Value::Str(a), Value::Str(b)) => a == b,
+            (Value::Symbol(a), Value::Symbol(b)) => a == b,
+            (Value::List(a), Value::List(b)) => a == b,
+            (Value::Void, Value::Void) => true,
+            (Value::Lambda(..), Value::Lambda(..)) => false,
+            _ => false,
+        }
+    }
 }
 
 impl Value {
@@ -28,6 +83,7 @@ impl Value {
                 let inner: Vec<String> = elems.iter().map(|v| v.to_scheme_string()).collect();
                 format!("({})", inner.join(" "))
             }
+            Value::Lambda(..) => "#<procedure>".to_string(),
             Value::Void => String::new(),
         }
     }
@@ -151,31 +207,86 @@ fn expr_to_value(expr: &Expr) -> Value {
     }
 }
 
-fn eval_expr(expr: &Expr, env: &mut Env) -> Result<Value, EvalError> {
+fn eval_expr(expr: &Expr, env: &EnvRef) -> Result<Value, EvalError> {
     match expr {
         Expr::Integer(n) => Ok(Value::Integer(*n)),
         Expr::Boolean(b) => Ok(Value::Boolean(*b)),
         Expr::Str(s) => Ok(Value::Str(s.clone())),
-        Expr::Symbol(s) => env
-            .get(s)
-            .cloned()
+        Expr::Symbol(s) => EnvFrame::get(env, s)
             .ok_or_else(|| EvalError::Parse(format!("unbound variable: {}", s))),
         Expr::List(elems) => {
             if elems.is_empty() {
                 return Err(EvalError::Parse("empty application".to_string()));
             }
+            // Check for special forms
             if let Expr::Symbol(op) = &elems[0] {
                 match op.as_str() {
                     "define" => {
-                        if elems.len() != 3 {
+                        if elems.len() < 3 {
                             return Err(EvalError::Parse("define requires exactly 2 arguments".to_string()));
                         }
-                        if let Expr::Symbol(name) = &elems[1] {
-                            let val = eval_expr(&elems[2], env)?;
-                            env.insert(name.clone(), val);
-                            Ok(Value::Void)
+                        match &elems[1] {
+                            Expr::Symbol(name) => {
+                                if elems.len() != 3 {
+                                    return Err(EvalError::Parse("define requires exactly 2 arguments".to_string()));
+                                }
+                                let val = eval_expr(&elems[2], env)?;
+                                // For recursive lambdas: patch the closure env
+                                if let Value::Lambda(params, body, closure_env) = &val {
+                                    let val = Value::Lambda(params.clone(), body.clone(), Rc::clone(closure_env));
+                                    EnvFrame::set(env, name.clone(), val.clone());
+                                    // Make the lambda visible in its own closure for recursion
+                                    EnvFrame::set(closure_env, name.clone(), val);
+                                } else {
+                                    EnvFrame::set(env, name.clone(), val);
+                                }
+                                Ok(Value::Void)
+                            }
+                            // Shorthand: (define (f x y) body...) => (define f (lambda (x y) body...))
+                            Expr::List(name_and_params) => {
+                                if name_and_params.is_empty() {
+                                    return Err(EvalError::Parse("define shorthand requires a name".to_string()));
+                                }
+                                if let Expr::Symbol(name) = &name_and_params[0] {
+                                    let params: Result<Vec<String>, _> = name_and_params[1..]
+                                        .iter()
+                                        .map(|p| match p {
+                                            Expr::Symbol(s) => Ok(s.clone()),
+                                            _ => Err(EvalError::Parse("parameter must be a symbol".to_string())),
+                                        })
+                                        .collect();
+                                    let params = params?;
+                                    let body: Vec<Expr> = elems[2..].to_vec();
+                                    let closure_env = Rc::clone(env);
+                                    let val = Value::Lambda(params, body, closure_env.clone());
+                                    EnvFrame::set(env, name.clone(), val.clone());
+                                    // Recursion support
+                                    EnvFrame::set(&closure_env, name.clone(), val);
+                                    Ok(Value::Void)
+                                } else {
+                                    Err(EvalError::Parse("define requires a symbol as name".to_string()))
+                                }
+                            }
+                            _ => Err(EvalError::Parse("define requires a symbol or list".to_string())),
+                        }
+                    }
+                    "lambda" => {
+                        if elems.len() < 3 {
+                            return Err(EvalError::Parse("lambda requires params and body".to_string()));
+                        }
+                        if let Expr::List(param_exprs) = &elems[1] {
+                            let params: Result<Vec<String>, _> = param_exprs
+                                .iter()
+                                .map(|p| match p {
+                                    Expr::Symbol(s) => Ok(s.clone()),
+                                    _ => Err(EvalError::Parse("parameter must be a symbol".to_string())),
+                                })
+                                .collect();
+                            let params = params?;
+                            let body: Vec<Expr> = elems[2..].to_vec();
+                            Ok(Value::Lambda(params, body, Rc::clone(env)))
                         } else {
-                            Err(EvalError::Parse("define requires a symbol".to_string()))
+                            Err(EvalError::Parse("lambda params must be a list".to_string()))
                         }
                     }
                     "if" => {
@@ -287,12 +398,43 @@ fn eval_expr(expr: &Expr, env: &mut Env) -> Result<Value, EvalError> {
                         }
                         Ok(result)
                     }
-                    _ => Err(EvalError::Parse(format!("unknown procedure: {}", op))),
+                    _ => {
+                        // Not a special form, try as procedure call
+                        apply_proc(elems, env)
+                    }
                 }
             } else {
-                Err(EvalError::Parse("not a procedure".to_string()))
+                // Operator is not a symbol — evaluate it (e.g., ((lambda ...) args))
+                apply_proc(elems, env)
             }
         }
+    }
+}
+
+fn apply_proc(elems: &[Expr], env: &EnvRef) -> Result<Value, EvalError> {
+    let func = eval_expr(&elems[0], env)?;
+    let args: Result<Vec<Value>, _> = elems[1..].iter().map(|a| eval_expr(a, env)).collect();
+    let args = args?;
+    match func {
+        Value::Lambda(params, body, closure_env) => {
+            if params.len() != args.len() {
+                return Err(EvalError::Parse(format!(
+                    "expected {} arguments, got {}",
+                    params.len(),
+                    args.len()
+                )));
+            }
+            let call_env = EnvFrame::child(&closure_env);
+            for (param, arg) in params.iter().zip(args) {
+                EnvFrame::set(&call_env, param.clone(), arg);
+            }
+            let mut result = Value::Void;
+            for expr in &body {
+                result = eval_expr(expr, &call_env)?;
+            }
+            Ok(result)
+        }
+        _ => Err(EvalError::Parse("not a procedure".to_string())),
     }
 }
 
@@ -300,7 +442,7 @@ fn is_false(val: &Value) -> bool {
     matches!(val, Value::Boolean(false))
 }
 
-fn require_two_ints(args: &[Expr], op: &str, env: &mut Env) -> Result<(i64, i64), EvalError> {
+fn require_two_ints(args: &[Expr], op: &str, env: &EnvRef) -> Result<(i64, i64), EvalError> {
     if args.len() != 2 {
         return Err(EvalError::Parse(format!("{} requires exactly two arguments", op)));
     }
@@ -329,10 +471,10 @@ pub fn eval_str(input: &str) -> Result<String, EvalError> {
     if exprs.is_empty() {
         return Err(EvalError::Parse("empty input".to_string()));
     }
-    let mut env = Env::new();
+    let env = EnvFrame::new();
     let mut result = Value::Boolean(false);
     for expr in &exprs {
-        result = eval_expr(expr, &mut env)?;
+        result = eval_expr(expr, &env)?;
     }
     Ok(result.to_scheme_string())
 }
