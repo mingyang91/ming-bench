@@ -1,0 +1,217 @@
+use super::{Env, EvalError, Value};
+
+pub(super) fn eval(value: &Value, env: &mut Env) -> Result<Value, EvalError> {
+    match value {
+        Value::Integer(_) | Value::Boolean(_) | Value::String(_) => Ok(value.clone()),
+        Value::Nil => Ok(Value::Nil),
+        Value::Symbol(name) => env.get(name).cloned().ok_or_else(|| EvalError::UnboundVariable {
+            name: name.clone(),
+        }),
+        Value::Pair(..) => eval_pair(value, env),
+    }
+}
+
+fn eval_pair(value: &Value, env: &mut Env) -> Result<Value, EvalError> {
+    let items = value
+        .to_list_vec()
+        .ok_or_else(|| EvalError::TypeError {
+            expected: "proper list".to_string(),
+            got: value.display(),
+        })?;
+
+    let [operator, args @ ..] = items.as_slice() else {
+        return Ok(Value::Nil);
+    };
+
+    // Special forms and builtin procedure calls
+    if let Value::Symbol(name) = operator {
+        return match name.as_str() {
+            "define" => eval_define(args, env),
+            "if" => eval_if(args, env),
+            "quote" => eval_quote(args),
+            _ => eval_builtin(name, args, env),
+        };
+    }
+
+    let proc = eval(operator, env)?;
+    Err(EvalError::NotAProcedure {
+        value: proc.display(),
+    })
+}
+
+fn eval_define(args: &[Value], env: &mut Env) -> Result<Value, EvalError> {
+    let [Value::Symbol(name), expr] = args else {
+        return Err(EvalError::TypeError {
+            expected: "symbol and value".to_string(),
+            got: format!("{} args", args.len()),
+        });
+    };
+    let val = eval(expr, env)?;
+    env.insert(name.clone(), val);
+    Ok(Value::Symbol(name.clone()))
+}
+
+fn eval_if(args: &[Value], env: &mut Env) -> Result<Value, EvalError> {
+    let (condition, consequent, alternative) = match args {
+        [cond, cons, alt] => (cond, cons, Some(alt)),
+        [cond, cons] => (cond, cons, None),
+        _ => {
+            return Err(EvalError::WrongArgCount {
+                expected: 3,
+                got: args.len(),
+            })
+        }
+    };
+    let test = eval(condition, env)?;
+    if test != Value::Boolean(false) {
+        eval(consequent, env)
+    } else {
+        alternative.map_or(Ok(Value::Nil), |alt| eval(alt, env))
+    }
+}
+
+fn eval_quote(args: &[Value]) -> Result<Value, EvalError> {
+    let [datum] = args else {
+        return Err(EvalError::WrongArgCount {
+            expected: 1,
+            got: args.len(),
+        });
+    };
+    Ok(datum.clone())
+}
+
+fn eval_builtin(name: &str, args: &[Value], env: &mut Env) -> Result<Value, EvalError> {
+    match name {
+        "+" | "-" | "*" | "/" => eval_arithmetic(name, args, env),
+        "<" | ">" | "=" | "<=" | ">=" => eval_comparison(name, args, env),
+        "not" => eval_not(args, env),
+        "and" => eval_and(args, env),
+        "or" => eval_or(args, env),
+        _ => Err(EvalError::UnboundVariable {
+            name: name.to_string(),
+        }),
+    }
+}
+
+fn checked_div(acc: i64, v: i64) -> Result<i64, EvalError> {
+    if v == 0 {
+        Err(EvalError::DivisionByZero)
+    } else {
+        Ok(acc / v)
+    }
+}
+
+fn eval_arithmetic(op: &str, args: &[Value], env: &mut Env) -> Result<Value, EvalError> {
+    let values: Vec<i64> = args
+        .iter()
+        .map(|a| {
+            let evaled = eval(a, env)?;
+            match evaled {
+                Value::Integer(n) => Ok(n),
+                other => Err(EvalError::TypeError {
+                    expected: "integer".to_string(),
+                    got: other.display(),
+                }),
+            }
+        })
+        .collect::<Result<_, _>>()?;
+
+    let result = match op {
+        "+" => values.iter().sum(),
+        "*" => values.iter().product(),
+        "-" => {
+            let [first, rest @ ..] = values.as_slice() else {
+                return Err(EvalError::WrongArgCount {
+                    expected: 1,
+                    got: 0,
+                });
+            };
+            if rest.is_empty() {
+                -first
+            } else {
+                rest.iter().fold(*first, |acc, &v| acc - v)
+            }
+        }
+        "/" => {
+            let [first, rest @ ..] = values.as_slice() else {
+                return Err(EvalError::WrongArgCount {
+                    expected: 1,
+                    got: 0,
+                });
+            };
+            rest.iter().try_fold(*first, |acc, &v| checked_div(acc, v))?
+        }
+        _ => unreachable!("unexpected arithmetic operator: {op}"),
+    };
+
+    Ok(Value::Integer(result))
+}
+
+fn eval_comparison(op: &str, args: &[Value], env: &mut Env) -> Result<Value, EvalError> {
+    let [lhs, rhs] = args else {
+        return Err(EvalError::WrongArgCount {
+            expected: 2,
+            got: args.len(),
+        });
+    };
+    let lhs = match eval(lhs, env)? {
+        Value::Integer(n) => n,
+        other => {
+            return Err(EvalError::TypeError {
+                expected: "integer".to_string(),
+                got: other.display(),
+            })
+        }
+    };
+    let rhs = match eval(rhs, env)? {
+        Value::Integer(n) => n,
+        other => {
+            return Err(EvalError::TypeError {
+                expected: "integer".to_string(),
+                got: other.display(),
+            })
+        }
+    };
+    let result = match op {
+        "<" => lhs < rhs,
+        ">" => lhs > rhs,
+        "=" => lhs == rhs,
+        "<=" => lhs <= rhs,
+        ">=" => lhs >= rhs,
+        _ => unreachable!("unexpected comparison operator: {op}"),
+    };
+    Ok(Value::Boolean(result))
+}
+
+fn eval_not(args: &[Value], env: &mut Env) -> Result<Value, EvalError> {
+    let [arg] = args else {
+        return Err(EvalError::WrongArgCount {
+            expected: 1,
+            got: args.len(),
+        });
+    };
+    let val = eval(arg, env)?;
+    Ok(Value::Boolean(val == Value::Boolean(false)))
+}
+
+fn eval_and(args: &[Value], env: &mut Env) -> Result<Value, EvalError> {
+    let mut result = Value::Boolean(true);
+    for arg in args {
+        result = eval(arg, env)?;
+        if result == Value::Boolean(false) {
+            return Ok(Value::Boolean(false));
+        }
+    }
+    Ok(result)
+}
+
+fn eval_or(args: &[Value], env: &mut Env) -> Result<Value, EvalError> {
+    let mut result = Value::Boolean(false);
+    for arg in args {
+        result = eval(arg, env)?;
+        if result != Value::Boolean(false) {
+            return Ok(result);
+        }
+    }
+    Ok(result)
+}
