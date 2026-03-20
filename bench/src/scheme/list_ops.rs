@@ -92,6 +92,26 @@ pub fn eval_list(args: &[Value], env: &Rc<Env>) -> Result<Value, EvalError> {
     Ok(Value::List(elems))
 }
 
+/// Evaluate a type predicate (`string?`, `number?`, `boolean?`, `pair?`, `symbol?`).
+pub fn eval_type_pred(pred: &str, args: &[Value], env: &Rc<Env>) -> Result<Value, EvalError> {
+    let [arg] = args else {
+        return Err(EvalError::WrongArgCount {
+            expected: "1".into(),
+            got: args.len(),
+        });
+    };
+    let val = eval(arg, env)?;
+    let result = match pred {
+        "string?" => matches!(val, Value::String(_)),
+        "number?" => matches!(val, Value::Integer(_)),
+        "boolean?" => matches!(val, Value::Boolean(_)),
+        "pair?" => matches!(val, Value::List(ref elems) if !elems.is_empty()),
+        "symbol?" => matches!(val, Value::Symbol(_)),
+        _ => unreachable!("invalid type predicate: {pred}"),
+    };
+    Ok(Value::Boolean(result))
+}
+
 /// Evaluate `(length lst)` — count elements in a list.
 pub fn eval_length(args: &[Value], env: &Rc<Env>) -> Result<Value, EvalError> {
     let [arg] = args else {
