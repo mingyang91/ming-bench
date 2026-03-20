@@ -6,7 +6,11 @@ use crate::scheme::builtins::{
 use crate::scheme::continuation;
 use crate::scheme::env::Env;
 use crate::scheme::error::EvalError;
-use crate::scheme::list_ops::{eval_car_values, eval_cdr_values, eval_cons_values, eval_length_values, eval_null_q_values};
+use crate::scheme::list_ops::{
+    eval_assoc_values, eval_car_values, eval_cdr_values, eval_cons_values,
+    eval_length_values, eval_list_pred_values, eval_list_ref_values,
+    eval_list_tail_values, eval_null_q_values,
+};
 use crate::scheme::vector_ops;
 use crate::scheme::value::Value;
 use crate::scheme::{eval, Trampoline};
@@ -44,7 +48,7 @@ pub(super) fn eval_apply(args: &[Value], env: &Rc<Env>) -> Result<Trampoline, Ev
 }
 
 /// Apply a value (Lambda, Builtin, or Continuation) to evaluated arguments, with TCO.
-pub(super) fn apply_value_tco(func: Value, args: &[Value]) -> Result<Trampoline, EvalError> {
+pub(crate) fn apply_value_tco(func: Value, args: &[Value]) -> Result<Trampoline, EvalError> {
     match &func {
         Value::Lambda { .. } => apply_lambda_tco(func, args),
         Value::Builtin(name) => dispatch_builtin(name, args).map(Trampoline::Done),
@@ -77,6 +81,10 @@ fn dispatch_builtin(name: &str, args: &[Value]) -> Result<Value, EvalError> {
         "null?" => eval_null_q_values(args),
         "list" => Ok(Value::List(args.to_vec())),
         "length" => eval_length_values(args),
+        "list?" => eval_list_pred_values(args),
+        "list-ref" => eval_list_ref_values(args),
+        "list-tail" => eval_list_tail_values(args),
+        "assoc" => eval_assoc_values(args),
         "not" => {
             let [arg] = args else {
                 return Err(EvalError::WrongArgCount {
@@ -163,6 +171,7 @@ pub(super) fn register_builtins(env: &Rc<Env>) {
         "call-with-current-continuation",
         "vector", "make-vector", "vector-ref", "vector-set!", "vector-length",
         "vector?", "vector->list", "list->vector",
+        "list?", "list-ref", "list-tail", "assoc",
         "zero?", "positive?", "negative?", "odd?", "even?",
         "abs", "quotient", "remainder", "modulo", "min", "max", "expt",
     ] {

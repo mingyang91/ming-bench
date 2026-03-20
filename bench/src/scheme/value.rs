@@ -13,6 +13,7 @@ pub enum Value {
     Symbol(String),
     Char(char),
     List(Vec<Value>),
+    Pair(Box<Value>, Box<Value>),
     Lambda {
         params: Vec<String>,
         rest_param: Option<String>,
@@ -39,6 +40,7 @@ impl PartialEq for Value {
             (Value::Symbol(a), Value::Symbol(b)) => a == b,
             (Value::Char(a), Value::Char(b)) => a == b,
             (Value::List(a), Value::List(b)) => a == b,
+            (Value::Pair(a1, a2), Value::Pair(b1, b2)) => a1 == b1 && a2 == b2,
             (Value::Vector(a), Value::Vector(b)) => Rc::ptr_eq(a, b),
             (Value::Continuation(a), Value::Continuation(b)) => a == b,
             (Value::Void, Value::Void) => true,
@@ -54,6 +56,29 @@ fn fmt_vector(elements: &[Value], f: &mut fmt::Formatter<'_>) -> fmt::Result {
             write!(f, " ")?;
         }
         write!(f, "{elem}")?;
+    }
+    write!(f, ")")
+}
+
+fn fmt_pair(car: &Value, cdr: &Value, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+    write!(f, "({car}")?;
+    let mut current = cdr;
+    loop {
+        match current {
+            Value::Pair(a, b) => {
+                write!(f, " {a}")?;
+                current = b;
+            }
+            Value::List(elems) if elems.is_empty() => break,
+            Value::List(elems) => {
+                elems.iter().try_for_each(|elem| write!(f, " {elem}"))?;
+                break;
+            }
+            other => {
+                write!(f, " . {other}")?;
+                break;
+            }
+        }
     }
     write!(f, ")")
 }
@@ -97,6 +122,7 @@ impl fmt::Display for Value {
             Value::Symbol(s) => write!(f, "{s}"),
             Value::Char(c) => write!(f, "#\\{c}"),
             Value::List(elements) => fmt_list(elements, f),
+            Value::Pair(car, cdr) => fmt_pair(car, cdr, f),
             Value::Vector(cells) => fmt_vector(&cells.borrow(), f),
             Value::Lambda { .. } | Value::Builtin(_) | Value::Continuation(_) | Value::Macro { .. } => write!(f, "#<procedure>"),
             Value::Void => write!(f, ""),

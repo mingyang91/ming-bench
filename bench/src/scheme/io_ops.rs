@@ -3,27 +3,45 @@ use std::rc::Rc;
 use crate::scheme::env::Env;
 use crate::scheme::error::EvalError;
 use crate::scheme::value::Value;
-use crate::scheme::apply::apply_lambda;
+use crate::scheme::dispatch::apply_value_tco;
 use crate::scheme::eval;
+use crate::scheme::Trampoline;
+
+/// Apply a function value (Lambda or Builtin) to evaluated arguments.
+fn apply_any(func: Value, args: &[Value]) -> Result<Value, EvalError> {
+    match apply_value_tco(func, args)? {
+        Trampoline::Done(v) => Ok(v),
+        Trampoline::Bounce { expr, env } => eval(&expr, &env),
+    }
+}
 
 pub(crate) fn eval_map(args: &[Value], env: &Rc<Env>) -> Result<Value, EvalError> {
-    let [func_expr, list_expr] = args else {
+    if args.len() < 2 {
         return Err(EvalError::WrongArgCount {
-            expected: "2".into(),
+            expected: "at least 2".into(),
             got: args.len(),
         });
-    };
-    let func = eval(func_expr, env)?;
-    let list_val = eval(list_expr, env)?;
-    let Value::List(elems) = list_val else {
-        return Err(EvalError::TypeError {
-            expected: "list".into(),
-            got: format!("{list_val}"),
-        });
-    };
-    let results: Vec<Value> = elems
+    }
+    let func = eval(&args[0], env)?;
+    let lists: Vec<Vec<Value>> = args[1..]
         .iter()
-        .map(|e| apply_lambda(func.clone(), std::slice::from_ref(e)))
+        .map(|a| {
+            let val = eval(a, env)?;
+            match val {
+                Value::List(elems) => Ok(elems),
+                other => Err(EvalError::TypeError {
+                    expected: "list".into(),
+                    got: format!("{other}"),
+                }),
+            }
+        })
+        .collect::<Result<_, _>>()?;
+    let len = lists[0].len();
+    let results: Vec<Value> = (0..len)
+        .map(|i| {
+            let call_args: Vec<Value> = lists.iter().map(|l| l[i].clone()).collect();
+            apply_any(func.clone(), &call_args)
+        })
         .collect::<Result<_, _>>()?;
     Ok(Value::List(results))
 }

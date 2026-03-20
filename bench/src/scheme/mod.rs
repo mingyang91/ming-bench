@@ -82,7 +82,7 @@ fn eval_inner(expr: &Value, env: &Rc<Env>) -> Result<Trampoline, EvalError> {
         Value::Integer(_) | Value::Boolean(_) | Value::String(_) | Value::Char(_) | Value::Void => {
             Ok(Trampoline::Done(expr.clone()))
         }
-        Value::Vector(_) | Value::Lambda { .. } | Value::Builtin(_) | Value::Continuation(_) | Value::Macro { .. } => {
+        Value::Pair(_, _) | Value::Vector(_) | Value::Lambda { .. } | Value::Builtin(_) | Value::Continuation(_) | Value::Macro { .. } => {
             Ok(Trampoline::Done(expr.clone()))
         }
         Value::Symbol(name) => env
@@ -137,7 +137,7 @@ fn eval_list_form(elements: &[Value], env: &Rc<Env>) -> Result<Trampoline, EvalE
         Value::Symbol(op)
             if matches!(
                 op.as_str(),
-                "string?" | "number?" | "boolean?" | "pair?" | "symbol?" | "char?" | "vector?"
+                "string?" | "number?" | "boolean?" | "pair?" | "symbol?" | "char?" | "vector?" | "list?"
             ) =>
         {
             eval_type_pred(op, args, env).map(Trampoline::Done)
