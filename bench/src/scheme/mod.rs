@@ -99,7 +99,15 @@ fn eval(val: Value) -> Result<Value, EvalError> {
             }
             let func = &items[0];
             match func {
-                Value::Symbol(name) => apply_builtin(name, &items[1..]),
+                Value::Symbol(name) => {
+                    // Special forms with short-circuit semantics
+                    match name.as_str() {
+                        "and" => return eval_and(&items[1..]),
+                        "or" => return eval_or(&items[1..]),
+                        _ => {}
+                    }
+                    apply_builtin(name, &items[1..])
+                }
                 _ => Err(EvalError::Parse(format!(
                     "not a procedure: {}",
                     func.to_scheme_string()
@@ -154,8 +162,70 @@ fn apply_builtin(name: &str, args: &[Value]) -> Result<Value, EvalError> {
             }
             Ok(Value::Integer(result))
         }
+        "<" => {
+            if eval_args.len() != 2 {
+                return Err(EvalError::Parse("< requires 2 arguments".to_string()));
+            }
+            Ok(Value::Boolean(expect_integer(&eval_args[0])? < expect_integer(&eval_args[1])?))
+        }
+        ">" => {
+            if eval_args.len() != 2 {
+                return Err(EvalError::Parse("> requires 2 arguments".to_string()));
+            }
+            Ok(Value::Boolean(expect_integer(&eval_args[0])? > expect_integer(&eval_args[1])?))
+        }
+        "=" => {
+            if eval_args.len() != 2 {
+                return Err(EvalError::Parse("= requires 2 arguments".to_string()));
+            }
+            Ok(Value::Boolean(expect_integer(&eval_args[0])? == expect_integer(&eval_args[1])?))
+        }
+        "<=" => {
+            if eval_args.len() != 2 {
+                return Err(EvalError::Parse("<= requires 2 arguments".to_string()));
+            }
+            Ok(Value::Boolean(expect_integer(&eval_args[0])? <= expect_integer(&eval_args[1])?))
+        }
+        "not" => {
+            if eval_args.len() != 1 {
+                return Err(EvalError::Parse("not requires 1 argument".to_string()));
+            }
+            Ok(Value::Boolean(is_falsy(&eval_args[0])))
+        }
         _ => Err(EvalError::Parse(format!("unknown procedure: {}", name))),
     }
+}
+
+fn is_falsy(val: &Value) -> bool {
+    matches!(val, Value::Boolean(false))
+}
+
+fn eval_and(args: &[Value]) -> Result<Value, EvalError> {
+    if args.is_empty() {
+        return Ok(Value::Boolean(true));
+    }
+    let mut result = Value::Boolean(true);
+    for arg in args {
+        result = eval(arg.clone())?;
+        if is_falsy(&result) {
+            return Ok(result);
+        }
+    }
+    Ok(result)
+}
+
+fn eval_or(args: &[Value]) -> Result<Value, EvalError> {
+    if args.is_empty() {
+        return Ok(Value::Boolean(false));
+    }
+    let mut result = Value::Boolean(false);
+    for arg in args {
+        result = eval(arg.clone())?;
+        if !is_falsy(&result) {
+            return Ok(result);
+        }
+    }
+    Ok(result)
 }
 
 fn expect_integer(val: &Value) -> Result<i64, EvalError> {
