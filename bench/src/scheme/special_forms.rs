@@ -332,3 +332,43 @@ pub(crate) fn eval_cond_tco(clauses: &[Value], env: &Rc<Env>) -> Result<Trampoli
     }
     Ok(Trampoline::Done(Value::Void))
 }
+
+/// Evaluate `(case key ((datum ...) body ...) ... (else body ...))`.
+/// Compares key against each datum using `eqv?` (== on Value).
+pub(crate) fn eval_case_tco(args: &[Value], env: &Rc<Env>) -> Result<Trampoline, EvalError> {
+    let [key_expr, clauses @ ..] = args else {
+        return Err(EvalError::BadSyntax {
+            form: "case".into(),
+        });
+    };
+    if clauses.is_empty() {
+        return Err(EvalError::BadSyntax {
+            form: "case".into(),
+        });
+    }
+    let key = eval(key_expr, env)?;
+    for clause in clauses {
+        let Value::List(parts) = clause else {
+            return Err(EvalError::BadSyntax {
+                form: "case".into(),
+            });
+        };
+        let [datums, body @ ..] = parts.as_slice() else {
+            return Err(EvalError::BadSyntax {
+                form: "case".into(),
+            });
+        };
+        if matches!(datums, Value::Symbol(s) if s == "else") {
+            return eval_body_tco(body, env);
+        }
+        let Value::List(datum_list) = datums else {
+            return Err(EvalError::BadSyntax {
+                form: "case".into(),
+            });
+        };
+        if datum_list.iter().any(|d| d == &key) {
+            return eval_body_tco(body, env);
+        }
+    }
+    Ok(Trampoline::Done(Value::Void))
+}
