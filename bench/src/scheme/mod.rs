@@ -6,6 +6,12 @@ pub use error::EvalError;
 
 use std::collections::HashMap;
 
+#[derive(Debug, Clone)]
+struct Span {
+    line: usize,
+    col: usize,
+}
+
 /// A Scheme value.
 #[derive(Debug, Clone, PartialEq)]
 enum Value {
@@ -80,8 +86,12 @@ pub fn eval_str(input: &str) -> Result<String, EvalError> {
     let exprs = parse::parse_all(input)?;
     let mut env = Env::new();
     let mut last = None;
-    for expr in &exprs {
-        last = Some(eval::eval(expr, &mut env)?);
+    for (expr, span) in &exprs {
+        last = Some(eval::eval(expr, &mut env).map_err(|e| EvalError::AtPosition {
+            line: span.line,
+            col: span.col,
+            source: Box::new(e),
+        })?);
     }
     let last = last.ok_or(EvalError::EmptyInput)?;
     Ok(last.display())

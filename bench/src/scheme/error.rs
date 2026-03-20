@@ -21,4 +21,11 @@ pub enum EvalError {
 
     #[error("not a procedure: {value}")]
     NotAProcedure { value: String },
+
+    #[error("at {line}:{col}: {source}")]
+    AtPosition {
+        line: usize,
+        col: usize,
+        source: Box<EvalError>,
+    },
 }

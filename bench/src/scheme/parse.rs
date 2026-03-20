@@ -1,5 +1,5 @@
 use super::error::EvalError;
-use super::Value;
+use super::{Span, Value};
 
 // --- Tokenizer ---
 
@@ -42,35 +42,65 @@ fn read_atom(chars: &mut std::iter::Peekable<std::str::Chars>) -> String {
     atom
 }
 
-fn tokenize(input: &str) -> Vec<Token> {
+fn tokenize(input: &str) -> (Vec<Token>, Vec<Span>) {
     let mut tokens = Vec::new();
+    let mut spans = Vec::new();
     let mut chars = input.chars().peekable();
+    let mut line: usize = 1;
+    let mut col: usize = 1;
     while let Some(&ch) = chars.peek() {
         match ch {
-            ' ' | '\t' | '\n' | '\r' => {
+            '\n' => {
                 chars.next();
+                line += 1;
+                col = 1;
             }
-            ';' => skip_line_comment(&mut chars),
+            ' ' | '\t' | '\r' => {
+                chars.next();
+                col += 1;
+            }
+            ';' => {
+                skip_line_comment(&mut chars);
+                line += 1;
+                col = 1;
+            }
             '(' => {
+                spans.push(Span { line, col });
                 tokens.push(Token::LParen);
                 chars.next();
+                col += 1;
             }
             ')' => {
+                spans.push(Span { line, col });
                 tokens.push(Token::RParen);
                 chars.next();
+                col += 1;
             }
             '\'' => {
+                spans.push(Span { line, col });
                 tokens.push(Token::Quote);
                 chars.next();
+                col += 1;
             }
             '"' => {
+                let start_col = col;
                 chars.next();
-                tokens.push(Token::Atom(read_string_literal(&mut chars)));
+                col += 1;
+                let s = read_string_literal(&mut chars);
+                col += s.len();
+                spans.push(Span { line, col: start_col });
+                tokens.push(Token::Atom(s));
             }
-            _ => tokens.push(Token::Atom(read_atom(&mut chars))),
+            _ => {
+                let start_col = col;
+                let atom = read_atom(&mut chars);
+                col += atom.len();
+                spans.push(Span { line, col: start_col });
+                tokens.push(Token::Atom(atom));
+            }
         }
     }
-    tokens
+    (tokens, spans)
 }
 
 // --- Parser ---
@@ -141,16 +171,17 @@ fn parse_atom(s: &str) -> Result<Value, EvalError> {
     Ok(Value::Symbol(s.to_string()))
 }
 
-pub fn parse_all(input: &str) -> Result<Vec<Value>, EvalError> {
-    let tokens = tokenize(input);
+pub fn parse_all(input: &str) -> Result<Vec<(Value, Span)>, EvalError> {
+    let (tokens, token_spans) = tokenize(input);
     if tokens.is_empty() {
         return Err(EvalError::EmptyInput);
     }
     let mut exprs = Vec::new();
     let mut pos = 0;
     while pos < tokens.len() {
+        let span = token_spans[pos].clone();
         let (val, next) = parse_tokens(&tokens, pos)?;
-        exprs.push(val);
+        exprs.push((val, span));
         pos = next;
     }
     Ok(exprs)
