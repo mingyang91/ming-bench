@@ -55,9 +55,10 @@ pub(crate) fn eval_define(args: &[Value], env: &Rc<Env>) -> Result<Value, EvalEr
                     form: "define".into(),
                 });
             };
-            let param_names = extract_params(params, "define")?;
+            let (param_names, rest_param) = extract_params(params, "define")?;
             let lambda = Value::Lambda {
                 params: param_names,
+                rest_param,
                 body: body.to_vec(),
                 env: Rc::clone(env),
             };
@@ -82,9 +83,10 @@ pub(crate) fn eval_lambda(args: &[Value], env: &Rc<Env>) -> Result<Value, EvalEr
             form: "lambda".into(),
         });
     }
-    let param_names = extract_params(params, "lambda")?;
+    let (param_names, rest_param) = extract_params(params, "lambda")?;
     Ok(Value::Lambda {
         params: param_names,
+        rest_param,
         body: body.to_vec(),
         env: Rc::clone(env),
     })

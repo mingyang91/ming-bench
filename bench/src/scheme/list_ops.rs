@@ -113,6 +113,97 @@ pub fn eval_type_pred(pred: &str, args: &[Value], env: &Rc<Env>) -> Result<Value
     Ok(Value::Boolean(result))
 }
 
+/// `cons` on already-evaluated values.
+pub fn eval_cons_values(args: &[Value]) -> Result<Value, EvalError> {
+    let [head, tail] = args else {
+        return Err(EvalError::WrongArgCount {
+            expected: "2".into(),
+            got: args.len(),
+        });
+    };
+    match tail {
+        Value::List(elems) => {
+            let mut new_elems = vec![head.clone()];
+            new_elems.extend(elems.iter().cloned());
+            Ok(Value::List(new_elems))
+        }
+        other => Err(EvalError::TypeError {
+            expected: "list".into(),
+            got: format!("{other}"),
+        }),
+    }
+}
+
+/// `car` on already-evaluated values.
+pub fn eval_car_values(args: &[Value]) -> Result<Value, EvalError> {
+    let [val] = args else {
+        return Err(EvalError::WrongArgCount {
+            expected: "1".into(),
+            got: args.len(),
+        });
+    };
+    match val {
+        Value::List(elems) if !elems.is_empty() => Ok(elems[0].clone()),
+        Value::List(_) => Err(EvalError::TypeError {
+            expected: "non-empty list".into(),
+            got: "()".into(),
+        }),
+        other => Err(EvalError::TypeError {
+            expected: "pair".into(),
+            got: format!("{other}"),
+        }),
+    }
+}
+
+/// `cdr` on already-evaluated values.
+pub fn eval_cdr_values(args: &[Value]) -> Result<Value, EvalError> {
+    let [val] = args else {
+        return Err(EvalError::WrongArgCount {
+            expected: "1".into(),
+            got: args.len(),
+        });
+    };
+    match val {
+        Value::List(elems) if !elems.is_empty() => Ok(Value::List(elems[1..].to_vec())),
+        Value::List(_) => Err(EvalError::TypeError {
+            expected: "non-empty list".into(),
+            got: "()".into(),
+        }),
+        other => Err(EvalError::TypeError {
+            expected: "pair".into(),
+            got: format!("{other}"),
+        }),
+    }
+}
+
+/// `null?` on already-evaluated values.
+pub fn eval_null_q_values(args: &[Value]) -> Result<Value, EvalError> {
+    let [val] = args else {
+        return Err(EvalError::WrongArgCount {
+            expected: "1".into(),
+            got: args.len(),
+        });
+    };
+    Ok(Value::Boolean(matches!(val, Value::List(elems) if elems.is_empty())))
+}
+
+/// `length` on already-evaluated values.
+pub fn eval_length_values(args: &[Value]) -> Result<Value, EvalError> {
+    let [val] = args else {
+        return Err(EvalError::WrongArgCount {
+            expected: "1".into(),
+            got: args.len(),
+        });
+    };
+    match val {
+        Value::List(elems) => Ok(Value::Integer(elems.len() as i64)),
+        other => Err(EvalError::TypeError {
+            expected: "list".into(),
+            got: format!("{other}"),
+        }),
+    }
+}
+
 /// Evaluate `(length lst)` — count elements in a list.
 pub fn eval_length(args: &[Value], env: &Rc<Env>) -> Result<Value, EvalError> {
     let [arg] = args else {

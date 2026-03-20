@@ -14,9 +14,11 @@ pub enum Value {
     List(Vec<Value>),
     Lambda {
         params: Vec<String>,
+        rest_param: Option<String>,
         body: Vec<Value>,
         env: Rc<Env>,
     },
+    Builtin(String),
     Void,
 }
 
@@ -72,7 +74,7 @@ impl fmt::Display for Value {
             Value::Symbol(s) => write!(f, "{s}"),
             Value::Char(c) => write!(f, "#\\{c}"),
             Value::List(elements) => fmt_list(elements, f),
-            Value::Lambda { .. } => write!(f, "#<procedure>"),
+            Value::Lambda { .. } | Value::Builtin(_) => write!(f, "#<procedure>"),
             Value::Void => write!(f, ""),
         }
     }
