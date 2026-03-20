@@ -450,6 +450,41 @@ fn eval_expr(expr: &Expr, env: &EnvRef) -> Result<Value, EvalError> {
                         }
                         Ok(Value::List(items))
                     }
+                    "string?" => {
+                        if elems.len() != 2 {
+                            return Err(EvalError::Parse("string? requires exactly 1 argument".to_string()));
+                        }
+                        let val = eval_expr(&elems[1], env)?;
+                        Ok(Value::Boolean(matches!(val, Value::Str(_))))
+                    }
+                    "number?" => {
+                        if elems.len() != 2 {
+                            return Err(EvalError::Parse("number? requires exactly 1 argument".to_string()));
+                        }
+                        let val = eval_expr(&elems[1], env)?;
+                        Ok(Value::Boolean(matches!(val, Value::Integer(_))))
+                    }
+                    "boolean?" => {
+                        if elems.len() != 2 {
+                            return Err(EvalError::Parse("boolean? requires exactly 1 argument".to_string()));
+                        }
+                        let val = eval_expr(&elems[1], env)?;
+                        Ok(Value::Boolean(matches!(val, Value::Boolean(_))))
+                    }
+                    "pair?" => {
+                        if elems.len() != 2 {
+                            return Err(EvalError::Parse("pair? requires exactly 1 argument".to_string()));
+                        }
+                        let val = eval_expr(&elems[1], env)?;
+                        Ok(Value::Boolean(matches!(val, Value::List(ref v) if !v.is_empty())))
+                    }
+                    "symbol?" => {
+                        if elems.len() != 2 {
+                            return Err(EvalError::Parse("symbol? requires exactly 1 argument".to_string()));
+                        }
+                        let val = eval_expr(&elems[1], env)?;
+                        Ok(Value::Boolean(matches!(val, Value::Symbol(_))))
+                    }
                     "length" => {
                         if elems.len() != 2 {
                             return Err(EvalError::Parse("length requires exactly 1 argument".to_string()));
