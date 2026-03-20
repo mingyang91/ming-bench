@@ -103,6 +103,7 @@ enum Value {
     Lambda(Vec<String>, Option<String>, Vec<SExpr>, EnvRef),
     Builtin(String),
     Continuation(u64),
+    Macro(Vec<String>, Vec<(SExpr, SExpr)>, EnvRef),
     Void,
 }
 
@@ -117,6 +118,7 @@ impl PartialEq for Value {
             (Value::List(a), Value::List(b)) => a == b,
             (Value::Void, Value::Void) => true,
             (Value::Lambda(..), Value::Lambda(..)) => false,
+            (Value::Macro(..), Value::Macro(..)) => false,
             (Value::Builtin(a), Value::Builtin(b)) => a == b,
             (Value::Continuation(a), Value::Continuation(b)) => a == b,
             _ => false,
@@ -146,6 +148,7 @@ impl Value {
                 format!("({})", inner.join(" "))
             }
             Value::Lambda(..) => "#<procedure>".to_string(),
+            Value::Macro(..) => "#<macro>".to_string(),
             Value::Builtin(_) => "#<procedure>".to_string(),
             Value::Continuation(_) => "#<continuation>".to_string(),
             Value::Void => String::new(),
@@ -380,6 +383,186 @@ fn sexpr_to_value(se: &SExpr) -> Value {
 enum Step {
     Done(Value),
     Tail(SExpr, EnvRef),
+}
+
+// --- Macro expansion ---
+
+struct MacroBindings {
+    singles: HashMap<String, SExpr>,
+    lists: HashMap<String, Vec<SExpr>>,
+}
+
+impl MacroBindings {
+    fn new() -> Self {
+        MacroBindings { singles: HashMap::new(), lists: HashMap::new() }
+    }
+}
+
+fn match_pattern(pattern: &SExpr, input: &[SExpr], _literals: &[String]) -> Option<MacroBindings> {
+    let pat_elems = match &pattern.expr {
+        Expr::List(e) => e,
+        _ => return None,
+    };
+    if pat_elems.is_empty() {
+        return None;
+    }
+    // Skip macro name (first element)
+    let pat = &pat_elems[1..];
+    let inp = &input[1..];
+
+    let mut bindings = MacroBindings::new();
+    let mut pi = 0;
+    let mut ii = 0;
+
+    while pi < pat.len() {
+        // Check if next element is "..."
+        let is_ellipsis = pi + 1 < pat.len()
+            && matches!(&pat[pi + 1].expr, Expr::Symbol(ref s) if s == "...");
+
+        if is_ellipsis {
+            if let Expr::Symbol(ref var) = pat[pi].expr {
+                // Collect remaining input elements into a list binding
+                bindings.lists.insert(var.clone(), inp[ii..].to_vec());
+                return Some(bindings);
+            }
+            return None;
+        }
+
+        if ii >= inp.len() {
+            return None; // Not enough input
+        }
+
+        match &pat[pi].expr {
+            Expr::Symbol(ref var) => {
+                bindings.singles.insert(var.clone(), inp[ii].clone());
+            }
+            _ => return None, // Only handle symbol patterns for now
+        }
+        pi += 1;
+        ii += 1;
+    }
+
+    if ii != inp.len() {
+        return None; // Extra input elements
+    }
+    Some(bindings)
+}
+
+fn instantiate_template(template: &SExpr, bindings: &MacroBindings) -> SExpr {
+    match &template.expr {
+        Expr::Symbol(ref s) => {
+            if let Some(val) = bindings.singles.get(s) {
+                return val.clone();
+            }
+            template.clone()
+        }
+        Expr::List(elems) => {
+            let mut result = Vec::new();
+            let mut i = 0;
+            while i < elems.len() {
+                // Check if next element is "..."
+                let is_ellipsis = i + 1 < elems.len()
+                    && matches!(&elems[i + 1].expr, Expr::Symbol(ref s) if s == "...");
+
+                if is_ellipsis {
+                    if let Expr::Symbol(ref s) = elems[i].expr {
+                        if let Some(list) = bindings.lists.get(s) {
+                            // Splice the list bindings
+                            result.extend(list.iter().cloned());
+                            i += 2; // skip var and ...
+                            continue;
+                        }
+                    }
+                    // It's a sub-template with ..., expand for each element in list bindings
+                    let sub = &elems[i];
+                    // Find which list variable is used in this sub-template
+                    if let Some((var_name, list)) = find_list_var_in_template(sub, bindings) {
+                        for item in list {
+                            let mut sub_bindings = MacroBindings::new();
+                            // Copy all singles
+                            sub_bindings.singles = bindings.singles.clone();
+                            sub_bindings.singles.insert(var_name.clone(), item.clone());
+                            result.push(instantiate_template(sub, &sub_bindings));
+                        }
+                        i += 2;
+                        continue;
+                    }
+                    // Fallback: just include as-is
+                    result.push(instantiate_template(&elems[i], bindings));
+                    i += 1;
+                } else {
+                    result.push(instantiate_template(&elems[i], bindings));
+                    i += 1;
+                }
+            }
+            SExpr { expr: Expr::List(result), span: template.span }
+        }
+        _ => template.clone(),
+    }
+}
+
+fn find_list_var_in_template<'a>(template: &SExpr, bindings: &'a MacroBindings) -> Option<(String, &'a Vec<SExpr>)> {
+    match &template.expr {
+        Expr::Symbol(s) => bindings.lists.get(s).map(|v| (s.clone(), v)),
+        Expr::List(elems) => {
+            for e in elems {
+                if let Some(result) = find_list_var_in_template(e, bindings) {
+                    return Some(result);
+                }
+            }
+            None
+        }
+        _ => None,
+    }
+}
+
+fn expand_macro(literals: &[String], rules: &[(SExpr, SExpr)], input: &[SExpr], span: Span, use_env: &EnvRef, def_env: &EnvRef) -> Result<(SExpr, EnvRef), EvalError> {
+    for (pattern, template) in rules {
+        if let Some(bindings) = match_pattern(pattern, input, literals) {
+            let expanded = instantiate_template(template, &bindings);
+            let hygienic_env = make_hygienic_env(template, use_env, def_env, &bindings);
+            return Ok((expanded, hygienic_env));
+        }
+    }
+    Err(err_at(span, "no matching syntax-rules pattern"))
+}
+
+fn collect_template_free_vars(se: &SExpr, pattern_vars: &std::collections::HashSet<String>, syms: &mut std::collections::HashSet<String>) {
+    match &se.expr {
+        Expr::Symbol(s) if s != "..." && !pattern_vars.contains(s) => {
+            syms.insert(s.clone());
+        }
+        Expr::List(elems) => {
+            for e in elems {
+                collect_template_free_vars(e, pattern_vars, syms);
+            }
+        }
+        _ => {}
+    }
+}
+
+fn make_hygienic_env(
+    template: &SExpr,
+    use_env: &EnvRef,
+    def_env: &EnvRef,
+    bindings: &MacroBindings,
+) -> EnvRef {
+    let mut pattern_vars = std::collections::HashSet::new();
+    for k in bindings.singles.keys() {
+        pattern_vars.insert(k.clone());
+    }
+    for k in bindings.lists.keys() {
+        pattern_vars.insert(k.clone());
+    }
+    let mut free_vars = std::collections::HashSet::new();
+    collect_template_free_vars(template, &pattern_vars, &mut free_vars);
+    let hygienic_env = EnvFrame::child(use_env);
+    for sym in &free_vars {
+        if let Some(val) = EnvFrame::get(def_env, sym) {
+            EnvFrame::set(&hygienic_env, sym.clone(), val);
+        }
+    }
+    hygienic_env
 }
 
 fn eval_expr(se: &SExpr, env: &EnvRef, out: &OutputBuf) -> Result<Value, EvalError> {
@@ -1058,7 +1241,57 @@ fn eval_step(se: &SExpr, env: &EnvRef, out: &OutputBuf) -> Result<Step, EvalErro
                         let func = eval_expr(&elems[1], env, out)?;
                         handle_callcc(&func, span, out).map(Step::Done)
                     }
-                    _ => apply_proc_step(elems, span, env, out),
+                    "define-syntax" => {
+                        if elems.len() != 3 {
+                            return Err(err_at(span, "define-syntax requires 2 arguments"));
+                        }
+                        let name = match &elems[1].expr {
+                            Expr::Symbol(s) => s.clone(),
+                            _ => return Err(err_at(elems[1].span, "define-syntax: expected symbol")),
+                        };
+                        let sr = match &elems[2].expr {
+                            Expr::List(l) => l,
+                            _ => return Err(err_at(elems[2].span, "define-syntax: expected syntax-rules")),
+                        };
+                        if sr.is_empty() || !matches!(&sr[0].expr, Expr::Symbol(ref s) if s == "syntax-rules") {
+                            return Err(err_at(elems[2].span, "define-syntax: expected syntax-rules"));
+                        }
+                        if sr.len() < 2 {
+                            return Err(err_at(elems[2].span, "syntax-rules: expected literals list"));
+                        }
+                        let literals = match &sr[1].expr {
+                            Expr::List(l) => {
+                                let mut lits = Vec::new();
+                                for e in l {
+                                    match &e.expr {
+                                        Expr::Symbol(s) => lits.push(s.clone()),
+                                        _ => return Err(err_at(e.span, "syntax-rules: literal must be a symbol")),
+                                    }
+                                }
+                                lits
+                            }
+                            _ => return Err(err_at(sr[1].span, "syntax-rules: expected literals list")),
+                        };
+                        let mut rules = Vec::new();
+                        for rule in &sr[2..] {
+                            match &rule.expr {
+                                Expr::List(parts) if parts.len() == 2 => {
+                                    rules.push((parts[0].clone(), parts[1].clone()));
+                                }
+                                _ => return Err(err_at(rule.span, "syntax-rules: each rule must be (pattern template)")),
+                            }
+                        }
+                        EnvFrame::set(env, name, Value::Macro(literals, rules, Rc::clone(env)));
+                        Ok(Step::Done(Value::Void))
+                    }
+                    _ => {
+                        // Check if it's a macro invocation
+                        if let Some(Value::Macro(ref literals, ref rules, ref def_env)) = EnvFrame::get(env, op) {
+                            let (expanded, hygienic_env) = expand_macro(literals, rules, elems, span, env, def_env)?;
+                            return Ok(Step::Tail(expanded, hygienic_env));
+                        }
+                        apply_proc_step(elems, span, env, out)
+                    }
                 }
             } else {
                 apply_proc_step(elems, span, env, out)
