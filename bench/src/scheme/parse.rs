@@ -164,6 +164,22 @@ fn parse_atom(s: &str) -> Result<Value, EvalError> {
     if let Ok(n) = s.parse::<i64>() {
         return Ok(Value::Integer(n));
     }
+    if s.starts_with("#\\") && s.len() >= 3 {
+        let char_name = &s[2..];
+        let c = match char_name {
+            "space" => ' ',
+            "newline" => '\n',
+            "tab" => '\t',
+            _ if char_name.len() == 1 => char_name.chars().next().expect("single char"),
+            _ => {
+                return Err(EvalError::TypeError {
+                    expected: "valid character literal".to_string(),
+                    got: s.to_string(),
+                })
+            }
+        };
+        return Ok(Value::Char(c));
+    }
     if s.starts_with('"') && s.ends_with('"') && s.len() >= 2 {
         let inner = &s[1..s.len() - 1];
         return Ok(Value::String(inner.to_string()));
