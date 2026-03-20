@@ -7,6 +7,7 @@ use std::collections::HashMap;
 use std::rc::Rc;
 
 type EnvRef = Rc<RefCell<EnvFrame>>;
+type OutputBuf = Rc<RefCell<String>>;
 
 #[derive(Debug, Clone, PartialEq)]
 struct EnvFrame {
@@ -84,6 +85,13 @@ impl PartialEq for Value {
 }
 
 impl Value {
+    fn display_string(&self) -> String {
+        match self {
+            Value::Str(s) => s.clone(),
+            other => other.to_scheme_string(),
+        }
+    }
+
     fn to_scheme_string(&self) -> String {
         match self {
             Value::Integer(n) => n.to_string(),
@@ -288,7 +296,7 @@ fn sexpr_to_value(se: &SExpr) -> Value {
     }
 }
 
-fn eval_expr(se: &SExpr, env: &EnvRef) -> Result<Value, EvalError> {
+fn eval_expr(se: &SExpr, env: &EnvRef, out: &OutputBuf) -> Result<Value, EvalError> {
     let span = se.span;
     match &se.expr {
         Expr::Integer(n) => Ok(Value::Integer(*n)),
@@ -311,7 +319,7 @@ fn eval_expr(se: &SExpr, env: &EnvRef) -> Result<Value, EvalError> {
                                 if elems.len() != 3 {
                                     return Err(err_at(span, "define requires exactly 2 arguments"));
                                 }
-                                let val = eval_expr(&elems[2], env)?;
+                                let val = eval_expr(&elems[2], env, out)?;
                                 if let Value::Lambda(params, body, closure_env) = &val {
                                     let val = Value::Lambda(
                                         params.clone(),
@@ -381,11 +389,11 @@ fn eval_expr(se: &SExpr, env: &EnvRef) -> Result<Value, EvalError> {
                         if elems.len() < 3 || elems.len() > 4 {
                             return Err(err_at(span, "if requires 2 or 3 arguments"));
                         }
-                        let cond = eval_expr(&elems[1], env)?;
+                        let cond = eval_expr(&elems[1], env, out)?;
                         if !is_false(&cond) {
-                            eval_expr(&elems[2], env)
+                            eval_expr(&elems[2], env, out)
                         } else if elems.len() == 4 {
-                            eval_expr(&elems[3], env)
+                            eval_expr(&elems[3], env, out)
                         } else {
                             Ok(Value::Void)
                         }
@@ -399,7 +407,7 @@ fn eval_expr(se: &SExpr, env: &EnvRef) -> Result<Value, EvalError> {
                     "+" => {
                         let mut sum: i64 = 0;
                         for arg in &elems[1..] {
-                            sum += require_int(&eval_expr(arg, env)?, arg.span)?;
+                            sum += require_int(&eval_expr(arg, env, out)?, arg.span)?;
                         }
                         Ok(Value::Integer(sum))
                     }
@@ -407,13 +415,13 @@ fn eval_expr(se: &SExpr, env: &EnvRef) -> Result<Value, EvalError> {
                         if elems.len() < 2 {
                             return Err(err_at(span, "- requires at least one argument"));
                         }
-                        let first = require_int(&eval_expr(&elems[1], env)?, elems[1].span)?;
+                        let first = require_int(&eval_expr(&elems[1], env, out)?, elems[1].span)?;
                         if elems.len() == 2 {
                             Ok(Value::Integer(-first))
                         } else {
                             let mut result = first;
                             for arg in &elems[2..] {
-                                result -= require_int(&eval_expr(arg, env)?, arg.span)?;
+                                result -= require_int(&eval_expr(arg, env, out)?, arg.span)?;
                             }
                             Ok(Value::Integer(result))
                         }
@@ -421,7 +429,7 @@ fn eval_expr(se: &SExpr, env: &EnvRef) -> Result<Value, EvalError> {
                     "*" => {
                         let mut product: i64 = 1;
                         for arg in &elems[1..] {
-                            product *= require_int(&eval_expr(arg, env)?, arg.span)?;
+                            product *= require_int(&eval_expr(arg, env, out)?, arg.span)?;
                         }
                         Ok(Value::Integer(product))
                     }
@@ -430,9 +438,9 @@ fn eval_expr(se: &SExpr, env: &EnvRef) -> Result<Value, EvalError> {
                             return Err(err_at(span, "/ requires at least two arguments"));
                         }
                         let mut result =
-                            require_int(&eval_expr(&elems[1], env)?, elems[1].span)?;
+                            require_int(&eval_expr(&elems[1], env, out)?, elems[1].span)?;
                         for arg in &elems[2..] {
-                            let divisor = require_int(&eval_expr(arg, env)?, arg.span)?;
+                            let divisor = require_int(&eval_expr(arg, env, out)?, arg.span)?;
                             if divisor == 0 {
                                 return Err(err_at(arg.span, "division by zero"));
                             }
@@ -441,36 +449,36 @@ fn eval_expr(se: &SExpr, env: &EnvRef) -> Result<Value, EvalError> {
                         Ok(Value::Integer(result))
                     }
                     "<" => {
-                        let (a, b) = require_two_ints(&elems[1..], "<", span, env)?;
+                        let (a, b) = require_two_ints(&elems[1..], "<", span, env, out)?;
                         Ok(Value::Boolean(a < b))
                     }
                     ">" => {
-                        let (a, b) = require_two_ints(&elems[1..], ">", span, env)?;
+                        let (a, b) = require_two_ints(&elems[1..], ">", span, env, out)?;
                         Ok(Value::Boolean(a > b))
                     }
                     "=" => {
-                        let (a, b) = require_two_ints(&elems[1..], "=", span, env)?;
+                        let (a, b) = require_two_ints(&elems[1..], "=", span, env, out)?;
                         Ok(Value::Boolean(a == b))
                     }
                     "<=" => {
-                        let (a, b) = require_two_ints(&elems[1..], "<=", span, env)?;
+                        let (a, b) = require_two_ints(&elems[1..], "<=", span, env, out)?;
                         Ok(Value::Boolean(a <= b))
                     }
                     ">=" => {
-                        let (a, b) = require_two_ints(&elems[1..], ">=", span, env)?;
+                        let (a, b) = require_two_ints(&elems[1..], ">=", span, env, out)?;
                         Ok(Value::Boolean(a >= b))
                     }
                     "not" => {
                         if elems.len() != 2 {
                             return Err(err_at(span, "not requires exactly one argument"));
                         }
-                        let val = eval_expr(&elems[1], env)?;
+                        let val = eval_expr(&elems[1], env, out)?;
                         Ok(Value::Boolean(is_false(&val)))
                     }
                     "and" => {
                         let mut result = Value::Boolean(true);
                         for arg in &elems[1..] {
-                            result = eval_expr(arg, env)?;
+                            result = eval_expr(arg, env, out)?;
                             if is_false(&result) {
                                 return Ok(result);
                             }
@@ -480,7 +488,7 @@ fn eval_expr(se: &SExpr, env: &EnvRef) -> Result<Value, EvalError> {
                     "or" => {
                         let mut result = Value::Boolean(false);
                         for arg in &elems[1..] {
-                            result = eval_expr(arg, env)?;
+                            result = eval_expr(arg, env, out)?;
                             if !is_false(&result) {
                                 return Ok(result);
                             }
@@ -491,8 +499,8 @@ fn eval_expr(se: &SExpr, env: &EnvRef) -> Result<Value, EvalError> {
                         if elems.len() != 3 {
                             return Err(err_at(span, "cons requires exactly 2 arguments"));
                         }
-                        let head = eval_expr(&elems[1], env)?;
-                        let tail = eval_expr(&elems[2], env)?;
+                        let head = eval_expr(&elems[1], env, out)?;
+                        let tail = eval_expr(&elems[2], env, out)?;
                         match tail {
                             Value::List(mut v) => {
                                 v.insert(0, head);
@@ -508,7 +516,7 @@ fn eval_expr(se: &SExpr, env: &EnvRef) -> Result<Value, EvalError> {
                         if elems.len() != 2 {
                             return Err(err_at(span, "car requires exactly 1 argument"));
                         }
-                        let val = eval_expr(&elems[1], env)?;
+                        let val = eval_expr(&elems[1], env, out)?;
                         match val {
                             Value::List(v) if !v.is_empty() => Ok(v[0].clone()),
                             _ => Err(err_at(
@@ -521,7 +529,7 @@ fn eval_expr(se: &SExpr, env: &EnvRef) -> Result<Value, EvalError> {
                         if elems.len() != 2 {
                             return Err(err_at(span, "cdr requires exactly 1 argument"));
                         }
-                        let val = eval_expr(&elems[1], env)?;
+                        let val = eval_expr(&elems[1], env, out)?;
                         match val {
                             Value::List(v) if !v.is_empty() => {
                                 Ok(Value::List(v[1..].to_vec()))
@@ -536,7 +544,7 @@ fn eval_expr(se: &SExpr, env: &EnvRef) -> Result<Value, EvalError> {
                         if elems.len() != 2 {
                             return Err(err_at(span, "null? requires exactly 1 argument"));
                         }
-                        let val = eval_expr(&elems[1], env)?;
+                        let val = eval_expr(&elems[1], env, out)?;
                         Ok(Value::Boolean(
                             matches!(val, Value::List(ref v) if v.is_empty()),
                         ))
@@ -544,7 +552,7 @@ fn eval_expr(se: &SExpr, env: &EnvRef) -> Result<Value, EvalError> {
                     "list" => {
                         let mut items = Vec::new();
                         for arg in &elems[1..] {
-                            items.push(eval_expr(arg, env)?);
+                            items.push(eval_expr(arg, env, out)?);
                         }
                         Ok(Value::List(items))
                     }
@@ -555,7 +563,7 @@ fn eval_expr(se: &SExpr, env: &EnvRef) -> Result<Value, EvalError> {
                                 "string? requires exactly 1 argument",
                             ));
                         }
-                        let val = eval_expr(&elems[1], env)?;
+                        let val = eval_expr(&elems[1], env, out)?;
                         Ok(Value::Boolean(matches!(val, Value::Str(_))))
                     }
                     "number?" => {
@@ -565,7 +573,7 @@ fn eval_expr(se: &SExpr, env: &EnvRef) -> Result<Value, EvalError> {
                                 "number? requires exactly 1 argument",
                             ));
                         }
-                        let val = eval_expr(&elems[1], env)?;
+                        let val = eval_expr(&elems[1], env, out)?;
                         Ok(Value::Boolean(matches!(val, Value::Integer(_))))
                     }
                     "boolean?" => {
@@ -575,14 +583,14 @@ fn eval_expr(se: &SExpr, env: &EnvRef) -> Result<Value, EvalError> {
                                 "boolean? requires exactly 1 argument",
                             ));
                         }
-                        let val = eval_expr(&elems[1], env)?;
+                        let val = eval_expr(&elems[1], env, out)?;
                         Ok(Value::Boolean(matches!(val, Value::Boolean(_))))
                     }
                     "pair?" => {
                         if elems.len() != 2 {
                             return Err(err_at(span, "pair? requires exactly 1 argument"));
                         }
-                        let val = eval_expr(&elems[1], env)?;
+                        let val = eval_expr(&elems[1], env, out)?;
                         Ok(Value::Boolean(
                             matches!(val, Value::List(ref v) if !v.is_empty()),
                         ))
@@ -594,7 +602,7 @@ fn eval_expr(se: &SExpr, env: &EnvRef) -> Result<Value, EvalError> {
                                 "symbol? requires exactly 1 argument",
                             ));
                         }
-                        let val = eval_expr(&elems[1], env)?;
+                        let val = eval_expr(&elems[1], env, out)?;
                         Ok(Value::Boolean(matches!(val, Value::Symbol(_))))
                     }
                     "length" => {
@@ -604,7 +612,7 @@ fn eval_expr(se: &SExpr, env: &EnvRef) -> Result<Value, EvalError> {
                                 "length requires exactly 1 argument",
                             ));
                         }
-                        let val = eval_expr(&elems[1], env)?;
+                        let val = eval_expr(&elems[1], env, out)?;
                         match val {
                             Value::List(v) => Ok(Value::Integer(v.len() as i64)),
                             _ => Err(err_at(span, "length: argument must be a list")),
@@ -613,7 +621,7 @@ fn eval_expr(se: &SExpr, env: &EnvRef) -> Result<Value, EvalError> {
                     "begin" => {
                         let mut result = Value::Void;
                         for arg in &elems[1..] {
-                            result = eval_expr(arg, env)?;
+                            result = eval_expr(arg, env, out)?;
                         }
                         Ok(result)
                     }
@@ -638,7 +646,7 @@ fn eval_expr(se: &SExpr, env: &EnvRef) -> Result<Value, EvalError> {
                             match &binding.expr {
                                 Expr::List(pair) if pair.len() == 2 => {
                                     if let Expr::Symbol(name) = &pair[0].expr {
-                                        let val = eval_expr(&pair[1], env)?;
+                                        let val = eval_expr(&pair[1], env, out)?;
                                         EnvFrame::set(&let_env, name.clone(), val);
                                     } else {
                                         return Err(err_at(
@@ -657,7 +665,7 @@ fn eval_expr(se: &SExpr, env: &EnvRef) -> Result<Value, EvalError> {
                         }
                         let mut result = Value::Void;
                         for expr in &elems[2..] {
-                            result = eval_expr(expr, &let_env)?;
+                            result = eval_expr(expr, &let_env, out)?;
                         }
                         Ok(result)
                     }
@@ -669,16 +677,16 @@ fn eval_expr(se: &SExpr, env: &EnvRef) -> Result<Value, EvalError> {
                                         if s == "else" {
                                             let mut result = Value::Void;
                                             for expr in &parts[1..] {
-                                                result = eval_expr(expr, env)?;
+                                                result = eval_expr(expr, env, out)?;
                                             }
                                             return Ok(result);
                                         }
                                     }
-                                    let test = eval_expr(&parts[0], env)?;
+                                    let test = eval_expr(&parts[0], env, out)?;
                                     if !is_false(&test) {
                                         let mut result = test;
                                         for expr in &parts[1..] {
-                                            result = eval_expr(expr, env)?;
+                                            result = eval_expr(expr, env, out)?;
                                         }
                                         return Ok(result);
                                     }
@@ -693,18 +701,41 @@ fn eval_expr(se: &SExpr, env: &EnvRef) -> Result<Value, EvalError> {
                         }
                         Ok(Value::Void)
                     }
-                    _ => apply_proc(elems, span, env),
+                    "display" => {
+                        if elems.len() != 2 {
+                            return Err(err_at(span, "display requires exactly 1 argument"));
+                        }
+                        let val = eval_expr(&elems[1], env, out)?;
+                        out.borrow_mut().push_str(&val.display_string());
+                        Ok(Value::Void)
+                    }
+                    "write" => {
+                        if elems.len() != 2 {
+                            return Err(err_at(span, "write requires exactly 1 argument"));
+                        }
+                        let val = eval_expr(&elems[1], env, out)?;
+                        out.borrow_mut().push_str(&val.to_scheme_string());
+                        Ok(Value::Void)
+                    }
+                    "newline" => {
+                        if elems.len() != 1 {
+                            return Err(err_at(span, "newline takes no arguments"));
+                        }
+                        out.borrow_mut().push('\n');
+                        Ok(Value::Void)
+                    }
+                    _ => apply_proc(elems, span, env, out),
                 }
             } else {
-                apply_proc(elems, span, env)
+                apply_proc(elems, span, env, out)
             }
         }
     }
 }
 
-fn apply_proc(elems: &[SExpr], call_span: Span, env: &EnvRef) -> Result<Value, EvalError> {
-    let func = eval_expr(&elems[0], env)?;
-    let args: Result<Vec<Value>, _> = elems[1..].iter().map(|a| eval_expr(a, env)).collect();
+fn apply_proc(elems: &[SExpr], call_span: Span, env: &EnvRef, out: &OutputBuf) -> Result<Value, EvalError> {
+    let func = eval_expr(&elems[0], env, out)?;
+    let args: Result<Vec<Value>, _> = elems[1..].iter().map(|a| eval_expr(a, env, out)).collect();
     let args = args?;
     match func {
         Value::Lambda(params, body, closure_env) => {
@@ -720,7 +751,7 @@ fn apply_proc(elems: &[SExpr], call_span: Span, env: &EnvRef) -> Result<Value, E
             }
             let mut result = Value::Void;
             for expr in &body {
-                result = eval_expr(expr, &call_env)?;
+                result = eval_expr(expr, &call_env, out)?;
             }
             Ok(result)
         }
@@ -737,6 +768,7 @@ fn require_two_ints(
     op: &str,
     call_span: Span,
     env: &EnvRef,
+    out: &OutputBuf,
 ) -> Result<(i64, i64), EvalError> {
     if args.len() != 2 {
         return Err(err_at(
@@ -744,8 +776,8 @@ fn require_two_ints(
             format!("{} requires exactly two arguments", op),
         ));
     }
-    let a = require_int(&eval_expr(&args[0], env)?, args[0].span)?;
-    let b = require_int(&eval_expr(&args[1], env)?, args[1].span)?;
+    let a = require_int(&eval_expr(&args[0], env, out)?, args[0].span)?;
+    let b = require_int(&eval_expr(&args[1], env, out)?, args[1].span)?;
     Ok((a, b))
 }
 
@@ -770,17 +802,29 @@ pub fn eval_str(input: &str) -> Result<String, EvalError> {
         return Err(EvalError::Parse("1:1: empty input".to_string()));
     }
     let env = EnvFrame::new();
+    let out: OutputBuf = Rc::new(RefCell::new(String::new()));
     let mut result = Value::Boolean(false);
     for expr in &exprs {
-        result = eval_expr(expr, &env)?;
+        result = eval_expr(expr, &env, &out)?;
     }
     Ok(result.to_scheme_string())
 }
 
 /// Evaluate Scheme expressions, returning both the result value and
 /// any output produced by `display`, `write`, or `newline`.
-pub fn eval_str_with_output(_input: &str) -> Result<(String, String), EvalError> {
-    todo!()
+pub fn eval_str_with_output(input: &str) -> Result<(String, String), EvalError> {
+    let exprs = parse_all(input)?;
+    if exprs.is_empty() {
+        return Err(EvalError::Parse("1:1: empty input".to_string()));
+    }
+    let env = EnvFrame::new();
+    let out: OutputBuf = Rc::new(RefCell::new(String::new()));
+    let mut result = Value::Boolean(false);
+    for expr in &exprs {
+        result = eval_expr(expr, &env, &out)?;
+    }
+    let output = out.borrow().clone();
+    Ok((result.to_scheme_string(), output))
 }
 
 #[cfg(test)]
