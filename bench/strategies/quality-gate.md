@@ -42,3 +42,37 @@ Write clean, idiomatic Rust. The quality gate enforces structure mechanically; t
 - **Immutable-first.** Build new values from inputs instead of mutating temporaries.
 - **Keep `mod.rs` thin.** Entry point and re-exports only; implementation goes in submodules.
 - **When touching a file, fix violations in that file.** Do not defer. Do not rewrite unrelated files unprompted.
+
+## Lint Reference
+
+These lints are enforced in a **separate cleanup pass** at the end of each level — not during coding. Focus on making tests pass first. You will get a dedicated session to fix lint violations afterward. This table is a quick-fix reference for that cleanup session.
+
+### Denied (hard errors)
+
+| Denied pattern | Use instead |
+|---|---|
+| `.unwrap()` | `.expect("reason")`, `?`, or `.ok_or()` |
+| `Result<T, ()>` | A meaningful error type |
+| `if !cond { panic!(...) }` | `assert!(cond, ...)` |
+
+### Structural limits
+
+| Constraint | L1-L5 | L6+ |
+|---|---|---|
+| Max function length | 80 lines | 60 lines |
+| Max nesting depth | 3 | 3 |
+| Max `mod.rs` size | 300 lines (L1-L3), 200 (L4-L6) | 100 lines |
+
+### Style (auto-fixable)
+
+| Flagged pattern | Use instead |
+|---|---|
+| `.filter().map()` | `.filter_map()` |
+| `.find().map()` | `.find_map()` |
+| `.map().flatten()` | `.flat_map()` |
+| `for i in 0..v.len()` | `for item in &v` or `.enumerate()` |
+| `for x in v.iter()` | `for x in &v` |
+| `let mut v = vec![]; v.push(x)` | `vec![x]` |
+| `.collect()` then `.iter()` | Chain iterators directly |
+| `format!("{}", x)` | `format!("{x}")` |
+| `let x = if let Some(v) = y { v } else { return }` | `let Some(x) = y else { return }` |
