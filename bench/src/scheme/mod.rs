@@ -4,7 +4,9 @@ mod parse;
 
 pub use error::EvalError;
 
+use std::cell::RefCell;
 use std::collections::HashMap;
+use std::rc::Rc;
 
 #[derive(Debug, Clone)]
 struct Span {
@@ -13,7 +15,7 @@ struct Span {
 }
 
 /// A Scheme value.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone)]
 enum Value {
     Integer(i64),
     Boolean(bool),
@@ -94,9 +96,24 @@ impl Value {
     }
 }
 
+impl PartialEq for Value {
+    fn eq(&self, other: &Self) -> bool {
+        match (self, other) {
+            (Value::Integer(a), Value::Integer(b)) => a == b,
+            (Value::Boolean(a), Value::Boolean(b)) => a == b,
+            (Value::String(a), Value::String(b)) => a == b,
+            (Value::Symbol(a), Value::Symbol(b)) => a == b,
+            (Value::Char(a), Value::Char(b)) => a == b,
+            (Value::Nil, Value::Nil) => true,
+            (Value::Pair(a1, a2), Value::Pair(b1, b2)) => a1 == b1 && a2 == b2,
+            _ => false,
+        }
+    }
+}
+
 // --- Environment ---
 
-type Env = HashMap<String, Value>;
+type Env = HashMap<String, Rc<RefCell<Value>>>;
 
 /// Evaluate one or more Scheme expressions and return the string
 /// representation of the last result.

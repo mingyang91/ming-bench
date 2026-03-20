@@ -1,3 +1,6 @@
+use std::cell::RefCell;
+use std::rc::Rc;
+
 use super::{Env, EvalError, Value};
 
 /// Trampoline result: either a final value, a tail-call in the same env,
@@ -37,8 +40,7 @@ fn eval_bounce(value: &Value, env: &mut Env, out: &mut String) -> Result<Bounce,
         Value::Nil => Ok(Bounce::Done(Value::Nil)),
         Value::Symbol(name) => env
             .get(name)
-            .cloned()
-            .map(Bounce::Done)
+            .map(|rc| Bounce::Done(rc.borrow().clone()))
             .ok_or_else(|| EvalError::UnboundVariable {
                 name: name.clone(),
             }),
@@ -70,6 +72,7 @@ fn eval_pair_bounce(
             "begin" => eval_begin_bounce(args, env, out),
             "let" => eval_let_bounce(args, env, out),
             "cond" => eval_cond_bounce(args, env, out),
+            "set!" => eval_set(args, env, out).map(Bounce::Done),
             "string-set!" => eval_string_set(args, env, out).map(Bounce::Done),
             _ => eval_symbol_call_bounce(name, args, env, out),
         };
@@ -93,7 +96,7 @@ fn eval_symbol_call_bounce(
     }
     let proc = env
         .get(name)
-        .cloned()
+        .map(|rc| rc.borrow().clone())
         .ok_or_else(|| EvalError::UnboundVariable {
             name: name.to_string(),
         })?;
@@ -131,7 +134,7 @@ fn apply_bounce(
         call_env.entry(k.clone()).or_insert_with(|| v.clone());
     }
     for (param, arg) in params.iter().zip(args) {
-        call_env.insert(param.clone(), arg.clone());
+        call_env.insert(param.clone(), Rc::new(RefCell::new(arg.clone())));
     }
 
     Ok(Bounce::Call {
@@ -161,7 +164,7 @@ fn eval_define(args: &[Value], env: &mut Env, out: &mut String) -> Result<Value,
         // (define x expr)
         [Value::Symbol(name), expr] => {
             let val = eval(expr, env, out)?;
-            env.insert(name.clone(), val);
+            env.insert(name.clone(), Rc::new(RefCell::new(val)));
             Ok(Value::Symbol(name.clone()))
         }
         // (define (name params...) body) → (define name (lambda (params...) body))
@@ -194,7 +197,7 @@ fn eval_define(args: &[Value], env: &mut Env, out: &mut String) -> Result<Value,
                 body: Box::new(func_body),
                 closure: env.clone(),
             };
-            env.insert(name.clone(), lambda);
+            env.insert(name.clone(), Rc::new(RefCell::new(lambda)));
             Ok(Value::Symbol(name.clone()))
         }
         _ => Err(EvalError::TypeError {
@@ -202,6 +205,21 @@ fn eval_define(args: &[Value], env: &mut Env, out: &mut String) -> Result<Value,
             got: format!("{} args", args.len()),
         }),
     }
+}
+
+fn eval_set(args: &[Value], env: &mut Env, out: &mut String) -> Result<Value, EvalError> {
+    let [Value::Symbol(name), expr] = args else {
+        return Err(EvalError::TypeError {
+            expected: "(set! symbol expr)".to_string(),
+            got: format!("{} args", args.len()),
+        });
+    };
+    let val = eval(expr, env, out)?;
+    let rc = env.get(name).ok_or_else(|| EvalError::UnboundVariable {
+        name: name.clone(),
+    })?;
+    *rc.borrow_mut() = val;
+    Ok(Value::Nil)
 }
 
 fn eval_if_bounce(
