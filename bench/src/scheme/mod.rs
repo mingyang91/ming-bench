@@ -1,4 +1,5 @@
 pub mod error;
+mod parse;
 
 pub use error::EvalError;
 
@@ -8,6 +9,9 @@ enum Value {
     Integer(i64),
     Boolean(bool),
     String(String),
+    Symbol(String),
+    Pair(Box<Value>, Box<Value>),
+    Nil,
 }
 
 impl Value {
@@ -17,42 +21,152 @@ impl Value {
             Value::Boolean(true) => "#t".to_string(),
             Value::Boolean(false) => "#f".to_string(),
             Value::String(s) => format!("\"{s}\""),
+            Value::Symbol(s) => s.clone(),
+            Value::Nil => "()".to_string(),
+            Value::Pair(..) => {
+                let mut out = String::from("(");
+                self.display_list_inner(&mut out);
+                out.push(')');
+                out
+            }
+        }
+    }
+
+    fn display_list_inner(&self, out: &mut String) {
+        let Value::Pair(car, cdr) = self else {
+            out.push_str(&self.display());
+            return;
+        };
+        out.push_str(&car.display());
+        match cdr.as_ref() {
+            Value::Nil => {}
+            Value::Pair(..) => {
+                out.push(' ');
+                cdr.display_list_inner(out);
+            }
+            other => {
+                out.push_str(" . ");
+                out.push_str(&other.display());
+            }
+        }
+    }
+
+    fn to_list_vec(&self) -> Option<Vec<Value>> {
+        let mut result = Vec::new();
+        let mut current = self;
+        while let Value::Pair(car, cdr) = current {
+            result.push(car.as_ref().clone());
+            current = cdr.as_ref();
+        }
+        matches!(current, Value::Nil).then_some(result)
+    }
+}
+
+// --- Evaluator ---
+
+fn eval(value: &Value) -> Result<Value, EvalError> {
+    match value {
+        Value::Integer(_) | Value::Boolean(_) | Value::String(_) => Ok(value.clone()),
+        Value::Nil => Ok(Value::Nil),
+        Value::Symbol(name) => Err(EvalError::UnboundVariable {
+            name: name.clone(),
+        }),
+        Value::Pair(..) => {
+            let items = value
+                .to_list_vec()
+                .ok_or_else(|| EvalError::TypeError {
+                    expected: "proper list".to_string(),
+                    got: value.display(),
+                })?;
+
+            let [operator, args @ ..] = items.as_slice() else {
+                return Ok(Value::Nil);
+            };
+
+            if let Value::Symbol(name) = operator {
+                return eval_builtin(name, args);
+            }
+
+            Err(EvalError::NotAProcedure {
+                value: operator.display(),
+            })
         }
     }
 }
 
-fn parse(input: &str) -> Result<Value, EvalError> {
-    let trimmed = input.trim();
-    if trimmed.is_empty() {
-        return Err(EvalError::EmptyInput);
+fn eval_builtin(name: &str, args: &[Value]) -> Result<Value, EvalError> {
+    match name {
+        "+" | "-" | "*" | "/" => eval_arithmetic(name, args),
+        _ => Err(EvalError::UnboundVariable {
+            name: name.to_string(),
+        }),
     }
+}
 
-    if trimmed == "#t" {
-        return Ok(Value::Boolean(true));
+fn checked_div(acc: i64, v: i64) -> Result<i64, EvalError> {
+    if v == 0 {
+        Err(EvalError::DivisionByZero)
+    } else {
+        Ok(acc / v)
     }
-    if trimmed == "#f" {
-        return Ok(Value::Boolean(false));
-    }
+}
 
-    if let Ok(n) = trimmed.parse::<i64>() {
-        return Ok(Value::Integer(n));
-    }
+fn eval_arithmetic(op: &str, args: &[Value]) -> Result<Value, EvalError> {
+    let values: Vec<i64> = args
+        .iter()
+        .map(|a| {
+            let evaled = eval(a)?;
+            match evaled {
+                Value::Integer(n) => Ok(n),
+                other => Err(EvalError::TypeError {
+                    expected: "integer".to_string(),
+                    got: other.display(),
+                }),
+            }
+        })
+        .collect::<Result<_, _>>()?;
 
-    if trimmed.starts_with('"') && trimmed.ends_with('"') && trimmed.len() >= 2 {
-        let inner = &trimmed[1..trimmed.len() - 1];
-        return Ok(Value::String(inner.to_string()));
-    }
+    let result = match op {
+        "+" => values.iter().sum(),
+        "*" => values.iter().product(),
+        "-" => {
+            let [first, rest @ ..] = values.as_slice() else {
+                return Err(EvalError::WrongArgCount {
+                    expected: 1,
+                    got: 0,
+                });
+            };
+            if rest.is_empty() {
+                -first
+            } else {
+                rest.iter().fold(*first, |acc, &v| acc - v)
+            }
+        }
+        "/" => {
+            let [first, rest @ ..] = values.as_slice() else {
+                return Err(EvalError::WrongArgCount {
+                    expected: 1,
+                    got: 0,
+                });
+            };
+            rest.iter().try_fold(*first, |acc, &v| checked_div(acc, v))?
+        }
+        _ => unreachable!("unexpected arithmetic operator: {op}"),
+    };
 
-    Err(EvalError::UnexpectedToken {
-        token: trimmed.to_string(),
-    })
+    Ok(Value::Integer(result))
 }
 
 /// Evaluate one or more Scheme expressions and return the string
 /// representation of the last result.
 pub fn eval_str(input: &str) -> Result<String, EvalError> {
-    let value = parse(input)?;
-    Ok(value.display())
+    let exprs = parse::parse_all(input)?;
+    let last = exprs
+        .iter()
+        .map(eval)
+        .next_back()
+        .ok_or(EvalError::EmptyInput)??;
+    Ok(last.display())
 }
 
 /// Evaluate Scheme expressions, returning both the result value and

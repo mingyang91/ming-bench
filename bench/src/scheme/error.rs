@@ -6,4 +6,19 @@ pub enum EvalError {
 
     #[error("empty input")]
     EmptyInput,
+
+    #[error("unbound variable: {name}")]
+    UnboundVariable { name: String },
+
+    #[error("wrong number of arguments: expected {expected}, got {got}")]
+    WrongArgCount { expected: usize, got: usize },
+
+    #[error("type error: expected {expected}, got {got}")]
+    TypeError { expected: String, got: String },
+
+    #[error("division by zero")]
+    DivisionByZero,
+
+    #[error("not a procedure: {value}")]
+    NotAProcedure { value: String },
 }
