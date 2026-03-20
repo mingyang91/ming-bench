@@ -4,7 +4,7 @@ Implement a Scheme interpreter in Rust. Read `SPEC.md` for the full specificatio
 
 ## Quality Gate
 
-`cargo xtask test` enforces code quality checks (clippy lints, mod.rs size limits, etc.) **before** running tests. Violations block testing. Write clean, modular, idiomatic Rust from the start to avoid rework. Read `src/lib.rs` for the active lint configuration.
+The `quality-gate` Cargo feature is enabled by default for this strategy, activating compile-time lint enforcement in `src/lib.rs`. `cargo xtask test` enforces code quality checks (clippy lints, mod.rs size limits, etc.) **before** running tests. Violations block testing. Write clean, modular, idiomatic Rust from the start to avoid rework. Read `src/lib.rs` for the active lint configuration.
 
 ## Contract
 

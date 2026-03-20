@@ -36,12 +36,14 @@ Shared types and helpers live in `xtask/src/model.rs`.
 
 Strategies live in `bench/strategies/`. Each is a `.md` file that becomes the agent's `CLAUDE.md` at launch via symlink.
 
-- **`default.md`** — Minimal: build the interpreter, test each level
-- **`quality-gate.md`** — Adds: clippy enforcement, mod.rs size limits, code style rules
+- **`default.md`** — Minimal: build the interpreter, test each level. No lint enforcement.
+- **`quality-gate.md`** — Adds: clippy enforcement, mod.rs size limits, code style rules. Activates the `quality-gate` Cargo feature.
 
 `bench/SPEC.md` is the shared task spec (identical for all strategies). `bench/CLAUDE.md` and `bench/AGENTS.md` are gitignored — created as symlinks by `run-agent --strategy <name>`.
 
-To add a new strategy: create `bench/strategies/<name>.md` and use `--strategy <name>`.
+**Lint enforcement via Cargo feature:** `bench/src/lib.rs` uses `#![cfg_attr(feature = "quality-gate", ...)]` for all lint attributes. The `quality-gate` feature is off by default (`default = []` in Cargo.toml). When a strategy includes `clippy.toml`, `run-agent` patches the worktree's Cargo.toml to set `default = ["quality-gate"]`, enabling lints for all cargo commands the agent runs.
+
+To add a new strategy: create `bench/strategies/<name>.md` and use `--strategy <name>`. To enable lint enforcement, also add a `clippy.toml` in the bench directory for that strategy.
 
 ## Key Conventions
 

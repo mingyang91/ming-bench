@@ -31,10 +31,12 @@ cargo xtask run-agent --name test-dry --skip-bench
 
 Strategy files live in `bench/strategies/`. At launch, `run-agent` symlinks the selected strategy as `bench/CLAUDE.md`.
 
-| Strategy | File | What it does |
-|----------|------|-------------|
-| `default` | `bench/strategies/default.md` | Minimal instructions: implement the spec, test each level |
-| `quality-gate` | `bench/strategies/quality-gate.md` | Adds clippy enforcement, mod.rs size limits, code style rules |
+| Strategy | File | Cargo feature | What it does |
+|----------|------|---------------|-------------|
+| `default` | `bench/strategies/default.md` | *(none)* | Minimal instructions: implement the spec, test each level |
+| `quality-gate` | `bench/strategies/quality-gate.md` | `quality-gate` enabled | Adds clippy enforcement, mod.rs size limits, code style rules |
+
+Lint enforcement uses a Cargo feature flag. `bench/src/lib.rs` wraps all lint attributes in `cfg_attr(feature = "quality-gate", ...)`. The `run-agent` orchestrator patches Cargo.toml to enable the feature when the strategy includes `clippy.toml`.
 
 Both share `bench/SPEC.md` (identical task definition). To add a new strategy, create `bench/strategies/<name>.md` and use `--strategy <name>`.
 

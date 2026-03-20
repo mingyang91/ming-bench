@@ -44,12 +44,12 @@ Agents are launched with `cwd = bench/` and only interact with files there. Fram
 
 ### The Experiment: Strategies
 
-| Strategy | CLAUDE.md | What it tests |
-|----------|-----------|---------------|
-| `default` | Minimal: implement the spec, test each level, fix failures | Baseline — how agents perform with standard guidance |
-| `quality-gate` | Adds: clippy enforcement, mod.rs size limits, code style rules | Whether structural enforcement improves agent code quality and completion rate |
+| Strategy | CLAUDE.md | Cargo feature | What it tests |
+|----------|-----------|---------------|---------------|
+| `default` | Minimal: implement the spec, test each level, fix failures | *(none)* | Baseline — how agents perform with standard guidance |
+| `quality-gate` | Adds: clippy enforcement, mod.rs size limits, code style rules | `quality-gate` enabled | Whether structural enforcement improves agent code quality and completion rate |
 
-Both strategies share `SPEC.md` (identical task definition) and the same test suite. The only difference is the instructions in `CLAUDE.md`. Strategy selection happens at runtime via `--strategy`.
+Both strategies share `SPEC.md` (identical task definition) and the same test suite. The only difference is the instructions in `CLAUDE.md` and whether lint enforcement is active. Lint attributes in `bench/src/lib.rs` use `cfg_attr(feature = "quality-gate", ...)` — they are inert by default and activated per-worktree when the strategy includes `clippy.toml`. Strategy selection happens at runtime via `--strategy`.
 
 ### Execution Modes
 

@@ -142,6 +142,21 @@ pub fn run(args: RunAgentArgs) -> Result<()> {
         std::os::unix::fs::symlink("CLAUDE.md", &agents_md)
             .map_err(|e| Error::io(&agents_md, e))?;
         println!("Strategy:   {} → CLAUDE.md", strategy_src);
+
+        // --- Enable quality-gate feature if strategy uses clippy.toml ---
+        let clippy_toml = agent_workdir.join("clippy.toml");
+        if clippy_toml.is_file() {
+            let cargo_toml = agent_workdir.join("Cargo.toml");
+            let content = fs::read_to_string(&cargo_toml)
+                .map_err(|e| Error::io(&cargo_toml, e))?;
+            let patched = content.replace(
+                "default = []",
+                "default = [\"quality-gate\"]",
+            );
+            fs::write(&cargo_toml, patched)
+                .map_err(|e| Error::io(&cargo_toml, e))?;
+            println!("Enabled quality-gate feature in Cargo.toml");
+        }
     }
 
     // --- Warm dependency cache ---
