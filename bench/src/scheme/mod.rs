@@ -22,11 +22,11 @@ thread_local! {
 
 struct ContCtx {
     next_id: u64,
-    intercept: Option<(u64, Value)>,
+    intercept: Option<(u64, Value, Span)>,
     escape_value: Option<Value>,
     current_expr_index: usize,
     id_at_expr_start: u64,
-    captures: HashMap<u64, (usize, u64)>,
+    captures: HashMap<u64, (usize, u64, Span)>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -1305,15 +1305,15 @@ fn handle_callcc(func: &Value, span: Span, out: &OutputBuf) -> Result<Value, Eva
         let mut c = ctx.borrow_mut();
         let id = c.next_id;
         c.next_id += 1;
-        if let Some((iid, _)) = &c.intercept {
-            if *iid == id {
+        if let Some((iid, _, ispan)) = &c.intercept {
+            if *iid == id && *ispan == span {
                 let val = c.intercept.take().unwrap().1;
                 return (id, Some(val));
             }
         }
         let ei = c.current_expr_index;
         let is = c.id_at_expr_start;
-        c.captures.insert(id, (ei, is));
+        c.captures.insert(id, (ei, is, span));
         (id, None)
     });
     if let Some(val) = maybe_intercept {
@@ -1685,8 +1685,8 @@ pub fn eval_str(input: &str) -> Result<String, EvalError> {
                 CONT_CTX.with(|ctx| {
                     let mut c = ctx.borrow_mut();
                     let value = c.escape_value.take().unwrap();
-                    let (expr_idx, id_at_start) = c.captures[&cont_id];
-                    c.intercept = Some((cont_id, value));
+                    let (expr_idx, id_at_start, cap_span) = c.captures[&cont_id];
+                    c.intercept = Some((cont_id, value, cap_span));
                     c.next_id = id_at_start;
                     i = expr_idx;
                 });
@@ -1733,8 +1733,8 @@ pub fn eval_str_with_output(input: &str) -> Result<(String, String), EvalError> 
                 CONT_CTX.with(|ctx| {
                     let mut c = ctx.borrow_mut();
                     let value = c.escape_value.take().unwrap();
-                    let (expr_idx, id_at_start) = c.captures[&cont_id];
-                    c.intercept = Some((cont_id, value));
+                    let (expr_idx, id_at_start, cap_span) = c.captures[&cont_id];
+                    c.intercept = Some((cont_id, value, cap_span));
                     c.next_id = id_at_start;
                     i = expr_idx;
                 });
