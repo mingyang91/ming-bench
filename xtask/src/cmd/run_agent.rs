@@ -11,6 +11,17 @@ use std::time::Instant;
 static INTERRUPTED: AtomicBool = AtomicBool::new(false);
 static CHILD_PID: AtomicU32 = AtomicU32::new(0);
 
+/// (level_label, duration_secs, status_string)
+type LevelTimes = Vec<(String, i64, String)>;
+
+struct RunContext<'a> {
+    session_uuid: String,
+    timestamp: String,
+    start_time: String,
+    prompt: &'a str,
+    mode: String,
+}
+
 pub struct RunAgentArgs {
     pub base: String,
     pub strategy: String,
@@ -32,7 +43,6 @@ After implementing each level, run cargo xtask test NN to verify.
 Fix failures before proceeding. Do not skip levels.";
 
 pub fn run(args: RunAgentArgs) -> Result<()> {
-    // Install ctrl-c handler
     install_signal_handlers();
 
     let proj = project_dir();
@@ -40,42 +50,89 @@ pub fn run(args: RunAgentArgs) -> Result<()> {
     let timestamp = compact_timestamp();
     let start_time = iso_now();
     let prompt = args.prompt.as_deref().unwrap_or(DEFAULT_PROMPT);
-
     let mode = args.mode.clone();
 
-    // --- Worktree path ---
     let worktree_dir = proj
         .parent()
         .expect("project has no parent dir")
         .join("workspace")
         .join(&args.name);
-    // Agent sees bench/ as its working directory
     let agent_workdir = worktree_dir.join("bench");
 
-    // --- Results dir ---
     let results_dir = if args.resume {
         find_resume_dir(&proj, &args.strategy, &args.name)?
     } else {
         setup_fresh_run(&proj, &args, &worktree_dir)?
     };
 
-    // --- Write initial meta.json ---
     if !args.resume {
-        let meta = serde_json::json!({
-            "base": args.base,
-            "strategy": args.strategy,
-            "name": args.name,
-            "session_id": session_uuid,
-            "agent": args.agent,
-            "mode": mode,
-            "model": args.model.as_deref().unwrap_or("default"),
-            "prompt": prompt,
-            "start_time": start_time,
-            "timestamp": timestamp,
-        });
-        write_meta(&results_dir.join("meta.json"), &meta)?;
+        write_initial_meta(&args, &results_dir, &session_uuid, &mode, prompt, &start_time, &timestamp)?;
     }
 
+    print_run_banner(&args, &session_uuid, &results_dir, &worktree_dir, &mode);
+
+    if !args.resume {
+        create_worktree(&args, &proj, &worktree_dir, &agent_workdir)?;
+    }
+
+    warm_cache(&worktree_dir);
+
+    let lockfile = results_dir.join(".run.lock");
+    acquire_lock(&lockfile)?;
+
+    let _cleanup_ctx = CleanupContext {
+        worktree_dir: worktree_dir.clone(),
+        name: args.name.clone(),
+        lockfile: lockfile.clone(),
+    };
+
+    let (agent_exit, level_times) = execute_mode(
+        &mode, &args, &agent_workdir, &worktree_dir, &results_dir,
+        prompt, &session_uuid,
+    )?;
+
+    let score = run_scoring(&args, &proj)?;
+
+    finalize_run(
+        &args, &results_dir, &session_uuid, &mode, prompt,
+        &start_time, &timestamp, agent_exit, &score, &level_times,
+    )?;
+
+    push_branch(&args.name, &worktree_dir);
+
+    let _ = fs::remove_file(&lockfile);
+
+    println!();
+    println!("=== Run complete ===");
+    println!("Results: {}", results_dir.display());
+    println!("Score:   {score}");
+
+    Ok(())
+}
+
+fn write_initial_meta(
+    args: &RunAgentArgs, results_dir: &Path, session_uuid: &str,
+    mode: &str, prompt: &str, start_time: &str, timestamp: &str,
+) -> Result<()> {
+    let meta = serde_json::json!({
+        "base": args.base,
+        "strategy": args.strategy,
+        "name": args.name,
+        "session_id": session_uuid,
+        "agent": args.agent,
+        "mode": mode,
+        "model": args.model.as_deref().unwrap_or("default"),
+        "prompt": prompt,
+        "start_time": start_time,
+        "timestamp": timestamp,
+    });
+    write_meta(&results_dir.join("meta.json"), &meta)
+}
+
+fn print_run_banner(
+    args: &RunAgentArgs, session_uuid: &str, results_dir: &Path,
+    worktree_dir: &Path, mode: &str,
+) {
     println!("=== Agent Run: {} ===", args.name);
     println!("Base:       {}", args.base);
     println!("Strategy:   {}", args.strategy);
@@ -87,261 +144,302 @@ pub fn run(args: RunAgentArgs) -> Result<()> {
     println!("Worktree:   {}", worktree_dir.display());
     println!("Resume:     {}", args.resume);
     println!();
+}
 
-    // --- Create worktree (fresh run only) ---
-    if !args.resume {
-        println!("Creating worktree from '{}'...", args.base);
-        let exit = run_cmd(
-            "git",
-            &[
-                "worktree",
-                "add",
-                "-b",
-                &args.name,
-                worktree_dir.to_str().expect("worktree path not utf8"),
-                &args.base,
-                "--quiet",
-            ],
-            &proj,
-        )?;
-        if exit != 0 {
-            return Err(Error::CommandFailed {
-                cmd: "git worktree add".to_string(),
-                exit_code: exit,
-            });
-        }
-        println!("Worktree created.");
-
-        // --- Symlink strategy file as CLAUDE.md ---
-        let strategy_src = format!("strategies/{}.md", args.strategy);
-        let strategy_path = agent_workdir.join(&strategy_src);
-        if !strategy_path.is_file() {
-            return Err(Error::CommandFailed {
-                cmd: format!(
-                    "strategy file not found: {} (available: ls bench/strategies/)",
-                    strategy_path.display()
-                ),
-                exit_code: 1,
-            });
-        }
-        let claude_md = agent_workdir.join("CLAUDE.md");
-        let _ = fs::remove_file(&claude_md);
-        std::os::unix::fs::symlink(&strategy_src, &claude_md)
-            .map_err(|e| Error::io(&claude_md, e))?;
-        let agents_md = agent_workdir.join("AGENTS.md");
-        let _ = fs::remove_file(&agents_md);
-        std::os::unix::fs::symlink("CLAUDE.md", &agents_md)
-            .map_err(|e| Error::io(&agents_md, e))?;
-        println!("Strategy:   {} → CLAUDE.md", strategy_src);
-
-        // --- Copy strategy-specific clippy.toml if it exists ---
-        let strategy_clippy = agent_workdir.join(format!("strategies/{}.clippy.toml", args.strategy));
-        let clippy_toml = agent_workdir.join("clippy.toml");
-        if strategy_clippy.is_file() {
-            fs::copy(&strategy_clippy, &clippy_toml)
-                .map_err(|e| Error::io(&clippy_toml, e))?;
-            println!("Copied {}.clippy.toml → clippy.toml", args.strategy);
-        }
-
-        // --- Enable quality-gate feature if clippy.toml is present ---
-        if clippy_toml.is_file() {
-            let cargo_toml = agent_workdir.join("Cargo.toml");
-            let content = fs::read_to_string(&cargo_toml)
-                .map_err(|e| Error::io(&cargo_toml, e))?;
-            let patched = content.replace(
-                "default = []",
-                "default = [\"quality-gate\"]",
-            );
-            fs::write(&cargo_toml, patched)
-                .map_err(|e| Error::io(&cargo_toml, e))?;
-            println!("Enabled quality-gate feature in Cargo.toml");
-        }
+fn create_worktree(
+    args: &RunAgentArgs, proj: &Path, worktree_dir: &Path, agent_workdir: &Path,
+) -> Result<()> {
+    println!("Creating worktree from '{}'...", args.base);
+    let exit = run_cmd(
+        "git",
+        &[
+            "worktree", "add", "-b", &args.name,
+            worktree_dir.to_str().expect("worktree path not utf8"),
+            &args.base, "--quiet",
+        ],
+        proj,
+    )?;
+    if exit != 0 {
+        return Err(Error::CommandFailed {
+            cmd: "git worktree add".to_string(),
+            exit_code: exit,
+        });
     }
+    println!("Worktree created.");
 
-    // --- Warm dependency cache ---
+    symlink_strategy(args, agent_workdir)?;
+    copy_strategy_clippy(args, agent_workdir)?;
+    // quality-gate lints are now enforced at runtime via `cargo xtask test`
+    // (clippy flags in test_level.rs), not via Cargo feature patching.
+    Ok(())
+}
+
+fn symlink_strategy(args: &RunAgentArgs, agent_workdir: &Path) -> Result<()> {
+    let strategy_src = format!("strategies/{}.md", args.strategy);
+    let strategy_path = agent_workdir.join(&strategy_src);
+    if !strategy_path.is_file() {
+        return Err(Error::CommandFailed {
+            cmd: format!(
+                "strategy file not found: {} (available: ls bench/strategies/)",
+                strategy_path.display()
+            ),
+            exit_code: 1,
+        });
+    }
+    let claude_md = agent_workdir.join("CLAUDE.md");
+    let _ = fs::remove_file(&claude_md);
+    std::os::unix::fs::symlink(&strategy_src, &claude_md)
+        .map_err(|e| Error::io(&claude_md, e))?;
+    let agents_md = agent_workdir.join("AGENTS.md");
+    let _ = fs::remove_file(&agents_md);
+    std::os::unix::fs::symlink("CLAUDE.md", &agents_md)
+        .map_err(|e| Error::io(&agents_md, e))?;
+    println!("Strategy:   {strategy_src} → CLAUDE.md");
+    Ok(())
+}
+
+fn copy_strategy_clippy(args: &RunAgentArgs, agent_workdir: &Path) -> Result<()> {
+    let strategy_clippy = agent_workdir.join(format!("strategies/{}.clippy.toml", args.strategy));
+    let clippy_toml = agent_workdir.join("clippy.toml");
+    if strategy_clippy.is_file() {
+        fs::copy(&strategy_clippy, &clippy_toml)
+            .map_err(|e| Error::io(&clippy_toml, e))?;
+        println!("Copied {}.clippy.toml → clippy.toml", args.strategy);
+    }
+    Ok(())
+}
+
+
+fn warm_cache(worktree_dir: &Path) {
     println!("Pre-building dependencies in worktree (release mode)...");
-    let prebuild = run_cmd("cargo", &["build", "--release"], &worktree_dir);
+    let prebuild = run_cmd("cargo", &["build", "--release"], worktree_dir);
     match prebuild {
         Ok(0) => println!("Pre-build complete."),
         _ => println!("WARNING: Pre-build failed. Agent may hit cold cache issues."),
     }
+}
 
-    // --- Lockfile ---
-    let lockfile = results_dir.join(".run.lock");
-    acquire_lock(&lockfile)?;
-
-    // Setup cleanup on exit
-    let _cleanup_ctx = CleanupContext {
-        worktree_dir: worktree_dir.clone(),
-        name: args.name.clone(),
-        lockfile: lockfile.clone(),
-    };
-
-    // --- Execute ---
-    let mut agent_exit = 0i32;
-    let mut level_times: Vec<(String, i64, String)> = Vec::new(); // (level, duration, status)
-
+fn execute_mode(
+    mode: &str, args: &RunAgentArgs, agent_workdir: &Path,
+    worktree_dir: &Path, results_dir: &Path,
+    prompt: &str, session_uuid: &str,
+) -> Result<(i32, Vec<(String, i64, String)>)> {
     if mode == "levels" {
-        println!("=== Level-by-level mode ===");
-
-        let start_level: u32 = args
-            .from_level
-            .as_ref()
-            .and_then(|s| s.parse().ok())
-            .unwrap_or(1);
-
-        for level in &LEVELS {
-            if INTERRUPTED.load(Ordering::Relaxed) {
-                println!("Interrupted — stopping.");
-                break;
-            }
-
-            let level_num: u32 = level.parse().expect("level constant not a number");
-
-            // Skip levels before --from-level
-            if level_num < start_level {
-                println!("Skipping L{level} (before --from-level {start_level})");
-                continue;
-            }
-
-            let level_dir = results_dir.join(format!("L{level}"));
-
-            // Resume: skip already-passed levels
-            if args.resume {
-                let status_file = level_dir.join("status.txt");
-                if status_file.is_file() {
-                    if let Ok(content) = fs::read_to_string(&status_file) {
-                        if content.contains("PASSED") {
-                            println!("Skipping L{level} — already PASSED (resume mode)");
-                            continue;
-                        }
-                    }
-                    // Level not passed — clean and retry
-                    println!("Retrying L{level} — previous attempt was not PASSED");
-                    let _ = fs::remove_dir_all(&level_dir);
-                }
-            }
-
-            fs::create_dir_all(&level_dir).map_err(|e| Error::io(&level_dir, e))?;
-
-            let level_uuid = uuid_v4();
-            let level_turns = turns_for_level(level_num, args.max_turns);
-
-            println!();
-            println!("--- Level {level} (max {level_turns} turns) ---");
-
-            // Build prompt
-            let level_prompt = build_level_prompt(level, &worktree_dir, &results_dir);
-
-            // Launch agent
-            let level_start = Instant::now();
-            agent_exit = launch_agent(
-                &args.agent,
-                &agent_workdir,
-                &level_prompt,
-                &level_uuid,
-                &level_dir.join("agent-output.txt"),
-                Some(level_turns),
-                args.model.as_deref(),
-            );
-            let level_duration = level_start.elapsed().as_secs() as i64;
-
-            // Capture session
-            capture_session(&args.agent, &level_uuid, &level_dir);
-
-            // Test this level
-            let test_exit = run_cmd("cargo", &["xtask", "test", level], &worktree_dir).unwrap_or(1);
-
-            let status_label = if test_exit == 0 { "PASSED" } else { "FAILED" };
-            level_times.push((
-                format!("L{level}"),
-                level_duration,
-                status_label.to_string(),
-            ));
-
-            let status_msg = format!("Level {level} {status_label} ({level_duration}s)");
-            println!("{status_msg}");
-            let _ = fs::write(level_dir.join("status.txt"), &status_msg);
-
-            // Git checkpoint
-            println!("Committing checkpoint for L{level}...");
-            let commit_msg = format!("checkpoint: L{level} {status_label} ({level_duration}s)");
-            let _ = run_cmd("git", &["add", "-A"], &worktree_dir);
-            let _ = run_cmd(
-                "git",
-                &["commit", "-m", &commit_msg, "--allow-empty"],
-                &worktree_dir,
-            );
-
-            if test_exit != 0 {
-                println!("Level {level} FAILED — stopping");
-                break;
-            }
-        }
+        run_levels_mode(args, agent_workdir, worktree_dir, results_dir)
     } else if mode == "full" {
-        println!("=== Full run mode ===");
-
-        agent_exit = launch_agent(
-            &args.agent,
-            &agent_workdir,
-            prompt,
-            &session_uuid,
-            &results_dir.join("agent-output.txt"),
-            args.max_turns,
-            args.model.as_deref(),
-        );
-
-        println!();
-        println!("Agent exited with code: {agent_exit}");
-
-        // Git checkpoint
-        let _ = run_cmd("git", &["add", "-A"], &worktree_dir);
-        let _ = run_cmd(
-            "git",
-            &["commit", "-m", "agent: full run complete", "--allow-empty"],
-            &worktree_dir,
-        );
-
-        // Capture session
-        capture_session(&args.agent, &session_uuid, &results_dir);
+        let exit = run_full_mode(args, agent_workdir, worktree_dir, results_dir, prompt, session_uuid);
+        Ok((exit, Vec::new()))
     } else {
         eprintln!("ERROR: Unknown mode '{mode}'. Use 'full' or 'levels'.");
-        return Err(Error::CommandFailed {
+        Err(Error::CommandFailed {
             cmd: "run-agent".to_string(),
             exit_code: 1,
-        });
+        })
     }
+}
 
-    // --- Scoring ---
-    let score = if !args.skip_bench {
-        println!();
-        println!("=== Scoring ===");
-        let bench_log = results_dir.join("bench.log");
-        let bench_exit = run_cmd(
-            "cargo",
-            &["xtask", "bench", &args.name, "--run-id", "bench"],
-            &proj,
-        )
+fn run_full_mode(
+    args: &RunAgentArgs, agent_workdir: &Path, worktree_dir: &Path,
+    results_dir: &Path, prompt: &str, session_uuid: &str,
+) -> i32 {
+    println!("=== Full run mode ===");
+
+    let agent_exit = launch_agent(
+        &args.agent, agent_workdir, prompt, session_uuid,
+        &results_dir.join("agent-output.txt"), args.max_turns, args.model.as_deref(),
+    );
+
+    println!();
+    println!("Agent exited with code: {agent_exit}");
+
+    let _ = run_cmd("git", &["add", "-A"], worktree_dir);
+    let _ = run_cmd(
+        "git",
+        &["commit", "-m", "agent: full run complete", "--allow-empty"],
+        worktree_dir,
+    );
+
+    capture_session(&args.agent, session_uuid, results_dir);
+    agent_exit
+}
+
+fn run_levels_mode(
+    args: &RunAgentArgs, agent_workdir: &Path, worktree_dir: &Path,
+    results_dir: &Path,
+) -> Result<(i32, Vec<(String, i64, String)>)> {
+    println!("=== Level-by-level mode ===");
+
+    let start_level: u32 = args
+        .from_level
+        .as_ref()
+        .and_then(|s| s.parse().ok())
         .unwrap_or(1);
 
-        // Try to extract score from bench output
-        if bench_log.is_file() {
-            extract_score_from_log(&bench_log)
-        } else {
-            if bench_exit == 0 {
-                "completed".to_string()
-            } else {
-                "unknown".to_string()
-            }
-        }
-    } else {
-        "skipped".to_string()
-    };
+    let mut agent_exit = 0i32;
+    let mut level_times: Vec<(String, i64, String)> = Vec::new();
 
-    // --- Update meta.json ---
+    for level in &LEVELS {
+        if INTERRUPTED.load(Ordering::Relaxed) {
+            println!("Interrupted — stopping.");
+            break;
+        }
+
+        let level_num: u32 = level.parse().expect("level constant not a number");
+        if level_num < start_level {
+            println!("Skipping L{level} (before --from-level {start_level})");
+            continue;
+        }
+
+        let level_dir = results_dir.join(format!("L{level}"));
+        if should_skip_level(args.resume, &level_dir, level) {
+            continue;
+        }
+
+        let result = run_single_level(args, agent_workdir, worktree_dir, &level_dir, level)?;
+        agent_exit = result.0;
+        level_times.push((format!("L{level}"), result.1, result.2.clone()));
+
+        commit_checkpoint(level, &result.2, result.1, worktree_dir);
+
+        if result.2 == "FAILED" {
+            println!("Level {level} FAILED — stopping");
+            break;
+        }
+    }
+
+    Ok((agent_exit, level_times))
+}
+
+fn should_skip_level(resume: bool, level_dir: &Path, level: &str) -> bool {
+    if !resume {
+        return false;
+    }
+    let status_file = level_dir.join("status.txt");
+    if !status_file.is_file() {
+        return false;
+    }
+    if let Ok(content) = fs::read_to_string(&status_file) {
+        if content.contains("PASSED") {
+            println!("Skipping L{level} — already PASSED (resume mode)");
+            return true;
+        }
+    }
+    println!("Retrying L{level} — previous attempt was not PASSED");
+    let _ = fs::remove_dir_all(level_dir);
+    false
+}
+
+/// Returns (agent_exit, duration_secs, status_label).
+fn run_single_level(
+    args: &RunAgentArgs, agent_workdir: &Path, worktree_dir: &Path,
+    level_dir: &Path, level: &str,
+) -> Result<(i32, i64, String)> {
+    fs::create_dir_all(level_dir).map_err(|e| Error::io(level_dir, e))?;
+
+    let level_num: u32 = level.parse().expect("level constant not a number");
+    let level_uuid = uuid_v4();
+    let level_turns = turns_for_level(level_num, args.max_turns);
+
+    println!();
+    println!("--- Level {level} (max {level_turns} turns) ---");
+
+    let level_prompt = build_level_prompt(level, worktree_dir, level_dir.parent().expect("level_dir has parent"));
+    let level_start = Instant::now();
+    let agent_exit = launch_agent(
+        &args.agent, agent_workdir, &level_prompt, &level_uuid,
+        &level_dir.join("agent-output.txt"), Some(level_turns), args.model.as_deref(),
+    );
+
+    capture_session(&args.agent, &level_uuid, level_dir);
+
+    let mut test_exit = run_level_tests(worktree_dir, level);
+
+    if test_exit == 0 && worktree_dir.join("bench/clippy.toml").is_file() {
+        test_exit = run_quality_gate_cleanup(args, agent_workdir, worktree_dir, level_dir, level);
+    }
+
+    let level_duration = level_start.elapsed().as_secs() as i64;
+    let status_label = if test_exit == 0 { "PASSED" } else { "FAILED" };
+
+    let status_msg = format!("Level {level} {status_label} ({level_duration}s)");
+    println!("{status_msg}");
+    let _ = fs::write(level_dir.join("status.txt"), &status_msg);
+
+    Ok((agent_exit, level_duration, status_label.to_string()))
+}
+
+fn run_level_tests(worktree_dir: &Path, level: &str) -> i32 {
+    let has_gate = worktree_dir.join("bench/clippy.toml").is_file();
+    if has_gate {
+        run_cmd("cargo", &["xtask", "test", level, "--no-gate"], worktree_dir).unwrap_or(1)
+    } else {
+        run_cmd("cargo", &["xtask", "test", level], worktree_dir).unwrap_or(1)
+    }
+}
+
+fn run_quality_gate_cleanup(
+    args: &RunAgentArgs, agent_workdir: &Path, worktree_dir: &Path,
+    level_dir: &Path, level: &str,
+) -> i32 {
+    println!("--- Level {level} cleanup (max 15 turns) ---");
+    let cleanup_uuid = uuid_v4();
+    let cleanup_prompt = format!(
+        "Level {level} tests pass. Fix any clippy/quality-gate warnings.\n\
+         Run `cargo xtask test {level}` to verify. Do not change test behavior."
+    );
+    let _cleanup_exit = launch_agent(
+        &args.agent, agent_workdir, &cleanup_prompt, &cleanup_uuid,
+        &level_dir.join("agent-output-cleanup.txt"), Some(15), args.model.as_deref(),
+    );
+    capture_session_as(&args.agent, &cleanup_uuid, level_dir, "session-cleanup.jsonl");
+
+    run_cmd("cargo", &["xtask", "test", level], worktree_dir).unwrap_or(1)
+}
+
+fn commit_checkpoint(level: &str, status: &str, duration: i64, worktree_dir: &Path) {
+    println!("Committing checkpoint for L{level}...");
+    let commit_msg = format!("checkpoint: L{level} {status} ({duration}s)");
+    let _ = run_cmd("git", &["add", "-A"], worktree_dir);
+    let _ = run_cmd(
+        "git",
+        &["commit", "-m", &commit_msg, "--allow-empty"],
+        worktree_dir,
+    );
+}
+
+fn run_scoring(args: &RunAgentArgs, proj: &Path) -> Result<String> {
+    if args.skip_bench {
+        return Ok("skipped".to_string());
+    }
+
+    println!();
+    println!("=== Scoring ===");
+    let bench_log = proj.join("results/bench.log");
+    let bench_exit = run_cmd(
+        "cargo",
+        &["xtask", "bench", &args.name, "--run-id", "bench"],
+        proj,
+    )
+    .unwrap_or(1);
+
+    if bench_log.is_file() {
+        return Ok(extract_score_from_log(&bench_log));
+    }
+    if bench_exit == 0 {
+        Ok("completed".to_string())
+    } else {
+        Ok("unknown".to_string())
+    }
+}
+
+fn finalize_run(
+    args: &RunAgentArgs, results_dir: &Path, session_uuid: &str,
+    mode: &str, prompt: &str, start_time: &str, timestamp: &str,
+    agent_exit: i32, score: &str, level_times: &[(String, i64, String)],
+) -> Result<()> {
     let end_time = iso_now();
     let mut level_times_json = serde_json::Map::new();
-    for (level, duration, status) in &level_times {
+    for (level, duration, status) in level_times {
         level_times_json.insert(
             level.clone(),
             serde_json::json!({"duration_s": duration, "status": status}),
@@ -363,25 +461,16 @@ pub fn run(args: RunAgentArgs) -> Result<()> {
         "score": score,
         "level_times": level_times_json,
     });
-    write_meta(&results_dir.join("meta.json"), &meta)?;
+    write_meta(&results_dir.join("meta.json"), &meta)
+}
 
-    // --- Push branch ---
+fn push_branch(name: &str, worktree_dir: &Path) {
     println!("Pushing branch to origin...");
-    let push_exit = run_cmd("git", &["push", "-u", "origin", &args.name], &worktree_dir);
+    let push_exit = run_cmd("git", &["push", "-u", "origin", name], worktree_dir);
     match push_exit {
-        Ok(0) => println!("Branch pushed: origin/{}", args.name),
+        Ok(0) => println!("Branch pushed: origin/{name}"),
         _ => println!("WARNING: Push to origin failed (no remote or auth issue)"),
     }
-
-    // Release lock
-    let _ = fs::remove_file(&lockfile);
-
-    println!();
-    println!("=== Run complete ===");
-    println!("Results: {}", results_dir.display());
-    println!("Score:   {score}");
-
-    Ok(())
 }
 
 // ---------------------------------------------------------------------------
@@ -392,34 +481,38 @@ fn find_resume_dir(proj: &Path, strategy: &str, name: &str) -> Result<PathBuf> {
     let results_dir = proj.join("results");
     let prefix = format!("{strategy}_{name}_");
 
-    let mut matching: Vec<PathBuf> = Vec::new();
-    if let Ok(entries) = fs::read_dir(&results_dir) {
-        for entry in entries.flatten() {
-            let fname = entry.file_name().to_string_lossy().into_owned();
-            if fname.starts_with(&prefix) && entry.path().is_dir() {
-                matching.push(entry.path());
-            }
-        }
-    }
+    let mut matching: Vec<PathBuf> = fs::read_dir(&results_dir)
+        .into_iter()
+        .flatten()
+        .flatten()
+        .filter(|e| {
+            let fname = e.file_name().to_string_lossy().into_owned();
+            fname.starts_with(&prefix) && e.path().is_dir()
+        })
+        .map(|e| e.path())
+        .collect();
     matching.sort();
     matching.last().cloned().ok_or(Error::RunNotFound {
         path: results_dir.join(format!("{prefix}*")),
     })
 }
 
+fn clean_stale_worktree(proj: &Path, worktree_dir: &Path, name: &str) -> Result<()> {
+    if worktree_dir.is_dir() {
+        println!("--clean: removing worktree dir {}", worktree_dir.display());
+        let _ = run_cmd("git", &["worktree", "remove", "--force", &worktree_dir.to_string_lossy()], proj);
+        if worktree_dir.is_dir() {
+            fs::remove_dir_all(worktree_dir).map_err(|e| Error::io(worktree_dir, e))?;
+        }
+    }
+    let _ = run_cmd("git", &["worktree", "prune"], proj);
+    let _ = run_cmd("git", &["branch", "-D", name], proj);
+    Ok(())
+}
+
 fn setup_fresh_run(proj: &Path, args: &RunAgentArgs, worktree_dir: &Path) -> Result<PathBuf> {
     if args.clean {
-        // Remove stale worktree directory
-        if worktree_dir.is_dir() {
-            println!("--clean: removing worktree dir {}", worktree_dir.display());
-            let _ = run_cmd("git", &["worktree", "remove", "--force", &worktree_dir.to_string_lossy()], proj);
-            if worktree_dir.is_dir() {
-                fs::remove_dir_all(worktree_dir).map_err(|e| Error::io(worktree_dir, e))?;
-            }
-        }
-        // Prune stale worktree refs and delete branch
-        let _ = run_cmd("git", &["worktree", "prune"], proj);
-        let _ = run_cmd("git", &["branch", "-D", &args.name], proj);
+        clean_stale_worktree(proj, worktree_dir, &args.name)?;
     }
 
     if worktree_dir.is_dir() {
@@ -453,21 +546,30 @@ fn setup_fresh_run(proj: &Path, args: &RunAgentArgs, worktree_dir: &Path) -> Res
 
 fn acquire_lock(lockfile: &Path) -> Result<()> {
     if lockfile.is_file() {
-        if let Ok(content) = fs::read_to_string(lockfile) {
-            if let Ok(pid) = content.trim().parse::<u32>() {
-                if Path::new(&format!("/proc/{pid}")).exists() {
-                    return Err(Error::LockConflict {
-                        path: lockfile.to_path_buf(),
-                        pid,
-                    });
-                }
-            }
+        if is_lock_held(lockfile) {
+            let pid = fs::read_to_string(lockfile)
+                .ok()
+                .and_then(|c| c.trim().parse::<u32>().ok())
+                .unwrap_or(0);
+            return Err(Error::LockConflict {
+                path: lockfile.to_path_buf(),
+                pid,
+            });
         }
-        // Stale lock — remove it
         println!("WARNING: Stale lockfile found. Removing.");
         let _ = fs::remove_file(lockfile);
     }
     fs::write(lockfile, format!("{}", std::process::id())).map_err(|e| Error::io(lockfile, e))
+}
+
+fn is_lock_held(lockfile: &Path) -> bool {
+    let Ok(content) = fs::read_to_string(lockfile) else {
+        return false;
+    };
+    let Ok(pid) = content.trim().parse::<u32>() else {
+        return false;
+    };
+    Path::new(&format!("/proc/{pid}")).exists()
 }
 
 // ---------------------------------------------------------------------------
@@ -550,6 +652,28 @@ fn launch_opencode(workdir: &Path, prompt: &str, output_file: &Path) -> Result<i
     run_cmd("script", &["-qec", &script_cmd, out_str], workdir)
 }
 
+fn tee_stdout_to_file(stdout: Option<std::process::ChildStdout>, out_path: &Path) {
+    use std::io::{BufRead, BufReader, Write};
+    let mut file = fs::File::create(out_path).expect("cannot create output file");
+    let Some(stdout) = stdout else { return };
+    let reader = BufReader::new(stdout);
+    for line in reader.lines() {
+        let Ok(line) = line else { break };
+        println!("{line}");
+        let _ = writeln!(file, "{line}");
+    }
+}
+
+fn forward_stderr(stderr: Option<std::process::ChildStderr>) {
+    use std::io::{BufRead, BufReader};
+    let Some(stderr) = stderr else { return };
+    let reader = BufReader::new(stderr);
+    for line in reader.lines() {
+        let Ok(line) = line else { break };
+        eprintln!("{line}");
+    }
+}
+
 fn run_agent_with_tee(cmd: &str, args: &[&str], workdir: &Path, output_file: &Path) -> Result<i32> {
     // Pipe through tee to capture output while showing it
     let mut child = Command::new(cmd)
@@ -574,27 +698,11 @@ fn run_agent_with_tee(cmd: &str, args: &[&str], workdir: &Path, output_file: &Pa
 
     let out_path = output_file.to_path_buf();
     let tee_thread = std::thread::spawn(move || {
-        use std::io::{BufRead, BufReader, Write};
-        let mut file = fs::File::create(&out_path).expect("cannot create output file");
-        if let Some(stdout) = stdout {
-            let reader = BufReader::new(stdout);
-            for line in reader.lines() {
-                let Ok(line) = line else { break };
-                println!("{line}");
-                let _ = writeln!(file, "{line}");
-            }
-        }
+        tee_stdout_to_file(stdout, &out_path);
     });
 
     let err_thread = std::thread::spawn(move || {
-        use std::io::{BufRead, BufReader};
-        if let Some(stderr) = stderr {
-            let reader = BufReader::new(stderr);
-            for line in reader.lines() {
-                let Ok(line) = line else { break };
-                eprintln!("{line}");
-            }
-        }
+        forward_stderr(stderr);
     });
 
     let status = child.wait().map_err(|e| Error::Io {
@@ -613,14 +721,24 @@ fn run_agent_with_tee(cmd: &str, args: &[&str], workdir: &Path, output_file: &Pa
 // Level helpers
 // ---------------------------------------------------------------------------
 
-fn turns_for_level(level_num: u32, max_turns: Option<u32>) -> u32 {
-    if let Some(t) = max_turns {
-        return t;
-    }
-    if level_num <= 9 {
-        40
-    } else {
-        60
+use crate::model::turns_for_level;
+
+fn append_file_listing(summary: &mut String, scheme_dir: &Path) {
+    let Ok(entries) = fs::read_dir(scheme_dir) else { return };
+    let mut files: Vec<(String, usize)> = entries
+        .flatten()
+        .filter_map(|e| {
+            let name = e.file_name().to_string_lossy().into_owned();
+            if !name.ends_with(".rs") {
+                return None;
+            }
+            let content = fs::read_to_string(e.path()).ok()?;
+            Some((name, content.lines().count()))
+        })
+        .collect();
+    files.sort_by_key(|(_, lines)| *lines);
+    for (name, lines) in &files {
+        summary.push_str(&format!("  {lines:>5} {name}\n"));
     }
 }
 
@@ -638,34 +756,18 @@ fn build_level_prompt(level: &str, worktree_dir: &Path, results_dir: &Path) -> S
     summary.push_str("Files under src/scheme/:\n");
 
     // List .rs files with line counts
-    if let Ok(entries) = fs::read_dir(worktree_dir.join("bench/src/scheme")) {
-        let mut files: Vec<(String, usize)> = entries
-            .flatten()
-            .filter_map(|e| {
-                let name = e.file_name().to_string_lossy().into_owned();
-                if name.ends_with(".rs") {
-                    let content = fs::read_to_string(e.path()).ok()?;
-                    Some((name, content.lines().count()))
-                } else {
-                    None
-                }
-            })
-            .collect();
-        files.sort_by_key(|(_, lines)| *lines);
-        for (name, lines) in &files {
-            summary.push_str(&format!("  {lines:>5} {name}\n"));
-        }
-    }
+    append_file_listing(&mut summary, &worktree_dir.join("bench/src/scheme"));
 
     summary.push_str("\nLevels already passing:\n");
     let level_num: u32 = level.parse().unwrap_or(1);
     for prev_num in 1..level_num {
         let prev = format!("{prev_num:02}");
         let status_file = results_dir.join(format!("L{prev}/status.txt"));
-        if let Ok(content) = fs::read_to_string(&status_file) {
-            if content.contains("PASSED") {
-                summary.push_str(&format!("  L{prev}: PASSED\n"));
-            }
+        let passed = fs::read_to_string(&status_file)
+            .map(|c| c.contains("PASSED"))
+            .unwrap_or(false);
+        if passed {
+            summary.push_str(&format!("  L{prev}: PASSED\n"));
         }
     }
 
@@ -682,45 +784,49 @@ fn build_level_prompt(level: &str, worktree_dir: &Path, results_dir: &Path) -> S
 // Session capture
 // ---------------------------------------------------------------------------
 
+/// Capture session with a custom output filename (for cleanup passes).
+fn capture_session_as(agent: &str, session_id: &str, dest: &Path, filename: &str) {
+    if agent != "claude" {
+        return;
+    }
+    let home = std::env::var("HOME").unwrap_or_default();
+    let projects_dir = PathBuf::from(&home).join(".claude/projects");
+    let Some(found) = find_session_jsonl(&projects_dir, session_id) else {
+        eprintln!("WARNING: Session JSONL not found for {session_id}");
+        return;
+    };
+    let target = dest.join(filename);
+    match fs::copy(&found, &target) {
+        Ok(_) => println!("Session captured: {}", target.display()),
+        Err(e) => eprintln!("WARNING: Failed to copy session: {e}"),
+    }
+}
+
 fn capture_session(agent: &str, session_id: &str, dest: &Path) {
     match agent {
-        "claude" => {
-            let home = std::env::var("HOME").unwrap_or_default();
-            let projects_dir = PathBuf::from(&home).join(".claude/projects");
-            if let Some(found) = find_session_jsonl(&projects_dir, session_id) {
-                let target = dest.join("session.jsonl");
-                match fs::copy(&found, &target) {
-                    Ok(_) => println!("Session captured: {}", target.display()),
-                    Err(e) => eprintln!("WARNING: Failed to copy session: {e}"),
-                }
-            } else {
-                eprintln!("WARNING: Session JSONL not found for {session_id}");
-            }
-        }
-        "codex" => {
-            let home = std::env::var("HOME").unwrap_or_default();
-            let codex_dir = PathBuf::from(&home).join(".codex");
-            if codex_dir.is_dir() {
-                if let Some(latest) = newest_file(&codex_dir, "log") {
-                    let target = dest.join("session.log");
-                    let _ = fs::copy(&latest, &target);
-                    println!("Codex session captured: {}", target.display());
-                }
-            }
-        }
-        "opencode" => {
-            let home = std::env::var("HOME").unwrap_or_default();
-            let oc_dir = PathBuf::from(&home).join(".opencode");
-            if oc_dir.is_dir() {
-                if let Some(latest) = newest_file(&oc_dir, "json") {
-                    let target = dest.join("session.json");
-                    let _ = fs::copy(&latest, &target);
-                    println!("OpenCode session captured: {}", target.display());
-                }
-            }
-        }
+        "claude" => capture_session_as(agent, session_id, dest, "session.jsonl"),
+        "codex" => capture_newest_session("codex", ".codex", "log", "session.log", dest),
+        "opencode" => capture_newest_session("opencode", ".opencode", "json", "session.json", dest),
         _ => {}
     }
+}
+
+fn capture_newest_session(
+    label: &str, home_subdir: &str, ext: &str, target_name: &str, dest: &Path,
+) {
+    let home = std::env::var("HOME").unwrap_or_default();
+    let dir = PathBuf::from(&home).join(home_subdir);
+    if !dir.is_dir() {
+        return;
+    }
+    let Some(latest) = newest_file(&dir, ext) else {
+        return;
+    };
+    let target = dest.join(target_name);
+    let _ = fs::copy(&latest, &target);
+    let label_cap = label.chars().next().unwrap_or('?').to_uppercase().to_string()
+        + &label[1..];
+    println!("{label_cap} session captured: {}", target.display());
 }
 
 fn find_session_jsonl(projects_dir: &Path, session_id: &str) -> Option<PathBuf> {
@@ -743,32 +849,31 @@ fn newest_file(dir: &Path, extension: &str) -> Option<PathBuf> {
     let mut best: Option<(PathBuf, std::time::SystemTime)> = None;
     for entry in entries.flatten() {
         let path = entry.path();
-        if path.extension().and_then(|e| e.to_str()) == Some(extension) {
-            if let Ok(meta) = path.metadata() {
-                if let Ok(modified) = meta.modified() {
-                    if best.as_ref().is_none_or(|(_, prev)| modified > *prev) {
-                        best = Some((path, modified));
-                    }
-                }
-            }
+        if path.extension().and_then(|e| e.to_str()) != Some(extension) {
+            continue;
+        }
+        let Ok(meta) = path.metadata() else { continue };
+        let Ok(modified) = meta.modified() else { continue };
+        if best.as_ref().is_none_or(|(_, prev)| modified > *prev) {
+            best = Some((path, modified));
         }
     }
     best.map(|(p, _)| p)
 }
 
 fn extract_score_from_log(log_path: &Path) -> String {
-    if let Ok(content) = fs::read_to_string(log_path) {
-        for line in content.lines() {
-            if let Some(pos) = line.find("Score: ") {
-                let rest = &line[pos + 7..];
-                let score: String = rest
-                    .chars()
-                    .take_while(|c| c.is_ascii_digit() || *c == '/')
-                    .collect();
-                if !score.is_empty() {
-                    return score;
-                }
-            }
+    let Ok(content) = fs::read_to_string(log_path) else {
+        return "unknown".to_string();
+    };
+    for line in content.lines() {
+        let Some(pos) = line.find("Score: ") else { continue };
+        let rest = &line[pos + 7..];
+        let score: String = rest
+            .chars()
+            .take_while(|c| c.is_ascii_digit() || *c == '/')
+            .collect();
+        if !score.is_empty() {
+            return score;
         }
     }
     "unknown".to_string()
@@ -816,32 +921,26 @@ struct CleanupContext {
 
 impl Drop for CleanupContext {
     fn drop(&mut self) {
-        if INTERRUPTED.load(Ordering::Relaxed) {
-            eprintln!("\n=== Cleaning up ===");
-
-            // Commit any uncommitted work
-            if self.worktree_dir.is_dir() {
-                eprintln!("Committing agent work before exit...");
-                let _ = run_cmd("git", &["add", "-A"], &self.worktree_dir);
-                let _ = run_cmd(
-                    "git",
-                    &[
-                        "commit",
-                        "-m",
-                        "checkpoint: interrupted/cleanup",
-                        "--allow-empty",
-                    ],
-                    &self.worktree_dir,
-                );
-                let _ = run_cmd(
-                    "git",
-                    &["push", "-u", "origin", &self.name],
-                    &self.worktree_dir,
-                );
-            }
-
-            // Release lock
-            let _ = fs::remove_file(&self.lockfile);
+        if !INTERRUPTED.load(Ordering::Relaxed) {
+            return;
         }
+        eprintln!("\n=== Cleaning up ===");
+
+        if self.worktree_dir.is_dir() {
+            commit_and_push_interrupted(&self.worktree_dir, &self.name);
+        }
+
+        let _ = fs::remove_file(&self.lockfile);
     }
+}
+
+fn commit_and_push_interrupted(worktree_dir: &Path, name: &str) {
+    eprintln!("Committing agent work before exit...");
+    let _ = run_cmd("git", &["add", "-A"], worktree_dir);
+    let _ = run_cmd(
+        "git",
+        &["commit", "-m", "checkpoint: interrupted/cleanup", "--allow-empty"],
+        worktree_dir,
+    );
+    let _ = run_cmd("git", &["push", "-u", "origin", name], worktree_dir);
 }

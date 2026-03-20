@@ -4,7 +4,7 @@ use std::path::Path;
 
 const IMAGE_NAME: &str = "cs61a-bench";
 
-pub fn run(level: &str) -> Result<()> {
+pub fn run(level: &str, no_gate: bool) -> Result<()> {
     let proj = project_dir();
 
     // --- AST rules (always enforced) ---
@@ -21,9 +21,9 @@ pub fn run(level: &str) -> Result<()> {
         });
     }
 
-    // --- Quality gates (only when clippy.toml exists) ---
+    // --- Quality gates (only when clippy.toml exists and --no-gate not set) ---
     let clippy_toml = proj.join("bench/clippy.toml");
-    if clippy_toml.is_file() {
+    if !no_gate && clippy_toml.is_file() {
         quality_gates(&proj, level)?;
     }
 
@@ -39,7 +39,7 @@ pub fn run(level: &str) -> Result<()> {
 
     // --- Run inside container ---
     let timeout_str = format!("{timeout}s");
-    let mount_spec = format!("./{}:/bench/test_bin:ro,Z", bin);
+    let mount_spec = format!("./{bin}:/bench/test_bin:ro,Z");
     let bash_cmd = if filter.is_empty() {
         format!("timeout {timeout_str} /bench/test_bin --test-threads=1 2>&1")
     } else {
@@ -84,6 +84,32 @@ pub fn run(level: &str) -> Result<()> {
     Ok(())
 }
 
+/// Lint flags enforced by the quality gate. These were previously compile-time
+/// attributes via `cfg_attr(feature = "quality-gate", ...)` in bench/src/lib.rs.
+/// Now they live here so agents only see lint errors during `cargo xtask test`,
+/// not on every `cargo build`.
+const GATE_LINT_FLAGS: &[&str] = &[
+    // Deny lints (hard errors)
+    "-D", "clippy::unwrap_used",
+    "-D", "clippy::result_unit_err",
+    "-D", "clippy::manual_assert",
+    "-D", "clippy::disallowed_macros",
+    // Warn lints (promoted to error by -D warnings)
+    "-W", "clippy::too_many_lines",
+    "-W", "clippy::excessive_nesting",
+    "-W", "clippy::manual_filter_map",
+    "-W", "clippy::manual_find_map",
+    "-W", "clippy::manual_flatten",
+    "-W", "clippy::manual_try_fold",
+    "-W", "clippy::manual_let_else",
+    "-W", "clippy::needless_range_loop",
+    "-W", "clippy::explicit_counter_loop",
+    "-W", "clippy::explicit_iter_loop",
+    "-W", "clippy::vec_init_then_push",
+    "-W", "clippy::needless_collect",
+    "-W", "clippy::uninlined_format_args",
+];
+
 fn quality_gates(proj: &Path, level: &str) -> Result<()> {
     let clippy_toml = proj.join("bench/clippy.toml");
     let clippy_bak = proj.join("bench/clippy.toml.bak");
@@ -119,14 +145,9 @@ fn quality_gates(proj: &Path, level: &str) -> Result<()> {
     // Run clippy --fix
     println!("Running clippy --fix (auto-fixing trivial lints)...");
     let mut clippy_args = vec![
-        "clippy",
-        "--fix",
-        "--allow-dirty",
-        "--allow-staged",
-        "--",
-        "-D",
-        "warnings",
+        "clippy", "--fix", "--allow-dirty", "--allow-staged", "--", "-D", "warnings",
     ];
+    clippy_args.extend_from_slice(GATE_LINT_FLAGS);
     if allow_dead_code {
         clippy_args.extend_from_slice(&["-A", "dead_code"]);
     }
@@ -135,6 +156,7 @@ fn quality_gates(proj: &Path, level: &str) -> Result<()> {
     // Run clippy (verify)
     println!("Running clippy (verify, fn limit={fn_limit})...");
     let mut verify_args = vec!["clippy", "--", "-D", "warnings"];
+    verify_args.extend_from_slice(GATE_LINT_FLAGS);
     if allow_dead_code {
         verify_args.extend_from_slice(&["-A", "dead_code"]);
     }
@@ -186,8 +208,7 @@ fn check_mod_size(proj: &Path, level: u32) -> Result<()> {
 
     if impl_lines > mod_limit {
         eprintln!(
-            "ERROR: mod.rs has {} impl lines (limit for L{:02}: {}).",
-            impl_lines, level, mod_limit
+            "ERROR: mod.rs has {impl_lines} impl lines (limit for L{level:02}: {mod_limit})."
         );
         eprintln!("  Extract implementation logic into submodules.");
         return Err(Error::CommandFailed {
