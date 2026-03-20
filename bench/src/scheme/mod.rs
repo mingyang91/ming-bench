@@ -460,6 +460,68 @@ fn eval_expr(expr: &Expr, env: &EnvRef) -> Result<Value, EvalError> {
                             _ => Err(EvalError::Parse("length: argument must be a list".to_string())),
                         }
                     }
+                    "begin" => {
+                        let mut result = Value::Void;
+                        for arg in &elems[1..] {
+                            result = eval_expr(arg, env)?;
+                        }
+                        Ok(result)
+                    }
+                    "let" => {
+                        if elems.len() < 3 {
+                            return Err(EvalError::Parse("let requires bindings and body".to_string()));
+                        }
+                        let bindings = match &elems[1] {
+                            Expr::List(b) => b,
+                            _ => return Err(EvalError::Parse("let bindings must be a list".to_string())),
+                        };
+                        let let_env = EnvFrame::child(env);
+                        for binding in bindings {
+                            match binding {
+                                Expr::List(pair) if pair.len() == 2 => {
+                                    if let Expr::Symbol(name) = &pair[0] {
+                                        let val = eval_expr(&pair[1], env)?;
+                                        EnvFrame::set(&let_env, name.clone(), val);
+                                    } else {
+                                        return Err(EvalError::Parse("let binding name must be a symbol".to_string()));
+                                    }
+                                }
+                                _ => return Err(EvalError::Parse("let binding must be a pair".to_string())),
+                            }
+                        }
+                        let mut result = Value::Void;
+                        for expr in &elems[2..] {
+                            result = eval_expr(expr, &let_env)?;
+                        }
+                        Ok(result)
+                    }
+                    "cond" => {
+                        for clause in &elems[1..] {
+                            match clause {
+                                Expr::List(parts) if !parts.is_empty() => {
+                                    if let Expr::Symbol(s) = &parts[0] {
+                                        if s == "else" {
+                                            let mut result = Value::Void;
+                                            for expr in &parts[1..] {
+                                                result = eval_expr(expr, env)?;
+                                            }
+                                            return Ok(result);
+                                        }
+                                    }
+                                    let test = eval_expr(&parts[0], env)?;
+                                    if !is_false(&test) {
+                                        let mut result = test;
+                                        for expr in &parts[1..] {
+                                            result = eval_expr(expr, env)?;
+                                        }
+                                        return Ok(result);
+                                    }
+                                }
+                                _ => return Err(EvalError::Parse("cond clause must be a list".to_string())),
+                            }
+                        }
+                        Ok(Value::Void)
+                    }
                     _ => {
                         // Not a special form, try as procedure call
                         apply_proc(elems, env)
