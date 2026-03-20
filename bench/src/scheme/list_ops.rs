@@ -107,6 +107,7 @@ pub fn eval_type_pred(pred: &str, args: &[Value], env: &Rc<Env>) -> Result<Value
         "boolean?" => matches!(val, Value::Boolean(_)),
         "pair?" => matches!(val, Value::List(ref elems) if !elems.is_empty()),
         "symbol?" => matches!(val, Value::Symbol(_)),
+        "char?" => matches!(val, Value::Char(_)),
         _ => unreachable!("invalid type predicate: {pred}"),
     };
     Ok(Value::Boolean(result))

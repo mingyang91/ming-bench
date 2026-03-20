@@ -4,12 +4,17 @@ pub mod error;
 mod list_ops;
 pub mod parser;
 mod special_forms;
+mod string_ops;
 pub mod value;
 
 pub use error::EvalError;
 use builtins::{apply_arithmetic, apply_comparison};
 use env::Env;
 use list_ops::{eval_car, eval_cdr, eval_cons, eval_length, eval_list, eval_null_q, eval_type_pred};
+use string_ops::{
+    eval_number_to_string, eval_string_append, eval_string_length, eval_string_ref,
+    eval_string_to_number, eval_string_to_symbol, eval_substring, eval_symbol_to_string,
+};
 use special_forms::{
     eval_and, eval_cond, eval_define, eval_if, eval_lambda, eval_let, eval_not, eval_or,
 };
@@ -62,7 +67,7 @@ fn eval_body(exprs: &[Value], env: &Rc<Env>) -> Result<Value, EvalError> {
 /// Evaluate a single parsed Scheme value.
 pub(crate) fn eval(expr: &Value, env: &Rc<Env>) -> Result<Value, EvalError> {
     match expr {
-        Value::Integer(_) | Value::Boolean(_) | Value::String(_) | Value::Void => Ok(expr.clone()),
+        Value::Integer(_) | Value::Boolean(_) | Value::String(_) | Value::Char(_) | Value::Void => Ok(expr.clone()),
         Value::Lambda { .. } => Ok(expr.clone()),
         Value::Symbol(name) => env
             .get(name)
@@ -108,11 +113,19 @@ pub(crate) fn eval(expr: &Value, env: &Rc<Env>) -> Result<Value, EvalError> {
                 Value::Symbol(op)
                     if matches!(
                         op.as_str(),
-                        "string?" | "number?" | "boolean?" | "pair?" | "symbol?"
+                        "string?" | "number?" | "boolean?" | "pair?" | "symbol?" | "char?"
                     ) =>
                 {
                     eval_type_pred(op, args, env)
                 }
+                Value::Symbol(op) if op == "string-append" => eval_string_append(args, env),
+                Value::Symbol(op) if op == "string-length" => eval_string_length(args, env),
+                Value::Symbol(op) if op == "substring" => eval_substring(args, env),
+                Value::Symbol(op) if op == "string->number" => eval_string_to_number(args, env),
+                Value::Symbol(op) if op == "number->string" => eval_number_to_string(args, env),
+                Value::Symbol(op) if op == "symbol->string" => eval_symbol_to_string(args, env),
+                Value::Symbol(op) if op == "string->symbol" => eval_string_to_symbol(args, env),
+                Value::Symbol(op) if op == "string-ref" => eval_string_ref(args, env),
                 Value::Symbol(op) if op == "display" => eval_display(args, env),
                 Value::Symbol(op) if op == "write" => eval_write(args, env),
                 Value::Symbol(op) if op == "newline" => eval_newline(args, env),

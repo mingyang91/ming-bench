@@ -1,0 +1,139 @@
+use std::rc::Rc;
+
+use crate::scheme::builtins::expect_integer;
+use crate::scheme::env::Env;
+use crate::scheme::error::EvalError;
+use crate::scheme::eval;
+use crate::scheme::value::Value;
+
+fn expect_string(val: &Value) -> Result<&str, EvalError> {
+    match val {
+        Value::String(s) => Ok(s.as_str()),
+        other => Err(EvalError::TypeError {
+            expected: "string".into(),
+            got: format!("{other}"),
+        }),
+    }
+}
+
+/// Evaluate `(string-append s ...)` — concatenate strings.
+pub fn eval_string_append(args: &[Value], env: &Rc<Env>) -> Result<Value, EvalError> {
+    let vals: Vec<Value> = args.iter().map(|a| eval(a, env)).collect::<Result<_, _>>()?;
+    let result: String = vals
+        .iter()
+        .map(expect_string)
+        .collect::<Result<Vec<_>, _>>()?
+        .join("");
+    Ok(Value::String(result))
+}
+
+/// Evaluate `(string-length s)` — length of a string.
+pub fn eval_string_length(args: &[Value], env: &Rc<Env>) -> Result<Value, EvalError> {
+    let [arg] = args else {
+        return Err(EvalError::WrongArgCount {
+            expected: "1".into(),
+            got: args.len(),
+        });
+    };
+    let val = eval(arg, env)?;
+    let s = expect_string(&val)?;
+    Ok(Value::Integer(s.len() as i64))
+}
+
+/// Evaluate `(substring s start end)` — extract a substring.
+pub fn eval_substring(args: &[Value], env: &Rc<Env>) -> Result<Value, EvalError> {
+    let [s_expr, start_expr, end_expr] = args else {
+        return Err(EvalError::WrongArgCount {
+            expected: "3".into(),
+            got: args.len(),
+        });
+    };
+    let s_val = eval(s_expr, env)?;
+    let s = expect_string(&s_val)?;
+    let start = expect_integer(&eval(start_expr, env)?)? as usize;
+    let end = expect_integer(&eval(end_expr, env)?)? as usize;
+    if start > end || end > s.len() {
+        return Err(EvalError::TypeError {
+            expected: format!("valid substring indices (0..{})", s.len()),
+            got: format!("{start}..{end}"),
+        });
+    }
+    Ok(Value::String(s[start..end].to_string()))
+}
+
+/// Evaluate `(string->number s)` — parse a string as a number.
+pub fn eval_string_to_number(args: &[Value], env: &Rc<Env>) -> Result<Value, EvalError> {
+    let [arg] = args else {
+        return Err(EvalError::WrongArgCount {
+            expected: "1".into(),
+            got: args.len(),
+        });
+    };
+    let val = eval(arg, env)?;
+    let s = expect_string(&val)?;
+    match s.parse::<i64>() {
+        Ok(n) => Ok(Value::Integer(n)),
+        Err(_) => Ok(Value::Boolean(false)),
+    }
+}
+
+/// Evaluate `(number->string n)` — convert a number to a string.
+pub fn eval_number_to_string(args: &[Value], env: &Rc<Env>) -> Result<Value, EvalError> {
+    let [arg] = args else {
+        return Err(EvalError::WrongArgCount {
+            expected: "1".into(),
+            got: args.len(),
+        });
+    };
+    let val = eval(arg, env)?;
+    let n = expect_integer(&val)?;
+    Ok(Value::String(n.to_string()))
+}
+
+/// Evaluate `(symbol->string sym)` — convert a symbol to a string.
+pub fn eval_symbol_to_string(args: &[Value], env: &Rc<Env>) -> Result<Value, EvalError> {
+    let [arg] = args else {
+        return Err(EvalError::WrongArgCount {
+            expected: "1".into(),
+            got: args.len(),
+        });
+    };
+    let val = eval(arg, env)?;
+    match val {
+        Value::Symbol(s) => Ok(Value::String(s)),
+        other => Err(EvalError::TypeError {
+            expected: "symbol".into(),
+            got: format!("{other}"),
+        }),
+    }
+}
+
+/// Evaluate `(string->symbol s)` — convert a string to a symbol.
+pub fn eval_string_to_symbol(args: &[Value], env: &Rc<Env>) -> Result<Value, EvalError> {
+    let [arg] = args else {
+        return Err(EvalError::WrongArgCount {
+            expected: "1".into(),
+            got: args.len(),
+        });
+    };
+    let val = eval(arg, env)?;
+    let s = expect_string(&val)?;
+    Ok(Value::Symbol(s.to_string()))
+}
+
+/// Evaluate `(string-ref s k)` — character at index k.
+pub fn eval_string_ref(args: &[Value], env: &Rc<Env>) -> Result<Value, EvalError> {
+    let [s_expr, k_expr] = args else {
+        return Err(EvalError::WrongArgCount {
+            expected: "2".into(),
+            got: args.len(),
+        });
+    };
+    let s_val = eval(s_expr, env)?;
+    let s = expect_string(&s_val)?;
+    let k = expect_integer(&eval(k_expr, env)?)? as usize;
+    s.chars().nth(k).map(Value::Char).ok_or_else(|| EvalError::TypeError {
+        expected: format!("index < {}", s.len()),
+        got: format!("{k}"),
+    })
+}

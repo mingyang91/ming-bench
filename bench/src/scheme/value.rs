@@ -10,6 +10,7 @@ pub enum Value {
     Boolean(bool),
     String(String),
     Symbol(String),
+    Char(char),
     List(Vec<Value>),
     Lambda {
         params: Vec<String>,
@@ -26,6 +27,7 @@ impl PartialEq for Value {
             (Value::Boolean(a), Value::Boolean(b)) => a == b,
             (Value::String(a), Value::String(b)) => a == b,
             (Value::Symbol(a), Value::Symbol(b)) => a == b,
+            (Value::Char(a), Value::Char(b)) => a == b,
             (Value::List(a), Value::List(b)) => a == b,
             (Value::Void, Value::Void) => true,
             _ => false,
@@ -49,6 +51,7 @@ impl Value {
     pub fn display_str(&self) -> String {
         match self {
             Value::String(s) => s.clone(),
+            Value::Char(c) => c.to_string(),
             other => other.to_string(),
         }
     }
@@ -67,6 +70,7 @@ impl fmt::Display for Value {
             Value::Boolean(false) => write!(f, "#f"),
             Value::String(s) => write!(f, "\"{s}\""),
             Value::Symbol(s) => write!(f, "{s}"),
+            Value::Char(c) => write!(f, "#\\{c}"),
             Value::List(elements) => fmt_list(elements, f),
             Value::Lambda { .. } => write!(f, "#<procedure>"),
             Value::Void => write!(f, ""),
