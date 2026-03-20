@@ -1,4 +1,4 @@
-use crate::model::{project_dir, run_cmd, run_cmd_capture_all, Error, Result};
+use crate::model::{project_dir, run_cmd, run_cmd_capture_all, Error, Result, LEVELS};
 use std::fs;
 use std::path::Path;
 
@@ -46,6 +46,15 @@ pub fn run(level: &str) -> Result<()> {
         format!("timeout {timeout_str} /bench/test_bin {filter} --test-threads=1 2>&1")
     };
 
+    // BENCH_LEVEL env: supports requirement-change levels where tests at level N
+    // are deprecated by level N+1. Tests check this to skip when superseded.
+    let bench_level = if level == "all" {
+        LEVELS.last().unwrap().to_string()
+    } else {
+        level.to_string()
+    };
+    let bench_level_env = format!("BENCH_LEVEL={bench_level}");
+
     let exit = run_cmd(
         "sudo",
         &[
@@ -57,6 +66,8 @@ pub fn run(level: &str) -> Result<()> {
             "--pids-limit=256",
             "-v",
             &mount_spec,
+            "-e",
+            &bench_level_env,
             IMAGE_NAME,
             &bash_cmd,
         ],

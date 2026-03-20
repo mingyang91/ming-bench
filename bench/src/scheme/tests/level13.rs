@@ -1,27 +1,42 @@
 use crate::scheme::eval_str;
 
-// ===== Level 13: Tail Call Optimization =====
+// ===== Level 13: Mutable Strings (R5RS) =====
+// Requirement-change level: string-set! is deprecated at L14 (strings become immutable).
+
+fn current_level() -> u32 {
+    std::env::var("BENCH_LEVEL")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(u32::MAX)
+}
 
 #[test]
-fn test_l13_tco_loop() {
+fn test_l13_string_set() {
+    if current_level() > 13 {
+        return;
+    } // deprecated at L14
     assert_eq!(
-        eval_str(include_str!("fixtures/l13_tco_loop.scm").trim()),
-        Ok("done".into())
+        eval_str(include_str!("fixtures/l13_string_set.scm").trim()),
+        Ok("\"Horld\"".into())
     );
 }
 
 #[test]
-fn test_l13_tco_fact_iter() {
+fn test_l13_string_copy() {
+    // string-copy is NOT deprecated — still valid after L14
     assert_eq!(
-        eval_str(include_str!("fixtures/l13_tco_fact_iter.scm").trim()),
-        Ok("2432902008176640000".into())
+        eval_str(include_str!("fixtures/l13_string_copy.scm").trim()),
+        Ok("\"hello\"".into())
     );
 }
 
 #[test]
-fn test_l13_tco_mutual_recursion() {
+fn test_l13_string_set_multiple() {
+    if current_level() > 13 {
+        return;
+    } // deprecated at L14
     assert_eq!(
-        eval_str(include_str!("fixtures/l13_tco_mutual_recursion.scm").trim()),
-        Ok("#t".into())
+        eval_str(include_str!("fixtures/l13_string_set_multiple.scm").trim()),
+        Ok("\"HELLO\"".into())
     );
 }

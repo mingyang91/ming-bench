@@ -1,51 +1,43 @@
 use crate::scheme::eval_str;
 
-// ===== Level 18: define-syntax / syntax-rules =====
+// ===== Level 18: Tail Position in All Forms =====
 
 #[test]
-fn test_l18_simple_macro() {
+fn test_l18_tco_cond() {
     assert_eq!(
-        eval_str(include_str!("fixtures/l18_simple_macro.scm").trim()),
-        Ok("1".into())
+        eval_str(include_str!("fixtures/l18_tco_cond.scm").trim()),
+        Ok("done".into())
     );
 }
 
 #[test]
-fn test_l18_my_and_macro() {
+fn test_l18_tco_named_let() {
     assert_eq!(
-        eval_str(include_str!("fixtures/l18_my_and_macro.scm").trim()),
-        Ok("3".into())
+        eval_str(include_str!("fixtures/l18_tco_named_let.scm").trim()),
+        Ok("done".into())
     );
 }
 
 #[test]
-fn test_l18_swap_hygiene() {
+fn test_l18_tco_and_or() {
     assert_eq!(
-        eval_str(include_str!("fixtures/l18_swap_hygiene.scm").trim()),
-        Ok("(2 1)".into())
+        eval_str(include_str!("fixtures/l18_tco_and_or.scm").trim()),
+        Ok("#t".into())
     );
 }
 
 #[test]
-fn test_l18_variadic_pattern() {
+fn test_l18_tco_begin() {
     assert_eq!(
-        eval_str(include_str!("fixtures/l18_variadic_pattern.scm").trim()),
-        Ok("(1 2 3)".into())
+        eval_str(include_str!("fixtures/l18_tco_begin.scm").trim()),
+        Ok("done".into())
     );
 }
 
 #[test]
-fn test_l18_nested_macro() {
+fn test_l18_tco_let_body() {
     assert_eq!(
-        eval_str(include_str!("fixtures/l18_nested_macro.scm").trim()),
-        Ok("2".into())
-    );
-}
-
-#[test]
-fn test_l18_macro_keeps_definition_site_binding() {
-    assert_eq!(
-        eval_str(include_str!("fixtures/l18_macro_keeps_definition_site_binding.scm").trim()),
-        Ok("10".into())
+        eval_str(include_str!("fixtures/l18_tco_let_body.scm").trim()),
+        Ok("done".into())
     );
 }

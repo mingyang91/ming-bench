@@ -1,43 +1,83 @@
 use crate::scheme::eval_str;
 
-// ===== Level 19: Comprehensive Integration =====
+// ===== Level 19: First-Class Continuations — call/cc =====
 
 #[test]
-fn test_l19_callcc_with_mutation() {
+fn test_l19_callcc_nonlocal_exit() {
     assert_eq!(
-        eval_str(include_str!("fixtures/l19_callcc_with_mutation.scm").trim()),
-        Ok("4".into())
+        eval_str(include_str!("fixtures/l19_callcc_nonlocal_exit.scm").trim()),
+        Ok("42".into())
     );
 }
 
 #[test]
-fn test_l19_macro_tco_loop() {
+fn test_l19_callcc_no_escape() {
     assert_eq!(
-        eval_str(include_str!("fixtures/l19_macro_tco_loop.scm").trim()),
-        Ok("1000000".into())
+        eval_str(include_str!("fixtures/l19_callcc_no_escape.scm").trim()),
+        Ok("7".into())
     );
 }
 
 #[test]
-fn test_l19_callcc_try_catch() {
+fn test_l19_callcc_early_return() {
     assert_eq!(
-        eval_str(include_str!("fixtures/l19_callcc_try_catch.scm").trim()),
-        Ok("(caught 42)".into())
+        eval_str(include_str!("fixtures/l19_callcc_early_return.scm").trim()),
+        Ok("-2".into())
     );
 }
 
 #[test]
-fn test_l19_coroutine_scheduler() {
+fn test_l19_callcc_saved_continuation() {
     assert_eq!(
-        eval_str(include_str!("fixtures/l19_coroutine_scheduler.scm").trim()),
-        Ok("4".into())
+        eval_str(include_str!("fixtures/l19_callcc_saved_continuation.scm").trim()),
+        Ok("42".into())
     );
 }
 
 #[test]
-fn test_l19_church_booleans_with_callcc() {
+fn test_l19_callcc_as_value() {
     assert_eq!(
-        eval_str(include_str!("fixtures/l19_church_booleans_with_callcc.scm").trim()),
-        Ok("yes".into())
+        eval_str(include_str!("fixtures/l19_callcc_as_value.scm").trim()),
+        Ok("11".into())
+    );
+}
+
+#[test]
+fn test_l19_callcc_reentrant() {
+    assert_eq!(
+        eval_str(include_str!("fixtures/l19_callcc_reentrant.scm").trim()),
+        Ok("3".into())
+    );
+}
+
+#[test]
+fn test_l19_callcc_exception_handler() {
+    assert_eq!(
+        eval_str(include_str!("fixtures/l19_callcc_exception_handler.scm").trim()),
+        Ok("(error 42)".into())
+    );
+}
+
+#[test]
+fn test_l19_callcc_is_first_class() {
+    assert_eq!(
+        eval_str(include_str!("fixtures/l19_callcc_is_first_class.scm").trim()),
+        Ok("7".into())
+    );
+}
+
+#[test]
+fn test_l19_callcc_resumes_lambda_body() {
+    assert_eq!(
+        eval_str(include_str!("fixtures/l19_callcc_resumes_lambda_body.scm").trim()),
+        Ok("3".into())
+    );
+}
+
+#[test]
+fn test_l19_callcc_resumes_pending_application() {
+    assert_eq!(
+        eval_str(include_str!("fixtures/l19_callcc_resumes_pending_application.scm").trim()),
+        Ok("43".into())
     );
 }

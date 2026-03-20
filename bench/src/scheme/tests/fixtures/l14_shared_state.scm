@@ -1,6 +1,0 @@
-(define (make-pair) (let ((val 0)) (define (getter) val) (define (setter v) (set! val v)) (list getter setter)))
-(define p (make-pair))
-(define get (car p))
-(define set-val (car (cdr p)))
-(set-val 42)
-(get)

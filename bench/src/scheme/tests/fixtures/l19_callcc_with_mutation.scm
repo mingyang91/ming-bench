@@ -1,5 +1,0 @@
-(define result '())
-(define saved #f)
-(define (run) (let ((v (call/cc (lambda (k) (set! saved k) 0)))) (set! result (cons v result)) v))
-(run)
-(if (< (car result) 3) (saved (+ (car result) 1)) (length result))

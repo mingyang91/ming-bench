@@ -1,83 +1,51 @@
 use crate::scheme::eval_str;
 
-// ===== Level 17: First-Class Continuations — call/cc =====
+// ===== Level 17: Variadic & apply =====
 
 #[test]
-fn test_l17_callcc_nonlocal_exit() {
+fn test_l17_rest_args() {
     assert_eq!(
-        eval_str(include_str!("fixtures/l17_callcc_nonlocal_exit.scm").trim()),
-        Ok("42".into())
+        eval_str(include_str!("fixtures/l17_rest_args.scm").trim()),
+        Ok("(2 3)".into())
     );
 }
 
 #[test]
-fn test_l17_callcc_no_escape() {
+fn test_l17_rest_args_empty() {
     assert_eq!(
-        eval_str(include_str!("fixtures/l17_callcc_no_escape.scm").trim()),
-        Ok("7".into())
+        eval_str(include_str!("fixtures/l17_rest_args_empty.scm").trim()),
+        Ok("()".into())
     );
 }
 
 #[test]
-fn test_l17_callcc_early_return() {
+fn test_l17_apply_builtin() {
     assert_eq!(
-        eval_str(include_str!("fixtures/l17_callcc_early_return.scm").trim()),
-        Ok("-2".into())
+        eval_str(include_str!("fixtures/l17_apply_builtin.scm").trim()),
+        Ok("6".into())
     );
 }
 
 #[test]
-fn test_l17_callcc_saved_continuation() {
+fn test_l17_apply_prefix_args() {
     assert_eq!(
-        eval_str(include_str!("fixtures/l17_callcc_saved_continuation.scm").trim()),
-        Ok("42".into())
+        eval_str(include_str!("fixtures/l17_apply_prefix_args.scm").trim()),
+        Ok("10".into())
     );
 }
 
 #[test]
-fn test_l17_callcc_as_value() {
+fn test_l17_apply_user_fn() {
     assert_eq!(
-        eval_str(include_str!("fixtures/l17_callcc_as_value.scm").trim()),
-        Ok("11".into())
+        eval_str(include_str!("fixtures/l17_apply_user_fn.scm").trim()),
+        Ok("15".into())
     );
 }
 
 #[test]
-fn test_l17_callcc_reentrant() {
+fn test_l17_apply_as_value() {
     assert_eq!(
-        eval_str(include_str!("fixtures/l17_callcc_reentrant.scm").trim()),
-        Ok("3".into())
-    );
-}
-
-#[test]
-fn test_l17_callcc_exception_handler() {
-    assert_eq!(
-        eval_str(include_str!("fixtures/l17_callcc_exception_handler.scm").trim()),
-        Ok("(error 42)".into())
-    );
-}
-
-#[test]
-fn test_l17_callcc_is_first_class() {
-    assert_eq!(
-        eval_str(include_str!("fixtures/l17_callcc_is_first_class.scm").trim()),
-        Ok("7".into())
-    );
-}
-
-#[test]
-fn test_l17_callcc_resumes_lambda_body() {
-    assert_eq!(
-        eval_str(include_str!("fixtures/l17_callcc_resumes_lambda_body.scm").trim()),
-        Ok("3".into())
-    );
-}
-
-#[test]
-fn test_l17_callcc_resumes_pending_application() {
-    assert_eq!(
-        eval_str(include_str!("fixtures/l17_callcc_resumes_pending_application.scm").trim()),
-        Ok("43".into())
+        eval_str(include_str!("fixtures/l17_apply_as_value.scm").trim()),
+        Ok("6".into())
     );
 }

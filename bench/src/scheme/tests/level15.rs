@@ -1,51 +1,27 @@
 use crate::scheme::eval_str;
 
-// ===== Level 15: Variadic & apply =====
+// ===== Level 15: Tail Call Optimization =====
 
 #[test]
-fn test_l15_rest_args() {
+fn test_l15_tco_loop() {
     assert_eq!(
-        eval_str(include_str!("fixtures/l15_rest_args.scm").trim()),
-        Ok("(2 3)".into())
+        eval_str(include_str!("fixtures/l15_tco_loop.scm").trim()),
+        Ok("done".into())
     );
 }
 
 #[test]
-fn test_l15_rest_args_empty() {
+fn test_l15_tco_fact_iter() {
     assert_eq!(
-        eval_str(include_str!("fixtures/l15_rest_args_empty.scm").trim()),
-        Ok("()".into())
+        eval_str(include_str!("fixtures/l15_tco_fact_iter.scm").trim()),
+        Ok("2432902008176640000".into())
     );
 }
 
 #[test]
-fn test_l15_apply_builtin() {
+fn test_l15_tco_mutual_recursion() {
     assert_eq!(
-        eval_str(include_str!("fixtures/l15_apply_builtin.scm").trim()),
-        Ok("6".into())
-    );
-}
-
-#[test]
-fn test_l15_apply_prefix_args() {
-    assert_eq!(
-        eval_str(include_str!("fixtures/l15_apply_prefix_args.scm").trim()),
-        Ok("10".into())
-    );
-}
-
-#[test]
-fn test_l15_apply_user_fn() {
-    assert_eq!(
-        eval_str(include_str!("fixtures/l15_apply_user_fn.scm").trim()),
-        Ok("15".into())
-    );
-}
-
-#[test]
-fn test_l15_apply_as_value() {
-    assert_eq!(
-        eval_str(include_str!("fixtures/l15_apply_as_value.scm").trim()),
-        Ok("6".into())
+        eval_str(include_str!("fixtures/l15_tco_mutual_recursion.scm").trim()),
+        Ok("#t".into())
     );
 }

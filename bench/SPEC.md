@@ -65,23 +65,29 @@ All error messages must include source position info (line:col). Errors for unde
 ### Level 12 — String & Symbol Operations
 `string-append`, `string-length`, `substring`, `string->number`, `number->string`. `symbol->string`, `string->symbol`. `string-ref` returns a character; `char?` predicate.
 
-### Level 13 — Tail Call Optimization
+### Level 13 — Mutable Strings (R5RS)
+`string-set!` mutates a character in a string by index. `string-copy` returns a mutable copy of a string. Strings created by `string-copy` are mutable.
+
+### Level 14 — String Immutability (R7RS)
+Strings are now immutable. `string-set!` must raise an error. Use `string->list` and `list->string` for character-level transformations. `string-copy` still works (returns an immutable copy). `char->integer` and `integer->char` convert between characters and their integer code points.
+
+### Level 15 — Tail Call Optimization
 Tail-position calls must not grow the stack. `(loop 1000000)` with a tail-recursive body must not overflow.
 
-### Level 14 — set! & Mutation
+### Level 16 — set! & Mutation
 `set!` mutates an existing binding (error if unbound). Closures that share a binding observe each other's mutations.
 
-### Level 15 — Variadic & Apply
+### Level 17 — Variadic & Apply
 Dot notation for rest parameters: `(define (f x . rest) rest)`. `apply` calls a function with an argument list. `apply` accepts prefix arguments: `(apply + 1 2 '(3 4))`.
 
-### Level 16 — Tail Position in All Forms
+### Level 18 — Tail Position in All Forms
 TCO must work through `cond`, named `let`, `and`, `or`, `begin`, and `let` body — not just `if`.
 
-### Level 17 — First-Class Continuations
+### Level 19 — First-Class Continuations
 `call/cc` (call-with-current-continuation) captures the current continuation as a first-class value. Supports: non-local exit, saving and resuming continuations, continuations as values passed to higher-order functions.
 
-### Level 18 — Hygienic Macros
+### Level 20 — Hygienic Macros
 `define-syntax` + `syntax-rules`. Pattern matching with literals and ellipsis (`...`). Macro-introduced bindings do not capture user bindings (hygiene). Definition-site bindings are preserved.
 
-### Level 19 — Integration
+### Level 21 — Integration
 Combined use of continuations, macros, mutation, and tail calls.
