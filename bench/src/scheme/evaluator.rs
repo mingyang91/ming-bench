@@ -7,6 +7,7 @@ use crate::scheme::environment::Environment;
 use crate::scheme::error::SchemeError;
 use crate::scheme::parser::{self, Expr};
 use crate::scheme::procedure::{Parameters, Procedure};
+use crate::scheme::syntax::SyntaxRules;
 use crate::scheme::value::Value;
 
 enum MachineState {
@@ -81,16 +82,21 @@ fn eval_expression(
     }
 
     match expression {
-        Expr::Symbol(name) => Ok(MachineState::Value(
-            environment
-                .get(&name)
-                .ok_or(SchemeError::UnboundSymbol { name })?,
-        )),
+        Expr::Symbol(name) => eval_symbol(name, environment),
+        Expr::ScopedSymbol { name, environment } => eval_symbol(name, environment),
         Expr::List(expressions) => eval_application(expressions, environment, stack),
         Expr::Integer(_) | Expr::Boolean(_) | Expr::String(_) => {
             unreachable!("literal expressions are handled before matching")
         }
     }
+}
+
+fn eval_symbol(name: String, environment: Environment) -> Result<MachineState, SchemeError> {
+    Ok(MachineState::Value(
+        environment
+            .get(&name)
+            .ok_or(SchemeError::UnboundSymbol { name })?,
+    ))
 }
 
 fn eval_application(
@@ -102,9 +108,13 @@ fn eval_application(
         return Err(SchemeError::EmptyApplication);
     };
 
-    if let Expr::Symbol(name) = operator {
+    if let Some(name) = operator.symbol_name() {
         if let Some(state) = eval_special_form(name, operands, &environment, stack)? {
             return Ok(state);
+        }
+
+        if let Some(expanded) = expand_macro(operator, &expressions, &environment)? {
+            return Ok(MachineState::Expression(expanded, environment));
         }
     }
 
@@ -116,6 +126,22 @@ fn eval_application(
     Ok(MachineState::Expression(operator.clone(), environment))
 }
 
+fn expand_macro(
+    operator: &Expr,
+    expression: &[Expr],
+    environment: &Environment,
+) -> Result<Option<Expr>, SchemeError> {
+    let Some(name) = operator.symbol_name() else {
+        return Ok(None);
+    };
+    let lookup_environment = symbol_lookup_environment(operator, environment);
+    let Some(syntax_rules) = lookup_environment.get_syntax(name) else {
+        return Ok(None);
+    };
+
+    syntax_rules.expand(expression).map(Some)
+}
+
 fn eval_special_form(
     operator: &str,
     operands: &[Expr],
@@ -124,6 +150,7 @@ fn eval_special_form(
 ) -> Result<Option<MachineState>, SchemeError> {
     match operator {
         "define" => eval_define(operands, environment, stack).map(Some),
+        "define-syntax" => eval_define_syntax(operands, environment).map(Some),
         "set!" => eval_set(operands, environment, stack).map(Some),
         "if" => eval_if(operands, environment, stack).map(Some),
         "quote" => eval_quote(operands).map(|value| Some(MachineState::Value(value))),
@@ -145,17 +172,21 @@ fn eval_define(
     stack: &mut Vec<Frame>,
 ) -> Result<MachineState, SchemeError> {
     match operands {
-        [Expr::Symbol(name), value_expression] => {
+        [target, value_expression] if target.symbol_name().is_some() => {
+            let name = target
+                .symbol_name()
+                .map(str::to_owned)
+                .unwrap_or_else(|| unreachable!("identifier presence is checked in the guard"));
             stack.push(Frame::Define {
-                name: name.clone(),
-                environment: environment.clone(),
+                name,
+                environment: symbol_lookup_environment(target, environment),
             });
             Ok(MachineState::Expression(
                 value_expression.clone(),
                 environment.clone(),
             ))
         }
-        [Expr::Symbol(_), ..] => Err(SchemeError::WrongArgumentCount {
+        [target, ..] if target.symbol_name().is_some() => Err(SchemeError::WrongArgumentCount {
             operator: "define",
             expected: 2,
             actual: operands.len(),
@@ -168,12 +199,35 @@ fn eval_define(
             min: 2,
             actual: operands.len(),
         }),
-        [target, _] | [target, ..] => Err(SchemeError::InvalidDefinitionTarget {
+        [target, ..] => Err(SchemeError::InvalidDefinitionTarget {
             found: expression_kind(target),
         }),
-        _ => Err(SchemeError::TooFewArguments {
+        [] => Err(SchemeError::TooFewArguments {
             operator: "define",
             min: 2,
+            actual: 0,
+        }),
+    }
+}
+
+fn eval_define_syntax(
+    operands: &[Expr],
+    environment: &Environment,
+) -> Result<MachineState, SchemeError> {
+    match operands {
+        [name, transformer] => {
+            let Some(name) = name.symbol_name() else {
+                return Err(SchemeError::InvalidSyntaxName {
+                    found: expression_kind(name),
+                });
+            };
+            let syntax_rules = SyntaxRules::parse(name, transformer, environment.clone())?;
+            environment.define_syntax(name, syntax_rules);
+            Ok(MachineState::Value(Value::Void))
+        }
+        _ => Err(SchemeError::WrongArgumentCount {
+            operator: "define-syntax",
+            expected: 2,
             actual: operands.len(),
         }),
     }
@@ -185,17 +239,21 @@ fn eval_set(
     stack: &mut Vec<Frame>,
 ) -> Result<MachineState, SchemeError> {
     match operands {
-        [Expr::Symbol(name), value_expression] => {
+        [target, value_expression] if target.symbol_name().is_some() => {
+            let name = target
+                .symbol_name()
+                .map(str::to_owned)
+                .unwrap_or_else(|| unreachable!("identifier presence is checked in the guard"));
             stack.push(Frame::Set {
-                name: name.clone(),
-                environment: environment.clone(),
+                name,
+                environment: symbol_lookup_environment(target, environment),
             });
             Ok(MachineState::Expression(
                 value_expression.clone(),
                 environment.clone(),
             ))
         }
-        [Expr::Symbol(_), ..] => Err(SchemeError::WrongArgumentCount {
+        [target, ..] if target.symbol_name().is_some() => Err(SchemeError::WrongArgumentCount {
             operator: "set!",
             expected: 2,
             actual: operands.len(),
@@ -216,19 +274,19 @@ fn define_function(
     body: &[Expr],
     environment: &Environment,
 ) -> Result<MachineState, SchemeError> {
-    let Some((name, parameters)) = signature.split_first() else {
+    let Some((name_expression, parameters)) = signature.split_first() else {
         return Err(SchemeError::InvalidDefinitionTarget { found: "list" });
     };
 
-    let Expr::Symbol(name) = name else {
+    let Some(name) = name_expression.symbol_name() else {
         return Err(SchemeError::InvalidDefinitionTarget {
-            found: expression_kind(name),
+            found: expression_kind(name_expression),
         });
     };
 
     let parameters = parse_parameters(parameters, "define")?;
     let procedure = Value::procedure(parameters, body.to_vec(), environment.clone());
-    environment.define(name, procedure);
+    symbol_lookup_environment(name_expression, environment).define(name, procedure);
     Ok(MachineState::Value(Value::Void))
 }
 
@@ -397,13 +455,18 @@ fn eval_let(
     stack: &mut Vec<Frame>,
 ) -> Result<MachineState, SchemeError> {
     match operands {
-        [Expr::Symbol(name), bindings_expression, body @ ..] if !body.is_empty() => {
+        [name, bindings_expression, body @ ..]
+            if !body.is_empty() && name.symbol_name().is_some() =>
+        {
+            let name = name
+                .symbol_name()
+                .unwrap_or_else(|| unreachable!("identifier presence is checked in the guard"));
             eval_named_let(name, bindings_expression, body, environment, stack)
         }
         [bindings_expression, body @ ..] if !body.is_empty() => {
             eval_let_body(bindings_expression, body, environment, stack)
         }
-        [Expr::Symbol(_), ..] => Err(SchemeError::TooFewArguments {
+        [name, ..] if name.symbol_name().is_some() => Err(SchemeError::TooFewArguments {
             operator: "let",
             min: 3,
             actual: operands.len(),
@@ -503,10 +566,14 @@ fn parse_let_binding(binding: &Expr) -> Result<LetBinding, SchemeError> {
     };
 
     match parts.as_slice() {
-        [Expr::Symbol(name), value_expression] => {
-            Ok(LetBinding::new(name.clone(), value_expression.clone()))
+        [name, value_expression] if name.symbol_name().is_some() => {
+            let name = name
+                .symbol_name()
+                .map(str::to_owned)
+                .unwrap_or_else(|| unreachable!("identifier presence is checked in the guard"));
+            Ok(LetBinding::new(name, value_expression.clone()))
         }
-        [Expr::Symbol(_), ..] => Err(SchemeError::WrongArgumentCount {
+        [name, ..] if name.symbol_name().is_some() => Err(SchemeError::WrongArgumentCount {
             operator: "let binding",
             expected: 2,
             actual: parts.len(),
@@ -529,7 +596,9 @@ fn parse_parameter_list(
 ) -> Result<Parameters, SchemeError> {
     match parameters {
         Expr::List(parameters) => parse_parameters(parameters, operator),
-        Expr::Symbol(name) if name != "." => Ok(Parameters::new(Vec::new(), Some(name.clone()))),
+        _ if parameters.symbol_name().is_some() && !parameters.is_symbol_named(".") => Ok(
+            Parameters::new(Vec::new(), parameters.symbol_name().map(str::to_owned)),
+        ),
         _ => Err(SchemeError::InvalidParameterList {
             operator,
             found: expression_kind(parameters),
@@ -544,9 +613,7 @@ fn parse_parameters(
     let mut dotted_indices = parameters
         .iter()
         .enumerate()
-        .filter_map(|(index, parameter)| {
-            matches!(parameter, Expr::Symbol(name) if name == ".").then_some(index)
-        });
+        .filter_map(|(index, parameter)| parameter.is_symbol_named(".").then_some(index));
 
     let Some(dotted_index) = dotted_indices.next() else {
         return parse_fixed_parameters(parameters, operator)
@@ -590,7 +657,7 @@ fn parse_fixed_parameters(
     let mut seen = HashSet::with_capacity(parameters.len());
 
     for parameter in parameters {
-        let Expr::Symbol(name) = parameter else {
+        let Some(name) = parameter.symbol_name() else {
             return Err(SchemeError::InvalidParameterName {
                 operator,
                 found: expression_kind(parameter),
@@ -601,21 +668,21 @@ fn parse_fixed_parameters(
             return Err(SchemeError::InvalidDottedParameterList { operator });
         }
 
-        if !seen.insert(name.clone()) {
+        if !seen.insert(name.to_owned()) {
             return Err(SchemeError::DuplicateParameter {
                 operator,
-                name: name.clone(),
+                name: name.to_owned(),
             });
         }
 
-        names.push(name.clone());
+        names.push(name.to_owned());
     }
 
     Ok(names)
 }
 
 fn parse_rest_parameter(parameter: &Expr, operator: &'static str) -> Result<String, SchemeError> {
-    let Expr::Symbol(name) = parameter else {
+    let Some(name) = parameter.symbol_name() else {
         return Err(SchemeError::InvalidParameterName {
             operator,
             found: expression_kind(parameter),
@@ -625,7 +692,7 @@ fn parse_rest_parameter(parameter: &Expr, operator: &'static str) -> Result<Stri
     if name == "." {
         Err(SchemeError::InvalidDottedParameterList { operator })
     } else {
-        Ok(name.clone())
+        Ok(name.to_owned())
     }
 }
 
@@ -1273,8 +1340,15 @@ fn divide_numbers(lhs: i64, rhs: i64) -> Result<i64, SchemeError> {
     }
 }
 
+fn symbol_lookup_environment(expression: &Expr, environment: &Environment) -> Environment {
+    expression
+        .symbol_environment()
+        .cloned()
+        .unwrap_or_else(|| environment.clone())
+}
+
 fn is_else_symbol(expression: &Expr) -> bool {
-    matches!(expression, Expr::Symbol(symbol) if symbol == "else")
+    expression.is_symbol_named("else")
 }
 
 fn expression_kind(expression: &Expr) -> &'static str {
@@ -1282,7 +1356,7 @@ fn expression_kind(expression: &Expr) -> &'static str {
         Expr::Integer(_) => "number",
         Expr::Boolean(_) => "boolean",
         Expr::String(_) => "string",
-        Expr::Symbol(_) => "symbol",
+        Expr::Symbol(_) | Expr::ScopedSymbol { .. } => "symbol",
         Expr::List(_) => "list",
     }
 }

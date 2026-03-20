@@ -57,6 +57,26 @@ pub(crate) enum SchemeError {
     InvalidDefinitionTarget { found: &'static str },
     #[error("`set!` expected a symbol name but got {found}")]
     InvalidAssignmentTarget { found: &'static str },
+    #[error("`define-syntax` expected a symbol name but got {found}")]
+    InvalidSyntaxName { found: &'static str },
+    #[error("`define-syntax` expected a `syntax-rules` transformer but got {found}")]
+    InvalidSyntaxTransformer { found: &'static str },
+    #[error("`syntax-rules` expected a list of literal identifiers but got {found}")]
+    InvalidSyntaxLiteralList { found: &'static str },
+    #[error("`syntax-rules` literal expected a symbol but got {found}")]
+    InvalidSyntaxLiteral { found: &'static str },
+    #[error("`syntax-rules` expected a rule list but got {found}")]
+    InvalidSyntaxRule { found: &'static str },
+    #[error("`syntax-rules` rule expected exactly 2 form(s) but got {actual}")]
+    InvalidSyntaxRuleArity { actual: usize },
+    #[error("`syntax-rules` rule expected macro name `{expected}` but got `{actual}`")]
+    UnexpectedMacroPatternName { expected: String, actual: String },
+    #[error("invalid ellipsis placement in {context}")]
+    InvalidEllipsisPlacement { context: &'static str },
+    #[error("template ellipsis in {context} must reference a repeated pattern variable")]
+    EllipsisWithoutPatternVariable { context: &'static str },
+    #[error("template variable `{name}` was used outside its repetition context")]
+    TemplateVariableOutOfContext { name: String },
     #[error("`{operator}` expected a binding list but got {found}")]
     InvalidBindingList {
         operator: &'static str,

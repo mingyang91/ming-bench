@@ -27,7 +27,7 @@ impl Value {
             Expr::Integer(value) => Some(Self::Integer(*value)),
             Expr::Boolean(value) => Some(Self::Boolean(*value)),
             Expr::String(value) => Some(Self::String(value.clone())),
-            Expr::Symbol(_) | Expr::List(_) => None,
+            Expr::Symbol(_) | Expr::ScopedSymbol { .. } | Expr::List(_) => None,
         }
     }
 
@@ -36,7 +36,9 @@ impl Value {
             Expr::Integer(value) => Self::Integer(*value),
             Expr::Boolean(value) => Self::Boolean(*value),
             Expr::String(value) => Self::String(value.clone()),
-            Expr::Symbol(value) => Self::Symbol(value.clone()),
+            Expr::Symbol(value) | Expr::ScopedSymbol { name: value, .. } => {
+                Self::Symbol(value.clone())
+            }
             Expr::List(values) => Self::list(values.iter().map(Self::from_quoted_expr).collect()),
         }
     }

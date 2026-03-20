@@ -1,12 +1,52 @@
+use crate::scheme::environment::Environment;
 use crate::scheme::error::SchemeError;
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone)]
 pub(crate) enum Expr {
     Integer(i64),
     Boolean(bool),
     String(String),
     Symbol(String),
+    ScopedSymbol {
+        name: String,
+        environment: Environment,
+    },
     List(Vec<Expr>),
+}
+
+impl Expr {
+    pub(crate) fn symbol(name: impl Into<String>) -> Self {
+        Self::Symbol(name.into())
+    }
+
+    pub(crate) fn scoped_symbol(name: impl Into<String>, environment: Environment) -> Self {
+        Self::ScopedSymbol {
+            name: name.into(),
+            environment,
+        }
+    }
+
+    pub(crate) fn symbol_name(&self) -> Option<&str> {
+        match self {
+            Self::Symbol(name) | Self::ScopedSymbol { name, .. } => Some(name),
+            Self::Integer(_) | Self::Boolean(_) | Self::String(_) | Self::List(_) => None,
+        }
+    }
+
+    pub(crate) fn symbol_environment(&self) -> Option<&Environment> {
+        match self {
+            Self::ScopedSymbol { environment, .. } => Some(environment),
+            Self::Integer(_)
+            | Self::Boolean(_)
+            | Self::String(_)
+            | Self::Symbol(_)
+            | Self::List(_) => None,
+        }
+    }
+
+    pub(crate) fn is_symbol_named(&self, expected: &str) -> bool {
+        self.symbol_name() == Some(expected)
+    }
 }
 
 pub(crate) fn parse_program(input: &str) -> Result<Vec<Expr>, SchemeError> {
@@ -79,7 +119,7 @@ impl<'a> Parser<'a> {
     fn parse_quote(&mut self) -> Result<Expr, SchemeError> {
         let _ = self.advance_char();
         let quoted = self.parse_expr()?;
-        Ok(Expr::List(vec![Expr::Symbol("quote".to_owned()), quoted]))
+        Ok(Expr::List(vec![Expr::symbol("quote"), quoted]))
     }
 
     fn parse_boolean(&mut self) -> Result<Expr, SchemeError> {
@@ -118,7 +158,7 @@ impl<'a> Parser<'a> {
                 None => Err(SchemeError::UnexpectedEndOfInput { context: "symbol" }),
             }
         } else {
-            Ok(Expr::Symbol(token.to_owned()))
+            Ok(Expr::symbol(token))
         }
     }
 
