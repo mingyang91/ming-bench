@@ -1,13 +1,12 @@
+pub mod env;
 pub mod error;
 pub mod parser;
 pub mod value;
 
 pub use error::EvalError;
-use std::collections::HashMap;
+use env::Env;
+use std::rc::Rc;
 use value::Value;
-
-/// A variable environment (flat for now — no closures yet).
-type Env = HashMap<String, Value>;
 
 /// Extract an integer from a Value, returning a TypeError if not an integer.
 fn expect_integer(val: &Value) -> Result<i64, EvalError> {
@@ -70,19 +69,19 @@ fn is_truthy(val: &Value) -> bool {
 }
 
 /// Evaluate `(not expr)` — returns #t if expr is falsy, #f otherwise.
-fn eval_not(args: &[Value], env: &mut Env) -> Result<Value, EvalError> {
-    if args.len() != 1 {
+fn eval_not(args: &[Value], env: &Rc<Env>) -> Result<Value, EvalError> {
+    let [arg] = args else {
         return Err(EvalError::WrongArgCount {
             expected: "1".into(),
             got: args.len(),
         });
-    }
-    let val = eval(&args[0], env)?;
+    };
+    let val = eval(arg, env)?;
     Ok(Value::Boolean(!is_truthy(&val)))
 }
 
 /// Evaluate `(and expr ...)` — short-circuit, returns last truthy or first falsy.
-fn eval_and(args: &[Value], env: &mut Env) -> Result<Value, EvalError> {
+fn eval_and(args: &[Value], env: &Rc<Env>) -> Result<Value, EvalError> {
     let mut result = Value::Boolean(true);
     for arg in args {
         result = eval(arg, env)?;
@@ -94,7 +93,7 @@ fn eval_and(args: &[Value], env: &mut Env) -> Result<Value, EvalError> {
 }
 
 /// Evaluate `(or expr ...)` — short-circuit, returns first truthy or last falsy.
-fn eval_or(args: &[Value], env: &mut Env) -> Result<Value, EvalError> {
+fn eval_or(args: &[Value], env: &Rc<Env>) -> Result<Value, EvalError> {
     let mut result = Value::Boolean(false);
     for arg in args {
         result = eval(arg, env)?;
@@ -105,20 +104,68 @@ fn eval_or(args: &[Value], env: &mut Env) -> Result<Value, EvalError> {
     Ok(result)
 }
 
-/// Evaluate `(define name expr)` — binds name in env, returns Void.
-fn eval_define(args: &[Value], env: &mut Env) -> Result<Value, EvalError> {
-    let [Value::Symbol(name), expr] = args else {
-        return Err(EvalError::BadSyntax {
+/// Extract parameter names from a list of symbols.
+fn extract_params(params: &[Value], form: &str) -> Result<Vec<String>, EvalError> {
+    params
+        .iter()
+        .map(|p| match p {
+            Value::Symbol(s) => Ok(s.clone()),
+            _ => Err(EvalError::BadSyntax { form: form.into() }),
+        })
+        .collect()
+}
+
+/// Evaluate `(define ...)` — supports both `(define name expr)` and `(define (name params...) body...)`.
+fn eval_define(args: &[Value], env: &Rc<Env>) -> Result<Value, EvalError> {
+    match args {
+        [Value::Symbol(name), expr] => {
+            let val = eval(expr, env)?;
+            env.set(name.clone(), val);
+            Ok(Value::Void)
+        }
+        [Value::List(name_and_params), body @ ..] if !body.is_empty() => {
+            let [Value::Symbol(name), params @ ..] = name_and_params.as_slice() else {
+                return Err(EvalError::BadSyntax {
+                    form: "define".into(),
+                });
+            };
+            let param_names = extract_params(params, "define")?;
+            let lambda = Value::Lambda {
+                params: param_names,
+                body: body.to_vec(),
+                env: Rc::clone(env),
+            };
+            env.set(name.clone(), lambda);
+            Ok(Value::Void)
+        }
+        _ => Err(EvalError::BadSyntax {
             form: "define".into(),
+        }),
+    }
+}
+
+/// Evaluate `(lambda (params...) body...)`.
+fn eval_lambda(args: &[Value], env: &Rc<Env>) -> Result<Value, EvalError> {
+    let [Value::List(params), body @ ..] = args else {
+        return Err(EvalError::BadSyntax {
+            form: "lambda".into(),
         });
     };
-    let val = eval(expr, env)?;
-    env.insert(name.clone(), val);
-    Ok(Value::Void)
+    if body.is_empty() {
+        return Err(EvalError::BadSyntax {
+            form: "lambda".into(),
+        });
+    }
+    let param_names = extract_params(params, "lambda")?;
+    Ok(Value::Lambda {
+        params: param_names,
+        body: body.to_vec(),
+        env: Rc::clone(env),
+    })
 }
 
 /// Evaluate `(if cond then else?)`.
-fn eval_if(args: &[Value], env: &mut Env) -> Result<Value, EvalError> {
+fn eval_if(args: &[Value], env: &Rc<Env>) -> Result<Value, EvalError> {
     match args {
         [cond, consequent, alternate] => {
             if is_truthy(&eval(cond, env)?) {
@@ -138,13 +185,40 @@ fn eval_if(args: &[Value], env: &mut Env) -> Result<Value, EvalError> {
     }
 }
 
+/// Apply a lambda to evaluated arguments.
+fn apply_lambda(func: Value, args: &[Value]) -> Result<Value, EvalError> {
+    let Value::Lambda { params, body, env } = func else {
+        return Err(EvalError::NotAProcedure {
+            value: format!("{func}"),
+        });
+    };
+    if params.len() != args.len() {
+        return Err(EvalError::WrongArgCount {
+            expected: params.len().to_string(),
+            got: args.len(),
+        });
+    }
+    let child = Env::child(&env);
+    for (param, arg) in params.iter().zip(args) {
+        child.set(param.clone(), arg.clone());
+    }
+    eval_body(&body, &child)
+}
+
+/// Evaluate a sequence of expressions, returning the last result.
+fn eval_body(exprs: &[Value], env: &Rc<Env>) -> Result<Value, EvalError> {
+    exprs
+        .iter()
+        .try_fold(Value::Void, |_, expr| eval(expr, env))
+}
+
 /// Evaluate a single parsed Scheme value.
-fn eval(expr: &Value, env: &mut Env) -> Result<Value, EvalError> {
+fn eval(expr: &Value, env: &Rc<Env>) -> Result<Value, EvalError> {
     match expr {
         Value::Integer(_) | Value::Boolean(_) | Value::String(_) | Value::Void => Ok(expr.clone()),
+        Value::Lambda { .. } => Ok(expr.clone()),
         Value::Symbol(name) => env
             .get(name)
-            .cloned()
             .ok_or_else(|| EvalError::UnboundVariable { name: name.clone() }),
         Value::List(elements) => {
             let [operator, args @ ..] = elements.as_slice() else {
@@ -159,6 +233,7 @@ fn eval(expr: &Value, env: &mut Env) -> Result<Value, EvalError> {
                 },
                 Value::Symbol(op) if op == "if" => eval_if(args, env),
                 Value::Symbol(op) if op == "define" => eval_define(args, env),
+                Value::Symbol(op) if op == "lambda" => eval_lambda(args, env),
                 Value::Symbol(op) if matches!(op.as_str(), "+" | "-" | "*" | "/") => {
                     let evaluated: Vec<Value> =
                         args.iter().map(|a| eval(a, env)).collect::<Result<_, _>>()?;
@@ -174,9 +249,12 @@ fn eval(expr: &Value, env: &mut Env) -> Result<Value, EvalError> {
                 Value::Symbol(op) if op == "not" => eval_not(args, env),
                 Value::Symbol(op) if op == "and" => eval_and(args, env),
                 Value::Symbol(op) if op == "or" => eval_or(args, env),
-                _ => Err(EvalError::NotAProcedure {
-                    value: format!("{operator}"),
-                }),
+                _ => {
+                    let func = eval(operator, env)?;
+                    let evaluated_args: Vec<Value> =
+                        args.iter().map(|a| eval(a, env)).collect::<Result<_, _>>()?;
+                    apply_lambda(func, &evaluated_args)
+                }
             }
         }
     }
@@ -189,11 +267,8 @@ pub fn eval_str(input: &str) -> Result<String, EvalError> {
     if expressions.is_empty() {
         return Err(EvalError::EmptyInput);
     }
-    let mut env = Env::new();
-    let mut last = Value::Void;
-    for expr in &expressions {
-        last = eval(expr, &mut env)?;
-    }
+    let env = Env::new();
+    let last = eval_body(&expressions, &env)?;
     match last {
         Value::Void => Err(EvalError::EmptyInput),
         val => Ok(val.to_string()),

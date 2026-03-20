@@ -1,14 +1,36 @@
 use std::fmt;
+use std::rc::Rc;
+
+use super::env::Env;
 
 /// A Scheme value.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone)]
 pub enum Value {
     Integer(i64),
     Boolean(bool),
     String(String),
     Symbol(String),
     List(Vec<Value>),
+    Lambda {
+        params: Vec<String>,
+        body: Vec<Value>,
+        env: Rc<Env>,
+    },
     Void,
+}
+
+impl PartialEq for Value {
+    fn eq(&self, other: &Self) -> bool {
+        match (self, other) {
+            (Value::Integer(a), Value::Integer(b)) => a == b,
+            (Value::Boolean(a), Value::Boolean(b)) => a == b,
+            (Value::String(a), Value::String(b)) => a == b,
+            (Value::Symbol(a), Value::Symbol(b)) => a == b,
+            (Value::List(a), Value::List(b)) => a == b,
+            (Value::Void, Value::Void) => true,
+            _ => false,
+        }
+    }
 }
 
 fn fmt_list(elements: &[Value], f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -31,6 +53,7 @@ impl fmt::Display for Value {
             Value::String(s) => write!(f, "\"{s}\""),
             Value::Symbol(s) => write!(f, "{s}"),
             Value::List(elements) => fmt_list(elements, f),
+            Value::Lambda { .. } => write!(f, "#<procedure>"),
             Value::Void => write!(f, ""),
         }
     }
