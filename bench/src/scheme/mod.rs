@@ -652,6 +652,15 @@ fn apply_builtin(
                     <= expect_integer(&eval_args[1], call_line, call_col)?,
             ))
         }
+        ">=" => {
+            if eval_args.len() != 2 {
+                return Err(err_at(">= requires 2 arguments", call_line, call_col));
+            }
+            Ok(Value::Boolean(
+                expect_integer(&eval_args[0], call_line, call_col)?
+                    >= expect_integer(&eval_args[1], call_line, call_col)?,
+            ))
+        }
         "not" => {
             if eval_args.len() != 1 {
                 return Err(err_at("not requires 1 argument", call_line, call_col));
@@ -710,6 +719,23 @@ fn apply_builtin(
             ))
         }
         "list" => Ok(Value::List(eval_args)),
+        "map" => {
+            if eval_args.len() != 2 {
+                return Err(err_at("map requires 2 arguments", call_line, call_col));
+            }
+            let func = eval_args[0].clone();
+            match &eval_args[1] {
+                Value::List(items) => {
+                    let mut result = Vec::new();
+                    for item in items {
+                        let val = apply_lambda(&func, &[item.clone()], None, call_line, call_col, output)?;
+                        result.push(val);
+                    }
+                    Ok(Value::List(result))
+                }
+                _ => Err(err_at("map: second argument must be a list", call_line, call_col)),
+            }
+        }
         "length" => {
             if eval_args.len() != 1 {
                 return Err(err_at("length requires 1 argument", call_line, call_col));
@@ -873,6 +899,52 @@ fn apply_builtin(
             match s.chars().nth(idx) {
                 Some(c) => Ok(Value::Char(c)),
                 None => Err(err_at("string-ref: index out of range", call_line, call_col)),
+            }
+        }
+        "string->list" => {
+            if eval_args.len() != 1 {
+                return Err(err_at("string->list requires 1 argument", call_line, call_col));
+            }
+            match &eval_args[0] {
+                Value::Str(s) => Ok(Value::List(s.chars().map(Value::Char).collect())),
+                _ => Err(err_at("string->list: expected string", call_line, call_col)),
+            }
+        }
+        "list->string" => {
+            if eval_args.len() != 1 {
+                return Err(err_at("list->string requires 1 argument", call_line, call_col));
+            }
+            match &eval_args[0] {
+                Value::List(items) => {
+                    let mut s = String::new();
+                    for item in items {
+                        match item {
+                            Value::Char(c) => s.push(*c),
+                            _ => return Err(err_at("list->string: list must contain only characters", call_line, call_col)),
+                        }
+                    }
+                    Ok(Value::Str(s))
+                }
+                _ => Err(err_at("list->string: expected list", call_line, call_col)),
+            }
+        }
+        "char->integer" => {
+            if eval_args.len() != 1 {
+                return Err(err_at("char->integer requires 1 argument", call_line, call_col));
+            }
+            match &eval_args[0] {
+                Value::Char(c) => Ok(Value::Integer(*c as i64)),
+                _ => Err(err_at("char->integer: expected char", call_line, call_col)),
+            }
+        }
+        "integer->char" => {
+            if eval_args.len() != 1 {
+                return Err(err_at("integer->char requires 1 argument", call_line, call_col));
+            }
+            let n = expect_integer(&eval_args[0], call_line, call_col)?;
+            match char::from_u32(n as u32) {
+                Some(c) => Ok(Value::Char(c)),
+                None => Err(err_at("integer->char: invalid code point", call_line, call_col)),
             }
         }
         _ => Err(err_at(
