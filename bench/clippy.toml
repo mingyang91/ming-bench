@@ -3,4 +3,4 @@ excessive-nesting-threshold = 3
 
 [[disallowed-macros]]
 path = "std::thread_local"
-reason = "Use algebraic types instead of thread-local state"
+reason = "Avoid thread-local state"
