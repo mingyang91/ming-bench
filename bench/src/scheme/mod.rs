@@ -27,6 +27,7 @@ enum Value {
         col: usize,
         expr_index: usize,
     },
+    Pair(Box<Value>, Box<Value>),
     Macro {
         literals: Vec<String>,
         rules: Vec<(Expr, Expr)>,
@@ -61,6 +62,7 @@ impl PartialEq for Value {
             (Value::Lambda { params: p1, body: b1, .. }, Value::Lambda { params: p2, body: b2, .. }) => {
                 p1 == p2 && b1 == b2
             }
+            (Value::Pair(a1, b1), Value::Pair(a2, b2)) => a1 == a2 && b1 == b2,
             (Value::Vector(a), Value::Vector(b)) => *a.borrow() == *b.borrow(),
             (Value::Builtin(a), Value::Builtin(b)) => a == b,
             (Value::Continuation { line: l1, col: c1, .. }, Value::Continuation { line: l2, col: c2, .. }) => {
@@ -164,6 +166,7 @@ impl Value {
                 let items: Vec<String> = v.borrow().iter().map(|x| x.to_scheme_string()).collect();
                 format!("#({})", items.join(" "))
             }
+            Value::Pair(a, b) => format!("({} . {})", a.to_scheme_string(), b.to_scheme_string()),
             Value::Lambda { .. } => "#<procedure>".to_string(),
             Value::Builtin(name) => format!("#<builtin:{}>", name),
             Value::Continuation { .. } => "#<continuation>".to_string(),
@@ -1277,7 +1280,7 @@ fn is_builtin_name(name: &str) -> bool {
             | "char->integer" | "integer->char"
             | "apply" | "equal?" | "eq?" | "abs" | "modulo" | "remainder"
             | "quotient" | "expt"
-            | "append" | "reverse" | "list-ref" | "filter" | "for-each"
+            | "append" | "reverse" | "list-ref" | "list-tail" | "filter" | "for-each" | "assoc"
             | "zero?" | "positive?" | "negative?" | "even?" | "odd?"
             | "min" | "max" | "list?" | "procedure?"
             | "char-alphabetic?" | "char-numeric?" | "char-whitespace?"
@@ -1412,10 +1415,9 @@ fn call_builtin_values(
                     new_list.extend(items.iter().cloned());
                     Ok(Value::List(new_list))
                 }
-                _ => Err(err_at(
-                    "cons: second argument must be a list",
-                    call_line,
-                    call_col,
+                _ => Ok(Value::Pair(
+                    Box::new(eval_args[0].clone()),
+                    Box::new(eval_args[1].clone()),
                 )),
             }
         }
@@ -1425,6 +1427,7 @@ fn call_builtin_values(
             }
             match &eval_args[0] {
                 Value::List(items) if !items.is_empty() => Ok(items[0].clone()),
+                Value::Pair(a, _) => Ok((**a).clone()),
                 _ => Err(err_at(
                     "car: argument must be a non-empty list",
                     call_line,
@@ -1438,6 +1441,7 @@ fn call_builtin_values(
             }
             match &eval_args[0] {
                 Value::List(items) if !items.is_empty() => Ok(Value::List(items[1..].to_vec())),
+                Value::Pair(_, b) => Ok((**b).clone()),
                 _ => Err(err_at(
                     "cdr: argument must be a non-empty list",
                     call_line,
@@ -1455,21 +1459,30 @@ fn call_builtin_values(
         }
         "list" => Ok(Value::List(eval_args)),
         "map" => {
-            if eval_args.len() != 2 {
-                return Err(err_at("map requires 2 arguments", call_line, call_col));
+            if eval_args.len() < 2 {
+                return Err(err_at("map requires at least 2 arguments", call_line, call_col));
             }
             let func = eval_args[0].clone();
-            match &eval_args[1] {
-                Value::List(items) => {
-                    let mut result = Vec::new();
-                    for item in items {
-                        let val = call_value(&func, vec![item.clone()], call_line, call_col, output)?;
-                        result.push(val);
-                    }
-                    Ok(Value::List(result))
+            let mut lists: Vec<&Vec<Value>> = Vec::new();
+            for arg in &eval_args[1..] {
+                match arg {
+                    Value::List(items) => lists.push(items),
+                    _ => return Err(err_at("map: arguments must be lists", call_line, call_col)),
                 }
-                _ => Err(err_at("map: second argument must be a list", call_line, call_col)),
             }
+            let len = lists[0].len();
+            for l in &lists {
+                if l.len() != len {
+                    return Err(err_at("map: lists must have equal length", call_line, call_col));
+                }
+            }
+            let mut result = Vec::new();
+            for i in 0..len {
+                let args: Vec<Value> = lists.iter().map(|l| l[i].clone()).collect();
+                let val = call_value(&func, args, call_line, call_col, output)?;
+                result.push(val);
+            }
+            Ok(Value::List(result))
         }
         "length" => {
             if eval_args.len() != 1 {
@@ -1523,7 +1536,8 @@ fn call_builtin_values(
                 ));
             }
             Ok(Value::Boolean(
-                matches!(&eval_args[0], Value::List(items) if !items.is_empty()),
+                matches!(&eval_args[0], Value::List(items) if !items.is_empty())
+                || matches!(&eval_args[0], Value::Pair(_, _)),
             ))
         }
         "symbol?" => {
@@ -1905,6 +1919,64 @@ fn call_builtin_values(
                 return Err(err_at("expt: negative exponent not supported for integers", call_line, call_col));
             }
             Ok(Value::Integer(base.pow(exp as u32)))
+        }
+        "list-ref" => {
+            if eval_args.len() != 2 {
+                return Err(err_at("list-ref requires 2 arguments", call_line, call_col));
+            }
+            match &eval_args[0] {
+                Value::List(items) => {
+                    let idx = expect_integer(&eval_args[1], call_line, call_col)? as usize;
+                    if idx >= items.len() {
+                        return Err(err_at("list-ref: index out of range", call_line, call_col));
+                    }
+                    Ok(items[idx].clone())
+                }
+                _ => Err(err_at("list-ref: first argument must be a list", call_line, call_col)),
+            }
+        }
+        "list-tail" => {
+            if eval_args.len() != 2 {
+                return Err(err_at("list-tail requires 2 arguments", call_line, call_col));
+            }
+            match &eval_args[0] {
+                Value::List(items) => {
+                    let idx = expect_integer(&eval_args[1], call_line, call_col)? as usize;
+                    if idx > items.len() {
+                        return Err(err_at("list-tail: index out of range", call_line, call_col));
+                    }
+                    Ok(Value::List(items[idx..].to_vec()))
+                }
+                _ => Err(err_at("list-tail: first argument must be a list", call_line, call_col)),
+            }
+        }
+        "list?" => {
+            if eval_args.len() != 1 {
+                return Err(err_at("list? requires 1 argument", call_line, call_col));
+            }
+            Ok(Value::Boolean(matches!(&eval_args[0], Value::List(_))))
+        }
+        "assoc" => {
+            if eval_args.len() != 2 {
+                return Err(err_at("assoc requires 2 arguments", call_line, call_col));
+            }
+            let key = &eval_args[0];
+            match &eval_args[1] {
+                Value::List(items) => {
+                    for item in items {
+                        match item {
+                            Value::List(pair) if !pair.is_empty() => {
+                                if pair[0] == *key {
+                                    return Ok(item.clone());
+                                }
+                            }
+                            _ => {}
+                        }
+                    }
+                    Ok(Value::Boolean(false))
+                }
+                _ => Err(err_at("assoc: second argument must be a list", call_line, call_col)),
+            }
         }
         _ => Err(err_at(
             format!("unknown procedure: {}", name),
