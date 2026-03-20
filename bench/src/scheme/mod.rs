@@ -16,9 +16,11 @@ enum Value {
     List(Vec<Value>),
     Lambda {
         params: Vec<String>,
+        rest_param: Option<String>,
         body: Vec<Expr>,
         env: Env,
     },
+    Builtin(String),
 }
 
 impl PartialEq for Value {
@@ -33,6 +35,7 @@ impl PartialEq for Value {
             (Value::Lambda { params: p1, body: b1, .. }, Value::Lambda { params: p2, body: b2, .. }) => {
                 p1 == p2 && b1 == b2
             }
+            (Value::Builtin(a), Value::Builtin(b)) => a == b,
             _ => false,
         }
     }
@@ -127,6 +130,7 @@ impl Value {
                 format!("({})", parts.join(" "))
             }
             Value::Lambda { .. } => "#<procedure>".to_string(),
+            Value::Builtin(name) => format!("#<builtin:{}>", name),
         }
     }
 
@@ -134,6 +138,7 @@ impl Value {
         match self {
             Value::Str(s) => s.clone(),
             Value::Char(c) => c.to_string(),
+            Value::Builtin(name) => format!("#<builtin:{}>", name),
             other => other.to_scheme_string(),
         }
     }
@@ -261,6 +266,8 @@ fn eval(expr: &Expr, env: &Env, output: &mut String) -> Result<Value, EvalError>
         ExprKind::Value(Value::Symbol(name)) => {
             if let Some(v) = env.get(name) {
                 Ok(v)
+            } else if is_builtin_name(name) {
+                Ok(Value::Builtin(name.clone()))
             } else {
                 Err(err_at(format!("undefined variable: {}", name), expr.line, expr.col))
             }
@@ -319,18 +326,32 @@ fn eval(expr: &Expr, env: &Env, output: &mut String) -> Result<Value, EvalError>
                     }
                     _ => {
                         if let Some(func_val) = env.get(name) {
-                            if let Value::Lambda { .. } = &func_val {
-                                let mut eval_args = Vec::new();
-                                for a in &items[1..] {
-                                    eval_args.push(eval(a, env, output)?);
+                            match &func_val {
+                                Value::Lambda { .. } => {
+                                    let mut eval_args = Vec::new();
+                                    for a in &items[1..] {
+                                        eval_args.push(eval(a, env, output)?);
+                                    }
+                                    return apply_lambda(
+                                        &func_val,
+                                        &eval_args,
+                                        expr.line,
+                                        expr.col,
+                                        output,
+                                    );
                                 }
-                                return apply_lambda(
-                                    &func_val,
-                                    &eval_args,
-                                    expr.line,
-                                    expr.col,
-                                    output,
-                                );
+                                Value::Builtin(bname) => {
+                                    let bname = bname.clone();
+                                    return apply_builtin(
+                                        &bname,
+                                        &items[1..],
+                                        env,
+                                        expr.line,
+                                        expr.col,
+                                        output,
+                                    );
+                                }
+                                _ => {}
                             }
                         }
                         apply_builtin(name, &items[1..], env, expr.line, expr.col, output)
@@ -338,20 +359,11 @@ fn eval(expr: &Expr, env: &Env, output: &mut String) -> Result<Value, EvalError>
                 }
             } else {
                 let func_val = eval(&items[0], env, output)?;
-                match func_val {
-                    Value::Lambda { .. } => {
-                        let mut eval_args = Vec::new();
-                        for a in &items[1..] {
-                            eval_args.push(eval(a, env, output)?);
-                        }
-                        apply_lambda(&func_val, &eval_args, expr.line, expr.col, output)
-                    }
-                    _ => Err(err_at(
-                        format!("not a procedure: {}", func_val.to_scheme_string()),
-                        expr.line,
-                        expr.col,
-                    )),
+                let mut eval_args = Vec::new();
+                for a in &items[1..] {
+                    eval_args.push(eval(a, env, output)?);
                 }
+                call_value(&func_val, eval_args, expr.line, expr.col, output)
             }
         }
     }
@@ -370,6 +382,51 @@ fn eval_set(items: &[Expr], expr: &Expr, env: &Env, output: &mut String) -> Resu
         return Err(err_at(format!("set!: unbound variable: {}", name), expr.line, expr.col));
     }
     Ok(Value::Symbol("".to_string()))
+}
+
+fn parse_params(param_exprs: &[Expr]) -> Result<(Vec<String>, Option<String>), EvalError> {
+    let mut params = Vec::new();
+    let mut rest_param = None;
+    let mut i = 0;
+    while i < param_exprs.len() {
+        match &param_exprs[i].kind {
+            ExprKind::Value(Value::Symbol(s)) if s == "." => {
+                if i + 1 < param_exprs.len() {
+                    match &param_exprs[i + 1].kind {
+                        ExprKind::Value(Value::Symbol(rp)) => {
+                            rest_param = Some(rp.clone());
+                        }
+                        _ => {
+                            return Err(err_at(
+                                "rest parameter must be a symbol",
+                                param_exprs[i + 1].line,
+                                param_exprs[i + 1].col,
+                            ))
+                        }
+                    }
+                    i += 2;
+                } else {
+                    return Err(err_at(
+                        "expected rest parameter after .",
+                        param_exprs[i].line,
+                        param_exprs[i].col,
+                    ));
+                }
+            }
+            ExprKind::Value(Value::Symbol(s)) => {
+                params.push(s.clone());
+                i += 1;
+            }
+            _ => {
+                return Err(err_at(
+                    "parameter must be a symbol",
+                    param_exprs[i].line,
+                    param_exprs[i].col,
+                ))
+            }
+        }
+    }
+    Ok((params, rest_param))
 }
 
 fn eval_define(items: &[Expr], expr: &Expr, env: &Env, output: &mut String) -> Result<Value, EvalError> {
@@ -398,20 +455,11 @@ fn eval_define(items: &[Expr], expr: &Expr, env: &Env, output: &mut String) -> R
                     ))
                 }
             };
-            let params: Vec<String> = sig[1..]
-                .iter()
-                .map(|e| match &e.kind {
-                    ExprKind::Value(Value::Symbol(s)) => Ok(s.clone()),
-                    _ => Err(err_at(
-                        "define: parameter must be a symbol",
-                        e.line,
-                        e.col,
-                    )),
-                })
-                .collect::<Result<_, _>>()?;
+            let (params, rest_param) = parse_params(&sig[1..])?;
             let body = items[2..].to_vec();
             let lambda = Value::Lambda {
                 params,
+                rest_param,
                 body,
                 env: env.clone(),
             };
@@ -454,18 +502,12 @@ fn eval_lambda(items: &[Expr], expr: &Expr, env: &Env) -> Result<Value, EvalErro
             expr.col,
         ));
     }
-    let params = match &items[1].kind {
-        ExprKind::List(p) => p
-            .iter()
-            .map(|e| match &e.kind {
-                ExprKind::Value(Value::Symbol(s)) => Ok(s.clone()),
-                _ => Err(err_at(
-                    "lambda: parameter must be a symbol",
-                    e.line,
-                    e.col,
-                )),
-            })
-            .collect::<Result<Vec<_>, _>>()?,
+    let (params, rest_param) = match &items[1].kind {
+        ExprKind::List(p) => parse_params(p)?,
+        ExprKind::Value(Value::Symbol(s)) => {
+            // (lambda args body) — single symbol catches all args
+            (vec![], Some(s.clone()))
+        }
         _ => {
             return Err(err_at(
                 "lambda: first argument must be a parameter list",
@@ -477,6 +519,7 @@ fn eval_lambda(items: &[Expr], expr: &Expr, env: &Env) -> Result<Value, EvalErro
     let body = items[2..].to_vec();
     Ok(Value::Lambda {
         params,
+        rest_param,
         body,
         env: env.clone(),
     })
@@ -708,15 +751,29 @@ fn eval_tail(expr: &Expr, env: &Env, output: &mut String) -> Result<EvalResult, 
                     | "write" | "newline" => Ok(EvalResult::Done(eval(expr, env, output)?)),
                     _ => {
                         if let Some(func_val) = env.get(name) {
-                            if let Value::Lambda { .. } = &func_val {
-                                let mut eval_args = Vec::new();
-                                for a in &items[1..] {
-                                    eval_args.push(eval(a, env, output)?);
+                            match &func_val {
+                                Value::Lambda { .. } => {
+                                    let mut eval_args = Vec::new();
+                                    for a in &items[1..] {
+                                        eval_args.push(eval(a, env, output)?);
+                                    }
+                                    return Ok(EvalResult::TailCall {
+                                        func: func_val,
+                                        args: eval_args,
+                                    });
                                 }
-                                return Ok(EvalResult::TailCall {
-                                    func: func_val,
-                                    args: eval_args,
-                                });
+                                Value::Builtin(bname) => {
+                                    let bname = bname.clone();
+                                    return Ok(EvalResult::Done(apply_builtin(
+                                        &bname,
+                                        &items[1..],
+                                        env,
+                                        expr.line,
+                                        expr.col,
+                                        output,
+                                    )?));
+                                }
+                                _ => {}
                             }
                         }
                         Ok(EvalResult::Done(apply_builtin(
@@ -731,17 +788,28 @@ fn eval_tail(expr: &Expr, env: &Env, output: &mut String) -> Result<EvalResult, 
                 }
             } else {
                 let func_val = eval(&items[0], env, output)?;
-                if let Value::Lambda { .. } = &func_val {
-                    let mut eval_args = Vec::new();
-                    for a in &items[1..] {
-                        eval_args.push(eval(a, env, output)?);
+                match &func_val {
+                    Value::Lambda { .. } => {
+                        let mut eval_args = Vec::new();
+                        for a in &items[1..] {
+                            eval_args.push(eval(a, env, output)?);
+                        }
+                        Ok(EvalResult::TailCall {
+                            func: func_val,
+                            args: eval_args,
+                        })
                     }
-                    return Ok(EvalResult::TailCall {
-                        func: func_val,
-                        args: eval_args,
-                    });
+                    Value::Builtin(bname) => {
+                        let mut eval_args = Vec::new();
+                        for a in &items[1..] {
+                            eval_args.push(eval(a, env, output)?);
+                        }
+                        Ok(EvalResult::Done(call_builtin_values(
+                            bname, eval_args, expr.line, expr.col, output,
+                        )?))
+                    }
+                    _ => Ok(EvalResult::Done(eval(expr, env, output)?)),
                 }
-                Ok(EvalResult::Done(eval(expr, env, output)?))
             }
         }
         _ => Ok(EvalResult::Done(eval(expr, env, output)?)),
@@ -759,8 +827,20 @@ fn apply_lambda(
     let mut current_args = args.to_vec();
 
     loop {
-        if let Value::Lambda { params, body, env } = &current_func {
-            if params.len() != current_args.len() {
+        if let Value::Lambda { params, rest_param, body, env } = &current_func {
+            if let Some(ref rp) = rest_param {
+                if current_args.len() < params.len() {
+                    return Err(err_at(
+                        format!(
+                            "expected at least {} arguments, got {}",
+                            params.len(),
+                            current_args.len()
+                        ),
+                        call_line,
+                        call_col,
+                    ));
+                }
+            } else if params.len() != current_args.len() {
                 return Err(err_at(
                     format!(
                         "expected {} arguments, got {}",
@@ -774,6 +854,10 @@ fn apply_lambda(
             let local_env = env.child();
             for (p, a) in params.iter().zip(current_args.iter()) {
                 local_env.define(p.clone(), a.clone());
+            }
+            if let Some(ref rp) = rest_param {
+                let rest_vals = current_args[params.len()..].to_vec();
+                local_env.define(rp.clone(), Value::List(rest_vals));
             }
 
             if body.is_empty() {
@@ -800,18 +884,35 @@ fn apply_lambda(
     }
 }
 
-fn apply_builtin(
+fn is_builtin_name(name: &str) -> bool {
+    matches!(
+        name,
+        "+" | "-" | "*" | "/" | "<" | ">" | "=" | "<=" | ">=" | "not"
+            | "cons" | "car" | "cdr" | "null?" | "list" | "map" | "length"
+            | "string?" | "number?" | "boolean?" | "pair?" | "symbol?" | "char?"
+            | "string-append" | "string-length" | "substring"
+            | "string->number" | "number->string" | "symbol->string" | "string->symbol"
+            | "string-copy" | "string-ref" | "string->list" | "list->string"
+            | "char->integer" | "integer->char"
+            | "apply" | "equal?" | "eq?" | "abs" | "modulo" | "remainder"
+            | "append" | "reverse" | "list-ref" | "filter" | "for-each"
+            | "zero?" | "positive?" | "negative?" | "even?" | "odd?"
+            | "min" | "max" | "list?" | "procedure?"
+            | "char-alphabetic?" | "char-numeric?" | "char-whitespace?"
+            | "char-upper-case?" | "char-lower-case?"
+            | "char-upcase" | "char-downcase"
+            | "make-string" | "string"
+            | "display" | "write" | "newline"
+    )
+}
+
+fn call_builtin_values(
     name: &str,
-    args: &[Expr],
-    env: &Env,
+    eval_args: Vec<Value>,
     call_line: usize,
     call_col: usize,
     output: &mut String,
 ) -> Result<Value, EvalError> {
-    let mut eval_args = Vec::with_capacity(args.len());
-    for a in args {
-        eval_args.push(eval(a, env, output)?);
-    }
     match name {
         "+" => {
             let mut sum: i64 = 0;
@@ -978,7 +1079,7 @@ fn apply_builtin(
                 Value::List(items) => {
                     let mut result = Vec::new();
                     for item in items {
-                        let val = apply_lambda(&func, &[item.clone()], call_line, call_col, output)?;
+                        let val = call_value(&func, vec![item.clone()], call_line, call_col, output)?;
                         result.push(val);
                     }
                     Ok(Value::List(result))
@@ -1197,12 +1298,59 @@ fn apply_builtin(
                 None => Err(err_at("integer->char: invalid code point", call_line, call_col)),
             }
         }
+        "apply" => {
+            if eval_args.len() < 2 {
+                return Err(err_at("apply requires at least 2 arguments", call_line, call_col));
+            }
+            let func = eval_args[0].clone();
+            let last = &eval_args[eval_args.len() - 1];
+            let tail_list = match last {
+                Value::List(items) => items.clone(),
+                _ => return Err(err_at("apply: last argument must be a list", call_line, call_col)),
+            };
+            let mut final_args: Vec<Value> = eval_args[1..eval_args.len() - 1].to_vec();
+            final_args.extend(tail_list);
+            call_value(&func, final_args, call_line, call_col, output)
+        }
         _ => Err(err_at(
             format!("unknown procedure: {}", name),
             call_line,
             call_col,
         )),
     }
+}
+
+fn call_value(
+    func: &Value,
+    args: Vec<Value>,
+    call_line: usize,
+    call_col: usize,
+    output: &mut String,
+) -> Result<Value, EvalError> {
+    match func {
+        Value::Lambda { .. } => apply_lambda(func, &args, call_line, call_col, output),
+        Value::Builtin(name) => call_builtin_values(name, args, call_line, call_col, output),
+        _ => Err(err_at(
+            format!("not a procedure: {}", func.to_scheme_string()),
+            call_line,
+            call_col,
+        )),
+    }
+}
+
+fn apply_builtin(
+    name: &str,
+    args: &[Expr],
+    env: &Env,
+    call_line: usize,
+    call_col: usize,
+    output: &mut String,
+) -> Result<Value, EvalError> {
+    let mut eval_args = Vec::with_capacity(args.len());
+    for a in args {
+        eval_args.push(eval(a, env, output)?);
+    }
+    call_builtin_values(name, eval_args, call_line, call_col, output)
 }
 
 fn is_falsy(val: &Value) -> bool {
