@@ -18,6 +18,11 @@ pub enum Value {
         body: Vec<Value>,
         env: Rc<Env>,
     },
+    Macro {
+        literals: Vec<String>,
+        rules: Vec<(Value, Value)>,
+        env: Rc<Env>,
+    },
     Builtin(String),
     Continuation(u64),
     Void,
@@ -56,7 +61,7 @@ impl Value {
         match self {
             Value::String(s) => s.clone(),
             Value::Char(c) => c.to_string(),
-            Value::Continuation(_) => "#<continuation>".to_string(),
+            Value::Continuation(_) | Value::Macro { .. } => "#<continuation>".to_string(),
             other => other.to_string(),
         }
     }
@@ -77,7 +82,7 @@ impl fmt::Display for Value {
             Value::Symbol(s) => write!(f, "{s}"),
             Value::Char(c) => write!(f, "#\\{c}"),
             Value::List(elements) => fmt_list(elements, f),
-            Value::Lambda { .. } | Value::Builtin(_) | Value::Continuation(_) => write!(f, "#<procedure>"),
+            Value::Lambda { .. } | Value::Builtin(_) | Value::Continuation(_) | Value::Macro { .. } => write!(f, "#<procedure>"),
             Value::Void => write!(f, ""),
         }
     }

@@ -6,6 +6,7 @@ pub mod env;
 pub mod error;
 mod io_ops;
 mod list_ops;
+mod macros;
 pub mod parser;
 mod special_forms;
 mod string_ops;
@@ -79,7 +80,7 @@ fn eval_inner(expr: &Value, env: &Rc<Env>) -> Result<Trampoline, EvalError> {
         Value::Integer(_) | Value::Boolean(_) | Value::String(_) | Value::Char(_) | Value::Void => {
             Ok(Trampoline::Done(expr.clone()))
         }
-        Value::Lambda { .. } | Value::Builtin(_) | Value::Continuation(_) => {
+        Value::Lambda { .. } | Value::Builtin(_) | Value::Continuation(_) | Value::Macro { .. } => {
             Ok(Trampoline::Done(expr.clone()))
         }
         Value::Symbol(name) => env
@@ -181,7 +182,17 @@ fn eval_list_form(elements: &[Value], env: &Rc<Env>) -> Result<Trampoline, EvalE
         Value::Symbol(op) if op == "write" => eval_write(args, env).map(Trampoline::Done),
         Value::Symbol(op) if op == "newline" => eval_newline(args, env).map(Trampoline::Done),
         Value::Symbol(op) if op == "apply" => eval_apply(args, env),
+        Value::Symbol(op) if op == "define-syntax" => {
+            macros::eval_define_syntax(args, env).map(Trampoline::Done)
+        }
         _ => {
+            if let Some(result) = macros::try_expand(elements, env) {
+                let (expanded, def_env) = result?;
+                return Ok(Trampoline::Bounce {
+                    expr: expanded,
+                    env: def_env,
+                });
+            }
             let func = eval(operator, env)?;
             let evaluated_args: Vec<Value> =
                 args.iter().map(|a| eval(a, env)).collect::<Result<_, _>>()?;
