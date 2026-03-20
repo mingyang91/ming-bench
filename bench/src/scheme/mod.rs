@@ -45,6 +45,18 @@ impl EnvFrame {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct Span {
+    line: usize,
+    col: usize,
+}
+
+impl std::fmt::Display for Span {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}:{}", self.line, self.col)
+    }
+}
+
 #[derive(Debug, Clone)]
 enum Value {
     Integer(i64),
@@ -52,7 +64,7 @@ enum Value {
     Str(String),
     Symbol(String),
     List(Vec<Value>),
-    Lambda(Vec<String>, Vec<Expr>, EnvRef),
+    Lambda(Vec<String>, Vec<SExpr>, EnvRef),
     Void,
 }
 
@@ -95,27 +107,69 @@ enum Expr {
     Boolean(bool),
     Str(String),
     Symbol(String),
-    List(Vec<Expr>),
+    List(Vec<SExpr>),
 }
 
-fn tokenize(input: &str) -> Vec<String> {
+#[derive(Debug, Clone, PartialEq)]
+struct SExpr {
+    expr: Expr,
+    span: Span,
+}
+
+fn err_at(span: Span, msg: impl std::fmt::Display) -> EvalError {
+    EvalError::Parse(format!("{}: {}", span, msg))
+}
+
+struct Token {
+    text: String,
+    span: Span,
+}
+
+fn tokenize(input: &str) -> Vec<Token> {
     let mut tokens = Vec::new();
     let chars: Vec<char> = input.chars().collect();
     let mut i = 0;
+    let mut line = 1usize;
+    let mut col = 1usize;
     while i < chars.len() {
         match chars[i] {
-            ' ' | '\t' | '\n' | '\r' => i += 1,
-            '(' => { tokens.push("(".to_string()); i += 1; }
-            ')' => { tokens.push(")".to_string()); i += 1; }
+            '\n' => {
+                i += 1;
+                line += 1;
+                col = 1;
+            }
+            ' ' | '\t' | '\r' => {
+                i += 1;
+                col += 1;
+            }
+            '(' => {
+                tokens.push(Token { text: "(".to_string(), span: Span { line, col } });
+                i += 1;
+                col += 1;
+            }
+            ')' => {
+                tokens.push(Token { text: ")".to_string(), span: Span { line, col } });
+                i += 1;
+                col += 1;
+            }
             '"' => {
+                let start = Span { line, col };
                 let mut s = String::from('"');
                 i += 1;
+                col += 1;
                 while i < chars.len() && chars[i] != '"' {
                     if chars[i] == '\\' && i + 1 < chars.len() {
                         s.push(chars[i]);
                         s.push(chars[i + 1]);
                         i += 2;
+                        col += 2;
                     } else {
+                        if chars[i] == '\n' {
+                            line += 1;
+                            col = 1;
+                        } else {
+                            col += 1;
+                        }
                         s.push(chars[i]);
                         i += 1;
                     }
@@ -123,52 +177,75 @@ fn tokenize(input: &str) -> Vec<String> {
                 if i < chars.len() {
                     s.push('"');
                     i += 1;
+                    col += 1;
                 }
-                tokens.push(s);
+                tokens.push(Token { text: s, span: start });
             }
             ';' => {
                 while i < chars.len() && chars[i] != '\n' {
                     i += 1;
                 }
             }
-            '\'' => { tokens.push("'".to_string()); i += 1; }
+            '\'' => {
+                tokens.push(Token { text: "'".to_string(), span: Span { line, col } });
+                i += 1;
+                col += 1;
+            }
             _ => {
+                let start = Span { line, col };
                 let mut s = String::new();
-                while i < chars.len() && !matches!(chars[i], ' ' | '\t' | '\n' | '\r' | '(' | ')' | ';' | '\'') {
+                while i < chars.len()
+                    && !matches!(
+                        chars[i],
+                        ' ' | '\t' | '\n' | '\r' | '(' | ')' | ';' | '\''
+                    )
+                {
                     s.push(chars[i]);
                     i += 1;
+                    col += 1;
                 }
-                tokens.push(s);
+                tokens.push(Token { text: s, span: start });
             }
         }
     }
     tokens
 }
 
-fn parse(tokens: &[String], pos: usize) -> Result<(Expr, usize), EvalError> {
+fn parse(tokens: &[Token], pos: usize) -> Result<(SExpr, usize), EvalError> {
     if pos >= tokens.len() {
-        return Err(EvalError::Parse("unexpected end of input".to_string()));
+        return Err(EvalError::Parse("1:1: unexpected end of input".to_string()));
     }
-    let token = &tokens[pos];
-    if token == "(" {
+    let tok = &tokens[pos];
+    let span = tok.span;
+    if tok.text == "(" {
         let mut elems = Vec::new();
         let mut i = pos + 1;
-        while i < tokens.len() && tokens[i] != ")" {
+        while i < tokens.len() && tokens[i].text != ")" {
             let (expr, next) = parse(tokens, i)?;
             elems.push(expr);
             i = next;
         }
         if i >= tokens.len() {
-            return Err(EvalError::Parse("missing closing paren".to_string()));
+            return Err(err_at(span, "missing closing paren"));
         }
-        Ok((Expr::List(elems), i + 1))
-    } else if token == ")" {
-        Err(EvalError::Parse("unexpected )".to_string()))
-    } else if token == "'" {
+        Ok((SExpr { expr: Expr::List(elems), span }, i + 1))
+    } else if tok.text == ")" {
+        Err(err_at(span, "unexpected )"))
+    } else if tok.text == "'" {
         let (inner, next) = parse(tokens, pos + 1)?;
-        Ok((Expr::List(vec![Expr::Symbol("quote".to_string()), inner]), next))
+        let quote_sym = SExpr {
+            expr: Expr::Symbol("quote".to_string()),
+            span,
+        };
+        Ok((
+            SExpr {
+                expr: Expr::List(vec![quote_sym, inner]),
+                span,
+            },
+            next,
+        ))
     } else {
-        Ok((parse_atom(token)?, pos + 1))
+        Ok((SExpr { expr: parse_atom(&tok.text)?, span }, pos + 1))
     }
 }
 
@@ -189,7 +266,7 @@ fn parse_atom(token: &str) -> Result<Expr, EvalError> {
     Ok(Expr::Symbol(token.to_string()))
 }
 
-fn parse_all(input: &str) -> Result<Vec<Expr>, EvalError> {
+fn parse_all(input: &str) -> Result<Vec<SExpr>, EvalError> {
     let tokens = tokenize(input);
     let mut exprs = Vec::new();
     let mut pos = 0;
@@ -201,101 +278,108 @@ fn parse_all(input: &str) -> Result<Vec<Expr>, EvalError> {
     Ok(exprs)
 }
 
-fn expr_to_value(expr: &Expr) -> Value {
-    match expr {
+fn sexpr_to_value(se: &SExpr) -> Value {
+    match &se.expr {
         Expr::Integer(n) => Value::Integer(*n),
         Expr::Boolean(b) => Value::Boolean(*b),
         Expr::Str(s) => Value::Str(s.clone()),
         Expr::Symbol(s) => Value::Symbol(s.clone()),
-        Expr::List(elems) => Value::List(elems.iter().map(expr_to_value).collect()),
+        Expr::List(elems) => Value::List(elems.iter().map(sexpr_to_value).collect()),
     }
 }
 
-fn eval_expr(expr: &Expr, env: &EnvRef) -> Result<Value, EvalError> {
-    match expr {
+fn eval_expr(se: &SExpr, env: &EnvRef) -> Result<Value, EvalError> {
+    let span = se.span;
+    match &se.expr {
         Expr::Integer(n) => Ok(Value::Integer(*n)),
         Expr::Boolean(b) => Ok(Value::Boolean(*b)),
         Expr::Str(s) => Ok(Value::Str(s.clone())),
         Expr::Symbol(s) => EnvFrame::get(env, s)
-            .ok_or_else(|| EvalError::Parse(format!("unbound variable: {}", s))),
+            .ok_or_else(|| err_at(span, format!("unbound variable: {}", s))),
         Expr::List(elems) => {
             if elems.is_empty() {
-                return Err(EvalError::Parse("empty application".to_string()));
+                return Err(err_at(span, "empty application"));
             }
-            // Check for special forms
-            if let Expr::Symbol(op) = &elems[0] {
+            if let Expr::Symbol(op) = &elems[0].expr {
                 match op.as_str() {
                     "define" => {
                         if elems.len() < 3 {
-                            return Err(EvalError::Parse("define requires exactly 2 arguments".to_string()));
+                            return Err(err_at(span, "define requires exactly 2 arguments"));
                         }
-                        match &elems[1] {
+                        match &elems[1].expr {
                             Expr::Symbol(name) => {
                                 if elems.len() != 3 {
-                                    return Err(EvalError::Parse("define requires exactly 2 arguments".to_string()));
+                                    return Err(err_at(span, "define requires exactly 2 arguments"));
                                 }
                                 let val = eval_expr(&elems[2], env)?;
-                                // For recursive lambdas: patch the closure env
                                 if let Value::Lambda(params, body, closure_env) = &val {
-                                    let val = Value::Lambda(params.clone(), body.clone(), Rc::clone(closure_env));
+                                    let val = Value::Lambda(
+                                        params.clone(),
+                                        body.clone(),
+                                        Rc::clone(closure_env),
+                                    );
                                     EnvFrame::set(env, name.clone(), val.clone());
-                                    // Make the lambda visible in its own closure for recursion
                                     EnvFrame::set(closure_env, name.clone(), val);
                                 } else {
                                     EnvFrame::set(env, name.clone(), val);
                                 }
                                 Ok(Value::Void)
                             }
-                            // Shorthand: (define (f x y) body...) => (define f (lambda (x y) body...))
                             Expr::List(name_and_params) => {
                                 if name_and_params.is_empty() {
-                                    return Err(EvalError::Parse("define shorthand requires a name".to_string()));
+                                    return Err(err_at(
+                                        span,
+                                        "define shorthand requires a name",
+                                    ));
                                 }
-                                if let Expr::Symbol(name) = &name_and_params[0] {
+                                if let Expr::Symbol(name) = &name_and_params[0].expr {
                                     let params: Result<Vec<String>, _> = name_and_params[1..]
                                         .iter()
-                                        .map(|p| match p {
+                                        .map(|p| match &p.expr {
                                             Expr::Symbol(s) => Ok(s.clone()),
-                                            _ => Err(EvalError::Parse("parameter must be a symbol".to_string())),
+                                            _ => Err(err_at(
+                                                p.span,
+                                                "parameter must be a symbol",
+                                            )),
                                         })
                                         .collect();
                                     let params = params?;
-                                    let body: Vec<Expr> = elems[2..].to_vec();
+                                    let body: Vec<SExpr> = elems[2..].to_vec();
                                     let closure_env = Rc::clone(env);
-                                    let val = Value::Lambda(params, body, closure_env.clone());
+                                    let val =
+                                        Value::Lambda(params, body, closure_env.clone());
                                     EnvFrame::set(env, name.clone(), val.clone());
-                                    // Recursion support
                                     EnvFrame::set(&closure_env, name.clone(), val);
                                     Ok(Value::Void)
                                 } else {
-                                    Err(EvalError::Parse("define requires a symbol as name".to_string()))
+                                    Err(err_at(span, "define requires a symbol as name"))
                                 }
                             }
-                            _ => Err(EvalError::Parse("define requires a symbol or list".to_string())),
+                            _ => Err(err_at(span, "define requires a symbol or list")),
                         }
                     }
                     "lambda" => {
                         if elems.len() < 3 {
-                            return Err(EvalError::Parse("lambda requires params and body".to_string()));
+                            return Err(err_at(span, "lambda requires params and body"));
                         }
-                        if let Expr::List(param_exprs) = &elems[1] {
+                        if let Expr::List(param_exprs) = &elems[1].expr {
                             let params: Result<Vec<String>, _> = param_exprs
                                 .iter()
-                                .map(|p| match p {
+                                .map(|p| match &p.expr {
                                     Expr::Symbol(s) => Ok(s.clone()),
-                                    _ => Err(EvalError::Parse("parameter must be a symbol".to_string())),
+                                    _ => Err(err_at(p.span, "parameter must be a symbol")),
                                 })
                                 .collect();
                             let params = params?;
-                            let body: Vec<Expr> = elems[2..].to_vec();
+                            let body: Vec<SExpr> = elems[2..].to_vec();
                             Ok(Value::Lambda(params, body, Rc::clone(env)))
                         } else {
-                            Err(EvalError::Parse("lambda params must be a list".to_string()))
+                            Err(err_at(span, "lambda params must be a list"))
                         }
                     }
                     "if" => {
                         if elems.len() < 3 || elems.len() > 4 {
-                            return Err(EvalError::Parse("if requires 2 or 3 arguments".to_string()));
+                            return Err(err_at(span, "if requires 2 or 3 arguments"));
                         }
                         let cond = eval_expr(&elems[1], env)?;
                         if !is_false(&cond) {
@@ -308,28 +392,28 @@ fn eval_expr(expr: &Expr, env: &EnvRef) -> Result<Value, EvalError> {
                     }
                     "quote" => {
                         if elems.len() != 2 {
-                            return Err(EvalError::Parse("quote requires exactly 1 argument".to_string()));
+                            return Err(err_at(span, "quote requires exactly 1 argument"));
                         }
-                        Ok(expr_to_value(&elems[1]))
+                        Ok(sexpr_to_value(&elems[1]))
                     }
                     "+" => {
                         let mut sum: i64 = 0;
                         for arg in &elems[1..] {
-                            sum += require_int(&eval_expr(arg, env)?)?;
+                            sum += require_int(&eval_expr(arg, env)?, arg.span)?;
                         }
                         Ok(Value::Integer(sum))
                     }
                     "-" => {
                         if elems.len() < 2 {
-                            return Err(EvalError::Parse("- requires at least one argument".to_string()));
+                            return Err(err_at(span, "- requires at least one argument"));
                         }
-                        let first = require_int(&eval_expr(&elems[1], env)?)?;
+                        let first = require_int(&eval_expr(&elems[1], env)?, elems[1].span)?;
                         if elems.len() == 2 {
                             Ok(Value::Integer(-first))
                         } else {
                             let mut result = first;
                             for arg in &elems[2..] {
-                                result -= require_int(&eval_expr(arg, env)?)?;
+                                result -= require_int(&eval_expr(arg, env)?, arg.span)?;
                             }
                             Ok(Value::Integer(result))
                         }
@@ -337,47 +421,48 @@ fn eval_expr(expr: &Expr, env: &EnvRef) -> Result<Value, EvalError> {
                     "*" => {
                         let mut product: i64 = 1;
                         for arg in &elems[1..] {
-                            product *= require_int(&eval_expr(arg, env)?)?;
+                            product *= require_int(&eval_expr(arg, env)?, arg.span)?;
                         }
                         Ok(Value::Integer(product))
                     }
                     "/" => {
                         if elems.len() < 3 {
-                            return Err(EvalError::Parse("/ requires at least two arguments".to_string()));
+                            return Err(err_at(span, "/ requires at least two arguments"));
                         }
-                        let mut result = require_int(&eval_expr(&elems[1], env)?)?;
+                        let mut result =
+                            require_int(&eval_expr(&elems[1], env)?, elems[1].span)?;
                         for arg in &elems[2..] {
-                            let divisor = require_int(&eval_expr(arg, env)?)?;
+                            let divisor = require_int(&eval_expr(arg, env)?, arg.span)?;
                             if divisor == 0 {
-                                return Err(EvalError::Parse("division by zero".to_string()));
+                                return Err(err_at(arg.span, "division by zero"));
                             }
                             result /= divisor;
                         }
                         Ok(Value::Integer(result))
                     }
                     "<" => {
-                        let (a, b) = require_two_ints(&elems[1..], "<", env)?;
+                        let (a, b) = require_two_ints(&elems[1..], "<", span, env)?;
                         Ok(Value::Boolean(a < b))
                     }
                     ">" => {
-                        let (a, b) = require_two_ints(&elems[1..], ">", env)?;
+                        let (a, b) = require_two_ints(&elems[1..], ">", span, env)?;
                         Ok(Value::Boolean(a > b))
                     }
                     "=" => {
-                        let (a, b) = require_two_ints(&elems[1..], "=", env)?;
+                        let (a, b) = require_two_ints(&elems[1..], "=", span, env)?;
                         Ok(Value::Boolean(a == b))
                     }
                     "<=" => {
-                        let (a, b) = require_two_ints(&elems[1..], "<=", env)?;
+                        let (a, b) = require_two_ints(&elems[1..], "<=", span, env)?;
                         Ok(Value::Boolean(a <= b))
                     }
                     ">=" => {
-                        let (a, b) = require_two_ints(&elems[1..], ">=", env)?;
+                        let (a, b) = require_two_ints(&elems[1..], ">=", span, env)?;
                         Ok(Value::Boolean(a >= b))
                     }
                     "not" => {
                         if elems.len() != 2 {
-                            return Err(EvalError::Parse("not requires exactly one argument".to_string()));
+                            return Err(err_at(span, "not requires exactly one argument"));
                         }
                         let val = eval_expr(&elems[1], env)?;
                         Ok(Value::Boolean(is_false(&val)))
@@ -404,7 +489,7 @@ fn eval_expr(expr: &Expr, env: &EnvRef) -> Result<Value, EvalError> {
                     }
                     "cons" => {
                         if elems.len() != 3 {
-                            return Err(EvalError::Parse("cons requires exactly 2 arguments".to_string()));
+                            return Err(err_at(span, "cons requires exactly 2 arguments"));
                         }
                         let head = eval_expr(&elems[1], env)?;
                         let tail = eval_expr(&elems[2], env)?;
@@ -413,35 +498,48 @@ fn eval_expr(expr: &Expr, env: &EnvRef) -> Result<Value, EvalError> {
                                 v.insert(0, head);
                                 Ok(Value::List(v))
                             }
-                            _ => Err(EvalError::Parse("cons: second argument must be a list".to_string())),
+                            _ => Err(err_at(
+                                span,
+                                "cons: second argument must be a list",
+                            )),
                         }
                     }
                     "car" => {
                         if elems.len() != 2 {
-                            return Err(EvalError::Parse("car requires exactly 1 argument".to_string()));
+                            return Err(err_at(span, "car requires exactly 1 argument"));
                         }
                         let val = eval_expr(&elems[1], env)?;
                         match val {
                             Value::List(v) if !v.is_empty() => Ok(v[0].clone()),
-                            _ => Err(EvalError::Parse("car: argument must be a non-empty list".to_string())),
+                            _ => Err(err_at(
+                                span,
+                                "car: argument must be a non-empty list",
+                            )),
                         }
                     }
                     "cdr" => {
                         if elems.len() != 2 {
-                            return Err(EvalError::Parse("cdr requires exactly 1 argument".to_string()));
+                            return Err(err_at(span, "cdr requires exactly 1 argument"));
                         }
                         let val = eval_expr(&elems[1], env)?;
                         match val {
-                            Value::List(v) if !v.is_empty() => Ok(Value::List(v[1..].to_vec())),
-                            _ => Err(EvalError::Parse("cdr: argument must be a non-empty list".to_string())),
+                            Value::List(v) if !v.is_empty() => {
+                                Ok(Value::List(v[1..].to_vec()))
+                            }
+                            _ => Err(err_at(
+                                span,
+                                "cdr: argument must be a non-empty list",
+                            )),
                         }
                     }
                     "null?" => {
                         if elems.len() != 2 {
-                            return Err(EvalError::Parse("null? requires exactly 1 argument".to_string()));
+                            return Err(err_at(span, "null? requires exactly 1 argument"));
                         }
                         let val = eval_expr(&elems[1], env)?;
-                        Ok(Value::Boolean(matches!(val, Value::List(ref v) if v.is_empty())))
+                        Ok(Value::Boolean(
+                            matches!(val, Value::List(ref v) if v.is_empty()),
+                        ))
                     }
                     "list" => {
                         let mut items = Vec::new();
@@ -452,47 +550,64 @@ fn eval_expr(expr: &Expr, env: &EnvRef) -> Result<Value, EvalError> {
                     }
                     "string?" => {
                         if elems.len() != 2 {
-                            return Err(EvalError::Parse("string? requires exactly 1 argument".to_string()));
+                            return Err(err_at(
+                                span,
+                                "string? requires exactly 1 argument",
+                            ));
                         }
                         let val = eval_expr(&elems[1], env)?;
                         Ok(Value::Boolean(matches!(val, Value::Str(_))))
                     }
                     "number?" => {
                         if elems.len() != 2 {
-                            return Err(EvalError::Parse("number? requires exactly 1 argument".to_string()));
+                            return Err(err_at(
+                                span,
+                                "number? requires exactly 1 argument",
+                            ));
                         }
                         let val = eval_expr(&elems[1], env)?;
                         Ok(Value::Boolean(matches!(val, Value::Integer(_))))
                     }
                     "boolean?" => {
                         if elems.len() != 2 {
-                            return Err(EvalError::Parse("boolean? requires exactly 1 argument".to_string()));
+                            return Err(err_at(
+                                span,
+                                "boolean? requires exactly 1 argument",
+                            ));
                         }
                         let val = eval_expr(&elems[1], env)?;
                         Ok(Value::Boolean(matches!(val, Value::Boolean(_))))
                     }
                     "pair?" => {
                         if elems.len() != 2 {
-                            return Err(EvalError::Parse("pair? requires exactly 1 argument".to_string()));
+                            return Err(err_at(span, "pair? requires exactly 1 argument"));
                         }
                         let val = eval_expr(&elems[1], env)?;
-                        Ok(Value::Boolean(matches!(val, Value::List(ref v) if !v.is_empty())))
+                        Ok(Value::Boolean(
+                            matches!(val, Value::List(ref v) if !v.is_empty()),
+                        ))
                     }
                     "symbol?" => {
                         if elems.len() != 2 {
-                            return Err(EvalError::Parse("symbol? requires exactly 1 argument".to_string()));
+                            return Err(err_at(
+                                span,
+                                "symbol? requires exactly 1 argument",
+                            ));
                         }
                         let val = eval_expr(&elems[1], env)?;
                         Ok(Value::Boolean(matches!(val, Value::Symbol(_))))
                     }
                     "length" => {
                         if elems.len() != 2 {
-                            return Err(EvalError::Parse("length requires exactly 1 argument".to_string()));
+                            return Err(err_at(
+                                span,
+                                "length requires exactly 1 argument",
+                            ));
                         }
                         let val = eval_expr(&elems[1], env)?;
                         match val {
                             Value::List(v) => Ok(Value::Integer(v.len() as i64)),
-                            _ => Err(EvalError::Parse("length: argument must be a list".to_string())),
+                            _ => Err(err_at(span, "length: argument must be a list")),
                         }
                     }
                     "begin" => {
@@ -504,24 +619,40 @@ fn eval_expr(expr: &Expr, env: &EnvRef) -> Result<Value, EvalError> {
                     }
                     "let" => {
                         if elems.len() < 3 {
-                            return Err(EvalError::Parse("let requires bindings and body".to_string()));
+                            return Err(err_at(
+                                span,
+                                "let requires bindings and body",
+                            ));
                         }
-                        let bindings = match &elems[1] {
+                        let bindings = match &elems[1].expr {
                             Expr::List(b) => b,
-                            _ => return Err(EvalError::Parse("let bindings must be a list".to_string())),
+                            _ => {
+                                return Err(err_at(
+                                    elems[1].span,
+                                    "let bindings must be a list",
+                                ))
+                            }
                         };
                         let let_env = EnvFrame::child(env);
                         for binding in bindings {
-                            match binding {
+                            match &binding.expr {
                                 Expr::List(pair) if pair.len() == 2 => {
-                                    if let Expr::Symbol(name) = &pair[0] {
+                                    if let Expr::Symbol(name) = &pair[0].expr {
                                         let val = eval_expr(&pair[1], env)?;
                                         EnvFrame::set(&let_env, name.clone(), val);
                                     } else {
-                                        return Err(EvalError::Parse("let binding name must be a symbol".to_string()));
+                                        return Err(err_at(
+                                            pair[0].span,
+                                            "let binding name must be a symbol",
+                                        ));
                                     }
                                 }
-                                _ => return Err(EvalError::Parse("let binding must be a pair".to_string())),
+                                _ => {
+                                    return Err(err_at(
+                                        binding.span,
+                                        "let binding must be a pair",
+                                    ))
+                                }
                             }
                         }
                         let mut result = Value::Void;
@@ -532,9 +663,9 @@ fn eval_expr(expr: &Expr, env: &EnvRef) -> Result<Value, EvalError> {
                     }
                     "cond" => {
                         for clause in &elems[1..] {
-                            match clause {
+                            match &clause.expr {
                                 Expr::List(parts) if !parts.is_empty() => {
-                                    if let Expr::Symbol(s) = &parts[0] {
+                                    if let Expr::Symbol(s) = &parts[0].expr {
                                         if s == "else" {
                                             let mut result = Value::Void;
                                             for expr in &parts[1..] {
@@ -552,36 +683,36 @@ fn eval_expr(expr: &Expr, env: &EnvRef) -> Result<Value, EvalError> {
                                         return Ok(result);
                                     }
                                 }
-                                _ => return Err(EvalError::Parse("cond clause must be a list".to_string())),
+                                _ => {
+                                    return Err(err_at(
+                                        clause.span,
+                                        "cond clause must be a list",
+                                    ))
+                                }
                             }
                         }
                         Ok(Value::Void)
                     }
-                    _ => {
-                        // Not a special form, try as procedure call
-                        apply_proc(elems, env)
-                    }
+                    _ => apply_proc(elems, span, env),
                 }
             } else {
-                // Operator is not a symbol — evaluate it (e.g., ((lambda ...) args))
-                apply_proc(elems, env)
+                apply_proc(elems, span, env)
             }
         }
     }
 }
 
-fn apply_proc(elems: &[Expr], env: &EnvRef) -> Result<Value, EvalError> {
+fn apply_proc(elems: &[SExpr], call_span: Span, env: &EnvRef) -> Result<Value, EvalError> {
     let func = eval_expr(&elems[0], env)?;
     let args: Result<Vec<Value>, _> = elems[1..].iter().map(|a| eval_expr(a, env)).collect();
     let args = args?;
     match func {
         Value::Lambda(params, body, closure_env) => {
             if params.len() != args.len() {
-                return Err(EvalError::Parse(format!(
-                    "expected {} arguments, got {}",
-                    params.len(),
-                    args.len()
-                )));
+                return Err(err_at(
+                    call_span,
+                    format!("expected {} arguments, got {}", params.len(), args.len()),
+                ));
             }
             let call_env = EnvFrame::child(&closure_env);
             for (param, arg) in params.iter().zip(args) {
@@ -593,7 +724,7 @@ fn apply_proc(elems: &[Expr], env: &EnvRef) -> Result<Value, EvalError> {
             }
             Ok(result)
         }
-        _ => Err(EvalError::Parse("not a procedure".to_string())),
+        _ => Err(err_at(call_span, "not a procedure")),
     }
 }
 
@@ -601,19 +732,27 @@ fn is_false(val: &Value) -> bool {
     matches!(val, Value::Boolean(false))
 }
 
-fn require_two_ints(args: &[Expr], op: &str, env: &EnvRef) -> Result<(i64, i64), EvalError> {
+fn require_two_ints(
+    args: &[SExpr],
+    op: &str,
+    call_span: Span,
+    env: &EnvRef,
+) -> Result<(i64, i64), EvalError> {
     if args.len() != 2 {
-        return Err(EvalError::Parse(format!("{} requires exactly two arguments", op)));
+        return Err(err_at(
+            call_span,
+            format!("{} requires exactly two arguments", op),
+        ));
     }
-    let a = require_int(&eval_expr(&args[0], env)?)?;
-    let b = require_int(&eval_expr(&args[1], env)?)?;
+    let a = require_int(&eval_expr(&args[0], env)?, args[0].span)?;
+    let b = require_int(&eval_expr(&args[1], env)?, args[1].span)?;
     Ok((a, b))
 }
 
-fn require_int(val: &Value) -> Result<i64, EvalError> {
+fn require_int(val: &Value, span: Span) -> Result<i64, EvalError> {
     match val {
         Value::Integer(n) => Ok(*n),
-        _ => Err(EvalError::Parse("expected integer".to_string())),
+        _ => Err(err_at(span, "expected integer")),
     }
 }
 
@@ -628,7 +767,7 @@ fn require_int(val: &Value) -> Result<i64, EvalError> {
 pub fn eval_str(input: &str) -> Result<String, EvalError> {
     let exprs = parse_all(input)?;
     if exprs.is_empty() {
-        return Err(EvalError::Parse("empty input".to_string()));
+        return Err(EvalError::Parse("1:1: empty input".to_string()));
     }
     let env = EnvFrame::new();
     let mut result = Value::Boolean(false);
