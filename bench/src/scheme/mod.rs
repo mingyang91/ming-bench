@@ -441,6 +441,36 @@ fn apply_builtin(name: &str, args: &[Value], env: &mut Env) -> Result<Value, Eva
                 _ => Err(EvalError::Parse("length: argument must be a list".to_string())),
             }
         }
+        "string?" => {
+            if eval_args.len() != 1 {
+                return Err(EvalError::Parse("string? requires 1 argument".to_string()));
+            }
+            Ok(Value::Boolean(matches!(&eval_args[0], Value::Str(_))))
+        }
+        "number?" => {
+            if eval_args.len() != 1 {
+                return Err(EvalError::Parse("number? requires 1 argument".to_string()));
+            }
+            Ok(Value::Boolean(matches!(&eval_args[0], Value::Integer(_))))
+        }
+        "boolean?" => {
+            if eval_args.len() != 1 {
+                return Err(EvalError::Parse("boolean? requires 1 argument".to_string()));
+            }
+            Ok(Value::Boolean(matches!(&eval_args[0], Value::Boolean(_))))
+        }
+        "pair?" => {
+            if eval_args.len() != 1 {
+                return Err(EvalError::Parse("pair? requires 1 argument".to_string()));
+            }
+            Ok(Value::Boolean(matches!(&eval_args[0], Value::List(items) if !items.is_empty())))
+        }
+        "symbol?" => {
+            if eval_args.len() != 1 {
+                return Err(EvalError::Parse("symbol? requires 1 argument".to_string()));
+            }
+            Ok(Value::Boolean(matches!(&eval_args[0], Value::Symbol(_))))
+        }
         _ => Err(EvalError::Parse(format!("unknown procedure: {}", name))),
     }
 }
