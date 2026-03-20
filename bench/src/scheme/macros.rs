@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::rc::Rc;
 
 use crate::scheme::env::Env;
@@ -70,12 +70,19 @@ pub(crate) fn eval_define_syntax(args: &[Value], env: &Rc<Env>) -> Result<Value,
     Ok(Value::Void)
 }
 
-/// Try to expand a macro invocation. Returns `Some((expanded, def_env))` if
-/// the operator resolves to a macro, `None` otherwise.
+/// Free variable bindings from the macro's definition-site environment.
+/// Each entry is (name, value) for template-introduced symbols found in def_env.
+pub(crate) type FreeBindings = Vec<(String, Value)>;
+
+/// Result of a macro expansion: (expanded form, definition env, free bindings).
+pub(crate) type ExpandResult = Result<(Value, Rc<Env>, FreeBindings), EvalError>;
+
+/// Try to expand a macro invocation. Returns `Some((expanded, def_env, free_bindings))`
+/// if the operator resolves to a macro, `None` otherwise.
 pub(crate) fn try_expand(
     elements: &[Value],
     env: &Rc<Env>,
-) -> Option<Result<(Value, Rc<Env>), EvalError>> {
+) -> Option<ExpandResult> {
     let Value::Symbol(op) = elements.first()? else {
         return None;
     };
@@ -97,19 +104,49 @@ fn expand(
     literals: &[String],
     rules: &[(Value, Value)],
     def_env: &Rc<Env>,
-) -> Result<(Value, Rc<Env>), EvalError> {
+) -> Result<(Value, Rc<Env>, FreeBindings), EvalError> {
     for (pattern, template) in rules {
         let Value::List(pat_elems) = pattern else {
             continue;
         };
         if let Some(bindings) = match_pattern(pat_elems, input, literals) {
+            let pattern_vars: HashSet<&String> = bindings.keys().collect();
             let expanded = instantiate(template, &bindings);
-            return Ok((expanded, Rc::clone(def_env)));
+            // Collect free variable bindings: template symbols that are NOT
+            // pattern variables but ARE bound in def_env (for hygiene).
+            let mut free_vars = HashSet::new();
+            collect_free_vars(template, &pattern_vars, &mut free_vars);
+            let free_bindings: FreeBindings = free_vars
+                .into_iter()
+                .filter_map(|name| def_env.get(&name).map(|val| (name, val)))
+                .collect();
+            return Ok((expanded, Rc::clone(def_env), free_bindings));
         }
     }
     Err(EvalError::BadSyntax {
         form: "macro expansion".into(),
     })
+}
+
+/// Collect template-introduced free variable names (symbols that are not
+/// pattern variables and not `...`).
+fn collect_free_vars(
+    template: &Value,
+    pattern_vars: &HashSet<&String>,
+    free_vars: &mut HashSet<String>,
+) {
+    match template {
+        Value::Symbol(name) if name == "..." => {}
+        Value::Symbol(name) if !pattern_vars.contains(name) => {
+            free_vars.insert(name.clone());
+        }
+        Value::List(elems) => {
+            for elem in elems {
+                collect_free_vars(elem, pattern_vars, free_vars);
+            }
+        }
+        _ => {}
+    }
 }
 
 // ── Pattern matching ────────────────────────────────────────────────

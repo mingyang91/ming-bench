@@ -17,6 +17,7 @@ pub(crate) fn next_cont_id() -> u64 {
 pub(crate) struct ContinuationCapture {
     pub exprs: Vec<(Value, Span)>,
     pub env: Rc<Env>,
+    pub start_index: usize,
 }
 
 thread_local! {
@@ -26,6 +27,8 @@ thread_local! {
     static RESUME_VALUE: RefCell<Option<Value>> = const { RefCell::new(None) };
     /// Current top-level expression context (remaining exprs + env).
     static TOP_LEVEL_CTX: RefCell<Option<TopLevelCtx>> = const { RefCell::new(None) };
+    /// Absolute index of the currently evaluating top-level expression.
+    static ABSOLUTE_INDEX: RefCell<Option<usize>> = const { RefCell::new(None) };
 }
 
 struct TopLevelCtx {
@@ -57,6 +60,7 @@ pub(crate) fn register_capture_from_ctx(id: u64) {
         ctx.as_ref().map(|tlc| ContinuationCapture {
             exprs: tlc.all_exprs[tlc.current_index..].to_vec(),
             env: Rc::clone(&tlc.env),
+            start_index: tlc.current_index,
         })
     });
     if let Some(cap) = capture {
@@ -70,8 +74,19 @@ pub(crate) fn get_capture(id: u64) -> Option<ContinuationCapture> {
         c.borrow().get(&id).map(|cap| ContinuationCapture {
             exprs: cap.exprs.clone(),
             env: Rc::clone(&cap.env),
+            start_index: cap.start_index,
         })
     })
+}
+
+/// Return the absolute index of the top-level expression currently being evaluated.
+pub(crate) fn current_top_level_index() -> Option<usize> {
+    ABSOLUTE_INDEX.with(|idx| *idx.borrow())
+}
+
+/// Set the absolute index of the currently evaluating top-level expression.
+pub(crate) fn set_absolute_index(idx: usize) {
+    ABSOLUTE_INDEX.with(|ai| *ai.borrow_mut() = Some(idx));
 }
 
 pub(crate) fn set_resume_value(val: Value) {
