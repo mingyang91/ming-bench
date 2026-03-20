@@ -113,6 +113,9 @@ pub(crate) fn eval(expr: &Value, env: &Rc<Env>) -> Result<Value, EvalError> {
                 {
                     eval_type_pred(op, args, env)
                 }
+                Value::Symbol(op) if op == "display" => eval_display(args, env),
+                Value::Symbol(op) if op == "write" => eval_write(args, env),
+                Value::Symbol(op) if op == "newline" => eval_newline(args, env),
                 _ => {
                     let func = eval(operator, env)?;
                     let evaluated_args: Vec<Value> =
@@ -122,6 +125,41 @@ pub(crate) fn eval(expr: &Value, env: &Rc<Env>) -> Result<Value, EvalError> {
             }
         }
     }
+}
+
+fn eval_display(args: &[Value], env: &Rc<Env>) -> Result<Value, EvalError> {
+    let [arg] = args else {
+        return Err(EvalError::WrongArgCount {
+            expected: "1".into(),
+            got: args.len(),
+        });
+    };
+    let val = eval(arg, env)?;
+    env.write_output(&val.display_str());
+    Ok(Value::Void)
+}
+
+fn eval_write(args: &[Value], env: &Rc<Env>) -> Result<Value, EvalError> {
+    let [arg] = args else {
+        return Err(EvalError::WrongArgCount {
+            expected: "1".into(),
+            got: args.len(),
+        });
+    };
+    let val = eval(arg, env)?;
+    env.write_output(&val.write_str());
+    Ok(Value::Void)
+}
+
+fn eval_newline(args: &[Value], env: &Rc<Env>) -> Result<Value, EvalError> {
+    if !args.is_empty() {
+        return Err(EvalError::WrongArgCount {
+            expected: "0".into(),
+            got: args.len(),
+        });
+    }
+    env.write_output("\n");
+    Ok(Value::Void)
 }
 
 /// Evaluate one or more Scheme expressions and return the string
@@ -148,8 +186,26 @@ pub fn eval_str(input: &str) -> Result<String, EvalError> {
 
 /// Evaluate Scheme expressions, returning both the result value and
 /// any output produced by `display`, `write`, or `newline`.
-pub fn eval_str_with_output(_input: &str) -> Result<(String, String), EvalError> {
-    todo!()
+pub fn eval_str_with_output(input: &str) -> Result<(String, String), EvalError> {
+    let expressions = parser::parse_spanned(input)?;
+    if expressions.is_empty() {
+        return Err(EvalError::EmptyInput);
+    }
+    let env = Env::new();
+    let mut last = Value::Void;
+    for (expr, span) in &expressions {
+        last = eval(expr, &env).map_err(|e| EvalError::AtPosition {
+            error: Box::new(e),
+            line: span.line,
+            col: span.col,
+        })?;
+    }
+    let output = env.take_output();
+    let result = match last {
+        Value::Void => String::new(),
+        val => val.to_string(),
+    };
+    Ok((result, output))
 }
 
 #[cfg(test)]

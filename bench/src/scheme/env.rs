@@ -10,6 +10,7 @@ use super::value::Value;
 pub struct Env {
     bindings: RefCell<HashMap<String, Value>>,
     parent: Option<Rc<Env>>,
+    output: Rc<RefCell<String>>,
 }
 
 impl fmt::Debug for Env {
@@ -23,14 +24,26 @@ impl Env {
         Rc::new(Self {
             bindings: RefCell::new(HashMap::new()),
             parent: None,
+            output: Rc::new(RefCell::new(String::new())),
         })
     }
 
     pub fn child(parent: &Rc<Env>) -> Rc<Self> {
         Rc::new(Self {
             bindings: RefCell::new(HashMap::new()),
+            output: Rc::clone(&parent.output),
             parent: Some(Rc::clone(parent)),
         })
+    }
+
+    /// Write to the shared output buffer.
+    pub fn write_output(&self, s: &str) {
+        self.output.borrow_mut().push_str(s);
+    }
+
+    /// Take the accumulated output, leaving the buffer empty.
+    pub fn take_output(&self) -> String {
+        self.output.borrow_mut().split_off(0)
     }
 
     pub fn get(&self, name: &str) -> Option<Value> {

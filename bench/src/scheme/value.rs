@@ -44,6 +44,21 @@ fn fmt_list(elements: &[Value], f: &mut fmt::Formatter<'_>) -> fmt::Result {
     write!(f, ")")
 }
 
+impl Value {
+    /// Format as `display` would — strings without quotes.
+    pub fn display_str(&self) -> String {
+        match self {
+            Value::String(s) => s.clone(),
+            other => other.to_string(),
+        }
+    }
+
+    /// Format as `write` would — strings with quotes (same as Display).
+    pub fn write_str(&self) -> String {
+        self.to_string()
+    }
+}
+
 impl fmt::Display for Value {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
