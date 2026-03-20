@@ -11,17 +11,6 @@ use std::time::Instant;
 static INTERRUPTED: AtomicBool = AtomicBool::new(false);
 static CHILD_PID: AtomicU32 = AtomicU32::new(0);
 
-/// (level_label, duration_secs, status_string)
-type LevelTimes = Vec<(String, i64, String)>;
-
-struct RunContext<'a> {
-    session_uuid: String,
-    timestamp: String,
-    start_time: String,
-    prompt: &'a str,
-    mode: String,
-}
-
 pub struct RunAgentArgs {
     pub base: String,
     pub strategy: String,

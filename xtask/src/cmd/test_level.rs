@@ -145,7 +145,7 @@ fn quality_gates(proj: &Path, level: &str) -> Result<()> {
     // Run clippy --fix
     println!("Running clippy --fix (auto-fixing trivial lints)...");
     let mut clippy_args = vec![
-        "clippy", "--fix", "--allow-dirty", "--allow-staged", "--", "-D", "warnings",
+        "clippy", "--package", "cs61a-bench", "--fix", "--allow-dirty", "--allow-staged", "--", "-D", "warnings",
     ];
     clippy_args.extend_from_slice(GATE_LINT_FLAGS);
     if allow_dead_code {
@@ -155,7 +155,7 @@ fn quality_gates(proj: &Path, level: &str) -> Result<()> {
 
     // Run clippy (verify)
     println!("Running clippy (verify, fn limit={fn_limit})...");
-    let mut verify_args = vec!["clippy", "--", "-D", "warnings"];
+    let mut verify_args = vec!["clippy", "--package", "cs61a-bench", "--", "-D", "warnings"];
     verify_args.extend_from_slice(GATE_LINT_FLAGS);
     if allow_dead_code {
         verify_args.extend_from_slice(&["-A", "dead_code"]);
