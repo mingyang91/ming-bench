@@ -44,6 +44,20 @@ impl EnvFrame {
     fn set(env: &EnvRef, name: String, val: Value) {
         env.borrow_mut().bindings.insert(name, val);
     }
+
+    fn set_existing(env: &EnvRef, name: &str, val: Value) -> bool {
+        let mut frame = env.borrow_mut();
+        if frame.bindings.contains_key(name) {
+            frame.bindings.insert(name.to_string(), val);
+            true
+        } else if let Some(ref parent) = frame.parent {
+            let parent = Rc::clone(parent);
+            drop(frame);
+            Self::set_existing(&parent, name, val)
+        } else {
+            false
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -400,6 +414,21 @@ fn eval_step(se: &SExpr, env: &EnvRef, out: &OutputBuf) -> Result<Step, EvalErro
                                 }
                             }
                             _ => Err(err_at(span, "define requires a symbol or list")),
+                        }
+                    }
+                    "set!" => {
+                        if elems.len() != 3 {
+                            return Err(err_at(span, "set! requires exactly 2 arguments"));
+                        }
+                        if let Expr::Symbol(name) = &elems[1].expr {
+                            let val = eval_expr(&elems[2], env, out)?;
+                            if EnvFrame::set_existing(env, name, val) {
+                                Ok(Step::Done(Value::Void))
+                            } else {
+                                Err(err_at(span, format!("set!: unbound variable: {}", name)))
+                            }
+                        } else {
+                            Err(err_at(span, "set! requires a symbol"))
                         }
                     }
                     "lambda" => {
