@@ -8,6 +8,7 @@ pub enum Value {
     String(String),
     Symbol(String),
     List(Vec<Value>),
+    Void,
 }
 
 fn fmt_list(elements: &[Value], f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -30,6 +31,7 @@ impl fmt::Display for Value {
             Value::String(s) => write!(f, "\"{s}\""),
             Value::Symbol(s) => write!(f, "{s}"),
             Value::List(elements) => fmt_list(elements, f),
+            Value::Void => write!(f, ""),
         }
     }
 }

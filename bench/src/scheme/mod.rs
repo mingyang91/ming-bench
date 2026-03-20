@@ -3,7 +3,11 @@ pub mod parser;
 pub mod value;
 
 pub use error::EvalError;
+use std::collections::HashMap;
 use value::Value;
+
+/// A variable environment (flat for now — no closures yet).
+type Env = HashMap<String, Value>;
 
 /// Extract an integer from a Value, returning a TypeError if not an integer.
 fn expect_integer(val: &Value) -> Result<i64, EvalError> {
@@ -66,22 +70,22 @@ fn is_truthy(val: &Value) -> bool {
 }
 
 /// Evaluate `(not expr)` — returns #t if expr is falsy, #f otherwise.
-fn eval_not(args: &[Value]) -> Result<Value, EvalError> {
+fn eval_not(args: &[Value], env: &mut Env) -> Result<Value, EvalError> {
     if args.len() != 1 {
         return Err(EvalError::WrongArgCount {
             expected: "1".into(),
             got: args.len(),
         });
     }
-    let val = eval(&args[0])?;
+    let val = eval(&args[0], env)?;
     Ok(Value::Boolean(!is_truthy(&val)))
 }
 
 /// Evaluate `(and expr ...)` — short-circuit, returns last truthy or first falsy.
-fn eval_and(args: &[Value]) -> Result<Value, EvalError> {
+fn eval_and(args: &[Value], env: &mut Env) -> Result<Value, EvalError> {
     let mut result = Value::Boolean(true);
     for arg in args {
-        result = eval(arg)?;
+        result = eval(arg, env)?;
         if !is_truthy(&result) {
             return Ok(result);
         }
@@ -90,10 +94,10 @@ fn eval_and(args: &[Value]) -> Result<Value, EvalError> {
 }
 
 /// Evaluate `(or expr ...)` — short-circuit, returns first truthy or last falsy.
-fn eval_or(args: &[Value]) -> Result<Value, EvalError> {
+fn eval_or(args: &[Value], env: &mut Env) -> Result<Value, EvalError> {
     let mut result = Value::Boolean(false);
     for arg in args {
-        result = eval(arg)?;
+        result = eval(arg, env)?;
         if is_truthy(&result) {
             return Ok(result);
         }
@@ -101,31 +105,75 @@ fn eval_or(args: &[Value]) -> Result<Value, EvalError> {
     Ok(result)
 }
 
+/// Evaluate `(define name expr)` — binds name in env, returns Void.
+fn eval_define(args: &[Value], env: &mut Env) -> Result<Value, EvalError> {
+    let [Value::Symbol(name), expr] = args else {
+        return Err(EvalError::BadSyntax {
+            form: "define".into(),
+        });
+    };
+    let val = eval(expr, env)?;
+    env.insert(name.clone(), val);
+    Ok(Value::Void)
+}
+
+/// Evaluate `(if cond then else?)`.
+fn eval_if(args: &[Value], env: &mut Env) -> Result<Value, EvalError> {
+    match args {
+        [cond, consequent, alternate] => {
+            if is_truthy(&eval(cond, env)?) {
+                eval(consequent, env)
+            } else {
+                eval(alternate, env)
+            }
+        }
+        [cond, consequent] => {
+            if is_truthy(&eval(cond, env)?) {
+                eval(consequent, env)
+            } else {
+                Ok(Value::Void)
+            }
+        }
+        _ => Err(EvalError::BadSyntax { form: "if".into() }),
+    }
+}
+
 /// Evaluate a single parsed Scheme value.
-fn eval(expr: &Value) -> Result<Value, EvalError> {
+fn eval(expr: &Value, env: &mut Env) -> Result<Value, EvalError> {
     match expr {
-        Value::Integer(_) | Value::Boolean(_) | Value::String(_) => Ok(expr.clone()),
-        Value::Symbol(name) => Err(EvalError::UnboundVariable { name: name.clone() }),
+        Value::Integer(_) | Value::Boolean(_) | Value::String(_) | Value::Void => Ok(expr.clone()),
+        Value::Symbol(name) => env
+            .get(name)
+            .cloned()
+            .ok_or_else(|| EvalError::UnboundVariable { name: name.clone() }),
         Value::List(elements) => {
             let [operator, args @ ..] = elements.as_slice() else {
                 return Err(EvalError::EmptyList);
             };
             match operator {
+                Value::Symbol(op) if op == "quote" => match args {
+                    [datum] => Ok(datum.clone()),
+                    _ => Err(EvalError::BadSyntax {
+                        form: "quote".into(),
+                    }),
+                },
+                Value::Symbol(op) if op == "if" => eval_if(args, env),
+                Value::Symbol(op) if op == "define" => eval_define(args, env),
                 Value::Symbol(op) if matches!(op.as_str(), "+" | "-" | "*" | "/") => {
                     let evaluated: Vec<Value> =
-                        args.iter().map(eval).collect::<Result<_, _>>()?;
+                        args.iter().map(|a| eval(a, env)).collect::<Result<_, _>>()?;
                     apply_arithmetic(op, &evaluated)
                 }
                 Value::Symbol(op)
                     if matches!(op.as_str(), "<" | ">" | "=" | "<=" | ">=") =>
                 {
                     let evaluated: Vec<Value> =
-                        args.iter().map(eval).collect::<Result<_, _>>()?;
+                        args.iter().map(|a| eval(a, env)).collect::<Result<_, _>>()?;
                     apply_comparison(op, &evaluated)
                 }
-                Value::Symbol(op) if op == "not" => eval_not(args),
-                Value::Symbol(op) if op == "and" => eval_and(args),
-                Value::Symbol(op) if op == "or" => eval_or(args),
+                Value::Symbol(op) if op == "not" => eval_not(args, env),
+                Value::Symbol(op) if op == "and" => eval_and(args, env),
+                Value::Symbol(op) if op == "or" => eval_or(args, env),
                 _ => Err(EvalError::NotAProcedure {
                     value: format!("{operator}"),
                 }),
@@ -141,12 +189,15 @@ pub fn eval_str(input: &str) -> Result<String, EvalError> {
     if expressions.is_empty() {
         return Err(EvalError::EmptyInput);
     }
-    let result = expressions
-        .iter()
-        .map(eval)
-        .next_back()
-        .expect("non-empty expressions guaranteed above")?;
-    Ok(result.to_string())
+    let mut env = Env::new();
+    let mut last = Value::Void;
+    for expr in &expressions {
+        last = eval(expr, &mut env)?;
+    }
+    match last {
+        Value::Void => Err(EvalError::EmptyInput),
+        val => Ok(val.to_string()),
+    }
 }
 
 /// Evaluate Scheme expressions, returning both the result value and

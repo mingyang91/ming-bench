@@ -66,7 +66,7 @@ fn tokenize(input: &str) -> Result<Vec<String>, EvalError> {
                 tokens.push(format!("\"{s}\""));
             }
             ';' => skip_comment(&mut chars),
-            '(' | ')' => {
+            '(' | ')' | '\'' => {
                 tokens.push(ch.to_string());
                 chars.next();
             }
@@ -112,6 +112,9 @@ fn parse_expr(tokens: &[String], pos: usize) -> Result<(Value, usize), EvalError
         Err(EvalError::Parse {
             message: "unexpected closing parenthesis".into(),
         })
+    } else if token == "'" {
+        let (quoted, next) = parse_expr(tokens, pos + 1)?;
+        Ok((Value::List(vec![Value::Symbol("quote".into()), quoted]), next))
     } else {
         Ok((parse_atom(token), pos + 1))
     }
