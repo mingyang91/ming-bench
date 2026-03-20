@@ -9,7 +9,7 @@ name = "cs61a_bench"
 path = "src/lib.rs"
 
 [features]
-default = []
+default = ["quality-gate"]
 quality-gate = []
 
 [dependencies]
