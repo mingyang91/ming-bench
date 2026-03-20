@@ -1,42 +1,77 @@
 use super::{Env, EvalError, Value};
 
+/// Trampoline result: either a final value, a tail-call in the same env,
+/// or a tail-call into a new env (function application).
+enum Bounce {
+    Done(Value),
+    /// Tail call: evaluate expr in the current (caller's) environment.
+    Continue(Value),
+    /// Tail call into a new environment (lambda application).
+    Call { expr: Value, env: Env },
+}
+
 pub(super) fn eval(value: &Value, env: &mut Env, out: &mut String) -> Result<Value, EvalError> {
-    match value {
-        Value::Integer(_) | Value::Boolean(_) | Value::String(_) | Value::Char(_)
-        | Value::Lambda { .. } => Ok(value.clone()),
-        Value::Nil => Ok(Value::Nil),
-        Value::Symbol(name) => env
-            .get(name)
-            .cloned()
-            .ok_or_else(|| EvalError::UnboundVariable {
-                name: name.clone(),
-            }),
-        Value::Pair(..) => eval_pair(value, env, out),
+    let mut current = value.clone();
+    let mut call_env: Option<Env> = None;
+
+    loop {
+        let bounce = {
+            let active_env = call_env.as_mut().unwrap_or(env);
+            eval_bounce(&current, active_env, out)?
+        };
+        match bounce {
+            Bounce::Done(val) => return Ok(val),
+            Bounce::Continue(expr) => current = expr,
+            Bounce::Call { expr, env: new_env } => {
+                current = expr;
+                call_env = Some(new_env);
+            }
+        }
     }
 }
 
-fn eval_pair(value: &Value, env: &mut Env, out: &mut String) -> Result<Value, EvalError> {
+fn eval_bounce(value: &Value, env: &mut Env, out: &mut String) -> Result<Bounce, EvalError> {
+    match value {
+        Value::Integer(_) | Value::Boolean(_) | Value::String(_) | Value::Char(_)
+        | Value::Lambda { .. } => Ok(Bounce::Done(value.clone())),
+        Value::Nil => Ok(Bounce::Done(Value::Nil)),
+        Value::Symbol(name) => env
+            .get(name)
+            .cloned()
+            .map(Bounce::Done)
+            .ok_or_else(|| EvalError::UnboundVariable {
+                name: name.clone(),
+            }),
+        Value::Pair(..) => eval_pair_bounce(value, env, out),
+    }
+}
+
+fn eval_pair_bounce(
+    value: &Value,
+    env: &mut Env,
+    out: &mut String,
+) -> Result<Bounce, EvalError> {
     let items = value.to_list_vec().ok_or_else(|| EvalError::TypeError {
         expected: "proper list".to_string(),
         got: value.display(),
     })?;
 
     let [operator, args @ ..] = items.as_slice() else {
-        return Ok(Value::Nil);
+        return Ok(Bounce::Done(Value::Nil));
     };
 
     // Special forms
     if let Value::Symbol(name) = operator {
         return match name.as_str() {
-            "define" => eval_define(args, env, out),
-            "if" => eval_if(args, env, out),
-            "quote" => eval_quote(args),
-            "lambda" => eval_lambda(args, env),
-            "begin" => eval_begin(args, env, out),
-            "let" => eval_let(args, env, out),
-            "cond" => eval_cond(args, env, out),
-            "string-set!" => eval_string_set(args, env, out),
-            _ => eval_symbol_call(name, args, env, out),
+            "define" => eval_define(args, env, out).map(Bounce::Done),
+            "if" => eval_if_bounce(args, env, out),
+            "quote" => eval_quote(args).map(Bounce::Done),
+            "lambda" => eval_lambda(args, env).map(Bounce::Done),
+            "begin" => eval_begin_bounce(args, env, out),
+            "let" => eval_let_bounce(args, env, out),
+            "cond" => eval_cond_bounce(args, env, out),
+            "string-set!" => eval_string_set(args, env, out).map(Bounce::Done),
+            _ => eval_symbol_call_bounce(name, args, env, out),
         };
     }
 
@@ -44,17 +79,17 @@ fn eval_pair(value: &Value, env: &mut Env, out: &mut String) -> Result<Value, Ev
     let proc = eval(operator, env, out)?;
     let evaled_args: Vec<Value> =
         args.iter().map(|a| eval(a, env, out)).collect::<Result<_, _>>()?;
-    apply(&proc, &evaled_args, env, out)
+    apply_bounce(&proc, &evaled_args, env)
 }
 
-fn eval_symbol_call(
+fn eval_symbol_call_bounce(
     name: &str,
     args: &[Value],
     env: &mut Env,
     out: &mut String,
-) -> Result<Value, EvalError> {
+) -> Result<Bounce, EvalError> {
     if is_builtin(name) {
-        return eval_builtin(name, args, env, out);
+        return eval_builtin(name, args, env, out).map(Bounce::Done);
     }
     let proc = env
         .get(name)
@@ -64,15 +99,15 @@ fn eval_symbol_call(
         })?;
     let evaled_args: Vec<Value> =
         args.iter().map(|a| eval(a, env, out)).collect::<Result<_, _>>()?;
-    apply(&proc, &evaled_args, env, out)
+    apply_bounce(&proc, &evaled_args, env)
 }
 
-fn apply(
+/// Build the call environment and return a tail-call bounce.
+fn apply_bounce(
     proc: &Value,
     args: &[Value],
     caller_env: &Env,
-    out: &mut String,
-) -> Result<Value, EvalError> {
+) -> Result<Bounce, EvalError> {
     let Value::Lambda {
         params,
         body,
@@ -91,7 +126,6 @@ fn apply(
         });
     }
 
-    // Build call env: start with captured closure, merge caller env as fallback, add params
     let mut call_env = closure.clone();
     for (k, v) in caller_env {
         call_env.entry(k.clone()).or_insert_with(|| v.clone());
@@ -100,7 +134,26 @@ fn apply(
         call_env.insert(param.clone(), arg.clone());
     }
 
-    eval(body, &mut call_env, out)
+    Ok(Bounce::Call {
+        expr: *body.clone(),
+        env: call_env,
+    })
+}
+
+/// Non-tail apply: resolves the bounce immediately via `eval`.
+fn apply(
+    proc: &Value,
+    args: &[Value],
+    caller_env: &Env,
+    out: &mut String,
+) -> Result<Value, EvalError> {
+    match apply_bounce(proc, args, caller_env)? {
+        Bounce::Done(val) => Ok(val),
+        Bounce::Call { expr, mut env } => eval(&expr, &mut env, out),
+        Bounce::Continue(expr) => {
+            unreachable!("apply_bounce returned Continue for {}", expr.display())
+        }
+    }
 }
 
 fn eval_define(args: &[Value], env: &mut Env, out: &mut String) -> Result<Value, EvalError> {
@@ -151,7 +204,11 @@ fn eval_define(args: &[Value], env: &mut Env, out: &mut String) -> Result<Value,
     }
 }
 
-fn eval_if(args: &[Value], env: &mut Env, out: &mut String) -> Result<Value, EvalError> {
+fn eval_if_bounce(
+    args: &[Value],
+    env: &mut Env,
+    out: &mut String,
+) -> Result<Bounce, EvalError> {
     let (condition, consequent, alternative) = match args {
         [cond, cons, alt] => (cond, cons, Some(alt)),
         [cond, cons] => (cond, cons, None),
@@ -164,9 +221,11 @@ fn eval_if(args: &[Value], env: &mut Env, out: &mut String) -> Result<Value, Eva
     };
     let test = eval(condition, env, out)?;
     if test != Value::Boolean(false) {
-        eval(consequent, env, out)
+        Ok(Bounce::Continue(consequent.clone()))
     } else {
-        alternative.map_or(Ok(Value::Nil), |alt| eval(alt, env, out))
+        Ok(alternative.map_or(Bounce::Done(Value::Nil), |alt| {
+            Bounce::Continue(alt.clone())
+        }))
     }
 }
 
@@ -180,7 +239,11 @@ fn eval_quote(args: &[Value]) -> Result<Value, EvalError> {
     Ok(datum.clone())
 }
 
-fn eval_let(args: &[Value], env: &mut Env, out: &mut String) -> Result<Value, EvalError> {
+fn eval_let_bounce(
+    args: &[Value],
+    env: &mut Env,
+    out: &mut String,
+) -> Result<Bounce, EvalError> {
     let [bindings_val, body @ ..] = args else {
         return Err(EvalError::WrongArgCount {
             expected: 2,
@@ -219,10 +282,28 @@ fn eval_let(args: &[Value], env: &mut Env, out: &mut String) -> Result<Value, Ev
         closure: env.clone(),
     };
 
-    apply(&lambda, &values, env, out)
+    apply_bounce(&lambda, &values, env)
 }
 
-fn eval_cond(args: &[Value], env: &mut Env, out: &mut String) -> Result<Value, EvalError> {
+fn eval_body_bounce(
+    body: &[Value],
+    env: &mut Env,
+    out: &mut String,
+) -> Result<Bounce, EvalError> {
+    let Some((last, rest)) = body.split_last() else {
+        return Ok(Bounce::Done(Value::Nil));
+    };
+    for expr in rest {
+        eval(expr, env, out)?;
+    }
+    Ok(Bounce::Continue(last.clone()))
+}
+
+fn eval_cond_bounce(
+    args: &[Value],
+    env: &mut Env,
+    out: &mut String,
+) -> Result<Bounce, EvalError> {
     for clause_val in args {
         let clause = clause_val
             .to_list_vec()
@@ -238,26 +319,26 @@ fn eval_cond(args: &[Value], env: &mut Env, out: &mut String) -> Result<Value, E
             });
         };
 
-        if matches!(test, Value::Symbol(s) if s == "else") {
-            return body
-                .iter()
-                .try_fold(Value::Nil, |_, expr| eval(expr, env, out));
-        }
+        let is_match = if matches!(test, Value::Symbol(s) if s == "else") {
+            true
+        } else {
+            eval(test, env, out)? != Value::Boolean(false)
+        };
 
-        let result = eval(test, env, out)?;
-        if result != Value::Boolean(false) {
-            return body
-                .iter()
-                .try_fold(Value::Nil, |_, expr| eval(expr, env, out));
+        if is_match {
+            return eval_body_bounce(body, env, out);
         }
     }
 
-    Ok(Value::Nil)
+    Ok(Bounce::Done(Value::Nil))
 }
 
-fn eval_begin(args: &[Value], env: &mut Env, out: &mut String) -> Result<Value, EvalError> {
-    args.iter()
-        .try_fold(Value::Nil, |_, expr| eval(expr, env, out))
+fn eval_begin_bounce(
+    args: &[Value],
+    env: &mut Env,
+    out: &mut String,
+) -> Result<Bounce, EvalError> {
+    eval_body_bounce(args, env, out)
 }
 
 fn wrap_body(body: &[Value]) -> Result<Value, EvalError> {
