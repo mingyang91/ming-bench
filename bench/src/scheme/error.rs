@@ -6,4 +6,23 @@
 pub enum EvalError {
     #[error("parse error: {msg}")]
     Parse { msg: String },
+
+    #[error("unbound variable: {name}")]
+    UnboundVariable { name: String },
+
+    #[error("not a procedure: {value}")]
+    NotAProcedure { value: String },
+
+    #[error("type error: expected {expected}, got {got}")]
+    TypeError { expected: String, got: String },
+
+    #[error("arity error: {name} expects {expected} args, got {actual}")]
+    ArityError {
+        name: String,
+        expected: usize,
+        actual: usize,
+    },
+
+    #[error("division by zero")]
+    DivisionByZero,
 }

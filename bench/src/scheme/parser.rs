@@ -38,7 +38,34 @@ fn parse_expr(
         }),
         Some('"') => parse_string(chars),
         Some('#') => parse_boolean(chars),
-        _ => parse_number_or_symbol(chars),
+        Some('(') => parse_list(chars),
+        Some(')') => Err(EvalError::Parse {
+            msg: "unexpected ')'".into(),
+        }),
+        _ => parse_atom(chars),
+    }
+}
+
+fn parse_list(
+    chars: &mut std::iter::Peekable<std::str::Chars<'_>>,
+) -> Result<Value, EvalError> {
+    chars.next(); // consume '('
+    let mut elems = Vec::new();
+
+    loop {
+        skip_whitespace(chars);
+        match chars.peek() {
+            None => {
+                return Err(EvalError::Parse {
+                    msg: "unterminated list".into(),
+                })
+            }
+            Some(')') => {
+                chars.next();
+                return Ok(Value::List(elems));
+            }
+            _ => elems.push(parse_expr(chars)?),
+        }
     }
 }
 
@@ -85,12 +112,16 @@ fn parse_boolean(
     }
 }
 
-fn parse_number_or_symbol(
+fn is_symbol_char(c: char) -> bool {
+    !c.is_whitespace() && c != '(' && c != ')' && c != '"'
+}
+
+fn parse_atom(
     chars: &mut std::iter::Peekable<std::str::Chars<'_>>,
 ) -> Result<Value, EvalError> {
     let mut token = String::new();
     while let Some(&c) = chars.peek() {
-        if c.is_whitespace() || c == '(' || c == ')' {
+        if !is_symbol_char(c) {
             break;
         }
         token.push(c);
@@ -101,7 +132,5 @@ fn parse_number_or_symbol(
         return Ok(Value::Integer(n));
     }
 
-    Err(EvalError::Parse {
-        msg: format!("unexpected token: {token}"),
-    })
+    Ok(Value::Symbol(token))
 }

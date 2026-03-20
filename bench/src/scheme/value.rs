@@ -6,6 +6,19 @@ pub enum Value {
     Integer(i64),
     Boolean(bool),
     Str(String),
+    Symbol(String),
+    List(Vec<Value>),
+}
+
+fn fmt_list(f: &mut fmt::Formatter<'_>, elems: &[Value]) -> fmt::Result {
+    write!(f, "(")?;
+    for (i, elem) in elems.iter().enumerate() {
+        if i > 0 {
+            write!(f, " ")?;
+        }
+        write!(f, "{elem}")?;
+    }
+    write!(f, ")")
 }
 
 impl fmt::Display for Value {
@@ -15,6 +28,8 @@ impl fmt::Display for Value {
             Value::Boolean(true) => write!(f, "#t"),
             Value::Boolean(false) => write!(f, "#f"),
             Value::Str(s) => write!(f, "\"{s}\""),
+            Value::Symbol(s) => write!(f, "{s}"),
+            Value::List(elems) => fmt_list(f, elems),
         }
     }
 }
