@@ -533,6 +533,73 @@ fn eval_let(items: &[Expr], expr: &Expr, env: &Env, output: &mut String) -> Resu
             expr.col,
         ));
     }
+    // Named let: (let name ((var init) ...) body ...)
+    if let ExprKind::Value(Value::Symbol(loop_name)) = &items[1].kind {
+        if items.len() < 4 {
+            return Err(err_at(
+                "named let requires bindings and body",
+                expr.line,
+                expr.col,
+            ));
+        }
+        let bindings = match &items[2].kind {
+            ExprKind::List(b) => b,
+            _ => {
+                return Err(err_at(
+                    "named let: second argument must be a list of bindings",
+                    expr.line,
+                    expr.col,
+                ))
+            }
+        };
+        let mut params = Vec::new();
+        let mut init_vals = Vec::new();
+        for binding in bindings {
+            match &binding.kind {
+                ExprKind::List(pair) if pair.len() == 2 => {
+                    let bname = match &pair[0].kind {
+                        ExprKind::Value(Value::Symbol(s)) => s.clone(),
+                        _ => {
+                            return Err(err_at(
+                                "named let: binding name must be a symbol",
+                                pair[0].line,
+                                pair[0].col,
+                            ))
+                        }
+                    };
+                    let val = eval(&pair[1], env, output)?;
+                    params.push(bname);
+                    init_vals.push(val);
+                }
+                _ => {
+                    return Err(err_at(
+                        "named let: each binding must be (name value)",
+                        binding.line,
+                        binding.col,
+                    ))
+                }
+            }
+        }
+        let body = items[3..].to_vec();
+        let lambda = Value::Lambda {
+            params: params.clone(),
+            rest_param: None,
+            body,
+            env: env.clone(),
+        };
+        // The lambda's env needs to include itself for recursion
+        let local_env = env.child();
+        local_env.define(loop_name.clone(), lambda.clone());
+        // Update the lambda to close over the env that includes itself
+        let lambda = Value::Lambda {
+            params,
+            rest_param: None,
+            body: items[3..].to_vec(),
+            env: local_env.clone(),
+        };
+        local_env.define(loop_name.clone(), lambda.clone());
+        return apply_lambda(&lambda, &init_vals, expr.line, expr.col, output);
+    }
     let bindings = match &items[1].kind {
         ExprKind::List(b) => b,
         _ => {
@@ -699,6 +766,10 @@ fn eval_tail(expr: &Expr, env: &Env, output: &mut String) -> Result<EvalResult, 
                         Ok(EvalResult::Done(Value::Symbol("".to_string())))
                     }
                     "let" => {
+                        // Named let falls through to eval (it uses apply_lambda trampoline)
+                        if matches!(&items[1].kind, ExprKind::Value(Value::Symbol(_))) {
+                            return Ok(EvalResult::Done(eval(expr, env, output)?));
+                        }
                         if items.len() < 3 {
                             return Err(err_at(
                                 "let requires bindings and body",
@@ -747,7 +818,31 @@ fn eval_tail(expr: &Expr, env: &Env, output: &mut String) -> Result<EvalResult, 
                         }
                         eval_tail(&items[items.len() - 1], &local_env, output)
                     }
-                    "define" | "set!" | "quote" | "lambda" | "and" | "or" | "string-set!" | "display"
+                    "and" => {
+                        if items.len() <= 1 {
+                            return Ok(EvalResult::Done(Value::Boolean(true)));
+                        }
+                        for arg in &items[1..items.len() - 1] {
+                            let val = eval(arg, env, output)?;
+                            if is_falsy(&val) {
+                                return Ok(EvalResult::Done(val));
+                            }
+                        }
+                        eval_tail(&items[items.len() - 1], env, output)
+                    }
+                    "or" => {
+                        if items.len() <= 1 {
+                            return Ok(EvalResult::Done(Value::Boolean(false)));
+                        }
+                        for arg in &items[1..items.len() - 1] {
+                            let val = eval(arg, env, output)?;
+                            if !is_falsy(&val) {
+                                return Ok(EvalResult::Done(val));
+                            }
+                        }
+                        eval_tail(&items[items.len() - 1], env, output)
+                    }
+                    "define" | "set!" | "quote" | "lambda" | "string-set!" | "display"
                     | "write" | "newline" => Ok(EvalResult::Done(eval(expr, env, output)?)),
                     _ => {
                         if let Some(func_val) = env.get(name) {
