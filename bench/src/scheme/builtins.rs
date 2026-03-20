@@ -45,6 +45,110 @@ pub fn apply_arithmetic(op: &str, args: &[Value]) -> Result<Value, EvalError> {
     }
 }
 
+/// Apply `abs` to a single integer argument.
+pub fn apply_abs(args: &[Value]) -> Result<Value, EvalError> {
+    let [arg] = args else {
+        return Err(EvalError::WrongArgCount {
+            expected: "1".into(),
+            got: args.len(),
+        });
+    };
+    let n = expect_integer(arg)?;
+    Ok(Value::Integer(n.abs()))
+}
+
+/// Apply `quotient` (truncated integer division).
+pub fn apply_quotient(args: &[Value]) -> Result<Value, EvalError> {
+    let [a, b] = args else {
+        return Err(EvalError::WrongArgCount {
+            expected: "2".into(),
+            got: args.len(),
+        });
+    };
+    let a = expect_integer(a)?;
+    let b = expect_integer(b)?;
+    checked_div(a, b).map(Value::Integer)
+}
+
+/// Apply `remainder` (sign follows dividend).
+pub fn apply_remainder(args: &[Value]) -> Result<Value, EvalError> {
+    let [a, b] = args else {
+        return Err(EvalError::WrongArgCount {
+            expected: "2".into(),
+            got: args.len(),
+        });
+    };
+    let a = expect_integer(a)?;
+    let b = expect_integer(b)?;
+    if b == 0 {
+        return Err(EvalError::DivisionByZero);
+    }
+    Ok(Value::Integer(a % b))
+}
+
+/// Apply `modulo` (sign follows divisor).
+pub fn apply_modulo(args: &[Value]) -> Result<Value, EvalError> {
+    let [a, b] = args else {
+        return Err(EvalError::WrongArgCount {
+            expected: "2".into(),
+            got: args.len(),
+        });
+    };
+    let a = expect_integer(a)?;
+    let b = expect_integer(b)?;
+    if b == 0 {
+        return Err(EvalError::DivisionByZero);
+    }
+    Ok(Value::Integer(((a % b) + b) % b))
+}
+
+/// Apply `min` to one or more integer arguments.
+pub fn apply_min(args: &[Value]) -> Result<Value, EvalError> {
+    if args.is_empty() {
+        return Err(EvalError::WrongArgCount {
+            expected: "at least 1".into(),
+            got: 0,
+        });
+    }
+    let nums: Vec<i64> = args.iter().map(expect_integer).collect::<Result<_, _>>()?;
+    Ok(Value::Integer(
+        nums.into_iter().min().expect("non-empty args"),
+    ))
+}
+
+/// Apply `max` to one or more integer arguments.
+pub fn apply_max(args: &[Value]) -> Result<Value, EvalError> {
+    if args.is_empty() {
+        return Err(EvalError::WrongArgCount {
+            expected: "at least 1".into(),
+            got: 0,
+        });
+    }
+    let nums: Vec<i64> = args.iter().map(expect_integer).collect::<Result<_, _>>()?;
+    Ok(Value::Integer(
+        nums.into_iter().max().expect("non-empty args"),
+    ))
+}
+
+/// Apply `expt` (integer exponentiation).
+pub fn apply_expt(args: &[Value]) -> Result<Value, EvalError> {
+    let [base, exp] = args else {
+        return Err(EvalError::WrongArgCount {
+            expected: "2".into(),
+            got: args.len(),
+        });
+    };
+    let base = expect_integer(base)?;
+    let exp = expect_integer(exp)?;
+    if exp < 0 {
+        return Err(EvalError::TypeError {
+            expected: "non-negative exponent".into(),
+            got: format!("{exp}"),
+        });
+    }
+    Ok(Value::Integer(base.pow(exp as u32)))
+}
+
 /// Apply a comparison operator to evaluated arguments.
 pub fn apply_comparison(op: &str, args: &[Value]) -> Result<Value, EvalError> {
     if args.len() != 2 {

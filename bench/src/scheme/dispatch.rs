@@ -1,5 +1,8 @@
 use crate::scheme::apply::{apply_lambda, apply_lambda_tco, is_truthy};
-use crate::scheme::builtins::{apply_arithmetic, apply_comparison};
+use crate::scheme::builtins::{
+    apply_abs, apply_arithmetic, apply_comparison, apply_expt, apply_max, apply_min,
+    apply_modulo, apply_quotient, apply_remainder,
+};
 use crate::scheme::continuation;
 use crate::scheme::env::Env;
 use crate::scheme::error::EvalError;
@@ -110,6 +113,13 @@ fn dispatch_builtin(name: &str, args: &[Value]) -> Result<Value, EvalError> {
             };
             continuation::eval_callcc(proc.clone())
         }
+        "abs" => apply_abs(args),
+        "quotient" => apply_quotient(args),
+        "remainder" => apply_remainder(args),
+        "modulo" => apply_modulo(args),
+        "min" => apply_min(args),
+        "max" => apply_max(args),
+        "expt" => apply_expt(args),
         "vector" => vector_ops::vector_new(args),
         "make-vector" => vector_ops::make_vector(args),
         "vector-ref" => vector_ops::vector_ref(args),
@@ -152,6 +162,7 @@ pub(super) fn register_builtins(env: &Rc<Env>) {
         "call-with-current-continuation",
         "vector", "make-vector", "vector-ref", "vector-set!", "vector-length",
         "vector?", "vector->list", "list->vector",
+        "abs", "quotient", "remainder", "modulo", "min", "max", "expt",
     ] {
         env.set(name.into(), Value::Builtin(name.into()));
     }
