@@ -719,6 +719,42 @@ fn eval_step(se: &SExpr, env: &EnvRef, out: &OutputBuf) -> Result<Step, EvalErro
                                 "let requires bindings and body",
                             ));
                         }
+                        // Named let: (let name ((var init) ...) body...)
+                        if let Expr::Symbol(loop_name) = &elems[1].expr {
+                            if elems.len() < 4 {
+                                return Err(err_at(span, "named let requires bindings and body"));
+                            }
+                            let bindings = match &elems[2].expr {
+                                Expr::List(b) => b,
+                                _ => return Err(err_at(elems[2].span, "named let bindings must be a list")),
+                            };
+                            let mut param_names = Vec::new();
+                            let mut init_vals = Vec::new();
+                            for binding in bindings {
+                                match &binding.expr {
+                                    Expr::List(pair) if pair.len() == 2 => {
+                                        if let Expr::Symbol(name) = &pair[0].expr {
+                                            param_names.push(name.clone());
+                                            init_vals.push(eval_expr(&pair[1], env, out)?);
+                                        } else {
+                                            return Err(err_at(pair[0].span, "let binding name must be a symbol"));
+                                        }
+                                    }
+                                    _ => return Err(err_at(binding.span, "let binding must be a pair")),
+                                }
+                            }
+                            let body: Vec<SExpr> = elems[3..].to_vec();
+                            let let_env = EnvFrame::child(env);
+                            let lambda = Value::Lambda(param_names.clone(), None, body, let_env.clone());
+                            EnvFrame::set(&let_env, loop_name.clone(), lambda);
+                            for (name, val) in param_names.iter().zip(init_vals) {
+                                EnvFrame::set(&let_env, name.clone(), val);
+                            }
+                            for expr in &elems[3..elems.len() - 1] {
+                                eval_expr(expr, &let_env, out)?;
+                            }
+                            return Ok(Step::Tail(elems[elems.len() - 1].clone(), let_env));
+                        }
                         let bindings = match &elems[1].expr {
                             Expr::List(b) => b,
                             _ => {
