@@ -840,31 +840,72 @@ fn eval_expr(se: &SExpr, env: &EnvRef, out: &OutputBuf) -> Result<Value, EvalErr
                         Ok(Value::Str(s))
                     }
                     "string-set!" => {
-                        if elems.len() != 4 {
-                            return Err(err_at(span, "string-set! requires exactly 3 arguments"));
+                        Err(err_at(span, "string-set!: strings are immutable"))
+                    }
+                    "string->list" => {
+                        if elems.len() != 2 {
+                            return Err(err_at(span, "string->list requires exactly 1 argument"));
                         }
-                        let var_name = match &elems[1].expr {
-                            Expr::Symbol(name) => name.clone(),
-                            _ => return Err(err_at(elems[1].span, "string-set!: first argument must be a variable")),
-                        };
-                        let s = match EnvFrame::get(env, &var_name) {
-                            Some(Value::Str(s)) => s,
-                            Some(_) => return Err(err_at(elems[1].span, "string-set!: expected string")),
-                            None => return Err(err_at(elems[1].span, format!("unbound variable: {}", var_name))),
-                        };
-                        let idx = require_int(&eval_expr(&elems[2], env, out)?, elems[2].span)? as usize;
-                        let c = match eval_expr(&elems[3], env, out)? {
-                            Value::Char(c) => c,
-                            _ => return Err(err_at(elems[3].span, "string-set!: expected char")),
-                        };
-                        let mut chars: Vec<char> = s.chars().collect();
-                        if idx >= chars.len() {
-                            return Err(err_at(span, "string-set!: index out of range"));
+                        match eval_expr(&elems[1], env, out)? {
+                            Value::Str(s) => Ok(Value::List(s.chars().map(Value::Char).collect())),
+                            _ => Err(err_at(elems[1].span, "string->list: expected string")),
                         }
-                        chars[idx] = c;
-                        let new_s: String = chars.into_iter().collect();
-                        EnvFrame::set(env, var_name, Value::Str(new_s));
-                        Ok(Value::Void)
+                    }
+                    "list->string" => {
+                        if elems.len() != 2 {
+                            return Err(err_at(span, "list->string requires exactly 1 argument"));
+                        }
+                        match eval_expr(&elems[1], env, out)? {
+                            Value::List(items) => {
+                                let mut s = String::new();
+                                for item in &items {
+                                    match item {
+                                        Value::Char(c) => s.push(*c),
+                                        _ => return Err(err_at(span, "list->string: expected list of characters")),
+                                    }
+                                }
+                                Ok(Value::Str(s))
+                            }
+                            _ => Err(err_at(elems[1].span, "list->string: expected list")),
+                        }
+                    }
+                    "char->integer" => {
+                        if elems.len() != 2 {
+                            return Err(err_at(span, "char->integer requires exactly 1 argument"));
+                        }
+                        match eval_expr(&elems[1], env, out)? {
+                            Value::Char(c) => Ok(Value::Integer(c as i64)),
+                            _ => Err(err_at(elems[1].span, "char->integer: expected char")),
+                        }
+                    }
+                    "integer->char" => {
+                        if elems.len() != 2 {
+                            return Err(err_at(span, "integer->char requires exactly 1 argument"));
+                        }
+                        let n = require_int(&eval_expr(&elems[1], env, out)?, elems[1].span)?;
+                        if let Some(c) = char::from_u32(n as u32) {
+                            Ok(Value::Char(c))
+                        } else {
+                            Err(err_at(span, "integer->char: invalid code point"))
+                        }
+                    }
+                    "map" => {
+                        if elems.len() != 3 {
+                            return Err(err_at(span, "map requires exactly 2 arguments"));
+                        }
+                        let func = eval_expr(&elems[1], env, out)?;
+                        let lst = eval_expr(&elems[2], env, out)?;
+                        match lst {
+                            Value::List(items) => {
+                                let mut results = Vec::new();
+                                for item in items {
+                                    let r = apply_value(&func, &[item], span, out)?;
+                                    results.push(r);
+                                }
+                                Ok(Value::List(results))
+                            }
+                            _ => Err(err_at(elems[2].span, "map: expected list")),
+                        }
                     }
                     "char?" => {
                         if elems.len() != 2 {
@@ -879,6 +920,29 @@ fn eval_expr(se: &SExpr, env: &EnvRef, out: &OutputBuf) -> Result<Value, EvalErr
                 apply_proc(elems, span, env, out)
             }
         }
+    }
+}
+
+fn apply_value(func: &Value, args: &[Value], call_span: Span, out: &OutputBuf) -> Result<Value, EvalError> {
+    match func {
+        Value::Lambda(params, body, closure_env) => {
+            if params.len() != args.len() {
+                return Err(err_at(
+                    call_span,
+                    format!("expected {} arguments, got {}", params.len(), args.len()),
+                ));
+            }
+            let call_env = EnvFrame::child(closure_env);
+            for (param, arg) in params.iter().zip(args) {
+                EnvFrame::set(&call_env, param.clone(), arg.clone());
+            }
+            let mut result = Value::Void;
+            for expr in body {
+                result = eval_expr(expr, &call_env, out)?;
+            }
+            Ok(result)
+        }
+        _ => Err(err_at(call_span, "not a procedure")),
     }
 }
 
