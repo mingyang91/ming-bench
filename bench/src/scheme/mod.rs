@@ -26,9 +26,11 @@ enum Value {
     Nil,
     Lambda {
         params: Vec<String>,
+        rest_param: Option<String>,
         body: Box<Value>,
         closure: Env,
     },
+    BuiltinProc(String),
 }
 
 impl Value {
@@ -41,7 +43,7 @@ impl Value {
             Value::Symbol(s) => s.clone(),
             Value::Char(c) => format!("#\\{c}"),
             Value::Nil => "()".to_string(),
-            Value::Lambda { .. } => "#<procedure>".to_string(),
+            Value::Lambda { .. } | Value::BuiltinProc(_) => "#<procedure>".to_string(),
             Value::Pair(..) => self.fmt_list(false),
         }
     }
@@ -52,7 +54,8 @@ impl Value {
             Value::String(s) => s.clone(),
             Value::Char(c) => c.to_string(),
             Value::Pair(..) => self.fmt_list(true),
-            _ => self.display(),
+            Value::Integer(_) | Value::Boolean(_) | Value::Symbol(_) | Value::Nil
+            | Value::Lambda { .. } | Value::BuiltinProc(_) => self.display(),
         }
     }
 
@@ -106,6 +109,7 @@ impl PartialEq for Value {
             (Value::Char(a), Value::Char(b)) => a == b,
             (Value::Nil, Value::Nil) => true,
             (Value::Pair(a1, a2), Value::Pair(b1, b2)) => a1 == b1 && a2 == b2,
+            (Value::BuiltinProc(a), Value::BuiltinProc(b)) => a == b,
             _ => false,
         }
     }

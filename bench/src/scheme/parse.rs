@@ -118,6 +118,10 @@ fn parse_list(tokens: &[Token], start: usize) -> Result<(Value, usize), EvalErro
             i += 1;
             break;
         }
+        // Handle dotted pair: (a b . c)
+        if matches!(&tokens[i], Token::Atom(s) if s == ".") {
+            return parse_dotted_tail(tokens, i + 1, elements);
+        }
         let (val, next) = parse_tokens(tokens, i)?;
         elements.push(val);
         i = next;
@@ -126,6 +130,25 @@ fn parse_list(tokens: &[Token], start: usize) -> Result<(Value, usize), EvalErro
         .into_iter()
         .rev()
         .fold(Value::Nil, |acc, v| Value::Pair(Box::new(v), Box::new(acc)));
+    Ok((list, i))
+}
+
+fn parse_dotted_tail(
+    tokens: &[Token],
+    dot_next: usize,
+    elements: Vec<Value>,
+) -> Result<(Value, usize), EvalError> {
+    let (cdr, mut i) = parse_tokens(tokens, dot_next)?;
+    if i >= tokens.len() || tokens[i] != Token::RParen {
+        return Err(EvalError::UnexpectedToken {
+            token: "expected ) after dotted pair".to_string(),
+        });
+    }
+    i += 1; // skip RParen
+    let list = elements
+        .into_iter()
+        .rev()
+        .fold(cdr, |acc, v| Value::Pair(Box::new(v), Box::new(acc)));
     Ok((list, i))
 }
 

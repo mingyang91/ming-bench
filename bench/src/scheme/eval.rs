@@ -36,14 +36,17 @@ pub(super) fn eval(value: &Value, env: &mut Env, out: &mut String) -> Result<Val
 fn eval_bounce(value: &Value, env: &mut Env, out: &mut String) -> Result<Bounce, EvalError> {
     match value {
         Value::Integer(_) | Value::Boolean(_) | Value::String(_) | Value::Char(_)
-        | Value::Lambda { .. } => Ok(Bounce::Done(value.clone())),
+        | Value::Lambda { .. } | Value::BuiltinProc(_) => Ok(Bounce::Done(value.clone())),
         Value::Nil => Ok(Bounce::Done(Value::Nil)),
-        Value::Symbol(name) => env
-            .get(name)
-            .map(|rc| Bounce::Done(rc.borrow().clone()))
-            .ok_or_else(|| EvalError::UnboundVariable {
-                name: name.clone(),
-            }),
+        Value::Symbol(name) => {
+            if let Some(rc) = env.get(name) {
+                Ok(Bounce::Done(rc.borrow().clone()))
+            } else if is_builtin(name) || name == "apply" {
+                Ok(Bounce::Done(Value::BuiltinProc(name.clone())))
+            } else {
+                Err(EvalError::UnboundVariable { name: name.clone() })
+            }
+        }
         Value::Pair(..) => eval_pair_bounce(value, env, out),
     }
 }
@@ -82,7 +85,7 @@ fn eval_pair_bounce(
     let proc = eval(operator, env, out)?;
     let evaled_args: Vec<Value> =
         args.iter().map(|a| eval(a, env, out)).collect::<Result<_, _>>()?;
-    apply_bounce(&proc, &evaled_args, env)
+    apply_proc_bounce(&proc, &evaled_args, env, out)
 }
 
 fn eval_symbol_call_bounce(
@@ -94,6 +97,11 @@ fn eval_symbol_call_bounce(
     if is_builtin(name) {
         return eval_builtin(name, args, env, out).map(Bounce::Done);
     }
+    if name == "apply" {
+        let evaled_args: Vec<Value> =
+            args.iter().map(|a| eval(a, env, out)).collect::<Result<_, _>>()?;
+        return eval_apply(&evaled_args, env, out).map(Bounce::Done);
+    }
     let proc = env
         .get(name)
         .map(|rc| rc.borrow().clone())
@@ -102,7 +110,7 @@ fn eval_symbol_call_bounce(
         })?;
     let evaled_args: Vec<Value> =
         args.iter().map(|a| eval(a, env, out)).collect::<Result<_, _>>()?;
-    apply_bounce(&proc, &evaled_args, env)
+    apply_proc_bounce(&proc, &evaled_args, env, out)
 }
 
 /// Build the call environment and return a tail-call bounce.
@@ -113,6 +121,7 @@ fn apply_bounce(
 ) -> Result<Bounce, EvalError> {
     let Value::Lambda {
         params,
+        rest_param,
         body,
         closure,
     } = proc
@@ -122,7 +131,14 @@ fn apply_bounce(
         });
     };
 
-    if params.len() != args.len() {
+    if rest_param.is_some() {
+        if args.len() < params.len() {
+            return Err(EvalError::WrongArgCount {
+                expected: params.len(),
+                got: args.len(),
+            });
+        }
+    } else if params.len() != args.len() {
         return Err(EvalError::WrongArgCount {
             expected: params.len(),
             got: args.len(),
@@ -136,6 +152,13 @@ fn apply_bounce(
     for (param, arg) in params.iter().zip(args) {
         call_env.insert(param.clone(), Rc::new(RefCell::new(arg.clone())));
     }
+    if let Some(rest_name) = rest_param {
+        let rest_args = &args[params.len()..];
+        let rest_list = rest_args.iter().rev().fold(Value::Nil, |acc, v| {
+            Value::Pair(Box::new(v.clone()), Box::new(acc))
+        });
+        call_env.insert(rest_name.clone(), Rc::new(RefCell::new(rest_list)));
+    }
 
     Ok(Bounce::Call {
         expr: *body.clone(),
@@ -144,17 +167,201 @@ fn apply_bounce(
 }
 
 /// Non-tail apply: resolves the bounce immediately via `eval`.
-fn apply(
+fn apply_value(
     proc: &Value,
     args: &[Value],
-    caller_env: &Env,
+    caller_env: &mut Env,
     out: &mut String,
 ) -> Result<Value, EvalError> {
-    match apply_bounce(proc, args, caller_env)? {
-        Bounce::Done(val) => Ok(val),
-        Bounce::Call { expr, mut env } => eval(&expr, &mut env, out),
-        Bounce::Continue(expr) => {
-            unreachable!("apply_bounce returned Continue for {}", expr.display())
+    match proc {
+        Value::BuiltinProc(name) => call_builtin_with_values(name, args, caller_env, out),
+        Value::Lambda { .. } => match apply_bounce(proc, args, caller_env)? {
+            Bounce::Done(val) => Ok(val),
+            Bounce::Call { expr, mut env } => eval(&expr, &mut env, out),
+            Bounce::Continue(expr) => {
+                unreachable!("apply_bounce returned Continue for {}", expr.display())
+            }
+        },
+        _ => Err(EvalError::NotAProcedure {
+            value: proc.display(),
+        }),
+    }
+}
+
+/// Dispatch to either lambda apply or builtin call, returning a bounce.
+fn apply_proc_bounce(
+    proc: &Value,
+    args: &[Value],
+    env: &mut Env,
+    out: &mut String,
+) -> Result<Bounce, EvalError> {
+    match proc {
+        Value::BuiltinProc(name) => {
+            call_builtin_with_values(name, args, env, out).map(Bounce::Done)
+        }
+        Value::Lambda { .. } => apply_bounce(proc, args, env),
+        _ => Err(EvalError::NotAProcedure {
+            value: proc.display(),
+        }),
+    }
+}
+
+/// Call a builtin by name with already-evaluated argument values.
+fn call_builtin_with_values(
+    name: &str,
+    args: &[Value],
+    env: &mut Env,
+    out: &mut String,
+) -> Result<Value, EvalError> {
+    match name {
+        "+" | "-" | "*" | "/" => {
+            let values: Vec<i64> = args
+                .iter()
+                .map(|v| match v {
+                    Value::Integer(n) => Ok(*n),
+                    other => Err(EvalError::TypeError {
+                        expected: "integer".to_string(),
+                        got: other.display(),
+                    }),
+                })
+                .collect::<Result<_, _>>()?;
+            compute_arithmetic(name, &values)
+        }
+        "cons" => {
+            let [a, b] = args else {
+                return Err(EvalError::WrongArgCount { expected: 2, got: args.len() });
+            };
+            Ok(Value::Pair(Box::new(a.clone()), Box::new(b.clone())))
+        }
+        "car" => {
+            let [a] = args else {
+                return Err(EvalError::WrongArgCount { expected: 1, got: args.len() });
+            };
+            let Value::Pair(car, _) = a else {
+                return Err(EvalError::TypeError { expected: "pair".to_string(), got: a.display() });
+            };
+            Ok(*car.clone())
+        }
+        "cdr" => {
+            let [a] = args else {
+                return Err(EvalError::WrongArgCount { expected: 1, got: args.len() });
+            };
+            let Value::Pair(_, cdr) = a else {
+                return Err(EvalError::TypeError { expected: "pair".to_string(), got: a.display() });
+            };
+            Ok(*cdr.clone())
+        }
+        "null?" => {
+            let [a] = args else {
+                return Err(EvalError::WrongArgCount { expected: 1, got: args.len() });
+            };
+            Ok(Value::Boolean(matches!(a, Value::Nil)))
+        }
+        "list" => Ok(args.iter().rev().fold(Value::Nil, |acc, v| {
+            Value::Pair(Box::new(v.clone()), Box::new(acc))
+        })),
+        "length" => {
+            let [a] = args else {
+                return Err(EvalError::WrongArgCount { expected: 1, got: args.len() });
+            };
+            let items = a.to_list_vec().ok_or_else(|| EvalError::TypeError {
+                expected: "proper list".to_string(),
+                got: a.display(),
+            })?;
+            Ok(Value::Integer(items.len() as i64))
+        }
+        "not" => {
+            let [a] = args else {
+                return Err(EvalError::WrongArgCount { expected: 1, got: args.len() });
+            };
+            Ok(Value::Boolean(*a == Value::Boolean(false)))
+        }
+        "<" | ">" | "=" | "<=" | ">=" => {
+            let [lhs, rhs] = args else {
+                return Err(EvalError::WrongArgCount { expected: 2, got: args.len() });
+            };
+            let l = match lhs { Value::Integer(n) => *n, other => return Err(EvalError::TypeError { expected: "integer".to_string(), got: other.display() }) };
+            let r = match rhs { Value::Integer(n) => *n, other => return Err(EvalError::TypeError { expected: "integer".to_string(), got: other.display() }) };
+            let result = match name { "<" => l < r, ">" => l > r, "=" => l == r, "<=" => l <= r, ">=" => l >= r, _ => unreachable!() };
+            Ok(Value::Boolean(result))
+        }
+        "apply" => eval_apply(args, env, out),
+        _ => {
+            // For other builtins, wrap values back as quoted exprs and delegate
+            // This is a fallback for builtins not yet handled above
+            Err(EvalError::NotAProcedure {
+                value: format!("builtin {name} not supported in apply context"),
+            })
+        }
+    }
+}
+
+/// Implement (apply proc arg1 ... argN list)
+fn eval_apply(
+    args: &[Value],
+    env: &mut Env,
+    out: &mut String,
+) -> Result<Value, EvalError> {
+    if args.len() < 2 {
+        return Err(EvalError::WrongArgCount { expected: 2, got: args.len() });
+    }
+    let proc = &args[0];
+    let last = &args[args.len() - 1];
+    let tail_list = last.to_list_vec().ok_or_else(|| EvalError::TypeError {
+        expected: "proper list".to_string(),
+        got: last.display(),
+    })?;
+    let mut all_args: Vec<Value> = args[1..args.len() - 1].to_vec();
+    all_args.extend(tail_list);
+    apply_value(proc, &all_args, env, out)
+}
+
+/// Extract (name, params, rest_param) from a define header like (f x . rest) or (f x y).
+fn parse_define_header(header: &Value) -> Result<(String, Vec<String>, Option<String>), EvalError> {
+    let Value::Pair(car, cdr) = header else {
+        return Err(EvalError::TypeError {
+            expected: "pair".to_string(),
+            got: header.display(),
+        });
+    };
+    let Value::Symbol(name) = car.as_ref() else {
+        return Err(EvalError::TypeError {
+            expected: "symbol as function name".to_string(),
+            got: car.display(),
+        });
+    };
+    let (params, rest_param) = extract_params(cdr)?;
+    Ok((name.clone(), params, rest_param))
+}
+
+fn expect_symbol(value: &Value) -> Result<String, EvalError> {
+    match value {
+        Value::Symbol(s) => Ok(s.clone()),
+        other => Err(EvalError::TypeError {
+            expected: "symbol".to_string(),
+            got: other.display(),
+        }),
+    }
+}
+
+/// Extract params and optional rest from a parameter-list value (the cdr of the header pair).
+fn extract_params(value: &Value) -> Result<(Vec<String>, Option<String>), EvalError> {
+    let mut params = Vec::new();
+    let mut current = value;
+    loop {
+        match current {
+            Value::Nil => return Ok((params, None)),
+            Value::Symbol(s) => return Ok((params, Some(s.clone()))),
+            Value::Pair(car, cdr) => {
+                params.push(expect_symbol(car)?);
+                current = cdr;
+            }
+            other => {
+                return Err(EvalError::TypeError {
+                    expected: "parameter list".to_string(),
+                    got: other.display(),
+                })
+            }
         }
     }
 }
@@ -167,38 +374,19 @@ fn eval_define(args: &[Value], env: &mut Env, out: &mut String) -> Result<Value,
             env.insert(name.clone(), Rc::new(RefCell::new(val)));
             Ok(Value::Symbol(name.clone()))
         }
-        // (define (name params...) body) → (define name (lambda (params...) body))
+        // (define (name params...) body) or (define (name p1 . rest) body)
         [Value::Pair(..), body @ ..] => {
-            let header = args[0].to_list_vec().ok_or_else(|| EvalError::TypeError {
-                expected: "proper list".to_string(),
-                got: args[0].display(),
-            })?;
-            let [Value::Symbol(name), param_vals @ ..] = header.as_slice() else {
-                return Err(EvalError::TypeError {
-                    expected: "symbol as function name".to_string(),
-                    got: header[0].display(),
-                });
-            };
-            let params: Vec<String> = param_vals
-                .iter()
-                .map(|p| match p {
-                    Value::Symbol(s) => Ok(s.clone()),
-                    other => Err(EvalError::TypeError {
-                        expected: "symbol".to_string(),
-                        got: other.display(),
-                    }),
-                })
-                .collect::<Result<_, _>>()?;
-
+            let (name, params, rest_param) = parse_define_header(&args[0])?;
             let func_body = wrap_body(body)?;
 
             let lambda = Value::Lambda {
                 params,
+                rest_param,
                 body: Box::new(func_body),
                 closure: env.clone(),
             };
             env.insert(name.clone(), Rc::new(RefCell::new(lambda)));
-            Ok(Value::Symbol(name.clone()))
+            Ok(Value::Symbol(name))
         }
         _ => Err(EvalError::TypeError {
             expected: "symbol and value".to_string(),
@@ -296,6 +484,7 @@ fn eval_let_bounce(
     let func_body = wrap_body(body)?;
     let lambda = Value::Lambda {
         params,
+        rest_param: None,
         body: Box::new(func_body),
         closure: env.clone(),
     };
@@ -384,28 +573,13 @@ fn eval_lambda(args: &[Value], env: &Env) -> Result<Value, EvalError> {
         });
     };
 
-    let param_vals = param_list
-        .to_list_vec()
-        .ok_or_else(|| EvalError::TypeError {
-            expected: "parameter list".to_string(),
-            got: param_list.display(),
-        })?;
-
-    let params: Vec<String> = param_vals
-        .iter()
-        .map(|p| match p {
-            Value::Symbol(s) => Ok(s.clone()),
-            other => Err(EvalError::TypeError {
-                expected: "symbol".to_string(),
-                got: other.display(),
-            }),
-        })
-        .collect::<Result<_, _>>()?;
+    let (params, rest_param) = extract_params(param_list)?;
 
     let func_body = wrap_body(body)?;
 
     Ok(Value::Lambda {
         params,
+        rest_param,
         body: Box::new(func_body),
         closure: env.clone(),
     })
@@ -487,36 +661,27 @@ fn eval_arithmetic(
             }
         })
         .collect::<Result<_, _>>()?;
+    compute_arithmetic(op, &values)
+}
 
+fn compute_arithmetic(op: &str, values: &[i64]) -> Result<Value, EvalError> {
     let result = match op {
         "+" => values.iter().sum(),
         "*" => values.iter().product(),
         "-" => {
-            let [first, rest @ ..] = values.as_slice() else {
-                return Err(EvalError::WrongArgCount {
-                    expected: 1,
-                    got: 0,
-                });
+            let [first, rest @ ..] = values else {
+                return Err(EvalError::WrongArgCount { expected: 1, got: 0 });
             };
-            if rest.is_empty() {
-                -first
-            } else {
-                rest.iter().fold(*first, |acc, &v| acc - v)
-            }
+            if rest.is_empty() { -first } else { rest.iter().fold(*first, |acc, &v| acc - v) }
         }
         "/" => {
-            let [first, rest @ ..] = values.as_slice() else {
-                return Err(EvalError::WrongArgCount {
-                    expected: 1,
-                    got: 0,
-                });
+            let [first, rest @ ..] = values else {
+                return Err(EvalError::WrongArgCount { expected: 1, got: 0 });
             };
-            rest.iter()
-                .try_fold(*first, |acc, &v| checked_div(acc, v))?
+            rest.iter().try_fold(*first, |acc, &v| checked_div(acc, v))?
         }
         _ => unreachable!("unexpected arithmetic operator: {op}"),
     };
-
     Ok(Value::Integer(result))
 }
 
@@ -954,7 +1119,7 @@ fn eval_map(
     })?;
     let results: Vec<Value> = items
         .iter()
-        .map(|item| apply(&func, std::slice::from_ref(item), env, out))
+        .map(|item| apply_value(&func, std::slice::from_ref(item), env, out))
         .collect::<Result<_, _>>()?;
     Ok(results.into_iter().rev().fold(Value::Nil, |acc, v| {
         Value::Pair(Box::new(v), Box::new(acc))
