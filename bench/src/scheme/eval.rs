@@ -2,9 +2,8 @@ use super::{Env, EvalError, Value};
 
 pub(super) fn eval(value: &Value, env: &mut Env, out: &mut String) -> Result<Value, EvalError> {
     match value {
-        Value::Integer(_) | Value::Boolean(_) | Value::String(_) | Value::Lambda { .. } => {
-            Ok(value.clone())
-        }
+        Value::Integer(_) | Value::Boolean(_) | Value::String(_) | Value::Char(_)
+        | Value::Lambda { .. } => Ok(value.clone()),
         Value::Nil => Ok(Value::Nil),
         Value::Symbol(name) => env
             .get(name)
@@ -317,8 +316,12 @@ fn is_builtin(name: &str) -> bool {
         name,
         "+" | "-" | "*" | "/" | "<" | ">" | "=" | "<=" | ">=" | "not" | "and" | "or"
             | "cons" | "car" | "cdr" | "null?" | "list" | "length"
-            | "string?" | "number?" | "boolean?" | "pair?" | "symbol?"
+            | "string?" | "number?" | "boolean?" | "pair?" | "symbol?" | "char?"
             | "display" | "write" | "newline"
+            | "string-append" | "string-length" | "substring"
+            | "string->number" | "number->string"
+            | "symbol->string" | "string->symbol"
+            | "string-ref"
     )
 }
 
@@ -337,8 +340,12 @@ fn eval_builtin(
         "cons" | "car" | "cdr" | "null?" | "list" | "length" => {
             eval_list_builtin(name, args, env, out)
         }
-        "string?" | "number?" | "boolean?" | "pair?" | "symbol?" => {
+        "string?" | "number?" | "boolean?" | "pair?" | "symbol?" | "char?" => {
             eval_type_pred(name, args, env, out)
+        }
+        "string-append" | "string-length" | "substring" | "string->number"
+        | "number->string" | "symbol->string" | "string->symbol" | "string-ref" => {
+            eval_string_builtin(name, args, env, out)
         }
         "display" => eval_display(args, env, out),
         "write" => eval_write(args, env, out),
@@ -587,9 +594,163 @@ fn eval_type_pred(
         "boolean?" => matches!(val, Value::Boolean(_)),
         "pair?" => matches!(val, Value::Pair(..)),
         "symbol?" => matches!(val, Value::Symbol(_)),
+        "char?" => matches!(val, Value::Char(_)),
         _ => unreachable!("unexpected type predicate: {name}"),
     };
     Ok(Value::Boolean(result))
+}
+
+fn eval_string_builtin(
+    name: &str,
+    args: &[Value],
+    env: &mut Env,
+    out: &mut String,
+) -> Result<Value, EvalError> {
+    match name {
+        "string-append" => {
+            let parts: Vec<String> = args
+                .iter()
+                .map(|a| match eval(a, env, out)? {
+                    Value::String(s) => Ok(s),
+                    other => Err(EvalError::TypeError {
+                        expected: "string".to_string(),
+                        got: other.display(),
+                    }),
+                })
+                .collect::<Result<_, _>>()?;
+            Ok(Value::String(parts.concat()))
+        }
+        "string-length" => {
+            let [arg] = args else {
+                return Err(EvalError::WrongArgCount { expected: 1, got: args.len() });
+            };
+            match eval(arg, env, out)? {
+                Value::String(s) => Ok(Value::Integer(s.len() as i64)),
+                other => Err(EvalError::TypeError {
+                    expected: "string".to_string(),
+                    got: other.display(),
+                }),
+            }
+        }
+        "substring" => {
+            let [s_arg, start_arg, end_arg] = args else {
+                return Err(EvalError::WrongArgCount { expected: 3, got: args.len() });
+            };
+            let s = match eval(s_arg, env, out)? {
+                Value::String(s) => s,
+                other => {
+                    return Err(EvalError::TypeError {
+                        expected: "string".to_string(),
+                        got: other.display(),
+                    })
+                }
+            };
+            let start = match eval(start_arg, env, out)? {
+                Value::Integer(n) => n as usize,
+                other => {
+                    return Err(EvalError::TypeError {
+                        expected: "integer".to_string(),
+                        got: other.display(),
+                    })
+                }
+            };
+            let end = match eval(end_arg, env, out)? {
+                Value::Integer(n) => n as usize,
+                other => {
+                    return Err(EvalError::TypeError {
+                        expected: "integer".to_string(),
+                        got: other.display(),
+                    })
+                }
+            };
+            Ok(Value::String(s[start..end].to_string()))
+        }
+        "string->number" => {
+            let [arg] = args else {
+                return Err(EvalError::WrongArgCount { expected: 1, got: args.len() });
+            };
+            match eval(arg, env, out)? {
+                Value::String(s) => s
+                    .parse::<i64>()
+                    .map(Value::Integer)
+                    .map_err(|_| EvalError::TypeError {
+                        expected: "numeric string".to_string(),
+                        got: format!("\"{s}\""),
+                    }),
+                other => Err(EvalError::TypeError {
+                    expected: "string".to_string(),
+                    got: other.display(),
+                }),
+            }
+        }
+        "number->string" => {
+            let [arg] = args else {
+                return Err(EvalError::WrongArgCount { expected: 1, got: args.len() });
+            };
+            match eval(arg, env, out)? {
+                Value::Integer(n) => Ok(Value::String(n.to_string())),
+                other => Err(EvalError::TypeError {
+                    expected: "integer".to_string(),
+                    got: other.display(),
+                }),
+            }
+        }
+        "symbol->string" => {
+            let [arg] = args else {
+                return Err(EvalError::WrongArgCount { expected: 1, got: args.len() });
+            };
+            match eval(arg, env, out)? {
+                Value::Symbol(s) => Ok(Value::String(s)),
+                other => Err(EvalError::TypeError {
+                    expected: "symbol".to_string(),
+                    got: other.display(),
+                }),
+            }
+        }
+        "string->symbol" => {
+            let [arg] = args else {
+                return Err(EvalError::WrongArgCount { expected: 1, got: args.len() });
+            };
+            match eval(arg, env, out)? {
+                Value::String(s) => Ok(Value::Symbol(s)),
+                other => Err(EvalError::TypeError {
+                    expected: "string".to_string(),
+                    got: other.display(),
+                }),
+            }
+        }
+        "string-ref" => {
+            let [s_arg, idx_arg] = args else {
+                return Err(EvalError::WrongArgCount { expected: 2, got: args.len() });
+            };
+            let s = match eval(s_arg, env, out)? {
+                Value::String(s) => s,
+                other => {
+                    return Err(EvalError::TypeError {
+                        expected: "string".to_string(),
+                        got: other.display(),
+                    })
+                }
+            };
+            let idx = match eval(idx_arg, env, out)? {
+                Value::Integer(n) => n as usize,
+                other => {
+                    return Err(EvalError::TypeError {
+                        expected: "integer".to_string(),
+                        got: other.display(),
+                    })
+                }
+            };
+            s.chars()
+                .nth(idx)
+                .map(Value::Char)
+                .ok_or_else(|| EvalError::TypeError {
+                    expected: format!("index < {}", s.len()),
+                    got: idx.to_string(),
+                })
+        }
+        _ => unreachable!("unexpected string builtin: {name}"),
+    }
 }
 
 fn eval_display(args: &[Value], env: &mut Env, out: &mut String) -> Result<Value, EvalError> {

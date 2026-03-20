@@ -19,6 +19,7 @@ enum Value {
     Boolean(bool),
     String(String),
     Symbol(String),
+    Char(char),
     Pair(Box<Value>, Box<Value>),
     Nil,
     Lambda {
@@ -36,6 +37,7 @@ impl Value {
             Value::Boolean(false) => "#f".to_string(),
             Value::String(s) => format!("\"{s}\""),
             Value::Symbol(s) => s.clone(),
+            Value::Char(c) => format!("#\\{c}"),
             Value::Nil => "()".to_string(),
             Value::Lambda { .. } => "#<procedure>".to_string(),
             Value::Pair(..) => self.fmt_list(false),
@@ -46,6 +48,7 @@ impl Value {
     fn display_human(&self) -> String {
         match self {
             Value::String(s) => s.clone(),
+            Value::Char(c) => c.to_string(),
             Value::Pair(..) => self.fmt_list(true),
             _ => self.display(),
         }
