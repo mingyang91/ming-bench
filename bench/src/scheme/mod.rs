@@ -66,6 +66,13 @@ impl Value {
             Value::Lambda { .. } => "#<procedure>".to_string(),
         }
     }
+
+    fn display_string(&self) -> String {
+        match self {
+            Value::Str(s) => s.clone(),
+            other => other.to_scheme_string(),
+        }
+    }
 }
 
 fn parse_atom(input: &str) -> Value {
@@ -169,7 +176,7 @@ fn expr_to_value(expr: &Expr) -> Value {
     }
 }
 
-fn eval(expr: &Expr, env: &mut Env) -> Result<Value, EvalError> {
+fn eval(expr: &Expr, env: &mut Env, output: &mut String) -> Result<Value, EvalError> {
     match &expr.kind {
         ExprKind::Value(Value::Symbol(name)) => {
             if let Some(v) = env.get(name) {
@@ -185,8 +192,8 @@ fn eval(expr: &Expr, env: &mut Env) -> Result<Value, EvalError> {
             }
             if let ExprKind::Value(Value::Symbol(name)) = &items[0].kind {
                 match name.as_str() {
-                    "define" => eval_define(items, expr, env),
-                    "if" => eval_if(items, expr, env),
+                    "define" => eval_define(items, expr, env, output),
+                    "if" => eval_if(items, expr, env, output),
                     "quote" => {
                         if items.len() != 2 {
                             return Err(err_at("quote requires 1 argument", expr.line, expr.col));
@@ -197,20 +204,43 @@ fn eval(expr: &Expr, env: &mut Env) -> Result<Value, EvalError> {
                     "begin" => {
                         let mut result = Value::Symbol("".to_string());
                         for e in &items[1..] {
-                            result = eval(e, env)?;
+                            result = eval(e, env, output)?;
                         }
                         Ok(result)
                     }
-                    "let" => eval_let(items, expr, env),
-                    "cond" => eval_cond(items, expr, env),
-                    "and" => eval_and(&items[1..], env),
-                    "or" => eval_or(&items[1..], env),
+                    "let" => eval_let(items, expr, env, output),
+                    "cond" => eval_cond(items, expr, env, output),
+                    "and" => eval_and(&items[1..], env, output),
+                    "or" => eval_or(&items[1..], env, output),
+                    "display" => {
+                        if items.len() != 2 {
+                            return Err(err_at("display requires 1 argument", expr.line, expr.col));
+                        }
+                        let val = eval(&items[1], env, output)?;
+                        output.push_str(&val.display_string());
+                        Ok(Value::Symbol("".to_string()))
+                    }
+                    "write" => {
+                        if items.len() != 2 {
+                            return Err(err_at("write requires 1 argument", expr.line, expr.col));
+                        }
+                        let val = eval(&items[1], env, output)?;
+                        output.push_str(&val.to_scheme_string());
+                        Ok(Value::Symbol("".to_string()))
+                    }
+                    "newline" => {
+                        if items.len() != 1 {
+                            return Err(err_at("newline takes no arguments", expr.line, expr.col));
+                        }
+                        output.push('\n');
+                        Ok(Value::Symbol("".to_string()))
+                    }
                     _ => {
                         if let Some(func_val) = env.get(name).cloned() {
                             if let Value::Lambda { .. } = &func_val {
                                 let mut eval_args = Vec::new();
                                 for a in &items[1..] {
-                                    eval_args.push(eval(a, env)?);
+                                    eval_args.push(eval(a, env, output)?);
                                 }
                                 return apply_lambda(
                                     &func_val,
@@ -218,21 +248,22 @@ fn eval(expr: &Expr, env: &mut Env) -> Result<Value, EvalError> {
                                     Some(name),
                                     expr.line,
                                     expr.col,
+                                    output,
                                 );
                             }
                         }
-                        apply_builtin(name, &items[1..], env, expr.line, expr.col)
+                        apply_builtin(name, &items[1..], env, expr.line, expr.col, output)
                     }
                 }
             } else {
-                let func_val = eval(&items[0], env)?;
+                let func_val = eval(&items[0], env, output)?;
                 match func_val {
                     Value::Lambda { .. } => {
                         let mut eval_args = Vec::new();
                         for a in &items[1..] {
-                            eval_args.push(eval(a, env)?);
+                            eval_args.push(eval(a, env, output)?);
                         }
-                        apply_lambda(&func_val, &eval_args, None, expr.line, expr.col)
+                        apply_lambda(&func_val, &eval_args, None, expr.line, expr.col, output)
                     }
                     _ => Err(err_at(
                         format!("not a procedure: {}", func_val.to_scheme_string()),
@@ -245,7 +276,7 @@ fn eval(expr: &Expr, env: &mut Env) -> Result<Value, EvalError> {
     }
 }
 
-fn eval_define(items: &[Expr], expr: &Expr, env: &mut Env) -> Result<Value, EvalError> {
+fn eval_define(items: &[Expr], expr: &Expr, env: &mut Env, output: &mut String) -> Result<Value, EvalError> {
     if items.len() < 3 {
         return Err(err_at("define requires 2 arguments", expr.line, expr.col));
     }
@@ -254,7 +285,7 @@ fn eval_define(items: &[Expr], expr: &Expr, env: &mut Env) -> Result<Value, Eval
             if items.len() != 3 {
                 return Err(err_at("define requires 2 arguments", expr.line, expr.col));
             }
-            let val = eval(&items[2], env)?;
+            let val = eval(&items[2], env, output)?;
             env.insert(s.clone(), val);
         }
         ExprKind::List(sig) => {
@@ -301,7 +332,7 @@ fn eval_define(items: &[Expr], expr: &Expr, env: &mut Env) -> Result<Value, Eval
     Ok(Value::Symbol("".to_string()))
 }
 
-fn eval_if(items: &[Expr], expr: &Expr, env: &mut Env) -> Result<Value, EvalError> {
+fn eval_if(items: &[Expr], expr: &Expr, env: &mut Env, output: &mut String) -> Result<Value, EvalError> {
     if items.len() < 3 || items.len() > 4 {
         return Err(err_at(
             "if requires 2 or 3 arguments",
@@ -309,11 +340,11 @@ fn eval_if(items: &[Expr], expr: &Expr, env: &mut Env) -> Result<Value, EvalErro
             expr.col,
         ));
     }
-    let cond = eval(&items[1], env)?;
+    let cond = eval(&items[1], env, output)?;
     if !is_falsy(&cond) {
-        eval(&items[2], env)
+        eval(&items[2], env, output)
     } else if items.len() == 4 {
-        eval(&items[3], env)
+        eval(&items[3], env, output)
     } else {
         Ok(Value::Symbol("".to_string()))
     }
@@ -355,7 +386,7 @@ fn eval_lambda(items: &[Expr], expr: &Expr, env: &mut Env) -> Result<Value, Eval
     })
 }
 
-fn eval_let(items: &[Expr], expr: &Expr, env: &mut Env) -> Result<Value, EvalError> {
+fn eval_let(items: &[Expr], expr: &Expr, env: &mut Env, output: &mut String) -> Result<Value, EvalError> {
     if items.len() < 3 {
         return Err(err_at(
             "let requires bindings and body",
@@ -387,7 +418,7 @@ fn eval_let(items: &[Expr], expr: &Expr, env: &mut Env) -> Result<Value, EvalErr
                         ))
                     }
                 };
-                let val = eval(&pair[1], env)?;
+                let val = eval(&pair[1], env, output)?;
                 local_env.insert(bname, val);
             }
             _ => {
@@ -401,12 +432,12 @@ fn eval_let(items: &[Expr], expr: &Expr, env: &mut Env) -> Result<Value, EvalErr
     }
     let mut result = Value::Symbol("".to_string());
     for e in &items[2..] {
-        result = eval(e, &mut local_env)?;
+        result = eval(e, &mut local_env, output)?;
     }
     Ok(result)
 }
 
-fn eval_cond(items: &[Expr], expr: &Expr, env: &mut Env) -> Result<Value, EvalError> {
+fn eval_cond(items: &[Expr], expr: &Expr, env: &mut Env, output: &mut String) -> Result<Value, EvalError> {
     let _ = expr; // position available if needed
     for clause in &items[1..] {
         match &clause.kind {
@@ -414,15 +445,15 @@ fn eval_cond(items: &[Expr], expr: &Expr, env: &mut Env) -> Result<Value, EvalEr
                 if matches!(&parts[0].kind, ExprKind::Value(Value::Symbol(s)) if s == "else") {
                     let mut result = Value::Symbol("".to_string());
                     for e in &parts[1..] {
-                        result = eval(e, env)?;
+                        result = eval(e, env, output)?;
                     }
                     return Ok(result);
                 }
-                let test = eval(&parts[0], env)?;
+                let test = eval(&parts[0], env, output)?;
                 if !is_falsy(&test) {
                     let mut result = Value::Symbol("".to_string());
                     for e in &parts[1..] {
-                        result = eval(e, env)?;
+                        result = eval(e, env, output)?;
                     }
                     return Ok(result);
                 }
@@ -445,6 +476,7 @@ fn apply_lambda(
     self_name: Option<&str>,
     call_line: usize,
     call_col: usize,
+    output: &mut String,
 ) -> Result<Value, EvalError> {
     if let Value::Lambda { params, body, env } = func {
         if params.len() != args.len() {
@@ -463,7 +495,7 @@ fn apply_lambda(
         }
         let mut result = Value::Symbol("".to_string());
         for expr in body {
-            result = eval(expr, &mut local_env)?;
+            result = eval(expr, &mut local_env, output)?;
         }
         Ok(result)
     } else {
@@ -477,10 +509,11 @@ fn apply_builtin(
     env: &mut Env,
     call_line: usize,
     call_col: usize,
+    output: &mut String,
 ) -> Result<Value, EvalError> {
     let mut eval_args = Vec::with_capacity(args.len());
     for a in args {
-        eval_args.push(eval(a, env)?);
+        eval_args.push(eval(a, env, output)?);
     }
     match name {
         "+" => {
@@ -707,13 +740,13 @@ fn is_falsy(val: &Value) -> bool {
     matches!(val, Value::Boolean(false))
 }
 
-fn eval_and(args: &[Expr], env: &mut Env) -> Result<Value, EvalError> {
+fn eval_and(args: &[Expr], env: &mut Env, output: &mut String) -> Result<Value, EvalError> {
     if args.is_empty() {
         return Ok(Value::Boolean(true));
     }
     let mut result = Value::Boolean(true);
     for arg in args {
-        result = eval(arg, env)?;
+        result = eval(arg, env, output)?;
         if is_falsy(&result) {
             return Ok(result);
         }
@@ -721,13 +754,13 @@ fn eval_and(args: &[Expr], env: &mut Env) -> Result<Value, EvalError> {
     Ok(result)
 }
 
-fn eval_or(args: &[Expr], env: &mut Env) -> Result<Value, EvalError> {
+fn eval_or(args: &[Expr], env: &mut Env, output: &mut String) -> Result<Value, EvalError> {
     if args.is_empty() {
         return Ok(Value::Boolean(false));
     }
     let mut result = Value::Boolean(false);
     for arg in args {
-        result = eval(arg, env)?;
+        result = eval(arg, env, output)?;
         if !is_falsy(&result) {
             return Ok(result);
         }
@@ -752,9 +785,10 @@ pub fn eval_str(input: &str) -> Result<String, EvalError> {
     let mut remaining = input;
     let mut last_value = None;
     let mut env = Env::new();
+    let mut output = String::new();
     while !remaining.trim().is_empty() {
         let (expr, rest) = parse_expr(remaining, input)?;
-        last_value = Some(eval(&expr, &mut env)?);
+        last_value = Some(eval(&expr, &mut env, &mut output)?);
         remaining = rest;
     }
     match last_value {
@@ -765,8 +799,20 @@ pub fn eval_str(input: &str) -> Result<String, EvalError> {
 
 /// Evaluate Scheme expressions, returning both the result value and
 /// any output produced by `display`, `write`, or `newline`.
-pub fn eval_str_with_output(_input: &str) -> Result<(String, String), EvalError> {
-    todo!()
+pub fn eval_str_with_output(input: &str) -> Result<(String, String), EvalError> {
+    let mut remaining = input;
+    let mut last_value = None;
+    let mut env = Env::new();
+    let mut output = String::new();
+    while !remaining.trim().is_empty() {
+        let (expr, rest) = parse_expr(remaining, input)?;
+        last_value = Some(eval(&expr, &mut env, &mut output)?);
+        remaining = rest;
+    }
+    match last_value {
+        Some(v) => Ok((v.to_scheme_string(), output)),
+        None => Err(EvalError::Parse("empty input".to_string())),
+    }
 }
 
 #[cfg(test)]
