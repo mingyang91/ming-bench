@@ -1,83 +1,40 @@
 use crate::scheme::eval_str;
 
-// ===== Level 14: First-Class Continuations — call/cc =====
+// ===== Level 14: set! and Mutation =====
 
 #[test]
-fn test_l14_callcc_nonlocal_exit() {
+fn test_l14_set_basic() {
     assert_eq!(
-        eval_str(include_str!("fixtures/l14_callcc_nonlocal_exit.scm").trim()),
-        Ok("42".into())
+        eval_str(include_str!("fixtures/l14_set_basic.scm").trim()),
+        Ok("2".into())
     );
 }
 
 #[test]
-fn test_l14_callcc_no_escape() {
-    assert_eq!(
-        eval_str(include_str!("fixtures/l14_callcc_no_escape.scm").trim()),
-        Ok("7".into())
-    );
+fn test_l14_set_unbound_error() {
+    assert!(eval_str(include_str!("fixtures/l14_set_unbound_error.scm").trim()).is_err());
 }
 
 #[test]
-fn test_l14_callcc_early_return() {
+fn test_l14_counter() {
     assert_eq!(
-        eval_str(include_str!("fixtures/l14_callcc_early_return.scm").trim()),
-        Ok("-2".into())
-    );
-}
-
-#[test]
-fn test_l14_callcc_saved_continuation() {
-    assert_eq!(
-        eval_str(include_str!("fixtures/l14_callcc_saved_continuation.scm").trim()),
-        Ok("42".into())
-    );
-}
-
-#[test]
-fn test_l14_callcc_as_value() {
-    assert_eq!(
-        eval_str(include_str!("fixtures/l14_callcc_as_value.scm").trim()),
-        Ok("11".into())
-    );
-}
-
-#[test]
-fn test_l14_callcc_reentrant() {
-    assert_eq!(
-        eval_str(include_str!("fixtures/l14_callcc_reentrant.scm").trim()),
+        eval_str(include_str!("fixtures/l14_counter.scm").trim()),
         Ok("3".into())
     );
 }
 
 #[test]
-fn test_l14_callcc_exception_handler() {
+fn test_l14_shared_state() {
     assert_eq!(
-        eval_str(include_str!("fixtures/l14_callcc_exception_handler.scm").trim()),
-        Ok("(error 42)".into())
+        eval_str(include_str!("fixtures/l14_shared_state.scm").trim()),
+        Ok("42".into())
     );
 }
 
 #[test]
-fn test_l14_callcc_is_first_class() {
+fn test_l14_set_in_loop() {
     assert_eq!(
-        eval_str(include_str!("fixtures/l14_callcc_is_first_class.scm").trim()),
-        Ok("7".into())
-    );
-}
-
-#[test]
-fn test_l14_callcc_resumes_lambda_body() {
-    assert_eq!(
-        eval_str(include_str!("fixtures/l14_callcc_resumes_lambda_body.scm").trim()),
-        Ok("3".into())
-    );
-}
-
-#[test]
-fn test_l14_callcc_resumes_pending_application() {
-    assert_eq!(
-        eval_str(include_str!("fixtures/l14_callcc_resumes_pending_application.scm").trim()),
-        Ok("43".into())
+        eval_str(include_str!("fixtures/l14_set_in_loop.scm").trim()),
+        Ok("55".into())
     );
 }

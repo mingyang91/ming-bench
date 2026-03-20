@@ -27,7 +27,7 @@ pub struct RunAgentArgs {
 }
 
 const DEFAULT_PROMPT: &str = "Implement the Scheme interpreter by following CLAUDE.md exactly.
-Work through levels 1 through 16 in order.
+Work through levels 1 through 19 in order.
 After implementing each level, run cargo xtask test NN to verify.
 Fix failures before proceeding. Do not skip levels.";
 
@@ -618,11 +618,9 @@ fn turns_for_level(level_num: u32, max_turns: Option<u32>) -> u32 {
         return t;
     }
     if level_num <= 9 {
-        60
-    } else if level_num <= 13 {
-        100
+        40
     } else {
-        160
+        60
     }
 }
 

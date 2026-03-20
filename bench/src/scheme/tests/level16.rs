@@ -1,43 +1,43 @@
 use crate::scheme::eval_str;
 
-// ===== Level 16: Comprehensive Integration =====
+// ===== Level 16: Tail Position in All Forms =====
 
 #[test]
-fn test_l16_callcc_with_mutation() {
+fn test_l16_tco_cond() {
     assert_eq!(
-        eval_str(include_str!("fixtures/l16_callcc_with_mutation.scm").trim()),
-        Ok("4".into())
+        eval_str(include_str!("fixtures/l16_tco_cond.scm").trim()),
+        Ok("done".into())
     );
 }
 
 #[test]
-fn test_l16_macro_tco_loop() {
+fn test_l16_tco_named_let() {
     assert_eq!(
-        eval_str(include_str!("fixtures/l16_macro_tco_loop.scm").trim()),
-        Ok("1000000".into())
+        eval_str(include_str!("fixtures/l16_tco_named_let.scm").trim()),
+        Ok("done".into())
     );
 }
 
 #[test]
-fn test_l16_callcc_try_catch() {
+fn test_l16_tco_and_or() {
     assert_eq!(
-        eval_str(include_str!("fixtures/l16_callcc_try_catch.scm").trim()),
-        Ok("(caught 42)".into())
+        eval_str(include_str!("fixtures/l16_tco_and_or.scm").trim()),
+        Ok("#t".into())
     );
 }
 
 #[test]
-fn test_l16_coroutine_scheduler() {
+fn test_l16_tco_begin() {
     assert_eq!(
-        eval_str(include_str!("fixtures/l16_coroutine_scheduler.scm").trim()),
-        Ok("4".into())
+        eval_str(include_str!("fixtures/l16_tco_begin.scm").trim()),
+        Ok("done".into())
     );
 }
 
 #[test]
-fn test_l16_church_booleans_with_callcc() {
+fn test_l16_tco_let_body() {
     assert_eq!(
-        eval_str(include_str!("fixtures/l16_church_booleans_with_callcc.scm").trim()),
-        Ok("yes".into())
+        eval_str(include_str!("fixtures/l16_tco_let_body.scm").trim()),
+        Ok("done".into())
     );
 }

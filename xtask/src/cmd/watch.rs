@@ -277,7 +277,7 @@ fn level_progress(run_dir: &Path) -> String {
     }
 
     if total > 0 {
-        format!("{last_level} ({passed}/16)")
+        format!("{last_level} ({passed}/{})", crate::model::LEVELS.len())
     } else {
         "---".to_string()
     }

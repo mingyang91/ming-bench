@@ -1,40 +1,45 @@
-use crate::scheme::eval_str;
+use crate::scheme::eval_str_with_output;
 
-// ===== Level 11: set! and Mutation =====
+// ===== Level 11: Display, Write, Newline =====
 
 #[test]
-fn test_l11_set_basic() {
-    assert_eq!(
-        eval_str(include_str!("fixtures/l11_set_basic.scm").trim()),
-        Ok("2".into())
-    );
+fn test_l11_display_number() {
+    let (_, output) =
+        eval_str_with_output(include_str!("fixtures/l11_display_number.scm").trim()).unwrap();
+    assert_eq!(output, "42");
 }
 
 #[test]
-fn test_l11_set_unbound_error() {
-    assert!(eval_str(include_str!("fixtures/l11_set_unbound_error.scm").trim()).is_err());
+fn test_l11_display_string() {
+    let (_, output) =
+        eval_str_with_output(include_str!("fixtures/l11_display_string.scm").trim()).unwrap();
+    assert_eq!(output, "hello");
 }
 
 #[test]
-fn test_l11_counter() {
-    assert_eq!(
-        eval_str(include_str!("fixtures/l11_counter.scm").trim()),
-        Ok("3".into())
-    );
+fn test_l11_write_string() {
+    let (_, output) =
+        eval_str_with_output(include_str!("fixtures/l11_write_string.scm").trim()).unwrap();
+    assert_eq!(output, "\"hello\"");
 }
 
 #[test]
-fn test_l11_shared_state() {
-    assert_eq!(
-        eval_str(include_str!("fixtures/l11_shared_state.scm").trim()),
-        Ok("42".into())
-    );
+fn test_l11_newline() {
+    let (_, output) =
+        eval_str_with_output(include_str!("fixtures/l11_newline.scm").trim()).unwrap();
+    assert_eq!(output, "\n");
 }
 
 #[test]
-fn test_l11_set_in_loop() {
-    assert_eq!(
-        eval_str(include_str!("fixtures/l11_set_in_loop.scm").trim()),
-        Ok("55".into())
-    );
+fn test_l11_display_list() {
+    let (_, output) =
+        eval_str_with_output(include_str!("fixtures/l11_display_list.scm").trim()).unwrap();
+    assert_eq!(output, "(1 2 3)");
+}
+
+#[test]
+fn test_l11_multiple_display() {
+    let (_, output) =
+        eval_str_with_output(include_str!("fixtures/l11_multiple_display.scm").trim()).unwrap();
+    assert_eq!(output, "123");
 }

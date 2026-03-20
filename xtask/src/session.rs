@@ -174,7 +174,7 @@ pub fn session_files(run_dir: &Path) -> Vec<(String, PathBuf)> {
         files.push(("full".to_string(), top));
     }
 
-    // Check for level directories (L01..L16)
+    // Check for level directories (L01..L19)
     for level in crate::model::LEVELS {
         let level_dir = run_dir.join(format!("L{level}"));
         let session = level_dir.join("session.jsonl");

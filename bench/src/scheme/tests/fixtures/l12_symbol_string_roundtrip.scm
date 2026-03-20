@@ -1,0 +1,1 @@
+(string->symbol (symbol->string 'hello))

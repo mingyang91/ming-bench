@@ -25,14 +25,14 @@ cargo xtask test 05   # test level 5
 cargo xtask test all  # test all levels (300s timeout)
 ```
 
-- A level argument is required (e.g., `01`, `16`, or `all`)
+- A level argument is required (e.g., `01`, `19`, or `all`)
 - Tests run in a container with 1GB memory, 1 CPU
 - Per-level timeout: 30s. Full suite (`all`): 300s. Exceeding these or OOM = failing
 - Build the container image first if not already built: `cargo xtask setup`
 
 ## Development Strategy
 
-- **Implement levels in order (L1 → L16).** Each level builds on the previous.
+- **Implement levels in order (L1 → L19).** Each level builds on the previous.
 - **After implementing each level, run its tests before moving on.**
 - **Do not skip ahead.** Later levels depend on earlier ones being correct.
 - **If a level's tests fail, fix them before proceeding.**

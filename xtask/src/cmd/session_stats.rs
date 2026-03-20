@@ -173,10 +173,11 @@ pub fn run(run_arg: PathBuf) -> Result<()> {
         let first = levels_attempted.first().unwrap();
         let last = levels_attempted.last().unwrap();
         println!(
-            "  Levels attempted: {}-{} ({}/16)",
+            "  Levels attempted: {}-{} ({}/{})",
             first,
             last,
-            levels_attempted.len()
+            levels_attempted.len(),
+            crate::model::LEVELS.len()
         );
     }
 

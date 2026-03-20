@@ -14,5 +14,11 @@ pub fn eval_str(_input: &str) -> Result<String, EvalError> {
     todo!()
 }
 
+/// Evaluate Scheme expressions, returning both the result value and
+/// any output produced by `display`, `write`, or `newline`.
+pub fn eval_str_with_output(_input: &str) -> Result<(String, String), EvalError> {
+    todo!()
+}
+
 #[cfg(test)]
 mod tests;

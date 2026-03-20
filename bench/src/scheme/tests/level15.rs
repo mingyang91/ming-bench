@@ -1,51 +1,51 @@
 use crate::scheme::eval_str;
 
-// ===== Level 15: define-syntax / syntax-rules =====
+// ===== Level 15: Variadic & apply =====
 
 #[test]
-fn test_l15_simple_macro() {
+fn test_l15_rest_args() {
     assert_eq!(
-        eval_str(include_str!("fixtures/l15_simple_macro.scm").trim()),
-        Ok("1".into())
+        eval_str(include_str!("fixtures/l15_rest_args.scm").trim()),
+        Ok("(2 3)".into())
     );
 }
 
 #[test]
-fn test_l15_my_and_macro() {
+fn test_l15_rest_args_empty() {
     assert_eq!(
-        eval_str(include_str!("fixtures/l15_my_and_macro.scm").trim()),
-        Ok("3".into())
+        eval_str(include_str!("fixtures/l15_rest_args_empty.scm").trim()),
+        Ok("()".into())
     );
 }
 
 #[test]
-fn test_l15_swap_hygiene() {
+fn test_l15_apply_builtin() {
     assert_eq!(
-        eval_str(include_str!("fixtures/l15_swap_hygiene.scm").trim()),
-        Ok("(2 1)".into())
+        eval_str(include_str!("fixtures/l15_apply_builtin.scm").trim()),
+        Ok("6".into())
     );
 }
 
 #[test]
-fn test_l15_variadic_pattern() {
+fn test_l15_apply_prefix_args() {
     assert_eq!(
-        eval_str(include_str!("fixtures/l15_variadic_pattern.scm").trim()),
-        Ok("(1 2 3)".into())
-    );
-}
-
-#[test]
-fn test_l15_nested_macro() {
-    assert_eq!(
-        eval_str(include_str!("fixtures/l15_nested_macro.scm").trim()),
-        Ok("2".into())
-    );
-}
-
-#[test]
-fn test_l15_macro_keeps_definition_site_binding() {
-    assert_eq!(
-        eval_str(include_str!("fixtures/l15_macro_keeps_definition_site_binding.scm").trim()),
+        eval_str(include_str!("fixtures/l15_apply_prefix_args.scm").trim()),
         Ok("10".into())
+    );
+}
+
+#[test]
+fn test_l15_apply_user_fn() {
+    assert_eq!(
+        eval_str(include_str!("fixtures/l15_apply_user_fn.scm").trim()),
+        Ok("15".into())
+    );
+}
+
+#[test]
+fn test_l15_apply_as_value() {
+    assert_eq!(
+        eval_str(include_str!("fixtures/l15_apply_as_value.scm").trim()),
+        Ok("6".into())
     );
 }

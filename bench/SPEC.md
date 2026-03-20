@@ -56,23 +56,32 @@ User-defined `map`, `filter`, `append`, `reverse` using the primitives from Leve
 ### Level 9 — Type Predicates
 `string?`, `number?`, `boolean?`, `pair?`, `symbol?` — each returns `#t` or `#f`.
 
-### Level 10 — Tail Call Optimization
+### Level 10 — Error Quality
+All error messages must include source position info (line:col). Errors for undefined variables, wrong argument count, type mismatches, syntax errors, and division by zero must carry position information.
+
+### Level 11 — Display, Write, Newline
+`display` outputs a value without quotes. `write` outputs with quotes (for strings). `newline` outputs a newline. Implement `eval_str_with_output` to capture side-effect output alongside the expression result.
+
+### Level 12 — String & Symbol Operations
+`string-append`, `string-length`, `substring`, `string->number`, `number->string`. `symbol->string`, `string->symbol`. `string-ref` returns a character; `char?` predicate.
+
+### Level 13 — Tail Call Optimization
 Tail-position calls must not grow the stack. `(loop 1000000)` with a tail-recursive body must not overflow.
 
-### Level 11 — set! & Mutation
+### Level 14 — set! & Mutation
 `set!` mutates an existing binding (error if unbound). Closures that share a binding observe each other's mutations.
 
-### Level 12 — Variadic & Apply
+### Level 15 — Variadic & Apply
 Dot notation for rest parameters: `(define (f x . rest) rest)`. `apply` calls a function with an argument list. `apply` accepts prefix arguments: `(apply + 1 2 '(3 4))`.
 
-### Level 13 — Tail Position in All Forms
+### Level 16 — Tail Position in All Forms
 TCO must work through `cond`, named `let`, `and`, `or`, `begin`, and `let` body — not just `if`.
 
-### Level 14 — First-Class Continuations
+### Level 17 — First-Class Continuations
 `call/cc` (call-with-current-continuation) captures the current continuation as a first-class value. Supports: non-local exit, saving and resuming continuations, continuations as values passed to higher-order functions.
 
-### Level 15 — Hygienic Macros
+### Level 18 — Hygienic Macros
 `define-syntax` + `syntax-rules`. Pattern matching with literals and ellipsis (`...`). Macro-introduced bindings do not capture user bindings (hygiene). Definition-site bindings are preserved.
 
-### Level 16 — Integration
+### Level 19 — Integration
 Combined use of continuations, macros, mutation, and tail calls.

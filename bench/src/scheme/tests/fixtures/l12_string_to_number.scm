@@ -1,0 +1,1 @@
+(string->number "42")
