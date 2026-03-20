@@ -41,16 +41,7 @@ pub fn run(args: RunAgentArgs) -> Result<()> {
     let start_time = iso_now();
     let prompt = args.prompt.as_deref().unwrap_or(DEFAULT_PROMPT);
 
-    // Default non-Claude agents to levels mode
-    let mode = if args.agent != "claude" && args.mode == "full" {
-        println!(
-            "NOTE: Defaulting to --mode levels for {} (override with explicit --mode full)",
-            args.agent
-        );
-        "levels".to_string()
-    } else {
-        args.mode.clone()
-    };
+    let mode = args.mode.clone();
 
     // --- Worktree path ---
     let worktree_dir = proj
