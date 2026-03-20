@@ -1542,6 +1542,51 @@ fn call_builtin_values(
             }
             Ok(Value::Boolean(matches!(&eval_args[0], Value::Char(_))))
         }
+        "zero?" => {
+            if eval_args.len() != 1 {
+                return Err(err_at("zero? requires 1 argument", call_line, call_col));
+            }
+            match &eval_args[0] {
+                Value::Integer(n) => Ok(Value::Boolean(*n == 0)),
+                _ => Err(err_at("zero? requires a number", call_line, call_col)),
+            }
+        }
+        "positive?" => {
+            if eval_args.len() != 1 {
+                return Err(err_at("positive? requires 1 argument", call_line, call_col));
+            }
+            match &eval_args[0] {
+                Value::Integer(n) => Ok(Value::Boolean(*n > 0)),
+                _ => Err(err_at("positive? requires a number", call_line, call_col)),
+            }
+        }
+        "negative?" => {
+            if eval_args.len() != 1 {
+                return Err(err_at("negative? requires 1 argument", call_line, call_col));
+            }
+            match &eval_args[0] {
+                Value::Integer(n) => Ok(Value::Boolean(*n < 0)),
+                _ => Err(err_at("negative? requires a number", call_line, call_col)),
+            }
+        }
+        "odd?" => {
+            if eval_args.len() != 1 {
+                return Err(err_at("odd? requires 1 argument", call_line, call_col));
+            }
+            match &eval_args[0] {
+                Value::Integer(n) => Ok(Value::Boolean(n % 2 != 0)),
+                _ => Err(err_at("odd? requires a number", call_line, call_col)),
+            }
+        }
+        "even?" => {
+            if eval_args.len() != 1 {
+                return Err(err_at("even? requires 1 argument", call_line, call_col));
+            }
+            match &eval_args[0] {
+                Value::Integer(n) => Ok(Value::Boolean(n % 2 == 0)),
+                _ => Err(err_at("even? requires a number", call_line, call_col)),
+            }
+        }
         "string-append" => {
             let mut result = String::new();
             for a in &eval_args {
