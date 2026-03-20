@@ -1490,6 +1490,18 @@ fn call_builtin_values(
             }
             eval_callcc(&eval_args[0], call_line, call_col, output)
         }
+        "equal?" => {
+            if eval_args.len() != 2 {
+                return Err(err_at("equal? requires 2 arguments", call_line, call_col));
+            }
+            Ok(Value::Boolean(eval_args[0] == eval_args[1]))
+        }
+        "eq?" => {
+            if eval_args.len() != 2 {
+                return Err(err_at("eq? requires 2 arguments", call_line, call_col));
+            }
+            Ok(Value::Boolean(eval_args[0] == eval_args[1]))
+        }
         _ => Err(err_at(
             format!("unknown procedure: {}", name),
             call_line,
