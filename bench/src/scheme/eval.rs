@@ -323,6 +323,9 @@ fn is_builtin(name: &str) -> bool {
             | "string->number" | "number->string"
             | "symbol->string" | "string->symbol"
             | "string-ref" | "string-copy"
+            | "string->list" | "list->string"
+            | "char->integer" | "integer->char"
+            | "map"
     )
 }
 
@@ -346,7 +349,9 @@ fn eval_builtin(
         }
         "string-append" | "string-length" | "substring" | "string->number"
         | "number->string" | "symbol->string" | "string->symbol" | "string-ref"
-        | "string-copy" => eval_string_builtin(name, args, env, out),
+        | "string-copy" | "string->list" | "list->string"
+        | "char->integer" | "integer->char" => eval_string_builtin(name, args, env, out),
+        "map" => eval_map(args, env, out),
         "display" => eval_display(args, env, out),
         "write" => eval_write(args, env, out),
         "newline" => eval_newline(args, out),
@@ -633,60 +638,8 @@ fn eval_string_builtin(
             }
         }
         "substring" => eval_substring(args, env, out),
-        "string->number" => {
-            let [arg] = args else {
-                return Err(EvalError::WrongArgCount { expected: 1, got: args.len() });
-            };
-            match eval(arg, env, out)? {
-                Value::String(s) => s
-                    .parse::<i64>()
-                    .map(Value::Integer)
-                    .map_err(|_| EvalError::TypeError {
-                        expected: "numeric string".to_string(),
-                        got: format!("\"{s}\""),
-                    }),
-                other => Err(EvalError::TypeError {
-                    expected: "string".to_string(),
-                    got: other.display(),
-                }),
-            }
-        }
-        "number->string" => {
-            let [arg] = args else {
-                return Err(EvalError::WrongArgCount { expected: 1, got: args.len() });
-            };
-            match eval(arg, env, out)? {
-                Value::Integer(n) => Ok(Value::String(n.to_string())),
-                other => Err(EvalError::TypeError {
-                    expected: "integer".to_string(),
-                    got: other.display(),
-                }),
-            }
-        }
-        "symbol->string" => {
-            let [arg] = args else {
-                return Err(EvalError::WrongArgCount { expected: 1, got: args.len() });
-            };
-            match eval(arg, env, out)? {
-                Value::Symbol(s) => Ok(Value::String(s)),
-                other => Err(EvalError::TypeError {
-                    expected: "symbol".to_string(),
-                    got: other.display(),
-                }),
-            }
-        }
-        "string->symbol" => {
-            let [arg] = args else {
-                return Err(EvalError::WrongArgCount { expected: 1, got: args.len() });
-            };
-            match eval(arg, env, out)? {
-                Value::String(s) => Ok(Value::Symbol(s)),
-                other => Err(EvalError::TypeError {
-                    expected: "string".to_string(),
-                    got: other.display(),
-                }),
-            }
-        }
+        "string->number" | "number->string" | "symbol->string" | "string->symbol"
+        | "char->integer" | "integer->char" => eval_conversion_builtin(name, args, env, out),
         "string-copy" => {
             let [arg] = args else {
                 return Err(EvalError::WrongArgCount { expected: 1, got: args.len() });
@@ -698,6 +651,41 @@ fn eval_string_builtin(
                     got: other.display(),
                 }),
             }
+        }
+        "string->list" => {
+            let [arg] = args else {
+                return Err(EvalError::WrongArgCount { expected: 1, got: args.len() });
+            };
+            match eval(arg, env, out)? {
+                Value::String(s) => Ok(s.chars().rev().fold(Value::Nil, |acc, c| {
+                    Value::Pair(Box::new(Value::Char(c)), Box::new(acc))
+                })),
+                other => Err(EvalError::TypeError {
+                    expected: "string".to_string(),
+                    got: other.display(),
+                }),
+            }
+        }
+        "list->string" => {
+            let [arg] = args else {
+                return Err(EvalError::WrongArgCount { expected: 1, got: args.len() });
+            };
+            let val = eval(arg, env, out)?;
+            let items = val.to_list_vec().ok_or_else(|| EvalError::TypeError {
+                expected: "proper list".to_string(),
+                got: val.display(),
+            })?;
+            let s: String = items
+                .iter()
+                .map(|v| match v {
+                    Value::Char(c) => Ok(*c),
+                    other => Err(EvalError::TypeError {
+                        expected: "char".to_string(),
+                        got: other.display(),
+                    }),
+                })
+                .collect::<Result<_, _>>()?;
+            Ok(Value::String(s))
         }
         "string-ref" => {
             let [s_arg, idx_arg] = args else {
@@ -730,6 +718,75 @@ fn eval_string_builtin(
                 })
         }
         _ => unreachable!("unexpected string builtin: {name}"),
+    }
+}
+
+fn eval_conversion_builtin(
+    name: &str,
+    args: &[Value],
+    env: &mut Env,
+    out: &mut String,
+) -> Result<Value, EvalError> {
+    let [arg] = args else {
+        return Err(EvalError::WrongArgCount { expected: 1, got: args.len() });
+    };
+    let val = eval(arg, env, out)?;
+    match name {
+        "string->number" => match val {
+            Value::String(s) => s
+                .parse::<i64>()
+                .map(Value::Integer)
+                .map_err(|_| EvalError::TypeError {
+                    expected: "numeric string".to_string(),
+                    got: format!("\"{s}\""),
+                }),
+            other => Err(EvalError::TypeError {
+                expected: "string".to_string(),
+                got: other.display(),
+            }),
+        },
+        "number->string" => match val {
+            Value::Integer(n) => Ok(Value::String(n.to_string())),
+            other => Err(EvalError::TypeError {
+                expected: "integer".to_string(),
+                got: other.display(),
+            }),
+        },
+        "symbol->string" => match val {
+            Value::Symbol(s) => Ok(Value::String(s)),
+            other => Err(EvalError::TypeError {
+                expected: "symbol".to_string(),
+                got: other.display(),
+            }),
+        },
+        "string->symbol" => match val {
+            Value::String(s) => Ok(Value::Symbol(s)),
+            other => Err(EvalError::TypeError {
+                expected: "string".to_string(),
+                got: other.display(),
+            }),
+        },
+        "char->integer" => match val {
+            Value::Char(c) => Ok(Value::Integer(c as i64)),
+            other => Err(EvalError::TypeError {
+                expected: "char".to_string(),
+                got: other.display(),
+            }),
+        },
+        "integer->char" => match val {
+            Value::Integer(n) => {
+                let c = char::from_u32(n as u32).ok_or_else(|| EvalError::TypeError {
+                    expected: "valid unicode code point".to_string(),
+                    got: n.to_string(),
+                })?;
+                Ok(Value::Char(c))
+            }
+            other => Err(EvalError::TypeError {
+                expected: "integer".to_string(),
+                got: other.display(),
+            }),
+        },
+        _ => unreachable!("unexpected conversion builtin: {name}"),
     }
 }
 
@@ -772,62 +829,37 @@ fn eval_substring(
 }
 
 fn eval_string_set(
+    _args: &[Value],
+    _env: &mut Env,
+    _out: &mut String,
+) -> Result<Value, EvalError> {
+    Err(EvalError::ImmutableString)
+}
+
+fn eval_map(
     args: &[Value],
     env: &mut Env,
     out: &mut String,
 ) -> Result<Value, EvalError> {
-    let [name_arg, idx_arg, char_arg] = args else {
+    let [func_arg, list_arg] = args else {
         return Err(EvalError::WrongArgCount {
-            expected: 3,
+            expected: 2,
             got: args.len(),
         });
     };
-    let Value::Symbol(name) = name_arg else {
-        return Err(EvalError::TypeError {
-            expected: "symbol".to_string(),
-            got: name_arg.display(),
-        });
-    };
-    let idx = match eval(idx_arg, env, out)? {
-        Value::Integer(n) => n as usize,
-        other => {
-            return Err(EvalError::TypeError {
-                expected: "integer".to_string(),
-                got: other.display(),
-            })
-        }
-    };
-    let c = match eval(char_arg, env, out)? {
-        Value::Char(c) => c,
-        other => {
-            return Err(EvalError::TypeError {
-                expected: "char".to_string(),
-                got: other.display(),
-            })
-        }
-    };
-    let val = env.get_mut(name).ok_or_else(|| EvalError::UnboundVariable {
-        name: name.clone(),
+    let func = eval(func_arg, env, out)?;
+    let list_val = eval(list_arg, env, out)?;
+    let items = list_val.to_list_vec().ok_or_else(|| EvalError::TypeError {
+        expected: "proper list".to_string(),
+        got: list_val.display(),
     })?;
-    let Value::String(ref mut s) = val else {
-        return Err(EvalError::TypeError {
-            expected: "string".to_string(),
-            got: val.display(),
-        });
-    };
-    let byte_idx = s
-        .char_indices()
-        .nth(idx)
-        .map(|(i, _)| i)
-        .ok_or_else(|| EvalError::TypeError {
-            expected: format!("index < {}", s.chars().count()),
-            got: idx.to_string(),
-        })?;
-    let old_char_len = s[byte_idx..].chars().next().expect("valid char index").len_utf8();
-    let mut buf = [0u8; 4];
-    let new_char_str = c.encode_utf8(&mut buf);
-    s.replace_range(byte_idx..byte_idx + old_char_len, new_char_str);
-    Ok(Value::Nil)
+    let results: Vec<Value> = items
+        .iter()
+        .map(|item| apply(&func, std::slice::from_ref(item), env, out))
+        .collect::<Result<_, _>>()?;
+    Ok(results.into_iter().rev().fold(Value::Nil, |acc, v| {
+        Value::Pair(Box::new(v), Box::new(acc))
+    }))
 }
 
 fn eval_display(args: &[Value], env: &mut Env, out: &mut String) -> Result<Value, EvalError> {
