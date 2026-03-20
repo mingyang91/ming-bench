@@ -82,6 +82,24 @@ fn dispatch_builtin(name: &str, args: &[Value]) -> Result<Value, EvalError> {
             };
             Ok(Value::Boolean(!is_truthy(arg)))
         }
+        "equal?" => {
+            let [a, b] = args else {
+                return Err(EvalError::WrongArgCount {
+                    expected: "2".into(),
+                    got: args.len(),
+                });
+            };
+            Ok(Value::Boolean(a == b))
+        }
+        "eq?" | "eqv?" => {
+            let [a, b] = args else {
+                return Err(EvalError::WrongArgCount {
+                    expected: "2".into(),
+                    got: args.len(),
+                });
+            };
+            Ok(Value::Boolean(a == b))
+        }
         "call/cc" | "call-with-current-continuation" => {
             let [proc] = args else {
                 return Err(EvalError::WrongArgCount {
@@ -121,7 +139,8 @@ fn dispatch_builtin(name: &str, args: &[Value]) -> Result<Value, EvalError> {
 pub(super) fn register_builtins(env: &Rc<Env>) {
     for name in [
         "+", "-", "*", "/", "<", ">", "=", "<=", ">=", "cons", "car", "cdr", "null?", "list",
-        "length", "not", "apply", "call/cc", "call-with-current-continuation",
+        "length", "not", "equal?", "eq?", "eqv?", "apply", "call/cc",
+        "call-with-current-continuation",
     ] {
         env.set(name.into(), Value::Builtin(name.into()));
     }
