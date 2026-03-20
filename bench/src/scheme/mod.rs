@@ -330,6 +330,8 @@ fn eval(expr: &Expr, env: &Env, output: &mut String) -> Result<Value, EvalError>
                         Ok(result)
                     }
                     "let" => eval_let(items, expr, env, output),
+                    "letrec" => eval_letrec(items, expr, env, output),
+                    "letrec*" => eval_letrec_star(items, expr, env, output),
                     "cond" => eval_cond(items, expr, env, output),
                     "and" => eval_and(&items[1..], env, output),
                     "or" => eval_or(&items[1..], env, output),
@@ -700,6 +702,71 @@ fn eval_let(items: &[Expr], expr: &Expr, env: &Env, output: &mut String) -> Resu
     Ok(result)
 }
 
+fn eval_letrec(items: &[Expr], expr: &Expr, env: &Env, output: &mut String) -> Result<Value, EvalError> {
+    if items.len() < 3 {
+        return Err(err_at("letrec requires bindings and body", expr.line, expr.col));
+    }
+    let bindings = match &items[1].kind {
+        ExprKind::List(b) => b,
+        _ => return Err(err_at("letrec: first argument must be a list of bindings", expr.line, expr.col)),
+    };
+    let local_env = env.child();
+    let mut names = Vec::new();
+    for binding in bindings {
+        match &binding.kind {
+            ExprKind::List(pair) if pair.len() == 2 => {
+                let bname = match &pair[0].kind {
+                    ExprKind::Value(Value::Symbol(s)) => s.clone(),
+                    _ => return Err(err_at("letrec: binding name must be a symbol", pair[0].line, pair[0].col)),
+                };
+                local_env.define(bname.clone(), Value::Symbol("".to_string()));
+                names.push(bname);
+            }
+            _ => return Err(err_at("letrec: each binding must be (name value)", binding.line, binding.col)),
+        }
+    }
+    for (i, binding) in bindings.iter().enumerate() {
+        if let ExprKind::List(pair) = &binding.kind {
+            let val = eval(&pair[1], &local_env, output)?;
+            local_env.set(&names[i], val);
+        }
+    }
+    let mut result = Value::Symbol("".to_string());
+    for e in &items[2..] {
+        result = eval(e, &local_env, output)?;
+    }
+    Ok(result)
+}
+
+fn eval_letrec_star(items: &[Expr], expr: &Expr, env: &Env, output: &mut String) -> Result<Value, EvalError> {
+    if items.len() < 3 {
+        return Err(err_at("letrec* requires bindings and body", expr.line, expr.col));
+    }
+    let bindings = match &items[1].kind {
+        ExprKind::List(b) => b,
+        _ => return Err(err_at("letrec*: first argument must be a list of bindings", expr.line, expr.col)),
+    };
+    let local_env = env.child();
+    for binding in bindings {
+        match &binding.kind {
+            ExprKind::List(pair) if pair.len() == 2 => {
+                let bname = match &pair[0].kind {
+                    ExprKind::Value(Value::Symbol(s)) => s.clone(),
+                    _ => return Err(err_at("letrec*: binding name must be a symbol", pair[0].line, pair[0].col)),
+                };
+                let val = eval(&pair[1], &local_env, output)?;
+                local_env.define(bname, val);
+            }
+            _ => return Err(err_at("letrec*: each binding must be (name value)", binding.line, binding.col)),
+        }
+    }
+    let mut result = Value::Symbol("".to_string());
+    for e in &items[2..] {
+        result = eval(e, &local_env, output)?;
+    }
+    Ok(result)
+}
+
 fn eval_cond(items: &[Expr], expr: &Expr, env: &Env, output: &mut String) -> Result<Value, EvalError> {
     let _ = expr;
     for clause in &items[1..] {
@@ -868,6 +935,69 @@ fn eval_tail(expr: &Expr, env: &Env, output: &mut String) -> Result<EvalResult, 
                                         binding.col,
                                     ))
                                 }
+                            }
+                        }
+                        for e in &items[2..items.len() - 1] {
+                            eval(e, &local_env, output)?;
+                        }
+                        eval_tail(&items[items.len() - 1], &local_env, output)
+                    }
+                    "letrec" => {
+                        if items.len() < 3 {
+                            return Err(err_at("letrec requires bindings and body", expr.line, expr.col));
+                        }
+                        let bindings = match &items[1].kind {
+                            ExprKind::List(b) => b,
+                            _ => return Err(err_at("letrec: first argument must be a list of bindings", expr.line, expr.col)),
+                        };
+                        let local_env = env.child();
+                        // First pass: bind all names to placeholder
+                        let mut names = Vec::new();
+                        for binding in bindings {
+                            match &binding.kind {
+                                ExprKind::List(pair) if pair.len() == 2 => {
+                                    let bname = match &pair[0].kind {
+                                        ExprKind::Value(Value::Symbol(s)) => s.clone(),
+                                        _ => return Err(err_at("letrec: binding name must be a symbol", pair[0].line, pair[0].col)),
+                                    };
+                                    local_env.define(bname.clone(), Value::Symbol("".to_string()));
+                                    names.push(bname);
+                                }
+                                _ => return Err(err_at("letrec: each binding must be (name value)", binding.line, binding.col)),
+                            }
+                        }
+                        // Second pass: evaluate init exprs in local_env and update
+                        for (i, binding) in bindings.iter().enumerate() {
+                            if let ExprKind::List(pair) = &binding.kind {
+                                let val = eval(&pair[1], &local_env, output)?;
+                                local_env.set(&names[i], val);
+                            }
+                        }
+                        for e in &items[2..items.len() - 1] {
+                            eval(e, &local_env, output)?;
+                        }
+                        eval_tail(&items[items.len() - 1], &local_env, output)
+                    }
+                    "letrec*" => {
+                        if items.len() < 3 {
+                            return Err(err_at("letrec* requires bindings and body", expr.line, expr.col));
+                        }
+                        let bindings = match &items[1].kind {
+                            ExprKind::List(b) => b,
+                            _ => return Err(err_at("letrec*: first argument must be a list of bindings", expr.line, expr.col)),
+                        };
+                        let local_env = env.child();
+                        for binding in bindings {
+                            match &binding.kind {
+                                ExprKind::List(pair) if pair.len() == 2 => {
+                                    let bname = match &pair[0].kind {
+                                        ExprKind::Value(Value::Symbol(s)) => s.clone(),
+                                        _ => return Err(err_at("letrec*: binding name must be a symbol", pair[0].line, pair[0].col)),
+                                    };
+                                    let val = eval(&pair[1], &local_env, output)?;
+                                    local_env.define(bname, val);
+                                }
+                                _ => return Err(err_at("letrec*: each binding must be (name value)", binding.line, binding.col)),
                             }
                         }
                         for e in &items[2..items.len() - 1] {
@@ -1692,7 +1822,7 @@ fn is_ellipsis(expr: &Expr) -> bool {
 
 fn is_special_keyword(name: &str) -> bool {
     matches!(name, "define" | "define-syntax" | "set!" | "if" | "quote" | "lambda"
-        | "begin" | "let" | "cond" | "and" | "or" | "display" | "write" | "newline"
+        | "begin" | "let" | "letrec" | "letrec*" | "cond" | "and" | "or" | "display" | "write" | "newline"
         | "call/cc" | "call-with-current-continuation" | "string-set!" | "...")
 }
 
