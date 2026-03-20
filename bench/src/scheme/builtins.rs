@@ -149,6 +149,26 @@ pub fn apply_expt(args: &[Value]) -> Result<Value, EvalError> {
     Ok(Value::Integer(base.pow(exp as u32)))
 }
 
+/// Apply a numeric predicate (`zero?`, `positive?`, `negative?`, `odd?`, `even?`).
+pub fn apply_numeric_pred(name: &str, args: &[Value]) -> Result<Value, EvalError> {
+    let [arg] = args else {
+        return Err(EvalError::WrongArgCount {
+            expected: "1".into(),
+            got: args.len(),
+        });
+    };
+    let n = expect_integer(arg)?;
+    let result = match name {
+        "zero?" => n == 0,
+        "positive?" => n > 0,
+        "negative?" => n < 0,
+        "odd?" => n % 2 != 0,
+        "even?" => n % 2 == 0,
+        _ => unreachable!("invalid numeric predicate: {name}"),
+    };
+    Ok(Value::Boolean(result))
+}
+
 /// Apply a comparison operator to evaluated arguments.
 pub fn apply_comparison(op: &str, args: &[Value]) -> Result<Value, EvalError> {
     if args.len() != 2 {
