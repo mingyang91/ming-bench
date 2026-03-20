@@ -308,6 +308,7 @@ fn is_builtin(name: &str) -> bool {
         name,
         "+" | "-" | "*" | "/" | "<" | ">" | "=" | "<=" | ">=" | "not" | "and" | "or"
             | "cons" | "car" | "cdr" | "null?" | "list" | "length"
+            | "string?" | "number?" | "boolean?" | "pair?" | "symbol?"
     )
 }
 
@@ -319,6 +320,7 @@ fn eval_builtin(name: &str, args: &[Value], env: &mut Env) -> Result<Value, Eval
         "and" => eval_and(args, env),
         "or" => eval_or(args, env),
         "cons" | "car" | "cdr" | "null?" | "list" | "length" => eval_list_builtin(name, args, env),
+        "string?" | "number?" | "boolean?" | "pair?" | "symbol?" => eval_type_pred(name, args, env),
         _ => Err(EvalError::UnboundVariable {
             name: name.to_string(),
         }),
@@ -505,4 +507,20 @@ fn eval_list_builtin(name: &str, args: &[Value], env: &mut Env) -> Result<Value,
         }
         _ => unreachable!("unexpected list builtin: {name}"),
     }
+}
+
+fn eval_type_pred(name: &str, args: &[Value], env: &mut Env) -> Result<Value, EvalError> {
+    let [arg] = args else {
+        return Err(EvalError::WrongArgCount { expected: 1, got: args.len() });
+    };
+    let val = eval(arg, env)?;
+    let result = match name {
+        "string?" => matches!(val, Value::String(_)),
+        "number?" => matches!(val, Value::Integer(_)),
+        "boolean?" => matches!(val, Value::Boolean(_)),
+        "pair?" => matches!(val, Value::Pair(..)),
+        "symbol?" => matches!(val, Value::Symbol(_)),
+        _ => unreachable!("unexpected type predicate: {name}"),
+    };
+    Ok(Value::Boolean(result))
 }
