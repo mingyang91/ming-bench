@@ -1,7 +1,7 @@
 use std::cell::RefCell;
 use std::rc::Rc;
 
-use super::{Env, EvalError, Value};
+use super::{CcStateInner, Env, EvalError, Value, CC_KEY};
 
 /// Trampoline result: either a final value, a tail-call in the same env,
 /// or a tail-call into a new env (function application).
@@ -36,12 +36,17 @@ pub(super) fn eval(value: &Value, env: &mut Env, out: &mut String) -> Result<Val
 fn eval_bounce(value: &Value, env: &mut Env, out: &mut String) -> Result<Bounce, EvalError> {
     match value {
         Value::Integer(_) | Value::Boolean(_) | Value::String(_) | Value::Char(_)
-        | Value::Lambda { .. } | Value::BuiltinProc(_) => Ok(Bounce::Done(value.clone())),
+        | Value::Lambda { .. } | Value::BuiltinProc(_) | Value::Continuation { .. }
+        | Value::CcState(_) => Ok(Bounce::Done(value.clone())),
         Value::Nil => Ok(Bounce::Done(Value::Nil)),
         Value::Symbol(name) => {
             if let Some(rc) = env.get(name) {
                 Ok(Bounce::Done(rc.borrow().clone()))
-            } else if is_builtin(name) || name == "apply" {
+            } else if is_builtin(name)
+                || name == "apply"
+                || name == "call/cc"
+                || name == "call-with-current-continuation"
+            {
                 Ok(Bounce::Done(Value::BuiltinProc(name.clone())))
             } else {
                 Err(EvalError::UnboundVariable { name: name.clone() })
@@ -79,6 +84,9 @@ fn eval_pair_bounce(
             "or" => eval_or_bounce(args, env, out),
             "set!" => eval_set(args, env, out).map(Bounce::Done),
             "string-set!" => eval_string_set(args, env, out).map(Bounce::Done),
+            "call/cc" | "call-with-current-continuation" => {
+                eval_callcc_bounce(args, env, out)
+            }
             _ => eval_symbol_call_bounce(name, args, env, out),
         };
     }
@@ -120,6 +128,10 @@ fn eval_symbol_call_bounce(
         Value::BuiltinProc(bname) => {
             call_builtin_with_values(bname, &evaled_args, env, out).map(Bounce::Done)
         }
+        Value::Continuation { expr_idx, cc } => {
+            invoke_continuation(*expr_idx, cc, &evaled_args)?;
+            unreachable!("invoke_continuation always returns Err")
+        }
         _ => Err(EvalError::NotAProcedure {
             value: proc_ref.display(),
         }),
@@ -140,6 +152,10 @@ fn apply_bounce_inner(
     args: &[Value],
     caller_env: Option<&Env>,
 ) -> Result<Bounce, EvalError> {
+    if let Value::Continuation { expr_idx, cc } = proc {
+        invoke_continuation(*expr_idx, cc, args)?;
+        unreachable!("invoke_continuation always returns Err");
+    }
     let Value::Lambda {
         params,
         rest_param,
@@ -205,6 +221,7 @@ fn apply_value(
                 unreachable!("apply_bounce returned Continue for {}", expr.display())
             }
         },
+        Value::Continuation { expr_idx, cc } => invoke_continuation(*expr_idx, cc, args),
         _ => Err(EvalError::NotAProcedure {
             value: proc.display(),
         }),
@@ -223,6 +240,10 @@ fn apply_proc_bounce(
             call_builtin_with_values(name, args, env, out).map(Bounce::Done)
         }
         Value::Lambda { .. } => apply_bounce(proc, args, env),
+        Value::Continuation { expr_idx, cc } => {
+            invoke_continuation(*expr_idx, cc, args)?;
+            unreachable!("invoke_continuation always returns Err")
+        }
         _ => Err(EvalError::NotAProcedure {
             value: proc.display(),
         }),
@@ -309,9 +330,16 @@ fn call_builtin_with_values(
             Ok(Value::Boolean(result))
         }
         "apply" => eval_apply(args, env, out),
+        "call/cc" | "call-with-current-continuation" => {
+            let [proc] = args else {
+                return Err(EvalError::WrongArgCount {
+                    expected: 1,
+                    got: args.len(),
+                });
+            };
+            handle_callcc(proc, env, out)
+        }
         _ => {
-            // For other builtins, wrap values back as quoted exprs and delegate
-            // This is a fallback for builtins not yet handled above
             Err(EvalError::NotAProcedure {
                 value: format!("builtin {name} not supported in apply context"),
             })
@@ -337,6 +365,83 @@ fn eval_apply(
     let mut all_args: Vec<Value> = args[1..args.len() - 1].to_vec();
     all_args.extend(tail_list);
     apply_value(proc, &all_args, env, out)
+}
+
+/// Extract the CcStateInner from the environment.
+fn extract_cc_state(env: &Env) -> Rc<RefCell<CcStateInner>> {
+    let rc = env.get(CC_KEY).expect("cc state initialized");
+    let val = rc.borrow();
+    let Value::CcState(state) = &*val else {
+        unreachable!("cc key holds non-CcState value");
+    };
+    state.clone()
+}
+
+fn eval_callcc_bounce(
+    args: &[Value],
+    env: &mut Env,
+    out: &mut String,
+) -> Result<Bounce, EvalError> {
+    let [arg] = args else {
+        return Err(EvalError::WrongArgCount {
+            expected: 1,
+            got: args.len(),
+        });
+    };
+    let proc = eval(arg, env, out)?;
+    handle_callcc(&proc, env, out).map(Bounce::Done)
+}
+
+/// Implement call/cc: call proc with a continuation value.
+fn handle_callcc(
+    proc: &Value,
+    env: &mut Env,
+    out: &mut String,
+) -> Result<Value, EvalError> {
+    let cc_state = extract_cc_state(env);
+
+    // Check for override (replay case)
+    if let Some(val) = cc_state.borrow_mut().override_value.take() {
+        return Ok(val);
+    }
+
+    let expr_idx = cc_state.borrow().expr_idx;
+    let cont = Value::Continuation {
+        expr_idx,
+        cc: cc_state.clone(),
+    };
+
+    match apply_value(proc, &[cont], env, out) {
+        Ok(val) => Ok(val),
+        Err(EvalError::ContinuationEscape) => {
+            let data = cc_state.borrow_mut().return_data.take();
+            match data {
+                Some((eidx, value)) if eidx == expr_idx => Ok(value),
+                Some(data) => {
+                    cc_state.borrow_mut().return_data = Some(data);
+                    Err(EvalError::ContinuationEscape)
+                }
+                None => unreachable!("ContinuationEscape without return data"),
+            }
+        }
+        Err(e) => Err(e),
+    }
+}
+
+/// Invoke a continuation: store return data and raise escape.
+fn invoke_continuation(
+    expr_idx: usize,
+    cc: &Rc<RefCell<CcStateInner>>,
+    args: &[Value],
+) -> Result<Value, EvalError> {
+    let [val] = args else {
+        return Err(EvalError::WrongArgCount {
+            expected: 1,
+            got: args.len(),
+        });
+    };
+    cc.borrow_mut().return_data = Some((expr_idx, val.clone()));
+    Err(EvalError::ContinuationEscape)
 }
 
 /// Extract (name, params, rest_param) from a define header like (f x . rest) or (f x y).

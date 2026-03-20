@@ -31,4 +31,7 @@ pub enum EvalError {
         col: usize,
         source: Box<EvalError>,
     },
+
+    #[error("continuation escape")]
+    ContinuationEscape,
 }

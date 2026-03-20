@@ -14,6 +14,24 @@ struct Span {
     col: usize,
 }
 
+/// Internal state for call/cc continuation support.
+struct CcStateInner {
+    expr_idx: usize,
+    override_value: Option<Value>,
+    return_data: Option<(usize, Value)>,
+}
+
+impl std::fmt::Debug for CcStateInner {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("CcStateInner")
+            .field("expr_idx", &self.expr_idx)
+            .finish_non_exhaustive()
+    }
+}
+
+/// Key for storing CcState in the environment.
+const CC_KEY: &str = "\0cc";
+
 /// A Scheme value.
 #[derive(Debug, Clone)]
 enum Value {
@@ -31,6 +49,11 @@ enum Value {
         closure: Env,
     },
     BuiltinProc(String),
+    Continuation {
+        expr_idx: usize,
+        cc: Rc<RefCell<CcStateInner>>,
+    },
+    CcState(Rc<RefCell<CcStateInner>>),
 }
 
 impl Value {
@@ -43,7 +66,10 @@ impl Value {
             Value::Symbol(s) => s.clone(),
             Value::Char(c) => format!("#\\{c}"),
             Value::Nil => "()".to_string(),
-            Value::Lambda { .. } | Value::BuiltinProc(_) => "#<procedure>".to_string(),
+            Value::Lambda { .. } | Value::BuiltinProc(_) | Value::Continuation { .. } => {
+                "#<procedure>".to_string()
+            }
+            Value::CcState(_) => "#<cc-state>".to_string(),
             Value::Pair(..) => self.fmt_list(false),
         }
     }
@@ -54,8 +80,7 @@ impl Value {
             Value::String(s) => s.clone(),
             Value::Char(c) => c.to_string(),
             Value::Pair(..) => self.fmt_list(true),
-            Value::Integer(_) | Value::Boolean(_) | Value::Symbol(_) | Value::Nil
-            | Value::Lambda { .. } | Value::BuiltinProc(_) => self.display(),
+            _ => self.display(),
         }
     }
 
@@ -110,6 +135,10 @@ impl PartialEq for Value {
             (Value::Nil, Value::Nil) => true,
             (Value::Pair(a1, a2), Value::Pair(b1, b2)) => a1 == b1 && a2 == b2,
             (Value::BuiltinProc(a), Value::BuiltinProc(b)) => a == b,
+            (
+                Value::Continuation { expr_idx: a, .. },
+                Value::Continuation { expr_idx: b, .. },
+            ) => a == b,
             _ => false,
         }
     }
@@ -118,6 +147,42 @@ impl PartialEq for Value {
 // --- Environment ---
 
 type Env = HashMap<String, Rc<RefCell<Value>>>;
+
+/// Evaluate expressions from `start_idx`, updating `last` with each result.
+/// Returns `Some((replay_idx, value))` on continuation escape, `None` if all
+/// expressions completed normally.
+fn eval_exprs_until_escape(
+    exprs: &[(Value, Span)],
+    start_idx: usize,
+    cc_state: &Rc<RefCell<CcStateInner>>,
+    env: &mut Env,
+    output: &mut String,
+    last: &mut Option<Value>,
+) -> Result<Option<(usize, Value)>, EvalError> {
+    for (idx, (expr, span)) in exprs.iter().enumerate().skip(start_idx) {
+        cc_state.borrow_mut().expr_idx = idx;
+
+        match eval::eval(expr, env, output) {
+            Ok(val) => *last = Some(val),
+            Err(EvalError::ContinuationEscape) => {
+                let data = cc_state
+                    .borrow_mut()
+                    .return_data
+                    .take()
+                    .expect("ContinuationEscape without return data");
+                return Ok(Some(data));
+            }
+            Err(e) => {
+                return Err(EvalError::AtPosition {
+                    line: span.line,
+                    col: span.col,
+                    source: Box::new(e),
+                });
+            }
+        }
+    }
+    Ok(None)
+}
 
 /// Evaluate one or more Scheme expressions and return the string
 /// representation of the last result.
@@ -132,16 +197,40 @@ pub fn eval_str_with_output(input: &str) -> Result<(String, String), EvalError> 
     let exprs = parse::parse_all(input)?;
     let mut env = Env::new();
     let mut output = String::new();
+
+    // Initialize call/cc state
+    let cc_state = Rc::new(RefCell::new(CcStateInner {
+        expr_idx: 0,
+        override_value: None,
+        return_data: None,
+    }));
+    env.insert(
+        CC_KEY.into(),
+        Rc::new(RefCell::new(Value::CcState(cc_state.clone()))),
+    );
+
+    let mut start_idx = 0;
     let mut last = None;
-    for (expr, span) in &exprs {
-        last = Some(
-            eval::eval(expr, &mut env, &mut output).map_err(|e| EvalError::AtPosition {
-                line: span.line,
-                col: span.col,
-                source: Box::new(e),
-            })?,
-        );
+
+    loop {
+        let cont_return = eval_exprs_until_escape(
+            &exprs,
+            start_idx,
+            &cc_state,
+            &mut env,
+            &mut output,
+            &mut last,
+        )?;
+
+        match cont_return {
+            Some((replay_idx, value)) => {
+                cc_state.borrow_mut().override_value = Some(value);
+                start_idx = replay_idx;
+            }
+            None => break,
+        }
     }
+
     let last = last.ok_or(EvalError::EmptyInput)?;
     Ok((last.display(), output))
 }
