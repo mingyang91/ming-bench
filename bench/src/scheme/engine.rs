@@ -1,8 +1,10 @@
 use std::cell::RefCell;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::rc::Rc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 type Continuation = Rc<Kont>;
+static GENSYM_COUNTER: AtomicUsize = AtomicUsize::new(0);
 
 pub(super) enum Value {
     Integer(i64),
@@ -91,6 +93,7 @@ fn fmt_string_contents(value: &str, formatter: &mut std::fmt::Formatter<'_>) -> 
 pub(super) enum Expr {
     Literal(Value),
     Symbol(String),
+    CapturedSymbol(String, Environment),
     Application(Vec<Expr>),
 }
 
@@ -194,6 +197,33 @@ pub(super) struct Procedure {
     environment: Environment,
 }
 
+#[derive(Clone)]
+struct SyntaxRules {
+    literals: HashSet<String>,
+    rules: Vec<SyntaxRule>,
+    environment: Environment,
+}
+
+#[derive(Clone)]
+struct SyntaxRule {
+    pattern: Expr,
+    template: Expr,
+}
+
+#[derive(Clone, Default)]
+struct MacroBindings {
+    singles: HashMap<String, Expr>,
+    repeats: HashMap<String, Vec<Expr>>,
+}
+
+#[derive(Clone)]
+enum TemplateExpr {
+    Literal(Value),
+    IntroducedSymbol(String),
+    Inserted(Expr),
+    Application(Vec<TemplateExpr>),
+}
+
 struct ParameterSpec {
     fixed: Vec<String>,
     rest: Option<String>,
@@ -203,6 +233,7 @@ type Environment = Rc<RefCell<Frame>>;
 
 pub(super) struct Frame {
     bindings: HashMap<String, Value>,
+    syntax_bindings: HashMap<String, SyntaxRules>,
     parent: Option<Environment>,
 }
 
@@ -321,12 +352,17 @@ fn global_environment() -> Environment {
 fn new_environment(parent: Option<Environment>) -> Environment {
     Rc::new(RefCell::new(Frame {
         bindings: HashMap::new(),
+        syntax_bindings: HashMap::new(),
         parent,
     }))
 }
 
 fn define_binding(environment: &Environment, name: String, value: Value) {
     environment.borrow_mut().bindings.insert(name, value);
+}
+
+fn define_syntax_binding(environment: &Environment, name: String, rules: SyntaxRules) {
+    environment.borrow_mut().syntax_bindings.insert(name, rules);
 }
 
 fn lookup_binding(environment: &Environment, name: &str) -> Option<Value> {
@@ -339,6 +375,18 @@ fn lookup_binding(environment: &Environment, name: &str) -> Option<Value> {
     };
 
     parent.and_then(|parent| lookup_binding(&parent, name))
+}
+
+fn lookup_syntax_binding(environment: &Environment, name: &str) -> Option<SyntaxRules> {
+    let parent = {
+        let frame = environment.borrow();
+        if let Some(rules) = frame.syntax_bindings.get(name) {
+            return Some(rules.clone());
+        }
+        frame.parent.clone()
+    };
+
+    parent.and_then(|parent| lookup_syntax_binding(&parent, name))
 }
 
 fn set_binding(environment: &Environment, name: &str, value: Value) -> Result<(), String> {
@@ -408,6 +456,11 @@ fn step_eval(
         Expr::Symbol(name) => lookup_binding(&environment, &name)
             .map(|value| Machine::value(value, continuation))
             .ok_or_else(|| format!("unbound symbol: {name}")),
+        Expr::CapturedSymbol(name, captured_environment) => {
+            lookup_binding(&captured_environment, &name)
+                .map(|value| Machine::value(value, continuation))
+                .ok_or_else(|| format!("unbound symbol: {name}"))
+        }
         Expr::Application(parts) => eval_application(parts, environment, continuation),
     }
 }
@@ -622,6 +675,10 @@ fn eval_application(
     environment: Environment,
     continuation: Continuation,
 ) -> Result<Machine, String> {
+    if let Some(expanded) = expand_macro_application(&parts, &environment)? {
+        return Ok(Machine::eval(expanded, environment, continuation));
+    }
+
     let mut parts = parts.into_iter();
     let operator = parts
         .next()
@@ -636,6 +693,9 @@ fn eval_application(
             "cond" => return schedule_cond(arguments, environment, continuation),
             "if" => return schedule_if(&arguments, environment, continuation),
             "define" => return schedule_define(&arguments, environment, continuation),
+            "define-syntax" => {
+                return schedule_define_syntax(&arguments, environment, continuation)
+            }
             "let" => return schedule_let(&arguments, environment, continuation),
             "quote" => return schedule_quote(&arguments, continuation),
             "lambda" => return schedule_lambda(&arguments, environment, continuation),
@@ -667,7 +727,11 @@ fn schedule_if(
         environment: environment.clone(),
         next: continuation,
     };
-    Ok(Machine::eval(condition.clone(), environment, Rc::new(frame)))
+    Ok(Machine::eval(
+        condition.clone(),
+        environment,
+        Rc::new(frame),
+    ))
 }
 
 fn schedule_define(
@@ -680,10 +744,32 @@ fn schedule_define(
         .ok_or_else(|| "`define` expects at least 2 arguments".to_string())?;
 
     match target {
-        Expr::Symbol(name) => define_value(name, body, environment, continuation),
         Expr::Application(signature) => define_function(signature, body, environment, continuation),
-        _ => Err("`define` expects a symbol name".into()),
+        _ => {
+            let Some(name) = identifier_name(target) else {
+                return Err("`define` expects a symbol name".into());
+            };
+            define_value(name, body, environment, continuation)
+        }
     }
+}
+
+fn schedule_define_syntax(
+    arguments: &[Expr],
+    environment: Environment,
+    continuation: Continuation,
+) -> Result<Machine, String> {
+    let [name_expr, transformer] = arguments else {
+        return Err("`define-syntax` expects exactly 2 arguments".into());
+    };
+
+    let Some(name) = identifier_name(name_expr) else {
+        return Err("`define-syntax` expects a symbol name".into());
+    };
+
+    let rules = parse_syntax_rules(transformer, &environment)?;
+    define_syntax_binding(&environment, name.to_string(), rules);
+    Ok(Machine::value(Value::Void, continuation))
 }
 
 fn define_value(
@@ -701,7 +787,11 @@ fn define_value(
         environment: environment.clone(),
         next: continuation,
     };
-    Ok(Machine::eval(value_expr.clone(), environment, Rc::new(frame)))
+    Ok(Machine::eval(
+        value_expr.clone(),
+        environment,
+        Rc::new(frame),
+    ))
 }
 
 fn define_function(
@@ -713,7 +803,7 @@ fn define_function(
     let (name, params) = signature
         .split_first()
         .ok_or_else(|| "`define` expects a function name".to_string())?;
-    let Expr::Symbol(name) = name else {
+    let Some(name) = identifier_name(name) else {
         return Err("`define` expects a symbol name".into());
     };
 
@@ -728,7 +818,7 @@ fn define_function(
         body: body.to_vec().into(),
         environment: environment.clone(),
     };
-    define_binding(&environment, name.clone(), Value::Procedure(procedure));
+    define_binding(&environment, name.to_string(), Value::Procedure(procedure));
 
     Ok(Machine::value(Value::Void, continuation))
 }
@@ -743,9 +833,15 @@ fn schedule_let(
         .ok_or_else(|| "`let` expects bindings and a body".to_string())?;
 
     match first {
-        Expr::Symbol(name) => schedule_named_let(name, rest, environment, continuation),
-        Expr::Application(bindings) => schedule_regular_let(bindings, rest, environment, continuation),
-        _ => Err("`let` expects a binding list".into()),
+        Expr::Application(bindings) => {
+            schedule_regular_let(bindings, rest, environment, continuation)
+        }
+        _ => {
+            let Some(name) = identifier_name(first) else {
+                return Err("`let` expects a binding list".into());
+            };
+            schedule_named_let(name, rest, environment, continuation)
+        }
     }
 }
 
@@ -766,7 +862,12 @@ fn schedule_regular_let(
         body: body.to_vec().into(),
         environment: environment.clone(),
     };
-    schedule_argument_evaluation(Value::Procedure(procedure), arguments, environment, continuation)
+    schedule_argument_evaluation(
+        Value::Procedure(procedure),
+        arguments,
+        environment,
+        continuation,
+    )
 }
 
 fn schedule_named_let(
@@ -801,7 +902,12 @@ fn schedule_named_let(
         Value::Procedure(procedure.clone()),
     );
 
-    schedule_argument_evaluation(Value::Procedure(procedure), arguments, environment, continuation)
+    schedule_argument_evaluation(
+        Value::Procedure(procedure),
+        arguments,
+        environment,
+        continuation,
+    )
 }
 
 fn schedule_quote(arguments: &[Expr], continuation: Continuation) -> Result<Machine, String> {
@@ -813,7 +919,10 @@ fn schedule_lambda(
     environment: Environment,
     continuation: Continuation,
 ) -> Result<Machine, String> {
-    Ok(Machine::value(eval_lambda(arguments, &environment)?, continuation))
+    Ok(Machine::value(
+        eval_lambda(arguments, &environment)?,
+        continuation,
+    ))
 }
 
 fn schedule_set(
@@ -825,16 +934,23 @@ fn schedule_set(
         return Err("`set!` expects exactly 2 arguments".into());
     };
 
-    let Expr::Symbol(name) = target else {
+    let Some(name) = identifier_name(target) else {
         return Err("`set!` expects a symbol name".into());
     };
+    let target_environment = captured_environment(target)
+        .cloned()
+        .unwrap_or_else(|| environment.clone());
 
     let frame = Kont::SetValue {
-        name: name.clone(),
-        environment: environment.clone(),
+        name: name.to_string(),
+        environment: target_environment,
         next: continuation,
     };
-    Ok(Machine::eval(value_expr.clone(), environment, Rc::new(frame)))
+    Ok(Machine::eval(
+        value_expr.clone(),
+        environment,
+        Rc::new(frame),
+    ))
 }
 
 fn schedule_sequence(
@@ -912,7 +1028,7 @@ fn schedule_cond(
         .split_first()
         .ok_or_else(|| "`cond` clauses must not be empty".to_string())?;
 
-    if matches!(test, Expr::Symbol(name) if name == "else") {
+    if matches!(identifier_name(test), Some("else")) {
         if !remaining_clauses.is_empty() {
             return Err("`cond` `else` clause must be last".into());
         }
@@ -1040,7 +1156,11 @@ fn call_procedure(
     validate_procedure_arity(&procedure, arguments.len())?;
     let call_environment = new_environment(Some(procedure.environment.clone()));
     bind_procedure_arguments(&call_environment, &procedure, &arguments);
-    schedule_sequence(procedure.body.as_ref().to_vec(), call_environment, continuation)
+    schedule_sequence(
+        procedure.body.as_ref().to_vec(),
+        call_environment,
+        continuation,
+    )
 }
 
 fn validate_procedure_arity(procedure: &Procedure, actual: usize) -> Result<(), String> {
@@ -1099,18 +1219,18 @@ fn parse_let_binding(binding: &Expr) -> Result<(String, Expr), String> {
         return Err("`let` bindings must contain exactly 2 forms".into());
     };
 
-    let Expr::Symbol(name) = name else {
+    let Some(name) = identifier_name(name) else {
         return Err("`let` binding names must be symbols".into());
     };
 
-    Ok((name.clone(), value_expr.clone()))
+    Ok((name.to_string(), value_expr.clone()))
 }
 
 fn parse_parameters(parameters: &[Expr]) -> Result<ParameterSpec, String> {
     let mut fixed = Vec::with_capacity(parameters.len());
 
     for (index, parameter) in parameters.iter().enumerate() {
-        let Expr::Symbol(name) = parameter else {
+        let Some(name) = identifier_name(parameter) else {
             return Err("parameter names must be symbols".into());
         };
 
@@ -1118,7 +1238,7 @@ fn parse_parameters(parameters: &[Expr]) -> Result<ParameterSpec, String> {
             return parse_rest_parameter(&parameters[index + 1..], fixed);
         }
 
-        fixed.push(name.clone());
+        fixed.push(name.to_string());
     }
 
     Ok(ParameterSpec { fixed, rest: None })
@@ -1128,7 +1248,7 @@ fn parse_rest_parameter(parameters: &[Expr], fixed: Vec<String>) -> Result<Param
     let [rest] = parameters else {
         return Err("rest parameter must be the final name".into());
     };
-    let Expr::Symbol(rest) = rest else {
+    let Some(rest) = identifier_name(rest) else {
         return Err("parameter names must be symbols".into());
     };
     if rest == "." {
@@ -1137,7 +1257,7 @@ fn parse_rest_parameter(parameters: &[Expr], fixed: Vec<String>) -> Result<Param
 
     Ok(ParameterSpec {
         fixed,
-        rest: Some(rest.clone()),
+        rest: Some(rest.to_string()),
     })
 }
 
@@ -1174,7 +1294,7 @@ fn eval_quote(arguments: &[Expr]) -> Result<Value, String> {
 fn quote_expr(expr: &Expr) -> Result<Value, String> {
     match expr {
         Expr::Literal(value) => Ok(value.clone()),
-        Expr::Symbol(value) => Ok(Value::Symbol(value.clone())),
+        Expr::Symbol(value) | Expr::CapturedSymbol(value, _) => Ok(Value::Symbol(value.clone())),
         Expr::Application(values) => {
             let mut list = Value::Nil;
             for value in values.iter().rev() {
@@ -1414,11 +1534,695 @@ fn list_to_vec(list: &Value) -> Result<Vec<Value>, String> {
     }
 }
 
-fn symbol_name(expr: &Expr) -> Option<&str> {
+fn identifier_name(expr: &Expr) -> Option<&str> {
     match expr {
-        Expr::Symbol(name) => Some(name.as_str()),
+        Expr::Symbol(name) | Expr::CapturedSymbol(name, _) => Some(name.as_str()),
         _ => None,
     }
+}
+
+fn symbol_name(expr: &Expr) -> Option<&str> {
+    identifier_name(expr)
+}
+
+fn captured_environment(expr: &Expr) -> Option<&Environment> {
+    match expr {
+        Expr::CapturedSymbol(_, environment) => Some(environment),
+        _ => None,
+    }
+}
+
+fn parse_syntax_rules(expr: &Expr, environment: &Environment) -> Result<SyntaxRules, String> {
+    let Expr::Application(forms) = expr else {
+        return Err("`define-syntax` expects a `syntax-rules` transformer".into());
+    };
+    let (head, rest) = forms
+        .split_first()
+        .ok_or_else(|| "`define-syntax` expects a `syntax-rules` transformer".to_string())?;
+
+    if !matches!(identifier_name(head), Some("syntax-rules")) {
+        return Err("`define-syntax` expects a `syntax-rules` transformer".into());
+    }
+
+    let (literal_names, raw_rules) = rest
+        .split_first()
+        .ok_or_else(|| "`syntax-rules` expects literals and at least one rule".to_string())?;
+    let Expr::Application(literal_names) = literal_names else {
+        return Err("`syntax-rules` expects a literal identifier list".into());
+    };
+    if raw_rules.is_empty() {
+        return Err("`syntax-rules` expects at least one rule".into());
+    }
+
+    let mut literals = HashSet::new();
+    for literal in literal_names {
+        let Some(name) = identifier_name(literal) else {
+            return Err("`syntax-rules` literals must be symbols".into());
+        };
+        literals.insert(name.to_string());
+    }
+
+    let mut rules = Vec::with_capacity(raw_rules.len());
+    for raw_rule in raw_rules {
+        let Expr::Application(rule_parts) = raw_rule else {
+            return Err("`syntax-rules` rules must be pairs".into());
+        };
+        let [pattern, template] = rule_parts.as_slice() else {
+            return Err("`syntax-rules` rules must contain a pattern and template".into());
+        };
+        rules.push(SyntaxRule {
+            pattern: pattern.clone(),
+            template: template.clone(),
+        });
+    }
+
+    Ok(SyntaxRules {
+        literals,
+        rules,
+        environment: environment.clone(),
+    })
+}
+
+fn expand_macro_application(
+    parts: &[Expr],
+    environment: &Environment,
+) -> Result<Option<Expr>, String> {
+    let Some(operator) = parts.first() else {
+        return Ok(None);
+    };
+    let Some(name) = identifier_name(operator) else {
+        return Ok(None);
+    };
+    let search_environment = captured_environment(operator).unwrap_or(environment);
+    let Some(rules) = lookup_syntax_binding(search_environment, name) else {
+        return Ok(None);
+    };
+
+    let application = Expr::Application(parts.to_vec());
+    let expanded = expand_syntax_rules(name, &application, &rules)?;
+    Ok(Some(expanded))
+}
+
+fn expand_syntax_rules(name: &str, input: &Expr, rules: &SyntaxRules) -> Result<Expr, String> {
+    for rule in &rules.rules {
+        if let Some(bindings) = match_pattern(&rule.pattern, input, &rules.literals, name) {
+            let template = instantiate_template(&rule.template, &bindings)?;
+            return finalize_template(&template, &rules.environment);
+        }
+    }
+
+    Err(format!("no matching `syntax-rules` pattern for `{name}`"))
+}
+
+fn match_pattern(
+    pattern: &Expr,
+    input: &Expr,
+    literals: &HashSet<String>,
+    keyword: &str,
+) -> Option<MacroBindings> {
+    match_pattern_inner(
+        pattern,
+        input,
+        literals,
+        keyword,
+        MacroBindings::default(),
+        false,
+    )
+}
+
+fn match_pattern_inner(
+    pattern: &Expr,
+    input: &Expr,
+    literals: &HashSet<String>,
+    keyword: &str,
+    bindings: MacroBindings,
+    repeated: bool,
+) -> Option<MacroBindings> {
+    match pattern {
+        Expr::Literal(_) => expr_syntax_equal(pattern, input).then_some(bindings),
+        Expr::Application(pattern_items) => {
+            let Expr::Application(input_items) = input else {
+                return None;
+            };
+            match_list_pattern(pattern_items, input_items, literals, keyword, bindings)
+        }
+        Expr::Symbol(name) | Expr::CapturedSymbol(name, _) => {
+            if name == "..." {
+                return None;
+            }
+            if is_literal_identifier(name, literals, keyword) {
+                match syntax_identifier_name(input) {
+                    Some(candidate) if candidate == name => Some(bindings),
+                    _ => None,
+                }
+            } else {
+                bind_pattern_variable(bindings, name, input.clone(), repeated)
+            }
+        }
+    }
+}
+
+fn match_list_pattern(
+    patterns: &[Expr],
+    inputs: &[Expr],
+    literals: &HashSet<String>,
+    keyword: &str,
+    bindings: MacroBindings,
+) -> Option<MacroBindings> {
+    let Some((current_pattern, remaining_patterns)) = patterns.split_first() else {
+        return inputs.is_empty().then_some(bindings);
+    };
+
+    if let Some((ellipsis, after_ellipsis)) = remaining_patterns.split_first() {
+        if is_ellipsis_expr(ellipsis) {
+            return match_repeated_list_pattern(
+                current_pattern,
+                after_ellipsis,
+                inputs,
+                literals,
+                keyword,
+                bindings,
+            );
+        }
+    }
+
+    let (current_input, remaining_inputs) = inputs.split_first()?;
+    let bindings = match_pattern_inner(
+        current_pattern,
+        current_input,
+        literals,
+        keyword,
+        bindings,
+        false,
+    )?;
+    match_list_pattern(
+        remaining_patterns,
+        remaining_inputs,
+        literals,
+        keyword,
+        bindings,
+    )
+}
+
+fn match_repeated_list_pattern(
+    current_pattern: &Expr,
+    after_ellipsis: &[Expr],
+    inputs: &[Expr],
+    literals: &HashSet<String>,
+    keyword: &str,
+    bindings: MacroBindings,
+) -> Option<MacroBindings> {
+    (0..=inputs.len()).find_map(|repeat_count| {
+        let repeated_bindings = match_repeated_prefix(
+            current_pattern,
+            &inputs[..repeat_count],
+            literals,
+            keyword,
+            bindings.clone(),
+        )?;
+
+        match_list_pattern(
+            after_ellipsis,
+            &inputs[repeat_count..],
+            literals,
+            keyword,
+            repeated_bindings,
+        )
+    })
+}
+
+fn match_repeated_prefix(
+    current_pattern: &Expr,
+    inputs: &[Expr],
+    literals: &HashSet<String>,
+    keyword: &str,
+    bindings: MacroBindings,
+) -> Option<MacroBindings> {
+    let mut current_bindings = bindings;
+    seed_repeated_bindings(current_pattern, literals, keyword, &mut current_bindings)?;
+    for input in inputs {
+        current_bindings = match_pattern_inner(
+            current_pattern,
+            input,
+            literals,
+            keyword,
+            current_bindings,
+            true,
+        )?;
+    }
+    Some(current_bindings)
+}
+
+fn seed_repeated_bindings(
+    pattern: &Expr,
+    literals: &HashSet<String>,
+    keyword: &str,
+    bindings: &mut MacroBindings,
+) -> Option<()> {
+    match pattern {
+        Expr::Literal(_) => Some(()),
+        Expr::Application(items) => {
+            for item in items {
+                seed_repeated_bindings(item, literals, keyword, bindings)?;
+            }
+            Some(())
+        }
+        Expr::Symbol(name) | Expr::CapturedSymbol(name, _) => {
+            if name == "..." || is_literal_identifier(name, literals, keyword) {
+                return Some(());
+            }
+            if bindings.singles.contains_key(name) {
+                return None;
+            }
+            bindings.repeats.entry(name.clone()).or_default();
+            Some(())
+        }
+    }
+}
+
+fn bind_pattern_variable(
+    mut bindings: MacroBindings,
+    name: &str,
+    value: Expr,
+    repeated: bool,
+) -> Option<MacroBindings> {
+    if repeated {
+        if bindings.singles.contains_key(name) {
+            return None;
+        }
+        bindings
+            .repeats
+            .entry(name.to_string())
+            .or_default()
+            .push(value);
+        return Some(bindings);
+    }
+
+    if bindings.repeats.contains_key(name) {
+        return None;
+    }
+
+    match bindings.singles.get(name) {
+        Some(existing) if !expr_syntax_equal(existing, &value) => None,
+        Some(_) => Some(bindings),
+        None => {
+            bindings.singles.insert(name.to_string(), value);
+            Some(bindings)
+        }
+    }
+}
+
+fn instantiate_template(template: &Expr, bindings: &MacroBindings) -> Result<TemplateExpr, String> {
+    instantiate_template_with_index(template, bindings, None)
+}
+
+fn instantiate_template_with_index(
+    template: &Expr,
+    bindings: &MacroBindings,
+    repetition_index: Option<usize>,
+) -> Result<TemplateExpr, String> {
+    match template {
+        Expr::Literal(value) => Ok(TemplateExpr::Literal(value.clone())),
+        Expr::Application(items) => Ok(TemplateExpr::Application(instantiate_template_list(
+            items,
+            bindings,
+            repetition_index,
+        )?)),
+        Expr::Symbol(name) | Expr::CapturedSymbol(name, _) => {
+            if let Some(expr) = bindings.singles.get(name) {
+                return Ok(TemplateExpr::Inserted(expr.clone()));
+            }
+
+            if bindings.repeats.contains_key(name) {
+                return instantiate_repeated_template_symbol(name, bindings, repetition_index);
+            }
+
+            Ok(TemplateExpr::IntroducedSymbol(name.clone()))
+        }
+    }
+}
+
+fn instantiate_repeated_template_symbol(
+    name: &str,
+    bindings: &MacroBindings,
+    repetition_index: Option<usize>,
+) -> Result<TemplateExpr, String> {
+    let index = repetition_index.ok_or_else(|| {
+        format!("pattern variable `{name}` must be used with `...` in the template")
+    })?;
+    let expr = bindings
+        .repeats
+        .get(name)
+        .and_then(|values| values.get(index))
+        .ok_or_else(|| "macro repetition index out of bounds".to_string())?;
+    Ok(TemplateExpr::Inserted(expr.clone()))
+}
+
+fn instantiate_template_list(
+    items: &[Expr],
+    bindings: &MacroBindings,
+    repetition_index: Option<usize>,
+) -> Result<Vec<TemplateExpr>, String> {
+    let mut result = Vec::new();
+    let mut index = 0;
+
+    while index < items.len() {
+        if index + 1 < items.len() && is_ellipsis_expr(&items[index + 1]) {
+            let repeat_count = template_repeat_count(&items[index], bindings)?;
+            let repeated_items =
+                instantiate_repeated_template_items(&items[index], bindings, repeat_count)?;
+            result.extend(repeated_items);
+            index += 2;
+            continue;
+        }
+
+        result.push(instantiate_template_with_index(
+            &items[index],
+            bindings,
+            repetition_index,
+        )?);
+        index += 1;
+    }
+
+    Ok(result)
+}
+
+fn instantiate_repeated_template_items(
+    item: &Expr,
+    bindings: &MacroBindings,
+    repeat_count: usize,
+) -> Result<Vec<TemplateExpr>, String> {
+    let mut result = Vec::with_capacity(repeat_count);
+    for current_index in 0..repeat_count {
+        result.push(instantiate_template_with_index(
+            item,
+            bindings,
+            Some(current_index),
+        )?);
+    }
+    Ok(result)
+}
+
+fn template_repeat_count(template: &Expr, bindings: &MacroBindings) -> Result<usize, String> {
+    let mut count = None;
+    collect_template_repeat_count(template, bindings, &mut count)?;
+    count.ok_or_else(|| {
+        "ellipsis must follow a template fragment with a repeated pattern variable".into()
+    })
+}
+
+fn collect_template_repeat_count(
+    template: &Expr,
+    bindings: &MacroBindings,
+    count: &mut Option<usize>,
+) -> Result<(), String> {
+    match template {
+        Expr::Literal(_) => Ok(()),
+        Expr::Application(items) => {
+            for item in items {
+                collect_template_repeat_count(item, bindings, count)?;
+            }
+            Ok(())
+        }
+        Expr::Symbol(name) | Expr::CapturedSymbol(name, _) => {
+            let Some(values) = bindings.repeats.get(name) else {
+                return Ok(());
+            };
+            match count {
+                Some(existing) if *existing != values.len() => {
+                    Err("mismatched repetition counts in macro template".into())
+                }
+                Some(_) => Ok(()),
+                None => {
+                    *count = Some(values.len());
+                    Ok(())
+                }
+            }
+        }
+    }
+}
+
+fn finalize_template(
+    template: &TemplateExpr,
+    definition_environment: &Environment,
+) -> Result<Expr, String> {
+    finalize_template_in_scope(template, definition_environment, &HashMap::new())
+}
+
+fn finalize_template_in_scope(
+    template: &TemplateExpr,
+    definition_environment: &Environment,
+    scope: &HashMap<String, Vec<String>>,
+) -> Result<Expr, String> {
+    match template {
+        TemplateExpr::Literal(value) => Ok(Expr::Literal(value.clone())),
+        TemplateExpr::Inserted(expr) => Ok(expr.clone()),
+        TemplateExpr::IntroducedSymbol(name) => {
+            if let Some(fresh) = scope.get(name).and_then(|names| names.last()) {
+                return Ok(Expr::Symbol(fresh.clone()));
+            }
+            Ok(Expr::CapturedSymbol(
+                name.clone(),
+                definition_environment.clone(),
+            ))
+        }
+        TemplateExpr::Application(items) => {
+            finalize_template_application(items, definition_environment, scope)
+        }
+    }
+}
+
+fn finalize_template_application(
+    items: &[TemplateExpr],
+    definition_environment: &Environment,
+    scope: &HashMap<String, Vec<String>>,
+) -> Result<Expr, String> {
+    let Some(operator_name) = items.first().and_then(template_symbol_name) else {
+        return finalize_generic_application(items, definition_environment, scope);
+    };
+
+    match operator_name {
+        "lambda" => finalize_lambda_template(items, definition_environment, scope),
+        "let" => finalize_let_template(items, definition_environment, scope),
+        _ => finalize_generic_application(items, definition_environment, scope),
+    }
+}
+
+fn finalize_generic_application(
+    items: &[TemplateExpr],
+    definition_environment: &Environment,
+    scope: &HashMap<String, Vec<String>>,
+) -> Result<Expr, String> {
+    let mut result = Vec::with_capacity(items.len());
+    for item in items {
+        result.push(finalize_template_in_scope(
+            item,
+            definition_environment,
+            scope,
+        )?);
+    }
+    Ok(Expr::Application(result))
+}
+
+fn finalize_lambda_template(
+    items: &[TemplateExpr],
+    definition_environment: &Environment,
+    scope: &HashMap<String, Vec<String>>,
+) -> Result<Expr, String> {
+    if items.len() < 2 {
+        return Err("macro-expanded `lambda` expects a parameter list".into());
+    }
+
+    let operator = finalize_template_in_scope(&items[0], definition_environment, scope)?;
+    let (parameters, body_scope) =
+        finalize_parameter_list(&items[1], definition_environment, scope)?;
+
+    let mut result = vec![operator, parameters];
+    for body in &items[2..] {
+        result.push(finalize_template_in_scope(
+            body,
+            definition_environment,
+            &body_scope,
+        )?);
+    }
+
+    Ok(Expr::Application(result))
+}
+
+fn finalize_parameter_list(
+    template: &TemplateExpr,
+    definition_environment: &Environment,
+    scope: &HashMap<String, Vec<String>>,
+) -> Result<(Expr, HashMap<String, Vec<String>>), String> {
+    let TemplateExpr::Application(parameters) = template else {
+        return Err("macro-expanded `lambda` expects a parameter list".into());
+    };
+
+    let mut body_scope = scope.clone();
+    let mut finalized = Vec::with_capacity(parameters.len());
+    for parameter in parameters {
+        finalized.push(finalize_binding_name(
+            parameter,
+            definition_environment,
+            &mut body_scope,
+        )?);
+    }
+
+    Ok((Expr::Application(finalized), body_scope))
+}
+
+fn finalize_let_template(
+    items: &[TemplateExpr],
+    definition_environment: &Environment,
+    scope: &HashMap<String, Vec<String>>,
+) -> Result<Expr, String> {
+    if items.len() < 2 {
+        return Err("macro-expanded `let` expects bindings and a body".into());
+    }
+
+    let operator = finalize_template_in_scope(&items[0], definition_environment, scope)?;
+    let mut result = vec![operator];
+    let mut body_scope = scope.clone();
+    let mut bindings_index = 1;
+
+    if !matches!(items.get(1), Some(TemplateExpr::Application(_))) {
+        let name = finalize_binding_name(&items[1], definition_environment, &mut body_scope)?;
+        result.push(name);
+        bindings_index = 2;
+    }
+
+    let bindings = items
+        .get(bindings_index)
+        .ok_or_else(|| "macro-expanded `let` expects a binding list".to_string())?;
+    result.push(finalize_let_bindings(
+        bindings,
+        definition_environment,
+        scope,
+        &mut body_scope,
+    )?);
+
+    for body in &items[bindings_index + 1..] {
+        result.push(finalize_template_in_scope(
+            body,
+            definition_environment,
+            &body_scope,
+        )?);
+    }
+
+    Ok(Expr::Application(result))
+}
+
+fn finalize_let_bindings(
+    template: &TemplateExpr,
+    definition_environment: &Environment,
+    value_scope: &HashMap<String, Vec<String>>,
+    body_scope: &mut HashMap<String, Vec<String>>,
+) -> Result<Expr, String> {
+    let TemplateExpr::Application(bindings) = template else {
+        return Err("macro-expanded `let` expects a binding list".into());
+    };
+
+    let mut finalized = Vec::with_capacity(bindings.len());
+    for binding in bindings {
+        let TemplateExpr::Application(parts) = binding else {
+            return Err("macro-expanded `let` bindings must be pairs".into());
+        };
+        let [name, value_expr] = parts.as_slice() else {
+            return Err("macro-expanded `let` bindings must be pairs".into());
+        };
+
+        let finalized_name = finalize_binding_name(name, definition_environment, body_scope)?;
+        let finalized_value =
+            finalize_template_in_scope(value_expr, definition_environment, value_scope)?;
+        finalized.push(Expr::Application(vec![finalized_name, finalized_value]));
+    }
+
+    Ok(Expr::Application(finalized))
+}
+
+fn finalize_binding_name(
+    template: &TemplateExpr,
+    _definition_environment: &Environment,
+    scope: &mut HashMap<String, Vec<String>>,
+) -> Result<Expr, String> {
+    match template {
+        TemplateExpr::IntroducedSymbol(name) => {
+            if name == "." {
+                return Ok(Expr::Symbol(name.clone()));
+            }
+
+            let fresh = fresh_identifier(name);
+            scope.entry(name.clone()).or_default().push(fresh.clone());
+            Ok(Expr::Symbol(fresh))
+        }
+        TemplateExpr::Inserted(expr) => {
+            let Some(name) = identifier_name(expr) else {
+                return Err("macro-expanded binding names must be symbols".into());
+            };
+            Ok(Expr::Symbol(name.to_string()))
+        }
+        _ => Err("macro-expanded binding names must be symbols".into()),
+    }
+}
+
+fn template_symbol_name(template: &TemplateExpr) -> Option<&str> {
+    match template {
+        TemplateExpr::IntroducedSymbol(name) => Some(name.as_str()),
+        TemplateExpr::Inserted(expr) => identifier_name(expr),
+        _ => None,
+    }
+}
+
+fn syntax_identifier_name(expr: &Expr) -> Option<&str> {
+    identifier_name(expr)
+}
+
+fn is_literal_identifier(name: &str, literals: &HashSet<String>, keyword: &str) -> bool {
+    name == keyword || literals.contains(name)
+}
+
+fn is_ellipsis_expr(expr: &Expr) -> bool {
+    matches!(identifier_name(expr), Some("..."))
+}
+
+fn expr_syntax_equal(left: &Expr, right: &Expr) -> bool {
+    match (left, right) {
+        (Expr::Literal(left), Expr::Literal(right)) => value_syntax_equal(left, right),
+        _ => match (identifier_name(left), identifier_name(right)) {
+            (Some(left), Some(right)) => left == right,
+            _ => match (left, right) {
+                (Expr::Application(left), Expr::Application(right))
+                    if left.len() == right.len() =>
+                {
+                    left.iter()
+                        .zip(right)
+                        .all(|(left, right)| expr_syntax_equal(left, right))
+                }
+                _ => false,
+            },
+        },
+    }
+}
+
+fn value_syntax_equal(left: &Value, right: &Value) -> bool {
+    match (left, right) {
+        (Value::Integer(left), Value::Integer(right)) => left == right,
+        (Value::Boolean(left), Value::Boolean(right)) => left == right,
+        (Value::String(left), Value::String(right)) => left == right,
+        (Value::Symbol(left), Value::Symbol(right)) => left == right,
+        (Value::Nil, Value::Nil) => true,
+        (Value::Pair(left_car, left_cdr), Value::Pair(right_car, right_cdr)) => {
+            value_syntax_equal(left_car, right_car) && value_syntax_equal(left_cdr, right_cdr)
+        }
+        (Value::Builtin(left), Value::Builtin(right)) => left.name() == right.name(),
+        (Value::Void, Value::Void) => true,
+        _ => false,
+    }
+}
+
+fn fresh_identifier(name: &str) -> String {
+    let suffix = GENSYM_COUNTER.fetch_add(1, Ordering::Relaxed);
+    format!("{name}__macro_{suffix}")
 }
 
 fn expect_integer(value: &Value, operator: &str) -> Result<i64, String> {
