@@ -10,10 +10,10 @@ pub use error::EvalError;
 /// representation of the last result.
 pub fn eval_str(input: &str) -> Result<String, EvalError> {
     let exprs = parser::parse(input)?;
-    let mut env = env::Env::new();
+    let env = env::Env::new();
     let mut last = None;
     for expr in &exprs {
-        let val = eval::eval(expr, &mut env)?;
+        let val = eval::eval(expr, &env)?;
         if !is_void(&val) {
             last = Some(val);
         }

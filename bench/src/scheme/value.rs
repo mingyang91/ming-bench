@@ -1,13 +1,33 @@
 use std::fmt;
 
+use crate::scheme::env::Env;
+
 /// A Scheme value.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone)]
 pub enum Value {
     Integer(i64),
     Boolean(bool),
     Str(String),
     Symbol(String),
     List(Vec<Value>),
+    Lambda {
+        params: Vec<String>,
+        body: Vec<Value>,
+        env: Env,
+    },
+}
+
+impl PartialEq for Value {
+    fn eq(&self, other: &Self) -> bool {
+        match (self, other) {
+            (Value::Integer(a), Value::Integer(b)) => a == b,
+            (Value::Boolean(a), Value::Boolean(b)) => a == b,
+            (Value::Str(a), Value::Str(b)) => a == b,
+            (Value::Symbol(a), Value::Symbol(b)) => a == b,
+            (Value::List(a), Value::List(b)) => a == b,
+            _ => false,
+        }
+    }
 }
 
 fn fmt_list(f: &mut fmt::Formatter<'_>, elems: &[Value]) -> fmt::Result {
@@ -30,6 +50,7 @@ impl fmt::Display for Value {
             Value::Str(s) => write!(f, "\"{s}\""),
             Value::Symbol(s) => write!(f, "{s}"),
             Value::List(elems) => fmt_list(f, elems),
+            Value::Lambda { .. } => write!(f, "#<procedure>"),
         }
     }
 }

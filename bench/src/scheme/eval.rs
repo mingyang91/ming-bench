@@ -2,17 +2,18 @@ use crate::scheme::env::Env;
 use crate::scheme::error::EvalError;
 use crate::scheme::value::Value;
 
-pub fn eval(expr: &Value, env: &mut Env) -> Result<Value, EvalError> {
+pub fn eval(expr: &Value, env: &Env) -> Result<Value, EvalError> {
     match expr {
         Value::Integer(_) | Value::Boolean(_) | Value::Str(_) => Ok(expr.clone()),
-        Value::Symbol(name) => env.get(name).cloned().ok_or(EvalError::UnboundVariable {
+        Value::Symbol(name) => env.get(name).ok_or(EvalError::UnboundVariable {
             name: name.clone(),
         }),
         Value::List(elems) => eval_list(elems, env),
+        Value::Lambda { .. } => Ok(expr.clone()),
     }
 }
 
-fn eval_list(elems: &[Value], env: &mut Env) -> Result<Value, EvalError> {
+fn eval_list(elems: &[Value], env: &Env) -> Result<Value, EvalError> {
     if elems.is_empty() {
         return Err(EvalError::Parse {
             msg: "empty application".into(),
@@ -29,25 +30,91 @@ fn eval_list(elems: &[Value], env: &mut Env) -> Result<Value, EvalError> {
             "quote" => return eval_quote(&elems[1..]),
             "and" => return eval_and(&elems[1..], env),
             "or" => return eval_or(&elems[1..], env),
+            "lambda" => return eval_lambda(&elems[1..], env),
             _ => {}
         }
     }
 
+    // Evaluate arguments
+    let args: Vec<Value> = elems[1..]
+        .iter()
+        .map(|e| eval(e, env))
+        .collect::<Result<Vec<_>, _>>()?;
+
     // Check for built-in procedures by symbol name
     if let Value::Symbol(name) = op {
         if is_builtin(name) {
-            let args: Vec<Value> = elems[1..]
-                .iter()
-                .map(|e| eval(e, env))
-                .collect::<Result<Vec<_>, _>>()?;
             return call_builtin(name, &args);
         }
     }
 
-    // Evaluate operator for non-builtins
+    // Evaluate operator
     let op_val = eval(op, env)?;
+
+    // Apply lambda
+    if let Value::Lambda {
+        params,
+        body,
+        env: closure_env,
+    } = &op_val
+    {
+        return apply_lambda(params, body, closure_env, &args);
+    }
+
     Err(EvalError::NotAProcedure {
         value: op_val.to_string(),
+    })
+}
+
+fn apply_lambda(
+    params: &[String],
+    body: &[Value],
+    closure_env: &Env,
+    args: &[Value],
+) -> Result<Value, EvalError> {
+    if params.len() != args.len() {
+        return Err(EvalError::ArityError {
+            name: "#<procedure>".into(),
+            expected: params.len(),
+            actual: args.len(),
+        });
+    }
+    let call_env = closure_env.child();
+    for (param, arg) in params.iter().zip(args.iter()) {
+        call_env.define(param.clone(), arg.clone());
+    }
+    let mut result = Value::Symbol("void".into());
+    for expr in body {
+        result = eval(expr, &call_env)?;
+    }
+    Ok(result)
+}
+
+fn eval_lambda(args: &[Value], env: &Env) -> Result<Value, EvalError> {
+    if args.len() < 2 {
+        return Err(EvalError::Parse {
+            msg: "lambda requires params and body".into(),
+        });
+    }
+    let Value::List(param_list) = &args[0] else {
+        return Err(EvalError::Parse {
+            msg: "lambda params must be a list".into(),
+        });
+    };
+    let params: Vec<String> = param_list
+        .iter()
+        .map(|p| match p {
+            Value::Symbol(s) => Ok(s.clone()),
+            other => Err(EvalError::Parse {
+                msg: format!("lambda param must be a symbol, got {other}"),
+            }),
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    let body = args[1..].to_vec();
+    Ok(Value::Lambda {
+        params,
+        body,
+        env: env.clone(),
     })
 }
 
@@ -73,23 +140,61 @@ fn call_builtin(name: &str, args: &[Value]) -> Result<Value, EvalError> {
     }
 }
 
-fn eval_define(args: &[Value], env: &mut Env) -> Result<Value, EvalError> {
-    if args.len() != 2 {
+fn eval_define(args: &[Value], env: &Env) -> Result<Value, EvalError> {
+    if args.len() < 2 {
         return Err(EvalError::Parse {
-            msg: "define requires exactly 2 arguments".into(),
+            msg: "define requires at least 2 arguments".into(),
         });
     }
-    let Value::Symbol(name) = &args[0] else {
-        return Err(EvalError::Parse {
-            msg: "define target must be a symbol".into(),
-        });
-    };
-    let val = eval(&args[1], env)?;
-    env.define(name.clone(), val);
+    match &args[0] {
+        Value::Symbol(name) => {
+            if args.len() != 2 {
+                return Err(EvalError::Parse {
+                    msg: "define requires exactly 2 arguments".into(),
+                });
+            }
+            let val = eval(&args[1], env)?;
+            env.define(name.clone(), val);
+        }
+        Value::List(name_and_params) => {
+            // (define (f x y) body...) => (define f (lambda (x y) body...))
+            if name_and_params.is_empty() {
+                return Err(EvalError::Parse {
+                    msg: "define function form requires a name".into(),
+                });
+            }
+            let Value::Symbol(name) = &name_and_params[0] else {
+                return Err(EvalError::Parse {
+                    msg: "define function name must be a symbol".into(),
+                });
+            };
+            let params: Vec<String> = name_and_params[1..]
+                .iter()
+                .map(|p| match p {
+                    Value::Symbol(s) => Ok(s.clone()),
+                    other => Err(EvalError::Parse {
+                        msg: format!("param must be a symbol, got {other}"),
+                    }),
+                })
+                .collect::<Result<Vec<_>, _>>()?;
+            let body = args[1..].to_vec();
+            let lambda = Value::Lambda {
+                params,
+                body,
+                env: env.clone(),
+            };
+            env.define(name.clone(), lambda);
+        }
+        other => {
+            return Err(EvalError::Parse {
+                msg: format!("define target must be a symbol or list, got {other}"),
+            });
+        }
+    }
     Ok(Value::Symbol("void".into()))
 }
 
-fn eval_if(args: &[Value], env: &mut Env) -> Result<Value, EvalError> {
+fn eval_if(args: &[Value], env: &Env) -> Result<Value, EvalError> {
     if args.len() < 2 || args.len() > 3 {
         return Err(EvalError::Parse {
             msg: "if requires 2 or 3 arguments".into(),
@@ -224,7 +329,7 @@ fn is_falsy(val: &Value) -> bool {
     matches!(val, Value::Boolean(false))
 }
 
-fn eval_and(exprs: &[Value], env: &mut Env) -> Result<Value, EvalError> {
+fn eval_and(exprs: &[Value], env: &Env) -> Result<Value, EvalError> {
     let mut result = Value::Boolean(true);
     for expr in exprs {
         result = eval(expr, env)?;
@@ -235,7 +340,7 @@ fn eval_and(exprs: &[Value], env: &mut Env) -> Result<Value, EvalError> {
     Ok(result)
 }
 
-fn eval_or(exprs: &[Value], env: &mut Env) -> Result<Value, EvalError> {
+fn eval_or(exprs: &[Value], env: &Env) -> Result<Value, EvalError> {
     let mut result = Value::Boolean(false);
     for expr in exprs {
         result = eval(expr, env)?;
