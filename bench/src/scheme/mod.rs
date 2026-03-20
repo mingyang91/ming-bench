@@ -9,6 +9,26 @@ use std::rc::Rc;
 type EnvRef = Rc<RefCell<EnvFrame>>;
 type OutputBuf = Rc<RefCell<String>>;
 
+thread_local! {
+    static CONT_CTX: RefCell<ContCtx> = RefCell::new(ContCtx {
+        next_id: 0,
+        intercept: None,
+        escape_value: None,
+        current_expr_index: 0,
+        id_at_expr_start: 0,
+        captures: HashMap::new(),
+    });
+}
+
+struct ContCtx {
+    next_id: u64,
+    intercept: Option<(u64, Value)>,
+    escape_value: Option<Value>,
+    current_expr_index: usize,
+    id_at_expr_start: u64,
+    captures: HashMap<u64, (usize, u64)>,
+}
+
 #[derive(Debug, Clone, PartialEq)]
 struct EnvFrame {
     bindings: HashMap<String, Value>,
@@ -82,6 +102,7 @@ enum Value {
     List(Vec<Value>),
     Lambda(Vec<String>, Option<String>, Vec<SExpr>, EnvRef),
     Builtin(String),
+    Continuation(u64),
     Void,
 }
 
@@ -97,6 +118,7 @@ impl PartialEq for Value {
             (Value::Void, Value::Void) => true,
             (Value::Lambda(..), Value::Lambda(..)) => false,
             (Value::Builtin(a), Value::Builtin(b)) => a == b,
+            (Value::Continuation(a), Value::Continuation(b)) => a == b,
             _ => false,
         }
     }
@@ -125,6 +147,7 @@ impl Value {
             }
             Value::Lambda(..) => "#<procedure>".to_string(),
             Value::Builtin(_) => "#<procedure>".to_string(),
+            Value::Continuation(_) => "#<continuation>".to_string(),
             Value::Void => String::new(),
         }
     }
@@ -1028,6 +1051,13 @@ fn eval_step(se: &SExpr, env: &EnvRef, out: &OutputBuf) -> Result<Step, EvalErro
                         let val = eval_expr(&elems[1], env, out)?;
                         Ok(Step::Done(Value::Boolean(matches!(val, Value::Char(_)))))
                     }
+                    "call/cc" | "call-with-current-continuation" => {
+                        if elems.len() != 2 {
+                            return Err(err_at(span, "call/cc requires exactly 1 argument"));
+                        }
+                        let func = eval_expr(&elems[1], env, out)?;
+                        handle_callcc(&func, span, out).map(Step::Done)
+                    }
                     _ => apply_proc_step(elems, span, env, out),
                 }
             } else {
@@ -1035,6 +1065,42 @@ fn eval_step(se: &SExpr, env: &EnvRef, out: &OutputBuf) -> Result<Step, EvalErro
             }
         }
     }
+}
+
+fn handle_callcc(func: &Value, span: Span, out: &OutputBuf) -> Result<Value, EvalError> {
+    let (id, maybe_intercept) = CONT_CTX.with(|ctx| {
+        let mut c = ctx.borrow_mut();
+        let id = c.next_id;
+        c.next_id += 1;
+        if let Some((iid, _)) = &c.intercept {
+            if *iid == id {
+                let val = c.intercept.take().unwrap().1;
+                return (id, Some(val));
+            }
+        }
+        let ei = c.current_expr_index;
+        let is = c.id_at_expr_start;
+        c.captures.insert(id, (ei, is));
+        (id, None)
+    });
+    if let Some(val) = maybe_intercept {
+        return Ok(val);
+    }
+    let cont = Value::Continuation(id);
+    match apply_value(func, &[cont], span, out) {
+        Ok(val) => Ok(val),
+        Err(EvalError::ContinuationEscape(esc_id)) if esc_id == id => {
+            CONT_CTX.with(|ctx| Ok(ctx.borrow_mut().escape_value.take().unwrap()))
+        }
+        Err(e) => Err(e),
+    }
+}
+
+fn invoke_continuation(id: u64, value: Value) -> Result<Value, EvalError> {
+    CONT_CTX.with(|ctx| {
+        ctx.borrow_mut().escape_value = Some(value);
+    });
+    Err(EvalError::ContinuationEscape(id))
 }
 
 fn bind_args(params: &[String], rest: &Option<String>, args: &[Value], call_env: &EnvRef, call_span: Span) -> Result<(), EvalError> {
@@ -1237,6 +1303,18 @@ fn apply_builtin(name: &str, args: &[Value], span: Span, out: &OutputBuf) -> Res
 
 fn apply_value(func: &Value, args: &[Value], call_span: Span, out: &OutputBuf) -> Result<Value, EvalError> {
     match func {
+        Value::Builtin(name) if name == "call/cc" || name == "call-with-current-continuation" => {
+            if args.len() != 1 {
+                return Err(err_at(call_span, "call/cc requires exactly 1 argument"));
+            }
+            handle_callcc(&args[0], call_span, out)
+        }
+        Value::Continuation(id) => {
+            if args.is_empty() {
+                return Err(err_at(call_span, "continuation requires exactly 1 argument"));
+            }
+            invoke_continuation(*id, args[0].clone())
+        }
         Value::Lambda(params, rest, body, closure_env) => {
             let call_env = EnvFrame::child(closure_env);
             bind_args(params, rest, args, &call_env, call_span)?;
@@ -1255,6 +1333,21 @@ fn apply_proc_step(elems: &[SExpr], call_span: Span, env: &EnvRef, out: &OutputB
     let func = eval_expr(&elems[0], env, out)?;
     let args: Result<Vec<Value>, _> = elems[1..].iter().map(|a| eval_expr(a, env, out)).collect();
     let args = args?;
+    match &func {
+        Value::Builtin(name) if name == "call/cc" || name == "call-with-current-continuation" => {
+            if args.len() != 1 {
+                return Err(err_at(call_span, "call/cc requires exactly 1 argument"));
+            }
+            return Ok(Step::Done(handle_callcc(&args[0], call_span, out)?));
+        }
+        Value::Continuation(id) => {
+            if args.is_empty() {
+                return Err(err_at(call_span, "continuation requires exactly 1 argument"));
+            }
+            return Ok(Step::Done(invoke_continuation(*id, args[0].clone())?));
+        }
+        _ => {}
+    }
     match func {
         Value::Lambda(params, rest, body, closure_env) => {
             let call_env = EnvFrame::child(&closure_env);
@@ -1319,6 +1412,7 @@ fn init_builtins(env: &EnvRef) {
         "number->string", "symbol->string", "string->symbol",
         "string-ref", "string-copy", "string-set!", "string->list", "list->string",
         "char->integer", "integer->char",
+        "call/cc", "call-with-current-continuation",
     ] {
         EnvFrame::set(env, name.to_string(), Value::Builtin(name.to_string()));
     }
@@ -1332,9 +1426,40 @@ pub fn eval_str(input: &str) -> Result<String, EvalError> {
     let env = EnvFrame::new();
     init_builtins(&env);
     let out: OutputBuf = Rc::new(RefCell::new(String::new()));
+    CONT_CTX.with(|ctx| {
+        let mut c = ctx.borrow_mut();
+        c.next_id = 0;
+        c.intercept = None;
+        c.escape_value = None;
+        c.current_expr_index = 0;
+        c.id_at_expr_start = 0;
+        c.captures.clear();
+    });
     let mut result = Value::Boolean(false);
-    for expr in &exprs {
-        result = eval_expr(expr, &env, &out)?;
+    let mut i = 0;
+    while i < exprs.len() {
+        CONT_CTX.with(|ctx| {
+            let mut c = ctx.borrow_mut();
+            c.current_expr_index = i;
+            c.id_at_expr_start = c.next_id;
+        });
+        match eval_expr(&exprs[i], &env, &out) {
+            Ok(val) => {
+                result = val;
+                i += 1;
+            }
+            Err(EvalError::ContinuationEscape(cont_id)) => {
+                CONT_CTX.with(|ctx| {
+                    let mut c = ctx.borrow_mut();
+                    let value = c.escape_value.take().unwrap();
+                    let (expr_idx, id_at_start) = c.captures[&cont_id];
+                    c.intercept = Some((cont_id, value));
+                    c.next_id = id_at_start;
+                    i = expr_idx;
+                });
+            }
+            Err(e) => return Err(e),
+        }
     }
     Ok(result.to_scheme_string())
 }
@@ -1349,9 +1474,40 @@ pub fn eval_str_with_output(input: &str) -> Result<(String, String), EvalError> 
     let env = EnvFrame::new();
     init_builtins(&env);
     let out: OutputBuf = Rc::new(RefCell::new(String::new()));
+    CONT_CTX.with(|ctx| {
+        let mut c = ctx.borrow_mut();
+        c.next_id = 0;
+        c.intercept = None;
+        c.escape_value = None;
+        c.current_expr_index = 0;
+        c.id_at_expr_start = 0;
+        c.captures.clear();
+    });
     let mut result = Value::Boolean(false);
-    for expr in &exprs {
-        result = eval_expr(expr, &env, &out)?;
+    let mut i = 0;
+    while i < exprs.len() {
+        CONT_CTX.with(|ctx| {
+            let mut c = ctx.borrow_mut();
+            c.current_expr_index = i;
+            c.id_at_expr_start = c.next_id;
+        });
+        match eval_expr(&exprs[i], &env, &out) {
+            Ok(val) => {
+                result = val;
+                i += 1;
+            }
+            Err(EvalError::ContinuationEscape(cont_id)) => {
+                CONT_CTX.with(|ctx| {
+                    let mut c = ctx.borrow_mut();
+                    let value = c.escape_value.take().unwrap();
+                    let (expr_idx, id_at_start) = c.captures[&cont_id];
+                    c.intercept = Some((cont_id, value));
+                    c.next_id = id_at_start;
+                    i = expr_idx;
+                });
+            }
+            Err(e) => return Err(e),
+        }
     }
     let output = out.borrow().clone();
     Ok((result.to_scheme_string(), output))

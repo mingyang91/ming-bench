@@ -6,4 +6,6 @@
 pub enum EvalError {
     #[error("parse error: {0}")]
     Parse(String),
+    #[error("continuation escape: {0}")]
+    ContinuationEscape(u64),
 }
