@@ -148,6 +148,20 @@ pub(crate) fn eval_let_tco(args: &[Value], env: &Rc<Env>) -> Result<Trampoline, 
     eval_body_tco(body, &child)
 }
 
+/// Evaluate `(set! name expr)` — mutate an existing binding.
+pub(crate) fn eval_set(args: &[Value], env: &Rc<Env>) -> Result<Value, EvalError> {
+    let [Value::Symbol(name), expr] = args else {
+        return Err(EvalError::BadSyntax {
+            form: "set!".into(),
+        });
+    };
+    let val = eval(expr, env)?;
+    if !env.set_existing(name, val) {
+        return Err(EvalError::UnboundVariable { name: name.clone() });
+    }
+    Ok(Value::Void)
+}
+
 /// Evaluate `(cond ...)` — TCO: matching clause body tail is a Bounce.
 pub(crate) fn eval_cond_tco(clauses: &[Value], env: &Rc<Env>) -> Result<Trampoline, EvalError> {
     for clause in clauses {
