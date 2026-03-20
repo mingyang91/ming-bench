@@ -1,4 +1,4 @@
-# CS 61A Scheme Interpreter
+# MING Scheme Interpreter
 
 Implement a Scheme interpreter in Rust. Read `SPEC.md` for the full specification.
 

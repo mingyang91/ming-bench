@@ -1,11 +1,11 @@
 [package]
-name = "cs61a-bench"
+name = "ming"
 version = "0.1.0"
 edition = "2021"
-description = "CS 61A Scheme interpreter benchmark for evaluating coding agents"
+description = "MING Interpreter Nurture Gauntlet — Scheme interpreter benchmark for evaluating coding agents"
 
 [lib]
-name = "cs61a_bench"
+name = "ming"
 path = "src/lib.rs"
 
 [dependencies]

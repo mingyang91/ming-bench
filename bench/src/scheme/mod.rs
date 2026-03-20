@@ -7,7 +7,7 @@ pub use error::EvalError;
 ///
 /// # Examples
 /// ```
-/// use cs61a_bench::scheme::eval_str;
+/// use ming::scheme::eval_str;
 /// assert_eq!(eval_str("(+ 1 2)"), Ok("3".into()));
 /// ```
 pub fn eval_str(_input: &str) -> Result<String, EvalError> {

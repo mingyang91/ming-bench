@@ -3,7 +3,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::Instant;
 
-const IMAGE_NAME: &str = "cs61a-bench";
+const IMAGE_NAME: &str = "ming";
 const TIMEOUT: u32 = 30;
 
 pub fn run(branch: &str, run_id: Option<&str>) -> Result<()> {
@@ -30,7 +30,7 @@ pub fn run(branch: &str, run_id: Option<&str>) -> Result<()> {
         branch_name: worktree_branch.clone(),
     };
 
-    println!("=== CS 61A Bench: branch={branch} run={run_id} ===");
+    println!("=== MING Bench: branch={branch} run={run_id} ===");
     println!("Creating worktree from '{branch}'...");
 
     let exit = crate::model::run_cmd(

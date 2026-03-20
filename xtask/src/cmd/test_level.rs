@@ -2,7 +2,7 @@ use crate::model::{project_dir, run_cmd, run_cmd_capture_all, Error, Result, LEV
 use std::fs;
 use std::path::Path;
 
-const IMAGE_NAME: &str = "cs61a-bench";
+const IMAGE_NAME: &str = "ming";
 
 pub fn run(level: &str, no_gate: bool) -> Result<()> {
     let proj = project_dir();
@@ -145,7 +145,7 @@ fn quality_gates(proj: &Path, level: &str) -> Result<()> {
     // Run clippy --fix
     println!("Running clippy --fix (auto-fixing trivial lints)...");
     let mut clippy_args = vec![
-        "clippy", "--package", "cs61a-bench", "--fix", "--allow-dirty", "--allow-staged", "--", "-D", "warnings",
+        "clippy", "--package", "ming", "--fix", "--allow-dirty", "--allow-staged", "--", "-D", "warnings",
     ];
     clippy_args.extend_from_slice(GATE_LINT_FLAGS);
     if allow_dead_code {
@@ -155,7 +155,7 @@ fn quality_gates(proj: &Path, level: &str) -> Result<()> {
 
     // Run clippy (verify)
     println!("Running clippy (verify, fn limit={fn_limit})...");
-    let mut verify_args = vec!["clippy", "--package", "cs61a-bench", "--", "-D", "warnings"];
+    let mut verify_args = vec!["clippy", "--package", "ming", "--", "-D", "warnings"];
     verify_args.extend_from_slice(GATE_LINT_FLAGS);
     if allow_dead_code {
         verify_args.extend_from_slice(&["-A", "dead_code"]);
@@ -226,7 +226,7 @@ fn find_test_binary(proj: &Path) -> Result<String> {
 
     // Parse output for binary path
     for line in output.lines() {
-        if let Some(start) = line.find("target/release/deps/cs61a_bench-") {
+        if let Some(start) = line.find("target/release/deps/ming-") {
             let bin = &line[start..];
             // Take until non-path character
             let bin: String = bin

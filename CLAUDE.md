@@ -1,4 +1,4 @@
-# CS 61A Benchmark Framework (Jug)
+# MING — Ming Interpreter Nurture Gauntlet
 
 This is the benchmark framework that orchestrates coding agent evaluation. The agent workspace lives in `bench/` — do NOT modify test cases or agent instructions without understanding the experimental design.
 

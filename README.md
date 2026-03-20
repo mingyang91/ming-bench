@@ -1,4 +1,4 @@
-# CS 61A Scheme Interpreter Benchmark
+# MING — Ming Interpreter Nurture Gauntlet
 
 A benchmark framework for measuring how **prompt engineering strategies** affect coding agent performance. Agents build a Scheme interpreter in Rust from scratch — 100+ tests across 25 difficulty levels, from basic arithmetic to first-class continuations, hygienic macros, and data structure extensions.
 
@@ -24,7 +24,7 @@ The agent implements a complete Scheme interpreter from scratch — lexer, parse
 ### Project Structure
 
 ```
-cs61a-bench/              # framework ("jug") — orchestration & analysis
+ming/                     # framework — orchestration & analysis
   xtask/                  # CLI: run-agent, test, bench, tokens, analyze, watch
   Dockerfile.bench        # container image for sandboxed testing
   CLAUDE.md               # framework maintainer instructions
