@@ -137,7 +137,10 @@ pub fn eval(expr: &Value, env: &Env) -> Result<Value, EvalError> {
                     name: name.clone(),
                 });
             }
-            Value::Lambda { .. } | Value::Builtin { .. } | Value::Continuation { .. } => {
+            Value::Lambda { .. }
+            | Value::Builtin { .. }
+            | Value::Continuation { .. }
+            | Value::Macro { .. } => {
                 return Ok(current_expr);
             }
             Value::List(ref elems) => match eval_list_trampoline(elems, &current_env)? {
@@ -162,6 +165,14 @@ fn eval_list_trampoline(elems: &[Value], env: &Env) -> Result<TailAction, EvalEr
         if let Some(action) = eval_special_form(name, &elems[1..], env)? {
             return Ok(action);
         }
+        if let Some(macro_val @ Value::Macro { .. }) = env.get(name) {
+            let expanded =
+                crate::scheme::macros::expand_macro(&macro_val, elems, env)?;
+            return Ok(TailAction::TailCall {
+                expr: expanded,
+                env: env.clone(),
+            });
+        }
     }
 
     eval_application(elems, env)
@@ -183,6 +194,12 @@ fn eval_special_form(
         "or" => eval_or_tail(args, env)?,
         "let" => eval_let_tail(args, env)?,
         "cond" => eval_cond_tail(args, env)?,
+        "define-syntax" => {
+            let (name, macro_val) =
+                crate::scheme::macros::parse_define_syntax(args, env)?;
+            env.define(name, macro_val);
+            TailAction::Return(Value::Symbol("void".into()))
+        }
         "call/cc" | "call-with-current-continuation" => {
             if args.len() != 1 {
                 return Err(EvalError::ArityError {

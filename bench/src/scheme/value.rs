@@ -22,6 +22,11 @@ pub enum Value {
     Continuation {
         id: u64,
     },
+    Macro {
+        literals: Vec<String>,
+        rules: Vec<(Value, Value)>,
+        def_env: Env,
+    },
 }
 
 impl PartialEq for Value {
@@ -34,6 +39,7 @@ impl PartialEq for Value {
             (Value::List(a), Value::List(b)) => a == b,
             (Value::Builtin { name: a }, Value::Builtin { name: b }) => a == b,
             (Value::Continuation { id: a }, Value::Continuation { id: b }) => a == b,
+            (Value::Macro { .. }, Value::Macro { .. }) => false,
             _ => false,
         }
     }
@@ -62,6 +68,7 @@ impl fmt::Display for Value {
             Value::Lambda { .. } | Value::Builtin { .. } | Value::Continuation { .. } => {
                 write!(f, "#<procedure>")
             }
+            Value::Macro { .. } => write!(f, "#<macro>"),
         }
     }
 }
