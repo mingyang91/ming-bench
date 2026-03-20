@@ -188,6 +188,66 @@ fn eval(val: Value, env: &mut Env) -> Result<Value, EvalError> {
                             let body = items[2..].to_vec();
                             Ok(Value::Lambda { params, body, env: env.clone() })
                         }
+                        "begin" => {
+                            let mut result = Value::Symbol("".to_string());
+                            for expr in &items[1..] {
+                                result = eval(expr.clone(), env)?;
+                            }
+                            return Ok(result);
+                        }
+                        "let" => {
+                            if items.len() < 3 {
+                                return Err(EvalError::Parse("let requires bindings and body".to_string()));
+                            }
+                            let bindings = match &items[1] {
+                                Value::List(b) => b,
+                                _ => return Err(EvalError::Parse("let: first argument must be a list of bindings".to_string())),
+                            };
+                            let mut local_env = env.clone();
+                            for binding in bindings {
+                                match binding {
+                                    Value::List(pair) if pair.len() == 2 => {
+                                        let name = match &pair[0] {
+                                            Value::Symbol(s) => s.clone(),
+                                            _ => return Err(EvalError::Parse("let: binding name must be a symbol".to_string())),
+                                        };
+                                        let val = eval(pair[1].clone(), env)?;
+                                        local_env.insert(name, val);
+                                    }
+                                    _ => return Err(EvalError::Parse("let: each binding must be (name value)".to_string())),
+                                }
+                            }
+                            let mut result = Value::Symbol("".to_string());
+                            for expr in &items[2..] {
+                                result = eval(expr.clone(), &mut local_env)?;
+                            }
+                            return Ok(result);
+                        }
+                        "cond" => {
+                            for clause in &items[1..] {
+                                match clause {
+                                    Value::List(parts) if parts.len() >= 2 => {
+                                        if matches!(&parts[0], Value::Symbol(s) if s == "else") {
+                                            let mut result = Value::Symbol("".to_string());
+                                            for expr in &parts[1..] {
+                                                result = eval(expr.clone(), env)?;
+                                            }
+                                            return Ok(result);
+                                        }
+                                        let test = eval(parts[0].clone(), env)?;
+                                        if !is_falsy(&test) {
+                                            let mut result = Value::Symbol("".to_string());
+                                            for expr in &parts[1..] {
+                                                result = eval(expr.clone(), env)?;
+                                            }
+                                            return Ok(result);
+                                        }
+                                    }
+                                    _ => return Err(EvalError::Parse("cond: invalid clause".to_string())),
+                                }
+                            }
+                            return Ok(Value::Symbol("".to_string()));
+                        }
                         "and" => return eval_and(&items[1..], env),
                         "or" => return eval_or(&items[1..], env),
                         _ => {
