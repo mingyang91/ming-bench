@@ -20,6 +20,7 @@ pub struct MetaJson {
     pub session_id: Option<String>,
     pub timestamp: Option<String>,
     pub exit_code: Option<i32>,
+    pub strategy: Option<String>,
 }
 
 // ---------------------------------------------------------------------------
