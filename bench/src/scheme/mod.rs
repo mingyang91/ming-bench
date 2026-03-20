@@ -2,6 +2,10 @@ pub mod error;
 
 pub use error::EvalError;
 
+use std::collections::HashMap;
+
+type Env = HashMap<String, Value>;
+
 #[derive(Debug, Clone, PartialEq)]
 enum Value {
     Integer(i64),
@@ -9,6 +13,7 @@ enum Value {
     Str(String),
     Symbol(String),
     List(Vec<Value>),
+    Void,
 }
 
 impl Value {
@@ -23,6 +28,7 @@ impl Value {
                 let inner: Vec<String> = elems.iter().map(|v| v.to_scheme_string()).collect();
                 format!("({})", inner.join(" "))
             }
+            Value::Void => String::new(),
         }
     }
 }
@@ -135,22 +141,66 @@ fn parse_all(input: &str) -> Result<Vec<Expr>, EvalError> {
     Ok(exprs)
 }
 
-fn eval_expr(expr: &Expr) -> Result<Value, EvalError> {
+fn expr_to_value(expr: &Expr) -> Value {
+    match expr {
+        Expr::Integer(n) => Value::Integer(*n),
+        Expr::Boolean(b) => Value::Boolean(*b),
+        Expr::Str(s) => Value::Str(s.clone()),
+        Expr::Symbol(s) => Value::Symbol(s.clone()),
+        Expr::List(elems) => Value::List(elems.iter().map(expr_to_value).collect()),
+    }
+}
+
+fn eval_expr(expr: &Expr, env: &mut Env) -> Result<Value, EvalError> {
     match expr {
         Expr::Integer(n) => Ok(Value::Integer(*n)),
         Expr::Boolean(b) => Ok(Value::Boolean(*b)),
         Expr::Str(s) => Ok(Value::Str(s.clone())),
-        Expr::Symbol(s) => Err(EvalError::Parse(format!("unbound variable: {}", s))),
+        Expr::Symbol(s) => env
+            .get(s)
+            .cloned()
+            .ok_or_else(|| EvalError::Parse(format!("unbound variable: {}", s))),
         Expr::List(elems) => {
             if elems.is_empty() {
                 return Err(EvalError::Parse("empty application".to_string()));
             }
             if let Expr::Symbol(op) = &elems[0] {
                 match op.as_str() {
+                    "define" => {
+                        if elems.len() != 3 {
+                            return Err(EvalError::Parse("define requires exactly 2 arguments".to_string()));
+                        }
+                        if let Expr::Symbol(name) = &elems[1] {
+                            let val = eval_expr(&elems[2], env)?;
+                            env.insert(name.clone(), val);
+                            Ok(Value::Void)
+                        } else {
+                            Err(EvalError::Parse("define requires a symbol".to_string()))
+                        }
+                    }
+                    "if" => {
+                        if elems.len() < 3 || elems.len() > 4 {
+                            return Err(EvalError::Parse("if requires 2 or 3 arguments".to_string()));
+                        }
+                        let cond = eval_expr(&elems[1], env)?;
+                        if !is_false(&cond) {
+                            eval_expr(&elems[2], env)
+                        } else if elems.len() == 4 {
+                            eval_expr(&elems[3], env)
+                        } else {
+                            Ok(Value::Void)
+                        }
+                    }
+                    "quote" => {
+                        if elems.len() != 2 {
+                            return Err(EvalError::Parse("quote requires exactly 1 argument".to_string()));
+                        }
+                        Ok(expr_to_value(&elems[1]))
+                    }
                     "+" => {
                         let mut sum: i64 = 0;
                         for arg in &elems[1..] {
-                            sum += require_int(&eval_expr(arg)?)?;
+                            sum += require_int(&eval_expr(arg, env)?)?;
                         }
                         Ok(Value::Integer(sum))
                     }
@@ -158,13 +208,13 @@ fn eval_expr(expr: &Expr) -> Result<Value, EvalError> {
                         if elems.len() < 2 {
                             return Err(EvalError::Parse("- requires at least one argument".to_string()));
                         }
-                        let first = require_int(&eval_expr(&elems[1])?)?;
+                        let first = require_int(&eval_expr(&elems[1], env)?)?;
                         if elems.len() == 2 {
                             Ok(Value::Integer(-first))
                         } else {
                             let mut result = first;
                             for arg in &elems[2..] {
-                                result -= require_int(&eval_expr(arg)?)?;
+                                result -= require_int(&eval_expr(arg, env)?)?;
                             }
                             Ok(Value::Integer(result))
                         }
@@ -172,7 +222,7 @@ fn eval_expr(expr: &Expr) -> Result<Value, EvalError> {
                     "*" => {
                         let mut product: i64 = 1;
                         for arg in &elems[1..] {
-                            product *= require_int(&eval_expr(arg)?)?;
+                            product *= require_int(&eval_expr(arg, env)?)?;
                         }
                         Ok(Value::Integer(product))
                     }
@@ -180,9 +230,9 @@ fn eval_expr(expr: &Expr) -> Result<Value, EvalError> {
                         if elems.len() < 3 {
                             return Err(EvalError::Parse("/ requires at least two arguments".to_string()));
                         }
-                        let mut result = require_int(&eval_expr(&elems[1])?)?;
+                        let mut result = require_int(&eval_expr(&elems[1], env)?)?;
                         for arg in &elems[2..] {
-                            let divisor = require_int(&eval_expr(arg)?)?;
+                            let divisor = require_int(&eval_expr(arg, env)?)?;
                             if divisor == 0 {
                                 return Err(EvalError::Parse("division by zero".to_string()));
                             }
@@ -191,36 +241,36 @@ fn eval_expr(expr: &Expr) -> Result<Value, EvalError> {
                         Ok(Value::Integer(result))
                     }
                     "<" => {
-                        let (a, b) = require_two_ints(&elems[1..], "<")?;
+                        let (a, b) = require_two_ints(&elems[1..], "<", env)?;
                         Ok(Value::Boolean(a < b))
                     }
                     ">" => {
-                        let (a, b) = require_two_ints(&elems[1..], ">")?;
+                        let (a, b) = require_two_ints(&elems[1..], ">", env)?;
                         Ok(Value::Boolean(a > b))
                     }
                     "=" => {
-                        let (a, b) = require_two_ints(&elems[1..], "=")?;
+                        let (a, b) = require_two_ints(&elems[1..], "=", env)?;
                         Ok(Value::Boolean(a == b))
                     }
                     "<=" => {
-                        let (a, b) = require_two_ints(&elems[1..], "<=")?;
+                        let (a, b) = require_two_ints(&elems[1..], "<=", env)?;
                         Ok(Value::Boolean(a <= b))
                     }
                     ">=" => {
-                        let (a, b) = require_two_ints(&elems[1..], ">=")?;
+                        let (a, b) = require_two_ints(&elems[1..], ">=", env)?;
                         Ok(Value::Boolean(a >= b))
                     }
                     "not" => {
                         if elems.len() != 2 {
                             return Err(EvalError::Parse("not requires exactly one argument".to_string()));
                         }
-                        let val = eval_expr(&elems[1])?;
+                        let val = eval_expr(&elems[1], env)?;
                         Ok(Value::Boolean(is_false(&val)))
                     }
                     "and" => {
                         let mut result = Value::Boolean(true);
                         for arg in &elems[1..] {
-                            result = eval_expr(arg)?;
+                            result = eval_expr(arg, env)?;
                             if is_false(&result) {
                                 return Ok(result);
                             }
@@ -230,7 +280,7 @@ fn eval_expr(expr: &Expr) -> Result<Value, EvalError> {
                     "or" => {
                         let mut result = Value::Boolean(false);
                         for arg in &elems[1..] {
-                            result = eval_expr(arg)?;
+                            result = eval_expr(arg, env)?;
                             if !is_false(&result) {
                                 return Ok(result);
                             }
@@ -250,12 +300,12 @@ fn is_false(val: &Value) -> bool {
     matches!(val, Value::Boolean(false))
 }
 
-fn require_two_ints(args: &[Expr], op: &str) -> Result<(i64, i64), EvalError> {
+fn require_two_ints(args: &[Expr], op: &str, env: &mut Env) -> Result<(i64, i64), EvalError> {
     if args.len() != 2 {
         return Err(EvalError::Parse(format!("{} requires exactly two arguments", op)));
     }
-    let a = require_int(&eval_expr(&args[0])?)?;
-    let b = require_int(&eval_expr(&args[1])?)?;
+    let a = require_int(&eval_expr(&args[0], env)?)?;
+    let b = require_int(&eval_expr(&args[1], env)?)?;
     Ok((a, b))
 }
 
@@ -279,9 +329,10 @@ pub fn eval_str(input: &str) -> Result<String, EvalError> {
     if exprs.is_empty() {
         return Err(EvalError::Parse("empty input".to_string()));
     }
+    let mut env = Env::new();
     let mut result = Value::Boolean(false);
     for expr in &exprs {
-        result = eval_expr(expr)?;
+        result = eval_expr(expr, &mut env)?;
     }
     Ok(result.to_scheme_string())
 }
