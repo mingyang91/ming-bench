@@ -10,7 +10,11 @@ Canonical registry of extracted helpers (>= 5 ops).
 
 ## Rust Helpers (src/scheme/)
 
-(none yet)
+### parse_program (src/scheme/parser.rs:4) — Parse one input string into a vector of Scheme expressions.
+### expand (src/scheme/macros.rs:71) — Recursively expand syntax-rules macros while preserving captured identifiers.
+### continue_program (src/scheme/evaluator.rs:311) — Interleave top-level macro installation, expansion, and evaluation across a whole program.
+### apply_builtin (src/scheme/evaluator.rs:684) — Dispatch and execute Scheme builtin procedures, including `apply` and `call/cc`.
+### render_value (src/scheme/runtime.rs:221) — Convert runtime values back into the exact output format expected by the tests.
 
 ## Python Helpers (scripts/)
 
