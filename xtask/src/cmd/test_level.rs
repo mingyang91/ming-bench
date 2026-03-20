@@ -125,6 +125,20 @@ fn quality_gates(proj: &Path, level: &str) -> Result<()> {
 
     restore();
 
+    // --- AST rule check ---
+    let scheme_src = proj.join("bench/src/scheme");
+    let violations = crate::ast_check::check_ast_rules(&scheme_src);
+    if !violations.is_empty() {
+        eprintln!("ERROR: AST rule violations found:");
+        for v in &violations {
+            eprintln!("  {}:{}: {}", v.file, v.line, v.message);
+        }
+        return Err(Error::CommandFailed {
+            cmd: "AST rule check".to_string(),
+            exit_code: 1,
+        });
+    }
+
     // --- mod.rs size check ---
     if level != "all" {
         let ln: u32 = level.parse().unwrap_or(99);

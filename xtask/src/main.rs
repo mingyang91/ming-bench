@@ -1,7 +1,9 @@
 #![allow(clippy::excessive_nesting)]
 
+mod ast_check;
 mod cmd;
 mod model;
+mod session;
 
 use clap::{Parser, Subcommand};
 use std::path::PathBuf;
@@ -106,6 +108,55 @@ enum Commands {
     },
     /// Verify test cases against Guile ground truth
     Verify,
+    /// Dump session content (thinking, text, tool calls)
+    SessionDump {
+        /// Run directory or name
+        run: PathBuf,
+        /// Show only thinking blocks
+        #[arg(long)]
+        thinking: bool,
+        /// Show only assistant text
+        #[arg(long)]
+        text: bool,
+        /// Show only tool calls
+        #[arg(long)]
+        tools: bool,
+        /// Show only user messages
+        #[arg(long)]
+        user: bool,
+        /// Filter to a specific level (e.g., 05)
+        #[arg(long)]
+        level: Option<String>,
+    },
+    /// Search session for keywords across content types
+    SessionGrep {
+        /// Run directory or name
+        run: PathBuf,
+        /// Keywords to search for
+        keywords: Vec<String>,
+        /// Characters of context around each hit
+        #[arg(long)]
+        context: Option<usize>,
+        /// Filter to a specific level
+        #[arg(long)]
+        level: Option<String>,
+    },
+    /// List tool calls in chronological order
+    SessionTools {
+        /// Run directory or name
+        run: PathBuf,
+        /// Show summary counts only
+        #[arg(long)]
+        summary: bool,
+        /// Filter to a specific level
+        #[arg(long)]
+        level: Option<String>,
+    },
+    /// Quick stats overview of a session
+    SessionStats {
+        /// Run directory or name
+        run: PathBuf,
+    },
 }
 
 fn main() {
@@ -149,6 +200,26 @@ fn main() {
         }),
         Commands::Analyze { runs, all } => cmd::analyze::run(runs, all),
         Commands::Verify => cmd::verify::run(),
+        Commands::SessionDump {
+            run,
+            thinking,
+            text,
+            tools,
+            user,
+            level,
+        } => cmd::session_dump::run(run, thinking, text, tools, user, level),
+        Commands::SessionGrep {
+            run,
+            keywords,
+            context,
+            level,
+        } => cmd::session_grep::run(run, keywords, context, level),
+        Commands::SessionTools {
+            run,
+            summary,
+            level,
+        } => cmd::session_tools::run(run, summary, level),
+        Commands::SessionStats { run } => cmd::session_stats::run(run),
     };
     if let Err(e) = result {
         eprintln!("error: {e}");
