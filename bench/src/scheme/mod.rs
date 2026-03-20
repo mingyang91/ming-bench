@@ -11,6 +11,11 @@ enum Value {
     Str(String),
     Symbol(String),
     List(Vec<Value>),
+    Lambda {
+        params: Vec<String>,
+        body: Vec<Value>,
+        env: Env,
+    },
 }
 
 type Env = HashMap<String, Value>;
@@ -27,6 +32,7 @@ impl Value {
                 let parts: Vec<String> = items.iter().map(|v| v.to_scheme_string()).collect();
                 format!("({})", parts.join(" "))
             }
+            Value::Lambda { .. } => "#<procedure>".to_string(),
         }
     }
 }
@@ -113,16 +119,37 @@ fn eval(val: Value, env: &mut Env) -> Result<Value, EvalError> {
                 Value::Symbol(name) => {
                     match name.as_str() {
                         "define" => {
-                            if items.len() != 3 {
+                            if items.len() < 3 {
                                 return Err(EvalError::Parse("define requires 2 arguments".to_string()));
                             }
-                            let sym = match &items[1] {
-                                Value::Symbol(s) => s.clone(),
-                                _ => return Err(EvalError::Parse("define: first argument must be a symbol".to_string())),
-                            };
-                            let val = eval(items[2].clone(), env)?;
-                            env.insert(sym, val);
-                            Ok(Value::Symbol("".to_string())) // define returns unspecified
+                            match &items[1] {
+                                Value::Symbol(s) => {
+                                    if items.len() != 3 {
+                                        return Err(EvalError::Parse("define requires 2 arguments".to_string()));
+                                    }
+                                    let val = eval(items[2].clone(), env)?;
+                                    env.insert(s.clone(), val);
+                                }
+                                Value::List(sig) => {
+                                    // (define (f params...) body...)
+                                    if sig.is_empty() {
+                                        return Err(EvalError::Parse("define: empty signature".to_string()));
+                                    }
+                                    let fname = match &sig[0] {
+                                        Value::Symbol(s) => s.clone(),
+                                        _ => return Err(EvalError::Parse("define: name must be a symbol".to_string())),
+                                    };
+                                    let params: Vec<String> = sig[1..].iter().map(|v| match v {
+                                        Value::Symbol(s) => Ok(s.clone()),
+                                        _ => Err(EvalError::Parse("define: parameter must be a symbol".to_string())),
+                                    }).collect::<Result<_, _>>()?;
+                                    let body = items[2..].to_vec();
+                                    let lambda = Value::Lambda { params, body, env: env.clone() };
+                                    env.insert(fname, lambda);
+                                }
+                                _ => return Err(EvalError::Parse("define: first argument must be a symbol or list".to_string())),
+                            }
+                            Ok(Value::Symbol("".to_string()))
                         }
                         "if" => {
                             if items.len() < 3 || items.len() > 4 {
@@ -143,18 +170,84 @@ fn eval(val: Value, env: &mut Env) -> Result<Value, EvalError> {
                             }
                             Ok(items[1].clone())
                         }
+                        "lambda" => {
+                            if items.len() < 3 {
+                                return Err(EvalError::Parse("lambda requires params and body".to_string()));
+                            }
+                            let params = match &items[1] {
+                                Value::List(p) => p.iter().map(|v| match v {
+                                    Value::Symbol(s) => Ok(s.clone()),
+                                    _ => Err(EvalError::Parse("lambda: parameter must be a symbol".to_string())),
+                                }).collect::<Result<Vec<_>, _>>()?,
+                                _ => return Err(EvalError::Parse("lambda: first argument must be a parameter list".to_string())),
+                            };
+                            let body = items[2..].to_vec();
+                            Ok(Value::Lambda { params, body, env: env.clone() })
+                        }
                         "and" => return eval_and(&items[1..], env),
                         "or" => return eval_or(&items[1..], env),
-                        _ => apply_builtin(name, &items[1..], env),
+                        _ => {
+                            // Look up the symbol — it might be a lambda
+                            if let Some(func_val) = env.get(name).cloned() {
+                                if let Value::Lambda { .. } = &func_val {
+                                    let mut eval_args = Vec::new();
+                                    for a in &items[1..] {
+                                        eval_args.push(eval(a.clone(), env)?);
+                                    }
+                                    return apply_lambda(&func_val, &eval_args, Some(name));
+                                }
+                            }
+                            apply_builtin(name, &items[1..], env)
+                        }
                     }
                 }
-                _ => Err(EvalError::Parse(format!(
-                    "not a procedure: {}",
-                    func.to_scheme_string()
-                ))),
+                _ => {
+                    // Evaluate the function position expression
+                    let func_val = eval(func.clone(), env)?;
+                    match func_val {
+                        Value::Lambda { .. } => {
+                            let mut eval_args = Vec::new();
+                            for a in &items[1..] {
+                                eval_args.push(eval(a.clone(), env)?);
+                            }
+                            apply_lambda(&func_val, &eval_args, None)
+                        }
+                        _ => Err(EvalError::Parse(format!(
+                            "not a procedure: {}",
+                            func_val.to_scheme_string()
+                        ))),
+                    }
+                }
             }
         }
         other => Ok(other),
+    }
+}
+
+fn apply_lambda(func: &Value, args: &[Value], self_name: Option<&str>) -> Result<Value, EvalError> {
+    if let Value::Lambda { params, body, env } = func {
+        if params.len() != args.len() {
+            return Err(EvalError::Parse(format!(
+                "expected {} arguments, got {}",
+                params.len(),
+                args.len()
+            )));
+        }
+        let mut local_env = env.clone();
+        // For recursion: inject the function itself into its execution env
+        if let Some(name) = self_name {
+            local_env.insert(name.to_string(), func.clone());
+        }
+        for (p, a) in params.iter().zip(args.iter()) {
+            local_env.insert(p.clone(), a.clone());
+        }
+        let mut result = Value::Symbol("".to_string());
+        for expr in body {
+            result = eval(expr.clone(), &mut local_env)?;
+        }
+        Ok(result)
+    } else {
+        Err(EvalError::Parse("not a procedure".to_string()))
     }
 }
 
