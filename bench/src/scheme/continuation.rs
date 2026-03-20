@@ -49,6 +49,9 @@ pub(crate) enum Frame {
         remaining_clauses: Vec<Expr>,
         environment: Environment,
     },
+    CallCcReturn {
+        void_stack: Vec<Frame>,
+    },
     ApplyOperator {
         operands: Vec<Expr>,
         environment: Environment,

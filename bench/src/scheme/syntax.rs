@@ -842,11 +842,11 @@ fn hygienize_define(
     renames: &Renames,
 ) -> Result<(Expr, Renames), SchemeError> {
     match items {
-        [_, target, value] => {
-            hygienize_variable_define(items, target, value, definition_environment, renames)
-        }
         [_, Expr::List(signature), body @ ..] if !body.is_empty() => {
             hygienize_function_define(items, signature, body, definition_environment, renames)
+        }
+        [_, target, value] => {
+            hygienize_variable_define(items, target, value, definition_environment, renames)
         }
         _ => hygienize_generic_list(items, definition_environment, renames),
     }

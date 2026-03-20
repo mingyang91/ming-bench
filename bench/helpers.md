@@ -10,11 +10,13 @@ Canonical registry of extracted helpers (>= 5 ops).
 
 ## Rust Helpers (src/scheme/)
 
-### start_sequence (src/scheme/evaluator.rs:52) — Schedule left-to-right sequence evaluation while preserving tail position for the final expression
-### continue_cond (src/scheme/evaluator.rs:322) — Advance through validated `cond` clauses with resumable predicate evaluation
-### finish_apply_arguments (src/scheme/evaluator.rs:775) — Resume a pending callable application after one argument value has been produced
-### finish_let_bindings (src/scheme/evaluator.rs:802) — Resume `let` binding evaluation and enter the body once all values are ready
-### start_argument_evaluation (src/scheme/evaluator.rs:882) — Evaluate application arguments right-to-left into continuation frames that `call/cc` can capture
+### start_sequence (src/scheme/evaluator.rs:53) — Schedule left-to-right sequence evaluation while preserving tail position for the final expression
+### continue_cond (src/scheme/evaluator.rs:380) — Advance through validated `cond` clauses with resumable predicate evaluation
+### finish_callcc_return (src/scheme/evaluator.rs:843) — Decide whether a `call/cc` callback returning `#<void>` should skip the current sequence frame
+### finish_apply_arguments (src/scheme/evaluator.rs:855) — Resume a pending callable application after one argument value has been produced
+### finish_let_bindings (src/scheme/evaluator.rs:882) — Resume `let` binding evaluation and enter the body once all values are ready
+### start_argument_evaluation (src/scheme/evaluator.rs:962) — Evaluate application arguments right-to-left into continuation frames that `call/cc` can capture
+### callcc_void_stack (src/scheme/evaluator.rs:1123) — Trim the immediate same-environment sequence frame when a `call/cc` callback returns `#<void>`
 
 ## Python Helpers (scripts/)
 

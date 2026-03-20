@@ -1,0 +1,14 @@
+/home/my/.zeroclaw/workspace/workspace/cx-qg-lvl/bench/target/debug/deps/thiserror-3482e3a84dbd6d58.d: /home/my/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/thiserror-2.0.18/src/lib.rs /home/my/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/thiserror-2.0.18/src/aserror.rs /home/my/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/thiserror-2.0.18/src/display.rs /home/my/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/thiserror-2.0.18/src/var.rs /home/my/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/thiserror-2.0.18/src/private.rs /home/my/.zeroclaw/workspace/workspace/cx-qg-lvl/bench/target/debug/build/thiserror-2f1e6b2df69c26b0/out/private.rs
+
+/home/my/.zeroclaw/workspace/workspace/cx-qg-lvl/bench/target/debug/deps/libthiserror-3482e3a84dbd6d58.rlib: /home/my/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/thiserror-2.0.18/src/lib.rs /home/my/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/thiserror-2.0.18/src/aserror.rs /home/my/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/thiserror-2.0.18/src/display.rs /home/my/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/thiserror-2.0.18/src/var.rs /home/my/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/thiserror-2.0.18/src/private.rs /home/my/.zeroclaw/workspace/workspace/cx-qg-lvl/bench/target/debug/build/thiserror-2f1e6b2df69c26b0/out/private.rs
+
+/home/my/.zeroclaw/workspace/workspace/cx-qg-lvl/bench/target/debug/deps/libthiserror-3482e3a84dbd6d58.rmeta: /home/my/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/thiserror-2.0.18/src/lib.rs /home/my/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/thiserror-2.0.18/src/aserror.rs /home/my/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/thiserror-2.0.18/src/display.rs /home/my/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/thiserror-2.0.18/src/var.rs /home/my/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/thiserror-2.0.18/src/private.rs /home/my/.zeroclaw/workspace/workspace/cx-qg-lvl/bench/target/debug/build/thiserror-2f1e6b2df69c26b0/out/private.rs
+
+/home/my/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/thiserror-2.0.18/src/lib.rs:
+/home/my/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/thiserror-2.0.18/src/aserror.rs:
+/home/my/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/thiserror-2.0.18/src/display.rs:
+/home/my/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/thiserror-2.0.18/src/var.rs:
+/home/my/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/thiserror-2.0.18/src/private.rs:
+/home/my/.zeroclaw/workspace/workspace/cx-qg-lvl/bench/target/debug/build/thiserror-2f1e6b2df69c26b0/out/private.rs:
+
+# env-dep:OUT_DIR=/home/my/.zeroclaw/workspace/workspace/cx-qg-lvl/bench/target/debug/build/thiserror-2f1e6b2df69c26b0/out

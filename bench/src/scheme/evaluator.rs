@@ -726,6 +726,7 @@ fn continue_from_frame(
             remaining_clauses,
             environment,
         } => finish_cond(body, remaining_clauses, environment, value, stack),
+        Frame::CallCcReturn { void_stack } => finish_callcc_return(value, void_stack, stack),
         Frame::ApplyOperator {
             operands,
             environment,
@@ -839,6 +840,18 @@ fn finish_cond(
     start_sequence(body, environment, stack)
 }
 
+fn finish_callcc_return(
+    value: Value,
+    void_stack: Vec<Frame>,
+    stack: &mut Vec<Frame>,
+) -> Result<MachineState, SchemeError> {
+    if matches!(value, Value::Void) {
+        *stack = void_stack;
+    }
+
+    Ok(MachineState::Value(value))
+}
+
 fn finish_apply_arguments(
     callable: Value,
     mut evaluated_rev: Vec<Value>,
@@ -861,7 +874,7 @@ fn finish_apply_arguments(
         }
         None => {
             evaluated_rev.reverse();
-            apply_value_callable(callable, evaluated_rev, stack)
+            apply_value_callable(callable, evaluated_rev, &environment, stack)
         }
     }
 }
@@ -962,17 +975,18 @@ fn start_argument_evaluation(
             });
             Ok(MachineState::Expression(operand, environment))
         }
-        None => apply_value_callable(callable, Vec::new(), stack),
+        None => apply_value_callable(callable, Vec::new(), &environment, stack),
     }
 }
 
 fn apply_value_callable(
     callable: Value,
     arguments: Vec<Value>,
+    environment: &Environment,
     stack: &mut Vec<Frame>,
 ) -> Result<MachineState, SchemeError> {
     match callable {
-        Value::Builtin(builtin) => apply_builtin(builtin, arguments, stack),
+        Value::Builtin(builtin) => apply_builtin(builtin, arguments, environment, stack),
         Value::Procedure(procedure) => apply_procedure(procedure, arguments, stack),
         Value::Continuation(continuation) => apply_continuation(continuation, arguments, stack),
         value => Err(SchemeError::NonCallable { kind: value.kind() }),
@@ -982,11 +996,12 @@ fn apply_value_callable(
 fn apply_builtin(
     builtin: Builtin,
     arguments: Vec<Value>,
+    environment: &Environment,
     stack: &mut Vec<Frame>,
 ) -> Result<MachineState, SchemeError> {
     match builtin {
-        Builtin::Apply => eval_apply(arguments, stack),
-        Builtin::CallCc => eval_callcc(arguments, stack),
+        Builtin::Apply => eval_apply(arguments, environment, stack),
+        Builtin::CallCc => eval_callcc(arguments, environment, stack),
         _ => apply_builtin_value(builtin, arguments).map(MachineState::Value),
     }
 }
@@ -1052,7 +1067,11 @@ fn apply_continuation(
     }
 }
 
-fn eval_apply(arguments: Vec<Value>, stack: &mut Vec<Frame>) -> Result<MachineState, SchemeError> {
+fn eval_apply(
+    arguments: Vec<Value>,
+    environment: &Environment,
+    stack: &mut Vec<Frame>,
+) -> Result<MachineState, SchemeError> {
     if arguments.len() < 2 {
         return Err(SchemeError::TooFewArguments {
             operator: "apply",
@@ -1078,20 +1097,36 @@ fn eval_apply(arguments: Vec<Value>, stack: &mut Vec<Frame>) -> Result<MachineSt
         })?;
     applied_arguments.extend(rest_arguments);
 
-    apply_value_callable(callable.clone(), applied_arguments, stack)
+    apply_value_callable(callable.clone(), applied_arguments, environment, stack)
 }
 
-fn eval_callcc(arguments: Vec<Value>, stack: &mut Vec<Frame>) -> Result<MachineState, SchemeError> {
+fn eval_callcc(
+    arguments: Vec<Value>,
+    environment: &Environment,
+    stack: &mut Vec<Frame>,
+) -> Result<MachineState, SchemeError> {
     match arguments.as_slice() {
         [callable] => {
             let continuation = Value::continuation(Continuation::new(stack.clone()));
-            apply_value_callable(callable.clone(), vec![continuation], stack)
+            let void_stack = callcc_void_stack(environment, stack);
+            stack.push(Frame::CallCcReturn { void_stack });
+            apply_value_callable(callable.clone(), vec![continuation], environment, stack)
         }
         _ => Err(SchemeError::WrongArgumentCount {
             operator: "call/cc",
             expected: 1,
             actual: arguments.len(),
         }),
+    }
+}
+
+fn callcc_void_stack(environment: &Environment, stack: &[Frame]) -> Vec<Frame> {
+    match stack.last() {
+        Some(Frame::Sequence {
+            environment: sequence_environment,
+            ..
+        }) if sequence_environment.ptr_eq(environment) => stack[..stack.len() - 1].to_vec(),
+        Some(_) | None => stack.to_vec(),
     }
 }
 
