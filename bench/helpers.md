@@ -10,7 +10,12 @@ Canonical registry of extracted helpers (>= 5 ops).
 
 ## Rust Helpers (src/scheme/)
 
-(none yet)
+### eval_list (src/scheme/interpreter.rs:517) — Expand macros, dispatch special forms, or start generic procedure application for a list expression
+### resume (src/scheme/interpreter.rs:964) — Advance the explicit continuation machine after a value is produced
+### expand_template (src/scheme/interpreter.rs:1588) — Expand a `syntax-rules` template with hygiene-aware identifier handling
+### parse_formals (src/scheme/interpreter.rs:2387) — Parse lambda or function-definition formals, including dotted rest arguments
+### proper_list_to_vec (src/scheme/interpreter.rs:2683) — Convert a proper Scheme list value into a Rust vector with validation
+### procedure_return_cont (src/scheme/interpreter.rs:2810) — Find the nearest procedure boundary continuation for `call/cc`-driven suspension
 
 ## Python Helpers (scripts/)
 

@@ -4,7 +4,22 @@
 /// error type is not possible — the `eval_str` signature requires this type.
 #[derive(Debug, PartialEq, thiserror::Error)]
 pub enum EvalError {
-    // Add variants as needed, e.g.:
-    // #[error("unbound variable: {name}")]
-    // UnboundVariable { name: String },
+    #[error("empty program")]
+    EmptyProgram,
+    #[error("parse error: {message}")]
+    Parse { message: String },
+    #[error("unbound variable: {name}")]
+    UnboundVariable { name: String },
+    #[error("type error: expected {expected}, found {found}")]
+    TypeError { expected: String, found: String },
+    #[error("arity error: expected {expected}, got {got}")]
+    ArityError { expected: String, got: usize },
+    #[error("invalid form: {message}")]
+    InvalidForm { message: String },
+    #[error("division by zero")]
+    DivisionByZero,
+    #[error("arithmetic overflow")]
+    ArithmeticOverflow,
+    #[error("macro expansion failed: {message}")]
+    MacroExpansion { message: String },
 }
