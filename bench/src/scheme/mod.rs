@@ -113,6 +113,61 @@ fn eval_lambda(args: &[Value], env: &Rc<Env>) -> Result<Value, EvalError> {
     })
 }
 
+/// Evaluate `(let ((var expr) ...) body...)`.
+fn eval_let(args: &[Value], env: &Rc<Env>) -> Result<Value, EvalError> {
+    let [Value::List(bindings), body @ ..] = args else {
+        return Err(EvalError::BadSyntax {
+            form: "let".into(),
+        });
+    };
+    if body.is_empty() {
+        return Err(EvalError::BadSyntax {
+            form: "let".into(),
+        });
+    }
+    let child = Env::child(env);
+    for binding in bindings {
+        let Value::List(pair) = binding else {
+            return Err(EvalError::BadSyntax {
+                form: "let".into(),
+            });
+        };
+        let [Value::Symbol(name), expr] = pair.as_slice() else {
+            return Err(EvalError::BadSyntax {
+                form: "let".into(),
+            });
+        };
+        let val = eval(expr, env)?;
+        child.set(name.clone(), val);
+    }
+    eval_body(body, &child)
+}
+
+/// Evaluate `(cond (test expr ...) ... (else expr ...))`.
+fn eval_cond(clauses: &[Value], env: &Rc<Env>) -> Result<Value, EvalError> {
+    for clause in clauses {
+        let Value::List(parts) = clause else {
+            return Err(EvalError::BadSyntax {
+                form: "cond".into(),
+            });
+        };
+        let [test, body @ ..] = parts.as_slice() else {
+            return Err(EvalError::BadSyntax {
+                form: "cond".into(),
+            });
+        };
+        if matches!(test, Value::Symbol(s) if s == "else") {
+            return eval_body(body, env);
+        }
+        let val = eval(test, env)?;
+        if !is_truthy(&val) {
+            continue;
+        }
+        return if body.is_empty() { Ok(val) } else { eval_body(body, env) };
+    }
+    Ok(Value::Void)
+}
+
 /// Evaluate `(if cond then else?)`.
 fn eval_if(args: &[Value], env: &Rc<Env>) -> Result<Value, EvalError> {
     match args {
@@ -195,6 +250,9 @@ pub(crate) fn eval(expr: &Value, env: &Rc<Env>) -> Result<Value, EvalError> {
                         args.iter().map(|a| eval(a, env)).collect::<Result<_, _>>()?;
                     apply_comparison(op, &evaluated)
                 }
+                Value::Symbol(op) if op == "let" => eval_let(args, env),
+                Value::Symbol(op) if op == "begin" => eval_body(args, env),
+                Value::Symbol(op) if op == "cond" => eval_cond(args, env),
                 Value::Symbol(op) if op == "not" => eval_not(args, env),
                 Value::Symbol(op) if op == "and" => eval_and(args, env),
                 Value::Symbol(op) if op == "or" => eval_or(args, env),
