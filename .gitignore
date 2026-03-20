@@ -7,3 +7,11 @@ results/
 !results/.gitkeep
 bench/CLAUDE.md
 bench/AGENTS.md
+*.sh
+
+## python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+*.py
