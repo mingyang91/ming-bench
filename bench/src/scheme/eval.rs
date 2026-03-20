@@ -11,6 +11,8 @@ enum Bounce {
     Continue(Value),
     /// Tail call into a new environment (lambda application).
     Call { expr: Value, env: Env },
+    /// Tail call where the env was updated in place (no allocation).
+    TailUpdate(Value),
 }
 
 pub(super) fn eval(value: &Value, env: &mut Env, out: &mut String) -> Result<Value, EvalError> {
@@ -24,7 +26,7 @@ pub(super) fn eval(value: &Value, env: &mut Env, out: &mut String) -> Result<Val
         };
         match bounce {
             Bounce::Done(val) => return Ok(val),
-            Bounce::Continue(expr) => current = expr,
+            Bounce::Continue(expr) | Bounce::TailUpdate(expr) => current = expr,
             Bounce::Call { expr, env: new_env } => {
                 current = expr;
                 call_env = Some(new_env);
@@ -75,6 +77,8 @@ fn eval_pair_bounce(
             "begin" => eval_begin_bounce(args, env, out),
             "let" => eval_let_bounce(args, env, out),
             "cond" => eval_cond_bounce(args, env, out),
+            "and" => eval_and_bounce(args, env, out),
+            "or" => eval_or_bounce(args, env, out),
             "set!" => eval_set(args, env, out).map(Bounce::Done),
             "string-set!" => eval_string_set(args, env, out).map(Bounce::Done),
             _ => eval_symbol_call_bounce(name, args, env, out),
@@ -102,15 +106,63 @@ fn eval_symbol_call_bounce(
             args.iter().map(|a| eval(a, env, out)).collect::<Result<_, _>>()?;
         return eval_apply(&evaled_args, env, out).map(Bounce::Done);
     }
-    let proc = env
+    let proc_rc = env
         .get(name)
-        .map(|rc| rc.borrow().clone())
+        .cloned()
         .ok_or_else(|| EvalError::UnboundVariable {
             name: name.to_string(),
         })?;
     let evaled_args: Vec<Value> =
         args.iter().map(|a| eval(a, env, out)).collect::<Result<_, _>>()?;
-    apply_proc_bounce(&proc, &evaled_args, env, out)
+
+    // Borrow the proc to avoid cloning the Lambda (and its closure HashMap)
+    let proc_ref = proc_rc.borrow();
+    match &*proc_ref {
+        Value::Lambda {
+            params,
+            rest_param,
+            body,
+            closure,
+        } => {
+            if rest_param.is_some() {
+                if evaled_args.len() < params.len() {
+                    return Err(EvalError::WrongArgCount {
+                        expected: params.len(),
+                        got: evaled_args.len(),
+                    });
+                }
+            } else if params.len() != evaled_args.len() {
+                return Err(EvalError::WrongArgCount {
+                    expected: params.len(),
+                    got: evaled_args.len(),
+                });
+            }
+            let mut call_env = closure.clone();
+            for (k, v) in env.iter() {
+                call_env.entry(k.clone()).or_insert_with(|| v.clone());
+            }
+            for (param, arg) in params.iter().zip(&evaled_args) {
+                call_env.insert(param.clone(), Rc::new(RefCell::new(arg.clone())));
+            }
+            if let Some(rest_name) = rest_param {
+                let rest_args = &evaled_args[params.len()..];
+                let rest_list = rest_args.iter().rev().fold(Value::Nil, |acc, v| {
+                    Value::Pair(Box::new(v.clone()), Box::new(acc))
+                });
+                call_env.insert(rest_name.clone(), Rc::new(RefCell::new(rest_list)));
+            }
+            Ok(Bounce::Call {
+                expr: body.as_ref().clone(),
+                env: call_env,
+            })
+        }
+        Value::BuiltinProc(bname) => {
+            call_builtin_with_values(bname, &evaled_args, env, out).map(Bounce::Done)
+        }
+        _ => Err(EvalError::NotAProcedure {
+            value: proc_ref.display(),
+        }),
+    }
 }
 
 /// Build the call environment and return a tail-call bounce.
@@ -118,6 +170,14 @@ fn apply_bounce(
     proc: &Value,
     args: &[Value],
     caller_env: &Env,
+) -> Result<Bounce, EvalError> {
+    apply_bounce_inner(proc, args, Some(caller_env))
+}
+
+fn apply_bounce_inner(
+    proc: &Value,
+    args: &[Value],
+    caller_env: Option<&Env>,
 ) -> Result<Bounce, EvalError> {
     let Value::Lambda {
         params,
@@ -146,8 +206,10 @@ fn apply_bounce(
     }
 
     let mut call_env = closure.clone();
-    for (k, v) in caller_env {
-        call_env.entry(k.clone()).or_insert_with(|| v.clone());
+    if let Some(caller) = caller_env {
+        for (k, v) in caller {
+            call_env.entry(k.clone()).or_insert_with(|| v.clone());
+        }
     }
     for (param, arg) in params.iter().zip(args) {
         call_env.insert(param.clone(), Rc::new(RefCell::new(arg.clone())));
@@ -161,7 +223,7 @@ fn apply_bounce(
     }
 
     Ok(Bounce::Call {
-        expr: *body.clone(),
+        expr: body.as_ref().clone(),
         env: call_env,
     })
 }
@@ -382,7 +444,7 @@ fn eval_define(args: &[Value], env: &mut Env, out: &mut String) -> Result<Value,
             let lambda = Value::Lambda {
                 params,
                 rest_param,
-                body: Box::new(func_body),
+                body: Rc::new(func_body),
                 closure: env.clone(),
             };
             env.insert(name.clone(), Rc::new(RefCell::new(lambda)));
@@ -450,6 +512,11 @@ fn eval_let_bounce(
     env: &mut Env,
     out: &mut String,
 ) -> Result<Bounce, EvalError> {
+    // Named let: (let name ((var init) ...) body ...)
+    if let [Value::Symbol(name), bindings_val, body @ ..] = args {
+        return eval_named_let_bounce(name, bindings_val, body, env, out);
+    }
+
     let [bindings_val, body @ ..] = args else {
         return Err(EvalError::WrongArgCount {
             expected: 2,
@@ -485,11 +552,74 @@ fn eval_let_bounce(
     let lambda = Value::Lambda {
         params,
         rest_param: None,
-        body: Box::new(func_body),
+        body: Rc::new(func_body),
         closure: env.clone(),
     };
 
     apply_bounce(&lambda, &values, env)
+}
+
+fn eval_named_let_bounce(
+    name: &str,
+    bindings_val: &Value,
+    body: &[Value],
+    env: &mut Env,
+    out: &mut String,
+) -> Result<Bounce, EvalError> {
+    let binding_list = bindings_val
+        .to_list_vec()
+        .ok_or_else(|| EvalError::TypeError {
+            expected: "binding list".to_string(),
+            got: bindings_val.display(),
+        })?;
+
+    let mut params = Vec::new();
+    let mut init_values = Vec::new();
+    for binding in &binding_list {
+        let pair = binding.to_list_vec().ok_or_else(|| EvalError::TypeError {
+            expected: "binding pair".to_string(),
+            got: binding.display(),
+        })?;
+        let [Value::Symbol(param), expr] = pair.as_slice() else {
+            return Err(EvalError::TypeError {
+                expected: "(symbol expr)".to_string(),
+                got: binding.display(),
+            });
+        };
+        params.push(param.clone());
+        init_values.push(eval(expr, env, out)?);
+    }
+
+    let func_body = wrap_body(body)?;
+
+    // Build lambda and bind name in env for self-reference
+    let lambda = Value::Lambda {
+        params: params.clone(),
+        rest_param: None,
+        body: Box::new(func_body.clone()),
+        closure: Env::new(),
+    };
+    let cell = Rc::new(RefCell::new(lambda));
+
+    let mut loop_env = env.clone();
+    loop_env.insert(name.to_string(), cell.clone());
+
+    // Update closure to include the self-reference
+    {
+        let mut borrowed = cell.borrow_mut();
+        if let Value::Lambda { ref mut closure, .. } = *borrowed {
+            *closure = loop_env.clone();
+        }
+    }
+
+    // Bind initial params
+    for (param, val) in params.iter().zip(&init_values) {
+        loop_env.insert(param.clone(), Rc::new(RefCell::new(val.clone())));
+    }
+
+    // Execute the loop body directly using eval, which uses the trampoline
+    let result = eval(&func_body, &mut loop_env, out)?;
+    Ok(Bounce::Done(result))
 }
 
 fn eval_body_bounce(
@@ -580,7 +710,7 @@ fn eval_lambda(args: &[Value], env: &Env) -> Result<Value, EvalError> {
     Ok(Value::Lambda {
         params,
         rest_param,
-        body: Box::new(func_body),
+        body: Rc::new(func_body),
         closure: env.clone(),
     })
 }
@@ -588,7 +718,7 @@ fn eval_lambda(args: &[Value], env: &Env) -> Result<Value, EvalError> {
 fn is_builtin(name: &str) -> bool {
     matches!(
         name,
-        "+" | "-" | "*" | "/" | "<" | ">" | "=" | "<=" | ">=" | "not" | "and" | "or"
+        "+" | "-" | "*" | "/" | "<" | ">" | "=" | "<=" | ">=" | "not"
             | "cons" | "car" | "cdr" | "null?" | "list" | "length"
             | "string?" | "number?" | "boolean?" | "pair?" | "symbol?" | "char?"
             | "display" | "write" | "newline"
@@ -612,8 +742,8 @@ fn eval_builtin(
         "+" | "-" | "*" | "/" => eval_arithmetic(name, args, env, out),
         "<" | ">" | "=" | "<=" | ">=" => eval_comparison(name, args, env, out),
         "not" => eval_not(args, env, out),
-        "and" => eval_and(args, env, out),
-        "or" => eval_or(args, env, out),
+        "and" => eval_and(args, env, out),  // fallback for non-tail contexts
+        "or" => eval_or(args, env, out),   // fallback for non-tail contexts
         "cons" | "car" | "cdr" | "null?" | "list" | "length" => {
             eval_list_builtin(name, args, env, out)
         }
@@ -738,25 +868,53 @@ fn eval_not(args: &[Value], env: &mut Env, out: &mut String) -> Result<Value, Ev
 }
 
 fn eval_and(args: &[Value], env: &mut Env, out: &mut String) -> Result<Value, EvalError> {
-    let mut result = Value::Boolean(true);
-    for arg in args {
-        result = eval(arg, env, out)?;
+    match eval_and_bounce(args, env, out)? {
+        Bounce::Done(v) => Ok(v),
+        Bounce::Continue(expr) => eval(&expr, env, out),
+        Bounce::Call { expr, mut env } => eval(&expr, &mut env, out),
+    }
+}
+
+fn eval_and_bounce(
+    args: &[Value],
+    env: &mut Env,
+    out: &mut String,
+) -> Result<Bounce, EvalError> {
+    let Some((last, rest)) = args.split_last() else {
+        return Ok(Bounce::Done(Value::Boolean(true)));
+    };
+    for arg in rest {
+        let result = eval(arg, env, out)?;
         if result == Value::Boolean(false) {
-            return Ok(Value::Boolean(false));
+            return Ok(Bounce::Done(Value::Boolean(false)));
         }
     }
-    Ok(result)
+    Ok(Bounce::Continue(last.clone()))
 }
 
 fn eval_or(args: &[Value], env: &mut Env, out: &mut String) -> Result<Value, EvalError> {
-    let mut result = Value::Boolean(false);
-    for arg in args {
-        result = eval(arg, env, out)?;
+    match eval_or_bounce(args, env, out)? {
+        Bounce::Done(v) => Ok(v),
+        Bounce::Continue(expr) => eval(&expr, env, out),
+        Bounce::Call { expr, mut env } => eval(&expr, &mut env, out),
+    }
+}
+
+fn eval_or_bounce(
+    args: &[Value],
+    env: &mut Env,
+    out: &mut String,
+) -> Result<Bounce, EvalError> {
+    let Some((last, rest)) = args.split_last() else {
+        return Ok(Bounce::Done(Value::Boolean(false)));
+    };
+    for arg in rest {
+        let result = eval(arg, env, out)?;
         if result != Value::Boolean(false) {
-            return Ok(result);
+            return Ok(Bounce::Done(result));
         }
     }
-    Ok(result)
+    Ok(Bounce::Continue(last.clone()))
 }
 
 fn eval_list_builtin(

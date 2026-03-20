@@ -27,7 +27,7 @@ enum Value {
     Lambda {
         params: Vec<String>,
         rest_param: Option<String>,
-        body: Box<Value>,
+        body: Rc<Value>,
         closure: Env,
     },
     BuiltinProc(String),
