@@ -10,6 +10,7 @@ enum Value {
     Boolean(bool),
     Str(String),
     Symbol(String),
+    Char(char),
     List(Vec<Value>),
     Lambda {
         params: Vec<String>,
@@ -59,6 +60,7 @@ impl Value {
             Value::Boolean(false) => "#f".to_string(),
             Value::Str(s) => format!("\"{}\"", s),
             Value::Symbol(s) => s.clone(),
+            Value::Char(c) => format!("#\\{}", c),
             Value::List(items) => {
                 let parts: Vec<String> = items.iter().map(|v| v.to_scheme_string()).collect();
                 format!("({})", parts.join(" "))
@@ -70,6 +72,7 @@ impl Value {
     fn display_string(&self) -> String {
         match self {
             Value::Str(s) => s.clone(),
+            Value::Char(c) => c.to_string(),
             other => other.to_scheme_string(),
         }
     }
@@ -727,6 +730,97 @@ fn apply_builtin(
                 ));
             }
             Ok(Value::Boolean(matches!(&eval_args[0], Value::Symbol(_))))
+        }
+        "char?" => {
+            if eval_args.len() != 1 {
+                return Err(err_at("char? requires 1 argument", call_line, call_col));
+            }
+            Ok(Value::Boolean(matches!(&eval_args[0], Value::Char(_))))
+        }
+        "string-append" => {
+            let mut result = String::new();
+            for a in &eval_args {
+                match a {
+                    Value::Str(s) => result.push_str(s),
+                    _ => return Err(err_at("string-append: expected string", call_line, call_col)),
+                }
+            }
+            Ok(Value::Str(result))
+        }
+        "string-length" => {
+            if eval_args.len() != 1 {
+                return Err(err_at("string-length requires 1 argument", call_line, call_col));
+            }
+            match &eval_args[0] {
+                Value::Str(s) => Ok(Value::Integer(s.len() as i64)),
+                _ => Err(err_at("string-length: expected string", call_line, call_col)),
+            }
+        }
+        "substring" => {
+            if eval_args.len() != 3 {
+                return Err(err_at("substring requires 3 arguments", call_line, call_col));
+            }
+            let s = match &eval_args[0] {
+                Value::Str(s) => s,
+                _ => return Err(err_at("substring: expected string", call_line, call_col)),
+            };
+            let start = expect_integer(&eval_args[1], call_line, call_col)? as usize;
+            let end = expect_integer(&eval_args[2], call_line, call_col)? as usize;
+            if start > end || end > s.len() {
+                return Err(err_at("substring: index out of range", call_line, call_col));
+            }
+            Ok(Value::Str(s[start..end].to_string()))
+        }
+        "string->number" => {
+            if eval_args.len() != 1 {
+                return Err(err_at("string->number requires 1 argument", call_line, call_col));
+            }
+            match &eval_args[0] {
+                Value::Str(s) => match s.parse::<i64>() {
+                    Ok(n) => Ok(Value::Integer(n)),
+                    Err(_) => Ok(Value::Boolean(false)),
+                },
+                _ => Err(err_at("string->number: expected string", call_line, call_col)),
+            }
+        }
+        "number->string" => {
+            if eval_args.len() != 1 {
+                return Err(err_at("number->string requires 1 argument", call_line, call_col));
+            }
+            let n = expect_integer(&eval_args[0], call_line, call_col)?;
+            Ok(Value::Str(n.to_string()))
+        }
+        "symbol->string" => {
+            if eval_args.len() != 1 {
+                return Err(err_at("symbol->string requires 1 argument", call_line, call_col));
+            }
+            match &eval_args[0] {
+                Value::Symbol(s) => Ok(Value::Str(s.clone())),
+                _ => Err(err_at("symbol->string: expected symbol", call_line, call_col)),
+            }
+        }
+        "string->symbol" => {
+            if eval_args.len() != 1 {
+                return Err(err_at("string->symbol requires 1 argument", call_line, call_col));
+            }
+            match &eval_args[0] {
+                Value::Str(s) => Ok(Value::Symbol(s.clone())),
+                _ => Err(err_at("string->symbol: expected string", call_line, call_col)),
+            }
+        }
+        "string-ref" => {
+            if eval_args.len() != 2 {
+                return Err(err_at("string-ref requires 2 arguments", call_line, call_col));
+            }
+            let s = match &eval_args[0] {
+                Value::Str(s) => s,
+                _ => return Err(err_at("string-ref: expected string", call_line, call_col)),
+            };
+            let idx = expect_integer(&eval_args[1], call_line, call_col)? as usize;
+            match s.chars().nth(idx) {
+                Some(c) => Ok(Value::Char(c)),
+                None => Err(err_at("string-ref: index out of range", call_line, call_col)),
+            }
         }
         _ => Err(err_at(
             format!("unknown procedure: {}", name),
