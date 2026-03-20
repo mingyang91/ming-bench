@@ -80,7 +80,8 @@ enum Value {
     Char(char),
     Symbol(String),
     List(Vec<Value>),
-    Lambda(Vec<String>, Vec<SExpr>, EnvRef),
+    Lambda(Vec<String>, Option<String>, Vec<SExpr>, EnvRef),
+    Builtin(String),
     Void,
 }
 
@@ -95,6 +96,7 @@ impl PartialEq for Value {
             (Value::List(a), Value::List(b)) => a == b,
             (Value::Void, Value::Void) => true,
             (Value::Lambda(..), Value::Lambda(..)) => false,
+            (Value::Builtin(a), Value::Builtin(b)) => a == b,
             _ => false,
         }
     }
@@ -122,6 +124,7 @@ impl Value {
                 format!("({})", inner.join(" "))
             }
             Value::Lambda(..) => "#<procedure>".to_string(),
+            Value::Builtin(_) => "#<procedure>".to_string(),
             Value::Void => String::new(),
         }
     }
@@ -316,6 +319,30 @@ fn parse_all(input: &str) -> Result<Vec<SExpr>, EvalError> {
     Ok(exprs)
 }
 
+fn parse_params(param_exprs: &[SExpr], span: Span) -> Result<(Vec<String>, Option<String>), EvalError> {
+    let mut params = Vec::new();
+    let mut i = 0;
+    while i < param_exprs.len() {
+        match &param_exprs[i].expr {
+            Expr::Symbol(s) if s == "." => {
+                if i + 1 != param_exprs.len() - 1 {
+                    return Err(err_at(span, "invalid dot syntax in parameters"));
+                }
+                match &param_exprs[i + 1].expr {
+                    Expr::Symbol(r) => return Ok((params, Some(r.clone()))),
+                    _ => return Err(err_at(param_exprs[i + 1].span, "rest parameter must be a symbol")),
+                }
+            }
+            Expr::Symbol(s) => {
+                params.push(s.clone());
+                i += 1;
+            }
+            _ => return Err(err_at(param_exprs[i].span, "parameter must be a symbol")),
+        }
+    }
+    Ok((params, None))
+}
+
 fn sexpr_to_value(se: &SExpr) -> Value {
     match &se.expr {
         Expr::Integer(n) => Value::Integer(*n),
@@ -370,9 +397,10 @@ fn eval_step(se: &SExpr, env: &EnvRef, out: &OutputBuf) -> Result<Step, EvalErro
                                     return Err(err_at(span, "define requires exactly 2 arguments"));
                                 }
                                 let val = eval_expr(&elems[2], env, out)?;
-                                if let Value::Lambda(params, body, closure_env) = &val {
+                                if let Value::Lambda(params, rest, body, closure_env) = &val {
                                     let val = Value::Lambda(
                                         params.clone(),
+                                        rest.clone(),
                                         body.clone(),
                                         Rc::clone(closure_env),
                                     );
@@ -391,21 +419,11 @@ fn eval_step(se: &SExpr, env: &EnvRef, out: &OutputBuf) -> Result<Step, EvalErro
                                     ));
                                 }
                                 if let Expr::Symbol(name) = &name_and_params[0].expr {
-                                    let params: Result<Vec<String>, _> = name_and_params[1..]
-                                        .iter()
-                                        .map(|p| match &p.expr {
-                                            Expr::Symbol(s) => Ok(s.clone()),
-                                            _ => Err(err_at(
-                                                p.span,
-                                                "parameter must be a symbol",
-                                            )),
-                                        })
-                                        .collect();
-                                    let params = params?;
+                                    let (params, rest) = parse_params(&name_and_params[1..], span)?;
                                     let body: Vec<SExpr> = elems[2..].to_vec();
                                     let closure_env = Rc::clone(env);
                                     let val =
-                                        Value::Lambda(params, body, closure_env.clone());
+                                        Value::Lambda(params, rest, body, closure_env.clone());
                                     EnvFrame::set(env, name.clone(), val.clone());
                                     EnvFrame::set(&closure_env, name.clone(), val);
                                     Ok(Step::Done(Value::Void))
@@ -435,19 +453,17 @@ fn eval_step(se: &SExpr, env: &EnvRef, out: &OutputBuf) -> Result<Step, EvalErro
                         if elems.len() < 3 {
                             return Err(err_at(span, "lambda requires params and body"));
                         }
-                        if let Expr::List(param_exprs) = &elems[1].expr {
-                            let params: Result<Vec<String>, _> = param_exprs
-                                .iter()
-                                .map(|p| match &p.expr {
-                                    Expr::Symbol(s) => Ok(s.clone()),
-                                    _ => Err(err_at(p.span, "parameter must be a symbol")),
-                                })
-                                .collect();
-                            let params = params?;
-                            let body: Vec<SExpr> = elems[2..].to_vec();
-                            Ok(Step::Done(Value::Lambda(params, body, Rc::clone(env))))
-                        } else {
-                            Err(err_at(span, "lambda params must be a list"))
+                        match &elems[1].expr {
+                            Expr::List(param_exprs) => {
+                                let (params, rest) = parse_params(param_exprs, span)?;
+                                let body: Vec<SExpr> = elems[2..].to_vec();
+                                Ok(Step::Done(Value::Lambda(params, rest, body, Rc::clone(env))))
+                            }
+                            Expr::Symbol(rest_name) => {
+                                let body: Vec<SExpr> = elems[2..].to_vec();
+                                Ok(Step::Done(Value::Lambda(vec![], Some(rest_name.clone()), body, Rc::clone(env))))
+                            }
+                            _ => Err(err_at(span, "lambda params must be a list or symbol")),
                         }
                     }
                     "if" => {
@@ -985,25 +1001,216 @@ fn eval_step(se: &SExpr, env: &EnvRef, out: &OutputBuf) -> Result<Step, EvalErro
     }
 }
 
+fn bind_args(params: &[String], rest: &Option<String>, args: &[Value], call_env: &EnvRef, call_span: Span) -> Result<(), EvalError> {
+    if let Some(rest_name) = rest {
+        if args.len() < params.len() {
+            return Err(err_at(call_span, format!("expected at least {} arguments, got {}", params.len(), args.len())));
+        }
+        for (param, arg) in params.iter().zip(args) {
+            EnvFrame::set(call_env, param.clone(), arg.clone());
+        }
+        EnvFrame::set(call_env, rest_name.clone(), Value::List(args[params.len()..].to_vec()));
+    } else {
+        if params.len() != args.len() {
+            return Err(err_at(call_span, format!("expected {} arguments, got {}", params.len(), args.len())));
+        }
+        for (param, arg) in params.iter().zip(args) {
+            EnvFrame::set(call_env, param.clone(), arg.clone());
+        }
+    }
+    Ok(())
+}
+
+fn apply_builtin(name: &str, args: &[Value], span: Span, out: &OutputBuf) -> Result<Value, EvalError> {
+    match name {
+        "+" => {
+            let mut sum: i64 = 0;
+            for arg in args { sum += require_int(arg, span)?; }
+            Ok(Value::Integer(sum))
+        }
+        "-" => {
+            if args.is_empty() { return Err(err_at(span, "- requires at least one argument")); }
+            let first = require_int(&args[0], span)?;
+            if args.len() == 1 { return Ok(Value::Integer(-first)); }
+            let mut result = first;
+            for arg in &args[1..] { result -= require_int(arg, span)?; }
+            Ok(Value::Integer(result))
+        }
+        "*" => {
+            let mut product: i64 = 1;
+            for arg in args { product *= require_int(arg, span)?; }
+            Ok(Value::Integer(product))
+        }
+        "/" => {
+            if args.len() < 2 { return Err(err_at(span, "/ requires at least two arguments")); }
+            let mut result = require_int(&args[0], span)?;
+            for arg in &args[1..] {
+                let d = require_int(arg, span)?;
+                if d == 0 { return Err(err_at(span, "division by zero")); }
+                result /= d;
+            }
+            Ok(Value::Integer(result))
+        }
+        "<" => { Ok(Value::Boolean(require_int(&args[0], span)? < require_int(&args[1], span)?)) }
+        ">" => { Ok(Value::Boolean(require_int(&args[0], span)? > require_int(&args[1], span)?)) }
+        "=" => { Ok(Value::Boolean(require_int(&args[0], span)? == require_int(&args[1], span)?)) }
+        "<=" => { Ok(Value::Boolean(require_int(&args[0], span)? <= require_int(&args[1], span)?)) }
+        ">=" => { Ok(Value::Boolean(require_int(&args[0], span)? >= require_int(&args[1], span)?)) }
+        "not" => {
+            Ok(Value::Boolean(is_false(&args[0])))
+        }
+        "cons" => {
+            match &args[1] {
+                Value::List(v) => {
+                    let mut new = vec![args[0].clone()];
+                    new.extend(v.iter().cloned());
+                    Ok(Value::List(new))
+                }
+                _ => Err(err_at(span, "cons: second argument must be a list")),
+            }
+        }
+        "car" => {
+            match &args[0] {
+                Value::List(v) if !v.is_empty() => Ok(v[0].clone()),
+                _ => Err(err_at(span, "car: argument must be a non-empty list")),
+            }
+        }
+        "cdr" => {
+            match &args[0] {
+                Value::List(v) if !v.is_empty() => Ok(Value::List(v[1..].to_vec())),
+                _ => Err(err_at(span, "cdr: argument must be a non-empty list")),
+            }
+        }
+        "null?" => {
+            Ok(Value::Boolean(matches!(&args[0], Value::List(v) if v.is_empty())))
+        }
+        "list" => Ok(Value::List(args.to_vec())),
+        "length" => {
+            match &args[0] {
+                Value::List(v) => Ok(Value::Integer(v.len() as i64)),
+                _ => Err(err_at(span, "length: argument must be a list")),
+            }
+        }
+        "display" => {
+            out.borrow_mut().push_str(&args[0].display_string());
+            Ok(Value::Void)
+        }
+        "write" => {
+            out.borrow_mut().push_str(&args[0].to_scheme_string());
+            Ok(Value::Void)
+        }
+        "newline" => {
+            out.borrow_mut().push('\n');
+            Ok(Value::Void)
+        }
+        "map" => {
+            match &args[1] {
+                Value::List(items) => {
+                    let mut results = Vec::new();
+                    for item in items {
+                        results.push(apply_value(&args[0], &[item.clone()], span, out)?);
+                    }
+                    Ok(Value::List(results))
+                }
+                _ => Err(err_at(span, "map: expected list")),
+            }
+        }
+        "apply" => {
+            if args.len() < 2 { return Err(err_at(span, "apply requires at least 2 arguments")); }
+            let func = &args[0];
+            let last = &args[args.len() - 1];
+            let tail_list = match last {
+                Value::List(v) => v.clone(),
+                _ => return Err(err_at(span, "apply: last argument must be a list")),
+            };
+            let mut all_args: Vec<Value> = args[1..args.len() - 1].to_vec();
+            all_args.extend(tail_list);
+            apply_value(func, &all_args, span, out)
+        }
+        "string?" => Ok(Value::Boolean(matches!(&args[0], Value::Str(_)))),
+        "number?" => Ok(Value::Boolean(matches!(&args[0], Value::Integer(_)))),
+        "boolean?" => Ok(Value::Boolean(matches!(&args[0], Value::Boolean(_)))),
+        "pair?" => Ok(Value::Boolean(matches!(&args[0], Value::List(v) if !v.is_empty()))),
+        "symbol?" => Ok(Value::Boolean(matches!(&args[0], Value::Symbol(_)))),
+        "char?" => Ok(Value::Boolean(matches!(&args[0], Value::Char(_)))),
+        "string-append" => {
+            let mut result = String::new();
+            for arg in args {
+                match arg { Value::Str(s) => result.push_str(s), _ => return Err(err_at(span, "string-append: expected string")) }
+            }
+            Ok(Value::Str(result))
+        }
+        "string-length" => {
+            match &args[0] { Value::Str(s) => Ok(Value::Integer(s.chars().count() as i64)), _ => Err(err_at(span, "string-length: expected string")) }
+        }
+        "substring" => {
+            let s = match &args[0] { Value::Str(s) => s, _ => return Err(err_at(span, "substring: expected string")) };
+            let start = require_int(&args[1], span)? as usize;
+            let end = require_int(&args[2], span)? as usize;
+            let chars: Vec<char> = s.chars().collect();
+            if end > chars.len() || start > end { return Err(err_at(span, "substring: index out of range")); }
+            Ok(Value::Str(chars[start..end].iter().collect()))
+        }
+        "string->number" => {
+            match &args[0] { Value::Str(s) => match s.parse::<i64>() { Ok(n) => Ok(Value::Integer(n)), Err(_) => Ok(Value::Boolean(false)) }, _ => Err(err_at(span, "string->number: expected string")) }
+        }
+        "number->string" => {
+            let n = require_int(&args[0], span)?;
+            Ok(Value::Str(n.to_string()))
+        }
+        "symbol->string" => {
+            match &args[0] { Value::Symbol(s) => Ok(Value::Str(s.clone())), _ => Err(err_at(span, "symbol->string: expected symbol")) }
+        }
+        "string->symbol" => {
+            match &args[0] { Value::Str(s) => Ok(Value::Symbol(s.clone())), _ => Err(err_at(span, "string->symbol: expected string")) }
+        }
+        "string-ref" => {
+            let s = match &args[0] { Value::Str(s) => s, _ => return Err(err_at(span, "string-ref: expected string")) };
+            let idx = require_int(&args[1], span)? as usize;
+            let chars: Vec<char> = s.chars().collect();
+            if idx >= chars.len() { return Err(err_at(span, "string-ref: index out of range")); }
+            Ok(Value::Char(chars[idx]))
+        }
+        "string-copy" => {
+            match &args[0] { Value::Str(s) => Ok(Value::Str(s.clone())), _ => Err(err_at(span, "string-copy: expected string")) }
+        }
+        "string-set!" => Err(err_at(span, "string-set!: strings are immutable")),
+        "string->list" => {
+            match &args[0] { Value::Str(s) => Ok(Value::List(s.chars().map(Value::Char).collect())), _ => Err(err_at(span, "string->list: expected string")) }
+        }
+        "list->string" => {
+            match &args[0] {
+                Value::List(items) => {
+                    let mut s = String::new();
+                    for item in items { match item { Value::Char(c) => s.push(*c), _ => return Err(err_at(span, "list->string: expected list of characters")) } }
+                    Ok(Value::Str(s))
+                }
+                _ => Err(err_at(span, "list->string: expected list")),
+            }
+        }
+        "char->integer" => {
+            match &args[0] { Value::Char(c) => Ok(Value::Integer(*c as i64)), _ => Err(err_at(span, "char->integer: expected char")) }
+        }
+        "integer->char" => {
+            let n = require_int(&args[0], span)?;
+            match char::from_u32(n as u32) { Some(c) => Ok(Value::Char(c)), None => Err(err_at(span, "integer->char: invalid code point")) }
+        }
+        _ => Err(err_at(span, format!("unknown builtin: {}", name))),
+    }
+}
+
 fn apply_value(func: &Value, args: &[Value], call_span: Span, out: &OutputBuf) -> Result<Value, EvalError> {
     match func {
-        Value::Lambda(params, body, closure_env) => {
-            if params.len() != args.len() {
-                return Err(err_at(
-                    call_span,
-                    format!("expected {} arguments, got {}", params.len(), args.len()),
-                ));
-            }
+        Value::Lambda(params, rest, body, closure_env) => {
             let call_env = EnvFrame::child(closure_env);
-            for (param, arg) in params.iter().zip(args) {
-                EnvFrame::set(&call_env, param.clone(), arg.clone());
-            }
+            bind_args(params, rest, args, &call_env, call_span)?;
             let mut result = Value::Void;
             for expr in body {
                 result = eval_expr(expr, &call_env, out)?;
             }
             Ok(result)
         }
+        Value::Builtin(name) => apply_builtin(name, args, call_span, out),
         _ => Err(err_at(call_span, "not a procedure")),
     }
 }
@@ -1013,17 +1220,9 @@ fn apply_proc_step(elems: &[SExpr], call_span: Span, env: &EnvRef, out: &OutputB
     let args: Result<Vec<Value>, _> = elems[1..].iter().map(|a| eval_expr(a, env, out)).collect();
     let args = args?;
     match func {
-        Value::Lambda(params, body, closure_env) => {
-            if params.len() != args.len() {
-                return Err(err_at(
-                    call_span,
-                    format!("expected {} arguments, got {}", params.len(), args.len()),
-                ));
-            }
+        Value::Lambda(params, rest, body, closure_env) => {
             let call_env = EnvFrame::child(&closure_env);
-            for (param, arg) in params.iter().zip(args) {
-                EnvFrame::set(&call_env, param.clone(), arg);
-            }
+            bind_args(&params, &rest, &args, &call_env, call_span)?;
             if body.is_empty() {
                 return Ok(Step::Done(Value::Void));
             }
@@ -1032,6 +1231,7 @@ fn apply_proc_step(elems: &[SExpr], call_span: Span, env: &EnvRef, out: &OutputB
             }
             Ok(Step::Tail(body[body.len() - 1].clone(), call_env))
         }
+        Value::Builtin(name) => Ok(Step::Done(apply_builtin(&name, &args, call_span, out)?)),
         _ => Err(err_at(call_span, "not a procedure")),
     }
 }
@@ -1073,12 +1273,28 @@ fn require_int(val: &Value, span: Span) -> Result<i64, EvalError> {
 /// use ming::scheme::eval_str;
 /// assert_eq!(eval_str("42"), Ok("42".into()));
 /// ```
+fn init_builtins(env: &EnvRef) {
+    for name in &[
+        "+", "-", "*", "/", "<", ">", "=", "<=", ">=", "not",
+        "cons", "car", "cdr", "null?", "list", "length",
+        "display", "write", "newline", "map", "apply",
+        "string?", "number?", "boolean?", "pair?", "symbol?", "char?",
+        "string-append", "string-length", "substring", "string->number",
+        "number->string", "symbol->string", "string->symbol",
+        "string-ref", "string-copy", "string-set!", "string->list", "list->string",
+        "char->integer", "integer->char",
+    ] {
+        EnvFrame::set(env, name.to_string(), Value::Builtin(name.to_string()));
+    }
+}
+
 pub fn eval_str(input: &str) -> Result<String, EvalError> {
     let exprs = parse_all(input)?;
     if exprs.is_empty() {
         return Err(EvalError::Parse("1:1: empty input".to_string()));
     }
     let env = EnvFrame::new();
+    init_builtins(&env);
     let out: OutputBuf = Rc::new(RefCell::new(String::new()));
     let mut result = Value::Boolean(false);
     for expr in &exprs {
@@ -1095,6 +1311,7 @@ pub fn eval_str_with_output(input: &str) -> Result<(String, String), EvalError> 
         return Err(EvalError::Parse("1:1: empty input".to_string()));
     }
     let env = EnvFrame::new();
+    init_builtins(&env);
     let out: OutputBuf = Rc::new(RefCell::new(String::new()));
     let mut result = Value::Boolean(false);
     for expr in &exprs {
