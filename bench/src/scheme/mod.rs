@@ -1468,6 +1468,7 @@ fn apply_builtin(name: &str, args: &[Value], span: Span, out: &OutputBuf) -> Res
         "pair?" => Ok(Value::Boolean(matches!(&args[0], Value::List(v) if !v.is_empty()))),
         "symbol?" => Ok(Value::Boolean(matches!(&args[0], Value::Symbol(_)))),
         "char?" => Ok(Value::Boolean(matches!(&args[0], Value::Char(_)))),
+        "equal?" => Ok(Value::Boolean(args[0] == args[1])),
         "string-append" => {
             let mut result = String::new();
             for arg in args {
@@ -1645,6 +1646,7 @@ fn init_builtins(env: &EnvRef) {
         "number->string", "symbol->string", "string->symbol",
         "string-ref", "string-copy", "string-set!", "string->list", "list->string",
         "char->integer", "integer->char",
+        "equal?",
         "call/cc", "call-with-current-continuation",
     ] {
         EnvFrame::set(env, name.to_string(), Value::Builtin(name.to_string()));
