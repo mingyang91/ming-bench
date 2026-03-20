@@ -1,17 +1,18 @@
+use crate::scheme::env::Env;
 use crate::scheme::error::EvalError;
 use crate::scheme::value::Value;
 
-pub fn eval(expr: &Value) -> Result<Value, EvalError> {
+pub fn eval(expr: &Value, env: &mut Env) -> Result<Value, EvalError> {
     match expr {
         Value::Integer(_) | Value::Boolean(_) | Value::Str(_) => Ok(expr.clone()),
-        Value::Symbol(name) => Err(EvalError::UnboundVariable {
+        Value::Symbol(name) => env.get(name).cloned().ok_or(EvalError::UnboundVariable {
             name: name.clone(),
         }),
-        Value::List(elems) => eval_list(elems),
+        Value::List(elems) => eval_list(elems, env),
     }
 }
 
-fn eval_list(elems: &[Value]) -> Result<Value, EvalError> {
+fn eval_list(elems: &[Value], env: &mut Env) -> Result<Value, EvalError> {
     if elems.is_empty() {
         return Err(EvalError::Parse {
             msg: "empty application".into(),
@@ -19,38 +20,98 @@ fn eval_list(elems: &[Value]) -> Result<Value, EvalError> {
     }
 
     let op = &elems[0];
-    let Value::Symbol(name) = op else {
-        return Err(EvalError::NotAProcedure {
-            value: op.to_string(),
+
+    // Handle special forms first (before evaluating operator)
+    if let Value::Symbol(name) = op {
+        match name.as_str() {
+            "define" => return eval_define(&elems[1..], env),
+            "if" => return eval_if(&elems[1..], env),
+            "quote" => return eval_quote(&elems[1..]),
+            "and" => return eval_and(&elems[1..], env),
+            "or" => return eval_or(&elems[1..], env),
+            _ => {}
+        }
+    }
+
+    // Check for built-in procedures by symbol name
+    if let Value::Symbol(name) = op {
+        if is_builtin(name) {
+            let args: Vec<Value> = elems[1..]
+                .iter()
+                .map(|e| eval(e, env))
+                .collect::<Result<Vec<_>, _>>()?;
+            return call_builtin(name, &args);
+        }
+    }
+
+    // Evaluate operator for non-builtins
+    let op_val = eval(op, env)?;
+    Err(EvalError::NotAProcedure {
+        value: op_val.to_string(),
+    })
+}
+
+fn is_builtin(name: &str) -> bool {
+    matches!(
+        name,
+        "+" | "-" | "*" | "/" | "<" | ">" | "=" | "<=" | "not"
+    )
+}
+
+fn call_builtin(name: &str, args: &[Value]) -> Result<Value, EvalError> {
+    match name {
+        "+" => arith_add(args),
+        "-" => arith_sub(name, args),
+        "*" => arith_mul(args),
+        "/" => arith_div(name, args),
+        "<" => cmp_lt(args),
+        ">" => cmp_gt(args),
+        "=" => cmp_eq(args),
+        "<=" => cmp_le(args),
+        "not" => eval_not(name, args),
+        _ => unreachable!(),
+    }
+}
+
+fn eval_define(args: &[Value], env: &mut Env) -> Result<Value, EvalError> {
+    if args.len() != 2 {
+        return Err(EvalError::Parse {
+            msg: "define requires exactly 2 arguments".into(),
+        });
+    }
+    let Value::Symbol(name) = &args[0] else {
+        return Err(EvalError::Parse {
+            msg: "define target must be a symbol".into(),
         });
     };
+    let val = eval(&args[1], env)?;
+    env.define(name.clone(), val);
+    Ok(Value::Symbol("void".into()))
+}
 
-    // Short-circuiting special forms — do not eagerly evaluate args
-    match name.as_str() {
-        "and" => return eval_and(&elems[1..]),
-        "or" => return eval_or(&elems[1..]),
-        _ => {}
+fn eval_if(args: &[Value], env: &mut Env) -> Result<Value, EvalError> {
+    if args.len() < 2 || args.len() > 3 {
+        return Err(EvalError::Parse {
+            msg: "if requires 2 or 3 arguments".into(),
+        });
     }
-
-    let args: Vec<Value> = elems[1..]
-        .iter()
-        .map(eval)
-        .collect::<Result<Vec<_>, _>>()?;
-
-    match name.as_str() {
-        "+" => arith_add(&args),
-        "-" => arith_sub(name, &args),
-        "*" => arith_mul(&args),
-        "/" => arith_div(name, &args),
-        "<" => cmp_lt(&args),
-        ">" => cmp_gt(&args),
-        "=" => cmp_eq(&args),
-        "<=" => cmp_le(&args),
-        "not" => eval_not(name, &args),
-        _ => Err(EvalError::UnboundVariable {
-            name: name.clone(),
-        }),
+    let cond = eval(&args[0], env)?;
+    if !is_falsy(&cond) {
+        eval(&args[1], env)
+    } else if args.len() == 3 {
+        eval(&args[2], env)
+    } else {
+        Ok(Value::Symbol("void".into()))
     }
+}
+
+fn eval_quote(args: &[Value]) -> Result<Value, EvalError> {
+    if args.len() != 1 {
+        return Err(EvalError::Parse {
+            msg: "quote requires exactly 1 argument".into(),
+        });
+    }
+    Ok(args[0].clone())
 }
 
 fn expect_integer(val: &Value) -> Result<i64, EvalError> {
@@ -163,10 +224,10 @@ fn is_falsy(val: &Value) -> bool {
     matches!(val, Value::Boolean(false))
 }
 
-fn eval_and(exprs: &[Value]) -> Result<Value, EvalError> {
+fn eval_and(exprs: &[Value], env: &mut Env) -> Result<Value, EvalError> {
     let mut result = Value::Boolean(true);
     for expr in exprs {
-        result = eval(expr)?;
+        result = eval(expr, env)?;
         if is_falsy(&result) {
             return Ok(result);
         }
@@ -174,10 +235,10 @@ fn eval_and(exprs: &[Value]) -> Result<Value, EvalError> {
     Ok(result)
 }
 
-fn eval_or(exprs: &[Value]) -> Result<Value, EvalError> {
+fn eval_or(exprs: &[Value], env: &mut Env) -> Result<Value, EvalError> {
     let mut result = Value::Boolean(false);
     for expr in exprs {
-        result = eval(expr)?;
+        result = eval(expr, env)?;
         if !is_falsy(&result) {
             return Ok(result);
         }
