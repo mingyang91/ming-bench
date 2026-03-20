@@ -19,6 +19,9 @@ pub enum Value {
     Builtin {
         name: String,
     },
+    Continuation {
+        id: u64,
+    },
 }
 
 impl PartialEq for Value {
@@ -30,6 +33,7 @@ impl PartialEq for Value {
             (Value::Symbol(a), Value::Symbol(b)) => a == b,
             (Value::List(a), Value::List(b)) => a == b,
             (Value::Builtin { name: a }, Value::Builtin { name: b }) => a == b,
+            (Value::Continuation { id: a }, Value::Continuation { id: b }) => a == b,
             _ => false,
         }
     }
@@ -55,7 +59,9 @@ impl fmt::Display for Value {
             Value::Str(s) => write!(f, "\"{s}\""),
             Value::Symbol(s) => write!(f, "{s}"),
             Value::List(elems) => fmt_list(f, elems),
-            Value::Lambda { .. } | Value::Builtin { .. } => write!(f, "#<procedure>"),
+            Value::Lambda { .. } | Value::Builtin { .. } | Value::Continuation { .. } => {
+                write!(f, "#<procedure>")
+            }
         }
     }
 }

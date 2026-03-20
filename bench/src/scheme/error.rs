@@ -25,4 +25,10 @@ pub enum EvalError {
 
     #[error("division by zero")]
     DivisionByZero,
+
+    #[error("continuation invoked")]
+    ContinuationReturn {
+        id: u64,
+        value: Box<crate::scheme::value::Value>,
+    },
 }

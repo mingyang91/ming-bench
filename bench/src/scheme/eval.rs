@@ -1,6 +1,123 @@
+use std::cell::{Cell, RefCell};
+use std::collections::HashMap;
+
 use crate::scheme::env::Env;
 use crate::scheme::error::EvalError;
 use crate::scheme::value::Value;
+
+#[derive(Clone)]
+struct ContinuationState {
+    env: Env,
+    current_expr: Value,
+    remaining_exprs: Vec<Value>,
+}
+
+thread_local! {
+    static CONT_COUNTER: Cell<u64> = const { Cell::new(0) };
+    static CONT_STORE: RefCell<HashMap<u64, ContinuationState>> = RefCell::new(HashMap::new());
+    static CONT_REPLAY: RefCell<Option<Value>> = const { RefCell::new(None) };
+    static TOP_LEVEL_CTX: RefCell<Option<(Value, Vec<Value>, Env)>> = const { RefCell::new(None) };
+}
+
+fn next_cont_id() -> u64 {
+    CONT_COUNTER.with(|c| {
+        let id = c.get();
+        c.set(id + 1);
+        id
+    })
+}
+
+fn read_top_level_ctx() -> Option<(Value, Vec<Value>, Env)> {
+    TOP_LEVEL_CTX.with(|ctx| ctx.borrow().clone())
+}
+
+fn lookup_continuation(id: u64) -> Option<ContinuationState> {
+    CONT_STORE.with(|s| s.borrow().get(&id).cloned())
+}
+
+fn save_continuation_state(id: u64) {
+    if let Some((expr, remaining, env)) = read_top_level_ctx() {
+        let state = ContinuationState {
+            env,
+            current_expr: expr,
+            remaining_exprs: remaining,
+        };
+        CONT_STORE.with(|s| {
+            s.borrow_mut().insert(id, state);
+        });
+    }
+}
+
+fn handle_callcc(proc: &Value) -> Result<Value, EvalError> {
+    let replay = CONT_REPLAY.with(|r| r.borrow_mut().take());
+    if let Some(value) = replay {
+        return Ok(value);
+    }
+    let id = next_cont_id();
+    save_continuation_state(id);
+    let k = Value::Continuation { id };
+    let result = match apply_value_tail(proc, &[k])? {
+        TailAction::Return(val) => Ok(val),
+        TailAction::TailCall { expr, env } => eval(&expr, &env),
+    };
+    match result {
+        Err(EvalError::ContinuationReturn {
+            id: ret_id,
+            value,
+        }) if ret_id == id => Ok(*value),
+        other => other,
+    }
+}
+
+fn is_void(val: &Value) -> bool {
+    matches!(val, Value::Symbol(s) if s == "void")
+}
+
+pub fn eval_program(exprs: Vec<Value>, env: Env) -> Result<String, EvalError> {
+    let mut current_exprs = exprs;
+    let mut current_env = env;
+
+    loop {
+        match eval_top_level(&current_exprs, &current_env) {
+            Ok(last) => {
+                let result = last.ok_or(EvalError::Parse {
+                    msg: "empty input".into(),
+                })?;
+                return Ok(result.to_string());
+            }
+            Err(EvalError::ContinuationReturn { id, value }) => {
+                let state = lookup_continuation(id);
+                let state = state.ok_or(EvalError::Parse {
+                    msg: "invalid continuation".into(),
+                })?;
+                CONT_REPLAY.with(|r| *r.borrow_mut() = Some(*value));
+                let mut new_exprs = vec![state.current_expr];
+                new_exprs.extend(state.remaining_exprs);
+                current_exprs = new_exprs;
+                current_env = state.env;
+            }
+            Err(e) => return Err(e),
+        }
+    }
+}
+
+fn eval_top_level(exprs: &[Value], env: &Env) -> Result<Option<Value>, EvalError> {
+    let mut last = None;
+    for (i, expr) in exprs.iter().enumerate() {
+        TOP_LEVEL_CTX.with(|ctx| {
+            *ctx.borrow_mut() = Some((
+                expr.clone(),
+                exprs[i + 1..].to_vec(),
+                env.clone(),
+            ));
+        });
+        let val = eval(expr, env)?;
+        if !is_void(&val) {
+            last = Some(val);
+        }
+    }
+    Ok(last)
+}
 
 /// Signals whether to return a value or continue the trampoline loop.
 enum TailAction {
@@ -20,7 +137,9 @@ pub fn eval(expr: &Value, env: &Env) -> Result<Value, EvalError> {
                     name: name.clone(),
                 });
             }
-            Value::Lambda { .. } | Value::Builtin { .. } => return Ok(current_expr),
+            Value::Lambda { .. } | Value::Builtin { .. } | Value::Continuation { .. } => {
+                return Ok(current_expr);
+            }
             Value::List(ref elems) => match eval_list_trampoline(elems, &current_env)? {
                 TailAction::Return(val) => return Ok(val),
                 TailAction::TailCall { expr, env } => {
@@ -64,6 +183,17 @@ fn eval_special_form(
         "or" => eval_or_tail(args, env)?,
         "let" => eval_let_tail(args, env)?,
         "cond" => eval_cond_tail(args, env)?,
+        "call/cc" | "call-with-current-continuation" => {
+            if args.len() != 1 {
+                return Err(EvalError::ArityError {
+                    name: "call/cc".into(),
+                    expected: 1,
+                    actual: args.len(),
+                });
+            }
+            let proc = eval(&args[0], env)?;
+            TailAction::Return(handle_callcc(&proc)?)
+        }
         _ => return Ok(None),
     };
     Ok(Some(action))
@@ -80,14 +210,41 @@ fn eval_application(elems: &[Value], env: &Env) -> Result<TailAction, EvalError>
     apply_value_tail(&op_val, &args)
 }
 
+fn apply_callcc_builtin(args: &[Value]) -> Result<TailAction, EvalError> {
+    if args.len() != 1 {
+        return Err(EvalError::ArityError {
+            name: "call/cc".into(),
+            expected: 1,
+            actual: args.len(),
+        });
+    }
+    Ok(TailAction::Return(handle_callcc(&args[0])?))
+}
+
+fn invoke_continuation(id: u64, args: &[Value]) -> Result<TailAction, EvalError> {
+    if args.len() != 1 {
+        return Err(EvalError::ArityError {
+            name: "#<continuation>".into(),
+            expected: 1,
+            actual: args.len(),
+        });
+    }
+    Err(EvalError::ContinuationReturn {
+        id,
+        value: Box::new(args[0].clone()),
+    })
+}
+
 fn apply_value_tail(op_val: &Value, args: &[Value]) -> Result<TailAction, EvalError> {
     match op_val {
-        Value::Builtin { name } => {
-            if name == "apply" {
-                return builtin_apply(args);
-            }
-            Ok(TailAction::Return(call_builtin(name, args)?))
+        Value::Builtin { name } if name == "apply" => builtin_apply(args),
+        Value::Builtin { name }
+            if name == "call/cc" || name == "call-with-current-continuation" =>
+        {
+            apply_callcc_builtin(args)
         }
+        Value::Builtin { name } => Ok(TailAction::Return(call_builtin(name, args)?)),
+        Value::Continuation { id } => invoke_continuation(*id, args),
         _ => apply_lambda_tail(op_val, args),
     }
 }
@@ -720,7 +877,7 @@ fn builtin_apply(args: &[Value]) -> Result<TailAction, EvalError> {
 const BUILTIN_NAMES: &[&str] = &[
     "+", "-", "*", "/", "<", ">", "=", "<=", "not", "cons", "car", "cdr",
     "null?", "list", "length", "string?", "number?", "boolean?", "pair?",
-    "symbol?", "apply",
+    "symbol?", "apply", "call/cc", "call-with-current-continuation",
 ];
 
 pub fn register_builtins(env: &Env) {
