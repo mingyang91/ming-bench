@@ -31,6 +31,9 @@ fn eval_list(elems: &[Value], env: &Env) -> Result<Value, EvalError> {
             "and" => return eval_and(&elems[1..], env),
             "or" => return eval_or(&elems[1..], env),
             "lambda" => return eval_lambda(&elems[1..], env),
+            "let" => return eval_let(&elems[1..], env),
+            "begin" => return eval_begin(&elems[1..], env),
+            "cond" => return eval_cond(&elems[1..], env),
             _ => {}
         }
     }
@@ -116,6 +119,85 @@ fn eval_lambda(args: &[Value], env: &Env) -> Result<Value, EvalError> {
         body,
         env: env.clone(),
     })
+}
+
+fn eval_let(args: &[Value], env: &Env) -> Result<Value, EvalError> {
+    if args.len() < 2 {
+        return Err(EvalError::Parse {
+            msg: "let requires bindings and body".into(),
+        });
+    }
+    let Value::List(bindings) = &args[0] else {
+        return Err(EvalError::Parse {
+            msg: "let bindings must be a list".into(),
+        });
+    };
+    let let_env = env.child();
+    for binding in bindings {
+        let Value::List(pair) = binding else {
+            return Err(EvalError::Parse {
+                msg: "let binding must be a list".into(),
+            });
+        };
+        if pair.len() != 2 {
+            return Err(EvalError::Parse {
+                msg: "let binding must have exactly 2 elements".into(),
+            });
+        }
+        let Value::Symbol(name) = &pair[0] else {
+            return Err(EvalError::Parse {
+                msg: "let binding name must be a symbol".into(),
+            });
+        };
+        let val = eval(&pair[1], env)?;
+        let_env.define(name.clone(), val);
+    }
+    let mut result = Value::Symbol("void".into());
+    for expr in &args[1..] {
+        result = eval(expr, &let_env)?;
+    }
+    Ok(result)
+}
+
+fn eval_begin(args: &[Value], env: &Env) -> Result<Value, EvalError> {
+    let mut result = Value::Symbol("void".into());
+    for expr in args {
+        result = eval(expr, env)?;
+    }
+    Ok(result)
+}
+
+fn eval_cond(clauses: &[Value], env: &Env) -> Result<Value, EvalError> {
+    for clause in clauses {
+        let Value::List(parts) = clause else {
+            return Err(EvalError::Parse {
+                msg: "cond clause must be a list".into(),
+            });
+        };
+        if parts.is_empty() {
+            return Err(EvalError::Parse {
+                msg: "cond clause cannot be empty".into(),
+            });
+        }
+        let is_else = matches!(&parts[0], Value::Symbol(s) if s == "else");
+        let test = if is_else {
+            Value::Boolean(true)
+        } else {
+            eval(&parts[0], env)?
+        };
+        if !is_falsy(&test) {
+            return eval_sequence(&parts[1..], env, test);
+        }
+    }
+    Ok(Value::Symbol("void".into()))
+}
+
+fn eval_sequence(exprs: &[Value], env: &Env, default: Value) -> Result<Value, EvalError> {
+    let mut result = default;
+    for expr in exprs {
+        result = eval(expr, env)?;
+    }
+    Ok(result)
 }
 
 fn is_builtin(name: &str) -> bool {
