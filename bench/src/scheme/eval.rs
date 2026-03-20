@@ -11,8 +11,6 @@ enum Bounce {
     Continue(Value),
     /// Tail call into a new environment (lambda application).
     Call { expr: Value, env: Env },
-    /// Tail call where the env was updated in place (no allocation).
-    TailUpdate(Value),
 }
 
 pub(super) fn eval(value: &Value, env: &mut Env, out: &mut String) -> Result<Value, EvalError> {
@@ -26,7 +24,7 @@ pub(super) fn eval(value: &Value, env: &mut Env, out: &mut String) -> Result<Val
         };
         match bounce {
             Bounce::Done(val) => return Ok(val),
-            Bounce::Continue(expr) | Bounce::TailUpdate(expr) => current = expr,
+            Bounce::Continue(expr) => current = expr,
             Bounce::Call { expr, env: new_env } => {
                 current = expr;
                 call_env = Some(new_env);
@@ -118,44 +116,7 @@ fn eval_symbol_call_bounce(
     // Borrow the proc to avoid cloning the Lambda (and its closure HashMap)
     let proc_ref = proc_rc.borrow();
     match &*proc_ref {
-        Value::Lambda {
-            params,
-            rest_param,
-            body,
-            closure,
-        } => {
-            if rest_param.is_some() {
-                if evaled_args.len() < params.len() {
-                    return Err(EvalError::WrongArgCount {
-                        expected: params.len(),
-                        got: evaled_args.len(),
-                    });
-                }
-            } else if params.len() != evaled_args.len() {
-                return Err(EvalError::WrongArgCount {
-                    expected: params.len(),
-                    got: evaled_args.len(),
-                });
-            }
-            let mut call_env = closure.clone();
-            for (k, v) in env.iter() {
-                call_env.entry(k.clone()).or_insert_with(|| v.clone());
-            }
-            for (param, arg) in params.iter().zip(&evaled_args) {
-                call_env.insert(param.clone(), Rc::new(RefCell::new(arg.clone())));
-            }
-            if let Some(rest_name) = rest_param {
-                let rest_args = &evaled_args[params.len()..];
-                let rest_list = rest_args.iter().rev().fold(Value::Nil, |acc, v| {
-                    Value::Pair(Box::new(v.clone()), Box::new(acc))
-                });
-                call_env.insert(rest_name.clone(), Rc::new(RefCell::new(rest_list)));
-            }
-            Ok(Bounce::Call {
-                expr: body.as_ref().clone(),
-                env: call_env,
-            })
-        }
+        Value::Lambda { .. } => apply_bounce(&proc_ref, &evaled_args, env),
         Value::BuiltinProc(bname) => {
             call_builtin_with_values(bname, &evaled_args, env, out).map(Bounce::Done)
         }
@@ -596,7 +557,7 @@ fn eval_named_let_bounce(
     let lambda = Value::Lambda {
         params: params.clone(),
         rest_param: None,
-        body: Box::new(func_body.clone()),
+        body: Rc::new(func_body.clone()),
         closure: Env::new(),
     };
     let cell = Rc::new(RefCell::new(lambda));
