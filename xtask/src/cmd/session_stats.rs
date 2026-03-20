@@ -38,150 +38,169 @@ pub fn run(run_arg: PathBuf) -> Result<()> {
         all_events.extend(events);
     }
 
-    // Count content blocks
-    let mut thinking_count = 0u64;
-    let mut thinking_chars = 0u64;
-    let mut text_count = 0u64;
-    let mut text_chars = 0u64;
-    let mut tool_use_count = 0u64;
-    let mut tool_result_count = 0u64;
-    let mut user_count = 0u64;
-    let mut tool_names: HashMap<String, u64> = HashMap::new();
-    let mut bash_cmds: HashMap<String, u64> = HashMap::new();
-    let mut test_results: (u64, u64) = (0, 0); // (pass, fail)
-    let mut levels_attempted: Vec<String> = Vec::new();
+    let stats = gather_stats(&all_events);
 
-    for event in &all_events {
+    print_report(&run_name, strategy, mode, &session_files, &all_events, &stats, &meta);
+
+    Ok(())
+}
+
+struct Stats {
+    thinking_count: u64,
+    thinking_chars: u64,
+    text_count: u64,
+    text_chars: u64,
+    tool_use_count: u64,
+    tool_result_count: u64,
+    user_count: u64,
+    tool_names: HashMap<String, u64>,
+    bash_cmds: HashMap<String, u64>,
+    test_results: (u64, u64),
+    levels_attempted: Vec<String>,
+}
+
+fn gather_stats(events: &[SessionEvent]) -> Stats {
+    let mut s = Stats {
+        thinking_count: 0, thinking_chars: 0,
+        text_count: 0, text_chars: 0,
+        tool_use_count: 0, tool_result_count: 0, user_count: 0,
+        tool_names: HashMap::new(), bash_cmds: HashMap::new(),
+        test_results: (0, 0), levels_attempted: Vec::new(),
+    };
+
+    for event in events {
         match &event.kind {
-            EventKind::User { .. } => user_count += 1,
-            EventKind::Assistant { blocks } => {
-                for block in blocks {
-                    match block {
-                        ContentBlock::Thinking(t) => {
-                            thinking_count += 1;
-                            thinking_chars += t.len() as u64;
-                        }
-                        ContentBlock::Text(t) => {
-                            text_count += 1;
-                            text_chars += t.len() as u64;
-                        }
-                        ContentBlock::ToolUse { name, input_json } => {
-                            tool_use_count += 1;
-                            *tool_names.entry(name.clone()).or_default() += 1;
-
-                            if name == "Bash" {
-                                if let Some(cmd) = extract_bash_command(input_json) {
-                                    let key = classify_bash_command(&cmd);
-                                    *bash_cmds.entry(key.clone()).or_default() += 1;
-
-                                    // Track test results
-                                    let effective_cmd = strip_cd_prefix(&cmd);
-                                    if effective_cmd.contains("cargo xtask test") {
-                                        // Extract level
-                                        if let Some(level) = extract_test_level(&cmd) {
-                                            if !levels_attempted.contains(&level) {
-                                                levels_attempted.push(level);
-                                            }
-                                        }
-                                    }
-                                }
-                            }
-                        }
-                        ContentBlock::ToolResult { content } => {
-                            tool_result_count += 1;
-                            // Check test pass/fail in tool results
-                            if content.contains("test result: ok") || content.contains("PASSED") {
-                                test_results.0 += 1;
-                            } else if content.contains("FAILED")
-                                || content.contains("test result: FAILED")
-                            {
-                                test_results.1 += 1;
-                            }
-                        }
-                    }
-                }
-            }
+            EventKind::User { .. } => s.user_count += 1,
+            EventKind::Assistant { blocks } => tally_blocks(blocks, &mut s),
             _ => {}
         }
     }
 
-    // Duration
-    let duration = model::elapsed_secs(&meta);
+    s.levels_attempted.sort();
+    s
+}
 
-    // Print report
+fn tally_blocks(blocks: &[ContentBlock], s: &mut Stats) {
+    for block in blocks {
+        tally_single_block(block, s);
+    }
+}
+
+fn tally_single_block(block: &ContentBlock, s: &mut Stats) {
+    match block {
+        ContentBlock::Thinking(t) => {
+            s.thinking_count += 1;
+            s.thinking_chars += t.len() as u64;
+        }
+        ContentBlock::Text(t) => {
+            s.text_count += 1;
+            s.text_chars += t.len() as u64;
+        }
+        ContentBlock::ToolUse { name, input_json } => {
+            s.tool_use_count += 1;
+            *s.tool_names.entry(name.clone()).or_default() += 1;
+            if name == "Bash" {
+                tally_bash(input_json, s);
+            }
+        }
+        ContentBlock::ToolResult { content } => {
+            s.tool_result_count += 1;
+            tally_test_result(content, s);
+        }
+    }
+}
+
+fn tally_test_result(content: &str, s: &mut Stats) {
+    if content.contains("test result: ok") || content.contains("PASSED") {
+        s.test_results.0 += 1;
+    } else if content.contains("FAILED") || content.contains("test result: FAILED") {
+        s.test_results.1 += 1;
+    }
+}
+
+fn tally_bash(input_json: &str, s: &mut Stats) {
+    let Some(cmd) = extract_bash_command(input_json) else { return };
+    let key = classify_bash_command(&cmd);
+    *s.bash_cmds.entry(key).or_default() += 1;
+
+    let effective_cmd = strip_cd_prefix(&cmd);
+    if !effective_cmd.contains("cargo xtask test") {
+        return;
+    }
+    if let Some(level) = extract_test_level(&cmd) {
+        if !s.levels_attempted.contains(&level) {
+            s.levels_attempted.push(level);
+        }
+    }
+}
+
+fn print_report(
+    run_name: &str,
+    strategy: &str,
+    mode: &str,
+    session_files: &[(String, std::path::PathBuf)],
+    all_events: &[SessionEvent],
+    s: &Stats,
+    meta: &MetaJson,
+) {
     println!(
-        "{}Run:{} {} (strategy: {}, mode: {})",
-        Color::BOLD,
-        Color::RESET,
-        run_name,
-        strategy,
-        mode
+        "{}Run:{} {run_name} (strategy: {strategy}, mode: {mode})",
+        Color::BOLD, Color::RESET
     );
-    println!(
-        "Session: {} file(s), {} events",
-        session_files.len(),
-        all_events.len()
-    );
+    println!("Session: {} file(s), {} events", session_files.len(), all_events.len());
     println!();
 
     println!("{}CONTENT BLOCKS:{}", Color::BOLD, Color::RESET);
-    println!(
-        "  thinking:     {:>4} blocks, {:>8} chars",
-        thinking_count,
-        fmt_comma(thinking_chars)
-    );
-    println!(
-        "  text:         {:>4} blocks, {:>8} chars",
-        text_count,
-        fmt_comma(text_chars)
-    );
-    println!("  tool_use:     {:>4} blocks", tool_use_count);
-    println!("  tool_result:  {:>4} blocks", tool_result_count);
-    println!("  user:         {:>4} messages", user_count);
+    println!("  thinking:     {:>4} blocks, {:>8} chars", s.thinking_count, fmt_comma(s.thinking_chars));
+    println!("  text:         {:>4} blocks, {:>8} chars", s.text_count, fmt_comma(s.text_chars));
+    println!("  tool_use:     {:>4} blocks", s.tool_use_count);
+    println!("  tool_result:  {:>4} blocks", s.tool_result_count);
+    println!("  user:         {:>4} messages", s.user_count);
     println!();
 
+    print_tool_usage(&s.tool_names);
+    print_bash_cmds(&s.bash_cmds, s.test_results);
+    print_timeline(meta, &s.levels_attempted);
+}
+
+fn print_tool_usage(tool_names: &HashMap<String, u64>) {
     println!("{}TOOL USAGE:{}", Color::BOLD, Color::RESET);
-    let mut sorted_tools: Vec<_> = tool_names.iter().collect();
-    sorted_tools.sort_by(|a, b| b.1.cmp(a.1));
-    for (name, count) in &sorted_tools {
-        println!("  {:<14} {}", name, count);
+    let mut sorted: Vec<_> = tool_names.iter().collect();
+    sorted.sort_by(|a, b| b.1.cmp(a.1));
+    for (name, count) in &sorted {
+        println!("  {name:<14} {count}");
     }
     println!();
+}
 
-    if !bash_cmds.is_empty() {
-        println!("{}BASH COMMANDS:{}", Color::BOLD, Color::RESET);
-        let mut sorted_bash: Vec<_> = bash_cmds.iter().collect();
-        sorted_bash.sort_by(|a, b| b.1.cmp(a.1));
-        for (cmd, count) in &sorted_bash {
-            println!("  {:<30} {}", cmd, count);
-        }
-        if test_results.0 > 0 || test_results.1 > 0 {
-            println!(
-                "  test outcomes: {} pass, {} fail",
-                test_results.0, test_results.1
-            );
-        }
-        println!();
+fn print_bash_cmds(bash_cmds: &HashMap<String, u64>, test_results: (u64, u64)) {
+    if bash_cmds.is_empty() {
+        return;
     }
+    println!("{}BASH COMMANDS:{}", Color::BOLD, Color::RESET);
+    let mut sorted: Vec<_> = bash_cmds.iter().collect();
+    sorted.sort_by(|a, b| b.1.cmp(a.1));
+    for (cmd, count) in &sorted {
+        println!("  {cmd:<30} {count}");
+    }
+    if test_results.0 > 0 || test_results.1 > 0 {
+        println!("  test outcomes: {} pass, {} fail", test_results.0, test_results.1);
+    }
+    println!();
+}
 
+fn print_timeline(meta: &MetaJson, levels_attempted: &[String]) {
     println!("{}TIMELINE:{}", Color::BOLD, Color::RESET);
-    if let Some(secs) = duration {
+    if let Some(secs) = model::elapsed_secs(meta) {
         println!("  Duration: {}", fmt_duration(secs));
     }
-    if !levels_attempted.is_empty() {
-        levels_attempted.sort();
-        let first = levels_attempted.first().unwrap();
-        let last = levels_attempted.last().unwrap();
+    if let (Some(first), Some(last)) = (levels_attempted.first(), levels_attempted.last()) {
         println!(
-            "  Levels attempted: {}-{} ({}/{})",
-            first,
-            last,
+            "  Levels attempted: {first}-{last} ({}/{})",
             levels_attempted.len(),
             crate::model::LEVELS.len()
         );
     }
-
-    Ok(())
 }
 
 fn extract_bash_command(input_json: &str) -> Option<String> {
@@ -225,14 +244,10 @@ fn strip_cd_prefix(cmd: &str) -> &str {
 fn extract_test_level(cmd: &str) -> Option<String> {
     let parts: Vec<&str> = cmd.split_whitespace().collect();
     // "cargo xtask test 01" -> "L01"
-    if let Some(pos) = parts.iter().position(|&p| p == "test") {
-        if let Some(level) = parts.get(pos + 1) {
-            if level.len() == 2 && level.chars().all(|c| c.is_ascii_digit()) {
-                return Some(format!("L{level}"));
-            }
-        }
-    }
-    None
+    let pos = parts.iter().position(|&p| p == "test")?;
+    let level = parts.get(pos + 1)?;
+    let is_level = level.len() == 2 && level.chars().all(|c| c.is_ascii_digit());
+    is_level.then(|| format!("L{level}"))
 }
 
 fn infer_strategy(run_name: &str) -> Option<&str> {

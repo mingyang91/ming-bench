@@ -89,73 +89,61 @@ pub fn parse_session(path: &Path) -> Result<Vec<SessionEvent>> {
 
 fn parse_content_blocks(obj: &serde_json::Value) -> Vec<ContentBlock> {
     let mut blocks = Vec::new();
-    let content = match obj.pointer("/message/content") {
-        Some(serde_json::Value::Array(arr)) => arr,
-        _ => return blocks,
+    let Some(serde_json::Value::Array(content)) = obj.pointer("/message/content") else {
+        return blocks;
     };
 
     for item in content {
-        let block_type = match item.get("type").and_then(|v| v.as_str()) {
-            Some(t) => t,
-            None => continue,
+        let Some(block_type) = item.get("type").and_then(|v| v.as_str()) else {
+            continue;
         };
 
-        match block_type {
-            "thinking" => {
-                let text = item
-                    .get("thinking")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("")
-                    .to_string();
-                if !text.is_empty() {
-                    blocks.push(ContentBlock::Thinking(text));
-                }
-            }
-            "text" => {
-                let text = item
-                    .get("text")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("")
-                    .to_string();
-                if !text.is_empty() {
-                    blocks.push(ContentBlock::Text(text));
-                }
-            }
-            "tool_use" => {
-                let name = item
-                    .get("name")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("unknown")
-                    .to_string();
-                let input_json = item
-                    .get("input")
-                    .map(|v| v.to_string())
-                    .unwrap_or_default();
-                blocks.push(ContentBlock::ToolUse { name, input_json });
-            }
-            "tool_result" => {
-                let content_str = match item.get("content") {
-                    Some(serde_json::Value::String(s)) => s.clone(),
-                    Some(serde_json::Value::Array(arr)) => {
-                        // tool_result content can be an array of {type: "text", text: "..."}
-                        arr.iter()
-                            .filter_map(|v| v.get("text").and_then(|t| t.as_str()))
-                            .collect::<Vec<_>>()
-                            .join("\n")
-                    }
-                    _ => String::new(),
-                };
-                if !content_str.is_empty() {
-                    blocks.push(ContentBlock::ToolResult {
-                        content: content_str,
-                    });
-                }
-            }
-            _ => {}
+        if let Some(block) = parse_single_block(block_type, item) {
+            blocks.push(block);
         }
     }
 
     blocks
+}
+
+fn parse_single_block(block_type: &str, item: &serde_json::Value) -> Option<ContentBlock> {
+    match block_type {
+        "thinking" => {
+            let text = item.get("thinking").and_then(|v| v.as_str()).unwrap_or("");
+            if text.is_empty() { return None; }
+            Some(ContentBlock::Thinking(text.to_string()))
+        }
+        "text" => {
+            let text = item.get("text").and_then(|v| v.as_str()).unwrap_or("");
+            if text.is_empty() { return None; }
+            Some(ContentBlock::Text(text.to_string()))
+        }
+        "tool_use" => {
+            let name = item.get("name").and_then(|v| v.as_str()).unwrap_or("unknown").to_string();
+            let input_json = item.get("input").map(|v| v.to_string()).unwrap_or_default();
+            Some(ContentBlock::ToolUse { name, input_json })
+        }
+        "tool_result" => {
+            let content_str = parse_tool_result_content(item);
+            if content_str.is_empty() { return None; }
+            Some(ContentBlock::ToolResult { content: content_str })
+        }
+        _ => None,
+    }
+}
+
+fn parse_tool_result_content(item: &serde_json::Value) -> String {
+    match item.get("content") {
+        Some(serde_json::Value::String(s)) => s.clone(),
+        Some(serde_json::Value::Array(arr)) => {
+            // tool_result content can be an array of {type: "text", text: "..."}
+            arr.iter()
+                .filter_map(|v| v.get("text").and_then(|t| t.as_str()))
+                .collect::<Vec<_>>()
+                .join("\n")
+        }
+        _ => String::new(),
+    }
 }
 
 // ---------------------------------------------------------------------------

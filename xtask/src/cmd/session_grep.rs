@@ -16,20 +16,7 @@ pub fn run(
         return Ok(());
     }
 
-    // Filter by level if specified
-    let files: Vec<_> = if let Some(ref lvl) = level {
-        let target = if lvl.starts_with('L') {
-            lvl.clone()
-        } else {
-            format!("L{lvl}")
-        };
-        session_files
-            .into_iter()
-            .filter(|(label, _)| label == &target)
-            .collect()
-    } else {
-        session_files
-    };
+    let files = filter_by_level(session_files, level.as_deref());
 
     // Parse all events
     let mut all_events = Vec::new();
@@ -38,135 +25,179 @@ pub fn run(
         all_events.extend(events);
     }
 
-    let total_events = all_events.len();
     let ctx_chars = context.unwrap_or(80);
 
     for keyword in &keywords {
-        let kw_lower = keyword.to_lowercase();
-        let mut thinking_hits: Vec<usize> = Vec::new();
-        let mut text_hits: Vec<usize> = Vec::new();
-        let mut tool_use_hits: Vec<usize> = Vec::new();
-        let mut tool_result_hits: Vec<usize> = Vec::new();
-        let mut user_hits: Vec<usize> = Vec::new();
-        let mut snippets: Vec<(usize, String, String)> = Vec::new(); // (event_idx, type, snippet)
-
-        for event in &all_events {
-            match &event.kind {
-                EventKind::User { text } => {
-                    if text.to_lowercase().contains(&kw_lower) {
-                        user_hits.push(event.index);
-                        if snippets.len() < 3 {
-                            snippets.push((
-                                event.index,
-                                "user".to_string(),
-                                extract_context(text, &kw_lower, ctx_chars),
-                            ));
-                        }
-                    }
-                }
-                EventKind::Assistant { blocks } => {
-                    for block in blocks {
-                        match block {
-                            ContentBlock::Thinking(t) => {
-                                if t.to_lowercase().contains(&kw_lower) {
-                                    thinking_hits.push(event.index);
-                                    if snippets.len() < 3 {
-                                        snippets.push((
-                                            event.index,
-                                            "thinking".to_string(),
-                                            extract_context(t, &kw_lower, ctx_chars),
-                                        ));
-                                    }
-                                }
-                            }
-                            ContentBlock::Text(t) => {
-                                if t.to_lowercase().contains(&kw_lower) {
-                                    text_hits.push(event.index);
-                                    if snippets.len() < 3 {
-                                        snippets.push((
-                                            event.index,
-                                            "text".to_string(),
-                                            extract_context(t, &kw_lower, ctx_chars),
-                                        ));
-                                    }
-                                }
-                            }
-                            ContentBlock::ToolUse { input_json, .. } => {
-                                if input_json.to_lowercase().contains(&kw_lower) {
-                                    tool_use_hits.push(event.index);
-                                }
-                            }
-                            ContentBlock::ToolResult { content } => {
-                                if content.to_lowercase().contains(&kw_lower) {
-                                    tool_result_hits.push(event.index);
-                                }
-                            }
-                        }
-                    }
-                }
-                _ => {}
-            }
-        }
-
-        let total_hits =
-            thinking_hits.len() + text_hits.len() + tool_use_hits.len() + user_hits.len();
-
-        println!(
-            "\n{}KEYWORD: {} ({} hits){}",
-            Color::BOLD,
-            keyword,
-            total_hits,
-            Color::RESET
-        );
-
-        if total_hits == 0 && tool_result_hits.is_empty() {
-            println!("  (no matches)");
-            continue;
-        }
-
-        print_hit_line("thinking", &thinking_hits);
-        print_hit_line("text", &text_hits);
-        print_hit_line("tool_use", &tool_use_hits);
-        print_hit_line("tool_result", &tool_result_hits);
-        print_hit_line("user", &user_hits);
-
-        // Span analysis
-        let all_indices: Vec<usize> = {
-            let mut v = Vec::new();
-            v.extend(&thinking_hits);
-            v.extend(&text_hits);
-            v.extend(&tool_use_hits);
-            v.extend(&user_hits);
-            v.sort();
-            v.dedup();
-            v
-        };
-
-        if let (Some(&first), Some(&last)) = (all_indices.first(), all_indices.last()) {
-            let span_pct = if total_events > 0 {
-                ((last - first) as f64 / total_events as f64 * 100.0) as u32
-            } else {
-                0
-            };
-            println!();
-            println!("  First: event {:>3}    Last: event {:>3}    Span: {}% of session",
-                first, last, span_pct);
-        }
-
-        // Show context snippets
-        if !snippets.is_empty() {
-            println!();
-            for (idx, kind, snippet) in &snippets {
-                println!(
-                    "  {}[event {} / {}]:{} {}",
-                    Color::DIM, idx, kind, Color::RESET, snippet
-                );
-            }
-        }
+        search_keyword(keyword, &all_events, ctx_chars);
     }
 
     println!();
     Ok(())
+}
+
+fn filter_by_level(
+    session_files: Vec<(String, std::path::PathBuf)>,
+    level: Option<&str>,
+) -> Vec<(String, std::path::PathBuf)> {
+    let Some(lvl) = level else { return session_files };
+    let target = if lvl.starts_with('L') {
+        lvl.to_string()
+    } else {
+        format!("L{lvl}")
+    };
+    session_files
+        .into_iter()
+        .filter(|(label, _)| label == &target)
+        .collect()
+}
+
+struct KeywordHits {
+    thinking: Vec<usize>,
+    text: Vec<usize>,
+    tool_use: Vec<usize>,
+    tool_result: Vec<usize>,
+    user: Vec<usize>,
+    snippets: Vec<(usize, String, String)>,
+}
+
+fn search_keyword(keyword: &str, events: &[session::SessionEvent], ctx_chars: usize) {
+    let kw_lower = keyword.to_lowercase();
+    let mut hits = KeywordHits {
+        thinking: Vec::new(),
+        text: Vec::new(),
+        tool_use: Vec::new(),
+        tool_result: Vec::new(),
+        user: Vec::new(),
+        snippets: Vec::new(),
+    };
+
+    for event in events {
+        collect_event_hits(event, &kw_lower, ctx_chars, &mut hits);
+    }
+
+    let total_hits = hits.thinking.len() + hits.text.len() + hits.tool_use.len() + hits.user.len();
+
+    println!(
+        "\n{}KEYWORD: {keyword} ({total_hits} hits){}",
+        Color::BOLD, Color::RESET
+    );
+
+    if total_hits == 0 && hits.tool_result.is_empty() {
+        println!("  (no matches)");
+        return;
+    }
+
+    print_hit_line("thinking", &hits.thinking);
+    print_hit_line("text", &hits.text);
+    print_hit_line("tool_use", &hits.tool_use);
+    print_hit_line("tool_result", &hits.tool_result);
+    print_hit_line("user", &hits.user);
+
+    print_span_and_snippets(&hits, events.len());
+}
+
+fn collect_event_hits(
+    event: &session::SessionEvent,
+    kw_lower: &str,
+    ctx_chars: usize,
+    hits: &mut KeywordHits,
+) {
+    match &event.kind {
+        EventKind::User { text } => {
+            if !text.to_lowercase().contains(kw_lower) {
+                return;
+            }
+            hits.user.push(event.index);
+            if hits.snippets.len() < 3 {
+                hits.snippets.push((event.index, "user".into(), extract_context(text, kw_lower, ctx_chars)));
+            }
+        }
+        EventKind::Assistant { blocks } => {
+            collect_block_hits(blocks, event.index, kw_lower, ctx_chars, hits);
+        }
+        _ => {}
+    }
+}
+
+fn collect_block_hits(
+    blocks: &[ContentBlock],
+    idx: usize,
+    kw_lower: &str,
+    ctx_chars: usize,
+    hits: &mut KeywordHits,
+) {
+    for block in blocks {
+        collect_single_block(block, idx, kw_lower, ctx_chars, hits);
+    }
+}
+
+fn collect_single_block(
+    block: &ContentBlock,
+    idx: usize,
+    kw_lower: &str,
+    ctx_chars: usize,
+    hits: &mut KeywordHits,
+) {
+    match block {
+        ContentBlock::Thinking(t) if t.to_lowercase().contains(kw_lower) => {
+            hits.thinking.push(idx);
+            maybe_add_snippet(hits, idx, "thinking", t, kw_lower, ctx_chars);
+        }
+        ContentBlock::Text(t) if t.to_lowercase().contains(kw_lower) => {
+            hits.text.push(idx);
+            maybe_add_snippet(hits, idx, "text", t, kw_lower, ctx_chars);
+        }
+        ContentBlock::ToolUse { input_json, .. } if input_json.to_lowercase().contains(kw_lower) => {
+            hits.tool_use.push(idx);
+        }
+        ContentBlock::ToolResult { content } if content.to_lowercase().contains(kw_lower) => {
+            hits.tool_result.push(idx);
+        }
+        _ => {}
+    }
+}
+
+fn maybe_add_snippet(
+    hits: &mut KeywordHits,
+    idx: usize,
+    kind: &str,
+    text: &str,
+    kw_lower: &str,
+    ctx_chars: usize,
+) {
+    if hits.snippets.len() < 3 {
+        hits.snippets.push((idx, kind.into(), extract_context(text, kw_lower, ctx_chars)));
+    }
+}
+
+fn print_span_and_snippets(hits: &KeywordHits, total_events: usize) {
+    let mut all_indices: Vec<usize> = Vec::new();
+    all_indices.extend(&hits.thinking);
+    all_indices.extend(&hits.text);
+    all_indices.extend(&hits.tool_use);
+    all_indices.extend(&hits.user);
+    all_indices.sort();
+    all_indices.dedup();
+
+    if let (Some(&first), Some(&last)) = (all_indices.first(), all_indices.last()) {
+        let span_pct = if total_events > 0 {
+            ((last - first) as f64 / total_events as f64 * 100.0) as u32
+        } else {
+            0
+        };
+        println!();
+        println!("  First: event {first:>3}    Last: event {last:>3}    Span: {span_pct}% of session");
+    }
+
+    if !hits.snippets.is_empty() {
+        println!();
+        for (idx, kind, snippet) in &hits.snippets {
+            println!(
+                "  {}[event {idx} / {kind}]:{} {snippet}",
+                Color::DIM, Color::RESET
+            );
+        }
+    }
 }
 
 fn print_hit_line(label: &str, hits: &[usize]) {

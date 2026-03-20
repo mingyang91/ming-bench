@@ -33,39 +33,14 @@ pub fn run(run_arg: PathBuf, summary: bool, level: Option<String>) -> Result<()>
     let mut bash_subcmds: HashMap<String, u64> = HashMap::new();
     let mut tool_first_last: HashMap<String, (String, String)> = HashMap::new();
 
-    for (_, path) in &files {
-        let events = session::parse_session(path)?;
-        for event in &events {
-            if let EventKind::Assistant { blocks } = &event.kind {
-                let ts = short_time(event.timestamp.as_deref());
-                for block in blocks {
-                    if let ContentBlock::ToolUse { name, input_json } = block {
-                        let input_summary = summarize_input(name, input_json);
-                        tool_calls.push(ToolCall {
-                            index: event.index,
-                            time: ts.clone(),
-                            tool: name.clone(),
-                            input: input_summary.clone(),
-                        });
-
-                        *tool_counts.entry(name.clone()).or_default() += 1;
-
-                        // Track first/last time per tool
-                        tool_first_last
-                            .entry(name.clone())
-                            .and_modify(|(_, last)| *last = ts.clone())
-                            .or_insert((ts.clone(), ts.clone()));
-
-                        // Track bash subcommands
-                        if name == "Bash" {
-                            let cmd = extract_bash_cmd(input_json);
-                            let key = classify_bash(&cmd);
-                            *bash_subcmds.entry(key).or_default() += 1;
-                        }
-                    }
-                }
-            }
-        }
+    let all_events = parse_all_events(&files)?;
+    for event in &all_events {
+        let EventKind::Assistant { blocks } = &event.kind else { continue };
+        let ts = short_time(event.timestamp.as_deref());
+        collect_tool_calls(
+            blocks, event.index, &ts,
+            &mut tool_calls, &mut tool_counts, &mut tool_first_last, &mut bash_subcmds,
+        );
     }
 
     if summary {
@@ -88,6 +63,50 @@ pub fn run(run_arg: PathBuf, summary: bool, level: Option<String>) -> Result<()>
     }
 
     Ok(())
+}
+
+fn parse_all_events(
+    files: &[(String, std::path::PathBuf)],
+) -> Result<Vec<session::SessionEvent>> {
+    let mut all = Vec::new();
+    for (_, path) in files {
+        all.extend(session::parse_session(path)?);
+    }
+    Ok(all)
+}
+
+fn collect_tool_calls(
+    blocks: &[ContentBlock],
+    event_idx: usize,
+    ts: &str,
+    tool_calls: &mut Vec<ToolCall>,
+    tool_counts: &mut HashMap<String, u64>,
+    tool_first_last: &mut HashMap<String, (String, String)>,
+    bash_subcmds: &mut HashMap<String, u64>,
+) {
+    for block in blocks {
+        let ContentBlock::ToolUse { name, input_json } = block else { continue };
+        let input_summary = summarize_input(name, input_json);
+        tool_calls.push(ToolCall {
+            index: event_idx,
+            time: ts.to_string(),
+            tool: name.clone(),
+            input: input_summary,
+        });
+
+        *tool_counts.entry(name.clone()).or_default() += 1;
+
+        tool_first_last
+            .entry(name.clone())
+            .and_modify(|(_, last)| *last = ts.to_string())
+            .or_insert((ts.to_string(), ts.to_string()));
+
+        if name == "Bash" {
+            let cmd = extract_bash_cmd(input_json);
+            let key = classify_bash(&cmd);
+            *bash_subcmds.entry(key).or_default() += 1;
+        }
+    }
 }
 
 struct ToolCall {
@@ -128,7 +147,7 @@ fn print_summary(
             .get(*name)
             .cloned()
             .unwrap_or(("?".into(), "?".into()));
-        println!("{:<14} {:>5}   {:<10} {:<10}", name, count, first, last);
+        println!("{name:<14} {count:>5}   {first:<10} {last:<10}");
     }
 
     if !bash_subcmds.is_empty() {
@@ -137,7 +156,7 @@ fn print_summary(
         let mut sorted_bash: Vec<_> = bash_subcmds.iter().collect();
         sorted_bash.sort_by(|a, b| b.1.cmp(a.1));
         for (cmd, count) in sorted_bash {
-            println!("  {:<30} {:>3}", cmd, count);
+            println!("  {cmd:<30} {count:>3}");
         }
     }
 }

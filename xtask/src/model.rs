@@ -128,7 +128,7 @@ pub fn fmt_duration(secs: u64) -> String {
     } else if secs >= 60 {
         format!("{}m{:02}s", secs / 60, secs % 60)
     } else {
-        format!("{}s", secs)
+        format!("{secs}s")
     }
 }
 
@@ -138,7 +138,7 @@ pub fn fmt_size(bytes: u64) -> String {
     } else if bytes >= 1024 {
         format!("{}KB", bytes / 1024)
     } else {
-        format!("{}B", bytes)
+        format!("{bytes}B")
     }
 }
 
@@ -149,7 +149,7 @@ pub fn fmt_tokens(n: u64) -> String {
     } else if n >= 1_000 {
         format!("{}K", n / 1_000)
     } else {
-        format!("{}", n)
+        format!("{n}")
     }
 }
 
@@ -191,7 +191,9 @@ pub fn parse_iso_epoch(s: &str) -> Option<i64> {
     }
     let hour: i64 = time_parts[0].parse().ok()?;
     let min: i64 = time_parts[1].parse().ok()?;
-    let sec: i64 = time_parts[2].parse().ok()?;
+    // Strip fractional seconds (e.g., "04.423" → "04")
+    let sec_str = time_parts[2].split('.').next().unwrap_or(time_parts[2]);
+    let sec: i64 = sec_str.parse().ok()?;
 
     // Days from epoch using a simplified calculation
     // (accurate for dates 2000-2099, which is all we need)
@@ -257,21 +259,16 @@ pub fn discover_runs(results_dir: &Path) -> Result<Vec<(PathBuf, MetaJson)>> {
     let entries = fs::read_dir(results_dir).map_err(|e| Error::io(results_dir, e))?;
 
     for entry in entries {
-        let entry = match entry {
-            Ok(e) => e,
-            Err(_) => continue,
-        };
+        let Ok(entry) = entry else { continue };
         let meta_path = entry.path().join("meta.json");
         if !meta_path.is_file() {
             continue;
         }
-        let content = match fs::read_to_string(&meta_path) {
-            Ok(c) => c,
-            Err(_) => continue,
+        let Ok(content) = fs::read_to_string(&meta_path) else {
+            continue;
         };
-        let meta: MetaJson = match serde_json::from_str(&content) {
-            Ok(m) => m,
-            Err(_) => continue,
+        let Ok(meta) = serde_json::from_str::<MetaJson>(&content) else {
+            continue;
         };
         runs.push((entry.path(), meta));
     }
@@ -341,6 +338,22 @@ pub const LEVELS: [&str; 25] = [
 ];
 
 // ---------------------------------------------------------------------------
+// Turn limits
+// ---------------------------------------------------------------------------
+
+/// Default turn limit for a given level number.
+pub fn turns_for_level(level_num: u32, max_turns: Option<u32>) -> u32 {
+    if let Some(t) = max_turns {
+        return t;
+    }
+    if level_num <= 9 {
+        40
+    } else {
+        60
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Project directory helpers
 // ---------------------------------------------------------------------------
 
@@ -352,12 +365,12 @@ pub fn project_dir() -> PathBuf {
     let mut dir = std::env::current_dir().expect("cannot read current directory");
     loop {
         let cargo = dir.join("Cargo.toml");
-        if cargo.is_file() {
-            if let Ok(content) = fs::read_to_string(&cargo) {
-                if content.contains("[workspace]") {
-                    return dir;
-                }
-            }
+        let is_workspace = cargo.is_file()
+            && fs::read_to_string(&cargo)
+                .map(|c| c.contains("[workspace]"))
+                .unwrap_or(false);
+        if is_workspace {
+            return dir;
         }
         if !dir.pop() {
             // Fall back to cwd

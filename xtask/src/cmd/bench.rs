@@ -86,8 +86,7 @@ pub fn run(branch: &str, run_id: Option<&str>) -> Result<()> {
         let start = Instant::now();
 
         let bash_cmd = format!(
-            "timeout {}s /bench/test_bin test_l{} --test-threads=1 2>&1",
-            TIMEOUT, level
+            "timeout {TIMEOUT}s /bench/test_bin test_l{level} --test-threads=1 2>&1"
         );
         let mount_spec = format!("{}:/bench/test_bin:ro,Z", test_bin.display());
 

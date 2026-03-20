@@ -85,128 +85,124 @@ fn render(ts_filter: Option<&str>, show_all: bool) -> Result<()> {
         return Ok(());
     }
 
-    // Header
-    println!(
-        "{}{:<28}  {:<9}  {:<8}  {:<10}  {:<8}  {:<8}  DETAIL{}",
-        Color::BOLD,
-        "NAME",
-        "STATUS",
-        "LEVEL",
-        "IDLE",
-        "ELAPSED",
-        "OUTPUT",
-        Color::RESET,
-    );
-    println!("{}", "─".repeat(100));
-
+    print_header();
     let now = now_epoch();
 
     for (run_dir, meta) in &runs {
-        let dirname = run_dir
-            .file_name()
-            .map(|n| n.to_string_lossy().into_owned())
-            .unwrap_or_default();
-
-        // Apply timestamp filter
-        if let Some(ts) = ts_filter {
-            if !dirname.contains(ts) {
-                continue;
-            }
-        }
-
-        let name = meta.name.as_deref().unwrap_or(&dirname);
-        let agent = meta.agent.as_deref().unwrap_or("?");
-        let mode = meta.mode.as_deref().unwrap_or("?");
-
-        // --- Status ---
-        let status = detect_status(run_dir, meta);
-
-        // Skip old DONE runs unless --all or --ts
-        if status == Status::Done && !show_all && ts_filter.is_none() {
-            if let Some(start) = meta.start_time.as_deref().and_then(parse_iso_epoch) {
-                if now - start > STALE_THRESHOLD {
-                    continue;
-                }
-            }
-        }
-
-        // --- Level progress ---
-        let level_str = if mode == "levels" {
-            level_progress(run_dir)
-        } else {
-            "---".to_string()
-        };
-
-        // --- Idle time ---
-        let output_file = find_latest_output(run_dir, mode);
-        let (mut idle_secs, mut idle_str) = match &output_file {
-            Some(f) => {
-                let mtime = file_mtime(f);
-                let secs = (now - mtime).max(0) as u64;
-                (secs, fmt_duration(secs))
-            }
-            None => (0, "---".to_string()),
-        };
-
-        // --- Elapsed ---
-        let elapsed_str = elapsed_secs(meta)
-            .map(fmt_duration)
-            .unwrap_or_else(|| "---".to_string());
-
-        // --- Output size ---
-        let out_str = output_file
-            .as_ref()
-            .and_then(|f| fs::metadata(f).ok())
-            .map(|m| fmt_size(m.len()))
-            .unwrap_or_else(|| "---".to_string());
-
-        // --- Detail ---
-        let mut detail = String::new();
-        if agent == "claude" {
-            let (d, live_idle) = claude_detail(run_dir, meta, &status, name, now);
-            detail = d;
-            // Update idle from live session if found
-            if let Some(li) = live_idle {
-                idle_secs = li;
-                idle_str = fmt_duration(li);
-            }
-        }
-        if status == Status::Done {
-            let score = score_display(meta);
-            if score != "?" && score != "null" {
-                detail = format!("score: {score}");
-            }
-        }
-
-        // --- Idle color ---
-        let idle_color = if status == Status::Running {
-            if idle_secs > 900 {
-                Color::RED
-            } else if idle_secs > 300 {
-                Color::YELLOW
-            } else {
-                Color::RESET
-            }
-        } else {
-            Color::RESET
-        };
-
-        // --- Print row ---
-        println!(
-            "{:<28}  {}  {:<8}  {}  {:<8}  {:<8}  {}{}{}",
-            name,
-            colored(&format!("{:<9}", status.label()), status.color()),
-            level_str,
-            colored(&format!("{:<10}", idle_str), idle_color),
-            elapsed_str,
-            out_str,
-            Color::DIM,
-            detail,
-            Color::RESET,
-        );
+        render_run(run_dir, meta, ts_filter, show_all, now);
     }
 
     Ok(())
+}
+
+fn print_header() {
+    println!(
+        "{}{:<28}  {:<9}  {:<8}  {:<10}  {:<8}  {:<8}  DETAIL{}",
+        Color::BOLD, "NAME", "STATUS", "LEVEL", "IDLE", "ELAPSED", "OUTPUT", Color::RESET,
+    );
+    println!("{}", "─".repeat(100));
+}
+
+fn render_run(
+    run_dir: &Path, meta: &MetaJson, ts_filter: Option<&str>, show_all: bool, now: i64,
+) {
+    let dirname = run_dir
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_default();
+
+    if let Some(ts) = ts_filter {
+        if !dirname.contains(ts) {
+            return;
+        }
+    }
+
+    let name = meta.name.as_deref().unwrap_or(&dirname);
+    let status = detect_status(run_dir, meta);
+
+    if should_skip_run(&status, show_all, ts_filter.is_some(), meta, now) {
+        return;
+    }
+
+    let mode = meta.mode.as_deref().unwrap_or("?");
+    let agent = meta.agent.as_deref().unwrap_or("?");
+    let level_str = if mode == "levels" { level_progress(run_dir) } else { "---".to_string() };
+    let (idle_secs, idle_str, detail) = compute_idle_and_detail(run_dir, meta, &status, name, agent, mode, now);
+    let elapsed_str = elapsed_secs(meta).map(fmt_duration).unwrap_or_else(|| "---".to_string());
+    let out_str = find_latest_output(run_dir, mode)
+        .and_then(|f| fs::metadata(&f).ok())
+        .map(|m| fmt_size(m.len()))
+        .unwrap_or_else(|| "---".to_string());
+    let idle_color = idle_color(&status, idle_secs);
+
+    println!(
+        "{:<28}  {}  {:<8}  {}  {:<8}  {:<8}  {}{}{}",
+        name,
+        colored(&format!("{:<9}", status.label()), status.color()),
+        level_str,
+        colored(&format!("{idle_str:<10}"), idle_color),
+        elapsed_str,
+        out_str,
+        Color::DIM,
+        detail,
+        Color::RESET,
+    );
+}
+
+fn should_skip_run(
+    status: &Status, show_all: bool, has_ts: bool, meta: &MetaJson, now: i64,
+) -> bool {
+    if *status != Status::Done || show_all || has_ts {
+        return false;
+    }
+    meta.start_time.as_deref()
+        .and_then(parse_iso_epoch)
+        .is_some_and(|start| now - start > STALE_THRESHOLD)
+}
+
+fn compute_idle_and_detail(
+    run_dir: &Path, meta: &MetaJson, status: &Status,
+    name: &str, agent: &str, mode: &str, now: i64,
+) -> (u64, String, String) {
+    let output_file = find_latest_output(run_dir, mode);
+    let (mut idle_secs, mut idle_str) = match &output_file {
+        Some(f) => {
+            let secs = (now - file_mtime(f)).max(0) as u64;
+            (secs, fmt_duration(secs))
+        }
+        None => (0, "---".to_string()),
+    };
+
+    let mut detail = String::new();
+    if agent == "claude" {
+        let (d, live_idle) = claude_detail(run_dir, meta, status, name, now);
+        detail = d;
+        if let Some(li) = live_idle {
+            idle_secs = li;
+            idle_str = fmt_duration(li);
+        }
+    }
+    if *status == Status::Done {
+        let score = score_display(meta);
+        if score != "?" && score != "null" {
+            detail = format!("score: {score}");
+        }
+    }
+
+    (idle_secs, idle_str, detail)
+}
+
+fn idle_color(status: &Status, idle_secs: u64) -> &'static str {
+    if *status != Status::Running {
+        return Color::RESET;
+    }
+    if idle_secs > 900 {
+        Color::RED
+    } else if idle_secs > 300 {
+        Color::YELLOW
+    } else {
+        Color::RESET
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -219,19 +215,21 @@ fn detect_status(run_dir: &Path, meta: &MetaJson) -> Status {
     }
 
     let lockfile = run_dir.join(".run.lock");
-    if lockfile.is_file() {
-        if let Ok(content) = fs::read_to_string(&lockfile) {
-            if let Ok(pid) = content.trim().parse::<u32>() {
-                // Check /proc/{pid} exists
-                if Path::new(&format!("/proc/{pid}")).exists() {
-                    return Status::Running;
-                }
-            }
-        }
-        return Status::Dead;
+    if !lockfile.is_file() {
+        return Status::Done;
     }
 
-    Status::Done
+    if lock_pid_alive(&lockfile) {
+        Status::Running
+    } else {
+        Status::Dead
+    }
+}
+
+fn lock_pid_alive(lockfile: &Path) -> bool {
+    let Ok(content) = fs::read_to_string(lockfile) else { return false };
+    let Ok(pid) = content.trim().parse::<u32>() else { return false };
+    Path::new(&format!("/proc/{pid}")).exists()
 }
 
 // ---------------------------------------------------------------------------
@@ -243,9 +241,8 @@ fn level_progress(run_dir: &Path) -> String {
     let mut last_level = String::new();
     let mut total = 0u32;
 
-    let entries = match fs::read_dir(run_dir) {
-        Ok(e) => e,
-        Err(_) => return "---".to_string(),
+    let Ok(entries) = fs::read_dir(run_dir) else {
+        return "---".to_string();
     };
 
     let mut level_dirs: Vec<PathBuf> = entries
@@ -263,17 +260,17 @@ fn level_progress(run_dir: &Path) -> String {
             .unwrap_or_default();
 
         let status_file = ldir.join("status.txt");
-        if status_file.is_file() {
-            if let Ok(content) = fs::read_to_string(&status_file) {
-                if content.to_uppercase().contains("PASSED") {
-                    passed += 1;
-                }
-            }
-            last_level = lname;
-        } else {
-            // Level started but no status = currently running
+        if !status_file.is_file() {
             last_level = format!("{lname}…");
+            continue;
         }
+        let has_passed = fs::read_to_string(&status_file)
+            .map(|c| c.to_uppercase().contains("PASSED"))
+            .unwrap_or(false);
+        if has_passed {
+            passed += 1;
+        }
+        last_level = lname;
     }
 
     if total > 0 {
@@ -288,32 +285,25 @@ fn level_progress(run_dir: &Path) -> String {
 // ---------------------------------------------------------------------------
 
 fn find_latest_output(run_dir: &Path, mode: &str) -> Option<PathBuf> {
-    let mut best: Option<(PathBuf, i64)> = None;
-
-    let mut check = |path: PathBuf| {
-        if path.is_file() {
-            let mt = file_mtime(&path);
-            if best.as_ref().is_none_or(|(_, prev)| mt > *prev) {
-                best = Some((path, mt));
-            }
-        }
-    };
+    let mut candidates = vec![run_dir.join("agent-output.txt")];
 
     if mode == "levels" {
-        // Check all L*/agent-output.txt
-        if let Ok(entries) = fs::read_dir(run_dir) {
-            for entry in entries.flatten() {
-                if entry.file_name().to_string_lossy().starts_with('L') && entry.path().is_dir() {
-                    check(entry.path().join("agent-output.txt"));
-                }
-            }
-        }
+        collect_level_outputs(run_dir, &mut candidates);
     }
 
-    // Also check top-level
-    check(run_dir.join("agent-output.txt"));
+    candidates
+        .into_iter()
+        .filter(|p| p.is_file())
+        .max_by_key(|p| file_mtime(p))
+}
 
-    best.map(|(p, _)| p)
+fn collect_level_outputs(run_dir: &Path, candidates: &mut Vec<PathBuf>) {
+    let Ok(entries) = fs::read_dir(run_dir) else { return };
+    for entry in entries.flatten() {
+        if entry.file_name().to_string_lossy().starts_with('L') && entry.path().is_dir() {
+            candidates.push(entry.path().join("agent-output.txt"));
+        }
+    }
 }
 
 fn file_mtime(path: &Path) -> i64 {
@@ -341,20 +331,11 @@ fn claude_detail(
     let mut jsonl_path = run_dir.join("session.jsonl");
     let mut live_idle = None;
 
-    // For running agents, try to find live JSONL
     if *status == Status::Running && !jsonl_path.is_file() {
         if let Some(live) = find_live_session(name, meta) {
-            // Update idle from live session mtime
-            let mt = file_mtime(&live);
-            if mt > 0 {
-                live_idle = Some((now - mt).max(0) as u64);
-            }
+            live_idle = live_idle_from_mtime(&live, now);
             jsonl_path = live;
         }
-    }
-
-    if !jsonl_path.is_file() {
-        return (String::new(), live_idle);
     }
 
     let content = match fs::read_to_string(&jsonl_path) {
@@ -362,6 +343,18 @@ fn claude_detail(
         _ => return (String::new(), live_idle),
     };
 
+    let (last_tool, total_out) = scan_session_detail(&content);
+
+    let detail = format_detail(&last_tool, total_out);
+    (detail, live_idle)
+}
+
+fn live_idle_from_mtime(path: &Path, now: i64) -> Option<u64> {
+    let mt = file_mtime(path);
+    if mt > 0 { Some((now - mt).max(0) as u64) } else { None }
+}
+
+fn scan_session_detail(content: &str) -> (String, u64) {
     let mut last_tool = String::new();
     let mut total_out: u64 = 0;
 
@@ -370,47 +363,49 @@ fn claude_detail(
         if line.is_empty() {
             continue;
         }
-        let obj: serde_json::Value = match serde_json::from_str(line) {
-            Ok(v) => v,
-            Err(_) => continue,
-        };
-
+        let Ok(obj) = serde_json::from_str::<serde_json::Value>(line) else { continue };
         if obj.get("type").and_then(|t| t.as_str()) != Some("assistant") {
             continue;
         }
+        let Some(msg) = obj.get("message").and_then(|m| m.as_object()) else { continue };
 
-        let msg = match obj.get("message").and_then(|m| m.as_object()) {
-            Some(m) => m,
-            None => continue,
-        };
+        total_out += msg
+            .get("usage")
+            .and_then(|u| u.get("output_tokens"))
+            .and_then(|v| v.as_u64())
+            .unwrap_or(0);
 
-        if let Some(usage) = msg.get("usage").and_then(|u| u.as_object()) {
-            total_out += usage
-                .get("output_tokens")
-                .and_then(|v| v.as_u64())
-                .unwrap_or(0);
-        }
-
-        if let Some(content) = msg.get("content").and_then(|c| c.as_array()) {
-            for block in content {
-                if block.get("type").and_then(|t| t.as_str()) == Some("tool_use") {
-                    if let Some(name) = block.get("name").and_then(|n| n.as_str()) {
-                        last_tool = name.to_string();
-                    }
-                }
-            }
+        if let Some(blocks) = msg.get("content").and_then(|c| c.as_array()) {
+            last_tool = extract_last_tool_name(blocks, &last_tool);
         }
     }
 
-    let mut detail = String::new();
-    if !last_tool.is_empty() {
-        detail = format!("last: {last_tool}");
-        if total_out > 0 {
-            detail = format!("{detail}  tok: {total_out}");
+    (last_tool, total_out)
+}
+
+fn extract_last_tool_name(blocks: &[serde_json::Value], current: &str) -> String {
+    let mut last = current.to_string();
+    for block in blocks {
+        let is_tool = block.get("type").and_then(|t| t.as_str()) == Some("tool_use");
+        if !is_tool {
+            continue;
+        }
+        if let Some(name) = block.get("name").and_then(|n| n.as_str()) {
+            last = name.to_string();
         }
     }
+    last
+}
 
-    (detail, live_idle)
+fn format_detail(last_tool: &str, total_out: u64) -> String {
+    if last_tool.is_empty() {
+        return String::new();
+    }
+    let mut detail = format!("last: {last_tool}");
+    if total_out > 0 {
+        detail = format!("{detail}  tok: {total_out}");
+    }
+    detail
 }
 
 /// Try to locate a live Claude session.jsonl for a running agent.
@@ -421,31 +416,25 @@ fn find_live_session(name: &str, meta: &MetaJson) -> Option<PathBuf> {
     let home = std::env::var("HOME").ok()?;
 
     // Strategy 1: Derive project dir from workspace path
-    // Workspace is typically at ../<project_root>/../workspace/<name>
-    let workspace_dir = project_workspace_dir(name);
-    if let Some(ws) = workspace_dir {
-        if let Ok(real) = fs::canonicalize(&ws) {
-            let proj_dir_name = derive_claude_project_name(&real);
-            let proj_dir = PathBuf::from(&home)
-                .join(".claude/projects")
-                .join(&proj_dir_name);
-            if proj_dir.is_dir() {
-                if let Some(live) = newest_jsonl(&proj_dir) {
-                    return Some(live);
-                }
-            }
-        }
+    if let Some(found) = find_live_from_workspace(name, &home) {
+        return Some(found);
     }
 
     // Strategy 2: Search by session_id
-    if let Some(sid) = &meta.session_id {
-        let projects_dir = PathBuf::from(&home).join(".claude/projects");
-        if let Some(found) = find_jsonl_by_session_id(&projects_dir, sid) {
-            return Some(found);
-        }
-    }
+    let sid = meta.session_id.as_deref()?;
+    let projects_dir = PathBuf::from(&home).join(".claude/projects");
+    find_jsonl_by_session_id(&projects_dir, sid)
+}
 
-    None
+fn find_live_from_workspace(name: &str, home: &str) -> Option<PathBuf> {
+    let ws = project_workspace_dir(name)?;
+    let real = fs::canonicalize(&ws).ok()?;
+    let proj_dir_name = derive_claude_project_name(&real);
+    let proj_dir = PathBuf::from(home).join(".claude/projects").join(&proj_dir_name);
+    if !proj_dir.is_dir() {
+        return None;
+    }
+    newest_jsonl(&proj_dir)
 }
 
 fn project_workspace_dir(name: &str) -> Option<PathBuf> {
@@ -475,11 +464,12 @@ fn newest_jsonl(dir: &Path) -> Option<PathBuf> {
 
     for entry in entries.flatten() {
         let path = entry.path();
-        if path.extension().and_then(|e| e.to_str()) == Some("jsonl") {
-            let mt = file_mtime(&path);
-            if best.as_ref().is_none_or(|(_, prev)| mt > *prev) {
-                best = Some((path, mt));
-            }
+        if path.extension().and_then(|e| e.to_str()) != Some("jsonl") {
+            continue;
+        }
+        let mt = file_mtime(&path);
+        if best.as_ref().is_none_or(|(_, prev)| mt > *prev) {
+            best = Some((path, mt));
         }
     }
 

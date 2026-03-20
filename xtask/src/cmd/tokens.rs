@@ -159,17 +159,17 @@ fn resolve_runs(runs: Vec<PathBuf>, all: bool) -> Result<Vec<PathBuf>> {
     if all {
         let results_dir = project_results_dir();
         let discovered = discover_runs(&results_dir)?;
-        Ok(discovered.into_iter().map(|(path, _)| path).collect())
-    } else if runs.is_empty() {
-        Err(Error::NoRuns)
-    } else {
-        for run in &runs {
-            if !run.is_dir() {
-                return Err(Error::RunNotFound { path: run.clone() });
-            }
-        }
-        Ok(runs)
+        return Ok(discovered.into_iter().map(|(path, _)| path).collect());
     }
+    if runs.is_empty() {
+        return Err(Error::NoRuns);
+    }
+    for run in &runs {
+        if !run.is_dir() {
+            return Err(Error::RunNotFound { path: run.clone() });
+        }
+    }
+    Ok(runs)
 }
 
 fn process_run(run_dir: &Path, label: &str) -> Result<RunReport> {
@@ -179,124 +179,19 @@ fn process_run(run_dir: &Path, label: &str) -> Result<RunReport> {
     levels.sort();
     let is_full_mode = levels.is_empty();
 
-    let separator = "=".repeat(70);
-    println!("\n{separator}");
-    println!("  {label}");
-    println!("{separator}");
+    print_run_header(label);
 
     if agent == "codex" {
         return process_codex_run(run_dir, &agent, is_full_mode);
     }
 
-    println!(
-        "{:<8} {:>10} {:>10} {:>12} {:>12} Status",
-        "Level", "Input", "Output", "Cache Write", "Cache Read"
-    );
-    println!(
-        "{} {} {} {} {} {}",
-        "-".repeat(8),
-        "-".repeat(10),
-        "-".repeat(10),
-        "-".repeat(12),
-        "-".repeat(12),
-        "-".repeat(10)
-    );
-
-    let mut grand_total = TokenUsage::default();
-    let mut any_usage = false;
-
-    if is_full_mode {
-        let session_file = run_dir.join("session.jsonl");
-        match parse_session(&session_file) {
-            Some(tokens) => {
-                any_usage = true;
-                grand_total.add(&tokens);
-                println!(
-                    "{:<8} {:>10} {:>10} {:>12} {:>12}",
-                    "full",
-                    fmt_comma(tokens.input_tokens),
-                    fmt_comma(tokens.output_tokens),
-                    fmt_comma(tokens.cache_creation_input_tokens),
-                    fmt_comma(tokens.cache_read_input_tokens),
-                );
-            }
-            None => {
-                println!(
-                    "{:<8} {:>10} {:>10} {:>12} {:>12}",
-                    "full", "—", "—", "—", "—"
-                );
-            }
-        }
-    } else {
-        for level_dir in &levels {
-            let level_name = level_dir
-                .file_name()
-                .map(|n| n.to_string_lossy().into_owned())
-                .unwrap_or_default();
-            let session_file = level_dir.join("session.jsonl");
-            let status = read_status(level_dir);
-
-            match parse_session(&session_file) {
-                Some(tokens) => {
-                    any_usage = true;
-                    grand_total.add(&tokens);
-                    println!(
-                        "{:<8} {:>10} {:>10} {:>12} {:>12} {}",
-                        level_name,
-                        fmt_comma(tokens.input_tokens),
-                        fmt_comma(tokens.output_tokens),
-                        fmt_comma(tokens.cache_creation_input_tokens),
-                        fmt_comma(tokens.cache_read_input_tokens),
-                        status,
-                    );
-                }
-                None => {
-                    println!(
-                        "{:<8} {:>10} {:>10} {:>12} {:>12} {}",
-                        level_name, "—", "—", "—", "—", status,
-                    );
-                }
-            }
-        }
-    }
-
-    println!(
-        "{} {} {} {} {}",
-        "-".repeat(8),
-        "-".repeat(10),
-        "-".repeat(10),
-        "-".repeat(12),
-        "-".repeat(12)
-    );
-    println!(
-        "{:<8} {:>10} {:>10} {:>12} {:>12}",
-        "TOTAL",
-        fmt_comma(grand_total.input_tokens),
-        fmt_comma(grand_total.output_tokens),
-        fmt_comma(grand_total.cache_creation_input_tokens),
-        fmt_comma(grand_total.cache_read_input_tokens),
-    );
-
-    let cost_input = grand_total.input_tokens as f64 * PRICE_INPUT;
-    let cost_output = grand_total.output_tokens as f64 * PRICE_OUTPUT;
-    let cost_cache_w = grand_total.cache_creation_input_tokens as f64 * PRICE_CACHE_WRITE;
-    let cost_cache_r = grand_total.cache_read_input_tokens as f64 * PRICE_CACHE_READ;
-    let total_cost = grand_total.cost();
-
-    println!();
-    if any_usage {
-        println!("  Total tokens: {}", fmt_comma(grand_total.total()));
-        println!("  Estimated cost: ${total_cost:.2}");
-        println!(
-            "    Input: ${cost_input:.2} | Output: ${cost_output:.2} | Cache Write: ${cost_cache_w:.2} | Cache Read: ${cost_cache_r:.2}"
-        );
-    } else {
-        println!("  Total tokens: unavailable");
-        println!("  Estimated cost: unavailable");
-    }
+    print_claude_table_header();
+    let (grand_total, any_usage) = print_claude_level_rows(run_dir, &levels, is_full_mode);
+    print_claude_table_footer(&grand_total);
+    print_claude_cost_summary(&grand_total, any_usage);
 
     let total_tokens = grand_total.total();
-    let cost = any_usage.then_some(total_cost);
+    let cost = any_usage.then_some(grand_total.cost());
     let usage = any_usage.then_some(grand_total);
 
     Ok(RunReport {
@@ -308,180 +203,274 @@ fn process_run(run_dir: &Path, label: &str) -> Result<RunReport> {
     })
 }
 
+fn print_run_header(label: &str) {
+    let separator = "=".repeat(70);
+    println!("\n{separator}");
+    println!("  {label}");
+    println!("{separator}");
+}
+
+fn print_claude_table_header() {
+    println!(
+        "{:<8} {:>10} {:>10} {:>12} {:>12} Status",
+        "Level", "Input", "Output", "Cache Write", "Cache Read"
+    );
+    println!(
+        "{} {} {} {} {} {}",
+        "-".repeat(8), "-".repeat(10), "-".repeat(10),
+        "-".repeat(12), "-".repeat(12), "-".repeat(10)
+    );
+}
+
+fn print_claude_level_rows(
+    run_dir: &Path, levels: &[PathBuf], is_full_mode: bool,
+) -> (TokenUsage, bool) {
+    let mut grand_total = TokenUsage::default();
+    let mut any_usage = false;
+
+    if is_full_mode {
+        let session_file = run_dir.join("session.jsonl");
+        print_claude_row("full", &session_file, None, &mut grand_total, &mut any_usage);
+    } else {
+        for level_dir in levels {
+            let level_name = level_dir
+                .file_name()
+                .map(|n| n.to_string_lossy().into_owned())
+                .unwrap_or_default();
+            let session_file = level_dir.join("session.jsonl");
+            let status = read_status(level_dir);
+            print_claude_row(&level_name, &session_file, Some(&status), &mut grand_total, &mut any_usage);
+        }
+    }
+
+    (grand_total, any_usage)
+}
+
+fn print_claude_row(
+    label: &str, session_file: &Path, status: Option<&str>,
+    grand_total: &mut TokenUsage, any_usage: &mut bool,
+) {
+    let suffix = status.map(|s| format!(" {s}")).unwrap_or_default();
+    match parse_session(session_file) {
+        Some(tokens) => {
+            *any_usage = true;
+            grand_total.add(&tokens);
+            println!(
+                "{:<8} {:>10} {:>10} {:>12} {:>12}{suffix}",
+                label,
+                fmt_comma(tokens.input_tokens),
+                fmt_comma(tokens.output_tokens),
+                fmt_comma(tokens.cache_creation_input_tokens),
+                fmt_comma(tokens.cache_read_input_tokens),
+            );
+        }
+        None => {
+            println!("{:<8} {:>10} {:>10} {:>12} {:>12}{suffix}", label, "—", "—", "—", "—");
+        }
+    }
+}
+
+fn print_claude_table_footer(grand_total: &TokenUsage) {
+    println!(
+        "{} {} {} {} {}",
+        "-".repeat(8), "-".repeat(10), "-".repeat(10),
+        "-".repeat(12), "-".repeat(12)
+    );
+    println!(
+        "{:<8} {:>10} {:>10} {:>12} {:>12}",
+        "TOTAL",
+        fmt_comma(grand_total.input_tokens),
+        fmt_comma(grand_total.output_tokens),
+        fmt_comma(grand_total.cache_creation_input_tokens),
+        fmt_comma(grand_total.cache_read_input_tokens),
+    );
+}
+
+fn print_claude_cost_summary(grand_total: &TokenUsage, any_usage: bool) {
+    println!();
+    if !any_usage {
+        println!("  Total tokens: unavailable");
+        println!("  Estimated cost: unavailable");
+        return;
+    }
+    let cost_input = grand_total.input_tokens as f64 * PRICE_INPUT;
+    let cost_output = grand_total.output_tokens as f64 * PRICE_OUTPUT;
+    let cost_cache_w = grand_total.cache_creation_input_tokens as f64 * PRICE_CACHE_WRITE;
+    let cost_cache_r = grand_total.cache_read_input_tokens as f64 * PRICE_CACHE_READ;
+    let total_cost = grand_total.cost();
+    println!("  Total tokens: {}", fmt_comma(grand_total.total()));
+    println!("  Estimated cost: ${total_cost:.2}");
+    println!(
+        "    Input: ${cost_input:.2} | Output: ${cost_output:.2} | Cache Write: ${cost_cache_w:.2} | Cache Read: ${cost_cache_r:.2}"
+    );
+}
+
+struct CodexRunState {
+    grand_usage: CodexUsage,
+    grand_total_tokens: u64,
+    grand_costs: CodexCostBreakdown,
+    any_usage: bool,
+    complete_usage: bool,
+    complete_cost: bool,
+    run_model: Option<String>,
+    mixed_model: bool,
+}
+
 fn process_codex_run(run_dir: &Path, agent: &str, is_full_mode: bool) -> Result<RunReport> {
+    print_codex_table_header();
+
+    let mut state = CodexRunState {
+        grand_usage: CodexUsage::default(),
+        grand_total_tokens: 0,
+        grand_costs: CodexCostBreakdown::default(),
+        any_usage: false,
+        complete_usage: true,
+        complete_cost: true,
+        run_model: None,
+        mixed_model: false,
+    };
+
+    for (level_name, dir) in codex_sources(run_dir, is_full_mode) {
+        process_codex_level(&level_name, &dir, &mut state);
+    }
+
+    let model = if state.mixed_model { Some("multiple".to_string()) } else { state.run_model.clone() };
+    print_codex_table_footer(&state, &model);
+
+    Ok(RunReport {
+        agent: agent.to_string(),
+        model,
+        usage: RunUsage::Codex {
+            usage: (state.any_usage && state.complete_usage).then_some(state.grand_usage),
+        },
+        total_tokens: state.grand_total_tokens,
+        cost: (state.complete_cost && state.any_usage).then_some(state.grand_costs.total()),
+    })
+}
+
+fn print_codex_table_header() {
     println!(
         "{:<8} {:>10} {:>12} {:>10} {:>12} {:>10} Status",
         "Level", "Input", "Cached In", "Output", "Total", "Cost"
     );
     println!(
         "{} {} {} {} {} {} {}",
-        "-".repeat(8),
-        "-".repeat(10),
-        "-".repeat(12),
-        "-".repeat(10),
-        "-".repeat(12),
-        "-".repeat(10),
-        "-".repeat(10)
+        "-".repeat(8), "-".repeat(10), "-".repeat(12),
+        "-".repeat(10), "-".repeat(12), "-".repeat(10), "-".repeat(10)
     );
+}
 
-    let mut grand_usage = CodexUsage::default();
-    let mut grand_total_tokens: u64 = 0;
-    let mut grand_costs = CodexCostBreakdown::default();
-    let mut any_usage = false;
-    let mut complete_usage = true;
-    let mut complete_cost = true;
-    let mut run_model: Option<String> = None;
-    let mut mixed_model = false;
+fn process_codex_level(level_name: &str, dir: &Path, state: &mut CodexRunState) {
+    let status = read_status(dir);
+    let output_info = parse_codex_output_info(dir);
+    let session_data = load_codex_session(dir, output_info.session_id.as_deref());
 
-    for (level_name, dir) in codex_sources(run_dir, is_full_mode) {
-        let status = read_status(&dir);
-        let output_info = parse_codex_output_info(&dir);
-        let session_data = load_codex_session(&dir, output_info.session_id.as_deref());
+    let level_model = session_data
+        .as_ref()
+        .and_then(|data| data.model.clone())
+        .or(output_info.model.clone());
+    merge_model_label(&mut state.run_model, &mut state.mixed_model, level_model.as_deref());
 
-        let level_model = session_data
-            .as_ref()
-            .and_then(|data| data.model.clone())
-            .or(output_info.model.clone());
-        merge_model_label(&mut run_model, &mut mixed_model, level_model.as_deref());
+    match session_data {
+        Some(data) => print_codex_level_with_data(level_name, &data, &level_model, &status, state),
+        None => print_codex_level_fallback(level_name, &output_info, &status, state),
+    }
+}
 
-        match session_data {
-            Some(data) => {
-                any_usage = true;
-                grand_usage.add(&data.usage);
-                let level_total_tokens = data.usage.total_tokens();
-                grand_total_tokens += level_total_tokens;
+fn print_codex_level_with_data(
+    level_name: &str, data: &CodexSessionData, level_model: &Option<String>,
+    status: &str, state: &mut CodexRunState,
+) {
+    state.any_usage = true;
+    state.grand_usage.add(&data.usage);
+    let level_total_tokens = data.usage.total_tokens();
+    state.grand_total_tokens += level_total_tokens;
 
-                let level_cost = level_model
-                    .as_deref()
-                    .and_then(codex_pricing)
-                    .map(|pricing| {
-                        let breakdown = pricing.cost_breakdown(&data.usage);
-                        grand_costs.add(&breakdown);
-                        breakdown.total()
-                    });
+    let level_cost = level_model
+        .as_deref()
+        .and_then(codex_pricing)
+        .map(|pricing| {
+            let breakdown = pricing.cost_breakdown(&data.usage);
+            state.grand_costs.add(&breakdown);
+            breakdown.total()
+        });
 
-                if level_cost.is_none() {
-                    complete_cost = false;
-                }
-
-                println!(
-                    "{:<8} {:>10} {:>12} {:>10} {:>12} {:>10} {}",
-                    level_name,
-                    fmt_comma(data.usage.input_tokens),
-                    fmt_comma(data.usage.cached_input_tokens),
-                    fmt_comma(data.usage.output_tokens),
-                    fmt_comma(level_total_tokens),
-                    level_cost
-                        .map(|cost| format!("${cost:.2}"))
-                        .unwrap_or_else(|| "—".to_string()),
-                    status,
-                );
-            }
-            None => {
-                complete_usage = false;
-                complete_cost = false;
-                match output_info.total_tokens {
-                    Some(total_tokens) => {
-                        grand_total_tokens += total_tokens;
-                        println!(
-                            "{:<8} {:>10} {:>12} {:>10} {:>12} {:>10} {}",
-                            level_name,
-                            "—",
-                            "—",
-                            "—",
-                            fmt_comma(total_tokens),
-                            "—",
-                            status,
-                        );
-                    }
-                    None => {
-                        println!(
-                            "{:<8} {:>10} {:>12} {:>10} {:>12} {:>10} {}",
-                            level_name, "—", "—", "—", "—", "—", status,
-                        );
-                    }
-                }
-            }
-        }
+    if level_cost.is_none() {
+        state.complete_cost = false;
     }
 
-    let model = if mixed_model {
-        Some("multiple".to_string())
-    } else {
-        run_model
+    println!(
+        "{:<8} {:>10} {:>12} {:>10} {:>12} {:>10} {status}",
+        level_name,
+        fmt_comma(data.usage.input_tokens),
+        fmt_comma(data.usage.cached_input_tokens),
+        fmt_comma(data.usage.output_tokens),
+        fmt_comma(level_total_tokens),
+        level_cost.map(|cost| format!("${cost:.2}")).unwrap_or_else(|| "—".to_string()),
+    );
+}
+
+fn print_codex_level_fallback(
+    level_name: &str, output_info: &CodexOutputInfo, status: &str, state: &mut CodexRunState,
+) {
+    state.complete_usage = false;
+    state.complete_cost = false;
+    let total_str = match output_info.total_tokens {
+        Some(total_tokens) => {
+            state.grand_total_tokens += total_tokens;
+            fmt_comma(total_tokens)
+        }
+        None => "—".to_string(),
     };
+    println!(
+        "{:<8} {:>10} {:>12} {:>10} {:>12} {:>10} {status}",
+        level_name, "—", "—", "—", total_str, "—",
+    );
+}
+
+fn print_codex_table_footer(state: &CodexRunState, model: &Option<String>) {
+    let dash = |ok: bool, val: u64| {
+        if ok { fmt_comma(val) } else { "—".to_string() }
+    };
+    let complete = state.any_usage && state.complete_usage;
 
     println!(
         "{} {} {} {} {} {}",
-        "-".repeat(8),
-        "-".repeat(10),
-        "-".repeat(12),
-        "-".repeat(10),
-        "-".repeat(12),
-        "-".repeat(10)
+        "-".repeat(8), "-".repeat(10), "-".repeat(12),
+        "-".repeat(10), "-".repeat(12), "-".repeat(10)
     );
     println!(
         "{:<8} {:>10} {:>12} {:>10} {:>12} {:>10}",
         "TOTAL",
-        if any_usage && complete_usage {
-            fmt_comma(grand_usage.input_tokens)
-        } else {
-            "—".to_string()
-        },
-        if any_usage && complete_usage {
-            fmt_comma(grand_usage.cached_input_tokens)
-        } else {
-            "—".to_string()
-        },
-        if any_usage && complete_usage {
-            fmt_comma(grand_usage.output_tokens)
-        } else {
-            "—".to_string()
-        },
-        if grand_total_tokens > 0 {
-            fmt_comma(grand_total_tokens)
-        } else {
-            "—".to_string()
-        },
-        if complete_cost && any_usage {
-            format!("${:.2}", grand_costs.total())
+        dash(complete, state.grand_usage.input_tokens),
+        dash(complete, state.grand_usage.cached_input_tokens),
+        dash(complete, state.grand_usage.output_tokens),
+        dash(state.grand_total_tokens > 0, state.grand_total_tokens),
+        if state.complete_cost && state.any_usage {
+            format!("${:.2}", state.grand_costs.total())
         } else {
             "—".to_string()
         },
     );
 
     println!();
-    if grand_total_tokens > 0 {
-        println!("  Total tokens: {}", fmt_comma(grand_total_tokens));
+    if state.grand_total_tokens > 0 {
+        println!("  Total tokens: {}", fmt_comma(state.grand_total_tokens));
     } else {
         println!("  Total tokens: unavailable");
     }
     if let Some(model_name) = model.as_deref() {
         println!("  Model: {model_name}");
     }
-    if complete_cost && any_usage {
-        println!("  Estimated cost: ${:.2}", grand_costs.total());
+    if state.complete_cost && state.any_usage {
+        println!("  Estimated cost: ${:.2}", state.grand_costs.total());
         println!(
             "    Uncached input: ${:.2} | Cached input: ${:.2} | Output: ${:.2}",
-            grand_costs.input, grand_costs.cached_input, grand_costs.output,
+            state.grand_costs.input, state.grand_costs.cached_input, state.grand_costs.output,
         );
     } else {
         println!("  Estimated cost: unavailable");
     }
-
-    Ok(RunReport {
-        agent: agent.to_string(),
-        model,
-        usage: RunUsage::Codex {
-            usage: if any_usage && complete_usage {
-                Some(grand_usage)
-            } else {
-                None
-            },
-        },
-        total_tokens: grand_total_tokens,
-        cost: (complete_cost && any_usage).then_some(grand_costs.total()),
-    })
 }
 
 fn print_comparison(all_reports: &[(String, RunReport)]) {
@@ -499,127 +488,36 @@ fn print_comparison(all_reports: &[(String, RunReport)]) {
 
 fn print_claude_comparison(all_reports: &[(String, RunReport)]) {
     let short_labels = short_labels(all_reports);
+    let col = |f: fn(&TokenUsage) -> String| -> Vec<String> {
+        all_reports.iter()
+            .map(|(_, r)| f(r.claude_usage().expect("checked")))
+            .collect()
+    };
     let rows = vec![
-        (
-            "Input Tokens",
-            all_reports
-                .iter()
-                .map(|(_, report)| fmt_comma(report.claude_usage().expect("checked").input_tokens))
-                .collect(),
-        ),
-        (
-            "Output Tokens",
-            all_reports
-                .iter()
-                .map(|(_, report)| fmt_comma(report.claude_usage().expect("checked").output_tokens))
-                .collect(),
-        ),
-        (
-            "Cache Write",
-            all_reports
-                .iter()
-                .map(|(_, report)| {
-                    fmt_comma(
-                        report
-                            .claude_usage()
-                            .expect("checked")
-                            .cache_creation_input_tokens,
-                    )
-                })
-                .collect(),
-        ),
-        (
-            "Cache Read",
-            all_reports
-                .iter()
-                .map(|(_, report)| {
-                    fmt_comma(
-                        report
-                            .claude_usage()
-                            .expect("checked")
-                            .cache_read_input_tokens,
-                    )
-                })
-                .collect(),
-        ),
-        (
-            "Total Tokens",
-            all_reports
-                .iter()
-                .map(|(_, report)| fmt_comma(report.claude_usage().expect("checked").total()))
-                .collect(),
-        ),
-        (
-            "Est. Cost",
-            all_reports
-                .iter()
-                .map(|(_, report)| report.cost_display())
-                .collect(),
-        ),
+        ("Input Tokens", col(|u| fmt_comma(u.input_tokens))),
+        ("Output Tokens", col(|u| fmt_comma(u.output_tokens))),
+        ("Cache Write", col(|u| fmt_comma(u.cache_creation_input_tokens))),
+        ("Cache Read", col(|u| fmt_comma(u.cache_read_input_tokens))),
+        ("Total Tokens", col(|u| fmt_comma(u.total()))),
+        ("Est. Cost", all_reports.iter().map(|(_, r)| r.cost_display()).collect()),
     ];
     print_string_comparison(&short_labels, &rows);
 }
 
 fn print_codex_comparison(all_reports: &[(String, RunReport)]) {
     let short_labels = short_labels(all_reports);
+    let codex_col = |f: fn(&CodexUsage) -> String| -> Vec<String> {
+        all_reports.iter()
+            .map(|(_, r)| r.codex_usage().map(f).unwrap_or_else(|| "—".to_string()))
+            .collect()
+    };
     let rows = vec![
-        (
-            "Model",
-            all_reports
-                .iter()
-                .map(|(_, report)| report.model_display())
-                .collect(),
-        ),
-        (
-            "Input Tokens",
-            all_reports
-                .iter()
-                .map(|(_, report)| {
-                    report
-                        .codex_usage()
-                        .map(|usage| fmt_comma(usage.input_tokens))
-                        .unwrap_or_else(|| "—".to_string())
-                })
-                .collect(),
-        ),
-        (
-            "Cached Input",
-            all_reports
-                .iter()
-                .map(|(_, report)| {
-                    report
-                        .codex_usage()
-                        .map(|usage| fmt_comma(usage.cached_input_tokens))
-                        .unwrap_or_else(|| "—".to_string())
-                })
-                .collect(),
-        ),
-        (
-            "Output Tokens",
-            all_reports
-                .iter()
-                .map(|(_, report)| {
-                    report
-                        .codex_usage()
-                        .map(|usage| fmt_comma(usage.output_tokens))
-                        .unwrap_or_else(|| "—".to_string())
-                })
-                .collect(),
-        ),
-        (
-            "Total Tokens",
-            all_reports
-                .iter()
-                .map(|(_, report)| report.total_tokens_display())
-                .collect(),
-        ),
-        (
-            "Est. Cost",
-            all_reports
-                .iter()
-                .map(|(_, report)| report.cost_display())
-                .collect(),
-        ),
+        ("Model", all_reports.iter().map(|(_, r)| r.model_display()).collect()),
+        ("Input Tokens", codex_col(|u| fmt_comma(u.input_tokens))),
+        ("Cached Input", codex_col(|u| fmt_comma(u.cached_input_tokens))),
+        ("Output Tokens", codex_col(|u| fmt_comma(u.output_tokens))),
+        ("Total Tokens", all_reports.iter().map(|(_, r)| r.total_tokens_display()).collect()),
+        ("Est. Cost", all_reports.iter().map(|(_, r)| r.cost_display()).collect()),
     ];
     print_string_comparison(&short_labels, &rows);
 }
@@ -680,7 +578,7 @@ fn print_string_comparison(short_labels: &[String], rows: &[(&str, Vec<String>)]
 
     print!("{:<25}", "Metric");
     for label in short_labels {
-        print!(" {:>width$}", label, width = col_width);
+        print!(" {label:>col_width$}");
     }
     println!();
 
@@ -691,9 +589,9 @@ fn print_string_comparison(short_labels: &[String], rows: &[(&str, Vec<String>)]
     println!();
 
     for (name, values) in rows {
-        print!("{:<25}", name);
+        print!("{name:<25}");
         for value in values {
-            print!(" {:>width$}", value, width = col_width);
+            print!(" {value:>col_width$}");
         }
         println!();
     }
@@ -708,31 +606,28 @@ fn short_labels(all_reports: &[(String, RunReport)]) -> Vec<String> {
 
 fn extract_run_name(dir_name: &str) -> String {
     let parts: Vec<&str> = dir_name.splitn(3, '_').collect();
-    if parts.len() >= 2 {
-        let name_and_ts = &dir_name[parts[0].len() + 1..];
-        if let Some(idx) = name_and_ts.rfind('_') {
-            let candidate = &name_and_ts[..idx];
-            let suffix = &name_and_ts[idx + 1..];
-            if suffix.len() >= 8
-                && suffix
-                    .chars()
-                    .take(8)
-                    .all(|c| c.is_ascii_digit() || c == 'T')
-            {
-                return candidate.to_string();
-            }
-        }
-        name_and_ts.to_string()
+    if parts.len() < 2 {
+        return dir_name.to_string();
+    }
+    let name_and_ts = &dir_name[parts[0].len() + 1..];
+    let Some(idx) = name_and_ts.rfind('_') else {
+        return name_and_ts.to_string();
+    };
+    let candidate = &name_and_ts[..idx];
+    let suffix = &name_and_ts[idx + 1..];
+    let looks_like_ts = suffix.len() >= 8
+        && suffix.chars().take(8).all(|c| c.is_ascii_digit() || c == 'T');
+    if looks_like_ts {
+        candidate.to_string()
     } else {
-        dir_name.to_string()
+        name_and_ts.to_string()
     }
 }
 
 fn find_level_dirs(run_dir: &Path) -> Vec<PathBuf> {
     let mut dirs = Vec::new();
-    let entries = match fs::read_dir(run_dir) {
-        Ok(entries) => entries,
-        Err(_) => return dirs,
+    let Ok(entries) = fs::read_dir(run_dir) else {
+        return dirs;
     };
 
     for entry in entries.flatten() {
@@ -791,9 +686,8 @@ fn codex_sources(run_dir: &Path, is_full_mode: bool) -> Vec<(String, PathBuf)> {
 
 fn parse_codex_output_info(dir: &Path) -> CodexOutputInfo {
     let path = dir.join("agent-output.txt");
-    let content = match fs::read_to_string(path) {
-        Ok(content) => content,
-        Err(_) => return CodexOutputInfo::default(),
+    let Ok(content) = fs::read_to_string(path) else {
+        return CodexOutputInfo::default();
     };
 
     let stripped = strip_ansi(&content);
@@ -1003,41 +897,20 @@ fn parse_codex_rollout(path: &Path) -> Option<CodexSessionData> {
             continue;
         }
 
-        let payload = match obj.get("payload") {
-            Some(payload) => payload,
-            None => continue,
-        };
+        let Some(payload) = obj.get("payload") else { continue };
         if payload.get("type").and_then(|value| value.as_str()) != Some("token_count") {
             continue;
         }
 
-        let totals = match payload
+        let Some(totals) = payload
             .get("info")
             .and_then(|value| value.get("total_token_usage"))
             .and_then(|value| value.as_object())
-        {
-            Some(totals) => totals,
-            None => continue,
+        else {
+            continue;
         };
 
-        usage.input_tokens = usage.input_tokens.max(
-            totals
-                .get("input_tokens")
-                .and_then(|value| value.as_u64())
-                .unwrap_or(0),
-        );
-        usage.cached_input_tokens = usage.cached_input_tokens.max(
-            totals
-                .get("cached_input_tokens")
-                .and_then(|value| value.as_u64())
-                .unwrap_or(0),
-        );
-        usage.output_tokens = usage.output_tokens.max(
-            totals
-                .get("output_tokens")
-                .and_then(|value| value.as_u64())
-                .unwrap_or(0),
-        );
+        update_codex_usage_from_totals(&mut usage, totals);
         found_usage = true;
     }
 
@@ -1048,93 +921,99 @@ fn parse_codex_rollout(path: &Path) -> Option<CodexSessionData> {
     }
 }
 
+fn update_codex_usage_from_totals(usage: &mut CodexUsage, totals: &serde_json::Map<String, serde_json::Value>) {
+    let get = |key| totals.get(key).and_then(|v| v.as_u64()).unwrap_or(0);
+    usage.input_tokens = usage.input_tokens.max(get("input_tokens"));
+    usage.cached_input_tokens = usage.cached_input_tokens.max(get("cached_input_tokens"));
+    usage.output_tokens = usage.output_tokens.max(get("output_tokens"));
+}
+
+const GPT_54: CodexPricing = CodexPricing {
+    input_per_token: 2.50 / 1_000_000.0,
+    cached_input_per_token: 0.25 / 1_000_000.0,
+    output_per_token: 15.00 / 1_000_000.0,
+};
+const GPT_54_MINI: CodexPricing = CodexPricing {
+    input_per_token: 0.75 / 1_000_000.0,
+    cached_input_per_token: 0.075 / 1_000_000.0,
+    output_per_token: 4.50 / 1_000_000.0,
+};
+const GPT_54_NANO: CodexPricing = CodexPricing {
+    input_per_token: 0.20 / 1_000_000.0,
+    cached_input_per_token: 0.02 / 1_000_000.0,
+    output_per_token: 1.25 / 1_000_000.0,
+};
+const GPT_53_CODEX: CodexPricing = CodexPricing {
+    input_per_token: 1.75 / 1_000_000.0,
+    cached_input_per_token: 0.175 / 1_000_000.0,
+    output_per_token: 14.00 / 1_000_000.0,
+};
+const GPT_52: CodexPricing = CodexPricing {
+    input_per_token: 1.75 / 1_000_000.0,
+    cached_input_per_token: 0.175 / 1_000_000.0,
+    output_per_token: 14.00 / 1_000_000.0,
+};
+const GPT_51: CodexPricing = CodexPricing {
+    input_per_token: 1.25 / 1_000_000.0,
+    cached_input_per_token: 0.125 / 1_000_000.0,
+    output_per_token: 10.00 / 1_000_000.0,
+};
+const GPT_5_MINI: CodexPricing = CodexPricing {
+    input_per_token: 0.25 / 1_000_000.0,
+    cached_input_per_token: 0.025 / 1_000_000.0,
+    output_per_token: 2.00 / 1_000_000.0,
+};
+const CODEX_MINI_LATEST: CodexPricing = CodexPricing {
+    input_per_token: 1.50 / 1_000_000.0,
+    cached_input_per_token: 0.375 / 1_000_000.0,
+    output_per_token: 6.00 / 1_000_000.0,
+};
+
 fn codex_pricing(model: &str) -> Option<CodexPricing> {
     let model = model.trim().to_ascii_lowercase();
+    resolve_codex_pricing(&model)
+}
 
-    const GPT_54: CodexPricing = CodexPricing {
-        input_per_token: 2.50 / 1_000_000.0,
-        cached_input_per_token: 0.25 / 1_000_000.0,
-        output_per_token: 15.00 / 1_000_000.0,
-    };
-    const GPT_54_MINI: CodexPricing = CodexPricing {
-        input_per_token: 0.75 / 1_000_000.0,
-        cached_input_per_token: 0.075 / 1_000_000.0,
-        output_per_token: 4.50 / 1_000_000.0,
-    };
-    const GPT_54_NANO: CodexPricing = CodexPricing {
-        input_per_token: 0.20 / 1_000_000.0,
-        cached_input_per_token: 0.02 / 1_000_000.0,
-        output_per_token: 1.25 / 1_000_000.0,
-    };
-    const GPT_53_CODEX: CodexPricing = CodexPricing {
-        input_per_token: 1.75 / 1_000_000.0,
-        cached_input_per_token: 0.175 / 1_000_000.0,
-        output_per_token: 14.00 / 1_000_000.0,
-    };
-    const GPT_52: CodexPricing = CodexPricing {
-        input_per_token: 1.75 / 1_000_000.0,
-        cached_input_per_token: 0.175 / 1_000_000.0,
-        output_per_token: 14.00 / 1_000_000.0,
-    };
-    const GPT_51: CodexPricing = CodexPricing {
-        input_per_token: 1.25 / 1_000_000.0,
-        cached_input_per_token: 0.125 / 1_000_000.0,
-        output_per_token: 10.00 / 1_000_000.0,
-    };
-    const GPT_5_MINI: CodexPricing = CodexPricing {
-        input_per_token: 0.25 / 1_000_000.0,
-        cached_input_per_token: 0.025 / 1_000_000.0,
-        output_per_token: 2.00 / 1_000_000.0,
-    };
-    const CODEX_MINI_LATEST: CodexPricing = CodexPricing {
-        input_per_token: 1.50 / 1_000_000.0,
-        cached_input_per_token: 0.375 / 1_000_000.0,
-        output_per_token: 6.00 / 1_000_000.0,
-    };
-
-    let pricing = if model == "codex-mini-latest" || model.starts_with("codex-mini-latest-") {
-        CODEX_MINI_LATEST
-    } else if model == "gpt-5.4" || model.starts_with("gpt-5.4-") {
-        if model.starts_with("gpt-5.4-mini") {
-            GPT_54_MINI
-        } else if model.starts_with("gpt-5.4-nano") {
-            GPT_54_NANO
-        } else {
-            GPT_54
-        }
-    } else if model == "gpt-5.3-codex" || model.starts_with("gpt-5.3-codex-") {
-        GPT_53_CODEX
-    } else if model == "gpt-5.2"
-        || model.starts_with("gpt-5.2-")
-        || model == "gpt-5.2-codex"
-        || model.starts_with("gpt-5.2-codex-")
-    {
-        GPT_52
-    } else if model == "gpt-5-codex-mini" || model.starts_with("gpt-5-codex-mini-") {
+fn resolve_codex_pricing(model: &str) -> Option<CodexPricing> {
+    if model == "codex-mini-latest" || model.starts_with("codex-mini-latest-") {
+        return Some(CODEX_MINI_LATEST);
+    }
+    if model == "gpt-5.4" || model.starts_with("gpt-5.4-") {
+        return Some(resolve_gpt54_variant(model));
+    }
+    if model == "gpt-5.3-codex" || model.starts_with("gpt-5.3-codex-") {
+        return Some(GPT_53_CODEX);
+    }
+    if matches_any(model, &["gpt-5.2", "gpt-5.2-codex"], &["gpt-5.2-", "gpt-5.2-codex-"]) {
+        return Some(GPT_52);
+    }
+    if model == "gpt-5-codex-mini" || model.starts_with("gpt-5-codex-mini-") {
         return None;
-    } else if model == "gpt-5.1-codex-mini"
-        || model.starts_with("gpt-5.1-codex-mini-")
-        || model == "gpt-5-mini"
-        || model.starts_with("gpt-5-mini-")
-    {
-        GPT_5_MINI
-    } else if model == "gpt-5.1-codex-max"
-        || model.starts_with("gpt-5.1-codex-max-")
-        || model == "gpt-5.1-codex"
-        || model.starts_with("gpt-5.1-codex-")
-        || model == "gpt-5-codex"
-        || model.starts_with("gpt-5-codex-")
-        || model == "gpt-5.1"
-        || model.starts_with("gpt-5.1-")
-        || model == "gpt-5"
-        || model.starts_with("gpt-5-")
-    {
-        GPT_51
+    }
+    if matches_any(model, &["gpt-5.1-codex-mini", "gpt-5-mini"], &["gpt-5.1-codex-mini-", "gpt-5-mini-"]) {
+        return Some(GPT_5_MINI);
+    }
+    if matches_any(model,
+        &["gpt-5.1-codex-max", "gpt-5.1-codex", "gpt-5-codex", "gpt-5.1", "gpt-5"],
+        &["gpt-5.1-codex-max-", "gpt-5.1-codex-", "gpt-5-codex-", "gpt-5.1-", "gpt-5-"],
+    ) {
+        return Some(GPT_51);
+    }
+    None
+}
+
+fn resolve_gpt54_variant(model: &str) -> CodexPricing {
+    if model.starts_with("gpt-5.4-mini") {
+        GPT_54_MINI
+    } else if model.starts_with("gpt-5.4-nano") {
+        GPT_54_NANO
     } else {
-        return None;
-    };
+        GPT_54
+    }
+}
 
-    Some(pricing)
+fn matches_any(model: &str, exact: &[&str], prefixes: &[&str]) -> bool {
+    exact.contains(&model) || prefixes.iter().any(|p| model.starts_with(p))
 }
 
 fn merge_model_label(current: &mut Option<String>, mixed: &mut bool, candidate: Option<&str>) {
@@ -1154,15 +1033,7 @@ fn strip_ansi(input: &str) -> String {
     let mut chars = input.chars().peekable();
     while let Some(ch) = chars.next() {
         if ch == '\x1b' {
-            if chars.peek() == Some(&'[') {
-                chars.next();
-                while let Some(&next) = chars.peek() {
-                    chars.next();
-                    if next.is_ascii_alphabetic() {
-                        break;
-                    }
-                }
-            }
+            skip_ansi_escape(&mut chars);
         } else if ch != '\r' {
             result.push(ch);
         }
@@ -1170,7 +1041,20 @@ fn strip_ansi(input: &str) -> String {
     result
 }
 
-fn parse_session(jsonl_path: &Path) -> Option<TokenUsage> {
+fn skip_ansi_escape(chars: &mut std::iter::Peekable<std::str::Chars<'_>>) {
+    if chars.peek() != Some(&'[') {
+        return;
+    }
+    chars.next();
+    while let Some(&next) = chars.peek() {
+        chars.next();
+        if next.is_ascii_alphabetic() {
+            break;
+        }
+    }
+}
+
+pub(crate) fn parse_session(jsonl_path: &Path) -> Option<TokenUsage> {
     let content = fs::read_to_string(jsonl_path).ok()?;
     let mut totals = TokenUsage::default();
     let mut found = false;

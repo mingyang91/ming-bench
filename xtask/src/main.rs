@@ -1,4 +1,19 @@
-#![allow(clippy::excessive_nesting)]
+#![deny(clippy::unwrap_used)]
+#![deny(clippy::result_unit_err)]
+#![deny(clippy::manual_assert)]
+#![warn(clippy::too_many_lines)]
+#![warn(clippy::excessive_nesting)]
+#![warn(clippy::manual_filter_map)]
+#![warn(clippy::manual_find_map)]
+#![warn(clippy::manual_flatten)]
+#![warn(clippy::manual_try_fold)]
+#![warn(clippy::manual_let_else)]
+#![warn(clippy::needless_range_loop)]
+#![warn(clippy::explicit_counter_loop)]
+#![warn(clippy::explicit_iter_loop)]
+#![warn(clippy::vec_init_then_push)]
+#![warn(clippy::needless_collect)]
+#![warn(clippy::uninlined_format_args)]
 
 mod ast_check;
 mod cmd;
@@ -48,8 +63,11 @@ enum Commands {
     Setup,
     /// Run tests for a level inside a container
     Test {
-        /// Level number (01-16) or "all"
+        /// Level number (01-21) or "all"
         level: String,
+        /// Skip quality gates (clippy, mod.rs size) — run tests only
+        #[arg(long)]
+        no_gate: bool,
     },
     /// Run full benchmark scoring pass
     Bench {
@@ -157,16 +175,36 @@ enum Commands {
         /// Run directory or name
         run: PathBuf,
     },
+    /// Per-level turn/time/token/test analysis
+    SessionTurns {
+        /// Run directory or name
+        run: PathBuf,
+    },
+    /// Compare two runs side-by-side
+    Compare {
+        /// First run directory or name
+        run1: PathBuf,
+        /// Second run directory or name
+        run2: PathBuf,
+    },
 }
 
 fn main() {
     let cli = Cli::parse();
-    let result = match cli.command {
+    let result = dispatch(cli.command);
+    if let Err(e) = result {
+        eprintln!("error: {e}");
+        process::exit(1);
+    }
+}
+
+fn dispatch(command: Commands) -> model::Result<()> {
+    match command {
         Commands::Results { json } => cmd::results::run(json),
         Commands::Tokens { runs, all } => cmd::tokens::run(runs, all),
         Commands::Watch { once, ts, all } => cmd::watch::run(once, ts, all),
         Commands::Setup => cmd::setup::run(),
-        Commands::Test { ref level } => cmd::test_level::run(level),
+        Commands::Test { ref level, no_gate } => cmd::test_level::run(level, no_gate),
         Commands::Bench {
             ref branch,
             ref run_id,
@@ -220,9 +258,7 @@ fn main() {
             level,
         } => cmd::session_tools::run(run, summary, level),
         Commands::SessionStats { run } => cmd::session_stats::run(run),
-    };
-    if let Err(e) = result {
-        eprintln!("error: {e}");
-        process::exit(1);
+        Commands::SessionTurns { run } => cmd::session_turns::run(run),
+        Commands::Compare { run1, run2 } => cmd::compare::run(run1, run2),
     }
 }

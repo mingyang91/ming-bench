@@ -1,11 +1,13 @@
 pub mod analyze;
 pub mod bench;
+pub mod compare;
 pub mod results;
 pub mod run_agent;
 pub mod session_dump;
 pub mod session_grep;
 pub mod session_stats;
 pub mod session_tools;
+pub mod session_turns;
 pub mod setup;
 pub mod test_level;
 pub mod tokens;

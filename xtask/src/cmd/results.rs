@@ -51,8 +51,7 @@ fn print_table(runs: &[(std::path::PathBuf, model::MetaJson)]) {
             .unwrap_or_else(|| "?".to_string());
 
         println!(
-            "{:<40} {:<10} {:<8} {:<10} {:<8} {}",
-            run_name, base, agent, score, duration, mode
+            "{run_name:<40} {base:<10} {agent:<8} {score:<10} {duration:<8} {mode}"
         );
     }
 }
@@ -95,17 +94,13 @@ fn print_json(runs: &[(std::path::PathBuf, model::MetaJson)]) -> Result<()> {
 fn bench_log_score(run_dir: &std::path::Path) -> Option<String> {
     let log_path = run_dir.join("bench.log");
     let content = fs::read_to_string(log_path).ok()?;
-    for line in content.lines() {
-        if let Some(pos) = line.find("Score: ") {
-            let rest = &line[pos + 7..];
-            let score: String = rest
-                .chars()
-                .take_while(|c| c.is_ascii_digit() || *c == '/')
-                .collect();
-            if !score.is_empty() {
-                return Some(score);
-            }
-        }
-    }
-    None
+    content.lines().find_map(|line| {
+        let pos = line.find("Score: ")?;
+        let rest = &line[pos + 7..];
+        let score: String = rest
+            .chars()
+            .take_while(|c| c.is_ascii_digit() || *c == '/')
+            .collect();
+        if score.is_empty() { None } else { Some(score) }
+    })
 }
