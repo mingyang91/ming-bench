@@ -11,6 +11,7 @@ pub use error::EvalError;
 pub fn eval_str(input: &str) -> Result<String, EvalError> {
     let exprs = parser::parse(input)?;
     let env = env::Env::new();
+    eval::register_builtins(&env);
     let mut last = None;
     for expr in &exprs {
         let val = eval::eval(expr, &env)?;

@@ -20,7 +20,7 @@ pub fn eval(expr: &Value, env: &Env) -> Result<Value, EvalError> {
                     name: name.clone(),
                 });
             }
-            Value::Lambda { .. } => return Ok(current_expr),
+            Value::Lambda { .. } | Value::Builtin { .. } => return Ok(current_expr),
             Value::List(ref elems) => match eval_list_trampoline(elems, &current_env)? {
                 TailAction::Return(val) => return Ok(val),
                 TailAction::TailCall { expr, env } => {
@@ -70,24 +70,32 @@ fn eval_special_form(
 }
 
 fn eval_application(elems: &[Value], env: &Env) -> Result<TailAction, EvalError> {
+    let op_val = eval(&elems[0], env)?;
+
     let args: Vec<Value> = elems[1..]
         .iter()
         .map(|e| eval(e, env))
         .collect::<Result<Vec<_>, _>>()?;
 
-    if let Value::Symbol(name) = &elems[0] {
-        if is_builtin(name) {
-            return Ok(TailAction::Return(call_builtin(name, &args)?));
-        }
-    }
+    apply_value_tail(&op_val, &args)
+}
 
-    let op_val = eval(&elems[0], env)?;
-    apply_lambda_tail(&op_val, &args)
+fn apply_value_tail(op_val: &Value, args: &[Value]) -> Result<TailAction, EvalError> {
+    match op_val {
+        Value::Builtin { name } => {
+            if name == "apply" {
+                return builtin_apply(args);
+            }
+            Ok(TailAction::Return(call_builtin(name, args)?))
+        }
+        _ => apply_lambda_tail(op_val, args),
+    }
 }
 
 fn apply_lambda_tail(op_val: &Value, args: &[Value]) -> Result<TailAction, EvalError> {
     let Value::Lambda {
         params,
+        rest_param,
         body,
         env: closure_env,
     } = op_val
@@ -97,20 +105,34 @@ fn apply_lambda_tail(op_val: &Value, args: &[Value]) -> Result<TailAction, EvalE
         });
     };
 
-    if params.len() != args.len() {
-        return Err(EvalError::ArityError {
-            name: "#<procedure>".into(),
-            expected: params.len(),
-            actual: args.len(),
-        });
+    if let Some(rest) = rest_param {
+        if args.len() < params.len() {
+            return Err(EvalError::ArityError {
+                name: "#<procedure>".into(),
+                expected: params.len(),
+                actual: args.len(),
+            });
+        }
+        let call_env = closure_env.child();
+        for (param, arg) in params.iter().zip(args.iter()) {
+            call_env.define(param.clone(), arg.clone());
+        }
+        call_env.define(rest.clone(), Value::List(args[params.len()..].to_vec()));
+        tail_from_body(body, &call_env)
+    } else {
+        if params.len() != args.len() {
+            return Err(EvalError::ArityError {
+                name: "#<procedure>".into(),
+                expected: params.len(),
+                actual: args.len(),
+            });
+        }
+        let call_env = closure_env.child();
+        for (param, arg) in params.iter().zip(args.iter()) {
+            call_env.define(param.clone(), arg.clone());
+        }
+        tail_from_body(body, &call_env)
     }
-
-    let call_env = closure_env.child();
-    for (param, arg) in params.iter().zip(args.iter()) {
-        call_env.define(param.clone(), arg.clone());
-    }
-
-    tail_from_body(body, &call_env)
 }
 
 fn tail_from_body(body: &[Value], env: &Env) -> Result<TailAction, EvalError> {
@@ -254,6 +276,43 @@ fn eval_cond_tail(clauses: &[Value], env: &Env) -> Result<TailAction, EvalError>
     Ok(TailAction::Return(Value::Symbol("void".into())))
 }
 
+fn parse_params(param_list: &[Value]) -> Result<(Vec<String>, Option<String>), EvalError> {
+    let dot_pos = param_list.iter().position(|p| matches!(p, Value::Symbol(s) if s == "."));
+    if let Some(pos) = dot_pos {
+        if pos + 2 != param_list.len() {
+            return Err(EvalError::Parse {
+                msg: "dot notation requires exactly one rest parameter".into(),
+            });
+        }
+        let params: Vec<String> = param_list[..pos]
+            .iter()
+            .map(|p| match p {
+                Value::Symbol(s) => Ok(s.clone()),
+                other => Err(EvalError::Parse {
+                    msg: format!("param must be a symbol, got {other}"),
+                }),
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        let Value::Symbol(rest) = &param_list[pos + 1] else {
+            return Err(EvalError::Parse {
+                msg: "rest parameter must be a symbol".into(),
+            });
+        };
+        Ok((params, Some(rest.clone())))
+    } else {
+        let params: Vec<String> = param_list
+            .iter()
+            .map(|p| match p {
+                Value::Symbol(s) => Ok(s.clone()),
+                other => Err(EvalError::Parse {
+                    msg: format!("param must be a symbol, got {other}"),
+                }),
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok((params, None))
+    }
+}
+
 fn eval_lambda(args: &[Value], env: &Env) -> Result<Value, EvalError> {
     if args.len() < 2 {
         return Err(EvalError::Parse {
@@ -265,18 +324,11 @@ fn eval_lambda(args: &[Value], env: &Env) -> Result<Value, EvalError> {
             msg: "lambda params must be a list".into(),
         });
     };
-    let params: Vec<String> = param_list
-        .iter()
-        .map(|p| match p {
-            Value::Symbol(s) => Ok(s.clone()),
-            other => Err(EvalError::Parse {
-                msg: format!("lambda param must be a symbol, got {other}"),
-            }),
-        })
-        .collect::<Result<Vec<_>, _>>()?;
+    let (params, rest_param) = parse_params(param_list)?;
     let body = args[1..].to_vec();
     Ok(Value::Lambda {
         params,
+        rest_param,
         body,
         env: env.clone(),
     })
@@ -309,18 +361,11 @@ fn eval_define(args: &[Value], env: &Env) -> Result<Value, EvalError> {
                     msg: "define function name must be a symbol".into(),
                 });
             };
-            let params: Vec<String> = name_and_params[1..]
-                .iter()
-                .map(|p| match p {
-                    Value::Symbol(s) => Ok(s.clone()),
-                    other => Err(EvalError::Parse {
-                        msg: format!("param must be a symbol, got {other}"),
-                    }),
-                })
-                .collect::<Result<Vec<_>, _>>()?;
+            let (params, rest_param) = parse_params(&name_and_params[1..])?;
             let body = args[1..].to_vec();
             let lambda = Value::Lambda {
                 params,
+                rest_param,
                 body,
                 env: env.clone(),
             };
@@ -376,15 +421,6 @@ fn expect_integer(val: &Value) -> Result<i64, EvalError> {
 
 fn is_falsy(val: &Value) -> bool {
     matches!(val, Value::Boolean(false))
-}
-
-fn is_builtin(name: &str) -> bool {
-    matches!(
-        name,
-        "+" | "-" | "*" | "/" | "<" | ">" | "=" | "<=" | "not" | "cons" | "car" | "cdr"
-            | "null?" | "list" | "length" | "string?" | "number?" | "boolean?" | "pair?"
-            | "symbol?"
-    )
 }
 
 fn call_builtin(name: &str, args: &[Value]) -> Result<Value, EvalError> {
@@ -616,5 +652,38 @@ fn builtin_length(name: &str, args: &[Value]) -> Result<Value, EvalError> {
             expected: "list".into(),
             got: other.to_string(),
         }),
+    }
+}
+
+fn builtin_apply(args: &[Value]) -> Result<TailAction, EvalError> {
+    if args.len() < 2 {
+        return Err(EvalError::ArityError {
+            name: "apply".into(),
+            expected: 2,
+            actual: args.len(),
+        });
+    }
+    let func = &args[0];
+    let last = &args[args.len() - 1];
+    let Value::List(tail_args) = last else {
+        return Err(EvalError::TypeError {
+            expected: "list".into(),
+            got: last.to_string(),
+        });
+    };
+    let mut combined = args[1..args.len() - 1].to_vec();
+    combined.extend(tail_args.iter().cloned());
+    apply_value_tail(func, &combined)
+}
+
+const BUILTIN_NAMES: &[&str] = &[
+    "+", "-", "*", "/", "<", ">", "=", "<=", "not", "cons", "car", "cdr",
+    "null?", "list", "length", "string?", "number?", "boolean?", "pair?",
+    "symbol?", "apply",
+];
+
+pub fn register_builtins(env: &Env) {
+    for &name in BUILTIN_NAMES {
+        env.define(name.into(), Value::Builtin { name: name.into() });
     }
 }
