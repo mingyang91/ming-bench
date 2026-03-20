@@ -7,6 +7,20 @@ const IMAGE_NAME: &str = "cs61a-bench";
 pub fn run(level: &str) -> Result<()> {
     let proj = project_dir();
 
+    // --- AST rules (always enforced) ---
+    let scheme_src = proj.join("bench/src/scheme");
+    let violations = crate::ast_check::check_ast_rules(&scheme_src);
+    if !violations.is_empty() {
+        eprintln!("ERROR: AST rule violations found:");
+        for v in &violations {
+            eprintln!("  {}:{}: {}", v.file, v.line, v.message);
+        }
+        return Err(Error::CommandFailed {
+            cmd: "AST rule check".to_string(),
+            exit_code: 1,
+        });
+    }
+
     // --- Quality gates (only when clippy.toml exists) ---
     let clippy_toml = proj.join("bench/clippy.toml");
     if clippy_toml.is_file() {
@@ -124,20 +138,6 @@ fn quality_gates(proj: &Path, level: &str) -> Result<()> {
     }
 
     restore();
-
-    // --- AST rule check ---
-    let scheme_src = proj.join("bench/src/scheme");
-    let violations = crate::ast_check::check_ast_rules(&scheme_src);
-    if !violations.is_empty() {
-        eprintln!("ERROR: AST rule violations found:");
-        for v in &violations {
-            eprintln!("  {}:{}: {}", v.file, v.line, v.message);
-        }
-        return Err(Error::CommandFailed {
-            cmd: "AST rule check".to_string(),
-            exit_code: 1,
-        });
-    }
 
     // --- mod.rs size check ---
     if level != "all" {

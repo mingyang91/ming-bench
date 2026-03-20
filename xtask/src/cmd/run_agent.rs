@@ -143,8 +143,16 @@ pub fn run(args: RunAgentArgs) -> Result<()> {
             .map_err(|e| Error::io(&agents_md, e))?;
         println!("Strategy:   {} → CLAUDE.md", strategy_src);
 
-        // --- Enable quality-gate feature if strategy uses clippy.toml ---
+        // --- Copy strategy-specific clippy.toml if it exists ---
+        let strategy_clippy = agent_workdir.join(format!("strategies/{}.clippy.toml", args.strategy));
         let clippy_toml = agent_workdir.join("clippy.toml");
+        if strategy_clippy.is_file() {
+            fs::copy(&strategy_clippy, &clippy_toml)
+                .map_err(|e| Error::io(&clippy_toml, e))?;
+            println!("Copied {}.clippy.toml → clippy.toml", args.strategy);
+        }
+
+        // --- Enable quality-gate feature if clippy.toml is present ---
         if clippy_toml.is_file() {
             let cargo_toml = agent_workdir.join("Cargo.toml");
             let content = fs::read_to_string(&cargo_toml)
