@@ -20,6 +20,7 @@ enum Value {
         body: Vec<Expr>,
         env: Env,
     },
+    Vector(Rc<RefCell<Vec<Value>>>),
     Builtin(String),
     Continuation {
         line: usize,
@@ -60,6 +61,7 @@ impl PartialEq for Value {
             (Value::Lambda { params: p1, body: b1, .. }, Value::Lambda { params: p2, body: b2, .. }) => {
                 p1 == p2 && b1 == b2
             }
+            (Value::Vector(a), Value::Vector(b)) => *a.borrow() == *b.borrow(),
             (Value::Builtin(a), Value::Builtin(b)) => a == b,
             (Value::Continuation { line: l1, col: c1, .. }, Value::Continuation { line: l2, col: c2, .. }) => {
                 l1 == l2 && c1 == c2
@@ -157,6 +159,10 @@ impl Value {
             Value::List(items) => {
                 let parts: Vec<String> = items.iter().map(|v| v.to_scheme_string()).collect();
                 format!("({})", parts.join(" "))
+            }
+            Value::Vector(v) => {
+                let items: Vec<String> = v.borrow().iter().map(|x| x.to_scheme_string()).collect();
+                format!("#({})", items.join(" "))
             }
             Value::Lambda { .. } => "#<procedure>".to_string(),
             Value::Builtin(name) => format!("#<builtin:{}>", name),
@@ -1277,6 +1283,7 @@ fn is_builtin_name(name: &str) -> bool {
             | "char-upper-case?" | "char-lower-case?"
             | "char-upcase" | "char-downcase"
             | "make-string" | "string"
+            | "vector" | "make-vector" | "vector-ref" | "vector-set!" | "vector?" | "vector-length" | "vector->list"
             | "display" | "write" | "newline"
             | "call/cc" | "call-with-current-continuation"
     )
@@ -1705,6 +1712,74 @@ fn call_builtin_values(
                 return Err(err_at("eq? requires 2 arguments", call_line, call_col));
             }
             Ok(Value::Boolean(eval_args[0] == eval_args[1]))
+        }
+        "vector" => {
+            Ok(Value::Vector(Rc::new(RefCell::new(eval_args))))
+        }
+        "make-vector" => {
+            if eval_args.len() < 1 || eval_args.len() > 2 {
+                return Err(err_at("make-vector requires 1 or 2 arguments", call_line, call_col));
+            }
+            let n = expect_integer(&eval_args[0], call_line, call_col)? as usize;
+            let fill = if eval_args.len() == 2 { eval_args[1].clone() } else { Value::Integer(0) };
+            Ok(Value::Vector(Rc::new(RefCell::new(vec![fill; n]))))
+        }
+        "vector-ref" => {
+            if eval_args.len() != 2 {
+                return Err(err_at("vector-ref requires 2 arguments", call_line, call_col));
+            }
+            match &eval_args[0] {
+                Value::Vector(v) => {
+                    let idx = expect_integer(&eval_args[1], call_line, call_col)? as usize;
+                    let borrowed = v.borrow();
+                    if idx >= borrowed.len() {
+                        return Err(err_at("vector-ref: index out of range", call_line, call_col));
+                    }
+                    Ok(borrowed[idx].clone())
+                }
+                _ => Err(err_at("vector-ref: first argument must be a vector", call_line, call_col)),
+            }
+        }
+        "vector-set!" => {
+            if eval_args.len() != 3 {
+                return Err(err_at("vector-set! requires 3 arguments", call_line, call_col));
+            }
+            match &eval_args[0] {
+                Value::Vector(v) => {
+                    let idx = expect_integer(&eval_args[1], call_line, call_col)? as usize;
+                    let mut borrowed = v.borrow_mut();
+                    if idx >= borrowed.len() {
+                        return Err(err_at("vector-set!: index out of range", call_line, call_col));
+                    }
+                    borrowed[idx] = eval_args[2].clone();
+                    Ok(Value::Symbol("".to_string()))
+                }
+                _ => Err(err_at("vector-set!: first argument must be a vector", call_line, call_col)),
+            }
+        }
+        "vector?" => {
+            if eval_args.len() != 1 {
+                return Err(err_at("vector? requires 1 argument", call_line, call_col));
+            }
+            Ok(Value::Boolean(matches!(eval_args[0], Value::Vector(_))))
+        }
+        "vector-length" => {
+            if eval_args.len() != 1 {
+                return Err(err_at("vector-length requires 1 argument", call_line, call_col));
+            }
+            match &eval_args[0] {
+                Value::Vector(v) => Ok(Value::Integer(v.borrow().len() as i64)),
+                _ => Err(err_at("vector-length: argument must be a vector", call_line, call_col)),
+            }
+        }
+        "vector->list" => {
+            if eval_args.len() != 1 {
+                return Err(err_at("vector->list requires 1 argument", call_line, call_col));
+            }
+            match &eval_args[0] {
+                Value::Vector(v) => Ok(Value::List(v.borrow().clone())),
+                _ => Err(err_at("vector->list: argument must be a vector", call_line, call_col)),
+            }
         }
         _ => Err(err_at(
             format!("unknown procedure: {}", name),
