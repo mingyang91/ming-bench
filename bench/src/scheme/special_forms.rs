@@ -3,7 +3,7 @@ use std::rc::Rc;
 use crate::scheme::env::Env;
 use crate::scheme::error::EvalError;
 use crate::scheme::value::Value;
-use crate::scheme::{eval, eval_body, extract_params, is_truthy};
+use crate::scheme::{eval, eval_body_tco, extract_params, is_truthy, Trampoline};
 
 /// Evaluate `(not expr)` — returns #t if expr is falsy, #f otherwise.
 pub(crate) fn eval_not(args: &[Value], env: &Rc<Env>) -> Result<Value, EvalError> {
@@ -90,8 +90,36 @@ pub(crate) fn eval_lambda(args: &[Value], env: &Rc<Env>) -> Result<Value, EvalEr
     })
 }
 
-/// Evaluate `(let ((var expr) ...) body...)`.
-pub(crate) fn eval_let(args: &[Value], env: &Rc<Env>) -> Result<Value, EvalError> {
+/// Evaluate `(if cond then else?)` — TCO: returns Bounce for the chosen branch.
+pub(crate) fn eval_if_tco(args: &[Value], env: &Rc<Env>) -> Result<Trampoline, EvalError> {
+    match args {
+        [cond, consequent, alternate] => {
+            let branch = if is_truthy(&eval(cond, env)?) {
+                consequent
+            } else {
+                alternate
+            };
+            Ok(Trampoline::Bounce {
+                expr: branch.clone(),
+                env: Rc::clone(env),
+            })
+        }
+        [cond, consequent] => {
+            if is_truthy(&eval(cond, env)?) {
+                Ok(Trampoline::Bounce {
+                    expr: consequent.clone(),
+                    env: Rc::clone(env),
+                })
+            } else {
+                Ok(Trampoline::Done(Value::Void))
+            }
+        }
+        _ => Err(EvalError::BadSyntax { form: "if".into() }),
+    }
+}
+
+/// Evaluate `(let ...) ` — TCO: last body expression is a Bounce.
+pub(crate) fn eval_let_tco(args: &[Value], env: &Rc<Env>) -> Result<Trampoline, EvalError> {
     let [Value::List(bindings), body @ ..] = args else {
         return Err(EvalError::BadSyntax {
             form: "let".into(),
@@ -117,11 +145,11 @@ pub(crate) fn eval_let(args: &[Value], env: &Rc<Env>) -> Result<Value, EvalError
         let val = eval(expr, env)?;
         child.set(name.clone(), val);
     }
-    eval_body(body, &child)
+    eval_body_tco(body, &child)
 }
 
-/// Evaluate `(cond (test expr ...) ... (else expr ...))`.
-pub(crate) fn eval_cond(clauses: &[Value], env: &Rc<Env>) -> Result<Value, EvalError> {
+/// Evaluate `(cond ...)` — TCO: matching clause body tail is a Bounce.
+pub(crate) fn eval_cond_tco(clauses: &[Value], env: &Rc<Env>) -> Result<Trampoline, EvalError> {
     for clause in clauses {
         let Value::List(parts) = clause else {
             return Err(EvalError::BadSyntax {
@@ -134,34 +162,17 @@ pub(crate) fn eval_cond(clauses: &[Value], env: &Rc<Env>) -> Result<Value, EvalE
             });
         };
         if matches!(test, Value::Symbol(s) if s == "else") {
-            return eval_body(body, env);
+            return eval_body_tco(body, env);
         }
         let val = eval(test, env)?;
         if !is_truthy(&val) {
             continue;
         }
-        return if body.is_empty() { Ok(val) } else { eval_body(body, env) };
+        return if body.is_empty() {
+            Ok(Trampoline::Done(val))
+        } else {
+            eval_body_tco(body, env)
+        };
     }
-    Ok(Value::Void)
-}
-
-/// Evaluate `(if cond then else?)`.
-pub(crate) fn eval_if(args: &[Value], env: &Rc<Env>) -> Result<Value, EvalError> {
-    match args {
-        [cond, consequent, alternate] => {
-            if is_truthy(&eval(cond, env)?) {
-                eval(consequent, env)
-            } else {
-                eval(alternate, env)
-            }
-        }
-        [cond, consequent] => {
-            if is_truthy(&eval(cond, env)?) {
-                eval(consequent, env)
-            } else {
-                Ok(Value::Void)
-            }
-        }
-        _ => Err(EvalError::BadSyntax { form: "if".into() }),
-    }
+    Ok(Trampoline::Done(Value::Void))
 }

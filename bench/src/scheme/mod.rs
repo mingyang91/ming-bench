@@ -1,6 +1,7 @@
 mod builtins;
 pub mod env;
 pub mod error;
+mod io_ops;
 mod list_ops;
 pub mod parser;
 mod special_forms;
@@ -17,8 +18,10 @@ use string_ops::{
     eval_string_to_list, eval_string_to_number, eval_string_to_symbol, eval_substring,
     eval_symbol_to_string,
 };
+use io_ops::{eval_display, eval_map, eval_newline, eval_write};
 use special_forms::{
-    eval_and, eval_cond, eval_define, eval_if, eval_lambda, eval_let, eval_not, eval_or,
+    eval_and, eval_cond_tco, eval_define, eval_if_tco, eval_lambda, eval_let_tco, eval_not,
+    eval_or,
 };
 use std::rc::Rc;
 use value::Value;
@@ -39,8 +42,30 @@ fn extract_params(params: &[Value], form: &str) -> Result<Vec<String>, EvalError
         .collect()
 }
 
-/// Apply a lambda to evaluated arguments.
-fn apply_lambda(func: Value, args: &[Value]) -> Result<Value, EvalError> {
+/// Result of evaluating in a tail-position-aware manner.
+/// `Bounce` signals a tail call that should be continued by the trampoline.
+pub(crate) enum Trampoline {
+    Done(Value),
+    Bounce { expr: Value, env: Rc<Env> },
+}
+
+/// Evaluate a sequence of expressions. All but the last are evaluated for
+/// side effects; the last is returned as a `Trampoline` for TCO.
+pub(crate) fn eval_body_tco(exprs: &[Value], env: &Rc<Env>) -> Result<Trampoline, EvalError> {
+    let [init @ .., last] = exprs else {
+        return Ok(Trampoline::Done(Value::Void));
+    };
+    for expr in init {
+        eval(expr, env)?;
+    }
+    Ok(Trampoline::Bounce {
+        expr: last.clone(),
+        env: Rc::clone(env),
+    })
+}
+
+/// Apply a lambda, returning a Trampoline for TCO.
+fn apply_lambda_tco(func: Value, args: &[Value]) -> Result<Trampoline, EvalError> {
     let Value::Lambda { params, body, env } = func else {
         return Err(EvalError::NotAProcedure {
             value: format!("{func}"),
@@ -56,154 +81,146 @@ fn apply_lambda(func: Value, args: &[Value]) -> Result<Value, EvalError> {
     for (param, arg) in params.iter().zip(args) {
         child.set(param.clone(), arg.clone());
     }
-    eval_body(&body, &child)
+    eval_body_tco(&body, &child)
 }
 
-/// Evaluate a sequence of expressions, returning the last result.
-fn eval_body(exprs: &[Value], env: &Rc<Env>) -> Result<Value, EvalError> {
-    exprs
-        .iter()
-        .try_fold(Value::Void, |_, expr| eval(expr, env))
+/// Apply a lambda to evaluated arguments (non-TCO, for use in non-tail contexts).
+pub(crate) fn apply_lambda(func: Value, args: &[Value]) -> Result<Value, EvalError> {
+    match apply_lambda_tco(func, args)? {
+        Trampoline::Done(v) => Ok(v),
+        Trampoline::Bounce { expr, env } => eval(&expr, &env),
+    }
 }
 
 /// Evaluate a single parsed Scheme value.
-pub(crate) fn eval(expr: &Value, env: &Rc<Env>) -> Result<Value, EvalError> {
-    match expr {
-        Value::Integer(_) | Value::Boolean(_) | Value::String(_) | Value::Char(_) | Value::Void => Ok(expr.clone()),
-        Value::Lambda { .. } => Ok(expr.clone()),
-        Value::Symbol(name) => env
-            .get(name)
-            .ok_or_else(|| EvalError::UnboundVariable { name: name.clone() }),
-        Value::List(elements) => {
-            let [operator, args @ ..] = elements.as_slice() else {
-                return Err(EvalError::EmptyList);
-            };
-            match operator {
-                Value::Symbol(op) if op == "quote" => match args {
-                    [datum] => Ok(datum.clone()),
-                    _ => Err(EvalError::BadSyntax {
-                        form: "quote".into(),
-                    }),
-                },
-                Value::Symbol(op) if op == "if" => eval_if(args, env),
-                Value::Symbol(op) if op == "define" => eval_define(args, env),
-                Value::Symbol(op) if op == "lambda" => eval_lambda(args, env),
-                Value::Symbol(op) if matches!(op.as_str(), "+" | "-" | "*" | "/") => {
-                    let evaluated: Vec<Value> =
-                        args.iter().map(|a| eval(a, env)).collect::<Result<_, _>>()?;
-                    apply_arithmetic(op, &evaluated)
-                }
-                Value::Symbol(op)
-                    if matches!(op.as_str(), "<" | ">" | "=" | "<=" | ">=") =>
-                {
-                    let evaluated: Vec<Value> =
-                        args.iter().map(|a| eval(a, env)).collect::<Result<_, _>>()?;
-                    apply_comparison(op, &evaluated)
-                }
-                Value::Symbol(op) if op == "let" => eval_let(args, env),
-                Value::Symbol(op) if op == "begin" => eval_body(args, env),
-                Value::Symbol(op) if op == "cond" => eval_cond(args, env),
-                Value::Symbol(op) if op == "not" => eval_not(args, env),
-                Value::Symbol(op) if op == "and" => eval_and(args, env),
-                Value::Symbol(op) if op == "or" => eval_or(args, env),
-                Value::Symbol(op) if op == "cons" => eval_cons(args, env),
-                Value::Symbol(op) if op == "car" => eval_car(args, env),
-                Value::Symbol(op) if op == "cdr" => eval_cdr(args, env),
-                Value::Symbol(op) if op == "null?" => eval_null_q(args, env),
-                Value::Symbol(op) if op == "list" => eval_list(args, env),
-                Value::Symbol(op) if op == "length" => eval_length(args, env),
-                Value::Symbol(op)
-                    if matches!(
-                        op.as_str(),
-                        "string?" | "number?" | "boolean?" | "pair?" | "symbol?" | "char?"
-                    ) =>
-                {
-                    eval_type_pred(op, args, env)
-                }
-                Value::Symbol(op) if op == "string-append" => eval_string_append(args, env),
-                Value::Symbol(op) if op == "string-length" => eval_string_length(args, env),
-                Value::Symbol(op) if op == "substring" => eval_substring(args, env),
-                Value::Symbol(op) if op == "string->number" => eval_string_to_number(args, env),
-                Value::Symbol(op) if op == "number->string" => eval_number_to_string(args, env),
-                Value::Symbol(op) if op == "symbol->string" => eval_symbol_to_string(args, env),
-                Value::Symbol(op) if op == "string->symbol" => eval_string_to_symbol(args, env),
-                Value::Symbol(op) if op == "string-ref" => eval_string_ref(args, env),
-                Value::Symbol(op) if op == "string-copy" => eval_string_copy(args, env),
-                Value::Symbol(op) if op == "string-set!" => eval_string_set(args, env),
-                Value::Symbol(op) if op == "string->list" => eval_string_to_list(args, env),
-                Value::Symbol(op) if op == "list->string" => eval_list_to_string(args, env),
-                Value::Symbol(op) if op == "char->integer" => eval_char_to_integer(args, env),
-                Value::Symbol(op) if op == "integer->char" => eval_integer_to_char(args, env),
-                Value::Symbol(op) if op == "map" => eval_map(args, env),
-                Value::Symbol(op) if op == "display" => eval_display(args, env),
-                Value::Symbol(op) if op == "write" => eval_write(args, env),
-                Value::Symbol(op) if op == "newline" => eval_newline(args, env),
-                _ => {
-                    let func = eval(operator, env)?;
-                    let evaluated_args: Vec<Value> =
-                        args.iter().map(|a| eval(a, env)).collect::<Result<_, _>>()?;
-                    apply_lambda(func, &evaluated_args)
-                }
+/// Uses a trampoline loop for tail-call optimization.
+pub(crate) fn eval(start_expr: &Value, start_env: &Rc<Env>) -> Result<Value, EvalError> {
+    let mut current_expr = start_expr.clone();
+    let mut current_env = Rc::clone(start_env);
+
+    loop {
+        let result = eval_inner(&current_expr, &current_env)?;
+        match result {
+            Trampoline::Done(val) => return Ok(val),
+            Trampoline::Bounce { expr, env } => {
+                current_expr = expr;
+                current_env = env;
             }
         }
     }
 }
 
-fn eval_map(args: &[Value], env: &Rc<Env>) -> Result<Value, EvalError> {
-    let [func_expr, list_expr] = args else {
-        return Err(EvalError::WrongArgCount {
-            expected: "2".into(),
-            got: args.len(),
-        });
-    };
-    let func = eval(func_expr, env)?;
-    let list_val = eval(list_expr, env)?;
-    let Value::List(elems) = list_val else {
-        return Err(EvalError::TypeError {
-            expected: "list".into(),
-            got: format!("{list_val}"),
-        });
-    };
-    let results: Vec<Value> = elems
-        .iter()
-        .map(|e| apply_lambda(func.clone(), std::slice::from_ref(e)))
-        .collect::<Result<_, _>>()?;
-    Ok(Value::List(results))
-}
-
-fn eval_display(args: &[Value], env: &Rc<Env>) -> Result<Value, EvalError> {
-    let [arg] = args else {
-        return Err(EvalError::WrongArgCount {
-            expected: "1".into(),
-            got: args.len(),
-        });
-    };
-    let val = eval(arg, env)?;
-    env.write_output(&val.display_str());
-    Ok(Value::Void)
-}
-
-fn eval_write(args: &[Value], env: &Rc<Env>) -> Result<Value, EvalError> {
-    let [arg] = args else {
-        return Err(EvalError::WrongArgCount {
-            expected: "1".into(),
-            got: args.len(),
-        });
-    };
-    let val = eval(arg, env)?;
-    env.write_output(&val.write_str());
-    Ok(Value::Void)
-}
-
-fn eval_newline(args: &[Value], env: &Rc<Env>) -> Result<Value, EvalError> {
-    if !args.is_empty() {
-        return Err(EvalError::WrongArgCount {
-            expected: "0".into(),
-            got: args.len(),
-        });
+/// Inner eval that returns Trampoline — tail positions return Bounce.
+fn eval_inner(expr: &Value, env: &Rc<Env>) -> Result<Trampoline, EvalError> {
+    match expr {
+        Value::Integer(_) | Value::Boolean(_) | Value::String(_) | Value::Char(_) | Value::Void => {
+            Ok(Trampoline::Done(expr.clone()))
+        }
+        Value::Lambda { .. } => Ok(Trampoline::Done(expr.clone())),
+        Value::Symbol(name) => env
+            .get(name)
+            .map(Trampoline::Done)
+            .ok_or_else(|| EvalError::UnboundVariable { name: name.clone() }),
+        Value::List(elements) => eval_list_form(elements, env),
     }
-    env.write_output("\n");
-    Ok(Value::Void)
+}
+
+/// Evaluate a list form (function application or special form).
+fn eval_list_form(elements: &[Value], env: &Rc<Env>) -> Result<Trampoline, EvalError> {
+    let [operator, args @ ..] = elements else {
+        return Err(EvalError::EmptyList);
+    };
+    match operator {
+        Value::Symbol(op) if op == "quote" => match args {
+            [datum] => Ok(Trampoline::Done(datum.clone())),
+            _ => Err(EvalError::BadSyntax {
+                form: "quote".into(),
+            }),
+        },
+        Value::Symbol(op) if op == "if" => eval_if_tco(args, env),
+        Value::Symbol(op) if op == "define" => eval_define(args, env).map(Trampoline::Done),
+        Value::Symbol(op) if op == "lambda" => eval_lambda(args, env).map(Trampoline::Done),
+        Value::Symbol(op) if matches!(op.as_str(), "+" | "-" | "*" | "/") => {
+            let evaluated: Vec<Value> =
+                args.iter().map(|a| eval(a, env)).collect::<Result<_, _>>()?;
+            apply_arithmetic(op, &evaluated).map(Trampoline::Done)
+        }
+        Value::Symbol(op) if matches!(op.as_str(), "<" | ">" | "=" | "<=" | ">=") => {
+            let evaluated: Vec<Value> =
+                args.iter().map(|a| eval(a, env)).collect::<Result<_, _>>()?;
+            apply_comparison(op, &evaluated).map(Trampoline::Done)
+        }
+        Value::Symbol(op) if op == "let" => eval_let_tco(args, env),
+        Value::Symbol(op) if op == "begin" => eval_body_tco(args, env),
+        Value::Symbol(op) if op == "cond" => eval_cond_tco(args, env),
+        Value::Symbol(op) if op == "not" => eval_not(args, env).map(Trampoline::Done),
+        Value::Symbol(op) if op == "and" => eval_and(args, env).map(Trampoline::Done),
+        Value::Symbol(op) if op == "or" => eval_or(args, env).map(Trampoline::Done),
+        Value::Symbol(op) if op == "cons" => eval_cons(args, env).map(Trampoline::Done),
+        Value::Symbol(op) if op == "car" => eval_car(args, env).map(Trampoline::Done),
+        Value::Symbol(op) if op == "cdr" => eval_cdr(args, env).map(Trampoline::Done),
+        Value::Symbol(op) if op == "null?" => eval_null_q(args, env).map(Trampoline::Done),
+        Value::Symbol(op) if op == "list" => eval_list(args, env).map(Trampoline::Done),
+        Value::Symbol(op) if op == "length" => eval_length(args, env).map(Trampoline::Done),
+        Value::Symbol(op)
+            if matches!(
+                op.as_str(),
+                "string?" | "number?" | "boolean?" | "pair?" | "symbol?" | "char?"
+            ) =>
+        {
+            eval_type_pred(op, args, env).map(Trampoline::Done)
+        }
+        Value::Symbol(op) if op == "string-append" => {
+            eval_string_append(args, env).map(Trampoline::Done)
+        }
+        Value::Symbol(op) if op == "string-length" => {
+            eval_string_length(args, env).map(Trampoline::Done)
+        }
+        Value::Symbol(op) if op == "substring" => eval_substring(args, env).map(Trampoline::Done),
+        Value::Symbol(op) if op == "string->number" => {
+            eval_string_to_number(args, env).map(Trampoline::Done)
+        }
+        Value::Symbol(op) if op == "number->string" => {
+            eval_number_to_string(args, env).map(Trampoline::Done)
+        }
+        Value::Symbol(op) if op == "symbol->string" => {
+            eval_symbol_to_string(args, env).map(Trampoline::Done)
+        }
+        Value::Symbol(op) if op == "string->symbol" => {
+            eval_string_to_symbol(args, env).map(Trampoline::Done)
+        }
+        Value::Symbol(op) if op == "string-ref" => {
+            eval_string_ref(args, env).map(Trampoline::Done)
+        }
+        Value::Symbol(op) if op == "string-copy" => {
+            eval_string_copy(args, env).map(Trampoline::Done)
+        }
+        Value::Symbol(op) if op == "string-set!" => {
+            eval_string_set(args, env).map(Trampoline::Done)
+        }
+        Value::Symbol(op) if op == "string->list" => {
+            eval_string_to_list(args, env).map(Trampoline::Done)
+        }
+        Value::Symbol(op) if op == "list->string" => {
+            eval_list_to_string(args, env).map(Trampoline::Done)
+        }
+        Value::Symbol(op) if op == "char->integer" => {
+            eval_char_to_integer(args, env).map(Trampoline::Done)
+        }
+        Value::Symbol(op) if op == "integer->char" => {
+            eval_integer_to_char(args, env).map(Trampoline::Done)
+        }
+        Value::Symbol(op) if op == "map" => eval_map(args, env).map(Trampoline::Done),
+        Value::Symbol(op) if op == "display" => eval_display(args, env).map(Trampoline::Done),
+        Value::Symbol(op) if op == "write" => eval_write(args, env).map(Trampoline::Done),
+        Value::Symbol(op) if op == "newline" => eval_newline(args, env).map(Trampoline::Done),
+        _ => {
+            let func = eval(operator, env)?;
+            let evaluated_args: Vec<Value> =
+                args.iter().map(|a| eval(a, env)).collect::<Result<_, _>>()?;
+            apply_lambda_tco(func, &evaluated_args)
+        }
+    }
 }
 
 /// Evaluate one or more Scheme expressions and return the string
