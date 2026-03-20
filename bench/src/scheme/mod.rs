@@ -2,6 +2,8 @@ pub mod error;
 
 pub use error::EvalError;
 
+use std::collections::HashMap;
+
 #[derive(Debug, Clone, PartialEq)]
 enum Value {
     Integer(i64),
@@ -10,6 +12,8 @@ enum Value {
     Symbol(String),
     List(Vec<Value>),
 }
+
+type Env = HashMap<String, Value>;
 
 impl Value {
     fn to_scheme_string(&self) -> String {
@@ -91,8 +95,15 @@ fn parse_list(input: &str) -> Result<(Value, &str), EvalError> {
     }
 }
 
-fn eval(val: Value) -> Result<Value, EvalError> {
+fn eval(val: Value, env: &mut Env) -> Result<Value, EvalError> {
     match val {
+        Value::Symbol(name) => {
+            if let Some(v) = env.get(&name) {
+                Ok(v.clone())
+            } else {
+                Err(EvalError::Parse(format!("undefined variable: {}", name)))
+            }
+        }
         Value::List(items) => {
             if items.is_empty() {
                 return Err(EvalError::Parse("empty application".to_string()));
@@ -100,13 +111,42 @@ fn eval(val: Value) -> Result<Value, EvalError> {
             let func = &items[0];
             match func {
                 Value::Symbol(name) => {
-                    // Special forms with short-circuit semantics
                     match name.as_str() {
-                        "and" => return eval_and(&items[1..]),
-                        "or" => return eval_or(&items[1..]),
-                        _ => {}
+                        "define" => {
+                            if items.len() != 3 {
+                                return Err(EvalError::Parse("define requires 2 arguments".to_string()));
+                            }
+                            let sym = match &items[1] {
+                                Value::Symbol(s) => s.clone(),
+                                _ => return Err(EvalError::Parse("define: first argument must be a symbol".to_string())),
+                            };
+                            let val = eval(items[2].clone(), env)?;
+                            env.insert(sym, val);
+                            Ok(Value::Symbol("".to_string())) // define returns unspecified
+                        }
+                        "if" => {
+                            if items.len() < 3 || items.len() > 4 {
+                                return Err(EvalError::Parse("if requires 2 or 3 arguments".to_string()));
+                            }
+                            let cond = eval(items[1].clone(), env)?;
+                            if !is_falsy(&cond) {
+                                eval(items[2].clone(), env)
+                            } else if items.len() == 4 {
+                                eval(items[3].clone(), env)
+                            } else {
+                                Ok(Value::Symbol("".to_string())) // unspecified
+                            }
+                        }
+                        "quote" => {
+                            if items.len() != 2 {
+                                return Err(EvalError::Parse("quote requires 1 argument".to_string()));
+                            }
+                            Ok(items[1].clone())
+                        }
+                        "and" => return eval_and(&items[1..], env),
+                        "or" => return eval_or(&items[1..], env),
+                        _ => apply_builtin(name, &items[1..], env),
                     }
-                    apply_builtin(name, &items[1..])
                 }
                 _ => Err(EvalError::Parse(format!(
                     "not a procedure: {}",
@@ -118,8 +158,11 @@ fn eval(val: Value) -> Result<Value, EvalError> {
     }
 }
 
-fn apply_builtin(name: &str, args: &[Value]) -> Result<Value, EvalError> {
-    let eval_args: Vec<Value> = args.iter().map(|a| eval(a.clone())).collect::<Result<_, _>>()?;
+fn apply_builtin(name: &str, args: &[Value], env: &mut Env) -> Result<Value, EvalError> {
+    let mut eval_args = Vec::with_capacity(args.len());
+    for a in args {
+        eval_args.push(eval(a.clone(), env)?);
+    }
     match name {
         "+" => {
             let mut sum: i64 = 0;
@@ -200,13 +243,13 @@ fn is_falsy(val: &Value) -> bool {
     matches!(val, Value::Boolean(false))
 }
 
-fn eval_and(args: &[Value]) -> Result<Value, EvalError> {
+fn eval_and(args: &[Value], env: &mut Env) -> Result<Value, EvalError> {
     if args.is_empty() {
         return Ok(Value::Boolean(true));
     }
     let mut result = Value::Boolean(true);
     for arg in args {
-        result = eval(arg.clone())?;
+        result = eval(arg.clone(), env)?;
         if is_falsy(&result) {
             return Ok(result);
         }
@@ -214,13 +257,13 @@ fn eval_and(args: &[Value]) -> Result<Value, EvalError> {
     Ok(result)
 }
 
-fn eval_or(args: &[Value]) -> Result<Value, EvalError> {
+fn eval_or(args: &[Value], env: &mut Env) -> Result<Value, EvalError> {
     if args.is_empty() {
         return Ok(Value::Boolean(false));
     }
     let mut result = Value::Boolean(false);
     for arg in args {
-        result = eval(arg.clone())?;
+        result = eval(arg.clone(), env)?;
         if !is_falsy(&result) {
             return Ok(result);
         }
@@ -243,9 +286,10 @@ fn expect_integer(val: &Value) -> Result<i64, EvalError> {
 pub fn eval_str(input: &str) -> Result<String, EvalError> {
     let mut remaining = input;
     let mut last_value = None;
+    let mut env = Env::new();
     while !remaining.trim().is_empty() {
         let (val, rest) = parse_expr(remaining)?;
-        last_value = Some(eval(val)?);
+        last_value = Some(eval(val, &mut env)?);
         remaining = rest;
     }
     match last_value {
