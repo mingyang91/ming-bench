@@ -1,5 +1,7 @@
 #![cfg_attr(feature = "quality-gate", deny(warnings))]
 #![cfg_attr(feature = "quality-gate", deny(clippy::unwrap_used))]
+#![cfg_attr(feature = "quality-gate", deny(clippy::result_unit_err))]
+#![cfg_attr(feature = "quality-gate", deny(clippy::manual_assert))]
 #![cfg_attr(feature = "quality-gate", warn(clippy::too_many_lines))]
 #![cfg_attr(feature = "quality-gate", warn(clippy::excessive_nesting))]
 #![cfg_attr(feature = "quality-gate", warn(clippy::manual_filter_map))]

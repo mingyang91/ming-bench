@@ -5,6 +5,7 @@ Implement a Scheme interpreter in Rust. Read `SPEC.md` for the full specificatio
 ## Contract
 
 - Implement `eval_str` in `src/scheme/mod.rs`
+- Add error variants to `EvalError` in `src/scheme/error.rs` as needed
 - You may create any additional modules/files under `src/scheme/`
 - Do NOT modify test functions
 - Allowed external crates: `thiserror`, `log`, `env_logger` (already in Cargo.toml). Do NOT add any others.
