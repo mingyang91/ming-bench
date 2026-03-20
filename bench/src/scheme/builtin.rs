@@ -21,9 +21,10 @@ pub(crate) enum Builtin {
     PairPredicate,
     SymbolPredicate,
     Apply,
+    CallCc,
 }
 
-pub(crate) const BUILTINS: [(&str, Builtin); 21] = [
+pub(crate) const BUILTINS: [(&str, Builtin); 22] = [
     ("+", Builtin::Add),
     ("-", Builtin::Subtract),
     ("*", Builtin::Multiply),
@@ -45,4 +46,5 @@ pub(crate) const BUILTINS: [(&str, Builtin); 21] = [
     ("pair?", Builtin::PairPredicate),
     ("symbol?", Builtin::SymbolPredicate),
     ("apply", Builtin::Apply),
+    ("call/cc", Builtin::CallCc),
 ];

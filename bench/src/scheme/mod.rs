@@ -1,4 +1,5 @@
 mod builtin;
+mod continuation;
 mod environment;
 mod error;
 mod evaluator;

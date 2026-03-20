@@ -2,6 +2,7 @@ use std::fmt::{self, Display, Formatter};
 use std::rc::Rc;
 
 use crate::scheme::builtin::Builtin;
+use crate::scheme::continuation::Continuation;
 use crate::scheme::environment::Environment;
 use crate::scheme::parser::Expr;
 use crate::scheme::procedure::{Parameters, Procedure};
@@ -16,6 +17,7 @@ pub(crate) enum Value {
     Pair(Box<Pair>),
     Builtin(Builtin),
     Procedure(Rc<Procedure>),
+    Continuation(Rc<Continuation>),
     Void,
 }
 
@@ -45,6 +47,10 @@ impl Value {
         environment: Environment,
     ) -> Self {
         Self::Procedure(Rc::new(Procedure::new(parameters, body, environment)))
+    }
+
+    pub(crate) fn continuation(continuation: Continuation) -> Self {
+        Self::Continuation(Rc::new(continuation))
     }
 
     pub(crate) fn pair(car: Value, cdr: Value) -> Self {
@@ -129,6 +135,7 @@ impl Value {
             Self::Pair(_) => "pair",
             Self::Builtin(_) => "procedure",
             Self::Procedure(_) => "procedure",
+            Self::Continuation(_) => "procedure",
             Self::Void => "void",
         }
     }
@@ -165,6 +172,7 @@ impl Display for Value {
             Self::Pair(pair) => write_pair(pair, f),
             Self::Builtin(_) => f.write_str("#<procedure>"),
             Self::Procedure(_) => f.write_str("#<procedure>"),
+            Self::Continuation(_) => f.write_str("#<procedure>"),
             Self::Void => f.write_str("#<void>"),
         }
     }

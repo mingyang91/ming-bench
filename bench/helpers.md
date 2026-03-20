@@ -10,7 +10,11 @@ Canonical registry of extracted helpers (>= 5 ops).
 
 ## Rust Helpers (src/scheme/)
 
-(none yet)
+### start_sequence (src/scheme/evaluator.rs:52) — Schedule left-to-right sequence evaluation while preserving tail position for the final expression
+### continue_cond (src/scheme/evaluator.rs:322) — Advance through validated `cond` clauses with resumable predicate evaluation
+### finish_apply_arguments (src/scheme/evaluator.rs:775) — Resume a pending callable application after one argument value has been produced
+### finish_let_bindings (src/scheme/evaluator.rs:802) — Resume `let` binding evaluation and enter the body once all values are ready
+### start_argument_evaluation (src/scheme/evaluator.rs:882) — Evaluate application arguments right-to-left into continuation frames that `call/cc` can capture
 
 ## Python Helpers (scripts/)
 

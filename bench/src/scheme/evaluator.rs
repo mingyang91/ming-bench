@@ -2,16 +2,16 @@ use std::collections::HashSet;
 use std::rc::Rc;
 
 use crate::scheme::builtin::{Builtin, BUILTINS};
+use crate::scheme::continuation::{Continuation, Frame, LetBinding};
 use crate::scheme::environment::Environment;
 use crate::scheme::error::SchemeError;
 use crate::scheme::parser::{self, Expr};
 use crate::scheme::procedure::{Parameters, Procedure};
 use crate::scheme::value::Value;
 
-enum EvalStep<'expr> {
+enum MachineState {
+    Expression(Expr, Environment),
     Value(Value),
-    Expression(&'expr Expr, Environment),
-    Procedure(Rc<Procedure>, Environment),
 }
 
 pub(crate) fn eval_str(input: &str) -> Result<String, SchemeError> {
@@ -33,104 +33,127 @@ fn define_builtins(environment: &Environment) {
 }
 
 fn eval_sequence(expressions: &[Expr], environment: &Environment) -> Result<Value, SchemeError> {
-    let Some((last_expression, _)) = expressions.split_last() else {
-        return Err(SchemeError::EmptyInput);
-    };
-
-    eval_leading_expressions(expressions, environment)?;
-    eval_expr(last_expression, environment)
-}
-
-fn eval_expr(expression: &Expr, environment: &Environment) -> Result<Value, SchemeError> {
-    let mut current_expression = expression;
-    let mut current_environment = environment.clone();
-    let mut procedure_anchor = Vec::new();
+    let mut stack = Vec::new();
+    let mut state = start_sequence(expressions.to_vec(), environment.clone(), &mut stack)?;
 
     loop {
-        if let Some(value) = Value::from_literal(current_expression) {
-            return Ok(value);
-        }
-
-        let step = match current_expression {
-            Expr::Symbol(name) => EvalStep::Value(
-                current_environment
-                    .get(name)
-                    .ok_or_else(|| SchemeError::UnboundSymbol { name: name.clone() })?,
-            ),
-            Expr::List(expressions) => eval_application(expressions, &current_environment)?,
-            Expr::Integer(_) | Expr::Boolean(_) | Expr::String(_) => unreachable!(),
+        state = match state {
+            MachineState::Expression(expression, environment) => {
+                eval_expression(expression, environment, &mut stack)?
+            }
+            MachineState::Value(value) => match stack.pop() {
+                Some(frame) => continue_from_frame(frame, value, &mut stack)?,
+                None => return Ok(value),
+            },
         };
+    }
+}
 
-        match step {
-            EvalStep::Value(value) => return Ok(value),
-            EvalStep::Expression(expression, environment) => {
-                current_expression = expression;
-                current_environment = environment;
-            }
-            EvalStep::Procedure(procedure, environment) => {
-                current_environment = environment;
-                procedure_anchor.clear();
-                procedure_anchor.push(procedure);
-                current_expression = current_procedure_expression(&procedure_anchor);
-            }
+fn start_sequence(
+    expressions: Vec<Expr>,
+    environment: Environment,
+    stack: &mut Vec<Frame>,
+) -> Result<MachineState, SchemeError> {
+    let Some((first_expression, remaining)) = expressions.split_first() else {
+        unreachable!("sequences are validated before evaluation");
+    };
+
+    if !remaining.is_empty() {
+        stack.push(Frame::Sequence {
+            remaining: remaining.to_vec(),
+            environment: environment.clone(),
+        });
+    }
+
+    Ok(MachineState::Expression(
+        first_expression.clone(),
+        environment,
+    ))
+}
+
+fn eval_expression(
+    expression: Expr,
+    environment: Environment,
+    stack: &mut Vec<Frame>,
+) -> Result<MachineState, SchemeError> {
+    if let Some(value) = Value::from_literal(&expression) {
+        return Ok(MachineState::Value(value));
+    }
+
+    match expression {
+        Expr::Symbol(name) => Ok(MachineState::Value(
+            environment
+                .get(&name)
+                .ok_or(SchemeError::UnboundSymbol { name })?,
+        )),
+        Expr::List(expressions) => eval_application(expressions, environment, stack),
+        Expr::Integer(_) | Expr::Boolean(_) | Expr::String(_) => {
+            unreachable!("literal expressions are handled before matching")
         }
     }
 }
 
-fn current_procedure_expression(procedures: &[Rc<Procedure>]) -> &Expr {
-    let Some(procedure) = procedures.last() else {
-        unreachable!("procedure anchors are stored before use");
+fn eval_application(
+    expressions: Vec<Expr>,
+    environment: Environment,
+    stack: &mut Vec<Frame>,
+) -> Result<MachineState, SchemeError> {
+    let Some((operator, operands)) = expressions.split_first() else {
+        return Err(SchemeError::EmptyApplication);
     };
-    let Some(expression) = procedure.body().last() else {
-        unreachable!("procedures are created with non-empty bodies");
-    };
-    expression
-}
-
-fn eval_application<'expr>(
-    expressions: &'expr [Expr],
-    environment: &Environment,
-) -> Result<EvalStep<'expr>, SchemeError> {
-    let (operator, operands) = expressions
-        .split_first()
-        .ok_or(SchemeError::EmptyApplication)?;
 
     if let Expr::Symbol(name) = operator {
-        if let Some(value) = eval_special_form(name, operands, environment)? {
-            return Ok(value);
+        if let Some(state) = eval_special_form(name, operands, &environment, stack)? {
+            return Ok(state);
         }
     }
 
-    let callable = eval_expr(operator, environment)?;
-    apply_callable(callable, operands, environment)
+    stack.push(Frame::ApplyOperator {
+        operands: operands.to_vec(),
+        environment: environment.clone(),
+    });
+
+    Ok(MachineState::Expression(operator.clone(), environment))
 }
 
-fn eval_special_form<'expr>(
+fn eval_special_form(
     operator: &str,
-    operands: &'expr [Expr],
+    operands: &[Expr],
     environment: &Environment,
-) -> Result<Option<EvalStep<'expr>>, SchemeError> {
+    stack: &mut Vec<Frame>,
+) -> Result<Option<MachineState>, SchemeError> {
     match operator {
-        "define" => eval_define(operands, environment).map(|value| Some(EvalStep::Value(value))),
-        "set!" => eval_set(operands, environment).map(|value| Some(EvalStep::Value(value))),
-        "if" => eval_if(operands, environment).map(Some),
-        "quote" => eval_quote(operands).map(|value| Some(EvalStep::Value(value))),
-        "lambda" => eval_lambda(operands, environment).map(|value| Some(EvalStep::Value(value))),
-        "and" => eval_and(operands, environment).map(Some),
-        "or" => eval_or(operands, environment).map(Some),
-        "begin" => eval_begin(operands, environment).map(Some),
-        "cond" => eval_cond(operands, environment).map(Some),
-        "let" => eval_let(operands, environment).map(Some),
+        "define" => eval_define(operands, environment, stack).map(Some),
+        "set!" => eval_set(operands, environment, stack).map(Some),
+        "if" => eval_if(operands, environment, stack).map(Some),
+        "quote" => eval_quote(operands).map(|value| Some(MachineState::Value(value))),
+        "lambda" => {
+            eval_lambda(operands, environment).map(|value| Some(MachineState::Value(value)))
+        }
+        "and" => start_and(operands.to_vec(), environment.clone(), stack).map(Some),
+        "or" => start_or(operands.to_vec(), environment.clone(), stack).map(Some),
+        "begin" => eval_begin(operands, environment, stack).map(Some),
+        "cond" => eval_cond(operands, environment, stack).map(Some),
+        "let" => eval_let(operands, environment, stack).map(Some),
         _ => Ok(None),
     }
 }
 
-fn eval_define(operands: &[Expr], environment: &Environment) -> Result<Value, SchemeError> {
+fn eval_define(
+    operands: &[Expr],
+    environment: &Environment,
+    stack: &mut Vec<Frame>,
+) -> Result<MachineState, SchemeError> {
     match operands {
         [Expr::Symbol(name), value_expression] => {
-            let value = eval_expr(value_expression, environment)?;
-            environment.define(name, value);
-            Ok(Value::Void)
+            stack.push(Frame::Define {
+                name: name.clone(),
+                environment: environment.clone(),
+            });
+            Ok(MachineState::Expression(
+                value_expression.clone(),
+                environment.clone(),
+            ))
         }
         [Expr::Symbol(_), ..] => Err(SchemeError::WrongArgumentCount {
             operator: "define",
@@ -145,10 +168,7 @@ fn eval_define(operands: &[Expr], environment: &Environment) -> Result<Value, Sc
             min: 2,
             actual: operands.len(),
         }),
-        [target, _] => Err(SchemeError::InvalidDefinitionTarget {
-            found: expression_kind(target),
-        }),
-        [target, ..] => Err(SchemeError::InvalidDefinitionTarget {
+        [target, _] | [target, ..] => Err(SchemeError::InvalidDefinitionTarget {
             found: expression_kind(target),
         }),
         _ => Err(SchemeError::TooFewArguments {
@@ -159,16 +179,21 @@ fn eval_define(operands: &[Expr], environment: &Environment) -> Result<Value, Sc
     }
 }
 
-fn eval_set(operands: &[Expr], environment: &Environment) -> Result<Value, SchemeError> {
+fn eval_set(
+    operands: &[Expr],
+    environment: &Environment,
+    stack: &mut Vec<Frame>,
+) -> Result<MachineState, SchemeError> {
     match operands {
         [Expr::Symbol(name), value_expression] => {
-            let value = eval_expr(value_expression, environment)?;
-
-            if environment.set(name, value) {
-                Ok(Value::Void)
-            } else {
-                Err(SchemeError::UnboundSymbol { name: name.clone() })
-            }
+            stack.push(Frame::Set {
+                name: name.clone(),
+                environment: environment.clone(),
+            });
+            Ok(MachineState::Expression(
+                value_expression.clone(),
+                environment.clone(),
+            ))
         }
         [Expr::Symbol(_), ..] => Err(SchemeError::WrongArgumentCount {
             operator: "set!",
@@ -190,10 +215,10 @@ fn define_function(
     signature: &[Expr],
     body: &[Expr],
     environment: &Environment,
-) -> Result<Value, SchemeError> {
-    let (name, parameters) = signature
-        .split_first()
-        .ok_or(SchemeError::InvalidDefinitionTarget { found: "list" })?;
+) -> Result<MachineState, SchemeError> {
+    let Some((name, parameters)) = signature.split_first() else {
+        return Err(SchemeError::InvalidDefinitionTarget { found: "list" });
+    };
 
     let Expr::Symbol(name) = name else {
         return Err(SchemeError::InvalidDefinitionTarget {
@@ -204,21 +229,25 @@ fn define_function(
     let parameters = parse_parameters(parameters, "define")?;
     let procedure = Value::procedure(parameters, body.to_vec(), environment.clone());
     environment.define(name, procedure);
-    Ok(Value::Void)
+    Ok(MachineState::Value(Value::Void))
 }
 
-fn eval_if<'expr>(
-    operands: &'expr [Expr],
+fn eval_if(
+    operands: &[Expr],
     environment: &Environment,
-) -> Result<EvalStep<'expr>, SchemeError> {
+    stack: &mut Vec<Frame>,
+) -> Result<MachineState, SchemeError> {
     match operands {
         [condition, consequent, alternative] => {
-            let value = eval_expr(condition, environment)?;
-            if value.is_truthy() {
-                Ok(EvalStep::Expression(consequent, environment.clone()))
-            } else {
-                Ok(EvalStep::Expression(alternative, environment.clone()))
-            }
+            stack.push(Frame::If {
+                consequent: consequent.clone(),
+                alternative: alternative.clone(),
+                environment: environment.clone(),
+            });
+            Ok(MachineState::Expression(
+                condition.clone(),
+                environment.clone(),
+            ))
         }
         _ => Err(SchemeError::WrongArgumentCount {
             operator: "if",
@@ -257,10 +286,11 @@ fn eval_lambda(operands: &[Expr], environment: &Environment) -> Result<Value, Sc
     }
 }
 
-fn eval_begin<'expr>(
-    operands: &'expr [Expr],
+fn eval_begin(
+    operands: &[Expr],
     environment: &Environment,
-) -> Result<EvalStep<'expr>, SchemeError> {
+    stack: &mut Vec<Frame>,
+) -> Result<MachineState, SchemeError> {
     if operands.is_empty() {
         Err(SchemeError::TooFewArguments {
             operator: "begin",
@@ -268,14 +298,15 @@ fn eval_begin<'expr>(
             actual: 0,
         })
     } else {
-        eval_tail_sequence(operands, environment)
+        start_sequence(operands.to_vec(), environment.clone(), stack)
     }
 }
 
-fn eval_cond<'expr>(
-    operands: &'expr [Expr],
+fn eval_cond(
+    operands: &[Expr],
     environment: &Environment,
-) -> Result<EvalStep<'expr>, SchemeError> {
+    stack: &mut Vec<Frame>,
+) -> Result<MachineState, SchemeError> {
     if operands.is_empty() {
         return Err(SchemeError::TooFewArguments {
             operator: "cond",
@@ -285,14 +316,35 @@ fn eval_cond<'expr>(
     }
 
     validate_cond_clauses(operands)?;
+    continue_cond(operands.to_vec(), environment.clone(), stack)
+}
 
-    for clause in operands {
-        if let Some(value) = eval_cond_clause(clause, environment)? {
-            return Ok(value);
-        }
+fn continue_cond(
+    clauses: Vec<Expr>,
+    environment: Environment,
+    stack: &mut Vec<Frame>,
+) -> Result<MachineState, SchemeError> {
+    let Some((clause, remaining_clauses)) = clauses.split_first() else {
+        return Ok(MachineState::Value(Value::Void));
+    };
+
+    let Expr::List(parts) = clause else {
+        unreachable!("cond clauses are validated before evaluation");
+    };
+    let Some((predicate, body)) = parts.split_first() else {
+        unreachable!("cond clauses are validated before evaluation");
+    };
+
+    if is_else_symbol(predicate) {
+        return start_sequence(body.to_vec(), environment, stack);
     }
 
-    Ok(EvalStep::Value(Value::Void))
+    stack.push(Frame::Cond {
+        body: body.to_vec(),
+        remaining_clauses: remaining_clauses.to_vec(),
+        environment: environment.clone(),
+    });
+    Ok(MachineState::Expression(predicate.clone(), environment))
 }
 
 fn validate_cond_clauses(clauses: &[Expr]) -> Result<(), SchemeError> {
@@ -339,58 +391,17 @@ fn validate_cond_clause(clause: &Expr, is_last: bool) -> Result<(), SchemeError>
     Ok(())
 }
 
-fn eval_cond_clause<'expr>(
-    clause: &'expr Expr,
+fn eval_let(
+    operands: &[Expr],
     environment: &Environment,
-) -> Result<Option<EvalStep<'expr>>, SchemeError> {
-    let Expr::List(parts) = clause else {
-        unreachable!("cond clauses are validated before evaluation");
-    };
-    let Some((predicate, body)) = parts.split_first() else {
-        unreachable!("cond clauses are validated before evaluation");
-    };
-
-    if is_else_symbol(predicate) {
-        return eval_cond_else(body, environment).map(Some);
-    }
-
-    let predicate_value = eval_expr(predicate, environment)?;
-    if !predicate_value.is_truthy() {
-        return Ok(None);
-    }
-
-    if body.is_empty() {
-        Ok(Some(EvalStep::Value(predicate_value)))
-    } else {
-        eval_tail_sequence(body, environment).map(Some)
-    }
-}
-
-fn eval_cond_else<'expr>(
-    body: &'expr [Expr],
-    environment: &Environment,
-) -> Result<EvalStep<'expr>, SchemeError> {
-    if body.is_empty() {
-        return Err(SchemeError::TooFewArguments {
-            operator: "cond else",
-            min: 1,
-            actual: 0,
-        });
-    }
-
-    eval_tail_sequence(body, environment)
-}
-
-fn eval_let<'expr>(
-    operands: &'expr [Expr],
-    environment: &Environment,
-) -> Result<EvalStep<'expr>, SchemeError> {
+    stack: &mut Vec<Frame>,
+) -> Result<MachineState, SchemeError> {
     match operands {
         [Expr::Symbol(name), bindings_expression, body @ ..] if !body.is_empty() => {
-            eval_named_let(name, bindings_expression, body, environment)
+            eval_named_let(name, bindings_expression, body, environment, stack)
         }
         [bindings_expression, body @ ..] if !body.is_empty() => {
-            eval_let_body(bindings_expression, body, environment)
+            eval_let_body(bindings_expression, body, environment, stack)
         }
         [Expr::Symbol(_), ..] => Err(SchemeError::TooFewArguments {
             operator: "let",
@@ -405,29 +416,46 @@ fn eval_let<'expr>(
     }
 }
 
-fn eval_let_body<'expr>(
+fn eval_let_body(
     bindings_expression: &Expr,
-    body: &'expr [Expr],
+    body: &[Expr],
     environment: &Environment,
-) -> Result<EvalStep<'expr>, SchemeError> {
-    let bindings = eval_let_bindings(bindings_expression, environment)?;
-    let let_environment = environment.child();
+    stack: &mut Vec<Frame>,
+) -> Result<MachineState, SchemeError> {
+    let mut bindings = parse_let_bindings(bindings_expression)?;
+    let Some(last_binding) = bindings.pop() else {
+        let let_environment = environment.child();
+        return start_sequence(body.to_vec(), let_environment, stack);
+    };
 
-    for (name, value) in bindings {
-        let_environment.define(&name, value);
-    }
-
-    eval_tail_sequence(body, &let_environment)
+    let (current_name, expression) = last_binding.into_parts();
+    stack.push(Frame::Let {
+        current_name,
+        evaluated_rev: Vec::new(),
+        remaining: bindings,
+        body: body.to_vec(),
+        environment: environment.clone(),
+    });
+    Ok(MachineState::Expression(expression, environment.clone()))
 }
 
-fn eval_named_let<'expr>(
+fn eval_named_let(
     name: &str,
     bindings_expression: &Expr,
-    body: &'expr [Expr],
+    body: &[Expr],
     environment: &Environment,
-) -> Result<EvalStep<'expr>, SchemeError> {
+    stack: &mut Vec<Frame>,
+) -> Result<MachineState, SchemeError> {
     let bindings = parse_let_bindings(bindings_expression)?;
-    let (parameters, arguments) = eval_named_let_bindings(bindings, environment)?;
+    let parameters = bindings
+        .iter()
+        .map(|binding| binding.name().to_owned())
+        .collect();
+    let arguments = bindings
+        .into_iter()
+        .map(LetBinding::into_parts)
+        .map(|(_, expression)| expression)
+        .collect();
     let let_environment = environment.child();
     let procedure = Value::procedure(
         Parameters::new(parameters, None),
@@ -436,39 +464,10 @@ fn eval_named_let<'expr>(
     );
 
     let_environment.define(name, procedure.clone());
-    apply_value_callable(procedure, arguments)
+    start_argument_evaluation(procedure, arguments, environment.clone(), stack)
 }
 
-fn eval_named_let_bindings(
-    bindings: Vec<(&str, &Expr)>,
-    environment: &Environment,
-) -> Result<(Vec<String>, Vec<Value>), SchemeError> {
-    let mut parameters = Vec::with_capacity(bindings.len());
-    let mut arguments = Vec::with_capacity(bindings.len());
-
-    for (name, value_expression) in bindings {
-        parameters.push(name.to_owned());
-        arguments.push(eval_expr(value_expression, environment)?);
-    }
-
-    Ok((parameters, arguments))
-}
-
-fn eval_let_bindings(
-    bindings_expression: &Expr,
-    environment: &Environment,
-) -> Result<Vec<(String, Value)>, SchemeError> {
-    let bindings = parse_let_bindings(bindings_expression)?;
-
-    bindings
-        .into_iter()
-        .map(|(name, value_expression)| {
-            eval_expr(value_expression, environment).map(|value| (name.to_owned(), value))
-        })
-        .collect()
-}
-
-fn parse_let_bindings(bindings_expression: &Expr) -> Result<Vec<(&str, &Expr)>, SchemeError> {
+fn parse_let_bindings(bindings_expression: &Expr) -> Result<Vec<LetBinding>, SchemeError> {
     let Expr::List(bindings) = bindings_expression else {
         return Err(SchemeError::InvalidBindingList {
             operator: "let",
@@ -480,22 +479,22 @@ fn parse_let_bindings(bindings_expression: &Expr) -> Result<Vec<(&str, &Expr)>, 
     let mut seen = HashSet::with_capacity(bindings.len());
 
     for binding in bindings {
-        let (name, value_expression) = parse_let_binding(binding)?;
+        let binding = parse_let_binding(binding)?;
 
-        if !seen.insert(name.to_owned()) {
+        if !seen.insert(binding.name().to_owned()) {
             return Err(SchemeError::DuplicateBinding {
                 operator: "let",
-                name: name.to_owned(),
+                name: binding.name().to_owned(),
             });
         }
 
-        parsed_bindings.push((name, value_expression));
+        parsed_bindings.push(binding);
     }
 
     Ok(parsed_bindings)
 }
 
-fn parse_let_binding(binding: &Expr) -> Result<(&str, &Expr), SchemeError> {
+fn parse_let_binding(binding: &Expr) -> Result<LetBinding, SchemeError> {
     let Expr::List(parts) = binding else {
         return Err(SchemeError::InvalidBinding {
             operator: "let",
@@ -504,7 +503,9 @@ fn parse_let_binding(binding: &Expr) -> Result<(&str, &Expr), SchemeError> {
     };
 
     match parts.as_slice() {
-        [Expr::Symbol(name), value_expression] => Ok((name.as_str(), value_expression)),
+        [Expr::Symbol(name), value_expression] => {
+            Ok(LetBinding::new(name.clone(), value_expression.clone()))
+        }
         [Expr::Symbol(_), ..] => Err(SchemeError::WrongArgumentCount {
             operator: "let binding",
             expected: 2,
@@ -628,43 +629,306 @@ fn parse_rest_parameter(parameter: &Expr, operator: &'static str) -> Result<Stri
     }
 }
 
-fn apply_builtin<'expr>(
-    builtin: Builtin,
-    operands: &[Expr],
-    environment: &Environment,
-) -> Result<EvalStep<'expr>, SchemeError> {
-    let arguments = eval_values(operands, environment)?;
-    apply_value_builtin(builtin, arguments)
-}
-
-fn apply_value_builtin<'expr>(
-    builtin: Builtin,
-    arguments: Vec<Value>,
-) -> Result<EvalStep<'expr>, SchemeError> {
-    match builtin {
-        Builtin::Apply => eval_apply(arguments),
-        _ => apply_builtin_value(builtin, arguments).map(EvalStep::Value),
+fn continue_from_frame(
+    frame: Frame,
+    value: Value,
+    stack: &mut Vec<Frame>,
+) -> Result<MachineState, SchemeError> {
+    match frame {
+        Frame::Sequence {
+            remaining,
+            environment,
+        } => start_sequence(remaining, environment, stack),
+        Frame::Define { name, environment } => finish_define(name, environment, value),
+        Frame::Set { name, environment } => finish_set(name, environment, value),
+        Frame::If {
+            consequent,
+            alternative,
+            environment,
+        } => finish_if(consequent, alternative, environment, value),
+        Frame::And {
+            remaining,
+            environment,
+        } => finish_and(remaining, environment, value, stack),
+        Frame::Or {
+            remaining,
+            environment,
+        } => finish_or(remaining, environment, value, stack),
+        Frame::Cond {
+            body,
+            remaining_clauses,
+            environment,
+        } => finish_cond(body, remaining_clauses, environment, value, stack),
+        Frame::ApplyOperator {
+            operands,
+            environment,
+        } => start_argument_evaluation(value, operands, environment, stack),
+        Frame::ApplyArguments {
+            callable,
+            evaluated_rev,
+            remaining,
+            environment,
+        } => finish_apply_arguments(
+            callable,
+            evaluated_rev,
+            remaining,
+            environment,
+            value,
+            stack,
+        ),
+        Frame::Let {
+            current_name,
+            evaluated_rev,
+            remaining,
+            body,
+            environment,
+        } => finish_let_bindings(
+            current_name,
+            evaluated_rev,
+            remaining,
+            body,
+            environment,
+            value,
+            stack,
+        ),
     }
 }
 
-fn apply_callable<'expr>(
+fn finish_define(
+    name: String,
+    environment: Environment,
+    value: Value,
+) -> Result<MachineState, SchemeError> {
+    environment.define(&name, value);
+    Ok(MachineState::Value(Value::Void))
+}
+
+fn finish_set(
+    name: String,
+    environment: Environment,
+    value: Value,
+) -> Result<MachineState, SchemeError> {
+    if environment.set(&name, value) {
+        Ok(MachineState::Value(Value::Void))
+    } else {
+        Err(SchemeError::UnboundSymbol { name })
+    }
+}
+
+fn finish_if(
+    consequent: Expr,
+    alternative: Expr,
+    environment: Environment,
+    value: Value,
+) -> Result<MachineState, SchemeError> {
+    if value.is_truthy() {
+        Ok(MachineState::Expression(consequent, environment))
+    } else {
+        Ok(MachineState::Expression(alternative, environment))
+    }
+}
+
+fn finish_and(
+    remaining: Vec<Expr>,
+    environment: Environment,
+    value: Value,
+    stack: &mut Vec<Frame>,
+) -> Result<MachineState, SchemeError> {
+    if value.is_truthy() {
+        start_and(remaining, environment, stack)
+    } else {
+        Ok(MachineState::Value(value))
+    }
+}
+
+fn finish_or(
+    remaining: Vec<Expr>,
+    environment: Environment,
+    value: Value,
+    stack: &mut Vec<Frame>,
+) -> Result<MachineState, SchemeError> {
+    if value.is_truthy() {
+        Ok(MachineState::Value(value))
+    } else {
+        start_or(remaining, environment, stack)
+    }
+}
+
+fn finish_cond(
+    body: Vec<Expr>,
+    remaining_clauses: Vec<Expr>,
+    environment: Environment,
+    value: Value,
+    stack: &mut Vec<Frame>,
+) -> Result<MachineState, SchemeError> {
+    if !value.is_truthy() {
+        return continue_cond(remaining_clauses, environment, stack);
+    }
+
+    if body.is_empty() {
+        return Ok(MachineState::Value(value));
+    }
+
+    start_sequence(body, environment, stack)
+}
+
+fn finish_apply_arguments(
     callable: Value,
-    operands: &'expr [Expr],
-    environment: &Environment,
-) -> Result<EvalStep<'expr>, SchemeError> {
-    match callable {
-        Value::Builtin(builtin) => apply_builtin(builtin, operands, environment),
-        Value::Procedure(procedure) => {
-            apply_procedure(procedure, eval_values(operands, environment)?)
+    mut evaluated_rev: Vec<Value>,
+    mut remaining: Vec<Expr>,
+    environment: Environment,
+    value: Value,
+    stack: &mut Vec<Frame>,
+) -> Result<MachineState, SchemeError> {
+    evaluated_rev.push(value);
+
+    match remaining.pop() {
+        Some(next_operand) => {
+            stack.push(Frame::ApplyArguments {
+                callable,
+                evaluated_rev,
+                remaining,
+                environment: environment.clone(),
+            });
+            Ok(MachineState::Expression(next_operand, environment))
         }
+        None => {
+            evaluated_rev.reverse();
+            apply_value_callable(callable, evaluated_rev, stack)
+        }
+    }
+}
+
+fn finish_let_bindings(
+    current_name: String,
+    mut evaluated_rev: Vec<(String, Value)>,
+    mut remaining: Vec<LetBinding>,
+    body: Vec<Expr>,
+    environment: Environment,
+    value: Value,
+    stack: &mut Vec<Frame>,
+) -> Result<MachineState, SchemeError> {
+    evaluated_rev.push((current_name, value));
+
+    match remaining.pop() {
+        Some(binding) => {
+            let (current_name, expression) = binding.into_parts();
+            stack.push(Frame::Let {
+                current_name,
+                evaluated_rev,
+                remaining,
+                body,
+                environment: environment.clone(),
+            });
+            Ok(MachineState::Expression(expression, environment))
+        }
+        None => finish_let_body(evaluated_rev, body, environment, stack),
+    }
+}
+
+fn finish_let_body(
+    evaluated_rev: Vec<(String, Value)>,
+    body: Vec<Expr>,
+    environment: Environment,
+    stack: &mut Vec<Frame>,
+) -> Result<MachineState, SchemeError> {
+    let let_environment = environment.child();
+
+    for (name, value) in evaluated_rev.into_iter().rev() {
+        let_environment.define(&name, value);
+    }
+
+    start_sequence(body, let_environment, stack)
+}
+
+fn start_and(
+    operands: Vec<Expr>,
+    environment: Environment,
+    stack: &mut Vec<Frame>,
+) -> Result<MachineState, SchemeError> {
+    let Some((first_operand, remaining)) = operands.split_first() else {
+        return Ok(MachineState::Value(Value::Boolean(true)));
+    };
+
+    if !remaining.is_empty() {
+        stack.push(Frame::And {
+            remaining: remaining.to_vec(),
+            environment: environment.clone(),
+        });
+    }
+
+    Ok(MachineState::Expression(first_operand.clone(), environment))
+}
+
+fn start_or(
+    operands: Vec<Expr>,
+    environment: Environment,
+    stack: &mut Vec<Frame>,
+) -> Result<MachineState, SchemeError> {
+    let Some((first_operand, remaining)) = operands.split_first() else {
+        return Ok(MachineState::Value(Value::Boolean(false)));
+    };
+
+    if !remaining.is_empty() {
+        stack.push(Frame::Or {
+            remaining: remaining.to_vec(),
+            environment: environment.clone(),
+        });
+    }
+
+    Ok(MachineState::Expression(first_operand.clone(), environment))
+}
+
+fn start_argument_evaluation(
+    callable: Value,
+    mut operands: Vec<Expr>,
+    environment: Environment,
+    stack: &mut Vec<Frame>,
+) -> Result<MachineState, SchemeError> {
+    match operands.pop() {
+        Some(operand) => {
+            stack.push(Frame::ApplyArguments {
+                callable,
+                evaluated_rev: Vec::new(),
+                remaining: operands,
+                environment: environment.clone(),
+            });
+            Ok(MachineState::Expression(operand, environment))
+        }
+        None => apply_value_callable(callable, Vec::new(), stack),
+    }
+}
+
+fn apply_value_callable(
+    callable: Value,
+    arguments: Vec<Value>,
+    stack: &mut Vec<Frame>,
+) -> Result<MachineState, SchemeError> {
+    match callable {
+        Value::Builtin(builtin) => apply_builtin(builtin, arguments, stack),
+        Value::Procedure(procedure) => apply_procedure(procedure, arguments, stack),
+        Value::Continuation(continuation) => apply_continuation(continuation, arguments, stack),
         value => Err(SchemeError::NonCallable { kind: value.kind() }),
     }
 }
 
-fn apply_procedure<'expr>(
+fn apply_builtin(
+    builtin: Builtin,
+    arguments: Vec<Value>,
+    stack: &mut Vec<Frame>,
+) -> Result<MachineState, SchemeError> {
+    match builtin {
+        Builtin::Apply => eval_apply(arguments, stack),
+        Builtin::CallCc => eval_callcc(arguments, stack),
+        _ => apply_builtin_value(builtin, arguments).map(MachineState::Value),
+    }
+}
+
+fn apply_procedure(
     procedure: Rc<Procedure>,
     arguments: Vec<Value>,
-) -> Result<EvalStep<'expr>, SchemeError> {
+    stack: &mut Vec<Frame>,
+) -> Result<MachineState, SchemeError> {
     let parameters = procedure.parameters();
     if !parameters.accepts_argument_count(arguments.len()) {
         if parameters.has_rest() {
@@ -682,9 +946,7 @@ fn apply_procedure<'expr>(
 
     let call_environment = procedure.environment().child();
     bind_procedure_arguments(&call_environment, parameters, arguments);
-
-    eval_leading_expressions(procedure.body(), &call_environment)?;
-    Ok(EvalStep::Procedure(procedure, call_environment))
+    start_sequence(procedure.body().to_vec(), call_environment, stack)
 }
 
 fn bind_procedure_arguments(
@@ -706,7 +968,24 @@ fn bind_procedure_arguments(
     }
 }
 
-fn eval_apply<'expr>(arguments: Vec<Value>) -> Result<EvalStep<'expr>, SchemeError> {
+fn apply_continuation(
+    continuation: Rc<Continuation>,
+    arguments: Vec<Value>,
+    stack: &mut Vec<Frame>,
+) -> Result<MachineState, SchemeError> {
+    match arguments.as_slice() {
+        [value] => {
+            *stack = continuation.cloned_frames();
+            Ok(MachineState::Value(value.clone()))
+        }
+        _ => Err(SchemeError::WrongProcedureArgumentCount {
+            expected: 1,
+            actual: arguments.len(),
+        }),
+    }
+}
+
+fn eval_apply(arguments: Vec<Value>, stack: &mut Vec<Frame>) -> Result<MachineState, SchemeError> {
     if arguments.len() < 2 {
         return Err(SchemeError::TooFewArguments {
             operator: "apply",
@@ -732,45 +1011,21 @@ fn eval_apply<'expr>(arguments: Vec<Value>) -> Result<EvalStep<'expr>, SchemeErr
         })?;
     applied_arguments.extend(rest_arguments);
 
-    apply_value_callable(callable.clone(), applied_arguments)
+    apply_value_callable(callable.clone(), applied_arguments, stack)
 }
 
-fn apply_value_callable<'expr>(
-    callable: Value,
-    arguments: Vec<Value>,
-) -> Result<EvalStep<'expr>, SchemeError> {
-    match callable {
-        Value::Builtin(builtin) => apply_value_builtin(builtin, arguments),
-        Value::Procedure(procedure) => apply_procedure(procedure, arguments),
-        value => Err(SchemeError::NonCallable { kind: value.kind() }),
+fn eval_callcc(arguments: Vec<Value>, stack: &mut Vec<Frame>) -> Result<MachineState, SchemeError> {
+    match arguments.as_slice() {
+        [callable] => {
+            let continuation = Value::continuation(Continuation::new(stack.clone()));
+            apply_value_callable(callable.clone(), vec![continuation], stack)
+        }
+        _ => Err(SchemeError::WrongArgumentCount {
+            operator: "call/cc",
+            expected: 1,
+            actual: arguments.len(),
+        }),
     }
-}
-
-fn eval_leading_expressions(
-    expressions: &[Expr],
-    environment: &Environment,
-) -> Result<(), SchemeError> {
-    let Some((_, leading_expressions)) = expressions.split_last() else {
-        unreachable!("procedures are created with non-empty bodies");
-    };
-
-    for expression in leading_expressions {
-        let _ = eval_expr(expression, environment)?;
-    }
-
-    Ok(())
-}
-
-fn eval_tail_sequence<'expr>(
-    expressions: &'expr [Expr],
-    environment: &Environment,
-) -> Result<EvalStep<'expr>, SchemeError> {
-    let Some((last_expression, _)) = expressions.split_last() else {
-        unreachable!("tail sequences are validated before evaluation");
-    };
-
-    eval_leading_expressions(expressions, environment)?;
-    Ok(EvalStep::Expression(last_expression, environment.clone()))
 }
 
 fn apply_builtin_value(builtin: Builtin, arguments: Vec<Value>) -> Result<Value, SchemeError> {
@@ -795,7 +1050,9 @@ fn apply_builtin_value(builtin: Builtin, arguments: Vec<Value>) -> Result<Value,
         Builtin::BooleanPredicate => eval_boolean_predicate(&arguments),
         Builtin::PairPredicate => eval_pair_predicate(&arguments),
         Builtin::SymbolPredicate => eval_symbol_predicate(&arguments),
-        Builtin::Apply => unreachable!("apply is handled before builtin value dispatch"),
+        Builtin::Apply | Builtin::CallCc => {
+            unreachable!("non-primitive builtins are handled before primitive dispatch")
+        }
     }
 }
 
@@ -874,44 +1131,6 @@ fn eval_not(arguments: &[Value]) -> Result<Value, SchemeError> {
             actual: arguments.len(),
         }),
     }
-}
-
-fn eval_and<'expr>(
-    operands: &'expr [Expr],
-    environment: &Environment,
-) -> Result<EvalStep<'expr>, SchemeError> {
-    let Some((last_operand, leading_operands)) = operands.split_last() else {
-        return Ok(EvalStep::Value(Value::Boolean(true)));
-    };
-
-    for operand in leading_operands {
-        let value = eval_expr(operand, environment)?;
-
-        if !value.is_truthy() {
-            return Ok(EvalStep::Value(value));
-        }
-    }
-
-    Ok(EvalStep::Expression(last_operand, environment.clone()))
-}
-
-fn eval_or<'expr>(
-    operands: &'expr [Expr],
-    environment: &Environment,
-) -> Result<EvalStep<'expr>, SchemeError> {
-    let Some((last_operand, leading_operands)) = operands.split_last() else {
-        return Ok(EvalStep::Value(Value::Boolean(false)));
-    };
-
-    for operand in leading_operands {
-        let value = eval_expr(operand, environment)?;
-
-        if value.is_truthy() {
-            return Ok(EvalStep::Value(value));
-        }
-    }
-
-    Ok(EvalStep::Expression(last_operand, environment.clone()))
 }
 
 fn eval_cons(arguments: &[Value]) -> Result<Value, SchemeError> {
@@ -1026,16 +1245,6 @@ fn eval_type_predicate(
             actual: arguments.len(),
         }),
     }
-}
-
-fn eval_values(operands: &[Expr], environment: &Environment) -> Result<Vec<Value>, SchemeError> {
-    let mut values = Vec::with_capacity(operands.len());
-
-    for operand in operands {
-        values.push(eval_expr(operand, environment)?);
-    }
-
-    Ok(values)
 }
 
 fn eval_numbers(operator: &'static str, arguments: &[Value]) -> Result<Vec<i64>, SchemeError> {
