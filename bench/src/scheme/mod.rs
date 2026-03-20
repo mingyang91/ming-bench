@@ -1,5 +1,6 @@
 pub(crate) mod apply;
 mod builtins;
+mod continuation;
 mod dispatch;
 pub mod env;
 pub mod error;
@@ -78,7 +79,9 @@ fn eval_inner(expr: &Value, env: &Rc<Env>) -> Result<Trampoline, EvalError> {
         Value::Integer(_) | Value::Boolean(_) | Value::String(_) | Value::Char(_) | Value::Void => {
             Ok(Trampoline::Done(expr.clone()))
         }
-        Value::Lambda { .. } | Value::Builtin(_) => Ok(Trampoline::Done(expr.clone())),
+        Value::Lambda { .. } | Value::Builtin(_) | Value::Continuation(_) => {
+            Ok(Trampoline::Done(expr.clone()))
+        }
         Value::Symbol(name) => env
             .get(name)
             .map(Trampoline::Done)
@@ -187,6 +190,52 @@ fn eval_list_form(elements: &[Value], env: &Rc<Env>) -> Result<Trampoline, EvalE
     }
 }
 
+/// Evaluate a sequence of top-level expressions, handling reentrant continuations.
+fn eval_top_level(exprs: &[(Value, error::Span)], env: &Rc<Env>) -> Result<Value, EvalError> {
+    let mut current_exprs: Vec<(Value, error::Span)> = exprs.to_vec();
+    let mut current_env = Rc::clone(env);
+
+    loop {
+        match eval_exprs_with_ctx(&current_exprs, &current_env) {
+            Ok(val) => return Ok(val),
+            Err(EvalError::ContinuationReturn { id, value }) => {
+                let capture = continuation::get_capture(id)
+                    .expect("continuation capture not found");
+                continuation::set_resume_value(value);
+                current_exprs = capture.exprs;
+                current_env = capture.env;
+            }
+            Err(e) => return Err(e),
+        }
+    }
+}
+
+/// Evaluate a sequence of top-level expressions, setting continuation context
+/// before each one so call/cc can capture remaining expressions.
+fn eval_exprs_with_ctx(
+    exprs: &[(Value, error::Span)],
+    env: &Rc<Env>,
+) -> Result<Value, EvalError> {
+    let mut last = Value::Void;
+    for (i, (expr, span)) in exprs.iter().enumerate() {
+        continuation::set_top_level_ctx(exprs, i, env);
+        last = match eval(expr, env) {
+            Ok(v) => v,
+            Err(EvalError::ContinuationReturn { id, value }) => {
+                return Err(EvalError::ContinuationReturn { id, value });
+            }
+            Err(e) => {
+                return Err(EvalError::AtPosition {
+                    error: Box::new(e),
+                    line: span.line,
+                    col: span.col,
+                });
+            }
+        };
+    }
+    Ok(last)
+}
+
 /// Evaluate one or more Scheme expressions and return the string
 /// representation of the last result.
 pub fn eval_str(input: &str) -> Result<String, EvalError> {
@@ -196,15 +245,7 @@ pub fn eval_str(input: &str) -> Result<String, EvalError> {
     }
     let env = Env::new();
     register_builtins(&env);
-    let mut last = Value::Void;
-    for (expr, span) in &expressions {
-        last = eval(expr, &env).map_err(|e| EvalError::AtPosition {
-            error: Box::new(e),
-            line: span.line,
-            col: span.col,
-        })?;
-    }
-    match last {
+    match eval_top_level(&expressions, &env)? {
         Value::Void => Err(EvalError::EmptyInput),
         val => Ok(val.to_string()),
     }
@@ -219,14 +260,7 @@ pub fn eval_str_with_output(input: &str) -> Result<(String, String), EvalError> 
     }
     let env = Env::new();
     register_builtins(&env);
-    let mut last = Value::Void;
-    for (expr, span) in &expressions {
-        last = eval(expr, &env).map_err(|e| EvalError::AtPosition {
-            error: Box::new(e),
-            line: span.line,
-            col: span.col,
-        })?;
-    }
+    let last = eval_top_level(&expressions, &env)?;
     let output = env.take_output();
     let result = match last {
         Value::Void => String::new(),

@@ -47,4 +47,10 @@ pub enum EvalError {
         line: usize,
         col: usize,
     },
+
+    #[error("continuation invoked")]
+    ContinuationReturn {
+        id: u64,
+        value: super::value::Value,
+    },
 }

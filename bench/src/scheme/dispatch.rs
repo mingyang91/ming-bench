@@ -1,5 +1,6 @@
 use crate::scheme::apply::{apply_lambda, apply_lambda_tco, is_truthy};
 use crate::scheme::builtins::{apply_arithmetic, apply_comparison};
+use crate::scheme::continuation;
 use crate::scheme::env::Env;
 use crate::scheme::error::EvalError;
 use crate::scheme::list_ops::{eval_car_values, eval_cdr_values, eval_cons_values, eval_length_values, eval_null_q_values};
@@ -38,11 +39,23 @@ pub(super) fn eval_apply(args: &[Value], env: &Rc<Env>) -> Result<Trampoline, Ev
     apply_value_tco(func, &all_args)
 }
 
-/// Apply a value (Lambda or Builtin) to evaluated arguments, with TCO.
+/// Apply a value (Lambda, Builtin, or Continuation) to evaluated arguments, with TCO.
 pub(super) fn apply_value_tco(func: Value, args: &[Value]) -> Result<Trampoline, EvalError> {
     match &func {
         Value::Lambda { .. } => apply_lambda_tco(func, args),
         Value::Builtin(name) => dispatch_builtin(name, args).map(Trampoline::Done),
+        Value::Continuation(id) => {
+            let [arg] = args else {
+                return Err(EvalError::WrongArgCount {
+                    expected: "1".into(),
+                    got: args.len(),
+                });
+            };
+            Err(EvalError::ContinuationReturn {
+                id: *id,
+                value: arg.clone(),
+            })
+        }
         _ => Err(EvalError::NotAProcedure {
             value: format!("{func}"),
         }),
@@ -68,6 +81,15 @@ fn dispatch_builtin(name: &str, args: &[Value]) -> Result<Value, EvalError> {
                 });
             };
             Ok(Value::Boolean(!is_truthy(arg)))
+        }
+        "call/cc" | "call-with-current-continuation" => {
+            let [proc] = args else {
+                return Err(EvalError::WrongArgCount {
+                    expected: "1".into(),
+                    got: args.len(),
+                });
+            };
+            continuation::eval_callcc(proc.clone())
         }
         "apply" => {
             if args.len() < 2 {
@@ -99,7 +121,7 @@ fn dispatch_builtin(name: &str, args: &[Value]) -> Result<Value, EvalError> {
 pub(super) fn register_builtins(env: &Rc<Env>) {
     for name in [
         "+", "-", "*", "/", "<", ">", "=", "<=", ">=", "cons", "car", "cdr", "null?", "list",
-        "length", "not", "apply",
+        "length", "not", "apply", "call/cc", "call-with-current-continuation",
     ] {
         env.set(name.into(), Value::Builtin(name.into()));
     }

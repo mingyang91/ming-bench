@@ -19,6 +19,7 @@ pub enum Value {
         env: Rc<Env>,
     },
     Builtin(String),
+    Continuation(u64),
     Void,
 }
 
@@ -31,6 +32,7 @@ impl PartialEq for Value {
             (Value::Symbol(a), Value::Symbol(b)) => a == b,
             (Value::Char(a), Value::Char(b)) => a == b,
             (Value::List(a), Value::List(b)) => a == b,
+            (Value::Continuation(a), Value::Continuation(b)) => a == b,
             (Value::Void, Value::Void) => true,
             _ => false,
         }
@@ -54,6 +56,7 @@ impl Value {
         match self {
             Value::String(s) => s.clone(),
             Value::Char(c) => c.to_string(),
+            Value::Continuation(_) => "#<continuation>".to_string(),
             other => other.to_string(),
         }
     }
@@ -74,7 +77,7 @@ impl fmt::Display for Value {
             Value::Symbol(s) => write!(f, "{s}"),
             Value::Char(c) => write!(f, "#\\{c}"),
             Value::List(elements) => fmt_list(elements, f),
-            Value::Lambda { .. } | Value::Builtin(_) => write!(f, "#<procedure>"),
+            Value::Lambda { .. } | Value::Builtin(_) | Value::Continuation(_) => write!(f, "#<procedure>"),
             Value::Void => write!(f, ""),
         }
     }
