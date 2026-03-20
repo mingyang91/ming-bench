@@ -1288,6 +1288,7 @@ fn is_builtin_name(name: &str) -> bool {
             | "char-upcase" | "char-downcase"
             | "char=?" | "char<?"
             | "make-string" | "string"
+            | "string=?" | "string<?" | "string-ci=?" | "string-upcase" | "string-downcase"
             | "vector" | "make-vector" | "vector-ref" | "vector-set!" | "vector?" | "vector-length" | "vector->list"
             | "display" | "write" | "newline"
             | "call/cc" | "call-with-current-continuation"
@@ -2058,6 +2059,51 @@ fn call_builtin_values(
                     Ok(Value::Boolean(false))
                 }
                 _ => Err(err_at("assoc: second argument must be a list", call_line, call_col)),
+            }
+        }
+        "string=?" => {
+            if eval_args.len() != 2 {
+                return Err(err_at("string=? requires 2 arguments", call_line, call_col));
+            }
+            match (&eval_args[0], &eval_args[1]) {
+                (Value::Str(a), Value::Str(b)) => Ok(Value::Boolean(a == b)),
+                _ => Err(err_at("string=? requires string arguments", call_line, call_col)),
+            }
+        }
+        "string<?" => {
+            if eval_args.len() != 2 {
+                return Err(err_at("string<? requires 2 arguments", call_line, call_col));
+            }
+            match (&eval_args[0], &eval_args[1]) {
+                (Value::Str(a), Value::Str(b)) => Ok(Value::Boolean(a < b)),
+                _ => Err(err_at("string<? requires string arguments", call_line, call_col)),
+            }
+        }
+        "string-ci=?" => {
+            if eval_args.len() != 2 {
+                return Err(err_at("string-ci=? requires 2 arguments", call_line, call_col));
+            }
+            match (&eval_args[0], &eval_args[1]) {
+                (Value::Str(a), Value::Str(b)) => Ok(Value::Boolean(a.to_lowercase() == b.to_lowercase())),
+                _ => Err(err_at("string-ci=? requires string arguments", call_line, call_col)),
+            }
+        }
+        "string-upcase" => {
+            if eval_args.len() != 1 {
+                return Err(err_at("string-upcase requires 1 argument", call_line, call_col));
+            }
+            match &eval_args[0] {
+                Value::Str(s) => Ok(Value::Str(s.to_uppercase())),
+                _ => Err(err_at("string-upcase: expected string", call_line, call_col)),
+            }
+        }
+        "string-downcase" => {
+            if eval_args.len() != 1 {
+                return Err(err_at("string-downcase requires 1 argument", call_line, call_col));
+            }
+            match &eval_args[0] {
+                Value::Str(s) => Ok(Value::Str(s.to_lowercase())),
+                _ => Err(err_at("string-downcase: expected string", call_line, call_col)),
             }
         }
         _ => Err(err_at(
