@@ -25,6 +25,13 @@ fn eval_list(elems: &[Value]) -> Result<Value, EvalError> {
         });
     };
 
+    // Short-circuiting special forms — do not eagerly evaluate args
+    match name.as_str() {
+        "and" => return eval_and(&elems[1..]),
+        "or" => return eval_or(&elems[1..]),
+        _ => {}
+    }
+
     let args: Vec<Value> = elems[1..]
         .iter()
         .map(eval)
@@ -35,6 +42,11 @@ fn eval_list(elems: &[Value]) -> Result<Value, EvalError> {
         "-" => arith_sub(name, &args),
         "*" => arith_mul(&args),
         "/" => arith_div(name, &args),
+        "<" => cmp_lt(&args),
+        ">" => cmp_gt(&args),
+        "=" => cmp_eq(&args),
+        "<=" => cmp_le(&args),
+        "not" => eval_not(name, &args),
         _ => Err(EvalError::UnboundVariable {
             name: name.clone(),
         }),
@@ -110,4 +122,65 @@ fn arith_div(name: &str, args: &[Value]) -> Result<Value, EvalError> {
         result /= divisor;
     }
     Ok(Value::Integer(result))
+}
+
+fn cmp_lt(args: &[Value]) -> Result<Value, EvalError> {
+    let a = expect_integer(&args[0])?;
+    let b = expect_integer(&args[1])?;
+    Ok(Value::Boolean(a < b))
+}
+
+fn cmp_gt(args: &[Value]) -> Result<Value, EvalError> {
+    let a = expect_integer(&args[0])?;
+    let b = expect_integer(&args[1])?;
+    Ok(Value::Boolean(a > b))
+}
+
+fn cmp_eq(args: &[Value]) -> Result<Value, EvalError> {
+    let a = expect_integer(&args[0])?;
+    let b = expect_integer(&args[1])?;
+    Ok(Value::Boolean(a == b))
+}
+
+fn cmp_le(args: &[Value]) -> Result<Value, EvalError> {
+    let a = expect_integer(&args[0])?;
+    let b = expect_integer(&args[1])?;
+    Ok(Value::Boolean(a <= b))
+}
+
+fn eval_not(name: &str, args: &[Value]) -> Result<Value, EvalError> {
+    if args.len() != 1 {
+        return Err(EvalError::ArityError {
+            name: name.into(),
+            expected: 1,
+            actual: args.len(),
+        });
+    }
+    Ok(Value::Boolean(is_falsy(&args[0])))
+}
+
+fn is_falsy(val: &Value) -> bool {
+    matches!(val, Value::Boolean(false))
+}
+
+fn eval_and(exprs: &[Value]) -> Result<Value, EvalError> {
+    let mut result = Value::Boolean(true);
+    for expr in exprs {
+        result = eval(expr)?;
+        if is_falsy(&result) {
+            return Ok(result);
+        }
+    }
+    Ok(result)
+}
+
+fn eval_or(exprs: &[Value]) -> Result<Value, EvalError> {
+    let mut result = Value::Boolean(false);
+    for expr in exprs {
+        result = eval(expr)?;
+        if !is_falsy(&result) {
+            return Ok(result);
+        }
+    }
+    Ok(result)
 }
