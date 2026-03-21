@@ -97,7 +97,7 @@ pub fn eval(expr: &Value, env: &Rc<RefCell<Env>>, out: &Output) -> Result<Value,
     loop {
         match &current_expr {
             Value::Integer(_) | Value::Boolean(_) | Value::Str(_) | Value::Char(_)
-            | Value::Void => return Ok(current_expr),
+            | Value::Void | Value::Vector(_) => return Ok(current_expr),
             Value::Lambda { .. } | Value::Builtin(_) | Value::Continuation(_)
             | Value::Macro { .. } => {
                 return Ok(current_expr)
@@ -145,6 +145,9 @@ fn eval_list_tail(
             "and" => return eval_and_tail(&items[1..], env, out),
             "or" => return eval_or_tail(&items[1..], env, out),
             "let" => return eval_let_tail(&items[1..], env, out),
+            "letrec" => return eval_letrec_tail(&items[1..], env, out),
+            "letrec*" => return eval_letrec_star_tail(&items[1..], env, out),
+            "case" => return eval_case_tail(&items[1..], env, out),
             "call/cc" | "call-with-current-continuation" => {
                 return eval_callcc(&items[1..], env, out).map(TailAction::Return)
             }
@@ -692,6 +695,9 @@ fn is_builtin(name: &str) -> bool {
             | "integer->char"
             | "map"
             | "apply"
+            | "equal?" | "eqv?" | "eq?"
+            | "vector" | "make-vector" | "vector-ref" | "vector-set!"
+            | "vector-length" | "vector?" | "vector->list" | "list->vector"
     )
 }
 
@@ -797,6 +803,17 @@ fn eval_builtin(
         "integer->char" => eval_integer_to_char(args, env, out),
         "map" => eval_map(args, env, out),
         "apply" => eval_apply(args, env, out),
+        "equal?" => eval_equal(args, env, out),
+        "eqv?" => eval_eqv(args, env, out),
+        "eq?" => eval_eqv(args, env, out),
+        "vector" => eval_vector_create(args, env, out),
+        "make-vector" => eval_make_vector(args, env, out),
+        "vector-ref" => eval_vector_ref(args, env, out),
+        "vector-set!" => eval_vector_set(args, env, out),
+        "vector-length" => eval_vector_length(args, env, out),
+        "vector?" => eval_type_pred(args, env, out, |v| matches!(v, Value::Vector(_))),
+        "vector->list" => eval_vector_to_list(args, env, out),
+        "list->vector" => eval_list_to_vector(args, env, out),
         _ => Err(EvalError::UnknownProcedure {
             name: name.into(),
         }),
@@ -1592,6 +1609,306 @@ fn eval_map(
     Ok(Value::List(results))
 }
 
+// --- Level 14: letrec, letrec*, case, equal?, eqv?, vectors ---
+
+fn eval_letrec_tail(
+    args: &[Value],
+    env: &Rc<RefCell<Env>>,
+    out: &Output,
+) -> Result<TailAction, EvalError> {
+    if args.len() < 2 {
+        return Err(EvalError::Parse {
+            message: "letrec: expected bindings and body".into(),
+        });
+    }
+    let Value::List(bindings) = &args[0] else {
+        return Err(EvalError::Parse {
+            message: "letrec: expected binding list".into(),
+        });
+    };
+    let child = Env::extend(env);
+    // First pass: bind all names to Void so they're visible
+    let mut names = Vec::new();
+    let mut init_exprs = Vec::new();
+    for binding in bindings {
+        let (name, expr) = parse_let_binding(binding)?;
+        child.borrow_mut().define(name.to_string(), Value::Void);
+        names.push(name.to_string());
+        init_exprs.push(expr.clone());
+    }
+    // Second pass: evaluate inits in the child env and set values
+    for (name, init_expr) in names.iter().zip(&init_exprs) {
+        let val = eval(init_expr, &child, out)?;
+        child.borrow_mut().define(name.clone(), val);
+    }
+    eval_body_tail(&args[1..], &child, out)
+}
+
+fn eval_letrec_star_tail(
+    args: &[Value],
+    env: &Rc<RefCell<Env>>,
+    out: &Output,
+) -> Result<TailAction, EvalError> {
+    if args.len() < 2 {
+        return Err(EvalError::Parse {
+            message: "letrec*: expected bindings and body".into(),
+        });
+    }
+    let Value::List(bindings) = &args[0] else {
+        return Err(EvalError::Parse {
+            message: "letrec*: expected binding list".into(),
+        });
+    };
+    let child = Env::extend(env);
+    for binding in bindings {
+        let (name, expr) = parse_let_binding(binding)?;
+        let val = eval(expr, &child, out)?;
+        child.borrow_mut().define(name.to_string(), val);
+    }
+    eval_body_tail(&args[1..], &child, out)
+}
+
+fn eval_case_tail(
+    args: &[Value],
+    env: &Rc<RefCell<Env>>,
+    out: &Output,
+) -> Result<TailAction, EvalError> {
+    if args.is_empty() {
+        return Err(EvalError::Parse {
+            message: "case: expected key and clauses".into(),
+        });
+    }
+    let key = eval(&args[0], env, out)?;
+    for clause in &args[1..] {
+        let Value::List(parts) = clause else {
+            return Err(EvalError::Parse {
+                message: "case: expected clause".into(),
+            });
+        };
+        if parts.is_empty() {
+            return Err(EvalError::Parse {
+                message: "case: empty clause".into(),
+            });
+        }
+        if matches!(&parts[0], Value::Symbol(s) if s == "else") {
+            return eval_body_tail(&parts[1..], env, out);
+        }
+        let Value::List(datums) = &parts[0] else {
+            return Err(EvalError::Parse {
+                message: "case: expected datum list".into(),
+            });
+        };
+        if datums.iter().any(|d| key.eqv(d)) {
+            return eval_body_tail(&parts[1..], env, out);
+        }
+    }
+    Ok(TailAction::Return(Value::Void))
+}
+
+fn eval_equal(
+    args: &[Value],
+    env: &Rc<RefCell<Env>>,
+    out: &Output,
+) -> Result<Value, EvalError> {
+    let [a, b] = args else {
+        return Err(EvalError::WrongArgCount {
+            expected: 2,
+            got: args.len(),
+        });
+    };
+    let va = eval(a, env, out)?;
+    let vb = eval(b, env, out)?;
+    Ok(Value::Boolean(va.deep_equal(&vb)))
+}
+
+fn eval_eqv(
+    args: &[Value],
+    env: &Rc<RefCell<Env>>,
+    out: &Output,
+) -> Result<Value, EvalError> {
+    let [a, b] = args else {
+        return Err(EvalError::WrongArgCount {
+            expected: 2,
+            got: args.len(),
+        });
+    };
+    let va = eval(a, env, out)?;
+    let vb = eval(b, env, out)?;
+    Ok(Value::Boolean(va.eqv(&vb)))
+}
+
+fn eval_vector_create(
+    args: &[Value],
+    env: &Rc<RefCell<Env>>,
+    out: &Output,
+) -> Result<Value, EvalError> {
+    let items: Vec<Value> = args
+        .iter()
+        .map(|a| eval(a, env, out))
+        .collect::<Result<_, _>>()?;
+    Ok(Value::Vector(Rc::new(RefCell::new(items))))
+}
+
+fn eval_make_vector(
+    args: &[Value],
+    env: &Rc<RefCell<Env>>,
+    out: &Output,
+) -> Result<Value, EvalError> {
+    let (size, fill) = match args {
+        [size_arg] => (eval(size_arg, env, out)?, Value::Integer(0)),
+        [size_arg, fill_arg] => (eval(size_arg, env, out)?, eval(fill_arg, env, out)?),
+        _ => {
+            return Err(EvalError::WrongArgCount {
+                expected: 1,
+                got: args.len(),
+            })
+        }
+    };
+    let Value::Integer(n) = size else {
+        return Err(EvalError::TypeError {
+            expected: "integer".into(),
+            got: format!("{size}"),
+        });
+    };
+    Ok(Value::Vector(Rc::new(RefCell::new(vec![fill; n as usize]))))
+}
+
+fn eval_vector_ref(
+    args: &[Value],
+    env: &Rc<RefCell<Env>>,
+    out: &Output,
+) -> Result<Value, EvalError> {
+    let [vec_arg, idx_arg] = args else {
+        return Err(EvalError::WrongArgCount {
+            expected: 2,
+            got: args.len(),
+        });
+    };
+    let vec_val = eval(vec_arg, env, out)?;
+    let idx_val = eval(idx_arg, env, out)?;
+    let Value::Vector(v) = vec_val else {
+        return Err(EvalError::TypeError {
+            expected: "vector".into(),
+            got: format!("{vec_val}"),
+        });
+    };
+    let Value::Integer(idx) = idx_val else {
+        return Err(EvalError::TypeError {
+            expected: "integer".into(),
+            got: format!("{idx_val}"),
+        });
+    };
+    let items = v.borrow();
+    items.get(idx as usize).cloned().ok_or_else(|| EvalError::TypeError {
+        expected: format!("index in range 0..{}", items.len()),
+        got: format!("{idx}"),
+    })
+}
+
+fn eval_vector_set(
+    args: &[Value],
+    env: &Rc<RefCell<Env>>,
+    out: &Output,
+) -> Result<Value, EvalError> {
+    let [vec_arg, idx_arg, val_arg] = args else {
+        return Err(EvalError::WrongArgCount {
+            expected: 3,
+            got: args.len(),
+        });
+    };
+    let vec_val = eval(vec_arg, env, out)?;
+    let idx_val = eval(idx_arg, env, out)?;
+    let new_val = eval(val_arg, env, out)?;
+    let Value::Vector(v) = vec_val else {
+        return Err(EvalError::TypeError {
+            expected: "vector".into(),
+            got: format!("{vec_val}"),
+        });
+    };
+    let Value::Integer(idx) = idx_val else {
+        return Err(EvalError::TypeError {
+            expected: "integer".into(),
+            got: format!("{idx_val}"),
+        });
+    };
+    let mut items = v.borrow_mut();
+    let i = idx as usize;
+    if i >= items.len() {
+        return Err(EvalError::TypeError {
+            expected: format!("index in range 0..{}", items.len()),
+            got: format!("{idx}"),
+        });
+    }
+    items[i] = new_val;
+    Ok(Value::Void)
+}
+
+fn eval_vector_length(
+    args: &[Value],
+    env: &Rc<RefCell<Env>>,
+    out: &Output,
+) -> Result<Value, EvalError> {
+    let [vec_arg] = args else {
+        return Err(EvalError::WrongArgCount {
+            expected: 1,
+            got: args.len(),
+        });
+    };
+    let vec_val = eval(vec_arg, env, out)?;
+    let Value::Vector(v) = vec_val else {
+        return Err(EvalError::TypeError {
+            expected: "vector".into(),
+            got: format!("{vec_val}"),
+        });
+    };
+    let len = v.borrow().len() as i64;
+    Ok(Value::Integer(len))
+}
+
+fn eval_vector_to_list(
+    args: &[Value],
+    env: &Rc<RefCell<Env>>,
+    out: &Output,
+) -> Result<Value, EvalError> {
+    let [vec_arg] = args else {
+        return Err(EvalError::WrongArgCount {
+            expected: 1,
+            got: args.len(),
+        });
+    };
+    let vec_val = eval(vec_arg, env, out)?;
+    let Value::Vector(v) = vec_val else {
+        return Err(EvalError::TypeError {
+            expected: "vector".into(),
+            got: format!("{vec_val}"),
+        });
+    };
+    let items = v.borrow().clone();
+    Ok(Value::List(items))
+}
+
+fn eval_list_to_vector(
+    args: &[Value],
+    env: &Rc<RefCell<Env>>,
+    out: &Output,
+) -> Result<Value, EvalError> {
+    let [list_arg] = args else {
+        return Err(EvalError::WrongArgCount {
+            expected: 1,
+            got: args.len(),
+        });
+    };
+    let list_val = eval(list_arg, env, out)?;
+    let Value::List(items) = list_val else {
+        return Err(EvalError::TypeError {
+            expected: "list".into(),
+            got: format!("{list_val}"),
+        });
+    };
+    let vec = Rc::new(RefCell::new(items));
+    Ok(Value::Vector(vec))
+}
+
 /// Seed all builtin procedures into the environment as first-class values.
 pub fn seed_builtins(env: &Rc<RefCell<Env>>) {
     let names = [
@@ -1605,6 +1922,9 @@ pub fn seed_builtins(env: &Rc<RefCell<Env>>) {
         "string-ref", "string-copy", "string->list", "list->string",
         "char->integer", "integer->char",
         "map", "apply",
+        "equal?", "eqv?", "eq?",
+        "vector", "make-vector", "vector-ref", "vector-set!",
+        "vector-length", "vector?", "vector->list", "list->vector",
         "call/cc", "call-with-current-continuation",
     ];
     let mut env_ref = env.borrow_mut();
