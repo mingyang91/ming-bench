@@ -26,20 +26,34 @@ pub fn eval_str(input: &str) -> Result<String, EvalError> {
         });
     }
     let mut env = Env::new();
+    let mut output = String::new();
     let mut last = Value::Boolean(false);
     for expr in &exprs {
-        last = eval(expr, &mut env)?;
+        last = eval(expr, &mut env, &mut output)?;
     }
     Ok(last.to_string())
 }
 
 /// Evaluate Scheme expressions, returning both the result value and
 /// any output produced by `display`, `write`, or `newline`.
-pub fn eval_str_with_output(_input: &str) -> Result<(String, String), EvalError> {
-    todo!()
+pub fn eval_str_with_output(input: &str) -> Result<(String, String), EvalError> {
+    let exprs = parser::parse(input)?;
+    if exprs.is_empty() {
+        return Err(EvalError::Parse {
+            message: "empty input".to_string(),
+            span: Span { line: 1, col: 1 },
+        });
+    }
+    let mut env = Env::new();
+    let mut output = String::new();
+    let mut last = Value::Boolean(false);
+    for expr in &exprs {
+        last = eval(expr, &mut env, &mut output)?;
+    }
+    Ok((last.to_string(), output))
 }
 
-pub(crate) fn eval(value: &Value, env: &mut Env) -> Result<Value, EvalError> {
+pub(crate) fn eval(value: &Value, env: &mut Env, output: &mut String) -> Result<Value, EvalError> {
     match value {
         Value::Integer(_) | Value::Boolean(_) | Value::String(_) | Value::Lambda { .. } => {
             Ok(value.clone())
@@ -50,11 +64,16 @@ pub(crate) fn eval(value: &Value, env: &mut Env) -> Result<Value, EvalError> {
                 span: *span,
             })
         }
-        Value::List(items, span) => eval_list(items, *span, env),
+        Value::List(items, span) => eval_list(items, *span, env, output),
     }
 }
 
-fn eval_list(items: &[Value], span: Span, env: &mut Env) -> Result<Value, EvalError> {
+fn eval_list(
+    items: &[Value],
+    span: Span,
+    env: &mut Env,
+    output: &mut String,
+) -> Result<Value, EvalError> {
     let [operator, args @ ..] = items else {
         return Err(EvalError::Parse {
             message: "empty application".to_string(),
@@ -65,15 +84,15 @@ fn eval_list(items: &[Value], span: Span, env: &mut Env) -> Result<Value, EvalEr
     // Handle special forms first (unevaluated operator)
     if let Value::Symbol(name, _) = operator {
         match name.as_str() {
-            "define" => return eval_define(args, env, span),
-            "if" => return eval_if(args, env, span),
+            "define" => return eval_define(args, env, span, output),
+            "if" => return eval_if(args, env, span, output),
             "quote" => return eval_quote(args, span),
-            "and" => return eval_and(args, env),
-            "or" => return eval_or(args, env),
+            "and" => return eval_and(args, env, output),
+            "or" => return eval_or(args, env, output),
             "lambda" => return eval_lambda(args, env, span),
-            "let" => return eval_let(args, env, span),
-            "begin" => return eval_begin(args, env, span),
-            "cond" => return eval_cond(args, env, span),
+            "let" => return eval_let(args, env, span, output),
+            "begin" => return eval_begin(args, env, span, output),
+            "cond" => return eval_cond(args, env, span, output),
             _ => {}
         }
     }
@@ -81,21 +100,27 @@ fn eval_list(items: &[Value], span: Span, env: &mut Env) -> Result<Value, EvalEr
     // Try builtin functions for known symbol names not in env
     if let Value::Symbol(name, _) = operator {
         if is_builtin(name) {
-            return apply_builtin(name, args, env, span);
+            return apply_builtin(name, args, env, span, output);
         }
     }
 
     // Evaluate operator and apply
-    let proc = eval(operator, env)?;
+    let proc = eval(operator, env, output)?;
     let evaluated_args: Vec<Value> = args
         .iter()
-        .map(|a| eval(a, env))
+        .map(|a| eval(a, env, output))
         .collect::<Result<_, _>>()?;
 
-    apply(proc, &evaluated_args, env, span)
+    apply(proc, &evaluated_args, env, span, output)
 }
 
-fn apply(proc: Value, args: &[Value], env: &mut Env, span: Span) -> Result<Value, EvalError> {
+fn apply(
+    proc: Value,
+    args: &[Value],
+    env: &mut Env,
+    span: Span,
+    output: &mut String,
+) -> Result<Value, EvalError> {
     match &proc {
         Value::Lambda {
             params,
@@ -116,7 +141,7 @@ fn apply(proc: Value, args: &[Value], env: &mut Env, span: Span) -> Result<Value
             for (param, arg) in params.iter().zip(args) {
                 local_env.insert(param.clone(), arg.clone());
             }
-            eval_body(body, Value::Boolean(false), &mut local_env)
+            eval_body(body, Value::Boolean(false), &mut local_env, output)
         }
         other => Err(EvalError::TypeError {
             expected: "procedure".to_string(),
@@ -126,8 +151,12 @@ fn apply(proc: Value, args: &[Value], env: &mut Env, span: Span) -> Result<Value
     }
 }
 
-pub(crate) fn eval_to_integer(value: &Value, env: &mut Env) -> Result<i64, EvalError> {
-    let result = eval(value, env)?;
+pub(crate) fn eval_to_integer(
+    value: &Value,
+    env: &mut Env,
+    output: &mut String,
+) -> Result<i64, EvalError> {
+    let result = eval(value, env, output)?;
     match &result {
         Value::Integer(n) => Ok(*n),
         other => Err(EvalError::TypeError {

@@ -2,11 +2,16 @@ use super::{eval, is_truthy, Env};
 use crate::scheme::error::EvalError;
 use crate::scheme::value::{Span, Value};
 
-pub(crate) fn eval_define(args: &[Value], env: &mut Env, span: Span) -> Result<Value, EvalError> {
+pub(crate) fn eval_define(
+    args: &[Value],
+    env: &mut Env,
+    span: Span,
+    output: &mut String,
+) -> Result<Value, EvalError> {
     match args {
         // (define x expr)
         [Value::Symbol(name, _), expr] => {
-            let val = eval(expr, env)?;
+            let val = eval(expr, env, output)?;
             env.insert(name.clone(), val);
             Ok(Value::Symbol(name.clone(), span))
         }
@@ -34,7 +39,12 @@ pub(crate) fn eval_define(args: &[Value], env: &mut Env, span: Span) -> Result<V
     }
 }
 
-pub(crate) fn eval_if(args: &[Value], env: &mut Env, span: Span) -> Result<Value, EvalError> {
+pub(crate) fn eval_if(
+    args: &[Value],
+    env: &mut Env,
+    span: Span,
+    output: &mut String,
+) -> Result<Value, EvalError> {
     let [condition, consequent, alternative] = args else {
         return Err(EvalError::WrongArgCount {
             expected: 3,
@@ -42,11 +52,11 @@ pub(crate) fn eval_if(args: &[Value], env: &mut Env, span: Span) -> Result<Value
             span,
         });
     };
-    let cond_val = eval(condition, env)?;
+    let cond_val = eval(condition, env, output)?;
     if is_truthy(&cond_val) {
-        eval(consequent, env)
+        eval(consequent, env, output)
     } else {
-        eval(alternative, env)
+        eval(alternative, env, output)
     }
 }
 
@@ -82,7 +92,12 @@ pub(crate) fn eval_lambda(args: &[Value], env: &Env, span: Span) -> Result<Value
     })
 }
 
-pub(crate) fn eval_let(args: &[Value], env: &mut Env, span: Span) -> Result<Value, EvalError> {
+pub(crate) fn eval_let(
+    args: &[Value],
+    env: &mut Env,
+    span: Span,
+    output: &mut String,
+) -> Result<Value, EvalError> {
     let [Value::List(bindings, _), body @ ..] = args else {
         return Err(EvalError::Parse {
             message: "let requires a bindings list and body".to_string(),
@@ -109,23 +124,33 @@ pub(crate) fn eval_let(args: &[Value], env: &mut Env, span: Span) -> Result<Valu
                 span,
             });
         };
-        let val = eval(expr, env)?;
+        let val = eval(expr, env, output)?;
         local_env.insert(name.clone(), val);
     }
-    eval_body(body, Value::Boolean(false), &mut local_env)
+    eval_body(body, Value::Boolean(false), &mut local_env, output)
 }
 
-pub(crate) fn eval_begin(args: &[Value], env: &mut Env, span: Span) -> Result<Value, EvalError> {
+pub(crate) fn eval_begin(
+    args: &[Value],
+    env: &mut Env,
+    span: Span,
+    output: &mut String,
+) -> Result<Value, EvalError> {
     if args.is_empty() {
         return Err(EvalError::Parse {
             message: "begin requires at least one expression".to_string(),
             span,
         });
     }
-    eval_body(args, Value::Boolean(false), env)
+    eval_body(args, Value::Boolean(false), env, output)
 }
 
-pub(crate) fn eval_cond(args: &[Value], env: &mut Env, span: Span) -> Result<Value, EvalError> {
+pub(crate) fn eval_cond(
+    args: &[Value],
+    env: &mut Env,
+    span: Span,
+    output: &mut String,
+) -> Result<Value, EvalError> {
     for clause in args {
         let Value::List(items, _) = clause else {
             return Err(EvalError::Parse {
@@ -140,20 +165,24 @@ pub(crate) fn eval_cond(args: &[Value], env: &mut Env, span: Span) -> Result<Val
             });
         };
         if matches!(test, Value::Symbol(s, _) if s == "else") {
-            return eval_body(body, Value::Boolean(false), env);
+            return eval_body(body, Value::Boolean(false), env, output);
         }
-        let test_val = eval(test, env)?;
+        let test_val = eval(test, env, output)?;
         if is_truthy(&test_val) {
-            return eval_body(body, test_val, env);
+            return eval_body(body, test_val, env, output);
         }
     }
     Ok(Value::Boolean(false))
 }
 
-pub(crate) fn eval_and(args: &[Value], env: &mut Env) -> Result<Value, EvalError> {
+pub(crate) fn eval_and(
+    args: &[Value],
+    env: &mut Env,
+    output: &mut String,
+) -> Result<Value, EvalError> {
     let mut result = Value::Boolean(true);
     for arg in args {
-        result = eval(arg, env)?;
+        result = eval(arg, env, output)?;
         if !is_truthy(&result) {
             return Ok(result);
         }
@@ -161,10 +190,14 @@ pub(crate) fn eval_and(args: &[Value], env: &mut Env) -> Result<Value, EvalError
     Ok(result)
 }
 
-pub(crate) fn eval_or(args: &[Value], env: &mut Env) -> Result<Value, EvalError> {
+pub(crate) fn eval_or(
+    args: &[Value],
+    env: &mut Env,
+    output: &mut String,
+) -> Result<Value, EvalError> {
     let mut result = Value::Boolean(false);
     for arg in args {
-        result = eval(arg, env)?;
+        result = eval(arg, env, output)?;
         if is_truthy(&result) {
             return Ok(result);
         }
@@ -176,8 +209,10 @@ pub(crate) fn eval_body(
     body: &[Value],
     default: Value,
     env: &mut Env,
+    output: &mut String,
 ) -> Result<Value, EvalError> {
-    body.iter().try_fold(default, |_, expr| eval(expr, env))
+    body.iter()
+        .try_fold(default, |_, expr| eval(expr, env, output))
 }
 
 fn extract_params(param_vals: &[Value], span: Span) -> Result<Vec<String>, EvalError> {

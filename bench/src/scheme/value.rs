@@ -53,3 +53,21 @@ impl fmt::Display for Value {
         }
     }
 }
+
+impl Value {
+    /// Format in `display` style: strings without quotes, everything else same.
+    pub fn display_fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Value::String(s) => write!(f, "{s}"),
+            other => write!(f, "{other}"),
+        }
+    }
+
+    /// Return the display-style string representation.
+    pub fn to_display_string(&self) -> String {
+        match self {
+            Value::String(s) => s.clone(),
+            other => format!("{other}"),
+        }
+    }
+}

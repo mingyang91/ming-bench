@@ -8,6 +8,7 @@ pub fn is_builtin(name: &str) -> bool {
         "+" | "-" | "*" | "/" | "<" | ">" | "=" | "<=" | ">=" | "not"
             | "cons" | "car" | "cdr" | "null?" | "list" | "length"
             | "boolean?" | "number?" | "pair?" | "string?" | "symbol?"
+            | "display" | "write" | "newline"
     )
 }
 
@@ -16,20 +17,24 @@ pub fn apply_builtin(
     args: &[Value],
     env: &mut Env,
     span: Span,
+    output: &mut String,
 ) -> Result<Value, EvalError> {
     match name {
-        "+" | "-" | "*" | "/" => apply_arithmetic(name, args, env, span),
-        "<" | ">" | "=" | "<=" | ">=" => apply_comparison(name, args, env, span),
-        "not" => apply_not(args, env, span),
-        "cons" => apply_cons(args, env, span),
-        "car" => apply_car(args, env, span),
-        "cdr" => apply_cdr(args, env, span),
-        "null?" => apply_null(args, env, span),
-        "list" => apply_list(args, env),
-        "length" => apply_length(args, env, span),
+        "+" | "-" | "*" | "/" => apply_arithmetic(name, args, env, span, output),
+        "<" | ">" | "=" | "<=" | ">=" => apply_comparison(name, args, env, span, output),
+        "not" => apply_not(args, env, span, output),
+        "cons" => apply_cons(args, env, span, output),
+        "car" => apply_car(args, env, span, output),
+        "cdr" => apply_cdr(args, env, span, output),
+        "null?" => apply_null(args, env, span, output),
+        "list" => apply_list(args, env, output),
+        "length" => apply_length(args, env, span, output),
         "boolean?" | "number?" | "pair?" | "string?" | "symbol?" => {
-            apply_type_pred(name, args, env, span)
+            apply_type_pred(name, args, env, span, output)
         }
+        "display" => apply_display(args, env, span, output),
+        "write" => apply_write(args, env, span, output),
+        "newline" => apply_newline(args, span, output),
         _ => Err(EvalError::UnboundVariable {
             name: name.to_string(),
             span,
@@ -50,10 +55,11 @@ fn apply_arithmetic(
     args: &[Value],
     env: &mut Env,
     span: Span,
+    output: &mut String,
 ) -> Result<Value, EvalError> {
     let evaluated: Vec<i64> = args
         .iter()
-        .map(|a| eval_to_integer(a, env))
+        .map(|a| eval_to_integer(a, env, output))
         .collect::<Result<_, _>>()?;
 
     let result = match op {
@@ -90,7 +96,12 @@ fn apply_arithmetic(
     Ok(Value::Integer(result))
 }
 
-fn apply_not(args: &[Value], env: &mut Env, span: Span) -> Result<Value, EvalError> {
+fn apply_not(
+    args: &[Value],
+    env: &mut Env,
+    span: Span,
+    output: &mut String,
+) -> Result<Value, EvalError> {
     let [arg] = args else {
         return Err(EvalError::WrongArgCount {
             expected: 1,
@@ -98,11 +109,16 @@ fn apply_not(args: &[Value], env: &mut Env, span: Span) -> Result<Value, EvalErr
             span,
         });
     };
-    let val = eval(arg, env)?;
+    let val = eval(arg, env, output)?;
     Ok(Value::Boolean(!is_truthy(&val)))
 }
 
-fn apply_cons(args: &[Value], env: &mut Env, span: Span) -> Result<Value, EvalError> {
+fn apply_cons(
+    args: &[Value],
+    env: &mut Env,
+    span: Span,
+    output: &mut String,
+) -> Result<Value, EvalError> {
     let [head, tail] = args else {
         return Err(EvalError::WrongArgCount {
             expected: 2,
@@ -110,8 +126,8 @@ fn apply_cons(args: &[Value], env: &mut Env, span: Span) -> Result<Value, EvalEr
             span,
         });
     };
-    let head_val = eval(head, env)?;
-    let tail_val = eval(tail, env)?;
+    let head_val = eval(head, env, output)?;
+    let tail_val = eval(tail, env, output)?;
     match tail_val {
         Value::List(mut items, list_span) => {
             items.insert(0, head_val);
@@ -125,7 +141,12 @@ fn apply_cons(args: &[Value], env: &mut Env, span: Span) -> Result<Value, EvalEr
     }
 }
 
-fn apply_car(args: &[Value], env: &mut Env, span: Span) -> Result<Value, EvalError> {
+fn apply_car(
+    args: &[Value],
+    env: &mut Env,
+    span: Span,
+    output: &mut String,
+) -> Result<Value, EvalError> {
     let [arg] = args else {
         return Err(EvalError::WrongArgCount {
             expected: 1,
@@ -133,7 +154,7 @@ fn apply_car(args: &[Value], env: &mut Env, span: Span) -> Result<Value, EvalErr
             span,
         });
     };
-    let val = eval(arg, env)?;
+    let val = eval(arg, env, output)?;
     match val {
         Value::List(items, _) if !items.is_empty() => {
             Ok(items.into_iter().next().expect("non-empty list"))
@@ -151,7 +172,12 @@ fn apply_car(args: &[Value], env: &mut Env, span: Span) -> Result<Value, EvalErr
     }
 }
 
-fn apply_cdr(args: &[Value], env: &mut Env, span: Span) -> Result<Value, EvalError> {
+fn apply_cdr(
+    args: &[Value],
+    env: &mut Env,
+    span: Span,
+    output: &mut String,
+) -> Result<Value, EvalError> {
     let [arg] = args else {
         return Err(EvalError::WrongArgCount {
             expected: 1,
@@ -159,7 +185,7 @@ fn apply_cdr(args: &[Value], env: &mut Env, span: Span) -> Result<Value, EvalErr
             span,
         });
     };
-    let val = eval(arg, env)?;
+    let val = eval(arg, env, output)?;
     match val {
         Value::List(items, list_span) if !items.is_empty() => {
             Ok(Value::List(items[1..].to_vec(), list_span))
@@ -177,7 +203,12 @@ fn apply_cdr(args: &[Value], env: &mut Env, span: Span) -> Result<Value, EvalErr
     }
 }
 
-fn apply_null(args: &[Value], env: &mut Env, span: Span) -> Result<Value, EvalError> {
+fn apply_null(
+    args: &[Value],
+    env: &mut Env,
+    span: Span,
+    output: &mut String,
+) -> Result<Value, EvalError> {
     let [arg] = args else {
         return Err(EvalError::WrongArgCount {
             expected: 1,
@@ -185,22 +216,27 @@ fn apply_null(args: &[Value], env: &mut Env, span: Span) -> Result<Value, EvalEr
             span,
         });
     };
-    let val = eval(arg, env)?;
+    let val = eval(arg, env, output)?;
     Ok(Value::Boolean(matches!(
         val,
         Value::List(ref items, _) if items.is_empty()
     )))
 }
 
-fn apply_list(args: &[Value], env: &mut Env) -> Result<Value, EvalError> {
+fn apply_list(args: &[Value], env: &mut Env, output: &mut String) -> Result<Value, EvalError> {
     let items: Vec<Value> = args
         .iter()
-        .map(|a| eval(a, env))
+        .map(|a| eval(a, env, output))
         .collect::<Result<_, _>>()?;
     Ok(Value::List(items, Span::default()))
 }
 
-fn apply_length(args: &[Value], env: &mut Env, span: Span) -> Result<Value, EvalError> {
+fn apply_length(
+    args: &[Value],
+    env: &mut Env,
+    span: Span,
+    output: &mut String,
+) -> Result<Value, EvalError> {
     let [arg] = args else {
         return Err(EvalError::WrongArgCount {
             expected: 1,
@@ -208,7 +244,7 @@ fn apply_length(args: &[Value], env: &mut Env, span: Span) -> Result<Value, Eval
             span,
         });
     };
-    let val = eval(arg, env)?;
+    let val = eval(arg, env, output)?;
     match val {
         Value::List(items, _) => Ok(Value::Integer(items.len() as i64)),
         other => Err(EvalError::TypeError {
@@ -224,6 +260,7 @@ fn apply_type_pred(
     args: &[Value],
     env: &mut Env,
     span: Span,
+    output: &mut String,
 ) -> Result<Value, EvalError> {
     let [arg] = args else {
         return Err(EvalError::WrongArgCount {
@@ -232,7 +269,7 @@ fn apply_type_pred(
             span,
         });
     };
-    let val = eval(arg, env)?;
+    let val = eval(arg, env, output)?;
     let result = match name {
         "boolean?" => matches!(val, Value::Boolean(_)),
         "number?" => matches!(val, Value::Integer(_)),
@@ -249,6 +286,7 @@ fn apply_comparison(
     args: &[Value],
     env: &mut Env,
     span: Span,
+    output: &mut String,
 ) -> Result<Value, EvalError> {
     let [left, right] = args else {
         return Err(EvalError::WrongArgCount {
@@ -257,8 +295,8 @@ fn apply_comparison(
             span,
         });
     };
-    let a = eval_to_integer(left, env)?;
-    let b = eval_to_integer(right, env)?;
+    let a = eval_to_integer(left, env, output)?;
+    let b = eval_to_integer(right, env, output)?;
 
     let result = match op {
         "<" => a < b,
@@ -269,4 +307,52 @@ fn apply_comparison(
         _ => unreachable!("apply_comparison called with non-comparison op"),
     };
     Ok(Value::Boolean(result))
+}
+
+fn apply_display(
+    args: &[Value],
+    env: &mut Env,
+    span: Span,
+    output: &mut String,
+) -> Result<Value, EvalError> {
+    let [arg] = args else {
+        return Err(EvalError::WrongArgCount {
+            expected: 1,
+            got: args.len(),
+            span,
+        });
+    };
+    let val = eval(arg, env, output)?;
+    output.push_str(&val.to_display_string());
+    Ok(Value::Boolean(false))
+}
+
+fn apply_write(
+    args: &[Value],
+    env: &mut Env,
+    span: Span,
+    output: &mut String,
+) -> Result<Value, EvalError> {
+    let [arg] = args else {
+        return Err(EvalError::WrongArgCount {
+            expected: 1,
+            got: args.len(),
+            span,
+        });
+    };
+    let val = eval(arg, env, output)?;
+    output.push_str(&format!("{val}"));
+    Ok(Value::Boolean(false))
+}
+
+fn apply_newline(args: &[Value], span: Span, output: &mut String) -> Result<Value, EvalError> {
+    if !args.is_empty() {
+        return Err(EvalError::WrongArgCount {
+            expected: 0,
+            got: args.len(),
+            span,
+        });
+    }
+    output.push('\n');
+    Ok(Value::Boolean(false))
 }
