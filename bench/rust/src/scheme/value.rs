@@ -11,6 +11,7 @@ pub enum Value {
     Boolean(bool),
     Str(String),
     Symbol(String),
+    Char(char),
     List(Vec<Value>),
     Lambda {
         params: Vec<String>,
@@ -27,6 +28,7 @@ impl PartialEq for Value {
             (Value::Boolean(a), Value::Boolean(b)) => a == b,
             (Value::Str(a), Value::Str(b)) => a == b,
             (Value::Symbol(a), Value::Symbol(b)) => a == b,
+            (Value::Char(a), Value::Char(b)) => a == b,
             (Value::List(a), Value::List(b)) => a == b,
             (Value::Void, Value::Void) => true,
             _ => false,
@@ -45,6 +47,17 @@ fn write_list(f: &mut fmt::Formatter<'_>, items: &[Value]) -> fmt::Result {
     write!(f, ")")
 }
 
+impl Value {
+    /// Format value for `display` (no quotes on strings).
+    pub fn display_value(&self) -> String {
+        match self {
+            Value::Str(s) => s.clone(),
+            Value::Char(c) => c.to_string(),
+            other => other.to_string(),
+        }
+    }
+}
+
 impl fmt::Display for Value {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
@@ -54,6 +67,7 @@ impl fmt::Display for Value {
             Value::Str(s) => write!(f, "\"{s}\""),
             Value::Symbol(s) => write!(f, "{s}"),
             Value::List(items) => write_list(f, items),
+            Value::Char(c) => write!(f, "#\\{c}"),
             Value::Lambda { .. } => write!(f, "#<procedure>"),
             Value::Void => write!(f, "#<void>"),
         }
