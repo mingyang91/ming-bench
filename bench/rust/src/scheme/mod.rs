@@ -3,6 +3,7 @@ pub mod error;
 pub use error::EvalError;
 
 use std::collections::HashMap;
+use std::rc::Rc;
 
 /// Source position (1-indexed line, 0-indexed column).
 #[derive(Debug, Clone, Copy)]
@@ -28,8 +29,8 @@ enum Value {
     Pair(Box<Value>, Box<Value>),
     Nil,
     Lambda {
-        params: Vec<String>,
-        body: Vec<Expr>,
+        params: Rc<Vec<String>>,
+        body: Rc<Vec<Expr>>,
         env: Env,
     },
 }
@@ -168,6 +169,19 @@ impl Env {
             parent.set_existing(name, val)
         } else {
             false
+        }
+    }
+
+    /// Copy all bindings from this env chain into target, skipping any
+    /// that already exist in target's chain (preserves lexical scoping).
+    fn copy_all_into_if_absent(&self, target: &mut Env) {
+        for (k, v) in &self.bindings {
+            if target.get(k).is_none() {
+                target.set(k.clone(), v.clone());
+            }
+        }
+        if let Some(ref parent) = self.parent {
+            parent.copy_all_into_if_absent(target);
         }
     }
 }
@@ -409,124 +423,312 @@ impl Parser {
 // ── Evaluator ───────────────────────────────────────────────────────
 
 fn eval(expr: &Expr, env: &mut Env, out: &mut String) -> Result<Value, EvalError> {
-    let pos = expr.pos;
-    match &expr.kind {
-        ExprKind::Integer(n) => Ok(Value::Integer(*n)),
-        ExprKind::Boolean(b) => Ok(Value::Boolean(*b)),
-        ExprKind::Str(s) => Ok(Value::Str(s.clone())),
-        ExprKind::Char(c) => Ok(Value::Char(*c)),
-        ExprKind::Symbol(name) => env
-            .get(name)
-            .ok_or_else(|| EvalError::UnboundVariable(format!("{} at {}", name, pos.fmt()))),
-        ExprKind::List(items) => {
-            if items.is_empty() {
-                return Err(EvalError::Parse(format!(
-                    "empty application at {}",
-                    pos.fmt()
-                )));
+    let mut cur_expr = expr.clone();
+    let mut cur_env = env.clone();
+    let mut in_tco = false;
+
+    let result = 'tco: loop {
+        let pos = cur_expr.pos;
+        match cur_expr.kind.clone() {
+            ExprKind::Integer(n) => break 'tco Ok(Value::Integer(n)),
+            ExprKind::Boolean(b) => break 'tco Ok(Value::Boolean(b)),
+            ExprKind::Str(s) => break 'tco Ok(Value::Str(s)),
+            ExprKind::Char(c) => break 'tco Ok(Value::Char(c)),
+            ExprKind::Symbol(name) => {
+                break 'tco cur_env
+                    .get(&name)
+                    .ok_or_else(|| {
+                        EvalError::UnboundVariable(format!("{} at {}", name, pos.fmt()))
+                    });
             }
-            // Check for special forms
-            if let ExprKind::Symbol(op) = &items[0].kind {
-                match op.as_str() {
-                    "if" => return eval_if(&items[1..], pos, env, out),
-                    "define" => return eval_define(&items[1..], pos, env, out),
-                    "quote" => return eval_quote(&items[1..], pos),
-                    "lambda" => return eval_lambda(&items[1..], pos, env),
-                    "and" => return eval_and(&items[1..], env, out),
-                    "or" => return eval_or(&items[1..], env, out),
-                    "let" => return eval_let(&items[1..], pos, env, out),
-                    "begin" => return eval_begin(&items[1..], env, out),
-                    "cond" => return eval_cond(&items[1..], env, out),
-                    "string-set!" => return eval_string_set(&items[1..], pos, env, out),
-                    _ => {}
+            ExprKind::List(items) => {
+                if items.is_empty() {
+                    break 'tco Err(EvalError::Parse(format!(
+                        "empty application at {}",
+                        pos.fmt()
+                    )));
                 }
-            }
-            // Check for builtins by name before general eval
-            if let ExprKind::Symbol(name) = &items[0].kind {
+                // Check for special forms
+                if let ExprKind::Symbol(ref op) = items[0].kind {
+                    match op.as_str() {
+                        "if" => {
+                            let args = &items[1..];
+                            if args.len() < 2 || args.len() > 3 {
+                                break 'tco Err(EvalError::Arity(format!(
+                                    "if requires 2 or 3 arguments at {}",
+                                    pos.fmt()
+                                )));
+                            }
+                            let cond = eval(&args[0], &mut cur_env, out)?;
+                            if cond.is_truthy() {
+                                cur_expr = args[1].clone();
+                                continue 'tco;
+                            } else if args.len() == 3 {
+                                cur_expr = args[2].clone();
+                                continue 'tco;
+                            } else {
+                                break 'tco Ok(Value::Nil);
+                            }
+                        }
+                        "define" => {
+                            break 'tco eval_define(&items[1..], pos, &mut cur_env, out);
+                        }
+                        "quote" => {
+                            break 'tco eval_quote(&items[1..], pos);
+                        }
+                        "lambda" => {
+                            break 'tco eval_lambda(&items[1..], pos, &cur_env);
+                        }
+                        "and" => {
+                            let args = &items[1..];
+                            if args.is_empty() {
+                                break 'tco Ok(Value::Boolean(true));
+                            }
+                            for a in &args[..args.len() - 1] {
+                                let v = eval(a, &mut cur_env, out)?;
+                                if !v.is_truthy() {
+                                    break 'tco Ok(v);
+                                }
+                            }
+                            cur_expr = args.last().unwrap().clone();
+                            continue 'tco;
+                        }
+                        "or" => {
+                            let args = &items[1..];
+                            if args.is_empty() {
+                                break 'tco Ok(Value::Boolean(false));
+                            }
+                            for a in &args[..args.len() - 1] {
+                                let v = eval(a, &mut cur_env, out)?;
+                                if v.is_truthy() {
+                                    break 'tco Ok(v);
+                                }
+                            }
+                            cur_expr = args.last().unwrap().clone();
+                            continue 'tco;
+                        }
+                        "let" => {
+                            let args = &items[1..];
+                            if args.len() < 2 {
+                                break 'tco Err(EvalError::Arity(format!(
+                                    "let requires bindings and body at {}",
+                                    pos.fmt()
+                                )));
+                            }
+                            // Named let: (let name ((var init) ...) body ...)
+                            if let ExprKind::Symbol(ref loop_name) = args[0].kind {
+                                if args.len() < 3 {
+                                    break 'tco Err(EvalError::Arity(format!(
+                                        "named let requires bindings and body at {}",
+                                        pos.fmt()
+                                    )));
+                                }
+                                let bindings_list = match &args[1].kind {
+                                    ExprKind::List(bs) => bs,
+                                    _ => break 'tco Err(EvalError::Type(format!(
+                                        "let: bindings must be a list at {}",
+                                        pos.fmt()
+                                    ))),
+                                };
+                                let mut params = Vec::new();
+                                let mut init_vals = Vec::new();
+                                for b in bindings_list {
+                                    match &b.kind {
+                                        ExprKind::List(pair) if pair.len() == 2 => {
+                                            let pname = match &pair[0].kind {
+                                                ExprKind::Symbol(s) => s.clone(),
+                                                _ => break 'tco Err(EvalError::Type(format!(
+                                                    "let: binding name must be symbol at {}",
+                                                    pair[0].pos.fmt()
+                                                ))),
+                                            };
+                                            let val = eval(&pair[1], &mut cur_env, out)?;
+                                            params.push(pname);
+                                            init_vals.push(val);
+                                        }
+                                        _ => break 'tco Err(EvalError::Type(format!(
+                                            "let: invalid binding at {}",
+                                            b.pos.fmt()
+                                        ))),
+                                    }
+                                }
+                                let body = Rc::new(args[2..].to_vec());
+                                let mut new_env = Env::with_parent(&cur_env);
+                                for (p, v) in params.iter().zip(init_vals.into_iter()) {
+                                    new_env.set(p.clone(), v);
+                                }
+                                let lambda = Value::Lambda {
+                                    params: Rc::new(params),
+                                    body: body.clone(),
+                                    env: cur_env.clone(),
+                                };
+                                new_env.set(loop_name.clone(), lambda);
+                                for e in &body[..body.len() - 1] {
+                                    eval(e, &mut new_env, out)?;
+                                }
+                                cur_expr = body.last().unwrap().clone();
+                                cur_env = new_env;
+                                in_tco = true;
+                                continue 'tco;
+                            }
+                            // Regular let
+                            let bindings = match &args[0].kind {
+                                ExprKind::List(bs) => bs,
+                                _ => break 'tco Err(EvalError::Type(format!(
+                                    "let: bindings must be a list at {}",
+                                    pos.fmt()
+                                ))),
+                            };
+                            let mut local_env = Env::with_parent(&cur_env);
+                            for b in bindings {
+                                match &b.kind {
+                                    ExprKind::List(pair) if pair.len() == 2 => {
+                                        let bname = match &pair[0].kind {
+                                            ExprKind::Symbol(s) => s.clone(),
+                                            _ => break 'tco Err(EvalError::Type(format!(
+                                                "let: binding name must be symbol at {}",
+                                                pair[0].pos.fmt()
+                                            ))),
+                                        };
+                                        let val = eval(&pair[1], &mut cur_env, out)?;
+                                        local_env.set(bname, val);
+                                    }
+                                    _ => break 'tco Err(EvalError::Type(format!(
+                                        "let: invalid binding at {}",
+                                        b.pos.fmt()
+                                    ))),
+                                }
+                            }
+                            let body = &args[1..];
+                            for e in &body[..body.len() - 1] {
+                                eval(e, &mut local_env, out)?;
+                            }
+                            cur_expr = body.last().unwrap().clone();
+                            cur_env = local_env;
+                            in_tco = true;
+                            continue 'tco;
+                        }
+                        "begin" => {
+                            let args = &items[1..];
+                            if args.is_empty() {
+                                break 'tco Ok(Value::Nil);
+                            }
+                            for e in &args[..args.len() - 1] {
+                                eval(e, &mut cur_env, out)?;
+                            }
+                            cur_expr = args.last().unwrap().clone();
+                            continue 'tco;
+                        }
+                        "cond" => {
+                            let clauses = &items[1..];
+                            let mut found = false;
+                            for clause in clauses {
+                                match &clause.kind {
+                                    ExprKind::List(parts) if parts.len() >= 2 => {
+                                        let is_else = matches!(
+                                            &parts[0].kind,
+                                            ExprKind::Symbol(ref s) if s == "else"
+                                        );
+                                        if is_else
+                                            || eval(&parts[0], &mut cur_env, out)?.is_truthy()
+                                        {
+                                            for e in &parts[1..parts.len() - 1] {
+                                                eval(e, &mut cur_env, out)?;
+                                            }
+                                            cur_expr = parts.last().unwrap().clone();
+                                            found = true;
+                                            break;
+                                        }
+                                    }
+                                    _ => {
+                                        break 'tco Err(EvalError::Type(format!(
+                                            "cond: invalid clause at {}",
+                                            clause.pos.fmt()
+                                        )));
+                                    }
+                                }
+                            }
+                            if found {
+                                continue 'tco;
+                            }
+                            break 'tco Ok(Value::Nil);
+                        }
+                        "string-set!" => {
+                            break 'tco eval_string_set(
+                                &items[1..],
+                                pos,
+                                &mut cur_env,
+                                out,
+                            );
+                        }
+                        _ => {}
+                    }
+                }
+                // Function application
+                let func_name = match &items[0].kind {
+                    ExprKind::Symbol(name) => Some(name.clone()),
+                    _ => None,
+                };
                 let args: Result<Vec<Value>, _> =
-                    items[1..].iter().map(|a| eval(a, env, out)).collect();
+                    items[1..].iter().map(|a| eval(a, &mut cur_env, out)).collect();
                 let args = args?;
-                if let Some(result) = apply_builtin(name, &args, pos, out)? {
-                    return Ok(result);
+                if let Some(ref name) = func_name {
+                    if let Some(result) = apply_builtin(name, &args, pos, out)? {
+                        break 'tco Ok(result);
+                    }
                 }
-                // Not a builtin, look up in env
-                let func = env.get(name).ok_or_else(|| {
-                    EvalError::UnboundVariable(format!("{} at {}", name, pos.fmt()))
-                })?;
-                return apply_named(&func, &args, name, env, pos, out);
-            }
-            // General application (e.g., lambda expression in head position)
-            let func = eval(&items[0], env, out)?;
-            let args: Result<Vec<Value>, _> = items[1..].iter().map(|a| eval(a, env, out)).collect();
-            let args = args?;
-            apply(&func, &args, pos, out)
-        }
-    }
-}
-
-fn apply(func: &Value, args: &[Value], pos: Pos, out: &mut String) -> Result<Value, EvalError> {
-    apply_named(func, args, "", &Env::new(), pos, out)
-}
-
-fn apply_named(
-    func: &Value,
-    args: &[Value],
-    name: &str,
-    calling_env: &Env,
-    pos: Pos,
-    out: &mut String,
-) -> Result<Value, EvalError> {
-    match func {
-        Value::Lambda {
-            params,
-            body,
-            env,
-        } => {
-            if params.len() != args.len() {
-                return Err(EvalError::Arity(format!(
-                    "expected {} arguments, got {} at {}",
-                    params.len(),
-                    args.len(),
-                    pos.fmt()
-                )));
-            }
-            let mut local_env = Env::with_parent(env);
-            if !name.is_empty() {
-                if let Some(f) = calling_env.get(name) {
-                    local_env.set(name.to_string(), f);
+                let func = if let Some(ref name) = func_name {
+                    cur_env.get(name).ok_or_else(|| {
+                        EvalError::UnboundVariable(format!("{} at {}", name, pos.fmt()))
+                    })?
+                } else {
+                    eval(&items[0], &mut cur_env, out)?
+                };
+                match func {
+                    Value::Lambda {
+                        params,
+                        body,
+                        env: closure_env,
+                    } => {
+                        if params.len() != args.len() {
+                            break 'tco Err(EvalError::Arity(format!(
+                                "expected {} arguments, got {} at {}",
+                                params.len(),
+                                args.len(),
+                                pos.fmt()
+                            )));
+                        }
+                        let mut new_env = Env::with_parent(&closure_env);
+                        // Copy calling env bindings for mutual recursion support
+                        cur_env.copy_all_into_if_absent(&mut new_env);
+                        for (p, a) in params.iter().zip(args.into_iter()) {
+                            new_env.set(p.clone(), a);
+                        }
+                        if body.is_empty() {
+                            break 'tco Ok(Value::Nil);
+                        }
+                        for e in &body[..body.len() - 1] {
+                            eval(e, &mut new_env, out)?;
+                        }
+                        cur_expr = body.last().unwrap().clone();
+                        cur_env = new_env;
+                        in_tco = true;
+                        continue 'tco;
+                    }
+                    _ => {
+                        break 'tco Err(EvalError::Type(format!(
+                            "not a procedure at {}",
+                            pos.fmt()
+                        )));
+                    }
                 }
             }
-            for (p, a) in params.iter().zip(args.iter()) {
-                local_env.set(p.clone(), a.clone());
-            }
-            let mut result = Value::Boolean(false);
-            for expr in body {
-                result = eval(expr, &mut local_env, out)?;
-            }
-            Ok(result)
         }
-        _ => Err(EvalError::Type(format!(
-            "not a procedure at {}",
-            pos.fmt()
-        ))),
+    };
+    if !in_tco {
+        *env = cur_env;
     }
-}
-
-fn eval_if(args: &[Expr], pos: Pos, env: &mut Env, out: &mut String) -> Result<Value, EvalError> {
-    if args.len() < 2 || args.len() > 3 {
-        return Err(EvalError::Arity(format!(
-            "if requires 2 or 3 arguments at {}",
-            pos.fmt()
-        )));
-    }
-    let cond = eval(&args[0], env, out)?;
-    if cond.is_truthy() {
-        eval(&args[1], env, out)
-    } else if args.len() == 3 {
-        eval(&args[2], env, out)
-    } else {
-        Ok(Value::Nil)
-    }
+    result
 }
 
 fn eval_define(args: &[Expr], pos: Pos, env: &mut Env, out: &mut String) -> Result<Value, EvalError> {
@@ -577,8 +779,8 @@ fn eval_define(args: &[Expr], pos: Pos, env: &mut Env, out: &mut String) -> Resu
             let params = params?;
             let body = args[1..].to_vec();
             let lambda = Value::Lambda {
-                params,
-                body,
+                params: Rc::new(params),
+                body: Rc::new(body),
                 env: env.clone(),
             };
             env.set(name.clone(), lambda);
@@ -649,121 +851,13 @@ fn eval_lambda(args: &[Expr], pos: Pos, env: &Env) -> Result<Value, EvalError> {
         }
     };
     Ok(Value::Lambda {
-        params,
-        body: args[1..].to_vec(),
+        params: Rc::new(params),
+        body: Rc::new(args[1..].to_vec()),
         env: env.clone(),
     })
 }
 
-fn eval_and(args: &[Expr], env: &mut Env, out: &mut String) -> Result<Value, EvalError> {
-    let mut result = Value::Boolean(true);
-    for a in args {
-        result = eval(a, env, out)?;
-        if !result.is_truthy() {
-            return Ok(result);
-        }
-    }
-    Ok(result)
-}
 
-fn eval_or(args: &[Expr], env: &mut Env, out: &mut String) -> Result<Value, EvalError> {
-    let mut result = Value::Boolean(false);
-    for a in args {
-        result = eval(a, env, out)?;
-        if result.is_truthy() {
-            return Ok(result);
-        }
-    }
-    Ok(result)
-}
-
-fn eval_let(args: &[Expr], pos: Pos, env: &mut Env, out: &mut String) -> Result<Value, EvalError> {
-    if args.len() < 2 {
-        return Err(EvalError::Arity(format!(
-            "let requires bindings and body at {}",
-            pos.fmt()
-        )));
-    }
-    let bindings = match &args[0].kind {
-        ExprKind::List(bs) => bs,
-        _ => {
-            return Err(EvalError::Type(format!(
-                "let: bindings must be a list at {}",
-                pos.fmt()
-            )))
-        }
-    };
-    let mut local_env = Env::with_parent(env);
-    for b in bindings {
-        match &b.kind {
-            ExprKind::List(pair) if pair.len() == 2 => {
-                let name = match &pair[0].kind {
-                    ExprKind::Symbol(s) => s.clone(),
-                    _ => {
-                        return Err(EvalError::Type(format!(
-                            "let: binding name must be symbol at {}",
-                            pair[0].pos.fmt()
-                        )))
-                    }
-                };
-                let val = eval(&pair[1], env, out)?;
-                local_env.set(name, val);
-            }
-            _ => {
-                return Err(EvalError::Type(format!(
-                    "let: invalid binding at {}",
-                    b.pos.fmt()
-                )))
-            }
-        }
-    }
-    let mut result = Value::Nil;
-    for expr in &args[1..] {
-        result = eval(expr, &mut local_env, out)?;
-    }
-    Ok(result)
-}
-
-fn eval_begin(args: &[Expr], env: &mut Env, out: &mut String) -> Result<Value, EvalError> {
-    let mut result = Value::Nil;
-    for expr in args {
-        result = eval(expr, env, out)?;
-    }
-    Ok(result)
-}
-
-fn eval_cond(args: &[Expr], env: &mut Env, out: &mut String) -> Result<Value, EvalError> {
-    for clause in args {
-        match &clause.kind {
-            ExprKind::List(parts) if parts.len() >= 2 => {
-                if let ExprKind::Symbol(s) = &parts[0].kind {
-                    if s == "else" {
-                        let mut result = Value::Nil;
-                        for expr in &parts[1..] {
-                            result = eval(expr, env, out)?;
-                        }
-                        return Ok(result);
-                    }
-                }
-                let test = eval(&parts[0], env, out)?;
-                if test.is_truthy() {
-                    let mut result = Value::Nil;
-                    for expr in &parts[1..] {
-                        result = eval(expr, env, out)?;
-                    }
-                    return Ok(result);
-                }
-            }
-            _ => {
-                return Err(EvalError::Type(format!(
-                    "cond: invalid clause at {}",
-                    clause.pos.fmt()
-                )))
-            }
-        }
-    }
-    Ok(Value::Nil)
-}
 
 fn eval_string_set(args: &[Expr], pos: Pos, env: &mut Env, out: &mut String) -> Result<Value, EvalError> {
     if args.len() != 3 {
