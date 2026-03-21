@@ -1,4 +1,7 @@
-use super::{atom_to_value, builtins, quote_expr, DisplayValue, Env, EvalError, Expr, Span, Value};
+use super::{
+    atom_to_value, builtins, env_define, env_get, env_set, quote_expr, DisplayValue, Env,
+    EvalError, Expr, Span, Value,
+};
 
 /// Result of one evaluation step: either a final value or a tail call to continue.
 enum Trampoline {
@@ -56,8 +59,8 @@ fn eval_step(expr: &Expr, env: &mut Env, out: &mut String) -> Result<Trampoline,
                 || token.starts_with("#\\")
             {
                 atom_to_value(token).map(Trampoline::Done)
-            } else if let Some(val) = env.get(token) {
-                Ok(Trampoline::Done(val.clone()))
+            } else if let Some(val) = env_get(env, token) {
+                Ok(Trampoline::Done(val))
             } else {
                 Err(EvalError::UnboundVariable {
                     name: token.clone(),
@@ -94,6 +97,7 @@ fn eval_list_step(
             "display" => return eval_display(args, env, out).map(Trampoline::Done),
             "write" => return eval_write(args, env, out).map(Trampoline::Done),
             "newline" => return eval_newline(args, out).map(Trampoline::Done),
+            "set!" => return eval_set(args, env, out).map(Trampoline::Done),
             "string-set!" => return eval_string_set(args, env, out).map(Trampoline::Done),
             _ => {}
         }
@@ -154,10 +158,10 @@ fn apply_lambda_step(
     }
     // Inject self-reference for recursion
     if let Some(n) = name {
-        local_env.insert(n.clone(), func.clone());
+        env_define(&mut local_env, n.clone(), func.clone());
     }
     for (param, arg) in params.iter().zip(args) {
-        local_env.insert(param.clone(), arg.clone());
+        env_define(&mut local_env, param.clone(), arg.clone());
     }
     eval_body_step(body, &mut local_env, out)
 }
@@ -267,10 +271,10 @@ fn apply_lambda(func: &Value, args: &[Value], out: &mut String) -> Result<Value,
     let mut local_env = closure_env.clone();
     // Inject self-reference for recursion
     if let Some(n) = name {
-        local_env.insert(n.clone(), func.clone());
+        env_define(&mut local_env, n.clone(), func.clone());
     }
     for (param, arg) in params.iter().zip(args) {
-        local_env.insert(param.clone(), arg.clone());
+        env_define(&mut local_env, param.clone(), arg.clone());
     }
     eval_body(body, &mut local_env, out)
 }
@@ -329,7 +333,7 @@ fn eval_define(args: &[Expr], env: &mut Env, out: &mut String) -> Result<Value, 
                 });
             };
             let val = eval(value_expr, env, out)?;
-            env.insert(name.clone(), val.clone());
+            env_define(env, name.clone(), val.clone());
             Ok(val)
         }
         Expr::List(parts, _) => {
@@ -353,7 +357,7 @@ fn eval_define(args: &[Expr], env: &mut Env, out: &mut String) -> Result<Value, 
                 body: body.to_vec(),
                 closure_env: env.clone(),
             };
-            env.insert(name.clone(), lambda);
+            env_define(env, name.clone(), lambda);
             Ok(Value::Nil)
         }
     }
@@ -447,7 +451,7 @@ fn eval_let_step(
         .collect::<Result<_, _>>()?;
     let mut local_env = env.clone();
     for (name, val) in pairs {
-        local_env.insert(name, val);
+        env_define(&mut local_env, name, val);
     }
     eval_body_step(body, &mut local_env, out)
 }
@@ -550,6 +554,18 @@ fn eval_builtin_map(args: &[Expr], env: &mut Env, out: &mut String) -> Result<Va
     } else {
         Ok(Value::List(results))
     }
+}
+
+/// Evaluate `(set! name value)` — mutate an existing binding.
+fn eval_set(args: &[Expr], env: &mut Env, out: &mut String) -> Result<Value, EvalError> {
+    let [Expr::Atom(name, _), value_expr] = args else {
+        return Err(EvalError::Parse {
+            message: "set! requires a variable name and a value".to_string(),
+        });
+    };
+    let val = eval(value_expr, env, out)?;
+    env_set(env, name, val)?;
+    Ok(Value::Nil)
 }
 
 /// Evaluate `(string-set! ...)` — strings are immutable in R7RS.

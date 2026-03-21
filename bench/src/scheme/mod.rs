@@ -5,7 +5,9 @@ mod parser;
 
 pub use error::EvalError;
 
+use std::cell::RefCell;
 use std::collections::HashMap;
+use std::rc::Rc;
 
 /// Source position in the input.
 #[derive(Debug, Clone, Copy, Default)]
@@ -109,7 +111,31 @@ fn fmt_list(items: &[Value]) -> String {
 }
 
 /// Environment for variable bindings.
-type Env = HashMap<String, Value>;
+/// Each binding is wrapped in Rc<RefCell<>> so closures can share mutable state via `set!`.
+type Env = HashMap<String, Rc<RefCell<Value>>>;
+
+/// Look up a variable in the environment.
+pub(crate) fn env_get(env: &Env, key: &str) -> Option<Value> {
+    env.get(key).map(|b| b.borrow().clone())
+}
+
+/// Define a new binding in the environment (creates a fresh cell).
+pub(crate) fn env_define(env: &mut Env, key: String, val: Value) {
+    env.insert(key, Rc::new(RefCell::new(val)));
+}
+
+/// Mutate an existing binding. Returns an error if the variable is not bound.
+pub(crate) fn env_set(env: &Env, key: &str, val: Value) -> Result<(), EvalError> {
+    match env.get(key) {
+        Some(binding) => {
+            *binding.borrow_mut() = val;
+            Ok(())
+        }
+        None => Err(EvalError::UnboundVariable {
+            name: key.to_string(),
+        }),
+    }
+}
 
 /// An S-expression AST node with source position.
 #[derive(Debug, Clone)]
