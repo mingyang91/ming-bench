@@ -1,8 +1,10 @@
 use std::fmt::{self, Formatter};
+use std::rc::Rc;
 
 use crate::scheme::ast::Expr;
 use crate::scheme::ast::SourceLocation;
 use crate::scheme::builtins::BuiltinProcedure;
+use crate::scheme::continuation::CapturedContinuation;
 use crate::scheme::environment::Environment;
 use crate::scheme::error::EvalError;
 use crate::scheme::string_value::SchemeString;
@@ -23,6 +25,8 @@ pub enum Value {
     EmptyList,
     Pair(Box<Value>, Box<Value>),
     Builtin(BuiltinProcedure),
+    CallWithCurrentContinuation,
+    Continuation(Rc<CapturedContinuation>),
     Closure(Closure),
     Void,
 }
@@ -83,6 +87,8 @@ impl Value {
             Self::EmptyList => "()".into(),
             Self::Pair(car, cdr) => render_pair(car, cdr, mode),
             Self::Builtin(procedure) => format!("#<procedure:{}>", procedure.name()),
+            Self::CallWithCurrentContinuation => "#<procedure:call/cc>".into(),
+            Self::Continuation(_) => "#<continuation>".into(),
             Self::Closure(closure) => render_closure(closure),
             Self::Void => "#<void>".into(),
         }
@@ -145,7 +151,10 @@ impl Value {
             Self::Symbol(_) => "symbol",
             Self::EmptyList => "null",
             Self::Pair(_, _) => "pair",
-            Self::Builtin(_) | Self::Closure(_) => "procedure",
+            Self::Builtin(_)
+            | Self::CallWithCurrentContinuation
+            | Self::Continuation(_)
+            | Self::Closure(_) => "procedure",
             Self::Void => "void",
         }
     }

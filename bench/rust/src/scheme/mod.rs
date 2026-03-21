@@ -1,5 +1,6 @@
 mod ast;
 mod builtins;
+mod continuation;
 mod environment;
 pub mod error;
 mod evaluator;

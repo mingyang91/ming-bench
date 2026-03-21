@@ -1,7 +1,7 @@
 use crate::scheme::ast::SourceLocation;
 use crate::scheme::environment::Environment;
-use crate::scheme::evaluator::apply_callable;
 use crate::scheme::error::{ArgCount, EvalError};
+use crate::scheme::evaluator::apply_callable;
 use crate::scheme::string_value::StringMutationError;
 use crate::scheme::value::{list_from_values, Value};
 
@@ -581,11 +581,7 @@ fn eval_string_set(arguments: &[Value], location: SourceLocation) -> Result<Valu
 
 fn eval_string_to_list(arguments: &[Value], location: SourceLocation) -> Result<Value, EvalError> {
     let string = unary_argument("string->list", arguments, location)?.expect_string(location)?;
-    let characters: Vec<_> = string
-        .as_string()
-        .chars()
-        .map(Value::Character)
-        .collect();
+    let characters: Vec<_> = string.as_string().chars().map(Value::Character).collect();
     Ok(eval_list(&characters))
 }
 
