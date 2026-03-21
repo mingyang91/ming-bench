@@ -441,41 +441,9 @@ fn eval(ast: &Ast, env: &mut Env, out: &mut String) -> Result<Value, EvalError> 
                         return Ok(result);
                     }
                     "string-set!" => {
-                        if items.len() != 4 {
-                            return Err(EvalError::Arity.with_position(line, col));
-                        }
-                        let var_name = match &items[1].kind {
-                            AstKind::Symbol(s) => s.clone(),
-                            _ => return Err(EvalError::TypeError(
-                                "string-set!: first argument must be a variable".into(),
-                            ).with_position(items[1].line, items[1].col)),
-                        };
-                        let idx = expect_integer(&eval(&items[2], env, out)?)?;
-                        let ch = match eval(&items[3], env, out)? {
-                            Value::Char(c) => c,
-                            _ => return Err(EvalError::TypeError(
-                                "string-set!: third argument must be a character".into(),
-                            ).with_position(items[3].line, items[3].col)),
-                        };
-                        let s = env.get_mut(&var_name).ok_or_else(|| {
-                            EvalError::UndefinedVariable(var_name.clone())
-                                .with_position(items[1].line, items[1].col)
-                        })?;
-                        return match s {
-                            Value::Str(ref mut string) => {
-                                let idx = idx as usize;
-                                if idx >= string.len() {
-                                    return Err(EvalError::TypeError(
-                                        "string-set!: index out of range".into(),
-                                    ).with_position(line, col));
-                                }
-                                unsafe { string.as_bytes_mut()[idx] = ch as u8; }
-                                Ok(Value::Symbol("ok".into()))
-                            }
-                            _ => Err(EvalError::TypeError(
-                                "string-set!: not a string".into(),
-                            ).with_position(line, col)),
-                        };
+                        return Err(EvalError::TypeError(
+                            "string-set!: strings are immutable".into(),
+                        ).with_position(line, col));
                     }
                     "cond" => {
                         for clause in &items[1..] {
@@ -779,6 +747,64 @@ fn apply_builtin(op: &str, args: &[Value], out: &mut String) -> Result<Value, Ev
         "char?" => {
             if args.len() != 1 { return Err(EvalError::Arity); }
             Ok(Value::Boolean(matches!(&args[0], Value::Char(_))))
+        }
+        "map" => {
+            if args.len() != 2 { return Err(EvalError::Arity); }
+            let func = &args[0];
+            let items = match &args[1] {
+                Value::List(items) => items,
+                _ => return Err(EvalError::TypeError("map: expected list".into())),
+            };
+            let mut results = Vec::new();
+            for item in items {
+                match func {
+                    Value::Lambda { params, body, env: closed_env } => {
+                        if params.len() != 1 {
+                            return Err(EvalError::Arity);
+                        }
+                        let mut local_env = closed_env.clone();
+                        local_env.insert(params[0].clone(), item.clone());
+                        results.push(eval(&body, &mut local_env, out)?);
+                    }
+                    _ => return Err(EvalError::NotAProcedure),
+                }
+            }
+            Ok(Value::List(results))
+        }
+        "string->list" => {
+            if args.len() != 1 { return Err(EvalError::Arity); }
+            match &args[0] {
+                Value::Str(s) => Ok(Value::List(s.chars().map(Value::Char).collect())),
+                _ => Err(EvalError::TypeError("string->list: expected string".into())),
+            }
+        }
+        "list->string" => {
+            if args.len() != 1 { return Err(EvalError::Arity); }
+            match &args[0] {
+                Value::List(items) => {
+                    let mut s = String::new();
+                    for item in items {
+                        match item {
+                            Value::Char(c) => s.push(*c),
+                            _ => return Err(EvalError::TypeError("list->string: expected list of characters".into())),
+                        }
+                    }
+                    Ok(Value::Str(s))
+                }
+                _ => Err(EvalError::TypeError("list->string: expected list".into())),
+            }
+        }
+        "char->integer" => {
+            if args.len() != 1 { return Err(EvalError::Arity); }
+            match &args[0] {
+                Value::Char(c) => Ok(Value::Integer(*c as i64)),
+                _ => Err(EvalError::TypeError("char->integer: expected character".into())),
+            }
+        }
+        "integer->char" => {
+            if args.len() != 1 { return Err(EvalError::Arity); }
+            let n = expect_integer(&args[0])?;
+            Ok(Value::Char(char::from_u32(n as u32).unwrap_or('\0')))
         }
         _ => Err(EvalError::UndefinedVariable(op.to_string())),
     }
