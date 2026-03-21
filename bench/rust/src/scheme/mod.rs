@@ -160,13 +160,18 @@ fn display_val(v: &Val) -> String {
 
 // ---------- Continuation State ----------
 
+type ContKey = (Pos, u32);
+
 struct ContState {
     next_id: u64,
     current_expr_index: usize,
     expr_start_ids: Vec<u64>,
+    expr_start_pos_counts: Vec<HashMap<Pos, u32>>,
+    pos_counts: HashMap<Pos, u32>,
+    id_to_key: HashMap<u64, ContKey>,
     cont_expr_index: HashMap<u64, usize>,
     signal: Option<(u64, Val)>,
-    resume: Option<(u64, Val)>,
+    resume: Option<(ContKey, Val)>,
 }
 
 impl ContState {
@@ -175,6 +180,9 @@ impl ContState {
             next_id: 0,
             current_expr_index: 0,
             expr_start_ids: Vec::new(),
+            expr_start_pos_counts: Vec::new(),
+            pos_counts: HashMap::new(),
+            id_to_key: HashMap::new(),
             cont_expr_index: HashMap::new(),
             signal: None,
             resume: None,
@@ -192,8 +200,15 @@ fn callcc_exec(proc: &Val, pos: Pos, out: &Output) -> Result<Val, EvalError> {
         let id = state.next_id;
         state.next_id += 1;
 
-        if let Some((target_id, _)) = &state.resume {
-            if id == *target_id {
+        // Compute position-based key for this call/cc invocation
+        let count = state.pos_counts.entry(pos).or_insert(0);
+        let key = (pos, *count);
+        *count += 1;
+        state.id_to_key.insert(id, key);
+
+        // Match resume by position-based key, not sequential ID
+        if let Some((target_key, _)) = &state.resume {
+            if key == *target_key {
                 let (_, val) = state.resume.take().unwrap();
                 return (id, Some(val));
             }
@@ -1840,6 +1855,8 @@ fn eval_program(exprs: &[Expr], env: &Env, out: &Output) -> Result<Val, EvalErro
             if state.expr_start_ids.len() <= i {
                 let id = state.next_id;
                 state.expr_start_ids.push(id);
+                let pc = state.pos_counts.clone();
+                state.expr_start_pos_counts.push(pc);
             }
         });
 
@@ -1855,10 +1872,14 @@ fn eval_program(exprs: &[Expr], env: &Env, out: &Output) -> Result<Val, EvalErro
                 let restart_idx = CONT_STATE.with(|cs| {
                     cs.borrow().cont_expr_index[&cont_id]
                 });
+                let key = CONT_STATE.with(|cs| {
+                    cs.borrow().id_to_key[&cont_id]
+                });
                 CONT_STATE.with(|cs| {
                     let mut state = cs.borrow_mut();
                     state.next_id = state.expr_start_ids[restart_idx];
-                    state.resume = Some((cont_id, cont_val));
+                    state.pos_counts = state.expr_start_pos_counts[restart_idx].clone();
+                    state.resume = Some((key, cont_val));
                 });
                 i = restart_idx;
             }
