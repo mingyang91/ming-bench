@@ -24,6 +24,7 @@ enum Value {
     Boolean(bool),
     Str(String),
     Symbol(String),
+    Char(char),
     Pair(Box<Value>, Box<Value>),
     Nil,
     Lambda {
@@ -34,13 +35,30 @@ enum Value {
 }
 
 impl Value {
+    /// Format for `write` and return values (strings get quotes).
     fn display(&self) -> String {
+        self.fmt_value(true)
+    }
+
+    /// Format for `display` output (strings without quotes).
+    fn display_unquoted(&self) -> String {
+        self.fmt_value(false)
+    }
+
+    fn fmt_value(&self, quote_strings: bool) -> String {
         match self {
             Value::Integer(n) => n.to_string(),
             Value::Boolean(true) => "#t".to_string(),
             Value::Boolean(false) => "#f".to_string(),
-            Value::Str(s) => format!("\"{}\"", s),
+            Value::Str(s) => {
+                if quote_strings {
+                    format!("\"{}\"", s)
+                } else {
+                    s.clone()
+                }
+            }
             Value::Symbol(s) => s.clone(),
+            Value::Char(c) => format!("#\\{}", c),
             Value::Nil => "()".to_string(),
             Value::Pair(_, _) => {
                 let mut out = String::from("(");
@@ -53,13 +71,13 @@ impl Value {
                                 out.push(' ');
                             }
                             first = false;
-                            out.push_str(&car.display());
+                            out.push_str(&car.fmt_value(quote_strings));
                             cur = cdr;
                         }
                         Value::Nil => break,
                         other => {
                             out.push_str(" . ");
-                            out.push_str(&other.display());
+                            out.push_str(&other.fmt_value(quote_strings));
                             break;
                         }
                     }
@@ -358,7 +376,7 @@ impl Parser {
 
 // ── Evaluator ───────────────────────────────────────────────────────
 
-fn eval(expr: &Expr, env: &mut Env) -> Result<Value, EvalError> {
+fn eval(expr: &Expr, env: &mut Env, out: &mut String) -> Result<Value, EvalError> {
     let pos = expr.pos;
     match &expr.kind {
         ExprKind::Integer(n) => Ok(Value::Integer(*n)),
@@ -377,43 +395,43 @@ fn eval(expr: &Expr, env: &mut Env) -> Result<Value, EvalError> {
             // Check for special forms
             if let ExprKind::Symbol(op) = &items[0].kind {
                 match op.as_str() {
-                    "if" => return eval_if(&items[1..], pos, env),
-                    "define" => return eval_define(&items[1..], pos, env),
+                    "if" => return eval_if(&items[1..], pos, env, out),
+                    "define" => return eval_define(&items[1..], pos, env, out),
                     "quote" => return eval_quote(&items[1..], pos),
                     "lambda" => return eval_lambda(&items[1..], pos, env),
-                    "and" => return eval_and(&items[1..], env),
-                    "or" => return eval_or(&items[1..], env),
-                    "let" => return eval_let(&items[1..], pos, env),
-                    "begin" => return eval_begin(&items[1..], env),
-                    "cond" => return eval_cond(&items[1..], env),
+                    "and" => return eval_and(&items[1..], env, out),
+                    "or" => return eval_or(&items[1..], env, out),
+                    "let" => return eval_let(&items[1..], pos, env, out),
+                    "begin" => return eval_begin(&items[1..], env, out),
+                    "cond" => return eval_cond(&items[1..], env, out),
                     _ => {}
                 }
             }
             // Check for builtins by name before general eval
             if let ExprKind::Symbol(name) = &items[0].kind {
                 let args: Result<Vec<Value>, _> =
-                    items[1..].iter().map(|a| eval(a, env)).collect();
+                    items[1..].iter().map(|a| eval(a, env, out)).collect();
                 let args = args?;
-                if let Some(result) = apply_builtin(name, &args, pos)? {
+                if let Some(result) = apply_builtin(name, &args, pos, out)? {
                     return Ok(result);
                 }
                 // Not a builtin, look up in env
                 let func = env.get(name).ok_or_else(|| {
                     EvalError::UnboundVariable(format!("{} at {}", name, pos.fmt()))
                 })?;
-                return apply_named(&func, &args, name, env, pos);
+                return apply_named(&func, &args, name, env, pos, out);
             }
             // General application (e.g., lambda expression in head position)
-            let func = eval(&items[0], env)?;
-            let args: Result<Vec<Value>, _> = items[1..].iter().map(|a| eval(a, env)).collect();
+            let func = eval(&items[0], env, out)?;
+            let args: Result<Vec<Value>, _> = items[1..].iter().map(|a| eval(a, env, out)).collect();
             let args = args?;
-            apply(&func, &args, pos)
+            apply(&func, &args, pos, out)
         }
     }
 }
 
-fn apply(func: &Value, args: &[Value], pos: Pos) -> Result<Value, EvalError> {
-    apply_named(func, args, "", &Env::new(), pos)
+fn apply(func: &Value, args: &[Value], pos: Pos, out: &mut String) -> Result<Value, EvalError> {
+    apply_named(func, args, "", &Env::new(), pos, out)
 }
 
 fn apply_named(
@@ -422,6 +440,7 @@ fn apply_named(
     name: &str,
     calling_env: &Env,
     pos: Pos,
+    out: &mut String,
 ) -> Result<Value, EvalError> {
     match func {
         Value::Lambda {
@@ -448,7 +467,7 @@ fn apply_named(
             }
             let mut result = Value::Boolean(false);
             for expr in body {
-                result = eval(expr, &mut local_env)?;
+                result = eval(expr, &mut local_env, out)?;
             }
             Ok(result)
         }
@@ -459,24 +478,24 @@ fn apply_named(
     }
 }
 
-fn eval_if(args: &[Expr], pos: Pos, env: &mut Env) -> Result<Value, EvalError> {
+fn eval_if(args: &[Expr], pos: Pos, env: &mut Env, out: &mut String) -> Result<Value, EvalError> {
     if args.len() < 2 || args.len() > 3 {
         return Err(EvalError::Arity(format!(
             "if requires 2 or 3 arguments at {}",
             pos.fmt()
         )));
     }
-    let cond = eval(&args[0], env)?;
+    let cond = eval(&args[0], env, out)?;
     if cond.is_truthy() {
-        eval(&args[1], env)
+        eval(&args[1], env, out)
     } else if args.len() == 3 {
-        eval(&args[2], env)
+        eval(&args[2], env, out)
     } else {
         Ok(Value::Nil)
     }
 }
 
-fn eval_define(args: &[Expr], pos: Pos, env: &mut Env) -> Result<Value, EvalError> {
+fn eval_define(args: &[Expr], pos: Pos, env: &mut Env, out: &mut String) -> Result<Value, EvalError> {
     if args.is_empty() {
         return Err(EvalError::Arity(format!(
             "define requires arguments at {}",
@@ -491,7 +510,7 @@ fn eval_define(args: &[Expr], pos: Pos, env: &mut Env) -> Result<Value, EvalErro
                     pos.fmt()
                 )));
             }
-            let val = eval(&args[1], env)?;
+            let val = eval(&args[1], env, out)?;
             env.set(name.clone(), val);
             Ok(Value::Nil)
         }
@@ -601,10 +620,10 @@ fn eval_lambda(args: &[Expr], pos: Pos, env: &Env) -> Result<Value, EvalError> {
     })
 }
 
-fn eval_and(args: &[Expr], env: &mut Env) -> Result<Value, EvalError> {
+fn eval_and(args: &[Expr], env: &mut Env, out: &mut String) -> Result<Value, EvalError> {
     let mut result = Value::Boolean(true);
     for a in args {
-        result = eval(a, env)?;
+        result = eval(a, env, out)?;
         if !result.is_truthy() {
             return Ok(result);
         }
@@ -612,10 +631,10 @@ fn eval_and(args: &[Expr], env: &mut Env) -> Result<Value, EvalError> {
     Ok(result)
 }
 
-fn eval_or(args: &[Expr], env: &mut Env) -> Result<Value, EvalError> {
+fn eval_or(args: &[Expr], env: &mut Env, out: &mut String) -> Result<Value, EvalError> {
     let mut result = Value::Boolean(false);
     for a in args {
-        result = eval(a, env)?;
+        result = eval(a, env, out)?;
         if result.is_truthy() {
             return Ok(result);
         }
@@ -623,7 +642,7 @@ fn eval_or(args: &[Expr], env: &mut Env) -> Result<Value, EvalError> {
     Ok(result)
 }
 
-fn eval_let(args: &[Expr], pos: Pos, env: &mut Env) -> Result<Value, EvalError> {
+fn eval_let(args: &[Expr], pos: Pos, env: &mut Env, out: &mut String) -> Result<Value, EvalError> {
     if args.len() < 2 {
         return Err(EvalError::Arity(format!(
             "let requires bindings and body at {}",
@@ -652,7 +671,7 @@ fn eval_let(args: &[Expr], pos: Pos, env: &mut Env) -> Result<Value, EvalError> 
                         )))
                     }
                 };
-                let val = eval(&pair[1], env)?;
+                let val = eval(&pair[1], env, out)?;
                 local_env.set(name, val);
             }
             _ => {
@@ -665,20 +684,20 @@ fn eval_let(args: &[Expr], pos: Pos, env: &mut Env) -> Result<Value, EvalError> 
     }
     let mut result = Value::Nil;
     for expr in &args[1..] {
-        result = eval(expr, &mut local_env)?;
+        result = eval(expr, &mut local_env, out)?;
     }
     Ok(result)
 }
 
-fn eval_begin(args: &[Expr], env: &mut Env) -> Result<Value, EvalError> {
+fn eval_begin(args: &[Expr], env: &mut Env, out: &mut String) -> Result<Value, EvalError> {
     let mut result = Value::Nil;
     for expr in args {
-        result = eval(expr, env)?;
+        result = eval(expr, env, out)?;
     }
     Ok(result)
 }
 
-fn eval_cond(args: &[Expr], env: &mut Env) -> Result<Value, EvalError> {
+fn eval_cond(args: &[Expr], env: &mut Env, out: &mut String) -> Result<Value, EvalError> {
     for clause in args {
         match &clause.kind {
             ExprKind::List(parts) if parts.len() >= 2 => {
@@ -686,16 +705,16 @@ fn eval_cond(args: &[Expr], env: &mut Env) -> Result<Value, EvalError> {
                     if s == "else" {
                         let mut result = Value::Nil;
                         for expr in &parts[1..] {
-                            result = eval(expr, env)?;
+                            result = eval(expr, env, out)?;
                         }
                         return Ok(result);
                     }
                 }
-                let test = eval(&parts[0], env)?;
+                let test = eval(&parts[0], env, out)?;
                 if test.is_truthy() {
                     let mut result = Value::Nil;
                     for expr in &parts[1..] {
-                        result = eval(expr, env)?;
+                        result = eval(expr, env, out)?;
                     }
                     return Ok(result);
                 }
@@ -711,7 +730,7 @@ fn eval_cond(args: &[Expr], env: &mut Env) -> Result<Value, EvalError> {
     Ok(Value::Nil)
 }
 
-fn apply_builtin(op: &str, args: &[Value], pos: Pos) -> Result<Option<Value>, EvalError> {
+fn apply_builtin(op: &str, args: &[Value], pos: Pos, out: &mut String) -> Result<Option<Value>, EvalError> {
     match op {
         "+" => {
             let mut sum: i64 = 0;
@@ -897,6 +916,168 @@ fn apply_builtin(op: &str, args: &[Value], pos: Pos) -> Result<Option<Value>, Ev
             }
             Ok(Some(Value::Boolean(matches!(args[0], Value::Symbol(_)))))
         }
+        "char?" => {
+            if args.len() != 1 {
+                return Err(EvalError::Arity(format!(
+                    "char? requires 1 argument at {}",
+                    pos.fmt()
+                )));
+            }
+            Ok(Some(Value::Boolean(matches!(args[0], Value::Char(_)))))
+        }
+        "display" => {
+            if args.len() != 1 {
+                return Err(EvalError::Arity(format!(
+                    "display requires 1 argument at {}",
+                    pos.fmt()
+                )));
+            }
+            out.push_str(&args[0].display_unquoted());
+            Ok(Some(Value::Nil))
+        }
+        "write" => {
+            if args.len() != 1 {
+                return Err(EvalError::Arity(format!(
+                    "write requires 1 argument at {}",
+                    pos.fmt()
+                )));
+            }
+            out.push_str(&args[0].display());
+            Ok(Some(Value::Nil))
+        }
+        "newline" => {
+            if !args.is_empty() {
+                return Err(EvalError::Arity(format!(
+                    "newline requires 0 arguments at {}",
+                    pos.fmt()
+                )));
+            }
+            out.push('\n');
+            Ok(Some(Value::Nil))
+        }
+        "string-append" => {
+            let mut result = String::new();
+            for a in args {
+                match a {
+                    Value::Str(s) => result.push_str(s),
+                    _ => return Err(EvalError::Type(format!(
+                        "string-append: expected string at {}",
+                        pos.fmt()
+                    ))),
+                }
+            }
+            Ok(Some(Value::Str(result)))
+        }
+        "string-length" => {
+            if args.len() != 1 {
+                return Err(EvalError::Arity(format!(
+                    "string-length requires 1 argument at {}",
+                    pos.fmt()
+                )));
+            }
+            match &args[0] {
+                Value::Str(s) => Ok(Some(Value::Integer(s.chars().count() as i64))),
+                _ => Err(EvalError::Type(format!(
+                    "string-length: expected string at {}",
+                    pos.fmt()
+                ))),
+            }
+        }
+        "substring" => {
+            if args.len() != 3 {
+                return Err(EvalError::Arity(format!(
+                    "substring requires 3 arguments at {}",
+                    pos.fmt()
+                )));
+            }
+            let s = match &args[0] {
+                Value::Str(s) => s,
+                _ => return Err(EvalError::Type(format!(
+                    "substring: expected string at {}",
+                    pos.fmt()
+                ))),
+            };
+            let start = args[1].as_integer(pos)? as usize;
+            let end = args[2].as_integer(pos)? as usize;
+            let chars: Vec<char> = s.chars().collect();
+            Ok(Some(Value::Str(chars[start..end].iter().collect())))
+        }
+        "string->number" => {
+            if args.len() != 1 {
+                return Err(EvalError::Arity(format!(
+                    "string->number requires 1 argument at {}",
+                    pos.fmt()
+                )));
+            }
+            match &args[0] {
+                Value::Str(s) => match s.parse::<i64>() {
+                    Ok(n) => Ok(Some(Value::Integer(n))),
+                    Err(_) => Ok(Some(Value::Boolean(false))),
+                },
+                _ => Err(EvalError::Type(format!(
+                    "string->number: expected string at {}",
+                    pos.fmt()
+                ))),
+            }
+        }
+        "number->string" => {
+            if args.len() != 1 {
+                return Err(EvalError::Arity(format!(
+                    "number->string requires 1 argument at {}",
+                    pos.fmt()
+                )));
+            }
+            let n = args[0].as_integer(pos)?;
+            Ok(Some(Value::Str(n.to_string())))
+        }
+        "symbol->string" => {
+            if args.len() != 1 {
+                return Err(EvalError::Arity(format!(
+                    "symbol->string requires 1 argument at {}",
+                    pos.fmt()
+                )));
+            }
+            match &args[0] {
+                Value::Symbol(s) => Ok(Some(Value::Str(s.clone()))),
+                _ => Err(EvalError::Type(format!(
+                    "symbol->string: expected symbol at {}",
+                    pos.fmt()
+                ))),
+            }
+        }
+        "string->symbol" => {
+            if args.len() != 1 {
+                return Err(EvalError::Arity(format!(
+                    "string->symbol requires 1 argument at {}",
+                    pos.fmt()
+                )));
+            }
+            match &args[0] {
+                Value::Str(s) => Ok(Some(Value::Symbol(s.clone()))),
+                _ => Err(EvalError::Type(format!(
+                    "string->symbol: expected string at {}",
+                    pos.fmt()
+                ))),
+            }
+        }
+        "string-ref" => {
+            if args.len() != 2 {
+                return Err(EvalError::Arity(format!(
+                    "string-ref requires 2 arguments at {}",
+                    pos.fmt()
+                )));
+            }
+            let s = match &args[0] {
+                Value::Str(s) => s,
+                _ => return Err(EvalError::Type(format!(
+                    "string-ref: expected string at {}",
+                    pos.fmt()
+                ))),
+            };
+            let idx = args[1].as_integer(pos)? as usize;
+            let chars: Vec<char> = s.chars().collect();
+            Ok(Some(Value::Char(chars[idx])))
+        }
         _ => Ok(None),
     }
 }
@@ -932,17 +1113,29 @@ pub fn eval_str(input: &str) -> Result<String, EvalError> {
         return Err(EvalError::Parse("no expressions".into()));
     }
     let mut env = Env::new();
+    let mut out = String::new();
     let mut result = Value::Boolean(false);
     for expr in &exprs {
-        result = eval(expr, &mut env)?;
+        result = eval(expr, &mut env, &mut out)?;
     }
     Ok(result.display())
 }
 
 /// Evaluate Scheme expressions, returning both the result value and
 /// any output produced by `display`, `write`, or `newline`.
-pub fn eval_str_with_output(_input: &str) -> Result<(String, String), EvalError> {
-    todo!()
+pub fn eval_str_with_output(input: &str) -> Result<(String, String), EvalError> {
+    let mut parser = Parser::new(input);
+    let exprs = parser.parse_all()?;
+    if exprs.is_empty() {
+        return Err(EvalError::Parse("no expressions".into()));
+    }
+    let mut env = Env::new();
+    let mut out = String::new();
+    let mut result = Value::Boolean(false);
+    for expr in &exprs {
+        result = eval(expr, &mut env, &mut out)?;
+    }
+    Ok((result.display(), out))
 }
 
 #[cfg(test)]
