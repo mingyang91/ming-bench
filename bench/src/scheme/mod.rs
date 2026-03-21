@@ -1313,7 +1313,8 @@ fn is_builtin(name: &str) -> bool {
         "call/cc" | "call-with-current-continuation" |
         "vector" | "make-vector" | "vector-ref" | "vector-set!" |
         "vector-length" | "vector?" | "vector->list" | "list->vector" |
-        "abs" | "modulo" | "remainder" | "quotient" | "min" | "max" | "expt"
+        "abs" | "modulo" | "remainder" | "quotient" | "min" | "max" | "expt" |
+        "zero?" | "positive?" | "negative?" | "odd?" | "even?"
     )
 }
 
@@ -1875,6 +1876,36 @@ fn apply_builtin_vals(op: &str, vals: &[Value], pos: Pos) -> Result<Value, EvalE
                 return Err(runtime_err(pos, "expt: negative exponent"));
             }
             Ok(Value::Integer(base.pow(exp as u32)))
+        }
+        "zero?" => {
+            if vals.len() != 1 {
+                return Err(runtime_err(pos, "zero? requires 1 argument"));
+            }
+            Ok(Value::Boolean(expect_int(&vals[0], pos)? == 0))
+        }
+        "positive?" => {
+            if vals.len() != 1 {
+                return Err(runtime_err(pos, "positive? requires 1 argument"));
+            }
+            Ok(Value::Boolean(expect_int(&vals[0], pos)? > 0))
+        }
+        "negative?" => {
+            if vals.len() != 1 {
+                return Err(runtime_err(pos, "negative? requires 1 argument"));
+            }
+            Ok(Value::Boolean(expect_int(&vals[0], pos)? < 0))
+        }
+        "odd?" => {
+            if vals.len() != 1 {
+                return Err(runtime_err(pos, "odd? requires 1 argument"));
+            }
+            Ok(Value::Boolean(expect_int(&vals[0], pos)? % 2 != 0))
+        }
+        "even?" => {
+            if vals.len() != 1 {
+                return Err(runtime_err(pos, "even? requires 1 argument"));
+            }
+            Ok(Value::Boolean(expect_int(&vals[0], pos)? % 2 == 0))
         }
         _ => Err(runtime_err(pos, format!("unknown procedure: {}", op))),
     }
