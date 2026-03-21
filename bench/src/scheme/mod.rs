@@ -2,7 +2,7 @@ pub mod error;
 
 pub use error::EvalError;
 
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
 use std::rc::Rc;
 
@@ -22,10 +22,18 @@ enum Value {
         env: Env,
     },
     Builtin(String),
+    Continuation { id: usize, top_expr_idx: usize },
 }
 
 type EnvCell = Rc<RefCell<Value>>;
 type Env = HashMap<String, EnvCell>;
+
+thread_local! {
+    static CONT_JUMP: RefCell<Option<(usize, Value, usize)>> = RefCell::new(None);
+    static CONT_RESUME: RefCell<Option<Value>> = RefCell::new(None);
+    static CURRENT_TOP_IDX: Cell<usize> = Cell::new(0);
+    static NEXT_CONT_ID: Cell<usize> = Cell::new(1);
+}
 
 fn env_get(env: &Env, name: &str) -> Option<Value> {
     env.get(name).map(|cell| cell.borrow().clone())
@@ -46,6 +54,7 @@ impl Value {
             Value::Char(c) => format!("#\\{}", c),
             Value::Lambda { .. } => "#<procedure>".to_string(),
             Value::Builtin(_) => "#<procedure>".to_string(),
+            Value::Continuation { .. } => "#<continuation>".to_string(),
             Value::List(items) => {
                 let parts: Vec<String> = items.iter().map(|v| v.to_scheme_string()).collect();
                 format!("({})", parts.join(" "))
@@ -250,7 +259,7 @@ fn is_builtin(name: &str) -> bool {
         "string->number" | "number->string" | "symbol->string" | "string->symbol" |
         "string-copy" | "string-ref" | "char?" | "map" |
         "string->list" | "list->string" | "char->integer" | "integer->char" |
-        "apply")
+        "apply" | "call/cc" | "call-with-current-continuation")
 }
 
 fn parse_params(param_asts: &[Ast]) -> Result<(Vec<String>, Option<String>), EvalError> {
@@ -632,7 +641,7 @@ fn eval(ast: &Ast, env: &mut Env, out: &mut String) -> Result<Value, EvalError> 
                 // Try builtin first if operator is a symbol not in env
                 // (skip "apply" — it needs special handling below)
                 if let AstKind::Symbol(s) = &items[0].kind {
-                    if !e.contains_key(s.as_str()) && s != "apply" {
+                    if !e.contains_key(s.as_str()) && s != "apply" && s != "call/cc" && s != "call-with-current-continuation" {
                         return apply_builtin(s, &args, out)
                             .map_err(|err| err.with_position(line, col));
                     }
@@ -707,6 +716,67 @@ fn eval(ast: &Ast, env: &mut Env, out: &mut String) -> Result<Value, EvalError> 
                             }
                             _ => return Err(EvalError::NotAProcedure.with_position(line, col)),
                         }
+                    }
+                    Value::Builtin(ref bname) if bname == "call/cc" || bname == "call-with-current-continuation" => {
+                        if args.len() != 1 {
+                            return Err(EvalError::Arity.with_position(line, col));
+                        }
+                        let proc = args.into_iter().next().unwrap();
+                        // Check if we're resuming a continuation
+                        let resume = CONT_RESUME.with(|r| r.borrow_mut().take());
+                        if let Some(val) = resume {
+                            return Ok(val);
+                        }
+                        // Create new continuation
+                        let id = NEXT_CONT_ID.with(|c| { let v = c.get(); c.set(v + 1); v });
+                        let top_idx = CURRENT_TOP_IDX.with(|c| c.get());
+                        let k = Value::Continuation { id, top_expr_idx: top_idx };
+                        // Call proc with k
+                        match proc {
+                            Value::Lambda { params, rest_param, body, env: closed_env } => {
+                                let mut local_env = closed_env;
+                                if let Some(ref rest) = rest_param {
+                                    if params.is_empty() {
+                                        env_set(&mut local_env, rest.clone(), Value::List(vec![k]));
+                                    } else {
+                                        for (i, p) in params.iter().enumerate() {
+                                            if i == 0 {
+                                                env_set(&mut local_env, p.clone(), k.clone());
+                                            }
+                                        }
+                                        env_set(&mut local_env, rest.clone(), Value::List(vec![]));
+                                    }
+                                } else {
+                                    if params.len() != 1 {
+                                        return Err(EvalError::Arity.with_position(line, col));
+                                    }
+                                    env_set(&mut local_env, params[0].clone(), k);
+                                }
+                                match eval(&body, &mut local_env, out) {
+                                    Ok(v) => return Ok(v),
+                                    Err(EvalError::ContinuationJump) => {
+                                        let jump = CONT_JUMP.with(|c| c.borrow_mut().take());
+                                        if let Some((jid, jval, jtop)) = jump {
+                                            if jid == id {
+                                                return Ok(jval);
+                                            }
+                                            CONT_JUMP.with(|c| *c.borrow_mut() = Some((jid, jval, jtop)));
+                                        }
+                                        return Err(EvalError::ContinuationJump);
+                                    }
+                                    Err(e) => return Err(e),
+                                }
+                            }
+                            _ => return Err(EvalError::NotAProcedure.with_position(line, col)),
+                        }
+                    }
+                    Value::Continuation { id, top_expr_idx } => {
+                        if args.len() != 1 {
+                            return Err(EvalError::Arity.with_position(line, col));
+                        }
+                        let val = args.into_iter().next().unwrap();
+                        CONT_JUMP.with(|c| *c.borrow_mut() = Some((id, val, top_expr_idx)));
+                        return Err(EvalError::ContinuationJump);
                     }
                     Value::Builtin(ref bname) => {
                         return apply_builtin(bname, &args, out)
@@ -1020,15 +1090,41 @@ fn apply_builtin(op: &str, args: &[Value], out: &mut String) -> Result<Value, Ev
 /// representation of the last result.
 pub fn eval_str(input: &str) -> Result<String, EvalError> {
     let tokens = tokenize(input);
+    let mut asts = Vec::new();
     let mut pos = 0;
-    let mut last_result = None;
-    let mut env = Env::new();
-    let mut out = String::new();
     while pos < tokens.len() {
         let (ast, next) = parse(&tokens, pos)?;
-        let result = eval(&ast, &mut env, &mut out)?;
-        last_result = Some(result);
+        asts.push(ast);
         pos = next;
+    }
+    if asts.is_empty() {
+        return Err(EvalError::Parse("empty input".into()));
+    }
+    NEXT_CONT_ID.with(|c| c.set(1));
+    CONT_RESUME.with(|r| *r.borrow_mut() = None);
+    CONT_JUMP.with(|c| *c.borrow_mut() = None);
+    let mut env = Env::new();
+    let mut out = String::new();
+    let mut last_result = None;
+    let mut idx = 0;
+    while idx < asts.len() {
+        CURRENT_TOP_IDX.with(|c| c.set(idx));
+        match eval(&asts[idx], &mut env, &mut out) {
+            Ok(v) => {
+                last_result = Some(v);
+                idx += 1;
+            }
+            Err(EvalError::ContinuationJump) => {
+                let jump = CONT_JUMP.with(|c| c.borrow_mut().take());
+                if let Some((_id, val, top_idx)) = jump {
+                    CONT_RESUME.with(|r| *r.borrow_mut() = Some(val));
+                    idx = top_idx;
+                } else {
+                    return Err(EvalError::ContinuationJump);
+                }
+            }
+            Err(e) => return Err(e),
+        }
     }
     match last_result {
         Some(v) => Ok(v.to_scheme_string()),
@@ -1040,15 +1136,41 @@ pub fn eval_str(input: &str) -> Result<String, EvalError> {
 /// any output produced by `display`, `write`, or `newline`.
 pub fn eval_str_with_output(input: &str) -> Result<(String, String), EvalError> {
     let tokens = tokenize(input);
+    let mut asts = Vec::new();
     let mut pos = 0;
-    let mut last_result = None;
-    let mut env = Env::new();
-    let mut out = String::new();
     while pos < tokens.len() {
         let (ast, next) = parse(&tokens, pos)?;
-        let result = eval(&ast, &mut env, &mut out)?;
-        last_result = Some(result);
+        asts.push(ast);
         pos = next;
+    }
+    if asts.is_empty() {
+        return Err(EvalError::Parse("empty input".into()));
+    }
+    NEXT_CONT_ID.with(|c| c.set(1));
+    CONT_RESUME.with(|r| *r.borrow_mut() = None);
+    CONT_JUMP.with(|c| *c.borrow_mut() = None);
+    let mut env = Env::new();
+    let mut out = String::new();
+    let mut last_result = None;
+    let mut idx = 0;
+    while idx < asts.len() {
+        CURRENT_TOP_IDX.with(|c| c.set(idx));
+        match eval(&asts[idx], &mut env, &mut out) {
+            Ok(v) => {
+                last_result = Some(v);
+                idx += 1;
+            }
+            Err(EvalError::ContinuationJump) => {
+                let jump = CONT_JUMP.with(|c| c.borrow_mut().take());
+                if let Some((_id, val, top_idx)) = jump {
+                    CONT_RESUME.with(|r| *r.borrow_mut() = Some(val));
+                    idx = top_idx;
+                } else {
+                    return Err(EvalError::ContinuationJump);
+                }
+            }
+            Err(e) => return Err(e),
+        }
     }
     match last_result {
         Some(v) => Ok((v.to_scheme_string(), out)),

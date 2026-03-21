@@ -16,6 +16,8 @@ pub enum EvalError {
     Arity,
     #[error("division by zero")]
     DivisionByZero,
+    #[error("continuation jump")]
+    ContinuationJump,
     #[error("{msg} at {line}:{col}")]
     WithPosition { msg: String, line: usize, col: usize },
 }
