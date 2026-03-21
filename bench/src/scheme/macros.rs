@@ -184,6 +184,8 @@ fn is_special_form(name: &str) -> bool {
             | "or"
             | "lambda"
             | "let"
+            | "letrec"
+            | "letrec*"
             | "begin"
             | "cond"
             | "display"

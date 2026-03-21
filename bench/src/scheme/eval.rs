@@ -357,6 +357,8 @@ fn eval_list_step(
             "or" => return eval_or_step(args, env, ctx),
             "lambda" => return eval_lambda(args, env).map(Trampoline::Done),
             "let" => return eval_let_step(args, env, ctx),
+            "letrec" => return eval_letrec_step(args, env, ctx),
+            "letrec*" => return eval_letrec_star_step(args, env, ctx),
             "begin" => return eval_body_step(args, env, ctx),
             "cond" => return eval_cond_step(args, env, ctx),
             "display" => return eval_display(args, env, ctx).map(Trampoline::Done),
@@ -809,6 +811,93 @@ fn eval_let_step(
     let mut local_env = env.clone();
     for (name, val) in pairs {
         env_define(&mut local_env, name, val);
+    }
+    eval_body_step(body, &mut local_env, ctx)
+}
+
+/// Parse let-style bindings list into (name, value_expr) pairs.
+fn parse_bindings(bindings_expr: &Expr) -> Result<Vec<(&str, &Expr)>, EvalError> {
+    let Expr::List(bindings, _) = bindings_expr else {
+        return Err(EvalError::Parse {
+            message: "letrec bindings must be a list".to_string(),
+        });
+    };
+    bindings
+        .iter()
+        .map(|b| {
+            let Expr::List(pair, _) = b else {
+                return Err(EvalError::Parse {
+                    message: "letrec binding must be a list".to_string(),
+                });
+            };
+            let [Expr::Atom(name, _), val_expr] = pair.as_slice() else {
+                return Err(EvalError::Parse {
+                    message: "letrec binding must be (name value)".to_string(),
+                });
+            };
+            Ok((name.as_str(), val_expr))
+        })
+        .collect()
+}
+
+/// Evaluate `(letrec ((var expr) ...) body...)`.
+/// All bindings are mutually visible — init exprs are evaluated in the new env.
+fn eval_letrec_step(
+    args: &[Expr],
+    env: &mut Env,
+    ctx: &mut EvalCtx,
+) -> Result<Trampoline, EvalError> {
+    let [bindings_expr, body @ ..] = args else {
+        return Err(EvalError::Parse {
+            message: "letrec requires bindings and body".to_string(),
+        });
+    };
+    if body.is_empty() {
+        return Err(EvalError::Parse {
+            message: "letrec requires bindings and body".to_string(),
+        });
+    }
+    let parsed = parse_bindings(bindings_expr)?;
+    let mut local_env = env.clone();
+    // Step 1: bind all names to placeholder
+    for &(name, _) in &parsed {
+        env_define(&mut local_env, name.to_string(), Value::Nil);
+    }
+    // Step 2: evaluate init exprs in the new env and set bindings
+    for &(name, val_expr) in &parsed {
+        let val = eval(val_expr, &mut local_env, ctx)?;
+        env_set(&local_env, name, val)?;
+    }
+    eval_body_step(body, &mut local_env, ctx)
+}
+
+/// Evaluate `(letrec* ((var expr) ...) body...)`.
+/// Bindings are visible sequentially — each init can see previous bindings.
+fn eval_letrec_star_step(
+    args: &[Expr],
+    env: &mut Env,
+    ctx: &mut EvalCtx,
+) -> Result<Trampoline, EvalError> {
+    let [bindings_expr, body @ ..] = args else {
+        return Err(EvalError::Parse {
+            message: "letrec* requires bindings and body".to_string(),
+        });
+    };
+    if body.is_empty() {
+        return Err(EvalError::Parse {
+            message: "letrec* requires bindings and body".to_string(),
+        });
+    }
+    let parsed = parse_bindings(bindings_expr)?;
+    let mut local_env = env.clone();
+    // Bind all names to placeholder first (so later bindings are in scope)
+    for &(name, _) in &parsed {
+        env_define(&mut local_env, name.to_string(), Value::Nil);
+    }
+    // Evaluate sequentially, updating each binding as we go
+    for &(name, val_expr) in &parsed {
+        let val = eval(val_expr, &mut local_env, ctx)?;
+        env_set(&local_env, name, val)?;
     }
     eval_body_step(body, &mut local_env, ctx)
 }
