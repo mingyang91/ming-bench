@@ -48,6 +48,10 @@ pub enum EvalError {
     DivisionByZero,
     #[error("integer overflow")]
     IntegerOverflow,
+    #[error("index out of bounds: index {index}, length {len}")]
+    IndexOutOfBounds { index: i64, len: usize },
+    #[error("invalid range: start {start}, end {end}, length {len}")]
+    InvalidRange { start: i64, end: i64, len: usize },
     #[error("not a procedure: {0}")]
     NotAProcedure(String),
 }
