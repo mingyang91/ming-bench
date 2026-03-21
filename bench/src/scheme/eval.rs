@@ -76,6 +76,12 @@ fn eval_list(items: &[Expr], env: &mut Env, out: &mut String) -> Result<Value, E
             _ => {}
         }
     }
+    // Higher-order builtins that need function application
+    if let Expr::Atom(op, _) = operator {
+        if op == "map" && !env.contains_key("map") {
+            return eval_builtin_map(args, env, out);
+        }
+    }
     // General function application
     let evaluated: Vec<Value> = args
         .iter()
@@ -129,6 +135,11 @@ fn apply_builtin(op: &str, args: &[Value]) -> Result<Value, EvalError> {
         "symbol->string" => builtins::apply_symbol_to_string(args),
         "string->symbol" => builtins::apply_string_to_symbol(args),
         "string-copy" => builtins::apply_string_copy(args),
+        "string->list" => builtins::apply_string_to_list(args),
+        "list->string" => builtins::apply_list_to_string(args),
+        "char->integer" => builtins::apply_char_to_integer(args),
+        "integer->char" => builtins::apply_integer_to_char(args),
+        // map is handled in eval_list as a higher-order function
         _ => Err(EvalError::UnboundVariable {
             name: op.to_string(),
         }),
@@ -418,51 +429,42 @@ fn eval_write(args: &[Expr], env: &mut Env, out: &mut String) -> Result<Value, E
     Ok(Value::Nil)
 }
 
-/// Evaluate `(string-set! var index char)` — mutates a character in a string.
-fn eval_string_set(args: &[Expr], env: &mut Env, out: &mut String) -> Result<Value, EvalError> {
-    let [var_expr, idx_expr, char_expr] = args else {
+/// Evaluate builtin `(map func list)`.
+fn eval_builtin_map(args: &[Expr], env: &mut Env, out: &mut String) -> Result<Value, EvalError> {
+    let [func_expr, list_expr] = args else {
         return Err(EvalError::WrongArgCount {
-            expected: 3,
+            expected: 2,
             got: args.len(),
         });
     };
-    let Expr::Atom(var_name, _) = var_expr else {
-        return Err(EvalError::TypeError {
-            expected: "variable name".to_string(),
-            got: "expression".to_string(),
-        });
+    let func = eval(func_expr, env, out)?;
+    let list_val = eval(list_expr, env, out)?;
+    let items = match &list_val {
+        Value::Nil => return Ok(Value::Nil),
+        Value::List(items) => items,
+        _ => {
+            return Err(EvalError::TypeError {
+                expected: "list".to_string(),
+                got: format!("{list_val}"),
+            })
+        }
     };
-    let idx_val = eval(idx_expr, env, out)?;
-    let Value::Integer(idx) = idx_val else {
-        return Err(EvalError::TypeError {
-            expected: "integer".to_string(),
-            got: format!("{idx_val}"),
-        });
-    };
-    let char_val = eval(char_expr, env, out)?;
-    let Value::Char(ch) = char_val else {
-        return Err(EvalError::TypeError {
-            expected: "char".to_string(),
-            got: format!("{char_val}"),
-        });
-    };
-    let Some(Value::String(s)) = env.get_mut(var_name) else {
-        return Err(EvalError::TypeError {
-            expected: "mutable string variable".to_string(),
-            got: var_name.clone(),
-        });
-    };
-    let idx_usize = idx as usize;
-    let mut chars: Vec<char> = s.chars().collect();
-    if idx_usize >= chars.len() {
-        return Err(EvalError::TypeError {
-            expected: "valid string index".to_string(),
-            got: format!("{idx}"),
-        });
+    let results: Vec<Value> = items
+        .iter()
+        .map(|item| apply_func(&func, std::slice::from_ref(item), out))
+        .collect::<Result<_, _>>()?;
+    if results.is_empty() {
+        Ok(Value::Nil)
+    } else {
+        Ok(Value::List(results))
     }
-    chars[idx_usize] = ch;
-    *s = chars.into_iter().collect();
-    Ok(Value::Nil)
+}
+
+/// Evaluate `(string-set! ...)` — strings are immutable in R7RS.
+fn eval_string_set(_args: &[Expr], _env: &mut Env, _out: &mut String) -> Result<Value, EvalError> {
+    Err(EvalError::Immutable {
+        message: "strings are immutable".to_string(),
+    })
 }
 
 /// Evaluate `(newline)` — prints a newline character.

@@ -16,6 +16,9 @@ pub enum EvalError {
     #[error("division by zero")]
     DivisionByZero,
 
+    #[error("immutable: {message}")]
+    Immutable { message: String },
+
     #[error("at {line}:{col}: {source}")]
     AtPosition {
         line: usize,

@@ -342,6 +342,93 @@ pub fn apply_is_char(args: &[Value]) -> Result<Value, EvalError> {
     Ok(Value::Boolean(matches!(val, Value::Char(_))))
 }
 
+pub fn apply_string_to_list(args: &[Value]) -> Result<Value, EvalError> {
+    let [val] = args else {
+        return Err(EvalError::WrongArgCount {
+            expected: 1,
+            got: args.len(),
+        });
+    };
+    let Value::String(s) = val else {
+        return Err(EvalError::TypeError {
+            expected: "string".to_string(),
+            got: format!("{val}"),
+        });
+    };
+    let chars: Vec<Value> = s.chars().map(Value::Char).collect();
+    if chars.is_empty() {
+        Ok(Value::Nil)
+    } else {
+        Ok(Value::List(chars))
+    }
+}
+
+pub fn apply_list_to_string(args: &[Value]) -> Result<Value, EvalError> {
+    let [val] = args else {
+        return Err(EvalError::WrongArgCount {
+            expected: 1,
+            got: args.len(),
+        });
+    };
+    let items = match val {
+        Value::Nil => return Ok(Value::String(String::new())),
+        Value::List(items) => items,
+        _ => {
+            return Err(EvalError::TypeError {
+                expected: "list".to_string(),
+                got: format!("{val}"),
+            })
+        }
+    };
+    let s: String = items
+        .iter()
+        .map(|v| match v {
+            Value::Char(c) => Ok(*c),
+            _ => Err(EvalError::TypeError {
+                expected: "char".to_string(),
+                got: format!("{v}"),
+            }),
+        })
+        .collect::<Result<_, _>>()?;
+    Ok(Value::String(s))
+}
+
+pub fn apply_char_to_integer(args: &[Value]) -> Result<Value, EvalError> {
+    let [val] = args else {
+        return Err(EvalError::WrongArgCount {
+            expected: 1,
+            got: args.len(),
+        });
+    };
+    let Value::Char(c) = val else {
+        return Err(EvalError::TypeError {
+            expected: "char".to_string(),
+            got: format!("{val}"),
+        });
+    };
+    Ok(Value::Integer(*c as i64))
+}
+
+pub fn apply_integer_to_char(args: &[Value]) -> Result<Value, EvalError> {
+    let [val] = args else {
+        return Err(EvalError::WrongArgCount {
+            expected: 1,
+            got: args.len(),
+        });
+    };
+    let Value::Integer(n) = val else {
+        return Err(EvalError::TypeError {
+            expected: "integer".to_string(),
+            got: format!("{val}"),
+        });
+    };
+    let ch = char::from_u32(*n as u32).ok_or_else(|| EvalError::TypeError {
+        expected: "valid unicode code point".to_string(),
+        got: format!("{n}"),
+    })?;
+    Ok(Value::Char(ch))
+}
+
 pub fn apply_length(args: &[Value]) -> Result<Value, EvalError> {
     let [val] = args else {
         return Err(EvalError::WrongArgCount {
