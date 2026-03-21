@@ -1,4 +1,5 @@
 pub mod error;
+pub mod env;
 mod eval;
 mod parser;
 mod value;
@@ -9,9 +10,10 @@ pub use error::EvalError;
 /// representation of the last result.
 pub fn eval_str(input: &str) -> Result<String, EvalError> {
     let exprs = parser::parse(input)?;
+    let env = env::Env::new();
     let mut result = None;
     for expr in &exprs {
-        result = Some(eval::eval(expr)?);
+        result = Some(eval::eval(expr, &env)?);
     }
     result
         .map(|v| v.to_string())

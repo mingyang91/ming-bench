@@ -7,6 +7,9 @@ pub enum EvalError {
     #[error("unknown operator: {name}")]
     UnknownOperator { name: String },
 
+    #[error("unbound variable: {name}")]
+    UnboundVariable { name: String },
+
     #[error("type error: expected {expected}, got {got}")]
     TypeError { expected: String, got: String },
 
