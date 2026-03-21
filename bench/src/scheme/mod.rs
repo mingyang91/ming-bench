@@ -257,6 +257,20 @@ fn ast_to_value(ast: &Ast) -> Value {
     }
 }
 
+fn values_equal(a: &Value, b: &Value) -> bool {
+    match (a, b) {
+        (Value::Integer(x), Value::Integer(y)) => x == y,
+        (Value::Boolean(x), Value::Boolean(y)) => x == y,
+        (Value::Str(x), Value::Str(y)) => x == y,
+        (Value::Symbol(x), Value::Symbol(y)) => x == y,
+        (Value::Char(x), Value::Char(y)) => x == y,
+        (Value::List(xs), Value::List(ys)) => {
+            xs.len() == ys.len() && xs.iter().zip(ys.iter()).all(|(a, b)| values_equal(a, b))
+        }
+        _ => false,
+    }
+}
+
 fn is_builtin(name: &str) -> bool {
     matches!(name, "+" | "-" | "*" | "/" | "<" | ">" | "=" | "<=" | ">=" | "not" |
         "cons" | "car" | "cdr" | "null?" | "list" | "length" |
@@ -266,7 +280,8 @@ fn is_builtin(name: &str) -> bool {
         "string->number" | "number->string" | "symbol->string" | "string->symbol" |
         "string-copy" | "string-ref" | "char?" | "map" |
         "string->list" | "list->string" | "char->integer" | "integer->char" |
-        "apply" | "call/cc" | "call-with-current-continuation")
+        "apply" | "call/cc" | "call-with-current-continuation" |
+        "equal?")
 }
 
 fn parse_params(param_asts: &[Ast]) -> Result<(Vec<String>, Option<String>), EvalError> {
@@ -1229,6 +1244,10 @@ fn apply_builtin(op: &str, args: &[Value], out: &mut String) -> Result<Value, Ev
         "symbol?" => {
             if args.len() != 1 { return Err(EvalError::Arity); }
             Ok(Value::Boolean(matches!(&args[0], Value::Symbol(_))))
+        }
+        "equal?" => {
+            if args.len() != 2 { return Err(EvalError::Arity); }
+            Ok(Value::Boolean(values_equal(&args[0], &args[1])))
         }
         "display" => {
             if args.len() != 1 { return Err(EvalError::Arity); }
