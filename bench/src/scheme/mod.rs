@@ -3,19 +3,26 @@ pub mod parser;
 pub mod value;
 
 pub use error::EvalError;
+use std::collections::HashMap;
 use value::Value;
+
+type Env = HashMap<String, Value>;
 
 /// Evaluate one or more Scheme expressions and return the string
 /// representation of the last result.
 pub fn eval_str(input: &str) -> Result<String, EvalError> {
     let exprs = parser::parse(input)?;
-    let last = exprs
-        .into_iter()
-        .last()
-        .ok_or(EvalError::Parse {
+    if exprs.is_empty() {
+        return Err(EvalError::Parse {
             message: "empty input".to_string(),
-        })?;
-    Ok(eval(&last)?.to_string())
+        });
+    }
+    let mut env = Env::new();
+    let mut last = Value::Boolean(false);
+    for expr in &exprs {
+        last = eval(expr, &mut env)?;
+    }
+    Ok(last.to_string())
 }
 
 /// Evaluate Scheme expressions, returning both the result value and
@@ -24,17 +31,17 @@ pub fn eval_str_with_output(_input: &str) -> Result<(String, String), EvalError>
     todo!()
 }
 
-fn eval(value: &Value) -> Result<Value, EvalError> {
+fn eval(value: &Value, env: &mut Env) -> Result<Value, EvalError> {
     match value {
         Value::Integer(_) | Value::Boolean(_) | Value::String(_) => Ok(value.clone()),
-        Value::Symbol(name) => Err(EvalError::UnboundVariable {
+        Value::Symbol(name) => env.get(name).cloned().ok_or_else(|| EvalError::UnboundVariable {
             name: name.clone(),
         }),
-        Value::List(items) => eval_list(items),
+        Value::List(items) => eval_list(items, env),
     }
 }
 
-fn eval_list(items: &[Value]) -> Result<Value, EvalError> {
+fn eval_list(items: &[Value], env: &mut Env) -> Result<Value, EvalError> {
     let [operator, args @ ..] = items else {
         return Err(EvalError::Parse {
             message: "empty application".to_string(),
@@ -43,9 +50,12 @@ fn eval_list(items: &[Value]) -> Result<Value, EvalError> {
 
     match operator {
         Value::Symbol(name) => match name.as_str() {
-            "and" => eval_and(args),
-            "or" => eval_or(args),
-            _ => apply_builtin(name, args),
+            "define" => eval_define(args, env),
+            "if" => eval_if(args, env),
+            "quote" => eval_quote(args),
+            "and" => eval_and(args, env),
+            "or" => eval_or(args, env),
+            _ => apply_builtin(name, args, env),
         },
         _ => Err(EvalError::TypeError {
             expected: "procedure".to_string(),
@@ -54,19 +64,55 @@ fn eval_list(items: &[Value]) -> Result<Value, EvalError> {
     }
 }
 
-fn apply_builtin(name: &str, args: &[Value]) -> Result<Value, EvalError> {
+fn eval_define(args: &[Value], env: &mut Env) -> Result<Value, EvalError> {
+    let [Value::Symbol(name), expr] = args else {
+        return Err(EvalError::Parse {
+            message: "define requires a symbol and an expression".to_string(),
+        });
+    };
+    let val = eval(expr, env)?;
+    env.insert(name.clone(), val);
+    Ok(Value::Symbol(name.clone()))
+}
+
+fn eval_if(args: &[Value], env: &mut Env) -> Result<Value, EvalError> {
+    let [condition, consequent, alternative] = args else {
+        return Err(EvalError::WrongArgCount {
+            expected: 3,
+            got: args.len(),
+        });
+    };
+    let cond_val = eval(condition, env)?;
+    if is_truthy(&cond_val) {
+        eval(consequent, env)
+    } else {
+        eval(alternative, env)
+    }
+}
+
+fn eval_quote(args: &[Value]) -> Result<Value, EvalError> {
+    let [expr] = args else {
+        return Err(EvalError::WrongArgCount {
+            expected: 1,
+            got: args.len(),
+        });
+    };
+    Ok(expr.clone())
+}
+
+fn apply_builtin(name: &str, args: &[Value], env: &mut Env) -> Result<Value, EvalError> {
     match name {
-        "+" | "-" | "*" | "/" => apply_arithmetic(name, args),
-        "<" | ">" | "=" | "<=" | ">=" => apply_comparison(name, args),
-        "not" => apply_not(args),
+        "+" | "-" | "*" | "/" => apply_arithmetic(name, args, env),
+        "<" | ">" | "=" | "<=" | ">=" => apply_comparison(name, args, env),
+        "not" => apply_not(args, env),
         _ => Err(EvalError::UnboundVariable {
             name: name.to_string(),
         }),
     }
 }
 
-fn eval_to_integer(value: &Value) -> Result<i64, EvalError> {
-    match eval(value)? {
+fn eval_to_integer(value: &Value, env: &mut Env) -> Result<i64, EvalError> {
+    match eval(value, env)? {
         Value::Integer(n) => Ok(n),
         other => Err(EvalError::TypeError {
             expected: "integer".to_string(),
@@ -83,8 +129,11 @@ fn checked_div(acc: i64, x: i64) -> Result<i64, EvalError> {
     }
 }
 
-fn apply_arithmetic(op: &str, args: &[Value]) -> Result<Value, EvalError> {
-    let evaluated: Vec<i64> = args.iter().map(eval_to_integer).collect::<Result<_, _>>()?;
+fn apply_arithmetic(op: &str, args: &[Value], env: &mut Env) -> Result<Value, EvalError> {
+    let evaluated: Vec<i64> = args
+        .iter()
+        .map(|a| eval_to_integer(a, env))
+        .collect::<Result<_, _>>()?;
 
     let result = match op {
         "+" => evaluated.iter().sum(),
@@ -115,10 +164,10 @@ fn is_truthy(value: &Value) -> bool {
     !matches!(value, Value::Boolean(false))
 }
 
-fn eval_and(args: &[Value]) -> Result<Value, EvalError> {
+fn eval_and(args: &[Value], env: &mut Env) -> Result<Value, EvalError> {
     let mut result = Value::Boolean(true);
     for arg in args {
-        result = eval(arg)?;
+        result = eval(arg, env)?;
         if !is_truthy(&result) {
             return Ok(result);
         }
@@ -126,10 +175,10 @@ fn eval_and(args: &[Value]) -> Result<Value, EvalError> {
     Ok(result)
 }
 
-fn eval_or(args: &[Value]) -> Result<Value, EvalError> {
+fn eval_or(args: &[Value], env: &mut Env) -> Result<Value, EvalError> {
     let mut result = Value::Boolean(false);
     for arg in args {
-        result = eval(arg)?;
+        result = eval(arg, env)?;
         if is_truthy(&result) {
             return Ok(result);
         }
@@ -137,26 +186,26 @@ fn eval_or(args: &[Value]) -> Result<Value, EvalError> {
     Ok(result)
 }
 
-fn apply_not(args: &[Value]) -> Result<Value, EvalError> {
+fn apply_not(args: &[Value], env: &mut Env) -> Result<Value, EvalError> {
     let [arg] = args else {
         return Err(EvalError::WrongArgCount {
             expected: 1,
             got: args.len(),
         });
     };
-    let val = eval(arg)?;
+    let val = eval(arg, env)?;
     Ok(Value::Boolean(!is_truthy(&val)))
 }
 
-fn apply_comparison(op: &str, args: &[Value]) -> Result<Value, EvalError> {
+fn apply_comparison(op: &str, args: &[Value], env: &mut Env) -> Result<Value, EvalError> {
     let [left, right] = args else {
         return Err(EvalError::WrongArgCount {
             expected: 2,
             got: args.len(),
         });
     };
-    let a = eval_to_integer(left)?;
-    let b = eval_to_integer(right)?;
+    let a = eval_to_integer(left, env)?;
+    let b = eval_to_integer(right, env)?;
 
     let result = match op {
         "<" => a < b,
