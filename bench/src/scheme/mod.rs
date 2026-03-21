@@ -355,38 +355,53 @@ pub fn eval_str(input: &str) -> Result<String, EvalError> {
 
 /// Evaluate a sequence of top-level expressions, handling continuation invocations.
 fn eval_top_level(exprs: &[(Value, Pos)], env: &Env) -> Result<Value, EvalError> {
-    let mut result = Value::Boolean(false);
-    let mut i = 0;
-    while i < exprs.len() {
-        // Set continuation context so call/cc can capture the current position
-        CONT_CONTEXT.with(|c| {
-            *c.borrow_mut() = Some((
-                exprs[i].0.clone(),
-                exprs[i].1,
-                exprs[i + 1..].to_vec(),
-                env.clone(),
-            ));
-        });
+    let mut current_exprs = exprs.to_vec();
+    let mut current_env = env.clone();
 
-        match eval(exprs[i].0.clone(), env, exprs[i].1) {
-            Ok(v) => {
-                result = v;
-                i += 1;
+    'restart: loop {
+        let mut result = Value::Boolean(false);
+        let mut i = 0;
+        while i < current_exprs.len() {
+            // Set continuation context so call/cc can capture the current position
+            CONT_CONTEXT.with(|c| {
+                *c.borrow_mut() = Some((
+                    current_exprs[i].0.clone(),
+                    current_exprs[i].1,
+                    current_exprs[i + 1..].to_vec(),
+                    current_env.clone(),
+                ));
+            });
+
+            match eval(current_exprs[i].0.clone(), &current_env, current_exprs[i].1) {
+                Ok(v) => {
+                    result = v;
+                    i += 1;
+                }
+                Err(EvalError::ContinuationInvoke) => {
+                    // A continuation was invoked — replay from its capture point
+                    let (data, value) = CONT_INVOKE_DATA
+                        .with(|d| d.borrow_mut().take())
+                        .expect("ContinuationInvoke without data");
+                    // If there's already a pending CONT_RETURN that no call/cc consumed,
+                    // a continuation was invoked during another continuation's replay.
+                    // Clear it to prevent the wrong call/cc from consuming it.
+                    let had_pending = CONT_RETURN.with(|c| c.borrow().is_some());
+                    if had_pending {
+                        CONT_RETURN.with(|c| *c.borrow_mut() = None);
+                    } else {
+                        CONT_RETURN.with(|c| *c.borrow_mut() = Some(value));
+                    }
+                    let mut replay = vec![(data.replay_expr.clone(), data.replay_pos)];
+                    replay.extend(data.remaining_exprs.iter().cloned());
+                    current_exprs = replay;
+                    current_env = data.env.clone();
+                    continue 'restart;
+                }
+                Err(e) => return Err(e),
             }
-            Err(EvalError::ContinuationInvoke) => {
-                // A continuation was invoked — replay from its capture point
-                let (data, value) = CONT_INVOKE_DATA
-                    .with(|d| d.borrow_mut().take())
-                    .expect("ContinuationInvoke without data");
-                CONT_RETURN.with(|c| *c.borrow_mut() = Some(value));
-                let mut replay = vec![(data.replay_expr.clone(), data.replay_pos)];
-                replay.extend(data.remaining_exprs.iter().cloned());
-                return eval_top_level(&replay, &data.env);
-            }
-            Err(e) => return Err(e),
         }
+        return Ok(result);
     }
-    Ok(result)
 }
 
 fn eval(mut expr: Value, env: &Env, pos: Pos) -> Result<Value, EvalError> {
