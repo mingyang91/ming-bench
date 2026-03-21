@@ -22,7 +22,7 @@ enum Value {
         env: Env,
     },
     Builtin(String),
-    Continuation { id: usize, top_expr_idx: usize },
+    Continuation { id: usize, top_expr_idx: usize, call_line: usize, call_col: usize },
     Macro {
         literals: Vec<String>,
         rules: Vec<(Ast, Ast)>,
@@ -34,8 +34,8 @@ type EnvCell = Rc<RefCell<Value>>;
 type Env = HashMap<String, EnvCell>;
 
 thread_local! {
-    static CONT_JUMP: RefCell<Option<(usize, Value, usize)>> = RefCell::new(None);
-    static CONT_RESUME: RefCell<Option<Value>> = RefCell::new(None);
+    static CONT_JUMP: RefCell<Option<(usize, Value, usize, usize, usize)>> = RefCell::new(None);
+    static CONT_RESUME: RefCell<Option<(Value, usize, usize)>> = RefCell::new(None);
     static CURRENT_TOP_IDX: Cell<usize> = Cell::new(0);
     static NEXT_CONT_ID: Cell<usize> = Cell::new(1);
     static GENSYM_COUNTER: Cell<usize> = Cell::new(0);
@@ -1016,15 +1016,27 @@ fn eval(ast: &Ast, env: &mut Env, out: &mut String) -> Result<Value, EvalError> 
                             return Err(EvalError::Arity.with_position(line, col));
                         }
                         let proc = args.into_iter().next().unwrap();
-                        // Check if we're resuming a continuation
-                        let resume = CONT_RESUME.with(|r| r.borrow_mut().take());
+                        // Check if we're resuming a continuation at this position
+                        let resume = CONT_RESUME.with(|r| {
+                            let cur = r.borrow();
+                            if let Some((_, rl, rc)) = cur.as_ref() {
+                                if *rl == line && *rc == col {
+                                    drop(cur);
+                                    r.borrow_mut().take().map(|(v, _, _)| v)
+                                } else {
+                                    None
+                                }
+                            } else {
+                                None
+                            }
+                        });
                         if let Some(val) = resume {
                             return Ok(val);
                         }
                         // Create new continuation
                         let id = NEXT_CONT_ID.with(|c| { let v = c.get(); c.set(v + 1); v });
                         let top_idx = CURRENT_TOP_IDX.with(|c| c.get());
-                        let k = Value::Continuation { id, top_expr_idx: top_idx };
+                        let k = Value::Continuation { id, top_expr_idx: top_idx, call_line: line, call_col: col };
                         // Call proc with k
                         match proc {
                             Value::Lambda { params, rest_param, body, env: closed_env } => {
@@ -1050,11 +1062,11 @@ fn eval(ast: &Ast, env: &mut Env, out: &mut String) -> Result<Value, EvalError> 
                                     Ok(v) => return Ok(v),
                                     Err(EvalError::ContinuationJump) => {
                                         let jump = CONT_JUMP.with(|c| c.borrow_mut().take());
-                                        if let Some((jid, jval, jtop)) = jump {
+                                        if let Some((jid, jval, jtop, jl, jc)) = jump {
                                             if jid == id {
                                                 return Ok(jval);
                                             }
-                                            CONT_JUMP.with(|c| *c.borrow_mut() = Some((jid, jval, jtop)));
+                                            CONT_JUMP.with(|c| *c.borrow_mut() = Some((jid, jval, jtop, jl, jc)));
                                         }
                                         return Err(EvalError::ContinuationJump);
                                     }
@@ -1064,12 +1076,12 @@ fn eval(ast: &Ast, env: &mut Env, out: &mut String) -> Result<Value, EvalError> 
                             _ => return Err(EvalError::NotAProcedure.with_position(line, col)),
                         }
                     }
-                    Value::Continuation { id, top_expr_idx } => {
+                    Value::Continuation { id, top_expr_idx, call_line, call_col } => {
                         if args.len() != 1 {
                             return Err(EvalError::Arity.with_position(line, col));
                         }
                         let val = args.into_iter().next().unwrap();
-                        CONT_JUMP.with(|c| *c.borrow_mut() = Some((id, val, top_expr_idx)));
+                        CONT_JUMP.with(|c| *c.borrow_mut() = Some((id, val, top_expr_idx, call_line, call_col)));
                         return Err(EvalError::ContinuationJump);
                     }
                     Value::Builtin(ref bname) => {
@@ -1411,8 +1423,8 @@ pub fn eval_str(input: &str) -> Result<String, EvalError> {
             }
             Err(EvalError::ContinuationJump) => {
                 let jump = CONT_JUMP.with(|c| c.borrow_mut().take());
-                if let Some((_id, val, top_idx)) = jump {
-                    CONT_RESUME.with(|r| *r.borrow_mut() = Some(val));
+                if let Some((_id, val, top_idx, cl, cc)) = jump {
+                    CONT_RESUME.with(|r| *r.borrow_mut() = Some((val, cl, cc)));
                     idx = top_idx;
                 } else {
                     return Err(EvalError::ContinuationJump);
@@ -1458,8 +1470,8 @@ pub fn eval_str_with_output(input: &str) -> Result<(String, String), EvalError> 
             }
             Err(EvalError::ContinuationJump) => {
                 let jump = CONT_JUMP.with(|c| c.borrow_mut().take());
-                if let Some((_id, val, top_idx)) = jump {
-                    CONT_RESUME.with(|r| *r.borrow_mut() = Some(val));
+                if let Some((_id, val, top_idx, cl, cc)) = jump {
+                    CONT_RESUME.with(|r| *r.borrow_mut() = Some((val, cl, cc)));
                     idx = top_idx;
                 } else {
                     return Err(EvalError::ContinuationJump);
