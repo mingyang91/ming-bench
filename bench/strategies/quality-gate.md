@@ -50,6 +50,9 @@ The quality gate enforces structure mechanically; these rules are the design int
 - **Maximize type safety over minimal diffs.** The compiler is the last line of defense. If it compiles, it's correct. Prefer type-level refactors even if they touch many files.
 - **Type precision is not over-engineering.** Newtypes, enums, `NonEmpty` wrappers — these remove runtime checks, not add complexity.
 - **Newtypes for domain values** where it prevents confusion. Propagate constraints through signatures — don't downgrade and re-validate internally.
+- **Wrap values that cross subsystem boundaries.** If a `String` means different things in different contexts (identifier vs user text vs output), it needs a newtype. If a `bool` parameter controls behavior, it needs an enum.
+- **Introduce types when they earn their keep.** A newtype is worth it when it prevents a class of bugs across multiple call sites. Don't wrap values that are only used locally or have no ambiguity.
+- **Enums over booleans for behavioral flags.** `enum Mode { Strict, Lenient }` communicates intent where `strict: bool` does not. The compiler can enforce exhaustive handling.
 
 ### Error Handling
 
