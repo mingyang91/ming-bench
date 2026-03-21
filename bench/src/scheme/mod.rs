@@ -29,6 +29,7 @@ thread_local! {
     static CONT_ID_COUNTER: Cell<u64> = Cell::new(0);
     static GENSYM_COUNTER: Cell<u64> = Cell::new(0);
     static CONT_FRAMES: RefCell<Vec<BodyFrame>> = RefCell::new(Vec::new());
+    static RAISED_VALUE: RefCell<Option<Value>> = RefCell::new(None);
 }
 
 fn next_cont_id() -> u64 {
@@ -212,6 +213,7 @@ fn default_env() -> Env {
         "char=?", "char<?",
         "string=?", "string<?", "string-ci=?", "string-upcase", "string-downcase",
         "dynamic-wind", "reverse",
+        "raise", "with-exception-handler",
     ];
     for name in &builtins {
         env_set(&env, name.to_string(), Value::Builtin(name.to_string(), sp));
@@ -913,6 +915,76 @@ fn eval(expr: &Value, env: &Env) -> Result<Value, EvalError> {
                             }
                             return Ok(Value::Void);
                         }
+                        "guard" => {
+                            // (guard (var clause ...) body ...)
+                            if elems.len() < 3 {
+                                return Err(EvalError::Parse("guard: expected clauses and body".into(), form_span));
+                            }
+                            let clauses_form = match &elems[1] {
+                                Value::List(c, _) if !c.is_empty() => c,
+                                _ => return Err(EvalError::Parse("guard: expected (var clause ...) list".into(), form_span)),
+                            };
+                            let var_name = match &clauses_form[0] {
+                                Value::Symbol(s, _) => s.clone(),
+                                _ => return Err(EvalError::Parse("guard: expected variable name".into(), form_span)),
+                            };
+                            let clauses = &clauses_form[1..];
+                            let body = &elems[2..];
+                            // Evaluate the body; catch SchemeRaise
+                            let body_result = (|| -> Result<Value, EvalError> {
+                                for expr in &body[..body.len().saturating_sub(1)] {
+                                    eval(expr, &current_env)?;
+                                }
+                                eval(&body[body.len() - 1], &current_env)
+                            })();
+                            match body_result {
+                                Ok(val) => return Ok(val),
+                                Err(EvalError::SchemeRaise) => {
+                                    let raised_val = RAISED_VALUE.with(|rv| rv.borrow_mut().take())
+                                        .unwrap_or(Value::Void);
+                                    // Evaluate clauses like cond with var bound
+                                    let clause_env = new_env(Some(current_env.clone()));
+                                    env_set(&clause_env, var_name, raised_val.clone());
+                                    let mut matched = false;
+                                    for clause in clauses {
+                                        match clause {
+                                            Value::List(celems, _) if celems.len() >= 2 => {
+                                                let is_else = matches!(&celems[0], Value::Symbol(s, _) if s == "else");
+                                                if is_else {
+                                                    for e in &celems[1..celems.len() - 1] {
+                                                        eval(e, &clause_env)?;
+                                                    }
+                                                    current_expr = celems[celems.len() - 1].clone();
+                                                    current_env = clause_env;
+                                                    matched = true;
+                                                    break;
+                                                }
+                                                let test_val = eval(&celems[0], &clause_env)?;
+                                                if test_val.is_truthy() {
+                                                    for e in &celems[1..celems.len() - 1] {
+                                                        eval(e, &clause_env)?;
+                                                    }
+                                                    current_expr = celems[celems.len() - 1].clone();
+                                                    current_env = clause_env;
+                                                    matched = true;
+                                                    break;
+                                                }
+                                            }
+                                            _ => return Err(EvalError::Parse("guard: invalid clause".into(), form_span)),
+                                        }
+                                    }
+                                    if matched {
+                                        continue;
+                                    }
+                                    // No clause matched and no else: re-raise
+                                    RAISED_VALUE.with(|rv| {
+                                        *rv.borrow_mut() = Some(raised_val);
+                                    });
+                                    return Err(EvalError::SchemeRaise);
+                                }
+                                Err(e) => return Err(e),
+                            }
+                        }
                         "define-syntax" => {
                             if elems.len() != 3 {
                                 return Err(EvalError::Parse("define-syntax: expected name and transformer".into(), form_span));
@@ -981,6 +1053,21 @@ fn eval(expr: &Value, env: &Env) -> Result<Value, EvalError> {
                             return Err(EvalError::WrongArgCount { expected: "3".into(), got: args.len(), at: form_span });
                         }
                         return eval_dynamic_wind(&args[0], &args[1], &args[2], form_span);
+                    }
+                    Value::Builtin(ref name, _) if name == "raise" => {
+                        if args.len() != 1 {
+                            return Err(EvalError::WrongArgCount { expected: "1".into(), got: args.len(), at: form_span });
+                        }
+                        RAISED_VALUE.with(|rv| {
+                            *rv.borrow_mut() = Some(args[0].clone());
+                        });
+                        return Err(EvalError::SchemeRaise);
+                    }
+                    Value::Builtin(ref name, _) if name == "with-exception-handler" => {
+                        if args.len() != 2 {
+                            return Err(EvalError::WrongArgCount { expected: "2".into(), got: args.len(), at: form_span });
+                        }
+                        return eval_with_exception_handler(&args[0], &args[1], form_span);
                     }
                     Value::Continuation { id, ref remaining_forms, ref body_frames, span, .. } => {
                         if args.len() != 1 {
@@ -1119,6 +1206,23 @@ fn eval_dynamic_wind(in_thunk: &Value, body_thunk: &Value, out_thunk: &Value, sp
             apply_function(out_thunk, &[], span)?;
             Err(EvalError::ContinuationReturn)
         }
+        Err(EvalError::SchemeRaise) => {
+            apply_function(out_thunk, &[], span)?;
+            Err(EvalError::SchemeRaise)
+        }
+        Err(e) => Err(e),
+    }
+}
+
+fn eval_with_exception_handler(handler: &Value, thunk: &Value, span: Span) -> Result<Value, EvalError> {
+    let result = apply_function(thunk, &[], span);
+    match result {
+        Ok(val) => Ok(val),
+        Err(EvalError::SchemeRaise) => {
+            let raised_val = RAISED_VALUE.with(|rv| rv.borrow_mut().take())
+                .unwrap_or(Value::Void);
+            apply_function(handler, &[raised_val], span)
+        }
         Err(e) => Err(e),
     }
 }
@@ -1205,6 +1309,21 @@ fn apply_function(func: &Value, args: &[Value], call_span: Span) -> Result<Value
                 return Err(EvalError::WrongArgCount { expected: "3".into(), got: args.len(), at: call_span });
             }
             eval_dynamic_wind(&args[0], &args[1], &args[2], call_span)
+        }
+        Value::Builtin(ref name, _) if name == "raise" => {
+            if args.len() != 1 {
+                return Err(EvalError::WrongArgCount { expected: "1".into(), got: args.len(), at: call_span });
+            }
+            RAISED_VALUE.with(|rv| {
+                *rv.borrow_mut() = Some(args[0].clone());
+            });
+            Err(EvalError::SchemeRaise)
+        }
+        Value::Builtin(ref name, _) if name == "with-exception-handler" => {
+            if args.len() != 2 {
+                return Err(EvalError::WrongArgCount { expected: "2".into(), got: args.len(), at: call_span });
+            }
+            eval_with_exception_handler(&args[0], &args[1], call_span)
         }
         Value::Continuation { id, ref remaining_forms, ref body_frames, span, .. } => {
             if args.len() != 1 {
@@ -1335,7 +1454,7 @@ fn eval_lambda(args: &[Value], env: &Env, form_span: Span) -> Result<Value, Eval
 fn is_special_form(s: &str) -> bool {
     matches!(s, "define" | "set!" | "quote" | "lambda" | "if" | "begin"
         | "and" | "or" | "cond" | "let" | "define-syntax" | "syntax-rules"
-        | "string-set!" | "else" | "letrec" | "letrec*" | "case")
+        | "string-set!" | "else" | "letrec" | "letrec*" | "case" | "guard")
 }
 
 #[derive(Clone)]

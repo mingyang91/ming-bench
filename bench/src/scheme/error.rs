@@ -30,4 +30,6 @@ pub enum EvalError {
     DivisionByZero(Span),
     #[error("continuation invoked")]
     ContinuationReturn,
+    #[error("scheme exception raised")]
+    SchemeRaise,
 }
