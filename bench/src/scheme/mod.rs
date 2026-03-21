@@ -23,6 +23,11 @@ enum Value {
     },
     Builtin(String),
     Continuation { id: usize, top_expr_idx: usize },
+    Macro {
+        literals: Vec<String>,
+        rules: Vec<(Ast, Ast)>,
+        def_env: Env,
+    },
 }
 
 type EnvCell = Rc<RefCell<Value>>;
@@ -33,6 +38,7 @@ thread_local! {
     static CONT_RESUME: RefCell<Option<Value>> = RefCell::new(None);
     static CURRENT_TOP_IDX: Cell<usize> = Cell::new(0);
     static NEXT_CONT_ID: Cell<usize> = Cell::new(1);
+    static GENSYM_COUNTER: Cell<usize> = Cell::new(0);
 }
 
 fn env_get(env: &Env, name: &str) -> Option<Value> {
@@ -55,6 +61,7 @@ impl Value {
             Value::Lambda { .. } => "#<procedure>".to_string(),
             Value::Builtin(_) => "#<procedure>".to_string(),
             Value::Continuation { .. } => "#<continuation>".to_string(),
+            Value::Macro { .. } => "#<macro>".to_string(),
             Value::List(items) => {
                 let parts: Vec<String> = items.iter().map(|v| v.to_scheme_string()).collect();
                 format!("({})", parts.join(" "))
@@ -285,6 +292,203 @@ fn parse_params(param_asts: &[Ast]) -> Result<(Vec<String>, Option<String>), Eva
         i += 1;
     }
     Ok((params, rest_param))
+}
+
+fn gensym(base: &str) -> String {
+    GENSYM_COUNTER.with(|c| {
+        let n = c.get();
+        c.set(n + 1);
+        format!("{}#~{}", base, n)
+    })
+}
+
+#[derive(Clone, Debug)]
+enum MacroBinding {
+    Single(Ast),
+    Ellipsis(Vec<Ast>),
+}
+
+fn collect_pattern_vars(pat: &Ast, literals: &[String]) -> Vec<String> {
+    match &pat.kind {
+        AstKind::Symbol(s) if s != "_" && s != "..." && !literals.contains(s) => {
+            vec![s.clone()]
+        }
+        AstKind::List(items) => {
+            items.iter().flat_map(|i| collect_pattern_vars(i, literals)).collect()
+        }
+        _ => vec![],
+    }
+}
+
+fn match_syntax_element(
+    pat: &Ast,
+    inp: &Ast,
+    literals: &[String],
+    bindings: &mut HashMap<String, MacroBinding>,
+) -> bool {
+    match &pat.kind {
+        AstKind::Symbol(s) if s == "_" => true,
+        AstKind::Symbol(s) if literals.contains(s) => {
+            matches!(&inp.kind, AstKind::Symbol(is) if is == s)
+        }
+        AstKind::Symbol(s) if s != "..." => {
+            bindings.insert(s.clone(), MacroBinding::Single(inp.clone()));
+            true
+        }
+        AstKind::List(pats) => {
+            if let AstKind::List(inps) = &inp.kind {
+                match_syntax_elements(pats, inps, literals, bindings)
+            } else {
+                false
+            }
+        }
+        AstKind::Integer(a) => matches!(&inp.kind, AstKind::Integer(b) if a == b),
+        AstKind::Boolean(a) => matches!(&inp.kind, AstKind::Boolean(b) if a == b),
+        _ => false,
+    }
+}
+
+fn match_syntax_elements(
+    pats: &[Ast],
+    inps: &[Ast],
+    literals: &[String],
+    bindings: &mut HashMap<String, MacroBinding>,
+) -> bool {
+    let ellipsis_pos = pats.iter().position(|p| matches!(&p.kind, AstKind::Symbol(s) if s == "..."));
+
+    if let Some(ep) = ellipsis_pos {
+        if ep == 0 { return false; }
+        let before = ep - 1;
+        let after = pats.len() - ep - 1;
+        if inps.len() < before + after { return false; }
+
+        for i in 0..before {
+            if !match_syntax_element(&pats[i], &inps[i], literals, bindings) {
+                return false;
+            }
+        }
+
+        let repeat_count = inps.len() - before - after;
+        let repeat_pat = &pats[ep - 1];
+        let var_names = collect_pattern_vars(repeat_pat, literals);
+        let mut ellipsis_lists: HashMap<String, Vec<Ast>> = HashMap::new();
+        for name in &var_names {
+            ellipsis_lists.insert(name.clone(), Vec::new());
+        }
+        for i in 0..repeat_count {
+            let mut sub_bindings = HashMap::new();
+            if !match_syntax_element(repeat_pat, &inps[before + i], literals, &mut sub_bindings) {
+                return false;
+            }
+            for (k, v) in sub_bindings {
+                if let MacroBinding::Single(ast) = v {
+                    ellipsis_lists.entry(k).or_default().push(ast);
+                }
+            }
+        }
+        for (k, v) in ellipsis_lists {
+            bindings.insert(k, MacroBinding::Ellipsis(v));
+        }
+
+        for i in 0..after {
+            if !match_syntax_element(&pats[ep + 1 + i], &inps[inps.len() - after + i], literals, bindings) {
+                return false;
+            }
+        }
+        true
+    } else {
+        if pats.len() != inps.len() { return false; }
+        for (p, i) in pats.iter().zip(inps.iter()) {
+            if !match_syntax_element(p, i, literals, bindings) {
+                return false;
+            }
+        }
+        true
+    }
+}
+
+fn collect_template_ellipsis_vars(
+    template: &Ast,
+    bindings: &HashMap<String, MacroBinding>,
+) -> Vec<String> {
+    match &template.kind {
+        AstKind::Symbol(s) => {
+            if matches!(bindings.get(s), Some(MacroBinding::Ellipsis(_))) {
+                vec![s.clone()]
+            } else {
+                vec![]
+            }
+        }
+        AstKind::List(items) => {
+            items.iter().flat_map(|i| collect_template_ellipsis_vars(i, bindings)).collect()
+        }
+        _ => vec![],
+    }
+}
+
+fn instantiate_template(
+    template: &Ast,
+    bindings: &HashMap<String, MacroBinding>,
+    hygiene_map: &HashMap<String, String>,
+) -> Ast {
+    match &template.kind {
+        AstKind::Symbol(s) => {
+            if let Some(binding) = bindings.get(s) {
+                match binding {
+                    MacroBinding::Single(ast) => ast.clone(),
+                    MacroBinding::Ellipsis(_) => template.clone(),
+                }
+            } else if let Some(renamed) = hygiene_map.get(s) {
+                Ast { kind: AstKind::Symbol(renamed.clone()), line: template.line, col: template.col }
+            } else {
+                template.clone()
+            }
+        }
+        AstKind::List(items) => {
+            let mut result = Vec::new();
+            let mut i = 0;
+            while i < items.len() {
+                if i + 1 < items.len() && matches!(&items[i + 1].kind, AstKind::Symbol(s) if s == "...") {
+                    let sub = &items[i];
+                    let vars = collect_template_ellipsis_vars(sub, bindings);
+                    if let Some(first_var) = vars.first() {
+                        if let Some(MacroBinding::Ellipsis(elts)) = bindings.get(first_var) {
+                            let count = elts.len();
+                            for j in 0..count {
+                                let mut iter_bindings = bindings.clone();
+                                for var in &vars {
+                                    if let Some(MacroBinding::Ellipsis(var_elts)) = bindings.get(var) {
+                                        if j < var_elts.len() {
+                                            iter_bindings.insert(var.clone(), MacroBinding::Single(var_elts[j].clone()));
+                                        }
+                                    }
+                                }
+                                result.push(instantiate_template(sub, &iter_bindings, hygiene_map));
+                            }
+                        }
+                    }
+                    i += 2;
+                } else {
+                    result.push(instantiate_template(&items[i], bindings, hygiene_map));
+                    i += 1;
+                }
+            }
+            Ast { kind: AstKind::List(result), line: template.line, col: template.col }
+        }
+        _ => template.clone(),
+    }
+}
+
+fn collect_free_template_vars(template: &Ast, pattern_vars: &[String]) -> Vec<String> {
+    match &template.kind {
+        AstKind::Symbol(s) if s != "..." && !pattern_vars.contains(s) => {
+            vec![s.clone()]
+        }
+        AstKind::List(items) => {
+            items.iter().flat_map(|i| collect_free_template_vars(i, pattern_vars)).collect()
+        }
+        _ => vec![],
+    }
 }
 
 /// Evaluate a parsed Scheme expression with tail call optimization.
@@ -630,7 +834,97 @@ fn eval(ast: &Ast, env: &mut Env, out: &mut String) -> Result<Value, EvalError> 
                             }
                             return Ok(Value::Symbol("ok".into()));
                         }
+                        "define-syntax" => {
+                            if items.len() != 3 {
+                                return Err(EvalError::Arity.with_position(line, col));
+                            }
+                            let name = match &items[1].kind {
+                                AstKind::Symbol(s) => s.clone(),
+                                _ => return Err(EvalError::TypeError(
+                                    "define-syntax: expected symbol".into(),
+                                ).with_position(line, col)),
+                            };
+                            let sr = match &items[2].kind {
+                                AstKind::List(parts) => parts,
+                                _ => return Err(EvalError::TypeError(
+                                    "define-syntax: expected syntax-rules".into(),
+                                ).with_position(line, col)),
+                            };
+                            if sr.is_empty() || !matches!(&sr[0].kind, AstKind::Symbol(s) if s == "syntax-rules") {
+                                return Err(EvalError::TypeError(
+                                    "define-syntax: expected syntax-rules".into(),
+                                ).with_position(line, col));
+                            }
+                            if sr.len() < 2 {
+                                return Err(EvalError::Arity.with_position(line, col));
+                            }
+                            let macro_literals = match &sr[1].kind {
+                                AstKind::List(lits) => {
+                                    lits.iter().map(|l| match &l.kind {
+                                        AstKind::Symbol(s) => Ok(s.clone()),
+                                        _ => Err(EvalError::TypeError(
+                                            "define-syntax: literal must be symbol".into(),
+                                        ).with_position(l.line, l.col)),
+                                    }).collect::<Result<Vec<_>, _>>()?
+                                }
+                                _ => return Err(EvalError::TypeError(
+                                    "define-syntax: expected literal list".into(),
+                                ).with_position(sr[1].line, sr[1].col)),
+                            };
+                            let mut macro_rules = Vec::new();
+                            for clause in &sr[2..] {
+                                match &clause.kind {
+                                    AstKind::List(pair) if pair.len() == 2 => {
+                                        macro_rules.push((pair[0].clone(), pair[1].clone()));
+                                    }
+                                    _ => return Err(EvalError::TypeError(
+                                        "define-syntax: bad rule".into(),
+                                    ).with_position(clause.line, clause.col)),
+                                }
+                            }
+                            let macro_val = Value::Macro {
+                                literals: macro_literals,
+                                rules: macro_rules,
+                                def_env: e.clone(),
+                            };
+                            env_set(e, name, macro_val);
+                            return Ok(Value::Symbol("ok".into()));
+                        }
                         _ => {}
+                    }
+                }
+                // Check for macro application
+                if let AstKind::Symbol(ref s) = items[0].kind {
+                    if let Some(Value::Macro { literals, rules, def_env }) = env_get(e, s) {
+                        let macro_name = s.clone();
+                        for (pattern, template) in &rules {
+                            let mut bindings = HashMap::new();
+                            let pat_elts = match &pattern.kind {
+                                AstKind::List(p) => &p[1..],
+                                _ => continue,
+                            };
+                            if match_syntax_elements(pat_elts, &items[1..], &literals, &mut bindings) {
+                                let all_pattern_vars: Vec<String> = pat_elts.iter()
+                                    .flat_map(|p| collect_pattern_vars(p, &literals))
+                                    .collect();
+                                let free_vars = collect_free_template_vars(&template, &all_pattern_vars);
+                                let mut hygiene_map = HashMap::new();
+                                for fv in &free_vars {
+                                    if def_env.contains_key(fv) {
+                                        let gs = gensym(fv);
+                                        hygiene_map.insert(fv.clone(), gs.clone());
+                                        let val = def_env.get(fv).unwrap().borrow().clone();
+                                        env_set(e, gs, val);
+                                    }
+                                }
+                                let expanded = instantiate_template(&template, &bindings, &hygiene_map);
+                                cur_ast = expanded;
+                                continue 'tco;
+                            }
+                        }
+                        return Err(EvalError::TypeError(
+                            format!("no matching pattern for macro {}", macro_name),
+                        ).with_position(line, col));
                     }
                 }
                 // General application: evaluate operator and arguments
@@ -1103,6 +1397,7 @@ pub fn eval_str(input: &str) -> Result<String, EvalError> {
     NEXT_CONT_ID.with(|c| c.set(1));
     CONT_RESUME.with(|r| *r.borrow_mut() = None);
     CONT_JUMP.with(|c| *c.borrow_mut() = None);
+    GENSYM_COUNTER.with(|c| c.set(0));
     let mut env = Env::new();
     let mut out = String::new();
     let mut last_result = None;
@@ -1149,6 +1444,7 @@ pub fn eval_str_with_output(input: &str) -> Result<(String, String), EvalError> 
     NEXT_CONT_ID.with(|c| c.set(1));
     CONT_RESUME.with(|r| *r.borrow_mut() = None);
     CONT_JUMP.with(|c| *c.borrow_mut() = None);
+    GENSYM_COUNTER.with(|c| c.set(0));
     let mut env = Env::new();
     let mut out = String::new();
     let mut last_result = None;
