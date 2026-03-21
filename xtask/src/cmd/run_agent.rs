@@ -38,7 +38,6 @@ pub fn run(args: RunAgentArgs) -> Result<()> {
     let proj = project_dir();
     let session_uuid = uuid_v4();
     let timestamp = compact_timestamp();
-    let start_time = iso_now();
     let prompt = args.prompt.as_deref().unwrap_or(DEFAULT_PROMPT);
     let mode = args.mode.clone();
 
@@ -57,6 +56,19 @@ pub fn run(args: RunAgentArgs) -> Result<()> {
         find_resume_dir(&proj, &args.strategy, &args.name)?
     } else {
         setup_fresh_run(&proj, &args, &worktree_dir)?
+    };
+
+    // On resume, preserve the original start_time from meta.json so that
+    // elapsed time reflects the full run, not just the resumed portion.
+    let start_time = if args.resume {
+        let meta_path = results_dir.join("meta.json");
+        fs::read_to_string(&meta_path)
+            .ok()
+            .and_then(|c| serde_json::from_str::<serde_json::Value>(&c).ok())
+            .and_then(|v| v["start_time"].as_str().map(String::from))
+            .unwrap_or_else(iso_now)
+    } else {
+        iso_now()
     };
 
     if !args.resume {
@@ -339,6 +351,16 @@ fn should_skip_level(resume: bool, level_dir: &Path, level: &str) -> bool {
     false
 }
 
+/// Parse duration in seconds from status text like "Level NN PASSED (123s)".
+fn parse_status_duration(status_text: &str) -> i64 {
+    status_text
+        .split('(')
+        .nth(1)
+        .and_then(|s| s.split('s').next())
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(0)
+}
+
 /// Maximum number of automatic retries when the agent fails for infrastructure
 /// reasons (API timeout, 529, crash) rather than exhausting its turn budget.
 const MAX_INFRA_RETRIES: u32 = 2;
@@ -421,7 +443,35 @@ fn run_single_level(
 
 fn run_level_tests(worktree_dir: &Path, level: &str, lang: &str) -> i32 {
     // Tests only — no quality gate. Gate is enforced in the cleanup pass.
-    run_cmd("cargo", &["xtask", "test", level, "--lang", lang], worktree_dir).unwrap_or(1)
+    // Use the host's xtask binary to avoid worktree xtask version mismatch.
+    run_host_xtask(&["test", level, "--lang", lang], worktree_dir).unwrap_or(1)
+}
+
+/// Run the host's pre-built xtask binary with PROJECT_DIR pointing to the worktree.
+///
+/// Worktrees contain old source code, so `cargo xtask` inside a worktree would build
+/// an outdated xtask that may lack new flags (e.g. --lang, --gate). Instead we run the
+/// host's binary directly and set PROJECT_DIR so `project_dir()` resolves to the worktree.
+fn run_host_xtask(args: &[&str], worktree_dir: &Path) -> Result<i32> {
+    let host_bin = project_dir()
+        .join("target")
+        .join("debug")
+        .join("xtask");
+    if !host_bin.is_file() {
+        return Err(Error::BinaryNotFound {
+            name: format!("host xtask at {}", host_bin.display()),
+        });
+    }
+    let status = Command::new(&host_bin)
+        .args(args)
+        .current_dir(worktree_dir)
+        .env("PROJECT_DIR", worktree_dir)
+        .status()
+        .map_err(|e| Error::Io {
+            path: host_bin,
+            source: e,
+        })?;
+    Ok(status.code().unwrap_or(1))
 }
 
 fn run_quality_gate_cleanup(
@@ -441,7 +491,7 @@ fn run_quality_gate_cleanup(
     );
     capture_session_as(&args.agent, &cleanup_uuid, level_dir, "session-cleanup.jsonl");
 
-    run_cmd("cargo", &["xtask", "test", level, "--lang", &args.lang, "--gate"], worktree_dir).unwrap_or(1)
+    run_host_xtask(&["test", level, "--lang", &args.lang, "--gate"], worktree_dir).unwrap_or(1)
 }
 
 fn commit_checkpoint(level: &str, status: &str, duration: i64, worktree_dir: &Path) {
@@ -486,7 +536,28 @@ fn finalize_run(
     agent_exit: i32, score: &str, level_times: &[(String, i64, String)],
 ) -> Result<()> {
     let end_time = iso_now();
+
+    // Build level_times from disk first (covers original run + previous resumes),
+    // then overlay the current session's in-memory data (more accurate for just-run levels).
     let mut level_times_json = serde_json::Map::new();
+    if let Ok(entries) = fs::read_dir(results_dir) {
+        for entry in entries.flatten() {
+            let name = entry.file_name().to_string_lossy().into_owned();
+            if !name.starts_with('L') || !entry.path().is_dir() {
+                continue;
+            }
+            let status_file = entry.path().join("status.txt");
+            if let Ok(content) = fs::read_to_string(&status_file) {
+                let duration = parse_status_duration(&content);
+                let status = if content.contains("PASSED") { "PASSED" } else { "FAILED" };
+                level_times_json.insert(
+                    name,
+                    serde_json::json!({"duration_s": duration, "status": status}),
+                );
+            }
+        }
+    }
+    // Overlay current session's level_times (more accurate timing for just-run levels)
     for (level, duration, status) in level_times {
         level_times_json.insert(
             level.clone(),
@@ -660,6 +731,10 @@ fn launch_claude(
     max_turns: Option<u32>,
     model: Option<&str>,
 ) -> Result<i32> {
+    // Resolve claude to absolute path so it works under nohup / cron where
+    // ~/.local/bin and ~/.cargo/bin may not be in PATH.
+    let claude_bin = resolve_agent_binary("claude")?;
+
     let mut cmd_args: Vec<String> = vec![
         "-p".to_string(),
         "--session-id".to_string(),
@@ -677,7 +752,32 @@ fn launch_claude(
     cmd_args.push(prompt.to_string());
 
     let args_ref: Vec<&str> = cmd_args.iter().map(|s| s.as_str()).collect();
-    run_agent_with_tee("claude", &args_ref, workdir, output_file)
+    run_agent_with_tee(&claude_bin, &args_ref, workdir, output_file)
+}
+
+/// Resolve an agent binary name to an absolute path.
+/// Checks PATH first, then common locations (~/.local/bin, ~/.cargo/bin).
+fn resolve_agent_binary(name: &str) -> Result<String> {
+    // Try PATH first (works in interactive terminals)
+    if let Ok(output) = Command::new("which").arg(name).output() {
+        if output.status.success() {
+            let path = String::from_utf8_lossy(&output.stdout).trim().to_string();
+            if !path.is_empty() {
+                return Ok(path);
+            }
+        }
+    }
+    // Fallback: check common locations
+    let home = std::env::var("HOME").unwrap_or_default();
+    for dir in &[".local/bin", ".cargo/bin"] {
+        let candidate = PathBuf::from(&home).join(dir).join(name);
+        if candidate.is_file() {
+            return Ok(candidate.to_string_lossy().into_owned());
+        }
+    }
+    Err(Error::BinaryNotFound {
+        name: format!("{name} not found in PATH — ensure ~/.local/bin and ~/.cargo/bin are in PATH"),
+    })
 }
 
 fn launch_codex(workdir: &Path, prompt: &str, output_file: &Path) -> Result<i32> {

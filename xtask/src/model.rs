@@ -113,13 +113,6 @@ impl Lang {
         }
     }
 
-    pub fn image_name(&self) -> &str {
-        match self {
-            Self::Rust | Self::Go => "ming",
-            Self::Java | Self::Scala => "ming-jvm",
-            Self::TypeScript => "ming-node",
-        }
-    }
 
     pub fn bench_dir(&self, proj: &std::path::Path) -> PathBuf {
         proj.join("bench").join(self.dir_name())
