@@ -1,13 +1,14 @@
 use std::collections::HashSet;
 
 use crate::scheme::ast::SourceLocation;
+use crate::scheme::datum::{datum_to_expr, expr_to_datum};
 use crate::scheme::environment::Environment;
 use crate::scheme::equality::{is_eq, is_equal, is_eqv};
 use crate::scheme::error::{ArgCount, EvalError};
 use crate::scheme::evaluator::apply_callable;
 use crate::scheme::number::Number;
 use crate::scheme::string_value::StringMutationError;
-use crate::scheme::value::{list_from_values, Value};
+use crate::scheme::value::{list_from_values, SyntaxValue, Value};
 use crate::scheme::vector_value::VectorMutationError;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -71,6 +72,8 @@ pub enum BuiltinProcedure {
     Denominator,
     SymbolToString,
     StringToSymbol,
+    SyntaxToDatum,
+    DatumToSyntax,
     StringRef,
     StringCopy,
     StringSet,
@@ -167,6 +170,8 @@ impl BuiltinProcedure {
             Self::Denominator => "denominator",
             Self::SymbolToString => "symbol->string",
             Self::StringToSymbol => "string->symbol",
+            Self::SyntaxToDatum => "syntax->datum",
+            Self::DatumToSyntax => "datum->syntax",
             Self::StringRef => "string-ref",
             Self::StringCopy => "string-copy",
             Self::StringSet => "string-set!",
@@ -264,6 +269,8 @@ pub fn install_builtins(environment: &Environment) {
         BuiltinProcedure::Denominator,
         BuiltinProcedure::SymbolToString,
         BuiltinProcedure::StringToSymbol,
+        BuiltinProcedure::SyntaxToDatum,
+        BuiltinProcedure::DatumToSyntax,
         BuiltinProcedure::StringRef,
         BuiltinProcedure::StringCopy,
         BuiltinProcedure::StringSet,
@@ -475,6 +482,8 @@ fn apply_string_builtin(
         BuiltinProcedure::Denominator => Some(eval_denominator(arguments, location)),
         BuiltinProcedure::SymbolToString => Some(eval_symbol_to_string(arguments, location)),
         BuiltinProcedure::StringToSymbol => Some(eval_string_to_symbol(arguments, location)),
+        BuiltinProcedure::SyntaxToDatum => Some(eval_syntax_to_datum(arguments, location)),
+        BuiltinProcedure::DatumToSyntax => Some(eval_datum_to_syntax(arguments, location)),
         BuiltinProcedure::StringRef => Some(eval_string_ref(arguments, location)),
         BuiltinProcedure::StringCopy => Some(eval_string_copy(arguments, location)),
         BuiltinProcedure::StringSet => Some(eval_string_set(arguments, location)),
@@ -1104,6 +1113,34 @@ fn eval_string_to_symbol(
 ) -> Result<Value, EvalError> {
     let string = unary_argument("string->symbol", arguments, location)?.expect_string(location)?;
     Ok(Value::Symbol(string.as_string()))
+}
+
+fn eval_syntax_to_datum(arguments: &[Value], location: SourceLocation) -> Result<Value, EvalError> {
+    let syntax = unary_argument("syntax->datum", arguments, location)?.expect_syntax(location)?;
+    match syntax {
+        SyntaxValue::Single(expression) => Ok(expr_to_datum(expression)),
+        SyntaxValue::Repeated(expressions) => Ok(list_from_values(
+            &expressions.iter().map(expr_to_datum).collect::<Vec<_>>(),
+        )),
+    }
+}
+
+fn eval_datum_to_syntax(arguments: &[Value], location: SourceLocation) -> Result<Value, EvalError> {
+    let [context, datum] = arguments else {
+        return Err(EvalError::WrongArgumentCount {
+            location,
+            procedure: "datum->syntax",
+            expected: ArgCount::Exactly(2),
+            got: arguments.len(),
+        });
+    };
+
+    let context = context.expect_single_syntax(location)?;
+    let expression = match datum {
+        Value::Syntax(SyntaxValue::Single(expression)) => expression.clone(),
+        value => datum_to_expr(value, context.location())?,
+    };
+    Ok(Value::syntax(expression))
 }
 
 fn eval_string_ref(arguments: &[Value], location: SourceLocation) -> Result<Value, EvalError> {

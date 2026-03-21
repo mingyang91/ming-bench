@@ -5,16 +5,33 @@ use std::rc::Rc;
 use crate::scheme::ast::{Expr, SourceLocation};
 use crate::scheme::environment::Environment;
 use crate::scheme::error::EvalError;
+use crate::scheme::evaluator::expand_transformer_procedure;
+use crate::scheme::value::{SyntaxValue, Value};
 
 type Scope = HashMap<String, String>;
+
+pub(crate) const SYNTAX_DEFINITION_ENVIRONMENT: &str =
+    "__ming_internal_syntax_definition_environment__";
 
 #[derive(Clone, Default)]
 pub struct MacroEnvironment(Rc<RefCell<MacroState>>);
 
 #[derive(Default)]
 struct MacroState {
-    transformers: HashMap<String, SyntaxRulesTransformer>,
+    transformers: HashMap<String, MacroTransformer>,
     next_identifier: usize,
+}
+
+#[derive(Clone)]
+enum MacroTransformer {
+    SyntaxRules(SyntaxRulesTransformer),
+    Procedure(ProcedureTransformer),
+}
+
+#[derive(Clone)]
+struct ProcedureTransformer {
+    callable: Value,
+    definition_environment: Environment,
 }
 
 #[derive(Clone)]
@@ -95,8 +112,27 @@ impl MacroEnvironment {
         self.0
             .borrow_mut()
             .transformers
-            .insert(name.clone(), transformer);
+            .insert(name.clone(), MacroTransformer::SyntaxRules(transformer));
         Ok(())
+    }
+
+    pub fn define_transformer(
+        &self,
+        name: impl Into<String>,
+        callable: Value,
+        fallback_definition_environment: Environment,
+    ) {
+        let definition_environment = match &callable {
+            Value::Closure(closure) => closure.environment.clone(),
+            _ => fallback_definition_environment,
+        };
+        self.0.borrow_mut().transformers.insert(
+            name.into(),
+            MacroTransformer::Procedure(ProcedureTransformer {
+                callable,
+                definition_environment,
+            }),
+        );
     }
 
     pub fn expand_expression(&self, expression: &Expr) -> Result<Expr, EvalError> {
@@ -121,7 +157,10 @@ impl MacroEnvironment {
                 location: *location,
                 name: name.clone(),
             })?;
-        transformer.expand(expression, self)
+        match transformer {
+            MacroTransformer::SyntaxRules(transformer) => transformer.expand(expression, self),
+            MacroTransformer::Procedure(transformer) => transformer.expand(expression, self),
+        }
     }
 
     fn fresh_identifier(&self, source_name: &str) -> String {
@@ -129,6 +168,17 @@ impl MacroEnvironment {
         let index = state.next_identifier;
         state.next_identifier += 1;
         format!("__macro_{index}_{source_name}")
+    }
+}
+
+impl ProcedureTransformer {
+    fn expand(&self, expression: &Expr, macros: &MacroEnvironment) -> Result<Expr, EvalError> {
+        expand_transformer_procedure(
+            self.callable.clone(),
+            self.definition_environment.clone(),
+            expression.clone(),
+            macros,
+        )
     }
 }
 
@@ -298,7 +348,10 @@ fn expand_list_expression_recursive(
         return expand_application_items(items, location, macros);
     };
 
-    if name == "quote" || name == "define-syntax" || name == "define-record-type" {
+    if matches!(
+        name,
+        "quote" | "define-syntax" | "define-record-type" | "syntax" | "syntax-case" | "with-syntax"
+    ) {
         return Ok(Expr::list(items.to_vec(), location));
     }
     if is_core_special_form(name) {
@@ -689,6 +742,24 @@ fn capture_definition_site_identifiers(
         collect_free_identifiers(&rule.template, &HashSet::new(), &mut free_identifiers);
     });
 
+    alias_definition_site_identifiers(free_identifiers, environment, macros)
+}
+
+fn capture_template_definition_site_identifiers(
+    template: &Template,
+    environment: &Environment,
+    macros: &MacroEnvironment,
+) -> HashMap<String, String> {
+    let mut free_identifiers = HashSet::new();
+    collect_free_identifiers(template, &HashSet::new(), &mut free_identifiers);
+    alias_definition_site_identifiers(free_identifiers, environment, macros)
+}
+
+fn alias_definition_site_identifiers(
+    free_identifiers: HashSet<String>,
+    environment: &Environment,
+    macros: &MacroEnvironment,
+) -> HashMap<String, String> {
     free_identifiers
         .into_iter()
         .filter(|name| !is_core_special_form(name))
@@ -928,7 +999,7 @@ fn collect_binder_names(template: &Template, bound_identifiers: &mut HashSet<Str
     }
 }
 
-fn parse_literal_identifiers(expression: &Expr) -> Result<HashSet<String>, EvalError> {
+pub(crate) fn parse_literal_identifiers(expression: &Expr) -> Result<HashSet<String>, EvalError> {
     let Expr::List { items, .. } = expression else {
         return Err(invalid_syntax_rules(
             expression.location(),
@@ -946,6 +1017,176 @@ fn parse_literal_identifiers(expression: &Expr) -> Result<HashSet<String>, EvalE
             )),
         })
         .collect()
+}
+
+pub(crate) fn bind_syntax_match(
+    pattern_expression: &Expr,
+    literal_identifiers: &HashSet<String>,
+    input: &Expr,
+    environment: &Environment,
+) -> Result<bool, EvalError> {
+    let mut pattern_variables = HashSet::new();
+    let pattern = compile_pattern(
+        pattern_expression,
+        literal_identifiers,
+        &mut pattern_variables,
+    )?;
+    let Some(bindings) = match_pattern(&pattern, input) else {
+        return Ok(false);
+    };
+
+    bindings.singles.into_iter().for_each(|(name, expression)| {
+        environment.define(name, Value::syntax(expression));
+    });
+    bindings
+        .repeated
+        .into_iter()
+        .for_each(|(name, expressions)| {
+            environment.define(name, Value::repeated_syntax(expressions));
+        });
+    Ok(true)
+}
+
+pub(crate) fn expand_runtime_syntax_template(
+    expression: &Expr,
+    environment: &Environment,
+    definition_environment: &Environment,
+    macros: &MacroEnvironment,
+) -> Result<Expr, EvalError> {
+    let template = compile_runtime_template(expression, environment)?;
+    let bindings = runtime_bindings_from_template(&template, environment)?;
+    let captured_aliases =
+        capture_template_definition_site_identifiers(&template, definition_environment, macros);
+
+    expand_template(
+        &template,
+        &bindings,
+        &captured_aliases,
+        &HashMap::new(),
+        macros,
+        None,
+    )
+}
+
+fn compile_runtime_template(
+    expression: &Expr,
+    environment: &Environment,
+) -> Result<Template, EvalError> {
+    if is_quote_form(expression) {
+        return Ok(Template::Datum(expression.clone()));
+    }
+
+    match expression {
+        Expr::Number { .. }
+        | Expr::Boolean { .. }
+        | Expr::String { .. }
+        | Expr::Character { .. } => Ok(Template::Datum(expression.clone())),
+        Expr::Symbol { name, .. } if name == "..." => Err(invalid_syntax_case(
+            expression.location(),
+            "ellipsis must follow a template",
+        )),
+        Expr::Symbol { name, .. } if is_runtime_syntax_binding(name, environment) => {
+            Ok(Template::PatternVariable(name.clone()))
+        }
+        Expr::Symbol { name, location } => Ok(Template::Identifier {
+            name: name.clone(),
+            location: *location,
+        }),
+        Expr::List { items, location } => {
+            compile_runtime_template_items(items, *location, environment)
+        }
+    }
+}
+
+fn compile_runtime_template_items(
+    items: &[Expr],
+    location: SourceLocation,
+    environment: &Environment,
+) -> Result<Template, EvalError> {
+    compile_runtime_repeated_items(items, location, |expression| {
+        compile_runtime_template(expression, environment)
+    })
+    .map(|items| Template::List {
+        items: items.into_iter().map(Into::into).collect(),
+        location,
+    })
+}
+
+fn compile_runtime_repeated_items<CompiledItem>(
+    items: &[Expr],
+    location: SourceLocation,
+    mut compile: impl FnMut(&Expr) -> Result<CompiledItem, EvalError>,
+) -> Result<Vec<CompiledItemWithRepeat<CompiledItem>>, EvalError> {
+    let mut index = 0usize;
+    let mut compiled_items = Vec::new();
+
+    while let Some(item) = items.get(index) {
+        if is_ellipsis(item) {
+            return Err(invalid_syntax_case(
+                item.location(),
+                "ellipsis must follow another form",
+            ));
+        }
+
+        let repeated = items.get(index + 1).is_some_and(is_ellipsis);
+        compiled_items.push(CompiledItemWithRepeat {
+            item: compile(item)?,
+            repeated,
+        });
+        index += if repeated { 2 } else { 1 };
+    }
+
+    if compiled_items.is_empty() && !items.is_empty() {
+        return Err(invalid_syntax_case(
+            location,
+            "invalid repeated form structure",
+        ));
+    }
+
+    Ok(compiled_items)
+}
+
+fn is_runtime_syntax_binding(name: &str, environment: &Environment) -> bool {
+    environment
+        .lookup(name)
+        .is_some_and(|value| matches!(value, Value::Syntax(_)))
+}
+
+fn runtime_bindings_from_template(
+    template: &Template,
+    environment: &Environment,
+) -> Result<MatchBindings, EvalError> {
+    let mut names = HashSet::new();
+    collect_template_pattern_variables(template, &mut names);
+
+    names
+        .into_iter()
+        .try_fold(MatchBindings::default(), |mut bindings, name| {
+            let value = environment
+                .lookup(&name)
+                .expect("runtime syntax binding should exist in the environment");
+            match value.expect_syntax(template.location())? {
+                SyntaxValue::Single(expression) => {
+                    bindings.singles.insert(name, expression.clone());
+                }
+                SyntaxValue::Repeated(expressions) => {
+                    bindings.repeated.insert(name, expressions.clone());
+                }
+            }
+            Ok(bindings)
+        })
+}
+
+fn collect_template_pattern_variables(template: &Template, names: &mut HashSet<String>) {
+    match template {
+        Template::PatternVariable(name) => {
+            names.insert(name.clone());
+        }
+        Template::List { items, .. } => items.iter().for_each(|item| {
+            collect_template_pattern_variables(&item.template, names);
+        }),
+        Template::Datum(_) | Template::Identifier { .. } => {}
+    }
 }
 
 fn match_pattern(pattern: &Pattern, expression: &Expr) -> Option<MatchBindings> {
@@ -1888,6 +2129,10 @@ fn invalid_syntax_rules(location: SourceLocation, detail: &'static str) -> EvalE
     EvalError::InvalidSyntaxRules { location, detail }
 }
 
+fn invalid_syntax_case(location: SourceLocation, detail: &'static str) -> EvalError {
+    EvalError::InvalidSyntaxCase { location, detail }
+}
+
 fn is_ellipsis(expression: &Expr) -> bool {
     matches!(expression, Expr::Symbol { name, .. } if name == "...")
 }
@@ -1927,6 +2172,9 @@ fn is_core_special_form(name: &str) -> bool {
             | "let"
             | "begin"
             | "cond"
+            | "syntax"
+            | "syntax-case"
+            | "with-syntax"
             | "define-syntax"
             | "define-record-type"
     )

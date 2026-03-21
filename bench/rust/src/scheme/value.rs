@@ -26,6 +26,12 @@ pub(crate) struct MultipleValues {
     location: SourceLocation,
 }
 
+#[derive(Clone)]
+pub(crate) enum SyntaxValue {
+    Single(Expr),
+    Repeated(Vec<Expr>),
+}
+
 impl MultipleValues {
     fn new(values: Vec<Value>, location: SourceLocation) -> Self {
         Self { values, location }
@@ -55,6 +61,7 @@ pub enum Value {
     String(SchemeString),
     Character(char),
     Symbol(String),
+    Syntax(SyntaxValue),
     EmptyList,
     Pair(SchemePair),
     Vector(SchemeVector),
@@ -70,6 +77,7 @@ pub enum Value {
     MultipleValues(MultipleValues),
     Continuation(Rc<CapturedContinuation>),
     Closure(Closure),
+    DefinitionEnvironment(Environment),
     Void,
     Uninitialized,
 }
@@ -123,6 +131,14 @@ impl Value {
 
     pub fn pair(car: Value, cdr: Value) -> Self {
         Self::Pair(SchemePair::new(car, cdr))
+    }
+
+    pub(crate) fn syntax(expression: Expr) -> Self {
+        Self::Syntax(SyntaxValue::Single(expression))
+    }
+
+    pub(crate) fn repeated_syntax(expressions: Vec<Expr>) -> Self {
+        Self::Syntax(SyntaxValue::Repeated(expressions))
     }
 
     pub fn into_values(self) -> Vec<Value> {
@@ -208,6 +224,29 @@ impl Value {
         }
     }
 
+    pub(crate) fn expect_syntax(
+        &self,
+        location: SourceLocation,
+    ) -> Result<&SyntaxValue, EvalError> {
+        match self {
+            Self::Syntax(value) => Ok(value),
+            _ => Err(EvalError::ExpectedSyntaxObject {
+                location,
+                found: self.type_name(),
+            }),
+        }
+    }
+
+    pub(crate) fn expect_single_syntax(&self, location: SourceLocation) -> Result<Expr, EvalError> {
+        match self.expect_syntax(location)? {
+            SyntaxValue::Single(expression) => Ok(expression.clone()),
+            SyntaxValue::Repeated(_) => Err(EvalError::ExpectedSyntaxObject {
+                location,
+                found: "syntax sequence",
+            }),
+        }
+    }
+
     pub fn expect_pair(&self, location: SourceLocation) -> Result<SchemePair, EvalError> {
         match self {
             Self::Pair(value) => Ok(value.clone()),
@@ -241,6 +280,7 @@ impl Value {
             Self::String(_) => "string",
             Self::Character(_) => "char",
             Self::Symbol(_) => "symbol",
+            Self::Syntax(_) => "syntax",
             Self::EmptyList => "null",
             Self::Pair(_) => "pair",
             Self::Vector(_) => "vector",
@@ -256,6 +296,7 @@ impl Value {
             | Self::Continuation(_)
             | Self::Closure(_) => "procedure",
             Self::MultipleValues(_) => "values",
+            Self::DefinitionEnvironment(_) => "internal",
             Self::Void => "void",
             Self::Uninitialized => "uninitialized",
         }
@@ -330,6 +371,7 @@ fn render_value(value: &Value, mode: RenderMode, seen_pairs: &mut HashSet<usize>
         Value::String(value) => render_string(value, mode),
         Value::Character(value) => render_character(*value, mode),
         Value::Symbol(value) => value.clone(),
+        Value::Syntax(_) => "#<syntax>".into(),
         Value::EmptyList => "()".into(),
         Value::Pair(pair) => render_pair(pair, mode, seen_pairs),
         Value::Vector(vector) => render_vector(vector, mode, seen_pairs),
@@ -345,6 +387,7 @@ fn render_value(value: &Value, mode: RenderMode, seen_pairs: &mut HashSet<usize>
         Value::MultipleValues(values) => render_multiple_values(values),
         Value::Continuation(_) => "#<continuation>".into(),
         Value::Closure(closure) => render_closure(closure),
+        Value::DefinitionEnvironment(_) => "#<syntax-context>".into(),
         Value::Void => "#<void>".into(),
         Value::Uninitialized => "#<uninitialized>".into(),
     }

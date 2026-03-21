@@ -40,6 +40,7 @@ impl<'src> Parser<'src> {
             '(' => self.parse_list(location),
             ')' => Err(ParseError::UnexpectedClosingParenthesis { location }),
             '\'' => self.parse_quote(location),
+            '#' if self.starts_with("#'") => self.parse_syntax_quote(location),
             '"' => self.parse_string(location),
             _ => self.parse_atom(location),
         }
@@ -74,6 +75,16 @@ impl<'src> Parser<'src> {
 
         Ok(Expr::list(
             vec![Expr::symbol("quote".into(), location), self.parse_expr()?],
+            location,
+        ))
+    }
+
+    fn parse_syntax_quote(&mut self, location: SourceLocation) -> Result<Expr, ParseError> {
+        self.consume_char();
+        self.consume_char();
+
+        Ok(Expr::list(
+            vec![Expr::symbol("syntax".into(), location), self.parse_expr()?],
             location,
         ))
     }
@@ -145,6 +156,10 @@ impl<'src> Parser<'src> {
 
     fn peek_char(&self) -> Option<char> {
         self.input[self.index..].chars().next()
+    }
+
+    fn starts_with(&self, prefix: &str) -> bool {
+        self.input[self.index..].starts_with(prefix)
     }
 
     fn consume_char(&mut self) -> Option<char> {

@@ -1,6 +1,7 @@
 mod ast;
 mod builtins;
 mod continuation;
+mod datum;
 mod environment;
 mod equality;
 pub mod error;

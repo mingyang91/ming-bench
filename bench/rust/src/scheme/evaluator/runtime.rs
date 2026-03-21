@@ -6,11 +6,15 @@ use crate::scheme::builtins::{apply_builtin, install_builtins};
 use crate::scheme::continuation::{
     CapturedContinuation, DynamicWind, ExceptionHandler, Frame, RaisedException,
 };
+use crate::scheme::datum::expr_to_datum;
 use crate::scheme::environment::Environment;
 use crate::scheme::equality::is_eqv;
 use crate::scheme::error::{ArgCount, EvalError};
 use crate::scheme::record::define_record_type;
-use crate::scheme::syntax::MacroEnvironment;
+use crate::scheme::syntax::{
+    bind_syntax_match, expand_runtime_syntax_template, parse_literal_identifiers, MacroEnvironment,
+    SYNTAX_DEFINITION_ENVIRONMENT,
+};
 use crate::scheme::value::{list_from_values, Closure, Value};
 
 type ContinuationFrames = Vec<Frame>;
@@ -109,6 +113,93 @@ pub(crate) fn apply_callable(
         },
         output,
         &MacroEnvironment::new(),
+    )
+}
+
+pub(crate) fn expand_transformer_procedure(
+    callable: Value,
+    definition_environment: Environment,
+    expression: Expr,
+    macro_environment: &MacroEnvironment,
+) -> Result<Expr, EvalError> {
+    let mut output = String::new();
+    let value = invoke_transformer_callable(
+        callable,
+        vec![Value::syntax(expression.clone())],
+        expression.location(),
+        definition_environment,
+        &mut output,
+        macro_environment,
+    )?
+    .expect_single()?;
+
+    value.expect_single_syntax(expression.location())
+}
+
+fn invoke_transformer_callable(
+    callable: Value,
+    arguments: Vec<Value>,
+    location: SourceLocation,
+    definition_environment: Environment,
+    output: &mut String,
+    macro_environment: &MacroEnvironment,
+) -> Result<Value, EvalError> {
+    match callable {
+        Value::Closure(closure) => run_transformer_closure(
+            closure,
+            arguments,
+            location,
+            definition_environment,
+            output,
+            macro_environment,
+        ),
+        callable => run(
+            State::Apply {
+                callable,
+                arguments,
+                location,
+                continuation: Vec::new(),
+            },
+            output,
+            macro_environment,
+        ),
+    }
+}
+
+fn run_transformer_closure(
+    closure: Closure,
+    arguments: Vec<Value>,
+    location: SourceLocation,
+    definition_environment: Environment,
+    output: &mut String,
+    macro_environment: &MacroEnvironment,
+) -> Result<Value, EvalError> {
+    if !closure_accepts_argument_count(&closure, arguments.len()) {
+        return Err(EvalError::WrongArgumentCount {
+            location,
+            procedure: "lambda",
+            expected: closure_expected_arg_count(&closure),
+            got: arguments.len(),
+        });
+    }
+
+    let call_environment = closure.environment.child();
+    call_environment.define(
+        SYNTAX_DEFINITION_ENVIRONMENT,
+        Value::DefinitionEnvironment(definition_environment),
+    );
+    bind_closure_arguments(&closure, arguments, &call_environment);
+
+    run(
+        eval_required_sequence(
+            closure.body,
+            call_environment,
+            "lambda",
+            location,
+            Vec::new(),
+        )?,
+        output,
+        macro_environment,
     )
 }
 
@@ -316,6 +407,30 @@ fn eval_special_form(
         }
         "set!" => eval_set(arguments, location, environment, continuation).map(Some),
         "quote" => eval_quote(arguments, location, continuation).map(Some),
+        "syntax" => eval_syntax(
+            arguments,
+            location,
+            environment,
+            continuation,
+            macro_environment,
+        )
+        .map(Some),
+        "syntax-case" => eval_syntax_case(
+            arguments,
+            location,
+            environment,
+            continuation,
+            macro_environment,
+        )
+        .map(Some),
+        "with-syntax" => eval_with_syntax(
+            arguments,
+            location,
+            environment,
+            continuation,
+            macro_environment,
+        )
+        .map(Some),
         "lambda" => eval_lambda(
             arguments,
             location,
@@ -567,7 +682,24 @@ fn eval_define_syntax(
     continuation: ContinuationFrames,
     macro_environment: &MacroEnvironment,
 ) -> Result<State, EvalError> {
-    macro_environment.define_syntax(arguments, location, &environment)?;
+    let [Expr::Symbol { name, .. }, transformer_expression] = arguments else {
+        return Err(EvalError::MalformedSpecialForm {
+            location,
+            form: "define-syntax",
+        });
+    };
+
+    if is_syntax_rules_expression(transformer_expression) {
+        macro_environment.define_syntax(arguments, location, &environment)?;
+    } else {
+        let transformer = eval_inline(
+            transformer_expression.clone(),
+            environment.clone(),
+            macro_environment,
+        )?
+        .expect_single()?;
+        macro_environment.define_transformer(name.clone(), transformer, environment);
+    }
 
     Ok(State::Return {
         value: Value::Void,
@@ -635,9 +767,290 @@ fn eval_quote(
     };
 
     Ok(State::Return {
-        value: quote_expression(expression),
+        value: expr_to_datum(expression),
         continuation,
     })
+}
+
+fn eval_syntax(
+    arguments: &[Expr],
+    location: SourceLocation,
+    environment: Environment,
+    continuation: ContinuationFrames,
+    macro_environment: &MacroEnvironment,
+) -> Result<State, EvalError> {
+    let [template_expression] = arguments else {
+        return Err(EvalError::WrongArgumentCount {
+            location,
+            procedure: "syntax",
+            expected: ArgCount::Exactly(1),
+            got: arguments.len(),
+        });
+    };
+
+    let definition_environment = current_syntax_definition_environment(&environment);
+    let expanded = expand_runtime_syntax_template(
+        template_expression,
+        &environment,
+        &definition_environment,
+        macro_environment,
+    )?;
+
+    Ok(State::Return {
+        value: Value::syntax(expanded),
+        continuation,
+    })
+}
+
+fn eval_syntax_case(
+    arguments: &[Expr],
+    location: SourceLocation,
+    environment: Environment,
+    continuation: ContinuationFrames,
+    macro_environment: &MacroEnvironment,
+) -> Result<State, EvalError> {
+    let [input_expression, literal_expression, clauses @ ..] = arguments else {
+        return Err(EvalError::WrongArgumentCount {
+            location,
+            procedure: "syntax-case",
+            expected: ArgCount::AtLeast(3),
+            got: arguments.len(),
+        });
+    };
+
+    let input = eval_inline(
+        input_expression.clone(),
+        environment.clone(),
+        macro_environment,
+    )?
+    .expect_single()?
+    .expect_single_syntax(input_expression.location())?;
+    let literal_identifiers = parse_syntax_case_literals(literal_expression)?;
+
+    let value = clauses
+        .iter()
+        .find_map(|clause| {
+            eval_syntax_case_clause(
+                clause,
+                &literal_identifiers,
+                &input,
+                environment.clone(),
+                macro_environment,
+            )
+            .transpose()
+        })
+        .transpose()?;
+    let Some(value) = value else {
+        return Err(EvalError::InvalidSyntaxCase {
+            location,
+            detail: "no matching syntax-case clause",
+        });
+    };
+
+    Ok(State::Return {
+        value,
+        continuation,
+    })
+}
+
+fn eval_syntax_case_clause(
+    clause: &Expr,
+    literal_identifiers: &std::collections::HashSet<String>,
+    input: &Expr,
+    environment: Environment,
+    macro_environment: &MacroEnvironment,
+) -> Result<Option<Value>, EvalError> {
+    let (pattern, fender, result) = parse_syntax_case_clause(clause)?;
+    let clause_environment = environment.child();
+    if !bind_syntax_match(pattern, literal_identifiers, input, &clause_environment)? {
+        return Ok(None);
+    }
+
+    if let Some(fender) = fender {
+        let value = eval_inline(
+            fender.clone(),
+            clause_environment.clone(),
+            macro_environment,
+        )?
+        .expect_single()?;
+        if !value.is_truthy() {
+            return Ok(None);
+        }
+    }
+
+    eval_inline(result.clone(), clause_environment, macro_environment).map(Some)
+}
+
+fn parse_syntax_case_clause(clause: &Expr) -> Result<(&Expr, Option<&Expr>, &Expr), EvalError> {
+    let Expr::List { items, location } = clause else {
+        return Err(EvalError::InvalidSyntaxCase {
+            location: clause.location(),
+            detail: "syntax-case clause must be a list",
+        });
+    };
+
+    match items.as_slice() {
+        [pattern, result] => Ok((pattern, None, result)),
+        [pattern, fender, result] => Ok((pattern, Some(fender), result)),
+        _ => Err(EvalError::InvalidSyntaxCase {
+            location: *location,
+            detail: "syntax-case clause must contain a pattern and result, with an optional fender",
+        }),
+    }
+}
+
+fn parse_syntax_case_literals(
+    literal_expression: &Expr,
+) -> Result<std::collections::HashSet<String>, EvalError> {
+    parse_literal_identifiers(literal_expression).map_err(|error| match error {
+        EvalError::InvalidSyntaxRules { location, detail } => {
+            EvalError::InvalidSyntaxCase { location, detail }
+        }
+        other => other,
+    })
+}
+
+fn eval_with_syntax(
+    arguments: &[Expr],
+    location: SourceLocation,
+    environment: Environment,
+    continuation: ContinuationFrames,
+    macro_environment: &MacroEnvironment,
+) -> Result<State, EvalError> {
+    let [bindings_expression, body @ ..] = arguments else {
+        return Err(EvalError::WrongArgumentCount {
+            location,
+            procedure: "with-syntax",
+            expected: ArgCount::AtLeast(2),
+            got: arguments.len(),
+        });
+    };
+    if body.is_empty() {
+        return Err(EvalError::MissingBody {
+            location,
+            form: "with-syntax",
+        });
+    }
+
+    let bindings = parse_with_syntax_bindings(bindings_expression)?;
+    let evaluated_bindings = bindings
+        .into_iter()
+        .map(|(pattern, expression, binding_location)| {
+            eval_inline(expression.clone(), environment.clone(), macro_environment)
+                .and_then(Value::expect_single)
+                .and_then(|value| {
+                    value
+                        .expect_single_syntax(expression.location())
+                        .map(|syntax| (pattern, syntax, binding_location))
+                })
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+
+    let scope = environment.child();
+    let literals = std::collections::HashSet::new();
+    evaluated_bindings
+        .into_iter()
+        .try_for_each(|(pattern, syntax, binding_location)| {
+            bind_syntax_match(&pattern, &literals, &syntax, &scope)?
+                .then_some(())
+                .ok_or(EvalError::InvalidSyntaxCase {
+                    location: binding_location,
+                    detail: "with-syntax binding did not match its pattern",
+                })
+        })?;
+
+    let value =
+        eval_inline_required_sequence(body, scope, "with-syntax", location, macro_environment)?;
+    Ok(State::Return {
+        value,
+        continuation,
+    })
+}
+
+fn parse_with_syntax_bindings(
+    bindings_expression: &Expr,
+) -> Result<Vec<(Expr, Expr, SourceLocation)>, EvalError> {
+    let Expr::List { items, location } = bindings_expression else {
+        return Err(EvalError::InvalidSyntaxCase {
+            location: bindings_expression.location(),
+            detail: "with-syntax bindings must be a list",
+        });
+    };
+
+    if items.is_empty() {
+        return Err(EvalError::InvalidSyntaxCase {
+            location: *location,
+            detail: "with-syntax requires at least one binding",
+        });
+    }
+
+    items
+        .iter()
+        .map(|binding| {
+            let Expr::List {
+                items: binding_items,
+                location: binding_location,
+            } = binding
+            else {
+                return Err(EvalError::InvalidSyntaxCase {
+                    location: binding.location(),
+                    detail: "with-syntax binding must be a list",
+                });
+            };
+            let [pattern, expression] = binding_items.as_slice() else {
+                return Err(EvalError::InvalidSyntaxCase {
+                    location: *binding_location,
+                    detail: "with-syntax binding must contain a pattern and expression",
+                });
+            };
+            Ok((pattern.clone(), expression.clone(), *binding_location))
+        })
+        .collect()
+}
+
+fn current_syntax_definition_environment(environment: &Environment) -> Environment {
+    match environment.lookup(SYNTAX_DEFINITION_ENVIRONMENT) {
+        Some(Value::DefinitionEnvironment(environment)) => environment,
+        _ => environment.clone(),
+    }
+}
+
+fn eval_inline(
+    expression: Expr,
+    environment: Environment,
+    macro_environment: &MacroEnvironment,
+) -> Result<Value, EvalError> {
+    let mut output = String::new();
+    run(
+        State::Eval {
+            expression,
+            environment,
+            continuation: Vec::new(),
+        },
+        &mut output,
+        macro_environment,
+    )
+}
+
+fn eval_inline_required_sequence(
+    expressions: &[Expr],
+    environment: Environment,
+    form: &'static str,
+    location: SourceLocation,
+    macro_environment: &MacroEnvironment,
+) -> Result<Value, EvalError> {
+    let mut output = String::new();
+    run(
+        eval_required_sequence(
+            expressions.to_vec(),
+            environment,
+            form,
+            location,
+            Vec::new(),
+        )?,
+        &mut output,
+        macro_environment,
+    )
 }
 
 fn eval_lambda(
@@ -1925,17 +2338,7 @@ fn apply_closure(
     }
 
     let call_environment = closure.environment.child();
-    let (required_arguments, rest_arguments) = arguments.split_at(closure.parameters.len());
-
-    closure
-        .parameters
-        .iter()
-        .cloned()
-        .zip(required_arguments.iter().cloned())
-        .for_each(|(name, value)| call_environment.define(name, value));
-    if let Some(rest_parameter) = &closure.rest_parameter {
-        call_environment.define(rest_parameter.clone(), list_from_values(rest_arguments));
-    }
+    bind_closure_arguments(&closure, arguments, &call_environment);
 
     eval_required_sequence(
         closure.body,
@@ -2341,7 +2744,7 @@ fn case_clause_matches(
 
     Ok(datums
         .iter()
-        .any(|datum| is_eqv(key, &quote_expression(datum))))
+        .any(|datum| is_eqv(key, &expr_to_datum(datum))))
 }
 
 fn malformed_case(location: SourceLocation) -> EvalError {
@@ -2501,6 +2904,20 @@ fn is_dot_parameter(parameter: &Expr) -> bool {
     matches!(parameter, Expr::Symbol { name, .. } if name == ".")
 }
 
+fn bind_closure_arguments(closure: &Closure, arguments: Vec<Value>, environment: &Environment) {
+    let (required_arguments, rest_arguments) = arguments.split_at(closure.parameters.len());
+
+    closure
+        .parameters
+        .iter()
+        .cloned()
+        .zip(required_arguments.iter().cloned())
+        .for_each(|(name, value)| environment.define(name, value));
+    if let Some(rest_parameter) = &closure.rest_parameter {
+        environment.define(rest_parameter.clone(), list_from_values(rest_arguments));
+    }
+}
+
 fn closure_accepts_argument_count(closure: &Closure, provided: usize) -> bool {
     closure
         .rest_parameter
@@ -2519,17 +2936,15 @@ fn closure_expected_arg_count(closure: &Closure) -> ArgCount {
         })
 }
 
-fn quote_expression(expression: &Expr) -> Value {
-    match expression {
-        Expr::Number { value, .. } => Value::Number(*value),
-        Expr::Boolean { value, .. } => Value::Boolean(*value),
-        Expr::String { value, .. } => Value::immutable_string(value.clone()),
-        Expr::Character { value, .. } => Value::Character(*value),
-        Expr::Symbol { name, .. } => Value::Symbol(name.clone()),
-        Expr::List { items, .. } => items.iter().rev().fold(Value::EmptyList, |tail, item| {
-            Value::pair(quote_expression(item), tail)
-        }),
-    }
+fn is_syntax_rules_expression(expression: &Expr) -> bool {
+    matches!(
+        expression,
+        Expr::List { items, .. }
+            if matches!(
+                items.first(),
+                Some(Expr::Symbol { name, .. }) if name == "syntax-rules"
+            )
+    )
 }
 
 fn split_first<T>(items: Vec<T>) -> Option<(T, Vec<T>)> {

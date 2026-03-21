@@ -156,6 +156,21 @@ pub enum EvalError {
         location: SourceLocation,
         detail: &'static str,
     },
+    #[error("{location}: invalid syntax-case: {detail}")]
+    InvalidSyntaxCase {
+        location: SourceLocation,
+        detail: &'static str,
+    },
+    #[error("{location}: expected syntax object, found {found}")]
+    ExpectedSyntaxObject {
+        location: SourceLocation,
+        found: &'static str,
+    },
+    #[error("{location}: invalid syntax datum: {detail}")]
+    InvalidSyntaxDatum {
+        location: SourceLocation,
+        detail: &'static str,
+    },
     #[error("{location}: expected record of type {expected}, found {found}")]
     RecordTypeMismatch {
         location: SourceLocation,

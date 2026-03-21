@@ -1,4 +1,6 @@
 #[path = "evaluator/runtime.rs"]
 mod runtime;
 
-pub(crate) use runtime::{apply_callable, eval_program, eval_program_with_output};
+pub(crate) use runtime::{
+    apply_callable, eval_program, eval_program_with_output, expand_transformer_procedure,
+};
