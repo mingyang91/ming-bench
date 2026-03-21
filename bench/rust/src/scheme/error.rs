@@ -71,4 +71,10 @@ pub enum EvalError {
 
     #[error("invalid character code at {pos}: {value}")]
     InvalidCharacterCode { pos: SourcePos, value: i64 },
+
+    #[error("invalid length at {pos}: {len}")]
+    InvalidLength { pos: SourcePos, len: i64 },
+
+    #[error("uninitialized binding at {pos}: {name}")]
+    UninitializedBinding { pos: SourcePos, name: String },
 }

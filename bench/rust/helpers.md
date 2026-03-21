@@ -10,7 +10,12 @@ Canonical registry of extracted helpers (>= 5 ops).
 
 ## Rust Helpers (src/scheme/)
 
-(none yet)
+### eval_case_clauses (src/scheme/mod.rs:1305) — Walk `case` clauses, compare quoted datums with `eqv?`, and dispatch the matching body or void.
+### values_eqv (src/scheme/mod.rs:2260) — Implement `eq?`/`eqv?` semantics across scalar, procedure, string, vector, and void values.
+### values_equal (src/scheme/mod.rs:2279) — Perform deep structural equality across lists, vectors, strings, and scalar values.
+### expand_recursive_bindings (src/scheme/expand.rs:611) — Pre-bind recursive identifiers so `letrec` initializers expand in an environment that can see all bindings.
+### expand_template_letrec (src/scheme/expand.rs:1249) — Hygienically expand `letrec` and `letrec*` macro templates with the right recursive binding visibility.
+### expand_template_case (src/scheme/expand.rs:1303) — Expand `case` templates without rewriting literal datum lists while still expanding clause bodies.
 
 ## Python Helpers (scripts/)
 

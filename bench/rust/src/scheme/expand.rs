@@ -192,12 +192,15 @@ impl Expander {
                     Some("set!") => self.expand_set(items, *pos, env),
                     Some("and") | Some("or") => self.expand_n_ary_special(items, *pos, env),
                     Some("let") => self.expand_let(items, *pos, env),
+                    Some("letrec") => self.expand_letrec(items, *pos, env, false),
+                    Some("letrec*") => self.expand_letrec(items, *pos, env, true),
                     Some("begin") => {
                         let mut local = env.clone();
                         let body = self.expand_sequence(&items[1..], &mut local)?;
                         Ok(list_with_head("begin", *pos, body))
                     }
                     Some("cond") => self.expand_cond(items, *pos, env),
+                    Some("case") => self.expand_case(items, *pos, env),
                     _ => self.expand_application(items, *pos, env),
                 }
             }
@@ -308,19 +311,21 @@ impl Expander {
         pos: SourcePos,
         env: &ExpandEnv,
     ) -> Result<Expr, EvalError> {
-        let [_, test, consequent, alternate] = items else {
-            return Err(syntax_error(pos, "if requires exactly 3 arguments"));
-        };
+        let mut result = vec![Expr::Symbol("if".into(), pos)];
+        match items {
+            [_, test, consequent] => {
+                result.push(self.expand_expr(test, env)?);
+                result.push(self.expand_expr(consequent, env)?);
+            }
+            [_, test, consequent, alternate] => {
+                result.push(self.expand_expr(test, env)?);
+                result.push(self.expand_expr(consequent, env)?);
+                result.push(self.expand_expr(alternate, env)?);
+            }
+            _ => return Err(syntax_error(pos, "if requires 2 or 3 arguments")),
+        }
 
-        Ok(Expr::List(
-            vec![
-                Expr::Symbol("if".into(), pos),
-                self.expand_expr(test, env)?,
-                self.expand_expr(consequent, env)?,
-                self.expand_expr(alternate, env)?,
-            ],
-            pos,
-        ))
+        Ok(Expr::List(result, pos))
     }
 
     fn expand_lambda(
@@ -440,6 +445,43 @@ impl Expander {
         }
     }
 
+    fn expand_letrec(
+        &mut self,
+        items: &[Expr],
+        pos: SourcePos,
+        env: &ExpandEnv,
+        sequential: bool,
+    ) -> Result<Expr, EvalError> {
+        let Some((_, parts)) = items.split_first() else {
+            return Err(syntax_error(pos, "letrec requires bindings"));
+        };
+        let [bindings_expr, body @ ..] = parts else {
+            return Err(syntax_error(pos, "letrec requires bindings"));
+        };
+        if body.is_empty() {
+            let form_name = if sequential { "letrec*" } else { "letrec" };
+            return Err(syntax_error(pos, format!("{form_name} requires a body")));
+        }
+
+        let bindings = binding_list(bindings_expr)?;
+        let mut body_env = self.child_env(env);
+        let expanded_bindings = if sequential {
+            self.expand_recursive_star_bindings(bindings, &mut body_env)?
+        } else {
+            self.expand_recursive_bindings(bindings, &mut body_env)?
+        };
+        let expanded_body = self.expand_sequence(body, &mut body_env)?;
+
+        let mut result = Vec::with_capacity(expanded_body.len() + 2);
+        result.push(Expr::Symbol(
+            if sequential { "letrec*".into() } else { "letrec".into() },
+            pos,
+        ));
+        result.push(Expr::List(expanded_bindings, bindings_expr.pos()));
+        result.extend(expanded_body);
+        Ok(Expr::List(result, pos))
+    }
+
     fn expand_cond(
         &mut self,
         items: &[Expr],
@@ -471,6 +513,53 @@ impl Expander {
         }
 
         Ok(Expr::List(clauses, pos))
+    }
+
+    fn expand_case(
+        &mut self,
+        items: &[Expr],
+        pos: SourcePos,
+        env: &ExpandEnv,
+    ) -> Result<Expr, EvalError> {
+        let Some((_, rest)) = items.split_first() else {
+            return Err(syntax_error(pos, "case requires a key"));
+        };
+        let Some((key, clauses)) = rest.split_first() else {
+            return Err(syntax_error(pos, "case requires a key"));
+        };
+
+        let mut result = Vec::with_capacity(items.len());
+        result.push(Expr::Symbol("case".into(), pos));
+        result.push(self.expand_expr(key, env)?);
+
+        for clause in clauses {
+            let Expr::List(parts, clause_pos) = clause else {
+                return Err(syntax_error(clause.pos(), "case clause must be a list"));
+            };
+            let Some((datum_expr, body)) = parts.split_first() else {
+                return Err(syntax_error(clause.pos(), "case clause cannot be empty"));
+            };
+
+            let mut clause_items = Vec::with_capacity(parts.len());
+            if matches!(symbol_name(datum_expr), Some("else")) {
+                clause_items.push(datum_expr.clone());
+            } else {
+                let Expr::List(datums, datum_pos) = datum_expr else {
+                    return Err(syntax_error(
+                        datum_expr.pos(),
+                        "case clause datums must be a list",
+                    ));
+                };
+                clause_items.push(Expr::List(datums.clone(), *datum_pos));
+            }
+
+            let mut clause_env = env.clone();
+            let expanded_body = self.expand_sequence(body, &mut clause_env)?;
+            clause_items.extend(expanded_body);
+            result.push(Expr::List(clause_items, *clause_pos));
+        }
+
+        Ok(Expr::List(result, pos))
     }
 
     fn expand_application(
@@ -512,6 +601,78 @@ impl Expander {
             let internal = self.bind_var(body_env, name);
             expanded.push(Expr::List(
                 vec![Expr::Symbol(internal, *name_pos), value],
+                *binding_pos,
+            ));
+        }
+
+        Ok(expanded)
+    }
+
+    fn expand_recursive_bindings(
+        &mut self,
+        bindings: &[Expr],
+        body_env: &mut ExpandEnv,
+    ) -> Result<Vec<Expr>, EvalError> {
+        let mut parsed = Vec::with_capacity(bindings.len());
+        for binding in bindings {
+            let Expr::List(parts, binding_pos) = binding else {
+                return Err(syntax_error(binding.pos(), "let binding must be a list"));
+            };
+            let [name_expr, value_expr] = parts.as_slice() else {
+                return Err(syntax_error(
+                    binding.pos(),
+                    "let binding must contain a name and value",
+                ));
+            };
+            let Expr::Symbol(name, name_pos) = name_expr else {
+                return Err(syntax_error(name_expr.pos(), "let binding name must be a symbol"));
+            };
+
+            let internal = self.bind_var(body_env, name);
+            parsed.push((internal, *name_pos, value_expr.clone(), *binding_pos));
+        }
+
+        let value_env = body_env.clone();
+        parsed
+            .into_iter()
+            .map(|(internal, name_pos, value_expr, binding_pos)| {
+                Ok(Expr::List(
+                    vec![
+                        Expr::Symbol(internal, name_pos),
+                        self.expand_expr(&value_expr, &value_env)?,
+                    ],
+                    binding_pos,
+                ))
+            })
+            .collect()
+    }
+
+    fn expand_recursive_star_bindings(
+        &mut self,
+        bindings: &[Expr],
+        body_env: &mut ExpandEnv,
+    ) -> Result<Vec<Expr>, EvalError> {
+        let mut expanded = Vec::with_capacity(bindings.len());
+        for binding in bindings {
+            let Expr::List(parts, binding_pos) = binding else {
+                return Err(syntax_error(binding.pos(), "let binding must be a list"));
+            };
+            let [name_expr, value_expr] = parts.as_slice() else {
+                return Err(syntax_error(
+                    binding.pos(),
+                    "let binding must contain a name and value",
+                ));
+            };
+            let Expr::Symbol(name, name_pos) = name_expr else {
+                return Err(syntax_error(name_expr.pos(), "let binding name must be a symbol"));
+            };
+
+            let internal = self.bind_var(body_env, name);
+            expanded.push(Expr::List(
+                vec![
+                    Expr::Symbol(internal, *name_pos),
+                    self.expand_expr(value_expr, body_env)?,
+                ],
                 *binding_pos,
             ));
         }
@@ -907,6 +1068,13 @@ impl Expander {
                 match symbol_name(head) {
                     Some("lambda") => self.expand_template_lambda(items, *pos, macro_def, bindings, repeat_index, intro),
                     Some("let") => self.expand_template_let(items, *pos, macro_def, bindings, repeat_index, intro),
+                    Some("letrec") => {
+                        self.expand_template_letrec(items, *pos, macro_def, bindings, repeat_index, intro, false)
+                    }
+                    Some("letrec*") => {
+                        self.expand_template_letrec(items, *pos, macro_def, bindings, repeat_index, intro, true)
+                    }
+                    Some("case") => self.expand_template_case(items, *pos, macro_def, bindings, repeat_index, intro),
                     Some("define") => self.expand_template_define(items, *pos, macro_def, bindings, repeat_index, intro),
                     _ => {
                         let mut expanded = Vec::new();
@@ -1078,6 +1246,121 @@ impl Expander {
         }
     }
 
+    fn expand_template_letrec(
+        &mut self,
+        items: &[Expr],
+        pos: SourcePos,
+        macro_def: &SyntaxRuleMacro,
+        bindings: &MatchBindings,
+        repeat_index: Option<usize>,
+        intro: &IntroEnv,
+        sequential: bool,
+    ) -> Result<Expr, EvalError> {
+        let Some((_, rest)) = items.split_first() else {
+            return Err(syntax_error(pos, "letrec requires bindings"));
+        };
+
+        let [bindings_expr, body @ ..] = rest else {
+            return Err(syntax_error(pos, "letrec requires bindings"));
+        };
+
+        let raw_bindings = binding_list(bindings_expr)?;
+        let mut body_intro = intro.clone();
+        let expanded_bindings = if sequential {
+            self.expand_template_recursive_star_bindings(
+                raw_bindings,
+                macro_def,
+                bindings,
+                repeat_index,
+                &mut body_intro,
+            )?
+        } else {
+            self.expand_template_recursive_bindings(
+                raw_bindings,
+                macro_def,
+                bindings,
+                repeat_index,
+                &mut body_intro,
+            )?
+        };
+
+        let mut result = Vec::with_capacity(items.len());
+        result.push(Expr::Symbol(
+            if sequential { "letrec*".into() } else { "letrec".into() },
+            pos,
+        ));
+        result.push(Expr::List(expanded_bindings, bindings_expr.pos()));
+        result.extend(self.expand_template_sequence(
+            body,
+            macro_def,
+            bindings,
+            repeat_index,
+            &mut body_intro,
+        )?);
+        Ok(Expr::List(result, pos))
+    }
+
+    fn expand_template_case(
+        &mut self,
+        items: &[Expr],
+        pos: SourcePos,
+        macro_def: &SyntaxRuleMacro,
+        bindings: &MatchBindings,
+        repeat_index: Option<usize>,
+        intro: &IntroEnv,
+    ) -> Result<Expr, EvalError> {
+        let Some((_, rest)) = items.split_first() else {
+            return Err(syntax_error(pos, "case requires a key"));
+        };
+        let Some((key, clauses)) = rest.split_first() else {
+            return Err(syntax_error(pos, "case requires a key"));
+        };
+
+        let mut result = Vec::with_capacity(items.len());
+        result.push(Expr::Symbol("case".into(), pos));
+        result.push(self.expand_template(
+            key,
+            macro_def,
+            bindings,
+            repeat_index,
+            intro,
+        )?);
+
+        for clause in clauses {
+            let Expr::List(parts, clause_pos) = clause else {
+                return Err(syntax_error(clause.pos(), "case clause must be a list"));
+            };
+            let Some((datum_expr, body)) = parts.split_first() else {
+                return Err(syntax_error(clause.pos(), "case clause cannot be empty"));
+            };
+
+            let mut clause_items = Vec::with_capacity(parts.len());
+            if matches!(symbol_name(datum_expr), Some("else")) {
+                clause_items.push(datum_expr.clone());
+            } else {
+                let Expr::List(datums, datum_pos) = datum_expr else {
+                    return Err(syntax_error(
+                        datum_expr.pos(),
+                        "case clause datums must be a list",
+                    ));
+                };
+                clause_items.push(Expr::List(datums.clone(), *datum_pos));
+            }
+
+            let mut clause_intro = intro.clone();
+            clause_items.extend(self.expand_template_sequence(
+                body,
+                macro_def,
+                bindings,
+                repeat_index,
+                &mut clause_intro,
+            )?);
+            result.push(Expr::List(clause_items, *clause_pos));
+        }
+
+        Ok(Expr::List(result, pos))
+    }
+
     fn expand_template_define(
         &mut self,
         items: &[Expr],
@@ -1236,6 +1519,95 @@ impl Expander {
                 bindings,
                 repeat_index,
                 body_intro,
+            )?;
+            expanded.push(Expr::List(vec![name, value], *binding_pos));
+        }
+        Ok(expanded)
+    }
+
+    fn expand_template_recursive_bindings(
+        &mut self,
+        raw_bindings: &[Expr],
+        macro_def: &SyntaxRuleMacro,
+        bindings: &MatchBindings,
+        repeat_index: Option<usize>,
+        intro: &mut IntroEnv,
+    ) -> Result<Vec<Expr>, EvalError> {
+        let mut parsed = Vec::with_capacity(raw_bindings.len());
+        for binding in raw_bindings {
+            let Expr::List(parts, binding_pos) = binding else {
+                return Err(syntax_error(binding.pos(), "let binding must be a list"));
+            };
+            let [name_expr, value_expr] = parts.as_slice() else {
+                return Err(syntax_error(
+                    binding.pos(),
+                    "let binding must contain a name and value",
+                ));
+            };
+
+            let name = self.bind_template_identifier(
+                name_expr,
+                macro_def,
+                bindings,
+                repeat_index,
+                intro,
+            )?;
+            parsed.push((name, value_expr.clone(), *binding_pos));
+        }
+
+        parsed
+            .into_iter()
+            .map(|(name, value_expr, binding_pos)| {
+                Ok(Expr::List(
+                    vec![
+                        name,
+                        self.expand_template(
+                            &value_expr,
+                            macro_def,
+                            bindings,
+                            repeat_index,
+                            intro,
+                        )?,
+                    ],
+                    binding_pos,
+                ))
+            })
+            .collect()
+    }
+
+    fn expand_template_recursive_star_bindings(
+        &mut self,
+        raw_bindings: &[Expr],
+        macro_def: &SyntaxRuleMacro,
+        bindings: &MatchBindings,
+        repeat_index: Option<usize>,
+        intro: &mut IntroEnv,
+    ) -> Result<Vec<Expr>, EvalError> {
+        let mut expanded = Vec::with_capacity(raw_bindings.len());
+        for binding in raw_bindings {
+            let Expr::List(parts, binding_pos) = binding else {
+                return Err(syntax_error(binding.pos(), "let binding must be a list"));
+            };
+            let [name_expr, value_expr] = parts.as_slice() else {
+                return Err(syntax_error(
+                    binding.pos(),
+                    "let binding must contain a name and value",
+                ));
+            };
+
+            let name = self.bind_template_identifier(
+                name_expr,
+                macro_def,
+                bindings,
+                repeat_index,
+                intro,
+            )?;
+            let value = self.expand_template(
+                value_expr,
+                macro_def,
+                bindings,
+                repeat_index,
+                intro,
             )?;
             expanded.push(Expr::List(vec![name, value], *binding_pos));
         }
@@ -1554,8 +1926,11 @@ fn is_special_form_name(name: &str) -> bool {
             | "and"
             | "or"
             | "let"
+            | "letrec"
+            | "letrec*"
             | "begin"
             | "cond"
+            | "case"
     )
 }
 
