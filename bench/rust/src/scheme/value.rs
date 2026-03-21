@@ -8,6 +8,9 @@ use crate::scheme::env::Env;
 #[derive(Debug, Clone)]
 pub enum Value {
     Integer(i64),
+    Float(f64),
+    /// Exact rational: (numerator, denominator), always reduced, denom > 0.
+    Rational(i64, i64),
     Boolean(bool),
     Str(String),
     Symbol(String),
@@ -37,6 +40,8 @@ impl PartialEq for Value {
     fn eq(&self, other: &Self) -> bool {
         match (self, other) {
             (Value::Integer(a), Value::Integer(b)) => a == b,
+            (Value::Float(a), Value::Float(b)) => a == b,
+            (Value::Rational(an, ad), Value::Rational(bn, bd)) => an == bn && ad == bd,
             (Value::Boolean(a), Value::Boolean(b)) => a == b,
             (Value::Str(a), Value::Str(b)) => a == b,
             (Value::Symbol(a), Value::Symbol(b)) => a == b,
@@ -106,6 +111,15 @@ fn write_vector(f: &mut fmt::Formatter<'_>, v: &RefCell<Vec<Value>>) -> fmt::Res
     write!(f, ")")
 }
 
+fn write_float(f: &mut fmt::Formatter<'_>, v: f64) -> fmt::Result {
+    let s = format!("{v}");
+    if v.is_finite() && !s.contains('.') {
+        write!(f, "{s}.0")
+    } else {
+        write!(f, "{s}")
+    }
+}
+
 fn write_list(f: &mut fmt::Formatter<'_>, items: &[Value]) -> fmt::Result {
     write!(f, "(")?;
     for (i, item) in items.iter().enumerate() {
@@ -131,6 +145,8 @@ impl Value {
     pub fn deep_equal(&self, other: &Self) -> bool {
         match (self, other) {
             (Value::Integer(a), Value::Integer(b)) => a == b,
+            (Value::Float(a), Value::Float(b)) => a == b,
+            (Value::Rational(an, ad), Value::Rational(bn, bd)) => an == bn && ad == bd,
             (Value::Boolean(a), Value::Boolean(b)) => a == b,
             (Value::Str(a), Value::Str(b)) => a == b,
             (Value::Symbol(a), Value::Symbol(b)) => a == b,
@@ -162,6 +178,8 @@ impl fmt::Display for Value {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Value::Integer(n) => write!(f, "{n}"),
+            Value::Float(v) => write_float(f, *v),
+            Value::Rational(n, d) => write!(f, "{n}/{d}"),
             Value::Boolean(true) => write!(f, "#t"),
             Value::Boolean(false) => write!(f, "#f"),
             Value::Str(s) => write!(f, "\"{s}\""),

@@ -12,6 +12,8 @@ enum Token {
     Quote,
     Symbol(String),
     Integer(i64),
+    Float(f64),
+    Rational(i64, i64),
     Boolean(bool),
     Str(String),
     Char(char),
@@ -142,11 +144,27 @@ fn tokenize_atom(chars: &[char], start: usize) -> (Token, usize) {
         i += 1;
     }
     let word: String = chars[start..i].iter().collect();
-    let tok = match word.parse::<i64>() {
-        Ok(n) => Token::Integer(n),
-        Err(_) => Token::Symbol(word),
+    let tok = if let Ok(n) = word.parse::<i64>() {
+        Token::Integer(n)
+    } else if let Some(tok) = try_parse_rational(&word) {
+        tok
+    } else if let Ok(f) = word.parse::<f64>() {
+        Token::Float(f)
+    } else {
+        Token::Symbol(word)
     };
     (tok, i)
+}
+
+/// Try to parse a rational literal like `1/3` or `-5/2`.
+fn try_parse_rational(word: &str) -> Option<Token> {
+    let slash = word.find('/')?;
+    let numer: i64 = word[..slash].parse().ok()?;
+    let denom: i64 = word[slash + 1..].parse().ok()?;
+    if denom == 0 {
+        return None;
+    }
+    Some(Token::Rational(numer, denom))
 }
 
 fn is_delimiter(c: char) -> bool {
@@ -175,6 +193,10 @@ fn parse_expr(tokens: &[(Token, Span)], pos: usize) -> Result<(Value, Span, usiz
     let (ref tok, span) = tokens[pos];
     match tok {
         Token::Integer(n) => Ok((Value::Integer(*n), span, pos + 1)),
+        Token::Float(f) => Ok((Value::Float(*f), span, pos + 1)),
+        Token::Rational(n, d) => {
+            Ok((crate::scheme::number::make_rational(*n, *d), span, pos + 1))
+        }
         Token::Boolean(b) => Ok((Value::Boolean(*b), span, pos + 1)),
         Token::Str(s) => Ok((Value::Str(s.clone()), span, pos + 1)),
         Token::Char(c) => Ok((Value::Char(*c), span, pos + 1)),

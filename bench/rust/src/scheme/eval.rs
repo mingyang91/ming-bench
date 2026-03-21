@@ -5,6 +5,7 @@ use std::rc::Rc;
 use crate::scheme::env::Env;
 use crate::scheme::error::EvalError;
 use crate::scheme::macros;
+use crate::scheme::number::{self, Num, num_add, num_div, num_mul, num_neg, num_sub, num_to_f64, num_to_value, value_to_num};
 use crate::scheme::value::Value;
 
 /// A snapshot of a body being evaluated — used for continuation path matching.
@@ -96,7 +97,8 @@ pub fn eval(expr: &Value, env: &Rc<RefCell<Env>>, out: &Output) -> Result<Value,
 
     loop {
         match &current_expr {
-            Value::Integer(_) | Value::Boolean(_) | Value::Str(_) | Value::Char(_)
+            Value::Integer(_) | Value::Float(_) | Value::Rational(_, _)
+            | Value::Boolean(_) | Value::Str(_) | Value::Char(_)
             | Value::Void | Value::Vector(_) | Value::Pair(_, _) | Value::Values(_) => {
                 return Ok(current_expr)
             }
@@ -904,6 +906,9 @@ fn is_builtin(name: &str) -> bool {
             | "string=?" | "string<?" | "string-ci=?"
             | "string-upcase" | "string-downcase"
             | "values" | "call-with-values"
+            | "exact?" | "inexact?" | "rational?" | "integer?"
+            | "exact->inexact" | "inexact->exact"
+            | "numerator" | "denominator"
     )
 }
 
@@ -931,7 +936,7 @@ fn eval_builtin(
         "list" => eval_list_builtin(args, env, out),
         "length" => eval_length(args, env, out),
         "string?" => eval_type_pred(args, env, out, |v| matches!(v, Value::Str(_))),
-        "number?" => eval_type_pred(args, env, out, |v| matches!(v, Value::Integer(_))),
+        "number?" => eval_type_pred(args, env, out, number::is_number),
         "boolean?" => eval_type_pred(args, env, out, |v| matches!(v, Value::Boolean(_))),
         "pair?" => eval_type_pred(args, env, out, |v| {
             matches!(v, Value::List(items) if !items.is_empty()) || matches!(v, Value::Pair(_, _))
@@ -997,6 +1002,14 @@ fn eval_builtin(
         "string-downcase" => eval_string_case(args, env, out, false),
         "values" => eval_values(args, env, out),
         "call-with-values" => eval_call_with_values(args, env, out),
+        "exact?" => eval_type_pred(args, env, out, number::is_exact),
+        "inexact?" => eval_type_pred(args, env, out, number::is_inexact),
+        "rational?" => eval_type_pred(args, env, out, number::is_rational),
+        "integer?" => eval_type_pred(args, env, out, number::is_integer),
+        "exact->inexact" => eval_exact_to_inexact(args, env, out),
+        "inexact->exact" => eval_inexact_to_exact(args, env, out),
+        "numerator" => eval_numerator(args, env, out),
+        "denominator" => eval_denominator(args, env, out),
         _ => Err(EvalError::UnknownProcedure {
             name: name.into(),
         }),
@@ -1204,64 +1217,51 @@ fn eval_not(args: &[Value], env: &Rc<RefCell<Env>>, out: &Output) -> Result<Valu
     Ok(Value::Boolean(val == Value::Boolean(false)))
 }
 
-fn eval_args_as_integers(
+fn eval_args_as_nums(
     args: &[Value],
     env: &Rc<RefCell<Env>>,
     out: &Output,
-) -> Result<Vec<i64>, EvalError> {
+) -> Result<Vec<Num>, EvalError> {
     args.iter()
         .map(|a| {
             let val = eval(a, env, out)?;
-            match val {
-                Value::Integer(n) => Ok(n),
-                other => Err(EvalError::TypeError {
-                    expected: "integer".into(),
-                    got: format!("{other}"),
-                }),
-            }
+            value_to_num(&val)
         })
         .collect()
 }
 
 fn eval_add(args: &[Value], env: &Rc<RefCell<Env>>, out: &Output) -> Result<Value, EvalError> {
-    let nums = eval_args_as_integers(args, env, out)?;
-    Ok(Value::Integer(nums.iter().sum()))
+    let nums = eval_args_as_nums(args, env, out)?;
+    let result = nums.into_iter().fold(Num::Exact(0, 1), num_add);
+    Ok(num_to_value(result))
 }
 
 fn eval_sub(args: &[Value], env: &Rc<RefCell<Env>>, out: &Output) -> Result<Value, EvalError> {
-    let nums = eval_args_as_integers(args, env, out)?;
+    let nums = eval_args_as_nums(args, env, out)?;
     match nums.as_slice() {
-        [] => Err(EvalError::WrongArgCount {
-            expected: 1,
-            got: 0,
-        }),
-        [single] => Ok(Value::Integer(-single)),
-        [first, rest @ ..] => Ok(Value::Integer(rest.iter().fold(*first, |acc, n| acc - n))),
+        [] => Err(EvalError::WrongArgCount { expected: 1, got: 0 }),
+        [single] => Ok(num_to_value(num_neg(*single))),
+        [first, rest @ ..] => {
+            let result = rest.iter().fold(*first, |acc, n| num_sub(acc, *n));
+            Ok(num_to_value(result))
+        }
     }
 }
 
 fn eval_mul(args: &[Value], env: &Rc<RefCell<Env>>, out: &Output) -> Result<Value, EvalError> {
-    let nums = eval_args_as_integers(args, env, out)?;
-    Ok(Value::Integer(nums.iter().product()))
+    let nums = eval_args_as_nums(args, env, out)?;
+    let result = nums.into_iter().fold(Num::Exact(1, 1), num_mul);
+    Ok(num_to_value(result))
 }
 
 fn eval_div(args: &[Value], env: &Rc<RefCell<Env>>, out: &Output) -> Result<Value, EvalError> {
-    let nums = eval_args_as_integers(args, env, out)?;
+    let nums = eval_args_as_nums(args, env, out)?;
     match nums.as_slice() {
-        [] => Err(EvalError::WrongArgCount {
-            expected: 1,
-            got: 0,
-        }),
+        [] => Err(EvalError::WrongArgCount { expected: 1, got: 0 }),
         [first, rest @ ..] => rest
             .iter()
-            .try_fold(*first, |acc, n| {
-                if *n == 0 {
-                    Err(EvalError::DivisionByZero)
-                } else {
-                    Ok(acc / n)
-                }
-            })
-            .map(Value::Integer),
+            .try_fold(*first, |acc, n| num_div(acc, *n))
+            .map(num_to_value),
     }
 }
 
@@ -1269,16 +1269,17 @@ fn eval_cmp(
     args: &[Value],
     env: &Rc<RefCell<Env>>,
     out: &Output,
-    cmp: fn(i64, i64) -> bool,
+    cmp: fn(f64, f64) -> bool,
 ) -> Result<Value, EvalError> {
-    let nums = eval_args_as_integers(args, env, out)?;
+    let nums = eval_args_as_nums(args, env, out)?;
     if nums.len() < 2 {
         return Err(EvalError::WrongArgCount {
             expected: 2,
             got: nums.len(),
         });
     }
-    let result = nums.windows(2).all(|w| cmp(w[0], w[1]));
+    let floats: Vec<f64> = nums.iter().map(num_to_f64).collect();
+    let result = floats.windows(2).all(|w| cmp(w[0], w[1]));
     Ok(Value::Boolean(result))
 }
 
@@ -2534,6 +2535,66 @@ fn eval_call_with_values_core(
     apply_values(consumer, args, env, out)
 }
 
+fn eval_exact_to_inexact(
+    args: &[Value],
+    env: &Rc<RefCell<Env>>,
+    out: &Output,
+) -> Result<Value, EvalError> {
+    let [arg] = args else {
+        return Err(EvalError::WrongArgCount { expected: 1, got: args.len() });
+    };
+    let val = eval(arg, env, out)?;
+    number::exact_to_inexact(&val)
+}
+
+fn eval_inexact_to_exact(
+    args: &[Value],
+    env: &Rc<RefCell<Env>>,
+    out: &Output,
+) -> Result<Value, EvalError> {
+    let [arg] = args else {
+        return Err(EvalError::WrongArgCount { expected: 1, got: args.len() });
+    };
+    let val = eval(arg, env, out)?;
+    number::inexact_to_exact(&val)
+}
+
+fn eval_numerator(
+    args: &[Value],
+    env: &Rc<RefCell<Env>>,
+    out: &Output,
+) -> Result<Value, EvalError> {
+    let [arg] = args else {
+        return Err(EvalError::WrongArgCount { expected: 1, got: args.len() });
+    };
+    match eval(arg, env, out)? {
+        Value::Integer(n) => Ok(Value::Integer(n)),
+        Value::Rational(n, _) => Ok(Value::Integer(n)),
+        other => Err(EvalError::TypeError {
+            expected: "rational".into(),
+            got: format!("{other}"),
+        }),
+    }
+}
+
+fn eval_denominator(
+    args: &[Value],
+    env: &Rc<RefCell<Env>>,
+    out: &Output,
+) -> Result<Value, EvalError> {
+    let [arg] = args else {
+        return Err(EvalError::WrongArgCount { expected: 1, got: args.len() });
+    };
+    match eval(arg, env, out)? {
+        Value::Integer(_) => Ok(Value::Integer(1)),
+        Value::Rational(_, d) => Ok(Value::Integer(d)),
+        other => Err(EvalError::TypeError {
+            expected: "rational".into(),
+            got: format!("{other}"),
+        }),
+    }
+}
+
 /// Seed all builtin procedures into the environment as first-class values.
 pub fn seed_builtins(env: &Rc<RefCell<Env>>) {
     let names = [
@@ -2561,6 +2622,9 @@ pub fn seed_builtins(env: &Rc<RefCell<Env>>) {
         "string=?", "string<?", "string-ci=?",
         "string-upcase", "string-downcase",
         "values", "call-with-values",
+        "exact?", "inexact?", "rational?", "integer?",
+        "exact->inexact", "inexact->exact",
+        "numerator", "denominator",
     ];
     let mut env_ref = env.borrow_mut();
     for name in names {
