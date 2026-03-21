@@ -28,6 +28,7 @@ pub enum Value {
         rules: Vec<(Vec<Expr>, Expr)>,
         def_env: Env,
     },
+    Values(Vec<Value>),
     Void,
 }
 
@@ -48,6 +49,7 @@ impl PartialEq for Value {
                 Value::Continuation { id: b, .. },
             ) => a == b,
             (Value::Macro { .. }, Value::Macro { .. }) => false,
+            (Value::Values(a), Value::Values(b)) => a == b,
             (Value::Void, Value::Void) => true,
             _ => false,
         }
@@ -70,9 +72,17 @@ impl fmt::Display for Value {
             | Value::Builtin(_)
             | Value::Continuation { .. }
             | Value::Macro { .. } => write!(f, "#<procedure>"),
+            Value::Values(vals) => fmt_values(f, vals),
             Value::Void => write!(f, ""),
         }
     }
+}
+
+fn fmt_values(f: &mut fmt::Formatter<'_>, vals: &[Value]) -> fmt::Result {
+    let Some((first, _)) = vals.split_first() else {
+        return write!(f, "");
+    };
+    write!(f, "{first}")
 }
 
 fn fmt_vector(f: &mut fmt::Formatter<'_>, items: &[Value]) -> fmt::Result {
@@ -118,6 +128,7 @@ impl Value {
             Value::List(items) => Self::display_list(items, buf),
             Value::Vector(v) => Self::display_vector(&v.borrow(), buf),
             Value::Continuation { .. } | Value::Macro { .. } => buf.push_str("#<procedure>"),
+            Value::Values(vals) => Self::display_values(vals, buf),
             other => buf.push_str(&other.to_string()),
         }
     }
@@ -134,6 +145,12 @@ impl Value {
             item.display_fmt(buf);
         }
         buf.push(')');
+    }
+
+    fn display_values(vals: &[Value], buf: &mut String) {
+        if let Some((first, _)) = vals.split_first() {
+            first.display_fmt(buf);
+        }
     }
 
     fn display_list(items: &[Value], buf: &mut String) {

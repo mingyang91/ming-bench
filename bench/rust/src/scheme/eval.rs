@@ -950,6 +950,21 @@ fn apply_builtin_values(name: &str, args: &[Value]) -> Result<Value, EvalError> 
         "list->vector" => apply_list_to_vector(args),
         "procedure?" => Ok(Value::Boolean(matches!(args, [Value::Lambda { .. } | Value::Builtin(_) | Value::Continuation { .. }]))),
         "integer?" => Ok(Value::Boolean(matches!(args, [Value::Integer(_)]))),
+        "values" => match args.len() {
+            1 => Ok(args[0].clone()),
+            _ => Ok(Value::Values(args.to_vec())),
+        },
+        "call-with-values" => {
+            let [ref producer, ref consumer] = args else {
+                return Err(EvalError::WrongArgCount { expected: 2, got: args.len() });
+            };
+            let produced = call_proc_values(producer, &[])?;
+            let consumer_args = match produced {
+                Value::Values(vals) => vals,
+                single => vec![single],
+            };
+            call_proc_values(consumer, &consumer_args)
+        }
         _ => Err(EvalError::UnboundVariable { name: name.into() }),
     }
 }
@@ -968,6 +983,30 @@ fn call_proc_values(proc: &Value, args: &[Value]) -> Result<Value, EvalError> {
             got: format!("{proc}"),
         }),
     }
+}
+
+/// Implement (values expr ...) — single value is transparent, 0 or 2+ wrapped.
+fn eval_values_builtin(args: &[Expr], env: &Env) -> Result<Value, EvalError> {
+    let vals: Vec<Value> = args.iter().map(|a| eval(a, env)).collect::<Result<_, _>>()?;
+    match vals.len() {
+        1 => Ok(vals.into_iter().next().expect("len checked")),
+        _ => Ok(Value::Values(vals)),
+    }
+}
+
+/// Implement (call-with-values producer consumer).
+fn eval_call_with_values_builtin(args: &[Expr], env: &Env) -> Result<Value, EvalError> {
+    let [ref producer_expr, ref consumer_expr] = args else {
+        return Err(EvalError::WrongArgCount { expected: 2, got: args.len() });
+    };
+    let producer = eval(producer_expr, env)?;
+    let consumer = eval(consumer_expr, env)?;
+    let produced = call_proc_values(&producer, &[])?;
+    let consumer_args = match produced {
+        Value::Values(vals) => vals,
+        single => vec![single],
+    };
+    call_proc_values(&consumer, &consumer_args)
 }
 
 fn eval_cmp_values(args: &[Value], cmp: fn(i64, i64) -> bool) -> Result<Value, EvalError> {
@@ -1105,6 +1144,7 @@ fn is_builtin(name: &str) -> bool {
             | "vector" | "make-vector" | "vector-ref" | "vector-set!"
             | "vector-length" | "vector?" | "vector->list" | "list->vector"
             | "procedure?" | "integer?"
+            | "values" | "call-with-values"
     )
 }
 
@@ -1194,6 +1234,8 @@ fn eval_builtin(op: &str, args: &[Expr], env: &Env) -> Result<Value, EvalError> 
             matches!(v, Value::Lambda { .. } | Value::Builtin(_) | Value::Continuation { .. })
         }),
         "integer?" => eval_type_pred(args, env, |v| matches!(v, Value::Integer(_))),
+        "values" => eval_values_builtin(args, env),
+        "call-with-values" => eval_call_with_values_builtin(args, env),
         _ => Err(EvalError::UnboundVariable { name: op.into() }),
     }
 }
