@@ -8,9 +8,9 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::rc::Rc;
 
 thread_local! {
-    static CALLCC_PENDING: RefCell<Option<Value>> = RefCell::new(None);
+    static CALLCC_PENDING: RefCell<Option<(Pos, Value)>> = RefCell::new(None);
     static CALLCC_TOP_IDX: Cell<usize> = Cell::new(0);
-    static CONT_RETURN: RefCell<Option<(usize, Value)>> = RefCell::new(None);
+    static CONT_RETURN: RefCell<Option<(Pos, usize, Value)>> = RefCell::new(None);
 }
 
 static GENSYM_COUNTER: AtomicUsize = AtomicUsize::new(0);
@@ -21,7 +21,7 @@ fn gensym(base: &str) -> String {
 }
 
 /// Source position (1-indexed line, 0-indexed column).
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct Pos {
     line: usize,
     col: usize,
@@ -50,7 +50,7 @@ enum Value {
         env: Env,
     },
     Builtin(String),
-    Continuation(usize),
+    Continuation(Pos, usize),
     Macro {
         literals: Rc<Vec<String>>,
         rules: Rc<Vec<(Expr, Expr)>>,
@@ -111,7 +111,7 @@ impl Value {
             }
             Value::Lambda { .. } => "<procedure>".to_string(),
             Value::Builtin(name) => format!("<builtin:{}>", name),
-            Value::Continuation(_) => "<continuation>".to_string(),
+            Value::Continuation(_, _) => "<continuation>".to_string(),
             Value::Macro { .. } => "<macro>".to_string(),
         }
     }
@@ -819,7 +819,7 @@ fn eval(expr: &Expr, env: &Env, out: &mut String) -> Result<Value, EvalError> {
                     eval(&items[0], &cur_env, out)?
                 };
                 match func {
-                    Value::Continuation(idx) => {
+                    Value::Continuation(cc_pos, top_idx) => {
                         if args.len() != 1 {
                             break 'tco Err(EvalError::Arity(format!(
                                 "continuation requires 1 argument at {}",
@@ -827,7 +827,7 @@ fn eval(expr: &Expr, env: &Env, out: &mut String) -> Result<Value, EvalError> {
                             )));
                         }
                         CONT_RETURN.with(|cr| {
-                            *cr.borrow_mut() = Some((idx, args.into_iter().next().unwrap()));
+                            *cr.borrow_mut() = Some((cc_pos, top_idx, args.into_iter().next().unwrap()));
                         });
                         break 'tco Err(EvalError::ContinuationReturn);
                     }
@@ -839,12 +839,20 @@ fn eval(expr: &Expr, env: &Env, out: &mut String) -> Result<Value, EvalError> {
                                     pos.fmt()
                                 )));
                             }
-                            let pending = CALLCC_PENDING.with(|p| p.borrow_mut().take());
+                            let pending = CALLCC_PENDING.with(|p| {
+                                let mut p = p.borrow_mut();
+                                if let Some((pending_pos, _)) = p.as_ref() {
+                                    if *pending_pos == pos {
+                                        return p.take().map(|(_, v)| v);
+                                    }
+                                }
+                                None
+                            });
                             if let Some(val) = pending {
                                 break 'tco Ok(val);
                             }
                             let start_idx = CALLCC_TOP_IDX.with(|c| c.get());
-                            let k = Value::Continuation(start_idx);
+                            let k = Value::Continuation(pos, start_idx);
                             let proc = args.into_iter().next().unwrap();
                             break 'tco apply_func(proc, vec![k], pos, &cur_env, out);
                         }
@@ -1048,13 +1056,21 @@ fn eval_lambda(args: &[Expr], pos: Pos, env: &Env) -> Result<Value, EvalError> {
 
 /// Perform call/cc: check for pending return, otherwise create continuation and call proc.
 fn do_callcc(proc_expr: &Expr, pos: Pos, env: &Env, out: &mut String) -> Result<Value, EvalError> {
-    let pending = CALLCC_PENDING.with(|p| p.borrow_mut().take());
+    let pending = CALLCC_PENDING.with(|p| {
+        let mut p = p.borrow_mut();
+        if let Some((pending_pos, _)) = p.as_ref() {
+            if *pending_pos == pos {
+                return p.take().map(|(_, v)| v);
+            }
+        }
+        None
+    });
     if let Some(val) = pending {
         return Ok(val);
     }
     let proc = eval(proc_expr, env, out)?;
     let start_idx = CALLCC_TOP_IDX.with(|c| c.get());
-    let k = Value::Continuation(start_idx);
+    let k = Value::Continuation(pos, start_idx);
     apply_func(proc, vec![k], pos, env, out)
 }
 
@@ -1107,7 +1123,7 @@ fn apply_func(func: Value, args: Vec<Value>, pos: Pos, env: &Env, out: &mut Stri
             }
             eval(body.last().unwrap(), &new_env, out)
         }
-        Value::Continuation(idx) => {
+        Value::Continuation(cc_pos, top_idx) => {
             if args.len() != 1 {
                 return Err(EvalError::Arity(format!(
                     "continuation requires 1 argument at {}",
@@ -1115,7 +1131,7 @@ fn apply_func(func: Value, args: Vec<Value>, pos: Pos, env: &Env, out: &mut Stri
                 )));
             }
             CONT_RETURN.with(|cr| {
-                *cr.borrow_mut() = Some((idx, args.into_iter().next().unwrap()));
+                *cr.borrow_mut() = Some((cc_pos, top_idx, args.into_iter().next().unwrap()));
             });
             Err(EvalError::ContinuationReturn)
         }
@@ -1204,7 +1220,7 @@ fn call_apply(args: &[Value], pos: Pos, env: &Env, out: &mut String) -> Result<V
     call_args.extend(tail);
 
     match func {
-        Value::Continuation(idx) => {
+        Value::Continuation(cc_pos, top_idx) => {
             if call_args.len() != 1 {
                 return Err(EvalError::Arity(format!(
                     "continuation requires 1 argument at {}",
@@ -1212,7 +1228,7 @@ fn call_apply(args: &[Value], pos: Pos, env: &Env, out: &mut String) -> Result<V
                 )));
             }
             CONT_RETURN.with(|cr| {
-                *cr.borrow_mut() = Some((*idx, call_args.into_iter().next().unwrap()));
+                *cr.borrow_mut() = Some((*cc_pos, *top_idx, call_args.into_iter().next().unwrap()));
             });
             Err(EvalError::ContinuationReturn)
         }
@@ -1959,9 +1975,9 @@ pub fn eval_str(input: &str) -> Result<String, EvalError> {
                 i += 1;
             }
             Err(EvalError::ContinuationReturn) => {
-                let (start_idx, value) =
+                let (cc_pos, start_idx, value) =
                     CONT_RETURN.with(|cr| cr.borrow_mut().take().unwrap());
-                CALLCC_PENDING.with(|p| *p.borrow_mut() = Some(value));
+                CALLCC_PENDING.with(|p| *p.borrow_mut() = Some((cc_pos, value)));
                 i = start_idx;
             }
             Err(e) => return Err(e),
@@ -1990,9 +2006,9 @@ pub fn eval_str_with_output(input: &str) -> Result<(String, String), EvalError> 
                 i += 1;
             }
             Err(EvalError::ContinuationReturn) => {
-                let (start_idx, value) =
+                let (cc_pos, start_idx, value) =
                     CONT_RETURN.with(|cr| cr.borrow_mut().take().unwrap());
-                CALLCC_PENDING.with(|p| *p.borrow_mut() = Some(value));
+                CALLCC_PENDING.with(|p| *p.borrow_mut() = Some((cc_pos, value)));
                 i = start_idx;
             }
             Err(e) => return Err(e),
