@@ -1,18 +1,37 @@
+/// Source position (line, column), 1-based.
+#[derive(Debug, Clone, Copy, PartialEq, Default)]
+pub struct Pos {
+    pub line: usize,
+    pub col: usize,
+}
+
+impl Pos {
+    pub fn new(line: usize, col: usize) -> Self {
+        Self { line, col }
+    }
+}
+
+impl std::fmt::Display for Pos {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}:{}", self.line, self.col)
+    }
+}
+
 /// Evaluation error type for the Scheme interpreter.
 #[derive(Debug, PartialEq, thiserror::Error)]
 pub enum EvalError {
-    #[error("parse error: {0}")]
-    Parse(String),
+    #[error("parse error at {pos}: {msg}")]
+    Parse { msg: String, pos: Pos },
 
-    #[error("unbound variable: {name}")]
-    UnboundVariable { name: String },
+    #[error("unbound variable at {pos}: {name}")]
+    UnboundVariable { name: String, pos: Pos },
 
-    #[error("type error: {0}")]
-    Type(String),
+    #[error("type error at {pos}: {msg}")]
+    Type { msg: String, pos: Pos },
 
-    #[error("arity error: {0}")]
-    Arity(String),
+    #[error("arity error at {pos}: {msg}")]
+    Arity { msg: String, pos: Pos },
 
-    #[error("runtime error: {0}")]
-    Runtime(String),
+    #[error("runtime error at {pos}: {msg}")]
+    Runtime { msg: String, pos: Pos },
 }
