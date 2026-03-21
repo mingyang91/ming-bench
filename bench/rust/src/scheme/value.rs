@@ -6,7 +6,7 @@ use crate::scheme::ast::SourceLocation;
 use crate::scheme::builtins::BuiltinProcedure;
 use crate::scheme::continuation::CapturedContinuation;
 use crate::scheme::environment::Environment;
-use crate::scheme::error::EvalError;
+use crate::scheme::error::{ArgCount, EvalError};
 use crate::scheme::string_value::SchemeString;
 use crate::scheme::vector_value::SchemeVector;
 
@@ -14,6 +14,34 @@ use crate::scheme::vector_value::SchemeVector;
 enum RenderMode {
     Write,
     Display,
+}
+
+#[derive(Clone)]
+pub(crate) struct MultipleValues {
+    values: Vec<Value>,
+    location: SourceLocation,
+}
+
+impl MultipleValues {
+    fn new(values: Vec<Value>, location: SourceLocation) -> Self {
+        Self { values, location }
+    }
+
+    fn len(&self) -> usize {
+        self.values.len()
+    }
+
+    fn location(&self) -> SourceLocation {
+        self.location
+    }
+
+    pub(crate) fn values(&self) -> &[Value] {
+        &self.values
+    }
+
+    fn into_values(self) -> Vec<Value> {
+        self.values
+    }
 }
 
 #[derive(Clone)]
@@ -28,9 +56,12 @@ pub enum Value {
     Vector(SchemeVector),
     Builtin(BuiltinProcedure),
     CallWithCurrentContinuation,
+    CallWithValues,
     DynamicWind,
     Raise,
+    ValuesProcedure,
     WithExceptionHandler,
+    MultipleValues(MultipleValues),
     Continuation(Rc<CapturedContinuation>),
     Closure(Closure),
     Void,
@@ -75,6 +106,33 @@ impl Value {
         Self::String(SchemeString::immutable(value))
     }
 
+    pub fn multiple(values: Vec<Value>, location: SourceLocation) -> Self {
+        debug_assert_ne!(
+            values.len(),
+            1,
+            "multiple-values carrier should only represent zero or multiple values"
+        );
+        Self::MultipleValues(MultipleValues::new(values, location))
+    }
+
+    pub fn into_values(self) -> Vec<Value> {
+        match self {
+            Self::MultipleValues(values) => values.into_values(),
+            value => vec![value],
+        }
+    }
+
+    pub fn expect_single(self) -> Result<Self, EvalError> {
+        match self {
+            Self::MultipleValues(values) => Err(EvalError::WrongValueCount {
+                location: values.location(),
+                expected: ArgCount::Exactly(1),
+                got: values.len(),
+            }),
+            value => Ok(value),
+        }
+    }
+
     pub fn render(&self) -> String {
         self.render_with_mode(RenderMode::Write)
     }
@@ -95,9 +153,12 @@ impl Value {
             Self::Vector(vector) => render_vector(vector, mode),
             Self::Builtin(procedure) => format!("#<procedure:{}>", procedure.name()),
             Self::CallWithCurrentContinuation => "#<procedure:call/cc>".into(),
+            Self::CallWithValues => "#<procedure:call-with-values>".into(),
             Self::DynamicWind => "#<procedure:dynamic-wind>".into(),
             Self::Raise => "#<procedure:raise>".into(),
+            Self::ValuesProcedure => "#<procedure:values>".into(),
             Self::WithExceptionHandler => "#<procedure:with-exception-handler>".into(),
+            Self::MultipleValues(values) => render_multiple_values(values),
             Self::Continuation(_) => "#<continuation>".into(),
             Self::Closure(closure) => render_closure(closure),
             Self::Void => "#<void>".into(),
@@ -176,11 +237,14 @@ impl Value {
             Self::Vector(_) => "vector",
             Self::Builtin(_)
             | Self::CallWithCurrentContinuation
+            | Self::CallWithValues
             | Self::DynamicWind
             | Self::Raise
+            | Self::ValuesProcedure
             | Self::WithExceptionHandler
             | Self::Continuation(_)
             | Self::Closure(_) => "procedure",
+            Self::MultipleValues(_) => "values",
             Self::Void => "void",
             Self::Uninitialized => "uninitialized",
         }
@@ -223,6 +287,10 @@ fn render_character(value: char, mode: RenderMode) -> String {
             _ => format!("#\\{value}"),
         },
     }
+}
+
+fn render_multiple_values(values: &MultipleValues) -> String {
+    format!("#<values:{}>", values.values().len())
 }
 
 fn escape_string_contents(value: &str) -> String {

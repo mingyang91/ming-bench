@@ -87,7 +87,8 @@ pub(crate) fn eval_program_with_output(expressions: &[Expr]) -> Result<(Value, S
         eval_sequence(expressions.to_vec(), environment, Vec::new())?,
         &mut output,
         &macro_environment,
-    )?;
+    )?
+    .expect_single()?;
 
     Ok((value, output))
 }
@@ -116,8 +117,10 @@ fn install_runtime_procedures(environment: &Environment) {
         "call-with-current-continuation",
         Value::CallWithCurrentContinuation,
     );
+    environment.define("call-with-values", Value::CallWithValues);
     environment.define("dynamic-wind", Value::DynamicWind);
     environment.define("raise", Value::Raise);
+    environment.define("values", Value::ValuesProcedure);
     environment.define("with-exception-handler", Value::WithExceptionHandler);
 }
 
@@ -160,10 +163,33 @@ fn continue_return(
     macro_environment: &MacroEnvironment,
 ) -> Result<ControlFlow<Value, State>, EvalError> {
     let Some(frame) = continuation.pop() else {
-        return Ok(ControlFlow::Break(value));
+        return value.expect_single().map(ControlFlow::Break);
     };
+    let value = normalize_return_value(&frame, value)?;
 
     continue_with_frame(frame, value, continuation, macro_environment).map(ControlFlow::Continue)
+}
+
+fn normalize_return_value(frame: &Frame, value: Value) -> Result<Value, EvalError> {
+    if frame_accepts_multiple_values(frame) {
+        return Ok(value);
+    }
+
+    value.expect_single()
+}
+
+fn frame_accepts_multiple_values(frame: &Frame) -> bool {
+    matches!(
+        frame,
+        Frame::CallWithValues { .. }
+            | Frame::DynamicWindBefore { .. }
+            | Frame::DynamicWindExit { .. }
+            | Frame::DynamicWindAfter { .. }
+            | Frame::DynamicWindContext { .. }
+            | Frame::ExceptionHandler { .. }
+            | Frame::ExceptionTransition { .. }
+            | Frame::ContinuationTransition { .. }
+    )
 }
 
 fn eval_expression(
@@ -1091,7 +1117,8 @@ fn continue_with_frame(
         Frame::CondClause { .. } | Frame::GuardClause { .. } | Frame::Case { .. } => {
             continue_branch_frame(frame, value, continuation)
         }
-        Frame::DynamicWindBefore { .. }
+        Frame::CallWithValues { .. }
+        | Frame::DynamicWindBefore { .. }
         | Frame::DynamicWindExit { .. }
         | Frame::DynamicWindAfter { .. }
         | Frame::DynamicWindContext { .. }
@@ -1281,6 +1308,9 @@ fn continue_effect_frame(
     continuation: ContinuationFrames,
 ) -> Result<State, EvalError> {
     match frame {
+        Frame::CallWithValues { consumer, location } => {
+            continue_call_with_values(consumer, location, value, continuation)
+        }
         Frame::DynamicWindBefore { body, wind } => {
             continue_dynamic_wind_before(body, wind, continuation)
         }
@@ -1621,6 +1651,20 @@ fn continue_dynamic_wind_before(
     })
 }
 
+fn continue_call_with_values(
+    consumer: Value,
+    location: SourceLocation,
+    produced: Value,
+    continuation: ContinuationFrames,
+) -> Result<State, EvalError> {
+    Ok(State::Apply {
+        callable: consumer,
+        arguments: produced.into_values(),
+        location,
+        continuation,
+    })
+}
+
 fn continue_dynamic_wind_exit(
     wind: Rc<DynamicWind>,
     value: Value,
@@ -1822,8 +1866,10 @@ fn apply_value(
         Value::CallWithCurrentContinuation => {
             apply_call_with_current_continuation(arguments, location, continuation)
         }
+        Value::CallWithValues => apply_call_with_values(arguments, location, continuation),
         Value::DynamicWind => apply_dynamic_wind(arguments, location, continuation),
         Value::Raise => apply_raise(arguments, location, continuation),
+        Value::ValuesProcedure => apply_values(arguments, location, continuation),
         Value::WithExceptionHandler => {
             apply_with_exception_handler(arguments, location, continuation)
         }
@@ -1898,6 +1944,33 @@ fn apply_call_with_current_continuation(
     })
 }
 
+fn apply_call_with_values(
+    arguments: Vec<Value>,
+    location: SourceLocation,
+    mut continuation: ContinuationFrames,
+) -> Result<State, EvalError> {
+    let [producer, consumer] = arguments.as_slice() else {
+        return Err(EvalError::WrongArgumentCount {
+            location,
+            procedure: "call-with-values",
+            expected: ArgCount::Exactly(2),
+            got: arguments.len(),
+        });
+    };
+
+    continuation.push(Frame::CallWithValues {
+        consumer: consumer.clone(),
+        location,
+    });
+
+    Ok(State::Apply {
+        callable: producer.clone(),
+        arguments: Vec::new(),
+        location,
+        continuation,
+    })
+}
+
 fn apply_dynamic_wind(
     arguments: Vec<Value>,
     location: SourceLocation,
@@ -1942,6 +2015,22 @@ fn apply_raise(
 
     Ok(State::Raise {
         exception: RaisedException::new(value.clone(), location),
+        continuation,
+    })
+}
+
+fn apply_values(
+    mut arguments: Vec<Value>,
+    location: SourceLocation,
+    continuation: ContinuationFrames,
+) -> Result<State, EvalError> {
+    let value = match arguments.len() {
+        1 => arguments.pop().expect("values should contain one argument"),
+        _ => Value::multiple(arguments, location),
+    };
+
+    Ok(State::Return {
+        value,
         continuation,
     })
 }

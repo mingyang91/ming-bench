@@ -146,6 +146,10 @@ pub(crate) enum Frame {
         body: Value,
         wind: Rc<DynamicWind>,
     },
+    CallWithValues {
+        consumer: Value,
+        location: SourceLocation,
+    },
     DynamicWindExit {
         wind: Rc<DynamicWind>,
     },

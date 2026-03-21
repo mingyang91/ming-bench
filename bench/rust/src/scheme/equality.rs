@@ -17,7 +17,9 @@ pub fn is_eqv(left: &Value, right: &Value) -> bool {
         (Value::Vector(left), Value::Vector(right)) => left.is_same_object(right),
         (Value::Builtin(left), Value::Builtin(right)) => left == right,
         (Value::CallWithCurrentContinuation, Value::CallWithCurrentContinuation) => true,
+        (Value::CallWithValues, Value::CallWithValues) => true,
         (Value::DynamicWind, Value::DynamicWind) => true,
+        (Value::ValuesProcedure, Value::ValuesProcedure) => true,
         (Value::Continuation(left), Value::Continuation(right)) => Rc::ptr_eq(left, right),
         (Value::Void, Value::Void) => true,
         (Value::Uninitialized, Value::Uninitialized) => true,
@@ -43,6 +45,14 @@ pub fn is_equal(left: &Value, right: &Value) -> bool {
                     .into_iter()
                     .zip(right.items())
                     .all(|(left, right)| is_equal(&left, &right))
+        }
+        (Value::MultipleValues(left), Value::MultipleValues(right)) => {
+            left.values().len() == right.values().len()
+                && left
+                    .values()
+                    .iter()
+                    .zip(right.values())
+                    .all(|(left, right)| is_equal(left, right))
         }
         _ => is_eqv(left, right),
     }

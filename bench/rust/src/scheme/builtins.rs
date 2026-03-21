@@ -1018,12 +1018,10 @@ fn eval_map(
                 argument.expect("map arguments should be present after shortest-list check")
             })
             .collect::<Vec<_>>();
-        mapped_values.push(apply_callable(
-            procedure.clone(),
-            &current_arguments,
-            location,
-            output,
-        )?);
+        mapped_values.push(
+            apply_callable(procedure.clone(), &current_arguments, location, output)?
+                .expect_single()?,
+        );
     }
 
     Ok(eval_list(&mapped_values))

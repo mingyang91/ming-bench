@@ -91,6 +91,12 @@ pub enum EvalError {
         expected: ArgCount,
         got: usize,
     },
+    #[error("{location}: wrong number of values: expected {expected}, got {got}")]
+    WrongValueCount {
+        location: SourceLocation,
+        expected: ArgCount,
+        got: usize,
+    },
     #[error("{location}: expected {expected}, found {found}")]
     TypeMismatch {
         location: SourceLocation,
