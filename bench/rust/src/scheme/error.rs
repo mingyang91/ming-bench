@@ -34,4 +34,7 @@ pub enum EvalError {
 
     #[error("runtime error at {pos}: {msg}")]
     Runtime { msg: String, pos: Pos },
+
+    #[error("continuation invoked")]
+    ContinuationReturn,
 }

@@ -23,6 +23,7 @@ enum Val {
         env: Env,
     },
     Builtin(String),
+    Continuation(u64),
     Void,
 }
 
@@ -55,6 +56,7 @@ impl fmt::Display for Val {
             Val::Char(c) => write!(f, "#\\{}", c),
             Val::Lambda { .. } => write!(f, "#<procedure>"),
             Val::Builtin(name) => write!(f, "#<builtin:{}>", name),
+            Val::Continuation(_) => write!(f, "#<continuation>"),
             Val::Void => write!(f, ""),
         }
     }
@@ -123,7 +125,7 @@ fn default_env() -> Env {
         "symbol->string", "string->symbol",
         "string-ref", "char?", "string-copy",
         "string->list", "list->string", "char->integer", "integer->char",
-        "map", "apply",
+        "map", "apply", "call/cc",
     ] {
         env_set(&env, name.to_string(), Val::Builtin(name.to_string()));
     }
@@ -147,6 +149,67 @@ fn display_val(v: &Val) -> String {
         }
         other => other.to_string(),
     }
+}
+
+// ---------- Continuation State ----------
+
+struct ContState {
+    next_id: u64,
+    current_expr_index: usize,
+    expr_start_ids: Vec<u64>,
+    cont_expr_index: HashMap<u64, usize>,
+    signal: Option<(u64, Val)>,
+    resume: Option<(u64, Val)>,
+}
+
+impl ContState {
+    fn new() -> Self {
+        ContState {
+            next_id: 0,
+            current_expr_index: 0,
+            expr_start_ids: Vec::new(),
+            cont_expr_index: HashMap::new(),
+            signal: None,
+            resume: None,
+        }
+    }
+}
+
+thread_local! {
+    static CONT_STATE: RefCell<ContState> = RefCell::new(ContState::new());
+}
+
+fn callcc_exec(proc: &Val, pos: Pos, out: &Output) -> Result<Val, EvalError> {
+    let (id, resume_val) = CONT_STATE.with(|cs| {
+        let mut state = cs.borrow_mut();
+        let id = state.next_id;
+        state.next_id += 1;
+
+        if let Some((target_id, _)) = &state.resume {
+            if id == *target_id {
+                let (_, val) = state.resume.take().unwrap();
+                return (id, Some(val));
+            }
+        }
+
+        let expr_idx = state.current_expr_index;
+        state.cont_expr_index.insert(id, expr_idx);
+        (id, None)
+    });
+
+    if let Some(val) = resume_val {
+        return Ok(val);
+    }
+
+    let cont_val = Val::Continuation(id);
+    apply_func(proc, &[cont_val], pos, out)
+}
+
+fn invoke_continuation(id: u64, val: Val) -> EvalError {
+    CONT_STATE.with(|cs| {
+        cs.borrow_mut().signal = Some((id, val));
+    });
+    EvalError::ContinuationReturn
 }
 
 // ---------- Tokenizer ----------
@@ -693,6 +756,24 @@ fn eval(expr: &Expr, env: &Env, out: &Output) -> Result<Val, EvalError> {
                     .collect::<Result<Vec<_>, _>>()?;
 
                 match func {
+                    Val::Builtin(ref name) if name == "call/cc" => {
+                        if args.len() != 1 {
+                            return Err(EvalError::Arity {
+                                msg: "call/cc requires 1 argument".into(),
+                                pos: p,
+                            });
+                        }
+                        return callcc_exec(&args[0], p, out);
+                    }
+                    Val::Continuation(id) => {
+                        if args.len() != 1 {
+                            return Err(EvalError::Arity {
+                                msg: "continuation requires 1 argument".into(),
+                                pos: p,
+                            });
+                        }
+                        return Err(invoke_continuation(id, args[0].clone()));
+                    }
                     Val::Builtin(name) => return apply_builtin(&name, &args, p, out),
                     Val::Lambda {
                         params,
@@ -745,6 +826,24 @@ fn eval(expr: &Expr, env: &Env, out: &Output) -> Result<Val, EvalError> {
 
 fn apply_func(func: &Val, args: &[Val], pos: Pos, out: &Output) -> Result<Val, EvalError> {
     match func {
+        Val::Builtin(name) if name == "call/cc" => {
+            if args.len() != 1 {
+                return Err(EvalError::Arity {
+                    msg: "call/cc requires 1 argument".into(),
+                    pos,
+                });
+            }
+            callcc_exec(&args[0], pos, out)
+        }
+        Val::Continuation(id) => {
+            if args.len() != 1 {
+                return Err(EvalError::Arity {
+                    msg: "continuation requires 1 argument".into(),
+                    pos,
+                });
+            }
+            Err(invoke_continuation(*id, args[0].clone()))
+        }
         Val::Builtin(name) => apply_builtin(name, args, pos, out),
         Val::Lambda {
             params,
@@ -1352,16 +1451,55 @@ fn two_ints(args: &[Val], op: &str, pos: Pos) -> Result<(i64, i64), EvalError> {
     Ok((as_int(&args[0], pos)?, as_int(&args[1], pos)?))
 }
 
+fn eval_program(exprs: &[Expr], env: &Env, out: &Output) -> Result<Val, EvalError> {
+    CONT_STATE.with(|cs| *cs.borrow_mut() = ContState::new());
+
+    let mut i = 0;
+    let mut result = Val::Void;
+
+    while i < exprs.len() {
+        CONT_STATE.with(|cs| {
+            let mut state = cs.borrow_mut();
+            state.current_expr_index = i;
+            if state.expr_start_ids.len() <= i {
+                let id = state.next_id;
+                state.expr_start_ids.push(id);
+            }
+        });
+
+        match eval(&exprs[i], env, out) {
+            Ok(val) => {
+                result = val;
+                i += 1;
+            }
+            Err(EvalError::ContinuationReturn) => {
+                let (cont_id, cont_val) = CONT_STATE.with(|cs| {
+                    cs.borrow_mut().signal.take().unwrap()
+                });
+                let restart_idx = CONT_STATE.with(|cs| {
+                    cs.borrow().cont_expr_index[&cont_id]
+                });
+                CONT_STATE.with(|cs| {
+                    let mut state = cs.borrow_mut();
+                    state.next_id = state.expr_start_ids[restart_idx];
+                    state.resume = Some((cont_id, cont_val));
+                });
+                i = restart_idx;
+            }
+            Err(e) => return Err(e),
+        }
+    }
+
+    Ok(result)
+}
+
 /// Evaluate one or more Scheme expressions and return the string
 /// representation of the last result.
 pub fn eval_str(input: &str) -> Result<String, EvalError> {
     let exprs = parse_all(input)?;
     let env = default_env();
     let out: Output = Rc::new(RefCell::new(String::new()));
-    let mut result = Val::Void;
-    for expr in &exprs {
-        result = eval(expr, &env, &out)?;
-    }
+    let result = eval_program(&exprs, &env, &out)?;
     Ok(result.to_string())
 }
 
@@ -1371,10 +1509,7 @@ pub fn eval_str_with_output(input: &str) -> Result<(String, String), EvalError> 
     let exprs = parse_all(input)?;
     let env = default_env();
     let out: Output = Rc::new(RefCell::new(String::new()));
-    let mut result = Val::Void;
-    for expr in &exprs {
-        result = eval(expr, &env, &out)?;
-    }
+    let result = eval_program(&exprs, &env, &out)?;
     let output = out.borrow().clone();
     Ok((result.to_string(), output))
 }
