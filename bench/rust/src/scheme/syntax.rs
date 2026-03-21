@@ -275,7 +275,7 @@ fn expand_expression_recursive(
     macros: &MacroEnvironment,
 ) -> Result<Expr, EvalError> {
     match expression {
-        Expr::Integer { .. }
+        Expr::Number { .. }
         | Expr::Boolean { .. }
         | Expr::String { .. }
         | Expr::Character { .. }
@@ -543,7 +543,7 @@ fn compile_pattern(
     }
 
     match expression {
-        Expr::Integer { .. }
+        Expr::Number { .. }
         | Expr::Boolean { .. }
         | Expr::String { .. }
         | Expr::Character { .. } => Ok(Pattern::Literal(expression.clone())),
@@ -587,7 +587,7 @@ fn compile_template(
     }
 
     match expression {
-        Expr::Integer { .. }
+        Expr::Number { .. }
         | Expr::Boolean { .. }
         | Expr::String { .. }
         | Expr::Character { .. } => Ok(Template::Datum(expression.clone())),
@@ -1858,7 +1858,7 @@ fn merge_scopes(left: &Scope, right: Scope) -> Scope {
 
 fn same_datum(left: &Expr, right: &Expr) -> bool {
     match (left, right) {
-        (Expr::Integer { value: left, .. }, Expr::Integer { value: right, .. }) => left == right,
+        (Expr::Number { value: left, .. }, Expr::Number { value: right, .. }) => left == right,
         (Expr::Boolean { value: left, .. }, Expr::Boolean { value: right, .. }) => left == right,
         (Expr::String { value: left, .. }, Expr::String { value: right, .. }) => left == right,
         (Expr::Character { value: left, .. }, Expr::Character { value: right, .. }) => {

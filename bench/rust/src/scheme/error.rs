@@ -159,9 +159,16 @@ pub enum EvalError {
     },
     #[error("{location}: division by zero")]
     DivisionByZero { location: SourceLocation },
+    #[error("{location}: numeric overflow")]
+    NumericOverflow { location: SourceLocation },
     #[error("{location}: unsupported exponent: {exponent}")]
     InvalidExponent {
         location: SourceLocation,
         exponent: i64,
+    },
+    #[error("{location}: cannot convert inexact number to exact: {value}")]
+    InexactToExactFailed {
+        location: SourceLocation,
+        value: String,
     },
 }

@@ -1,5 +1,7 @@
 use std::fmt::{self, Display, Formatter};
 
+use crate::scheme::number::Number;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct SourceLocation {
     pub line: usize,
@@ -18,10 +20,10 @@ impl Display for SourceLocation {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub enum Expr {
-    Integer {
-        value: i64,
+    Number {
+        value: Number,
         location: SourceLocation,
     },
     Boolean {
@@ -47,8 +49,8 @@ pub enum Expr {
 }
 
 impl Expr {
-    pub fn integer(value: i64, location: SourceLocation) -> Self {
-        Self::Integer { value, location }
+    pub fn number(value: Number, location: SourceLocation) -> Self {
+        Self::Number { value, location }
     }
 
     pub fn boolean(value: bool, location: SourceLocation) -> Self {
@@ -73,7 +75,7 @@ impl Expr {
 
     pub fn location(&self) -> SourceLocation {
         match self {
-            Self::Integer { location, .. }
+            Self::Number { location, .. }
             | Self::Boolean { location, .. }
             | Self::String { location, .. }
             | Self::Character { location, .. }

@@ -5,6 +5,7 @@ mod environment;
 mod equality;
 pub mod error;
 mod evaluator;
+mod number;
 mod parser;
 mod string_value;
 mod syntax;

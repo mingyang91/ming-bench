@@ -199,8 +199,8 @@ fn eval_expression(
     macro_environment: &MacroEnvironment,
 ) -> Result<State, EvalError> {
     match expression {
-        Expr::Integer { value, .. } => Ok(State::Return {
-            value: Value::Integer(value),
+        Expr::Number { value, .. } => Ok(State::Return {
+            value: Value::Number(value),
             continuation,
         }),
         Expr::Boolean { value, .. } => Ok(State::Return {
@@ -2495,7 +2495,7 @@ fn closure_expected_arg_count(closure: &Closure) -> ArgCount {
 
 fn quote_expression(expression: &Expr) -> Value {
     match expression {
-        Expr::Integer { value, .. } => Value::Integer(*value),
+        Expr::Number { value, .. } => Value::Number(*value),
         Expr::Boolean { value, .. } => Value::Boolean(*value),
         Expr::String { value, .. } => Value::immutable_string(value.clone()),
         Expr::Character { value, .. } => Value::Character(*value),

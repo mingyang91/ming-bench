@@ -1,5 +1,6 @@
 use crate::scheme::ast::{Expr, SourceLocation};
 use crate::scheme::error::ParseError;
+use crate::scheme::number::Number;
 
 pub fn parse_program(input: &str) -> Result<Vec<Expr>, ParseError> {
     let mut parser = Parser::new(input);
@@ -103,10 +104,9 @@ impl<'src> Parser<'src> {
             "#t" => Ok(Expr::boolean(true, location)),
             "#f" => Ok(Expr::boolean(false, location)),
             _ if token.starts_with("#\\") => parse_character_literal(token, location),
-            _ => match token.parse::<i64>() {
-                Ok(value) => Ok(Expr::integer(value, location)),
-                Err(_) => Ok(Expr::symbol(token.to_string(), location)),
-            },
+            _ => Ok(Number::parse(token)
+                .map(|value| Expr::number(value, location))
+                .unwrap_or_else(|| Expr::symbol(token.to_string(), location))),
         }
     }
 

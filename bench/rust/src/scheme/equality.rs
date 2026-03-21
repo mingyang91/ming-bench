@@ -8,7 +8,7 @@ pub fn is_eq(left: &Value, right: &Value) -> bool {
 
 pub fn is_eqv(left: &Value, right: &Value) -> bool {
     match (left, right) {
-        (Value::Integer(left), Value::Integer(right)) => left == right,
+        (Value::Number(left), Value::Number(right)) => left.eqv(*right),
         (Value::Boolean(left), Value::Boolean(right)) => left == right,
         (Value::Character(left), Value::Character(right)) => left == right,
         (Value::Symbol(left), Value::Symbol(right)) => left == right,
@@ -29,7 +29,7 @@ pub fn is_eqv(left: &Value, right: &Value) -> bool {
 
 pub fn is_equal(left: &Value, right: &Value) -> bool {
     match (left, right) {
-        (Value::Integer(left), Value::Integer(right)) => left == right,
+        (Value::Number(left), Value::Number(right)) => left.numeric_eq(*right),
         (Value::Boolean(left), Value::Boolean(right)) => left == right,
         (Value::String(left), Value::String(right)) => left.as_string() == right.as_string(),
         (Value::Character(left), Value::Character(right)) => left == right,

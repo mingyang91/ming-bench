@@ -7,6 +7,7 @@ use crate::scheme::builtins::BuiltinProcedure;
 use crate::scheme::continuation::CapturedContinuation;
 use crate::scheme::environment::Environment;
 use crate::scheme::error::{ArgCount, EvalError};
+use crate::scheme::number::Number;
 use crate::scheme::string_value::SchemeString;
 use crate::scheme::vector_value::SchemeVector;
 
@@ -46,7 +47,7 @@ impl MultipleValues {
 
 #[derive(Clone)]
 pub enum Value {
-    Integer(i64),
+    Number(Number),
     Boolean(bool),
     String(SchemeString),
     Character(char),
@@ -143,7 +144,7 @@ impl Value {
 
     fn render_with_mode(&self, mode: RenderMode) -> String {
         match self {
-            Self::Integer(value) => value.to_string(),
+            Self::Number(value) => value.render(),
             Self::Boolean(value) => render_boolean(*value),
             Self::String(value) => render_string(value, mode),
             Self::Character(value) => render_character(*value, mode),
@@ -166,15 +167,24 @@ impl Value {
         }
     }
 
-    pub fn expect_number(&self, location: SourceLocation) -> Result<i64, EvalError> {
+    pub fn expect_number(&self, location: SourceLocation) -> Result<Number, EvalError> {
         match self {
-            Self::Integer(value) => Ok(*value),
+            Self::Number(value) => Ok(*value),
             _ => Err(EvalError::TypeMismatch {
                 location,
                 expected: "number",
                 found: self.type_name(),
             }),
         }
+    }
+
+    pub fn expect_integer(&self, location: SourceLocation) -> Result<i64, EvalError> {
+        let number = self.expect_number(location)?;
+        number.integer_value().ok_or(EvalError::TypeMismatch {
+            location,
+            expected: "integer",
+            found: self.type_name(),
+        })
     }
 
     pub fn expect_string(&self, location: SourceLocation) -> Result<&SchemeString, EvalError> {
@@ -227,7 +237,7 @@ impl Value {
 
     pub fn type_name(&self) -> &'static str {
         match self {
-            Self::Integer(_) => "number",
+            Self::Number(_) => "number",
             Self::Boolean(_) => "boolean",
             Self::String(_) => "string",
             Self::Character(_) => "char",
