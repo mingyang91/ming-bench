@@ -361,6 +361,7 @@ fn eval_list_step(
             "letrec*" => return eval_letrec_star_step(args, env, ctx),
             "begin" => return eval_body_step(args, env, ctx),
             "cond" => return eval_cond_step(args, env, ctx),
+            "case" => return eval_case_step(args, env, ctx),
             "display" => return eval_display(args, env, ctx).map(Trampoline::Done),
             "write" => return eval_write(args, env, ctx).map(Trampoline::Done),
             "newline" => return eval_newline(args, &mut ctx.out).map(Trampoline::Done),
@@ -962,6 +963,61 @@ fn eval_cond_step(
         }
     }
     Ok(Trampoline::Done(Value::Nil))
+}
+
+/// Evaluate `(case key ((datum ...) expr ...) ... (else expr ...))`.
+fn eval_case_step(
+    args: &[Expr],
+    env: &mut Env,
+    ctx: &mut EvalCtx,
+) -> Result<Trampoline, EvalError> {
+    let [key_expr, clauses @ ..] = args else {
+        return Err(EvalError::Parse {
+            message: "case requires a key expression".to_string(),
+        });
+    };
+    let key = eval(key_expr, env, ctx)?;
+    for clause in clauses {
+        let Expr::List(parts, _) = clause else {
+            return Err(EvalError::Parse {
+                message: "case clause must be a list".to_string(),
+            });
+        };
+        let [datums_expr, body @ ..] = parts.as_slice() else {
+            return Err(EvalError::Parse {
+                message: "case clause must have datums and body".to_string(),
+            });
+        };
+        if matches!(datums_expr, Expr::Atom(s, _) if s == "else") {
+            return eval_body_step(body, env, ctx);
+        }
+        let Expr::List(datum_exprs, _) = datums_expr else {
+            return Err(EvalError::Parse {
+                message: "case clause datums must be a list".to_string(),
+            });
+        };
+        let matches_key = datum_exprs.iter().any(|d| {
+            quote_expr(d)
+                .map(|v| eqv_match(&key, &v))
+                .unwrap_or(false)
+        });
+        if matches_key {
+            return eval_body_step(body, env, ctx);
+        }
+    }
+    Ok(Trampoline::Done(Value::Nil))
+}
+
+/// Check eqv? equivalence for case matching.
+fn eqv_match(a: &Value, b: &Value) -> bool {
+    match (a, b) {
+        (Value::Integer(x), Value::Integer(y)) => x == y,
+        (Value::Boolean(x), Value::Boolean(y)) => x == y,
+        (Value::Symbol(x), Value::Symbol(y)) => x == y,
+        (Value::Char(x), Value::Char(y)) => x == y,
+        (Value::Nil, Value::Nil) => true,
+        _ => false,
+    }
 }
 
 /// Short-circuit `or` with TCO: last expression is in tail position.
