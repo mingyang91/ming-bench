@@ -81,6 +81,10 @@ enum Value {
         clauses: Rc<Vec<(Vec<String>, Option<String>, Vec<Expr>)>>,
         env: Env,
     },
+    Parameter {
+        value: Rc<RefCell<Value>>,
+        converter: Option<Rc<RefCell<Value>>>,
+    },
 }
 
 fn gcd(a: i64, b: i64) -> i64 {
@@ -289,6 +293,7 @@ impl Value {
                 }
             }
             Value::Record { type_name, .. } => format!("<record:{}>", type_name),
+            Value::Parameter { .. } => "<parameter>".to_string(),
         }
     }
 
@@ -324,6 +329,7 @@ impl Value {
                 | "numerator" | "denominator" | "rational?" | "integer?"
                 | "syntax->datum" | "datum->syntax"
                 | "procedure?"
+                | "make-parameter"
         )
     }
 
@@ -1596,6 +1602,78 @@ fn eval_tco(expr: &Expr, env: &Env, out: &mut String) -> Result<Value, EvalError
                                 Err(e) => break 'tco Err(e),
                             }
                         }
+                        "parameterize" => {
+                            // (parameterize ((param expr) ...) body ...)
+                            if items.len() < 3 {
+                                break 'tco Err(EvalError::Arity(format!(
+                                    "parameterize requires bindings and body at {}",
+                                    pos.fmt()
+                                )));
+                            }
+                            let bindings_expr = &items[1];
+                            let bindings_list = match &bindings_expr.kind {
+                                ExprKind::List(parts) => parts,
+                                _ => break 'tco Err(EvalError::Parse(format!(
+                                    "parameterize: expected bindings list at {}",
+                                    pos.fmt()
+                                ))),
+                            };
+                            // Evaluate all parameter expressions and new values
+                            let mut saved: Vec<(Rc<RefCell<Value>>, Value)> = Vec::new();
+                            for binding in bindings_list {
+                                let pair = match &binding.kind {
+                                    ExprKind::List(parts) if parts.len() == 2 => parts,
+                                    _ => break 'tco Err(EvalError::Parse(format!(
+                                        "parameterize: bad binding at {}",
+                                        pos.fmt()
+                                    ))),
+                                };
+                                let param_val = eval(&pair[0], &cur_env, out)?;
+                                let new_val = eval(&pair[1], &cur_env, out)?;
+                                match param_val {
+                                    Value::Parameter { ref value, ref converter } => {
+                                        let old = value.borrow().clone();
+                                        let converted = if let Some(ref conv) = converter {
+                                            let conv_fn = conv.borrow().clone();
+                                            apply_func(conv_fn, vec![new_val], pos, &cur_env, out)?
+                                        } else {
+                                            new_val
+                                        };
+                                        saved.push((Rc::clone(value), old));
+                                        *value.borrow_mut() = converted;
+                                    }
+                                    _ => break 'tco Err(EvalError::Type(format!(
+                                        "parameterize: expected parameter, got {} at {}",
+                                        param_val.display(), pos.fmt()
+                                    ))),
+                                }
+                            }
+                            // Evaluate body
+                            let body = &items[2..];
+                            let result = (|| -> Result<Value, EvalError> {
+                                if body.is_empty() {
+                                    return Ok(Value::Nil);
+                                }
+                                for e in &body[..body.len() - 1] {
+                                    eval(e, &cur_env, out)?;
+                                }
+                                eval(body.last().unwrap(), &cur_env, out)
+                            })();
+                            // Restore, regardless of how we exit
+                            match &result {
+                                Ok(_) | Err(EvalError::ContinuationReturn) | Err(EvalError::Raised) => {
+                                    for (cell, old_val) in saved.into_iter().rev() {
+                                        *cell.borrow_mut() = old_val;
+                                    }
+                                }
+                                Err(_) => {
+                                    for (cell, old_val) in saved.into_iter().rev() {
+                                        *cell.borrow_mut() = old_val;
+                                    }
+                                }
+                            }
+                            break 'tco result;
+                        }
                         "call/cc" | "call-with-current-continuation" => {
                             if items.len() != 2 {
                                 break 'tco Err(EvalError::Arity(format!(
@@ -1978,6 +2056,16 @@ fn eval_tco(expr: &Expr, env: &Env, out: &mut String) -> Result<Value, EvalError
                         cur_expr = body.last().unwrap().clone();
                         cur_env = new_env;
                         continue 'tco;
+                    }
+                    Value::Parameter { ref value, .. } => {
+                        if args.is_empty() {
+                            break 'tco Ok(value.borrow().clone());
+                        } else {
+                            break 'tco Err(EvalError::Type(format!(
+                                "parameter called with arguments at {}",
+                                pos.fmt()
+                            )));
+                        }
                     }
                     _ => {
                         break 'tco Err(EvalError::Type(format!(
@@ -2448,6 +2536,16 @@ fn apply_func(func: Value, args: Vec<Value>, pos: Pos, env: &Env, out: &mut Stri
                     bname,
                     pos.fmt()
                 ))),
+            }
+        }
+        Value::Parameter { ref value, .. } => {
+            if args.is_empty() {
+                Ok(value.borrow().clone())
+            } else {
+                Err(EvalError::Type(format!(
+                    "parameter called with arguments at {}",
+                    pos.fmt()
+                )))
             }
         }
         _ => Err(EvalError::Type(format!(
@@ -3034,7 +3132,7 @@ fn apply_builtin(op: &str, args: &[Value], pos: Pos, out: &mut String) -> Result
                     pos.fmt()
                 )));
             }
-            Ok(Some(Value::Boolean(matches!(args[0], Value::Lambda { .. } | Value::Builtin(_) | Value::Continuation(_, _) | Value::CaseLambda { .. }))))
+            Ok(Some(Value::Boolean(matches!(args[0], Value::Lambda { .. } | Value::Builtin(_) | Value::Continuation(_, _) | Value::CaseLambda { .. } | Value::Parameter { .. }))))
         }
         "pair?" => {
             if args.len() != 1 {
@@ -3887,6 +3985,29 @@ fn apply_builtin(op: &str, args: &[Value], pos: Pos, out: &mut String) -> Result
             };
             Ok(Some(Value::Boolean(is_int)))
         }
+        "make-parameter" => {
+            if args.is_empty() || args.len() > 2 {
+                return Err(EvalError::Arity(format!(
+                    "make-parameter requires 1 or 2 arguments at {}",
+                    pos.fmt()
+                )));
+            }
+            let converter = if args.len() == 2 {
+                Some(Rc::new(RefCell::new(args[1].clone())))
+            } else {
+                None
+            };
+            let init_val = if let Some(ref conv) = converter {
+                let conv_fn = conv.borrow().clone();
+                apply_func(conv_fn, vec![args[0].clone()], pos, &Env::new(), out)?
+            } else {
+                args[0].clone()
+            };
+            Ok(Some(Value::Parameter {
+                value: Rc::new(RefCell::new(init_val)),
+                converter,
+            }))
+        }
         "syntax->datum" => {
             if args.len() != 1 {
                 return Err(EvalError::Arity(format!("syntax->datum requires 1 argument at {}", pos.fmt())));
@@ -4014,6 +4135,7 @@ fn is_keyword(name: &str) -> bool {
             | "define-record-type" | "syntax-case" | "syntax"
             | "with-syntax" | "case-lambda" | "do"
             | "let-values" | "receive"
+            | "parameterize"
     ) || Value::is_builtin_name(name)
 }
 
