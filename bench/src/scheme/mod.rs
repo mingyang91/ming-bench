@@ -211,7 +211,7 @@ fn ast_to_value(ast: &Ast) -> Value {
 }
 
 /// Evaluate a parsed Scheme expression.
-fn eval(ast: &Ast, env: &mut Env) -> Result<Value, EvalError> {
+fn eval(ast: &Ast, env: &mut Env, out: &mut String) -> Result<Value, EvalError> {
     let line = ast.line;
     let col = ast.col;
     match &ast.kind {
@@ -239,7 +239,7 @@ fn eval(ast: &Ast, env: &mut Env) -> Result<Value, EvalError> {
                                 if items.len() != 3 {
                                     return Err(EvalError::Arity.with_position(line, col));
                                 }
-                                let val = eval(&items[2], env)?;
+                                let val = eval(&items[2], env, out)?;
                                 env.insert(name.clone(), val);
                                 return Ok(Value::Symbol("ok".into()));
                             }
@@ -349,11 +349,11 @@ fn eval(ast: &Ast, env: &mut Env) -> Result<Value, EvalError> {
                         if items.len() < 3 {
                             return Err(EvalError::Arity.with_position(line, col));
                         }
-                        let cond = eval(&items[1], env)?;
+                        let cond = eval(&items[1], env, out)?;
                         if cond != Value::Boolean(false) {
-                            return eval(&items[2], env);
+                            return eval(&items[2], env, out);
                         } else if items.len() > 3 {
-                            return eval(&items[3], env);
+                            return eval(&items[3], env, out);
                         } else {
                             return Ok(Value::Symbol("ok".into()));
                         }
@@ -367,7 +367,7 @@ fn eval(ast: &Ast, env: &mut Env) -> Result<Value, EvalError> {
                     "and" => {
                         let mut result = Value::Boolean(true);
                         for a in &items[1..] {
-                            result = eval(a, env)?;
+                            result = eval(a, env, out)?;
                             if result == Value::Boolean(false) {
                                 return Ok(result);
                             }
@@ -377,7 +377,7 @@ fn eval(ast: &Ast, env: &mut Env) -> Result<Value, EvalError> {
                     "or" => {
                         let mut result = Value::Boolean(false);
                         for a in &items[1..] {
-                            result = eval(a, env)?;
+                            result = eval(a, env, out)?;
                             if result != Value::Boolean(false) {
                                 return Ok(result);
                             }
@@ -387,7 +387,7 @@ fn eval(ast: &Ast, env: &mut Env) -> Result<Value, EvalError> {
                     "begin" => {
                         let mut result = Value::Symbol("ok".into());
                         for expr in &items[1..] {
-                            result = eval(expr, env)?;
+                            result = eval(expr, env, out)?;
                         }
                         return Ok(result);
                     }
@@ -409,7 +409,7 @@ fn eval(ast: &Ast, env: &mut Env) -> Result<Value, EvalError> {
                                         _ => return Err(EvalError::TypeError("let: binding name must be symbol".into())
                                             .with_position(pair[0].line, pair[0].col)),
                                     };
-                                    let val = eval(&pair[1], env)?;
+                                    let val = eval(&pair[1], env, out)?;
                                     local_env.insert(name, val);
                                 }
                                 _ => return Err(EvalError::TypeError("let: bad binding".into())
@@ -418,7 +418,7 @@ fn eval(ast: &Ast, env: &mut Env) -> Result<Value, EvalError> {
                         }
                         let mut result = Value::Symbol("ok".into());
                         for expr in &items[2..] {
-                            result = eval(expr, &mut local_env)?;
+                            result = eval(expr, &mut local_env, out)?;
                         }
                         return Ok(result);
                     }
@@ -430,16 +430,16 @@ fn eval(ast: &Ast, env: &mut Env) -> Result<Value, EvalError> {
                                         if s == "else" {
                                             let mut result = Value::Symbol("ok".into());
                                             for expr in &parts[1..] {
-                                                result = eval(expr, env)?;
+                                                result = eval(expr, env, out)?;
                                             }
                                             return Ok(result);
                                         }
                                     }
-                                    let test = eval(&parts[0], env)?;
+                                    let test = eval(&parts[0], env, out)?;
                                     if test != Value::Boolean(false) {
                                         let mut result = Value::Symbol("ok".into());
                                         for expr in &parts[1..] {
-                                            result = eval(expr, env)?;
+                                            result = eval(expr, env, out)?;
                                         }
                                         return Ok(result);
                                     }
@@ -454,17 +454,18 @@ fn eval(ast: &Ast, env: &mut Env) -> Result<Value, EvalError> {
                 }
             }
             // General application: evaluate operator and arguments
-            let args: Result<Vec<Value>, _> =
-                items[1..].iter().map(|a| eval(a, env)).collect();
-            let args = args?;
+            let mut args = Vec::new();
+            for a in &items[1..] {
+                args.push(eval(a, env, out)?);
+            }
             // Try builtin first if operator is a symbol not in env
             if let AstKind::Symbol(s) = &items[0].kind {
                 if !env.contains_key(s.as_str()) {
-                    return apply_builtin(s, &args)
+                    return apply_builtin(s, &args, out)
                         .map_err(|e| e.with_position(line, col));
                 }
             }
-            let func = eval(&items[0], env)?;
+            let func = eval(&items[0], env, out)?;
             match func {
                 Value::Lambda {
                     params,
@@ -481,7 +482,7 @@ fn eval(ast: &Ast, env: &mut Env) -> Result<Value, EvalError> {
                     for (p, a) in params.iter().zip(args) {
                         local_env.insert(p.clone(), a);
                     }
-                    eval(&body, &mut local_env)
+                    eval(&body, &mut local_env, out)
                 }
                 _ => Err(EvalError::NotAProcedure.with_position(items[0].line, items[0].col)),
             }
@@ -496,7 +497,7 @@ fn expect_integer(v: &Value) -> Result<i64, EvalError> {
     }
 }
 
-fn apply_builtin(op: &str, args: &[Value]) -> Result<Value, EvalError> {
+fn apply_builtin(op: &str, args: &[Value], out: &mut String) -> Result<Value, EvalError> {
     match op {
         "+" => {
             let mut sum: i64 = 0;
@@ -624,6 +625,24 @@ fn apply_builtin(op: &str, args: &[Value]) -> Result<Value, EvalError> {
             if args.len() != 1 { return Err(EvalError::Arity); }
             Ok(Value::Boolean(matches!(&args[0], Value::Symbol(_))))
         }
+        "display" => {
+            if args.len() != 1 { return Err(EvalError::Arity); }
+            match &args[0] {
+                Value::Str(s) => out.push_str(s),
+                other => out.push_str(&other.to_scheme_string()),
+            }
+            Ok(Value::Symbol("ok".into()))
+        }
+        "write" => {
+            if args.len() != 1 { return Err(EvalError::Arity); }
+            out.push_str(&args[0].to_scheme_string());
+            Ok(Value::Symbol("ok".into()))
+        }
+        "newline" => {
+            if !args.is_empty() { return Err(EvalError::Arity); }
+            out.push('\n');
+            Ok(Value::Symbol("ok".into()))
+        }
         _ => Err(EvalError::UndefinedVariable(op.to_string())),
     }
 }
@@ -635,9 +654,10 @@ pub fn eval_str(input: &str) -> Result<String, EvalError> {
     let mut pos = 0;
     let mut last_result = None;
     let mut env = Env::new();
+    let mut out = String::new();
     while pos < tokens.len() {
         let (ast, next) = parse(&tokens, pos)?;
-        let result = eval(&ast, &mut env)?;
+        let result = eval(&ast, &mut env, &mut out)?;
         last_result = Some(result);
         pos = next;
     }
@@ -649,8 +669,22 @@ pub fn eval_str(input: &str) -> Result<String, EvalError> {
 
 /// Evaluate Scheme expressions, returning both the result value and
 /// any output produced by `display`, `write`, or `newline`.
-pub fn eval_str_with_output(_input: &str) -> Result<(String, String), EvalError> {
-    todo!()
+pub fn eval_str_with_output(input: &str) -> Result<(String, String), EvalError> {
+    let tokens = tokenize(input);
+    let mut pos = 0;
+    let mut last_result = None;
+    let mut env = Env::new();
+    let mut out = String::new();
+    while pos < tokens.len() {
+        let (ast, next) = parse(&tokens, pos)?;
+        let result = eval(&ast, &mut env, &mut out)?;
+        last_result = Some(result);
+        pos = next;
+    }
+    match last_result {
+        Some(v) => Ok((v.to_scheme_string(), out)),
+        None => Err(EvalError::Parse("empty input".into())),
+    }
 }
 
 #[cfg(test)]
