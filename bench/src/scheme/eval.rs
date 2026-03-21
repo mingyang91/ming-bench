@@ -34,6 +34,7 @@ fn is_builtin(name: &str) -> bool {
             | "symbol->string"
             | "string->symbol"
             | "string-ref"
+            | "string-copy"
     )
 }
 
@@ -83,6 +84,7 @@ fn eval_list(
             "let" => return eval_let(args, env, span, output),
             "begin" => return eval_begin(args, env, span, output),
             "cond" => return eval_cond(args, env, span, output),
+            "string-set!" => return eval_string_set(args, env, span, output),
             _ => {}
         }
     }
@@ -429,7 +431,8 @@ fn apply_builtin(
             Ok(Value::Void)
         }
         "string-append" | "string-length" | "substring" | "string->number"
-        | "number->string" | "symbol->string" | "string->symbol" | "string-ref" => {
+        | "number->string" | "symbol->string" | "string->symbol" | "string-ref"
+        | "string-copy" => {
             apply_string_builtin(name, args, span)
         }
         _ => Err(EvalError::UnboundVariable {
@@ -709,6 +712,75 @@ fn apply_string_builtin(
             })?;
             Ok(Value::Char(c))
         }
+        "string-copy" => {
+            let [Value::String(s)] = args else {
+                return Err(EvalError::TypeError {
+                    message: "string-copy: expected one string argument".into(),
+                    span,
+                });
+            };
+            Ok(Value::String(s.clone()))
+        }
         _ => unreachable!("apply_string_builtin called with non-string builtin: {name}"),
     }
+}
+
+fn eval_string_set(
+    args: &[Value],
+    env: &Rc<RefCell<Env>>,
+    span: Span,
+    output: &RefCell<String>,
+) -> Result<Value, EvalError> {
+    let [var_expr, idx_expr, char_expr] = args else {
+        return Err(EvalError::WrongArgCount {
+            expected: 3,
+            got: args.len(),
+            span,
+        });
+    };
+    let Value::Symbol(var_name) = var_expr else {
+        return Err(EvalError::TypeError {
+            message: "string-set!: first argument must be a variable name".into(),
+            span,
+        });
+    };
+    let idx = require_integer(&eval(idx_expr, env, span, output)?, span)? as usize;
+    let ch = match eval(char_expr, env, span, output)? {
+        Value::Char(c) => c,
+        other => {
+            return Err(EvalError::TypeError {
+                message: format!("string-set!: expected char, got {other}"),
+                span,
+            });
+        }
+    };
+    let current = env.borrow().get(var_name).ok_or_else(|| EvalError::UnboundVariable {
+        name: var_name.clone(),
+        span,
+    })?;
+    let Value::String(s) = current else {
+        return Err(EvalError::TypeError {
+            message: format!("string-set!: expected string, got {current}"),
+            span,
+        });
+    };
+    let mut chars: Vec<char> = s.chars().collect();
+    if idx >= chars.len() {
+        return Err(EvalError::TypeError {
+            message: format!(
+                "string-set!: index {idx} out of range for string of length {}",
+                chars.len()
+            ),
+            span,
+        });
+    }
+    chars[idx] = ch;
+    let new_string: String = chars.into_iter().collect();
+    if !env.borrow_mut().set(var_name, Value::String(new_string)) {
+        return Err(EvalError::UnboundVariable {
+            name: var_name.clone(),
+            span,
+        });
+    }
+    Ok(Value::Void)
 }

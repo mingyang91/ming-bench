@@ -193,6 +193,12 @@ fn parse_atom(token: &str) -> Value {
     match token {
         "#t" => Value::Boolean(true),
         "#f" => Value::Boolean(false),
+        "#\\space" => Value::Char(' '),
+        "#\\newline" => Value::Char('\n'),
+        "#\\tab" => Value::Char('\t'),
+        s if s.starts_with("#\\") && s.len() == 3 => {
+            Value::Char(s.chars().nth(2).expect("char literal must have a character"))
+        }
         s if s.starts_with('"') && s.ends_with('"') && s.len() >= 2 => {
             Value::String(s[1..s.len() - 1].to_string())
         }
