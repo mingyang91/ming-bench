@@ -1158,6 +1158,20 @@ fn subst_template(
     }
 }
 
+fn values_equal(a: &Value, b: &Value) -> bool {
+    match (a, b) {
+        (Value::Integer(x), Value::Integer(y)) => x == y,
+        (Value::Boolean(x), Value::Boolean(y)) => x == y,
+        (Value::Str(x), Value::Str(y)) => x == y,
+        (Value::Symbol(x), Value::Symbol(y)) => x == y,
+        (Value::Char(x), Value::Char(y)) => x == y,
+        (Value::List(xs), Value::List(ys)) => {
+            xs.len() == ys.len() && xs.iter().zip(ys.iter()).all(|(x, y)| values_equal(x, y))
+        }
+        _ => false,
+    }
+}
+
 fn is_builtin(name: &str) -> bool {
     matches!(name,
         "+" | "-" | "*" | "/" | "<" | ">" | "=" | "<=" | ">=" |
@@ -1168,6 +1182,7 @@ fn is_builtin(name: &str) -> bool {
         "string->number" | "number->string" | "symbol->string" | "string->symbol" |
         "string-ref" | "string-copy" | "char?" | "string->list" | "list->string" |
         "char->integer" | "integer->char" |
+        "equal?" |
         "apply" | "map" |
         "call/cc" | "call-with-current-continuation"
     )
@@ -1403,6 +1418,12 @@ fn apply_builtin_vals(op: &str, vals: &[Value], pos: Pos) -> Result<Value, EvalE
                 return Err(runtime_err(pos, "symbol? requires 1 argument"));
             }
             Ok(Value::Boolean(matches!(&vals[0], Value::Symbol(_))))
+        }
+        "equal?" => {
+            if vals.len() != 2 {
+                return Err(runtime_err(pos, "equal? requires 2 arguments"));
+            }
+            Ok(Value::Boolean(values_equal(&vals[0], &vals[1])))
         }
         "display" => {
             if vals.len() != 1 {
