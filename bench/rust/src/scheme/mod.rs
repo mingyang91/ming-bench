@@ -120,6 +120,7 @@ enum Value {
     Char(char),
     Symbol(String),
     List(Vec<Value>),
+    Pair(Box<(Value, Value)>),
     Builtin(Builtin),
     Procedure(Rc<LambdaProcedure>),
     Continuation(ContinuationRef),
@@ -143,6 +144,7 @@ impl Value {
             Self::Char(_) => "char",
             Self::Symbol(_) => "symbol",
             Self::List(_) => "list",
+            Self::Pair(_) => "pair",
             Self::Builtin(_) | Self::Procedure(_) | Self::Continuation(_) => "procedure",
             Self::Void => "void",
         }
@@ -177,6 +179,7 @@ impl Value {
                     .join(" ");
                 format!("({rendered})")
             }
+            Self::Pair(pair) => render_pair(&pair.0, &pair.1, mode),
             Self::Builtin(_) | Self::Procedure(_) | Self::Continuation(_) => {
                 "#<procedure>".to_string()
             }
@@ -197,7 +200,7 @@ enum RenderMode {
     Write,
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Builtin {
     Add,
     Sub,
@@ -207,12 +210,31 @@ enum Builtin {
     GreaterThan,
     Equal,
     LessEqual,
+    Eq,
+    EqualPred,
     Not,
+    Abs,
+    Modulo,
+    Remainder,
+    Quotient,
+    Min,
+    Max,
+    Expt,
+    ZeroPred,
+    PositivePred,
+    NegativePred,
+    OddPred,
+    EvenPred,
     Cons,
     Car,
     Cdr,
     Null,
     List,
+    ListRef,
+    ListTail,
+    ListPred,
+    Assoc,
+    Map,
     Apply,
     CallCc,
     Length,
@@ -229,7 +251,18 @@ enum Builtin {
     SymbolToString,
     StringToSymbol,
     StringRef,
+    StringEqual,
+    StringLessThan,
+    StringCiEqual,
+    StringUpcase,
+    StringDowncase,
     CharPred,
+    CharAlphabeticPred,
+    CharNumericPred,
+    CharUpcase,
+    CharDowncase,
+    CharEqual,
+    CharLessThan,
     StringPred,
     NumberPred,
     BooleanPred,
@@ -238,7 +271,7 @@ enum Builtin {
 }
 
 impl Builtin {
-    const ALL: [Self; 36] = [
+    const ALL: &'static [Self] = &[
         Self::Add,
         Self::Sub,
         Self::Mul,
@@ -247,12 +280,31 @@ impl Builtin {
         Self::GreaterThan,
         Self::Equal,
         Self::LessEqual,
+        Self::Eq,
+        Self::EqualPred,
         Self::Not,
+        Self::Abs,
+        Self::Modulo,
+        Self::Remainder,
+        Self::Quotient,
+        Self::Min,
+        Self::Max,
+        Self::Expt,
+        Self::ZeroPred,
+        Self::PositivePred,
+        Self::NegativePred,
+        Self::OddPred,
+        Self::EvenPred,
         Self::Cons,
         Self::Car,
         Self::Cdr,
         Self::Null,
         Self::List,
+        Self::ListRef,
+        Self::ListTail,
+        Self::ListPred,
+        Self::Assoc,
+        Self::Map,
         Self::Apply,
         Self::CallCc,
         Self::Length,
@@ -269,7 +321,18 @@ impl Builtin {
         Self::SymbolToString,
         Self::StringToSymbol,
         Self::StringRef,
+        Self::StringEqual,
+        Self::StringLessThan,
+        Self::StringCiEqual,
+        Self::StringUpcase,
+        Self::StringDowncase,
         Self::CharPred,
+        Self::CharAlphabeticPred,
+        Self::CharNumericPred,
+        Self::CharUpcase,
+        Self::CharDowncase,
+        Self::CharEqual,
+        Self::CharLessThan,
         Self::StringPred,
         Self::NumberPred,
         Self::BooleanPred,
@@ -287,12 +350,31 @@ impl Builtin {
             Self::GreaterThan => ">",
             Self::Equal => "=",
             Self::LessEqual => "<=",
+            Self::Eq => "eq?",
+            Self::EqualPred => "equal?",
             Self::Not => "not",
+            Self::Abs => "abs",
+            Self::Modulo => "modulo",
+            Self::Remainder => "remainder",
+            Self::Quotient => "quotient",
+            Self::Min => "min",
+            Self::Max => "max",
+            Self::Expt => "expt",
+            Self::ZeroPred => "zero?",
+            Self::PositivePred => "positive?",
+            Self::NegativePred => "negative?",
+            Self::OddPred => "odd?",
+            Self::EvenPred => "even?",
             Self::Cons => "cons",
             Self::Car => "car",
             Self::Cdr => "cdr",
             Self::Null => "null?",
             Self::List => "list",
+            Self::ListRef => "list-ref",
+            Self::ListTail => "list-tail",
+            Self::ListPred => "list?",
+            Self::Assoc => "assoc",
+            Self::Map => "map",
             Self::Apply => "apply",
             Self::CallCc => "call/cc",
             Self::Length => "length",
@@ -309,7 +391,18 @@ impl Builtin {
             Self::SymbolToString => "symbol->string",
             Self::StringToSymbol => "string->symbol",
             Self::StringRef => "string-ref",
+            Self::StringEqual => "string=?",
+            Self::StringLessThan => "string<?",
+            Self::StringCiEqual => "string-ci=?",
+            Self::StringUpcase => "string-upcase",
+            Self::StringDowncase => "string-downcase",
             Self::CharPred => "char?",
+            Self::CharAlphabeticPred => "char-alphabetic?",
+            Self::CharNumericPred => "char-numeric?",
+            Self::CharUpcase => "char-upcase",
+            Self::CharDowncase => "char-downcase",
+            Self::CharEqual => "char=?",
+            Self::CharLessThan => "char<?",
             Self::StringPred => "string?",
             Self::NumberPred => "number?",
             Self::BooleanPred => "boolean?",
@@ -336,13 +429,11 @@ impl Env {
 
         {
             let mut bindings = env.borrow_mut();
-            for builtin in Builtin::ALL {
-                bindings
-                    .bindings
-                    .insert(
-                        builtin.name().to_string(),
-                        Rc::new(RefCell::new(Value::Builtin(builtin))),
-                    );
+            for builtin in Builtin::ALL.iter().copied() {
+                bindings.bindings.insert(
+                    builtin.name().to_string(),
+                    Rc::new(RefCell::new(Value::Builtin(builtin))),
+                );
             }
         }
 
@@ -590,10 +681,8 @@ fn run_machine(exprs: &[Expr], env: EnvRef, ctx: &mut EvalContext) -> Result<Val
                         })?;
                         (MachineControl::Value(value), cont)
                     }
-                    ExprKind::List(items) => {
-                        schedule_list_eval(items, expr.pos, env, cont, ctx)
-                            .map_err(|err| err.with_position(expr.pos))?
-                    }
+                    ExprKind::List(items) => schedule_list_eval(items, expr.pos, env, cont, ctx)
+                        .map_err(|err| err.with_position(expr.pos))?,
                 };
 
                 control = next_control;
@@ -615,8 +704,9 @@ fn run_machine(exprs: &[Expr], env: EnvRef, ctx: &mut EvalContext) -> Result<Val
                 }
                 Value::Builtin(Builtin::CallCc) => {
                     if args.len() != 1 {
-                        return Err(wrong_arg_count("call/cc", "exactly 1", args.len())
-                            .with_position(pos));
+                        return Err(
+                            wrong_arg_count("call/cc", "exactly 1", args.len()).with_position(pos)
+                        );
                     }
 
                     let resume = cont.clone();
@@ -629,8 +719,9 @@ fn run_machine(exprs: &[Expr], env: EnvRef, ctx: &mut EvalContext) -> Result<Val
                     cont = Rc::new(MachineContinuation::CallCcReturn { resume, suspend });
                 }
                 Value::Builtin(builtin) => {
-                    let value = apply_builtin(builtin, &args, ctx)
-                        .map_err(|err| err.with_position(pos))?;
+                    let value =
+                        resolve_tail_outcome(dispatch_builtin_call(builtin, args, pos, ctx)?, ctx)
+                            .map_err(|err| err.with_position(pos))?;
                     control = MachineControl::Value(value);
                 }
                 Value::Procedure(procedure) => {
@@ -905,13 +996,9 @@ fn run_machine(exprs: &[Expr], env: EnvRef, ctx: &mut EvalContext) -> Result<Val
                             cont = next_cont;
                         }
                     } else {
-                        let (next_control, next_cont) = schedule_cond(
-                            clauses.as_ref(),
-                            index + 1,
-                            env.clone(),
-                            next.clone(),
-                        )
-                        .map_err(|err| err.with_position(clause.pos))?;
+                        let (next_control, next_cont) =
+                            schedule_cond(clauses.as_ref(), index + 1, env.clone(), next.clone())
+                                .map_err(|err| err.with_position(clause.pos))?;
                         control = next_control;
                         cont = next_cont;
                     }
@@ -948,9 +1035,7 @@ fn find_enclosing_procedure_caller(cont: &ContinuationRef) -> Option<Continuatio
     match cont.as_ref() {
         MachineContinuation::Halt => None,
         MachineContinuation::ProcedureReturn { next } => Some(next.clone()),
-        MachineContinuation::CallCcReturn { resume, .. } => {
-            find_enclosing_procedure_caller(resume)
-        }
+        MachineContinuation::CallCcReturn { resume, .. } => find_enclosing_procedure_caller(resume),
         MachineContinuation::Sequence { next, .. }
         | MachineContinuation::If { next, .. }
         | MachineContinuation::And { next, .. }
@@ -1235,12 +1320,14 @@ fn schedule_cond(
     };
 
     let ExprKind::List(items) = &clause.kind else {
-        return Err(EvalError::Syntax("cond clauses must be lists".into())
-            .with_position(clause.pos));
+        return Err(
+            EvalError::Syntax("cond clauses must be lists".into()).with_position(clause.pos)
+        );
     };
     let Some((test, body)) = items.split_first() else {
-        return Err(EvalError::Syntax("cond clauses cannot be empty".into())
-            .with_position(clause.pos));
+        return Err(
+            EvalError::Syntax("cond clauses cannot be empty".into()).with_position(clause.pos)
+        );
     };
 
     match &test.kind {
@@ -1789,23 +1876,33 @@ fn parse_define_syntax(args: &[Expr], env: EnvRef) -> Result<(String, MacroDefin
 
     let name = expect_symbol(&args[0], "macro name")?;
     let ExprKind::List(items) = &args[1].kind else {
-        return Err(EvalError::Syntax("define-syntax requires a syntax-rules form".into()));
+        return Err(EvalError::Syntax(
+            "define-syntax requires a syntax-rules form".into(),
+        ));
     };
 
     let Some((keyword, rest)) = items.split_first() else {
-        return Err(EvalError::Syntax("define-syntax requires a syntax-rules form".into()));
+        return Err(EvalError::Syntax(
+            "define-syntax requires a syntax-rules form".into(),
+        ));
     };
 
     let keyword = expect_symbol(keyword, "syntax-rules keyword")?;
     if keyword != "syntax-rules" {
-        return Err(EvalError::Syntax("define-syntax requires syntax-rules".into()));
+        return Err(EvalError::Syntax(
+            "define-syntax requires syntax-rules".into(),
+        ));
     }
 
     let Some((literals_expr, rule_exprs)) = rest.split_first() else {
-        return Err(EvalError::Syntax("syntax-rules requires literals and at least one rule".into()));
+        return Err(EvalError::Syntax(
+            "syntax-rules requires literals and at least one rule".into(),
+        ));
     };
     if rule_exprs.is_empty() {
-        return Err(EvalError::Syntax("syntax-rules requires at least one rule".into()));
+        return Err(EvalError::Syntax(
+            "syntax-rules requires at least one rule".into(),
+        ));
     }
 
     let literals = parse_syntax_rule_literals(literals_expr)?;
@@ -1839,18 +1936,26 @@ fn parse_syntax_rule_literals(expr: &Expr) -> Result<HashSet<String>, EvalError>
 
 fn parse_macro_rule(expr: &Expr, macro_name: &str) -> Result<MacroRule, EvalError> {
     let ExprKind::List(items) = &expr.kind else {
-        return Err(EvalError::Syntax("syntax-rules clause must be a (pattern template) pair".into()));
+        return Err(EvalError::Syntax(
+            "syntax-rules clause must be a (pattern template) pair".into(),
+        ));
     };
 
     if items.len() != 2 {
-        return Err(EvalError::Syntax("syntax-rules clause must be a (pattern template) pair".into()));
+        return Err(EvalError::Syntax(
+            "syntax-rules clause must be a (pattern template) pair".into(),
+        ));
     }
 
     let ExprKind::List(pattern_items) = &items[0].kind else {
-        return Err(EvalError::Syntax("syntax-rules pattern must be a list".into()));
+        return Err(EvalError::Syntax(
+            "syntax-rules pattern must be a list".into(),
+        ));
     };
     let Some((head, pattern_args)) = pattern_items.split_first() else {
-        return Err(EvalError::Syntax("syntax-rules pattern cannot be empty".into()));
+        return Err(EvalError::Syntax(
+            "syntax-rules pattern cannot be empty".into(),
+        ));
     };
 
     let head = expect_symbol(head, "syntax-rules pattern head")?;
@@ -1903,7 +2008,9 @@ fn expand_macro_invocation(
             .map_err(|err| err.with_position(pos));
     }
 
-    Err(EvalError::Syntax("macro invocation did not match any syntax-rules pattern".into()))
+    Err(EvalError::Syntax(
+        "macro invocation did not match any syntax-rules pattern".into(),
+    ))
 }
 
 fn match_macro_rule(
@@ -2114,11 +2221,18 @@ fn expand_template_node(
     repetition_index: Option<usize>,
 ) -> Result<SyntaxExpr, EvalError> {
     match &template.kind {
-        ExprKind::Bool(value) => Ok(SyntaxExpr::generated(SyntaxExprKind::Bool(*value), template.pos)),
-        ExprKind::Number(value) => {
-            Ok(SyntaxExpr::generated(SyntaxExprKind::Number(*value), template.pos))
-        }
-        ExprKind::Char(value) => Ok(SyntaxExpr::generated(SyntaxExprKind::Char(*value), template.pos)),
+        ExprKind::Bool(value) => Ok(SyntaxExpr::generated(
+            SyntaxExprKind::Bool(*value),
+            template.pos,
+        )),
+        ExprKind::Number(value) => Ok(SyntaxExpr::generated(
+            SyntaxExprKind::Number(*value),
+            template.pos,
+        )),
+        ExprKind::Char(value) => Ok(SyntaxExpr::generated(
+            SyntaxExprKind::Char(*value),
+            template.pos,
+        )),
         ExprKind::String(value) => Ok(SyntaxExpr::generated(
             SyntaxExprKind::String(value.clone()),
             template.pos,
@@ -2132,7 +2246,9 @@ fn expand_template_node(
                     ));
                 };
                 let expr = values.get(index).ok_or_else(|| {
-                    EvalError::Syntax("ellipsis repetition index out of bounds during macro expansion".into())
+                    EvalError::Syntax(
+                        "ellipsis repetition index out of bounds during macro expansion".into(),
+                    )
                 })?;
                 Ok(SyntaxExpr::raw(expr.clone()))
             }
@@ -2167,7 +2283,10 @@ fn expand_template_node(
                 }
             }
 
-            Ok(SyntaxExpr::generated(SyntaxExprKind::List(expanded), template.pos))
+            Ok(SyntaxExpr::generated(
+                SyntaxExprKind::List(expanded),
+                template.pos,
+            ))
         }
     }
 }
@@ -2267,9 +2386,7 @@ fn lower_macro_syntax_with_state(
         SyntaxExprKind::Bool(value) => Ok(Expr::new(ExprKind::Bool(*value), syntax.pos)),
         SyntaxExprKind::Number(value) => Ok(Expr::new(ExprKind::Number(*value), syntax.pos)),
         SyntaxExprKind::Char(value) => Ok(Expr::new(ExprKind::Char(*value), syntax.pos)),
-        SyntaxExprKind::String(value) => {
-            Ok(Expr::new(ExprKind::String(value.clone()), syntax.pos))
-        }
+        SyntaxExprKind::String(value) => Ok(Expr::new(ExprKind::String(value.clone()), syntax.pos)),
         SyntaxExprKind::Symbol(name) => lower_generated_symbol(name, syntax.pos, quote_mode, state),
         SyntaxExprKind::List(items) => lower_generated_list(items, syntax.pos, quote_mode, state),
     }
@@ -2371,7 +2488,11 @@ fn lower_let_form(
         binding_index = 2;
     }
 
-    lowered.push(lower_let_bindings(&items[binding_index], state, &mut scope)?);
+    lowered.push(lower_let_bindings(
+        &items[binding_index],
+        state,
+        &mut scope,
+    )?);
 
     state.renamed_bindings.push(scope);
     for body_expr in &items[binding_index + 1..] {
@@ -2678,6 +2799,9 @@ fn dispatch_builtin_call(
                 expand_apply_args(&args).map_err(|err| err.with_position(pos))?;
             dispatch_call(function, applied_args, pos, ctx)
         }
+        Builtin::Map => apply_map_builtin(&args, pos, ctx)
+            .map(TailOutcome::Value)
+            .map_err(|err| err.with_position(pos)),
         _ => apply_builtin(builtin, &args, ctx)
             .map(TailOutcome::Value)
             .map_err(|err| err.with_position(pos)),
@@ -2804,49 +2928,101 @@ fn apply_builtin(
         Builtin::GreaterThan => compare_numbers(name, args, |left, right| left > right),
         Builtin::Equal => compare_numbers(name, args, |left, right| left == right),
         Builtin::LessEqual => compare_numbers(name, args, |left, right| left <= right),
+        Builtin::Eq | Builtin::EqualPred => compare_values_builtin(name, args),
         Builtin::Not => {
             if args.len() != 1 {
                 return Err(wrong_arg_count(name, "exactly 1", args.len()));
             }
             Ok(Value::Bool(!args[0].is_truthy()))
         }
+        Builtin::Abs => {
+            if args.len() != 1 {
+                return Err(wrong_arg_count(name, "exactly 1", args.len()));
+            }
+
+            let number = expect_number_value(name, &args[0])?;
+            let abs = number.checked_abs().ok_or(EvalError::IntegerOverflow)?;
+            Ok(Value::Number(abs))
+        }
+        Builtin::Modulo => {
+            let [dividend, divisor] = expect_exact_numbers(name, args)?;
+            Ok(Value::Number(integer_modulo(dividend, divisor)?))
+        }
+        Builtin::Remainder => {
+            let [dividend, divisor] = expect_exact_numbers(name, args)?;
+            Ok(Value::Number(integer_remainder(dividend, divisor)?))
+        }
+        Builtin::Quotient => {
+            let [dividend, divisor] = expect_exact_numbers(name, args)?;
+            Ok(Value::Number(integer_quotient(dividend, divisor)?))
+        }
+        Builtin::Min => fold_numeric_extrema(name, args, i64::min),
+        Builtin::Max => fold_numeric_extrema(name, args, i64::max),
+        Builtin::Expt => {
+            let [base, exponent] = expect_exact_numbers(name, args)?;
+            Ok(Value::Number(integer_expt(base, exponent)?))
+        }
+        Builtin::ZeroPred => unary_number_predicate(name, args, |value| value == 0),
+        Builtin::PositivePred => unary_number_predicate(name, args, |value| value > 0),
+        Builtin::NegativePred => unary_number_predicate(name, args, |value| value < 0),
+        Builtin::OddPred => unary_number_predicate(name, args, |value| value % 2 != 0),
+        Builtin::EvenPred => unary_number_predicate(name, args, |value| value % 2 == 0),
         Builtin::Cons => {
             if args.len() != 2 {
                 return Err(wrong_arg_count(name, "exactly 2", args.len()));
             }
 
-            let list = expect_list_value(name, &args[1])?;
-            let mut items = Vec::with_capacity(list.len() + 1);
-            items.push(args[0].clone());
-            items.extend(list.iter().cloned());
-            Ok(Value::List(items))
+            match &args[1] {
+                Value::List(list) => {
+                    let mut items = Vec::with_capacity(list.len() + 1);
+                    items.push(args[0].clone());
+                    items.extend(list.iter().cloned());
+                    Ok(Value::List(items))
+                }
+                other => Ok(Value::Pair(Box::new((args[0].clone(), other.clone())))),
+            }
         }
         Builtin::Car => {
             if args.len() != 1 {
                 return Err(wrong_arg_count(name, "exactly 1", args.len()));
             }
 
-            let list = expect_list_value(name, &args[0])?;
-            list.first()
-                .cloned()
-                .ok_or_else(|| EvalError::TypeMismatch {
-                    expected: "non-empty list for car".into(),
-                    found: "empty list".into(),
-                })
+            match &args[0] {
+                Value::List(list) => list
+                    .first()
+                    .cloned()
+                    .ok_or_else(|| EvalError::TypeMismatch {
+                        expected: "non-empty pair for car".into(),
+                        found: "empty list".into(),
+                    }),
+                Value::Pair(pair) => Ok(pair.0.clone()),
+                other => Err(EvalError::TypeMismatch {
+                    expected: "pair for car".into(),
+                    found: other.type_name().to_string(),
+                }),
+            }
         }
         Builtin::Cdr => {
             if args.len() != 1 {
                 return Err(wrong_arg_count(name, "exactly 1", args.len()));
             }
 
-            let list = expect_list_value(name, &args[0])?;
-            if list.is_empty() {
-                return Err(EvalError::TypeMismatch {
-                    expected: "non-empty list for cdr".into(),
-                    found: "empty list".into(),
-                });
+            match &args[0] {
+                Value::List(list) => {
+                    if list.is_empty() {
+                        return Err(EvalError::TypeMismatch {
+                            expected: "non-empty pair for cdr".into(),
+                            found: "empty list".into(),
+                        });
+                    }
+                    Ok(Value::List(list[1..].to_vec()))
+                }
+                Value::Pair(pair) => Ok(pair.1.clone()),
+                other => Err(EvalError::TypeMismatch {
+                    expected: "pair for cdr".into(),
+                    found: other.type_name().to_string(),
+                }),
             }
-            Ok(Value::List(list[1..].to_vec()))
         }
         Builtin::Null => {
             if args.len() != 1 {
@@ -2857,6 +3033,17 @@ fn apply_builtin(
             ))
         }
         Builtin::List => Ok(Value::List(args.to_vec())),
+        Builtin::ListRef => {
+            let (list, index) = expect_list_and_index(name, args)?;
+            Ok(list[index].clone())
+        }
+        Builtin::ListTail => {
+            let (list, index) = expect_list_and_tail_index(name, args)?;
+            Ok(Value::List(list[index..].to_vec()))
+        }
+        Builtin::ListPred => unary_predicate(name, args, |value| matches!(value, Value::List(_))),
+        Builtin::Assoc => assoc_builtin(name, args),
+        Builtin::Map => unreachable!("map is handled by dispatch_builtin_call"),
         Builtin::Apply => unreachable!("apply is handled by dispatch_builtin_call"),
         Builtin::CallCc => unreachable!("call/cc is handled by the machine runtime"),
         Builtin::Length => {
@@ -3028,7 +3215,50 @@ fn apply_builtin(
                 })?;
             Ok(Value::Char(ch))
         }
+        Builtin::StringEqual => compare_strings(name, args, |left, right| left == right),
+        Builtin::StringLessThan => compare_strings(name, args, |left, right| left < right),
+        Builtin::StringCiEqual => compare_strings(name, args, |left, right| {
+            left.to_lowercase() == right.to_lowercase()
+        }),
+        Builtin::StringUpcase => {
+            if args.len() != 1 {
+                return Err(wrong_arg_count(name, "exactly 1", args.len()));
+            }
+
+            let string = expect_string_value(name, &args[0])?;
+            let upper = string.borrow().to_uppercase();
+            Ok(Value::string(upper))
+        }
+        Builtin::StringDowncase => {
+            if args.len() != 1 {
+                return Err(wrong_arg_count(name, "exactly 1", args.len()));
+            }
+
+            let string = expect_string_value(name, &args[0])?;
+            let lower = string.borrow().to_lowercase();
+            Ok(Value::string(lower))
+        }
         Builtin::CharPred => unary_predicate(name, args, |value| matches!(value, Value::Char(_))),
+        Builtin::CharAlphabeticPred => unary_char_predicate(name, args, |ch| ch.is_alphabetic()),
+        Builtin::CharNumericPred => unary_char_predicate(name, args, |ch| ch.is_numeric()),
+        Builtin::CharUpcase => {
+            if args.len() != 1 {
+                return Err(wrong_arg_count(name, "exactly 1", args.len()));
+            }
+
+            let ch = expect_char_value(name, &args[0])?;
+            Ok(Value::Char(ch.to_uppercase().next().unwrap_or(ch)))
+        }
+        Builtin::CharDowncase => {
+            if args.len() != 1 {
+                return Err(wrong_arg_count(name, "exactly 1", args.len()));
+            }
+
+            let ch = expect_char_value(name, &args[0])?;
+            Ok(Value::Char(ch.to_lowercase().next().unwrap_or(ch)))
+        }
+        Builtin::CharEqual => compare_chars(name, args, |left, right| left == right),
+        Builtin::CharLessThan => compare_chars(name, args, |left, right| left < right),
         Builtin::StringPred => {
             unary_predicate(name, args, |value| matches!(value, Value::String(_)))
         }
@@ -3038,11 +3268,10 @@ fn apply_builtin(
         Builtin::BooleanPred => {
             unary_predicate(name, args, |value| matches!(value, Value::Bool(_)))
         }
-        Builtin::PairPred => unary_predicate(
-            name,
-            args,
-            |value| matches!(value, Value::List(items) if !items.is_empty()),
-        ),
+        Builtin::PairPred => unary_predicate(name, args, |value| {
+            matches!(value, Value::List(items) if !items.is_empty())
+                || matches!(value, Value::Pair(_))
+        }),
         Builtin::SymbolPred => {
             unary_predicate(name, args, |value| matches!(value, Value::Symbol(_)))
         }
@@ -3063,10 +3292,159 @@ fn compare_numbers(
     Ok(Value::Bool(is_true))
 }
 
+fn compare_values_builtin(name: &str, args: &[Value]) -> Result<Value, EvalError> {
+    if args.len() != 2 {
+        return Err(wrong_arg_count(name, "exactly 2", args.len()));
+    }
+
+    Ok(Value::Bool(values_equal(&args[0], &args[1])))
+}
+
+fn fold_numeric_extrema(
+    name: &str,
+    args: &[Value],
+    chooser: impl Fn(i64, i64) -> i64,
+) -> Result<Value, EvalError> {
+    let numbers = expect_numbers(name, args)?;
+    let Some((first, rest)) = numbers.split_first() else {
+        return Err(wrong_arg_count(name, "at least 1", args.len()));
+    };
+
+    let result = rest
+        .iter()
+        .fold(*first, |current, value| chooser(current, *value));
+    Ok(Value::Number(result))
+}
+
+fn expect_exact_numbers<const N: usize>(name: &str, args: &[Value]) -> Result<[i64; N], EvalError> {
+    if args.len() != N {
+        return Err(wrong_arg_count(name, &format!("exactly {N}"), args.len()));
+    }
+
+    expect_numbers(name, args)?
+        .try_into()
+        .map_err(|_| unreachable!("checked exact argument count"))
+}
+
+fn integer_quotient(dividend: i64, divisor: i64) -> Result<i64, EvalError> {
+    if divisor == 0 {
+        return Err(EvalError::DivisionByZero);
+    }
+
+    dividend
+        .checked_div(divisor)
+        .ok_or(EvalError::IntegerOverflow)
+}
+
+fn integer_remainder(dividend: i64, divisor: i64) -> Result<i64, EvalError> {
+    if divisor == 0 {
+        return Err(EvalError::DivisionByZero);
+    }
+
+    dividend
+        .checked_rem(divisor)
+        .ok_or(EvalError::IntegerOverflow)
+}
+
+fn integer_modulo(dividend: i64, divisor: i64) -> Result<i64, EvalError> {
+    let remainder = integer_remainder(dividend, divisor)?;
+    if remainder != 0 && (remainder > 0) != (divisor > 0) {
+        remainder
+            .checked_add(divisor)
+            .ok_or(EvalError::IntegerOverflow)
+    } else {
+        Ok(remainder)
+    }
+}
+
+fn integer_expt(base: i64, exponent: i64) -> Result<i64, EvalError> {
+    if exponent < 0 {
+        return Err(EvalError::InvalidArgument(
+            "expt requires a non-negative exponent".into(),
+        ));
+    }
+
+    let mut result = 1_i64;
+    let mut factor = base;
+    let mut exp = exponent;
+
+    while exp > 0 {
+        if exp % 2 == 1 {
+            result = result
+                .checked_mul(factor)
+                .ok_or(EvalError::IntegerOverflow)?;
+        }
+        exp /= 2;
+        if exp > 0 {
+            factor = factor
+                .checked_mul(factor)
+                .ok_or(EvalError::IntegerOverflow)?;
+        }
+    }
+
+    Ok(result)
+}
+
 fn expect_numbers(name: &str, args: &[Value]) -> Result<Vec<i64>, EvalError> {
     args.iter()
         .map(|value| expect_number_value(name, value))
         .collect()
+}
+
+fn unary_number_predicate(
+    name: &str,
+    args: &[Value],
+    predicate: impl Fn(i64) -> bool,
+) -> Result<Value, EvalError> {
+    if args.len() != 1 {
+        return Err(wrong_arg_count(name, "exactly 1", args.len()));
+    }
+
+    Ok(Value::Bool(predicate(expect_number_value(name, &args[0])?)))
+}
+
+fn compare_chars(
+    name: &str,
+    args: &[Value],
+    predicate: impl Fn(char, char) -> bool,
+) -> Result<Value, EvalError> {
+    if args.len() < 2 {
+        return Err(wrong_arg_count(name, "at least 2", args.len()));
+    }
+
+    let chars = args
+        .iter()
+        .map(|value| expect_char_value(name, value))
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(Value::Bool(
+        chars.windows(2).all(|pair| predicate(pair[0], pair[1])),
+    ))
+}
+
+fn compare_strings(
+    name: &str,
+    args: &[Value],
+    predicate: impl Fn(&str, &str) -> bool,
+) -> Result<Value, EvalError> {
+    if args.len() < 2 {
+        return Err(wrong_arg_count(name, "at least 2", args.len()));
+    }
+
+    let strings = args
+        .iter()
+        .map(|value| expect_string_value(name, value))
+        .collect::<Result<Vec<_>, _>>()?;
+    let mut previous = strings[0].borrow().clone();
+
+    for string in strings.iter().skip(1) {
+        let current = string.borrow().clone();
+        if !predicate(previous.as_str(), current.as_str()) {
+            return Ok(Value::Bool(false));
+        }
+        previous = current;
+    }
+
+    Ok(Value::Bool(true))
 }
 
 fn expect_list_value<'a>(name: &str, value: &'a Value) -> Result<&'a [Value], EvalError> {
@@ -3079,6 +3457,114 @@ fn expect_list_value<'a>(name: &str, value: &'a Value) -> Result<&'a [Value], Ev
     }
 }
 
+fn expect_list_and_index<'a>(
+    name: &str,
+    args: &'a [Value],
+) -> Result<(&'a [Value], usize), EvalError> {
+    if args.len() != 2 {
+        return Err(wrong_arg_count(name, "exactly 2", args.len()));
+    }
+
+    let list = expect_list_value(name, &args[0])?;
+    let index = expect_number_value(name, &args[1])?;
+    let len = list.len();
+
+    if index < 0 {
+        return Err(EvalError::IndexOutOfBounds { index, len });
+    }
+
+    let index = usize::try_from(index).map_err(|_| EvalError::IntegerOverflow)?;
+    if index >= len {
+        return Err(EvalError::IndexOutOfBounds {
+            index: i64::try_from(index).map_err(|_| EvalError::IntegerOverflow)?,
+            len,
+        });
+    }
+
+    Ok((list, index))
+}
+
+fn expect_list_and_tail_index<'a>(
+    name: &str,
+    args: &'a [Value],
+) -> Result<(&'a [Value], usize), EvalError> {
+    if args.len() != 2 {
+        return Err(wrong_arg_count(name, "exactly 2", args.len()));
+    }
+
+    let list = expect_list_value(name, &args[0])?;
+    let index = expect_number_value(name, &args[1])?;
+    let len = list.len();
+
+    if index < 0 {
+        return Err(EvalError::IndexOutOfBounds { index, len });
+    }
+
+    let index = usize::try_from(index).map_err(|_| EvalError::IntegerOverflow)?;
+    if index > len {
+        return Err(EvalError::IndexOutOfBounds {
+            index: i64::try_from(index).map_err(|_| EvalError::IntegerOverflow)?,
+            len,
+        });
+    }
+
+    Ok((list, index))
+}
+
+fn assoc_builtin(name: &str, args: &[Value]) -> Result<Value, EvalError> {
+    if args.len() != 2 {
+        return Err(wrong_arg_count(name, "exactly 2", args.len()));
+    }
+
+    let key = &args[0];
+    let alist = expect_list_value(name, &args[1])?;
+    for entry in alist {
+        match entry {
+            Value::List(items) if !items.is_empty() => {
+                if values_equal(key, &items[0]) {
+                    return Ok(entry.clone());
+                }
+            }
+            Value::Pair(pair) => {
+                if values_equal(key, &pair.0) {
+                    return Ok(entry.clone());
+                }
+            }
+            _ => {}
+        }
+    }
+
+    Ok(Value::Bool(false))
+}
+
+fn apply_map_builtin(
+    args: &[Value],
+    pos: SourcePos,
+    ctx: &mut EvalContext,
+) -> Result<Value, EvalError> {
+    if args.len() < 2 {
+        return Err(wrong_arg_count("map", "at least 2", args.len()));
+    }
+
+    let function = args[0].clone();
+    let lists = args[1..]
+        .iter()
+        .map(|value| expect_list_value("map", value))
+        .collect::<Result<Vec<_>, _>>()?;
+    let min_len = lists.iter().map(|list| list.len()).min().unwrap_or(0);
+    let mut result = Vec::with_capacity(min_len);
+
+    for index in 0..min_len {
+        let element_args = lists
+            .iter()
+            .map(|list| list[index].clone())
+            .collect::<Vec<_>>();
+        result.push(apply(function.clone(), &element_args, pos, ctx)?);
+    }
+
+    Ok(Value::List(result))
+}
+
 fn unary_predicate(
     name: &str,
     args: &[Value],
@@ -3089,6 +3575,18 @@ fn unary_predicate(
     }
 
     Ok(Value::Bool(predicate(&args[0])))
+}
+
+fn unary_char_predicate(
+    name: &str,
+    args: &[Value],
+    predicate: impl Fn(char) -> bool,
+) -> Result<Value, EvalError> {
+    if args.len() != 1 {
+        return Err(wrong_arg_count(name, "exactly 1", args.len()));
+    }
+
+    Ok(Value::Bool(predicate(expect_char_value(name, &args[0])?)))
 }
 
 fn expect_number_value(name: &str, value: &Value) -> Result<i64, EvalError> {
@@ -3131,6 +3629,33 @@ fn expect_symbol_value<'a>(name: &str, value: &'a Value) -> Result<&'a str, Eval
     }
 }
 
+fn values_equal(left: &Value, right: &Value) -> bool {
+    match (left, right) {
+        (Value::Bool(left), Value::Bool(right)) => left == right,
+        (Value::Number(left), Value::Number(right)) => left == right,
+        (Value::String(left), Value::String(right)) => {
+            left.borrow().as_str() == right.borrow().as_str()
+        }
+        (Value::Char(left), Value::Char(right)) => left == right,
+        (Value::Symbol(left), Value::Symbol(right)) => left == right,
+        (Value::List(left), Value::List(right)) => {
+            left.len() == right.len()
+                && left
+                    .iter()
+                    .zip(right.iter())
+                    .all(|(left, right)| values_equal(left, right))
+        }
+        (Value::Pair(left), Value::Pair(right)) => {
+            values_equal(&left.0, &right.0) && values_equal(&left.1, &right.1)
+        }
+        (Value::Builtin(left), Value::Builtin(right)) => left == right,
+        (Value::Procedure(left), Value::Procedure(right)) => Rc::ptr_eq(left, right),
+        (Value::Continuation(left), Value::Continuation(right)) => Rc::ptr_eq(left, right),
+        (Value::Void, Value::Void) => true,
+        _ => false,
+    }
+}
+
 fn wrong_arg_count(name: &str, expected: &str, got: usize) -> EvalError {
     EvalError::WrongArgumentCount {
         name: name.to_string(),
@@ -3159,6 +3684,28 @@ fn render_char(ch: char) -> String {
         ' ' => "#\\space".to_string(),
         '\n' => "#\\newline".to_string(),
         _ => format!("#\\{ch}"),
+    }
+}
+
+fn render_pair(car: &Value, cdr: &Value, mode: RenderMode) -> String {
+    let mut rendered = vec![car.render(mode)];
+    let mut tail = cdr;
+
+    loop {
+        match tail {
+            Value::List(items) => {
+                rendered.extend(items.iter().map(|item| item.render(mode)));
+                return format!("({})", rendered.join(" "));
+            }
+            Value::Pair(pair) => {
+                rendered.push(pair.0.render(mode));
+                tail = &pair.1;
+            }
+            other => {
+                let prefix = rendered.join(" ");
+                return format!("({prefix} . {})", other.render(mode));
+            }
+        }
     }
 }
 

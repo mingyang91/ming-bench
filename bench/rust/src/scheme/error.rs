@@ -52,6 +52,8 @@ pub enum EvalError {
     IndexOutOfBounds { index: i64, len: usize },
     #[error("invalid range: start {start}, end {end}, length {len}")]
     InvalidRange { start: i64, end: i64, len: usize },
+    #[error("invalid argument: {0}")]
+    InvalidArgument(String),
     #[error("not a procedure: {0}")]
     NotAProcedure(String),
 }
