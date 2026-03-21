@@ -1,3 +1,4 @@
+mod builtins;
 pub mod error;
 
 pub use error::EvalError;
@@ -157,7 +158,7 @@ fn eval(expr: &Expr) -> Result<Value, EvalError> {
     }
 }
 
-/// Evaluate a list expression (function application).
+/// Evaluate a list expression (function application or special form).
 fn eval_list(items: &[Expr]) -> Result<Value, EvalError> {
     let [operator, args @ ..] = items else {
         return Err(EvalError::Parse {
@@ -169,75 +170,57 @@ fn eval_list(items: &[Expr]) -> Result<Value, EvalError> {
             message: "expected operator".to_string(),
         });
     };
-    let evaluated: Vec<Value> = args.iter().map(eval).collect::<Result<_, _>>()?;
-    apply_builtin(op, &evaluated)
+    match op.as_str() {
+        "and" => eval_and(args),
+        "or" => eval_or(args),
+        _ => {
+            let evaluated: Vec<Value> = args.iter().map(eval).collect::<Result<_, _>>()?;
+            apply_builtin(op, &evaluated)
+        }
+    }
 }
 
-/// Apply a built-in arithmetic operator.
+/// Apply a built-in operator.
 fn apply_builtin(op: &str, args: &[Value]) -> Result<Value, EvalError> {
     match op {
-        "+" => apply_add(args),
-        "-" => apply_sub(args),
-        "*" => apply_mul(args),
-        "/" => apply_div(args),
+        "+" => builtins::apply_add(args),
+        "-" => builtins::apply_sub(args),
+        "*" => builtins::apply_mul(args),
+        "/" => builtins::apply_div(args),
+        "<" => builtins::apply_compare(args, |a, b| a < b),
+        ">" => builtins::apply_compare(args, |a, b| a > b),
+        "=" => builtins::apply_compare(args, |a, b| a == b),
+        "<=" => builtins::apply_compare(args, |a, b| a <= b),
+        ">=" => builtins::apply_compare(args, |a, b| a >= b),
+        "not" => builtins::apply_not(args),
         _ => Err(EvalError::UnboundVariable {
             name: op.to_string(),
         }),
     }
 }
 
-fn require_integers(args: &[Value]) -> Result<Vec<i64>, EvalError> {
-    args.iter()
-        .map(|v| match v {
-            Value::Integer(n) => Ok(*n),
-            other => Err(EvalError::TypeError {
-                expected: "integer".to_string(),
-                got: format!("{other}"),
-            }),
-        })
-        .collect()
-}
-
-fn apply_add(args: &[Value]) -> Result<Value, EvalError> {
-    let nums = require_integers(args)?;
-    Ok(Value::Integer(nums.iter().sum()))
-}
-
-fn apply_sub(args: &[Value]) -> Result<Value, EvalError> {
-    let nums = require_integers(args)?;
-    let [first, rest @ ..] = nums.as_slice() else {
-        return Err(EvalError::WrongArgCount {
-            expected: 1,
-            got: 0,
-        });
-    };
-    if rest.is_empty() {
-        Ok(Value::Integer(-first))
-    } else {
-        Ok(Value::Integer(rest.iter().fold(*first, |acc, n| acc - n)))
-    }
-}
-
-fn apply_mul(args: &[Value]) -> Result<Value, EvalError> {
-    let nums = require_integers(args)?;
-    Ok(Value::Integer(nums.iter().product()))
-}
-
-fn apply_div(args: &[Value]) -> Result<Value, EvalError> {
-    let nums = require_integers(args)?;
-    let [first, rest @ ..] = nums.as_slice() else {
-        return Err(EvalError::WrongArgCount {
-            expected: 1,
-            got: 0,
-        });
-    };
-    rest.iter().try_fold(*first, |acc, &n| {
-        if n == 0 {
-            Err(EvalError::DivisionByZero)
-        } else {
-            Ok(acc / n)
+/// Short-circuit `and`: returns last truthy value, or first falsy value.
+fn eval_and(args: &[Expr]) -> Result<Value, EvalError> {
+    let mut result = Value::Boolean(true);
+    for arg in args {
+        result = eval(arg)?;
+        if result == Value::Boolean(false) {
+            return Ok(result);
         }
-    }).map(Value::Integer)
+    }
+    Ok(result)
+}
+
+/// Short-circuit `or`: returns first truthy value, or last falsy value.
+fn eval_or(args: &[Expr]) -> Result<Value, EvalError> {
+    let mut result = Value::Boolean(false);
+    for arg in args {
+        result = eval(arg)?;
+        if result != Value::Boolean(false) {
+            return Ok(result);
+        }
+    }
+    Ok(result)
 }
 
 /// Evaluate one or more Scheme expressions and return the string
