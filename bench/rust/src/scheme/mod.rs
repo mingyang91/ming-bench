@@ -37,6 +37,7 @@ enum Builtin {
     Mul,
     Div,
     Apply,
+    CallCc,
     LessThan,
     GreaterThan,
     Equal,
@@ -95,18 +96,8 @@ struct Environment {
 struct Procedure {
     params: Vec<String>,
     rest_param: Option<String>,
-    body: Vec<Expr>,
+    body: Rc<Vec<Expr>>,
     env: EnvRef,
-}
-
-#[derive(Debug)]
-enum TailOutcome {
-    Value(Value),
-    TailCall {
-        procedure: Rc<Procedure>,
-        args: Vec<Value>,
-        pos: SourcePos,
-    },
 }
 
 #[derive(Clone, Debug)]
@@ -144,7 +135,109 @@ enum Value {
     List(Vec<Value>),
     Builtin(Builtin),
     Procedure(Rc<Procedure>),
+    Continuation(Rc<Continuation>),
     Void,
+}
+
+#[derive(Clone, Debug)]
+enum Continuation {
+    Halt,
+    DefineValue {
+        name: String,
+        env: EnvRef,
+        next: Rc<Continuation>,
+    },
+    SetValue {
+        name: String,
+        pos: SourcePos,
+        env: EnvRef,
+        next: Rc<Continuation>,
+    },
+    If {
+        consequent: Expr,
+        alternate: Expr,
+        env: EnvRef,
+        next: Rc<Continuation>,
+    },
+    Sequence {
+        exprs: Rc<Vec<Expr>>,
+        index: usize,
+        env: EnvRef,
+        next: Rc<Continuation>,
+    },
+    And {
+        exprs: Rc<Vec<Expr>>,
+        index: usize,
+        env: EnvRef,
+        next: Rc<Continuation>,
+    },
+    Or {
+        exprs: Rc<Vec<Expr>>,
+        index: usize,
+        env: EnvRef,
+        next: Rc<Continuation>,
+    },
+    CondTest {
+        clauses: Rc<Vec<Expr>>,
+        next_index: usize,
+        body: Rc<Vec<Expr>>,
+        env: EnvRef,
+        next: Rc<Continuation>,
+    },
+    LetBinding {
+        bindings: Rc<Vec<(String, Expr)>>,
+        index: usize,
+        values: Vec<Value>,
+        body: Rc<Vec<Expr>>,
+        env: EnvRef,
+        next: Rc<Continuation>,
+    },
+    NamedLetBinding {
+        name: String,
+        bindings: Rc<Vec<(String, Expr)>>,
+        index: usize,
+        values: Vec<Value>,
+        body: Rc<Vec<Expr>>,
+        env: EnvRef,
+        pos: SourcePos,
+        next: Rc<Continuation>,
+    },
+    Operator {
+        arg_exprs: Rc<Vec<Expr>>,
+        env: EnvRef,
+        pos: SourcePos,
+        next: Rc<Continuation>,
+    },
+    Argument {
+        operator: Value,
+        args: Vec<Value>,
+        arg_exprs: Rc<Vec<Expr>>,
+        index: usize,
+        env: EnvRef,
+        pos: SourcePos,
+        next: Rc<Continuation>,
+    },
+    Map {
+        procedure: Value,
+        items: Rc<Vec<Value>>,
+        index: usize,
+        acc: Vec<Value>,
+        pos: SourcePos,
+        output: Rc<RefCell<String>>,
+        next: Rc<Continuation>,
+    },
+}
+
+enum MachineState {
+    Eval {
+        expr: Expr,
+        env: EnvRef,
+        cont: Rc<Continuation>,
+    },
+    Return {
+        value: Value,
+        cont: Rc<Continuation>,
+    },
 }
 
 impl Value {
@@ -156,7 +249,7 @@ impl Value {
             Self::Symbol(_) => "symbol",
             Self::Char(_) => "char",
             Self::List(_) => "list",
-            Self::Builtin(_) | Self::Procedure(_) => "procedure",
+            Self::Builtin(_) | Self::Procedure(_) | Self::Continuation(_) => "procedure",
             Self::Void => "void",
         }
     }
@@ -188,7 +281,7 @@ impl Value {
             Self::Symbol(value) => value.clone(),
             Self::Char(value) => render_char(*value, mode),
             Self::List(items) => render_list(items, mode),
-            Self::Builtin(_) | Self::Procedure(_) => "#<procedure>".into(),
+            Self::Builtin(_) | Self::Procedure(_) | Self::Continuation(_) => "#<procedure>".into(),
             Self::Void => "#<void>".into(),
         }
     }
@@ -539,14 +632,12 @@ fn eval_program(input: &str) -> Result<(Value, String), EvalError> {
     let mut parser = Parser::new(input);
     let exprs = parser.parse_program()?;
     let env = default_env();
-    let mut last_value = None;
-
-    for expr in exprs {
-        last_value = Some(eval_expr(&expr, &env)?);
-    }
-
-    let value = last_value
-        .ok_or_else(|| syntax_error(SourcePos { line: 1, col: 1 }, "expected expression"))?;
+    let value = run_machine(eval_sequence_state(
+        Rc::new(exprs),
+        0,
+        env.clone(),
+        Rc::new(Continuation::Halt),
+    ))?;
     let output = env.output.borrow().clone();
     Ok((value, output))
 }
@@ -566,6 +657,7 @@ fn default_env() -> EnvRef {
         ("*", Builtin::Mul),
         ("/", Builtin::Div),
         ("apply", Builtin::Apply),
+        ("call/cc", Builtin::CallCc),
         ("<", Builtin::LessThan),
         (">", Builtin::GreaterThan),
         ("=", Builtin::Equal),
@@ -609,214 +701,6 @@ fn default_env() -> EnvRef {
     env
 }
 
-fn eval_expr(expr: &Expr, env: &EnvRef) -> Result<Value, EvalError> {
-    match expr {
-        Expr::Int(value, _) => Ok(Value::Int(*value)),
-        Expr::Bool(value, _) => Ok(Value::Bool(*value)),
-        Expr::String(value, _) => Ok(Value::String(SchemeString::new(value.clone()))),
-        Expr::Char(value, _) => Ok(Value::Char(*value)),
-        Expr::Symbol(name, pos) => env
-            .lookup(name)
-            .ok_or_else(|| unbound_variable(*pos, name.clone())),
-        Expr::List(items, pos) => eval_list(items, *pos, env),
-    }
-}
-
-fn eval_list(items: &[Expr], list_pos: SourcePos, env: &EnvRef) -> Result<Value, EvalError> {
-    let Some(head) = items.first() else {
-        return Err(syntax_error(list_pos, "cannot evaluate empty list"));
-    };
-
-    if let Expr::Symbol(name, pos) = head {
-        match name.as_str() {
-            "define" => return eval_define(&items[1..], *pos, env),
-            "set!" => return eval_set(&items[1..], *pos, env),
-            "if" => return eval_if(&items[1..], *pos, env),
-            "quote" => return eval_quote(&items[1..], *pos),
-            "lambda" => return eval_lambda(&items[1..], *pos, env),
-            "and" => return eval_and(&items[1..], env),
-            "or" => return eval_or(&items[1..], env),
-            "let" => return eval_let(&items[1..], *pos, env),
-            "begin" => return eval_begin(&items[1..], env),
-            "cond" => return eval_cond(&items[1..], *pos, env),
-            _ => {}
-        }
-    }
-
-    let operator = eval_expr(head, env)?;
-    let args = eval_arg_values(&items[1..], env)?;
-    apply_value(operator, &args, head.pos(), &env.output)
-}
-
-fn eval_define(parts: &[Expr], pos: SourcePos, env: &EnvRef) -> Result<Value, EvalError> {
-    match parts {
-        [Expr::Symbol(name, _), value_expr] => {
-            let value = eval_expr(value_expr, env)?;
-            env.define(name.clone(), value);
-            Ok(Value::Void)
-        }
-        [Expr::List(signature, signature_pos), body @ ..] => {
-            if body.is_empty() {
-                return Err(syntax_error(pos, "define requires a function body"));
-            }
-
-            let Some((name_expr, params_exprs)) = signature.split_first() else {
-                return Err(syntax_error(
-                    *signature_pos,
-                    "define requires a function name",
-                ));
-            };
-
-            let Expr::Symbol(name, _) = name_expr else {
-                return Err(syntax_error(
-                    name_expr.pos(),
-                    "define function name must be a symbol",
-                ));
-            };
-
-            let (params, rest_param) = parse_formal_list(params_exprs)?;
-            let procedure = Value::Procedure(Rc::new(Procedure {
-                params,
-                rest_param,
-                body: body.to_vec(),
-                env: env.clone(),
-            }));
-            env.define(name.clone(), procedure);
-            Ok(Value::Void)
-        }
-        _ => Err(syntax_error(expr_pos_or(parts, pos), "malformed define")),
-    }
-}
-
-fn eval_if(parts: &[Expr], pos: SourcePos, env: &EnvRef) -> Result<Value, EvalError> {
-    let [condition, consequent, alternate] = parts else {
-        return Err(wrong_arity(pos, "if", "exactly 3", parts.len()));
-    };
-
-    if eval_expr(condition, env)?.is_truthy() {
-        eval_expr(consequent, env)
-    } else {
-        eval_expr(alternate, env)
-    }
-}
-
-fn eval_set(parts: &[Expr], pos: SourcePos, env: &EnvRef) -> Result<Value, EvalError> {
-    let [target, value_expr] = parts else {
-        return Err(wrong_arity(pos, "set!", "exactly 2", parts.len()));
-    };
-
-    let Expr::Symbol(name, name_pos) = target else {
-        return Err(syntax_error(target.pos(), "set! target must be a symbol"));
-    };
-
-    let value = eval_expr(value_expr, env)?;
-    if env.set(name, value) {
-        Ok(Value::Void)
-    } else {
-        Err(unbound_variable(*name_pos, name.clone()))
-    }
-}
-
-fn eval_quote(parts: &[Expr], pos: SourcePos) -> Result<Value, EvalError> {
-    let [datum] = parts else {
-        return Err(wrong_arity(pos, "quote", "exactly 1", parts.len()));
-    };
-
-    Ok(quote_expr(datum))
-}
-
-fn eval_lambda(parts: &[Expr], pos: SourcePos, env: &EnvRef) -> Result<Value, EvalError> {
-    let Some((params_expr, body)) = parts.split_first() else {
-        return Err(wrong_arity(pos, "lambda", "at least 2", parts.len()));
-    };
-
-    if body.is_empty() {
-        return Err(syntax_error(pos, "lambda requires a body"));
-    }
-
-    let (params, rest_param) = parse_formals(params_expr)?;
-    Ok(Value::Procedure(Rc::new(Procedure {
-        params,
-        rest_param,
-        body: body.to_vec(),
-        env: env.clone(),
-    })))
-}
-
-fn eval_let(parts: &[Expr], pos: SourcePos, env: &EnvRef) -> Result<Value, EvalError> {
-    match parts {
-        [Expr::Symbol(name, _), bindings_expr, body @ ..] => {
-            if body.is_empty() {
-                return Err(syntax_error(pos, "let requires a body"));
-            }
-
-            let (procedure, args) = build_named_let_call(name, bindings_expr, body, env)?;
-            apply_procedure(procedure, args, pos)
-        }
-        [bindings_expr, body @ ..] => {
-            if body.is_empty() {
-                return Err(syntax_error(pos, "let requires a body"));
-            }
-
-            let evaluated_bindings = eval_let_bindings(bindings_expr, env)?;
-            let local_env = Environment::new(Some(env.clone()));
-            for (name, value) in evaluated_bindings {
-                local_env.define(name, value);
-            }
-
-            eval_body(body, &local_env)
-        }
-        _ => Err(wrong_arity(pos, "let", "at least 2", parts.len())),
-    }
-}
-
-fn eval_begin(parts: &[Expr], env: &EnvRef) -> Result<Value, EvalError> {
-    eval_body(parts, env)
-}
-
-fn eval_cond(clauses: &[Expr], _pos: SourcePos, env: &EnvRef) -> Result<Value, EvalError> {
-    for (index, clause) in clauses.iter().enumerate() {
-        let Expr::List(items, _) = clause else {
-            return Err(syntax_error(clause.pos(), "cond clause must be a list"));
-        };
-
-        let Some((test_expr, body)) = items.split_first() else {
-            return Err(syntax_error(clause.pos(), "cond clause cannot be empty"));
-        };
-
-        if let Expr::Symbol(name, _) = test_expr {
-            if name == "else" {
-                if index + 1 != clauses.len() {
-                    return Err(syntax_error(
-                        test_expr.pos(),
-                        "cond else clause must be last",
-                    ));
-                }
-
-                if body.is_empty() {
-                    return Err(syntax_error(
-                        clause.pos(),
-                        "cond else clause requires a body",
-                    ));
-                }
-
-                return eval_body(body, env);
-            }
-        }
-
-        let test_value = eval_expr(test_expr, env)?;
-        if test_value.is_truthy() {
-            return if body.is_empty() {
-                Ok(test_value)
-            } else {
-                eval_body(body, env)
-            };
-        }
-    }
-
-    Ok(Value::Void)
-}
-
 fn parse_formals(params_expr: &Expr) -> Result<(Vec<String>, Option<String>), EvalError> {
     match params_expr {
         Expr::List(params, _) => parse_formal_list(params),
@@ -845,13 +729,13 @@ fn parse_formal_list(params: &[Expr]) -> Result<(Vec<String>, Option<String>), E
                     ));
                 };
                 if rest_name == "." {
-                    return Err(syntax_error(rest_expr.pos(), "parameter names must be symbols"));
-                }
-                if iter.next().is_some() {
                     return Err(syntax_error(
                         rest_expr.pos(),
-                        "rest parameter must be last",
+                        "parameter names must be symbols",
                     ));
+                }
+                if iter.next().is_some() {
+                    return Err(syntax_error(rest_expr.pos(), "rest parameter must be last"));
                 }
                 return Ok((required, Some(rest_name.clone())));
             }
@@ -874,387 +758,956 @@ fn quote_expr(expr: &Expr) -> Value {
     }
 }
 
-fn eval_arg_values(args: &[Expr], env: &EnvRef) -> Result<Vec<Value>, EvalError> {
-    args.iter().map(|expr| eval_expr(expr, env)).collect()
+fn eval_expr(expr: &Expr, env: &EnvRef) -> Result<Value, EvalError> {
+    run_machine(MachineState::Eval {
+        expr: expr.clone(),
+        env: env.clone(),
+        cont: Rc::new(Continuation::Halt),
+    })
 }
 
-fn apply_value(
-    operator: Value,
-    args: &[Value],
+fn run_machine(mut state: MachineState) -> Result<Value, EvalError> {
+    loop {
+        state = match state {
+            MachineState::Eval { expr, env, cont } => eval_expr_state(expr, env, cont)?,
+            MachineState::Return { value, cont } => match cont.as_ref() {
+                Continuation::Halt => return Ok(value),
+                _ => continue_with_value(value, cont)?,
+            },
+        };
+    }
+}
+
+fn eval_expr_state(
+    expr: Expr,
+    env: EnvRef,
+    cont: Rc<Continuation>,
+) -> Result<MachineState, EvalError> {
+    match expr {
+        Expr::Int(value, _) => Ok(MachineState::Return {
+            value: Value::Int(value),
+            cont,
+        }),
+        Expr::Bool(value, _) => Ok(MachineState::Return {
+            value: Value::Bool(value),
+            cont,
+        }),
+        Expr::String(value, _) => Ok(MachineState::Return {
+            value: Value::String(SchemeString::new(value)),
+            cont,
+        }),
+        Expr::Char(value, _) => Ok(MachineState::Return {
+            value: Value::Char(value),
+            cont,
+        }),
+        Expr::Symbol(name, pos) => Ok(MachineState::Return {
+            value: env
+                .lookup(&name)
+                .ok_or_else(|| unbound_variable(pos, name.clone()))?,
+            cont,
+        }),
+        Expr::List(items, pos) => eval_list_state(items, pos, env, cont),
+    }
+}
+
+fn eval_list_state(
+    items: Vec<Expr>,
+    list_pos: SourcePos,
+    env: EnvRef,
+    cont: Rc<Continuation>,
+) -> Result<MachineState, EvalError> {
+    let Some(head) = items.first() else {
+        return Err(syntax_error(list_pos, "cannot evaluate empty list"));
+    };
+
+    if let Expr::Symbol(name, pos) = head {
+        match name.as_str() {
+            "define" => return eval_define_state(&items[1..], *pos, env, cont),
+            "set!" => return eval_set_state(&items[1..], *pos, env, cont),
+            "if" => return eval_if_state(&items[1..], *pos, env, cont),
+            "quote" => {
+                return Ok(MachineState::Return {
+                    value: eval_quote(&items[1..], *pos)?,
+                    cont,
+                })
+            }
+            "lambda" => {
+                return Ok(MachineState::Return {
+                    value: eval_lambda_value(&items[1..], *pos, &env)?,
+                    cont,
+                })
+            }
+            "and" => return Ok(eval_and_state(Rc::new(items[1..].to_vec()), 0, env, cont)),
+            "or" => return Ok(eval_or_state(Rc::new(items[1..].to_vec()), 0, env, cont)),
+            "let" => return eval_let_state(&items[1..], *pos, env, cont),
+            "begin" => {
+                return Ok(eval_sequence_state(
+                    Rc::new(items[1..].to_vec()),
+                    0,
+                    env,
+                    cont,
+                ))
+            }
+            "cond" => return eval_cond_state(&items[1..], env, cont),
+            _ => {}
+        }
+    }
+
+    eval_application_state(items, env, cont)
+}
+
+fn eval_define_state(
+    parts: &[Expr],
     pos: SourcePos,
-    output: &Rc<RefCell<String>>,
-) -> Result<Value, EvalError> {
+    env: EnvRef,
+    cont: Rc<Continuation>,
+) -> Result<MachineState, EvalError> {
+    match parts {
+        [Expr::Symbol(name, _), value_expr] => Ok(MachineState::Eval {
+            expr: value_expr.clone(),
+            env: env.clone(),
+            cont: Rc::new(Continuation::DefineValue {
+                name: name.clone(),
+                env,
+                next: cont,
+            }),
+        }),
+        [Expr::List(signature, signature_pos), body @ ..] => {
+            if body.is_empty() {
+                return Err(syntax_error(pos, "define requires a function body"));
+            }
+
+            let Some((name_expr, params_exprs)) = signature.split_first() else {
+                return Err(syntax_error(
+                    *signature_pos,
+                    "define requires a function name",
+                ));
+            };
+
+            let Expr::Symbol(name, _) = name_expr else {
+                return Err(syntax_error(
+                    name_expr.pos(),
+                    "define function name must be a symbol",
+                ));
+            };
+
+            let (params, rest_param) = parse_formal_list(params_exprs)?;
+            let procedure = Value::Procedure(Rc::new(Procedure {
+                params,
+                rest_param,
+                body: Rc::new(body.to_vec()),
+                env: env.clone(),
+            }));
+            env.define(name.clone(), procedure);
+            Ok(MachineState::Return {
+                value: Value::Void,
+                cont,
+            })
+        }
+        _ => Err(syntax_error(expr_pos_or(parts, pos), "malformed define")),
+    }
+}
+
+fn eval_set_state(
+    parts: &[Expr],
+    pos: SourcePos,
+    env: EnvRef,
+    cont: Rc<Continuation>,
+) -> Result<MachineState, EvalError> {
+    let [target, value_expr] = parts else {
+        return Err(wrong_arity(pos, "set!", "exactly 2", parts.len()));
+    };
+
+    let Expr::Symbol(name, _) = target else {
+        return Err(syntax_error(target.pos(), "set! target must be a symbol"));
+    };
+
+    Ok(MachineState::Eval {
+        expr: value_expr.clone(),
+        env: env.clone(),
+        cont: Rc::new(Continuation::SetValue {
+            name: name.clone(),
+            pos: target.pos(),
+            env,
+            next: cont,
+        }),
+    })
+}
+
+fn eval_quote(parts: &[Expr], pos: SourcePos) -> Result<Value, EvalError> {
+    let [datum] = parts else {
+        return Err(wrong_arity(pos, "quote", "exactly 1", parts.len()));
+    };
+
+    Ok(quote_expr(datum))
+}
+
+fn eval_lambda_value(parts: &[Expr], pos: SourcePos, env: &EnvRef) -> Result<Value, EvalError> {
+    let Some((params_expr, body)) = parts.split_first() else {
+        return Err(wrong_arity(pos, "lambda", "at least 2", parts.len()));
+    };
+
+    if body.is_empty() {
+        return Err(syntax_error(pos, "lambda requires a body"));
+    }
+
+    let (params, rest_param) = parse_formals(params_expr)?;
+    Ok(Value::Procedure(Rc::new(Procedure {
+        params,
+        rest_param,
+        body: Rc::new(body.to_vec()),
+        env: env.clone(),
+    })))
+}
+
+fn eval_if_state(
+    parts: &[Expr],
+    pos: SourcePos,
+    env: EnvRef,
+    cont: Rc<Continuation>,
+) -> Result<MachineState, EvalError> {
+    let [condition, consequent, alternate] = parts else {
+        return Err(wrong_arity(pos, "if", "exactly 3", parts.len()));
+    };
+
+    Ok(MachineState::Eval {
+        expr: condition.clone(),
+        env: env.clone(),
+        cont: Rc::new(Continuation::If {
+            consequent: consequent.clone(),
+            alternate: alternate.clone(),
+            env,
+            next: cont,
+        }),
+    })
+}
+
+fn eval_let_state(
+    parts: &[Expr],
+    pos: SourcePos,
+    env: EnvRef,
+    cont: Rc<Continuation>,
+) -> Result<MachineState, EvalError> {
+    match parts {
+        [Expr::Symbol(name, _), bindings_expr, body @ ..] => {
+            if body.is_empty() {
+                return Err(syntax_error(pos, "let requires a body"));
+            }
+
+            let bindings = Rc::new(parse_let_bindings(bindings_expr)?);
+            let body = Rc::new(body.to_vec());
+            if bindings.is_empty() {
+                let procedure =
+                    build_named_let_procedure(name.clone(), bindings.as_slice(), body, &env);
+                return dispatch_apply(
+                    Value::Procedure(procedure),
+                    Vec::new(),
+                    pos,
+                    env.output.clone(),
+                    cont,
+                );
+            }
+
+            Ok(MachineState::Eval {
+                expr: bindings[0].1.clone(),
+                env: env.clone(),
+                cont: Rc::new(Continuation::NamedLetBinding {
+                    name: name.clone(),
+                    bindings,
+                    index: 1,
+                    values: Vec::new(),
+                    body,
+                    env,
+                    pos,
+                    next: cont,
+                }),
+            })
+        }
+        [bindings_expr, body @ ..] => {
+            if body.is_empty() {
+                return Err(syntax_error(pos, "let requires a body"));
+            }
+
+            let bindings = Rc::new(parse_let_bindings(bindings_expr)?);
+            let body = Rc::new(body.to_vec());
+            if bindings.is_empty() {
+                let local_env = Environment::new(Some(env));
+                return Ok(eval_sequence_state(body, 0, local_env, cont));
+            }
+
+            Ok(MachineState::Eval {
+                expr: bindings[0].1.clone(),
+                env: env.clone(),
+                cont: Rc::new(Continuation::LetBinding {
+                    bindings,
+                    index: 1,
+                    values: Vec::new(),
+                    body,
+                    env,
+                    next: cont,
+                }),
+            })
+        }
+        _ => Err(wrong_arity(pos, "let", "at least 2", parts.len())),
+    }
+}
+
+fn eval_cond_state(
+    clauses: &[Expr],
+    env: EnvRef,
+    cont: Rc<Continuation>,
+) -> Result<MachineState, EvalError> {
+    eval_cond_clauses(Rc::new(clauses.to_vec()), 0, env, cont)
+}
+
+fn eval_cond_clauses(
+    clauses: Rc<Vec<Expr>>,
+    index: usize,
+    env: EnvRef,
+    cont: Rc<Continuation>,
+) -> Result<MachineState, EvalError> {
+    let Some(clause) = clauses.get(index) else {
+        return Ok(MachineState::Return {
+            value: Value::Void,
+            cont,
+        });
+    };
+
+    let Expr::List(items, _) = clause else {
+        return Err(syntax_error(clause.pos(), "cond clause must be a list"));
+    };
+
+    let Some((test_expr, body)) = items.split_first() else {
+        return Err(syntax_error(clause.pos(), "cond clause cannot be empty"));
+    };
+
+    if let Expr::Symbol(name, _) = test_expr {
+        if name == "else" {
+            if index + 1 != clauses.len() {
+                return Err(syntax_error(
+                    test_expr.pos(),
+                    "cond else clause must be last",
+                ));
+            }
+
+            if body.is_empty() {
+                return Err(syntax_error(
+                    clause.pos(),
+                    "cond else clause requires a body",
+                ));
+            }
+
+            return Ok(eval_sequence_state(Rc::new(body.to_vec()), 0, env, cont));
+        }
+    }
+
+    Ok(MachineState::Eval {
+        expr: test_expr.clone(),
+        env: env.clone(),
+        cont: Rc::new(Continuation::CondTest {
+            clauses: clauses.clone(),
+            next_index: index + 1,
+            body: Rc::new(body.to_vec()),
+            env,
+            next: cont,
+        }),
+    })
+}
+
+fn eval_application_state(
+    items: Vec<Expr>,
+    env: EnvRef,
+    cont: Rc<Continuation>,
+) -> Result<MachineState, EvalError> {
+    let head = items[0].clone();
+    Ok(MachineState::Eval {
+        expr: head.clone(),
+        env: env.clone(),
+        cont: Rc::new(Continuation::Operator {
+            arg_exprs: Rc::new(items[1..].to_vec()),
+            env,
+            pos: head.pos(),
+            next: cont,
+        }),
+    })
+}
+
+fn eval_sequence_state(
+    exprs: Rc<Vec<Expr>>,
+    index: usize,
+    env: EnvRef,
+    cont: Rc<Continuation>,
+) -> MachineState {
+    let Some(expr) = exprs.get(index).cloned() else {
+        return MachineState::Return {
+            value: Value::Void,
+            cont,
+        };
+    };
+
+    if index + 1 == exprs.len() {
+        MachineState::Eval { expr, env, cont }
+    } else {
+        MachineState::Eval {
+            expr,
+            env: env.clone(),
+            cont: Rc::new(Continuation::Sequence {
+                exprs,
+                index: index + 1,
+                env,
+                next: cont,
+            }),
+        }
+    }
+}
+
+fn eval_and_state(
+    exprs: Rc<Vec<Expr>>,
+    index: usize,
+    env: EnvRef,
+    cont: Rc<Continuation>,
+) -> MachineState {
+    let Some(expr) = exprs.get(index).cloned() else {
+        return MachineState::Return {
+            value: Value::Bool(true),
+            cont,
+        };
+    };
+
+    if index + 1 == exprs.len() {
+        MachineState::Eval { expr, env, cont }
+    } else {
+        MachineState::Eval {
+            expr,
+            env: env.clone(),
+            cont: Rc::new(Continuation::And {
+                exprs,
+                index: index + 1,
+                env,
+                next: cont,
+            }),
+        }
+    }
+}
+
+fn eval_or_state(
+    exprs: Rc<Vec<Expr>>,
+    index: usize,
+    env: EnvRef,
+    cont: Rc<Continuation>,
+) -> MachineState {
+    let Some(expr) = exprs.get(index).cloned() else {
+        return MachineState::Return {
+            value: Value::Bool(false),
+            cont,
+        };
+    };
+
+    if index + 1 == exprs.len() {
+        MachineState::Eval { expr, env, cont }
+    } else {
+        MachineState::Eval {
+            expr,
+            env: env.clone(),
+            cont: Rc::new(Continuation::Or {
+                exprs,
+                index: index + 1,
+                env,
+                next: cont,
+            }),
+        }
+    }
+}
+
+fn continue_with_value(value: Value, cont: Rc<Continuation>) -> Result<MachineState, EvalError> {
+    match cont.as_ref() {
+        Continuation::Halt => Ok(MachineState::Return { value, cont }),
+        Continuation::DefineValue { name, env, next } => {
+            env.define(name.clone(), value);
+            Ok(MachineState::Return {
+                value: Value::Void,
+                cont: next.clone(),
+            })
+        }
+        Continuation::SetValue {
+            name,
+            pos,
+            env,
+            next,
+        } => {
+            if env.set(name, value) {
+                Ok(MachineState::Return {
+                    value: Value::Void,
+                    cont: next.clone(),
+                })
+            } else {
+                Err(unbound_variable(*pos, name.clone()))
+            }
+        }
+        Continuation::If {
+            consequent,
+            alternate,
+            env,
+            next,
+        } => Ok(MachineState::Eval {
+            expr: if value.is_truthy() {
+                consequent.clone()
+            } else {
+                alternate.clone()
+            },
+            env: env.clone(),
+            cont: next.clone(),
+        }),
+        Continuation::Sequence {
+            exprs,
+            index,
+            env,
+            next,
+        } => Ok(eval_sequence_state(
+            exprs.clone(),
+            *index,
+            env.clone(),
+            next.clone(),
+        )),
+        Continuation::And {
+            exprs,
+            index,
+            env,
+            next,
+        } => {
+            if value.is_truthy() {
+                Ok(eval_and_state(
+                    exprs.clone(),
+                    *index,
+                    env.clone(),
+                    next.clone(),
+                ))
+            } else {
+                Ok(MachineState::Return {
+                    value,
+                    cont: next.clone(),
+                })
+            }
+        }
+        Continuation::Or {
+            exprs,
+            index,
+            env,
+            next,
+        } => {
+            if value.is_truthy() {
+                Ok(MachineState::Return {
+                    value,
+                    cont: next.clone(),
+                })
+            } else {
+                Ok(eval_or_state(
+                    exprs.clone(),
+                    *index,
+                    env.clone(),
+                    next.clone(),
+                ))
+            }
+        }
+        Continuation::CondTest {
+            clauses,
+            next_index,
+            body,
+            env,
+            next,
+        } => {
+            if value.is_truthy() {
+                if body.is_empty() {
+                    Ok(MachineState::Return {
+                        value,
+                        cont: next.clone(),
+                    })
+                } else {
+                    Ok(eval_sequence_state(
+                        body.clone(),
+                        0,
+                        env.clone(),
+                        next.clone(),
+                    ))
+                }
+            } else {
+                eval_cond_clauses(clauses.clone(), *next_index, env.clone(), next.clone())
+            }
+        }
+        Continuation::LetBinding {
+            bindings,
+            index,
+            values,
+            body,
+            env,
+            next,
+        } => {
+            let mut next_values = values.clone();
+            next_values.push(value);
+
+            if *index >= bindings.len() {
+                let local_env = Environment::new(Some(env.clone()));
+                for ((name, _), bound_value) in bindings.iter().zip(next_values.into_iter()) {
+                    local_env.define(name.clone(), bound_value);
+                }
+                Ok(eval_sequence_state(
+                    body.clone(),
+                    0,
+                    local_env,
+                    next.clone(),
+                ))
+            } else {
+                Ok(MachineState::Eval {
+                    expr: bindings[*index].1.clone(),
+                    env: env.clone(),
+                    cont: Rc::new(Continuation::LetBinding {
+                        bindings: bindings.clone(),
+                        index: *index + 1,
+                        values: next_values,
+                        body: body.clone(),
+                        env: env.clone(),
+                        next: next.clone(),
+                    }),
+                })
+            }
+        }
+        Continuation::NamedLetBinding {
+            name,
+            bindings,
+            index,
+            values,
+            body,
+            env,
+            pos,
+            next,
+        } => {
+            let mut next_values = values.clone();
+            next_values.push(value);
+
+            if *index >= bindings.len() {
+                let procedure =
+                    build_named_let_procedure(name.clone(), bindings.as_slice(), body.clone(), env);
+                dispatch_apply(
+                    Value::Procedure(procedure),
+                    next_values,
+                    *pos,
+                    env.output.clone(),
+                    next.clone(),
+                )
+            } else {
+                Ok(MachineState::Eval {
+                    expr: bindings[*index].1.clone(),
+                    env: env.clone(),
+                    cont: Rc::new(Continuation::NamedLetBinding {
+                        name: name.clone(),
+                        bindings: bindings.clone(),
+                        index: *index + 1,
+                        values: next_values,
+                        body: body.clone(),
+                        env: env.clone(),
+                        pos: *pos,
+                        next: next.clone(),
+                    }),
+                })
+            }
+        }
+        Continuation::Operator {
+            arg_exprs,
+            env,
+            pos,
+            next,
+        } => {
+            if arg_exprs.is_empty() {
+                dispatch_apply(value, Vec::new(), *pos, env.output.clone(), next.clone())
+            } else {
+                // The benchmark suite expects operand evaluation to proceed from right to left.
+                let last_index = arg_exprs.len() - 1;
+                Ok(MachineState::Eval {
+                    expr: arg_exprs[last_index].clone(),
+                    env: env.clone(),
+                    cont: Rc::new(Continuation::Argument {
+                        operator: value,
+                        args: Vec::new(),
+                        arg_exprs: arg_exprs.clone(),
+                        index: last_index,
+                        env: env.clone(),
+                        pos: *pos,
+                        next: next.clone(),
+                    }),
+                })
+            }
+        }
+        Continuation::Argument {
+            operator,
+            args,
+            arg_exprs,
+            index,
+            env,
+            pos,
+            next,
+        } => {
+            let mut next_args = args.clone();
+            next_args.push(value);
+
+            if *index == 0 {
+                next_args.reverse();
+                dispatch_apply(
+                    operator.clone(),
+                    next_args,
+                    *pos,
+                    env.output.clone(),
+                    next.clone(),
+                )
+            } else {
+                let next_index = *index - 1;
+                Ok(MachineState::Eval {
+                    expr: arg_exprs[next_index].clone(),
+                    env: env.clone(),
+                    cont: Rc::new(Continuation::Argument {
+                        operator: operator.clone(),
+                        args: next_args,
+                        arg_exprs: arg_exprs.clone(),
+                        index: next_index,
+                        env: env.clone(),
+                        pos: *pos,
+                        next: next.clone(),
+                    }),
+                })
+            }
+        }
+        Continuation::Map {
+            procedure,
+            items,
+            index,
+            acc,
+            pos,
+            output,
+            next,
+        } => {
+            let mut next_acc = acc.clone();
+            next_acc.push(value);
+
+            if *index >= items.len() {
+                Ok(MachineState::Return {
+                    value: Value::List(next_acc),
+                    cont: next.clone(),
+                })
+            } else {
+                dispatch_apply(
+                    procedure.clone(),
+                    vec![items[*index].clone()],
+                    *pos,
+                    output.clone(),
+                    Rc::new(Continuation::Map {
+                        procedure: procedure.clone(),
+                        items: items.clone(),
+                        index: *index + 1,
+                        acc: next_acc,
+                        pos: *pos,
+                        output: output.clone(),
+                        next: next.clone(),
+                    }),
+                )
+            }
+        }
+    }
+}
+
+fn dispatch_apply(
+    operator: Value,
+    args: Vec<Value>,
+    pos: SourcePos,
+    output: Rc<RefCell<String>>,
+    cont: Rc<Continuation>,
+) -> Result<MachineState, EvalError> {
     match operator {
-        Value::Builtin(builtin) => apply_builtin(builtin, args, pos, output),
-        Value::Procedure(procedure) => apply_procedure(procedure, args.to_vec(), pos),
+        Value::Builtin(builtin) => apply_builtin_state(builtin, args, pos, output, cont),
+        Value::Procedure(procedure) => apply_procedure_state(procedure, args, pos, cont),
+        Value::Continuation(saved) => {
+            if args.len() != 1 {
+                return Err(wrong_arity(pos, "procedure", "exactly 1", args.len()));
+            }
+
+            Ok(MachineState::Return {
+                value: args.into_iter().next().expect("continuation arity checked"),
+                cont: saved,
+            })
+        }
         other => Err(not_callable(pos, other.type_name())),
     }
 }
 
-fn apply_builtin(
+fn apply_builtin_state(
     builtin: Builtin,
-    args: &[Value],
+    args: Vec<Value>,
     pos: SourcePos,
-    output: &Rc<RefCell<String>>,
-) -> Result<Value, EvalError> {
-    match builtin {
-        Builtin::Add => eval_add(args, pos),
-        Builtin::Sub => eval_sub(args, pos),
-        Builtin::Mul => eval_mul(args, pos),
-        Builtin::Div => eval_div(args, pos),
-        Builtin::Apply => eval_apply(args, pos, output),
-        Builtin::LessThan => eval_compare(args, "<", pos, |left, right| left < right),
-        Builtin::GreaterThan => eval_compare(args, ">", pos, |left, right| left > right),
-        Builtin::Equal => eval_compare(args, "=", pos, |left, right| left == right),
-        Builtin::LessEqual => eval_compare(args, "<=", pos, |left, right| left <= right),
-        Builtin::GreaterEqual => eval_compare(args, ">=", pos, |left, right| left >= right),
-        Builtin::Not => eval_not(args, pos),
-        Builtin::Cons => eval_cons(args, pos),
-        Builtin::Car => eval_car(args, pos),
-        Builtin::Cdr => eval_cdr(args, pos),
-        Builtin::IsNull => eval_null(args, pos),
-        Builtin::List => eval_list_builtin(args, pos),
-        Builtin::Map => eval_map(args, pos, output),
-        Builtin::Length => eval_length(args, pos),
-        Builtin::IsString => eval_type_predicate(args, "string?", pos, |value| {
-            matches!(value, Value::String(_))
-        }),
-        Builtin::IsNumber => {
-            eval_type_predicate(args, "number?", pos, |value| matches!(value, Value::Int(_)))
+    output: Rc<RefCell<String>>,
+    cont: Rc<Continuation>,
+) -> Result<MachineState, EvalError> {
+    let value = match builtin {
+        Builtin::Add => Some(eval_add(&args, pos)?),
+        Builtin::Sub => Some(eval_sub(&args, pos)?),
+        Builtin::Mul => Some(eval_mul(&args, pos)?),
+        Builtin::Div => Some(eval_div(&args, pos)?),
+        Builtin::Apply => {
+            let [operator, rest @ ..] = args.as_slice() else {
+                return Err(wrong_arity(pos, "apply", "at least 2", args.len()));
+            };
+
+            if rest.is_empty() {
+                return Err(wrong_arity(pos, "apply", "at least 2", args.len()));
+            }
+
+            let prefix = &rest[..rest.len() - 1];
+            let last = &rest[rest.len() - 1];
+            let Value::List(spliced) = last else {
+                return Err(type_error(pos, "list", last.type_name()));
+            };
+
+            let mut expanded_args = Vec::with_capacity(prefix.len() + spliced.len());
+            expanded_args.extend(prefix.iter().cloned());
+            expanded_args.extend(spliced.iter().cloned());
+            return dispatch_apply(operator.clone(), expanded_args, pos, output, cont);
         }
-        Builtin::IsBoolean => eval_type_predicate(args, "boolean?", pos, |value| {
+        Builtin::CallCc => {
+            let [procedure] = args.as_slice() else {
+                return Err(wrong_arity(pos, "call/cc", "exactly 1", args.len()));
+            };
+
+            return dispatch_apply(
+                procedure.clone(),
+                vec![Value::Continuation(cont.clone())],
+                pos,
+                output,
+                cont,
+            );
+        }
+        Builtin::LessThan => Some(eval_compare(&args, "<", pos, |left, right| left < right)?),
+        Builtin::GreaterThan => Some(eval_compare(&args, ">", pos, |left, right| left > right)?),
+        Builtin::Equal => Some(eval_compare(&args, "=", pos, |left, right| left == right)?),
+        Builtin::LessEqual => Some(eval_compare(&args, "<=", pos, |left, right| left <= right)?),
+        Builtin::GreaterEqual => Some(eval_compare(&args, ">=", pos, |left, right| left >= right)?),
+        Builtin::Not => Some(eval_not(&args, pos)?),
+        Builtin::Cons => Some(eval_cons(&args, pos)?),
+        Builtin::Car => Some(eval_car(&args, pos)?),
+        Builtin::Cdr => Some(eval_cdr(&args, pos)?),
+        Builtin::IsNull => Some(eval_null(&args, pos)?),
+        Builtin::List => Some(eval_list_builtin(&args, pos)?),
+        Builtin::Map => {
+            let [procedure, list] = args.as_slice() else {
+                return Err(wrong_arity(pos, "map", "exactly 2", args.len()));
+            };
+
+            let Value::List(items) = list else {
+                return Err(type_error(pos, "list", list.type_name()));
+            };
+
+            if items.is_empty() {
+                Some(Value::List(Vec::new()))
+            } else {
+                let items = Rc::new(items.clone());
+                return dispatch_apply(
+                    procedure.clone(),
+                    vec![items[0].clone()],
+                    pos,
+                    output.clone(),
+                    Rc::new(Continuation::Map {
+                        procedure: procedure.clone(),
+                        items,
+                        index: 1,
+                        acc: Vec::new(),
+                        pos,
+                        output,
+                        next: cont,
+                    }),
+                );
+            }
+        }
+        Builtin::Length => Some(eval_length(&args, pos)?),
+        Builtin::IsString => Some(eval_type_predicate(&args, "string?", pos, |value| {
+            matches!(value, Value::String(_))
+        })?),
+        Builtin::IsNumber => Some(eval_type_predicate(&args, "number?", pos, |value| {
+            matches!(value, Value::Int(_))
+        })?),
+        Builtin::IsBoolean => Some(eval_type_predicate(&args, "boolean?", pos, |value| {
             matches!(value, Value::Bool(_))
-        }),
-        Builtin::IsPair => eval_type_predicate(
-            args,
+        })?),
+        Builtin::IsPair => Some(eval_type_predicate(
+            &args,
             "pair?",
             pos,
             |value| matches!(value, Value::List(items) if !items.is_empty()),
-        ),
-        Builtin::IsSymbol => eval_type_predicate(args, "symbol?", pos, |value| {
+        )?),
+        Builtin::IsSymbol => Some(eval_type_predicate(&args, "symbol?", pos, |value| {
             matches!(value, Value::Symbol(_))
-        }),
-        Builtin::Display => eval_display(args, pos, output),
-        Builtin::Write => eval_write(args, pos, output),
-        Builtin::Newline => eval_newline(args, pos, output),
-        Builtin::StringAppend => eval_string_append(args, pos),
-        Builtin::StringLength => eval_string_length(args, pos),
-        Builtin::Substring => eval_substring(args, pos),
-        Builtin::StringToNumber => eval_string_to_number(args, pos),
-        Builtin::NumberToString => eval_number_to_string(args, pos),
-        Builtin::SymbolToString => eval_symbol_to_string(args, pos),
-        Builtin::StringToSymbol => eval_string_to_symbol(args, pos),
-        Builtin::StringToList => eval_string_to_list(args, pos),
-        Builtin::ListToString => eval_list_to_string(args, pos),
-        Builtin::StringRef => eval_string_ref(args, pos),
-        Builtin::StringCopy => eval_string_copy(args, pos),
-        Builtin::StringSet => eval_string_set(args, pos),
-        Builtin::IsChar => {
-            eval_type_predicate(args, "char?", pos, |value| matches!(value, Value::Char(_)))
-        }
-        Builtin::CharToInteger => eval_char_to_integer(args, pos),
-        Builtin::IntegerToChar => eval_integer_to_char(args, pos),
-    }
-}
-
-fn apply_procedure(
-    mut procedure: Rc<Procedure>,
-    mut args: Vec<Value>,
-    mut pos: SourcePos,
-) -> Result<Value, EvalError> {
-    loop {
-        let required = procedure.params.len();
-        let expected = if procedure.rest_param.is_some() {
-            format!("at least {required}")
-        } else {
-            required.to_string()
-        };
-        let arity_ok = if procedure.rest_param.is_some() {
-            args.len() >= required
-        } else {
-            args.len() == required
-        };
-        if !arity_ok {
-            return Err(wrong_arity(
-                pos,
-                "procedure",
-                expected,
-                args.len(),
-            ));
-        }
-
-        let local_env = Environment::new(Some(procedure.env.clone()));
-        for (param, arg) in procedure.params.iter().zip(args.iter().take(required)) {
-            local_env.define(param.clone(), arg.clone());
-        }
-        if let Some(rest_param) = &procedure.rest_param {
-            local_env.define(rest_param.clone(), Value::List(args[required..].to_vec()));
-        }
-
-        match eval_tail_body(&procedure.body, &local_env)? {
-            TailOutcome::Value(value) => return Ok(value),
-            TailOutcome::TailCall {
-                procedure: next_procedure,
-                args: next_args,
-                pos: next_pos,
-            } => {
-                procedure = next_procedure;
-                args = next_args;
-                pos = next_pos;
-            }
-        }
-    }
-}
-
-fn eval_body(body: &[Expr], env: &EnvRef) -> Result<Value, EvalError> {
-    let mut last = Value::Void;
-
-    for expr in body {
-        last = eval_expr(expr, env)?;
-    }
-
-    Ok(last)
-}
-
-fn eval_tail_body(body: &[Expr], env: &EnvRef) -> Result<TailOutcome, EvalError> {
-    let Some((last, init)) = body.split_last() else {
-        return Ok(TailOutcome::Value(Value::Void));
+        })?),
+        Builtin::Display => Some(eval_display(&args, pos, &output)?),
+        Builtin::Write => Some(eval_write(&args, pos, &output)?),
+        Builtin::Newline => Some(eval_newline(&args, pos, &output)?),
+        Builtin::StringAppend => Some(eval_string_append(&args, pos)?),
+        Builtin::StringLength => Some(eval_string_length(&args, pos)?),
+        Builtin::Substring => Some(eval_substring(&args, pos)?),
+        Builtin::StringToNumber => Some(eval_string_to_number(&args, pos)?),
+        Builtin::NumberToString => Some(eval_number_to_string(&args, pos)?),
+        Builtin::SymbolToString => Some(eval_symbol_to_string(&args, pos)?),
+        Builtin::StringToSymbol => Some(eval_string_to_symbol(&args, pos)?),
+        Builtin::StringToList => Some(eval_string_to_list(&args, pos)?),
+        Builtin::ListToString => Some(eval_list_to_string(&args, pos)?),
+        Builtin::StringRef => Some(eval_string_ref(&args, pos)?),
+        Builtin::StringCopy => Some(eval_string_copy(&args, pos)?),
+        Builtin::StringSet => Some(eval_string_set(&args, pos)?),
+        Builtin::IsChar => Some(eval_type_predicate(&args, "char?", pos, |value| {
+            matches!(value, Value::Char(_))
+        })?),
+        Builtin::CharToInteger => Some(eval_char_to_integer(&args, pos)?),
+        Builtin::IntegerToChar => Some(eval_integer_to_char(&args, pos)?),
     };
 
-    for expr in init {
-        eval_expr(expr, env)?;
-    }
-
-    eval_tail_expr(last, env)
+    Ok(MachineState::Return {
+        value: value.expect("simple builtin must produce a value"),
+        cont,
+    })
 }
 
-fn eval_tail_expr(mut expr: &Expr, env: &EnvRef) -> Result<TailOutcome, EvalError> {
-    let mut current_env = env.clone();
-
-    loop {
-        match expr {
-            Expr::Int(value, _) => return Ok(TailOutcome::Value(Value::Int(*value))),
-            Expr::Bool(value, _) => return Ok(TailOutcome::Value(Value::Bool(*value))),
-            Expr::String(value, _) => {
-                return Ok(TailOutcome::Value(Value::String(SchemeString::new(
-                    value.clone(),
-                ))))
-            }
-            Expr::Char(value, _) => return Ok(TailOutcome::Value(Value::Char(*value))),
-            Expr::Symbol(name, pos) => {
-                let value = current_env
-                    .lookup(name)
-                    .ok_or_else(|| unbound_variable(*pos, name.clone()))?;
-                return Ok(TailOutcome::Value(value));
-            }
-            Expr::List(items, list_pos) => {
-                let Some(head) = items.first() else {
-                    return Err(syntax_error(*list_pos, "cannot evaluate empty list"));
-                };
-
-                if let Expr::Symbol(name, pos) = head {
-                    match name.as_str() {
-                        "define" => {
-                            return Ok(TailOutcome::Value(eval_define(
-                                &items[1..],
-                                *pos,
-                                &current_env,
-                            )?))
-                        }
-                        "set!" => {
-                            return Ok(TailOutcome::Value(eval_set(
-                                &items[1..],
-                                *pos,
-                                &current_env,
-                            )?))
-                        }
-                        "if" => {
-                            let [condition, consequent, alternate] = &items[1..] else {
-                                return Err(wrong_arity(*pos, "if", "exactly 3", items.len() - 1));
-                            };
-
-                            expr = if eval_expr(condition, &current_env)?.is_truthy() {
-                                consequent
-                            } else {
-                                alternate
-                            };
-                            continue;
-                        }
-                        "quote" => {
-                            return Ok(TailOutcome::Value(eval_quote(&items[1..], *pos)?));
-                        }
-                        "lambda" => {
-                            return Ok(TailOutcome::Value(eval_lambda(
-                                &items[1..],
-                                *pos,
-                                &current_env,
-                            )?))
-                        }
-                        "and" => {
-                            let Some((last, init)) = items[1..].split_last() else {
-                                return Ok(TailOutcome::Value(Value::Bool(true)));
-                            };
-
-                            for part in init {
-                                let value = eval_expr(part, &current_env)?;
-                                if !value.is_truthy() {
-                                    return Ok(TailOutcome::Value(value));
-                                }
-                            }
-
-                            expr = last;
-                            continue;
-                        }
-                        "or" => {
-                            let Some((last, init)) = items[1..].split_last() else {
-                                return Ok(TailOutcome::Value(Value::Bool(false)));
-                            };
-
-                            for part in init {
-                                let value = eval_expr(part, &current_env)?;
-                                if value.is_truthy() {
-                                    return Ok(TailOutcome::Value(value));
-                                }
-                            }
-
-                            expr = last;
-                            continue;
-                        }
-                        "let" => match &items[1..] {
-                            [Expr::Symbol(name, _), bindings_expr, body @ ..] => {
-                                if body.is_empty() {
-                                    return Err(syntax_error(*pos, "let requires a body"));
-                                }
-
-                                let (procedure, args) =
-                                    build_named_let_call(name, bindings_expr, body, &current_env)?;
-                                return Ok(TailOutcome::TailCall {
-                                    procedure,
-                                    args,
-                                    pos: *pos,
-                                });
-                            }
-                            [bindings_expr, body @ ..] => {
-                                if body.is_empty() {
-                                    return Err(syntax_error(*pos, "let requires a body"));
-                                }
-
-                                let evaluated_bindings =
-                                    eval_let_bindings(bindings_expr, &current_env)?;
-                                let local_env = Environment::new(Some(current_env.clone()));
-                                for (name, value) in evaluated_bindings {
-                                    local_env.define(name, value);
-                                }
-
-                                let Some((last, init)) = body.split_last() else {
-                                    return Ok(TailOutcome::Value(Value::Void));
-                                };
-
-                                for part in init {
-                                    eval_expr(part, &local_env)?;
-                                }
-
-                                current_env = local_env;
-                                expr = last;
-                                continue;
-                            }
-                            _ => {
-                                return Err(wrong_arity(*pos, "let", "at least 2", items.len() - 1))
-                            }
-                        },
-                        "begin" => {
-                            let Some((last, init)) = items[1..].split_last() else {
-                                return Ok(TailOutcome::Value(Value::Void));
-                            };
-
-                            for part in init {
-                                eval_expr(part, &current_env)?;
-                            }
-
-                            expr = last;
-                            continue;
-                        }
-                        "cond" => return eval_tail_cond(&items[1..], *pos, &current_env),
-                        _ => {}
-                    }
-                }
-
-                let operator = eval_expr(head, &current_env)?;
-                let args = eval_arg_values(&items[1..], &current_env)?;
-                match operator {
-                    Value::Builtin(builtin) => {
-                        return Ok(TailOutcome::Value(apply_builtin(
-                            builtin,
-                            &args,
-                            head.pos(),
-                            &current_env.output,
-                        )?))
-                    }
-                    Value::Procedure(procedure) => {
-                        return Ok(TailOutcome::TailCall {
-                            procedure,
-                            args,
-                            pos: head.pos(),
-                        })
-                    }
-                    other => return Err(not_callable(head.pos(), other.type_name())),
-                }
-            }
-        }
-    }
-}
-
-fn eval_tail_cond(
-    clauses: &[Expr],
-    _pos: SourcePos,
-    env: &EnvRef,
-) -> Result<TailOutcome, EvalError> {
-    for (index, clause) in clauses.iter().enumerate() {
-        let Expr::List(items, _) = clause else {
-            return Err(syntax_error(clause.pos(), "cond clause must be a list"));
-        };
-
-        let Some((test_expr, body)) = items.split_first() else {
-            return Err(syntax_error(clause.pos(), "cond clause cannot be empty"));
-        };
-
-        if let Expr::Symbol(name, _) = test_expr {
-            if name == "else" {
-                if index + 1 != clauses.len() {
-                    return Err(syntax_error(
-                        test_expr.pos(),
-                        "cond else clause must be last",
-                    ));
-                }
-
-                if body.is_empty() {
-                    return Err(syntax_error(
-                        clause.pos(),
-                        "cond else clause requires a body",
-                    ));
-                }
-
-                return eval_tail_body(body, env);
-            }
-        }
-
-        let test_value = eval_expr(test_expr, env)?;
-        if test_value.is_truthy() {
-            return if body.is_empty() {
-                Ok(TailOutcome::Value(test_value))
-            } else {
-                eval_tail_body(body, env)
-            };
-        }
+fn apply_procedure_state(
+    procedure: Rc<Procedure>,
+    args: Vec<Value>,
+    pos: SourcePos,
+    cont: Rc<Continuation>,
+) -> Result<MachineState, EvalError> {
+    let required = procedure.params.len();
+    let expected = if procedure.rest_param.is_some() {
+        format!("at least {required}")
+    } else {
+        required.to_string()
+    };
+    let arity_ok = if procedure.rest_param.is_some() {
+        args.len() >= required
+    } else {
+        args.len() == required
+    };
+    if !arity_ok {
+        return Err(wrong_arity(pos, "procedure", expected, args.len()));
     }
 
-    Ok(TailOutcome::Value(Value::Void))
+    let local_env = Environment::new(Some(procedure.env.clone()));
+    for (param, arg) in procedure.params.iter().zip(args.iter().take(required)) {
+        local_env.define(param.clone(), arg.clone());
+    }
+    if let Some(rest_param) = &procedure.rest_param {
+        local_env.define(rest_param.clone(), Value::List(args[required..].to_vec()));
+    }
+
+    Ok(eval_sequence_state(
+        procedure.body.clone(),
+        0,
+        local_env,
+        cont,
+    ))
 }
 
-fn eval_let_bindings(
-    bindings_expr: &Expr,
-    env: &EnvRef,
-) -> Result<Vec<(String, Value)>, EvalError> {
+fn parse_let_bindings(bindings_expr: &Expr) -> Result<Vec<(String, Expr)>, EvalError> {
     let Expr::List(bindings, _) = bindings_expr else {
         return Err(syntax_error(
             bindings_expr.pos(),
@@ -1276,36 +1729,42 @@ fn eval_let_bindings(
                 ));
             };
 
-            Ok((name.clone(), eval_expr(value_expr, env)?))
+            Ok((name.clone(), value_expr.clone()))
         })
         .collect()
 }
 
-fn build_named_let_call(
-    name: &str,
-    bindings_expr: &Expr,
-    body: &[Expr],
+fn build_named_let_procedure(
+    name: String,
+    bindings: &[(String, Expr)],
+    body: Rc<Vec<Expr>>,
     env: &EnvRef,
-) -> Result<(Rc<Procedure>, Vec<Value>), EvalError> {
-    let evaluated_bindings = eval_let_bindings(bindings_expr, env)?;
-    let params = evaluated_bindings
-        .iter()
-        .map(|(param, _)| param.clone())
-        .collect();
-    let args = evaluated_bindings
-        .into_iter()
-        .map(|(_, value)| value)
-        .collect();
-
+) -> Rc<Procedure> {
+    let params = bindings.iter().map(|(param, _)| param.clone()).collect();
     let local_env = Environment::new(Some(env.clone()));
     let procedure = Rc::new(Procedure {
         params,
         rest_param: None,
-        body: body.to_vec(),
+        body,
         env: local_env.clone(),
     });
-    local_env.define(name.to_string(), Value::Procedure(procedure.clone()));
-    Ok((procedure, args))
+    local_env.define(name, Value::Procedure(procedure.clone()));
+    procedure
+}
+
+fn apply_value(
+    operator: Value,
+    args: &[Value],
+    pos: SourcePos,
+    output: &Rc<RefCell<String>>,
+) -> Result<Value, EvalError> {
+    run_machine(dispatch_apply(
+        operator,
+        args.to_vec(),
+        pos,
+        output.clone(),
+        Rc::new(Continuation::Halt),
+    )?)
 }
 
 fn eval_add(args: &[Value], pos: SourcePos) -> Result<Value, EvalError> {
