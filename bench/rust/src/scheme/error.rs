@@ -28,4 +28,10 @@ pub enum EvalError {
         col: usize,
         inner: Box<EvalError>,
     },
+
+    #[error("continuation return")]
+    ContinuationReturn {
+        id: u64,
+        value: Box<crate::scheme::value::Value>,
+    },
 }

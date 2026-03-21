@@ -20,6 +20,7 @@ pub enum Value {
         closure: Rc<RefCell<Env>>,
     },
     Builtin(String),
+    Continuation(u64),
     Void,
 }
 
@@ -33,6 +34,7 @@ impl PartialEq for Value {
             (Value::Char(a), Value::Char(b)) => a == b,
             (Value::List(a), Value::List(b)) => a == b,
             (Value::Builtin(a), Value::Builtin(b)) => a == b,
+            (Value::Continuation(a), Value::Continuation(b)) => a == b,
             (Value::Void, Value::Void) => true,
             _ => false,
         }
@@ -71,7 +73,9 @@ impl fmt::Display for Value {
             Value::Symbol(s) => write!(f, "{s}"),
             Value::List(items) => write_list(f, items),
             Value::Char(c) => write!(f, "#\\{c}"),
-            Value::Lambda { .. } | Value::Builtin(_) => write!(f, "#<procedure>"),
+            Value::Lambda { .. } | Value::Builtin(_) | Value::Continuation(_) => {
+                write!(f, "#<procedure>")
+            }
             Value::Void => write!(f, "#<void>"),
         }
     }

@@ -1,12 +1,33 @@
 use std::cell::RefCell;
+use std::collections::HashMap;
 use std::rc::Rc;
 
 use crate::scheme::env::Env;
 use crate::scheme::error::EvalError;
 use crate::scheme::value::Value;
 
-/// Shared output buffer for display/write/newline.
-pub type Output = Rc<RefCell<String>>;
+/// Shared interpreter state: output buffer + continuation registry.
+pub struct InterpState {
+    pub output: String,
+    pub next_cont_id: u64,
+    pub cont_captures: HashMap<u64, usize>,
+    pub resume: Option<Value>,
+    pub current_expr_idx: usize,
+}
+
+impl InterpState {
+    pub fn new() -> Self {
+        Self {
+            output: String::new(),
+            next_cont_id: 0,
+            cont_captures: HashMap::new(),
+            resume: None,
+            current_expr_idx: 0,
+        }
+    }
+}
+
+pub type Output = Rc<RefCell<InterpState>>;
 
 /// Validate that the number of arguments matches the parameter list.
 fn check_arity(
@@ -34,7 +55,9 @@ pub fn eval(expr: &Value, env: &Rc<RefCell<Env>>, out: &Output) -> Result<Value,
         match &current_expr {
             Value::Integer(_) | Value::Boolean(_) | Value::Str(_) | Value::Char(_)
             | Value::Void => return Ok(current_expr),
-            Value::Lambda { .. } | Value::Builtin(_) => return Ok(current_expr),
+            Value::Lambda { .. } | Value::Builtin(_) | Value::Continuation(_) => {
+                return Ok(current_expr)
+            }
             Value::Symbol(name) => {
                 return current_env
                     .borrow()
@@ -78,6 +101,9 @@ fn eval_list_tail(
             "and" => return eval_and_tail(&items[1..], env, out),
             "or" => return eval_or_tail(&items[1..], env, out),
             "let" => return eval_let_tail(&items[1..], env, out),
+            "call/cc" | "call-with-current-continuation" => {
+                return eval_callcc(&items[1..], env, out).map(TailAction::Return)
+            }
             s if is_builtin(s) => {
                 return eval_builtin(s, &items[1..], env, out).map(TailAction::Return)
             }
@@ -152,6 +178,88 @@ fn eval_or_tail(
     Ok(TailAction::TailEval(last.clone(), Rc::clone(env)))
 }
 
+/// Evaluate `call/cc`: capture the current continuation and call proc with it.
+fn eval_callcc(
+    args: &[Value],
+    env: &Rc<RefCell<Env>>,
+    out: &Output,
+) -> Result<Value, EvalError> {
+    let [proc_arg] = args else {
+        return Err(EvalError::WrongArgCount {
+            expected: 1,
+            got: args.len(),
+        });
+    };
+    if let Some(value) = out.borrow_mut().resume.take() {
+        return Ok(value);
+    }
+    let proc = eval(proc_arg, env, out)?;
+    eval_callcc_core(proc, env, out)
+}
+
+/// Core call/cc logic with an already-evaluated procedure.
+fn eval_callcc_core(
+    proc: Value,
+    env: &Rc<RefCell<Env>>,
+    out: &Output,
+) -> Result<Value, EvalError> {
+    let id = {
+        let mut st = out.borrow_mut();
+        let id = st.next_cont_id;
+        let expr_idx = st.current_expr_idx;
+        st.next_cont_id += 1;
+        st.cont_captures.insert(id, expr_idx);
+        id
+    };
+    let cont = Value::Continuation(id);
+    apply_values(&proc, vec![cont], env, out)
+}
+
+/// Apply a procedure to already-evaluated argument values.
+fn apply_values(
+    proc: &Value,
+    args: Vec<Value>,
+    env: &Rc<RefCell<Env>>,
+    out: &Output,
+) -> Result<Value, EvalError> {
+    match proc {
+        Value::Lambda {
+            params,
+            rest_param,
+            body,
+            closure,
+        } => {
+            check_arity(params.len(), rest_param.is_some(), args.len())?;
+            let child = Env::extend(closure);
+            for (param, val) in params.iter().zip(&args) {
+                child.borrow_mut().define(param.clone(), val.clone());
+            }
+            if let Some(rest_name) = rest_param {
+                let rest_vals = args[params.len()..].to_vec();
+                child.borrow_mut().define(rest_name.clone(), Value::List(rest_vals));
+            }
+            eval_body(body, &child, out)
+        }
+        Value::Builtin(name) => call_builtin_with_values(name, args, env, out),
+        Value::Continuation(id) => {
+            let [value] = args.as_slice() else {
+                return Err(EvalError::WrongArgCount {
+                    expected: 1,
+                    got: args.len(),
+                });
+            };
+            Err(EvalError::ContinuationReturn {
+                id: *id,
+                value: Box::new(value.clone()),
+            })
+        }
+        _ => Err(EvalError::TypeError {
+            expected: "procedure".into(),
+            got: format!("{proc}"),
+        }),
+    }
+}
+
 /// Evaluate a function application, returning a tail action for lambda calls.
 fn eval_application_tail(
     items: &[Value],
@@ -159,6 +267,22 @@ fn eval_application_tail(
     out: &Output,
 ) -> Result<TailAction, EvalError> {
     let proc = eval(&items[0], env, out)?;
+
+    // Handle call/cc as first-class value (e.g., passed to a lambda)
+    if matches!(&proc, Value::Builtin(name) if name == "call/cc") {
+        let [proc_arg] = &items[1..] else {
+            return Err(EvalError::WrongArgCount {
+                expected: 1,
+                got: items.len() - 1,
+            });
+        };
+        if let Some(value) = out.borrow_mut().resume.take() {
+            return Ok(TailAction::Return(value));
+        }
+        let proc_val = eval(proc_arg, env, out)?;
+        return eval_callcc_core(proc_val, env, out).map(TailAction::Return);
+    }
+
     let args: Vec<Value> = items[1..]
         .iter()
         .map(|a| eval(a, env, out))
@@ -170,11 +294,21 @@ fn eval_application_tail(
             rest_param,
             body,
             closure,
-        } => {
-            bind_and_tail_call(params, rest_param, body, closure, args, out)
-        }
+        } => bind_and_tail_call(params, rest_param, body, closure, args, out),
         Value::Builtin(name) => {
             call_builtin_with_values(&name, args, env, out).map(TailAction::Return)
+        }
+        Value::Continuation(id) => {
+            let [value] = args.as_slice() else {
+                return Err(EvalError::WrongArgCount {
+                    expected: 1,
+                    got: args.len(),
+                });
+            };
+            Err(EvalError::ContinuationReturn {
+                id,
+                value: Box::new(value.clone()),
+            })
         }
         _ => Err(EvalError::TypeError {
             expected: "procedure".into(),
@@ -225,6 +359,18 @@ fn call_builtin_with_values(
 ) -> Result<Value, EvalError> {
     if name == "apply" {
         return eval_apply_values(values, env, out);
+    }
+    if name == "call/cc" || name == "call-with-current-continuation" {
+        let [proc] = values.as_slice() else {
+            return Err(EvalError::WrongArgCount {
+                expected: 1,
+                got: values.len(),
+            });
+        };
+        if let Some(value) = out.borrow_mut().resume.take() {
+            return Ok(value);
+        }
+        return eval_callcc_core(proc.clone(), env, out);
     }
     let quoted_args: Vec<Value> = values
         .into_iter()
@@ -286,6 +432,18 @@ fn eval_apply_values(
             eval_body(&body, &child, out)
         }
         Value::Builtin(name) => call_builtin_with_values(&name, combined, env, out),
+        Value::Continuation(id) => {
+            let [value] = combined.as_slice() else {
+                return Err(EvalError::WrongArgCount {
+                    expected: 1,
+                    got: combined.len(),
+                });
+            };
+            Err(EvalError::ContinuationReturn {
+                id,
+                value: Box::new(value.clone()),
+            })
+        }
         _ => Err(EvalError::TypeError {
             expected: "procedure".into(),
             got: format!("{proc}"),
@@ -479,6 +637,22 @@ fn call_proc(
             eval_body(body, &child, out)
         }
         Value::Builtin(name) => eval_builtin(name, args, env, out),
+        Value::Continuation(id) => {
+            let eval_args: Vec<Value> = args
+                .iter()
+                .map(|a| eval(a, env, out))
+                .collect::<Result<_, _>>()?;
+            let [value] = eval_args.as_slice() else {
+                return Err(EvalError::WrongArgCount {
+                    expected: 1,
+                    got: eval_args.len(),
+                });
+            };
+            Err(EvalError::ContinuationReturn {
+                id: *id,
+                value: Box::new(value.clone()),
+            })
+        }
         _ => Err(EvalError::TypeError {
             expected: "procedure".into(),
             got: format!("{proc}"),
@@ -883,7 +1057,7 @@ fn eval_display(
         });
     };
     let val = eval(arg, env, out)?;
-    out.borrow_mut().push_str(&val.display_value());
+    out.borrow_mut().output.push_str(&val.display_value());
     Ok(Value::Void)
 }
 
@@ -899,7 +1073,7 @@ fn eval_write(
         });
     };
     let val = eval(arg, env, out)?;
-    out.borrow_mut().push_str(&val.to_string());
+    out.borrow_mut().output.push_str(&val.to_string());
     Ok(Value::Void)
 }
 
@@ -910,7 +1084,7 @@ fn eval_newline(args: &[Value], out: &Output) -> Result<Value, EvalError> {
             got: args.len(),
         });
     }
-    out.borrow_mut().push('\n');
+    out.borrow_mut().output.push('\n');
     Ok(Value::Void)
 }
 
@@ -1278,6 +1452,7 @@ pub fn seed_builtins(env: &Rc<RefCell<Env>>) {
         "string-ref", "string-copy", "string->list", "list->string",
         "char->integer", "integer->char",
         "map", "apply",
+        "call/cc", "call-with-current-continuation",
     ];
     let mut env_ref = env.borrow_mut();
     for name in names {
