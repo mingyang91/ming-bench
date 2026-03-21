@@ -106,7 +106,12 @@ impl Value {
             Value::Boolean(false) => "#f".to_string(),
             Value::Str(s) => format!("\"{}\"", s),
             Value::Symbol(s) => s.clone(),
-            Value::Char(c) => format!("#\\{}", c),
+            Value::Char(c) => match c {
+                ' ' => "#\\space".to_string(),
+                '\n' => "#\\newline".to_string(),
+                '\t' => "#\\tab".to_string(),
+                _ => format!("#\\{}", c),
+            },
             Value::Lambda { .. } | Value::Builtin(_) | Value::Continuation(_) | Value::Macro { .. } => "#<procedure>".to_string(),
             Value::Vector(v) => {
                 let inner: Vec<String> = v.borrow().iter().map(|v| v.display()).collect();
@@ -1308,6 +1313,8 @@ fn is_builtin(name: &str) -> bool {
         "string->number" | "number->string" | "symbol->string" | "string->symbol" |
         "string-ref" | "string-copy" | "char?" | "string->list" | "list->string" |
         "char->integer" | "integer->char" |
+        "char=?" | "char<?" | "char-alphabetic?" | "char-numeric?" |
+        "char-upcase" | "char-downcase" |
         "eq?" | "eqv?" | "equal?" |
         "apply" | "map" |
         "call/cc" | "call-with-current-continuation" |
@@ -1801,6 +1808,60 @@ fn apply_builtin_vals(op: &str, vals: &[Value], pos: Pos) -> Result<Value, EvalE
             }
             let n = expect_int(&vals[0], pos)?;
             Ok(Value::Char(char::from_u32(n as u32).unwrap_or('\u{FFFD}')))
+        }
+        "char=?" => {
+            if vals.len() != 2 {
+                return Err(runtime_err(pos, "char=? requires 2 arguments"));
+            }
+            match (&vals[0], &vals[1]) {
+                (Value::Char(a), Value::Char(b)) => Ok(Value::Boolean(a == b)),
+                _ => Err(runtime_err(pos, "char=?: expected characters")),
+            }
+        }
+        "char<?" => {
+            if vals.len() != 2 {
+                return Err(runtime_err(pos, "char<? requires 2 arguments"));
+            }
+            match (&vals[0], &vals[1]) {
+                (Value::Char(a), Value::Char(b)) => Ok(Value::Boolean(a < b)),
+                _ => Err(runtime_err(pos, "char<?: expected characters")),
+            }
+        }
+        "char-alphabetic?" => {
+            if vals.len() != 1 {
+                return Err(runtime_err(pos, "char-alphabetic? requires 1 argument"));
+            }
+            match &vals[0] {
+                Value::Char(c) => Ok(Value::Boolean(c.is_alphabetic())),
+                _ => Err(runtime_err(pos, "char-alphabetic?: expected char")),
+            }
+        }
+        "char-numeric?" => {
+            if vals.len() != 1 {
+                return Err(runtime_err(pos, "char-numeric? requires 1 argument"));
+            }
+            match &vals[0] {
+                Value::Char(c) => Ok(Value::Boolean(c.is_ascii_digit())),
+                _ => Err(runtime_err(pos, "char-numeric?: expected char")),
+            }
+        }
+        "char-upcase" => {
+            if vals.len() != 1 {
+                return Err(runtime_err(pos, "char-upcase requires 1 argument"));
+            }
+            match &vals[0] {
+                Value::Char(c) => Ok(Value::Char(c.to_ascii_uppercase())),
+                _ => Err(runtime_err(pos, "char-upcase: expected char")),
+            }
+        }
+        "char-downcase" => {
+            if vals.len() != 1 {
+                return Err(runtime_err(pos, "char-downcase requires 1 argument"));
+            }
+            match &vals[0] {
+                Value::Char(c) => Ok(Value::Char(c.to_ascii_lowercase())),
+                _ => Err(runtime_err(pos, "char-downcase: expected char")),
+            }
         }
         "vector" => {
             Ok(Value::Vector(Rc::new(RefCell::new(vals.to_vec()))))
