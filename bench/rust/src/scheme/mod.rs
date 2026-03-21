@@ -45,8 +45,7 @@ fn eval_program(input: &str, ctx: &mut EvalContext) -> Result<Value, EvalError> 
     }
 
     let env = Env::global();
-    let outcome = eval_tail_sequence(&program, env, ctx)?;
-    resolve_tail_outcome(outcome, ctx)
+    run_machine(&program, env, ctx)
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -96,6 +95,7 @@ enum ExprKind {
 }
 
 type StringRef = Rc<RefCell<String>>;
+type ContinuationRef = Rc<MachineContinuation>;
 
 #[derive(Debug, Clone)]
 enum Value {
@@ -107,6 +107,7 @@ enum Value {
     List(Vec<Value>),
     Builtin(Builtin),
     Procedure(Rc<LambdaProcedure>),
+    Continuation(ContinuationRef),
     Void,
 }
 
@@ -127,7 +128,7 @@ impl Value {
             Self::Char(_) => "char",
             Self::Symbol(_) => "symbol",
             Self::List(_) => "list",
-            Self::Builtin(_) | Self::Procedure(_) => "procedure",
+            Self::Builtin(_) | Self::Procedure(_) | Self::Continuation(_) => "procedure",
             Self::Void => "void",
         }
     }
@@ -161,7 +162,9 @@ impl Value {
                     .join(" ");
                 format!("({rendered})")
             }
-            Self::Builtin(_) | Self::Procedure(_) => "#<procedure>".to_string(),
+            Self::Builtin(_) | Self::Procedure(_) | Self::Continuation(_) => {
+                "#<procedure>".to_string()
+            }
             Self::Void => "#<void>".to_string(),
         }
     }
@@ -196,6 +199,7 @@ enum Builtin {
     Null,
     List,
     Apply,
+    CallCc,
     Length,
     Display,
     Write,
@@ -219,7 +223,7 @@ enum Builtin {
 }
 
 impl Builtin {
-    const ALL: [Self; 35] = [
+    const ALL: [Self; 36] = [
         Self::Add,
         Self::Sub,
         Self::Mul,
@@ -235,6 +239,7 @@ impl Builtin {
         Self::Null,
         Self::List,
         Self::Apply,
+        Self::CallCc,
         Self::Length,
         Self::Display,
         Self::Write,
@@ -274,6 +279,7 @@ impl Builtin {
             Self::Null => "null?",
             Self::List => "list",
             Self::Apply => "apply",
+            Self::CallCc => "call/cc",
             Self::Length => "length",
             Self::Display => "display",
             Self::Write => "write",
@@ -390,6 +396,739 @@ struct LetForm<'a> {
     name: Option<&'a str>,
     bindings_expr: &'a Expr,
     body: &'a [Expr],
+}
+
+#[derive(Debug, Clone)]
+enum MachineLetMode {
+    Plain,
+    Named(String),
+}
+
+#[derive(Debug)]
+enum MachineContinuation {
+    Halt,
+    Sequence {
+        exprs: Rc<[Expr]>,
+        index: usize,
+        env: EnvRef,
+        next: ContinuationRef,
+    },
+    If {
+        consequent: Expr,
+        alternate: Expr,
+        env: EnvRef,
+        next: ContinuationRef,
+    },
+    And {
+        exprs: Rc<[Expr]>,
+        index: usize,
+        env: EnvRef,
+        next: ContinuationRef,
+    },
+    Or {
+        exprs: Rc<[Expr]>,
+        index: usize,
+        env: EnvRef,
+        next: ContinuationRef,
+    },
+    CallHead {
+        args: Rc<[Expr]>,
+        env: EnvRef,
+        pos: SourcePos,
+        next: ContinuationRef,
+    },
+    CallArg {
+        function: Value,
+        args: Rc<[Expr]>,
+        index: usize,
+        evaluated: Vec<Value>,
+        env: EnvRef,
+        pos: SourcePos,
+        next: ContinuationRef,
+    },
+    DefineValue {
+        name: String,
+        env: EnvRef,
+        next: ContinuationRef,
+    },
+    SetValue {
+        name: String,
+        env: EnvRef,
+        pos: SourcePos,
+        next: ContinuationRef,
+    },
+    LetBinding {
+        mode: MachineLetMode,
+        names: Rc<[String]>,
+        exprs: Rc<[Expr]>,
+        index: usize,
+        values: Vec<Value>,
+        env: EnvRef,
+        body: Rc<[Expr]>,
+        pos: SourcePos,
+        next: ContinuationRef,
+    },
+    Cond {
+        clauses: Rc<[Expr]>,
+        index: usize,
+        env: EnvRef,
+        next: ContinuationRef,
+    },
+}
+
+#[derive(Debug)]
+enum MachineControl {
+    Expr(Expr, EnvRef),
+    Apply {
+        function: Value,
+        args: Vec<Value>,
+        pos: SourcePos,
+    },
+    Value(Value),
+}
+
+fn run_machine(exprs: &[Expr], env: EnvRef, ctx: &mut EvalContext) -> Result<Value, EvalError> {
+    let halt = Rc::new(MachineContinuation::Halt);
+    let (mut control, mut cont) = schedule_sequence(exprs, env, halt);
+
+    loop {
+        match control {
+            MachineControl::Expr(expr, env) => {
+                let (next_control, next_cont) = match &expr.kind {
+                    ExprKind::Bool(value) => (MachineControl::Value(Value::Bool(*value)), cont),
+                    ExprKind::Number(value) => (MachineControl::Value(Value::Number(*value)), cont),
+                    ExprKind::Char(value) => (MachineControl::Value(Value::Char(*value)), cont),
+                    ExprKind::String(value) => {
+                        (MachineControl::Value(Value::string(value.clone())), cont)
+                    }
+                    ExprKind::Symbol(name) => {
+                        let value = Env::lookup(&env, name).ok_or_else(|| {
+                            EvalError::UnboundSymbol(name.clone()).with_position(expr.pos)
+                        })?;
+                        (MachineControl::Value(value), cont)
+                    }
+                    ExprKind::List(items) => {
+                        schedule_list_eval(items, expr.pos, env, cont)
+                            .map_err(|err| err.with_position(expr.pos))?
+                    }
+                };
+
+                control = next_control;
+                cont = next_cont;
+            }
+            MachineControl::Apply {
+                function,
+                args,
+                pos,
+            } => match function {
+                Value::Builtin(Builtin::Apply) => {
+                    let (function, args) =
+                        expand_apply_args(&args).map_err(|err| err.with_position(pos))?;
+                    control = MachineControl::Apply {
+                        function,
+                        args,
+                        pos,
+                    };
+                }
+                Value::Builtin(Builtin::CallCc) => {
+                    if args.len() != 1 {
+                        return Err(wrong_arg_count("call/cc", "exactly 1", args.len())
+                            .with_position(pos));
+                    }
+
+                    control = MachineControl::Apply {
+                        function: args[0].clone(),
+                        args: vec![Value::Continuation(cont.clone())],
+                        pos,
+                    };
+                }
+                Value::Builtin(builtin) => {
+                    let value = apply_builtin(builtin, &args, ctx)
+                        .map_err(|err| err.with_position(pos))?;
+                    control = MachineControl::Value(value);
+                }
+                Value::Procedure(procedure) => {
+                    let local_env =
+                        bind_call_env(&procedure, &args).map_err(|err| err.with_position(pos))?;
+                    let (next_control, next_cont) = schedule_sequence(&procedure.body, local_env, cont);
+                    control = next_control;
+                    cont = next_cont;
+                }
+                Value::Continuation(saved) => {
+                    if args.len() != 1 {
+                        return Err(wrong_arg_count("continuation", "exactly 1", args.len())
+                            .with_position(pos));
+                    }
+
+                    control = MachineControl::Value(args[0].clone());
+                    cont = saved;
+                }
+                other => {
+                    return Err(EvalError::NotAProcedure(other.to_string()).with_position(pos));
+                }
+            },
+            MachineControl::Value(value) => match cont.as_ref() {
+                MachineContinuation::Halt => return Ok(value),
+                MachineContinuation::Sequence {
+                    exprs,
+                    index,
+                    env,
+                    next,
+                } => {
+                    let expr = exprs[*index].clone();
+                    let next_cont = if *index + 1 < exprs.len() {
+                        Rc::new(MachineContinuation::Sequence {
+                            exprs: exprs.clone(),
+                            index: index + 1,
+                            env: env.clone(),
+                            next: next.clone(),
+                        })
+                    } else {
+                        next.clone()
+                    };
+
+                    control = MachineControl::Expr(expr, env.clone());
+                    cont = next_cont;
+                }
+                MachineContinuation::If {
+                    consequent,
+                    alternate,
+                    env,
+                    next,
+                } => {
+                    let branch = if value.is_truthy() {
+                        consequent.clone()
+                    } else {
+                        alternate.clone()
+                    };
+                    control = MachineControl::Expr(branch, env.clone());
+                    cont = next.clone();
+                }
+                MachineContinuation::And {
+                    exprs,
+                    index,
+                    env,
+                    next,
+                } => {
+                    if !value.is_truthy() || *index >= exprs.len() {
+                        control = MachineControl::Value(value);
+                        cont = next.clone();
+                    } else {
+                        let expr = exprs[*index].clone();
+                        let next_cont = if *index + 1 < exprs.len() {
+                            Rc::new(MachineContinuation::And {
+                                exprs: exprs.clone(),
+                                index: index + 1,
+                                env: env.clone(),
+                                next: next.clone(),
+                            })
+                        } else {
+                            next.clone()
+                        };
+                        control = MachineControl::Expr(expr, env.clone());
+                        cont = next_cont;
+                    }
+                }
+                MachineContinuation::Or {
+                    exprs,
+                    index,
+                    env,
+                    next,
+                } => {
+                    if value.is_truthy() || *index >= exprs.len() {
+                        control = MachineControl::Value(value);
+                        cont = next.clone();
+                    } else {
+                        let expr = exprs[*index].clone();
+                        let next_cont = if *index + 1 < exprs.len() {
+                            Rc::new(MachineContinuation::Or {
+                                exprs: exprs.clone(),
+                                index: index + 1,
+                                env: env.clone(),
+                                next: next.clone(),
+                            })
+                        } else {
+                            next.clone()
+                        };
+                        control = MachineControl::Expr(expr, env.clone());
+                        cont = next_cont;
+                    }
+                }
+                MachineContinuation::CallHead {
+                    args,
+                    env,
+                    pos,
+                    next,
+                } => {
+                    if args.is_empty() {
+                        control = MachineControl::Apply {
+                            function: value,
+                            args: Vec::new(),
+                            pos: *pos,
+                        };
+                        cont = next.clone();
+                    } else {
+                        let last_index = args.len() - 1;
+                        control = MachineControl::Expr(args[last_index].clone(), env.clone());
+                        cont = Rc::new(MachineContinuation::CallArg {
+                            function: value,
+                            args: args.clone(),
+                            index: last_index,
+                            evaluated: Vec::new(),
+                            env: env.clone(),
+                            pos: *pos,
+                            next: next.clone(),
+                        });
+                    }
+                }
+                MachineContinuation::CallArg {
+                    function,
+                    args,
+                    index,
+                    evaluated,
+                    env,
+                    pos,
+                    next,
+                } => {
+                    let mut evaluated = evaluated.clone();
+                    evaluated.insert(0, value);
+
+                    if *index == 0 {
+                        control = MachineControl::Apply {
+                            function: function.clone(),
+                            args: evaluated,
+                            pos: *pos,
+                        };
+                        cont = next.clone();
+                    } else {
+                        let next_index = index - 1;
+                        control = MachineControl::Expr(args[next_index].clone(), env.clone());
+                        cont = Rc::new(MachineContinuation::CallArg {
+                            function: function.clone(),
+                            args: args.clone(),
+                            index: next_index,
+                            evaluated,
+                            env: env.clone(),
+                            pos: *pos,
+                            next: next.clone(),
+                        });
+                    }
+                }
+                MachineContinuation::DefineValue { name, env, next } => {
+                    Env::define(env, name.clone(), value);
+                    control = MachineControl::Value(Value::Void);
+                    cont = next.clone();
+                }
+                MachineContinuation::SetValue {
+                    name,
+                    env,
+                    pos,
+                    next,
+                } => {
+                    Env::set(env, name, value).map_err(|err| err.with_position(*pos))?;
+                    control = MachineControl::Value(Value::Void);
+                    cont = next.clone();
+                }
+                MachineContinuation::LetBinding {
+                    mode,
+                    names,
+                    exprs,
+                    index,
+                    values,
+                    env,
+                    body,
+                    pos,
+                    next,
+                } => {
+                    let mut values = values.clone();
+                    values.push(value);
+
+                    if *index >= exprs.len() {
+                        let (next_control, next_cont) = finish_let(
+                            mode.clone(),
+                            names.as_ref(),
+                            values,
+                            env.clone(),
+                            body.clone(),
+                            *pos,
+                            next.clone(),
+                        )
+                        .map_err(|err| err.with_position(*pos))?;
+                        control = next_control;
+                        cont = next_cont;
+                    } else {
+                        control = MachineControl::Expr(exprs[*index].clone(), env.clone());
+                        cont = Rc::new(MachineContinuation::LetBinding {
+                            mode: mode.clone(),
+                            names: names.clone(),
+                            exprs: exprs.clone(),
+                            index: index + 1,
+                            values,
+                            env: env.clone(),
+                            body: body.clone(),
+                            pos: *pos,
+                            next: next.clone(),
+                        });
+                    }
+                }
+                MachineContinuation::Cond {
+                    clauses,
+                    index,
+                    env,
+                    next,
+                } => {
+                    let clause = &clauses[*index];
+                    let ExprKind::List(items) = &clause.kind else {
+                        return Err(EvalError::Syntax("cond clauses must be lists".into())
+                            .with_position(clause.pos));
+                    };
+                    let Some((_test, body)) = items.split_first() else {
+                        return Err(EvalError::Syntax("cond clauses cannot be empty".into())
+                            .with_position(clause.pos));
+                    };
+
+                    if value.is_truthy() {
+                        if body.is_empty() {
+                            control = MachineControl::Value(value);
+                            cont = next.clone();
+                        } else {
+                            let (next_control, next_cont) =
+                                schedule_sequence(body, env.clone(), next.clone());
+                            control = next_control;
+                            cont = next_cont;
+                        }
+                    } else {
+                        let (next_control, next_cont) = schedule_cond(
+                            clauses.as_ref(),
+                            index + 1,
+                            env.clone(),
+                            next.clone(),
+                        )
+                        .map_err(|err| err.with_position(clause.pos))?;
+                        control = next_control;
+                        cont = next_cont;
+                    }
+                }
+            },
+        }
+    }
+}
+
+fn schedule_sequence(
+    exprs: &[Expr],
+    env: EnvRef,
+    next: ContinuationRef,
+) -> (MachineControl, ContinuationRef) {
+    let Some((first, _rest)) = exprs.split_first() else {
+        return (MachineControl::Value(Value::Void), next);
+    };
+
+    if exprs.len() == 1 {
+        return (MachineControl::Expr(first.clone(), env), next);
+    }
+
+    let exprs: Rc<[Expr]> = Rc::from(exprs.to_vec());
+    let cont = Rc::new(MachineContinuation::Sequence {
+        exprs,
+        index: 1,
+        env: env.clone(),
+        next,
+    });
+    (MachineControl::Expr(first.clone(), env), cont)
+}
+
+fn schedule_list_eval(
+    items: &[Expr],
+    pos: SourcePos,
+    env: EnvRef,
+    next: ContinuationRef,
+) -> Result<(MachineControl, ContinuationRef), EvalError> {
+    let Some((head, args)) = items.split_first() else {
+        return Err(EvalError::Syntax("cannot evaluate an empty list".into()).with_position(pos));
+    };
+
+    match &head.kind {
+        ExprKind::Symbol(name) if name == "and" => Ok(schedule_and(args, env, next)),
+        ExprKind::Symbol(name) if name == "or" => Ok(schedule_or(args, env, next)),
+        ExprKind::Symbol(name) if name == "if" => {
+            if args.len() != 3 {
+                return Err(wrong_arg_count("if", "exactly 3", args.len()));
+            }
+
+            Ok((
+                MachineControl::Expr(args[0].clone(), env.clone()),
+                Rc::new(MachineContinuation::If {
+                    consequent: args[1].clone(),
+                    alternate: args[2].clone(),
+                    env,
+                    next,
+                }),
+            ))
+        }
+        ExprKind::Symbol(name) if name == "let" => schedule_let(args, pos, env, next),
+        ExprKind::Symbol(name) if name == "begin" => Ok(schedule_sequence(args, env, next)),
+        ExprKind::Symbol(name) if name == "cond" => schedule_cond(args, 0, env, next),
+        ExprKind::Symbol(name) if name == "quote" => {
+            Ok((MachineControl::Value(eval_quote(args)?), next))
+        }
+        ExprKind::Symbol(name) if name == "define" => schedule_define(args, env, next),
+        ExprKind::Symbol(name) if name == "set!" => schedule_set(args, pos, env, next),
+        ExprKind::Symbol(name) if name == "lambda" => {
+            Ok((MachineControl::Value(eval_lambda(args, env)?), next))
+        }
+        _ => Ok(schedule_application(head, args, env, pos, next)),
+    }
+}
+
+fn schedule_and(
+    args: &[Expr],
+    env: EnvRef,
+    next: ContinuationRef,
+) -> (MachineControl, ContinuationRef) {
+    let Some((first, _rest)) = args.split_first() else {
+        return (MachineControl::Value(Value::Bool(true)), next);
+    };
+
+    if args.len() == 1 {
+        return (MachineControl::Expr(first.clone(), env), next);
+    }
+
+    let exprs: Rc<[Expr]> = Rc::from(args.to_vec());
+    let cont = Rc::new(MachineContinuation::And {
+        exprs,
+        index: 1,
+        env: env.clone(),
+        next,
+    });
+    (MachineControl::Expr(first.clone(), env), cont)
+}
+
+fn schedule_or(
+    args: &[Expr],
+    env: EnvRef,
+    next: ContinuationRef,
+) -> (MachineControl, ContinuationRef) {
+    let Some((first, _rest)) = args.split_first() else {
+        return (MachineControl::Value(Value::Bool(false)), next);
+    };
+
+    if args.len() == 1 {
+        return (MachineControl::Expr(first.clone(), env), next);
+    }
+
+    let exprs: Rc<[Expr]> = Rc::from(args.to_vec());
+    let cont = Rc::new(MachineContinuation::Or {
+        exprs,
+        index: 1,
+        env: env.clone(),
+        next,
+    });
+    (MachineControl::Expr(first.clone(), env), cont)
+}
+
+fn schedule_application(
+    head: &Expr,
+    args: &[Expr],
+    env: EnvRef,
+    pos: SourcePos,
+    next: ContinuationRef,
+) -> (MachineControl, ContinuationRef) {
+    let args: Rc<[Expr]> = Rc::from(args.to_vec());
+    let cont = Rc::new(MachineContinuation::CallHead {
+        args,
+        env: env.clone(),
+        pos,
+        next,
+    });
+    (MachineControl::Expr(head.clone(), env), cont)
+}
+
+fn schedule_define(
+    args: &[Expr],
+    env: EnvRef,
+    next: ContinuationRef,
+) -> Result<(MachineControl, ContinuationRef), EvalError> {
+    if args.len() < 2 {
+        return Err(wrong_arg_count("define", "at least 2", args.len()));
+    }
+
+    match &args[0].kind {
+        ExprKind::Symbol(name) => {
+            if args.len() != 2 {
+                return Err(wrong_arg_count("define", "exactly 2", args.len()));
+            }
+
+            Ok((
+                MachineControl::Expr(args[1].clone(), env.clone()),
+                Rc::new(MachineContinuation::DefineValue {
+                    name: name.clone(),
+                    env,
+                    next,
+                }),
+            ))
+        }
+        ExprKind::List(signature) => {
+            let Some((name, params)) = signature.split_first() else {
+                return Err(EvalError::Syntax("define requires a function name".into()));
+            };
+            let name = expect_symbol(name, "function name")?;
+            let params = parse_parameters(params)?;
+            let procedure = Value::Procedure(Rc::new(LambdaProcedure {
+                name: Some(name.clone()),
+                params,
+                body: args[1..].to_vec(),
+                env: env.clone(),
+            }));
+            Env::define(&env, name, procedure);
+            Ok((MachineControl::Value(Value::Void), next))
+        }
+        _ => Err(EvalError::Syntax(
+            "define requires a symbol or function signature".into(),
+        )),
+    }
+}
+
+fn schedule_set(
+    args: &[Expr],
+    pos: SourcePos,
+    env: EnvRef,
+    next: ContinuationRef,
+) -> Result<(MachineControl, ContinuationRef), EvalError> {
+    if args.len() != 2 {
+        return Err(wrong_arg_count("set!", "exactly 2", args.len()));
+    }
+
+    let name = expect_symbol(&args[0], "set! target")?;
+    Ok((
+        MachineControl::Expr(args[1].clone(), env.clone()),
+        Rc::new(MachineContinuation::SetValue {
+            name,
+            env,
+            pos,
+            next,
+        }),
+    ))
+}
+
+fn schedule_let(
+    args: &[Expr],
+    pos: SourcePos,
+    env: EnvRef,
+    next: ContinuationRef,
+) -> Result<(MachineControl, ContinuationRef), EvalError> {
+    let form = parse_let_form(args)?;
+    let bindings = parse_let_bindings(form.bindings_expr)?;
+    let mode = match form.name {
+        Some(name) => MachineLetMode::Named(name.to_string()),
+        None => MachineLetMode::Plain,
+    };
+    let names: Vec<String> = bindings.iter().map(|(name, _)| name.clone()).collect();
+    let exprs: Vec<Expr> = bindings.into_iter().map(|(_, expr)| expr).collect();
+    let body: Rc<[Expr]> = Rc::from(form.body.to_vec());
+
+    if exprs.is_empty() {
+        return finish_let(mode, &names, Vec::new(), env, body, pos, next);
+    }
+
+    let names: Rc<[String]> = Rc::from(names);
+    let exprs: Rc<[Expr]> = Rc::from(exprs);
+
+    Ok((
+        MachineControl::Expr(exprs[0].clone(), env.clone()),
+        Rc::new(MachineContinuation::LetBinding {
+            mode,
+            names,
+            exprs: exprs.clone(),
+            index: 1,
+            values: Vec::new(),
+            env,
+            body,
+            pos,
+            next,
+        }),
+    ))
+}
+
+fn finish_let(
+    mode: MachineLetMode,
+    names: &[String],
+    values: Vec<Value>,
+    env: EnvRef,
+    body: Rc<[Expr]>,
+    pos: SourcePos,
+    next: ContinuationRef,
+) -> Result<(MachineControl, ContinuationRef), EvalError> {
+    match mode {
+        MachineLetMode::Plain => {
+            let local_env = bind_names(env, names, &values);
+            Ok(schedule_sequence(body.as_ref(), local_env, next))
+        }
+        MachineLetMode::Named(name) => {
+            let local_env = Env::child(env);
+            let procedure = Rc::new(LambdaProcedure {
+                name: Some(name.clone()),
+                params: Parameters {
+                    required: names.to_vec(),
+                    rest: None,
+                },
+                body: body.as_ref().to_vec(),
+                env: local_env.clone(),
+            });
+            Env::define(&local_env, name, Value::Procedure(procedure.clone()));
+            Ok((
+                MachineControl::Apply {
+                    function: Value::Procedure(procedure),
+                    args: values,
+                    pos,
+                },
+                next,
+            ))
+        }
+    }
+}
+
+fn schedule_cond(
+    clauses: &[Expr],
+    index: usize,
+    env: EnvRef,
+    next: ContinuationRef,
+) -> Result<(MachineControl, ContinuationRef), EvalError> {
+    let Some(clause) = clauses.get(index) else {
+        return Ok((MachineControl::Value(Value::Void), next));
+    };
+
+    let ExprKind::List(items) = &clause.kind else {
+        return Err(EvalError::Syntax("cond clauses must be lists".into())
+            .with_position(clause.pos));
+    };
+    let Some((test, body)) = items.split_first() else {
+        return Err(EvalError::Syntax("cond clauses cannot be empty".into())
+            .with_position(clause.pos));
+    };
+
+    match &test.kind {
+        ExprKind::Symbol(name) if name == "else" => {
+            if index + 1 != clauses.len() {
+                return Err(EvalError::Syntax("cond else clause must be last".into())
+                    .with_position(clause.pos));
+            }
+            if body.is_empty() {
+                return Err(EvalError::Syntax("cond else clause requires a body".into())
+                    .with_position(clause.pos));
+            }
+
+            Ok(schedule_sequence(body, env, next))
+        }
+        _ => Ok((
+            MachineControl::Expr(test.clone(), env.clone()),
+            Rc::new(MachineContinuation::Cond {
+                clauses: Rc::from(clauses.to_vec()),
+                index,
+                env,
+                next,
+            }),
+        )),
+    }
 }
 
 fn eval_sequence(exprs: &[Expr], env: EnvRef, ctx: &mut EvalContext) -> Result<Value, EvalError> {
@@ -1251,6 +1990,7 @@ fn apply_builtin(
         }
         Builtin::List => Ok(Value::List(args.to_vec())),
         Builtin::Apply => unreachable!("apply is handled by dispatch_builtin_call"),
+        Builtin::CallCc => unreachable!("call/cc is handled by the machine runtime"),
         Builtin::Length => {
             if args.len() != 1 {
                 return Err(wrong_arg_count(name, "exactly 1", args.len()));
