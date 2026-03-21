@@ -6,11 +6,18 @@ use crate::scheme::builtins::BuiltinProcedure;
 use crate::scheme::environment::Environment;
 use crate::scheme::error::EvalError;
 
+#[derive(Clone, Copy)]
+enum RenderMode {
+    Write,
+    Display,
+}
+
 #[derive(Clone)]
 pub enum Value {
     Integer(i64),
     Boolean(bool),
     String(String),
+    Character(char),
     Symbol(String),
     EmptyList,
     Pair(Box<Value>, Box<Value>),
@@ -51,13 +58,22 @@ impl fmt::Debug for Value {
 
 impl Value {
     pub fn render(&self) -> String {
+        self.render_with_mode(RenderMode::Write)
+    }
+
+    pub fn render_display(&self) -> String {
+        self.render_with_mode(RenderMode::Display)
+    }
+
+    fn render_with_mode(&self, mode: RenderMode) -> String {
         match self {
             Self::Integer(value) => value.to_string(),
             Self::Boolean(value) => render_boolean(*value),
-            Self::String(value) => format!("\"{}\"", escape_string_contents(value)),
+            Self::String(value) => render_string(value, mode),
+            Self::Character(value) => render_character(*value, mode),
             Self::Symbol(value) => value.clone(),
             Self::EmptyList => "()".into(),
-            Self::Pair(car, cdr) => render_pair(car, cdr),
+            Self::Pair(car, cdr) => render_pair(car, cdr, mode),
             Self::Builtin(procedure) => format!("#<procedure:{}>", procedure.name()),
             Self::Closure(closure) => render_closure(closure),
             Self::Void => "#<void>".into(),
@@ -75,6 +91,28 @@ impl Value {
         }
     }
 
+    pub fn expect_string(&self, location: SourceLocation) -> Result<&str, EvalError> {
+        match self {
+            Self::String(value) => Ok(value),
+            _ => Err(EvalError::TypeMismatch {
+                location,
+                expected: "string",
+                found: self.type_name(),
+            }),
+        }
+    }
+
+    pub fn expect_symbol(&self, location: SourceLocation) -> Result<&str, EvalError> {
+        match self {
+            Self::Symbol(value) => Ok(value),
+            _ => Err(EvalError::TypeMismatch {
+                location,
+                expected: "symbol",
+                found: self.type_name(),
+            }),
+        }
+    }
+
     pub fn is_truthy(&self) -> bool {
         !matches!(self, Self::Boolean(false))
     }
@@ -84,6 +122,7 @@ impl Value {
             Self::Integer(_) => "number",
             Self::Boolean(_) => "boolean",
             Self::String(_) => "string",
+            Self::Character(_) => "char",
             Self::Symbol(_) => "symbol",
             Self::EmptyList => "null",
             Self::Pair(_, _) => "pair",
@@ -98,6 +137,24 @@ fn render_boolean(value: bool) -> String {
         "#t".into()
     } else {
         "#f".into()
+    }
+}
+
+fn render_string(value: &str, mode: RenderMode) -> String {
+    match mode {
+        RenderMode::Write => format!("\"{}\"", escape_string_contents(value)),
+        RenderMode::Display => value.to_string(),
+    }
+}
+
+fn render_character(value: char, mode: RenderMode) -> String {
+    match mode {
+        RenderMode::Display => value.to_string(),
+        RenderMode::Write => match value {
+            ' ' => "#\\space".into(),
+            '\n' => "#\\newline".into(),
+            _ => format!("#\\{value}"),
+        },
     }
 }
 
@@ -122,25 +179,25 @@ fn render_closure(closure: &Closure) -> String {
     )
 }
 
-fn render_pair(car: &Value, cdr: &Value) -> String {
+fn render_pair(car: &Value, cdr: &Value, mode: RenderMode) -> String {
     let mut rendered = String::from("(");
-    render_pair_contents(car, cdr, &mut rendered);
+    render_pair_contents(car, cdr, mode, &mut rendered);
     rendered.push(')');
     rendered
 }
 
-fn render_pair_contents(car: &Value, cdr: &Value, rendered: &mut String) {
-    rendered.push_str(&car.render());
+fn render_pair_contents(car: &Value, cdr: &Value, mode: RenderMode, rendered: &mut String) {
+    rendered.push_str(&car.render_with_mode(mode));
 
     match cdr {
         Value::EmptyList => {}
         Value::Pair(item, remainder) => {
             rendered.push(' ');
-            render_pair_contents(item, remainder, rendered);
+            render_pair_contents(item, remainder, mode, rendered);
         }
         other => {
             rendered.push_str(" . ");
-            rendered.push_str(&other.render());
+            rendered.push_str(&other.render_with_mode(mode));
         }
     }
 }

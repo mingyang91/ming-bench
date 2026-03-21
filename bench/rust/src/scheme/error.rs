@@ -87,6 +87,19 @@ pub enum EvalError {
         expected: &'static str,
         found: &'static str,
     },
+    #[error("{location}: string index {index} out of bounds for length {length}")]
+    StringIndexOutOfBounds {
+        location: SourceLocation,
+        index: i64,
+        length: usize,
+    },
+    #[error("{location}: invalid substring range [{start}, {end}) for string length {length}")]
+    InvalidSubstringRange {
+        location: SourceLocation,
+        start: i64,
+        end: i64,
+        length: usize,
+    },
     #[error("{location}: division by zero")]
     DivisionByZero { location: SourceLocation },
 }

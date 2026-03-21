@@ -25,6 +25,18 @@ pub enum BuiltinProcedure {
     BooleanPred,
     PairPred,
     SymbolPred,
+    Display,
+    Write,
+    Newline,
+    StringAppend,
+    StringLength,
+    Substring,
+    StringToNumber,
+    NumberToString,
+    SymbolToString,
+    StringToSymbol,
+    StringRef,
+    CharPred,
 }
 
 impl BuiltinProcedure {
@@ -50,6 +62,18 @@ impl BuiltinProcedure {
             Self::BooleanPred => "boolean?",
             Self::PairPred => "pair?",
             Self::SymbolPred => "symbol?",
+            Self::Display => "display",
+            Self::Write => "write",
+            Self::Newline => "newline",
+            Self::StringAppend => "string-append",
+            Self::StringLength => "string-length",
+            Self::Substring => "substring",
+            Self::StringToNumber => "string->number",
+            Self::NumberToString => "number->string",
+            Self::SymbolToString => "symbol->string",
+            Self::StringToSymbol => "string->symbol",
+            Self::StringRef => "string-ref",
+            Self::CharPred => "char?",
         }
     }
 }
@@ -76,6 +100,18 @@ pub fn install_builtins(environment: &Environment) {
         BuiltinProcedure::BooleanPred,
         BuiltinProcedure::PairPred,
         BuiltinProcedure::SymbolPred,
+        BuiltinProcedure::Display,
+        BuiltinProcedure::Write,
+        BuiltinProcedure::Newline,
+        BuiltinProcedure::StringAppend,
+        BuiltinProcedure::StringLength,
+        BuiltinProcedure::Substring,
+        BuiltinProcedure::StringToNumber,
+        BuiltinProcedure::NumberToString,
+        BuiltinProcedure::SymbolToString,
+        BuiltinProcedure::StringToSymbol,
+        BuiltinProcedure::StringRef,
+        BuiltinProcedure::CharPred,
     ];
 
     BUILTIN_PROCEDURES.iter().copied().for_each(|procedure| {
@@ -87,6 +123,7 @@ pub fn apply_builtin(
     procedure: BuiltinProcedure,
     arguments: &[Value],
     location: SourceLocation,
+    output: &mut String,
 ) -> Result<Value, EvalError> {
     match procedure {
         BuiltinProcedure::Add => eval_add(arguments, location),
@@ -125,6 +162,18 @@ pub fn apply_builtin(
         BuiltinProcedure::SymbolPred => {
             eval_type_predicate("symbol?", arguments, location, is_symbol)
         }
+        BuiltinProcedure::Display => eval_display(arguments, location, output),
+        BuiltinProcedure::Write => eval_write(arguments, location, output),
+        BuiltinProcedure::Newline => eval_newline(arguments, location, output),
+        BuiltinProcedure::StringAppend => eval_string_append(arguments, location),
+        BuiltinProcedure::StringLength => eval_string_length(arguments, location),
+        BuiltinProcedure::Substring => eval_substring(arguments, location),
+        BuiltinProcedure::StringToNumber => eval_string_to_number(arguments, location),
+        BuiltinProcedure::NumberToString => eval_number_to_string(arguments, location),
+        BuiltinProcedure::SymbolToString => eval_symbol_to_string(arguments, location),
+        BuiltinProcedure::StringToSymbol => eval_string_to_symbol(arguments, location),
+        BuiltinProcedure::StringRef => eval_string_ref(arguments, location),
+        BuiltinProcedure::CharPred => eval_type_predicate("char?", arguments, location, is_char),
     }
 }
 
@@ -286,6 +335,179 @@ fn eval_length(arguments: &[Value], location: SourceLocation) -> Result<Value, E
     ))
 }
 
+fn eval_display(
+    arguments: &[Value],
+    location: SourceLocation,
+    output: &mut String,
+) -> Result<Value, EvalError> {
+    let value = unary_argument("display", arguments, location)?;
+    output.push_str(&value.render_display());
+    Ok(Value::Void)
+}
+
+fn eval_write(
+    arguments: &[Value],
+    location: SourceLocation,
+    output: &mut String,
+) -> Result<Value, EvalError> {
+    let value = unary_argument("write", arguments, location)?;
+    output.push_str(&value.render());
+    Ok(Value::Void)
+}
+
+fn eval_newline(
+    arguments: &[Value],
+    location: SourceLocation,
+    output: &mut String,
+) -> Result<Value, EvalError> {
+    if !arguments.is_empty() {
+        return Err(EvalError::WrongArgumentCount {
+            location,
+            procedure: "newline",
+            expected: ArgCount::Exactly(0),
+            got: arguments.len(),
+        });
+    }
+
+    output.push('\n');
+    Ok(Value::Void)
+}
+
+fn eval_string_append(arguments: &[Value], location: SourceLocation) -> Result<Value, EvalError> {
+    let combined = arguments
+        .iter()
+        .try_fold(String::new(), |mut combined, argument| {
+            combined.push_str(argument.expect_string(location)?);
+            Ok::<_, EvalError>(combined)
+        })?;
+
+    Ok(Value::String(combined))
+}
+
+fn eval_string_length(arguments: &[Value], location: SourceLocation) -> Result<Value, EvalError> {
+    let string = unary_argument("string-length", arguments, location)?.expect_string(location)?;
+    let length = string.chars().count();
+
+    Ok(Value::Integer(
+        i64::try_from(length).expect("string length should fit in i64"),
+    ))
+}
+
+fn eval_substring(arguments: &[Value], location: SourceLocation) -> Result<Value, EvalError> {
+    let [string_value, start_value, end_value] = arguments else {
+        return Err(EvalError::WrongArgumentCount {
+            location,
+            procedure: "substring",
+            expected: ArgCount::Exactly(3),
+            got: arguments.len(),
+        });
+    };
+
+    let string = string_value.expect_string(location)?;
+    let start = start_value.expect_number(location)?;
+    let end = end_value.expect_number(location)?;
+    let characters: Vec<_> = string.chars().collect();
+    let length = characters.len();
+    let Some(start_index) = usize::try_from(start).ok() else {
+        return Err(EvalError::InvalidSubstringRange {
+            location,
+            start,
+            end,
+            length,
+        });
+    };
+    let Some(end_index) = usize::try_from(end).ok() else {
+        return Err(EvalError::InvalidSubstringRange {
+            location,
+            start,
+            end,
+            length,
+        });
+    };
+
+    if start_index > end_index || end_index > length {
+        return Err(EvalError::InvalidSubstringRange {
+            location,
+            start,
+            end,
+            length,
+        });
+    }
+
+    Ok(Value::String(
+        characters[start_index..end_index].iter().collect(),
+    ))
+}
+
+fn eval_string_to_number(
+    arguments: &[Value],
+    location: SourceLocation,
+) -> Result<Value, EvalError> {
+    let string = unary_argument("string->number", arguments, location)?.expect_string(location)?;
+
+    match string.parse::<i64>() {
+        Ok(value) => Ok(Value::Integer(value)),
+        Err(_) => Ok(Value::Boolean(false)),
+    }
+}
+
+fn eval_number_to_string(
+    arguments: &[Value],
+    location: SourceLocation,
+) -> Result<Value, EvalError> {
+    let number = unary_argument("number->string", arguments, location)?.expect_number(location)?;
+    Ok(Value::String(number.to_string()))
+}
+
+fn eval_symbol_to_string(
+    arguments: &[Value],
+    location: SourceLocation,
+) -> Result<Value, EvalError> {
+    let symbol = unary_argument("symbol->string", arguments, location)?.expect_symbol(location)?;
+    Ok(Value::String(symbol.to_string()))
+}
+
+fn eval_string_to_symbol(
+    arguments: &[Value],
+    location: SourceLocation,
+) -> Result<Value, EvalError> {
+    let string = unary_argument("string->symbol", arguments, location)?.expect_string(location)?;
+    Ok(Value::Symbol(string.to_string()))
+}
+
+fn eval_string_ref(arguments: &[Value], location: SourceLocation) -> Result<Value, EvalError> {
+    let [string_value, index_value] = arguments else {
+        return Err(EvalError::WrongArgumentCount {
+            location,
+            procedure: "string-ref",
+            expected: ArgCount::Exactly(2),
+            got: arguments.len(),
+        });
+    };
+
+    let string = string_value.expect_string(location)?;
+    let index = index_value.expect_number(location)?;
+    let characters: Vec<_> = string.chars().collect();
+    let length = characters.len();
+    let Some(index) = usize::try_from(index).ok() else {
+        return Err(EvalError::StringIndexOutOfBounds {
+            location,
+            index: index_value.expect_number(location)?,
+            length,
+        });
+    };
+
+    characters
+        .get(index)
+        .copied()
+        .map(Value::Character)
+        .ok_or(EvalError::StringIndexOutOfBounds {
+            location,
+            index: index_value.expect_number(location)?,
+            length,
+        })
+}
+
 fn eval_type_predicate(
     procedure: &'static str,
     arguments: &[Value],
@@ -368,4 +590,8 @@ fn is_pair(value: &Value) -> bool {
 
 fn is_symbol(value: &Value) -> bool {
     matches!(value, Value::Symbol(_))
+}
+
+fn is_char(value: &Value) -> bool {
+    matches!(value, Value::Character(_))
 }

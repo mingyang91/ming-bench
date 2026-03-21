@@ -7,7 +7,7 @@ mod parser;
 mod value;
 
 pub use error::EvalError;
-use evaluator::eval_program;
+use evaluator::{eval_program, eval_program_with_output};
 use parser::parse_program;
 
 /// Evaluate one or more Scheme expressions and return the string
@@ -35,7 +35,9 @@ pub fn eval_str(input: &str) -> Result<String, EvalError> {
 ///
 /// Returns [`EvalError`] when parsing fails or evaluation encounters an error.
 pub fn eval_str_with_output(input: &str) -> Result<(String, String), EvalError> {
-    eval_str(input).map(|result| (result, String::new()))
+    let program = parse_program(input)?;
+    let (value, output) = eval_program_with_output(&program)?;
+    Ok((value.render(), output))
 }
 
 #[cfg(test)]

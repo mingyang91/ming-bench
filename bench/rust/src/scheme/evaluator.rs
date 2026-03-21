@@ -6,21 +6,29 @@ use crate::scheme::error::{ArgCount, EvalError};
 use crate::scheme::value::{Closure, Value};
 
 pub fn eval_program(expressions: &[Expr]) -> Result<Value, EvalError> {
+    eval_program_with_output(expressions).map(|(value, _)| value)
+}
+
+pub fn eval_program_with_output(expressions: &[Expr]) -> Result<(Value, String), EvalError> {
     let Some((last_expression, prefix)) = expressions.split_last() else {
         return Err(EvalError::EmptyProgram);
     };
 
     let environment = Environment::new();
     install_builtins(&environment);
+    let mut output = String::new();
 
-    prefix
-        .iter()
-        .try_for_each(|expression| eval_expr(expression, &environment).map(|_| ()))?;
+    eval_discarded_expressions(prefix, &environment, &mut output)?;
+    let value = eval_expr(last_expression, &environment, &mut output)?;
 
-    eval_expr(last_expression, &environment)
+    Ok((value, output))
 }
 
-fn eval_expr(expression: &Expr, environment: &Environment) -> Result<Value, EvalError> {
+fn eval_expr(
+    expression: &Expr,
+    environment: &Environment,
+    output: &mut String,
+) -> Result<Value, EvalError> {
     match expression {
         Expr::Integer { value, .. } => Ok(Value::Integer(*value)),
         Expr::Boolean { value, .. } => Ok(Value::Boolean(*value)),
@@ -33,7 +41,7 @@ fn eval_expr(expression: &Expr, environment: &Environment) -> Result<Value, Eval
                     name: name.clone(),
                 })
         }
-        Expr::List { items, location } => eval_list(items, *location, environment),
+        Expr::List { items, location } => eval_list(items, *location, environment, output),
     }
 }
 
@@ -41,20 +49,23 @@ fn eval_list(
     items: &[Expr],
     location: SourceLocation,
     environment: &Environment,
+    output: &mut String,
 ) -> Result<Value, EvalError> {
     let Some((operator, arguments)) = items.split_first() else {
         return Err(EvalError::EmptyApplication { location });
     };
 
     if let Some(name) = operator.symbol_name() {
-        if let Some(value) = eval_special_form(name, arguments, operator.location(), environment)? {
+        if let Some(value) =
+            eval_special_form(name, arguments, operator.location(), environment, output)?
+        {
             return Ok(value);
         }
     }
 
-    let callable = eval_expr(operator, environment)?;
-    let values = eval_arguments(arguments, environment)?;
-    apply_callable(callable, &values, operator.location())
+    let callable = eval_expr(operator, environment, output)?;
+    let values = eval_arguments(arguments, environment, output)?;
+    apply_callable(callable, &values, operator.location(), output)
 }
 
 fn eval_special_form(
@@ -62,26 +73,31 @@ fn eval_special_form(
     arguments: &[Expr],
     location: SourceLocation,
     environment: &Environment,
+    output: &mut String,
 ) -> Result<Option<Value>, EvalError> {
     match name {
-        "and" => eval_and(arguments, environment).map(Some),
-        "or" => eval_or(arguments, environment).map(Some),
-        "if" => eval_if(arguments, location, environment).map(Some),
-        "define" => eval_define(arguments, location, environment).map(Some),
+        "and" => eval_and(arguments, environment, output).map(Some),
+        "or" => eval_or(arguments, environment, output).map(Some),
+        "if" => eval_if(arguments, location, environment, output).map(Some),
+        "define" => eval_define(arguments, location, environment, output).map(Some),
         "quote" => eval_quote(arguments, location).map(Some),
         "lambda" => eval_lambda(arguments, location, environment).map(Some),
-        "let" => eval_let(arguments, location, environment).map(Some),
-        "begin" => eval_begin(arguments, environment).map(Some),
-        "cond" => eval_cond(arguments, location, environment).map(Some),
+        "let" => eval_let(arguments, location, environment, output).map(Some),
+        "begin" => eval_begin(arguments, environment, output).map(Some),
+        "cond" => eval_cond(arguments, location, environment, output).map(Some),
         _ => Ok(None),
     }
 }
 
-fn eval_and(arguments: &[Expr], environment: &Environment) -> Result<Value, EvalError> {
+fn eval_and(
+    arguments: &[Expr],
+    environment: &Environment,
+    output: &mut String,
+) -> Result<Value, EvalError> {
     let mut last_value = Value::Boolean(true);
 
     for argument in arguments {
-        let value = eval_expr(argument, environment)?;
+        let value = eval_expr(argument, environment, output)?;
         if !value.is_truthy() {
             return Ok(value);
         }
@@ -91,11 +107,15 @@ fn eval_and(arguments: &[Expr], environment: &Environment) -> Result<Value, Eval
     Ok(last_value)
 }
 
-fn eval_or(arguments: &[Expr], environment: &Environment) -> Result<Value, EvalError> {
+fn eval_or(
+    arguments: &[Expr],
+    environment: &Environment,
+    output: &mut String,
+) -> Result<Value, EvalError> {
     let mut last_value = Value::Boolean(false);
 
     for argument in arguments {
-        let value = eval_expr(argument, environment)?;
+        let value = eval_expr(argument, environment, output)?;
         if value.is_truthy() {
             return Ok(value);
         }
@@ -109,6 +129,7 @@ fn eval_if(
     arguments: &[Expr],
     location: SourceLocation,
     environment: &Environment,
+    output: &mut String,
 ) -> Result<Value, EvalError> {
     let [condition, consequent, alternate] = arguments else {
         return Err(EvalError::WrongArgumentCount {
@@ -119,23 +140,24 @@ fn eval_if(
         });
     };
 
-    let branch = if eval_expr(condition, environment)?.is_truthy() {
+    let branch = if eval_expr(condition, environment, output)?.is_truthy() {
         consequent
     } else {
         alternate
     };
 
-    eval_expr(branch, environment)
+    eval_expr(branch, environment, output)
 }
 
 fn eval_define(
     arguments: &[Expr],
     location: SourceLocation,
     environment: &Environment,
+    output: &mut String,
 ) -> Result<Value, EvalError> {
     match arguments {
         [Expr::Symbol { name, .. }, expression] => {
-            let value = eval_expr(expression, environment)?;
+            let value = eval_expr(expression, environment, output)?;
             environment.define(name.clone(), value);
             Ok(Value::Void)
         }
@@ -226,6 +248,7 @@ fn eval_let(
     arguments: &[Expr],
     location: SourceLocation,
     environment: &Environment,
+    output: &mut String,
 ) -> Result<Value, EvalError> {
     let Some((bindings, body)) = arguments.split_first() else {
         return Err(EvalError::WrongArgumentCount {
@@ -248,7 +271,7 @@ fn eval_let(
 
     let evaluated_bindings = bindings
         .iter()
-        .map(|binding| eval_let_binding(binding, environment))
+        .map(|binding| eval_let_binding(binding, environment, output))
         .collect::<Result<Vec<_>, _>>()?;
 
     let scope = environment.child();
@@ -256,12 +279,13 @@ fn eval_let(
         scope.define(name, value);
     }
 
-    eval_required_sequence(body, &scope, "let", location)
+    eval_required_sequence(body, &scope, "let", location, output)
 }
 
 fn eval_let_binding(
     binding: &Expr,
     environment: &Environment,
+    output: &mut String,
 ) -> Result<(String, Value), EvalError> {
     let location = binding.location();
     let Expr::List { items, .. } = binding else {
@@ -277,21 +301,26 @@ fn eval_let_binding(
         });
     };
 
-    Ok((name.clone(), eval_expr(expression, environment)?))
+    Ok((name.clone(), eval_expr(expression, environment, output)?))
 }
 
-fn eval_begin(arguments: &[Expr], environment: &Environment) -> Result<Value, EvalError> {
-    eval_sequence(arguments, environment)
+fn eval_begin(
+    arguments: &[Expr],
+    environment: &Environment,
+    output: &mut String,
+) -> Result<Value, EvalError> {
+    eval_sequence(arguments, environment, output)
 }
 
 fn eval_cond(
     clauses: &[Expr],
     location: SourceLocation,
     environment: &Environment,
+    output: &mut String,
 ) -> Result<Value, EvalError> {
     match clauses {
         [] => Ok(Value::Void),
-        [clause, rest @ ..] => eval_cond_clause(clause, rest, location, environment),
+        [clause, rest @ ..] => eval_cond_clause(clause, rest, location, environment, output),
     }
 }
 
@@ -300,6 +329,7 @@ fn eval_cond_clause(
     remaining_clauses: &[Expr],
     location: SourceLocation,
     environment: &Environment,
+    output: &mut String,
 ) -> Result<Value, EvalError> {
     let clause_location = clause.location();
     let Expr::List { items, .. } = clause else {
@@ -322,19 +352,19 @@ fn eval_cond_clause(
                 form: "cond",
             });
         }
-        return eval_required_sequence(body, environment, "cond", clause_location);
+        return eval_required_sequence(body, environment, "cond", clause_location, output);
     }
 
-    let test_value = eval_expr(test, environment)?;
+    let test_value = eval_expr(test, environment, output)?;
     if !test_value.is_truthy() {
-        return eval_cond(remaining_clauses, location, environment);
+        return eval_cond(remaining_clauses, location, environment, output);
     }
 
     if body.is_empty() {
         return Ok(test_value);
     }
 
-    eval_sequence(body, environment)
+    eval_sequence(body, environment, output)
 }
 
 fn build_closure(
@@ -375,21 +405,29 @@ fn quote_expression(expression: &Expr) -> Value {
     }
 }
 
-fn eval_arguments(arguments: &[Expr], environment: &Environment) -> Result<Vec<Value>, EvalError> {
-    arguments
-        .iter()
-        .map(|argument| eval_expr(argument, environment))
-        .collect()
+fn eval_arguments(
+    arguments: &[Expr],
+    environment: &Environment,
+    output: &mut String,
+) -> Result<Vec<Value>, EvalError> {
+    arguments.iter().try_fold(
+        Vec::with_capacity(arguments.len()),
+        |mut values, argument| {
+            values.push(eval_expr(argument, environment, output)?);
+            Ok(values)
+        },
+    )
 }
 
 fn apply_callable(
     callable: Value,
     arguments: &[Value],
     location: SourceLocation,
+    output: &mut String,
 ) -> Result<Value, EvalError> {
     match callable {
-        Value::Builtin(procedure) => apply_builtin(procedure, arguments, location),
-        Value::Closure(closure) => apply_closure(&closure, arguments, location),
+        Value::Builtin(procedure) => apply_builtin(procedure, arguments, location, output),
+        Value::Closure(closure) => apply_closure(&closure, arguments, location, output),
         other => Err(EvalError::NotCallable {
             location,
             expression: other.render(),
@@ -401,6 +439,7 @@ fn apply_closure(
     closure: &Closure,
     arguments: &[Value],
     location: SourceLocation,
+    output: &mut String,
 ) -> Result<Value, EvalError> {
     if arguments.len() != closure.parameters.len() {
         return Err(EvalError::WrongArgumentCount {
@@ -421,7 +460,7 @@ fn apply_closure(
         call_environment.define(name, value);
     }
 
-    eval_required_sequence(&closure.body, &call_environment, "lambda", location)
+    eval_required_sequence(&closure.body, &call_environment, "lambda", location, output)
 }
 
 fn eval_required_sequence(
@@ -429,22 +468,35 @@ fn eval_required_sequence(
     environment: &Environment,
     form: &'static str,
     location: SourceLocation,
+    output: &mut String,
 ) -> Result<Value, EvalError> {
     if body.is_empty() {
         return Err(EvalError::MissingBody { location, form });
     }
 
-    eval_sequence(body, environment)
+    eval_sequence(body, environment, output)
 }
 
-fn eval_sequence(body: &[Expr], environment: &Environment) -> Result<Value, EvalError> {
+fn eval_sequence(
+    body: &[Expr],
+    environment: &Environment,
+    output: &mut String,
+) -> Result<Value, EvalError> {
     let Some((last_expression, prefix)) = body.split_last() else {
         return Ok(Value::Void);
     };
 
-    prefix
-        .iter()
-        .try_for_each(|expression| eval_expr(expression, environment).map(|_| ()))?;
+    eval_discarded_expressions(prefix, environment, output)?;
 
-    eval_expr(last_expression, environment)
+    eval_expr(last_expression, environment, output)
+}
+
+fn eval_discarded_expressions(
+    expressions: &[Expr],
+    environment: &Environment,
+    output: &mut String,
+) -> Result<(), EvalError> {
+    expressions
+        .iter()
+        .try_for_each(|expression| eval_expr(expression, environment, output).map(|_| ()))
 }
