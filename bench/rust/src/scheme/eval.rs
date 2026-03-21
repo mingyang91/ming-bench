@@ -28,6 +28,9 @@ fn eval_list(elems: &[Expr], env: &Env) -> Result<Value, EvalError> {
             "if" => return eval_if(args, env),
             "define" => return eval_define(args, env),
             "lambda" => return eval_lambda(args, env),
+            "let" => return eval_let(args, env),
+            "begin" => return eval_begin(args, env),
+            "cond" => return eval_cond(args, env),
             _ => {}
         }
     }
@@ -69,6 +72,8 @@ fn is_builtin(name: &str) -> bool {
     matches!(
         name,
         "+" | "-" | "*" | "/" | "<" | ">" | "=" | "<=" | ">=" | "not" | "and" | "or"
+            | "cons" | "car" | "cdr" | "null?" | "list" | "length"
+            | "string?" | "number?" | "boolean?" | "pair?" | "symbol?"
     )
 }
 
@@ -86,6 +91,17 @@ fn eval_builtin(op: &str, args: &[Expr], env: &Env) -> Result<Value, EvalError> 
         "not" => eval_not(args, env),
         "and" => eval_and(args, env),
         "or" => eval_or(args, env),
+        "cons" => eval_cons(args, env),
+        "car" => eval_car(args, env),
+        "cdr" => eval_cdr(args, env),
+        "null?" => eval_null(args, env),
+        "list" => eval_list_builtin(args, env),
+        "length" => eval_length(args, env),
+        "string?" => eval_type_pred(args, env, |v| matches!(v, Value::String(_))),
+        "number?" => eval_type_pred(args, env, |v| matches!(v, Value::Integer(_))),
+        "boolean?" => eval_type_pred(args, env, |v| matches!(v, Value::Boolean(_))),
+        "pair?" => eval_type_pred(args, env, |v| matches!(v, Value::List(l) if !l.is_empty())),
+        "symbol?" => eval_type_pred(args, env, |v| matches!(v, Value::Symbol(_))),
         _ => Err(EvalError::UnboundVariable { name: op.into() }),
     }
 }
@@ -105,7 +121,7 @@ fn expr_to_value(expr: &Expr) -> Result<Value, EvalError> {
         Expr::Integer(n) => Ok(Value::Integer(*n)),
         Expr::Boolean(b) => Ok(Value::Boolean(*b)),
         Expr::String(s) => Ok(Value::String(s.clone())),
-        Expr::Symbol(s) => Ok(Value::String(s.clone())),
+        Expr::Symbol(s) => Ok(Value::Symbol(s.clone())),
         Expr::List(items) => {
             let vals: Vec<Value> = items.iter().map(expr_to_value).collect::<Result<_, _>>()?;
             Ok(Value::List(vals))
@@ -143,8 +159,8 @@ fn eval_define(args: &[Expr], env: &Env) -> Result<Value, EvalError> {
             env.define(name.clone(), val);
             Ok(Value::Void)
         }
-        // (define (f params...) body)
-        [Expr::List(name_and_params), body] => {
+        // (define (f params...) body...)
+        [Expr::List(name_and_params), body @ ..] if !body.is_empty() => {
             let [Expr::Symbol(name), params @ ..] = name_and_params.as_slice() else {
                 return Err(EvalError::Parse("invalid define form".into()));
             };
@@ -155,9 +171,16 @@ fn eval_define(args: &[Expr], env: &Env) -> Result<Value, EvalError> {
                     _ => Err(EvalError::Parse("parameter must be a symbol".into())),
                 })
                 .collect::<Result<_, _>>()?;
+            let wrapped_body = if body.len() == 1 {
+                body[0].clone()
+            } else {
+                let mut begin = vec![Expr::Symbol("begin".into())];
+                begin.extend(body.iter().cloned());
+                Expr::List(begin)
+            };
             let lambda = Value::Lambda {
                 params: param_names,
-                body: body.clone(),
+                body: wrapped_body,
                 closure: env.clone(),
             };
             env.define(name.clone(), lambda);
@@ -330,4 +353,135 @@ fn eval_or(args: &[Expr], env: &Env) -> Result<Value, EvalError> {
         }
     }
     Ok(result)
+}
+
+fn eval_cons(args: &[Expr], env: &Env) -> Result<Value, EvalError> {
+    let [head, tail] = args else {
+        return Err(EvalError::WrongArgCount { expected: 2, got: args.len() });
+    };
+    let h = eval(head, env)?;
+    let t = eval(tail, env)?;
+    match t {
+        Value::List(mut items) => {
+            items.insert(0, h);
+            Ok(Value::List(items))
+        }
+        _ => Ok(Value::List(vec![h, t])),
+    }
+}
+
+fn eval_car(args: &[Expr], env: &Env) -> Result<Value, EvalError> {
+    let [arg] = args else {
+        return Err(EvalError::WrongArgCount { expected: 1, got: args.len() });
+    };
+    let val = eval(arg, env)?;
+    let Value::List(items) = val else {
+        return Err(EvalError::TypeError { expected: "pair".into(), got: format!("{val}") });
+    };
+    items.into_iter().next().ok_or_else(|| EvalError::TypeError {
+        expected: "pair".into(),
+        got: "()".into(),
+    })
+}
+
+fn eval_cdr(args: &[Expr], env: &Env) -> Result<Value, EvalError> {
+    let [arg] = args else {
+        return Err(EvalError::WrongArgCount { expected: 1, got: args.len() });
+    };
+    let val = eval(arg, env)?;
+    let Value::List(items) = val else {
+        return Err(EvalError::TypeError { expected: "pair".into(), got: format!("{val}") });
+    };
+    if items.is_empty() {
+        return Err(EvalError::TypeError { expected: "pair".into(), got: "()".into() });
+    }
+    Ok(Value::List(items[1..].to_vec()))
+}
+
+fn eval_null(args: &[Expr], env: &Env) -> Result<Value, EvalError> {
+    let [arg] = args else {
+        return Err(EvalError::WrongArgCount { expected: 1, got: args.len() });
+    };
+    let val = eval(arg, env)?;
+    Ok(Value::Boolean(matches!(val, Value::List(ref items) if items.is_empty())))
+}
+
+fn eval_list_builtin(args: &[Expr], env: &Env) -> Result<Value, EvalError> {
+    let items: Vec<Value> = args.iter().map(|a| eval(a, env)).collect::<Result<_, _>>()?;
+    Ok(Value::List(items))
+}
+
+fn eval_length(args: &[Expr], env: &Env) -> Result<Value, EvalError> {
+    let [arg] = args else {
+        return Err(EvalError::WrongArgCount { expected: 1, got: args.len() });
+    };
+    let val = eval(arg, env)?;
+    let Value::List(items) = val else {
+        return Err(EvalError::TypeError { expected: "list".into(), got: format!("{val}") });
+    };
+    Ok(Value::Integer(items.len() as i64))
+}
+
+fn eval_type_pred(
+    args: &[Expr],
+    env: &Env,
+    pred: fn(&Value) -> bool,
+) -> Result<Value, EvalError> {
+    let [arg] = args else {
+        return Err(EvalError::WrongArgCount { expected: 1, got: args.len() });
+    };
+    let val = eval(arg, env)?;
+    Ok(Value::Boolean(pred(&val)))
+}
+
+fn eval_let(args: &[Expr], env: &Env) -> Result<Value, EvalError> {
+    let [Expr::List(bindings), body @ ..] = args else {
+        return Err(EvalError::Parse("invalid let form".into()));
+    };
+    if body.is_empty() {
+        return Err(EvalError::Parse("let requires a body".into()));
+    }
+    let let_env = Env::extend(env);
+    for binding in bindings {
+        let Expr::List(pair) = binding else {
+            return Err(EvalError::Parse("let binding must be a list".into()));
+        };
+        let [Expr::Symbol(name), val_expr] = pair.as_slice() else {
+            return Err(EvalError::Parse("let binding must be (name expr)".into()));
+        };
+        let val = eval(val_expr, env)?;
+        let_env.define(name.clone(), val);
+    }
+    eval_body(body, &let_env)
+}
+
+fn eval_begin(args: &[Expr], env: &Env) -> Result<Value, EvalError> {
+    eval_body(args, env)
+}
+
+fn eval_body(exprs: &[Expr], env: &Env) -> Result<Value, EvalError> {
+    let mut result = Value::Void;
+    for expr in exprs {
+        result = eval(expr, env)?;
+    }
+    Ok(result)
+}
+
+fn eval_cond(args: &[Expr], env: &Env) -> Result<Value, EvalError> {
+    for clause in args {
+        let Expr::List(parts) = clause else {
+            return Err(EvalError::Parse("cond clause must be a list".into()));
+        };
+        let [test, body @ ..] = parts.as_slice() else {
+            return Err(EvalError::Parse("cond clause must have a test".into()));
+        };
+        if matches!(test, Expr::Symbol(s) if s == "else") {
+            return eval_body(body, env);
+        }
+        let test_val = eval(test, env)?;
+        if test_val.is_truthy() {
+            return eval_body(body, env);
+        }
+    }
+    Ok(Value::Void)
 }

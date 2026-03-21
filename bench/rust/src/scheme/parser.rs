@@ -65,6 +65,10 @@ fn tokenize(input: &str) -> Vec<String> {
                 chars.next();
                 tokens.push(read_string(&mut chars));
             }
+            '\'' => {
+                tokens.push("'".to_string());
+                chars.next();
+            }
             ';' => skip_comment(&mut chars),
             _ => tokens.push(read_atom(&mut chars)),
         }
@@ -94,6 +98,10 @@ fn parse_tokens(tokens: &[String], pos: &mut usize) -> Result<Expr, EvalError> {
             Ok(Expr::List(list))
         }
         ")" => Err(EvalError::Parse("unexpected ')'".into())),
+        "'" => {
+            let quoted = parse_tokens(tokens, pos)?;
+            Ok(Expr::List(vec![Expr::Symbol("quote".into()), quoted]))
+        }
         _ => Ok(parse_atom(token)),
     }
 }
