@@ -6,6 +6,63 @@ use crate::scheme::value::{Span, Value};
 use std::cell::RefCell;
 use std::rc::Rc;
 
+/// Apply a lambda: bind params, set up environment, evaluate body.
+fn apply_lambda(
+    proc: &Value,
+    args: &[Value],
+    env: &Env,
+    span: Span,
+    output: &mut String,
+) -> Result<Bounce, EvalError> {
+    let Value::Lambda {
+        params,
+        rest_param,
+        body,
+        env: captured_env,
+    } = proc
+    else {
+        unreachable!("apply_lambda called with non-lambda")
+    };
+    let arg_count_mismatch = if rest_param.is_some() {
+        args.len() < params.len()
+    } else {
+        args.len() != params.len()
+    };
+    if arg_count_mismatch {
+        return Err(EvalError::WrongArgCount {
+            expected: params.len(),
+            got: args.len(),
+            span,
+        });
+    }
+    let mut local_env = env.clone();
+    local_env.extend(captured_env.iter().map(|(k, v)| (k.clone(), Rc::clone(v))));
+    // Preserve internal bookkeeping from caller env — captured_env
+    // may contain stale values from the definition site.
+    for key in ["\x00ei", "\x00co"] {
+        let Some(val) = env.get(key) else { continue };
+        local_env.insert(key.to_string(), Rc::clone(val));
+    }
+    for (param, arg) in params.iter().zip(args) {
+        local_env.insert(param.clone(), Rc::new(RefCell::new(arg.clone())));
+    }
+    if let Some(rest_name) = rest_param {
+        let rest_args = args[params.len()..].to_vec();
+        local_env.insert(
+            rest_name.clone(),
+            Rc::new(RefCell::new(Value::List(rest_args, Span::default()))),
+        );
+    }
+    eval_body_step(body, Value::Boolean(false), &mut local_env, output)
+        .map(|b| match b {
+            Bounce::Continue(expr) => Bounce::ReplaceEnv {
+                expr,
+                env: local_env,
+            },
+            other => other,
+        })
+}
+
 /// Tail-call-aware apply: returns Bounce instead of recursing into eval_body.
 pub(crate) fn apply_step(
     proc: Value,
@@ -15,45 +72,7 @@ pub(crate) fn apply_step(
     output: &mut String,
 ) -> Result<Bounce, EvalError> {
     match &proc {
-        Value::Lambda {
-            params,
-            rest_param,
-            body,
-            env: captured_env,
-        } => {
-            let arg_count_mismatch = if rest_param.is_some() {
-                args.len() < params.len()
-            } else {
-                args.len() != params.len()
-            };
-            if arg_count_mismatch {
-                return Err(EvalError::WrongArgCount {
-                    expected: params.len(),
-                    got: args.len(),
-                    span,
-                });
-            }
-            let mut local_env = env.clone();
-            local_env.extend(captured_env.iter().map(|(k, v)| (k.clone(), Rc::clone(v))));
-            for (param, arg) in params.iter().zip(args) {
-                local_env.insert(param.clone(), Rc::new(RefCell::new(arg.clone())));
-            }
-            if let Some(rest_name) = rest_param {
-                let rest_args = args[params.len()..].to_vec();
-                local_env.insert(
-                    rest_name.clone(),
-                    Rc::new(RefCell::new(Value::List(rest_args, Span::default()))),
-                );
-            }
-            eval_body_step(body, Value::Boolean(false), &mut local_env, output)
-                .map(|b| match b {
-                    Bounce::Continue(expr) => Bounce::ReplaceEnv {
-                        expr,
-                        env: local_env,
-                    },
-                    other => other,
-                })
-        }
+        Value::Lambda { .. } => apply_lambda(&proc, args, env, span, output),
         Value::Symbol(name, _)
             if name == "call/cc" || name == "call-with-current-continuation" =>
         {

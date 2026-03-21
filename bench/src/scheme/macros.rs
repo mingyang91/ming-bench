@@ -255,10 +255,13 @@ fn expand_with_hygiene(
 
     let expanded = expand_inner(template, bindings, &rename_map, span)?;
 
-    // Bind gensymed names in use_env from definition-site env
+    // Bind gensymed names in use_env, preferring definition-site env
+    // but falling back to use-site env for forward-referenced macros.
     for (original, gensymed) in &rename_map {
         if let Some(cell) = def_env.get(original) {
             use_env.insert(gensymed.clone(), Rc::clone(cell));
+        } else if let Some(cell) = use_env.get(original).cloned() {
+            use_env.insert(gensymed.clone(), cell);
         }
     }
 
