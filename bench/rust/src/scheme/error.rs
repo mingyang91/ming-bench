@@ -19,6 +19,9 @@ pub enum EvalError {
     #[error("unbound variable: {name}")]
     UnboundVariable { name: String },
 
+    #[error("string-set!: strings are immutable in R7RS")]
+    ImmutableString,
+
     #[error("{line}:{col}: {inner}")]
     Positioned {
         line: usize,

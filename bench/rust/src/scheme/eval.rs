@@ -37,6 +37,11 @@ fn is_builtin(name: &str) -> bool {
             | "symbol->string" | "string->symbol"
             | "string-ref"
             | "string-copy"
+            | "string->list"
+            | "list->string"
+            | "char->integer"
+            | "integer->char"
+            | "map"
     )
 }
 
@@ -56,7 +61,7 @@ fn eval_list(items: &[Value], env: &Rc<RefCell<Env>>, out: &Output) -> Result<Va
             "cond" => return eval_cond(&items[1..], env, out),
             "and" => return eval_and(&items[1..], env, out),
             "or" => return eval_or(&items[1..], env, out),
-            "string-set!" => return eval_string_set(&items[1..], env, out),
+            "string-set!" => return Err(EvalError::ImmutableString),
             s if is_builtin(s) => return eval_builtin(s, &items[1..], env, out),
             _ => {}
         }
@@ -145,6 +150,11 @@ fn eval_builtin(
         "string->symbol" => eval_string_to_symbol(args, env, out),
         "string-ref" => eval_string_ref(args, env, out),
         "string-copy" => eval_string_copy(args, env, out),
+        "string->list" => eval_string_to_list(args, env, out),
+        "list->string" => eval_list_to_string(args, env, out),
+        "char->integer" => eval_char_to_integer(args, env, out),
+        "integer->char" => eval_integer_to_char(args, env, out),
+        "map" => eval_map(args, env, out),
         _ => Err(EvalError::UnknownProcedure {
             name: name.into(),
         }),
@@ -812,60 +822,128 @@ fn eval_string_copy(
     }
 }
 
-fn eval_string_set(
+fn eval_string_to_list(
     args: &[Value],
     env: &Rc<RefCell<Env>>,
     out: &Output,
 ) -> Result<Value, EvalError> {
-    let [name_arg, idx_arg, char_arg] = args else {
+    let [arg] = args else {
         return Err(EvalError::WrongArgCount {
-            expected: 3,
+            expected: 1,
             got: args.len(),
         });
     };
-    let Value::Symbol(name) = name_arg else {
-        return Err(EvalError::TypeError {
-            expected: "symbol".into(),
-            got: format!("{name_arg}"),
-        });
-    };
-    let idx = match eval(idx_arg, env, out)? {
-        Value::Integer(n) => n as usize,
-        other => {
-            return Err(EvalError::TypeError {
-                expected: "integer".into(),
-                got: format!("{other}"),
-            })
-        }
-    };
-    let ch = match eval(char_arg, env, out)? {
-        Value::Char(c) => c,
-        other => {
-            return Err(EvalError::TypeError {
-                expected: "char".into(),
-                got: format!("{other}"),
-            })
-        }
-    };
-    let s = match env.borrow().get(name) {
-        Some(Value::Str(s)) => s,
-        Some(other) => {
-            return Err(EvalError::TypeError {
-                expected: "string".into(),
-                got: format!("{other}"),
-            })
-        }
-        None => return Err(EvalError::UnboundVariable { name: name.clone() }),
-    };
-    let mut chars: Vec<char> = s.chars().collect();
-    if idx >= chars.len() {
-        return Err(EvalError::TypeError {
-            expected: format!("index < {}", chars.len()),
-            got: format!("{idx}"),
-        });
+    match eval(arg, env, out)? {
+        Value::Str(s) => Ok(Value::List(s.chars().map(Value::Char).collect())),
+        other => Err(EvalError::TypeError {
+            expected: "string".into(),
+            got: format!("{other}"),
+        }),
     }
-    chars[idx] = ch;
-    let new_s: String = chars.into_iter().collect();
-    env.borrow_mut().define(name.clone(), Value::Str(new_s));
-    Ok(Value::Void)
+}
+
+fn eval_list_to_string(
+    args: &[Value],
+    env: &Rc<RefCell<Env>>,
+    out: &Output,
+) -> Result<Value, EvalError> {
+    let [arg] = args else {
+        return Err(EvalError::WrongArgCount {
+            expected: 1,
+            got: args.len(),
+        });
+    };
+    match eval(arg, env, out)? {
+        Value::List(items) => {
+            let s: String = items
+                .iter()
+                .map(|v| match v {
+                    Value::Char(c) => Ok(*c),
+                    other => Err(EvalError::TypeError {
+                        expected: "char".into(),
+                        got: format!("{other}"),
+                    }),
+                })
+                .collect::<Result<_, _>>()?;
+            Ok(Value::Str(s))
+        }
+        other => Err(EvalError::TypeError {
+            expected: "list".into(),
+            got: format!("{other}"),
+        }),
+    }
+}
+
+fn eval_char_to_integer(
+    args: &[Value],
+    env: &Rc<RefCell<Env>>,
+    out: &Output,
+) -> Result<Value, EvalError> {
+    let [arg] = args else {
+        return Err(EvalError::WrongArgCount {
+            expected: 1,
+            got: args.len(),
+        });
+    };
+    match eval(arg, env, out)? {
+        Value::Char(c) => Ok(Value::Integer(c as i64)),
+        other => Err(EvalError::TypeError {
+            expected: "char".into(),
+            got: format!("{other}"),
+        }),
+    }
+}
+
+fn eval_integer_to_char(
+    args: &[Value],
+    env: &Rc<RefCell<Env>>,
+    out: &Output,
+) -> Result<Value, EvalError> {
+    let [arg] = args else {
+        return Err(EvalError::WrongArgCount {
+            expected: 1,
+            got: args.len(),
+        });
+    };
+    match eval(arg, env, out)? {
+        Value::Integer(n) => {
+            let ch = char::from_u32(n as u32).ok_or_else(|| EvalError::TypeError {
+                expected: "valid unicode code point".into(),
+                got: format!("{n}"),
+            })?;
+            Ok(Value::Char(ch))
+        }
+        other => Err(EvalError::TypeError {
+            expected: "integer".into(),
+            got: format!("{other}"),
+        }),
+    }
+}
+
+fn eval_map(
+    args: &[Value],
+    env: &Rc<RefCell<Env>>,
+    out: &Output,
+) -> Result<Value, EvalError> {
+    let [proc_arg, list_arg] = args else {
+        return Err(EvalError::WrongArgCount {
+            expected: 2,
+            got: args.len(),
+        });
+    };
+    let proc = eval(proc_arg, env, out)?;
+    let list = match eval(list_arg, env, out)? {
+        Value::List(items) => items,
+        other => {
+            return Err(EvalError::TypeError {
+                expected: "list".into(),
+                got: format!("{other}"),
+            })
+        }
+    };
+    let results: Vec<Value> = list
+        .iter()
+        .map(|item| call_proc(&proc, std::slice::from_ref(item), env, out))
+        .collect::<Result<_, _>>()?;
+    Ok(Value::List(results))
 }
