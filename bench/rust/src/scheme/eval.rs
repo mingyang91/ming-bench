@@ -286,6 +286,9 @@ fn eval_special_form(
         "with-exception-handler" => eval_with_exception_handler(args, span, env)
             .map(Bounce::Done)
             .map(Some),
+        "define-record-type" => eval_define_record_type(args, span, env)
+            .map(Bounce::Done)
+            .map(Some),
         _ => Ok(None),
     }
 }
@@ -1140,8 +1143,68 @@ fn apply_builtin_values(name: &str, args: &[Value]) -> Result<Value, EvalError> 
             };
             call_proc_values(consumer, &consumer_args)
         }
+        _ if name.starts_with("__record_ctor_") => apply_record_ctor(name, args),
+        _ if name.starts_with("__record_pred_") => apply_record_pred(name, args),
+        _ if name.starts_with("__record_acc_") => apply_record_acc(name, args),
         _ => Err(EvalError::UnboundVariable { name: name.into() }),
     }
+}
+
+/// Constructor builtin name: `__record_ctor_{type_id}:{type_name}:{field1},{field2},...`
+fn apply_record_ctor(name: &str, args: &[Value]) -> Result<Value, EvalError> {
+    let rest = name.strip_prefix("__record_ctor_").expect("checked prefix");
+    let mut parts = rest.splitn(3, ':');
+    let type_id: u64 = parts.next().expect("type_id").parse().expect("valid u64");
+    let type_name = parts.next().expect("type_name");
+    let fields_str = parts.next().expect("fields");
+    let field_names: Vec<&str> = if fields_str.is_empty() {
+        vec![]
+    } else {
+        fields_str.split(',').collect()
+    };
+    if args.len() != field_names.len() {
+        return Err(EvalError::WrongArgCount { expected: field_names.len(), got: args.len() });
+    }
+    let fields = field_names.iter().zip(args.iter())
+        .map(|(f, v)| (f.to_string(), v.clone()))
+        .collect();
+    Ok(Value::Record { type_id, type_name: type_name.to_string(), fields })
+}
+
+/// Predicate builtin name: `__record_pred_{type_id}`
+fn apply_record_pred(name: &str, args: &[Value]) -> Result<Value, EvalError> {
+    let [arg] = args else {
+        return Err(EvalError::WrongArgCount { expected: 1, got: args.len() });
+    };
+    let type_id: u64 = name.strip_prefix("__record_pred_").expect("checked prefix")
+        .parse().expect("valid u64");
+    let is_match = matches!(arg, Value::Record { type_id: tid, .. } if *tid == type_id);
+    Ok(Value::Boolean(is_match))
+}
+
+/// Accessor builtin name: `__record_acc_{type_id}:{field_name}`
+fn apply_record_acc(name: &str, args: &[Value]) -> Result<Value, EvalError> {
+    let [arg] = args else {
+        return Err(EvalError::WrongArgCount { expected: 1, got: args.len() });
+    };
+    let rest = name.strip_prefix("__record_acc_").expect("checked prefix");
+    let (type_id_str, field_name) = rest.split_once(':').expect("colon separator");
+    let type_id: u64 = type_id_str.parse().expect("valid u64");
+    let Value::Record { type_id: tid, fields, type_name, .. } = arg else {
+        return Err(EvalError::TypeError { expected: "record".into(), got: format!("{arg}") });
+    };
+    if *tid != type_id {
+        return Err(EvalError::TypeError {
+            expected: "record of correct type".to_string(),
+            got: format!("{type_name} record"),
+        });
+    }
+    fields.iter()
+        .find_map(|(f, v)| (f == field_name).then(|| v.clone()))
+        .ok_or_else(|| EvalError::TypeError {
+            expected: format!("field {field_name}"),
+            got: "no such field".to_string(),
+        })
 }
 
 fn call_proc_values(proc: &Value, args: &[Value]) -> Result<Value, EvalError> {
@@ -2623,4 +2686,69 @@ fn apply_list_to_vector(args: &[Value]) -> Result<Value, EvalError> {
     };
     let cloned = items.clone();
     Ok(Value::Vector(std::rc::Rc::new(std::cell::RefCell::new(cloned))))
+}
+
+/// (define-record-type <name> (constructor field-names...) predicate (field accessor)...)
+fn eval_define_record_type(args: &[Expr], span: Span, env: &Env) -> Result<Value, EvalError> {
+    // args: <type-name> <constructor-clause> <predicate-name> <field-spec>...
+    let (type_name_expr, rest) = args.split_first()
+        .ok_or_else(|| EvalError::Parse("define-record-type requires arguments".into()).at(span))?;
+    let Expr::Symbol(ref _type_name, _) = type_name_expr else {
+        return Err(EvalError::Parse("define-record-type: expected type name".into()).at(span));
+    };
+    let type_name = _type_name.clone();
+
+    let (constructor_expr, rest) = rest.split_first()
+        .ok_or_else(|| EvalError::Parse("define-record-type: expected constructor".into()).at(span))?;
+    let Expr::List(ref ctor_parts, _) = constructor_expr else {
+        return Err(EvalError::Parse("define-record-type: expected constructor list".into()).at(span));
+    };
+    let (ctor_name_expr, ctor_field_exprs) = ctor_parts.split_first()
+        .ok_or_else(|| EvalError::Parse("define-record-type: empty constructor".into()).at(span))?;
+    let Expr::Symbol(ref ctor_name, _) = ctor_name_expr else {
+        return Err(EvalError::Parse("define-record-type: constructor name must be symbol".into()).at(span));
+    };
+    let ctor_name = ctor_name.clone();
+    let ctor_fields: Vec<String> = ctor_field_exprs.iter().map(|e| {
+        let Expr::Symbol(ref s, _) = e else {
+            return Err(EvalError::Parse("define-record-type: constructor field must be symbol".into()).at(span));
+        };
+        Ok(s.clone())
+    }).collect::<Result<_, _>>()?;
+
+    let (pred_expr, field_specs) = rest.split_first()
+        .ok_or_else(|| EvalError::Parse("define-record-type: expected predicate".into()).at(span))?;
+    let Expr::Symbol(ref pred_name, _) = pred_expr else {
+        return Err(EvalError::Parse("define-record-type: predicate must be symbol".into()).at(span));
+    };
+    let pred_name = pred_name.clone();
+
+    // Parse field specs: (field-name accessor-name)
+    let mut field_accessors: Vec<(String, String)> = Vec::new();
+    for spec in field_specs {
+        let Expr::List(ref parts, _) = spec else {
+            return Err(EvalError::Parse("define-record-type: field spec must be list".into()).at(span));
+        };
+        let [Expr::Symbol(ref field_name, _), Expr::Symbol(ref accessor_name, _)] = parts.as_slice() else {
+            return Err(EvalError::Parse("define-record-type: field spec must be (field accessor)".into()).at(span));
+        };
+        field_accessors.push((field_name.clone(), accessor_name.clone()));
+    }
+
+    let type_id = env.next_record_type_id();
+
+    // Constructor: __record_ctor_{type_id}:{type_name}:{field1},{field2},...
+    let fields_encoded = ctor_fields.join(",");
+    let ctor_key = format!("__record_ctor_{type_id}:{type_name}:{fields_encoded}");
+    env.define(ctor_name, Value::Builtin(ctor_key));
+
+    // Predicate: __record_pred_{type_id}
+    env.define(pred_name, Value::Builtin(format!("__record_pred_{type_id}")));
+
+    // Accessors: __record_acc_{type_id}:{field_name}
+    for (field_name, accessor_name) in &field_accessors {
+        env.define(accessor_name.clone(), Value::Builtin(format!("__record_acc_{type_id}:{field_name}")));
+    }
+
+    Ok(Value::Void)
 }

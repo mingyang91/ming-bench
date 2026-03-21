@@ -14,6 +14,7 @@ pub struct Env {
     current_expr_index: Rc<Cell<usize>>,
     gensym_counter: Rc<Cell<u64>>,
     active_callcc: Rc<RefCell<HashSet<u64>>>,
+    record_type_counter: Rc<Cell<u64>>,
 }
 
 impl Default for Env {
@@ -33,6 +34,7 @@ impl Env {
             current_expr_index: Rc::new(Cell::new(0)),
             gensym_counter: Rc::new(Cell::new(0)),
             active_callcc: Rc::new(RefCell::new(HashSet::new())),
+            record_type_counter: Rc::new(Cell::new(0)),
         }
     }
 
@@ -46,6 +48,7 @@ impl Env {
             current_expr_index: Rc::clone(&parent.current_expr_index),
             gensym_counter: Rc::clone(&parent.gensym_counter),
             active_callcc: Rc::clone(&parent.active_callcc),
+            record_type_counter: Rc::clone(&parent.record_type_counter),
         }
     }
 
@@ -124,5 +127,11 @@ impl Env {
 
     pub fn is_callcc_active(&self, id: u64) -> bool {
         self.active_callcc.borrow().contains(&id)
+    }
+
+    pub fn next_record_type_id(&self) -> u64 {
+        let id = self.record_type_counter.get();
+        self.record_type_counter.set(id + 1);
+        id
     }
 }

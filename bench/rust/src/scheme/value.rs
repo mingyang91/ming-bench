@@ -30,6 +30,11 @@ pub enum Value {
         rules: Vec<(Vec<Expr>, Expr)>,
         def_env: Env,
     },
+    Record {
+        type_id: u64,
+        type_name: String,
+        fields: Vec<(String, Value)>,
+    },
     Values(Vec<Value>),
     Void,
 }
@@ -76,6 +81,10 @@ impl PartialEq for Value {
                 Value::Continuation { id: b, .. },
             ) => a == b,
             (Value::Macro { .. }, Value::Macro { .. }) => false,
+            (
+                Value::Record { type_id: a, fields: af, .. },
+                Value::Record { type_id: b, fields: bf, .. },
+            ) => a == b && af == bf,
             (Value::Values(a), Value::Values(b)) => a == b,
             (Value::Void, Value::Void) => true,
             _ => false,
@@ -101,6 +110,7 @@ impl fmt::Display for Value {
             | Value::Builtin(_)
             | Value::Continuation { .. }
             | Value::Macro { .. } => write!(f, "#<procedure>"),
+            Value::Record { type_name, fields, .. } => fmt_record(f, type_name, fields),
             Value::Values(vals) => fmt_values(f, vals),
             Value::Void => write!(f, ""),
         }
@@ -121,6 +131,14 @@ fn fmt_vector(f: &mut fmt::Formatter<'_>, items: &[Value]) -> fmt::Result {
         write!(f, "{item}")?;
     }
     write!(f, ")")
+}
+
+fn fmt_record(f: &mut fmt::Formatter<'_>, type_name: &str, fields: &[(String, Value)]) -> fmt::Result {
+    write!(f, "#<{type_name}")?;
+    for (name, val) in fields {
+        write!(f, " {name}={val}")?;
+    }
+    write!(f, ">")
 }
 
 fn fmt_float(f: &mut fmt::Formatter<'_>, x: f64) -> fmt::Result {
@@ -175,9 +193,23 @@ impl Value {
             Value::List(items) => Self::display_list(items, buf),
             Value::Vector(v) => Self::display_vector(&v.borrow(), buf),
             Value::Continuation { .. } | Value::Macro { .. } => buf.push_str("#<procedure>"),
+            Value::Record { type_name, fields, .. } => {
+                Self::display_record(type_name, fields, buf);
+            }
             Value::Values(vals) => Self::display_values(vals, buf),
             other => buf.push_str(&other.to_string()),
         }
+    }
+
+    fn display_record(type_name: &str, fields: &[(String, Value)], buf: &mut String) {
+        buf.push_str(&format!("#<{type_name}"));
+        for (name, val) in fields {
+            buf.push(' ');
+            buf.push_str(name);
+            buf.push('=');
+            val.display_fmt(buf);
+        }
+        buf.push('>');
     }
 
     fn display_vector(items: &[Value], buf: &mut String) {
