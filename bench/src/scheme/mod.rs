@@ -64,12 +64,15 @@ fn env_set(env: &Env, name: String, val: Value) {
     env.borrow_mut().bindings.insert(name, val);
 }
 
-fn env_set_existing(env: &Env, name: &str, val: Value) {
+fn env_set_existing(env: &Env, name: &str, val: Value) -> bool {
     let mut inner = env.borrow_mut();
     if inner.bindings.contains_key(name) {
         inner.bindings.insert(name.to_string(), val);
+        true
     } else if let Some(ref parent) = inner.parent {
-        env_set_existing(parent, name, val);
+        env_set_existing(parent, name, val)
+    } else {
+        false
     }
 }
 
@@ -353,6 +356,20 @@ fn eval(mut expr: Value, env: &Env, pos: Pos) -> Result<Value, EvalError> {
                 let first = &elems[0];
                 match first {
                     Value::Symbol(op) => match op.as_str() {
+                        "set!" => {
+                            if elems.len() != 3 {
+                                return Err(runtime_err(current_pos, "set! requires 2 arguments"));
+                            }
+                            let name = match &elems[1] {
+                                Value::Symbol(s) => s.clone(),
+                                _ => return Err(runtime_err(current_pos, "set!: first argument must be a symbol")),
+                            };
+                            let val = eval(elems[2].clone(), &current_env, current_pos)?;
+                            if !env_set_existing(&current_env, &name, val.clone()) {
+                                return Err(runtime_err(current_pos, format!("set!: unbound variable: {}", name)));
+                            }
+                            return Ok(val);
+                        }
                         "define" => {
                             if elems.len() < 3 {
                                 return Err(runtime_err(current_pos, "define requires 2 arguments"));
