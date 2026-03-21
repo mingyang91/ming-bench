@@ -23,6 +23,7 @@ fn is_builtin(name: &str) -> bool {
             | "pair?"
             | "symbol?"
             | "char?"
+            | "map"
             | "display"
             | "write"
             | "newline"
@@ -35,6 +36,10 @@ fn is_builtin(name: &str) -> bool {
             | "string->symbol"
             | "string-ref"
             | "string-copy"
+            | "string->list"
+            | "list->string"
+            | "char->integer"
+            | "integer->char"
     )
 }
 
@@ -397,6 +402,19 @@ fn apply_builtin(
         )),
         "symbol?" => Ok(Value::Boolean(matches!(args, [Value::Symbol(_)]))),
         "char?" => Ok(Value::Boolean(matches!(args, [Value::Char(_)]))),
+        "map" => {
+            let [proc, Value::List(elems)] = args else {
+                return Err(EvalError::TypeError {
+                    message: "map: expected procedure and list".into(),
+                    span,
+                });
+            };
+            let results: Vec<Value> = elems
+                .iter()
+                .map(|elem| apply(proc, std::slice::from_ref(elem), span, output))
+                .collect::<Result<_, _>>()?;
+            Ok(Value::List(results))
+        }
         "display" => {
             let [arg] = args else {
                 return Err(EvalError::WrongArgCount {
@@ -432,7 +450,8 @@ fn apply_builtin(
         }
         "string-append" | "string-length" | "substring" | "string->number"
         | "number->string" | "symbol->string" | "string->symbol" | "string-ref"
-        | "string-copy" => {
+        | "string-copy" | "string->list" | "list->string" | "char->integer"
+        | "integer->char" => {
             apply_string_builtin(name, args, span)
         }
         _ => Err(EvalError::UnboundVariable {
@@ -721,7 +740,70 @@ fn apply_string_builtin(
             };
             Ok(Value::String(s.clone()))
         }
+        "string->list" => {
+            let [Value::String(s)] = args else {
+                return Err(EvalError::TypeError {
+                    message: "string->list: expected one string argument".into(),
+                    span,
+                });
+            };
+            Ok(Value::List(s.chars().map(Value::Char).collect()))
+        }
+        "list->string" => {
+            let [Value::List(elems)] = args else {
+                return Err(EvalError::TypeError {
+                    message: "list->string: expected one list argument".into(),
+                    span,
+                });
+            };
+            let s: String = elems
+                .iter()
+                .map(|v| match v {
+                    Value::Char(c) => Ok(*c),
+                    other => Err(EvalError::TypeError {
+                        message: format!("list->string: expected char, got {other}"),
+                        span,
+                    }),
+                })
+                .collect::<Result<_, _>>()?;
+            Ok(Value::String(s))
+        }
+        "char->integer" | "integer->char" => apply_char_builtin(name, args, span),
         _ => unreachable!("apply_string_builtin called with non-string builtin: {name}"),
+    }
+}
+
+fn apply_char_builtin(
+    name: &str,
+    args: &[Value],
+    span: Span,
+) -> Result<Value, EvalError> {
+    match name {
+        "char->integer" => {
+            let [Value::Char(c)] = args else {
+                return Err(EvalError::TypeError {
+                    message: "char->integer: expected one char argument".into(),
+                    span,
+                });
+            };
+            Ok(Value::Integer(*c as i64))
+        }
+        "integer->char" => {
+            let [arg] = args else {
+                return Err(EvalError::WrongArgCount {
+                    expected: 1,
+                    got: args.len(),
+                    span,
+                });
+            };
+            let n = require_integer(arg, span)?;
+            let c = char::from_u32(n as u32).ok_or_else(|| EvalError::TypeError {
+                message: format!("integer->char: invalid code point {n}"),
+                span,
+            })?;
+            Ok(Value::Char(c))
+        }
+        _ => unreachable!("apply_char_builtin called with non-char builtin: {name}"),
     }
 }
 
