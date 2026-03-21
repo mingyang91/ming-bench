@@ -845,6 +845,7 @@ fn is_builtin(name: &str) -> bool {
             | "string-ref" | "string-copy"
             | "string->list" | "list->string"
             | "char->integer" | "integer->char"
+            | "equal?"
             | "map"
     )
 }
@@ -871,6 +872,7 @@ fn eval_builtin(
         | "number->string" | "symbol->string" | "string->symbol" | "string-ref"
         | "string-copy" | "string->list" | "list->string"
         | "char->integer" | "integer->char" => eval_string_builtin(name, args, env, out),
+        "equal?" => eval_equal(args, env, out),
         "map" => eval_map(args, env, out),
         "display" => eval_display(args, env, out),
         "write" => eval_write(args, env, out),
@@ -1117,6 +1119,34 @@ fn eval_list_builtin(
         }
         _ => unreachable!("unexpected list builtin: {name}"),
     }
+}
+
+fn values_equal(a: &Value, b: &Value) -> bool {
+    match (a, b) {
+        (Value::Integer(x), Value::Integer(y)) => x == y,
+        (Value::Boolean(x), Value::Boolean(y)) => x == y,
+        (Value::String(x), Value::String(y)) => x == y,
+        (Value::Symbol(x), Value::Symbol(y)) => x == y,
+        (Value::Char(x), Value::Char(y)) => x == y,
+        (Value::Nil, Value::Nil) => true,
+        (Value::Pair(a1, a2), Value::Pair(b1, b2)) => {
+            values_equal(a1, b1) && values_equal(a2, b2)
+        }
+        _ => false,
+    }
+}
+
+fn eval_equal(
+    args: &[Value],
+    env: &mut Env,
+    out: &mut String,
+) -> Result<Value, EvalError> {
+    let [a_expr, b_expr] = args else {
+        return Err(EvalError::WrongArgCount { expected: 2, got: args.len() });
+    };
+    let a = eval(a_expr, env, out)?;
+    let b = eval(b_expr, env, out)?;
+    Ok(Value::Boolean(values_equal(&a, &b)))
 }
 
 fn eval_type_pred(
