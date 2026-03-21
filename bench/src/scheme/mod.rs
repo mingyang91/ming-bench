@@ -1745,6 +1745,26 @@ fn apply_builtin(name: &str, args: &[Value], span: Span, out: &OutputBuf) -> Res
             if exp < 0 { return Err(err_at(span, "expt: negative exponent not supported for integers")); }
             Ok(Value::Integer(base.pow(exp as u32)))
         }
+        "zero?" => {
+            let v = require_int(&args[0], span)?;
+            Ok(Value::Boolean(v == 0))
+        }
+        "positive?" => {
+            let v = require_int(&args[0], span)?;
+            Ok(Value::Boolean(v > 0))
+        }
+        "negative?" => {
+            let v = require_int(&args[0], span)?;
+            Ok(Value::Boolean(v < 0))
+        }
+        "odd?" => {
+            let v = require_int(&args[0], span)?;
+            Ok(Value::Boolean(v % 2 != 0))
+        }
+        "even?" => {
+            let v = require_int(&args[0], span)?;
+            Ok(Value::Boolean(v % 2 == 0))
+        }
         _ => Err(err_at(span, format!("unknown builtin: {}", name))),
     }
 }
@@ -1876,6 +1896,7 @@ fn init_builtins(env: &EnvRef) {
         "call/cc", "call-with-current-continuation",
         "vector", "make-vector", "vector-ref", "vector-set!", "vector?", "vector-length", "vector->list",
         "abs", "modulo", "remainder", "quotient", "min", "max", "expt",
+        "zero?", "positive?", "negative?", "odd?", "even?",
     ] {
         EnvFrame::set(env, name.to_string(), Value::Builtin(name.to_string()));
     }
