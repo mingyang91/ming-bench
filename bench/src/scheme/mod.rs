@@ -113,12 +113,15 @@ fn env_set(env: &Env, name: String, val: Value) {
     env.borrow_mut().bindings.insert(name, val);
 }
 
-fn env_set_existing(env: &Env, name: &str, val: Value) {
+fn env_set_existing(env: &Env, name: &str, val: Value) -> bool {
     let mut inner = env.borrow_mut();
     if inner.bindings.contains_key(name) {
         inner.bindings.insert(name.to_string(), val);
+        true
     } else if let Some(ref parent) = inner.parent {
-        env_set_existing(parent, name, val);
+        env_set_existing(parent, name, val)
+    } else {
+        false
     }
 }
 
@@ -388,6 +391,29 @@ fn eval(expr: &Value, env: &Env) -> Result<Value, EvalError> {
                     match op.as_str() {
                         "define" => {
                             return eval_define(&elems[1..], &current_env, form_span);
+                        }
+                        "set!" => {
+                            if elems.len() != 3 {
+                                return Err(EvalError::WrongArgCount {
+                                    expected: "2".into(),
+                                    got: elems.len() - 1,
+                                    at: form_span,
+                                });
+                            }
+                            let name = match &elems[1] {
+                                Value::Symbol(s, _) => s.clone(),
+                                _ => {
+                                    return Err(EvalError::Parse(
+                                        "set!: expected symbol".into(),
+                                        form_span,
+                                    ))
+                                }
+                            };
+                            let val = eval(&elems[2], &current_env)?;
+                            if !env_set_existing(&current_env, &name, val) {
+                                return Err(EvalError::UnboundVariable(name, form_span));
+                            }
+                            return Ok(Value::Void);
                         }
                         "quote" => {
                             if elems.len() != 2 {
