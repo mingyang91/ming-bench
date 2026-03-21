@@ -6,6 +6,18 @@ use std::cell::RefCell;
 use std::collections::HashMap;
 use std::rc::Rc;
 
+thread_local! {
+    static OUTPUT_BUFFER: RefCell<String> = RefCell::new(String::new());
+}
+
+fn output_write(s: &str) {
+    OUTPUT_BUFFER.with(|buf| buf.borrow_mut().push_str(s));
+}
+
+fn output_take() -> String {
+    OUTPUT_BUFFER.with(|buf| buf.borrow_mut().split_off(0))
+}
+
 /// A Scheme value.
 #[derive(Debug, Clone, PartialEq)]
 enum Value {
@@ -64,6 +76,18 @@ impl Value {
                 let inner: Vec<String> = elems.iter().map(|v| v.display()).collect();
                 format!("({})", inner.join(" "))
             }
+        }
+    }
+
+    /// Display without quotes around strings (used by Scheme `display`).
+    fn display_unquoted(&self) -> String {
+        match self {
+            Value::Str(s) => s.clone(),
+            Value::List(elems) => {
+                let inner: Vec<String> = elems.iter().map(|v| v.display_unquoted()).collect();
+                format!("({})", inner.join(" "))
+            }
+            _ => self.display(),
         }
     }
 }
@@ -732,6 +756,27 @@ fn apply_builtin_vals(op: &str, vals: &[Value], pos: Pos) -> Result<Value, EvalE
             }
             Ok(Value::Boolean(matches!(&vals[0], Value::Symbol(_))))
         }
+        "display" => {
+            if vals.len() != 1 {
+                return Err(runtime_err(pos, "display requires 1 argument"));
+            }
+            output_write(&vals[0].display_unquoted());
+            Ok(Value::Boolean(false))
+        }
+        "write" => {
+            if vals.len() != 1 {
+                return Err(runtime_err(pos, "write requires 1 argument"));
+            }
+            output_write(&vals[0].display());
+            Ok(Value::Boolean(false))
+        }
+        "newline" => {
+            if !vals.is_empty() {
+                return Err(runtime_err(pos, "newline takes no arguments"));
+            }
+            output_write("\n");
+            Ok(Value::Boolean(false))
+        }
         _ => Err(runtime_err(pos, format!("unknown procedure: {}", op))),
     }
 }
@@ -745,8 +790,20 @@ fn expect_int(v: &Value, pos: Pos) -> Result<i64, EvalError> {
 
 /// Evaluate Scheme expressions, returning both the result value and
 /// any output produced by `display`, `write`, or `newline`.
-pub fn eval_str_with_output(_input: &str) -> Result<(String, String), EvalError> {
-    todo!()
+pub fn eval_str_with_output(input: &str) -> Result<(String, String), EvalError> {
+    // Clear any prior output
+    output_take();
+    let exprs = parse_all(input)?;
+    if exprs.is_empty() {
+        return Err(EvalError::Parse("empty input".to_string()));
+    }
+    let env = new_env(None);
+    let mut result = Value::Boolean(false);
+    for (expr, pos) in exprs {
+        result = eval(expr, &env, pos)?;
+    }
+    let output = output_take();
+    Ok((result.display(), output))
 }
 
 #[cfg(test)]
