@@ -306,6 +306,7 @@ fn eval_special_form(
         "with-syntax" => syntax_case::eval_with_syntax(args, span, env, eval)
             .map(Bounce::Done)
             .map(Some),
+        "do" => eval_do(args, span, env).map(Some),
         _ => Ok(None),
     }
 }
@@ -398,6 +399,78 @@ fn parse_and_eval_binding(
     };
     let val = eval(val_expr, env)?;
     Ok((bname.clone(), val))
+}
+
+/// `(do ((var init step) ...) (test expr ...) body ...)`
+/// Parallel update iteration construct.
+fn eval_do(args: &[Expr], span: Span, env: &Env) -> Result<Bounce, EvalError> {
+    let [Expr::List(ref bindings, _), Expr::List(ref test_clause, _), ref body @ ..] =
+        args
+    else {
+        return Err(EvalError::Parse("invalid do form".into()).at(span));
+    };
+    let Some((test_expr, result_exprs)) = test_clause.split_first() else {
+        return Err(EvalError::Parse("do test clause must have a test".into()).at(span));
+    };
+    // Parse bindings: each is (var init) or (var init step)
+    let parsed: Vec<(String, Option<Expr>)> = bindings
+        .iter()
+        .map(|b| parse_do_binding(b, span))
+        .collect::<Result<_, _>>()?;
+    // Evaluate init values in outer env
+    let init_vals: Vec<Value> = bindings
+        .iter()
+        .map(|b| {
+            let Expr::List(ref parts, _) = b else {
+                unreachable!();
+            };
+            eval(&parts[1], env)
+        })
+        .collect::<Result<_, _>>()?;
+    // Create loop env with initial bindings
+    let loop_env = Env::extend(env);
+    for ((name, _), val) in parsed.iter().zip(init_vals) {
+        loop_env.define(name.clone(), val);
+    }
+    // Iteration loop
+    loop {
+        let test_val = eval(test_expr, &loop_env)?;
+        if test_val.is_truthy() && result_exprs.is_empty() {
+            return Ok(Bounce::Done(Value::Void));
+        }
+        if test_val.is_truthy() {
+            return eval_body_tco(result_exprs, loop_env);
+        }
+        // Execute body for side effects
+        for expr in body {
+            eval(expr, &loop_env)?;
+        }
+        // Evaluate all step exprs using current values (parallel update)
+        let new_vals: Vec<(String, Value)> = parsed
+            .iter()
+            .filter_map(|(name, step)| {
+                step.as_ref().map(|s| eval(s, &loop_env).map(|v| (name.clone(), v)))
+            })
+            .collect::<Result<_, _>>()?;
+        // Now update all at once
+        for (name, val) in new_vals {
+            let updated = loop_env.set(&name, val);
+            debug_assert!(updated, "do variable must be bound");
+        }
+    }
+}
+
+/// Parse a do binding `(var init)` or `(var init step)`.
+fn parse_do_binding(binding: &Expr, span: Span) -> Result<(String, Option<Expr>), EvalError> {
+    let Expr::List(ref parts, _) = binding else {
+        return Err(EvalError::Parse("do binding must be a list".into()).at(span));
+    };
+    match parts.as_slice() {
+        [Expr::Symbol(ref name, _), _init] => Ok((name.clone(), None)),
+        [Expr::Symbol(ref name, _), _init, ref step] => Ok((name.clone(), Some(step.clone()))),
+        _ => Err(EvalError::Parse("do binding must be (var init) or (var init step)".into())
+            .at(span)),
+    }
 }
 
 fn eval_begin(args: &[Expr], env: &Env) -> Result<Bounce, EvalError> {
