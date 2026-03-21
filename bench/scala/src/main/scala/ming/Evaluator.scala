@@ -1,7 +1,14 @@
 package ming
 
+import scala.annotation.tailrec
+
 /** Scheme interpreter entry point. */
 object Evaluator:
+
+  /** Internal result type for trampoline-based TCO. */
+  sealed private[ming] trait EvalResult
+  private[ming] case class Done(value: Value, env: Env, out: String)  extends EvalResult
+  private[ming] case class Bounce(expr: Value, env: Env, out: String) extends EvalResult
 
   def evalStr(input: String): String =
     evalStrWithOutput(input)._1
@@ -22,24 +29,75 @@ object Evaluator:
       case head :: Nil => eval(head, env, out)
       case head :: tail =>
         val (_, newEnv, out2) = eval(head, env, out)
-        evalAll(tail, newEnv, out2)
+        val nextEnv = head match
+          case Value.PairVal(Value.Symbol("define", _), _, _) =>
+            patchClosures(newEnv)
+          case _ => env
+        evalAll(tail, nextEnv, out2)
 
-  private def eval(
+  /** Tie-the-knot: update named lambdas' closures so they can see all current bindings (enables mutual recursion at top
+    * level).
+    */
+  private def patchClosures(env: Env): Env =
+    val hasNamedLambda = env.bindings.exists {
+      case (_, Value.LambdaVal(_, _, _, Some(_))) => true
+      case _                                      => false
+    }
+    if !hasNamedLambda then return env
+    lazy val patched: Env = Env(
+      env.bindings.map {
+        case (n, Value.LambdaVal(ps, bd, _, ln @ Some(_))) =>
+          n -> Value.LambdaVal(ps, bd, () => patched, ln)
+        case other => other
+      },
+      env.parent
+    )
+    patched
+
+  /** Evaluate body exprs, returning Bounce for the last (tail position). */
+  private[ming] def evalBodyTail(
+    exprs: List[Value],
+    env: Env,
+    out: String
+  ): EvalResult =
+    exprs match
+      case Nil         => Done(Value.VoidVal, env, out)
+      case last :: Nil => Bounce(last, env, out)
+      case head :: tail =>
+        val (_, newEnv, out2) = eval(head, env, out)
+        val nextEnv = head match
+          case Value.PairVal(Value.Symbol("define", _), _, _) => newEnv
+          case _                                              => env
+        evalBodyTail(tail, nextEnv, out2)
+
+  /** Trampoline: evaluate expr, looping on Bounce until Done. */
+  @tailrec
+  private[ming] def eval(
     expr: Value,
     env: Env,
     out: String
   ): (Value, Env, String) =
+    evalStep(expr, env, out) match
+      case Done(v, e, o)       => (v, e, o)
+      case Bounce(e2, env2, o) => eval(e2, env2, o)
+
+  /** Single evaluation step — returns Bounce for tail positions. */
+  private def evalStep(
+    expr: Value,
+    env: Env,
+    out: String
+  ): EvalResult =
     expr match
-      case Value.IntVal(_)           => (expr, env, out)
-      case Value.BoolVal(_)          => (expr, env, out)
-      case Value.StringVal(_)        => (expr, env, out)
-      case Value.CharVal(_)          => (expr, env, out)
-      case Value.NilVal              => (expr, env, out)
-      case Value.VoidVal             => (expr, env, out)
-      case _: Value.MutableStringVal => (expr, env, out)
-      case _: Value.LambdaVal        => (expr, env, out)
+      case Value.IntVal(_)           => Done(expr, env, out)
+      case Value.BoolVal(_)          => Done(expr, env, out)
+      case Value.StringVal(_)        => Done(expr, env, out)
+      case Value.CharVal(_)          => Done(expr, env, out)
+      case Value.NilVal              => Done(expr, env, out)
+      case Value.VoidVal             => Done(expr, env, out)
+      case _: Value.MutableStringVal => Done(expr, env, out)
+      case _: Value.LambdaVal        => Done(expr, env, out)
       case Value.Symbol(name, pos) =>
-        (env.lookup(name, pos), env, out)
+        Done(env.lookup(name, pos), env, out)
       case Value.PairVal(car, _, pos) =>
         val args = toList(expr).tail
         evalForm(car, args, env, pos, out)
@@ -50,49 +108,31 @@ object Evaluator:
     env: Env,
     pos: Option[(Int, Int)],
     out: String
-  ): (Value, Env, String) =
+  ): EvalResult =
     op match
-      case Value.Symbol("define", _) => evalDefine(args, env, pos, out)
-      case Value.Symbol("if", _)     => evalIf(args, env, pos, out)
-      case Value.Symbol("quote", _)  => evalQuote(args, env, out)
+      case Value.Symbol("define", _) => Forms.evalDefine(args, env, pos, out)
+      case Value.Symbol("if", _)     => Forms.evalIf(args, env, pos, out)
+      case Value.Symbol("quote", _)  => Forms.evalQuote(args, env, out)
       case Value.Symbol("lambda", _) =>
-        (makeLambda(args, env), env, out)
-      case Value.Symbol("let", _)   => evalLet(args, env, out)
-      case Value.Symbol("begin", _) => evalAll(args, env, out)
-      case Value.Symbol("cond", _)  => evalCond(args, env, out)
-      case Value.Symbol("and", _) =>
-        val (v, out2) = evalAnd(args, env, out)
-        (v, env, out2)
-      case Value.Symbol("or", _) =>
-        val (v, out2) = evalOr(args, env, out)
-        (v, env, out2)
+        Done(Forms.makeLambda(args, env), env, out)
+      case Value.Symbol("let", _)   => Forms.evalLet(args, env, out)
+      case Value.Symbol("begin", _) => evalBodyTail(args, env, out)
+      case Value.Symbol("cond", _)  => Forms.evalCond(args, env, out)
+      case Value.Symbol("and", _)   => Forms.evalAnd(args, env, out)
+      case Value.Symbol("or", _)    => Forms.evalOr(args, env, out)
       case Value.Symbol("not", _) =>
-        val (v, out2) = evalNot(args, env, out)
-        (v, env, out2)
+        val (v, out2) = Forms.evalNotInner(args, env, out)
+        Done(v, env, out2)
       case Value.Symbol("display", _) =>
-        evalDisplayForm(args, env, out, _.displayRepr)
+        Forms.evalDisplayForm(args, env, out, _.displayRepr)
       case Value.Symbol("write", _) =>
-        evalDisplayForm(args, env, out, _.display)
+        Forms.evalDisplayForm(args, env, out, _.display)
       case Value.Symbol("newline", _) =>
-        (Value.VoidVal, env, out + "\n")
+        Done(Value.VoidVal, env, out + "\n")
       case _ =>
         val (proc, _, out2)    = eval(op, env, out)
         val (evaledArgs, out3) = evalArgs(args, env, out2)
-        val (result, out4)     = applyProc(proc, evaledArgs, pos, out3)
-        (result, env, out4)
-
-  private def evalDisplayForm(
-    args: List[Value],
-    env: Env,
-    out: String,
-    fmt: Value => String
-  ): (Value, Env, String) =
-    args match
-      case arg :: Nil =>
-        val (v, _, out2) = eval(arg, env, out)
-        (Value.VoidVal, env, out2 + fmt(v))
-      case _ =>
-        throw new EvalError("display/write requires exactly 1 argument")
+        applyProcTail(proc, evaledArgs, pos, out3)
 
   private def evalArgs(
     args: List[Value],
@@ -104,182 +144,43 @@ object Evaluator:
       (acc :+ v, o2)
     }
 
-  private def evalDefine(
-    args: List[Value],
-    env: Env,
-    pos: Option[(Int, Int)],
-    out: String
-  ): (Value, Env, String) =
-    args match
-      case Value.PairVal(
-            Value.Symbol(name, _),
-            paramsList,
-            _
-          ) :: body =>
-        val params = extractParams(paramsList)
-        val lambda = Value.LambdaVal(params, body, env, Some(name))
-        (Value.VoidVal, env.define(name, lambda), out)
-      case Value.Symbol(name, _) :: valueExpr :: Nil =>
-        val (v, _, out2) = eval(valueExpr, env, out)
-        (Value.VoidVal, env.define(name, v), out2)
-      case _ =>
-        throw EvalError.withPos("bad define syntax", pos)
-
-  private def evalIf(
-    args: List[Value],
-    env: Env,
-    pos: Option[(Int, Int)],
-    out: String
-  ): (Value, Env, String) =
-    args match
-      case cond :: thenBranch :: elseBranch =>
-        val (condVal, _, out2) = eval(cond, env, out)
-        if !isFalsy(condVal) then eval(thenBranch, env, out2)
-        else
-          elseBranch match
-            case eb :: Nil => eval(eb, env, out2)
-            case Nil       => (Value.VoidVal, env, out2)
-            case _ =>
-              throw EvalError.withPos("bad if syntax", pos)
-      case _ => throw EvalError.withPos("bad if syntax", pos)
-
-  private def evalQuote(
-    args: List[Value],
-    env: Env,
-    out: String
-  ): (Value, Env, String) =
-    args match
-      case datum :: Nil => (datum, env, out)
-      case _ =>
-        throw new EvalError("quote requires exactly 1 argument")
-
-  private def makeLambda(args: List[Value], env: Env): Value =
-    args match
-      case paramExpr :: body if body.nonEmpty =>
-        val params = extractParams(paramExpr)
-        Value.LambdaVal(params, body, env, None)
-      case _ => throw new EvalError("bad lambda syntax")
-
-  private def extractParams(paramExpr: Value): List[String] =
-    toList(paramExpr).map {
-      case Value.Symbol(s, _) => s
-      case other =>
-        throw new EvalError(
-          s"expected symbol in parameter list, got: ${other.display}"
-        )
-    }
-
-  private def applyProc(
+  /** Apply a procedure, returning Bounce for lambda bodies (TCO). */
+  private[ming] def applyProcTail(
     proc: Value,
     args: List[Value],
     pos: Option[(Int, Int)],
     out: String
-  ): (Value, String) =
+  ): EvalResult =
     proc match
       case lam @ Value.LambdaVal(
             params,
             body,
-            closure,
+            closureThunk,
             nameOpt
           ) =>
+        val closure = closureThunk()
         val closureWithSelf = nameOpt match
           case Some(n) => closure.define(n, lam)
           case None    => closure
-        val localEnv          = closureWithSelf.extend(params, args, pos)
-        val (result, _, out2) = evalAll(body, localEnv, out)
-        (result, out2)
+        val localEnv = closureWithSelf.extend(params, args, pos)
+        evalBodyTail(body, localEnv, out)
       case Value.Symbol(name, _) =>
-        (Builtins.applyBuiltin(name, args, pos), out)
+        Done(
+          Builtins.applyBuiltin(name, args, pos),
+          Env(Map.empty, None),
+          out
+        )
       case _ =>
         throw EvalError.withPos(
           s"not a procedure: ${proc.display}",
           pos
         )
 
-  private def evalAnd(
-    args: List[Value],
-    env: Env,
-    out: String
-  ): (Value, String) =
-    args match
-      case Nil => (Value.BoolVal(true), out)
-      case head :: Nil =>
-        val (v, _, out2) = eval(head, env, out)
-        (v, out2)
-      case head :: tail =>
-        val (v, _, out2) = eval(head, env, out)
-        if isFalsy(v) then (v, out2) else evalAnd(tail, env, out2)
-
-  private def evalOr(
-    args: List[Value],
-    env: Env,
-    out: String
-  ): (Value, String) =
-    args match
-      case Nil => (Value.BoolVal(false), out)
-      case head :: Nil =>
-        val (v, _, out2) = eval(head, env, out)
-        (v, out2)
-      case head :: tail =>
-        val (v, _, out2) = eval(head, env, out)
-        if !isFalsy(v) then (v, out2) else evalOr(tail, env, out2)
-
-  private def evalNot(
-    args: List[Value],
-    env: Env,
-    out: String
-  ): (Value, String) =
-    args match
-      case head :: Nil =>
-        val (v, _, out2) = eval(head, env, out)
-        (Value.BoolVal(isFalsy(v)), out2)
-      case _ =>
-        throw new EvalError("not requires exactly 1 argument")
-
-  private def evalLet(
-    args: List[Value],
-    env: Env,
-    out: String
-  ): (Value, Env, String) =
-    args match
-      case bindings :: body if body.nonEmpty =>
-        val bindingList = toList(bindings)
-        val (localEnv, out2) =
-          bindingList.foldLeft((env, out)) { case ((acc, o), binding) =>
-            val pair = toList(binding)
-            pair match
-              case Value.Symbol(name, _) :: valExpr :: Nil =>
-                val (v, _, o2) = eval(valExpr, env, o)
-                (acc.define(name, v), o2)
-              case _ => throw new EvalError("bad let binding")
-          }
-        val (result, _, out3) = evalAll(body, localEnv, out2)
-        (result, env, out3)
-      case _ => throw new EvalError("bad let syntax")
-
-  private def evalCond(
-    clauses: List[Value],
-    env: Env,
-    out: String
-  ): (Value, Env, String) =
-    clauses match
-      case Nil => (Value.VoidVal, env, out)
-      case clause :: rest =>
-        val parts = toList(clause)
-        parts match
-          case Value.Symbol("else", _) :: body =>
-            evalAll(body, env, out)
-          case test :: body =>
-            val (testVal, _, out2) = eval(test, env, out)
-            if !isFalsy(testVal) then evalAll(body, env, out2)
-            else evalCond(rest, env, out2)
-          case _ => throw new EvalError("bad cond clause")
-
-  private def isFalsy(v: Value): Boolean = v match
+  private[ming] def isFalsy(v: Value): Boolean = v match
     case Value.BoolVal(false) => true
     case _                    => false
 
-  private def toList(v: Value): List[Value] = v match
+  private[ming] def toList(v: Value): List[Value] = v match
     case Value.NilVal           => Nil
     case Value.PairVal(h, t, _) => h :: toList(t)
     case other                  => List(other)

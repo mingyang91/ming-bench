@@ -13,7 +13,7 @@ enum Value:
   case LambdaVal(
     params: List[String],
     body: List[Value],
-    closure: Env,
+    closure: () => Env,
     name: Option[String]
   )
   case MutableStringVal(chars: Array[Char])
