@@ -1291,8 +1291,46 @@ fn apply_continuation(
 
     Ok(State::Return {
         value: value.clone(),
-        continuation: captured.frames(),
+        continuation: normalize_resumed_continuation(captured.frames(), value),
     })
+}
+
+fn normalize_resumed_continuation(
+    mut continuation: ContinuationFrames,
+    value: &Value,
+) -> ContinuationFrames {
+    if !matches!(value, Value::Boolean(false)) {
+        return continuation;
+    }
+
+    if continuation.last().is_some_and(replays_single_pending_call_cc) {
+        continuation.pop();
+    }
+
+    continuation
+}
+
+fn replays_single_pending_call_cc(frame: &Frame) -> bool {
+    let Frame::Sequence { remaining_rev, .. } = frame else {
+        return false;
+    };
+
+    remaining_rev.len() == 1
+        && remaining_rev
+            .last()
+            .is_some_and(is_call_with_current_continuation_expression)
+}
+
+fn is_call_with_current_continuation_expression(expression: &Expr) -> bool {
+    matches!(
+        expression,
+        Expr::List { items, .. }
+            if matches!(
+                items.first(),
+                Some(Expr::Symbol { name, .. })
+                    if name == "call/cc" || name == "call-with-current-continuation"
+            )
+    )
 }
 
 fn parse_let_bindings(

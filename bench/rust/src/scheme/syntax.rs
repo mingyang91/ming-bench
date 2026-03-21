@@ -1336,7 +1336,7 @@ fn expand_lambda_template(
         repetition_index,
     )?;
     let body_scope = merge_scopes(scope, parameter_scope);
-    let expanded_body = expand_template_items(
+    let expanded_body = expand_body_items(
         body,
         bindings,
         captured_aliases,
@@ -1386,7 +1386,7 @@ fn expand_let_template(
                 repetition_index,
             )?;
             let body_scope = merge_scopes(&merge_scopes(scope, name_scope), binding_scope);
-            let expanded_body = expand_template_items(
+            let expanded_body = expand_body_items(
                 body,
                 bindings,
                 captured_aliases,
@@ -1422,7 +1422,7 @@ fn expand_let_template(
                 repetition_index,
             )?;
             let body_scope = merge_scopes(scope, binding_scope);
-            let expanded_body = expand_template_items(
+            let expanded_body = expand_body_items(
                 body,
                 bindings,
                 captured_aliases,
@@ -1452,6 +1452,27 @@ fn expand_define_template(
     macros: &MacroEnvironment,
     repetition_index: Option<usize>,
 ) -> Result<Expr, EvalError> {
+    expand_define_template_with_scope(
+        items,
+        location,
+        bindings,
+        captured_aliases,
+        scope,
+        macros,
+        repetition_index,
+    )
+    .map(|(expression, _)| expression)
+}
+
+fn expand_define_template_with_scope(
+    items: &[TemplateItem],
+    location: SourceLocation,
+    bindings: &MatchBindings,
+    captured_aliases: &HashMap<String, String>,
+    scope: &Scope,
+    macros: &MacroEnvironment,
+    repetition_index: Option<usize>,
+) -> Result<(Expr, Scope), EvalError> {
     let Some(operator) = items.first() else {
         return Err(invalid_syntax_rules(location, "define template is empty"));
     };
@@ -1471,7 +1492,7 @@ fn expand_define_template(
                 location: signature_location,
             } = &name.template
             {
-                let (signature, body_scope) = expand_define_signature(
+                let (signature, function_scope, body_scope) = expand_define_signature(
                     signature_items,
                     *signature_location,
                     bindings,
@@ -1489,10 +1510,10 @@ fn expand_define_template(
                     repetition_index,
                 )?;
 
-                return Ok(Expr::list(vec![operator, signature, body], location));
+                return Ok((Expr::list(vec![operator, signature, body], location), function_scope));
             }
 
-            let (name, _) =
+            let (name, name_scope) =
                 expand_binder_template(&name.template, bindings, scope, macros, repetition_index)?;
             let expression = expand_template(
                 &expression.template,
@@ -1502,7 +1523,7 @@ fn expand_define_template(
                 macros,
                 repetition_index,
             )?;
-            Ok(Expr::list(vec![operator, name, expression], location))
+            Ok((Expr::list(vec![operator, name, expression], location), name_scope))
         }
         [_, name, body @ ..] if matches!(name.template, Template::List { .. }) => {
             let Template::List {
@@ -1512,7 +1533,7 @@ fn expand_define_template(
             else {
                 unreachable!("function definition signature must be a list");
             };
-            let (signature, body_scope) = expand_define_signature(
+            let (signature, function_scope, body_scope) = expand_define_signature(
                 signature_items,
                 *signature_location,
                 bindings,
@@ -1521,7 +1542,7 @@ fn expand_define_template(
                 macros,
                 repetition_index,
             )?;
-            let body = expand_template_items(
+            let body = expand_body_items(
                 body,
                 bindings,
                 captured_aliases,
@@ -1530,12 +1551,15 @@ fn expand_define_template(
                 repetition_index,
             )?;
 
-            Ok(Expr::list(
-                std::iter::once(operator)
-                    .chain(std::iter::once(signature))
-                    .chain(body)
-                    .collect(),
-                location,
+            Ok((
+                Expr::list(
+                    std::iter::once(operator)
+                        .chain(std::iter::once(signature))
+                        .chain(body)
+                        .collect(),
+                    location,
+                ),
+                function_scope,
             ))
         }
         _ => Err(invalid_syntax_rules(
@@ -1553,7 +1577,7 @@ fn expand_define_signature(
     scope: &Scope,
     macros: &MacroEnvironment,
     repetition_index: Option<usize>,
-) -> Result<(Expr, Scope), EvalError> {
+) -> Result<(Expr, Scope, Scope), EvalError> {
     let Some((function_name, parameters)) = signature_items.split_first() else {
         return Err(invalid_syntax_rules(
             signature_location,
@@ -1579,8 +1603,81 @@ fn expand_define_signature(
         std::iter::once(function_name).chain(parameters).collect(),
         signature_location,
     );
-    let body_scope = merge_scopes(&merge_scopes(scope, function_scope), parameter_scope);
-    Ok((signature, body_scope))
+    let body_scope = merge_scopes(&merge_scopes(scope, function_scope.clone()), parameter_scope);
+    Ok((signature, function_scope, body_scope))
+}
+
+fn expand_body_items(
+    items: &[TemplateItem],
+    bindings: &MatchBindings,
+    captured_aliases: &HashMap<String, String>,
+    scope: &Scope,
+    macros: &MacroEnvironment,
+    repetition_index: Option<usize>,
+) -> Result<Vec<Expr>, EvalError> {
+    items
+        .iter()
+        .try_fold((Vec::new(), scope.clone()), |(mut expressions, body_scope), item| {
+            let (expanded, scope_updates) = expand_body_item(
+                item,
+                bindings,
+                captured_aliases,
+                &body_scope,
+                macros,
+                repetition_index,
+            )?;
+            expressions.extend(expanded);
+            Ok((expressions, merge_scopes(&body_scope, scope_updates)))
+        })
+        .map(|(expressions, _)| expressions)
+}
+
+fn expand_body_item(
+    item: &TemplateItem,
+    bindings: &MatchBindings,
+    captured_aliases: &HashMap<String, String>,
+    scope: &Scope,
+    macros: &MacroEnvironment,
+    repetition_index: Option<usize>,
+) -> Result<(Vec<Expr>, Scope), EvalError> {
+    if item.repeated {
+        return expand_template_item(
+            item,
+            bindings,
+            captured_aliases,
+            scope,
+            macros,
+            repetition_index,
+        )
+        .map(|expressions| (expressions, HashMap::new()));
+    }
+
+    if !is_define_template(&item.template) {
+        return expand_template(
+            &item.template,
+            bindings,
+            captured_aliases,
+            scope,
+            macros,
+            repetition_index,
+        )
+        .map(|expression| (vec![expression], HashMap::new()));
+    }
+
+    let Template::List { items, location } = &item.template else {
+        unreachable!("define template must be a list");
+    };
+
+    expand_define_template_with_scope(
+        items,
+        *location,
+        bindings,
+        captured_aliases,
+        scope,
+        macros,
+        repetition_index,
+    )
+    .map(|(expression, scope_updates)| (vec![expression], scope_updates))
 }
 
 fn expand_formals_template(
@@ -1790,6 +1887,17 @@ fn is_quote_form(expression: &Expr) -> bool {
             if matches!(
                 items.first(),
                 Some(Expr::Symbol { name, .. }) if name == "quote"
+            )
+    )
+}
+
+fn is_define_template(template: &Template) -> bool {
+    matches!(
+        template,
+        Template::List { items, .. }
+            if matches!(
+                items.first().map(|item| &item.template),
+                Some(Template::Identifier { name, .. }) if name == "define"
             )
     )
 }
