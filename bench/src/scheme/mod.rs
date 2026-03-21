@@ -42,7 +42,11 @@ fn eval_list(items: &[Value]) -> Result<Value, EvalError> {
     };
 
     match operator {
-        Value::Symbol(name) => apply_builtin(name, args),
+        Value::Symbol(name) => match name.as_str() {
+            "and" => eval_and(args),
+            "or" => eval_or(args),
+            _ => apply_builtin(name, args),
+        },
         _ => Err(EvalError::TypeError {
             expected: "procedure".to_string(),
             got: format!("{operator}"),
@@ -53,6 +57,8 @@ fn eval_list(items: &[Value]) -> Result<Value, EvalError> {
 fn apply_builtin(name: &str, args: &[Value]) -> Result<Value, EvalError> {
     match name {
         "+" | "-" | "*" | "/" => apply_arithmetic(name, args),
+        "<" | ">" | "=" | "<=" | ">=" => apply_comparison(name, args),
+        "not" => apply_not(args),
         _ => Err(EvalError::UnboundVariable {
             name: name.to_string(),
         }),
@@ -103,6 +109,64 @@ fn apply_arithmetic(op: &str, args: &[Value]) -> Result<Value, EvalError> {
     };
 
     Ok(Value::Integer(result))
+}
+
+fn is_truthy(value: &Value) -> bool {
+    !matches!(value, Value::Boolean(false))
+}
+
+fn eval_and(args: &[Value]) -> Result<Value, EvalError> {
+    let mut result = Value::Boolean(true);
+    for arg in args {
+        result = eval(arg)?;
+        if !is_truthy(&result) {
+            return Ok(result);
+        }
+    }
+    Ok(result)
+}
+
+fn eval_or(args: &[Value]) -> Result<Value, EvalError> {
+    let mut result = Value::Boolean(false);
+    for arg in args {
+        result = eval(arg)?;
+        if is_truthy(&result) {
+            return Ok(result);
+        }
+    }
+    Ok(result)
+}
+
+fn apply_not(args: &[Value]) -> Result<Value, EvalError> {
+    let [arg] = args else {
+        return Err(EvalError::WrongArgCount {
+            expected: 1,
+            got: args.len(),
+        });
+    };
+    let val = eval(arg)?;
+    Ok(Value::Boolean(!is_truthy(&val)))
+}
+
+fn apply_comparison(op: &str, args: &[Value]) -> Result<Value, EvalError> {
+    let [left, right] = args else {
+        return Err(EvalError::WrongArgCount {
+            expected: 2,
+            got: args.len(),
+        });
+    };
+    let a = eval_to_integer(left)?;
+    let b = eval_to_integer(right)?;
+
+    let result = match op {
+        "<" => a < b,
+        ">" => a > b,
+        "=" => a == b,
+        "<=" => a <= b,
+        ">=" => a >= b,
+        _ => unreachable!("apply_comparison called with non-comparison op"),
+    };
+    Ok(Value::Boolean(result))
 }
 
 #[cfg(test)]
