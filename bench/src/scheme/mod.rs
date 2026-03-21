@@ -303,7 +303,8 @@ fn is_builtin(name: &str) -> bool {
         "vector" | "make-vector" | "vector-ref" | "vector-set!" | "vector-length" |
         "vector?" | "vector->list" | "list->vector" |
         "abs" | "modulo" | "remainder" | "quotient" | "min" | "max" | "expt" |
-        "zero?" | "positive?" | "negative?" | "odd?" | "even?")
+        "zero?" | "positive?" | "negative?" | "odd?" | "even?" |
+        "string=?" | "string<?" | "string-ci=?" | "string-upcase" | "string-downcase")
 }
 
 fn parse_params(param_asts: &[Ast]) -> Result<(Vec<String>, Option<String>), EvalError> {
@@ -1497,6 +1498,41 @@ fn apply_builtin(op: &str, args: &[Value], out: &mut String) -> Result<Value, Ev
                 return Err(EvalError::TypeError("string-ref: index out of range".into()));
             }
             Ok(Value::Char(s.as_bytes()[idx] as char))
+        }
+        "string=?" => {
+            if args.len() != 2 { return Err(EvalError::Arity); }
+            match (&args[0], &args[1]) {
+                (Value::Str(a), Value::Str(b)) => Ok(Value::Boolean(a == b)),
+                _ => Err(EvalError::TypeError("string=?: expected strings".into())),
+            }
+        }
+        "string<?" => {
+            if args.len() != 2 { return Err(EvalError::Arity); }
+            match (&args[0], &args[1]) {
+                (Value::Str(a), Value::Str(b)) => Ok(Value::Boolean(a < b)),
+                _ => Err(EvalError::TypeError("string<?: expected strings".into())),
+            }
+        }
+        "string-ci=?" => {
+            if args.len() != 2 { return Err(EvalError::Arity); }
+            match (&args[0], &args[1]) {
+                (Value::Str(a), Value::Str(b)) => Ok(Value::Boolean(a.to_lowercase() == b.to_lowercase())),
+                _ => Err(EvalError::TypeError("string-ci=?: expected strings".into())),
+            }
+        }
+        "string-upcase" => {
+            if args.len() != 1 { return Err(EvalError::Arity); }
+            match &args[0] {
+                Value::Str(s) => Ok(Value::Str(s.to_uppercase())),
+                _ => Err(EvalError::TypeError("string-upcase: expected string".into())),
+            }
+        }
+        "string-downcase" => {
+            if args.len() != 1 { return Err(EvalError::Arity); }
+            match &args[0] {
+                Value::Str(s) => Ok(Value::Str(s.to_lowercase())),
+                _ => Err(EvalError::TypeError("string-downcase: expected string".into())),
+            }
         }
         "char?" => {
             if args.len() != 1 { return Err(EvalError::Arity); }
