@@ -119,6 +119,13 @@ fn is_builtin(name: &str) -> bool {
             | "map"
             | "call/cc"
             | "call-with-current-continuation"
+            | "vector"
+            | "make-vector"
+            | "vector-ref"
+            | "vector-set!"
+            | "vector?"
+            | "vector-length"
+            | "vector->list"
     )
 }
 
@@ -574,6 +581,13 @@ fn apply_builtin(op: &str, args: &[Value]) -> Result<Value, EvalError> {
         "list->string" => builtins::apply_list_to_string(args),
         "char->integer" => builtins::apply_char_to_integer(args),
         "integer->char" => builtins::apply_integer_to_char(args),
+        "vector" => builtins::apply_vector(args),
+        "make-vector" => builtins::apply_make_vector(args),
+        "vector-ref" => builtins::apply_vector_ref(args),
+        "vector-set!" => builtins::apply_vector_set(args),
+        "vector?" => builtins::apply_type_predicate(args, |v| matches!(v, Value::Vector(_))),
+        "vector-length" => builtins::apply_vector_length(args),
+        "vector->list" => builtins::apply_vector_to_list(args),
         _ => Err(EvalError::UnboundVariable {
             name: op.to_string(),
         }),

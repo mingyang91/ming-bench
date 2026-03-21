@@ -1,3 +1,6 @@
+use std::cell::RefCell;
+use std::rc::Rc;
+
 use super::{EvalError, Value};
 
 fn require_integers(args: &[Value]) -> Result<Vec<i64>, EvalError> {
@@ -471,5 +474,124 @@ pub fn apply_length(args: &[Value]) -> Result<Value, EvalError> {
             expected: "list".to_string(),
             got: format!("{val}"),
         }),
+    }
+}
+
+pub fn apply_vector(args: &[Value]) -> Result<Value, EvalError> {
+    Ok(Value::Vector(Rc::new(RefCell::new(args.to_vec()))))
+}
+
+pub fn apply_make_vector(args: &[Value]) -> Result<Value, EvalError> {
+    let [len_val, fill_val] = args else {
+        return Err(EvalError::WrongArgCount {
+            expected: 2,
+            got: args.len(),
+        });
+    };
+    let Value::Integer(len) = len_val else {
+        return Err(EvalError::TypeError {
+            expected: "integer".to_string(),
+            got: format!("{len_val}"),
+        });
+    };
+    Ok(Value::Vector(Rc::new(RefCell::new(
+        vec![fill_val.clone(); *len as usize],
+    ))))
+}
+
+pub fn apply_vector_ref(args: &[Value]) -> Result<Value, EvalError> {
+    let [vec_val, idx_val] = args else {
+        return Err(EvalError::WrongArgCount {
+            expected: 2,
+            got: args.len(),
+        });
+    };
+    let Value::Vector(v) = vec_val else {
+        return Err(EvalError::TypeError {
+            expected: "vector".to_string(),
+            got: format!("{vec_val}"),
+        });
+    };
+    let Value::Integer(idx) = idx_val else {
+        return Err(EvalError::TypeError {
+            expected: "integer".to_string(),
+            got: format!("{idx_val}"),
+        });
+    };
+    let items = v.borrow();
+    items
+        .get(*idx as usize)
+        .cloned()
+        .ok_or_else(|| EvalError::TypeError {
+            expected: "valid vector index".to_string(),
+            got: format!("{idx}"),
+        })
+}
+
+pub fn apply_vector_set(args: &[Value]) -> Result<Value, EvalError> {
+    let [vec_val, idx_val, new_val] = args else {
+        return Err(EvalError::WrongArgCount {
+            expected: 3,
+            got: args.len(),
+        });
+    };
+    let Value::Vector(v) = vec_val else {
+        return Err(EvalError::TypeError {
+            expected: "vector".to_string(),
+            got: format!("{vec_val}"),
+        });
+    };
+    let Value::Integer(idx) = idx_val else {
+        return Err(EvalError::TypeError {
+            expected: "integer".to_string(),
+            got: format!("{idx_val}"),
+        });
+    };
+    let mut items = v.borrow_mut();
+    let i = *idx as usize;
+    if i >= items.len() {
+        return Err(EvalError::TypeError {
+            expected: "valid vector index".to_string(),
+            got: format!("{idx}"),
+        });
+    }
+    items[i] = new_val.clone();
+    Ok(Value::Nil)
+}
+
+pub fn apply_vector_length(args: &[Value]) -> Result<Value, EvalError> {
+    let [val] = args else {
+        return Err(EvalError::WrongArgCount {
+            expected: 1,
+            got: args.len(),
+        });
+    };
+    let Value::Vector(v) = val else {
+        return Err(EvalError::TypeError {
+            expected: "vector".to_string(),
+            got: format!("{val}"),
+        });
+    };
+    Ok(Value::Integer(v.borrow().len() as i64))
+}
+
+pub fn apply_vector_to_list(args: &[Value]) -> Result<Value, EvalError> {
+    let [val] = args else {
+        return Err(EvalError::WrongArgCount {
+            expected: 1,
+            got: args.len(),
+        });
+    };
+    let Value::Vector(v) = val else {
+        return Err(EvalError::TypeError {
+            expected: "vector".to_string(),
+            got: format!("{val}"),
+        });
+    };
+    let items = v.borrow();
+    if items.is_empty() {
+        Ok(Value::Nil)
+    } else {
+        Ok(Value::List(items.clone()))
     }
 }

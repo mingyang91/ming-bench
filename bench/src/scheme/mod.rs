@@ -43,6 +43,7 @@ pub(crate) enum Value {
         literals: Vec<String>,
         def_env: Env,
     },
+    Vector(Rc<RefCell<Vec<Value>>>),
 }
 
 impl PartialEq for Value {
@@ -58,6 +59,7 @@ impl PartialEq for Value {
             (Value::Nil, Value::Nil) => true,
             (Value::Continuation { id: a }, Value::Continuation { id: b }) => a == b,
             (Value::Macro { .. }, Value::Macro { .. }) => false,
+            (Value::Vector(a), Value::Vector(b)) => *a.borrow() == *b.borrow(),
             _ => false,
         }
     }
@@ -75,6 +77,10 @@ impl std::fmt::Display for Value {
             Value::Nil => write!(f, "()"),
             Value::List(items) => write!(f, "({})", fmt_list(items)),
             Value::Pair(car, cdr) => write!(f, "({car} . {cdr})"),
+            Value::Vector(v) => {
+                let items = v.borrow();
+                write!(f, "#({})", fmt_list(&items))
+            }
             Value::Lambda { .. } | Value::Continuation { .. } | Value::Macro { .. } => {
                 write!(f, "#<procedure>")
             }
