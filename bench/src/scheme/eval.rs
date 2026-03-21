@@ -77,6 +77,15 @@ fn apply_builtin(op: &str, args: &[Value]) -> Result<Value, EvalError> {
         "null?" => builtins::apply_null(args),
         "list" => builtins::apply_list(args),
         "length" => builtins::apply_length(args),
+        "string?" => builtins::apply_type_predicate(args, |v| matches!(v, Value::String(_))),
+        "number?" => builtins::apply_type_predicate(args, |v| matches!(v, Value::Integer(_))),
+        "boolean?" => builtins::apply_type_predicate(args, |v| matches!(v, Value::Boolean(_))),
+        "pair?" => builtins::apply_type_predicate(args, |v| match v {
+            Value::Pair(_, _) => true,
+            Value::List(items) => !items.is_empty(),
+            _ => false,
+        }),
+        "symbol?" => builtins::apply_type_predicate(args, |v| matches!(v, Value::Symbol(_))),
         _ => Err(EvalError::UnboundVariable {
             name: op.to_string(),
         }),

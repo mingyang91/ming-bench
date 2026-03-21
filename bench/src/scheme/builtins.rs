@@ -148,6 +148,16 @@ pub fn apply_list(args: &[Value]) -> Result<Value, EvalError> {
     }
 }
 
+pub fn apply_type_predicate(args: &[Value], pred: fn(&Value) -> bool) -> Result<Value, EvalError> {
+    let [val] = args else {
+        return Err(EvalError::WrongArgCount {
+            expected: 1,
+            got: args.len(),
+        });
+    };
+    Ok(Value::Boolean(pred(val)))
+}
+
 pub fn apply_length(args: &[Value]) -> Result<Value, EvalError> {
     let [val] = args else {
         return Err(EvalError::WrongArgCount {
