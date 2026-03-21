@@ -1727,6 +1727,24 @@ fn apply_builtin(name: &str, args: &[Value], span: Span, out: &OutputBuf) -> Res
             let n = require_int(&args[0], span)?;
             match char::from_u32(n as u32) { Some(c) => Ok(Value::Char(c)), None => Err(err_at(span, "integer->char: invalid code point")) }
         }
+        "char-alphabetic?" => {
+            match &args[0] { Value::Char(c) => Ok(Value::Boolean(c.is_alphabetic())), _ => Err(err_at(span, "char-alphabetic?: expected char")) }
+        }
+        "char-numeric?" => {
+            match &args[0] { Value::Char(c) => Ok(Value::Boolean(c.is_ascii_digit())), _ => Err(err_at(span, "char-numeric?: expected char")) }
+        }
+        "char-upcase" => {
+            match &args[0] { Value::Char(c) => Ok(Value::Char(c.to_ascii_uppercase())), _ => Err(err_at(span, "char-upcase: expected char")) }
+        }
+        "char-downcase" => {
+            match &args[0] { Value::Char(c) => Ok(Value::Char(c.to_ascii_lowercase())), _ => Err(err_at(span, "char-downcase: expected char")) }
+        }
+        "char=?" => {
+            match (&args[0], &args[1]) { (Value::Char(a), Value::Char(b)) => Ok(Value::Boolean(a == b)), _ => Err(err_at(span, "char=?: expected chars")) }
+        }
+        "char<?" => {
+            match (&args[0], &args[1]) { (Value::Char(a), Value::Char(b)) => Ok(Value::Boolean(a < b)), _ => Err(err_at(span, "char<?: expected chars")) }
+        }
         "vector" => Ok(Value::Vector(Rc::new(RefCell::new(args.to_vec())))),
         "make-vector" => {
             let len = require_int(&args[0], span)? as usize;
@@ -1956,6 +1974,7 @@ fn init_builtins(env: &EnvRef) {
         "number->string", "symbol->string", "string->symbol",
         "string-ref", "string-copy", "string-set!", "string->list", "list->string",
         "char->integer", "integer->char",
+        "char-alphabetic?", "char-numeric?", "char-upcase", "char-downcase", "char=?", "char<?",
         "equal?", "eqv?", "eq?",
         "call/cc", "call-with-current-continuation",
         "vector", "make-vector", "vector-ref", "vector-set!", "vector?", "vector-length", "vector->list",
