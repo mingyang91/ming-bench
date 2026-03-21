@@ -2,12 +2,14 @@ mod ast;
 mod builtins;
 mod continuation;
 mod environment;
+mod equality;
 pub mod error;
 mod evaluator;
 mod parser;
 mod string_value;
 mod syntax;
 mod value;
+mod vector_value;
 
 pub use error::EvalError;
 use evaluator::{eval_program, eval_program_with_output};

@@ -8,6 +8,7 @@ use crate::scheme::continuation::CapturedContinuation;
 use crate::scheme::environment::Environment;
 use crate::scheme::error::EvalError;
 use crate::scheme::string_value::SchemeString;
+use crate::scheme::vector_value::SchemeVector;
 
 #[derive(Clone, Copy)]
 enum RenderMode {
@@ -24,11 +25,13 @@ pub enum Value {
     Symbol(String),
     EmptyList,
     Pair(Box<Value>, Box<Value>),
+    Vector(SchemeVector),
     Builtin(BuiltinProcedure),
     CallWithCurrentContinuation,
     Continuation(Rc<CapturedContinuation>),
     Closure(Closure),
     Void,
+    Uninitialized,
 }
 
 #[derive(Clone)]
@@ -86,11 +89,13 @@ impl Value {
             Self::Symbol(value) => value.clone(),
             Self::EmptyList => "()".into(),
             Self::Pair(car, cdr) => render_pair(car, cdr, mode),
+            Self::Vector(vector) => render_vector(vector, mode),
             Self::Builtin(procedure) => format!("#<procedure:{}>", procedure.name()),
             Self::CallWithCurrentContinuation => "#<procedure:call/cc>".into(),
             Self::Continuation(_) => "#<continuation>".into(),
             Self::Closure(closure) => render_closure(closure),
             Self::Void => "#<void>".into(),
+            Self::Uninitialized => "#<uninitialized>".into(),
         }
     }
 
@@ -138,6 +143,17 @@ impl Value {
         }
     }
 
+    pub fn expect_vector(&self, location: SourceLocation) -> Result<&SchemeVector, EvalError> {
+        match self {
+            Self::Vector(value) => Ok(value),
+            _ => Err(EvalError::TypeMismatch {
+                location,
+                expected: "vector",
+                found: self.type_name(),
+            }),
+        }
+    }
+
     pub fn is_truthy(&self) -> bool {
         !matches!(self, Self::Boolean(false))
     }
@@ -151,11 +167,13 @@ impl Value {
             Self::Symbol(_) => "symbol",
             Self::EmptyList => "null",
             Self::Pair(_, _) => "pair",
+            Self::Vector(_) => "vector",
             Self::Builtin(_)
             | Self::CallWithCurrentContinuation
             | Self::Continuation(_)
             | Self::Closure(_) => "procedure",
             Self::Void => "void",
+            Self::Uninitialized => "uninitialized",
         }
     }
 }
@@ -224,6 +242,17 @@ fn render_pair(car: &Value, cdr: &Value, mode: RenderMode) -> String {
     render_pair_contents(car, cdr, mode, &mut rendered);
     rendered.push(')');
     rendered
+}
+
+fn render_vector(vector: &SchemeVector, mode: RenderMode) -> String {
+    let contents = vector
+        .items()
+        .into_iter()
+        .map(|item| item.render_with_mode(mode))
+        .collect::<Vec<_>>()
+        .join(" ");
+
+    format!("#({contents})")
 }
 
 fn render_pair_contents(car: &Value, cdr: &Value, mode: RenderMode, rendered: &mut String) {

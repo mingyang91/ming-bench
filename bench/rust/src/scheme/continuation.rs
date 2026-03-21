@@ -25,7 +25,7 @@ pub(crate) enum Frame {
     },
     If {
         consequent: Expr,
-        alternate: Expr,
+        alternate: Option<Expr>,
         environment: Environment,
     },
     Define {
@@ -77,6 +77,18 @@ pub(crate) enum Frame {
     CondClause {
         body: Vec<Expr>,
         remaining_clauses_rev: Vec<Expr>,
+        environment: Environment,
+    },
+    RecursiveLet {
+        binding_name: String,
+        pending_rev: Vec<(String, Expr)>,
+        body: Vec<Expr>,
+        environment: Environment,
+        location: SourceLocation,
+        form: &'static str,
+    },
+    Case {
+        clauses_rev: Vec<Expr>,
         environment: Environment,
     },
 }

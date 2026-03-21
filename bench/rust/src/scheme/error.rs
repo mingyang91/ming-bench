@@ -49,6 +49,11 @@ pub enum EvalError {
         location: SourceLocation,
         name: String,
     },
+    #[error("{location}: uninitialized variable: {name}")]
+    UninitializedVariable {
+        location: SourceLocation,
+        name: String,
+    },
     #[error("{location}: unknown procedure: {name}")]
     UnknownProcedure {
         location: SourceLocation,
@@ -109,6 +114,17 @@ pub enum EvalError {
     InvalidCharacterCodePoint {
         location: SourceLocation,
         value: i64,
+    },
+    #[error("{location}: invalid vector length: {length}")]
+    InvalidVectorLength {
+        location: SourceLocation,
+        length: i64,
+    },
+    #[error("{location}: vector index {index} out of bounds for length {length}")]
+    VectorIndexOutOfBounds {
+        location: SourceLocation,
+        index: i64,
+        length: usize,
     },
     #[error("{location}: cannot mutate immutable string with {procedure}")]
     ImmutableString {

@@ -5,6 +5,7 @@ use crate::scheme::ast::{Expr, SourceLocation};
 use crate::scheme::builtins::{apply_builtin, install_builtins};
 use crate::scheme::continuation::{CapturedContinuation, Frame};
 use crate::scheme::environment::Environment;
+use crate::scheme::equality::is_eqv;
 use crate::scheme::error::{ArgCount, EvalError};
 use crate::scheme::syntax::MacroEnvironment;
 use crate::scheme::value::{list_from_values, Closure, Value};
@@ -51,6 +52,14 @@ struct NamedLetProgress {
     body: Vec<Expr>,
     environment: Environment,
     location: SourceLocation,
+}
+
+struct RecursiveLetProgress {
+    pending_rev: Vec<(String, Expr)>,
+    body: Vec<Expr>,
+    environment: Environment,
+    location: SourceLocation,
+    form: &'static str,
 }
 
 pub(crate) fn eval_program(expressions: &[Expr]) -> Result<Value, EvalError> {
@@ -167,13 +176,14 @@ fn eval_expression(
             value: Value::Character(value),
             continuation,
         }),
-        Expr::Symbol { name, location } => environment
-            .lookup(&name)
-            .map(|value| State::Return {
+        Expr::Symbol { name, location } => match environment.lookup(&name) {
+            Some(Value::Uninitialized) => Err(EvalError::UninitializedVariable { location, name }),
+            Some(value) => Ok(State::Return {
                 value,
                 continuation,
-            })
-            .ok_or(EvalError::UnboundVariable { location, name }),
+            }),
+            None => Err(EvalError::UnboundVariable { location, name }),
+        },
         Expr::List { items, location } => eval_list_expression(
             items,
             location,
@@ -279,8 +289,15 @@ fn eval_special_form(
             macro_environment,
         )
         .map(Some),
+        "letrec" => {
+            eval_recursive_let(arguments, location, environment, continuation, "letrec").map(Some)
+        }
+        "letrec*" => {
+            eval_recursive_let(arguments, location, environment, continuation, "letrec*").map(Some)
+        }
         "begin" => eval_sequence(arguments.to_vec(), environment, continuation).map(Some),
         "cond" => eval_cond(arguments.to_vec(), environment, continuation).map(Some),
+        "case" => eval_case(arguments, location, environment, continuation).map(Some),
         _ => Ok(None),
     }
 }
@@ -369,19 +386,23 @@ fn eval_if(
     environment: Environment,
     continuation: ContinuationFrames,
 ) -> Result<State, EvalError> {
-    let [condition, consequent, alternate] = arguments else {
-        return Err(EvalError::WrongArgumentCount {
-            location,
-            procedure: "if",
-            expected: ArgCount::Exactly(3),
-            got: arguments.len(),
-        });
+    let (condition, consequent, alternate) = match arguments {
+        [condition, consequent] => (condition, consequent, None),
+        [condition, consequent, alternate] => (condition, consequent, Some(alternate.clone())),
+        _ => {
+            return Err(EvalError::WrongArgumentCount {
+                location,
+                procedure: "if",
+                expected: ArgCount::AtLeast(2),
+                got: arguments.len(),
+            });
+        }
     };
 
     let mut next_continuation = continuation;
     next_continuation.push(Frame::If {
         consequent: consequent.clone(),
-        alternate: alternate.clone(),
+        alternate,
         environment: environment.clone(),
     });
 
@@ -389,6 +410,72 @@ fn eval_if(
         expression: condition.clone(),
         environment,
         continuation: next_continuation,
+    })
+}
+
+fn eval_recursive_let(
+    arguments: &[Expr],
+    location: SourceLocation,
+    environment: Environment,
+    continuation: ContinuationFrames,
+    form: &'static str,
+) -> Result<State, EvalError> {
+    let [bindings_expression, body @ ..] = arguments else {
+        return Err(EvalError::WrongArgumentCount {
+            location,
+            procedure: form,
+            expected: ArgCount::AtLeast(2),
+            got: arguments.len(),
+        });
+    };
+
+    let bindings = parse_bindings(bindings_expression, form, location)?;
+    let scope = environment.child();
+    bindings.iter().for_each(|(name, _)| {
+        scope.define(name.clone(), Value::Uninitialized);
+    });
+
+    let mut pending_rev = bindings;
+    pending_rev.reverse();
+    start_recursive_let(
+        RecursiveLetProgress {
+            pending_rev,
+            body: body.to_vec(),
+            environment: scope,
+            location,
+            form,
+        },
+        continuation,
+    )
+}
+
+fn start_recursive_let(
+    mut progress: RecursiveLetProgress,
+    mut continuation: ContinuationFrames,
+) -> Result<State, EvalError> {
+    let Some((binding_name, expression)) = progress.pending_rev.pop() else {
+        return eval_required_sequence(
+            progress.body,
+            progress.environment,
+            progress.form,
+            progress.location,
+            continuation,
+        );
+    };
+
+    continuation.push(Frame::RecursiveLet {
+        binding_name,
+        pending_rev: progress.pending_rev,
+        body: progress.body,
+        environment: progress.environment.clone(),
+        location: progress.location,
+        form: progress.form,
+    });
+
+    Ok(State::Eval {
+        expression,
+        environment: progress.environment,
+        continuation,
     })
 }
 
@@ -564,7 +651,7 @@ fn eval_standard_let(
     environment: Environment,
     continuation: ContinuationFrames,
 ) -> Result<State, EvalError> {
-    let bindings = parse_let_bindings(bindings_expression, location)?;
+    let bindings = parse_bindings(bindings_expression, "let", location)?;
     let (names, expressions): (Vec<_>, Vec<_>) = bindings.into_iter().unzip();
     start_standard_let(
         names,
@@ -637,7 +724,7 @@ fn eval_named_let(
     continuation: ContinuationFrames,
     macro_environment: &MacroEnvironment,
 ) -> Result<State, EvalError> {
-    let bindings = parse_let_bindings(bindings_expression, location)?;
+    let bindings = parse_bindings(bindings_expression, "let", location)?;
     let (parameters, expressions): (Vec<_>, Vec<_>) = bindings.into_iter().unzip();
     start_named_let(
         NamedLetProgress {
@@ -776,6 +863,44 @@ fn eval_reversed_cond_clauses(
         expression: test,
         environment,
         continuation,
+    })
+}
+
+fn eval_case(
+    arguments: &[Expr],
+    location: SourceLocation,
+    environment: Environment,
+    continuation: ContinuationFrames,
+) -> Result<State, EvalError> {
+    let Some((key, clauses)) = arguments.split_first() else {
+        return Err(EvalError::WrongArgumentCount {
+            location,
+            procedure: "case",
+            expected: ArgCount::AtLeast(2),
+            got: 0,
+        });
+    };
+    if clauses.is_empty() {
+        return Err(EvalError::WrongArgumentCount {
+            location,
+            procedure: "case",
+            expected: ArgCount::AtLeast(2),
+            got: 1,
+        });
+    }
+
+    let mut clauses_rev = clauses.to_vec();
+    clauses_rev.reverse();
+    let mut next_continuation = continuation;
+    next_continuation.push(Frame::Case {
+        clauses_rev,
+        environment: environment.clone(),
+    });
+
+    Ok(State::Eval {
+        expression: key.clone(),
+        environment,
+        continuation: next_continuation,
     })
 }
 
@@ -933,6 +1058,29 @@ fn continue_with_frame(
             value,
             continuation,
         ),
+        Frame::RecursiveLet {
+            binding_name,
+            pending_rev,
+            body,
+            environment,
+            location,
+            form,
+        } => continue_recursive_let(
+            binding_name,
+            RecursiveLetProgress {
+                pending_rev,
+                body,
+                environment,
+                location,
+                form,
+            },
+            value,
+            continuation,
+        ),
+        Frame::Case {
+            clauses_rev,
+            environment,
+        } => continue_case(clauses_rev, environment, value, continuation),
     }
 }
 
@@ -946,18 +1094,28 @@ fn continue_sequence(
 
 fn continue_if(
     consequent: Expr,
-    alternate: Expr,
+    alternate: Option<Expr>,
     environment: Environment,
     value: Value,
     continuation: ContinuationFrames,
 ) -> Result<State, EvalError> {
-    let expression = if value.is_truthy() {
-        consequent
-    } else {
-        alternate
+    if value.is_truthy() {
+        return Ok(State::Eval {
+            expression: consequent,
+            environment,
+            continuation,
+        });
+    }
+
+    let Some(alternate) = alternate else {
+        return Ok(State::Return {
+            value: Value::Void,
+            continuation,
+        });
     };
+
     Ok(State::Eval {
-        expression,
+        expression: alternate,
         environment,
         continuation,
     })
@@ -1188,6 +1346,36 @@ fn continue_cond_clause(
     eval_sequence(body, environment, continuation)
 }
 
+fn continue_recursive_let(
+    binding_name: String,
+    progress: RecursiveLetProgress,
+    value: Value,
+    continuation: ContinuationFrames,
+) -> Result<State, EvalError> {
+    let did_set = progress.environment.set(&binding_name, value);
+    debug_assert!(
+        did_set,
+        "recursive let binding should exist before evaluation"
+    );
+    start_recursive_let(progress, continuation)
+}
+
+fn continue_case(
+    clauses_rev: Vec<Expr>,
+    environment: Environment,
+    key: Value,
+    continuation: ContinuationFrames,
+) -> Result<State, EvalError> {
+    let Some((body, clause_location)) = find_matching_case_clause(&key, clauses_rev)? else {
+        return Ok(State::Return {
+            value: Value::Void,
+            continuation,
+        });
+    };
+
+    eval_required_sequence(body, environment, "case", clause_location, continuation)
+}
+
 fn apply_value(
     callable: Value,
     arguments: Vec<Value>,
@@ -1303,7 +1491,10 @@ fn normalize_resumed_continuation(
         return continuation;
     }
 
-    if continuation.last().is_some_and(replays_single_pending_call_cc) {
+    if continuation
+        .last()
+        .is_some_and(replays_single_pending_call_cc)
+    {
         continuation.pop();
     }
 
@@ -1333,35 +1524,97 @@ fn is_call_with_current_continuation_expression(expression: &Expr) -> bool {
     )
 }
 
-fn parse_let_bindings(
+fn parse_bindings(
     bindings_expression: &Expr,
+    form: &'static str,
     location: SourceLocation,
 ) -> Result<Vec<(String, Expr)>, EvalError> {
     let Expr::List { items, .. } = bindings_expression else {
-        return Err(EvalError::MalformedSpecialForm {
-            location,
-            form: "let",
-        });
+        return Err(EvalError::MalformedSpecialForm { location, form });
     };
 
-    items.iter().map(parse_let_binding).collect()
+    items
+        .iter()
+        .map(|binding| parse_binding(binding, form))
+        .collect()
 }
 
-fn parse_let_binding(binding: &Expr) -> Result<(String, Expr), EvalError> {
+fn parse_binding(binding: &Expr, form: &'static str) -> Result<(String, Expr), EvalError> {
     let Expr::List { items, .. } = binding else {
         return Err(EvalError::MalformedSpecialForm {
             location: binding.location(),
-            form: "let",
+            form,
         });
     };
     let [Expr::Symbol { name, .. }, expression] = items.as_slice() else {
         return Err(EvalError::MalformedSpecialForm {
             location: binding.location(),
-            form: "let",
+            form,
         });
     };
 
     Ok((name.clone(), expression.clone()))
+}
+
+fn find_matching_case_clause(
+    key: &Value,
+    mut clauses_rev: Vec<Expr>,
+) -> Result<Option<(Vec<Expr>, SourceLocation)>, EvalError> {
+    while let Some(clause) = clauses_rev.pop() {
+        let (datum_expression, body, clause_location) = parse_case_clause(clause)?;
+
+        if matches!(&datum_expression, Expr::Symbol { name, .. } if name == "else") {
+            validate_case_else_position(&datum_expression, clauses_rev.is_empty())?;
+            return Ok(Some((body, clause_location)));
+        }
+
+        if case_clause_matches(key, &datum_expression, clause_location)? {
+            return Ok(Some((body, clause_location)));
+        }
+    }
+
+    Ok(None)
+}
+
+fn parse_case_clause(clause: Expr) -> Result<(Expr, Vec<Expr>, SourceLocation), EvalError> {
+    let clause_location = clause.location();
+    let Expr::List { items, .. } = clause else {
+        return Err(malformed_case(clause_location));
+    };
+    let Some((datum_expression, body)) = split_first(items) else {
+        return Err(malformed_case(clause_location));
+    };
+
+    Ok((datum_expression, body, clause_location))
+}
+
+fn validate_case_else_position(datum_expression: &Expr, is_last: bool) -> Result<(), EvalError> {
+    if is_last {
+        return Ok(());
+    }
+
+    Err(malformed_case(datum_expression.location()))
+}
+
+fn case_clause_matches(
+    key: &Value,
+    datum_expression: &Expr,
+    clause_location: SourceLocation,
+) -> Result<bool, EvalError> {
+    let Expr::List { items: datums, .. } = datum_expression else {
+        return Err(malformed_case(clause_location));
+    };
+
+    Ok(datums
+        .iter()
+        .any(|datum| is_eqv(key, &quote_expression(datum))))
+}
+
+fn malformed_case(location: SourceLocation) -> EvalError {
+    EvalError::MalformedSpecialForm {
+        location,
+        form: "case",
+    }
 }
 
 fn define_function(

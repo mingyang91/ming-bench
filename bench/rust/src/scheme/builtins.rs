@@ -1,11 +1,13 @@
 use crate::scheme::ast::SourceLocation;
 use crate::scheme::environment::Environment;
+use crate::scheme::equality::{is_eq, is_equal, is_eqv};
 use crate::scheme::error::{ArgCount, EvalError};
 use crate::scheme::evaluator::apply_callable;
 use crate::scheme::string_value::StringMutationError;
 use crate::scheme::value::{list_from_values, Value};
+use crate::scheme::vector_value::VectorMutationError;
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BuiltinProcedure {
     Add,
     Sub,
@@ -48,6 +50,17 @@ pub enum BuiltinProcedure {
     IntegerToChar,
     Map,
     Apply,
+    Eq,
+    Eqv,
+    EqualPred,
+    Vector,
+    MakeVector,
+    VectorRef,
+    VectorSet,
+    VectorLength,
+    VectorPred,
+    VectorToList,
+    ListToVector,
 }
 
 impl BuiltinProcedure {
@@ -94,6 +107,17 @@ impl BuiltinProcedure {
             Self::IntegerToChar => "integer->char",
             Self::Map => "map",
             Self::Apply => "apply",
+            Self::Eq => "eq?",
+            Self::Eqv => "eqv?",
+            Self::EqualPred => "equal?",
+            Self::Vector => "vector",
+            Self::MakeVector => "make-vector",
+            Self::VectorRef => "vector-ref",
+            Self::VectorSet => "vector-set!",
+            Self::VectorLength => "vector-length",
+            Self::VectorPred => "vector?",
+            Self::VectorToList => "vector->list",
+            Self::ListToVector => "list->vector",
         }
     }
 }
@@ -141,6 +165,17 @@ pub fn install_builtins(environment: &Environment) {
         BuiltinProcedure::IntegerToChar,
         BuiltinProcedure::Map,
         BuiltinProcedure::Apply,
+        BuiltinProcedure::Eq,
+        BuiltinProcedure::Eqv,
+        BuiltinProcedure::EqualPred,
+        BuiltinProcedure::Vector,
+        BuiltinProcedure::MakeVector,
+        BuiltinProcedure::VectorRef,
+        BuiltinProcedure::VectorSet,
+        BuiltinProcedure::VectorLength,
+        BuiltinProcedure::VectorPred,
+        BuiltinProcedure::VectorToList,
+        BuiltinProcedure::ListToVector,
     ];
 
     BUILTIN_PROCEDURES.iter().copied().for_each(|procedure| {
@@ -214,6 +249,21 @@ pub fn apply_builtin(
         BuiltinProcedure::IntegerToChar => eval_integer_to_char(arguments, location),
         BuiltinProcedure::Map => eval_map(arguments, location, output),
         BuiltinProcedure::Apply => eval_apply(arguments, location, output),
+        BuiltinProcedure::Eq => eval_binary_value_predicate("eq?", arguments, location, is_eq),
+        BuiltinProcedure::Eqv => eval_binary_value_predicate("eqv?", arguments, location, is_eqv),
+        BuiltinProcedure::EqualPred => {
+            eval_binary_value_predicate("equal?", arguments, location, is_equal)
+        }
+        BuiltinProcedure::Vector => Ok(eval_vector(arguments)),
+        BuiltinProcedure::MakeVector => eval_make_vector(arguments, location),
+        BuiltinProcedure::VectorRef => eval_vector_ref(arguments, location),
+        BuiltinProcedure::VectorSet => eval_vector_set(arguments, location),
+        BuiltinProcedure::VectorLength => eval_vector_length(arguments, location),
+        BuiltinProcedure::VectorPred => {
+            eval_type_predicate("vector?", arguments, location, is_vector)
+        }
+        BuiltinProcedure::VectorToList => eval_vector_to_list(arguments, location),
+        BuiltinProcedure::ListToVector => eval_list_to_vector(arguments, location),
     }
 }
 
@@ -665,6 +715,117 @@ fn eval_apply(
     apply_callable(procedure.clone(), &applied_arguments, location, output)
 }
 
+fn eval_binary_value_predicate(
+    procedure: &'static str,
+    arguments: &[Value],
+    location: SourceLocation,
+    predicate: impl Fn(&Value, &Value) -> bool,
+) -> Result<Value, EvalError> {
+    let [left, right] = arguments else {
+        return Err(EvalError::WrongArgumentCount {
+            location,
+            procedure,
+            expected: ArgCount::Exactly(2),
+            got: arguments.len(),
+        });
+    };
+
+    Ok(Value::Boolean(predicate(left, right)))
+}
+
+fn eval_vector(arguments: &[Value]) -> Value {
+    Value::Vector(crate::scheme::vector_value::SchemeVector::new(
+        arguments.to_vec(),
+    ))
+}
+
+fn eval_make_vector(arguments: &[Value], location: SourceLocation) -> Result<Value, EvalError> {
+    match arguments {
+        [length] => {
+            let length = vector_length_value(length, location)?;
+            Ok(Value::Vector(
+                crate::scheme::vector_value::SchemeVector::make(length, Value::Void),
+            ))
+        }
+        [length, fill] => {
+            let length = vector_length_value(length, location)?;
+            Ok(Value::Vector(
+                crate::scheme::vector_value::SchemeVector::make(length, fill.clone()),
+            ))
+        }
+        _ => Err(EvalError::WrongArgumentCount {
+            location,
+            procedure: "make-vector",
+            expected: ArgCount::AtLeast(1),
+            got: arguments.len(),
+        }),
+    }
+}
+
+fn eval_vector_ref(arguments: &[Value], location: SourceLocation) -> Result<Value, EvalError> {
+    let [vector_value, index_value] = arguments else {
+        return Err(EvalError::WrongArgumentCount {
+            location,
+            procedure: "vector-ref",
+            expected: ArgCount::Exactly(2),
+            got: arguments.len(),
+        });
+    };
+
+    let vector = vector_value.expect_vector(location)?;
+    let index = vector_index(index_value, vector.len(), location)?;
+    vector.get(index).ok_or(EvalError::VectorIndexOutOfBounds {
+        location,
+        index: index_value.expect_number(location)?,
+        length: vector.len(),
+    })
+}
+
+fn eval_vector_set(arguments: &[Value], location: SourceLocation) -> Result<Value, EvalError> {
+    let [vector_value, index_value, new_value] = arguments else {
+        return Err(EvalError::WrongArgumentCount {
+            location,
+            procedure: "vector-set!",
+            expected: ArgCount::Exactly(3),
+            got: arguments.len(),
+        });
+    };
+
+    let vector = vector_value.expect_vector(location)?;
+    let index = vector_index(index_value, vector.len(), location)?;
+
+    match vector.set(index, new_value.clone()) {
+        Ok(()) => Ok(Value::Void),
+        Err(VectorMutationError::IndexOutOfBounds { length }) => {
+            Err(EvalError::VectorIndexOutOfBounds {
+                location,
+                index: index_value.expect_number(location)?,
+                length,
+            })
+        }
+    }
+}
+
+fn eval_vector_length(arguments: &[Value], location: SourceLocation) -> Result<Value, EvalError> {
+    let vector = unary_argument("vector-length", arguments, location)?.expect_vector(location)?;
+    Ok(Value::Integer(
+        i64::try_from(vector.len()).expect("vector length should fit in i64"),
+    ))
+}
+
+fn eval_vector_to_list(arguments: &[Value], location: SourceLocation) -> Result<Value, EvalError> {
+    let vector = unary_argument("vector->list", arguments, location)?.expect_vector(location)?;
+    Ok(list_from_values(&vector.items()))
+}
+
+fn eval_list_to_vector(arguments: &[Value], location: SourceLocation) -> Result<Value, EvalError> {
+    let list = unary_argument("list->vector", arguments, location)?;
+    let elements = proper_list_items(list, location)?;
+    Ok(Value::Vector(
+        crate::scheme::vector_value::SchemeVector::new(elements),
+    ))
+}
+
 fn eval_type_predicate(
     procedure: &'static str,
     arguments: &[Value],
@@ -697,6 +858,35 @@ fn number_arguments(arguments: &[Value], location: SourceLocation) -> Result<Vec
         .iter()
         .map(|argument| argument.expect_number(location))
         .collect()
+}
+
+fn vector_length_value(argument: &Value, location: SourceLocation) -> Result<usize, EvalError> {
+    let length = argument.expect_number(location)?;
+    usize::try_from(length).map_err(|_| EvalError::InvalidVectorLength { location, length })
+}
+
+fn vector_index(
+    argument: &Value,
+    length: usize,
+    location: SourceLocation,
+) -> Result<usize, EvalError> {
+    let index = argument.expect_number(location)?;
+    let Some(index) = usize::try_from(index).ok() else {
+        return Err(EvalError::VectorIndexOutOfBounds {
+            location,
+            index,
+            length,
+        });
+    };
+    if index >= length {
+        return Err(EvalError::VectorIndexOutOfBounds {
+            location,
+            index: argument.expect_number(location)?,
+            length,
+        });
+    }
+
+    Ok(index)
 }
 
 fn proper_list_items(value: &Value, location: SourceLocation) -> Result<Vec<Value>, EvalError> {
@@ -773,4 +963,8 @@ fn is_symbol(value: &Value) -> bool {
 
 fn is_char(value: &Value) -> bool {
     matches!(value, Value::Character(_))
+}
+
+fn is_vector(value: &Value) -> bool {
+    matches!(value, Value::Vector(_))
 }

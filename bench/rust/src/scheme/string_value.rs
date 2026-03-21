@@ -43,6 +43,10 @@ impl SchemeString {
         self.0.borrow().characters.iter().collect()
     }
 
+    pub fn is_same_object(&self, other: &Self) -> bool {
+        Rc::ptr_eq(&self.0, &other.0)
+    }
+
     pub fn len(&self) -> usize {
         self.0.borrow().characters.len()
     }

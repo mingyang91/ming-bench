@@ -10,7 +10,10 @@ Canonical registry of extracted helpers (>= 5 ops).
 
 ## Rust Helpers (src/scheme/)
 
-(none yet)
+### is_equal (src/scheme/equality.rs:27) — Perform recursive structural equality across lists, vectors, strings, and scalar values
+### start_recursive_let (src/scheme/evaluator/runtime.rs:452) — Drive sequential initialization and body entry for `letrec` and `letrec*`
+### find_matching_case_clause (src/scheme/evaluator/runtime.rs:1559) — Select the first `case` clause whose datums are `eqv?` to the evaluated key
+### vector_index (src/scheme/builtins.rs:868) — Validate and convert Scheme vector indices with structured bounds errors
 
 ## Python Helpers (scripts/)
 
