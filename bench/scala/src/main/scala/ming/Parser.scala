@@ -24,10 +24,15 @@ object Parser:
   private def parseExpr(cursor: Cursor): (Expr, Cursor) =
     if cursor.atEnd then throw EvalError.syntax("unexpected end of input")
     cursor.input.charAt(cursor.offset) match
-      case '(' => parseList(cursor.copy(offset = cursor.offset + 1))
-      case ')' => throw EvalError.syntax("unexpected ')'")
-      case '"' => parseString(cursor.copy(offset = cursor.offset + 1))
-      case _   => parseAtom(cursor)
+      case '('  => parseList(cursor.copy(offset = cursor.offset + 1))
+      case ')'  => throw EvalError.syntax("unexpected ')'")
+      case '\'' => parseQuoted(cursor.copy(offset = cursor.offset + 1))
+      case '"'  => parseString(cursor.copy(offset = cursor.offset + 1))
+      case _    => parseAtom(cursor)
+
+  private def parseQuoted(cursor: Cursor): (Expr, Cursor) =
+    val (expression, next) = parseExpr(skipWhitespace(cursor))
+    (Expr.ListExpr(List(Expr.Symbol("quote"), expression)), next)
 
   private def parseList(cursor: Cursor): (Expr, Cursor) =
     val (items, next) = parseListItems(skipWhitespace(cursor), Nil)
@@ -94,7 +99,7 @@ object Parser:
     else findTokenEnd(input, offset + 1)
 
   private def isDelimiter(char: Char): Boolean =
-    char.isWhitespace || char == '(' || char == ')'
+    char.isWhitespace || char == '(' || char == ')' || char == '\''
 
   private def isIntegerToken(token: String): Boolean =
     token match

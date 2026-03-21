@@ -230,6 +230,10 @@ if [ "$1" = "--bsp" ] || [ "$1" = "-i" ] || [ "$1" = "--interactive" ] || [ "$1"
   shift
 fi
 
+if [ -z "${MILL_FIRST_ARG}" ] && [ -n "${MILL_WRAPPER_NO_SERVER}" ] ; then
+  MILL_FIRST_ARG="--no-server"
+fi
+
 unset MILL_DOWNLOAD_PATH
 unset MILL_OLD_DOWNLOAD_PATH
 unset OLD_MILL
