@@ -157,6 +157,12 @@ fn eval_list_tail(
             "define-syntax" => {
                 return eval_define_syntax(&items[1..], env).map(TailAction::Return)
             }
+            "guard" => return eval_guard(&items[1..], env, out),
+            "raise" => return eval_raise(&items[1..], env, out).map(TailAction::Return),
+            "with-exception-handler" => {
+                return eval_with_exception_handler(&items[1..], env, out)
+                    .map(TailAction::Return)
+            }
             s if is_builtin(s) => {
                 return eval_builtin(s, &items[1..], env, out).map(TailAction::Return)
             }
@@ -336,6 +342,124 @@ fn eval_dynamic_wind_core(
             apply_values(out_thunk, vec![], env, out)?;
             Err(e)
         }
+    }
+}
+
+/// Evaluate `raise`: (raise value)
+fn eval_raise(
+    args: &[Value],
+    env: &Rc<RefCell<Env>>,
+    out: &Output,
+) -> Result<Value, EvalError> {
+    let [val_expr] = args else {
+        return Err(EvalError::WrongArgCount {
+            expected: 1,
+            got: args.len(),
+        });
+    };
+    let value = eval(val_expr, env, out)?;
+    Err(EvalError::RaisedException {
+        value: Box::new(value),
+    })
+}
+
+/// Evaluate `guard`: (guard (var clause ...) body ...)
+/// Each clause is (test expr ...) or (else expr ...).
+fn eval_guard(
+    args: &[Value],
+    env: &Rc<RefCell<Env>>,
+    out: &Output,
+) -> Result<TailAction, EvalError> {
+    let Some((clauses_form, body)) = args.split_first() else {
+        return Err(EvalError::Parse {
+            message: "guard: expected (var clause ...) body".into(),
+        });
+    };
+    let Value::List(clause_parts) = clauses_form else {
+        return Err(EvalError::Parse {
+            message: "guard: first arg must be (var clause ...)".into(),
+        });
+    };
+    let Some((var_name_val, clauses)) = clause_parts.split_first() else {
+        return Err(EvalError::Parse {
+            message: "guard: empty clause list".into(),
+        });
+    };
+    let Value::Symbol(var_name) = var_name_val else {
+        return Err(EvalError::Parse {
+            message: "guard: variable must be a symbol".into(),
+        });
+    };
+
+    // Evaluate body, catching RaisedException
+    let body_result = eval_body(body, env, out);
+    match body_result {
+        Ok(val) => Ok(TailAction::Return(val)),
+        Err(EvalError::RaisedException { value }) => {
+            // Bind the exception value to var_name and test clauses
+            let guard_env = Env::extend(env);
+            guard_env
+                .borrow_mut()
+                .define(var_name.clone(), *value.clone());
+            eval_guard_clauses(clauses, *value, &guard_env, out)
+        }
+        Err(e) => Err(e),
+    }
+}
+
+/// Test guard clauses against a raised exception value.
+fn eval_guard_clauses(
+    clauses: &[Value],
+    raised_value: Value,
+    env: &Rc<RefCell<Env>>,
+    out: &Output,
+) -> Result<TailAction, EvalError> {
+    for clause in clauses {
+        let Value::List(parts) = clause else {
+            return Err(EvalError::Parse {
+                message: "guard: expected clause".into(),
+            });
+        };
+        if parts.is_empty() {
+            return Err(EvalError::Parse {
+                message: "guard: empty clause".into(),
+            });
+        }
+        if matches!(&parts[0], Value::Symbol(s) if s == "else") {
+            return eval_body_tail(&parts[1..], env, out);
+        }
+        let test_val = eval(&parts[0], env, out)?;
+        if test_val != Value::Boolean(false) {
+            return eval_body_tail(&parts[1..], env, out);
+        }
+    }
+    // No clause matched — re-raise
+    Err(EvalError::RaisedException {
+        value: Box::new(raised_value),
+    })
+}
+
+/// Evaluate `with-exception-handler`: (with-exception-handler handler thunk)
+fn eval_with_exception_handler(
+    args: &[Value],
+    env: &Rc<RefCell<Env>>,
+    out: &Output,
+) -> Result<Value, EvalError> {
+    let [handler_expr, thunk_expr] = args else {
+        return Err(EvalError::WrongArgCount {
+            expected: 2,
+            got: args.len(),
+        });
+    };
+    let handler = eval(handler_expr, env, out)?;
+    let thunk = eval(thunk_expr, env, out)?;
+    let result = apply_values(&thunk, vec![], env, out);
+    match result {
+        Ok(val) => Ok(val),
+        Err(EvalError::RaisedException { value }) => {
+            apply_values(&handler, vec![*value], env, out)
+        }
+        Err(e) => Err(e),
     }
 }
 

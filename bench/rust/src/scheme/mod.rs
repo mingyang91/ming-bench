@@ -25,7 +25,7 @@ fn eval_one_expr(
 ) -> Result<value::Value, EvalError> {
     out.borrow_mut().current_expr_idx = idx;
     eval::eval(expr, env, out).map_err(|e| match e {
-        EvalError::ContinuationReturn { .. } => e,
+        EvalError::ContinuationReturn { .. } | EvalError::RaisedException { .. } => e,
         other => EvalError::Positioned {
             line,
             col,

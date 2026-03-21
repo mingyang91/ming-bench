@@ -34,4 +34,9 @@ pub enum EvalError {
         id: u64,
         value: Box<crate::scheme::value::Value>,
     },
+
+    #[error("raised exception")]
+    RaisedException {
+        value: Box<crate::scheme::value::Value>,
+    },
 }
