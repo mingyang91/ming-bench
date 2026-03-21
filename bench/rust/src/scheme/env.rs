@@ -15,6 +15,7 @@ pub struct Env {
     gensym_counter: Rc<Cell<u64>>,
     active_callcc: Rc<RefCell<HashSet<u64>>>,
     record_type_counter: Rc<Cell<u64>>,
+    syntax_hygiene: Rc<RefCell<Vec<(String, Value)>>>,
 }
 
 impl Default for Env {
@@ -35,6 +36,7 @@ impl Env {
             gensym_counter: Rc::new(Cell::new(0)),
             active_callcc: Rc::new(RefCell::new(HashSet::new())),
             record_type_counter: Rc::new(Cell::new(0)),
+            syntax_hygiene: Rc::new(RefCell::new(Vec::new())),
         }
     }
 
@@ -49,6 +51,7 @@ impl Env {
             gensym_counter: Rc::clone(&parent.gensym_counter),
             active_callcc: Rc::clone(&parent.active_callcc),
             record_type_counter: Rc::clone(&parent.record_type_counter),
+            syntax_hygiene: Rc::clone(&parent.syntax_hygiene),
         }
     }
 
@@ -133,5 +136,17 @@ impl Env {
         let id = self.record_type_counter.get();
         self.record_type_counter.set(id + 1);
         id
+    }
+
+    pub fn add_syntax_hygiene(&self, name: String, val: Value) {
+        self.syntax_hygiene.borrow_mut().push((name, val));
+    }
+
+    pub fn take_syntax_hygiene(&self) -> Vec<(String, Value)> {
+        std::mem::take(&mut *self.syntax_hygiene.borrow_mut())
+    }
+
+    pub fn clear_syntax_hygiene(&self) {
+        self.syntax_hygiene.borrow_mut().clear();
     }
 }

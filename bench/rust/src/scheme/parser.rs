@@ -103,6 +103,19 @@ fn read_atom(lexer: &mut Lexer) -> String {
     atom
 }
 
+fn read_hash(lexer: &mut Lexer) -> String {
+    lexer.advance(); // consume #
+    if lexer.peek() == Some(&'\'') {
+        lexer.advance(); // consume '
+        return "#'".to_string();
+    }
+    let mut atom = String::from('#');
+    while lexer.peek().is_some_and(|&c| !is_delimiter(c)) {
+        atom.push(lexer.advance().expect("peeked Some"));
+    }
+    atom
+}
+
 fn tokenize_one(lexer: &mut Lexer, tokens: &mut Vec<(String, Span)>) {
     let &ch = lexer.peek().expect("caller checked is_some");
     match ch {
@@ -125,6 +138,10 @@ fn tokenize_one(lexer: &mut Lexer, tokens: &mut Vec<(String, Span)>) {
             lexer.advance();
         }
         ';' => skip_comment(lexer),
+        '#' => {
+            let span = lexer.span();
+            tokens.push((read_hash(lexer), span));
+        }
         _ => {
             let span = lexer.span();
             tokens.push((read_atom(lexer), span));
@@ -159,6 +176,13 @@ fn parse_tokens(tokens: &[(String, Span)], pos: &mut usize) -> Result<Expr, Eval
             let quoted = parse_tokens(tokens, pos)?;
             Ok(Expr::List(
                 vec![Expr::Symbol("quote".into(), span), quoted],
+                span,
+            ))
+        }
+        "#'" => {
+            let quoted = parse_tokens(tokens, pos)?;
+            Ok(Expr::List(
+                vec![Expr::Symbol("syntax".into(), span), quoted],
                 span,
             ))
         }

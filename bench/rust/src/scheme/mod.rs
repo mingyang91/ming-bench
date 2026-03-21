@@ -3,6 +3,7 @@ pub mod env;
 mod eval;
 mod macros;
 mod parser;
+mod syntax_case;
 mod value;
 
 pub use error::EvalError;

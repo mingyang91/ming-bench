@@ -31,6 +31,9 @@ pub enum Value {
         rules: Vec<(Vec<Expr>, Expr)>,
         def_env: Env,
     },
+    TransformerMacro {
+        transformer: Box<Value>,
+    },
     Record {
         type_id: u64,
         type_name: String,
@@ -86,6 +89,7 @@ impl PartialEq for Value {
                 Value::Continuation { id: b, .. },
             ) => a == b,
             (Value::Macro { .. }, Value::Macro { .. }) => false,
+            (Value::TransformerMacro { .. }, Value::TransformerMacro { .. }) => false,
             (
                 Value::Record { type_id: a, fields: af, .. },
                 Value::Record { type_id: b, fields: bf, .. },
@@ -114,7 +118,8 @@ impl fmt::Display for Value {
             Value::Lambda { .. }
             | Value::Builtin(_)
             | Value::Continuation { .. }
-            | Value::Macro { .. } => write!(f, "#<procedure>"),
+            | Value::Macro { .. }
+            | Value::TransformerMacro { .. } => write!(f, "#<procedure>"),
             Value::Record { type_name, fields, .. } => fmt_record(f, type_name, fields),
             Value::Values(vals) => fmt_values(f, vals),
             Value::Void => write!(f, ""),
@@ -257,7 +262,9 @@ impl Value {
             Value::Pair(p) => display_pair_chain(p, buf),
             Value::List(items) => Self::display_list(items, buf),
             Value::Vector(v) => Self::display_vector(&v.borrow(), buf),
-            Value::Continuation { .. } | Value::Macro { .. } => buf.push_str("#<procedure>"),
+            Value::Continuation { .. } | Value::Macro { .. } | Value::TransformerMacro { .. } => {
+                buf.push_str("#<procedure>");
+            }
             Value::Record { type_name, fields, .. } => {
                 Self::display_record(type_name, fields, buf);
             }

@@ -2,6 +2,7 @@ use crate::scheme::env::Env;
 use crate::scheme::error::{EvalError, Span};
 use crate::scheme::macros;
 use crate::scheme::parser::Expr;
+use crate::scheme::syntax_case;
 use crate::scheme::value::{Value, gcd, make_rational};
 
 /// Trampoline result: either a final value or a tail-call continuation.
@@ -235,6 +236,11 @@ fn eval_list(elems: &[Expr], span: Span, env: &Env) -> Result<Bounce, EvalError>
             let eval_env = make_hygiene_env(env, expansion.hygiene_bindings);
             return Ok(Bounce::Tco(expansion.expr, eval_env));
         }
+        if let Some(Value::TransformerMacro { ref transformer }) = env.get(op) {
+            return invoke_transformer_macro(
+                transformer, op, operator, args, span, env,
+            );
+        }
         if is_builtin(op) {
             return eval_builtin(op, args, env)
                 .map(Bounce::Done)
@@ -287,6 +293,15 @@ fn eval_special_form(
             .map(Bounce::Done)
             .map(Some),
         "define-record-type" => eval_define_record_type(args, span, env)
+            .map(Bounce::Done)
+            .map(Some),
+        "syntax-case" => syntax_case::eval_syntax_case(args, span, env, eval)
+            .map(Bounce::Done)
+            .map(Some),
+        "syntax" => syntax_case::eval_syntax(args, span, env)
+            .map(Bounce::Done)
+            .map(Some),
+        "with-syntax" => syntax_case::eval_with_syntax(args, span, env, eval)
             .map(Bounce::Done)
             .map(Some),
         _ => Ok(None),
@@ -438,6 +453,39 @@ fn eval_body_tco(body: &[Expr], env: Env) -> Result<Bounce, EvalError> {
         eval(expr, &env)?;
     }
     Ok(Bounce::Tco(last.clone(), env))
+}
+
+/// Invoke a syntax-case transformer macro.
+fn invoke_transformer_macro(
+    transformer: &Value,
+    _op: &str,
+    operator: &Expr,
+    args: &[Expr],
+    span: Span,
+    env: &Env,
+) -> Result<Bounce, EvalError> {
+    // Build full form as a Value
+    let mut form_parts = vec![syntax_case::expr_to_value(operator)];
+    form_parts.extend(args.iter().map(syntax_case::expr_to_value));
+    let form_val = Value::make_list(form_parts);
+
+    // Clear previous hygiene bindings
+    env.clear_syntax_hygiene();
+
+    // Call transformer: fully evaluate to get result
+    let result = match apply_lambda_values(transformer.clone(), &[form_val], span)? {
+        Bounce::Done(val) => val,
+        Bounce::Tco(expr, tco_env) => eval(&expr, &tco_env)?,
+    };
+
+    // Convert result Value back to Expr
+    let expansion = syntax_case::value_to_expr(&result, span)?;
+
+    // Apply hygiene bindings
+    let hygiene = env.take_syntax_hygiene();
+    let eval_env = make_hygiene_env(env, hygiene);
+
+    Ok(Bounce::Tco(expansion, eval_env))
 }
 
 /// Apply a callable value to evaluated arguments.
@@ -1179,6 +1227,18 @@ fn apply_builtin_values(name: &str, args: &[Value]) -> Result<Value, EvalError> 
             };
             call_proc_values(consumer, &consumer_args)
         }
+        "syntax->datum" => {
+            let [arg] = args else {
+                return Err(EvalError::WrongArgCount { expected: 1, got: args.len() });
+            };
+            Ok(arg.clone())
+        }
+        "datum->syntax" => {
+            let [_context, datum] = args else {
+                return Err(EvalError::WrongArgCount { expected: 2, got: args.len() });
+            };
+            Ok(datum.clone())
+        }
         _ if name.starts_with("__record_ctor_") => apply_record_ctor(name, args),
         _ if name.starts_with("__record_pred_") => apply_record_pred(name, args),
         _ if name.starts_with("__record_acc_") => apply_record_acc(name, args),
@@ -1461,6 +1521,7 @@ fn is_builtin(name: &str) -> bool {
             | "exact?" | "inexact?" | "exact->inexact" | "inexact->exact"
             | "numerator" | "denominator"
             | "values" | "call-with-values"
+            | "syntax->datum" | "datum->syntax"
     )
 }
 
@@ -1562,8 +1623,24 @@ fn eval_builtin(op: &str, args: &[Expr], env: &Env) -> Result<Value, EvalError> 
         "denominator" => eval_denominator(args, env),
         "values" => eval_values_builtin(args, env),
         "call-with-values" => eval_call_with_values_builtin(args, env),
+        "syntax->datum" => eval_syntax_to_datum(args, env),
+        "datum->syntax" => eval_datum_to_syntax(args, env),
         _ => Err(EvalError::UnboundVariable { name: op.into() }),
     }
+}
+
+fn eval_syntax_to_datum(args: &[Expr], env: &Env) -> Result<Value, EvalError> {
+    let [ref arg] = args else {
+        return Err(EvalError::WrongArgCount { expected: 1, got: args.len() });
+    };
+    eval(arg, env)
+}
+
+fn eval_datum_to_syntax(args: &[Expr], env: &Env) -> Result<Value, EvalError> {
+    let [_context, ref datum] = args else {
+        return Err(EvalError::WrongArgCount { expected: 2, got: args.len() });
+    };
+    eval(datum, env)
 }
 
 fn eval_quote(args: &[Expr]) -> Result<Value, EvalError> {
@@ -1651,17 +1728,36 @@ fn eval_lambda(args: &[Expr], env: &Env) -> Result<Value, EvalError> {
 }
 
 fn eval_define_syntax(args: &[Expr], span: Span, env: &Env) -> Result<Value, EvalError> {
-    let [Expr::Symbol(ref name, _), Expr::List(ref sr_form, _)] = args else {
+    let [Expr::Symbol(ref name, _), ref form] = args else {
         return Err(EvalError::Parse("invalid define-syntax form".into()).at(span));
     };
-    let [Expr::Symbol(ref sr, _), Expr::List(ref lit_exprs, _), ref rule_exprs @ ..] =
-        sr_form.as_slice()
+    let Expr::List(ref form_parts, _) = form else {
+        return Err(EvalError::Parse("invalid define-syntax form".into()).at(span));
+    };
+    let Some(Expr::Symbol(ref keyword, _)) = form_parts.first() else {
+        return Err(EvalError::Parse("invalid define-syntax form".into()).at(span));
+    };
+    match keyword.as_str() {
+        "syntax-rules" => eval_define_syntax_rules(name, form_parts, span, env),
+        "lambda" => eval_define_syntax_transformer(name, form, span, env),
+        _ => Err(EvalError::Parse(
+            "expected syntax-rules or lambda in define-syntax".into(),
+        )
+        .at(span)),
+    }
+}
+
+fn eval_define_syntax_rules(
+    name: &str,
+    sr_form: &[Expr],
+    span: Span,
+    env: &Env,
+) -> Result<Value, EvalError> {
+    let [Expr::Symbol(..), Expr::List(ref lit_exprs, _), ref rule_exprs @ ..] =
+        sr_form
     else {
         return Err(EvalError::Parse("expected syntax-rules form".into()).at(span));
     };
-    if sr != "syntax-rules" {
-        return Err(EvalError::Parse("expected syntax-rules".into()).at(span));
-    }
     let literals: Vec<String> = lit_exprs
         .iter()
         .map(|e| match e {
@@ -1684,11 +1780,34 @@ fn eval_define_syntax(args: &[Expr], span: Span, env: &Env) -> Result<Value, Eva
         })
         .collect::<Result<_, _>>()?;
     env.define(
-        name.clone(),
+        name.to_string(),
         Value::Macro {
             literals,
             rules,
             def_env: env.clone(),
+        },
+    );
+    Ok(Value::Void)
+}
+
+fn eval_define_syntax_transformer(
+    name: &str,
+    lambda_form: &Expr,
+    span: Span,
+    env: &Env,
+) -> Result<Value, EvalError> {
+    let transformer = eval(lambda_form, env)?;
+    if !matches!(&transformer, Value::Lambda { .. }) {
+        return Err(EvalError::TypeError {
+            expected: "lambda".into(),
+            got: format!("{transformer}"),
+        }
+        .at(span));
+    }
+    env.define(
+        name.to_string(),
+        Value::TransformerMacro {
+            transformer: Box::new(transformer),
         },
     );
     Ok(Value::Void)
