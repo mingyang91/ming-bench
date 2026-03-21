@@ -338,15 +338,16 @@ fn eval_list_expression(
     };
 
     if let Some(name) = operator.symbol_name() {
-        if let Some(state) = eval_special_form(
-            name,
-            &arguments,
-            operator.location(),
-            environment.clone(),
-            continuation.clone(),
-            macro_environment,
-        )? {
-            return Ok(state);
+        if is_special_form(name) {
+            return eval_special_form(
+                name,
+                &arguments,
+                operator.location(),
+                environment,
+                continuation,
+                macro_environment,
+            )
+            .map(|state| state.expect("special-form dispatch should always produce a state"));
         }
 
         if macro_environment.is_macro(name) {
@@ -2449,14 +2450,11 @@ fn apply_raise(
 }
 
 fn apply_values(
-    mut arguments: Vec<Value>,
+    arguments: Vec<Value>,
     location: SourceLocation,
     continuation: ContinuationFrames,
 ) -> Result<State, EvalError> {
-    let value = match arguments.len() {
-        1 => arguments.pop().expect("values should contain one argument"),
-        _ => Value::multiple(arguments, location),
-    };
+    let value = value_from_arguments(arguments, location);
 
     Ok(State::Return {
         value,
@@ -2499,19 +2497,12 @@ fn apply_continuation(
     location: SourceLocation,
     continuation: ContinuationFrames,
 ) -> Result<State, EvalError> {
-    let [value] = arguments.as_slice() else {
-        return Err(EvalError::WrongArgumentCount {
-            location,
-            procedure: "continuation",
-            expected: ArgCount::Exactly(1),
-            got: arguments.len(),
-        });
-    };
+    let value = value_from_arguments(arguments, location);
 
     resume_continuation(
         continuation,
-        normalize_resumed_continuation(captured.frames(), value),
-        value.clone(),
+        normalize_resumed_continuation(captured.frames(), &value),
+        value,
     )
 }
 
@@ -2945,6 +2936,40 @@ fn is_syntax_rules_expression(expression: &Expr) -> bool {
                 Some(Expr::Symbol { name, .. }) if name == "syntax-rules"
             )
     )
+}
+
+fn is_special_form(name: &str) -> bool {
+    matches!(
+        name,
+        "and"
+            | "or"
+            | "if"
+            | "define"
+            | "define-syntax"
+            | "define-record-type"
+            | "set!"
+            | "quote"
+            | "syntax"
+            | "syntax-case"
+            | "with-syntax"
+            | "lambda"
+            | "let"
+            | "letrec"
+            | "letrec*"
+            | "begin"
+            | "cond"
+            | "case"
+            | "guard"
+    )
+}
+
+fn value_from_arguments(mut arguments: Vec<Value>, location: SourceLocation) -> Value {
+    match arguments.len() {
+        1 => arguments
+            .pop()
+            .expect("single-value return should provide one argument"),
+        _ => Value::multiple(arguments, location),
+    }
 }
 
 fn split_first<T>(items: Vec<T>) -> Option<(T, Vec<T>)> {
