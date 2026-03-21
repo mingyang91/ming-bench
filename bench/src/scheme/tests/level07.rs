@@ -1,43 +1,33 @@
 use crate::scheme::eval_str;
 
-// ===== Level 7: Recursive List Programs =====
+// ===== Level 7: Immutable Strings (R7RS) =====
 
 #[test]
-fn test_l07_count() {
+fn test_l07_string_set_error() {
+    let err = eval_str(include_str!("fixtures/l07_string_set_error.scm").trim());
+    assert!(err.is_err(), "string-set! should error on immutable strings");
+}
+
+#[test]
+fn test_l07_string_to_list() {
     assert_eq!(
-        eval_str(include_str!("fixtures/l07_count.scm").trim()),
-        Ok("3".into())
+        eval_str(include_str!("fixtures/l07_string_to_list.scm").trim()),
+        Ok("(#\\h #\\e #\\l #\\l #\\o)".into())
     );
 }
 
 #[test]
-fn test_l07_append() {
+fn test_l07_list_to_string() {
     assert_eq!(
-        eval_str(include_str!("fixtures/l07_append.scm").trim()),
-        Ok("(1 2 3 4)".into())
+        eval_str(include_str!("fixtures/l07_list_to_string.scm").trim()),
+        Ok("\"hello\"".into())
     );
 }
 
 #[test]
-fn test_l07_reverse() {
+fn test_l07_string_transform_via_list() {
     assert_eq!(
-        eval_str(include_str!("fixtures/l07_reverse.scm").trim()),
-        Ok("(3 2 1)".into())
-    );
-}
-
-#[test]
-fn test_l07_map() {
-    assert_eq!(
-        eval_str(include_str!("fixtures/l07_map.scm").trim()),
-        Ok("(1 4 9 16)".into())
-    );
-}
-
-#[test]
-fn test_l07_filter() {
-    assert_eq!(
-        eval_str(include_str!("fixtures/l07_filter.scm").trim()),
-        Ok("(3 4 5)".into())
+        eval_str(include_str!("fixtures/l07_string_transform_via_list.scm").trim()),
+        Ok("\"HELLO\"".into())
     );
 }

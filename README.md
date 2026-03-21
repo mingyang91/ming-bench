@@ -1,6 +1,6 @@
 # MING — Ming Interpreter Nurture Gauntlet
 
-A benchmark framework for measuring how **prompt engineering strategies** affect coding agent performance. Agents build a Scheme interpreter in Rust from scratch — 100+ tests across 25 difficulty levels, from basic arithmetic to first-class continuations, hygienic macros, and data structure extensions.
+A benchmark framework for measuring how **prompt engineering strategies** affect coding agent performance. Agents build a Scheme interpreter in Rust from scratch — 100+ tests across 15 difficulty levels, from basic arithmetic to first-class continuations, hygienic macros, and data structure extensions.
 
 ## Why This Exists
 
@@ -16,7 +16,7 @@ The task is deliberately chosen to stress-test this: a Scheme interpreter requir
 
 The agent receives:
 - A function signature: `eval_str(input: &str) -> Result<String, EvalError>`
-- 100+ test cases across 25 levels (each test loads Scheme code from a `.scm` fixture file)
+- 165 test cases across 15 levels (each test loads Scheme code from a `.scm` fixture file)
 - Instructions in `bench/CLAUDE.md` (the only file the agent reads for guidance)
 
 The agent implements a complete Scheme interpreter from scratch — lexer, parser, environment, evaluator, tail-call optimization, continuations, and hygienic macros. No starter code. No libraries beyond `thiserror` for error types.
@@ -55,7 +55,7 @@ Both strategies share `SPEC.md` (identical task definition) and the same test su
 
 Each agent run uses one of two modes:
 
-- **Full mode** — one agent session tackles all 25 levels. Simpler, but if the agent gets stuck it burns budget.
+- **Full mode** — one agent session tackles all 15 levels. Simpler, but if the agent gets stuck it burns budget.
 - **Levels mode** — orchestrator runs a fresh agent per level. Fail-fast: stops on first failure. Per-level session data for granular analysis.
 
 ### Sandboxed Testing
@@ -71,33 +71,23 @@ This prevents agent-written infinite loops or memory bombs from crashing the ben
 
 | Level | Topic | Tests | Key Concepts |
 |-------|-------|-------|-------------|
-| 1 | Atoms | 5 | Self-evaluating: integers, booleans, strings |
-| 2 | Arithmetic | 7 | `+`, `-`, `*`, `/`, variadic, nested |
-| 3 | Comparisons | 7 | `<`, `>`, `=`, `<=`, `not`, `and`, `or` |
-| 4 | Define & If | 7 | Variable binding, conditionals, `quote` |
-| 5 | Lambda | 7 | Closures, define sugar, recursion |
-| 6 | Lists | 8 | `cons`, `car`, `cdr`, `null?`, `list`, `length` |
-| 7 | Recursive programs | 5 | map, filter, append, reverse (user-defined) |
-| 8 | Let/begin/cond | 6 | Local bindings, sequencing, multi-branch |
-| 9 | Type predicates | 5 | `string?`, `number?`, `boolean?`, `pair?`, `symbol?` |
-| 10 | Error quality | 6 | Error messages with source position (line:col) |
-| 11 | Display/write | 6 | `display`, `write`, `newline`, output capture |
-| 12 | String & symbol ops | 7 | `string-append`, `substring`, `string->number`, `char?` |
-| 13 | **Mutable strings** | 3 | `string-set!`, `string-copy` (R5RS) |
-| 14 | **String immutability** | 4 | `string-set!` errors, `string->list`/`list->string` (R7RS) |
-| 15 | Tail call opt. | 3 | Deep recursion without stack overflow |
-| 16 | set! & mutation | 5 | Mutable bindings, shared state in closures |
-| 17 | Variadic & apply | 6 | Rest args, `apply` with prefix args |
-| 18 | Tail position (all) | 5 | TCO in `cond`, named `let`, `and`/`or`, `begin` |
-| 19 | **call/cc** | 10 | First-class continuations, non-local exit, reentrant |
-| 20 | **Macros** | 6 | `define-syntax`, `syntax-rules`, hygiene, ellipsis |
-| 21 | **Integration** | 5 | call/cc + macros + mutation + TCO combined |
-| 22 | Deep equality | 4 | `equal?` recursive structural comparison |
-| 23 | Recursive bindings | 4 | `letrec`, `letrec*`, mutual recursion |
-| 24 | Case expression | 4 | `case`, `eqv?`, datum dispatch |
-| 25 | Vectors | 5 | `vector`, `vector-ref`, `vector-set!`, conversion |
+| 1 | Atoms, arithmetic, comparisons | ~19 | Integers, booleans, strings, `+`/`-`/`*`/`/`, `<`/`>`/`=`, `and`/`or`/`not` |
+| 2 | Variables, conditionals, lambda | ~14 | `define`, `if`, `quote`, `lambda`, closures, recursion |
+| 3 | Lists, recursion, let/begin/cond, predicates | ~24 | `cons`/`car`/`cdr`, map/filter, `let`/`begin`/`cond`, type predicates |
+| 4 | Error quality | 6 | Error messages with source position (line:col) |
+| 5 | Display/write & string ops | ~13 | `display`, `write`, `newline`, `string-append`, `substring`, `char?` |
+| 6 | **Mutable strings** | 3 | `string-set!`, `string-copy` (R5RS) |
+| 7 | **String immutability** | 4 | `string-set!` errors, `string->list`/`list->string` (R7RS) |
+| 8 | Tail call optimization (all forms) | ~8 | TCO in `if`, `cond`, named `let`, `and`/`or`, `begin` |
+| 9 | set! & mutation | 5 | Mutable bindings, shared state in closures |
+| 10 | Variadic & apply | 6 | Rest args, `apply` with prefix args |
+| 11 | **call/cc** | 10 | First-class continuations, non-local exit, reentrant |
+| 12 | **Macros** | 6 | `define-syntax`, `syntax-rules`, hygiene, ellipsis |
+| 13 | **Integration** | 5 | call/cc + macros + mutation + TCO combined |
+| 14 | Equality, letrec, case, vectors | ~17 | `equal?`, `letrec`/`letrec*`, `case`/`eqv?`, `vector` |
+| 15 | Numeric/char/string utilities | ~25 | `abs`, `modulo`, `min`/`max`, `zero?`, `list-ref`, `char-upcase`, `string=?` |
 
-Levels 1-9 are foundational. Levels 10-12 are **maintenance levels** — cross-cutting refactors on existing code (error quality, I/O, string ops). Levels 13-14 test **requirement changes** — the agent implements mutable strings (R5RS), then must refactor to immutable strings (R7RS). Levels 15-18 add architectural complexity (TCO, mutation, variadic). Levels 19-21 are where most agents struggle — continuations and macros demand non-obvious design decisions. Levels 22-25 are **maintenance extensions** — straightforward feature additions that test whether agents can cleanly extend a complex, mature codebase.
+Levels 1-3 are foundational (compressed from 9 original levels). Levels 4-5 are **maintenance levels** — cross-cutting refactors on existing code (error quality, I/O, string ops). Levels 6-7 test **requirement changes** — the agent implements mutable strings (R5RS), then must refactor to immutable strings (R7RS). Levels 8-10 add architectural complexity (TCO, mutation, variadic). Levels 11-13 are where most agents struggle — continuations and macros demand non-obvious design decisions. Levels 14-15 are **extension levels** — feature additions that test whether agents can cleanly extend a complex, mature codebase.
 
 ## Tooling
 
@@ -106,7 +96,7 @@ All benchmark infrastructure lives in a single Rust CLI: `cargo xtask`.
 ```
 cargo xtask setup           # install podman, build container image
 cargo xtask test 01         # run level 1 tests (containerized)
-cargo xtask bench main      # score a branch (all 25 levels)
+cargo xtask bench main      # score a branch (all 15 levels)
 cargo xtask run-agent ...   # orchestrate an agent run (worktree + agent + scoring)
 cargo xtask results         # tabular summary of all runs
 cargo xtask tokens --all    # per-level token usage and cost estimates

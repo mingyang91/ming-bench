@@ -117,7 +117,7 @@ fn quality_gates(proj: &Path, level: &str) -> Result<()> {
     // Determine limits based on level
     let (fn_limit, allow_dead_code) = if level != "all" {
         let ln: u32 = level.parse().unwrap_or(99);
-        if ln <= 5 {
+        if ln <= 3 {
             (150, true)
         } else {
             (150, false)

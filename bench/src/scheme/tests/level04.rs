@@ -1,59 +1,64 @@
 use crate::scheme::eval_str;
 
-// ===== Level 4: Define & If =====
+// ===== Level 4: Error Quality =====
+
+/// Check that an error message contains position info (digit followed by colon).
+fn has_position_info(msg: &str) -> bool {
+    msg.as_bytes()
+        .windows(2)
+        .any(|w| w[0].is_ascii_digit() && w[1] == b':')
+}
 
 #[test]
-fn test_l04_if_true() {
-    assert_eq!(
-        eval_str(include_str!("fixtures/l04_if_true.scm").trim()),
-        Ok("1".into())
+fn test_l04_error_undefined_var() {
+    let err = eval_str(include_str!("fixtures/l04_error_undefined_var.scm").trim()).unwrap_err();
+    assert!(
+        has_position_info(&err.to_string()),
+        "error should contain position info: {err}"
     );
 }
 
 #[test]
-fn test_l04_if_false() {
-    assert_eq!(
-        eval_str(include_str!("fixtures/l04_if_false.scm").trim()),
-        Ok("2".into())
+fn test_l04_error_wrong_arg_count() {
+    let err = eval_str(include_str!("fixtures/l04_error_wrong_arg_count.scm").trim()).unwrap_err();
+    assert!(
+        has_position_info(&err.to_string()),
+        "error should contain position info: {err}"
     );
 }
 
 #[test]
-fn test_l04_if_expr() {
-    assert_eq!(
-        eval_str(include_str!("fixtures/l04_if_expr.scm").trim()),
-        Ok("10".into())
+fn test_l04_error_type_mismatch() {
+    let err = eval_str(include_str!("fixtures/l04_error_type_mismatch.scm").trim()).unwrap_err();
+    assert!(
+        has_position_info(&err.to_string()),
+        "error should contain position info: {err}"
     );
 }
 
 #[test]
-fn test_l04_define_var() {
-    assert_eq!(
-        eval_str(include_str!("fixtures/l04_define_var.scm").trim()),
-        Ok("5".into())
+fn test_l04_error_syntax() {
+    let err = eval_str(include_str!("fixtures/l04_error_syntax.scm").trim()).unwrap_err();
+    assert!(
+        has_position_info(&err.to_string()),
+        "error should contain position info: {err}"
     );
 }
 
 #[test]
-fn test_l04_define_use() {
-    assert_eq!(
-        eval_str(include_str!("fixtures/l04_define_use.scm").trim()),
-        Ok("4".into())
+fn test_l04_error_division_by_zero() {
+    let err = eval_str(include_str!("fixtures/l04_error_division_by_zero.scm").trim()).unwrap_err();
+    assert!(
+        has_position_info(&err.to_string()),
+        "error should contain position info: {err}"
     );
 }
 
 #[test]
-fn test_l04_define_multi() {
-    assert_eq!(
-        eval_str(include_str!("fixtures/l04_define_multi.scm").trim()),
-        Ok("30".into())
-    );
-}
-
-#[test]
-fn test_l04_quote() {
-    assert_eq!(
-        eval_str(include_str!("fixtures/l04_quote.scm").trim()),
-        Ok("(1 2 3)".into())
+fn test_l04_error_not_a_procedure() {
+    let err = eval_str(include_str!("fixtures/l04_error_not_a_procedure.scm").trim()).unwrap_err();
+    assert!(
+        has_position_info(&err.to_string()),
+        "error should contain position info: {err}"
     );
 }

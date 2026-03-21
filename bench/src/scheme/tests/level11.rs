@@ -1,45 +1,83 @@
-use crate::scheme::eval_str_with_output;
+use crate::scheme::eval_str;
 
-// ===== Level 11: Display, Write, Newline =====
+// ===== Level 11: First-Class Continuations (call/cc) =====
 
 #[test]
-fn test_l11_display_number() {
-    let (_, output) =
-        eval_str_with_output(include_str!("fixtures/l11_display_number.scm").trim()).unwrap();
-    assert_eq!(output, "42");
+fn test_l11_callcc_nonlocal_exit() {
+    assert_eq!(
+        eval_str(include_str!("fixtures/l11_callcc_nonlocal_exit.scm").trim()),
+        Ok("42".into())
+    );
 }
 
 #[test]
-fn test_l11_display_string() {
-    let (_, output) =
-        eval_str_with_output(include_str!("fixtures/l11_display_string.scm").trim()).unwrap();
-    assert_eq!(output, "hello");
+fn test_l11_callcc_no_escape() {
+    assert_eq!(
+        eval_str(include_str!("fixtures/l11_callcc_no_escape.scm").trim()),
+        Ok("7".into())
+    );
 }
 
 #[test]
-fn test_l11_write_string() {
-    let (_, output) =
-        eval_str_with_output(include_str!("fixtures/l11_write_string.scm").trim()).unwrap();
-    assert_eq!(output, "\"hello\"");
+fn test_l11_callcc_early_return() {
+    assert_eq!(
+        eval_str(include_str!("fixtures/l11_callcc_early_return.scm").trim()),
+        Ok("-2".into())
+    );
 }
 
 #[test]
-fn test_l11_newline() {
-    let (_, output) =
-        eval_str_with_output(include_str!("fixtures/l11_newline.scm").trim()).unwrap();
-    assert_eq!(output, "\n");
+fn test_l11_callcc_saved_continuation() {
+    assert_eq!(
+        eval_str(include_str!("fixtures/l11_callcc_saved_continuation.scm").trim()),
+        Ok("42".into())
+    );
 }
 
 #[test]
-fn test_l11_display_list() {
-    let (_, output) =
-        eval_str_with_output(include_str!("fixtures/l11_display_list.scm").trim()).unwrap();
-    assert_eq!(output, "(1 2 3)");
+fn test_l11_callcc_as_value() {
+    assert_eq!(
+        eval_str(include_str!("fixtures/l11_callcc_as_value.scm").trim()),
+        Ok("11".into())
+    );
 }
 
 #[test]
-fn test_l11_multiple_display() {
-    let (_, output) =
-        eval_str_with_output(include_str!("fixtures/l11_multiple_display.scm").trim()).unwrap();
-    assert_eq!(output, "123");
+fn test_l11_callcc_reentrant() {
+    assert_eq!(
+        eval_str(include_str!("fixtures/l11_callcc_reentrant.scm").trim()),
+        Ok("3".into())
+    );
+}
+
+#[test]
+fn test_l11_callcc_exception_handler() {
+    assert_eq!(
+        eval_str(include_str!("fixtures/l11_callcc_exception_handler.scm").trim()),
+        Ok("(error 42)".into())
+    );
+}
+
+#[test]
+fn test_l11_callcc_is_first_class() {
+    assert_eq!(
+        eval_str(include_str!("fixtures/l11_callcc_is_first_class.scm").trim()),
+        Ok("7".into())
+    );
+}
+
+#[test]
+fn test_l11_callcc_resumes_lambda_body() {
+    assert_eq!(
+        eval_str(include_str!("fixtures/l11_callcc_resumes_lambda_body.scm").trim()),
+        Ok("3".into())
+    );
+}
+
+#[test]
+fn test_l11_callcc_resumes_pending_application() {
+    assert_eq!(
+        eval_str(include_str!("fixtures/l11_callcc_resumes_pending_application.scm").trim()),
+        Ok("43".into())
+    );
 }

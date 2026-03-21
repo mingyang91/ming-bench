@@ -1,42 +1,43 @@
 use crate::scheme::eval_str;
 
-// ===== Level 13: Mutable Strings (R5RS) =====
-// Requirement-change level: string-set! is deprecated at L14 (strings become immutable).
-
-fn current_level() -> u32 {
-    std::env::var("BENCH_LEVEL")
-        .ok()
-        .and_then(|v| v.parse().ok())
-        .unwrap_or(u32::MAX)
-}
+// ===== Level 13: Integration =====
 
 #[test]
-fn test_l13_string_set() {
-    if current_level() > 13 {
-        return;
-    } // deprecated at L14
+fn test_l13_callcc_with_mutation() {
     assert_eq!(
-        eval_str(include_str!("fixtures/l13_string_set.scm").trim()),
-        Ok("\"Horld\"".into())
+        eval_str(include_str!("fixtures/l13_callcc_with_mutation.scm").trim()),
+        Ok("4".into())
     );
 }
 
 #[test]
-fn test_l13_string_copy() {
-    // string-copy is NOT deprecated — still valid after L14
+fn test_l13_macro_tco_loop() {
     assert_eq!(
-        eval_str(include_str!("fixtures/l13_string_copy.scm").trim()),
-        Ok("\"hello\"".into())
+        eval_str(include_str!("fixtures/l13_macro_tco_loop.scm").trim()),
+        Ok("1000000".into())
     );
 }
 
 #[test]
-fn test_l13_string_set_multiple() {
-    if current_level() > 13 {
-        return;
-    } // deprecated at L14
+fn test_l13_callcc_try_catch() {
     assert_eq!(
-        eval_str(include_str!("fixtures/l13_string_set_multiple.scm").trim()),
-        Ok("\"HELLO\"".into())
+        eval_str(include_str!("fixtures/l13_callcc_try_catch.scm").trim()),
+        Ok("(caught 42)".into())
+    );
+}
+
+#[test]
+fn test_l13_coroutine_scheduler() {
+    assert_eq!(
+        eval_str(include_str!("fixtures/l13_coroutine_scheduler.scm").trim()),
+        Ok("4".into())
+    );
+}
+
+#[test]
+fn test_l13_church_booleans_with_callcc() {
+    assert_eq!(
+        eval_str(include_str!("fixtures/l13_church_booleans_with_callcc.scm").trim()),
+        Ok("yes".into())
     );
 }

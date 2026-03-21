@@ -331,11 +331,9 @@ pub fn elapsed_secs(meta: &MetaJson) -> Option<u64> {
 // Level constants
 // ---------------------------------------------------------------------------
 
-pub const LEVELS: [&str; 30] = [
+pub const LEVELS: [&str; 15] = [
     "01", "02", "03", "04", "05", "06", "07", "08", "09",
-    "10", "11", "12", "13", "14", "15", "16", "17", "18", "19",
-    "20", "21", "22", "23", "24", "25", "26", "27", "28", "29",
-    "30",
+    "10", "11", "12", "13", "14", "15",
 ];
 
 // ---------------------------------------------------------------------------
@@ -344,18 +342,23 @@ pub const LEVELS: [&str; 30] = [
 
 /// Default turn limit for a given level number.
 ///
-/// Three tiers based on observed difficulty:
-///   L01-L09 (basics)         → 30 turns
-///   L10-L16, L22-L30 (medium) → 45 turns
-///   L17-L21 (hard: TCO, call/cc, macros) → 75 turns
+/// Tiers based on difficulty:
+///   L01-L03 (foundation, merged)   → 45 turns
+///   L04-L07 (maintenance/strings)  → 30 turns
+///   L08-L10 (TCO, mutation, apply) → 45 turns
+///   L11-L13 (call/cc, macros, integration) → 75 turns
+///   L14-L15 (extensions, merged)   → 45 turns
 pub fn turns_for_level(level_num: u32, max_turns: Option<u32>) -> u32 {
     if let Some(t) = max_turns {
         return t;
     }
     match level_num {
-        1..=9 => 30,
-        17..=21 => 75,
-        _ => 45,
+        1..=3 => 45,
+        4..=7 => 30,
+        8..=10 => 45,
+        11..=13 => 75,
+        14..=15 => 45,
+        _ => 60, // future levels (L16+)
     }
 }
 

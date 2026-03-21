@@ -1,59 +1,51 @@
 use crate::scheme::eval_str;
 
-// ===== Level 12: String & Symbol Operations =====
+// ===== Level 12: Hygienic Macros =====
 
 #[test]
-fn test_l12_string_append() {
+fn test_l12_simple_macro() {
     assert_eq!(
-        eval_str(include_str!("fixtures/l12_string_append.scm").trim()),
-        Ok("\"hello world\"".into())
+        eval_str(include_str!("fixtures/l12_simple_macro.scm").trim()),
+        Ok("1".into())
     );
 }
 
 #[test]
-fn test_l12_string_length() {
+fn test_l12_my_and_macro() {
     assert_eq!(
-        eval_str(include_str!("fixtures/l12_string_length.scm").trim()),
-        Ok("5".into())
+        eval_str(include_str!("fixtures/l12_my_and_macro.scm").trim()),
+        Ok("3".into())
     );
 }
 
 #[test]
-fn test_l12_substring() {
+fn test_l12_swap_hygiene() {
     assert_eq!(
-        eval_str(include_str!("fixtures/l12_substring.scm").trim()),
-        Ok("\"world\"".into())
+        eval_str(include_str!("fixtures/l12_swap_hygiene.scm").trim()),
+        Ok("(2 1)".into())
     );
 }
 
 #[test]
-fn test_l12_string_to_number() {
+fn test_l12_variadic_pattern() {
     assert_eq!(
-        eval_str(include_str!("fixtures/l12_string_to_number.scm").trim()),
-        Ok("42".into())
+        eval_str(include_str!("fixtures/l12_variadic_pattern.scm").trim()),
+        Ok("(1 2 3)".into())
     );
 }
 
 #[test]
-fn test_l12_number_to_string() {
+fn test_l12_nested_macro() {
     assert_eq!(
-        eval_str(include_str!("fixtures/l12_number_to_string.scm").trim()),
-        Ok("\"42\"".into())
+        eval_str(include_str!("fixtures/l12_nested_macro.scm").trim()),
+        Ok("2".into())
     );
 }
 
 #[test]
-fn test_l12_symbol_string_roundtrip() {
+fn test_l12_macro_keeps_definition_site_binding() {
     assert_eq!(
-        eval_str(include_str!("fixtures/l12_symbol_string_roundtrip.scm").trim()),
-        Ok("hello".into())
-    );
-}
-
-#[test]
-fn test_l12_string_ref_and_char() {
-    assert_eq!(
-        eval_str(include_str!("fixtures/l12_string_ref_and_char.scm").trim()),
-        Ok("#t".into())
+        eval_str(include_str!("fixtures/l12_macro_keeps_definition_site_binding.scm").trim()),
+        Ok("10".into())
     );
 }

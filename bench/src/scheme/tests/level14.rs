@@ -1,35 +1,139 @@
 use crate::scheme::eval_str;
 
-// ===== Level 14: String Immutability (R7RS) =====
-// Requirement change: strings are now immutable. string-set! must raise an error.
-// Use string->list and list->string for character-level transformations.
+// ===== Level 14: Deep Equality, Letrec, Case & Vectors =====
 
 #[test]
-fn test_l14_string_set_error() {
-    let err = eval_str(include_str!("fixtures/l14_string_set_error.scm").trim());
-    assert!(err.is_err(), "string-set! should error on immutable strings");
-}
-
-#[test]
-fn test_l14_string_to_list() {
+fn test_l14_equal_numbers() {
     assert_eq!(
-        eval_str(include_str!("fixtures/l14_string_to_list.scm").trim()),
-        Ok("(#\\h #\\e #\\l #\\l #\\o)".into())
+        eval_str(include_str!("fixtures/l14_equal_numbers.scm").trim()),
+        Ok("#t".into())
     );
 }
 
 #[test]
-fn test_l14_list_to_string() {
+fn test_l14_equal_strings() {
     assert_eq!(
-        eval_str(include_str!("fixtures/l14_list_to_string.scm").trim()),
-        Ok("\"hello\"".into())
+        eval_str(include_str!("fixtures/l14_equal_strings.scm").trim()),
+        Ok("#t".into())
     );
 }
 
 #[test]
-fn test_l14_string_transform_via_list() {
+fn test_l14_equal_nested_lists() {
     assert_eq!(
-        eval_str(include_str!("fixtures/l14_string_transform_via_list.scm").trim()),
-        Ok("\"HELLO\"".into())
+        eval_str(include_str!("fixtures/l14_equal_nested_lists.scm").trim()),
+        Ok("#t".into())
+    );
+}
+
+#[test]
+fn test_l14_equal_different_types() {
+    assert_eq!(
+        eval_str(include_str!("fixtures/l14_equal_different_types.scm").trim()),
+        Ok("#f".into())
+    );
+}
+
+#[test]
+fn test_l14_letrec_simple() {
+    assert_eq!(
+        eval_str(include_str!("fixtures/l14_letrec_simple.scm").trim()),
+        Ok("120".into())
+    );
+}
+
+#[test]
+fn test_l14_letrec_mutual() {
+    assert_eq!(
+        eval_str(include_str!("fixtures/l14_letrec_mutual.scm").trim()),
+        Ok("#t".into())
+    );
+}
+
+#[test]
+fn test_l14_letrec_star() {
+    assert_eq!(
+        eval_str(include_str!("fixtures/l14_letrec_star.scm").trim()),
+        Ok("2".into())
+    );
+}
+
+#[test]
+fn test_l14_letrec_shadow() {
+    assert_eq!(
+        eval_str(include_str!("fixtures/l14_letrec_shadow.scm").trim()),
+        Ok("42".into())
+    );
+}
+
+#[test]
+fn test_l14_case_symbol() {
+    assert_eq!(
+        eval_str(include_str!("fixtures/l14_case_symbol.scm").trim()),
+        Ok("2".into())
+    );
+}
+
+#[test]
+fn test_l14_case_number() {
+    assert_eq!(
+        eval_str(include_str!("fixtures/l14_case_number.scm").trim()),
+        Ok("\"two\"".into())
+    );
+}
+
+#[test]
+fn test_l14_case_else() {
+    assert_eq!(
+        eval_str(include_str!("fixtures/l14_case_else.scm").trim()),
+        Ok("0".into())
+    );
+}
+
+#[test]
+fn test_l14_case_no_match() {
+    assert_eq!(
+        eval_str(include_str!("fixtures/l14_case_no_match.scm").trim()),
+        Ok("#t".into())
+    );
+}
+
+#[test]
+fn test_l14_vector_create_ref() {
+    assert_eq!(
+        eval_str(include_str!("fixtures/l14_vector_create_ref.scm").trim()),
+        Ok("2".into())
+    );
+}
+
+#[test]
+fn test_l14_vector_set() {
+    assert_eq!(
+        eval_str(include_str!("fixtures/l14_vector_set.scm").trim()),
+        Ok("42".into())
+    );
+}
+
+#[test]
+fn test_l14_vector_predicate() {
+    assert_eq!(
+        eval_str(include_str!("fixtures/l14_vector_predicate.scm").trim()),
+        Ok("(#t #f 3)".into())
+    );
+}
+
+#[test]
+fn test_l14_vector_conversion() {
+    assert_eq!(
+        eval_str(include_str!("fixtures/l14_vector_conversion.scm").trim()),
+        Ok("(1 2 3)".into())
+    );
+}
+
+#[test]
+fn test_l14_vector_nested() {
+    assert_eq!(
+        eval_str(include_str!("fixtures/l14_vector_nested.scm").trim()),
+        Ok("3".into())
     );
 }

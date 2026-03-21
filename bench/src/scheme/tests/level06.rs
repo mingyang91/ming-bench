@@ -1,67 +1,42 @@
 use crate::scheme::eval_str;
 
-// ===== Level 6: List Operations =====
+// ===== Level 6: Mutable Strings (R5RS) =====
+// Requirement-change level: string-set! is deprecated at L07 (strings become immutable).
+
+fn current_level() -> u32 {
+    std::env::var("BENCH_LEVEL")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(u32::MAX)
+}
 
 #[test]
-fn test_l06_cons() {
+fn test_l06_string_set() {
+    if current_level() > 6 {
+        return;
+    } // deprecated at L07
     assert_eq!(
-        eval_str(include_str!("fixtures/l06_cons.scm").trim()),
-        Ok("(1)".into())
+        eval_str(include_str!("fixtures/l06_string_set.scm").trim()),
+        Ok("\"Horld\"".into())
     );
 }
 
 #[test]
-fn test_l06_cons_chain() {
+fn test_l06_string_copy() {
+    // string-copy is NOT deprecated — still valid after L14
     assert_eq!(
-        eval_str(include_str!("fixtures/l06_cons_chain.scm").trim()),
-        Ok("(1 2 3)".into())
+        eval_str(include_str!("fixtures/l06_string_copy.scm").trim()),
+        Ok("\"hello\"".into())
     );
 }
 
 #[test]
-fn test_l06_car() {
+fn test_l06_string_set_multiple() {
+    if current_level() > 6 {
+        return;
+    } // deprecated at L07
     assert_eq!(
-        eval_str(include_str!("fixtures/l06_car.scm").trim()),
-        Ok("1".into())
-    );
-}
-
-#[test]
-fn test_l06_cdr() {
-    assert_eq!(
-        eval_str(include_str!("fixtures/l06_cdr.scm").trim()),
-        Ok("(2 3)".into())
-    );
-}
-
-#[test]
-fn test_l06_null_true() {
-    assert_eq!(
-        eval_str(include_str!("fixtures/l06_null_true.scm").trim()),
-        Ok("#t".into())
-    );
-}
-
-#[test]
-fn test_l06_null_false() {
-    assert_eq!(
-        eval_str(include_str!("fixtures/l06_null_false.scm").trim()),
-        Ok("#f".into())
-    );
-}
-
-#[test]
-fn test_l06_list() {
-    assert_eq!(
-        eval_str(include_str!("fixtures/l06_list.scm").trim()),
-        Ok("(1 2 3)".into())
-    );
-}
-
-#[test]
-fn test_l06_length() {
-    assert_eq!(
-        eval_str(include_str!("fixtures/l06_length.scm").trim()),
-        Ok("3".into())
+        eval_str(include_str!("fixtures/l06_string_set_multiple.scm").trim()),
+        Ok("\"HELLO\"".into())
     );
 }

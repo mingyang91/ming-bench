@@ -1,65 +1,51 @@
 use crate::scheme::eval_str;
 
-// ===== Level 10: Error Quality =====
-// All error messages must include source position info (line:col).
-
-/// Check that an error message contains position info (digit followed by colon).
-fn has_position_info(msg: &str) -> bool {
-    msg.as_bytes()
-        .windows(2)
-        .any(|w| w[0].is_ascii_digit() && w[1] == b':')
-}
+// ===== Level 10: Variadic & Apply =====
 
 #[test]
-fn test_l10_error_undefined_var() {
-    let err = eval_str(include_str!("fixtures/l10_error_undefined_var.scm").trim()).unwrap_err();
-    assert!(
-        has_position_info(&err.to_string()),
-        "error should contain position info: {err}"
+fn test_l10_rest_args() {
+    assert_eq!(
+        eval_str(include_str!("fixtures/l10_rest_args.scm").trim()),
+        Ok("(2 3)".into())
     );
 }
 
 #[test]
-fn test_l10_error_wrong_arg_count() {
-    let err = eval_str(include_str!("fixtures/l10_error_wrong_arg_count.scm").trim()).unwrap_err();
-    assert!(
-        has_position_info(&err.to_string()),
-        "error should contain position info: {err}"
+fn test_l10_rest_args_empty() {
+    assert_eq!(
+        eval_str(include_str!("fixtures/l10_rest_args_empty.scm").trim()),
+        Ok("()".into())
     );
 }
 
 #[test]
-fn test_l10_error_type_mismatch() {
-    let err = eval_str(include_str!("fixtures/l10_error_type_mismatch.scm").trim()).unwrap_err();
-    assert!(
-        has_position_info(&err.to_string()),
-        "error should contain position info: {err}"
+fn test_l10_apply_builtin() {
+    assert_eq!(
+        eval_str(include_str!("fixtures/l10_apply_builtin.scm").trim()),
+        Ok("6".into())
     );
 }
 
 #[test]
-fn test_l10_error_syntax() {
-    let err = eval_str(include_str!("fixtures/l10_error_syntax.scm").trim()).unwrap_err();
-    assert!(
-        has_position_info(&err.to_string()),
-        "error should contain position info: {err}"
+fn test_l10_apply_prefix_args() {
+    assert_eq!(
+        eval_str(include_str!("fixtures/l10_apply_prefix_args.scm").trim()),
+        Ok("10".into())
     );
 }
 
 #[test]
-fn test_l10_error_division_by_zero() {
-    let err = eval_str(include_str!("fixtures/l10_error_division_by_zero.scm").trim()).unwrap_err();
-    assert!(
-        has_position_info(&err.to_string()),
-        "error should contain position info: {err}"
+fn test_l10_apply_user_fn() {
+    assert_eq!(
+        eval_str(include_str!("fixtures/l10_apply_user_fn.scm").trim()),
+        Ok("15".into())
     );
 }
 
 #[test]
-fn test_l10_error_not_a_procedure() {
-    let err = eval_str(include_str!("fixtures/l10_error_not_a_procedure.scm").trim()).unwrap_err();
-    assert!(
-        has_position_info(&err.to_string()),
-        "error should contain position info: {err}"
+fn test_l10_apply_as_value() {
+    assert_eq!(
+        eval_str(include_str!("fixtures/l10_apply_as_value.scm").trim()),
+        Ok("6".into())
     );
 }
