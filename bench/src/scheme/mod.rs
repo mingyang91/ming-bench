@@ -93,6 +93,13 @@ fn eval_step(value: &Value, env: &mut Env, output: &mut String) -> Result<Bounce
         Value::Symbol(name, span) => env
             .get(name)
             .map(|rc| Bounce::Done(rc.borrow().clone()))
+            .or_else(|| {
+                if is_builtin(name) || name == "apply" {
+                    Some(Bounce::Done(Value::Symbol(name.clone(), *span)))
+                } else {
+                    None
+                }
+            })
             .ok_or_else(|| EvalError::UnboundVariable {
                 name: name.clone(),
                 span: *span,
@@ -157,10 +164,16 @@ fn apply_step(
     match &proc {
         Value::Lambda {
             params,
+            rest_param,
             body,
             env: captured_env,
         } => {
-            if args.len() != params.len() {
+            let arg_count_mismatch = if rest_param.is_some() {
+                args.len() < params.len()
+            } else {
+                args.len() != params.len()
+            };
+            if arg_count_mismatch {
                 return Err(EvalError::WrongArgCount {
                     expected: params.len(),
                     got: args.len(),
@@ -172,6 +185,13 @@ fn apply_step(
             for (param, arg) in params.iter().zip(args) {
                 local_env.insert(param.clone(), Rc::new(RefCell::new(arg.clone())));
             }
+            if let Some(rest_name) = rest_param {
+                let rest_args = args[params.len()..].to_vec();
+                local_env.insert(
+                    rest_name.clone(),
+                    Rc::new(RefCell::new(Value::List(rest_args, Span::default()))),
+                );
+            }
             eval_body_step(body, Value::Boolean(false), &mut local_env, output)
                 .map(|b| match b {
                     Bounce::Continue(expr) => Bounce::ReplaceEnv {
@@ -180,6 +200,9 @@ fn apply_step(
                     },
                     other => other,
                 })
+        }
+        Value::Symbol(name, _) if is_builtin(name) || name == "apply" => {
+            builtins::call_builtin_values(name, args, env, span, output).map(Bounce::Done)
         }
         other => Err(EvalError::TypeError {
             expected: "procedure".to_string(),

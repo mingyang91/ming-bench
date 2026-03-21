@@ -25,9 +25,10 @@ pub(crate) fn eval_define(
                     span,
                 });
             };
-            let params = extract_params(param_vals, span)?;
+            let (params, rest_param) = extract_params(param_vals, span)?;
             let lambda = Value::Lambda {
                 params,
+                rest_param,
                 body: body.to_vec(),
                 env: env.clone(),
             };
@@ -86,9 +87,10 @@ pub(crate) fn eval_lambda(args: &[Value], env: &Env, span: Span) -> Result<Value
             span,
         });
     }
-    let params = extract_params(param_list, span)?;
+    let (params, rest_param) = extract_params(param_list, span)?;
     Ok(Value::Lambda {
         params,
+        rest_param,
         body: body.to_vec(),
         env: env.clone(),
     })
@@ -265,16 +267,48 @@ pub(crate) fn eval_string_set(
     })
 }
 
-fn extract_params(param_vals: &[Value], span: Span) -> Result<Vec<String>, EvalError> {
-    param_vals
+fn extract_params(
+    param_vals: &[Value],
+    span: Span,
+) -> Result<(Vec<String>, Option<String>), EvalError> {
+    // Look for dot notation: (a b . rest)
+    let dot_pos = param_vals
         .iter()
-        .map(|v| match v {
-            Value::Symbol(s, _) => Ok(s.clone()),
-            other => Err(EvalError::TypeError {
-                expected: "symbol".to_string(),
-                got: format!("{other}"),
+        .position(|v| matches!(v, Value::Symbol(s, _) if s == "."));
+
+    if let Some(pos) = dot_pos {
+        let fixed = &param_vals[..pos];
+        let rest_slice = &param_vals[pos + 1..];
+        let [Value::Symbol(rest_name, _)] = rest_slice else {
+            return Err(EvalError::Parse {
+                message: "exactly one symbol must follow '.' in parameter list".to_string(),
                 span,
-            }),
-        })
-        .collect()
+            });
+        };
+        let params: Vec<String> = fixed
+            .iter()
+            .map(|v| match v {
+                Value::Symbol(s, _) => Ok(s.clone()),
+                other => Err(EvalError::TypeError {
+                    expected: "symbol".to_string(),
+                    got: format!("{other}"),
+                    span,
+                }),
+            })
+            .collect::<Result<_, _>>()?;
+        Ok((params, Some(rest_name.clone())))
+    } else {
+        let params: Vec<String> = param_vals
+            .iter()
+            .map(|v| match v {
+                Value::Symbol(s, _) => Ok(s.clone()),
+                other => Err(EvalError::TypeError {
+                    expected: "symbol".to_string(),
+                    got: format!("{other}"),
+                    span,
+                }),
+            })
+            .collect::<Result<_, _>>()?;
+        Ok((params, None))
+    }
 }

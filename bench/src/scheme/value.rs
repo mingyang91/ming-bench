@@ -27,6 +27,7 @@ pub enum Value {
     List(Vec<Value>, Span),
     Lambda {
         params: Vec<String>,
+        rest_param: Option<String>,
         body: Vec<Value>,
         env: HashMap<String, Rc<RefCell<Value>>>,
     },

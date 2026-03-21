@@ -172,7 +172,7 @@ fn is_delimiter(c: char) -> bool {
 }
 
 fn is_symbol_start(c: char) -> bool {
-    matches!(c, '+' | '*' | '/' | '<' | '>' | '=' | '!' | '?' | '_')
+    matches!(c, '+' | '*' | '/' | '<' | '>' | '=' | '!' | '?' | '_' | '.')
         || c.is_ascii_alphabetic()
 }
 
