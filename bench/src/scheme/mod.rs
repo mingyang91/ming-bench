@@ -1312,6 +1312,7 @@ fn is_builtin(name: &str) -> bool {
         "string-append" | "string-length" | "substring" |
         "string->number" | "number->string" | "symbol->string" | "string->symbol" |
         "string-ref" | "string-copy" | "char?" | "string->list" | "list->string" |
+        "string=?" | "string<?" | "string-ci=?" | "string-upcase" | "string-downcase" |
         "char->integer" | "integer->char" |
         "char=?" | "char<?" | "char-alphabetic?" | "char-numeric?" |
         "char-upcase" | "char-downcase" |
@@ -1791,6 +1792,51 @@ fn apply_builtin_vals(op: &str, vals: &[Value], pos: Pos) -> Result<Value, EvalE
                     Ok(Value::Str(s))
                 }
                 _ => Err(runtime_err(pos, "list->string: expected list")),
+            }
+        }
+        "string=?" => {
+            if vals.len() != 2 {
+                return Err(runtime_err(pos, "string=? requires 2 arguments"));
+            }
+            match (&vals[0], &vals[1]) {
+                (Value::Str(a), Value::Str(b)) => Ok(Value::Boolean(a == b)),
+                _ => Err(runtime_err(pos, "string=?: expected strings")),
+            }
+        }
+        "string<?" => {
+            if vals.len() != 2 {
+                return Err(runtime_err(pos, "string<? requires 2 arguments"));
+            }
+            match (&vals[0], &vals[1]) {
+                (Value::Str(a), Value::Str(b)) => Ok(Value::Boolean(a < b)),
+                _ => Err(runtime_err(pos, "string<?: expected strings")),
+            }
+        }
+        "string-ci=?" => {
+            if vals.len() != 2 {
+                return Err(runtime_err(pos, "string-ci=? requires 2 arguments"));
+            }
+            match (&vals[0], &vals[1]) {
+                (Value::Str(a), Value::Str(b)) => Ok(Value::Boolean(a.to_lowercase() == b.to_lowercase())),
+                _ => Err(runtime_err(pos, "string-ci=?: expected strings")),
+            }
+        }
+        "string-upcase" => {
+            if vals.len() != 1 {
+                return Err(runtime_err(pos, "string-upcase requires 1 argument"));
+            }
+            match &vals[0] {
+                Value::Str(s) => Ok(Value::Str(s.to_uppercase())),
+                _ => Err(runtime_err(pos, "string-upcase: expected string")),
+            }
+        }
+        "string-downcase" => {
+            if vals.len() != 1 {
+                return Err(runtime_err(pos, "string-downcase requires 1 argument"));
+            }
+            match &vals[0] {
+                Value::Str(s) => Ok(Value::Str(s.to_lowercase())),
+                _ => Err(runtime_err(pos, "string-downcase: expected string")),
             }
         }
         "char->integer" => {
