@@ -10,7 +10,9 @@ Canonical registry of extracted helpers (>= 5 ops).
 
 ## Rust Helpers (src/scheme/)
 
-(none yet)
+### case_lambda_procedure (src/scheme/mod.rs:726) — Build a multi-clause procedure value from parsed case-lambda clauses
+### eval_case_lambda (src/scheme/mod.rs:2871) — Parse and construct a `case-lambda` procedure from clause forms
+### lower_case_lambda_form (src/scheme/mod.rs:4060) — Preserve hygiene when macros generate `case-lambda` clauses with bindings
 
 ## Python Helpers (scripts/)
 

@@ -387,6 +387,7 @@ enum Builtin {
     BooleanPred,
     PairPred,
     SymbolPred,
+    ProcedurePred,
     Vector,
     MakeVector,
     VectorRef,
@@ -489,6 +490,7 @@ impl Builtin {
         Self::BooleanPred,
         Self::PairPred,
         Self::SymbolPred,
+        Self::ProcedurePred,
         Self::Vector,
         Self::MakeVector,
         Self::VectorRef,
@@ -591,6 +593,7 @@ impl Builtin {
             Self::BooleanPred => "boolean?",
             Self::PairPred => "pair?",
             Self::SymbolPred => "symbol?",
+            Self::ProcedurePred => "procedure?",
             Self::Vector => "vector",
             Self::MakeVector => "make-vector",
             Self::VectorRef => "vector-ref",
@@ -682,15 +685,54 @@ impl Env {
 #[derive(Debug)]
 struct LambdaProcedure {
     name: Option<String>,
-    params: Parameters,
-    body: Vec<Expr>,
+    clauses: Rc<[LambdaClause]>,
     env: EnvRef,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
+struct LambdaClause {
+    params: Parameters,
+    body: Rc<[Expr]>,
+}
+
+#[derive(Debug, Clone)]
 struct Parameters {
     required: Vec<String>,
     rest: Option<String>,
+}
+
+#[derive(Debug)]
+struct BoundProcedureCall {
+    env: EnvRef,
+    body: Rc<[Expr]>,
+}
+
+fn lambda_clause(params: Parameters, body: Vec<Expr>) -> LambdaClause {
+    LambdaClause {
+        params,
+        body: Rc::from(body),
+    }
+}
+
+fn lambda_procedure(
+    name: Option<String>,
+    params: Parameters,
+    body: Vec<Expr>,
+    env: EnvRef,
+) -> Rc<LambdaProcedure> {
+    case_lambda_procedure(name, vec![lambda_clause(params, body)], env)
+}
+
+fn case_lambda_procedure(
+    name: Option<String>,
+    clauses: Vec<LambdaClause>,
+    env: EnvRef,
+) -> Rc<LambdaProcedure> {
+    Rc::new(LambdaProcedure {
+        name,
+        clauses: Rc::from(clauses),
+        env,
+    })
 }
 
 #[derive(Debug)]
@@ -1125,7 +1167,7 @@ fn run_machine(exprs: &[Expr], env: EnvRef, ctx: &mut EvalContext) -> Result<Val
                     control = MachineControl::Value(value);
                 }
                 Value::Procedure(procedure) => {
-                    let local_env =
+                    let call =
                         bind_call_env(&procedure, &args).map_err(|err| err.with_position(pos))?;
                     let body_cont = if matches!(
                         cont.as_ref(),
@@ -1136,7 +1178,7 @@ fn run_machine(exprs: &[Expr], env: EnvRef, ctx: &mut EvalContext) -> Result<Val
                         Rc::new(MachineContinuation::ProcedureReturn { next: cont.clone() })
                     };
                     let (next_control, next_cont) =
-                        schedule_sequence(&procedure.body, local_env, body_cont);
+                        schedule_sequence(call.body.as_ref(), call.env, body_cont);
                     control = next_control;
                     cont = next_cont;
                 }
@@ -1815,6 +1857,9 @@ fn schedule_list_eval(
         ExprKind::Symbol(name) if name == "lambda" => {
             Ok((MachineControl::Value(eval_lambda(args, env)?), next))
         }
+        ExprKind::Symbol(name) if name == "case-lambda" => {
+            Ok((MachineControl::Value(eval_case_lambda(args, env)?), next))
+        }
         _ => Ok(schedule_application(head, args, env, pos, next)),
     }
 }
@@ -1912,12 +1957,12 @@ fn schedule_define(
             };
             let name = expect_symbol(name, "function name")?;
             let params = parse_parameters(params)?;
-            let procedure = Value::Procedure(Rc::new(LambdaProcedure {
-                name: Some(name.clone()),
+            let procedure = Value::Procedure(lambda_procedure(
+                Some(name.clone()),
                 params,
-                body: args[1..].to_vec(),
-                env: env.clone(),
-            }));
+                args[1..].to_vec(),
+                env.clone(),
+            ));
             Env::define(&env, name, procedure);
             Ok((MachineControl::Value(Value::Void), next))
         }
@@ -2004,15 +2049,15 @@ fn finish_let(
         }
         MachineLetMode::Named(name) => {
             let local_env = Env::child(env);
-            let procedure = Rc::new(LambdaProcedure {
-                name: Some(name.clone()),
-                params: Parameters {
+            let procedure = lambda_procedure(
+                Some(name.clone()),
+                Parameters {
                     required: names.to_vec(),
                     rest: None,
                 },
-                body: body.as_ref().to_vec(),
-                env: local_env.clone(),
-            });
+                body.as_ref().to_vec(),
+                local_env.clone(),
+            );
             Env::define(&local_env, name, Value::Procedure(procedure.clone()));
             Ok((
                 MachineControl::Apply {
@@ -2108,9 +2153,9 @@ fn resolve_tail_outcome(
                 args,
                 pos,
             } => {
-                let local_env =
+                let call =
                     bind_call_env(&procedure, &args).map_err(|err| err.with_position(pos))?;
-                outcome = eval_tail_sequence(&procedure.body, local_env, ctx)
+                outcome = eval_tail_sequence(call.body.as_ref(), call.env, ctx)
                     .map_err(|err| err.with_position(pos))?;
             }
         }
@@ -2208,6 +2253,7 @@ fn eval_list(
         ExprKind::Symbol(name) if name == "define-syntax" => eval_define_syntax(args, env, ctx),
         ExprKind::Symbol(name) if name == "set!" => eval_set(args, env, ctx),
         ExprKind::Symbol(name) if name == "lambda" => eval_lambda(args, env),
+        ExprKind::Symbol(name) if name == "case-lambda" => eval_case_lambda(args, env),
         _ => {
             let procedure = eval_expr(head, env.clone(), ctx)?;
             if matches!(
@@ -2289,6 +2335,9 @@ fn eval_tail_list(
         }
         ExprKind::Symbol(name) if name == "lambda" => {
             eval_lambda(args, env).map(TailOutcome::Value)
+        }
+        ExprKind::Symbol(name) if name == "case-lambda" => {
+            eval_case_lambda(args, env).map(TailOutcome::Value)
         }
         _ => {
             let procedure = eval_expr(head, env.clone(), ctx)?;
@@ -2425,15 +2474,15 @@ fn eval_let(
     match form.name {
         Some(name) => {
             let local_env = Env::child(env);
-            let procedure = Rc::new(LambdaProcedure {
-                name: Some(name.to_string()),
-                params: Parameters {
+            let procedure = lambda_procedure(
+                Some(name.to_string()),
+                Parameters {
                     required: names,
                     rest: None,
                 },
-                body: form.body.to_vec(),
-                env: local_env.clone(),
-            });
+                form.body.to_vec(),
+                local_env.clone(),
+            );
             Env::define(
                 &local_env,
                 name.to_string(),
@@ -2467,15 +2516,15 @@ fn eval_tail_let(
     match form.name {
         Some(name) => {
             let local_env = Env::child(env);
-            let procedure = Rc::new(LambdaProcedure {
-                name: Some(name.to_string()),
-                params: Parameters {
+            let procedure = lambda_procedure(
+                Some(name.to_string()),
+                Parameters {
                     required: names,
                     rest: None,
                 },
-                body: form.body.to_vec(),
-                env: local_env.clone(),
-            });
+                form.body.to_vec(),
+                local_env.clone(),
+            );
             Env::define(
                 &local_env,
                 name.to_string(),
@@ -2780,12 +2829,12 @@ fn eval_define(args: &[Expr], env: EnvRef, ctx: &mut EvalContext) -> Result<Valu
             };
             let name = expect_symbol(name, "function name")?;
             let params = parse_parameters(params)?;
-            let procedure = Value::Procedure(Rc::new(LambdaProcedure {
-                name: Some(name.clone()),
+            let procedure = Value::Procedure(lambda_procedure(
+                Some(name.clone()),
                 params,
-                body: args[1..].to_vec(),
-                env: env.clone(),
-            }));
+                args[1..].to_vec(),
+                env.clone(),
+            ));
 
             Env::define(&env, name, procedure);
             Ok(Value::Void)
@@ -2811,12 +2860,44 @@ fn eval_lambda(args: &[Expr], env: EnvRef) -> Result<Value, EvalError> {
     }
 
     let params = parse_parameter_list(params_expr)?;
-    Ok(Value::Procedure(Rc::new(LambdaProcedure {
-        name: None,
+    Ok(Value::Procedure(lambda_procedure(
+        None,
         params,
-        body: body.to_vec(),
+        body.to_vec(),
         env,
-    })))
+    )))
+}
+
+fn eval_case_lambda(args: &[Expr], env: EnvRef) -> Result<Value, EvalError> {
+    if args.is_empty() {
+        return Err(wrong_arg_count("case-lambda", "at least 1", args.len()));
+    }
+
+    let clauses = args
+        .iter()
+        .map(parse_case_lambda_clause)
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(Value::Procedure(case_lambda_procedure(None, clauses, env)))
+}
+
+fn parse_case_lambda_clause(expr: &Expr) -> Result<LambdaClause, EvalError> {
+    let ExprKind::List(items) = &expr.kind else {
+        return Err(EvalError::Syntax("case-lambda clause must be a list".into()));
+    };
+
+    let Some((params_expr, body)) = items.split_first() else {
+        return Err(EvalError::Syntax(
+            "case-lambda clause must include a parameter list".into(),
+        ));
+    };
+    if body.is_empty() {
+        return Err(EvalError::Syntax(
+            "case-lambda clause must include at least one body expression".into(),
+        ));
+    }
+
+    let params = parse_parameter_list(params_expr)?;
+    Ok(lambda_clause(params, body.to_vec()))
 }
 
 fn eval_set(args: &[Expr], env: EnvRef, ctx: &mut EvalContext) -> Result<Value, EvalError> {
@@ -3945,6 +4026,7 @@ fn lower_generated_list(
             Ok(Expr::new(ExprKind::List(vec![head, quoted]), pos))
         }
         Some("lambda") if items.len() >= 3 => lower_lambda_form(items, pos, state),
+        Some("case-lambda") if items.len() >= 2 => lower_case_lambda_form(items, pos, state),
         Some("let") if items.len() >= 3 => lower_let_form(items, pos, state),
         _ => {
             let lowered = items
@@ -3971,6 +4053,42 @@ fn lower_lambda_form(
         lowered.push(lower_macro_syntax_with_state(body_expr, false, state)?);
     }
     state.renamed_bindings.pop();
+
+    Ok(Expr::new(ExprKind::List(lowered), pos))
+}
+
+fn lower_case_lambda_form(
+    items: &[SyntaxExpr],
+    pos: SourcePos,
+    state: &mut HygieneState<'_>,
+) -> Result<Expr, EvalError> {
+    let head = lower_macro_syntax_with_state(&items[0], false, state)?;
+    let mut lowered = vec![head];
+
+    for clause in &items[1..] {
+        match &clause.kind {
+            SyntaxExprKind::Raw(expr) => lowered.push(expr.clone()),
+            SyntaxExprKind::List(parts) => {
+                let Some((params_syntax, body)) = parts.split_first() else {
+                    lowered.push(Expr::new(ExprKind::List(Vec::new()), clause.pos));
+                    continue;
+                };
+
+                let mut scope = HashMap::new();
+                let params = lower_binding_expr(params_syntax, state, &mut scope)?;
+                state.renamed_bindings.push(scope);
+
+                let mut lowered_clause = vec![params];
+                for body_expr in body {
+                    lowered_clause.push(lower_macro_syntax_with_state(body_expr, false, state)?);
+                }
+
+                state.renamed_bindings.pop();
+                lowered.push(Expr::new(ExprKind::List(lowered_clause), clause.pos));
+            }
+            _ => lowered.push(lower_macro_syntax_with_state(clause, false, state)?),
+        }
+    }
 
     Ok(Expr::new(ExprKind::List(lowered), pos))
 }
@@ -4111,6 +4229,7 @@ fn is_syntax_keyword(name: &str) -> bool {
             | "define-record-type"
             | "set!"
             | "lambda"
+            | "case-lambda"
             | "define-syntax"
             | "syntax-rules"
             | "syntax"
@@ -4570,38 +4689,58 @@ fn dispatch_builtin_call(
     }
 }
 
-fn bind_call_env(procedure: &Rc<LambdaProcedure>, args: &[Value]) -> Result<EnvRef, EvalError> {
-    let required = procedure.params.required.len();
+fn bind_call_env(
+    procedure: &Rc<LambdaProcedure>,
+    args: &[Value],
+) -> Result<BoundProcedureCall, EvalError> {
     let name = procedure.name.as_deref().unwrap_or("lambda");
 
-    match procedure.params.rest.as_ref() {
-        Some(rest) => {
-            if args.len() < required {
-                let expected = format!("at least {required}");
-                return Err(wrong_arg_count(name, &expected, args.len()));
-            }
+    let Some(clause) = procedure
+        .clauses
+        .iter()
+        .find(|clause| clause_matches_arity(clause, args.len()))
+    else {
+        let expected = format_expected_arities(procedure.clauses.as_ref());
+        return Err(wrong_arg_count(name, &expected, args.len()));
+    };
 
-            let local_env = bind_names(
-                procedure.env.clone(),
-                &procedure.params.required,
-                &args[..required],
-            );
-            Env::define(&local_env, rest.clone(), list_from_slice(&args[required..]));
-            Ok(local_env)
-        }
-        None => {
-            if args.len() != required {
-                let expected = format!("exactly {required}");
-                return Err(wrong_arg_count(name, &expected, args.len()));
-            }
+    Ok(BoundProcedureCall {
+        env: bind_clause_env(procedure.env.clone(), clause, args),
+        body: clause.body.clone(),
+    })
+}
 
-            Ok(bind_names(
-                procedure.env.clone(),
-                &procedure.params.required,
-                args,
-            ))
-        }
+fn clause_matches_arity(clause: &LambdaClause, arg_count: usize) -> bool {
+    let required = clause.params.required.len();
+    match clause.params.rest.as_ref() {
+        Some(_) => arg_count >= required,
+        None => arg_count == required,
     }
+}
+
+fn format_expected_arities(clauses: &[LambdaClause]) -> String {
+    clauses
+        .iter()
+        .map(format_clause_arity)
+        .collect::<Vec<_>>()
+        .join(" or ")
+}
+
+fn format_clause_arity(clause: &LambdaClause) -> String {
+    let required = clause.params.required.len();
+    match clause.params.rest.as_ref() {
+        Some(_) => format!("at least {required}"),
+        None => format!("exactly {required}"),
+    }
+}
+
+fn bind_clause_env(parent: EnvRef, clause: &LambdaClause, args: &[Value]) -> EnvRef {
+    let required = clause.params.required.len();
+    let local_env = bind_names(parent, &clause.params.required, &args[..required]);
+    if let Some(rest) = clause.params.rest.as_ref() {
+        Env::define(&local_env, rest.clone(), list_from_slice(&args[required..]));
+    }
+    local_env
 }
 
 fn bind_names(parent: EnvRef, names: &[String], values: &[Value]) -> EnvRef {
@@ -5227,6 +5366,15 @@ fn apply_builtin(
         Builtin::SymbolPred => {
             unary_predicate(name, args, |value| matches!(value, Value::Symbol(_)))
         }
+        Builtin::ProcedurePred => unary_predicate(name, args, |value| {
+            matches!(
+                value,
+                Value::Builtin(_)
+                    | Value::Procedure(_)
+                    | Value::NativeProcedure(_)
+                    | Value::Continuation(_)
+            )
+        }),
     }
 }
 
