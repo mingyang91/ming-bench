@@ -48,6 +48,21 @@ pub enum EvalError {
     #[error("division by zero at {pos}")]
     DivisionByZero { pos: SourcePos },
 
+    #[error("index out of bounds at {pos}: index {index}, length {len}")]
+    IndexOutOfBounds {
+        pos: SourcePos,
+        index: i64,
+        len: usize,
+    },
+
+    #[error("invalid range at {pos}: start {start}, end {end}, length {len}")]
+    InvalidRange {
+        pos: SourcePos,
+        start: i64,
+        end: i64,
+        len: usize,
+    },
+
     #[error("cannot call non-function at {pos}: {found}")]
     NotCallable { pos: SourcePos, found: &'static str },
 }
