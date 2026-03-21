@@ -143,6 +143,9 @@ fn eval_special_form(
         "letrec" => eval_letrec(args, span, env).map(Some),
         "letrec*" => eval_letrec_star(args, span, env).map(Some),
         "case" => eval_case(args, span, env).map(Some),
+        "dynamic-wind" => eval_dynamic_wind(args, span, env)
+            .map(Bounce::Done)
+            .map(Some),
         _ => Ok(None),
     }
 }
@@ -510,6 +513,48 @@ fn eval_callcc_with_proc(proc: Value, span: Span, env: &Env) -> Result<Value, Ev
     }
 }
 
+/// Call a zero-argument thunk (lambda) and return its result.
+fn call_thunk(thunk: &Value, span: Span) -> Result<Value, EvalError> {
+    match apply_lambda_values(thunk.clone(), &[], span)? {
+        Bounce::Done(val) => Ok(val),
+        Bounce::Tco(expr, env) => eval(&expr, &env),
+    }
+}
+
+/// Evaluate `(dynamic-wind in-thunk body-thunk out-thunk)`.
+fn eval_dynamic_wind(args: &[Expr], span: Span, env: &Env) -> Result<Value, EvalError> {
+    let [ref in_expr, ref body_expr, ref out_expr] = args else {
+        return Err(EvalError::WrongArgCount { expected: 3, got: args.len() }.at(span));
+    };
+    let in_thunk = eval(in_expr, env)?;
+    let body_thunk = eval(body_expr, env)?;
+    let out_thunk = eval(out_expr, env)?;
+
+    // Run in-thunk
+    call_thunk(&in_thunk, span)?;
+
+    // Run body-thunk, catching continuation escapes
+    let body_result = call_thunk(&body_thunk, span);
+
+    match body_result {
+        Ok(val) => {
+            // Normal return: run out-thunk, return body value
+            call_thunk(&out_thunk, span)?;
+            Ok(val)
+        }
+        Err(EvalError::ContinuationReturn { cont_id, value, expr_index }) => {
+            // Non-local exit: run out-thunk, then re-throw
+            call_thunk(&out_thunk, span)?;
+            Err(EvalError::ContinuationReturn { cont_id, value, expr_index })
+        }
+        Err(e) => {
+            // Other errors: run out-thunk, propagate error
+            call_thunk(&out_thunk, span)?;
+            Err(e)
+        }
+    }
+}
+
 fn wrap_body(body: &[Expr], span: Span) -> Expr {
     if body.len() == 1 {
         body[0].clone()
@@ -737,6 +782,15 @@ fn apply_list_builtin(name: &str, args: &[Value]) -> Result<Value, EvalError> {
             });
             Ok(found.cloned().unwrap_or(Value::Boolean(false)))
         }
+        "reverse" => {
+            let [arg] = args else {
+                return Err(EvalError::WrongArgCount { expected: 1, got: args.len() });
+            };
+            let Value::List(items) = arg else {
+                return Err(EvalError::TypeError { expected: "list".into(), got: format!("{arg}") });
+            };
+            Ok(Value::List(items.iter().rev().cloned().collect()))
+        }
         _ => unreachable!("not a list builtin: {name}"),
     }
 }
@@ -747,7 +801,7 @@ fn apply_builtin_values(name: &str, args: &[Value]) -> Result<Value, EvalError> 
         "+" | "-" | "*" | "/" | "abs" | "modulo" | "remainder" | "quotient"
         | "min" | "max" | "expt" => apply_arithmetic_builtin(name, args),
         "cons" | "car" | "cdr" | "null?" | "list" | "length"
-        | "list-ref" | "list-tail" | "list?" | "assoc" => apply_list_builtin(name, args),
+        | "list-ref" | "list-tail" | "list?" | "assoc" | "reverse" => apply_list_builtin(name, args),
         "<" => eval_cmp_values(args, |a, b| a < b),
         ">" => eval_cmp_values(args, |a, b| a > b),
         "=" => eval_cmp_values(args, |a, b| a == b),
@@ -949,7 +1003,7 @@ fn is_builtin(name: &str) -> bool {
             | "abs" | "modulo" | "remainder" | "quotient"
             | "min" | "max" | "expt"
             | "zero?" | "positive?" | "negative?" | "odd?" | "even?"
-            | "list-ref" | "list-tail" | "list?" | "assoc" | "map"
+            | "list-ref" | "list-tail" | "list?" | "assoc" | "map" | "reverse"
             | "char-alphabetic?" | "char-numeric?"
             | "char-upcase" | "char-downcase"
             | "char=?" | "char<?"
@@ -979,6 +1033,7 @@ fn eval_builtin(op: &str, args: &[Expr], env: &Env) -> Result<Value, EvalError> 
         "null?" => eval_null(args, env),
         "list" => eval_list_builtin(args, env),
         "length" => eval_length(args, env),
+        "reverse" => eval_reverse(args, env),
         "string?" => eval_type_pred(args, env, |v| matches!(v, Value::String(_))),
         "number?" => eval_type_pred(args, env, |v| matches!(v, Value::Integer(_))),
         "boolean?" => eval_type_pred(args, env, |v| matches!(v, Value::Boolean(_))),
@@ -1403,6 +1458,17 @@ fn eval_length(args: &[Expr], env: &Env) -> Result<Value, EvalError> {
         });
     };
     Ok(Value::Integer(items.len() as i64))
+}
+
+fn eval_reverse(args: &[Expr], env: &Env) -> Result<Value, EvalError> {
+    let [ref arg] = args else {
+        return Err(EvalError::WrongArgCount { expected: 1, got: args.len() });
+    };
+    let val = eval(arg, env)?;
+    let Value::List(items) = val else {
+        return Err(EvalError::TypeError { expected: "list".into(), got: format!("{val}") });
+    };
+    Ok(Value::List(items.into_iter().rev().collect()))
 }
 
 fn eval_type_pred(
