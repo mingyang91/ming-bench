@@ -25,6 +25,7 @@ enum Value {
     Boolean(bool),
     Str(String),
     Symbol(String),
+    Char(char),
     List(Vec<Value>),
     Lambda {
         params: Vec<String>,
@@ -71,6 +72,7 @@ impl Value {
             Value::Boolean(false) => "#f".to_string(),
             Value::Str(s) => format!("\"{}\"", s),
             Value::Symbol(s) => s.clone(),
+            Value::Char(c) => format!("#\\{}", c),
             Value::Lambda { .. } => "#<procedure>".to_string(),
             Value::List(elems) => {
                 let inner: Vec<String> = elems.iter().map(|v| v.display()).collect();
@@ -313,7 +315,7 @@ pub fn eval_str(input: &str) -> Result<String, EvalError> {
 
 fn eval(expr: Value, env: &Env, pos: Pos) -> Result<Value, EvalError> {
     match expr {
-        Value::Integer(_) | Value::Boolean(_) | Value::Str(_) | Value::Lambda { .. } => Ok(expr),
+        Value::Integer(_) | Value::Boolean(_) | Value::Str(_) | Value::Char(_) | Value::Lambda { .. } => Ok(expr),
         Value::Symbol(s) => {
             env_get(env, &s).ok_or_else(|| runtime_err(pos, format!("unbound symbol: {}", s)))
         }
@@ -776,6 +778,97 @@ fn apply_builtin_vals(op: &str, vals: &[Value], pos: Pos) -> Result<Value, EvalE
             }
             output_write("\n");
             Ok(Value::Boolean(false))
+        }
+        "string-append" => {
+            let mut result = String::new();
+            for v in vals {
+                match v {
+                    Value::Str(s) => result.push_str(s),
+                    _ => return Err(runtime_err(pos, "string-append: expected string")),
+                }
+            }
+            Ok(Value::Str(result))
+        }
+        "string-length" => {
+            if vals.len() != 1 {
+                return Err(runtime_err(pos, "string-length requires 1 argument"));
+            }
+            match &vals[0] {
+                Value::Str(s) => Ok(Value::Integer(s.len() as i64)),
+                _ => Err(runtime_err(pos, "string-length: expected string")),
+            }
+        }
+        "substring" => {
+            if vals.len() != 3 {
+                return Err(runtime_err(pos, "substring requires 3 arguments"));
+            }
+            let s = match &vals[0] {
+                Value::Str(s) => s,
+                _ => return Err(runtime_err(pos, "substring: expected string")),
+            };
+            let start = expect_int(&vals[1], pos)? as usize;
+            let end = expect_int(&vals[2], pos)? as usize;
+            if start > end || end > s.len() {
+                return Err(runtime_err(pos, "substring: index out of bounds"));
+            }
+            Ok(Value::Str(s[start..end].to_string()))
+        }
+        "string->number" => {
+            if vals.len() != 1 {
+                return Err(runtime_err(pos, "string->number requires 1 argument"));
+            }
+            match &vals[0] {
+                Value::Str(s) => match s.parse::<i64>() {
+                    Ok(n) => Ok(Value::Integer(n)),
+                    Err(_) => Ok(Value::Boolean(false)),
+                },
+                _ => Err(runtime_err(pos, "string->number: expected string")),
+            }
+        }
+        "number->string" => {
+            if vals.len() != 1 {
+                return Err(runtime_err(pos, "number->string requires 1 argument"));
+            }
+            let n = expect_int(&vals[0], pos)?;
+            Ok(Value::Str(n.to_string()))
+        }
+        "symbol->string" => {
+            if vals.len() != 1 {
+                return Err(runtime_err(pos, "symbol->string requires 1 argument"));
+            }
+            match &vals[0] {
+                Value::Symbol(s) => Ok(Value::Str(s.clone())),
+                _ => Err(runtime_err(pos, "symbol->string: expected symbol")),
+            }
+        }
+        "string->symbol" => {
+            if vals.len() != 1 {
+                return Err(runtime_err(pos, "string->symbol requires 1 argument"));
+            }
+            match &vals[0] {
+                Value::Str(s) => Ok(Value::Symbol(s.clone())),
+                _ => Err(runtime_err(pos, "string->symbol: expected string")),
+            }
+        }
+        "string-ref" => {
+            if vals.len() != 2 {
+                return Err(runtime_err(pos, "string-ref requires 2 arguments"));
+            }
+            let s = match &vals[0] {
+                Value::Str(s) => s,
+                _ => return Err(runtime_err(pos, "string-ref: expected string")),
+            };
+            let idx = expect_int(&vals[1], pos)? as usize;
+            if idx >= s.len() {
+                return Err(runtime_err(pos, "string-ref: index out of bounds"));
+            }
+            Ok(Value::Char(s.chars().nth(idx).unwrap()))
+        }
+        "char?" => {
+            if vals.len() != 1 {
+                return Err(runtime_err(pos, "char? requires 1 argument"));
+            }
+            Ok(Value::Boolean(matches!(&vals[0], Value::Char(_))))
         }
         _ => Err(runtime_err(pos, format!("unknown procedure: {}", op))),
     }
