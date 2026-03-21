@@ -400,48 +400,299 @@ fn parse_all(input: &str) -> Result<Vec<Expr>, EvalError> {
 // ---------- Evaluator ----------
 
 fn eval(expr: &Expr, env: &Env, out: &Output) -> Result<Val, EvalError> {
-    let p = expr.pos;
-    match &expr.kind {
-        ExprKind::Int(n) => Ok(Val::Int(*n)),
-        ExprKind::Bool(b) => Ok(Val::Bool(*b)),
-        ExprKind::Str(s) => Ok(Val::Str(s.clone())),
-        ExprKind::Char(c) => Ok(Val::Char(*c)),
-        ExprKind::Symbol(name) => {
-            env_get(env, name).ok_or_else(|| EvalError::UnboundVariable {
-                name: name.clone(),
-                pos: p,
-            })
-        }
-        ExprKind::List(elems) => {
-            if elems.is_empty() {
-                return Ok(Val::List(vec![]));
-            }
+    let mut cur_expr = expr.clone();
+    let mut cur_env = env.clone();
 
-            // Check for special forms
-            if let ExprKind::Symbol(op) = &elems[0].kind {
-                match op.as_str() {
-                    "if" => return eval_if(&elems[1..], env, p, out),
-                    "define" => return eval_define(&elems[1..], env, p, out),
-                    "quote" => return eval_quote(&elems[1..], p),
-                    "lambda" => return eval_lambda(&elems[1..], env, p),
-                    "and" => return eval_and(&elems[1..], env, out),
-                    "or" => return eval_or(&elems[1..], env, out),
-                    "let" => return eval_let(&elems[1..], env, p, out),
-                    "begin" => return eval_begin(&elems[1..], env, out),
-                    "cond" => return eval_cond(&elems[1..], env, p, out),
-                    "string-set!" => return eval_string_set(&elems[1..], env, p, out),
-                    _ => {}
+    loop {
+        let p = cur_expr.pos;
+        match &cur_expr.kind {
+            ExprKind::Int(n) => return Ok(Val::Int(*n)),
+            ExprKind::Bool(b) => return Ok(Val::Bool(*b)),
+            ExprKind::Str(s) => return Ok(Val::Str(s.clone())),
+            ExprKind::Char(c) => return Ok(Val::Char(*c)),
+            ExprKind::Symbol(name) => {
+                return env_get(&cur_env, name).ok_or_else(|| EvalError::UnboundVariable {
+                    name: name.clone(),
+                    pos: p,
+                });
+            }
+            ExprKind::List(elems) => {
+                if elems.is_empty() {
+                    return Ok(Val::List(vec![]));
+                }
+
+                // Check for special forms
+                if let ExprKind::Symbol(op) = &elems[0].kind {
+                    match op.as_str() {
+                        "if" => {
+                            let args = &elems[1..];
+                            if args.len() < 2 || args.len() > 3 {
+                                return Err(EvalError::Arity {
+                                    msg: "if requires 2 or 3 arguments".into(),
+                                    pos: p,
+                                });
+                            }
+                            let cond = eval(&args[0], &cur_env, out)?;
+                            if cond.is_truthy() {
+                                cur_expr = args[1].clone();
+                                continue;
+                            } else if args.len() == 3 {
+                                cur_expr = args[2].clone();
+                                continue;
+                            } else {
+                                return Ok(Val::Void);
+                            }
+                        }
+                        "define" => return eval_define(&elems[1..], &cur_env, p, out),
+                        "quote" => return eval_quote(&elems[1..], p),
+                        "lambda" => return eval_lambda(&elems[1..], &cur_env, p),
+                        "and" => {
+                            let args = &elems[1..];
+                            if args.is_empty() {
+                                return Ok(Val::Bool(true));
+                            }
+                            for expr in &args[..args.len() - 1] {
+                                let result = eval(expr, &cur_env, out)?;
+                                if !result.is_truthy() {
+                                    return Ok(result);
+                                }
+                            }
+                            cur_expr = args[args.len() - 1].clone();
+                            continue;
+                        }
+                        "or" => {
+                            let args = &elems[1..];
+                            if args.is_empty() {
+                                return Ok(Val::Bool(false));
+                            }
+                            for expr in &args[..args.len() - 1] {
+                                let result = eval(expr, &cur_env, out)?;
+                                if result.is_truthy() {
+                                    return Ok(result);
+                                }
+                            }
+                            cur_expr = args[args.len() - 1].clone();
+                            continue;
+                        }
+                        "let" => {
+                            let args = &elems[1..];
+                            if args.len() < 2 {
+                                return Err(EvalError::Arity {
+                                    msg: "let requires bindings and body".into(),
+                                    pos: p,
+                                });
+                            }
+                            // Named let: (let name ((var init) ...) body...)
+                            if let ExprKind::Symbol(name) = &args[0].kind {
+                                let name = name.clone();
+                                if args.len() < 3 {
+                                    return Err(EvalError::Arity {
+                                        msg: "named let requires bindings and body".into(),
+                                        pos: p,
+                                    });
+                                }
+                                let bindings_expr = match &args[1].kind {
+                                    ExprKind::List(b) => b,
+                                    _ => return Err(EvalError::Parse {
+                                        msg: "let: expected bindings list".into(),
+                                        pos: p,
+                                    }),
+                                };
+                                let mut param_names = Vec::new();
+                                let mut init_vals = Vec::new();
+                                for binding in bindings_expr {
+                                    match &binding.kind {
+                                        ExprKind::List(pair) if pair.len() == 2 => {
+                                            let pname = match &pair[0].kind {
+                                                ExprKind::Symbol(s) => s.clone(),
+                                                _ => return Err(EvalError::Parse {
+                                                    msg: "let: expected symbol".into(),
+                                                    pos: pair[0].pos,
+                                                }),
+                                            };
+                                            let val = eval(&pair[1], &cur_env, out)?;
+                                            param_names.push(pname);
+                                            init_vals.push(val);
+                                        }
+                                        _ => return Err(EvalError::Parse {
+                                            msg: "let: invalid binding".into(),
+                                            pos: binding.pos,
+                                        }),
+                                    }
+                                }
+                                let body = args[2..].to_vec();
+                                // Create env where the named function closes over itself
+                                let fn_env = new_env(Some(cur_env.clone()));
+                                let lambda = Val::Lambda {
+                                    params: param_names.clone(),
+                                    body: body.clone(),
+                                    env: fn_env.clone(),
+                                };
+                                env_set(&fn_env, name, lambda);
+
+                                // Set up call env with initial bindings
+                                let call_env = new_env(Some(fn_env));
+                                for (pn, val) in param_names.iter().zip(init_vals.iter()) {
+                                    env_set(&call_env, pn.clone(), val.clone());
+                                }
+
+                                for expr in &body[..body.len() - 1] {
+                                    eval(expr, &call_env, out)?;
+                                }
+                                cur_expr = body[body.len() - 1].clone();
+                                cur_env = call_env;
+                                continue;
+                            }
+                            let bindings = match &args[0].kind {
+                                ExprKind::List(b) => b,
+                                _ => {
+                                    return Err(EvalError::Parse {
+                                        msg: "let: expected bindings list".into(),
+                                        pos: p,
+                                    })
+                                }
+                            };
+                            let local_env = new_env(Some(cur_env.clone()));
+                            for binding in bindings {
+                                match &binding.kind {
+                                    ExprKind::List(pair) if pair.len() == 2 => {
+                                        let bname = match &pair[0].kind {
+                                            ExprKind::Symbol(s) => s.clone(),
+                                            _ => {
+                                                return Err(EvalError::Parse {
+                                                    msg: "let: expected symbol".into(),
+                                                    pos: pair[0].pos,
+                                                })
+                                            }
+                                        };
+                                        let val = eval(&pair[1], &cur_env, out)?;
+                                        env_set(&local_env, bname, val);
+                                    }
+                                    _ => {
+                                        return Err(EvalError::Parse {
+                                            msg: "let: invalid binding".into(),
+                                            pos: binding.pos,
+                                        })
+                                    }
+                                }
+                            }
+                            let body = &args[1..];
+                            for expr in &body[..body.len() - 1] {
+                                eval(expr, &local_env, out)?;
+                            }
+                            cur_expr = body[body.len() - 1].clone();
+                            cur_env = local_env;
+                            continue;
+                        }
+                        "begin" => {
+                            let args = &elems[1..];
+                            if args.is_empty() {
+                                return Ok(Val::Void);
+                            }
+                            for expr in &args[..args.len() - 1] {
+                                eval(expr, &cur_env, out)?;
+                            }
+                            cur_expr = args[args.len() - 1].clone();
+                            continue;
+                        }
+                        "cond" => {
+                            let clauses = &elems[1..];
+                            let mut found = false;
+                            for clause in clauses {
+                                let parts = match &clause.kind {
+                                    ExprKind::List(p) => p,
+                                    _ => {
+                                        return Err(EvalError::Parse {
+                                            msg: "cond: expected clause list".into(),
+                                            pos: clause.pos,
+                                        })
+                                    }
+                                };
+                                if parts.is_empty() {
+                                    return Err(EvalError::Parse {
+                                        msg: "cond: empty clause".into(),
+                                        pos: clause.pos,
+                                    });
+                                }
+                                if let ExprKind::Symbol(s) = &parts[0].kind {
+                                    if s == "else" {
+                                        for expr in &parts[1..parts.len() - 1] {
+                                            eval(expr, &cur_env, out)?;
+                                        }
+                                        if parts.len() > 1 {
+                                            cur_expr = parts[parts.len() - 1].clone();
+                                        } else {
+                                            return Ok(Val::Void);
+                                        }
+                                        found = true;
+                                        break;
+                                    }
+                                }
+                                let test = eval(&parts[0], &cur_env, out)?;
+                                if test.is_truthy() {
+                                    if parts.len() == 1 {
+                                        return Ok(test);
+                                    }
+                                    for expr in &parts[1..parts.len() - 1] {
+                                        eval(expr, &cur_env, out)?;
+                                    }
+                                    cur_expr = parts[parts.len() - 1].clone();
+                                    found = true;
+                                    break;
+                                }
+                            }
+                            if found {
+                                continue;
+                            }
+                            return Ok(Val::Void);
+                        }
+                        "string-set!" => return eval_string_set(&elems[1..], &cur_env, p, out),
+                        _ => {}
+                    }
+                }
+
+                // Function call
+                let func = eval(&elems[0], &cur_env, out)?;
+                let args: Vec<Val> = elems[1..]
+                    .iter()
+                    .map(|e| eval(e, &cur_env, out))
+                    .collect::<Result<Vec<_>, _>>()?;
+
+                match func {
+                    Val::Builtin(name) => return apply_builtin(&name, &args, p, out),
+                    Val::Lambda {
+                        params,
+                        body,
+                        env: closure_env,
+                    } => {
+                        if args.len() != params.len() {
+                            return Err(EvalError::Arity {
+                                msg: format!("expected {} arguments, got {}", params.len(), args.len()),
+                                pos: p,
+                            });
+                        }
+                        let local_env = new_env(Some(closure_env.clone()));
+                        for (param, arg) in params.iter().zip(args.iter()) {
+                            env_set(&local_env, param.clone(), arg.clone());
+                        }
+                        for expr in &body[..body.len().saturating_sub(1)] {
+                            eval(expr, &local_env, out)?;
+                        }
+                        if body.is_empty() {
+                            return Ok(Val::Void);
+                        }
+                        cur_expr = body[body.len() - 1].clone();
+                        cur_env = local_env;
+                        continue;
+                    }
+                    _ => {
+                        return Err(EvalError::Type {
+                            msg: format!("not a procedure: {}", func),
+                            pos: p,
+                        });
+                    }
                 }
             }
-
-            // Function call
-            let func = eval(&elems[0], env, out)?;
-            let args: Vec<Val> = elems[1..]
-                .iter()
-                .map(|e| eval(e, env, out))
-                .collect::<Result<Vec<_>, _>>()?;
-
-            apply(&func, &args, p, out)
         }
     }
 }
@@ -474,23 +725,6 @@ fn apply(func: &Val, args: &[Val], pos: Pos, out: &Output) -> Result<Val, EvalEr
             msg: format!("not a procedure: {}", func),
             pos,
         }),
-    }
-}
-
-fn eval_if(args: &[Expr], env: &Env, pos: Pos, out: &Output) -> Result<Val, EvalError> {
-    if args.len() < 2 || args.len() > 3 {
-        return Err(EvalError::Arity {
-            msg: "if requires 2 or 3 arguments".into(),
-            pos,
-        });
-    }
-    let cond = eval(&args[0], env, out)?;
-    if cond.is_truthy() {
-        eval(&args[1], env, out)
-    } else if args.len() == 3 {
-        eval(&args[2], env, out)
-    } else {
-        Ok(Val::Void)
     }
 }
 
@@ -619,144 +853,11 @@ fn eval_lambda(args: &[Expr], env: &Env, pos: Pos) -> Result<Val, EvalError> {
     })
 }
 
-fn eval_and(exprs: &[Expr], env: &Env, out: &Output) -> Result<Val, EvalError> {
-    if exprs.is_empty() {
-        return Ok(Val::Bool(true));
-    }
-    let mut result = Val::Bool(true);
-    for expr in exprs {
-        result = eval(expr, env, out)?;
-        if !result.is_truthy() {
-            return Ok(result);
-        }
-    }
-    Ok(result)
-}
-
-fn eval_or(exprs: &[Expr], env: &Env, out: &Output) -> Result<Val, EvalError> {
-    if exprs.is_empty() {
-        return Ok(Val::Bool(false));
-    }
-    for expr in exprs {
-        let result = eval(expr, env, out)?;
-        if result.is_truthy() {
-            return Ok(result);
-        }
-    }
-    Ok(Val::Bool(false))
-}
-
-fn eval_let(args: &[Expr], env: &Env, pos: Pos, out: &Output) -> Result<Val, EvalError> {
-    if args.len() < 2 {
-        return Err(EvalError::Arity {
-            msg: "let requires bindings and body".into(),
-            pos,
-        });
-    }
-    let bindings = match &args[0].kind {
-        ExprKind::List(b) => b,
-        _ => {
-            return Err(EvalError::Parse {
-                msg: "let: expected bindings list".into(),
-                pos,
-            })
-        }
-    };
-    let local_env = new_env(Some(env.clone()));
-    for binding in bindings {
-        match &binding.kind {
-            ExprKind::List(pair) if pair.len() == 2 => {
-                let name = match &pair[0].kind {
-                    ExprKind::Symbol(s) => s.clone(),
-                    _ => {
-                        return Err(EvalError::Parse {
-                            msg: "let: expected symbol".into(),
-                            pos: pair[0].pos,
-                        })
-                    }
-                };
-                let val = eval(&pair[1], env, out)?;
-                env_set(&local_env, name, val);
-            }
-            _ => {
-                return Err(EvalError::Parse {
-                    msg: "let: invalid binding".into(),
-                    pos: binding.pos,
-                })
-            }
-        }
-    }
-    let mut result = Val::Void;
-    for expr in &args[1..] {
-        result = eval(expr, &local_env, out)?;
-    }
-    Ok(result)
-}
-
-fn eval_begin(args: &[Expr], env: &Env, out: &Output) -> Result<Val, EvalError> {
-    let mut result = Val::Void;
-    for expr in args {
-        result = eval(expr, env, out)?;
-    }
-    Ok(result)
-}
-
-fn eval_cond(clauses: &[Expr], env: &Env, pos: Pos, out: &Output) -> Result<Val, EvalError> {
-    for clause in clauses {
-        let parts = match &clause.kind {
-            ExprKind::List(p) => p,
-            _ => {
-                return Err(EvalError::Parse {
-                    msg: "cond: expected clause list".into(),
-                    pos: clause.pos,
-                })
-            }
-        };
-        if parts.is_empty() {
-            return Err(EvalError::Parse {
-                msg: "cond: empty clause".into(),
-                pos: clause.pos,
-            });
-        }
-        // Check for else clause
-        if let ExprKind::Symbol(s) = &parts[0].kind {
-            if s == "else" {
-                let mut result = Val::Void;
-                for expr in &parts[1..] {
-                    result = eval(expr, env, out)?;
-                }
-                return Ok(result);
-            }
-        }
-        let test = eval(&parts[0], env, out)?;
-        if test.is_truthy() {
-            let mut result = test;
-            for expr in &parts[1..] {
-                result = eval(expr, env, out)?;
-            }
-            return Ok(result);
-        }
-    }
-    Ok(Val::Void)
-}
-
 fn eval_string_set(_args: &[Expr], _env: &Env, pos: Pos, _out: &Output) -> Result<Val, EvalError> {
     Err(EvalError::Runtime {
         msg: "string-set!: strings are immutable".into(),
         pos,
     })
-}
-
-fn env_set_existing(env: &Env, name: &str, val: Val) {
-    let has_key = env.borrow().bindings.contains_key(name);
-    if has_key {
-        env.borrow_mut().bindings.insert(name.to_string(), val);
-        return;
-    }
-    let parent = env.borrow().parent.clone();
-    if let Some(parent) = parent {
-        env_set_existing(&parent, name, val);
-    }
 }
 
 fn apply_builtin(name: &str, args: &[Val], pos: Pos, out: &Output) -> Result<Val, EvalError> {
