@@ -11,4 +11,6 @@ pub enum EvalError {
     Arity(String),
     #[error("division by zero {0}")]
     DivisionByZero(String),
+    #[error("continuation invoked")]
+    ContinuationReturn,
 }

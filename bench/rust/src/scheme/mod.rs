@@ -2,9 +2,15 @@ pub mod error;
 
 pub use error::EvalError;
 
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
 use std::rc::Rc;
+
+thread_local! {
+    static CALLCC_PENDING: RefCell<Option<Value>> = RefCell::new(None);
+    static CALLCC_TOP_IDX: Cell<usize> = Cell::new(0);
+    static CONT_RETURN: RefCell<Option<(usize, Value)>> = RefCell::new(None);
+}
 
 /// Source position (1-indexed line, 0-indexed column).
 #[derive(Debug, Clone, Copy)]
@@ -36,6 +42,7 @@ enum Value {
         env: Env,
     },
     Builtin(String),
+    Continuation(usize),
 }
 
 impl Value {
@@ -91,6 +98,7 @@ impl Value {
             }
             Value::Lambda { .. } => "<procedure>".to_string(),
             Value::Builtin(name) => format!("<builtin:{}>", name),
+            Value::Continuation(_) => "<continuation>".to_string(),
         }
     }
 
@@ -108,7 +116,7 @@ impl Value {
                 | "string-append" | "string-length" | "substring"
                 | "string->number" | "number->string" | "symbol->string" | "string->symbol"
                 | "string-copy" | "string-ref" | "string-set!"
-                | "apply"
+                | "apply" | "call/cc"
         )
     }
 
@@ -712,6 +720,15 @@ fn eval(expr: &Expr, env: &Env, out: &mut String) -> Result<Value, EvalError> {
                                 out,
                             );
                         }
+                        "call/cc" | "call-with-current-continuation" => {
+                            if items.len() != 2 {
+                                break 'tco Err(EvalError::Arity(format!(
+                                    "call/cc requires 1 argument at {}",
+                                    pos.fmt()
+                                )));
+                            }
+                            break 'tco do_callcc(&items[1], pos, &cur_env, out);
+                        }
                         _ => {}
                     }
                 }
@@ -743,7 +760,35 @@ fn eval(expr: &Expr, env: &Env, out: &mut String) -> Result<Value, EvalError> {
                     eval(&items[0], &cur_env, out)?
                 };
                 match func {
+                    Value::Continuation(idx) => {
+                        if args.len() != 1 {
+                            break 'tco Err(EvalError::Arity(format!(
+                                "continuation requires 1 argument at {}",
+                                pos.fmt()
+                            )));
+                        }
+                        CONT_RETURN.with(|cr| {
+                            *cr.borrow_mut() = Some((idx, args.into_iter().next().unwrap()));
+                        });
+                        break 'tco Err(EvalError::ContinuationReturn);
+                    }
                     Value::Builtin(ref bname) => {
+                        if bname == "call/cc" {
+                            if args.len() != 1 {
+                                break 'tco Err(EvalError::Arity(format!(
+                                    "call/cc requires 1 argument at {}",
+                                    pos.fmt()
+                                )));
+                            }
+                            let pending = CALLCC_PENDING.with(|p| p.borrow_mut().take());
+                            if let Some(val) = pending {
+                                break 'tco Ok(val);
+                            }
+                            let start_idx = CALLCC_TOP_IDX.with(|c| c.get());
+                            let k = Value::Continuation(start_idx);
+                            let proc = args.into_iter().next().unwrap();
+                            break 'tco apply_func(proc, vec![k], pos, &cur_env, out);
+                        }
                         if bname == "apply" {
                             break 'tco call_apply(&args, pos, &cur_env, out);
                         }
@@ -942,7 +987,85 @@ fn eval_lambda(args: &[Expr], pos: Pos, env: &Env) -> Result<Value, EvalError> {
     }
 }
 
+/// Perform call/cc: check for pending return, otherwise create continuation and call proc.
+fn do_callcc(proc_expr: &Expr, pos: Pos, env: &Env, out: &mut String) -> Result<Value, EvalError> {
+    let pending = CALLCC_PENDING.with(|p| p.borrow_mut().take());
+    if let Some(val) = pending {
+        return Ok(val);
+    }
+    let proc = eval(proc_expr, env, out)?;
+    let start_idx = CALLCC_TOP_IDX.with(|c| c.get());
+    let k = Value::Continuation(start_idx);
+    apply_func(proc, vec![k], pos, env, out)
+}
 
+/// Apply a function value to arguments (non-TCO, used by call/cc).
+fn apply_func(func: Value, args: Vec<Value>, pos: Pos, env: &Env, out: &mut String) -> Result<Value, EvalError> {
+    match func {
+        Value::Lambda {
+            params,
+            rest_param,
+            body,
+            env: closure_env,
+        } => {
+            let new_env = Env::with_parent(&closure_env);
+            env.copy_all_into_if_absent(&new_env);
+            if let Some(ref rp) = rest_param {
+                if args.len() < params.len() {
+                    return Err(EvalError::Arity(format!(
+                        "expected at least {} arguments, got {} at {}",
+                        params.len(),
+                        args.len(),
+                        pos.fmt()
+                    )));
+                }
+                for (p, a) in params.iter().zip(args.iter()) {
+                    new_env.set(p.clone(), a.clone());
+                }
+                let mut rest = Value::Nil;
+                for a in args[params.len()..].iter().rev() {
+                    rest = Value::Pair(Box::new(a.clone()), Box::new(rest));
+                }
+                new_env.set(rp.clone(), rest);
+            } else {
+                if params.len() != args.len() {
+                    return Err(EvalError::Arity(format!(
+                        "expected {} arguments, got {} at {}",
+                        params.len(),
+                        args.len(),
+                        pos.fmt()
+                    )));
+                }
+                for (p, a) in params.iter().zip(args.into_iter()) {
+                    new_env.set(p.clone(), a);
+                }
+            }
+            if body.is_empty() {
+                return Ok(Value::Nil);
+            }
+            for e in &body[..body.len() - 1] {
+                eval(e, &new_env, out)?;
+            }
+            eval(body.last().unwrap(), &new_env, out)
+        }
+        Value::Continuation(idx) => {
+            if args.len() != 1 {
+                return Err(EvalError::Arity(format!(
+                    "continuation requires 1 argument at {}",
+                    pos.fmt()
+                )));
+            }
+            CONT_RETURN.with(|cr| {
+                *cr.borrow_mut() = Some((idx, args.into_iter().next().unwrap()));
+            });
+            Err(EvalError::ContinuationReturn)
+        }
+        _ => Err(EvalError::Type(format!(
+            "call/cc: argument must be a procedure at {}",
+            pos.fmt()
+        ))),
+    }
+}
 
 /// Parse parameter list, handling dot notation for rest params.
 /// e.g. [x, y, ., rest] -> (vec!["x", "y"], Some("rest"))
@@ -1022,6 +1145,18 @@ fn call_apply(args: &[Value], pos: Pos, env: &Env, out: &mut String) -> Result<V
     call_args.extend(tail);
 
     match func {
+        Value::Continuation(idx) => {
+            if call_args.len() != 1 {
+                return Err(EvalError::Arity(format!(
+                    "continuation requires 1 argument at {}",
+                    pos.fmt()
+                )));
+            }
+            CONT_RETURN.with(|cr| {
+                *cr.borrow_mut() = Some((*idx, call_args.into_iter().next().unwrap()));
+            });
+            Err(EvalError::ContinuationReturn)
+        }
         Value::Builtin(bname) => {
             if bname == "apply" {
                 return call_apply(&call_args, pos, env, out);
@@ -1532,8 +1667,22 @@ pub fn eval_str(input: &str) -> Result<String, EvalError> {
     let env = Env::new();
     let mut out = String::new();
     let mut result = Value::Boolean(false);
-    for expr in &exprs {
-        result = eval(expr, &env, &mut out)?;
+    let mut i = 0;
+    while i < exprs.len() {
+        CALLCC_TOP_IDX.with(|c| c.set(i));
+        match eval(&exprs[i], &env, &mut out) {
+            Ok(val) => {
+                result = val;
+                i += 1;
+            }
+            Err(EvalError::ContinuationReturn) => {
+                let (start_idx, value) =
+                    CONT_RETURN.with(|cr| cr.borrow_mut().take().unwrap());
+                CALLCC_PENDING.with(|p| *p.borrow_mut() = Some(value));
+                i = start_idx;
+            }
+            Err(e) => return Err(e),
+        }
     }
     Ok(result.display())
 }
@@ -1549,8 +1698,22 @@ pub fn eval_str_with_output(input: &str) -> Result<(String, String), EvalError> 
     let env = Env::new();
     let mut out = String::new();
     let mut result = Value::Boolean(false);
-    for expr in &exprs {
-        result = eval(expr, &env, &mut out)?;
+    let mut i = 0;
+    while i < exprs.len() {
+        CALLCC_TOP_IDX.with(|c| c.set(i));
+        match eval(&exprs[i], &env, &mut out) {
+            Ok(val) => {
+                result = val;
+                i += 1;
+            }
+            Err(EvalError::ContinuationReturn) => {
+                let (start_idx, value) =
+                    CONT_RETURN.with(|cr| cr.borrow_mut().take().unwrap());
+                CALLCC_PENDING.with(|p| *p.borrow_mut() = Some(value));
+                i = start_idx;
+            }
+            Err(e) => return Err(e),
+        }
     }
     Ok((result.display(), out))
 }
