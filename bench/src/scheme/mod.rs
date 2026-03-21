@@ -498,6 +498,26 @@ fn apply_builtin(op: &str, args: &[Value]) -> Result<Value, EvalError> {
                 _ => Err(EvalError::TypeError("length: not a list".into())),
             }
         }
+        "string?" => {
+            if args.len() != 1 { return Err(EvalError::Arity); }
+            Ok(Value::Boolean(matches!(&args[0], Value::Str(_))))
+        }
+        "number?" => {
+            if args.len() != 1 { return Err(EvalError::Arity); }
+            Ok(Value::Boolean(matches!(&args[0], Value::Integer(_))))
+        }
+        "boolean?" => {
+            if args.len() != 1 { return Err(EvalError::Arity); }
+            Ok(Value::Boolean(matches!(&args[0], Value::Boolean(_))))
+        }
+        "pair?" => {
+            if args.len() != 1 { return Err(EvalError::Arity); }
+            Ok(Value::Boolean(matches!(&args[0], Value::List(items) if !items.is_empty())))
+        }
+        "symbol?" => {
+            if args.len() != 1 { return Err(EvalError::Arity); }
+            Ok(Value::Boolean(matches!(&args[0], Value::Symbol(_))))
+        }
         _ => Err(EvalError::UndefinedVariable(op.to_string())),
     }
 }
