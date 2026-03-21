@@ -35,6 +35,12 @@ cargo xtask test all  # test all levels (300s timeout)
 - **If a level's tests fail, fix them before proceeding.**
 - **Rely on the provided level tests as the source of truth.**
 
+## Problem-Solving Approach
+
+- **Code first, debug from test output.** Write a working first attempt based on your understanding, then iterate from test failures. Do not mentally simulate test cases before writing code — let the test runner do that work.
+- **One failing test = one targeted fix.** When tests fail, read the error output and fix the specific failure. Do not re-analyze the entire design.
+- **Budget your planning.** For any single feature, your plan should fit in a few paragraphs. If you're tracing through execution step-by-step in your head, stop and write code instead.
+
 ## Code Philosophy
 
 The quality gate enforces structure mechanically; these rules are the design intent behind those checks. Follow them proactively — the gate is a safety net, not a substitute for judgment.
