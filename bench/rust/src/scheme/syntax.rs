@@ -1510,7 +1510,10 @@ fn expand_define_template_with_scope(
                     repetition_index,
                 )?;
 
-                return Ok((Expr::list(vec![operator, signature, body], location), function_scope));
+                return Ok((
+                    Expr::list(vec![operator, signature, body], location),
+                    function_scope,
+                ));
             }
 
             let (name, name_scope) =
@@ -1523,7 +1526,10 @@ fn expand_define_template_with_scope(
                 macros,
                 repetition_index,
             )?;
-            Ok((Expr::list(vec![operator, name, expression], location), name_scope))
+            Ok((
+                Expr::list(vec![operator, name, expression], location),
+                name_scope,
+            ))
         }
         [_, name, body @ ..] if matches!(name.template, Template::List { .. }) => {
             let Template::List {
@@ -1603,7 +1609,10 @@ fn expand_define_signature(
         std::iter::once(function_name).chain(parameters).collect(),
         signature_location,
     );
-    let body_scope = merge_scopes(&merge_scopes(scope, function_scope.clone()), parameter_scope);
+    let body_scope = merge_scopes(
+        &merge_scopes(scope, function_scope.clone()),
+        parameter_scope,
+    );
     Ok((signature, function_scope, body_scope))
 }
 
@@ -1617,18 +1626,21 @@ fn expand_body_items(
 ) -> Result<Vec<Expr>, EvalError> {
     items
         .iter()
-        .try_fold((Vec::new(), scope.clone()), |(mut expressions, body_scope), item| {
-            let (expanded, scope_updates) = expand_body_item(
-                item,
-                bindings,
-                captured_aliases,
-                &body_scope,
-                macros,
-                repetition_index,
-            )?;
-            expressions.extend(expanded);
-            Ok((expressions, merge_scopes(&body_scope, scope_updates)))
-        })
+        .try_fold(
+            (Vec::new(), scope.clone()),
+            |(mut expressions, body_scope), item| {
+                let (expanded, scope_updates) = expand_body_item(
+                    item,
+                    bindings,
+                    captured_aliases,
+                    &body_scope,
+                    macros,
+                    repetition_index,
+                )?;
+                expressions.extend(expanded);
+                Ok((expressions, merge_scopes(&body_scope, scope_updates)))
+            },
+        )
         .map(|(expressions, _)| expressions)
 }
 

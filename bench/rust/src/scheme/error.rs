@@ -103,6 +103,11 @@ pub enum EvalError {
         index: i64,
         length: usize,
     },
+    #[error("{location}: list index {index} out of bounds")]
+    ListIndexOutOfBounds {
+        location: SourceLocation,
+        index: i64,
+    },
     #[error("{location}: invalid substring range [{start}, {end}) for string length {length}")]
     InvalidSubstringRange {
         location: SourceLocation,
@@ -143,4 +148,9 @@ pub enum EvalError {
     },
     #[error("{location}: division by zero")]
     DivisionByZero { location: SourceLocation },
+    #[error("{location}: unsupported exponent: {exponent}")]
+    InvalidExponent {
+        location: SourceLocation,
+        exponent: i64,
+    },
 }

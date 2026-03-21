@@ -13,18 +13,34 @@ pub enum BuiltinProcedure {
     Sub,
     Mul,
     Div,
+    Abs,
+    Modulo,
+    Remainder,
+    Quotient,
+    Min,
+    Max,
+    Expt,
     LessThan,
     GreaterThan,
     Equal,
     LessEqual,
     GreaterEqual,
+    ZeroPred,
+    PositivePred,
+    NegativePred,
+    OddPred,
+    EvenPred,
     Not,
     Cons,
     Car,
     Cdr,
     Null,
     List,
+    ListRef,
+    ListTail,
+    ListPred,
     Length,
+    Assoc,
     StringPred,
     NumberPred,
     BooleanPred,
@@ -44,10 +60,21 @@ pub enum BuiltinProcedure {
     StringCopy,
     StringSet,
     CharPred,
+    CharAlphabeticPred,
+    CharNumericPred,
+    CharUpcase,
+    CharDowncase,
+    CharEqual,
+    CharLessThan,
     StringToList,
     ListToString,
     CharToInteger,
     IntegerToChar,
+    StringEqual,
+    StringLessThan,
+    StringCiEqual,
+    StringUpcase,
+    StringDowncase,
     Map,
     Apply,
     Eq,
@@ -70,18 +97,34 @@ impl BuiltinProcedure {
             Self::Sub => "-",
             Self::Mul => "*",
             Self::Div => "/",
+            Self::Abs => "abs",
+            Self::Modulo => "modulo",
+            Self::Remainder => "remainder",
+            Self::Quotient => "quotient",
+            Self::Min => "min",
+            Self::Max => "max",
+            Self::Expt => "expt",
             Self::LessThan => "<",
             Self::GreaterThan => ">",
             Self::Equal => "=",
             Self::LessEqual => "<=",
             Self::GreaterEqual => ">=",
+            Self::ZeroPred => "zero?",
+            Self::PositivePred => "positive?",
+            Self::NegativePred => "negative?",
+            Self::OddPred => "odd?",
+            Self::EvenPred => "even?",
             Self::Not => "not",
             Self::Cons => "cons",
             Self::Car => "car",
             Self::Cdr => "cdr",
             Self::Null => "null?",
             Self::List => "list",
+            Self::ListRef => "list-ref",
+            Self::ListTail => "list-tail",
+            Self::ListPred => "list?",
             Self::Length => "length",
+            Self::Assoc => "assoc",
             Self::StringPred => "string?",
             Self::NumberPred => "number?",
             Self::BooleanPred => "boolean?",
@@ -101,10 +144,21 @@ impl BuiltinProcedure {
             Self::StringCopy => "string-copy",
             Self::StringSet => "string-set!",
             Self::CharPred => "char?",
+            Self::CharAlphabeticPred => "char-alphabetic?",
+            Self::CharNumericPred => "char-numeric?",
+            Self::CharUpcase => "char-upcase",
+            Self::CharDowncase => "char-downcase",
+            Self::CharEqual => "char=?",
+            Self::CharLessThan => "char<?",
             Self::StringToList => "string->list",
             Self::ListToString => "list->string",
             Self::CharToInteger => "char->integer",
             Self::IntegerToChar => "integer->char",
+            Self::StringEqual => "string=?",
+            Self::StringLessThan => "string<?",
+            Self::StringCiEqual => "string-ci=?",
+            Self::StringUpcase => "string-upcase",
+            Self::StringDowncase => "string-downcase",
             Self::Map => "map",
             Self::Apply => "apply",
             Self::Eq => "eq?",
@@ -128,18 +182,34 @@ pub fn install_builtins(environment: &Environment) {
         BuiltinProcedure::Sub,
         BuiltinProcedure::Mul,
         BuiltinProcedure::Div,
+        BuiltinProcedure::Abs,
+        BuiltinProcedure::Modulo,
+        BuiltinProcedure::Remainder,
+        BuiltinProcedure::Quotient,
+        BuiltinProcedure::Min,
+        BuiltinProcedure::Max,
+        BuiltinProcedure::Expt,
         BuiltinProcedure::LessThan,
         BuiltinProcedure::GreaterThan,
         BuiltinProcedure::Equal,
         BuiltinProcedure::LessEqual,
         BuiltinProcedure::GreaterEqual,
+        BuiltinProcedure::ZeroPred,
+        BuiltinProcedure::PositivePred,
+        BuiltinProcedure::NegativePred,
+        BuiltinProcedure::OddPred,
+        BuiltinProcedure::EvenPred,
         BuiltinProcedure::Not,
         BuiltinProcedure::Cons,
         BuiltinProcedure::Car,
         BuiltinProcedure::Cdr,
         BuiltinProcedure::Null,
         BuiltinProcedure::List,
+        BuiltinProcedure::ListRef,
+        BuiltinProcedure::ListTail,
+        BuiltinProcedure::ListPred,
         BuiltinProcedure::Length,
+        BuiltinProcedure::Assoc,
         BuiltinProcedure::StringPred,
         BuiltinProcedure::NumberPred,
         BuiltinProcedure::BooleanPred,
@@ -159,10 +229,21 @@ pub fn install_builtins(environment: &Environment) {
         BuiltinProcedure::StringCopy,
         BuiltinProcedure::StringSet,
         BuiltinProcedure::CharPred,
+        BuiltinProcedure::CharAlphabeticPred,
+        BuiltinProcedure::CharNumericPred,
+        BuiltinProcedure::CharUpcase,
+        BuiltinProcedure::CharDowncase,
+        BuiltinProcedure::CharEqual,
+        BuiltinProcedure::CharLessThan,
         BuiltinProcedure::StringToList,
         BuiltinProcedure::ListToString,
         BuiltinProcedure::CharToInteger,
         BuiltinProcedure::IntegerToChar,
+        BuiltinProcedure::StringEqual,
+        BuiltinProcedure::StringLessThan,
+        BuiltinProcedure::StringCiEqual,
+        BuiltinProcedure::StringUpcase,
+        BuiltinProcedure::StringDowncase,
         BuiltinProcedure::Map,
         BuiltinProcedure::Apply,
         BuiltinProcedure::Eq,
@@ -194,6 +275,13 @@ pub fn apply_builtin(
         BuiltinProcedure::Sub => eval_sub(arguments, location),
         BuiltinProcedure::Mul => eval_mul(arguments, location),
         BuiltinProcedure::Div => eval_div(arguments, location),
+        BuiltinProcedure::Abs => eval_abs(arguments, location),
+        BuiltinProcedure::Modulo => eval_modulo(arguments, location),
+        BuiltinProcedure::Remainder => eval_remainder(arguments, location),
+        BuiltinProcedure::Quotient => eval_quotient(arguments, location),
+        BuiltinProcedure::Min => eval_min(arguments, location),
+        BuiltinProcedure::Max => eval_max(arguments, location),
+        BuiltinProcedure::Expt => eval_expt(arguments, location),
         BuiltinProcedure::LessThan => {
             eval_comparison("<", arguments, location, |left, right| left < right)
         }
@@ -209,13 +297,32 @@ pub fn apply_builtin(
         BuiltinProcedure::GreaterEqual => {
             eval_comparison(">=", arguments, location, |left, right| left >= right)
         }
+        BuiltinProcedure::ZeroPred => {
+            eval_number_predicate("zero?", arguments, location, |value| value == 0)
+        }
+        BuiltinProcedure::PositivePred => {
+            eval_number_predicate("positive?", arguments, location, |value| value > 0)
+        }
+        BuiltinProcedure::NegativePred => {
+            eval_number_predicate("negative?", arguments, location, |value| value < 0)
+        }
+        BuiltinProcedure::OddPred => {
+            eval_number_predicate("odd?", arguments, location, |value| value % 2 != 0)
+        }
+        BuiltinProcedure::EvenPred => {
+            eval_number_predicate("even?", arguments, location, |value| value % 2 == 0)
+        }
         BuiltinProcedure::Not => eval_not(arguments, location),
         BuiltinProcedure::Cons => eval_cons(arguments, location),
         BuiltinProcedure::Car => eval_car(arguments, location),
         BuiltinProcedure::Cdr => eval_cdr(arguments, location),
         BuiltinProcedure::Null => eval_null(arguments, location),
         BuiltinProcedure::List => Ok(eval_list(arguments)),
+        BuiltinProcedure::ListRef => eval_list_ref(arguments, location),
+        BuiltinProcedure::ListTail => eval_list_tail(arguments, location),
+        BuiltinProcedure::ListPred => eval_list_pred(arguments, location),
         BuiltinProcedure::Length => eval_length(arguments, location),
+        BuiltinProcedure::Assoc => eval_assoc(arguments, location),
         BuiltinProcedure::StringPred => {
             eval_type_predicate("string?", arguments, location, is_string)
         }
@@ -243,10 +350,57 @@ pub fn apply_builtin(
         BuiltinProcedure::StringCopy => eval_string_copy(arguments, location),
         BuiltinProcedure::StringSet => eval_string_set(arguments, location),
         BuiltinProcedure::CharPred => eval_type_predicate("char?", arguments, location, is_char),
+        BuiltinProcedure::CharAlphabeticPred => {
+            eval_char_predicate("char-alphabetic?", arguments, location, |value| {
+                value.is_alphabetic()
+            })
+        }
+        BuiltinProcedure::CharNumericPred => {
+            eval_char_predicate("char-numeric?", arguments, location, |value| {
+                value.is_numeric()
+            })
+        }
+        BuiltinProcedure::CharUpcase => {
+            eval_char_transform("char-upcase", arguments, location, |value| {
+                value.to_ascii_uppercase()
+            })
+        }
+        BuiltinProcedure::CharDowncase => {
+            eval_char_transform("char-downcase", arguments, location, |value| {
+                value.to_ascii_lowercase()
+            })
+        }
+        BuiltinProcedure::CharEqual => {
+            eval_char_comparison("char=?", arguments, location, |left, right| left == right)
+        }
+        BuiltinProcedure::CharLessThan => {
+            eval_char_comparison("char<?", arguments, location, |left, right| left < right)
+        }
         BuiltinProcedure::StringToList => eval_string_to_list(arguments, location),
         BuiltinProcedure::ListToString => eval_list_to_string(arguments, location),
         BuiltinProcedure::CharToInteger => eval_char_to_integer(arguments, location),
         BuiltinProcedure::IntegerToChar => eval_integer_to_char(arguments, location),
+        BuiltinProcedure::StringEqual => {
+            eval_string_comparison("string=?", arguments, location, |left, right| left == right)
+        }
+        BuiltinProcedure::StringLessThan => {
+            eval_string_comparison("string<?", arguments, location, |left, right| left < right)
+        }
+        BuiltinProcedure::StringCiEqual => {
+            eval_string_comparison("string-ci=?", arguments, location, |left, right| {
+                left.to_lowercase() == right.to_lowercase()
+            })
+        }
+        BuiltinProcedure::StringUpcase => {
+            eval_string_transform("string-upcase", arguments, location, |value| {
+                value.to_uppercase()
+            })
+        }
+        BuiltinProcedure::StringDowncase => {
+            eval_string_transform("string-downcase", arguments, location, |value| {
+                value.to_lowercase()
+            })
+        }
         BuiltinProcedure::Map => eval_map(arguments, location, output),
         BuiltinProcedure::Apply => eval_apply(arguments, location, output),
         BuiltinProcedure::Eq => eval_binary_value_predicate("eq?", arguments, location, is_eq),
@@ -318,6 +472,52 @@ fn eval_div(arguments: &[Value], location: SourceLocation) -> Result<Value, Eval
     rest.iter()
         .try_fold(*first, |quotient, value| divide(quotient, *value, location))
         .map(Value::Integer)
+}
+
+fn eval_abs(arguments: &[Value], location: SourceLocation) -> Result<Value, EvalError> {
+    let value = unary_number_argument("abs", arguments, location)?;
+    Ok(Value::Integer(value.abs()))
+}
+
+fn eval_modulo(arguments: &[Value], location: SourceLocation) -> Result<Value, EvalError> {
+    let (dividend, divisor) = binary_number_arguments("modulo", arguments, location)?;
+    let remainder = divide_remainder(dividend, divisor, location)?;
+    let result = if remainder != 0 && (remainder > 0) != (divisor > 0) {
+        remainder + divisor
+    } else {
+        remainder
+    };
+
+    Ok(Value::Integer(result))
+}
+
+fn eval_remainder(arguments: &[Value], location: SourceLocation) -> Result<Value, EvalError> {
+    let (dividend, divisor) = binary_number_arguments("remainder", arguments, location)?;
+    Ok(Value::Integer(divide_remainder(
+        dividend, divisor, location,
+    )?))
+}
+
+fn eval_quotient(arguments: &[Value], location: SourceLocation) -> Result<Value, EvalError> {
+    let (dividend, divisor) = binary_number_arguments("quotient", arguments, location)?;
+    divide(dividend, divisor, location).map(Value::Integer)
+}
+
+fn eval_min(arguments: &[Value], location: SourceLocation) -> Result<Value, EvalError> {
+    eval_extremum("min", arguments, location, |left, right| left.min(right))
+}
+
+fn eval_max(arguments: &[Value], location: SourceLocation) -> Result<Value, EvalError> {
+    eval_extremum("max", arguments, location, |left, right| left.max(right))
+}
+
+fn eval_expt(arguments: &[Value], location: SourceLocation) -> Result<Value, EvalError> {
+    let (base, exponent) = binary_number_arguments("expt", arguments, location)?;
+    let Ok(exponent) = u32::try_from(exponent) else {
+        return Err(EvalError::InvalidExponent { location, exponent });
+    };
+
+    Ok(Value::Integer(base.pow(exponent)))
 }
 
 fn eval_comparison(
@@ -417,6 +617,55 @@ fn eval_length(arguments: &[Value], location: SourceLocation) -> Result<Value, E
     Ok(Value::Integer(
         i64::try_from(length).expect("list length should fit in i64"),
     ))
+}
+
+fn eval_list_ref(arguments: &[Value], location: SourceLocation) -> Result<Value, EvalError> {
+    let (list, index) = list_argument_index("list-ref", arguments, location)?;
+    let tail = list_tail_at(list, index, location)?;
+    match tail {
+        Value::Pair(item, _) => Ok((**item).clone()),
+        Value::EmptyList => Err(EvalError::ListIndexOutOfBounds { location, index }),
+        _ => Err(EvalError::TypeMismatch {
+            location,
+            expected: "pair",
+            found: tail.type_name(),
+        }),
+    }
+}
+
+fn eval_list_tail(arguments: &[Value], location: SourceLocation) -> Result<Value, EvalError> {
+    let (list, index) = list_argument_index("list-tail", arguments, location)?;
+    if !matches!(list, Value::EmptyList | Value::Pair(_, _)) {
+        return Err(EvalError::TypeMismatch {
+            location,
+            expected: "list",
+            found: list.type_name(),
+        });
+    }
+
+    list_tail_at(list, index, location).cloned()
+}
+
+fn eval_list_pred(arguments: &[Value], location: SourceLocation) -> Result<Value, EvalError> {
+    let value = unary_argument("list?", arguments, location)?;
+    Ok(Value::Boolean(is_proper_list(value)))
+}
+
+fn eval_assoc(arguments: &[Value], location: SourceLocation) -> Result<Value, EvalError> {
+    let (key, association_list) = binary_arguments("assoc", arguments, location)?;
+    let mut current = association_list;
+
+    loop {
+        let Some((entry, remainder)) = assoc_list_node(current, location)? else {
+            return Ok(Value::Boolean(false));
+        };
+
+        if is_equal(key, assoc_entry_key(entry, location)?) {
+            return Ok(entry.clone());
+        }
+
+        current = remainder;
+    }
 }
 
 fn eval_display(
@@ -662,24 +911,109 @@ fn eval_integer_to_char(arguments: &[Value], location: SourceLocation) -> Result
     Ok(Value::Character(character))
 }
 
+fn eval_char_predicate(
+    procedure: &'static str,
+    arguments: &[Value],
+    location: SourceLocation,
+    predicate: impl Fn(char) -> bool,
+) -> Result<Value, EvalError> {
+    let value = unary_argument(procedure, arguments, location)?.expect_char(location)?;
+    Ok(Value::Boolean(predicate(value)))
+}
+
+fn eval_char_transform(
+    procedure: &'static str,
+    arguments: &[Value],
+    location: SourceLocation,
+    transform: impl Fn(char) -> char,
+) -> Result<Value, EvalError> {
+    let value = unary_argument(procedure, arguments, location)?.expect_char(location)?;
+    Ok(Value::Character(transform(value)))
+}
+
+fn eval_char_comparison(
+    procedure: &'static str,
+    arguments: &[Value],
+    location: SourceLocation,
+    compare: impl Fn(char, char) -> bool,
+) -> Result<Value, EvalError> {
+    let characters = char_arguments(procedure, arguments, location)?;
+    Ok(Value::Boolean(
+        characters.windows(2).all(|pair| compare(pair[0], pair[1])),
+    ))
+}
+
+fn eval_string_comparison(
+    procedure: &'static str,
+    arguments: &[Value],
+    location: SourceLocation,
+    compare: impl Fn(&str, &str) -> bool,
+) -> Result<Value, EvalError> {
+    let strings = string_arguments(procedure, arguments, location)?;
+    Ok(Value::Boolean(
+        strings
+            .windows(2)
+            .all(|pair| compare(pair[0].as_str(), pair[1].as_str())),
+    ))
+}
+
+fn eval_string_transform(
+    procedure: &'static str,
+    arguments: &[Value],
+    location: SourceLocation,
+    transform: impl Fn(String) -> String,
+) -> Result<Value, EvalError> {
+    let value = unary_argument(procedure, arguments, location)?.expect_string(location)?;
+    Ok(Value::immutable_string(transform(value.as_string())))
+}
+
 fn eval_map(
     arguments: &[Value],
     location: SourceLocation,
     output: &mut String,
 ) -> Result<Value, EvalError> {
-    let [procedure, list] = arguments else {
+    let Some((procedure, list_arguments)) = arguments.split_first() else {
         return Err(EvalError::WrongArgumentCount {
             location,
             procedure: "map",
-            expected: ArgCount::Exactly(2),
-            got: arguments.len(),
+            expected: ArgCount::AtLeast(2),
+            got: 0,
         });
     };
+    if list_arguments.is_empty() {
+        return Err(EvalError::WrongArgumentCount {
+            location,
+            procedure: "map",
+            expected: ArgCount::AtLeast(2),
+            got: 1,
+        });
+    }
 
-    let mapped_values = proper_list_items(list, location)?
-        .into_iter()
-        .map(|value| apply_callable(procedure.clone(), &[value], location, output))
+    let mut iterators = list_arguments
+        .iter()
+        .map(|list| proper_list_items(list, location).map(|items| items.into_iter()))
         .collect::<Result<Vec<_>, _>>()?;
+    let mut mapped_values = Vec::new();
+
+    loop {
+        let current_arguments = iterators.iter_mut().map(Iterator::next).collect::<Vec<_>>();
+        if current_arguments.iter().any(Option::is_none) {
+            break;
+        }
+
+        let current_arguments = current_arguments
+            .into_iter()
+            .map(|argument| {
+                argument.expect("map arguments should be present after shortest-list check")
+            })
+            .collect::<Vec<_>>();
+        mapped_values.push(apply_callable(
+            procedure.clone(),
+            &current_arguments,
+            location,
+            output,
+        )?);
+    }
 
     Ok(eval_list(&mapped_values))
 }
@@ -853,11 +1187,126 @@ fn unary_argument<'a>(
     Ok(argument)
 }
 
+fn unary_number_argument(
+    procedure: &'static str,
+    arguments: &[Value],
+    location: SourceLocation,
+) -> Result<i64, EvalError> {
+    unary_argument(procedure, arguments, location)?.expect_number(location)
+}
+
+fn binary_arguments<'a>(
+    procedure: &'static str,
+    arguments: &'a [Value],
+    location: SourceLocation,
+) -> Result<(&'a Value, &'a Value), EvalError> {
+    let [left, right] = arguments else {
+        return Err(EvalError::WrongArgumentCount {
+            location,
+            procedure,
+            expected: ArgCount::Exactly(2),
+            got: arguments.len(),
+        });
+    };
+
+    Ok((left, right))
+}
+
+fn binary_number_arguments(
+    procedure: &'static str,
+    arguments: &[Value],
+    location: SourceLocation,
+) -> Result<(i64, i64), EvalError> {
+    let (left, right) = binary_arguments(procedure, arguments, location)?;
+    Ok((
+        left.expect_number(location)?,
+        right.expect_number(location)?,
+    ))
+}
+
 fn number_arguments(arguments: &[Value], location: SourceLocation) -> Result<Vec<i64>, EvalError> {
     arguments
         .iter()
         .map(|argument| argument.expect_number(location))
         .collect()
+}
+
+fn string_arguments(
+    procedure: &'static str,
+    arguments: &[Value],
+    location: SourceLocation,
+) -> Result<Vec<String>, EvalError> {
+    require_argument_count_at_least(procedure, arguments, location, 2)?;
+    arguments
+        .iter()
+        .map(|argument| {
+            argument
+                .expect_string(location)
+                .map(|value| value.as_string())
+        })
+        .collect()
+}
+
+fn char_arguments(
+    procedure: &'static str,
+    arguments: &[Value],
+    location: SourceLocation,
+) -> Result<Vec<char>, EvalError> {
+    require_argument_count_at_least(procedure, arguments, location, 2)?;
+    arguments
+        .iter()
+        .map(|argument| argument.expect_char(location))
+        .collect()
+}
+
+fn require_argument_count_at_least(
+    procedure: &'static str,
+    arguments: &[Value],
+    location: SourceLocation,
+    minimum: usize,
+) -> Result<(), EvalError> {
+    if arguments.len() < minimum {
+        return Err(EvalError::WrongArgumentCount {
+            location,
+            procedure,
+            expected: ArgCount::AtLeast(minimum),
+            got: arguments.len(),
+        });
+    }
+
+    Ok(())
+}
+
+fn eval_number_predicate(
+    procedure: &'static str,
+    arguments: &[Value],
+    location: SourceLocation,
+    predicate: impl Fn(i64) -> bool,
+) -> Result<Value, EvalError> {
+    let value = unary_number_argument(procedure, arguments, location)?;
+    Ok(Value::Boolean(predicate(value)))
+}
+
+fn eval_extremum(
+    procedure: &'static str,
+    arguments: &[Value],
+    location: SourceLocation,
+    choose: impl Fn(i64, i64) -> i64,
+) -> Result<Value, EvalError> {
+    let numbers = number_arguments(arguments, location)?;
+    let [first, rest @ ..] = numbers.as_slice() else {
+        return Err(EvalError::WrongArgumentCount {
+            location,
+            procedure,
+            expected: ArgCount::AtLeast(1),
+            got: 0,
+        });
+    };
+
+    Ok(Value::Integer(
+        rest.iter()
+            .fold(*first, |current, value| choose(current, *value)),
+    ))
 }
 
 fn vector_length_value(argument: &Value, location: SourceLocation) -> Result<usize, EvalError> {
@@ -933,12 +1382,95 @@ fn list_length(value: &Value, location: SourceLocation) -> Result<usize, EvalErr
     }
 }
 
+fn list_argument_index<'a>(
+    procedure: &'static str,
+    arguments: &'a [Value],
+    location: SourceLocation,
+) -> Result<(&'a Value, i64), EvalError> {
+    let (list, index) = binary_arguments(procedure, arguments, location)?;
+    Ok((list, index.expect_number(location)?))
+}
+
+fn assoc_list_node(
+    current: &Value,
+    location: SourceLocation,
+) -> Result<Option<(&Value, &Value)>, EvalError> {
+    match current {
+        Value::EmptyList => Ok(None),
+        Value::Pair(entry, remainder) => Ok(Some((entry.as_ref(), remainder.as_ref()))),
+        _ => Err(EvalError::TypeMismatch {
+            location,
+            expected: "list",
+            found: current.type_name(),
+        }),
+    }
+}
+
+fn assoc_entry_key(entry: &Value, location: SourceLocation) -> Result<&Value, EvalError> {
+    match entry {
+        Value::Pair(entry_key, _) => Ok(entry_key.as_ref()),
+        _ => Err(EvalError::TypeMismatch {
+            location,
+            expected: "pair",
+            found: entry.type_name(),
+        }),
+    }
+}
+
+fn list_tail_at(value: &Value, index: i64, location: SourceLocation) -> Result<&Value, EvalError> {
+    let Some(mut remaining) = usize::try_from(index).ok() else {
+        return Err(EvalError::ListIndexOutOfBounds { location, index });
+    };
+    let mut current = value;
+
+    while remaining > 0 {
+        match current {
+            Value::Pair(_, cdr) => {
+                current = cdr.as_ref();
+                remaining -= 1;
+            }
+            Value::EmptyList => {
+                return Err(EvalError::ListIndexOutOfBounds { location, index });
+            }
+            _ => {
+                return Err(EvalError::TypeMismatch {
+                    location,
+                    expected: "pair",
+                    found: current.type_name(),
+                });
+            }
+        }
+    }
+
+    Ok(current)
+}
+
+fn is_proper_list(value: &Value) -> bool {
+    let mut current = value;
+
+    loop {
+        match current {
+            Value::EmptyList => return true,
+            Value::Pair(_, cdr) => current = cdr.as_ref(),
+            _ => return false,
+        }
+    }
+}
+
 fn divide(left: i64, right: i64, location: SourceLocation) -> Result<i64, EvalError> {
     if right == 0 {
         return Err(EvalError::DivisionByZero { location });
     }
 
     Ok(left / right)
+}
+
+fn divide_remainder(left: i64, right: i64, location: SourceLocation) -> Result<i64, EvalError> {
+    if right == 0 {
+        return Err(EvalError::DivisionByZero { location });
+    }
+
+    Ok(left % right)
 }
 
 fn is_string(value: &Value) -> bool {
