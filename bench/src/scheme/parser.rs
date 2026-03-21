@@ -34,8 +34,10 @@ fn parse_expr(
 
     match chars.peek() {
         None => Err(ParseError::UnexpectedEof),
+        Some('(') => parse_list(chars),
         Some('"') => parse_string(chars),
         Some('#') => parse_boolean(chars),
+        Some(&c) if is_symbol_start(c) => parse_symbol(chars),
         Some(&c) if c == '-' || c.is_ascii_digit() => parse_number_or_symbol(chars),
         Some(&c) => Err(ParseError::UnexpectedChar { ch: c }),
     }
@@ -79,6 +81,50 @@ fn parse_boolean(
     }
 }
 
+fn is_symbol_start(c: char) -> bool {
+    matches!(c, '+' | '*' | '/' | '<' | '>' | '=' | '!' | '?' | '_')
+        || c.is_ascii_alphabetic()
+}
+
+fn is_symbol_char(c: char) -> bool {
+    is_symbol_start(c) || c == '-' || c.is_ascii_digit()
+}
+
+fn parse_symbol(
+    chars: &mut std::iter::Peekable<std::str::Chars<'_>>,
+) -> Result<Value, ParseError> {
+    let mut token = String::new();
+
+    while let Some(&c) = chars.peek() {
+        if c.is_whitespace() || c == '(' || c == ')' {
+            break;
+        }
+        token.push(c);
+        chars.next();
+    }
+
+    Ok(Value::Symbol(token))
+}
+
+fn parse_list(
+    chars: &mut std::iter::Peekable<std::str::Chars<'_>>,
+) -> Result<Value, ParseError> {
+    chars.next(); // consume '('
+    let mut items = Vec::new();
+
+    loop {
+        skip_whitespace(chars);
+        match chars.peek() {
+            None => return Err(ParseError::UnexpectedEof),
+            Some(')') => {
+                chars.next();
+                return Ok(Value::List(items));
+            }
+            _ => items.push(parse_expr(chars)?),
+        }
+    }
+}
+
 fn parse_number_or_symbol(
     chars: &mut std::iter::Peekable<std::str::Chars<'_>>,
 ) -> Result<Value, ParseError> {
@@ -92,10 +138,8 @@ fn parse_number_or_symbol(
         chars.next();
     }
 
-    token
-        .parse::<i64>()
-        .map(Value::Integer)
-        .map_err(|_| ParseError::UnexpectedChar {
-            ch: token.chars().next().unwrap_or('?'),
-        })
+    match token.parse::<i64>() {
+        Ok(n) => Ok(Value::Integer(n)),
+        Err(_) => Ok(Value::Symbol(token)),
+    }
 }
