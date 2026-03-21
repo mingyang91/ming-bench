@@ -151,6 +151,9 @@ fn eval_list_tail(
             "call/cc" | "call-with-current-continuation" => {
                 return eval_callcc(&items[1..], env, out).map(TailAction::Return)
             }
+            "dynamic-wind" => {
+                return eval_dynamic_wind(&items[1..], env, out).map(TailAction::Return)
+            }
             "define-syntax" => {
                 return eval_define_syntax(&items[1..], env).map(TailAction::Return)
             }
@@ -287,6 +290,53 @@ fn eval_callcc_core(
     };
     let cont = Value::Continuation(id);
     apply_values(&proc, vec![cont], env, out)
+}
+
+/// Evaluate `dynamic-wind`: (dynamic-wind in-thunk body-thunk out-thunk)
+fn eval_dynamic_wind(
+    args: &[Value],
+    env: &Rc<RefCell<Env>>,
+    out: &Output,
+) -> Result<Value, EvalError> {
+    let [in_arg, body_arg, out_arg] = args else {
+        return Err(EvalError::WrongArgCount {
+            expected: 3,
+            got: args.len(),
+        });
+    };
+    let in_thunk = eval(in_arg, env, out)?;
+    let body_thunk = eval(body_arg, env, out)?;
+    let out_thunk = eval(out_arg, env, out)?;
+    eval_dynamic_wind_core(&in_thunk, &body_thunk, &out_thunk, env, out)
+}
+
+/// Core dynamic-wind logic with already-evaluated thunks.
+fn eval_dynamic_wind_core(
+    in_thunk: &Value,
+    body_thunk: &Value,
+    out_thunk: &Value,
+    env: &Rc<RefCell<Env>>,
+    out: &Output,
+) -> Result<Value, EvalError> {
+    // Run in-thunk
+    apply_values(in_thunk, vec![], env, out)?;
+    // Run body-thunk, catching ContinuationReturn
+    let body_result = apply_values(body_thunk, vec![], env, out);
+    match body_result {
+        Ok(val) => {
+            apply_values(out_thunk, vec![], env, out)?;
+            Ok(val)
+        }
+        Err(EvalError::ContinuationReturn { id, value }) => {
+            // Run out-thunk even on non-local exit
+            apply_values(out_thunk, vec![], env, out)?;
+            Err(EvalError::ContinuationReturn { id, value })
+        }
+        Err(e) => {
+            apply_values(out_thunk, vec![], env, out)?;
+            Err(e)
+        }
+    }
 }
 
 /// Apply a procedure to already-evaluated argument values.
@@ -445,6 +495,15 @@ fn call_builtin_with_values(
             return Ok(value);
         }
         return eval_callcc_core(proc.clone(), env, out);
+    }
+    if name == "dynamic-wind" {
+        let [in_thunk, body_thunk, out_thunk] = values.as_slice() else {
+            return Err(EvalError::WrongArgCount {
+                expected: 3,
+                got: values.len(),
+            });
+        };
+        return eval_dynamic_wind_core(in_thunk, body_thunk, out_thunk, env, out);
     }
     let quoted_args: Vec<Value> = values
         .into_iter()
@@ -700,6 +759,7 @@ fn is_builtin(name: &str) -> bool {
             | "vector-length" | "vector?" | "vector->list" | "list->vector"
             | "abs" | "modulo" | "remainder" | "quotient" | "min" | "max" | "expt"
             | "zero?" | "positive?" | "negative?" | "odd?" | "even?"
+            | "reverse"
             | "list-ref" | "list-tail" | "list?" | "assoc"
             | "char-alphabetic?" | "char-numeric?" | "char-upcase" | "char-downcase"
             | "char=?" | "char<?"
@@ -780,6 +840,7 @@ fn eval_builtin(
         "negative?" => eval_num_pred(args, env, out, |n| n < 0),
         "odd?" => eval_num_pred(args, env, out, |n| n % 2 != 0),
         "even?" => eval_num_pred(args, env, out, |n| n % 2 == 0),
+        "reverse" => eval_reverse(args, env, out),
         "list-ref" => eval_list_ref(args, env, out),
         "list-tail" => eval_list_tail_builtin(args, env, out),
         "list?" => eval_list_pred(args, env, out),
@@ -1175,6 +1236,51 @@ fn eval_length(args: &[Value], env: &Rc<RefCell<Env>>, out: &Output) -> Result<V
             got: format!("{other}"),
         }),
     }
+}
+
+fn collect_pair_chain(val: &Value) -> Result<Vec<Value>, EvalError> {
+    let mut elems = Vec::new();
+    let mut cur = val;
+    loop {
+        match cur {
+            Value::Pair(car, cdr) => {
+                elems.push(car.as_ref().clone());
+                cur = cdr.as_ref();
+            }
+            Value::List(items) if items.is_empty() => break,
+            _ => {
+                return Err(EvalError::TypeError {
+                    expected: "proper list".into(),
+                    got: format!("{val}"),
+                });
+            }
+        }
+    }
+    Ok(elems)
+}
+
+fn eval_reverse(args: &[Value], env: &Rc<RefCell<Env>>, out: &Output) -> Result<Value, EvalError> {
+    let [arg] = args else {
+        return Err(EvalError::WrongArgCount { expected: 1, got: args.len() });
+    };
+    let val = eval(arg, env, out)?;
+    // Collect elements from either List or Pair-chain
+    let items = match &val {
+        Value::List(items) => items.clone(),
+        Value::Pair(_, _) => collect_pair_chain(&val)?,
+        _ => {
+            return Err(EvalError::TypeError {
+                expected: "list".into(),
+                got: format!("{val}"),
+            });
+        }
+    };
+    // Build reversed list as Pair chain (consistent with cons-built lists)
+    let reversed = items.into_iter().fold(
+        Value::List(vec![]),
+        |acc, item| Value::Pair(Box::new(item), Box::new(acc)),
+    );
+    Ok(reversed)
 }
 
 fn eval_type_pred(
@@ -2256,8 +2362,10 @@ pub fn seed_builtins(env: &Rc<RefCell<Env>>) {
         "vector", "make-vector", "vector-ref", "vector-set!",
         "vector-length", "vector?", "vector->list", "list->vector",
         "call/cc", "call-with-current-continuation",
+        "dynamic-wind",
         "abs", "modulo", "remainder", "quotient", "min", "max", "expt",
         "zero?", "positive?", "negative?", "odd?", "even?",
+        "reverse",
         "list-ref", "list-tail", "list?", "assoc",
         "char-alphabetic?", "char-numeric?", "char-upcase", "char-downcase",
         "char=?", "char<?",
