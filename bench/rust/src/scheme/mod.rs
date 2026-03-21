@@ -12,6 +12,7 @@ enum Expr {
     Int(i64, SourcePos),
     Bool(bool, SourcePos),
     String(String, SourcePos),
+    Char(char, SourcePos),
     Symbol(String, SourcePos),
     List(Vec<Expr>, SourcePos),
 }
@@ -22,6 +23,7 @@ impl Expr {
             Self::Int(_, pos)
             | Self::Bool(_, pos)
             | Self::String(_, pos)
+            | Self::Char(_, pos)
             | Self::Symbol(_, pos)
             | Self::List(_, pos) => *pos,
         }
@@ -61,6 +63,8 @@ enum Builtin {
     SymbolToString,
     StringToSymbol,
     StringRef,
+    StringCopy,
+    StringSet,
     IsChar,
 }
 
@@ -87,10 +91,44 @@ struct Procedure {
 }
 
 #[derive(Clone, Debug)]
+struct SchemeString(Rc<RefCell<Vec<char>>>);
+
+impl SchemeString {
+    fn new(value: impl Into<String>) -> Self {
+        Self(Rc::new(RefCell::new(value.into().chars().collect())))
+    }
+
+    fn copy(&self) -> Self {
+        Self(Rc::new(RefCell::new(self.0.borrow().clone())))
+    }
+
+    fn len(&self) -> usize {
+        self.0.borrow().len()
+    }
+
+    fn to_plain_string(&self) -> String {
+        self.0.borrow().iter().collect()
+    }
+
+    fn char_at(&self, index: usize) -> Option<char> {
+        self.0.borrow().get(index).copied()
+    }
+
+    fn set_char(&self, index: usize, value: char) -> bool {
+        let mut chars = self.0.borrow_mut();
+        let Some(slot) = chars.get_mut(index) else {
+            return false;
+        };
+        *slot = value;
+        true
+    }
+}
+
+#[derive(Clone, Debug)]
 enum Value {
     Int(i64),
     Bool(bool),
-    String(String),
+    String(SchemeString),
     Symbol(String),
     Char(char),
     List(Vec<Value>),
@@ -130,9 +168,12 @@ impl Value {
             Self::Int(value) => value.to_string(),
             Self::Bool(true) => "#t".into(),
             Self::Bool(false) => "#f".into(),
-            Self::String(value) => match mode {
-                RenderMode::Write => render_string(value),
-                RenderMode::Display => value.clone(),
+            Self::String(value) => {
+                let rendered = value.to_plain_string();
+                match mode {
+                    RenderMode::Write => render_string(&rendered),
+                    RenderMode::Display => rendered,
+                }
             },
             Self::Symbol(value) => value.clone(),
             Self::Char(value) => render_char(*value, mode),
@@ -299,6 +340,7 @@ impl<'a> Parser<'a> {
         match token {
             "#t" => Ok(Expr::Bool(true, pos)),
             "#f" => Ok(Expr::Bool(false, pos)),
+            _ if token.starts_with("#\\") => Ok(Expr::Char(parse_char_literal(token, pos)?, pos)),
             _ => match token.parse::<i64>() {
                 Ok(value) => Ok(Expr::Int(value, pos)),
                 Err(_) => Ok(Expr::Symbol(token.into(), pos)),
@@ -356,6 +398,29 @@ fn syntax_error(pos: SourcePos, message: impl Into<String>) -> EvalError {
     EvalError::SyntaxError {
         pos,
         message: message.into(),
+    }
+}
+
+fn parse_char_literal(token: &str, pos: SourcePos) -> Result<char, EvalError> {
+    let Some(literal) = token.strip_prefix("#\\") else {
+        return Err(syntax_error(pos, format!("invalid character literal: {token}")));
+    };
+
+    match literal {
+        "space" => Ok(' '),
+        "newline" => Ok('\n'),
+        _ => {
+            let mut chars = literal.chars();
+            let Some(value) = chars.next() else {
+                return Err(syntax_error(pos, "invalid character literal"));
+            };
+
+            if chars.next().is_some() {
+                return Err(syntax_error(pos, format!("invalid character literal: {token}")));
+            }
+
+            Ok(value)
+        }
     }
 }
 
@@ -486,6 +551,8 @@ fn default_env() -> EnvRef {
         ("symbol->string", Builtin::SymbolToString),
         ("string->symbol", Builtin::StringToSymbol),
         ("string-ref", Builtin::StringRef),
+        ("string-copy", Builtin::StringCopy),
+        ("string-set!", Builtin::StringSet),
         ("char?", Builtin::IsChar),
     ] {
         env.define(name, Value::Builtin(builtin));
@@ -498,7 +565,8 @@ fn eval_expr(expr: &Expr, env: &EnvRef) -> Result<Value, EvalError> {
     match expr {
         Expr::Int(value, _) => Ok(Value::Int(*value)),
         Expr::Bool(value, _) => Ok(Value::Bool(*value)),
-        Expr::String(value, _) => Ok(Value::String(value.clone())),
+        Expr::String(value, _) => Ok(Value::String(SchemeString::new(value.clone()))),
+        Expr::Char(value, _) => Ok(Value::Char(*value)),
         Expr::Symbol(name, pos) => env
             .lookup(name)
             .ok_or_else(|| unbound_variable(*pos, name.clone())),
@@ -717,7 +785,8 @@ fn quote_expr(expr: &Expr) -> Value {
     match expr {
         Expr::Int(value, _) => Value::Int(*value),
         Expr::Bool(value, _) => Value::Bool(*value),
-        Expr::String(value, _) => Value::String(value.clone()),
+        Expr::String(value, _) => Value::String(SchemeString::new(value.clone())),
+        Expr::Char(value, _) => Value::Char(*value),
         Expr::Symbol(value, _) => Value::Symbol(value.clone()),
         Expr::List(items, _) => Value::List(items.iter().map(quote_expr).collect()),
     }
@@ -791,6 +860,8 @@ fn apply_builtin(
         Builtin::SymbolToString => eval_symbol_to_string(args, pos),
         Builtin::StringToSymbol => eval_string_to_symbol(args, pos),
         Builtin::StringRef => eval_string_ref(args, pos),
+        Builtin::StringCopy => eval_string_copy(args, pos),
+        Builtin::StringSet => eval_string_set(args, pos),
         Builtin::IsChar => {
             eval_type_predicate(args, "char?", pos, |value| matches!(value, Value::Char(_)))
         }
@@ -1007,10 +1078,10 @@ fn eval_string_append(args: &[Value], pos: SourcePos) -> Result<Value, EvalError
     let mut result = String::new();
 
     for value in args {
-        result.push_str(expect_string(value, pos)?);
+        result.push_str(&expect_string(value, pos)?.to_plain_string());
     }
 
-    Ok(Value::String(result))
+    Ok(Value::String(SchemeString::new(result)))
 }
 
 fn eval_string_length(args: &[Value], pos: SourcePos) -> Result<Value, EvalError> {
@@ -1018,7 +1089,7 @@ fn eval_string_length(args: &[Value], pos: SourcePos) -> Result<Value, EvalError
         return Err(wrong_arity(pos, "string-length", "exactly 1", args.len()));
     };
 
-    Ok(Value::Int(expect_string(value, pos)?.chars().count() as i64))
+    Ok(Value::Int(expect_string(value, pos)?.len() as i64))
 }
 
 fn eval_substring(args: &[Value], pos: SourcePos) -> Result<Value, EvalError> {
@@ -1029,15 +1100,20 @@ fn eval_substring(args: &[Value], pos: SourcePos) -> Result<Value, EvalError> {
     let string = expect_string(value, pos)?;
     let start = expect_integer(start, pos)?;
     let end = expect_integer(end, pos)?;
-    let len = string.chars().count();
+    let len = string.len();
 
     if start < 0 || end < 0 || start > end || end as usize > len {
         return Err(invalid_range(pos, start, end, len));
     }
 
     let count = (end - start) as usize;
-    let substring = string.chars().skip(start as usize).take(count).collect();
-    Ok(Value::String(substring))
+    let substring = string
+        .to_plain_string()
+        .chars()
+        .skip(start as usize)
+        .take(count)
+        .collect::<String>();
+    Ok(Value::String(SchemeString::new(substring)))
 }
 
 fn eval_string_to_number(args: &[Value], pos: SourcePos) -> Result<Value, EvalError> {
@@ -1045,7 +1121,7 @@ fn eval_string_to_number(args: &[Value], pos: SourcePos) -> Result<Value, EvalEr
         return Err(wrong_arity(pos, "string->number", "exactly 1", args.len()));
     };
 
-    match expect_string(value, pos)?.parse::<i64>() {
+    match expect_string(value, pos)?.to_plain_string().parse::<i64>() {
         Ok(number) => Ok(Value::Int(number)),
         Err(_) => Ok(Value::Bool(false)),
     }
@@ -1056,7 +1132,9 @@ fn eval_number_to_string(args: &[Value], pos: SourcePos) -> Result<Value, EvalEr
         return Err(wrong_arity(pos, "number->string", "exactly 1", args.len()));
     };
 
-    Ok(Value::String(expect_integer(value, pos)?.to_string()))
+    Ok(Value::String(SchemeString::new(
+        expect_integer(value, pos)?.to_string(),
+    )))
 }
 
 fn eval_symbol_to_string(args: &[Value], pos: SourcePos) -> Result<Value, EvalError> {
@@ -1064,7 +1142,9 @@ fn eval_symbol_to_string(args: &[Value], pos: SourcePos) -> Result<Value, EvalEr
         return Err(wrong_arity(pos, "symbol->string", "exactly 1", args.len()));
     };
 
-    Ok(Value::String(expect_symbol(value, pos)?.to_string()))
+    Ok(Value::String(SchemeString::new(
+        expect_symbol(value, pos)?.to_string(),
+    )))
 }
 
 fn eval_string_to_symbol(args: &[Value], pos: SourcePos) -> Result<Value, EvalError> {
@@ -1072,7 +1152,7 @@ fn eval_string_to_symbol(args: &[Value], pos: SourcePos) -> Result<Value, EvalEr
         return Err(wrong_arity(pos, "string->symbol", "exactly 1", args.len()));
     };
 
-    Ok(Value::Symbol(expect_string(value, pos)?.to_string()))
+    Ok(Value::Symbol(expect_string(value, pos)?.to_plain_string()))
 }
 
 fn eval_string_ref(args: &[Value], pos: SourcePos) -> Result<Value, EvalError> {
@@ -1082,17 +1162,42 @@ fn eval_string_ref(args: &[Value], pos: SourcePos) -> Result<Value, EvalError> {
 
     let string = expect_string(value, pos)?;
     let index = expect_integer(index, pos)?;
-    let len = string.chars().count();
+    let len = string.len();
 
     if index < 0 || index as usize >= len {
         return Err(index_out_of_bounds(pos, index, len));
     }
 
     let ch = string
-        .chars()
-        .nth(index as usize)
+        .char_at(index as usize)
         .ok_or_else(|| index_out_of_bounds(pos, index, len))?;
     Ok(Value::Char(ch))
+}
+
+fn eval_string_copy(args: &[Value], pos: SourcePos) -> Result<Value, EvalError> {
+    let [value] = args else {
+        return Err(wrong_arity(pos, "string-copy", "exactly 1", args.len()));
+    };
+
+    Ok(Value::String(expect_string(value, pos)?.copy()))
+}
+
+fn eval_string_set(args: &[Value], pos: SourcePos) -> Result<Value, EvalError> {
+    let [value, index, ch] = args else {
+        return Err(wrong_arity(pos, "string-set!", "exactly 3", args.len()));
+    };
+
+    let string = expect_string(value, pos)?;
+    let index = expect_integer(index, pos)?;
+    let ch = expect_char(ch, pos)?;
+    let len = string.len();
+
+    if index < 0 || index as usize >= len {
+        return Err(index_out_of_bounds(pos, index, len));
+    }
+
+    let _ = string.set_char(index as usize, ch);
+    Ok(Value::Void)
 }
 
 fn eval_type_predicate<F>(
@@ -1152,9 +1257,9 @@ fn expect_integer(value: &Value, pos: SourcePos) -> Result<i64, EvalError> {
     }
 }
 
-fn expect_string<'a>(value: &'a Value, pos: SourcePos) -> Result<&'a str, EvalError> {
+fn expect_string(value: &Value, pos: SourcePos) -> Result<SchemeString, EvalError> {
     match value {
-        Value::String(string) => Ok(string),
+        Value::String(string) => Ok(string.clone()),
         other => Err(type_error(pos, "string", other.type_name())),
     }
 }
@@ -1163,6 +1268,13 @@ fn expect_symbol<'a>(value: &'a Value, pos: SourcePos) -> Result<&'a str, EvalEr
     match value {
         Value::Symbol(symbol) => Ok(symbol),
         other => Err(type_error(pos, "symbol", other.type_name())),
+    }
+}
+
+fn expect_char(value: &Value, pos: SourcePos) -> Result<char, EvalError> {
+    match value {
+        Value::Char(ch) => Ok(*ch),
+        other => Err(type_error(pos, "char", other.type_name())),
     }
 }
 
