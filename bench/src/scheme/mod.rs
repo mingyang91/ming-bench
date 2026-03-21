@@ -9,6 +9,7 @@ use builtins::{apply_builtin, is_builtin};
 use forms::{
     eval_and_step, eval_begin_step, eval_body_step, eval_cond_step, eval_define, eval_if_step,
     eval_lambda, eval_let_step, eval_or_step, eval_quote, eval_set, eval_string_set,
+    handle_callcc,
 };
 use std::cell::RefCell;
 use std::collections::HashMap;
@@ -38,10 +39,7 @@ pub fn eval_str(input: &str) -> Result<String, EvalError> {
     }
     let mut env = Env::new();
     let mut output = String::new();
-    let mut last = Value::Boolean(false);
-    for expr in &exprs {
-        last = eval(expr, &mut env, &mut output)?;
-    }
+    let last = eval_exprs(&exprs, &mut env, &mut output)?;
     Ok(last.to_string())
 }
 
@@ -57,11 +55,60 @@ pub fn eval_str_with_output(input: &str) -> Result<(String, String), EvalError> 
     }
     let mut env = Env::new();
     let mut output = String::new();
-    let mut last = Value::Boolean(false);
-    for expr in &exprs {
-        last = eval(expr, &mut env, &mut output)?;
-    }
+    let last = eval_exprs(&exprs, &mut env, &mut output)?;
     Ok((last.to_string(), output))
+}
+
+/// Run the expression sequence with continuation restart loop.
+fn eval_exprs(exprs: &[Value], env: &mut Env, output: &mut String) -> Result<Value, EvalError> {
+    let mut last = Value::Boolean(false);
+    let mut start_index = 0;
+    loop {
+        match eval_expr_sequence(exprs, start_index, env, output, &mut last)? {
+            Some(idx) => start_index = idx,
+            None => return Ok(last),
+        }
+    }
+}
+
+/// Evaluate expressions from `start_index`, returning `Some(restart_index)` on
+/// continuation invocation or `None` when all expressions complete.
+fn eval_expr_sequence(
+    exprs: &[Value],
+    start_index: usize,
+    env: &mut Env,
+    output: &mut String,
+    last: &mut Value,
+) -> Result<Option<usize>, EvalError> {
+    for i in start_index..exprs.len() {
+        env.insert(
+            "\x00ei".to_string(),
+            Rc::new(RefCell::new(Value::Integer(i as i64))),
+        );
+        match eval(&exprs[i], env, output) {
+            Ok(v) => *last = v,
+            Err(EvalError::ContinuationInvoked {
+                id,
+                value,
+                expr_index,
+            }) => {
+                store_continuation_override(env, id, *value);
+                return Ok(Some(expr_index));
+            }
+            Err(e) => return Err(e),
+        }
+    }
+    Ok(None)
+}
+
+fn store_continuation_override(env: &mut Env, id: usize, value: Value) {
+    env.insert(
+        "\x00co".to_string(),
+        Rc::new(RefCell::new(Value::List(
+            vec![Value::Integer(id as i64), value],
+            Span::default(),
+        ))),
+    );
 }
 
 /// Trampoline-based eval: loops on tail calls instead of recursing.
@@ -89,12 +136,12 @@ pub(crate) fn eval(value: &Value, env: &mut Env, output: &mut String) -> Result<
 fn eval_step(value: &Value, env: &mut Env, output: &mut String) -> Result<Bounce, EvalError> {
     match value {
         Value::Integer(_) | Value::Boolean(_) | Value::String(_) | Value::Char(_)
-        | Value::Lambda { .. } => Ok(Bounce::Done(value.clone())),
+        | Value::Lambda { .. } | Value::Continuation { .. } => Ok(Bounce::Done(value.clone())),
         Value::Symbol(name, span) => env
             .get(name)
             .map(|rc| Bounce::Done(rc.borrow().clone()))
             .or_else(|| {
-                if is_builtin(name) || name == "apply" {
+                if is_builtin(name) || name == "apply" || name == "call/cc" || name == "call-with-current-continuation" {
                     Some(Bounce::Done(Value::Symbol(name.clone(), *span)))
                 } else {
                     None
@@ -134,6 +181,17 @@ fn eval_list_step(
             "cond" => return eval_cond_step(args, env, span, output),
             "set!" => return eval_set(args, env, span, output).map(Bounce::Done),
             "string-set!" => return eval_string_set(args, env, span, output).map(Bounce::Done),
+            "call/cc" | "call-with-current-continuation" => {
+                let [arg_expr] = args else {
+                    return Err(EvalError::WrongArgCount {
+                        expected: 1,
+                        got: args.len(),
+                        span,
+                    });
+                };
+                let proc = eval(arg_expr, env, output)?;
+                return handle_callcc(proc, env, span, output);
+            }
             _ => {}
         }
     }
@@ -201,8 +259,34 @@ fn apply_step(
                     other => other,
                 })
         }
+        Value::Symbol(name, _)
+            if name == "call/cc" || name == "call-with-current-continuation" =>
+        {
+            let [proc] = args else {
+                return Err(EvalError::WrongArgCount {
+                    expected: 1,
+                    got: args.len(),
+                    span,
+                });
+            };
+            handle_callcc(proc.clone(), env, span, output)
+        }
         Value::Symbol(name, _) if is_builtin(name) || name == "apply" => {
             builtins::call_builtin_values(name, args, env, span, output).map(Bounce::Done)
+        }
+        Value::Continuation { id, expr_index } => {
+            let [arg] = args else {
+                return Err(EvalError::WrongArgCount {
+                    expected: 1,
+                    got: args.len(),
+                    span,
+                });
+            };
+            Err(EvalError::ContinuationInvoked {
+                id: *id,
+                value: Box::new(arg.clone()),
+                expr_index: *expr_index,
+            })
         }
         other => Err(EvalError::TypeError {
             expected: "procedure".to_string(),

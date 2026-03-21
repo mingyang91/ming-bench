@@ -1,4 +1,4 @@
-use super::{eval, is_truthy, Bounce, Env};
+use super::{apply, eval, is_truthy, Bounce, Env};
 use crate::scheme::error::EvalError;
 use crate::scheme::value::{Span, Value};
 use std::cell::RefCell;
@@ -336,6 +336,49 @@ pub(crate) fn eval_string_set(
         got: "immutable string (strings are immutable in R7RS)".to_string(),
         span,
     })
+}
+
+fn check_continuation_override(env: &mut Env, id: usize) -> Option<Value> {
+    let cell = env.get("\x00co")?;
+    let val = cell.borrow().clone();
+    let Value::List(ref items, _) = val else { return None };
+    let [Value::Integer(oid), ref value] = items.as_slice() else { return None };
+    if *oid as usize != id {
+        return None;
+    }
+    env.remove("\x00co");
+    Some(value.clone())
+}
+
+pub(crate) fn handle_callcc(
+    proc: Value,
+    env: &mut Env,
+    span: Span,
+    output: &mut String,
+) -> Result<Bounce, EvalError> {
+    let id = span.line * 1_000_000 + span.col;
+
+    // Check for continuation override (reentrant continuation invocation)
+    if let Some(value) = check_continuation_override(env, id) {
+        return Ok(Bounce::Done(value));
+    }
+
+    let expr_index = env
+        .get("\x00ei")
+        .map(|v| match &*v.borrow() {
+            Value::Integer(n) => *n as usize,
+            _ => 0,
+        })
+        .unwrap_or(0);
+    let cont = Value::Continuation { id, expr_index };
+
+    match apply(proc, &[cont], env, span, output) {
+        Ok(v) => Ok(Bounce::Done(v)),
+        Err(EvalError::ContinuationInvoked {
+            id: iid, value, ..
+        }) if iid == id => Ok(Bounce::Done(*value)),
+        Err(e) => Err(e),
+    }
 }
 
 fn extract_params(

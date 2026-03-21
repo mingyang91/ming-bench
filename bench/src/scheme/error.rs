@@ -1,4 +1,4 @@
-use crate::scheme::value::Span;
+use crate::scheme::value::{Span, Value};
 
 /// Evaluation error type for the Scheme interpreter.
 #[derive(Debug, PartialEq, thiserror::Error)]
@@ -25,6 +25,13 @@ pub enum EvalError {
 
     #[error("division by zero at {span}")]
     DivisionByZero { span: Span },
+
+    #[error("continuation invoked")]
+    ContinuationInvoked {
+        id: usize,
+        value: Box<Value>,
+        expr_index: usize,
+    },
 }
 
 /// Parse error type for the Scheme reader.

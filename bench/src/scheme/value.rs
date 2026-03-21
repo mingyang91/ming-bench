@@ -31,6 +31,10 @@ pub enum Value {
         body: Vec<Value>,
         env: HashMap<String, Rc<RefCell<Value>>>,
     },
+    Continuation {
+        id: usize,
+        expr_index: usize,
+    },
 }
 
 fn fmt_list(f: &mut fmt::Formatter<'_>, items: &[Value]) -> fmt::Result {
@@ -54,7 +58,7 @@ impl fmt::Display for Value {
             Value::Char(c) => write!(f, "#\\{c}"),
             Value::Symbol(s, _) => write!(f, "{s}"),
             Value::List(items, _) => fmt_list(f, items),
-            Value::Lambda { .. } => write!(f, "#<procedure>"),
+            Value::Lambda { .. } | Value::Continuation { .. } => write!(f, "#<procedure>"),
         }
     }
 }
