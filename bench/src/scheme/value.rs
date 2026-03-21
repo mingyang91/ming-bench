@@ -49,6 +49,12 @@ pub enum Value {
         rules: Vec<(Value, Value)>,
         def_env: Rc<RefCell<Env>>,
     },
+    /// A syntax-case macro transformer (a lambda that receives the input form).
+    SyntaxCaseMacro {
+        name: std::string::String,
+        transformer: Box<Value>,
+        def_env: Rc<RefCell<Env>>,
+    },
     /// Multiple return values from `values`.
     Values(Vec<Value>),
     /// A record instance created by `define-record-type`.
@@ -140,6 +146,7 @@ impl PartialEq for Value {
             (Value::Void, Value::Void) => true,
             (Value::Lambda { .. }, Value::Lambda { .. }) => false,
             (Value::Macro { .. }, Value::Macro { .. }) => false,
+            (Value::SyntaxCaseMacro { .. }, Value::SyntaxCaseMacro { .. }) => false,
             (Value::Continuation(a), Value::Continuation(b)) => a.id == b.id,
             (
                 Value::Record { type_id: a_id, fields: a_fields, .. },
@@ -281,7 +288,7 @@ impl Value {
                 let inner: Vec<std::string::String> = elems.iter().map(|e| e.display_str()).collect();
                 format!("#({})", inner.join(" "))
             }
-            Value::Macro { .. } => "#<macro>".to_string(),
+            Value::Macro { .. } | Value::SyntaxCaseMacro { .. } => "#<macro>".to_string(),
             Value::Values(vals) => vals.iter().map(|v| v.display_str()).collect::<Vec<_>>().join("\n"),
             Value::RecordConstructor { .. }
             | Value::RecordPredicate { .. }
@@ -316,7 +323,7 @@ impl fmt::Display for Value {
             | Value::RecordPredicate { .. }
             | Value::RecordAccessor { .. } => write!(f, "#<procedure>"),
             Value::Record { type_name, .. } => write!(f, "#<record:{type_name}>"),
-            Value::Macro { .. } => write!(f, "#<macro>"),
+            Value::Macro { .. } | Value::SyntaxCaseMacro { .. } => write!(f, "#<macro>"),
             Value::Void => write!(f, ""),
         }
     }

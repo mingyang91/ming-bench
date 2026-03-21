@@ -1,8 +1,10 @@
 use std::cell::{Cell, RefCell};
+use std::collections::HashMap;
 use std::rc::Rc;
 
 use crate::scheme::env::Env;
 use crate::scheme::error::{EvalError, Span};
+use crate::scheme::macros::Binding;
 use crate::scheme::number::{float_to_exact, Num};
 use crate::scheme::value::{self, BodyContinuation, ContinuationData, Value};
 
@@ -101,6 +103,8 @@ fn is_builtin(name: &str) -> bool {
             | "cadr"
             | "cdar"
             | "cddr"
+            | "syntax->datum"
+            | "datum->syntax"
     )
 }
 
@@ -121,6 +125,14 @@ pub struct EvalContext {
     wind_depth: Cell<u64>,
     /// Counter for generating unique record type IDs.
     record_type_counter: Cell<u64>,
+    /// Stack of syntax-case pattern bindings for `syntax` template expansion.
+    syntax_frames: RefCell<Vec<SyntaxFrame>>,
+}
+
+/// A frame of syntax-case bindings for template expansion.
+pub struct SyntaxFrame {
+    pub bindings: HashMap<String, Binding>,
+    pub macro_name: String,
 }
 
 pub struct ContReturnData {
@@ -141,6 +153,7 @@ impl EvalContext {
             body_continuation: RefCell::new(None),
             wind_depth: Cell::new(0),
             record_type_counter: Cell::new(0),
+            syntax_frames: RefCell::new(Vec::new()),
         }
     }
 
@@ -194,6 +207,7 @@ pub fn eval(
                 Bounce::TailCall { expr, env } => { cur_expr = expr; cur_env = env; }
             },
             Value::Lambda { .. } | Value::Continuation(_) | Value::Macro { .. }
+            | Value::SyntaxCaseMacro { .. }
             | Value::Vector(_) | Value::Pair(..) | Value::Values(_)
             | Value::Record { .. } | Value::RecordConstructor { .. }
             | Value::RecordPredicate { .. } | Value::RecordAccessor { .. } => {
@@ -201,6 +215,46 @@ pub fn eval(
             }
             Value::Void => return Ok(Value::Void),
         }
+    }
+}
+
+/// Try to expand a macro bound to the head symbol of a list form.
+/// Returns `Ok(Some(expanded))` if a macro was found and expanded, `Ok(None)` otherwise.
+fn try_expand_macro(
+    env: &Rc<RefCell<Env>>,
+    elems: &[Value],
+    span: Span,
+    ctx: &EvalContext,
+) -> Result<Option<Value>, EvalError> {
+    let Some(Value::Symbol(name)) = elems.first() else {
+        return Ok(None);
+    };
+    let Some(macro_val) = env.borrow().get(name) else {
+        return Ok(None);
+    };
+    match macro_val {
+        Value::Macro {
+            ref name,
+            ref keywords,
+            ref rules,
+            ref def_env,
+        } => {
+            let expanded = crate::scheme::macros::expand_macro(
+                name, keywords, rules, def_env, elems, span, &ctx.gensym_counter,
+            )?;
+            Ok(Some(expanded))
+        }
+        Value::SyntaxCaseMacro {
+            ref name,
+            ref transformer,
+            ref def_env,
+        } => {
+            let expanded = expand_syntax_case_macro(
+                name, transformer, def_env, elems, span, ctx,
+            )?;
+            Ok(Some(expanded))
+        }
+        _ => Ok(None),
     }
 }
 
@@ -234,7 +288,16 @@ fn eval_list_tco(
                 return eval_vector_set(args, env, span, ctx).map(Bounce::Done);
             }
             "define-syntax" => {
-                return eval_define_syntax(args, env, span).map(Bounce::Done);
+                return eval_define_syntax(args, env, span, ctx).map(Bounce::Done);
+            }
+            "syntax-case" => {
+                return eval_syntax_case_tco(args, env, span, ctx);
+            }
+            "syntax" => {
+                return eval_syntax(args, span, ctx).map(Bounce::Done);
+            }
+            "with-syntax" => {
+                return eval_with_syntax_tco(args, env, span, ctx);
             }
             "guard" => return eval_guard_tco(args, env, span, ctx),
             "define-record-type" => {
@@ -244,16 +307,7 @@ fn eval_list_tco(
         }
 
         // Check if this symbol is bound to a macro (outside match to reduce nesting)
-        if let Some(Value::Macro {
-            ref name,
-            ref keywords,
-            ref rules,
-            ref def_env,
-        }) = env.borrow().get(name)
-        {
-            let expanded = crate::scheme::macros::expand_macro(
-                name, keywords, rules, def_env, elems, span, &ctx.gensym_counter,
-            )?;
+        if let Some(expanded) = try_expand_macro(env, elems, span, ctx)? {
             return Ok(Bounce::TailCall {
                 expr: expanded,
                 env: Rc::clone(env),
@@ -802,6 +856,7 @@ fn eval_define_syntax(
     args: &[Value],
     env: &Rc<RefCell<Env>>,
     span: Span,
+    _ctx: &EvalContext,
 ) -> Result<Value, EvalError> {
     let [Value::Symbol(name), transformer] = args else {
         return Err(EvalError::TypeError {
@@ -811,23 +866,52 @@ fn eval_define_syntax(
     };
     let Value::List(sr_elems) = transformer else {
         return Err(EvalError::TypeError {
-            message: "define-syntax: expected syntax-rules form".into(),
+            message: "define-syntax: expected syntax-rules or lambda form".into(),
             span,
         });
     };
-    let [Value::Symbol(sr_kw), Value::List(keywords_list), rules @ ..] = sr_elems.as_slice()
-    else {
+    let Some(Value::Symbol(first_kw)) = sr_elems.first() else {
+        return Err(EvalError::TypeError {
+            message: "define-syntax: expected syntax-rules or lambda form".into(),
+            span,
+        });
+    };
+
+    match first_kw.as_str() {
+        "lambda" => {
+            let transformer_val = eval_lambda(&sr_elems[1..], env, span)?;
+            let macro_val = Value::SyntaxCaseMacro {
+                name: name.clone(),
+                transformer: Box::new(transformer_val),
+                def_env: Rc::clone(env),
+            };
+            env.borrow_mut().define(name.clone(), macro_val);
+            Ok(Value::Void)
+        }
+        "syntax-rules" => {
+            let macro_val = parse_syntax_rules(name, sr_elems, env, span)?;
+            env.borrow_mut().define(name.clone(), macro_val);
+            Ok(Value::Void)
+        }
+        _ => Err(EvalError::TypeError {
+            message: format!("define-syntax: expected syntax-rules or lambda, got {first_kw}"),
+            span,
+        }),
+    }
+}
+
+fn parse_syntax_rules(
+    name: &str,
+    sr_elems: &[Value],
+    env: &Rc<RefCell<Env>>,
+    span: Span,
+) -> Result<Value, EvalError> {
+    let [Value::Symbol(_), Value::List(keywords_list), rules @ ..] = sr_elems else {
         return Err(EvalError::TypeError {
             message: "syntax-rules: expected (syntax-rules (keywords...) rules...)".into(),
             span,
         });
     };
-    if sr_kw != "syntax-rules" {
-        return Err(EvalError::TypeError {
-            message: "define-syntax: expected syntax-rules".into(),
-            span,
-        });
-    }
 
     let keywords: Vec<String> = keywords_list
         .iter()
@@ -859,14 +943,233 @@ fn eval_define_syntax(
         })
         .collect::<Result<_, _>>()?;
 
-    let macro_val = Value::Macro {
-        name: name.clone(),
+    Ok(Value::Macro {
+        name: name.to_string(),
         keywords,
         rules: parsed_rules,
         def_env: Rc::clone(env),
+    })
+}
+
+/// Expand a syntax-case macro by calling the transformer lambda with the input form.
+fn expand_syntax_case_macro(
+    macro_name: &str,
+    transformer: &Value,
+    _def_env: &Rc<RefCell<Env>>,
+    input: &[Value],
+    span: Span,
+    ctx: &EvalContext,
+) -> Result<Value, EvalError> {
+    // The input form is passed as a Value::List to the transformer
+    let input_form = Value::List(input.to_vec());
+
+    // Push a syntax frame with the macro name and def_env (bindings filled by syntax-case)
+    ctx.syntax_frames.borrow_mut().push(SyntaxFrame {
+        bindings: HashMap::new(),
+        macro_name: macro_name.to_string(),
+    });
+
+    let result = apply(transformer, &[input_form], span, ctx);
+
+    ctx.syntax_frames.borrow_mut().pop();
+
+    result
+}
+
+/// Push syntax-case bindings onto the current syntax frame.
+fn push_syntax_bindings(ctx: &EvalContext, bindings: HashMap<String, Binding>) {
+    let mut frames = ctx.syntax_frames.borrow_mut();
+    if let Some(frame) = frames.last_mut() {
+        frame.bindings.extend(bindings);
+    }
+}
+
+/// Evaluate an optional fender (guard) expression. Returns true if no fender or fender is truthy.
+fn eval_fender(
+    fender: Option<&Value>,
+    bindings: &HashMap<String, Binding>,
+    env: &Rc<RefCell<Env>>,
+    span: Span,
+    ctx: &EvalContext,
+) -> Result<bool, EvalError> {
+    let Some(fender_expr) = fender else {
+        return Ok(true);
     };
-    env.borrow_mut().define(name.clone(), macro_val);
-    Ok(Value::Void)
+    // Temporarily push bindings so syntax templates in the fender can access them
+    if let Some(frame) = ctx.syntax_frames.borrow_mut().last_mut() { frame.bindings.extend(bindings.clone()); }
+    let result = eval(fender_expr, env, span, ctx)?;
+    // Pop the bindings we just added (they'll be re-added if pattern matches)
+    if let Some(frame) = ctx.syntax_frames.borrow_mut().last_mut() {
+        for key in bindings.keys() {
+            frame.bindings.remove(key);
+        }
+    }
+    Ok(!matches!(result, Value::Boolean(false)))
+}
+
+/// Evaluate `(syntax-case expr (keywords...) clause ...)`.
+fn eval_syntax_case_tco(
+    args: &[Value],
+    env: &Rc<RefCell<Env>>,
+    span: Span,
+    ctx: &EvalContext,
+) -> Result<Bounce, EvalError> {
+    let [input_expr, Value::List(keywords_list), clauses @ ..] = args else {
+        return Err(EvalError::TypeError {
+            message: "syntax-case: expected (syntax-case expr (keywords...) clause ...)".into(),
+            span,
+        });
+    };
+
+    let input = eval(input_expr, env, span, ctx)?;
+    let input_elems = match &input {
+        Value::List(elems) => elems.clone(),
+        _ => vec![input.clone()],
+    };
+
+    let keywords: Vec<String> = keywords_list
+        .iter()
+        .filter_map(|v| match v {
+            Value::Symbol(s) => Some(s.clone()),
+            _ => None,
+        })
+        .collect();
+
+    for clause in clauses {
+        let Value::List(clause_elems) = clause else {
+            return Err(EvalError::TypeError {
+                message: "syntax-case: clause must be a list".into(),
+                span,
+            });
+        };
+
+        let (pattern, fender, body) = match clause_elems.as_slice() {
+            [pat, body] => (pat, None, body),
+            [pat, fender, body] => (pat, Some(fender), body),
+            _ => {
+                return Err(EvalError::TypeError {
+                    message: "syntax-case: clause must be (pattern body) or (pattern fender body)"
+                        .into(),
+                    span,
+                });
+            }
+        };
+
+        let Value::List(pat_elems) = pattern else {
+            continue;
+        };
+
+        let mut bindings = HashMap::new();
+        if !crate::scheme::macros::match_elements(
+            pat_elems, &input_elems, &keywords, &mut bindings,
+        ) {
+            continue;
+        }
+
+        // Check fender if present
+        if !eval_fender(fender, &bindings, env, span, ctx)? {
+            continue;
+        }
+
+        // Push syntax bindings for template expansion
+        push_syntax_bindings(ctx, bindings);
+
+        return Ok(Bounce::TailCall {
+            expr: body.clone(),
+            env: Rc::clone(env),
+        });
+    }
+
+    Err(EvalError::TypeError {
+        message: "syntax-case: no matching pattern".into(),
+        span,
+    })
+}
+
+/// Evaluate `(syntax template)` — expand template using syntax-case bindings.
+fn eval_syntax(
+    args: &[Value],
+    span: Span,
+    ctx: &EvalContext,
+) -> Result<Value, EvalError> {
+    let [template] = args else {
+        return Err(EvalError::TypeError {
+            message: "syntax: expected (syntax template)".into(),
+            span,
+        });
+    };
+
+    let frames = ctx.syntax_frames.borrow();
+    let Some(frame) = frames.last() else {
+        return Err(EvalError::TypeError {
+            message: "syntax: not in a syntax-case context".into(),
+            span,
+        });
+    };
+
+    let mut gensym_map = HashMap::new();
+    // Use an empty env so free variables stay as symbols (runtime handles scoping).
+    // This avoids capturing mutated def_env bindings that break hygiene.
+    let empty_env = Env::new();
+    Ok(crate::scheme::macros::expand_template(
+        template,
+        &frame.bindings,
+        &frame.macro_name,
+        &empty_env,
+        &ctx.gensym_counter,
+        &mut gensym_map,
+    ))
+}
+
+/// Evaluate `(with-syntax ((pattern expr) ...) body ...)`.
+fn eval_with_syntax_tco(
+    args: &[Value],
+    env: &Rc<RefCell<Env>>,
+    span: Span,
+    ctx: &EvalContext,
+) -> Result<Bounce, EvalError> {
+    let [Value::List(bindings_list), body @ ..] = args else {
+        return Err(EvalError::TypeError {
+            message: "with-syntax: expected (with-syntax ((pat expr) ...) body ...)".into(),
+            span,
+        });
+    };
+
+    // Evaluate each binding and add to the current syntax frame
+    for binding in bindings_list {
+        let Value::List(pair) = binding else {
+            return Err(EvalError::TypeError {
+                message: "with-syntax: binding must be (pattern expr)".into(),
+                span,
+            });
+        };
+        let [Value::Symbol(name), expr] = pair.as_slice() else {
+            return Err(EvalError::TypeError {
+                message: "with-syntax: binding must be (name expr)".into(),
+                span,
+            });
+        };
+        let val = eval(expr, env, span, ctx)?;
+        let mut frames = ctx.syntax_frames.borrow_mut();
+        if let Some(frame) = frames.last_mut() {
+            frame.bindings.insert(name.clone(), Binding::One(val));
+        }
+    }
+
+    // Evaluate body
+    if body.is_empty() {
+        return Ok(Bounce::Done(Value::Void));
+    }
+    let [init @ .., last] = body else {
+        unreachable!();
+    };
+    for expr in init {
+        eval(expr, env, span, ctx)?;
+    }
+    Ok(Bounce::TailCall {
+        expr: last.clone(),
+        env: Rc::clone(env),
+    })
 }
 
 fn eval_set(
@@ -1169,63 +1472,8 @@ fn apply_builtin(
             args,
             [Value::Integer(_) | Value::Rational(..)]
         ))),
-        "exact?" => {
-            let [arg] = args else {
-                return Err(EvalError::WrongArgCount { expected: 1, got: args.len(), span });
-            };
-            Ok(Value::Boolean(matches!(arg, Value::Integer(_) | Value::Rational(..))))
-        }
-        "inexact?" => {
-            let [arg] = args else {
-                return Err(EvalError::WrongArgCount { expected: 1, got: args.len(), span });
-            };
-            Ok(Value::Boolean(matches!(arg, Value::Float(_))))
-        }
-        "exact->inexact" => {
-            let [arg] = args else {
-                return Err(EvalError::WrongArgCount { expected: 1, got: args.len(), span });
-            };
-            Ok(Value::Float(require_number(arg, span)?.to_f64()))
-        }
-        "inexact->exact" => {
-            let [arg] = args else {
-                return Err(EvalError::WrongArgCount { expected: 1, got: args.len(), span });
-            };
-            match arg {
-                Value::Integer(_) | Value::Rational(..) => Ok(arg.clone()),
-                Value::Float(f) => Ok(float_to_exact(*f).to_value()),
-                other => Err(EvalError::TypeError {
-                    message: format!("expected number, got {other}"),
-                    span,
-                }),
-            }
-        }
-        "numerator" => {
-            let [arg] = args else {
-                return Err(EvalError::WrongArgCount { expected: 1, got: args.len(), span });
-            };
-            match arg {
-                Value::Integer(n) => Ok(Value::Integer(*n)),
-                Value::Rational(n, _) => Ok(Value::Integer(*n)),
-                other => Err(EvalError::TypeError {
-                    message: format!("expected rational, got {other}"),
-                    span,
-                }),
-            }
-        }
-        "denominator" => {
-            let [arg] = args else {
-                return Err(EvalError::WrongArgCount { expected: 1, got: args.len(), span });
-            };
-            match arg {
-                Value::Integer(_) => Ok(Value::Integer(1)),
-                Value::Rational(_, d) => Ok(Value::Integer(*d)),
-                other => Err(EvalError::TypeError {
-                    message: format!("expected rational, got {other}"),
-                    span,
-                }),
-            }
-        }
+        "exact?" | "inexact?" | "exact->inexact" | "inexact->exact"
+        | "numerator" | "denominator" => apply_exactness_builtin(name, args, span),
         "boolean?" => Ok(Value::Boolean(matches!(args, [Value::Boolean(_)]))),
         "pair?" => Ok(Value::Boolean(
             matches!(args, [Value::List(e)] if !e.is_empty())
@@ -1253,10 +1501,62 @@ fn apply_builtin(
         }
         "char-alphabetic?" | "char-numeric?" | "char-upcase" | "char-downcase" | "char=?"
         | "char<?" => apply_char_builtin(name, args, span),
+        "syntax->datum" => {
+            let [val] = args else {
+                return Err(EvalError::WrongArgCount { expected: 1, got: args.len(), span });
+            };
+            Ok(val.clone())
+        }
+        "datum->syntax" => {
+            let [_template_id, datum] = args else {
+                return Err(EvalError::WrongArgCount { expected: 2, got: args.len(), span });
+            };
+            Ok(datum.clone())
+        }
         _ => Err(EvalError::UnboundVariable {
             name: name.to_string(),
             span,
         }),
+    }
+}
+
+fn apply_exactness_builtin(
+    name: &str,
+    args: &[Value],
+    span: Span,
+) -> Result<Value, EvalError> {
+    let [arg] = args else {
+        return Err(EvalError::WrongArgCount { expected: 1, got: args.len(), span });
+    };
+    match name {
+        "exact?" => Ok(Value::Boolean(matches!(arg, Value::Integer(_) | Value::Rational(..)))),
+        "inexact?" => Ok(Value::Boolean(matches!(arg, Value::Float(_)))),
+        "exact->inexact" => Ok(Value::Float(require_number(arg, span)?.to_f64())),
+        "inexact->exact" => match arg {
+            Value::Integer(_) | Value::Rational(..) => Ok(arg.clone()),
+            Value::Float(f) => Ok(float_to_exact(*f).to_value()),
+            other => Err(EvalError::TypeError {
+                message: format!("expected number, got {other}"),
+                span,
+            }),
+        },
+        "numerator" => match arg {
+            Value::Integer(n) => Ok(Value::Integer(*n)),
+            Value::Rational(n, _) => Ok(Value::Integer(*n)),
+            other => Err(EvalError::TypeError {
+                message: format!("expected rational, got {other}"),
+                span,
+            }),
+        },
+        "denominator" => match arg {
+            Value::Integer(_) => Ok(Value::Integer(1)),
+            Value::Rational(_, d) => Ok(Value::Integer(*d)),
+            other => Err(EvalError::TypeError {
+                message: format!("expected rational, got {other}"),
+                span,
+            }),
+        },
+        _ => unreachable!("apply_exactness_builtin called with {name}"),
     }
 }
 

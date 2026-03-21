@@ -84,6 +84,18 @@ fn read_atom(reader: &mut Reader<'_>) -> String {
     atom
 }
 
+/// Read a `#`-prefixed token (opening `#` already consumed).
+fn read_hash_token(reader: &mut Reader<'_>, span: Span) -> Token {
+    if reader.peek() == Some(&'\'') {
+        reader.next();
+        Token { text: "#'".into(), span }
+    } else {
+        let mut text = String::from('#');
+        text.push_str(&read_atom(reader));
+        Token { text, span }
+    }
+}
+
 /// Tokenize input into a flat list of tokens with positions.
 fn tokenize(input: &str) -> Vec<Token> {
     let mut tokens = Vec::new();
@@ -116,6 +128,11 @@ fn tokenize(input: &str) -> Vec<Token> {
                 reader.next();
                 let text = read_string(&mut reader);
                 tokens.push(Token { text, span });
+            }
+            '#' => {
+                let span = reader.span();
+                reader.next();
+                tokens.push(read_hash_token(&mut reader, span));
             }
             _ => {
                 let span = reader.span();
@@ -160,6 +177,13 @@ fn parse_expr(tokens: &[Token], pos: usize) -> Result<(Value, usize), EvalError>
             let (quoted, next_pos) = parse_expr(tokens, pos + 1)?;
             Ok((
                 Value::List(vec![Value::Symbol("quote".into()), quoted]),
+                next_pos,
+            ))
+        }
+        "#'" => {
+            let (quoted, next_pos) = parse_expr(tokens, pos + 1)?;
+            Ok((
+                Value::List(vec![Value::Symbol("syntax".into()), quoted]),
                 next_pos,
             ))
         }

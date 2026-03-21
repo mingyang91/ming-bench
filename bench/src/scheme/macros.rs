@@ -8,7 +8,7 @@ use crate::scheme::value::Value;
 
 /// A pattern variable binding.
 #[derive(Debug, Clone)]
-enum Binding {
+pub enum Binding {
     /// Single matched value.
     One(Value),
     /// Multiple matched values (from `...` ellipsis).
@@ -54,7 +54,7 @@ pub fn expand_macro(
 
 // --- Pattern matching ---
 
-fn match_elements(
+pub fn match_elements(
     pattern: &[Value],
     input: &[Value],
     keywords: &[String],
@@ -171,6 +171,9 @@ fn is_special_form(name: &str) -> bool {
             | "and"
             | "or"
             | "syntax-rules"
+            | "syntax-case"
+            | "syntax"
+            | "with-syntax"
             | "string-set!"
     )
 }
@@ -225,10 +228,12 @@ fn is_builtin_name(name: &str) -> bool {
             | "cadr"
             | "cdar"
             | "cddr"
+            | "syntax->datum"
+            | "datum->syntax"
     )
 }
 
-fn expand_template(
+pub fn expand_template(
     template: &Value,
     bindings: &HashMap<String, Binding>,
     macro_name: &str,
