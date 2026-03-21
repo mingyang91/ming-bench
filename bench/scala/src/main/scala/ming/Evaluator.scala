@@ -144,6 +144,8 @@ object Evaluator:
   ): EvalResult =
     expr match
       case Value.IntVal(_)           => Done(expr, env, out)
+      case Value.RationalVal(_, _)   => Done(expr, env, out)
+      case Value.DoubleVal(_)        => Done(expr, env, out)
       case Value.BoolVal(_)          => Done(expr, env, out)
       case Value.StringVal(_)        => Done(expr, env, out)
       case Value.CharVal(_)          => Done(expr, env, out)

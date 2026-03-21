@@ -33,15 +33,19 @@ object StringBuiltins:
         val s = asString(v)
         s.toLongOption match
           case Some(n) => Value.IntVal(n)
-          case None    => Value.BoolVal(false)
+          case None =>
+            s.toDoubleOption match
+              case Some(d) => Value.DoubleVal(d)
+              case None    => Value.BoolVal(false)
       case _ =>
         throw new EvalError("string->number requires 1 string argument")
 
   def evalNumberToString(args: List[Value]): Value =
     args match
-      case Value.IntVal(n) :: Nil => Value.StringVal(n.toString)
+      case (v @ (Value.IntVal(_) | Value.RationalVal(_, _) | Value.DoubleVal(_))) :: Nil =>
+        Value.StringVal(v.display)
       case _ =>
-        throw new EvalError("number->string requires 1 integer argument")
+        throw new EvalError("number->string requires 1 number argument")
 
   def evalSymbolToString(args: List[Value]): Value =
     args match
@@ -92,7 +96,10 @@ object StringBuiltins:
 
   private[ming] def schemeEq(a: Value, b: Value): Boolean =
     (a, b) match
-      case (Value.IntVal(x), Value.IntVal(y))       => x == y
+      case (Value.IntVal(x), Value.IntVal(y)) => x == y
+      case (Value.RationalVal(xn, xd), Value.RationalVal(yn, yd)) =>
+        xn == yn && xd == yd
+      case (Value.DoubleVal(x), Value.DoubleVal(y)) => x == y
       case (Value.BoolVal(x), Value.BoolVal(y))     => x == y
       case (Value.Symbol(x, _), Value.Symbol(y, _)) => x == y
       case (Value.CharVal(x), Value.CharVal(y))     => x == y

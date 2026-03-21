@@ -86,6 +86,24 @@ object Parser:
     else
       s.toLongOption match
         case Some(n) => Value.IntVal(n)
+        case None    => parseNumericAtom(s, line, col)
+
+  private def parseNumericAtom(
+    s: String,
+    line: Int,
+    col: Int
+  ): Value =
+    val slashIdx = s.indexOf('/')
+    if slashIdx > 0 && slashIdx < s.length - 1 then
+      val numStr = s.substring(0, slashIdx)
+      val denStr = s.substring(slashIdx + 1)
+      (numStr.toLongOption, denStr.toLongOption) match
+        case (Some(n), Some(d)) if d != 0 =>
+          Value.makeRational(n, d)
+        case _ => Value.Symbol(s, Some((line, col)))
+    else
+      s.toDoubleOption match
+        case Some(d) => Value.DoubleVal(d)
         case None    => Value.Symbol(s, Some((line, col)))
 
   private def parseCharLiteral(name: String): Value =

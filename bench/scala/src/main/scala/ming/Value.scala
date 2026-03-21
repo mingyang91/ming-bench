@@ -3,6 +3,8 @@ package ming
 /** Scheme value representation. */
 enum Value:
   case IntVal(n: Long)
+  case RationalVal(num: Long, den: Long)
+  case DoubleVal(d: Double)
   case BoolVal(b: Boolean)
   case StringVal(s: String)
   case CharVal(c: Char)
@@ -47,14 +49,16 @@ enum Value:
 
   /** Write representation (strings with quotes). */
   def display: String = this match
-    case IntVal(n)            => n.toString
-    case BoolVal(b)           => if b then "#t" else "#f"
-    case StringVal(s)         => "\"" + s + "\""
-    case MutableStringVal(cs) => "\"" + String(cs) + "\""
-    case CharVal(c)           => s"#\\$c"
-    case Symbol(name, _)      => name
-    case NilVal               => "()"
-    case PairVal(_, _, _)     => formatList(_.display)
+    case IntVal(n)             => n.toString
+    case RationalVal(num, den) => s"$num/$den"
+    case DoubleVal(d)          => formatDouble(d)
+    case BoolVal(b)            => if b then "#t" else "#f"
+    case StringVal(s)          => "\"" + s + "\""
+    case MutableStringVal(cs)  => "\"" + String(cs) + "\""
+    case CharVal(c)            => s"#\\$c"
+    case Symbol(name, _)       => name
+    case NilVal                => "()"
+    case PairVal(_, _, _)      => formatList(_.display)
     case VectorVal(elems) =>
       "#(" + elems.map(_.display).mkString(" ") + ")"
     case _: LambdaVal       => "#<procedure>"
@@ -81,6 +85,12 @@ enum Value:
       case other =>
         "(" + elems.map(fmt).mkString(" ") + " . " + fmt(other) + ")"
 
+  private def formatDouble(d: Double): String =
+    if d == d.toLong.toDouble && !d.isInfinite then
+      val s = d.toString
+      if s.contains('.') then s else s + ".0"
+    else d.toString
+
   private def collectList(
     v: Value,
     acc: List[Value]
@@ -88,3 +98,20 @@ enum Value:
     v match
       case PairVal(car, cdr, _) => collectList(cdr, acc :+ car)
       case other                => (acc, other)
+
+object Value:
+
+  /** Create a rational, simplifying to IntVal when denominator is 1. */
+  def makeRational(num: Long, den: Long): Value =
+    assert(den != 0, "denominator must not be zero")
+    val sign = if den < 0 then -1L else 1L
+    val n    = num * sign
+    val d    = den * sign
+    val g    = gcd(math.abs(n), d)
+    val sn   = n / g
+    val sd   = d / g
+    if sd == 1L then IntVal(sn) else RationalVal(sn, sd)
+
+  @scala.annotation.tailrec
+  private def gcd(a: Long, b: Long): Long =
+    if b == 0L then a else gcd(b, a % b)

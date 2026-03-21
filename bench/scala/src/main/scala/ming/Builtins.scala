@@ -18,6 +18,30 @@ object Builtins:
       case "="  => MathBuiltins.evalCmp(args, _ == _, pos)
       case "<=" => MathBuiltins.evalCmp(args, _ <= _, pos)
       case ">=" => MathBuiltins.evalCmp(args, _ >= _, pos)
+      case "exact?" =>
+        typePred(args, MathBuiltins.isExact)
+      case "inexact?" =>
+        typePred(args, v => MathBuiltins.isNumeric(v) && !MathBuiltins.isExact(v))
+      case "exact->inexact" =>
+        args match
+          case v :: Nil => MathBuiltins.exactToInexact(v, pos)
+          case _        => throw new EvalError("exact->inexact requires 1 argument")
+      case "inexact->exact" =>
+        args match
+          case v :: Nil => MathBuiltins.inexactToExact(v, pos)
+          case _        => throw new EvalError("inexact->exact requires 1 argument")
+      case "numerator" =>
+        args match
+          case Value.IntVal(n) :: Nil         => Value.IntVal(n)
+          case Value.RationalVal(n, _) :: Nil => Value.IntVal(n)
+          case _                              => throw new EvalError("numerator requires 1 exact argument")
+      case "denominator" =>
+        args match
+          case Value.IntVal(_) :: Nil         => Value.IntVal(1L)
+          case Value.RationalVal(_, d) :: Nil => Value.IntVal(d)
+          case _                              => throw new EvalError("denominator requires 1 exact argument")
+      case "rational?" =>
+        typePred(args, v => MathBuiltins.isExact(v))
       case "cons" =>
         args match
           case a :: b :: Nil => Value.PairVal(a, b)
@@ -43,47 +67,63 @@ object Builtins:
         args.foldRight(Value.NilVal: Value)(Value.PairVal(_, _))
       case "length" =>
         args match
-          case head :: Nil => Value.IntVal(listLength(head))
+          case head :: Nil => Value.IntVal(ListBuiltins.listLength(head))
           case _ =>
             throw new EvalError("length requires exactly 1 argument")
       case "string?"  => typePred(args, v => v.isInstanceOf[Value.StringVal] || v.isInstanceOf[Value.MutableStringVal])
-      case "number?"  => typePred(args, _.isInstanceOf[Value.IntVal])
+      case "number?"  => typePred(args, MathBuiltins.isNumeric)
       case "boolean?" => typePred(args, _.isInstanceOf[Value.BoolVal])
       case "pair?"    => typePred(args, _.isInstanceOf[Value.PairVal])
       case "symbol?"  => typePred(args, _.isInstanceOf[Value.Symbol])
       case "char?"    => typePred(args, _.isInstanceOf[Value.CharVal])
-      case "string-append"    => StringBuiltins.evalStringAppend(args)
-      case "string-length"    => StringBuiltins.evalStringLength(args)
-      case "substring"        => StringBuiltins.evalSubstring(args)
-      case "string->number"   => StringBuiltins.evalStringToNumber(args)
-      case "number->string"   => StringBuiltins.evalNumberToString(args)
-      case "symbol->string"   => StringBuiltins.evalSymbolToString(args)
-      case "string->symbol"   => StringBuiltins.evalStringToSymbol(args)
-      case "string-ref"       => StringBuiltins.evalStringRef(args)
-      case "string-copy"      => StringBuiltins.evalStringCopy(args)
-      case "string-set!"      => StringBuiltins.evalStringSet(args)
-      case "string->list"     => StringBuiltins.evalStringToList(args)
-      case "list->string"     => StringBuiltins.evalListToString(args)
-      case "char->integer"    => StringBuiltins.evalCharToInteger(args)
-      case "integer->char"    => StringBuiltins.evalIntegerToChar(args)
-      case "eq?"              => StringBuiltins.evalEq(args)
-      case "equal?"           => StringBuiltins.evalEqual(args)
-      case "abs"              => MathBuiltins.evalAbs(args, pos)
-      case "modulo"           => MathBuiltins.evalModulo(args, pos)
-      case "remainder"        => MathBuiltins.evalRemainder(args, pos)
-      case "quotient"         => MathBuiltins.evalQuotient(args, pos)
-      case "min"              => MathBuiltins.evalMinMax(args, pos, _ min _)
-      case "max"              => MathBuiltins.evalMinMax(args, pos, _ max _)
+      case _          => applyBuiltinExtended(name, args, pos)
+
+  private def applyBuiltinExtended(
+    name: String,
+    args: List[Value],
+    pos: Option[(Int, Int)]
+  ): Value =
+    name match
+      case "string-append"  => StringBuiltins.evalStringAppend(args)
+      case "string-length"  => StringBuiltins.evalStringLength(args)
+      case "substring"      => StringBuiltins.evalSubstring(args)
+      case "string->number" => StringBuiltins.evalStringToNumber(args)
+      case "number->string" => StringBuiltins.evalNumberToString(args)
+      case "symbol->string" => StringBuiltins.evalSymbolToString(args)
+      case "string->symbol" => StringBuiltins.evalStringToSymbol(args)
+      case "string-ref"     => StringBuiltins.evalStringRef(args)
+      case "string-copy"    => StringBuiltins.evalStringCopy(args)
+      case "string-set!"    => StringBuiltins.evalStringSet(args)
+      case "string->list"   => StringBuiltins.evalStringToList(args)
+      case "list->string"   => StringBuiltins.evalListToString(args)
+      case "char->integer"  => StringBuiltins.evalCharToInteger(args)
+      case "integer->char"  => StringBuiltins.evalIntegerToChar(args)
+      case "eq?"            => StringBuiltins.evalEq(args)
+      case "equal?"         => StringBuiltins.evalEqual(args)
+      case "abs"            => MathBuiltins.evalAbs(args, pos)
+      case "modulo"         => MathBuiltins.evalModulo(args, pos)
+      case "remainder"      => MathBuiltins.evalRemainder(args, pos)
+      case "quotient"       => MathBuiltins.evalQuotient(args, pos)
+      case "min"            => MathBuiltins.evalMinMax(args, pos, _ min _)
+      case "max"            => MathBuiltins.evalMinMax(args, pos, _ max _)
+      case "exact" =>
+        args match
+          case v :: Nil => MathBuiltins.inexactToExact(v, pos)
+          case _        => throw new EvalError("exact requires 1 argument")
+      case "inexact" =>
+        args match
+          case v :: Nil => MathBuiltins.exactToInexact(v, pos)
+          case _        => throw new EvalError("inexact requires 1 argument")
       case "expt"             => MathBuiltins.evalExpt(args, pos)
       case "zero?"            => MathBuiltins.numPred(args, pos, _ == 0L)
       case "positive?"        => MathBuiltins.numPred(args, pos, _ > 0L)
       case "negative?"        => MathBuiltins.numPred(args, pos, _ < 0L)
       case "odd?"             => MathBuiltins.numPred(args, pos, n => math.abs(n % 2) == 1L)
       case "even?"            => MathBuiltins.numPred(args, pos, _ % 2 == 0L)
-      case "list-ref"         => evalListRef(args)
-      case "list-tail"        => evalListTail(args)
-      case "list?"            => evalListPred(args)
-      case "assoc"            => evalAssoc(args)
+      case "list-ref"         => ListBuiltins.evalListRef(args)
+      case "list-tail"        => ListBuiltins.evalListTail(args)
+      case "list?"            => ListBuiltins.evalListPred(args)
+      case "assoc"            => ListBuiltins.evalAssoc(args)
       case "char-alphabetic?" => StringBuiltins.charPred(args, _.isLetter)
       case "char-numeric?"    => StringBuiltins.charPred(args, _.isDigit)
       case "char-upcase"      => StringBuiltins.charTransform(args, _.toUpper)
@@ -95,7 +135,7 @@ object Builtins:
       case "string-ci=?"      => StringBuiltins.strCmp(args, (a, b) => a.equalsIgnoreCase(b))
       case "string-upcase"    => StringBuiltins.strCase(args, _.toUpperCase)
       case "string-downcase"  => StringBuiltins.strCase(args, _.toLowerCase)
-      case "integer?"         => typePred(args, _.isInstanceOf[Value.IntVal])
+      case "integer?"         => typePred(args, MathBuiltins.isInteger)
       case "procedure?"       => typePred(args, v => v.isInstanceOf[Value.LambdaVal] || v.isInstanceOf[Value.Symbol])
       case "eqv?"             => StringBuiltins.evalEq(args)
       case "vector"           => VectorBuiltins.evalVector(args)
@@ -106,7 +146,7 @@ object Builtins:
       case "vector?"          => typePred(args, _.isInstanceOf[Value.VectorVal])
       case "vector->list"     => VectorBuiltins.evalVectorToList(args)
       case "list->vector"     => VectorBuiltins.evalListToVector(args)
-      case "reverse"          => evalReverse(args)
+      case "reverse"          => ListBuiltins.evalReverse(args)
       case _                  => throw new EvalError(s"unknown procedure: $name")
 
   private def typePred(
@@ -119,72 +159,6 @@ object Builtins:
         throw new EvalError(
           "type predicate requires exactly 1 argument"
         )
-
-  private def listLength(v: Value): Long = v match
-    case Value.NilVal           => 0L
-    case Value.PairVal(_, t, _) => 1L + listLength(t)
-    case _                      => throw new EvalError("length: not a proper list")
-
-  private def evalListRef(args: List[Value]): Value =
-    args match
-      case lst :: Value.IntVal(idx) :: Nil => listRef(lst, idx.toInt)
-      case _                               => throw new EvalError("list-ref requires list and index")
-
-  @scala.annotation.tailrec
-  private def listRef(v: Value, idx: Int): Value =
-    v match
-      case Value.PairVal(car, cdr, _) =>
-        if idx == 0 then car else listRef(cdr, idx - 1)
-      case _ => throw new EvalError("list-ref: index out of range")
-
-  private def evalListTail(args: List[Value]): Value =
-    args match
-      case lst :: Value.IntVal(idx) :: Nil => listTail(lst, idx.toInt)
-      case _                               => throw new EvalError("list-tail requires list and index")
-
-  @scala.annotation.tailrec
-  private def listTail(v: Value, idx: Int): Value =
-    if idx == 0 then v
-    else
-      v match
-        case Value.PairVal(_, cdr, _) => listTail(cdr, idx - 1)
-        case _                        => throw new EvalError("list-tail: index out of range")
-
-  private def evalListPred(args: List[Value]): Value =
-    args match
-      case v :: Nil => Value.BoolVal(isProperList(v))
-      case _        => throw new EvalError("list? requires exactly 1 argument")
-
-  @scala.annotation.tailrec
-  private def isProperList(v: Value): Boolean = v match
-    case Value.NilVal           => true
-    case Value.PairVal(_, t, _) => isProperList(t)
-    case _                      => false
-
-  private def evalReverse(args: List[Value]): Value =
-    args match
-      case lst :: Nil => reverseList(lst, Value.NilVal)
-      case _          => throw new EvalError("reverse requires exactly 1 argument")
-
-  @scala.annotation.tailrec
-  private def reverseList(lst: Value, acc: Value): Value = lst match
-    case Value.NilVal               => acc
-    case Value.PairVal(car, cdr, _) => reverseList(cdr, Value.PairVal(car, acc))
-    case _                          => throw new EvalError("reverse: not a proper list")
-
-  private def evalAssoc(args: List[Value]): Value =
-    args match
-      case key :: lst :: Nil => assocSearch(key, lst)
-      case _                 => throw new EvalError("assoc requires exactly 2 arguments")
-
-  @scala.annotation.tailrec
-  private def assocSearch(key: Value, lst: Value): Value =
-    lst match
-      case Value.NilVal => Value.BoolVal(false)
-      case Value.PairVal(pair @ Value.PairVal(k, _, _), rest, _) =>
-        if StringBuiltins.schemeEqual(key, k) then pair
-        else assocSearch(key, rest)
-      case _ => throw new EvalError("assoc: not a proper alist")
 
   val defaultEnv: Env = Env(Map.empty, None)
     .define("+", Value.Symbol("+"))
@@ -273,3 +247,12 @@ object Builtins:
     .define("reverse", Value.Symbol("reverse"))
     .define("values", Value.Symbol("values"))
     .define("call-with-values", Value.Symbol("call-with-values"))
+    .define("exact?", Value.Symbol("exact?"))
+    .define("inexact?", Value.Symbol("inexact?"))
+    .define("exact->inexact", Value.Symbol("exact->inexact"))
+    .define("inexact->exact", Value.Symbol("inexact->exact"))
+    .define("exact", Value.Symbol("exact"))
+    .define("inexact", Value.Symbol("inexact"))
+    .define("numerator", Value.Symbol("numerator"))
+    .define("denominator", Value.Symbol("denominator"))
+    .define("rational?", Value.Symbol("rational?"))
