@@ -40,7 +40,7 @@ impl<'src> Parser<'src> {
             ')' => Err(ParseError::UnexpectedClosingParenthesis { location }),
             '\'' => self.parse_quote(location),
             '"' => self.parse_string(location),
-            _ => Ok(self.parse_atom(location)),
+            _ => self.parse_atom(location),
         }
     }
 
@@ -96,15 +96,16 @@ impl<'src> Parser<'src> {
         }
     }
 
-    fn parse_atom(&mut self, location: SourceLocation) -> Expr {
+    fn parse_atom(&mut self, location: SourceLocation) -> Result<Expr, ParseError> {
         let token = self.take_while(|ch| !ch.is_whitespace() && ch != '(' && ch != ')');
 
         match token {
-            "#t" => Expr::boolean(true, location),
-            "#f" => Expr::boolean(false, location),
+            "#t" => Ok(Expr::boolean(true, location)),
+            "#f" => Ok(Expr::boolean(false, location)),
+            _ if token.starts_with("#\\") => parse_character_literal(token, location),
             _ => match token.parse::<i64>() {
-                Ok(value) => Expr::integer(value, location),
-                Err(_) => Expr::symbol(token.to_string(), location),
+                Ok(value) => Ok(Expr::integer(value, location)),
+                Err(_) => Ok(Expr::symbol(token.to_string(), location)),
             },
         }
     }
@@ -191,4 +192,28 @@ fn next_location(location: SourceLocation, ch: char) -> SourceLocation {
     }
 
     SourceLocation::new(location.line, location.column + 1)
+}
+
+fn parse_character_literal(token: &str, location: SourceLocation) -> Result<Expr, ParseError> {
+    let literal = &token[2..];
+    let value = match literal {
+        "space" => Some(' '),
+        "newline" => Some('\n'),
+        _ => {
+            let mut chars = literal.chars();
+            let first = chars.next();
+            if chars.next().is_none() {
+                first
+            } else {
+                None
+            }
+        }
+    };
+
+    value
+        .map(|value| Expr::character(value, location))
+        .ok_or(ParseError::InvalidCharacterLiteral {
+            location,
+            literal: token.to_string(),
+        })
 }

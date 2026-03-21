@@ -32,7 +32,8 @@ fn eval_expr(
     match expression {
         Expr::Integer { value, .. } => Ok(Value::Integer(*value)),
         Expr::Boolean { value, .. } => Ok(Value::Boolean(*value)),
-        Expr::String { value, .. } => Ok(Value::String(value.clone())),
+        Expr::String { value, .. } => Ok(Value::immutable_string(value.clone())),
+        Expr::Character { value, .. } => Ok(Value::Character(*value)),
         Expr::Symbol { name, location } => {
             environment
                 .lookup(name)
@@ -397,7 +398,8 @@ fn quote_expression(expression: &Expr) -> Value {
     match expression {
         Expr::Integer { value, .. } => Value::Integer(*value),
         Expr::Boolean { value, .. } => Value::Boolean(*value),
-        Expr::String { value, .. } => Value::String(value.clone()),
+        Expr::String { value, .. } => Value::immutable_string(value.clone()),
+        Expr::Character { value, .. } => Value::Character(*value),
         Expr::Symbol { name, .. } => Value::Symbol(name.clone()),
         Expr::List { items, .. } => items.iter().rev().fold(Value::EmptyList, |tail, item| {
             Value::Pair(Box::new(quote_expression(item)), Box::new(tail))

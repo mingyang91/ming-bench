@@ -1,6 +1,7 @@
 use crate::scheme::ast::SourceLocation;
 use crate::scheme::environment::Environment;
 use crate::scheme::error::{ArgCount, EvalError};
+use crate::scheme::string_value::StringMutationError;
 use crate::scheme::value::Value;
 
 #[derive(Debug, Clone, Copy)]
@@ -36,6 +37,8 @@ pub enum BuiltinProcedure {
     SymbolToString,
     StringToSymbol,
     StringRef,
+    StringCopy,
+    StringSet,
     CharPred,
 }
 
@@ -73,6 +76,8 @@ impl BuiltinProcedure {
             Self::SymbolToString => "symbol->string",
             Self::StringToSymbol => "string->symbol",
             Self::StringRef => "string-ref",
+            Self::StringCopy => "string-copy",
+            Self::StringSet => "string-set!",
             Self::CharPred => "char?",
         }
     }
@@ -111,6 +116,8 @@ pub fn install_builtins(environment: &Environment) {
         BuiltinProcedure::SymbolToString,
         BuiltinProcedure::StringToSymbol,
         BuiltinProcedure::StringRef,
+        BuiltinProcedure::StringCopy,
+        BuiltinProcedure::StringSet,
         BuiltinProcedure::CharPred,
     ];
 
@@ -173,6 +180,8 @@ pub fn apply_builtin(
         BuiltinProcedure::SymbolToString => eval_symbol_to_string(arguments, location),
         BuiltinProcedure::StringToSymbol => eval_string_to_symbol(arguments, location),
         BuiltinProcedure::StringRef => eval_string_ref(arguments, location),
+        BuiltinProcedure::StringCopy => eval_string_copy(arguments, location),
+        BuiltinProcedure::StringSet => eval_string_set(arguments, location),
         BuiltinProcedure::CharPred => eval_type_predicate("char?", arguments, location, is_char),
     }
 }
@@ -377,16 +386,16 @@ fn eval_string_append(arguments: &[Value], location: SourceLocation) -> Result<V
     let combined = arguments
         .iter()
         .try_fold(String::new(), |mut combined, argument| {
-            combined.push_str(argument.expect_string(location)?);
+            combined.push_str(&argument.expect_string(location)?.as_string());
             Ok::<_, EvalError>(combined)
         })?;
 
-    Ok(Value::String(combined))
+    Ok(Value::immutable_string(combined))
 }
 
 fn eval_string_length(arguments: &[Value], location: SourceLocation) -> Result<Value, EvalError> {
     let string = unary_argument("string-length", arguments, location)?.expect_string(location)?;
-    let length = string.chars().count();
+    let length = string.len();
 
     Ok(Value::Integer(
         i64::try_from(length).expect("string length should fit in i64"),
@@ -406,8 +415,7 @@ fn eval_substring(arguments: &[Value], location: SourceLocation) -> Result<Value
     let string = string_value.expect_string(location)?;
     let start = start_value.expect_number(location)?;
     let end = end_value.expect_number(location)?;
-    let characters: Vec<_> = string.chars().collect();
-    let length = characters.len();
+    let length = string.len();
     let Some(start_index) = usize::try_from(start).ok() else {
         return Err(EvalError::InvalidSubstringRange {
             location,
@@ -434,9 +442,7 @@ fn eval_substring(arguments: &[Value], location: SourceLocation) -> Result<Value
         });
     }
 
-    Ok(Value::String(
-        characters[start_index..end_index].iter().collect(),
-    ))
+    Ok(Value::String(string.substring(start_index, end_index)))
 }
 
 fn eval_string_to_number(
@@ -445,7 +451,7 @@ fn eval_string_to_number(
 ) -> Result<Value, EvalError> {
     let string = unary_argument("string->number", arguments, location)?.expect_string(location)?;
 
-    match string.parse::<i64>() {
+    match string.as_string().parse::<i64>() {
         Ok(value) => Ok(Value::Integer(value)),
         Err(_) => Ok(Value::Boolean(false)),
     }
@@ -456,7 +462,7 @@ fn eval_number_to_string(
     location: SourceLocation,
 ) -> Result<Value, EvalError> {
     let number = unary_argument("number->string", arguments, location)?.expect_number(location)?;
-    Ok(Value::String(number.to_string()))
+    Ok(Value::immutable_string(number.to_string()))
 }
 
 fn eval_symbol_to_string(
@@ -464,7 +470,7 @@ fn eval_symbol_to_string(
     location: SourceLocation,
 ) -> Result<Value, EvalError> {
     let symbol = unary_argument("symbol->string", arguments, location)?.expect_symbol(location)?;
-    Ok(Value::String(symbol.to_string()))
+    Ok(Value::immutable_string(symbol.to_string()))
 }
 
 fn eval_string_to_symbol(
@@ -472,7 +478,7 @@ fn eval_string_to_symbol(
     location: SourceLocation,
 ) -> Result<Value, EvalError> {
     let string = unary_argument("string->symbol", arguments, location)?.expect_string(location)?;
-    Ok(Value::Symbol(string.to_string()))
+    Ok(Value::Symbol(string.as_string()))
 }
 
 fn eval_string_ref(arguments: &[Value], location: SourceLocation) -> Result<Value, EvalError> {
@@ -487,25 +493,65 @@ fn eval_string_ref(arguments: &[Value], location: SourceLocation) -> Result<Valu
 
     let string = string_value.expect_string(location)?;
     let index = index_value.expect_number(location)?;
-    let characters: Vec<_> = string.chars().collect();
-    let length = characters.len();
+    let length = string.len();
     let Some(index) = usize::try_from(index).ok() else {
         return Err(EvalError::StringIndexOutOfBounds {
             location,
-            index: index_value.expect_number(location)?,
+            index,
             length,
         });
     };
 
-    characters
-        .get(index)
-        .copied()
+    string
+        .char_at(index)
         .map(Value::Character)
         .ok_or(EvalError::StringIndexOutOfBounds {
             location,
             index: index_value.expect_number(location)?,
             length,
         })
+}
+
+fn eval_string_copy(arguments: &[Value], location: SourceLocation) -> Result<Value, EvalError> {
+    let string = unary_argument("string-copy", arguments, location)?.expect_string(location)?;
+    Ok(Value::String(string.mutable_copy()))
+}
+
+fn eval_string_set(arguments: &[Value], location: SourceLocation) -> Result<Value, EvalError> {
+    let [string_value, index_value, character_value] = arguments else {
+        return Err(EvalError::WrongArgumentCount {
+            location,
+            procedure: "string-set!",
+            expected: ArgCount::Exactly(3),
+            got: arguments.len(),
+        });
+    };
+
+    let string = string_value.expect_string(location)?;
+    let index = index_value.expect_number(location)?;
+    let character = character_value.expect_char(location)?;
+    let Some(index) = usize::try_from(index).ok() else {
+        return Err(EvalError::StringIndexOutOfBounds {
+            location,
+            index,
+            length: string.len(),
+        });
+    };
+
+    match string.set_char(index, character) {
+        Ok(()) => Ok(Value::Void),
+        Err(StringMutationError::Immutable) => Err(EvalError::ImmutableString {
+            location,
+            procedure: "string-set!",
+        }),
+        Err(StringMutationError::IndexOutOfBounds { length }) => {
+            Err(EvalError::StringIndexOutOfBounds {
+                location,
+                index: index_value.expect_number(location)?,
+                length,
+            })
+        }
+    }
 }
 
 fn eval_type_predicate(

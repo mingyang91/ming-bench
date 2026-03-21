@@ -5,6 +5,7 @@ use crate::scheme::ast::SourceLocation;
 use crate::scheme::builtins::BuiltinProcedure;
 use crate::scheme::environment::Environment;
 use crate::scheme::error::EvalError;
+use crate::scheme::string_value::SchemeString;
 
 #[derive(Clone, Copy)]
 enum RenderMode {
@@ -16,7 +17,7 @@ enum RenderMode {
 pub enum Value {
     Integer(i64),
     Boolean(bool),
-    String(String),
+    String(SchemeString),
     Character(char),
     Symbol(String),
     EmptyList,
@@ -57,6 +58,10 @@ impl fmt::Debug for Value {
 }
 
 impl Value {
+    pub fn immutable_string(value: impl Into<String>) -> Self {
+        Self::String(SchemeString::immutable(value))
+    }
+
     pub fn render(&self) -> String {
         self.render_with_mode(RenderMode::Write)
     }
@@ -91,12 +96,23 @@ impl Value {
         }
     }
 
-    pub fn expect_string(&self, location: SourceLocation) -> Result<&str, EvalError> {
+    pub fn expect_string(&self, location: SourceLocation) -> Result<&SchemeString, EvalError> {
         match self {
             Self::String(value) => Ok(value),
             _ => Err(EvalError::TypeMismatch {
                 location,
                 expected: "string",
+                found: self.type_name(),
+            }),
+        }
+    }
+
+    pub fn expect_char(&self, location: SourceLocation) -> Result<char, EvalError> {
+        match self {
+            Self::Character(value) => Ok(*value),
+            _ => Err(EvalError::TypeMismatch {
+                location,
+                expected: "char",
                 found: self.type_name(),
             }),
         }
@@ -140,10 +156,12 @@ fn render_boolean(value: bool) -> String {
     }
 }
 
-fn render_string(value: &str, mode: RenderMode) -> String {
+fn render_string(value: &SchemeString, mode: RenderMode) -> String {
+    let rendered = value.as_string();
+
     match mode {
-        RenderMode::Write => format!("\"{}\"", escape_string_contents(value)),
-        RenderMode::Display => value.to_string(),
+        RenderMode::Write => format!("\"{}\"", escape_string_contents(&rendered)),
+        RenderMode::Display => rendered,
     }
 }
 

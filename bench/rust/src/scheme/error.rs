@@ -28,6 +28,11 @@ pub enum ParseError {
         location: SourceLocation,
         escape: char,
     },
+    #[error("{location}: invalid character literal: {literal}")]
+    InvalidCharacterLiteral {
+        location: SourceLocation,
+        literal: String,
+    },
 }
 
 /// Evaluation error type for the Scheme interpreter.
@@ -99,6 +104,11 @@ pub enum EvalError {
         start: i64,
         end: i64,
         length: usize,
+    },
+    #[error("{location}: cannot mutate immutable string with {procedure}")]
+    ImmutableString {
+        location: SourceLocation,
+        procedure: &'static str,
     },
     #[error("{location}: division by zero")]
     DivisionByZero { location: SourceLocation },

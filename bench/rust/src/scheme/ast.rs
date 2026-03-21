@@ -32,6 +32,10 @@ pub enum Expr {
         value: String,
         location: SourceLocation,
     },
+    Character {
+        value: char,
+        location: SourceLocation,
+    },
     Symbol {
         name: String,
         location: SourceLocation,
@@ -55,6 +59,10 @@ impl Expr {
         Self::String { value, location }
     }
 
+    pub fn character(value: char, location: SourceLocation) -> Self {
+        Self::Character { value, location }
+    }
+
     pub fn symbol(name: String, location: SourceLocation) -> Self {
         Self::Symbol { name, location }
     }
@@ -68,6 +76,7 @@ impl Expr {
             Self::Integer { location, .. }
             | Self::Boolean { location, .. }
             | Self::String { location, .. }
+            | Self::Character { location, .. }
             | Self::Symbol { location, .. }
             | Self::List { location, .. } => *location,
         }
