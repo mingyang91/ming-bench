@@ -146,6 +146,11 @@ fn eval_special_form(
         "dynamic-wind" => eval_dynamic_wind(args, span, env)
             .map(Bounce::Done)
             .map(Some),
+        "raise" => eval_raise(args, span, env).map(Bounce::Done).map(Some),
+        "guard" => eval_guard(args, span, env).map(Some),
+        "with-exception-handler" => eval_with_exception_handler(args, span, env)
+            .map(Bounce::Done)
+            .map(Some),
         _ => Ok(None),
     }
 }
@@ -552,6 +557,94 @@ fn eval_dynamic_wind(args: &[Expr], span: Span, env: &Env) -> Result<Value, Eval
             call_thunk(&out_thunk, span)?;
             Err(e)
         }
+    }
+}
+
+/// Evaluate `(raise value)` — signal a Scheme exception.
+fn eval_raise(args: &[Expr], span: Span, env: &Env) -> Result<Value, EvalError> {
+    let [ref val_expr] = args else {
+        return Err(EvalError::WrongArgCount { expected: 1, got: args.len() }.at(span));
+    };
+    let val = eval(val_expr, env)?;
+    Err(EvalError::SchemeException(Box::new(val)))
+}
+
+/// Try each guard clause in order; return the first matching clause's body as a Bounce.
+fn match_guard_clause(
+    clauses: &[Expr],
+    span: Span,
+    env: &Env,
+) -> Result<Option<Bounce>, EvalError> {
+    for clause in clauses {
+        let Expr::List(ref parts, _) = clause else {
+            return Err(EvalError::Parse("guard clause must be a list".into()).at(span));
+        };
+        let [ref test, ref clause_body @ ..] = parts.as_slice() else {
+            return Err(EvalError::Parse("guard clause must have a test".into()).at(span));
+        };
+        let is_else = matches!(test, Expr::Symbol(s, _) if s == "else");
+        if is_else || eval(test, env)?.is_truthy() {
+            return eval_body_tco(clause_body, env.clone()).map(Some);
+        }
+    }
+    Ok(None)
+}
+
+/// Evaluate `(guard (var clause ...) body ...)`.
+/// Catches SchemeException, binds it to `var`, tests cond-like clauses.
+fn eval_guard(args: &[Expr], span: Span, env: &Env) -> Result<Bounce, EvalError> {
+    let [Expr::List(ref clauses_list, _), ref body @ ..] = args else {
+        return Err(EvalError::Parse("invalid guard form".into()).at(span));
+    };
+    let [Expr::Symbol(ref var_name, _), ref clauses @ ..] = clauses_list.as_slice() else {
+        return Err(EvalError::Parse("guard requires a variable".into()).at(span));
+    };
+    if body.is_empty() {
+        return Err(EvalError::Parse("guard requires a body".into()).at(span));
+    }
+
+    // Evaluate body, catching SchemeException
+    let body_expr = wrap_body(body, span);
+    let body_result = eval(&body_expr, env);
+
+    match body_result {
+        Ok(val) => Ok(Bounce::Done(val)),
+        Err(EvalError::SchemeException(exn_val)) => {
+            // Bind exception to var_name and test clauses
+            let guard_env = Env::extend(env);
+            guard_env.define(var_name.clone(), *exn_val.clone());
+
+            match match_guard_clause(clauses, span, &guard_env)? {
+                Some(bounce) => Ok(bounce),
+                None => Err(EvalError::SchemeException(exn_val)),
+            }
+        }
+        Err(e) => Err(e),
+    }
+}
+
+/// Evaluate `(with-exception-handler handler thunk)`.
+fn eval_with_exception_handler(
+    args: &[Expr],
+    span: Span,
+    env: &Env,
+) -> Result<Value, EvalError> {
+    let [ref handler_expr, ref thunk_expr] = args else {
+        return Err(EvalError::WrongArgCount { expected: 2, got: args.len() }.at(span));
+    };
+    let handler = eval(handler_expr, env)?;
+    let thunk = eval(thunk_expr, env)?;
+
+    match call_thunk(&thunk, span) {
+        Ok(val) => Ok(val),
+        Err(EvalError::SchemeException(exn_val)) => {
+            // Call handler with the exception value
+            match apply_lambda_values(handler, &[*exn_val], span)? {
+                Bounce::Done(val) => Ok(val),
+                Bounce::Tco(expr, tco_env) => eval(&expr, &tco_env),
+            }
+        }
+        Err(e) => Err(e),
     }
 }
 

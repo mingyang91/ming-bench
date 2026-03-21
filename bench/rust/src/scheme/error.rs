@@ -41,6 +41,9 @@ pub enum EvalError {
         value: Box<Value>,
         expr_index: usize,
     },
+
+    #[error("scheme exception: {0}")]
+    SchemeException(Box<Value>),
 }
 
 impl PartialEq for EvalError {
@@ -86,6 +89,7 @@ impl PartialEq for EvalError {
                     col: bc,
                 },
             ) => ai == bi && al == bl && ac == bc,
+            (EvalError::SchemeException(a), EvalError::SchemeException(b)) => a == b,
             _ => false,
         }
     }
@@ -95,7 +99,7 @@ impl EvalError {
     pub fn at(self, span: Span) -> Self {
         if matches!(
             self,
-            EvalError::Positioned { .. } | EvalError::ContinuationReturn { .. }
+            EvalError::Positioned { .. } | EvalError::ContinuationReturn { .. } | EvalError::SchemeException(_)
         ) {
             return self;
         }
