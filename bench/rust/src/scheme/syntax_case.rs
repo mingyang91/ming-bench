@@ -542,7 +542,7 @@ fn is_reserved_syntax(name: &str) -> bool {
         "if" | "let" | "let*" | "letrec" | "letrec*"
             | "begin" | "set!" | "define" | "quote"
             | "cond" | "case" | "and" | "or"
-            | "lambda" | "when" | "unless" | "do"
+            | "lambda" | "case-lambda" | "when" | "unless" | "do"
             | "define-syntax" | "syntax-rules" | "syntax-case"
             | "syntax" | "with-syntax"
             | "string-set!" | "else" | "=>"

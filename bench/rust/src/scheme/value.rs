@@ -24,6 +24,9 @@ pub enum Value {
         body: Expr,
         closure: Env,
     },
+    CaseLambda {
+        clauses: Vec<(Vec<String>, Option<String>, Expr, Env)>,
+    },
     Builtin(String),
     Continuation { id: u64, expr_index: usize },
     Macro {
@@ -116,6 +119,7 @@ impl fmt::Display for Value {
             Value::List(items) => fmt_list(f, items),
             Value::Vector(v) => fmt_vector(f, &v.borrow()),
             Value::Lambda { .. }
+            | Value::CaseLambda { .. }
             | Value::Builtin(_)
             | Value::Continuation { .. }
             | Value::Macro { .. }

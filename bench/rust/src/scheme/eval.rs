@@ -266,6 +266,10 @@ fn eval_special_form(
             .map(Bounce::Done)
             .map(Some)
             .map_err(|e| e.at(span)),
+        "case-lambda" => eval_case_lambda(args, env)
+            .map(Bounce::Done)
+            .map(Some)
+            .map_err(|e| e.at(span)),
         "let" => eval_let(args, span, env).map(Some),
         "begin" => eval_begin(args, env).map(Some),
         "cond" => eval_cond(args, span, env).map(Some),
@@ -499,6 +503,11 @@ fn eval_application(
                 args.iter().map(|a| eval(a, env)).collect::<Result<_, _>>()?;
             apply_lambda_values(op_val, &arg_vals, span)
         }
+        Value::CaseLambda { .. } => {
+            let arg_vals: Vec<Value> =
+                args.iter().map(|a| eval(a, env)).collect::<Result<_, _>>()?;
+            apply_case_lambda(op_val, &arg_vals, span)
+        }
         Value::Builtin(ref name) if name == "apply" => {
             let arg_vals: Vec<Value> =
                 args.iter().map(|a| eval(a, env)).collect::<Result<_, _>>()?;
@@ -613,6 +622,7 @@ fn eval_apply(args: &[Value], span: Span, env: &Env) -> Result<Bounce, EvalError
 
     match proc {
         Value::Lambda { .. } => apply_lambda_values(proc.clone(), &combined, span),
+        Value::CaseLambda { .. } => apply_case_lambda(proc.clone(), &combined, span),
         Value::Builtin(ref name) if name == "apply" => eval_apply(&combined, span, env),
         Value::Builtin(ref name)
             if name == "call/cc" || name == "call-with-current-continuation" =>
@@ -676,8 +686,13 @@ fn eval_callcc_with_proc(proc: Value, span: Span, env: &Env) -> Result<Value, Ev
     let cont = Value::Continuation { id, expr_index };
 
     env.activate_callcc(id);
-    let result = if matches!(proc, Value::Lambda { .. }) {
-        match apply_lambda_values(proc, &[cont], span) {
+    let apply_result = match &proc {
+        Value::Lambda { .. } => Some(apply_lambda_values(proc.clone(), std::slice::from_ref(&cont), span)),
+        Value::CaseLambda { .. } => Some(apply_case_lambda(proc.clone(), std::slice::from_ref(&cont), span)),
+        _ => None,
+    };
+    let result = if let Some(apply_result) = apply_result {
+        match apply_result {
             Ok(Bounce::Done(val)) => Ok(val),
             Ok(Bounce::Tco(expr, tco_env)) => eval(&expr, &tco_env),
             Err(e) => Err(e),
@@ -1247,7 +1262,7 @@ fn apply_builtin_values(name: &str, args: &[Value]) -> Result<Value, EvalError> 
         "vector?" => Ok(Value::Boolean(matches!(args, [Value::Vector(_)]))),
         "vector->list" => apply_vector_to_list(args),
         "list->vector" => apply_list_to_vector(args),
-        "procedure?" => Ok(Value::Boolean(matches!(args, [Value::Lambda { .. } | Value::Builtin(_) | Value::Continuation { .. }]))),
+        "procedure?" => Ok(Value::Boolean(matches!(args, [Value::Lambda { .. } | Value::CaseLambda { .. } | Value::Builtin(_) | Value::Continuation { .. }]))),
         "integer?" => Ok(Value::Boolean(matches!(args, [Value::Integer(_)]))),
         "rational?" => Ok(Value::Boolean(matches!(args, [Value::Integer(_) | Value::Rational(_, _)]))),
         "exact?" => Ok(Value::Boolean(matches!(args, [Value::Integer(_) | Value::Rational(_, _)]))),
@@ -1384,6 +1399,12 @@ fn call_proc_values(proc: &Value, args: &[Value]) -> Result<Value, EvalError> {
     match proc {
         Value::Lambda { .. } => {
             match apply_lambda_values(proc.clone(), args, Span { line: 0, col: 0 })? {
+                Bounce::Done(val) => Ok(val),
+                Bounce::Tco(expr, tco_env) => eval(&expr, &tco_env),
+            }
+        }
+        Value::CaseLambda { .. } => {
+            match apply_case_lambda(proc.clone(), args, Span { line: 0, col: 0 })? {
                 Bounce::Done(val) => Ok(val),
                 Bounce::Tco(expr, tco_env) => eval(&expr, &tco_env),
             }
@@ -1688,7 +1709,7 @@ fn eval_builtin(op: &str, args: &[Expr], env: &Env) -> Result<Value, EvalError> 
         "vector->list" => eval_vector_to_list(args, env),
         "list->vector" => eval_list_to_vector(args, env),
         "procedure?" => eval_type_pred(args, env, |v| {
-            matches!(v, Value::Lambda { .. } | Value::Builtin(_) | Value::Continuation { .. })
+            matches!(v, Value::Lambda { .. } | Value::CaseLambda { .. } | Value::Builtin(_) | Value::Continuation { .. })
         }),
         "integer?" => eval_type_pred(args, env, |v| matches!(v, Value::Integer(_))),
         "rational?" => eval_type_pred(args, env, |v| matches!(v, Value::Integer(_) | Value::Rational(_, _))),
@@ -1802,6 +1823,63 @@ fn eval_lambda(args: &[Expr], env: &Env) -> Result<Value, EvalError> {
         body: wrapped_body,
         closure: env.clone(),
     })
+}
+
+fn eval_case_lambda(args: &[Expr], env: &Env) -> Result<Value, EvalError> {
+    let clauses: Vec<(Vec<String>, Option<String>, Expr, Env)> = args
+        .iter()
+        .map(|clause| {
+            let Expr::List(elems, span) = clause else {
+                return Err(EvalError::Parse("case-lambda clause must be a list".into()));
+            };
+            let [Expr::List(params, pspan), body @ ..] = elems.as_slice() else {
+                return Err(EvalError::Parse("case-lambda clause must have formals and body".into()));
+            };
+            if body.is_empty() {
+                return Err(EvalError::Parse("case-lambda clause requires a body".into()));
+            }
+            let (param_names, rest_param) = parse_params(params, *pspan)?;
+            let wrapped_body = wrap_body(body, *span);
+            Ok((param_names, rest_param, wrapped_body, env.clone()))
+        })
+        .collect::<Result<_, _>>()?;
+    Ok(Value::CaseLambda { clauses })
+}
+
+fn apply_case_lambda(
+    case_lambda: Value,
+    arg_vals: &[Value],
+    span: Span,
+) -> Result<Bounce, EvalError> {
+    let Value::CaseLambda { clauses } = case_lambda else {
+        unreachable!("caller ensures case-lambda");
+    };
+    let argc = arg_vals.len();
+    for (params, rest_param, body, closure) in clauses {
+        let min_params = params.len();
+        let matches = if rest_param.is_some() {
+            argc >= min_params
+        } else {
+            argc == min_params
+        };
+        if !matches {
+            continue;
+        }
+        let call_env = Env::extend(&closure);
+        for (param, val) in params.iter().zip(arg_vals.iter()) {
+            call_env.define(param.clone(), val.clone());
+        }
+        if let Some(rest_name) = rest_param {
+            let rest_vals = arg_vals[min_params..].to_vec();
+            call_env.define(rest_name, Value::make_list(rest_vals));
+        }
+        return Ok(Bounce::Tco(body, call_env));
+    }
+    Err(EvalError::WrongArgCount {
+        expected: 0, // no matching clause
+        got: argc,
+    }
+    .at(span))
 }
 
 fn eval_define_syntax(args: &[Expr], span: Span, env: &Env) -> Result<Value, EvalError> {
@@ -2496,6 +2574,12 @@ fn eval_map(args: &[Expr], env: &Env) -> Result<Value, EvalError> {
         let result = match &proc {
             Value::Lambda { .. } => {
                 match apply_lambda_values(proc.clone(), &call_args, Span { line: 0, col: 0 })? {
+                    Bounce::Done(val) => val,
+                    Bounce::Tco(expr, tco_env) => eval(&expr, &tco_env)?,
+                }
+            }
+            Value::CaseLambda { .. } => {
+                match apply_case_lambda(proc.clone(), &call_args, Span { line: 0, col: 0 })? {
                     Bounce::Done(val) => val,
                     Bounce::Tco(expr, tco_env) => eval(&expr, &tco_env)?,
                 }
