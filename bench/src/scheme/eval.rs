@@ -82,6 +82,8 @@ fn eval_pair_bounce(
             "cond" => eval_cond_bounce(args, env, out),
             "and" => eval_and_bounce(args, env, out),
             "or" => eval_or_bounce(args, env, out),
+            "letrec" => eval_letrec_bounce(args, env, out),
+            "letrec*" => eval_letrec_star_bounce(args, env, out),
             "set!" => eval_set(args, env, out).map(Bounce::Done),
             "string-set!" => eval_string_set(args, env, out).map(Bounce::Done),
             "call/cc" | "call-with-current-continuation" => {
@@ -736,6 +738,93 @@ fn eval_named_let_bounce(
 
     // Execute the loop body directly using eval, which uses the trampoline
     let result = eval(&func_body, &mut loop_env, out)?;
+    Ok(Bounce::Done(result))
+}
+
+type ParsedBindings<'a> = (&'a Value, Vec<(String, Value)>, &'a [Value]);
+
+fn parse_bindings(args: &[Value]) -> Result<ParsedBindings<'_>, EvalError> {
+    let [bindings_val, body @ ..] = args else {
+        return Err(EvalError::WrongArgCount {
+            expected: 2,
+            got: args.len(),
+        });
+    };
+    let binding_list = bindings_val
+        .to_list_vec()
+        .ok_or_else(|| EvalError::TypeError {
+            expected: "binding list".to_string(),
+            got: bindings_val.display(),
+        })?;
+    let pairs: Vec<(String, Value)> = binding_list
+        .iter()
+        .map(|binding| {
+            let pair = binding.to_list_vec().ok_or_else(|| EvalError::TypeError {
+                expected: "binding pair".to_string(),
+                got: binding.display(),
+            })?;
+            let [Value::Symbol(name), expr] = pair.as_slice() else {
+                return Err(EvalError::TypeError {
+                    expected: "(symbol expr)".to_string(),
+                    got: binding.display(),
+                });
+            };
+            Ok((name.clone(), expr.clone()))
+        })
+        .collect::<Result<_, EvalError>>()?;
+    Ok((bindings_val, pairs, body))
+}
+
+fn eval_letrec_bounce(
+    args: &[Value],
+    env: &mut Env,
+    out: &mut String,
+) -> Result<Bounce, EvalError> {
+    let (_bindings_val, pairs, body) = parse_bindings(args)?;
+
+    // Create new env with all variables bound to Nil (placeholder)
+    let mut letrec_env = env.clone();
+    let cells: Vec<Rc<RefCell<Value>>> = pairs
+        .iter()
+        .map(|(name, _)| {
+            let cell = Rc::new(RefCell::new(Value::Nil));
+            letrec_env.insert(name.clone(), cell.clone());
+            cell
+        })
+        .collect();
+
+    // Evaluate all init expressions in the extended env
+    let values: Vec<Value> = pairs
+        .iter()
+        .map(|(_, expr)| eval(expr, &mut letrec_env, out))
+        .collect::<Result<_, _>>()?;
+
+    // Assign computed values
+    for (cell, val) in cells.iter().zip(values) {
+        *cell.borrow_mut() = val;
+    }
+
+    let func_body = wrap_body(body)?;
+    let result = eval(&func_body, &mut letrec_env, out)?;
+    Ok(Bounce::Done(result))
+}
+
+fn eval_letrec_star_bounce(
+    args: &[Value],
+    env: &mut Env,
+    out: &mut String,
+) -> Result<Bounce, EvalError> {
+    let (_bindings_val, pairs, body) = parse_bindings(args)?;
+
+    // Create new env, evaluate and bind sequentially
+    let mut letrec_env = env.clone();
+    for (name, expr) in &pairs {
+        let val = eval(expr, &mut letrec_env, out)?;
+        letrec_env.insert(name.clone(), Rc::new(RefCell::new(val)));
+    }
+
+    let func_body = wrap_body(body)?;
+    let result = eval(&func_body, &mut letrec_env, out)?;
     Ok(Bounce::Done(result))
 }
 
