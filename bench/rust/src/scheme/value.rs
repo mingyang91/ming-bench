@@ -42,6 +42,10 @@ pub enum Value {
         type_name: String,
         fields: Vec<(String, Value)>,
     },
+    Parameter {
+        cell: Rc<RefCell<Value>>,
+        converter: Option<Box<Value>>,
+    },
     Values(Vec<Value>),
     Void,
 }
@@ -97,6 +101,9 @@ impl PartialEq for Value {
                 Value::Record { type_id: a, fields: af, .. },
                 Value::Record { type_id: b, fields: bf, .. },
             ) => a == b && af == bf,
+            (Value::Parameter { cell: a, .. }, Value::Parameter { cell: b, .. }) => {
+                Rc::ptr_eq(a, b)
+            }
             (Value::Values(a), Value::Values(b)) => a == b,
             (Value::Void, Value::Void) => true,
             _ => false,
@@ -123,7 +130,8 @@ impl fmt::Display for Value {
             | Value::Builtin(_)
             | Value::Continuation { .. }
             | Value::Macro { .. }
-            | Value::TransformerMacro { .. } => write!(f, "#<procedure>"),
+            | Value::TransformerMacro { .. }
+            | Value::Parameter { .. } => write!(f, "#<procedure>"),
             Value::Record { type_name, fields, .. } => fmt_record(f, type_name, fields),
             Value::Values(vals) => fmt_values(f, vals),
             Value::Void => write!(f, ""),
@@ -266,7 +274,8 @@ impl Value {
             Value::Pair(p) => display_pair_chain(p, buf),
             Value::List(items) => Self::display_list(items, buf),
             Value::Vector(v) => Self::display_vector(&v.borrow(), buf),
-            Value::Continuation { .. } | Value::Macro { .. } | Value::TransformerMacro { .. } => {
+            Value::Continuation { .. } | Value::Macro { .. } | Value::TransformerMacro { .. }
+            | Value::Parameter { .. } => {
                 buf.push_str("#<procedure>");
             }
             Value::Record { type_name, fields, .. } => {

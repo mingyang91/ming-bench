@@ -1,9 +1,15 @@
+use std::cell::RefCell;
+use std::rc::Rc;
+
 use crate::scheme::env::Env;
 use crate::scheme::error::{EvalError, Span};
 use crate::scheme::macros;
 use crate::scheme::parser::Expr;
 use crate::scheme::syntax_case;
 use crate::scheme::value::{Value, gcd, make_rational};
+
+/// State for a single parameterize binding: (cell, converter, old_value, new_value).
+type ParamBinding = (Rc<RefCell<Value>>, Option<Box<Value>>, Value, Value);
 
 /// Trampoline result: either a final value or a tail-call continuation.
 enum Bounce {
@@ -309,6 +315,9 @@ fn eval_special_form(
         "do" => eval_do(args, span, env).map(Some),
         "let-values" => eval_let_values(args, span, env).map(Some),
         "receive" => eval_receive(args, span, env).map(Some),
+        "parameterize" => eval_parameterize(args, span, env)
+            .map(Bounce::Done)
+            .map(Some),
         _ => Ok(None),
     }
 }
@@ -678,6 +687,11 @@ fn eval_application(
                 args.iter().map(|a| eval(a, env)).collect::<Result<_, _>>()?;
             apply_builtin_values(name, &arg_vals).map(Bounce::Done).map_err(|e| e.at(span))
         }
+        Value::Parameter { ref cell, ref converter } => {
+            let arg_vals: Vec<Value> =
+                args.iter().map(|a| eval(a, env)).collect::<Result<_, _>>()?;
+            apply_parameter(cell, converter.as_deref(), arg_vals).map(Bounce::Done).map_err(|e| e.at(span))
+        }
         Value::Continuation { id, expr_index } => {
             let arg_vals: Vec<Value> =
                 args.iter().map(|a| eval(a, env)).collect::<Result<_, _>>()?;
@@ -910,6 +924,106 @@ fn eval_dynamic_wind(args: &[Expr], span: Span, env: &Env) -> Result<Value, Eval
             Err(e)
         }
     }
+}
+
+/// Apply a parameter object: 0 args = get, 1 arg = set (with optional converter).
+fn apply_parameter(
+    cell: &Rc<RefCell<Value>>,
+    converter: Option<&Value>,
+    arg_vals: Vec<Value>,
+) -> Result<Value, EvalError> {
+    match arg_vals.len() {
+        0 => Ok(cell.borrow().clone()),
+        1 => {
+            let raw = arg_vals.into_iter().next().expect("len checked");
+            let new_val = match converter {
+                Some(conv) => call_proc_values(conv, &[raw])?,
+                None => raw,
+            };
+            *cell.borrow_mut() = new_val;
+            Ok(Value::Void)
+        }
+        n => Err(EvalError::WrongArgCount { expected: 1, got: n }),
+    }
+}
+
+/// Create a parameter object: `(make-parameter value)` or `(make-parameter value converter)`.
+fn apply_make_parameter(args: &[Value]) -> Result<Value, EvalError> {
+    let (init, converter) = match args {
+        [init] => (init.clone(), None),
+        [init, conv] => {
+            let converted = call_proc_values(conv, std::slice::from_ref(init))?;
+            (converted, Some(Box::new(conv.clone())))
+        }
+        _ => return Err(EvalError::WrongArgCount { expected: 1, got: args.len() }),
+    };
+    Ok(Value::Parameter {
+        cell: Rc::new(RefCell::new(init)),
+        converter,
+    })
+}
+
+/// Evaluate `(parameterize ((param val) ...) body ...)`.
+/// Saves old values, sets new values, evaluates body, restores old values.
+/// Restores even on non-local exit (continuation escape).
+fn eval_parameterize(args: &[Expr], span: Span, env: &Env) -> Result<Value, EvalError> {
+    let (bindings_expr, body) = match args {
+        [bindings, body @ ..] if !body.is_empty() => (bindings, body),
+        _ => return Err(EvalError::Parse("parameterize requires bindings and body".into()).at(span)),
+    };
+    let Expr::List(ref bindings, _) = bindings_expr else {
+        return Err(EvalError::Parse("parameterize bindings must be a list".into()).at(span));
+    };
+
+    // Evaluate all parameter references and new values
+    let mut params: Vec<ParamBinding> = Vec::new();
+    for binding in bindings {
+        let Expr::List(ref parts, bspan) = *binding else {
+            return Err(EvalError::Parse("parameterize binding must be (param val)".into()).at(span));
+        };
+        let [ref param_expr, ref val_expr] = parts[..] else {
+            return Err(EvalError::Parse("parameterize binding must be (param val)".into()).at(bspan));
+        };
+        let param_val = eval(param_expr, env)?;
+        let Value::Parameter { cell, converter } = param_val else {
+            return Err(EvalError::TypeError {
+                expected: "parameter".into(),
+                got: format!("{param_val}"),
+            }.at(bspan));
+        };
+        let new_val_raw = eval(val_expr, env)?;
+        let new_val = if let Some(ref conv) = converter {
+            call_proc_values(conv, &[new_val_raw])?
+        } else {
+            new_val_raw
+        };
+        let old_val = cell.borrow().clone();
+        params.push((cell, converter, old_val, new_val));
+    }
+
+    // Set new values
+    for (cell, _, _, new_val) in &params {
+        *cell.borrow_mut() = new_val.clone();
+    }
+
+    // Evaluate body, restoring on any exit
+    let result = eval_body_sequence(body, env);
+
+    // Restore old values
+    for (cell, _, old_val, _) in &params {
+        *cell.borrow_mut() = old_val.clone();
+    }
+
+    result
+}
+
+/// Evaluate a sequence of body expressions, returning the last result.
+fn eval_body_sequence(body: &[Expr], env: &Env) -> Result<Value, EvalError> {
+    let (last, rest) = body.split_last().expect("body is non-empty");
+    for expr in rest {
+        eval(expr, env)?;
+    }
+    eval(last, env)
 }
 
 /// Evaluate `(raise value)` — signal a Scheme exception.
@@ -1408,6 +1522,25 @@ fn apply_builtin_values(name: &str, args: &[Value]) -> Result<Value, EvalError> 
         | "char=?" | "char<?" => apply_char_builtin(name, args),
         "string=?" | "string<?" | "string-ci=?" | "string-upcase" | "string-downcase" =>
             apply_string_builtin(name, args),
+        "string-length" => {
+            let [arg] = args else {
+                return Err(EvalError::WrongArgCount { expected: 1, got: args.len() });
+            };
+            match arg {
+                Value::String(s) => Ok(Value::Integer(s.len() as i64)),
+                _ => Err(EvalError::TypeError { expected: "string".into(), got: format!("{arg}") }),
+            }
+        }
+        "string-append" => {
+            let mut result = String::new();
+            for arg in args {
+                match arg {
+                    Value::String(s) => result.push_str(s),
+                    _ => return Err(EvalError::TypeError { expected: "string".into(), got: format!("{arg}") }),
+                }
+            }
+            Ok(Value::String(result))
+        }
         "map" => apply_map_builtin(args),
         "vector" => Ok(Value::Vector(std::rc::Rc::new(std::cell::RefCell::new(args.to_vec())))),
         "make-vector" => apply_make_vector(args),
@@ -1417,48 +1550,13 @@ fn apply_builtin_values(name: &str, args: &[Value]) -> Result<Value, EvalError> 
         "vector?" => Ok(Value::Boolean(matches!(args, [Value::Vector(_)]))),
         "vector->list" => apply_vector_to_list(args),
         "list->vector" => apply_list_to_vector(args),
-        "procedure?" => Ok(Value::Boolean(matches!(args, [Value::Lambda { .. } | Value::CaseLambda { .. } | Value::Builtin(_) | Value::Continuation { .. }]))),
+        "procedure?" => Ok(Value::Boolean(matches!(args, [Value::Lambda { .. } | Value::CaseLambda { .. } | Value::Builtin(_) | Value::Continuation { .. } | Value::Parameter { .. }]))),
         "integer?" => Ok(Value::Boolean(matches!(args, [Value::Integer(_)]))),
         "rational?" => Ok(Value::Boolean(matches!(args, [Value::Integer(_) | Value::Rational(_, _)]))),
         "exact?" => Ok(Value::Boolean(matches!(args, [Value::Integer(_) | Value::Rational(_, _)]))),
         "inexact?" => Ok(Value::Boolean(matches!(args, [Value::Float(_)]))),
-        "exact->inexact" => {
-            let [arg] = args else {
-                return Err(EvalError::WrongArgCount { expected: 1, got: args.len() });
-            };
-            let n = expect_num(arg)?;
-            Ok(Value::Float(num_to_f64(n)))
-        }
-        "inexact->exact" => {
-            let [arg] = args else {
-                return Err(EvalError::WrongArgCount { expected: 1, got: args.len() });
-            };
-            match arg {
-                Value::Integer(_) | Value::Rational(_, _) => Ok(arg.clone()),
-                Value::Float(x) => Ok(float_to_exact(*x)),
-                _ => Err(EvalError::TypeError { expected: "number".into(), got: format!("{arg}") }),
-            }
-        }
-        "numerator" => {
-            let [arg] = args else {
-                return Err(EvalError::WrongArgCount { expected: 1, got: args.len() });
-            };
-            match arg {
-                Value::Integer(n) => Ok(Value::Integer(*n)),
-                Value::Rational(n, _) => Ok(Value::Integer(*n)),
-                _ => Err(EvalError::TypeError { expected: "rational".into(), got: format!("{arg}") }),
-            }
-        }
-        "denominator" => {
-            let [arg] = args else {
-                return Err(EvalError::WrongArgCount { expected: 1, got: args.len() });
-            };
-            match arg {
-                Value::Integer(_) => Ok(Value::Integer(1)),
-                Value::Rational(_, d) => Ok(Value::Integer(*d)),
-                _ => Err(EvalError::TypeError { expected: "rational".into(), got: format!("{arg}") }),
-            }
-        }
+        "exact->inexact" | "inexact->exact" | "numerator" | "denominator" =>
+            apply_numeric_conversion(name, args),
         "values" => match args.len() {
             1 => Ok(args[0].clone()),
             _ => Ok(Value::Values(args.to_vec())),
@@ -1486,10 +1584,40 @@ fn apply_builtin_values(name: &str, args: &[Value]) -> Result<Value, EvalError> 
             };
             Ok(datum.clone())
         }
+        "make-parameter" => apply_make_parameter(args),
         _ if name.starts_with("__record_ctor_") => apply_record_ctor(name, args),
         _ if name.starts_with("__record_pred_") => apply_record_pred(name, args),
         _ if name.starts_with("__record_acc_") => apply_record_acc(name, args),
         _ => Err(EvalError::UnboundVariable { name: name.into() }),
+    }
+}
+
+/// Numeric conversion builtins: exact->inexact, inexact->exact, numerator, denominator.
+fn apply_numeric_conversion(name: &str, args: &[Value]) -> Result<Value, EvalError> {
+    let [arg] = args else {
+        return Err(EvalError::WrongArgCount { expected: 1, got: args.len() });
+    };
+    match name {
+        "exact->inexact" => {
+            let n = expect_num(arg)?;
+            Ok(Value::Float(num_to_f64(n)))
+        }
+        "inexact->exact" => match arg {
+            Value::Integer(_) | Value::Rational(_, _) => Ok(arg.clone()),
+            Value::Float(x) => Ok(float_to_exact(*x)),
+            _ => Err(EvalError::TypeError { expected: "number".into(), got: format!("{arg}") }),
+        },
+        "numerator" => match arg {
+            Value::Integer(n) => Ok(Value::Integer(*n)),
+            Value::Rational(n, _) => Ok(Value::Integer(*n)),
+            _ => Err(EvalError::TypeError { expected: "rational".into(), got: format!("{arg}") }),
+        },
+        "denominator" => match arg {
+            Value::Integer(_) => Ok(Value::Integer(1)),
+            Value::Rational(_, d) => Ok(Value::Integer(*d)),
+            _ => Err(EvalError::TypeError { expected: "rational".into(), got: format!("{arg}") }),
+        },
+        _ => unreachable!("unexpected numeric conversion: {name}"),
     }
 }
 
@@ -1774,6 +1902,7 @@ fn is_builtin(name: &str) -> bool {
             | "exact?" | "inexact?" | "exact->inexact" | "inexact->exact"
             | "numerator" | "denominator"
             | "values" | "call-with-values"
+            | "make-parameter"
             | "syntax->datum" | "datum->syntax"
     )
 }
@@ -1864,7 +1993,7 @@ fn eval_builtin(op: &str, args: &[Expr], env: &Env) -> Result<Value, EvalError> 
         "vector->list" => eval_vector_to_list(args, env),
         "list->vector" => eval_list_to_vector(args, env),
         "procedure?" => eval_type_pred(args, env, |v| {
-            matches!(v, Value::Lambda { .. } | Value::CaseLambda { .. } | Value::Builtin(_) | Value::Continuation { .. })
+            matches!(v, Value::Lambda { .. } | Value::CaseLambda { .. } | Value::Builtin(_) | Value::Continuation { .. } | Value::Parameter { .. })
         }),
         "integer?" => eval_type_pred(args, env, |v| matches!(v, Value::Integer(_))),
         "rational?" => eval_type_pred(args, env, |v| matches!(v, Value::Integer(_) | Value::Rational(_, _))),
@@ -1876,10 +2005,16 @@ fn eval_builtin(op: &str, args: &[Expr], env: &Env) -> Result<Value, EvalError> 
         "denominator" => eval_denominator(args, env),
         "values" => eval_values_builtin(args, env),
         "call-with-values" => eval_call_with_values_builtin(args, env),
+        "make-parameter" => eval_make_parameter(args, env),
         "syntax->datum" => eval_syntax_to_datum(args, env),
         "datum->syntax" => eval_datum_to_syntax(args, env),
         _ => Err(EvalError::UnboundVariable { name: op.into() }),
     }
+}
+
+fn eval_make_parameter(args: &[Expr], env: &Env) -> Result<Value, EvalError> {
+    let arg_vals: Vec<Value> = args.iter().map(|a| eval(a, env)).collect::<Result<_, _>>()?;
+    apply_make_parameter(&arg_vals)
 }
 
 fn eval_syntax_to_datum(args: &[Expr], env: &Env) -> Result<Value, EvalError> {
