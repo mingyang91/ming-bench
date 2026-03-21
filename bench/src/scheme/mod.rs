@@ -104,6 +104,7 @@ enum Value {
     Builtin(String),
     Continuation(u64),
     Macro(Vec<String>, Vec<(SExpr, SExpr)>, EnvRef),
+    Pair(Box<Value>, Box<Value>),
     Vector(Rc<RefCell<Vec<Value>>>),
     Void,
 }
@@ -117,6 +118,7 @@ impl PartialEq for Value {
             (Value::Char(a), Value::Char(b)) => a == b,
             (Value::Symbol(a), Value::Symbol(b)) => a == b,
             (Value::List(a), Value::List(b)) => a == b,
+            (Value::Pair(a1, a2), Value::Pair(b1, b2)) => a1 == b1 && a2 == b2,
             (Value::Vector(a), Value::Vector(b)) => *a.borrow() == *b.borrow(),
             (Value::Void, Value::Void) => true,
             (Value::Lambda(..), Value::Lambda(..)) => false,
@@ -149,6 +151,7 @@ impl Value {
                 let inner: Vec<String> = elems.iter().map(|v| v.to_scheme_string()).collect();
                 format!("({})", inner.join(" "))
             }
+            Value::Pair(a, b) => format!("({} . {})", a.to_scheme_string(), b.to_scheme_string()),
             Value::Lambda(..) => "#<procedure>".to_string(),
             Value::Macro(..) => "#<macro>".to_string(),
             Value::Builtin(_) => "#<procedure>".to_string(),
@@ -803,10 +806,7 @@ fn eval_step(se: &SExpr, env: &EnvRef, out: &OutputBuf) -> Result<Step, EvalErro
                                 v.insert(0, head);
                                 Ok(Step::Done(Value::List(v)))
                             }
-                            _ => Err(err_at(
-                                span,
-                                "cons: second argument must be a list",
-                            )),
+                            _ => Ok(Step::Done(Value::Pair(Box::new(head), Box::new(tail)))),
                         }
                     }
                     "car" => {
@@ -816,6 +816,7 @@ fn eval_step(se: &SExpr, env: &EnvRef, out: &OutputBuf) -> Result<Step, EvalErro
                         let val = eval_expr(&elems[1], env, out)?;
                         match val {
                             Value::List(v) if !v.is_empty() => Ok(Step::Done(v[0].clone())),
+                            Value::Pair(a, _) => Ok(Step::Done(*a)),
                             _ => Err(err_at(
                                 span,
                                 "car: argument must be a non-empty list",
@@ -831,6 +832,7 @@ fn eval_step(se: &SExpr, env: &EnvRef, out: &OutputBuf) -> Result<Step, EvalErro
                             Value::List(v) if !v.is_empty() => {
                                 Ok(Step::Done(Value::List(v[1..].to_vec())))
                             }
+                            Value::Pair(_, b) => Ok(Step::Done(*b)),
                             _ => Err(err_at(
                                 span,
                                 "cdr: argument must be a non-empty list",
@@ -1340,22 +1342,24 @@ fn eval_step(se: &SExpr, env: &EnvRef, out: &OutputBuf) -> Result<Step, EvalErro
                         }
                     }
                     "map" => {
-                        if elems.len() != 3 {
-                            return Err(err_at(span, "map requires exactly 2 arguments"));
+                        if elems.len() < 3 {
+                            return Err(err_at(span, "map requires at least 2 arguments"));
                         }
                         let func = eval_expr(&elems[1], env, out)?;
-                        let lst = eval_expr(&elems[2], env, out)?;
-                        match lst {
-                            Value::List(items) => {
-                                let mut results = Vec::new();
-                                for item in items {
-                                    let r = apply_value(&func, &[item], span, out)?;
-                                    results.push(r);
-                                }
-                                Ok(Step::Done(Value::List(results)))
+                        let mut lists: Vec<Vec<Value>> = Vec::new();
+                        for e in &elems[2..] {
+                            match eval_expr(e, env, out)? {
+                                Value::List(items) => lists.push(items),
+                                _ => return Err(err_at(e.span, "map: expected list")),
                             }
-                            _ => Err(err_at(elems[2].span, "map: expected list")),
                         }
+                        let len = lists[0].len();
+                        let mut results = Vec::new();
+                        for i in 0..len {
+                            let call_args: Vec<Value> = lists.iter().map(|l| l[i].clone()).collect();
+                            results.push(apply_value(&func, &call_args, span, out)?);
+                        }
+                        Ok(Step::Done(Value::List(results)))
                     }
                     "char?" => {
                         if elems.len() != 2 {
@@ -1531,18 +1535,20 @@ fn apply_builtin(name: &str, args: &[Value], span: Span, out: &OutputBuf) -> Res
                     new.extend(v.iter().cloned());
                     Ok(Value::List(new))
                 }
-                _ => Err(err_at(span, "cons: second argument must be a list")),
+                _ => Ok(Value::Pair(Box::new(args[0].clone()), Box::new(args[1].clone()))),
             }
         }
         "car" => {
             match &args[0] {
                 Value::List(v) if !v.is_empty() => Ok(v[0].clone()),
+                Value::Pair(a, _) => Ok(*a.clone()),
                 _ => Err(err_at(span, "car: argument must be a non-empty list")),
             }
         }
         "cdr" => {
             match &args[0] {
                 Value::List(v) if !v.is_empty() => Ok(Value::List(v[1..].to_vec())),
+                Value::Pair(_, b) => Ok(*b.clone()),
                 _ => Err(err_at(span, "cdr: argument must be a non-empty list")),
             }
         }
@@ -1569,16 +1575,21 @@ fn apply_builtin(name: &str, args: &[Value], span: Span, out: &OutputBuf) -> Res
             Ok(Value::Void)
         }
         "map" => {
-            match &args[1] {
-                Value::List(items) => {
-                    let mut results = Vec::new();
-                    for item in items {
-                        results.push(apply_value(&args[0], &[item.clone()], span, out)?);
-                    }
-                    Ok(Value::List(results))
+            let func = &args[0];
+            let mut lists: Vec<Vec<Value>> = Vec::new();
+            for arg in &args[1..] {
+                match arg {
+                    Value::List(items) => lists.push(items.clone()),
+                    _ => return Err(err_at(span, "map: expected list")),
                 }
-                _ => Err(err_at(span, "map: expected list")),
             }
+            let len = lists[0].len();
+            let mut results = Vec::new();
+            for i in 0..len {
+                let call_args: Vec<Value> = lists.iter().map(|l| l[i].clone()).collect();
+                results.push(apply_value(func, &call_args, span, out)?);
+            }
+            Ok(Value::List(results))
         }
         "apply" => {
             if args.len() < 2 { return Err(err_at(span, "apply requires at least 2 arguments")); }
@@ -1595,7 +1606,60 @@ fn apply_builtin(name: &str, args: &[Value], span: Span, out: &OutputBuf) -> Res
         "string?" => Ok(Value::Boolean(matches!(&args[0], Value::Str(_)))),
         "number?" => Ok(Value::Boolean(matches!(&args[0], Value::Integer(_)))),
         "boolean?" => Ok(Value::Boolean(matches!(&args[0], Value::Boolean(_)))),
-        "pair?" => Ok(Value::Boolean(matches!(&args[0], Value::List(v) if !v.is_empty()))),
+        "pair?" => Ok(Value::Boolean(matches!(&args[0], Value::List(v) if !v.is_empty()) || matches!(&args[0], Value::Pair(..)))),
+        "list?" => {
+            let mut cur = args[0].clone();
+            loop {
+                match cur {
+                    Value::List(_) => break Ok(Value::Boolean(true)),
+                    Value::Pair(_, b) => cur = *b,
+                    _ => break Ok(Value::Boolean(false)),
+                }
+            }
+        }
+        "list-ref" => {
+            match (&args[0], &args[1]) {
+                (Value::List(v), Value::Integer(i)) => {
+                    let idx = *i as usize;
+                    if idx < v.len() {
+                        Ok(v[idx].clone())
+                    } else {
+                        Err(err_at(span, "list-ref: index out of range"))
+                    }
+                }
+                _ => Err(err_at(span, "list-ref: expected list and integer")),
+            }
+        }
+        "list-tail" => {
+            match (&args[0], &args[1]) {
+                (Value::List(v), Value::Integer(i)) => {
+                    let idx = *i as usize;
+                    if idx <= v.len() {
+                        Ok(Value::List(v[idx..].to_vec()))
+                    } else {
+                        Err(err_at(span, "list-tail: index out of range"))
+                    }
+                }
+                _ => Err(err_at(span, "list-tail: expected list and integer")),
+            }
+        }
+        "assoc" => {
+            let key = &args[0];
+            match &args[1] {
+                Value::List(alist) => {
+                    for entry in alist {
+                        match entry {
+                            Value::List(pair) if !pair.is_empty() && pair[0] == *key => {
+                                return Ok(entry.clone());
+                            }
+                            _ => {}
+                        }
+                    }
+                    Ok(Value::Boolean(false))
+                }
+                _ => Err(err_at(span, "assoc: expected list")),
+            }
+        }
         "symbol?" => Ok(Value::Boolean(matches!(&args[0], Value::Symbol(_)))),
         "char?" => Ok(Value::Boolean(matches!(&args[0], Value::Char(_)))),
         "equal?" => Ok(Value::Boolean(args[0] == args[1])),
@@ -1885,7 +1949,7 @@ fn require_int(val: &Value, span: Span) -> Result<i64, EvalError> {
 fn init_builtins(env: &EnvRef) {
     for name in &[
         "+", "-", "*", "/", "<", ">", "=", "<=", ">=", "not",
-        "cons", "car", "cdr", "null?", "list", "length",
+        "cons", "car", "cdr", "null?", "list", "list?", "list-ref", "list-tail", "length", "assoc",
         "display", "write", "newline", "map", "apply",
         "string?", "number?", "boolean?", "pair?", "symbol?", "char?",
         "string-append", "string-length", "substring", "string->number",
