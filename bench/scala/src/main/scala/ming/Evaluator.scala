@@ -39,16 +39,18 @@ object Evaluator:
     * level).
     */
   private def patchClosures(env: Env): Env =
-    val hasNamedLambda = env.bindings.exists {
-      case (_, Value.LambdaVal(_, _, _, Some(_))) => true
-      case _                                      => false
+    val hasNamedLambda = env.bindings.exists { case (n, cell) =>
+      cell(0) match
+        case Value.LambdaVal(_, _, _, Some(ln)) => ln == n
+        case _                                  => false
     }
     if !hasNamedLambda then return env
     lazy val patched: Env = Env(
-      env.bindings.map {
-        case (n, Value.LambdaVal(ps, bd, _, ln @ Some(_))) =>
-          n -> Value.LambdaVal(ps, bd, () => patched, ln)
-        case other => other
+      env.bindings.map { case (n, cell) =>
+        cell(0) match
+          case Value.LambdaVal(ps, bd, _, ln @ Some(name)) if name == n =>
+            n -> Array[Value](Value.LambdaVal(ps, bd, () => patched, ln))
+          case _ => n -> cell
       },
       env.parent
     )
@@ -116,6 +118,7 @@ object Evaluator:
       case Value.Symbol("lambda", _) =>
         Done(Forms.makeLambda(args, env), env, out)
       case Value.Symbol("let", _)   => Forms.evalLet(args, env, out)
+      case Value.Symbol("set!", _)  => Forms.evalSet(args, env, pos, out)
       case Value.Symbol("begin", _) => evalBodyTail(args, env, out)
       case Value.Symbol("cond", _)  => Forms.evalCond(args, env, out)
       case Value.Symbol("and", _)   => Forms.evalAnd(args, env, out)

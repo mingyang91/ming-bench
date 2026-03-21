@@ -18,6 +18,20 @@ private[ming] object Forms:
       case _ =>
         throw new EvalError("display/write requires exactly 1 argument")
 
+  def evalSet(
+    args: List[Value],
+    env: Env,
+    pos: Option[(Int, Int)],
+    out: String
+  ): EvalResult =
+    args match
+      case Value.Symbol(name, namePos) :: valueExpr :: Nil =>
+        val (v, _, out2) = Evaluator.eval(valueExpr, env, out)
+        env.set(name, v, namePos.orElse(pos))
+        Done(Value.VoidVal, env, out2)
+      case _ =>
+        throw EvalError.withPos("bad set! syntax", pos)
+
   def evalDefine(
     args: List[Value],
     env: Env,
