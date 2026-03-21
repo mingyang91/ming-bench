@@ -1,10 +1,27 @@
 /// Evaluation error type for the Scheme interpreter.
-///
-/// Agents must add domain-specific variants here. Using `String` as the
-/// error type is not possible — the `eval_str` signature requires this type.
 #[derive(Debug, PartialEq, thiserror::Error)]
 pub enum EvalError {
-    // Add variants as needed, e.g.:
-    // #[error("unbound variable: {name}")]
-    // UnboundVariable { name: String },
+    #[error("parse error: {message}")]
+    Parse { message: String },
+}
+
+/// Parse error type for the Scheme reader.
+#[derive(Debug, PartialEq, thiserror::Error)]
+pub enum ParseError {
+    #[error("unexpected end of input")]
+    UnexpectedEof,
+
+    #[error("unexpected character: {ch}")]
+    UnexpectedChar { ch: char },
+
+    #[error("unterminated string")]
+    UnterminatedString,
+}
+
+impl From<ParseError> for EvalError {
+    fn from(e: ParseError) -> Self {
+        EvalError::Parse {
+            message: e.to_string(),
+        }
+    }
 }
