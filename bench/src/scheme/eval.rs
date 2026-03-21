@@ -80,6 +80,8 @@ fn is_builtin(name: &str) -> bool {
             | "string-ci=?"
             | "string-upcase"
             | "string-downcase"
+            | "dynamic-wind"
+            | "reverse"
     )
 }
 
@@ -96,6 +98,8 @@ pub struct EvalContext {
     pub gensym_counter: Cell<u64>,
     /// Current body continuation context — set by eval_body_tco for init expressions.
     body_continuation: RefCell<Option<BodyContinuation>>,
+    /// Nesting depth of active dynamic-wind calls.
+    wind_depth: Cell<u64>,
 }
 
 pub struct ContReturnData {
@@ -114,6 +118,7 @@ impl EvalContext {
             next_id: Cell::new(0),
             gensym_counter: Cell::new(0),
             body_continuation: RefCell::new(None),
+            wind_depth: Cell::new(0),
         }
     }
 
@@ -247,6 +252,16 @@ fn apply_tco(
             };
             eval_callcc(lambda, span, ctx).map(Bounce::Done)
         }
+        Value::Symbol(name) if name == "dynamic-wind" => {
+            let [in_thunk, body_thunk, out_thunk] = args else {
+                return Err(EvalError::WrongArgCount {
+                    expected: 3,
+                    got: args.len(),
+                    span,
+                });
+            };
+            eval_dynamic_wind(in_thunk, body_thunk, out_thunk, span, ctx).map(Bounce::Done)
+        }
         Value::Symbol(name) => apply_builtin(name, args, span, ctx).map(Bounce::Done),
         Value::Lambda {
             params,
@@ -310,7 +325,13 @@ fn eval_callcc(
     }
 
     let id = ctx.next_cont_id();
-    let body_cont = ctx.body_continuation.borrow().clone();
+    // Inside dynamic-wind, force ContinuationReturn so re-execution goes
+    // through dynamic-wind (firing in-thunks on re-entry, out-thunks on exit).
+    let body_cont = if ctx.wind_depth.get() > 0 {
+        None
+    } else {
+        ctx.body_continuation.borrow().clone()
+    };
     let cont = Value::Continuation(Rc::new(ContinuationData {
         id,
         expr_idx: ctx.current_expr_idx.get(),
@@ -336,6 +357,23 @@ fn eval_callcc(
         }
         Err(e) => Err(e),
     }
+}
+
+/// Evaluate dynamic-wind: run in-thunk, body-thunk, out-thunk.
+/// Out-thunk runs even on non-local exit via continuation.
+fn eval_dynamic_wind(
+    in_thunk: &Value,
+    body_thunk: &Value,
+    out_thunk: &Value,
+    span: Span,
+    ctx: &EvalContext,
+) -> Result<Value, EvalError> {
+    apply(in_thunk, &[], span, ctx)?;
+    ctx.wind_depth.set(ctx.wind_depth.get() + 1);
+    let body_result = apply(body_thunk, &[], span, ctx);
+    ctx.wind_depth.set(ctx.wind_depth.get() - 1);
+    apply(out_thunk, &[], span, ctx)?;
+    body_result
 }
 
 /// Apply a lambda procedure to arguments, binding params and returning a TCO bounce.
@@ -874,7 +912,7 @@ fn apply_builtin(
             };
             Ok(Value::Boolean(!is_truthy(arg)))
         }
-        "cons" | "car" | "cdr" | "null?" | "list" | "length" => {
+        "cons" | "car" | "cdr" | "null?" | "list" | "length" | "reverse" => {
             apply_list_builtin(name, args, span)
         }
         "string?" => Ok(Value::Boolean(matches!(args, [Value::String(_)]))),
@@ -1113,6 +1151,25 @@ fn apply_list_builtin(name: &str, args: &[Value], span: Span) -> Result<Value, E
                 Value::List(elems) => Ok(Value::Integer(elems.len() as i64)),
                 _ => Err(EvalError::TypeError {
                     message: format!("length: expected list, got {arg}"),
+                    span,
+                }),
+            }
+        }
+        "reverse" => {
+            let [arg] = args else {
+                return Err(EvalError::WrongArgCount {
+                    expected: 1,
+                    got: args.len(),
+                    span,
+                });
+            };
+            match arg {
+                Value::List(elems) => {
+                    let reversed: Vec<Value> = elems.iter().rev().cloned().collect();
+                    Ok(Value::List(reversed))
+                }
+                _ => Err(EvalError::TypeError {
+                    message: format!("reverse: expected list, got {arg}"),
                     span,
                 }),
             }
