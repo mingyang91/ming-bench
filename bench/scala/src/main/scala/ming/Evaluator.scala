@@ -30,13 +30,14 @@ object Evaluator:
     out: String
   ): (Value, Env, String) =
     expr match
-      case Value.IntVal(_)    => (expr, env, out)
-      case Value.BoolVal(_)   => (expr, env, out)
-      case Value.StringVal(_) => (expr, env, out)
-      case Value.CharVal(_)   => (expr, env, out)
-      case Value.NilVal       => (expr, env, out)
-      case Value.VoidVal      => (expr, env, out)
-      case _: Value.LambdaVal => (expr, env, out)
+      case Value.IntVal(_)           => (expr, env, out)
+      case Value.BoolVal(_)          => (expr, env, out)
+      case Value.StringVal(_)        => (expr, env, out)
+      case Value.CharVal(_)          => (expr, env, out)
+      case Value.NilVal              => (expr, env, out)
+      case Value.VoidVal             => (expr, env, out)
+      case _: Value.MutableStringVal => (expr, env, out)
+      case _: Value.LambdaVal        => (expr, env, out)
       case Value.Symbol(name, pos) =>
         (env.lookup(name, pos), env, out)
       case Value.PairVal(car, _, pos) =>

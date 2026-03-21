@@ -16,26 +16,35 @@ enum Value:
     closure: Env,
     name: Option[String]
   )
+  case MutableStringVal(chars: Array[Char])
   case VoidVal
+
+  /** Extract string content from either StringVal or MutableStringVal. */
+  def stringContent: Option[String] = this match
+    case StringVal(s)         => Some(s)
+    case MutableStringVal(cs) => Some(String(cs))
+    case _                    => None
 
   /** Write representation (strings with quotes). */
   def display: String = this match
-    case IntVal(n)        => n.toString
-    case BoolVal(b)       => if b then "#t" else "#f"
-    case StringVal(s)     => "\"" + s + "\""
-    case CharVal(c)       => s"#\\$c"
-    case Symbol(name, _)  => name
-    case NilVal           => "()"
-    case PairVal(_, _, _) => formatList(_.display)
-    case _: LambdaVal     => "#<procedure>"
-    case VoidVal          => ""
+    case IntVal(n)            => n.toString
+    case BoolVal(b)           => if b then "#t" else "#f"
+    case StringVal(s)         => "\"" + s + "\""
+    case MutableStringVal(cs) => "\"" + String(cs) + "\""
+    case CharVal(c)           => s"#\\$c"
+    case Symbol(name, _)      => name
+    case NilVal               => "()"
+    case PairVal(_, _, _)     => formatList(_.display)
+    case _: LambdaVal         => "#<procedure>"
+    case VoidVal              => ""
 
   /** Display representation (strings without quotes). */
   def displayRepr: String = this match
-    case StringVal(s)     => s
-    case CharVal(c)       => c.toString
-    case PairVal(_, _, _) => formatList(_.displayRepr)
-    case other            => other.display
+    case StringVal(s)         => s
+    case MutableStringVal(cs) => String(cs)
+    case CharVal(c)           => c.toString
+    case PairVal(_, _, _)     => formatList(_.displayRepr)
+    case other                => other.display
 
   private def formatList(fmt: Value => String): String =
     val (elems, tail) = collectList(this, List.empty)

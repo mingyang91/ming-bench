@@ -46,12 +46,12 @@ object Builtins:
           case head :: Nil => Value.IntVal(listLength(head))
           case _ =>
             throw new EvalError("length requires exactly 1 argument")
-      case "string?"        => typePred(args, _.isInstanceOf[Value.StringVal])
-      case "number?"        => typePred(args, _.isInstanceOf[Value.IntVal])
-      case "boolean?"       => typePred(args, _.isInstanceOf[Value.BoolVal])
-      case "pair?"          => typePred(args, _.isInstanceOf[Value.PairVal])
-      case "symbol?"        => typePred(args, _.isInstanceOf[Value.Symbol])
-      case "char?"          => typePred(args, _.isInstanceOf[Value.CharVal])
+      case "string?"  => typePred(args, v => v.isInstanceOf[Value.StringVal] || v.isInstanceOf[Value.MutableStringVal])
+      case "number?"  => typePred(args, _.isInstanceOf[Value.IntVal])
+      case "boolean?" => typePred(args, _.isInstanceOf[Value.BoolVal])
+      case "pair?"    => typePred(args, _.isInstanceOf[Value.PairVal])
+      case "symbol?"  => typePred(args, _.isInstanceOf[Value.Symbol])
+      case "char?"    => typePred(args, _.isInstanceOf[Value.CharVal])
       case "string-append"  => evalStringAppend(args)
       case "string-length"  => evalStringLength(args)
       case "substring"      => evalSubstring(args)
@@ -60,6 +60,8 @@ object Builtins:
       case "symbol->string" => evalSymbolToString(args)
       case "string->symbol" => evalStringToSymbol(args)
       case "string-ref"     => evalStringRef(args)
+      case "string-copy"    => evalStringCopy(args)
+      case "string-set!"    => evalStringSet(args)
       case _                => throw new EvalError(s"unknown procedure: $name")
 
   private def typePred(
@@ -89,10 +91,10 @@ object Builtins:
         pos
       )
 
-  private def asString(v: Value): String = v match
-    case Value.StringVal(s) => s
-    case other =>
-      throw new EvalError(s"expected string, got: ${other.display}")
+  private def asString(v: Value): String =
+    v.stringContent.getOrElse(
+      throw new EvalError(s"expected string, got: ${v.display}")
+    )
 
   private def evalAdd(
     args: List[Value],
@@ -152,20 +154,24 @@ object Builtins:
 
   private def evalStringLength(args: List[Value]): Value =
     args match
-      case Value.StringVal(s) :: Nil => Value.IntVal(s.length.toLong)
+      case v :: Nil =>
+        val s = asString(v)
+        Value.IntVal(s.length.toLong)
       case _ =>
         throw new EvalError("string-length requires 1 string argument")
 
   private def evalSubstring(args: List[Value]): Value =
     args match
-      case Value.StringVal(s) :: Value.IntVal(start) :: Value.IntVal(end) :: Nil =>
+      case v :: Value.IntVal(start) :: Value.IntVal(end) :: Nil =>
+        val s = asString(v)
         Value.StringVal(s.substring(start.toInt, end.toInt))
       case _ =>
         throw new EvalError("substring requires string, start, end")
 
   private def evalStringToNumber(args: List[Value]): Value =
     args match
-      case Value.StringVal(s) :: Nil =>
+      case v :: Nil =>
+        val s = asString(v)
         s.toLongOption match
           case Some(n) => Value.IntVal(n)
           case None    => Value.BoolVal(false)
@@ -186,16 +192,35 @@ object Builtins:
 
   private def evalStringToSymbol(args: List[Value]): Value =
     args match
-      case Value.StringVal(s) :: Nil => Value.Symbol(s)
+      case v :: Nil =>
+        val s = asString(v)
+        Value.Symbol(s)
       case _ =>
         throw new EvalError("string->symbol requires 1 string argument")
 
   private def evalStringRef(args: List[Value]): Value =
     args match
-      case Value.StringVal(s) :: Value.IntVal(i) :: Nil =>
+      case v :: Value.IntVal(i) :: Nil =>
+        val s = asString(v)
         Value.CharVal(s.charAt(i.toInt))
       case _ =>
         throw new EvalError("string-ref requires string and index")
+
+  private def evalStringCopy(args: List[Value]): Value =
+    args match
+      case v :: Nil =>
+        val s = asString(v)
+        Value.MutableStringVal(s.toCharArray)
+      case _ =>
+        throw new EvalError("string-copy requires 1 string argument")
+
+  private def evalStringSet(args: List[Value]): Value =
+    args match
+      case Value.MutableStringVal(chars) :: Value.IntVal(i) :: Value.CharVal(c) :: Nil =>
+        chars(i.toInt) = c
+        Value.VoidVal
+      case _ =>
+        throw new EvalError("string-set! requires mutable string, index, and char")
 
   val defaultEnv: Env = Env(Map.empty, None)
     .define("+", Value.Symbol("+"))
@@ -230,3 +255,5 @@ object Builtins:
     .define("symbol->string", Value.Symbol("symbol->string"))
     .define("string->symbol", Value.Symbol("string->symbol"))
     .define("string-ref", Value.Symbol("string-ref"))
+    .define("string-copy", Value.Symbol("string-copy"))
+    .define("string-set!", Value.Symbol("string-set!"))

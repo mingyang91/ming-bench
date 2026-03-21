@@ -69,11 +69,21 @@ object Parser:
   private def parseAtom(s: String, line: Int, col: Int): Value =
     if s == "#t" then Value.BoolVal(true)
     else if s == "#f" then Value.BoolVal(false)
+    else if s.startsWith("#\\") then parseCharLiteral(s.substring(2))
     else if s.startsWith("\"") && s.endsWith("\"") then Value.StringVal(s.substring(1, s.length - 1))
     else
       s.toLongOption match
         case Some(n) => Value.IntVal(n)
         case None    => Value.Symbol(s, Some((line, col)))
+
+  private def parseCharLiteral(name: String): Value =
+    val ch = name match
+      case "space"            => ' '
+      case "newline"          => '\n'
+      case "tab"              => '\t'
+      case s if s.length == 1 => s.charAt(0)
+      case _                  => throw new EvalError(s"unknown character name: $name")
+    Value.CharVal(ch)
 
   private def posOf(input: String, offset: Int): (Int, Int) =
     input.take(offset).foldLeft((1, 1)) {
