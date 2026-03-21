@@ -1798,6 +1798,14 @@ fn schedule_list_eval(
         ExprKind::Symbol(name) if name == "guard" => {
             schedule_guard(args, pos, env, next, winds, handlers)
         }
+        ExprKind::Symbol(name) if name == "let-values" => Ok((
+            MachineControl::Expr(expand_let_values_form(args, pos, ctx)?, env),
+            next,
+        )),
+        ExprKind::Symbol(name) if name == "receive" => Ok((
+            MachineControl::Expr(expand_receive_form(args, pos)?, env),
+            next,
+        )),
         ExprKind::Symbol(name) if name == "if" => {
             if !(2..=3).contains(&args.len()) {
                 return Err(wrong_arg_count("if", "2 or 3", args.len()));
@@ -2246,6 +2254,12 @@ fn eval_list(
         ExprKind::Symbol(name) if name == "and" => eval_and(args, env, ctx),
         ExprKind::Symbol(name) if name == "or" => eval_or(args, env, ctx),
         ExprKind::Symbol(name) if name == "if" => eval_if(args, env, ctx),
+        ExprKind::Symbol(name) if name == "let-values" => {
+            eval_expr(&expand_let_values_form(args, pos, ctx)?, env, ctx)
+        }
+        ExprKind::Symbol(name) if name == "receive" => {
+            eval_expr(&expand_receive_form(args, pos)?, env, ctx)
+        }
         ExprKind::Symbol(name) if name == "let" => eval_let(args, pos, env, ctx),
         ExprKind::Symbol(name) if name == "do" => eval_do(args, pos, env, ctx),
         ExprKind::Symbol(name) if name == "letrec" => {
@@ -2318,6 +2332,12 @@ fn eval_tail_list(
         ExprKind::Symbol(name) if name == "and" => eval_tail_and(args, env, ctx),
         ExprKind::Symbol(name) if name == "or" => eval_tail_or(args, env, ctx),
         ExprKind::Symbol(name) if name == "if" => eval_tail_if(args, env, ctx),
+        ExprKind::Symbol(name) if name == "let-values" => {
+            eval_tail_expr(&expand_let_values_form(args, pos, ctx)?, env, ctx)
+        }
+        ExprKind::Symbol(name) if name == "receive" => {
+            eval_tail_expr(&expand_receive_form(args, pos)?, env, ctx)
+        }
         ExprKind::Symbol(name) if name == "let" => eval_tail_let(args, pos, env, ctx),
         ExprKind::Symbol(name) if name == "do" => eval_tail_do(args, pos, env, ctx),
         ExprKind::Symbol(name) if name == "letrec" => {
@@ -4060,6 +4080,8 @@ fn lower_generated_list(
         Some("lambda") if items.len() >= 3 => lower_lambda_form(items, pos, state),
         Some("case-lambda") if items.len() >= 2 => lower_case_lambda_form(items, pos, state),
         Some("let") if items.len() >= 3 => lower_let_form(items, pos, state),
+        Some("let-values") if items.len() >= 3 => lower_let_values_form(items, pos, state),
+        Some("receive") if items.len() >= 4 => lower_receive_form(items, pos, state),
         _ => {
             let lowered = items
                 .iter()
@@ -4148,6 +4170,46 @@ fn lower_let_form(
 
     state.renamed_bindings.push(scope);
     for body_expr in &items[binding_index + 1..] {
+        lowered.push(lower_macro_syntax_with_state(body_expr, false, state)?);
+    }
+    state.renamed_bindings.pop();
+
+    Ok(Expr::new(ExprKind::List(lowered), pos))
+}
+
+fn lower_let_values_form(
+    items: &[SyntaxExpr],
+    pos: SourcePos,
+    state: &mut HygieneState<'_>,
+) -> Result<Expr, EvalError> {
+    let head = lower_macro_syntax_with_state(&items[0], false, state)?;
+    let mut lowered = vec![head];
+    let mut scope = HashMap::new();
+
+    lowered.push(lower_let_bindings(&items[1], state, &mut scope)?);
+
+    state.renamed_bindings.push(scope);
+    for body_expr in &items[2..] {
+        lowered.push(lower_macro_syntax_with_state(body_expr, false, state)?);
+    }
+    state.renamed_bindings.pop();
+
+    Ok(Expr::new(ExprKind::List(lowered), pos))
+}
+
+fn lower_receive_form(
+    items: &[SyntaxExpr],
+    pos: SourcePos,
+    state: &mut HygieneState<'_>,
+) -> Result<Expr, EvalError> {
+    let head = lower_macro_syntax_with_state(&items[0], false, state)?;
+    let producer = lower_macro_syntax_with_state(&items[2], false, state)?;
+    let mut scope = HashMap::new();
+    let formals = lower_binding_expr(&items[1], state, &mut scope)?;
+
+    state.renamed_bindings.push(scope);
+    let mut lowered = vec![head, formals, producer];
+    for body_expr in &items[3..] {
         lowered.push(lower_macro_syntax_with_state(body_expr, false, state)?);
     }
     state.renamed_bindings.pop();
@@ -4253,6 +4315,8 @@ fn is_syntax_keyword(name: &str) -> bool {
             | "or"
             | "guard"
             | "if"
+            | "let-values"
+            | "receive"
             | "let"
             | "do"
             | "begin"
@@ -4425,6 +4489,131 @@ fn build_begin_expr(exprs: Vec<Expr>, pos: SourcePos) -> Expr {
     items.push(Expr::new(ExprKind::Symbol("begin".to_string()), pos));
     items.extend(exprs);
     Expr::new(ExprKind::List(items), pos)
+}
+
+fn symbol_expr(name: impl Into<String>, pos: SourcePos) -> Expr {
+    Expr::new(ExprKind::Symbol(name.into()), pos)
+}
+
+fn list_expr(items: Vec<Expr>, pos: SourcePos) -> Expr {
+    Expr::new(ExprKind::List(items), pos)
+}
+
+fn build_lambda_expr(params: Expr, body: Vec<Expr>, pos: SourcePos) -> Expr {
+    let mut items = Vec::with_capacity(body.len() + 2);
+    items.push(symbol_expr("lambda", pos));
+    items.push(params);
+    items.extend(body);
+    list_expr(items, pos)
+}
+
+fn parse_receive_form<'a>(args: &'a [Expr]) -> Result<(&'a Expr, &'a Expr, &'a [Expr]), EvalError> {
+    if args.len() < 3 {
+        return Err(wrong_arg_count("receive", "at least 3", args.len()));
+    }
+
+    let formals = &args[0];
+    parse_parameter_list(formals)?;
+    Ok((formals, &args[1], &args[2..]))
+}
+
+fn parse_let_values_form<'a>(
+    args: &'a [Expr],
+) -> Result<(Vec<(&'a Expr, &'a Expr)>, &'a [Expr]), EvalError> {
+    let (bindings_expr, body) = parse_binding_body_form("let-values", args)?;
+    let ExprKind::List(bindings) = &bindings_expr.kind else {
+        return Err(EvalError::Syntax(
+            "let-values bindings must be a list".into(),
+        ));
+    };
+
+    let mut parsed = Vec::with_capacity(bindings.len());
+    for binding in bindings {
+        let ExprKind::List(parts) = &binding.kind else {
+            return Err(EvalError::Syntax(
+                "let-values binding must be a (formals expr) pair".into(),
+            ));
+        };
+
+        match parts.as_slice() {
+            [formals, value_expr] => {
+                parse_parameter_list(formals)?;
+                parsed.push((formals, value_expr));
+            }
+            _ => {
+                return Err(EvalError::Syntax(
+                    "let-values binding must be a (formals expr) pair".into(),
+                ))
+            }
+        }
+    }
+
+    Ok((parsed, body))
+}
+
+fn expand_receive_form(args: &[Expr], pos: SourcePos) -> Result<Expr, EvalError> {
+    let (formals, producer, body) = parse_receive_form(args)?;
+    let producer_thunk = build_lambda_expr(list_expr(Vec::new(), pos), vec![producer.clone()], pos);
+    let consumer = build_lambda_expr(formals.clone(), body.to_vec(), pos);
+
+    Ok(list_expr(
+        vec![
+            symbol_expr("call-with-values", pos),
+            producer_thunk,
+            consumer,
+        ],
+        pos,
+    ))
+}
+
+fn expand_let_values_form(
+    args: &[Expr],
+    pos: SourcePos,
+    ctx: &mut EvalContext,
+) -> Result<Expr, EvalError> {
+    let (bindings, body) = parse_let_values_form(args)?;
+    if bindings.is_empty() {
+        return Ok(build_begin_expr(body.to_vec(), pos));
+    }
+
+    let thunk_names = (0..bindings.len())
+        .map(|_| ctx.fresh_generated_name("let_values"))
+        .collect::<Vec<_>>();
+
+    let mut current_body = body.to_vec();
+    for index in (0..bindings.len()).rev() {
+        let consumer = build_lambda_expr(bindings[index].0.clone(), current_body, pos);
+        current_body = vec![list_expr(
+            vec![
+                symbol_expr("call-with-values", pos),
+                symbol_expr(thunk_names[index].clone(), pos),
+                consumer,
+            ],
+            pos,
+        )];
+    }
+
+    let outer_params = list_expr(
+        thunk_names
+            .iter()
+            .cloned()
+            .map(|name| symbol_expr(name, pos))
+            .collect(),
+        pos,
+    );
+    let outer_lambda = build_lambda_expr(outer_params, current_body, pos);
+
+    let mut application = Vec::with_capacity(bindings.len() + 1);
+    application.push(outer_lambda);
+    for (_, producer) in bindings {
+        application.push(build_lambda_expr(
+            list_expr(Vec::new(), pos),
+            vec![producer.clone()],
+            pos,
+        ));
+    }
+
+    Ok(list_expr(application, pos))
 }
 
 fn parse_let_bindings(expr: &Expr) -> Result<Vec<(String, Expr)>, EvalError> {
