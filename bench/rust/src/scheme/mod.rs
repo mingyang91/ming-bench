@@ -11,6 +11,7 @@ thread_local! {
     static CALLCC_PENDING: RefCell<Option<(Pos, Value)>> = RefCell::new(None);
     static CALLCC_TOP_IDX: Cell<usize> = Cell::new(0);
     static CONT_RETURN: RefCell<Option<(Pos, usize, Value)>> = RefCell::new(None);
+    static RAISED_VALUE: RefCell<Option<Value>> = RefCell::new(None);
 }
 
 static GENSYM_COUNTER: AtomicUsize = AtomicUsize::new(0);
@@ -961,6 +962,125 @@ fn eval(expr: &Expr, env: &Env, out: &mut String) -> Result<Value, EvalError> {
                             }
                             break 'tco Ok(Value::Nil);
                         }
+                        "raise" => {
+                            if items.len() != 2 {
+                                break 'tco Err(EvalError::Arity(format!(
+                                    "raise requires 1 argument at {}",
+                                    pos.fmt()
+                                )));
+                            }
+                            let val = eval(&items[1], &cur_env, out)?;
+                            RAISED_VALUE.with(|rv| *rv.borrow_mut() = Some(val));
+                            break 'tco Err(EvalError::Raised);
+                        }
+                        "guard" => {
+                            // (guard (var clause ...) body ...)
+                            if items.len() < 3 {
+                                break 'tco Err(EvalError::Arity(format!(
+                                    "guard requires at least 2 arguments at {}",
+                                    pos.fmt()
+                                )));
+                            }
+                            let clauses_expr = match &items[1].kind {
+                                ExprKind::List(parts) => parts,
+                                _ => break 'tco Err(EvalError::Type(format!(
+                                    "guard: first argument must be a list at {}",
+                                    pos.fmt()
+                                ))),
+                            };
+                            if clauses_expr.is_empty() {
+                                break 'tco Err(EvalError::Type(format!(
+                                    "guard: missing variable at {}",
+                                    pos.fmt()
+                                )));
+                            }
+                            let var_name = match &clauses_expr[0].kind {
+                                ExprKind::Symbol(s) => s.clone(),
+                                _ => break 'tco Err(EvalError::Type(format!(
+                                    "guard: expected symbol at {}",
+                                    pos.fmt()
+                                ))),
+                            };
+                            let clauses = &clauses_expr[1..];
+                            // Evaluate body expressions
+                            let mut body_result = Ok(Value::Nil);
+                            for body_expr in &items[2..] {
+                                body_result = eval(body_expr, &cur_env, out);
+                                if body_result.is_err() {
+                                    break;
+                                }
+                            }
+                            match body_result {
+                                Ok(val) => break 'tco Ok(val),
+                                Err(EvalError::Raised) => {
+                                    let exn = RAISED_VALUE.with(|rv| rv.borrow_mut().take())
+                                        .unwrap_or(Value::Nil);
+                                    // Bind exception to var and test clauses
+                                    let guard_env = Env::with_parent(&cur_env);
+                                    guard_env.set(var_name.clone(), exn);
+                                    let mut matched = false;
+                                    let mut result = Value::Nil;
+                                    for clause in clauses {
+                                        match &clause.kind {
+                                            ExprKind::List(parts) if !parts.is_empty() => {
+                                                if let ExprKind::Symbol(ref s) = parts[0].kind {
+                                                    if s == "else" {
+                                                        // else clause
+                                                        for p in &parts[1..] {
+                                                            result = eval(p, &guard_env, out)?;
+                                                        }
+                                                        matched = true;
+                                                        break;
+                                                    }
+                                                }
+                                                let test = eval(&parts[0], &guard_env, out)?;
+                                                if test.is_truthy() {
+                                                    if parts.len() > 1 {
+                                                        for p in &parts[1..] {
+                                                            result = eval(p, &guard_env, out)?;
+                                                        }
+                                                    } else {
+                                                        result = test;
+                                                    }
+                                                    matched = true;
+                                                    break;
+                                                }
+                                            }
+                                            _ => {}
+                                        }
+                                    }
+                                    if matched {
+                                        break 'tco Ok(result);
+                                    } else {
+                                        // Re-raise
+                                        let exn = guard_env.get(&var_name).unwrap_or(Value::Nil);
+                                        RAISED_VALUE.with(|rv| *rv.borrow_mut() = Some(exn));
+                                        break 'tco Err(EvalError::Raised);
+                                    }
+                                }
+                                Err(e) => break 'tco Err(e),
+                            }
+                        }
+                        "with-exception-handler" => {
+                            if items.len() != 3 {
+                                break 'tco Err(EvalError::Arity(format!(
+                                    "with-exception-handler requires 2 arguments at {}",
+                                    pos.fmt()
+                                )));
+                            }
+                            let handler = eval(&items[1], &cur_env, out)?;
+                            let thunk = eval(&items[2], &cur_env, out)?;
+                            let result = call_thunk(&thunk, pos, &cur_env, out);
+                            match result {
+                                Ok(val) => break 'tco Ok(val),
+                                Err(EvalError::Raised) => {
+                                    let exn = RAISED_VALUE.with(|rv| rv.borrow_mut().take())
+                                        .unwrap_or(Value::Nil);
+                                    break 'tco apply_func(handler, vec![exn], pos, &cur_env, out);
+                                }
+                                Err(e) => break 'tco Err(e),
+                            }
+                        }
                         "dynamic-wind" => {
                             if items.len() != 4 {
                                 break 'tco Err(EvalError::Arity(format!(
@@ -973,7 +1093,7 @@ fn eval(expr: &Expr, env: &Env, out: &mut String) -> Result<Value, EvalError> {
                             let out_thunk = eval(&items[3], &cur_env, out)?;
                             // Call in-thunk
                             call_thunk(&in_thunk, pos, &cur_env, out)?;
-                            // Call body-thunk, catching ContinuationReturn
+                            // Call body-thunk, catching ContinuationReturn and Raised
                             let body_result = call_thunk(&body_thunk, pos, &cur_env, out);
                             match body_result {
                                 Ok(val) => {
@@ -985,6 +1105,13 @@ fn eval(expr: &Expr, env: &Env, out: &mut String) -> Result<Value, EvalError> {
                                     // Non-local exit: call out-thunk, then re-throw
                                     call_thunk(&out_thunk, pos, &cur_env, out)?;
                                     break 'tco Err(EvalError::ContinuationReturn);
+                                }
+                                Err(EvalError::Raised) => {
+                                    // Exception: call out-thunk, then re-raise
+                                    let saved = RAISED_VALUE.with(|rv| rv.borrow_mut().take());
+                                    call_thunk(&out_thunk, pos, &cur_env, out)?;
+                                    RAISED_VALUE.with(|rv| *rv.borrow_mut() = saved);
+                                    break 'tco Err(EvalError::Raised);
                                 }
                                 Err(e) => break 'tco Err(e),
                             }
@@ -2615,6 +2742,7 @@ fn is_keyword(name: &str) -> bool {
             | "let" | "begin" | "cond" | "set!" | "call/cc"
             | "call-with-current-continuation" | "string-set!"
             | "define-syntax" | "syntax-rules" | "dynamic-wind"
+            | "raise" | "guard" | "with-exception-handler"
     ) || Value::is_builtin_name(name)
 }
 

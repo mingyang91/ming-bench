@@ -13,4 +13,6 @@ pub enum EvalError {
     DivisionByZero(String),
     #[error("continuation invoked")]
     ContinuationReturn,
+    #[error("raised exception")]
+    Raised,
 }
