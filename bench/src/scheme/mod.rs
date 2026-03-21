@@ -1,5 +1,6 @@
 mod builtins;
 pub mod error;
+mod eval;
 mod parser;
 
 pub use error::EvalError;
@@ -7,7 +8,7 @@ pub use error::EvalError;
 use std::collections::HashMap;
 
 /// A Scheme value.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone)]
 enum Value {
     Integer(i64),
     Boolean(bool),
@@ -15,6 +16,26 @@ enum Value {
     Symbol(String),
     List(Vec<Value>),
     Nil,
+    Lambda {
+        name: Option<String>,
+        params: Vec<String>,
+        body: Expr,
+        closure_env: Env,
+    },
+}
+
+impl PartialEq for Value {
+    fn eq(&self, other: &Self) -> bool {
+        match (self, other) {
+            (Value::Integer(a), Value::Integer(b)) => a == b,
+            (Value::Boolean(a), Value::Boolean(b)) => a == b,
+            (Value::String(a), Value::String(b)) => a == b,
+            (Value::Symbol(a), Value::Symbol(b)) => a == b,
+            (Value::List(a), Value::List(b)) => a == b,
+            (Value::Nil, Value::Nil) => true,
+            _ => false,
+        }
+    }
 }
 
 impl std::fmt::Display for Value {
@@ -27,6 +48,7 @@ impl std::fmt::Display for Value {
             Value::Symbol(s) => write!(f, "{s}"),
             Value::Nil => write!(f, "()"),
             Value::List(items) => write!(f, "({})", fmt_list(items)),
+            Value::Lambda { .. } => write!(f, "#<procedure>"),
         }
     }
 }
@@ -81,144 +103,6 @@ fn quote_expr(expr: &Expr) -> Result<Value, EvalError> {
     }
 }
 
-/// Evaluate an expression in the given environment.
-fn eval(expr: &Expr, env: &mut Env) -> Result<Value, EvalError> {
-    match expr {
-        Expr::Atom(token) => {
-            // Try literal first, then variable lookup
-            if token.starts_with('"')
-                || token.parse::<i64>().is_ok()
-                || token == "#t"
-                || token == "#f"
-            {
-                atom_to_value(token)
-            } else if let Some(val) = env.get(token) {
-                Ok(val.clone())
-            } else {
-                // Return as symbol for now (unbound)
-                Err(EvalError::UnboundVariable {
-                    name: token.clone(),
-                })
-            }
-        }
-        Expr::List(items) => eval_list(items, env),
-    }
-}
-
-/// Evaluate a list expression (function application or special form).
-fn eval_list(items: &[Expr], env: &mut Env) -> Result<Value, EvalError> {
-    let [operator, args @ ..] = items else {
-        return Err(EvalError::Parse {
-            message: "empty list".to_string(),
-        });
-    };
-    let Expr::Atom(op) = operator else {
-        return Err(EvalError::Parse {
-            message: "expected operator".to_string(),
-        });
-    };
-    match op.as_str() {
-        "define" => eval_define(args, env),
-        "if" => eval_if(args, env),
-        "quote" => eval_quote(args),
-        "and" => eval_and(args, env),
-        "or" => eval_or(args, env),
-        _ => {
-            let evaluated: Vec<Value> = args
-                .iter()
-                .map(|a| eval(a, env))
-                .collect::<Result<_, _>>()?;
-            apply_builtin(op, &evaluated)
-        }
-    }
-}
-
-/// Apply a built-in operator.
-fn apply_builtin(op: &str, args: &[Value]) -> Result<Value, EvalError> {
-    match op {
-        "+" => builtins::apply_add(args),
-        "-" => builtins::apply_sub(args),
-        "*" => builtins::apply_mul(args),
-        "/" => builtins::apply_div(args),
-        "<" => builtins::apply_compare(args, |a, b| a < b),
-        ">" => builtins::apply_compare(args, |a, b| a > b),
-        "=" => builtins::apply_compare(args, |a, b| a == b),
-        "<=" => builtins::apply_compare(args, |a, b| a <= b),
-        ">=" => builtins::apply_compare(args, |a, b| a >= b),
-        "not" => builtins::apply_not(args),
-        _ => Err(EvalError::UnboundVariable {
-            name: op.to_string(),
-        }),
-    }
-}
-
-/// Evaluate `(define name value)`.
-fn eval_define(args: &[Expr], env: &mut Env) -> Result<Value, EvalError> {
-    let [Expr::Atom(name), val_expr] = args else {
-        return Err(EvalError::Parse {
-            message: "define requires a name and a value".to_string(),
-        });
-    };
-    let val = eval(val_expr, env)?;
-    env.insert(name.clone(), val.clone());
-    Ok(val)
-}
-
-/// Evaluate `(if cond then else)`.
-fn eval_if(args: &[Expr], env: &mut Env) -> Result<Value, EvalError> {
-    let (cond, then_expr, else_expr) = match args {
-        [c, t, e] => (c, t, Some(e)),
-        [c, t] => (c, t, None),
-        _ => {
-            return Err(EvalError::Parse {
-                message: "if requires 2 or 3 arguments".to_string(),
-            })
-        }
-    };
-    let cond_val = eval(cond, env)?;
-    if cond_val != Value::Boolean(false) {
-        eval(then_expr, env)
-    } else if let Some(e) = else_expr {
-        eval(e, env)
-    } else {
-        Ok(Value::Nil)
-    }
-}
-
-/// Evaluate `(quote expr)`.
-fn eval_quote(args: &[Expr]) -> Result<Value, EvalError> {
-    let [expr] = args else {
-        return Err(EvalError::Parse {
-            message: "quote requires exactly 1 argument".to_string(),
-        });
-    };
-    quote_expr(expr)
-}
-
-/// Short-circuit `and`: returns last truthy value, or first falsy value.
-fn eval_and(args: &[Expr], env: &mut Env) -> Result<Value, EvalError> {
-    let mut result = Value::Boolean(true);
-    for arg in args {
-        result = eval(arg, env)?;
-        if result == Value::Boolean(false) {
-            return Ok(result);
-        }
-    }
-    Ok(result)
-}
-
-/// Short-circuit `or`: returns first truthy value, or last falsy value.
-fn eval_or(args: &[Expr], env: &mut Env) -> Result<Value, EvalError> {
-    let mut result = Value::Boolean(false);
-    for arg in args {
-        result = eval(arg, env)?;
-        if result != Value::Boolean(false) {
-            return Ok(result);
-        }
-    }
-    Ok(result)
-}
-
 /// Evaluate one or more Scheme expressions and return the string
 /// representation of the last result.
 pub fn eval_str(input: &str) -> Result<String, EvalError> {
@@ -232,7 +116,7 @@ pub fn eval_str(input: &str) -> Result<String, EvalError> {
     let mut env = Env::new();
     let mut last = None;
     for expr in &exprs {
-        last = Some(eval(expr, &mut env)?);
+        last = Some(eval::eval(expr, &mut env)?);
     }
     Ok(last.expect("exprs is non-empty").to_string())
 }
