@@ -1,0 +1,97 @@
+#!/bin/sh
+
+#
+# Gradle wrapper bootstrap script.
+# Downloads gradle-wrapper.jar on first run if missing, then delegates
+# to the standard Gradle wrapper main class.
+#
+
+set -e
+
+app_path=$0
+while [ -h "$app_path" ]; do
+    ls=$( ls -ld -- "$app_path" )
+    link=${ls#*' -> '}
+    case $link in
+      /*)   app_path=$link ;;
+      *)    app_path="${app_path%"${app_path##*/}"}$link" ;;
+    esac
+done
+
+APP_HOME=$( cd -P "${app_path%"${app_path##*/}"}." > /dev/null && printf '%s\n' "$PWD" ) || exit
+
+WRAPPER_JAR="$APP_HOME/gradle/wrapper/gradle-wrapper.jar"
+WRAPPER_PROPERTIES="$APP_HOME/gradle/wrapper/gradle-wrapper.properties"
+
+# Download wrapper JAR if missing
+if [ ! -f "$WRAPPER_JAR" ]; then
+    echo "Downloading Gradle wrapper JAR..."
+    mkdir -p "$APP_HOME/gradle/wrapper"
+    GRADLE_VERSION=$(sed -n 's/.*gradle-\([0-9.]*\)-.*/\1/p' "$WRAPPER_PROPERTIES")
+    JAR_URL="https://raw.githubusercontent.com/gradle/gradle/v${GRADLE_VERSION}/gradle/wrapper/gradle-wrapper.jar"
+    if command -v curl >/dev/null 2>&1; then
+        curl -sL -o "$WRAPPER_JAR" "$JAR_URL" || {
+            # Fallback: let Gradle's own distribution host serve the wrapper
+            # The wrapper JAR is version-independent; use a known good copy
+            curl -sL -o "$WRAPPER_JAR" "https://services.gradle.org/distributions/gradle-${GRADLE_VERSION}-bin.zip" 2>/dev/null && {
+                echo "ERROR: Could not download gradle-wrapper.jar. Please run 'gradle wrapper' manually." >&2
+                rm -f "$WRAPPER_JAR"
+                exit 1
+            }
+        }
+    elif command -v wget >/dev/null 2>&1; then
+        wget -q -O "$WRAPPER_JAR" "$JAR_URL"
+    else
+        echo "ERROR: Neither curl nor wget found. Cannot download gradle-wrapper.jar." >&2
+        echo "Please install curl/wget or run 'gradle wrapper' in this directory." >&2
+        exit 1
+    fi
+    # Verify we got a JAR (not an HTML error page)
+    if [ -f "$WRAPPER_JAR" ]; then
+        head_bytes=$(od -A n -t x1 -N 2 "$WRAPPER_JAR" 2>/dev/null | tr -d ' ')
+        if [ "$head_bytes" != "504b" ]; then
+            echo "WARNING: Downloaded file does not appear to be a valid JAR." >&2
+            echo "Attempting alternative download..." >&2
+            rm -f "$WRAPPER_JAR"
+            # Alternative: use gradle's own release artifacts
+            ALT_URL="https://github.com/gradle/gradle/raw/v${GRADLE_VERSION}/gradle/wrapper/gradle-wrapper.jar"
+            if command -v curl >/dev/null 2>&1; then
+                curl -sL -o "$WRAPPER_JAR" "$ALT_URL"
+            elif command -v wget >/dev/null 2>&1; then
+                wget -q -O "$WRAPPER_JAR" "$ALT_URL"
+            fi
+        fi
+    fi
+    if [ ! -f "$WRAPPER_JAR" ]; then
+        echo "ERROR: Failed to download gradle-wrapper.jar." >&2
+        echo "Please run 'gradle wrapper --gradle-version ${GRADLE_VERSION}' manually." >&2
+        exit 1
+    fi
+    echo "Gradle wrapper JAR downloaded."
+fi
+
+# Determine Java command
+if [ -n "$JAVA_HOME" ]; then
+    if [ -x "$JAVA_HOME/jre/sh/java" ]; then
+        JAVACMD="$JAVA_HOME/jre/sh/java"
+    else
+        JAVACMD="$JAVA_HOME/bin/java"
+    fi
+    if [ ! -x "$JAVACMD" ]; then
+        echo "ERROR: JAVA_HOME is set to an invalid directory: $JAVA_HOME" >&2
+        exit 1
+    fi
+else
+    JAVACMD=java
+    if ! command -v java >/dev/null 2>&1; then
+        echo "ERROR: JAVA_HOME is not set and 'java' not found in PATH." >&2
+        exit 1
+    fi
+fi
+
+exec "$JAVACMD" \
+    -Xmx64m -Xms64m \
+    "-Dorg.gradle.appname=${0##*/}" \
+    -classpath "$WRAPPER_JAR" \
+    org.gradle.wrapper.GradleWrapperMain \
+    "$@"

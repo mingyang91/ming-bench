@@ -24,6 +24,7 @@ pub struct RunAgentArgs {
     pub resume: bool,
     pub from_level: Option<String>,
     pub clean: bool,
+    pub lang: String,
 }
 
 const DEFAULT_PROMPT: &str = "Implement the Scheme interpreter by following CLAUDE.md exactly.
@@ -46,7 +47,11 @@ pub fn run(args: RunAgentArgs) -> Result<()> {
         .expect("project has no parent dir")
         .join("workspace")
         .join(&args.name);
-    let agent_workdir = worktree_dir.join("bench");
+    let parsed_lang = crate::model::Lang::from_str(&args.lang).map_err(|msg| Error::CommandFailed {
+        cmd: msg,
+        exit_code: 1,
+    })?;
+    let agent_workdir = worktree_dir.join("bench").join(parsed_lang.dir_name());
 
     let results_dir = if args.resume {
         find_resume_dir(&proj, &args.strategy, &args.name)?
@@ -164,31 +169,47 @@ fn create_worktree(
 }
 
 fn symlink_strategy(args: &RunAgentArgs, agent_workdir: &Path) -> Result<()> {
-    let strategy_src = format!("strategies/{}.md", args.strategy);
-    let strategy_path = agent_workdir.join(&strategy_src);
-    if !strategy_path.is_file() {
+    // Look for per-language strategy first, fallback to base.
+    // Strategies live at bench/strategies/ — one level up from bench/{lang}/.
+    let lang = crate::model::Lang::from_str(&args.lang).unwrap_or(crate::model::Lang::Rust);
+    let bench_dir = agent_workdir.parent().expect("agent_workdir has parent");
+
+    let lang_rel = format!("strategies/{}/{}.md", lang.dir_name(), args.strategy);
+    let base_rel = format!("strategies/{}.md", args.strategy);
+
+    // Check which file exists on the filesystem (bench_dir = bench/)
+    let strategy_rel = if bench_dir.join(&lang_rel).is_file() {
+        lang_rel
+    } else if bench_dir.join(&base_rel).is_file() {
+        base_rel
+    } else {
         return Err(Error::CommandFailed {
             cmd: format!(
-                "strategy file not found: {} (available: ls bench/strategies/)",
-                strategy_path.display()
+                "strategy file not found: {} or {} (in {})",
+                lang_rel, base_rel, bench_dir.display()
             ),
             exit_code: 1,
         });
-    }
+    };
+
+    // Symlink target is relative to agent_workdir (bench/{lang}/), so prepend ../
+    let symlink_target = format!("../{strategy_rel}");
+
     let claude_md = agent_workdir.join("CLAUDE.md");
     let _ = fs::remove_file(&claude_md);
-    std::os::unix::fs::symlink(&strategy_src, &claude_md)
+    std::os::unix::fs::symlink(&symlink_target, &claude_md)
         .map_err(|e| Error::io(&claude_md, e))?;
     let agents_md = agent_workdir.join("AGENTS.md");
     let _ = fs::remove_file(&agents_md);
     std::os::unix::fs::symlink("CLAUDE.md", &agents_md)
         .map_err(|e| Error::io(&agents_md, e))?;
-    println!("Strategy:   {strategy_src} → CLAUDE.md");
+    println!("Strategy:   {strategy_rel} → CLAUDE.md");
     Ok(())
 }
 
 fn copy_strategy_clippy(args: &RunAgentArgs, agent_workdir: &Path) -> Result<()> {
-    let strategy_clippy = agent_workdir.join(format!("strategies/{}.clippy.toml", args.strategy));
+    let bench_dir = agent_workdir.parent().expect("agent_workdir has parent");
+    let strategy_clippy = bench_dir.join(format!("strategies/{}.clippy.toml", args.strategy));
     let clippy_toml = agent_workdir.join("clippy.toml");
     if strategy_clippy.is_file() {
         fs::copy(&strategy_clippy, &clippy_toml)
@@ -365,9 +386,9 @@ fn run_single_level(
 
         capture_session(&args.agent, &level_uuid, level_dir);
 
-        let mut test_exit = run_level_tests(worktree_dir, level);
+        let mut test_exit = run_level_tests(worktree_dir, level, &args.lang);
 
-        if test_exit == 0 && worktree_dir.join("bench/clippy.toml").is_file() {
+        if test_exit == 0 && args.strategy.contains("quality-gate") {
             test_exit = run_quality_gate_cleanup(args, agent_workdir, worktree_dir, level_dir, level);
         }
 
@@ -398,9 +419,9 @@ fn run_single_level(
     }
 }
 
-fn run_level_tests(worktree_dir: &Path, level: &str) -> i32 {
+fn run_level_tests(worktree_dir: &Path, level: &str, lang: &str) -> i32 {
     // Tests only — no quality gate. Gate is enforced in the cleanup pass.
-    run_cmd("cargo", &["xtask", "test", level], worktree_dir).unwrap_or(1)
+    run_cmd("cargo", &["xtask", "test", level, "--lang", lang], worktree_dir).unwrap_or(1)
 }
 
 fn run_quality_gate_cleanup(
@@ -410,8 +431,9 @@ fn run_quality_gate_cleanup(
     println!("--- Level {level} cleanup (max 15 turns) ---");
     let cleanup_uuid = uuid_v4();
     let cleanup_prompt = format!(
-        "Level {level} tests pass. Fix any clippy/quality-gate warnings.\n\
-         Run `cargo xtask test {level} --gate` to verify. Do not change test behavior."
+        "Level {level} tests pass. Fix any quality-gate warnings.\n\
+         Run `cargo xtask test {level} --lang {} --gate` to verify. Do not change test behavior.",
+        args.lang
     );
     let _cleanup_exit = launch_agent(
         &args.agent, agent_workdir, &cleanup_prompt, &cleanup_uuid,
@@ -419,7 +441,7 @@ fn run_quality_gate_cleanup(
     );
     capture_session_as(&args.agent, &cleanup_uuid, level_dir, "session-cleanup.jsonl");
 
-    run_cmd("cargo", &["xtask", "test", level, "--gate"], worktree_dir).unwrap_or(1)
+    run_cmd("cargo", &["xtask", "test", level, "--lang", &args.lang, "--gate"], worktree_dir).unwrap_or(1)
 }
 
 fn commit_checkpoint(level: &str, status: &str, duration: i64, worktree_dir: &Path) {
@@ -782,7 +804,7 @@ fn build_level_prompt(level: &str, worktree_dir: &Path, results_dir: &Path) -> S
     summary.push_str("Files under src/scheme/:\n");
 
     // List .rs files with line counts
-    append_file_listing(&mut summary, &worktree_dir.join("bench/src/scheme"));
+    append_file_listing(&mut summary, &worktree_dir.join("bench/rust/src/scheme"));
 
     summary.push_str("\nLevels already passing:\n");
     let level_num: u32 = level.parse().unwrap_or(1);

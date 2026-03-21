@@ -22,12 +22,12 @@ pub fn run(json: bool) -> Result<()> {
 
 fn print_table(runs: &[(std::path::PathBuf, model::MetaJson)]) {
     println!(
-        "{:<40} {:<10} {:<8} {:<10} {:<8} MODE",
-        "RUN", "BASE", "AGENT", "SCORE", "DURATION"
+        "{:<40} {:<6} {:<10} {:<8} {:<10} {:<8} MODE",
+        "RUN", "LANG", "BASE", "AGENT", "SCORE", "DURATION"
     );
     println!(
-        "{:<40} {:<10} {:<8} {:<10} {:<8} ----",
-        "---", "----", "-----", "-----", "--------"
+        "{:<40} {:<6} {:<10} {:<8} {:<10} {:<8} ----",
+        "---", "----", "----", "-----", "-----", "--------"
     );
 
     for (run_dir, meta) in runs {
@@ -36,6 +36,7 @@ fn print_table(runs: &[(std::path::PathBuf, model::MetaJson)]) {
             .map(|n| n.to_string_lossy().into_owned())
             .unwrap_or_default();
 
+        let lang = meta.lang.as_deref().unwrap_or("rust");
         let base = meta.base.as_deref().unwrap_or("?");
         let agent = meta.agent.as_deref().unwrap_or("?");
         let mode = meta.mode.as_deref().unwrap_or("?");
@@ -51,7 +52,7 @@ fn print_table(runs: &[(std::path::PathBuf, model::MetaJson)]) {
             .unwrap_or_else(|| "?".to_string());
 
         println!(
-            "{run_name:<40} {base:<10} {agent:<8} {score:<10} {duration:<8} {mode}"
+            "{run_name:<40} {lang:<6} {base:<10} {agent:<8} {score:<10} {duration:<8} {mode}"
         );
     }
 }
@@ -74,6 +75,7 @@ fn print_json(runs: &[(std::path::PathBuf, model::MetaJson)]) -> Result<()> {
 
             serde_json::json!({
                 "run": run_name,
+                "lang": meta.lang.as_deref().unwrap_or("rust"),
                 "base": meta.base,
                 "agent": meta.agent,
                 "score": score,

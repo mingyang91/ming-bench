@@ -4,11 +4,23 @@ use std::path::Path;
 
 const IMAGE_NAME: &str = "ming";
 
-pub fn run(level: &str, gate: bool) -> Result<()> {
+pub fn run(level: &str, gate: bool, lang: &str) -> Result<()> {
+    let parsed_lang = crate::model::Lang::from_str(lang).map_err(|msg| Error::CommandFailed {
+        cmd: msg,
+        exit_code: 1,
+    })?;
+
+    match parsed_lang {
+        crate::model::Lang::Rust => run_rust(level, gate),
+        _ => run_script(level, gate, &parsed_lang),
+    }
+}
+
+fn run_rust(level: &str, gate: bool) -> Result<()> {
     let proj = project_dir();
 
     // --- AST rules (always enforced) ---
-    let scheme_src = proj.join("bench/src/scheme");
+    let scheme_src = proj.join("bench/rust/src/scheme");
     let violations = crate::ast_check::check_ast_rules(&scheme_src);
     if !violations.is_empty() {
         eprintln!("ERROR: AST rule violations found:");
@@ -22,7 +34,7 @@ pub fn run(level: &str, gate: bool) -> Result<()> {
     }
 
     // --- Quality gates (only when --gate is set and clippy.toml exists) ---
-    let clippy_toml = proj.join("bench/clippy.toml");
+    let clippy_toml = proj.join("bench/rust/clippy.toml");
     if gate && clippy_toml.is_file() {
         quality_gates(&proj, level)?;
     }
@@ -49,7 +61,7 @@ pub fn run(level: &str, gate: bool) -> Result<()> {
     // BENCH_LEVEL env: supports requirement-change levels where tests at level N
     // are deprecated by level N+1. Tests check this to skip when superseded.
     let bench_level = if level == "all" {
-        LEVELS.last().unwrap().to_string()
+        LEVELS.last().expect("no levels defined").to_string()
     } else {
         level.to_string()
     };
@@ -84,6 +96,57 @@ pub fn run(level: &str, gate: bool) -> Result<()> {
     Ok(())
 }
 
+/// Run tests for non-Rust languages by calling build.sh + test.sh scripts.
+fn run_script(level: &str, gate: bool, lang: &crate::model::Lang) -> Result<()> {
+    let proj = project_dir();
+    let lang_dir = lang.bench_dir(&proj);
+
+    if !lang_dir.is_dir() {
+        return Err(Error::CommandFailed {
+            cmd: format!("bench/{} directory not found", lang.dir_name()),
+            exit_code: 1,
+        });
+    }
+
+    // Build
+    let build_script = lang_dir.join("build.sh");
+    if build_script.is_file() {
+        println!("Building {} tests...", lang.display_name());
+        let exit = run_cmd("bash", &["build.sh"], &lang_dir)?;
+        if exit != 0 {
+            return Err(Error::CommandFailed {
+                cmd: format!("build.sh ({})", lang.display_name()),
+                exit_code: exit,
+            });
+        }
+    }
+
+    // Test
+    let test_script = lang_dir.join("test.sh");
+    if !test_script.is_file() {
+        return Err(Error::CommandFailed {
+            cmd: format!("bench/{}/test.sh not found", lang.dir_name()),
+            exit_code: 1,
+        });
+    }
+
+    println!("Running {} tests (level {level})...", lang.display_name());
+    let mut test_args = vec!["test.sh", level];
+    if gate {
+        test_args.push("--gate");
+    }
+    let exit = run_cmd("bash", &test_args, &lang_dir)?;
+
+    if exit != 0 {
+        return Err(Error::CommandFailed {
+            cmd: format!("test.sh ({})", lang.display_name()),
+            exit_code: exit,
+        });
+    }
+
+    Ok(())
+}
+
 /// Lint flags enforced by the quality gate. These were previously compile-time
 /// attributes via `cfg_attr(feature = "quality-gate", ...)` in bench/src/lib.rs.
 /// Now they live here so agents only see lint errors during `cargo xtask test`,
@@ -111,8 +174,8 @@ const GATE_LINT_FLAGS: &[&str] = &[
 ];
 
 fn quality_gates(proj: &Path, level: &str) -> Result<()> {
-    let clippy_toml = proj.join("bench/clippy.toml");
-    let clippy_bak = proj.join("bench/clippy.toml.bak");
+    let clippy_toml = proj.join("bench/rust/clippy.toml");
+    let clippy_bak = proj.join("bench/rust/clippy.toml.bak");
 
     // Determine limits based on level
     let (fn_limit, allow_dead_code) = if level != "all" {
@@ -184,7 +247,7 @@ fn quality_gates(proj: &Path, level: &str) -> Result<()> {
 fn check_mod_size(proj: &Path, level: u32) -> Result<()> {
     let mod_limit: usize = 300;
 
-    let mod_file = proj.join("bench/src/scheme/mod.rs");
+    let mod_file = proj.join("bench/rust/src/scheme/mod.rs");
     if !mod_file.is_file() {
         return Ok(());
     }

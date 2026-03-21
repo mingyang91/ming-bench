@@ -1,0 +1,25 @@
+package build
+
+import mill._
+import mill.scalalib._
+import mill.scalalib.scalafmt._
+
+object ming extends ScalaModule with ScalafmtModule {
+  def scalaVersion = "3.8.1"
+
+  def scalacOptions = Seq(
+    "-Werror",
+    "-deprecation",
+    "-feature",
+    "-unchecked",
+  )
+
+  object test extends ScalaTests with TestModule.Munit with ScalafmtModule {
+    def ivyDeps = Agg(
+      ivy"org.scalameta::munit::1.1.0",
+      ivy"com.google.code.gson:gson:2.11.0",
+    )
+  }
+
+  object fix extends ScalafixModule
+}

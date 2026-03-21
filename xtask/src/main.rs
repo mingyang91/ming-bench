@@ -63,11 +63,14 @@ enum Commands {
     Setup,
     /// Run tests for a level inside a container
     Test {
-        /// Level number (01-21) or "all"
+        /// Level number (01-23) or "all"
         level: String,
         /// Enable quality gates (clippy, mod.rs size) — off by default
         #[arg(long)]
         gate: bool,
+        /// Language: rust (default), java, go, ts, scala
+        #[arg(long, default_value = "rust")]
+        lang: String,
     },
     /// Run full benchmark scoring pass
     Bench {
@@ -115,6 +118,9 @@ enum Commands {
         /// Clean stale worktree + branch before creating fresh
         #[arg(long)]
         clean: bool,
+        /// Language: rust (default), java, go, ts, scala
+        #[arg(long, default_value = "rust")]
+        lang: String,
     },
     /// Analyze session request patterns and cost drivers
     Analyze {
@@ -204,7 +210,7 @@ fn dispatch(command: Commands) -> model::Result<()> {
         Commands::Tokens { runs, all } => cmd::tokens::run(runs, all),
         Commands::Watch { once, ts, all } => cmd::watch::run(once, ts, all),
         Commands::Setup => cmd::setup::run(),
-        Commands::Test { ref level, gate } => cmd::test_level::run(level, gate),
+        Commands::Test { ref level, gate, ref lang } => cmd::test_level::run(level, gate, lang),
         Commands::Bench {
             ref branch,
             ref run_id,
@@ -222,6 +228,7 @@ fn dispatch(command: Commands) -> model::Result<()> {
             resume,
             from_level,
             clean,
+            lang,
         } => cmd::run_agent::run(cmd::run_agent::RunAgentArgs {
             base,
             strategy,
@@ -235,6 +242,7 @@ fn dispatch(command: Commands) -> model::Result<()> {
             resume,
             from_level,
             clean,
+            lang,
         }),
         Commands::Analyze { runs, all } => cmd::analyze::run(runs, all),
         Commands::Verify => cmd::verify::run(),

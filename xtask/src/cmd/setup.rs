@@ -17,30 +17,34 @@ pub fn run() -> Result<()> {
     // Show podman version
     let _ = run_cmd("podman", &["--version"], &proj);
 
-    // 2. Build bench container image
-    println!("Building bench container image 'ming'...");
-    let exit = run_cmd(
-        "sudo",
-        &[
-            "podman",
-            "build",
-            "-t",
-            "ming",
-            "-f",
-            "Dockerfile.bench",
-            ".",
-        ],
-        &proj,
-    )?;
+    // 2. Build container images
+    let images = [
+        ("ming", "Dockerfile.bench"),
+        ("ming-jvm", "Dockerfile.jvm"),
+        ("ming-node", "Dockerfile.node"),
+    ];
 
-    if exit != 0 {
-        return Err(crate::model::Error::CommandFailed {
-            cmd: "podman build".to_string(),
-            exit_code: exit,
-        });
+    for (name, dockerfile) in &images {
+        let dockerfile_path = proj.join(dockerfile);
+        if !dockerfile_path.is_file() {
+            println!("Skipping {name} (no {dockerfile})");
+            continue;
+        }
+        println!("Building container image '{name}' from {dockerfile}...");
+        let exit = run_cmd(
+            "sudo",
+            &["podman", "build", "-t", name, "-f", dockerfile, "."],
+            &proj,
+        )?;
+        if exit != 0 {
+            return Err(crate::model::Error::CommandFailed {
+                cmd: format!("podman build {name}"),
+                exit_code: exit,
+            });
+        }
+        println!("Image '{name}' built successfully.");
     }
 
-    println!("Image 'ming' built successfully.");
     println!("=== Setup complete ===");
     println!("Run benchmarks with: cargo xtask bench <branch>");
 

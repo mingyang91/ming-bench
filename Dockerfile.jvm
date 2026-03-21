@@ -1,0 +1,3 @@
+FROM amazoncorretto:26-headless
+WORKDIR /bench
+ENTRYPOINT ["bash", "-c"]

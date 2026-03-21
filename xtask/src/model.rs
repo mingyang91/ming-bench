@@ -21,6 +21,7 @@ pub struct MetaJson {
     pub timestamp: Option<String>,
     pub exit_code: Option<i32>,
     pub strategy: Option<String>,
+    pub lang: Option<String>,
 }
 
 // ---------------------------------------------------------------------------
@@ -66,6 +67,64 @@ pub const PRICE_INPUT: f64 = 15.0 / 1_000_000.0;
 pub const PRICE_OUTPUT: f64 = 75.0 / 1_000_000.0;
 pub const PRICE_CACHE_WRITE: f64 = 18.75 / 1_000_000.0;
 pub const PRICE_CACHE_READ: f64 = 1.50 / 1_000_000.0;
+
+// ---------------------------------------------------------------------------
+// Language support
+// ---------------------------------------------------------------------------
+
+#[derive(Clone, Debug, PartialEq)]
+pub enum Lang {
+    Rust,
+    Java,
+    Go,
+    TypeScript,
+    Scala,
+}
+
+impl Lang {
+    pub fn from_str(s: &str) -> std::result::Result<Self, String> {
+        match s.to_lowercase().as_str() {
+            "rust" | "rs" => Ok(Self::Rust),
+            "java" => Ok(Self::Java),
+            "go" | "golang" => Ok(Self::Go),
+            "typescript" | "ts" => Ok(Self::TypeScript),
+            "scala" => Ok(Self::Scala),
+            _ => Err(format!("unknown language: {s} (expected: rust, java, go, ts, scala)")),
+        }
+    }
+
+    pub fn dir_name(&self) -> &str {
+        match self {
+            Self::Rust => "rust",
+            Self::Java => "java",
+            Self::Go => "go",
+            Self::TypeScript => "ts",
+            Self::Scala => "scala",
+        }
+    }
+
+    pub fn display_name(&self) -> &str {
+        match self {
+            Self::Rust => "Rust",
+            Self::Java => "Java",
+            Self::Go => "Go",
+            Self::TypeScript => "TypeScript",
+            Self::Scala => "Scala",
+        }
+    }
+
+    pub fn image_name(&self) -> &str {
+        match self {
+            Self::Rust | Self::Go => "ming",
+            Self::Java | Self::Scala => "ming-jvm",
+            Self::TypeScript => "ming-node",
+        }
+    }
+
+    pub fn bench_dir(&self, proj: &std::path::Path) -> PathBuf {
+        proj.join("bench").join(self.dir_name())
+    }
+}
 
 // ---------------------------------------------------------------------------
 // Errors

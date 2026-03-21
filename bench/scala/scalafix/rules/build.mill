@@ -1,0 +1,12 @@
+package build.scalafix.rules
+
+import mill._
+import mill.scalalib._
+
+object `package` extends ScalaModule {
+  def scalaVersion = "2.13.16"
+
+  def ivyDeps = Agg(
+    ivy"ch.epfl.scala::scalafix-core:0.14.3",
+  )
+}
