@@ -140,6 +140,9 @@ fn eval_special_form(
         "define-syntax" => eval_define_syntax(args, span, env)
             .map(Bounce::Done)
             .map(Some),
+        "letrec" => eval_letrec(args, span, env).map(Some),
+        "letrec*" => eval_letrec_star(args, span, env).map(Some),
+        "case" => eval_case(args, span, env).map(Some),
         _ => Ok(None),
     }
 }
@@ -768,6 +771,12 @@ fn apply_builtin_values(name: &str, args: &[Value]) -> Result<Value, EvalError> 
             };
             Ok(Value::Boolean(values_eq(a, b)))
         }
+        "eqv?" => {
+            let [a, b] = args else {
+                return Err(EvalError::WrongArgCount { expected: 2, got: args.len() });
+            };
+            Ok(Value::Boolean(values_eqv(a, b)))
+        }
         "equal?" => {
             let [a, b] = args else {
                 return Err(EvalError::WrongArgCount { expected: 2, got: args.len() });
@@ -784,6 +793,16 @@ fn apply_builtin_values(name: &str, args: &[Value]) -> Result<Value, EvalError> 
         "string=?" | "string<?" | "string-ci=?" | "string-upcase" | "string-downcase" =>
             apply_string_builtin(name, args),
         "map" => apply_map_builtin(args),
+        "vector" => Ok(Value::Vector(std::rc::Rc::new(std::cell::RefCell::new(args.to_vec())))),
+        "make-vector" => apply_make_vector(args),
+        "vector-ref" => apply_vector_ref(args),
+        "vector-set!" => apply_vector_set(args),
+        "vector-length" => apply_vector_length(args),
+        "vector?" => Ok(Value::Boolean(matches!(args, [Value::Vector(_)]))),
+        "vector->list" => apply_vector_to_list(args),
+        "list->vector" => apply_list_to_vector(args),
+        "procedure?" => Ok(Value::Boolean(matches!(args, [Value::Lambda { .. } | Value::Builtin(_) | Value::Continuation { .. }]))),
+        "integer?" => Ok(Value::Boolean(matches!(args, [Value::Integer(_)]))),
         _ => Err(EvalError::UnboundVariable { name: name.into() }),
     }
 }
@@ -926,7 +945,7 @@ fn is_builtin(name: &str) -> bool {
             | "string-copy"
             | "string->list" | "list->string"
             | "char->integer" | "integer->char"
-            | "eq?" | "equal?"
+            | "eq?" | "eqv?" | "equal?"
             | "abs" | "modulo" | "remainder" | "quotient"
             | "min" | "max" | "expt"
             | "zero?" | "positive?" | "negative?" | "odd?" | "even?"
@@ -936,6 +955,9 @@ fn is_builtin(name: &str) -> bool {
             | "char=?" | "char<?"
             | "string=?" | "string<?" | "string-ci=?"
             | "string-upcase" | "string-downcase"
+            | "vector" | "make-vector" | "vector-ref" | "vector-set!"
+            | "vector-length" | "vector?" | "vector->list" | "list->vector"
+            | "procedure?" | "integer?"
     )
 }
 
@@ -1011,6 +1033,19 @@ fn eval_builtin(op: &str, args: &[Expr], env: &Env) -> Result<Value, EvalError> 
         }),
         "string-upcase" => eval_string_case(args, env, |s| s.to_uppercase()),
         "string-downcase" => eval_string_case(args, env, |s| s.to_lowercase()),
+        "eqv?" => eval_eqv(args, env),
+        "vector" => eval_vector_create(args, env),
+        "make-vector" => eval_make_vector(args, env),
+        "vector-ref" => eval_vector_ref(args, env),
+        "vector-set!" => eval_vector_set(args, env),
+        "vector-length" => eval_vector_length(args, env),
+        "vector?" => eval_type_pred(args, env, |v| matches!(v, Value::Vector(_))),
+        "vector->list" => eval_vector_to_list(args, env),
+        "list->vector" => eval_list_to_vector(args, env),
+        "procedure?" => eval_type_pred(args, env, |v| {
+            matches!(v, Value::Lambda { .. } | Value::Builtin(_) | Value::Continuation { .. })
+        }),
+        "integer?" => eval_type_pred(args, env, |v| matches!(v, Value::Integer(_))),
         _ => Err(EvalError::UnboundVariable { name: op.into() }),
     }
 }
@@ -1576,6 +1611,18 @@ fn values_eq(a: &Value, b: &Value) -> bool {
         (Value::Symbol(x), Value::Symbol(y)) => x == y,
         (Value::Char(x), Value::Char(y)) => x == y,
         (Value::List(x), Value::List(y)) => x.is_empty() && y.is_empty(),
+        (Value::Void, Value::Void) => true,
+        _ => std::ptr::eq(a as *const _, b as *const _),
+    }
+}
+
+fn values_eqv(a: &Value, b: &Value) -> bool {
+    match (a, b) {
+        (Value::Integer(x), Value::Integer(y)) => x == y,
+        (Value::Boolean(x), Value::Boolean(y)) => x == y,
+        (Value::Symbol(x), Value::Symbol(y)) => x == y,
+        (Value::Char(x), Value::Char(y)) => x == y,
+        (Value::List(x), Value::List(y)) => x.is_empty() && y.is_empty(),
         _ => std::ptr::eq(a as *const _, b as *const _),
     }
 }
@@ -1592,6 +1639,11 @@ fn values_equal(a: &Value, b: &Value) -> bool {
         }
         (Value::List(x), Value::List(y)) => {
             x.len() == y.len() && x.iter().zip(y.iter()).all(|(a, b)| values_equal(a, b))
+        }
+        (Value::Vector(x), Value::Vector(y)) => {
+            let xb = x.borrow();
+            let yb = y.borrow();
+            xb.len() == yb.len() && xb.iter().zip(yb.iter()).all(|(a, b)| values_equal(a, b))
         }
         _ => false,
     }
@@ -1920,4 +1972,265 @@ fn eval_integer_to_char(args: &[Expr], env: &Env) -> Result<Value, EvalError> {
         got: format!("{n}"),
     })?;
     Ok(Value::Char(ch))
+}
+
+// ===== L15: letrec, letrec*, case, eqv?, vectors =====
+
+fn eval_letrec(args: &[Expr], span: Span, env: &Env) -> Result<Bounce, EvalError> {
+    let [Expr::List(ref bindings, _), ref body @ ..] = args else {
+        return Err(EvalError::Parse("invalid letrec form".into()).at(span));
+    };
+    if body.is_empty() {
+        return Err(EvalError::Parse("letrec requires a body".into()).at(span));
+    }
+    let letrec_env = Env::extend(env);
+    // First pass: define all names as Void (placeholder)
+    let mut names_and_exprs = Vec::new();
+    for binding in bindings {
+        let Expr::List(ref pair, _) = binding else {
+            return Err(EvalError::Parse("letrec binding must be a list".into()).at(span));
+        };
+        let [Expr::Symbol(ref bname, _), ref val_expr] = pair.as_slice() else {
+            return Err(EvalError::Parse("letrec binding must be (name expr)".into()).at(span));
+        };
+        letrec_env.define(bname.clone(), Value::Void);
+        names_and_exprs.push((bname.clone(), val_expr.clone()));
+    }
+    // Second pass: evaluate init expressions in the letrec env and set!
+    for (name, expr) in &names_and_exprs {
+        let val = eval(expr, &letrec_env)?;
+        letrec_env.set(name, val);
+    }
+    eval_body_tco(body, letrec_env)
+}
+
+fn eval_letrec_star(args: &[Expr], span: Span, env: &Env) -> Result<Bounce, EvalError> {
+    let [Expr::List(ref bindings, _), ref body @ ..] = args else {
+        return Err(EvalError::Parse("invalid letrec* form".into()).at(span));
+    };
+    if body.is_empty() {
+        return Err(EvalError::Parse("letrec* requires a body".into()).at(span));
+    }
+    let letrec_env = Env::extend(env);
+    // Define all names as Void first
+    let mut names_and_exprs = Vec::new();
+    for binding in bindings {
+        let Expr::List(ref pair, _) = binding else {
+            return Err(EvalError::Parse("letrec* binding must be a list".into()).at(span));
+        };
+        let [Expr::Symbol(ref bname, _), ref val_expr] = pair.as_slice() else {
+            return Err(EvalError::Parse("letrec* binding must be (name expr)".into()).at(span));
+        };
+        letrec_env.define(bname.clone(), Value::Void);
+        names_and_exprs.push((bname.clone(), val_expr.clone()));
+    }
+    // Evaluate sequentially so earlier bindings are visible to later ones
+    for (name, expr) in &names_and_exprs {
+        let val = eval(expr, &letrec_env)?;
+        letrec_env.set(name, val);
+    }
+    eval_body_tco(body, letrec_env)
+}
+
+fn eval_case(args: &[Expr], span: Span, env: &Env) -> Result<Bounce, EvalError> {
+    let [ref key_expr, ref clauses @ ..] = args else {
+        return Err(EvalError::Parse("case requires a key expression".into()).at(span));
+    };
+    let key = eval(key_expr, env)?;
+    for clause in clauses {
+        let Expr::List(ref parts, _) = clause else {
+            return Err(EvalError::Parse("case clause must be a list".into()).at(span));
+        };
+        let [ref datums_expr, ref body @ ..] = parts.as_slice() else {
+            return Err(EvalError::Parse("case clause must have datums and body".into()).at(span));
+        };
+        // Check for else clause
+        if matches!(datums_expr, Expr::Symbol(s, _) if s == "else") {
+            return eval_body_tco(body, env.clone());
+        }
+        let Expr::List(ref datums, _) = datums_expr else {
+            return Err(EvalError::Parse("case datums must be a list".into()).at(span));
+        };
+        let matched = datums.iter().any(|d| {
+            expr_to_value(d).is_ok_and(|dv| values_eqv(&key, &dv))
+        });
+        if matched {
+            return eval_body_tco(body, env.clone());
+        }
+    }
+    // No match, no else → void
+    Ok(Bounce::Done(Value::Void))
+}
+
+fn eval_eqv(args: &[Expr], env: &Env) -> Result<Value, EvalError> {
+    let [a_expr, b_expr] = args else {
+        return Err(EvalError::WrongArgCount { expected: 2, got: args.len() });
+    };
+    let a = eval(a_expr, env)?;
+    let b = eval(b_expr, env)?;
+    Ok(Value::Boolean(values_eqv(&a, &b)))
+}
+
+fn eval_vector_create(args: &[Expr], env: &Env) -> Result<Value, EvalError> {
+    let items: Vec<Value> = args.iter().map(|a| eval(a, env)).collect::<Result<_, _>>()?;
+    Ok(Value::Vector(std::rc::Rc::new(std::cell::RefCell::new(items))))
+}
+
+fn eval_make_vector(args: &[Expr], env: &Env) -> Result<Value, EvalError> {
+    let (size, fill) = match args {
+        [size_expr] => (eval(size_expr, env)?, Value::Integer(0)),
+        [size_expr, fill_expr] => (eval(size_expr, env)?, eval(fill_expr, env)?),
+        _ => return Err(EvalError::WrongArgCount { expected: 2, got: args.len() }),
+    };
+    let n = expect_integer(&size)? as usize;
+    Ok(Value::Vector(std::rc::Rc::new(std::cell::RefCell::new(vec![fill; n]))))
+}
+
+fn eval_vector_ref(args: &[Expr], env: &Env) -> Result<Value, EvalError> {
+    let [vec_expr, idx_expr] = args else {
+        return Err(EvalError::WrongArgCount { expected: 2, got: args.len() });
+    };
+    let vec_val = eval(vec_expr, env)?;
+    let Value::Vector(ref v) = vec_val else {
+        return Err(EvalError::TypeError { expected: "vector".into(), got: format!("{vec_val}") });
+    };
+    let idx = expect_integer(&eval(idx_expr, env)?)? as usize;
+    let borrowed = v.borrow();
+    borrowed.get(idx).cloned().ok_or_else(|| EvalError::TypeError {
+        expected: "valid vector index".into(),
+        got: format!("index {idx} out of range"),
+    })
+}
+
+fn eval_vector_set(args: &[Expr], env: &Env) -> Result<Value, EvalError> {
+    let [vec_expr, idx_expr, val_expr] = args else {
+        return Err(EvalError::WrongArgCount { expected: 3, got: args.len() });
+    };
+    let vec_val = eval(vec_expr, env)?;
+    let Value::Vector(ref v) = vec_val else {
+        return Err(EvalError::TypeError { expected: "vector".into(), got: format!("{vec_val}") });
+    };
+    let idx = expect_integer(&eval(idx_expr, env)?)? as usize;
+    let new_val = eval(val_expr, env)?;
+    let mut borrowed = v.borrow_mut();
+    if idx >= borrowed.len() {
+        return Err(EvalError::TypeError {
+            expected: "valid vector index".into(),
+            got: format!("index {idx} out of range"),
+        });
+    }
+    borrowed[idx] = new_val;
+    Ok(Value::Void)
+}
+
+fn eval_vector_length(args: &[Expr], env: &Env) -> Result<Value, EvalError> {
+    let [arg] = args else {
+        return Err(EvalError::WrongArgCount { expected: 1, got: args.len() });
+    };
+    let val = eval(arg, env)?;
+    let Value::Vector(ref v) = val else {
+        return Err(EvalError::TypeError { expected: "vector".into(), got: format!("{val}") });
+    };
+    let len = v.borrow().len() as i64;
+    Ok(Value::Integer(len))
+}
+
+fn eval_vector_to_list(args: &[Expr], env: &Env) -> Result<Value, EvalError> {
+    let [arg] = args else {
+        return Err(EvalError::WrongArgCount { expected: 1, got: args.len() });
+    };
+    let val = eval(arg, env)?;
+    let Value::Vector(ref v) = val else {
+        return Err(EvalError::TypeError { expected: "vector".into(), got: format!("{val}") });
+    };
+    let items = v.borrow().clone();
+    Ok(Value::List(items))
+}
+
+fn eval_list_to_vector(args: &[Expr], env: &Env) -> Result<Value, EvalError> {
+    let [arg] = args else {
+        return Err(EvalError::WrongArgCount { expected: 1, got: args.len() });
+    };
+    let val = eval(arg, env)?;
+    let Value::List(items) = val else {
+        return Err(EvalError::TypeError { expected: "list".into(), got: format!("{val}") });
+    };
+    Ok(Value::Vector(std::rc::Rc::new(std::cell::RefCell::new(items))))
+}
+
+// Apply-style vector builtins (for higher-order use)
+fn apply_make_vector(args: &[Value]) -> Result<Value, EvalError> {
+    let (size, fill) = match args {
+        [size] => (size, &Value::Integer(0)),
+        [size, fill] => (size, fill),
+        _ => return Err(EvalError::WrongArgCount { expected: 2, got: args.len() }),
+    };
+    let n = expect_integer(size)? as usize;
+    Ok(Value::Vector(std::rc::Rc::new(std::cell::RefCell::new(vec![fill.clone(); n]))))
+}
+
+fn apply_vector_ref(args: &[Value]) -> Result<Value, EvalError> {
+    let [ref vec_val, ref idx_val] = args else {
+        return Err(EvalError::WrongArgCount { expected: 2, got: args.len() });
+    };
+    let Value::Vector(ref v) = vec_val else {
+        return Err(EvalError::TypeError { expected: "vector".into(), got: format!("{vec_val}") });
+    };
+    let idx = expect_integer(idx_val)? as usize;
+    let borrowed = v.borrow();
+    borrowed.get(idx).cloned().ok_or_else(|| EvalError::TypeError {
+        expected: "valid vector index".into(),
+        got: format!("index {idx} out of range"),
+    })
+}
+
+fn apply_vector_set(args: &[Value]) -> Result<Value, EvalError> {
+    let [ref vec_val, ref idx_val, ref new_val] = args else {
+        return Err(EvalError::WrongArgCount { expected: 3, got: args.len() });
+    };
+    let Value::Vector(ref v) = vec_val else {
+        return Err(EvalError::TypeError { expected: "vector".into(), got: format!("{vec_val}") });
+    };
+    let idx = expect_integer(idx_val)? as usize;
+    let mut borrowed = v.borrow_mut();
+    if idx >= borrowed.len() {
+        return Err(EvalError::TypeError {
+            expected: "valid vector index".into(),
+            got: format!("index {idx} out of range"),
+        });
+    }
+    borrowed[idx] = new_val.clone();
+    Ok(Value::Void)
+}
+
+fn apply_vector_length(args: &[Value]) -> Result<Value, EvalError> {
+    let [ref val] = args else {
+        return Err(EvalError::WrongArgCount { expected: 1, got: args.len() });
+    };
+    let Value::Vector(ref v) = val else {
+        return Err(EvalError::TypeError { expected: "vector".into(), got: format!("{val}") });
+    };
+    Ok(Value::Integer(v.borrow().len() as i64))
+}
+
+fn apply_vector_to_list(args: &[Value]) -> Result<Value, EvalError> {
+    let [ref val] = args else {
+        return Err(EvalError::WrongArgCount { expected: 1, got: args.len() });
+    };
+    let Value::Vector(ref v) = val else {
+        return Err(EvalError::TypeError { expected: "vector".into(), got: format!("{val}") });
+    };
+    let items = v.borrow().clone();
+    Ok(Value::List(items))
+}
+
+fn apply_list_to_vector(args: &[Value]) -> Result<Value, EvalError> {
+    let [ref val] = args else {
+        return Err(EvalError::WrongArgCount { expected: 1, got: args.len() });
+    };
+    let Value::List(ref items) = val else {
+        return Err(EvalError::TypeError { expected: "list".into(), got: format!("{val}") });
+    };
+    let cloned = items.clone();
+    Ok(Value::Vector(std::rc::Rc::new(std::cell::RefCell::new(cloned))))
 }

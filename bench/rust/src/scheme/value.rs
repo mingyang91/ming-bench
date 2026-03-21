@@ -1,4 +1,6 @@
+use std::cell::RefCell;
 use std::fmt;
+use std::rc::Rc;
 
 use crate::scheme::env::Env;
 use crate::scheme::parser::Expr;
@@ -12,6 +14,7 @@ pub enum Value {
     Char(char),
     Pair(Box<Value>, Box<Value>),
     List(Vec<Value>),
+    Vector(Rc<RefCell<Vec<Value>>>),
     Lambda {
         params: Vec<String>,
         rest_param: Option<String>,
@@ -38,6 +41,7 @@ impl PartialEq for Value {
             (Value::Char(a), Value::Char(b)) => a == b,
             (Value::Pair(a1, a2), Value::Pair(b1, b2)) => a1 == b1 && a2 == b2,
             (Value::List(a), Value::List(b)) => a == b,
+            (Value::Vector(a), Value::Vector(b)) => *a.borrow() == *b.borrow(),
             (Value::Builtin(a), Value::Builtin(b)) => a == b,
             (
                 Value::Continuation { id: a, .. },
@@ -61,6 +65,7 @@ impl fmt::Display for Value {
             Value::Pair(car, cdr) => write!(f, "({car} . {cdr})"),
             Value::Symbol(s) => write!(f, "{s}"),
             Value::List(items) => fmt_list(f, items),
+            Value::Vector(v) => fmt_vector(f, &v.borrow()),
             Value::Lambda { .. }
             | Value::Builtin(_)
             | Value::Continuation { .. }
@@ -68,6 +73,15 @@ impl fmt::Display for Value {
             Value::Void => write!(f, ""),
         }
     }
+}
+
+fn fmt_vector(f: &mut fmt::Formatter<'_>, items: &[Value]) -> fmt::Result {
+    write!(f, "#(")?;
+    for (i, item) in items.iter().enumerate() {
+        if i > 0 { write!(f, " ")?; }
+        write!(f, "{item}")?;
+    }
+    write!(f, ")")
 }
 
 fn fmt_list(f: &mut fmt::Formatter<'_>, items: &[Value]) -> fmt::Result {
@@ -102,9 +116,24 @@ impl Value {
                 buf.push(')');
             }
             Value::List(items) => Self::display_list(items, buf),
+            Value::Vector(v) => Self::display_vector(&v.borrow(), buf),
             Value::Continuation { .. } | Value::Macro { .. } => buf.push_str("#<procedure>"),
             other => buf.push_str(&other.to_string()),
         }
+    }
+
+    fn display_vector(items: &[Value], buf: &mut String) {
+        buf.push_str("#(");
+        let Some((first, rest)) = items.split_first() else {
+            buf.push(')');
+            return;
+        };
+        first.display_fmt(buf);
+        for item in rest {
+            buf.push(' ');
+            item.display_fmt(buf);
+        }
+        buf.push(')');
     }
 
     fn display_list(items: &[Value], buf: &mut String) {
