@@ -18,4 +18,11 @@ pub enum EvalError {
 
     #[error("unbound variable: {name}")]
     UnboundVariable { name: String },
+
+    #[error("{line}:{col}: {inner}")]
+    Positioned {
+        line: usize,
+        col: usize,
+        inner: Box<EvalError>,
+    },
 }

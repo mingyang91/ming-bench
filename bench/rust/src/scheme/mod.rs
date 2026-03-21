@@ -12,13 +12,14 @@ pub fn eval_str(input: &str) -> Result<String, EvalError> {
     let exprs = parser::parse(input)?;
     let env = env::Env::new();
     let mut result = value::Value::Void;
-    for expr in &exprs {
-        result = eval::eval(expr, &env)?;
+    for (ref expr, (line, col)) in exprs {
+        result = eval::eval(expr, &env).map_err(|e| EvalError::Positioned {
+            line,
+            col,
+            inner: Box::new(e),
+        })?;
     }
-    match result {
-        value::Value::Void => Ok(result.to_string()),
-        _ => Ok(result.to_string()),
-    }
+    Ok(result.to_string())
 }
 
 /// Evaluate Scheme expressions, returning both the result value and
