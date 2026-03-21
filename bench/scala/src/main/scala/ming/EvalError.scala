@@ -15,6 +15,12 @@ class CallCCSetup(
   val pos: Option[(Int, Int)]
 ) extends RuntimeException(null, null, true, false)
 
+/** Thrown by `raise` to signal a Scheme-level exception. */
+class SchemeRaised(
+  val value: Value,
+  val output: String
+) extends RuntimeException(null, null, true, false)
+
 /** Thrown when a continuation value is invoked. */
 class ContinuationInvoked(
   val tag: AnyRef,

@@ -195,6 +195,12 @@ object Evaluator:
         Continuations.handleCallCCForm(args, env, out)
       case Value.Symbol("dynamic-wind", _) =>
         DynamicWind.evalDynamicWind(args, env, out)
+      case Value.Symbol("raise", _) =>
+        ExceptionHandling.evalRaise(args, env, out)
+      case Value.Symbol("guard", _) =>
+        ExceptionHandling.evalGuard(args, env, out)
+      case Value.Symbol("with-exception-handler", _) =>
+        ExceptionHandling.evalWithExceptionHandler(args, env, out)
       case Value.Symbol("define-syntax", _) =>
         Continuations.handleDefineSyntax(args, env, pos, out)
       case _ =>

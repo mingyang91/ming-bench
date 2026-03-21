@@ -39,6 +39,10 @@ object DynamicWind:
       val (_, _, out3) = callThunk(outThunk, out2)
       (bodyVal, out3)
     catch
+      case raised: SchemeRaised =>
+        setWindStack(env, prevStack)
+        val (_, _, outAfter) = callThunk(outThunk, raised.output)
+        throw new SchemeRaised(raised.value, outAfter)
       case ci: ContinuationInvoked =>
         setWindStack(env, prevStack)
         val (_, _, outAfter) = callThunk(outThunk, ci.output)
@@ -101,6 +105,10 @@ object DynamicWind:
           val (_, _, o2) = callThunk(outThunk, o)
           (v, e, o2)
         catch
+          case raised: SchemeRaised =>
+            setWindStack(env, prevStack)
+            val (_, _, outAfter) = callThunk(outThunk, raised.output)
+            throw new SchemeRaised(raised.value, outAfter)
           case ci: ContinuationInvoked =>
             setWindStack(env, prevStack)
             val (_, _, outAfter) = callThunk(outThunk, ci.output)
