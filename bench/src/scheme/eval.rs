@@ -43,53 +43,69 @@ fn is_builtin(name: &str) -> bool {
     )
 }
 
-/// Evaluate a single expression in the given environment.
+/// Trampoline result: either a final value or a pending tail call.
+enum Bounce {
+    Done(Value),
+    TailCall { expr: Value, env: Rc<RefCell<Env>> },
+}
+
+/// Evaluate a single expression in the given environment (trampoline loop).
 pub fn eval(
     expr: &Value,
     env: &Rc<RefCell<Env>>,
     span: Span,
     output: &RefCell<String>,
 ) -> Result<Value, EvalError> {
-    match expr {
-        Value::Integer(_) | Value::Boolean(_) | Value::String(_) | Value::Char(_) => {
-            Ok(expr.clone())
+    let mut cur_expr = expr.clone();
+    let mut cur_env = Rc::clone(env);
+
+    loop {
+        match &cur_expr {
+            Value::Integer(_) | Value::Boolean(_) | Value::String(_) | Value::Char(_) => {
+                return Ok(cur_expr);
+            }
+            Value::Symbol(name) => {
+                return match cur_env.borrow().get(name) {
+                    Some(val) => Ok(val),
+                    None if is_builtin(name) => Ok(Value::Symbol(name.clone())),
+                    None => Err(EvalError::UnboundVariable {
+                        name: name.clone(),
+                        span,
+                    }),
+                };
+            }
+            Value::List(elems) => match eval_list_tco(&elems.clone(), &cur_env, span, output)? {
+                Bounce::Done(v) => return Ok(v),
+                Bounce::TailCall { expr, env } => { cur_expr = expr; cur_env = env; }
+            },
+            Value::Lambda { .. } => return Ok(cur_expr),
+            Value::Void => return Ok(Value::Void),
         }
-        Value::Symbol(name) => match env.borrow().get(name) {
-            Some(val) => Ok(val),
-            None if is_builtin(name) => Ok(Value::Symbol(name.clone())),
-            None => Err(EvalError::UnboundVariable {
-                name: name.clone(),
-                span,
-            }),
-        },
-        Value::List(elems) => eval_list(elems, env, span, output),
-        Value::Lambda { .. } => Ok(expr.clone()),
-        Value::Void => Ok(Value::Void),
     }
 }
 
-fn eval_list(
+fn eval_list_tco(
     elems: &[Value],
     env: &Rc<RefCell<Env>>,
     span: Span,
     output: &RefCell<String>,
-) -> Result<Value, EvalError> {
+) -> Result<Bounce, EvalError> {
     let [head, args @ ..] = elems else {
-        return Ok(Value::List(vec![]));
+        return Ok(Bounce::Done(Value::List(vec![])));
     };
 
     if let Value::Symbol(name) = head {
         match name.as_str() {
-            "and" => return eval_and(args, env, span, output),
-            "or" => return eval_or(args, env, span, output),
-            "if" => return eval_if(args, env, span, output),
-            "define" => return eval_define(args, env, span, output),
-            "quote" => return eval_quote(args, span),
-            "lambda" => return eval_lambda(args, env, span),
-            "let" => return eval_let(args, env, span, output),
-            "begin" => return eval_begin(args, env, span, output),
-            "cond" => return eval_cond(args, env, span, output),
-            "string-set!" => return eval_string_set(args, env, span, output),
+            "and" => return eval_and_tco(args, env, span, output),
+            "or" => return eval_or_tco(args, env, span, output),
+            "if" => return eval_if_tco(args, env, span, output),
+            "define" => return eval_define(args, env, span, output).map(Bounce::Done),
+            "quote" => return eval_quote(args, span).map(Bounce::Done),
+            "lambda" => return eval_lambda(args, env, span).map(Bounce::Done),
+            "let" => return eval_let_tco(args, env, span, output),
+            "begin" => return eval_body_tco(args, env, span, output),
+            "cond" => return eval_cond_tco(args, env, span, output),
+            "string-set!" => return eval_string_set(args, env, span, output).map(Bounce::Done),
             _ => {}
         }
     }
@@ -99,18 +115,21 @@ fn eval_list(
         .iter()
         .map(|a| eval(a, env, span, output))
         .collect::<Result<_, _>>()?;
-    apply(&proc, &evaluated_args, span, output)
+    apply_tco(&proc, &evaluated_args, span, output)
 }
 
-fn apply(
+/// Apply a procedure, returning a Bounce for TCO.
+fn apply_tco(
     proc: &Value,
     args: &[Value],
     span: Span,
     output: &RefCell<String>,
-) -> Result<Value, EvalError> {
+) -> Result<Bounce, EvalError> {
     match proc {
-        Value::Symbol(name) => apply_builtin(name, args, span, output),
-        Value::Lambda { params, body, env } => {
+        Value::Symbol(name) => apply_builtin(name, args, span, output).map(Bounce::Done),
+        Value::Lambda {
+            params, body, env, ..
+        } => {
             if params.len() != args.len() {
                 return Err(EvalError::WrongArgCount {
                     expected: params.len(),
@@ -122,8 +141,7 @@ fn apply(
             for (param, arg) in params.iter().zip(args) {
                 local_env.borrow_mut().define(param.clone(), arg.clone());
             }
-            body.iter()
-                .try_fold(Value::Void, |_, expr| eval(expr, &local_env, span, output))
+            eval_body_tco(body, &local_env, span, output)
         }
         other => Err(EvalError::TypeError {
             message: format!("not a procedure: {other}"),
@@ -132,44 +150,92 @@ fn apply(
     }
 }
 
-fn eval_and(
+/// Non-TCO apply for use in builtins like `map`.
+fn apply(
+    proc: &Value,
     args: &[Value],
-    env: &Rc<RefCell<Env>>,
     span: Span,
     output: &RefCell<String>,
 ) -> Result<Value, EvalError> {
-    let mut result = Value::Boolean(true);
-    for arg in args {
-        result = eval(arg, env, span, output)?;
-        if !is_truthy(&result) {
-            return Ok(result);
-        }
+    match apply_tco(proc, args, span, output)? {
+        Bounce::Done(v) => Ok(v),
+        Bounce::TailCall { expr, env } => eval(&expr, &env, span, output),
     }
-    Ok(result)
 }
 
-fn eval_or(
-    args: &[Value],
+/// Evaluate a body (sequence of expressions) with TCO on the last one.
+fn eval_body_tco(
+    body: &[Value],
     env: &Rc<RefCell<Env>>,
     span: Span,
     output: &RefCell<String>,
-) -> Result<Value, EvalError> {
-    let mut result = Value::Boolean(false);
-    for arg in args {
-        result = eval(arg, env, span, output)?;
-        if is_truthy(&result) {
-            return Ok(result);
-        }
+) -> Result<Bounce, EvalError> {
+    let [init @ .., last] = body else {
+        return Ok(Bounce::Done(Value::Void));
+    };
+    for expr in init {
+        eval(expr, env, span, output)?;
     }
-    Ok(result)
+    Ok(Bounce::TailCall {
+        expr: last.clone(),
+        env: Rc::clone(env),
+    })
 }
 
-fn eval_if(
+fn eval_and_tco(
     args: &[Value],
     env: &Rc<RefCell<Env>>,
     span: Span,
     output: &RefCell<String>,
-) -> Result<Value, EvalError> {
+) -> Result<Bounce, EvalError> {
+    if args.is_empty() {
+        return Ok(Bounce::Done(Value::Boolean(true)));
+    }
+    let [init @ .., last] = args else {
+        unreachable!()
+    };
+    for arg in init {
+        let val = eval(arg, env, span, output)?;
+        if !is_truthy(&val) {
+            return Ok(Bounce::Done(val));
+        }
+    }
+    Ok(Bounce::TailCall {
+        expr: last.clone(),
+        env: Rc::clone(env),
+    })
+}
+
+fn eval_or_tco(
+    args: &[Value],
+    env: &Rc<RefCell<Env>>,
+    span: Span,
+    output: &RefCell<String>,
+) -> Result<Bounce, EvalError> {
+    if args.is_empty() {
+        return Ok(Bounce::Done(Value::Boolean(false)));
+    }
+    let [init @ .., last] = args else {
+        unreachable!()
+    };
+    for arg in init {
+        let val = eval(arg, env, span, output)?;
+        if is_truthy(&val) {
+            return Ok(Bounce::Done(val));
+        }
+    }
+    Ok(Bounce::TailCall {
+        expr: last.clone(),
+        env: Rc::clone(env),
+    })
+}
+
+fn eval_if_tco(
+    args: &[Value],
+    env: &Rc<RefCell<Env>>,
+    span: Span,
+    output: &RefCell<String>,
+) -> Result<Bounce, EvalError> {
     let (condition, consequent, alternate) = match args {
         [cond, cons, alt] => (cond, cons, Some(alt)),
         [cond, cons] => (cond, cons, None),
@@ -183,11 +249,17 @@ fn eval_if(
     };
 
     if is_truthy(&eval(condition, env, span, output)?) {
-        eval(consequent, env, span, output)
+        Ok(Bounce::TailCall {
+            expr: consequent.clone(),
+            env: Rc::clone(env),
+        })
     } else if let Some(alt) = alternate {
-        eval(alt, env, span, output)
+        Ok(Bounce::TailCall {
+            expr: alt.clone(),
+            env: Rc::clone(env),
+        })
     } else {
-        Ok(Value::Void)
+        Ok(Bounce::Done(Value::Void))
     }
 }
 
@@ -276,12 +348,58 @@ fn eval_lambda(args: &[Value], env: &Rc<RefCell<Env>>, span: Span) -> Result<Val
     })
 }
 
-fn eval_let(
+/// Parse a single `let` binding form `(name expr)`, returning the name and expression.
+fn parse_let_binding(binding: &Value, span: Span) -> Result<(&str, &Value), EvalError> {
+    let Value::List(pair) = binding else {
+        return Err(EvalError::TypeError {
+            message: "let: binding must be a list".into(),
+            span,
+        });
+    };
+    let [Value::Symbol(param), val_expr] = pair.as_slice() else {
+        return Err(EvalError::TypeError {
+            message: "let: binding must be (name expr)".into(),
+            span,
+        });
+    };
+    Ok((param.as_str(), val_expr))
+}
+
+fn eval_let_tco(
     args: &[Value],
     env: &Rc<RefCell<Env>>,
     span: Span,
     output: &RefCell<String>,
-) -> Result<Value, EvalError> {
+) -> Result<Bounce, EvalError> {
+    // Named let: (let name ((var init) ...) body ...)
+    if let [Value::Symbol(name), Value::List(bindings), body @ ..] = args {
+        if body.is_empty() {
+            return Err(EvalError::TypeError {
+                message: "let: expected body".into(),
+                span,
+            });
+        }
+        let mut params = Vec::new();
+        let mut init_vals = Vec::new();
+        for binding in bindings {
+            let (param, val_expr) = parse_let_binding(binding, span)?;
+            params.push(param.to_owned());
+            init_vals.push(eval(val_expr, env, span, output)?);
+        }
+        let local_env = Env::with_parent(env);
+        let lambda = Value::Lambda {
+            params: params.clone(),
+            body: body.to_vec(),
+            env: Rc::clone(&local_env),
+        };
+        local_env.borrow_mut().define(name.clone(), lambda);
+        for (param, val) in params.iter().zip(&init_vals) {
+            local_env.borrow_mut().define(param.clone(), val.clone());
+        }
+        return eval_body_tco(body, &local_env, span, output);
+    }
+
+    // Regular let: (let ((var init) ...) body ...)
     let [Value::List(bindings), body @ ..] = args else {
         return Err(EvalError::TypeError {
             message: "let: expected bindings list".into(),
@@ -296,41 +414,19 @@ fn eval_let(
     }
     let local_env = Env::with_parent(env);
     for binding in bindings {
-        let Value::List(pair) = binding else {
-            return Err(EvalError::TypeError {
-                message: "let: binding must be a list".into(),
-                span,
-            });
-        };
-        let [Value::Symbol(name), val_expr] = pair.as_slice() else {
-            return Err(EvalError::TypeError {
-                message: "let: binding must be (name expr)".into(),
-                span,
-            });
-        };
+        let (name, val_expr) = parse_let_binding(binding, span)?;
         let val = eval(val_expr, env, span, output)?;
-        local_env.borrow_mut().define(name.clone(), val);
+        local_env.borrow_mut().define(name.to_owned(), val);
     }
-    body.iter()
-        .try_fold(Value::Void, |_, expr| eval(expr, &local_env, span, output))
+    eval_body_tco(body, &local_env, span, output)
 }
 
-fn eval_begin(
+fn eval_cond_tco(
     args: &[Value],
     env: &Rc<RefCell<Env>>,
     span: Span,
     output: &RefCell<String>,
-) -> Result<Value, EvalError> {
-    args.iter()
-        .try_fold(Value::Void, |_, expr| eval(expr, env, span, output))
-}
-
-fn eval_cond(
-    args: &[Value],
-    env: &Rc<RefCell<Env>>,
-    span: Span,
-    output: &RefCell<String>,
-) -> Result<Value, EvalError> {
+) -> Result<Bounce, EvalError> {
     for clause in args {
         let Value::List(elems) = clause else {
             return Err(EvalError::TypeError {
@@ -344,21 +440,13 @@ fn eval_cond(
                 span,
             });
         };
-        if matches!(test, Value::Symbol(s) if s == "else") || is_truthy(&eval(test, env, span, output)?) {
-            return eval_body(body, env, span, output);
+        if matches!(test, Value::Symbol(s) if s == "else")
+            || is_truthy(&eval(test, env, span, output)?)
+        {
+            return eval_body_tco(body, env, span, output);
         }
     }
-    Ok(Value::Void)
-}
-
-fn eval_body(
-    body: &[Value],
-    env: &Rc<RefCell<Env>>,
-    span: Span,
-    output: &RefCell<String>,
-) -> Result<Value, EvalError> {
-    body.iter()
-        .try_fold(Value::Void, |_, expr| eval(expr, env, span, output))
+    Ok(Bounce::Done(Value::Void))
 }
 
 fn is_truthy(val: &Value) -> bool {
@@ -451,9 +539,7 @@ fn apply_builtin(
         "string-append" | "string-length" | "substring" | "string->number"
         | "number->string" | "symbol->string" | "string->symbol" | "string-ref"
         | "string-copy" | "string->list" | "list->string" | "char->integer"
-        | "integer->char" => {
-            apply_string_builtin(name, args, span)
-        }
+        | "integer->char" => apply_string_builtin(name, args, span),
         _ => Err(EvalError::UnboundVariable {
             name: name.to_string(),
             span,
@@ -544,11 +630,7 @@ fn compare_op(
     Ok(Value::Boolean(result))
 }
 
-fn apply_list_builtin(
-    name: &str,
-    args: &[Value],
-    span: Span,
-) -> Result<Value, EvalError> {
+fn apply_list_builtin(name: &str, args: &[Value], span: Span) -> Result<Value, EvalError> {
     match name {
         "cons" => {
             let [car, cdr] = args else {
@@ -633,11 +715,7 @@ fn apply_list_builtin(
     }
 }
 
-fn apply_string_builtin(
-    name: &str,
-    args: &[Value],
-    span: Span,
-) -> Result<Value, EvalError> {
+fn apply_string_builtin(name: &str, args: &[Value], span: Span) -> Result<Value, EvalError> {
     match name {
         "string-append" => {
             let result: String = args
@@ -773,11 +851,7 @@ fn apply_string_builtin(
     }
 }
 
-fn apply_char_builtin(
-    name: &str,
-    args: &[Value],
-    span: Span,
-) -> Result<Value, EvalError> {
+fn apply_char_builtin(name: &str, args: &[Value], span: Span) -> Result<Value, EvalError> {
     match name {
         "char->integer" => {
             let [Value::Char(c)] = args else {
