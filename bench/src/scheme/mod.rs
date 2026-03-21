@@ -17,9 +17,11 @@ enum Value {
     List(Vec<Value>),
     Lambda {
         params: Vec<String>,
+        rest_param: Option<String>,
         body: Box<Ast>,
         env: Env,
     },
+    Builtin(String),
 }
 
 type EnvCell = Rc<RefCell<Value>>;
@@ -43,6 +45,7 @@ impl Value {
             Value::Symbol(s) => s.clone(),
             Value::Char(c) => format!("#\\{}", c),
             Value::Lambda { .. } => "#<procedure>".to_string(),
+            Value::Builtin(_) => "#<procedure>".to_string(),
             Value::List(items) => {
                 let parts: Vec<String> = items.iter().map(|v| v.to_scheme_string()).collect();
                 format!("({})", parts.join(" "))
@@ -238,6 +241,43 @@ fn ast_to_value(ast: &Ast) -> Value {
     }
 }
 
+fn is_builtin(name: &str) -> bool {
+    matches!(name, "+" | "-" | "*" | "/" | "<" | ">" | "=" | "<=" | ">=" | "not" |
+        "cons" | "car" | "cdr" | "null?" | "list" | "length" |
+        "string?" | "number?" | "boolean?" | "pair?" | "symbol?" |
+        "display" | "write" | "newline" |
+        "string-append" | "string-length" | "substring" |
+        "string->number" | "number->string" | "symbol->string" | "string->symbol" |
+        "string-copy" | "string-ref" | "char?" | "map" |
+        "string->list" | "list->string" | "char->integer" | "integer->char" |
+        "apply")
+}
+
+fn parse_params(param_asts: &[Ast]) -> Result<(Vec<String>, Option<String>), EvalError> {
+    let mut params = Vec::new();
+    let mut rest_param = None;
+    let mut i = 0;
+    while i < param_asts.len() {
+        if let AstKind::Symbol(s) = &param_asts[i].kind {
+            if s == "." {
+                if i + 1 < param_asts.len() {
+                    if let AstKind::Symbol(rest) = &param_asts[i + 1].kind {
+                        rest_param = Some(rest.clone());
+                        break;
+                    }
+                }
+                return Err(EvalError::Parse("bad dot notation in parameters".into()));
+            }
+            params.push(s.clone());
+        } else {
+            return Err(EvalError::TypeError("parameter must be symbol".into())
+                .with_position(param_asts[i].line, param_asts[i].col));
+        }
+        i += 1;
+    }
+    Ok((params, rest_param))
+}
+
 /// Evaluate a parsed Scheme expression with tail call optimization.
 fn eval(ast: &Ast, env: &mut Env, out: &mut String) -> Result<Value, EvalError> {
     let mut cur_ast = ast.clone();
@@ -256,8 +296,13 @@ fn eval(ast: &Ast, env: &mut Env, out: &mut String) -> Result<Value, EvalError> 
             AstKind::Str(s) => return Ok(Value::Str(s)),
             AstKind::Char(c) => return Ok(Value::Char(c)),
             AstKind::Symbol(s) => {
-                return env_get(e, &s)
-                    .ok_or_else(|| EvalError::UndefinedVariable(s).with_position(line, col));
+                if let Some(v) = env_get(e, &s) {
+                    return Ok(v);
+                }
+                if is_builtin(&s) {
+                    return Ok(Value::Builtin(s));
+                }
+                return Err(EvalError::UndefinedVariable(s).with_position(line, col));
             }
             AstKind::List(items) => {
                 if items.is_empty() {
@@ -294,16 +339,7 @@ fn eval(ast: &Ast, env: &mut Env, out: &mut String) -> Result<Value, EvalError> 
                                             ).with_position(line, col))
                                         }
                                     };
-                                    let params: Result<Vec<String>, _> = sig[1..]
-                                        .iter()
-                                        .map(|v| match &v.kind {
-                                            AstKind::Symbol(s) => Ok(s.clone()),
-                                            _ => Err(EvalError::TypeError(
-                                                "parameter must be symbol".into(),
-                                            ).with_position(v.line, v.col)),
-                                        })
-                                        .collect();
-                                    let params = params?;
+                                    let (params, rest_param) = parse_params(&sig[1..])?;
                                     let body = if items.len() == 3 {
                                         items[2].clone()
                                     } else {
@@ -321,14 +357,14 @@ fn eval(ast: &Ast, env: &mut Env, out: &mut String) -> Result<Value, EvalError> 
                                     };
                                     let lambda = Value::Lambda {
                                         params: params.clone(),
+                                        rest_param: rest_param.clone(),
                                         body: Box::new(body.clone()),
                                         env: e.clone(),
                                     };
                                     env_set(e, name.clone(), lambda);
-                                    // Re-capture env so recursive calls see the binding
-                                    // Mutate the existing cell so the Rc in the closure's env updates too
                                     let lambda = Value::Lambda {
                                         params,
+                                        rest_param,
                                         body: Box::new(body),
                                         env: e.clone(),
                                     };
@@ -376,15 +412,7 @@ fn eval(ast: &Ast, env: &mut Env, out: &mut String) -> Result<Value, EvalError> 
                                     ).with_position(line, col))
                                 }
                             };
-                            let params: Result<Vec<String>, _> = param_list
-                                .iter()
-                                .map(|v| match &v.kind {
-                                    AstKind::Symbol(s) => Ok(s.clone()),
-                                    _ => Err(EvalError::TypeError(
-                                        "parameter must be symbol".into(),
-                                    ).with_position(v.line, v.col)),
-                                })
-                                .collect();
+                            let (params, rest_param) = parse_params(param_list)?;
                             let body = if items.len() == 3 {
                                 items[2].clone()
                             } else {
@@ -401,7 +429,8 @@ fn eval(ast: &Ast, env: &mut Env, out: &mut String) -> Result<Value, EvalError> 
                                 }
                             };
                             return Ok(Value::Lambda {
-                                params: params?,
+                                params,
+                                rest_param,
                                 body: Box::new(body),
                                 env: e.clone(),
                             });
@@ -537,8 +566,9 @@ fn eval(ast: &Ast, env: &mut Env, out: &mut String) -> Result<Value, EvalError> 
                     args.push(eval(a, e, out)?);
                 }
                 // Try builtin first if operator is a symbol not in env
+                // (skip "apply" — it needs special handling below)
                 if let AstKind::Symbol(s) = &items[0].kind {
-                    if !e.contains_key(s.as_str()) {
+                    if !e.contains_key(s.as_str()) && s != "apply" {
                         return apply_builtin(s, &args, out)
                             .map_err(|err| err.with_position(line, col));
                     }
@@ -547,19 +577,76 @@ fn eval(ast: &Ast, env: &mut Env, out: &mut String) -> Result<Value, EvalError> 
                 match func {
                     Value::Lambda {
                         params,
+                        rest_param,
                         body,
                         env: closed_env,
                     } => {
-                        if args.len() != params.len() {
-                            return Err(EvalError::Arity.with_position(line, col));
-                        }
                         let mut local_env = closed_env.clone();
-                        for (p, a) in params.iter().zip(args) {
-                            env_set(&mut local_env, p.clone(), a);
+                        if let Some(ref rest) = rest_param {
+                            if args.len() < params.len() {
+                                return Err(EvalError::Arity.with_position(line, col));
+                            }
+                            for (p, a) in params.iter().zip(&args) {
+                                env_set(&mut local_env, p.clone(), a.clone());
+                            }
+                            env_set(&mut local_env, rest.clone(), Value::List(args[params.len()..].to_vec()));
+                        } else {
+                            if args.len() != params.len() {
+                                return Err(EvalError::Arity.with_position(line, col));
+                            }
+                            for (p, a) in params.iter().zip(args) {
+                                env_set(&mut local_env, p.clone(), a);
+                            }
                         }
                         cur_ast = *body;
                         tco_env = Some(local_env);
                         continue;
+                    }
+                    Value::Builtin(ref bname) if bname == "apply" => {
+                        if args.len() < 2 {
+                            return Err(EvalError::Arity.with_position(line, col));
+                        }
+                        let apply_func = args[0].clone();
+                        let last = args.last().unwrap();
+                        let tail = match last {
+                            Value::List(items) => items.clone(),
+                            _ => return Err(EvalError::TypeError("apply: last argument must be a list".into()).with_position(line, col)),
+                        };
+                        let mut full_args: Vec<Value> = args[1..args.len()-1].to_vec();
+                        full_args.extend(tail);
+                        match apply_func {
+                            Value::Lambda { params, rest_param, body, env: closed_env } => {
+                                let mut local_env = closed_env.clone();
+                                if let Some(ref rest) = rest_param {
+                                    if full_args.len() < params.len() {
+                                        return Err(EvalError::Arity.with_position(line, col));
+                                    }
+                                    for (p, a) in params.iter().zip(&full_args) {
+                                        env_set(&mut local_env, p.clone(), a.clone());
+                                    }
+                                    env_set(&mut local_env, rest.clone(), Value::List(full_args[params.len()..].to_vec()));
+                                } else {
+                                    if full_args.len() != params.len() {
+                                        return Err(EvalError::Arity.with_position(line, col));
+                                    }
+                                    for (p, a) in params.iter().zip(full_args) {
+                                        env_set(&mut local_env, p.clone(), a);
+                                    }
+                                }
+                                cur_ast = *body;
+                                tco_env = Some(local_env);
+                                continue;
+                            }
+                            Value::Builtin(ref bname2) => {
+                                return apply_builtin(bname2, &full_args, out)
+                                    .map_err(|err| err.with_position(line, col));
+                            }
+                            _ => return Err(EvalError::NotAProcedure.with_position(line, col)),
+                        }
+                    }
+                    Value::Builtin(ref bname) => {
+                        return apply_builtin(bname, &args, out)
+                            .map_err(|err| err.with_position(line, col));
                     }
                     _ => return Err(EvalError::NotAProcedure.with_position(items[0].line, items[0].col)),
                 }
@@ -813,7 +900,7 @@ fn apply_builtin(op: &str, args: &[Value], out: &mut String) -> Result<Value, Ev
             let mut results = Vec::new();
             for item in items {
                 match func {
-                    Value::Lambda { params, body, env: closed_env } => {
+                    Value::Lambda { params, body, env: closed_env, .. } => {
                         if params.len() != 1 {
                             return Err(EvalError::Arity);
                         }
