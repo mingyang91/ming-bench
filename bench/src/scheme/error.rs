@@ -46,4 +46,7 @@ pub enum EvalError {
 
     #[error("{span}: division by zero")]
     DivisionByZero { span: Span },
+
+    #[error("continuation return")]
+    ContinuationReturn,
 }

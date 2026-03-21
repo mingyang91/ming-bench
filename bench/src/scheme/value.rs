@@ -4,6 +4,13 @@ use std::rc::Rc;
 
 use crate::scheme::env::Env;
 
+/// Data for a captured continuation.
+#[derive(Debug, Clone)]
+pub struct ContinuationData {
+    pub id: u64,
+    pub expr_idx: usize,
+}
+
 /// A Scheme value.
 #[derive(Debug, Clone)]
 pub enum Value {
@@ -19,6 +26,7 @@ pub enum Value {
         body: Vec<Value>,
         env: Rc<RefCell<Env>>,
     },
+    Continuation(Rc<ContinuationData>),
     Void,
 }
 
@@ -33,6 +41,7 @@ impl PartialEq for Value {
             (Value::List(a), Value::List(b)) => a == b,
             (Value::Void, Value::Void) => true,
             (Value::Lambda { .. }, Value::Lambda { .. }) => false,
+            (Value::Continuation(a), Value::Continuation(b)) => a.id == b.id,
             _ => false,
         }
     }
@@ -74,7 +83,7 @@ impl fmt::Display for Value {
             Value::Symbol(s) => write!(f, "{s}"),
             Value::Char(c) => write!(f, "#\\{c}"),
             Value::List(elems) => fmt_list(elems, f),
-            Value::Lambda { .. } => write!(f, "#<procedure>"),
+            Value::Lambda { .. } | Value::Continuation(_) => write!(f, "#<procedure>"),
             Value::Void => write!(f, ""),
         }
     }
