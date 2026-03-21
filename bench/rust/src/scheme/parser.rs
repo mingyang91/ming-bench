@@ -1,0 +1,148 @@
+use crate::scheme::error::EvalError;
+use crate::scheme::value::Value;
+
+/// Token produced by the lexer.
+#[derive(Debug, Clone, PartialEq)]
+enum Token {
+    LParen,
+    RParen,
+    Symbol(String),
+    Integer(i64),
+    Boolean(bool),
+    Str(String),
+}
+
+/// Tokenize input into a sequence of tokens.
+fn tokenize(input: &str) -> Result<Vec<Token>, EvalError> {
+    let mut tokens = Vec::new();
+    let chars: Vec<char> = input.chars().collect();
+    let mut i = 0;
+
+    while i < chars.len() {
+        match chars[i] {
+            ' ' | '\t' | '\n' | '\r' => i += 1,
+            ';' => i = skip_line_comment(&chars, i),
+            '(' => { tokens.push(Token::LParen); i += 1; }
+            ')' => { tokens.push(Token::RParen); i += 1; }
+            '#' => { let (tok, next) = tokenize_hash(&chars, i)?; tokens.push(tok); i = next; }
+            '"' => { let (tok, next) = tokenize_string(&chars, i)?; tokens.push(tok); i = next; }
+            _ => { let (tok, next) = tokenize_atom(&chars, i); tokens.push(tok); i = next; }
+        }
+    }
+    Ok(tokens)
+}
+
+fn skip_line_comment(chars: &[char], start: usize) -> usize {
+    let mut i = start;
+    while i < chars.len() && chars[i] != '\n' {
+        i += 1;
+    }
+    i
+}
+
+fn tokenize_hash(chars: &[char], start: usize) -> Result<(Token, usize), EvalError> {
+    let i = start + 1;
+    if i < chars.len() && chars[i] == 't' {
+        Ok((Token::Boolean(true), i + 1))
+    } else if i < chars.len() && chars[i] == 'f' {
+        Ok((Token::Boolean(false), i + 1))
+    } else {
+        Err(EvalError::Parse {
+            message: "unexpected character after #".into(),
+        })
+    }
+}
+
+fn push_escape(s: &mut String, c: char) {
+    match c {
+        'n' => s.push('\n'),
+        't' => s.push('\t'),
+        '\\' => s.push('\\'),
+        '"' => s.push('"'),
+        other => { s.push('\\'); s.push(other); }
+    }
+}
+
+fn tokenize_string(chars: &[char], start: usize) -> Result<(Token, usize), EvalError> {
+    let mut i = start + 1;
+    let mut s = String::new();
+    while i < chars.len() && chars[i] != '"' {
+        if chars[i] == '\\' && i + 1 < chars.len() {
+            i += 1;
+            push_escape(&mut s, chars[i]);
+        } else {
+            s.push(chars[i]);
+        }
+        i += 1;
+    }
+    if i >= chars.len() {
+        return Err(EvalError::Parse {
+            message: "unterminated string".into(),
+        });
+    }
+    Ok((Token::Str(s), i + 1))
+}
+
+fn tokenize_atom(chars: &[char], start: usize) -> (Token, usize) {
+    let mut i = start;
+    while i < chars.len() && !is_delimiter(chars[i]) {
+        i += 1;
+    }
+    let word: String = chars[start..i].iter().collect();
+    let tok = match word.parse::<i64>() {
+        Ok(n) => Token::Integer(n),
+        Err(_) => Token::Symbol(word),
+    };
+    (tok, i)
+}
+
+fn is_delimiter(c: char) -> bool {
+    matches!(c, ' ' | '\t' | '\n' | '\r' | '(' | ')' | ';' | '"')
+}
+
+/// Parse all expressions from input.
+pub fn parse(input: &str) -> Result<Vec<Value>, EvalError> {
+    let tokens = tokenize(input)?;
+    let mut pos = 0;
+    let mut exprs = Vec::new();
+    while pos < tokens.len() {
+        let (val, next) = parse_expr(&tokens, pos)?;
+        exprs.push(val);
+        pos = next;
+    }
+    Ok(exprs)
+}
+
+fn parse_expr(tokens: &[Token], pos: usize) -> Result<(Value, usize), EvalError> {
+    if pos >= tokens.len() {
+        return Err(EvalError::Parse {
+            message: "unexpected end of input".into(),
+        });
+    }
+    match &tokens[pos] {
+        Token::Integer(n) => Ok((Value::Integer(*n), pos + 1)),
+        Token::Boolean(b) => Ok((Value::Boolean(*b), pos + 1)),
+        Token::Str(s) => Ok((Value::Str(s.clone()), pos + 1)),
+        Token::Symbol(s) => Ok((Value::Symbol(s.clone()), pos + 1)),
+        Token::LParen => parse_list(tokens, pos + 1),
+        Token::RParen => Err(EvalError::Parse {
+            message: "unexpected closing parenthesis".into(),
+        }),
+    }
+}
+
+fn parse_list(tokens: &[Token], start: usize) -> Result<(Value, usize), EvalError> {
+    let mut items = Vec::new();
+    let mut i = start;
+    while i < tokens.len() && tokens[i] != Token::RParen {
+        let (val, next) = parse_expr(tokens, i)?;
+        items.push(val);
+        i = next;
+    }
+    if i >= tokens.len() {
+        return Err(EvalError::Parse {
+            message: "unmatched opening parenthesis".into(),
+        });
+    }
+    Ok((Value::List(items), i + 1))
+}
