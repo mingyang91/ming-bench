@@ -54,6 +54,10 @@ pub enum EvalError {
     InvalidRange { start: i64, end: i64, len: usize },
     #[error("invalid argument: {0}")]
     InvalidArgument(String),
+    #[error("string is immutable")]
+    ImmutableString,
+    #[error("invalid character code point: {0}")]
+    InvalidCharCodePoint(i64),
     #[error("not a procedure: {0}")]
     NotAProcedure(String),
 }

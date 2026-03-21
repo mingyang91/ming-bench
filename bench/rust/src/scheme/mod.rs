@@ -210,6 +210,7 @@ enum Builtin {
     GreaterThan,
     Equal,
     LessEqual,
+    GreaterEqual,
     Eq,
     EqualPred,
     Not,
@@ -256,6 +257,8 @@ enum Builtin {
     StringCiEqual,
     StringUpcase,
     StringDowncase,
+    StringToList,
+    ListToString,
     CharPred,
     CharAlphabeticPred,
     CharNumericPred,
@@ -263,6 +266,8 @@ enum Builtin {
     CharDowncase,
     CharEqual,
     CharLessThan,
+    CharToInteger,
+    IntegerToChar,
     StringPred,
     NumberPred,
     BooleanPred,
@@ -280,6 +285,7 @@ impl Builtin {
         Self::GreaterThan,
         Self::Equal,
         Self::LessEqual,
+        Self::GreaterEqual,
         Self::Eq,
         Self::EqualPred,
         Self::Not,
@@ -326,6 +332,8 @@ impl Builtin {
         Self::StringCiEqual,
         Self::StringUpcase,
         Self::StringDowncase,
+        Self::StringToList,
+        Self::ListToString,
         Self::CharPred,
         Self::CharAlphabeticPred,
         Self::CharNumericPred,
@@ -333,6 +341,8 @@ impl Builtin {
         Self::CharDowncase,
         Self::CharEqual,
         Self::CharLessThan,
+        Self::CharToInteger,
+        Self::IntegerToChar,
         Self::StringPred,
         Self::NumberPred,
         Self::BooleanPred,
@@ -350,6 +360,7 @@ impl Builtin {
             Self::GreaterThan => ">",
             Self::Equal => "=",
             Self::LessEqual => "<=",
+            Self::GreaterEqual => ">=",
             Self::Eq => "eq?",
             Self::EqualPred => "equal?",
             Self::Not => "not",
@@ -396,6 +407,8 @@ impl Builtin {
             Self::StringCiEqual => "string-ci=?",
             Self::StringUpcase => "string-upcase",
             Self::StringDowncase => "string-downcase",
+            Self::StringToList => "string->list",
+            Self::ListToString => "list->string",
             Self::CharPred => "char?",
             Self::CharAlphabeticPred => "char-alphabetic?",
             Self::CharNumericPred => "char-numeric?",
@@ -403,6 +416,8 @@ impl Builtin {
             Self::CharDowncase => "char-downcase",
             Self::CharEqual => "char=?",
             Self::CharLessThan => "char<?",
+            Self::CharToInteger => "char->integer",
+            Self::IntegerToChar => "integer->char",
             Self::StringPred => "string?",
             Self::NumberPred => "number?",
             Self::BooleanPred => "boolean?",
@@ -2928,6 +2943,7 @@ fn apply_builtin(
         Builtin::GreaterThan => compare_numbers(name, args, |left, right| left > right),
         Builtin::Equal => compare_numbers(name, args, |left, right| left == right),
         Builtin::LessEqual => compare_numbers(name, args, |left, right| left <= right),
+        Builtin::GreaterEqual => compare_numbers(name, args, |left, right| left >= right),
         Builtin::Eq | Builtin::EqualPred => compare_values_builtin(name, args),
         Builtin::Not => {
             if args.len() != 1 {
@@ -3108,30 +3124,10 @@ fn apply_builtin(
                 return Err(wrong_arg_count(name, "exactly 3", args.len()));
             }
 
-            let string = expect_string_value(name, &args[0])?;
-            let index = expect_number_value(name, &args[1])?;
-            let ch = expect_char_value(name, &args[2])?;
-            let mut chars = {
-                let value = string.borrow();
-                value.chars().collect::<Vec<_>>()
-            };
-            let len = chars.len();
-
-            if index < 0 {
-                return Err(EvalError::IndexOutOfBounds { index, len });
-            }
-
-            let index = usize::try_from(index).map_err(|_| EvalError::IntegerOverflow)?;
-            if index >= len {
-                return Err(EvalError::IndexOutOfBounds {
-                    index: i64::try_from(index).map_err(|_| EvalError::IntegerOverflow)?,
-                    len,
-                });
-            }
-
-            chars[index] = ch;
-            *string.borrow_mut() = chars.into_iter().collect();
-            Ok(Value::Void)
+            expect_string_value(name, &args[0])?;
+            expect_number_value(name, &args[1])?;
+            expect_char_value(name, &args[2])?;
+            Err(EvalError::ImmutableString)
         }
         Builtin::Substring => {
             if args.len() != 3 {
@@ -3238,6 +3234,27 @@ fn apply_builtin(
             let lower = string.borrow().to_lowercase();
             Ok(Value::string(lower))
         }
+        Builtin::StringToList => {
+            if args.len() != 1 {
+                return Err(wrong_arg_count(name, "exactly 1", args.len()));
+            }
+
+            let string = expect_string_value(name, &args[0])?;
+            let chars = string.borrow().chars().map(Value::Char).collect();
+            Ok(Value::List(chars))
+        }
+        Builtin::ListToString => {
+            if args.len() != 1 {
+                return Err(wrong_arg_count(name, "exactly 1", args.len()));
+            }
+
+            let list = expect_list_value(name, &args[0])?;
+            let mut result = String::with_capacity(list.len());
+            for value in list {
+                result.push(expect_char_value(name, value)?);
+            }
+            Ok(Value::string(result))
+        }
         Builtin::CharPred => unary_predicate(name, args, |value| matches!(value, Value::Char(_))),
         Builtin::CharAlphabeticPred => unary_char_predicate(name, args, |ch| ch.is_alphabetic()),
         Builtin::CharNumericPred => unary_char_predicate(name, args, |ch| ch.is_numeric()),
@@ -3259,6 +3276,26 @@ fn apply_builtin(
         }
         Builtin::CharEqual => compare_chars(name, args, |left, right| left == right),
         Builtin::CharLessThan => compare_chars(name, args, |left, right| left < right),
+        Builtin::CharToInteger => {
+            if args.len() != 1 {
+                return Err(wrong_arg_count(name, "exactly 1", args.len()));
+            }
+
+            let ch = expect_char_value(name, &args[0])?;
+            Ok(Value::Number(i64::from(u32::from(ch))))
+        }
+        Builtin::IntegerToChar => {
+            if args.len() != 1 {
+                return Err(wrong_arg_count(name, "exactly 1", args.len()));
+            }
+
+            let code_point = expect_number_value(name, &args[0])?;
+            let ch = u32::try_from(code_point)
+                .ok()
+                .and_then(char::from_u32)
+                .ok_or(EvalError::InvalidCharCodePoint(code_point))?;
+            Ok(Value::Char(ch))
+        }
         Builtin::StringPred => {
             unary_predicate(name, args, |value| matches!(value, Value::String(_)))
         }
