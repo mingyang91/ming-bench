@@ -116,6 +116,12 @@ object StringBuiltins:
     (a, b) match
       case (Value.PairVal(ca, cd, _), Value.PairVal(cb, dd, _)) =>
         schemeEqual(ca, cb) && schemeEqual(cd, dd)
+      case (Value.MutablePairVal(ca), Value.MutablePairVal(cb)) =>
+        (ca eq cb) || (schemeEqual(ca(0), cb(0)) && schemeEqual(ca(1), cb(1)))
+      case (Value.PairVal(ca, cd, _), Value.MutablePairVal(cb)) =>
+        schemeEqual(ca, cb(0)) && schemeEqual(cd, cb(1))
+      case (Value.MutablePairVal(ca), Value.PairVal(cb, cd, _)) =>
+        schemeEqual(ca(0), cb) && schemeEqual(ca(1), cd)
       case (Value.NilVal, Value.NilVal) => true
       case (Value.VectorVal(ea), Value.VectorVal(eb)) =>
         ea.length == eb.length && ea.zip(eb).forall((x, y) => schemeEqual(x, y))
@@ -161,7 +167,7 @@ object StringBuiltins:
     args match
       case v :: Nil =>
         val s = asString(v)
-        s.foldRight(Value.NilVal: Value)((c, acc) => Value.PairVal(Value.CharVal(c), acc))
+        s.foldRight(Value.NilVal: Value)((c, acc) => Value.MutablePairVal(Array(Value.CharVal(c), acc)))
       case _ =>
         throw new EvalError("string->list requires 1 string argument")
 
@@ -179,6 +185,10 @@ object StringBuiltins:
       case Value.NilVal => acc.reverse
       case Value.PairVal(Value.CharVal(c), cdr, _) =>
         collectChars(cdr, c :: acc)
+      case Value.MutablePairVal(cell) =>
+        cell(0) match
+          case Value.CharVal(c) => collectChars(cell(1), c :: acc)
+          case _                => throw new EvalError("list->string: expected list of characters")
       case _ =>
         throw new EvalError("list->string: expected list of characters")
 

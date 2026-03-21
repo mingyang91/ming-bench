@@ -156,6 +156,7 @@ object Evaluator:
       case Value.VoidVal             => Done(expr, env, out)
       case _: Value.MutableStringVal => Done(expr, env, out)
       case _: Value.VectorVal        => Done(expr, env, out)
+      case _: Value.MutablePairVal   => Done(expr, env, out)
       case _: Value.LambdaVal        => Done(expr, env, out)
       case _: Value.ContinuationVal  => Done(expr, env, out)
       case _: Value.MacroVal         => Done(expr, env, out)

@@ -38,7 +38,7 @@ private[ming] object VectorBuiltins:
   def evalVectorToList(args: List[Value]): Value =
     args match
       case Value.VectorVal(elems) :: Nil =>
-        elems.foldRight(Value.NilVal: Value)(Value.PairVal(_, _))
+        elems.foldRight(Value.NilVal: Value)((a, b) => Value.MutablePairVal(Array(a, b)))
       case _ => throw new EvalError("vector->list requires a vector")
 
   def evalListToVector(args: List[Value]): Value =
@@ -54,6 +54,7 @@ private[ming] object VectorBuiltins:
     acc: List[Value]
   ): List[Value] =
     v match
-      case Value.NilVal           => acc.reverse
-      case Value.PairVal(h, t, _) => collectListToArray(t, h :: acc)
-      case _                      => throw new EvalError("list->vector: not a proper list")
+      case Value.NilVal               => acc.reverse
+      case Value.PairVal(h, t, _)     => collectListToArray(t, h :: acc)
+      case Value.MutablePairVal(cell) => collectListToArray(cell(1), cell(0) :: acc)
+      case _                          => throw new EvalError("list->vector: not a proper list")

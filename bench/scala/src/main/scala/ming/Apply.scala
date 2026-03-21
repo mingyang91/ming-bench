@@ -100,6 +100,7 @@ object Apply:
     case _                    => false
 
   private[ming] def toList(v: Value): List[Value] = v match
-    case Value.NilVal           => Nil
-    case Value.PairVal(h, t, _) => h :: toList(t)
-    case other                  => List(other)
+    case Value.NilVal               => Nil
+    case Value.PairVal(h, t, _)     => h :: toList(t)
+    case Value.MutablePairVal(cell) => cell(0) :: toList(cell(1))
+    case other                      => List(other)

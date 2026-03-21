@@ -73,7 +73,7 @@ final case class Env(
           )
         val (fixed, remaining) = args.splitAt(params.length)
         val restList =
-          remaining.foldRight(Value.NilVal: Value)(Value.PairVal(_, _))
+          remaining.foldRight(Value.NilVal: Value)((a, b) => Value.MutablePairVal(Array(a, b)))
         val allParams = params :+ rest
         val allArgs   = fixed :+ restList
         Env(allParams.zip(allArgs.map(v => Array(v))).toMap, Some(this))

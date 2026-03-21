@@ -20,6 +20,7 @@ enum Value:
     restParam: Option[String] = None
   )
   case MutableStringVal(chars: Array[Char])
+  case MutablePairVal(cell: Array[Value])
   case VoidVal
 
   case ContinuationVal(
@@ -63,6 +64,7 @@ enum Value:
     case Symbol(name, _)       => name
     case NilVal                => "()"
     case PairVal(_, _, _)      => formatList(_.display)
+    case _: MutablePairVal     => formatList(_.display)
     case VectorVal(elems) =>
       "#(" + elems.map(_.display).mkString(" ") + ")"
     case _: LambdaVal       => "#<procedure>"
@@ -80,8 +82,9 @@ enum Value:
     case CharVal(c)           => c.toString
     case VectorVal(elems) =>
       "#(" + elems.map(_.displayRepr).mkString(" ") + ")"
-    case PairVal(_, _, _) => formatList(_.displayRepr)
-    case other            => other.display
+    case PairVal(_, _, _)  => formatList(_.displayRepr)
+    case _: MutablePairVal => formatList(_.displayRepr)
+    case other             => other.display
 
   private def formatList(fmt: Value => String): String =
     val (elems, tail) = collectList(this, List.empty)
@@ -99,10 +102,14 @@ enum Value:
 
   private def collectList(
     v: Value,
-    acc: List[Value]
+    acc: List[Value],
+    seen: Set[AnyRef] = Set.empty
   ): (List[Value], Value) =
     v match
-      case PairVal(car, cdr, _) => collectList(cdr, acc :+ car)
+      case MutablePairVal(cell) =>
+        if seen.contains(cell) then (acc, Symbol("..."))
+        else collectList(cell(1), acc :+ cell(0), seen + cell)
+      case PairVal(car, cdr, _) => collectList(cdr, acc :+ car, seen)
       case other                => (acc, other)
 
 object Value:

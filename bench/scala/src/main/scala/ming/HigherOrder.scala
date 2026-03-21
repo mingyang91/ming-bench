@@ -15,7 +15,7 @@ object HigherOrder:
     val lists               = args.tail.map(Evaluator.toList)
     val (results, finalOut) = mapLoop(proc, lists, List.empty, pos, out)
     val result =
-      results.foldRight(Value.NilVal: Value)(Value.PairVal(_, _))
+      results.foldRight(Value.NilVal: Value)((a, b) => Value.MutablePairVal(Array(a, b)))
     Done(result, Env(Map.empty, None), finalOut)
 
   @scala.annotation.tailrec

@@ -44,19 +44,14 @@ object Builtins:
         typePred(args, v => MathBuiltins.isExact(v))
       case "cons" =>
         args match
-          case a :: b :: Nil => Value.PairVal(a, b)
-          case _ =>
-            throw new EvalError("cons requires exactly 2 arguments")
-      case "car" =>
-        args match
-          case Value.PairVal(h, _, _) :: Nil => h
-          case _ =>
-            throw new EvalError("car requires a pair argument")
-      case "cdr" =>
-        args match
-          case Value.PairVal(_, t, _) :: Nil => t
-          case _ =>
-            throw new EvalError("cdr requires a pair argument")
+          case a :: b :: Nil => Value.MutablePairVal(Array(a, b))
+          case _             => throw new EvalError("cons requires exactly 2 arguments")
+      case "car"  => singleArg(args, "car", pairCar)
+      case "cdr"  => singleArg(args, "cdr", pairCdr)
+      case "caar" => singleArg(args, "caar", v => pairCar(pairCar(v)))
+      case "cadr" => singleArg(args, "cadr", v => pairCar(pairCdr(v)))
+      case "cdar" => singleArg(args, "cdar", v => pairCdr(pairCar(v)))
+      case "cddr" => singleArg(args, "cddr", v => pairCdr(pairCdr(v)))
       case "null?" =>
         args match
           case Value.NilVal :: Nil => Value.BoolVal(true)
@@ -64,7 +59,7 @@ object Builtins:
           case _ =>
             throw new EvalError("null? requires exactly 1 argument")
       case "list" =>
-        args.foldRight(Value.NilVal: Value)(Value.PairVal(_, _))
+        args.foldRight(Value.NilVal: Value)((a, b) => Value.MutablePairVal(Array(a, b)))
       case "length" =>
         args match
           case head :: Nil => Value.IntVal(ListBuiltins.listLength(head))
@@ -73,10 +68,11 @@ object Builtins:
       case "string?"  => typePred(args, v => v.isInstanceOf[Value.StringVal] || v.isInstanceOf[Value.MutableStringVal])
       case "number?"  => typePred(args, MathBuiltins.isNumeric)
       case "boolean?" => typePred(args, _.isInstanceOf[Value.BoolVal])
-      case "pair?"    => typePred(args, _.isInstanceOf[Value.PairVal])
-      case "symbol?"  => typePred(args, _.isInstanceOf[Value.Symbol])
-      case "char?"    => typePred(args, _.isInstanceOf[Value.CharVal])
-      case _          => applyBuiltinExtended(name, args, pos)
+      case "pair?" =>
+        typePred(args, v => v.isInstanceOf[Value.PairVal] || v.isInstanceOf[Value.MutablePairVal])
+      case "symbol?" => typePred(args, _.isInstanceOf[Value.Symbol])
+      case "char?"   => typePred(args, _.isInstanceOf[Value.CharVal])
+      case _         => applyBuiltinExtended(name, args, pos)
 
   private def applyBuiltinExtended(
     name: String,
@@ -147,7 +143,30 @@ object Builtins:
       case "vector->list"     => VectorBuiltins.evalVectorToList(args)
       case "list->vector"     => VectorBuiltins.evalListToVector(args)
       case "reverse"          => ListBuiltins.evalReverse(args)
-      case _                  => throw new EvalError(s"unknown procedure: $name")
+      case "set-car!" =>
+        args match
+          case Value.MutablePairVal(cell) :: v :: Nil => cell(0) = v; Value.VoidVal
+          case _ => throw new EvalError("set-car! requires a mutable pair and a value")
+      case "set-cdr!" =>
+        args match
+          case Value.MutablePairVal(cell) :: v :: Nil => cell(1) = v; Value.VoidVal
+          case _ => throw new EvalError("set-cdr! requires a mutable pair and a value")
+      case _ => throw new EvalError(s"unknown procedure: $name")
+
+  private def pairCar(v: Value): Value = v match
+    case Value.PairVal(h, _, _)     => h
+    case Value.MutablePairVal(cell) => cell(0)
+    case _                          => throw new EvalError("car: not a pair")
+
+  private def pairCdr(v: Value): Value = v match
+    case Value.PairVal(_, t, _)     => t
+    case Value.MutablePairVal(cell) => cell(1)
+    case _                          => throw new EvalError("cdr: not a pair")
+
+  private def singleArg(args: List[Value], name: String, f: Value => Value): Value =
+    args match
+      case v :: Nil => f(v)
+      case _        => throw new EvalError(s"$name requires exactly 1 argument")
 
   private def typePred(
     args: List[Value],
@@ -245,6 +264,12 @@ object Builtins:
     .define("call-with-current-continuation", Value.Symbol("call/cc"))
     .define("dynamic-wind", Value.Symbol("dynamic-wind"))
     .define("reverse", Value.Symbol("reverse"))
+    .define("set-car!", Value.Symbol("set-car!"))
+    .define("set-cdr!", Value.Symbol("set-cdr!"))
+    .define("caar", Value.Symbol("caar"))
+    .define("cadr", Value.Symbol("cadr"))
+    .define("cdar", Value.Symbol("cdar"))
+    .define("cddr", Value.Symbol("cddr"))
     .define("values", Value.Symbol("values"))
     .define("call-with-values", Value.Symbol("call-with-values"))
     .define("exact?", Value.Symbol("exact?"))
