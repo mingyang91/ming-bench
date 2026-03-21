@@ -37,6 +37,8 @@ enum Value:
 
   case VectorVal(elems: Array[Value])
 
+  case MultipleValues(vals: List[Value])
+
   /** Extract string content from either StringVal or MutableStringVal. */
   def stringContent: Option[String] = this match
     case StringVal(s)         => Some(s)
@@ -59,6 +61,7 @@ enum Value:
     case _: ContinuationVal => "#<continuation>"
     case _: MacroVal        => "#<macro>"
     case VoidVal            => ""
+    case MultipleValues(vs) => vs.map(_.display).mkString(" ")
 
   /** Display representation (strings without quotes). */
   def displayRepr: String = this match

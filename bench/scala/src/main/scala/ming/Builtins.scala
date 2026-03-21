@@ -271,3 +271,5 @@ object Builtins:
     .define("call-with-current-continuation", Value.Symbol("call/cc"))
     .define("dynamic-wind", Value.Symbol("dynamic-wind"))
     .define("reverse", Value.Symbol("reverse"))
+    .define("values", Value.Symbol("values"))
+    .define("call-with-values", Value.Symbol("call-with-values"))

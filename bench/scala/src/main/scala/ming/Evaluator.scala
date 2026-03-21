@@ -137,7 +137,7 @@ object Evaluator:
       case Bounce(e2, env2, o) => eval(e2, env2, o)
 
   /** Single evaluation step — returns Bounce for tail positions. */
-  private def evalStep(
+  private[ming] def evalStep(
     expr: Value,
     env: Env,
     out: String
@@ -154,6 +154,7 @@ object Evaluator:
       case _: Value.LambdaVal        => Done(expr, env, out)
       case _: Value.ContinuationVal  => Done(expr, env, out)
       case _: Value.MacroVal         => Done(expr, env, out)
+      case _: Value.MultipleValues   => Done(expr, env, out)
       case Value.Symbol(name, pos) =>
         Done(env.lookup(name, pos), env, out)
       case Value.PairVal(car, _, pos) =>
@@ -228,64 +229,14 @@ object Evaluator:
       (acc :+ v, o2)
     }
 
-  /** Apply a procedure, returning Bounce for lambda bodies (TCO). */
+  /** Delegate to Apply object. */
   private[ming] def applyProcTail(
     proc: Value,
     args: List[Value],
     pos: Option[(Int, Int)],
     out: String
-  ): EvalResult =
-    proc match
-      case lam @ Value.LambdaVal(
-            params,
-            body,
-            closureThunk,
-            nameOpt,
-            restParam
-          ) =>
-        val closure = closureThunk()
-        val closureWithSelf = nameOpt match
-          case Some(n) => closure.define(n, lam)
-          case None    => closure
-        val localEnv =
-          closureWithSelf.extendVariadic(params, restParam, args, pos)
-        evalBodyTail(body, localEnv, out)
-      case Value.Symbol("apply", _) =>
-        HigherOrder.evalApply(args, pos, out)
-      case Value.Symbol("map", _) =>
-        HigherOrder.evalMap(args, pos, out)
-      case cv: Value.ContinuationVal =>
-        if args.length != 1 then throw EvalError.withPos("continuation requires 1 argument", pos)
-        throw new ContinuationInvoked(
-          cv.tag,
-          args.head,
-          out,
-          cv.remaining,
-          cv.envThunk,
-          cv.capturedOut,
-          cv.bodyLevel,
-          cv.windEntries
-        )
-      case Value.Symbol("call/cc" | "call-with-current-continuation", _) =>
-        if args.length != 1 then throw EvalError.withPos("call/cc requires 1 argument", pos)
-        throw new CallCCSetup(args.head, out, pos)
-      case Value.Symbol(name, _) =>
-        Done(
-          Builtins.applyBuiltin(name, args, pos),
-          Env(Map.empty, None),
-          out
-        )
-      case _ =>
-        throw EvalError.withPos(
-          s"not a procedure: ${proc.display}",
-          pos
-        )
+  ): EvalResult = Apply.applyProcTail(proc, args, pos, out)
 
-  private[ming] def isFalsy(v: Value): Boolean = v match
-    case Value.BoolVal(false) => true
-    case _                    => false
+  private[ming] def isFalsy(v: Value): Boolean = Apply.isFalsy(v)
 
-  private[ming] def toList(v: Value): List[Value] = v match
-    case Value.NilVal           => Nil
-    case Value.PairVal(h, t, _) => h :: toList(t)
-    case other                  => List(other)
+  private[ming] def toList(v: Value): List[Value] = Apply.toList(v)
