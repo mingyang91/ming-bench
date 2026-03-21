@@ -39,6 +39,9 @@ fn eval_list(items: &[Expr], env: &mut Env) -> Result<Value, EvalError> {
             "and" => return eval_and(args, env),
             "or" => return eval_or(args, env),
             "lambda" => return eval_lambda(args, env),
+            "let" => return eval_let(args, env),
+            "begin" => return eval_body(args, env),
+            "cond" => return eval_cond(args, env),
             _ => {}
         }
     }
@@ -248,6 +251,73 @@ fn eval_and(args: &[Expr], env: &mut Env) -> Result<Value, EvalError> {
         }
     }
     Ok(result)
+}
+
+/// Evaluate `(let ((var val) ...) body...)`.
+fn eval_let(args: &[Expr], env: &mut Env) -> Result<Value, EvalError> {
+    let [bindings_expr, body @ ..] = args else {
+        return Err(EvalError::Parse {
+            message: "let requires bindings and body".to_string(),
+        });
+    };
+    if body.is_empty() {
+        return Err(EvalError::Parse {
+            message: "let requires bindings and body".to_string(),
+        });
+    }
+    let Expr::List(bindings) = bindings_expr else {
+        return Err(EvalError::Parse {
+            message: "let bindings must be a list".to_string(),
+        });
+    };
+    // Evaluate all values in the outer env, then bind simultaneously
+    let pairs: Vec<(String, Value)> = bindings
+        .iter()
+        .map(|b| {
+            let Expr::List(pair) = b else {
+                return Err(EvalError::Parse {
+                    message: "let binding must be a list".to_string(),
+                });
+            };
+            let [Expr::Atom(name), val_expr] = pair.as_slice() else {
+                return Err(EvalError::Parse {
+                    message: "let binding must be (name value)".to_string(),
+                });
+            };
+            let val = eval(val_expr, env)?;
+            Ok((name.clone(), val))
+        })
+        .collect::<Result<_, _>>()?;
+    let mut local_env = env.clone();
+    for (name, val) in pairs {
+        local_env.insert(name, val);
+    }
+    eval_body(body, &mut local_env)
+}
+
+/// Evaluate `(cond (test expr) ... (else expr))`.
+fn eval_cond(args: &[Expr], env: &mut Env) -> Result<Value, EvalError> {
+    for clause in args {
+        let Expr::List(parts) = clause else {
+            return Err(EvalError::Parse {
+                message: "cond clause must be a list".to_string(),
+            });
+        };
+        let [test_expr, body @ ..] = parts.as_slice() else {
+            return Err(EvalError::Parse {
+                message: "cond clause must have a test and body".to_string(),
+            });
+        };
+        // Check for else clause
+        if matches!(test_expr, Expr::Atom(s) if s == "else") {
+            return eval_body(body, env);
+        }
+        let test_val = eval(test_expr, env)?;
+        if test_val != Value::Boolean(false) {
+            return eval_body(body, env);
+        }
+    }
+    Ok(Value::Nil)
 }
 
 /// Short-circuit `or`: returns first truthy value, or last falsy value.
