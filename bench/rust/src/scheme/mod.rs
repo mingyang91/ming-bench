@@ -150,7 +150,7 @@ impl Value {
                 | "apply" | "call/cc"
                 | "abs" | "modulo" | "remainder" | "quotient" | "min" | "max" | "expt"
                 | "zero?" | "positive?" | "negative?" | "odd?" | "even?"
-                | "list-ref" | "list-tail" | "list?" | "assoc" | "map"
+                | "list-ref" | "list-tail" | "list?" | "reverse" | "assoc" | "map"
                 | "eq?" | "eqv?" | "equal?"
                 | "char-alphabetic?" | "char-numeric?" | "char-upcase" | "char-downcase"
                 | "char=?" | "char<?"
@@ -961,6 +961,34 @@ fn eval(expr: &Expr, env: &Env, out: &mut String) -> Result<Value, EvalError> {
                             }
                             break 'tco Ok(Value::Nil);
                         }
+                        "dynamic-wind" => {
+                            if items.len() != 4 {
+                                break 'tco Err(EvalError::Arity(format!(
+                                    "dynamic-wind requires 3 arguments at {}",
+                                    pos.fmt()
+                                )));
+                            }
+                            let in_thunk = eval(&items[1], &cur_env, out)?;
+                            let body_thunk = eval(&items[2], &cur_env, out)?;
+                            let out_thunk = eval(&items[3], &cur_env, out)?;
+                            // Call in-thunk
+                            call_thunk(&in_thunk, pos, &cur_env, out)?;
+                            // Call body-thunk, catching ContinuationReturn
+                            let body_result = call_thunk(&body_thunk, pos, &cur_env, out);
+                            match body_result {
+                                Ok(val) => {
+                                    // Normal exit: call out-thunk, return body value
+                                    call_thunk(&out_thunk, pos, &cur_env, out)?;
+                                    break 'tco Ok(val);
+                                }
+                                Err(EvalError::ContinuationReturn) => {
+                                    // Non-local exit: call out-thunk, then re-throw
+                                    call_thunk(&out_thunk, pos, &cur_env, out)?;
+                                    break 'tco Err(EvalError::ContinuationReturn);
+                                }
+                                Err(e) => break 'tco Err(e),
+                            }
+                        }
                         "call/cc" | "call-with-current-continuation" => {
                             if items.len() != 2 {
                                 break 'tco Err(EvalError::Arity(format!(
@@ -1276,6 +1304,33 @@ fn eval_lambda(args: &[Expr], pos: Pos, env: &Env) -> Result<Value, EvalError> {
         }
         _ => Err(EvalError::Type(format!(
             "lambda: params must be a list or symbol at {}",
+            pos.fmt()
+        ))),
+    }
+}
+
+/// Call a zero-argument thunk (used by dynamic-wind).
+fn call_thunk(thunk: &Value, pos: Pos, env: &Env, out: &mut String) -> Result<Value, EvalError> {
+    match thunk {
+        Value::Lambda { params, rest_param, body, env: closure_env } => {
+            if !params.is_empty() || rest_param.is_some() {
+                return Err(EvalError::Type(format!(
+                    "dynamic-wind: thunk must accept 0 arguments at {}",
+                    pos.fmt()
+                )));
+            }
+            let new_env = Env::with_parent(closure_env);
+            env.copy_all_into_if_absent(&new_env);
+            if body.is_empty() {
+                return Ok(Value::Nil);
+            }
+            for e in &body[..body.len() - 1] {
+                eval(e, &new_env, out)?;
+            }
+            eval(body.last().unwrap(), &new_env, out)
+        }
+        _ => Err(EvalError::Type(format!(
+            "dynamic-wind: expected procedure at {}",
             pos.fmt()
         ))),
     }
@@ -2199,6 +2254,24 @@ fn apply_builtin(op: &str, args: &[Value], pos: Pos, out: &mut String) -> Result
             };
             Ok(Some(Value::Boolean(result)))
         }
+        "reverse" => {
+            if args.len() != 1 {
+                return Err(EvalError::Arity(format!("reverse requires 1 argument at {}", pos.fmt())));
+            }
+            let mut cur = &args[0];
+            let mut result = Value::Nil;
+            loop {
+                match cur {
+                    Value::Nil => break,
+                    Value::Pair(car, cdr) => {
+                        result = Value::Pair(Box::new(*car.clone()), Box::new(result));
+                        cur = cdr;
+                    }
+                    _ => return Err(EvalError::Type(format!("reverse: not a proper list at {}", pos.fmt()))),
+                }
+            }
+            Ok(Some(result))
+        }
         "eq?" => {
             if args.len() != 2 {
                 return Err(EvalError::Arity(format!("eq? requires 2 arguments at {}", pos.fmt())));
@@ -2541,7 +2614,7 @@ fn is_keyword(name: &str) -> bool {
         "if" | "define" | "quote" | "lambda" | "and" | "or"
             | "let" | "begin" | "cond" | "set!" | "call/cc"
             | "call-with-current-continuation" | "string-set!"
-            | "define-syntax" | "syntax-rules"
+            | "define-syntax" | "syntax-rules" | "dynamic-wind"
     ) || Value::is_builtin_name(name)
 }
 
