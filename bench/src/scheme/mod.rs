@@ -11,6 +11,7 @@ enum Value {
     Boolean(bool),
     Str(String),
     Symbol(String),
+    Char(char),
     List(Vec<Value>),
     Lambda {
         params: Vec<String>,
@@ -29,6 +30,7 @@ impl Value {
             Value::Boolean(false) => "#f".to_string(),
             Value::Str(s) => format!("\"{}\"", s),
             Value::Symbol(s) => s.clone(),
+            Value::Char(c) => format!("#\\{}", c),
             Value::Lambda { .. } => "#<procedure>".to_string(),
             Value::List(items) => {
                 let parts: Vec<String> = items.iter().map(|v| v.to_scheme_string()).collect();
@@ -642,6 +644,81 @@ fn apply_builtin(op: &str, args: &[Value], out: &mut String) -> Result<Value, Ev
             if !args.is_empty() { return Err(EvalError::Arity); }
             out.push('\n');
             Ok(Value::Symbol("ok".into()))
+        }
+        "string-append" => {
+            let mut result = String::new();
+            for a in args {
+                match a {
+                    Value::Str(s) => result.push_str(s),
+                    _ => return Err(EvalError::TypeError("string-append: expected string".into())),
+                }
+            }
+            Ok(Value::Str(result))
+        }
+        "string-length" => {
+            if args.len() != 1 { return Err(EvalError::Arity); }
+            match &args[0] {
+                Value::Str(s) => Ok(Value::Integer(s.len() as i64)),
+                _ => Err(EvalError::TypeError("string-length: expected string".into())),
+            }
+        }
+        "substring" => {
+            if args.len() != 3 { return Err(EvalError::Arity); }
+            let s = match &args[0] {
+                Value::Str(s) => s,
+                _ => return Err(EvalError::TypeError("substring: expected string".into())),
+            };
+            let start = expect_integer(&args[1])? as usize;
+            let end = expect_integer(&args[2])? as usize;
+            if start > end || end > s.len() {
+                return Err(EvalError::TypeError("substring: index out of range".into()));
+            }
+            Ok(Value::Str(s[start..end].to_string()))
+        }
+        "string->number" => {
+            if args.len() != 1 { return Err(EvalError::Arity); }
+            match &args[0] {
+                Value::Str(s) => match s.parse::<i64>() {
+                    Ok(n) => Ok(Value::Integer(n)),
+                    Err(_) => Ok(Value::Boolean(false)),
+                },
+                _ => Err(EvalError::TypeError("string->number: expected string".into())),
+            }
+        }
+        "number->string" => {
+            if args.len() != 1 { return Err(EvalError::Arity); }
+            let n = expect_integer(&args[0])?;
+            Ok(Value::Str(n.to_string()))
+        }
+        "symbol->string" => {
+            if args.len() != 1 { return Err(EvalError::Arity); }
+            match &args[0] {
+                Value::Symbol(s) => Ok(Value::Str(s.clone())),
+                _ => Err(EvalError::TypeError("symbol->string: expected symbol".into())),
+            }
+        }
+        "string->symbol" => {
+            if args.len() != 1 { return Err(EvalError::Arity); }
+            match &args[0] {
+                Value::Str(s) => Ok(Value::Symbol(s.clone())),
+                _ => Err(EvalError::TypeError("string->symbol: expected string".into())),
+            }
+        }
+        "string-ref" => {
+            if args.len() != 2 { return Err(EvalError::Arity); }
+            let s = match &args[0] {
+                Value::Str(s) => s,
+                _ => return Err(EvalError::TypeError("string-ref: expected string".into())),
+            };
+            let idx = expect_integer(&args[1])? as usize;
+            if idx >= s.len() {
+                return Err(EvalError::TypeError("string-ref: index out of range".into()));
+            }
+            Ok(Value::Char(s.as_bytes()[idx] as char))
+        }
+        "char?" => {
+            if args.len() != 1 { return Err(EvalError::Arity); }
+            Ok(Value::Boolean(matches!(&args[0], Value::Char(_))))
         }
         _ => Err(EvalError::UndefinedVariable(op.to_string())),
     }
