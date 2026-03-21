@@ -14,6 +14,7 @@ enum Token {
     Integer(i64),
     Boolean(bool),
     Str(String),
+    Char(char),
 }
 
 /// Compute (line, col) for each char index.
@@ -70,11 +71,39 @@ fn tokenize_hash(chars: &[char], start: usize) -> Result<(Token, usize), EvalErr
         Ok((Token::Boolean(true), i + 1))
     } else if i < chars.len() && chars[i] == 'f' {
         Ok((Token::Boolean(false), i + 1))
+    } else if i < chars.len() && chars[i] == '\\' {
+        tokenize_char_literal(chars, i + 1)
     } else {
         Err(EvalError::Parse {
             message: "unexpected character after #".into(),
         })
     }
+}
+
+fn tokenize_char_literal(chars: &[char], start: usize) -> Result<(Token, usize), EvalError> {
+    if start >= chars.len() {
+        return Err(EvalError::Parse {
+            message: "unexpected end of character literal".into(),
+        });
+    }
+    // Collect the name (could be "space", "newline", or a single char)
+    let mut end = start;
+    while end < chars.len() && !is_delimiter(chars[end]) {
+        end += 1;
+    }
+    let name: String = chars[start..end].iter().collect();
+    let ch = match name.as_str() {
+        "space" => ' ',
+        "newline" => '\n',
+        "tab" => '\t',
+        s if s.len() == 1 => s.chars().next().expect("single char"),
+        _ => {
+            return Err(EvalError::Parse {
+                message: format!("unknown character name: {name}"),
+            })
+        }
+    };
+    Ok((Token::Char(ch), end))
 }
 
 fn push_escape(s: &mut String, c: char) {
@@ -148,6 +177,7 @@ fn parse_expr(tokens: &[(Token, Span)], pos: usize) -> Result<(Value, Span, usiz
         Token::Integer(n) => Ok((Value::Integer(*n), span, pos + 1)),
         Token::Boolean(b) => Ok((Value::Boolean(*b), span, pos + 1)),
         Token::Str(s) => Ok((Value::Str(s.clone()), span, pos + 1)),
+        Token::Char(c) => Ok((Value::Char(*c), span, pos + 1)),
         Token::Symbol(s) => Ok((Value::Symbol(s.clone()), span, pos + 1)),
         Token::Quote => {
             let (inner, _, next) = parse_expr(tokens, pos + 1)?;

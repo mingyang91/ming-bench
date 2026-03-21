@@ -36,6 +36,7 @@ fn is_builtin(name: &str) -> bool {
             | "string->number" | "number->string"
             | "symbol->string" | "string->symbol"
             | "string-ref"
+            | "string-copy"
     )
 }
 
@@ -55,6 +56,7 @@ fn eval_list(items: &[Value], env: &Rc<RefCell<Env>>, out: &Output) -> Result<Va
             "cond" => return eval_cond(&items[1..], env, out),
             "and" => return eval_and(&items[1..], env, out),
             "or" => return eval_or(&items[1..], env, out),
+            "string-set!" => return eval_string_set(&items[1..], env, out),
             s if is_builtin(s) => return eval_builtin(s, &items[1..], env, out),
             _ => {}
         }
@@ -142,6 +144,7 @@ fn eval_builtin(
         "symbol->string" => eval_symbol_to_string(args, env, out),
         "string->symbol" => eval_string_to_symbol(args, env, out),
         "string-ref" => eval_string_ref(args, env, out),
+        "string-copy" => eval_string_copy(args, env, out),
         _ => Err(EvalError::UnknownProcedure {
             name: name.into(),
         }),
@@ -787,4 +790,82 @@ fn eval_string_ref(
             got: format!("{idx}"),
         })?;
     Ok(Value::Char(ch))
+}
+
+fn eval_string_copy(
+    args: &[Value],
+    env: &Rc<RefCell<Env>>,
+    out: &Output,
+) -> Result<Value, EvalError> {
+    let [arg] = args else {
+        return Err(EvalError::WrongArgCount {
+            expected: 1,
+            got: args.len(),
+        });
+    };
+    match eval(arg, env, out)? {
+        Value::Str(s) => Ok(Value::Str(s)),
+        other => Err(EvalError::TypeError {
+            expected: "string".into(),
+            got: format!("{other}"),
+        }),
+    }
+}
+
+fn eval_string_set(
+    args: &[Value],
+    env: &Rc<RefCell<Env>>,
+    out: &Output,
+) -> Result<Value, EvalError> {
+    let [name_arg, idx_arg, char_arg] = args else {
+        return Err(EvalError::WrongArgCount {
+            expected: 3,
+            got: args.len(),
+        });
+    };
+    let Value::Symbol(name) = name_arg else {
+        return Err(EvalError::TypeError {
+            expected: "symbol".into(),
+            got: format!("{name_arg}"),
+        });
+    };
+    let idx = match eval(idx_arg, env, out)? {
+        Value::Integer(n) => n as usize,
+        other => {
+            return Err(EvalError::TypeError {
+                expected: "integer".into(),
+                got: format!("{other}"),
+            })
+        }
+    };
+    let ch = match eval(char_arg, env, out)? {
+        Value::Char(c) => c,
+        other => {
+            return Err(EvalError::TypeError {
+                expected: "char".into(),
+                got: format!("{other}"),
+            })
+        }
+    };
+    let s = match env.borrow().get(name) {
+        Some(Value::Str(s)) => s,
+        Some(other) => {
+            return Err(EvalError::TypeError {
+                expected: "string".into(),
+                got: format!("{other}"),
+            })
+        }
+        None => return Err(EvalError::UnboundVariable { name: name.clone() }),
+    };
+    let mut chars: Vec<char> = s.chars().collect();
+    if idx >= chars.len() {
+        return Err(EvalError::TypeError {
+            expected: format!("index < {}", chars.len()),
+            got: format!("{idx}"),
+        });
+    }
+    chars[idx] = ch;
+    let new_s: String = chars.into_iter().collect();
+    env.borrow_mut().define(name.clone(), Value::Str(new_s));
+    Ok(Value::Void)
 }
