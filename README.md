@@ -1,6 +1,6 @@
 # MING — Ming Interpreter Nurture Gauntlet
 
-A benchmark framework for measuring how **prompt engineering strategies** affect coding agent performance. Agents build a Scheme interpreter in Rust from scratch — 100+ tests across 15 difficulty levels, from basic arithmetic to first-class continuations, hygienic macros, and data structure extensions.
+A benchmark framework for measuring how **prompt engineering strategies** affect coding agent performance. Agents build a Scheme interpreter from scratch — 188 tests across 23 difficulty levels, from basic arithmetic to first-class continuations, hygienic macros, and exact arithmetic. Supports **5 languages**: Rust, Go, Java, TypeScript, and Scala.
 
 ## Why This Exists
 
@@ -8,111 +8,151 @@ Coding agents (Claude Code, Codex, OpenCode, etc.) can write working software, b
 
 > **Does adding structure to agent instructions — quality gates, code style rules, modular architecture enforcement — improve outcomes compared to minimal "just do it" prompts?**
 
-The task is deliberately chosen to stress-test this: a Scheme interpreter requires the agent to make hundreds of architectural decisions (data representation, evaluation strategy, environment model, continuation implementation) over 25 progressively harder levels. Bad early decisions compound. Good structure should help.
+The task is deliberately chosen to stress-test this: a Scheme interpreter requires the agent to make hundreds of architectural decisions (data representation, evaluation strategy, environment model, continuation implementation) over 23 progressively harder levels. Bad early decisions compound. Good structure should help.
+
+Multi-language support adds another dimension: **does language choice affect agent performance on the same algorithmic task?**
 
 ## How It Works
 
 ### The Task
 
 The agent receives:
-- A function signature: `eval_str(input: &str) -> Result<String, EvalError>`
-- 165 test cases across 15 levels (each test loads Scheme code from a `.scm` fixture file)
-- Instructions in `bench/CLAUDE.md` (the only file the agent reads for guidance)
+- A function signature (language-specific): `evalStr(input) → result`
+- 188 test cases across 23 levels (each test loads Scheme code from a `.scm` fixture file)
+- Instructions in `CLAUDE.md` (the only file the agent reads for guidance)
 
-The agent implements a complete Scheme interpreter from scratch — lexer, parser, environment, evaluator, tail-call optimization, continuations, and hygienic macros. No starter code. No libraries beyond `thiserror` for error types.
+The agent implements a complete Scheme interpreter from scratch — lexer, parser, environment, evaluator, tail-call optimization, continuations, and hygienic macros. No starter code. No external parsing libraries.
+
+### Supported Languages
+
+| Language | Directory | Build System | Test Execution | Container |
+|----------|-----------|-------------|----------------|-----------|
+| Rust | `bench/rust/` | Cargo | Pre-compiled binary in `ming` | debian-slim |
+| Go | `bench/go/` | Go modules | Pre-compiled binary in `ming` | debian-slim |
+| Java | `bench/java/` | Gradle | JUnit 5 via `test.sh` | `ming-jvm` (Corretto 26) |
+| TypeScript | `bench/ts/` | npm/tsc | vitest via `test.sh` | `ming-node` |
+| Scala | `bench/scala/` | Mill 1.1.2 | Fat JAR in `ming-jvm` | Corretto 26 (2GB/45s) |
 
 ### Project Structure
 
 ```
-ming/                     # framework — orchestration & analysis
-  xtask/                  # CLI: run-agent, test, bench, tokens, analyze, watch
-  Dockerfile.bench        # container image for sandboxed testing
-  CLAUDE.md               # framework maintainer instructions
+ming/                         # framework — orchestration & analysis
+  xtask/                      # CLI: run-agent, test, bench, tokens, analyze, watch
+  Dockerfile.bench            # container image for Rust/Go (static binaries)
+  Dockerfile.jvm              # container image for Java/Scala (amazoncorretto:26)
+  Dockerfile.node             # container image for TypeScript (node:latest)
+  CLAUDE.md                   # framework maintainer instructions
 
-  bench/                  # agent playground — what the agent sees
-    SPEC.md               # interpreter specification (shared, all strategies)
-    strategies/
-      default.md          # group 1: minimal instructions
-      quality-gate.md     # group 2: quality gates + code style rules
-    CLAUDE.md             # ← symlink to strategy file, created at launch
-    src/scheme/           # agent implements here
-    src/scheme/tests/     # test suite (read-only to agent)
-    src/scheme/tests/fixtures/  # .scm files loaded by tests
+  bench/                      # agent playground
+    SPEC.md                   # interpreter specification (shared, all languages)
+    tests.json                # shared test manifest (188 test cases)
+    fixtures/                 # shared .scm fixture files (214 files)
+    strategies/               # strategy files (per-language subdirectories)
+      default.md              # Rust default (legacy)
+      quality-gate.md         # Rust quality-gate (legacy)
+      rust/default.md         # Rust default strategy
+      go/default.md           # Go default strategy
+      java/default.md         # Java default strategy
+      ts/default.md           # TypeScript default strategy
+      scala/default.md        # Scala default strategy
+      scala/quality-gate.md   # Scala quality-gate (pure FP, scalafix)
+    rust/                     # Rust interpreter crate
+    go/                       # Go interpreter scaffold
+    java/                     # Java interpreter scaffold (Gradle)
+    ts/                       # TypeScript interpreter scaffold (vitest)
+    scala/                    # Scala interpreter scaffold (Mill + scalafix)
 ```
 
-Agents are launched with `cwd = bench/` and only interact with files there. Framework code (xtask, Dockerfile) lives above the agent's working directory.
+Agents are launched with `cwd = bench/{lang}/` and only interact with files there. Framework code (xtask, Dockerfiles) lives above the agent's working directory.
 
 ### The Experiment: Strategies
 
-| Strategy | CLAUDE.md | Cargo feature | What it tests |
-|----------|-----------|---------------|---------------|
-| `default` | Minimal: implement the spec, test each level, fix failures | *(none)* | Baseline — how agents perform with standard guidance |
-| `quality-gate` | Adds: clippy enforcement, mod.rs size limits, code style rules | `quality-gate` enabled | Whether structural enforcement improves agent code quality and completion rate |
+| Strategy | What it tests |
+|----------|---------------|
+| `default` | Baseline — minimal instructions: implement the spec, test each level, fix failures |
+| `quality-gate` | Whether structural enforcement improves agent code quality and completion rate |
 
-Both strategies share `SPEC.md` (identical task definition) and the same test suite. The only difference is the instructions in `CLAUDE.md` and whether lint enforcement is active. Lint attributes in `bench/src/lib.rs` use `cfg_attr(feature = "quality-gate", ...)` — they are inert by default and activated per-worktree when the strategy includes `clippy.toml`. Strategy selection happens at runtime via `--strategy`.
+Both strategies share `SPEC.md` (identical task definition) and the same test suite. The only difference is the instructions in `CLAUDE.md` and whether lint enforcement is active.
+
+Per-language strategies live in `bench/strategies/{lang}/`. The orchestrator picks the language-specific strategy first, falling back to the base strategy.
+
+**Quality gate enforcement by language:**
+- **Rust**: clippy + mod.rs size check (via `--gate` flag)
+- **Scala**: scalafix (FileTooLong, MethodTooLong, NestingDepth) + scalafmt (via `--gate` flag)
+- **Others**: `--gate` flag passed to language's `test.sh`
 
 ### Execution Modes
 
 Each agent run uses one of two modes:
 
-- **Full mode** — one agent session tackles all 15 levels. Simpler, but if the agent gets stuck it burns budget.
+- **Full mode** — one agent session tackles all 23 levels. Simpler, but if the agent gets stuck it burns budget.
 - **Levels mode** — orchestrator runs a fresh agent per level. Fail-fast: stops on first failure. Per-level session data for granular analysis.
 
 ### Sandboxed Testing
 
 Tests never run on the host. Every test execution happens inside a container with hard resource limits:
-- 1 GB memory, 1 CPU, 256 PIDs
-- 30s timeout per level, 300s for the full suite
-- OOM or timeout = test failure
 
-This prevents agent-written infinite loops or memory bombs from crashing the benchmark host.
+| Language | Memory | Timeout (per-level) | Timeout (all) | Container |
+|----------|--------|-------------------|---------------|-----------|
+| Rust / Go | 1 GB | 30s | 300s | `ming` |
+| Java / Scala | 2 GB | 45s | 450s | `ming-jvm` |
+| TypeScript | 1 GB | 30s | 300s | `ming-node` |
+
+All containers: 1 CPU, 256 PIDs. OOM or timeout = test failure. This prevents agent-written infinite loops or memory bombs from crashing the benchmark host.
 
 ## Test Levels
 
 | Level | Topic | Tests | Key Concepts |
 |-------|-------|-------|-------------|
-| 1 | Atoms, arithmetic, comparisons | ~19 | Integers, booleans, strings, `+`/`-`/`*`/`/`, `<`/`>`/`=`, `and`/`or`/`not` |
-| 2 | Variables, conditionals, lambda | ~14 | `define`, `if`, `quote`, `lambda`, closures, recursion |
-| 3 | Lists, recursion, let/begin/cond, predicates | ~24 | `cons`/`car`/`cdr`, map/filter, `let`/`begin`/`cond`, type predicates |
+| 1 | Atoms, arithmetic, comparisons | 19 | Integers, booleans, strings, `+`/`-`/`*`/`/`, `<`/`>`/`=`, `and`/`or`/`not` |
+| 2 | Variables, conditionals, lambda | 14 | `define`, `if`, `quote`, `lambda`, closures, recursion |
+| 3 | Lists, recursion, let/begin/cond | 24 | `cons`/`car`/`cdr`, map/filter, `let`/`begin`/`cond`, type predicates |
 | 4 | Error quality | 6 | Error messages with source position (line:col) |
-| 5 | Display/write & string ops | ~13 | `display`, `write`, `newline`, `string-append`, `substring`, `char?` |
-| 6 | **Mutable strings** | 3 | `string-set!`, `string-copy` (R5RS) |
-| 7 | **String immutability** | 4 | `string-set!` errors, `string->list`/`list->string` (R7RS) |
-| 8 | Tail call optimization (all forms) | ~8 | TCO in `if`, `cond`, named `let`, `and`/`or`, `begin` |
+| 5 | Display/write & string ops | 13 | `display`, `write`, `newline`, `string-append`, `substring` |
+| 6 | Mutable strings (R5RS) | 3 | `string-set!`, `string-copy` |
+| 7 | String immutability (R7RS) | 4 | `string-set!` errors, `string->list`/`list->string` |
+| 8 | Tail call optimization | 8 | TCO in `if`, `cond`, named `let`, `and`/`or`, `begin` |
 | 9 | set! & mutation | 5 | Mutable bindings, shared state in closures |
 | 10 | Variadic & apply | 6 | Rest args, `apply` with prefix args |
 | 11 | **call/cc** | 10 | First-class continuations, non-local exit, reentrant |
 | 12 | **Macros** | 6 | `define-syntax`, `syntax-rules`, hygiene, ellipsis |
 | 13 | **Integration** | 5 | call/cc + macros + mutation + TCO combined |
-| 14 | Equality, letrec, case, vectors | ~17 | `equal?`, `letrec`/`letrec*`, `case`/`eqv?`, `vector` |
-| 15 | Numeric/char/string utilities | ~25 | `abs`, `modulo`, `min`/`max`, `zero?`, `list-ref`, `char-upcase`, `string=?` |
+| 14 | Equality, letrec, case, vectors | 17 | `equal?`, `letrec`/`letrec*`, `case`, `vector` |
+| 15 | Numeric/char/string utilities | 25 | `abs`, `modulo`, `min`/`max`, `char-upcase`, `string=?` |
+| 16 | dynamic-wind | 6 | Resource cleanup on non-local exit |
+| 17 | guard & raise | 6 | Exception signaling and catching |
+| 18 | values & call-with-values | 6 | Multi-value returns |
+| 19 | **Exact arithmetic** | 8 | Rationals, cross-tower comparison |
+| 20 | define-record-type | 5 | R7RS records with disjoint types |
+| 21 | **Pair mutation** | 5 | `set-car!`/`set-cdr!`, circular list detection |
+| 22 | **syntax-case** | 5 | Advanced macro system with guards |
+| 23 | **Final integration** | 8 | All features combined |
 
-Levels 1-3 are foundational (compressed from 9 original levels). Levels 4-5 are **maintenance levels** — cross-cutting refactors on existing code (error quality, I/O, string ops). Levels 6-7 test **requirement changes** — the agent implements mutable strings (R5RS), then must refactor to immutable strings (R7RS). Levels 8-10 add architectural complexity (TCO, mutation, variadic). Levels 11-13 are where most agents struggle — continuations and macros demand non-obvious design decisions. Levels 14-15 are **extension levels** — feature additions that test whether agents can cleanly extend a complex, mature codebase.
+Levels 1-3 are foundational. Levels 4-7 are maintenance/requirement-change levels. Levels 8-10 add architectural complexity. Levels 11-13 are where most agents struggle — continuations and macros demand non-obvious design decisions. Levels 14-15 are extension levels. Levels 16-23 are advanced — dynamic-wind, exceptions, exact arithmetic, records, pair mutation, syntax-case.
 
 ## Tooling
 
 All benchmark infrastructure lives in a single Rust CLI: `cargo xtask`.
 
-```
-cargo xtask setup           # install podman, build container image
-cargo xtask test 01         # run level 1 tests (containerized)
-cargo xtask bench main      # score a branch (all 15 levels)
-cargo xtask run-agent ...   # orchestrate an agent run (worktree + agent + scoring)
-cargo xtask results         # tabular summary of all runs
-cargo xtask tokens --all    # per-level token usage and cost estimates
-cargo xtask analyze --all   # request-level cost analysis + anti-pattern detection
-cargo xtask watch           # live dashboard of running agents
-cargo xtask verify          # ground-truth check against Guile Scheme
+```bash
+cargo xtask setup                          # install podman, build all container images
+cargo xtask test 01                        # test level 1 (Rust, default)
+cargo xtask test 01 --lang scala           # test level 1 (Scala)
+cargo xtask test 01 --lang scala --gate    # test with quality gate
+cargo xtask run-agent --lang scala --strategy default --name scala-r1 --mode levels
+cargo xtask results                        # tabular summary of all runs
+cargo xtask tokens --all                   # per-level token usage and cost estimates
+cargo xtask analyze --all                  # request-level cost analysis
+cargo xtask watch                          # live dashboard of running agents
+cargo xtask verify                         # ground-truth check against Guile
 ```
 
 ### Agent Orchestration
 
-> **Note:** Shell scripts under `scripts/` are deprecated launch helpers. `cargo xtask` is the only supported interface for running agents and benchmarks.
-
 `cargo xtask run-agent` handles the full lifecycle:
 
 1. Creates an isolated git worktree
-2. Symlinks the selected strategy file as `bench/CLAUDE.md`
+2. Symlinks the selected strategy file as `bench/{lang}/CLAUDE.md`
 3. Pre-builds dependencies (warm cache)
 4. Launches the agent (Claude, Codex, or OpenCode)
 5. Captures session transcripts
@@ -122,15 +162,7 @@ cargo xtask verify          # ground-truth check against Guile Scheme
 
 Each run is self-contained — unique worktree, UUID, results directory. Multiple runs execute in parallel without interference.
 
-**Worktree path convention:** Worktrees are created at `<repo>/../workspace/<name>`. The agent's working directory is set to `<worktree>/bench/`, so it only sees the playground contents.
-
-**Cleanup:** If a previous run left a stale worktree or branch, use `--clean` to auto-remove them:
-
-```bash
-cargo xtask run-agent --strategy default --name claude-r1 --clean --agent claude --mode levels
-```
-
-Without `--clean`, you'll get distinct errors for stale directories vs stale branches, with instructions on how to fix each.
+**Worktree path convention:** Worktrees are created at `<repo>/../workspace/<name>`. The agent's working directory is set to `<worktree>/bench/{lang}/`, so it only sees its language's playground contents.
 
 ### Cost Analysis
 
@@ -147,16 +179,15 @@ Without `--clean`, you'll get distinct errors for stale directories vs stale bra
 
 ```
 results/
-  default_claude-r1_20260319T120000/
-    meta.json             # run metadata (strategy, agent, mode, score, timing)
+  default_scala-r1_20260321T120000/
+    meta.json             # run metadata (strategy, agent, lang, mode, score, timing)
     agent-output.txt      # agent stdout
     session.jsonl         # full session transcript
     bench.log             # scoring output
     L01/                  # per-level data (levels mode)
       agent-output.txt
       session.jsonl
-      status.txt          # "Level 01 PASSED (51s)"
-      test-result.txt
+      status.txt          # "Level 01 PASSED (130s)"
     L02/
       ...
 ```
@@ -167,21 +198,22 @@ results/
 # One-time setup
 cargo xtask setup
 
-# Run with default strategy (minimal instructions)
+# Run Rust with default strategy
 cargo xtask run-agent --strategy default --name claude-r1 --agent claude --mode levels
 
-# Run with quality-gate strategy (clippy + code style)
-cargo xtask run-agent --strategy quality-gate --name claude-q1 --agent claude --mode levels
+# Run Scala with quality-gate strategy
+cargo xtask run-agent --lang scala --strategy quality-gate --name scala-q1 --agent claude --mode levels
+
+# Run Go with default strategy
+cargo xtask run-agent --lang go --strategy default --name go-r1 --agent claude --mode levels
 
 # Compare results
 cargo xtask results
-cargo xtask analyze \
-  results/default_claude-r1_* \
-  results/quality-gate_claude-q1_*
+cargo xtask compare results/default_claude-r1_* results/default_scala-q1_*
 ```
 
 See [BENCH_GUIDE.md](BENCH_GUIDE.md) for the full supervisor reference.
 
 ## Ground Truth
 
-Test expected values are verified against Guile Scheme. Run `cargo xtask verify` to re-check.
+Test expected values are verified against Guile Scheme. Run `cargo xtask verify` to re-check. The shared test manifest (`bench/tests.json`) and fixture files (`bench/fixtures/`) are the canonical source — all language test harnesses read from them.

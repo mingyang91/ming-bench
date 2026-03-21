@@ -8,14 +8,20 @@ This file is for **humans supervising agent runs**. It is NOT read by agents.
 # One-time setup
 cargo xtask setup
 
-# Single full run (agent does L1→L16 in one session)
+# Single full run (agent does L1→L23 in one session)
 cargo xtask run-agent --name claude-r1
 
 # Level-by-level run (fresh agent per level, fail-fast)
 cargo xtask run-agent --name claude-r2 --mode levels
 
-# Use quality-gate strategy instead of default
+# Use quality-gate strategy
 cargo xtask run-agent --strategy quality-gate --name claude-q1 --mode levels
+
+# Run in a different language
+cargo xtask run-agent --lang scala --name scala-r1 --mode levels
+cargo xtask run-agent --lang go --name go-r1 --mode levels
+cargo xtask run-agent --lang java --name java-r1 --mode levels
+cargo xtask run-agent --lang ts --name ts-r1 --mode levels
 
 # Resume a crashed/stopped run (skips passed levels, reuses worktree)
 cargo xtask run-agent --strategy default --name claude-r2 --mode levels --resume
@@ -27,18 +33,36 @@ cargo xtask run-agent --name claude-r3 --mode levels --from-level 13
 cargo xtask run-agent --name test-dry --skip-bench
 ```
 
+## Languages
+
+| Language | `--lang` | Build System | Container | Memory | Timeout |
+|----------|----------|-------------|-----------|--------|---------|
+| Rust | `rust` (default) | Cargo | `ming` | 1 GB | 30s/300s |
+| Go | `go` | Go modules | `ming` | 1 GB | 30s/300s |
+| Java | `java` | Gradle | `ming-jvm` | 2 GB | 45s/450s |
+| TypeScript | `ts` | npm/tsc | `ming-node` | 1 GB | 30s/300s |
+| Scala | `scala` | Mill | `ming-jvm` | 2 GB | 45s/450s |
+
+All tests run inside containers with 1 CPU, 256 PIDs. OOM or timeout = test failure.
+
+**Scala specifics:** No shell scripts — xtask calls `./mill` directly. Quality gate uses scalafix (FileTooLong, MethodTooLong, NestingDepth) + scalafmt. Tests run via a standalone `TestRunner` main JAR inside the container.
+
 ## Strategies
 
-Strategy files live in `bench/strategies/`. At launch, `run-agent` symlinks the selected strategy as `bench/CLAUDE.md`.
+Strategy files live in `bench/strategies/`. Per-language strategies in `bench/strategies/{lang}/`. At launch, `run-agent` symlinks the selected strategy as `bench/{lang}/CLAUDE.md`.
 
-| Strategy | File | Cargo feature | What it does |
-|----------|------|---------------|-------------|
-| `default` | `bench/strategies/default.md` | *(none)* | Minimal instructions: implement the spec, test each level |
-| `quality-gate` | `bench/strategies/quality-gate.md` | `quality-gate` enabled | Adds clippy enforcement, mod.rs size limits, code style rules |
+| Strategy | What it does |
+|----------|-------------|
+| `default` | Minimal instructions: implement the spec, test each level |
+| `quality-gate` | Adds lint enforcement, structural limits, code style rules |
 
-Lint enforcement uses a Cargo feature flag. `bench/src/lib.rs` wraps all lint attributes in `cfg_attr(feature = "quality-gate", ...)`. The `run-agent` orchestrator patches Cargo.toml to enable the feature when the strategy includes `clippy.toml`.
+**Available quality-gate strategies:**
+- **Rust**: clippy + mod.rs size limits
+- **Scala**: scalafix (FileTooLong 300, MethodTooLong 100, NestingDepth 5) + scalafmt. Pure FP: no `var` allowed.
 
-Both share `bench/SPEC.md` (identical task definition). To add a new strategy, create `bench/strategies/<name>.md` and use `--strategy <name>`.
+Both share `bench/SPEC.md` (identical task definition) and `bench/tests.json` (shared test manifest). To add a new strategy, create `bench/strategies/{lang}/<name>.md` and use `--strategy <name> --lang <lang>`.
+
+**Two-pass quality gate (levels mode):** The orchestrator splits each level into: (1) coding pass — plain tests, full turn budget, (2) cleanup pass — `--gate` flag, fresh session, 15 turns. The agent never sees lint checks during coding.
 
 ## Agent Examples
 
@@ -49,25 +73,11 @@ cargo xtask run-agent --name claude-r1 --agent claude
 cargo xtask run-agent --name claude-r1 --agent claude --model claude-opus-4-6
 ```
 
-Under the hood:
-```bash
-claude -p --session-id <uuid> --dangerously-skip-permissions "prompt"
-```
-
-Session data: `~/.claude/projects/<project>/<uuid>.jsonl`
-
 ### Codex (OpenAI)
 
 ```bash
 cargo xtask run-agent --name codex-r1 --agent codex
 ```
-
-Under the hood:
-```bash
-codex --full-auto "prompt"
-```
-
-Session data: check `~/.codex/` for logs.
 
 ### OpenCode
 
@@ -75,15 +85,21 @@ Session data: check `~/.codex/` for logs.
 cargo xtask run-agent --name opencode-r1 --agent opencode
 ```
 
-Under the hood: pipes prompt to `opencode` via stdin.
+### Cross-Language Comparison
 
-Session data: check `~/.opencode/` for session JSON.
+```bash
+cargo xtask run-agent --lang rust --name rust-r1 --mode levels &
+cargo xtask run-agent --lang scala --name scala-r1 --mode levels &
+cargo xtask run-agent --lang go --name go-r1 --mode levels &
+wait
+cargo xtask results
+```
 
 ## Execution Modes
 
 ### Full Mode (default)
 
-One agent session tackles all levels. Simple, but if the agent gets stuck it may burn budget.
+One agent session tackles all 23 levels. Simple, but if the agent gets stuck it may burn budget.
 
 ```bash
 cargo xtask run-agent --name claude-r1 --mode full
@@ -103,12 +119,20 @@ Benefits:
 - Per-level session dumps for granular analysis
 - Can compare "which level does agent X struggle on?"
 
-### Effort Limits
+### Turn Limits
 
-| Mechanism | Flag | Notes |
-|-----------|------|-------|
-| `--max-turns N` | All modes | Limits tool call rounds. Defaults: 60 (L1-9), 100 (L10-13), 160 (L14-16) |
-| Wall-clock timeout | `timeout 1h cargo xtask run-agent ...` | Hard kill from outside |
+| Levels | Default turns |
+|--------|--------------|
+| L01-L03 | 45 |
+| L04-L07 | 30 |
+| L08-L10 | 45 |
+| L11-L13 | 90 |
+| L14-L15 | 60 |
+| L16-L18 | 60 |
+| L19-L20 | 75 |
+| L21-L23 | 90 |
+
+Override with `--max-turns N`. Quality-gate cleanup pass: 15 turns.
 
 ### Resume & Recovery
 
@@ -122,25 +146,16 @@ cargo xtask run-agent --strategy default --name claude-r2 --mode levels --resume
 cargo xtask run-agent --name claude-r3 --mode levels --from-level 13
 ```
 
-Resume mode:
-- Reuses the existing worktree (no collision error)
-- Finds the latest results directory for the strategy+name
-- Skips levels with `status.txt` containing `PASSED`
-- Retries levels that were `FAILED` or incomplete
+Failed levels auto-retry up to 2 times if the failure was infrastructure (timeout/529/crash), not turns exhaustion.
 
 ### Git Checkpoints
 
 In levels mode, every passing level is automatically committed:
 ```
-checkpoint: L01 passed (51s)
-checkpoint: L02 passed (36s)
+checkpoint: L01 PASSED (130s)
+checkpoint: L02 PASSED (85s)
 ...
 ```
-
-This means:
-- You can `git log` in the worktree to see progress
-- You can `git checkout` any checkpoint to inspect/restore state
-- If a level fails, you can reset to the last good checkpoint
 
 ### Process Safety
 
@@ -157,12 +172,11 @@ Each invocation is self-contained (unique worktree, UUID, results dir). No share
 cargo xtask run-agent --strategy default --name claude-d1 --mode levels &
 cargo xtask run-agent --strategy quality-gate --name claude-q1 --mode levels &
 wait
-```
 
-Or compare agents:
-```bash
-cargo xtask run-agent --name claude-r1 --agent claude &
-cargo xtask run-agent --name codex-r1 --agent codex &
+# Compare languages
+cargo xtask run-agent --lang rust --name rust-r1 --mode levels &
+cargo xtask run-agent --lang scala --name scala-r1 --mode levels &
+cargo xtask run-agent --lang go --name go-r1 --mode levels &
 wait
 ```
 
@@ -176,14 +190,13 @@ cargo xtask watch
 cargo xtask watch --once
 
 # Filter by timestamp
-cargo xtask watch --ts 20260319
+cargo xtask watch --ts 20260321
 
 # Check progress in worktree
-git -C ../workspace/claude-r1 log --oneline -5
-git -C ../workspace/claude-r1 status
+git -C ../workspace/scala-r1 log --oneline -5
 
 # Tail agent output
-tail -f results/default_claude-r1_*/agent-output.txt
+tail -f results/default_scala-r1_*/L01/agent-output.txt
 ```
 
 ## Results
@@ -191,7 +204,7 @@ tail -f results/default_claude-r1_*/agent-output.txt
 ### View all results
 
 ```bash
-cargo xtask results
+cargo xtask results           # shows LANG column
 cargo xtask results --json    # machine-readable
 ```
 
@@ -202,55 +215,40 @@ cargo xtask tokens results/default_claude-r1_*    # single run
 cargo xtask tokens --all                           # all runs + comparison
 ```
 
+### Session analysis
+
+```bash
+cargo xtask session-turns <run>     # per-level turn/time/token analysis
+cargo xtask session-stats <run>     # quick overview
+cargo xtask session-dump <run>      # dump content (--thinking, --text, --tools)
+cargo xtask session-grep <run> <keywords...>  # keyword search
+cargo xtask session-tools <run>     # tool call timeline (--summary)
+cargo xtask compare <run1> <run2>   # side-by-side comparison
+```
+
 ### Results directory structure
 
 ```
 results/
-  default_claude-r1_20260319T120000/
-    meta.json           # run metadata (strategy, agent, score, timing)
+  default_scala-r1_20260321T120000/
+    meta.json           # run metadata (strategy, agent, lang, score, timing)
     agent-output.txt    # stdout from agent
-    session.jsonl       # full session transcript (Claude only)
+    session.jsonl       # full session transcript
     bench.log           # scoring output
-  quality-gate_claude-q1_20260319T130000/
-    meta.json
     L01/                # levels mode: per-level data
       agent-output.txt
       session.jsonl
-      test-result.txt
       status.txt
     L02/
       ...
-    bench.log
-```
-
-### Inspect meta.json
-
-```bash
-jq . results/default_claude-r1_*/meta.json
-```
-
-### Parse session JSONL (Claude)
-
-```bash
-# Count tool calls
-jq 'select(.type == "tool_use")' results/*/session.jsonl | jq -s 'length'
-
-# Extract thinking blocks
-jq 'select(.type == "thinking") | .text' results/*/session.jsonl
-
-# Find errors
-jq 'select(.type == "tool_result") | select(.is_error == true)' results/*/session.jsonl
-
-# Timeline of tool calls
-jq 'select(.type == "tool_use") | {tool: .name, input: .input | keys}' results/*/session.jsonl
 ```
 
 ## Cleanup
 
 ```bash
 # Remove a specific worktree + branch
-git worktree remove ../workspace/claude-r1
-git branch -D claude-r1
+git worktree remove ../workspace/scala-r1
+git branch -D scala-r1
 
 # Remove all bench worktrees
 git worktree list | grep workspace | awk '{print $1}' | xargs -I{} git worktree remove --force {}
@@ -259,37 +257,24 @@ git worktree list | grep workspace | awk '{print $1}' | xargs -I{} git worktree 
 git worktree prune
 
 # Clear results (careful!)
-rm -rf results/default_claude-r1_*
-```
-
-## Custom Prompts
-
-```bash
-cargo xtask run-agent --name custom-r1 \
-  --prompt "Implement only levels 1-5 of the Scheme interpreter. Follow CLAUDE.md. Run tests after each level."
-```
-
-## Comparing Strategies
-
-```bash
-cargo xtask run-agent --strategy default --name compare-d1 --mode levels &
-cargo xtask run-agent --strategy quality-gate --name compare-q1 --mode levels &
-wait
-cargo xtask results
-cargo xtask analyze results/default_compare-d1_* results/quality-gate_compare-q1_*
+rm -rf results/default_scala-r1_*
 ```
 
 ## All xtask Commands
 
 ```bash
-cargo xtask --help          # list all commands
-cargo xtask setup           # install deps + build container
-cargo xtask test 01         # run level tests
-cargo xtask bench main      # score a branch
-cargo xtask run-agent ...   # orchestrate agent run
-cargo xtask results         # list results
-cargo xtask tokens --all    # token usage + costs
-cargo xtask analyze --all   # request-level cost analysis
-cargo xtask watch           # live dashboard
-cargo xtask verify          # guile ground-truth checks
+cargo xtask --help                     # list all commands
+cargo xtask setup                      # install deps + build all container images
+cargo xtask test 01                    # run level tests (Rust default)
+cargo xtask test 01 --lang scala       # run level tests (Scala)
+cargo xtask test 01 --lang go --gate   # run with quality gate
+cargo xtask bench main                 # score a branch
+cargo xtask run-agent ...              # orchestrate agent run
+cargo xtask results                    # list results (with LANG column)
+cargo xtask tokens --all               # token usage + costs
+cargo xtask analyze --all              # request-level cost analysis
+cargo xtask watch                      # live dashboard
+cargo xtask verify                     # guile ground-truth checks
+cargo xtask session-turns <run>        # per-level analysis
+cargo xtask compare <run1> <run2>      # side-by-side comparison
 ```
