@@ -11,15 +11,24 @@ struct ContinuationData {
     id: u64,
     value: Value,
     remaining_forms: Vec<Value>,
+    body_frames: Vec<BodyFrame>,
+    callcc_span: Span,
+}
+
+#[derive(Debug, Clone)]
+struct BodyFrame {
+    remaining: Vec<Value>,
+    env: Env,
 }
 
 thread_local! {
     static OUTPUT: RefCell<String> = RefCell::new(String::new());
     static REMAINING_FORMS: RefCell<Vec<Value>> = RefCell::new(Vec::new());
     static CONT_DATA: RefCell<Option<ContinuationData>> = RefCell::new(None);
-    static REPLAY_VALUE: RefCell<Option<Value>> = RefCell::new(None);
+    static REPLAY_TARGET: RefCell<Option<(u64, Span, Value)>> = RefCell::new(None);
     static CONT_ID_COUNTER: Cell<u64> = Cell::new(0);
     static GENSYM_COUNTER: Cell<u64> = Cell::new(0);
+    static CONT_FRAMES: RefCell<Vec<BodyFrame>> = RefCell::new(Vec::new());
 }
 
 fn next_cont_id() -> u64 {
@@ -61,6 +70,7 @@ enum Value {
     Continuation {
         id: u64,
         remaining_forms: Vec<Value>,
+        body_frames: Vec<BodyFrame>,
         span: Span,
     },
     Macro {
@@ -521,8 +531,28 @@ fn eval(expr: &Value, env: &Env) -> Result<Value, EvalError> {
                             if args.is_empty() {
                                 return Ok(Value::Void);
                             }
-                            for a in &args[..args.len() - 1] {
-                                eval(a, &current_env)?;
+                            if args.len() > 1 {
+                                CONT_FRAMES.with(|cf| cf.borrow_mut().push(BodyFrame {
+                                    remaining: args[1..].to_vec(),
+                                    env: current_env.clone(),
+                                }));
+                                for (idx, a) in args[..args.len() - 1].iter().enumerate() {
+                                    if idx > 0 {
+                                        CONT_FRAMES.with(|cf| {
+                                            if let Some(frame) = cf.borrow_mut().last_mut() {
+                                                frame.remaining = args[idx + 1..].to_vec();
+                                            }
+                                        });
+                                    }
+                                    match eval(a, &current_env) {
+                                        Ok(_) => {}
+                                        Err(e) => {
+                                            CONT_FRAMES.with(|cf| cf.borrow_mut().pop());
+                                            return Err(e);
+                                        }
+                                    }
+                                }
+                                CONT_FRAMES.with(|cf| cf.borrow_mut().pop());
                             }
                             current_expr = args[args.len() - 1].clone();
                             continue;
@@ -651,8 +681,28 @@ fn eval(expr: &Value, env: &Env) -> Result<Value, EvalError> {
                                     env_set(&local_env, p.clone(), v.clone());
                                 }
                                 let body_exprs = &args[2..];
-                                for e in &body_exprs[..body_exprs.len() - 1] {
-                                    eval(e, &local_env)?;
+                                if body_exprs.len() > 1 {
+                                    CONT_FRAMES.with(|cf| cf.borrow_mut().push(BodyFrame {
+                                        remaining: body_exprs[1..].to_vec(),
+                                        env: local_env.clone(),
+                                    }));
+                                    for (idx, e) in body_exprs[..body_exprs.len() - 1].iter().enumerate() {
+                                        if idx > 0 {
+                                            CONT_FRAMES.with(|cf| {
+                                                if let Some(frame) = cf.borrow_mut().last_mut() {
+                                                    frame.remaining = body_exprs[idx + 1..].to_vec();
+                                                }
+                                            });
+                                        }
+                                        match eval(e, &local_env) {
+                                            Ok(_) => {}
+                                            Err(e) => {
+                                                CONT_FRAMES.with(|cf| cf.borrow_mut().pop());
+                                                return Err(e);
+                                            }
+                                        }
+                                    }
+                                    CONT_FRAMES.with(|cf| cf.borrow_mut().pop());
                                 }
                                 current_expr = body_exprs[body_exprs.len() - 1].clone();
                                 current_env = local_env;
@@ -694,8 +744,28 @@ fn eval(expr: &Value, env: &Env) -> Result<Value, EvalError> {
                                 }
                             }
                             let body = &args[1..];
-                            for e in &body[..body.len() - 1] {
-                                eval(e, &local_env)?;
+                            if body.len() > 1 {
+                                CONT_FRAMES.with(|cf| cf.borrow_mut().push(BodyFrame {
+                                    remaining: body[1..].to_vec(),
+                                    env: local_env.clone(),
+                                }));
+                                for (idx, e) in body[..body.len() - 1].iter().enumerate() {
+                                    if idx > 0 {
+                                        CONT_FRAMES.with(|cf| {
+                                            if let Some(frame) = cf.borrow_mut().last_mut() {
+                                                frame.remaining = body[idx + 1..].to_vec();
+                                            }
+                                        });
+                                    }
+                                    match eval(e, &local_env) {
+                                        Ok(_) => {}
+                                        Err(e) => {
+                                            CONT_FRAMES.with(|cf| cf.borrow_mut().pop());
+                                            return Err(e);
+                                        }
+                                    }
+                                }
+                                CONT_FRAMES.with(|cf| cf.borrow_mut().pop());
                             }
                             current_expr = body[body.len() - 1].clone();
                             current_env = local_env;
@@ -764,11 +834,11 @@ fn eval(expr: &Value, env: &Env) -> Result<Value, EvalError> {
                         }
                         return eval_callcc(&args[0], form_span);
                     }
-                    Value::Continuation { id, ref remaining_forms, .. } => {
+                    Value::Continuation { id, ref remaining_forms, ref body_frames, span, .. } => {
                         if args.len() != 1 {
                             return Err(EvalError::WrongArgCount { expected: "1".into(), got: args.len(), at: form_span });
                         }
-                        return invoke_continuation(id, remaining_forms, args[0].clone());
+                        return invoke_continuation(id, remaining_forms, body_frames, span, args[0].clone());
                     }
                     Value::Lambda {
                         ref params,
@@ -803,8 +873,28 @@ fn eval(expr: &Value, env: &Env) -> Result<Value, EvalError> {
                         if body.is_empty() {
                             return Ok(Value::Void);
                         }
-                        for e in &body[..body.len() - 1] {
-                            eval(e, &local_env)?;
+                        if body.len() > 1 {
+                            CONT_FRAMES.with(|cf| cf.borrow_mut().push(BodyFrame {
+                                remaining: body[1..].to_vec(),
+                                env: local_env.clone(),
+                            }));
+                            for (idx, e) in body[..body.len() - 1].iter().enumerate() {
+                                if idx > 0 {
+                                    CONT_FRAMES.with(|cf| {
+                                        if let Some(frame) = cf.borrow_mut().last_mut() {
+                                            frame.remaining = body[idx + 1..].to_vec();
+                                        }
+                                    });
+                                }
+                                match eval(e, &local_env) {
+                                    Ok(_) => {}
+                                    Err(e) => {
+                                        CONT_FRAMES.with(|cf| cf.borrow_mut().pop());
+                                        return Err(e);
+                                    }
+                                }
+                            }
+                            CONT_FRAMES.with(|cf| cf.borrow_mut().pop());
                         }
                         current_expr = body[body.len() - 1].clone();
                         current_env = local_env;
@@ -826,18 +916,33 @@ fn eval(expr: &Value, env: &Env) -> Result<Value, EvalError> {
 }
 
 fn eval_callcc(proc: &Value, form_span: Span) -> Result<Value, EvalError> {
-    let replay = REPLAY_VALUE.with(|rv| rv.borrow_mut().take());
+    let id = next_cont_id();
+    // Check if this call/cc is the target of a replay (match by id AND span)
+    let replay = REPLAY_TARGET.with(|rt| {
+        let should_take = rt.borrow().as_ref()
+            .map(|(tid, tspan, _)| *tid == id && *tspan == form_span)
+            .unwrap_or(false);
+        if should_take {
+            rt.borrow_mut().take().map(|(_, _, v)| v)
+        } else {
+            None
+        }
+    });
     if let Some(val) = replay {
         return Ok(val);
     }
-    let id = next_cont_id();
     let remaining = REMAINING_FORMS.with(|rf| rf.borrow().clone());
+    let body_frames = CONT_FRAMES.with(|cf| cf.borrow().clone());
     let cont = Value::Continuation {
         id,
         remaining_forms: remaining,
+        body_frames,
         span: form_span,
     };
-    match apply_function(proc, &[cont], form_span) {
+    let saved_depth = CONT_FRAMES.with(|cf| cf.borrow().len());
+    let result = apply_function(proc, &[cont], form_span);
+    CONT_FRAMES.with(|cf| cf.borrow_mut().truncate(saved_depth));
+    match result {
         Ok(val) => Ok(val),
         Err(EvalError::ContinuationReturn) => {
             let matches = CONT_DATA.with(|cd| {
@@ -854,12 +959,14 @@ fn eval_callcc(proc: &Value, form_span: Span) -> Result<Value, EvalError> {
     }
 }
 
-fn invoke_continuation(id: u64, remaining_forms: &[Value], value: Value) -> Result<Value, EvalError> {
+fn invoke_continuation(id: u64, remaining_forms: &[Value], body_frames: &[BodyFrame], callcc_span: Span, value: Value) -> Result<Value, EvalError> {
     CONT_DATA.with(|cd| {
         *cd.borrow_mut() = Some(ContinuationData {
             id,
             value,
             remaining_forms: remaining_forms.to_vec(),
+            body_frames: body_frames.to_vec(),
+            callcc_span,
         })
     });
     Err(EvalError::ContinuationReturn)
@@ -894,8 +1001,32 @@ fn apply_function(func: &Value, args: &[Value], call_span: Span) -> Result<Value
                 env_set(&local_env, rp.clone(), Value::List(rest, call_span));
             }
             let mut result = Value::Void;
-            for expr in body {
-                result = eval(expr, &local_env)?;
+            if body.len() > 1 {
+                CONT_FRAMES.with(|cf| cf.borrow_mut().push(BodyFrame {
+                    remaining: body[1..].to_vec(),
+                    env: local_env.clone(),
+                }));
+                for (idx, expr) in body.iter().enumerate() {
+                    if idx > 0 {
+                        CONT_FRAMES.with(|cf| {
+                            if let Some(frame) = cf.borrow_mut().last_mut() {
+                                frame.remaining = body[idx + 1..].to_vec();
+                            }
+                        });
+                    }
+                    match eval(expr, &local_env) {
+                        Ok(val) => result = val,
+                        Err(e) => {
+                            CONT_FRAMES.with(|cf| cf.borrow_mut().pop());
+                            return Err(e);
+                        }
+                    }
+                }
+                CONT_FRAMES.with(|cf| cf.borrow_mut().pop());
+            } else {
+                for expr in body {
+                    result = eval(expr, &local_env)?;
+                }
             }
             Ok(result)
         }
@@ -905,11 +1036,11 @@ fn apply_function(func: &Value, args: &[Value], call_span: Span) -> Result<Value
             }
             eval_callcc(&args[0], call_span)
         }
-        Value::Continuation { id, ref remaining_forms, .. } => {
+        Value::Continuation { id, ref remaining_forms, ref body_frames, span, .. } => {
             if args.len() != 1 {
                 return Err(EvalError::WrongArgCount { expected: "1".into(), got: args.len(), at: call_span });
             }
-            invoke_continuation(*id, remaining_forms, args[0].clone())
+            invoke_continuation(*id, remaining_forms, body_frames, *span, args[0].clone())
         }
         Value::Builtin(name, _) => eval_builtin_with_values(name, args, call_span),
         _ => Err(EvalError::NotAProcedure(
@@ -1945,10 +2076,12 @@ fn expect_integer(v: &Value) -> Result<i64, EvalError> {
 pub fn eval_str(input: &str) -> Result<String, EvalError> {
     // Clear continuation state
     CONT_DATA.with(|cd| *cd.borrow_mut() = None);
-    REPLAY_VALUE.with(|rv| *rv.borrow_mut() = None);
+    REPLAY_TARGET.with(|rt| *rt.borrow_mut() = None);
     REMAINING_FORMS.with(|rf| rf.borrow_mut().clear());
     CONT_ID_COUNTER.with(|c| c.set(0));
     GENSYM_COUNTER.with(|c| c.set(0));
+    CONT_FRAMES.with(|cf| cf.borrow_mut().clear());
+
 
     let exprs = parse_all(input)?;
     let env = default_env();
@@ -1962,10 +2095,12 @@ pub fn eval_str_with_output(input: &str) -> Result<(String, String), EvalError> 
     OUTPUT.with(|o| o.borrow_mut().clear());
     // Clear continuation state
     CONT_DATA.with(|cd| *cd.borrow_mut() = None);
-    REPLAY_VALUE.with(|rv| *rv.borrow_mut() = None);
+    REPLAY_TARGET.with(|rt| *rt.borrow_mut() = None);
     REMAINING_FORMS.with(|rf| rf.borrow_mut().clear());
     CONT_ID_COUNTER.with(|c| c.set(0));
     GENSYM_COUNTER.with(|c| c.set(0));
+    CONT_FRAMES.with(|cf| cf.borrow_mut().clear());
+
 
     let exprs = parse_all(input)?;
     let env = default_env();
@@ -1991,7 +2126,8 @@ fn eval_top_level(exprs: &[Value], env: &Env) -> Result<Value, EvalError> {
             Err(EvalError::ContinuationReturn) => {
                 let data = CONT_DATA.with(|cd| cd.borrow_mut().take())
                     .expect("ContinuationReturn without data");
-                REPLAY_VALUE.with(|rv| *rv.borrow_mut() = Some(data.value));
+                CONT_FRAMES.with(|cf| cf.borrow_mut().clear());
+                REPLAY_TARGET.with(|rt| *rt.borrow_mut() = Some((data.id, data.callcc_span, data.value)));
                 CONT_ID_COUNTER.with(|c| c.set(0));
                 forms = data.remaining_forms;
                 i = 0;
