@@ -167,8 +167,8 @@ object Evaluator:
         Done(Forms.makeLambda(args, env), env, out)
       case Value.Symbol("case-lambda", _) =>
         Done(Forms.makeCaseLambda(args, env), env, out)
-      case Value.Symbol("do", _)      => Forms.evalDo(args, env, out)
-      case Value.Symbol("let", _)     => Forms.evalLet(args, env, out)
+      case Value.Symbol("do", _)      => BindingForms.evalDo(args, env, out)
+      case Value.Symbol("let", _)     => BindingForms.evalLet(args, env, out)
       case Value.Symbol("letrec", _)  => CondForms.evalLetrec(args, env, out)
       case Value.Symbol("letrec*", _) => CondForms.evalLetrecStar(args, env, out)
       case Value.Symbol("case", _)    => CondForms.evalCase(args, env, out)
@@ -206,6 +206,10 @@ object Evaluator:
         SyntaxCase.evalWithSyntax(args, env, out)
       case Value.Symbol("define-record-type", _) =>
         Records.evalDefineRecordType(args, env, pos, out)
+      case Value.Symbol("let-values", _) =>
+        BindingForms.evalLetValues(args, env, out)
+      case Value.Symbol("receive", _) =>
+        BindingForms.evalReceive(args, env, out)
       case _ =>
         val (proc, _, out2) = eval(op, env, out)
         proc match

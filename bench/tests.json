@@ -1560,5 +1560,40 @@
     "fixture": "l25_do_vector_fill.scm",
     "kind": "eval_str_ok",
     "expected": "#(0 1 4 9 16)"
+  },
+  {
+    "name": "l26_let_values_basic",
+    "level": 26,
+    "fixture": "l26_let_values_basic.scm",
+    "kind": "eval_str_ok",
+    "expected": "6"
+  },
+  {
+    "name": "l26_let_values_multi",
+    "level": 26,
+    "fixture": "l26_let_values_multi.scm",
+    "kind": "eval_str_ok",
+    "expected": "#t"
+  },
+  {
+    "name": "l26_let_values_nested",
+    "level": 26,
+    "fixture": "l26_let_values_nested.scm",
+    "kind": "eval_str_ok",
+    "expected": "#t"
+  },
+  {
+    "name": "l26_receive_basic",
+    "level": 26,
+    "fixture": "l26_receive_basic.scm",
+    "kind": "eval_str_ok",
+    "expected": "(1 2 3)"
+  },
+  {
+    "name": "l26_receive_rest",
+    "level": 26,
+    "fixture": "l26_receive_rest.scm",
+    "kind": "eval_str_ok",
+    "expected": "(2 3)"
   }
 ]
