@@ -318,43 +318,84 @@ fn should_skip_level(resume: bool, level_dir: &Path, level: &str) -> bool {
     false
 }
 
+/// Maximum number of automatic retries when the agent fails for infrastructure
+/// reasons (API timeout, 529, crash) rather than exhausting its turn budget.
+const MAX_INFRA_RETRIES: u32 = 2;
+
+/// Check whether the agent output indicates it ran out of turns (not retryable)
+/// vs an infrastructure failure like timeout/529/crash (retryable).
+fn agent_exhausted_turns(output_file: &Path) -> bool {
+    fs::read_to_string(output_file)
+        .map(|c| c.contains("Reached max turns"))
+        .unwrap_or(false)
+}
+
 /// Returns (agent_exit, duration_secs, status_label).
 fn run_single_level(
     args: &RunAgentArgs, agent_workdir: &Path, worktree_dir: &Path,
     level_dir: &Path, level: &str,
 ) -> Result<(i32, i64, String)> {
-    fs::create_dir_all(level_dir).map_err(|e| Error::io(level_dir, e))?;
-
-    let level_num: u32 = level.parse().expect("level constant not a number");
-    let level_uuid = uuid_v4();
-    let level_turns = turns_for_level(level_num, args.max_turns);
-
-    println!();
-    println!("--- Level {level} (max {level_turns} turns) ---");
-
-    let level_prompt = build_level_prompt(level, worktree_dir, level_dir.parent().expect("level_dir has parent"));
     let level_start = Instant::now();
-    let agent_exit = launch_agent(
-        &args.agent, agent_workdir, &level_prompt, &level_uuid,
-        &level_dir.join("agent-output.txt"), Some(level_turns), args.model.as_deref(),
-    );
+    let mut attempt = 0u32;
 
-    capture_session(&args.agent, &level_uuid, level_dir);
+    loop {
+        if attempt > 0 {
+            // Clean up previous attempt's level_dir contents for a fresh retry
+            let _ = fs::remove_dir_all(level_dir);
+        }
+        fs::create_dir_all(level_dir).map_err(|e| Error::io(level_dir, e))?;
 
-    let mut test_exit = run_level_tests(worktree_dir, level);
+        let level_num: u32 = level.parse().expect("level constant not a number");
+        let level_uuid = uuid_v4();
+        let level_turns = turns_for_level(level_num, args.max_turns);
 
-    if test_exit == 0 && worktree_dir.join("bench/clippy.toml").is_file() {
-        test_exit = run_quality_gate_cleanup(args, agent_workdir, worktree_dir, level_dir, level);
+        if attempt == 0 {
+            println!();
+            println!("--- Level {level} (max {level_turns} turns) ---");
+        } else {
+            println!();
+            println!("--- Level {level} RETRY {attempt}/{MAX_INFRA_RETRIES} (max {level_turns} turns) ---");
+        }
+
+        let level_prompt = build_level_prompt(level, worktree_dir, level_dir.parent().expect("level_dir has parent"));
+        let agent_exit = launch_agent(
+            &args.agent, agent_workdir, &level_prompt, &level_uuid,
+            &level_dir.join("agent-output.txt"), Some(level_turns), args.model.as_deref(),
+        );
+
+        capture_session(&args.agent, &level_uuid, level_dir);
+
+        let mut test_exit = run_level_tests(worktree_dir, level);
+
+        if test_exit == 0 && worktree_dir.join("bench/clippy.toml").is_file() {
+            test_exit = run_quality_gate_cleanup(args, agent_workdir, worktree_dir, level_dir, level);
+        }
+
+        if test_exit == 0 {
+            // Success
+            let level_duration = level_start.elapsed().as_secs() as i64;
+            let status_msg = format!("Level {level} PASSED ({level_duration}s)");
+            println!("{status_msg}");
+            let _ = fs::write(level_dir.join("status.txt"), &status_msg);
+            return Ok((agent_exit, level_duration, "PASSED".to_string()));
+        }
+
+        // Failed — decide whether to retry
+        let output_file = level_dir.join("agent-output.txt");
+        let exhausted = agent_exhausted_turns(&output_file);
+
+        if exhausted || attempt >= MAX_INFRA_RETRIES {
+            let reason = if exhausted { "turns exhausted" } else { "max retries reached" };
+            let level_duration = level_start.elapsed().as_secs() as i64;
+            let status_msg = format!("Level {level} FAILED ({level_duration}s) [{reason}]");
+            println!("{status_msg}");
+            let _ = fs::write(level_dir.join("status.txt"), &status_msg);
+            return Ok((agent_exit, level_duration, "FAILED".to_string()));
+        }
+
+        println!("Level {level} failed (infra issue, not turns) — will retry");
+        attempt += 1;
     }
-
-    let level_duration = level_start.elapsed().as_secs() as i64;
-    let status_label = if test_exit == 0 { "PASSED" } else { "FAILED" };
-
-    let status_msg = format!("Level {level} {status_label} ({level_duration}s)");
-    println!("{status_msg}");
-    let _ = fs::write(level_dir.join("status.txt"), &status_msg);
-
-    Ok((agent_exit, level_duration, status_label.to_string()))
 }
 
 fn run_level_tests(worktree_dir: &Path, level: &str) -> i32 {

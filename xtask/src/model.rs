@@ -343,14 +343,19 @@ pub const LEVELS: [&str; 30] = [
 // ---------------------------------------------------------------------------
 
 /// Default turn limit for a given level number.
+///
+/// Three tiers based on observed difficulty:
+///   L01-L09 (basics)         → 30 turns
+///   L10-L16, L22-L30 (medium) → 45 turns
+///   L17-L21 (hard: TCO, call/cc, macros) → 75 turns
 pub fn turns_for_level(level_num: u32, max_turns: Option<u32>) -> u32 {
     if let Some(t) = max_turns {
         return t;
     }
-    if level_num <= 9 {
-        40
-    } else {
-        60
+    match level_num {
+        1..=9 => 30,
+        17..=21 => 75,
+        _ => 45,
     }
 }
 
