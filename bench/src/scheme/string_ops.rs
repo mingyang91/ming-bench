@@ -238,3 +238,87 @@ pub fn eval_string_ref(args: &[Value], env: &Rc<Env>) -> Result<Value, EvalError
         got: format!("{k}"),
     })
 }
+
+fn expect_char(val: &Value) -> Result<char, EvalError> {
+    match val {
+        Value::Char(c) => Ok(*c),
+        other => Err(EvalError::TypeError {
+            expected: "char".into(),
+            got: format!("{other}"),
+        }),
+    }
+}
+
+/// Evaluate `(char=? c1 c2)` — character equality.
+pub fn eval_char_eq(args: &[Value], env: &Rc<Env>) -> Result<Value, EvalError> {
+    let [a_expr, b_expr] = args else {
+        return Err(EvalError::WrongArgCount {
+            expected: "2".into(),
+            got: args.len(),
+        });
+    };
+    let a = expect_char(&eval(a_expr, env)?)?;
+    let b = expect_char(&eval(b_expr, env)?)?;
+    Ok(Value::Boolean(a == b))
+}
+
+/// Evaluate `(char<? c1 c2)` — character ordering.
+pub fn eval_char_lt(args: &[Value], env: &Rc<Env>) -> Result<Value, EvalError> {
+    let [a_expr, b_expr] = args else {
+        return Err(EvalError::WrongArgCount {
+            expected: "2".into(),
+            got: args.len(),
+        });
+    };
+    let a = expect_char(&eval(a_expr, env)?)?;
+    let b = expect_char(&eval(b_expr, env)?)?;
+    Ok(Value::Boolean(a < b))
+}
+
+/// Evaluate `(char-alphabetic? c)`.
+pub fn eval_char_alphabetic(args: &[Value], env: &Rc<Env>) -> Result<Value, EvalError> {
+    let [c_expr] = args else {
+        return Err(EvalError::WrongArgCount {
+            expected: "1".into(),
+            got: args.len(),
+        });
+    };
+    let c = expect_char(&eval(c_expr, env)?)?;
+    Ok(Value::Boolean(c.is_ascii_alphabetic()))
+}
+
+/// Evaluate `(char-numeric? c)`.
+pub fn eval_char_numeric(args: &[Value], env: &Rc<Env>) -> Result<Value, EvalError> {
+    let [c_expr] = args else {
+        return Err(EvalError::WrongArgCount {
+            expected: "1".into(),
+            got: args.len(),
+        });
+    };
+    let c = expect_char(&eval(c_expr, env)?)?;
+    Ok(Value::Boolean(c.is_ascii_digit()))
+}
+
+/// Evaluate `(char-upcase c)`.
+pub fn eval_char_upcase(args: &[Value], env: &Rc<Env>) -> Result<Value, EvalError> {
+    let [c_expr] = args else {
+        return Err(EvalError::WrongArgCount {
+            expected: "1".into(),
+            got: args.len(),
+        });
+    };
+    let c = expect_char(&eval(c_expr, env)?)?;
+    Ok(Value::Char(c.to_ascii_uppercase()))
+}
+
+/// Evaluate `(char-downcase c)`.
+pub fn eval_char_downcase(args: &[Value], env: &Rc<Env>) -> Result<Value, EvalError> {
+    let [c_expr] = args else {
+        return Err(EvalError::WrongArgCount {
+            expected: "1".into(),
+            got: args.len(),
+        });
+    };
+    let c = expect_char(&eval(c_expr, env)?)?;
+    Ok(Value::Char(c.to_ascii_lowercase()))
+}

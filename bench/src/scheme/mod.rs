@@ -23,10 +23,11 @@ use list_ops::{
     eval_length, eval_list, eval_null_q, eval_type_pred,
 };
 use string_ops::{
-    eval_char_to_integer, eval_integer_to_char, eval_list_to_string, eval_number_to_string,
-    eval_string_append, eval_string_copy, eval_string_length, eval_string_ref, eval_string_set,
-    eval_string_to_list, eval_string_to_number, eval_string_to_symbol, eval_substring,
-    eval_symbol_to_string,
+    eval_char_alphabetic, eval_char_downcase, eval_char_eq, eval_char_lt, eval_char_numeric,
+    eval_char_to_integer, eval_char_upcase, eval_integer_to_char, eval_list_to_string,
+    eval_number_to_string, eval_string_append, eval_string_copy, eval_string_length,
+    eval_string_ref, eval_string_set, eval_string_to_list, eval_string_to_number,
+    eval_string_to_symbol, eval_substring, eval_symbol_to_string,
 };
 use io_ops::{eval_display, eval_map, eval_newline, eval_write};
 use special_forms::{
@@ -181,6 +182,20 @@ fn eval_list_form(elements: &[Value], env: &Rc<Env>) -> Result<Trampoline, EvalE
         }
         Value::Symbol(op) if op == "integer->char" => {
             eval_integer_to_char(args, env).map(Trampoline::Done)
+        }
+        Value::Symbol(op) if op == "char=?" => eval_char_eq(args, env).map(Trampoline::Done),
+        Value::Symbol(op) if op == "char<?" => eval_char_lt(args, env).map(Trampoline::Done),
+        Value::Symbol(op) if op == "char-alphabetic?" => {
+            eval_char_alphabetic(args, env).map(Trampoline::Done)
+        }
+        Value::Symbol(op) if op == "char-numeric?" => {
+            eval_char_numeric(args, env).map(Trampoline::Done)
+        }
+        Value::Symbol(op) if op == "char-upcase" => {
+            eval_char_upcase(args, env).map(Trampoline::Done)
+        }
+        Value::Symbol(op) if op == "char-downcase" => {
+            eval_char_downcase(args, env).map(Trampoline::Done)
         }
         Value::Symbol(op) if op == "map" => eval_map(args, env).map(Trampoline::Done),
         Value::Symbol(op) if op == "display" => eval_display(args, env).map(Trampoline::Done),
