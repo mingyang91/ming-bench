@@ -429,6 +429,34 @@ pub fn apply_integer_to_char(args: &[Value]) -> Result<Value, EvalError> {
     Ok(Value::Char(ch))
 }
 
+pub fn apply_equal(args: &[Value]) -> Result<Value, EvalError> {
+    let [a, b] = args else {
+        return Err(EvalError::WrongArgCount {
+            expected: 2,
+            got: args.len(),
+        });
+    };
+    Ok(Value::Boolean(a == b))
+}
+
+pub fn apply_eq(args: &[Value]) -> Result<Value, EvalError> {
+    let [a, b] = args else {
+        return Err(EvalError::WrongArgCount {
+            expected: 2,
+            got: args.len(),
+        });
+    };
+    let result = match (a, b) {
+        (Value::Integer(x), Value::Integer(y)) => x == y,
+        (Value::Boolean(x), Value::Boolean(y)) => x == y,
+        (Value::Symbol(x), Value::Symbol(y)) => x == y,
+        (Value::Char(x), Value::Char(y)) => x == y,
+        (Value::Nil, Value::Nil) => true,
+        _ => std::ptr::eq(a as *const Value, b as *const Value),
+    };
+    Ok(Value::Boolean(result))
+}
+
 pub fn apply_length(args: &[Value]) -> Result<Value, EvalError> {
     let [val] = args else {
         return Err(EvalError::WrongArgCount {
