@@ -7,6 +7,7 @@ pub fn is_builtin(name: &str) -> bool {
         name,
         "+" | "-" | "*" | "/" | "<" | ">" | "=" | "<=" | ">=" | "not"
             | "cons" | "car" | "cdr" | "null?" | "list" | "length"
+            | "boolean?" | "number?" | "pair?" | "string?" | "symbol?"
     )
 }
 
@@ -21,6 +22,7 @@ pub fn apply_builtin(name: &str, args: &[Value], env: &mut Env) -> Result<Value,
         "null?" => apply_null(args, env),
         "list" => apply_list(args, env),
         "length" => apply_length(args, env),
+        "boolean?" | "number?" | "pair?" | "string?" | "symbol?" => apply_type_pred(name, args, env),
         _ => Err(EvalError::UnboundVariable {
             name: name.to_string(),
         }),
@@ -159,6 +161,22 @@ fn apply_length(args: &[Value], env: &mut Env) -> Result<Value, EvalError> {
             got: format!("{other}"),
         }),
     }
+}
+
+fn apply_type_pred(name: &str, args: &[Value], env: &mut Env) -> Result<Value, EvalError> {
+    let [arg] = args else {
+        return Err(EvalError::WrongArgCount { expected: 1, got: args.len() });
+    };
+    let val = eval(arg, env)?;
+    let result = match name {
+        "boolean?" => matches!(val, Value::Boolean(_)),
+        "number?" => matches!(val, Value::Integer(_)),
+        "pair?" => matches!(val, Value::List(ref items) if !items.is_empty()),
+        "string?" => matches!(val, Value::String(_)),
+        "symbol?" => matches!(val, Value::Symbol(_)),
+        _ => unreachable!("apply_type_pred called with unknown predicate"),
+    };
+    Ok(Value::Boolean(result))
 }
 
 fn apply_comparison(op: &str, args: &[Value], env: &mut Env) -> Result<Value, EvalError> {
