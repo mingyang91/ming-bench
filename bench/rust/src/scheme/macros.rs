@@ -9,6 +9,7 @@ use crate::scheme::value::Value;
 const SPECIAL_FORMS: &[&str] = &[
     "define",
     "define-syntax",
+    "define-record-type",
     "quote",
     "lambda",
     "set!",
@@ -18,8 +19,16 @@ const SPECIAL_FORMS: &[&str] = &[
     "and",
     "or",
     "let",
+    "let*",
+    "letrec",
     "call/cc",
     "call-with-current-continuation",
+    "call-with-values",
+    "dynamic-wind",
+    "guard",
+    "raise",
+    "with-exception-handler",
+    "values",
     "string-set!",
 ];
 
@@ -37,7 +46,7 @@ pub fn expand_macro(
     def_env: &Rc<RefCell<Env>>,
     input: &[Value],
     counter: &mut u64,
-) -> Result<Value, EvalError> {
+) -> Result<Expansion, EvalError> {
     let args = &input[1..];
     for (pattern_elems, template) in rules {
         let pat = &pattern_elems[1..];
@@ -160,12 +169,19 @@ pub fn match_single(
     }
 }
 
+/// Result of macro instantiation: expanded form + hygiene bindings to inject.
+pub struct Expansion {
+    pub expanded: Value,
+    /// (gensym_name, value) pairs to inject into the use-site environment.
+    pub hygiene_bindings: Vec<(String, Value)>,
+}
+
 pub fn instantiate(
     template: &Value,
     bindings: &Bindings,
     def_env: &Rc<RefCell<Env>>,
     counter: &mut u64,
-) -> Result<Value, EvalError> {
+) -> Result<Expansion, EvalError> {
     let pattern_vars: HashSet<&String> = bindings.keys().collect();
     let mut gensym_map: HashMap<String, String> = HashMap::new();
     collect_introduced(template, &pattern_vars, &mut gensym_map, counter);
@@ -177,19 +193,10 @@ pub fn instantiate(
         .filter_map(|(orig, gs)| def_env.borrow().get(orig).map(|val| (gs.clone(), val)))
         .collect();
 
-    if hygiene_bindings.is_empty() {
-        Ok(expanded)
-    } else {
-        let binding_forms: Vec<Value> = hygiene_bindings
-            .into_iter()
-            .map(|(name, val)| Value::List(vec![Value::Symbol(name), val]))
-            .collect();
-        Ok(Value::List(vec![
-            Value::Symbol("let".into()),
-            Value::List(binding_forms),
-            expanded,
-        ]))
-    }
+    Ok(Expansion {
+        expanded,
+        hygiene_bindings,
+    })
 }
 
 pub fn collect_introduced(

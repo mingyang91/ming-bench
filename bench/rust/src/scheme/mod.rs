@@ -86,7 +86,10 @@ fn eval_expr_sequence(
                 out.borrow_mut().resume = None;
             }
             Err(EvalError::ContinuationReturn { id, value }) => {
-                out.borrow_mut().body_stack.clear();
+                let mut st = out.borrow_mut();
+                st.body_stack.clear();
+                st.next_frame_id = 0;
+                drop(st);
                 let idx = handle_continuation(id, *value, out);
                 return Ok(EvalStep::Restart(idx));
             }

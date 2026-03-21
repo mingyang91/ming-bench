@@ -10,19 +10,20 @@ use crate::scheme::value::{Value, list_from_vec, make_pair};
 
 /// A snapshot of a body being evaluated — used for continuation path matching.
 pub struct BodyFrame {
-    pub env: Rc<RefCell<Env>>,
     /// Index of the expression currently being evaluated.
     pub current_pos: usize,
+    /// Monotonic frame ID, deterministic across replays.
+    pub frame_id: u64,
 }
 
-/// Identity path of a call/cc site: sequence of (body_pos, env_ptr).
+/// Identity path of a call/cc site: sequence of (body_pos, frame_id).
 /// Two call/cc invocations with the same path are the "same" call/cc.
-type CallPath = Vec<(usize, usize)>;
+type CallPath = Vec<(usize, u64)>;
 
 fn make_call_path(body_stack: &[BodyFrame]) -> CallPath {
     body_stack
         .iter()
-        .map(|f| (f.current_pos, Rc::as_ptr(&f.env) as usize))
+        .map(|f| (f.current_pos, f.frame_id))
         .collect()
 }
 
@@ -43,6 +44,8 @@ pub struct InterpState {
     pub next_record_type_id: u64,
     /// Pending hygiene gensym mappings from syntax-case (orig_name → gensym_name).
     pub pending_hygiene: Vec<(String, String)>,
+    /// Monotonic counter for deterministic frame IDs.
+    pub next_frame_id: u64,
 }
 
 impl InterpState {
@@ -58,6 +61,7 @@ impl InterpState {
             body_stack: Vec::new(),
             next_record_type_id: 0,
             pending_hygiene: Vec::new(),
+            next_frame_id: 0,
         }
     }
 }
@@ -93,6 +97,14 @@ fn check_arity(
         });
     }
     Ok(())
+}
+
+/// Package continuation arguments: 1 arg → value, multiple → Values.
+fn continuation_value_from_args(args: Vec<Value>) -> Value {
+    match args.len() {
+        1 => args.into_iter().next().expect("checked length"),
+        _ => Value::Values(args),
+    }
 }
 
 /// Evaluate a single parsed expression in the given environment.
@@ -213,9 +225,12 @@ fn try_expand_macro_tail(
             ref def_env,
         }) => {
             let mut counter = out.borrow().gensym_counter;
-            let expanded = macros::expand_macro(literals, rules, def_env, items, &mut counter)?;
+            let expansion = macros::expand_macro(literals, rules, def_env, items, &mut counter)?;
             out.borrow_mut().gensym_counter = counter;
-            Ok(TailAction::TailEval(expanded, Rc::clone(env)))
+            for (gs_name, val) in expansion.hygiene_bindings {
+                env.borrow_mut().define(gs_name, val);
+            }
+            Ok(TailAction::TailEval(expansion.expanded, Rc::clone(env)))
         }
         Some(Value::TransformerMacro { ref transformer }) => {
             let expanded = call_transformer(transformer, items, env, out)?;
@@ -440,13 +455,8 @@ fn eval_raise(
     })
 }
 
-/// Evaluate `guard`: (guard (var clause ...) body ...)
-/// Each clause is (test expr ...) or (else expr ...).
-fn eval_guard(
-    args: &[Value],
-    env: &Rc<RefCell<Env>>,
-    out: &Output,
-) -> Result<TailAction, EvalError> {
+/// Parse guard arguments into (var_name, clauses, body).
+fn parse_guard_args(args: &[Value]) -> Result<(String, Vec<Value>, Vec<Value>), EvalError> {
     let Some((clauses_form, body)) = args.split_first() else {
         return Err(EvalError::Parse {
             message: "guard: expected (var clause ...) body".into(),
@@ -467,21 +477,142 @@ fn eval_guard(
             message: "guard: variable must be a symbol".into(),
         });
     };
+    Ok((var_name.clone(), clauses.to_vec(), body.to_vec()))
+}
 
-    // Evaluate body, catching RaisedException
-    let body_result = eval_body(body, env, out);
-    match body_result {
-        Ok(val) => Ok(TailAction::Return(val)),
-        Err(EvalError::RaisedException { value }) => {
-            // Bind the exception value to var_name and test clauses
-            let guard_env = Env::extend(env);
-            guard_env
-                .borrow_mut()
-                .define(var_name.clone(), *value.clone());
-            eval_guard_clauses(clauses, *value, &guard_env, out)
+/// Result of the guard trampoline's inner loop.
+enum GuardTrampResult {
+    /// The trampoline produced a final result.
+    Finished(Result<TailAction, EvalError>),
+    /// A nested guard form was encountered; restart with new parameters.
+    RestartGuard {
+        var_name: String,
+        clauses: Vec<Value>,
+        body: Vec<Value>,
+        env: Rc<RefCell<Env>>,
+    },
+}
+
+/// If `expr` is a `(guard ...)` form, parse it and return a trampoline result.
+fn try_intercept_guard(expr: &Value, env: &Rc<RefCell<Env>>) -> Option<GuardTrampResult> {
+    let Value::List(items) = expr else { return None };
+    if !is_guard_form(items) { return None; }
+    Some(match parse_guard_args(&items[1..]) {
+        Ok((v, c, b)) => GuardTrampResult::RestartGuard {
+            var_name: v, clauses: c, body: b, env: Rc::clone(env),
+        },
+        Err(e) => GuardTrampResult::Finished(Err(e)),
+    })
+}
+
+/// Run a local trampoline for the guard tail expression, catching exceptions.
+/// Returns `RestartGuard` when a nested guard form is encountered.
+fn run_guard_trampoline(
+    mut current_expr: Value,
+    mut current_env: Rc<RefCell<Env>>,
+    var_name: &str,
+    clauses: &[Value],
+    guard_env: &Rc<RefCell<Env>>,
+    out: &Output,
+) -> GuardTrampResult {
+    loop {
+        if let Some(result) = try_intercept_guard(&current_expr, &current_env) {
+            return result;
         }
-        Err(e) => Err(e),
+        let step = match &current_expr {
+            Value::List(items) => eval_list_tail(items, &current_env, out),
+            Value::Symbol(name) => current_env
+                .borrow()
+                .get(name)
+                .ok_or_else(|| EvalError::UnboundVariable { name: name.clone() })
+                .map(TailAction::Return),
+            _ => Ok(TailAction::Return(current_expr.clone())),
+        };
+        match step {
+            Ok(TailAction::Return(val)) => {
+                return GuardTrampResult::Finished(Ok(TailAction::Return(val)));
+            }
+            Ok(TailAction::TailEval(expr, env)) => {
+                current_expr = expr;
+                current_env = env;
+            }
+            Err(EvalError::RaisedException { value }) => {
+                return GuardTrampResult::Finished(dispatch_guard_exception(
+                    var_name, clauses, *value, guard_env, out,
+                ));
+            }
+            Err(e) => return GuardTrampResult::Finished(Err(e)),
+        }
     }
+}
+
+/// Evaluate `guard`: (guard (var clause ...) body ...)
+/// Each clause is (test expr ...) or (else expr ...).
+/// Uses a local trampoline to support TCO when the body tail-calls back
+/// into a function that contains guard (e.g., tail-recursive guard loops).
+fn eval_guard(
+    args: &[Value],
+    env: &Rc<RefCell<Env>>,
+    out: &Output,
+) -> Result<TailAction, EvalError> {
+    let (mut var_name, mut clauses, mut body) = parse_guard_args(args)?;
+    let mut guard_env = Rc::clone(env);
+
+    loop {
+        let tail_expr = match eval_guard_body_prefix(&body, &guard_env, out) {
+            Ok(expr) => expr,
+            Err(EvalError::RaisedException { value }) => {
+                return dispatch_guard_exception(&var_name, &clauses, *value, &guard_env, out);
+            }
+            Err(e) => return Err(e),
+        };
+        let Some(tail_expr) = tail_expr else {
+            return Ok(TailAction::Return(Value::Void));
+        };
+        match run_guard_trampoline(tail_expr, Rc::clone(&guard_env), &var_name, &clauses, &guard_env, out) {
+            GuardTrampResult::Finished(result) => return result,
+            GuardTrampResult::RestartGuard { var_name: v, clauses: c, body: b, env: e } => {
+                var_name = v;
+                clauses = c;
+                body = b;
+                guard_env = e;
+            }
+        }
+    }
+}
+
+/// Evaluate non-tail body expressions, returning the last (tail) expression unevaluated.
+fn eval_guard_body_prefix(
+    body: &[Value],
+    env: &Rc<RefCell<Env>>,
+    out: &Output,
+) -> Result<Option<Value>, EvalError> {
+    let Some((last, rest)) = body.split_last() else {
+        return Ok(None);
+    };
+    for expr in rest {
+        eval(expr, env, out)?;
+    }
+    Ok(Some(last.clone()))
+}
+
+fn is_guard_form(items: &[Value]) -> bool {
+    matches!(items.first(), Some(Value::Symbol(s)) if s == "guard")
+}
+
+/// Dispatch a caught exception to guard clauses.
+fn dispatch_guard_exception(
+    var_name: &str,
+    clauses: &[Value],
+    value: Value,
+    env: &Rc<RefCell<Env>>,
+    out: &Output,
+) -> Result<TailAction, EvalError> {
+    let guard_env = Env::extend(env);
+    guard_env
+        .borrow_mut()
+        .define(var_name.to_string(), value.clone());
+    eval_guard_clauses(clauses, value, &guard_env, out)
 }
 
 /// Test guard clauses against a raised exception value.
@@ -567,15 +698,10 @@ fn apply_values(
         }
         Value::Builtin(name) => call_builtin_with_values(name, args, env, out),
         Value::Continuation(id) => {
-            let [value] = args.as_slice() else {
-                return Err(EvalError::WrongArgCount {
-                    expected: 1,
-                    got: args.len(),
-                });
-            };
+            let value = continuation_value_from_args(args);
             Err(EvalError::ContinuationReturn {
                 id: *id,
-                value: Box::new(value.clone()),
+                value: Box::new(value),
             })
         }
         _ => Err(EvalError::TypeError {
@@ -624,15 +750,10 @@ fn eval_application_tail(
             call_builtin_with_values(&name, args, env, out).map(TailAction::Return)
         }
         Value::Continuation(id) => {
-            let [value] = args.as_slice() else {
-                return Err(EvalError::WrongArgCount {
-                    expected: 1,
-                    got: args.len(),
-                });
-            };
+            let value = continuation_value_from_args(args);
             Err(EvalError::ContinuationReturn {
                 id,
-                value: Box::new(value.clone()),
+                value: Box::new(value),
             })
         }
         _ => Err(EvalError::TypeError {
@@ -774,15 +895,10 @@ fn eval_apply_values(
         }
         Value::Builtin(name) => call_builtin_with_values(&name, combined, env, out),
         Value::Continuation(id) => {
-            let [value] = combined.as_slice() else {
-                return Err(EvalError::WrongArgCount {
-                    expected: 1,
-                    got: combined.len(),
-                });
-            };
+            let value = continuation_value_from_args(combined);
             Err(EvalError::ContinuationReturn {
                 id,
-                value: Box::new(value.clone()),
+                value: Box::new(value),
             })
         }
         _ => Err(EvalError::TypeError {
@@ -833,10 +949,15 @@ fn eval_body_prefix(
     out: &Output,
 ) -> Result<(), EvalError> {
     let frame_idx = out.borrow().body_stack.len();
-    out.borrow_mut().body_stack.push(BodyFrame {
-        env: Rc::clone(env),
-        current_pos: 0,
-    });
+    {
+        let mut st = out.borrow_mut();
+        let fid = st.next_frame_id;
+        st.next_frame_id += 1;
+        st.body_stack.push(BodyFrame {
+            current_pos: 0,
+            frame_id: fid,
+        });
+    }
     for (i, expr) in prefix.iter().enumerate() {
         out.borrow_mut().body_stack[frame_idx].current_pos = i;
         eval(expr, env, out)?;
@@ -1244,10 +1365,15 @@ fn eval_datum_to_syntax(
 /// Evaluate a sequence of body expressions, returning the last.
 fn eval_body(body: &[Value], env: &Rc<RefCell<Env>>, out: &Output) -> Result<Value, EvalError> {
     let frame_idx = out.borrow().body_stack.len();
-    out.borrow_mut().body_stack.push(BodyFrame {
-        env: Rc::clone(env),
-        current_pos: 0,
-    });
+    {
+        let mut st = out.borrow_mut();
+        let fid = st.next_frame_id;
+        st.next_frame_id += 1;
+        st.body_stack.push(BodyFrame {
+            current_pos: 0,
+            frame_id: fid,
+        });
+    }
     let mut result = Value::Void;
     for (i, expr) in body.iter().enumerate() {
         out.borrow_mut().body_stack[frame_idx].current_pos = i;
@@ -2467,15 +2593,10 @@ fn apply_proc_evaluated(
         }
         Value::Builtin(name) => call_builtin_with_values(name, eval_args, env, out),
         Value::Continuation(id) => {
-            let [value] = eval_args.as_slice() else {
-                return Err(EvalError::WrongArgCount {
-                    expected: 1,
-                    got: eval_args.len(),
-                });
-            };
+            let value = continuation_value_from_args(eval_args);
             Err(EvalError::ContinuationReturn {
                 id: *id,
-                value: Box::new(value.clone()),
+                value: Box::new(value),
             })
         }
         _ => Err(EvalError::TypeError {
