@@ -51,6 +51,7 @@ enum Value {
     },
     Builtin(String),
     Continuation(Pos, usize),
+    Vector(Rc<RefCell<Vec<Value>>>),
     Macro {
         literals: Rc<Vec<String>>,
         rules: Rc<Vec<(Expr, Expr)>>,
@@ -114,6 +115,16 @@ impl Value {
                 out.push(')');
                 out
             }
+            Value::Vector(v) => {
+                let elems = v.borrow();
+                let mut out = String::from("#(");
+                for (i, e) in elems.iter().enumerate() {
+                    if i > 0 { out.push(' '); }
+                    out.push_str(&e.fmt_value(quote_strings));
+                }
+                out.push(')');
+                out
+            }
             Value::Lambda { .. } => "<procedure>".to_string(),
             Value::Builtin(name) => format!("<builtin:{}>", name),
             Value::Continuation(_, _) => "<continuation>".to_string(),
@@ -140,11 +151,13 @@ impl Value {
                 | "abs" | "modulo" | "remainder" | "quotient" | "min" | "max" | "expt"
                 | "zero?" | "positive?" | "negative?" | "odd?" | "even?"
                 | "list-ref" | "list-tail" | "list?" | "assoc" | "map"
-                | "eq?" | "equal?"
+                | "eq?" | "eqv?" | "equal?"
                 | "char-alphabetic?" | "char-numeric?" | "char-upcase" | "char-downcase"
                 | "char=?" | "char<?"
                 | "string=?" | "string<?" | "string-ci=?"
                 | "string-upcase" | "string-downcase"
+                | "vector" | "make-vector" | "vector-ref" | "vector-set!"
+                | "vector-length" | "vector?" | "vector->list" | "list->vector"
         )
     }
 
@@ -795,6 +808,159 @@ fn eval(expr: &Expr, env: &Env, out: &mut String) -> Result<Value, EvalError> {
                                 pos.fmt()
                             )));
                         }
+                        "letrec" => {
+                            let args = &items[1..];
+                            if args.len() < 2 {
+                                break 'tco Err(EvalError::Arity(format!(
+                                    "letrec requires bindings and body at {}",
+                                    pos.fmt()
+                                )));
+                            }
+                            let bindings = match &args[0].kind {
+                                ExprKind::List(bs) => bs,
+                                _ => break 'tco Err(EvalError::Type(format!(
+                                    "letrec: bindings must be a list at {}",
+                                    pos.fmt()
+                                ))),
+                            };
+                            let local_env = Env::with_parent(&cur_env);
+                            // First, bind all names to Nil
+                            let mut names = Vec::new();
+                            let mut inits = Vec::new();
+                            for b in bindings {
+                                match &b.kind {
+                                    ExprKind::List(pair) if pair.len() == 2 => {
+                                        let bname = match &pair[0].kind {
+                                            ExprKind::Symbol(s) => s.clone(),
+                                            _ => break 'tco Err(EvalError::Type(format!(
+                                                "letrec: binding name must be symbol at {}",
+                                                pair[0].pos.fmt()
+                                            ))),
+                                        };
+                                        local_env.set(bname.clone(), Value::Nil);
+                                        names.push(bname);
+                                        inits.push(&pair[1]);
+                                    }
+                                    _ => break 'tco Err(EvalError::Type(format!(
+                                        "letrec: invalid binding at {}",
+                                        b.pos.fmt()
+                                    ))),
+                                }
+                            }
+                            // Evaluate inits in the local env (all names visible)
+                            for (name, init_expr) in names.iter().zip(inits.iter()) {
+                                let val = eval(init_expr, &local_env, out)?;
+                                local_env.set(name.clone(), val);
+                            }
+                            let body = &args[1..];
+                            for e in &body[..body.len() - 1] {
+                                eval(e, &local_env, out)?;
+                            }
+                            cur_expr = body.last().unwrap().clone();
+                            cur_env = local_env;
+                            continue 'tco;
+                        }
+                        "letrec*" => {
+                            let args = &items[1..];
+                            if args.len() < 2 {
+                                break 'tco Err(EvalError::Arity(format!(
+                                    "letrec* requires bindings and body at {}",
+                                    pos.fmt()
+                                )));
+                            }
+                            let bindings = match &args[0].kind {
+                                ExprKind::List(bs) => bs,
+                                _ => break 'tco Err(EvalError::Type(format!(
+                                    "letrec*: bindings must be a list at {}",
+                                    pos.fmt()
+                                ))),
+                            };
+                            let local_env = Env::with_parent(&cur_env);
+                            for b in bindings {
+                                match &b.kind {
+                                    ExprKind::List(pair) if pair.len() == 2 => {
+                                        let bname = match &pair[0].kind {
+                                            ExprKind::Symbol(s) => s.clone(),
+                                            _ => break 'tco Err(EvalError::Type(format!(
+                                                "letrec*: binding name must be symbol at {}",
+                                                pair[0].pos.fmt()
+                                            ))),
+                                        };
+                                        let val = eval(&pair[1], &local_env, out)?;
+                                        local_env.set(bname, val);
+                                    }
+                                    _ => break 'tco Err(EvalError::Type(format!(
+                                        "letrec*: invalid binding at {}",
+                                        b.pos.fmt()
+                                    ))),
+                                }
+                            }
+                            let body = &args[1..];
+                            for e in &body[..body.len() - 1] {
+                                eval(e, &local_env, out)?;
+                            }
+                            cur_expr = body.last().unwrap().clone();
+                            cur_env = local_env;
+                            continue 'tco;
+                        }
+                        "case" => {
+                            if items.len() < 2 {
+                                break 'tco Err(EvalError::Arity(format!(
+                                    "case requires key and clauses at {}",
+                                    pos.fmt()
+                                )));
+                            }
+                            let key = eval(&items[1], &cur_env, out)?;
+                            let clauses = &items[2..];
+                            let mut found = false;
+                            for clause in clauses {
+                                match &clause.kind {
+                                    ExprKind::List(parts) if parts.len() >= 2 => {
+                                        let is_else = matches!(
+                                            &parts[0].kind,
+                                            ExprKind::Symbol(ref s) if s == "else"
+                                        );
+                                        if is_else {
+                                            for e in &parts[1..parts.len() - 1] {
+                                                eval(e, &cur_env, out)?;
+                                            }
+                                            cur_expr = parts.last().unwrap().clone();
+                                            found = true;
+                                            break;
+                                        }
+                                        // datums list
+                                        if let ExprKind::List(datums) = &parts[0].kind {
+                                            let mut matched = false;
+                                            for datum in datums {
+                                                let dval = expr_to_datum(datum);
+                                                if values_eqv(&key, &dval) {
+                                                    matched = true;
+                                                    break;
+                                                }
+                                            }
+                                            if matched {
+                                                for e in &parts[1..parts.len() - 1] {
+                                                    eval(e, &cur_env, out)?;
+                                                }
+                                                cur_expr = parts.last().unwrap().clone();
+                                                found = true;
+                                                break;
+                                            }
+                                        }
+                                    }
+                                    _ => {
+                                        break 'tco Err(EvalError::Type(format!(
+                                            "case: invalid clause at {}",
+                                            clause.pos.fmt()
+                                        )));
+                                    }
+                                }
+                            }
+                            if found {
+                                continue 'tco;
+                            }
+                            break 'tco Ok(Value::Nil);
+                        }
                         "call/cc" | "call-with-current-continuation" => {
                             if items.len() != 2 {
                                 break 'tco Err(EvalError::Arity(format!(
@@ -1414,16 +1580,44 @@ fn values_eq(a: &Value, b: &Value) -> bool {
     }
 }
 
-fn values_equal(a: &Value, b: &Value) -> bool {
+fn expr_to_datum(expr: &Expr) -> Value {
+    match &expr.kind {
+        ExprKind::Integer(n) => Value::Integer(*n),
+        ExprKind::Boolean(b) => Value::Boolean(*b),
+        ExprKind::Str(s) => Value::Str(s.clone()),
+        ExprKind::Symbol(s) => Value::Symbol(s.clone()),
+        ExprKind::Char(c) => Value::Char(*c),
+        ExprKind::List(items) => {
+            let mut result = Value::Nil;
+            for item in items.iter().rev() {
+                result = Value::Pair(Box::new(expr_to_datum(item)), Box::new(result));
+            }
+            result
+        }
+    }
+}
+
+fn values_eqv(a: &Value, b: &Value) -> bool {
     match (a, b) {
         (Value::Integer(x), Value::Integer(y)) => x == y,
         (Value::Boolean(x), Value::Boolean(y)) => x == y,
-        (Value::Str(x), Value::Str(y)) => x == y,
         (Value::Symbol(x), Value::Symbol(y)) => x == y,
         (Value::Char(x), Value::Char(y)) => x == y,
+        (Value::Str(x), Value::Str(y)) => x == y,
         (Value::Nil, Value::Nil) => true,
-        (Value::Pair(a1, a2), Value::Pair(b1, b2)) => values_equal(a1, b1) && values_equal(a2, b2),
         _ => false,
+    }
+}
+
+fn values_equal(a: &Value, b: &Value) -> bool {
+    match (a, b) {
+        (Value::Pair(a1, a2), Value::Pair(b1, b2)) => values_equal(a1, b1) && values_equal(a2, b2),
+        (Value::Vector(va), Value::Vector(vb)) => {
+            let va = va.borrow();
+            let vb = vb.borrow();
+            va.len() == vb.len() && va.iter().zip(vb.iter()).all(|(a, b)| values_equal(a, b))
+        }
+        _ => values_eqv(a, b),
     }
 }
 
@@ -2207,6 +2401,105 @@ fn apply_builtin(op: &str, args: &[Value], pos: Pos, out: &mut String) -> Result
                 Value::Str(s) => Ok(Some(Value::Str(s.to_lowercase()))),
                 _ => Err(EvalError::Type(format!("string-downcase: expected string at {}", pos.fmt()))),
             }
+        }
+        "eqv?" => {
+            if args.len() != 2 {
+                return Err(EvalError::Arity(format!("eqv? requires 2 arguments at {}", pos.fmt())));
+            }
+            Ok(Some(Value::Boolean(values_eqv(&args[0], &args[1]))))
+        }
+        "vector" => {
+            Ok(Some(Value::Vector(Rc::new(RefCell::new(args.to_vec())))))
+        }
+        "make-vector" => {
+            if args.is_empty() || args.len() > 2 {
+                return Err(EvalError::Arity(format!("make-vector requires 1-2 arguments at {}", pos.fmt())));
+            }
+            let size = args[0].as_integer(pos)? as usize;
+            let fill = if args.len() == 2 { args[1].clone() } else { Value::Integer(0) };
+            Ok(Some(Value::Vector(Rc::new(RefCell::new(vec![fill; size])))))
+        }
+        "vector-ref" => {
+            if args.len() != 2 {
+                return Err(EvalError::Arity(format!("vector-ref requires 2 arguments at {}", pos.fmt())));
+            }
+            match &args[0] {
+                Value::Vector(v) => {
+                    let idx = args[1].as_integer(pos)? as usize;
+                    let v = v.borrow();
+                    if idx >= v.len() {
+                        return Err(EvalError::Type(format!("vector-ref: index out of range at {}", pos.fmt())));
+                    }
+                    Ok(Some(v[idx].clone()))
+                }
+                _ => Err(EvalError::Type(format!("vector-ref: expected vector at {}", pos.fmt()))),
+            }
+        }
+        "vector-set!" => {
+            if args.len() != 3 {
+                return Err(EvalError::Arity(format!("vector-set! requires 3 arguments at {}", pos.fmt())));
+            }
+            match &args[0] {
+                Value::Vector(v) => {
+                    let idx = args[1].as_integer(pos)? as usize;
+                    let mut v = v.borrow_mut();
+                    if idx >= v.len() {
+                        return Err(EvalError::Type(format!("vector-set!: index out of range at {}", pos.fmt())));
+                    }
+                    v[idx] = args[2].clone();
+                    Ok(Some(Value::Nil))
+                }
+                _ => Err(EvalError::Type(format!("vector-set!: expected vector at {}", pos.fmt()))),
+            }
+        }
+        "vector-length" => {
+            if args.len() != 1 {
+                return Err(EvalError::Arity(format!("vector-length requires 1 argument at {}", pos.fmt())));
+            }
+            match &args[0] {
+                Value::Vector(v) => Ok(Some(Value::Integer(v.borrow().len() as i64))),
+                _ => Err(EvalError::Type(format!("vector-length: expected vector at {}", pos.fmt()))),
+            }
+        }
+        "vector?" => {
+            if args.len() != 1 {
+                return Err(EvalError::Arity(format!("vector? requires 1 argument at {}", pos.fmt())));
+            }
+            Ok(Some(Value::Boolean(matches!(&args[0], Value::Vector(_)))))
+        }
+        "vector->list" => {
+            if args.len() != 1 {
+                return Err(EvalError::Arity(format!("vector->list requires 1 argument at {}", pos.fmt())));
+            }
+            match &args[0] {
+                Value::Vector(v) => {
+                    let v = v.borrow();
+                    let mut result = Value::Nil;
+                    for item in v.iter().rev() {
+                        result = Value::Pair(Box::new(item.clone()), Box::new(result));
+                    }
+                    Ok(Some(result))
+                }
+                _ => Err(EvalError::Type(format!("vector->list: expected vector at {}", pos.fmt()))),
+            }
+        }
+        "list->vector" => {
+            if args.len() != 1 {
+                return Err(EvalError::Arity(format!("list->vector requires 1 argument at {}", pos.fmt())));
+            }
+            let mut items = Vec::new();
+            let mut cur = &args[0];
+            loop {
+                match cur {
+                    Value::Nil => break,
+                    Value::Pair(car, cdr) => {
+                        items.push(*car.clone());
+                        cur = cdr;
+                    }
+                    _ => return Err(EvalError::Type(format!("list->vector: not a proper list at {}", pos.fmt()))),
+                }
+            }
+            Ok(Some(Value::Vector(Rc::new(RefCell::new(items)))))
         }
         _ => Ok(None),
     }
