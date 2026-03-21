@@ -93,6 +93,11 @@ fn is_builtin(name: &str) -> bool {
             | "cons"
             | "car"
             | "cdr"
+            | "zero?"
+            | "positive?"
+            | "negative?"
+            | "odd?"
+            | "even?"
             | "null?"
             | "list"
             | "length"
@@ -562,6 +567,11 @@ fn apply_builtin(op: &str, args: &[Value]) -> Result<Value, EvalError> {
         "cons" => builtins::apply_cons(args),
         "car" => builtins::apply_car(args),
         "cdr" => builtins::apply_cdr(args),
+        "zero?" => builtins::apply_numeric_predicate(args, |n| n == 0),
+        "positive?" => builtins::apply_numeric_predicate(args, |n| n > 0),
+        "negative?" => builtins::apply_numeric_predicate(args, |n| n < 0),
+        "odd?" => builtins::apply_numeric_predicate(args, |n| n % 2 != 0),
+        "even?" => builtins::apply_numeric_predicate(args, |n| n % 2 == 0),
         "null?" => builtins::apply_null(args),
         "list" => builtins::apply_list(args),
         "length" => builtins::apply_length(args),

@@ -151,6 +151,22 @@ pub fn apply_list(args: &[Value]) -> Result<Value, EvalError> {
     }
 }
 
+pub fn apply_numeric_predicate(args: &[Value], pred: fn(i64) -> bool) -> Result<Value, EvalError> {
+    let [val] = args else {
+        return Err(EvalError::WrongArgCount {
+            expected: 1,
+            got: args.len(),
+        });
+    };
+    match val {
+        Value::Integer(n) => Ok(Value::Boolean(pred(*n))),
+        other => Err(EvalError::TypeError {
+            expected: "integer".to_string(),
+            got: format!("{other}"),
+        }),
+    }
+}
+
 pub fn apply_type_predicate(args: &[Value], pred: fn(&Value) -> bool) -> Result<Value, EvalError> {
     let [val] = args else {
         return Err(EvalError::WrongArgCount {
