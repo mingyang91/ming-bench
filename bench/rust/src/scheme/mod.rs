@@ -61,6 +61,9 @@ enum Value {
         rules: Rc<Vec<(Expr, Expr)>>,
         def_env: Env,
     },
+    MacroTransformer(Box<Value>, Env),
+    SyntaxObject(Expr),
+    SyntaxList(Vec<Expr>),
     Values(Vec<Value>),
     Record {
         type_id: usize,
@@ -264,6 +267,9 @@ impl Value {
             Value::Builtin(name) => format!("<builtin:{}>", name),
             Value::Continuation(_, _) => "<continuation>".to_string(),
             Value::Macro { .. } => "<macro>".to_string(),
+            Value::MacroTransformer(..) => "<macro>".to_string(),
+            Value::SyntaxObject(ref expr) => format!("#<syntax {}>", syntax_expr_to_string(expr)),
+            Value::SyntaxList(_) => "#<syntax-list>".to_string(),
             Value::Values(vals) => {
                 if vals.is_empty() {
                     "".to_string()
@@ -305,6 +311,7 @@ impl Value {
                 | "values" | "call-with-values"
                 | "exact?" | "inexact?" | "exact->inexact" | "inexact->exact"
                 | "numerator" | "denominator" | "rational?" | "integer?"
+                | "syntax->datum" | "datum->syntax"
         )
     }
 
@@ -649,6 +656,20 @@ impl Parser {
                         start.fmt()
                     ))),
                 }
+            }
+            Some('\'') => {
+                self.next_char(); // consume '
+                let inner = self.parse_expr()?;
+                Ok(Expr {
+                    kind: ExprKind::List(vec![
+                        Expr {
+                            kind: ExprKind::Symbol("syntax".into()),
+                            pos: start,
+                        },
+                        inner,
+                    ]),
+                    pos: start,
+                })
             }
             _ => Err(EvalError::Parse(format!(
                 "invalid # literal at {}",
@@ -1329,27 +1350,161 @@ fn eval(expr: &Expr, env: &Env, out: &mut String) -> Result<Value, EvalError> {
                             let sr = match &items[2].kind {
                                 ExprKind::List(parts) => parts,
                                 _ => break 'tco Err(EvalError::Type(format!(
-                                    "define-syntax: expected syntax-rules at {}",
+                                    "define-syntax: expected syntax-rules or lambda at {}",
                                     pos.fmt()
                                 ))),
                             };
-                            let literals = Rc::new(match &sr[1].kind {
+                            let is_syntax_rules = matches!(&sr[0].kind, ExprKind::Symbol(ref s) if s == "syntax-rules");
+                            if is_syntax_rules {
+                                let literals = Rc::new(match &sr[1].kind {
+                                    ExprKind::List(lits) => lits.iter().filter_map(|e| {
+                                        if let ExprKind::Symbol(s) = &e.kind { Some(s.clone()) } else { None }
+                                    }).collect(),
+                                    _ => vec![],
+                                });
+                                let rules = Rc::new(sr[2..].iter().filter_map(|clause| {
+                                    if let ExprKind::List(parts) = &clause.kind {
+                                        if parts.len() == 2 {
+                                            return Some((parts[0].clone(), parts[1].clone()));
+                                        }
+                                    }
+                                    None
+                                }).collect());
+                                let macro_val = Value::Macro { literals, rules, def_env: cur_env.clone() };
+                                cur_env.set(macro_name, macro_val);
+                            } else {
+                                // Lambda transformer (syntax-case style)
+                                let transformer = eval(&items[2], &cur_env, out)?;
+                                let macro_val = Value::MacroTransformer(Box::new(transformer), cur_env.clone());
+                                cur_env.set(macro_name, macro_val);
+                            }
+                            break 'tco Ok(Value::Nil);
+                        }
+                        "syntax-case" => {
+                            // (syntax-case expr (literals...) clause ...)
+                            // clause: (pattern body) or (pattern guard body)
+                            if items.len() < 4 {
+                                break 'tco Err(EvalError::Arity(format!(
+                                    "syntax-case requires at least 3 arguments at {}",
+                                    pos.fmt()
+                                )));
+                            }
+                            let stx_val = eval(&items[1], &cur_env, out)?;
+                            let stx_expr = match stx_val {
+                                Value::SyntaxObject(e) => e,
+                                _ => break 'tco Err(EvalError::Type(format!(
+                                    "syntax-case: expected syntax object at {}",
+                                    pos.fmt()
+                                ))),
+                            };
+                            let literals: Vec<String> = match &items[2].kind {
                                 ExprKind::List(lits) => lits.iter().filter_map(|e| {
                                     if let ExprKind::Symbol(s) = &e.kind { Some(s.clone()) } else { None }
                                 }).collect(),
                                 _ => vec![],
-                            });
-                            let rules = Rc::new(sr[2..].iter().filter_map(|clause| {
-                                if let ExprKind::List(parts) = &clause.kind {
-                                    if parts.len() == 2 {
-                                        return Some((parts[0].clone(), parts[1].clone()));
+                            };
+                            let stx_items = match &stx_expr.kind {
+                                ExprKind::List(items) => items.clone(),
+                                _ => vec![stx_expr.clone()],
+                            };
+                            let mut matched = false;
+                            for clause_idx in 3..items.len() {
+                                let clause = match &items[clause_idx].kind {
+                                    ExprKind::List(parts) => parts,
+                                    _ => continue,
+                                };
+                                if clause.len() < 2 { continue; }
+                                let pattern = &clause[0];
+                                let (guard, body) = if clause.len() == 3 {
+                                    (Some(&clause[1]), &clause[2])
+                                } else {
+                                    (None, &clause[1])
+                                };
+                                let pat_items = match &pattern.kind {
+                                    ExprKind::List(items) => items,
+                                    _ => continue,
+                                };
+                                if let Some(bindings) = match_pattern(&pat_items[1..], &stx_items[1..], &literals) {
+                                    let inner_env = Env::with_parent(&cur_env);
+                                    for (name, binding) in &bindings {
+                                        match binding {
+                                            MacroBinding::Single(expr) => {
+                                                inner_env.set(name.clone(), Value::SyntaxObject(expr.clone()));
+                                            }
+                                            MacroBinding::List(exprs) => {
+                                                inner_env.set(name.clone(), Value::SyntaxList(exprs.clone()));
+                                            }
+                                        }
                                     }
+                                    if let Some(guard_expr) = guard {
+                                        let guard_val = eval(guard_expr, &inner_env, out)?;
+                                        if !guard_val.is_truthy() {
+                                            continue;
+                                        }
+                                    }
+                                    cur_expr = body.clone();
+                                    cur_env = inner_env;
+                                    matched = true;
+                                    break;
                                 }
-                                None
-                            }).collect());
-                            let macro_val = Value::Macro { literals, rules, def_env: cur_env.clone() };
-                            cur_env.set(macro_name, macro_val);
-                            break 'tco Ok(Value::Nil);
+                            }
+                            if matched {
+                                continue 'tco;
+                            }
+                            break 'tco Err(EvalError::Type(format!(
+                                "no matching syntax-case pattern at {}",
+                                pos.fmt()
+                            )));
+                        }
+                        "syntax" => {
+                            // (syntax template) - expand template with pattern variable bindings
+                            if items.len() != 2 {
+                                break 'tco Err(EvalError::Arity(format!(
+                                    "syntax requires 1 argument at {}",
+                                    pos.fmt()
+                                )));
+                            }
+                            let expanded = expand_syntax_template(&items[1], &cur_env, pos)?;
+                            break 'tco Ok(Value::SyntaxObject(expanded));
+                        }
+                        "with-syntax" => {
+                            // (with-syntax ((pattern expr) ...) body ...)
+                            if items.len() < 3 {
+                                break 'tco Err(EvalError::Arity(format!(
+                                    "with-syntax requires at least 2 arguments at {}",
+                                    pos.fmt()
+                                )));
+                            }
+                            let bindings_list = match &items[1].kind {
+                                ExprKind::List(bs) => bs,
+                                _ => break 'tco Err(EvalError::Type(format!(
+                                    "with-syntax: expected binding list at {}",
+                                    pos.fmt()
+                                ))),
+                            };
+                            let inner_env = Env::with_parent(&cur_env);
+                            for binding in bindings_list {
+                                let parts = match &binding.kind {
+                                    ExprKind::List(parts) => parts,
+                                    _ => continue,
+                                };
+                                if parts.len() != 2 { continue; }
+                                let val = eval(&parts[1], &cur_env, out)?;
+                                match &parts[0].kind {
+                                    ExprKind::Symbol(name) => {
+                                        inner_env.set(name.clone(), val);
+                                    }
+                                    _ => {}
+                                }
+                            }
+                            // Evaluate body expressions
+                            let last = items.len() - 1;
+                            for i in 2..last {
+                                eval(&items[i], &inner_env, out)?;
+                            }
+                            cur_expr = items[last].clone();
+                            cur_env = inner_env;
+                            continue 'tco;
                         }
                         "define-record-type" => {
                             break 'tco eval_define_record_type(&items[1..], pos, &cur_env);
@@ -1359,6 +1514,25 @@ fn eval(expr: &Expr, env: &Env, out: &mut String) -> Result<Value, EvalError> {
                                 let expanded = expand_macro(&items, literals, rules, def_env, &cur_env, pos)?;
                                 cur_expr = expanded;
                                 continue 'tco;
+                            }
+                            if let Some(Value::MacroTransformer(ref transformer, ref _def_env)) = cur_env.get(op) {
+                                let transformer = (**transformer).clone();
+                                let input_expr = Expr {
+                                    kind: ExprKind::List(items.clone()),
+                                    pos,
+                                };
+                                let stx = Value::SyntaxObject(input_expr);
+                                let result = apply_func(transformer, vec![stx], pos, &cur_env, out)?;
+                                match result {
+                                    Value::SyntaxObject(expanded) => {
+                                        cur_expr = expanded;
+                                        continue 'tco;
+                                    }
+                                    _ => break 'tco Err(EvalError::Type(format!(
+                                        "macro transformer must return a syntax object at {}",
+                                        pos.fmt()
+                                    ))),
+                                }
                             }
                         }
                     }
@@ -3299,6 +3473,22 @@ fn apply_builtin(op: &str, args: &[Value], pos: Pos, out: &mut String) -> Result
             };
             Ok(Some(Value::Boolean(is_int)))
         }
+        "syntax->datum" => {
+            if args.len() != 1 {
+                return Err(EvalError::Arity(format!("syntax->datum requires 1 argument at {}", pos.fmt())));
+            }
+            match &args[0] {
+                Value::SyntaxObject(expr) => Ok(Some(syntax_to_datum(expr))),
+                other => Ok(Some(other.clone())),
+            }
+        }
+        "datum->syntax" => {
+            if args.len() != 2 {
+                return Err(EvalError::Arity(format!("datum->syntax requires 2 arguments at {}", pos.fmt())));
+            }
+            let expr = datum_to_syntax(&args[1]);
+            Ok(Some(Value::SyntaxObject(expr)))
+        }
         _ if op.starts_with("##record-ctor-") => {
             let type_id: usize = op["##record-ctor-".len()..].parse().unwrap();
             let info = RECORD_TYPES.with(|rt| {
@@ -3407,7 +3597,8 @@ fn is_keyword(name: &str) -> bool {
             | "call-with-current-continuation" | "string-set!"
             | "define-syntax" | "syntax-rules" | "dynamic-wind"
             | "raise" | "guard" | "with-exception-handler"
-            | "define-record-type"
+            | "define-record-type" | "syntax-case" | "syntax"
+            | "with-syntax"
     ) || Value::is_builtin_name(name)
 }
 
@@ -3576,6 +3767,143 @@ fn collect_free_symbols(
             }
         }
         _ => {}
+    }
+}
+
+// ── syntax-case helpers ─────────────────────────────────────────────
+
+fn syntax_expr_to_string(expr: &Expr) -> String {
+    match &expr.kind {
+        ExprKind::Integer(n) => n.to_string(),
+        ExprKind::Float(f) => format!("{}", f),
+        ExprKind::Rational(n, d) => format!("{}/{}", n, d),
+        ExprKind::Boolean(true) => "#t".to_string(),
+        ExprKind::Boolean(false) => "#f".to_string(),
+        ExprKind::Str(s) => format!("\"{}\"", s),
+        ExprKind::Symbol(s) => s.clone(),
+        ExprKind::Char(c) => format!("#\\{}", c),
+        ExprKind::List(items) => {
+            let inner: Vec<String> = items.iter().map(|e| syntax_expr_to_string(e)).collect();
+            format!("({})", inner.join(" "))
+        }
+    }
+}
+
+fn syntax_to_datum(expr: &Expr) -> Value {
+    match &expr.kind {
+        ExprKind::Integer(n) => Value::Integer(*n),
+        ExprKind::Float(f) => Value::Float(*f),
+        ExprKind::Rational(n, d) => Value::Rational(*n, *d),
+        ExprKind::Boolean(b) => Value::Boolean(*b),
+        ExprKind::Str(s) => Value::Str(s.clone()),
+        ExprKind::Symbol(s) => Value::Symbol(s.clone()),
+        ExprKind::Char(c) => Value::Char(*c),
+        ExprKind::List(items) => {
+            let mut result = Value::Nil;
+            for item in items.iter().rev() {
+                result = make_pair(syntax_to_datum(item), result);
+            }
+            result
+        }
+    }
+}
+
+fn datum_to_syntax(val: &Value) -> Expr {
+    let pos = Pos { line: 0, col: 0 };
+    match val {
+        Value::Integer(n) => Expr { kind: ExprKind::Integer(*n), pos },
+        Value::Float(f) => Expr { kind: ExprKind::Float(*f), pos },
+        Value::Rational(n, d) => Expr { kind: ExprKind::Rational(*n, *d), pos },
+        Value::Boolean(b) => Expr { kind: ExprKind::Boolean(*b), pos },
+        Value::Str(s) => Expr { kind: ExprKind::Str(s.clone()), pos },
+        Value::Symbol(s) => Expr { kind: ExprKind::Symbol(s.clone()), pos },
+        Value::Char(c) => Expr { kind: ExprKind::Char(*c), pos },
+        Value::Nil => Expr { kind: ExprKind::List(vec![]), pos },
+        Value::Pair(_) => {
+            let mut items = Vec::new();
+            let mut cur = val.clone();
+            loop {
+                match cur {
+                    Value::Pair(p) => {
+                        let (car, cdr) = {
+                            let inner = p.borrow();
+                            (inner.0.clone(), inner.1.clone())
+                        };
+                        items.push(datum_to_syntax(&car));
+                        cur = cdr;
+                    }
+                    Value::Nil => break,
+                    _ => {
+                        items.push(datum_to_syntax(&cur));
+                        break;
+                    }
+                }
+            }
+            Expr { kind: ExprKind::List(items), pos }
+        }
+        _ => Expr { kind: ExprKind::Symbol("<unknown>".into()), pos },
+    }
+}
+
+fn find_syntax_ellipsis_var(expr: &Expr, env: &Env) -> Option<String> {
+    match &expr.kind {
+        ExprKind::Symbol(ref s) => {
+            if let Some(Value::SyntaxList(_)) = env.get(s) {
+                Some(s.clone())
+            } else {
+                None
+            }
+        }
+        ExprKind::List(items) => {
+            for item in items {
+                if let Some(v) = find_syntax_ellipsis_var(item, env) {
+                    return Some(v);
+                }
+            }
+            None
+        }
+        _ => None,
+    }
+}
+
+fn expand_syntax_template(template: &Expr, env: &Env, pos: Pos) -> Result<Expr, EvalError> {
+    match &template.kind {
+        ExprKind::Symbol(ref s) => {
+            match env.get(s) {
+                Some(Value::SyntaxObject(expr)) => Ok(expr),
+                _ => Ok(template.clone()),
+            }
+        }
+        ExprKind::List(items) => {
+            let mut expanded = Vec::new();
+            let mut i = 0;
+            while i < items.len() {
+                if i + 1 < items.len() {
+                    if let ExprKind::Symbol(ref s) = items[i + 1].kind {
+                        if s == "..." {
+                            if let Some(var_name) = find_syntax_ellipsis_var(&items[i], env) {
+                                if let Some(Value::SyntaxList(ref elems)) = env.get(&var_name) {
+                                    for elem in elems {
+                                        let child_env = Env::with_parent(env);
+                                        child_env.set(var_name.clone(), Value::SyntaxObject(elem.clone()));
+                                        expanded.push(expand_syntax_template(&items[i], &child_env, pos)?);
+                                    }
+                                }
+                            }
+                            i += 2;
+                            continue;
+                        }
+                    }
+                }
+                expanded.push(expand_syntax_template(&items[i], env, pos)?);
+                i += 1;
+            }
+            Ok(Expr {
+                kind: ExprKind::List(expanded),
+                pos: template.pos,
+            })
+        }
+        _ => Ok(template.clone()),
     }
 }
 
