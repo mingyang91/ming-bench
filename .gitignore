@@ -9,6 +9,12 @@ bench/*/CLAUDE.md
 bench/*/AGENTS.md
 *.sh
 
+## mill / scala
+out/
+.metals/
+.bsp/
+node_modules/
+
 ## python
 __pycache__/
 *.pyc

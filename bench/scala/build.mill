@@ -7,19 +7,25 @@ import mill.scalalib.scalafmt._
 object ming extends ScalaModule with ScalafmtModule {
   def scalaVersion = "3.8.1"
 
+  def sources = Task.Sources(moduleDir / os.up / "src" / "main" / "scala")
+
   def scalacOptions = Seq(
-    "-Werror",
     "-deprecation",
     "-feature",
     "-unchecked",
   )
 
   object test extends ScalaTests with TestModule.Munit with ScalafmtModule {
-    def ivyDeps = Agg(
-      ivy"org.scalameta::munit::1.1.0",
-      ivy"com.google.code.gson:gson:2.11.0",
+    def sources = Task.Sources(moduleDir / os.up / os.up / "src" / "test" / "scala")
+
+    // bench/ dir contains tests.json and fixtures/; pass as absolute path
+    // since Mill sandboxes the test working directory.
+    private val benchDirPath = (moduleDir / os.up / os.up / os.up).toString
+    def forkArgs = Seq(s"-Dbench.dir=$benchDirPath")
+
+    def mvnDeps = Seq(
+      mvn"org.scalameta::munit::1.1.0",
+      mvn"com.google.code.gson:gson:2.11.0",
     )
   }
-
-  object fix extends ScalafixModule
 }

@@ -98,7 +98,7 @@ Session analysis tools parse Claude Code JSONL sessions from `results/`. The sha
 - **`/compare` skill** — Guides narrative analysis: runs compare, identifies struggle levels, reads thinking blocks, produces verdict.
 - **`/compliance` skill** — Analyzes whether an agent followed its strategy rules.
 
-Turn limits: L01-L03 = 45 turns, L04-L07 = 30 turns, L08-L10 = 45 turns, L11-L13 = 75 turns, L14-L15 = 45 turns. Quality-gate levels get an additional 15-turn cleanup pass. Failed levels auto-retry up to 2 times if the failure was infrastructure (timeout/529/crash), not turns exhaustion.
+Turn limits: L01-L03 = 45, L04-L07 = 30, L08-L10 = 45, L11-L13 = 90, L14-L15 = 60, L16-L18 = 60, L19-L20 = 75, L21-L23 = 90. Quality-gate levels get an additional 15-turn cleanup pass. Failed levels auto-retry up to 2 times if the failure was infrastructure (timeout/529/crash), not turns exhaustion.
 
 ## Key Conventions
 

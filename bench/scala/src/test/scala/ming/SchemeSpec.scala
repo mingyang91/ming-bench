@@ -9,10 +9,14 @@ import scala.jdk.CollectionConverters.*
 class SchemeSpec extends FunSuite {
 
   private val benchDir: Path = {
-    val scalaDir = Path.of(System.getProperty("user.dir"))
-    val parent = scalaDir.getParent
-    if (parent != null && Files.exists(parent.resolve("tests.json"))) parent
-    else scalaDir
+    // Mill passes bench dir via system property; fall back to parent of user.dir
+    val fromProp = Option(System.getProperty("bench.dir")).map(Path.of(_))
+    fromProp.filter(p => Files.exists(p.resolve("tests.json"))).getOrElse {
+      val scalaDir = Path.of(System.getProperty("user.dir"))
+      val parent = scalaDir.getParent
+      if (parent != null && Files.exists(parent.resolve("tests.json"))) parent
+      else scalaDir
+    }
   }
 
   private val fixturesDir: Path = benchDir.resolve("fixtures")

@@ -403,11 +403,14 @@ pub const LEVELS: [&str; 23] = [
 /// Default turn limit for a given level number.
 ///
 /// Tiers based on difficulty:
-///   L01-L03 (foundation, merged)   → 45 turns
-///   L04-L07 (maintenance/strings)  → 30 turns
-///   L08-L10 (TCO, mutation, apply) → 45 turns
-///   L11-L13 (call/cc, macros, integration) → 75 turns
-///   L14-L15 (extensions, merged)   → 45 turns
+///   L01-L03 (foundation, merged)              → 45 turns
+///   L04-L07 (single-feature levels)           → 30 turns
+///   L08-L10 (TCO, mutation, apply)            → 45 turns
+///   L11-L13 (call/cc, macros, integration)    → 90 turns
+///   L14-L15 (merged 4-5 old levels each)      → 60 turns
+///   L16-L18 (dynamic-wind, guard, values)     → 60 turns
+///   L19-L20 (exact arith, records)            → 75 turns
+///   L21-L23 (pair mutation, syntax-case, integration) → 90 turns
 pub fn turns_for_level(level_num: u32, max_turns: Option<u32>) -> u32 {
     if let Some(t) = max_turns {
         return t;
@@ -416,12 +419,12 @@ pub fn turns_for_level(level_num: u32, max_turns: Option<u32>) -> u32 {
         1..=3 => 45,
         4..=7 => 30,
         8..=10 => 45,
-        11..=13 => 75,
-        14..=15 => 45,
-        16..=18 => 60,  // maintenance stress: dynamic-wind, guard, values
-        19..=20 => 75,  // data model extensions: exact arith, records
-        21..=23 => 75,  // advanced: pair mutation, syntax-case, integration
-        _ => 75,        // future levels
+        11..=13 => 90,  // call/cc, macros, integration — R11: both agents blew 75
+        14..=15 => 60,  // merged 4-5 old levels — R11: A blew 45 on L15
+        16..=18 => 60,  // dynamic-wind, guard, values
+        19..=20 => 75,  // exact arith, records
+        21..=23 => 90,  // pair mutation, syntax-case — R11: both at/over 75
+        _ => 75,
     }
 }
 
