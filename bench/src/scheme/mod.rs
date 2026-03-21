@@ -14,7 +14,7 @@ use macros::{eval_define_syntax, expand_macro};
 use forms::{
     eval_and_step, eval_begin_step, eval_cond_step, eval_define, eval_if_step,
     eval_lambda, eval_let_step, eval_or_step, eval_quote, eval_set, eval_string_set,
-    eval_callcc,
+    eval_callcc, eval_letrec_step, eval_letrec_star_step,
 };
 use std::cell::RefCell;
 use std::collections::HashMap;
@@ -184,6 +184,8 @@ fn eval_list_step(
             "or" => return eval_or_step(args, env, output),
             "lambda" => return eval_lambda(args, env, span).map(Bounce::Done),
             "let" => return eval_let_step(args, env, span, output),
+            "letrec" => return eval_letrec_step(args, env, span, output),
+            "letrec*" => return eval_letrec_star_step(args, env, span, output),
             "begin" => return eval_begin_step(args, env, span, output),
             "cond" => return eval_cond_step(args, env, span, output),
             "set!" => return eval_set(args, env, span, output).map(Bounce::Done),

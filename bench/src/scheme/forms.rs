@@ -398,6 +398,127 @@ pub(crate) fn handle_callcc(
     }
 }
 
+pub(crate) fn eval_letrec_step(
+    args: &[Value],
+    env: &mut Env,
+    span: Span,
+    output: &mut String,
+) -> Result<Bounce, EvalError> {
+    let [Value::List(bindings, _), body @ ..] = args else {
+        return Err(EvalError::Parse {
+            message: "letrec requires a bindings list and body".to_string(),
+            span,
+        });
+    };
+    if body.is_empty() {
+        return Err(EvalError::Parse {
+            message: "letrec requires a body".to_string(),
+            span,
+        });
+    }
+    // Create local env with all names bound to placeholders
+    let mut local_env = env.clone();
+    let mut binding_info: Vec<(String, Value)> = Vec::new();
+    for binding in bindings {
+        let Value::List(pair, _) = binding else {
+            return Err(EvalError::Parse {
+                message: "letrec binding must be a list".to_string(),
+                span,
+            });
+        };
+        let [Value::Symbol(name, _), expr] = pair.as_slice() else {
+            return Err(EvalError::Parse {
+                message: "letrec binding must be (name expr)".to_string(),
+                span,
+            });
+        };
+        local_env.insert(name.clone(), Rc::new(RefCell::new(Value::Boolean(false))));
+        binding_info.push((name.clone(), expr.clone()));
+    }
+    // Evaluate init expressions in the local env and update bindings
+    for (name, expr) in &binding_info {
+        let val = eval(expr, &mut local_env, output)?;
+        if let Some(cell) = local_env.get(name) {
+            *cell.borrow_mut() = val;
+        }
+    }
+    // For lambdas, update their captured env to include the letrec bindings
+    patch_letrec_lambdas(&binding_info, &local_env);
+    eval_body_step(body, Value::Boolean(false), &mut local_env, output)
+        .map(|b| match b {
+            Bounce::Continue(expr) => Bounce::ReplaceEnv {
+                expr,
+                env: local_env,
+            },
+            other => other,
+        })
+}
+
+fn collect_binding_cells(binding_info: &[(String, Value)], local_env: &Env) -> Vec<(String, Rc<RefCell<Value>>)> {
+    binding_info.iter()
+        .filter_map(|(n, _)| local_env.get(n).map(|c| (n.clone(), Rc::clone(c))))
+        .collect()
+}
+
+fn patch_letrec_lambdas(binding_info: &[(String, Value)], local_env: &Env) {
+    let cells = collect_binding_cells(binding_info, local_env);
+    for (name, _) in binding_info {
+        let cell = local_env.get(name).expect("binding must exist").clone();
+        let val = cell.borrow().clone();
+        let Value::Lambda { params, rest_param, body, env: ref captured_env } = val else {
+            continue;
+        };
+        let mut updated_env = captured_env.clone();
+        updated_env.extend(cells.iter().map(|(n, c)| (n.clone(), Rc::clone(c))));
+        *cell.borrow_mut() = Value::Lambda { params, rest_param, body, env: updated_env };
+    }
+}
+
+pub(crate) fn eval_letrec_star_step(
+    args: &[Value],
+    env: &mut Env,
+    span: Span,
+    output: &mut String,
+) -> Result<Bounce, EvalError> {
+    let [Value::List(bindings, _), body @ ..] = args else {
+        return Err(EvalError::Parse {
+            message: "letrec* requires a bindings list and body".to_string(),
+            span,
+        });
+    };
+    if body.is_empty() {
+        return Err(EvalError::Parse {
+            message: "letrec* requires a body".to_string(),
+            span,
+        });
+    }
+    let mut local_env = env.clone();
+    for binding in bindings {
+        let Value::List(pair, _) = binding else {
+            return Err(EvalError::Parse {
+                message: "letrec* binding must be a list".to_string(),
+                span,
+            });
+        };
+        let [Value::Symbol(name, _), expr] = pair.as_slice() else {
+            return Err(EvalError::Parse {
+                message: "letrec* binding must be (name expr)".to_string(),
+                span,
+            });
+        };
+        let val = eval(expr, &mut local_env, output)?;
+        local_env.insert(name.clone(), Rc::new(RefCell::new(val)));
+    }
+    eval_body_step(body, Value::Boolean(false), &mut local_env, output)
+        .map(|b| match b {
+            Bounce::Continue(expr) => Bounce::ReplaceEnv {
+                expr,
+                env: local_env,
+            },
+            other => other,
+        })
+}
+
 fn extract_params(
     param_vals: &[Value],
     span: Span,
