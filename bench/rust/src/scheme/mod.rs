@@ -58,6 +58,7 @@ enum Value {
         rules: Rc<Vec<(Expr, Expr)>>,
         def_env: Env,
     },
+    Values(Vec<Value>),
 }
 
 impl Value {
@@ -130,6 +131,13 @@ impl Value {
             Value::Builtin(name) => format!("<builtin:{}>", name),
             Value::Continuation(_, _) => "<continuation>".to_string(),
             Value::Macro { .. } => "<macro>".to_string(),
+            Value::Values(vals) => {
+                if vals.is_empty() {
+                    "".to_string()
+                } else {
+                    vals[0].fmt_value(quote_strings)
+                }
+            }
         }
     }
 
@@ -159,6 +167,7 @@ impl Value {
                 | "string-upcase" | "string-downcase"
                 | "vector" | "make-vector" | "vector-ref" | "vector-set!"
                 | "vector-length" | "vector?" | "vector->list" | "list->vector"
+                | "values" | "call-with-values"
         )
     }
 
@@ -1185,6 +1194,9 @@ fn eval(expr: &Expr, env: &Env, out: &mut String) -> Result<Value, EvalError> {
                     if name == "apply" {
                         break 'tco call_apply(&args, pos, &cur_env, out);
                     }
+                    if name == "call-with-values" {
+                        break 'tco call_with_values(&args, pos, &cur_env, out);
+                    }
                     if let Some(result) = apply_builtin(name, &args, pos, out)? {
                         break 'tco Ok(result);
                     }
@@ -1240,6 +1252,9 @@ fn eval(expr: &Expr, env: &Env, out: &mut String) -> Result<Value, EvalError> {
                         }
                         if bname == "apply" {
                             break 'tco call_apply(&args, pos, &cur_env, out);
+                        }
+                        if bname == "call-with-values" {
+                            break 'tco call_with_values(&args, pos, &cur_env, out);
                         }
                         match apply_builtin(bname, &args, pos, out)? {
                             Some(result) => break 'tco Ok(result),
@@ -1544,6 +1559,22 @@ fn apply_func(func: Value, args: Vec<Value>, pos: Pos, env: &Env, out: &mut Stri
             });
             Err(EvalError::ContinuationReturn)
         }
+        Value::Builtin(ref bname) => {
+            if bname == "apply" {
+                return call_apply(&args, pos, env, out);
+            }
+            if bname == "call-with-values" {
+                return call_with_values(&args, pos, env, out);
+            }
+            match apply_builtin(bname, &args, pos, out)? {
+                Some(result) => Ok(result),
+                None => Err(EvalError::Type(format!(
+                    "unknown builtin {} at {}",
+                    bname,
+                    pos.fmt()
+                ))),
+            }
+        }
         _ => Err(EvalError::Type(format!(
             "call/cc: argument must be a procedure at {}",
             pos.fmt()
@@ -1615,6 +1646,23 @@ fn value_list_to_vec(val: &Value, pos: Pos) -> Result<Vec<Value>, EvalError> {
 }
 
 /// Implement (apply fn arg1 ... argN list)
+fn call_with_values(args: &[Value], pos: Pos, env: &Env, out: &mut String) -> Result<Value, EvalError> {
+    if args.len() != 2 {
+        return Err(EvalError::Arity(format!(
+            "call-with-values requires 2 arguments at {}",
+            pos.fmt()
+        )));
+    }
+    let producer = args[0].clone();
+    let consumer = args[1].clone();
+    let produced = apply_func(producer, vec![], pos, env, out)?;
+    let consumer_args = match produced {
+        Value::Values(vals) => vals,
+        single => vec![single],
+    };
+    apply_func(consumer, consumer_args, pos, env, out)
+}
+
 fn call_apply(args: &[Value], pos: Pos, env: &Env, out: &mut String) -> Result<Value, EvalError> {
     if args.len() < 2 {
         return Err(EvalError::Arity(format!(
@@ -1644,6 +1692,9 @@ fn call_apply(args: &[Value], pos: Pos, env: &Env, out: &mut String) -> Result<V
         Value::Builtin(bname) => {
             if bname == "apply" {
                 return call_apply(&call_args, pos, env, out);
+            }
+            if bname == "call-with-values" {
+                return call_with_values(&call_args, pos, env, out);
             }
             match apply_builtin(bname, &call_args, pos, out)? {
                 Some(result) => Ok(result),
@@ -2700,6 +2751,13 @@ fn apply_builtin(op: &str, args: &[Value], pos: Pos, out: &mut String) -> Result
                 }
             }
             Ok(Some(Value::Vector(Rc::new(RefCell::new(items)))))
+        }
+        "values" => {
+            match args.len() {
+                0 => Ok(Some(Value::Values(vec![]))),
+                1 => Ok(Some(args[0].clone())),
+                _ => Ok(Some(Value::Values(args.to_vec()))),
+            }
         }
         _ => Ok(None),
     }
