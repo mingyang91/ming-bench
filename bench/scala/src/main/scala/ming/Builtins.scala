@@ -46,17 +46,21 @@ object Builtins:
           case head :: Nil => Value.IntVal(listLength(head))
           case _ =>
             throw new EvalError("length requires exactly 1 argument")
-      case "string?" =>
-        typePred(args, _.isInstanceOf[Value.StringVal])
-      case "number?" =>
-        typePred(args, _.isInstanceOf[Value.IntVal])
-      case "boolean?" =>
-        typePred(args, _.isInstanceOf[Value.BoolVal])
-      case "pair?" =>
-        typePred(args, _.isInstanceOf[Value.PairVal])
-      case "symbol?" =>
-        typePred(args, _.isInstanceOf[Value.Symbol])
-      case _ => throw new EvalError(s"unknown procedure: $name")
+      case "string?"        => typePred(args, _.isInstanceOf[Value.StringVal])
+      case "number?"        => typePred(args, _.isInstanceOf[Value.IntVal])
+      case "boolean?"       => typePred(args, _.isInstanceOf[Value.BoolVal])
+      case "pair?"          => typePred(args, _.isInstanceOf[Value.PairVal])
+      case "symbol?"        => typePred(args, _.isInstanceOf[Value.Symbol])
+      case "char?"          => typePred(args, _.isInstanceOf[Value.CharVal])
+      case "string-append"  => evalStringAppend(args)
+      case "string-length"  => evalStringLength(args)
+      case "substring"      => evalSubstring(args)
+      case "string->number" => evalStringToNumber(args)
+      case "number->string" => evalNumberToString(args)
+      case "symbol->string" => evalSymbolToString(args)
+      case "string->symbol" => evalStringToSymbol(args)
+      case "string-ref"     => evalStringRef(args)
+      case _                => throw new EvalError(s"unknown procedure: $name")
 
   private def typePred(
     args: List[Value],
@@ -84,6 +88,11 @@ object Builtins:
         s"expected integer, got: ${other.display}",
         pos
       )
+
+  private def asString(v: Value): String = v match
+    case Value.StringVal(s) => s
+    case other =>
+      throw new EvalError(s"expected string, got: ${other.display}")
 
   private def evalAdd(
     args: List[Value],
@@ -138,6 +147,56 @@ object Builtins:
           "comparison requires exactly 2 arguments"
         )
 
+  private def evalStringAppend(args: List[Value]): Value =
+    Value.StringVal(args.map(asString).mkString)
+
+  private def evalStringLength(args: List[Value]): Value =
+    args match
+      case Value.StringVal(s) :: Nil => Value.IntVal(s.length.toLong)
+      case _ =>
+        throw new EvalError("string-length requires 1 string argument")
+
+  private def evalSubstring(args: List[Value]): Value =
+    args match
+      case Value.StringVal(s) :: Value.IntVal(start) :: Value.IntVal(end) :: Nil =>
+        Value.StringVal(s.substring(start.toInt, end.toInt))
+      case _ =>
+        throw new EvalError("substring requires string, start, end")
+
+  private def evalStringToNumber(args: List[Value]): Value =
+    args match
+      case Value.StringVal(s) :: Nil =>
+        s.toLongOption match
+          case Some(n) => Value.IntVal(n)
+          case None    => Value.BoolVal(false)
+      case _ =>
+        throw new EvalError("string->number requires 1 string argument")
+
+  private def evalNumberToString(args: List[Value]): Value =
+    args match
+      case Value.IntVal(n) :: Nil => Value.StringVal(n.toString)
+      case _ =>
+        throw new EvalError("number->string requires 1 integer argument")
+
+  private def evalSymbolToString(args: List[Value]): Value =
+    args match
+      case Value.Symbol(name, _) :: Nil => Value.StringVal(name)
+      case _ =>
+        throw new EvalError("symbol->string requires 1 symbol argument")
+
+  private def evalStringToSymbol(args: List[Value]): Value =
+    args match
+      case Value.StringVal(s) :: Nil => Value.Symbol(s)
+      case _ =>
+        throw new EvalError("string->symbol requires 1 string argument")
+
+  private def evalStringRef(args: List[Value]): Value =
+    args match
+      case Value.StringVal(s) :: Value.IntVal(i) :: Nil =>
+        Value.CharVal(s.charAt(i.toInt))
+      case _ =>
+        throw new EvalError("string-ref requires string and index")
+
   val defaultEnv: Env = Env(Map.empty, None)
     .define("+", Value.Symbol("+"))
     .define("-", Value.Symbol("-"))
@@ -159,3 +218,15 @@ object Builtins:
     .define("boolean?", Value.Symbol("boolean?"))
     .define("pair?", Value.Symbol("pair?"))
     .define("symbol?", Value.Symbol("symbol?"))
+    .define("char?", Value.Symbol("char?"))
+    .define("display", Value.Symbol("display"))
+    .define("write", Value.Symbol("write"))
+    .define("newline", Value.Symbol("newline"))
+    .define("string-append", Value.Symbol("string-append"))
+    .define("string-length", Value.Symbol("string-length"))
+    .define("substring", Value.Symbol("substring"))
+    .define("string->number", Value.Symbol("string->number"))
+    .define("number->string", Value.Symbol("number->string"))
+    .define("symbol->string", Value.Symbol("symbol->string"))
+    .define("string->symbol", Value.Symbol("string->symbol"))
+    .define("string-ref", Value.Symbol("string-ref"))
