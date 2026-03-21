@@ -9,15 +9,15 @@ object Builtins:
     pos: Option[(Int, Int)]
   ): Value =
     name match
-      case "+"  => evalAdd(args, pos)
-      case "-"  => evalSub(args, pos)
-      case "*"  => evalMul(args, pos)
-      case "/"  => evalDiv(args, pos)
-      case "<"  => evalCmp(args, _ < _, pos)
-      case ">"  => evalCmp(args, _ > _, pos)
-      case "="  => evalCmp(args, _ == _, pos)
-      case "<=" => evalCmp(args, _ <= _, pos)
-      case ">=" => evalCmp(args, _ >= _, pos)
+      case "+"  => MathBuiltins.evalAdd(args, pos)
+      case "-"  => MathBuiltins.evalSub(args, pos)
+      case "*"  => MathBuiltins.evalMul(args, pos)
+      case "/"  => MathBuiltins.evalDiv(args, pos)
+      case "<"  => MathBuiltins.evalCmp(args, _ < _, pos)
+      case ">"  => MathBuiltins.evalCmp(args, _ > _, pos)
+      case "="  => MathBuiltins.evalCmp(args, _ == _, pos)
+      case "<=" => MathBuiltins.evalCmp(args, _ <= _, pos)
+      case ">=" => MathBuiltins.evalCmp(args, _ >= _, pos)
       case "cons" =>
         args match
           case a :: b :: Nil => Value.PairVal(a, b)
@@ -52,17 +52,48 @@ object Builtins:
       case "pair?"    => typePred(args, _.isInstanceOf[Value.PairVal])
       case "symbol?"  => typePred(args, _.isInstanceOf[Value.Symbol])
       case "char?"    => typePred(args, _.isInstanceOf[Value.CharVal])
-      case "string-append"  => evalStringAppend(args)
-      case "string-length"  => evalStringLength(args)
-      case "substring"      => evalSubstring(args)
-      case "string->number" => evalStringToNumber(args)
-      case "number->string" => evalNumberToString(args)
-      case "symbol->string" => evalSymbolToString(args)
-      case "string->symbol" => evalStringToSymbol(args)
-      case "string-ref"     => evalStringRef(args)
-      case "string-copy"    => evalStringCopy(args)
-      case "string-set!"    => evalStringSet(args)
-      case _                => throw new EvalError(s"unknown procedure: $name")
+      case "string-append"    => StringBuiltins.evalStringAppend(args)
+      case "string-length"    => StringBuiltins.evalStringLength(args)
+      case "substring"        => StringBuiltins.evalSubstring(args)
+      case "string->number"   => StringBuiltins.evalStringToNumber(args)
+      case "number->string"   => StringBuiltins.evalNumberToString(args)
+      case "symbol->string"   => StringBuiltins.evalSymbolToString(args)
+      case "string->symbol"   => StringBuiltins.evalStringToSymbol(args)
+      case "string-ref"       => StringBuiltins.evalStringRef(args)
+      case "string-copy"      => StringBuiltins.evalStringCopy(args)
+      case "string-set!"      => StringBuiltins.evalStringSet(args)
+      case "eq?"              => StringBuiltins.evalEq(args)
+      case "equal?"           => StringBuiltins.evalEqual(args)
+      case "abs"              => MathBuiltins.evalAbs(args, pos)
+      case "modulo"           => MathBuiltins.evalModulo(args, pos)
+      case "remainder"        => MathBuiltins.evalRemainder(args, pos)
+      case "quotient"         => MathBuiltins.evalQuotient(args, pos)
+      case "min"              => MathBuiltins.evalMinMax(args, pos, _ min _)
+      case "max"              => MathBuiltins.evalMinMax(args, pos, _ max _)
+      case "expt"             => MathBuiltins.evalExpt(args, pos)
+      case "zero?"            => MathBuiltins.numPred(args, pos, _ == 0L)
+      case "positive?"        => MathBuiltins.numPred(args, pos, _ > 0L)
+      case "negative?"        => MathBuiltins.numPred(args, pos, _ < 0L)
+      case "odd?"             => MathBuiltins.numPred(args, pos, n => math.abs(n % 2) == 1L)
+      case "even?"            => MathBuiltins.numPred(args, pos, _ % 2 == 0L)
+      case "list-ref"         => evalListRef(args)
+      case "list-tail"        => evalListTail(args)
+      case "list?"            => evalListPred(args)
+      case "assoc"            => evalAssoc(args)
+      case "char-alphabetic?" => StringBuiltins.charPred(args, _.isLetter)
+      case "char-numeric?"    => StringBuiltins.charPred(args, _.isDigit)
+      case "char-upcase"      => StringBuiltins.charTransform(args, _.toUpper)
+      case "char-downcase"    => StringBuiltins.charTransform(args, _.toLower)
+      case "char=?"           => StringBuiltins.charCmp(args, _ == _)
+      case "char<?"           => StringBuiltins.charCmp(args, _ < _)
+      case "string=?"         => StringBuiltins.strCmp(args, _ == _)
+      case "string<?"         => StringBuiltins.strCmp(args, _ < _)
+      case "string-ci=?"      => StringBuiltins.strCmp(args, (a, b) => a.equalsIgnoreCase(b))
+      case "string-upcase"    => StringBuiltins.strCase(args, _.toUpperCase)
+      case "string-downcase"  => StringBuiltins.strCase(args, _.toLowerCase)
+      case "integer?"         => typePred(args, _.isInstanceOf[Value.IntVal])
+      case "procedure?"       => typePred(args, v => v.isInstanceOf[Value.LambdaVal] || v.isInstanceOf[Value.Symbol])
+      case _                  => throw new EvalError(s"unknown procedure: $name")
 
   private def typePred(
     args: List[Value],
@@ -80,147 +111,55 @@ object Builtins:
     case Value.PairVal(_, t, _) => 1L + listLength(t)
     case _                      => throw new EvalError("length: not a proper list")
 
-  private def asInt(
-    v: Value,
-    pos: Option[(Int, Int)]
-  ): Long = v match
-    case Value.IntVal(n) => n
-    case other =>
-      throw EvalError.withPos(
-        s"expected integer, got: ${other.display}",
-        pos
-      )
-
-  private def asString(v: Value): String =
-    v.stringContent.getOrElse(
-      throw new EvalError(s"expected string, got: ${v.display}")
-    )
-
-  private def evalAdd(
-    args: List[Value],
-    pos: Option[(Int, Int)]
-  ): Value =
-    Value.IntVal(args.foldLeft(0L)((acc, v) => acc + asInt(v, pos)))
-
-  private def evalSub(
-    args: List[Value],
-    pos: Option[(Int, Int)]
-  ): Value = args match
-    case Nil         => throw new EvalError("- requires at least 1 argument")
-    case head :: Nil => Value.IntVal(-asInt(head, pos))
-    case head :: tail =>
-      Value.IntVal(
-        tail.foldLeft(asInt(head, pos))((a, v) => a - asInt(v, pos))
-      )
-
-  private def evalMul(
-    args: List[Value],
-    pos: Option[(Int, Int)]
-  ): Value =
-    Value.IntVal(args.foldLeft(1L)((acc, v) => acc * asInt(v, pos)))
-
-  private def evalDiv(
-    args: List[Value],
-    pos: Option[(Int, Int)]
-  ): Value = args match
-    case Nil =>
-      throw new EvalError("/ requires at least 1 argument")
-    case head :: Nil =>
-      val d = asInt(head, pos)
-      if d == 0L then throw EvalError.withPos("division by zero", pos)
-      else Value.IntVal(1L / d)
-    case head :: tail =>
-      Value.IntVal(tail.foldLeft(asInt(head, pos)) { (a, v) =>
-        val d = asInt(v, pos)
-        if d == 0L then throw EvalError.withPos("division by zero", pos)
-        else a / d
-      })
-
-  private def evalCmp(
-    args: List[Value],
-    op: (Long, Long) => Boolean,
-    pos: Option[(Int, Int)]
-  ): Value =
+  private def evalListRef(args: List[Value]): Value =
     args match
-      case a :: b :: Nil =>
-        Value.BoolVal(op(asInt(a, pos), asInt(b, pos)))
-      case _ =>
-        throw new EvalError(
-          "comparison requires exactly 2 arguments"
-        )
+      case lst :: Value.IntVal(idx) :: Nil => listRef(lst, idx.toInt)
+      case _                               => throw new EvalError("list-ref requires list and index")
 
-  private def evalStringAppend(args: List[Value]): Value =
-    Value.StringVal(args.map(asString).mkString)
+  @scala.annotation.tailrec
+  private def listRef(v: Value, idx: Int): Value =
+    v match
+      case Value.PairVal(car, cdr, _) =>
+        if idx == 0 then car else listRef(cdr, idx - 1)
+      case _ => throw new EvalError("list-ref: index out of range")
 
-  private def evalStringLength(args: List[Value]): Value =
+  private def evalListTail(args: List[Value]): Value =
     args match
-      case v :: Nil =>
-        val s = asString(v)
-        Value.IntVal(s.length.toLong)
-      case _ =>
-        throw new EvalError("string-length requires 1 string argument")
+      case lst :: Value.IntVal(idx) :: Nil => listTail(lst, idx.toInt)
+      case _                               => throw new EvalError("list-tail requires list and index")
 
-  private def evalSubstring(args: List[Value]): Value =
-    args match
-      case v :: Value.IntVal(start) :: Value.IntVal(end) :: Nil =>
-        val s = asString(v)
-        Value.StringVal(s.substring(start.toInt, end.toInt))
-      case _ =>
-        throw new EvalError("substring requires string, start, end")
+  @scala.annotation.tailrec
+  private def listTail(v: Value, idx: Int): Value =
+    if idx == 0 then v
+    else
+      v match
+        case Value.PairVal(_, cdr, _) => listTail(cdr, idx - 1)
+        case _                        => throw new EvalError("list-tail: index out of range")
 
-  private def evalStringToNumber(args: List[Value]): Value =
+  private def evalListPred(args: List[Value]): Value =
     args match
-      case v :: Nil =>
-        val s = asString(v)
-        s.toLongOption match
-          case Some(n) => Value.IntVal(n)
-          case None    => Value.BoolVal(false)
-      case _ =>
-        throw new EvalError("string->number requires 1 string argument")
+      case v :: Nil => Value.BoolVal(isProperList(v))
+      case _        => throw new EvalError("list? requires exactly 1 argument")
 
-  private def evalNumberToString(args: List[Value]): Value =
-    args match
-      case Value.IntVal(n) :: Nil => Value.StringVal(n.toString)
-      case _ =>
-        throw new EvalError("number->string requires 1 integer argument")
+  @scala.annotation.tailrec
+  private def isProperList(v: Value): Boolean = v match
+    case Value.NilVal           => true
+    case Value.PairVal(_, t, _) => isProperList(t)
+    case _                      => false
 
-  private def evalSymbolToString(args: List[Value]): Value =
+  private def evalAssoc(args: List[Value]): Value =
     args match
-      case Value.Symbol(name, _) :: Nil => Value.StringVal(name)
-      case _ =>
-        throw new EvalError("symbol->string requires 1 symbol argument")
+      case key :: lst :: Nil => assocSearch(key, lst)
+      case _                 => throw new EvalError("assoc requires exactly 2 arguments")
 
-  private def evalStringToSymbol(args: List[Value]): Value =
-    args match
-      case v :: Nil =>
-        val s = asString(v)
-        Value.Symbol(s)
-      case _ =>
-        throw new EvalError("string->symbol requires 1 string argument")
-
-  private def evalStringRef(args: List[Value]): Value =
-    args match
-      case v :: Value.IntVal(i) :: Nil =>
-        val s = asString(v)
-        Value.CharVal(s.charAt(i.toInt))
-      case _ =>
-        throw new EvalError("string-ref requires string and index")
-
-  private def evalStringCopy(args: List[Value]): Value =
-    args match
-      case v :: Nil =>
-        val s = asString(v)
-        Value.MutableStringVal(s.toCharArray)
-      case _ =>
-        throw new EvalError("string-copy requires 1 string argument")
-
-  private def evalStringSet(args: List[Value]): Value =
-    args match
-      case Value.MutableStringVal(chars) :: Value.IntVal(i) :: Value.CharVal(c) :: Nil =>
-        chars(i.toInt) = c
-        Value.VoidVal
-      case _ =>
-        throw new EvalError("string-set! requires mutable string, index, and char")
+  @scala.annotation.tailrec
+  private def assocSearch(key: Value, lst: Value): Value =
+    lst match
+      case Value.NilVal => Value.BoolVal(false)
+      case Value.PairVal(pair @ Value.PairVal(k, _, _), rest, _) =>
+        if StringBuiltins.schemeEqual(key, k) then pair
+        else assocSearch(key, rest)
+      case _ => throw new EvalError("assoc: not a proper alist")
 
   val defaultEnv: Env = Env(Map.empty, None)
     .define("+", Value.Symbol("+"))
@@ -257,6 +196,38 @@ object Builtins:
     .define("string-ref", Value.Symbol("string-ref"))
     .define("string-copy", Value.Symbol("string-copy"))
     .define("string-set!", Value.Symbol("string-set!"))
+    .define("eq?", Value.Symbol("eq?"))
+    .define("equal?", Value.Symbol("equal?"))
+    .define("abs", Value.Symbol("abs"))
+    .define("modulo", Value.Symbol("modulo"))
+    .define("remainder", Value.Symbol("remainder"))
+    .define("quotient", Value.Symbol("quotient"))
+    .define("min", Value.Symbol("min"))
+    .define("max", Value.Symbol("max"))
+    .define("expt", Value.Symbol("expt"))
+    .define("zero?", Value.Symbol("zero?"))
+    .define("positive?", Value.Symbol("positive?"))
+    .define("negative?", Value.Symbol("negative?"))
+    .define("odd?", Value.Symbol("odd?"))
+    .define("even?", Value.Symbol("even?"))
+    .define("list-ref", Value.Symbol("list-ref"))
+    .define("list-tail", Value.Symbol("list-tail"))
+    .define("list?", Value.Symbol("list?"))
+    .define("assoc", Value.Symbol("assoc"))
+    .define("map", Value.Symbol("map"))
+    .define("char-alphabetic?", Value.Symbol("char-alphabetic?"))
+    .define("char-numeric?", Value.Symbol("char-numeric?"))
+    .define("char-upcase", Value.Symbol("char-upcase"))
+    .define("char-downcase", Value.Symbol("char-downcase"))
+    .define("char=?", Value.Symbol("char=?"))
+    .define("char<?", Value.Symbol("char<?"))
+    .define("string=?", Value.Symbol("string=?"))
+    .define("string<?", Value.Symbol("string<?"))
+    .define("string-ci=?", Value.Symbol("string-ci=?"))
+    .define("string-upcase", Value.Symbol("string-upcase"))
+    .define("string-downcase", Value.Symbol("string-downcase"))
+    .define("integer?", Value.Symbol("integer?"))
+    .define("procedure?", Value.Symbol("procedure?"))
     .define("apply", Value.Symbol("apply"))
     .define("call/cc", Value.Symbol("call/cc"))
     .define("call-with-current-continuation", Value.Symbol("call/cc"))

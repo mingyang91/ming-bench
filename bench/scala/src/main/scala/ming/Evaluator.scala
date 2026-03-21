@@ -232,7 +232,9 @@ object Evaluator:
           closureWithSelf.extendVariadic(params, restParam, args, pos)
         evalBodyTail(body, localEnv, out)
       case Value.Symbol("apply", _) =>
-        evalApply(args, pos, out)
+        HigherOrder.evalApply(args, pos, out)
+      case Value.Symbol("map", _) =>
+        HigherOrder.evalMap(args, pos, out)
       case cv: Value.ContinuationVal =>
         if args.length != 1 then throw EvalError.withPos("continuation requires 1 argument", pos)
         throw new ContinuationInvoked(
@@ -258,18 +260,6 @@ object Evaluator:
           s"not a procedure: ${proc.display}",
           pos
         )
-
-  private def evalApply(
-    args: List[Value],
-    pos: Option[(Int, Int)],
-    out: String
-  ): EvalResult =
-    if args.length < 2 then throw EvalError.withPos("apply requires at least 2 arguments", pos)
-    val proc       = args.head
-    val prefixArgs = args.tail.init
-    val lastArg    = args.last
-    val listArgs   = toList(lastArg)
-    applyProcTail(proc, prefixArgs ++ listArgs, pos, out)
 
   private[ming] def isFalsy(v: Value): Boolean = v match
     case Value.BoolVal(false) => true
