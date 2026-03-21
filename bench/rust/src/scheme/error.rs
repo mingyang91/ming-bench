@@ -60,6 +60,10 @@ pub enum EvalError {
     InvalidCharCodePoint(i64),
     #[error("not a procedure: {0}")]
     NotAProcedure(String),
+    #[error("uncaught exception: {0}")]
+    UncaughtException(String),
+    #[error("exception handler returned")]
+    ExceptionHandlerReturned,
 }
 
 impl EvalError {

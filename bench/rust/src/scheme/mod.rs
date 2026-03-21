@@ -114,6 +114,8 @@ type ContinuationRef = Rc<MachineContinuation>;
 type CapturedContinuationRef = Rc<CapturedContinuation>;
 type WindRef = Rc<WindFrame>;
 type WindState = Option<WindRef>;
+type HandlerRef = Rc<HandlerFrame>;
+type HandlerState = Option<HandlerRef>;
 type BindingRef = Rc<RefCell<Value>>;
 
 #[derive(Debug, Clone)]
@@ -256,6 +258,8 @@ enum Builtin {
     Apply,
     CallCc,
     DynamicWind,
+    Raise,
+    WithExceptionHandler,
     Length,
     Display,
     Write,
@@ -342,6 +346,8 @@ impl Builtin {
         Self::Apply,
         Self::CallCc,
         Self::DynamicWind,
+        Self::Raise,
+        Self::WithExceptionHandler,
         Self::Length,
         Self::Display,
         Self::Write,
@@ -428,6 +434,8 @@ impl Builtin {
             Self::Apply => "apply",
             Self::CallCc => "call/cc",
             Self::DynamicWind => "dynamic-wind",
+            Self::Raise => "raise",
+            Self::WithExceptionHandler => "with-exception-handler",
             Self::Length => "length",
             Self::Display => "display",
             Self::Write => "write",
@@ -567,6 +575,7 @@ struct Parameters {
 struct CapturedContinuation {
     machine: ContinuationRef,
     winds: WindState,
+    handlers: HandlerState,
 }
 
 #[derive(Debug)]
@@ -575,6 +584,28 @@ struct WindFrame {
     after: Value,
     parent: WindState,
     pos: SourcePos,
+}
+
+#[derive(Debug)]
+struct HandlerFrame {
+    kind: HandlerKind,
+    parent: HandlerState,
+    winds: WindState,
+}
+
+#[derive(Debug)]
+enum HandlerKind {
+    Guard {
+        var: String,
+        clauses: Rc<[Expr]>,
+        env: EnvRef,
+        next: ContinuationRef,
+        pos: SourcePos,
+    },
+    LowLevel {
+        handler: Value,
+        pos: SourcePos,
+    },
 }
 
 #[derive(Debug)]
@@ -662,6 +693,20 @@ enum MachineContinuation {
     },
     CallCcReturn {
         resume: ContinuationRef,
+    },
+    WithExceptionHandlerReturn {
+        frame: HandlerRef,
+        next: ContinuationRef,
+    },
+    GuardReturn {
+        frame: HandlerRef,
+        next: ContinuationRef,
+    },
+    InvokeExceptionHandler {
+        frame: HandlerRef,
+    },
+    LowLevelHandlerReturn {
+        frame: HandlerRef,
     },
     DynamicWindEnter {
         wind: WindRef,
@@ -775,6 +820,7 @@ fn run_machine(exprs: &[Expr], env: EnvRef, ctx: &mut EvalContext) -> Result<Val
     let halt = Rc::new(MachineContinuation::Halt);
     let (mut control, mut cont) = schedule_sequence(exprs, env, halt);
     let mut winds: WindState = None;
+    let mut handlers: HandlerState = None;
 
     loop {
         match control {
@@ -792,8 +838,10 @@ fn run_machine(exprs: &[Expr], env: EnvRef, ctx: &mut EvalContext) -> Result<Val
                         })?;
                         (MachineControl::Value(value), cont)
                     }
-                    ExprKind::List(items) => schedule_list_eval(items, expr.pos, env, cont, ctx)
-                        .map_err(|err| err.with_position(expr.pos))?,
+                    ExprKind::List(items) => {
+                        schedule_list_eval(items, expr.pos, env, cont, &winds, &mut handlers, ctx)
+                            .map_err(|err| err.with_position(expr.pos))?
+                    }
                 };
 
                 control = next_control;
@@ -826,6 +874,7 @@ fn run_machine(exprs: &[Expr], env: EnvRef, ctx: &mut EvalContext) -> Result<Val
                         args: vec![Value::Continuation(Rc::new(CapturedContinuation {
                             machine: resume.clone(),
                             winds: winds.clone(),
+                            handlers: handlers.clone(),
                         }))],
                         pos,
                     };
@@ -852,6 +901,47 @@ fn run_machine(exprs: &[Expr], env: EnvRef, ctx: &mut EvalContext) -> Result<Val
                         wind,
                         body: args[1].clone(),
                         pos,
+                        next: cont.clone(),
+                    });
+                }
+                Value::Builtin(Builtin::Raise) => {
+                    if args.len() != 1 {
+                        return Err(
+                            wrong_arg_count("raise", "exactly 1", args.len()).with_position(pos)
+                        );
+                    }
+
+                    let (next_control, next_cont) =
+                        raise_exception(args[0].clone(), pos, &mut winds, &mut handlers)?;
+                    control = next_control;
+                    cont = next_cont;
+                }
+                Value::Builtin(Builtin::WithExceptionHandler) => {
+                    if args.len() != 2 {
+                        return Err(wrong_arg_count(
+                            "with-exception-handler",
+                            "exactly 2",
+                            args.len(),
+                        )
+                        .with_position(pos));
+                    }
+
+                    let frame = Rc::new(HandlerFrame {
+                        kind: HandlerKind::LowLevel {
+                            handler: args[0].clone(),
+                            pos,
+                        },
+                        parent: handlers.clone(),
+                        winds: winds.clone(),
+                    });
+                    handlers = Some(frame.clone());
+                    control = MachineControl::Apply {
+                        function: args[1].clone(),
+                        args: Vec::new(),
+                        pos,
+                    };
+                    cont = Rc::new(MachineContinuation::WithExceptionHandlerReturn {
+                        frame,
                         next: cont.clone(),
                     });
                 }
@@ -883,8 +973,12 @@ fn run_machine(exprs: &[Expr], env: EnvRef, ctx: &mut EvalContext) -> Result<Val
                             .with_position(pos));
                     }
 
-                    let (next_control, next_cont) =
-                        prepare_continuation_jump(args[0].clone(), saved, &mut winds);
+                    let (next_control, next_cont) = prepare_continuation_jump(
+                        args[0].clone(),
+                        saved,
+                        &mut winds,
+                        &mut handlers,
+                    );
                     control = next_control;
                     cont = next_cont;
                 }
@@ -901,6 +995,52 @@ fn run_machine(exprs: &[Expr], env: EnvRef, ctx: &mut EvalContext) -> Result<Val
                 MachineContinuation::CallCcReturn { resume } => {
                     control = MachineControl::Value(value.clone());
                     cont = resume.clone();
+                }
+                MachineContinuation::WithExceptionHandlerReturn { frame, next } => {
+                    handlers = frame.parent.clone();
+                    control = MachineControl::Value(value);
+                    cont = next.clone();
+                }
+                MachineContinuation::GuardReturn { frame, next } => {
+                    handlers = frame.parent.clone();
+                    control = MachineControl::Value(value);
+                    cont = next.clone();
+                }
+                MachineContinuation::InvokeExceptionHandler { frame } => match &frame.kind {
+                    HandlerKind::Guard {
+                        var,
+                        clauses,
+                        env,
+                        next,
+                        pos,
+                    } => {
+                        let local_env = Env::child(env.clone());
+                        Env::define(&local_env, var.clone(), value);
+                        let (next_control, next_cont) = schedule_guard_handler_clauses(
+                            var,
+                            clauses,
+                            local_env,
+                            *pos,
+                            next.clone(),
+                        )?;
+                        control = next_control;
+                        cont = next_cont;
+                    }
+                    HandlerKind::LowLevel { handler, pos } => {
+                        control = MachineControl::Apply {
+                            function: handler.clone(),
+                            args: vec![value],
+                            pos: *pos,
+                        };
+                        cont = Rc::new(MachineContinuation::LowLevelHandlerReturn {
+                            frame: frame.clone(),
+                        });
+                    }
+                },
+                MachineContinuation::LowLevelHandlerReturn { frame } => {
+                    return Err(
+                        EvalError::ExceptionHandlerReturned.with_position(handler_frame_pos(frame))
+                    );
                 }
                 MachineContinuation::DynamicWindEnter {
                     wind,
@@ -960,6 +1100,7 @@ fn run_machine(exprs: &[Expr], env: EnvRef, ctx: &mut EvalContext) -> Result<Val
                         });
                     } else if enters.is_empty() {
                         winds = target.winds.clone();
+                        handlers = target.handlers.clone();
                         control = MachineControl::Value(jump_value.clone());
                         cont = target.machine.clone();
                     } else {
@@ -1002,6 +1143,7 @@ fn run_machine(exprs: &[Expr], env: EnvRef, ctx: &mut EvalContext) -> Result<Val
                         });
                     } else {
                         winds = target.winds.clone();
+                        handlers = target.handlers.clone();
                         control = MachineControl::Value(jump_value.clone());
                         cont = target.machine.clone();
                     }
@@ -1275,6 +1417,7 @@ fn prepare_continuation_jump(
     value: Value,
     target: CapturedContinuationRef,
     winds: &mut WindState,
+    handlers: &mut HandlerState,
 ) -> (MachineControl, ContinuationRef) {
     let (exits, enters) = split_wind_transfer(winds, &target.winds);
 
@@ -1313,6 +1456,7 @@ fn prepare_continuation_jump(
     }
 
     *winds = target.winds.clone();
+    *handlers = target.handlers.clone();
     (MachineControl::Value(value), target.machine.clone())
 }
 
@@ -1361,6 +1505,8 @@ fn schedule_list_eval(
     pos: SourcePos,
     env: EnvRef,
     next: ContinuationRef,
+    winds: &WindState,
+    handlers: &mut HandlerState,
     ctx: &mut EvalContext,
 ) -> Result<(MachineControl, ContinuationRef), EvalError> {
     let Some((head, args)) = items.split_first() else {
@@ -1374,6 +1520,9 @@ fn schedule_list_eval(
     match &head.kind {
         ExprKind::Symbol(name) if name == "and" => Ok(schedule_and(args, env, next)),
         ExprKind::Symbol(name) if name == "or" => Ok(schedule_or(args, env, next)),
+        ExprKind::Symbol(name) if name == "guard" => {
+            schedule_guard(args, pos, env, next, winds, handlers)
+        }
         ExprKind::Symbol(name) if name == "if" => {
             if !(2..=3).contains(&args.len()) {
                 return Err(wrong_arg_count("if", "2 or 3", args.len()));
@@ -1391,7 +1540,13 @@ fn schedule_list_eval(
         }
         ExprKind::Symbol(name) if name == "let" => schedule_let(args, pos, env, next),
         ExprKind::Symbol(name) if name == "letrec" => Ok((
-            MachineControl::Value(eval_letrec(args, "letrec", RecursiveBindingMode::Parallel, env, ctx)?),
+            MachineControl::Value(eval_letrec(
+                args,
+                "letrec",
+                RecursiveBindingMode::Parallel,
+                env,
+                ctx,
+            )?),
             next,
         )),
         ExprKind::Symbol(name) if name == "letrec*" => Ok((
@@ -1757,6 +1912,14 @@ fn eval_expr(expr: &Expr, env: EnvRef, ctx: &mut EvalContext) -> Result<Value, E
     }
 }
 
+fn eval_expr_via_machine(
+    expr: &Expr,
+    env: EnvRef,
+    ctx: &mut EvalContext,
+) -> Result<Value, EvalError> {
+    run_machine(std::slice::from_ref(expr), env, ctx)
+}
+
 fn eval_list(
     items: &[Expr],
     pos: SourcePos,
@@ -1772,6 +1935,9 @@ fn eval_list(
     }
 
     match &head.kind {
+        ExprKind::Symbol(name) if name == "guard" => {
+            eval_expr_via_machine(&Expr::new(ExprKind::List(items.to_vec()), pos), env, ctx)
+        }
         ExprKind::Symbol(name) if name == "and" => eval_and(args, env, ctx),
         ExprKind::Symbol(name) if name == "or" => eval_or(args, env, ctx),
         ExprKind::Symbol(name) if name == "if" => eval_if(args, env, ctx),
@@ -1792,6 +1958,21 @@ fn eval_list(
         ExprKind::Symbol(name) if name == "lambda" => eval_lambda(args, env),
         _ => {
             let procedure = eval_expr(head, env.clone(), ctx)?;
+            if matches!(
+                procedure,
+                Value::Builtin(
+                    Builtin::CallCc
+                        | Builtin::DynamicWind
+                        | Builtin::Raise
+                        | Builtin::WithExceptionHandler
+                )
+            ) {
+                return eval_expr_via_machine(
+                    &Expr::new(ExprKind::List(items.to_vec()), pos),
+                    env,
+                    ctx,
+                );
+            }
             let mut evaluated = Vec::with_capacity(args.len());
             for arg in args {
                 evaluated.push(eval_expr(arg, env.clone(), ctx)?);
@@ -1816,6 +1997,10 @@ fn eval_tail_list(
     }
 
     match &head.kind {
+        ExprKind::Symbol(name) if name == "guard" => {
+            eval_expr_via_machine(&Expr::new(ExprKind::List(items.to_vec()), pos), env, ctx)
+                .map(TailOutcome::Value)
+        }
         ExprKind::Symbol(name) if name == "and" => eval_tail_and(args, env, ctx),
         ExprKind::Symbol(name) if name == "or" => eval_tail_or(args, env, ctx),
         ExprKind::Symbol(name) if name == "if" => eval_tail_if(args, env, ctx),
@@ -1844,6 +2029,22 @@ fn eval_tail_list(
         }
         _ => {
             let procedure = eval_expr(head, env.clone(), ctx)?;
+            if matches!(
+                procedure,
+                Value::Builtin(
+                    Builtin::CallCc
+                        | Builtin::DynamicWind
+                        | Builtin::Raise
+                        | Builtin::WithExceptionHandler
+                )
+            ) {
+                return eval_expr_via_machine(
+                    &Expr::new(ExprKind::List(items.to_vec()), pos),
+                    env,
+                    ctx,
+                )
+                .map(TailOutcome::Value);
+            }
             let mut evaluated = Vec::with_capacity(args.len());
             for arg in args {
                 evaluated.push(eval_expr(arg, env.clone(), ctx)?);
@@ -2139,6 +2340,126 @@ fn eval_tail_cond(
     }
 
     Ok(TailOutcome::Value(Value::Void))
+}
+
+fn schedule_guard(
+    args: &[Expr],
+    pos: SourcePos,
+    env: EnvRef,
+    next: ContinuationRef,
+    winds: &WindState,
+    handlers: &mut HandlerState,
+) -> Result<(MachineControl, ContinuationRef), EvalError> {
+    let (var, clauses, body) = parse_guard_form(args)?;
+    let frame = Rc::new(HandlerFrame {
+        kind: HandlerKind::Guard {
+            var,
+            clauses: Rc::from(clauses.to_vec()),
+            env: env.clone(),
+            next: next.clone(),
+            pos,
+        },
+        parent: handlers.clone(),
+        winds: winds.clone(),
+    });
+    *handlers = Some(frame.clone());
+
+    let (control, cont) = schedule_sequence(
+        body,
+        env,
+        Rc::new(MachineContinuation::GuardReturn { frame, next }),
+    );
+    Ok((control, cont))
+}
+
+fn parse_guard_form<'a>(args: &'a [Expr]) -> Result<(String, &'a [Expr], &'a [Expr]), EvalError> {
+    let Some((spec, body)) = args.split_first() else {
+        return Err(wrong_arg_count("guard", "at least 2", args.len()));
+    };
+    if body.is_empty() {
+        return Err(wrong_arg_count("guard", "at least 2", args.len()));
+    }
+
+    let ExprKind::List(spec_items) = &spec.kind else {
+        return Err(EvalError::Syntax(
+            "guard requires an exception variable and clauses".into(),
+        ));
+    };
+    let Some((var, clauses)) = spec_items.split_first() else {
+        return Err(EvalError::Syntax(
+            "guard requires an exception variable".into(),
+        ));
+    };
+
+    Ok((
+        expect_symbol(var, "guard exception variable")?,
+        clauses,
+        body,
+    ))
+}
+
+fn schedule_guard_handler_clauses(
+    var: &str,
+    clauses: &[Expr],
+    env: EnvRef,
+    pos: SourcePos,
+    next: ContinuationRef,
+) -> Result<(MachineControl, ContinuationRef), EvalError> {
+    let has_else = clauses.iter().any(cond_clause_is_else);
+
+    if has_else {
+        return schedule_cond(clauses, 0, env, next);
+    }
+
+    let raise_symbol = Expr::new(ExprKind::Symbol("raise".to_string()), pos);
+    let exn_symbol = Expr::new(ExprKind::Symbol(var.to_string()), pos);
+    let raise_expr = Expr::new(ExprKind::List(vec![raise_symbol, exn_symbol]), pos);
+    let else_clause = Expr::new(
+        ExprKind::List(vec![
+            Expr::new(ExprKind::Symbol("else".to_string()), pos),
+            raise_expr,
+        ]),
+        pos,
+    );
+
+    let mut all_clauses = clauses.to_vec();
+    all_clauses.push(else_clause);
+    schedule_cond(&all_clauses, 0, env, next)
+}
+
+fn cond_clause_is_else(clause: &Expr) -> bool {
+    matches!(
+        &clause.kind,
+        ExprKind::List(items)
+            if matches!(items.first(), Some(first) if matches!(&first.kind, ExprKind::Symbol(name) if name == "else"))
+    )
+}
+
+fn raise_exception(
+    value: Value,
+    pos: SourcePos,
+    winds: &mut WindState,
+    handlers: &mut HandlerState,
+) -> Result<(MachineControl, ContinuationRef), EvalError> {
+    let Some(frame) = handlers.clone() else {
+        return Err(EvalError::UncaughtException(value.to_string()).with_position(pos));
+    };
+
+    let target = Rc::new(CapturedContinuation {
+        machine: Rc::new(MachineContinuation::InvokeExceptionHandler {
+            frame: frame.clone(),
+        }),
+        winds: frame.winds.clone(),
+        handlers: frame.parent.clone(),
+    });
+
+    Ok(prepare_continuation_jump(value, target, winds, handlers))
+}
+
+fn handler_frame_pos(frame: &HandlerRef) -> SourcePos {
+    match &frame.kind {
+        HandlerKind::Guard { pos, .. } | HandlerKind::LowLevel { pos, .. } => *pos,
+    }
 }
 
 fn eval_case(args: &[Expr], env: EnvRef, ctx: &mut EvalContext) -> Result<Value, EvalError> {
@@ -2979,6 +3300,7 @@ fn is_syntax_keyword(name: &str) -> bool {
         name,
         "and"
             | "or"
+            | "guard"
             | "if"
             | "let"
             | "begin"
@@ -3152,12 +3474,14 @@ fn eval_case_clauses(
 ) -> Result<Value, EvalError> {
     for (index, clause) in clauses.iter().enumerate() {
         let ExprKind::List(items) = &clause.kind else {
-            return Err(EvalError::Syntax("case clauses must be lists".into())
-                .with_position(clause.pos));
+            return Err(
+                EvalError::Syntax("case clauses must be lists".into()).with_position(clause.pos)
+            );
         };
         let Some((datums_expr, body)) = items.split_first() else {
-            return Err(EvalError::Syntax("case clauses cannot be empty".into())
-                .with_position(clause.pos));
+            return Err(
+                EvalError::Syntax("case clauses cannot be empty".into()).with_position(clause.pos)
+            );
         };
 
         match &datums_expr.kind {
@@ -3173,7 +3497,10 @@ fn eval_case_clauses(
                 return eval_sequence(body, env, ctx);
             }
             ExprKind::List(datums) => {
-                if datums.iter().any(|datum| values_eqv(key, &quote_expr(datum))) {
+                if datums
+                    .iter()
+                    .any(|datum| values_eqv(key, &quote_expr(datum)))
+                {
                     if body.is_empty() {
                         return Err(EvalError::Syntax("case clause requires a body".into())
                             .with_position(clause.pos));
@@ -3182,8 +3509,10 @@ fn eval_case_clauses(
                 }
             }
             _ => {
-                return Err(EvalError::Syntax("case clause datums must be a list".into())
-                    .with_position(datums_expr.pos));
+                return Err(
+                    EvalError::Syntax("case clause datums must be a list".into())
+                        .with_position(datums_expr.pos),
+                );
             }
         }
     }
@@ -3199,12 +3528,14 @@ fn eval_tail_case_clauses(
 ) -> Result<TailOutcome, EvalError> {
     for (index, clause) in clauses.iter().enumerate() {
         let ExprKind::List(items) = &clause.kind else {
-            return Err(EvalError::Syntax("case clauses must be lists".into())
-                .with_position(clause.pos));
+            return Err(
+                EvalError::Syntax("case clauses must be lists".into()).with_position(clause.pos)
+            );
         };
         let Some((datums_expr, body)) = items.split_first() else {
-            return Err(EvalError::Syntax("case clauses cannot be empty".into())
-                .with_position(clause.pos));
+            return Err(
+                EvalError::Syntax("case clauses cannot be empty".into()).with_position(clause.pos)
+            );
         };
 
         match &datums_expr.kind {
@@ -3220,7 +3551,10 @@ fn eval_tail_case_clauses(
                 return eval_tail_sequence(body, env, ctx);
             }
             ExprKind::List(datums) => {
-                if datums.iter().any(|datum| values_eqv(key, &quote_expr(datum))) {
+                if datums
+                    .iter()
+                    .any(|datum| values_eqv(key, &quote_expr(datum)))
+                {
                     if body.is_empty() {
                         return Err(EvalError::Syntax("case clause requires a body".into())
                             .with_position(clause.pos));
@@ -3229,8 +3563,10 @@ fn eval_tail_case_clauses(
                 }
             }
             _ => {
-                return Err(EvalError::Syntax("case clause datums must be a list".into())
-                    .with_position(datums_expr.pos));
+                return Err(
+                    EvalError::Syntax("case clause datums must be a list".into())
+                        .with_position(datums_expr.pos),
+                );
             }
         }
     }
@@ -3605,10 +3941,13 @@ fn apply_builtin(
             }
 
             let index = usize::try_from(index).map_err(|_| EvalError::IntegerOverflow)?;
-            let value = items.get(index).cloned().ok_or(EvalError::IndexOutOfBounds {
-                index: i64::try_from(index).map_err(|_| EvalError::IntegerOverflow)?,
-                len,
-            })?;
+            let value = items
+                .get(index)
+                .cloned()
+                .ok_or(EvalError::IndexOutOfBounds {
+                    index: i64::try_from(index).map_err(|_| EvalError::IntegerOverflow)?,
+                    len,
+                })?;
             Ok(value)
         }
         Builtin::VectorSet => {
@@ -3639,7 +3978,8 @@ fn apply_builtin(
             }
 
             let vector = expect_vector_value(name, &args[0])?;
-            let len = i64::try_from(vector.borrow().len()).map_err(|_| EvalError::IntegerOverflow)?;
+            let len =
+                i64::try_from(vector.borrow().len()).map_err(|_| EvalError::IntegerOverflow)?;
             Ok(Value::Number(len))
         }
         Builtin::VectorPred => {
@@ -3686,6 +4026,10 @@ fn apply_builtin(
         Builtin::Apply => unreachable!("apply is handled by dispatch_builtin_call"),
         Builtin::CallCc => unreachable!("call/cc is handled by the machine runtime"),
         Builtin::DynamicWind => unreachable!("dynamic-wind is handled by the machine runtime"),
+        Builtin::Raise => unreachable!("raise is handled by the machine runtime"),
+        Builtin::WithExceptionHandler => {
+            unreachable!("with-exception-handler is handled by the machine runtime")
+        }
         Builtin::Length => {
             if args.len() != 1 {
                 return Err(wrong_arg_count(name, "exactly 1", args.len()));
