@@ -55,6 +55,7 @@ enum Value {
         cc: Rc<RefCell<CcStateInner>>,
     },
     CcState(Rc<RefCell<CcStateInner>>),
+    Vector(Rc<RefCell<Vec<Value>>>),
     SyntaxRules {
         name: String,
         literals: Vec<String>,
@@ -78,6 +79,11 @@ impl Value {
             }
             Value::SyntaxRules { .. } => "#<syntax>".to_string(),
             Value::CcState(_) => "#<cc-state>".to_string(),
+            Value::Vector(v) => {
+                let elems = v.borrow();
+                let inner: Vec<String> = elems.iter().map(|e| e.display()).collect();
+                format!("#({})", inner.join(" "))
+            }
             Value::Pair(..) => self.fmt_list(false),
         }
     }
@@ -87,6 +93,11 @@ impl Value {
         match self {
             Value::String(s) => s.clone(),
             Value::Char(c) => c.to_string(),
+            Value::Vector(v) => {
+                let elems = v.borrow();
+                let inner: Vec<String> = elems.iter().map(|e| e.display_human()).collect();
+                format!("#({})", inner.join(" "))
+            }
             Value::Pair(..) => self.fmt_list(true),
             _ => self.display(),
         }
@@ -148,6 +159,7 @@ impl PartialEq for Value {
                 Value::Continuation { expr_idx: b, .. },
             ) => a == b,
             (Value::SyntaxRules { name: a, .. }, Value::SyntaxRules { name: b, .. }) => a == b,
+            (Value::Vector(a), Value::Vector(b)) => Rc::ptr_eq(a, b),
             _ => false,
         }
     }

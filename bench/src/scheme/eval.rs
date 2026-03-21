@@ -37,7 +37,7 @@ fn eval_bounce(value: &Value, env: &mut Env, out: &mut String) -> Result<Bounce,
     match value {
         Value::Integer(_) | Value::Boolean(_) | Value::String(_) | Value::Char(_)
         | Value::Lambda { .. } | Value::BuiltinProc(_) | Value::Continuation { .. }
-        | Value::CcState(_) | Value::SyntaxRules { .. } => Ok(Bounce::Done(value.clone())),
+        | Value::CcState(_) | Value::SyntaxRules { .. } | Value::Vector(_) => Ok(Bounce::Done(value.clone())),
         Value::Nil => Ok(Bounce::Done(Value::Nil)),
         Value::Symbol(name) => {
             if let Some(rc) = env.get(name) {
@@ -272,6 +272,98 @@ fn apply_proc_bounce(
     }
 }
 
+/// Vector builtins dispatched with already-evaluated values.
+fn apply_vector_builtin(name: &str, args: &[Value]) -> Result<Value, EvalError> {
+    match name {
+        "vector" => Ok(Value::Vector(Rc::new(RefCell::new(args.to_vec())))),
+        "vector?" => {
+            let [a] = args else {
+                return Err(EvalError::WrongArgCount { expected: 1, got: args.len() });
+            };
+            Ok(Value::Boolean(matches!(a, Value::Vector(_))))
+        }
+        "vector-ref" => {
+            let [vec_val, idx_val] = args else {
+                return Err(EvalError::WrongArgCount { expected: 2, got: args.len() });
+            };
+            let Value::Vector(v) = vec_val else {
+                return Err(EvalError::TypeError { expected: "vector".to_string(), got: vec_val.display() });
+            };
+            let Value::Integer(i) = idx_val else {
+                return Err(EvalError::TypeError { expected: "integer".to_string(), got: idx_val.display() });
+            };
+            let elems = v.borrow();
+            elems.get(*i as usize).cloned().ok_or_else(|| EvalError::TypeError {
+                expected: format!("index < {}", elems.len()),
+                got: i.to_string(),
+            })
+        }
+        "vector-set!" => {
+            let [vec_val, idx_val, new_val] = args else {
+                return Err(EvalError::WrongArgCount { expected: 3, got: args.len() });
+            };
+            let Value::Vector(v) = vec_val else {
+                return Err(EvalError::TypeError { expected: "vector".to_string(), got: vec_val.display() });
+            };
+            let Value::Integer(i) = idx_val else {
+                return Err(EvalError::TypeError { expected: "integer".to_string(), got: idx_val.display() });
+            };
+            let idx = *i as usize;
+            let mut elems = v.borrow_mut();
+            if idx >= elems.len() {
+                return Err(EvalError::TypeError {
+                    expected: format!("index < {}", elems.len()),
+                    got: i.to_string(),
+                });
+            }
+            elems[idx] = new_val.clone();
+            Ok(Value::Nil)
+        }
+        "vector-length" => {
+            let [vec_val] = args else {
+                return Err(EvalError::WrongArgCount { expected: 1, got: args.len() });
+            };
+            let Value::Vector(v) = vec_val else {
+                return Err(EvalError::TypeError { expected: "vector".to_string(), got: vec_val.display() });
+            };
+            let len = v.borrow().len() as i64;
+            Ok(Value::Integer(len))
+        }
+        "vector->list" => {
+            let [vec_val] = args else {
+                return Err(EvalError::WrongArgCount { expected: 1, got: args.len() });
+            };
+            let Value::Vector(v) = vec_val else {
+                return Err(EvalError::TypeError { expected: "vector".to_string(), got: vec_val.display() });
+            };
+            let elems = v.borrow();
+            Ok(elems.iter().rev().fold(Value::Nil, |acc, item| {
+                Value::Pair(Box::new(item.clone()), Box::new(acc))
+            }))
+        }
+        "list->vector" => {
+            let [list_val] = args else {
+                return Err(EvalError::WrongArgCount { expected: 1, got: args.len() });
+            };
+            let items = list_val.to_list_vec().ok_or_else(|| EvalError::TypeError {
+                expected: "proper list".to_string(),
+                got: list_val.display(),
+            })?;
+            Ok(Value::Vector(Rc::new(RefCell::new(items))))
+        }
+        "make-vector" => {
+            let [size_val, fill_val] = args else {
+                return Err(EvalError::WrongArgCount { expected: 2, got: args.len() });
+            };
+            let Value::Integer(n) = size_val else {
+                return Err(EvalError::TypeError { expected: "integer".to_string(), got: size_val.display() });
+            };
+            Ok(Value::Vector(Rc::new(RefCell::new(vec![fill_val.clone(); *n as usize]))))
+        }
+        _ => unreachable!("not a vector builtin: {name}"),
+    }
+}
+
 /// Call a builtin by name with already-evaluated argument values.
 fn call_builtin_with_values(
     name: &str,
@@ -351,6 +443,8 @@ fn call_builtin_with_values(
             let result = match name { "<" => l < r, ">" => l > r, "=" => l == r, "<=" => l <= r, ">=" => l >= r, _ => unreachable!() };
             Ok(Value::Boolean(result))
         }
+        "vector" | "vector?" | "vector-ref" | "vector-set!" | "vector-length"
+        | "vector->list" | "list->vector" | "make-vector" => apply_vector_builtin(name, args),
         "apply" => eval_apply(args, env, out),
         "call/cc" | "call-with-current-continuation" => {
             let [proc] = args else {
@@ -996,6 +1090,8 @@ fn is_builtin(name: &str) -> bool {
             | "char->integer" | "integer->char"
             | "eq?" | "eqv?" | "equal?"
             | "map"
+            | "vector" | "make-vector" | "vector-ref" | "vector-set!"
+            | "vector-length" | "vector?" | "vector->list" | "list->vector"
     )
 }
 
@@ -1024,6 +1120,8 @@ fn eval_builtin(
         "eq?" | "eqv?" => eval_eqv(args, env, out),
         "equal?" => eval_equal(args, env, out),
         "map" => eval_map(args, env, out),
+        "vector" | "make-vector" | "vector-ref" | "vector-set!" | "vector-length"
+        | "vector?" | "vector->list" | "list->vector" => eval_vector_builtin(name, args, env, out),
         "display" => eval_display(args, env, out),
         "write" => eval_write(args, env, out),
         "newline" => eval_newline(args, out),
@@ -1558,6 +1656,140 @@ fn eval_substring(
         }
     };
     Ok(Value::String(s[start..end].to_string()))
+}
+
+fn eval_vector_builtin(
+    name: &str,
+    args: &[Value],
+    env: &mut Env,
+    out: &mut String,
+) -> Result<Value, EvalError> {
+    match name {
+        "vector" => {
+            let values: Vec<Value> = args
+                .iter()
+                .map(|a| eval(a, env, out))
+                .collect::<Result<_, _>>()?;
+            Ok(Value::Vector(Rc::new(RefCell::new(values))))
+        }
+        "make-vector" => {
+            let [size_expr, fill_expr] = args else {
+                return Err(EvalError::WrongArgCount { expected: 2, got: args.len() });
+            };
+            let size_val = eval(size_expr, env, out)?;
+            let Value::Integer(n) = size_val else {
+                return Err(EvalError::TypeError {
+                    expected: "integer".to_string(),
+                    got: size_val.display(),
+                });
+            };
+            let fill = eval(fill_expr, env, out)?;
+            Ok(Value::Vector(Rc::new(RefCell::new(vec![fill; n as usize]))))
+        }
+        "vector-ref" => {
+            let [vec_expr, idx_expr] = args else {
+                return Err(EvalError::WrongArgCount { expected: 2, got: args.len() });
+            };
+            let vec_val = eval(vec_expr, env, out)?;
+            let Value::Vector(v) = vec_val else {
+                return Err(EvalError::TypeError {
+                    expected: "vector".to_string(),
+                    got: vec_val.display(),
+                });
+            };
+            let idx_val = eval(idx_expr, env, out)?;
+            let Value::Integer(i) = idx_val else {
+                return Err(EvalError::TypeError {
+                    expected: "integer".to_string(),
+                    got: idx_val.display(),
+                });
+            };
+            let elems = v.borrow();
+            elems.get(i as usize).cloned().ok_or_else(|| EvalError::TypeError {
+                expected: format!("index < {}", elems.len()),
+                got: i.to_string(),
+            })
+        }
+        "vector-set!" => {
+            let [vec_expr, idx_expr, val_expr] = args else {
+                return Err(EvalError::WrongArgCount { expected: 3, got: args.len() });
+            };
+            let vec_val = eval(vec_expr, env, out)?;
+            let Value::Vector(v) = vec_val else {
+                return Err(EvalError::TypeError {
+                    expected: "vector".to_string(),
+                    got: vec_val.display(),
+                });
+            };
+            let idx_val = eval(idx_expr, env, out)?;
+            let Value::Integer(i) = idx_val else {
+                return Err(EvalError::TypeError {
+                    expected: "integer".to_string(),
+                    got: idx_val.display(),
+                });
+            };
+            let new_val = eval(val_expr, env, out)?;
+            let mut elems = v.borrow_mut();
+            let idx = i as usize;
+            if idx >= elems.len() {
+                return Err(EvalError::TypeError {
+                    expected: format!("index < {}", elems.len()),
+                    got: i.to_string(),
+                });
+            }
+            elems[idx] = new_val;
+            Ok(Value::Nil)
+        }
+        "vector-length" => {
+            let [vec_expr] = args else {
+                return Err(EvalError::WrongArgCount { expected: 1, got: args.len() });
+            };
+            let vec_val = eval(vec_expr, env, out)?;
+            let Value::Vector(v) = vec_val else {
+                return Err(EvalError::TypeError {
+                    expected: "vector".to_string(),
+                    got: vec_val.display(),
+                });
+            };
+            let len = v.borrow().len() as i64;
+            Ok(Value::Integer(len))
+        }
+        "vector?" => {
+            let [expr] = args else {
+                return Err(EvalError::WrongArgCount { expected: 1, got: args.len() });
+            };
+            let val = eval(expr, env, out)?;
+            Ok(Value::Boolean(matches!(val, Value::Vector(_))))
+        }
+        "vector->list" => {
+            let [vec_expr] = args else {
+                return Err(EvalError::WrongArgCount { expected: 1, got: args.len() });
+            };
+            let vec_val = eval(vec_expr, env, out)?;
+            let Value::Vector(v) = vec_val else {
+                return Err(EvalError::TypeError {
+                    expected: "vector".to_string(),
+                    got: vec_val.display(),
+                });
+            };
+            let elems = v.borrow();
+            Ok(elems.iter().rev().fold(Value::Nil, |acc, item| {
+                Value::Pair(Box::new(item.clone()), Box::new(acc))
+            }))
+        }
+        "list->vector" => {
+            let [list_expr] = args else {
+                return Err(EvalError::WrongArgCount { expected: 1, got: args.len() });
+            };
+            let list_val = eval(list_expr, env, out)?;
+            let items = list_val.to_list_vec().ok_or_else(|| EvalError::TypeError {
+                expected: "proper list".to_string(),
+                got: list_val.display(),
+            })?;
+            Ok(Value::Vector(Rc::new(RefCell::new(items))))
+        }
+        _ => unreachable!("unknown vector builtin: {name}"),
+    }
 }
 
 fn eval_string_set(
