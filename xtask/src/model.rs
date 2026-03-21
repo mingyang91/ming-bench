@@ -331,10 +331,10 @@ pub fn elapsed_secs(meta: &MetaJson) -> Option<u64> {
 // Level constants
 // ---------------------------------------------------------------------------
 
-pub const LEVELS: [&str; 20] = [
+pub const LEVELS: [&str; 23] = [
     "01", "02", "03", "04", "05", "06", "07", "08", "09",
     "10", "11", "12", "13", "14", "15", "16", "17", "18",
-    "19", "20",
+    "19", "20", "21", "22", "23",
 ];
 
 // ---------------------------------------------------------------------------
@@ -361,7 +361,8 @@ pub fn turns_for_level(level_num: u32, max_turns: Option<u32>) -> u32 {
         14..=15 => 45,
         16..=18 => 60,  // maintenance stress: dynamic-wind, guard, values
         19..=20 => 75,  // data model extensions: exact arith, records
-        _ => 75,        // future levels (L21+)
+        21..=23 => 75,  // advanced: pair mutation, syntax-case, integration
+        _ => 75,        // future levels
     }
 }
 

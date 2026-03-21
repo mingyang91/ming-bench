@@ -88,3 +88,12 @@ Numbers are either exact or inexact. Integers are exact. Division of exact integ
 
 ### Level 20 — define-record-type
 R7RS `define-record-type` creates a new disjoint type with a constructor, predicate, and field accessors. Each record type is distinct — `(point? '(1 2))` → `#f`. Multiple record types can coexist. Records work with higher-order functions and can contain other records.
+
+### Level 21 — Pair Mutation & Cycle Detection
+`set-car!` and `set-cdr!` mutate pairs in place. Shared structure is observable: `(define b a)` then `(set-car! a 99)` makes `(car b)` → `99`. Circular lists created via `set-cdr!` must not cause `list?` to infinite-loop — `list?` on a circular structure must return `#f`. Deep tail-recursive allocation (1M cons cells) must not OOM — old unreachable cells must be reclaimable.
+
+### Level 22 — syntax-case
+`syntax-case` is a more powerful macro system than `syntax-rules`. Macros are defined as transformer procedures that receive a syntax object. Supports: pattern matching with `syntax-case`, template construction with `#'(...)`, hygiene (same guarantees as `syntax-rules`), `syntax->datum` and `datum->syntax` for computed identifiers, and ellipsis patterns. Fender expressions (guards) on patterns are optional.
+
+### Level 23 — Final Integration
+Combined use of all features: dynamic-wind + guard for resource cleanup on exceptions, values + call/cc for multi-value continuations, records as exception payloads, rationals in data structures (lists, vectors, record fields), macros generating record-based code, TCO inside guard bodies, and a full pipeline combining macros + records + exceptions + values + continuations.
