@@ -382,6 +382,47 @@ fn apply_builtin(op: &str, args: &[Value]) -> Result<Value, EvalError> {
             if args.len() != 1 { return Err(EvalError::Arity); }
             Ok(Value::Boolean(args[0] == Value::Boolean(false)))
         }
+        "cons" => {
+            if args.len() != 2 { return Err(EvalError::Arity); }
+            match &args[1] {
+                Value::List(tail) => {
+                    let mut new_list = vec![args[0].clone()];
+                    new_list.extend(tail.iter().cloned());
+                    Ok(Value::List(new_list))
+                }
+                _ => Err(EvalError::TypeError("cons: second argument must be a list".into())),
+            }
+        }
+        "car" => {
+            if args.len() != 1 { return Err(EvalError::Arity); }
+            match &args[0] {
+                Value::List(items) if !items.is_empty() => Ok(items[0].clone()),
+                Value::List(_) => Err(EvalError::TypeError("car: empty list".into())),
+                _ => Err(EvalError::TypeError("car: not a pair".into())),
+            }
+        }
+        "cdr" => {
+            if args.len() != 1 { return Err(EvalError::Arity); }
+            match &args[0] {
+                Value::List(items) if !items.is_empty() => Ok(Value::List(items[1..].to_vec())),
+                Value::List(_) => Err(EvalError::TypeError("cdr: empty list".into())),
+                _ => Err(EvalError::TypeError("cdr: not a pair".into())),
+            }
+        }
+        "null?" => {
+            if args.len() != 1 { return Err(EvalError::Arity); }
+            Ok(Value::Boolean(matches!(&args[0], Value::List(items) if items.is_empty())))
+        }
+        "list" => {
+            Ok(Value::List(args.to_vec()))
+        }
+        "length" => {
+            if args.len() != 1 { return Err(EvalError::Arity); }
+            match &args[0] {
+                Value::List(items) => Ok(Value::Integer(items.len() as i64)),
+                _ => Err(EvalError::TypeError("length: not a list".into())),
+            }
+        }
         _ => Err(EvalError::UndefinedVariable(op.to_string())),
     }
 }
