@@ -4,6 +4,7 @@ use std::rc::Rc;
 
 use crate::scheme::env::Env;
 use crate::scheme::error::EvalError;
+use crate::scheme::macros;
 use crate::scheme::value::Value;
 
 /// Shared interpreter state: output buffer + continuation registry.
@@ -13,6 +14,7 @@ pub struct InterpState {
     pub cont_captures: HashMap<u64, usize>,
     pub resume: Option<Value>,
     pub current_expr_idx: usize,
+    pub gensym_counter: u64,
 }
 
 impl InterpState {
@@ -23,6 +25,7 @@ impl InterpState {
             cont_captures: HashMap::new(),
             resume: None,
             current_expr_idx: 0,
+            gensym_counter: 0,
         }
     }
 }
@@ -55,7 +58,8 @@ pub fn eval(expr: &Value, env: &Rc<RefCell<Env>>, out: &Output) -> Result<Value,
         match &current_expr {
             Value::Integer(_) | Value::Boolean(_) | Value::Str(_) | Value::Char(_)
             | Value::Void => return Ok(current_expr),
-            Value::Lambda { .. } | Value::Builtin(_) | Value::Continuation(_) => {
+            Value::Lambda { .. } | Value::Builtin(_) | Value::Continuation(_)
+            | Value::Macro { .. } => {
                 return Ok(current_expr)
             }
             Value::Symbol(name) => {
@@ -104,13 +108,38 @@ fn eval_list_tail(
             "call/cc" | "call-with-current-continuation" => {
                 return eval_callcc(&items[1..], env, out).map(TailAction::Return)
             }
+            "define-syntax" => {
+                return eval_define_syntax(&items[1..], env).map(TailAction::Return)
+            }
             s if is_builtin(s) => {
                 return eval_builtin(s, &items[1..], env, out).map(TailAction::Return)
             }
-            _ => {}
+            _ => return try_expand_macro_tail(name, items, env, out),
         }
     }
 
+    eval_application_tail(items, env, out)
+}
+
+/// If `name` is a macro, expand and return as tail eval; otherwise fall through
+/// to normal application.
+fn try_expand_macro_tail(
+    name: &str,
+    items: &[Value],
+    env: &Rc<RefCell<Env>>,
+    out: &Output,
+) -> Result<TailAction, EvalError> {
+    if let Some(Value::Macro {
+        ref literals,
+        ref rules,
+        ref def_env,
+    }) = env.borrow().get(name)
+    {
+        let mut counter = out.borrow().gensym_counter;
+        let expanded = macros::expand_macro(literals, rules, def_env, items, &mut counter)?;
+        out.borrow_mut().gensym_counter = counter;
+        return Ok(TailAction::TailEval(expanded, Rc::clone(env)));
+    }
     eval_application_tail(items, env, out)
 }
 
@@ -809,6 +838,64 @@ fn eval_define(
             message: "define: bad syntax".into(),
         }),
     }
+}
+
+fn eval_define_syntax(
+    args: &[Value],
+    env: &Rc<RefCell<Env>>,
+) -> Result<Value, EvalError> {
+    let [Value::Symbol(name), transformer] = args else {
+        return Err(EvalError::Parse {
+            message: "define-syntax: expected name and transformer".into(),
+        });
+    };
+    let Value::List(sr_form) = transformer else {
+        return Err(EvalError::Parse {
+            message: "define-syntax: expected syntax-rules".into(),
+        });
+    };
+    if !matches!(sr_form.first(), Some(Value::Symbol(s)) if s == "syntax-rules") {
+        return Err(EvalError::Parse {
+            message: "define-syntax: expected syntax-rules".into(),
+        });
+    }
+    let Value::List(lit_list) = &sr_form[1] else {
+        return Err(EvalError::Parse {
+            message: "syntax-rules: expected literal list".into(),
+        });
+    };
+    let literals: Vec<String> = lit_list
+        .iter()
+        .map(|v| match v {
+            Value::Symbol(s) => Ok(s.clone()),
+            _ => Err(EvalError::Parse {
+                message: "syntax-rules: literals must be symbols".into(),
+            }),
+        })
+        .collect::<Result<_, _>>()?;
+    let rules: Vec<(Vec<Value>, Value)> = sr_form[2..]
+        .iter()
+        .map(|rule| {
+            let Value::List(parts) = rule else {
+                return Err(EvalError::Parse {
+                    message: "syntax-rules: expected (pattern template)".into(),
+                });
+            };
+            let [Value::List(pattern), template] = parts.as_slice() else {
+                return Err(EvalError::Parse {
+                    message: "syntax-rules: expected (pattern template)".into(),
+                });
+            };
+            Ok((pattern.clone(), template.clone()))
+        })
+        .collect::<Result<_, _>>()?;
+    let macro_val = Value::Macro {
+        literals,
+        rules,
+        def_env: Rc::clone(env),
+    };
+    env.borrow_mut().define(name.clone(), macro_val);
+    Ok(Value::Void)
 }
 
 fn eval_quote(args: &[Value]) -> Result<Value, EvalError> {
