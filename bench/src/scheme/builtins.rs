@@ -14,6 +14,9 @@ pub fn is_builtin(name: &str) -> bool {
             | "string->symbol" | "symbol->string"
             | "string-ref"
             | "string-copy"
+            | "string->list" | "list->string"
+            | "char->integer" | "integer->char"
+            | "map"
     )
 }
 
@@ -46,6 +49,11 @@ pub fn apply_builtin(
         "symbol->string" => apply_symbol_to_string(args, env, span, output),
         "string-ref" => apply_string_ref(args, env, span, output),
         "string-copy" => apply_string_copy(args, env, span, output),
+        "string->list" => apply_string_to_list(args, env, span, output),
+        "list->string" => apply_list_to_string(args, env, span, output),
+        "char->integer" => apply_char_to_integer(args, env, span, output),
+        "integer->char" => apply_integer_to_char(args, env, span, output),
+        "map" => apply_map(args, env, span, output),
         "display" => apply_display(args, env, span, output),
         "write" => apply_write(args, env, span, output),
         "newline" => apply_newline(args, span, output),
@@ -526,4 +534,108 @@ fn apply_string_copy(
     };
     let s = eval_to_string(arg, env, span, output)?;
     Ok(Value::String(s))
+}
+
+fn apply_string_to_list(
+    args: &[Value],
+    env: &mut Env,
+    span: Span,
+    output: &mut String,
+) -> Result<Value, EvalError> {
+    let [arg] = args else {
+        return Err(EvalError::WrongArgCount { expected: 1, got: args.len(), span });
+    };
+    let s = eval_to_string(arg, env, span, output)?;
+    let items: Vec<Value> = s.chars().map(Value::Char).collect();
+    Ok(Value::List(items, Span::default()))
+}
+
+fn apply_list_to_string(
+    args: &[Value],
+    env: &mut Env,
+    span: Span,
+    output: &mut String,
+) -> Result<Value, EvalError> {
+    let [arg] = args else {
+        return Err(EvalError::WrongArgCount { expected: 1, got: args.len(), span });
+    };
+    let val = eval(arg, env, output)?;
+    let Value::List(items, _) = val else {
+        return Err(EvalError::TypeError {
+            expected: "list".to_string(),
+            got: format!("{val}"),
+            span,
+        });
+    };
+    let s: Result<String, EvalError> = items.iter().map(|item| match item {
+        Value::Char(c) => Ok(*c),
+        other => Err(EvalError::TypeError {
+            expected: "char".to_string(),
+            got: format!("{other}"),
+            span,
+        }),
+    }).collect();
+    Ok(Value::String(s?))
+}
+
+fn apply_char_to_integer(
+    args: &[Value],
+    env: &mut Env,
+    span: Span,
+    output: &mut String,
+) -> Result<Value, EvalError> {
+    let [arg] = args else {
+        return Err(EvalError::WrongArgCount { expected: 1, got: args.len(), span });
+    };
+    let val = eval(arg, env, output)?;
+    match val {
+        Value::Char(c) => Ok(Value::Integer(c as i64)),
+        other => Err(EvalError::TypeError {
+            expected: "char".to_string(),
+            got: format!("{other}"),
+            span,
+        }),
+    }
+}
+
+fn apply_integer_to_char(
+    args: &[Value],
+    env: &mut Env,
+    span: Span,
+    output: &mut String,
+) -> Result<Value, EvalError> {
+    let [arg] = args else {
+        return Err(EvalError::WrongArgCount { expected: 1, got: args.len(), span });
+    };
+    let n = eval_to_integer(arg, env, output)?;
+    let c = char::from_u32(n as u32).ok_or_else(|| EvalError::TypeError {
+        expected: "valid Unicode code point".to_string(),
+        got: format!("{n}"),
+        span,
+    })?;
+    Ok(Value::Char(c))
+}
+
+fn apply_map(
+    args: &[Value],
+    env: &mut Env,
+    span: Span,
+    output: &mut String,
+) -> Result<Value, EvalError> {
+    let [proc_arg, list_arg] = args else {
+        return Err(EvalError::WrongArgCount { expected: 2, got: args.len(), span });
+    };
+    let proc = eval(proc_arg, env, output)?;
+    let list_val = eval(list_arg, env, output)?;
+    let Value::List(items, _) = list_val else {
+        return Err(EvalError::TypeError {
+            expected: "list".to_string(),
+            got: format!("{list_val}"),
+            span,
+        });
+    };
+    let results: Vec<Value> = items.iter().map(|item| {
+        super::apply(proc.clone(), std::slice::from_ref(item), env, span, output)
+    }).collect::<Result<_, _>>()?;
+    Ok(Value::List(results, Span::default()))
 }

@@ -114,7 +114,7 @@ fn eval_list(
     apply(proc, &evaluated_args, env, span, output)
 }
 
-fn apply(
+pub(crate) fn apply(
     proc: Value,
     args: &[Value],
     env: &mut Env,
