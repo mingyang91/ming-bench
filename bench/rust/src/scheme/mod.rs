@@ -45,7 +45,7 @@ enum Value {
     Str(String),
     Symbol(String),
     Char(char),
-    Pair(Box<Value>, Box<Value>),
+    Pair(Rc<RefCell<(Value, Value)>>),
     Nil,
     Lambda {
         params: Rc<Vec<String>>,
@@ -88,6 +88,10 @@ fn make_rational_value(n: i64, d: i64) -> Value {
     let n = n / g;
     let d = d / g;
     if d == 1 { Value::Integer(n) } else { Value::Rational(n, d) }
+}
+
+fn make_pair(car: Value, cdr: Value) -> Value {
+    Value::Pair(Rc::new(RefCell::new((car, cdr))))
 }
 
 fn value_to_f64(v: &Value, pos: Pos) -> Result<f64, EvalError> {
@@ -213,20 +217,28 @@ impl Value {
                 _ => format!("#\\{}", c),
             },
             Value::Nil => "()".to_string(),
-            Value::Pair(_, _) => {
+            Value::Pair(cell) => {
                 let mut out = String::from("(");
-                let mut cur = self;
+                let mut cur_cell = Rc::clone(cell);
                 let mut first = true;
+                let mut seen = HashSet::new();
                 loop {
-                    match cur {
-                        Value::Pair(car, cdr) => {
-                            if !first {
-                                out.push(' ');
-                            }
-                            first = false;
-                            out.push_str(&car.fmt_value(quote_strings));
-                            cur = cdr;
-                        }
+                    let ptr = Rc::as_ptr(&cur_cell) as usize;
+                    if !seen.insert(ptr) {
+                        out.push_str("...");
+                        break;
+                    }
+                    let (car_val, cdr_val) = {
+                        let inner = cur_cell.borrow();
+                        (inner.0.clone(), inner.1.clone())
+                    };
+                    if !first {
+                        out.push(' ');
+                    }
+                    first = false;
+                    out.push_str(&car_val.fmt_value(quote_strings));
+                    match cdr_val {
+                        Value::Pair(next) => cur_cell = next,
                         Value::Nil => break,
                         other => {
                             out.push_str(" . ");
@@ -282,6 +294,7 @@ impl Value {
                 | "abs" | "modulo" | "remainder" | "quotient" | "min" | "max" | "expt"
                 | "zero?" | "positive?" | "negative?" | "odd?" | "even?"
                 | "list-ref" | "list-tail" | "list?" | "reverse" | "assoc" | "map"
+                | "set-car!" | "set-cdr!" | "cddr" | "cadr" | "caar" | "cdar"
                 | "eq?" | "eqv?" | "equal?"
                 | "char-alphabetic?" | "char-numeric?" | "char-upcase" | "char-downcase"
                 | "char=?" | "char<?"
@@ -1456,7 +1469,7 @@ fn eval(expr: &Expr, env: &Env, out: &mut String) -> Result<Value, EvalError> {
                             // Build rest list from excess args
                             let mut rest = Value::Nil;
                             for a in args[params.len()..].iter().rev() {
-                                rest = Value::Pair(Box::new(a.clone()), Box::new(rest));
+                                rest = make_pair(a.clone(), rest);
                             }
                             new_env.set(rp.clone(), rest);
                             if body.is_empty() {
@@ -1709,7 +1722,7 @@ fn expr_to_value(expr: &Expr) -> Value {
         ExprKind::List(items) => {
             let mut result = Value::Nil;
             for item in items.iter().rev() {
-                result = Value::Pair(Box::new(expr_to_value(item)), Box::new(result));
+                result = make_pair(expr_to_value(item), result);
             }
             result
         }
@@ -1831,7 +1844,7 @@ fn apply_func(func: Value, args: Vec<Value>, pos: Pos, env: &Env, out: &mut Stri
                 }
                 let mut rest = Value::Nil;
                 for a in args[params.len()..].iter().rev() {
-                    rest = Value::Pair(Box::new(a.clone()), Box::new(rest));
+                    rest = make_pair(a.clone(), rest);
                 }
                 new_env.set(rp.clone(), rest);
             } else {
@@ -1935,12 +1948,16 @@ fn parse_params(parts: &[Expr], pos: Pos) -> Result<(Vec<String>, Option<String>
 /// Convert a Value list to a Vec<Value>.
 fn value_list_to_vec(val: &Value, pos: Pos) -> Result<Vec<Value>, EvalError> {
     let mut result = Vec::new();
-    let mut cur = val;
+    let mut cur = val.clone();
     loop {
-        match cur {
+        match &cur {
             Value::Nil => return Ok(result),
-            Value::Pair(car, cdr) => {
-                result.push(*car.clone());
+            Value::Pair(cell) => {
+                let (car, cdr) = {
+                    let inner = cell.borrow();
+                    (inner.0.clone(), inner.1.clone())
+                };
+                result.push(car);
                 cur = cdr;
             }
             _ => {
@@ -2035,7 +2052,7 @@ fn call_apply(args: &[Value], pos: Pos, env: &Env, out: &mut String) -> Result<V
                 }
                 let mut rest = Value::Nil;
                 for a in call_args[params.len()..].iter().rev() {
-                    rest = Value::Pair(Box::new(a.clone()), Box::new(rest));
+                    rest = make_pair(a.clone(), rest);
                 }
                 new_env.set(rp.clone(), rest);
             } else {
@@ -2135,7 +2152,7 @@ fn expr_to_datum(expr: &Expr) -> Value {
         ExprKind::List(items) => {
             let mut result = Value::Nil;
             for item in items.iter().rev() {
-                result = Value::Pair(Box::new(expr_to_datum(item)), Box::new(result));
+                result = make_pair(expr_to_datum(item), result);
             }
             result
         }
@@ -2158,7 +2175,11 @@ fn values_eqv(a: &Value, b: &Value) -> bool {
 
 fn values_equal(a: &Value, b: &Value) -> bool {
     match (a, b) {
-        (Value::Pair(a1, a2), Value::Pair(b1, b2)) => values_equal(a1, b1) && values_equal(a2, b2),
+        (Value::Pair(ac), Value::Pair(bc)) => {
+            let (a1, a2) = { let i = ac.borrow(); (i.0.clone(), i.1.clone()) };
+            let (b1, b2) = { let i = bc.borrow(); (i.0.clone(), i.1.clone()) };
+            values_equal(&a1, &b1) && values_equal(&a2, &b2)
+        }
         (Value::Vector(va), Value::Vector(vb)) => {
             let va = va.borrow();
             let vb = vb.borrow();
@@ -2248,10 +2269,7 @@ fn apply_builtin(op: &str, args: &[Value], pos: Pos, out: &mut String) -> Result
                     pos.fmt()
                 )));
             }
-            Ok(Some(Value::Pair(
-                Box::new(args[0].clone()),
-                Box::new(args[1].clone()),
-            )))
+            Ok(Some(make_pair(args[0].clone(), args[1].clone())))
         }
         "car" => {
             if args.len() != 1 {
@@ -2261,7 +2279,7 @@ fn apply_builtin(op: &str, args: &[Value], pos: Pos, out: &mut String) -> Result
                 )));
             }
             match &args[0] {
-                Value::Pair(car, _) => Ok(Some(*car.clone())),
+                Value::Pair(cell) => Ok(Some(cell.borrow().0.clone())),
                 _ => Err(EvalError::Type(format!("car: not a pair at {}", pos.fmt()))),
             }
         }
@@ -2273,8 +2291,92 @@ fn apply_builtin(op: &str, args: &[Value], pos: Pos, out: &mut String) -> Result
                 )));
             }
             match &args[0] {
-                Value::Pair(_, cdr) => Ok(Some(*cdr.clone())),
+                Value::Pair(cell) => Ok(Some(cell.borrow().1.clone())),
                 _ => Err(EvalError::Type(format!("cdr: not a pair at {}", pos.fmt()))),
+            }
+        }
+        "set-car!" => {
+            if args.len() != 2 {
+                return Err(EvalError::Arity(format!("set-car! requires 2 arguments at {}", pos.fmt())));
+            }
+            match &args[0] {
+                Value::Pair(cell) => {
+                    cell.borrow_mut().0 = args[1].clone();
+                    Ok(Some(Value::Nil))
+                }
+                _ => Err(EvalError::Type(format!("set-car!: not a pair at {}", pos.fmt()))),
+            }
+        }
+        "set-cdr!" => {
+            if args.len() != 2 {
+                return Err(EvalError::Arity(format!("set-cdr! requires 2 arguments at {}", pos.fmt())));
+            }
+            match &args[0] {
+                Value::Pair(cell) => {
+                    cell.borrow_mut().1 = args[1].clone();
+                    Ok(Some(Value::Nil))
+                }
+                _ => Err(EvalError::Type(format!("set-cdr!: not a pair at {}", pos.fmt()))),
+            }
+        }
+        "cadr" => {
+            if args.len() != 1 {
+                return Err(EvalError::Arity(format!("cadr requires 1 argument at {}", pos.fmt())));
+            }
+            match &args[0] {
+                Value::Pair(cell) => {
+                    let cdr = cell.borrow().1.clone();
+                    match &cdr {
+                        Value::Pair(cell2) => Ok(Some(cell2.borrow().0.clone())),
+                        _ => Err(EvalError::Type(format!("cadr: not a pair at {}", pos.fmt()))),
+                    }
+                }
+                _ => Err(EvalError::Type(format!("cadr: not a pair at {}", pos.fmt()))),
+            }
+        }
+        "cddr" => {
+            if args.len() != 1 {
+                return Err(EvalError::Arity(format!("cddr requires 1 argument at {}", pos.fmt())));
+            }
+            match &args[0] {
+                Value::Pair(cell) => {
+                    let cdr = cell.borrow().1.clone();
+                    match &cdr {
+                        Value::Pair(cell2) => Ok(Some(cell2.borrow().1.clone())),
+                        _ => Err(EvalError::Type(format!("cddr: not a pair at {}", pos.fmt()))),
+                    }
+                }
+                _ => Err(EvalError::Type(format!("cddr: not a pair at {}", pos.fmt()))),
+            }
+        }
+        "caar" => {
+            if args.len() != 1 {
+                return Err(EvalError::Arity(format!("caar requires 1 argument at {}", pos.fmt())));
+            }
+            match &args[0] {
+                Value::Pair(cell) => {
+                    let car = cell.borrow().0.clone();
+                    match &car {
+                        Value::Pair(cell2) => Ok(Some(cell2.borrow().0.clone())),
+                        _ => Err(EvalError::Type(format!("caar: not a pair at {}", pos.fmt()))),
+                    }
+                }
+                _ => Err(EvalError::Type(format!("caar: not a pair at {}", pos.fmt()))),
+            }
+        }
+        "cdar" => {
+            if args.len() != 1 {
+                return Err(EvalError::Arity(format!("cdar requires 1 argument at {}", pos.fmt())));
+            }
+            match &args[0] {
+                Value::Pair(cell) => {
+                    let car = cell.borrow().0.clone();
+                    match &car {
+                        Value::Pair(cell2) => Ok(Some(cell2.borrow().1.clone())),
+                        _ => Err(EvalError::Type(format!("cdar: not a pair at {}", pos.fmt()))),
+                    }
+                }
+                _ => Err(EvalError::Type(format!("cdar: not a pair at {}", pos.fmt()))),
             }
         }
         "null?" => {
@@ -2289,7 +2391,7 @@ fn apply_builtin(op: &str, args: &[Value], pos: Pos, out: &mut String) -> Result
         "list" => {
             let mut result = Value::Nil;
             for a in args.iter().rev() {
-                result = Value::Pair(Box::new(a.clone()), Box::new(result));
+                result = make_pair(a.clone(), result);
             }
             Ok(Some(result))
         }
@@ -2301,13 +2403,13 @@ fn apply_builtin(op: &str, args: &[Value], pos: Pos, out: &mut String) -> Result
                 )));
             }
             let mut count = 0i64;
-            let mut cur = &args[0];
+            let mut cur = args[0].clone();
             loop {
                 match cur {
                     Value::Nil => break,
-                    Value::Pair(_, cdr) => {
+                    Value::Pair(cell) => {
                         count += 1;
-                        cur = cdr;
+                        cur = cell.borrow().1.clone();
                     }
                     _ => {
                         return Err(EvalError::Type(format!(
@@ -2353,7 +2455,7 @@ fn apply_builtin(op: &str, args: &[Value], pos: Pos, out: &mut String) -> Result
                     pos.fmt()
                 )));
             }
-            Ok(Some(Value::Boolean(matches!(args[0], Value::Pair(_, _)))))
+            Ok(Some(Value::Boolean(matches!(args[0], Value::Pair(_)))))
         }
         "symbol?" => {
             if args.len() != 1 {
@@ -2554,7 +2656,7 @@ fn apply_builtin(op: &str, args: &[Value], pos: Pos, out: &mut String) -> Result
             match &args[0] {
                 Value::Str(s) => {
                     let list = s.chars().rev().fold(Value::Nil, |acc, c| {
-                        Value::Pair(Box::new(Value::Char(c)), Box::new(acc))
+                        make_pair(Value::Char(c), acc)
                     });
                     Ok(Some(list))
                 }
@@ -2570,17 +2672,21 @@ fn apply_builtin(op: &str, args: &[Value], pos: Pos, out: &mut String) -> Result
                 )));
             }
             let mut chars = String::new();
-            let mut cur = &args[0];
+            let mut cur = args[0].clone();
             loop {
-                match cur {
-                    Value::Pair(car, cdr) => {
-                        match car.as_ref() {
-                            Value::Char(c) => chars.push(*c),
+                match &cur {
+                    Value::Pair(cell) => {
+                        let (car, cdr) = {
+                            let inner = cell.borrow();
+                            (inner.0.clone(), inner.1.clone())
+                        };
+                        match car {
+                            Value::Char(c) => chars.push(c),
                             _ => return Err(EvalError::Type(format!(
                                 "list->string: expected character in list at {}", pos.fmt()
                             ))),
                         }
-                        cur = cdr.as_ref();
+                        cur = cdr;
                     }
                     Value::Nil => break,
                     _ => return Err(EvalError::Type(format!(
@@ -2720,15 +2826,16 @@ fn apply_builtin(op: &str, args: &[Value], pos: Pos, out: &mut String) -> Result
                 return Err(EvalError::Arity(format!("list-ref requires 2 arguments at {}", pos.fmt())));
             }
             let idx = args[1].as_integer(pos)? as usize;
-            let mut cur = &args[0];
+            let mut cur = args[0].clone();
             for _ in 0..idx {
-                match cur {
-                    Value::Pair(_, cdr) => cur = cdr,
+                let next = match &cur {
+                    Value::Pair(cell) => cell.borrow().1.clone(),
                     _ => return Err(EvalError::Type(format!("list-ref: index out of range at {}", pos.fmt()))),
-                }
+                };
+                cur = next;
             }
-            match cur {
-                Value::Pair(car, _) => Ok(Some(*car.clone())),
+            match &cur {
+                Value::Pair(cell) => Ok(Some(cell.borrow().0.clone())),
                 _ => Err(EvalError::Type(format!("list-ref: index out of range at {}", pos.fmt()))),
             }
         }
@@ -2739,10 +2846,11 @@ fn apply_builtin(op: &str, args: &[Value], pos: Pos, out: &mut String) -> Result
             let idx = args[1].as_integer(pos)? as usize;
             let mut cur = args[0].clone();
             for _ in 0..idx {
-                match cur {
-                    Value::Pair(_, cdr) => cur = *cdr,
+                let next = match &cur {
+                    Value::Pair(cell) => cell.borrow().1.clone(),
                     _ => return Err(EvalError::Type(format!("list-tail: index out of range at {}", pos.fmt()))),
-                }
+                };
+                cur = next;
             }
             Ok(Some(cur))
         }
@@ -2750,12 +2858,31 @@ fn apply_builtin(op: &str, args: &[Value], pos: Pos, out: &mut String) -> Result
             if args.len() != 1 {
                 return Err(EvalError::Arity(format!("list? requires 1 argument at {}", pos.fmt())));
             }
-            let mut cur = &args[0];
+            // Floyd's cycle detection for list?
+            let mut slow = args[0].clone();
+            let mut fast = args[0].clone();
             let result = loop {
-                match cur {
+                // Advance slow by 1
+                let next_slow = match &slow {
                     Value::Nil => break true,
-                    Value::Pair(_, cdr) => cur = cdr,
+                    Value::Pair(cell) => cell.borrow().1.clone(),
                     _ => break false,
+                };
+                slow = next_slow;
+                // Advance fast by 2
+                for _ in 0..2 {
+                    let next_fast = match &fast {
+                        Value::Nil => { fast = Value::Nil; break; }
+                        Value::Pair(cell) => cell.borrow().1.clone(),
+                        _ => break,
+                    };
+                    fast = next_fast;
+                }
+                // Check if slow == fast (cycle)
+                if let (Value::Pair(sc), Value::Pair(fc)) = (&slow, &fast) {
+                    if Rc::ptr_eq(sc, fc) {
+                        break false;
+                    }
                 }
             };
             Ok(Some(Value::Boolean(result)))
@@ -2764,13 +2891,17 @@ fn apply_builtin(op: &str, args: &[Value], pos: Pos, out: &mut String) -> Result
             if args.len() != 1 {
                 return Err(EvalError::Arity(format!("reverse requires 1 argument at {}", pos.fmt())));
             }
-            let mut cur = &args[0];
+            let mut cur = args[0].clone();
             let mut result = Value::Nil;
             loop {
-                match cur {
+                match &cur {
                     Value::Nil => break,
-                    Value::Pair(car, cdr) => {
-                        result = Value::Pair(Box::new(*car.clone()), Box::new(result));
+                    Value::Pair(cell) => {
+                        let (car, cdr) = {
+                            let inner = cell.borrow();
+                            (inner.0.clone(), inner.1.clone())
+                        };
+                        result = make_pair(car, result);
                         cur = cdr;
                     }
                     _ => return Err(EvalError::Type(format!("reverse: not a proper list at {}", pos.fmt()))),
@@ -2795,14 +2926,19 @@ fn apply_builtin(op: &str, args: &[Value], pos: Pos, out: &mut String) -> Result
                 return Err(EvalError::Arity(format!("assoc requires 2 arguments at {}", pos.fmt())));
             }
             let key = &args[0];
-            let mut cur = &args[1];
+            let mut cur = args[1].clone();
             loop {
-                match cur {
+                match &cur {
                     Value::Nil => return Ok(Some(Value::Boolean(false))),
-                    Value::Pair(car, cdr) => {
-                        if let Value::Pair(ref entry_key, _) = **car {
-                            if values_equal(key, entry_key) {
-                                return Ok(Some(*car.clone()));
+                    Value::Pair(cell) => {
+                        let (car, cdr) = {
+                            let inner = cell.borrow();
+                            (inner.0.clone(), inner.1.clone())
+                        };
+                        if let Value::Pair(ref entry_cell) = car {
+                            let entry_key = entry_cell.borrow().0.clone();
+                            if values_equal(key, &entry_key) {
+                                return Ok(Some(car));
                             }
                         }
                         cur = cdr;
@@ -2816,27 +2952,27 @@ fn apply_builtin(op: &str, args: &[Value], pos: Pos, out: &mut String) -> Result
                 return Err(EvalError::Arity(format!("map requires at least 2 arguments at {}", pos.fmt())));
             }
             let func = &args[0];
-            let num_lists = args.len() - 1;
-            let mut lists: Vec<&Value> = args[1..].iter().collect();
+            let mut lists: Vec<Value> = args[1..].to_vec();
             let mut result_items = Vec::new();
             loop {
                 // Check if any list is nil (done)
-                let mut all_nil = false;
+                let mut any_nil = false;
                 for l in &lists {
                     if matches!(l, Value::Nil) {
-                        all_nil = true;
+                        any_nil = true;
                         break;
                     }
                 }
-                if all_nil { break; }
+                if any_nil { break; }
                 // Extract car of each list
                 let mut call_args = Vec::new();
-                let mut new_lists: Vec<&Value> = Vec::new();
+                let mut new_lists: Vec<Value> = Vec::new();
                 for l in &lists {
                     match l {
-                        Value::Pair(car, cdr) => {
-                            call_args.push(*car.clone());
-                            new_lists.push(cdr);
+                        Value::Pair(cell) => {
+                            let inner = cell.borrow();
+                            call_args.push(inner.0.clone());
+                            new_lists.push(inner.1.clone());
                         }
                         _ => return Err(EvalError::Type(format!("map: not a proper list at {}", pos.fmt()))),
                     }
@@ -2857,7 +2993,7 @@ fn apply_builtin(op: &str, args: &[Value], pos: Pos, out: &mut String) -> Result
                             }
                             let mut rest = Value::Nil;
                             for a in call_args[params.len()..].iter().rev() {
-                                rest = Value::Pair(Box::new(a.clone()), Box::new(rest));
+                                rest = make_pair(a.clone(), rest);
                             }
                             new_env.set(rp.clone(), rest);
                         } else {
@@ -2878,7 +3014,7 @@ fn apply_builtin(op: &str, args: &[Value], pos: Pos, out: &mut String) -> Result
             }
             let mut result = Value::Nil;
             for item in result_items.into_iter().rev() {
-                result = Value::Pair(Box::new(item), Box::new(result));
+                result = make_pair(item, result);
             }
             Ok(Some(result))
         }
@@ -3055,7 +3191,7 @@ fn apply_builtin(op: &str, args: &[Value], pos: Pos, out: &mut String) -> Result
                     let v = v.borrow();
                     let mut result = Value::Nil;
                     for item in v.iter().rev() {
-                        result = Value::Pair(Box::new(item.clone()), Box::new(result));
+                        result = make_pair(item.clone(), result);
                     }
                     Ok(Some(result))
                 }
@@ -3067,12 +3203,16 @@ fn apply_builtin(op: &str, args: &[Value], pos: Pos, out: &mut String) -> Result
                 return Err(EvalError::Arity(format!("list->vector requires 1 argument at {}", pos.fmt())));
             }
             let mut items = Vec::new();
-            let mut cur = &args[0];
+            let mut cur = args[0].clone();
             loop {
-                match cur {
+                match &cur {
                     Value::Nil => break,
-                    Value::Pair(car, cdr) => {
-                        items.push(*car.clone());
+                    Value::Pair(cell) => {
+                        let (car, cdr) = {
+                            let inner = cell.borrow();
+                            (inner.0.clone(), inner.1.clone())
+                        };
+                        items.push(car);
                         cur = cdr;
                     }
                     _ => return Err(EvalError::Type(format!("list->vector: not a proper list at {}", pos.fmt()))),
