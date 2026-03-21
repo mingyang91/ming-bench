@@ -6,7 +6,7 @@ use crate::scheme::env::Env;
 use crate::scheme::error::EvalError;
 use crate::scheme::macros;
 use crate::scheme::number::{self, Num, num_add, num_div, num_mul, num_neg, num_sub, num_to_f64, num_to_value, value_to_num};
-use crate::scheme::value::Value;
+use crate::scheme::value::{Value, list_from_vec, make_pair};
 
 /// A snapshot of a body being evaluated — used for continuation path matching.
 pub struct BodyFrame {
@@ -102,7 +102,7 @@ pub fn eval(expr: &Value, env: &Rc<RefCell<Env>>, out: &Output) -> Result<Value,
         match &current_expr {
             Value::Integer(_) | Value::Float(_) | Value::Rational(_, _)
             | Value::Boolean(_) | Value::Str(_) | Value::Char(_)
-            | Value::Void | Value::Vector(_) | Value::Pair(_, _) | Value::Values(_)
+            | Value::Void | Value::Vector(_) | Value::Pair(_) | Value::Values(_)
             | Value::Record { .. } => {
                 return Ok(current_expr)
             }
@@ -496,7 +496,7 @@ fn apply_values(
             }
             if let Some(rest_name) = rest_param {
                 let rest_vals = args[params.len()..].to_vec();
-                child.borrow_mut().define(rest_name.clone(), Value::List(rest_vals));
+                child.borrow_mut().define(rest_name.clone(), list_from_vec(rest_vals));
             }
             eval_body(body, &child, out)
         }
@@ -605,7 +605,7 @@ fn bind_and_tail_call(
     }
     if let Some(rest_name) = rest_param {
         let rest_vals = args[params.len()..].to_vec();
-        child.borrow_mut().define(rest_name, Value::List(rest_vals));
+        child.borrow_mut().define(rest_name, list_from_vec(rest_vals));
     }
     eval_body_tail(&body, &child, out)
 }
@@ -685,14 +685,9 @@ fn eval_apply_values(
         });
     }
     let proc = args[0].clone();
-    let Value::List(tail_args) = &args[args.len() - 1] else {
-        return Err(EvalError::TypeError {
-            expected: "list".into(),
-            got: format!("{}", args[args.len() - 1]),
-        });
-    };
+    let tail_args = collect_list(&args[args.len() - 1])?;
     let mut combined: Vec<Value> = args[1..args.len() - 1].to_vec();
-    combined.extend(tail_args.iter().cloned());
+    combined.extend(tail_args);
 
     match proc {
         Value::Lambda {
@@ -708,7 +703,7 @@ fn eval_apply_values(
             }
             if let Some(rest_name) = rest_param {
                 let rest_vals = combined[params.len()..].to_vec();
-                child.borrow_mut().define(rest_name, Value::List(rest_vals));
+                child.borrow_mut().define(rest_name, list_from_vec(rest_vals));
             }
             eval_body(&body, &child, out)
         }
@@ -917,6 +912,7 @@ fn is_builtin(name: &str) -> bool {
             | "exact?" | "inexact?" | "rational?" | "integer?"
             | "exact->inexact" | "inexact->exact"
             | "numerator" | "denominator"
+            | "set-car!" | "set-cdr!" | "cddr" | "cadr" | "caar" | "cdar"
             | "__make-record-internal"
             | "__record-predicate-internal"
             | "__record-accessor-internal"
@@ -950,7 +946,7 @@ fn eval_builtin(
         "number?" => eval_type_pred(args, env, out, number::is_number),
         "boolean?" => eval_type_pred(args, env, out, |v| matches!(v, Value::Boolean(_))),
         "pair?" => eval_type_pred(args, env, out, |v| {
-            matches!(v, Value::List(items) if !items.is_empty()) || matches!(v, Value::Pair(_, _))
+            matches!(v, Value::List(items) if !items.is_empty()) || matches!(v, Value::Pair(_))
         }),
         "symbol?" => eval_type_pred(args, env, out, |v| matches!(v, Value::Symbol(_))),
         "char?" => eval_type_pred(args, env, out, |v| matches!(v, Value::Char(_))),
@@ -1021,6 +1017,12 @@ fn eval_builtin(
         "inexact->exact" => eval_inexact_to_exact(args, env, out),
         "numerator" => eval_numerator(args, env, out),
         "denominator" => eval_denominator(args, env, out),
+        "set-car!" => eval_set_car(args, env, out),
+        "set-cdr!" => eval_set_cdr(args, env, out),
+        "cddr" => eval_cddr(args, env, out),
+        "cadr" => eval_cadr(args, env, out),
+        "caar" => eval_caar(args, env, out),
+        "cdar" => eval_cdar(args, env, out),
         "__make-record-internal" => eval_make_record_internal(args, env, out),
         "__record-predicate-internal" => eval_record_predicate_internal(args, env, out),
         "__record-accessor-internal" => eval_record_accessor_internal(args, env, out),
@@ -1565,13 +1567,7 @@ fn eval_cons(args: &[Value], env: &Rc<RefCell<Env>>, out: &Output) -> Result<Val
     };
     let head_val = eval(head, env, out)?;
     let tail_val = eval(tail, env, out)?;
-    match tail_val {
-        Value::List(mut items) => {
-            items.insert(0, head_val);
-            Ok(Value::List(items))
-        }
-        _ => Ok(Value::Pair(Box::new(head_val), Box::new(tail_val))),
-    }
+    Ok(make_pair(head_val, tail_val))
 }
 
 fn eval_car(args: &[Value], env: &Rc<RefCell<Env>>, out: &Output) -> Result<Value, EvalError> {
@@ -1581,9 +1577,25 @@ fn eval_car(args: &[Value], env: &Rc<RefCell<Env>>, out: &Output) -> Result<Valu
             got: args.len(),
         });
     };
-    match eval(arg, env, out)? {
-        Value::List(items) if !items.is_empty() => Ok(items.into_iter().next().expect("non-empty")),
-        Value::Pair(car, _) => Ok(*car),
+    let val = eval(arg, env, out)?;
+    get_car(&val)
+}
+
+fn get_car(val: &Value) -> Result<Value, EvalError> {
+    match val {
+        Value::List(items) if !items.is_empty() => Ok(items[0].clone()),
+        Value::Pair(p) => Ok(p.borrow().0.clone()),
+        other => Err(EvalError::TypeError {
+            expected: "pair".into(),
+            got: format!("{other}"),
+        }),
+    }
+}
+
+fn get_cdr(val: &Value) -> Result<Value, EvalError> {
+    match val {
+        Value::List(items) if !items.is_empty() => Ok(Value::List(items[1..].to_vec())),
+        Value::Pair(p) => Ok(p.borrow().1.clone()),
         other => Err(EvalError::TypeError {
             expected: "pair".into(),
             got: format!("{other}"),
@@ -1598,14 +1610,8 @@ fn eval_cdr(args: &[Value], env: &Rc<RefCell<Env>>, out: &Output) -> Result<Valu
             got: args.len(),
         });
     };
-    match eval(arg, env, out)? {
-        Value::List(items) if !items.is_empty() => Ok(Value::List(items[1..].to_vec())),
-        Value::Pair(_, cdr) => Ok(*cdr),
-        other => Err(EvalError::TypeError {
-            expected: "pair".into(),
-            got: format!("{other}"),
-        }),
-    }
+    let val = eval(arg, env, out)?;
+    get_cdr(&val)
 }
 
 fn eval_null_pred(
@@ -1630,11 +1636,14 @@ fn eval_list_builtin(
     env: &Rc<RefCell<Env>>,
     out: &Output,
 ) -> Result<Value, EvalError> {
+    if args.is_empty() {
+        return Ok(Value::List(vec![]));
+    }
     let items: Vec<Value> = args
         .iter()
         .map(|a| eval(a, env, out))
         .collect::<Result<_, _>>()?;
-    Ok(Value::List(items))
+    Ok(list_from_vec(items))
 }
 
 fn eval_length(args: &[Value], env: &Rc<RefCell<Env>>, out: &Output) -> Result<Value, EvalError> {
@@ -1644,23 +1653,35 @@ fn eval_length(args: &[Value], env: &Rc<RefCell<Env>>, out: &Output) -> Result<V
             got: args.len(),
         });
     };
-    match eval(arg, env, out)? {
-        Value::List(items) => Ok(Value::Integer(items.len() as i64)),
-        other => Err(EvalError::TypeError {
+    let val = eval(arg, env, out)?;
+    let items = collect_list(&val)?;
+    Ok(Value::Integer(items.len() as i64))
+}
+
+/// Collect elements from a proper list (either Value::List or Pair chain).
+fn collect_list(val: &Value) -> Result<Vec<Value>, EvalError> {
+    match val {
+        Value::List(items) => Ok(items.clone()),
+        Value::Pair(_) => collect_pair_list(val),
+        _ => Err(EvalError::TypeError {
             expected: "list".into(),
-            got: format!("{other}"),
+            got: format!("{val}"),
         }),
     }
 }
 
-fn collect_pair_chain(val: &Value) -> Result<Vec<Value>, EvalError> {
+fn collect_pair_list(val: &Value) -> Result<Vec<Value>, EvalError> {
     let mut elems = Vec::new();
-    let mut cur = val;
+    let mut cur = val.clone();
     loop {
-        match cur {
-            Value::Pair(car, cdr) => {
-                elems.push(car.as_ref().clone());
-                cur = cdr.as_ref();
+        match &cur {
+            Value::Pair(p) => {
+                let inner = p.borrow();
+                let car = inner.0.clone();
+                let cdr = inner.1.clone();
+                drop(inner);
+                elems.push(car);
+                cur = cdr;
             }
             Value::List(items) if items.is_empty() => break,
             _ => {
@@ -1679,22 +1700,10 @@ fn eval_reverse(args: &[Value], env: &Rc<RefCell<Env>>, out: &Output) -> Result<
         return Err(EvalError::WrongArgCount { expected: 1, got: args.len() });
     };
     let val = eval(arg, env, out)?;
-    // Collect elements from either List or Pair-chain
-    let items = match &val {
-        Value::List(items) => items.clone(),
-        Value::Pair(_, _) => collect_pair_chain(&val)?,
-        _ => {
-            return Err(EvalError::TypeError {
-                expected: "list".into(),
-                got: format!("{val}"),
-            });
-        }
-    };
-    // Build reversed list as Pair chain (consistent with cons-built lists)
-    let reversed = items.into_iter().fold(
-        Value::List(vec![]),
-        |acc, item| Value::Pair(Box::new(item), Box::new(acc)),
-    );
+    let items = collect_list(&val)?;
+    let reversed = items
+        .into_iter()
+        .fold(Value::List(vec![]), |acc, item| make_pair(item, acc));
     Ok(reversed)
 }
 
@@ -1996,7 +2005,7 @@ fn eval_string_to_list(
         });
     };
     match eval(arg, env, out)? {
-        Value::Str(s) => Ok(Value::List(s.chars().map(Value::Char).collect())),
+        Value::Str(s) => Ok(list_from_vec(s.chars().map(Value::Char).collect())),
         other => Err(EvalError::TypeError {
             expected: "string".into(),
             got: format!("{other}"),
@@ -2015,25 +2024,19 @@ fn eval_list_to_string(
             got: args.len(),
         });
     };
-    match eval(arg, env, out)? {
-        Value::List(items) => {
-            let s: String = items
-                .iter()
-                .map(|v| match v {
-                    Value::Char(c) => Ok(*c),
-                    other => Err(EvalError::TypeError {
-                        expected: "char".into(),
-                        got: format!("{other}"),
-                    }),
-                })
-                .collect::<Result<_, _>>()?;
-            Ok(Value::Str(s))
-        }
-        other => Err(EvalError::TypeError {
-            expected: "list".into(),
-            got: format!("{other}"),
-        }),
-    }
+    let list_val = eval(arg, env, out)?;
+    let items = collect_list(&list_val)?;
+    let s: String = items
+        .iter()
+        .map(|v| match v {
+            Value::Char(c) => Ok(*c),
+            other => Err(EvalError::TypeError {
+                expected: "char".into(),
+                got: format!("{other}"),
+            }),
+        })
+        .collect::<Result<_, _>>()?;
+    Ok(Value::Str(s))
 }
 
 fn eval_char_to_integer(
@@ -2103,7 +2106,7 @@ fn apply_proc_evaluated(
             }
             if let Some(rest_name) = rest_param {
                 let rest_vals = eval_args[params.len()..].to_vec();
-                child.borrow_mut().define(rest_name.clone(), Value::List(rest_vals));
+                child.borrow_mut().define(rest_name.clone(), list_from_vec(rest_vals));
             }
             eval_body(body, &child, out)
         }
@@ -2141,12 +2144,9 @@ fn eval_map(
     let proc = eval(&args[0], env, out)?;
     let lists: Vec<Vec<Value>> = args[1..]
         .iter()
-        .map(|a| match eval(a, env, out)? {
-            Value::List(items) => Ok(items),
-            other => Err(EvalError::TypeError {
-                expected: "list".into(),
-                got: format!("{other}"),
-            }),
+        .map(|a| {
+            let val = eval(a, env, out)?;
+            collect_list(&val)
         })
         .collect::<Result<_, EvalError>>()?;
     let len = lists[0].len();
@@ -2156,7 +2156,7 @@ fn eval_map(
             apply_proc_evaluated(&proc, call_args, env, out)
         })
         .collect::<Result<_, _>>()?;
-    Ok(Value::List(results))
+    Ok(list_from_vec(results))
 }
 
 // --- Level 14: letrec, letrec*, case, equal?, eqv?, vectors ---
@@ -2434,7 +2434,7 @@ fn eval_vector_to_list(
         });
     };
     let items = v.borrow().clone();
-    Ok(Value::List(items))
+    Ok(list_from_vec(items))
 }
 
 fn eval_list_to_vector(
@@ -2449,12 +2449,7 @@ fn eval_list_to_vector(
         });
     };
     let list_val = eval(list_arg, env, out)?;
-    let Value::List(items) = list_val else {
-        return Err(EvalError::TypeError {
-            expected: "list".into(),
-            got: format!("{list_val}"),
-        });
-    };
+    let items = collect_list(&list_val)?;
     let vec = Rc::new(RefCell::new(items));
     Ok(Value::Vector(vec))
 }
@@ -2595,9 +2590,8 @@ fn eval_list_ref(
     let [list_arg, idx_arg] = args else {
         return Err(EvalError::WrongArgCount { expected: 2, got: args.len() });
     };
-    let Value::List(items) = eval(list_arg, env, out)? else {
-        return Err(EvalError::TypeError { expected: "list".into(), got: "non-list".into() });
-    };
+    let list_val = eval(list_arg, env, out)?;
+    let items = collect_list(&list_val)?;
     let Value::Integer(idx) = eval(idx_arg, env, out)? else {
         return Err(EvalError::TypeError { expected: "number".into(), got: "non-number".into() });
     };
@@ -2617,13 +2611,12 @@ fn eval_list_tail_builtin(
     let [list_arg, idx_arg] = args else {
         return Err(EvalError::WrongArgCount { expected: 2, got: args.len() });
     };
-    let Value::List(items) = eval(list_arg, env, out)? else {
-        return Err(EvalError::TypeError { expected: "list".into(), got: "non-list".into() });
-    };
+    let list_val = eval(list_arg, env, out)?;
+    let items = collect_list(&list_val)?;
     let Value::Integer(idx) = eval(idx_arg, env, out)? else {
         return Err(EvalError::TypeError { expected: "number".into(), got: "non-number".into() });
     };
-    Ok(Value::List(items[idx as usize..].to_vec()))
+    Ok(list_from_vec(items[idx as usize..].to_vec()))
 }
 
 fn eval_list_pred(
@@ -2635,7 +2628,47 @@ fn eval_list_pred(
         return Err(EvalError::WrongArgCount { expected: 1, got: args.len() });
     };
     let val = eval(arg, env, out)?;
-    Ok(Value::Boolean(matches!(val, Value::List(_))))
+    Ok(Value::Boolean(is_proper_list(&val)))
+}
+
+/// Check if a value is a proper list (ends with nil), with cycle detection.
+fn is_proper_list(val: &Value) -> bool {
+    match val {
+        Value::List(_) => true,
+        Value::Pair(_) => is_proper_list_tortoise_hare(val),
+        _ => false,
+    }
+}
+
+/// Tortoise-and-hare cycle detection for pair-chain lists.
+fn is_proper_list_tortoise_hare(val: &Value) -> bool {
+    let mut slow = val.clone();
+    let mut fast = val.clone();
+    loop {
+        slow = match &slow {
+            Value::Pair(p) => p.borrow().1.clone(),
+            Value::List(_) => return true,
+            _ => return false,
+        };
+        // Advance fast by two steps (unrolled to avoid nesting)
+        fast = match &fast {
+            Value::Pair(p) => p.borrow().1.clone(),
+            Value::List(_) => return true,
+            _ => return false,
+        };
+        fast = match &fast {
+            Value::Pair(p) => p.borrow().1.clone(),
+            Value::List(_) => return true,
+            _ => return false,
+        };
+        let is_cycle = matches!(
+            (&slow, &fast),
+            (Value::Pair(s), Value::Pair(f)) if Rc::ptr_eq(s, f)
+        );
+        if is_cycle {
+            return false;
+        }
+    }
 }
 
 fn eval_assoc(
@@ -2647,13 +2680,16 @@ fn eval_assoc(
         return Err(EvalError::WrongArgCount { expected: 2, got: args.len() });
     };
     let key = eval(key_arg, env, out)?;
-    let Value::List(items) = eval(list_arg, env, out)? else {
-        return Err(EvalError::TypeError { expected: "list".into(), got: "non-list".into() });
-    };
-    let found = items.iter().find(|item| {
-        matches!(item, Value::List(pair) if !pair.is_empty() && pair[0].deep_equal(&key))
+    let list_val = eval(list_arg, env, out)?;
+    let items = collect_list(&list_val)?;
+    let found = items.into_iter().find(|item| {
+        if let Ok(pair_items) = collect_list(item) {
+            !pair_items.is_empty() && pair_items[0].deep_equal(&key)
+        } else {
+            false
+        }
     });
-    Ok(found.cloned().unwrap_or(Value::Boolean(false)))
+    Ok(found.unwrap_or(Value::Boolean(false)))
 }
 
 fn eval_char_pred(
@@ -2868,6 +2904,100 @@ fn eval_denominator(
     }
 }
 
+// --- Level 21: Pair Mutation & Cycle Detection ---
+
+fn eval_set_car(
+    args: &[Value],
+    env: &Rc<RefCell<Env>>,
+    out: &Output,
+) -> Result<Value, EvalError> {
+    let [pair_arg, val_arg] = args else {
+        return Err(EvalError::WrongArgCount { expected: 2, got: args.len() });
+    };
+    let pair_val = eval(pair_arg, env, out)?;
+    let new_val = eval(val_arg, env, out)?;
+    let Value::Pair(p) = pair_val else {
+        return Err(EvalError::TypeError {
+            expected: "pair".into(),
+            got: format!("{pair_val}"),
+        });
+    };
+    p.borrow_mut().0 = new_val;
+    Ok(Value::Void)
+}
+
+fn eval_set_cdr(
+    args: &[Value],
+    env: &Rc<RefCell<Env>>,
+    out: &Output,
+) -> Result<Value, EvalError> {
+    let [pair_arg, val_arg] = args else {
+        return Err(EvalError::WrongArgCount { expected: 2, got: args.len() });
+    };
+    let pair_val = eval(pair_arg, env, out)?;
+    let new_val = eval(val_arg, env, out)?;
+    let Value::Pair(p) = pair_val else {
+        return Err(EvalError::TypeError {
+            expected: "pair".into(),
+            got: format!("{pair_val}"),
+        });
+    };
+    p.borrow_mut().1 = new_val;
+    Ok(Value::Void)
+}
+
+fn eval_cddr(
+    args: &[Value],
+    env: &Rc<RefCell<Env>>,
+    out: &Output,
+) -> Result<Value, EvalError> {
+    let [arg] = args else {
+        return Err(EvalError::WrongArgCount { expected: 1, got: args.len() });
+    };
+    let val = eval(arg, env, out)?;
+    let cdr1 = get_cdr(&val)?;
+    get_cdr(&cdr1)
+}
+
+fn eval_cadr(
+    args: &[Value],
+    env: &Rc<RefCell<Env>>,
+    out: &Output,
+) -> Result<Value, EvalError> {
+    let [arg] = args else {
+        return Err(EvalError::WrongArgCount { expected: 1, got: args.len() });
+    };
+    let val = eval(arg, env, out)?;
+    let cdr1 = get_cdr(&val)?;
+    get_car(&cdr1)
+}
+
+fn eval_caar(
+    args: &[Value],
+    env: &Rc<RefCell<Env>>,
+    out: &Output,
+) -> Result<Value, EvalError> {
+    let [arg] = args else {
+        return Err(EvalError::WrongArgCount { expected: 1, got: args.len() });
+    };
+    let val = eval(arg, env, out)?;
+    let car1 = get_car(&val)?;
+    get_car(&car1)
+}
+
+fn eval_cdar(
+    args: &[Value],
+    env: &Rc<RefCell<Env>>,
+    out: &Output,
+) -> Result<Value, EvalError> {
+    let [arg] = args else {
+        return Err(EvalError::WrongArgCount { expected: 1, got: args.len() });
+    };
+    let val = eval(arg, env, out)?;
+    let car1 = get_car(&val)?;
+    get_cdr(&car1)
+}
+
 /// Seed all builtin procedures into the environment as first-class values.
 pub fn seed_builtins(env: &Rc<RefCell<Env>>) {
     let names = [
@@ -2898,6 +3028,7 @@ pub fn seed_builtins(env: &Rc<RefCell<Env>>) {
         "exact?", "inexact?", "rational?", "integer?",
         "exact->inexact", "inexact->exact",
         "numerator", "denominator",
+        "set-car!", "set-cdr!", "cddr", "cadr", "caar", "cdar",
     ];
     let mut env_ref = env.borrow_mut();
     for name in names {
