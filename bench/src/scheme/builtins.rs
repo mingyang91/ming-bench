@@ -432,6 +432,97 @@ pub fn apply_integer_to_char(args: &[Value]) -> Result<Value, EvalError> {
     Ok(Value::Char(ch))
 }
 
+pub fn apply_abs(args: &[Value]) -> Result<Value, EvalError> {
+    let [val] = args else {
+        return Err(EvalError::WrongArgCount {
+            expected: 1,
+            got: args.len(),
+        });
+    };
+    let Value::Integer(n) = val else {
+        return Err(EvalError::TypeError {
+            expected: "integer".to_string(),
+            got: format!("{val}"),
+        });
+    };
+    Ok(Value::Integer(n.abs()))
+}
+
+pub fn apply_modulo(args: &[Value]) -> Result<Value, EvalError> {
+    let nums = require_integers(args)?;
+    let [a, b] = nums.as_slice() else {
+        return Err(EvalError::WrongArgCount {
+            expected: 2,
+            got: nums.len(),
+        });
+    };
+    if *b == 0 {
+        return Err(EvalError::DivisionByZero);
+    }
+    Ok(Value::Integer(((a % b) + b) % b))
+}
+
+pub fn apply_remainder(args: &[Value]) -> Result<Value, EvalError> {
+    let nums = require_integers(args)?;
+    let [a, b] = nums.as_slice() else {
+        return Err(EvalError::WrongArgCount {
+            expected: 2,
+            got: nums.len(),
+        });
+    };
+    if *b == 0 {
+        return Err(EvalError::DivisionByZero);
+    }
+    Ok(Value::Integer(a % b))
+}
+
+pub fn apply_quotient(args: &[Value]) -> Result<Value, EvalError> {
+    let nums = require_integers(args)?;
+    let [a, b] = nums.as_slice() else {
+        return Err(EvalError::WrongArgCount {
+            expected: 2,
+            got: nums.len(),
+        });
+    };
+    if *b == 0 {
+        return Err(EvalError::DivisionByZero);
+    }
+    Ok(Value::Integer(a / b))
+}
+
+pub fn apply_min(args: &[Value]) -> Result<Value, EvalError> {
+    let nums = require_integers(args)?;
+    if nums.is_empty() {
+        return Err(EvalError::WrongArgCount {
+            expected: 1,
+            got: 0,
+        });
+    }
+    Ok(Value::Integer(*nums.iter().min().expect("non-empty checked above")))
+}
+
+pub fn apply_max(args: &[Value]) -> Result<Value, EvalError> {
+    let nums = require_integers(args)?;
+    if nums.is_empty() {
+        return Err(EvalError::WrongArgCount {
+            expected: 1,
+            got: 0,
+        });
+    }
+    Ok(Value::Integer(*nums.iter().max().expect("non-empty checked above")))
+}
+
+pub fn apply_expt(args: &[Value]) -> Result<Value, EvalError> {
+    let nums = require_integers(args)?;
+    let [base, exp] = nums.as_slice() else {
+        return Err(EvalError::WrongArgCount {
+            expected: 2,
+            got: nums.len(),
+        });
+    };
+    Ok(Value::Integer((*base).pow(*exp as u32)))
+}
+
 pub fn apply_equal(args: &[Value]) -> Result<Value, EvalError> {
     let [a, b] = args else {
         return Err(EvalError::WrongArgCount {

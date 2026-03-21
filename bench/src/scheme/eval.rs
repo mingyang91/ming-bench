@@ -126,6 +126,13 @@ fn is_builtin(name: &str) -> bool {
             | "vector?"
             | "vector-length"
             | "vector->list"
+            | "abs"
+            | "modulo"
+            | "remainder"
+            | "quotient"
+            | "min"
+            | "max"
+            | "expt"
     )
 }
 
@@ -588,6 +595,13 @@ fn apply_builtin(op: &str, args: &[Value]) -> Result<Value, EvalError> {
         "vector?" => builtins::apply_type_predicate(args, |v| matches!(v, Value::Vector(_))),
         "vector-length" => builtins::apply_vector_length(args),
         "vector->list" => builtins::apply_vector_to_list(args),
+        "abs" => builtins::apply_abs(args),
+        "modulo" => builtins::apply_modulo(args),
+        "remainder" => builtins::apply_remainder(args),
+        "quotient" => builtins::apply_quotient(args),
+        "min" => builtins::apply_min(args),
+        "max" => builtins::apply_max(args),
+        "expt" => builtins::apply_expt(args),
         _ => Err(EvalError::UnboundVariable {
             name: op.to_string(),
         }),
