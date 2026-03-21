@@ -9,6 +9,7 @@ Implement a Scheme interpreter in Rust. Read `SPEC.md` for the full specificatio
 - You may create any additional modules/files under `src/scheme/`
 - Do NOT modify test functions
 - Allowed external crates: `thiserror`, `log`, `env_logger` (already in Cargo.toml). Do NOT add any others.
+- **No `thread_local!` or `std::thread_local`.** All state must be passed explicitly through function parameters. Thread-local storage hides state from signatures and defeats testability.
 - **NEVER run `cargo test` directly on the host.** Always use `cargo xtask test`. Bare `cargo test` risks infinite loops and OOM that crash the host. This rule has NO exceptions.
 
 ## Build & Test
@@ -69,9 +70,9 @@ impl From<ParseError> for EvalError { ... }  // enables ? propagation
 ### Effect Marking (visible signatures)
 
 Make capabilities visible in function signatures — callers see exactly what a function does:
-- Mutation: `&mut Env` (not hidden behind `&self`)
+- Mutation: `&mut` parameters (not hidden behind `&self`)
 - Fallibility: `-> Result<T, EvalError>` (not panic)
-- Allocation: `&Arena` or lifetime params
+- Ownership: lifetime parameters where borrowing is non-obvious
 
 No hidden side effects.
 
@@ -272,6 +273,7 @@ These lints are enforced in a **separate cleanup pass** at the end of each level
 | `.unwrap()` | `.expect("reason")`, `?`, or `.ok_or()` |
 | `Result<T, ()>` | A meaningful error type |
 | `if !cond { panic!(...) }` | `assert!(cond, ...)` |
+| `thread_local!` / `std::thread_local` | Pass state via function parameters |
 
 ### Structural limits
 
