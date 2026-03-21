@@ -1,6 +1,7 @@
 pub mod error;
 
 pub use error::EvalError;
+use error::SourcePos;
 
 use std::{cell::RefCell, collections::HashMap, fmt, rc::Rc};
 
@@ -31,7 +32,10 @@ fn eval_program(input: &str) -> Result<Value, EvalError> {
     let program = parser.parse_program()?;
 
     if program.is_empty() {
-        return Err(EvalError::Syntax("expected at least one expression".into()));
+        return Err(
+            EvalError::Syntax("expected at least one expression".into())
+                .with_position(SourcePos::new(1, 1)),
+        );
     }
 
     let env = Env::global();
@@ -39,7 +43,19 @@ fn eval_program(input: &str) -> Result<Value, EvalError> {
 }
 
 #[derive(Debug, Clone, PartialEq)]
-enum Token {
+struct Token {
+    kind: TokenKind,
+    pos: SourcePos,
+}
+
+impl Token {
+    fn new(kind: TokenKind, pos: SourcePos) -> Self {
+        Self { kind, pos }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq)]
+enum TokenKind {
     LParen,
     RParen,
     Quote,
@@ -50,7 +66,19 @@ enum Token {
 }
 
 #[derive(Debug, Clone, PartialEq)]
-enum Expr {
+struct Expr {
+    kind: ExprKind,
+    pos: SourcePos,
+}
+
+impl Expr {
+    fn new(kind: ExprKind, pos: SourcePos) -> Self {
+        Self { kind, pos }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq)]
+enum ExprKind {
     Bool(bool),
     Number(i64),
     String(String),
@@ -251,39 +279,40 @@ fn eval_sequence(exprs: &[Expr], env: EnvRef) -> Result<Value, EvalError> {
 }
 
 fn eval_expr(expr: &Expr, env: EnvRef) -> Result<Value, EvalError> {
-    match expr {
-        Expr::Bool(value) => Ok(Value::Bool(*value)),
-        Expr::Number(value) => Ok(Value::Number(*value)),
-        Expr::String(value) => Ok(Value::String(value.clone())),
-        Expr::Symbol(name) => {
-            Env::lookup(&env, name).ok_or_else(|| EvalError::UnboundSymbol(name.clone()))
+    match &expr.kind {
+        ExprKind::Bool(value) => Ok(Value::Bool(*value)),
+        ExprKind::Number(value) => Ok(Value::Number(*value)),
+        ExprKind::String(value) => Ok(Value::String(value.clone())),
+        ExprKind::Symbol(name) => Env::lookup(&env, name)
+            .ok_or_else(|| EvalError::UnboundSymbol(name.clone()).with_position(expr.pos)),
+        ExprKind::List(items) => {
+            eval_list(items, expr.pos, env).map_err(|err| err.with_position(expr.pos))
         }
-        Expr::List(items) => eval_list(items, env),
     }
 }
 
-fn eval_list(items: &[Expr], env: EnvRef) -> Result<Value, EvalError> {
+fn eval_list(items: &[Expr], pos: SourcePos, env: EnvRef) -> Result<Value, EvalError> {
     let Some((head, args)) = items.split_first() else {
-        return Err(EvalError::Syntax("cannot evaluate an empty list".into()));
+        return Err(EvalError::Syntax("cannot evaluate an empty list".into()).with_position(pos));
     };
 
-    match head {
-        Expr::Symbol(name) if name == "and" => eval_and(args, env),
-        Expr::Symbol(name) if name == "or" => eval_or(args, env),
-        Expr::Symbol(name) if name == "if" => eval_if(args, env),
-        Expr::Symbol(name) if name == "let" => eval_let(args, env),
-        Expr::Symbol(name) if name == "begin" => eval_begin(args, env),
-        Expr::Symbol(name) if name == "cond" => eval_cond(args, env),
-        Expr::Symbol(name) if name == "quote" => eval_quote(args),
-        Expr::Symbol(name) if name == "define" => eval_define(args, env),
-        Expr::Symbol(name) if name == "lambda" => eval_lambda(args, env),
+    match &head.kind {
+        ExprKind::Symbol(name) if name == "and" => eval_and(args, env),
+        ExprKind::Symbol(name) if name == "or" => eval_or(args, env),
+        ExprKind::Symbol(name) if name == "if" => eval_if(args, env),
+        ExprKind::Symbol(name) if name == "let" => eval_let(args, env),
+        ExprKind::Symbol(name) if name == "begin" => eval_begin(args, env),
+        ExprKind::Symbol(name) if name == "cond" => eval_cond(args, env),
+        ExprKind::Symbol(name) if name == "quote" => eval_quote(args),
+        ExprKind::Symbol(name) if name == "define" => eval_define(args, env),
+        ExprKind::Symbol(name) if name == "lambda" => eval_lambda(args, env),
         _ => {
             let procedure = eval_expr(head, env.clone())?;
             let evaluated = args
                 .iter()
                 .map(|arg| eval_expr(arg, env.clone()))
                 .collect::<Result<Vec<_>, EvalError>>()?;
-            apply(procedure, &evaluated)
+            apply(procedure, &evaluated, pos)
         }
     }
 }
@@ -350,7 +379,7 @@ fn eval_begin(args: &[Expr], env: EnvRef) -> Result<Value, EvalError> {
 
 fn eval_cond(args: &[Expr], env: EnvRef) -> Result<Value, EvalError> {
     for (index, clause) in args.iter().enumerate() {
-        let Expr::List(items) = clause else {
+        let ExprKind::List(items) = &clause.kind else {
             return Err(EvalError::Syntax("cond clauses must be lists".into()));
         };
 
@@ -358,8 +387,8 @@ fn eval_cond(args: &[Expr], env: EnvRef) -> Result<Value, EvalError> {
             return Err(EvalError::Syntax("cond clauses cannot be empty".into()));
         };
 
-        match test {
-            Expr::Symbol(name) if name == "else" => {
+        match &test.kind {
+            ExprKind::Symbol(name) if name == "else" => {
                 if index + 1 != args.len() {
                     return Err(EvalError::Syntax("cond else clause must be last".into()));
                 }
@@ -394,12 +423,12 @@ fn eval_quote(args: &[Expr]) -> Result<Value, EvalError> {
 }
 
 fn quote_expr(expr: &Expr) -> Value {
-    match expr {
-        Expr::Bool(value) => Value::Bool(*value),
-        Expr::Number(value) => Value::Number(*value),
-        Expr::String(value) => Value::String(value.clone()),
-        Expr::Symbol(value) => Value::Symbol(value.clone()),
-        Expr::List(items) => Value::List(items.iter().map(quote_expr).collect()),
+    match &expr.kind {
+        ExprKind::Bool(value) => Value::Bool(*value),
+        ExprKind::Number(value) => Value::Number(*value),
+        ExprKind::String(value) => Value::String(value.clone()),
+        ExprKind::Symbol(value) => Value::Symbol(value.clone()),
+        ExprKind::List(items) => Value::List(items.iter().map(quote_expr).collect()),
     }
 }
 
@@ -408,8 +437,8 @@ fn eval_define(args: &[Expr], env: EnvRef) -> Result<Value, EvalError> {
         return Err(wrong_arg_count("define", "at least 2", args.len()));
     }
 
-    match &args[0] {
-        Expr::Symbol(name) => {
+    match &args[0].kind {
+        ExprKind::Symbol(name) => {
             if args.len() != 2 {
                 return Err(wrong_arg_count("define", "exactly 2", args.len()));
             }
@@ -418,7 +447,7 @@ fn eval_define(args: &[Expr], env: EnvRef) -> Result<Value, EvalError> {
             Env::define(&env, name.clone(), value);
             Ok(Value::Void)
         }
-        Expr::List(signature) => {
+        ExprKind::List(signature) => {
             let Some((name, params)) = signature.split_first() else {
                 return Err(EvalError::Syntax("define requires a function name".into()));
             };
@@ -458,8 +487,8 @@ fn eval_lambda(args: &[Expr], env: EnvRef) -> Result<Value, EvalError> {
 }
 
 fn parse_parameter_list(expr: &Expr) -> Result<Vec<String>, EvalError> {
-    match expr {
-        Expr::List(items) => parse_parameters(items),
+    match &expr.kind {
+        ExprKind::List(items) => parse_parameters(items),
         _ => Err(EvalError::Syntax(
             "lambda parameter list must be a list".into(),
         )),
@@ -467,14 +496,14 @@ fn parse_parameter_list(expr: &Expr) -> Result<Vec<String>, EvalError> {
 }
 
 fn parse_let_bindings(expr: &Expr) -> Result<Vec<(String, Expr)>, EvalError> {
-    let Expr::List(bindings) = expr else {
+    let ExprKind::List(bindings) = &expr.kind else {
         return Err(EvalError::Syntax("let bindings must be a list".into()));
     };
 
     bindings
         .iter()
         .map(|binding| {
-            let Expr::List(parts) = binding else {
+            let ExprKind::List(parts) = &binding.kind else {
                 return Err(EvalError::Syntax(
                     "let binding must be a (name expr) pair".into(),
                 ));
@@ -498,17 +527,19 @@ fn parse_parameters(items: &[Expr]) -> Result<Vec<String>, EvalError> {
 }
 
 fn expect_symbol(expr: &Expr, context: &str) -> Result<String, EvalError> {
-    match expr {
-        Expr::Symbol(name) => Ok(name.clone()),
+    match &expr.kind {
+        ExprKind::Symbol(name) => Ok(name.clone()),
         _ => Err(EvalError::Syntax(format!("{context} must be a symbol"))),
     }
 }
 
-fn apply(function: Value, args: &[Value]) -> Result<Value, EvalError> {
+fn apply(function: Value, args: &[Value], pos: SourcePos) -> Result<Value, EvalError> {
     match function {
-        Value::Builtin(builtin) => apply_builtin(builtin, args),
-        Value::Procedure(procedure) => apply_lambda(&procedure, args),
-        other => Err(EvalError::NotAProcedure(other.to_string())),
+        Value::Builtin(builtin) => apply_builtin(builtin, args).map_err(|err| err.with_position(pos)),
+        Value::Procedure(procedure) => {
+            apply_lambda(&procedure, args).map_err(|err| err.with_position(pos))
+        }
+        other => Err(EvalError::NotAProcedure(other.to_string()).with_position(pos)),
     }
 }
 
@@ -737,9 +768,19 @@ fn escape_string(value: &str) -> String {
     escaped
 }
 
+fn advance_position(pos: &mut SourcePos, ch: char) {
+    if ch == '\n' {
+        pos.line += 1;
+        pos.col = 1;
+    } else {
+        pos.col += 1;
+    }
+}
+
 fn tokenize(input: &str) -> Result<Vec<Token>, EvalError> {
     let mut tokens = Vec::new();
     let mut index = 0;
+    let mut pos = SourcePos::new(1, 1);
 
     while index < input.len() {
         let ch = input[index..]
@@ -750,39 +791,48 @@ fn tokenize(input: &str) -> Result<Vec<Token>, EvalError> {
         match ch {
             c if c.is_whitespace() => {
                 index += ch.len_utf8();
+                advance_position(&mut pos, ch);
             }
             ';' => {
                 index += ch.len_utf8();
+                advance_position(&mut pos, ch);
                 while index < input.len() {
                     let next = input[index..]
                         .chars()
                         .next()
                         .expect("index always points to a valid character boundary");
                     index += next.len_utf8();
+                    advance_position(&mut pos, next);
                     if next == '\n' {
                         break;
                     }
                 }
             }
             '(' => {
-                tokens.push(Token::LParen);
+                tokens.push(Token::new(TokenKind::LParen, pos));
                 index += ch.len_utf8();
+                advance_position(&mut pos, ch);
             }
             ')' => {
-                tokens.push(Token::RParen);
+                tokens.push(Token::new(TokenKind::RParen, pos));
                 index += ch.len_utf8();
+                advance_position(&mut pos, ch);
             }
             '\'' => {
-                tokens.push(Token::Quote);
+                tokens.push(Token::new(TokenKind::Quote, pos));
                 index += ch.len_utf8();
+                advance_position(&mut pos, ch);
             }
             '"' => {
-                let (string, next_index) = parse_string(input, index)?;
-                tokens.push(Token::String(string));
+                let start_pos = pos;
+                let (string, next_index, next_pos) = parse_string(input, index, pos)?;
+                tokens.push(Token::new(TokenKind::String(string), start_pos));
                 index = next_index;
+                pos = next_pos;
             }
             _ => {
                 let start = index;
+                let start_pos = pos;
                 while index < input.len() {
                     let next = input[index..]
                         .chars()
@@ -797,10 +847,11 @@ fn tokenize(input: &str) -> Result<Vec<Token>, EvalError> {
                         break;
                     }
                     index += next.len_utf8();
+                    advance_position(&mut pos, next);
                 }
 
                 let atom = &input[start..index];
-                tokens.push(parse_atom(atom));
+                tokens.push(Token::new(parse_atom(atom), start_pos));
             }
         }
     }
@@ -808,9 +859,15 @@ fn tokenize(input: &str) -> Result<Vec<Token>, EvalError> {
     Ok(tokens)
 }
 
-fn parse_string(input: &str, start: usize) -> Result<(String, usize), EvalError> {
+fn parse_string(
+    input: &str,
+    start: usize,
+    start_pos: SourcePos,
+) -> Result<(String, usize, SourcePos), EvalError> {
     let mut result = String::new();
+    let mut pos = start_pos;
     let mut index = start + 1;
+    advance_position(&mut pos, '"');
 
     while index < input.len() {
         let ch = input[index..]
@@ -818,15 +875,21 @@ fn parse_string(input: &str, start: usize) -> Result<(String, usize), EvalError>
             .next()
             .expect("index always points to a valid character boundary");
         index += ch.len_utf8();
+        advance_position(&mut pos, ch);
 
         match ch {
-            '"' => return Ok((result, index)),
+            '"' => return Ok((result, index, pos)),
             '\\' => {
+                let escape_pos = pos;
                 let escaped = input[index..]
                     .chars()
                     .next()
-                    .ok_or_else(|| EvalError::Syntax("unterminated string literal".into()))?;
+                    .ok_or_else(|| {
+                        EvalError::Syntax("unterminated string literal".into())
+                            .with_position(start_pos)
+                    })?;
                 index += escaped.len_utf8();
+                advance_position(&mut pos, escaped);
                 match escaped {
                     '"' => result.push('"'),
                     '\\' => result.push('\\'),
@@ -834,9 +897,10 @@ fn parse_string(input: &str, start: usize) -> Result<(String, usize), EvalError>
                     'r' => result.push('\r'),
                     't' => result.push('\t'),
                     _ => {
-                        return Err(EvalError::Syntax(format!(
-                            "unsupported escape sequence: \\{escaped}"
-                        )));
+                        return Err(
+                            EvalError::Syntax(format!("unsupported escape sequence: \\{escaped}"))
+                                .with_position(escape_pos),
+                        );
                     }
                 }
             }
@@ -844,16 +908,16 @@ fn parse_string(input: &str, start: usize) -> Result<(String, usize), EvalError>
         }
     }
 
-    Err(EvalError::Syntax("unterminated string literal".into()))
+    Err(EvalError::Syntax("unterminated string literal".into()).with_position(start_pos))
 }
 
-fn parse_atom(atom: &str) -> Token {
+fn parse_atom(atom: &str) -> TokenKind {
     match atom {
-        "#t" => Token::Bool(true),
-        "#f" => Token::Bool(false),
+        "#t" => TokenKind::Bool(true),
+        "#f" => TokenKind::Bool(false),
         _ => match atom.parse::<i64>() {
-            Ok(value) => Token::Number(value),
-            Err(_) => Token::Symbol(atom.to_string()),
+            Ok(value) => TokenKind::Number(value),
+            Err(_) => TokenKind::Symbol(atom.to_string()),
         },
     }
 }
@@ -861,11 +925,16 @@ fn parse_atom(atom: &str) -> Token {
 struct Parser {
     tokens: Vec<Token>,
     index: usize,
+    last_pos: SourcePos,
 }
 
 impl Parser {
     fn new(tokens: Vec<Token>) -> Self {
-        Self { tokens, index: 0 }
+        Self {
+            tokens,
+            index: 0,
+            last_pos: SourcePos::new(1, 1),
+        }
     }
 
     fn parse_program(&mut self) -> Result<Vec<Expr>, EvalError> {
@@ -881,30 +950,45 @@ impl Parser {
             .tokens
             .get(self.index)
             .cloned()
-            .ok_or_else(|| EvalError::Syntax("unexpected end of input".into()))?;
+            .ok_or_else(|| {
+                EvalError::Syntax("unexpected end of input".into()).with_position(self.last_pos)
+            })?;
         self.index += 1;
+        self.last_pos = token.pos;
 
-        match token {
-            Token::LParen => {
+        match token.kind {
+            TokenKind::LParen => {
                 let mut items = Vec::new();
                 while self.index < self.tokens.len() {
-                    if matches!(self.tokens.get(self.index), Some(Token::RParen)) {
+                    if matches!(
+                        self.tokens.get(self.index).map(|next| &next.kind),
+                        Some(TokenKind::RParen)
+                    ) {
+                        self.last_pos = self.tokens[self.index].pos;
                         self.index += 1;
-                        return Ok(Expr::List(items));
+                        return Ok(Expr::new(ExprKind::List(items), token.pos));
                     }
                     items.push(self.parse_expr()?);
                 }
-                Err(EvalError::Syntax("missing ')'".into()))
+                Err(EvalError::Syntax("missing ')'".into()).with_position(token.pos))
             }
-            Token::RParen => Err(EvalError::Syntax("unexpected ')'".into())),
-            Token::Quote => {
+            TokenKind::RParen => {
+                Err(EvalError::Syntax("unexpected ')'".into()).with_position(token.pos))
+            }
+            TokenKind::Quote => {
                 let quoted = self.parse_expr()?;
-                Ok(Expr::List(vec![Expr::Symbol("quote".to_string()), quoted]))
+                Ok(Expr::new(
+                    ExprKind::List(vec![
+                        Expr::new(ExprKind::Symbol("quote".to_string()), token.pos),
+                        quoted,
+                    ]),
+                    token.pos,
+                ))
             }
-            Token::Bool(value) => Ok(Expr::Bool(value)),
-            Token::Number(value) => Ok(Expr::Number(value)),
-            Token::String(value) => Ok(Expr::String(value)),
-            Token::Symbol(name) => Ok(Expr::Symbol(name)),
+            TokenKind::Bool(value) => Ok(Expr::new(ExprKind::Bool(value), token.pos)),
+            TokenKind::Number(value) => Ok(Expr::new(ExprKind::Number(value), token.pos)),
+            TokenKind::String(value) => Ok(Expr::new(ExprKind::String(value), token.pos)),
+            TokenKind::Symbol(name) => Ok(Expr::new(ExprKind::Symbol(name), token.pos)),
         }
     }
 }

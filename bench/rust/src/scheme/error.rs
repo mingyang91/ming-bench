@@ -1,9 +1,35 @@
+use std::fmt;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SourcePos {
+    pub line: usize,
+    pub col: usize,
+}
+
+impl SourcePos {
+    pub const fn new(line: usize, col: usize) -> Self {
+        Self { line, col }
+    }
+}
+
+impl fmt::Display for SourcePos {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}:{}", self.line, self.col)
+    }
+}
+
 /// Evaluation error type for the Scheme interpreter.
 ///
 /// Agents must add domain-specific variants here. Using `String` as the
 /// error type is not possible — the `eval_str` signature requires this type.
 #[derive(Debug, PartialEq, thiserror::Error)]
 pub enum EvalError {
+    #[error("{pos}: {inner}")]
+    Located {
+        pos: SourcePos,
+        #[source]
+        inner: Box<EvalError>,
+    },
     #[error("syntax error: {0}")]
     Syntax(String),
     #[error("unbound symbol: {0}")]
@@ -24,4 +50,16 @@ pub enum EvalError {
     IntegerOverflow,
     #[error("not a procedure: {0}")]
     NotAProcedure(String),
+}
+
+impl EvalError {
+    pub fn with_position(self, pos: SourcePos) -> Self {
+        match self {
+            Self::Located { .. } => self,
+            other => Self::Located {
+                pos,
+                inner: Box::new(other),
+            },
+        }
+    }
 }
