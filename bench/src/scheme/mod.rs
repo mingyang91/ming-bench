@@ -192,7 +192,28 @@ fn eval(expr: Value) -> Result<Value, EvalError> {
             }
             let first = &elems[0];
             match first {
-                Value::Symbol(op) => apply_builtin(op, &elems[1..]),
+                Value::Symbol(op) => match op.as_str() {
+                    "and" => {
+                        let mut result = Value::Boolean(true);
+                        for arg in &elems[1..] {
+                            result = eval(arg.clone())?;
+                            if result == Value::Boolean(false) {
+                                return Ok(Value::Boolean(false));
+                            }
+                        }
+                        Ok(result)
+                    }
+                    "or" => {
+                        for arg in &elems[1..] {
+                            let result = eval(arg.clone())?;
+                            if result != Value::Boolean(false) {
+                                return Ok(result);
+                            }
+                        }
+                        Ok(Value::Boolean(false))
+                    }
+                    _ => apply_builtin(op, &elems[1..]),
+                },
                 _ => Err(EvalError::Runtime("not a procedure".to_string())),
             }
         }
@@ -247,6 +268,42 @@ fn apply_builtin(op: &str, args: &[Value]) -> Result<Value, EvalError> {
                 result /= d;
             }
             Ok(Value::Integer(result))
+        }
+        "<" => {
+            if vals.len() != 2 {
+                return Err(EvalError::Runtime("< requires 2 arguments".to_string()));
+            }
+            Ok(Value::Boolean(expect_int(&vals[0])? < expect_int(&vals[1])?))
+        }
+        ">" => {
+            if vals.len() != 2 {
+                return Err(EvalError::Runtime("> requires 2 arguments".to_string()));
+            }
+            Ok(Value::Boolean(expect_int(&vals[0])? > expect_int(&vals[1])?))
+        }
+        "=" => {
+            if vals.len() != 2 {
+                return Err(EvalError::Runtime("= requires 2 arguments".to_string()));
+            }
+            Ok(Value::Boolean(expect_int(&vals[0])? == expect_int(&vals[1])?))
+        }
+        "<=" => {
+            if vals.len() != 2 {
+                return Err(EvalError::Runtime("<= requires 2 arguments".to_string()));
+            }
+            Ok(Value::Boolean(expect_int(&vals[0])? <= expect_int(&vals[1])?))
+        }
+        ">=" => {
+            if vals.len() != 2 {
+                return Err(EvalError::Runtime(">= requires 2 arguments".to_string()));
+            }
+            Ok(Value::Boolean(expect_int(&vals[0])? >= expect_int(&vals[1])?))
+        }
+        "not" => {
+            if vals.len() != 1 {
+                return Err(EvalError::Runtime("not requires 1 argument".to_string()));
+            }
+            Ok(Value::Boolean(vals[0] == Value::Boolean(false)))
         }
         _ => Err(EvalError::Runtime(format!("unknown procedure: {}", op))),
     }
