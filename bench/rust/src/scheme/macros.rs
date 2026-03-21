@@ -23,12 +23,12 @@ const SPECIAL_FORMS: &[&str] = &[
     "string-set!",
 ];
 
-enum Binding {
+pub enum Binding {
     Single(Value),
     Repeated(Vec<Value>),
 }
 
-type Bindings = HashMap<String, Binding>;
+pub type Bindings = HashMap<String, Binding>;
 
 /// Expand a macro invocation. `input` is the full form including the macro name.
 pub fn expand_macro(
@@ -130,7 +130,7 @@ fn collect_ellipsis_matches(
     Some(collected)
 }
 
-fn match_single(
+pub fn match_single(
     pattern: &Value,
     input: &Value,
     literals: &[String],
@@ -160,7 +160,7 @@ fn match_single(
     }
 }
 
-fn instantiate(
+pub fn instantiate(
     template: &Value,
     bindings: &Bindings,
     def_env: &Rc<RefCell<Env>>,
@@ -192,7 +192,7 @@ fn instantiate(
     }
 }
 
-fn collect_introduced(
+pub fn collect_introduced(
     template: &Value,
     pattern_vars: &HashSet<&String>,
     gensym_map: &mut HashMap<String, String>,
@@ -210,6 +210,10 @@ fn collect_introduced(
             gensym_map.insert(name.clone(), gensym);
         }
         Value::List(elems) => {
+            // Skip quoted forms — symbols inside (quote ...) are data, not identifiers
+            if matches!(elems.first(), Some(Value::Symbol(s)) if s == "quote") {
+                return;
+            }
             for elem in elems {
                 collect_introduced(elem, pattern_vars, gensym_map, counter);
             }
@@ -218,7 +222,7 @@ fn collect_introduced(
     }
 }
 
-fn substitute(
+pub fn substitute(
     template: &Value,
     bindings: &Bindings,
     gensym_map: &HashMap<String, String>,
@@ -248,6 +252,10 @@ fn substitute_list(
     bindings: &Bindings,
     gensym_map: &HashMap<String, String>,
 ) -> Result<Value, EvalError> {
+    // Don't substitute inside quoted forms
+    if matches!(elems.first(), Some(Value::Symbol(s)) if s == "quote") {
+        return Ok(Value::List(elems.to_vec()));
+    }
     let mut result = Vec::new();
     let mut i = 0;
 
@@ -312,4 +320,16 @@ fn clone_bindings(bindings: &Bindings) -> Bindings {
             (k.clone(), cloned)
         })
         .collect()
+}
+
+/// Match a syntax-case pattern against an input value.
+/// Returns bindings if the match succeeds.
+pub fn syntax_case_match(
+    pattern: &Value,
+    input: &Value,
+    literals: &[String],
+) -> Option<Bindings> {
+    let mut bindings = HashMap::new();
+    match_single(pattern, input, literals, &mut bindings)?;
+    Some(bindings)
 }

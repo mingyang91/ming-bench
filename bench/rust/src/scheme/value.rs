@@ -35,6 +35,10 @@ pub enum Value {
         rules: Vec<(Vec<Value>, Value)>,
         def_env: Rc<RefCell<Env>>,
     },
+    /// A syntax-case transformer macro: a lambda that takes syntax and returns syntax.
+    TransformerMacro {
+        transformer: Box<Value>,
+    },
     Void,
     /// Multiple return values from `(values ...)`.
     Values(Vec<Value>),
@@ -75,6 +79,7 @@ impl PartialEq for Value {
             (Value::Builtin(a), Value::Builtin(b)) => a == b,
             (Value::Continuation(a), Value::Continuation(b)) => a == b,
             (Value::Macro { .. }, Value::Macro { .. }) => false,
+            (Value::TransformerMacro { .. }, Value::TransformerMacro { .. }) => false,
             (Value::Values(a), Value::Values(b)) => a == b,
             (Value::Void, Value::Void) => true,
             (Value::Record { type_id: a, .. }, Value::Record { type_id: b, .. }) => a == b,
@@ -304,7 +309,8 @@ impl fmt::Display for Value {
             Value::Lambda { .. }
             | Value::Builtin(_)
             | Value::Continuation(_)
-            | Value::Macro { .. } => {
+            | Value::Macro { .. }
+            | Value::TransformerMacro { .. } => {
                 write!(f, "#<procedure>")
             }
             Value::Record { type_name, .. } => write!(f, "#<record:{type_name}>"),

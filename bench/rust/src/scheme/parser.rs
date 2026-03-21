@@ -10,6 +10,7 @@ enum Token {
     LParen,
     RParen,
     Quote,
+    SyntaxQuote,
     Symbol(String),
     Integer(i64),
     Float(f64),
@@ -69,7 +70,9 @@ fn skip_line_comment(chars: &[char], start: usize) -> usize {
 
 fn tokenize_hash(chars: &[char], start: usize) -> Result<(Token, usize), EvalError> {
     let i = start + 1;
-    if i < chars.len() && chars[i] == 't' {
+    if i < chars.len() && chars[i] == '\'' {
+        Ok((Token::SyntaxQuote, i + 1))
+    } else if i < chars.len() && chars[i] == 't' {
         Ok((Token::Boolean(true), i + 1))
     } else if i < chars.len() && chars[i] == 'f' {
         Ok((Token::Boolean(false), i + 1))
@@ -204,6 +207,10 @@ fn parse_expr(tokens: &[(Token, Span)], pos: usize) -> Result<(Value, Span, usiz
         Token::Quote => {
             let (inner, _, next) = parse_expr(tokens, pos + 1)?;
             Ok((Value::List(vec![Value::Symbol("quote".into()), inner]), span, next))
+        }
+        Token::SyntaxQuote => {
+            let (inner, _, next) = parse_expr(tokens, pos + 1)?;
+            Ok((Value::List(vec![Value::Symbol("syntax".into()), inner]), span, next))
         }
         Token::LParen => {
             let (items, next) = parse_list_items(tokens, pos + 1)?;
