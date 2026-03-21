@@ -1088,6 +1088,9 @@ impl<'a> Parser<'a> {
         self.skip_whitespace();
 
         let pos = self.current_pos();
+        if self.input[self.offset..].starts_with("#'") {
+            return self.parse_syntax_sugar();
+        }
         let next = self.peek_char().ok_or_else(|| unexpected_eof(pos))?;
         match next {
             '(' => self.parse_list(),
@@ -1103,6 +1106,16 @@ impl<'a> Parser<'a> {
         self.expect_char('\'')?;
         Ok(Expr::List(
             vec![Expr::Symbol("quote".into(), pos), self.parse_expr()?],
+            pos,
+        ))
+    }
+
+    fn parse_syntax_sugar(&mut self) -> Result<Expr, EvalError> {
+        let pos = self.current_pos();
+        self.expect_char('#')?;
+        self.expect_char('\'')?;
+        Ok(Expr::List(
+            vec![Expr::Symbol("syntax".into(), pos), self.parse_expr()?],
             pos,
         ))
     }

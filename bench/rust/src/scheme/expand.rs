@@ -1,4 +1,8 @@
-use super::{internal_builtin_name, syntax_error, EvalError, Expr, SourcePos, BUILTIN_BINDINGS};
+use super::{
+    default_env, eval_expr, internal_builtin_name, invalid_argument, not_callable, quote_expr,
+    syntax_error, type_error, unbound_variable, wrong_arity, EvalError, Expr, SourcePos, Value,
+    BUILTIN_BINDINGS,
+};
 use std::collections::{HashMap, HashSet};
 
 const INTERNAL_PREFIX: &str = "#%";
@@ -65,6 +69,36 @@ struct SyntaxRule {
 }
 
 #[derive(Clone)]
+enum MacroDef {
+    SyntaxRules(SyntaxRuleMacro),
+    SyntaxCase(SyntaxCaseMacro),
+}
+
+#[derive(Clone)]
+struct SyntaxCaseMacro {
+    surface_name: String,
+    input_name: String,
+    literals: HashSet<String>,
+    clauses: Vec<SyntaxCaseClause>,
+    def_vars: HashMap<String, String>,
+    def_macros: HashMap<String, String>,
+}
+
+#[derive(Clone)]
+struct SyntaxCaseClause {
+    pattern: Expr,
+    fender: Option<Expr>,
+    output: Expr,
+}
+
+struct MacroContext<'a> {
+    surface_name: &'a str,
+    literals: &'a HashSet<String>,
+    def_vars: &'a HashMap<String, String>,
+    def_macros: &'a HashMap<String, String>,
+}
+
+#[derive(Clone)]
 struct RecordFieldSpec {
     name: String,
     accessor_name: String,
@@ -103,10 +137,52 @@ struct IntroEnv {
     pattern_overrides: HashMap<String, String>,
 }
 
+#[derive(Clone)]
+enum TransformerValue {
+    Datum(Value),
+    Syntax(Expr),
+}
+
+impl TransformerValue {
+    fn type_name(&self) -> &'static str {
+        match self {
+            Self::Datum(value) => value.type_name(),
+            Self::Syntax(_) => "syntax",
+        }
+    }
+}
+
+#[derive(Clone, Default)]
+struct TransformerEnv {
+    values: HashMap<String, TransformerValue>,
+}
+
 struct Expander {
     next_scope_id: usize,
     next_internal_id: usize,
-    macros: HashMap<String, SyntaxRuleMacro>,
+    macros: HashMap<String, MacroDef>,
+}
+
+impl SyntaxRuleMacro {
+    fn context(&self) -> MacroContext<'_> {
+        MacroContext {
+            surface_name: &self.surface_name,
+            literals: &self.literals,
+            def_vars: &self.def_vars,
+            def_macros: &self.def_macros,
+        }
+    }
+}
+
+impl SyntaxCaseMacro {
+    fn context(&self) -> MacroContext<'_> {
+        MacroContext {
+            surface_name: &self.surface_name,
+            literals: &self.literals,
+            def_vars: &self.def_vars,
+            def_macros: &self.def_macros,
+        }
+    }
 }
 
 pub(super) fn expand_program(exprs: Vec<Expr>) -> Result<Vec<Expr>, EvalError> {
@@ -158,7 +234,11 @@ impl Expander {
                 self.expand_define_syntax(&items[1..], *pos, env)?;
                 Ok(None)
             }
-            Some("define") => Ok(Some(self.expand_define(&items[1..], *pos, env)?)),
+            Some("define") => {
+                let expanded = self.expand_define(&items[1..], *pos, env)?;
+                self.record_sequence_define_alias(&items[1..], env);
+                Ok(Some(expanded))
+            }
             Some("define-record-type") => {
                 Ok(Some(self.expand_define_record_type(&items[1..], *pos, env)?))
             }
@@ -166,7 +246,38 @@ impl Expander {
                 let body = self.expand_sequence(&items[1..], env)?;
                 Ok(Some(list_with_head("begin", *pos, body)))
             }
-            _ => Ok(Some(self.expand_expr(expr, env)?)),
+            _ => {
+                if let Some(macro_id) = self.lookup_macro_call(head, env) {
+                    let expanded = self.expand_macro_output(items, *pos, &macro_id, env)?;
+                    return self.expand_sequence_expr(&expanded, env);
+                }
+
+                let expanded = self.expand_expr(expr, env)?;
+                if let Expr::List(items, pos) = &expanded {
+                    match items.first().and_then(symbol_name) {
+                        Some("define-syntax") => {
+                            self.expand_define_syntax(&items[1..], *pos, env)?;
+                            return Ok(None);
+                        }
+                        Some("define") => {
+                            let expanded = self.expand_define(&items[1..], *pos, env)?;
+                            self.record_sequence_define_alias(&items[1..], env);
+                            return Ok(Some(expanded));
+                        }
+                        Some("define-record-type") => {
+                            return Ok(Some(
+                                self.expand_define_record_type(&items[1..], *pos, env)?,
+                            ));
+                        }
+                        Some("begin") => {
+                            let body = self.expand_sequence(&items[1..], env)?;
+                            return Ok(Some(list_with_head("begin", *pos, body)));
+                        }
+                        _ => {}
+                    }
+                }
+                Ok(Some(expanded))
+            }
         }
     }
 
@@ -315,8 +426,7 @@ impl Expander {
             .map(|(name, binding)| (name.clone(), binding.internal.clone()))
             .collect::<HashMap<_, _>>();
 
-        let macro_def =
-            self.parse_syntax_rules(name, &internal_name, transformer, &def_vars, &def_macros)?;
+        let macro_def = self.parse_transformer(name, &internal_name, transformer, &def_vars, &def_macros)?;
         self.macros.insert(internal_name, macro_def);
         Ok(())
     }
@@ -1085,6 +1195,177 @@ impl Expander {
         Ok(expanded)
     }
 
+    fn parse_transformer(
+        &self,
+        surface_name: &str,
+        internal_name: &str,
+        transformer: &Expr,
+        def_vars: &HashMap<String, String>,
+        def_macros: &HashMap<String, String>,
+    ) -> Result<MacroDef, EvalError> {
+        let Expr::List(items, _) = transformer else {
+            return Err(syntax_error(
+                transformer.pos(),
+                "define-syntax transformer must be syntax-rules or lambda",
+            ));
+        };
+
+        match items.first().and_then(symbol_name) {
+            Some("syntax-rules") => Ok(MacroDef::SyntaxRules(self.parse_syntax_rules(
+                surface_name,
+                internal_name,
+                transformer,
+                def_vars,
+                def_macros,
+            )?)),
+            Some("lambda") => Ok(MacroDef::SyntaxCase(self.parse_syntax_case(
+                surface_name,
+                transformer,
+                def_vars,
+                def_macros,
+            )?)),
+            _ => Err(syntax_error(
+                transformer.pos(),
+                "define-syntax transformer must be syntax-rules or lambda",
+            )),
+        }
+    }
+
+    fn parse_syntax_case(
+        &self,
+        surface_name: &str,
+        transformer: &Expr,
+        def_vars: &HashMap<String, String>,
+        def_macros: &HashMap<String, String>,
+    ) -> Result<SyntaxCaseMacro, EvalError> {
+        let Expr::List(items, _) = transformer else {
+            return Err(syntax_error(
+                transformer.pos(),
+                "define-syntax transformer must be lambda",
+            ));
+        };
+
+        let [Expr::Symbol(head, _), formals_expr, body_expr] = items.as_slice() else {
+            return Err(syntax_error(
+                transformer.pos(),
+                "syntax-case transformer must be a single-argument lambda",
+            ));
+        };
+        if head != "lambda" {
+            return Err(syntax_error(
+                transformer.pos(),
+                "define-syntax transformer must be lambda",
+            ));
+        }
+
+        let Expr::List(formals, _) = formals_expr else {
+            return Err(syntax_error(
+                formals_expr.pos(),
+                "syntax-case transformer parameters must be a list",
+            ));
+        };
+        let [Expr::Symbol(input_name, _)] = formals.as_slice() else {
+            return Err(syntax_error(
+                formals_expr.pos(),
+                "syntax-case transformer must accept exactly one parameter",
+            ));
+        };
+
+        let Expr::List(body_items, body_pos) = body_expr else {
+            return Err(syntax_error(
+                body_expr.pos(),
+                "syntax-case transformer body must be syntax-case",
+            ));
+        };
+        let Some(Expr::Symbol(body_head, _)) = body_items.first() else {
+            return Err(syntax_error(
+                body_expr.pos(),
+                "syntax-case transformer body must be syntax-case",
+            ));
+        };
+        if body_head != "syntax-case" {
+            return Err(syntax_error(
+                body_expr.pos(),
+                "syntax-case transformer body must be syntax-case",
+            ));
+        }
+
+        let [stx_expr, literal_expr, clauses @ ..] = &body_items[1..] else {
+            return Err(syntax_error(
+                *body_pos,
+                "syntax-case requires an input, literals, and clauses",
+            ));
+        };
+        if !matches!(stx_expr, Expr::Symbol(name, _) if name == input_name) {
+            return Err(syntax_error(
+                stx_expr.pos(),
+                "syntax-case input must be the transformer parameter",
+            ));
+        }
+
+        let Expr::List(literal_items, _) = literal_expr else {
+            return Err(syntax_error(
+                literal_expr.pos(),
+                "syntax-case literals must be a list",
+            ));
+        };
+
+        let mut literals = HashSet::new();
+        for literal in literal_items {
+            let Expr::Symbol(name, _) = literal else {
+                return Err(syntax_error(
+                    literal.pos(),
+                    "syntax-case literals must be symbols",
+                ));
+            };
+            literals.insert(resolve_definition_identifier(name, def_vars, def_macros));
+        }
+
+        if clauses.is_empty() {
+            return Err(syntax_error(
+                *body_pos,
+                "syntax-case requires at least one clause",
+            ));
+        }
+
+        let mut parsed_clauses = Vec::with_capacity(clauses.len());
+        for clause in clauses {
+            let Expr::List(parts, _) = clause else {
+                return Err(syntax_error(clause.pos(), "syntax-case clause must be a list"));
+            };
+
+            let parsed = match parts.as_slice() {
+                [pattern, output] => SyntaxCaseClause {
+                    pattern: pattern.clone(),
+                    fender: None,
+                    output: output.clone(),
+                },
+                [pattern, fender, output] => SyntaxCaseClause {
+                    pattern: pattern.clone(),
+                    fender: Some(fender.clone()),
+                    output: output.clone(),
+                },
+                _ => {
+                    return Err(syntax_error(
+                        clause.pos(),
+                        "syntax-case clause must contain a pattern, optional fender, and output",
+                    ))
+                }
+            };
+
+            parsed_clauses.push(parsed);
+        }
+
+        Ok(SyntaxCaseMacro {
+            surface_name: surface_name.to_string(),
+            input_name: input_name.clone(),
+            literals,
+            clauses: parsed_clauses,
+            def_vars: def_vars.clone(),
+            def_macros: def_macros.clone(),
+        })
+    }
+
     fn parse_syntax_rules(
         &self,
         surface_name: &str,
@@ -1175,44 +1456,514 @@ impl Expander {
         macro_id: &str,
         env: &ExpandEnv,
     ) -> Result<Expr, EvalError> {
+        let expanded = self.expand_macro_output(items, pos, macro_id, env)?;
+        self.expand_expr(&expanded, env)
+    }
+
+    fn expand_macro_output(
+        &mut self,
+        items: &[Expr],
+        pos: SourcePos,
+        macro_id: &str,
+        env: &ExpandEnv,
+    ) -> Result<Expr, EvalError> {
         let macro_def = self
             .macros
             .get(macro_id)
             .cloned()
             .ok_or_else(|| syntax_error(pos, "unknown syntax transformer"))?;
 
-        for rule in &macro_def.rules {
-            if let Some(bindings) = self.match_rule(rule, items, &macro_def, env)? {
-                let expanded = self.expand_template(
-                    &rule.template,
-                    &macro_def,
-                    &bindings,
-                    None,
-                    &IntroEnv::default(),
-                )?;
-                return self.expand_expr(&expanded, env);
+        match macro_def {
+            MacroDef::SyntaxRules(macro_def) => {
+                let macro_ctx = macro_def.context();
+                for rule in &macro_def.rules {
+                    if let Some(bindings) =
+                        self.match_rule(&rule.pattern, items, &macro_ctx, env)?
+                    {
+                        let expanded = self.expand_template(
+                            &rule.template,
+                            &macro_ctx,
+                            &bindings,
+                            None,
+                            &IntroEnv::default(),
+                        )?;
+                        return Ok(expanded);
+                    }
+                }
+
+                Err(syntax_error(
+                    pos,
+                    format!(
+                        "no matching syntax-rules clause for {}",
+                        macro_ctx.surface_name
+                    ),
+                ))
             }
+            MacroDef::SyntaxCase(macro_def) => {
+                self.expand_syntax_case_output(items, pos, &macro_def, env)
+            }
+        }
+    }
+
+    fn expand_syntax_case_output(
+        &mut self,
+        items: &[Expr],
+        pos: SourcePos,
+        macro_def: &SyntaxCaseMacro,
+        env: &ExpandEnv,
+    ) -> Result<Expr, EvalError> {
+        let macro_ctx = macro_def.context();
+        let mut transformer_env = TransformerEnv::default();
+        transformer_env.values.insert(
+            macro_def.input_name.clone(),
+            TransformerValue::Syntax(Expr::List(items.to_vec(), pos)),
+        );
+
+        for clause in &macro_def.clauses {
+            let Some(bindings) = self.match_rule(&clause.pattern, items, &macro_ctx, env)? else {
+                continue;
+            };
+
+            if let Some(fender) = &clause.fender {
+                let value =
+                    self.eval_transformer_expr(fender, &macro_ctx, &bindings, &transformer_env)?;
+                if !transformer_truthy(&value) {
+                    continue;
+                }
+            }
+
+            let value =
+                self.eval_transformer_expr(&clause.output, &macro_ctx, &bindings, &transformer_env)?;
+            let TransformerValue::Syntax(expanded) = value else {
+                return Err(type_error(
+                    clause.output.pos(),
+                    "syntax",
+                    value.type_name(),
+                ));
+            };
+            return Ok(expanded);
         }
 
         Err(syntax_error(
             pos,
             format!(
-                "no matching syntax-rules clause for {}",
+                "no matching syntax-case clause for {}",
                 macro_def.surface_name
             ),
         ))
     }
 
+    fn eval_transformer_expr(
+        &mut self,
+        expr: &Expr,
+        macro_ctx: &MacroContext<'_>,
+        bindings: &MatchBindings,
+        env: &TransformerEnv,
+    ) -> Result<TransformerValue, EvalError> {
+        match expr {
+            Expr::Int(value, _) => Ok(TransformerValue::Datum(Value::Int(*value))),
+            Expr::Rational(value, _) => Ok(TransformerValue::Datum(Value::Rational(*value))),
+            Expr::Float(value, _) => Ok(TransformerValue::Datum(Value::Float(*value))),
+            Expr::Bool(value, _) => Ok(TransformerValue::Datum(Value::Bool(*value))),
+            Expr::String(value, _) => Ok(TransformerValue::Datum(Value::String(
+                super::SchemeString::new(value.clone()),
+            ))),
+            Expr::Char(value, _) => Ok(TransformerValue::Datum(Value::Char(*value))),
+            Expr::Symbol(name, pos) => self
+                .lookup_transformer_value(name, *pos, bindings, env)?
+                .ok_or_else(|| unbound_variable(*pos, name)),
+            Expr::List(items, pos) => {
+                let Some(head) = items.first() else {
+                    return Err(syntax_error(*pos, "cannot evaluate empty list"));
+                };
+
+                match symbol_name(head) {
+                    Some("quote") => self.eval_transformer_quote(&items[1..], *pos),
+                    Some("syntax") => {
+                        self.eval_transformer_syntax(&items[1..], *pos, macro_ctx, bindings, env)
+                    }
+                    Some("with-syntax") => self.eval_transformer_with_syntax(
+                        &items[1..],
+                        *pos,
+                        macro_ctx,
+                        bindings,
+                        env,
+                    ),
+                    Some("begin") => {
+                        self.eval_transformer_sequence(&items[1..], macro_ctx, bindings, env)
+                    }
+                    Some("if") => {
+                        self.eval_transformer_if(&items[1..], *pos, macro_ctx, bindings, env)
+                    }
+                    Some("and") => self.eval_transformer_and(&items[1..], macro_ctx, bindings, env),
+                    Some("or") => self.eval_transformer_or(&items[1..], macro_ctx, bindings, env),
+                    Some("let") => self.eval_transformer_let(
+                        &items[1..],
+                        *pos,
+                        macro_ctx,
+                        bindings,
+                        env,
+                        false,
+                    ),
+                    Some("let*") => self.eval_transformer_let(
+                        &items[1..],
+                        *pos,
+                        macro_ctx,
+                        bindings,
+                        env,
+                        true,
+                    ),
+                    _ => self.eval_transformer_application(items, *pos, macro_ctx, bindings, env),
+                }
+            }
+        }
+    }
+
+    fn eval_transformer_sequence(
+        &mut self,
+        exprs: &[Expr],
+        macro_ctx: &MacroContext<'_>,
+        bindings: &MatchBindings,
+        env: &TransformerEnv,
+    ) -> Result<TransformerValue, EvalError> {
+        let mut value = TransformerValue::Datum(Value::Void);
+        for expr in exprs {
+            value = self.eval_transformer_expr(expr, macro_ctx, bindings, env)?;
+        }
+        Ok(value)
+    }
+
+    fn eval_transformer_quote(
+        &self,
+        parts: &[Expr],
+        pos: SourcePos,
+    ) -> Result<TransformerValue, EvalError> {
+        let [datum] = parts else {
+            return Err(wrong_arity(pos, "quote", "exactly 1", parts.len()));
+        };
+        Ok(TransformerValue::Datum(quote_expr(datum)))
+    }
+
+    fn eval_transformer_syntax(
+        &mut self,
+        parts: &[Expr],
+        pos: SourcePos,
+        macro_ctx: &MacroContext<'_>,
+        bindings: &MatchBindings,
+        env: &TransformerEnv,
+    ) -> Result<TransformerValue, EvalError> {
+        let [template] = parts else {
+            return Err(wrong_arity(pos, "syntax", "exactly 1", parts.len()));
+        };
+
+        let mut template_bindings = bindings.clone();
+        for (name, value) in &env.values {
+            if let TransformerValue::Syntax(expr) = value {
+                template_bindings.single.insert(name.clone(), expr.clone());
+            }
+        }
+
+        Ok(TransformerValue::Syntax(self.expand_template(
+            template,
+            macro_ctx,
+            &template_bindings,
+            None,
+            &IntroEnv::default(),
+        )?))
+    }
+
+    fn eval_transformer_with_syntax(
+        &mut self,
+        parts: &[Expr],
+        pos: SourcePos,
+        macro_ctx: &MacroContext<'_>,
+        bindings: &MatchBindings,
+        env: &TransformerEnv,
+    ) -> Result<TransformerValue, EvalError> {
+        let [binding_expr, body @ ..] = parts else {
+            return Err(syntax_error(pos, "with-syntax requires bindings and a body"));
+        };
+
+        let Expr::List(raw_bindings, _) = binding_expr else {
+            return Err(syntax_error(
+                binding_expr.pos(),
+                "with-syntax bindings must be a list",
+            ));
+        };
+
+        let mut evaluated = Vec::with_capacity(raw_bindings.len());
+        for binding in raw_bindings {
+            let Expr::List(items, _) = binding else {
+                return Err(syntax_error(
+                    binding.pos(),
+                    "with-syntax binding must be a list",
+                ));
+            };
+            let [name_expr, value_expr] = items.as_slice() else {
+                return Err(syntax_error(
+                    binding.pos(),
+                    "with-syntax binding must contain a name and value",
+                ));
+            };
+            let Expr::Symbol(name, _) = name_expr else {
+                return Err(syntax_error(
+                    name_expr.pos(),
+                    "with-syntax binding name must be a symbol",
+                ));
+            };
+
+            let value = self.eval_transformer_expr(value_expr, macro_ctx, bindings, env)?;
+            let TransformerValue::Syntax(syntax) = value else {
+                return Err(type_error(
+                    value_expr.pos(),
+                    "syntax",
+                    value.type_name(),
+                ));
+            };
+            evaluated.push((name.clone(), syntax));
+        }
+
+        let mut next_env = env.clone();
+        let mut next_bindings = bindings.clone();
+        for (name, syntax) in evaluated {
+            next_env
+                .values
+                .insert(name.clone(), TransformerValue::Syntax(syntax.clone()));
+            next_bindings.single.insert(name, syntax);
+        }
+
+        self.eval_transformer_sequence(body, macro_ctx, &next_bindings, &next_env)
+    }
+
+    fn eval_transformer_if(
+        &mut self,
+        parts: &[Expr],
+        pos: SourcePos,
+        macro_ctx: &MacroContext<'_>,
+        bindings: &MatchBindings,
+        env: &TransformerEnv,
+    ) -> Result<TransformerValue, EvalError> {
+        match parts {
+            [test, consequent] => {
+                let test_value = self.eval_transformer_expr(test, macro_ctx, bindings, env)?;
+                if transformer_truthy(&test_value) {
+                    self.eval_transformer_expr(consequent, macro_ctx, bindings, env)
+                } else {
+                    Ok(TransformerValue::Datum(Value::Void))
+                }
+            }
+            [test, consequent, alternate] => {
+                let test_value = self.eval_transformer_expr(test, macro_ctx, bindings, env)?;
+                if transformer_truthy(&test_value) {
+                    self.eval_transformer_expr(consequent, macro_ctx, bindings, env)
+                } else {
+                    self.eval_transformer_expr(alternate, macro_ctx, bindings, env)
+                }
+            }
+            _ => Err(syntax_error(pos, "if requires 2 or 3 arguments")),
+        }
+    }
+
+    fn eval_transformer_and(
+        &mut self,
+        exprs: &[Expr],
+        macro_ctx: &MacroContext<'_>,
+        bindings: &MatchBindings,
+        env: &TransformerEnv,
+    ) -> Result<TransformerValue, EvalError> {
+        let mut value = TransformerValue::Datum(Value::Bool(true));
+        for expr in exprs {
+            value = self.eval_transformer_expr(expr, macro_ctx, bindings, env)?;
+            if !transformer_truthy(&value) {
+                return Ok(value);
+            }
+        }
+        Ok(value)
+    }
+
+    fn eval_transformer_or(
+        &mut self,
+        exprs: &[Expr],
+        macro_ctx: &MacroContext<'_>,
+        bindings: &MatchBindings,
+        env: &TransformerEnv,
+    ) -> Result<TransformerValue, EvalError> {
+        for expr in exprs {
+            let value = self.eval_transformer_expr(expr, macro_ctx, bindings, env)?;
+            if transformer_truthy(&value) {
+                return Ok(value);
+            }
+        }
+        Ok(TransformerValue::Datum(Value::Bool(false)))
+    }
+
+    fn eval_transformer_let(
+        &mut self,
+        parts: &[Expr],
+        pos: SourcePos,
+        macro_ctx: &MacroContext<'_>,
+        bindings: &MatchBindings,
+        env: &TransformerEnv,
+        sequential: bool,
+    ) -> Result<TransformerValue, EvalError> {
+        let [binding_expr, body @ ..] = parts else {
+            return Err(syntax_error(pos, "let requires bindings and a body"));
+        };
+        let Expr::List(raw_bindings, _) = binding_expr else {
+            return Err(syntax_error(binding_expr.pos(), "let requires bindings"));
+        };
+
+        let mut next_env = env.clone();
+        let mut next_bindings = bindings.clone();
+
+        if sequential {
+            for binding in raw_bindings {
+                let Expr::List(items, _) = binding else {
+                    return Err(syntax_error(binding.pos(), "let binding must be a list"));
+                };
+                let [name_expr, value_expr] = items.as_slice() else {
+                    return Err(syntax_error(
+                        binding.pos(),
+                        "let binding must contain a name and value",
+                    ));
+                };
+                let Expr::Symbol(name, _) = name_expr else {
+                    return Err(syntax_error(
+                        name_expr.pos(),
+                        "let binding name must be a symbol",
+                    ));
+                };
+
+                let value =
+                    self.eval_transformer_expr(value_expr, macro_ctx, &next_bindings, &next_env)?;
+                if let TransformerValue::Syntax(syntax) = &value {
+                    next_bindings.single.insert(name.clone(), syntax.clone());
+                }
+                next_env.values.insert(name.clone(), value);
+            }
+        } else {
+            let mut evaluated = Vec::with_capacity(raw_bindings.len());
+            for binding in raw_bindings {
+                let Expr::List(items, _) = binding else {
+                    return Err(syntax_error(binding.pos(), "let binding must be a list"));
+                };
+                let [name_expr, value_expr] = items.as_slice() else {
+                    return Err(syntax_error(
+                        binding.pos(),
+                        "let binding must contain a name and value",
+                    ));
+                };
+                let Expr::Symbol(name, _) = name_expr else {
+                    return Err(syntax_error(
+                        name_expr.pos(),
+                        "let binding name must be a symbol",
+                    ));
+                };
+
+                let value = self.eval_transformer_expr(value_expr, macro_ctx, bindings, env)?;
+                evaluated.push((name.clone(), value));
+            }
+
+            for (name, value) in evaluated {
+                if let TransformerValue::Syntax(syntax) = &value {
+                    next_bindings.single.insert(name.clone(), syntax.clone());
+                }
+                next_env.values.insert(name, value);
+            }
+        }
+
+        self.eval_transformer_sequence(body, macro_ctx, &next_bindings, &next_env)
+    }
+
+    fn eval_transformer_application(
+        &mut self,
+        items: &[Expr],
+        pos: SourcePos,
+        macro_ctx: &MacroContext<'_>,
+        bindings: &MatchBindings,
+        env: &TransformerEnv,
+    ) -> Result<TransformerValue, EvalError> {
+        let Some(head) = items.first() else {
+            return Err(syntax_error(pos, "cannot evaluate empty list"));
+        };
+        let Some(name) = symbol_name(head) else {
+            return Err(syntax_error(pos, "transformer application requires a symbol operator"));
+        };
+
+        if let Some(value) = self.lookup_transformer_value(name, pos, bindings, env)? {
+            return Err(not_callable(pos, value.type_name()));
+        }
+
+        let args = items[1..]
+            .iter()
+            .map(|expr| self.eval_transformer_expr(expr, macro_ctx, bindings, env))
+            .collect::<Result<Vec<_>, _>>()?;
+
+        match name {
+            "syntax->datum" => {
+                let [value] = args.as_slice() else {
+                    return Err(wrong_arity(pos, "syntax->datum", "exactly 1", args.len()));
+                };
+                let syntax = expect_transformer_syntax(value, pos, "syntax->datum")?;
+                Ok(TransformerValue::Datum(quote_expr(syntax)))
+            }
+            "datum->syntax" => {
+                let [context, datum] = args.as_slice() else {
+                    return Err(wrong_arity(pos, "datum->syntax", "exactly 2", args.len()));
+                };
+                let context = expect_transformer_syntax(context, pos, "datum->syntax")?;
+                let datum = expect_transformer_datum(datum, pos, "datum->syntax")?;
+                Ok(TransformerValue::Syntax(datum_to_expr(datum, context.pos())?))
+            }
+            _ => {
+                let datum_args = args
+                    .iter()
+                    .map(|value| expect_transformer_datum(value, pos, name).cloned())
+                    .collect::<Result<Vec<_>, _>>()?;
+
+                let mut runtime_items = Vec::with_capacity(datum_args.len() + 1);
+                runtime_items.push(symbol_expr(name, pos));
+                for arg in &datum_args {
+                    runtime_items.push(value_to_runtime_expr(arg, pos)?);
+                }
+
+                Ok(TransformerValue::Datum(eval_expr(
+                    &Expr::List(runtime_items, pos),
+                    &default_env(),
+                )?))
+            }
+        }
+    }
+
+    fn lookup_transformer_value(
+        &self,
+        name: &str,
+        pos: SourcePos,
+        bindings: &MatchBindings,
+        env: &TransformerEnv,
+    ) -> Result<Option<TransformerValue>, EvalError> {
+        if let Some(value) = env.values.get(name) {
+            return Ok(Some(value.clone()));
+        }
+        if let Some(value) = bindings.single.get(name) {
+            return Ok(Some(TransformerValue::Syntax(value.clone())));
+        }
+        if bindings.repeated.contains_key(name) {
+            return Err(syntax_error(pos, "pattern variable used outside of ellipsis"));
+        }
+        Ok(None)
+    }
+
     fn match_rule(
         &self,
-        rule: &SyntaxRule,
+        pattern: &Expr,
         input_items: &[Expr],
-        macro_def: &SyntaxRuleMacro,
+        macro_ctx: &MacroContext<'_>,
         env: &ExpandEnv,
     ) -> Result<Option<MatchBindings>, EvalError> {
-        let Expr::List(pattern_items, _) = &rule.pattern else {
+        let Expr::List(pattern_items, _) = pattern else {
             return Err(syntax_error(
-                rule.pattern.pos(),
+                pattern.pos(),
                 "syntax-rules pattern must be a list",
             ));
         };
@@ -1221,13 +1972,13 @@ impl Expander {
             return Ok(None);
         };
 
-        let mut literals = macro_def.literals.clone();
+        let mut literals = macro_ctx.literals.clone();
         if let Some(name) = symbol_name(head) {
             if name != "_" {
                 literals.insert(resolve_definition_identifier(
                     name,
-                    &macro_def.def_vars,
-                    &macro_def.def_macros,
+                    macro_ctx.def_vars,
+                    macro_ctx.def_macros,
                 ));
             }
         } else {
@@ -1240,12 +1991,12 @@ impl Expander {
         let mut bindings = MatchBindings::default();
         if self.match_list_pattern(
             pattern_items,
-            input_items,
-            &literals,
-            macro_def,
-            env,
-            &mut bindings,
-        )? {
+                input_items,
+                &literals,
+                macro_ctx,
+                env,
+                &mut bindings,
+            )? {
             Ok(Some(bindings))
         } else {
             Ok(None)
@@ -1257,11 +2008,11 @@ impl Expander {
         patterns: &[Expr],
         inputs: &[Expr],
         literals: &HashSet<String>,
-        macro_def: &SyntaxRuleMacro,
+        macro_ctx: &MacroContext<'_>,
         env: &ExpandEnv,
         bindings: &mut MatchBindings,
     ) -> Result<bool, EvalError> {
-        self.match_list_pattern_from(patterns, 0, inputs, 0, literals, macro_def, env, bindings)
+        self.match_list_pattern_from(patterns, 0, inputs, 0, literals, macro_ctx, env, bindings)
     }
 
     fn match_list_pattern_from(
@@ -1271,7 +2022,7 @@ impl Expander {
         inputs: &[Expr],
         input_index: usize,
         literals: &HashSet<String>,
-        macro_def: &SyntaxRuleMacro,
+        macro_ctx: &MacroContext<'_>,
         env: &ExpandEnv,
         bindings: &mut MatchBindings,
     ) -> Result<bool, EvalError> {
@@ -1305,7 +2056,7 @@ impl Expander {
                         &inputs[input_index + offset],
                         true,
                         literals,
-                        macro_def,
+                        macro_ctx,
                         env,
                         &mut local,
                     )? {
@@ -1321,7 +2072,7 @@ impl Expander {
                         inputs,
                         input_index + count,
                         literals,
-                        macro_def,
+                        macro_ctx,
                         env,
                         &mut local,
                     )?
@@ -1342,7 +2093,7 @@ impl Expander {
                 input,
                 false,
                 literals,
-                macro_def,
+                macro_ctx,
                 env,
                 &mut local,
             )? {
@@ -1354,7 +2105,7 @@ impl Expander {
                 inputs,
                 input_index + 1,
                 literals,
-                macro_def,
+                macro_ctx,
                 env,
                 &mut local,
             )? {
@@ -1372,7 +2123,7 @@ impl Expander {
         input: &Expr,
         repeated: bool,
         literals: &HashSet<String>,
-        macro_def: &SyntaxRuleMacro,
+        macro_ctx: &MacroContext<'_>,
         env: &ExpandEnv,
         bindings: &mut MatchBindings,
     ) -> Result<bool, EvalError> {
@@ -1391,7 +2142,7 @@ impl Expander {
                 }
 
                 let resolved =
-                    resolve_definition_identifier(name, &macro_def.def_vars, &macro_def.def_macros);
+                    resolve_definition_identifier(name, macro_ctx.def_vars, macro_ctx.def_macros);
                 if literals.contains(&resolved) {
                     return Ok(match input {
                         Expr::Symbol(found, _) => {
@@ -1416,7 +2167,7 @@ impl Expander {
                     pattern_items,
                     input_items,
                     literals,
-                    macro_def,
+                    macro_ctx,
                     env,
                     bindings,
                 )
@@ -1427,7 +2178,7 @@ impl Expander {
     fn expand_template(
         &mut self,
         template: &Expr,
-        macro_def: &SyntaxRuleMacro,
+        macro_ctx: &MacroContext<'_>,
         bindings: &MatchBindings,
         repeat_index: Option<usize>,
         intro: &IntroEnv,
@@ -1442,7 +2193,7 @@ impl Expander {
                 Ok(template.clone())
             }
             Expr::Symbol(name, pos) => {
-                self.expand_template_symbol(name, *pos, macro_def, bindings, repeat_index, intro)
+                self.expand_template_symbol(name, *pos, macro_ctx, bindings, repeat_index, intro)
             }
             Expr::List(items, pos) => {
                 let Some(head) = items.first() else {
@@ -1453,7 +2204,7 @@ impl Expander {
                     Some("lambda") => self.expand_template_lambda(
                         items,
                         *pos,
-                        macro_def,
+                        macro_ctx,
                         bindings,
                         repeat_index,
                         intro,
@@ -1461,7 +2212,7 @@ impl Expander {
                     Some("let") => self.expand_template_let(
                         items,
                         *pos,
-                        macro_def,
+                        macro_ctx,
                         bindings,
                         repeat_index,
                         intro,
@@ -1469,7 +2220,7 @@ impl Expander {
                     Some("letrec") => self.expand_template_letrec(
                         items,
                         *pos,
-                        macro_def,
+                        macro_ctx,
                         bindings,
                         repeat_index,
                         intro,
@@ -1478,7 +2229,7 @@ impl Expander {
                     Some("letrec*") => self.expand_template_letrec(
                         items,
                         *pos,
-                        macro_def,
+                        macro_ctx,
                         bindings,
                         repeat_index,
                         intro,
@@ -1487,7 +2238,7 @@ impl Expander {
                     Some("case") => self.expand_template_case(
                         items,
                         *pos,
-                        macro_def,
+                        macro_ctx,
                         bindings,
                         repeat_index,
                         intro,
@@ -1495,7 +2246,7 @@ impl Expander {
                     Some("define") => self.expand_template_define(
                         items,
                         *pos,
-                        macro_def,
+                        macro_ctx,
                         bindings,
                         repeat_index,
                         intro,
@@ -1509,7 +2260,7 @@ impl Expander {
                                 for item_index in 0..count {
                                     expanded.push(self.expand_template(
                                         &items[index],
-                                        macro_def,
+                                        macro_ctx,
                                         bindings,
                                         Some(item_index),
                                         intro,
@@ -1519,7 +2270,7 @@ impl Expander {
                             } else {
                                 expanded.push(self.expand_template(
                                     &items[index],
-                                    macro_def,
+                                    macro_ctx,
                                     bindings,
                                     repeat_index,
                                     intro,
@@ -1538,7 +2289,7 @@ impl Expander {
         &self,
         name: &str,
         pos: SourcePos,
-        macro_def: &SyntaxRuleMacro,
+        macro_ctx: &MacroContext<'_>,
         bindings: &MatchBindings,
         repeat_index: Option<usize>,
         intro: &IntroEnv,
@@ -1555,11 +2306,11 @@ impl Expander {
             return Ok(Expr::Symbol(internal.clone(), pos));
         }
 
-        if let Some(internal) = macro_def.def_vars.get(name) {
+        if let Some(internal) = macro_ctx.def_vars.get(name) {
             return Ok(Expr::Symbol(internal.clone(), pos));
         }
 
-        if let Some(internal) = macro_def.def_macros.get(name) {
+        if let Some(internal) = macro_ctx.def_macros.get(name) {
             return Ok(Expr::Symbol(internal.clone(), pos));
         }
 
@@ -1570,7 +2321,7 @@ impl Expander {
         &mut self,
         items: &[Expr],
         pos: SourcePos,
-        macro_def: &SyntaxRuleMacro,
+        macro_ctx: &MacroContext<'_>,
         bindings: &MatchBindings,
         repeat_index: Option<usize>,
         intro: &IntroEnv,
@@ -1585,14 +2336,14 @@ impl Expander {
         let mut body_intro = intro.clone();
         let formals = self.expand_template_formals_expr(
             formals_expr,
-            macro_def,
+            macro_ctx,
             bindings,
             repeat_index,
             &mut body_intro,
         )?;
         let expanded_body = self.expand_template_sequence(
             body,
-            macro_def,
+            macro_ctx,
             bindings,
             repeat_index,
             &mut body_intro,
@@ -1610,7 +2361,7 @@ impl Expander {
         &mut self,
         items: &[Expr],
         pos: SourcePos,
-        macro_def: &SyntaxRuleMacro,
+        macro_ctx: &MacroContext<'_>,
         bindings: &MatchBindings,
         repeat_index: Option<usize>,
         intro: &IntroEnv,
@@ -1625,14 +2376,14 @@ impl Expander {
                 let mut body_intro = intro.clone();
                 let let_name = self.bind_template_identifier(
                     &Expr::Symbol(name.clone(), *name_pos),
-                    macro_def,
+                    macro_ctx,
                     bindings,
                     repeat_index,
                     &mut body_intro,
                 )?;
                 let expanded_bindings = self.expand_template_bindings(
                     raw_bindings,
-                    macro_def,
+                    macro_ctx,
                     bindings,
                     repeat_index,
                     intro,
@@ -1645,7 +2396,7 @@ impl Expander {
                 result.push(Expr::List(expanded_bindings, bindings_expr.pos()));
                 result.extend(self.expand_template_sequence(
                     body,
-                    macro_def,
+                    macro_ctx,
                     bindings,
                     repeat_index,
                     &mut body_intro,
@@ -1657,7 +2408,7 @@ impl Expander {
                 let mut body_intro = intro.clone();
                 let expanded_bindings = self.expand_template_bindings(
                     raw_bindings,
-                    macro_def,
+                    macro_ctx,
                     bindings,
                     repeat_index,
                     intro,
@@ -1669,7 +2420,7 @@ impl Expander {
                 result.push(Expr::List(expanded_bindings, bindings_expr.pos()));
                 result.extend(self.expand_template_sequence(
                     body,
-                    macro_def,
+                    macro_ctx,
                     bindings,
                     repeat_index,
                     &mut body_intro,
@@ -1684,7 +2435,7 @@ impl Expander {
         &mut self,
         items: &[Expr],
         pos: SourcePos,
-        macro_def: &SyntaxRuleMacro,
+        macro_ctx: &MacroContext<'_>,
         bindings: &MatchBindings,
         repeat_index: Option<usize>,
         intro: &IntroEnv,
@@ -1703,7 +2454,7 @@ impl Expander {
         let expanded_bindings = if sequential {
             self.expand_template_recursive_star_bindings(
                 raw_bindings,
-                macro_def,
+                macro_ctx,
                 bindings,
                 repeat_index,
                 &mut body_intro,
@@ -1711,7 +2462,7 @@ impl Expander {
         } else {
             self.expand_template_recursive_bindings(
                 raw_bindings,
-                macro_def,
+                macro_ctx,
                 bindings,
                 repeat_index,
                 &mut body_intro,
@@ -1730,7 +2481,7 @@ impl Expander {
         result.push(Expr::List(expanded_bindings, bindings_expr.pos()));
         result.extend(self.expand_template_sequence(
             body,
-            macro_def,
+            macro_ctx,
             bindings,
             repeat_index,
             &mut body_intro,
@@ -1742,7 +2493,7 @@ impl Expander {
         &mut self,
         items: &[Expr],
         pos: SourcePos,
-        macro_def: &SyntaxRuleMacro,
+        macro_ctx: &MacroContext<'_>,
         bindings: &MatchBindings,
         repeat_index: Option<usize>,
         intro: &IntroEnv,
@@ -1756,7 +2507,7 @@ impl Expander {
 
         let mut result = Vec::with_capacity(items.len());
         result.push(Expr::Symbol("case".into(), pos));
-        result.push(self.expand_template(key, macro_def, bindings, repeat_index, intro)?);
+        result.push(self.expand_template(key, macro_ctx, bindings, repeat_index, intro)?);
 
         for clause in clauses {
             let Expr::List(parts, clause_pos) = clause else {
@@ -1782,7 +2533,7 @@ impl Expander {
             let mut clause_intro = intro.clone();
             clause_items.extend(self.expand_template_sequence(
                 body,
-                macro_def,
+                macro_ctx,
                 bindings,
                 repeat_index,
                 &mut clause_intro,
@@ -1797,7 +2548,7 @@ impl Expander {
         &mut self,
         items: &[Expr],
         pos: SourcePos,
-        macro_def: &SyntaxRuleMacro,
+        macro_ctx: &MacroContext<'_>,
         bindings: &MatchBindings,
         repeat_index: Option<usize>,
         intro: &IntroEnv,
@@ -1806,7 +2557,7 @@ impl Expander {
         self.expand_template_define_in_sequence(
             items,
             pos,
-            macro_def,
+            macro_ctx,
             bindings,
             repeat_index,
             &mut local,
@@ -1817,7 +2568,7 @@ impl Expander {
         &mut self,
         items: &[Expr],
         pos: SourcePos,
-        macro_def: &SyntaxRuleMacro,
+        macro_ctx: &MacroContext<'_>,
         bindings: &MatchBindings,
         repeat_index: Option<usize>,
         intro: &mut IntroEnv,
@@ -1826,13 +2577,13 @@ impl Expander {
             [Expr::Symbol(name, name_pos), value_expr] => {
                 let target = self.bind_template_identifier(
                     &Expr::Symbol(name.clone(), *name_pos),
-                    macro_def,
+                    macro_ctx,
                     bindings,
                     repeat_index,
                     intro,
                 )?;
                 let value =
-                    self.expand_template(value_expr, macro_def, bindings, repeat_index, intro)?;
+                    self.expand_template(value_expr, macro_ctx, bindings, repeat_index, intro)?;
                 Ok(Expr::List(
                     vec![Expr::Symbol("define".into(), pos), target, value],
                     pos,
@@ -1848,7 +2599,7 @@ impl Expander {
 
                 let target = self.bind_template_identifier(
                     name_expr,
-                    macro_def,
+                    macro_ctx,
                     bindings,
                     repeat_index,
                     intro,
@@ -1856,14 +2607,14 @@ impl Expander {
                 let mut body_intro = intro.clone();
                 let expanded_formals = self.expand_template_formals(
                     formals,
-                    macro_def,
+                    macro_ctx,
                     bindings,
                     repeat_index,
                     &mut body_intro,
                 )?;
                 let expanded_body = self.expand_template_sequence(
                     body,
-                    macro_def,
+                    macro_ctx,
                     bindings,
                     repeat_index,
                     &mut body_intro,
@@ -1886,7 +2637,7 @@ impl Expander {
     fn expand_template_sequence(
         &mut self,
         exprs: &[Expr],
-        macro_def: &SyntaxRuleMacro,
+        macro_ctx: &MacroContext<'_>,
         bindings: &MatchBindings,
         repeat_index: Option<usize>,
         intro: &mut IntroEnv,
@@ -1898,7 +2649,7 @@ impl Expander {
                     expanded.push(self.expand_template_define_in_sequence(
                         items,
                         *pos,
-                        macro_def,
+                        macro_ctx,
                         bindings,
                         repeat_index,
                         intro,
@@ -1907,7 +2658,7 @@ impl Expander {
                 }
             }
 
-            expanded.push(self.expand_template(expr, macro_def, bindings, repeat_index, intro)?);
+            expanded.push(self.expand_template(expr, macro_ctx, bindings, repeat_index, intro)?);
         }
         Ok(expanded)
     }
@@ -1915,7 +2666,7 @@ impl Expander {
     fn expand_template_bindings(
         &mut self,
         raw_bindings: &[Expr],
-        macro_def: &SyntaxRuleMacro,
+        macro_ctx: &MacroContext<'_>,
         bindings: &MatchBindings,
         repeat_index: Option<usize>,
         value_intro: &IntroEnv,
@@ -1933,10 +2684,10 @@ impl Expander {
                 ));
             };
             let value =
-                self.expand_template(value_expr, macro_def, bindings, repeat_index, value_intro)?;
+                self.expand_template(value_expr, macro_ctx, bindings, repeat_index, value_intro)?;
             let name = self.bind_template_identifier(
                 name_expr,
-                macro_def,
+                macro_ctx,
                 bindings,
                 repeat_index,
                 body_intro,
@@ -1949,7 +2700,7 @@ impl Expander {
     fn expand_template_recursive_bindings(
         &mut self,
         raw_bindings: &[Expr],
-        macro_def: &SyntaxRuleMacro,
+        macro_ctx: &MacroContext<'_>,
         bindings: &MatchBindings,
         repeat_index: Option<usize>,
         intro: &mut IntroEnv,
@@ -1967,7 +2718,7 @@ impl Expander {
             };
 
             let name =
-                self.bind_template_identifier(name_expr, macro_def, bindings, repeat_index, intro)?;
+                self.bind_template_identifier(name_expr, macro_ctx, bindings, repeat_index, intro)?;
             parsed.push((name, value_expr.clone(), *binding_pos));
         }
 
@@ -1979,7 +2730,7 @@ impl Expander {
                         name,
                         self.expand_template(
                             &value_expr,
-                            macro_def,
+                            macro_ctx,
                             bindings,
                             repeat_index,
                             intro,
@@ -1994,7 +2745,7 @@ impl Expander {
     fn expand_template_recursive_star_bindings(
         &mut self,
         raw_bindings: &[Expr],
-        macro_def: &SyntaxRuleMacro,
+        macro_ctx: &MacroContext<'_>,
         bindings: &MatchBindings,
         repeat_index: Option<usize>,
         intro: &mut IntroEnv,
@@ -2012,9 +2763,9 @@ impl Expander {
             };
 
             let name =
-                self.bind_template_identifier(name_expr, macro_def, bindings, repeat_index, intro)?;
+                self.bind_template_identifier(name_expr, macro_ctx, bindings, repeat_index, intro)?;
             let value =
-                self.expand_template(value_expr, macro_def, bindings, repeat_index, intro)?;
+                self.expand_template(value_expr, macro_ctx, bindings, repeat_index, intro)?;
             expanded.push(Expr::List(vec![name, value], *binding_pos));
         }
         Ok(expanded)
@@ -2023,17 +2774,17 @@ impl Expander {
     fn expand_template_formals_expr(
         &mut self,
         expr: &Expr,
-        macro_def: &SyntaxRuleMacro,
+        macro_ctx: &MacroContext<'_>,
         bindings: &MatchBindings,
         repeat_index: Option<usize>,
         intro: &mut IntroEnv,
     ) -> Result<Expr, EvalError> {
         match expr {
             Expr::Symbol(_, _) => {
-                self.bind_template_identifier(expr, macro_def, bindings, repeat_index, intro)
+                self.bind_template_identifier(expr, macro_ctx, bindings, repeat_index, intro)
             }
             Expr::List(items, pos) => Ok(Expr::List(
-                self.expand_template_formals(items, macro_def, bindings, repeat_index, intro)?,
+                self.expand_template_formals(items, macro_ctx, bindings, repeat_index, intro)?,
                 *pos,
             )),
             _ => Err(syntax_error(
@@ -2046,7 +2797,7 @@ impl Expander {
     fn expand_template_formals(
         &mut self,
         items: &[Expr],
-        macro_def: &SyntaxRuleMacro,
+        macro_ctx: &MacroContext<'_>,
         bindings: &MatchBindings,
         repeat_index: Option<usize>,
         intro: &mut IntroEnv,
@@ -2058,7 +2809,7 @@ impl Expander {
             } else {
                 expanded.push(self.bind_template_identifier(
                     item,
-                    macro_def,
+                    macro_ctx,
                     bindings,
                     repeat_index,
                     intro,
@@ -2071,7 +2822,7 @@ impl Expander {
     fn bind_template_identifier(
         &mut self,
         expr: &Expr,
-        macro_def: &SyntaxRuleMacro,
+        macro_ctx: &MacroContext<'_>,
         bindings: &MatchBindings,
         repeat_index: Option<usize>,
         intro: &mut IntroEnv,
@@ -2103,11 +2854,11 @@ impl Expander {
             return Ok(Expr::Symbol(internal, *pos));
         }
 
-        if macro_def.def_vars.contains_key(name) || macro_def.def_macros.contains_key(name) {
+        if macro_ctx.def_vars.contains_key(name) || macro_ctx.def_macros.contains_key(name) {
             return Ok(self.expand_template_symbol(
                 name,
                 *pos,
-                macro_def,
+                macro_ctx,
                 bindings,
                 repeat_index,
                 intro,
@@ -2117,6 +2868,29 @@ impl Expander {
         let internal = self.fresh_internal("var", name);
         intro.introduced.insert(name.clone(), internal.clone());
         Ok(Expr::Symbol(internal, *pos))
+    }
+
+    fn record_sequence_define_alias(&self, parts: &[Expr], env: &mut ExpandEnv) {
+        let name = match parts {
+            [Expr::Symbol(name, _), _] => name.as_str(),
+            [Expr::List(signature, _), ..] => match signature.first() {
+                Some(Expr::Symbol(name, _)) => name.as_str(),
+                _ => return,
+            },
+            _ => return,
+        };
+
+        let Some(surface) = internal_surface_name(name) else {
+            return;
+        };
+
+        env.vars.insert(
+            surface.to_string(),
+            BindingInfo {
+                internal: name.to_string(),
+                scope_id: env.scope_id,
+            },
+        );
     }
 
     fn bind_var(&mut self, env: &mut ExpandEnv, name: &str) -> String {
@@ -2250,6 +3024,101 @@ fn repeat_count(template: &Expr, bindings: &MatchBindings) -> Result<usize, Eval
     Ok(0)
 }
 
+fn transformer_truthy(value: &TransformerValue) -> bool {
+    !matches!(value, TransformerValue::Datum(Value::Bool(false)))
+}
+
+fn expect_transformer_syntax<'a>(
+    value: &'a TransformerValue,
+    pos: SourcePos,
+    _name: &str,
+) -> Result<&'a Expr, EvalError> {
+    match value {
+        TransformerValue::Syntax(expr) => Ok(expr),
+        other => Err(type_error(pos, "syntax", other.type_name())),
+    }
+}
+
+fn expect_transformer_datum<'a>(
+    value: &'a TransformerValue,
+    pos: SourcePos,
+    _name: &str,
+) -> Result<&'a Value, EvalError> {
+    match value {
+        TransformerValue::Datum(value) => Ok(value),
+        other => Err(type_error(pos, "datum", other.type_name())),
+    }
+}
+
+fn value_to_runtime_expr(value: &Value, pos: SourcePos) -> Result<Expr, EvalError> {
+    match value {
+        Value::Int(value) => Ok(Expr::Int(*value, pos)),
+        Value::Rational(value) => Ok(Expr::Rational(*value, pos)),
+        Value::Float(value) => Ok(Expr::Float(*value, pos)),
+        Value::Bool(value) => Ok(Expr::Bool(*value, pos)),
+        Value::String(value) => Ok(Expr::String(value.to_plain_string(), pos)),
+        Value::Char(value) => Ok(Expr::Char(*value, pos)),
+        _ => Ok(list_expr(
+            vec![symbol_expr("quote", pos), datum_to_expr(value, pos)?],
+            pos,
+        )),
+    }
+}
+
+fn datum_to_expr(value: &Value, pos: SourcePos) -> Result<Expr, EvalError> {
+    match value {
+        Value::Int(value) => Ok(Expr::Int(*value, pos)),
+        Value::Rational(value) => Ok(Expr::Rational(*value, pos)),
+        Value::Float(value) => Ok(Expr::Float(*value, pos)),
+        Value::Bool(value) => Ok(Expr::Bool(*value, pos)),
+        Value::String(value) => Ok(Expr::String(value.to_plain_string(), pos)),
+        Value::Symbol(value) => Ok(Expr::Symbol(value.clone(), pos)),
+        Value::Char(value) => Ok(Expr::Char(*value, pos)),
+        Value::List(items) => Ok(Expr::List(
+            items.iter().map(|item| datum_to_expr(item, pos)).collect::<Result<Vec<_>, _>>()?,
+            pos,
+        )),
+        Value::Pair(_) => datum_pair_to_expr(value, pos),
+        Value::Vector(_) => Err(invalid_argument(
+            pos,
+            "datum->syntax does not support vectors",
+        )),
+        other => Err(type_error(pos, "datum", other.type_name())),
+    }
+}
+
+fn datum_pair_to_expr(value: &Value, pos: SourcePos) -> Result<Expr, EvalError> {
+    let mut items = Vec::new();
+    let mut current = value.clone();
+    let mut seen_pairs = HashSet::new();
+
+    loop {
+        match current {
+            Value::List(rest) => {
+                for item in &rest {
+                    items.push(datum_to_expr(item, pos)?);
+                }
+                return Ok(Expr::List(items, pos));
+            }
+            Value::Pair(pair) => {
+                if !seen_pairs.insert(pair.addr()) {
+                    return Err(invalid_argument(
+                        pos,
+                        "datum->syntax does not support cyclic pairs",
+                    ));
+                }
+                items.push(datum_to_expr(&pair.car(), pos)?);
+                current = pair.cdr();
+            }
+            other => {
+                items.push(symbol_expr(".", pos));
+                items.push(datum_to_expr(&other, pos)?);
+                return Ok(Expr::List(items, pos));
+            }
+        }
+    }
+}
+
 fn binding_list(expr: &Expr) -> Result<&[Expr], EvalError> {
     let Expr::List(bindings, _) = expr else {
         return Err(syntax_error(expr.pos(), "let bindings must be a list"));
@@ -2275,7 +3144,7 @@ fn resolve_definition_identifier(
 fn resolve_call_identifier(
     name: &str,
     env: &ExpandEnv,
-    macros: &HashMap<String, SyntaxRuleMacro>,
+    macros: &HashMap<String, MacroDef>,
 ) -> String {
     if is_internal_name(name) {
         return name.to_string();
@@ -2360,6 +3229,12 @@ fn is_ellipsis(expr: &Expr) -> bool {
 
 fn is_internal_name(name: &str) -> bool {
     name.starts_with(INTERNAL_PREFIX)
+}
+
+fn internal_surface_name(name: &str) -> Option<&str> {
+    let rest = name.strip_prefix(INTERNAL_PREFIX)?;
+    let (_, rest) = rest.split_once(':')?;
+    Some(rest.rsplit_once(':').map_or(rest, |(base, _)| base))
 }
 
 fn is_special_form_name(name: &str) -> bool {
