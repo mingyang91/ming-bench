@@ -12,6 +12,7 @@ pub fn run(level: &str, gate: bool, lang: &str) -> Result<()> {
 
     match parsed_lang {
         crate::model::Lang::Rust => run_rust(level, gate),
+        crate::model::Lang::Scala => run_mill(level, gate),
         _ => run_script(level, gate, &parsed_lang),
     }
 }
@@ -89,6 +90,61 @@ fn run_rust(level: &str, gate: bool) -> Result<()> {
     if exit != 0 {
         return Err(Error::CommandFailed {
             cmd: "podman run (test)".to_string(),
+            exit_code: exit,
+        });
+    }
+
+    Ok(())
+}
+
+/// Run Scala tests via Mill directly — no shell scripts needed.
+fn run_mill(level: &str, gate: bool) -> Result<()> {
+    let proj = project_dir();
+    let lang_dir = proj.join("bench/scala");
+
+    // Build
+    println!("Building Scala tests...");
+    let exit = run_cmd("./mill", &["test.compile"], &lang_dir)?;
+    if exit != 0 {
+        return Err(Error::CommandFailed {
+            cmd: "mill test.compile".to_string(),
+            exit_code: exit,
+        });
+    }
+
+    // Quality gate: scalafix + scalafmt
+    if gate {
+        println!("Running scalafix (quality gate)...");
+        let exit = run_cmd("./mill", &["fix", "--check"], &lang_dir)?;
+        if exit != 0 {
+            return Err(Error::CommandFailed {
+                cmd: "mill fix --check".to_string(),
+                exit_code: exit,
+            });
+        }
+
+        println!("Running scalafmt check (quality gate)...");
+        let exit = run_cmd("./mill", &["checkFormat"], &lang_dir)?;
+        if exit != 0 {
+            return Err(Error::CommandFailed {
+                cmd: "mill checkFormat".to_string(),
+                exit_code: exit,
+            });
+        }
+    }
+
+    // Run tests
+    println!("Running Scala tests (level {level})...");
+    let exit = if level == "all" {
+        run_cmd("./mill", &["test"], &lang_dir)?
+    } else {
+        let tag = format!("--include-tags=l{level}");
+        run_cmd("./mill", &["test", "--", &tag], &lang_dir)?
+    };
+
+    if exit != 0 {
+        return Err(Error::CommandFailed {
+            cmd: "mill test".to_string(),
             exit_code: exit,
         });
     }
