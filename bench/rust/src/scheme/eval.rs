@@ -54,6 +54,7 @@ fn eval_list_tail(
             "define" => return eval_define(&items[1..], env, out).map(TailAction::Return),
             "quote" => return eval_quote(&items[1..]).map(TailAction::Return),
             "lambda" => return eval_lambda(&items[1..], env).map(TailAction::Return),
+            "set!" => return eval_set(&items[1..], env, out).map(TailAction::Return),
             "string-set!" => return Err(EvalError::ImmutableString),
             "if" => return eval_if_tail(&items[1..], env, out),
             "begin" => return eval_body_tail(&items[1..], env, out),
@@ -423,6 +424,24 @@ fn eval_body(body: &[Value], env: &Rc<RefCell<Env>>, out: &Output) -> Result<Val
         result = eval(expr, env, out)?;
     }
     Ok(result)
+}
+
+fn eval_set(
+    args: &[Value],
+    env: &Rc<RefCell<Env>>,
+    out: &Output,
+) -> Result<Value, EvalError> {
+    let [Value::Symbol(name), expr] = args else {
+        return Err(EvalError::Parse {
+            message: "set!: expected (set! <symbol> <expr>)".into(),
+        });
+    };
+    let val = eval(expr, env, out)?;
+    if env.borrow_mut().set(name, val) {
+        Ok(Value::Void)
+    } else {
+        Err(EvalError::UnboundVariable { name: name.clone() })
+    }
 }
 
 fn eval_define(
