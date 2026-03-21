@@ -32,6 +32,7 @@ enum Val {
         rules: Vec<(Expr, Expr)>,
         def_env: Env,
     },
+    Values(Vec<Val>),
     Void,
 }
 
@@ -99,6 +100,13 @@ impl fmt::Display for Val {
             Val::Builtin(name) => write!(f, "#<builtin:{}>", name),
             Val::Continuation(_) => write!(f, "#<continuation>"),
             Val::Macro { .. } => write!(f, "#<macro>"),
+            Val::Values(vals) => {
+                for (i, v) in vals.iter().enumerate() {
+                    if i > 0 { write!(f, "\n")?; }
+                    write!(f, "{}", v)?;
+                }
+                Ok(())
+            }
             Val::Void => write!(f, ""),
         }
     }
@@ -178,6 +186,7 @@ fn default_env() -> Env {
         "char=?", "char<?",
         "string=?", "string<?", "string-ci=?", "string-upcase", "string-downcase",
         "raise", "with-exception-handler",
+        "values", "call-with-values",
     ] {
         env_set(&env, name.to_string(), Val::Builtin(name.to_string()));
     }
@@ -2645,6 +2654,25 @@ fn apply_builtin(name: &str, args: &[Val], pos: Pos, out: &Output) -> Result<Val
             match &args[0] {
                 Val::Str(s) => Ok(Val::Str(s.to_lowercase())),
                 _ => Err(EvalError::Type { msg: "string-downcase: expected string".into(), pos }),
+            }
+        }
+        "values" => {
+            if args.len() == 1 {
+                Ok(args[0].clone())
+            } else {
+                Ok(Val::Values(args.to_vec()))
+            }
+        }
+        "call-with-values" => {
+            if args.len() != 2 {
+                return Err(EvalError::Arity { msg: "call-with-values requires 2 arguments".into(), pos });
+            }
+            let producer = &args[0];
+            let consumer = &args[1];
+            let produced = apply_func(producer, &[], pos, out)?;
+            match produced {
+                Val::Values(vals) => apply_func(consumer, &vals, pos, out),
+                single => apply_func(consumer, &[single], pos, out),
             }
         }
         _ => Err(EvalError::UnboundVariable {
