@@ -2527,7 +2527,7 @@ fn quote_expression(expression: &Expr) -> Value {
         Expr::Character { value, .. } => Value::Character(*value),
         Expr::Symbol { name, .. } => Value::Symbol(name.clone()),
         Expr::List { items, .. } => items.iter().rev().fold(Value::EmptyList, |tail, item| {
-            Value::Pair(Box::new(quote_expression(item)), Box::new(tail))
+            Value::pair(quote_expression(item), tail)
         }),
     }
 }

@@ -121,6 +121,8 @@ pub enum EvalError {
         location: SourceLocation,
         index: i64,
     },
+    #[error("{location}: circular list")]
+    CircularList { location: SourceLocation },
     #[error("{location}: invalid substring range [{start}, {end}) for string length {length}")]
     InvalidSubstringRange {
         location: SourceLocation,

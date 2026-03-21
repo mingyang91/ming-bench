@@ -6,6 +6,7 @@ mod equality;
 pub mod error;
 mod evaluator;
 mod number;
+mod pair_value;
 mod parser;
 mod record;
 mod string_value;

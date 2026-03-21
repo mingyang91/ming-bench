@@ -1,3 +1,5 @@
+use std::collections::HashSet;
+
 use crate::scheme::ast::SourceLocation;
 use crate::scheme::environment::Environment;
 use crate::scheme::equality::{is_eq, is_equal, is_eqv};
@@ -35,6 +37,9 @@ pub enum BuiltinProcedure {
     Cons,
     Car,
     Cdr,
+    Cddr,
+    SetCar,
+    SetCdr,
     Null,
     List,
     ListRef,
@@ -128,6 +133,9 @@ impl BuiltinProcedure {
             Self::Cons => "cons",
             Self::Car => "car",
             Self::Cdr => "cdr",
+            Self::Cddr => "cddr",
+            Self::SetCar => "set-car!",
+            Self::SetCdr => "set-cdr!",
             Self::Null => "null?",
             Self::List => "list",
             Self::ListRef => "list-ref",
@@ -222,6 +230,9 @@ pub fn install_builtins(environment: &Environment) {
         BuiltinProcedure::Cons,
         BuiltinProcedure::Car,
         BuiltinProcedure::Cdr,
+        BuiltinProcedure::Cddr,
+        BuiltinProcedure::SetCar,
+        BuiltinProcedure::SetCdr,
         BuiltinProcedure::Null,
         BuiltinProcedure::List,
         BuiltinProcedure::ListRef,
@@ -399,6 +410,9 @@ fn apply_list_builtin(
         BuiltinProcedure::Cons => Some(eval_cons(arguments, location)),
         BuiltinProcedure::Car => Some(eval_car(arguments, location)),
         BuiltinProcedure::Cdr => Some(eval_cdr(arguments, location)),
+        BuiltinProcedure::Cddr => Some(eval_cddr(arguments, location)),
+        BuiltinProcedure::SetCar => Some(eval_set_car(arguments, location)),
+        BuiltinProcedure::SetCdr => Some(eval_set_cdr(arguments, location)),
         BuiltinProcedure::Null => Some(eval_null(arguments, location)),
         BuiltinProcedure::List => Some(Ok(eval_list(arguments))),
         BuiltinProcedure::ListRef => Some(eval_list_ref(arguments, location)),
@@ -789,33 +803,36 @@ fn eval_cons(arguments: &[Value], location: SourceLocation) -> Result<Value, Eva
         });
     };
 
-    Ok(Value::Pair(Box::new(car.clone()), Box::new(cdr.clone())))
+    Ok(Value::pair(car.clone(), cdr.clone()))
 }
 
 fn eval_car(arguments: &[Value], location: SourceLocation) -> Result<Value, EvalError> {
-    let pair = unary_argument("car", arguments, location)?;
-    let Value::Pair(car, _) = pair else {
-        return Err(EvalError::TypeMismatch {
-            location,
-            expected: "pair",
-            found: pair.type_name(),
-        });
-    };
-
-    Ok((**car).clone())
+    unary_argument("car", arguments, location)?
+        .expect_pair(location)
+        .map(|pair| pair.car())
 }
 
 fn eval_cdr(arguments: &[Value], location: SourceLocation) -> Result<Value, EvalError> {
-    let pair = unary_argument("cdr", arguments, location)?;
-    let Value::Pair(_, cdr) = pair else {
-        return Err(EvalError::TypeMismatch {
-            location,
-            expected: "pair",
-            found: pair.type_name(),
-        });
-    };
+    unary_argument("cdr", arguments, location)?
+        .expect_pair(location)
+        .map(|pair| pair.cdr())
+}
 
-    Ok((**cdr).clone())
+fn eval_cddr(arguments: &[Value], location: SourceLocation) -> Result<Value, EvalError> {
+    let pair = unary_argument("cddr", arguments, location)?.expect_pair(location)?;
+    pair.cdr().expect_pair(location).map(|pair| pair.cdr())
+}
+
+fn eval_set_car(arguments: &[Value], location: SourceLocation) -> Result<Value, EvalError> {
+    let (pair_value, new_value) = binary_arguments("set-car!", arguments, location)?;
+    pair_value.expect_pair(location)?.set_car(new_value.clone());
+    Ok(Value::Void)
+}
+
+fn eval_set_cdr(arguments: &[Value], location: SourceLocation) -> Result<Value, EvalError> {
+    let (pair_value, new_value) = binary_arguments("set-cdr!", arguments, location)?;
+    pair_value.expect_pair(location)?.set_cdr(new_value.clone());
+    Ok(Value::Void)
 }
 
 fn eval_null(arguments: &[Value], location: SourceLocation) -> Result<Value, EvalError> {
@@ -848,19 +865,19 @@ fn eval_list_ref(arguments: &[Value], location: SourceLocation) -> Result<Value,
     let (list, index) = list_argument_index("list-ref", arguments, location)?;
     let tail = list_tail_at(list, index, location)?;
     match tail {
-        Value::Pair(item, _) => Ok((**item).clone()),
+        Value::Pair(pair) => Ok(pair.car()),
         Value::EmptyList => Err(EvalError::ListIndexOutOfBounds { location, index }),
-        _ => Err(EvalError::TypeMismatch {
+        other => Err(EvalError::TypeMismatch {
             location,
             expected: "pair",
-            found: tail.type_name(),
+            found: other.type_name(),
         }),
     }
 }
 
 fn eval_list_tail(arguments: &[Value], location: SourceLocation) -> Result<Value, EvalError> {
     let (list, index) = list_argument_index("list-tail", arguments, location)?;
-    if !matches!(list, Value::EmptyList | Value::Pair(_, _)) {
+    if !matches!(list, Value::EmptyList | Value::Pair(_)) {
         return Err(EvalError::TypeMismatch {
             location,
             expected: "list",
@@ -868,7 +885,7 @@ fn eval_list_tail(arguments: &[Value], location: SourceLocation) -> Result<Value
         });
     }
 
-    list_tail_at(list, index, location).cloned()
+    list_tail_at(list, index, location)
 }
 
 fn eval_list_pred(arguments: &[Value], location: SourceLocation) -> Result<Value, EvalError> {
@@ -878,18 +895,32 @@ fn eval_list_pred(arguments: &[Value], location: SourceLocation) -> Result<Value
 
 fn eval_assoc(arguments: &[Value], location: SourceLocation) -> Result<Value, EvalError> {
     let (key, association_list) = binary_arguments("assoc", arguments, location)?;
-    let mut current = association_list;
+    let mut current = association_list.clone();
+    let mut seen_pairs = HashSet::new();
 
     loop {
-        let Some((entry, remainder)) = assoc_list_node(current, location)? else {
-            return Ok(Value::Boolean(false));
+        let pair = match current {
+            Value::EmptyList => return Ok(Value::Boolean(false)),
+            Value::Pair(pair) => pair,
+            other => {
+                return Err(EvalError::TypeMismatch {
+                    location,
+                    expected: "list",
+                    found: other.type_name(),
+                });
+            }
         };
 
-        if is_equal(key, assoc_entry_key(entry, location)?) {
-            return Ok(entry.clone());
+        if !seen_pairs.insert(pair.id()) {
+            return Err(EvalError::CircularList { location });
         }
 
-        current = remainder;
+        let entry = pair.car();
+        if is_equal(key, &assoc_entry_key(&entry, location)?) {
+            return Ok(entry);
+        }
+
+        current = pair.cdr();
     }
 }
 
@@ -1678,45 +1709,55 @@ fn vector_index(
 
 fn proper_list_items(value: &Value, location: SourceLocation) -> Result<Vec<Value>, EvalError> {
     let mut items = Vec::new();
-    let mut current = value;
+    let mut current = value.clone();
+    let mut seen_pairs = HashSet::new();
 
     loop {
-        match current {
+        let pair = match current {
             Value::EmptyList => return Ok(items),
-            Value::Pair(car, cdr) => {
-                items.push((**car).clone());
-                current = cdr.as_ref();
-            }
-            _ => {
+            Value::Pair(pair) => pair,
+            other => {
                 return Err(EvalError::TypeMismatch {
                     location,
                     expected: "list",
-                    found: current.type_name(),
+                    found: other.type_name(),
                 });
             }
+        };
+
+        if !seen_pairs.insert(pair.id()) {
+            return Err(EvalError::CircularList { location });
         }
+
+        items.push(pair.car());
+        current = pair.cdr();
     }
 }
 
 fn list_length(value: &Value, location: SourceLocation) -> Result<usize, EvalError> {
     let mut length = 0usize;
-    let mut current = value;
+    let mut current = value.clone();
+    let mut seen_pairs = HashSet::new();
 
     loop {
-        match current {
+        let pair = match current {
             Value::EmptyList => return Ok(length),
-            Value::Pair(_, next) => {
-                length += 1;
-                current = next.as_ref();
-            }
-            _ => {
+            Value::Pair(pair) => pair,
+            other => {
                 return Err(EvalError::TypeMismatch {
                     location,
                     expected: "list",
-                    found: current.type_name(),
+                    found: other.type_name(),
                 });
             }
+        };
+
+        if !seen_pairs.insert(pair.id()) {
+            return Err(EvalError::CircularList { location });
         }
+
+        length += 1;
+        current = pair.cdr();
     }
 }
 
@@ -1729,24 +1770,9 @@ fn list_argument_index<'a>(
     Ok((list, index.expect_integer(location)?))
 }
 
-fn assoc_list_node(
-    current: &Value,
-    location: SourceLocation,
-) -> Result<Option<(&Value, &Value)>, EvalError> {
-    match current {
-        Value::EmptyList => Ok(None),
-        Value::Pair(entry, remainder) => Ok(Some((entry.as_ref(), remainder.as_ref()))),
-        _ => Err(EvalError::TypeMismatch {
-            location,
-            expected: "list",
-            found: current.type_name(),
-        }),
-    }
-}
-
-fn assoc_entry_key(entry: &Value, location: SourceLocation) -> Result<&Value, EvalError> {
+fn assoc_entry_key(entry: &Value, location: SourceLocation) -> Result<Value, EvalError> {
     match entry {
-        Value::Pair(entry_key, _) => Ok(entry_key.as_ref()),
+        Value::Pair(pair) => Ok(pair.car()),
         _ => Err(EvalError::TypeMismatch {
             location,
             expected: "pair",
@@ -1755,43 +1781,55 @@ fn assoc_entry_key(entry: &Value, location: SourceLocation) -> Result<&Value, Ev
     }
 }
 
-fn list_tail_at(value: &Value, index: i64, location: SourceLocation) -> Result<&Value, EvalError> {
+fn list_tail_at(value: &Value, index: i64, location: SourceLocation) -> Result<Value, EvalError> {
     let Some(mut remaining) = usize::try_from(index).ok() else {
         return Err(EvalError::ListIndexOutOfBounds { location, index });
     };
-    let mut current = value;
+    let mut current = value.clone();
+    let mut seen_pairs = HashSet::new();
 
     while remaining > 0 {
-        match current {
-            Value::Pair(_, cdr) => {
-                current = cdr.as_ref();
-                remaining -= 1;
-            }
+        let pair = match current {
+            Value::Pair(pair) => pair,
             Value::EmptyList => {
                 return Err(EvalError::ListIndexOutOfBounds { location, index });
             }
-            _ => {
+            other => {
                 return Err(EvalError::TypeMismatch {
                     location,
                     expected: "pair",
-                    found: current.type_name(),
+                    found: other.type_name(),
                 });
             }
+        };
+
+        if !seen_pairs.insert(pair.id()) {
+            return Err(EvalError::CircularList { location });
         }
+
+        current = pair.cdr();
+        remaining -= 1;
     }
 
     Ok(current)
 }
 
 fn is_proper_list(value: &Value) -> bool {
-    let mut current = value;
+    let mut current = value.clone();
+    let mut seen_pairs = HashSet::new();
 
     loop {
-        match current {
+        let pair = match current {
             Value::EmptyList => return true,
-            Value::Pair(_, cdr) => current = cdr.as_ref(),
+            Value::Pair(pair) => pair,
             _ => return false,
+        };
+
+        if !seen_pairs.insert(pair.id()) {
+            return false;
         }
+
+        current = pair.cdr();
     }
 }
 
@@ -1840,7 +1878,7 @@ fn is_boolean(value: &Value) -> bool {
 }
 
 fn is_pair(value: &Value) -> bool {
-    matches!(value, Value::Pair(_, _))
+    matches!(value, Value::Pair(_))
 }
 
 fn is_symbol(value: &Value) -> bool {

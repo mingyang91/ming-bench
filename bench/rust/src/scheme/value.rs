@@ -1,3 +1,4 @@
+use std::collections::HashSet;
 use std::fmt::{self, Formatter};
 use std::rc::Rc;
 
@@ -8,6 +9,7 @@ use crate::scheme::continuation::CapturedContinuation;
 use crate::scheme::environment::Environment;
 use crate::scheme::error::{ArgCount, EvalError};
 use crate::scheme::number::Number;
+use crate::scheme::pair_value::SchemePair;
 use crate::scheme::record::{RecordProcedure, SchemeRecord};
 use crate::scheme::string_value::SchemeString;
 use crate::scheme::vector_value::SchemeVector;
@@ -54,7 +56,7 @@ pub enum Value {
     Character(char),
     Symbol(String),
     EmptyList,
-    Pair(Box<Value>, Box<Value>),
+    Pair(SchemePair),
     Vector(SchemeVector),
     Record(SchemeRecord),
     Builtin(BuiltinProcedure),
@@ -119,6 +121,10 @@ impl Value {
         Self::MultipleValues(MultipleValues::new(values, location))
     }
 
+    pub fn pair(car: Value, cdr: Value) -> Self {
+        Self::Pair(SchemePair::new(car, cdr))
+    }
+
     pub fn into_values(self) -> Vec<Value> {
         match self {
             Self::MultipleValues(values) => values.into_values(),
@@ -146,30 +152,7 @@ impl Value {
     }
 
     fn render_with_mode(&self, mode: RenderMode) -> String {
-        match self {
-            Self::Number(value) => value.render(),
-            Self::Boolean(value) => render_boolean(*value),
-            Self::String(value) => render_string(value, mode),
-            Self::Character(value) => render_character(*value, mode),
-            Self::Symbol(value) => value.clone(),
-            Self::EmptyList => "()".into(),
-            Self::Pair(car, cdr) => render_pair(car, cdr, mode),
-            Self::Vector(vector) => render_vector(vector, mode),
-            Self::Record(record) => record.render(),
-            Self::Builtin(procedure) => format!("#<procedure:{}>", procedure.name()),
-            Self::RecordProcedure(procedure) => format!("#<procedure:{}>", procedure.name()),
-            Self::CallWithCurrentContinuation => "#<procedure:call/cc>".into(),
-            Self::CallWithValues => "#<procedure:call-with-values>".into(),
-            Self::DynamicWind => "#<procedure:dynamic-wind>".into(),
-            Self::Raise => "#<procedure:raise>".into(),
-            Self::ValuesProcedure => "#<procedure:values>".into(),
-            Self::WithExceptionHandler => "#<procedure:with-exception-handler>".into(),
-            Self::MultipleValues(values) => render_multiple_values(values),
-            Self::Continuation(_) => "#<continuation>".into(),
-            Self::Closure(closure) => render_closure(closure),
-            Self::Void => "#<void>".into(),
-            Self::Uninitialized => "#<uninitialized>".into(),
-        }
+        render_value(self, mode, &mut HashSet::new())
     }
 
     pub fn expect_number(&self, location: SourceLocation) -> Result<Number, EvalError> {
@@ -225,6 +208,17 @@ impl Value {
         }
     }
 
+    pub fn expect_pair(&self, location: SourceLocation) -> Result<SchemePair, EvalError> {
+        match self {
+            Self::Pair(value) => Ok(value.clone()),
+            _ => Err(EvalError::TypeMismatch {
+                location,
+                expected: "pair",
+                found: self.type_name(),
+            }),
+        }
+    }
+
     pub fn expect_vector(&self, location: SourceLocation) -> Result<&SchemeVector, EvalError> {
         match self {
             Self::Vector(value) => Ok(value),
@@ -248,7 +242,7 @@ impl Value {
             Self::Character(_) => "char",
             Self::Symbol(_) => "symbol",
             Self::EmptyList => "null",
-            Self::Pair(_, _) => "pair",
+            Self::Pair(_) => "pair",
             Self::Vector(_) => "vector",
             Self::Record(_) => "record",
             Self::Builtin(_)
@@ -273,9 +267,7 @@ pub fn list_from_values(values: &[Value]) -> Value {
         .iter()
         .rev()
         .cloned()
-        .fold(Value::EmptyList, |tail, value| {
-            Value::Pair(Box::new(value), Box::new(tail))
-        })
+        .fold(Value::EmptyList, |tail, value| Value::pair(value, tail))
 }
 
 fn render_boolean(value: bool) -> String {
@@ -331,36 +323,88 @@ fn render_closure(closure: &Closure) -> String {
     )
 }
 
-fn render_pair(car: &Value, cdr: &Value, mode: RenderMode) -> String {
+fn render_value(value: &Value, mode: RenderMode, seen_pairs: &mut HashSet<usize>) -> String {
+    match value {
+        Value::Number(value) => value.render(),
+        Value::Boolean(value) => render_boolean(*value),
+        Value::String(value) => render_string(value, mode),
+        Value::Character(value) => render_character(*value, mode),
+        Value::Symbol(value) => value.clone(),
+        Value::EmptyList => "()".into(),
+        Value::Pair(pair) => render_pair(pair, mode, seen_pairs),
+        Value::Vector(vector) => render_vector(vector, mode, seen_pairs),
+        Value::Record(record) => record.render(),
+        Value::Builtin(procedure) => format!("#<procedure:{}>", procedure.name()),
+        Value::RecordProcedure(procedure) => format!("#<procedure:{}>", procedure.name()),
+        Value::CallWithCurrentContinuation => "#<procedure:call/cc>".into(),
+        Value::CallWithValues => "#<procedure:call-with-values>".into(),
+        Value::DynamicWind => "#<procedure:dynamic-wind>".into(),
+        Value::Raise => "#<procedure:raise>".into(),
+        Value::ValuesProcedure => "#<procedure:values>".into(),
+        Value::WithExceptionHandler => "#<procedure:with-exception-handler>".into(),
+        Value::MultipleValues(values) => render_multiple_values(values),
+        Value::Continuation(_) => "#<continuation>".into(),
+        Value::Closure(closure) => render_closure(closure),
+        Value::Void => "#<void>".into(),
+        Value::Uninitialized => "#<uninitialized>".into(),
+    }
+}
+
+fn render_pair(pair: &SchemePair, mode: RenderMode, seen_pairs: &mut HashSet<usize>) -> String {
+    let id = pair.id();
+    if !seen_pairs.insert(id) {
+        return "#<cycle>".into();
+    }
+
+    let (car, cdr) = pair.parts();
     let mut rendered = String::from("(");
-    render_pair_contents(car, cdr, mode, &mut rendered);
+    render_pair_contents(&car, &cdr, mode, seen_pairs, &mut rendered);
     rendered.push(')');
+    seen_pairs.remove(&id);
     rendered
 }
 
-fn render_vector(vector: &SchemeVector, mode: RenderMode) -> String {
+fn render_vector(
+    vector: &SchemeVector,
+    mode: RenderMode,
+    seen_pairs: &mut HashSet<usize>,
+) -> String {
     let contents = vector
         .items()
         .into_iter()
-        .map(|item| item.render_with_mode(mode))
+        .map(|item| render_value(&item, mode, seen_pairs))
         .collect::<Vec<_>>()
         .join(" ");
 
     format!("#({contents})")
 }
 
-fn render_pair_contents(car: &Value, cdr: &Value, mode: RenderMode, rendered: &mut String) {
-    rendered.push_str(&car.render_with_mode(mode));
+fn render_pair_contents(
+    car: &Value,
+    cdr: &Value,
+    mode: RenderMode,
+    seen_pairs: &mut HashSet<usize>,
+    rendered: &mut String,
+) {
+    rendered.push_str(&render_value(car, mode, seen_pairs));
 
     match cdr {
         Value::EmptyList => {}
-        Value::Pair(item, remainder) => {
+        Value::Pair(pair) => {
+            let id = pair.id();
+            if !seen_pairs.insert(id) {
+                rendered.push_str(" . #<cycle>");
+                return;
+            }
+
+            let (item, remainder) = pair.parts();
             rendered.push(' ');
-            render_pair_contents(item, remainder, mode, rendered);
+            render_pair_contents(&item, &remainder, mode, seen_pairs, rendered);
+            seen_pairs.remove(&id);
         }
         other => {
             rendered.push_str(" . ");
-            rendered.push_str(&other.render_with_mode(mode));
+            rendered.push_str(&render_value(other, mode, seen_pairs));
         }
     }
 }
