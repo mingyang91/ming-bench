@@ -428,6 +428,64 @@ fn call_builtin_with_values(
             })?;
             Ok(Value::Integer(items.len() as i64))
         }
+        "list?" => {
+            let [a] = args else {
+                return Err(EvalError::WrongArgCount { expected: 1, got: args.len() });
+            };
+            Ok(Value::Boolean(is_proper_list(a)))
+        }
+        "list-tail" => {
+            let [list_val, k_val] = args else {
+                return Err(EvalError::WrongArgCount { expected: 2, got: args.len() });
+            };
+            let Value::Integer(n) = k_val else {
+                return Err(EvalError::TypeError { expected: "integer".to_string(), got: k_val.display() });
+            };
+            list_tail(list_val, *n as usize)
+        }
+        "list-ref" => {
+            let [list_val, k_val] = args else {
+                return Err(EvalError::WrongArgCount { expected: 2, got: args.len() });
+            };
+            let Value::Integer(n) = k_val else {
+                return Err(EvalError::TypeError { expected: "integer".to_string(), got: k_val.display() });
+            };
+            let tail = list_tail(list_val, *n as usize)?;
+            let Value::Pair(car, _) = tail else {
+                return Err(EvalError::TypeError { expected: "pair".to_string(), got: tail.display() });
+            };
+            Ok(*car)
+        }
+        "assoc" => {
+            let [key, alist] = args else {
+                return Err(EvalError::WrongArgCount { expected: 2, got: args.len() });
+            };
+            eval_assoc(key, alist)
+        }
+        "map" => {
+            if args.len() < 2 {
+                return Err(EvalError::WrongArgCount { expected: 2, got: args.len() });
+            }
+            let func = &args[0];
+            let lists: Vec<Vec<Value>> = args[1..]
+                .iter()
+                .map(|a| {
+                    a.to_list_vec().ok_or_else(|| EvalError::TypeError {
+                        expected: "proper list".to_string(),
+                        got: a.display(),
+                    })
+                })
+                .collect::<Result<_, _>>()?;
+            let len = lists.first().map_or(0, Vec::len);
+            let mut results = Vec::with_capacity(len);
+            for i in 0..len {
+                let call_args: Vec<Value> = lists.iter().map(|l| l[i].clone()).collect();
+                results.push(apply_value(func, &call_args, env, out)?);
+            }
+            Ok(results.into_iter().rev().fold(Value::Nil, |acc, v| {
+                Value::Pair(Box::new(v), Box::new(acc))
+            }))
+        }
         "not" => {
             let [a] = args else {
                 return Err(EvalError::WrongArgCount { expected: 1, got: args.len() });
@@ -1079,7 +1137,8 @@ fn is_builtin(name: &str) -> bool {
     matches!(
         name,
         "+" | "-" | "*" | "/" | "<" | ">" | "=" | "<=" | ">=" | "not"
-            | "cons" | "car" | "cdr" | "null?" | "list" | "length"
+            | "cons" | "car" | "cdr" | "null?" | "list" | "list?" | "length"
+            | "list-tail" | "list-ref" | "assoc"
             | "string?" | "number?" | "boolean?" | "pair?" | "symbol?" | "char?"
             | "display" | "write" | "newline"
             | "string-append" | "string-length" | "substring"
@@ -1109,9 +1168,8 @@ fn eval_builtin(
         "not" => eval_not(args, env, out),
         "and" => eval_and(args, env, out),  // fallback for non-tail contexts
         "or" => eval_or(args, env, out),   // fallback for non-tail contexts
-        "cons" | "car" | "cdr" | "null?" | "list" | "length" => {
-            eval_list_builtin(name, args, env, out)
-        }
+        "cons" | "car" | "cdr" | "null?" | "list" | "list?" | "length"
+        | "list-tail" | "list-ref" | "assoc" => eval_list_builtin(name, args, env, out),
         "string?" | "number?" | "boolean?" | "pair?" | "symbol?" | "char?" => {
             eval_type_pred(name, args, env, out)
         }
@@ -1459,7 +1517,108 @@ fn eval_list_builtin(
             })?;
             Ok(Value::Integer(items.len() as i64))
         }
+        "list?" => {
+            let [a] = args else {
+                return Err(EvalError::WrongArgCount { expected: 1, got: args.len() });
+            };
+            let val = eval(a, env, out)?;
+            Ok(Value::Boolean(is_proper_list(&val)))
+        }
+        "list-tail" => {
+            let [list_arg, k_arg] = args else {
+                return Err(EvalError::WrongArgCount { expected: 2, got: args.len() });
+            };
+            let list_val = eval(list_arg, env, out)?;
+            let k = eval_to_usize(k_arg, env, out)?;
+            list_tail(&list_val, k)
+        }
+        "list-ref" => {
+            let [list_arg, k_arg] = args else {
+                return Err(EvalError::WrongArgCount { expected: 2, got: args.len() });
+            };
+            let list_val = eval(list_arg, env, out)?;
+            let k = eval_to_usize(k_arg, env, out)?;
+            let tail = list_tail(&list_val, k)?;
+            let Value::Pair(car, _) = tail else {
+                return Err(EvalError::TypeError {
+                    expected: "pair".to_string(),
+                    got: tail.display(),
+                });
+            };
+            Ok(*car)
+        }
+        "assoc" => {
+            let [key_arg, alist_arg] = args else {
+                return Err(EvalError::WrongArgCount { expected: 2, got: args.len() });
+            };
+            let key = eval(key_arg, env, out)?;
+            let alist = eval(alist_arg, env, out)?;
+            eval_assoc(&key, &alist)
+        }
         _ => unreachable!("unexpected list builtin: {name}"),
+    }
+}
+
+fn is_proper_list(val: &Value) -> bool {
+    let mut current = val;
+    loop {
+        match current {
+            Value::Nil => return true,
+            Value::Pair(_, cdr) => current = cdr,
+            _ => return false,
+        }
+    }
+}
+
+fn eval_to_usize(arg: &Value, env: &mut Env, out: &mut String) -> Result<usize, EvalError> {
+    let val = eval(arg, env, out)?;
+    match val {
+        Value::Integer(n) if n >= 0 => Ok(n as usize),
+        Value::Integer(n) => Err(EvalError::TypeError {
+            expected: "non-negative integer".to_string(),
+            got: n.to_string(),
+        }),
+        other => Err(EvalError::TypeError {
+            expected: "integer".to_string(),
+            got: other.display(),
+        }),
+    }
+}
+
+fn list_tail(list: &Value, k: usize) -> Result<Value, EvalError> {
+    let mut current = list.clone();
+    for _ in 0..k {
+        let Value::Pair(_, cdr) = current else {
+            return Err(EvalError::TypeError {
+                expected: "pair".to_string(),
+                got: current.display(),
+            });
+        };
+        current = *cdr;
+    }
+    Ok(current)
+}
+
+fn assoc_entry_matches(key: &Value, entry: &Value) -> bool {
+    matches!(entry, Value::Pair(entry_key, _) if values_equal(key, entry_key))
+}
+
+fn eval_assoc(key: &Value, alist: &Value) -> Result<Value, EvalError> {
+    let mut current = alist;
+    loop {
+        match current {
+            Value::Nil => return Ok(Value::Boolean(false)),
+            Value::Pair(car, cdr) if assoc_entry_matches(key, car) => {
+                return Ok(*car.clone());
+            }
+            Value::Pair(_, cdr) => current = cdr,
+            _ => {
+                return Err(EvalError::TypeError {
+                    expected: "proper list".to_string(),
+                    got: current.display(),
+                });
+            }
+        }
     }
 }
 
@@ -1923,22 +2082,26 @@ fn eval_map(
     env: &mut Env,
     out: &mut String,
 ) -> Result<Value, EvalError> {
-    let [func_arg, list_arg] = args else {
-        return Err(EvalError::WrongArgCount {
-            expected: 2,
-            got: args.len(),
-        });
-    };
-    let func = eval(func_arg, env, out)?;
-    let list_val = eval(list_arg, env, out)?;
-    let items = list_val.to_list_vec().ok_or_else(|| EvalError::TypeError {
-        expected: "proper list".to_string(),
-        got: list_val.display(),
-    })?;
-    let results: Vec<Value> = items
+    if args.len() < 2 {
+        return Err(EvalError::WrongArgCount { expected: 2, got: args.len() });
+    }
+    let func = eval(&args[0], env, out)?;
+    let lists: Vec<Vec<Value>> = args[1..]
         .iter()
-        .map(|item| apply_value(&func, std::slice::from_ref(item), env, out))
+        .map(|a| {
+            let val = eval(a, env, out)?;
+            val.to_list_vec().ok_or_else(|| EvalError::TypeError {
+                expected: "proper list".to_string(),
+                got: val.display(),
+            })
+        })
         .collect::<Result<_, _>>()?;
+    let len = lists.first().map_or(0, Vec::len);
+    let mut results = Vec::with_capacity(len);
+    for i in 0..len {
+        let call_args: Vec<Value> = lists.iter().map(|l| l[i].clone()).collect();
+        results.push(apply_value(&func, &call_args, env, out)?);
+    }
     Ok(results.into_iter().rev().fold(Value::Nil, |acc, v| {
         Value::Pair(Box::new(v), Box::new(acc))
     }))
