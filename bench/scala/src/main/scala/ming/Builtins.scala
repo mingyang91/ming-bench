@@ -258,3 +258,5 @@ object Builtins:
     .define("string-copy", Value.Symbol("string-copy"))
     .define("string-set!", Value.Symbol("string-set!"))
     .define("apply", Value.Symbol("apply"))
+    .define("call/cc", Value.Symbol("call/cc"))
+    .define("call-with-current-continuation", Value.Symbol("call/cc"))

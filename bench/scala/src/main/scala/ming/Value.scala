@@ -20,6 +20,13 @@ enum Value:
   case MutableStringVal(chars: Array[Char])
   case VoidVal
 
+  case ContinuationVal(
+    tag: AnyRef,
+    remaining: List[Value],
+    envThunk: () => Env,
+    capturedOut: String
+  )
+
   /** Extract string content from either StringVal or MutableStringVal. */
   def stringContent: Option[String] = this match
     case StringVal(s)         => Some(s)
@@ -37,6 +44,7 @@ enum Value:
     case NilVal               => "()"
     case PairVal(_, _, _)     => formatList(_.display)
     case _: LambdaVal         => "#<procedure>"
+    case _: ContinuationVal   => "#<continuation>"
     case VoidVal              => ""
 
   /** Display representation (strings without quotes). */
