@@ -1312,7 +1312,8 @@ fn is_builtin(name: &str) -> bool {
         "apply" | "map" |
         "call/cc" | "call-with-current-continuation" |
         "vector" | "make-vector" | "vector-ref" | "vector-set!" |
-        "vector-length" | "vector?" | "vector->list" | "list->vector"
+        "vector-length" | "vector?" | "vector->list" | "list->vector" |
+        "abs" | "modulo" | "remainder" | "quotient" | "min" | "max" | "expt"
     )
 }
 
@@ -1802,6 +1803,78 @@ fn apply_builtin_vals(op: &str, vals: &[Value], pos: Pos) -> Result<Value, EvalE
                 Value::List(l) => Ok(Value::Vector(Rc::new(RefCell::new(l.clone())))),
                 _ => Err(runtime_err(pos, "list->vector: expected list")),
             }
+        }
+        "abs" => {
+            if vals.len() != 1 {
+                return Err(runtime_err(pos, "abs requires 1 argument"));
+            }
+            Ok(Value::Integer(expect_int(&vals[0], pos)?.abs()))
+        }
+        "modulo" => {
+            if vals.len() != 2 {
+                return Err(runtime_err(pos, "modulo requires 2 arguments"));
+            }
+            let a = expect_int(&vals[0], pos)?;
+            let b = expect_int(&vals[1], pos)?;
+            if b == 0 {
+                return Err(runtime_err(pos, "modulo: division by zero"));
+            }
+            Ok(Value::Integer(((a % b) + b) % b))
+        }
+        "remainder" => {
+            if vals.len() != 2 {
+                return Err(runtime_err(pos, "remainder requires 2 arguments"));
+            }
+            let a = expect_int(&vals[0], pos)?;
+            let b = expect_int(&vals[1], pos)?;
+            if b == 0 {
+                return Err(runtime_err(pos, "remainder: division by zero"));
+            }
+            Ok(Value::Integer(a % b))
+        }
+        "quotient" => {
+            if vals.len() != 2 {
+                return Err(runtime_err(pos, "quotient requires 2 arguments"));
+            }
+            let a = expect_int(&vals[0], pos)?;
+            let b = expect_int(&vals[1], pos)?;
+            if b == 0 {
+                return Err(runtime_err(pos, "quotient: division by zero"));
+            }
+            Ok(Value::Integer(a / b))
+        }
+        "min" => {
+            if vals.is_empty() {
+                return Err(runtime_err(pos, "min requires at least 1 argument"));
+            }
+            let mut result = expect_int(&vals[0], pos)?;
+            for v in &vals[1..] {
+                let n = expect_int(v, pos)?;
+                if n < result { result = n; }
+            }
+            Ok(Value::Integer(result))
+        }
+        "max" => {
+            if vals.is_empty() {
+                return Err(runtime_err(pos, "max requires at least 1 argument"));
+            }
+            let mut result = expect_int(&vals[0], pos)?;
+            for v in &vals[1..] {
+                let n = expect_int(v, pos)?;
+                if n > result { result = n; }
+            }
+            Ok(Value::Integer(result))
+        }
+        "expt" => {
+            if vals.len() != 2 {
+                return Err(runtime_err(pos, "expt requires 2 arguments"));
+            }
+            let base = expect_int(&vals[0], pos)?;
+            let exp = expect_int(&vals[1], pos)?;
+            if exp < 0 {
+                return Err(runtime_err(pos, "expt: negative exponent"));
+            }
+            Ok(Value::Integer(base.pow(exp as u32)))
         }
         _ => Err(runtime_err(pos, format!("unknown procedure: {}", op))),
     }
