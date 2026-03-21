@@ -16,7 +16,7 @@ pub(crate) struct Span {
 
 /// A Scheme value.
 #[derive(Debug, Clone)]
-enum Value {
+pub(crate) enum Value {
     Integer(i64),
     Boolean(bool),
     String(String),
@@ -63,6 +63,38 @@ impl std::fmt::Display for Value {
     }
 }
 
+impl Value {
+    /// Format for `display`: strings without quotes, everything else as Display.
+    fn display_fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Value::String(s) => write!(f, "{s}"),
+            Value::List(items) => display_fmt_list(items, f),
+            other => write!(f, "{other}"),
+        }
+    }
+}
+
+/// Format a list of values using display semantics (no quotes on strings).
+fn display_fmt_list(items: &[Value], f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+    write!(f, "(")?;
+    for (i, item) in items.iter().enumerate() {
+        if i > 0 {
+            write!(f, " ")?;
+        }
+        item.display_fmt(f)?;
+    }
+    write!(f, ")")
+}
+
+/// Wrapper for display-style formatting (no quotes on strings).
+pub(crate) struct DisplayValue<'a>(pub(crate) &'a Value);
+
+impl std::fmt::Display for DisplayValue<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.0.display_fmt(f)
+    }
+}
+
 /// Format a slice of values as a space-separated string.
 fn fmt_list(items: &[Value]) -> String {
     items
@@ -77,7 +109,7 @@ type Env = HashMap<String, Value>;
 
 /// An S-expression AST node with source position.
 #[derive(Debug, Clone)]
-enum Expr {
+pub(crate) enum Expr {
     Atom(String, Span),
     List(Vec<Expr>, Span),
 }
@@ -133,17 +165,32 @@ pub fn eval_str(input: &str) -> Result<String, EvalError> {
     }
     let exprs = parse_all(&tokens)?;
     let mut env = Env::new();
+    let mut output = String::new();
     let mut last = None;
     for expr in &exprs {
-        last = Some(eval::eval(expr, &mut env)?);
+        last = Some(eval::eval(expr, &mut env, &mut output)?);
     }
     Ok(last.expect("exprs is non-empty").to_string())
 }
 
 /// Evaluate Scheme expressions, returning both the result value and
 /// any output produced by `display`, `write`, or `newline`.
-pub fn eval_str_with_output(_input: &str) -> Result<(String, String), EvalError> {
-    todo!()
+pub fn eval_str_with_output(input: &str) -> Result<(String, String), EvalError> {
+    let tokens = tokenize(input);
+    if tokens.is_empty() {
+        return Err(EvalError::Parse {
+            message: "empty input".to_string(),
+        });
+    }
+    let exprs = parse_all(&tokens)?;
+    let mut env = Env::new();
+    let mut output = String::new();
+    let mut last = None;
+    for expr in &exprs {
+        last = Some(eval::eval(expr, &mut env, &mut output)?);
+    }
+    let result = last.expect("exprs is non-empty").to_string();
+    Ok((result, output))
 }
 
 #[cfg(test)]

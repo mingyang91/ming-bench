@@ -1,4 +1,4 @@
-use super::{atom_to_value, builtins, quote_expr, Env, EvalError, Expr, Span, Value};
+use super::{atom_to_value, builtins, quote_expr, DisplayValue, Env, EvalError, Expr, Span, Value};
 
 /// Extract an unbound variable name from an error (possibly wrapped in AtPosition).
 fn as_unbound_variable(err: &EvalError) -> Option<&str> {
@@ -22,13 +22,13 @@ fn with_span(span: Span, err: EvalError) -> EvalError {
 }
 
 /// Evaluate an expression in the given environment.
-pub fn eval(expr: &Expr, env: &mut Env) -> Result<Value, EvalError> {
+pub fn eval(expr: &Expr, env: &mut Env, out: &mut String) -> Result<Value, EvalError> {
     let span = expr.span();
-    eval_inner(expr, env).map_err(|e| with_span(span, e))
+    eval_inner(expr, env, out).map_err(|e| with_span(span, e))
 }
 
 /// Core evaluation logic (without position wrapping).
-fn eval_inner(expr: &Expr, env: &mut Env) -> Result<Value, EvalError> {
+fn eval_inner(expr: &Expr, env: &mut Env, out: &mut String) -> Result<Value, EvalError> {
     match expr {
         Expr::Atom(token, _) => {
             if token.starts_with('"')
@@ -45,12 +45,12 @@ fn eval_inner(expr: &Expr, env: &mut Env) -> Result<Value, EvalError> {
                 })
             }
         }
-        Expr::List(items, _) => eval_list(items, env),
+        Expr::List(items, _) => eval_list(items, env, out),
     }
 }
 
 /// Evaluate a list expression (function application or special form).
-fn eval_list(items: &[Expr], env: &mut Env) -> Result<Value, EvalError> {
+fn eval_list(items: &[Expr], env: &mut Env, out: &mut String) -> Result<Value, EvalError> {
     let [operator, args @ ..] = items else {
         return Err(EvalError::Parse {
             message: "empty list".to_string(),
@@ -59,26 +59,29 @@ fn eval_list(items: &[Expr], env: &mut Env) -> Result<Value, EvalError> {
     // Check for special forms (operator must be an atom)
     if let Expr::Atom(op, _) = operator {
         match op.as_str() {
-            "define" => return eval_define(args, env),
-            "if" => return eval_if(args, env),
+            "define" => return eval_define(args, env, out),
+            "if" => return eval_if(args, env, out),
             "quote" => return eval_quote(args),
-            "and" => return eval_and(args, env),
-            "or" => return eval_or(args, env),
+            "and" => return eval_and(args, env, out),
+            "or" => return eval_or(args, env, out),
             "lambda" => return eval_lambda(args, env),
-            "let" => return eval_let(args, env),
-            "begin" => return eval_body(args, env),
-            "cond" => return eval_cond(args, env),
+            "let" => return eval_let(args, env, out),
+            "begin" => return eval_body(args, env, out),
+            "cond" => return eval_cond(args, env, out),
+            "display" => return eval_display(args, env, out),
+            "write" => return eval_write(args, env, out),
+            "newline" => return eval_newline(args, out),
             _ => {}
         }
     }
     // General function application
     let evaluated: Vec<Value> = args
         .iter()
-        .map(|a| eval(a, env))
+        .map(|a| eval(a, env, out))
         .collect::<Result<_, _>>()?;
     // Try evaluating operator; fall back to builtin for atoms
-    match eval(operator, env) {
-        Ok(func) => apply_func(&func, &evaluated),
+    match eval(operator, env, out) {
+        Ok(func) => apply_func(&func, &evaluated, out),
         Err(ref e) if as_unbound_variable(e).is_some() => {
             apply_builtin(as_unbound_variable(e).expect("checked above"), &evaluated)
         }
@@ -121,9 +124,9 @@ fn apply_builtin(op: &str, args: &[Value]) -> Result<Value, EvalError> {
 }
 
 /// Apply a function value (lambda or builtin lookup).
-fn apply_func(func: &Value, args: &[Value]) -> Result<Value, EvalError> {
+fn apply_func(func: &Value, args: &[Value], out: &mut String) -> Result<Value, EvalError> {
     match func {
-        Value::Lambda { .. } => apply_lambda(func, args),
+        Value::Lambda { .. } => apply_lambda(func, args, out),
         Value::Symbol(name) => apply_builtin(name, args),
         other => Err(EvalError::TypeError {
             expected: "procedure".to_string(),
@@ -133,16 +136,16 @@ fn apply_func(func: &Value, args: &[Value]) -> Result<Value, EvalError> {
 }
 
 /// Evaluate a sequence of body expressions, returning the last result.
-fn eval_body(body: &[Expr], env: &mut Env) -> Result<Value, EvalError> {
+fn eval_body(body: &[Expr], env: &mut Env, out: &mut String) -> Result<Value, EvalError> {
     let mut result = Value::Nil;
     for expr in body {
-        result = eval(expr, env)?;
+        result = eval(expr, env, out)?;
     }
     Ok(result)
 }
 
 /// Apply a lambda closure to arguments.
-fn apply_lambda(func: &Value, args: &[Value]) -> Result<Value, EvalError> {
+fn apply_lambda(func: &Value, args: &[Value], out: &mut String) -> Result<Value, EvalError> {
     let Value::Lambda {
         name,
         params,
@@ -166,7 +169,7 @@ fn apply_lambda(func: &Value, args: &[Value]) -> Result<Value, EvalError> {
     for (param, arg) in params.iter().zip(args) {
         local_env.insert(param.clone(), arg.clone());
     }
-    eval_body(body, &mut local_env)
+    eval_body(body, &mut local_env, out)
 }
 
 /// Evaluate `(lambda (params...) body...)`.
@@ -204,7 +207,7 @@ fn eval_lambda(args: &[Expr], env: &Env) -> Result<Value, EvalError> {
 }
 
 /// Evaluate `(define name value)` or `(define (name params...) body...)`.
-fn eval_define(args: &[Expr], env: &mut Env) -> Result<Value, EvalError> {
+fn eval_define(args: &[Expr], env: &mut Env, out: &mut String) -> Result<Value, EvalError> {
     let [target, body @ ..] = args else {
         return Err(EvalError::Parse {
             message: "define requires a name and a value".to_string(),
@@ -222,7 +225,7 @@ fn eval_define(args: &[Expr], env: &mut Env) -> Result<Value, EvalError> {
                     message: "define variable form takes exactly one value".to_string(),
                 });
             };
-            let val = eval(value_expr, env)?;
+            let val = eval(value_expr, env, out)?;
             env.insert(name.clone(), val.clone());
             Ok(val)
         }
@@ -254,7 +257,7 @@ fn eval_define(args: &[Expr], env: &mut Env) -> Result<Value, EvalError> {
 }
 
 /// Evaluate `(if cond then else)`.
-fn eval_if(args: &[Expr], env: &mut Env) -> Result<Value, EvalError> {
+fn eval_if(args: &[Expr], env: &mut Env, out: &mut String) -> Result<Value, EvalError> {
     let (cond, then_expr, else_expr) = match args {
         [c, t, e] => (c, t, Some(e)),
         [c, t] => (c, t, None),
@@ -264,11 +267,11 @@ fn eval_if(args: &[Expr], env: &mut Env) -> Result<Value, EvalError> {
             })
         }
     };
-    let cond_val = eval(cond, env)?;
+    let cond_val = eval(cond, env, out)?;
     if cond_val != Value::Boolean(false) {
-        eval(then_expr, env)
+        eval(then_expr, env, out)
     } else if let Some(e) = else_expr {
-        eval(e, env)
+        eval(e, env, out)
     } else {
         Ok(Value::Nil)
     }
@@ -285,10 +288,10 @@ fn eval_quote(args: &[Expr]) -> Result<Value, EvalError> {
 }
 
 /// Short-circuit `and`: returns last truthy value, or first falsy value.
-fn eval_and(args: &[Expr], env: &mut Env) -> Result<Value, EvalError> {
+fn eval_and(args: &[Expr], env: &mut Env, out: &mut String) -> Result<Value, EvalError> {
     let mut result = Value::Boolean(true);
     for arg in args {
-        result = eval(arg, env)?;
+        result = eval(arg, env, out)?;
         if result == Value::Boolean(false) {
             return Ok(result);
         }
@@ -297,7 +300,7 @@ fn eval_and(args: &[Expr], env: &mut Env) -> Result<Value, EvalError> {
 }
 
 /// Evaluate `(let ((var val) ...) body...)`.
-fn eval_let(args: &[Expr], env: &mut Env) -> Result<Value, EvalError> {
+fn eval_let(args: &[Expr], env: &mut Env, out: &mut String) -> Result<Value, EvalError> {
     let [bindings_expr, body @ ..] = args else {
         return Err(EvalError::Parse {
             message: "let requires bindings and body".to_string(),
@@ -327,7 +330,7 @@ fn eval_let(args: &[Expr], env: &mut Env) -> Result<Value, EvalError> {
                     message: "let binding must be (name value)".to_string(),
                 });
             };
-            let val = eval(val_expr, env)?;
+            let val = eval(val_expr, env, out)?;
             Ok((name.clone(), val))
         })
         .collect::<Result<_, _>>()?;
@@ -335,11 +338,11 @@ fn eval_let(args: &[Expr], env: &mut Env) -> Result<Value, EvalError> {
     for (name, val) in pairs {
         local_env.insert(name, val);
     }
-    eval_body(body, &mut local_env)
+    eval_body(body, &mut local_env, out)
 }
 
 /// Evaluate `(cond (test expr) ... (else expr))`.
-fn eval_cond(args: &[Expr], env: &mut Env) -> Result<Value, EvalError> {
+fn eval_cond(args: &[Expr], env: &mut Env, out: &mut String) -> Result<Value, EvalError> {
     for clause in args {
         let Expr::List(parts, _) = clause else {
             return Err(EvalError::Parse {
@@ -353,24 +356,64 @@ fn eval_cond(args: &[Expr], env: &mut Env) -> Result<Value, EvalError> {
         };
         // Check for else clause
         if matches!(test_expr, Expr::Atom(s, _) if s == "else") {
-            return eval_body(body, env);
+            return eval_body(body, env, out);
         }
-        let test_val = eval(test_expr, env)?;
+        let test_val = eval(test_expr, env, out)?;
         if test_val != Value::Boolean(false) {
-            return eval_body(body, env);
+            return eval_body(body, env, out);
         }
     }
     Ok(Value::Nil)
 }
 
 /// Short-circuit `or`: returns first truthy value, or last falsy value.
-fn eval_or(args: &[Expr], env: &mut Env) -> Result<Value, EvalError> {
+fn eval_or(args: &[Expr], env: &mut Env, out: &mut String) -> Result<Value, EvalError> {
     let mut result = Value::Boolean(false);
     for arg in args {
-        result = eval(arg, env)?;
+        result = eval(arg, env, out)?;
         if result != Value::Boolean(false) {
             return Ok(result);
         }
     }
     Ok(result)
+}
+
+/// Evaluate `(display expr)` — prints value without quotes on strings.
+fn eval_display(args: &[Expr], env: &mut Env, out: &mut String) -> Result<Value, EvalError> {
+    let [expr] = args else {
+        return Err(EvalError::WrongArgCount {
+            expected: 1,
+            got: args.len(),
+        });
+    };
+    let val = eval(expr, env, out)?;
+    use std::fmt::Write;
+    write!(out, "{}", DisplayValue(&val)).expect("write to String cannot fail");
+    Ok(Value::Nil)
+}
+
+/// Evaluate `(write expr)` — prints value with quotes on strings.
+fn eval_write(args: &[Expr], env: &mut Env, out: &mut String) -> Result<Value, EvalError> {
+    let [expr] = args else {
+        return Err(EvalError::WrongArgCount {
+            expected: 1,
+            got: args.len(),
+        });
+    };
+    let val = eval(expr, env, out)?;
+    use std::fmt::Write;
+    write!(out, "{val}").expect("write to String cannot fail");
+    Ok(Value::Nil)
+}
+
+/// Evaluate `(newline)` — prints a newline character.
+fn eval_newline(args: &[Expr], out: &mut String) -> Result<Value, EvalError> {
+    if !args.is_empty() {
+        return Err(EvalError::WrongArgCount {
+            expected: 0,
+            got: args.len(),
+        });
+    }
+    out.push('\n');
+    Ok(Value::Nil)
 }
