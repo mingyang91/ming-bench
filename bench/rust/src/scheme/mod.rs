@@ -46,6 +46,7 @@ enum Builtin {
     Expt,
     Apply,
     CallCc,
+    DynamicWind,
     Eq,
     Eqv,
     EqualDeep,
@@ -60,6 +61,7 @@ enum Builtin {
     Cdr,
     IsNull,
     List,
+    Reverse,
     Map,
     ListRef,
     ListTail,
@@ -129,6 +131,7 @@ const BUILTIN_BINDINGS: &[(&str, Builtin)] = &[
     ("expt", Builtin::Expt),
     ("apply", Builtin::Apply),
     ("call/cc", Builtin::CallCc),
+    ("dynamic-wind", Builtin::DynamicWind),
     ("eq?", Builtin::Eq),
     ("eqv?", Builtin::Eqv),
     ("equal?", Builtin::EqualDeep),
@@ -143,6 +146,7 @@ const BUILTIN_BINDINGS: &[(&str, Builtin)] = &[
     ("cdr", Builtin::Cdr),
     ("null?", Builtin::IsNull),
     ("list", Builtin::List),
+    ("reverse", Builtin::Reverse),
     ("map", Builtin::Map),
     ("list-ref", Builtin::ListRef),
     ("list-tail", Builtin::ListTail),
@@ -286,6 +290,34 @@ impl SchemeVector {
 #[derive(Clone, Debug)]
 struct SchemePair(Rc<PairValue>);
 
+type WindFrameRef = Rc<DynamicWindFrame>;
+
+#[derive(Clone, Debug)]
+struct DynamicWindFrame {
+    before: Value,
+    after: Value,
+    pos: SourcePos,
+    output: Rc<RefCell<String>>,
+}
+
+#[derive(Clone, Debug)]
+struct CapturedContinuation {
+    cont: Rc<Continuation>,
+    winds: Vec<WindFrameRef>,
+}
+
+#[derive(Clone, Copy, Debug)]
+enum WindAction {
+    Enter,
+    Exit,
+}
+
+#[derive(Clone, Debug)]
+struct WindStep {
+    action: WindAction,
+    frame: WindFrameRef,
+}
+
 #[derive(Clone, Debug)]
 enum Value {
     Int(i64),
@@ -298,7 +330,7 @@ enum Value {
     Vector(SchemeVector),
     Builtin(Builtin),
     Procedure(Rc<Procedure>),
-    Continuation(Rc<Continuation>),
+    Continuation(Rc<CapturedContinuation>),
     Uninitialized(String),
     Void,
 }
@@ -344,6 +376,25 @@ enum Continuation {
         normal: Rc<Continuation>,
         suspend: Rc<Continuation>,
         suspend_on_void: bool,
+    },
+    DynamicWindAfterIn {
+        frame: WindFrameRef,
+        body: Value,
+        next: Rc<Continuation>,
+    },
+    DynamicWindAfterBody {
+        frame: WindFrameRef,
+        next: Rc<Continuation>,
+    },
+    DynamicWindAfterOut {
+        result: Value,
+        next: Rc<Continuation>,
+    },
+    WindStepDone {
+        steps: Rc<Vec<WindStep>>,
+        index: usize,
+        final_value: Value,
+        final_cont: Rc<Continuation>,
     },
     If {
         consequent: Expr,
@@ -542,6 +593,104 @@ impl Environment {
     }
 }
 
+thread_local! {
+    static DYNAMIC_WIND_STACK: RefCell<Vec<WindFrameRef>> = RefCell::new(Vec::new());
+}
+
+fn reset_dynamic_wind_stack() {
+    DYNAMIC_WIND_STACK.with(|stack| stack.borrow_mut().clear());
+}
+
+fn current_dynamic_wind_stack() -> Vec<WindFrameRef> {
+    DYNAMIC_WIND_STACK.with(|stack| stack.borrow().clone())
+}
+
+fn push_dynamic_wind_frame(frame: WindFrameRef) {
+    DYNAMIC_WIND_STACK.with(|stack| stack.borrow_mut().push(frame));
+}
+
+fn pop_dynamic_wind_frame(expected: &WindFrameRef) {
+    DYNAMIC_WIND_STACK.with(|stack| {
+        let popped = stack
+            .borrow_mut()
+            .pop()
+            .expect("dynamic-wind stack underflow");
+        debug_assert!(Rc::ptr_eq(&popped, expected));
+    });
+}
+
+fn common_dynamic_wind_prefix_len(current: &[WindFrameRef], target: &[WindFrameRef]) -> usize {
+    current
+        .iter()
+        .zip(target.iter())
+        .take_while(|(left, right)| Rc::ptr_eq(left, right))
+        .count()
+}
+
+fn continue_wind_transition(
+    steps: Rc<Vec<WindStep>>,
+    index: usize,
+    final_value: Value,
+    final_cont: Rc<Continuation>,
+) -> Result<MachineState, EvalError> {
+    let Some(step) = steps.get(index) else {
+        return Ok(MachineState::Return {
+            value: final_value,
+            cont: final_cont,
+        });
+    };
+
+    match step.action {
+        WindAction::Exit => {
+            pop_dynamic_wind_frame(&step.frame);
+            dispatch_apply(
+                step.frame.after.clone(),
+                Vec::new(),
+                step.frame.pos,
+                step.frame.output.clone(),
+                Rc::new(Continuation::WindStepDone {
+                    steps,
+                    index,
+                    final_value,
+                    final_cont,
+                }),
+            )
+        }
+        WindAction::Enter => dispatch_apply(
+            step.frame.before.clone(),
+            Vec::new(),
+            step.frame.pos,
+            step.frame.output.clone(),
+            Rc::new(Continuation::WindStepDone {
+                steps,
+                index,
+                final_value,
+                final_cont,
+            }),
+        ),
+    }
+}
+
+fn invoke_captured_continuation(
+    saved: Rc<CapturedContinuation>,
+    value: Value,
+) -> Result<MachineState, EvalError> {
+    let current_winds = current_dynamic_wind_stack();
+    let shared = common_dynamic_wind_prefix_len(current_winds.as_slice(), saved.winds.as_slice());
+    let mut steps = Vec::with_capacity(current_winds.len() + saved.winds.len() - (shared * 2));
+
+    steps.extend(current_winds[shared..].iter().rev().cloned().map(|frame| WindStep {
+        action: WindAction::Exit,
+        frame,
+    }));
+    steps.extend(saved.winds[shared..].iter().cloned().map(|frame| WindStep {
+        action: WindAction::Enter,
+        frame,
+    }));
+
+    continue_wind_transition(Rc::new(steps), 0, value, saved.cont.clone())
+}
+
 struct Parser<'a> {
     input: &'a str,
     offset: usize,
@@ -681,8 +830,20 @@ impl<'a> Parser<'a> {
     }
 
     fn skip_whitespace(&mut self) {
-        while matches!(self.peek_char(), Some(ch) if ch.is_whitespace()) {
-            self.advance_char();
+        loop {
+            while matches!(self.peek_char(), Some(ch) if ch.is_whitespace()) {
+                self.advance_char();
+            }
+
+            if self.peek_char() != Some(';') {
+                break;
+            }
+
+            while let Some(ch) = self.advance_char() {
+                if ch == '\n' {
+                    break;
+                }
+            }
         }
     }
 
@@ -989,15 +1150,20 @@ fn eval_expr(expr: &Expr, env: &EnvRef) -> Result<Value, EvalError> {
 }
 
 fn run_machine(mut state: MachineState) -> Result<Value, EvalError> {
-    loop {
-        state = match state {
-            MachineState::Eval { expr, env, cont } => eval_expr_state(expr, env, cont)?,
-            MachineState::Return { value, cont } => match cont.as_ref() {
-                Continuation::Halt => return Ok(value),
-                _ => continue_with_value(value, cont)?,
-            },
-        };
-    }
+    reset_dynamic_wind_stack();
+    let result = (|| {
+        loop {
+            state = match state {
+                MachineState::Eval { expr, env, cont } => eval_expr_state(expr, env, cont)?,
+                MachineState::Return { value, cont } => match cont.as_ref() {
+                    Continuation::Halt => return Ok(value),
+                    _ => continue_with_value(value, cont)?,
+                },
+            };
+        }
+    })();
+    reset_dynamic_wind_stack();
+    result
 }
 
 fn eval_expr_state(
@@ -1627,6 +1793,52 @@ fn continue_with_value(value: Value, cont: Rc<Continuation>) -> Result<MachineSt
                 },
             })
         }
+        Continuation::DynamicWindAfterIn { frame, body, next } => {
+            push_dynamic_wind_frame(frame.clone());
+            dispatch_apply(
+                body.clone(),
+                Vec::new(),
+                frame.pos,
+                frame.output.clone(),
+                Rc::new(Continuation::DynamicWindAfterBody {
+                    frame: frame.clone(),
+                    next: next.clone(),
+                }),
+            )
+        }
+        Continuation::DynamicWindAfterBody { frame, next } => {
+            pop_dynamic_wind_frame(frame);
+            dispatch_apply(
+                frame.after.clone(),
+                Vec::new(),
+                frame.pos,
+                frame.output.clone(),
+                Rc::new(Continuation::DynamicWindAfterOut {
+                    result: value,
+                    next: next.clone(),
+                }),
+            )
+        }
+        Continuation::DynamicWindAfterOut { result, next } => Ok(MachineState::Return {
+            value: result.clone(),
+            cont: next.clone(),
+        }),
+        Continuation::WindStepDone {
+            steps,
+            index,
+            final_value,
+            final_cont,
+        } => {
+            if matches!(steps[*index].action, WindAction::Enter) {
+                push_dynamic_wind_frame(steps[*index].frame.clone());
+            }
+            continue_wind_transition(
+                steps.clone(),
+                *index + 1,
+                final_value.clone(),
+                final_cont.clone(),
+            )
+        }
         Continuation::If {
             consequent,
             alternate,
@@ -1964,10 +2176,10 @@ fn dispatch_apply(
                 return Err(wrong_arity(pos, "procedure", "exactly 1", args.len()));
             }
 
-            Ok(MachineState::Return {
-                value: args.into_iter().next().expect("continuation arity checked"),
-                cont: saved,
-            })
+            invoke_captured_continuation(
+                saved,
+                args.into_iter().next().expect("continuation arity checked"),
+            )
         }
         other => Err(not_callable(pos, other.type_name())),
     }
@@ -2022,13 +2234,39 @@ fn apply_builtin_state(
 
             return dispatch_apply(
                 procedure.clone(),
-                vec![Value::Continuation(cont.clone())],
+                vec![Value::Continuation(Rc::new(CapturedContinuation {
+                    cont: cont.clone(),
+                    winds: current_dynamic_wind_stack(),
+                }))],
                 pos,
                 output,
                 Rc::new(Continuation::CallCcReturn {
                     normal: cont,
                     suspend,
                     suspend_on_void,
+                }),
+            );
+        }
+        Builtin::DynamicWind => {
+            let [before, body, after] = args.as_slice() else {
+                return Err(wrong_arity(pos, "dynamic-wind", "exactly 3", args.len()));
+            };
+            let frame = Rc::new(DynamicWindFrame {
+                before: before.clone(),
+                after: after.clone(),
+                pos,
+                output: output.clone(),
+            });
+
+            return dispatch_apply(
+                before.clone(),
+                Vec::new(),
+                pos,
+                output,
+                Rc::new(Continuation::DynamicWindAfterIn {
+                    frame,
+                    body: body.clone(),
+                    next: cont,
                 }),
             );
         }
@@ -2046,6 +2284,7 @@ fn apply_builtin_state(
         Builtin::Cdr => Some(eval_cdr(&args, pos)?),
         Builtin::IsNull => Some(eval_null(&args, pos)?),
         Builtin::List => Some(eval_list_builtin(&args, pos)?),
+        Builtin::Reverse => Some(eval_reverse(&args, pos)?),
         Builtin::Map => {
             let [procedure, list_args @ ..] = args.as_slice() else {
                 return Err(wrong_arity(pos, "map", "at least 2", args.len()));
@@ -2280,6 +2519,9 @@ fn enclosing_procedure_cont(cont: &Rc<Continuation>) -> Option<Rc<Continuation>>
         Continuation::Halt => None,
         Continuation::DefineValue { next, .. }
         | Continuation::SetValue { next, .. }
+        | Continuation::DynamicWindAfterIn { next, .. }
+        | Continuation::DynamicWindAfterBody { next, .. }
+        | Continuation::DynamicWindAfterOut { next, .. }
         | Continuation::If { next, .. }
         | Continuation::Sequence { next, .. }
         | Continuation::And { next, .. }
@@ -2294,6 +2536,7 @@ fn enclosing_procedure_cont(cont: &Rc<Continuation>) -> Option<Rc<Continuation>>
         | Continuation::Map { next, .. } => enclosing_procedure_cont(next),
         Continuation::ProcedureReturn { next } => Some(next.clone()),
         Continuation::CallCcReturn { normal, .. } => enclosing_procedure_cont(normal),
+        Continuation::WindStepDone { final_cont, .. } => enclosing_procedure_cont(final_cont),
     }
 }
 
@@ -2668,6 +2911,16 @@ fn eval_null(args: &[Value], pos: SourcePos) -> Result<Value, EvalError> {
 
 fn eval_list_builtin(args: &[Value], _pos: SourcePos) -> Result<Value, EvalError> {
     Ok(Value::List(args.to_vec()))
+}
+
+fn eval_reverse(args: &[Value], pos: SourcePos) -> Result<Value, EvalError> {
+    let [value] = args else {
+        return Err(wrong_arity(pos, "reverse", "exactly 1", args.len()));
+    };
+
+    let mut items = proper_list_to_vec(value).ok_or_else(|| type_error(pos, "list", value.type_name()))?;
+    items.reverse();
+    Ok(Value::List(items))
 }
 
 fn eval_list_ref(args: &[Value], pos: SourcePos) -> Result<Value, EvalError> {
