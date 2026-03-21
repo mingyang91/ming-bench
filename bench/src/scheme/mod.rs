@@ -8,6 +8,8 @@ enum Value {
     Integer(i64),
     Boolean(bool),
     Str(String),
+    Symbol(String),
+    List(Vec<Value>),
 }
 
 impl Value {
@@ -17,6 +19,11 @@ impl Value {
             Value::Boolean(true) => "#t".to_string(),
             Value::Boolean(false) => "#f".to_string(),
             Value::Str(s) => format!("\"{}\"", s),
+            Value::Symbol(s) => s.clone(),
+            Value::List(elems) => {
+                let inner: Vec<String> = elems.iter().map(|v| v.display()).collect();
+                format!("({})", inner.join(" "))
+            }
         }
     }
 }
@@ -121,7 +128,25 @@ fn parse(tokens: &[String], pos: usize) -> Result<(Value, usize), EvalError> {
         return Ok((Value::Integer(n), pos + 1));
     }
 
-    Err(EvalError::Parse(format!("unexpected token: {}", token)))
+    // List
+    if token == "(" {
+        let mut elems = Vec::new();
+        let mut p = pos + 1;
+        loop {
+            if p >= tokens.len() {
+                return Err(EvalError::Parse("unclosed parenthesis".to_string()));
+            }
+            if tokens[p] == ")" {
+                return Ok((Value::List(elems), p + 1));
+            }
+            let (val, next) = parse(tokens, p)?;
+            elems.push(val);
+            p = next;
+        }
+    }
+
+    // Symbol
+    Ok((Value::Symbol(token.clone()), pos + 1))
 }
 
 /// Parse all expressions from input.
@@ -150,9 +175,88 @@ pub fn eval_str(input: &str) -> Result<String, EvalError> {
     if exprs.is_empty() {
         return Err(EvalError::Parse("empty input".to_string()));
     }
-    // For level 1, atoms are self-evaluating
-    let last = exprs.last().unwrap();
-    Ok(last.display())
+    let mut result = Value::Boolean(false);
+    for expr in exprs {
+        result = eval(expr)?;
+    }
+    Ok(result.display())
+}
+
+fn eval(expr: Value) -> Result<Value, EvalError> {
+    match expr {
+        Value::Integer(_) | Value::Boolean(_) | Value::Str(_) => Ok(expr),
+        Value::Symbol(s) => Err(EvalError::Runtime(format!("unbound symbol: {}", s))),
+        Value::List(elems) => {
+            if elems.is_empty() {
+                return Err(EvalError::Runtime("empty application".to_string()));
+            }
+            let first = &elems[0];
+            match first {
+                Value::Symbol(op) => apply_builtin(op, &elems[1..]),
+                _ => Err(EvalError::Runtime("not a procedure".to_string())),
+            }
+        }
+    }
+}
+
+fn apply_builtin(op: &str, args: &[Value]) -> Result<Value, EvalError> {
+    // Evaluate all arguments first
+    let mut vals = Vec::with_capacity(args.len());
+    for arg in args {
+        vals.push(eval(arg.clone())?);
+    }
+
+    match op {
+        "+" => {
+            let mut sum: i64 = 0;
+            for v in &vals {
+                sum += expect_int(v)?;
+            }
+            Ok(Value::Integer(sum))
+        }
+        "-" => {
+            if vals.is_empty() {
+                return Err(EvalError::Runtime("- requires at least 1 argument".to_string()));
+            }
+            if vals.len() == 1 {
+                return Ok(Value::Integer(-expect_int(&vals[0])?));
+            }
+            let mut result = expect_int(&vals[0])?;
+            for v in &vals[1..] {
+                result -= expect_int(v)?;
+            }
+            Ok(Value::Integer(result))
+        }
+        "*" => {
+            let mut product: i64 = 1;
+            for v in &vals {
+                product *= expect_int(v)?;
+            }
+            Ok(Value::Integer(product))
+        }
+        "/" => {
+            if vals.is_empty() {
+                return Err(EvalError::Runtime("/ requires at least 1 argument".to_string()));
+            }
+            let mut result = expect_int(&vals[0])?;
+            for v in &vals[1..] {
+                let d = expect_int(v)?;
+                if d == 0 {
+                    return Err(EvalError::Runtime("division by zero".to_string()));
+                }
+                result /= d;
+            }
+            Ok(Value::Integer(result))
+        }
+        _ => Err(EvalError::Runtime(format!("unknown procedure: {}", op))),
+    }
+}
+
+fn expect_int(v: &Value) -> Result<i64, EvalError> {
+    match v {
+        Value::Integer(n) => Ok(*n),
+        _ => Err(EvalError::Runtime("expected integer".to_string())),
+    }
 }
 
 /// Evaluate Scheme expressions, returning both the result value and
