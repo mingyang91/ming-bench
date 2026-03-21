@@ -16,7 +16,9 @@ object Evaluator:
   def evalStrWithOutput(input: String): (String, String) =
     val exprs = Parser.parse(input)
     if exprs.isEmpty then throw new EvalError("no expressions")
-    val env                  = Builtins.defaultEnv.define("__callcc_replay__", Value.NilVal)
+    val env = Builtins.defaultEnv
+      .define("__callcc_replay__", Value.NilVal)
+      .define("__wind_stack__", Value.NilVal)
     val (lastVal, _, output) = evalTopLevel(exprs, env, "")
     (lastVal.display, output)
 
@@ -47,20 +49,25 @@ object Evaluator:
           case ci: ContinuationInvoked =>
             Continuations.resumeContinuation(ci)
       case head :: tail =>
-        try
-          val (_, newEnv, out2) = eval(head, env, out)
-          val nextEnv = head match
-            case Value.PairVal(Value.Symbol("define", _), _, _) =>
-              patchClosures(newEnv)
-            case Value.PairVal(Value.Symbol("define-syntax", _), _, _) =>
-              newEnv
-            case _ => env
-          evalAll(tail, nextEnv, out2)
-        catch
-          case setup: CallCCSetup =>
-            Continuations.replayCallCC(setup, head, tail, env, out)
-          case ci: ContinuationInvoked =>
-            Continuations.resumeContinuation(ci)
+        val headEval: Either[(Value, Env, String), (Value, Env, String)] =
+          try Right(eval(head, env, out))
+          catch
+            case setup: CallCCSetup =>
+              Left(Continuations.replayCallCC(setup, head, tail, env, out))
+            case ci: ContinuationInvoked =>
+              val resumed = Continuations.resumeContinuation(ci)
+              if ci.bodyLevel then Left(evalAll(tail, env, resumed._3))
+              else Left(resumed)
+        headEval match
+          case Left(result) => result
+          case Right((_, newEnv, out2)) =>
+            val nextEnv = head match
+              case Value.PairVal(Value.Symbol("define", _), _, _) =>
+                patchClosures(newEnv)
+              case Value.PairVal(Value.Symbol("define-syntax", _), _, _) =>
+                newEnv
+              case _ => env
+            evalAll(tail, nextEnv, out2)
 
   /** Tie-the-knot: update named lambdas' closures so they can see all current bindings (enables mutual recursion at top
     * level).
@@ -186,6 +193,8 @@ object Evaluator:
         Done(Value.VoidVal, env, out + "\n")
       case Value.Symbol("call/cc" | "call-with-current-continuation", _) =>
         Continuations.handleCallCCForm(args, env, out)
+      case Value.Symbol("dynamic-wind", _) =>
+        DynamicWind.evalDynamicWind(args, env, out)
       case Value.Symbol("define-syntax", _) =>
         Continuations.handleDefineSyntax(args, env, pos, out)
       case _ =>
@@ -248,7 +257,8 @@ object Evaluator:
           cv.remaining,
           cv.envThunk,
           cv.capturedOut,
-          cv.bodyLevel
+          cv.bodyLevel,
+          cv.windEntries
         )
       case Value.Symbol("call/cc" | "call-with-current-continuation", _) =>
         if args.length != 1 then throw EvalError.withPos("call/cc requires 1 argument", pos)

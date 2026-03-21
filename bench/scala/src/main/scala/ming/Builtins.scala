@@ -106,6 +106,7 @@ object Builtins:
       case "vector?"          => typePred(args, _.isInstanceOf[Value.VectorVal])
       case "vector->list"     => VectorBuiltins.evalVectorToList(args)
       case "list->vector"     => VectorBuiltins.evalListToVector(args)
+      case "reverse"          => evalReverse(args)
       case _                  => throw new EvalError(s"unknown procedure: $name")
 
   private def typePred(
@@ -159,6 +160,17 @@ object Builtins:
     case Value.NilVal           => true
     case Value.PairVal(_, t, _) => isProperList(t)
     case _                      => false
+
+  private def evalReverse(args: List[Value]): Value =
+    args match
+      case lst :: Nil => reverseList(lst, Value.NilVal)
+      case _          => throw new EvalError("reverse requires exactly 1 argument")
+
+  @scala.annotation.tailrec
+  private def reverseList(lst: Value, acc: Value): Value = lst match
+    case Value.NilVal               => acc
+    case Value.PairVal(car, cdr, _) => reverseList(cdr, Value.PairVal(car, acc))
+    case _                          => throw new EvalError("reverse: not a proper list")
 
   private def evalAssoc(args: List[Value]): Value =
     args match
@@ -257,3 +269,5 @@ object Builtins:
     .define("apply", Value.Symbol("apply"))
     .define("call/cc", Value.Symbol("call/cc"))
     .define("call-with-current-continuation", Value.Symbol("call/cc"))
+    .define("dynamic-wind", Value.Symbol("dynamic-wind"))
+    .define("reverse", Value.Symbol("reverse"))

@@ -25,7 +25,8 @@ enum Value:
     remaining: List[Value],
     envThunk: () => Env,
     capturedOut: String,
-    bodyLevel: Boolean = false
+    bodyLevel: Boolean = false,
+    windEntries: List[(Value, Value)] = Nil
   )
 
   case MacroVal(

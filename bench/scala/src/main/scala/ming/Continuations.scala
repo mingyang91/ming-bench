@@ -28,9 +28,10 @@ object Continuations:
     env: Env,
     out: String
   ): (Value, Env, String) =
-    val tag       = new Object()
-    val remaining = currentExpr :: remainingExprs
-    val cont      = Value.ContinuationVal(tag, remaining, () => env, out)
+    val tag         = new Object()
+    val remaining   = currentExpr :: remainingExprs
+    val windEntries = DynamicWind.windStackToEntries(DynamicWind.lookupWindStack(env))
+    val cont        = Value.ContinuationVal(tag, remaining, () => env, out, windEntries = windEntries)
     val callccResult: Value =
       try
         Evaluator.applyProcTail(setup.proc, List(cont), setup.pos, setup.output) match
@@ -45,12 +46,15 @@ object Continuations:
     ci: ContinuationInvoked
   ): (Value, Env, String) =
     val env = ci.envThunk()
-    env.set("__callcc_replay__", Value.PairVal(ci.value, Value.NilVal), None)
-    if ci.bodyLevel then
-      Evaluator.evalBodyTail(ci.remaining, env, ci.capturedOut, replayMode = true) match
-        case Done(v, e, o)       => (v, e, o)
-        case Bounce(e2, env2, o) => Evaluator.eval(e2, env2, o)
-    else Evaluator.evalAll(ci.remaining, env, ci.capturedOut)
+    def doResume(out: String): (Value, Env, String) =
+      env.set("__callcc_replay__", Value.PairVal(ci.value, Value.NilVal), None)
+      if ci.bodyLevel then
+        Evaluator.evalBodyTail(ci.remaining, env, out, replayMode = true) match
+          case Done(v, e, o)       => (v, e, o)
+          case Bounce(e2, env2, o) => Evaluator.eval(e2, env2, o)
+      else Evaluator.evalAll(ci.remaining, env, out)
+    if ci.windEntries.nonEmpty then DynamicWind.withRewind(ci.windEntries.reverse, env, ci.capturedOut, doResume)
+    else doResume(ci.capturedOut)
 
   /** Check if an expression is a call/cc form. */
   private[ming] def isCallCCForm(v: Value): Boolean = v match
@@ -97,8 +101,9 @@ object Continuations:
     val (proc, _, out2) = Evaluator.eval(args.head, env, out)
     val tag             = new Object()
     val remaining       = head :: tail
+    val windEntries     = DynamicWind.windStackToEntries(DynamicWind.lookupWindStack(env))
     val cont =
-      Value.ContinuationVal(tag, remaining, () => env, out, bodyLevel = true)
+      Value.ContinuationVal(tag, remaining, () => env, out, bodyLevel = true, windEntries = windEntries)
     val callccResult: Value =
       try
         Evaluator.applyProcTail(proc, List(cont), None, out2) match
