@@ -3,6 +3,7 @@ use std::rc::Rc;
 
 use crate::scheme::env::Env;
 use crate::scheme::error::{EvalError, Span};
+use crate::scheme::number::{float_to_exact, Num};
 use crate::scheme::value::{BodyContinuation, ContinuationData, Value};
 
 /// Check if a name is a builtin procedure.
@@ -86,6 +87,14 @@ fn is_builtin(name: &str) -> bool {
             | "raise"
             | "values"
             | "call-with-values"
+            | "exact?"
+            | "inexact?"
+            | "exact->inexact"
+            | "inexact->exact"
+            | "numerator"
+            | "denominator"
+            | "rational?"
+            | "integer?"
     )
 }
 
@@ -151,7 +160,8 @@ pub fn eval(
 
     loop {
         match &cur_expr {
-            Value::Integer(_) | Value::Boolean(_) | Value::String(_) | Value::Char(_) => {
+            Value::Integer(_) | Value::Rational(..) | Value::Float(_)
+            | Value::Boolean(_) | Value::String(_) | Value::Char(_) => {
                 return Ok(cur_expr);
             }
             Value::Symbol(name) => {
@@ -1038,8 +1048,8 @@ fn apply_builtin(
     ctx: &EvalContext,
 ) -> Result<Value, EvalError> {
     match name {
-        "+" => arith_variadic(args, 0, |a, b| Ok(a + b), span),
-        "*" => arith_variadic(args, 1, |a, b| Ok(a * b), span),
+        "+" => arith_add(args, span),
+        "*" => arith_mul(args, span),
         "-" => eval_sub(args, span),
         "/" => eval_div(args, span),
         "<" => compare_op(args, |a, b| a < b, span),
@@ -1061,7 +1071,72 @@ fn apply_builtin(
             apply_list_builtin(name, args, span)
         }
         "string?" => Ok(Value::Boolean(matches!(args, [Value::String(_)]))),
-        "number?" => Ok(Value::Boolean(matches!(args, [Value::Integer(_)]))),
+        "number?" => Ok(Value::Boolean(matches!(
+            args,
+            [Value::Integer(_) | Value::Rational(..) | Value::Float(_)]
+        ))),
+        "integer?" => Ok(Value::Boolean(matches!(args, [Value::Integer(_)]))),
+        "rational?" => Ok(Value::Boolean(matches!(
+            args,
+            [Value::Integer(_) | Value::Rational(..)]
+        ))),
+        "exact?" => {
+            let [arg] = args else {
+                return Err(EvalError::WrongArgCount { expected: 1, got: args.len(), span });
+            };
+            Ok(Value::Boolean(matches!(arg, Value::Integer(_) | Value::Rational(..))))
+        }
+        "inexact?" => {
+            let [arg] = args else {
+                return Err(EvalError::WrongArgCount { expected: 1, got: args.len(), span });
+            };
+            Ok(Value::Boolean(matches!(arg, Value::Float(_))))
+        }
+        "exact->inexact" => {
+            let [arg] = args else {
+                return Err(EvalError::WrongArgCount { expected: 1, got: args.len(), span });
+            };
+            Ok(Value::Float(require_number(arg, span)?.to_f64()))
+        }
+        "inexact->exact" => {
+            let [arg] = args else {
+                return Err(EvalError::WrongArgCount { expected: 1, got: args.len(), span });
+            };
+            match arg {
+                Value::Integer(_) | Value::Rational(..) => Ok(arg.clone()),
+                Value::Float(f) => Ok(float_to_exact(*f).to_value()),
+                other => Err(EvalError::TypeError {
+                    message: format!("expected number, got {other}"),
+                    span,
+                }),
+            }
+        }
+        "numerator" => {
+            let [arg] = args else {
+                return Err(EvalError::WrongArgCount { expected: 1, got: args.len(), span });
+            };
+            match arg {
+                Value::Integer(n) => Ok(Value::Integer(*n)),
+                Value::Rational(n, _) => Ok(Value::Integer(*n)),
+                other => Err(EvalError::TypeError {
+                    message: format!("expected rational, got {other}"),
+                    span,
+                }),
+            }
+        }
+        "denominator" => {
+            let [arg] = args else {
+                return Err(EvalError::WrongArgCount { expected: 1, got: args.len(), span });
+            };
+            match arg {
+                Value::Integer(_) => Ok(Value::Integer(1)),
+                Value::Rational(_, d) => Ok(Value::Integer(*d)),
+                other => Err(EvalError::TypeError {
+                    message: format!("expected rational, got {other}"),
+                    span,
+                }),
+            }
+        }
         "boolean?" => Ok(Value::Boolean(matches!(args, [Value::Boolean(_)]))),
         "pair?" => Ok(Value::Boolean(
             matches!(args, [Value::List(e)] if !e.is_empty())
@@ -1071,39 +1146,7 @@ fn apply_builtin(
         "char?" => Ok(Value::Boolean(matches!(args, [Value::Char(_)]))),
         "apply" => eval_apply(args, span, ctx),
         "map" => apply_map(args, span, ctx),
-        "display" => {
-            let [arg] = args else {
-                return Err(EvalError::WrongArgCount {
-                    expected: 1,
-                    got: args.len(),
-                    span,
-                });
-            };
-            ctx.output.borrow_mut().push_str(&arg.display_str());
-            Ok(Value::Void)
-        }
-        "write" => {
-            let [arg] = args else {
-                return Err(EvalError::WrongArgCount {
-                    expected: 1,
-                    got: args.len(),
-                    span,
-                });
-            };
-            ctx.output.borrow_mut().push_str(&arg.to_string());
-            Ok(Value::Void)
-        }
-        "newline" => {
-            if !args.is_empty() {
-                return Err(EvalError::WrongArgCount {
-                    expected: 0,
-                    got: args.len(),
-                    span,
-                });
-            }
-            ctx.output.borrow_mut().push('\n');
-            Ok(Value::Void)
-        }
+        "display" | "write" | "newline" => apply_io_builtin(name, args, span, ctx),
         "string-append" | "string-length" | "substring" | "string->number"
         | "number->string" | "symbol->string" | "string->symbol" | "string-ref"
         | "string-copy" | "string->list" | "list->string" | "char->integer"
@@ -1130,6 +1173,38 @@ fn apply_builtin(
     }
 }
 
+fn apply_io_builtin(
+    name: &str,
+    args: &[Value],
+    span: Span,
+    ctx: &EvalContext,
+) -> Result<Value, EvalError> {
+    match name {
+        "display" => {
+            let [arg] = args else {
+                return Err(EvalError::WrongArgCount { expected: 1, got: args.len(), span });
+            };
+            ctx.output.borrow_mut().push_str(&arg.display_str());
+            Ok(Value::Void)
+        }
+        "write" => {
+            let [arg] = args else {
+                return Err(EvalError::WrongArgCount { expected: 1, got: args.len(), span });
+            };
+            ctx.output.borrow_mut().push_str(&arg.to_string());
+            Ok(Value::Void)
+        }
+        "newline" => {
+            if !args.is_empty() {
+                return Err(EvalError::WrongArgCount { expected: 0, got: args.len(), span });
+            }
+            ctx.output.borrow_mut().push('\n');
+            Ok(Value::Void)
+        }
+        _ => unreachable!("apply_io_builtin called with {name}"),
+    }
+}
+
 fn require_integer(val: &Value, span: Span) -> Result<i64, EvalError> {
     match val {
         Value::Integer(n) => Ok(*n),
@@ -1140,15 +1215,20 @@ fn require_integer(val: &Value, span: Span) -> Result<i64, EvalError> {
     }
 }
 
-fn arith_variadic(
-    args: &[Value],
-    identity: i64,
-    op: impl Fn(i64, i64) -> Result<i64, EvalError>,
-    span: Span,
-) -> Result<Value, EvalError> {
+fn require_number(val: &Value, span: Span) -> Result<Num, EvalError> {
+    Num::from_value(val, span)
+}
+
+fn arith_add(args: &[Value], span: Span) -> Result<Value, EvalError> {
     args.iter()
-        .try_fold(identity, |acc, val| op(acc, require_integer(val, span)?))
-        .map(Value::Integer)
+        .try_fold(Num::Int(0), |acc, val| Ok(acc.add(require_number(val, span)?)))
+        .map(|n| n.to_value())
+}
+
+fn arith_mul(args: &[Value], span: Span) -> Result<Value, EvalError> {
+    args.iter()
+        .try_fold(Num::Int(1), |acc, val| Ok(acc.mul(require_number(val, span)?)))
+        .map(|n| n.to_value())
 }
 
 fn eval_sub(args: &[Value], span: Span) -> Result<Value, EvalError> {
@@ -1158,21 +1238,14 @@ fn eval_sub(args: &[Value], span: Span) -> Result<Value, EvalError> {
             got: 0,
             span,
         }),
-        [single] => Ok(Value::Integer(-require_integer(single, span)?)),
+        [single] => Ok(require_number(single, span)?.negate().to_value()),
         [first, rest @ ..] => rest
             .iter()
-            .try_fold(require_integer(first, span)?, |acc, val| {
-                Ok(acc - require_integer(val, span)?)
+            .try_fold(require_number(first, span)?, |acc, val| {
+                Ok(acc.sub(require_number(val, span)?))
             })
-            .map(Value::Integer),
+            .map(|n| n.to_value()),
     }
-}
-
-fn checked_div(a: i64, b: i64, span: Span) -> Result<i64, EvalError> {
-    if b == 0 {
-        return Err(EvalError::DivisionByZero { span });
-    }
-    Ok(a / b)
 }
 
 fn eval_div(args: &[Value], span: Span) -> Result<Value, EvalError> {
@@ -1182,19 +1255,19 @@ fn eval_div(args: &[Value], span: Span) -> Result<Value, EvalError> {
             got: 0,
             span,
         }),
-        [single] => checked_div(1, require_integer(single, span)?, span).map(Value::Integer),
+        [single] => Num::Int(1).div(require_number(single, span)?, span).map(|n| n.to_value()),
         [first, rest @ ..] => rest
             .iter()
-            .try_fold(require_integer(first, span)?, |acc, val| {
-                checked_div(acc, require_integer(val, span)?, span)
+            .try_fold(require_number(first, span)?, |acc, val| {
+                acc.div(require_number(val, span)?, span)
             })
-            .map(Value::Integer),
+            .map(|n| n.to_value()),
     }
 }
 
 fn compare_op(
     args: &[Value],
-    op: impl Fn(i64, i64) -> bool,
+    op: impl Fn(f64, f64) -> bool,
     span: Span,
 ) -> Result<Value, EvalError> {
     if args.len() < 2 {
@@ -1205,9 +1278,9 @@ fn compare_op(
         });
     }
 
-    let nums: Vec<i64> = args
+    let nums: Vec<f64> = args
         .iter()
-        .map(|v| require_integer(v, span))
+        .map(|v| require_number(v, span).map(|n| n.to_f64()))
         .collect::<Result<_, _>>()?;
     let result = nums.windows(2).all(|w| op(w[0], w[1]));
     Ok(Value::Boolean(result))

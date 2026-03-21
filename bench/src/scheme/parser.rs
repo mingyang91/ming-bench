@@ -1,4 +1,5 @@
 use crate::scheme::error::{EvalError, Span};
+use crate::scheme::number::simplify;
 use crate::scheme::value::Value;
 
 /// Position-tracking character reader.
@@ -185,9 +186,27 @@ fn parse_list(tokens: &[Token], mut pos: usize) -> Result<(Value, usize), EvalEr
     }
 }
 
+fn try_parse_rational(token: &str) -> Option<Value> {
+    let (numer_str, denom_str) = token.split_once('/')?;
+    let numer: i64 = numer_str.parse().ok()?;
+    let denom: i64 = denom_str.parse().ok()?;
+    if denom == 0 {
+        return None;
+    }
+    Some(simplify(numer, denom).to_value())
+}
+
 fn parse_atom(token: &str) -> Value {
     if let Ok(n) = token.parse::<i64>() {
         return Value::Integer(n);
+    }
+
+    if let Some(val) = try_parse_rational(token) {
+        return val;
+    }
+
+    if let Ok(f) = token.parse::<f64>() {
+        return Value::Float(f);
     }
 
     match token {

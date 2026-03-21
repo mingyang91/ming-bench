@@ -3,6 +3,7 @@ use std::fmt;
 use std::rc::Rc;
 
 use crate::scheme::env::Env;
+use crate::scheme::number::fmt_float;
 
 /// Captured remaining body for a continuation in a body-init position.
 #[derive(Debug, Clone)]
@@ -23,6 +24,8 @@ pub struct ContinuationData {
 #[derive(Debug, Clone)]
 pub enum Value {
     Integer(i64),
+    Rational(i64, i64),
+    Float(f64),
     Boolean(bool),
     String(std::string::String),
     Symbol(std::string::String),
@@ -52,6 +55,8 @@ impl PartialEq for Value {
     fn eq(&self, other: &Self) -> bool {
         match (self, other) {
             (Value::Integer(a), Value::Integer(b)) => a == b,
+            (Value::Rational(n1, d1), Value::Rational(n2, d2)) => n1 == n2 && d1 == d2,
+            (Value::Float(a), Value::Float(b)) => a == b,
             (Value::Boolean(a), Value::Boolean(b)) => a == b,
             (Value::String(a), Value::String(b)) => a == b,
             (Value::Symbol(a), Value::Symbol(b)) => a == b,
@@ -129,6 +134,8 @@ impl fmt::Display for Value {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Value::Integer(n) => write!(f, "{n}"),
+            Value::Rational(n, d) => write!(f, "{n}/{d}"),
+            Value::Float(v) => write!(f, "{}", fmt_float(*v)),
             Value::Boolean(true) => write!(f, "#t"),
             Value::Boolean(false) => write!(f, "#f"),
             Value::String(s) => write!(f, "\"{s}\""),

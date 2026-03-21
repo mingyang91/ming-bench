@@ -2,6 +2,7 @@ pub mod error;
 mod env;
 mod eval;
 mod macros;
+pub(crate) mod number;
 mod parser;
 mod value;
 
