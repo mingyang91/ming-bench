@@ -30,6 +30,181 @@ fn with_span(span: Span, err: EvalError) -> EvalError {
     }
 }
 
+/// Check if a name is a known builtin (so it can be used as a first-class value).
+fn is_builtin(name: &str) -> bool {
+    matches!(
+        name,
+        "+" | "-"
+            | "*"
+            | "/"
+            | "<"
+            | ">"
+            | "="
+            | "<="
+            | ">="
+            | "not"
+            | "cons"
+            | "car"
+            | "cdr"
+            | "null?"
+            | "list"
+            | "length"
+            | "string?"
+            | "number?"
+            | "boolean?"
+            | "pair?"
+            | "symbol?"
+            | "char?"
+            | "string-length"
+            | "string-ref"
+            | "string-append"
+            | "substring"
+            | "string->number"
+            | "number->string"
+            | "symbol->string"
+            | "string->symbol"
+            | "string-copy"
+            | "string->list"
+            | "list->string"
+            | "char->integer"
+            | "integer->char"
+            | "apply"
+            | "map"
+    )
+}
+
+/// Parse parameter list, detecting dot notation for rest params.
+/// E.g., `(x y . rest)` → params=["x","y"], rest_param=Some("rest")
+fn parse_params(exprs: &[Expr]) -> Result<(Vec<String>, Option<String>), EvalError> {
+    parse_params_from_slice(exprs)
+}
+
+/// Parse a slice of param exprs, handling dot notation.
+fn parse_params_from_slice(exprs: &[Expr]) -> Result<(Vec<String>, Option<String>), EvalError> {
+    // Find the dot position
+    let dot_pos = exprs.iter().position(|e| matches!(e, Expr::Atom(s, _) if s == "."));
+    match dot_pos {
+        Some(pos) => {
+            let params: Vec<String> = exprs[..pos]
+                .iter()
+                .map(|e| match e {
+                    Expr::Atom(name, _) => Ok(name.clone()),
+                    _ => Err(EvalError::Parse {
+                        message: "parameter must be a symbol".to_string(),
+                    }),
+                })
+                .collect::<Result<_, _>>()?;
+            let [Expr::Atom(rest_name, _)] = &exprs[pos + 1..] else {
+                return Err(EvalError::Parse {
+                    message: "expected exactly one symbol after dot in parameter list".to_string(),
+                });
+            };
+            Ok((params, Some(rest_name.clone())))
+        }
+        None => {
+            let params: Vec<String> = exprs
+                .iter()
+                .map(|e| match e {
+                    Expr::Atom(name, _) => Ok(name.clone()),
+                    _ => Err(EvalError::Parse {
+                        message: "parameter must be a symbol".to_string(),
+                    }),
+                })
+                .collect::<Result<_, _>>()?;
+            Ok((params, None))
+        }
+    }
+}
+
+/// Validate argument count against lambda signature (fixed + optional rest).
+fn validate_lambda_args(
+    params: &[String],
+    rest_param: &Option<String>,
+    arg_count: usize,
+) -> Result<(), EvalError> {
+    if rest_param.is_some() {
+        if arg_count < params.len() {
+            return Err(EvalError::WrongArgCount {
+                expected: params.len(),
+                got: arg_count,
+            });
+        }
+    } else if arg_count != params.len() {
+        return Err(EvalError::WrongArgCount {
+            expected: params.len(),
+            got: arg_count,
+        });
+    }
+    Ok(())
+}
+
+/// Bind fixed params and optional rest param in a local environment.
+fn bind_lambda_params(
+    params: &[String],
+    rest_param: &Option<String>,
+    args: &[Value],
+    env: &mut Env,
+) {
+    for (param, arg) in params.iter().zip(args) {
+        env_define(env, param.clone(), arg.clone());
+    }
+    if let Some(rest_name) = rest_param {
+        let rest_args = &args[params.len()..];
+        let rest_val = if rest_args.is_empty() {
+            Value::Nil
+        } else {
+            Value::List(rest_args.to_vec())
+        };
+        env_define(env, rest_name.clone(), rest_val);
+    }
+}
+
+/// Convert a Value to a list of values (for `apply`).
+fn value_to_list(val: &Value) -> Result<Vec<Value>, EvalError> {
+    match val {
+        Value::Nil => Ok(Vec::new()),
+        Value::List(items) => Ok(items.clone()),
+        other => Err(EvalError::TypeError {
+            expected: "list".to_string(),
+            got: format!("{other}"),
+        }),
+    }
+}
+
+/// Evaluate `(apply proc arg1 ... arg-list)` from already-evaluated arguments.
+fn eval_apply_values(
+    args: &[Value],
+    env: &Env,
+    out: &mut String,
+) -> Result<Trampoline, EvalError> {
+    let [proc_val, rest @ ..] = args else {
+        return Err(EvalError::WrongArgCount {
+            expected: 2,
+            got: 0,
+        });
+    };
+    let [prefix @ .., last] = rest else {
+        return Err(EvalError::WrongArgCount {
+            expected: 2,
+            got: 1,
+        });
+    };
+    let tail_items = value_to_list(last)?;
+    let mut all_args: Vec<Value> = prefix.to_vec();
+    all_args.extend(tail_items);
+    match proc_val {
+        Value::Lambda { .. } => {
+            apply_lambda_step(proc_val, &all_args, &env.clone(), out)
+        }
+        Value::Symbol(name) if name == "apply" => eval_apply_values(&all_args, env, out),
+        Value::Symbol(name) => apply_builtin(name, &all_args).map(Trampoline::Done),
+        other => Err(EvalError::TypeError {
+            expected: "procedure".to_string(),
+            got: format!("{other}"),
+        }),
+    }
+}
+
 /// Evaluate an expression in the given environment (trampoline loop for TCO).
 pub fn eval(expr: &Expr, env: &mut Env, out: &mut String) -> Result<Value, EvalError> {
     let span = expr.span();
@@ -61,6 +236,8 @@ fn eval_step(expr: &Expr, env: &mut Env, out: &mut String) -> Result<Trampoline,
                 atom_to_value(token).map(Trampoline::Done)
             } else if let Some(val) = env_get(env, token) {
                 Ok(Trampoline::Done(val))
+            } else if is_builtin(token) {
+                Ok(Trampoline::Done(Value::Symbol(token.clone())))
             } else {
                 Err(EvalError::UnboundVariable {
                     name: token.clone(),
@@ -116,6 +293,9 @@ fn eval_list_step(
     // Try evaluating operator; fall back to builtin for atoms
     match eval(operator, env, out) {
         Ok(func @ Value::Lambda { .. }) => apply_lambda_step(&func, &evaluated, env, out),
+        Ok(Value::Symbol(ref name)) if name == "apply" => {
+            eval_apply_values(&evaluated, env, out)
+        }
         Ok(Value::Symbol(ref name)) => apply_builtin(name, &evaluated).map(Trampoline::Done),
         Ok(ref other) => Err(EvalError::TypeError {
             expected: "procedure".to_string(),
@@ -139,18 +319,14 @@ fn apply_lambda_step(
     let Value::Lambda {
         name,
         params,
+        rest_param,
         body,
         closure_env,
     } = func
     else {
         unreachable!("apply_lambda_step called with non-lambda");
     };
-    if params.len() != args.len() {
-        return Err(EvalError::WrongArgCount {
-            expected: params.len(),
-            got: args.len(),
-        });
-    }
+    validate_lambda_args(params, rest_param, args.len())?;
     // Build local env: caller env as base (for mutual recursion), overlay closure, bind params
     let mut local_env = caller_env.clone();
     for (k, v) in closure_env {
@@ -160,9 +336,7 @@ fn apply_lambda_step(
     if let Some(n) = name {
         env_define(&mut local_env, n.clone(), func.clone());
     }
-    for (param, arg) in params.iter().zip(args) {
-        env_define(&mut local_env, param.clone(), arg.clone());
-    }
+    bind_lambda_params(params, rest_param, args, &mut local_env);
     eval_body_step(body, &mut local_env, out)
 }
 
@@ -256,26 +430,20 @@ fn apply_lambda(func: &Value, args: &[Value], out: &mut String) -> Result<Value,
     let Value::Lambda {
         name,
         params,
+        rest_param,
         body,
         closure_env,
     } = func
     else {
         unreachable!("apply_lambda called with non-lambda");
     };
-    if params.len() != args.len() {
-        return Err(EvalError::WrongArgCount {
-            expected: params.len(),
-            got: args.len(),
-        });
-    }
+    validate_lambda_args(params, rest_param, args.len())?;
     let mut local_env = closure_env.clone();
     // Inject self-reference for recursion
     if let Some(n) = name {
         env_define(&mut local_env, n.clone(), func.clone());
     }
-    for (param, arg) in params.iter().zip(args) {
-        env_define(&mut local_env, param.clone(), arg.clone());
-    }
+    bind_lambda_params(params, rest_param, args, &mut local_env);
     eval_body(body, &mut local_env, out)
 }
 
@@ -296,18 +464,11 @@ fn eval_lambda(args: &[Expr], env: &Env) -> Result<Value, EvalError> {
             message: "lambda params must be a list".to_string(),
         });
     };
-    let params: Vec<String> = param_exprs
-        .iter()
-        .map(|e| match e {
-            Expr::Atom(name, _) => Ok(name.clone()),
-            _ => Err(EvalError::Parse {
-                message: "lambda param must be a symbol".to_string(),
-            }),
-        })
-        .collect::<Result<_, _>>()?;
+    let (params, rest_param) = parse_params(param_exprs)?;
     Ok(Value::Lambda {
         name: None,
         params,
+        rest_param,
         body: body.to_vec(),
         closure_env: env.clone(),
     })
@@ -342,18 +503,11 @@ fn eval_define(args: &[Expr], env: &mut Env, out: &mut String) -> Result<Value, 
                     message: "define function form requires a name".to_string(),
                 });
             };
-            let params: Vec<String> = param_exprs
-                .iter()
-                .map(|e| match e {
-                    Expr::Atom(s, _) => Ok(s.clone()),
-                    _ => Err(EvalError::Parse {
-                        message: "parameter must be a symbol".to_string(),
-                    }),
-                })
-                .collect::<Result<_, _>>()?;
+            let (params, rest_param) = parse_params_from_slice(param_exprs)?;
             let lambda = Value::Lambda {
                 name: Some(name.clone()),
                 params,
+                rest_param,
                 body: body.to_vec(),
                 closure_env: env.clone(),
             };

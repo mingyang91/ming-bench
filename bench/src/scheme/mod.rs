@@ -30,6 +30,7 @@ pub(crate) enum Value {
     Lambda {
         name: Option<String>,
         params: Vec<String>,
+        rest_param: Option<String>,
         body: Vec<Expr>,
         closure_env: Env,
     },
