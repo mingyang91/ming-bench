@@ -816,6 +816,79 @@ fn eval(ast: &Ast, env: &mut Env, out: &mut String) -> Result<Value, EvalError> 
                             tco_env = Some(local_env);
                             continue;
                         }
+                        "letrec" => {
+                            if items.len() < 3 {
+                                return Err(EvalError::Arity.with_position(line, col));
+                            }
+                            let bindings = match &items[1].kind {
+                                AstKind::List(bs) => bs,
+                                _ => return Err(EvalError::TypeError("letrec: bindings must be a list".into())
+                                    .with_position(line, col)),
+                            };
+                            let mut local_env = e.clone();
+                            // First pass: bind all names to Void placeholders
+                            let mut names = Vec::new();
+                            let mut inits = Vec::new();
+                            for b in bindings {
+                                match &b.kind {
+                                    AstKind::List(pair) if pair.len() == 2 => {
+                                        let name = match &pair[0].kind {
+                                            AstKind::Symbol(s) => s.clone(),
+                                            _ => return Err(EvalError::TypeError("letrec: binding name must be symbol".into())
+                                                .with_position(pair[0].line, pair[0].col)),
+                                        };
+                                        env_set(&mut local_env, name.clone(), Value::Boolean(false));
+                                        names.push(name);
+                                        inits.push(&pair[1]);
+                                    }
+                                    _ => return Err(EvalError::TypeError("letrec: bad binding".into())
+                                        .with_position(b.line, b.col)),
+                                }
+                            }
+                            // Second pass: evaluate inits in local_env (all names visible)
+                            for (name, init_expr) in names.iter().zip(inits) {
+                                let val = eval(init_expr, &mut local_env, out)?;
+                                *local_env.get(name).unwrap().borrow_mut() = val;
+                            }
+                            for expr in &items[2..items.len() - 1] {
+                                eval(expr, &mut local_env, out)?;
+                            }
+                            cur_ast = items.last().unwrap().clone();
+                            tco_env = Some(local_env);
+                            continue;
+                        }
+                        "letrec*" => {
+                            if items.len() < 3 {
+                                return Err(EvalError::Arity.with_position(line, col));
+                            }
+                            let bindings = match &items[1].kind {
+                                AstKind::List(bs) => bs,
+                                _ => return Err(EvalError::TypeError("letrec*: bindings must be a list".into())
+                                    .with_position(line, col)),
+                            };
+                            let mut local_env = e.clone();
+                            for b in bindings {
+                                match &b.kind {
+                                    AstKind::List(pair) if pair.len() == 2 => {
+                                        let name = match &pair[0].kind {
+                                            AstKind::Symbol(s) => s.clone(),
+                                            _ => return Err(EvalError::TypeError("letrec*: binding name must be symbol".into())
+                                                .with_position(pair[0].line, pair[0].col)),
+                                        };
+                                        let val = eval(&pair[1], &mut local_env, out)?;
+                                        env_set(&mut local_env, name, val);
+                                    }
+                                    _ => return Err(EvalError::TypeError("letrec*: bad binding".into())
+                                        .with_position(b.line, b.col)),
+                                }
+                            }
+                            for expr in &items[2..items.len() - 1] {
+                                eval(expr, &mut local_env, out)?;
+                            }
+                            cur_ast = items.last().unwrap().clone();
+                            tco_env = Some(local_env);
+                            continue;
+                        }
                         "string-set!" => {
                             return Err(EvalError::TypeError(
                                 "string-set!: strings are immutable".into(),
