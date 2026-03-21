@@ -68,6 +68,12 @@ fn apply_builtin(op: &str, args: &[Value]) -> Result<Value, EvalError> {
         "<=" => builtins::apply_compare(args, |a, b| a <= b),
         ">=" => builtins::apply_compare(args, |a, b| a >= b),
         "not" => builtins::apply_not(args),
+        "cons" => builtins::apply_cons(args),
+        "car" => builtins::apply_car(args),
+        "cdr" => builtins::apply_cdr(args),
+        "null?" => builtins::apply_null(args),
+        "list" => builtins::apply_list(args),
+        "length" => builtins::apply_length(args),
         _ => Err(EvalError::UnboundVariable {
             name: op.to_string(),
         }),

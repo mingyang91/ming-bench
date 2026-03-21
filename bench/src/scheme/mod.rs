@@ -16,6 +16,7 @@ enum Value {
     Symbol(String),
     List(Vec<Value>),
     Nil,
+    Pair(Box<Value>, Box<Value>),
     Lambda {
         name: Option<String>,
         params: Vec<String>,
@@ -32,6 +33,7 @@ impl PartialEq for Value {
             (Value::String(a), Value::String(b)) => a == b,
             (Value::Symbol(a), Value::Symbol(b)) => a == b,
             (Value::List(a), Value::List(b)) => a == b,
+            (Value::Pair(a1, a2), Value::Pair(b1, b2)) => a1 == b1 && a2 == b2,
             (Value::Nil, Value::Nil) => true,
             _ => false,
         }
@@ -48,6 +50,7 @@ impl std::fmt::Display for Value {
             Value::Symbol(s) => write!(f, "{s}"),
             Value::Nil => write!(f, "()"),
             Value::List(items) => write!(f, "({})", fmt_list(items)),
+            Value::Pair(car, cdr) => write!(f, "({car} . {cdr})"),
             Value::Lambda { .. } => write!(f, "#<procedure>"),
         }
     }
@@ -96,6 +99,7 @@ fn atom_to_value(token: &str) -> Result<Value, EvalError> {
 fn quote_expr(expr: &Expr) -> Result<Value, EvalError> {
     match expr {
         Expr::Atom(token) => atom_to_value(token),
+        Expr::List(items) if items.is_empty() => Ok(Value::Nil),
         Expr::List(items) => {
             let values: Vec<Value> = items.iter().map(quote_expr).collect::<Result<_, _>>()?;
             Ok(Value::List(values))

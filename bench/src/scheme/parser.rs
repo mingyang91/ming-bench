@@ -35,24 +35,93 @@ fn read_atom(chars: &mut std::iter::Peekable<std::str::Chars<'_>>) -> String {
     tok
 }
 
+/// Skip whitespace in the char stream.
+fn skip_whitespace(chars: &mut std::iter::Peekable<std::str::Chars<'_>>) {
+    while chars.peek().is_some_and(|c| c.is_whitespace()) {
+        chars.next();
+    }
+}
+
+/// Tokenize a single element from the char stream, returning the change in
+/// paren depth (1 for `(`, -1 for `)`, 0 otherwise). Returns `None` at EOF.
+fn tokenize_one(
+    chars: &mut std::iter::Peekable<std::str::Chars<'_>>,
+    tokens: &mut Vec<String>,
+) -> Option<i32> {
+    skip_whitespace(chars);
+    match chars.peek() {
+        Some(&'(') => {
+            tokens.push("(".to_string());
+            chars.next();
+            Some(1)
+        }
+        Some(&')') => {
+            tokens.push(")".to_string());
+            chars.next();
+            Some(-1)
+        }
+        Some(&'\'') => {
+            tokens.push("(".to_string());
+            tokens.push("quote".to_string());
+            chars.next();
+            collect_one_expr(chars, tokens);
+            tokens.push(")".to_string());
+            Some(0)
+        }
+        Some(&'"') => {
+            chars.next();
+            tokens.push(read_string_literal(chars));
+            Some(0)
+        }
+        Some(_) => {
+            tokens.push(read_atom(chars));
+            Some(0)
+        }
+        None => None,
+    }
+}
+
+/// Collect tokens for exactly one S-expression from the char stream.
+fn collect_one_expr(
+    chars: &mut std::iter::Peekable<std::str::Chars<'_>>,
+    tokens: &mut Vec<String>,
+) {
+    skip_whitespace(chars);
+    match chars.peek() {
+        Some(&'(') => {
+            tokens.push("(".to_string());
+            chars.next();
+            let mut depth = 1u32;
+            while depth > 0 {
+                match tokenize_one(chars, tokens) {
+                    Some(delta) => depth = depth.wrapping_add_signed(delta),
+                    None => break,
+                }
+            }
+        }
+        Some(&'\'') => {
+            tokens.push("(".to_string());
+            tokens.push("quote".to_string());
+            chars.next();
+            collect_one_expr(chars, tokens);
+            tokens.push(")".to_string());
+        }
+        Some(&'"') => {
+            chars.next();
+            tokens.push(read_string_literal(chars));
+        }
+        Some(_) => tokens.push(read_atom(chars)),
+        None => {}
+    }
+}
+
 /// Tokenize input into a flat list of tokens (atoms, parens, strings).
 pub(super) fn tokenize(input: &str) -> Vec<String> {
     let mut tokens = Vec::new();
     let mut chars = input.chars().peekable();
-    while let Some(&ch) = chars.peek() {
-        match ch {
-            _ if ch.is_whitespace() => {
-                chars.next();
-            }
-            '(' | ')' => {
-                tokens.push(ch.to_string());
-                chars.next();
-            }
-            '"' => {
-                chars.next();
-                tokens.push(read_string_literal(&mut chars));
-            }
-            _ => tokens.push(read_atom(&mut chars)),
+    while chars.peek().is_some() {
+        if tokenize_one(&mut chars, &mut tokens).is_none() {
+            break;
         }
     }
     tokens
