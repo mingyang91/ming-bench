@@ -751,6 +751,47 @@ fn eval(mut expr: Value, env: &Env, pos: Pos) -> Result<Value, EvalError> {
                             }
                             return Ok(Value::Boolean(false));
                         }
+                        "case" => {
+                            if elems.len() < 3 {
+                                return Err(runtime_err(current_pos, "case requires at least 2 arguments"));
+                            }
+                            let key = eval(elems[1].clone(), &current_env, current_pos)?;
+                            let mut found = false;
+                            for clause in &elems[2..] {
+                                match clause {
+                                    Value::List(parts) if parts.len() >= 2 => {
+                                        if parts[0] == Value::Symbol("else".to_string()) {
+                                            for e in &parts[1..parts.len() - 1] {
+                                                eval(e.clone(), &current_env, current_pos)?;
+                                            }
+                                            expr = parts.last().unwrap().clone();
+                                            found = true;
+                                            break;
+                                        }
+                                        // parts[0] is a list of datums
+                                        if let Value::List(datums) = &parts[0] {
+                                            if datums.iter().any(|d| eqv_values(&key, d)) {
+                                                for e in &parts[1..parts.len() - 1] {
+                                                    eval(e.clone(), &current_env, current_pos)?;
+                                                }
+                                                expr = parts.last().unwrap().clone();
+                                                found = true;
+                                                break;
+                                            }
+                                        } else {
+                                            return Err(runtime_err(current_pos, "case: invalid clause"));
+                                        }
+                                    }
+                                    _ => {
+                                        return Err(runtime_err(current_pos, "case: invalid clause"))
+                                    }
+                                }
+                            }
+                            if found {
+                                continue;
+                            }
+                            return Ok(Value::Boolean(false));
+                        }
                         "call/cc" | "call-with-current-continuation" => {
                             if elems.len() != 2 {
                                 return Err(runtime_err(current_pos, "call/cc requires 1 argument"));
@@ -1029,7 +1070,7 @@ fn gensym(base: &str) -> String {
 fn is_special_form(s: &str) -> bool {
     matches!(s,
         "set!" | "define" | "lambda" | "if" | "quote" | "and" | "or" | "begin" |
-        "let" | "letrec" | "letrec*" | "cond" | "call/cc" | "call-with-current-continuation" | "string-set!" |
+        "let" | "letrec" | "letrec*" | "cond" | "case" | "call/cc" | "call-with-current-continuation" | "string-set!" |
         "apply" | "map" | "define-syntax" | "syntax-rules" | "quasiquote" |
         "unquote" | "unquote-splicing" | "else"
     )
@@ -1228,6 +1269,16 @@ fn subst_template(
     }
 }
 
+fn eqv_values(a: &Value, b: &Value) -> bool {
+    match (a, b) {
+        (Value::Integer(x), Value::Integer(y)) => x == y,
+        (Value::Boolean(x), Value::Boolean(y)) => x == y,
+        (Value::Symbol(x), Value::Symbol(y)) => x == y,
+        (Value::Char(x), Value::Char(y)) => x == y,
+        _ => std::ptr::eq(a as *const _, b as *const _),
+    }
+}
+
 fn values_equal(a: &Value, b: &Value) -> bool {
     match (a, b) {
         (Value::Integer(x), Value::Integer(y)) => x == y,
@@ -1252,7 +1303,7 @@ fn is_builtin(name: &str) -> bool {
         "string->number" | "number->string" | "symbol->string" | "string->symbol" |
         "string-ref" | "string-copy" | "char?" | "string->list" | "list->string" |
         "char->integer" | "integer->char" |
-        "equal?" |
+        "eq?" | "eqv?" | "equal?" |
         "apply" | "map" |
         "call/cc" | "call-with-current-continuation"
     )
@@ -1488,6 +1539,18 @@ fn apply_builtin_vals(op: &str, vals: &[Value], pos: Pos) -> Result<Value, EvalE
                 return Err(runtime_err(pos, "symbol? requires 1 argument"));
             }
             Ok(Value::Boolean(matches!(&vals[0], Value::Symbol(_))))
+        }
+        "eq?" => {
+            if vals.len() != 2 {
+                return Err(runtime_err(pos, "eq? requires 2 arguments"));
+            }
+            Ok(Value::Boolean(eqv_values(&vals[0], &vals[1])))
+        }
+        "eqv?" => {
+            if vals.len() != 2 {
+                return Err(runtime_err(pos, "eqv? requires 2 arguments"));
+            }
+            Ok(Value::Boolean(eqv_values(&vals[0], &vals[1])))
         }
         "equal?" => {
             if vals.len() != 2 {
