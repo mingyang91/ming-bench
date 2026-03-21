@@ -148,6 +148,43 @@ object StringBuiltins:
           "string comparison requires 2 string arguments"
         )
 
+  def evalStringToList(args: List[Value]): Value =
+    args match
+      case v :: Nil =>
+        val s = asString(v)
+        s.foldRight(Value.NilVal: Value)((c, acc) => Value.PairVal(Value.CharVal(c), acc))
+      case _ =>
+        throw new EvalError("string->list requires 1 string argument")
+
+  def evalListToString(args: List[Value]): Value =
+    args match
+      case v :: Nil =>
+        val chars = collectChars(v, List.empty)
+        Value.StringVal(chars.mkString)
+      case _ =>
+        throw new EvalError("list->string requires 1 argument")
+
+  @scala.annotation.tailrec
+  private def collectChars(v: Value, acc: List[Char]): List[Char] =
+    v match
+      case Value.NilVal => acc.reverse
+      case Value.PairVal(Value.CharVal(c), cdr, _) =>
+        collectChars(cdr, c :: acc)
+      case _ =>
+        throw new EvalError("list->string: expected list of characters")
+
+  def evalCharToInteger(args: List[Value]): Value =
+    args match
+      case Value.CharVal(c) :: Nil => Value.IntVal(c.toLong)
+      case _ =>
+        throw new EvalError("char->integer requires 1 char argument")
+
+  def evalIntegerToChar(args: List[Value]): Value =
+    args match
+      case Value.IntVal(n) :: Nil => Value.CharVal(n.toChar)
+      case _ =>
+        throw new EvalError("integer->char requires 1 integer argument")
+
   def strCase(args: List[Value], f: String => String): Value =
     args match
       case v :: Nil => Value.StringVal(f(asString(v)))
