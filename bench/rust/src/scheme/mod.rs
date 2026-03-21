@@ -26,6 +26,17 @@ enum Builtin {
     Equal,
     LessEqual,
     Not,
+    Cons,
+    Car,
+    Cdr,
+    IsNull,
+    List,
+    Length,
+    IsString,
+    IsNumber,
+    IsBoolean,
+    IsPair,
+    IsSymbol,
 }
 
 type EnvRef = Rc<Environment>;
@@ -144,9 +155,18 @@ impl<'a> Parser<'a> {
             ')' => Err(EvalError::SyntaxError {
                 message: "unexpected ')'".into(),
             }),
+            '\'' => self.parse_quote_sugar(),
             '"' => self.parse_string(),
             _ => self.parse_atom(),
         }
+    }
+
+    fn parse_quote_sugar(&mut self) -> Result<Expr, EvalError> {
+        self.expect_char('\'')?;
+        Ok(Expr::List(vec![
+            Expr::Symbol("quote".into()),
+            self.parse_expr()?,
+        ]))
     }
 
     fn parse_list(&mut self) -> Result<Expr, EvalError> {
@@ -301,6 +321,17 @@ fn default_env() -> EnvRef {
         ("=", Builtin::Equal),
         ("<=", Builtin::LessEqual),
         ("not", Builtin::Not),
+        ("cons", Builtin::Cons),
+        ("car", Builtin::Car),
+        ("cdr", Builtin::Cdr),
+        ("null?", Builtin::IsNull),
+        ("list", Builtin::List),
+        ("length", Builtin::Length),
+        ("string?", Builtin::IsString),
+        ("number?", Builtin::IsNumber),
+        ("boolean?", Builtin::IsBoolean),
+        ("pair?", Builtin::IsPair),
+        ("symbol?", Builtin::IsSymbol),
     ] {
         env.define(name, Value::Builtin(builtin));
     }
@@ -335,6 +366,9 @@ fn eval_list(items: &[Expr], env: &EnvRef) -> Result<Value, EvalError> {
             "lambda" => return eval_lambda(&items[1..], env),
             "and" => return eval_and(&items[1..], env),
             "or" => return eval_or(&items[1..], env),
+            "let" => return eval_let(&items[1..], env),
+            "begin" => return eval_begin(&items[1..], env),
+            "cond" => return eval_cond(&items[1..], env),
             _ => {}
         }
     }
@@ -442,6 +476,103 @@ fn eval_lambda(parts: &[Expr], env: &EnvRef) -> Result<Value, EvalError> {
     })))
 }
 
+fn eval_let(parts: &[Expr], env: &EnvRef) -> Result<Value, EvalError> {
+    let Some((bindings_expr, body)) = parts.split_first() else {
+        return Err(EvalError::WrongArity {
+            name: "let".into(),
+            expected: "at least 2".into(),
+            got: parts.len(),
+        });
+    };
+
+    if body.is_empty() {
+        return Err(EvalError::SyntaxError {
+            message: "let requires a body".into(),
+        });
+    }
+
+    let Expr::List(bindings) = bindings_expr else {
+        return Err(EvalError::SyntaxError {
+            message: "let bindings must be a list".into(),
+        });
+    };
+
+    let evaluated_bindings = bindings
+        .iter()
+        .map(|binding| {
+            let Expr::List(parts) = binding else {
+                return Err(EvalError::SyntaxError {
+                    message: "let binding must be a list".into(),
+                });
+            };
+
+            let [Expr::Symbol(name), value_expr] = parts.as_slice() else {
+                return Err(EvalError::SyntaxError {
+                    message: "let binding must contain a name and value".into(),
+                });
+            };
+
+            Ok((name.clone(), eval_expr(value_expr, env)?))
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+
+    let local_env = Environment::new(Some(env.clone()));
+    for (name, value) in evaluated_bindings {
+        local_env.define(name, value);
+    }
+
+    eval_body(body, &local_env)
+}
+
+fn eval_begin(parts: &[Expr], env: &EnvRef) -> Result<Value, EvalError> {
+    eval_body(parts, env)
+}
+
+fn eval_cond(clauses: &[Expr], env: &EnvRef) -> Result<Value, EvalError> {
+    for (index, clause) in clauses.iter().enumerate() {
+        let Expr::List(items) = clause else {
+            return Err(EvalError::SyntaxError {
+                message: "cond clause must be a list".into(),
+            });
+        };
+
+        let Some((test_expr, body)) = items.split_first() else {
+            return Err(EvalError::SyntaxError {
+                message: "cond clause cannot be empty".into(),
+            });
+        };
+
+        if let Expr::Symbol(name) = test_expr {
+            if name == "else" {
+                if index + 1 != clauses.len() {
+                    return Err(EvalError::SyntaxError {
+                        message: "cond else clause must be last".into(),
+                    });
+                }
+
+                if body.is_empty() {
+                    return Err(EvalError::SyntaxError {
+                        message: "cond else clause requires a body".into(),
+                    });
+                }
+
+                return eval_body(body, env);
+            }
+        }
+
+        let test_value = eval_expr(test_expr, env)?;
+        if test_value.is_truthy() {
+            return if body.is_empty() {
+                Ok(test_value)
+            } else {
+                eval_body(body, env)
+            };
+        }
+    }
+
+    Ok(Value::Void)
+}
+
 fn parse_param_names(params: &[Expr]) -> Result<Vec<String>, EvalError> {
     params
         .iter()
@@ -489,6 +620,27 @@ fn apply_builtin(builtin: Builtin, args: &[Value]) -> Result<Value, EvalError> {
         Builtin::Equal => eval_compare(args, "=", |left, right| left == right),
         Builtin::LessEqual => eval_compare(args, "<=", |left, right| left <= right),
         Builtin::Not => eval_not(args),
+        Builtin::Cons => eval_cons(args),
+        Builtin::Car => eval_car(args),
+        Builtin::Cdr => eval_cdr(args),
+        Builtin::IsNull => eval_null(args),
+        Builtin::List => eval_list_builtin(args),
+        Builtin::Length => eval_length(args),
+        Builtin::IsString => eval_type_predicate(args, "string?", |value| {
+            matches!(value, Value::String(_))
+        }),
+        Builtin::IsNumber => eval_type_predicate(args, "number?", |value| {
+            matches!(value, Value::Int(_))
+        }),
+        Builtin::IsBoolean => eval_type_predicate(args, "boolean?", |value| {
+            matches!(value, Value::Bool(_))
+        }),
+        Builtin::IsPair => eval_type_predicate(args, "pair?", |value| {
+            matches!(value, Value::List(items) if !items.is_empty())
+        }),
+        Builtin::IsSymbol => eval_type_predicate(args, "symbol?", |value| {
+            matches!(value, Value::Symbol(_))
+        }),
     }
 }
 
@@ -605,6 +757,113 @@ fn eval_not(args: &[Value]) -> Result<Value, EvalError> {
     }
 
     Ok(Value::Bool(!args[0].is_truthy()))
+}
+
+fn eval_cons(args: &[Value]) -> Result<Value, EvalError> {
+    let [head, tail] = args else {
+        return Err(EvalError::WrongArity {
+            name: "cons".into(),
+            expected: "exactly 2".into(),
+            got: args.len(),
+        });
+    };
+
+    let Value::List(items) = tail else {
+        return Err(EvalError::TypeError {
+            expected: "list",
+            found: tail.type_name(),
+        });
+    };
+
+    let mut result = Vec::with_capacity(items.len() + 1);
+    result.push(head.clone());
+    result.extend(items.iter().cloned());
+    Ok(Value::List(result))
+}
+
+fn eval_car(args: &[Value]) -> Result<Value, EvalError> {
+    let [value] = args else {
+        return Err(EvalError::WrongArity {
+            name: "car".into(),
+            expected: "exactly 1".into(),
+            got: args.len(),
+        });
+    };
+
+    match value {
+        Value::List(items) if !items.is_empty() => Ok(items[0].clone()),
+        other => Err(EvalError::TypeError {
+            expected: "pair",
+            found: other.type_name(),
+        }),
+    }
+}
+
+fn eval_cdr(args: &[Value]) -> Result<Value, EvalError> {
+    let [value] = args else {
+        return Err(EvalError::WrongArity {
+            name: "cdr".into(),
+            expected: "exactly 1".into(),
+            got: args.len(),
+        });
+    };
+
+    match value {
+        Value::List(items) if !items.is_empty() => Ok(Value::List(items[1..].to_vec())),
+        other => Err(EvalError::TypeError {
+            expected: "pair",
+            found: other.type_name(),
+        }),
+    }
+}
+
+fn eval_null(args: &[Value]) -> Result<Value, EvalError> {
+    let [value] = args else {
+        return Err(EvalError::WrongArity {
+            name: "null?".into(),
+            expected: "exactly 1".into(),
+            got: args.len(),
+        });
+    };
+
+    Ok(Value::Bool(matches!(value, Value::List(items) if items.is_empty())))
+}
+
+fn eval_list_builtin(args: &[Value]) -> Result<Value, EvalError> {
+    Ok(Value::List(args.to_vec()))
+}
+
+fn eval_length(args: &[Value]) -> Result<Value, EvalError> {
+    let [value] = args else {
+        return Err(EvalError::WrongArity {
+            name: "length".into(),
+            expected: "exactly 1".into(),
+            got: args.len(),
+        });
+    };
+
+    match value {
+        Value::List(items) => Ok(Value::Int(items.len() as i64)),
+        other => Err(EvalError::TypeError {
+            expected: "list",
+            found: other.type_name(),
+        }),
+    }
+}
+
+fn eval_type_predicate<F>(args: &[Value], name: &str, predicate: F) -> Result<Value, EvalError>
+where
+    F: Fn(&Value) -> bool,
+{
+    let [value] = args else {
+        return Err(EvalError::WrongArity {
+            name: name.into(),
+            expected: "exactly 1".into(),
+            got: args.len(),
+        });
+    };
+
+    Ok(Value::Bool(predicate(value)))
 }
 
 fn eval_and(args: &[Expr], env: &EnvRef) -> Result<Value, EvalError> {
