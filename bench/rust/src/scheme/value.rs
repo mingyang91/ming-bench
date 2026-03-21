@@ -21,6 +21,7 @@ pub enum Value {
     },
     Builtin(String),
     Continuation(u64),
+    Pair(Box<Value>, Box<Value>),
     Vector(Rc<RefCell<Vec<Value>>>),
     Macro {
         literals: Vec<String>,
@@ -39,6 +40,7 @@ impl PartialEq for Value {
             (Value::Symbol(a), Value::Symbol(b)) => a == b,
             (Value::Char(a), Value::Char(b)) => a == b,
             (Value::List(a), Value::List(b)) => a == b,
+            (Value::Pair(a1, a2), Value::Pair(b1, b2)) => a1 == b1 && a2 == b2,
             (Value::Vector(a), Value::Vector(b)) => Rc::ptr_eq(a, b),
             (Value::Builtin(a), Value::Builtin(b)) => a == b,
             (Value::Continuation(a), Value::Continuation(b)) => a == b,
@@ -47,6 +49,36 @@ impl PartialEq for Value {
             _ => false,
         }
     }
+}
+
+fn write_pair(f: &mut fmt::Formatter<'_>, car: &Value, cdr: &Value) -> fmt::Result {
+    write!(f, "({car}")?;
+    let mut current = cdr;
+    loop {
+        match current {
+            Value::Pair(a, b) => {
+                write!(f, " {a}")?;
+                current = b;
+            }
+            Value::List(items) if items.is_empty() => break,
+            Value::List(items) => {
+                write_list_tail(f, items)?;
+                break;
+            }
+            other => {
+                write!(f, " . {other}")?;
+                break;
+            }
+        }
+    }
+    write!(f, ")")
+}
+
+fn write_list_tail(f: &mut fmt::Formatter<'_>, items: &[Value]) -> fmt::Result {
+    for item in items {
+        write!(f, " {item}")?;
+    }
+    Ok(())
 }
 
 fn write_vector(f: &mut fmt::Formatter<'_>, v: &RefCell<Vec<Value>>) -> fmt::Result {
@@ -93,6 +125,7 @@ impl Value {
             (Value::List(a), Value::List(b)) => {
                 a.len() == b.len() && a.iter().zip(b).all(|(x, y)| x.deep_equal(y))
             }
+            (Value::Pair(a1, a2), Value::Pair(b1, b2)) => a1.deep_equal(b1) && a2.deep_equal(b2),
             (Value::Vector(a), Value::Vector(b)) => {
                 let a = a.borrow();
                 let b = b.borrow();
@@ -118,6 +151,7 @@ impl fmt::Display for Value {
             Value::Str(s) => write!(f, "\"{s}\""),
             Value::Symbol(s) => write!(f, "{s}"),
             Value::List(items) => write_list(f, items),
+            Value::Pair(car, cdr) => write_pair(f, car, cdr),
             Value::Vector(v) => write_vector(f, v),
             Value::Char(c) => write!(f, "#\\{c}"),
             Value::Lambda { .. } | Value::Builtin(_) | Value::Continuation(_)

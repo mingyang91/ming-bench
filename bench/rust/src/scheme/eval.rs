@@ -97,7 +97,7 @@ pub fn eval(expr: &Value, env: &Rc<RefCell<Env>>, out: &Output) -> Result<Value,
     loop {
         match &current_expr {
             Value::Integer(_) | Value::Boolean(_) | Value::Str(_) | Value::Char(_)
-            | Value::Void | Value::Vector(_) => return Ok(current_expr),
+            | Value::Void | Value::Vector(_) | Value::Pair(_, _) => return Ok(current_expr),
             Value::Lambda { .. } | Value::Builtin(_) | Value::Continuation(_)
             | Value::Macro { .. } => {
                 return Ok(current_expr)
@@ -698,60 +698,14 @@ fn is_builtin(name: &str) -> bool {
             | "equal?" | "eqv?" | "eq?"
             | "vector" | "make-vector" | "vector-ref" | "vector-set!"
             | "vector-length" | "vector?" | "vector->list" | "list->vector"
+            | "abs" | "modulo" | "remainder" | "quotient" | "min" | "max" | "expt"
+            | "zero?" | "positive?" | "negative?" | "odd?" | "even?"
+            | "list-ref" | "list-tail" | "list?" | "assoc"
+            | "char-alphabetic?" | "char-numeric?" | "char-upcase" | "char-downcase"
+            | "char=?" | "char<?"
+            | "string=?" | "string<?" | "string-ci=?"
+            | "string-upcase" | "string-downcase"
     )
-}
-
-/// Non-tail call into a procedure (used by map and similar).
-fn call_proc(
-    proc: &Value,
-    args: &[Value],
-    env: &Rc<RefCell<Env>>,
-    out: &Output,
-) -> Result<Value, EvalError> {
-    match proc {
-        Value::Lambda {
-            params,
-            rest_param,
-            body,
-            closure,
-        } => {
-            let eval_args: Vec<Value> = args
-                .iter()
-                .map(|a| eval(a, env, out))
-                .collect::<Result<_, _>>()?;
-            check_arity(params.len(), rest_param.is_some(), eval_args.len())?;
-            let child = Env::extend(closure);
-            for (param, val) in params.iter().zip(&eval_args) {
-                child.borrow_mut().define(param.clone(), val.clone());
-            }
-            if let Some(rest_name) = rest_param {
-                let rest_vals = eval_args[params.len()..].to_vec();
-                child.borrow_mut().define(rest_name.clone(), Value::List(rest_vals));
-            }
-            eval_body(body, &child, out)
-        }
-        Value::Builtin(name) => eval_builtin(name, args, env, out),
-        Value::Continuation(id) => {
-            let eval_args: Vec<Value> = args
-                .iter()
-                .map(|a| eval(a, env, out))
-                .collect::<Result<_, _>>()?;
-            let [value] = eval_args.as_slice() else {
-                return Err(EvalError::WrongArgCount {
-                    expected: 1,
-                    got: eval_args.len(),
-                });
-            };
-            Err(EvalError::ContinuationReturn {
-                id: *id,
-                value: Box::new(value.clone()),
-            })
-        }
-        _ => Err(EvalError::TypeError {
-            expected: "procedure".into(),
-            got: format!("{proc}"),
-        }),
-    }
 }
 
 fn eval_builtin(
@@ -781,7 +735,7 @@ fn eval_builtin(
         "number?" => eval_type_pred(args, env, out, |v| matches!(v, Value::Integer(_))),
         "boolean?" => eval_type_pred(args, env, out, |v| matches!(v, Value::Boolean(_))),
         "pair?" => eval_type_pred(args, env, out, |v| {
-            matches!(v, Value::List(items) if !items.is_empty())
+            matches!(v, Value::List(items) if !items.is_empty()) || matches!(v, Value::Pair(_, _))
         }),
         "symbol?" => eval_type_pred(args, env, out, |v| matches!(v, Value::Symbol(_))),
         "char?" => eval_type_pred(args, env, out, |v| matches!(v, Value::Char(_))),
@@ -814,6 +768,33 @@ fn eval_builtin(
         "vector?" => eval_type_pred(args, env, out, |v| matches!(v, Value::Vector(_))),
         "vector->list" => eval_vector_to_list(args, env, out),
         "list->vector" => eval_list_to_vector(args, env, out),
+        "abs" => eval_abs(args, env, out),
+        "modulo" => eval_modulo(args, env, out),
+        "remainder" => eval_remainder(args, env, out),
+        "quotient" => eval_quotient(args, env, out),
+        "min" => eval_min_max(args, env, out, true),
+        "max" => eval_min_max(args, env, out, false),
+        "expt" => eval_expt(args, env, out),
+        "zero?" => eval_num_pred(args, env, out, |n| n == 0),
+        "positive?" => eval_num_pred(args, env, out, |n| n > 0),
+        "negative?" => eval_num_pred(args, env, out, |n| n < 0),
+        "odd?" => eval_num_pred(args, env, out, |n| n % 2 != 0),
+        "even?" => eval_num_pred(args, env, out, |n| n % 2 == 0),
+        "list-ref" => eval_list_ref(args, env, out),
+        "list-tail" => eval_list_tail_builtin(args, env, out),
+        "list?" => eval_list_pred(args, env, out),
+        "assoc" => eval_assoc(args, env, out),
+        "char-alphabetic?" => eval_char_pred(args, env, out, |c| c.is_alphabetic()),
+        "char-numeric?" => eval_char_pred(args, env, out, |c| c.is_ascii_digit()),
+        "char-upcase" => eval_char_case(args, env, out, true),
+        "char-downcase" => eval_char_case(args, env, out, false),
+        "char=?" => eval_char_cmp(args, env, out, |a, b| a == b),
+        "char<?" => eval_char_cmp(args, env, out, |a, b| a < b),
+        "string=?" => eval_string_cmp(args, env, out, |a, b| a == b),
+        "string<?" => eval_string_cmp(args, env, out, |a, b| a < b),
+        "string-ci=?" => eval_string_ci_eq(args, env, out),
+        "string-upcase" => eval_string_case(args, env, out, true),
+        "string-downcase" => eval_string_case(args, env, out, false),
         _ => Err(EvalError::UnknownProcedure {
             name: name.into(),
         }),
@@ -1113,10 +1094,7 @@ fn eval_cons(args: &[Value], env: &Rc<RefCell<Env>>, out: &Output) -> Result<Val
             items.insert(0, head_val);
             Ok(Value::List(items))
         }
-        _ => Err(EvalError::TypeError {
-            expected: "list".into(),
-            got: format!("{tail_val}"),
-        }),
+        _ => Ok(Value::Pair(Box::new(head_val), Box::new(tail_val))),
     }
 }
 
@@ -1129,6 +1107,7 @@ fn eval_car(args: &[Value], env: &Rc<RefCell<Env>>, out: &Output) -> Result<Valu
     };
     match eval(arg, env, out)? {
         Value::List(items) if !items.is_empty() => Ok(items.into_iter().next().expect("non-empty")),
+        Value::Pair(car, _) => Ok(*car),
         other => Err(EvalError::TypeError {
             expected: "pair".into(),
             got: format!("{other}"),
@@ -1145,6 +1124,7 @@ fn eval_cdr(args: &[Value], env: &Rc<RefCell<Env>>, out: &Output) -> Result<Valu
     };
     match eval(arg, env, out)? {
         Value::List(items) if !items.is_empty() => Ok(Value::List(items[1..].to_vec())),
+        Value::Pair(_, cdr) => Ok(*cdr),
         other => Err(EvalError::TypeError {
             expected: "pair".into(),
             got: format!("{other}"),
@@ -1581,30 +1561,79 @@ fn eval_integer_to_char(
     }
 }
 
+/// Apply a procedure to already-evaluated arguments (no re-evaluation).
+fn apply_proc_evaluated(
+    proc: &Value,
+    eval_args: Vec<Value>,
+    env: &Rc<RefCell<Env>>,
+    out: &Output,
+) -> Result<Value, EvalError> {
+    match proc {
+        Value::Lambda {
+            params,
+            rest_param,
+            body,
+            closure,
+        } => {
+            check_arity(params.len(), rest_param.is_some(), eval_args.len())?;
+            let child = Env::extend(closure);
+            for (param, val) in params.iter().zip(&eval_args) {
+                child.borrow_mut().define(param.clone(), val.clone());
+            }
+            if let Some(rest_name) = rest_param {
+                let rest_vals = eval_args[params.len()..].to_vec();
+                child.borrow_mut().define(rest_name.clone(), Value::List(rest_vals));
+            }
+            eval_body(body, &child, out)
+        }
+        Value::Builtin(name) => call_builtin_with_values(name, eval_args, env, out),
+        Value::Continuation(id) => {
+            let [value] = eval_args.as_slice() else {
+                return Err(EvalError::WrongArgCount {
+                    expected: 1,
+                    got: eval_args.len(),
+                });
+            };
+            Err(EvalError::ContinuationReturn {
+                id: *id,
+                value: Box::new(value.clone()),
+            })
+        }
+        _ => Err(EvalError::TypeError {
+            expected: "procedure".into(),
+            got: format!("{proc}"),
+        }),
+    }
+}
+
 fn eval_map(
     args: &[Value],
     env: &Rc<RefCell<Env>>,
     out: &Output,
 ) -> Result<Value, EvalError> {
-    let [proc_arg, list_arg] = args else {
+    if args.len() < 2 {
         return Err(EvalError::WrongArgCount {
             expected: 2,
             got: args.len(),
         });
-    };
-    let proc = eval(proc_arg, env, out)?;
-    let list = match eval(list_arg, env, out)? {
-        Value::List(items) => items,
-        other => {
-            return Err(EvalError::TypeError {
+    }
+    let proc = eval(&args[0], env, out)?;
+    let lists: Vec<Vec<Value>> = args[1..]
+        .iter()
+        .map(|a| match eval(a, env, out)? {
+            Value::List(items) => Ok(items),
+            other => Err(EvalError::TypeError {
                 expected: "list".into(),
                 got: format!("{other}"),
-            })
-        }
-    };
-    let results: Vec<Value> = list
-        .iter()
-        .map(|item| call_proc(&proc, std::slice::from_ref(item), env, out))
+            }),
+        })
+        .collect::<Result<_, EvalError>>()?;
+    let len = lists[0].len();
+    let results: Vec<Value> = (0..len)
+        .map(|i| {
+            let call_args: Vec<Value> = lists.iter().map(|l| l[i].clone()).collect();
+            apply_proc_evaluated(&proc, call_args, env, out)
+        })
         .collect::<Result<_, _>>()?;
     Ok(Value::List(results))
 }
@@ -1909,6 +1938,307 @@ fn eval_list_to_vector(
     Ok(Value::Vector(vec))
 }
 
+// --- Level 15: Numeric/Char/String Utilities ---
+
+fn eval_abs(
+    args: &[Value],
+    env: &Rc<RefCell<Env>>,
+    out: &Output,
+) -> Result<Value, EvalError> {
+    let [arg] = args else {
+        return Err(EvalError::WrongArgCount { expected: 1, got: args.len() });
+    };
+    let Value::Integer(n) = eval(arg, env, out)? else {
+        return Err(EvalError::TypeError { expected: "number".into(), got: "non-number".into() });
+    };
+    Ok(Value::Integer(n.abs()))
+}
+
+fn eval_modulo(
+    args: &[Value],
+    env: &Rc<RefCell<Env>>,
+    out: &Output,
+) -> Result<Value, EvalError> {
+    let [a, b] = args else {
+        return Err(EvalError::WrongArgCount { expected: 2, got: args.len() });
+    };
+    let Value::Integer(x) = eval(a, env, out)? else {
+        return Err(EvalError::TypeError { expected: "number".into(), got: "non-number".into() });
+    };
+    let Value::Integer(y) = eval(b, env, out)? else {
+        return Err(EvalError::TypeError { expected: "number".into(), got: "non-number".into() });
+    };
+    let r = x % y;
+    let result = if r != 0 && (r > 0) != (y > 0) { r + y } else { r };
+    Ok(Value::Integer(result))
+}
+
+fn eval_remainder(
+    args: &[Value],
+    env: &Rc<RefCell<Env>>,
+    out: &Output,
+) -> Result<Value, EvalError> {
+    let [a, b] = args else {
+        return Err(EvalError::WrongArgCount { expected: 2, got: args.len() });
+    };
+    let Value::Integer(x) = eval(a, env, out)? else {
+        return Err(EvalError::TypeError { expected: "number".into(), got: "non-number".into() });
+    };
+    let Value::Integer(y) = eval(b, env, out)? else {
+        return Err(EvalError::TypeError { expected: "number".into(), got: "non-number".into() });
+    };
+    Ok(Value::Integer(x % y))
+}
+
+fn eval_quotient(
+    args: &[Value],
+    env: &Rc<RefCell<Env>>,
+    out: &Output,
+) -> Result<Value, EvalError> {
+    let [a, b] = args else {
+        return Err(EvalError::WrongArgCount { expected: 2, got: args.len() });
+    };
+    let Value::Integer(x) = eval(a, env, out)? else {
+        return Err(EvalError::TypeError { expected: "number".into(), got: "non-number".into() });
+    };
+    let Value::Integer(y) = eval(b, env, out)? else {
+        return Err(EvalError::TypeError { expected: "number".into(), got: "non-number".into() });
+    };
+    Ok(Value::Integer(x / y))
+}
+
+fn eval_min_max(
+    args: &[Value],
+    env: &Rc<RefCell<Env>>,
+    out: &Output,
+    is_min: bool,
+) -> Result<Value, EvalError> {
+    if args.is_empty() {
+        return Err(EvalError::WrongArgCount { expected: 1, got: 0 });
+    }
+    let values: Vec<i64> = args
+        .iter()
+        .map(|a| match eval(a, env, out)? {
+            Value::Integer(n) => Ok(n),
+            other => Err(EvalError::TypeError {
+                expected: "number".into(),
+                got: format!("{other}"),
+            }),
+        })
+        .collect::<Result<_, _>>()?;
+    let result = if is_min {
+        values.iter().copied().min().expect("non-empty")
+    } else {
+        values.iter().copied().max().expect("non-empty")
+    };
+    Ok(Value::Integer(result))
+}
+
+fn eval_expt(
+    args: &[Value],
+    env: &Rc<RefCell<Env>>,
+    out: &Output,
+) -> Result<Value, EvalError> {
+    let [base_arg, exp_arg] = args else {
+        return Err(EvalError::WrongArgCount { expected: 2, got: args.len() });
+    };
+    let Value::Integer(base) = eval(base_arg, env, out)? else {
+        return Err(EvalError::TypeError { expected: "number".into(), got: "non-number".into() });
+    };
+    let Value::Integer(exp) = eval(exp_arg, env, out)? else {
+        return Err(EvalError::TypeError { expected: "number".into(), got: "non-number".into() });
+    };
+    Ok(Value::Integer(base.pow(exp as u32)))
+}
+
+fn eval_num_pred(
+    args: &[Value],
+    env: &Rc<RefCell<Env>>,
+    out: &Output,
+    pred: fn(i64) -> bool,
+) -> Result<Value, EvalError> {
+    let [arg] = args else {
+        return Err(EvalError::WrongArgCount { expected: 1, got: args.len() });
+    };
+    let Value::Integer(n) = eval(arg, env, out)? else {
+        return Err(EvalError::TypeError { expected: "number".into(), got: "non-number".into() });
+    };
+    Ok(Value::Boolean(pred(n)))
+}
+
+fn eval_list_ref(
+    args: &[Value],
+    env: &Rc<RefCell<Env>>,
+    out: &Output,
+) -> Result<Value, EvalError> {
+    let [list_arg, idx_arg] = args else {
+        return Err(EvalError::WrongArgCount { expected: 2, got: args.len() });
+    };
+    let Value::List(items) = eval(list_arg, env, out)? else {
+        return Err(EvalError::TypeError { expected: "list".into(), got: "non-list".into() });
+    };
+    let Value::Integer(idx) = eval(idx_arg, env, out)? else {
+        return Err(EvalError::TypeError { expected: "number".into(), got: "non-number".into() });
+    };
+    items
+        .get(idx as usize)
+        .cloned()
+        .ok_or_else(|| EvalError::Parse {
+            message: format!("list-ref: index {idx} out of range"),
+        })
+}
+
+fn eval_list_tail_builtin(
+    args: &[Value],
+    env: &Rc<RefCell<Env>>,
+    out: &Output,
+) -> Result<Value, EvalError> {
+    let [list_arg, idx_arg] = args else {
+        return Err(EvalError::WrongArgCount { expected: 2, got: args.len() });
+    };
+    let Value::List(items) = eval(list_arg, env, out)? else {
+        return Err(EvalError::TypeError { expected: "list".into(), got: "non-list".into() });
+    };
+    let Value::Integer(idx) = eval(idx_arg, env, out)? else {
+        return Err(EvalError::TypeError { expected: "number".into(), got: "non-number".into() });
+    };
+    Ok(Value::List(items[idx as usize..].to_vec()))
+}
+
+fn eval_list_pred(
+    args: &[Value],
+    env: &Rc<RefCell<Env>>,
+    out: &Output,
+) -> Result<Value, EvalError> {
+    let [arg] = args else {
+        return Err(EvalError::WrongArgCount { expected: 1, got: args.len() });
+    };
+    let val = eval(arg, env, out)?;
+    Ok(Value::Boolean(matches!(val, Value::List(_))))
+}
+
+fn eval_assoc(
+    args: &[Value],
+    env: &Rc<RefCell<Env>>,
+    out: &Output,
+) -> Result<Value, EvalError> {
+    let [key_arg, list_arg] = args else {
+        return Err(EvalError::WrongArgCount { expected: 2, got: args.len() });
+    };
+    let key = eval(key_arg, env, out)?;
+    let Value::List(items) = eval(list_arg, env, out)? else {
+        return Err(EvalError::TypeError { expected: "list".into(), got: "non-list".into() });
+    };
+    let found = items.iter().find(|item| {
+        matches!(item, Value::List(pair) if !pair.is_empty() && pair[0].deep_equal(&key))
+    });
+    Ok(found.cloned().unwrap_or(Value::Boolean(false)))
+}
+
+fn eval_char_pred(
+    args: &[Value],
+    env: &Rc<RefCell<Env>>,
+    out: &Output,
+    pred: fn(char) -> bool,
+) -> Result<Value, EvalError> {
+    let [arg] = args else {
+        return Err(EvalError::WrongArgCount { expected: 1, got: args.len() });
+    };
+    let Value::Char(c) = eval(arg, env, out)? else {
+        return Err(EvalError::TypeError { expected: "char".into(), got: "non-char".into() });
+    };
+    Ok(Value::Boolean(pred(c)))
+}
+
+fn eval_char_case(
+    args: &[Value],
+    env: &Rc<RefCell<Env>>,
+    out: &Output,
+    upcase: bool,
+) -> Result<Value, EvalError> {
+    let [arg] = args else {
+        return Err(EvalError::WrongArgCount { expected: 1, got: args.len() });
+    };
+    let Value::Char(c) = eval(arg, env, out)? else {
+        return Err(EvalError::TypeError { expected: "char".into(), got: "non-char".into() });
+    };
+    let result = if upcase {
+        c.to_ascii_uppercase()
+    } else {
+        c.to_ascii_lowercase()
+    };
+    Ok(Value::Char(result))
+}
+
+fn eval_char_cmp(
+    args: &[Value],
+    env: &Rc<RefCell<Env>>,
+    out: &Output,
+    cmp: fn(char, char) -> bool,
+) -> Result<Value, EvalError> {
+    let [a, b] = args else {
+        return Err(EvalError::WrongArgCount { expected: 2, got: args.len() });
+    };
+    let Value::Char(ca) = eval(a, env, out)? else {
+        return Err(EvalError::TypeError { expected: "char".into(), got: "non-char".into() });
+    };
+    let Value::Char(cb) = eval(b, env, out)? else {
+        return Err(EvalError::TypeError { expected: "char".into(), got: "non-char".into() });
+    };
+    Ok(Value::Boolean(cmp(ca, cb)))
+}
+
+fn eval_string_cmp(
+    args: &[Value],
+    env: &Rc<RefCell<Env>>,
+    out: &Output,
+    cmp: fn(&str, &str) -> bool,
+) -> Result<Value, EvalError> {
+    let [a, b] = args else {
+        return Err(EvalError::WrongArgCount { expected: 2, got: args.len() });
+    };
+    let Value::Str(sa) = eval(a, env, out)? else {
+        return Err(EvalError::TypeError { expected: "string".into(), got: "non-string".into() });
+    };
+    let Value::Str(sb) = eval(b, env, out)? else {
+        return Err(EvalError::TypeError { expected: "string".into(), got: "non-string".into() });
+    };
+    Ok(Value::Boolean(cmp(&sa, &sb)))
+}
+
+fn eval_string_ci_eq(
+    args: &[Value],
+    env: &Rc<RefCell<Env>>,
+    out: &Output,
+) -> Result<Value, EvalError> {
+    let [a, b] = args else {
+        return Err(EvalError::WrongArgCount { expected: 2, got: args.len() });
+    };
+    let Value::Str(sa) = eval(a, env, out)? else {
+        return Err(EvalError::TypeError { expected: "string".into(), got: "non-string".into() });
+    };
+    let Value::Str(sb) = eval(b, env, out)? else {
+        return Err(EvalError::TypeError { expected: "string".into(), got: "non-string".into() });
+    };
+    Ok(Value::Boolean(sa.to_lowercase() == sb.to_lowercase()))
+}
+
+fn eval_string_case(
+    args: &[Value],
+    env: &Rc<RefCell<Env>>,
+    out: &Output,
+    upcase: bool,
+) -> Result<Value, EvalError> {
+    let [arg] = args else {
+        return Err(EvalError::WrongArgCount { expected: 1, got: args.len() });
+    };
+    let Value::Str(s) = eval(arg, env, out)? else {
+        return Err(EvalError::TypeError { expected: "string".into(), got: "non-string".into() });
+    };
+    let result = if upcase { s.to_uppercase() } else { s.to_lowercase() };
+    Ok(Value::Str(result))
+}
+
 /// Seed all builtin procedures into the environment as first-class values.
 pub fn seed_builtins(env: &Rc<RefCell<Env>>) {
     let names = [
@@ -1926,6 +2256,13 @@ pub fn seed_builtins(env: &Rc<RefCell<Env>>) {
         "vector", "make-vector", "vector-ref", "vector-set!",
         "vector-length", "vector?", "vector->list", "list->vector",
         "call/cc", "call-with-current-continuation",
+        "abs", "modulo", "remainder", "quotient", "min", "max", "expt",
+        "zero?", "positive?", "negative?", "odd?", "even?",
+        "list-ref", "list-tail", "list?", "assoc",
+        "char-alphabetic?", "char-numeric?", "char-upcase", "char-downcase",
+        "char=?", "char<?",
+        "string=?", "string<?", "string-ci=?",
+        "string-upcase", "string-downcase",
     ];
     let mut env_ref = env.borrow_mut();
     for name in names {
