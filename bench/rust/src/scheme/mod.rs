@@ -3,13 +3,21 @@ pub mod error;
 pub use error::EvalError;
 
 use std::cell::{Cell, RefCell};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::rc::Rc;
 
 thread_local! {
     static CALLCC_PENDING: RefCell<Option<Value>> = RefCell::new(None);
     static CALLCC_TOP_IDX: Cell<usize> = Cell::new(0);
     static CONT_RETURN: RefCell<Option<(usize, Value)>> = RefCell::new(None);
+}
+
+static GENSYM_COUNTER: AtomicUsize = AtomicUsize::new(0);
+
+fn gensym(base: &str) -> String {
+    let n = GENSYM_COUNTER.fetch_add(1, Ordering::Relaxed);
+    format!("{}##{}", base, n)
 }
 
 /// Source position (1-indexed line, 0-indexed column).
@@ -43,6 +51,11 @@ enum Value {
     },
     Builtin(String),
     Continuation(usize),
+    Macro {
+        literals: Rc<Vec<String>>,
+        rules: Rc<Vec<(Expr, Expr)>>,
+        def_env: Env,
+    },
 }
 
 impl Value {
@@ -99,6 +112,7 @@ impl Value {
             Value::Lambda { .. } => "<procedure>".to_string(),
             Value::Builtin(name) => format!("<builtin:{}>", name),
             Value::Continuation(_) => "<continuation>".to_string(),
+            Value::Macro { .. } => "<macro>".to_string(),
         }
     }
 
@@ -729,7 +743,52 @@ fn eval(expr: &Expr, env: &Env, out: &mut String) -> Result<Value, EvalError> {
                             }
                             break 'tco do_callcc(&items[1], pos, &cur_env, out);
                         }
-                        _ => {}
+                        "define-syntax" => {
+                            if items.len() != 3 {
+                                break 'tco Err(EvalError::Arity(format!(
+                                    "define-syntax requires 2 arguments at {}",
+                                    pos.fmt()
+                                )));
+                            }
+                            let macro_name = match &items[1].kind {
+                                ExprKind::Symbol(s) => s.clone(),
+                                _ => break 'tco Err(EvalError::Type(format!(
+                                    "define-syntax: name must be a symbol at {}",
+                                    pos.fmt()
+                                ))),
+                            };
+                            let sr = match &items[2].kind {
+                                ExprKind::List(parts) => parts,
+                                _ => break 'tco Err(EvalError::Type(format!(
+                                    "define-syntax: expected syntax-rules at {}",
+                                    pos.fmt()
+                                ))),
+                            };
+                            let literals = Rc::new(match &sr[1].kind {
+                                ExprKind::List(lits) => lits.iter().filter_map(|e| {
+                                    if let ExprKind::Symbol(s) = &e.kind { Some(s.clone()) } else { None }
+                                }).collect(),
+                                _ => vec![],
+                            });
+                            let rules = Rc::new(sr[2..].iter().filter_map(|clause| {
+                                if let ExprKind::List(parts) = &clause.kind {
+                                    if parts.len() == 2 {
+                                        return Some((parts[0].clone(), parts[1].clone()));
+                                    }
+                                }
+                                None
+                            }).collect());
+                            let macro_val = Value::Macro { literals, rules, def_env: cur_env.clone() };
+                            cur_env.set(macro_name, macro_val);
+                            break 'tco Ok(Value::Nil);
+                        }
+                        _ => {
+                            if let Some(Value::Macro { ref literals, ref rules, ref def_env }) = cur_env.get(op) {
+                                let expanded = expand_macro(&items, literals, rules, def_env, &cur_env, pos)?;
+                                cur_expr = expanded;
+                                continue 'tco;
+                            }
+                        }
                     }
                 }
                 // Function application
@@ -1654,6 +1713,230 @@ fn compare_op_val(
         prev = cur;
     }
     Ok(Some(Value::Boolean(true)))
+}
+
+// ── Hygienic Macros ─────────────────────────────────────────────────
+
+#[derive(Debug, Clone)]
+enum MacroBinding {
+    Single(Expr),
+    List(Vec<Expr>),
+}
+
+fn is_keyword(name: &str) -> bool {
+    matches!(
+        name,
+        "if" | "define" | "quote" | "lambda" | "and" | "or"
+            | "let" | "begin" | "cond" | "set!" | "call/cc"
+            | "call-with-current-continuation" | "string-set!"
+            | "define-syntax" | "syntax-rules"
+    ) || Value::is_builtin_name(name)
+}
+
+fn match_pattern(
+    pattern: &[Expr],
+    input: &[Expr],
+    literals: &[String],
+) -> Option<HashMap<String, MacroBinding>> {
+    let mut bindings = HashMap::new();
+    let mut pi = 0;
+    let mut ii = 0;
+
+    while pi < pattern.len() {
+        // Check for ellipsis
+        if pi + 1 < pattern.len() {
+            if let ExprKind::Symbol(ref s) = pattern[pi + 1].kind {
+                if s == "..." {
+                    let var_name = match &pattern[pi].kind {
+                        ExprKind::Symbol(s) => s.clone(),
+                        _ => return None,
+                    };
+                    let remaining_pattern = pattern.len() - pi - 2;
+                    let available = input.len().checked_sub(ii + remaining_pattern)?;
+                    let mut collected = Vec::new();
+                    for _ in 0..available {
+                        collected.push(input[ii].clone());
+                        ii += 1;
+                    }
+                    bindings.insert(var_name, MacroBinding::List(collected));
+                    pi += 2;
+                    continue;
+                }
+            }
+        }
+
+        if ii >= input.len() {
+            return None;
+        }
+
+        match &pattern[pi].kind {
+            ExprKind::Symbol(ref s) if literals.contains(s) => {
+                match &input[ii].kind {
+                    ExprKind::Symbol(ref is) if is == s => {}
+                    _ => return None,
+                }
+            }
+            ExprKind::Symbol(ref s) if s == "_" => {}
+            ExprKind::Symbol(ref s) => {
+                bindings.insert(s.clone(), MacroBinding::Single(input[ii].clone()));
+            }
+            ExprKind::List(sub_pat) => match &input[ii].kind {
+                ExprKind::List(sub_inp) => {
+                    let sub = match_pattern(sub_pat, sub_inp, literals)?;
+                    bindings.extend(sub);
+                }
+                _ => return None,
+            },
+            ExprKind::Integer(n) => match &input[ii].kind {
+                ExprKind::Integer(m) if n == m => {}
+                _ => return None,
+            },
+            ExprKind::Boolean(b) => match &input[ii].kind {
+                ExprKind::Boolean(b2) if b == b2 => {}
+                _ => return None,
+            },
+            _ => return None,
+        }
+
+        pi += 1;
+        ii += 1;
+    }
+
+    if ii == input.len() {
+        Some(bindings)
+    } else {
+        None
+    }
+}
+
+fn find_ellipsis_var(expr: &Expr, bindings: &HashMap<String, MacroBinding>) -> Option<String> {
+    match &expr.kind {
+        ExprKind::Symbol(ref s) => {
+            if let Some(MacroBinding::List(_)) = bindings.get(s) {
+                Some(s.clone())
+            } else {
+                None
+            }
+        }
+        ExprKind::List(items) => {
+            for item in items {
+                if let Some(v) = find_ellipsis_var(item, bindings) {
+                    return Some(v);
+                }
+            }
+            None
+        }
+        _ => None,
+    }
+}
+
+fn expand_template(
+    template: &Expr,
+    bindings: &HashMap<String, MacroBinding>,
+    renames: &HashMap<String, String>,
+) -> Expr {
+    match &template.kind {
+        ExprKind::Symbol(ref s) => {
+            if let Some(MacroBinding::Single(expr)) = bindings.get(s) {
+                return expr.clone();
+            }
+            if let Some(new_name) = renames.get(s) {
+                return Expr {
+                    kind: ExprKind::Symbol(new_name.clone()),
+                    pos: template.pos,
+                };
+            }
+            template.clone()
+        }
+        ExprKind::List(items) => {
+            let mut expanded = Vec::new();
+            let mut i = 0;
+            while i < items.len() {
+                if i + 1 < items.len() {
+                    if let ExprKind::Symbol(ref s) = items[i + 1].kind {
+                        if s == "..." {
+                            if let Some(var_name) = find_ellipsis_var(&items[i], bindings) {
+                                if let Some(MacroBinding::List(ref elems)) = bindings.get(&var_name) {
+                                    for elem in elems {
+                                        let mut local = bindings.clone();
+                                        local.insert(var_name.clone(), MacroBinding::Single(elem.clone()));
+                                        expanded.push(expand_template(&items[i], &local, renames));
+                                    }
+                                }
+                            }
+                            i += 2;
+                            continue;
+                        }
+                    }
+                }
+                expanded.push(expand_template(&items[i], bindings, renames));
+                i += 1;
+            }
+            Expr {
+                kind: ExprKind::List(expanded),
+                pos: template.pos,
+            }
+        }
+        _ => template.clone(),
+    }
+}
+
+fn collect_free_symbols(
+    expr: &Expr,
+    pattern_vars: &HashSet<String>,
+    result: &mut HashSet<String>,
+) {
+    match &expr.kind {
+        ExprKind::Symbol(ref s) => {
+            if s != "..." && !pattern_vars.contains(s) && !is_keyword(s) {
+                result.insert(s.clone());
+            }
+        }
+        ExprKind::List(items) => {
+            for item in items {
+                collect_free_symbols(item, pattern_vars, result);
+            }
+        }
+        _ => {}
+    }
+}
+
+fn expand_macro(
+    input: &[Expr],
+    literals: &[String],
+    rules: &[(Expr, Expr)],
+    def_env: &Env,
+    use_env: &Env,
+    pos: Pos,
+) -> Result<Expr, EvalError> {
+    for (pattern, template) in rules {
+        let pat_items = match &pattern.kind {
+            ExprKind::List(items) => items,
+            _ => continue,
+        };
+        if let Some(bindings) = match_pattern(&pat_items[1..], &input[1..], literals) {
+            let pattern_vars: HashSet<String> = bindings.keys().cloned().collect();
+            let mut free_syms = HashSet::new();
+            collect_free_symbols(template, &pattern_vars, &mut free_syms);
+
+            let mut renames = HashMap::new();
+            for sym in &free_syms {
+                renames.insert(sym.clone(), gensym(sym));
+            }
+
+            for (orig, renamed) in &renames {
+                if let Some(val) = def_env.get(orig) {
+                    use_env.set(renamed.clone(), val);
+                }
+            }
+
+            return Ok(expand_template(template, &bindings, &renames));
+        }
+    }
+    Err(EvalError::Type(format!(
+        "no matching macro pattern at {}",
+        pos.fmt()
+    )))
 }
 
 /// Evaluate one or more Scheme expressions and return the string
