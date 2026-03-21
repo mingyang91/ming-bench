@@ -1214,6 +1214,111 @@ fn eval_tco(expr: &Expr, env: &Env, out: &mut String) -> Result<Value, EvalError
                             cur_env = local_env;
                             continue 'tco;
                         }
+                        "do" => {
+                            // (do ((var init step) ...) (test expr ...) body ...)
+                            let args = &items[1..];
+                            if args.len() < 2 {
+                                break 'tco Err(EvalError::Arity(format!(
+                                    "do requires variable bindings and test clause at {}",
+                                    pos.fmt()
+                                )));
+                            }
+                            let var_specs = match &args[0].kind {
+                                ExprKind::List(vs) => vs,
+                                _ => break 'tco Err(EvalError::Type(format!(
+                                    "do: variable bindings must be a list at {}",
+                                    args[0].pos.fmt()
+                                ))),
+                            };
+                            let test_clause = match &args[1].kind {
+                                ExprKind::List(tc) => tc,
+                                _ => break 'tco Err(EvalError::Type(format!(
+                                    "do: test clause must be a list at {}",
+                                    args[1].pos.fmt()
+                                ))),
+                            };
+                            if test_clause.is_empty() {
+                                break 'tco Err(EvalError::Type(format!(
+                                    "do: test clause must have at least a test expression at {}",
+                                    args[1].pos.fmt()
+                                )));
+                            }
+                            let body = &args[2..];
+
+                            // Parse variable specs: (var init [step])
+                            let mut var_names: Vec<String> = Vec::new();
+                            let mut init_exprs: Vec<Expr> = Vec::new();
+                            let mut step_exprs: Vec<Option<Expr>> = Vec::new();
+                            for spec in var_specs {
+                                match &spec.kind {
+                                    ExprKind::List(parts) if parts.len() >= 2 && parts.len() <= 3 => {
+                                        let name = match &parts[0].kind {
+                                            ExprKind::Symbol(s) => s.clone(),
+                                            _ => break 'tco Err(EvalError::Type(format!(
+                                                "do: variable name must be a symbol at {}",
+                                                parts[0].pos.fmt()
+                                            ))),
+                                        };
+                                        var_names.push(name);
+                                        init_exprs.push(parts[1].clone());
+                                        step_exprs.push(if parts.len() == 3 { Some(parts[2].clone()) } else { None });
+                                    }
+                                    _ => break 'tco Err(EvalError::Type(format!(
+                                        "do: invalid variable spec at {}",
+                                        spec.pos.fmt()
+                                    ))),
+                                }
+                            }
+
+                            // Evaluate init expressions in current env
+                            let loop_env = Env::with_parent(&cur_env);
+                            for (name, init_expr) in var_names.iter().zip(init_exprs.iter()) {
+                                let val = eval(init_expr, &cur_env, out)?;
+                                loop_env.set(name.clone(), val);
+                            }
+
+                            let test_expr = &test_clause[0];
+                            let result_exprs = &test_clause[1..];
+
+                            loop {
+                                // Evaluate test
+                                let test_val = eval(test_expr, &loop_env, out)?;
+                                if test_val.is_truthy() {
+                                    // Test is true: evaluate result exprs and return last
+                                    if result_exprs.is_empty() {
+                                        break 'tco Ok(Value::Nil);
+                                    }
+                                    for e in &result_exprs[..result_exprs.len() - 1] {
+                                        eval(e, &loop_env, out)?;
+                                    }
+                                    cur_expr = result_exprs.last().unwrap().clone();
+                                    cur_env = loop_env;
+                                    continue 'tco;
+                                }
+
+                                // Execute body
+                                for e in body {
+                                    eval(e, &loop_env, out)?;
+                                }
+
+                                // Evaluate step expressions with current values (parallel)
+                                let mut new_vals: Vec<Value> = Vec::new();
+                                for (i, step) in step_exprs.iter().enumerate() {
+                                    match step {
+                                        Some(step_expr) => {
+                                            new_vals.push(eval(step_expr, &loop_env, out)?);
+                                        }
+                                        None => {
+                                            new_vals.push(loop_env.get(&var_names[i]).unwrap());
+                                        }
+                                    }
+                                }
+                                // Update all variables at once
+                                for (name, val) in var_names.iter().zip(new_vals.into_iter()) {
+                                    loop_env.set(name.clone(), val);
+                                }
+                            }
+                        }
                         "case" => {
                             if items.len() < 2 {
                                 break 'tco Err(EvalError::Arity(format!(
@@ -3797,7 +3902,7 @@ fn is_keyword(name: &str) -> bool {
             | "define-syntax" | "syntax-rules" | "dynamic-wind"
             | "raise" | "guard" | "with-exception-handler"
             | "define-record-type" | "syntax-case" | "syntax"
-            | "with-syntax" | "case-lambda"
+            | "with-syntax" | "case-lambda" | "do"
     ) || Value::is_builtin_name(name)
 }
 
