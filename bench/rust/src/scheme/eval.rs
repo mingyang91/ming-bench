@@ -80,6 +80,7 @@ fn eval_special_form(
         "cond" => eval_cond(args, span, env).map(Some),
         "and" => eval_and(args, env).map(Some),
         "or" => eval_or(args, env).map(Some),
+        "set!" => eval_set(args, span, env).map(Bounce::Done).map(Some),
         "string-set!" => eval_string_set(args, env)
             .map(Bounce::Done)
             .map(Some)
@@ -390,9 +391,12 @@ fn eval_define(args: &[Expr], span: Span, env: &Env) -> Result<Value, EvalError>
 }
 
 fn eval_lambda(args: &[Expr], env: &Env) -> Result<Value, EvalError> {
-    let [Expr::List(params, _), body] = args else {
+    let [Expr::List(params, span), body @ ..] = args else {
         return Err(EvalError::Parse("invalid lambda form".into()));
     };
+    if body.is_empty() {
+        return Err(EvalError::Parse("lambda requires a body".into()));
+    }
     let param_names: Vec<String> = params
         .iter()
         .map(|p| {
@@ -403,11 +407,23 @@ fn eval_lambda(args: &[Expr], env: &Env) -> Result<Value, EvalError> {
             }
         })
         .collect::<Result<_, _>>()?;
+    let wrapped_body = wrap_body(body, *span);
     Ok(Value::Lambda {
         params: param_names,
-        body: body.clone(),
+        body: wrapped_body,
         closure: env.clone(),
     })
+}
+
+fn eval_set(args: &[Expr], span: Span, env: &Env) -> Result<Value, EvalError> {
+    let [Expr::Symbol(ref name, _), ref val_expr] = args else {
+        return Err(EvalError::Parse("set! requires (set! var expr)".into()).at(span));
+    };
+    let val = eval(val_expr, env)?;
+    if !env.set(name, val) {
+        return Err(EvalError::UnboundVariable { name: name.clone() }.at(span));
+    }
+    Ok(Value::Void)
 }
 
 fn eval_arithmetic(
