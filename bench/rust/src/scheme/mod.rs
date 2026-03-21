@@ -31,9 +31,11 @@ enum Value {
     Nil,
     Lambda {
         params: Rc<Vec<String>>,
+        rest_param: Option<String>,
         body: Rc<Vec<Expr>>,
         env: Env,
     },
+    Builtin(String),
 }
 
 impl Value {
@@ -88,11 +90,26 @@ impl Value {
                 out
             }
             Value::Lambda { .. } => "<procedure>".to_string(),
+            Value::Builtin(name) => format!("<builtin:{}>", name),
         }
     }
 
     fn is_truthy(&self) -> bool {
         !matches!(self, Value::Boolean(false))
+    }
+
+    fn is_builtin_name(name: &str) -> bool {
+        matches!(
+            name,
+            "+" | "-" | "*" | "/" | "<" | ">" | "=" | "<=" | ">="
+                | "not" | "cons" | "car" | "cdr" | "null?" | "list" | "length"
+                | "string?" | "number?" | "boolean?" | "pair?" | "symbol?" | "char?"
+                | "display" | "write" | "newline"
+                | "string-append" | "string-length" | "substring"
+                | "string->number" | "number->string" | "symbol->string" | "string->symbol"
+                | "string-copy" | "string-ref" | "string-set!"
+                | "apply"
+        )
     }
 
     fn as_integer(&self, pos: Pos) -> Result<i64, EvalError> {
@@ -444,11 +461,13 @@ fn eval(expr: &Expr, env: &Env, out: &mut String) -> Result<Value, EvalError> {
             ExprKind::Str(s) => break 'tco Ok(Value::Str(s)),
             ExprKind::Char(c) => break 'tco Ok(Value::Char(c)),
             ExprKind::Symbol(name) => {
-                break 'tco cur_env
-                    .get(&name)
-                    .ok_or_else(|| {
-                        EvalError::UnboundVariable(format!("{} at {}", name, pos.fmt()))
-                    });
+                if let Some(val) = cur_env.get(&name) {
+                    break 'tco Ok(val);
+                } else if Value::is_builtin_name(&name) {
+                    break 'tco Ok(Value::Builtin(name));
+                } else {
+                    break 'tco Err(EvalError::UnboundVariable(format!("{} at {}", name, pos.fmt())));
+                }
             }
             ExprKind::List(items) => {
                 if items.is_empty() {
@@ -568,6 +587,7 @@ fn eval(expr: &Expr, env: &Env, out: &mut String) -> Result<Value, EvalError> {
                                 }
                                 let lambda = Value::Lambda {
                                     params: Rc::new(params),
+                                    rest_param: None,
                                     body: body.clone(),
                                     env: cur_env.clone(),
                                 };
@@ -704,46 +724,97 @@ fn eval(expr: &Expr, env: &Env, out: &mut String) -> Result<Value, EvalError> {
                     items[1..].iter().map(|a| eval(a, &cur_env, out)).collect();
                 let args = args?;
                 if let Some(ref name) = func_name {
+                    if name == "apply" {
+                        break 'tco call_apply(&args, pos, &cur_env, out);
+                    }
                     if let Some(result) = apply_builtin(name, &args, pos, out)? {
                         break 'tco Ok(result);
                     }
                 }
                 let func = if let Some(ref name) = func_name {
-                    cur_env.get(name).ok_or_else(|| {
-                        EvalError::UnboundVariable(format!("{} at {}", name, pos.fmt()))
-                    })?
+                    if let Some(val) = cur_env.get(name) {
+                        val
+                    } else if Value::is_builtin_name(name) {
+                        Value::Builtin(name.clone())
+                    } else {
+                        break 'tco Err(EvalError::UnboundVariable(format!("{} at {}", name, pos.fmt())));
+                    }
                 } else {
                     eval(&items[0], &cur_env, out)?
                 };
                 match func {
+                    Value::Builtin(ref bname) => {
+                        if bname == "apply" {
+                            break 'tco call_apply(&args, pos, &cur_env, out);
+                        }
+                        match apply_builtin(bname, &args, pos, out)? {
+                            Some(result) => break 'tco Ok(result),
+                            None => break 'tco Err(EvalError::Type(format!(
+                                "unknown builtin {} at {}",
+                                bname,
+                                pos.fmt()
+                            ))),
+                        }
+                    }
                     Value::Lambda {
                         params,
+                        rest_param,
                         body,
                         env: closure_env,
                     } => {
-                        if params.len() != args.len() {
-                            break 'tco Err(EvalError::Arity(format!(
-                                "expected {} arguments, got {} at {}",
-                                params.len(),
-                                args.len(),
-                                pos.fmt()
-                            )));
+                        if let Some(ref rp) = rest_param {
+                            if args.len() < params.len() {
+                                break 'tco Err(EvalError::Arity(format!(
+                                    "expected at least {} arguments, got {} at {}",
+                                    params.len(),
+                                    args.len(),
+                                    pos.fmt()
+                                )));
+                            }
+                            let new_env = Env::with_parent(&closure_env);
+                            cur_env.copy_all_into_if_absent(&new_env);
+                            for (p, a) in params.iter().zip(args.iter()) {
+                                new_env.set(p.clone(), a.clone());
+                            }
+                            // Build rest list from excess args
+                            let mut rest = Value::Nil;
+                            for a in args[params.len()..].iter().rev() {
+                                rest = Value::Pair(Box::new(a.clone()), Box::new(rest));
+                            }
+                            new_env.set(rp.clone(), rest);
+                            if body.is_empty() {
+                                break 'tco Ok(Value::Nil);
+                            }
+                            for e in &body[..body.len() - 1] {
+                                eval(e, &new_env, out)?;
+                            }
+                            cur_expr = body.last().unwrap().clone();
+                            cur_env = new_env;
+                            continue 'tco;
+                        } else {
+                            if params.len() != args.len() {
+                                break 'tco Err(EvalError::Arity(format!(
+                                    "expected {} arguments, got {} at {}",
+                                    params.len(),
+                                    args.len(),
+                                    pos.fmt()
+                                )));
+                            }
+                            let new_env = Env::with_parent(&closure_env);
+                            cur_env.copy_all_into_if_absent(&new_env);
+                            for (p, a) in params.iter().zip(args.into_iter()) {
+                                new_env.set(p.clone(), a);
+                            }
+                            if body.is_empty() {
+                                break 'tco Ok(Value::Nil);
+                            }
+                            for e in &body[..body.len() - 1] {
+                                eval(e, &new_env, out)?;
+                            }
+                            cur_expr = body.last().unwrap().clone();
+                            cur_env = new_env;
+                            continue 'tco;
                         }
-                        let new_env = Env::with_parent(&closure_env);
-                        // Copy calling env bindings for mutual recursion support
-                        cur_env.copy_all_into_if_absent(&new_env);
-                        for (p, a) in params.iter().zip(args.into_iter()) {
-                            new_env.set(p.clone(), a);
-                        }
-                        if body.is_empty() {
-                            break 'tco Ok(Value::Nil);
-                        }
-                        for e in &body[..body.len() - 1] {
-                            eval(e, &new_env, out)?;
-                        }
-                        cur_expr = body.last().unwrap().clone();
-                        cur_env = new_env;
-                        continue 'tco;
                     }
                     _ => {
                         break 'tco Err(EvalError::Type(format!(
@@ -793,20 +864,11 @@ fn eval_define(args: &[Expr], pos: Pos, env: &Env, out: &mut String) -> Result<V
                     )))
                 }
             };
-            let params: Result<Vec<String>, _> = parts[1..]
-                .iter()
-                .map(|p| match &p.kind {
-                    ExprKind::Symbol(s) => Ok(s.clone()),
-                    _ => Err(EvalError::Type(format!(
-                        "parameter must be symbol at {}",
-                        p.pos.fmt()
-                    ))),
-                })
-                .collect();
-            let params = params?;
+            let (params, rest_param) = parse_params(&parts[1..], pos)?;
             let body = args[1..].to_vec();
             let lambda = Value::Lambda {
                 params: Rc::new(params),
+                rest_param,
                 body: Rc::new(body),
                 env: env.clone(),
             };
@@ -854,37 +916,177 @@ fn eval_lambda(args: &[Expr], pos: Pos, env: &Env) -> Result<Value, EvalError> {
             pos.fmt()
         )));
     }
-    let params = match &args[0].kind {
+    match &args[0].kind {
         ExprKind::List(parts) => {
-            let mut ps = Vec::new();
-            for p in parts {
-                match &p.kind {
-                    ExprKind::Symbol(s) => ps.push(s.clone()),
-                    _ => {
-                        return Err(EvalError::Type(format!(
-                            "parameter must be symbol at {}",
-                            p.pos.fmt()
-                        )))
-                    }
-                }
-            }
-            ps
+            let (params, rest_param) = parse_params(parts, pos)?;
+            Ok(Value::Lambda {
+                params: Rc::new(params),
+                rest_param,
+                body: Rc::new(args[1..].to_vec()),
+                env: env.clone(),
+            })
         }
-        _ => {
-            return Err(EvalError::Type(format!(
-                "lambda: params must be a list at {}",
-                pos.fmt()
-            )))
+        ExprKind::Symbol(s) => {
+            // (lambda args body) — all args collected into rest
+            Ok(Value::Lambda {
+                params: Rc::new(vec![]),
+                rest_param: Some(s.clone()),
+                body: Rc::new(args[1..].to_vec()),
+                env: env.clone(),
+            })
         }
-    };
-    Ok(Value::Lambda {
-        params: Rc::new(params),
-        body: Rc::new(args[1..].to_vec()),
-        env: env.clone(),
-    })
+        _ => Err(EvalError::Type(format!(
+            "lambda: params must be a list or symbol at {}",
+            pos.fmt()
+        ))),
+    }
 }
 
 
+
+/// Parse parameter list, handling dot notation for rest params.
+/// e.g. [x, y, ., rest] -> (vec!["x", "y"], Some("rest"))
+fn parse_params(parts: &[Expr], pos: Pos) -> Result<(Vec<String>, Option<String>), EvalError> {
+    let mut params = Vec::new();
+    let mut rest_param = None;
+    let mut i = 0;
+    while i < parts.len() {
+        match &parts[i].kind {
+            ExprKind::Symbol(s) if s == "." => {
+                if i + 1 >= parts.len() {
+                    return Err(EvalError::Parse(format!(
+                        "expected rest parameter after . at {}",
+                        pos.fmt()
+                    )));
+                }
+                match &parts[i + 1].kind {
+                    ExprKind::Symbol(rp) => rest_param = Some(rp.clone()),
+                    _ => {
+                        return Err(EvalError::Type(format!(
+                            "rest parameter must be symbol at {}",
+                            parts[i + 1].pos.fmt()
+                        )))
+                    }
+                }
+                i += 2;
+                break;
+            }
+            ExprKind::Symbol(s) => {
+                params.push(s.clone());
+                i += 1;
+            }
+            _ => {
+                return Err(EvalError::Type(format!(
+                    "parameter must be symbol at {}",
+                    parts[i].pos.fmt()
+                )))
+            }
+        }
+    }
+    Ok((params, rest_param))
+}
+
+/// Convert a Value list to a Vec<Value>.
+fn value_list_to_vec(val: &Value, pos: Pos) -> Result<Vec<Value>, EvalError> {
+    let mut result = Vec::new();
+    let mut cur = val;
+    loop {
+        match cur {
+            Value::Nil => return Ok(result),
+            Value::Pair(car, cdr) => {
+                result.push(*car.clone());
+                cur = cdr;
+            }
+            _ => {
+                return Err(EvalError::Type(format!(
+                    "apply: last argument must be a proper list at {}",
+                    pos.fmt()
+                )))
+            }
+        }
+    }
+}
+
+/// Implement (apply fn arg1 ... argN list)
+fn call_apply(args: &[Value], pos: Pos, env: &Env, out: &mut String) -> Result<Value, EvalError> {
+    if args.len() < 2 {
+        return Err(EvalError::Arity(format!(
+            "apply requires at least 2 arguments at {}",
+            pos.fmt()
+        )));
+    }
+    let func = &args[0];
+    let last = &args[args.len() - 1];
+    let mut call_args: Vec<Value> = args[1..args.len() - 1].to_vec();
+    let tail = value_list_to_vec(last, pos)?;
+    call_args.extend(tail);
+
+    match func {
+        Value::Builtin(bname) => {
+            if bname == "apply" {
+                return call_apply(&call_args, pos, env, out);
+            }
+            match apply_builtin(bname, &call_args, pos, out)? {
+                Some(result) => Ok(result),
+                None => Err(EvalError::Type(format!(
+                    "unknown builtin {} at {}",
+                    bname,
+                    pos.fmt()
+                ))),
+            }
+        }
+        Value::Lambda {
+            params,
+            rest_param,
+            body,
+            env: closure_env,
+        } => {
+            let new_env = Env::with_parent(closure_env);
+            env.copy_all_into_if_absent(&new_env);
+            if let Some(ref rp) = rest_param {
+                if call_args.len() < params.len() {
+                    return Err(EvalError::Arity(format!(
+                        "expected at least {} arguments, got {} at {}",
+                        params.len(),
+                        call_args.len(),
+                        pos.fmt()
+                    )));
+                }
+                for (p, a) in params.iter().zip(call_args.iter()) {
+                    new_env.set(p.clone(), a.clone());
+                }
+                let mut rest = Value::Nil;
+                for a in call_args[params.len()..].iter().rev() {
+                    rest = Value::Pair(Box::new(a.clone()), Box::new(rest));
+                }
+                new_env.set(rp.clone(), rest);
+            } else {
+                if params.len() != call_args.len() {
+                    return Err(EvalError::Arity(format!(
+                        "expected {} arguments, got {} at {}",
+                        params.len(),
+                        call_args.len(),
+                        pos.fmt()
+                    )));
+                }
+                for (p, a) in params.iter().zip(call_args.into_iter()) {
+                    new_env.set(p.clone(), a);
+                }
+            }
+            if body.is_empty() {
+                return Ok(Value::Nil);
+            }
+            for e in &body[..body.len() - 1] {
+                eval(e, &new_env, out)?;
+            }
+            eval(body.last().unwrap(), &new_env, out)
+        }
+        _ => Err(EvalError::Type(format!(
+            "apply: first argument must be a procedure at {}",
+            pos.fmt()
+        ))),
+    }
+}
 
 fn eval_string_set(args: &[Expr], pos: Pos, env: &Env, out: &mut String) -> Result<Value, EvalError> {
     if args.len() != 3 {
