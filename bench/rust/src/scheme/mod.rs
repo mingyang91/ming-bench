@@ -37,6 +37,13 @@ enum Builtin {
     Sub,
     Mul,
     Div,
+    Abs,
+    Modulo,
+    Remainder,
+    Quotient,
+    Min,
+    Max,
+    Expt,
     Apply,
     CallCc,
     Eq,
@@ -54,12 +61,21 @@ enum Builtin {
     IsNull,
     List,
     Map,
+    ListRef,
+    ListTail,
     Length,
+    IsList,
+    Assoc,
     IsString,
     IsNumber,
     IsBoolean,
     IsPair,
     IsSymbol,
+    IsZero,
+    IsPositive,
+    IsNegative,
+    IsOdd,
+    IsEven,
     Display,
     Write,
     Newline,
@@ -78,6 +94,17 @@ enum Builtin {
     IsChar,
     CharToInteger,
     IntegerToChar,
+    CharAlphabetic,
+    CharNumeric,
+    CharUpcase,
+    CharDowncase,
+    CharEqual,
+    CharLess,
+    StringEqual,
+    StringLess,
+    StringCiEqual,
+    StringUpcase,
+    StringDowncase,
     Vector,
     MakeVector,
     VectorRef,
@@ -93,6 +120,13 @@ const BUILTIN_BINDINGS: &[(&str, Builtin)] = &[
     ("-", Builtin::Sub),
     ("*", Builtin::Mul),
     ("/", Builtin::Div),
+    ("abs", Builtin::Abs),
+    ("modulo", Builtin::Modulo),
+    ("remainder", Builtin::Remainder),
+    ("quotient", Builtin::Quotient),
+    ("min", Builtin::Min),
+    ("max", Builtin::Max),
+    ("expt", Builtin::Expt),
     ("apply", Builtin::Apply),
     ("call/cc", Builtin::CallCc),
     ("eq?", Builtin::Eq),
@@ -110,12 +144,21 @@ const BUILTIN_BINDINGS: &[(&str, Builtin)] = &[
     ("null?", Builtin::IsNull),
     ("list", Builtin::List),
     ("map", Builtin::Map),
+    ("list-ref", Builtin::ListRef),
+    ("list-tail", Builtin::ListTail),
     ("length", Builtin::Length),
+    ("list?", Builtin::IsList),
+    ("assoc", Builtin::Assoc),
     ("string?", Builtin::IsString),
     ("number?", Builtin::IsNumber),
     ("boolean?", Builtin::IsBoolean),
     ("pair?", Builtin::IsPair),
     ("symbol?", Builtin::IsSymbol),
+    ("zero?", Builtin::IsZero),
+    ("positive?", Builtin::IsPositive),
+    ("negative?", Builtin::IsNegative),
+    ("odd?", Builtin::IsOdd),
+    ("even?", Builtin::IsEven),
     ("display", Builtin::Display),
     ("write", Builtin::Write),
     ("newline", Builtin::Newline),
@@ -134,6 +177,17 @@ const BUILTIN_BINDINGS: &[(&str, Builtin)] = &[
     ("char?", Builtin::IsChar),
     ("char->integer", Builtin::CharToInteger),
     ("integer->char", Builtin::IntegerToChar),
+    ("char-alphabetic?", Builtin::CharAlphabetic),
+    ("char-numeric?", Builtin::CharNumeric),
+    ("char-upcase", Builtin::CharUpcase),
+    ("char-downcase", Builtin::CharDowncase),
+    ("char=?", Builtin::CharEqual),
+    ("char<?", Builtin::CharLess),
+    ("string=?", Builtin::StringEqual),
+    ("string<?", Builtin::StringLess),
+    ("string-ci=?", Builtin::StringCiEqual),
+    ("string-upcase", Builtin::StringUpcase),
+    ("string-downcase", Builtin::StringDowncase),
     ("vector", Builtin::Vector),
     ("make-vector", Builtin::MakeVector),
     ("vector-ref", Builtin::VectorRef),
@@ -230,6 +284,9 @@ impl SchemeVector {
 }
 
 #[derive(Clone, Debug)]
+struct SchemePair(Rc<PairValue>);
+
+#[derive(Clone, Debug)]
 enum Value {
     Int(i64),
     Bool(bool),
@@ -237,12 +294,33 @@ enum Value {
     Symbol(String),
     Char(char),
     List(Vec<Value>),
+    Pair(SchemePair),
     Vector(SchemeVector),
     Builtin(Builtin),
     Procedure(Rc<Procedure>),
     Continuation(Rc<Continuation>),
     Uninitialized(String),
     Void,
+}
+
+#[derive(Clone, Debug)]
+struct PairValue {
+    car: Value,
+    cdr: Value,
+}
+
+impl SchemePair {
+    fn new(car: Value, cdr: Value) -> Self {
+        Self(Rc::new(PairValue { car, cdr }))
+    }
+
+    fn car(&self) -> Value {
+        self.0.car.clone()
+    }
+
+    fn cdr(&self) -> Value {
+        self.0.cdr.clone()
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -346,7 +424,8 @@ enum Continuation {
     },
     Map {
         procedure: Value,
-        items: Rc<Vec<Value>>,
+        lists: Rc<Vec<Vec<Value>>>,
+        len: usize,
         index: usize,
         acc: Vec<Value>,
         pos: SourcePos,
@@ -376,6 +455,7 @@ impl Value {
             Self::Symbol(_) => "symbol",
             Self::Char(_) => "char",
             Self::List(_) => "list",
+            Self::Pair(_) => "pair",
             Self::Vector(_) => "vector",
             Self::Builtin(_) | Self::Procedure(_) | Self::Continuation(_) => "procedure",
             Self::Uninitialized(_) => "uninitialized",
@@ -410,6 +490,7 @@ impl Value {
             Self::Symbol(value) => value.clone(),
             Self::Char(value) => render_char(*value, mode),
             Self::List(items) => render_list(items, mode),
+            Self::Pair(pair) => render_pair(pair, mode),
             Self::Vector(items) => render_vector(items, mode),
             Self::Builtin(_) | Self::Procedure(_) | Self::Continuation(_) => "#<procedure>".into(),
             Self::Uninitialized(_) => "#<uninitialized>".into(),
@@ -747,6 +828,13 @@ fn invalid_length(pos: SourcePos, len: i64) -> EvalError {
     EvalError::InvalidLength { pos, len }
 }
 
+fn invalid_argument(pos: SourcePos, message: impl Into<String>) -> EvalError {
+    EvalError::InvalidArgument {
+        pos,
+        message: message.into(),
+    }
+}
+
 fn uninitialized_binding(pos: SourcePos, name: impl Into<String>) -> EvalError {
     EvalError::UninitializedBinding {
         pos,
@@ -858,8 +946,38 @@ fn quote_expr(expr: &Expr) -> Value {
         Expr::String(value, _) => Value::String(SchemeString::new(value.clone())),
         Expr::Char(value, _) => Value::Char(*value),
         Expr::Symbol(value, _) => Value::Symbol(value.clone()),
-        Expr::List(items, _) => Value::List(items.iter().map(quote_expr).collect()),
+        Expr::List(items, _) => quote_list(items),
     }
+}
+
+fn quote_list(items: &[Expr]) -> Value {
+    if let Some((prefix, tail)) = dotted_list_parts(items) {
+        prefix.iter().rev().fold(quote_expr(tail), |cdr, expr| {
+            Value::Pair(SchemePair::new(quote_expr(expr), cdr))
+        })
+    } else {
+        Value::List(items.iter().map(quote_expr).collect())
+    }
+}
+
+fn dotted_list_parts(items: &[Expr]) -> Option<(&[Expr], &Expr)> {
+    let mut dot_index = None;
+
+    for (index, expr) in items.iter().enumerate() {
+        if matches!(expr, Expr::Symbol(name, _) if name == ".") {
+            if dot_index.is_some() {
+                return None;
+            }
+            dot_index = Some(index);
+        }
+    }
+
+    let dot_index = dot_index?;
+    if dot_index == 0 || dot_index + 2 != items.len() {
+        return None;
+    }
+
+    Some((&items[..dot_index], &items[dot_index + 1]))
 }
 
 fn eval_expr(expr: &Expr, env: &EnvRef) -> Result<Value, EvalError> {
@@ -1789,7 +1907,8 @@ fn continue_with_value(value: Value, cont: Rc<Continuation>) -> Result<MachineSt
         }
         Continuation::Map {
             procedure,
-            items,
+            lists,
+            len,
             index,
             acc,
             pos,
@@ -1799,20 +1918,25 @@ fn continue_with_value(value: Value, cont: Rc<Continuation>) -> Result<MachineSt
             let mut next_acc = acc.clone();
             next_acc.push(value);
 
-            if *index >= items.len() {
+            if *index >= *len {
                 Ok(MachineState::Return {
                     value: Value::List(next_acc),
                     cont: next.clone(),
                 })
             } else {
+                let row = lists
+                    .iter()
+                    .map(|list| list[*index].clone())
+                    .collect::<Vec<_>>();
                 dispatch_apply(
                     procedure.clone(),
-                    vec![items[*index].clone()],
+                    row,
                     *pos,
                     output.clone(),
                     Rc::new(Continuation::Map {
                         procedure: procedure.clone(),
-                        items: items.clone(),
+                        lists: lists.clone(),
+                        len: *len,
                         index: *index + 1,
                         acc: next_acc,
                         pos: *pos,
@@ -1861,6 +1985,13 @@ fn apply_builtin_state(
         Builtin::Sub => Some(eval_sub(&args, pos)?),
         Builtin::Mul => Some(eval_mul(&args, pos)?),
         Builtin::Div => Some(eval_div(&args, pos)?),
+        Builtin::Abs => Some(eval_abs(&args, pos)?),
+        Builtin::Modulo => Some(eval_modulo(&args, pos)?),
+        Builtin::Remainder => Some(eval_remainder(&args, pos)?),
+        Builtin::Quotient => Some(eval_quotient(&args, pos)?),
+        Builtin::Min => Some(eval_min(&args, pos)?),
+        Builtin::Max => Some(eval_max(&args, pos)?),
+        Builtin::Expt => Some(eval_expt(&args, pos)?),
         Builtin::Apply => {
             let [operator, rest @ ..] = args.as_slice() else {
                 return Err(wrong_arity(pos, "apply", "at least 2", args.len()));
@@ -1872,13 +2003,11 @@ fn apply_builtin_state(
 
             let prefix = &rest[..rest.len() - 1];
             let last = &rest[rest.len() - 1];
-            let Value::List(spliced) = last else {
-                return Err(type_error(pos, "list", last.type_name()));
-            };
+            let spliced = proper_list_to_vec(last).ok_or_else(|| type_error(pos, "list", last.type_name()))?;
 
             let mut expanded_args = Vec::with_capacity(prefix.len() + spliced.len());
             expanded_args.extend(prefix.iter().cloned());
-            expanded_args.extend(spliced.iter().cloned());
+            expanded_args.extend(spliced);
             return dispatch_apply(operator.clone(), expanded_args, pos, output, cont);
         }
         Builtin::CallCc => {
@@ -1918,26 +2047,36 @@ fn apply_builtin_state(
         Builtin::IsNull => Some(eval_null(&args, pos)?),
         Builtin::List => Some(eval_list_builtin(&args, pos)?),
         Builtin::Map => {
-            let [procedure, list] = args.as_slice() else {
-                return Err(wrong_arity(pos, "map", "exactly 2", args.len()));
+            let [procedure, list_args @ ..] = args.as_slice() else {
+                return Err(wrong_arity(pos, "map", "at least 2", args.len()));
             };
 
-            let Value::List(items) = list else {
-                return Err(type_error(pos, "list", list.type_name()));
-            };
+            if list_args.is_empty() {
+                return Err(wrong_arity(pos, "map", "at least 2", args.len()));
+            }
 
-            if items.is_empty() {
+            let lists = list_args
+                .iter()
+                .map(|value| {
+                    proper_list_to_vec(value).ok_or_else(|| type_error(pos, "list", value.type_name()))
+                })
+                .collect::<Result<Vec<_>, _>>()?;
+
+            let len = lists.iter().map(Vec::len).min().unwrap_or(0);
+            if len == 0 {
                 Some(Value::List(Vec::new()))
             } else {
-                let items = Rc::new(items.clone());
+                let row = lists.iter().map(|list| list[0].clone()).collect::<Vec<_>>();
+                let lists = Rc::new(lists);
                 return dispatch_apply(
                     procedure.clone(),
-                    vec![items[0].clone()],
+                    row,
                     pos,
                     output.clone(),
                     Rc::new(Continuation::Map {
                         procedure: procedure.clone(),
-                        items,
+                        lists,
+                        len,
                         index: 1,
                         acc: Vec::new(),
                         pos,
@@ -1947,7 +2086,13 @@ fn apply_builtin_state(
                 );
             }
         }
+        Builtin::ListRef => Some(eval_list_ref(&args, pos)?),
+        Builtin::ListTail => Some(eval_list_tail(&args, pos)?),
         Builtin::Length => Some(eval_length(&args, pos)?),
+        Builtin::IsList => Some(eval_type_predicate(&args, "list?", pos, |value| {
+            proper_list_to_vec(value).is_some()
+        })?),
+        Builtin::Assoc => Some(eval_assoc(&args, pos)?),
         Builtin::IsString => Some(eval_type_predicate(&args, "string?", pos, |value| {
             matches!(value, Value::String(_))
         })?),
@@ -1961,11 +2106,22 @@ fn apply_builtin_state(
             &args,
             "pair?",
             pos,
-            |value| matches!(value, Value::List(items) if !items.is_empty()),
+            is_pair,
         )?),
         Builtin::IsSymbol => Some(eval_type_predicate(&args, "symbol?", pos, |value| {
             matches!(value, Value::Symbol(_))
         })?),
+        Builtin::IsZero => Some(eval_number_predicate(&args, "zero?", pos, |value| value == 0)?),
+        Builtin::IsPositive => {
+            Some(eval_number_predicate(&args, "positive?", pos, |value| value > 0)?)
+        }
+        Builtin::IsNegative => {
+            Some(eval_number_predicate(&args, "negative?", pos, |value| value < 0)?)
+        }
+        Builtin::IsOdd => Some(eval_number_predicate(&args, "odd?", pos, |value| value % 2 != 0)?),
+        Builtin::IsEven => {
+            Some(eval_number_predicate(&args, "even?", pos, |value| value % 2 == 0)?)
+        }
         Builtin::Display => Some(eval_display(&args, pos, &output)?),
         Builtin::Write => Some(eval_write(&args, pos, &output)?),
         Builtin::Newline => Some(eval_newline(&args, pos, &output)?),
@@ -1986,6 +2142,60 @@ fn apply_builtin_state(
         })?),
         Builtin::CharToInteger => Some(eval_char_to_integer(&args, pos)?),
         Builtin::IntegerToChar => Some(eval_integer_to_char(&args, pos)?),
+        Builtin::CharAlphabetic => Some(eval_char_predicate(
+            &args,
+            "char-alphabetic?",
+            pos,
+            |value| value.is_alphabetic(),
+        )?),
+        Builtin::CharNumeric => Some(eval_char_predicate(
+            &args,
+            "char-numeric?",
+            pos,
+            |value| value.is_numeric(),
+        )?),
+        Builtin::CharUpcase => Some(eval_char_transform(&args, "char-upcase", pos, |value| {
+            value.to_uppercase().next().unwrap_or(value)
+        })?),
+        Builtin::CharDowncase => Some(eval_char_transform(
+            &args,
+            "char-downcase",
+            pos,
+            |value| value.to_lowercase().next().unwrap_or(value),
+        )?),
+        Builtin::CharEqual => Some(eval_char_compare(&args, "char=?", pos, |left, right| {
+            left == right
+        })?),
+        Builtin::CharLess => Some(eval_char_compare(&args, "char<?", pos, |left, right| {
+            left < right
+        })?),
+        Builtin::StringEqual => Some(eval_string_compare(
+            &args,
+            "string=?",
+            pos,
+            |left, right| left == right,
+        )?),
+        Builtin::StringLess => Some(eval_string_compare(
+            &args,
+            "string<?",
+            pos,
+            |left, right| left < right,
+        )?),
+        Builtin::StringCiEqual => Some(eval_string_compare(
+            &args,
+            "string-ci=?",
+            pos,
+            |left, right| left.to_lowercase() == right.to_lowercase(),
+        )?),
+        Builtin::StringUpcase => Some(eval_string_case(&args, "string-upcase", pos, |value| {
+            value.chars().flat_map(char::to_uppercase).collect()
+        })?),
+        Builtin::StringDowncase => Some(eval_string_case(
+            &args,
+            "string-downcase",
+            pos,
+            |value| value.chars().flat_map(char::to_lowercase).collect(),
+        )?),
         Builtin::Vector => Some(eval_vector(&args, pos)?),
         Builtin::MakeVector => Some(eval_make_vector(&args, pos)?),
         Builtin::VectorRef => Some(eval_vector_ref(&args, pos)?),
@@ -2189,6 +2399,90 @@ fn eval_div(args: &[Value], pos: SourcePos) -> Result<Value, EvalError> {
     Ok(Value::Int(result))
 }
 
+fn eval_abs(args: &[Value], pos: SourcePos) -> Result<Value, EvalError> {
+    let [value] = args else {
+        return Err(wrong_arity(pos, "abs", "exactly 1", args.len()));
+    };
+
+    Ok(Value::Int(expect_integer(value, pos)?.abs()))
+}
+
+fn eval_modulo(args: &[Value], pos: SourcePos) -> Result<Value, EvalError> {
+    let [dividend, divisor] = args else {
+        return Err(wrong_arity(pos, "modulo", "exactly 2", args.len()));
+    };
+
+    let dividend = expect_integer(dividend, pos)?;
+    let divisor = expect_integer(divisor, pos)?;
+    if divisor == 0 {
+        return Err(division_by_zero(pos));
+    }
+
+    let remainder = dividend % divisor;
+    let modulo = if remainder != 0 && (remainder > 0) != (divisor > 0) {
+        remainder + divisor
+    } else {
+        remainder
+    };
+    Ok(Value::Int(modulo))
+}
+
+fn eval_remainder(args: &[Value], pos: SourcePos) -> Result<Value, EvalError> {
+    let [dividend, divisor] = args else {
+        return Err(wrong_arity(pos, "remainder", "exactly 2", args.len()));
+    };
+
+    let dividend = expect_integer(dividend, pos)?;
+    let divisor = expect_integer(divisor, pos)?;
+    if divisor == 0 {
+        return Err(division_by_zero(pos));
+    }
+
+    Ok(Value::Int(dividend % divisor))
+}
+
+fn eval_quotient(args: &[Value], pos: SourcePos) -> Result<Value, EvalError> {
+    let [dividend, divisor] = args else {
+        return Err(wrong_arity(pos, "quotient", "exactly 2", args.len()));
+    };
+
+    let dividend = expect_integer(dividend, pos)?;
+    let divisor = expect_integer(divisor, pos)?;
+    if divisor == 0 {
+        return Err(division_by_zero(pos));
+    }
+
+    Ok(Value::Int(dividend / divisor))
+}
+
+fn eval_min(args: &[Value], pos: SourcePos) -> Result<Value, EvalError> {
+    let numbers = eval_number_args(args, pos)?;
+    let Some(minimum) = numbers.into_iter().min() else {
+        return Err(wrong_arity(pos, "min", "at least 1", 0));
+    };
+    Ok(Value::Int(minimum))
+}
+
+fn eval_max(args: &[Value], pos: SourcePos) -> Result<Value, EvalError> {
+    let numbers = eval_number_args(args, pos)?;
+    let Some(maximum) = numbers.into_iter().max() else {
+        return Err(wrong_arity(pos, "max", "at least 1", 0));
+    };
+    Ok(Value::Int(maximum))
+}
+
+fn eval_expt(args: &[Value], pos: SourcePos) -> Result<Value, EvalError> {
+    let [base, exponent] = args else {
+        return Err(wrong_arity(pos, "expt", "exactly 2", args.len()));
+    };
+
+    let base = expect_integer(base, pos)?;
+    let exponent = expect_integer(exponent, pos)?;
+    let exponent =
+        u32::try_from(exponent).map_err(|_| invalid_argument(pos, "expt requires a non-negative exponent"))?;
+    Ok(Value::Int(base.pow(exponent)))
+}
+
 fn eval_apply(
     args: &[Value],
     pos: SourcePos,
@@ -2204,13 +2498,11 @@ fn eval_apply(
 
     let prefix = &rest[..rest.len() - 1];
     let last = &rest[rest.len() - 1];
-    let Value::List(spliced) = last else {
-        return Err(type_error(pos, "list", last.type_name()));
-    };
+    let spliced = proper_list_to_vec(last).ok_or_else(|| type_error(pos, "list", last.type_name()))?;
 
     let mut expanded_args = Vec::with_capacity(prefix.len() + spliced.len());
     expanded_args.extend_from_slice(prefix);
-    expanded_args.extend(spliced.iter().cloned());
+    expanded_args.extend(spliced);
     apply_value(operator.clone(), &expanded_args, pos, output)
 }
 
@@ -2253,6 +2545,22 @@ where
     Ok(Value::Bool(predicate(left, right)))
 }
 
+fn eval_number_predicate<F>(
+    args: &[Value],
+    name: &str,
+    pos: SourcePos,
+    predicate: F,
+) -> Result<Value, EvalError>
+where
+    F: Fn(i64) -> bool,
+{
+    let [value] = args else {
+        return Err(wrong_arity(pos, name, "exactly 1", args.len()));
+    };
+
+    Ok(Value::Bool(predicate(expect_integer(value, pos)?)))
+}
+
 fn values_eq(left: &Value, right: &Value) -> bool {
     values_eqv(left, right)
 }
@@ -2265,6 +2573,7 @@ fn values_eqv(left: &Value, right: &Value) -> bool {
         (Value::Char(a), Value::Char(b)) => a == b,
         (Value::String(a), Value::String(b)) => Rc::ptr_eq(&a.0, &b.0),
         (Value::List(a), Value::List(b)) => a.is_empty() && b.is_empty(),
+        (Value::Pair(a), Value::Pair(b)) => Rc::ptr_eq(&a.0, &b.0),
         (Value::Vector(a), Value::Vector(b)) => Rc::ptr_eq(&a.0, &b.0),
         (Value::Builtin(a), Value::Builtin(b)) => {
             std::mem::discriminant(a) == std::mem::discriminant(b)
@@ -2277,17 +2586,23 @@ fn values_eqv(left: &Value, right: &Value) -> bool {
 }
 
 fn values_equal(left: &Value, right: &Value) -> bool {
+    if let (Some(left_items), Some(right_items)) = (proper_list_to_vec(left), proper_list_to_vec(right))
+    {
+        return left_items.len() == right_items.len()
+            && left_items
+                .iter()
+                .zip(right_items.iter())
+                .all(|(left_item, right_item)| values_equal(left_item, right_item));
+    }
+
     match (left, right) {
         (Value::Int(a), Value::Int(b)) => a == b,
         (Value::Bool(a), Value::Bool(b)) => a == b,
         (Value::String(a), Value::String(b)) => a.to_plain_string() == b.to_plain_string(),
         (Value::Symbol(a), Value::Symbol(b)) => a == b,
         (Value::Char(a), Value::Char(b)) => a == b,
-        (Value::List(a), Value::List(b)) => {
-            a.len() == b.len()
-                && a.iter()
-                    .zip(b.iter())
-                    .all(|(left_item, right_item)| values_equal(left_item, right_item))
+        (Value::Pair(a), Value::Pair(b)) => {
+            values_equal(&a.car(), &b.car()) && values_equal(&a.cdr(), &b.cdr())
         }
         (Value::Vector(a), Value::Vector(b)) => {
             let left_items = a.to_vec();
@@ -2315,14 +2630,14 @@ fn eval_cons(args: &[Value], pos: SourcePos) -> Result<Value, EvalError> {
         return Err(wrong_arity(pos, "cons", "exactly 2", args.len()));
     };
 
-    let Value::List(items) = tail else {
-        return Err(type_error(pos, "list", tail.type_name()));
-    };
-
-    let mut result = Vec::with_capacity(items.len() + 1);
-    result.push(head.clone());
-    result.extend(items.iter().cloned());
-    Ok(Value::List(result))
+    if let Some(mut items) = proper_list_to_vec(tail) {
+        let mut result = Vec::with_capacity(items.len() + 1);
+        result.push(head.clone());
+        result.append(&mut items);
+        Ok(Value::List(result))
+    } else {
+        Ok(Value::Pair(SchemePair::new(head.clone(), tail.clone())))
+    }
 }
 
 fn eval_car(args: &[Value], pos: SourcePos) -> Result<Value, EvalError> {
@@ -2330,10 +2645,7 @@ fn eval_car(args: &[Value], pos: SourcePos) -> Result<Value, EvalError> {
         return Err(wrong_arity(pos, "car", "exactly 1", args.len()));
     };
 
-    match value {
-        Value::List(items) if !items.is_empty() => Ok(items[0].clone()),
-        other => Err(type_error(pos, "pair", other.type_name())),
-    }
+    pair_car(value).ok_or_else(|| type_error(pos, "pair", value.type_name()))
 }
 
 fn eval_cdr(args: &[Value], pos: SourcePos) -> Result<Value, EvalError> {
@@ -2341,10 +2653,7 @@ fn eval_cdr(args: &[Value], pos: SourcePos) -> Result<Value, EvalError> {
         return Err(wrong_arity(pos, "cdr", "exactly 1", args.len()));
     };
 
-    match value {
-        Value::List(items) if !items.is_empty() => Ok(Value::List(items[1..].to_vec())),
-        other => Err(type_error(pos, "pair", other.type_name())),
-    }
+    pair_cdr(value).ok_or_else(|| type_error(pos, "pair", value.type_name()))
 }
 
 fn eval_null(args: &[Value], pos: SourcePos) -> Result<Value, EvalError> {
@@ -2361,27 +2670,85 @@ fn eval_list_builtin(args: &[Value], _pos: SourcePos) -> Result<Value, EvalError
     Ok(Value::List(args.to_vec()))
 }
 
+fn eval_list_ref(args: &[Value], pos: SourcePos) -> Result<Value, EvalError> {
+    let [list, index] = args else {
+        return Err(wrong_arity(pos, "list-ref", "exactly 2", args.len()));
+    };
+
+    let index = expect_integer(index, pos)?;
+    if index < 0 {
+        return Err(index_out_of_bounds(pos, index, 0));
+    }
+
+    let items = proper_list_to_vec(list).ok_or_else(|| type_error(pos, "list", list.type_name()))?;
+    items
+        .get(index as usize)
+        .cloned()
+        .ok_or_else(|| index_out_of_bounds(pos, index, items.len()))
+}
+
+fn eval_list_tail(args: &[Value], pos: SourcePos) -> Result<Value, EvalError> {
+    let [list, index] = args else {
+        return Err(wrong_arity(pos, "list-tail", "exactly 2", args.len()));
+    };
+
+    let index = expect_integer(index, pos)?;
+    if index < 0 {
+        return Err(index_out_of_bounds(pos, index, 0));
+    }
+
+    let items = proper_list_to_vec(list).ok_or_else(|| type_error(pos, "list", list.type_name()))?;
+    if index as usize > items.len() {
+        return Err(index_out_of_bounds(pos, index, items.len()));
+    }
+
+    Ok(Value::List(items[index as usize..].to_vec()))
+}
+
+fn eval_assoc(args: &[Value], pos: SourcePos) -> Result<Value, EvalError> {
+    let [key, alist] = args else {
+        return Err(wrong_arity(pos, "assoc", "exactly 2", args.len()));
+    };
+
+    let entries = proper_list_to_vec(alist).ok_or_else(|| type_error(pos, "list", alist.type_name()))?;
+    for entry in entries {
+        let Some(found_key) = pair_car(&entry) else {
+            return Err(type_error(pos, "pair", entry.type_name()));
+        };
+
+        if values_equal(key, &found_key) {
+            return Ok(entry);
+        }
+    }
+
+    Ok(Value::Bool(false))
+}
+
 fn eval_map(
     args: &[Value],
     pos: SourcePos,
     output: &Rc<RefCell<String>>,
 ) -> Result<Value, EvalError> {
-    let [procedure, list] = args else {
-        return Err(wrong_arity(pos, "map", "exactly 2", args.len()));
+    let [procedure, list_args @ ..] = args else {
+        return Err(wrong_arity(pos, "map", "at least 2", args.len()));
     };
 
-    let Value::List(items) = list else {
-        return Err(type_error(pos, "list", list.type_name()));
-    };
+    if list_args.is_empty() {
+        return Err(wrong_arity(pos, "map", "at least 2", args.len()));
+    }
 
-    let mut mapped = Vec::with_capacity(items.len());
-    for item in items {
-        mapped.push(apply_value(
-            procedure.clone(),
-            &[item.clone()],
-            pos,
-            output,
-        )?);
+    let lists = list_args
+        .iter()
+        .map(|value| {
+            proper_list_to_vec(value).ok_or_else(|| type_error(pos, "list", value.type_name()))
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+
+    let len = lists.iter().map(Vec::len).min().unwrap_or(0);
+    let mut mapped = Vec::with_capacity(len);
+    for index in 0..len {
+        let row = lists.iter().map(|list| list[index].clone()).collect::<Vec<_>>();
+        mapped.push(apply_value(procedure.clone(), &row, pos, output)?);
     }
 
     Ok(Value::List(mapped))
@@ -2392,10 +2759,8 @@ fn eval_length(args: &[Value], pos: SourcePos) -> Result<Value, EvalError> {
         return Err(wrong_arity(pos, "length", "exactly 1", args.len()));
     };
 
-    match value {
-        Value::List(items) => Ok(Value::Int(items.len() as i64)),
-        other => Err(type_error(pos, "list", other.type_name())),
-    }
+    let items = proper_list_to_vec(value).ok_or_else(|| type_error(pos, "list", value.type_name()))?;
+    Ok(Value::Int(items.len() as i64))
 }
 
 fn eval_display(
@@ -2536,12 +2901,10 @@ fn eval_list_to_string(args: &[Value], pos: SourcePos) -> Result<Value, EvalErro
         return Err(wrong_arity(pos, "list->string", "exactly 1", args.len()));
     };
 
-    let Value::List(items) = value else {
-        return Err(type_error(pos, "list", value.type_name()));
-    };
+    let items = proper_list_to_vec(value).ok_or_else(|| type_error(pos, "list", value.type_name()))?;
 
     let mut rendered = String::with_capacity(items.len());
-    for item in items {
+    for item in &items {
         let Value::Char(ch) = item else {
             return Err(type_error(pos, "char", item.type_name()));
         };
@@ -2606,6 +2969,108 @@ fn eval_integer_to_char(args: &[Value], pos: SourcePos) -> Result<Value, EvalErr
     };
 
     Ok(Value::Char(ch))
+}
+
+fn eval_char_predicate<F>(
+    args: &[Value],
+    name: &str,
+    pos: SourcePos,
+    predicate: F,
+) -> Result<Value, EvalError>
+where
+    F: Fn(char) -> bool,
+{
+    let [value] = args else {
+        return Err(wrong_arity(pos, name, "exactly 1", args.len()));
+    };
+
+    Ok(Value::Bool(predicate(expect_char(value, pos)?)))
+}
+
+fn eval_char_transform<F>(
+    args: &[Value],
+    name: &str,
+    pos: SourcePos,
+    transform: F,
+) -> Result<Value, EvalError>
+where
+    F: Fn(char) -> char,
+{
+    let [value] = args else {
+        return Err(wrong_arity(pos, name, "exactly 1", args.len()));
+    };
+
+    Ok(Value::Char(transform(expect_char(value, pos)?)))
+}
+
+fn eval_char_compare<F>(
+    args: &[Value],
+    name: &str,
+    pos: SourcePos,
+    predicate: F,
+) -> Result<Value, EvalError>
+where
+    F: Fn(char, char) -> bool,
+{
+    let chars = args
+        .iter()
+        .map(|value| expect_char(value, pos))
+        .collect::<Result<Vec<_>, _>>()?;
+    if chars.len() < 2 {
+        return Err(wrong_arity(pos, name, "at least 2", chars.len()));
+    }
+
+    for pair in chars.windows(2) {
+        if !predicate(pair[0], pair[1]) {
+            return Ok(Value::Bool(false));
+        }
+    }
+
+    Ok(Value::Bool(true))
+}
+
+fn eval_string_compare<F>(
+    args: &[Value],
+    name: &str,
+    pos: SourcePos,
+    predicate: F,
+) -> Result<Value, EvalError>
+where
+    F: Fn(&str, &str) -> bool,
+{
+    let strings = args
+        .iter()
+        .map(|value| Ok(expect_string(value, pos)?.to_plain_string()))
+        .collect::<Result<Vec<_>, EvalError>>()?;
+    if strings.len() < 2 {
+        return Err(wrong_arity(pos, name, "at least 2", strings.len()));
+    }
+
+    for pair in strings.windows(2) {
+        if !predicate(&pair[0], &pair[1]) {
+            return Ok(Value::Bool(false));
+        }
+    }
+
+    Ok(Value::Bool(true))
+}
+
+fn eval_string_case<F>(
+    args: &[Value],
+    name: &str,
+    pos: SourcePos,
+    transform: F,
+) -> Result<Value, EvalError>
+where
+    F: Fn(&str) -> String,
+{
+    let [value] = args else {
+        return Err(wrong_arity(pos, name, "exactly 1", args.len()));
+    };
+
+    Ok(Value::String(SchemeString::new(transform(
+        &expect_string(value, pos)?.to_plain_string(),
+    ))))
 }
 
 fn eval_vector(args: &[Value], _pos: SourcePos) -> Result<Value, EvalError> {
@@ -2687,11 +3152,9 @@ fn eval_list_to_vector(args: &[Value], pos: SourcePos) -> Result<Value, EvalErro
         return Err(wrong_arity(pos, "list->vector", "exactly 1", args.len()));
     };
 
-    let Value::List(items) = value else {
-        return Err(type_error(pos, "list", value.type_name()));
-    };
+    let items = proper_list_to_vec(value).ok_or_else(|| type_error(pos, "list", value.type_name()))?;
 
-    Ok(Value::Vector(SchemeVector::new(items.clone())))
+    Ok(Value::Vector(SchemeVector::new(items)))
 }
 
 fn eval_type_predicate<F>(
@@ -2779,6 +3242,45 @@ fn expect_vector(value: &Value, pos: SourcePos) -> Result<SchemeVector, EvalErro
     }
 }
 
+fn is_pair(value: &Value) -> bool {
+    pair_car(value).is_some()
+}
+
+fn pair_car(value: &Value) -> Option<Value> {
+    match value {
+        Value::List(items) if !items.is_empty() => Some(items[0].clone()),
+        Value::Pair(pair) => Some(pair.car()),
+        _ => None,
+    }
+}
+
+fn pair_cdr(value: &Value) -> Option<Value> {
+    match value {
+        Value::List(items) if !items.is_empty() => Some(Value::List(items[1..].to_vec())),
+        Value::Pair(pair) => Some(pair.cdr()),
+        _ => None,
+    }
+}
+
+fn proper_list_to_vec(value: &Value) -> Option<Vec<Value>> {
+    let mut items = Vec::new();
+    let mut current = value.clone();
+
+    loop {
+        match current {
+            Value::List(rest) => {
+                items.extend(rest);
+                return Some(items);
+            }
+            Value::Pair(pair) => {
+                items.push(pair.car());
+                current = pair.cdr();
+            }
+            _ => return None,
+        }
+    }
+}
+
 fn render_list(items: &[Value], mode: RenderMode) -> String {
     let mut rendered = String::from("(");
 
@@ -2791,6 +3293,44 @@ fn render_list(items: &[Value], mode: RenderMode) -> String {
 
     rendered.push(')');
     rendered
+}
+
+fn render_pair(pair: &SchemePair, mode: RenderMode) -> String {
+    let mut rendered = String::from("(");
+    let mut first = true;
+    let mut current = Value::Pair(pair.clone());
+
+    loop {
+        match current {
+            Value::Pair(next) => {
+                if !first {
+                    rendered.push(' ');
+                }
+                rendered.push_str(&next.car().render_with_mode(mode));
+                current = next.cdr();
+                first = false;
+            }
+            Value::List(items) => {
+                for item in items {
+                    if !first {
+                        rendered.push(' ');
+                    }
+                    rendered.push_str(&item.render_with_mode(mode));
+                    first = false;
+                }
+                rendered.push(')');
+                return rendered;
+            }
+            other => {
+                if !first {
+                    rendered.push_str(" . ");
+                }
+                rendered.push_str(&other.render_with_mode(mode));
+                rendered.push(')');
+                return rendered;
+            }
+        }
+    }
 }
 
 fn render_vector(items: &SchemeVector, mode: RenderMode) -> String {

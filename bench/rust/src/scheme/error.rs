@@ -75,6 +75,9 @@ pub enum EvalError {
     #[error("invalid length at {pos}: {len}")]
     InvalidLength { pos: SourcePos, len: i64 },
 
+    #[error("invalid argument at {pos}: {message}")]
+    InvalidArgument { pos: SourcePos, message: String },
+
     #[error("uninitialized binding at {pos}: {name}")]
     UninitializedBinding { pos: SourcePos, name: String },
 }
