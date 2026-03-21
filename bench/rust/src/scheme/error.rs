@@ -40,6 +40,14 @@ pub enum EvalError {
     UnknownProcedure { name: String },
     #[error("operator is not callable: {expression}")]
     NotCallable { expression: String },
+    #[error("malformed special form: {form}")]
+    MalformedSpecialForm { form: &'static str },
+    #[error("{form} requires at least one body expression")]
+    MissingBody { form: &'static str },
+    #[error("{form} requires a parameter list")]
+    InvalidParameterList { form: &'static str },
+    #[error("{form} parameters must be symbols")]
+    NonSymbolParameter { form: &'static str },
     #[error("wrong argument count for {procedure}: expected {expected}, got {got}")]
     WrongArgumentCount {
         procedure: &'static str,

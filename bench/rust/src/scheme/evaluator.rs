@@ -1,61 +1,74 @@
 use crate::scheme::ast::Expr;
+use crate::scheme::builtins::apply_builtin;
+use crate::scheme::builtins::install_builtins;
+use crate::scheme::environment::Environment;
 use crate::scheme::error::{ArgCount, EvalError};
-use crate::scheme::value::Value;
+use crate::scheme::value::{Closure, Value};
 
 pub fn eval_program(expressions: &[Expr]) -> Result<Value, EvalError> {
     let Some((last_expression, prefix)) = expressions.split_last() else {
         return Err(EvalError::EmptyProgram);
     };
 
+    let environment = Environment::new();
+    install_builtins(&environment);
+
     prefix
         .iter()
-        .try_for_each(|expression| eval_expr(expression).map(|_| ()))?;
+        .try_for_each(|expression| eval_expr(expression, &environment).map(|_| ()))?;
 
-    eval_expr(last_expression)
+    eval_expr(last_expression, &environment)
 }
 
-fn eval_expr(expression: &Expr) -> Result<Value, EvalError> {
+fn eval_expr(expression: &Expr, environment: &Environment) -> Result<Value, EvalError> {
     match expression {
         Expr::Integer(value) => Ok(Value::Integer(*value)),
         Expr::Boolean(value) => Ok(Value::Boolean(*value)),
         Expr::String(value) => Ok(Value::String(value.clone())),
-        Expr::Symbol(name) => Err(EvalError::UnboundVariable { name: name.clone() }),
-        Expr::List(items) => eval_list(items),
+        Expr::Symbol(name) => environment
+            .lookup(name)
+            .ok_or_else(|| EvalError::UnboundVariable { name: name.clone() }),
+        Expr::List(items) => eval_list(items, environment),
     }
 }
 
-fn eval_list(items: &[Expr]) -> Result<Value, EvalError> {
+fn eval_list(items: &[Expr], environment: &Environment) -> Result<Value, EvalError> {
     let Some((operator, arguments)) = items.split_first() else {
         return Err(EvalError::EmptyApplication);
     };
 
-    let Expr::Symbol(name) = operator else {
-        return Err(EvalError::NotCallable {
-            expression: format!("{operator:?}"),
-        });
-    };
+    if let Expr::Symbol(name) = operator {
+        if let Some(value) = eval_special_form(name, arguments, environment)? {
+            return Ok(value);
+        }
+    }
 
-    match name.as_str() {
-        "and" => eval_and(arguments),
-        "or" => eval_or(arguments),
-        "+" => eval_add(arguments),
-        "-" => eval_sub(arguments),
-        "*" => eval_mul(arguments),
-        "/" => eval_div(arguments),
-        "<" => eval_comparison("<", arguments, |left, right| left < right),
-        ">" => eval_comparison(">", arguments, |left, right| left > right),
-        "=" => eval_comparison("=", arguments, |left, right| left == right),
-        "<=" => eval_comparison("<=", arguments, |left, right| left <= right),
-        "not" => eval_not(arguments),
-        _ => Err(EvalError::UnknownProcedure { name: name.clone() }),
+    let callable = eval_expr(operator, environment)?;
+    let values = eval_arguments(arguments, environment)?;
+    apply_callable(callable, &values)
+}
+
+fn eval_special_form(
+    name: &str,
+    arguments: &[Expr],
+    environment: &Environment,
+) -> Result<Option<Value>, EvalError> {
+    match name {
+        "and" => eval_and(arguments, environment).map(Some),
+        "or" => eval_or(arguments, environment).map(Some),
+        "if" => eval_if(arguments, environment).map(Some),
+        "define" => eval_define(arguments, environment).map(Some),
+        "quote" => eval_quote(arguments).map(Some),
+        "lambda" => eval_lambda(arguments, environment).map(Some),
+        _ => Ok(None),
     }
 }
 
-fn eval_and(arguments: &[Expr]) -> Result<Value, EvalError> {
+fn eval_and(arguments: &[Expr], environment: &Environment) -> Result<Value, EvalError> {
     let mut last_value = Value::Boolean(true);
 
     for argument in arguments {
-        let value = eval_expr(argument)?;
+        let value = eval_expr(argument, environment)?;
         if !value.is_truthy() {
             return Ok(value);
         }
@@ -65,11 +78,11 @@ fn eval_and(arguments: &[Expr]) -> Result<Value, EvalError> {
     Ok(last_value)
 }
 
-fn eval_or(arguments: &[Expr]) -> Result<Value, EvalError> {
+fn eval_or(arguments: &[Expr], environment: &Environment) -> Result<Value, EvalError> {
     let mut last_value = Value::Boolean(false);
 
     for argument in arguments {
-        let value = eval_expr(argument)?;
+        let value = eval_expr(argument, environment)?;
         if value.is_truthy() {
             return Ok(value);
         }
@@ -79,106 +92,164 @@ fn eval_or(arguments: &[Expr]) -> Result<Value, EvalError> {
     Ok(last_value)
 }
 
-fn eval_add(arguments: &[Expr]) -> Result<Value, EvalError> {
-    let total: i64 = eval_number_arguments(arguments)?.into_iter().sum();
-    Ok(Value::Integer(total))
-}
-
-fn eval_sub(arguments: &[Expr]) -> Result<Value, EvalError> {
-    let numbers = eval_number_arguments(arguments)?;
-
-    match numbers.as_slice() {
-        [] => Err(EvalError::WrongArgumentCount {
-            procedure: "-",
-            expected: ArgCount::AtLeast(1),
-            got: 0,
-        }),
-        [value] => Ok(Value::Integer(-value)),
-        [first, rest @ ..] => Ok(Value::Integer(
-            rest.iter().fold(*first, |total, value| total - value),
-        )),
-    }
-}
-
-fn eval_mul(arguments: &[Expr]) -> Result<Value, EvalError> {
-    let product: i64 = eval_number_arguments(arguments)?.into_iter().product();
-    Ok(Value::Integer(product))
-}
-
-fn eval_div(arguments: &[Expr]) -> Result<Value, EvalError> {
-    let numbers = eval_number_arguments(arguments)?;
-
-    let [first, rest @ ..] = numbers.as_slice() else {
+fn eval_if(arguments: &[Expr], environment: &Environment) -> Result<Value, EvalError> {
+    let [condition, consequent, alternate] = arguments else {
         return Err(EvalError::WrongArgumentCount {
-            procedure: "/",
-            expected: ArgCount::AtLeast(2),
-            got: 0,
+            procedure: "if",
+            expected: ArgCount::Exactly(3),
+            got: arguments.len(),
         });
     };
 
-    if rest.is_empty() {
-        return Err(EvalError::WrongArgumentCount {
-            procedure: "/",
-            expected: ArgCount::AtLeast(2),
-            got: 1,
-        });
-    }
+    let branch = if eval_expr(condition, environment)?.is_truthy() {
+        consequent
+    } else {
+        alternate
+    };
 
-    rest.iter()
-        .try_fold(*first, |quotient, value| divide(quotient, *value))
-        .map(Value::Integer)
+    eval_expr(branch, environment)
 }
 
-fn eval_comparison(
-    procedure: &'static str,
-    arguments: &[Expr],
-    compare: impl Fn(i64, i64) -> bool,
+fn eval_define(arguments: &[Expr], environment: &Environment) -> Result<Value, EvalError> {
+    match arguments {
+        [Expr::Symbol(name), expression] => {
+            let value = eval_expr(expression, environment)?;
+            environment.define(name.clone(), value);
+            Ok(Value::Void)
+        }
+        [Expr::List(signature), body @ ..] => define_function(signature, body, environment),
+        _ => Err(EvalError::MalformedSpecialForm { form: "define" }),
+    }
+}
+
+fn define_function(
+    signature: &[Expr],
+    body: &[Expr],
+    environment: &Environment,
 ) -> Result<Value, EvalError> {
-    let numbers = eval_number_arguments(arguments)?;
-
-    let [first, second, rest @ ..] = numbers.as_slice() else {
-        return Err(EvalError::WrongArgumentCount {
-            procedure,
-            expected: ArgCount::AtLeast(2),
-            got: numbers.len(),
-        });
+    let Some((Expr::Symbol(name), parameters)) = signature.split_first() else {
+        return Err(EvalError::MalformedSpecialForm { form: "define" });
     };
 
-    let is_sorted = std::iter::once((*first, *second))
-        .chain(rest.iter().scan(*second, |left, value| {
-            let pair = (*left, *value);
-            *left = *value;
-            Some(pair)
-        }))
-        .all(|(left, right)| compare(left, right));
-
-    Ok(Value::Boolean(is_sorted))
+    let closure = build_closure(
+        Some(name.clone()),
+        parameters,
+        body,
+        environment.clone(),
+        "define",
+    )?;
+    environment.define(name.clone(), Value::Closure(closure));
+    Ok(Value::Void)
 }
 
-fn eval_not(arguments: &[Expr]) -> Result<Value, EvalError> {
-    let [argument] = arguments else {
+fn eval_quote(arguments: &[Expr]) -> Result<Value, EvalError> {
+    let [expression] = arguments else {
         return Err(EvalError::WrongArgumentCount {
-            procedure: "not",
+            procedure: "quote",
             expected: ArgCount::Exactly(1),
             got: arguments.len(),
         });
     };
 
-    Ok(Value::Boolean(!eval_expr(argument)?.is_truthy()))
+    Ok(quote_expression(expression))
 }
 
-fn eval_number_arguments(arguments: &[Expr]) -> Result<Vec<i64>, EvalError> {
+fn eval_lambda(arguments: &[Expr], environment: &Environment) -> Result<Value, EvalError> {
+    let Some((parameters, body)) = arguments.split_first() else {
+        return Err(EvalError::WrongArgumentCount {
+            procedure: "lambda",
+            expected: ArgCount::AtLeast(2),
+            got: 0,
+        });
+    };
+
+    let Expr::List(parameters) = parameters else {
+        return Err(EvalError::InvalidParameterList { form: "lambda" });
+    };
+
+    let closure = build_closure(None, parameters, body, environment.clone(), "lambda")?;
+    Ok(Value::Closure(closure))
+}
+
+fn build_closure(
+    name: Option<String>,
+    parameters: &[Expr],
+    body: &[Expr],
+    environment: Environment,
+    form: &'static str,
+) -> Result<Closure, EvalError> {
+    if body.is_empty() {
+        return Err(EvalError::MissingBody { form });
+    }
+
+    let parameters = parameters
+        .iter()
+        .map(|parameter| match parameter {
+            Expr::Symbol(name) => Ok(name.clone()),
+            _ => Err(EvalError::NonSymbolParameter { form }),
+        })
+        .collect::<Result<_, _>>()?;
+
+    Ok(Closure::new(name, parameters, body.to_vec(), environment))
+}
+
+fn quote_expression(expression: &Expr) -> Value {
+    match expression {
+        Expr::Integer(value) => Value::Integer(*value),
+        Expr::Boolean(value) => Value::Boolean(*value),
+        Expr::String(value) => Value::String(value.clone()),
+        Expr::Symbol(value) => Value::Symbol(value.clone()),
+        Expr::List(items) => items.iter().rev().fold(Value::EmptyList, |tail, item| {
+            Value::Pair(Box::new(quote_expression(item)), Box::new(tail))
+        }),
+    }
+}
+
+fn eval_arguments(arguments: &[Expr], environment: &Environment) -> Result<Vec<Value>, EvalError> {
     arguments
         .iter()
-        .map(eval_expr)
-        .map(|value| value.and_then(|value| value.expect_number()))
+        .map(|argument| eval_expr(argument, environment))
         .collect()
 }
 
-fn divide(left: i64, right: i64) -> Result<i64, EvalError> {
-    if right == 0 {
-        return Err(EvalError::DivisionByZero);
+fn apply_callable(callable: Value, arguments: &[Value]) -> Result<Value, EvalError> {
+    match callable {
+        Value::Builtin(procedure) => apply_builtin(procedure, arguments),
+        Value::Closure(closure) => apply_closure(closure, arguments),
+        other => Err(EvalError::NotCallable {
+            expression: other.render(),
+        }),
+    }
+}
+
+fn apply_closure(closure: Closure, arguments: &[Value]) -> Result<Value, EvalError> {
+    if arguments.len() != closure.parameters.len() {
+        return Err(EvalError::WrongArgumentCount {
+            procedure: "lambda",
+            expected: ArgCount::Exactly(closure.parameters.len()),
+            got: arguments.len(),
+        });
     }
 
-    Ok(left / right)
+    let call_environment = closure.environment.child();
+    closure
+        .parameters
+        .iter()
+        .cloned()
+        .zip(arguments.iter().cloned())
+        .for_each(|(name, value)| call_environment.define(name, value));
+
+    eval_body(&closure.body, &call_environment)
+}
+
+fn eval_body(body: &[Expr], environment: &Environment) -> Result<Value, EvalError> {
+    let Some((last_expression, prefix)) = body.split_last() else {
+        return Err(EvalError::MissingBody { form: "lambda" });
+    };
+
+    prefix
+        .iter()
+        .try_for_each(|expression| eval_expr(expression, environment).map(|_| ()))?;
+
+    eval_expr(last_expression, environment)
 }
