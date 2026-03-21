@@ -20,6 +20,7 @@ pub enum Value {
     Integer(i64),
     Boolean(bool),
     String(String),
+    Char(char),
     Symbol(String, Span),
     List(Vec<Value>, Span),
     Lambda {
@@ -47,6 +48,7 @@ impl fmt::Display for Value {
             Value::Boolean(true) => write!(f, "#t"),
             Value::Boolean(false) => write!(f, "#f"),
             Value::String(s) => write!(f, "\"{s}\""),
+            Value::Char(c) => write!(f, "#\\{c}"),
             Value::Symbol(s, _) => write!(f, "{s}"),
             Value::List(items, _) => fmt_list(f, items),
             Value::Lambda { .. } => write!(f, "#<procedure>"),
@@ -59,6 +61,7 @@ impl Value {
     pub fn display_fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Value::String(s) => write!(f, "{s}"),
+            Value::Char(c) => write!(f, "{c}"),
             other => write!(f, "{other}"),
         }
     }
@@ -67,6 +70,7 @@ impl Value {
     pub fn to_display_string(&self) -> String {
         match self {
             Value::String(s) => s.clone(),
+            Value::Char(c) => c.to_string(),
             other => format!("{other}"),
         }
     }

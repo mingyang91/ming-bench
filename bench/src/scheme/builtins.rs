@@ -7,8 +7,12 @@ pub fn is_builtin(name: &str) -> bool {
         name,
         "+" | "-" | "*" | "/" | "<" | ">" | "=" | "<=" | ">=" | "not"
             | "cons" | "car" | "cdr" | "null?" | "list" | "length"
-            | "boolean?" | "number?" | "pair?" | "string?" | "symbol?"
+            | "boolean?" | "number?" | "pair?" | "string?" | "symbol?" | "char?"
             | "display" | "write" | "newline"
+            | "string-append" | "string-length" | "substring"
+            | "string->number" | "number->string"
+            | "string->symbol" | "symbol->string"
+            | "string-ref"
     )
 }
 
@@ -29,9 +33,17 @@ pub fn apply_builtin(
         "null?" => apply_null(args, env, span, output),
         "list" => apply_list(args, env, output),
         "length" => apply_length(args, env, span, output),
-        "boolean?" | "number?" | "pair?" | "string?" | "symbol?" => {
+        "boolean?" | "number?" | "pair?" | "string?" | "symbol?" | "char?" => {
             apply_type_pred(name, args, env, span, output)
         }
+        "string-append" => apply_string_append(args, env, span, output),
+        "string-length" => apply_string_length(args, env, span, output),
+        "substring" => apply_substring(args, env, span, output),
+        "string->number" => apply_string_to_number(args, env, span, output),
+        "number->string" => apply_number_to_string(args, env, span, output),
+        "string->symbol" => apply_string_to_symbol(args, env, span, output),
+        "symbol->string" => apply_symbol_to_string(args, env, span, output),
+        "string-ref" => apply_string_ref(args, env, span, output),
         "display" => apply_display(args, env, span, output),
         "write" => apply_write(args, env, span, output),
         "newline" => apply_newline(args, span, output),
@@ -276,6 +288,7 @@ fn apply_type_pred(
         "pair?" => matches!(val, Value::List(ref items, _) if !items.is_empty()),
         "string?" => matches!(val, Value::String(_)),
         "symbol?" => matches!(val, Value::Symbol(_, _)),
+        "char?" => matches!(val, Value::Char(_)),
         _ => unreachable!("apply_type_pred called with unknown predicate"),
     };
     Ok(Value::Boolean(result))
@@ -355,4 +368,147 @@ fn apply_newline(args: &[Value], span: Span, output: &mut String) -> Result<Valu
     }
     output.push('\n');
     Ok(Value::Boolean(false))
+}
+
+fn eval_to_string(val: &Value, env: &mut Env, span: Span, output: &mut String) -> Result<String, EvalError> {
+    match eval(val, env, output)? {
+        Value::String(s) => Ok(s),
+        other => Err(EvalError::TypeError {
+            expected: "string".to_string(),
+            got: format!("{other}"),
+            span,
+        }),
+    }
+}
+
+fn apply_string_append(
+    args: &[Value],
+    env: &mut Env,
+    span: Span,
+    output: &mut String,
+) -> Result<Value, EvalError> {
+    let result: String = args
+        .iter()
+        .map(|a| eval_to_string(a, env, span, output))
+        .collect::<Result<Vec<_>, _>>()?
+        .join("");
+    Ok(Value::String(result))
+}
+
+fn apply_string_length(
+    args: &[Value],
+    env: &mut Env,
+    span: Span,
+    output: &mut String,
+) -> Result<Value, EvalError> {
+    let [arg] = args else {
+        return Err(EvalError::WrongArgCount { expected: 1, got: args.len(), span });
+    };
+    let s = eval_to_string(arg, env, span, output)?;
+    Ok(Value::Integer(s.len() as i64))
+}
+
+fn apply_substring(
+    args: &[Value],
+    env: &mut Env,
+    span: Span,
+    output: &mut String,
+) -> Result<Value, EvalError> {
+    let [s_arg, start_arg, end_arg] = args else {
+        return Err(EvalError::WrongArgCount { expected: 3, got: args.len(), span });
+    };
+    let s = eval_to_string(s_arg, env, span, output)?;
+    let start = eval_to_integer(start_arg, env, output)? as usize;
+    let end = eval_to_integer(end_arg, env, output)? as usize;
+    if start > end || end > s.len() {
+        return Err(EvalError::TypeError {
+            expected: format!("valid indices for string of length {}", s.len()),
+            got: format!("start={start}, end={end}"),
+            span,
+        });
+    }
+    Ok(Value::String(s[start..end].to_string()))
+}
+
+fn apply_string_to_number(
+    args: &[Value],
+    env: &mut Env,
+    span: Span,
+    output: &mut String,
+) -> Result<Value, EvalError> {
+    let [arg] = args else {
+        return Err(EvalError::WrongArgCount { expected: 1, got: args.len(), span });
+    };
+    let s = eval_to_string(arg, env, span, output)?;
+    let n = s.parse::<i64>().map_err(|_| EvalError::TypeError {
+        expected: "numeric string".to_string(),
+        got: format!("\"{s}\""),
+        span,
+    })?;
+    Ok(Value::Integer(n))
+}
+
+fn apply_number_to_string(
+    args: &[Value],
+    env: &mut Env,
+    span: Span,
+    output: &mut String,
+) -> Result<Value, EvalError> {
+    let [arg] = args else {
+        return Err(EvalError::WrongArgCount { expected: 1, got: args.len(), span });
+    };
+    let n = eval_to_integer(arg, env, output)?;
+    Ok(Value::String(n.to_string()))
+}
+
+fn apply_string_to_symbol(
+    args: &[Value],
+    env: &mut Env,
+    span: Span,
+    output: &mut String,
+) -> Result<Value, EvalError> {
+    let [arg] = args else {
+        return Err(EvalError::WrongArgCount { expected: 1, got: args.len(), span });
+    };
+    let s = eval_to_string(arg, env, span, output)?;
+    Ok(Value::Symbol(s, span))
+}
+
+fn apply_symbol_to_string(
+    args: &[Value],
+    env: &mut Env,
+    span: Span,
+    output: &mut String,
+) -> Result<Value, EvalError> {
+    let [arg] = args else {
+        return Err(EvalError::WrongArgCount { expected: 1, got: args.len(), span });
+    };
+    let val = eval(arg, env, output)?;
+    match val {
+        Value::Symbol(s, _) => Ok(Value::String(s)),
+        other => Err(EvalError::TypeError {
+            expected: "symbol".to_string(),
+            got: format!("{other}"),
+            span,
+        }),
+    }
+}
+
+fn apply_string_ref(
+    args: &[Value],
+    env: &mut Env,
+    span: Span,
+    output: &mut String,
+) -> Result<Value, EvalError> {
+    let [s_arg, idx_arg] = args else {
+        return Err(EvalError::WrongArgCount { expected: 2, got: args.len(), span });
+    };
+    let s = eval_to_string(s_arg, env, span, output)?;
+    let idx = eval_to_integer(idx_arg, env, output)? as usize;
+    let ch = s.chars().nth(idx).ok_or_else(|| EvalError::TypeError {
+        expected: format!("index < {}", s.len()),
+        got: format!("{idx}"),
+        span,
+    })?;
+    Ok(Value::Char(ch))
 }

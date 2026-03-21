@@ -55,9 +55,8 @@ pub fn eval_str_with_output(input: &str) -> Result<(String, String), EvalError> 
 
 pub(crate) fn eval(value: &Value, env: &mut Env, output: &mut String) -> Result<Value, EvalError> {
     match value {
-        Value::Integer(_) | Value::Boolean(_) | Value::String(_) | Value::Lambda { .. } => {
-            Ok(value.clone())
-        }
+        Value::Integer(_) | Value::Boolean(_) | Value::String(_) | Value::Char(_)
+        | Value::Lambda { .. } => Ok(value.clone()),
         Value::Symbol(name, span) => {
             env.get(name).cloned().ok_or_else(|| EvalError::UnboundVariable {
                 name: name.clone(),
