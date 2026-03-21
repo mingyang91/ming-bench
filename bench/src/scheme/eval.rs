@@ -105,6 +105,7 @@ fn eval_list_tco(
             "let" => return eval_let_tco(args, env, span, output),
             "begin" => return eval_body_tco(args, env, span, output),
             "cond" => return eval_cond_tco(args, env, span, output),
+            "set!" => return eval_set(args, env, span, output).map(Bounce::Done),
             "string-set!" => return eval_string_set(args, env, span, output).map(Bounce::Done),
             _ => {}
         }
@@ -305,6 +306,28 @@ fn eval_define(
             span,
         }),
     }
+}
+
+fn eval_set(
+    args: &[Value],
+    env: &Rc<RefCell<Env>>,
+    span: Span,
+    output: &RefCell<String>,
+) -> Result<Value, EvalError> {
+    let [Value::Symbol(name), expr] = args else {
+        return Err(EvalError::TypeError {
+            message: "set!: expected (set! variable expr)".into(),
+            span,
+        });
+    };
+    let val = eval(expr, env, span, output)?;
+    if !env.borrow_mut().set(name, val) {
+        return Err(EvalError::UnboundVariable {
+            name: name.clone(),
+            span,
+        });
+    }
+    Ok(Value::Void)
 }
 
 fn eval_quote(args: &[Value], span: Span) -> Result<Value, EvalError> {
