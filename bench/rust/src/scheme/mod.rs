@@ -14,6 +14,7 @@ use std::rc::Rc;
 pub fn eval_str(input: &str) -> Result<String, EvalError> {
     let exprs = parser::parse(input)?;
     let env = env::Env::new();
+    eval::seed_builtins(&env);
     let out = Rc::new(RefCell::new(String::new()));
     let mut result = value::Value::Void;
     for (ref expr, (line, col)) in exprs {
@@ -31,6 +32,7 @@ pub fn eval_str(input: &str) -> Result<String, EvalError> {
 pub fn eval_str_with_output(input: &str) -> Result<(String, String), EvalError> {
     let exprs = parser::parse(input)?;
     let env = env::Env::new();
+    eval::seed_builtins(&env);
     let out = Rc::new(RefCell::new(String::new()));
     let mut result = value::Value::Void;
     for (ref expr, (line, col)) in exprs {

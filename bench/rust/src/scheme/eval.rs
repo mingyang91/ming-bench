@@ -8,6 +8,22 @@ use crate::scheme::value::Value;
 /// Shared output buffer for display/write/newline.
 pub type Output = Rc<RefCell<String>>;
 
+/// Validate that the number of arguments matches the parameter list.
+fn check_arity(
+    params_len: usize,
+    has_rest: bool,
+    got: usize,
+) -> Result<(), EvalError> {
+    let ok = if has_rest { got >= params_len } else { got == params_len };
+    if !ok {
+        return Err(EvalError::WrongArgCount {
+            expected: params_len,
+            got,
+        });
+    }
+    Ok(())
+}
+
 /// Evaluate a single parsed expression in the given environment.
 /// Uses a trampoline loop for tail call optimization.
 pub fn eval(expr: &Value, env: &Rc<RefCell<Env>>, out: &Output) -> Result<Value, EvalError> {
@@ -18,7 +34,7 @@ pub fn eval(expr: &Value, env: &Rc<RefCell<Env>>, out: &Output) -> Result<Value,
         match &current_expr {
             Value::Integer(_) | Value::Boolean(_) | Value::Str(_) | Value::Char(_)
             | Value::Void => return Ok(current_expr),
-            Value::Lambda { .. } => return Ok(current_expr),
+            Value::Lambda { .. } | Value::Builtin(_) => return Ok(current_expr),
             Value::Symbol(name) => {
                 return current_env
                     .borrow()
@@ -148,29 +164,133 @@ fn eval_application_tail(
         .map(|a| eval(a, env, out))
         .collect::<Result<_, _>>()?;
 
-    let Value::Lambda {
-        params,
-        body,
-        closure,
-    } = proc
-    else {
-        return Err(EvalError::TypeError {
+    match proc {
+        Value::Lambda {
+            params,
+            rest_param,
+            body,
+            closure,
+        } => {
+            bind_and_tail_call(params, rest_param, body, closure, args, out)
+        }
+        Value::Builtin(name) => {
+            call_builtin_with_values(&name, args, env, out).map(TailAction::Return)
+        }
+        _ => Err(EvalError::TypeError {
             expected: "procedure".into(),
             got: format!("{proc}"),
-        });
-    };
+        }),
+    }
+}
 
-    if args.len() != params.len() {
+/// Bind args to params (with optional rest param) and tail-call the body.
+fn bind_and_tail_call(
+    params: Vec<String>,
+    rest_param: Option<String>,
+    body: Vec<Value>,
+    closure: Rc<RefCell<Env>>,
+    args: Vec<Value>,
+    out: &Output,
+) -> Result<TailAction, EvalError> {
+    if rest_param.is_some() {
+        if args.len() < params.len() {
+            return Err(EvalError::WrongArgCount {
+                expected: params.len(),
+                got: args.len(),
+            });
+        }
+    } else if args.len() != params.len() {
         return Err(EvalError::WrongArgCount {
             expected: params.len(),
             got: args.len(),
         });
     }
     let child = Env::extend(&closure);
-    for (param, val) in params.iter().zip(args) {
-        child.borrow_mut().define(param.clone(), val);
+    for (param, val) in params.iter().zip(&args) {
+        child.borrow_mut().define(param.clone(), val.clone());
+    }
+    if let Some(rest_name) = rest_param {
+        let rest_vals = args[params.len()..].to_vec();
+        child.borrow_mut().define(rest_name, Value::List(rest_vals));
     }
     eval_body_tail(&body, &child, out)
+}
+
+/// Call a builtin with already-evaluated argument values.
+fn call_builtin_with_values(
+    name: &str,
+    values: Vec<Value>,
+    env: &Rc<RefCell<Env>>,
+    out: &Output,
+) -> Result<Value, EvalError> {
+    if name == "apply" {
+        return eval_apply_values(values, env, out);
+    }
+    let quoted_args: Vec<Value> = values
+        .into_iter()
+        .map(|v| Value::List(vec![Value::Symbol("quote".into()), v]))
+        .collect();
+    eval_builtin(name, &quoted_args, env, out)
+}
+
+/// Implement `apply`: (apply proc arg1 ... args-list)
+fn eval_apply(
+    args: &[Value],
+    env: &Rc<RefCell<Env>>,
+    out: &Output,
+) -> Result<Value, EvalError> {
+    let values: Vec<Value> = args
+        .iter()
+        .map(|a| eval(a, env, out))
+        .collect::<Result<_, _>>()?;
+    eval_apply_values(values, env, out)
+}
+
+fn eval_apply_values(
+    args: Vec<Value>,
+    env: &Rc<RefCell<Env>>,
+    out: &Output,
+) -> Result<Value, EvalError> {
+    if args.len() < 2 {
+        return Err(EvalError::WrongArgCount {
+            expected: 2,
+            got: args.len(),
+        });
+    }
+    let proc = args[0].clone();
+    let Value::List(tail_args) = &args[args.len() - 1] else {
+        return Err(EvalError::TypeError {
+            expected: "list".into(),
+            got: format!("{}", args[args.len() - 1]),
+        });
+    };
+    let mut combined: Vec<Value> = args[1..args.len() - 1].to_vec();
+    combined.extend(tail_args.iter().cloned());
+
+    match proc {
+        Value::Lambda {
+            params,
+            rest_param,
+            body,
+            closure,
+        } => {
+            check_arity(params.len(), rest_param.is_some(), combined.len())?;
+            let child = Env::extend(&closure);
+            for (param, val) in params.iter().zip(&combined) {
+                child.borrow_mut().define(param.clone(), val.clone());
+            }
+            if let Some(rest_name) = rest_param {
+                let rest_vals = combined[params.len()..].to_vec();
+                child.borrow_mut().define(rest_name, Value::List(rest_vals));
+            }
+            eval_body(&body, &child, out)
+        }
+        Value::Builtin(name) => call_builtin_with_values(&name, combined, env, out),
+        _ => Err(EvalError::TypeError {
+            expected: "procedure".into(),
+            got: format!("{proc}"),
+        }),
+    }
 }
 
 /// Result of evaluating a form that may produce a tail call.
@@ -297,6 +417,7 @@ fn eval_named_let_tail(
     let child = Env::extend(env);
     let lambda = Value::Lambda {
         params: params.clone(),
+        rest_param: None,
         body,
         closure: Rc::clone(&child),
     };
@@ -324,6 +445,7 @@ fn is_builtin(name: &str) -> bool {
             | "char->integer"
             | "integer->char"
             | "map"
+            | "apply"
     )
 }
 
@@ -337,6 +459,7 @@ fn call_proc(
     match proc {
         Value::Lambda {
             params,
+            rest_param,
             body,
             closure,
         } => {
@@ -344,18 +467,18 @@ fn call_proc(
                 .iter()
                 .map(|a| eval(a, env, out))
                 .collect::<Result<_, _>>()?;
-            if eval_args.len() != params.len() {
-                return Err(EvalError::WrongArgCount {
-                    expected: params.len(),
-                    got: eval_args.len(),
-                });
-            }
+            check_arity(params.len(), rest_param.is_some(), eval_args.len())?;
             let child = Env::extend(closure);
-            for (param, val) in params.iter().zip(eval_args) {
-                child.borrow_mut().define(param.clone(), val);
+            for (param, val) in params.iter().zip(&eval_args) {
+                child.borrow_mut().define(param.clone(), val.clone());
+            }
+            if let Some(rest_name) = rest_param {
+                let rest_vals = eval_args[params.len()..].to_vec();
+                child.borrow_mut().define(rest_name.clone(), Value::List(rest_vals));
             }
             eval_body(body, &child, out)
         }
+        Value::Builtin(name) => eval_builtin(name, args, env, out),
         _ => Err(EvalError::TypeError {
             expected: "procedure".into(),
             got: format!("{proc}"),
@@ -411,6 +534,7 @@ fn eval_builtin(
         "char->integer" => eval_char_to_integer(args, env, out),
         "integer->char" => eval_integer_to_char(args, env, out),
         "map" => eval_map(args, env, out),
+        "apply" => eval_apply(args, env, out),
         _ => Err(EvalError::UnknownProcedure {
             name: name.into(),
         }),
@@ -444,6 +568,42 @@ fn eval_set(
     }
 }
 
+/// Parse a parameter list, detecting dot notation for rest parameters.
+/// Returns (fixed_params, optional_rest_param).
+fn parse_params(param_list: &[Value]) -> Result<(Vec<String>, Option<String>), EvalError> {
+    let dot_pos = param_list
+        .iter()
+        .position(|v| matches!(v, Value::Symbol(s) if s == "."));
+    let Some(dot_pos) = dot_pos else {
+        let params: Vec<String> = param_list
+            .iter()
+            .map(|p| match p {
+                Value::Symbol(s) => Ok(s.clone()),
+                other => Err(EvalError::Parse {
+                    message: format!("expected parameter name, got {other}"),
+                }),
+            })
+            .collect::<Result<_, _>>()?;
+        return Ok((params, None));
+    };
+    let fixed: Vec<String> = param_list[..dot_pos]
+        .iter()
+        .map(|p| match p {
+            Value::Symbol(s) => Ok(s.clone()),
+            other => Err(EvalError::Parse {
+                message: format!("expected parameter name, got {other}"),
+            }),
+        })
+        .collect::<Result<_, _>>()?;
+    let rest_slice = &param_list[dot_pos + 1..];
+    let [Value::Symbol(rest_name)] = rest_slice else {
+        return Err(EvalError::Parse {
+            message: "expected exactly one rest parameter after dot".into(),
+        });
+    };
+    Ok((fixed, Some(rest_name.clone())))
+}
+
 fn eval_define(
     args: &[Value],
     env: &Rc<RefCell<Env>>,
@@ -461,17 +621,10 @@ fn eval_define(
                     message: "define: expected function name".into(),
                 });
             };
-            let params: Vec<String> = sig[1..]
-                .iter()
-                .map(|p| match p {
-                    Value::Symbol(s) => Ok(s.clone()),
-                    other => Err(EvalError::Parse {
-                        message: format!("define: expected parameter name, got {other}"),
-                    }),
-                })
-                .collect::<Result<_, _>>()?;
+            let (params, rest_param) = parse_params(&sig[1..])?;
             let lambda = Value::Lambda {
                 params,
+                rest_param,
                 body: body.to_vec(),
                 closure: Rc::clone(env),
             };
@@ -504,17 +657,10 @@ fn eval_lambda(args: &[Value], env: &Rc<RefCell<Env>>) -> Result<Value, EvalErro
             message: "lambda: expected parameter list".into(),
         });
     };
-    let params: Vec<String> = param_list
-        .iter()
-        .map(|p| match p {
-            Value::Symbol(s) => Ok(s.clone()),
-            other => Err(EvalError::Parse {
-                message: format!("lambda: expected parameter name, got {other}"),
-            }),
-        })
-        .collect::<Result<_, _>>()?;
+    let (params, rest_param) = parse_params(param_list)?;
     Ok(Value::Lambda {
         params,
+        rest_param,
         body: args[1..].to_vec(),
         closure: Rc::clone(env),
     })
@@ -1117,4 +1263,24 @@ fn eval_map(
         .map(|item| call_proc(&proc, std::slice::from_ref(item), env, out))
         .collect::<Result<_, _>>()?;
     Ok(Value::List(results))
+}
+
+/// Seed all builtin procedures into the environment as first-class values.
+pub fn seed_builtins(env: &Rc<RefCell<Env>>) {
+    let names = [
+        "+", "-", "*", "/", "<", ">", "=", "<=", ">=", "not",
+        "cons", "car", "cdr", "null?", "list", "length",
+        "string?", "number?", "boolean?", "pair?", "symbol?", "char?",
+        "display", "write", "newline",
+        "string-append", "string-length", "substring",
+        "string->number", "number->string",
+        "symbol->string", "string->symbol",
+        "string-ref", "string-copy", "string->list", "list->string",
+        "char->integer", "integer->char",
+        "map", "apply",
+    ];
+    let mut env_ref = env.borrow_mut();
+    for name in names {
+        env_ref.define(name.to_string(), Value::Builtin(name.to_string()));
+    }
 }
