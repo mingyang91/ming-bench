@@ -4,11 +4,13 @@ use std::rc::Rc;
 
 use crate::scheme::value::Value;
 
+type Binding = Rc<RefCell<Value>>;
+
 #[derive(Clone)]
 pub struct Environment(Rc<RefCell<Frame>>);
 
 struct Frame {
-    bindings: HashMap<String, Value>,
+    bindings: HashMap<String, Binding>,
     parent: Option<Environment>,
 }
 
@@ -28,15 +30,32 @@ impl Environment {
     }
 
     pub fn define(&self, name: impl Into<String>, value: Value) {
-        self.0.borrow_mut().bindings.insert(name.into(), value);
+        self.0
+            .borrow_mut()
+            .bindings
+            .insert(name.into(), Rc::new(RefCell::new(value)));
     }
 
     pub fn lookup(&self, name: &str) -> Option<Value> {
-        let frame = self.0.borrow();
-        if let Some(value) = frame.bindings.get(name) {
-            return Some(value.clone());
-        }
+        self.lookup_binding(name)
+            .map(|binding| binding.borrow().clone())
+    }
 
-        frame.parent.as_ref().and_then(|parent| parent.lookup(name))
+    pub fn set(&self, name: &str, value: Value) -> bool {
+        let Some(binding) = self.lookup_binding(name) else {
+            return false;
+        };
+
+        *binding.borrow_mut() = value;
+        true
+    }
+
+    fn lookup_binding(&self, name: &str) -> Option<Binding> {
+        let frame = self.0.borrow();
+        let binding = frame.bindings.get(name).cloned();
+        let parent = frame.parent.clone();
+        drop(frame);
+
+        binding.or_else(|| parent.and_then(|parent| parent.lookup_binding(name)))
     }
 }

@@ -116,6 +116,9 @@ fn eval_tail_special_form(
         "define" => eval_define(arguments, location, environment, output)
             .map(EvalAction::Value)
             .map(Some),
+        "set!" => eval_set(arguments, location, environment, output)
+            .map(EvalAction::Value)
+            .map(Some),
         "quote" => eval_quote(arguments, location)
             .map(EvalAction::Value)
             .map(Some),
@@ -211,6 +214,30 @@ fn eval_define(
             form: "define",
         }),
     }
+}
+
+fn eval_set(
+    arguments: &[Expr],
+    location: SourceLocation,
+    environment: &Environment,
+    output: &mut String,
+) -> Result<Value, EvalError> {
+    let [Expr::Symbol { name, location: name_location }, expression] = arguments else {
+        return Err(EvalError::MalformedSpecialForm {
+            location,
+            form: "set!",
+        });
+    };
+
+    let value = eval_expr(expression, environment, output)?;
+    if environment.set(name, value) {
+        return Ok(Value::Void);
+    }
+
+    Err(EvalError::UnboundVariable {
+        location: *name_location,
+        name: name.clone(),
+    })
 }
 
 fn define_function(
