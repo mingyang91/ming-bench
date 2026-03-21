@@ -34,6 +34,8 @@ enum Value:
     defEnv: () => Env
   )
 
+  case VectorVal(elems: Array[Value])
+
   /** Extract string content from either StringVal or MutableStringVal. */
   def stringContent: Option[String] = this match
     case StringVal(s)         => Some(s)
@@ -50,18 +52,22 @@ enum Value:
     case Symbol(name, _)      => name
     case NilVal               => "()"
     case PairVal(_, _, _)     => formatList(_.display)
-    case _: LambdaVal         => "#<procedure>"
-    case _: ContinuationVal   => "#<continuation>"
-    case _: MacroVal          => "#<macro>"
-    case VoidVal              => ""
+    case VectorVal(elems) =>
+      "#(" + elems.map(_.display).mkString(" ") + ")"
+    case _: LambdaVal       => "#<procedure>"
+    case _: ContinuationVal => "#<continuation>"
+    case _: MacroVal        => "#<macro>"
+    case VoidVal            => ""
 
   /** Display representation (strings without quotes). */
   def displayRepr: String = this match
     case StringVal(s)         => s
     case MutableStringVal(cs) => String(cs)
     case CharVal(c)           => c.toString
-    case PairVal(_, _, _)     => formatList(_.displayRepr)
-    case other                => other.display
+    case VectorVal(elems) =>
+      "#(" + elems.map(_.displayRepr).mkString(" ") + ")"
+    case PairVal(_, _, _) => formatList(_.displayRepr)
+    case other            => other.display
 
   private def formatList(fmt: Value => String): String =
     val (elems, tail) = collectList(this, List.empty)

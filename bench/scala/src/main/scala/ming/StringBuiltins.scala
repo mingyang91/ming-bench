@@ -110,6 +110,8 @@ object StringBuiltins:
       case (Value.PairVal(ca, cd, _), Value.PairVal(cb, dd, _)) =>
         schemeEqual(ca, cb) && schemeEqual(cd, dd)
       case (Value.NilVal, Value.NilVal) => true
+      case (Value.VectorVal(ea), Value.VectorVal(eb)) =>
+        ea.length == eb.length && ea.zip(eb).forall((x, y) => schemeEqual(x, y))
       case (sa, sb) if sa.stringContent.isDefined && sb.stringContent.isDefined =>
         sa.stringContent == sb.stringContent
       case _ => schemeEq(a, b)

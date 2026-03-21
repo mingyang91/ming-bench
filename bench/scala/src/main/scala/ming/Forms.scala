@@ -209,21 +209,3 @@ private[ming] object Forms:
           case _ => throw new EvalError("bad let binding")
       }
     Evaluator.evalBodyTail(body, localEnv, out2)
-
-  def evalCond(
-    clauses: List[Value],
-    env: Env,
-    out: String
-  ): EvalResult =
-    clauses match
-      case Nil => Done(Value.VoidVal, env, out)
-      case clause :: rest =>
-        val parts = Evaluator.toList(clause)
-        parts match
-          case Value.Symbol("else", _) :: body =>
-            Evaluator.evalBodyTail(body, env, out)
-          case test :: body =>
-            val (testVal, _, out2) = Evaluator.eval(test, env, out)
-            if !Evaluator.isFalsy(testVal) then Evaluator.evalBodyTail(body, env, out2)
-            else evalCond(rest, env, out2)
-          case _ => throw new EvalError("bad cond clause")
