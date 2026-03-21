@@ -1,54 +1,59 @@
 use crate::scheme::env::Env;
-use crate::scheme::error::EvalError;
+use crate::scheme::error::{EvalError, Span};
 use crate::scheme::parser::Expr;
 use crate::scheme::value::Value;
 
 /// Evaluate a parsed expression in the given environment.
 pub fn eval(expr: &Expr, env: &Env) -> Result<Value, EvalError> {
     match expr {
-        Expr::Integer(n) => Ok(Value::Integer(*n)),
-        Expr::Boolean(b) => Ok(Value::Boolean(*b)),
-        Expr::String(s) => Ok(Value::String(s.clone())),
-        Expr::Symbol(name) => env
+        Expr::Integer(n, _) => Ok(Value::Integer(*n)),
+        Expr::Boolean(b, _) => Ok(Value::Boolean(*b)),
+        Expr::String(s, _) => Ok(Value::String(s.clone())),
+        Expr::Symbol(name, span) => env
             .get(name)
-            .ok_or_else(|| EvalError::UnboundVariable { name: name.clone() }),
-        Expr::List(elems) => eval_list(elems, env),
+            .ok_or_else(|| EvalError::UnboundVariable { name: name.clone() }.at(*span)),
+        Expr::List(elems, span) => eval_list(elems, *span, env),
     }
 }
 
-fn eval_list(elems: &[Expr], env: &Env) -> Result<Value, EvalError> {
+fn eval_list(elems: &[Expr], span: Span, env: &Env) -> Result<Value, EvalError> {
     let [operator, args @ ..] = elems else {
-        return Err(EvalError::Parse("empty list".into()));
+        return Err(EvalError::Parse("empty list".into()).at(span));
     };
 
     // Check for special forms first (symbol-based)
-    if let Expr::Symbol(op) = operator {
+    if let Expr::Symbol(op, _) = operator {
         match op.as_str() {
-            "quote" => return eval_quote(args),
-            "if" => return eval_if(args, env),
-            "define" => return eval_define(args, env),
-            "lambda" => return eval_lambda(args, env),
-            "let" => return eval_let(args, env),
-            "begin" => return eval_begin(args, env),
-            "cond" => return eval_cond(args, env),
+            "quote" => return eval_quote(args).map_err(|e| e.at(span)),
+            "if" => return eval_if(args, env).map_err(|e| e.at(span)),
+            "define" => return eval_define(args, span, env),
+            "lambda" => return eval_lambda(args, env).map_err(|e| e.at(span)),
+            "let" => return eval_let(args, env).map_err(|e| e.at(span)),
+            "begin" => return eval_begin(args, env).map_err(|e| e.at(span)),
+            "cond" => return eval_cond(args, env).map_err(|e| e.at(span)),
             _ => {}
         }
     }
 
     // Try built-in operators for symbol forms
-    if let Expr::Symbol(op) = operator {
+    if let Expr::Symbol(op, _) = operator {
         if is_builtin(op) {
-            return eval_builtin(op, args, env);
+            return eval_builtin(op, args, env).map_err(|e| e.at(span));
         }
     }
 
     // Evaluate operator to get a callable value
     let op_val = eval(operator, env)?;
-    apply(op_val, args, env)
+    apply(op_val, args, env).map_err(|e| e.at(span))
 }
 
 fn apply(op_val: Value, args: &[Expr], env: &Env) -> Result<Value, EvalError> {
-    let Value::Lambda { params, body, closure } = op_val else {
+    let Value::Lambda {
+        params,
+        body,
+        closure,
+    } = op_val
+    else {
         return Err(EvalError::TypeError {
             expected: "procedure".into(),
             got: format!("{op_val}"),
@@ -118,11 +123,11 @@ fn eval_quote(args: &[Expr]) -> Result<Value, EvalError> {
 
 fn expr_to_value(expr: &Expr) -> Result<Value, EvalError> {
     match expr {
-        Expr::Integer(n) => Ok(Value::Integer(*n)),
-        Expr::Boolean(b) => Ok(Value::Boolean(*b)),
-        Expr::String(s) => Ok(Value::String(s.clone())),
-        Expr::Symbol(s) => Ok(Value::Symbol(s.clone())),
-        Expr::List(items) => {
+        Expr::Integer(n, _) => Ok(Value::Integer(*n)),
+        Expr::Boolean(b, _) => Ok(Value::Boolean(*b)),
+        Expr::String(s, _) => Ok(Value::String(s.clone())),
+        Expr::Symbol(s, _) => Ok(Value::Symbol(s.clone())),
+        Expr::List(items, _) => {
             let vals: Vec<Value> = items.iter().map(expr_to_value).collect::<Result<_, _>>()?;
             Ok(Value::List(vals))
         }
@@ -151,32 +156,32 @@ fn eval_if(args: &[Expr], env: &Env) -> Result<Value, EvalError> {
     }
 }
 
-fn eval_define(args: &[Expr], env: &Env) -> Result<Value, EvalError> {
+fn eval_define(args: &[Expr], span: Span, env: &Env) -> Result<Value, EvalError> {
     match args {
         // (define x expr)
-        [Expr::Symbol(name), expr] => {
+        [Expr::Symbol(name, _), expr] => {
             let val = eval(expr, env)?;
             env.define(name.clone(), val);
             Ok(Value::Void)
         }
         // (define (f params...) body...)
-        [Expr::List(name_and_params), body @ ..] if !body.is_empty() => {
-            let [Expr::Symbol(name), params @ ..] = name_and_params.as_slice() else {
-                return Err(EvalError::Parse("invalid define form".into()));
+        [Expr::List(name_and_params, _), body @ ..] if !body.is_empty() => {
+            let [Expr::Symbol(name, _), params @ ..] = name_and_params.as_slice() else {
+                return Err(EvalError::Parse("invalid define form".into()).at(span));
             };
             let param_names: Vec<String> = params
                 .iter()
                 .map(|p| match p {
-                    Expr::Symbol(s) => Ok(s.clone()),
-                    _ => Err(EvalError::Parse("parameter must be a symbol".into())),
+                    Expr::Symbol(s, _) => Ok(s.clone()),
+                    _ => Err(EvalError::Parse("parameter must be a symbol".into()).at(span)),
                 })
                 .collect::<Result<_, _>>()?;
             let wrapped_body = if body.len() == 1 {
                 body[0].clone()
             } else {
-                let mut begin = vec![Expr::Symbol("begin".into())];
+                let mut begin = vec![Expr::Symbol("begin".into(), span)];
                 begin.extend(body.iter().cloned());
-                Expr::List(begin)
+                Expr::List(begin, span)
             };
             let lambda = Value::Lambda {
                 params: param_names,
@@ -186,18 +191,18 @@ fn eval_define(args: &[Expr], env: &Env) -> Result<Value, EvalError> {
             env.define(name.clone(), lambda);
             Ok(Value::Void)
         }
-        _ => Err(EvalError::Parse("invalid define form".into())),
+        _ => Err(EvalError::Parse("invalid define form".into()).at(span)),
     }
 }
 
 fn eval_lambda(args: &[Expr], env: &Env) -> Result<Value, EvalError> {
-    let [Expr::List(params), body] = args else {
+    let [Expr::List(params, _), body] = args else {
         return Err(EvalError::Parse("invalid lambda form".into()));
     };
     let param_names: Vec<String> = params
         .iter()
         .map(|p| {
-            if let Expr::Symbol(s) = p {
+            if let Expr::Symbol(s, _) = p {
                 Ok(s.clone())
             } else {
                 Err(EvalError::Parse("parameter must be a symbol".into()))
@@ -357,7 +362,10 @@ fn eval_or(args: &[Expr], env: &Env) -> Result<Value, EvalError> {
 
 fn eval_cons(args: &[Expr], env: &Env) -> Result<Value, EvalError> {
     let [head, tail] = args else {
-        return Err(EvalError::WrongArgCount { expected: 2, got: args.len() });
+        return Err(EvalError::WrongArgCount {
+            expected: 2,
+            got: args.len(),
+        });
     };
     let h = eval(head, env)?;
     let t = eval(tail, env)?;
@@ -372,11 +380,17 @@ fn eval_cons(args: &[Expr], env: &Env) -> Result<Value, EvalError> {
 
 fn eval_car(args: &[Expr], env: &Env) -> Result<Value, EvalError> {
     let [arg] = args else {
-        return Err(EvalError::WrongArgCount { expected: 1, got: args.len() });
+        return Err(EvalError::WrongArgCount {
+            expected: 1,
+            got: args.len(),
+        });
     };
     let val = eval(arg, env)?;
     let Value::List(items) = val else {
-        return Err(EvalError::TypeError { expected: "pair".into(), got: format!("{val}") });
+        return Err(EvalError::TypeError {
+            expected: "pair".into(),
+            got: format!("{val}"),
+        });
     };
     items.into_iter().next().ok_or_else(|| EvalError::TypeError {
         expected: "pair".into(),
@@ -386,24 +400,38 @@ fn eval_car(args: &[Expr], env: &Env) -> Result<Value, EvalError> {
 
 fn eval_cdr(args: &[Expr], env: &Env) -> Result<Value, EvalError> {
     let [arg] = args else {
-        return Err(EvalError::WrongArgCount { expected: 1, got: args.len() });
+        return Err(EvalError::WrongArgCount {
+            expected: 1,
+            got: args.len(),
+        });
     };
     let val = eval(arg, env)?;
     let Value::List(items) = val else {
-        return Err(EvalError::TypeError { expected: "pair".into(), got: format!("{val}") });
+        return Err(EvalError::TypeError {
+            expected: "pair".into(),
+            got: format!("{val}"),
+        });
     };
     if items.is_empty() {
-        return Err(EvalError::TypeError { expected: "pair".into(), got: "()".into() });
+        return Err(EvalError::TypeError {
+            expected: "pair".into(),
+            got: "()".into(),
+        });
     }
     Ok(Value::List(items[1..].to_vec()))
 }
 
 fn eval_null(args: &[Expr], env: &Env) -> Result<Value, EvalError> {
     let [arg] = args else {
-        return Err(EvalError::WrongArgCount { expected: 1, got: args.len() });
+        return Err(EvalError::WrongArgCount {
+            expected: 1,
+            got: args.len(),
+        });
     };
     let val = eval(arg, env)?;
-    Ok(Value::Boolean(matches!(val, Value::List(ref items) if items.is_empty())))
+    Ok(Value::Boolean(
+        matches!(val, Value::List(ref items) if items.is_empty()),
+    ))
 }
 
 fn eval_list_builtin(args: &[Expr], env: &Env) -> Result<Value, EvalError> {
@@ -413,11 +441,17 @@ fn eval_list_builtin(args: &[Expr], env: &Env) -> Result<Value, EvalError> {
 
 fn eval_length(args: &[Expr], env: &Env) -> Result<Value, EvalError> {
     let [arg] = args else {
-        return Err(EvalError::WrongArgCount { expected: 1, got: args.len() });
+        return Err(EvalError::WrongArgCount {
+            expected: 1,
+            got: args.len(),
+        });
     };
     let val = eval(arg, env)?;
     let Value::List(items) = val else {
-        return Err(EvalError::TypeError { expected: "list".into(), got: format!("{val}") });
+        return Err(EvalError::TypeError {
+            expected: "list".into(),
+            got: format!("{val}"),
+        });
     };
     Ok(Value::Integer(items.len() as i64))
 }
@@ -428,14 +462,17 @@ fn eval_type_pred(
     pred: fn(&Value) -> bool,
 ) -> Result<Value, EvalError> {
     let [arg] = args else {
-        return Err(EvalError::WrongArgCount { expected: 1, got: args.len() });
+        return Err(EvalError::WrongArgCount {
+            expected: 1,
+            got: args.len(),
+        });
     };
     let val = eval(arg, env)?;
     Ok(Value::Boolean(pred(&val)))
 }
 
 fn eval_let(args: &[Expr], env: &Env) -> Result<Value, EvalError> {
-    let [Expr::List(bindings), body @ ..] = args else {
+    let [Expr::List(bindings, _), body @ ..] = args else {
         return Err(EvalError::Parse("invalid let form".into()));
     };
     if body.is_empty() {
@@ -443,10 +480,10 @@ fn eval_let(args: &[Expr], env: &Env) -> Result<Value, EvalError> {
     }
     let let_env = Env::extend(env);
     for binding in bindings {
-        let Expr::List(pair) = binding else {
+        let Expr::List(pair, _) = binding else {
             return Err(EvalError::Parse("let binding must be a list".into()));
         };
-        let [Expr::Symbol(name), val_expr] = pair.as_slice() else {
+        let [Expr::Symbol(name, _), val_expr] = pair.as_slice() else {
             return Err(EvalError::Parse("let binding must be (name expr)".into()));
         };
         let val = eval(val_expr, env)?;
@@ -469,13 +506,13 @@ fn eval_body(exprs: &[Expr], env: &Env) -> Result<Value, EvalError> {
 
 fn eval_cond(args: &[Expr], env: &Env) -> Result<Value, EvalError> {
     for clause in args {
-        let Expr::List(parts) = clause else {
+        let Expr::List(parts, _) = clause else {
             return Err(EvalError::Parse("cond clause must be a list".into()));
         };
         let [test, body @ ..] = parts.as_slice() else {
             return Err(EvalError::Parse("cond clause must have a test".into()));
         };
-        if matches!(test, Expr::Symbol(s) if s == "else") {
+        if matches!(test, Expr::Symbol(s, _) if s == "else") {
             return eval_body(body, env);
         }
         let test_val = eval(test, env)?;
