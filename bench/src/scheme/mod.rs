@@ -30,6 +30,8 @@ thread_local! {
     static GENSYM_COUNTER: Cell<u64> = Cell::new(0);
     static CONT_FRAMES: RefCell<Vec<BodyFrame>> = RefCell::new(Vec::new());
     static RAISED_VALUE: RefCell<Option<Value>> = RefCell::new(None);
+    static RECORD_TYPE_COUNTER: Cell<u64> = Cell::new(0);
+    static RECORD_TYPE_NAMES: RefCell<HashMap<u64, String>> = RefCell::new(HashMap::new());
 }
 
 fn next_cont_id() -> u64 {
@@ -85,6 +87,12 @@ enum Value {
     DottedPair(Box<Value>, Box<Value>, Span),
     Vector(Rc<RefCell<Vec<Value>>>, Span),
     Values(Vec<Value>, Span),
+    Record {
+        type_id: u64,
+        type_name: String,
+        fields: Vec<Value>,
+        span: Span,
+    },
     Void,
 }
 
@@ -103,7 +111,7 @@ impl Value {
             | Value::DottedPair(_, _, s)
             | Value::Vector(_, s)
             | Value::Values(_, s) => *s,
-            Value::Lambda { span, .. } | Value::Continuation { span, .. } | Value::Macro { span, .. } => *span,
+            Value::Lambda { span, .. } | Value::Continuation { span, .. } | Value::Macro { span, .. } | Value::Record { span, .. } => *span,
             Value::Void => Span::default(),
         }
     }
@@ -139,6 +147,7 @@ impl Value {
                 format!("#({})", inner.join(" "))
             }
             Value::Lambda { .. } | Value::Builtin(..) | Value::Continuation { .. } | Value::Macro { .. } => "#<procedure>".to_string(),
+            Value::Record { ref type_name, .. } => format!("#<record:{}>", type_name),
             Value::Values(vals, _) => {
                 if vals.len() == 1 {
                     vals[0].display_scheme()
@@ -572,7 +581,7 @@ fn eval(expr: &Value, env: &Env) -> Result<Value, EvalError> {
                     .ok_or_else(|| EvalError::UnboundVariable(name.clone(), *span));
             }
             Value::Void => return Ok(Value::Void),
-            Value::Lambda { .. } | Value::Builtin(..) | Value::Continuation { .. } | Value::Macro { .. } => return Ok(current_expr),
+            Value::Lambda { .. } | Value::Builtin(..) | Value::Continuation { .. } | Value::Macro { .. } | Value::Record { .. } => return Ok(current_expr),
             Value::List(elems, span) => {
                 let form_span = *span;
                 if elems.is_empty() {
@@ -1088,6 +1097,9 @@ fn eval(expr: &Value, env: &Env) -> Result<Value, EvalError> {
                                 Err(e) => return Err(e),
                             }
                         }
+                        "define-record-type" => {
+                            return eval_define_record_type(&elems[1..], &current_env, form_span);
+                        }
                         "define-syntax" => {
                             if elems.len() != 3 {
                                 return Err(EvalError::Parse("define-syntax: expected name and transformer".into(), form_span));
@@ -1466,6 +1478,95 @@ fn parse_params(elems: &[Value], span: Span) -> Result<(Vec<String>, Option<Stri
     Ok((params, rest_param))
 }
 
+fn next_record_type_id() -> u64 {
+    RECORD_TYPE_COUNTER.with(|c| {
+        let id = c.get();
+        c.set(id + 1);
+        id
+    })
+}
+
+fn eval_define_record_type(args: &[Value], env: &Env, form_span: Span) -> Result<Value, EvalError> {
+    // (define-record-type <name> (constructor field-names ...) predicate (field accessor) ...)
+    if args.len() < 3 {
+        return Err(EvalError::Parse("define-record-type: expected type name, constructor, predicate, and fields".into(), form_span));
+    }
+    let type_name = match &args[0] {
+        Value::Symbol(s, _) => s.clone(),
+        _ => return Err(EvalError::Parse("define-record-type: expected type name symbol".into(), form_span)),
+    };
+    let type_id = next_record_type_id();
+
+    // Parse constructor: (constructor-name field-name ...)
+    let (ctor_name, ctor_fields) = match &args[1] {
+        Value::List(elems, _) if !elems.is_empty() => {
+            let name = match &elems[0] {
+                Value::Symbol(s, _) => s.clone(),
+                _ => return Err(EvalError::Parse("define-record-type: expected constructor name".into(), form_span)),
+            };
+            let fields: Vec<String> = elems[1..].iter().map(|e| match e {
+                Value::Symbol(s, _) => Ok(s.clone()),
+                _ => Err(EvalError::Parse("define-record-type: expected field name".into(), form_span)),
+            }).collect::<Result<_, _>>()?;
+            (name, fields)
+        }
+        _ => return Err(EvalError::Parse("define-record-type: expected constructor form".into(), form_span)),
+    };
+
+    // Parse predicate name
+    let pred_name = match &args[2] {
+        Value::Symbol(s, _) => s.clone(),
+        _ => return Err(EvalError::Parse("define-record-type: expected predicate name".into(), form_span)),
+    };
+
+    // Parse field specs: (field-name accessor-name) ...
+    let mut field_accessors: Vec<(String, String)> = Vec::new();
+    for arg in &args[3..] {
+        match arg {
+            Value::List(elems, _) if elems.len() == 2 => {
+                let field = match &elems[0] {
+                    Value::Symbol(s, _) => s.clone(),
+                    _ => return Err(EvalError::Parse("define-record-type: expected field name in field spec".into(), form_span)),
+                };
+                let accessor = match &elems[1] {
+                    Value::Symbol(s, _) => s.clone(),
+                    _ => return Err(EvalError::Parse("define-record-type: expected accessor name in field spec".into(), form_span)),
+                };
+                field_accessors.push((field, accessor));
+            }
+            _ => return Err(EvalError::Parse("define-record-type: expected (field accessor) spec".into(), form_span)),
+        }
+    }
+
+    let num_fields = ctor_fields.len();
+
+    // Define constructor as a builtin: __record_ctor_{type_id}_{num_fields}
+    let ctor_builtin_name = format!("__record_ctor_{}_{}", type_id, num_fields);
+    env_set(env, ctor_name, Value::Builtin(ctor_builtin_name, form_span));
+
+    // Define predicate as a builtin: __record_pred_{type_id}
+    let pred_builtin_name = format!("__record_pred_{}", type_id);
+    env_set(env, pred_name, Value::Builtin(pred_builtin_name, form_span));
+
+    // Define accessors: __record_acc_{type_id}_{field_index}
+    for (field_name, accessor_name) in &field_accessors {
+        let idx = ctor_fields.iter().position(|f| f == field_name)
+            .ok_or_else(|| EvalError::Parse(
+                format!("define-record-type: field '{}' not in constructor", field_name),
+                form_span,
+            ))?;
+        let acc_builtin_name = format!("__record_acc_{}_{}", type_id, idx);
+        env_set(env, accessor_name.clone(), Value::Builtin(acc_builtin_name, form_span));
+    }
+
+    // Store the type name for the constructor to use
+    // We encode it in the builtin names, but also need the type_name when creating records.
+    // Store a mapping from type_id -> type_name in a thread-local
+    RECORD_TYPE_NAMES.with(|m| m.borrow_mut().insert(type_id, type_name));
+
+    Ok(Value::Void)
+}
+
 fn eval_define(args: &[Value], env: &Env, form_span: Span) -> Result<Value, EvalError> {
     if args.is_empty() {
         return Err(EvalError::Parse(
@@ -1557,7 +1658,8 @@ fn eval_lambda(args: &[Value], env: &Env, form_span: Span) -> Result<Value, Eval
 fn is_special_form(s: &str) -> bool {
     matches!(s, "define" | "set!" | "quote" | "lambda" | "if" | "begin"
         | "and" | "or" | "cond" | "let" | "define-syntax" | "syntax-rules"
-        | "string-set!" | "else" | "letrec" | "letrec*" | "case" | "guard")
+        | "string-set!" | "else" | "letrec" | "letrec*" | "case" | "guard"
+        | "define-record-type")
 }
 
 #[derive(Clone)]
@@ -3118,6 +3220,39 @@ fn eval_builtin_with_values(op: &str, args: &[Value], sp: Span) -> Result<Value,
                 _ => Ok(Value::Boolean(false, sp)),
             }
         }
+        _ if op.starts_with("__record_ctor_") => {
+            let parts: Vec<&str> = op.strip_prefix("__record_ctor_").unwrap().splitn(2, '_').collect();
+            let type_id: u64 = parts[0].parse().unwrap();
+            let num_fields: usize = parts[1].parse().unwrap();
+            if args.len() != num_fields {
+                return Err(EvalError::WrongArgCount { expected: num_fields.to_string(), got: args.len(), at: sp });
+            }
+            let type_name = RECORD_TYPE_NAMES.with(|m| m.borrow().get(&type_id).cloned().unwrap_or_default());
+            Ok(Value::Record { type_id, type_name, fields: args.to_vec(), span: sp })
+        }
+        _ if op.starts_with("__record_pred_") => {
+            let tid: u64 = op.strip_prefix("__record_pred_").unwrap().parse().unwrap();
+            if args.len() != 1 {
+                return Err(EvalError::WrongArgCount { expected: "1".into(), got: args.len(), at: sp });
+            }
+            let is_match = matches!(&args[0], Value::Record { type_id, .. } if *type_id == tid);
+            Ok(Value::Boolean(is_match, sp))
+        }
+        _ if op.starts_with("__record_acc_") => {
+            let rest = op.strip_prefix("__record_acc_").unwrap();
+            let parts: Vec<&str> = rest.splitn(2, '_').collect();
+            let tid: u64 = parts[0].parse().unwrap();
+            let idx: usize = parts[1].parse().unwrap();
+            if args.len() != 1 {
+                return Err(EvalError::WrongArgCount { expected: "1".into(), got: args.len(), at: sp });
+            }
+            match &args[0] {
+                Value::Record { type_id, fields, .. } if *type_id == tid => {
+                    Ok(fields[idx].clone())
+                }
+                _ => Err(EvalError::TypeError("record accessor: wrong record type".into(), sp)),
+            }
+        }
         _ => Err(EvalError::UnboundVariable(op.to_string(), sp)),
     }
 }
@@ -3233,6 +3368,8 @@ pub fn eval_str(input: &str) -> Result<String, EvalError> {
     CONT_ID_COUNTER.with(|c| c.set(0));
     GENSYM_COUNTER.with(|c| c.set(0));
     CONT_FRAMES.with(|cf| cf.borrow_mut().clear());
+    RECORD_TYPE_COUNTER.with(|c| c.set(0));
+    RECORD_TYPE_NAMES.with(|m| m.borrow_mut().clear());
 
 
     let exprs = parse_all(input)?;
@@ -3252,6 +3389,8 @@ pub fn eval_str_with_output(input: &str) -> Result<(String, String), EvalError> 
     CONT_ID_COUNTER.with(|c| c.set(0));
     GENSYM_COUNTER.with(|c| c.set(0));
     CONT_FRAMES.with(|cf| cf.borrow_mut().clear());
+    RECORD_TYPE_COUNTER.with(|c| c.set(0));
+    RECORD_TYPE_NAMES.with(|m| m.borrow_mut().clear());
 
 
     let exprs = parse_all(input)?;
