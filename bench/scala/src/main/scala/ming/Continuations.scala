@@ -35,8 +35,9 @@ object Continuations:
     val callccResult: Value =
       try
         Evaluator.applyProcTail(setup.proc, List(cont), setup.pos, setup.output) match
-          case Done(v, _, _)       => v
-          case Bounce(e2, env2, o) => Evaluator.eval(e2, env2, o)._1
+          case Done(v, _, _)             => v
+          case Bounce(e2, env2, o)       => Evaluator.eval(e2, env2, o)._1
+          case gb: Evaluator.GuardBounce => ExceptionHandling.guardLoop(gb)._1
       catch case ci: ContinuationInvoked if ci.tag eq tag => ci.value
     env.set("__callcc_replay__", Value.PairVal(callccResult, Value.NilVal), None)
     Evaluator.evalAll(remaining, env, out)
@@ -50,8 +51,9 @@ object Continuations:
       env.set("__callcc_replay__", Value.PairVal(ci.value, Value.NilVal), None)
       if ci.bodyLevel then
         Evaluator.evalBodyTail(ci.remaining, env, out, replayMode = true) match
-          case Done(v, e, o)       => (v, e, o)
-          case Bounce(e2, env2, o) => Evaluator.eval(e2, env2, o)
+          case Done(v, e, o)             => (v, e, o)
+          case Bounce(e2, env2, o)       => Evaluator.eval(e2, env2, o)
+          case gb: Evaluator.GuardBounce => ExceptionHandling.guardLoop(gb)
       else Evaluator.evalAll(ci.remaining, env, out)
     if ci.windEntries.nonEmpty then DynamicWind.withRewind(ci.windEntries.reverse, env, ci.capturedOut, doResume)
     else doResume(ci.capturedOut)
@@ -107,8 +109,9 @@ object Continuations:
     val callccResult: Value =
       try
         Evaluator.applyProcTail(proc, List(cont), None, out2) match
-          case Done(v, _, _)       => v
-          case Bounce(e2, env2, o) => Evaluator.eval(e2, env2, o)._1
+          case Done(v, _, _)             => v
+          case Bounce(e2, env2, o)       => Evaluator.eval(e2, env2, o)._1
+          case gb: Evaluator.GuardBounce => ExceptionHandling.guardLoop(gb)._1
       catch case ci: ContinuationInvoked if ci.tag eq tag => ci.value
     (callccResult, env, out2)
 

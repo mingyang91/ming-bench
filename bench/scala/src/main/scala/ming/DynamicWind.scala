@@ -65,8 +65,9 @@ object DynamicWind:
     out: String
   ): (Value, Env, String) =
     Evaluator.applyProcTail(thunk, Nil, None, out) match
-      case Done(v, e, o)       => (v, e, o)
-      case Bounce(e2, env2, o) => Evaluator.eval(e2, env2, o)
+      case Done(v, e, o)             => (v, e, o)
+      case Bounce(e2, env2, o)       => Evaluator.eval(e2, env2, o)
+      case gb: Evaluator.GuardBounce => ExceptionHandling.guardLoop(gb)
 
   private[ming] def lookupWindStack(env: Env): Value =
     try env.lookup("__wind_stack__")

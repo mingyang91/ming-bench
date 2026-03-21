@@ -43,10 +43,12 @@ object Apply:
       case Value.Symbol("call-with-values", _) =>
         applyCallWithValues(args, pos, out)
       case cv: Value.ContinuationVal =>
-        if args.length != 1 then throw EvalError.withPos("continuation requires 1 argument", pos)
+        val value = args match
+          case single :: Nil => single
+          case _             => Value.MultipleValues(args)
         throw new ContinuationInvoked(
           cv.tag,
-          args.head,
+          value,
           out,
           cv.remaining,
           cv.envThunk,
@@ -92,8 +94,10 @@ object Apply:
   @tailrec
   private[ming] def trampolineResult(r: EvalResult): (Value, Env, String) =
     r match
-      case Done(v, e, o)       => (v, e, o)
-      case Bounce(e2, env2, o) => trampolineResult(Evaluator.evalStep(e2, env2, o))
+      case Done(v, e, o)             => (v, e, o)
+      case gb: Evaluator.GuardBounce => ExceptionHandling.guardLoop(gb)
+      case Bounce(e2, env2, o) =>
+        trampolineResult(Evaluator.evalStep(e2, env2, o))
 
   private[ming] def isFalsy(v: Value): Boolean = v match
     case Value.BoolVal(false) => true

@@ -32,8 +32,9 @@ object HigherOrder:
       val tails = lists.map(_.tail)
       val (v, _, o) =
         Evaluator.applyProcTail(proc, heads, pos, out) match
-          case Done(v, e, o)     => (v, e, o)
-          case Bounce(e, env, o) => Evaluator.eval(e, env, o)
+          case Done(v, e, o)             => (v, e, o)
+          case Bounce(e, env, o)         => Evaluator.eval(e, env, o)
+          case gb: Evaluator.GuardBounce => ExceptionHandling.guardLoop(gb)
       mapLoop(proc, tails, acc :+ v, pos, o)
 
   def evalApply(
