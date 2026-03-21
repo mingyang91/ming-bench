@@ -539,30 +539,24 @@ fn eval(expr: Value, env: &Env, pos: Pos) -> Result<Value, EvalError> {
                         Ok(Value::Boolean(false))
                     }
                     "string-set!" => {
-                        if elems.len() != 4 {
-                            return Err(runtime_err(pos, "string-set! requires 3 arguments"));
+                        Err(runtime_err(pos, "string-set!: strings are immutable"))
+                    }
+                    "map" => {
+                        if elems.len() != 3 {
+                            return Err(runtime_err(pos, "map requires 2 arguments"));
                         }
-                        let var_name = match &elems[1] {
-                            Value::Symbol(s) => s.clone(),
-                            _ => return Err(runtime_err(pos, "string-set!: first arg must be a variable")),
-                        };
-                        let idx = expect_int(&eval(elems[2].clone(), env, pos)?, pos)? as usize;
-                        let ch = match eval(elems[3].clone(), env, pos)? {
-                            Value::Char(c) => c,
-                            _ => return Err(runtime_err(pos, "string-set!: third arg must be a char")),
-                        };
-                        let mut s = match env_get(env, &var_name) {
-                            Some(Value::Str(s)) => s,
-                            _ => return Err(runtime_err(pos, "string-set!: variable is not a string")),
-                        };
-                        let mut chars: Vec<char> = s.chars().collect();
-                        if idx >= chars.len() {
-                            return Err(runtime_err(pos, "string-set!: index out of bounds"));
+                        let func = eval(elems[1].clone(), env, pos)?;
+                        let lst = eval(elems[2].clone(), env, pos)?;
+                        match lst {
+                            Value::List(items) => {
+                                let mut results = Vec::new();
+                                for item in &items {
+                                    results.push(apply_proc(&func, "map", &[item.clone()], env, pos)?);
+                                }
+                                Ok(Value::List(results))
+                            }
+                            _ => Err(runtime_err(pos, "map: second argument must be a list")),
                         }
-                        chars[idx] = ch;
-                        s = chars.into_iter().collect();
-                        env_set_existing(env, &var_name, Value::Str(s));
-                        Ok(Value::Boolean(false))
                     }
                     _ => {
                         let mut args = Vec::new();
@@ -926,6 +920,49 @@ fn apply_builtin_vals(op: &str, vals: &[Value], pos: Pos) -> Result<Value, EvalE
                 return Err(runtime_err(pos, "char? requires 1 argument"));
             }
             Ok(Value::Boolean(matches!(&vals[0], Value::Char(_))))
+        }
+        "string->list" => {
+            if vals.len() != 1 {
+                return Err(runtime_err(pos, "string->list requires 1 argument"));
+            }
+            match &vals[0] {
+                Value::Str(s) => Ok(Value::List(s.chars().map(Value::Char).collect())),
+                _ => Err(runtime_err(pos, "string->list: expected string")),
+            }
+        }
+        "list->string" => {
+            if vals.len() != 1 {
+                return Err(runtime_err(pos, "list->string requires 1 argument"));
+            }
+            match &vals[0] {
+                Value::List(elems) => {
+                    let mut s = String::new();
+                    for v in elems {
+                        match v {
+                            Value::Char(c) => s.push(*c),
+                            _ => return Err(runtime_err(pos, "list->string: expected list of characters")),
+                        }
+                    }
+                    Ok(Value::Str(s))
+                }
+                _ => Err(runtime_err(pos, "list->string: expected list")),
+            }
+        }
+        "char->integer" => {
+            if vals.len() != 1 {
+                return Err(runtime_err(pos, "char->integer requires 1 argument"));
+            }
+            match &vals[0] {
+                Value::Char(c) => Ok(Value::Integer(*c as i64)),
+                _ => Err(runtime_err(pos, "char->integer: expected char")),
+            }
+        }
+        "integer->char" => {
+            if vals.len() != 1 {
+                return Err(runtime_err(pos, "integer->char requires 1 argument"));
+            }
+            let n = expect_int(&vals[0], pos)?;
+            Ok(Value::Char(char::from_u32(n as u32).unwrap_or('\u{FFFD}')))
         }
         _ => Err(runtime_err(pos, format!("unknown procedure: {}", op))),
     }
