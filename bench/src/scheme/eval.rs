@@ -265,8 +265,8 @@ fn eval_list_step(
             "define" => return eval_define(args, env, out).map(Trampoline::Done),
             "if" => return eval_if_step(args, env, out),
             "quote" => return eval_quote(args).map(Trampoline::Done),
-            "and" => return eval_and(args, env, out).map(Trampoline::Done),
-            "or" => return eval_or(args, env, out).map(Trampoline::Done),
+            "and" => return eval_and_step(args, env, out),
+            "or" => return eval_or_step(args, env, out),
             "lambda" => return eval_lambda(args, env).map(Trampoline::Done),
             "let" => return eval_let_step(args, env, out),
             "begin" => return eval_body_step(args, env, out),
@@ -552,24 +552,32 @@ fn eval_quote(args: &[Expr]) -> Result<Value, EvalError> {
     quote_expr(expr)
 }
 
-/// Short-circuit `and`: returns last truthy value, or first falsy value.
-fn eval_and(args: &[Expr], env: &mut Env, out: &mut String) -> Result<Value, EvalError> {
-    let mut result = Value::Boolean(true);
-    for arg in args {
-        result = eval(arg, env, out)?;
-        if result == Value::Boolean(false) {
-            return Ok(result);
+/// Short-circuit `and` with TCO: last expression is in tail position.
+fn eval_and_step(args: &[Expr], env: &mut Env, out: &mut String) -> Result<Trampoline, EvalError> {
+    let [rest @ .., last] = args else {
+        return Ok(Trampoline::Done(Value::Boolean(true)));
+    };
+    for arg in rest {
+        let val = eval(arg, env, out)?;
+        if val == Value::Boolean(false) {
+            return Ok(Trampoline::Done(val));
         }
     }
-    Ok(result)
+    Ok(Trampoline::Continue(last.clone(), env.clone()))
 }
 
-/// Evaluate `(let ((var val) ...) body...)` — returns Continue for body (TCO).
+/// Evaluate `(let ((var val) ...) body...)` or named `(let name ((var val) ...) body...)`.
 fn eval_let_step(
     args: &[Expr],
     env: &mut Env,
     out: &mut String,
 ) -> Result<Trampoline, EvalError> {
+    // Check for named let: (let name ((var val) ...) body...)
+    if let [Expr::Atom(name, _), Expr::List(bindings, _), body @ ..] = args {
+        if !body.is_empty() {
+            return eval_named_let_step(name, bindings, body, env, out);
+        }
+    }
     let [bindings_expr, body @ ..] = args else {
         return Err(EvalError::Parse {
             message: "let requires bindings and body".to_string(),
@@ -610,6 +618,41 @@ fn eval_let_step(
     eval_body_step(body, &mut local_env, out)
 }
 
+/// Evaluate named let: `(let name ((var val) ...) body...)`.
+/// Desugars to a recursive lambda call with TCO.
+fn eval_named_let_step(
+    name: &str,
+    bindings: &[Expr],
+    body: &[Expr],
+    env: &mut Env,
+    out: &mut String,
+) -> Result<Trampoline, EvalError> {
+    let mut params = Vec::new();
+    let mut init_vals = Vec::new();
+    for b in bindings {
+        let Expr::List(pair, _) = b else {
+            return Err(EvalError::Parse {
+                message: "named let binding must be a list".to_string(),
+            });
+        };
+        let [Expr::Atom(param, _), val_expr] = pair.as_slice() else {
+            return Err(EvalError::Parse {
+                message: "named let binding must be (name value)".to_string(),
+            });
+        };
+        params.push(param.clone());
+        init_vals.push(eval(val_expr, env, out)?);
+    }
+    let lambda = Value::Lambda {
+        name: Some(name.to_string()),
+        params,
+        rest_param: None,
+        body: body.to_vec(),
+        closure_env: env.clone(),
+    };
+    apply_lambda_step(&lambda, &init_vals, env, out)
+}
+
 /// Evaluate `(cond (test expr) ... (else expr))` — returns Continue for body (TCO).
 fn eval_cond_step(
     args: &[Expr],
@@ -639,16 +682,18 @@ fn eval_cond_step(
     Ok(Trampoline::Done(Value::Nil))
 }
 
-/// Short-circuit `or`: returns first truthy value, or last falsy value.
-fn eval_or(args: &[Expr], env: &mut Env, out: &mut String) -> Result<Value, EvalError> {
-    let mut result = Value::Boolean(false);
-    for arg in args {
-        result = eval(arg, env, out)?;
-        if result != Value::Boolean(false) {
-            return Ok(result);
+/// Short-circuit `or` with TCO: last expression is in tail position.
+fn eval_or_step(args: &[Expr], env: &mut Env, out: &mut String) -> Result<Trampoline, EvalError> {
+    let [rest @ .., last] = args else {
+        return Ok(Trampoline::Done(Value::Boolean(false)));
+    };
+    for arg in rest {
+        let val = eval(arg, env, out)?;
+        if val != Value::Boolean(false) {
+            return Ok(Trampoline::Done(val));
         }
     }
-    Ok(result)
+    Ok(Trampoline::Continue(last.clone(), env.clone()))
 }
 
 /// Evaluate `(display expr)` — prints value without quotes on strings.
