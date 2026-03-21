@@ -2,6 +2,7 @@ mod apply;
 mod builtins;
 pub mod error;
 mod forms;
+mod macros;
 pub mod parser;
 pub mod value;
 
@@ -9,6 +10,7 @@ pub use error::EvalError;
 use apply::apply_step;
 pub(crate) use apply::{apply, eval_to_integer, is_truthy};
 use builtins::{apply_builtin, is_builtin};
+use macros::{eval_define_syntax, expand_macro};
 use forms::{
     eval_and_step, eval_begin_step, eval_cond_step, eval_define, eval_if_step,
     eval_lambda, eval_let_step, eval_or_step, eval_quote, eval_set, eval_string_set,
@@ -139,7 +141,9 @@ pub(crate) fn eval(value: &Value, env: &mut Env, output: &mut String) -> Result<
 fn eval_step(value: &Value, env: &mut Env, output: &mut String) -> Result<Bounce, EvalError> {
     match value {
         Value::Integer(_) | Value::Boolean(_) | Value::String(_) | Value::Char(_)
-        | Value::Lambda { .. } | Value::Continuation { .. } => Ok(Bounce::Done(value.clone())),
+        | Value::Lambda { .. } | Value::Continuation { .. } | Value::Macro { .. } => {
+            Ok(Bounce::Done(value.clone()))
+        }
         Value::Symbol(name, span) => env
             .get(name)
             .map(|rc| Bounce::Done(rc.borrow().clone()))
@@ -187,8 +191,16 @@ fn eval_list_step(
             "call/cc" | "call-with-current-continuation" => {
                 return eval_callcc(args, env, span, output);
             }
+            "define-syntax" => {
+                return eval_define_syntax(args, env, span).map(Bounce::Done);
+            }
             _ => {}
         }
+    }
+
+    // Macro expansion: check if operator resolves to a macro
+    if let Some(expanded) = try_expand_macro(operator, args, env, span)? {
+        return Ok(Bounce::Continue(expanded));
     }
 
     if let Value::Symbol(name, _) = operator {
@@ -204,6 +216,25 @@ fn eval_list_step(
         .collect::<Result<_, _>>()?;
 
     apply_step(proc, &evaluated_args, env, span, output)
+}
+
+fn try_expand_macro(
+    operator: &Value,
+    args: &[Value],
+    env: &mut Env,
+    span: Span,
+) -> Result<Option<Value>, EvalError> {
+    let Value::Symbol(name, _) = operator else {
+        return Ok(None);
+    };
+    let Some(cell) = env.get(name).cloned() else {
+        return Ok(None);
+    };
+    let val = cell.borrow().clone();
+    if !matches!(&val, Value::Macro { .. }) {
+        return Ok(None);
+    }
+    expand_macro(&val, args, env, span).map(Some)
 }
 
 #[cfg(test)]
