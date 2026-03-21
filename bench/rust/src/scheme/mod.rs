@@ -2826,16 +2826,7 @@ fn dispatch_apply(
     match operator {
         Value::Builtin(builtin) => apply_builtin_state(builtin, args, pos, output, cont),
         Value::Procedure(procedure) => apply_procedure_state(procedure, args, pos, cont),
-        Value::Continuation(saved) => {
-            if args.len() != 1 {
-                return Err(wrong_arity(pos, "procedure", "exactly 1", args.len()));
-            }
-
-            invoke_captured_continuation(
-                saved,
-                args.into_iter().next().expect("continuation arity checked"),
-            )
-        }
+        Value::Continuation(saved) => invoke_captured_continuation(saved, pack_values(args)),
         other => Err(not_callable(pos, other.type_name())),
     }
 }
@@ -2878,11 +2869,7 @@ fn apply_builtin_state(
             expanded_args.extend(spliced);
             return dispatch_apply(operator.clone(), expanded_args, pos, output, cont);
         }
-        Builtin::Values => Some(if args.len() == 1 {
-            args[0].clone()
-        } else {
-            Value::Values(args)
-        }),
+        Builtin::Values => Some(pack_values(args)),
         Builtin::CallWithValues => {
             let [producer, consumer] = args.as_slice() else {
                 return Err(wrong_arity(
@@ -4545,6 +4532,14 @@ fn flatten_values(value: Value) -> Vec<Value> {
     match value {
         Value::Values(items) => items,
         other => vec![other],
+    }
+}
+
+fn pack_values(mut items: Vec<Value>) -> Value {
+    if items.len() == 1 {
+        items.pop().expect("single value length checked")
+    } else {
+        Value::Values(items)
     }
 }
 
