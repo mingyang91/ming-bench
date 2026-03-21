@@ -61,6 +61,7 @@ enum AstKind {
     Boolean(bool),
     Str(String),
     Symbol(String),
+    Char(char),
     List(Vec<Ast>),
 }
 
@@ -187,6 +188,19 @@ fn parse(tokens: &[Token], pos: usize) -> Result<(Ast, usize), EvalError> {
         ))
     } else if token.text == ")" {
         Err(EvalError::Parse("unexpected )".into()).with_position(line, col))
+    } else if token.text.starts_with("#\\") {
+        let ch = if token.text.len() == 3 {
+            token.text.chars().nth(2).unwrap()
+        } else {
+            match &token.text[2..] {
+                "space" => ' ',
+                "newline" => '\n',
+                "tab" => '\t',
+                _ => return Err(EvalError::Parse(format!("unknown character literal: {}", token.text))
+                    .with_position(line, col)),
+            }
+        };
+        Ok((Ast { kind: AstKind::Char(ch), line, col }, pos + 1))
     } else if token.text == "#t" {
         Ok((Ast { kind: AstKind::Boolean(true), line, col }, pos + 1))
     } else if token.text == "#f" {
@@ -208,6 +222,7 @@ fn ast_to_value(ast: &Ast) -> Value {
         AstKind::Boolean(b) => Value::Boolean(*b),
         AstKind::Str(s) => Value::Str(s.clone()),
         AstKind::Symbol(s) => Value::Symbol(s.clone()),
+        AstKind::Char(c) => Value::Char(*c),
         AstKind::List(items) => Value::List(items.iter().map(ast_to_value).collect()),
     }
 }
@@ -220,6 +235,7 @@ fn eval(ast: &Ast, env: &mut Env, out: &mut String) -> Result<Value, EvalError> 
         AstKind::Integer(n) => Ok(Value::Integer(*n)),
         AstKind::Boolean(b) => Ok(Value::Boolean(*b)),
         AstKind::Str(s) => Ok(Value::Str(s.clone())),
+        AstKind::Char(c) => Ok(Value::Char(*c)),
         AstKind::Symbol(s) => env
             .get(s)
             .cloned()
@@ -423,6 +439,43 @@ fn eval(ast: &Ast, env: &mut Env, out: &mut String) -> Result<Value, EvalError> 
                             result = eval(expr, &mut local_env, out)?;
                         }
                         return Ok(result);
+                    }
+                    "string-set!" => {
+                        if items.len() != 4 {
+                            return Err(EvalError::Arity.with_position(line, col));
+                        }
+                        let var_name = match &items[1].kind {
+                            AstKind::Symbol(s) => s.clone(),
+                            _ => return Err(EvalError::TypeError(
+                                "string-set!: first argument must be a variable".into(),
+                            ).with_position(items[1].line, items[1].col)),
+                        };
+                        let idx = expect_integer(&eval(&items[2], env, out)?)?;
+                        let ch = match eval(&items[3], env, out)? {
+                            Value::Char(c) => c,
+                            _ => return Err(EvalError::TypeError(
+                                "string-set!: third argument must be a character".into(),
+                            ).with_position(items[3].line, items[3].col)),
+                        };
+                        let s = env.get_mut(&var_name).ok_or_else(|| {
+                            EvalError::UndefinedVariable(var_name.clone())
+                                .with_position(items[1].line, items[1].col)
+                        })?;
+                        return match s {
+                            Value::Str(ref mut string) => {
+                                let idx = idx as usize;
+                                if idx >= string.len() {
+                                    return Err(EvalError::TypeError(
+                                        "string-set!: index out of range".into(),
+                                    ).with_position(line, col));
+                                }
+                                unsafe { string.as_bytes_mut()[idx] = ch as u8; }
+                                Ok(Value::Symbol("ok".into()))
+                            }
+                            _ => Err(EvalError::TypeError(
+                                "string-set!: not a string".into(),
+                            ).with_position(line, col)),
+                        };
                     }
                     "cond" => {
                         for clause in &items[1..] {
@@ -702,6 +755,13 @@ fn apply_builtin(op: &str, args: &[Value], out: &mut String) -> Result<Value, Ev
             match &args[0] {
                 Value::Str(s) => Ok(Value::Symbol(s.clone())),
                 _ => Err(EvalError::TypeError("string->symbol: expected string".into())),
+            }
+        }
+        "string-copy" => {
+            if args.len() != 1 { return Err(EvalError::Arity); }
+            match &args[0] {
+                Value::Str(s) => Ok(Value::Str(s.clone())),
+                _ => Err(EvalError::TypeError("string-copy: expected string".into())),
             }
         }
         "string-ref" => {
