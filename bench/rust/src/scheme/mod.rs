@@ -333,6 +333,22 @@ impl Env {
         env.borrow_mut().bindings.insert(name, value);
     }
 
+    fn set(env: &EnvRef, name: &str, value: Value) -> Result<(), EvalError> {
+        let parent = {
+            let mut env_ref = env.borrow_mut();
+            if let Some(binding) = env_ref.bindings.get_mut(name) {
+                *binding = value;
+                return Ok(());
+            }
+            env_ref.parent.clone()
+        };
+
+        match parent {
+            Some(parent) => Self::set(&parent, name, value),
+            None => Err(EvalError::UnboundSymbol(name.to_string())),
+        }
+    }
+
     fn lookup(env: &EnvRef, name: &str) -> Option<Value> {
         let (value, parent) = {
             let env_ref = env.borrow();
@@ -464,6 +480,7 @@ fn eval_list(
         ExprKind::Symbol(name) if name == "cond" => eval_cond(args, env, ctx),
         ExprKind::Symbol(name) if name == "quote" => eval_quote(args),
         ExprKind::Symbol(name) if name == "define" => eval_define(args, env, ctx),
+        ExprKind::Symbol(name) if name == "set!" => eval_set(args, env, ctx),
         ExprKind::Symbol(name) if name == "lambda" => eval_lambda(args, env),
         _ => {
             let procedure = eval_expr(head, env.clone(), ctx)?;
@@ -496,6 +513,9 @@ fn eval_tail_list(
         ExprKind::Symbol(name) if name == "quote" => eval_quote(args).map(TailOutcome::Value),
         ExprKind::Symbol(name) if name == "define" => {
             eval_define(args, env, ctx).map(TailOutcome::Value)
+        }
+        ExprKind::Symbol(name) if name == "set!" => {
+            eval_set(args, env, ctx).map(TailOutcome::Value)
         }
         ExprKind::Symbol(name) if name == "lambda" => {
             eval_lambda(args, env).map(TailOutcome::Value)
@@ -836,6 +856,17 @@ fn eval_lambda(args: &[Expr], env: EnvRef) -> Result<Value, EvalError> {
         body: body.to_vec(),
         env,
     })))
+}
+
+fn eval_set(args: &[Expr], env: EnvRef, ctx: &mut EvalContext) -> Result<Value, EvalError> {
+    if args.len() != 2 {
+        return Err(wrong_arg_count("set!", "exactly 2", args.len()));
+    }
+
+    let name = expect_symbol(&args[0], "set! target")?;
+    let value = eval_expr(&args[1], env.clone(), ctx)?;
+    Env::set(&env, &name, value)?;
+    Ok(Value::Void)
 }
 
 fn parse_parameter_list(expr: &Expr) -> Result<Vec<String>, EvalError> {
