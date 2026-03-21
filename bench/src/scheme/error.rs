@@ -16,4 +16,19 @@ pub enum EvalError {
     Arity,
     #[error("division by zero")]
     DivisionByZero,
+    #[error("{msg} at {line}:{col}")]
+    WithPosition { msg: String, line: usize, col: usize },
+}
+
+impl EvalError {
+    pub fn with_position(self, line: usize, col: usize) -> EvalError {
+        match self {
+            EvalError::WithPosition { .. } => self,
+            other => EvalError::WithPosition {
+                msg: other.to_string(),
+                line,
+                col,
+            },
+        }
+    }
 }
