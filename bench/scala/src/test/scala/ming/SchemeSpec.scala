@@ -27,8 +27,11 @@ class SchemeSpec extends FunSuite {
   }
 
   private val benchLevel: Int = {
-    val env = Option(System.getenv("BENCH_LEVEL")).getOrElse("")
-    env.toIntOption.getOrElse(0)
+    // Mill passes BENCH_LEVEL via system property (env vars don't propagate to forked JVM)
+    val fromProp = Option(System.getProperty("bench.level")).getOrElse("")
+    val fromEnv = Option(System.getenv("BENCH_LEVEL")).getOrElse("")
+    val raw = if (fromProp.nonEmpty) fromProp else fromEnv
+    raw.toIntOption.getOrElse(0)
   }
 
   locally {

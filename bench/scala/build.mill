@@ -1,13 +1,14 @@
+//| mvnDeps:
+//| - com.goyeau::mill-scalafix::0.6.0
+
 package build
 
-import mill._
-import mill.scalalib._
-import mill.scalalib.scalafmt._
+import mill._, scalalib._, scalafmt.ScalafmtModule
+import com.goyeau.mill.scalafix.ScalafixModule
 
-object ming extends ScalaModule with ScalafmtModule {
+object `package` extends SbtModule with ScalafmtModule with ScalafixModule {
+
   def scalaVersion = "3.8.1"
-
-  def sources = Task.Sources(moduleDir / os.up / "src" / "main" / "scala")
 
   def scalacOptions = Seq(
     "-deprecation",
@@ -15,16 +16,20 @@ object ming extends ScalaModule with ScalafmtModule {
     "-unchecked",
   )
 
-  object test extends ScalaTests with TestModule.Munit with ScalafmtModule {
-    def sources = Task.Sources(moduleDir / os.up / os.up / "src" / "test" / "scala")
+  def scalafixConfig = Some(moduleDir / ".scalafix.conf")
 
-    // bench/ dir contains tests.json and fixtures/; pass as absolute path
-    // since Mill sandboxes the test working directory.
-    private val benchDirPath = (moduleDir / os.up / os.up / os.up).toString
-    def forkArgs = Seq(s"-Dbench.dir=$benchDirPath")
+  def scalafixIvyDeps = Seq(
+    mvn"com.github.metals:ming-scalafix-rules_2.13:0.1.0-SNAPSHOT",
+  )
+
+  object test extends SbtTests {
+    def testFramework = "munit.Framework"
+
+    // bench/ dir contains tests.json and fixtures/
+    def forkArgs = Seq(s"-Dbench.dir=${moduleDir / os.up}")
 
     def mvnDeps = Seq(
-      mvn"org.scalameta::munit::1.1.0",
+      mvn"org.scalameta::munit:1.1.0",
       mvn"com.google.code.gson:gson:2.11.0",
     )
   }
