@@ -281,7 +281,7 @@ fn is_builtin(name: &str) -> bool {
         "string-copy" | "string-ref" | "char?" | "map" |
         "string->list" | "list->string" | "char->integer" | "integer->char" |
         "apply" | "call/cc" | "call-with-current-continuation" |
-        "equal?")
+        "equal?" | "eq?" | "eqv?")
 }
 
 fn parse_params(param_asts: &[Ast]) -> Result<(Vec<String>, Option<String>), EvalError> {
@@ -922,6 +922,50 @@ fn eval(ast: &Ast, env: &mut Env, out: &mut String) -> Result<Value, EvalError> 
                             }
                             return Ok(Value::Symbol("ok".into()));
                         }
+                        "case" => {
+                            if items.len() < 2 {
+                                return Err(EvalError::Arity.with_position(line, col));
+                            }
+                            let key = eval(&items[1], e, out)?;
+                            for clause in &items[2..] {
+                                match &clause.kind {
+                                    AstKind::List(parts) if parts.len() >= 2 => {
+                                        if let AstKind::Symbol(s) = &parts[0].kind {
+                                            if s == "else" {
+                                                for expr in &parts[1..parts.len() - 1] {
+                                                    eval(expr, e, out)?;
+                                                }
+                                                cur_ast = parts.last().unwrap().clone();
+                                                continue 'tco;
+                                            }
+                                        }
+                                        // parts[0] should be a list of datums
+                                        if let AstKind::List(datums) = &parts[0].kind {
+                                            let matched = datums.iter().any(|d| {
+                                                let dv = ast_to_value(d);
+                                                match (&key, &dv) {
+                                                    (Value::Integer(x), Value::Integer(y)) => x == y,
+                                                    (Value::Boolean(x), Value::Boolean(y)) => x == y,
+                                                    (Value::Symbol(x), Value::Symbol(y)) => x == y,
+                                                    (Value::Char(x), Value::Char(y)) => x == y,
+                                                    _ => false,
+                                                }
+                                            });
+                                            if matched {
+                                                for expr in &parts[1..parts.len() - 1] {
+                                                    eval(expr, e, out)?;
+                                                }
+                                                cur_ast = parts.last().unwrap().clone();
+                                                continue 'tco;
+                                            }
+                                        }
+                                    }
+                                    _ => return Err(EvalError::TypeError("case: bad clause".into())
+                                        .with_position(clause.line, clause.col)),
+                                }
+                            }
+                            return Ok(Value::Symbol("ok".into()));
+                        }
                         "define-syntax" => {
                             if items.len() != 3 {
                                 return Err(EvalError::Arity.with_position(line, col));
@@ -1321,6 +1365,18 @@ fn apply_builtin(op: &str, args: &[Value], out: &mut String) -> Result<Value, Ev
         "equal?" => {
             if args.len() != 2 { return Err(EvalError::Arity); }
             Ok(Value::Boolean(values_equal(&args[0], &args[1])))
+        }
+        "eq?" | "eqv?" => {
+            if args.len() != 2 { return Err(EvalError::Arity); }
+            let result = match (&args[0], &args[1]) {
+                (Value::Integer(x), Value::Integer(y)) => x == y,
+                (Value::Boolean(x), Value::Boolean(y)) => x == y,
+                (Value::Symbol(x), Value::Symbol(y)) => x == y,
+                (Value::Char(x), Value::Char(y)) => x == y,
+                (Value::List(x), Value::List(y)) => x.is_empty() && y.is_empty(),
+                _ => false,
+            };
+            Ok(Value::Boolean(result))
         }
         "display" => {
             if args.len() != 1 { return Err(EvalError::Arity); }
