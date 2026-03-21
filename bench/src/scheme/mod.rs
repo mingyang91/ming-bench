@@ -127,6 +127,30 @@ fn eval(value: &Value) -> Result<Value, EvalError> {
                 Value::Symbol(s) => s.as_str(),
                 _ => return Err(EvalError::NotAProcedure),
             };
+            // Special forms with short-circuit evaluation
+            match op {
+                "and" => {
+                    let mut result = Value::Boolean(true);
+                    for a in &items[1..] {
+                        result = eval(a)?;
+                        if result == Value::Boolean(false) {
+                            return Ok(result);
+                        }
+                    }
+                    return Ok(result);
+                }
+                "or" => {
+                    let mut result = Value::Boolean(false);
+                    for a in &items[1..] {
+                        result = eval(a)?;
+                        if result != Value::Boolean(false) {
+                            return Ok(result);
+                        }
+                    }
+                    return Ok(result);
+                }
+                _ => {}
+            }
             let args: Result<Vec<Value>, _> = items[1..].iter().map(|a| eval(a)).collect();
             let args = args?;
             apply_builtin(op, &args)
@@ -183,6 +207,30 @@ fn apply_builtin(op: &str, args: &[Value]) -> Result<Value, EvalError> {
                 result /= d;
             }
             Ok(Value::Integer(result))
+        }
+        "<" => {
+            if args.len() != 2 { return Err(EvalError::Arity); }
+            Ok(Value::Boolean(expect_integer(&args[0])? < expect_integer(&args[1])?))
+        }
+        ">" => {
+            if args.len() != 2 { return Err(EvalError::Arity); }
+            Ok(Value::Boolean(expect_integer(&args[0])? > expect_integer(&args[1])?))
+        }
+        "=" => {
+            if args.len() != 2 { return Err(EvalError::Arity); }
+            Ok(Value::Boolean(expect_integer(&args[0])? == expect_integer(&args[1])?))
+        }
+        "<=" => {
+            if args.len() != 2 { return Err(EvalError::Arity); }
+            Ok(Value::Boolean(expect_integer(&args[0])? <= expect_integer(&args[1])?))
+        }
+        ">=" => {
+            if args.len() != 2 { return Err(EvalError::Arity); }
+            Ok(Value::Boolean(expect_integer(&args[0])? >= expect_integer(&args[1])?))
+        }
+        "not" => {
+            if args.len() != 1 { return Err(EvalError::Arity); }
+            Ok(Value::Boolean(args[0] == Value::Boolean(false)))
         }
         _ => Err(EvalError::UndefinedVariable(op.to_string())),
     }
