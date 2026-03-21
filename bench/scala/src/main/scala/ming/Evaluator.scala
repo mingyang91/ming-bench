@@ -47,6 +47,9 @@ object Evaluator:
       case Value.Symbol("if")     => evalIf(args, env)
       case Value.Symbol("quote")  => evalQuote(args, env)
       case Value.Symbol("lambda") => evalLambda(args, env)
+      case Value.Symbol("let")    => evalLet(args, env)
+      case Value.Symbol("begin")  => evalBegin(args, env)
+      case Value.Symbol("cond")   => evalCond(args, env)
       case Value.Symbol("and")    => (evalAnd(args, env), env)
       case Value.Symbol("or")     => (evalOr(args, env), env)
       case Value.Symbol("not")    => (evalNot(args, env), env)
@@ -133,7 +136,34 @@ object Evaluator:
       case "="  => evalCmp(args, _ == _)
       case "<=" => evalCmp(args, _ <= _)
       case ">=" => evalCmp(args, _ >= _)
-      case _    => throw new EvalError(s"unknown procedure: $name")
+      case "cons" =>
+        args match
+          case a :: b :: Nil => Value.PairVal(a, b)
+          case _             => throw new EvalError("cons requires exactly 2 arguments")
+      case "car" =>
+        args match
+          case Value.PairVal(h, _) :: Nil => h
+          case _                          => throw new EvalError("car requires a pair argument")
+      case "cdr" =>
+        args match
+          case Value.PairVal(_, t) :: Nil => t
+          case _                          => throw new EvalError("cdr requires a pair argument")
+      case "null?" =>
+        args match
+          case Value.NilVal :: Nil => Value.BoolVal(true)
+          case _ :: Nil            => Value.BoolVal(false)
+          case _                   => throw new EvalError("null? requires exactly 1 argument")
+      case "list" => args.foldRight(Value.NilVal: Value)(Value.PairVal(_, _))
+      case "length" =>
+        args match
+          case head :: Nil => Value.IntVal(listLength(head))
+          case _           => throw new EvalError("length requires exactly 1 argument")
+      case "string?"  => typePred(args, _.isInstanceOf[Value.StringVal])
+      case "number?"  => typePred(args, _.isInstanceOf[Value.IntVal])
+      case "boolean?" => typePred(args, _.isInstanceOf[Value.BoolVal])
+      case "pair?"    => typePred(args, _.isInstanceOf[Value.PairVal])
+      case "symbol?"  => typePred(args, _.isInstanceOf[Value.Symbol])
+      case _          => throw new EvalError(s"unknown procedure: $name")
 
   private def evalAnd(args: List[Value], env: Env): Value =
     args match
@@ -155,6 +185,49 @@ object Evaluator:
     args match
       case head :: Nil => Value.BoolVal(isFalsy(eval(head, env)._1))
       case _           => throw new EvalError("not requires exactly 1 argument")
+
+  private def evalLet(args: List[Value], env: Env): (Value, Env) =
+    args match
+      case bindings :: body if body.nonEmpty =>
+        val bindingList = toList(bindings)
+        val localEnv = bindingList.foldLeft(env) { (acc, binding) =>
+          val pair = toList(binding)
+          pair match
+            case Value.Symbol(name) :: valExpr :: Nil =>
+              val (v, _) = eval(valExpr, env)
+              acc.define(name, v)
+            case _ => throw new EvalError("bad let binding")
+        }
+        val (result, _) = evalAll(body, localEnv)
+        (result, env)
+      case _ => throw new EvalError("bad let syntax")
+
+  private def evalBegin(args: List[Value], env: Env): (Value, Env) =
+    evalAll(args, env)
+
+  private def evalCond(clauses: List[Value], env: Env): (Value, Env) =
+    clauses match
+      case Nil => (Value.VoidVal, env)
+      case clause :: rest =>
+        val parts = toList(clause)
+        parts match
+          case Value.Symbol("else") :: body =>
+            evalAll(body, env)
+          case test :: body =>
+            val (testVal, _) = eval(test, env)
+            if !isFalsy(testVal) then evalAll(body, env)
+            else evalCond(rest, env)
+          case _ => throw new EvalError("bad cond clause")
+
+  private def typePred(args: List[Value], pred: Value => Boolean): Value =
+    args match
+      case v :: Nil => Value.BoolVal(pred(v))
+      case _        => throw new EvalError("type predicate requires exactly 1 argument")
+
+  private def listLength(v: Value): Long = v match
+    case Value.NilVal        => 0L
+    case Value.PairVal(_, t) => 1L + listLength(t)
+    case _                   => throw new EvalError("length: not a proper list")
 
   private def isFalsy(v: Value): Boolean = v match
     case Value.BoolVal(false) => true
@@ -203,3 +276,14 @@ object Evaluator:
     .define("=", Value.Symbol("="))
     .define("<=", Value.Symbol("<="))
     .define(">=", Value.Symbol(">="))
+    .define("cons", Value.Symbol("cons"))
+    .define("car", Value.Symbol("car"))
+    .define("cdr", Value.Symbol("cdr"))
+    .define("null?", Value.Symbol("null?"))
+    .define("list", Value.Symbol("list"))
+    .define("length", Value.Symbol("length"))
+    .define("string?", Value.Symbol("string?"))
+    .define("number?", Value.Symbol("number?"))
+    .define("boolean?", Value.Symbol("boolean?"))
+    .define("pair?", Value.Symbol("pair?"))
+    .define("symbol?", Value.Symbol("symbol?"))
