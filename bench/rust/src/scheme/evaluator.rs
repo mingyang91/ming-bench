@@ -1,9 +1,17 @@
 use crate::scheme::ast::{Expr, SourceLocation};
-use crate::scheme::builtins::apply_builtin;
-use crate::scheme::builtins::install_builtins;
+use crate::scheme::builtins::{apply_builtin, install_builtins};
 use crate::scheme::environment::Environment;
 use crate::scheme::error::{ArgCount, EvalError};
 use crate::scheme::value::{Closure, Value};
+
+enum EvalAction {
+    Value(Value),
+    Call {
+        callable: Value,
+        arguments: Vec<Value>,
+        location: SourceLocation,
+    },
+}
 
 pub fn eval_program(expressions: &[Expr]) -> Result<Value, EvalError> {
     eval_program_with_output(expressions).map(|(value, _)| value)
@@ -29,109 +37,142 @@ fn eval_expr(
     environment: &Environment,
     output: &mut String,
 ) -> Result<Value, EvalError> {
-    match expression {
-        Expr::Integer { value, .. } => Ok(Value::Integer(*value)),
-        Expr::Boolean { value, .. } => Ok(Value::Boolean(*value)),
-        Expr::String { value, .. } => Ok(Value::immutable_string(value.clone())),
-        Expr::Character { value, .. } => Ok(Value::Character(*value)),
-        Expr::Symbol { name, location } => {
-            environment
-                .lookup(name)
-                .ok_or_else(|| EvalError::UnboundVariable {
-                    location: *location,
-                    name: name.clone(),
-                })
-        }
-        Expr::List { items, location } => eval_list(items, *location, environment, output),
+    resolve_action(eval_tail_expr(expression, environment, output)?, output)
+}
+
+fn resolve_action(mut action: EvalAction, output: &mut String) -> Result<Value, EvalError> {
+    loop {
+        action = match action {
+            EvalAction::Value(value) => return Ok(value),
+            EvalAction::Call {
+                callable,
+                arguments,
+                location,
+            } => apply_tail_callable(callable, arguments, location, output)?,
+        };
     }
 }
 
-fn eval_list(
+fn eval_tail_expr(
+    expression: &Expr,
+    environment: &Environment,
+    output: &mut String,
+) -> Result<EvalAction, EvalError> {
+    match expression {
+        Expr::Integer { value, .. } => Ok(EvalAction::Value(Value::Integer(*value))),
+        Expr::Boolean { value, .. } => Ok(EvalAction::Value(Value::Boolean(*value))),
+        Expr::String { value, .. } => Ok(EvalAction::Value(Value::immutable_string(value.clone()))),
+        Expr::Character { value, .. } => Ok(EvalAction::Value(Value::Character(*value))),
+        Expr::Symbol { name, location } => environment
+            .lookup(name)
+            .map(EvalAction::Value)
+            .ok_or_else(|| EvalError::UnboundVariable {
+                location: *location,
+                name: name.clone(),
+            }),
+        Expr::List { items, location } => eval_tail_list(items, *location, environment, output),
+    }
+}
+
+fn eval_tail_list(
     items: &[Expr],
     location: SourceLocation,
     environment: &Environment,
     output: &mut String,
-) -> Result<Value, EvalError> {
+) -> Result<EvalAction, EvalError> {
     let Some((operator, arguments)) = items.split_first() else {
         return Err(EvalError::EmptyApplication { location });
     };
 
     if let Some(name) = operator.symbol_name() {
-        if let Some(value) =
-            eval_special_form(name, arguments, operator.location(), environment, output)?
+        if let Some(action) =
+            eval_tail_special_form(name, arguments, operator.location(), environment, output)?
         {
-            return Ok(value);
+            return Ok(action);
         }
     }
 
     let callable = eval_expr(operator, environment, output)?;
     let values = eval_arguments(arguments, environment, output)?;
-    apply_callable(callable, &values, operator.location(), output)
+
+    Ok(EvalAction::Call {
+        callable,
+        arguments: values,
+        location: operator.location(),
+    })
 }
 
-fn eval_special_form(
+fn eval_tail_special_form(
     name: &str,
     arguments: &[Expr],
     location: SourceLocation,
     environment: &Environment,
     output: &mut String,
-) -> Result<Option<Value>, EvalError> {
+) -> Result<Option<EvalAction>, EvalError> {
     match name {
-        "and" => eval_and(arguments, environment, output).map(Some),
-        "or" => eval_or(arguments, environment, output).map(Some),
-        "if" => eval_if(arguments, location, environment, output).map(Some),
-        "define" => eval_define(arguments, location, environment, output).map(Some),
-        "quote" => eval_quote(arguments, location).map(Some),
-        "lambda" => eval_lambda(arguments, location, environment).map(Some),
-        "let" => eval_let(arguments, location, environment, output).map(Some),
-        "begin" => eval_begin(arguments, environment, output).map(Some),
-        "cond" => eval_cond(arguments, location, environment, output).map(Some),
+        "and" => eval_tail_and(arguments, environment, output).map(Some),
+        "or" => eval_tail_or(arguments, environment, output).map(Some),
+        "if" => eval_tail_if(arguments, location, environment, output).map(Some),
+        "define" => eval_define(arguments, location, environment, output)
+            .map(EvalAction::Value)
+            .map(Some),
+        "quote" => eval_quote(arguments, location)
+            .map(EvalAction::Value)
+            .map(Some),
+        "lambda" => eval_lambda(arguments, location, environment)
+            .map(EvalAction::Value)
+            .map(Some),
+        "let" => eval_tail_let(arguments, location, environment, output).map(Some),
+        "begin" => eval_tail_sequence(arguments, environment, output).map(Some),
+        "cond" => eval_tail_cond(arguments, location, environment, output).map(Some),
         _ => Ok(None),
     }
 }
 
-fn eval_and(
+fn eval_tail_and(
     arguments: &[Expr],
     environment: &Environment,
     output: &mut String,
-) -> Result<Value, EvalError> {
-    let mut last_value = Value::Boolean(true);
+) -> Result<EvalAction, EvalError> {
+    let Some((last_argument, prefix)) = arguments.split_last() else {
+        return Ok(EvalAction::Value(Value::Boolean(true)));
+    };
 
-    for argument in arguments {
+    for argument in prefix {
         let value = eval_expr(argument, environment, output)?;
         if !value.is_truthy() {
-            return Ok(value);
+            return Ok(EvalAction::Value(value));
         }
-        last_value = value;
     }
 
-    Ok(last_value)
+    eval_tail_expr(last_argument, environment, output)
 }
 
-fn eval_or(
+fn eval_tail_or(
     arguments: &[Expr],
     environment: &Environment,
     output: &mut String,
-) -> Result<Value, EvalError> {
-    let mut last_value = Value::Boolean(false);
+) -> Result<EvalAction, EvalError> {
+    let Some((last_argument, prefix)) = arguments.split_last() else {
+        return Ok(EvalAction::Value(Value::Boolean(false)));
+    };
 
-    for argument in arguments {
+    for argument in prefix {
         let value = eval_expr(argument, environment, output)?;
         if value.is_truthy() {
-            return Ok(value);
+            return Ok(EvalAction::Value(value));
         }
-        last_value = value;
     }
 
-    Ok(last_value)
+    eval_tail_expr(last_argument, environment, output)
 }
 
-fn eval_if(
+fn eval_tail_if(
     arguments: &[Expr],
     location: SourceLocation,
     environment: &Environment,
     output: &mut String,
-) -> Result<Value, EvalError> {
+) -> Result<EvalAction, EvalError> {
     let [condition, consequent, alternate] = arguments else {
         return Err(EvalError::WrongArgumentCount {
             location,
@@ -147,7 +188,7 @@ fn eval_if(
         alternate
     };
 
-    eval_expr(branch, environment, output)
+    eval_tail_expr(branch, environment, output)
 }
 
 fn eval_define(
@@ -245,32 +286,34 @@ fn eval_lambda(
     Ok(Value::Closure(closure))
 }
 
-fn eval_let(
+fn eval_tail_let(
     arguments: &[Expr],
     location: SourceLocation,
     environment: &Environment,
     output: &mut String,
-) -> Result<Value, EvalError> {
-    let Some((bindings, body)) = arguments.split_first() else {
-        return Err(EvalError::WrongArgumentCount {
+) -> Result<EvalAction, EvalError> {
+    match arguments {
+        [] => Err(EvalError::WrongArgumentCount {
             location,
             procedure: "let",
             expected: ArgCount::AtLeast(2),
             got: 0,
-        });
-    };
+        }),
+        [Expr::Symbol { name, .. }, bindings, body @ ..] => {
+            eval_named_let(name, bindings, body, location, environment, output)
+        }
+        [bindings, body @ ..] => eval_standard_let(bindings, body, location, environment, output),
+    }
+}
 
-    let Expr::List {
-        items: bindings, ..
-    } = bindings
-    else {
-        return Err(EvalError::MalformedSpecialForm {
-            location,
-            form: "let",
-        });
-    };
-
-    let evaluated_bindings = bindings
+fn eval_standard_let(
+    bindings_expression: &Expr,
+    body: &[Expr],
+    location: SourceLocation,
+    environment: &Environment,
+    output: &mut String,
+) -> Result<EvalAction, EvalError> {
+    let evaluated_bindings = let_binding_items(bindings_expression, location)?
         .iter()
         .map(|binding| eval_let_binding(binding, environment, output))
         .collect::<Result<Vec<_>, _>>()?;
@@ -280,7 +323,61 @@ fn eval_let(
         scope.define(name, value);
     }
 
-    eval_required_sequence(body, &scope, "let", location, output)
+    eval_required_sequence_tail(body, &scope, "let", location, output)
+}
+
+fn eval_named_let(
+    name: &str,
+    bindings_expression: &Expr,
+    body: &[Expr],
+    location: SourceLocation,
+    environment: &Environment,
+    output: &mut String,
+) -> Result<EvalAction, EvalError> {
+    let evaluated_bindings = let_binding_items(bindings_expression, location)?
+        .iter()
+        .map(|binding| eval_let_binding(binding, environment, output))
+        .collect::<Result<Vec<_>, _>>()?;
+
+    let closure_environment = environment.child();
+    let parameters = evaluated_bindings
+        .iter()
+        .map(|(parameter, _)| parameter.clone())
+        .collect();
+    let arguments = evaluated_bindings
+        .into_iter()
+        .map(|(_, value)| value)
+        .collect();
+    let closure = build_closure_from_names(
+        Some(name.to_string()),
+        parameters,
+        body,
+        closure_environment.clone(),
+        "let",
+        location,
+    )?;
+    let callable = Value::Closure(closure);
+    closure_environment.define(name.to_string(), callable.clone());
+
+    Ok(EvalAction::Call {
+        callable,
+        arguments,
+        location,
+    })
+}
+
+fn let_binding_items(
+    bindings_expression: &Expr,
+    location: SourceLocation,
+) -> Result<&[Expr], EvalError> {
+    let Expr::List { items, .. } = bindings_expression else {
+        return Err(EvalError::MalformedSpecialForm {
+            location,
+            form: "let",
+        });
+    };
+
+    Ok(items)
 }
 
 fn eval_let_binding(
@@ -305,33 +402,25 @@ fn eval_let_binding(
     Ok((name.clone(), eval_expr(expression, environment, output)?))
 }
 
-fn eval_begin(
-    arguments: &[Expr],
-    environment: &Environment,
-    output: &mut String,
-) -> Result<Value, EvalError> {
-    eval_sequence(arguments, environment, output)
-}
-
-fn eval_cond(
+fn eval_tail_cond(
     clauses: &[Expr],
     location: SourceLocation,
     environment: &Environment,
     output: &mut String,
-) -> Result<Value, EvalError> {
+) -> Result<EvalAction, EvalError> {
     match clauses {
-        [] => Ok(Value::Void),
-        [clause, rest @ ..] => eval_cond_clause(clause, rest, location, environment, output),
+        [] => Ok(EvalAction::Value(Value::Void)),
+        [clause, rest @ ..] => eval_tail_cond_clause(clause, rest, location, environment, output),
     }
 }
 
-fn eval_cond_clause(
+fn eval_tail_cond_clause(
     clause: &Expr,
     remaining_clauses: &[Expr],
     location: SourceLocation,
     environment: &Environment,
     output: &mut String,
-) -> Result<Value, EvalError> {
+) -> Result<EvalAction, EvalError> {
     let clause_location = clause.location();
     let Expr::List { items, .. } = clause else {
         return Err(EvalError::MalformedSpecialForm {
@@ -353,19 +442,19 @@ fn eval_cond_clause(
                 form: "cond",
             });
         }
-        return eval_required_sequence(body, environment, "cond", clause_location, output);
+        return eval_required_sequence_tail(body, environment, "cond", clause_location, output);
     }
 
     let test_value = eval_expr(test, environment, output)?;
     if !test_value.is_truthy() {
-        return eval_cond(remaining_clauses, location, environment, output);
+        return eval_tail_cond(remaining_clauses, location, environment, output);
     }
 
     if body.is_empty() {
-        return Ok(test_value);
+        return Ok(EvalAction::Value(test_value));
     }
 
-    eval_sequence(body, environment, output)
+    eval_tail_sequence(body, environment, output)
 }
 
 fn build_closure(
@@ -376,10 +465,6 @@ fn build_closure(
     form: &'static str,
     location: SourceLocation,
 ) -> Result<Closure, EvalError> {
-    if body.is_empty() {
-        return Err(EvalError::MissingBody { location, form });
-    }
-
     let parameters = parameters
         .iter()
         .map(|parameter| match parameter {
@@ -390,6 +475,21 @@ fn build_closure(
             }),
         })
         .collect::<Result<_, _>>()?;
+
+    build_closure_from_names(name, parameters, body, environment, form, location)
+}
+
+fn build_closure_from_names(
+    name: Option<String>,
+    parameters: Vec<String>,
+    body: &[Expr],
+    environment: Environment,
+    form: &'static str,
+    location: SourceLocation,
+) -> Result<Closure, EvalError> {
+    if body.is_empty() {
+        return Err(EvalError::MissingBody { location, form });
+    }
 
     Ok(Closure::new(name, parameters, body.to_vec(), environment))
 }
@@ -412,13 +512,10 @@ fn eval_arguments(
     environment: &Environment,
     output: &mut String,
 ) -> Result<Vec<Value>, EvalError> {
-    arguments.iter().try_fold(
-        Vec::with_capacity(arguments.len()),
-        |mut values, argument| {
-            values.push(eval_expr(argument, environment, output)?);
-            Ok(values)
-        },
-    )
+    arguments
+        .iter()
+        .map(|argument| eval_expr(argument, environment, output))
+        .collect()
 }
 
 pub(crate) fn apply_callable(
@@ -427,9 +524,27 @@ pub(crate) fn apply_callable(
     location: SourceLocation,
     output: &mut String,
 ) -> Result<Value, EvalError> {
+    resolve_action(
+        EvalAction::Call {
+            callable,
+            arguments: arguments.to_vec(),
+            location,
+        },
+        output,
+    )
+}
+
+fn apply_tail_callable(
+    callable: Value,
+    arguments: Vec<Value>,
+    location: SourceLocation,
+    output: &mut String,
+) -> Result<EvalAction, EvalError> {
     match callable {
-        Value::Builtin(procedure) => apply_builtin(procedure, arguments, location, output),
-        Value::Closure(closure) => apply_closure(&closure, arguments, location, output),
+        Value::Builtin(procedure) => {
+            apply_builtin(procedure, &arguments, location, output).map(EvalAction::Value)
+        }
+        Value::Closure(closure) => apply_tail_closure(closure, arguments, location, output),
         other => Err(EvalError::NotCallable {
             location,
             expression: other.render(),
@@ -437,12 +552,12 @@ pub(crate) fn apply_callable(
     }
 }
 
-fn apply_closure(
-    closure: &Closure,
-    arguments: &[Value],
+fn apply_tail_closure(
+    closure: Closure,
+    arguments: Vec<Value>,
     location: SourceLocation,
     output: &mut String,
-) -> Result<Value, EvalError> {
+) -> Result<EvalAction, EvalError> {
     if arguments.len() != closure.parameters.len() {
         return Err(EvalError::WrongArgumentCount {
             location,
@@ -453,44 +568,38 @@ fn apply_closure(
     }
 
     let call_environment = closure.environment.child();
-    for (name, value) in closure
-        .parameters
-        .iter()
-        .cloned()
-        .zip(arguments.iter().cloned())
-    {
+    for (name, value) in closure.parameters.iter().cloned().zip(arguments) {
         call_environment.define(name, value);
     }
 
-    eval_required_sequence(&closure.body, &call_environment, "lambda", location, output)
+    eval_required_sequence_tail(&closure.body, &call_environment, "lambda", location, output)
 }
 
-fn eval_required_sequence(
+fn eval_required_sequence_tail(
     body: &[Expr],
     environment: &Environment,
     form: &'static str,
     location: SourceLocation,
     output: &mut String,
-) -> Result<Value, EvalError> {
+) -> Result<EvalAction, EvalError> {
     if body.is_empty() {
         return Err(EvalError::MissingBody { location, form });
     }
 
-    eval_sequence(body, environment, output)
+    eval_tail_sequence(body, environment, output)
 }
 
-fn eval_sequence(
+fn eval_tail_sequence(
     body: &[Expr],
     environment: &Environment,
     output: &mut String,
-) -> Result<Value, EvalError> {
+) -> Result<EvalAction, EvalError> {
     let Some((last_expression, prefix)) = body.split_last() else {
-        return Ok(Value::Void);
+        return Ok(EvalAction::Value(Value::Void));
     };
 
     eval_discarded_expressions(prefix, environment, output)?;
-
-    eval_expr(last_expression, environment, output)
+    eval_tail_expr(last_expression, environment, output)
 }
 
 fn eval_discarded_expressions(
