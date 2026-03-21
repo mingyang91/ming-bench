@@ -7,13 +7,22 @@ pub mod value;
 pub use error::EvalError;
 use builtins::{apply_builtin, is_builtin};
 use forms::{
-    eval_and, eval_begin, eval_body, eval_cond, eval_define, eval_if, eval_lambda, eval_let,
-    eval_or, eval_quote, eval_string_set,
+    eval_and, eval_begin_step, eval_body_step, eval_cond_step, eval_define, eval_if_step,
+    eval_lambda, eval_let_step, eval_or, eval_quote, eval_string_set,
 };
 use std::collections::HashMap;
 use value::{Span, Value};
 
 type Env = HashMap<String, Value>;
+
+/// Trampoline result for tail-call optimization.
+pub(crate) enum Bounce {
+    Done(Value),
+    /// Re-evaluate expression in the current env (no env change).
+    Continue(Value),
+    /// Re-evaluate expression in a new owned env (from apply/let).
+    ReplaceEnv { expr: Value, env: Env },
+}
 
 /// Evaluate one or more Scheme expressions and return the string
 /// representation of the last result.
@@ -53,26 +62,50 @@ pub fn eval_str_with_output(input: &str) -> Result<(String, String), EvalError> 
     Ok((last.to_string(), output))
 }
 
+/// Trampoline-based eval: loops on tail calls instead of recursing.
 pub(crate) fn eval(value: &Value, env: &mut Env, output: &mut String) -> Result<Value, EvalError> {
-    match value {
-        Value::Integer(_) | Value::Boolean(_) | Value::String(_) | Value::Char(_)
-        | Value::Lambda { .. } => Ok(value.clone()),
-        Value::Symbol(name, span) => {
-            env.get(name).cloned().ok_or_else(|| EvalError::UnboundVariable {
-                name: name.clone(),
-                span: *span,
-            })
+    let mut current = value.clone();
+    let mut owned_env: Option<Env> = None;
+
+    loop {
+        let active_env = owned_env.as_mut().unwrap_or(env);
+        match eval_step(&current, active_env, output)? {
+            Bounce::Done(v) => return Ok(v),
+            Bounce::Continue(expr) => current = expr,
+            Bounce::ReplaceEnv {
+                expr,
+                env: new_env,
+            } => {
+                current = expr;
+                owned_env = Some(new_env);
+            }
         }
-        Value::List(items, span) => eval_list(items, *span, env, output),
     }
 }
 
-fn eval_list(
+/// One step of the trampoline: evaluate without recursing for tail positions.
+fn eval_step(value: &Value, env: &mut Env, output: &mut String) -> Result<Bounce, EvalError> {
+    match value {
+        Value::Integer(_) | Value::Boolean(_) | Value::String(_) | Value::Char(_)
+        | Value::Lambda { .. } => Ok(Bounce::Done(value.clone())),
+        Value::Symbol(name, span) => env
+            .get(name)
+            .cloned()
+            .map(Bounce::Done)
+            .ok_or_else(|| EvalError::UnboundVariable {
+                name: name.clone(),
+                span: *span,
+            }),
+        Value::List(items, span) => eval_list_step(items, *span, env, output),
+    }
+}
+
+fn eval_list_step(
     items: &[Value],
     span: Span,
     env: &mut Env,
     output: &mut String,
-) -> Result<Value, EvalError> {
+) -> Result<Bounce, EvalError> {
     let [operator, args @ ..] = items else {
         return Err(EvalError::Parse {
             message: "empty application".to_string(),
@@ -80,47 +113,45 @@ fn eval_list(
         });
     };
 
-    // Handle special forms first (unevaluated operator)
     if let Value::Symbol(name, _) = operator {
         match name.as_str() {
-            "define" => return eval_define(args, env, span, output),
-            "if" => return eval_if(args, env, span, output),
-            "quote" => return eval_quote(args, span),
-            "and" => return eval_and(args, env, output),
-            "or" => return eval_or(args, env, output),
-            "lambda" => return eval_lambda(args, env, span),
-            "let" => return eval_let(args, env, span, output),
-            "begin" => return eval_begin(args, env, span, output),
-            "cond" => return eval_cond(args, env, span, output),
-            "string-set!" => return eval_string_set(args, env, span, output),
+            "define" => return eval_define(args, env, span, output).map(Bounce::Done),
+            "if" => return eval_if_step(args, env, span, output),
+            "quote" => return eval_quote(args, span).map(Bounce::Done),
+            "and" => return eval_and(args, env, output).map(Bounce::Done),
+            "or" => return eval_or(args, env, output).map(Bounce::Done),
+            "lambda" => return eval_lambda(args, env, span).map(Bounce::Done),
+            "let" => return eval_let_step(args, env, span, output),
+            "begin" => return eval_begin_step(args, env, span, output),
+            "cond" => return eval_cond_step(args, env, span, output),
+            "string-set!" => return eval_string_set(args, env, span, output).map(Bounce::Done),
             _ => {}
         }
     }
 
-    // Try builtin functions for known symbol names not in env
     if let Value::Symbol(name, _) = operator {
         if is_builtin(name) {
-            return apply_builtin(name, args, env, span, output);
+            return apply_builtin(name, args, env, span, output).map(Bounce::Done);
         }
     }
 
-    // Evaluate operator and apply
     let proc = eval(operator, env, output)?;
     let evaluated_args: Vec<Value> = args
         .iter()
         .map(|a| eval(a, env, output))
         .collect::<Result<_, _>>()?;
 
-    apply(proc, &evaluated_args, env, span, output)
+    apply_step(proc, &evaluated_args, env, span, output)
 }
 
-pub(crate) fn apply(
+/// Tail-call-aware apply: returns Bounce instead of recursing into eval_body.
+fn apply_step(
     proc: Value,
     args: &[Value],
     env: &mut Env,
     span: Span,
     output: &mut String,
-) -> Result<Value, EvalError> {
+) -> Result<Bounce, EvalError> {
     match &proc {
         Value::Lambda {
             params,
@@ -134,20 +165,43 @@ pub(crate) fn apply(
                     span,
                 });
             }
-            // Caller's env as base (provides global defs for recursion),
-            // captured env overlays (lexical scoping), params on top.
             let mut local_env = env.clone();
             local_env.extend(captured_env.clone());
             for (param, arg) in params.iter().zip(args) {
                 local_env.insert(param.clone(), arg.clone());
             }
-            eval_body(body, Value::Boolean(false), &mut local_env, output)
+            eval_body_step(body, Value::Boolean(false), &mut local_env, output)
+                .map(|b| match b {
+                    Bounce::Continue(expr) => Bounce::ReplaceEnv {
+                        expr,
+                        env: local_env,
+                    },
+                    other => other,
+                })
         }
         other => Err(EvalError::TypeError {
             expected: "procedure".to_string(),
             got: format!("{other}"),
             span,
         }),
+    }
+}
+
+/// Non-tail apply for use by builtins (map, etc.).
+pub(crate) fn apply(
+    proc: Value,
+    args: &[Value],
+    env: &mut Env,
+    span: Span,
+    output: &mut String,
+) -> Result<Value, EvalError> {
+    match apply_step(proc, args, env, span, output)? {
+        Bounce::Done(v) => Ok(v),
+        Bounce::Continue(expr) => eval(&expr, env, output),
+        Bounce::ReplaceEnv {
+            expr,
+            env: mut new_env,
+        } => eval(&expr, &mut new_env, output),
     }
 }
 

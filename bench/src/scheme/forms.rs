@@ -1,4 +1,4 @@
-use super::{eval, is_truthy, Env};
+use super::{eval, is_truthy, Bounce, Env};
 use crate::scheme::error::EvalError;
 use crate::scheme::value::{Span, Value};
 
@@ -39,12 +39,12 @@ pub(crate) fn eval_define(
     }
 }
 
-pub(crate) fn eval_if(
+pub(crate) fn eval_if_step(
     args: &[Value],
     env: &mut Env,
     span: Span,
     output: &mut String,
-) -> Result<Value, EvalError> {
+) -> Result<Bounce, EvalError> {
     let [condition, consequent, alternative] = args else {
         return Err(EvalError::WrongArgCount {
             expected: 3,
@@ -54,9 +54,9 @@ pub(crate) fn eval_if(
     };
     let cond_val = eval(condition, env, output)?;
     if is_truthy(&cond_val) {
-        eval(consequent, env, output)
+        Ok(Bounce::Continue(consequent.clone()))
     } else {
-        eval(alternative, env, output)
+        Ok(Bounce::Continue(alternative.clone()))
     }
 }
 
@@ -92,12 +92,12 @@ pub(crate) fn eval_lambda(args: &[Value], env: &Env, span: Span) -> Result<Value
     })
 }
 
-pub(crate) fn eval_let(
+pub(crate) fn eval_let_step(
     args: &[Value],
     env: &mut Env,
     span: Span,
     output: &mut String,
-) -> Result<Value, EvalError> {
+) -> Result<Bounce, EvalError> {
     let [Value::List(bindings, _), body @ ..] = args else {
         return Err(EvalError::Parse {
             message: "let requires a bindings list and body".to_string(),
@@ -127,30 +127,37 @@ pub(crate) fn eval_let(
         let val = eval(expr, env, output)?;
         local_env.insert(name.clone(), val);
     }
-    eval_body(body, Value::Boolean(false), &mut local_env, output)
+    eval_body_step(body, Value::Boolean(false), &mut local_env, output)
+        .map(|b| match b {
+            Bounce::Continue(expr) => Bounce::ReplaceEnv {
+                expr,
+                env: local_env,
+            },
+            other => other,
+        })
 }
 
-pub(crate) fn eval_begin(
+pub(crate) fn eval_begin_step(
     args: &[Value],
     env: &mut Env,
     span: Span,
     output: &mut String,
-) -> Result<Value, EvalError> {
+) -> Result<Bounce, EvalError> {
     if args.is_empty() {
         return Err(EvalError::Parse {
             message: "begin requires at least one expression".to_string(),
             span,
         });
     }
-    eval_body(args, Value::Boolean(false), env, output)
+    eval_body_step(args, Value::Boolean(false), env, output)
 }
 
-pub(crate) fn eval_cond(
+pub(crate) fn eval_cond_step(
     args: &[Value],
     env: &mut Env,
     span: Span,
     output: &mut String,
-) -> Result<Value, EvalError> {
+) -> Result<Bounce, EvalError> {
     for clause in args {
         let Value::List(items, _) = clause else {
             return Err(EvalError::Parse {
@@ -165,14 +172,14 @@ pub(crate) fn eval_cond(
             });
         };
         if matches!(test, Value::Symbol(s, _) if s == "else") {
-            return eval_body(body, Value::Boolean(false), env, output);
+            return eval_body_step(body, Value::Boolean(false), env, output);
         }
         let test_val = eval(test, env, output)?;
         if is_truthy(&test_val) {
-            return eval_body(body, test_val, env, output);
+            return eval_body_step(body, test_val, env, output);
         }
     }
-    Ok(Value::Boolean(false))
+    Ok(Bounce::Done(Value::Boolean(false)))
 }
 
 pub(crate) fn eval_and(
@@ -205,14 +212,19 @@ pub(crate) fn eval_or(
     Ok(result)
 }
 
-pub(crate) fn eval_body(
+pub(crate) fn eval_body_step(
     body: &[Value],
     default: Value,
     env: &mut Env,
     output: &mut String,
-) -> Result<Value, EvalError> {
-    body.iter()
-        .try_fold(default, |_, expr| eval(expr, env, output))
+) -> Result<Bounce, EvalError> {
+    let Some((last, rest)) = body.split_last() else {
+        return Ok(Bounce::Done(default));
+    };
+    for expr in rest {
+        eval(expr, env, output)?;
+    }
+    Ok(Bounce::Continue(last.clone()))
 }
 
 pub(crate) fn eval_string_set(
