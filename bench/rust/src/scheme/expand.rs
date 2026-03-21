@@ -64,6 +64,14 @@ struct SyntaxRule {
     template: Expr,
 }
 
+#[derive(Clone)]
+struct RecordFieldSpec {
+    name: String,
+    accessor_name: String,
+    mutator_name: Option<String>,
+    pos: SourcePos,
+}
+
 #[derive(Clone, Default)]
 struct MatchBindings {
     single: HashMap<String, Expr>,
@@ -151,6 +159,9 @@ impl Expander {
                 Ok(None)
             }
             Some("define") => Ok(Some(self.expand_define(&items[1..], *pos, env)?)),
+            Some("define-record-type") => {
+                Ok(Some(self.expand_define_record_type(&items[1..], *pos, env)?))
+            }
             Some("begin") => {
                 let body = self.expand_sequence(&items[1..], env)?;
                 Ok(Some(list_with_head("begin", *pos, body)))
@@ -193,6 +204,10 @@ impl Expander {
                         let mut local = env.clone();
                         self.expand_define_syntax(&items[1..], *pos, &mut local)?;
                         Ok(list_with_head("begin", *pos, Vec::new()))
+                    }
+                    Some("define-record-type") => {
+                        let mut local = env.clone();
+                        self.expand_define_record_type(&items[1..], *pos, &mut local)
                     }
                     Some("set!") => self.expand_set(items, *pos, env),
                     Some("and") | Some("or") => self.expand_n_ary_special(items, *pos, env),
@@ -304,6 +319,276 @@ impl Expander {
             self.parse_syntax_rules(name, &internal_name, transformer, &def_vars, &def_macros)?;
         self.macros.insert(internal_name, macro_def);
         Ok(())
+    }
+
+    fn expand_define_record_type(
+        &mut self,
+        parts: &[Expr],
+        pos: SourcePos,
+        env: &mut ExpandEnv,
+    ) -> Result<Expr, EvalError> {
+        let Some((type_name_expr, rest)) = parts.split_first() else {
+            return Err(syntax_error(
+                pos,
+                "define-record-type requires a type, constructor, and predicate",
+            ));
+        };
+        let Some((constructor_expr, rest)) = rest.split_first() else {
+            return Err(syntax_error(
+                pos,
+                "define-record-type requires a constructor and predicate",
+            ));
+        };
+        let Some((predicate_expr, field_exprs)) = rest.split_first() else {
+            return Err(syntax_error(
+                pos,
+                "define-record-type requires a predicate",
+            ));
+        };
+
+        let Expr::Symbol(type_name, type_pos) = type_name_expr else {
+            return Err(syntax_error(
+                type_name_expr.pos(),
+                "record type name must be a symbol",
+            ));
+        };
+        let Expr::List(constructor_items, constructor_pos) = constructor_expr else {
+            return Err(syntax_error(
+                constructor_expr.pos(),
+                "record constructor spec must be a list",
+            ));
+        };
+        let Some((constructor_name_expr, constructor_field_exprs)) = constructor_items.split_first()
+        else {
+            return Err(syntax_error(
+                constructor_expr.pos(),
+                "record constructor spec cannot be empty",
+            ));
+        };
+        let Expr::Symbol(constructor_name, _) = constructor_name_expr else {
+            return Err(syntax_error(
+                constructor_name_expr.pos(),
+                "record constructor name must be a symbol",
+            ));
+        };
+        let Expr::Symbol(predicate_name, _) = predicate_expr else {
+            return Err(syntax_error(
+                predicate_expr.pos(),
+                "record predicate name must be a symbol",
+            ));
+        };
+
+        let mut constructor_fields = Vec::with_capacity(constructor_field_exprs.len());
+        let mut constructor_params = HashMap::new();
+        for field_expr in constructor_field_exprs {
+            let Expr::Symbol(field_name, field_pos) = field_expr else {
+                return Err(syntax_error(
+                    field_expr.pos(),
+                    "record constructor fields must be symbols",
+                ));
+            };
+            let internal = self.fresh_internal("record-arg", field_name);
+            if constructor_params
+                .insert(field_name.clone(), internal.clone())
+                .is_some()
+            {
+                return Err(syntax_error(
+                    *field_pos,
+                    format!("duplicate constructor field {field_name}"),
+                ));
+            }
+            constructor_fields.push(internal);
+        }
+
+        let mut fields = Vec::with_capacity(field_exprs.len());
+        let mut seen_fields = HashSet::new();
+        for field_expr in field_exprs {
+            let Expr::List(field_items, field_pos) = field_expr else {
+                return Err(syntax_error(
+                    field_expr.pos(),
+                    "record field spec must be a list",
+                ));
+            };
+
+            let parsed = match field_items.as_slice() {
+                [Expr::Symbol(field_name, _), Expr::Symbol(accessor_name, _)] => RecordFieldSpec {
+                    name: field_name.clone(),
+                    accessor_name: accessor_name.clone(),
+                    mutator_name: None,
+                    pos: *field_pos,
+                },
+                [
+                    Expr::Symbol(field_name, _),
+                    Expr::Symbol(accessor_name, _),
+                    Expr::Symbol(mutator_name, _),
+                ] => RecordFieldSpec {
+                    name: field_name.clone(),
+                    accessor_name: accessor_name.clone(),
+                    mutator_name: Some(mutator_name.clone()),
+                    pos: *field_pos,
+                },
+                _ => {
+                    return Err(syntax_error(
+                        field_expr.pos(),
+                        "record field spec must be (field accessor) or (field accessor mutator)",
+                    ))
+                }
+            };
+
+            if !seen_fields.insert(parsed.name.clone()) {
+                return Err(syntax_error(
+                    parsed.pos,
+                    format!("duplicate record field {}", parsed.name),
+                ));
+            }
+            if !constructor_params.contains_key(&parsed.name) {
+                return Err(syntax_error(
+                    parsed.pos,
+                    format!("constructor missing field {}", parsed.name),
+                ));
+            }
+            fields.push(parsed);
+        }
+
+        let constructor_internal = self.bind_var(env, constructor_name);
+        let predicate_internal = self.bind_var(env, predicate_name);
+        let mut field_bindings = Vec::with_capacity(fields.len());
+        for field in &fields {
+            let accessor_internal = self.bind_var(env, &field.accessor_name);
+            let mutator_internal = field
+                .mutator_name
+                .as_ref()
+                .map(|name| self.bind_var(env, name));
+            field_bindings.push((accessor_internal, mutator_internal));
+        }
+
+        let hidden_tag = self.fresh_internal("record-tag", type_name);
+
+        let tag_value = list_expr(
+            vec![
+                builtin_symbol_expr("vector", pos),
+                quote_symbol_expr(type_name, *type_pos),
+            ],
+            pos,
+        );
+
+        let mut constructor_body_items = Vec::with_capacity(fields.len() + 2);
+        constructor_body_items.push(builtin_symbol_expr("vector", pos));
+        constructor_body_items.push(symbol_expr(hidden_tag.clone(), pos));
+        for field in &fields {
+            constructor_body_items.push(symbol_expr(
+                constructor_params
+                    .get(&field.name)
+                    .expect("field existence checked above")
+                    .clone(),
+                pos,
+            ));
+        }
+        let constructor_body = list_expr(constructor_body_items, pos);
+
+        let record_value_param = self.fresh_internal("record-value", type_name);
+        let record_value_expr = symbol_expr(record_value_param.clone(), pos);
+        let vector_ref_zero = list_expr(
+            vec![
+                builtin_symbol_expr("vector-ref", pos),
+                record_value_expr.clone(),
+                Expr::Int(0, pos),
+            ],
+            pos,
+        );
+        let vector_length = list_expr(
+            vec![
+                builtin_symbol_expr("vector-length", pos),
+                record_value_expr.clone(),
+            ],
+            pos,
+        );
+        let predicate_body = list_expr(
+            vec![
+                symbol_expr("and", pos),
+                list_expr(
+                    vec![
+                        builtin_symbol_expr("vector?", pos),
+                        record_value_expr.clone(),
+                    ],
+                    pos,
+                ),
+                list_expr(
+                    vec![
+                        builtin_symbol_expr("=", pos),
+                        vector_length,
+                        Expr::Int(fields.len() as i64 + 1, pos),
+                    ],
+                    pos,
+                ),
+                list_expr(
+                    vec![
+                        builtin_symbol_expr("eq?", pos),
+                        vector_ref_zero,
+                        symbol_expr(hidden_tag.clone(), pos),
+                    ],
+                    pos,
+                ),
+            ],
+            pos,
+        );
+
+        let mut definitions = Vec::with_capacity(3 + fields.len() * 2);
+        definitions.push(define_value_expr(hidden_tag, tag_value, pos));
+        definitions.push(define_function_expr(
+            constructor_internal,
+            constructor_fields,
+            constructor_body,
+            *constructor_pos,
+        ));
+        definitions.push(define_function_expr(
+            predicate_internal,
+            vec![record_value_param],
+            predicate_body,
+            pos,
+        ));
+
+        for (index, (field, (accessor_internal, mutator_internal))) in
+            fields.iter().zip(field_bindings.into_iter()).enumerate()
+        {
+            let accessor_record = self.fresh_internal("record-access", &field.name);
+            let accessor_body = list_expr(
+                vec![
+                    builtin_symbol_expr("vector-ref", field.pos),
+                    symbol_expr(accessor_record.clone(), field.pos),
+                    Expr::Int(index as i64 + 1, field.pos),
+                ],
+                field.pos,
+            );
+            definitions.push(define_function_expr(
+                accessor_internal,
+                vec![accessor_record],
+                accessor_body,
+                field.pos,
+            ));
+
+            if let Some(mutator_internal) = mutator_internal {
+                let mutator_record = self.fresh_internal("record-set", &field.name);
+                let mutator_value = self.fresh_internal("record-value", &field.name);
+                let mutator_body = list_expr(
+                    vec![
+                        builtin_symbol_expr("vector-set!", field.pos),
+                        symbol_expr(mutator_record.clone(), field.pos),
+                        Expr::Int(index as i64 + 1, field.pos),
+                        symbol_expr(mutator_value.clone(), field.pos),
+                    ],
+                    field.pos,
+                );
+                definitions.push(define_function_expr(
+                    mutator_internal,
+                    vec![mutator_record, mutator_value],
+                    mutator_body,
+                    field.pos,
+                ));
+            }
+        }
+
+        Ok(list_with_head("begin", pos, definitions))
     }
 
     fn expand_if(
@@ -2024,6 +2309,44 @@ fn list_with_head(head: &str, pos: SourcePos, body: Vec<Expr>) -> Expr {
     Expr::List(items, pos)
 }
 
+fn list_expr(items: Vec<Expr>, pos: SourcePos) -> Expr {
+    Expr::List(items, pos)
+}
+
+fn symbol_expr(name: impl Into<String>, pos: SourcePos) -> Expr {
+    Expr::Symbol(name.into(), pos)
+}
+
+fn builtin_symbol_expr(name: &str, pos: SourcePos) -> Expr {
+    symbol_expr(internal_builtin_name(name), pos)
+}
+
+fn quote_symbol_expr(name: &str, pos: SourcePos) -> Expr {
+    list_expr(vec![symbol_expr("quote", pos), symbol_expr(name, pos)], pos)
+}
+
+fn define_value_expr(name: impl Into<String>, value: Expr, pos: SourcePos) -> Expr {
+    list_expr(
+        vec![symbol_expr("define", pos), symbol_expr(name, pos), value],
+        pos,
+    )
+}
+
+fn define_function_expr(
+    name: impl Into<String>,
+    params: Vec<String>,
+    body: Expr,
+    pos: SourcePos,
+) -> Expr {
+    let mut signature = Vec::with_capacity(params.len() + 1);
+    signature.push(symbol_expr(name, pos));
+    signature.extend(params.into_iter().map(|param| symbol_expr(param, pos)));
+    list_expr(
+        vec![symbol_expr("define", pos), list_expr(signature, pos), body],
+        pos,
+    )
+}
+
 fn symbol_name(expr: &Expr) -> Option<&str> {
     match expr {
         Expr::Symbol(name, _) => Some(name),
@@ -2057,6 +2380,7 @@ fn is_special_form_name(name: &str) -> bool {
             | "cond"
             | "case"
             | "guard"
+            | "define-record-type"
     )
 }
 
