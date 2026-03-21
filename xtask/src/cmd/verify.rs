@@ -104,6 +104,36 @@ const TEST_CASES: &[(&str, &str, &str)] = &[
     ("l15_str_down",    "(write (string-downcase \"HELLO\")) (newline)", "\"hello\""),
 ];
 
+fn print_section_header<'a>(label: &'a str, current_section: &mut &'a str) {
+    let section = &label[..3];
+    if section == *current_section {
+        return;
+    }
+    *current_section = section;
+    let level_name = match section {
+        "l01" => "Level 1: Atoms, Arithmetic & Comparisons",
+        "l02" => "Level 2: Variables, Conditionals & Lambda",
+        "l03" => "Level 3: Lists, Recursion, Let/Begin/Cond & Predicates",
+        "l08" => "Level 8: Tail Call Optimization",
+        "l15" => "Level 15: Numeric/Char/String Utilities",
+        _ => section,
+    };
+    println!("=== {level_name} ===");
+}
+
+/// Returns Ok(()) on pass, Err(message) on failure.
+fn check_result(
+    label: &str, expr: &str, expected: &str, exit_code: i32, actual: &str,
+) -> std::result::Result<(), String> {
+    if exit_code != 0 {
+        Err(format!("  FAIL {label}: guile error on: {expr}"))
+    } else if actual == expected {
+        Ok(())
+    } else {
+        Err(format!("  FAIL {label}: expected '{expected}', got '{actual}'"))
+    }
+}
+
 pub fn run() -> Result<()> {
     if !command_exists("guile") {
         return Err(Error::BinaryNotFound {
@@ -119,42 +149,14 @@ pub fn run() -> Result<()> {
     let mut current_section = "";
 
     for (label, expr, expected) in TEST_CASES {
-        // Print section headers
-        let section = &label[..3];
-        if section != current_section {
-            current_section = section;
-            let level_name = match section {
-                "l01" => "Level 1: Atoms, Arithmetic & Comparisons",
-                "l02" => "Level 2: Variables, Conditionals & Lambda",
-                "l03" => "Level 3: Lists, Recursion, Let/Begin/Cond & Predicates",
-                "l08" => "Level 8: Tail Call Optimization",
-                "l15" => "Level 15: Numeric/Char/String Utilities",
-                _ => section,
-            };
-            println!("=== {level_name} ===");
-        }
-
-        let result = run_cmd_capture("guile", &["--no-auto-compile", "-c", expr], &cwd);
-
-        match result {
-            Ok((exit_code, actual)) => {
-                let actual = actual.trim_end();
-                if exit_code != 0 {
-                    failed += 1;
-                    errors.push(format!("  FAIL {label}: guile error on: {expr}"));
-                } else if actual == *expected {
-                    passed += 1;
-                } else {
-                    failed += 1;
-                    errors.push(format!(
-                        "  FAIL {label}: expected '{expected}', got '{actual}'"
-                    ));
-                }
-            }
-            Err(_) => {
-                failed += 1;
-                errors.push(format!("  FAIL {label}: failed to run guile"));
-            }
+        print_section_header(label, &mut current_section);
+        let verdict = match run_cmd_capture("guile", &["--no-auto-compile", "-c", expr], &cwd) {
+            Ok((exit_code, actual)) => check_result(label, expr, expected, exit_code, actual.trim_end()),
+            Err(_) => Err(format!("  FAIL {label}: failed to run guile")),
+        };
+        match verdict {
+            Ok(()) => passed += 1,
+            Err(msg) => { failed += 1; errors.push(msg); }
         }
     }
 

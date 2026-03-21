@@ -11,6 +11,9 @@ use std::time::Instant;
 static INTERRUPTED: AtomicBool = AtomicBool::new(false);
 static CHILD_PID: AtomicU32 = AtomicU32::new(0);
 
+/// Per-level timing entry: (label, duration_s, status).
+type LevelTimes = Vec<(String, i64, String)>;
+
 pub struct RunAgentArgs {
     pub base: String,
     pub strategy: String,
@@ -58,18 +61,7 @@ pub fn run(args: RunAgentArgs) -> Result<()> {
         setup_fresh_run(&proj, &args, &worktree_dir)?
     };
 
-    // On resume, preserve the original start_time from meta.json so that
-    // elapsed time reflects the full run, not just the resumed portion.
-    let start_time = if args.resume {
-        let meta_path = results_dir.join("meta.json");
-        fs::read_to_string(&meta_path)
-            .ok()
-            .and_then(|c| serde_json::from_str::<serde_json::Value>(&c).ok())
-            .and_then(|v| v["start_time"].as_str().map(String::from))
-            .unwrap_or_else(iso_now)
-    } else {
-        iso_now()
-    };
+    let start_time = resume_start_time(args.resume, &results_dir);
 
     if !args.resume {
         write_initial_meta(&args, &results_dir, &session_uuid, &mode, prompt, &start_time, &timestamp)?;
@@ -99,10 +91,16 @@ pub fn run(args: RunAgentArgs) -> Result<()> {
 
     let score = run_scoring(&args, &proj)?;
 
-    finalize_run(
-        &args, &results_dir, &session_uuid, &mode, prompt,
-        &start_time, &timestamp, agent_exit, &score, &level_times,
-    )?;
+    finalize_run(&args, &results_dir, &FinalizeContext {
+        session_uuid: &session_uuid,
+        mode: &mode,
+        prompt,
+        start_time: &start_time,
+        timestamp: &timestamp,
+        agent_exit,
+        score: &score,
+        level_times: &level_times,
+    })?;
 
     push_branch(&args.name, &worktree_dir);
 
@@ -245,7 +243,7 @@ fn execute_mode(
     mode: &str, args: &RunAgentArgs, agent_workdir: &Path,
     worktree_dir: &Path, results_dir: &Path,
     prompt: &str, session_uuid: &str,
-) -> Result<(i32, Vec<(String, i64, String)>)> {
+) -> Result<(i32, LevelTimes)> {
     if mode == "levels" {
         run_levels_mode(args, agent_workdir, worktree_dir, results_dir)
     } else if mode == "full" {
@@ -288,7 +286,7 @@ fn run_full_mode(
 fn run_levels_mode(
     args: &RunAgentArgs, agent_workdir: &Path, worktree_dir: &Path,
     results_dir: &Path,
-) -> Result<(i32, Vec<(String, i64, String)>)> {
+) -> Result<(i32, LevelTimes)> {
     println!("=== Level-by-level mode ===");
 
     let start_level: u32 = args
@@ -424,11 +422,11 @@ fn run_single_level(
         }
 
         // Failed — decide whether to retry
-        let output_file = level_dir.join("agent-output.txt");
-        let exhausted = agent_exhausted_turns(&output_file);
+        let exhausted = agent_exhausted_turns(&level_dir.join("agent-output.txt"));
+        let should_stop = exhausted || attempt >= MAX_INFRA_RETRIES;
 
-        if exhausted || attempt >= MAX_INFRA_RETRIES {
-            let reason = if exhausted { "turns exhausted" } else { "max retries reached" };
+        if should_stop {
+            let reason = failure_reason(exhausted);
             let level_duration = level_start.elapsed().as_secs() as i64;
             let status_msg = format!("Level {level} FAILED ({level_duration}s) [{reason}]");
             println!("{status_msg}");
@@ -439,6 +437,10 @@ fn run_single_level(
         println!("Level {level} failed (infra issue, not turns) — will retry");
         attempt += 1;
     }
+}
+
+fn failure_reason(exhausted: bool) -> &'static str {
+    if exhausted { "turns exhausted" } else { "max retries reached" }
 }
 
 fn run_level_tests(worktree_dir: &Path, level: &str, lang: &str) -> i32 {
@@ -530,35 +532,40 @@ fn run_scoring(args: &RunAgentArgs, proj: &Path) -> Result<String> {
     }
 }
 
+struct FinalizeContext<'a> {
+    session_uuid: &'a str,
+    mode: &'a str,
+    prompt: &'a str,
+    start_time: &'a str,
+    timestamp: &'a str,
+    agent_exit: i32,
+    score: &'a str,
+    level_times: &'a [(String, i64, String)],
+}
+
 fn finalize_run(
-    args: &RunAgentArgs, results_dir: &Path, session_uuid: &str,
-    mode: &str, prompt: &str, start_time: &str, timestamp: &str,
-    agent_exit: i32, score: &str, level_times: &[(String, i64, String)],
+    args: &RunAgentArgs, results_dir: &Path, ctx: &FinalizeContext,
 ) -> Result<()> {
     let end_time = iso_now();
 
     // Build level_times from disk first (covers original run + previous resumes),
     // then overlay the current session's in-memory data (more accurate for just-run levels).
     let mut level_times_json = serde_json::Map::new();
-    if let Ok(entries) = fs::read_dir(results_dir) {
-        for entry in entries.flatten() {
-            let name = entry.file_name().to_string_lossy().into_owned();
-            if !name.starts_with('L') || !entry.path().is_dir() {
-                continue;
-            }
-            let status_file = entry.path().join("status.txt");
-            if let Ok(content) = fs::read_to_string(&status_file) {
-                let duration = parse_status_duration(&content);
-                let status = if content.contains("PASSED") { "PASSED" } else { "FAILED" };
-                level_times_json.insert(
-                    name,
-                    serde_json::json!({"duration_s": duration, "status": status}),
-                );
-            }
+    for entry in fs::read_dir(results_dir).into_iter().flatten().flatten() {
+        let name = entry.file_name().to_string_lossy().into_owned();
+        if !name.starts_with('L') || !entry.path().is_dir() {
+            continue;
         }
+        let Ok(content) = fs::read_to_string(entry.path().join("status.txt")) else { continue };
+        let duration = parse_status_duration(&content);
+        let status = if content.contains("PASSED") { "PASSED" } else { "FAILED" };
+        level_times_json.insert(
+            name,
+            serde_json::json!({"duration_s": duration, "status": status}),
+        );
     }
     // Overlay current session's level_times (more accurate timing for just-run levels)
-    for (level, duration, status) in level_times {
+    for (level, duration, status) in ctx.level_times {
         level_times_json.insert(
             level.clone(),
             serde_json::json!({"duration_s": duration, "status": status}),
@@ -568,19 +575,32 @@ fn finalize_run(
     let meta = serde_json::json!({
         "base": args.base,
         "name": args.name,
-        "session_id": session_uuid,
+        "session_id": ctx.session_uuid,
         "agent": args.agent,
-        "mode": mode,
+        "mode": ctx.mode,
         "model": args.model.as_deref().unwrap_or("default"),
-        "prompt": prompt,
-        "start_time": start_time,
-        "timestamp": timestamp,
+        "prompt": ctx.prompt,
+        "start_time": ctx.start_time,
+        "timestamp": ctx.timestamp,
         "end_time": end_time,
-        "exit_code": agent_exit,
-        "score": score,
+        "exit_code": ctx.agent_exit,
+        "score": ctx.score,
         "level_times": level_times_json,
     });
     write_meta(&results_dir.join("meta.json"), &meta)
+}
+
+/// On resume, preserve the original start_time from meta.json so that
+/// elapsed time reflects the full run, not just the resumed portion.
+fn resume_start_time(resume: bool, results_dir: &Path) -> String {
+    if !resume {
+        return iso_now();
+    }
+    fs::read_to_string(results_dir.join("meta.json"))
+        .ok()
+        .and_then(|c| serde_json::from_str::<serde_json::Value>(&c).ok())
+        .and_then(|v| v["start_time"].as_str().map(String::from))
+        .unwrap_or_else(iso_now)
 }
 
 fn push_branch(name: &str, worktree_dir: &Path) {
@@ -760,11 +780,9 @@ fn launch_claude(
 fn resolve_agent_binary(name: &str) -> Result<String> {
     // Try PATH first (works in interactive terminals)
     if let Ok(output) = Command::new("which").arg(name).output() {
-        if output.status.success() {
-            let path = String::from_utf8_lossy(&output.stdout).trim().to_string();
-            if !path.is_empty() {
-                return Ok(path);
-            }
+        let path = String::from_utf8_lossy(&output.stdout).trim().to_string();
+        if output.status.success() && !path.is_empty() {
+            return Ok(path);
         }
     }
     // Fallback: check common locations

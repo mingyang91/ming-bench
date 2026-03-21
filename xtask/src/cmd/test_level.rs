@@ -43,49 +43,7 @@ fn run_rust(level: &str, gate: bool) -> Result<()> {
     // --- Build test binary ---
     let bin = find_test_binary(&proj)?;
 
-    // --- Build filter and timeout ---
-    let (filter, timeout) = if level == "all" {
-        (String::new(), 300)
-    } else {
-        (format!("test_l{level}"), 30)
-    };
-
-    // --- Run inside container ---
-    let timeout_str = format!("{timeout}s");
-    let mount_spec = format!("./{bin}:/bench/test_bin:ro,Z");
-    let bash_cmd = if filter.is_empty() {
-        format!("timeout {timeout_str} /bench/test_bin --test-threads=1 2>&1")
-    } else {
-        format!("timeout {timeout_str} /bench/test_bin {filter} --test-threads=1 2>&1")
-    };
-
-    // BENCH_LEVEL env: supports requirement-change levels where tests at level N
-    // are deprecated by level N+1. Tests check this to skip when superseded.
-    let bench_level = if level == "all" {
-        LEVELS.last().expect("no levels defined").to_string()
-    } else {
-        level.to_string()
-    };
-    let bench_level_env = format!("BENCH_LEVEL={bench_level}");
-
-    let exit = run_cmd(
-        "sudo",
-        &[
-            "podman",
-            "run",
-            "--rm",
-            "--memory=1g",
-            "--cpus=1",
-            "--pids-limit=256",
-            "-v",
-            &mount_spec,
-            "-e",
-            &bench_level_env,
-            IMAGE_NAME,
-            &bash_cmd,
-        ],
-        &proj,
-    )?;
+    let exit = run_container_test(&proj, &bin, level)?;
 
     if exit != 0 {
         return Err(Error::CommandFailed {
@@ -97,59 +55,98 @@ fn run_rust(level: &str, gate: bool) -> Result<()> {
     Ok(())
 }
 
-/// Run Scala tests via Mill directly — no shell scripts needed.
+const JVM_IMAGE: &str = "ming-jvm";
+
+fn mill_quality_gate(lang_dir: &Path) -> Result<()> {
+    println!("Running scalafix (quality gate)...");
+    let exit = run_cmd("./mill", &["fix", "--check"], lang_dir)?;
+    if exit != 0 {
+        return Err(Error::CommandFailed {
+            cmd: "mill fix --check".to_string(),
+            exit_code: exit,
+        });
+    }
+
+    println!("Running scalafmt check (quality gate)...");
+    let exit = run_cmd("./mill", &["checkFormat"], lang_dir)?;
+    if exit != 0 {
+        return Err(Error::CommandFailed {
+            cmd: "mill checkFormat".to_string(),
+            exit_code: exit,
+        });
+    }
+    Ok(())
+}
+
+fn run_mill_container(proj: &Path, jar: &Path, level: &str) -> Result<()> {
+    let (timeout, tag_arg) = if level == "all" {
+        (300, String::new())
+    } else {
+        (30, format!(" --include-tags=l{level}"))
+    };
+
+    let bench_level = if level == "all" {
+        LEVELS.last().expect("no levels defined").to_string()
+    } else {
+        level.to_string()
+    };
+
+    let bench_dir = proj.join("bench");
+    let jar_mount = format!("{}:/bench/test.jar:ro,Z", jar.display());
+    let fixtures_mount = format!("{}:/bench/fixtures:ro,Z", bench_dir.join("fixtures").display());
+    let tests_mount = format!("{}:/bench/tests.json:ro,Z", bench_dir.join("tests.json").display());
+
+    let java_cmd = format!(
+        "timeout {timeout}s java -Dbench.dir=/bench -jar /bench/test.jar --bench-level {bench_level}{tag_arg}"
+    );
+
+    println!("Running Scala tests (level {level}) in container...");
+    let exit = run_cmd(
+        "sudo",
+        &[
+            "podman", "run", "--rm",
+            "--memory=1g", "--cpus=1", "--pids-limit=256",
+            "-v", &jar_mount, "-v", &fixtures_mount, "-v", &tests_mount,
+            JVM_IMAGE, &java_cmd,
+        ],
+        proj,
+    )?;
+    if exit != 0 {
+        return Err(Error::CommandFailed {
+            cmd: "podman run (scala test)".to_string(),
+            exit_code: exit,
+        });
+    }
+    Ok(())
+}
+
+/// Run Scala tests: compile + assembly on host, execute JAR in container.
 fn run_mill(level: &str, gate: bool) -> Result<()> {
     let proj = project_dir();
     let lang_dir = proj.join("bench/scala");
 
-    // Build
-    println!("Building Scala tests...");
-    let exit = run_cmd("./mill", &["test.compile"], &lang_dir)?;
-    if exit != 0 {
-        return Err(Error::CommandFailed {
-            cmd: "mill test.compile".to_string(),
-            exit_code: exit,
-        });
-    }
-
-    // Quality gate: scalafix + scalafmt
     if gate {
-        println!("Running scalafix (quality gate)...");
-        let exit = run_cmd("./mill", &["fix", "--check"], &lang_dir)?;
-        if exit != 0 {
-            return Err(Error::CommandFailed {
-                cmd: "mill fix --check".to_string(),
-                exit_code: exit,
-            });
-        }
-
-        println!("Running scalafmt check (quality gate)...");
-        let exit = run_cmd("./mill", &["checkFormat"], &lang_dir)?;
-        if exit != 0 {
-            return Err(Error::CommandFailed {
-                cmd: "mill checkFormat".to_string(),
-                exit_code: exit,
-            });
-        }
+        mill_quality_gate(&lang_dir)?;
     }
 
-    // Run tests
-    println!("Running Scala tests (level {level})...");
-    let exit = if level == "all" {
-        run_cmd("./mill", &["test"], &lang_dir)?
-    } else {
-        let tag = format!("--include-tags=l{level}");
-        run_cmd("./mill", &["test", "--", &tag], &lang_dir)?
-    };
-
+    println!("Building Scala assembly...");
+    let exit = run_cmd("./mill", &["assembly"], &lang_dir)?;
     if exit != 0 {
         return Err(Error::CommandFailed {
-            cmd: "mill test".to_string(),
+            cmd: "mill assembly".to_string(),
             exit_code: exit,
         });
     }
 
-    Ok(())
+    let jar = lang_dir.join("out/assembly.dest/out.jar");
+    if !jar.is_file() {
+        return Err(Error::CommandFailed {
+            cmd: "assembly JAR not found after build".to_string(),
+            exit_code: 1,
+        });
+    }
+
+    run_mill_container(&proj, &jar, level)
 }
 
 /// Run tests for non-Rust languages by calling build.sh + test.sh scripts.
@@ -333,24 +330,52 @@ fn check_mod_size(proj: &Path, level: u32) -> Result<()> {
     Ok(())
 }
 
+fn run_container_test(proj: &Path, bin: &str, level: &str) -> Result<i32> {
+    let (filter, timeout) = if level == "all" {
+        (String::new(), 300)
+    } else {
+        (format!("test_l{level}"), 30)
+    };
+
+    let timeout_str = format!("{timeout}s");
+    let mount_spec = format!("./{bin}:/bench/test_bin:ro,Z");
+    let bash_cmd = if filter.is_empty() {
+        format!("timeout {timeout_str} /bench/test_bin --test-threads=1 2>&1")
+    } else {
+        format!("timeout {timeout_str} /bench/test_bin {filter} --test-threads=1 2>&1")
+    };
+
+    let bench_level = if level == "all" {
+        LEVELS.last().expect("no levels defined").to_string()
+    } else {
+        level.to_string()
+    };
+    let bench_level_env = format!("BENCH_LEVEL={bench_level}");
+
+    run_cmd(
+        "sudo",
+        &[
+            "podman", "run", "--rm", "--memory=1g", "--cpus=1",
+            "--pids-limit=256", "-v", &mount_spec, "-e", &bench_level_env,
+            IMAGE_NAME, &bash_cmd,
+        ],
+        proj,
+    )
+}
+
 fn find_test_binary(proj: &Path) -> Result<String> {
     // Build test binary in release mode
     let (exit, output) = run_cmd_capture_all("cargo", &["test", "--no-run", "--release"], proj)?;
 
     // Parse output for binary path
     for line in output.lines() {
-        if let Some(start) = line.find("target/release/deps/ming-") {
-            let bin = &line[start..];
-            // Take until non-path character
-            let bin: String = bin
-                .chars()
-                .take_while(|c| {
-                    c.is_alphanumeric() || *c == '/' || *c == '-' || *c == '_' || *c == '.'
-                })
-                .collect();
-            if proj.join(&bin).is_file() {
-                return Ok(bin);
-            }
+        let Some(start) = line.find("target/release/deps/ming-") else { continue };
+        let bin: String = line[start..]
+            .chars()
+            .take_while(|c| c.is_alphanumeric() || matches!(c, '/' | '-' | '_' | '.'))
+            .collect();
+        if proj.join(&bin).is_file() {
+            return Ok(bin);
         }
     }
 

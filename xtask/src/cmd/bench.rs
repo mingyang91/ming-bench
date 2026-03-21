@@ -6,45 +6,57 @@ use std::time::Instant;
 const IMAGE_NAME: &str = "ming";
 const TIMEOUT: u32 = 30;
 
-pub fn run(branch: &str, run_id: Option<&str>) -> Result<()> {
-    let proj = project_dir();
-    let run_id = run_id
-        .map(|s| s.to_string())
-        .unwrap_or_else(|| format!("run-{}", crate::model::now_epoch()));
-    let timestamp = compact_timestamp();
+struct BenchLevelResult {
+    status: &'static str,
+    duration: u64,
+    passed: u32,
+    failed: u32,
+    output: String,
+}
 
-    // --- Results setup ---
-    let results_dir = proj.join("results");
-    fs::create_dir_all(&results_dir).map_err(|e| Error::io(&results_dir, e))?;
-    let result_file = results_dir.join(format!("{branch}_{run_id}_{timestamp}.log"));
+fn run_bench_level(proj: &Path, test_bin: &Path, level: &str) -> Result<BenchLevelResult> {
+    let start = Instant::now();
 
-    // --- Create temp worktree ---
-    let worktree_dir =
-        std::env::temp_dir().join(format!("bench-{}-{}", run_id, std::process::id()));
-    let worktree_branch = format!("bench-{}-{}", run_id, std::process::id());
+    let bash_cmd = format!(
+        "timeout {TIMEOUT}s /bench/test_bin test_l{level} --test-threads=1 2>&1"
+    );
+    let mount_spec = format!("{}:/bench/test_bin:ro,Z", test_bin.display());
 
-    // Cleanup guard
-    let _guard = WorktreeGuard {
-        proj_dir: proj.clone(),
-        worktree_dir: worktree_dir.clone(),
-        branch_name: worktree_branch.clone(),
+    let (exit_code, output) = run_cmd_capture_all(
+        "sudo",
+        &[
+            "podman", "run", "--rm", "--memory=1g", "--cpus=1",
+            "--pids-limit=256", "-v", &mount_spec, IMAGE_NAME, &bash_cmd,
+        ],
+        proj,
+    )?;
+
+    let duration = start.elapsed().as_secs();
+    let (passed, failed) = parse_test_result(&output);
+
+    let status = if exit_code == 124 || duration >= TIMEOUT as u64 {
+        "TIMEOUT"
+    } else if exit_code == 0 {
+        "PASS"
+    } else {
+        "FAIL"
     };
 
-    println!("=== MING Bench: branch={branch} run={run_id} ===");
+    Ok(BenchLevelResult { status, duration, passed, failed, output })
+}
+
+fn setup_bench(proj: &Path, branch: &str, worktree_dir: &Path, worktree_branch: &str) -> Result<PathBuf> {
+    println!("=== MING Bench: branch={branch} ===");
     println!("Creating worktree from '{branch}'...");
 
     let exit = crate::model::run_cmd(
         "git",
         &[
-            "worktree",
-            "add",
-            "-b",
-            &worktree_branch,
+            "worktree", "add", "-b", worktree_branch,
             worktree_dir.to_str().expect("worktree path not utf8"),
-            branch,
-            "--quiet",
+            branch, "--quiet",
         ],
-        &proj,
+        proj,
     )?;
     if exit != 0 {
         return Err(Error::CommandFailed {
@@ -53,9 +65,8 @@ pub fn run(branch: &str, run_id: Option<&str>) -> Result<()> {
         });
     }
 
-    // --- Check image exists ---
     let (img_exit, _) =
-        run_cmd_capture_all("sudo", &["podman", "image", "exists", IMAGE_NAME], &proj)?;
+        run_cmd_capture_all("sudo", &["podman", "image", "exists", IMAGE_NAME], proj)?;
     if img_exit != 0 {
         eprintln!("Image '{IMAGE_NAME}' not found. Run `cargo xtask setup` first.");
         return Err(Error::CommandFailed {
@@ -64,12 +75,49 @@ pub fn run(branch: &str, run_id: Option<&str>) -> Result<()> {
         });
     }
 
-    // --- Compile tests on host ---
     println!("Compiling tests on host...");
-    let test_bin = find_test_binary(&worktree_dir)?;
+    let test_bin = find_test_binary(worktree_dir)?;
     println!("Test binary: {}", test_bin.display());
+    Ok(test_bin)
+}
 
-    // --- Run tests level by level ---
+fn log_level_output(log: &mut String, level: &str, output: &str) {
+    log.push_str(&format!("  --- L{level} output ---\n"));
+    for line in output.lines() {
+        log.push_str(&format!("  {line}\n"));
+    }
+    log.push_str(&format!("  --- end L{level} ---\n"));
+}
+
+fn append_log(log: &mut String, msg: &str) {
+    println!("{msg}");
+    log.push_str(msg);
+    log.push('\n');
+}
+
+pub fn run(branch: &str, run_id: Option<&str>) -> Result<()> {
+    let proj = project_dir();
+    let run_id = run_id
+        .map(|s| s.to_string())
+        .unwrap_or_else(|| format!("run-{}", crate::model::now_epoch()));
+    let timestamp = compact_timestamp();
+
+    let results_dir = proj.join("results");
+    fs::create_dir_all(&results_dir).map_err(|e| Error::io(&results_dir, e))?;
+    let result_file = results_dir.join(format!("{branch}_{run_id}_{timestamp}.log"));
+
+    let worktree_dir =
+        std::env::temp_dir().join(format!("bench-{}-{}", run_id, std::process::id()));
+    let worktree_branch = format!("bench-{}-{}", run_id, std::process::id());
+
+    let _guard = WorktreeGuard {
+        proj_dir: proj.clone(),
+        worktree_dir: worktree_dir.clone(),
+        branch_name: worktree_branch.clone(),
+    };
+
+    let test_bin = setup_bench(&proj, branch, &worktree_dir, &worktree_branch)?;
+
     let mut log =
         format!("Branch: {branch}\nRun ID: {run_id}\nTimeout: {TIMEOUT}s per level\n---\n");
     println!("Branch: {branch}");
@@ -83,90 +131,36 @@ pub fn run(branch: &str, run_id: Option<&str>) -> Result<()> {
     let mut timeout_levels: Vec<String> = Vec::new();
 
     for level in &LEVELS {
-        let start = Instant::now();
+        let result = run_bench_level(&proj, &test_bin, level)?;
+        total_tests += result.passed + result.failed;
+        passed_tests += result.passed;
 
-        let bash_cmd = format!(
-            "timeout {TIMEOUT}s /bench/test_bin test_l{level} --test-threads=1 2>&1"
-        );
-        let mount_spec = format!("{}:/bench/test_bin:ro,Z", test_bin.display());
-
-        let (exit_code, output) = run_cmd_capture_all(
-            "sudo",
-            &[
-                "podman",
-                "run",
-                "--rm",
-                "--memory=1g",
-                "--cpus=1",
-                "--pids-limit=256",
-                "-v",
-                &mount_spec,
-                IMAGE_NAME,
-                &bash_cmd,
-            ],
-            &proj,
-        )?;
-
-        let duration = start.elapsed().as_secs();
-
-        // Parse test results
-        let (level_passed, level_failed) = parse_test_result(&output);
-        let level_total = level_passed + level_failed;
-
-        let status = if exit_code == 124 || duration >= TIMEOUT as u64 {
+        if result.status == "TIMEOUT" {
             timeout_levels.push(format!("L{level}"));
-            "TIMEOUT"
-        } else if exit_code == 0 {
-            "PASS"
-        } else {
+        } else if result.status == "FAIL" {
             failed_levels.push(format!("L{level}"));
-            "FAIL"
-        };
+        }
 
-        total_tests += level_total;
-        passed_tests += level_passed;
+        append_log(&mut log, &format!(
+            "L{level}: {} ({}s) [{}/{} tests]",
+            result.status, result.duration, result.passed, result.passed + result.failed
+        ));
 
-        let result_line =
-            format!("L{level}: {status} ({duration}s) [{level_passed}/{level_total} tests]");
-        println!("{result_line}");
-        log.push_str(&result_line);
-        log.push('\n');
-
-        // Append full output for failed/timeout levels
-        if status != "PASS" {
-            log.push_str(&format!("  --- L{level} output ---\n"));
-            for line in output.lines() {
-                log.push_str(&format!("  {line}\n"));
-            }
-            log.push_str(&format!("  --- end L{level} ---\n"));
+        if result.status != "PASS" {
+            log_level_output(&mut log, level, &result.output);
         }
     }
 
     // --- Summary ---
     log.push_str("---\n");
-    let summary = format!("Score: {passed_tests}/{total_tests} tests passed");
-    println!("---");
-    println!("{summary}");
-    log.push_str(&summary);
-    log.push('\n');
-
+    append_log(&mut log, &format!("Score: {passed_tests}/{total_tests} tests passed"));
     if !failed_levels.is_empty() {
-        let msg = format!("Failed:  {}", failed_levels.join(" "));
-        println!("{msg}");
-        log.push_str(&msg);
-        log.push('\n');
+        append_log(&mut log, &format!("Failed:  {}", failed_levels.join(" ")));
     }
     if !timeout_levels.is_empty() {
-        let msg = format!("Timeout: {}", timeout_levels.join(" "));
-        println!("{msg}");
-        log.push_str(&msg);
-        log.push('\n');
+        append_log(&mut log, &format!("Timeout: {}", timeout_levels.join(" ")));
     }
-
-    let msg = format!("Results: {}", result_file.display());
-    println!("{msg}");
-    log.push_str(&msg);
-    log.push('\n');
+    append_log(&mut log, &format!("Results: {}", result_file.display()));
 
     fs::write(&result_file, &log).map_err(|e| Error::io(&result_file, e))?;
 
@@ -187,68 +181,71 @@ fn parse_test_result(output: &str) -> (u32, u32) {
 }
 
 fn extract_count(line: &str, label: &str) -> u32 {
-    // Find "N <label>" pattern
-    for part in line.split_whitespace().collect::<Vec<_>>().windows(2) {
-        if part[1] == label || part[1].starts_with(label) {
-            if let Ok(n) = part[0].parse::<u32>() {
-                return n;
-            }
+    line.split_whitespace()
+        .collect::<Vec<_>>()
+        .windows(2)
+        .filter(|w| w[1] == label || w[1].starts_with(label))
+        .find_map(|w| w[0].parse::<u32>().ok())
+        .unwrap_or(0)
+}
+
+fn is_path_char(c: char) -> bool {
+    c.is_alphanumeric() || c == '/' || c == '-' || c == '_' || c == '.'
+}
+
+/// Extract a test binary path from `cargo test --no-run --message-format=json` output.
+fn parse_json_test_binary(json_output: &str) -> Option<PathBuf> {
+    for line in json_output.lines() {
+        let Ok(obj) = serde_json::from_str::<serde_json::Value>(line) else { continue };
+        if obj.get("reason").and_then(|r| r.as_str()) != Some("compiler-artifact") {
+            continue;
+        }
+        let is_lib = obj
+            .get("target")
+            .and_then(|t| t.get("kind"))
+            .and_then(|k| k.as_array())
+            .is_some_and(|kinds| kinds.iter().any(|k| k.as_str() == Some("lib")));
+        if !is_lib {
+            continue;
+        }
+        let exe = obj.get("executable").and_then(|e| e.as_str()).unwrap_or("");
+        if exe.is_empty() {
+            continue;
+        }
+        let path = PathBuf::from(exe);
+        if path.is_file() {
+            return Some(path);
         }
     }
-    0
+    None
+}
+
+/// Extract a test binary path by grepping `cargo test --no-run` output for target/ paths.
+fn parse_fallback_test_binary(output: &str, base: &Path) -> Option<PathBuf> {
+    for line in output.lines() {
+        let Some(start) = line.find("target/") else { continue };
+        let bin: String = line[start..].chars().take_while(|c| is_path_char(*c)).collect();
+        let path = base.join(&bin);
+        if path.is_file() {
+            return Some(path);
+        }
+    }
+    None
 }
 
 fn find_test_binary(worktree_dir: &Path) -> Result<PathBuf> {
-    // Try JSON output first
     let (_, json_output) = run_cmd_capture_all(
         "cargo",
         &["test", "--no-run", "--message-format=json"],
         worktree_dir,
     )?;
-
-    for line in json_output.lines() {
-        let obj: serde_json::Value = match serde_json::from_str(line) {
-            Ok(v) => v,
-            Err(_) => continue,
-        };
-        if obj.get("reason").and_then(|r| r.as_str()) != Some("compiler-artifact") {
-            continue;
-        }
-        let kinds = obj
-            .get("target")
-            .and_then(|t| t.get("kind"))
-            .and_then(|k| k.as_array());
-        if let Some(kinds) = kinds {
-            if kinds.iter().any(|k| k.as_str() == Some("lib")) {
-                if let Some(exe) = obj.get("executable").and_then(|e| e.as_str()) {
-                    if !exe.is_empty() {
-                        let path = PathBuf::from(exe);
-                        if path.is_file() {
-                            return Ok(path);
-                        }
-                    }
-                }
-            }
-        }
+    if let Some(bin) = parse_json_test_binary(&json_output) {
+        return Ok(bin);
     }
 
-    // Fallback: build and grep for binary path
     let (_, fallback_output) = run_cmd_capture_all("cargo", &["test", "--no-run"], worktree_dir)?;
-
-    for line in fallback_output.lines() {
-        if let Some(start) = line.find("target/") {
-            let bin = &line[start..];
-            let bin: String = bin
-                .chars()
-                .take_while(|c| {
-                    c.is_alphanumeric() || *c == '/' || *c == '-' || *c == '_' || *c == '.'
-                })
-                .collect();
-            let path = worktree_dir.join(&bin);
-            if path.is_file() {
-                return Ok(path);
-            }
-        }
+    if let Some(bin) = parse_fallback_test_binary(&fallback_output, worktree_dir) {
+        return Ok(bin);
     }
 
     Err(Error::TestBinaryNotFound)

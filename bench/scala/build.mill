@@ -16,6 +16,12 @@ object `package` extends SbtModule with ScalafmtModule with ScalafixModule {
     "-unchecked",
   )
 
+  def mainClass = Some("ming.TestRunner")
+
+  def mvnDeps = Seq(
+    mvn"com.google.code.gson:gson:2.11.0",
+  )
+
   def scalafixConfig = Some(moduleDir / ".scalafix.conf")
 
   def scalafixIvyDeps = Seq(
@@ -30,7 +36,6 @@ object `package` extends SbtModule with ScalafmtModule with ScalafixModule {
 
     def mvnDeps = Seq(
       mvn"org.scalameta::munit:1.1.0",
-      mvn"com.google.code.gson:gson:2.11.0",
     )
   }
 }
