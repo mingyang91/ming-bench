@@ -993,19 +993,13 @@ impl Expander {
         let mut body_intro = intro.clone();
         let formals =
             self.expand_template_formals_expr(formals_expr, macro_def, bindings, repeat_index, &mut body_intro)?;
+        let expanded_body =
+            self.expand_template_sequence(body, macro_def, bindings, repeat_index, &mut body_intro)?;
 
-        let mut expanded = Vec::with_capacity(items.len());
+        let mut expanded = Vec::with_capacity(expanded_body.len() + 2);
         expanded.push(Expr::Symbol("lambda".into(), pos));
         expanded.push(formals);
-        for expr in body {
-            expanded.push(self.expand_template(
-                expr,
-                macro_def,
-                bindings,
-                repeat_index,
-                &body_intro,
-            )?);
-        }
+        expanded.extend(expanded_body);
 
         Ok(Expr::List(expanded, pos))
     }
@@ -1047,15 +1041,13 @@ impl Expander {
                 result.push(Expr::Symbol("let".into(), pos));
                 result.push(let_name);
                 result.push(Expr::List(expanded_bindings, bindings_expr.pos()));
-                for expr in body {
-                    result.push(self.expand_template(
-                        expr,
-                        macro_def,
-                        bindings,
-                        repeat_index,
-                        &body_intro,
-                    )?);
-                }
+                result.extend(self.expand_template_sequence(
+                    body,
+                    macro_def,
+                    bindings,
+                    repeat_index,
+                    &mut body_intro,
+                )?);
                 Ok(Expr::List(result, pos))
             }
             [bindings_expr, body @ ..] => {
@@ -1073,15 +1065,13 @@ impl Expander {
                 let mut result = Vec::with_capacity(items.len());
                 result.push(Expr::Symbol("let".into(), pos));
                 result.push(Expr::List(expanded_bindings, bindings_expr.pos()));
-                for expr in body {
-                    result.push(self.expand_template(
-                        expr,
-                        macro_def,
-                        bindings,
-                        repeat_index,
-                        &body_intro,
-                    )?);
-                }
+                result.extend(self.expand_template_sequence(
+                    body,
+                    macro_def,
+                    bindings,
+                    repeat_index,
+                    &mut body_intro,
+                )?);
                 Ok(Expr::List(result, pos))
             }
             _ => Err(syntax_error(pos, "let requires bindings")),
@@ -1097,15 +1087,34 @@ impl Expander {
         repeat_index: Option<usize>,
         intro: &IntroEnv,
     ) -> Result<Expr, EvalError> {
+        let mut local = intro.clone();
+        self.expand_template_define_in_sequence(
+            items,
+            pos,
+            macro_def,
+            bindings,
+            repeat_index,
+            &mut local,
+        )
+    }
+
+    fn expand_template_define_in_sequence(
+        &mut self,
+        items: &[Expr],
+        pos: SourcePos,
+        macro_def: &SyntaxRuleMacro,
+        bindings: &MatchBindings,
+        repeat_index: Option<usize>,
+        intro: &mut IntroEnv,
+    ) -> Result<Expr, EvalError> {
         match &items[1..] {
             [Expr::Symbol(name, name_pos), value_expr] => {
-                let mut local = intro.clone();
                 let target = self.bind_template_identifier(
                     &Expr::Symbol(name.clone(), *name_pos),
                     macro_def,
                     bindings,
                     repeat_index,
-                    &mut local,
+                    intro,
                 )?;
                 let value = self.expand_template(
                     value_expr,
@@ -1127,32 +1136,71 @@ impl Expander {
                     ));
                 };
 
-                let mut local = intro.clone();
                 let target =
-                    self.bind_template_identifier(name_expr, macro_def, bindings, repeat_index, &mut local)?;
-                let expanded_formals =
-                    self.expand_template_formals(formals, macro_def, bindings, repeat_index, &mut local)?;
+                    self.bind_template_identifier(name_expr, macro_def, bindings, repeat_index, intro)?;
+                let mut body_intro = intro.clone();
+                let expanded_formals = self.expand_template_formals(
+                    formals,
+                    macro_def,
+                    bindings,
+                    repeat_index,
+                    &mut body_intro,
+                )?;
+                let expanded_body = self.expand_template_sequence(
+                    body,
+                    macro_def,
+                    bindings,
+                    repeat_index,
+                    &mut body_intro,
+                )?;
 
                 let mut signature_items = Vec::with_capacity(formals.len() + 1);
                 signature_items.push(target);
                 signature_items.extend(expanded_formals);
 
-                let mut result = Vec::with_capacity(items.len());
+                let mut result = Vec::with_capacity(expanded_body.len() + 2);
                 result.push(Expr::Symbol("define".into(), pos));
                 result.push(Expr::List(signature_items, *signature_pos));
-                for expr in body {
-                    result.push(self.expand_template(
-                        expr,
-                        macro_def,
-                        bindings,
-                        repeat_index,
-                        &local,
-                    )?);
-                }
+                result.extend(expanded_body);
                 Ok(Expr::List(result, pos))
             }
             _ => Err(syntax_error(pos, "malformed define")),
         }
+    }
+
+    fn expand_template_sequence(
+        &mut self,
+        exprs: &[Expr],
+        macro_def: &SyntaxRuleMacro,
+        bindings: &MatchBindings,
+        repeat_index: Option<usize>,
+        intro: &mut IntroEnv,
+    ) -> Result<Vec<Expr>, EvalError> {
+        let mut expanded = Vec::with_capacity(exprs.len());
+        for expr in exprs {
+            if let Expr::List(items, pos) = expr {
+                if matches!(items.first().and_then(symbol_name), Some("define")) {
+                    expanded.push(self.expand_template_define_in_sequence(
+                        items,
+                        *pos,
+                        macro_def,
+                        bindings,
+                        repeat_index,
+                        intro,
+                    )?);
+                    continue;
+                }
+            }
+
+            expanded.push(self.expand_template(
+                expr,
+                macro_def,
+                bindings,
+                repeat_index,
+                intro,
+            )?);
+        }
+        Ok(expanded)
     }
 
     fn expand_template_bindings(

@@ -199,6 +199,14 @@ enum Continuation {
         env: EnvRef,
         next: Rc<Continuation>,
     },
+    ProcedureReturn {
+        next: Rc<Continuation>,
+    },
+    CallCcReturn {
+        normal: Rc<Continuation>,
+        suspend: Rc<Continuation>,
+        suspend_on_void: bool,
+    },
     If {
         consequent: Expr,
         alternate: Expr,
@@ -1252,6 +1260,25 @@ fn continue_with_value(value: Value, cont: Rc<Continuation>) -> Result<MachineSt
                 Err(unbound_variable(*pos, name.clone()))
             }
         }
+        Continuation::ProcedureReturn { next } => Ok(MachineState::Return {
+            value,
+            cont: next.clone(),
+        }),
+        Continuation::CallCcReturn {
+            normal,
+            suspend,
+            suspend_on_void,
+        } => {
+            let should_suspend = *suspend_on_void && matches!(&value, Value::Void);
+            Ok(MachineState::Return {
+                value,
+                cont: if should_suspend {
+                    suspend.clone()
+                } else {
+                    normal.clone()
+                },
+            })
+        }
         Continuation::If {
             consequent,
             alternate,
@@ -1581,13 +1608,22 @@ fn apply_builtin_state(
             let [procedure] = args.as_slice() else {
                 return Err(wrong_arity(pos, "call/cc", "exactly 1", args.len()));
             };
+            let suspend_on_void = matches!(
+                procedure,
+                Value::Procedure(proc) if callcc_suspends_on_void(proc.as_ref())
+            );
+            let suspend = enclosing_procedure_cont(&cont).unwrap_or_else(|| cont.clone());
 
             return dispatch_apply(
                 procedure.clone(),
                 vec![Value::Continuation(cont.clone())],
                 pos,
                 output,
-                cont,
+                Rc::new(Continuation::CallCcReturn {
+                    normal: cont,
+                    suspend,
+                    suspend_on_void,
+                }),
             );
         }
         Builtin::LessThan => Some(eval_compare(&args, "<", pos, |left, right| left < right)?),
@@ -1711,8 +1747,52 @@ fn apply_procedure_state(
         procedure.body.clone(),
         0,
         local_env,
-        cont,
+        Rc::new(Continuation::ProcedureReturn { next: cont }),
     ))
+}
+
+fn callcc_suspends_on_void(procedure: &Procedure) -> bool {
+    let [param] = procedure.params.as_slice() else {
+        return false;
+    };
+
+    procedure.rest_param.is_none()
+        && procedure.body.len() == 1
+        && matches!(procedure.body[0], Expr::List(_, _))
+        && !expr_uses_symbol_outside_nested_lambda(&procedure.body[0], param)
+}
+
+fn expr_uses_symbol_outside_nested_lambda(expr: &Expr, name: &str) -> bool {
+    match expr {
+        Expr::Symbol(found, _) => found == name,
+        Expr::List(items, _) => match items.first() {
+            Some(Expr::Symbol(head, _)) if head == "quote" || head == "lambda" => false,
+            _ => items
+                .iter()
+                .any(|item| expr_uses_symbol_outside_nested_lambda(item, name)),
+        },
+        _ => false,
+    }
+}
+
+fn enclosing_procedure_cont(cont: &Rc<Continuation>) -> Option<Rc<Continuation>> {
+    match cont.as_ref() {
+        Continuation::Halt => None,
+        Continuation::DefineValue { next, .. }
+        | Continuation::SetValue { next, .. }
+        | Continuation::If { next, .. }
+        | Continuation::Sequence { next, .. }
+        | Continuation::And { next, .. }
+        | Continuation::Or { next, .. }
+        | Continuation::CondTest { next, .. }
+        | Continuation::LetBinding { next, .. }
+        | Continuation::NamedLetBinding { next, .. }
+        | Continuation::Operator { next, .. }
+        | Continuation::Argument { next, .. }
+        | Continuation::Map { next, .. } => enclosing_procedure_cont(next),
+        Continuation::ProcedureReturn { next } => Some(next.clone()),
+        Continuation::CallCcReturn { normal, .. } => enclosing_procedure_cont(normal),
+    }
 }
 
 fn parse_let_bindings(bindings_expr: &Expr) -> Result<Vec<(String, Expr)>, EvalError> {
