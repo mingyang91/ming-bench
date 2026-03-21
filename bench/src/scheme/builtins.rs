@@ -316,6 +316,22 @@ pub fn apply_string_to_symbol(args: &[Value]) -> Result<Value, EvalError> {
     Ok(Value::Symbol(s.clone()))
 }
 
+pub fn apply_string_copy(args: &[Value]) -> Result<Value, EvalError> {
+    let [val] = args else {
+        return Err(EvalError::WrongArgCount {
+            expected: 1,
+            got: args.len(),
+        });
+    };
+    let Value::String(s) = val else {
+        return Err(EvalError::TypeError {
+            expected: "string".to_string(),
+            got: format!("{val}"),
+        });
+    };
+    Ok(Value::String(s.clone()))
+}
+
 pub fn apply_is_char(args: &[Value]) -> Result<Value, EvalError> {
     let [val] = args else {
         return Err(EvalError::WrongArgCount {

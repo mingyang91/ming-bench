@@ -139,6 +139,21 @@ fn atom_to_value(token: &str) -> Result<Value, EvalError> {
     if token == "#f" {
         return Ok(Value::Boolean(false));
     }
+    if token.starts_with("#\\") && token.len() > 2 {
+        let char_name = &token[2..];
+        let ch = match char_name {
+            "space" => ' ',
+            "newline" => '\n',
+            "tab" => '\t',
+            _ if char_name.len() == 1 => char_name.chars().next().expect("single char"),
+            _ => {
+                return Err(EvalError::Parse {
+                    message: format!("unknown character name: {char_name}"),
+                })
+            }
+        };
+        return Ok(Value::Char(ch));
+    }
     if token.starts_with('"') && token.ends_with('"') && token.len() >= 2 {
         let inner = &token[1..token.len() - 1];
         return Ok(Value::String(inner.to_string()));

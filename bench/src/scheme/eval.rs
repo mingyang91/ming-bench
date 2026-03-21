@@ -35,6 +35,7 @@ fn eval_inner(expr: &Expr, env: &mut Env, out: &mut String) -> Result<Value, Eva
                 || token.parse::<i64>().is_ok()
                 || token == "#t"
                 || token == "#f"
+                || token.starts_with("#\\")
             {
                 atom_to_value(token)
             } else if let Some(val) = env.get(token) {
@@ -71,6 +72,7 @@ fn eval_list(items: &[Expr], env: &mut Env, out: &mut String) -> Result<Value, E
             "display" => return eval_display(args, env, out),
             "write" => return eval_write(args, env, out),
             "newline" => return eval_newline(args, out),
+            "string-set!" => return eval_string_set(args, env, out),
             _ => {}
         }
     }
@@ -126,6 +128,7 @@ fn apply_builtin(op: &str, args: &[Value]) -> Result<Value, EvalError> {
         "number->string" => builtins::apply_number_to_string(args),
         "symbol->string" => builtins::apply_symbol_to_string(args),
         "string->symbol" => builtins::apply_string_to_symbol(args),
+        "string-copy" => builtins::apply_string_copy(args),
         _ => Err(EvalError::UnboundVariable {
             name: op.to_string(),
         }),
@@ -412,6 +415,53 @@ fn eval_write(args: &[Expr], env: &mut Env, out: &mut String) -> Result<Value, E
     let val = eval(expr, env, out)?;
     use std::fmt::Write;
     write!(out, "{val}").expect("write to String cannot fail");
+    Ok(Value::Nil)
+}
+
+/// Evaluate `(string-set! var index char)` — mutates a character in a string.
+fn eval_string_set(args: &[Expr], env: &mut Env, out: &mut String) -> Result<Value, EvalError> {
+    let [var_expr, idx_expr, char_expr] = args else {
+        return Err(EvalError::WrongArgCount {
+            expected: 3,
+            got: args.len(),
+        });
+    };
+    let Expr::Atom(var_name, _) = var_expr else {
+        return Err(EvalError::TypeError {
+            expected: "variable name".to_string(),
+            got: "expression".to_string(),
+        });
+    };
+    let idx_val = eval(idx_expr, env, out)?;
+    let Value::Integer(idx) = idx_val else {
+        return Err(EvalError::TypeError {
+            expected: "integer".to_string(),
+            got: format!("{idx_val}"),
+        });
+    };
+    let char_val = eval(char_expr, env, out)?;
+    let Value::Char(ch) = char_val else {
+        return Err(EvalError::TypeError {
+            expected: "char".to_string(),
+            got: format!("{char_val}"),
+        });
+    };
+    let Some(Value::String(s)) = env.get_mut(var_name) else {
+        return Err(EvalError::TypeError {
+            expected: "mutable string variable".to_string(),
+            got: var_name.clone(),
+        });
+    };
+    let idx_usize = idx as usize;
+    let mut chars: Vec<char> = s.chars().collect();
+    if idx_usize >= chars.len() {
+        return Err(EvalError::TypeError {
+            expected: "valid string index".to_string(),
+            got: format!("{idx}"),
+        });
+    }
+    chars[idx_usize] = ch;
+    *s = chars.into_iter().collect();
     Ok(Value::Nil)
 }
 
