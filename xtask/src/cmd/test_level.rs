@@ -93,8 +93,14 @@ fn run_mill_container(proj: &Path, jar: &Path, level: &str) -> Result<()> {
 
     let bench_dir = proj.join("bench");
     let jar_mount = format!("{}:/bench/test.jar:ro,Z", jar.display());
-    let fixtures_mount = format!("{}:/bench/fixtures:ro,Z", bench_dir.join("fixtures").display());
-    let tests_mount = format!("{}:/bench/tests.json:ro,Z", bench_dir.join("tests.json").display());
+    let fixtures_mount = format!(
+        "{}:/bench/fixtures:ro,Z",
+        bench_dir.join("fixtures").display()
+    );
+    let tests_mount = format!(
+        "{}:/bench/tests.json:ro,Z",
+        bench_dir.join("tests.json").display()
+    );
 
     let java_cmd = format!(
         "timeout {timeout}s java -Dbench.dir=/bench -jar /bench/test.jar --bench-level {bench_level}{tag_arg}"
@@ -104,10 +110,20 @@ fn run_mill_container(proj: &Path, jar: &Path, level: &str) -> Result<()> {
     let exit = run_cmd(
         "sudo",
         &[
-            "podman", "run", "--rm",
-            "--memory=2g", "--cpus=1", "--pids-limit=256",
-            "-v", &jar_mount, "-v", &fixtures_mount, "-v", &tests_mount,
-            JVM_IMAGE, &java_cmd,
+            "podman",
+            "run",
+            "--rm",
+            "--memory=2g",
+            "--cpus=1",
+            "--pids-limit=256",
+            "-v",
+            &jar_mount,
+            "-v",
+            &fixtures_mount,
+            "-v",
+            &tests_mount,
+            JVM_IMAGE,
+            &java_cmd,
         ],
         proj,
     )?;
@@ -206,79 +222,58 @@ fn run_script(level: &str, gate: bool, lang: &crate::model::Lang) -> Result<()> 
 /// not on every `cargo build`.
 const GATE_LINT_FLAGS: &[&str] = &[
     // Deny lints (hard errors)
-    "-D", "clippy::unwrap_used",
-    "-D", "clippy::result_unit_err",
-    "-D", "clippy::manual_assert",
-    "-D", "clippy::disallowed_macros",
+    "-D",
+    "clippy::unwrap_used",
+    "-D",
+    "clippy::result_unit_err",
+    "-D",
+    "clippy::manual_assert",
+    "-D",
+    "clippy::disallowed_macros",
     // Warn lints (promoted to error by -D warnings)
-    "-W", "clippy::too_many_lines",
-    "-W", "clippy::excessive_nesting",
-    "-W", "clippy::manual_filter_map",
-    "-W", "clippy::manual_find_map",
-    "-W", "clippy::manual_flatten",
-    "-W", "clippy::manual_try_fold",
-    "-W", "clippy::manual_let_else",
-    "-W", "clippy::needless_range_loop",
-    "-W", "clippy::explicit_counter_loop",
-    "-W", "clippy::explicit_iter_loop",
-    "-W", "clippy::vec_init_then_push",
-    "-W", "clippy::needless_collect",
-    "-W", "clippy::uninlined_format_args",
+    "-W",
+    "clippy::too_many_lines",
+    "-W",
+    "clippy::excessive_nesting",
+    "-W",
+    "clippy::manual_filter_map",
+    "-W",
+    "clippy::manual_find_map",
+    "-W",
+    "clippy::manual_flatten",
+    "-W",
+    "clippy::manual_try_fold",
+    "-W",
+    "clippy::manual_let_else",
+    "-W",
+    "clippy::needless_range_loop",
+    "-W",
+    "clippy::explicit_counter_loop",
+    "-W",
+    "clippy::explicit_iter_loop",
+    "-W",
+    "clippy::vec_init_then_push",
+    "-W",
+    "clippy::needless_collect",
+    "-W",
+    "clippy::uninlined_format_args",
 ];
 
 fn quality_gates(proj: &Path, level: &str) -> Result<()> {
     let clippy_toml = proj.join("bench/rust/clippy.toml");
     let clippy_bak = proj.join("bench/rust/clippy.toml.bak");
+    let config = gate_config(level);
 
-    // Determine limits based on level
-    let (fn_limit, allow_dead_code) = if level != "all" {
-        let ln: u32 = level.parse().unwrap_or(99);
-        if ln <= 3 {
-            (150, true)
-        } else {
-            (150, false)
-        }
-    } else {
-        (150, false)
-    };
+    backup_clippy_config(&clippy_toml, &clippy_bak);
+    write_gate_clippy_config(&clippy_toml, config.fn_limit)?;
 
-    // Backup and write leveled clippy.toml
-    if clippy_toml.is_file() {
-        let _ = fs::copy(&clippy_toml, &clippy_bak);
-    }
-    fs::write(
-        &clippy_toml,
-        format!("too-many-lines-threshold = {fn_limit}\nexcessive-nesting-threshold = 3\n"),
-    )
-    .map_err(|e| Error::io(&clippy_toml, e))?;
-
-    let restore = || {
-        if clippy_bak.is_file() {
-            let _ = fs::rename(&clippy_bak, &clippy_toml);
-        }
-    };
-
-    // Run clippy --fix
     println!("Running clippy --fix (auto-fixing trivial lints)...");
-    let mut clippy_args = vec![
-        "clippy", "--package", "ming", "--fix", "--allow-dirty", "--allow-staged", "--", "-D", "warnings",
-    ];
-    clippy_args.extend_from_slice(GATE_LINT_FLAGS);
-    if allow_dead_code {
-        clippy_args.extend_from_slice(&["-A", "dead_code"]);
-    }
-    let _ = run_cmd("cargo", &clippy_args, proj);
+    let _ = run_cmd("cargo", &clippy_args(true, config.allow_dead_code), proj);
 
-    // Run clippy (verify)
-    println!("Running clippy (verify, fn limit={fn_limit})...");
-    let mut verify_args = vec!["clippy", "--package", "ming", "--", "-D", "warnings"];
-    verify_args.extend_from_slice(GATE_LINT_FLAGS);
-    if allow_dead_code {
-        verify_args.extend_from_slice(&["-A", "dead_code"]);
-    }
-    let exit = run_cmd("cargo", &verify_args, proj)?;
+    println!("Running clippy (verify, fn limit={})...", config.fn_limit);
+    let exit = run_cmd("cargo", &clippy_args(false, config.allow_dead_code), proj)?;
     if exit != 0 {
-        restore();
+        restore_clippy_config(&clippy_toml, &clippy_bak);
         eprintln!("ERROR: clippy failed — fix warnings before testing");
         return Err(Error::CommandFailed {
             cmd: "cargo clippy".to_string(),
@@ -286,15 +281,67 @@ fn quality_gates(proj: &Path, level: &str) -> Result<()> {
         });
     }
 
-    restore();
+    restore_clippy_config(&clippy_toml, &clippy_bak);
 
-    // --- mod.rs size check ---
     if level != "all" {
         let ln: u32 = level.parse().unwrap_or(99);
         check_mod_size(proj, ln)?;
     }
 
     Ok(())
+}
+
+struct GateConfig {
+    fn_limit: u32,
+    allow_dead_code: bool,
+}
+
+fn gate_config(level: &str) -> GateConfig {
+    if level == "all" {
+        return GateConfig {
+            fn_limit: 150,
+            allow_dead_code: false,
+        };
+    }
+
+    let ln: u32 = level.parse().unwrap_or(99);
+    GateConfig {
+        fn_limit: 150,
+        allow_dead_code: ln <= 3,
+    }
+}
+
+fn backup_clippy_config(clippy_toml: &Path, clippy_bak: &Path) {
+    if clippy_toml.is_file() {
+        let _ = fs::copy(clippy_toml, clippy_bak);
+    }
+}
+
+fn write_gate_clippy_config(clippy_toml: &Path, fn_limit: u32) -> Result<()> {
+    fs::write(
+        clippy_toml,
+        format!("too-many-lines-threshold = {fn_limit}\nexcessive-nesting-threshold = 3\n"),
+    )
+    .map_err(|e| Error::io(clippy_toml, e))
+}
+
+fn restore_clippy_config(clippy_toml: &Path, clippy_bak: &Path) {
+    if clippy_bak.is_file() {
+        let _ = fs::rename(clippy_bak, clippy_toml);
+    }
+}
+
+fn clippy_args(fix: bool, allow_dead_code: bool) -> Vec<&'static str> {
+    let mut args = vec!["clippy", "--package", "ming"];
+    if fix {
+        args.extend_from_slice(&["--fix", "--allow-dirty", "--allow-staged"]);
+    }
+    args.extend_from_slice(&["--", "-D", "warnings"]);
+    args.extend_from_slice(GATE_LINT_FLAGS);
+    if allow_dead_code {
+        args.extend_from_slice(&["-A", "dead_code"]);
+    }
+    args
 }
 
 fn check_mod_size(proj: &Path, level: u32) -> Result<()> {
@@ -355,9 +402,18 @@ fn run_container_test(proj: &Path, bin: &str, level: &str) -> Result<i32> {
     run_cmd(
         "sudo",
         &[
-            "podman", "run", "--rm", "--memory=1g", "--cpus=1",
-            "--pids-limit=256", "-v", &mount_spec, "-e", &bench_level_env,
-            IMAGE_NAME, &bash_cmd,
+            "podman",
+            "run",
+            "--rm",
+            "--memory=1g",
+            "--cpus=1",
+            "--pids-limit=256",
+            "-v",
+            &mount_spec,
+            "-e",
+            &bench_level_env,
+            IMAGE_NAME,
+            &bash_cmd,
         ],
         proj,
     )
@@ -369,7 +425,9 @@ fn find_test_binary(proj: &Path) -> Result<String> {
 
     // Parse output for binary path
     for line in output.lines() {
-        let Some(start) = line.find("target/release/deps/ming-") else { continue };
+        let Some(start) = line.find("target/release/deps/ming-") else {
+            continue;
+        };
         let bin: String = line[start..]
             .chars()
             .take_while(|c| c.is_alphanumeric() || matches!(c, '/' | '-' | '_' | '.'))

@@ -36,16 +36,46 @@ Work through levels 1 through 23 in order.
 After implementing each level, run cargo xtask test NN to verify.
 Fix failures before proceeding. Do not skip levels.";
 
-#[allow(clippy::too_many_lines)]
 pub fn run(args: RunAgentArgs) -> Result<()> {
     install_signal_handlers();
+    let ctx = build_run_context(&args)?;
+    prepare_run(&args, &ctx)?;
+    let _cleanup_ctx = cleanup_context(&args, &ctx);
+    let (agent_exit, level_times) = execute_mode(
+        &ctx.mode,
+        &args,
+        &ctx.agent_workdir,
+        &ctx.worktree_dir,
+        &ctx.results_dir,
+        &ctx.prompt,
+        &ctx.session_uuid,
+    )?;
+    let score = run_scoring(&args, &ctx.proj)?;
+    finalize_agent_run(&args, &ctx, agent_exit, &score, &level_times)?;
+    Ok(())
+}
 
+struct RunContext {
+    proj: PathBuf,
+    session_uuid: String,
+    timestamp: String,
+    prompt: String,
+    mode: String,
+    worktree_dir: PathBuf,
+    agent_workdir: PathBuf,
+    results_dir: PathBuf,
+    start_time: String,
+    lockfile: PathBuf,
+}
+
+fn build_run_context(args: &RunAgentArgs) -> Result<RunContext> {
     let proj = project_dir();
     let session_uuid = uuid_v4();
     let timestamp = compact_timestamp();
-    let prompt = args.prompt.as_deref().unwrap_or(DEFAULT_PROMPT);
-    let mode = args.mode.clone();
-
+    let prompt = args
+        .prompt
+        .clone()
+        .unwrap_or_else(|| DEFAULT_PROMPT.to_string());
     let worktree_dir = proj
         .parent()
         .expect("project has no parent dir")
@@ -57,80 +87,94 @@ pub fn run(args: RunAgentArgs) -> Result<()> {
             exit_code: 1,
         })?;
     let agent_workdir = worktree_dir.join("bench").join(parsed_lang.dir_name());
-
     let results_dir = if args.resume {
         find_resume_dir(&proj, &args.strategy, &args.name)?
     } else {
-        setup_fresh_run(&proj, &args, &worktree_dir)?
+        setup_fresh_run(&proj, args, &worktree_dir)?
     };
-
     let start_time = resume_start_time(args.resume, &results_dir);
+    let lockfile = results_dir.join(".run.lock");
 
+    Ok(RunContext {
+        proj,
+        session_uuid,
+        timestamp,
+        prompt,
+        mode: args.mode.clone(),
+        worktree_dir,
+        agent_workdir,
+        results_dir,
+        start_time,
+        lockfile,
+    })
+}
+
+fn prepare_run(args: &RunAgentArgs, ctx: &RunContext) -> Result<()> {
     if !args.resume {
         write_initial_meta(
-            &args,
-            &results_dir,
-            &session_uuid,
-            &mode,
-            prompt,
-            &start_time,
-            &timestamp,
+            args,
+            &ctx.results_dir,
+            &ctx.session_uuid,
+            &ctx.mode,
+            &ctx.prompt,
+            &ctx.start_time,
+            &ctx.timestamp,
         )?;
     }
 
-    print_run_banner(&args, &session_uuid, &results_dir, &worktree_dir, &mode);
+    print_run_banner(
+        args,
+        &ctx.session_uuid,
+        &ctx.results_dir,
+        &ctx.worktree_dir,
+        &ctx.mode,
+    );
 
     if !args.resume {
-        create_worktree(&args, &proj, &worktree_dir, &agent_workdir)?;
+        create_worktree(args, &ctx.proj, &ctx.worktree_dir, &ctx.agent_workdir)?;
     }
 
-    warm_cache(&worktree_dir);
+    warm_cache(&ctx.worktree_dir);
+    acquire_lock(&ctx.lockfile)
+}
 
-    let lockfile = results_dir.join(".run.lock");
-    acquire_lock(&lockfile)?;
-
-    let _cleanup_ctx = CleanupContext {
-        worktree_dir: worktree_dir.clone(),
+fn cleanup_context(args: &RunAgentArgs, ctx: &RunContext) -> CleanupContext {
+    CleanupContext {
+        worktree_dir: ctx.worktree_dir.clone(),
         name: args.name.clone(),
-        lockfile: lockfile.clone(),
-    };
+        lockfile: ctx.lockfile.clone(),
+    }
+}
 
-    let (agent_exit, level_times) = execute_mode(
-        &mode,
-        &args,
-        &agent_workdir,
-        &worktree_dir,
-        &results_dir,
-        prompt,
-        &session_uuid,
-    )?;
-
-    let score = run_scoring(&args, &proj)?;
-
+fn finalize_agent_run(
+    args: &RunAgentArgs,
+    ctx: &RunContext,
+    agent_exit: i32,
+    score: &str,
+    level_times: &LevelTimes,
+) -> Result<()> {
     finalize_run(
-        &args,
-        &results_dir,
+        args,
+        &ctx.results_dir,
         &FinalizeContext {
-            session_uuid: &session_uuid,
-            mode: &mode,
-            prompt,
-            start_time: &start_time,
-            timestamp: &timestamp,
+            session_uuid: &ctx.session_uuid,
+            mode: &ctx.mode,
+            prompt: &ctx.prompt,
+            start_time: &ctx.start_time,
+            timestamp: &ctx.timestamp,
             agent_exit,
-            score: &score,
-            level_times: &level_times,
+            score,
+            level_times,
         },
     )?;
 
-    push_branch(&args.name, &worktree_dir);
-
-    let _ = fs::remove_file(&lockfile);
+    push_branch(&args.name, &ctx.worktree_dir);
+    let _ = fs::remove_file(&ctx.lockfile);
 
     println!();
     println!("=== Run complete ===");
-    println!("Results: {}", results_dir.display());
+    println!("Results: {}", ctx.results_dir.display());
     println!("Score:   {score}");
-
     Ok(())
 }
 

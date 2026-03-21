@@ -151,14 +151,20 @@ fn print_section_header<'a>(label: &'a str, current_section: &mut &'a str) {
 
 /// Returns Ok(()) on pass, Err(message) on failure.
 fn check_result(
-    label: &str, expr: &str, expected: &str, exit_code: i32, actual: &str,
+    label: &str,
+    expr: &str,
+    expected: &str,
+    exit_code: i32,
+    actual: &str,
 ) -> std::result::Result<(), String> {
     if exit_code != 0 {
         Err(format!("  FAIL {label}: guile error on: {expr}"))
     } else if actual == expected {
         Ok(())
     } else {
-        Err(format!("  FAIL {label}: expected '{expected}', got '{actual}'"))
+        Err(format!(
+            "  FAIL {label}: expected '{expected}', got '{actual}'"
+        ))
     }
 }
 
@@ -179,12 +185,17 @@ pub fn run() -> Result<()> {
     for (label, expr, expected) in TEST_CASES {
         print_section_header(label, &mut current_section);
         let verdict = match run_cmd_capture("guile", &["--no-auto-compile", "-c", expr], &cwd) {
-            Ok((exit_code, actual)) => check_result(label, expr, expected, exit_code, actual.trim_end()),
+            Ok((exit_code, actual)) => {
+                check_result(label, expr, expected, exit_code, actual.trim_end())
+            }
             Err(_) => Err(format!("  FAIL {label}: failed to run guile")),
         };
         match verdict {
             Ok(()) => passed += 1,
-            Err(msg) => { failed += 1; errors.push(msg); }
+            Err(msg) => {
+                failed += 1;
+                errors.push(msg);
+            }
         }
     }
 

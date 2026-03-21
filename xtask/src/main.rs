@@ -17,6 +17,7 @@
 
 mod ast_check;
 mod cmd;
+mod codex;
 mod model;
 mod session;
 
@@ -205,25 +206,65 @@ fn main() {
 }
 
 fn dispatch(command: Commands) -> model::Result<()> {
+    if let Commands::RunAgent {
+        base,
+        strategy,
+        name,
+        prompt,
+        model,
+        agent,
+        mode,
+        max_turns,
+        skip_bench,
+        resume,
+        from_level,
+        clean,
+        lang,
+    } = command
+    {
+        return dispatch_run_agent(cmd::run_agent::RunAgentArgs {
+            base,
+            strategy,
+            name,
+            prompt,
+            model,
+            agent,
+            mode,
+            max_turns,
+            skip_bench,
+            resume,
+            from_level,
+            clean,
+            lang,
+        });
+    }
+
+    dispatch_non_agent(command)
+}
+
+fn dispatch_non_agent(command: Commands) -> model::Result<()> {
     match command {
         Commands::Results { json } => cmd::results::run(json),
         Commands::Tokens { runs, all } => cmd::tokens::run(runs, all),
         Commands::Watch { once, ts, all } => cmd::watch::run(once, ts, all),
         Commands::Setup => cmd::setup::run(),
-        Commands::Test { ref level, gate, ref lang } => cmd::test_level::run(level, gate, lang),
+        Commands::Test {
+            ref level,
+            gate,
+            ref lang,
+        } => cmd::test_level::run(level, gate, lang),
         Commands::Bench {
             ref branch,
             ref run_id,
         } => cmd::bench::run(branch, run_id.as_deref()),
-        Commands::RunAgent {
-            base, strategy, name, prompt, model, agent,
-            mode, max_turns, skip_bench, resume, from_level, clean, lang,
-        } => cmd::run_agent::run(cmd::run_agent::RunAgentArgs {
-            base, strategy, name, prompt, model, agent,
-            mode, max_turns, skip_bench, resume, from_level, clean, lang,
-        }),
         Commands::Analyze { runs, all } => cmd::analyze::run(runs, all),
         Commands::Verify => cmd::verify::run(),
+        other => dispatch_session_command(other),
+    }
+}
+
+fn dispatch_session_command(command: Commands) -> model::Result<()> {
+    match command {
         Commands::SessionDump {
             run,
             thinking,
@@ -246,5 +287,18 @@ fn dispatch(command: Commands) -> model::Result<()> {
         Commands::SessionStats { run } => cmd::session_stats::run(run),
         Commands::SessionTurns { run } => cmd::session_turns::run(run),
         Commands::Compare { run1, run2 } => cmd::compare::run(run1, run2),
+        Commands::RunAgent { .. } => unreachable!("run-agent handled earlier"),
+        Commands::Results { .. }
+        | Commands::Tokens { .. }
+        | Commands::Watch { .. }
+        | Commands::Setup
+        | Commands::Test { .. }
+        | Commands::Bench { .. }
+        | Commands::Analyze { .. }
+        | Commands::Verify => unreachable!("non-session command dispatched elsewhere"),
     }
+}
+
+fn dispatch_run_agent(args: cmd::run_agent::RunAgentArgs) -> model::Result<()> {
+    cmd::run_agent::run(args)
 }

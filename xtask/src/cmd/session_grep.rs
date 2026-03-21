@@ -39,7 +39,9 @@ fn filter_by_level(
     session_files: Vec<(String, std::path::PathBuf)>,
     level: Option<&str>,
 ) -> Vec<(String, std::path::PathBuf)> {
-    let Some(lvl) = level else { return session_files };
+    let Some(lvl) = level else {
+        return session_files;
+    };
     let target = if lvl.starts_with('L') {
         lvl.to_string()
     } else {
@@ -79,7 +81,8 @@ fn search_keyword(keyword: &str, events: &[session::SessionEvent], ctx_chars: us
 
     println!(
         "\n{}KEYWORD: {keyword} ({total_hits} hits){}",
-        Color::BOLD, Color::RESET
+        Color::BOLD,
+        Color::RESET
     );
 
     if total_hits == 0 && hits.tool_result.is_empty() {
@@ -109,7 +112,11 @@ fn collect_event_hits(
             }
             hits.user.push(event.index);
             if hits.snippets.len() < 3 {
-                hits.snippets.push((event.index, "user".into(), extract_context(text, kw_lower, ctx_chars)));
+                hits.snippets.push((
+                    event.index,
+                    "user".into(),
+                    extract_context(text, kw_lower, ctx_chars),
+                ));
             }
         }
         EventKind::Assistant { blocks } => {
@@ -147,7 +154,9 @@ fn collect_single_block(
             hits.text.push(idx);
             maybe_add_snippet(hits, idx, "text", t, kw_lower, ctx_chars);
         }
-        ContentBlock::ToolUse { input_json, .. } if input_json.to_lowercase().contains(kw_lower) => {
+        ContentBlock::ToolUse { input_json, .. }
+            if input_json.to_lowercase().contains(kw_lower) =>
+        {
             hits.tool_use.push(idx);
         }
         ContentBlock::ToolResult { content } if content.to_lowercase().contains(kw_lower) => {
@@ -166,7 +175,8 @@ fn maybe_add_snippet(
     ctx_chars: usize,
 ) {
     if hits.snippets.len() < 3 {
-        hits.snippets.push((idx, kind.into(), extract_context(text, kw_lower, ctx_chars)));
+        hits.snippets
+            .push((idx, kind.into(), extract_context(text, kw_lower, ctx_chars)));
     }
 }
 
@@ -186,7 +196,9 @@ fn print_span_and_snippets(hits: &KeywordHits, total_events: usize) {
             0
         };
         println!();
-        println!("  First: event {first:>3}    Last: event {last:>3}    Span: {span_pct}% of session");
+        println!(
+            "  First: event {first:>3}    Last: event {last:>3}    Span: {span_pct}% of session"
+        );
     }
 
     if !hits.snippets.is_empty() {
@@ -194,7 +206,8 @@ fn print_span_and_snippets(hits: &KeywordHits, total_events: usize) {
         for (idx, kind, snippet) in &hits.snippets {
             println!(
                 "  {}[event {idx} / {kind}]:{} {snippet}",
-                Color::DIM, Color::RESET
+                Color::DIM,
+                Color::RESET
             );
         }
     }

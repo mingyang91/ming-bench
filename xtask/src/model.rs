@@ -89,7 +89,9 @@ impl Lang {
             "go" | "golang" => Ok(Self::Go),
             "typescript" | "ts" => Ok(Self::TypeScript),
             "scala" => Ok(Self::Scala),
-            _ => Err(format!("unknown language: {s} (expected: rust, java, go, ts, scala)")),
+            _ => Err(format!(
+                "unknown language: {s} (expected: rust, java, go, ts, scala)"
+            )),
         }
     }
 
@@ -112,7 +114,6 @@ impl Lang {
             Self::Scala => "Scala",
         }
     }
-
 
     pub fn bench_dir(&self, proj: &std::path::Path) -> PathBuf {
         proj.join("bench").join(self.dir_name())
@@ -384,9 +385,8 @@ pub fn elapsed_secs(meta: &MetaJson) -> Option<u64> {
 // ---------------------------------------------------------------------------
 
 pub const LEVELS: [&str; 27] = [
-    "01", "02", "03", "04", "05", "06", "07", "08", "09",
-    "10", "11", "12", "13", "14", "15", "16", "17", "18",
-    "19", "20", "21", "22", "23", "24", "25", "26", "27",
+    "01", "02", "03", "04", "05", "06", "07", "08", "09", "10", "11", "12", "13", "14", "15", "16",
+    "17", "18", "19", "20", "21", "22", "23", "24", "25", "26", "27",
 ];
 
 // ---------------------------------------------------------------------------
@@ -417,7 +417,7 @@ pub fn turns_for_level(level_num: u32, max_turns: Option<u32>) -> u32 {
         7..=9 => 45,   // TCO, set!, variadic
         10..=12 => 90, // call/cc, macros, integration
         13..=14 => 45, // builtins, string immutability (req change)
-        15 => 60,       // equality, letrec, case, vectors
+        15 => 60,      // equality, letrec, case, vectors
         16..=18 => 60, // dynamic-wind, guard, values
         19..=20 => 75, // exact arith, records
         21..=23 => 90, // pair mutation, syntax-case, final integration

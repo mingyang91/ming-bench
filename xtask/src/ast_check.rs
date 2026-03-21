@@ -22,7 +22,9 @@ pub fn check_ast_rules(src_dir: &Path) -> Vec<Violation> {
 }
 
 fn visit_rs_files(dir: &Path, violations: &mut Vec<Violation>) {
-    let Ok(entries) = std::fs::read_dir(dir) else { return };
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
     for entry in entries.flatten() {
         let path = entry.path();
         let is_tests_dir = path.is_dir() && path.file_name().is_some_and(|n| n == "tests");
@@ -35,8 +37,12 @@ fn visit_rs_files(dir: &Path, violations: &mut Vec<Violation>) {
 }
 
 fn check_file(path: &Path, violations: &mut Vec<Violation>) {
-    let Ok(content) = std::fs::read_to_string(path) else { return };
-    let Ok(file) = syn::parse_file(&content) else { return };
+    let Ok(content) = std::fs::read_to_string(path) else {
+        return;
+    };
+    let Ok(file) = syn::parse_file(&content) else {
+        return;
+    };
 
     let file_str = path.display().to_string();
     let mut checker = RuleChecker {
@@ -58,7 +64,9 @@ impl<'a> RuleChecker<'a> {
     }
 
     fn check_return_type(&mut self, sig: &syn::Signature) {
-        let syn::ReturnType::Type(_, ty) = &sig.output else { return };
+        let syn::ReturnType::Type(_, ty) = &sig.output else {
+            return;
+        };
         if !Self::is_result_string(ty) {
             return;
         }
@@ -74,7 +82,9 @@ impl<'a> RuleChecker<'a> {
 
     /// Check if a type path ends with `String` (i.e., the error type is String).
     fn is_string_type(ty: &syn::Type) -> bool {
-        let syn::Type::Path(tp) = ty else { return false };
+        let syn::Type::Path(tp) = ty else {
+            return false;
+        };
         tp.path
             .segments
             .last()
@@ -83,19 +93,19 @@ impl<'a> RuleChecker<'a> {
 
     /// Check if a type is `Result<_, String>`.
     fn is_result_string(ty: &syn::Type) -> bool {
-        let syn::Type::Path(tp) = ty else { return false };
-        let Some(seg) = tp.path.segments.last() else { return false };
+        let syn::Type::Path(tp) = ty else {
+            return false;
+        };
+        let Some(seg) = tp.path.segments.last() else {
+            return false;
+        };
         if seg.ident != "Result" {
             return false;
         }
         let syn::PathArguments::AngleBracketed(args) = &seg.arguments else {
             return false;
         };
-        let type_args: Vec<_> = args
-            .args
-            .iter()
-            .filter_map(extract_generic_type)
-            .collect();
+        let type_args: Vec<_> = args.args.iter().filter_map(extract_generic_type).collect();
         type_args.len() == 2 && Self::is_string_type(type_args[1])
     }
 }
@@ -128,7 +138,7 @@ mod tests {
     use super::*;
 
     fn check_source(src: &str) -> Vec<Violation> {
-        let file = syn::parse_file(src).unwrap();
+        let file = syn::parse_file(src).expect("test source should parse");
         let mut violations = Vec::new();
         let mut checker = RuleChecker {
             file: "test.rs",
@@ -153,9 +163,7 @@ mod tests {
 
     #[test]
     fn rejects_impl_method_result_string() {
-        let v = check_source(
-            "struct S; impl S { fn bar(&self) -> Result<(), String> { Ok(()) } }",
-        );
+        let v = check_source("struct S; impl S { fn bar(&self) -> Result<(), String> { Ok(()) } }");
         assert_eq!(v.len(), 1);
         assert!(v[0].message.contains("bar"));
     }

@@ -40,7 +40,15 @@ pub fn run(run_arg: PathBuf) -> Result<()> {
 
     let stats = gather_stats(&all_events);
 
-    print_report(&run_name, strategy, mode, &session_files, &all_events, &stats, &meta);
+    print_report(
+        &run_name,
+        strategy,
+        mode,
+        &session_files,
+        &all_events,
+        &stats,
+        &meta,
+    );
 
     Ok(())
 }
@@ -61,11 +69,17 @@ struct Stats {
 
 fn gather_stats(events: &[SessionEvent]) -> Stats {
     let mut s = Stats {
-        thinking_count: 0, thinking_chars: 0,
-        text_count: 0, text_chars: 0,
-        tool_use_count: 0, tool_result_count: 0, user_count: 0,
-        tool_names: HashMap::new(), bash_cmds: HashMap::new(),
-        test_results: (0, 0), levels_attempted: Vec::new(),
+        thinking_count: 0,
+        thinking_chars: 0,
+        text_count: 0,
+        text_chars: 0,
+        tool_use_count: 0,
+        tool_result_count: 0,
+        user_count: 0,
+        tool_names: HashMap::new(),
+        bash_cmds: HashMap::new(),
+        test_results: (0, 0),
+        levels_attempted: Vec::new(),
     };
 
     for event in events {
@@ -99,7 +113,7 @@ fn tally_single_block(block: &ContentBlock, s: &mut Stats) {
         ContentBlock::ToolUse { name, input_json } => {
             s.tool_use_count += 1;
             *s.tool_names.entry(name.clone()).or_default() += 1;
-            if name == "Bash" {
+            if session::shell_command(name, input_json).is_some() {
                 tally_bash(input_json, s);
             }
         }
@@ -119,7 +133,8 @@ fn tally_test_result(content: &str, s: &mut Stats) {
 }
 
 fn tally_bash(input_json: &str, s: &mut Stats) {
-    let Some(cmd) = extract_bash_command(input_json) else { return };
+    let cmd = extract_bash_command(input_json).or_else(|| extract_exec_command(input_json));
+    let Some(cmd) = cmd else { return };
     let key = classify_bash_command(&cmd);
     *s.bash_cmds.entry(key).or_default() += 1;
 
@@ -145,14 +160,27 @@ fn print_report(
 ) {
     println!(
         "{}Run:{} {run_name} (strategy: {strategy}, mode: {mode})",
-        Color::BOLD, Color::RESET
+        Color::BOLD,
+        Color::RESET
     );
-    println!("Session: {} file(s), {} events", session_files.len(), all_events.len());
+    println!(
+        "Session: {} file(s), {} events",
+        session_files.len(),
+        all_events.len()
+    );
     println!();
 
     println!("{}CONTENT BLOCKS:{}", Color::BOLD, Color::RESET);
-    println!("  thinking:     {:>4} blocks, {:>8} chars", s.thinking_count, fmt_comma(s.thinking_chars));
-    println!("  text:         {:>4} blocks, {:>8} chars", s.text_count, fmt_comma(s.text_chars));
+    println!(
+        "  thinking:     {:>4} blocks, {:>8} chars",
+        s.thinking_count,
+        fmt_comma(s.thinking_chars)
+    );
+    println!(
+        "  text:         {:>4} blocks, {:>8} chars",
+        s.text_count,
+        fmt_comma(s.text_chars)
+    );
     println!("  tool_use:     {:>4} blocks", s.tool_use_count);
     println!("  tool_result:  {:>4} blocks", s.tool_result_count);
     println!("  user:         {:>4} messages", s.user_count);
@@ -184,7 +212,10 @@ fn print_bash_cmds(bash_cmds: &HashMap<String, u64>, test_results: (u64, u64)) {
         println!("  {cmd:<30} {count}");
     }
     if test_results.0 > 0 || test_results.1 > 0 {
-        println!("  test outcomes: {} pass, {} fail", test_results.0, test_results.1);
+        println!(
+            "  test outcomes: {} pass, {} fail",
+            test_results.0, test_results.1
+        );
     }
     println!();
 }
@@ -206,6 +237,11 @@ fn print_timeline(meta: &MetaJson, levels_attempted: &[String]) {
 fn extract_bash_command(input_json: &str) -> Option<String> {
     let v: serde_json::Value = serde_json::from_str(input_json).ok()?;
     v.get("command").and_then(|c| c.as_str()).map(String::from)
+}
+
+fn extract_exec_command(input_json: &str) -> Option<String> {
+    let v: serde_json::Value = serde_json::from_str(input_json).ok()?;
+    v.get("cmd").and_then(|c| c.as_str()).map(String::from)
 }
 
 fn classify_bash_command(cmd: &str) -> String {

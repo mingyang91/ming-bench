@@ -17,16 +17,23 @@ struct BenchLevelResult {
 fn run_bench_level(proj: &Path, test_bin: &Path, level: &str) -> Result<BenchLevelResult> {
     let start = Instant::now();
 
-    let bash_cmd = format!(
-        "timeout {TIMEOUT}s /bench/test_bin test_l{level} --test-threads=1 2>&1"
-    );
+    let bash_cmd =
+        format!("timeout {TIMEOUT}s /bench/test_bin test_l{level} --test-threads=1 2>&1");
     let mount_spec = format!("{}:/bench/test_bin:ro,Z", test_bin.display());
 
     let (exit_code, output) = run_cmd_capture_all(
         "sudo",
         &[
-            "podman", "run", "--rm", "--memory=1g", "--cpus=1",
-            "--pids-limit=256", "-v", &mount_spec, IMAGE_NAME, &bash_cmd,
+            "podman",
+            "run",
+            "--rm",
+            "--memory=1g",
+            "--cpus=1",
+            "--pids-limit=256",
+            "-v",
+            &mount_spec,
+            IMAGE_NAME,
+            &bash_cmd,
         ],
         proj,
     )?;
@@ -42,19 +49,34 @@ fn run_bench_level(proj: &Path, test_bin: &Path, level: &str) -> Result<BenchLev
         "FAIL"
     };
 
-    Ok(BenchLevelResult { status, duration, passed, failed, output })
+    Ok(BenchLevelResult {
+        status,
+        duration,
+        passed,
+        failed,
+        output,
+    })
 }
 
-fn setup_bench(proj: &Path, branch: &str, worktree_dir: &Path, worktree_branch: &str) -> Result<PathBuf> {
+fn setup_bench(
+    proj: &Path,
+    branch: &str,
+    worktree_dir: &Path,
+    worktree_branch: &str,
+) -> Result<PathBuf> {
     println!("=== MING Bench: branch={branch} ===");
     println!("Creating worktree from '{branch}'...");
 
     let exit = crate::model::run_cmd(
         "git",
         &[
-            "worktree", "add", "-b", worktree_branch,
+            "worktree",
+            "add",
+            "-b",
+            worktree_branch,
             worktree_dir.to_str().expect("worktree path not utf8"),
-            branch, "--quiet",
+            branch,
+            "--quiet",
         ],
         proj,
     )?;
@@ -97,9 +119,7 @@ fn append_log(log: &mut String, msg: &str) {
 
 pub fn run(branch: &str, run_id: Option<&str>) -> Result<()> {
     let proj = project_dir();
-    let run_id = run_id
-        .map(|s| s.to_string())
-        .unwrap_or_else(|| format!("run-{}", crate::model::now_epoch()));
+    let run_id = bench_run_id(run_id);
     let timestamp = compact_timestamp();
 
     let results_dir = proj.join("results");
@@ -118,54 +138,99 @@ pub fn run(branch: &str, run_id: Option<&str>) -> Result<()> {
 
     let test_bin = setup_bench(&proj, branch, &worktree_dir, &worktree_branch)?;
 
-    let mut log =
-        format!("Branch: {branch}\nRun ID: {run_id}\nTimeout: {TIMEOUT}s per level\n---\n");
-    println!("Branch: {branch}");
-    println!("Run ID: {run_id}");
-    println!("Timeout: {TIMEOUT}s per level");
-    println!("---");
-
-    let mut total_tests: u32 = 0;
-    let mut passed_tests: u32 = 0;
-    let mut failed_levels: Vec<String> = Vec::new();
-    let mut timeout_levels: Vec<String> = Vec::new();
-
-    for level in &LEVELS {
-        let result = run_bench_level(&proj, &test_bin, level)?;
-        total_tests += result.passed + result.failed;
-        passed_tests += result.passed;
-
-        if result.status == "TIMEOUT" {
-            timeout_levels.push(format!("L{level}"));
-        } else if result.status == "FAIL" {
-            failed_levels.push(format!("L{level}"));
-        }
-
-        append_log(&mut log, &format!(
-            "L{level}: {} ({}s) [{}/{} tests]",
-            result.status, result.duration, result.passed, result.passed + result.failed
-        ));
-
-        if result.status != "PASS" {
-            log_level_output(&mut log, level, &result.output);
-        }
-    }
-
-    // --- Summary ---
-    log.push_str("---\n");
-    append_log(&mut log, &format!("Score: {passed_tests}/{total_tests} tests passed"));
-    if !failed_levels.is_empty() {
-        append_log(&mut log, &format!("Failed:  {}", failed_levels.join(" ")));
-    }
-    if !timeout_levels.is_empty() {
-        append_log(&mut log, &format!("Timeout: {}", timeout_levels.join(" ")));
-    }
-    append_log(&mut log, &format!("Results: {}", result_file.display()));
+    let mut log = bench_log_header(branch, &run_id);
+    let summary = run_all_levels(&proj, &test_bin, &mut log)?;
+    append_summary(&mut log, &summary, &result_file);
 
     fs::write(&result_file, &log).map_err(|e| Error::io(&result_file, e))?;
 
     println!("=== Bench complete ===");
     Ok(())
+}
+
+fn bench_run_id(run_id: Option<&str>) -> String {
+    run_id
+        .map(str::to_string)
+        .unwrap_or_else(|| format!("run-{}", crate::model::now_epoch()))
+}
+
+fn bench_log_header(branch: &str, run_id: &str) -> String {
+    println!("Branch: {branch}");
+    println!("Run ID: {run_id}");
+    println!("Timeout: {TIMEOUT}s per level");
+    println!("---");
+    format!("Branch: {branch}\nRun ID: {run_id}\nTimeout: {TIMEOUT}s per level\n---\n")
+}
+
+fn run_all_levels(proj: &Path, test_bin: &Path, log: &mut String) -> Result<BenchSummary> {
+    let mut summary = BenchSummary::default();
+    for level in &LEVELS {
+        let result = run_bench_level(proj, test_bin, level)?;
+        summary.record(level, &result);
+        append_level_result(log, level, &result);
+    }
+    Ok(summary)
+}
+
+fn append_level_result(log: &mut String, level: &str, result: &BenchLevelResult) {
+    append_log(
+        log,
+        &format!(
+            "L{level}: {} ({}s) [{}/{} tests]",
+            result.status,
+            result.duration,
+            result.passed,
+            result.passed + result.failed
+        ),
+    );
+    if result.status != "PASS" {
+        log_level_output(log, level, &result.output);
+    }
+}
+
+fn append_summary(log: &mut String, summary: &BenchSummary, result_file: &Path) {
+    log.push_str("---\n");
+    append_log(
+        log,
+        &format!(
+            "Score: {}/{} tests passed",
+            summary.passed_tests, summary.total_tests
+        ),
+    );
+    if !summary.failed_levels.is_empty() {
+        append_log(
+            log,
+            &format!("Failed:  {}", summary.failed_levels.join(" ")),
+        );
+    }
+    if !summary.timeout_levels.is_empty() {
+        append_log(
+            log,
+            &format!("Timeout: {}", summary.timeout_levels.join(" ")),
+        );
+    }
+    append_log(log, &format!("Results: {}", result_file.display()));
+}
+
+#[derive(Default)]
+struct BenchSummary {
+    total_tests: u32,
+    passed_tests: u32,
+    failed_levels: Vec<String>,
+    timeout_levels: Vec<String>,
+}
+
+impl BenchSummary {
+    fn record(&mut self, level: &str, result: &BenchLevelResult) {
+        self.total_tests += result.passed + result.failed;
+        self.passed_tests += result.passed;
+
+        match result.status {
+            "TIMEOUT" => self.timeout_levels.push(format!("L{level}")),
+            "FAIL" => self.failed_levels.push(format!("L{level}")),
+            _ => {}
+        }
+    }
 }
 
 fn parse_test_result(output: &str) -> (u32, u32) {
@@ -196,7 +261,9 @@ fn is_path_char(c: char) -> bool {
 /// Extract a test binary path from `cargo test --no-run --message-format=json` output.
 fn parse_json_test_binary(json_output: &str) -> Option<PathBuf> {
     for line in json_output.lines() {
-        let Ok(obj) = serde_json::from_str::<serde_json::Value>(line) else { continue };
+        let Ok(obj) = serde_json::from_str::<serde_json::Value>(line) else {
+            continue;
+        };
         if obj.get("reason").and_then(|r| r.as_str()) != Some("compiler-artifact") {
             continue;
         }
@@ -223,8 +290,13 @@ fn parse_json_test_binary(json_output: &str) -> Option<PathBuf> {
 /// Extract a test binary path by grepping `cargo test --no-run` output for target/ paths.
 fn parse_fallback_test_binary(output: &str, base: &Path) -> Option<PathBuf> {
     for line in output.lines() {
-        let Some(start) = line.find("target/") else { continue };
-        let bin: String = line[start..].chars().take_while(|c| is_path_char(*c)).collect();
+        let Some(start) = line.find("target/") else {
+            continue;
+        };
+        let bin: String = line[start..]
+            .chars()
+            .take_while(|c| is_path_char(*c))
+            .collect();
         let path = base.join(&bin);
         if path.is_file() {
             return Some(path);

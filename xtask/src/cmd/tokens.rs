@@ -1,3 +1,7 @@
+use crate::codex::{
+    self, CostBreakdown as CodexCostBreakdown, OutputInfo as CodexOutputInfo,
+    SessionData as CodexSessionData, Usage as CodexUsage,
+};
 use crate::model::{
     discover_runs, fmt_comma, project_results_dir, Error, MetaJson, Result, TokenUsage,
     PRICE_CACHE_READ, PRICE_CACHE_WRITE, PRICE_INPUT, PRICE_OUTPUT,
@@ -56,78 +60,6 @@ impl RunReport {
 enum RunUsage {
     Claude { usage: Option<TokenUsage> },
     Codex { usage: Option<CodexUsage> },
-}
-
-#[derive(Default, Clone, Debug)]
-struct CodexUsage {
-    input_tokens: u64,
-    cached_input_tokens: u64,
-    output_tokens: u64,
-}
-
-impl CodexUsage {
-    fn total_tokens(&self) -> u64 {
-        self.input_tokens + self.output_tokens
-    }
-
-    fn uncached_input_tokens(&self) -> u64 {
-        self.input_tokens.saturating_sub(self.cached_input_tokens)
-    }
-
-    fn add(&mut self, other: &CodexUsage) {
-        self.input_tokens += other.input_tokens;
-        self.cached_input_tokens += other.cached_input_tokens;
-        self.output_tokens += other.output_tokens;
-    }
-}
-
-#[derive(Default, Clone, Copy, Debug)]
-struct CodexCostBreakdown {
-    input: f64,
-    cached_input: f64,
-    output: f64,
-}
-
-impl CodexCostBreakdown {
-    fn total(&self) -> f64 {
-        self.input + self.cached_input + self.output
-    }
-
-    fn add(&mut self, other: &CodexCostBreakdown) {
-        self.input += other.input;
-        self.cached_input += other.cached_input;
-        self.output += other.output;
-    }
-}
-
-#[derive(Clone, Copy, Debug)]
-struct CodexPricing {
-    input_per_token: f64,
-    cached_input_per_token: f64,
-    output_per_token: f64,
-}
-
-impl CodexPricing {
-    fn cost_breakdown(&self, usage: &CodexUsage) -> CodexCostBreakdown {
-        CodexCostBreakdown {
-            input: usage.uncached_input_tokens() as f64 * self.input_per_token,
-            cached_input: usage.cached_input_tokens as f64 * self.cached_input_per_token,
-            output: usage.output_tokens as f64 * self.output_per_token,
-        }
-    }
-}
-
-#[derive(Default, Clone, Debug)]
-struct CodexOutputInfo {
-    model: Option<String>,
-    session_id: Option<String>,
-    total_tokens: Option<u64>,
-}
-
-#[derive(Default, Clone, Debug)]
-struct CodexSessionData {
-    model: Option<String>,
-    usage: CodexUsage,
 }
 
 pub fn run(runs: Vec<PathBuf>, all: bool) -> Result<()> {
@@ -217,20 +149,32 @@ fn print_claude_table_header() {
     );
     println!(
         "{} {} {} {} {} {}",
-        "-".repeat(8), "-".repeat(10), "-".repeat(10),
-        "-".repeat(12), "-".repeat(12), "-".repeat(10)
+        "-".repeat(8),
+        "-".repeat(10),
+        "-".repeat(10),
+        "-".repeat(12),
+        "-".repeat(12),
+        "-".repeat(10)
     );
 }
 
 fn print_claude_level_rows(
-    run_dir: &Path, levels: &[PathBuf], is_full_mode: bool,
+    run_dir: &Path,
+    levels: &[PathBuf],
+    is_full_mode: bool,
 ) -> (TokenUsage, bool) {
     let mut grand_total = TokenUsage::default();
     let mut any_usage = false;
 
     if is_full_mode {
         let session_file = run_dir.join("session.jsonl");
-        print_claude_row("full", &session_file, None, &mut grand_total, &mut any_usage);
+        print_claude_row(
+            "full",
+            &session_file,
+            None,
+            &mut grand_total,
+            &mut any_usage,
+        );
     } else {
         for level_dir in levels {
             let level_name = level_dir
@@ -239,7 +183,13 @@ fn print_claude_level_rows(
                 .unwrap_or_default();
             let session_file = level_dir.join("session.jsonl");
             let status = read_status(level_dir);
-            print_claude_row(&level_name, &session_file, Some(&status), &mut grand_total, &mut any_usage);
+            print_claude_row(
+                &level_name,
+                &session_file,
+                Some(&status),
+                &mut grand_total,
+                &mut any_usage,
+            );
         }
     }
 
@@ -247,8 +197,11 @@ fn print_claude_level_rows(
 }
 
 fn print_claude_row(
-    label: &str, session_file: &Path, status: Option<&str>,
-    grand_total: &mut TokenUsage, any_usage: &mut bool,
+    label: &str,
+    session_file: &Path,
+    status: Option<&str>,
+    grand_total: &mut TokenUsage,
+    any_usage: &mut bool,
 ) {
     let suffix = status.map(|s| format!(" {s}")).unwrap_or_default();
     match parse_session(session_file) {
@@ -265,7 +218,10 @@ fn print_claude_row(
             );
         }
         None => {
-            println!("{:<8} {:>10} {:>10} {:>12} {:>12}{suffix}", label, "—", "—", "—", "—");
+            println!(
+                "{:<8} {:>10} {:>10} {:>12} {:>12}{suffix}",
+                label, "—", "—", "—", "—"
+            );
         }
     }
 }
@@ -273,8 +229,11 @@ fn print_claude_row(
 fn print_claude_table_footer(grand_total: &TokenUsage) {
     println!(
         "{} {} {} {} {}",
-        "-".repeat(8), "-".repeat(10), "-".repeat(10),
-        "-".repeat(12), "-".repeat(12)
+        "-".repeat(8),
+        "-".repeat(10),
+        "-".repeat(10),
+        "-".repeat(12),
+        "-".repeat(12)
     );
     println!(
         "{:<8} {:>10} {:>10} {:>12} {:>12}",
@@ -334,7 +293,11 @@ fn process_codex_run(run_dir: &Path, agent: &str, is_full_mode: bool) -> Result<
         process_codex_level(&level_name, &dir, &mut state);
     }
 
-    let model = if state.mixed_model { Some("multiple".to_string()) } else { state.run_model.clone() };
+    let model = if state.mixed_model {
+        Some("multiple".to_string())
+    } else {
+        state.run_model.clone()
+    };
     print_codex_table_footer(&state, &model);
 
     Ok(RunReport {
@@ -355,21 +318,30 @@ fn print_codex_table_header() {
     );
     println!(
         "{} {} {} {} {} {} {}",
-        "-".repeat(8), "-".repeat(10), "-".repeat(12),
-        "-".repeat(10), "-".repeat(12), "-".repeat(10), "-".repeat(10)
+        "-".repeat(8),
+        "-".repeat(10),
+        "-".repeat(12),
+        "-".repeat(10),
+        "-".repeat(12),
+        "-".repeat(10),
+        "-".repeat(10)
     );
 }
 
 fn process_codex_level(level_name: &str, dir: &Path, state: &mut CodexRunState) {
     let status = read_status(dir);
-    let output_info = parse_codex_output_info(dir);
-    let session_data = load_codex_session(dir, output_info.session_id.as_deref());
+    let output_info = codex::parse_output_info(&dir.join("agent-output.txt"));
+    let session_data = codex::load_session(dir, output_info.session_id.as_deref());
 
     let level_model = session_data
         .as_ref()
         .and_then(|data| data.model.clone())
         .or(output_info.model.clone());
-    merge_model_label(&mut state.run_model, &mut state.mixed_model, level_model.as_deref());
+    merge_model_label(
+        &mut state.run_model,
+        &mut state.mixed_model,
+        level_model.as_deref(),
+    );
 
     match session_data {
         Some(data) => print_codex_level_with_data(level_name, &data, &level_model, &status, state),
@@ -378,8 +350,11 @@ fn process_codex_level(level_name: &str, dir: &Path, state: &mut CodexRunState) 
 }
 
 fn print_codex_level_with_data(
-    level_name: &str, data: &CodexSessionData, level_model: &Option<String>,
-    status: &str, state: &mut CodexRunState,
+    level_name: &str,
+    data: &CodexSessionData,
+    level_model: &Option<String>,
+    status: &str,
+    state: &mut CodexRunState,
 ) {
     state.any_usage = true;
     state.grand_usage.add(&data.usage);
@@ -388,7 +363,7 @@ fn print_codex_level_with_data(
 
     let level_cost = level_model
         .as_deref()
-        .and_then(codex_pricing)
+        .and_then(codex::pricing)
         .map(|pricing| {
             let breakdown = pricing.cost_breakdown(&data.usage);
             state.grand_costs.add(&breakdown);
@@ -406,12 +381,17 @@ fn print_codex_level_with_data(
         fmt_comma(data.usage.cached_input_tokens),
         fmt_comma(data.usage.output_tokens),
         fmt_comma(level_total_tokens),
-        level_cost.map(|cost| format!("${cost:.2}")).unwrap_or_else(|| "—".to_string()),
+        level_cost
+            .map(|cost| format!("${cost:.2}"))
+            .unwrap_or_else(|| "—".to_string()),
     );
 }
 
 fn print_codex_level_fallback(
-    level_name: &str, output_info: &CodexOutputInfo, status: &str, state: &mut CodexRunState,
+    level_name: &str,
+    output_info: &CodexOutputInfo,
+    status: &str,
+    state: &mut CodexRunState,
 ) {
     state.complete_usage = false;
     state.complete_cost = false;
@@ -430,14 +410,22 @@ fn print_codex_level_fallback(
 
 fn print_codex_table_footer(state: &CodexRunState, model: &Option<String>) {
     let dash = |ok: bool, val: u64| {
-        if ok { fmt_comma(val) } else { "—".to_string() }
+        if ok {
+            fmt_comma(val)
+        } else {
+            "—".to_string()
+        }
     };
     let complete = state.any_usage && state.complete_usage;
 
     println!(
         "{} {} {} {} {} {}",
-        "-".repeat(8), "-".repeat(10), "-".repeat(12),
-        "-".repeat(10), "-".repeat(12), "-".repeat(10)
+        "-".repeat(8),
+        "-".repeat(10),
+        "-".repeat(12),
+        "-".repeat(10),
+        "-".repeat(12),
+        "-".repeat(10)
     );
     println!(
         "{:<8} {:>10} {:>12} {:>10} {:>12} {:>10}",
@@ -489,17 +477,24 @@ fn print_comparison(all_reports: &[(String, RunReport)]) {
 fn print_claude_comparison(all_reports: &[(String, RunReport)]) {
     let short_labels = short_labels(all_reports);
     let col = |f: fn(&TokenUsage) -> String| -> Vec<String> {
-        all_reports.iter()
+        all_reports
+            .iter()
             .map(|(_, r)| f(r.claude_usage().expect("checked")))
             .collect()
     };
     let rows = vec![
         ("Input Tokens", col(|u| fmt_comma(u.input_tokens))),
         ("Output Tokens", col(|u| fmt_comma(u.output_tokens))),
-        ("Cache Write", col(|u| fmt_comma(u.cache_creation_input_tokens))),
+        (
+            "Cache Write",
+            col(|u| fmt_comma(u.cache_creation_input_tokens)),
+        ),
         ("Cache Read", col(|u| fmt_comma(u.cache_read_input_tokens))),
         ("Total Tokens", col(|u| fmt_comma(u.total()))),
-        ("Est. Cost", all_reports.iter().map(|(_, r)| r.cost_display()).collect()),
+        (
+            "Est. Cost",
+            all_reports.iter().map(|(_, r)| r.cost_display()).collect(),
+        ),
     ];
     print_string_comparison(&short_labels, &rows);
 }
@@ -507,17 +502,33 @@ fn print_claude_comparison(all_reports: &[(String, RunReport)]) {
 fn print_codex_comparison(all_reports: &[(String, RunReport)]) {
     let short_labels = short_labels(all_reports);
     let codex_col = |f: fn(&CodexUsage) -> String| -> Vec<String> {
-        all_reports.iter()
+        all_reports
+            .iter()
             .map(|(_, r)| r.codex_usage().map(f).unwrap_or_else(|| "—".to_string()))
             .collect()
     };
     let rows = vec![
-        ("Model", all_reports.iter().map(|(_, r)| r.model_display()).collect()),
+        (
+            "Model",
+            all_reports.iter().map(|(_, r)| r.model_display()).collect(),
+        ),
         ("Input Tokens", codex_col(|u| fmt_comma(u.input_tokens))),
-        ("Cached Input", codex_col(|u| fmt_comma(u.cached_input_tokens))),
+        (
+            "Cached Input",
+            codex_col(|u| fmt_comma(u.cached_input_tokens)),
+        ),
         ("Output Tokens", codex_col(|u| fmt_comma(u.output_tokens))),
-        ("Total Tokens", all_reports.iter().map(|(_, r)| r.total_tokens_display()).collect()),
-        ("Est. Cost", all_reports.iter().map(|(_, r)| r.cost_display()).collect()),
+        (
+            "Total Tokens",
+            all_reports
+                .iter()
+                .map(|(_, r)| r.total_tokens_display())
+                .collect(),
+        ),
+        (
+            "Est. Cost",
+            all_reports.iter().map(|(_, r)| r.cost_display()).collect(),
+        ),
     ];
     print_string_comparison(&short_labels, &rows);
 }
@@ -616,7 +627,10 @@ fn extract_run_name(dir_name: &str) -> String {
     let candidate = &name_and_ts[..idx];
     let suffix = &name_and_ts[idx + 1..];
     let looks_like_ts = suffix.len() >= 8
-        && suffix.chars().take(8).all(|c| c.is_ascii_digit() || c == 'T');
+        && suffix
+            .chars()
+            .take(8)
+            .all(|c| c.is_ascii_digit() || c == 'T');
     if looks_like_ts {
         candidate.to_string()
     } else {
@@ -684,338 +698,6 @@ fn codex_sources(run_dir: &Path, is_full_mode: bool) -> Vec<(String, PathBuf)> {
     }
 }
 
-fn parse_codex_output_info(dir: &Path) -> CodexOutputInfo {
-    let path = dir.join("agent-output.txt");
-    let Ok(content) = fs::read_to_string(path) else {
-        return CodexOutputInfo::default();
-    };
-
-    let stripped = strip_ansi(&content);
-    let lines: Vec<&str> = stripped.lines().map(str::trim).collect();
-
-    let mut info = CodexOutputInfo::default();
-
-    for (idx, line) in lines.iter().enumerate() {
-        if let Some(model) = line.strip_prefix("model:") {
-            info.model = Some(model.trim().to_string());
-        }
-        if let Some(session_id) = line.strip_prefix("session id:") {
-            info.session_id = Some(session_id.trim().to_string());
-        }
-        if *line == "tokens used" {
-            info.total_tokens = parse_following_number(&lines, idx + 1);
-        }
-    }
-
-    info
-}
-
-fn parse_following_number(lines: &[&str], start_idx: usize) -> Option<u64> {
-    for line in lines.iter().skip(start_idx) {
-        let digits: String = line.chars().filter(|c| c.is_ascii_digit()).collect();
-        if !digits.is_empty() {
-            return digits.parse().ok();
-        }
-        if !line.is_empty() {
-            break;
-        }
-    }
-    None
-}
-
-fn load_codex_session(dir: &Path, session_id: Option<&str>) -> Option<CodexSessionData> {
-    let captured = dir.join("session.jsonl");
-    if captured.is_file() {
-        return parse_codex_rollout(&captured);
-    }
-
-    let session_id = session_id?;
-    let rollout = find_codex_rollout(session_id)?;
-    parse_codex_rollout(&rollout)
-}
-
-fn find_codex_rollout(session_id: &str) -> Option<PathBuf> {
-    let home = std::env::var("HOME").ok()?;
-    let sessions_root = PathBuf::from(home).join(".codex").join("sessions");
-    if !sessions_root.is_dir() {
-        return None;
-    }
-
-    if let Some(day_dir) = codex_day_dir(&sessions_root, session_id) {
-        if let Some(found) = find_rollout_in_dir(&day_dir, session_id) {
-            return Some(found);
-        }
-    }
-
-    find_rollout_recursive(&sessions_root, session_id, 3)
-}
-
-fn codex_day_dir(sessions_root: &Path, session_id: &str) -> Option<PathBuf> {
-    let unix_ms = uuid_v7_unix_ms(session_id)?;
-    let (year, month, day, _, _, _) = utc_from_epoch((unix_ms / 1000) as i64)?;
-    Some(
-        sessions_root
-            .join(format!("{year:04}"))
-            .join(format!("{month:02}"))
-            .join(format!("{day:02}")),
-    )
-}
-
-fn find_rollout_in_dir(dir: &Path, session_id: &str) -> Option<PathBuf> {
-    let suffix = format!("{session_id}.jsonl");
-    let entries = fs::read_dir(dir).ok()?;
-    for entry in entries.flatten() {
-        let path = entry.path();
-        if !path.is_file() {
-            continue;
-        }
-        let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
-            continue;
-        };
-        if name.starts_with("rollout-") && name.ends_with(&suffix) {
-            return Some(path);
-        }
-    }
-    None
-}
-
-fn find_rollout_recursive(dir: &Path, session_id: &str, remaining_depth: usize) -> Option<PathBuf> {
-    if let Some(found) = find_rollout_in_dir(dir, session_id) {
-        return Some(found);
-    }
-    if remaining_depth == 0 {
-        return None;
-    }
-
-    let entries = fs::read_dir(dir).ok()?;
-    for entry in entries.flatten() {
-        let path = entry.path();
-        if !path.is_dir() {
-            continue;
-        }
-        if let Some(found) = find_rollout_recursive(&path, session_id, remaining_depth - 1) {
-            return Some(found);
-        }
-    }
-    None
-}
-
-fn uuid_v7_unix_ms(session_id: &str) -> Option<u64> {
-    let compact: String = session_id.chars().filter(|c| *c != '-').collect();
-    if compact.len() != 32 {
-        return None;
-    }
-    if compact.chars().nth(12)? != '7' {
-        return None;
-    }
-    u64::from_str_radix(&compact[..12], 16).ok()
-}
-
-fn utc_from_epoch(epoch: i64) -> Option<(i64, i64, i64, i64, i64, i64)> {
-    if epoch < 0 {
-        return None;
-    }
-
-    let days = epoch / 86_400;
-    let secs_in_day = epoch % 86_400;
-
-    let mut year = 1970i64;
-    let mut remaining_days = days;
-    loop {
-        let year_days = if is_leap_year(year) { 366 } else { 365 };
-        if remaining_days < year_days {
-            break;
-        }
-        remaining_days -= year_days;
-        year += 1;
-    }
-
-    let month_days = [
-        31,
-        28 + if is_leap_year(year) { 1 } else { 0 },
-        31,
-        30,
-        31,
-        30,
-        31,
-        31,
-        30,
-        31,
-        30,
-        31,
-    ];
-
-    let mut month = 1i64;
-    for month_len in month_days {
-        if remaining_days < month_len {
-            break;
-        }
-        remaining_days -= month_len;
-        month += 1;
-    }
-
-    let day = remaining_days + 1;
-    let hour = secs_in_day / 3_600;
-    let minute = (secs_in_day % 3_600) / 60;
-    let second = secs_in_day % 60;
-
-    Some((year, month, day, hour, minute, second))
-}
-
-fn is_leap_year(year: i64) -> bool {
-    year % 4 == 0 && (year % 100 != 0 || year % 400 == 0)
-}
-
-fn parse_codex_rollout(path: &Path) -> Option<CodexSessionData> {
-    let content = fs::read_to_string(path).ok()?;
-    let mut usage = CodexUsage::default();
-    let mut model = None;
-    let mut found_usage = false;
-
-    for line in content.lines() {
-        let line = line.trim();
-        if line.is_empty() {
-            continue;
-        }
-
-        let obj: serde_json::Value = match serde_json::from_str(line) {
-            Ok(value) => value,
-            Err(_) => continue,
-        };
-
-        if model.is_none()
-            && obj.get("type").and_then(|value| value.as_str()) == Some("turn_context")
-        {
-            model = obj
-                .get("payload")
-                .and_then(|value| value.get("model"))
-                .and_then(|value| value.as_str())
-                .map(|value| value.to_string());
-        }
-
-        if obj.get("type").and_then(|value| value.as_str()) != Some("event_msg") {
-            continue;
-        }
-
-        let Some(payload) = obj.get("payload") else { continue };
-        if payload.get("type").and_then(|value| value.as_str()) != Some("token_count") {
-            continue;
-        }
-
-        let Some(totals) = payload
-            .get("info")
-            .and_then(|value| value.get("total_token_usage"))
-            .and_then(|value| value.as_object())
-        else {
-            continue;
-        };
-
-        update_codex_usage_from_totals(&mut usage, totals);
-        found_usage = true;
-    }
-
-    if found_usage {
-        Some(CodexSessionData { model, usage })
-    } else {
-        None
-    }
-}
-
-fn update_codex_usage_from_totals(usage: &mut CodexUsage, totals: &serde_json::Map<String, serde_json::Value>) {
-    let get = |key| totals.get(key).and_then(|v| v.as_u64()).unwrap_or(0);
-    usage.input_tokens = usage.input_tokens.max(get("input_tokens"));
-    usage.cached_input_tokens = usage.cached_input_tokens.max(get("cached_input_tokens"));
-    usage.output_tokens = usage.output_tokens.max(get("output_tokens"));
-}
-
-const GPT_54: CodexPricing = CodexPricing {
-    input_per_token: 2.50 / 1_000_000.0,
-    cached_input_per_token: 0.25 / 1_000_000.0,
-    output_per_token: 15.00 / 1_000_000.0,
-};
-const GPT_54_MINI: CodexPricing = CodexPricing {
-    input_per_token: 0.75 / 1_000_000.0,
-    cached_input_per_token: 0.075 / 1_000_000.0,
-    output_per_token: 4.50 / 1_000_000.0,
-};
-const GPT_54_NANO: CodexPricing = CodexPricing {
-    input_per_token: 0.20 / 1_000_000.0,
-    cached_input_per_token: 0.02 / 1_000_000.0,
-    output_per_token: 1.25 / 1_000_000.0,
-};
-const GPT_53_CODEX: CodexPricing = CodexPricing {
-    input_per_token: 1.75 / 1_000_000.0,
-    cached_input_per_token: 0.175 / 1_000_000.0,
-    output_per_token: 14.00 / 1_000_000.0,
-};
-const GPT_52: CodexPricing = CodexPricing {
-    input_per_token: 1.75 / 1_000_000.0,
-    cached_input_per_token: 0.175 / 1_000_000.0,
-    output_per_token: 14.00 / 1_000_000.0,
-};
-const GPT_51: CodexPricing = CodexPricing {
-    input_per_token: 1.25 / 1_000_000.0,
-    cached_input_per_token: 0.125 / 1_000_000.0,
-    output_per_token: 10.00 / 1_000_000.0,
-};
-const GPT_5_MINI: CodexPricing = CodexPricing {
-    input_per_token: 0.25 / 1_000_000.0,
-    cached_input_per_token: 0.025 / 1_000_000.0,
-    output_per_token: 2.00 / 1_000_000.0,
-};
-const CODEX_MINI_LATEST: CodexPricing = CodexPricing {
-    input_per_token: 1.50 / 1_000_000.0,
-    cached_input_per_token: 0.375 / 1_000_000.0,
-    output_per_token: 6.00 / 1_000_000.0,
-};
-
-fn codex_pricing(model: &str) -> Option<CodexPricing> {
-    let model = model.trim().to_ascii_lowercase();
-    resolve_codex_pricing(&model)
-}
-
-fn resolve_codex_pricing(model: &str) -> Option<CodexPricing> {
-    if model == "codex-mini-latest" || model.starts_with("codex-mini-latest-") {
-        return Some(CODEX_MINI_LATEST);
-    }
-    if model == "gpt-5.4" || model.starts_with("gpt-5.4-") {
-        return Some(resolve_gpt54_variant(model));
-    }
-    if model == "gpt-5.3-codex" || model.starts_with("gpt-5.3-codex-") {
-        return Some(GPT_53_CODEX);
-    }
-    if matches_any(model, &["gpt-5.2", "gpt-5.2-codex"], &["gpt-5.2-", "gpt-5.2-codex-"]) {
-        return Some(GPT_52);
-    }
-    if model == "gpt-5-codex-mini" || model.starts_with("gpt-5-codex-mini-") {
-        return None;
-    }
-    if matches_any(model, &["gpt-5.1-codex-mini", "gpt-5-mini"], &["gpt-5.1-codex-mini-", "gpt-5-mini-"]) {
-        return Some(GPT_5_MINI);
-    }
-    if matches_any(model,
-        &["gpt-5.1-codex-max", "gpt-5.1-codex", "gpt-5-codex", "gpt-5.1", "gpt-5"],
-        &["gpt-5.1-codex-max-", "gpt-5.1-codex-", "gpt-5-codex-", "gpt-5.1-", "gpt-5-"],
-    ) {
-        return Some(GPT_51);
-    }
-    None
-}
-
-fn resolve_gpt54_variant(model: &str) -> CodexPricing {
-    if model.starts_with("gpt-5.4-mini") {
-        GPT_54_MINI
-    } else if model.starts_with("gpt-5.4-nano") {
-        GPT_54_NANO
-    } else {
-        GPT_54
-    }
-}
-
-fn matches_any(model: &str, exact: &[&str], prefixes: &[&str]) -> bool {
-    exact.contains(&model) || prefixes.iter().any(|p| model.starts_with(p))
-}
-
 fn merge_model_label(current: &mut Option<String>, mixed: &mut bool, candidate: Option<&str>) {
     let Some(candidate) = candidate.filter(|value| !value.is_empty()) else {
         return;
@@ -1025,32 +707,6 @@ fn merge_model_label(current: &mut Option<String>, mixed: &mut bool, candidate: 
         Some(existing) if existing != candidate => *mixed = true,
         Some(_) => {}
         None => *current = Some(candidate.to_string()),
-    }
-}
-
-fn strip_ansi(input: &str) -> String {
-    let mut result = String::with_capacity(input.len());
-    let mut chars = input.chars().peekable();
-    while let Some(ch) = chars.next() {
-        if ch == '\x1b' {
-            skip_ansi_escape(&mut chars);
-        } else if ch != '\r' {
-            result.push(ch);
-        }
-    }
-    result
-}
-
-fn skip_ansi_escape(chars: &mut std::iter::Peekable<std::str::Chars<'_>>) {
-    if chars.peek() != Some(&'[') {
-        return;
-    }
-    chars.next();
-    while let Some(&next) = chars.peek() {
-        chars.next();
-        if next.is_ascii_alphabetic() {
-            break;
-        }
     }
 }
 

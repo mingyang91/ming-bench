@@ -143,6 +143,10 @@ cargo xtask run-agent --lang scala --strategy default --name scala-r1 --mode lev
 cargo xtask results                        # tabular summary of all runs
 cargo xtask tokens --all                   # per-level token usage and cost estimates
 cargo xtask analyze --all                  # request-level cost analysis
+cargo xtask session-stats results/<run>    # session summary from a run directory
+cargo xtask session-tools results/<run> --summary
+cargo xtask session-turns results/<run>
+cargo xtask session-dump results/<run> --text
 cargo xtask watch                          # live dashboard of running agents
 cargo xtask verify                         # ground-truth check against Guile
 ```
@@ -155,7 +159,7 @@ cargo xtask verify                         # ground-truth check against Guile
 2. Symlinks the selected strategy file as `bench/{lang}/CLAUDE.md`
 3. Pre-builds dependencies (warm cache)
 4. Launches the agent (Claude, Codex, or OpenCode)
-5. Captures session transcripts
+5. Captures the exact session transcript into `results/.../session.jsonl`
 6. Runs the benchmark scorer
 7. Records results with metadata (timing, tokens, scores)
 8. Commits checkpoints and pushes to origin
@@ -166,7 +170,12 @@ Each run is self-contained — unique worktree, UUID, results directory. Multipl
 
 ### Cost Analysis
 
-`cargo xtask analyze` goes beyond raw token counts. Session JSONL files contain multiple streaming rows per API request; the analyzer deduplicates by request ID and computes:
+`cargo xtask analyze` goes beyond raw token counts. It works directly on `results/<run>` for both Claude and Codex runs.
+
+- **Claude**: session JSONL contains multiple streaming rows per API request, so the analyzer deduplicates by request ID.
+- **Codex**: the rollout JSONL is analyzed as request-equivalent turns, using distinct `token_count` snapshots and per-snapshot token deltas.
+
+The analyzer computes:
 
 - **Billed request count** vs raw usage rows
 - **Stop reason distribution** (tool_use, end_turn, max_tokens)
@@ -175,6 +184,15 @@ Each run is self-contained — unique worktree, UUID, results directory. Multipl
 - **Anti-pattern detection** — flags fragmented runs, cache-read cost dominance, single-tool loops, heavy narration
 - **Side-by-side comparison** of two runs with percentage diffs
 
+The session inspection commands (`session-dump`, `session-stats`, `session-tools`, `session-turns`, `compare`, `analyze`) all accept a run directory directly:
+
+```bash
+cargo xtask session-stats results/default_cx-def-lvl12_20260321T091713
+cargo xtask session-tools results/default_cx-def-lvl12_20260321T091713 --summary
+cargo xtask session-turns results/default_cx-def-lvl12_20260321T091713
+cargo xtask analyze results/default_cx-def-lvl12_20260321T091713
+```
+
 ## Results Structure
 
 ```
@@ -182,15 +200,19 @@ results/
   default_scala-r1_20260321T120000/
     meta.json             # run metadata (strategy, agent, lang, mode, score, timing)
     agent-output.txt      # agent stdout
-    session.jsonl         # full session transcript
+    session.jsonl         # canonical full session transcript (Claude or Codex)
     bench.log             # scoring output
     L01/                  # per-level data (levels mode)
       agent-output.txt
-      session.jsonl
+      session.jsonl       # exact per-level transcript when captured
       status.txt          # "Level 01 PASSED (130s)"
     L02/
       ...
 ```
+
+New Codex runs are self-contained: `run-agent` copies the exact rollout JSONL into each results directory as `session.jsonl`.
+
+Older Codex runs may only have `agent-output.txt`. The session commands still work on those runs by extracting the real Codex session id from `agent-output.txt` and resolving the matching rollout under `~/.codex/sessions/...`.
 
 ## Quick Start
 

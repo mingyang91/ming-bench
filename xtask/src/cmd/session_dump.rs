@@ -22,7 +22,13 @@ pub fn run(
 
     // If no filter flags, show everything
     let show_all = !thinking && !text && !tools && !user;
-    let filter = DumpFilter { thinking, text, tools, user, show_all };
+    let filter = DumpFilter {
+        thinking,
+        text,
+        tools,
+        user,
+        show_all,
+    };
 
     for (label, path) in &files {
         if files.len() > 1 {
@@ -53,7 +59,10 @@ fn print_event(event: &session::SessionEvent, f: &DumpFilter) {
         EventKind::User { text: t } if f.show_all || f.user => {
             println!(
                 "\n{}[{:03} {ts}] USER ({} chars){}",
-                Color::CYAN, event.index, t.len(), Color::RESET
+                Color::CYAN,
+                event.index,
+                t.len(),
+                Color::RESET
             );
             print_indented(t, 200);
         }
@@ -70,28 +79,35 @@ fn print_assistant_blocks(blocks: &[ContentBlock], idx: usize, ts: &str, f: &Dum
             ContentBlock::Thinking(t) if f.show_all || f.thinking => {
                 println!(
                     "\n{}[{idx:03} {ts}] THINKING ({} chars){}",
-                    Color::DIM, t.len(), Color::RESET
+                    Color::DIM,
+                    t.len(),
+                    Color::RESET
                 );
                 print_indented(t, 500);
             }
             ContentBlock::Text(t) if f.show_all || f.text => {
                 println!(
                     "\n{}[{idx:03} {ts}] TEXT ({} chars){}",
-                    Color::GREEN, t.len(), Color::RESET
+                    Color::GREEN,
+                    t.len(),
+                    Color::RESET
                 );
                 print_indented(t, 300);
             }
             ContentBlock::ToolUse { name, input_json } if f.show_all || f.tools => {
                 println!(
                     "\n{}[{idx:03} {ts}] TOOL: {name}{}",
-                    Color::YELLOW, Color::RESET
+                    Color::YELLOW,
+                    Color::RESET
                 );
                 print_indented(input_json, 200);
             }
             ContentBlock::ToolResult { content } if f.show_all || f.tools => {
                 println!(
                     "{}[{idx:03} {ts}] TOOL_RESULT ({} chars){}",
-                    Color::DIM, content.len(), Color::RESET
+                    Color::DIM,
+                    content.len(),
+                    Color::RESET
                 );
                 print_indented(content, 150);
             }
@@ -104,7 +120,9 @@ fn filter_by_level(
     session_files: Vec<(String, PathBuf)>,
     level: Option<&str>,
 ) -> Vec<(String, PathBuf)> {
-    let Some(lvl) = level else { return session_files };
+    let Some(lvl) = level else {
+        return session_files;
+    };
     let target = if lvl.starts_with('L') {
         lvl.to_string()
     } else {

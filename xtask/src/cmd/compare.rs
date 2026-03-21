@@ -15,12 +15,21 @@ pub fn run(run1: PathBuf, run2: PathBuf) -> Result<()> {
 
     println!(
         "{}Comparing:{} {} ({}) vs {} ({})",
-        Color::BOLD, Color::RESET,
-        a.short_name, a.strategy,
-        b.short_name, b.strategy
+        Color::BOLD,
+        Color::RESET,
+        a.short_name,
+        a.strategy,
+        b.short_name,
+        b.strategy
     );
     println!();
-    println!("{}A = {}  B = {}{}", Color::DIM, a.short_name, b.short_name, Color::RESET);
+    println!(
+        "{}A = {}  B = {}{}",
+        Color::DIM,
+        a.short_name,
+        b.short_name,
+        Color::RESET
+    );
     println!();
 
     let level_labels = union_levels(&a, &b);
@@ -35,46 +44,12 @@ fn print_comparison_table(
     b: &RunAnalysis,
     level_labels: &[String],
 ) -> (Totals, Totals) {
-    println!(
-        "{}{:<5} {:>4} {:>4}  {:>6} {:>6}  {:>7} {:>7}  {:>3} {:>3}  {:>3} {:>3}{}",
-        Color::BOLD,
-        "LEVEL", "A", "B", "A", "B", "A", "B", "A", "B", "A", "B",
-        Color::RESET
-    );
-    println!(
-        "{}{:<5} {:>4} {:>4}  {:>6} {:>6}  {:>7} {:>7}  {:>3} {:>3}  {:>3} {:>3}{}",
-        Color::DIM,
-        "", "trn", "trn", "time", "time", "output", "output", "tst", "tst", "fri", "fri",
-        Color::RESET
-    );
+    print_comparison_header();
 
     let mut tot_a = Totals::default();
     let mut tot_b = Totals::default();
-
-    for label in level_labels {
-        let la = find_level(a, label);
-        let lb = find_level(b, label);
-        let (at, atime, aout, atest, afric) = fmt_level(la);
-        let (bt, btime, bout, btest, bfric) = fmt_level(lb);
-
-        println!(
-            "{label:<5} {at:>4} {bt:>4}  {atime:>6} {btime:>6}  {aout:>7} {bout:>7}  {atest:>3} {btest:>3}  {afric:>3} {bfric:>3}"
-        );
-
-        if let Some(l) = la { tot_a.add(l); }
-        if let Some(l) = lb { tot_b.add(l); }
-    }
-
-    println!(
-        "{}{:<5} {:>4} {:>4}  {:>6} {:>6}  {:>7} {:>7}  {:>3} {:>3}  {:>3} {:>3}{}",
-        Color::BOLD, "TOTAL",
-        tot_a.turns, tot_b.turns,
-        fmt_duration(tot_a.time), fmt_duration(tot_b.time),
-        model::fmt_tokens(tot_a.output), model::fmt_tokens(tot_b.output),
-        tot_a.tests, tot_b.tests,
-        tot_a.friction, tot_b.friction,
-        Color::RESET
-    );
+    print_level_rows(a, b, level_labels, &mut tot_a, &mut tot_b);
+    print_totals_row(&tot_a, &tot_b);
 
     (tot_a, tot_b)
 }
@@ -89,14 +64,19 @@ fn print_comparison_summary(
     println!();
     println!(
         "{}COST:{}  A ${:.2} ({})  vs  B ${:.2} ({})",
-        Color::BOLD, Color::RESET,
-        a.cost, model::fmt_tokens(a.total_tokens),
-        b.cost, model::fmt_tokens(b.total_tokens),
+        Color::BOLD,
+        Color::RESET,
+        a.cost,
+        model::fmt_tokens(a.total_tokens),
+        b.cost,
+        model::fmt_tokens(b.total_tokens),
     );
     println!(
         "Levels: A {}/{}  vs  B {}/{}",
-        a.levels.len(), level_labels.len(),
-        b.levels.len(), level_labels.len()
+        a.levels.len(),
+        level_labels.len(),
+        b.levels.len(),
+        level_labels.len()
     );
 }
 
@@ -135,13 +115,107 @@ fn fmt_level(level: Option<&LevelAnalysis>) -> (String, String, String, String, 
     match level {
         Some(l) => (
             l.turns.to_string(),
-            if l.time_secs > 0 { fmt_duration(l.time_secs) } else { "--".into() },
+            if l.time_secs > 0 {
+                fmt_duration(l.time_secs)
+            } else {
+                "--".into()
+            },
             fmt_comma(l.output_tokens),
             l.test_runs.to_string(),
             l.friction.to_string(),
         ),
-        None => ("--".into(), "--".into(), "--".into(), "--".into(), "--".into()),
+        None => (
+            "--".into(),
+            "--".into(),
+            "--".into(),
+            "--".into(),
+            "--".into(),
+        ),
     }
+}
+
+fn print_comparison_header() {
+    println!(
+        "{}{:<5} {:>4} {:>4}  {:>6} {:>6}  {:>7} {:>7}  {:>3} {:>3}  {:>3} {:>3}{}",
+        Color::BOLD,
+        "LEVEL",
+        "A",
+        "B",
+        "A",
+        "B",
+        "A",
+        "B",
+        "A",
+        "B",
+        "A",
+        "B",
+        Color::RESET
+    );
+    println!(
+        "{}{:<5} {:>4} {:>4}  {:>6} {:>6}  {:>7} {:>7}  {:>3} {:>3}  {:>3} {:>3}{}",
+        Color::DIM,
+        "",
+        "trn",
+        "trn",
+        "time",
+        "time",
+        "output",
+        "output",
+        "tst",
+        "tst",
+        "fri",
+        "fri",
+        Color::RESET
+    );
+}
+
+fn print_level_rows(
+    a: &RunAnalysis,
+    b: &RunAnalysis,
+    level_labels: &[String],
+    tot_a: &mut Totals,
+    tot_b: &mut Totals,
+) {
+    for label in level_labels {
+        let la = find_level(a, label);
+        let lb = find_level(b, label);
+        print_level_row(label, la, lb);
+        add_level_totals(tot_a, la);
+        add_level_totals(tot_b, lb);
+    }
+}
+
+fn print_level_row(label: &str, la: Option<&LevelAnalysis>, lb: Option<&LevelAnalysis>) {
+    let (at, atime, aout, atest, afric) = fmt_level(la);
+    let (bt, btime, bout, btest, bfric) = fmt_level(lb);
+    println!(
+        "{label:<5} {at:>4} {bt:>4}  {atime:>6} {btime:>6}  {aout:>7} {bout:>7}  {atest:>3} {btest:>3}  {afric:>3} {bfric:>3}"
+    );
+}
+
+fn add_level_totals(totals: &mut Totals, level: Option<&LevelAnalysis>) {
+    if let Some(level) = level {
+        totals.add(level);
+    }
+}
+
+fn print_totals_row(tot_a: &Totals, tot_b: &Totals) {
+    println!(
+        "{}{:<5} {:>4} {:>4}  {:>6} {:>6}  {:>7} {:>7}  {:>3} {:>3}  {:>3} {:>3}{}",
+        Color::BOLD,
+        "TOTAL",
+        tot_a.turns,
+        tot_b.turns,
+        fmt_duration(tot_a.time),
+        fmt_duration(tot_b.time),
+        model::fmt_tokens(tot_a.output),
+        model::fmt_tokens(tot_b.output),
+        tot_a.tests,
+        tot_b.tests,
+        tot_a.friction,
+        tot_b.friction,
+        Color::RESET
+    );
 }
 
 #[derive(Default)]

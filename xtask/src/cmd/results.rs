@@ -51,9 +51,7 @@ fn print_table(runs: &[(std::path::PathBuf, model::MetaJson)]) {
             .map(fmt_duration)
             .unwrap_or_else(|| "?".to_string());
 
-        println!(
-            "{run_name:<40} {lang:<6} {base:<10} {agent:<8} {score:<10} {duration:<8} {mode}"
-        );
+        println!("{run_name:<40} {lang:<6} {base:<10} {agent:<8} {score:<10} {duration:<8} {mode}");
     }
 }
 
@@ -103,6 +101,10 @@ fn bench_log_score(run_dir: &std::path::Path) -> Option<String> {
             .chars()
             .take_while(|c| c.is_ascii_digit() || *c == '/')
             .collect();
-        if score.is_empty() { None } else { Some(score) }
+        if score.is_empty() {
+            None
+        } else {
+            Some(score)
+        }
     })
 }

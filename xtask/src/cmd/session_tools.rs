@@ -30,21 +30,28 @@ pub fn run(run_arg: PathBuf, summary: bool, level: Option<String>) -> Result<()>
     // Collect all tool calls
     let mut tool_calls: Vec<ToolCall> = Vec::new();
     let mut tool_counts: HashMap<String, u64> = HashMap::new();
-    let mut bash_subcmds: HashMap<String, u64> = HashMap::new();
+    let mut shell_subcmds: HashMap<String, u64> = HashMap::new();
     let mut tool_first_last: HashMap<String, (String, String)> = HashMap::new();
 
     let all_events = parse_all_events(&files)?;
     for event in &all_events {
-        let EventKind::Assistant { blocks } = &event.kind else { continue };
+        let EventKind::Assistant { blocks } = &event.kind else {
+            continue;
+        };
         let ts = short_time(event.timestamp.as_deref());
         collect_tool_calls(
-            blocks, event.index, &ts,
-            &mut tool_calls, &mut tool_counts, &mut tool_first_last, &mut bash_subcmds,
+            blocks,
+            event.index,
+            &ts,
+            &mut tool_calls,
+            &mut tool_counts,
+            &mut tool_first_last,
+            &mut shell_subcmds,
         );
     }
 
     if summary {
-        print_summary(&tool_counts, &tool_first_last, &bash_subcmds);
+        print_summary(&tool_counts, &tool_first_last, &shell_subcmds);
     } else {
         print_timeline(&tool_calls);
 
@@ -65,9 +72,7 @@ pub fn run(run_arg: PathBuf, summary: bool, level: Option<String>) -> Result<()>
     Ok(())
 }
 
-fn parse_all_events(
-    files: &[(String, std::path::PathBuf)],
-) -> Result<Vec<session::SessionEvent>> {
+fn parse_all_events(files: &[(String, std::path::PathBuf)]) -> Result<Vec<session::SessionEvent>> {
     let mut all = Vec::new();
     for (_, path) in files {
         all.extend(session::parse_session(path)?);
@@ -82,10 +87,12 @@ fn collect_tool_calls(
     tool_calls: &mut Vec<ToolCall>,
     tool_counts: &mut HashMap<String, u64>,
     tool_first_last: &mut HashMap<String, (String, String)>,
-    bash_subcmds: &mut HashMap<String, u64>,
+    shell_subcmds: &mut HashMap<String, u64>,
 ) {
     for block in blocks {
-        let ContentBlock::ToolUse { name, input_json } = block else { continue };
+        let ContentBlock::ToolUse { name, input_json } = block else {
+            continue;
+        };
         let input_summary = summarize_input(name, input_json);
         tool_calls.push(ToolCall {
             index: event_idx,
@@ -101,10 +108,9 @@ fn collect_tool_calls(
             .and_modify(|(_, last)| *last = ts.to_string())
             .or_insert((ts.to_string(), ts.to_string()));
 
-        if name == "Bash" {
-            let cmd = extract_bash_cmd(input_json);
-            let key = classify_bash(&cmd);
-            *bash_subcmds.entry(key).or_default() += 1;
+        if let Some(cmd) = session::shell_command(name, input_json) {
+            let key = classify_shell_command(&cmd);
+            *shell_subcmds.entry(key).or_default() += 1;
         }
     }
 }
@@ -119,7 +125,11 @@ struct ToolCall {
 fn print_timeline(calls: &[ToolCall]) {
     println!(
         "{}{:<5} {:<10} {:<10} INPUT{}",
-        Color::BOLD, "#", "TIME", "TOOL", Color::RESET
+        Color::BOLD,
+        "#",
+        "TIME",
+        "TOOL",
+        Color::RESET
     );
     for call in calls {
         println!(
@@ -132,11 +142,16 @@ fn print_timeline(calls: &[ToolCall]) {
 fn print_summary(
     tool_counts: &HashMap<String, u64>,
     first_last: &HashMap<String, (String, String)>,
-    bash_subcmds: &HashMap<String, u64>,
+    shell_subcmds: &HashMap<String, u64>,
 ) {
     println!(
         "{}{:<14} {:>5}   {:<10} {:<10}{}",
-        Color::BOLD, "TOOL", "COUNT", "FIRST", "LAST", Color::RESET
+        Color::BOLD,
+        "TOOL",
+        "COUNT",
+        "FIRST",
+        "LAST",
+        Color::RESET
     );
 
     let mut sorted: Vec<_> = tool_counts.iter().collect();
@@ -150,12 +165,12 @@ fn print_summary(
         println!("{name:<14} {count:>5}   {first:<10} {last:<10}");
     }
 
-    if !bash_subcmds.is_empty() {
+    if !shell_subcmds.is_empty() {
         println!();
-        println!("{}BASH BREAKDOWN:{}",Color::BOLD, Color::RESET);
-        let mut sorted_bash: Vec<_> = bash_subcmds.iter().collect();
-        sorted_bash.sort_by(|a, b| b.1.cmp(a.1));
-        for (cmd, count) in sorted_bash {
+        println!("{}SHELL BREAKDOWN:{}", Color::BOLD, Color::RESET);
+        let mut sorted_shell: Vec<_> = shell_subcmds.iter().collect();
+        sorted_shell.sort_by(|a, b| b.1.cmp(a.1));
+        for (cmd, count) in sorted_shell {
             println!("  {cmd:<30} {count:>3}");
         }
     }
@@ -201,10 +216,8 @@ fn summarize_input(tool_name: &str, input_json: &str) -> String {
                 .unwrap_or_default();
             path
         }
-        "Bash" => v
-            .get("command")
-            .and_then(|c| c.as_str())
-            .map(|s| truncate(s, 60))
+        "Bash" | "exec_command" => session::shell_command(tool_name, input_json)
+            .map(|cmd| truncate(&cmd, 60))
             .unwrap_or_default(),
         "Grep" => {
             let pattern = v.get("pattern").and_then(|p| p.as_str()).unwrap_or("?");
@@ -239,14 +252,7 @@ fn truncate(s: &str, max: usize) -> String {
     }
 }
 
-fn extract_bash_cmd(input_json: &str) -> String {
-    serde_json::from_str::<serde_json::Value>(input_json)
-        .ok()
-        .and_then(|v| v.get("command").and_then(|c| c.as_str()).map(String::from))
-        .unwrap_or_default()
-}
-
-fn classify_bash(cmd: &str) -> String {
+fn classify_shell_command(cmd: &str) -> String {
     let effective = strip_cd_prefix(cmd);
     let trimmed = effective.trim();
     if trimmed.starts_with("cargo xtask test") {
@@ -275,4 +281,27 @@ fn strip_cd_prefix(cmd: &str) -> &str {
         }
     }
     trimmed
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn summarizes_codex_exec_command_input() {
+        let summary = summarize_input("exec_command", r#"{"cmd":"cargo xtask test 01"}"#);
+        assert_eq!(summary, "cargo xtask test 01");
+    }
+
+    #[test]
+    fn classifies_codex_shell_command_like_bash() {
+        assert_eq!(
+            classify_shell_command("cargo xtask test 01"),
+            "cargo xtask test"
+        );
+        assert_eq!(
+            classify_shell_command("cd /tmp && cargo build"),
+            "cargo build"
+        );
+    }
 }
