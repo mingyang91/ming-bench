@@ -18,6 +18,7 @@ pub enum Value {
         closure: Env,
     },
     Builtin(String),
+    Continuation { id: u64, expr_index: usize },
     Void,
 }
 
@@ -31,6 +32,10 @@ impl PartialEq for Value {
             (Value::Char(a), Value::Char(b)) => a == b,
             (Value::List(a), Value::List(b)) => a == b,
             (Value::Builtin(a), Value::Builtin(b)) => a == b,
+            (
+                Value::Continuation { id: a, .. },
+                Value::Continuation { id: b, .. },
+            ) => a == b,
             (Value::Void, Value::Void) => true,
             _ => false,
         }
@@ -47,7 +52,9 @@ impl fmt::Display for Value {
             Value::Char(c) => write!(f, "#\\{c}"),
             Value::Symbol(s) => write!(f, "{s}"),
             Value::List(items) => fmt_list(f, items),
-            Value::Lambda { .. } | Value::Builtin(_) => write!(f, "#<procedure>"),
+            Value::Lambda { .. } | Value::Builtin(_) | Value::Continuation { .. } => {
+                write!(f, "#<procedure>")
+            }
             Value::Void => write!(f, ""),
         }
     }
@@ -73,6 +80,7 @@ impl Value {
             Value::String(s) => buf.push_str(s),
             Value::Char(c) => buf.push(*c),
             Value::List(items) => Self::display_list(items, buf),
+            Value::Continuation { .. } => buf.push_str("#<procedure>"),
             other => buf.push_str(&other.to_string()),
         }
     }

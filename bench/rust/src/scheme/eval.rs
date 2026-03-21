@@ -38,7 +38,11 @@ fn resolve_symbol(name: &str, span: Span, env: &Env) -> Result<Value, EvalError>
     if let Some(val) = env.get(name) {
         return Ok(val);
     }
-    if is_builtin(name) || name == "apply" {
+    if is_builtin(name)
+        || name == "apply"
+        || name == "call/cc"
+        || name == "call-with-current-continuation"
+    {
         return Ok(Value::Builtin(name.to_string()));
     }
     Err(EvalError::UnboundVariable { name: name.to_string() }.at(span))
@@ -64,8 +68,11 @@ fn eval_list(elems: &[Expr], span: Span, env: &Env) -> Result<Bounce, EvalError>
         return Err(EvalError::Parse("empty list".into()).at(span));
     };
 
-    // Check for special forms
+    // Check for call/cc before special forms
     if let Expr::Symbol(ref op, _) = operator {
+        if op == "call/cc" || op == "call-with-current-continuation" {
+            return eval_callcc(args, span, env).map(Bounce::Done);
+        }
         if let Some(bounce) = eval_special_form(op, args, span, env)? {
             return Ok(bounce);
         }
@@ -273,12 +280,32 @@ fn eval_application(
         Value::Builtin(ref name) if name == "apply" => {
             let arg_vals: Vec<Value> =
                 args.iter().map(|a| eval(a, env)).collect::<Result<_, _>>()?;
-            eval_apply(&arg_vals, span)
+            eval_apply(&arg_vals, span, env)
+        }
+        Value::Builtin(ref name)
+            if name == "call/cc" || name == "call-with-current-continuation" =>
+        {
+            eval_callcc(args, span, env).map(Bounce::Done)
         }
         Value::Builtin(ref name) => {
             let arg_vals: Vec<Value> =
                 args.iter().map(|a| eval(a, env)).collect::<Result<_, _>>()?;
             apply_builtin_values(name, &arg_vals).map(Bounce::Done).map_err(|e| e.at(span))
+        }
+        Value::Continuation { id, expr_index } => {
+            let [ref arg_expr] = args else {
+                return Err(EvalError::WrongArgCount {
+                    expected: 1,
+                    got: args.len(),
+                }
+                .at(span));
+            };
+            let value = eval(arg_expr, env)?;
+            Err(EvalError::ContinuationReturn {
+                cont_id: id,
+                value: Box::new(value),
+                expr_index,
+            })
         }
         _ => Err(EvalError::TypeError {
             expected: "procedure".into(),
@@ -331,7 +358,7 @@ fn apply_lambda_values(
 }
 
 /// Implement (apply proc arg1 ... args-list).
-fn eval_apply(args: &[Value], span: Span) -> Result<Bounce, EvalError> {
+fn eval_apply(args: &[Value], span: Span, env: &Env) -> Result<Bounce, EvalError> {
     if args.len() < 2 {
         return Err(EvalError::WrongArgCount {
             expected: 2,
@@ -352,7 +379,34 @@ fn eval_apply(args: &[Value], span: Span) -> Result<Bounce, EvalError> {
 
     match proc {
         Value::Lambda { .. } => apply_lambda_values(proc.clone(), &combined, span),
-        Value::Builtin(ref name) if name == "apply" => eval_apply(&combined, span),
+        Value::Builtin(ref name) if name == "apply" => eval_apply(&combined, span, env),
+        Value::Builtin(ref name)
+            if name == "call/cc" || name == "call-with-current-continuation" =>
+        {
+            if combined.len() != 1 {
+                return Err(EvalError::WrongArgCount {
+                    expected: 1,
+                    got: combined.len(),
+                }
+                .at(span));
+            }
+            eval_callcc_with_proc(combined.into_iter().next().expect("len checked"), span, env)
+                .map(Bounce::Done)
+        }
+        Value::Continuation { id, expr_index } => {
+            if combined.len() != 1 {
+                return Err(EvalError::WrongArgCount {
+                    expected: 1,
+                    got: combined.len(),
+                }
+                .at(span));
+            }
+            Err(EvalError::ContinuationReturn {
+                cont_id: *id,
+                value: Box::new(combined.into_iter().next().expect("len checked")),
+                expr_index: *expr_index,
+            })
+        }
         Value::Builtin(ref name) => {
             apply_builtin_values(name, &combined).map(Bounce::Done).map_err(|e| e.at(span))
         }
@@ -361,6 +415,50 @@ fn eval_apply(args: &[Value], span: Span) -> Result<Bounce, EvalError> {
             got: format!("{proc}"),
         }
         .at(span)),
+    }
+}
+
+fn eval_callcc(args: &[Expr], span: Span, env: &Env) -> Result<Value, EvalError> {
+    let [ref proc_expr] = args else {
+        return Err(EvalError::WrongArgCount {
+            expected: 1,
+            got: args.len(),
+        }
+        .at(span));
+    };
+    let proc = eval(proc_expr, env)?;
+    eval_callcc_with_proc(proc, span, env)
+}
+
+fn eval_callcc_with_proc(proc: Value, span: Span, env: &Env) -> Result<Value, EvalError> {
+    let id = env.next_callcc_id();
+
+    if let Some(value) = env.take_pending_cont(id) {
+        return Ok(value);
+    }
+
+    let expr_index = env.current_expr_index();
+    let cont = Value::Continuation { id, expr_index };
+
+    let result = if matches!(proc, Value::Lambda { .. }) {
+        match apply_lambda_values(proc, &[cont], span) {
+            Ok(Bounce::Done(val)) => Ok(val),
+            Ok(Bounce::Tco(expr, tco_env)) => eval(&expr, &tco_env),
+            Err(e) => Err(e),
+        }
+    } else {
+        Err(EvalError::TypeError {
+            expected: "procedure".into(),
+            got: format!("{proc}"),
+        }
+        .at(span))
+    };
+
+    match result {
+        Err(EvalError::ContinuationReturn {
+            cont_id, value, ..
+        }) if cont_id == id => Ok(*value),
+        other => other,
     }
 }
 
