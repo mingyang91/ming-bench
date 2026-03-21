@@ -82,7 +82,12 @@ impl Value {
                 }
             }
             Value::Symbol(s) => s.clone(),
-            Value::Char(c) => format!("#\\{}", c),
+            Value::Char(c) => match c {
+                ' ' => "#\\space".to_string(),
+                '\n' => "#\\newline".to_string(),
+                '\t' => "#\\tab".to_string(),
+                _ => format!("#\\{}", c),
+            },
             Value::Nil => "()".to_string(),
             Value::Pair(_, _) => {
                 let mut out = String::from("(");
@@ -131,6 +136,14 @@ impl Value {
                 | "string->number" | "number->string" | "symbol->string" | "string->symbol"
                 | "string-copy" | "string-ref" | "string-set!"
                 | "apply" | "call/cc"
+                | "abs" | "modulo" | "remainder" | "quotient" | "min" | "max" | "expt"
+                | "zero?" | "positive?" | "negative?" | "odd?" | "even?"
+                | "list-ref" | "list-tail" | "list?" | "assoc" | "map"
+                | "eq?" | "equal?"
+                | "char-alphabetic?" | "char-numeric?" | "char-upcase" | "char-downcase"
+                | "char=?" | "char<?"
+                | "string=?" | "string<?" | "string-ci=?"
+                | "string-upcase" | "string-downcase"
         )
     }
 
@@ -412,11 +425,60 @@ impl Parser {
             }
             Some('\\') => {
                 self.next_char(); // consume '\'
+                // Try to read a named character literal
+                let char_start = self.pos;
+                // Read first char
                 match self.next_char() {
-                    Some(c) => Ok(Expr {
-                        kind: ExprKind::Char(c),
-                        pos: start,
-                    }),
+                    Some(c) => {
+                        // Check if it's a letter that could start a name
+                        if c.is_alphabetic() {
+                            // Try to read more letters
+                            let mut name = String::new();
+                            name.push(c);
+                            while self.pos < self.chars.len() {
+                                let next = self.chars[self.pos];
+                                if next.is_alphabetic() {
+                                    name.push(next);
+                                    self.advance();
+                                } else {
+                                    break;
+                                }
+                            }
+                            if name.len() == 1 {
+                                // Single character like #\a
+                                Ok(Expr {
+                                    kind: ExprKind::Char(c),
+                                    pos: start,
+                                })
+                            } else {
+                                // Named character
+                                match name.as_str() {
+                                    "space" => Ok(Expr {
+                                        kind: ExprKind::Char(' '),
+                                        pos: start,
+                                    }),
+                                    "newline" => Ok(Expr {
+                                        kind: ExprKind::Char('\n'),
+                                        pos: start,
+                                    }),
+                                    "tab" => Ok(Expr {
+                                        kind: ExprKind::Char('\t'),
+                                        pos: start,
+                                    }),
+                                    _ => Err(EvalError::Parse(format!(
+                                        "unknown character name '{}' at {}",
+                                        name,
+                                        start.fmt()
+                                    ))),
+                                }
+                            }
+                        } else {
+                            Ok(Expr {
+                                kind: ExprKind::Char(c),
+                                pos: start,
+                            })
+                        }
+                    }
                     None => Err(EvalError::Parse(format!(
                         "unterminated character literal at {}",
                         start.fmt()
@@ -1342,6 +1404,30 @@ fn eval_string_set(args: &[Expr], pos: Pos, env: &Env, out: &mut String) -> Resu
     }
 }
 
+fn values_eq(a: &Value, b: &Value) -> bool {
+    match (a, b) {
+        (Value::Integer(x), Value::Integer(y)) => x == y,
+        (Value::Boolean(x), Value::Boolean(y)) => x == y,
+        (Value::Symbol(x), Value::Symbol(y)) => x == y,
+        (Value::Char(x), Value::Char(y)) => x == y,
+        (Value::Nil, Value::Nil) => true,
+        _ => false,
+    }
+}
+
+fn values_equal(a: &Value, b: &Value) -> bool {
+    match (a, b) {
+        (Value::Integer(x), Value::Integer(y)) => x == y,
+        (Value::Boolean(x), Value::Boolean(y)) => x == y,
+        (Value::Str(x), Value::Str(y)) => x == y,
+        (Value::Symbol(x), Value::Symbol(y)) => x == y,
+        (Value::Char(x), Value::Char(y)) => x == y,
+        (Value::Nil, Value::Nil) => true,
+        (Value::Pair(a1, a2), Value::Pair(b1, b2)) => values_equal(a1, b1) && values_equal(a2, b2),
+        _ => false,
+    }
+}
+
 fn apply_builtin(op: &str, args: &[Value], pos: Pos, out: &mut String) -> Result<Option<Value>, EvalError> {
     match op {
         "+" => {
@@ -1704,6 +1790,357 @@ fn apply_builtin(op: &str, args: &[Value], pos: Pos, out: &mut String) -> Result
             let idx = args[1].as_integer(pos)? as usize;
             let chars: Vec<char> = s.chars().collect();
             Ok(Some(Value::Char(chars[idx])))
+        }
+        "abs" => {
+            if args.len() != 1 {
+                return Err(EvalError::Arity(format!("abs requires 1 argument at {}", pos.fmt())));
+            }
+            Ok(Some(Value::Integer(args[0].as_integer(pos)?.abs())))
+        }
+        "modulo" => {
+            if args.len() != 2 {
+                return Err(EvalError::Arity(format!("modulo requires 2 arguments at {}", pos.fmt())));
+            }
+            let a = args[0].as_integer(pos)?;
+            let b = args[1].as_integer(pos)?;
+            if b == 0 {
+                return Err(EvalError::DivisionByZero(format!("at {}", pos.fmt())));
+            }
+            Ok(Some(Value::Integer(((a % b) + b) % b)))
+        }
+        "remainder" => {
+            if args.len() != 2 {
+                return Err(EvalError::Arity(format!("remainder requires 2 arguments at {}", pos.fmt())));
+            }
+            let a = args[0].as_integer(pos)?;
+            let b = args[1].as_integer(pos)?;
+            if b == 0 {
+                return Err(EvalError::DivisionByZero(format!("at {}", pos.fmt())));
+            }
+            Ok(Some(Value::Integer(a % b)))
+        }
+        "quotient" => {
+            if args.len() != 2 {
+                return Err(EvalError::Arity(format!("quotient requires 2 arguments at {}", pos.fmt())));
+            }
+            let a = args[0].as_integer(pos)?;
+            let b = args[1].as_integer(pos)?;
+            if b == 0 {
+                return Err(EvalError::DivisionByZero(format!("at {}", pos.fmt())));
+            }
+            Ok(Some(Value::Integer(a / b)))
+        }
+        "min" => {
+            if args.is_empty() {
+                return Err(EvalError::Arity(format!("min requires at least 1 argument at {}", pos.fmt())));
+            }
+            let mut result = args[0].as_integer(pos)?;
+            for a in &args[1..] {
+                let v = a.as_integer(pos)?;
+                if v < result { result = v; }
+            }
+            Ok(Some(Value::Integer(result)))
+        }
+        "max" => {
+            if args.is_empty() {
+                return Err(EvalError::Arity(format!("max requires at least 1 argument at {}", pos.fmt())));
+            }
+            let mut result = args[0].as_integer(pos)?;
+            for a in &args[1..] {
+                let v = a.as_integer(pos)?;
+                if v > result { result = v; }
+            }
+            Ok(Some(Value::Integer(result)))
+        }
+        "expt" => {
+            if args.len() != 2 {
+                return Err(EvalError::Arity(format!("expt requires 2 arguments at {}", pos.fmt())));
+            }
+            let base = args[0].as_integer(pos)?;
+            let exp = args[1].as_integer(pos)?;
+            if exp < 0 {
+                Ok(Some(Value::Integer(0)))
+            } else {
+                Ok(Some(Value::Integer(base.pow(exp as u32))))
+            }
+        }
+        "zero?" => {
+            if args.len() != 1 {
+                return Err(EvalError::Arity(format!("zero? requires 1 argument at {}", pos.fmt())));
+            }
+            Ok(Some(Value::Boolean(args[0].as_integer(pos)? == 0)))
+        }
+        "positive?" => {
+            if args.len() != 1 {
+                return Err(EvalError::Arity(format!("positive? requires 1 argument at {}", pos.fmt())));
+            }
+            Ok(Some(Value::Boolean(args[0].as_integer(pos)? > 0)))
+        }
+        "negative?" => {
+            if args.len() != 1 {
+                return Err(EvalError::Arity(format!("negative? requires 1 argument at {}", pos.fmt())));
+            }
+            Ok(Some(Value::Boolean(args[0].as_integer(pos)? < 0)))
+        }
+        "odd?" => {
+            if args.len() != 1 {
+                return Err(EvalError::Arity(format!("odd? requires 1 argument at {}", pos.fmt())));
+            }
+            Ok(Some(Value::Boolean(args[0].as_integer(pos)? % 2 != 0)))
+        }
+        "even?" => {
+            if args.len() != 1 {
+                return Err(EvalError::Arity(format!("even? requires 1 argument at {}", pos.fmt())));
+            }
+            Ok(Some(Value::Boolean(args[0].as_integer(pos)? % 2 == 0)))
+        }
+        "list-ref" => {
+            if args.len() != 2 {
+                return Err(EvalError::Arity(format!("list-ref requires 2 arguments at {}", pos.fmt())));
+            }
+            let idx = args[1].as_integer(pos)? as usize;
+            let mut cur = &args[0];
+            for _ in 0..idx {
+                match cur {
+                    Value::Pair(_, cdr) => cur = cdr,
+                    _ => return Err(EvalError::Type(format!("list-ref: index out of range at {}", pos.fmt()))),
+                }
+            }
+            match cur {
+                Value::Pair(car, _) => Ok(Some(*car.clone())),
+                _ => Err(EvalError::Type(format!("list-ref: index out of range at {}", pos.fmt()))),
+            }
+        }
+        "list-tail" => {
+            if args.len() != 2 {
+                return Err(EvalError::Arity(format!("list-tail requires 2 arguments at {}", pos.fmt())));
+            }
+            let idx = args[1].as_integer(pos)? as usize;
+            let mut cur = args[0].clone();
+            for _ in 0..idx {
+                match cur {
+                    Value::Pair(_, cdr) => cur = *cdr,
+                    _ => return Err(EvalError::Type(format!("list-tail: index out of range at {}", pos.fmt()))),
+                }
+            }
+            Ok(Some(cur))
+        }
+        "list?" => {
+            if args.len() != 1 {
+                return Err(EvalError::Arity(format!("list? requires 1 argument at {}", pos.fmt())));
+            }
+            let mut cur = &args[0];
+            let result = loop {
+                match cur {
+                    Value::Nil => break true,
+                    Value::Pair(_, cdr) => cur = cdr,
+                    _ => break false,
+                }
+            };
+            Ok(Some(Value::Boolean(result)))
+        }
+        "eq?" => {
+            if args.len() != 2 {
+                return Err(EvalError::Arity(format!("eq? requires 2 arguments at {}", pos.fmt())));
+            }
+            Ok(Some(Value::Boolean(values_eq(&args[0], &args[1]))))
+        }
+        "equal?" => {
+            if args.len() != 2 {
+                return Err(EvalError::Arity(format!("equal? requires 2 arguments at {}", pos.fmt())));
+            }
+            Ok(Some(Value::Boolean(values_equal(&args[0], &args[1]))))
+        }
+        "assoc" => {
+            if args.len() != 2 {
+                return Err(EvalError::Arity(format!("assoc requires 2 arguments at {}", pos.fmt())));
+            }
+            let key = &args[0];
+            let mut cur = &args[1];
+            loop {
+                match cur {
+                    Value::Nil => return Ok(Some(Value::Boolean(false))),
+                    Value::Pair(car, cdr) => {
+                        if let Value::Pair(ref entry_key, _) = **car {
+                            if values_equal(key, entry_key) {
+                                return Ok(Some(*car.clone()));
+                            }
+                        }
+                        cur = cdr;
+                    }
+                    _ => return Err(EvalError::Type(format!("assoc: not a proper list at {}", pos.fmt()))),
+                }
+            }
+        }
+        "map" => {
+            if args.len() < 2 {
+                return Err(EvalError::Arity(format!("map requires at least 2 arguments at {}", pos.fmt())));
+            }
+            let func = &args[0];
+            let num_lists = args.len() - 1;
+            let mut lists: Vec<&Value> = args[1..].iter().collect();
+            let mut result_items = Vec::new();
+            loop {
+                // Check if any list is nil (done)
+                let mut all_nil = false;
+                for l in &lists {
+                    if matches!(l, Value::Nil) {
+                        all_nil = true;
+                        break;
+                    }
+                }
+                if all_nil { break; }
+                // Extract car of each list
+                let mut call_args = Vec::new();
+                let mut new_lists: Vec<&Value> = Vec::new();
+                for l in &lists {
+                    match l {
+                        Value::Pair(car, cdr) => {
+                            call_args.push(*car.clone());
+                            new_lists.push(cdr);
+                        }
+                        _ => return Err(EvalError::Type(format!("map: not a proper list at {}", pos.fmt()))),
+                    }
+                }
+                // Apply function
+                let val = match func {
+                    Value::Builtin(bname) => {
+                        match apply_builtin(bname, &call_args, pos, out)? {
+                            Some(v) => v,
+                            None => return Err(EvalError::Type(format!("unknown builtin {} at {}", bname, pos.fmt()))),
+                        }
+                    }
+                    Value::Lambda { params, rest_param, body, env: closure_env } => {
+                        let new_env = Env::with_parent(closure_env);
+                        if let Some(ref rp) = rest_param {
+                            for (p, a) in params.iter().zip(call_args.iter()) {
+                                new_env.set(p.clone(), a.clone());
+                            }
+                            let mut rest = Value::Nil;
+                            for a in call_args[params.len()..].iter().rev() {
+                                rest = Value::Pair(Box::new(a.clone()), Box::new(rest));
+                            }
+                            new_env.set(rp.clone(), rest);
+                        } else {
+                            for (p, a) in params.iter().zip(call_args.into_iter()) {
+                                new_env.set(p.clone(), a);
+                            }
+                        }
+                        let mut v = Value::Nil;
+                        for e in body.iter() {
+                            v = eval(e, &new_env, out)?;
+                        }
+                        v
+                    }
+                    _ => return Err(EvalError::Type(format!("map: first argument must be a procedure at {}", pos.fmt()))),
+                };
+                result_items.push(val);
+                lists = new_lists;
+            }
+            let mut result = Value::Nil;
+            for item in result_items.into_iter().rev() {
+                result = Value::Pair(Box::new(item), Box::new(result));
+            }
+            Ok(Some(result))
+        }
+        "char-alphabetic?" => {
+            if args.len() != 1 {
+                return Err(EvalError::Arity(format!("char-alphabetic? requires 1 argument at {}", pos.fmt())));
+            }
+            match &args[0] {
+                Value::Char(c) => Ok(Some(Value::Boolean(c.is_alphabetic()))),
+                _ => Err(EvalError::Type(format!("char-alphabetic?: expected char at {}", pos.fmt()))),
+            }
+        }
+        "char-numeric?" => {
+            if args.len() != 1 {
+                return Err(EvalError::Arity(format!("char-numeric? requires 1 argument at {}", pos.fmt())));
+            }
+            match &args[0] {
+                Value::Char(c) => Ok(Some(Value::Boolean(c.is_ascii_digit()))),
+                _ => Err(EvalError::Type(format!("char-numeric?: expected char at {}", pos.fmt()))),
+            }
+        }
+        "char-upcase" => {
+            if args.len() != 1 {
+                return Err(EvalError::Arity(format!("char-upcase requires 1 argument at {}", pos.fmt())));
+            }
+            match &args[0] {
+                Value::Char(c) => Ok(Some(Value::Char(c.to_ascii_uppercase()))),
+                _ => Err(EvalError::Type(format!("char-upcase: expected char at {}", pos.fmt()))),
+            }
+        }
+        "char-downcase" => {
+            if args.len() != 1 {
+                return Err(EvalError::Arity(format!("char-downcase requires 1 argument at {}", pos.fmt())));
+            }
+            match &args[0] {
+                Value::Char(c) => Ok(Some(Value::Char(c.to_ascii_lowercase()))),
+                _ => Err(EvalError::Type(format!("char-downcase: expected char at {}", pos.fmt()))),
+            }
+        }
+        "char=?" => {
+            if args.len() != 2 {
+                return Err(EvalError::Arity(format!("char=? requires 2 arguments at {}", pos.fmt())));
+            }
+            match (&args[0], &args[1]) {
+                (Value::Char(a), Value::Char(b)) => Ok(Some(Value::Boolean(a == b))),
+                _ => Err(EvalError::Type(format!("char=?: expected chars at {}", pos.fmt()))),
+            }
+        }
+        "char<?" => {
+            if args.len() != 2 {
+                return Err(EvalError::Arity(format!("char<? requires 2 arguments at {}", pos.fmt())));
+            }
+            match (&args[0], &args[1]) {
+                (Value::Char(a), Value::Char(b)) => Ok(Some(Value::Boolean(a < b))),
+                _ => Err(EvalError::Type(format!("char<?: expected chars at {}", pos.fmt()))),
+            }
+        }
+        "string=?" => {
+            if args.len() != 2 {
+                return Err(EvalError::Arity(format!("string=? requires 2 arguments at {}", pos.fmt())));
+            }
+            match (&args[0], &args[1]) {
+                (Value::Str(a), Value::Str(b)) => Ok(Some(Value::Boolean(a == b))),
+                _ => Err(EvalError::Type(format!("string=?: expected strings at {}", pos.fmt()))),
+            }
+        }
+        "string<?" => {
+            if args.len() != 2 {
+                return Err(EvalError::Arity(format!("string<? requires 2 arguments at {}", pos.fmt())));
+            }
+            match (&args[0], &args[1]) {
+                (Value::Str(a), Value::Str(b)) => Ok(Some(Value::Boolean(a < b))),
+                _ => Err(EvalError::Type(format!("string<?: expected strings at {}", pos.fmt()))),
+            }
+        }
+        "string-ci=?" => {
+            if args.len() != 2 {
+                return Err(EvalError::Arity(format!("string-ci=? requires 2 arguments at {}", pos.fmt())));
+            }
+            match (&args[0], &args[1]) {
+                (Value::Str(a), Value::Str(b)) => Ok(Some(Value::Boolean(a.to_lowercase() == b.to_lowercase()))),
+                _ => Err(EvalError::Type(format!("string-ci=?: expected strings at {}", pos.fmt()))),
+            }
+        }
+        "string-upcase" => {
+            if args.len() != 1 {
+                return Err(EvalError::Arity(format!("string-upcase requires 1 argument at {}", pos.fmt())));
+            }
+            match &args[0] {
+                Value::Str(s) => Ok(Some(Value::Str(s.to_uppercase()))),
+                _ => Err(EvalError::Type(format!("string-upcase: expected string at {}", pos.fmt()))),
+            }
+        }
+        "string-downcase" => {
+            if args.len() != 1 {
+                return Err(EvalError::Arity(format!("string-downcase requires 1 argument at {}", pos.fmt())));
+            }
+            match &args[0] {
+                Value::Str(s) => Ok(Some(Value::Str(s.to_lowercase()))),
+                _ => Err(EvalError::Type(format!("string-downcase: expected string at {}", pos.fmt()))),
+            }
         }
         _ => Ok(None),
     }
