@@ -1,4 +1,5 @@
 pub mod error;
+mod env;
 mod eval;
 mod parser;
 mod value;
@@ -9,11 +10,15 @@ pub use error::EvalError;
 /// representation of the last result.
 pub fn eval_str(input: &str) -> Result<String, EvalError> {
     let exprs = parser::parse(input)?;
-    let mut result = value::Value::List(vec![]);
+    let env = env::Env::new();
+    let mut result = value::Value::Void;
     for expr in &exprs {
-        result = eval::eval(expr)?;
+        result = eval::eval(expr, &env)?;
     }
-    Ok(result.to_string())
+    match result {
+        value::Value::Void => Ok(result.to_string()),
+        _ => Ok(result.to_string()),
+    }
 }
 
 /// Evaluate Scheme expressions, returning both the result value and

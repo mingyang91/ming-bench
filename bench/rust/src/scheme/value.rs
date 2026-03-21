@@ -1,13 +1,37 @@
+use std::cell::RefCell;
 use std::fmt;
+use std::rc::Rc;
+
+use crate::scheme::env::Env;
 
 /// A Scheme value.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone)]
 pub enum Value {
     Integer(i64),
     Boolean(bool),
     Str(String),
     Symbol(String),
     List(Vec<Value>),
+    Lambda {
+        params: Vec<String>,
+        body: Vec<Value>,
+        closure: Rc<RefCell<Env>>,
+    },
+    Void,
+}
+
+impl PartialEq for Value {
+    fn eq(&self, other: &Self) -> bool {
+        match (self, other) {
+            (Value::Integer(a), Value::Integer(b)) => a == b,
+            (Value::Boolean(a), Value::Boolean(b)) => a == b,
+            (Value::Str(a), Value::Str(b)) => a == b,
+            (Value::Symbol(a), Value::Symbol(b)) => a == b,
+            (Value::List(a), Value::List(b)) => a == b,
+            (Value::Void, Value::Void) => true,
+            _ => false,
+        }
+    }
 }
 
 fn write_list(f: &mut fmt::Formatter<'_>, items: &[Value]) -> fmt::Result {
@@ -30,6 +54,8 @@ impl fmt::Display for Value {
             Value::Str(s) => write!(f, "\"{s}\""),
             Value::Symbol(s) => write!(f, "{s}"),
             Value::List(items) => write_list(f, items),
+            Value::Lambda { .. } => write!(f, "#<procedure>"),
+            Value::Void => write!(f, "#<void>"),
         }
     }
 }
