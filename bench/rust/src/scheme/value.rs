@@ -1,6 +1,7 @@
 use std::fmt::{self, Formatter};
 
 use crate::scheme::ast::Expr;
+use crate::scheme::ast::SourceLocation;
 use crate::scheme::builtins::BuiltinProcedure;
 use crate::scheme::environment::Environment;
 use crate::scheme::error::EvalError;
@@ -63,10 +64,11 @@ impl Value {
         }
     }
 
-    pub fn expect_number(&self) -> Result<i64, EvalError> {
+    pub fn expect_number(&self, location: SourceLocation) -> Result<i64, EvalError> {
         match self {
             Self::Integer(value) => Ok(*value),
             _ => Err(EvalError::TypeMismatch {
+                location,
                 expected: "number",
                 found: self.type_name(),
             }),

@@ -1,3 +1,5 @@
+use crate::scheme::ast::SourceLocation;
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ArgCount {
     Exactly(usize),
@@ -15,14 +17,17 @@ impl std::fmt::Display for ArgCount {
 
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum ParseError {
-    #[error("unexpected end of input")]
-    UnexpectedEndOfInput,
-    #[error("unexpected closing parenthesis")]
-    UnexpectedClosingParenthesis,
-    #[error("unterminated string literal")]
-    UnterminatedStringLiteral,
-    #[error("invalid escape sequence: \\{escape}")]
-    InvalidEscapeSequence { escape: char },
+    #[error("{location}: unexpected end of input")]
+    UnexpectedEndOfInput { location: SourceLocation },
+    #[error("{location}: unexpected closing parenthesis")]
+    UnexpectedClosingParenthesis { location: SourceLocation },
+    #[error("{location}: unterminated string literal")]
+    UnterminatedStringLiteral { location: SourceLocation },
+    #[error("{location}: invalid escape sequence: \\{escape}")]
+    InvalidEscapeSequence {
+        location: SourceLocation,
+        escape: char,
+    },
 }
 
 /// Evaluation error type for the Scheme interpreter.
@@ -32,33 +37,56 @@ pub enum EvalError {
     Parse(#[from] ParseError),
     #[error("program did not contain any expressions")]
     EmptyProgram,
-    #[error("cannot evaluate an empty application")]
-    EmptyApplication,
-    #[error("unbound variable: {name}")]
-    UnboundVariable { name: String },
-    #[error("unknown procedure: {name}")]
-    UnknownProcedure { name: String },
-    #[error("operator is not callable: {expression}")]
-    NotCallable { expression: String },
-    #[error("malformed special form: {form}")]
-    MalformedSpecialForm { form: &'static str },
-    #[error("{form} requires at least one body expression")]
-    MissingBody { form: &'static str },
-    #[error("{form} requires a parameter list")]
-    InvalidParameterList { form: &'static str },
-    #[error("{form} parameters must be symbols")]
-    NonSymbolParameter { form: &'static str },
-    #[error("wrong argument count for {procedure}: expected {expected}, got {got}")]
+    #[error("{location}: cannot evaluate an empty application")]
+    EmptyApplication { location: SourceLocation },
+    #[error("{location}: unbound variable: {name}")]
+    UnboundVariable {
+        location: SourceLocation,
+        name: String,
+    },
+    #[error("{location}: unknown procedure: {name}")]
+    UnknownProcedure {
+        location: SourceLocation,
+        name: String,
+    },
+    #[error("{location}: operator is not callable: {expression}")]
+    NotCallable {
+        location: SourceLocation,
+        expression: String,
+    },
+    #[error("{location}: malformed special form: {form}")]
+    MalformedSpecialForm {
+        location: SourceLocation,
+        form: &'static str,
+    },
+    #[error("{location}: {form} requires at least one body expression")]
+    MissingBody {
+        location: SourceLocation,
+        form: &'static str,
+    },
+    #[error("{location}: {form} requires a parameter list")]
+    InvalidParameterList {
+        location: SourceLocation,
+        form: &'static str,
+    },
+    #[error("{location}: {form} parameters must be symbols")]
+    NonSymbolParameter {
+        location: SourceLocation,
+        form: &'static str,
+    },
+    #[error("{location}: wrong argument count for {procedure}: expected {expected}, got {got}")]
     WrongArgumentCount {
+        location: SourceLocation,
         procedure: &'static str,
         expected: ArgCount,
         got: usize,
     },
-    #[error("expected {expected}, found {found}")]
+    #[error("{location}: expected {expected}, found {found}")]
     TypeMismatch {
+        location: SourceLocation,
         expected: &'static str,
         found: &'static str,
     },
-    #[error("division by zero")]
-    DivisionByZero,
+    #[error("{location}: division by zero")]
+    DivisionByZero { location: SourceLocation },
 }

@@ -1,4 +1,4 @@
-use crate::scheme::ast::Expr;
+use crate::scheme::ast::{Expr, SourceLocation};
 use crate::scheme::error::ParseError;
 
 pub fn parse_program(input: &str) -> Result<Vec<Expr>, ParseError> {
@@ -15,30 +15,36 @@ pub fn parse_program(input: &str) -> Result<Vec<Expr>, ParseError> {
 struct Parser<'src> {
     input: &'src str,
     index: usize,
+    location: SourceLocation,
 }
 
 impl<'src> Parser<'src> {
     fn new(input: &'src str) -> Self {
-        Self { input, index: 0 }
+        Self {
+            input,
+            index: 0,
+            location: SourceLocation::new(1, 1),
+        }
     }
 
     fn parse_expr(&mut self) -> Result<Expr, ParseError> {
         self.skip_ignored();
+        let location = self.location;
 
         let Some(ch) = self.peek_char() else {
-            return Err(ParseError::UnexpectedEndOfInput);
+            return Err(ParseError::UnexpectedEndOfInput { location });
         };
 
         match ch {
-            '(' => self.parse_list(),
-            ')' => Err(ParseError::UnexpectedClosingParenthesis),
-            '\'' => self.parse_quote(),
-            '"' => self.parse_string(),
-            _ => Ok(self.parse_atom()),
+            '(' => self.parse_list(location),
+            ')' => Err(ParseError::UnexpectedClosingParenthesis { location }),
+            '\'' => self.parse_quote(location),
+            '"' => self.parse_string(location),
+            _ => Ok(self.parse_atom(location)),
         }
     }
 
-    fn parse_list(&mut self) -> Result<Expr, ParseError> {
+    fn parse_list(&mut self, location: SourceLocation) -> Result<Expr, ParseError> {
         self.consume_char();
         let mut items = Vec::new();
 
@@ -46,34 +52,35 @@ impl<'src> Parser<'src> {
             items.push(expression);
         }
 
-        Ok(Expr::List(items))
+        Ok(Expr::list(items, location))
     }
 
-    fn parse_string(&mut self) -> Result<Expr, ParseError> {
+    fn parse_string(&mut self, location: SourceLocation) -> Result<Expr, ParseError> {
         self.consume_char();
         let mut value = String::new();
 
         loop {
             match self.consume_string_char()? {
-                '"' => return Ok(Expr::String(value)),
+                '"' => return Ok(Expr::string(value, location)),
                 '\\' => value.push(self.parse_escape_sequence()?),
                 ch => value.push(ch),
             }
         }
     }
 
-    fn parse_quote(&mut self) -> Result<Expr, ParseError> {
+    fn parse_quote(&mut self, location: SourceLocation) -> Result<Expr, ParseError> {
         self.consume_char();
 
-        Ok(Expr::List(vec![
-            Expr::Symbol("quote".into()),
-            self.parse_expr()?,
-        ]))
+        Ok(Expr::list(
+            vec![Expr::symbol("quote".into(), location), self.parse_expr()?],
+            location,
+        ))
     }
 
     fn parse_escape_sequence(&mut self) -> Result<char, ParseError> {
+        let location = self.location;
         let Some(ch) = self.consume_char() else {
-            return Err(ParseError::UnterminatedStringLiteral);
+            return Err(ParseError::UnterminatedStringLiteral { location });
         };
 
         match ch {
@@ -82,19 +89,22 @@ impl<'src> Parser<'src> {
             'n' => Ok('\n'),
             'r' => Ok('\r'),
             't' => Ok('\t'),
-            _ => Err(ParseError::InvalidEscapeSequence { escape: ch }),
+            _ => Err(ParseError::InvalidEscapeSequence {
+                location,
+                escape: ch,
+            }),
         }
     }
 
-    fn parse_atom(&mut self) -> Expr {
+    fn parse_atom(&mut self, location: SourceLocation) -> Expr {
         let token = self.take_while(|ch| !ch.is_whitespace() && ch != '(' && ch != ')');
 
         match token {
-            "#t" => Expr::Boolean(true),
-            "#f" => Expr::Boolean(false),
+            "#t" => Expr::boolean(true, location),
+            "#f" => Expr::boolean(false, location),
             _ => match token.parse::<i64>() {
-                Ok(value) => Expr::Integer(value),
-                Err(_) => Expr::Symbol(token.to_string()),
+                Ok(value) => Expr::integer(value, location),
+                Err(_) => Expr::symbol(token.to_string(), location),
             },
         }
     }
@@ -139,12 +149,15 @@ impl<'src> Parser<'src> {
     fn consume_char(&mut self) -> Option<char> {
         let ch = self.peek_char()?;
         self.index += ch.len_utf8();
+        self.location = next_location(self.location, ch);
         Some(ch)
     }
 
     fn consume_string_char(&mut self) -> Result<char, ParseError> {
         self.consume_char()
-            .ok_or(ParseError::UnterminatedStringLiteral)
+            .ok_or(ParseError::UnterminatedStringLiteral {
+                location: self.location,
+            })
     }
 
     fn parse_list_expression(&mut self) -> Result<Option<Expr>, ParseError> {
@@ -154,7 +167,9 @@ impl<'src> Parser<'src> {
         }
 
         if self.peek_char().is_none() {
-            return Err(ParseError::UnexpectedEndOfInput);
+            return Err(ParseError::UnexpectedEndOfInput {
+                location: self.location,
+            });
         }
 
         self.parse_expr().map(Some)
@@ -168,4 +183,12 @@ impl<'src> Parser<'src> {
         self.consume_char();
         true
     }
+}
+
+fn next_location(location: SourceLocation, ch: char) -> SourceLocation {
+    if ch == '\n' {
+        return SourceLocation::new(location.line + 1, 1);
+    }
+
+    SourceLocation::new(location.line, location.column + 1)
 }
