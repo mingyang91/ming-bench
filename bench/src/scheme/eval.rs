@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use super::{
     atom_to_value, builtins, env_define, env_get, env_set, macros, quote_expr, DisplayValue, Env,
@@ -29,6 +29,8 @@ pub(crate) struct EvalCtx {
     pub cont_id_at_expr_start: u64,
     /// Counter for generating unique hygienic macro variable names.
     pub gensym_counter: u64,
+    /// Set of continuation IDs whose call/cc is currently on the call stack.
+    pub active_continuations: HashSet<u64>,
 }
 
 impl EvalCtx {
@@ -43,6 +45,7 @@ impl EvalCtx {
             cont_registry: HashMap::new(),
             cont_id_at_expr_start: 0,
             gensym_counter: 0,
+            active_continuations: HashSet::new(),
         }
     }
 }
@@ -253,7 +256,13 @@ fn eval_apply_values(
     }
 }
 
-/// Invoke a continuation value, returning a ContinuationReturn error.
+/// Invoke a continuation value.
+///
+/// Three cases:
+/// 1. Call/cc is on the stack (escape): throw ContinuationReturn, caught by eval_callcc_with_func.
+/// 2. Call/cc is NOT on the stack, captured in same top-level expr: return value directly.
+///    Re-execution would follow a different path due to mutable state changes.
+/// 3. Call/cc is NOT on the stack, captured in different expr: throw for eval_exprs re-execution.
 fn invoke_continuation(
     id: u64,
     args: &[Value],
@@ -265,6 +274,21 @@ fn invoke_continuation(
             got: args.len(),
         });
     };
+
+    if ctx.active_continuations.contains(&id) {
+        ctx.cont_return_value = Some(arg.clone());
+        return Err(EvalError::ContinuationReturn { id });
+    }
+
+    let same_expr = ctx.all_exprs
+        && ctx
+            .cont_registry
+            .get(&id)
+            .is_some_and(|info| info.expr_index == ctx.current_expr_index);
+    if same_expr {
+        return Ok(Trampoline::Done(arg.clone()));
+    }
+
     ctx.cont_return_value = Some(arg.clone());
     Err(EvalError::ContinuationReturn { id })
 }
@@ -456,7 +480,11 @@ fn eval_callcc_with_func(func: &Value, ctx: &mut EvalCtx) -> Result<Trampoline, 
     let cont_val = Value::Continuation { id };
 
     // Fully evaluate func(cont) to catch escape continuation returns
-    match apply_lambda(func, &[cont_val], ctx) {
+    ctx.active_continuations.insert(id);
+    let result = apply_lambda(func, &[cont_val], ctx);
+    ctx.active_continuations.remove(&id);
+
+    match result {
         Ok(val) => Ok(Trampoline::Done(val)),
         Err(EvalError::ContinuationReturn { id: ret_id }) if ret_id == id => {
             let val = ctx
@@ -550,16 +578,11 @@ fn apply_builtin(op: &str, args: &[Value]) -> Result<Value, EvalError> {
 fn apply_func(func: &Value, args: &[Value], ctx: &mut EvalCtx) -> Result<Value, EvalError> {
     match func {
         Value::Lambda { .. } => apply_lambda(func, args, ctx),
-        Value::Continuation { id } => {
-            let [arg] = args else {
-                return Err(EvalError::WrongArgCount {
-                    expected: 1,
-                    got: args.len(),
-                });
-            };
-            ctx.cont_return_value = Some(arg.clone());
-            Err(EvalError::ContinuationReturn { id: *id })
-        }
+        Value::Continuation { id } => match invoke_continuation(*id, args, ctx) {
+            Ok(Trampoline::Done(val)) => Ok(val),
+            Err(e) => Err(e),
+            Ok(Trampoline::Continue(..)) => unreachable!("invoke_continuation never returns Continue"),
+        },
         Value::Symbol(name) => apply_builtin(name, args),
         other => Err(EvalError::TypeError {
             expected: "procedure".to_string(),
