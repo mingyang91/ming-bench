@@ -37,16 +37,14 @@ pub fn eval(expr: &Expr, env: &Env) -> Result<Value, EvalError> {
     }
 }
 
-/// Build an environment with hygiene bindings from macro expansion.
+/// Add hygiene bindings from macro expansion directly into the use-site env.
+/// Using gensym names ensures no conflicts, and keeps `define` in the
+/// expanded form visible in the correct scope.
 fn make_hygiene_env(env: &Env, hygiene_bindings: Vec<(String, Value)>) -> Env {
-    if hygiene_bindings.is_empty() {
-        return env.clone();
-    }
-    let e = Env::extend(env);
     for (name, val) in hygiene_bindings {
-        e.define(name, val);
+        env.define(name, val);
     }
-    e
+    env.clone()
 }
 
 /// Resolve a symbol: check environment, then builtins.
@@ -517,14 +515,12 @@ fn eval_application(
             apply_builtin_values(name, &arg_vals).map(Bounce::Done).map_err(|e| e.at(span))
         }
         Value::Continuation { id, expr_index } => {
-            let [ref arg_expr] = args else {
-                return Err(EvalError::WrongArgCount {
-                    expected: 1,
-                    got: args.len(),
-                }
-                .at(span));
+            let arg_vals: Vec<Value> =
+                args.iter().map(|a| eval(a, env)).collect::<Result<_, _>>()?;
+            let value = match arg_vals.len() {
+                1 => arg_vals.into_iter().next().expect("len checked"),
+                _ => Value::Values(arg_vals),
             };
-            let value = eval(arg_expr, env)?;
             invoke_continuation(id, value, expr_index, env)
         }
         _ => Err(EvalError::TypeError {
@@ -776,9 +772,11 @@ fn match_guard_clause(
     Ok(None)
 }
 
-/// Evaluate `(guard (var clause ...) body ...)`.
-/// Catches SchemeException, binds it to `var`, tests cond-like clauses.
-fn eval_guard(args: &[Expr], span: Span, env: &Env) -> Result<Bounce, EvalError> {
+/// Parse guard form arguments into (var_name, clauses, body_expr).
+fn parse_guard_parts(
+    args: &[Expr],
+    span: Span,
+) -> Result<(String, Vec<Expr>, Expr), EvalError> {
     let [Expr::List(ref clauses_list, _), ref body @ ..] = args else {
         return Err(EvalError::Parse("invalid guard form".into()).at(span));
     };
@@ -788,24 +786,103 @@ fn eval_guard(args: &[Expr], span: Span, env: &Env) -> Result<Bounce, EvalError>
     if body.is_empty() {
         return Err(EvalError::Parse("guard requires a body".into()).at(span));
     }
+    Ok((var_name.clone(), clauses.to_vec(), wrap_body(body, span)))
+}
 
-    // Evaluate body, catching SchemeException
-    let body_expr = wrap_body(body, span);
-    let body_result = eval(&body_expr, env);
+/// If `expr` is a `(guard ...)` form, parse and return a `TailGuard` result for iterative handling.
+fn try_extract_guard(expr: &Expr, env: Env) -> Result<Option<GuardListResult>, EvalError> {
+    let Expr::List(ref elems, span) = expr else { return Ok(None) };
+    let [Expr::Symbol(ref kw, _), ref guard_args @ ..] = elems.as_slice() else {
+        return Ok(None);
+    };
+    if kw != "guard" {
+        return Ok(None);
+    }
+    let (var, clauses, body) = parse_guard_parts(guard_args, *span)?;
+    Ok(Some(GuardListResult::TailGuard {
+        var,
+        clauses,
+        body,
+        handler_env: env,
+        handler_span: *span,
+    }))
+}
 
-    match body_result {
-        Ok(val) => Ok(Bounce::Done(val)),
-        Err(EvalError::SchemeException(exn_val)) => {
-            // Bind exception to var_name and test clauses
-            let guard_env = Env::extend(env);
-            guard_env.define(var_name.clone(), *exn_val.clone());
+/// Result of evaluating a list expression within a guard body.
+enum GuardListResult {
+    /// Evaluation completed with a final bounce.
+    Finished(Bounce),
+    /// TCO bounce to a new guard form — loop should continue with updated state.
+    TailGuard {
+        var: String,
+        clauses: Vec<Expr>,
+        body: Expr,
+        handler_env: Env,
+        handler_span: Span,
+    },
+    /// TCO bounce to a non-guard expression — loop should continue with new expr/env.
+    TailExpr(Expr, Env),
+}
 
-            match match_guard_clause(clauses, span, &guard_env)? {
-                Some(bounce) => Ok(bounce),
-                None => Err(EvalError::SchemeException(exn_val)),
+/// Evaluate a list expression in the guard trampoline, classifying the result.
+fn eval_guard_list(elems: &[Expr], sp: Span, env: &Env) -> Result<GuardListResult, EvalError> {
+    match eval_list(elems, sp, env)? {
+        Bounce::Done(val) => Ok(GuardListResult::Finished(Bounce::Done(val))),
+        Bounce::Tco(next_expr, next_env) => {
+            if let Some(tail_guard) = try_extract_guard(&next_expr, next_env.clone())? {
+                Ok(tail_guard)
+            } else {
+                Ok(GuardListResult::TailExpr(next_expr, next_env))
             }
         }
-        Err(e) => Err(e),
+    }
+}
+
+/// Evaluate `(guard (var clause ...) body ...)`.
+/// Uses an inline trampoline that detects guard forms in TCO bounces,
+/// avoiding recursive `eval_guard` calls for tail-recursive guards.
+fn eval_guard(args: &[Expr], span: Span, env: &Env) -> Result<Bounce, EvalError> {
+    let (mut cur_var, mut cur_clauses, mut cur) = parse_guard_parts(args, span)?;
+    let mut cur_env = env.clone();
+    let mut cur_handler_env = env.clone();
+    let mut cur_handler_span = span;
+
+    loop {
+        match cur {
+            Expr::Integer(n, _) => return Ok(Bounce::Done(Value::Integer(n))),
+            Expr::Rational(n, d, _) => return Ok(Bounce::Done(make_rational(n, d))),
+            Expr::Float(x, _) => return Ok(Bounce::Done(Value::Float(x))),
+            Expr::Boolean(b, _) => return Ok(Bounce::Done(Value::Boolean(b))),
+            Expr::String(ref s, _) => return Ok(Bounce::Done(Value::String(s.clone()))),
+            Expr::Char(c, _) => return Ok(Bounce::Done(Value::Char(c))),
+            Expr::Symbol(ref name, sp) => {
+                return resolve_symbol(name, sp, &cur_env).map(Bounce::Done)
+            }
+            Expr::List(ref elems, sp) => match eval_guard_list(elems, sp, &cur_env) {
+                Ok(GuardListResult::Finished(bounce)) => return Ok(bounce),
+                Ok(GuardListResult::TailGuard { var, clauses, body, handler_env, handler_span }) => {
+                    cur = body;
+                    cur_env = handler_env.clone();
+                    cur_var = var;
+                    cur_clauses = clauses;
+                    cur_handler_env = handler_env;
+                    cur_handler_span = handler_span;
+                }
+                Ok(GuardListResult::TailExpr(next_expr, next_env)) => {
+                    cur = next_expr;
+                    cur_env = next_env;
+                }
+                Err(EvalError::SchemeException(exn_val)) => {
+                    let guard_env = Env::extend(&cur_handler_env);
+                    guard_env.define(cur_var.clone(), *exn_val.clone());
+                    match match_guard_clause(&cur_clauses, cur_handler_span, &guard_env)? {
+                        Some(bounce) => return Ok(bounce),
+                        None => return Err(EvalError::SchemeException(exn_val)),
+                    }
+                }
+                Err(e) => return Err(e),
+            },
+        }
     }
 }
 
