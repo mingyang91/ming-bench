@@ -36,6 +36,15 @@ impl Environment {
             .insert(name.into(), Rc::new(RefCell::new(value)));
     }
 
+    pub fn define_alias(&self, alias: impl Into<String>, existing: &str) -> bool {
+        let Some(binding) = self.lookup_binding(existing) else {
+            return false;
+        };
+
+        self.0.borrow_mut().bindings.insert(alias.into(), binding);
+        true
+    }
+
     pub fn lookup(&self, name: &str) -> Option<Value> {
         self.lookup_binding(name)
             .map(|binding| binding.borrow().clone())

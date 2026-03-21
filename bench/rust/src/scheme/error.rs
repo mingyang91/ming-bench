@@ -115,6 +115,16 @@ pub enum EvalError {
         location: SourceLocation,
         procedure: &'static str,
     },
+    #[error("{location}: invalid syntax-rules: {detail}")]
+    InvalidSyntaxRules {
+        location: SourceLocation,
+        detail: &'static str,
+    },
+    #[error("{location}: no matching syntax-rules clause for macro {name}")]
+    MacroNoMatchingRule {
+        location: SourceLocation,
+        name: String,
+    },
     #[error("{location}: division by zero")]
     DivisionByZero { location: SourceLocation },
 }

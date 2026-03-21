@@ -6,6 +6,7 @@ pub mod error;
 mod evaluator;
 mod parser;
 mod string_value;
+mod syntax;
 mod value;
 
 pub use error::EvalError;

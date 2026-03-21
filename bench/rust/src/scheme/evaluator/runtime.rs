@@ -6,6 +6,7 @@ use crate::scheme::builtins::{apply_builtin, install_builtins};
 use crate::scheme::continuation::{CapturedContinuation, Frame};
 use crate::scheme::environment::Environment;
 use crate::scheme::error::{ArgCount, EvalError};
+use crate::scheme::syntax::MacroEnvironment;
 use crate::scheme::value::{list_from_values, Closure, Value};
 
 type ContinuationFrames = Vec<Frame>;
@@ -62,6 +63,7 @@ pub(crate) fn eval_program_with_output(expressions: &[Expr]) -> Result<(Value, S
     }
 
     let environment = Environment::new();
+    let macro_environment = MacroEnvironment::new();
     install_builtins(&environment);
     install_runtime_procedures(&environment);
 
@@ -69,6 +71,7 @@ pub(crate) fn eval_program_with_output(expressions: &[Expr]) -> Result<(Value, S
     let value = run(
         eval_sequence(expressions.to_vec(), environment, Vec::new())?,
         &mut output,
+        &macro_environment,
     )?;
 
     Ok((value, output))
@@ -88,6 +91,7 @@ pub(crate) fn apply_callable(
             continuation: Vec::new(),
         },
         output,
+        &MacroEnvironment::new(),
     )
 }
 
@@ -99,14 +103,18 @@ fn install_runtime_procedures(environment: &Environment) {
     );
 }
 
-fn run(mut state: State, output: &mut String) -> Result<Value, EvalError> {
+fn run(
+    mut state: State,
+    output: &mut String,
+    macro_environment: &MacroEnvironment,
+) -> Result<Value, EvalError> {
     loop {
         state = match state {
             State::Eval {
                 expression,
                 environment,
                 continuation,
-            } => eval_expression(expression, environment, continuation)?,
+            } => eval_expression(expression, environment, continuation, macro_environment)?,
             State::Apply {
                 callable,
                 arguments,
@@ -116,7 +124,7 @@ fn run(mut state: State, output: &mut String) -> Result<Value, EvalError> {
             State::Return {
                 value,
                 continuation,
-            } => match continue_return(value, continuation)? {
+            } => match continue_return(value, continuation, macro_environment)? {
                 ControlFlow::Break(value) => return Ok(value),
                 ControlFlow::Continue(state) => state,
             },
@@ -127,18 +135,20 @@ fn run(mut state: State, output: &mut String) -> Result<Value, EvalError> {
 fn continue_return(
     value: Value,
     mut continuation: ContinuationFrames,
+    macro_environment: &MacroEnvironment,
 ) -> Result<ControlFlow<Value, State>, EvalError> {
     let Some(frame) = continuation.pop() else {
         return Ok(ControlFlow::Break(value));
     };
 
-    continue_with_frame(frame, value, continuation).map(ControlFlow::Continue)
+    continue_with_frame(frame, value, continuation, macro_environment).map(ControlFlow::Continue)
 }
 
 fn eval_expression(
     expression: Expr,
     environment: Environment,
     continuation: ContinuationFrames,
+    macro_environment: &MacroEnvironment,
 ) -> Result<State, EvalError> {
     match expression {
         Expr::Integer { value, .. } => Ok(State::Return {
@@ -164,9 +174,13 @@ fn eval_expression(
                 continuation,
             })
             .ok_or(EvalError::UnboundVariable { location, name }),
-        Expr::List { items, location } => {
-            eval_list_expression(items, location, environment, continuation)
-        }
+        Expr::List { items, location } => eval_list_expression(
+            items,
+            location,
+            environment,
+            continuation,
+            macro_environment,
+        ),
     }
 }
 
@@ -175,7 +189,9 @@ fn eval_list_expression(
     location: SourceLocation,
     environment: Environment,
     continuation: ContinuationFrames,
+    macro_environment: &MacroEnvironment,
 ) -> Result<State, EvalError> {
+    let expression = Expr::list(items.clone(), location);
     let Some((operator, arguments)) = split_first(items) else {
         return Err(EvalError::EmptyApplication { location });
     };
@@ -187,8 +203,18 @@ fn eval_list_expression(
             operator.location(),
             environment.clone(),
             continuation.clone(),
+            macro_environment,
         )? {
             return Ok(state);
+        }
+
+        if macro_environment.is_macro(name) {
+            let expanded = macro_environment.expand_expression(&expression)?;
+            return Ok(State::Eval {
+                expression: expanded,
+                environment,
+                continuation,
+            });
         }
     }
 
@@ -213,16 +239,46 @@ fn eval_special_form(
     location: SourceLocation,
     environment: Environment,
     continuation: ContinuationFrames,
+    macro_environment: &MacroEnvironment,
 ) -> Result<Option<State>, EvalError> {
     match name {
         "and" => eval_and(arguments.to_vec(), environment, continuation).map(Some),
         "or" => eval_or(arguments.to_vec(), environment, continuation).map(Some),
         "if" => eval_if(arguments, location, environment, continuation).map(Some),
-        "define" => eval_define(arguments, location, environment, continuation).map(Some),
+        "define" => eval_define(
+            arguments,
+            location,
+            environment,
+            continuation,
+            macro_environment,
+        )
+        .map(Some),
+        "define-syntax" => eval_define_syntax(
+            arguments,
+            location,
+            environment,
+            continuation,
+            macro_environment,
+        )
+        .map(Some),
         "set!" => eval_set(arguments, location, environment, continuation).map(Some),
         "quote" => eval_quote(arguments, location, continuation).map(Some),
-        "lambda" => eval_lambda(arguments, location, environment, continuation).map(Some),
-        "let" => eval_let(arguments, location, environment, continuation).map(Some),
+        "lambda" => eval_lambda(
+            arguments,
+            location,
+            environment,
+            continuation,
+            macro_environment,
+        )
+        .map(Some),
+        "let" => eval_let(
+            arguments,
+            location,
+            environment,
+            continuation,
+            macro_environment,
+        )
+        .map(Some),
         "begin" => eval_sequence(arguments.to_vec(), environment, continuation).map(Some),
         "cond" => eval_cond(arguments.to_vec(), environment, continuation).map(Some),
         _ => Ok(None),
@@ -341,6 +397,7 @@ fn eval_define(
     location: SourceLocation,
     environment: Environment,
     continuation: ContinuationFrames,
+    macro_environment: &MacroEnvironment,
 ) -> Result<State, EvalError> {
     match arguments {
         [Expr::Symbol { name, .. }, expression] => {
@@ -358,16 +415,33 @@ fn eval_define(
         [Expr::List {
             items: signature, ..
         }, body @ ..] => {
-            define_function(signature, body, location, &environment).map(|value| State::Return {
-                value,
-                continuation,
-            })
+            define_function(signature, body, location, &environment, macro_environment).map(
+                |value| State::Return {
+                    value,
+                    continuation,
+                },
+            )
         }
         _ => Err(EvalError::MalformedSpecialForm {
             location,
             form: "define",
         }),
     }
+}
+
+fn eval_define_syntax(
+    arguments: &[Expr],
+    location: SourceLocation,
+    environment: Environment,
+    continuation: ContinuationFrames,
+    macro_environment: &MacroEnvironment,
+) -> Result<State, EvalError> {
+    macro_environment.define_syntax(arguments, location, &environment)?;
+
+    Ok(State::Return {
+        value: Value::Void,
+        continuation,
+    })
 }
 
 fn eval_set(
@@ -426,6 +500,7 @@ fn eval_lambda(
     location: SourceLocation,
     environment: Environment,
     continuation: ContinuationFrames,
+    macro_environment: &MacroEnvironment,
 ) -> Result<State, EvalError> {
     let Some((parameters, body)) = arguments.split_first() else {
         return Err(EvalError::WrongArgumentCount {
@@ -437,7 +512,15 @@ fn eval_lambda(
     };
 
     let formals = parse_lambda_formals(parameters, "lambda", location)?;
-    let closure = build_closure(None, formals, body, environment, "lambda", location)?;
+    let closure = build_closure(
+        None,
+        formals,
+        body,
+        environment,
+        "lambda",
+        location,
+        macro_environment,
+    )?;
 
     Ok(State::Return {
         value: Value::Closure(closure),
@@ -450,6 +533,7 @@ fn eval_let(
     location: SourceLocation,
     environment: Environment,
     continuation: ContinuationFrames,
+    macro_environment: &MacroEnvironment,
 ) -> Result<State, EvalError> {
     match arguments {
         [] => Err(EvalError::WrongArgumentCount {
@@ -458,9 +542,15 @@ fn eval_let(
             expected: ArgCount::AtLeast(2),
             got: 0,
         }),
-        [Expr::Symbol { name, .. }, bindings, body @ ..] => {
-            eval_named_let(name, bindings, body, location, environment, continuation)
-        }
+        [Expr::Symbol { name, .. }, bindings, body @ ..] => eval_named_let(
+            name,
+            bindings,
+            body,
+            location,
+            environment,
+            continuation,
+            macro_environment,
+        ),
         [bindings, body @ ..] => {
             eval_standard_let(bindings, body, location, environment, continuation)
         }
@@ -545,83 +635,86 @@ fn eval_named_let(
     location: SourceLocation,
     environment: Environment,
     continuation: ContinuationFrames,
+    macro_environment: &MacroEnvironment,
 ) -> Result<State, EvalError> {
     let bindings = parse_let_bindings(bindings_expression, location)?;
     let (parameters, expressions): (Vec<_>, Vec<_>) = bindings.into_iter().unzip();
     start_named_let(
-        name.to_string(),
-        parameters,
-        expressions,
-        body.to_vec(),
-        environment,
-        location,
+        NamedLetProgress {
+            name: name.to_string(),
+            parameters,
+            pending: expressions,
+            evaluated_rev: Vec::new(),
+            body: body.to_vec(),
+            environment,
+            location,
+        },
         continuation,
+        macro_environment,
     )
 }
 
 fn start_named_let(
-    name: String,
-    parameters: Vec<String>,
-    mut expressions: Vec<Expr>,
-    body: Vec<Expr>,
-    environment: Environment,
-    location: SourceLocation,
+    mut progress: NamedLetProgress,
     mut continuation: ContinuationFrames,
+    macro_environment: &MacroEnvironment,
 ) -> Result<State, EvalError> {
-    let Some(expression) = expressions.pop() else {
-        return finish_named_let(
-            name,
-            parameters,
-            Vec::new(),
-            body,
-            environment,
-            location,
-            continuation,
-        );
+    let Some(expression) = progress.pending.pop() else {
+        return finish_named_let(progress, continuation, macro_environment);
     };
 
     continuation.push(Frame::NamedLet {
-        name,
-        parameters,
-        pending: expressions,
-        evaluated_rev: Vec::new(),
-        body,
-        environment: environment.clone(),
-        location,
+        name: progress.name,
+        parameters: progress.parameters,
+        pending: progress.pending,
+        evaluated_rev: progress.evaluated_rev,
+        body: progress.body,
+        environment: progress.environment.clone(),
+        location: progress.location,
     });
 
     Ok(State::Eval {
         expression,
-        environment,
+        environment: progress.environment,
         continuation,
     })
 }
 
 fn finish_named_let(
-    name: String,
-    parameters: Vec<String>,
-    arguments: Vec<Value>,
-    body: Vec<Expr>,
-    environment: Environment,
-    location: SourceLocation,
+    progress: NamedLetProgress,
     continuation: ContinuationFrames,
+    macro_environment: &MacroEnvironment,
 ) -> Result<State, EvalError> {
-    let closure_environment = environment.child();
-    let closure = build_closure_from_names(
-        Some(name.clone()),
+    let NamedLetProgress {
+        name,
         parameters,
-        None,
+        pending: _,
+        mut evaluated_rev,
+        body,
+        environment,
+        location,
+    } = progress;
+    evaluated_rev.reverse();
+
+    let closure_environment = environment.child();
+    let closure = build_closure(
+        Some(name.clone()),
+        ParsedFormals {
+            required_parameters: parameters,
+            rest_parameter: None,
+        },
         &body,
         closure_environment.clone(),
         "let",
         location,
+        macro_environment,
     )?;
     let callable = Value::Closure(closure);
     closure_environment.define(name, callable.clone());
 
     Ok(State::Apply {
         callable,
-        arguments,
+        arguments: evaluated_rev,
         location,
         continuation,
     })
@@ -740,6 +833,7 @@ fn continue_with_frame(
     frame: Frame,
     value: Value,
     continuation: ContinuationFrames,
+    macro_environment: &MacroEnvironment,
 ) -> Result<State, EvalError> {
     match frame {
         Frame::Sequence {
@@ -826,6 +920,7 @@ fn continue_with_frame(
             },
             value,
             continuation,
+            macro_environment,
         ),
         Frame::CondClause {
             body,
@@ -1048,19 +1143,11 @@ fn continue_named_let(
     mut progress: NamedLetProgress,
     value: Value,
     mut continuation: ContinuationFrames,
+    macro_environment: &MacroEnvironment,
 ) -> Result<State, EvalError> {
     progress.evaluated_rev.push(value);
     let Some(expression) = progress.pending.pop() else {
-        progress.evaluated_rev.reverse();
-        return finish_named_let(
-            progress.name,
-            progress.parameters,
-            progress.evaluated_rev,
-            progress.body,
-            progress.environment,
-            progress.location,
-            continuation,
-        );
+        return finish_named_let(progress, continuation, macro_environment);
     };
 
     continuation.push(Frame::NamedLet {
@@ -1244,6 +1331,7 @@ fn define_function(
     body: &[Expr],
     location: SourceLocation,
     environment: &Environment,
+    macro_environment: &MacroEnvironment,
 ) -> Result<Value, EvalError> {
     let Some((Expr::Symbol { name, .. }, parameters)) = signature.split_first() else {
         return Err(EvalError::MalformedSpecialForm {
@@ -1260,6 +1348,7 @@ fn define_function(
         environment.clone(),
         "define",
         location,
+        macro_environment,
     )?;
 
     environment.define(name.clone(), Value::Closure(closure));
@@ -1273,38 +1362,31 @@ fn build_closure(
     environment: Environment,
     form: &'static str,
     location: SourceLocation,
-) -> Result<Closure, EvalError> {
-    build_closure_from_names(
-        name,
-        formals.required_parameters,
-        formals.rest_parameter,
-        body,
-        environment,
-        form,
-        location,
-    )
-}
-
-fn build_closure_from_names(
-    name: Option<String>,
-    parameters: Vec<String>,
-    rest_parameter: Option<String>,
-    body: &[Expr],
-    environment: Environment,
-    form: &'static str,
-    location: SourceLocation,
+    macro_environment: &MacroEnvironment,
 ) -> Result<Closure, EvalError> {
     if body.is_empty() {
         return Err(EvalError::MissingBody { location, form });
     }
 
+    let expanded_body = expand_expressions(body, macro_environment)?;
+
     Ok(Closure::new(
         name,
-        parameters,
-        rest_parameter,
-        body.to_vec(),
+        formals.required_parameters,
+        formals.rest_parameter,
+        expanded_body,
         environment,
     ))
+}
+
+fn expand_expressions(
+    expressions: &[Expr],
+    macro_environment: &MacroEnvironment,
+) -> Result<Vec<Expr>, EvalError> {
+    expressions
+        .iter()
+        .map(|expression| macro_environment.expand_expression(expression))
+        .collect()
 }
 
 fn parse_lambda_formals(
