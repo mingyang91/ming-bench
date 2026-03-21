@@ -255,7 +255,7 @@ fn parse_claude_content_block(block_type: &str, item: &serde_json::Value) -> Opt
 fn parse_codex_event_message(obj: &serde_json::Value) -> Option<EventKind> {
     let payload = obj.get("payload")?;
     match payload.get("type").and_then(|value| value.as_str()) {
-        Some("user_message") => {
+        Some("user_message") | Some("agent_message") => {
             let text = payload
                 .get("message")
                 .and_then(|value| value.as_str())
