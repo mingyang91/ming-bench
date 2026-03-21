@@ -25,9 +25,10 @@ use list_ops::{
 use string_ops::{
     eval_char_alphabetic, eval_char_downcase, eval_char_eq, eval_char_lt, eval_char_numeric,
     eval_char_to_integer, eval_char_upcase, eval_integer_to_char, eval_list_to_string,
-    eval_number_to_string, eval_string_append, eval_string_copy, eval_string_length,
+    eval_number_to_string, eval_string_append, eval_string_ci_eq, eval_string_copy,
+    eval_string_downcase, eval_string_eq, eval_string_length, eval_string_lt,
     eval_string_ref, eval_string_set, eval_string_to_list, eval_string_to_number,
-    eval_string_to_symbol, eval_substring, eval_symbol_to_string,
+    eval_string_to_symbol, eval_string_upcase, eval_substring, eval_symbol_to_string,
 };
 use io_ops::{eval_display, eval_map, eval_newline, eval_write};
 use special_forms::{
@@ -196,6 +197,21 @@ fn eval_list_form(elements: &[Value], env: &Rc<Env>) -> Result<Trampoline, EvalE
         }
         Value::Symbol(op) if op == "char-downcase" => {
             eval_char_downcase(args, env).map(Trampoline::Done)
+        }
+        Value::Symbol(op) if op == "string=?" => {
+            eval_string_eq(args, env).map(Trampoline::Done)
+        }
+        Value::Symbol(op) if op == "string<?" => {
+            eval_string_lt(args, env).map(Trampoline::Done)
+        }
+        Value::Symbol(op) if op == "string-upcase" => {
+            eval_string_upcase(args, env).map(Trampoline::Done)
+        }
+        Value::Symbol(op) if op == "string-downcase" => {
+            eval_string_downcase(args, env).map(Trampoline::Done)
+        }
+        Value::Symbol(op) if op == "string-ci=?" => {
+            eval_string_ci_eq(args, env).map(Trampoline::Done)
         }
         Value::Symbol(op) if op == "map" => eval_map(args, env).map(Trampoline::Done),
         Value::Symbol(op) if op == "display" => eval_display(args, env).map(Trampoline::Done),

@@ -322,3 +322,74 @@ pub fn eval_char_downcase(args: &[Value], env: &Rc<Env>) -> Result<Value, EvalEr
     let c = expect_char(&eval(c_expr, env)?)?;
     Ok(Value::Char(c.to_ascii_lowercase()))
 }
+
+/// Evaluate `(string=? s1 s2)` — string equality.
+pub fn eval_string_eq(args: &[Value], env: &Rc<Env>) -> Result<Value, EvalError> {
+    let [a_expr, b_expr] = args else {
+        return Err(EvalError::WrongArgCount {
+            expected: "2".into(),
+            got: args.len(),
+        });
+    };
+    let a_val = eval(a_expr, env)?;
+    let b_val = eval(b_expr, env)?;
+    let a = expect_string(&a_val)?;
+    let b = expect_string(&b_val)?;
+    Ok(Value::Boolean(a == b))
+}
+
+/// Evaluate `(string<? s1 s2)` — string lexicographic ordering.
+pub fn eval_string_lt(args: &[Value], env: &Rc<Env>) -> Result<Value, EvalError> {
+    let [a_expr, b_expr] = args else {
+        return Err(EvalError::WrongArgCount {
+            expected: "2".into(),
+            got: args.len(),
+        });
+    };
+    let a_val = eval(a_expr, env)?;
+    let b_val = eval(b_expr, env)?;
+    let a = expect_string(&a_val)?;
+    let b = expect_string(&b_val)?;
+    Ok(Value::Boolean(a < b))
+}
+
+/// Evaluate `(string-upcase s)` — convert string to uppercase.
+pub fn eval_string_upcase(args: &[Value], env: &Rc<Env>) -> Result<Value, EvalError> {
+    let [arg] = args else {
+        return Err(EvalError::WrongArgCount {
+            expected: "1".into(),
+            got: args.len(),
+        });
+    };
+    let val = eval(arg, env)?;
+    let s = expect_string(&val)?;
+    Ok(Value::String(s.to_uppercase()))
+}
+
+/// Evaluate `(string-downcase s)` — convert string to lowercase.
+pub fn eval_string_downcase(args: &[Value], env: &Rc<Env>) -> Result<Value, EvalError> {
+    let [arg] = args else {
+        return Err(EvalError::WrongArgCount {
+            expected: "1".into(),
+            got: args.len(),
+        });
+    };
+    let val = eval(arg, env)?;
+    let s = expect_string(&val)?;
+    Ok(Value::String(s.to_lowercase()))
+}
+
+/// Evaluate `(string-ci=? s1 s2)` — case-insensitive string equality.
+pub fn eval_string_ci_eq(args: &[Value], env: &Rc<Env>) -> Result<Value, EvalError> {
+    let [a_expr, b_expr] = args else {
+        return Err(EvalError::WrongArgCount {
+            expected: "2".into(),
+            got: args.len(),
+        });
+    };
+    let a_val = eval(a_expr, env)?;
+    let b_val = eval(b_expr, env)?;
+    let a = expect_string(&a_val)?;
+    let b = expect_string(&b_val)?;
+    Ok(Value::Boolean(a.to_lowercase() == b.to_lowercase()))
+}
