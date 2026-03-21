@@ -45,7 +45,6 @@ object Parser:
       case Token.Atom(s, l, c) :: rest =>
         (parseAtom(s, l, c), rest)
 
-  @tailrec
   private def parseList(
     tokens: List[Token],
     acc: List[Value],
@@ -62,6 +61,19 @@ object Parser:
             Value.PairVal(car, cdr, Some(startPos))
           case other => other
         (result, rest)
+      case Token.Atom(".", _, _) :: rest =>
+        val (cdrVal, rest2) = parseExpr(rest)
+        rest2 match
+          case Token.RParen(_, _) :: rest3 =>
+            val list =
+              acc.foldRight(cdrVal)((h, t) => Value.PairVal(h, t))
+            val result = list match
+              case Value.PairVal(car, cdr, _) =>
+                Value.PairVal(car, cdr, Some(startPos))
+              case other => other
+            (result, rest3)
+          case _ =>
+            throw new EvalError("expected ) after dot notation")
       case _ =>
         val (value, rest) = parseExpr(tokens)
         parseList(rest, acc :+ value, startPos)

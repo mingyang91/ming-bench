@@ -257,3 +257,4 @@ object Builtins:
     .define("string-ref", Value.Symbol("string-ref"))
     .define("string-copy", Value.Symbol("string-copy"))
     .define("string-set!", Value.Symbol("string-set!"))
+    .define("apply", Value.Symbol("apply"))

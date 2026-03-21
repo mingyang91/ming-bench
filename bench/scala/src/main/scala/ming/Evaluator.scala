@@ -41,15 +41,17 @@ object Evaluator:
   private def patchClosures(env: Env): Env =
     val hasNamedLambda = env.bindings.exists { case (n, cell) =>
       cell(0) match
-        case Value.LambdaVal(_, _, _, Some(ln)) => ln == n
-        case _                                  => false
+        case Value.LambdaVal(_, _, _, Some(ln), _) => ln == n
+        case _                                     => false
     }
     if !hasNamedLambda then return env
     lazy val patched: Env = Env(
       env.bindings.map { case (n, cell) =>
         cell(0) match
-          case Value.LambdaVal(ps, bd, _, ln @ Some(name)) if name == n =>
-            n -> Array[Value](Value.LambdaVal(ps, bd, () => patched, ln))
+          case Value.LambdaVal(ps, bd, _, ln @ Some(name), rp) if name == n =>
+            n -> Array[Value](
+              Value.LambdaVal(ps, bd, () => patched, ln, rp)
+            )
           case _ => n -> cell
       },
       env.parent
@@ -159,14 +161,18 @@ object Evaluator:
             params,
             body,
             closureThunk,
-            nameOpt
+            nameOpt,
+            restParam
           ) =>
         val closure = closureThunk()
         val closureWithSelf = nameOpt match
           case Some(n) => closure.define(n, lam)
           case None    => closure
-        val localEnv = closureWithSelf.extend(params, args, pos)
+        val localEnv =
+          closureWithSelf.extendVariadic(params, restParam, args, pos)
         evalBodyTail(body, localEnv, out)
+      case Value.Symbol("apply", _) =>
+        evalApply(args, pos, out)
       case Value.Symbol(name, _) =>
         Done(
           Builtins.applyBuiltin(name, args, pos),
@@ -178,6 +184,18 @@ object Evaluator:
           s"not a procedure: ${proc.display}",
           pos
         )
+
+  private def evalApply(
+    args: List[Value],
+    pos: Option[(Int, Int)],
+    out: String
+  ): EvalResult =
+    if args.length < 2 then throw EvalError.withPos("apply requires at least 2 arguments", pos)
+    val proc       = args.head
+    val prefixArgs = args.tail.init
+    val lastArg    = args.last
+    val listArgs   = toList(lastArg)
+    applyProcTail(proc, prefixArgs ++ listArgs, pos, out)
 
   private[ming] def isFalsy(v: Value): Boolean = v match
     case Value.BoolVal(false) => true

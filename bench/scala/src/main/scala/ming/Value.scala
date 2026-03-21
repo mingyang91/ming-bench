@@ -14,7 +14,8 @@ enum Value:
     params: List[String],
     body: List[Value],
     closure: () => Env,
-    name: Option[String]
+    name: Option[String],
+    restParam: Option[String] = None
   )
   case MutableStringVal(chars: Array[Char])
   case VoidVal

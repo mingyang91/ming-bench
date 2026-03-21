@@ -44,9 +44,9 @@ private[ming] object Forms:
             paramsList,
             _
           ) :: body =>
-        val params = extractParams(paramsList)
-        val envRef = () => env
-        val lambda = Value.LambdaVal(params, body, envRef, Some(name))
+        val (params, rest) = extractParamsWithRest(paramsList)
+        val envRef         = () => env
+        val lambda         = Value.LambdaVal(params, body, envRef, Some(name), rest)
         Done(Value.VoidVal, env.define(name, lambda), out)
       case Value.Symbol(name, _) :: valueExpr :: Nil =>
         val (v, _, out2) = Evaluator.eval(valueExpr, env, out)
@@ -85,19 +85,37 @@ private[ming] object Forms:
   def makeLambda(args: List[Value], env: Env): Value =
     args match
       case paramExpr :: body if body.nonEmpty =>
-        val params = extractParams(paramExpr)
-        val envRef = () => env
-        Value.LambdaVal(params, body, envRef, None)
+        val (params, rest) = extractParamsWithRest(paramExpr)
+        val envRef         = () => env
+        Value.LambdaVal(params, body, envRef, None, rest)
       case _ => throw new EvalError("bad lambda syntax")
 
   private def extractParams(paramExpr: Value): List[String] =
-    Evaluator.toList(paramExpr).map {
-      case Value.Symbol(s, _) => s
-      case other =>
-        throw new EvalError(
-          s"expected symbol in parameter list, got: ${other.display}"
-        )
-    }
+    extractParamsWithRest(paramExpr)._1
+
+  private[ming] def extractParamsWithRest(
+    paramExpr: Value
+  ): (List[String], Option[String]) =
+    paramExpr match
+      case Value.NilVal          => (Nil, None)
+      case Value.Symbol(name, _) => (Nil, Some(name))
+      case Value.PairVal(_, _, _) =>
+        val (elems, tail) = collectParamPairs(paramExpr)
+        val rest = tail match
+          case Value.NilVal       => None
+          case Value.Symbol(n, _) => Some(n)
+          case _                  => throw new EvalError("invalid rest parameter")
+        (elems, rest)
+      case _ => throw new EvalError("invalid parameter list")
+
+  private def collectParamPairs(
+    v: Value
+  ): (List[String], Value) =
+    v match
+      case Value.PairVal(Value.Symbol(name, _), cdr, _) =>
+        val (rest, tail) = collectParamPairs(cdr)
+        (name :: rest, tail)
+      case other => (Nil, other)
 
   def evalAnd(
     args: List[Value],
