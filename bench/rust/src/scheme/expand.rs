@@ -161,7 +161,12 @@ impl Expander {
 
     fn expand_expr(&mut self, expr: &Expr, env: &ExpandEnv) -> Result<Expr, EvalError> {
         match expr {
-            Expr::Int(_, _) | Expr::Bool(_, _) | Expr::String(_, _) | Expr::Char(_, _) => {
+            Expr::Int(_, _)
+            | Expr::Rational(_, _)
+            | Expr::Float(_, _)
+            | Expr::Bool(_, _)
+            | Expr::String(_, _)
+            | Expr::Char(_, _) => {
                 Ok(expr.clone())
             }
             Expr::Symbol(name, pos) => {
@@ -1088,6 +1093,10 @@ impl Expander {
     ) -> Result<bool, EvalError> {
         match pattern {
             Expr::Int(value, _) => Ok(matches!(input, Expr::Int(found, _) if found == value)),
+            Expr::Rational(value, _) => {
+                Ok(matches!(input, Expr::Rational(found, _) if found == value))
+            }
+            Expr::Float(value, _) => Ok(matches!(input, Expr::Float(found, _) if found == value)),
             Expr::Bool(value, _) => Ok(matches!(input, Expr::Bool(found, _) if found == value)),
             Expr::String(value, _) => Ok(matches!(input, Expr::String(found, _) if found == value)),
             Expr::Char(value, _) => Ok(matches!(input, Expr::Char(found, _) if found == value)),
@@ -1139,7 +1148,12 @@ impl Expander {
         intro: &IntroEnv,
     ) -> Result<Expr, EvalError> {
         match template {
-            Expr::Int(_, _) | Expr::Bool(_, _) | Expr::String(_, _) | Expr::Char(_, _) => {
+            Expr::Int(_, _)
+            | Expr::Rational(_, _)
+            | Expr::Float(_, _)
+            | Expr::Bool(_, _)
+            | Expr::String(_, _)
+            | Expr::Char(_, _) => {
                 Ok(template.clone())
             }
             Expr::Symbol(name, pos) => {
@@ -2053,6 +2067,8 @@ fn expr_pos(exprs: &[Expr], default: SourcePos) -> SourcePos {
 fn expr_eq(left: &Expr, right: &Expr) -> bool {
     match (left, right) {
         (Expr::Int(a, _), Expr::Int(b, _)) => a == b,
+        (Expr::Rational(a, _), Expr::Rational(b, _)) => a == b,
+        (Expr::Float(a, _), Expr::Float(b, _)) => a == b,
         (Expr::Bool(a, _), Expr::Bool(b, _)) => a == b,
         (Expr::String(a, _), Expr::String(b, _)) => a == b,
         (Expr::Char(a, _), Expr::Char(b, _)) => a == b,

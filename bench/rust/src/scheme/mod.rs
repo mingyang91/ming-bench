@@ -5,12 +5,15 @@ pub use error::EvalError;
 
 use error::SourcePos;
 use std::cell::RefCell;
+use std::cmp::Ordering;
 use std::collections::HashMap;
 use std::rc::Rc;
 
 #[derive(Clone, Debug, PartialEq)]
 enum Expr {
     Int(i64, SourcePos),
+    Rational(Rational, SourcePos),
+    Float(f64, SourcePos),
     Bool(bool, SourcePos),
     String(String, SourcePos),
     Char(char, SourcePos),
@@ -22,11 +25,111 @@ impl Expr {
     fn pos(&self) -> SourcePos {
         match self {
             Self::Int(_, pos)
+            | Self::Rational(_, pos)
+            | Self::Float(_, pos)
             | Self::Bool(_, pos)
             | Self::String(_, pos)
             | Self::Char(_, pos)
             | Self::Symbol(_, pos)
             | Self::List(_, pos) => *pos,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct Rational {
+    numerator: i64,
+    denominator: i64,
+}
+
+impl Rational {
+    fn new(numerator: i64, denominator: i64) -> Self {
+        debug_assert_ne!(denominator, 0);
+
+        if numerator == 0 {
+            return Self {
+                numerator: 0,
+                denominator: 1,
+            };
+        }
+
+        let mut numerator = numerator;
+        let mut denominator = denominator;
+        if denominator < 0 {
+            numerator = -numerator;
+            denominator = -denominator;
+        }
+
+        let divisor = gcd_i64(numerator, denominator);
+        Self {
+            numerator: numerator / divisor,
+            denominator: denominator / divisor,
+        }
+    }
+
+    fn from_int(value: i64) -> Self {
+        Self {
+            numerator: value,
+            denominator: 1,
+        }
+    }
+
+    fn is_integer(self) -> bool {
+        self.denominator == 1
+    }
+
+    fn abs(self) -> Self {
+        Self::new(self.numerator.abs(), self.denominator)
+    }
+
+    fn to_f64(self) -> f64 {
+        self.numerator as f64 / self.denominator as f64
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum Number {
+    Exact(Rational),
+    Inexact(f64),
+}
+
+impl Number {
+    fn exact_int(value: i64) -> Self {
+        Self::Exact(Rational::from_int(value))
+    }
+
+    fn is_integer(self) -> bool {
+        match self {
+            Self::Exact(value) => value.is_integer(),
+            Self::Inexact(value) => value.fract() == 0.0,
+        }
+    }
+
+    fn to_f64(self) -> f64 {
+        match self {
+            Self::Exact(value) => value.to_f64(),
+            Self::Inexact(value) => value,
+        }
+    }
+
+    fn abs(self) -> Self {
+        match self {
+            Self::Exact(value) => Self::Exact(value.abs()),
+            Self::Inexact(value) => Self::Inexact(value.abs()),
+        }
+    }
+
+    fn render(self) -> String {
+        match self {
+            Self::Exact(value) => render_rational(value),
+            Self::Inexact(value) => render_float(value),
+        }
+    }
+
+    fn exact_rational(self) -> Rational {
+        match self {
+            Self::Exact(value) => value,
+            Self::Inexact(value) => decimal_to_rational(value),
         }
     }
 }
@@ -74,14 +177,22 @@ enum Builtin {
     Assoc,
     IsString,
     IsNumber,
+    IsInteger,
+    IsRational,
     IsBoolean,
     IsPair,
     IsSymbol,
+    IsExact,
+    IsInexact,
     IsZero,
     IsPositive,
     IsNegative,
     IsOdd,
     IsEven,
+    ExactToInexact,
+    InexactToExact,
+    Numerator,
+    Denominator,
     Display,
     Write,
     Newline,
@@ -163,14 +274,22 @@ const BUILTIN_BINDINGS: &[(&str, Builtin)] = &[
     ("assoc", Builtin::Assoc),
     ("string?", Builtin::IsString),
     ("number?", Builtin::IsNumber),
+    ("integer?", Builtin::IsInteger),
+    ("rational?", Builtin::IsRational),
     ("boolean?", Builtin::IsBoolean),
     ("pair?", Builtin::IsPair),
     ("symbol?", Builtin::IsSymbol),
+    ("exact?", Builtin::IsExact),
+    ("inexact?", Builtin::IsInexact),
     ("zero?", Builtin::IsZero),
     ("positive?", Builtin::IsPositive),
     ("negative?", Builtin::IsNegative),
     ("odd?", Builtin::IsOdd),
     ("even?", Builtin::IsEven),
+    ("exact->inexact", Builtin::ExactToInexact),
+    ("inexact->exact", Builtin::InexactToExact),
+    ("numerator", Builtin::Numerator),
+    ("denominator", Builtin::Denominator),
     ("display", Builtin::Display),
     ("write", Builtin::Write),
     ("newline", Builtin::Newline),
@@ -329,6 +448,8 @@ struct WindStep {
 #[derive(Clone, Debug)]
 enum Value {
     Int(i64),
+    Rational(Rational),
+    Float(f64),
     Bool(bool),
     String(SchemeString),
     Symbol(String),
@@ -547,7 +668,7 @@ enum MachineState {
 impl Value {
     fn type_name(&self) -> &'static str {
         match self {
-            Self::Int(_) => "number",
+            Self::Int(_) | Self::Rational(_) | Self::Float(_) => "number",
             Self::Bool(_) => "boolean",
             Self::String(_) => "string",
             Self::Symbol(_) => "symbol",
@@ -577,6 +698,8 @@ impl Value {
     fn render_with_mode(&self, mode: RenderMode) -> String {
         match self {
             Self::Int(value) => value.to_string(),
+            Self::Rational(value) => render_rational(*value),
+            Self::Float(value) => render_float(*value),
             Self::Bool(true) => "#t".into(),
             Self::Bool(false) => "#f".into(),
             Self::String(value) => {
@@ -1038,10 +1161,10 @@ impl<'a> Parser<'a> {
             "#t" => Ok(Expr::Bool(true, pos)),
             "#f" => Ok(Expr::Bool(false, pos)),
             _ if token.starts_with("#\\") => Ok(Expr::Char(parse_char_literal(token, pos)?, pos)),
-            _ => match token.parse::<i64>() {
-                Ok(value) => Ok(Expr::Int(value, pos)),
-                Err(_) => Ok(Expr::Symbol(token.into(), pos)),
-            },
+            _ => parse_number_literal(token, pos).map_or_else(
+                || Ok(Expr::Symbol(token.into(), pos)),
+                Ok,
+            ),
         }
     }
 
@@ -1137,6 +1260,45 @@ fn parse_char_literal(token: &str, pos: SourcePos) -> Result<char, EvalError> {
             Ok(value)
         }
     }
+}
+
+fn parse_number_literal(token: &str, pos: SourcePos) -> Option<Expr> {
+    if let Ok(value) = token.parse::<i64>() {
+        return Some(Expr::Int(value, pos));
+    }
+
+    if let Some(value) = parse_rational_literal(token) {
+        return Some(if value.is_integer() {
+            Expr::Int(value.numerator, pos)
+        } else {
+            Expr::Rational(value, pos)
+        });
+    }
+
+    if looks_like_inexact_literal(token) {
+        if let Ok(value) = token.parse::<f64>() {
+            if value.is_finite() {
+                return Some(Expr::Float(value, pos));
+            }
+        }
+    }
+
+    None
+}
+
+fn parse_rational_literal(token: &str) -> Option<Rational> {
+    let (numerator, denominator) = token.split_once('/')?;
+    let numerator = numerator.parse::<i64>().ok()?;
+    let denominator = denominator.parse::<i64>().ok()?;
+    if denominator == 0 {
+        return None;
+    }
+
+    Some(Rational::new(numerator, denominator))
+}
+
+fn looks_like_inexact_literal(token: &str) -> bool {
+    token.contains('.') || token.contains('e') || token.contains('E')
 }
 
 fn unexpected_eof(pos: SourcePos) -> EvalError {
@@ -1330,6 +1492,8 @@ fn parse_formal_list(params: &[Expr]) -> Result<(Vec<String>, Option<String>), E
 fn quote_expr(expr: &Expr) -> Value {
     match expr {
         Expr::Int(value, _) => Value::Int(*value),
+        Expr::Rational(value, _) => rational_to_value(*value),
+        Expr::Float(value, _) => Value::Float(*value),
         Expr::Bool(value, _) => Value::Bool(*value),
         Expr::String(value, _) => Value::String(SchemeString::new(value.clone())),
         Expr::Char(value, _) => Value::Char(*value),
@@ -1399,6 +1563,14 @@ fn eval_expr_state(
     match expr {
         Expr::Int(value, _) => Ok(MachineState::Return {
             value: Value::Int(value),
+            cont,
+        }),
+        Expr::Rational(value, _) => Ok(MachineState::Return {
+            value: rational_to_value(value),
+            cont,
+        }),
+        Expr::Float(value, _) => Ok(MachineState::Return {
+            value: Value::Float(value),
             cont,
         }),
         Expr::Bool(value, _) => Ok(MachineState::Return {
@@ -2713,11 +2885,21 @@ fn apply_builtin_state(
         Builtin::Eq => Some(eval_eqv_like(&args, pos, "eq?", values_eq)?),
         Builtin::Eqv => Some(eval_eqv_like(&args, pos, "eqv?", values_eqv)?),
         Builtin::EqualDeep => Some(eval_eqv_like(&args, pos, "equal?", values_equal)?),
-        Builtin::LessThan => Some(eval_compare(&args, "<", pos, |left, right| left < right)?),
-        Builtin::GreaterThan => Some(eval_compare(&args, ">", pos, |left, right| left > right)?),
-        Builtin::Equal => Some(eval_compare(&args, "=", pos, |left, right| left == right)?),
-        Builtin::LessEqual => Some(eval_compare(&args, "<=", pos, |left, right| left <= right)?),
-        Builtin::GreaterEqual => Some(eval_compare(&args, ">=", pos, |left, right| left >= right)?),
+        Builtin::LessThan => Some(eval_compare(&args, "<", pos, |left, right| {
+            number_compare(left, right) == Ordering::Less
+        })?),
+        Builtin::GreaterThan => Some(eval_compare(&args, ">", pos, |left, right| {
+            number_compare(left, right) == Ordering::Greater
+        })?),
+        Builtin::Equal => Some(eval_compare(&args, "=", pos, |left, right| {
+            numbers_equal(left, right)
+        })?),
+        Builtin::LessEqual => Some(eval_compare(&args, "<=", pos, |left, right| {
+            matches!(number_compare(left, right), Ordering::Less | Ordering::Equal)
+        })?),
+        Builtin::GreaterEqual => Some(eval_compare(&args, ">=", pos, |left, right| {
+            matches!(number_compare(left, right), Ordering::Greater | Ordering::Equal)
+        })?),
         Builtin::Not => Some(eval_not(&args, pos)?),
         Builtin::Cons => Some(eval_cons(&args, pos)?),
         Builtin::Car => Some(eval_car(&args, pos)?),
@@ -2776,9 +2958,11 @@ fn apply_builtin_state(
         Builtin::IsString => Some(eval_type_predicate(&args, "string?", pos, |value| {
             matches!(value, Value::String(_))
         })?),
-        Builtin::IsNumber => Some(eval_type_predicate(&args, "number?", pos, |value| {
-            matches!(value, Value::Int(_))
+        Builtin::IsNumber => Some(eval_type_predicate(&args, "number?", pos, is_number)?),
+        Builtin::IsInteger => Some(eval_type_predicate(&args, "integer?", pos, |value| {
+            is_integer_value(value)
         })?),
+        Builtin::IsRational => Some(eval_type_predicate(&args, "rational?", pos, is_number)?),
         Builtin::IsBoolean => Some(eval_type_predicate(&args, "boolean?", pos, |value| {
             matches!(value, Value::Bool(_))
         })?),
@@ -2786,21 +2970,31 @@ fn apply_builtin_state(
         Builtin::IsSymbol => Some(eval_type_predicate(&args, "symbol?", pos, |value| {
             matches!(value, Value::Symbol(_))
         })?),
+        Builtin::IsExact => Some(eval_type_predicate(&args, "exact?", pos, |value| {
+            matches!(value, Value::Int(_) | Value::Rational(_))
+        })?),
+        Builtin::IsInexact => Some(eval_type_predicate(&args, "inexact?", pos, |value| {
+            matches!(value, Value::Float(_))
+        })?),
         Builtin::IsZero => Some(eval_number_predicate(&args, "zero?", pos, |value| {
-            value == 0
+            numbers_equal(value, Number::exact_int(0))
         })?),
         Builtin::IsPositive => Some(eval_number_predicate(&args, "positive?", pos, |value| {
-            value > 0
+            number_compare(value, Number::exact_int(0)) == Ordering::Greater
         })?),
         Builtin::IsNegative => Some(eval_number_predicate(&args, "negative?", pos, |value| {
-            value < 0
+            number_compare(value, Number::exact_int(0)) == Ordering::Less
         })?),
-        Builtin::IsOdd => Some(eval_number_predicate(&args, "odd?", pos, |value| {
+        Builtin::IsOdd => Some(eval_integer_predicate(&args, "odd?", pos, |value| {
             value % 2 != 0
         })?),
-        Builtin::IsEven => Some(eval_number_predicate(&args, "even?", pos, |value| {
+        Builtin::IsEven => Some(eval_integer_predicate(&args, "even?", pos, |value| {
             value % 2 == 0
         })?),
+        Builtin::ExactToInexact => Some(eval_exact_to_inexact(&args, pos)?),
+        Builtin::InexactToExact => Some(eval_inexact_to_exact(&args, pos)?),
+        Builtin::Numerator => Some(eval_numerator(&args, pos)?),
+        Builtin::Denominator => Some(eval_denominator(&args, pos)?),
         Builtin::Display => Some(eval_display(&args, pos, &output)?),
         Builtin::Write => Some(eval_write(&args, pos, &output)?),
         Builtin::Newline => Some(eval_newline(&args, pos, &output)?),
@@ -3016,23 +3210,29 @@ fn apply_value(
 
 fn eval_add(args: &[Value], pos: SourcePos) -> Result<Value, EvalError> {
     let numbers = eval_number_args(args, pos)?;
-    Ok(Value::Int(numbers.into_iter().sum()))
+    let total = numbers
+        .into_iter()
+        .fold(Number::exact_int(0), add_numbers);
+    Ok(number_to_value(total))
 }
 
 fn eval_sub(args: &[Value], pos: SourcePos) -> Result<Value, EvalError> {
     let numbers = eval_number_args(args, pos)?;
     match numbers.as_slice() {
         [] => Err(wrong_arity(pos, "-", "at least 1", 0)),
-        [value] => Ok(Value::Int(-value)),
-        [first, rest @ ..] => Ok(Value::Int(
-            rest.iter().fold(*first, |acc, value| acc - value),
+        [value] => Ok(number_to_value(negate_number(*value))),
+        [first, rest @ ..] => Ok(number_to_value(
+            rest.iter().copied().fold(*first, sub_numbers),
         )),
     }
 }
 
 fn eval_mul(args: &[Value], pos: SourcePos) -> Result<Value, EvalError> {
     let numbers = eval_number_args(args, pos)?;
-    Ok(Value::Int(numbers.into_iter().product()))
+    let product = numbers
+        .into_iter()
+        .fold(Number::exact_int(1), mul_numbers);
+    Ok(number_to_value(product))
 }
 
 fn eval_div(args: &[Value], pos: SourcePos) -> Result<Value, EvalError> {
@@ -3047,13 +3247,10 @@ fn eval_div(args: &[Value], pos: SourcePos) -> Result<Value, EvalError> {
 
     let mut result = *first;
     for value in rest {
-        if *value == 0 {
-            return Err(division_by_zero(pos));
-        }
-        result /= value;
+        result = div_numbers(result, *value, pos)?;
     }
 
-    Ok(Value::Int(result))
+    Ok(number_to_value(result))
 }
 
 fn eval_abs(args: &[Value], pos: SourcePos) -> Result<Value, EvalError> {
@@ -3061,7 +3258,7 @@ fn eval_abs(args: &[Value], pos: SourcePos) -> Result<Value, EvalError> {
         return Err(wrong_arity(pos, "abs", "exactly 1", args.len()));
     };
 
-    Ok(Value::Int(expect_integer(value, pos)?.abs()))
+    Ok(number_to_value(expect_number(value, pos)?.abs()))
 }
 
 fn eval_modulo(args: &[Value], pos: SourcePos) -> Result<Value, EvalError> {
@@ -3114,18 +3311,30 @@ fn eval_quotient(args: &[Value], pos: SourcePos) -> Result<Value, EvalError> {
 
 fn eval_min(args: &[Value], pos: SourcePos) -> Result<Value, EvalError> {
     let numbers = eval_number_args(args, pos)?;
-    let Some(minimum) = numbers.into_iter().min() else {
+    let mut iter = numbers.into_iter();
+    let Some(mut minimum) = iter.next() else {
         return Err(wrong_arity(pos, "min", "at least 1", 0));
     };
-    Ok(Value::Int(minimum))
+    for value in iter {
+        if number_compare(value, minimum) == Ordering::Less {
+            minimum = value;
+        }
+    }
+    Ok(number_to_value(minimum))
 }
 
 fn eval_max(args: &[Value], pos: SourcePos) -> Result<Value, EvalError> {
     let numbers = eval_number_args(args, pos)?;
-    let Some(maximum) = numbers.into_iter().max() else {
+    let mut iter = numbers.into_iter();
+    let Some(mut maximum) = iter.next() else {
         return Err(wrong_arity(pos, "max", "at least 1", 0));
     };
-    Ok(Value::Int(maximum))
+    for value in iter {
+        if number_compare(value, maximum) == Ordering::Greater {
+            maximum = value;
+        }
+    }
+    Ok(number_to_value(maximum))
 }
 
 fn eval_expt(args: &[Value], pos: SourcePos) -> Result<Value, EvalError> {
@@ -3171,7 +3380,7 @@ fn eval_compare<F>(
     predicate: F,
 ) -> Result<Value, EvalError>
 where
-    F: Fn(i64, i64) -> bool,
+    F: Fn(Number, Number) -> bool,
 {
     let numbers = eval_number_args(args, pos)?;
     if numbers.len() < 2 {
@@ -3210,6 +3419,22 @@ fn eval_number_predicate<F>(
     predicate: F,
 ) -> Result<Value, EvalError>
 where
+    F: Fn(Number) -> bool,
+{
+    let [value] = args else {
+        return Err(wrong_arity(pos, name, "exactly 1", args.len()));
+    };
+
+    Ok(Value::Bool(predicate(expect_number(value, pos)?)))
+}
+
+fn eval_integer_predicate<F>(
+    args: &[Value],
+    name: &str,
+    pos: SourcePos,
+    predicate: F,
+) -> Result<Value, EvalError>
+where
     F: Fn(i64) -> bool,
 {
     let [value] = args else {
@@ -3219,13 +3444,53 @@ where
     Ok(Value::Bool(predicate(expect_integer(value, pos)?)))
 }
 
+fn eval_exact_to_inexact(args: &[Value], pos: SourcePos) -> Result<Value, EvalError> {
+    let [value] = args else {
+        return Err(wrong_arity(pos, "exact->inexact", "exactly 1", args.len()));
+    };
+
+    Ok(Value::Float(expect_number(value, pos)?.to_f64()))
+}
+
+fn eval_inexact_to_exact(args: &[Value], pos: SourcePos) -> Result<Value, EvalError> {
+    let [value] = args else {
+        return Err(wrong_arity(pos, "inexact->exact", "exactly 1", args.len()));
+    };
+
+    let number = expect_number(value, pos)?;
+    let exact = match number {
+        Number::Exact(value) => value,
+        Number::Inexact(value) => decimal_to_rational(value),
+    };
+    Ok(rational_to_value(exact))
+}
+
+fn eval_numerator(args: &[Value], pos: SourcePos) -> Result<Value, EvalError> {
+    let [value] = args else {
+        return Err(wrong_arity(pos, "numerator", "exactly 1", args.len()));
+    };
+
+    Ok(Value::Int(expect_number(value, pos)?.exact_rational().numerator))
+}
+
+fn eval_denominator(args: &[Value], pos: SourcePos) -> Result<Value, EvalError> {
+    let [value] = args else {
+        return Err(wrong_arity(pos, "denominator", "exactly 1", args.len()));
+    };
+
+    Ok(Value::Int(expect_number(value, pos)?.exact_rational().denominator))
+}
+
 fn values_eq(left: &Value, right: &Value) -> bool {
     values_eqv(left, right)
 }
 
 fn values_eqv(left: &Value, right: &Value) -> bool {
+    if let (Some(left_number), Some(right_number)) = (as_number(left), as_number(right)) {
+        return numbers_equal(left_number, right_number);
+    }
+
     match (left, right) {
-        (Value::Int(a), Value::Int(b)) => a == b,
         (Value::Bool(a), Value::Bool(b)) => a == b,
         (Value::Symbol(a), Value::Symbol(b)) => a == b,
         (Value::Char(a), Value::Char(b)) => a == b,
@@ -3254,8 +3519,11 @@ fn values_equal(left: &Value, right: &Value) -> bool {
                 .all(|(left_item, right_item)| values_equal(left_item, right_item));
     }
 
+    if let (Some(left_number), Some(right_number)) = (as_number(left), as_number(right)) {
+        return numbers_equal(left_number, right_number);
+    }
+
     match (left, right) {
-        (Value::Int(a), Value::Int(b)) => a == b,
         (Value::Bool(a), Value::Bool(b)) => a == b,
         (Value::String(a), Value::String(b)) => a.to_plain_string() == b.to_plain_string(),
         (Value::Symbol(a), Value::Symbol(b)) => a == b,
@@ -3526,10 +3794,10 @@ fn eval_string_to_number(args: &[Value], pos: SourcePos) -> Result<Value, EvalEr
         return Err(wrong_arity(pos, "string->number", "exactly 1", args.len()));
     };
 
-    match expect_string(value, pos)?.to_plain_string().parse::<i64>() {
-        Ok(number) => Ok(Value::Int(number)),
-        Err(_) => Ok(Value::Bool(false)),
-    }
+    let text = expect_string(value, pos)?.to_plain_string();
+    Ok(parse_number_literal(&text, pos)
+        .map(|expr| quote_expr(&expr))
+        .unwrap_or(Value::Bool(false)))
 }
 
 fn eval_number_to_string(args: &[Value], pos: SourcePos) -> Result<Value, EvalError> {
@@ -3538,7 +3806,7 @@ fn eval_number_to_string(args: &[Value], pos: SourcePos) -> Result<Value, EvalEr
     };
 
     Ok(Value::String(SchemeString::new(
-        expect_integer(value, pos)?.to_string(),
+        expect_number(value, pos)?.render(),
     )))
 }
 
@@ -3877,20 +4145,37 @@ fn eval_or(args: &[Expr], env: &EnvRef) -> Result<Value, EvalError> {
     Ok(Value::Bool(false))
 }
 
-fn eval_number_args(args: &[Value], pos: SourcePos) -> Result<Vec<i64>, EvalError> {
-    args.iter()
-        .map(|value| match value {
-            Value::Int(number) => Ok(*number),
-            other => Err(type_error(pos, "number", other.type_name())),
-        })
-        .collect()
+fn eval_number_args(args: &[Value], pos: SourcePos) -> Result<Vec<Number>, EvalError> {
+    args.iter().map(|value| expect_number(value, pos)).collect()
+}
+
+fn as_number(value: &Value) -> Option<Number> {
+    match value {
+        Value::Int(number) => Some(Number::exact_int(*number)),
+        Value::Rational(number) => Some(Number::Exact(*number)),
+        Value::Float(number) => Some(Number::Inexact(*number)),
+        _ => None,
+    }
+}
+
+fn expect_number(value: &Value, pos: SourcePos) -> Result<Number, EvalError> {
+    as_number(value).ok_or_else(|| type_error(pos, "number", value.type_name()))
 }
 
 fn expect_integer(value: &Value, pos: SourcePos) -> Result<i64, EvalError> {
     match value {
         Value::Int(number) => Ok(*number),
+        Value::Rational(number) if number.is_integer() => Ok(number.numerator),
         other => Err(type_error(pos, "number", other.type_name())),
     }
+}
+
+fn is_number(value: &Value) -> bool {
+    as_number(value).is_some()
+}
+
+fn is_integer_value(value: &Value) -> bool {
+    as_number(value).map(Number::is_integer).unwrap_or(false)
 }
 
 fn expect_string(value: &Value, pos: SourcePos) -> Result<SchemeString, EvalError> {
@@ -3918,6 +4203,154 @@ fn expect_vector(value: &Value, pos: SourcePos) -> Result<SchemeVector, EvalErro
     match value {
         Value::Vector(vector) => Ok(vector.clone()),
         other => Err(type_error(pos, "vector", other.type_name())),
+    }
+}
+
+fn rational_to_value(value: Rational) -> Value {
+    if value.is_integer() {
+        Value::Int(value.numerator)
+    } else {
+        Value::Rational(value)
+    }
+}
+
+fn number_to_value(value: Number) -> Value {
+    match value {
+        Number::Exact(value) => rational_to_value(value),
+        Number::Inexact(value) => Value::Float(value),
+    }
+}
+
+fn negate_number(value: Number) -> Number {
+    match value {
+        Number::Exact(value) => Number::Exact(Rational::new(-value.numerator, value.denominator)),
+        Number::Inexact(value) => Number::Inexact(-value),
+    }
+}
+
+fn add_numbers(left: Number, right: Number) -> Number {
+    match (left, right) {
+        (Number::Exact(left), Number::Exact(right)) => Number::Exact(Rational::new(
+            left.numerator * right.denominator + right.numerator * left.denominator,
+            left.denominator * right.denominator,
+        )),
+        _ => Number::Inexact(left.to_f64() + right.to_f64()),
+    }
+}
+
+fn sub_numbers(left: Number, right: Number) -> Number {
+    match (left, right) {
+        (Number::Exact(left), Number::Exact(right)) => Number::Exact(Rational::new(
+            left.numerator * right.denominator - right.numerator * left.denominator,
+            left.denominator * right.denominator,
+        )),
+        _ => Number::Inexact(left.to_f64() - right.to_f64()),
+    }
+}
+
+fn mul_numbers(left: Number, right: Number) -> Number {
+    match (left, right) {
+        (Number::Exact(left), Number::Exact(right)) => Number::Exact(Rational::new(
+            left.numerator * right.numerator,
+            left.denominator * right.denominator,
+        )),
+        _ => Number::Inexact(left.to_f64() * right.to_f64()),
+    }
+}
+
+fn div_numbers(left: Number, right: Number, pos: SourcePos) -> Result<Number, EvalError> {
+    match (left, right) {
+        (_, Number::Exact(value)) if value.numerator == 0 => Err(division_by_zero(pos)),
+        (_, Number::Inexact(value)) if value == 0.0 => Err(division_by_zero(pos)),
+        (Number::Exact(left), Number::Exact(right)) => Ok(Number::Exact(Rational::new(
+            left.numerator * right.denominator,
+            left.denominator * right.numerator,
+        ))),
+        _ => Ok(Number::Inexact(left.to_f64() / right.to_f64())),
+    }
+}
+
+fn number_compare(left: Number, right: Number) -> Ordering {
+    match (left, right) {
+        (Number::Exact(left), Number::Exact(right)) => {
+            (left.numerator * right.denominator).cmp(&(right.numerator * left.denominator))
+        }
+        _ => left
+            .to_f64()
+            .partial_cmp(&right.to_f64())
+            .unwrap_or(Ordering::Equal),
+    }
+}
+
+fn numbers_equal(left: Number, right: Number) -> bool {
+    match (left, right) {
+        (Number::Exact(left), Number::Exact(right)) => left == right,
+        _ => left.to_f64() == right.to_f64(),
+    }
+}
+
+fn decimal_to_rational(value: f64) -> Rational {
+    parse_decimal_rational(&render_float(value)).unwrap_or_else(|| Rational::from_int(value as i64))
+}
+
+fn parse_decimal_rational(text: &str) -> Option<Rational> {
+    let (negative, text) = if let Some(rest) = text.strip_prefix('-') {
+        (true, rest)
+    } else if let Some(rest) = text.strip_prefix('+') {
+        (false, rest)
+    } else {
+        (false, text)
+    };
+
+    let (mantissa, exponent) = if let Some((mantissa, exponent)) = text.split_once(['e', 'E']) {
+        (mantissa, exponent.parse::<i32>().ok()?)
+    } else {
+        (text, 0)
+    };
+
+    let (whole, fraction) = mantissa.split_once('.').unwrap_or((mantissa, ""));
+    if whole.is_empty() && fraction.is_empty() {
+        return None;
+    }
+
+    let digits = format!("{whole}{fraction}");
+    let mut numerator = digits.parse::<i64>().ok()?;
+    if negative {
+        numerator = -numerator;
+    }
+
+    let mut denominator = pow10_i64(fraction.len() as u32)?;
+    if exponent >= 0 {
+        numerator *= pow10_i64(exponent as u32)?;
+    } else {
+        denominator *= pow10_i64((-exponent) as u32)?;
+    }
+
+    Some(Rational::new(numerator, denominator))
+}
+
+fn pow10_i64(power: u32) -> Option<i64> {
+    let mut value = 1i64;
+    for _ in 0..power {
+        value = value.checked_mul(10)?;
+    }
+    Some(value)
+}
+
+fn gcd_i64(left: i64, right: i64) -> i64 {
+    let mut left = i128::from(left).abs();
+    let mut right = i128::from(right).abs();
+
+    while right != 0 {
+        let next = left % right;
+        left = right;
+        right = next;
+    }
+
+    if left == 0 {
+        1
+    } else {
+        left as i64
     }
 }
 
@@ -4039,6 +4472,23 @@ fn render_values(items: &[Value], mode: RenderMode) -> String {
     }
 
     "#<values>".into()
+}
+
+fn render_rational(value: Rational) -> String {
+    if value.is_integer() {
+        value.numerator.to_string()
+    } else {
+        format!("{}/{}", value.numerator, value.denominator)
+    }
+}
+
+fn render_float(value: f64) -> String {
+    let rendered = value.to_string();
+    if rendered.contains('.') || rendered.contains('e') || rendered.contains('E') {
+        rendered
+    } else {
+        format!("{rendered}.0")
+    }
 }
 
 fn render_string(value: &str) -> String {
