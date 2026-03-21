@@ -294,7 +294,8 @@ fn is_builtin(name: &str) -> bool {
         "display" | "write" | "newline" |
         "string-append" | "string-length" | "substring" |
         "string->number" | "number->string" | "symbol->string" | "string->symbol" |
-        "string-copy" | "string-ref" | "char?" | "map" |
+        "string-copy" | "string-ref" | "char?" | "char=?" | "char<?" |
+        "char-alphabetic?" | "char-numeric?" | "char-upcase" | "char-downcase" | "map" |
         "list-ref" | "list-tail" | "list?" | "assoc" |
         "string->list" | "list->string" | "char->integer" | "integer->char" |
         "apply" | "call/cc" | "call-with-current-continuation" |
@@ -1500,6 +1501,48 @@ fn apply_builtin(op: &str, args: &[Value], out: &mut String) -> Result<Value, Ev
         "char?" => {
             if args.len() != 1 { return Err(EvalError::Arity); }
             Ok(Value::Boolean(matches!(&args[0], Value::Char(_))))
+        }
+        "char=?" => {
+            if args.len() != 2 { return Err(EvalError::Arity); }
+            match (&args[0], &args[1]) {
+                (Value::Char(a), Value::Char(b)) => Ok(Value::Boolean(a == b)),
+                _ => Err(EvalError::TypeError("char=?: expected characters".into())),
+            }
+        }
+        "char<?" => {
+            if args.len() != 2 { return Err(EvalError::Arity); }
+            match (&args[0], &args[1]) {
+                (Value::Char(a), Value::Char(b)) => Ok(Value::Boolean(a < b)),
+                _ => Err(EvalError::TypeError("char<?: expected characters".into())),
+            }
+        }
+        "char-alphabetic?" => {
+            if args.len() != 1 { return Err(EvalError::Arity); }
+            match &args[0] {
+                Value::Char(c) => Ok(Value::Boolean(c.is_alphabetic())),
+                _ => Err(EvalError::TypeError("char-alphabetic?: expected character".into())),
+            }
+        }
+        "char-numeric?" => {
+            if args.len() != 1 { return Err(EvalError::Arity); }
+            match &args[0] {
+                Value::Char(c) => Ok(Value::Boolean(c.is_ascii_digit())),
+                _ => Err(EvalError::TypeError("char-numeric?: expected character".into())),
+            }
+        }
+        "char-upcase" => {
+            if args.len() != 1 { return Err(EvalError::Arity); }
+            match &args[0] {
+                Value::Char(c) => Ok(Value::Char(c.to_ascii_uppercase())),
+                _ => Err(EvalError::TypeError("char-upcase: expected character".into())),
+            }
+        }
+        "char-downcase" => {
+            if args.len() != 1 { return Err(EvalError::Arity); }
+            match &args[0] {
+                Value::Char(c) => Ok(Value::Char(c.to_ascii_lowercase())),
+                _ => Err(EvalError::TypeError("char-downcase: expected character".into())),
+            }
         }
         "map" => {
             if args.len() < 2 { return Err(EvalError::Arity); }
