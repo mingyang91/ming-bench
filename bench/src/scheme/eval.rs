@@ -22,13 +22,32 @@ fn is_builtin(name: &str) -> bool {
             | "boolean?"
             | "pair?"
             | "symbol?"
+            | "char?"
+            | "display"
+            | "write"
+            | "newline"
+            | "string-append"
+            | "string-length"
+            | "substring"
+            | "string->number"
+            | "number->string"
+            | "symbol->string"
+            | "string->symbol"
+            | "string-ref"
     )
 }
 
 /// Evaluate a single expression in the given environment.
-pub fn eval(expr: &Value, env: &Rc<RefCell<Env>>, span: Span) -> Result<Value, EvalError> {
+pub fn eval(
+    expr: &Value,
+    env: &Rc<RefCell<Env>>,
+    span: Span,
+    output: &RefCell<String>,
+) -> Result<Value, EvalError> {
     match expr {
-        Value::Integer(_) | Value::Boolean(_) | Value::String(_) => Ok(expr.clone()),
+        Value::Integer(_) | Value::Boolean(_) | Value::String(_) | Value::Char(_) => {
+            Ok(expr.clone())
+        }
         Value::Symbol(name) => match env.borrow().get(name) {
             Some(val) => Ok(val),
             None if is_builtin(name) => Ok(Value::Symbol(name.clone())),
@@ -37,41 +56,53 @@ pub fn eval(expr: &Value, env: &Rc<RefCell<Env>>, span: Span) -> Result<Value, E
                 span,
             }),
         },
-        Value::List(elems) => eval_list(elems, env, span),
+        Value::List(elems) => eval_list(elems, env, span, output),
         Value::Lambda { .. } => Ok(expr.clone()),
         Value::Void => Ok(Value::Void),
     }
 }
 
-fn eval_list(elems: &[Value], env: &Rc<RefCell<Env>>, span: Span) -> Result<Value, EvalError> {
+fn eval_list(
+    elems: &[Value],
+    env: &Rc<RefCell<Env>>,
+    span: Span,
+    output: &RefCell<String>,
+) -> Result<Value, EvalError> {
     let [head, args @ ..] = elems else {
         return Ok(Value::List(vec![]));
     };
 
     if let Value::Symbol(name) = head {
         match name.as_str() {
-            "and" => return eval_and(args, env, span),
-            "or" => return eval_or(args, env, span),
-            "if" => return eval_if(args, env, span),
-            "define" => return eval_define(args, env, span),
+            "and" => return eval_and(args, env, span, output),
+            "or" => return eval_or(args, env, span, output),
+            "if" => return eval_if(args, env, span, output),
+            "define" => return eval_define(args, env, span, output),
             "quote" => return eval_quote(args, span),
             "lambda" => return eval_lambda(args, env, span),
-            "let" => return eval_let(args, env, span),
-            "begin" => return eval_begin(args, env, span),
-            "cond" => return eval_cond(args, env, span),
+            "let" => return eval_let(args, env, span, output),
+            "begin" => return eval_begin(args, env, span, output),
+            "cond" => return eval_cond(args, env, span, output),
             _ => {}
         }
     }
 
-    let proc = eval(head, env, span)?;
-    let evaluated_args: Vec<Value> =
-        args.iter().map(|a| eval(a, env, span)).collect::<Result<_, _>>()?;
-    apply(&proc, &evaluated_args, span)
+    let proc = eval(head, env, span, output)?;
+    let evaluated_args: Vec<Value> = args
+        .iter()
+        .map(|a| eval(a, env, span, output))
+        .collect::<Result<_, _>>()?;
+    apply(&proc, &evaluated_args, span, output)
 }
 
-fn apply(proc: &Value, args: &[Value], span: Span) -> Result<Value, EvalError> {
+fn apply(
+    proc: &Value,
+    args: &[Value],
+    span: Span,
+    output: &RefCell<String>,
+) -> Result<Value, EvalError> {
     match proc {
-        Value::Symbol(name) => apply_builtin(name, args, span),
+        Value::Symbol(name) => apply_builtin(name, args, span, output),
         Value::Lambda { params, body, env } => {
             if params.len() != args.len() {
                 return Err(EvalError::WrongArgCount {
@@ -85,7 +116,7 @@ fn apply(proc: &Value, args: &[Value], span: Span) -> Result<Value, EvalError> {
                 local_env.borrow_mut().define(param.clone(), arg.clone());
             }
             body.iter()
-                .try_fold(Value::Void, |_, expr| eval(expr, &local_env, span))
+                .try_fold(Value::Void, |_, expr| eval(expr, &local_env, span, output))
         }
         other => Err(EvalError::TypeError {
             message: format!("not a procedure: {other}"),
@@ -94,10 +125,15 @@ fn apply(proc: &Value, args: &[Value], span: Span) -> Result<Value, EvalError> {
     }
 }
 
-fn eval_and(args: &[Value], env: &Rc<RefCell<Env>>, span: Span) -> Result<Value, EvalError> {
+fn eval_and(
+    args: &[Value],
+    env: &Rc<RefCell<Env>>,
+    span: Span,
+    output: &RefCell<String>,
+) -> Result<Value, EvalError> {
     let mut result = Value::Boolean(true);
     for arg in args {
-        result = eval(arg, env, span)?;
+        result = eval(arg, env, span, output)?;
         if !is_truthy(&result) {
             return Ok(result);
         }
@@ -105,10 +141,15 @@ fn eval_and(args: &[Value], env: &Rc<RefCell<Env>>, span: Span) -> Result<Value,
     Ok(result)
 }
 
-fn eval_or(args: &[Value], env: &Rc<RefCell<Env>>, span: Span) -> Result<Value, EvalError> {
+fn eval_or(
+    args: &[Value],
+    env: &Rc<RefCell<Env>>,
+    span: Span,
+    output: &RefCell<String>,
+) -> Result<Value, EvalError> {
     let mut result = Value::Boolean(false);
     for arg in args {
-        result = eval(arg, env, span)?;
+        result = eval(arg, env, span, output)?;
         if is_truthy(&result) {
             return Ok(result);
         }
@@ -116,7 +157,12 @@ fn eval_or(args: &[Value], env: &Rc<RefCell<Env>>, span: Span) -> Result<Value, 
     Ok(result)
 }
 
-fn eval_if(args: &[Value], env: &Rc<RefCell<Env>>, span: Span) -> Result<Value, EvalError> {
+fn eval_if(
+    args: &[Value],
+    env: &Rc<RefCell<Env>>,
+    span: Span,
+    output: &RefCell<String>,
+) -> Result<Value, EvalError> {
     let (condition, consequent, alternate) = match args {
         [cond, cons, alt] => (cond, cons, Some(alt)),
         [cond, cons] => (cond, cons, None),
@@ -129,19 +175,24 @@ fn eval_if(args: &[Value], env: &Rc<RefCell<Env>>, span: Span) -> Result<Value, 
         }
     };
 
-    if is_truthy(&eval(condition, env, span)?) {
-        eval(consequent, env, span)
+    if is_truthy(&eval(condition, env, span, output)?) {
+        eval(consequent, env, span, output)
     } else if let Some(alt) = alternate {
-        eval(alt, env, span)
+        eval(alt, env, span, output)
     } else {
         Ok(Value::Void)
     }
 }
 
-fn eval_define(args: &[Value], env: &Rc<RefCell<Env>>, span: Span) -> Result<Value, EvalError> {
+fn eval_define(
+    args: &[Value],
+    env: &Rc<RefCell<Env>>,
+    span: Span,
+    output: &RefCell<String>,
+) -> Result<Value, EvalError> {
     match args {
         [Value::Symbol(name), expr] => {
-            let val = eval(expr, env, span)?;
+            let val = eval(expr, env, span, output)?;
             env.borrow_mut().define(name.clone(), val);
             Ok(Value::Void)
         }
@@ -218,7 +269,12 @@ fn eval_lambda(args: &[Value], env: &Rc<RefCell<Env>>, span: Span) -> Result<Val
     })
 }
 
-fn eval_let(args: &[Value], env: &Rc<RefCell<Env>>, span: Span) -> Result<Value, EvalError> {
+fn eval_let(
+    args: &[Value],
+    env: &Rc<RefCell<Env>>,
+    span: Span,
+    output: &RefCell<String>,
+) -> Result<Value, EvalError> {
     let [Value::List(bindings), body @ ..] = args else {
         return Err(EvalError::TypeError {
             message: "let: expected bindings list".into(),
@@ -245,19 +301,29 @@ fn eval_let(args: &[Value], env: &Rc<RefCell<Env>>, span: Span) -> Result<Value,
                 span,
             });
         };
-        let val = eval(val_expr, env, span)?;
+        let val = eval(val_expr, env, span, output)?;
         local_env.borrow_mut().define(name.clone(), val);
     }
     body.iter()
-        .try_fold(Value::Void, |_, expr| eval(expr, &local_env, span))
+        .try_fold(Value::Void, |_, expr| eval(expr, &local_env, span, output))
 }
 
-fn eval_begin(args: &[Value], env: &Rc<RefCell<Env>>, span: Span) -> Result<Value, EvalError> {
+fn eval_begin(
+    args: &[Value],
+    env: &Rc<RefCell<Env>>,
+    span: Span,
+    output: &RefCell<String>,
+) -> Result<Value, EvalError> {
     args.iter()
-        .try_fold(Value::Void, |_, expr| eval(expr, env, span))
+        .try_fold(Value::Void, |_, expr| eval(expr, env, span, output))
 }
 
-fn eval_cond(args: &[Value], env: &Rc<RefCell<Env>>, span: Span) -> Result<Value, EvalError> {
+fn eval_cond(
+    args: &[Value],
+    env: &Rc<RefCell<Env>>,
+    span: Span,
+    output: &RefCell<String>,
+) -> Result<Value, EvalError> {
     for clause in args {
         let Value::List(elems) = clause else {
             return Err(EvalError::TypeError {
@@ -271,23 +337,33 @@ fn eval_cond(args: &[Value], env: &Rc<RefCell<Env>>, span: Span) -> Result<Value
                 span,
             });
         };
-        if matches!(test, Value::Symbol(s) if s == "else") || is_truthy(&eval(test, env, span)?) {
-            return eval_body(body, env, span);
+        if matches!(test, Value::Symbol(s) if s == "else") || is_truthy(&eval(test, env, span, output)?) {
+            return eval_body(body, env, span, output);
         }
     }
     Ok(Value::Void)
 }
 
-fn eval_body(body: &[Value], env: &Rc<RefCell<Env>>, span: Span) -> Result<Value, EvalError> {
+fn eval_body(
+    body: &[Value],
+    env: &Rc<RefCell<Env>>,
+    span: Span,
+    output: &RefCell<String>,
+) -> Result<Value, EvalError> {
     body.iter()
-        .try_fold(Value::Void, |_, expr| eval(expr, env, span))
+        .try_fold(Value::Void, |_, expr| eval(expr, env, span, output))
 }
 
 fn is_truthy(val: &Value) -> bool {
     !matches!(val, Value::Boolean(false))
 }
 
-fn apply_builtin(name: &str, args: &[Value], span: Span) -> Result<Value, EvalError> {
+fn apply_builtin(
+    name: &str,
+    args: &[Value],
+    span: Span,
+    output: &RefCell<String>,
+) -> Result<Value, EvalError> {
     match name {
         "+" => arith_variadic(args, 0, |a, b| Ok(a + b), span),
         "*" => arith_variadic(args, 1, |a, b| Ok(a * b), span),
@@ -308,84 +384,8 @@ fn apply_builtin(name: &str, args: &[Value], span: Span) -> Result<Value, EvalEr
             };
             Ok(Value::Boolean(!is_truthy(arg)))
         }
-        "cons" => {
-            let [car, cdr] = args else {
-                return Err(EvalError::WrongArgCount {
-                    expected: 2,
-                    got: args.len(),
-                    span,
-                });
-            };
-            match cdr {
-                Value::List(elems) => {
-                    let mut new_list = vec![car.clone()];
-                    new_list.extend(elems.iter().cloned());
-                    Ok(Value::List(new_list))
-                }
-                _ => Ok(Value::List(vec![car.clone(), cdr.clone()])),
-            }
-        }
-        "car" => {
-            let [arg] = args else {
-                return Err(EvalError::WrongArgCount {
-                    expected: 1,
-                    got: args.len(),
-                    span,
-                });
-            };
-            match arg {
-                Value::List(elems) if !elems.is_empty() => Ok(elems[0].clone()),
-                _ => Err(EvalError::TypeError {
-                    message: format!("car: expected non-empty pair, got {arg}"),
-                    span,
-                }),
-            }
-        }
-        "cdr" => {
-            let [arg] = args else {
-                return Err(EvalError::WrongArgCount {
-                    expected: 1,
-                    got: args.len(),
-                    span,
-                });
-            };
-            match arg {
-                Value::List(elems) if !elems.is_empty() => Ok(Value::List(elems[1..].to_vec())),
-                _ => Err(EvalError::TypeError {
-                    message: format!("cdr: expected non-empty pair, got {arg}"),
-                    span,
-                }),
-            }
-        }
-        "null?" => {
-            let [arg] = args else {
-                return Err(EvalError::WrongArgCount {
-                    expected: 1,
-                    got: args.len(),
-                    span,
-                });
-            };
-            Ok(Value::Boolean(matches!(
-                arg,
-                Value::List(elems) if elems.is_empty()
-            )))
-        }
-        "list" => Ok(Value::List(args.to_vec())),
-        "length" => {
-            let [arg] = args else {
-                return Err(EvalError::WrongArgCount {
-                    expected: 1,
-                    got: args.len(),
-                    span,
-                });
-            };
-            match arg {
-                Value::List(elems) => Ok(Value::Integer(elems.len() as i64)),
-                _ => Err(EvalError::TypeError {
-                    message: format!("length: expected list, got {arg}"),
-                    span,
-                }),
-            }
+        "cons" | "car" | "cdr" | "null?" | "list" | "length" => {
+            apply_list_builtin(name, args, span)
         }
         "string?" => Ok(Value::Boolean(matches!(args, [Value::String(_)]))),
         "number?" => Ok(Value::Boolean(matches!(args, [Value::Integer(_)]))),
@@ -394,6 +394,44 @@ fn apply_builtin(name: &str, args: &[Value], span: Span) -> Result<Value, EvalEr
             matches!(args, [Value::List(e)] if !e.is_empty()),
         )),
         "symbol?" => Ok(Value::Boolean(matches!(args, [Value::Symbol(_)]))),
+        "char?" => Ok(Value::Boolean(matches!(args, [Value::Char(_)]))),
+        "display" => {
+            let [arg] = args else {
+                return Err(EvalError::WrongArgCount {
+                    expected: 1,
+                    got: args.len(),
+                    span,
+                });
+            };
+            output.borrow_mut().push_str(&arg.display_str());
+            Ok(Value::Void)
+        }
+        "write" => {
+            let [arg] = args else {
+                return Err(EvalError::WrongArgCount {
+                    expected: 1,
+                    got: args.len(),
+                    span,
+                });
+            };
+            output.borrow_mut().push_str(&arg.to_string());
+            Ok(Value::Void)
+        }
+        "newline" => {
+            if !args.is_empty() {
+                return Err(EvalError::WrongArgCount {
+                    expected: 0,
+                    got: args.len(),
+                    span,
+                });
+            }
+            output.borrow_mut().push('\n');
+            Ok(Value::Void)
+        }
+        "string-append" | "string-length" | "substring" | "string->number"
+        | "number->string" | "symbol->string" | "string->symbol" | "string-ref" => {
+            apply_string_builtin(name, args, span)
+        }
         _ => Err(EvalError::UnboundVariable {
             name: name.to_string(),
             span,
@@ -482,4 +520,195 @@ fn compare_op(
         .collect::<Result<_, _>>()?;
     let result = nums.windows(2).all(|w| op(w[0], w[1]));
     Ok(Value::Boolean(result))
+}
+
+fn apply_list_builtin(
+    name: &str,
+    args: &[Value],
+    span: Span,
+) -> Result<Value, EvalError> {
+    match name {
+        "cons" => {
+            let [car, cdr] = args else {
+                return Err(EvalError::WrongArgCount {
+                    expected: 2,
+                    got: args.len(),
+                    span,
+                });
+            };
+            match cdr {
+                Value::List(elems) => {
+                    let mut new_list = vec![car.clone()];
+                    new_list.extend(elems.iter().cloned());
+                    Ok(Value::List(new_list))
+                }
+                _ => Ok(Value::List(vec![car.clone(), cdr.clone()])),
+            }
+        }
+        "car" => {
+            let [arg] = args else {
+                return Err(EvalError::WrongArgCount {
+                    expected: 1,
+                    got: args.len(),
+                    span,
+                });
+            };
+            match arg {
+                Value::List(elems) if !elems.is_empty() => Ok(elems[0].clone()),
+                _ => Err(EvalError::TypeError {
+                    message: format!("car: expected non-empty pair, got {arg}"),
+                    span,
+                }),
+            }
+        }
+        "cdr" => {
+            let [arg] = args else {
+                return Err(EvalError::WrongArgCount {
+                    expected: 1,
+                    got: args.len(),
+                    span,
+                });
+            };
+            match arg {
+                Value::List(elems) if !elems.is_empty() => Ok(Value::List(elems[1..].to_vec())),
+                _ => Err(EvalError::TypeError {
+                    message: format!("cdr: expected non-empty pair, got {arg}"),
+                    span,
+                }),
+            }
+        }
+        "null?" => {
+            let [arg] = args else {
+                return Err(EvalError::WrongArgCount {
+                    expected: 1,
+                    got: args.len(),
+                    span,
+                });
+            };
+            Ok(Value::Boolean(matches!(
+                arg,
+                Value::List(elems) if elems.is_empty()
+            )))
+        }
+        "list" => Ok(Value::List(args.to_vec())),
+        "length" => {
+            let [arg] = args else {
+                return Err(EvalError::WrongArgCount {
+                    expected: 1,
+                    got: args.len(),
+                    span,
+                });
+            };
+            match arg {
+                Value::List(elems) => Ok(Value::Integer(elems.len() as i64)),
+                _ => Err(EvalError::TypeError {
+                    message: format!("length: expected list, got {arg}"),
+                    span,
+                }),
+            }
+        }
+        _ => unreachable!("apply_list_builtin called with non-list builtin: {name}"),
+    }
+}
+
+fn apply_string_builtin(
+    name: &str,
+    args: &[Value],
+    span: Span,
+) -> Result<Value, EvalError> {
+    match name {
+        "string-append" => {
+            let result: String = args
+                .iter()
+                .map(|a| match a {
+                    Value::String(s) => Ok(s.as_str()),
+                    other => Err(EvalError::TypeError {
+                        message: format!("string-append: expected string, got {other}"),
+                        span,
+                    }),
+                })
+                .collect::<Result<Vec<_>, _>>()?
+                .join("");
+            Ok(Value::String(result))
+        }
+        "string-length" => {
+            let [Value::String(s)] = args else {
+                return Err(EvalError::TypeError {
+                    message: "string-length: expected one string argument".into(),
+                    span,
+                });
+            };
+            Ok(Value::Integer(s.len() as i64))
+        }
+        "substring" => {
+            let [Value::String(s), start_val, end_val] = args else {
+                return Err(EvalError::TypeError {
+                    message: "substring: expected (string start end)".into(),
+                    span,
+                });
+            };
+            let start = require_integer(start_val, span)? as usize;
+            let end = require_integer(end_val, span)? as usize;
+            Ok(Value::String(s[start..end].to_string()))
+        }
+        "string->number" => {
+            let [Value::String(s)] = args else {
+                return Err(EvalError::TypeError {
+                    message: "string->number: expected one string argument".into(),
+                    span,
+                });
+            };
+            match s.parse::<i64>() {
+                Ok(n) => Ok(Value::Integer(n)),
+                Err(_) => Ok(Value::Boolean(false)),
+            }
+        }
+        "number->string" => {
+            let [arg] = args else {
+                return Err(EvalError::WrongArgCount {
+                    expected: 1,
+                    got: args.len(),
+                    span,
+                });
+            };
+            let n = require_integer(arg, span)?;
+            Ok(Value::String(n.to_string()))
+        }
+        "symbol->string" => {
+            let [Value::Symbol(s)] = args else {
+                return Err(EvalError::TypeError {
+                    message: "symbol->string: expected one symbol argument".into(),
+                    span,
+                });
+            };
+            Ok(Value::String(s.clone()))
+        }
+        "string->symbol" => {
+            let [Value::String(s)] = args else {
+                return Err(EvalError::TypeError {
+                    message: "string->symbol: expected one string argument".into(),
+                    span,
+                });
+            };
+            Ok(Value::Symbol(s.clone()))
+        }
+        "string-ref" => {
+            let [Value::String(s), idx_val] = args else {
+                return Err(EvalError::TypeError {
+                    message: "string-ref: expected (string index)".into(),
+                    span,
+                });
+            };
+            let idx = require_integer(idx_val, span)? as usize;
+            let c = s.chars().nth(idx).ok_or_else(|| EvalError::TypeError {
+                message: format!(
+                    "string-ref: index {idx} out of range for string of length {}",
+                    s.len()
+                ),
+                span,
+            })?;
+            Ok(Value::Char(c))
+        }
+        _ => unreachable!("apply_string_builtin called with non-string builtin: {name}"),
+    }
 }

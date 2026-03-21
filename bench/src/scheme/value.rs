@@ -11,6 +11,7 @@ pub enum Value {
     Boolean(bool),
     String(std::string::String),
     Symbol(std::string::String),
+    Char(char),
     List(Vec<Value>),
     Lambda {
         params: Vec<std::string::String>,
@@ -27,6 +28,7 @@ impl PartialEq for Value {
             (Value::Boolean(a), Value::Boolean(b)) => a == b,
             (Value::String(a), Value::String(b)) => a == b,
             (Value::Symbol(a), Value::Symbol(b)) => a == b,
+            (Value::Char(a), Value::Char(b)) => a == b,
             (Value::List(a), Value::List(b)) => a == b,
             (Value::Void, Value::Void) => true,
             (Value::Lambda { .. }, Value::Lambda { .. }) => false,
@@ -46,6 +48,21 @@ fn fmt_list(elems: &[Value], f: &mut fmt::Formatter<'_>) -> fmt::Result {
     write!(f, ")")
 }
 
+impl Value {
+    /// Format for `display` — strings without quotes, chars as raw characters.
+    pub fn display_str(&self) -> String {
+        match self {
+            Value::String(s) => s.clone(),
+            Value::Char(c) => c.to_string(),
+            Value::List(elems) => {
+                let inner: Vec<String> = elems.iter().map(|e| e.display_str()).collect();
+                format!("({})", inner.join(" "))
+            }
+            other => other.to_string(),
+        }
+    }
+}
+
 impl fmt::Display for Value {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
@@ -54,6 +71,7 @@ impl fmt::Display for Value {
             Value::Boolean(false) => write!(f, "#f"),
             Value::String(s) => write!(f, "\"{s}\""),
             Value::Symbol(s) => write!(f, "{s}"),
+            Value::Char(c) => write!(f, "#\\{c}"),
             Value::List(elems) => fmt_list(elems, f),
             Value::Lambda { .. } => write!(f, "#<procedure>"),
             Value::Void => write!(f, ""),
