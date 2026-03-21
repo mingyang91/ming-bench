@@ -863,6 +863,69 @@ pub fn apply_assoc(args: &[Value]) -> Result<Value, EvalError> {
         .map_or(Ok(Value::Boolean(false)), Ok)
 }
 
+fn require_two_strings(args: &[Value]) -> Result<(&str, &str), EvalError> {
+    let [a, b] = args else {
+        return Err(EvalError::WrongArgCount {
+            expected: 2,
+            got: args.len(),
+        });
+    };
+    let Value::String(sa) = a else {
+        return Err(EvalError::TypeError {
+            expected: "string".to_string(),
+            got: format!("{a}"),
+        });
+    };
+    let Value::String(sb) = b else {
+        return Err(EvalError::TypeError {
+            expected: "string".to_string(),
+            got: format!("{b}"),
+        });
+    };
+    Ok((sa.as_str(), sb.as_str()))
+}
+
+fn require_one_string(args: &[Value]) -> Result<&str, EvalError> {
+    let [val] = args else {
+        return Err(EvalError::WrongArgCount {
+            expected: 1,
+            got: args.len(),
+        });
+    };
+    let Value::String(s) = val else {
+        return Err(EvalError::TypeError {
+            expected: "string".to_string(),
+            got: format!("{val}"),
+        });
+    };
+    Ok(s.as_str())
+}
+
+pub fn apply_string_eq(args: &[Value]) -> Result<Value, EvalError> {
+    let (a, b) = require_two_strings(args)?;
+    Ok(Value::Boolean(a == b))
+}
+
+pub fn apply_string_lt(args: &[Value]) -> Result<Value, EvalError> {
+    let (a, b) = require_two_strings(args)?;
+    Ok(Value::Boolean(a < b))
+}
+
+pub fn apply_string_ci_eq(args: &[Value]) -> Result<Value, EvalError> {
+    let (a, b) = require_two_strings(args)?;
+    Ok(Value::Boolean(a.to_lowercase() == b.to_lowercase()))
+}
+
+pub fn apply_string_upcase(args: &[Value]) -> Result<Value, EvalError> {
+    let s = require_one_string(args)?;
+    Ok(Value::String(s.to_uppercase()))
+}
+
+pub fn apply_string_downcase(args: &[Value]) -> Result<Value, EvalError> {
+    let s = require_one_string(args)?;
+    Ok(Value::String(s.to_lowercase()))
+}
+
 pub fn apply_vector_to_list(args: &[Value]) -> Result<Value, EvalError> {
     let [val] = args else {
         return Err(EvalError::WrongArgCount {

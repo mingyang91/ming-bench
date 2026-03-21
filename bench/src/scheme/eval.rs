@@ -122,6 +122,11 @@ fn is_builtin(name: &str) -> bool {
             | "symbol->string"
             | "string->symbol"
             | "string-copy"
+            | "string=?"
+            | "string<?"
+            | "string-ci=?"
+            | "string-upcase"
+            | "string-downcase"
             | "string->list"
             | "list->string"
             | "char->integer"
@@ -604,6 +609,11 @@ fn apply_builtin(op: &str, args: &[Value]) -> Result<Value, EvalError> {
         "symbol->string" => builtins::apply_symbol_to_string(args),
         "string->symbol" => builtins::apply_string_to_symbol(args),
         "string-copy" => builtins::apply_string_copy(args),
+        "string=?" => builtins::apply_string_eq(args),
+        "string<?" => builtins::apply_string_lt(args),
+        "string-ci=?" => builtins::apply_string_ci_eq(args),
+        "string-upcase" => builtins::apply_string_upcase(args),
+        "string-downcase" => builtins::apply_string_downcase(args),
         "string->list" => builtins::apply_string_to_list(args),
         "list->string" => builtins::apply_list_to_string(args),
         "char->integer" => builtins::apply_char_to_integer(args),
