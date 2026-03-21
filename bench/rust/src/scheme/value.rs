@@ -10,6 +10,7 @@ pub enum Value {
     String(String),
     Symbol(String),
     Char(char),
+    Pair(Box<Value>, Box<Value>),
     List(Vec<Value>),
     Lambda {
         params: Vec<String>,
@@ -35,6 +36,7 @@ impl PartialEq for Value {
             (Value::String(a), Value::String(b)) => a == b,
             (Value::Symbol(a), Value::Symbol(b)) => a == b,
             (Value::Char(a), Value::Char(b)) => a == b,
+            (Value::Pair(a1, a2), Value::Pair(b1, b2)) => a1 == b1 && a2 == b2,
             (Value::List(a), Value::List(b)) => a == b,
             (Value::Builtin(a), Value::Builtin(b)) => a == b,
             (
@@ -56,6 +58,7 @@ impl fmt::Display for Value {
             Value::Boolean(false) => write!(f, "#f"),
             Value::String(s) => write!(f, "\"{s}\""),
             Value::Char(c) => write!(f, "#\\{c}"),
+            Value::Pair(car, cdr) => write!(f, "({car} . {cdr})"),
             Value::Symbol(s) => write!(f, "{s}"),
             Value::List(items) => fmt_list(f, items),
             Value::Lambda { .. }
@@ -81,11 +84,23 @@ impl Value {
         !matches!(self, Value::Boolean(false))
     }
 
+    /// Check if this value is a pair (non-empty list or dotted pair).
+    pub fn is_pair(&self) -> bool {
+        matches!(self, Value::List(l) if !l.is_empty()) || matches!(self, Value::Pair(_, _))
+    }
+
     /// Format for `display` — strings without quotes, chars as plain characters.
     pub fn display_fmt(&self, buf: &mut String) {
         match self {
             Value::String(s) => buf.push_str(s),
             Value::Char(c) => buf.push(*c),
+            Value::Pair(car, cdr) => {
+                buf.push('(');
+                car.display_fmt(buf);
+                buf.push_str(" . ");
+                cdr.display_fmt(buf);
+                buf.push(')');
+            }
             Value::List(items) => Self::display_list(items, buf),
             Value::Continuation { .. } | Value::Macro { .. } => buf.push_str("#<procedure>"),
             other => buf.push_str(&other.to_string()),

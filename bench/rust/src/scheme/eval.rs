@@ -553,14 +553,12 @@ fn parse_params(params: &[Expr], span: Span) -> Result<(Vec<String>, Option<Stri
     Ok((names, Some(rest_name.clone())))
 }
 
-/// Apply a builtin procedure to already-evaluated argument values.
-fn apply_builtin_values(name: &str, args: &[Value]) -> Result<Value, EvalError> {
+/// Apply arithmetic builtin operations.
+fn apply_arithmetic_builtin(name: &str, args: &[Value]) -> Result<Value, EvalError> {
     match name {
-        "+" => {
-            args.iter()
-                .try_fold(0i64, |acc, v| Ok(acc + expect_integer(v)?))
-                .map(Value::Integer)
-        }
+        "+" => args.iter()
+            .try_fold(0i64, |acc, v| Ok(acc + expect_integer(v)?))
+            .map(Value::Integer),
         "-" => {
             let [first, rest @ ..] = args else {
                 return Err(EvalError::WrongArgCount { expected: 1, got: 0 });
@@ -573,11 +571,9 @@ fn apply_builtin_values(name: &str, args: &[Value]) -> Result<Value, EvalError> 
                 .try_fold(first_val, |acc, v| Ok(acc - expect_integer(v)?))
                 .map(Value::Integer)
         }
-        "*" => {
-            args.iter()
-                .try_fold(1i64, |acc, v| Ok(acc * expect_integer(v)?))
-                .map(Value::Integer)
-        }
+        "*" => args.iter()
+            .try_fold(1i64, |acc, v| Ok(acc * expect_integer(v)?))
+            .map(Value::Integer),
         "/" => {
             let [first, rest @ ..] = args else {
                 return Err(EvalError::WrongArgCount { expected: 1, got: 0 });
@@ -587,6 +583,65 @@ fn apply_builtin_values(name: &str, args: &[Value]) -> Result<Value, EvalError> 
                 .try_fold(first_val, |acc, v| checked_div(acc, expect_integer(v)?))
                 .map(Value::Integer)
         }
+        "abs" => {
+            let [arg] = args else {
+                return Err(EvalError::WrongArgCount { expected: 1, got: args.len() });
+            };
+            Ok(Value::Integer(expect_integer(arg)?.abs()))
+        }
+        "modulo" => {
+            let [a, b] = args else {
+                return Err(EvalError::WrongArgCount { expected: 2, got: args.len() });
+            };
+            let (a, b) = (expect_integer(a)?, expect_integer(b)?);
+            if b == 0 { return Err(EvalError::DivisionByZero); }
+            Ok(Value::Integer(((a % b) + b) % b))
+        }
+        "remainder" => {
+            let [a, b] = args else {
+                return Err(EvalError::WrongArgCount { expected: 2, got: args.len() });
+            };
+            let (a, b) = (expect_integer(a)?, expect_integer(b)?);
+            if b == 0 { return Err(EvalError::DivisionByZero); }
+            Ok(Value::Integer(a % b))
+        }
+        "quotient" => {
+            let [a, b] = args else {
+                return Err(EvalError::WrongArgCount { expected: 2, got: args.len() });
+            };
+            let (a, b) = (expect_integer(a)?, expect_integer(b)?);
+            checked_div(a, b).map(Value::Integer)
+        }
+        "min" => {
+            let [first, rest @ ..] = args else {
+                return Err(EvalError::WrongArgCount { expected: 1, got: 0 });
+            };
+            rest.iter().try_fold(expect_integer(first)?, |acc, v| {
+                Ok(acc.min(expect_integer(v)?))
+            }).map(Value::Integer)
+        }
+        "max" => {
+            let [first, rest @ ..] = args else {
+                return Err(EvalError::WrongArgCount { expected: 1, got: 0 });
+            };
+            rest.iter().try_fold(expect_integer(first)?, |acc, v| {
+                Ok(acc.max(expect_integer(v)?))
+            }).map(Value::Integer)
+        }
+        "expt" => {
+            let [base, exp] = args else {
+                return Err(EvalError::WrongArgCount { expected: 2, got: args.len() });
+            };
+            let (b, e) = (expect_integer(base)?, expect_integer(exp)?);
+            Ok(Value::Integer(b.pow(e as u32)))
+        }
+        _ => unreachable!("not an arithmetic builtin: {name}"),
+    }
+}
+
+/// Apply list-related builtin operations.
+fn apply_list_builtin(name: &str, args: &[Value]) -> Result<Value, EvalError> {
+    match name {
         "cons" => {
             let [h, t] = args else {
                 return Err(EvalError::WrongArgCount { expected: 2, got: args.len() });
@@ -597,29 +652,29 @@ fn apply_builtin_values(name: &str, args: &[Value]) -> Result<Value, EvalError> 
                     new.extend(items.iter().cloned());
                     Ok(Value::List(new))
                 }
-                _ => Ok(Value::List(vec![h.clone(), t.clone()])),
+                _ => Ok(Value::Pair(Box::new(h.clone()), Box::new(t.clone()))),
             }
         }
         "car" => {
             let [arg] = args else {
                 return Err(EvalError::WrongArgCount { expected: 1, got: args.len() });
             };
-            let Value::List(items) = arg else {
-                return Err(EvalError::TypeError { expected: "pair".into(), got: format!("{arg}") });
-            };
-            items.first().cloned().ok_or_else(|| EvalError::TypeError { expected: "pair".into(), got: "()".into() })
+            match arg {
+                Value::Pair(car, _) => Ok(car.as_ref().clone()),
+                Value::List(items) => items.first().cloned().ok_or_else(|| EvalError::TypeError { expected: "pair".into(), got: "()".into() }),
+                _ => Err(EvalError::TypeError { expected: "pair".into(), got: format!("{arg}") }),
+            }
         }
         "cdr" => {
             let [arg] = args else {
                 return Err(EvalError::WrongArgCount { expected: 1, got: args.len() });
             };
-            let Value::List(items) = arg else {
-                return Err(EvalError::TypeError { expected: "pair".into(), got: format!("{arg}") });
-            };
-            if items.is_empty() {
-                return Err(EvalError::TypeError { expected: "pair".into(), got: "()".into() });
+            match arg {
+                Value::Pair(_, cdr) => Ok(cdr.as_ref().clone()),
+                Value::List(items) if items.is_empty() => Err(EvalError::TypeError { expected: "pair".into(), got: "()".into() }),
+                Value::List(items) => Ok(Value::List(items[1..].to_vec())),
+                _ => Err(EvalError::TypeError { expected: "pair".into(), got: format!("{arg}") }),
             }
-            Ok(Value::List(items[1..].to_vec()))
         }
         "null?" => {
             let [arg] = args else {
@@ -637,6 +692,59 @@ fn apply_builtin_values(name: &str, args: &[Value]) -> Result<Value, EvalError> 
             };
             Ok(Value::Integer(items.len() as i64))
         }
+        "list-ref" => {
+            let [list, idx] = args else {
+                return Err(EvalError::WrongArgCount { expected: 2, got: args.len() });
+            };
+            let Value::List(items) = list else {
+                return Err(EvalError::TypeError { expected: "list".into(), got: format!("{list}") });
+            };
+            let i = expect_integer(idx)? as usize;
+            items.get(i).cloned().ok_or_else(|| EvalError::TypeError {
+                expected: "valid list index".into(),
+                got: format!("index {i} out of range"),
+            })
+        }
+        "list-tail" => {
+            let [list, idx] = args else {
+                return Err(EvalError::WrongArgCount { expected: 2, got: args.len() });
+            };
+            let Value::List(items) = list else {
+                return Err(EvalError::TypeError { expected: "list".into(), got: format!("{list}") });
+            };
+            let i = expect_integer(idx)? as usize;
+            if i > items.len() {
+                return Err(EvalError::TypeError {
+                    expected: "valid list index".into(),
+                    got: format!("index {i} out of range"),
+                });
+            }
+            Ok(Value::List(items[i..].to_vec()))
+        }
+        "list?" => Ok(Value::Boolean(matches!(args, [v] if is_proper_list(v)))),
+        "assoc" => {
+            let [key, alist] = args else {
+                return Err(EvalError::WrongArgCount { expected: 2, got: args.len() });
+            };
+            let Value::List(items) = alist else {
+                return Err(EvalError::TypeError { expected: "list".into(), got: format!("{alist}") });
+            };
+            let found = items.iter().find(|entry| {
+                matches!(entry, Value::List(pair) if !pair.is_empty() && values_equal(key, &pair[0]))
+            });
+            Ok(found.cloned().unwrap_or(Value::Boolean(false)))
+        }
+        _ => unreachable!("not a list builtin: {name}"),
+    }
+}
+
+/// Apply a builtin procedure to already-evaluated argument values.
+fn apply_builtin_values(name: &str, args: &[Value]) -> Result<Value, EvalError> {
+    match name {
+        "+" | "-" | "*" | "/" | "abs" | "modulo" | "remainder" | "quotient"
+        | "min" | "max" | "expt" => apply_arithmetic_builtin(name, args),
+        "cons" | "car" | "cdr" | "null?" | "list" | "length"
+        | "list-ref" | "list-tail" | "list?" | "assoc" => apply_list_builtin(name, args),
         "<" => eval_cmp_values(args, |a, b| a < b),
         ">" => eval_cmp_values(args, |a, b| a > b),
         "=" => eval_cmp_values(args, |a, b| a == b),
@@ -651,10 +759,48 @@ fn apply_builtin_values(name: &str, args: &[Value]) -> Result<Value, EvalError> 
         "string?" => Ok(Value::Boolean(matches!(args, [Value::String(_)]))),
         "number?" => Ok(Value::Boolean(matches!(args, [Value::Integer(_)]))),
         "boolean?" => Ok(Value::Boolean(matches!(args, [Value::Boolean(_)]))),
-        "pair?" => Ok(Value::Boolean(matches!(args, [Value::List(l)] if !l.is_empty()))),
+        "pair?" => Ok(Value::Boolean(matches!(args, [ref v] if v.is_pair()))),
         "symbol?" => Ok(Value::Boolean(matches!(args, [Value::Symbol(_)]))),
         "char?" => Ok(Value::Boolean(matches!(args, [Value::Char(_)]))),
+        "eq?" => {
+            let [a, b] = args else {
+                return Err(EvalError::WrongArgCount { expected: 2, got: args.len() });
+            };
+            Ok(Value::Boolean(values_eq(a, b)))
+        }
+        "equal?" => {
+            let [a, b] = args else {
+                return Err(EvalError::WrongArgCount { expected: 2, got: args.len() });
+            };
+            Ok(Value::Boolean(values_equal(a, b)))
+        }
+        "zero?" => Ok(Value::Boolean(matches!(args, [Value::Integer(0)]))),
+        "positive?" => Ok(Value::Boolean(matches!(args, [Value::Integer(n)] if *n > 0))),
+        "negative?" => Ok(Value::Boolean(matches!(args, [Value::Integer(n)] if *n < 0))),
+        "odd?" => Ok(Value::Boolean(matches!(args, [Value::Integer(n)] if n % 2 != 0))),
+        "even?" => Ok(Value::Boolean(matches!(args, [Value::Integer(n)] if n % 2 == 0))),
+        "char-alphabetic?" | "char-numeric?" | "char-upcase" | "char-downcase"
+        | "char=?" | "char<?" => apply_char_builtin(name, args),
+        "string=?" | "string<?" | "string-ci=?" | "string-upcase" | "string-downcase" =>
+            apply_string_builtin(name, args),
+        "map" => apply_map_builtin(args),
         _ => Err(EvalError::UnboundVariable { name: name.into() }),
+    }
+}
+
+fn call_proc_values(proc: &Value, args: &[Value]) -> Result<Value, EvalError> {
+    match proc {
+        Value::Lambda { .. } => {
+            match apply_lambda_values(proc.clone(), args, Span { line: 0, col: 0 })? {
+                Bounce::Done(val) => Ok(val),
+                Bounce::Tco(expr, tco_env) => eval(&expr, &tco_env),
+            }
+        }
+        Value::Builtin(ref bname) => apply_builtin_values(bname, args),
+        _ => Err(EvalError::TypeError {
+            expected: "procedure".into(),
+            got: format!("{proc}"),
+        }),
     }
 }
 
@@ -671,6 +817,102 @@ fn eval_cmp_values(args: &[Value], cmp: fn(i64, i64) -> bool) -> Result<Value, E
     Ok(Value::Boolean(cmp(*a, *b)))
 }
 
+fn apply_char_builtin(name: &str, args: &[Value]) -> Result<Value, EvalError> {
+    match name {
+        "char-alphabetic?" => {
+            let [Value::Char(c)] = args else {
+                return Err(EvalError::TypeError { expected: "char".into(), got: format!("{args:?}") });
+            };
+            Ok(Value::Boolean(c.is_alphabetic()))
+        }
+        "char-numeric?" => {
+            let [Value::Char(c)] = args else {
+                return Err(EvalError::TypeError { expected: "char".into(), got: format!("{args:?}") });
+            };
+            Ok(Value::Boolean(c.is_ascii_digit()))
+        }
+        "char-upcase" => {
+            let [Value::Char(c)] = args else {
+                return Err(EvalError::TypeError { expected: "char".into(), got: format!("{args:?}") });
+            };
+            Ok(Value::Char(c.to_ascii_uppercase()))
+        }
+        "char-downcase" => {
+            let [Value::Char(c)] = args else {
+                return Err(EvalError::TypeError { expected: "char".into(), got: format!("{args:?}") });
+            };
+            Ok(Value::Char(c.to_ascii_lowercase()))
+        }
+        "char=?" => {
+            let [Value::Char(a), Value::Char(b)] = args else {
+                return Err(EvalError::TypeError { expected: "char".into(), got: format!("{args:?}") });
+            };
+            Ok(Value::Boolean(a == b))
+        }
+        "char<?" => {
+            let [Value::Char(a), Value::Char(b)] = args else {
+                return Err(EvalError::TypeError { expected: "char".into(), got: format!("{args:?}") });
+            };
+            Ok(Value::Boolean(a < b))
+        }
+        _ => unreachable!("not a char builtin: {name}"),
+    }
+}
+
+fn apply_string_builtin(name: &str, args: &[Value]) -> Result<Value, EvalError> {
+    match name {
+        "string=?" | "string<?" | "string-ci=?" => {
+            let [Value::String(a), Value::String(b)] = args else {
+                return Err(EvalError::TypeError { expected: "string".into(), got: format!("{args:?}") });
+            };
+            let result = match name {
+                "string=?" => a == b,
+                "string<?" => a < b,
+                "string-ci=?" => a.to_lowercase() == b.to_lowercase(),
+                _ => unreachable!(),
+            };
+            Ok(Value::Boolean(result))
+        }
+        "string-upcase" => {
+            let [Value::String(s)] = args else {
+                return Err(EvalError::TypeError { expected: "string".into(), got: format!("{args:?}") });
+            };
+            Ok(Value::String(s.to_uppercase()))
+        }
+        "string-downcase" => {
+            let [Value::String(s)] = args else {
+                return Err(EvalError::TypeError { expected: "string".into(), got: format!("{args:?}") });
+            };
+            Ok(Value::String(s.to_lowercase()))
+        }
+        _ => unreachable!("not a string builtin: {name}"),
+    }
+}
+
+fn apply_map_builtin(args: &[Value]) -> Result<Value, EvalError> {
+    let [proc, list_args @ ..] = args else {
+        return Err(EvalError::WrongArgCount { expected: 2, got: args.len() });
+    };
+    if list_args.is_empty() {
+        return Err(EvalError::WrongArgCount { expected: 2, got: 1 });
+    }
+    let lists: Vec<&Vec<Value>> = list_args
+        .iter()
+        .map(|v| match v {
+            Value::List(items) => Ok(items),
+            _ => Err(EvalError::TypeError { expected: "list".into(), got: format!("{v}") }),
+        })
+        .collect::<Result<_, _>>()?;
+    let len = lists[0].len();
+    let mut results = Vec::with_capacity(len);
+    for i in 0..len {
+        let call_args: Vec<Value> = lists.iter().map(|l| l[i].clone()).collect();
+        let result = call_proc_values(proc, &call_args)?;
+        results.push(result);
+    }
+    Ok(Value::List(results))
+}
+
 fn is_builtin(name: &str) -> bool {
     matches!(
         name,
@@ -682,6 +924,16 @@ fn is_builtin(name: &str) -> bool {
             | "string->number" | "number->string"
             | "string-ref" | "symbol->string" | "string->symbol"
             | "string-copy"
+            | "eq?" | "equal?"
+            | "abs" | "modulo" | "remainder" | "quotient"
+            | "min" | "max" | "expt"
+            | "zero?" | "positive?" | "negative?" | "odd?" | "even?"
+            | "list-ref" | "list-tail" | "list?" | "assoc" | "map"
+            | "char-alphabetic?" | "char-numeric?"
+            | "char-upcase" | "char-downcase"
+            | "char=?" | "char<?"
+            | "string=?" | "string<?" | "string-ci=?"
+            | "string-upcase" | "string-downcase"
     )
 }
 
@@ -706,7 +958,7 @@ fn eval_builtin(op: &str, args: &[Expr], env: &Env) -> Result<Value, EvalError> 
         "string?" => eval_type_pred(args, env, |v| matches!(v, Value::String(_))),
         "number?" => eval_type_pred(args, env, |v| matches!(v, Value::Integer(_))),
         "boolean?" => eval_type_pred(args, env, |v| matches!(v, Value::Boolean(_))),
-        "pair?" => eval_type_pred(args, env, |v| matches!(v, Value::List(l) if !l.is_empty())),
+        "pair?" => eval_type_pred(args, env, |v| v.is_pair()),
         "symbol?" => eval_type_pred(args, env, |v| matches!(v, Value::Symbol(_))),
         "char?" => eval_type_pred(args, env, |v| matches!(v, Value::Char(_))),
         "display" => eval_display(args, env),
@@ -721,6 +973,38 @@ fn eval_builtin(op: &str, args: &[Expr], env: &Env) -> Result<Value, EvalError> 
         "symbol->string" => eval_symbol_to_string(args, env),
         "string->symbol" => eval_string_to_symbol(args, env),
         "string-copy" => eval_string_copy(args, env),
+        "eq?" => eval_eq(args, env),
+        "equal?" => eval_equal(args, env),
+        "abs" => eval_abs(args, env),
+        "modulo" => eval_modulo(args, env),
+        "remainder" => eval_remainder(args, env),
+        "quotient" => eval_quotient(args, env),
+        "min" => eval_min_max(args, env, true),
+        "max" => eval_min_max(args, env, false),
+        "expt" => eval_expt(args, env),
+        "zero?" => eval_type_pred(args, env, |v| matches!(v, Value::Integer(0))),
+        "positive?" => eval_type_pred(args, env, |v| matches!(v, Value::Integer(n) if *n > 0)),
+        "negative?" => eval_type_pred(args, env, |v| matches!(v, Value::Integer(n) if *n < 0)),
+        "odd?" => eval_type_pred(args, env, |v| matches!(v, Value::Integer(n) if n % 2 != 0)),
+        "even?" => eval_type_pred(args, env, |v| matches!(v, Value::Integer(n) if n % 2 == 0)),
+        "list-ref" => eval_list_ref(args, env),
+        "list-tail" => eval_list_tail(args, env),
+        "list?" => eval_type_pred(args, env, is_proper_list),
+        "assoc" => eval_assoc(args, env),
+        "map" => eval_map(args, env),
+        "char-alphabetic?" => eval_char_pred(args, env, |c| c.is_alphabetic()),
+        "char-numeric?" => eval_char_pred(args, env, |c| c.is_ascii_digit()),
+        "char-upcase" => eval_char_transform(args, env, |c| c.to_ascii_uppercase()),
+        "char-downcase" => eval_char_transform(args, env, |c| c.to_ascii_lowercase()),
+        "char=?" => eval_char_cmp(args, env, |a, b| a == b),
+        "char<?" => eval_char_cmp(args, env, |a, b| a < b),
+        "string=?" => eval_string_cmp(args, env, |a, b| a == b),
+        "string<?" => eval_string_cmp(args, env, |a, b| a < b),
+        "string-ci=?" => eval_string_cmp(args, env, |a, b| {
+            a.to_lowercase() == b.to_lowercase()
+        }),
+        "string-upcase" => eval_string_case(args, env, |s| s.to_uppercase()),
+        "string-downcase" => eval_string_case(args, env, |s| s.to_lowercase()),
         _ => Err(EvalError::UnboundVariable { name: op.into() }),
     }
 }
@@ -998,7 +1282,7 @@ fn eval_cons(args: &[Expr], env: &Env) -> Result<Value, EvalError> {
             items.insert(0, h);
             Ok(Value::List(items))
         }
-        _ => Ok(Value::List(vec![h, t])),
+        _ => Ok(Value::Pair(Box::new(h), Box::new(t))),
     }
 }
 
@@ -1010,16 +1294,17 @@ fn eval_car(args: &[Expr], env: &Env) -> Result<Value, EvalError> {
         });
     };
     let val = eval(arg, env)?;
-    let Value::List(items) = val else {
-        return Err(EvalError::TypeError {
+    match val {
+        Value::Pair(car, _) => Ok(*car),
+        Value::List(items) => items.into_iter().next().ok_or_else(|| EvalError::TypeError {
+            expected: "pair".into(),
+            got: "()".into(),
+        }),
+        _ => Err(EvalError::TypeError {
             expected: "pair".into(),
             got: format!("{val}"),
-        });
-    };
-    items.into_iter().next().ok_or_else(|| EvalError::TypeError {
-        expected: "pair".into(),
-        got: "()".into(),
-    })
+        }),
+    }
 }
 
 fn eval_cdr(args: &[Expr], env: &Env) -> Result<Value, EvalError> {
@@ -1030,19 +1315,18 @@ fn eval_cdr(args: &[Expr], env: &Env) -> Result<Value, EvalError> {
         });
     };
     let val = eval(arg, env)?;
-    let Value::List(items) = val else {
-        return Err(EvalError::TypeError {
-            expected: "pair".into(),
-            got: format!("{val}"),
-        });
-    };
-    if items.is_empty() {
-        return Err(EvalError::TypeError {
+    match val {
+        Value::Pair(_, cdr) => Ok(*cdr),
+        Value::List(items) if items.is_empty() => Err(EvalError::TypeError {
             expected: "pair".into(),
             got: "()".into(),
-        });
+        }),
+        Value::List(items) => Ok(Value::List(items[1..].to_vec())),
+        _ => Err(EvalError::TypeError {
+            expected: "pair".into(),
+            got: format!("{val}"),
+        }),
     }
-    Ok(Value::List(items[1..].to_vec()))
 }
 
 fn eval_null(args: &[Expr], env: &Env) -> Result<Value, EvalError> {
@@ -1275,6 +1559,298 @@ fn eval_string_copy(args: &[Expr], env: &Env) -> Result<Value, EvalError> {
         });
     };
     Ok(Value::String(s))
+}
+
+// ===== L13: Equality helpers =====
+
+fn values_eq(a: &Value, b: &Value) -> bool {
+    match (a, b) {
+        (Value::Integer(x), Value::Integer(y)) => x == y,
+        (Value::Boolean(x), Value::Boolean(y)) => x == y,
+        (Value::Symbol(x), Value::Symbol(y)) => x == y,
+        (Value::Char(x), Value::Char(y)) => x == y,
+        (Value::List(x), Value::List(y)) => x.is_empty() && y.is_empty(),
+        _ => std::ptr::eq(a as *const _, b as *const _),
+    }
+}
+
+fn values_equal(a: &Value, b: &Value) -> bool {
+    match (a, b) {
+        (Value::Integer(x), Value::Integer(y)) => x == y,
+        (Value::Boolean(x), Value::Boolean(y)) => x == y,
+        (Value::String(x), Value::String(y)) => x == y,
+        (Value::Symbol(x), Value::Symbol(y)) => x == y,
+        (Value::Char(x), Value::Char(y)) => x == y,
+        (Value::Pair(a1, a2), Value::Pair(b1, b2)) => {
+            values_equal(a1, b1) && values_equal(a2, b2)
+        }
+        (Value::List(x), Value::List(y)) => {
+            x.len() == y.len() && x.iter().zip(y.iter()).all(|(a, b)| values_equal(a, b))
+        }
+        _ => false,
+    }
+}
+
+fn is_proper_list(v: &Value) -> bool {
+    matches!(v, Value::List(_))
+}
+
+// ===== L13: Numeric builtins =====
+
+fn eval_eq(args: &[Expr], env: &Env) -> Result<Value, EvalError> {
+    let [a_expr, b_expr] = args else {
+        return Err(EvalError::WrongArgCount { expected: 2, got: args.len() });
+    };
+    let a = eval(a_expr, env)?;
+    let b = eval(b_expr, env)?;
+    Ok(Value::Boolean(values_eq(&a, &b)))
+}
+
+fn eval_equal(args: &[Expr], env: &Env) -> Result<Value, EvalError> {
+    let [a_expr, b_expr] = args else {
+        return Err(EvalError::WrongArgCount { expected: 2, got: args.len() });
+    };
+    let a = eval(a_expr, env)?;
+    let b = eval(b_expr, env)?;
+    Ok(Value::Boolean(values_equal(&a, &b)))
+}
+
+fn eval_abs(args: &[Expr], env: &Env) -> Result<Value, EvalError> {
+    let [arg] = args else {
+        return Err(EvalError::WrongArgCount { expected: 1, got: args.len() });
+    };
+    let val = eval(arg, env)?;
+    Ok(Value::Integer(expect_integer(&val)?.abs()))
+}
+
+fn eval_modulo(args: &[Expr], env: &Env) -> Result<Value, EvalError> {
+    let [a_expr, b_expr] = args else {
+        return Err(EvalError::WrongArgCount { expected: 2, got: args.len() });
+    };
+    let a = expect_integer(&eval(a_expr, env)?)?;
+    let b = expect_integer(&eval(b_expr, env)?)?;
+    if b == 0 { return Err(EvalError::DivisionByZero); }
+    Ok(Value::Integer(((a % b) + b) % b))
+}
+
+fn eval_remainder(args: &[Expr], env: &Env) -> Result<Value, EvalError> {
+    let [a_expr, b_expr] = args else {
+        return Err(EvalError::WrongArgCount { expected: 2, got: args.len() });
+    };
+    let a = expect_integer(&eval(a_expr, env)?)?;
+    let b = expect_integer(&eval(b_expr, env)?)?;
+    if b == 0 { return Err(EvalError::DivisionByZero); }
+    Ok(Value::Integer(a % b))
+}
+
+fn eval_quotient(args: &[Expr], env: &Env) -> Result<Value, EvalError> {
+    let [a_expr, b_expr] = args else {
+        return Err(EvalError::WrongArgCount { expected: 2, got: args.len() });
+    };
+    let a = expect_integer(&eval(a_expr, env)?)?;
+    let b = expect_integer(&eval(b_expr, env)?)?;
+    checked_div(a, b).map(Value::Integer)
+}
+
+fn eval_min_max(args: &[Expr], env: &Env, is_min: bool) -> Result<Value, EvalError> {
+    let [first, rest @ ..] = args else {
+        return Err(EvalError::WrongArgCount { expected: 1, got: 0 });
+    };
+    let mut result = expect_integer(&eval(first, env)?)?;
+    for arg in rest {
+        let n = expect_integer(&eval(arg, env)?)?;
+        result = if is_min { result.min(n) } else { result.max(n) };
+    }
+    Ok(Value::Integer(result))
+}
+
+fn eval_expt(args: &[Expr], env: &Env) -> Result<Value, EvalError> {
+    let [base_expr, exp_expr] = args else {
+        return Err(EvalError::WrongArgCount { expected: 2, got: args.len() });
+    };
+    let base = expect_integer(&eval(base_expr, env)?)?;
+    let exp = expect_integer(&eval(exp_expr, env)?)?;
+    Ok(Value::Integer(base.pow(exp as u32)))
+}
+
+// ===== L13: List builtins =====
+
+fn eval_list_ref(args: &[Expr], env: &Env) -> Result<Value, EvalError> {
+    let [list_expr, idx_expr] = args else {
+        return Err(EvalError::WrongArgCount { expected: 2, got: args.len() });
+    };
+    let list_val = eval(list_expr, env)?;
+    let Value::List(items) = list_val else {
+        return Err(EvalError::TypeError { expected: "list".into(), got: format!("{list_val}") });
+    };
+    let i = expect_integer(&eval(idx_expr, env)?)? as usize;
+    items.get(i).cloned().ok_or_else(|| EvalError::TypeError {
+        expected: "valid list index".into(),
+        got: format!("index {i} out of range"),
+    })
+}
+
+fn eval_list_tail(args: &[Expr], env: &Env) -> Result<Value, EvalError> {
+    let [list_expr, idx_expr] = args else {
+        return Err(EvalError::WrongArgCount { expected: 2, got: args.len() });
+    };
+    let list_val = eval(list_expr, env)?;
+    let Value::List(items) = list_val else {
+        return Err(EvalError::TypeError { expected: "list".into(), got: format!("{list_val}") });
+    };
+    let i = expect_integer(&eval(idx_expr, env)?)? as usize;
+    if i > items.len() {
+        return Err(EvalError::TypeError {
+            expected: "valid list index".into(),
+            got: format!("index {i} out of range"),
+        });
+    }
+    Ok(Value::List(items[i..].to_vec()))
+}
+
+fn eval_assoc(args: &[Expr], env: &Env) -> Result<Value, EvalError> {
+    let [key_expr, alist_expr] = args else {
+        return Err(EvalError::WrongArgCount { expected: 2, got: args.len() });
+    };
+    let key = eval(key_expr, env)?;
+    let alist = eval(alist_expr, env)?;
+    let Value::List(items) = alist else {
+        return Err(EvalError::TypeError { expected: "list".into(), got: format!("{alist}") });
+    };
+    let found = items.iter().find(|entry| {
+        matches!(entry, Value::List(pair) if !pair.is_empty() && values_equal(&key, &pair[0]))
+    });
+    Ok(found.cloned().unwrap_or(Value::Boolean(false)))
+}
+
+fn eval_map(args: &[Expr], env: &Env) -> Result<Value, EvalError> {
+    let [proc_expr, list_exprs @ ..] = args else {
+        return Err(EvalError::WrongArgCount { expected: 2, got: args.len() });
+    };
+    if list_exprs.is_empty() {
+        return Err(EvalError::WrongArgCount { expected: 2, got: 1 });
+    }
+    let proc = eval(proc_expr, env)?;
+    let lists: Vec<Vec<Value>> = list_exprs
+        .iter()
+        .map(|expr| {
+            let val = eval(expr, env)?;
+            let Value::List(items) = val else {
+                return Err(EvalError::TypeError { expected: "list".into(), got: format!("{val}") });
+            };
+            Ok(items)
+        })
+        .collect::<Result<_, _>>()?;
+
+    let len = lists[0].len();
+    let mut results = Vec::with_capacity(len);
+    for i in 0..len {
+        let call_args: Vec<Value> = lists.iter().map(|l| l[i].clone()).collect();
+        let result = match &proc {
+            Value::Lambda { .. } => {
+                match apply_lambda_values(proc.clone(), &call_args, Span { line: 0, col: 0 })? {
+                    Bounce::Done(val) => val,
+                    Bounce::Tco(expr, tco_env) => eval(&expr, &tco_env)?,
+                }
+            }
+            Value::Builtin(name) => apply_builtin_values(name, &call_args)?,
+            _ => {
+                return Err(EvalError::TypeError {
+                    expected: "procedure".into(),
+                    got: format!("{proc}"),
+                })
+            }
+        };
+        results.push(result);
+    }
+    Ok(Value::List(results))
+}
+
+// ===== L13: Char builtins =====
+
+fn eval_char_pred(
+    args: &[Expr],
+    env: &Env,
+    pred: fn(char) -> bool,
+) -> Result<Value, EvalError> {
+    let [arg] = args else {
+        return Err(EvalError::WrongArgCount { expected: 1, got: args.len() });
+    };
+    let val = eval(arg, env)?;
+    let Value::Char(c) = val else {
+        return Err(EvalError::TypeError { expected: "char".into(), got: format!("{val}") });
+    };
+    Ok(Value::Boolean(pred(c)))
+}
+
+fn eval_char_transform(
+    args: &[Expr],
+    env: &Env,
+    transform: fn(char) -> char,
+) -> Result<Value, EvalError> {
+    let [arg] = args else {
+        return Err(EvalError::WrongArgCount { expected: 1, got: args.len() });
+    };
+    let val = eval(arg, env)?;
+    let Value::Char(c) = val else {
+        return Err(EvalError::TypeError { expected: "char".into(), got: format!("{val}") });
+    };
+    Ok(Value::Char(transform(c)))
+}
+
+fn eval_char_cmp(
+    args: &[Expr],
+    env: &Env,
+    cmp: fn(char, char) -> bool,
+) -> Result<Value, EvalError> {
+    let [a_expr, b_expr] = args else {
+        return Err(EvalError::WrongArgCount { expected: 2, got: args.len() });
+    };
+    let a = eval(a_expr, env)?;
+    let b = eval(b_expr, env)?;
+    let Value::Char(ca) = a else {
+        return Err(EvalError::TypeError { expected: "char".into(), got: format!("{a}") });
+    };
+    let Value::Char(cb) = b else {
+        return Err(EvalError::TypeError { expected: "char".into(), got: format!("{b}") });
+    };
+    Ok(Value::Boolean(cmp(ca, cb)))
+}
+
+// ===== L13: String builtins =====
+
+fn eval_string_cmp(
+    args: &[Expr],
+    env: &Env,
+    cmp: fn(&str, &str) -> bool,
+) -> Result<Value, EvalError> {
+    let [a_expr, b_expr] = args else {
+        return Err(EvalError::WrongArgCount { expected: 2, got: args.len() });
+    };
+    let a = eval(a_expr, env)?;
+    let b = eval(b_expr, env)?;
+    let Value::String(sa) = a else {
+        return Err(EvalError::TypeError { expected: "string".into(), got: format!("{a}") });
+    };
+    let Value::String(sb) = b else {
+        return Err(EvalError::TypeError { expected: "string".into(), got: format!("{b}") });
+    };
+    Ok(Value::Boolean(cmp(&sa, &sb)))
+}
+
+fn eval_string_case(
+    args: &[Expr],
+    env: &Env,
+    transform: fn(&str) -> String,
+) -> Result<Value, EvalError> {
+    let [arg] = args else {
+        return Err(EvalError::WrongArgCount { expected: 1, got: args.len() });
+    };
+    let val = eval(arg, env)?;
+    let Value::String(s) = val else {
+        return Err(EvalError::TypeError { expected: "string".into(), got: format!("{val}") });
+    };
+    Ok(Value::String(transform(&s)))
 }
 
 fn eval_string_set(args: &[Expr], env: &Env) -> Result<Value, EvalError> {
