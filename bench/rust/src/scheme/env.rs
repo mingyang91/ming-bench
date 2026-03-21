@@ -52,4 +52,14 @@ impl Env {
     pub fn define(&self, name: String, val: Value) {
         self.bindings.borrow_mut().insert(name, val);
     }
+
+    /// Mutate an existing binding in the nearest frame that contains it.
+    /// Returns false if the variable is not found in any frame.
+    pub fn set(&self, name: &str, val: Value) -> bool {
+        if self.bindings.borrow().contains_key(name) {
+            self.bindings.borrow_mut().insert(name.to_string(), val);
+            return true;
+        }
+        self.parent.as_ref().is_some_and(|p| p.set(name, val))
+    }
 }

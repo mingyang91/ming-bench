@@ -9,6 +9,7 @@ pub fn eval(expr: &Expr, env: &Env) -> Result<Value, EvalError> {
         Expr::Integer(n, _) => Ok(Value::Integer(*n)),
         Expr::Boolean(b, _) => Ok(Value::Boolean(*b)),
         Expr::String(s, _) => Ok(Value::String(s.clone())),
+        Expr::Char(c, _) => Ok(Value::Char(*c)),
         Expr::Symbol(name, span) => env
             .get(name)
             .ok_or_else(|| EvalError::UnboundVariable { name: name.clone() }.at(*span)),
@@ -31,6 +32,7 @@ fn eval_list(elems: &[Expr], span: Span, env: &Env) -> Result<Value, EvalError> 
             "let" => return eval_let(args, env).map_err(|e| e.at(span)),
             "begin" => return eval_begin(args, env).map_err(|e| e.at(span)),
             "cond" => return eval_cond(args, env).map_err(|e| e.at(span)),
+            "string-set!" => return eval_string_set(args, env).map_err(|e| e.at(span)),
             _ => {}
         }
     }
@@ -83,6 +85,7 @@ fn is_builtin(name: &str) -> bool {
             | "string-append" | "string-length" | "substring"
             | "string->number" | "number->string"
             | "string-ref" | "symbol->string" | "string->symbol"
+            | "string-copy"
     )
 }
 
@@ -123,6 +126,7 @@ fn eval_builtin(op: &str, args: &[Expr], env: &Env) -> Result<Value, EvalError> 
         "string-ref" => eval_string_ref(args, env),
         "symbol->string" => eval_symbol_to_string(args, env),
         "string->symbol" => eval_string_to_symbol(args, env),
+        "string-copy" => eval_string_copy(args, env),
         _ => Err(EvalError::UnboundVariable { name: op.into() }),
     }
 }
@@ -142,6 +146,7 @@ fn expr_to_value(expr: &Expr) -> Result<Value, EvalError> {
         Expr::Integer(n, _) => Ok(Value::Integer(*n)),
         Expr::Boolean(b, _) => Ok(Value::Boolean(*b)),
         Expr::String(s, _) => Ok(Value::String(s.clone())),
+        Expr::Char(c, _) => Ok(Value::Char(*c)),
         Expr::Symbol(s, _) => Ok(Value::Symbol(s.clone())),
         Expr::List(items, _) => {
             let vals: Vec<Value> = items.iter().map(expr_to_value).collect::<Result<_, _>>()?;
@@ -686,6 +691,58 @@ fn eval_string_to_symbol(args: &[Expr], env: &Env) -> Result<Value, EvalError> {
         });
     };
     Ok(Value::Symbol(s))
+}
+
+fn eval_string_copy(args: &[Expr], env: &Env) -> Result<Value, EvalError> {
+    let [arg] = args else {
+        return Err(EvalError::WrongArgCount { expected: 1, got: args.len() });
+    };
+    let val = eval(arg, env)?;
+    let Value::String(s) = val else {
+        return Err(EvalError::TypeError {
+            expected: "string".into(),
+            got: format!("{val}"),
+        });
+    };
+    Ok(Value::String(s))
+}
+
+fn eval_string_set(args: &[Expr], env: &Env) -> Result<Value, EvalError> {
+    let [str_expr, idx_expr, char_expr] = args else {
+        return Err(EvalError::WrongArgCount { expected: 3, got: args.len() });
+    };
+    let Expr::Symbol(name, _) = str_expr else {
+        return Err(EvalError::TypeError {
+            expected: "symbol".into(),
+            got: "non-symbol".into(),
+        });
+    };
+    let val = env.get(name).ok_or_else(|| EvalError::UnboundVariable { name: name.clone() })?;
+    let Value::String(mut s) = val else {
+        return Err(EvalError::TypeError {
+            expected: "string".into(),
+            got: format!("{val}"),
+        });
+    };
+    let Value::Integer(idx) = eval(idx_expr, env)? else {
+        return Err(EvalError::TypeError { expected: "integer".into(), got: "non-integer".into() });
+    };
+    let Value::Char(ch) = eval(char_expr, env)? else {
+        return Err(EvalError::TypeError { expected: "char".into(), got: "non-char".into() });
+    };
+    let idx = idx as usize;
+    if idx >= s.len() {
+        return Err(EvalError::TypeError {
+            expected: "valid string index".into(),
+            got: format!("index {idx} out of range for string of length {}", s.len()),
+        });
+    }
+    // SAFETY: replacing a single byte in an ASCII-safe position
+    // For full unicode support, would need char-level indexing
+    let bytes = unsafe { s.as_bytes_mut() };
+    bytes[idx] = ch as u8;
+    env.set(name, Value::String(s));
+    Ok(Value::Void)
 }
 
 fn eval_cond(args: &[Expr], env: &Env) -> Result<Value, EvalError> {

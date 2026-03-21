@@ -6,6 +6,7 @@ pub enum Expr {
     Integer(i64, Span),
     Boolean(bool, Span),
     String(String, Span),
+    Char(char, Span),
     Symbol(String, Span),
     List(Vec<Expr>, Span),
 }
@@ -16,6 +17,7 @@ impl Expr {
             Expr::Integer(_, s)
             | Expr::Boolean(_, s)
             | Expr::String(_, s)
+            | Expr::Char(_, s)
             | Expr::Symbol(_, s)
             | Expr::List(_, s) => *s,
         }
@@ -173,6 +175,15 @@ fn parse_atom(token: &str, span: Span) -> Expr {
     }
     if token.starts_with('"') && token.ends_with('"') {
         return Expr::String(token[1..token.len() - 1].to_string(), span);
+    }
+    if let Some(rest) = token.strip_prefix("#\\") {
+        let ch = match rest {
+            "space" => ' ',
+            "newline" => '\n',
+            "tab" => '\t',
+            _ => rest.chars().next().unwrap_or(' '),
+        };
+        return Expr::Char(ch, span);
     }
     Expr::Symbol(token.to_string(), span)
 }
