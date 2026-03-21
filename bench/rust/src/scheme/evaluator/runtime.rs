@@ -9,6 +9,7 @@ use crate::scheme::continuation::{
 use crate::scheme::environment::Environment;
 use crate::scheme::equality::is_eqv;
 use crate::scheme::error::{ArgCount, EvalError};
+use crate::scheme::record::define_record_type;
 use crate::scheme::syntax::MacroEnvironment;
 use crate::scheme::value::{list_from_values, Closure, Value};
 
@@ -310,6 +311,9 @@ fn eval_special_form(
             macro_environment,
         )
         .map(Some),
+        "define-record-type" => {
+            eval_define_record_type(arguments, location, environment, continuation).map(Some)
+        }
         "set!" => eval_set(arguments, location, environment, continuation).map(Some),
         "quote" => eval_quote(arguments, location, continuation).map(Some),
         "lambda" => eval_lambda(
@@ -564,6 +568,20 @@ fn eval_define_syntax(
     macro_environment: &MacroEnvironment,
 ) -> Result<State, EvalError> {
     macro_environment.define_syntax(arguments, location, &environment)?;
+
+    Ok(State::Return {
+        value: Value::Void,
+        continuation,
+    })
+}
+
+fn eval_define_record_type(
+    arguments: &[Expr],
+    location: SourceLocation,
+    environment: Environment,
+    continuation: ContinuationFrames,
+) -> Result<State, EvalError> {
+    define_record_type(arguments, location, &environment)?;
 
     Ok(State::Return {
         value: Value::Void,
@@ -1861,6 +1879,14 @@ fn apply_value(
                 value,
                 continuation,
             })
+        }
+        Value::RecordProcedure(procedure) => {
+            procedure
+                .apply(&arguments, location)
+                .map(|value| State::Return {
+                    value,
+                    continuation,
+                })
         }
         Value::Closure(closure) => apply_closure(closure, arguments, location, continuation),
         Value::CallWithCurrentContinuation => {

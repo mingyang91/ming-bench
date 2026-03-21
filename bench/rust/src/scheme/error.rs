@@ -91,6 +91,13 @@ pub enum EvalError {
         expected: ArgCount,
         got: usize,
     },
+    #[error("{location}: wrong argument count for {procedure}: expected {expected}, got {got}")]
+    WrongArgumentCountNamed {
+        location: SourceLocation,
+        procedure: String,
+        expected: ArgCount,
+        got: usize,
+    },
     #[error("{location}: wrong number of values: expected {expected}, got {got}")]
     WrongValueCount {
         location: SourceLocation,
@@ -146,6 +153,12 @@ pub enum EvalError {
     InvalidSyntaxRules {
         location: SourceLocation,
         detail: &'static str,
+    },
+    #[error("{location}: expected record of type {expected}, found {found}")]
+    RecordTypeMismatch {
+        location: SourceLocation,
+        expected: String,
+        found: String,
     },
     #[error("{location}: no matching syntax-rules clause for macro {name}")]
     MacroNoMatchingRule {

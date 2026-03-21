@@ -8,6 +8,7 @@ use crate::scheme::continuation::CapturedContinuation;
 use crate::scheme::environment::Environment;
 use crate::scheme::error::{ArgCount, EvalError};
 use crate::scheme::number::Number;
+use crate::scheme::record::{RecordProcedure, SchemeRecord};
 use crate::scheme::string_value::SchemeString;
 use crate::scheme::vector_value::SchemeVector;
 
@@ -55,7 +56,9 @@ pub enum Value {
     EmptyList,
     Pair(Box<Value>, Box<Value>),
     Vector(SchemeVector),
+    Record(SchemeRecord),
     Builtin(BuiltinProcedure),
+    RecordProcedure(RecordProcedure),
     CallWithCurrentContinuation,
     CallWithValues,
     DynamicWind,
@@ -152,7 +155,9 @@ impl Value {
             Self::EmptyList => "()".into(),
             Self::Pair(car, cdr) => render_pair(car, cdr, mode),
             Self::Vector(vector) => render_vector(vector, mode),
+            Self::Record(record) => record.render(),
             Self::Builtin(procedure) => format!("#<procedure:{}>", procedure.name()),
+            Self::RecordProcedure(procedure) => format!("#<procedure:{}>", procedure.name()),
             Self::CallWithCurrentContinuation => "#<procedure:call/cc>".into(),
             Self::CallWithValues => "#<procedure:call-with-values>".into(),
             Self::DynamicWind => "#<procedure:dynamic-wind>".into(),
@@ -245,7 +250,9 @@ impl Value {
             Self::EmptyList => "null",
             Self::Pair(_, _) => "pair",
             Self::Vector(_) => "vector",
+            Self::Record(_) => "record",
             Self::Builtin(_)
+            | Self::RecordProcedure(_)
             | Self::CallWithCurrentContinuation
             | Self::CallWithValues
             | Self::DynamicWind

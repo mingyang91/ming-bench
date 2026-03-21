@@ -298,7 +298,7 @@ fn expand_list_expression_recursive(
         return expand_application_items(items, location, macros);
     };
 
-    if name == "quote" || name == "define-syntax" {
+    if name == "quote" || name == "define-syntax" || name == "define-record-type" {
         return Ok(Expr::list(items.to_vec(), location));
     }
     if is_core_special_form(name) {
@@ -1928,5 +1928,6 @@ fn is_core_special_form(name: &str) -> bool {
             | "begin"
             | "cond"
             | "define-syntax"
+            | "define-record-type"
     )
 }

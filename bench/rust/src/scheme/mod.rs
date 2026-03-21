@@ -7,6 +7,7 @@ pub mod error;
 mod evaluator;
 mod number;
 mod parser;
+mod record;
 mod string_value;
 mod syntax;
 mod value;
