@@ -7,6 +7,10 @@ use std::cell::RefCell;
 use std::collections::HashMap;
 use std::rc::Rc;
 
+thread_local! {
+    static OUTPUT: RefCell<String> = RefCell::new(String::new());
+}
+
 // ---------------------------------------------------------------------------
 // Value representation
 // ---------------------------------------------------------------------------
@@ -17,6 +21,7 @@ enum Value {
     Boolean(bool, Span),
     Str(String, Span),
     Symbol(String, Span),
+    Char(char, Span),
     List(Vec<Value>, Span),
     Lambda {
         params: Vec<String>,
@@ -34,6 +39,7 @@ impl Value {
             | Value::Boolean(_, s)
             | Value::Str(_, s)
             | Value::Symbol(_, s)
+            | Value::Char(_, s)
             | Value::List(_, s) => *s,
             Value::Lambda { span, .. } => *span,
             Value::Void => Span::default(),
@@ -45,6 +51,7 @@ impl Value {
             Value::Integer(n, _) => n.to_string(),
             Value::Boolean(true, _) => "#t".to_string(),
             Value::Boolean(false, _) => "#f".to_string(),
+            Value::Char(c, _) => format!("#\\{}", c),
             Value::Str(s, _) => format!("\"{}\"", s),
             Value::Symbol(s, _) => s.clone(),
             Value::List(elems, _) => {
@@ -54,6 +61,17 @@ impl Value {
             Value::Lambda { .. } => "#<procedure>".to_string(),
             Value::Void => "".to_string(),
         }
+    }
+
+    fn display_output(&self) -> String {
+        match self {
+            Value::Str(s, _) => s.clone(),
+            _ => self.display_scheme(),
+        }
+    }
+
+    fn write_output(&self) -> String {
+        self.display_scheme()
     }
 
     fn is_truthy(&self) -> bool {
@@ -309,7 +327,7 @@ fn parse_all(input: &str) -> Result<Vec<Value>, EvalError> {
 
 fn eval(expr: &Value, env: &Env) -> Result<Value, EvalError> {
     match expr {
-        Value::Integer(..) | Value::Boolean(..) | Value::Str(..) => Ok(expr.clone()),
+        Value::Integer(..) | Value::Boolean(..) | Value::Str(..) | Value::Char(..) => Ok(expr.clone()),
         Value::Symbol(name, span) => {
             env_get(env, name).ok_or_else(|| EvalError::UnboundVariable(name.clone(), *span))
         }
@@ -340,7 +358,11 @@ fn eval(expr: &Value, env: &Env) -> Result<Value, EvalError> {
                     "cond" => return eval_cond(&elems[1..], env),
                     "+" | "-" | "*" | "/" | "<" | ">" | "=" | "<=" | ">=" | "not" | "cons"
                     | "car" | "cdr" | "null?" | "list" | "length" | "string?" | "number?"
-                    | "boolean?" | "pair?" | "symbol?" => {
+                    | "boolean?" | "pair?" | "symbol?" | "char?"
+                    | "display" | "write" | "newline"
+                    | "string-append" | "string-length" | "substring"
+                    | "string->number" | "number->string"
+                    | "symbol->string" | "string->symbol" | "string-ref" => {
                         return eval_builtin(op, &elems[1..], env, form_span);
                     }
                     _ => {}
@@ -727,6 +749,177 @@ fn eval_builtin(
             let val = eval(&args[0], env)?;
             Ok(Value::Boolean(matches!(val, Value::Symbol(..)), sp))
         }
+        "char?" => {
+            if args.len() != 1 {
+                return Err(EvalError::WrongArgCount {
+                    expected: "1".into(),
+                    got: args.len(),
+                    at: sp,
+                });
+            }
+            let val = eval(&args[0], env)?;
+            Ok(Value::Boolean(matches!(val, Value::Char(..)), sp))
+        }
+        "display" => {
+            if args.len() != 1 {
+                return Err(EvalError::WrongArgCount {
+                    expected: "1".into(),
+                    got: args.len(),
+                    at: sp,
+                });
+            }
+            let val = eval(&args[0], env)?;
+            let text = val.display_output();
+            OUTPUT.with(|o| o.borrow_mut().push_str(&text));
+            Ok(Value::Void)
+        }
+        "write" => {
+            if args.len() != 1 {
+                return Err(EvalError::WrongArgCount {
+                    expected: "1".into(),
+                    got: args.len(),
+                    at: sp,
+                });
+            }
+            let val = eval(&args[0], env)?;
+            let text = val.write_output();
+            OUTPUT.with(|o| o.borrow_mut().push_str(&text));
+            Ok(Value::Void)
+        }
+        "newline" => {
+            if !args.is_empty() {
+                return Err(EvalError::WrongArgCount {
+                    expected: "0".into(),
+                    got: args.len(),
+                    at: sp,
+                });
+            }
+            OUTPUT.with(|o| o.borrow_mut().push('\n'));
+            Ok(Value::Void)
+        }
+        "string-append" => {
+            let mut result = String::new();
+            for a in args {
+                let val = eval(a, env)?;
+                match val {
+                    Value::Str(s, _) => result.push_str(&s),
+                    _ => return Err(EvalError::TypeError("string-append: expected string".into(), sp)),
+                }
+            }
+            Ok(Value::Str(result, sp))
+        }
+        "string-length" => {
+            if args.len() != 1 {
+                return Err(EvalError::WrongArgCount {
+                    expected: "1".into(),
+                    got: args.len(),
+                    at: sp,
+                });
+            }
+            let val = eval(&args[0], env)?;
+            match val {
+                Value::Str(s, _) => Ok(Value::Integer(s.len() as i64, sp)),
+                _ => Err(EvalError::TypeError("string-length: expected string".into(), sp)),
+            }
+        }
+        "substring" => {
+            if args.len() != 3 {
+                return Err(EvalError::WrongArgCount {
+                    expected: "3".into(),
+                    got: args.len(),
+                    at: sp,
+                });
+            }
+            let val = eval(&args[0], env)?;
+            let start = expect_integer(&eval(&args[1], env)?)? as usize;
+            let end = expect_integer(&eval(&args[2], env)?)? as usize;
+            match val {
+                Value::Str(s, _) => {
+                    if end > s.len() || start > end {
+                        return Err(EvalError::TypeError("substring: index out of range".into(), sp));
+                    }
+                    Ok(Value::Str(s[start..end].to_string(), sp))
+                }
+                _ => Err(EvalError::TypeError("substring: expected string".into(), sp)),
+            }
+        }
+        "string->number" => {
+            if args.len() != 1 {
+                return Err(EvalError::WrongArgCount {
+                    expected: "1".into(),
+                    got: args.len(),
+                    at: sp,
+                });
+            }
+            let val = eval(&args[0], env)?;
+            match val {
+                Value::Str(s, _) => match s.parse::<i64>() {
+                    Ok(n) => Ok(Value::Integer(n, sp)),
+                    Err(_) => Ok(Value::Boolean(false, sp)),
+                },
+                _ => Err(EvalError::TypeError("string->number: expected string".into(), sp)),
+            }
+        }
+        "number->string" => {
+            if args.len() != 1 {
+                return Err(EvalError::WrongArgCount {
+                    expected: "1".into(),
+                    got: args.len(),
+                    at: sp,
+                });
+            }
+            let val = eval(&args[0], env)?;
+            let n = expect_integer(&val)?;
+            Ok(Value::Str(n.to_string(), sp))
+        }
+        "symbol->string" => {
+            if args.len() != 1 {
+                return Err(EvalError::WrongArgCount {
+                    expected: "1".into(),
+                    got: args.len(),
+                    at: sp,
+                });
+            }
+            let val = eval(&args[0], env)?;
+            match val {
+                Value::Symbol(s, _) => Ok(Value::Str(s, sp)),
+                _ => Err(EvalError::TypeError("symbol->string: expected symbol".into(), sp)),
+            }
+        }
+        "string->symbol" => {
+            if args.len() != 1 {
+                return Err(EvalError::WrongArgCount {
+                    expected: "1".into(),
+                    got: args.len(),
+                    at: sp,
+                });
+            }
+            let val = eval(&args[0], env)?;
+            match val {
+                Value::Str(s, _) => Ok(Value::Symbol(s, sp)),
+                _ => Err(EvalError::TypeError("string->symbol: expected string".into(), sp)),
+            }
+        }
+        "string-ref" => {
+            if args.len() != 2 {
+                return Err(EvalError::WrongArgCount {
+                    expected: "2".into(),
+                    got: args.len(),
+                    at: sp,
+                });
+            }
+            let val = eval(&args[0], env)?;
+            let idx = expect_integer(&eval(&args[1], env)?)? as usize;
+            match val {
+                Value::Str(s, _) => {
+                    if idx >= s.len() {
+                        return Err(EvalError::TypeError("string-ref: index out of range".into(), sp));
+                    }
+                    Ok(Value::Char(s.chars().nth(idx).unwrap(), sp))
+                }
+                _ => Err(EvalError::TypeError("string-ref: expected string".into(), sp)),
+            }
+        }
         _ => Err(EvalError::UnboundVariable(op.to_string(), sp)),
     }
 }
@@ -897,8 +1090,16 @@ pub fn eval_str(input: &str) -> Result<String, EvalError> {
 
 /// Evaluate Scheme expressions, returning both the result value and
 /// any output produced by `display`, `write`, or `newline`.
-pub fn eval_str_with_output(_input: &str) -> Result<(String, String), EvalError> {
-    todo!()
+pub fn eval_str_with_output(input: &str) -> Result<(String, String), EvalError> {
+    OUTPUT.with(|o| o.borrow_mut().clear());
+    let exprs = parse_all(input)?;
+    let env = default_env();
+    let mut last = Value::Void;
+    for expr in &exprs {
+        last = eval(expr, &env)?;
+    }
+    let output = OUTPUT.with(|o| o.borrow().clone());
+    Ok((last.display_scheme(), output))
 }
 
 #[cfg(test)]
