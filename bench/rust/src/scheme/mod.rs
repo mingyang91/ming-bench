@@ -135,6 +135,7 @@ impl Value {
                 | "string-append" | "string-length" | "substring"
                 | "string->number" | "number->string" | "symbol->string" | "string->symbol"
                 | "string-copy" | "string-ref" | "string-set!"
+                | "string->list" | "list->string" | "char->integer" | "integer->char"
                 | "apply" | "call/cc"
                 | "abs" | "modulo" | "remainder" | "quotient" | "min" | "max" | "expt"
                 | "zero?" | "positive?" | "negative?" | "odd?" | "even?"
@@ -789,12 +790,10 @@ fn eval(expr: &Expr, env: &Env, out: &mut String) -> Result<Value, EvalError> {
                             break 'tco Ok(Value::Nil);
                         }
                         "string-set!" => {
-                            break 'tco eval_string_set(
-                                &items[1..],
-                                pos,
-                                &cur_env,
-                                out,
-                            );
+                            break 'tco Err(EvalError::Type(format!(
+                                "string-set!: strings are immutable at {}",
+                                pos.fmt()
+                            )));
                         }
                         "call/cc" | "call-with-current-continuation" => {
                             if items.len() != 2 {
@@ -1790,6 +1789,73 @@ fn apply_builtin(op: &str, args: &[Value], pos: Pos, out: &mut String) -> Result
             let idx = args[1].as_integer(pos)? as usize;
             let chars: Vec<char> = s.chars().collect();
             Ok(Some(Value::Char(chars[idx])))
+        }
+        "string->list" => {
+            if args.len() != 1 {
+                return Err(EvalError::Arity(format!(
+                    "string->list requires 1 argument at {}", pos.fmt()
+                )));
+            }
+            match &args[0] {
+                Value::Str(s) => {
+                    let list = s.chars().rev().fold(Value::Nil, |acc, c| {
+                        Value::Pair(Box::new(Value::Char(c)), Box::new(acc))
+                    });
+                    Ok(Some(list))
+                }
+                _ => Err(EvalError::Type(format!(
+                    "string->list: expected string at {}", pos.fmt()
+                ))),
+            }
+        }
+        "list->string" => {
+            if args.len() != 1 {
+                return Err(EvalError::Arity(format!(
+                    "list->string requires 1 argument at {}", pos.fmt()
+                )));
+            }
+            let mut chars = String::new();
+            let mut cur = &args[0];
+            loop {
+                match cur {
+                    Value::Pair(car, cdr) => {
+                        match car.as_ref() {
+                            Value::Char(c) => chars.push(*c),
+                            _ => return Err(EvalError::Type(format!(
+                                "list->string: expected character in list at {}", pos.fmt()
+                            ))),
+                        }
+                        cur = cdr.as_ref();
+                    }
+                    Value::Nil => break,
+                    _ => return Err(EvalError::Type(format!(
+                        "list->string: expected proper list at {}", pos.fmt()
+                    ))),
+                }
+            }
+            Ok(Some(Value::Str(chars)))
+        }
+        "char->integer" => {
+            if args.len() != 1 {
+                return Err(EvalError::Arity(format!(
+                    "char->integer requires 1 argument at {}", pos.fmt()
+                )));
+            }
+            match &args[0] {
+                Value::Char(c) => Ok(Some(Value::Integer(*c as i64))),
+                _ => Err(EvalError::Type(format!(
+                    "char->integer: expected character at {}", pos.fmt()
+                ))),
+            }
+        }
+        "integer->char" => {
+            if args.len() != 1 {
+                return Err(EvalError::Arity(format!(
+                    "integer->char requires 1 argument at {}", pos.fmt()
+                )));
+            }
+            let n = args[0].as_integer(pos)?;
+            Ok(Some(Value::Char(char::from_u32(n as u32).unwrap_or('\u{FFFD}'))))
         }
         "abs" => {
             if args.len() != 1 {
