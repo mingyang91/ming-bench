@@ -219,6 +219,12 @@ fn is_builtin_name(name: &str) -> bool {
             | "integer->char"
             | "call/cc"
             | "call-with-current-continuation"
+            | "set-car!"
+            | "set-cdr!"
+            | "caar"
+            | "cadr"
+            | "cdar"
+            | "cddr"
     )
 }
 

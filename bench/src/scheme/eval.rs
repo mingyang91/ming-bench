@@ -4,7 +4,7 @@ use std::rc::Rc;
 use crate::scheme::env::Env;
 use crate::scheme::error::{EvalError, Span};
 use crate::scheme::number::{float_to_exact, Num};
-use crate::scheme::value::{BodyContinuation, ContinuationData, Value};
+use crate::scheme::value::{self, BodyContinuation, ContinuationData, Value};
 
 /// Check if a name is a builtin procedure.
 fn is_builtin(name: &str) -> bool {
@@ -95,6 +95,12 @@ fn is_builtin(name: &str) -> bool {
             | "denominator"
             | "rational?"
             | "integer?"
+            | "set-car!"
+            | "set-cdr!"
+            | "caar"
+            | "cadr"
+            | "cdar"
+            | "cddr"
     )
 }
 
@@ -610,7 +616,7 @@ fn apply_lambda(
         for (param, arg) in params.iter().zip(args) {
             local_env.borrow_mut().define(param.clone(), arg.clone());
         }
-        let rest = Value::List(args[params.len()..].to_vec());
+        let rest = value::vec_to_list(args[params.len()..].to_vec());
         local_env.borrow_mut().define(rest_name.to_string(), rest);
         eval_body_tco(body, &local_env, span, ctx)
     } else {
@@ -1087,14 +1093,13 @@ fn eval_apply(
     }
     let proc = &args[0];
     let prefix = &args[1..args.len() - 1];
-    let Value::List(tail_list) = &args[args.len() - 1] else {
-        return Err(EvalError::TypeError {
-            message: "apply: last argument must be a list".into(),
-            span,
-        });
-    };
+    let tail = &args[args.len() - 1];
+    let tail_elems = value::proper_list_elems(tail).ok_or_else(|| EvalError::TypeError {
+        message: "apply: last argument must be a list".into(),
+        span,
+    })?;
     let mut all_args: Vec<Value> = prefix.to_vec();
-    all_args.extend(tail_list.iter().cloned());
+    all_args.extend(tail_elems);
     apply(proc, &all_args, span, ctx)
 }
 
@@ -1124,8 +1129,35 @@ fn apply_builtin(
             };
             Ok(Value::Boolean(!is_truthy(arg)))
         }
-        "cons" | "car" | "cdr" | "null?" | "list" | "length" | "reverse" => {
+        "cons" | "car" | "cdr" | "caar" | "cadr" | "cdar" | "cddr"
+        | "null?" | "list" | "length" | "reverse" => {
             apply_list_builtin(name, args, span)
+        }
+        "set-car!" => {
+            let [pair_val, new_val] = args else {
+                return Err(EvalError::WrongArgCount { expected: 2, got: args.len(), span });
+            };
+            let Value::Pair(cell) = pair_val else {
+                return Err(EvalError::TypeError {
+                    message: format!("set-car!: expected pair, got {pair_val}"),
+                    span,
+                });
+            };
+            cell.borrow_mut().0 = new_val.clone();
+            Ok(Value::Void)
+        }
+        "set-cdr!" => {
+            let [pair_val, new_val] = args else {
+                return Err(EvalError::WrongArgCount { expected: 2, got: args.len(), span });
+            };
+            let Value::Pair(cell) = pair_val else {
+                return Err(EvalError::TypeError {
+                    message: format!("set-cdr!: expected pair, got {pair_val}"),
+                    span,
+                });
+            };
+            cell.borrow_mut().1 = new_val.clone();
+            Ok(Value::Void)
         }
         "string?" => Ok(Value::Boolean(matches!(args, [Value::String(_)]))),
         "number?" => Ok(Value::Boolean(matches!(
@@ -1197,7 +1229,7 @@ fn apply_builtin(
         "boolean?" => Ok(Value::Boolean(matches!(args, [Value::Boolean(_)]))),
         "pair?" => Ok(Value::Boolean(
             matches!(args, [Value::List(e)] if !e.is_empty())
-                || matches!(args, [Value::Pair(..)])
+                || matches!(args, [Value::Pair(_)])
         )),
         "symbol?" => Ok(Value::Boolean(matches!(args, [Value::Symbol(_)]))),
         "char?" => Ok(Value::Boolean(matches!(args, [Value::Char(_)]))),
@@ -1207,7 +1239,8 @@ fn apply_builtin(
         "string-append" | "string-length" | "substring" | "string->number"
         | "number->string" | "symbol->string" | "string->symbol" | "string-ref"
         | "string-copy" | "string->list" | "list->string" | "char->integer"
-        | "integer->char" => apply_string_builtin(name, args, span),
+        | "integer->char" | "string=?" | "string<?" | "string-ci=?" | "string-upcase"
+        | "string-downcase" => apply_string_builtin(name, args, span),
         "equal?" | "eqv?" | "eq?" => apply_equality_builtin(name, args, span),
         "vector" | "make-vector" | "vector-ref" | "vector-length" | "vector?"
         | "vector->list" | "list->vector" => apply_vector_builtin(name, args, span),
@@ -1220,9 +1253,6 @@ fn apply_builtin(
         }
         "char-alphabetic?" | "char-numeric?" | "char-upcase" | "char-downcase" | "char=?"
         | "char<?" => apply_char_builtin(name, args, span),
-        "string=?" | "string<?" | "string-ci=?" | "string-upcase" | "string-downcase" => {
-            apply_string_builtin(name, args, span)
-        }
         _ => Err(EvalError::UnboundVariable {
             name: name.to_string(),
             span,
@@ -1343,6 +1373,30 @@ fn compare_op(
     Ok(Value::Boolean(result))
 }
 
+fn pair_car(arg: &Value, span: Span) -> Result<Value, EvalError> {
+    match arg {
+        Value::List(elems) if !elems.is_empty() => Ok(elems[0].clone()),
+        Value::Pair(cell) => Ok(cell.borrow().0.clone()),
+        _ => Err(EvalError::TypeError {
+            message: format!("car: expected non-empty pair, got {arg}"),
+            span,
+        }),
+    }
+}
+
+fn pair_cdr(arg: &Value, span: Span) -> Result<Value, EvalError> {
+    match arg {
+        Value::List(elems) if !elems.is_empty() => {
+            Ok(value::vec_to_list(elems[1..].to_vec()))
+        }
+        Value::Pair(cell) => Ok(cell.borrow().1.clone()),
+        _ => Err(EvalError::TypeError {
+            message: format!("cdr: expected non-empty pair, got {arg}"),
+            span,
+        }),
+    }
+}
+
 fn apply_list_builtin(name: &str, args: &[Value], span: Span) -> Result<Value, EvalError> {
     match name {
         "cons" => {
@@ -1353,18 +1407,7 @@ fn apply_list_builtin(name: &str, args: &[Value], span: Span) -> Result<Value, E
                     span,
                 });
             };
-            match cdr {
-                Value::List(elems) => {
-                    let mut new_list = vec![car.clone()];
-                    new_list.extend(elems.iter().cloned());
-                    Ok(Value::List(new_list))
-                }
-                Value::Pair(..) => Ok(Value::Pair(
-                    Box::new(car.clone()),
-                    Box::new(cdr.clone()),
-                )),
-                _ => Ok(Value::Pair(Box::new(car.clone()), Box::new(cdr.clone()))),
-            }
+            Ok(value::cons(car.clone(), cdr.clone()))
         }
         "car" => {
             let [arg] = args else {
@@ -1374,14 +1417,7 @@ fn apply_list_builtin(name: &str, args: &[Value], span: Span) -> Result<Value, E
                     span,
                 });
             };
-            match arg {
-                Value::List(elems) if !elems.is_empty() => Ok(elems[0].clone()),
-                Value::Pair(car, _) => Ok(*car.clone()),
-                _ => Err(EvalError::TypeError {
-                    message: format!("car: expected non-empty pair, got {arg}"),
-                    span,
-                }),
-            }
+            pair_car(arg, span)
         }
         "cdr" => {
             let [arg] = args else {
@@ -1391,14 +1427,31 @@ fn apply_list_builtin(name: &str, args: &[Value], span: Span) -> Result<Value, E
                     span,
                 });
             };
-            match arg {
-                Value::List(elems) if !elems.is_empty() => Ok(Value::List(elems[1..].to_vec())),
-                Value::Pair(_, cdr) => Ok(*cdr.clone()),
-                _ => Err(EvalError::TypeError {
-                    message: format!("cdr: expected non-empty pair, got {arg}"),
-                    span,
-                }),
-            }
+            pair_cdr(arg, span)
+        }
+        "caar" => {
+            let [arg] = args else {
+                return Err(EvalError::WrongArgCount { expected: 1, got: args.len(), span });
+            };
+            pair_car(&pair_car(arg, span)?, span)
+        }
+        "cadr" => {
+            let [arg] = args else {
+                return Err(EvalError::WrongArgCount { expected: 1, got: args.len(), span });
+            };
+            pair_car(&pair_cdr(arg, span)?, span)
+        }
+        "cdar" => {
+            let [arg] = args else {
+                return Err(EvalError::WrongArgCount { expected: 1, got: args.len(), span });
+            };
+            pair_cdr(&pair_car(arg, span)?, span)
+        }
+        "cddr" => {
+            let [arg] = args else {
+                return Err(EvalError::WrongArgCount { expected: 1, got: args.len(), span });
+            };
+            pair_cdr(&pair_cdr(arg, span)?, span)
         }
         "null?" => {
             let [arg] = args else {
@@ -1408,12 +1461,9 @@ fn apply_list_builtin(name: &str, args: &[Value], span: Span) -> Result<Value, E
                     span,
                 });
             };
-            Ok(Value::Boolean(matches!(
-                arg,
-                Value::List(elems) if elems.is_empty()
-            )))
+            Ok(Value::Boolean(arg.is_nil()))
         }
-        "list" => Ok(Value::List(args.to_vec())),
+        "list" => Ok(value::vec_to_list(args.to_vec())),
         "length" => {
             let [arg] = args else {
                 return Err(EvalError::WrongArgCount {
@@ -1422,13 +1472,11 @@ fn apply_list_builtin(name: &str, args: &[Value], span: Span) -> Result<Value, E
                     span,
                 });
             };
-            match arg {
-                Value::List(elems) => Ok(Value::Integer(elems.len() as i64)),
-                _ => Err(EvalError::TypeError {
-                    message: format!("length: expected list, got {arg}"),
-                    span,
-                }),
-            }
+            let elems = value::proper_list_elems(arg).ok_or_else(|| EvalError::TypeError {
+                message: format!("length: expected list, got {arg}"),
+                span,
+            })?;
+            Ok(Value::Integer(elems.len() as i64))
         }
         "reverse" => {
             let [arg] = args else {
@@ -1438,16 +1486,12 @@ fn apply_list_builtin(name: &str, args: &[Value], span: Span) -> Result<Value, E
                     span,
                 });
             };
-            match arg {
-                Value::List(elems) => {
-                    let reversed: Vec<Value> = elems.iter().rev().cloned().collect();
-                    Ok(Value::List(reversed))
-                }
-                _ => Err(EvalError::TypeError {
-                    message: format!("reverse: expected list, got {arg}"),
-                    span,
-                }),
-            }
+            let elems = value::proper_list_elems(arg).ok_or_else(|| EvalError::TypeError {
+                message: format!("reverse: expected list, got {arg}"),
+                span,
+            })?;
+            let reversed: Vec<Value> = elems.into_iter().rev().collect();
+            Ok(value::vec_to_list(reversed))
         }
         _ => unreachable!("apply_list_builtin called with non-list builtin: {name}"),
     }
@@ -1569,15 +1613,19 @@ fn apply_string_builtin_ext(name: &str, args: &[Value], span: Span) -> Result<Va
                     span,
                 });
             };
-            Ok(Value::List(s.chars().map(Value::Char).collect()))
+            Ok(value::vec_to_list(s.chars().map(Value::Char).collect()))
         }
         "list->string" => {
-            let [Value::List(elems)] = args else {
+            let [list_val] = args else {
                 return Err(EvalError::TypeError {
                     message: "list->string: expected one list argument".into(),
                     span,
                 });
             };
+            let elems = value::proper_list_elems(list_val).ok_or_else(|| EvalError::TypeError {
+                message: "list->string: expected one list argument".into(),
+                span,
+            })?;
             let s: String = elems
                 .iter()
                 .map(|v| match v {
@@ -1738,27 +1786,13 @@ fn apply_map(
         });
     }
     let proc = &args[0];
-    if args.len() == 2 {
-        let Value::List(elems) = &args[1] else {
-            return Err(EvalError::TypeError {
-                message: "map: expected list argument".into(),
-                span,
-            });
-        };
-        let results: Vec<Value> = elems
-            .iter()
-            .map(|elem| apply(proc, std::slice::from_ref(elem), span, ctx))
-            .collect::<Result<_, _>>()?;
-        return Ok(Value::List(results));
-    }
-    let lists: Vec<&Vec<Value>> = args[1..]
+    let lists: Vec<Vec<Value>> = args[1..]
         .iter()
-        .map(|a| match a {
-            Value::List(elems) => Ok(elems),
-            _ => Err(EvalError::TypeError {
+        .map(|a| {
+            value::proper_list_elems(a).ok_or_else(|| EvalError::TypeError {
                 message: "map: expected list argument".into(),
                 span,
-            }),
+            })
         })
         .collect::<Result<_, _>>()?;
     let len = lists[0].len();
@@ -1768,7 +1802,7 @@ fn apply_map(
             apply(proc, &call_args, span, ctx)
         })
         .collect::<Result<_, _>>()?;
-    Ok(Value::List(results))
+    Ok(value::vec_to_list(results))
 }
 
 fn apply_numeric_extra(
@@ -1879,12 +1913,16 @@ fn apply_list_extra(
 ) -> Result<Value, EvalError> {
     match name {
         "list-ref" => {
-            let [Value::List(elems), idx_val] = args else {
+            let [list_val, idx_val] = args else {
                 return Err(EvalError::TypeError {
                     message: "list-ref: expected list and integer".into(),
                     span,
                 });
             };
+            let elems = value::proper_list_elems(list_val).ok_or_else(|| EvalError::TypeError {
+                message: format!("list-ref: expected list, got {list_val}"),
+                span,
+            })?;
             let idx = require_integer(idx_val, span)? as usize;
             elems.get(idx).cloned().ok_or_else(|| EvalError::TypeError {
                 message: format!("list-ref: index {idx} out of range"),
@@ -1892,12 +1930,16 @@ fn apply_list_extra(
             })
         }
         "list-tail" => {
-            let [Value::List(elems), idx_val] = args else {
+            let [list_val, idx_val] = args else {
                 return Err(EvalError::TypeError {
                     message: "list-tail: expected list and integer".into(),
                     span,
                 });
             };
+            let elems = value::proper_list_elems(list_val).ok_or_else(|| EvalError::TypeError {
+                message: format!("list-tail: expected list, got {list_val}"),
+                span,
+            })?;
             let idx = require_integer(idx_val, span)? as usize;
             if idx > elems.len() {
                 return Err(EvalError::TypeError {
@@ -1905,31 +1947,83 @@ fn apply_list_extra(
                     span,
                 });
             }
-            Ok(Value::List(elems[idx..].to_vec()))
+            Ok(value::vec_to_list(elems[idx..].to_vec()))
         }
         "list?" => {
             let [arg] = args else {
                 return Err(EvalError::WrongArgCount { expected: 1, got: args.len(), span });
             };
-            match arg {
-                Value::List(_) => Ok(Value::Boolean(true)),
-                _ => Ok(Value::Boolean(false)),
-            }
+            // list? must return #f for circular or improper lists, #t for proper lists
+            Ok(Value::Boolean(is_proper_list(arg)))
         }
         "assoc" => {
-            let [key, Value::List(alist)] = args else {
+            let [key, alist_val] = args else {
                 return Err(EvalError::TypeError {
                     message: "assoc: expected key and association list".into(),
                     span,
                 });
             };
-            let found = alist.iter().find(|entry| {
-                matches!(entry, Value::List(pair) if !pair.is_empty() && values_equal(&pair[0], key))
-            });
-            Ok(found.cloned().unwrap_or(Value::Boolean(false)))
+            let alist = value::proper_list_elems(alist_val).ok_or_else(|| EvalError::TypeError {
+                message: "assoc: expected association list".into(),
+                span,
+            })?;
+            if let Some(found) = alist.iter().find(|entry| {
+                pair_car(entry, span)
+                    .ok()
+                    .is_some_and(|car_val| values_equal(&car_val, key))
+            }) {
+                return Ok(found.clone());
+            }
+            Ok(Value::Boolean(false))
         }
         _ => unreachable!(),
     }
+}
+
+/// Check if a value is a proper list (possibly empty, no cycles, nil-terminated).
+/// Uses tortoise-and-hare for cycle detection.
+fn is_proper_list(val: &Value) -> bool {
+    match val {
+        Value::List(_) => true,
+        Value::Pair(_) => is_proper_list_pair(val),
+        _ => false,
+    }
+}
+
+/// Tortoise-and-hare cycle detection for pair chains.
+fn is_proper_list_pair(val: &Value) -> bool {
+    let mut slow = val.clone();
+    let mut fast = val.clone();
+    loop {
+        let Some(next_slow) = get_pair_cdr(&slow) else {
+            return is_nil_value(&slow);
+        };
+        slow = next_slow;
+        let Some(next_fast) = get_pair_cdr(&fast) else {
+            return is_nil_value(&fast);
+        };
+        fast = next_fast;
+        let Some(next_fast) = get_pair_cdr(&fast) else {
+            return is_nil_value(&fast);
+        };
+        fast = next_fast;
+        let cycle = matches!((&slow, &fast), (Value::Pair(s), Value::Pair(f)) if Rc::ptr_eq(s, f));
+        if cycle {
+            return false;
+        }
+    }
+}
+
+/// If `val` is a Pair, return its cdr. Otherwise return None.
+fn get_pair_cdr(val: &Value) -> Option<Value> {
+    match val {
+        Value::Pair(cell) => Some(cell.borrow().1.clone()),
+        _ => None,
+    }
+}
+
+fn is_nil_value(val: &Value) -> bool {
+    matches!(val, Value::List(e) if e.is_empty())
 }
 
 fn eval_string_set(
@@ -1996,6 +2090,14 @@ fn eval_string_set(
 
 /// Deep structural equality for `equal?`.
 fn values_equal(a: &Value, b: &Value) -> bool {
+    values_equal_inner(a, b, &mut std::collections::HashSet::new())
+}
+
+fn values_equal_inner(
+    a: &Value,
+    b: &Value,
+    seen: &mut std::collections::HashSet<(usize, usize)>,
+) -> bool {
     match (a, b) {
         (Value::Integer(x), Value::Integer(y)) => x == y,
         (Value::Boolean(x), Value::Boolean(y)) => x == y,
@@ -2003,15 +2105,34 @@ fn values_equal(a: &Value, b: &Value) -> bool {
         (Value::Symbol(x), Value::Symbol(y)) => x == y,
         (Value::Char(x), Value::Char(y)) => x == y,
         (Value::List(xs), Value::List(ys)) => {
-            xs.len() == ys.len() && xs.iter().zip(ys).all(|(a, b)| values_equal(a, b))
+            xs.len() == ys.len() && xs.iter().zip(ys).all(|(a, b)| values_equal_inner(a, b, seen))
         }
-        (Value::Pair(a1, a2), Value::Pair(b1, b2)) => {
-            values_equal(a1, b1) && values_equal(a2, b2)
+        (Value::Pair(ac), Value::Pair(bc)) => {
+            let key = (Rc::as_ptr(ac) as usize, Rc::as_ptr(bc) as usize);
+            if !seen.insert(key) {
+                return true; // already comparing these — assume equal to avoid infinite loop
+            }
+            let ap = ac.borrow();
+            let bp = bc.borrow();
+            values_equal_inner(&ap.0, &bp.0, seen) && values_equal_inner(&ap.1, &bp.1, seen)
+        }
+        // Cross-representation: List vs Pair chain
+        (Value::List(xs), Value::Pair(_)) | (Value::Pair(_), Value::List(xs)) => {
+            let (list_elems, pair_val) = if matches!(a, Value::List(_)) {
+                (xs, b)
+            } else {
+                (xs, a)
+            };
+            let Some(pair_elems) = value::proper_list_elems(pair_val) else {
+                return false;
+            };
+            list_elems.len() == pair_elems.len()
+                && list_elems.iter().zip(&pair_elems).all(|(a, b)| values_equal_inner(a, b, seen))
         }
         (Value::Vector(xs), Value::Vector(ys)) => {
             let xs = xs.borrow();
             let ys = ys.borrow();
-            xs.len() == ys.len() && xs.iter().zip(ys.iter()).all(|(a, b)| values_equal(a, b))
+            xs.len() == ys.len() && xs.iter().zip(ys.iter()).all(|(a, b)| values_equal_inner(a, b, seen))
         }
         (Value::Void, Value::Void) => true,
         _ => false,
@@ -2027,7 +2148,7 @@ fn values_eqv(a: &Value, b: &Value) -> bool {
         (Value::Symbol(x), Value::Symbol(y)) => x == y,
         (Value::Char(x), Value::Char(y)) => x == y,
         (Value::List(xs), Value::List(ys)) => xs.is_empty() && ys.is_empty(),
-        (Value::Pair(..), Value::Pair(..)) => false,
+        (Value::Pair(a), Value::Pair(b)) => Rc::ptr_eq(a, b),
         (Value::Vector(x), Value::Vector(y)) => Rc::ptr_eq(x, y),
         (Value::Void, Value::Void) => true,
         _ => false,
@@ -2285,7 +2406,7 @@ fn apply_vector_builtin(
                     span,
                 });
             };
-            Ok(Value::List(cells.borrow().clone()))
+            Ok(value::vec_to_list(cells.borrow().clone()))
         }
         "list->vector" => {
             let [list_val] = args else {
@@ -2295,13 +2416,11 @@ fn apply_vector_builtin(
                     span,
                 });
             };
-            let Value::List(elems) = list_val else {
-                return Err(EvalError::TypeError {
-                    message: format!("list->vector: expected list, got {list_val}"),
-                    span,
-                });
-            };
-            Ok(Value::Vector(Rc::new(RefCell::new(elems.clone()))))
+            let elems = value::proper_list_elems(list_val).ok_or_else(|| EvalError::TypeError {
+                message: format!("list->vector: expected list, got {list_val}"),
+                span,
+            })?;
+            Ok(Value::Vector(Rc::new(RefCell::new(elems))))
         }
         _ => unreachable!("apply_vector_builtin called with: {name}"),
     }
