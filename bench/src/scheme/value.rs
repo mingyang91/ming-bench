@@ -28,6 +28,7 @@ pub enum Value {
     Symbol(std::string::String),
     Char(char),
     List(Vec<Value>),
+    Vector(Rc<RefCell<Vec<Value>>>),
     Lambda {
         params: Vec<std::string::String>,
         rest_param: Option<std::string::String>,
@@ -53,6 +54,7 @@ impl PartialEq for Value {
             (Value::Symbol(a), Value::Symbol(b)) => a == b,
             (Value::Char(a), Value::Char(b)) => a == b,
             (Value::List(a), Value::List(b)) => a == b,
+            (Value::Vector(a), Value::Vector(b)) => Rc::ptr_eq(a, b),
             (Value::Void, Value::Void) => true,
             (Value::Lambda { .. }, Value::Lambda { .. }) => false,
             (Value::Macro { .. }, Value::Macro { .. }) => false,
@@ -60,6 +62,17 @@ impl PartialEq for Value {
             _ => false,
         }
     }
+}
+
+fn fmt_vector(elems: &[Value], f: &mut fmt::Formatter<'_>) -> fmt::Result {
+    write!(f, "#(")?;
+    for (i, elem) in elems.iter().enumerate() {
+        if i > 0 {
+            write!(f, " ")?;
+        }
+        write!(f, "{elem}")?;
+    }
+    write!(f, ")")
 }
 
 fn fmt_list(elems: &[Value], f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -83,6 +96,11 @@ impl Value {
                 let inner: Vec<String> = elems.iter().map(|e| e.display_str()).collect();
                 format!("({})", inner.join(" "))
             }
+            Value::Vector(cells) => {
+                let elems = cells.borrow();
+                let inner: Vec<String> = elems.iter().map(|e| e.display_str()).collect();
+                format!("#({})", inner.join(" "))
+            }
             Value::Macro { .. } => "#<macro>".to_string(),
             other => other.to_string(),
         }
@@ -99,6 +117,7 @@ impl fmt::Display for Value {
             Value::Symbol(s) => write!(f, "{s}"),
             Value::Char(c) => write!(f, "#\\{c}"),
             Value::List(elems) => fmt_list(elems, f),
+            Value::Vector(cells) => fmt_vector(&cells.borrow(), f),
             Value::Lambda { .. } | Value::Continuation(_) => write!(f, "#<procedure>"),
             Value::Macro { .. } => write!(f, "#<macro>"),
             Value::Void => write!(f, ""),

@@ -43,6 +43,16 @@ fn is_builtin(name: &str) -> bool {
             | "integer->char"
             | "call/cc"
             | "call-with-current-continuation"
+            | "equal?"
+            | "eqv?"
+            | "eq?"
+            | "vector"
+            | "make-vector"
+            | "vector-ref"
+            | "vector-length"
+            | "vector?"
+            | "vector->list"
+            | "list->vector"
     )
 }
 
@@ -122,7 +132,8 @@ pub fn eval(
                 Bounce::Done(v) => return Ok(v),
                 Bounce::TailCall { expr, env } => { cur_expr = expr; cur_env = env; }
             },
-            Value::Lambda { .. } | Value::Continuation(_) | Value::Macro { .. } => {
+            Value::Lambda { .. } | Value::Continuation(_) | Value::Macro { .. }
+            | Value::Vector(_) => {
                 return Ok(cur_expr);
             }
             Value::Void => return Ok(Value::Void),
@@ -153,6 +164,12 @@ fn eval_list_tco(
             "cond" => return eval_cond_tco(args, env, span, ctx),
             "set!" => return eval_set(args, env, span, ctx).map(Bounce::Done),
             "string-set!" => return eval_string_set(args, env, span, ctx).map(Bounce::Done),
+            "letrec" => return eval_letrec_tco(args, env, span, ctx),
+            "letrec*" => return eval_letrec_star_tco(args, env, span, ctx),
+            "case" => return eval_case_tco(args, env, span, ctx),
+            "vector-set!" => {
+                return eval_vector_set(args, env, span, ctx).map(Bounce::Done);
+            }
             "define-syntax" => {
                 return eval_define_syntax(args, env, span).map(Bounce::Done);
             }
@@ -892,6 +909,9 @@ fn apply_builtin(
         | "number->string" | "symbol->string" | "string->symbol" | "string-ref"
         | "string-copy" | "string->list" | "list->string" | "char->integer"
         | "integer->char" => apply_string_builtin(name, args, span),
+        "equal?" | "eqv?" | "eq?" => apply_equality_builtin(name, args, span),
+        "vector" | "make-vector" | "vector-ref" | "vector-length" | "vector?"
+        | "vector->list" | "list->vector" => apply_vector_builtin(name, args, span),
         _ => Err(EvalError::UnboundVariable {
             name: name.to_string(),
             span,
@@ -1291,4 +1311,315 @@ fn eval_string_set(
         });
     }
     Ok(Value::Void)
+}
+
+// ===== Level 14: Deep Equality, Letrec, Case & Vectors =====
+
+/// Deep structural equality for `equal?`.
+fn values_equal(a: &Value, b: &Value) -> bool {
+    match (a, b) {
+        (Value::Integer(x), Value::Integer(y)) => x == y,
+        (Value::Boolean(x), Value::Boolean(y)) => x == y,
+        (Value::String(x), Value::String(y)) => x == y,
+        (Value::Symbol(x), Value::Symbol(y)) => x == y,
+        (Value::Char(x), Value::Char(y)) => x == y,
+        (Value::List(xs), Value::List(ys)) => {
+            xs.len() == ys.len() && xs.iter().zip(ys).all(|(a, b)| values_equal(a, b))
+        }
+        (Value::Vector(xs), Value::Vector(ys)) => {
+            let xs = xs.borrow();
+            let ys = ys.borrow();
+            xs.len() == ys.len() && xs.iter().zip(ys.iter()).all(|(a, b)| values_equal(a, b))
+        }
+        (Value::Void, Value::Void) => true,
+        _ => false,
+    }
+}
+
+/// `eqv?` / `eq?` — shallow identity-like equality.
+fn values_eqv(a: &Value, b: &Value) -> bool {
+    match (a, b) {
+        (Value::Integer(x), Value::Integer(y)) => x == y,
+        (Value::Boolean(x), Value::Boolean(y)) => x == y,
+        (Value::String(x), Value::String(y)) => x == y,
+        (Value::Symbol(x), Value::Symbol(y)) => x == y,
+        (Value::Char(x), Value::Char(y)) => x == y,
+        (Value::List(xs), Value::List(ys)) => xs.is_empty() && ys.is_empty(),
+        (Value::Vector(x), Value::Vector(y)) => Rc::ptr_eq(x, y),
+        (Value::Void, Value::Void) => true,
+        _ => false,
+    }
+}
+
+fn apply_equality_builtin(
+    name: &str,
+    args: &[Value],
+    span: Span,
+) -> Result<Value, EvalError> {
+    let [a, b] = args else {
+        return Err(EvalError::WrongArgCount {
+            expected: 2,
+            got: args.len(),
+            span,
+        });
+    };
+    let result = match name {
+        "equal?" => values_equal(a, b),
+        "eqv?" | "eq?" => values_eqv(a, b),
+        _ => unreachable!(),
+    };
+    Ok(Value::Boolean(result))
+}
+
+fn eval_letrec_tco(
+    args: &[Value],
+    env: &Rc<RefCell<Env>>,
+    span: Span,
+    ctx: &EvalContext,
+) -> Result<Bounce, EvalError> {
+    let [Value::List(bindings), body @ ..] = args else {
+        return Err(EvalError::TypeError {
+            message: "letrec: expected bindings list".into(),
+            span,
+        });
+    };
+    if body.is_empty() {
+        return Err(EvalError::TypeError {
+            message: "letrec: expected body".into(),
+            span,
+        });
+    }
+    let local_env = Env::with_parent(env);
+    // First pass: bind all names to Void (placeholder)
+    let mut names = Vec::new();
+    let mut init_exprs = Vec::new();
+    for binding in bindings {
+        let (name, val_expr) = parse_let_binding(binding, span)?;
+        local_env.borrow_mut().define(name.to_owned(), Value::Void);
+        names.push(name.to_owned());
+        init_exprs.push(val_expr.clone());
+    }
+    // Second pass: evaluate init exprs in the local env and set bindings
+    for (name, init_expr) in names.iter().zip(&init_exprs) {
+        let val = eval(init_expr, &local_env, span, ctx)?;
+        local_env.borrow_mut().set(name, val);
+    }
+    eval_body_tco(body, &local_env, span, ctx)
+}
+
+fn eval_letrec_star_tco(
+    args: &[Value],
+    env: &Rc<RefCell<Env>>,
+    span: Span,
+    ctx: &EvalContext,
+) -> Result<Bounce, EvalError> {
+    let [Value::List(bindings), body @ ..] = args else {
+        return Err(EvalError::TypeError {
+            message: "letrec*: expected bindings list".into(),
+            span,
+        });
+    };
+    if body.is_empty() {
+        return Err(EvalError::TypeError {
+            message: "letrec*: expected body".into(),
+            span,
+        });
+    }
+    let local_env = Env::with_parent(env);
+    // Evaluate sequentially — each binding is visible to the next
+    for binding in bindings {
+        let (name, val_expr) = parse_let_binding(binding, span)?;
+        let val = eval(val_expr, &local_env, span, ctx)?;
+        local_env.borrow_mut().define(name.to_owned(), val);
+    }
+    eval_body_tco(body, &local_env, span, ctx)
+}
+
+fn eval_case_tco(
+    args: &[Value],
+    env: &Rc<RefCell<Env>>,
+    span: Span,
+    ctx: &EvalContext,
+) -> Result<Bounce, EvalError> {
+    let [key_expr, clauses @ ..] = args else {
+        return Err(EvalError::TypeError {
+            message: "case: expected key expression".into(),
+            span,
+        });
+    };
+    let key = eval(key_expr, env, span, ctx)?;
+    for clause in clauses {
+        let Value::List(elems) = clause else {
+            return Err(EvalError::TypeError {
+                message: "case: clause must be a list".into(),
+                span,
+            });
+        };
+        let [datums, body @ ..] = elems.as_slice() else {
+            return Err(EvalError::TypeError {
+                message: "case: empty clause".into(),
+                span,
+            });
+        };
+        // else clause
+        if matches!(datums, Value::Symbol(s) if s == "else") {
+            return eval_body_tco(body, env, span, ctx);
+        }
+        // datum list
+        let Value::List(datum_list) = datums else {
+            return Err(EvalError::TypeError {
+                message: "case: expected datum list".into(),
+                span,
+            });
+        };
+        if datum_list.iter().any(|d| values_eqv(&key, d)) {
+            return eval_body_tco(body, env, span, ctx);
+        }
+    }
+    Ok(Bounce::Done(Value::Void))
+}
+
+fn eval_vector_set(
+    args: &[Value],
+    env: &Rc<RefCell<Env>>,
+    span: Span,
+    ctx: &EvalContext,
+) -> Result<Value, EvalError> {
+    let [vec_expr, idx_expr, val_expr] = args else {
+        return Err(EvalError::WrongArgCount {
+            expected: 3,
+            got: args.len(),
+            span,
+        });
+    };
+    let vec_val = eval(vec_expr, env, span, ctx)?;
+    let idx = require_integer(&eval(idx_expr, env, span, ctx)?, span)? as usize;
+    let val = eval(val_expr, env, span, ctx)?;
+    let Value::Vector(cells) = vec_val else {
+        return Err(EvalError::TypeError {
+            message: format!("vector-set!: expected vector, got {vec_val}"),
+            span,
+        });
+    };
+    let mut elems = cells.borrow_mut();
+    if idx >= elems.len() {
+        return Err(EvalError::TypeError {
+            message: format!(
+                "vector-set!: index {idx} out of range for vector of length {}",
+                elems.len()
+            ),
+            span,
+        });
+    }
+    elems[idx] = val;
+    Ok(Value::Void)
+}
+
+fn apply_vector_builtin(
+    name: &str,
+    args: &[Value],
+    span: Span,
+) -> Result<Value, EvalError> {
+    match name {
+        "vector" => Ok(Value::Vector(Rc::new(RefCell::new(args.to_vec())))),
+        "make-vector" => {
+            let (len, fill) = match args {
+                [len_val] => (require_integer(len_val, span)? as usize, Value::Integer(0)),
+                [len_val, fill_val] => {
+                    (require_integer(len_val, span)? as usize, fill_val.clone())
+                }
+                _ => {
+                    return Err(EvalError::WrongArgCount {
+                        expected: 2,
+                        got: args.len(),
+                        span,
+                    });
+                }
+            };
+            Ok(Value::Vector(Rc::new(RefCell::new(vec![fill; len]))))
+        }
+        "vector-ref" => {
+            let [vec_val, idx_val] = args else {
+                return Err(EvalError::WrongArgCount {
+                    expected: 2,
+                    got: args.len(),
+                    span,
+                });
+            };
+            let Value::Vector(cells) = vec_val else {
+                return Err(EvalError::TypeError {
+                    message: format!("vector-ref: expected vector, got {vec_val}"),
+                    span,
+                });
+            };
+            let idx = require_integer(idx_val, span)? as usize;
+            let elems = cells.borrow();
+            elems.get(idx).cloned().ok_or_else(|| EvalError::TypeError {
+                message: format!(
+                    "vector-ref: index {idx} out of range for vector of length {}",
+                    elems.len()
+                ),
+                span,
+            })
+        }
+        "vector-length" => {
+            let [vec_val] = args else {
+                return Err(EvalError::WrongArgCount {
+                    expected: 1,
+                    got: args.len(),
+                    span,
+                });
+            };
+            let Value::Vector(cells) = vec_val else {
+                return Err(EvalError::TypeError {
+                    message: format!("vector-length: expected vector, got {vec_val}"),
+                    span,
+                });
+            };
+            Ok(Value::Integer(cells.borrow().len() as i64))
+        }
+        "vector?" => {
+            let [val] = args else {
+                return Err(EvalError::WrongArgCount {
+                    expected: 1,
+                    got: args.len(),
+                    span,
+                });
+            };
+            Ok(Value::Boolean(matches!(val, Value::Vector(_))))
+        }
+        "vector->list" => {
+            let [vec_val] = args else {
+                return Err(EvalError::WrongArgCount {
+                    expected: 1,
+                    got: args.len(),
+                    span,
+                });
+            };
+            let Value::Vector(cells) = vec_val else {
+                return Err(EvalError::TypeError {
+                    message: format!("vector->list: expected vector, got {vec_val}"),
+                    span,
+                });
+            };
+            Ok(Value::List(cells.borrow().clone()))
+        }
+        "list->vector" => {
+            let [list_val] = args else {
+                return Err(EvalError::WrongArgCount {
+                    expected: 1,
+                    got: args.len(),
+                    span,
+                });
+            };
+            let Value::List(elems) = list_val else {
+                return Err(EvalError::TypeError {
+                    message: format!("list->vector: expected list, got {list_val}"),
+                    span,
+                });
+            };
+            Ok(Value::Vector(Rc::new(RefCell::new(elems.clone()))))
+        }
+        _ => unreachable!("apply_vector_builtin called with: {name}"),
+    }
 }
