@@ -682,6 +682,117 @@ pub fn apply_vector_length(args: &[Value]) -> Result<Value, EvalError> {
     Ok(Value::Integer(v.borrow().len() as i64))
 }
 
+pub fn apply_list_predicate(args: &[Value]) -> Result<Value, EvalError> {
+    let [val] = args else {
+        return Err(EvalError::WrongArgCount {
+            expected: 1,
+            got: args.len(),
+        });
+    };
+    let result = match val {
+        Value::Nil => true,
+        Value::List(_) => true,
+        Value::Pair(_, _) => false,
+        _ => false,
+    };
+    Ok(Value::Boolean(result))
+}
+
+pub fn apply_list_ref(args: &[Value]) -> Result<Value, EvalError> {
+    let [list_val, idx_val] = args else {
+        return Err(EvalError::WrongArgCount {
+            expected: 2,
+            got: args.len(),
+        });
+    };
+    let Value::Integer(idx) = idx_val else {
+        return Err(EvalError::TypeError {
+            expected: "integer".to_string(),
+            got: format!("{idx_val}"),
+        });
+    };
+    let i = *idx as usize;
+    match list_val {
+        Value::List(items) => items.get(i).cloned().ok_or_else(|| EvalError::TypeError {
+            expected: "valid list index".to_string(),
+            got: format!("{idx}"),
+        }),
+        Value::Nil => Err(EvalError::TypeError {
+            expected: "valid list index".to_string(),
+            got: format!("{idx}"),
+        }),
+        _ => Err(EvalError::TypeError {
+            expected: "list".to_string(),
+            got: format!("{list_val}"),
+        }),
+    }
+}
+
+pub fn apply_list_tail(args: &[Value]) -> Result<Value, EvalError> {
+    let [list_val, idx_val] = args else {
+        return Err(EvalError::WrongArgCount {
+            expected: 2,
+            got: args.len(),
+        });
+    };
+    let Value::Integer(idx) = idx_val else {
+        return Err(EvalError::TypeError {
+            expected: "integer".to_string(),
+            got: format!("{idx_val}"),
+        });
+    };
+    let i = *idx as usize;
+    match list_val {
+        Value::Nil if i == 0 => Ok(Value::Nil),
+        Value::Nil => Err(EvalError::TypeError {
+            expected: "valid list index".to_string(),
+            got: format!("{idx}"),
+        }),
+        Value::List(items) => {
+            if i > items.len() {
+                Err(EvalError::TypeError {
+                    expected: "valid list index".to_string(),
+                    got: format!("{idx}"),
+                })
+            } else if i == items.len() {
+                Ok(Value::Nil)
+            } else {
+                Ok(Value::List(items[i..].to_vec()))
+            }
+        }
+        _ => Err(EvalError::TypeError {
+            expected: "list".to_string(),
+            got: format!("{list_val}"),
+        }),
+    }
+}
+
+pub fn apply_assoc(args: &[Value]) -> Result<Value, EvalError> {
+    let [key, list_val] = args else {
+        return Err(EvalError::WrongArgCount {
+            expected: 2,
+            got: args.len(),
+        });
+    };
+    let items = match list_val {
+        Value::Nil => return Ok(Value::Boolean(false)),
+        Value::List(items) => items,
+        _ => {
+            return Err(EvalError::TypeError {
+                expected: "list".to_string(),
+                got: format!("{list_val}"),
+            })
+        }
+    };
+    items
+        .iter()
+        .find_map(|entry| match entry {
+            Value::List(pair) if !pair.is_empty() && &pair[0] == key => Some(entry.clone()),
+            _ => None,
+        })
+        .map_or(Ok(Value::Boolean(false)), Ok)
+}
+
 pub fn apply_vector_to_list(args: &[Value]) -> Result<Value, EvalError> {
     let [val] = args else {
         return Err(EvalError::WrongArgCount {

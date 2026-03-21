@@ -138,6 +138,10 @@ fn is_builtin(name: &str) -> bool {
             | "min"
             | "max"
             | "expt"
+            | "list?"
+            | "list-ref"
+            | "list-tail"
+            | "assoc"
     )
 }
 
@@ -612,6 +616,10 @@ fn apply_builtin(op: &str, args: &[Value]) -> Result<Value, EvalError> {
         "min" => builtins::apply_min(args),
         "max" => builtins::apply_max(args),
         "expt" => builtins::apply_expt(args),
+        "list?" => builtins::apply_list_predicate(args),
+        "list-ref" => builtins::apply_list_ref(args),
+        "list-tail" => builtins::apply_list_tail(args),
+        "assoc" => builtins::apply_assoc(args),
         _ => Err(EvalError::UnboundVariable {
             name: op.to_string(),
         }),
@@ -1118,33 +1126,38 @@ fn eval_builtin_map(
     env: &mut Env,
     ctx: &mut EvalCtx,
 ) -> Result<Value, EvalError> {
-    let [func_expr, list_expr] = args else {
+    if args.len() < 2 {
         return Err(EvalError::WrongArgCount {
             expected: 2,
             got: args.len(),
         });
-    };
-    let func = eval(func_expr, env, ctx)?;
-    let list_val = eval(list_expr, env, ctx)?;
-    let items = match &list_val {
-        Value::Nil => return Ok(Value::Nil),
-        Value::List(items) => items,
-        _ => {
-            return Err(EvalError::TypeError {
-                expected: "list".to_string(),
-                got: format!("{list_val}"),
-            })
-        }
-    };
-    let results: Vec<Value> = items
-        .iter()
-        .map(|item| apply_func(&func, std::slice::from_ref(item), ctx))
-        .collect::<Result<_, _>>()?;
-    if results.is_empty() {
-        Ok(Value::Nil)
-    } else {
-        Ok(Value::List(results))
     }
+    let func = eval(&args[0], env, ctx)?;
+    let lists: Vec<Vec<Value>> = args[1..]
+        .iter()
+        .map(|expr| {
+            let val = eval(expr, env, ctx)?;
+            match val {
+                Value::Nil => Ok(vec![]),
+                Value::List(items) => Ok(items),
+                _ => Err(EvalError::TypeError {
+                    expected: "list".to_string(),
+                    got: format!("{val}"),
+                }),
+            }
+        })
+        .collect::<Result<_, _>>()?;
+    let len = lists.first().map_or(0, Vec::len);
+    if len == 0 {
+        return Ok(Value::Nil);
+    }
+    let results: Vec<Value> = (0..len)
+        .map(|i| {
+            let call_args: Vec<Value> = lists.iter().map(|l| l[i].clone()).collect();
+            apply_func(&func, &call_args, ctx)
+        })
+        .collect::<Result<_, _>>()?;
+    Ok(Value::List(results))
 }
 
 /// Evaluate `(set! name value)` — mutate an existing binding.
