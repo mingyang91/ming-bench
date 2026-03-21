@@ -1,6 +1,6 @@
 # MING — Ming Interpreter Nurture Gauntlet
 
-A benchmark framework for measuring how **prompt engineering strategies** affect coding agent performance. Agents build a Scheme interpreter from scratch — 188 tests across 23 difficulty levels, from basic arithmetic to first-class continuations, hygienic macros, and exact arithmetic. Supports **5 languages**: Rust, Go, Java, TypeScript, and Scala.
+A benchmark framework for measuring how **prompt engineering strategies** affect coding agent performance. Agents build a Scheme interpreter from scratch — 214 tests across 27 difficulty levels, from basic arithmetic to first-class continuations, hygienic macros, and exact arithmetic. Supports **5 languages**: Rust, Go, Java, TypeScript, and Scala.
 
 ## Why This Exists
 
@@ -8,7 +8,7 @@ Coding agents (Claude Code, Codex, OpenCode, etc.) can write working software, b
 
 > **Does adding structure to agent instructions — quality gates, code style rules, modular architecture enforcement — improve outcomes compared to minimal "just do it" prompts?**
 
-The task is deliberately chosen to stress-test this: a Scheme interpreter requires the agent to make hundreds of architectural decisions (data representation, evaluation strategy, environment model, continuation implementation) over 23 progressively harder levels. Bad early decisions compound. Good structure should help.
+The task is deliberately chosen to stress-test this: a Scheme interpreter requires the agent to make hundreds of architectural decisions (data representation, evaluation strategy, environment model, continuation implementation) over 27 progressively harder levels. Bad early decisions compound. Good structure should help.
 
 Multi-language support adds another dimension: **does language choice affect agent performance on the same algorithmic task?**
 
@@ -45,7 +45,7 @@ ming/                         # framework — orchestration & analysis
 
   bench/                      # agent playground
     SPEC.md                   # interpreter specification (shared, all languages)
-    tests.json                # shared test manifest (188 test cases)
+    tests.json                # shared test manifest (214 test cases)
     fixtures/                 # shared .scm fixture files (214 files)
     strategies/               # strategy files (per-language subdirectories)
       default.md              # Rust default (legacy)
@@ -109,16 +109,16 @@ All containers: 1 CPU, 256 PIDs. OOM or timeout = test failure. This prevents ag
 | 3 | Lists, recursion, let/begin/cond | 24 | `cons`/`car`/`cdr`, map/filter, `let`/`begin`/`cond`, type predicates |
 | 4 | Error quality | 6 | Error messages with source position (line:col) |
 | 5 | Display/write & string ops | 13 | `display`, `write`, `newline`, `string-append`, `substring` |
-| 6 | Mutable strings (R5RS) | 3 | `string-set!`, `string-copy` |
-| 7 | String immutability (R7RS) | 4 | `string-set!` errors, `string->list`/`list->string` |
-| 8 | Tail call optimization | 8 | TCO in `if`, `cond`, named `let`, `and`/`or`, `begin` |
-| 9 | set! & mutation | 5 | Mutable bindings, shared state in closures |
-| 10 | Variadic & apply | 6 | Rest args, `apply` with prefix args |
-| 11 | **call/cc** | 10 | First-class continuations, non-local exit, reentrant |
-| 12 | **Macros** | 6 | `define-syntax`, `syntax-rules`, hygiene, ellipsis |
-| 13 | **Integration** | 5 | call/cc + macros + mutation + TCO combined |
-| 14 | Equality, letrec, case, vectors | 17 | `equal?`, `letrec`/`letrec*`, `case`, `vector` |
-| 15 | Numeric/char/string utilities | 25 | `abs`, `modulo`, `min`/`max`, `char-upcase`, `string=?` |
+| 6 | Mutable strings (R5RS) | 3 | `string-set!`, `string-copy` — **seed: agent assumes mutability** |
+| 7 | **Tail call optimization** | 8 | TCO in `if`, `cond`, named `let`, `and`/`or`, `begin` |
+| 8 | set! & mutation | 5 | Mutable bindings, shared state in closures |
+| 9 | Variadic & apply | 6 | Rest args, `apply` with prefix args |
+| 10 | **call/cc** | 10 | First-class continuations, non-local exit, reentrant |
+| 11 | **Macros** | 6 | `define-syntax`, `syntax-rules`, hygiene, ellipsis |
+| 12 | **Integration** | 5 | call/cc + macros + mutation + TCO combined |
+| 13 | Numeric/char/string utilities | 25 | `abs`, `modulo`, `min`/`max`, `char-upcase`, `string=?` |
+| 14 | String immutability (R7RS) | 4 | **Requirement change** — `string-set!` now errors (8 levels after L06) |
+| 15 | Equality, letrec, case, vectors | 17 | `equal?`, `letrec`/`letrec*`, `case`, `vector` |
 | 16 | dynamic-wind | 6 | Resource cleanup on non-local exit |
 | 17 | guard & raise | 6 | Exception signaling and catching |
 | 18 | values & call-with-values | 6 | Multi-value returns |
@@ -127,8 +127,12 @@ All containers: 1 CPU, 256 PIDs. OOM or timeout = test failure. This prevents ag
 | 21 | **Pair mutation** | 5 | `set-car!`/`set-cdr!`, circular list detection |
 | 22 | **syntax-case** | 5 | Advanced macro system with guards |
 | 23 | **Final integration** | 8 | All features combined |
+| 24 | **case-lambda** | 5 | Multi-arity closures — **forces closure restructure** |
+| 25 | **do loops** | 5 | Iteration with parallel step — **tests env model** |
+| 26 | **let-values & receive** | 5 | Multi-value destructuring — **tests values composability** |
+| 27 | **parameterize** | 5 | Dynamic parameters — **tests dynamic-wind generality** |
 
-Levels 1-3 are foundational. Levels 4-7 are maintenance/requirement-change levels. Levels 8-10 add architectural complexity. Levels 11-13 are where most agents struggle — continuations and macros demand non-obvious design decisions. Levels 14-15 are extension levels. Levels 16-23 are advanced — dynamic-wind, exceptions, exact arithmetic, records, pair mutation, syntax-case.
+**Level design philosophy:** Levels are ordered to maximize tech-debt exposure. L06 plants mutable strings, then L14 (8 levels later) reverses the requirement. L24-L27 force restructuring of core infrastructure (closures, eval loop, values, dynamic-wind) established 10-20 levels earlier. Quality-gate agents that build clean architecture early should handle these transitions cheaper than default agents.
 
 ## Tooling
 
