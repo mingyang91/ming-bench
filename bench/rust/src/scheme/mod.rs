@@ -109,6 +109,8 @@ fn default_env() -> Env {
         "string->number", "number->string",
         "symbol->string", "string->symbol",
         "string-ref", "char?", "string-copy",
+        "string->list", "list->string", "char->integer", "integer->char",
+        "map",
     ] {
         env_set(&env, name.to_string(), Val::Builtin(name.to_string()));
     }
@@ -738,59 +740,11 @@ fn eval_cond(clauses: &[Expr], env: &Env, pos: Pos, out: &Output) -> Result<Val,
     Ok(Val::Void)
 }
 
-fn eval_string_set(args: &[Expr], env: &Env, pos: Pos, out: &Output) -> Result<Val, EvalError> {
-    if args.len() != 3 {
-        return Err(EvalError::Arity {
-            msg: "string-set! requires 3 arguments".into(),
-            pos,
-        });
-    }
-    let var_name = match &args[0].kind {
-        ExprKind::Symbol(s) => s.clone(),
-        _ => {
-            return Err(EvalError::Type {
-                msg: "string-set!: first argument must be a variable".into(),
-                pos,
-            })
-        }
-    };
-    let idx_val = eval(&args[1], env, out)?;
-    let idx = as_int(&idx_val, pos)? as usize;
-    let ch_val = eval(&args[2], env, out)?;
-    let ch = match ch_val {
-        Val::Char(c) => c,
-        _ => {
-            return Err(EvalError::Type {
-                msg: "string-set!: third argument must be a character".into(),
-                pos,
-            })
-        }
-    };
-    // Look up the string, modify it, and set it back
-    let current = env_get(env, &var_name).ok_or_else(|| EvalError::UnboundVariable {
-        name: var_name.clone(),
+fn eval_string_set(_args: &[Expr], _env: &Env, pos: Pos, _out: &Output) -> Result<Val, EvalError> {
+    Err(EvalError::Runtime {
+        msg: "string-set!: strings are immutable".into(),
         pos,
-    })?;
-    match current {
-        Val::Str(mut s) => {
-            let chars: Vec<char> = s.chars().collect();
-            if idx >= chars.len() {
-                return Err(EvalError::Runtime {
-                    msg: "string-set!: index out of bounds".into(),
-                    pos,
-                });
-            }
-            let mut new_chars = chars;
-            new_chars[idx] = ch;
-            s = new_chars.into_iter().collect();
-            env_set_existing(env, &var_name, Val::Str(s));
-            Ok(Val::Void)
-        }
-        _ => Err(EvalError::Type {
-            msg: "string-set!: first argument must be a string".into(),
-            pos,
-        }),
-    }
+    })
 }
 
 fn env_set_existing(env: &Env, name: &str, val: Val) {
@@ -1120,6 +1074,67 @@ fn apply_builtin(name: &str, args: &[Val], pos: Pos, out: &Output) -> Result<Val
             match &args[0] {
                 Val::Str(s) => Ok(Val::Str(s.clone())),
                 _ => Err(EvalError::Type { msg: "string-copy: expected string".into(), pos }),
+            }
+        }
+        "string->list" => {
+            if args.len() != 1 {
+                return Err(EvalError::Arity { msg: "string->list requires 1 argument".into(), pos });
+            }
+            match &args[0] {
+                Val::Str(s) => Ok(Val::List(s.chars().map(Val::Char).collect())),
+                _ => Err(EvalError::Type { msg: "string->list: expected string".into(), pos }),
+            }
+        }
+        "list->string" => {
+            if args.len() != 1 {
+                return Err(EvalError::Arity { msg: "list->string requires 1 argument".into(), pos });
+            }
+            match &args[0] {
+                Val::List(elems) => {
+                    let mut s = String::new();
+                    for e in elems {
+                        match e {
+                            Val::Char(c) => s.push(*c),
+                            _ => return Err(EvalError::Type { msg: "list->string: expected list of characters".into(), pos }),
+                        }
+                    }
+                    Ok(Val::Str(s))
+                }
+                _ => Err(EvalError::Type { msg: "list->string: expected list".into(), pos }),
+            }
+        }
+        "char->integer" => {
+            if args.len() != 1 {
+                return Err(EvalError::Arity { msg: "char->integer requires 1 argument".into(), pos });
+            }
+            match &args[0] {
+                Val::Char(c) => Ok(Val::Int(*c as i64)),
+                _ => Err(EvalError::Type { msg: "char->integer: expected character".into(), pos }),
+            }
+        }
+        "integer->char" => {
+            if args.len() != 1 {
+                return Err(EvalError::Arity { msg: "integer->char requires 1 argument".into(), pos });
+            }
+            let n = as_int(&args[0], pos)?;
+            Ok(Val::Char(char::from_u32(n as u32).ok_or_else(|| EvalError::Runtime {
+                msg: format!("integer->char: invalid code point {}", n), pos,
+            })?))
+        }
+        "map" => {
+            if args.len() != 2 {
+                return Err(EvalError::Arity { msg: "map requires 2 arguments".into(), pos });
+            }
+            let func = &args[0];
+            match &args[1] {
+                Val::List(elems) => {
+                    let results: Vec<Val> = elems
+                        .iter()
+                        .map(|e| apply(func, &[e.clone()], pos, out))
+                        .collect::<Result<Vec<_>, _>>()?;
+                    Ok(Val::List(results))
+                }
+                _ => Err(EvalError::Type { msg: "map: expected list as second argument".into(), pos }),
             }
         }
         _ => Err(EvalError::UnboundVariable {
