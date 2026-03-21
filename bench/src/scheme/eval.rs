@@ -1148,6 +1148,8 @@ fn is_builtin(name: &str) -> bool {
             | "symbol->string" | "string->symbol"
             | "string-ref" | "string-copy"
             | "string->list" | "list->string"
+            | "string=?" | "string<?" | "string-ci=?"
+            | "string-upcase" | "string-downcase"
             | "char->integer" | "integer->char"
             | "eq?" | "eqv?" | "equal?"
             | "map"
@@ -1180,6 +1182,8 @@ fn eval_builtin(
         "string-append" | "string-length" | "substring" | "string->number"
         | "number->string" | "symbol->string" | "string->symbol" | "string-ref"
         | "string-copy" | "string->list" | "list->string"
+        | "string=?" | "string<?" | "string-ci=?"
+        | "string-upcase" | "string-downcase"
         | "char->integer" | "integer->char" => eval_string_builtin(name, args, env, out),
         "eq?" | "eqv?" => eval_eqv(args, env, out),
         "equal?" => eval_equal(args, env, out),
@@ -1885,6 +1889,44 @@ fn eval_string_builtin(
                     expected: format!("index < {}", s.len()),
                     got: idx.to_string(),
                 })
+        }
+        "string=?" | "string<?" | "string-ci=?" => {
+            let [a_arg, b_arg] = args else {
+                return Err(EvalError::WrongArgCount { expected: 2, got: args.len() });
+            };
+            let a = match eval(a_arg, env, out)? {
+                Value::String(s) => s,
+                other => return Err(EvalError::TypeError { expected: "string".to_string(), got: other.display() }),
+            };
+            let b = match eval(b_arg, env, out)? {
+                Value::String(s) => s,
+                other => return Err(EvalError::TypeError { expected: "string".to_string(), got: other.display() }),
+            };
+            let result = match name {
+                "string=?" => a == b,
+                "string<?" => a < b,
+                "string-ci=?" => a.to_lowercase() == b.to_lowercase(),
+                _ => unreachable!(),
+            };
+            Ok(Value::Boolean(result))
+        }
+        "string-upcase" => {
+            let [arg] = args else {
+                return Err(EvalError::WrongArgCount { expected: 1, got: args.len() });
+            };
+            match eval(arg, env, out)? {
+                Value::String(s) => Ok(Value::String(s.to_uppercase())),
+                other => Err(EvalError::TypeError { expected: "string".to_string(), got: other.display() }),
+            }
+        }
+        "string-downcase" => {
+            let [arg] = args else {
+                return Err(EvalError::WrongArgCount { expected: 1, got: args.len() });
+            };
+            match eval(arg, env, out)? {
+                Value::String(s) => Ok(Value::String(s.to_lowercase())),
+                other => Err(EvalError::TypeError { expected: "string".to_string(), got: other.display() }),
+            }
         }
         _ => unreachable!("unexpected string builtin: {name}"),
     }
