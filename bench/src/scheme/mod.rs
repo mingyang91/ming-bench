@@ -29,9 +29,11 @@ enum Value {
     List(Vec<Value>),
     Lambda {
         params: Vec<String>,
+        rest_param: Option<String>,
         body: Vec<Value>,
         env: Env,
     },
+    Builtin(String),
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -85,7 +87,7 @@ impl Value {
             Value::Str(s) => format!("\"{}\"", s),
             Value::Symbol(s) => s.clone(),
             Value::Char(c) => format!("#\\{}", c),
-            Value::Lambda { .. } => "#<procedure>".to_string(),
+            Value::Lambda { .. } | Value::Builtin(_) => "#<procedure>".to_string(),
             Value::List(elems) => {
                 let inner: Vec<String> = elems.iter().map(|v| v.display()).collect();
                 format!("({})", inner.join(" "))
@@ -345,9 +347,11 @@ fn eval(mut expr: Value, env: &Env, pos: Pos) -> Result<Value, EvalError> {
     loop {
         let current = std::mem::replace(&mut expr, Value::Boolean(false));
         match current {
-            Value::Integer(_) | Value::Boolean(_) | Value::Str(_) | Value::Char(_) | Value::Lambda { .. } => return Ok(current),
+            Value::Integer(_) | Value::Boolean(_) | Value::Str(_) | Value::Char(_) | Value::Lambda { .. } | Value::Builtin(_) => return Ok(current),
             Value::Symbol(s) => {
-                return env_get(&current_env, &s).ok_or_else(|| runtime_err(current_pos, format!("unbound symbol: {}", s)));
+                return env_get(&current_env, &s)
+                    .or_else(|| if is_builtin(&s) { Some(Value::Builtin(s.clone())) } else { None })
+                    .ok_or_else(|| runtime_err(current_pos, format!("unbound symbol: {}", s)));
             }
             Value::List(elems) => {
                 if elems.is_empty() {
@@ -390,18 +394,10 @@ fn eval(mut expr: Value, env: &Env, pos: Pos) -> Result<Value, EvalError> {
                                             return Err(runtime_err(current_pos, "define: expected symbol"))
                                         }
                                     };
-                                    let params: Result<Vec<String>, _> = sig[1..]
-                                        .iter()
-                                        .map(|v| match v {
-                                            Value::Symbol(s) => Ok(s.clone()),
-                                            _ => Err(runtime_err(
-                                                current_pos,
-                                                "define: expected symbol in params",
-                                            )),
-                                        })
-                                        .collect();
+                                    let (params, rest_param) = parse_formals(&sig[1..], current_pos)?;
                                     let lambda = Value::Lambda {
-                                        params: params?,
+                                        params,
+                                        rest_param,
                                         body: elems[2..].to_vec(),
                                         env: current_env.clone(),
                                     };
@@ -421,21 +417,11 @@ fn eval(mut expr: Value, env: &Env, pos: Pos) -> Result<Value, EvalError> {
                                     "lambda requires at least 2 arguments",
                                 ));
                             }
-                            let params = match &elems[1] {
-                                Value::List(ps) => {
-                                    let mut names = Vec::new();
-                                    for p in ps {
-                                        match p {
-                                            Value::Symbol(s) => names.push(s.clone()),
-                                            _ => {
-                                                return Err(runtime_err(
-                                                    current_pos,
-                                                    "lambda: expected symbol in params",
-                                                ))
-                                            }
-                                        }
-                                    }
-                                    names
+                            let (params, rest_param) = match &elems[1] {
+                                Value::List(ps) => parse_formals(ps, current_pos)?,
+                                Value::Symbol(s) => {
+                                    // (lambda args body) — single symbol captures all
+                                    (vec![], Some(s.clone()))
                                 }
                                 _ => {
                                     return Err(runtime_err(
@@ -446,6 +432,7 @@ fn eval(mut expr: Value, env: &Env, pos: Pos) -> Result<Value, EvalError> {
                             };
                             return Ok(Value::Lambda {
                                 params,
+                                rest_param,
                                 body: elems[2..].to_vec(),
                                 env: current_env.clone(),
                             });
@@ -585,22 +572,12 @@ fn eval(mut expr: Value, env: &Env, pos: Pos) -> Result<Value, EvalError> {
                         "string-set!" => {
                             return Err(runtime_err(current_pos, "string-set!: strings are immutable"));
                         }
-                        "map" => {
-                            if elems.len() != 3 {
-                                return Err(runtime_err(current_pos, "map requires 2 arguments"));
+                        "apply" | "map" => {
+                            let mut args = Vec::new();
+                            for arg in &elems[1..] {
+                                args.push(eval(arg.clone(), &current_env, current_pos)?);
                             }
-                            let func = eval(elems[1].clone(), &current_env, current_pos)?;
-                            let lst = eval(elems[2].clone(), &current_env, current_pos)?;
-                            match lst {
-                                Value::List(items) => {
-                                    let mut results = Vec::new();
-                                    for item in &items {
-                                        results.push(apply_proc(&func, "map", &[item.clone()], &current_env, current_pos)?);
-                                    }
-                                    return Ok(Value::List(results));
-                                }
-                                _ => return Err(runtime_err(current_pos, "map: second argument must be a list")),
-                            }
+                            return call_builtin(op, args, &current_env, current_pos);
                         }
                         _ => {
                             let mut args = Vec::new();
@@ -610,24 +587,17 @@ fn eval(mut expr: Value, env: &Env, pos: Pos) -> Result<Value, EvalError> {
                             // Try as variable (user-defined procedure) first, then builtin
                             if let Some(proc) = env_get(&current_env, op) {
                                 match proc {
-                                    Value::Lambda { params, body, env: closure_env } => {
-                                        if args.len() != params.len() {
-                                            return Err(runtime_err(
-                                                current_pos,
-                                                format!("{}: expected {} arguments, got {}", op, params.len(), args.len()),
-                                            ));
-                                        }
-                                        let call_env = new_env(Some(closure_env));
-                                        for (param, arg) in params.iter().zip(args.iter()) {
-                                            env_set(&call_env, param.clone(), arg.clone());
-                                        }
-                                        // Eval all but last body expr, then TCO on last
+                                    Value::Lambda { params, rest_param, body, env: closure_env } => {
+                                        let call_env = bind_args(op, &params, &rest_param, &args, &closure_env, current_pos)?;
                                         for e in &body[..body.len().saturating_sub(1)] {
                                             eval(e.clone(), &call_env, current_pos)?;
                                         }
                                         expr = body.last().cloned().unwrap_or(Value::Boolean(false));
                                         current_env = call_env;
                                         continue;
+                                    }
+                                    Value::Builtin(name) => {
+                                        return call_builtin(&name, args, &current_env, current_pos);
                                     }
                                     _ => return Err(runtime_err(current_pos, format!("{} is not a procedure", op))),
                                 }
@@ -644,17 +614,8 @@ fn eval(mut expr: Value, env: &Env, pos: Pos) -> Result<Value, EvalError> {
                             args.push(eval(arg.clone(), &current_env, current_pos)?);
                         }
                         match proc {
-                            Value::Lambda { params, body, env: closure_env } => {
-                                if args.len() != params.len() {
-                                    return Err(runtime_err(
-                                        current_pos,
-                                        format!("<anonymous>: expected {} arguments, got {}", params.len(), args.len()),
-                                    ));
-                                }
-                                let call_env = new_env(Some(closure_env));
-                                for (param, arg) in params.iter().zip(args.iter()) {
-                                    env_set(&call_env, param.clone(), arg.clone());
-                                }
+                            Value::Lambda { params, rest_param, body, env: closure_env } => {
+                                let call_env = bind_args("<anonymous>", &params, &rest_param, &args, &closure_env, current_pos)?;
                                 for e in &body[..body.len().saturating_sub(1)] {
                                     eval(e.clone(), &call_env, current_pos)?;
                                 }
@@ -662,7 +623,10 @@ fn eval(mut expr: Value, env: &Env, pos: Pos) -> Result<Value, EvalError> {
                                 current_env = call_env;
                                 continue;
                             }
-                            _ => return Err(runtime_err(current_pos, format!("<anonymous> is not a procedure"))),
+                            Value::Builtin(name) => {
+                                return call_builtin(&name, args, &current_env, current_pos);
+                            }
+                            _ => return Err(runtime_err(current_pos, "<anonymous> is not a procedure")),
                         }
                     }
                 }
@@ -681,34 +645,135 @@ fn apply_proc(
     match proc {
         Value::Lambda {
             params,
+            rest_param,
             body,
             env: closure_env,
         } => {
-            if args.len() != params.len() {
-                return Err(runtime_err(
-                    pos,
-                    format!(
-                        "{}: expected {} arguments, got {}",
-                        name,
-                        params.len(),
-                        args.len()
-                    ),
-                ));
-            }
-            let call_env = new_env(Some(closure_env.clone()));
-            for (param, arg) in params.iter().zip(args.iter()) {
-                env_set(&call_env, param.clone(), arg.clone());
-            }
+            let call_env = bind_args(name, params, rest_param, args, closure_env, pos)?;
             let mut result = Value::Boolean(false);
             for expr in body.iter() {
                 result = eval(expr.clone(), &call_env, pos)?;
             }
             Ok(result)
         }
+        Value::Builtin(bname) => {
+            apply_builtin_vals(bname, args, pos)
+        }
         _ => Err(runtime_err(
             pos,
             format!("{} is not a procedure", name),
         )),
+    }
+}
+
+/// Parse a formals list, handling dotted rest params like (x y . rest).
+fn parse_formals(formals: &[Value], pos: Pos) -> Result<(Vec<String>, Option<String>), EvalError> {
+    let mut params = Vec::new();
+    let mut rest_param = None;
+    let mut i = 0;
+    while i < formals.len() {
+        match &formals[i] {
+            Value::Symbol(s) if s == "." => {
+                if i + 1 >= formals.len() || i + 2 < formals.len() {
+                    return Err(runtime_err(pos, "malformed dotted parameter list"));
+                }
+                match &formals[i + 1] {
+                    Value::Symbol(rest) => rest_param = Some(rest.clone()),
+                    _ => return Err(runtime_err(pos, "expected symbol after dot in formals")),
+                }
+                break;
+            }
+            Value::Symbol(s) => params.push(s.clone()),
+            _ => return Err(runtime_err(pos, "expected symbol in parameter list")),
+        }
+        i += 1;
+    }
+    Ok((params, rest_param))
+}
+
+/// Bind arguments to parameters, handling rest params.
+fn bind_args(
+    name: &str,
+    params: &[String],
+    rest_param: &Option<String>,
+    args: &[Value],
+    closure_env: &Env,
+    pos: Pos,
+) -> Result<Env, EvalError> {
+    if let Some(_) = rest_param {
+        if args.len() < params.len() {
+            return Err(runtime_err(pos, format!("{}: expected at least {} arguments, got {}", name, params.len(), args.len())));
+        }
+    } else if args.len() != params.len() {
+        return Err(runtime_err(pos, format!("{}: expected {} arguments, got {}", name, params.len(), args.len())));
+    }
+    let call_env = new_env(Some(closure_env.clone()));
+    for (param, arg) in params.iter().zip(args.iter()) {
+        env_set(&call_env, param.clone(), arg.clone());
+    }
+    if let Some(rest) = rest_param {
+        env_set(&call_env, rest.clone(), Value::List(args[params.len()..].to_vec()));
+    }
+    Ok(call_env)
+}
+
+fn is_builtin(name: &str) -> bool {
+    matches!(name,
+        "+" | "-" | "*" | "/" | "<" | ">" | "=" | "<=" | ">=" |
+        "not" | "cons" | "car" | "cdr" | "null?" | "list" | "length" |
+        "string?" | "number?" | "boolean?" | "pair?" | "symbol?" |
+        "display" | "write" | "newline" |
+        "string-append" | "string-length" | "substring" |
+        "string->number" | "number->string" | "symbol->string" | "string->symbol" |
+        "string-ref" | "string-copy" | "char?" | "string->list" | "list->string" |
+        "char->integer" | "integer->char" |
+        "apply" | "map"
+    )
+}
+
+fn call_builtin(name: &str, args: Vec<Value>, env: &Env, pos: Pos) -> Result<Value, EvalError> {
+    match name {
+        "apply" => {
+            if args.len() < 2 {
+                return Err(runtime_err(pos, "apply requires at least 2 arguments"));
+            }
+            let proc = args[0].clone();
+            let last = match &args[args.len() - 1] {
+                Value::List(l) => l.clone(),
+                _ => return Err(runtime_err(pos, "apply: last argument must be a list")),
+            };
+            let mut all_args: Vec<Value> = args[1..args.len() - 1].to_vec();
+            all_args.extend(last);
+            match &proc {
+                Value::Lambda { params, rest_param, body, env: closure_env } => {
+                    let call_env = bind_args("apply", params, rest_param, &all_args, closure_env, pos)?;
+                    let mut result = Value::Boolean(false);
+                    for expr in body.iter() {
+                        result = eval(expr.clone(), &call_env, pos)?;
+                    }
+                    Ok(result)
+                }
+                Value::Builtin(bname) => apply_builtin_vals(bname, &all_args, pos),
+                _ => Err(runtime_err(pos, "apply: first argument must be a procedure")),
+            }
+        }
+        "map" => {
+            if args.len() != 2 {
+                return Err(runtime_err(pos, "map requires 2 arguments"));
+            }
+            let func = &args[0];
+            match &args[1] {
+                Value::List(items) => {
+                    let mut results = Vec::new();
+                    for item in items {
+                        results.push(apply_proc(func, "map", &[item.clone()], env, pos)?);
+                    }
+                    Ok(Value::List(results))
+                }
+                _ => Err(runtime_err(pos, "map: second argument must be a list")),
+            }
+        }
+        _ => apply_builtin_vals(name, &args, pos),
     }
 }
 
