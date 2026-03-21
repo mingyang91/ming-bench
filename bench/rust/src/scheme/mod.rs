@@ -36,6 +36,7 @@ enum Builtin {
     Sub,
     Mul,
     Div,
+    Apply,
     LessThan,
     GreaterThan,
     Equal,
@@ -93,6 +94,7 @@ struct Environment {
 #[derive(Clone, Debug)]
 struct Procedure {
     params: Vec<String>,
+    rest_param: Option<String>,
     body: Vec<Expr>,
     env: EnvRef,
 }
@@ -563,6 +565,7 @@ fn default_env() -> EnvRef {
         ("-", Builtin::Sub),
         ("*", Builtin::Mul),
         ("/", Builtin::Div),
+        ("apply", Builtin::Apply),
         ("<", Builtin::LessThan),
         (">", Builtin::GreaterThan),
         ("=", Builtin::Equal),
@@ -671,9 +674,10 @@ fn eval_define(parts: &[Expr], pos: SourcePos, env: &EnvRef) -> Result<Value, Ev
                 ));
             };
 
-            let params = parse_param_names(params_exprs)?;
+            let (params, rest_param) = parse_formal_list(params_exprs)?;
             let procedure = Value::Procedure(Rc::new(Procedure {
                 params,
+                rest_param,
                 body: body.to_vec(),
                 env: env.clone(),
             }));
@@ -730,16 +734,10 @@ fn eval_lambda(parts: &[Expr], pos: SourcePos, env: &EnvRef) -> Result<Value, Ev
         return Err(syntax_error(pos, "lambda requires a body"));
     }
 
-    let Expr::List(params_exprs, _) = params_expr else {
-        return Err(syntax_error(
-            params_expr.pos(),
-            "lambda parameters must be a list",
-        ));
-    };
-
-    let params = parse_param_names(params_exprs)?;
+    let (params, rest_param) = parse_formals(params_expr)?;
     Ok(Value::Procedure(Rc::new(Procedure {
         params,
+        rest_param,
         body: body.to_vec(),
         env: env.clone(),
     })))
@@ -819,14 +817,50 @@ fn eval_cond(clauses: &[Expr], _pos: SourcePos, env: &EnvRef) -> Result<Value, E
     Ok(Value::Void)
 }
 
-fn parse_param_names(params: &[Expr]) -> Result<Vec<String>, EvalError> {
-    params
-        .iter()
-        .map(|param| match param {
-            Expr::Symbol(name, _) => Ok(name.clone()),
-            _ => Err(syntax_error(param.pos(), "parameter names must be symbols")),
-        })
-        .collect()
+fn parse_formals(params_expr: &Expr) -> Result<(Vec<String>, Option<String>), EvalError> {
+    match params_expr {
+        Expr::List(params, _) => parse_formal_list(params),
+        Expr::Symbol(name, _) => Ok((Vec::new(), Some(name.clone()))),
+        _ => Err(syntax_error(
+            params_expr.pos(),
+            "lambda parameters must be a list or symbol",
+        )),
+    }
+}
+
+fn parse_formal_list(params: &[Expr]) -> Result<(Vec<String>, Option<String>), EvalError> {
+    let mut required = Vec::new();
+    let mut iter = params.iter();
+
+    while let Some(param) = iter.next() {
+        match param {
+            Expr::Symbol(name, pos) if name == "." => {
+                let Some(rest_expr) = iter.next() else {
+                    return Err(syntax_error(*pos, "expected rest parameter after '.'"));
+                };
+                let Expr::Symbol(rest_name, _) = rest_expr else {
+                    return Err(syntax_error(
+                        rest_expr.pos(),
+                        "parameter names must be symbols",
+                    ));
+                };
+                if rest_name == "." {
+                    return Err(syntax_error(rest_expr.pos(), "parameter names must be symbols"));
+                }
+                if iter.next().is_some() {
+                    return Err(syntax_error(
+                        rest_expr.pos(),
+                        "rest parameter must be last",
+                    ));
+                }
+                return Ok((required, Some(rest_name.clone())));
+            }
+            Expr::Symbol(name, _) => required.push(name.clone()),
+            _ => return Err(syntax_error(param.pos(), "parameter names must be symbols")),
+        }
+    }
+
+    Ok((required, None))
 }
 
 fn quote_expr(expr: &Expr) -> Value {
@@ -868,6 +902,7 @@ fn apply_builtin(
         Builtin::Sub => eval_sub(args, pos),
         Builtin::Mul => eval_mul(args, pos),
         Builtin::Div => eval_div(args, pos),
+        Builtin::Apply => eval_apply(args, pos, output),
         Builtin::LessThan => eval_compare(args, "<", pos, |left, right| left < right),
         Builtin::GreaterThan => eval_compare(args, ">", pos, |left, right| left > right),
         Builtin::Equal => eval_compare(args, "=", pos, |left, right| left == right),
@@ -928,18 +963,32 @@ fn apply_procedure(
     mut pos: SourcePos,
 ) -> Result<Value, EvalError> {
     loop {
-        if args.len() != procedure.params.len() {
+        let required = procedure.params.len();
+        let expected = if procedure.rest_param.is_some() {
+            format!("at least {required}")
+        } else {
+            required.to_string()
+        };
+        let arity_ok = if procedure.rest_param.is_some() {
+            args.len() >= required
+        } else {
+            args.len() == required
+        };
+        if !arity_ok {
             return Err(wrong_arity(
                 pos,
                 "procedure",
-                procedure.params.len().to_string(),
+                expected,
                 args.len(),
             ));
         }
 
         let local_env = Environment::new(Some(procedure.env.clone()));
-        for (param, arg) in procedure.params.iter().zip(&args) {
+        for (param, arg) in procedure.params.iter().zip(args.iter().take(required)) {
             local_env.define(param.clone(), arg.clone());
+        }
+        if let Some(rest_param) = &procedure.rest_param {
+            local_env.define(rest_param.clone(), Value::List(args[required..].to_vec()));
         }
 
         match eval_tail_body(&procedure.body, &local_env)? {
@@ -1251,6 +1300,7 @@ fn build_named_let_call(
     let local_env = Environment::new(Some(env.clone()));
     let procedure = Rc::new(Procedure {
         params,
+        rest_param: None,
         body: body.to_vec(),
         env: local_env.clone(),
     });
@@ -1298,6 +1348,31 @@ fn eval_div(args: &[Value], pos: SourcePos) -> Result<Value, EvalError> {
     }
 
     Ok(Value::Int(result))
+}
+
+fn eval_apply(
+    args: &[Value],
+    pos: SourcePos,
+    output: &Rc<RefCell<String>>,
+) -> Result<Value, EvalError> {
+    let [operator, rest @ ..] = args else {
+        return Err(wrong_arity(pos, "apply", "at least 2", args.len()));
+    };
+
+    if rest.is_empty() {
+        return Err(wrong_arity(pos, "apply", "at least 2", args.len()));
+    }
+
+    let prefix = &rest[..rest.len() - 1];
+    let last = &rest[rest.len() - 1];
+    let Value::List(spliced) = last else {
+        return Err(type_error(pos, "list", last.type_name()));
+    };
+
+    let mut expanded_args = Vec::with_capacity(prefix.len() + spliced.len());
+    expanded_args.extend_from_slice(prefix);
+    expanded_args.extend(spliced.iter().cloned());
+    apply_value(operator.clone(), &expanded_args, pos, output)
 }
 
 fn eval_compare<F>(
