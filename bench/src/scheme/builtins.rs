@@ -158,6 +158,174 @@ pub fn apply_type_predicate(args: &[Value], pred: fn(&Value) -> bool) -> Result<
     Ok(Value::Boolean(pred(val)))
 }
 
+pub fn apply_string_length(args: &[Value]) -> Result<Value, EvalError> {
+    let [val] = args else {
+        return Err(EvalError::WrongArgCount {
+            expected: 1,
+            got: args.len(),
+        });
+    };
+    match val {
+        Value::String(s) => Ok(Value::Integer(s.len() as i64)),
+        _ => Err(EvalError::TypeError {
+            expected: "string".to_string(),
+            got: format!("{val}"),
+        }),
+    }
+}
+
+pub fn apply_string_ref(args: &[Value]) -> Result<Value, EvalError> {
+    let [s_val, idx_val] = args else {
+        return Err(EvalError::WrongArgCount {
+            expected: 2,
+            got: args.len(),
+        });
+    };
+    let Value::String(s) = s_val else {
+        return Err(EvalError::TypeError {
+            expected: "string".to_string(),
+            got: format!("{s_val}"),
+        });
+    };
+    let Value::Integer(idx) = idx_val else {
+        return Err(EvalError::TypeError {
+            expected: "integer".to_string(),
+            got: format!("{idx_val}"),
+        });
+    };
+    s.chars()
+        .nth(*idx as usize)
+        .map(Value::Char)
+        .ok_or_else(|| EvalError::TypeError {
+            expected: "valid string index".to_string(),
+            got: format!("{idx}"),
+        })
+}
+
+pub fn apply_string_append(args: &[Value]) -> Result<Value, EvalError> {
+    let result: String = args
+        .iter()
+        .map(|v| match v {
+            Value::String(s) => Ok(s.as_str()),
+            _ => Err(EvalError::TypeError {
+                expected: "string".to_string(),
+                got: format!("{v}"),
+            }),
+        })
+        .collect::<Result<Vec<_>, _>>()?
+        .join("");
+    Ok(Value::String(result))
+}
+
+pub fn apply_substring(args: &[Value]) -> Result<Value, EvalError> {
+    let [s_val, start_val, end_val] = args else {
+        return Err(EvalError::WrongArgCount {
+            expected: 3,
+            got: args.len(),
+        });
+    };
+    let Value::String(s) = s_val else {
+        return Err(EvalError::TypeError {
+            expected: "string".to_string(),
+            got: format!("{s_val}"),
+        });
+    };
+    let Value::Integer(start) = start_val else {
+        return Err(EvalError::TypeError {
+            expected: "integer".to_string(),
+            got: format!("{start_val}"),
+        });
+    };
+    let Value::Integer(end) = end_val else {
+        return Err(EvalError::TypeError {
+            expected: "integer".to_string(),
+            got: format!("{end_val}"),
+        });
+    };
+    let chars: Vec<char> = s.chars().collect();
+    let sub: String = chars[*start as usize..*end as usize].iter().collect();
+    Ok(Value::String(sub))
+}
+
+pub fn apply_string_to_number(args: &[Value]) -> Result<Value, EvalError> {
+    let [val] = args else {
+        return Err(EvalError::WrongArgCount {
+            expected: 1,
+            got: args.len(),
+        });
+    };
+    let Value::String(s) = val else {
+        return Err(EvalError::TypeError {
+            expected: "string".to_string(),
+            got: format!("{val}"),
+        });
+    };
+    s.parse::<i64>()
+        .map(Value::Integer)
+        .map_err(|_| EvalError::TypeError {
+            expected: "numeric string".to_string(),
+            got: format!("\"{s}\""),
+        })
+}
+
+pub fn apply_number_to_string(args: &[Value]) -> Result<Value, EvalError> {
+    let [val] = args else {
+        return Err(EvalError::WrongArgCount {
+            expected: 1,
+            got: args.len(),
+        });
+    };
+    let Value::Integer(n) = val else {
+        return Err(EvalError::TypeError {
+            expected: "integer".to_string(),
+            got: format!("{val}"),
+        });
+    };
+    Ok(Value::String(n.to_string()))
+}
+
+pub fn apply_symbol_to_string(args: &[Value]) -> Result<Value, EvalError> {
+    let [val] = args else {
+        return Err(EvalError::WrongArgCount {
+            expected: 1,
+            got: args.len(),
+        });
+    };
+    let Value::Symbol(s) = val else {
+        return Err(EvalError::TypeError {
+            expected: "symbol".to_string(),
+            got: format!("{val}"),
+        });
+    };
+    Ok(Value::String(s.clone()))
+}
+
+pub fn apply_string_to_symbol(args: &[Value]) -> Result<Value, EvalError> {
+    let [val] = args else {
+        return Err(EvalError::WrongArgCount {
+            expected: 1,
+            got: args.len(),
+        });
+    };
+    let Value::String(s) = val else {
+        return Err(EvalError::TypeError {
+            expected: "string".to_string(),
+            got: format!("{val}"),
+        });
+    };
+    Ok(Value::Symbol(s.clone()))
+}
+
+pub fn apply_is_char(args: &[Value]) -> Result<Value, EvalError> {
+    let [val] = args else {
+        return Err(EvalError::WrongArgCount {
+            expected: 1,
+            got: args.len(),
+        });
+    };
+    Ok(Value::Boolean(matches!(val, Value::Char(_))))
+}
+
 pub fn apply_length(args: &[Value]) -> Result<Value, EvalError> {
     let [val] = args else {
         return Err(EvalError::WrongArgCount {

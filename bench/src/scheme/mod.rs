@@ -23,6 +23,7 @@ pub(crate) enum Value {
     Symbol(String),
     List(Vec<Value>),
     Nil,
+    Char(char),
     Pair(Box<Value>, Box<Value>),
     Lambda {
         name: Option<String>,
@@ -39,6 +40,7 @@ impl PartialEq for Value {
             (Value::Boolean(a), Value::Boolean(b)) => a == b,
             (Value::String(a), Value::String(b)) => a == b,
             (Value::Symbol(a), Value::Symbol(b)) => a == b,
+            (Value::Char(a), Value::Char(b)) => a == b,
             (Value::List(a), Value::List(b)) => a == b,
             (Value::Pair(a1, a2), Value::Pair(b1, b2)) => a1 == b1 && a2 == b2,
             (Value::Nil, Value::Nil) => true,
@@ -55,6 +57,7 @@ impl std::fmt::Display for Value {
             Value::Boolean(false) => write!(f, "#f"),
             Value::String(s) => write!(f, "\"{s}\""),
             Value::Symbol(s) => write!(f, "{s}"),
+            Value::Char(c) => write!(f, "#\\{c}"),
             Value::Nil => write!(f, "()"),
             Value::List(items) => write!(f, "({})", fmt_list(items)),
             Value::Pair(car, cdr) => write!(f, "({car} . {cdr})"),
@@ -68,6 +71,7 @@ impl Value {
     fn display_fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Value::String(s) => write!(f, "{s}"),
+            Value::Char(c) => write!(f, "{c}"),
             Value::List(items) => display_fmt_list(items, f),
             other => write!(f, "{other}"),
         }
