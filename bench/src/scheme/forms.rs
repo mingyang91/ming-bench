@@ -350,6 +350,23 @@ fn check_continuation_override(env: &mut Env, id: usize) -> Option<Value> {
     Some(value.clone())
 }
 
+pub(crate) fn eval_callcc(
+    args: &[Value],
+    env: &mut Env,
+    span: Span,
+    output: &mut String,
+) -> Result<Bounce, EvalError> {
+    let [arg_expr] = args else {
+        return Err(EvalError::WrongArgCount {
+            expected: 1,
+            got: args.len(),
+            span,
+        });
+    };
+    let proc = eval(arg_expr, env, output)?;
+    handle_callcc(proc, env, span, output)
+}
+
 pub(crate) fn handle_callcc(
     proc: Value,
     env: &mut Env,

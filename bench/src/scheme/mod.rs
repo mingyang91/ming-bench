@@ -9,7 +9,7 @@ use builtins::{apply_builtin, is_builtin};
 use forms::{
     eval_and_step, eval_begin_step, eval_body_step, eval_cond_step, eval_define, eval_if_step,
     eval_lambda, eval_let_step, eval_or_step, eval_quote, eval_set, eval_string_set,
-    handle_callcc,
+    eval_callcc, handle_callcc,
 };
 use std::cell::RefCell;
 use std::collections::HashMap;
@@ -80,12 +80,12 @@ fn eval_expr_sequence(
     output: &mut String,
     last: &mut Value,
 ) -> Result<Option<usize>, EvalError> {
-    for i in start_index..exprs.len() {
+    for (i, expr) in exprs.iter().enumerate().skip(start_index) {
         env.insert(
             "\x00ei".to_string(),
             Rc::new(RefCell::new(Value::Integer(i as i64))),
         );
-        match eval(&exprs[i], env, output) {
+        match eval(expr, env, output) {
             Ok(v) => *last = v,
             Err(EvalError::ContinuationInvoked {
                 id,
@@ -182,15 +182,7 @@ fn eval_list_step(
             "set!" => return eval_set(args, env, span, output).map(Bounce::Done),
             "string-set!" => return eval_string_set(args, env, span, output).map(Bounce::Done),
             "call/cc" | "call-with-current-continuation" => {
-                let [arg_expr] = args else {
-                    return Err(EvalError::WrongArgCount {
-                        expected: 1,
-                        got: args.len(),
-                        span,
-                    });
-                };
-                let proc = eval(arg_expr, env, output)?;
-                return handle_callcc(proc, env, span, output);
+                return eval_callcc(args, env, span, output);
             }
             _ => {}
         }
