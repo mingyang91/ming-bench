@@ -12,6 +12,7 @@ pub struct Env {
     callcc_counter: Rc<Cell<u64>>,
     pending_cont: Rc<RefCell<Option<(u64, Value)>>>,
     current_expr_index: Rc<Cell<usize>>,
+    gensym_counter: Rc<Cell<u64>>,
 }
 
 impl Default for Env {
@@ -29,6 +30,7 @@ impl Env {
             callcc_counter: Rc::new(Cell::new(0)),
             pending_cont: Rc::new(RefCell::new(None)),
             current_expr_index: Rc::new(Cell::new(0)),
+            gensym_counter: Rc::new(Cell::new(0)),
         }
     }
 
@@ -40,6 +42,7 @@ impl Env {
             callcc_counter: Rc::clone(&parent.callcc_counter),
             pending_cont: Rc::clone(&parent.pending_cont),
             current_expr_index: Rc::clone(&parent.current_expr_index),
+            gensym_counter: Rc::clone(&parent.gensym_counter),
         }
     }
 
@@ -100,5 +103,11 @@ impl Env {
 
     pub fn set_current_expr_index(&self, idx: usize) {
         self.current_expr_index.set(idx);
+    }
+
+    pub fn next_gensym(&self) -> u64 {
+        let id = self.gensym_counter.get();
+        self.gensym_counter.set(id + 1);
+        id
     }
 }

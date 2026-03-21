@@ -1,5 +1,6 @@
 use crate::scheme::env::Env;
 use crate::scheme::error::{EvalError, Span};
+use crate::scheme::macros;
 use crate::scheme::parser::Expr;
 use crate::scheme::value::Value;
 
@@ -31,6 +32,18 @@ pub fn eval(expr: &Expr, env: &Env) -> Result<Value, EvalError> {
             },
         }
     }
+}
+
+/// Build an environment with hygiene bindings from macro expansion.
+fn make_hygiene_env(env: &Env, hygiene_bindings: Vec<(String, Value)>) -> Env {
+    if hygiene_bindings.is_empty() {
+        return env.clone();
+    }
+    let e = Env::extend(env);
+    for (name, val) in hygiene_bindings {
+        e.define(name, val);
+    }
+    e
 }
 
 /// Resolve a symbol: check environment, then builtins.
@@ -76,6 +89,17 @@ fn eval_list(elems: &[Expr], span: Span, env: &Env) -> Result<Bounce, EvalError>
         if let Some(bounce) = eval_special_form(op, args, span, env)? {
             return Ok(bounce);
         }
+        if let Some(Value::Macro {
+            ref literals,
+            ref rules,
+            ref def_env,
+        }) = env.get(op)
+        {
+            let expansion =
+                macros::expand_macro(literals, rules, def_env, args, span, env)?;
+            let eval_env = make_hygiene_env(env, expansion.hygiene_bindings);
+            return Ok(Bounce::Tco(expansion.expr, eval_env));
+        }
         if is_builtin(op) {
             return eval_builtin(op, args, env)
                 .map(Bounce::Done)
@@ -113,6 +137,9 @@ fn eval_special_form(
             .map(Bounce::Done)
             .map(Some)
             .map_err(|e| e.at(span)),
+        "define-syntax" => eval_define_syntax(args, span, env)
+            .map(Bounce::Done)
+            .map(Some),
         _ => Ok(None),
     }
 }
@@ -760,6 +787,50 @@ fn eval_lambda(args: &[Expr], env: &Env) -> Result<Value, EvalError> {
         body: wrapped_body,
         closure: env.clone(),
     })
+}
+
+fn eval_define_syntax(args: &[Expr], span: Span, env: &Env) -> Result<Value, EvalError> {
+    let [Expr::Symbol(ref name, _), Expr::List(ref sr_form, _)] = args else {
+        return Err(EvalError::Parse("invalid define-syntax form".into()).at(span));
+    };
+    let [Expr::Symbol(ref sr, _), Expr::List(ref lit_exprs, _), ref rule_exprs @ ..] =
+        sr_form.as_slice()
+    else {
+        return Err(EvalError::Parse("expected syntax-rules form".into()).at(span));
+    };
+    if sr != "syntax-rules" {
+        return Err(EvalError::Parse("expected syntax-rules".into()).at(span));
+    }
+    let literals: Vec<String> = lit_exprs
+        .iter()
+        .map(|e| match e {
+            Expr::Symbol(s, _) => Ok(s.clone()),
+            _ => Err(EvalError::Parse("literal must be a symbol".into()).at(span)),
+        })
+        .collect::<Result<_, _>>()?;
+    let rules: Vec<(Vec<Expr>, Expr)> = rule_exprs
+        .iter()
+        .map(|r| {
+            let Expr::List(ref parts, _) = r else {
+                return Err(EvalError::Parse("rule must be a list".into()).at(span));
+            };
+            let [Expr::List(ref pattern, _), ref template] = parts.as_slice() else {
+                return Err(
+                    EvalError::Parse("rule must be (pattern template)".into()).at(span),
+                );
+            };
+            Ok((pattern.clone(), template.clone()))
+        })
+        .collect::<Result<_, _>>()?;
+    env.define(
+        name.clone(),
+        Value::Macro {
+            literals,
+            rules,
+            def_env: env.clone(),
+        },
+    );
+    Ok(Value::Void)
 }
 
 fn eval_set(args: &[Expr], span: Span, env: &Env) -> Result<Value, EvalError> {
