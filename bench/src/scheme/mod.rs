@@ -82,6 +82,7 @@ enum Value {
     },
     DottedPair(Box<Value>, Box<Value>, Span),
     Vector(Rc<RefCell<Vec<Value>>>, Span),
+    Values(Vec<Value>, Span),
     Void,
 }
 
@@ -96,7 +97,8 @@ impl Value {
             | Value::List(_, s)
             | Value::Builtin(_, s)
             | Value::DottedPair(_, _, s)
-            | Value::Vector(_, s) => *s,
+            | Value::Vector(_, s)
+            | Value::Values(_, s) => *s,
             Value::Lambda { span, .. } | Value::Continuation { span, .. } | Value::Macro { span, .. } => *span,
             Value::Void => Span::default(),
         }
@@ -125,6 +127,13 @@ impl Value {
                 format!("#({})", inner.join(" "))
             }
             Value::Lambda { .. } | Value::Builtin(..) | Value::Continuation { .. } | Value::Macro { .. } => "#<procedure>".to_string(),
+            Value::Values(vals, _) => {
+                if vals.len() == 1 {
+                    vals[0].display_scheme()
+                } else {
+                    vals.iter().map(|v| v.display_scheme()).collect::<Vec<_>>().join("\n")
+                }
+            }
             Value::Void => "".to_string(),
         }
     }
@@ -214,6 +223,7 @@ fn default_env() -> Env {
         "string=?", "string<?", "string-ci=?", "string-upcase", "string-downcase",
         "dynamic-wind", "reverse",
         "raise", "with-exception-handler",
+        "values", "call-with-values",
     ];
     for name in &builtins {
         env_set(&env, name.to_string(), Value::Builtin(name.to_string(), sp));
@@ -464,7 +474,7 @@ fn eval(expr: &Value, env: &Env) -> Result<Value, EvalError> {
 
     loop {
         match &current_expr {
-            Value::Integer(..) | Value::Boolean(..) | Value::Str(..) | Value::Char(..) | Value::Vector(..) | Value::DottedPair(..) => {
+            Value::Integer(..) | Value::Boolean(..) | Value::Str(..) | Value::Char(..) | Value::Vector(..) | Value::DottedPair(..) | Value::Values(..) => {
                 return Ok(current_expr);
             }
             Value::Symbol(name, span) => {
@@ -533,7 +543,8 @@ fn eval(expr: &Value, env: &Env) -> Result<Value, EvalError> {
                         | "char->integer" | "integer->char" | "map" | "apply"
                         | "equal?" | "eqv?" | "eq?"
                         | "vector" | "make-vector" | "vector-ref" | "vector-set!"
-                        | "vector-length" | "vector?" | "vector->list" | "list->vector" => {
+                        | "vector-length" | "vector?" | "vector->list" | "list->vector"
+                        | "values" | "call-with-values" => {
                             return eval_builtin(op, &elems[1..], &current_env, form_span);
                         }
                         // --- TCO forms: update current_expr/current_env and continue ---
@@ -2505,6 +2516,30 @@ fn eval_builtin(
                 _ => Err(EvalError::TypeError("reverse: expected list".into(), sp)),
             }
         }
+        "values" => {
+            let mut vals: Vec<Value> = Vec::new();
+            for a in args {
+                vals.push(eval(a, env)?);
+            }
+            if vals.len() == 1 {
+                Ok(vals.into_iter().next().unwrap())
+            } else {
+                Ok(Value::Values(vals, sp))
+            }
+        }
+        "call-with-values" => {
+            if args.len() != 2 {
+                return Err(EvalError::WrongArgCount { expected: "2".into(), got: args.len(), at: sp });
+            }
+            let producer = eval(&args[0], env)?;
+            let consumer = eval(&args[1], env)?;
+            let produced = apply_function(&producer, &[], sp)?;
+            let call_args = match produced {
+                Value::Values(vals, _) => vals,
+                other => vec![other],
+            };
+            apply_function(&consumer, &call_args, sp)
+        }
         _ => Err(EvalError::UnboundVariable(op.to_string(), sp)),
     }
 }
@@ -2905,6 +2940,24 @@ fn eval_builtin_with_values(op: &str, args: &[Value], sp: Span) -> Result<Value,
                 }
                 _ => Err(EvalError::TypeError("reverse: expected list".into(), sp)),
             }
+        }
+        "values" => {
+            if args.len() == 1 {
+                Ok(args[0].clone())
+            } else {
+                Ok(Value::Values(args.to_vec(), sp))
+            }
+        }
+        "call-with-values" => {
+            if args.len() != 2 {
+                return Err(EvalError::WrongArgCount { expected: "2".into(), got: args.len(), at: sp });
+            }
+            let produced = apply_function(&args[0], &[], sp)?;
+            let call_args = match produced {
+                Value::Values(vals, _) => vals,
+                other => vec![other],
+            };
+            apply_function(&args[1], &call_args, sp)
         }
         _ => Err(EvalError::UnboundVariable(op.to_string(), sp)),
     }
