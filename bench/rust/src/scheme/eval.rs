@@ -21,11 +21,7 @@ pub fn eval(expr: &Expr, env: &Env) -> Result<Value, EvalError> {
             Expr::Boolean(b, _) => return Ok(Value::Boolean(b)),
             Expr::String(ref s, _) => return Ok(Value::String(s.clone())),
             Expr::Char(c, _) => return Ok(Value::Char(c)),
-            Expr::Symbol(ref name, span) => {
-                return cur_env
-                    .get(name)
-                    .ok_or_else(|| EvalError::UnboundVariable { name: name.clone() }.at(span));
-            }
+            Expr::Symbol(ref name, span) => return resolve_symbol(name, span, &cur_env),
             Expr::List(ref elems, span) => match eval_list(elems, span, &cur_env)? {
                 Bounce::Done(val) => return Ok(val),
                 Bounce::Tco(next_expr, next_env) => {
@@ -35,6 +31,31 @@ pub fn eval(expr: &Expr, env: &Env) -> Result<Value, EvalError> {
             },
         }
     }
+}
+
+/// Resolve a symbol: check environment, then builtins.
+fn resolve_symbol(name: &str, span: Span, env: &Env) -> Result<Value, EvalError> {
+    if let Some(val) = env.get(name) {
+        return Ok(val);
+    }
+    if is_builtin(name) || name == "apply" {
+        return Ok(Value::Builtin(name.to_string()));
+    }
+    Err(EvalError::UnboundVariable { name: name.to_string() }.at(span))
+}
+
+/// Extract an integer from a Value, or return a TypeError.
+fn expect_integer(v: &Value) -> Result<i64, EvalError> {
+    match v {
+        Value::Integer(n) => Ok(*n),
+        _ => Err(EvalError::TypeError { expected: "integer".into(), got: format!("{v}") }),
+    }
+}
+
+/// Integer division with zero-check.
+fn checked_div(a: i64, b: i64) -> Result<i64, EvalError> {
+    if b == 0 { return Err(EvalError::DivisionByZero); }
+    Ok(a / b)
 }
 
 /// Evaluate a list form (special forms, builtins, or lambda application).
@@ -152,6 +173,7 @@ fn eval_named_let(
     let let_env = Env::extend(env);
     let lambda = Value::Lambda {
         params: param_names.clone(),
+        rest_param: None,
         body: loop_body.clone(),
         closure: let_env.clone(),
     };
@@ -242,31 +264,104 @@ fn eval_application(
     span: Span,
     env: &Env,
 ) -> Result<Bounce, EvalError> {
-    let Value::Lambda {
-        params,
-        body,
-        closure,
-    } = op_val
-    else {
-        return Err(EvalError::TypeError {
+    match op_val {
+        Value::Lambda { .. } => {
+            let arg_vals: Vec<Value> =
+                args.iter().map(|a| eval(a, env)).collect::<Result<_, _>>()?;
+            apply_lambda_values(op_val, &arg_vals, span)
+        }
+        Value::Builtin(ref name) if name == "apply" => {
+            let arg_vals: Vec<Value> =
+                args.iter().map(|a| eval(a, env)).collect::<Result<_, _>>()?;
+            eval_apply(&arg_vals, span)
+        }
+        Value::Builtin(ref name) => {
+            let arg_vals: Vec<Value> =
+                args.iter().map(|a| eval(a, env)).collect::<Result<_, _>>()?;
+            apply_builtin_values(name, &arg_vals).map(Bounce::Done).map_err(|e| e.at(span))
+        }
+        _ => Err(EvalError::TypeError {
             expected: "procedure".into(),
             got: format!("{op_val}"),
         }
-        .at(span));
+        .at(span)),
+    }
+}
+
+/// Apply a lambda to already-evaluated argument values.
+fn apply_lambda_values(
+    lambda: Value,
+    arg_vals: &[Value],
+    span: Span,
+) -> Result<Bounce, EvalError> {
+    let Value::Lambda {
+        params,
+        rest_param,
+        body,
+        closure,
+    } = lambda
+    else {
+        unreachable!("caller ensures lambda");
     };
-    if params.len() != args.len() {
+    let min_params = params.len();
+    if rest_param.is_some() {
+        if arg_vals.len() < min_params {
+            return Err(EvalError::WrongArgCount {
+                expected: min_params,
+                got: arg_vals.len(),
+            }
+            .at(span));
+        }
+    } else if arg_vals.len() != min_params {
         return Err(EvalError::WrongArgCount {
-            expected: params.len(),
-            got: args.len(),
+            expected: min_params,
+            got: arg_vals.len(),
         }
         .at(span));
     }
     let call_env = Env::extend(&closure);
-    for (param, arg_expr) in params.iter().zip(args) {
-        let arg_val = eval(arg_expr, env)?;
-        call_env.define(param.clone(), arg_val);
+    for (param, val) in params.iter().zip(arg_vals.iter()) {
+        call_env.define(param.clone(), val.clone());
+    }
+    if let Some(rest_name) = rest_param {
+        let rest_vals = arg_vals[min_params..].to_vec();
+        call_env.define(rest_name, Value::List(rest_vals));
     }
     Ok(Bounce::Tco(body, call_env))
+}
+
+/// Implement (apply proc arg1 ... args-list).
+fn eval_apply(args: &[Value], span: Span) -> Result<Bounce, EvalError> {
+    if args.len() < 2 {
+        return Err(EvalError::WrongArgCount {
+            expected: 2,
+            got: args.len(),
+        }
+        .at(span));
+    }
+    let proc = &args[0];
+    let Value::List(ref tail_list) = args[args.len() - 1] else {
+        return Err(EvalError::TypeError {
+            expected: "list".into(),
+            got: format!("{}", args[args.len() - 1]),
+        }
+        .at(span));
+    };
+    let mut combined: Vec<Value> = args[1..args.len() - 1].to_vec();
+    combined.extend(tail_list.iter().cloned());
+
+    match proc {
+        Value::Lambda { .. } => apply_lambda_values(proc.clone(), &combined, span),
+        Value::Builtin(ref name) if name == "apply" => eval_apply(&combined, span),
+        Value::Builtin(ref name) => {
+            apply_builtin_values(name, &combined).map(Bounce::Done).map_err(|e| e.at(span))
+        }
+        _ => Err(EvalError::TypeError {
+            expected: "procedure".into(),
+            got: format!("{proc}"),
+        }
+        .at(span)),
+    }
 }
 
 fn wrap_body(body: &[Expr], span: Span) -> Expr {
@@ -277,6 +372,160 @@ fn wrap_body(body: &[Expr], span: Span) -> Expr {
         begin.extend(body.iter().cloned());
         Expr::List(begin, span)
     }
+}
+
+/// Parse parameter list, handling dot notation for rest params.
+/// `(x y . rest)` → (["x", "y"], Some("rest"))
+fn parse_params(params: &[Expr], span: Span) -> Result<(Vec<String>, Option<String>), EvalError> {
+    // Look for a dot
+    let dot_pos = params
+        .iter()
+        .position(|p| matches!(p, Expr::Symbol(s, _) if s == "."));
+
+    let Some(dot_idx) = dot_pos else {
+        // No dot — all regular params
+        let names: Vec<String> = params
+            .iter()
+            .map(|p| match p {
+                Expr::Symbol(s, _) => Ok(s.clone()),
+                _ => Err(EvalError::Parse("parameter must be a symbol".into()).at(span)),
+            })
+            .collect::<Result<_, _>>()?;
+        return Ok((names, None));
+    };
+
+    // Dot found: params before dot are regular, one param after dot is rest
+    let regular = &params[..dot_idx];
+    let rest = &params[dot_idx + 1..];
+    let [Expr::Symbol(ref rest_name, _)] = rest else {
+        return Err(EvalError::Parse("expected exactly one parameter after dot".into()).at(span));
+    };
+    let names: Vec<String> = regular
+        .iter()
+        .map(|p| match p {
+            Expr::Symbol(s, _) => Ok(s.clone()),
+            _ => Err(EvalError::Parse("parameter must be a symbol".into()).at(span)),
+        })
+        .collect::<Result<_, _>>()?;
+    Ok((names, Some(rest_name.clone())))
+}
+
+/// Apply a builtin procedure to already-evaluated argument values.
+fn apply_builtin_values(name: &str, args: &[Value]) -> Result<Value, EvalError> {
+    match name {
+        "+" => {
+            args.iter()
+                .try_fold(0i64, |acc, v| Ok(acc + expect_integer(v)?))
+                .map(Value::Integer)
+        }
+        "-" => {
+            let [first, rest @ ..] = args else {
+                return Err(EvalError::WrongArgCount { expected: 1, got: 0 });
+            };
+            let first_val = expect_integer(first)?;
+            if rest.is_empty() {
+                return Ok(Value::Integer(-first_val));
+            }
+            rest.iter()
+                .try_fold(first_val, |acc, v| Ok(acc - expect_integer(v)?))
+                .map(Value::Integer)
+        }
+        "*" => {
+            args.iter()
+                .try_fold(1i64, |acc, v| Ok(acc * expect_integer(v)?))
+                .map(Value::Integer)
+        }
+        "/" => {
+            let [first, rest @ ..] = args else {
+                return Err(EvalError::WrongArgCount { expected: 1, got: 0 });
+            };
+            let first_val = expect_integer(first)?;
+            rest.iter()
+                .try_fold(first_val, |acc, v| checked_div(acc, expect_integer(v)?))
+                .map(Value::Integer)
+        }
+        "cons" => {
+            let [h, t] = args else {
+                return Err(EvalError::WrongArgCount { expected: 2, got: args.len() });
+            };
+            match t {
+                Value::List(items) => {
+                    let mut new = vec![h.clone()];
+                    new.extend(items.iter().cloned());
+                    Ok(Value::List(new))
+                }
+                _ => Ok(Value::List(vec![h.clone(), t.clone()])),
+            }
+        }
+        "car" => {
+            let [arg] = args else {
+                return Err(EvalError::WrongArgCount { expected: 1, got: args.len() });
+            };
+            let Value::List(items) = arg else {
+                return Err(EvalError::TypeError { expected: "pair".into(), got: format!("{arg}") });
+            };
+            items.first().cloned().ok_or_else(|| EvalError::TypeError { expected: "pair".into(), got: "()".into() })
+        }
+        "cdr" => {
+            let [arg] = args else {
+                return Err(EvalError::WrongArgCount { expected: 1, got: args.len() });
+            };
+            let Value::List(items) = arg else {
+                return Err(EvalError::TypeError { expected: "pair".into(), got: format!("{arg}") });
+            };
+            if items.is_empty() {
+                return Err(EvalError::TypeError { expected: "pair".into(), got: "()".into() });
+            }
+            Ok(Value::List(items[1..].to_vec()))
+        }
+        "null?" => {
+            let [arg] = args else {
+                return Err(EvalError::WrongArgCount { expected: 1, got: args.len() });
+            };
+            Ok(Value::Boolean(matches!(arg, Value::List(l) if l.is_empty())))
+        }
+        "list" => Ok(Value::List(args.to_vec())),
+        "length" => {
+            let [arg] = args else {
+                return Err(EvalError::WrongArgCount { expected: 1, got: args.len() });
+            };
+            let Value::List(items) = arg else {
+                return Err(EvalError::TypeError { expected: "list".into(), got: format!("{arg}") });
+            };
+            Ok(Value::Integer(items.len() as i64))
+        }
+        "<" => eval_cmp_values(args, |a, b| a < b),
+        ">" => eval_cmp_values(args, |a, b| a > b),
+        "=" => eval_cmp_values(args, |a, b| a == b),
+        "<=" => eval_cmp_values(args, |a, b| a <= b),
+        ">=" => eval_cmp_values(args, |a, b| a >= b),
+        "not" => {
+            let [arg] = args else {
+                return Err(EvalError::WrongArgCount { expected: 1, got: args.len() });
+            };
+            Ok(Value::Boolean(!arg.is_truthy()))
+        }
+        "string?" => Ok(Value::Boolean(matches!(args, [Value::String(_)]))),
+        "number?" => Ok(Value::Boolean(matches!(args, [Value::Integer(_)]))),
+        "boolean?" => Ok(Value::Boolean(matches!(args, [Value::Boolean(_)]))),
+        "pair?" => Ok(Value::Boolean(matches!(args, [Value::List(l)] if !l.is_empty()))),
+        "symbol?" => Ok(Value::Boolean(matches!(args, [Value::Symbol(_)]))),
+        "char?" => Ok(Value::Boolean(matches!(args, [Value::Char(_)]))),
+        _ => Err(EvalError::UnboundVariable { name: name.into() }),
+    }
+}
+
+fn eval_cmp_values(args: &[Value], cmp: fn(i64, i64) -> bool) -> Result<Value, EvalError> {
+    let [left, right] = args else {
+        return Err(EvalError::WrongArgCount { expected: 2, got: args.len() });
+    };
+    let Value::Integer(a) = left else {
+        return Err(EvalError::TypeError { expected: "integer".into(), got: format!("{left}") });
+    };
+    let Value::Integer(b) = right else {
+        return Err(EvalError::TypeError { expected: "integer".into(), got: format!("{right}") });
+    };
+    Ok(Value::Boolean(cmp(*a, *b)))
 }
 
 fn is_builtin(name: &str) -> bool {
@@ -370,16 +619,11 @@ fn eval_define(args: &[Expr], span: Span, env: &Env) -> Result<Value, EvalError>
             let [Expr::Symbol(name, _), params @ ..] = name_and_params.as_slice() else {
                 return Err(EvalError::Parse("invalid define form".into()).at(span));
             };
-            let param_names: Vec<String> = params
-                .iter()
-                .map(|p| match p {
-                    Expr::Symbol(s, _) => Ok(s.clone()),
-                    _ => Err(EvalError::Parse("parameter must be a symbol".into()).at(span)),
-                })
-                .collect::<Result<_, _>>()?;
+            let (param_names, rest_param) = parse_params(params, span)?;
             let wrapped_body = wrap_body(body, span);
             let lambda = Value::Lambda {
                 params: param_names,
+                rest_param,
                 body: wrapped_body,
                 closure: env.clone(),
             };
@@ -392,24 +636,29 @@ fn eval_define(args: &[Expr], span: Span, env: &Env) -> Result<Value, EvalError>
 
 fn eval_lambda(args: &[Expr], env: &Env) -> Result<Value, EvalError> {
     let [Expr::List(params, span), body @ ..] = args else {
-        return Err(EvalError::Parse("invalid lambda form".into()));
+        // (lambda rest-symbol body) — single symbol means all args go to rest
+        let [Expr::Symbol(ref rest_name, span), body @ ..] = args else {
+            return Err(EvalError::Parse("invalid lambda form".into()));
+        };
+        if body.is_empty() {
+            return Err(EvalError::Parse("lambda requires a body".into()));
+        }
+        let wrapped_body = wrap_body(body, *span);
+        return Ok(Value::Lambda {
+            params: vec![],
+            rest_param: Some(rest_name.clone()),
+            body: wrapped_body,
+            closure: env.clone(),
+        });
     };
     if body.is_empty() {
         return Err(EvalError::Parse("lambda requires a body".into()));
     }
-    let param_names: Vec<String> = params
-        .iter()
-        .map(|p| {
-            if let Expr::Symbol(s, _) = p {
-                Ok(s.clone())
-            } else {
-                Err(EvalError::Parse("parameter must be a symbol".into()))
-            }
-        })
-        .collect::<Result<_, _>>()?;
+    let (param_names, rest_param) = parse_params(params, *span)?;
     let wrapped_body = wrap_body(body, *span);
     Ok(Value::Lambda {
         params: param_names,
+        rest_param,
         body: wrapped_body,
         closure: env.clone(),
     })

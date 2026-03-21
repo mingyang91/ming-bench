@@ -13,9 +13,11 @@ pub enum Value {
     List(Vec<Value>),
     Lambda {
         params: Vec<String>,
+        rest_param: Option<String>,
         body: Expr,
         closure: Env,
     },
+    Builtin(String),
     Void,
 }
 
@@ -28,6 +30,7 @@ impl PartialEq for Value {
             (Value::Symbol(a), Value::Symbol(b)) => a == b,
             (Value::Char(a), Value::Char(b)) => a == b,
             (Value::List(a), Value::List(b)) => a == b,
+            (Value::Builtin(a), Value::Builtin(b)) => a == b,
             (Value::Void, Value::Void) => true,
             _ => false,
         }
@@ -44,7 +47,7 @@ impl fmt::Display for Value {
             Value::Char(c) => write!(f, "#\\{c}"),
             Value::Symbol(s) => write!(f, "{s}"),
             Value::List(items) => fmt_list(f, items),
-            Value::Lambda { .. } => write!(f, "#<procedure>"),
+            Value::Lambda { .. } | Value::Builtin(_) => write!(f, "#<procedure>"),
             Value::Void => write!(f, ""),
         }
     }
