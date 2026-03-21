@@ -1093,6 +1093,7 @@ fn is_builtin(name: &str) -> bool {
             | "vector" | "make-vector" | "vector-ref" | "vector-set!"
             | "vector-length" | "vector?" | "vector->list" | "list->vector"
             | "abs" | "modulo" | "remainder" | "quotient" | "min" | "max" | "expt"
+            | "zero?" | "positive?" | "negative?" | "odd?" | "even?"
     )
 }
 
@@ -1125,6 +1126,9 @@ fn eval_builtin(
         | "vector?" | "vector->list" | "list->vector" => eval_vector_builtin(name, args, env, out),
         "abs" | "modulo" | "remainder" | "quotient" | "min" | "max" | "expt" => {
             eval_numeric_util(name, args, env, out)
+        }
+        "zero?" | "positive?" | "negative?" | "odd?" | "even?" => {
+            eval_numeric_pred(name, args, env, out)
         }
         "display" => eval_display(args, env, out),
         "write" => eval_write(args, env, out),
@@ -1521,6 +1525,30 @@ fn eval_type_pred(
         "symbol?" => matches!(val, Value::Symbol(_)),
         "char?" => matches!(val, Value::Char(_)),
         _ => unreachable!("unexpected type predicate: {name}"),
+    };
+    Ok(Value::Boolean(result))
+}
+
+fn eval_numeric_pred(
+    name: &str,
+    args: &[Value],
+    env: &mut Env,
+    out: &mut String,
+) -> Result<Value, EvalError> {
+    let [arg] = args else {
+        return Err(EvalError::WrongArgCount {
+            expected: 1,
+            got: args.len(),
+        });
+    };
+    let n = eval_to_int(arg, env, out)?;
+    let result = match name {
+        "zero?" => n == 0,
+        "positive?" => n > 0,
+        "negative?" => n < 0,
+        "odd?" => n % 2 != 0,
+        "even?" => n % 2 == 0,
+        _ => unreachable!("unexpected numeric predicate: {name}"),
     };
     Ok(Value::Boolean(result))
 }

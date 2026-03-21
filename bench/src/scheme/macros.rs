@@ -253,6 +253,7 @@ fn is_special_or_builtin(name: &str) -> bool {
             | "string->list" | "list->string"
             | "char->integer" | "integer->char"
             | "map" | "apply"
+            | "zero?" | "positive?" | "negative?" | "odd?" | "even?"
     )
 }
 
