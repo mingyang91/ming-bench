@@ -80,6 +80,7 @@ fn eval_pair_bounce(
             "begin" => eval_begin_bounce(args, env, out),
             "let" => eval_let_bounce(args, env, out),
             "cond" => eval_cond_bounce(args, env, out),
+            "case" => eval_case_bounce(args, env, out),
             "and" => eval_and_bounce(args, env, out),
             "or" => eval_or_bounce(args, env, out),
             "letrec" => eval_letrec_bounce(args, env, out),
@@ -876,6 +877,65 @@ fn eval_cond_bounce(
     Ok(Bounce::Done(Value::Nil))
 }
 
+fn eval_case_bounce(
+    args: &[Value],
+    env: &mut Env,
+    out: &mut String,
+) -> Result<Bounce, EvalError> {
+    let [key_expr, clauses @ ..] = args else {
+        return Err(EvalError::WrongArgCount {
+            expected: 2,
+            got: args.len(),
+        });
+    };
+
+    let key = eval(key_expr, env, out)?;
+
+    for clause_val in clauses {
+        let clause = clause_val
+            .to_list_vec()
+            .ok_or_else(|| EvalError::TypeError {
+                expected: "case clause".to_string(),
+                got: clause_val.display(),
+            })?;
+
+        let [datums_or_else, body @ ..] = clause.as_slice() else {
+            return Err(EvalError::WrongArgCount {
+                expected: 1,
+                got: 0,
+            });
+        };
+
+        if matches!(datums_or_else, Value::Symbol(s) if s == "else") {
+            return eval_body_bounce(body, env, out);
+        }
+
+        let datums = datums_or_else
+            .to_list_vec()
+            .ok_or_else(|| EvalError::TypeError {
+                expected: "list of datums".to_string(),
+                got: datums_or_else.display(),
+            })?;
+
+        if datums.iter().any(|d| eqv(&key, d)) {
+            return eval_body_bounce(body, env, out);
+        }
+    }
+
+    Ok(Bounce::Done(Value::Nil))
+}
+
+fn eqv(a: &Value, b: &Value) -> bool {
+    match (a, b) {
+        (Value::Integer(x), Value::Integer(y)) => x == y,
+        (Value::Boolean(x), Value::Boolean(y)) => x == y,
+        (Value::Symbol(x), Value::Symbol(y)) => x == y,
+        (Value::Char(x), Value::Char(y)) => x == y,
+        (Value::Nil, Value::Nil) => true,
+        _ => false,
+    }
+}
+
 fn eval_begin_bounce(
     args: &[Value],
     env: &mut Env,
@@ -934,7 +994,7 @@ fn is_builtin(name: &str) -> bool {
             | "string-ref" | "string-copy"
             | "string->list" | "list->string"
             | "char->integer" | "integer->char"
-            | "equal?"
+            | "eq?" | "eqv?" | "equal?"
             | "map"
     )
 }
@@ -961,6 +1021,7 @@ fn eval_builtin(
         | "number->string" | "symbol->string" | "string->symbol" | "string-ref"
         | "string-copy" | "string->list" | "list->string"
         | "char->integer" | "integer->char" => eval_string_builtin(name, args, env, out),
+        "eq?" | "eqv?" => eval_eqv(args, env, out),
         "equal?" => eval_equal(args, env, out),
         "map" => eval_map(args, env, out),
         "display" => eval_display(args, env, out),
@@ -1223,6 +1284,19 @@ fn values_equal(a: &Value, b: &Value) -> bool {
         }
         _ => false,
     }
+}
+
+fn eval_eqv(
+    args: &[Value],
+    env: &mut Env,
+    out: &mut String,
+) -> Result<Value, EvalError> {
+    let [a_expr, b_expr] = args else {
+        return Err(EvalError::WrongArgCount { expected: 2, got: args.len() });
+    };
+    let a = eval(a_expr, env, out)?;
+    let b = eval(b_expr, env, out)?;
+    Ok(Value::Boolean(eqv(&a, &b)))
 }
 
 fn eval_equal(
