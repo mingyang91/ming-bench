@@ -3,7 +3,7 @@ pub mod error;
 pub use error::EvalError;
 
 use std::cell::RefCell;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::rc::Rc;
 
 type Pos = (usize, usize);
@@ -42,6 +42,10 @@ enum Value {
     },
     Builtin(String),
     Continuation(Rc<ContinuationData>),
+    Macro {
+        rules: Vec<(Value, Value)>,
+        def_env: Env,
+    },
 }
 
 thread_local! {
@@ -102,7 +106,7 @@ impl Value {
             Value::Str(s) => format!("\"{}\"", s),
             Value::Symbol(s) => s.clone(),
             Value::Char(c) => format!("#\\{}", c),
-            Value::Lambda { .. } | Value::Builtin(_) | Value::Continuation(_) => "#<procedure>".to_string(),
+            Value::Lambda { .. } | Value::Builtin(_) | Value::Continuation(_) | Value::Macro { .. } => "#<procedure>".to_string(),
             Value::List(elems) => {
                 let inner: Vec<String> = elems.iter().map(|v| v.display()).collect();
                 format!("({})", inner.join(" "))
@@ -392,7 +396,7 @@ fn eval(mut expr: Value, env: &Env, pos: Pos) -> Result<Value, EvalError> {
     loop {
         let current = std::mem::replace(&mut expr, Value::Boolean(false));
         match current {
-            Value::Integer(_) | Value::Boolean(_) | Value::Str(_) | Value::Char(_) | Value::Lambda { .. } | Value::Builtin(_) | Value::Continuation(_) => return Ok(current),
+            Value::Integer(_) | Value::Boolean(_) | Value::Str(_) | Value::Char(_) | Value::Lambda { .. } | Value::Builtin(_) | Value::Continuation(_) | Value::Macro { .. } => return Ok(current),
             Value::Symbol(s) => {
                 return env_get(&current_env, &s)
                     .or_else(|| if is_builtin(&s) { Some(Value::Builtin(s.clone())) } else { None })
@@ -673,6 +677,38 @@ fn eval(mut expr: Value, env: &Env, pos: Pos) -> Result<Value, EvalError> {
                             let proc = eval(elems[1].clone(), &current_env, current_pos)?;
                             return handle_callcc(&proc, &current_env, current_pos);
                         }
+                        "define-syntax" => {
+                            if elems.len() != 3 {
+                                return Err(runtime_err(current_pos, "define-syntax requires 2 arguments"));
+                            }
+                            let name = match &elems[1] {
+                                Value::Symbol(s) => s.clone(),
+                                _ => return Err(runtime_err(current_pos, "define-syntax: expected symbol")),
+                            };
+                            let sr = match &elems[2] {
+                                Value::List(l) => l,
+                                _ => return Err(runtime_err(current_pos, "define-syntax: expected syntax-rules")),
+                            };
+                            if sr.is_empty() || sr[0] != Value::Symbol("syntax-rules".to_string()) {
+                                return Err(runtime_err(current_pos, "define-syntax: expected syntax-rules"));
+                            }
+                            // sr[1] is the literals list (ignored for now)
+                            let mut rules = Vec::new();
+                            for rule in &sr[2..] {
+                                match rule {
+                                    Value::List(r) if r.len() == 2 => {
+                                        rules.push((r[0].clone(), r[1].clone()));
+                                    }
+                                    _ => return Err(runtime_err(current_pos, "define-syntax: invalid rule")),
+                                }
+                            }
+                            let macro_val = Value::Macro {
+                                rules,
+                                def_env: current_env.clone(),
+                            };
+                            env_set(&current_env, name, macro_val.clone());
+                            return Ok(macro_val);
+                        }
                         "string-set!" => {
                             return Err(runtime_err(current_pos, "string-set!: strings are immutable"));
                         }
@@ -684,6 +720,17 @@ fn eval(mut expr: Value, env: &Env, pos: Pos) -> Result<Value, EvalError> {
                             return call_builtin(op, args, &current_env, current_pos);
                         }
                         _ => {
+                            // Check for macro before evaluating args
+                            if let Some(Value::Macro { rules, def_env }) = env_get(&current_env, op) {
+                                let (expanded, hygiene) = expand_macro(&elems, &rules, &def_env, current_pos)?;
+                                let hyg_env = new_env(Some(current_env.clone()));
+                                for (gs, val) in hygiene {
+                                    env_set(&hyg_env, gs, val);
+                                }
+                                expr = expanded;
+                                current_env = hyg_env;
+                                continue;
+                            }
                             let mut args = Vec::new();
                             for arg in &elems[1..] {
                                 args.push(eval(arg.clone(), &current_env, current_pos)?);
@@ -883,6 +930,217 @@ fn handle_callcc(proc: &Value, env: &Env, pos: Pos) -> Result<Value, EvalError> 
 
     // Call proc with the continuation
     apply_proc(proc, "call/cc", &[cont], env, pos)
+}
+
+// ===== Macro expansion (define-syntax / syntax-rules) =====
+
+static GENSYM_COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+fn gensym(base: &str) -> String {
+    let n = GENSYM_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    format!("{}__gs{}", base, n)
+}
+
+fn is_special_form(s: &str) -> bool {
+    matches!(s,
+        "set!" | "define" | "lambda" | "if" | "quote" | "and" | "or" | "begin" |
+        "let" | "cond" | "call/cc" | "call-with-current-continuation" | "string-set!" |
+        "apply" | "map" | "define-syntax" | "syntax-rules" | "quasiquote" |
+        "unquote" | "unquote-splicing" | "else"
+    )
+}
+
+/// Collect pattern variable names from a syntax-rules pattern.
+fn collect_pattern_vars(pattern: &Value, vars: &mut HashSet<String>, skip_first: bool) {
+    match pattern {
+        Value::List(elems) => {
+            for (i, elem) in elems.iter().enumerate() {
+                if i == 0 && skip_first {
+                    continue;
+                }
+                collect_pattern_vars(elem, vars, false);
+            }
+        }
+        Value::Symbol(s) if s != "..." && s != "_" => {
+            vars.insert(s.clone());
+        }
+        _ => {}
+    }
+}
+
+enum PatBinding {
+    One(Value),
+    Many(Vec<Value>),
+}
+
+/// Match an input form against a syntax-rules pattern.
+fn match_pattern(pattern: &Value, input: &Value) -> Option<HashMap<String, PatBinding>> {
+    let mut bindings = HashMap::new();
+    if match_inner(pattern, input, &mut bindings, true) {
+        Some(bindings)
+    } else {
+        None
+    }
+}
+
+fn match_inner(pattern: &Value, input: &Value, bindings: &mut HashMap<String, PatBinding>, top: bool) -> bool {
+    match (pattern, input) {
+        (Value::List(pat), Value::List(inp)) => match_list(pat, inp, bindings, top),
+        (Value::Symbol(s), _) if s == "_" => true,
+        (Value::Boolean(a), Value::Boolean(b)) => a == b,
+        (Value::Integer(a), Value::Integer(b)) => a == b,
+        (Value::Str(a), Value::Str(b)) => a == b,
+        (Value::Symbol(s), _) if !top => {
+            bindings.insert(s.clone(), PatBinding::One(input.clone()));
+            true
+        }
+        _ => false,
+    }
+}
+
+fn match_list(pat: &[Value], inp: &[Value], bindings: &mut HashMap<String, PatBinding>, top: bool) -> bool {
+    let mut pi = 0;
+    let mut ii = 0;
+    while pi < pat.len() {
+        // Check for variadic: pattern[pi] followed by ...
+        if pi + 1 < pat.len() && pat[pi + 1] == Value::Symbol("...".to_string()) {
+            let var_name = match &pat[pi] {
+                Value::Symbol(s) => s.clone(),
+                _ => return false,
+            };
+            let remaining_pat = pat.len() - pi - 2;
+            let available = if ii <= inp.len() { inp.len() - ii } else { return false };
+            if available < remaining_pat {
+                return false;
+            }
+            let var_count = available - remaining_pat;
+            let values: Vec<Value> = inp[ii..ii + var_count].to_vec();
+            bindings.insert(var_name, PatBinding::Many(values));
+            ii += var_count;
+            pi += 2;
+        } else {
+            if ii >= inp.len() {
+                return false;
+            }
+            if pi == 0 && top {
+                // Skip macro name (first element at top level)
+                pi += 1;
+                ii += 1;
+                continue;
+            }
+            if !match_inner(&pat[pi], &inp[ii], bindings, false) {
+                return false;
+            }
+            pi += 1;
+            ii += 1;
+        }
+    }
+    ii == inp.len()
+}
+
+/// Expand a macro: try each rule, return expanded form + hygiene bindings.
+fn expand_macro(
+    input: &[Value],
+    rules: &[(Value, Value)],
+    def_env: &Env,
+    pos: Pos,
+) -> Result<(Value, Vec<(String, Value)>), EvalError> {
+    let input_val = Value::List(input.to_vec());
+    for (pattern, template) in rules {
+        if let Some(bindings) = match_pattern(pattern, &input_val) {
+            // Collect pattern variable names
+            let mut pat_vars = HashSet::new();
+            collect_pattern_vars(pattern, &mut pat_vars, true);
+
+            // Collect free symbols in template and generate renames
+            let mut renames: HashMap<String, String> = HashMap::new();
+            collect_free_syms(template, &pat_vars, &mut renames);
+
+            // Build hygiene bindings (gensym → def_env value)
+            let mut hygiene = Vec::new();
+            for (original, gs) in &renames {
+                if let Some(val) = env_get(def_env, original) {
+                    hygiene.push((gs.clone(), val));
+                }
+            }
+
+            // Substitute template
+            let expanded = subst_template(template, &bindings, &renames, pos)?;
+            return Ok((expanded, hygiene));
+        }
+    }
+    Err(runtime_err(pos, "no matching syntax-rules pattern"))
+}
+
+/// Collect free symbols in a template (not pattern vars, not special forms, not builtins).
+fn collect_free_syms(
+    template: &Value,
+    pat_vars: &HashSet<String>,
+    renames: &mut HashMap<String, String>,
+) {
+    match template {
+        Value::Symbol(s) if s == "..." || pat_vars.contains(s) => {}
+        Value::Symbol(s) if is_special_form(s) || is_builtin(s) => {}
+        Value::Symbol(s) => {
+            if !renames.contains_key(s) {
+                renames.insert(s.clone(), gensym(s));
+            }
+        }
+        Value::List(elems) => {
+            for elem in elems {
+                collect_free_syms(elem, pat_vars, renames);
+            }
+        }
+        _ => {}
+    }
+}
+
+/// Substitute pattern variables and renames into a template.
+fn subst_template(
+    template: &Value,
+    bindings: &HashMap<String, PatBinding>,
+    renames: &HashMap<String, String>,
+    pos: Pos,
+) -> Result<Value, EvalError> {
+    match template {
+        Value::Symbol(s) => {
+            if let Some(b) = bindings.get(s) {
+                match b {
+                    PatBinding::One(v) => Ok(v.clone()),
+                    PatBinding::Many(_) => Err(runtime_err(pos, format!("unexpected variadic use of {}", s))),
+                }
+            } else if let Some(gs) = renames.get(s) {
+                Ok(Value::Symbol(gs.clone()))
+            } else {
+                Ok(template.clone())
+            }
+        }
+        Value::List(elems) => {
+            let mut result = Vec::new();
+            let mut i = 0;
+            while i < elems.len() {
+                if i + 1 < elems.len() && elems[i + 1] == Value::Symbol("...".to_string()) {
+                    // Variadic splice
+                    match &elems[i] {
+                        Value::Symbol(s) if bindings.contains_key(s) => {
+                            if let Some(PatBinding::Many(vs)) = bindings.get(s) {
+                                result.extend(vs.iter().cloned());
+                            }
+                        }
+                        _ => {
+                            result.push(subst_template(&elems[i], bindings, renames, pos)?);
+                        }
+                    }
+                    i += 2;
+                } else {
+                    result.push(subst_template(&elems[i], bindings, renames, pos)?);
+                    i += 1;
+                }
+            }
+            Ok(Value::List(result))
+        }
+        _ => Ok(template.clone()),
+    }
 }
 
 fn is_builtin(name: &str) -> bool {
