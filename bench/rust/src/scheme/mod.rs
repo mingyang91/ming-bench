@@ -108,7 +108,7 @@ fn default_env() -> Env {
         "string-append", "string-length", "substring",
         "string->number", "number->string",
         "symbol->string", "string->symbol",
-        "string-ref", "char?",
+        "string-ref", "char?", "string-copy",
     ] {
         env_set(&env, name.to_string(), Val::Builtin(name.to_string()));
     }
@@ -144,6 +144,7 @@ enum Token {
     Int(i64),
     Bool(bool),
     Str(String),
+    Char(char),
     Quote,
 }
 
@@ -237,6 +238,19 @@ fn tokenize(input: &str) -> Result<Vec<(Token, Pos)>, EvalError> {
                             i += 2;
                             col += 2;
                         }
+                        '\\' => {
+                            // Character literal #\<char>
+                            if i + 2 >= chars.len() {
+                                return Err(EvalError::Parse {
+                                    msg: "unexpected end of character literal".into(),
+                                    pos: p,
+                                });
+                            }
+                            let ch = chars[i + 2];
+                            tokens.push((Token::Char(ch), p));
+                            i += 3;
+                            col += 3;
+                        }
                         _ => {
                             return Err(EvalError::Parse {
                                 msg: format!("unexpected #{}", chars[i + 1]),
@@ -286,6 +300,7 @@ enum ExprKind {
     Int(i64),
     Bool(bool),
     Str(String),
+    Char(char),
     Symbol(String),
     List(Vec<Expr>),
 }
@@ -329,6 +344,11 @@ fn parse(tokens: &[(Token, Pos)], pos: &mut usize) -> Result<Expr, EvalError> {
             let s = s.clone();
             *pos += 1;
             Ok(Expr::new(ExprKind::Symbol(s), tpos))
+        }
+        Token::Char(c) => {
+            let c = *c;
+            *pos += 1;
+            Ok(Expr::new(ExprKind::Char(c), tpos))
         }
         Token::Quote => {
             let qpos = tpos;
@@ -383,6 +403,7 @@ fn eval(expr: &Expr, env: &Env, out: &Output) -> Result<Val, EvalError> {
         ExprKind::Int(n) => Ok(Val::Int(*n)),
         ExprKind::Bool(b) => Ok(Val::Bool(*b)),
         ExprKind::Str(s) => Ok(Val::Str(s.clone())),
+        ExprKind::Char(c) => Ok(Val::Char(*c)),
         ExprKind::Symbol(name) => {
             env_get(env, name).ok_or_else(|| EvalError::UnboundVariable {
                 name: name.clone(),
@@ -406,6 +427,7 @@ fn eval(expr: &Expr, env: &Env, out: &Output) -> Result<Val, EvalError> {
                     "let" => return eval_let(&elems[1..], env, p, out),
                     "begin" => return eval_begin(&elems[1..], env, out),
                     "cond" => return eval_cond(&elems[1..], env, p, out),
+                    "string-set!" => return eval_string_set(&elems[1..], env, p, out),
                     _ => {}
                 }
             }
@@ -548,6 +570,7 @@ fn expr_to_val(expr: &Expr) -> Result<Val, EvalError> {
         ExprKind::Int(n) => Ok(Val::Int(*n)),
         ExprKind::Bool(b) => Ok(Val::Bool(*b)),
         ExprKind::Str(s) => Ok(Val::Str(s.clone())),
+        ExprKind::Char(c) => Ok(Val::Char(*c)),
         ExprKind::Symbol(s) => Ok(Val::Symbol(s.clone())),
         ExprKind::List(elems) => {
             let vals: Vec<Val> = elems
@@ -713,6 +736,73 @@ fn eval_cond(clauses: &[Expr], env: &Env, pos: Pos, out: &Output) -> Result<Val,
         }
     }
     Ok(Val::Void)
+}
+
+fn eval_string_set(args: &[Expr], env: &Env, pos: Pos, out: &Output) -> Result<Val, EvalError> {
+    if args.len() != 3 {
+        return Err(EvalError::Arity {
+            msg: "string-set! requires 3 arguments".into(),
+            pos,
+        });
+    }
+    let var_name = match &args[0].kind {
+        ExprKind::Symbol(s) => s.clone(),
+        _ => {
+            return Err(EvalError::Type {
+                msg: "string-set!: first argument must be a variable".into(),
+                pos,
+            })
+        }
+    };
+    let idx_val = eval(&args[1], env, out)?;
+    let idx = as_int(&idx_val, pos)? as usize;
+    let ch_val = eval(&args[2], env, out)?;
+    let ch = match ch_val {
+        Val::Char(c) => c,
+        _ => {
+            return Err(EvalError::Type {
+                msg: "string-set!: third argument must be a character".into(),
+                pos,
+            })
+        }
+    };
+    // Look up the string, modify it, and set it back
+    let current = env_get(env, &var_name).ok_or_else(|| EvalError::UnboundVariable {
+        name: var_name.clone(),
+        pos,
+    })?;
+    match current {
+        Val::Str(mut s) => {
+            let chars: Vec<char> = s.chars().collect();
+            if idx >= chars.len() {
+                return Err(EvalError::Runtime {
+                    msg: "string-set!: index out of bounds".into(),
+                    pos,
+                });
+            }
+            let mut new_chars = chars;
+            new_chars[idx] = ch;
+            s = new_chars.into_iter().collect();
+            env_set_existing(env, &var_name, Val::Str(s));
+            Ok(Val::Void)
+        }
+        _ => Err(EvalError::Type {
+            msg: "string-set!: first argument must be a string".into(),
+            pos,
+        }),
+    }
+}
+
+fn env_set_existing(env: &Env, name: &str, val: Val) {
+    let has_key = env.borrow().bindings.contains_key(name);
+    if has_key {
+        env.borrow_mut().bindings.insert(name.to_string(), val);
+        return;
+    }
+    let parent = env.borrow().parent.clone();
+    if let Some(parent) = parent {
+        env_set_existing(&parent, name, val);
+    }
 }
 
 fn apply_builtin(name: &str, args: &[Val], pos: Pos, out: &Output) -> Result<Val, EvalError> {
@@ -1022,6 +1112,15 @@ fn apply_builtin(name: &str, args: &[Val], pos: Pos, out: &Output) -> Result<Val
                 return Err(EvalError::Arity { msg: "char? requires 1 argument".into(), pos });
             }
             Ok(Val::Bool(matches!(&args[0], Val::Char(_))))
+        }
+        "string-copy" => {
+            if args.len() != 1 {
+                return Err(EvalError::Arity { msg: "string-copy requires 1 argument".into(), pos });
+            }
+            match &args[0] {
+                Val::Str(s) => Ok(Val::Str(s.clone())),
+                _ => Err(EvalError::Type { msg: "string-copy: expected string".into(), pos }),
+            }
         }
         _ => Err(EvalError::UnboundVariable {
             name: name.into(),
