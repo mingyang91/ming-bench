@@ -59,7 +59,7 @@ fn eval_program(input: &str, ctx: &mut EvalContext) -> Result<Value, EvalError> 
     }
 
     let env = Env::global();
-    run_machine(&program, env, ctx)
+    Ok(collapse_transparent_values(run_machine(&program, env, ctx)?))
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -128,6 +128,7 @@ enum Value {
     List(Vec<Value>),
     Pair(Box<(Value, Value)>),
     Vector(VectorRef),
+    Multi(Vec<Value>),
     Builtin(Builtin),
     Procedure(Rc<LambdaProcedure>),
     Continuation(CapturedContinuationRef),
@@ -153,6 +154,7 @@ impl Value {
             Self::List(_) => "list",
             Self::Pair(_) => "pair",
             Self::Vector(_) => "vector",
+            Self::Multi(_) => "multiple values",
             Self::Builtin(_) | Self::Procedure(_) | Self::Continuation(_) => "procedure",
             Self::Void => "void",
         }
@@ -197,6 +199,11 @@ impl Value {
                     .join(" ");
                 format!("#({rendered})")
             }
+            Self::Multi(values) => match values.as_slice() {
+                [] => "#<multiple-values>".to_string(),
+                [value] => value.render(mode),
+                _ => "#<multiple-values>".to_string(),
+            },
             Self::Builtin(_) | Self::Procedure(_) | Self::Continuation(_) => {
                 "#<procedure>".to_string()
             }
@@ -257,6 +264,8 @@ enum Builtin {
     Map,
     Apply,
     CallCc,
+    Values,
+    CallWithValues,
     DynamicWind,
     Raise,
     WithExceptionHandler,
@@ -345,6 +354,8 @@ impl Builtin {
         Self::Map,
         Self::Apply,
         Self::CallCc,
+        Self::Values,
+        Self::CallWithValues,
         Self::DynamicWind,
         Self::Raise,
         Self::WithExceptionHandler,
@@ -433,6 +444,8 @@ impl Builtin {
             Self::Map => "map",
             Self::Apply => "apply",
             Self::CallCc => "call/cc",
+            Self::Values => "values",
+            Self::CallWithValues => "call-with-values",
             Self::DynamicWind => "dynamic-wind",
             Self::Raise => "raise",
             Self::WithExceptionHandler => "with-exception-handler",
@@ -1154,6 +1167,7 @@ fn run_machine(exprs: &[Expr], env: EnvRef, ctx: &mut EvalContext) -> Result<Val
                     env,
                     next,
                 } => {
+                    expect_single_value(value)?;
                     let expr = exprs[*index].clone();
                     let next_cont = if *index + 1 < exprs.len() {
                         Rc::new(MachineContinuation::Sequence {
@@ -1175,6 +1189,7 @@ fn run_machine(exprs: &[Expr], env: EnvRef, ctx: &mut EvalContext) -> Result<Val
                     env,
                     next,
                 } => {
+                    let value = expect_single_value(value)?;
                     if value.is_truthy() {
                         control = MachineControl::Expr(consequent.clone(), env.clone());
                     } else if let Some(alternate) = alternate {
@@ -1190,6 +1205,7 @@ fn run_machine(exprs: &[Expr], env: EnvRef, ctx: &mut EvalContext) -> Result<Val
                     env,
                     next,
                 } => {
+                    let value = expect_single_value(value)?;
                     if !value.is_truthy() || *index >= exprs.len() {
                         control = MachineControl::Value(value);
                         cont = next.clone();
@@ -1215,6 +1231,7 @@ fn run_machine(exprs: &[Expr], env: EnvRef, ctx: &mut EvalContext) -> Result<Val
                     env,
                     next,
                 } => {
+                    let value = expect_single_value(value)?;
                     if value.is_truthy() || *index >= exprs.len() {
                         control = MachineControl::Value(value);
                         cont = next.clone();
@@ -1240,6 +1257,7 @@ fn run_machine(exprs: &[Expr], env: EnvRef, ctx: &mut EvalContext) -> Result<Val
                     pos,
                     next,
                 } => {
+                    let value = expect_single_value(value)?;
                     if args.is_empty() {
                         control = MachineControl::Apply {
                             function: value,
@@ -1270,6 +1288,7 @@ fn run_machine(exprs: &[Expr], env: EnvRef, ctx: &mut EvalContext) -> Result<Val
                     pos,
                     next,
                 } => {
+                    let value = expect_single_value(value)?;
                     let mut evaluated = evaluated.clone();
                     evaluated.insert(0, value);
 
@@ -1295,6 +1314,7 @@ fn run_machine(exprs: &[Expr], env: EnvRef, ctx: &mut EvalContext) -> Result<Val
                     }
                 }
                 MachineContinuation::DefineValue { name, env, next } => {
+                    let value = expect_single_value(value)?;
                     Env::define(env, name.clone(), value);
                     control = MachineControl::Value(Value::Void);
                     cont = next.clone();
@@ -1305,6 +1325,7 @@ fn run_machine(exprs: &[Expr], env: EnvRef, ctx: &mut EvalContext) -> Result<Val
                     pos,
                     next,
                 } => {
+                    let value = expect_single_value(value)?;
                     Env::set(env, name, value).map_err(|err| err.with_position(*pos))?;
                     control = MachineControl::Value(Value::Void);
                     cont = next.clone();
@@ -1320,6 +1341,7 @@ fn run_machine(exprs: &[Expr], env: EnvRef, ctx: &mut EvalContext) -> Result<Val
                     pos,
                     next,
                 } => {
+                    let value = expect_single_value(value)?;
                     let mut values = values.clone();
                     values.push(value);
 
@@ -1357,6 +1379,7 @@ fn run_machine(exprs: &[Expr], env: EnvRef, ctx: &mut EvalContext) -> Result<Val
                     env,
                     next,
                 } => {
+                    let value = expect_single_value(value)?;
                     let clause = &clauses[*index];
                     let ExprKind::List(items) = &clause.kind else {
                         return Err(EvalError::Syntax("cond clauses must be lists".into())
@@ -1387,6 +1410,36 @@ fn run_machine(exprs: &[Expr], env: EnvRef, ctx: &mut EvalContext) -> Result<Val
                 }
             },
         }
+    }
+}
+
+fn collapse_transparent_values(value: Value) -> Value {
+    match value {
+        Value::Multi(values) => match values.as_slice() {
+            [value] => value.clone(),
+            _ => Value::Multi(values),
+        },
+        other => other,
+    }
+}
+
+fn expect_single_value(value: Value) -> Result<Value, EvalError> {
+    match value {
+        Value::Multi(values) => match values.as_slice() {
+            [value] => Ok(value.clone()),
+            _ => Err(EvalError::WrongValueCount {
+                expected: "exactly 1".into(),
+                got: values.len(),
+            }),
+        },
+        other => Ok(other),
+    }
+}
+
+fn split_values(value: Value) -> Vec<Value> {
+    match value {
+        Value::Multi(values) => values,
+        other => vec![other],
     }
 }
 
@@ -1912,12 +1965,20 @@ fn eval_expr(expr: &Expr, env: EnvRef, ctx: &mut EvalContext) -> Result<Value, E
     }
 }
 
-fn eval_expr_via_machine(
+fn eval_expr_via_machine_raw(
     expr: &Expr,
     env: EnvRef,
     ctx: &mut EvalContext,
 ) -> Result<Value, EvalError> {
     run_machine(std::slice::from_ref(expr), env, ctx)
+}
+
+fn eval_expr_via_machine(
+    expr: &Expr,
+    env: EnvRef,
+    ctx: &mut EvalContext,
+) -> Result<Value, EvalError> {
+    expect_single_value(eval_expr_via_machine_raw(expr, env, ctx)?)
 }
 
 fn eval_list(
@@ -1998,7 +2059,7 @@ fn eval_tail_list(
 
     match &head.kind {
         ExprKind::Symbol(name) if name == "guard" => {
-            eval_expr_via_machine(&Expr::new(ExprKind::List(items.to_vec()), pos), env, ctx)
+            eval_expr_via_machine_raw(&Expr::new(ExprKind::List(items.to_vec()), pos), env, ctx)
                 .map(TailOutcome::Value)
         }
         ExprKind::Symbol(name) if name == "and" => eval_tail_and(args, env, ctx),
@@ -2038,7 +2099,7 @@ fn eval_tail_list(
                         | Builtin::WithExceptionHandler
                 )
             ) {
-                return eval_expr_via_machine(
+                return eval_expr_via_machine_raw(
                     &Expr::new(ExprKind::List(items.to_vec()), pos),
                     env,
                     ctx,
@@ -3632,6 +3693,15 @@ fn apply(
     pos: SourcePos,
     ctx: &mut EvalContext,
 ) -> Result<Value, EvalError> {
+    expect_single_value(apply_allow_values(function, args, pos, ctx)?)
+}
+
+fn apply_allow_values(
+    function: Value,
+    args: &[Value],
+    pos: SourcePos,
+    ctx: &mut EvalContext,
+) -> Result<Value, EvalError> {
     resolve_tail_outcome(dispatch_call(function, args.to_vec(), pos, ctx)?, ctx)
 }
 
@@ -3672,6 +3742,18 @@ fn dispatch_builtin_call(
             let (function, applied_args) =
                 expand_apply_args(&args).map_err(|err| err.with_position(pos))?;
             dispatch_call(function, applied_args, pos, ctx)
+        }
+        Builtin::CallWithValues => {
+            if args.len() != 2 {
+                return Err(
+                    wrong_arg_count("call-with-values", "exactly 2", args.len())
+                        .with_position(pos),
+                );
+            }
+
+            let produced = apply_allow_values(args[0].clone(), &[], pos, ctx)
+                .map_err(|err| err.with_position(pos))?;
+            dispatch_call(args[1].clone(), split_values(produced), pos, ctx)
         }
         Builtin::Map => apply_map_builtin(&args, pos, ctx)
             .map(TailOutcome::Value)
@@ -3748,6 +3830,7 @@ fn apply_builtin(
 ) -> Result<Value, EvalError> {
     let name = builtin.name();
     match builtin {
+        Builtin::Values => Ok(Value::Multi(args.to_vec())),
         Builtin::Add => {
             let numbers = expect_numbers(name, args)?;
             let sum = numbers
@@ -4025,6 +4108,9 @@ fn apply_builtin(
         Builtin::Map => unreachable!("map is handled by dispatch_builtin_call"),
         Builtin::Apply => unreachable!("apply is handled by dispatch_builtin_call"),
         Builtin::CallCc => unreachable!("call/cc is handled by the machine runtime"),
+        Builtin::CallWithValues => {
+            unreachable!("call-with-values is handled by dispatch_builtin_call")
+        }
         Builtin::DynamicWind => unreachable!("dynamic-wind is handled by the machine runtime"),
         Builtin::Raise => unreachable!("raise is handled by the machine runtime"),
         Builtin::WithExceptionHandler => {
@@ -4668,6 +4754,13 @@ fn values_eqv(left: &Value, right: &Value) -> bool {
             values_eqv(&left.0, &right.0) && values_eqv(&left.1, &right.1)
         }
         (Value::Vector(left), Value::Vector(right)) => Rc::ptr_eq(left, right),
+        (Value::Multi(left), Value::Multi(right)) => {
+            left.len() == right.len()
+                && left
+                    .iter()
+                    .zip(right.iter())
+                    .all(|(left, right)| values_eqv(left, right))
+        }
         (Value::Builtin(left), Value::Builtin(right)) => left == right,
         (Value::Procedure(left), Value::Procedure(right)) => Rc::ptr_eq(left, right),
         (Value::Continuation(left), Value::Continuation(right)) => Rc::ptr_eq(left, right),
@@ -4698,6 +4791,13 @@ fn values_equal(left: &Value, right: &Value) -> bool {
         (Value::Vector(left), Value::Vector(right)) => {
             let left = left.borrow();
             let right = right.borrow();
+            left.len() == right.len()
+                && left
+                    .iter()
+                    .zip(right.iter())
+                    .all(|(left, right)| values_equal(left, right))
+        }
+        (Value::Multi(left), Value::Multi(right)) => {
             left.len() == right.len()
                 && left
                     .iter()
