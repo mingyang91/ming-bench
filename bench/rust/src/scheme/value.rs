@@ -8,6 +8,8 @@ use crate::scheme::parser::Expr;
 #[derive(Debug, Clone)]
 pub enum Value {
     Integer(i64),
+    Rational(i64, i64), // numerator, denominator (always simplified, denom > 0)
+    Float(f64),
     Boolean(bool),
     String(String),
     Symbol(String),
@@ -32,10 +34,35 @@ pub enum Value {
     Void,
 }
 
+/// Greatest common divisor (always positive).
+pub fn gcd(mut a: i64, mut b: i64) -> i64 {
+    a = a.abs();
+    b = b.abs();
+    while b != 0 {
+        let t = b;
+        b = a % b;
+        a = t;
+    }
+    a
+}
+
+/// Create a simplified rational, reducing to Integer when denominator is 1.
+pub fn make_rational(numer: i64, denom: i64) -> Value {
+    debug_assert!(denom != 0, "rational denominator must not be zero");
+    let sign = if denom < 0 { -1 } else { 1 };
+    let n = numer * sign;
+    let d = denom * sign;
+    let g = gcd(n, d);
+    let (n, d) = (n / g, d / g);
+    if d == 1 { Value::Integer(n) } else { Value::Rational(n, d) }
+}
+
 impl PartialEq for Value {
     fn eq(&self, other: &Self) -> bool {
         match (self, other) {
             (Value::Integer(a), Value::Integer(b)) => a == b,
+            (Value::Rational(an, ad), Value::Rational(bn, bd)) => an == bn && ad == bd,
+            (Value::Float(a), Value::Float(b)) => a == b,
             (Value::Boolean(a), Value::Boolean(b)) => a == b,
             (Value::String(a), Value::String(b)) => a == b,
             (Value::Symbol(a), Value::Symbol(b)) => a == b,
@@ -60,6 +87,8 @@ impl fmt::Display for Value {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Value::Integer(n) => write!(f, "{n}"),
+            Value::Rational(n, d) => write!(f, "{n}/{d}"),
+            Value::Float(x) => fmt_float(f, *x),
             Value::Boolean(true) => write!(f, "#t"),
             Value::Boolean(false) => write!(f, "#f"),
             Value::String(s) => write!(f, "\"{s}\""),
@@ -94,6 +123,14 @@ fn fmt_vector(f: &mut fmt::Formatter<'_>, items: &[Value]) -> fmt::Result {
     write!(f, ")")
 }
 
+fn fmt_float(f: &mut fmt::Formatter<'_>, x: f64) -> fmt::Result {
+    if x.fract() == 0.0 && x.is_finite() {
+        write!(f, "{x:.1}")
+    } else {
+        write!(f, "{x}")
+    }
+}
+
 fn fmt_list(f: &mut fmt::Formatter<'_>, items: &[Value]) -> fmt::Result {
     write!(f, "(")?;
     for (i, item) in items.iter().enumerate() {
@@ -111,6 +148,16 @@ impl Value {
     /// Check if this value is a pair (non-empty list or dotted pair).
     pub fn is_pair(&self) -> bool {
         matches!(self, Value::List(l) if !l.is_empty()) || matches!(self, Value::Pair(_, _))
+    }
+
+    /// Check if this value is a number (integer, rational, or float).
+    pub fn is_number(&self) -> bool {
+        matches!(self, Value::Integer(_) | Value::Rational(_, _) | Value::Float(_))
+    }
+
+    /// Check if this value is an exact integer (including rationals like 4/2 that simplify).
+    pub fn is_integer_value(&self) -> bool {
+        matches!(self, Value::Integer(_))
     }
 
     /// Format for `display` — strings without quotes, chars as plain characters.

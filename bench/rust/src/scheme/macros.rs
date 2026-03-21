@@ -118,6 +118,8 @@ fn match_single(
             match_elements(sub_pat, arg_elems, literals, bindings)
         }
         Expr::Integer(n, _) => matches!(arg, Expr::Integer(m, _) if m == n).then_some(()),
+        Expr::Rational(n, d, _) => matches!(arg, Expr::Rational(m, e, _) if m == n && e == d).then_some(()),
+        Expr::Float(x, _) => matches!(arg, Expr::Float(y, _) if y == x).then_some(()),
         Expr::Boolean(b, _) => matches!(arg, Expr::Boolean(c, _) if c == b).then_some(()),
         Expr::String(s, _) => matches!(arg, Expr::String(t, _) if t == s).then_some(()),
         Expr::Char(c, _) => matches!(arg, Expr::Char(d, _) if d == c).then_some(()),

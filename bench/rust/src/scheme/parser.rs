@@ -4,6 +4,8 @@ use crate::scheme::error::{EvalError, Span};
 #[derive(Debug, Clone, PartialEq)]
 pub enum Expr {
     Integer(i64, Span),
+    Rational(i64, i64, Span), // numerator, denominator
+    Float(f64, Span),
     Boolean(bool, Span),
     String(String, Span),
     Char(char, Span),
@@ -15,6 +17,8 @@ impl Expr {
     pub fn span(&self) -> Span {
         match self {
             Expr::Integer(_, s)
+            | Expr::Rational(_, _, s)
+            | Expr::Float(_, s)
             | Expr::Boolean(_, s)
             | Expr::String(_, s)
             | Expr::Char(_, s)
@@ -162,6 +166,16 @@ fn parse_tokens(tokens: &[(String, Span)], pos: &mut usize) -> Result<Expr, Eval
     }
 }
 
+/// Try to parse a rational literal like `1/3` or `-5/2`.
+fn parse_rational(token: &str) -> Option<(i64, i64)> {
+    let slash_pos = token.find('/')?;
+    let (numer_s, rest) = token.split_at(slash_pos);
+    let denom_s = &rest[1..];
+    let n = numer_s.parse::<i64>().ok()?;
+    let d = denom_s.parse::<i64>().ok()?;
+    (d != 0).then_some((n, d))
+}
+
 /// Parse an atom token into an Expr.
 fn parse_atom(token: &str, span: Span) -> Expr {
     if token == "#t" {
@@ -172,6 +186,14 @@ fn parse_atom(token: &str, span: Span) -> Expr {
     }
     if let Ok(n) = token.parse::<i64>() {
         return Expr::Integer(n, span);
+    }
+    // Rational literal: e.g. 1/3, -5/2
+    if let Some((n, d)) = parse_rational(token) {
+        return Expr::Rational(n, d, span);
+    }
+    // Float literal
+    if let Ok(x) = token.parse::<f64>() {
+        return Expr::Float(x, span);
     }
     if token.starts_with('"') && token.ends_with('"') {
         return Expr::String(token[1..token.len() - 1].to_string(), span);
