@@ -496,6 +496,70 @@ fn eval(ast: &Ast, env: &mut Env, out: &mut String) -> Result<Value, EvalError> 
                             if items.len() < 3 {
                                 return Err(EvalError::Arity.with_position(line, col));
                             }
+                            // Named let: (let name ((var init) ...) body ...)
+                            if let AstKind::Symbol(loop_name) = &items[1].kind {
+                                if items.len() < 4 {
+                                    return Err(EvalError::Arity.with_position(line, col));
+                                }
+                                let bindings = match &items[2].kind {
+                                    AstKind::List(bs) => bs,
+                                    _ => return Err(EvalError::TypeError("let: bindings must be a list".into())
+                                        .with_position(line, col)),
+                                };
+                                let mut params = Vec::new();
+                                let mut init_vals = Vec::new();
+                                for b in bindings {
+                                    match &b.kind {
+                                        AstKind::List(pair) if pair.len() == 2 => {
+                                            let pname = match &pair[0].kind {
+                                                AstKind::Symbol(s) => s.clone(),
+                                                _ => return Err(EvalError::TypeError("let: binding name must be symbol".into())
+                                                    .with_position(pair[0].line, pair[0].col)),
+                                            };
+                                            let val = eval(&pair[1], e, out)?;
+                                            params.push(pname);
+                                            init_vals.push(val);
+                                        }
+                                        _ => return Err(EvalError::TypeError("let: bad binding".into())
+                                            .with_position(b.line, b.col)),
+                                    }
+                                }
+                                let body = if items.len() == 4 {
+                                    items[3].clone()
+                                } else {
+                                    let mut begin_items = vec![Ast {
+                                        kind: AstKind::Symbol("begin".into()),
+                                        line, col,
+                                    }];
+                                    begin_items.extend(items[3..].iter().cloned());
+                                    Ast { kind: AstKind::List(begin_items), line, col }
+                                };
+                                let mut local_env = e.clone();
+                                let lambda = Value::Lambda {
+                                    params: params.clone(),
+                                    rest_param: None,
+                                    body: Box::new(body.clone()),
+                                    env: local_env.clone(),
+                                };
+                                env_set(&mut local_env, loop_name.clone(), lambda);
+                                // Update closure env to include self-reference
+                                let lambda = Value::Lambda {
+                                    params: params.clone(),
+                                    rest_param: None,
+                                    body: Box::new(body),
+                                    env: local_env.clone(),
+                                };
+                                *local_env.get(loop_name).unwrap().borrow_mut() = lambda;
+                                for (p, v) in params.iter().zip(init_vals) {
+                                    env_set(&mut local_env, p.clone(), v);
+                                }
+                                for expr in &items[3..items.len() - 1] {
+                                    eval(expr, &mut local_env, out)?;
+                                }
+                                cur_ast = items.last().unwrap().clone();
+                                tco_env = Some(local_env);
+                                continue;
+                            }
                             let bindings = match &items[1].kind {
                                 AstKind::List(bs) => bs,
                                 _ => return Err(EvalError::TypeError("let: bindings must be a list".into())
