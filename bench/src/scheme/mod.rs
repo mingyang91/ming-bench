@@ -7,8 +7,8 @@ pub mod value;
 pub use error::EvalError;
 use builtins::{apply_builtin, is_builtin};
 use forms::{
-    eval_and, eval_begin_step, eval_body_step, eval_cond_step, eval_define, eval_if_step,
-    eval_lambda, eval_let_step, eval_or, eval_quote, eval_set, eval_string_set,
+    eval_and_step, eval_begin_step, eval_body_step, eval_cond_step, eval_define, eval_if_step,
+    eval_lambda, eval_let_step, eval_or_step, eval_quote, eval_set, eval_string_set,
 };
 use std::cell::RefCell;
 use std::collections::HashMap;
@@ -126,8 +126,8 @@ fn eval_list_step(
             "define" => return eval_define(args, env, span, output).map(Bounce::Done),
             "if" => return eval_if_step(args, env, span, output),
             "quote" => return eval_quote(args, span).map(Bounce::Done),
-            "and" => return eval_and(args, env, output).map(Bounce::Done),
-            "or" => return eval_or(args, env, output).map(Bounce::Done),
+            "and" => return eval_and_step(args, env, output),
+            "or" => return eval_or_step(args, env, output),
             "lambda" => return eval_lambda(args, env, span).map(Bounce::Done),
             "let" => return eval_let_step(args, env, span, output),
             "begin" => return eval_begin_step(args, env, span, output),

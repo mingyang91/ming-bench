@@ -102,6 +102,16 @@ pub(crate) fn eval_let_step(
     span: Span,
     output: &mut String,
 ) -> Result<Bounce, EvalError> {
+    // Named let: (let name ((var init) ...) body ...)
+    if let [Value::Symbol(name, _), Value::List(bindings, _), body @ ..] = args {
+        if body.is_empty() {
+            return Err(EvalError::Parse {
+                message: "named let requires a body".to_string(),
+                span,
+            });
+        }
+        return eval_named_let(name, bindings, body, env, span, output);
+    }
     let [Value::List(bindings, _), body @ ..] = args else {
         return Err(EvalError::Parse {
             message: "let requires a bindings list and body".to_string(),
@@ -130,6 +140,63 @@ pub(crate) fn eval_let_step(
         };
         let val = eval(expr, env, output)?;
         local_env.insert(name.clone(), Rc::new(RefCell::new(val)));
+    }
+    eval_body_step(body, Value::Boolean(false), &mut local_env, output)
+        .map(|b| match b {
+            Bounce::Continue(expr) => Bounce::ReplaceEnv {
+                expr,
+                env: local_env,
+            },
+            other => other,
+        })
+}
+
+fn eval_named_let(
+    name: &str,
+    bindings: &[Value],
+    body: &[Value],
+    env: &mut Env,
+    span: Span,
+    output: &mut String,
+) -> Result<Bounce, EvalError> {
+    let mut params = Vec::new();
+    let mut init_vals = Vec::new();
+    for binding in bindings {
+        let Value::List(pair, _) = binding else {
+            return Err(EvalError::Parse {
+                message: "named let binding must be a list".to_string(),
+                span,
+            });
+        };
+        let [Value::Symbol(param, _), init_expr] = pair.as_slice() else {
+            return Err(EvalError::Parse {
+                message: "named let binding must be (name expr)".to_string(),
+                span,
+            });
+        };
+        params.push(param.clone());
+        init_vals.push(eval(init_expr, env, output)?);
+    }
+    // Create a lambda for the loop and bind it in the local env
+    let lambda = Value::Lambda {
+        params: params.clone(),
+        rest_param: None,
+        body: body.to_vec(),
+        env: env.clone(),
+    };
+    let mut local_env = env.clone();
+    let lambda_cell = Rc::new(RefCell::new(lambda));
+    local_env.insert(name.to_string(), Rc::clone(&lambda_cell));
+    // Update the lambda's captured env to include itself (for recursion)
+    {
+        let mut lam = lambda_cell.borrow_mut();
+        if let Value::Lambda { env: ref mut captured_env, .. } = *lam {
+            captured_env.insert(name.to_string(), Rc::clone(&lambda_cell));
+        }
+    }
+    // Bind initial values
+    for (param, val) in params.iter().zip(&init_vals) {
+        local_env.insert(param.clone(), Rc::new(RefCell::new(val.clone())));
     }
     eval_body_step(body, Value::Boolean(false), &mut local_env, output)
         .map(|b| match b {
@@ -186,34 +253,38 @@ pub(crate) fn eval_cond_step(
     Ok(Bounce::Done(Value::Boolean(false)))
 }
 
-pub(crate) fn eval_and(
+pub(crate) fn eval_and_step(
     args: &[Value],
     env: &mut Env,
     output: &mut String,
-) -> Result<Value, EvalError> {
-    let mut result = Value::Boolean(true);
-    for arg in args {
-        result = eval(arg, env, output)?;
+) -> Result<Bounce, EvalError> {
+    let Some((last, rest)) = args.split_last() else {
+        return Ok(Bounce::Done(Value::Boolean(true)));
+    };
+    for arg in rest {
+        let result = eval(arg, env, output)?;
         if !is_truthy(&result) {
-            return Ok(result);
+            return Ok(Bounce::Done(result));
         }
     }
-    Ok(result)
+    Ok(Bounce::Continue(last.clone()))
 }
 
-pub(crate) fn eval_or(
+pub(crate) fn eval_or_step(
     args: &[Value],
     env: &mut Env,
     output: &mut String,
-) -> Result<Value, EvalError> {
-    let mut result = Value::Boolean(false);
-    for arg in args {
-        result = eval(arg, env, output)?;
+) -> Result<Bounce, EvalError> {
+    let Some((last, rest)) = args.split_last() else {
+        return Ok(Bounce::Done(Value::Boolean(false)));
+    };
+    for arg in rest {
+        let result = eval(arg, env, output)?;
         if is_truthy(&result) {
-            return Ok(result);
+            return Ok(Bounce::Done(result));
         }
     }
-    Ok(result)
+    Ok(Bounce::Continue(last.clone()))
 }
 
 pub(crate) fn eval_body_step(
