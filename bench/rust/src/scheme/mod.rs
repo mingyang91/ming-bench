@@ -111,6 +111,9 @@ enum ExprKind {
 type StringRef = Rc<RefCell<String>>;
 type VectorRef = Rc<RefCell<Vec<Value>>>;
 type ContinuationRef = Rc<MachineContinuation>;
+type CapturedContinuationRef = Rc<CapturedContinuation>;
+type WindRef = Rc<WindFrame>;
+type WindState = Option<WindRef>;
 type BindingRef = Rc<RefCell<Value>>;
 
 #[derive(Debug, Clone)]
@@ -125,7 +128,7 @@ enum Value {
     Vector(VectorRef),
     Builtin(Builtin),
     Procedure(Rc<LambdaProcedure>),
-    Continuation(ContinuationRef),
+    Continuation(CapturedContinuationRef),
     Void,
 }
 
@@ -248,9 +251,11 @@ enum Builtin {
     ListTail,
     ListPred,
     Assoc,
+    Reverse,
     Map,
     Apply,
     CallCc,
+    DynamicWind,
     Length,
     Display,
     Write,
@@ -332,9 +337,11 @@ impl Builtin {
         Self::ListTail,
         Self::ListPred,
         Self::Assoc,
+        Self::Reverse,
         Self::Map,
         Self::Apply,
         Self::CallCc,
+        Self::DynamicWind,
         Self::Length,
         Self::Display,
         Self::Write,
@@ -416,9 +423,11 @@ impl Builtin {
             Self::ListTail => "list-tail",
             Self::ListPred => "list?",
             Self::Assoc => "assoc",
+            Self::Reverse => "reverse",
             Self::Map => "map",
             Self::Apply => "apply",
             Self::CallCc => "call/cc",
+            Self::DynamicWind => "dynamic-wind",
             Self::Length => "length",
             Self::Display => "display",
             Self::Write => "write",
@@ -555,6 +564,20 @@ struct Parameters {
 }
 
 #[derive(Debug)]
+struct CapturedContinuation {
+    machine: ContinuationRef,
+    winds: WindState,
+}
+
+#[derive(Debug)]
+struct WindFrame {
+    before: Value,
+    after: Value,
+    parent: WindState,
+    pos: SourcePos,
+}
+
+#[derive(Debug)]
 enum TailOutcome {
     Value(Value),
     TailCall {
@@ -639,7 +662,34 @@ enum MachineContinuation {
     },
     CallCcReturn {
         resume: ContinuationRef,
-        suspend: Option<ContinuationRef>,
+    },
+    DynamicWindEnter {
+        wind: WindRef,
+        body: Value,
+        pos: SourcePos,
+        next: ContinuationRef,
+    },
+    DynamicWindExit {
+        wind: WindRef,
+        pos: SourcePos,
+        next: ContinuationRef,
+    },
+    DynamicWindComplete {
+        result: Value,
+        next: ContinuationRef,
+    },
+    WindTransferExit {
+        value: Value,
+        target: CapturedContinuationRef,
+        exits: Rc<[WindRef]>,
+        index: usize,
+        enters: Rc<[WindRef]>,
+    },
+    WindTransferEnter {
+        value: Value,
+        target: CapturedContinuationRef,
+        enters: Rc<[WindRef]>,
+        index: usize,
     },
     Sequence {
         exprs: Rc<[Expr]>,
@@ -724,6 +774,7 @@ enum MachineControl {
 fn run_machine(exprs: &[Expr], env: EnvRef, ctx: &mut EvalContext) -> Result<Value, EvalError> {
     let halt = Rc::new(MachineContinuation::Halt);
     let (mut control, mut cont) = schedule_sequence(exprs, env, halt);
+    let mut winds: WindState = None;
 
     loop {
         match control {
@@ -770,13 +821,39 @@ fn run_machine(exprs: &[Expr], env: EnvRef, ctx: &mut EvalContext) -> Result<Val
                     }
 
                     let resume = cont.clone();
-                    let suspend = find_enclosing_procedure_caller(&resume);
                     control = MachineControl::Apply {
                         function: args[0].clone(),
-                        args: vec![Value::Continuation(resume.clone())],
+                        args: vec![Value::Continuation(Rc::new(CapturedContinuation {
+                            machine: resume.clone(),
+                            winds: winds.clone(),
+                        }))],
                         pos,
                     };
-                    cont = Rc::new(MachineContinuation::CallCcReturn { resume, suspend });
+                    cont = Rc::new(MachineContinuation::CallCcReturn { resume });
+                }
+                Value::Builtin(Builtin::DynamicWind) => {
+                    if args.len() != 3 {
+                        return Err(wrong_arg_count("dynamic-wind", "exactly 3", args.len())
+                            .with_position(pos));
+                    }
+
+                    let wind = Rc::new(WindFrame {
+                        before: args[0].clone(),
+                        after: args[2].clone(),
+                        parent: winds.clone(),
+                        pos,
+                    });
+                    control = MachineControl::Apply {
+                        function: args[0].clone(),
+                        args: Vec::new(),
+                        pos,
+                    };
+                    cont = Rc::new(MachineContinuation::DynamicWindEnter {
+                        wind,
+                        body: args[1].clone(),
+                        pos,
+                        next: cont.clone(),
+                    });
                 }
                 Value::Builtin(builtin) => {
                     let value =
@@ -806,8 +883,10 @@ fn run_machine(exprs: &[Expr], env: EnvRef, ctx: &mut EvalContext) -> Result<Val
                             .with_position(pos));
                     }
 
-                    control = MachineControl::Value(args[0].clone());
-                    cont = saved;
+                    let (next_control, next_cont) =
+                        prepare_continuation_jump(args[0].clone(), saved, &mut winds);
+                    control = next_control;
+                    cont = next_cont;
                 }
                 other => {
                     return Err(EvalError::NotAProcedure(other.to_string()).with_position(pos));
@@ -819,13 +898,113 @@ fn run_machine(exprs: &[Expr], env: EnvRef, ctx: &mut EvalContext) -> Result<Val
                     control = MachineControl::Value(value);
                     cont = next.clone();
                 }
-                MachineContinuation::CallCcReturn { resume, suspend } => {
+                MachineContinuation::CallCcReturn { resume } => {
                     control = MachineControl::Value(value.clone());
-                    cont = if matches!(value, Value::Void) {
-                        suspend.clone().unwrap_or_else(|| resume.clone())
-                    } else {
-                        resume.clone()
+                    cont = resume.clone();
+                }
+                MachineContinuation::DynamicWindEnter {
+                    wind,
+                    body,
+                    pos,
+                    next,
+                } => {
+                    activate_wind(&mut winds, wind);
+                    control = MachineControl::Apply {
+                        function: body.clone(),
+                        args: Vec::new(),
+                        pos: *pos,
                     };
+                    cont = Rc::new(MachineContinuation::DynamicWindExit {
+                        wind: wind.clone(),
+                        pos: *pos,
+                        next: next.clone(),
+                    });
+                }
+                MachineContinuation::DynamicWindExit { wind, pos, next } => {
+                    deactivate_wind(&mut winds, wind);
+                    control = MachineControl::Apply {
+                        function: wind.after.clone(),
+                        args: Vec::new(),
+                        pos: *pos,
+                    };
+                    cont = Rc::new(MachineContinuation::DynamicWindComplete {
+                        result: value,
+                        next: next.clone(),
+                    });
+                }
+                MachineContinuation::DynamicWindComplete { result, next } => {
+                    control = MachineControl::Value(result.clone());
+                    cont = next.clone();
+                }
+                MachineContinuation::WindTransferExit {
+                    value: jump_value,
+                    target,
+                    exits,
+                    index,
+                    enters,
+                } => {
+                    if *index < exits.len() {
+                        let wind = exits[*index].clone();
+                        deactivate_wind(&mut winds, &wind);
+                        control = MachineControl::Apply {
+                            function: wind.after.clone(),
+                            args: Vec::new(),
+                            pos: wind.pos,
+                        };
+                        cont = Rc::new(MachineContinuation::WindTransferExit {
+                            value: jump_value.clone(),
+                            target: target.clone(),
+                            exits: exits.clone(),
+                            index: *index + 1,
+                            enters: enters.clone(),
+                        });
+                    } else if enters.is_empty() {
+                        winds = target.winds.clone();
+                        control = MachineControl::Value(jump_value.clone());
+                        cont = target.machine.clone();
+                    } else {
+                        let wind = enters[0].clone();
+                        control = MachineControl::Apply {
+                            function: wind.before.clone(),
+                            args: Vec::new(),
+                            pos: wind.pos,
+                        };
+                        cont = Rc::new(MachineContinuation::WindTransferEnter {
+                            value: jump_value.clone(),
+                            target: target.clone(),
+                            enters: enters.clone(),
+                            index: 0,
+                        });
+                    }
+                }
+                MachineContinuation::WindTransferEnter {
+                    value: jump_value,
+                    target,
+                    enters,
+                    index,
+                } => {
+                    let wind = enters[*index].clone();
+                    activate_wind(&mut winds, &wind);
+                    let next_index = *index + 1;
+
+                    if next_index < enters.len() {
+                        let next_wind = enters[next_index].clone();
+                        control = MachineControl::Apply {
+                            function: next_wind.before.clone(),
+                            args: Vec::new(),
+                            pos: next_wind.pos,
+                        };
+                        cont = Rc::new(MachineContinuation::WindTransferEnter {
+                            value: jump_value.clone(),
+                            target: target.clone(),
+                            enters: enters.clone(),
+                            index: next_index,
+                        });
+                    } else {
+                        winds = target.winds.clone();
+                        control = MachineControl::Value(jump_value.clone());
+                        cont = target.machine.clone();
+                    }
                 }
                 MachineContinuation::Sequence {
                     exprs,
@@ -1092,22 +1271,89 @@ fn schedule_sequence(
     (MachineControl::Expr(first.clone(), env), cont)
 }
 
-fn find_enclosing_procedure_caller(cont: &ContinuationRef) -> Option<ContinuationRef> {
-    match cont.as_ref() {
-        MachineContinuation::Halt => None,
-        MachineContinuation::ProcedureReturn { next } => Some(next.clone()),
-        MachineContinuation::CallCcReturn { resume, .. } => find_enclosing_procedure_caller(resume),
-        MachineContinuation::Sequence { next, .. }
-        | MachineContinuation::If { next, .. }
-        | MachineContinuation::And { next, .. }
-        | MachineContinuation::Or { next, .. }
-        | MachineContinuation::CallHead { next, .. }
-        | MachineContinuation::CallArg { next, .. }
-        | MachineContinuation::DefineValue { next, .. }
-        | MachineContinuation::SetValue { next, .. }
-        | MachineContinuation::LetBinding { next, .. }
-        | MachineContinuation::Cond { next, .. } => find_enclosing_procedure_caller(next),
+fn prepare_continuation_jump(
+    value: Value,
+    target: CapturedContinuationRef,
+    winds: &mut WindState,
+) -> (MachineControl, ContinuationRef) {
+    let (exits, enters) = split_wind_transfer(winds, &target.winds);
+
+    if let Some(wind) = exits.first().cloned() {
+        deactivate_wind(winds, &wind);
+        return (
+            MachineControl::Apply {
+                function: wind.after.clone(),
+                args: Vec::new(),
+                pos: wind.pos,
+            },
+            Rc::new(MachineContinuation::WindTransferExit {
+                value,
+                target,
+                exits: Rc::from(exits),
+                index: 1,
+                enters: Rc::from(enters),
+            }),
+        );
     }
+
+    if let Some(wind) = enters.first().cloned() {
+        return (
+            MachineControl::Apply {
+                function: wind.before.clone(),
+                args: Vec::new(),
+                pos: wind.pos,
+            },
+            Rc::new(MachineContinuation::WindTransferEnter {
+                value,
+                target,
+                enters: Rc::from(enters),
+                index: 0,
+            }),
+        );
+    }
+
+    *winds = target.winds.clone();
+    (MachineControl::Value(value), target.machine.clone())
+}
+
+fn split_wind_transfer(current: &WindState, target: &WindState) -> (Vec<WindRef>, Vec<WindRef>) {
+    let current_path = collect_wind_path(current);
+    let target_path = collect_wind_path(target);
+
+    let shared = current_path
+        .iter()
+        .zip(target_path.iter())
+        .take_while(|(left, right)| Rc::ptr_eq(left, right))
+        .count();
+
+    let exits = current_path[shared..]
+        .iter()
+        .rev()
+        .cloned()
+        .collect::<Vec<_>>();
+    let enters = target_path[shared..].to_vec();
+    (exits, enters)
+}
+
+fn collect_wind_path(state: &WindState) -> Vec<WindRef> {
+    let mut path = Vec::new();
+    let mut cursor = state.clone();
+
+    while let Some(wind) = cursor {
+        path.push(wind.clone());
+        cursor = wind.parent.clone();
+    }
+
+    path.reverse();
+    path
+}
+
+fn activate_wind(winds: &mut WindState, wind: &WindRef) {
+    *winds = Some(wind.clone());
+}
+
+fn deactivate_wind(winds: &mut WindState, wind: &WindRef) {
+    *winds = wind.parent.clone();
 }
 
 fn schedule_list_eval(
@@ -3427,9 +3673,19 @@ fn apply_builtin(
         }
         Builtin::ListPred => unary_predicate(name, args, |value| matches!(value, Value::List(_))),
         Builtin::Assoc => assoc_builtin(name, args),
+        Builtin::Reverse => {
+            if args.len() != 1 {
+                return Err(wrong_arg_count(name, "exactly 1", args.len()));
+            }
+
+            let mut items = expect_list_value(name, &args[0])?.to_vec();
+            items.reverse();
+            Ok(Value::List(items))
+        }
         Builtin::Map => unreachable!("map is handled by dispatch_builtin_call"),
         Builtin::Apply => unreachable!("apply is handled by dispatch_builtin_call"),
         Builtin::CallCc => unreachable!("call/cc is handled by the machine runtime"),
+        Builtin::DynamicWind => unreachable!("dynamic-wind is handled by the machine runtime"),
         Builtin::Length => {
             if args.len() != 1 {
                 return Err(wrong_arg_count(name, "exactly 1", args.len()));
