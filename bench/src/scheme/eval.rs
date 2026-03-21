@@ -3,7 +3,7 @@ use std::rc::Rc;
 
 use crate::scheme::env::Env;
 use crate::scheme::error::{EvalError, Span};
-use crate::scheme::value::{ContinuationData, Value};
+use crate::scheme::value::{BodyContinuation, ContinuationData, Value};
 
 /// Check if a name is a builtin procedure.
 fn is_builtin(name: &str) -> bool {
@@ -57,6 +57,8 @@ pub struct EvalContext {
     pub current_expr_idx: Cell<usize>,
     next_id: Cell<u64>,
     pub gensym_counter: Cell<u64>,
+    /// Current body continuation context — set by eval_body_tco for init expressions.
+    body_continuation: RefCell<Option<BodyContinuation>>,
 }
 
 pub struct ContReturnData {
@@ -74,6 +76,7 @@ impl EvalContext {
             current_expr_idx: Cell::new(0),
             next_id: Cell::new(0),
             gensym_counter: Cell::new(0),
+            body_continuation: RefCell::new(None),
         }
     }
 
@@ -207,26 +210,48 @@ fn apply_tco(
             body,
             env,
         } => apply_lambda(params, rest_param.as_deref(), body, env, args, span, ctx),
-        Value::Continuation(data) => {
-            let [value] = args else {
-                return Err(EvalError::WrongArgCount {
-                    expected: 1,
-                    got: args.len(),
-                    span,
-                });
-            };
-            *ctx.cont_return_data.borrow_mut() = Some(ContReturnData {
-                cont_id: data.id,
-                expr_idx: data.expr_idx,
-                value: value.clone(),
-            });
-            Err(EvalError::ContinuationReturn)
-        }
+        Value::Continuation(data) => apply_continuation(data, args, span, ctx),
         other => Err(EvalError::TypeError {
             message: format!("not a procedure: {other}"),
             span,
         }),
     }
+}
+
+/// Apply a continuation value to arguments.
+fn apply_continuation(
+    data: &Rc<ContinuationData>,
+    args: &[Value],
+    span: Span,
+    ctx: &EvalContext,
+) -> Result<Bounce, EvalError> {
+    let [value] = args else {
+        return Err(EvalError::WrongArgCount {
+            expected: 1,
+            got: args.len(),
+            span,
+        });
+    };
+    let Some(body_cont) = &data.body_continuation else {
+        *ctx.cont_return_data.borrow_mut() = Some(ContReturnData {
+            cont_id: data.id,
+            expr_idx: data.expr_idx,
+            value: value.clone(),
+        });
+        return Err(EvalError::ContinuationReturn);
+    };
+    let body = &body_cont.remaining;
+    let env = &body_cont.env;
+    let [init @ .., last_expr] = body.as_slice() else {
+        return Ok(Bounce::Done(value.clone()));
+    };
+    for expr in init {
+        eval(expr, env, span, ctx)?;
+    }
+    Ok(Bounce::TailCall {
+        expr: last_expr.clone(),
+        env: Rc::clone(env),
+    })
 }
 
 /// Evaluate call/cc: capture continuation, call proc with it.
@@ -241,9 +266,11 @@ fn eval_callcc(
     }
 
     let id = ctx.next_cont_id();
+    let body_cont = ctx.body_continuation.borrow().clone();
     let cont = Value::Continuation(Rc::new(ContinuationData {
         id,
         expr_idx: ctx.current_expr_idx.get(),
+        body_continuation: body_cont,
     }));
 
     match apply(proc, &[cont], span, ctx) {
@@ -331,9 +358,23 @@ fn eval_body_tco(
     let [init @ .., last] = body else {
         return Ok(Bounce::Done(Value::Void));
     };
-    for expr in init {
-        eval(expr, env, span, ctx)?;
+    for (i, expr) in init.iter().enumerate() {
+        let remaining: Vec<Value> = init[i + 1..]
+            .iter()
+            .chain(std::iter::once(last))
+            .cloned()
+            .collect();
+        let prev = ctx.body_continuation.borrow_mut().replace(BodyContinuation {
+            remaining,
+            env: Rc::clone(env),
+        });
+        let result = eval(expr, env, span, ctx);
+        *ctx.body_continuation.borrow_mut() = prev;
+        result?;
     }
+    // Clear body_continuation for the tail expression — it's in tail position,
+    // so no remaining body to capture.
+    let _prev = ctx.body_continuation.borrow_mut().take();
     Ok(Bounce::TailCall {
         expr: last.clone(),
         env: Rc::clone(env),

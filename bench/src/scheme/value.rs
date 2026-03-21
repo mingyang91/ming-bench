@@ -4,11 +4,19 @@ use std::rc::Rc;
 
 use crate::scheme::env::Env;
 
+/// Captured remaining body for a continuation in a body-init position.
+#[derive(Debug, Clone)]
+pub struct BodyContinuation {
+    pub remaining: Vec<Value>,
+    pub env: Rc<RefCell<Env>>,
+}
+
 /// Data for a captured continuation.
 #[derive(Debug, Clone)]
 pub struct ContinuationData {
     pub id: u64,
     pub expr_idx: usize,
+    pub body_continuation: Option<BodyContinuation>,
 }
 
 /// A Scheme value.

@@ -243,21 +243,15 @@ fn expand_template(
                 return Value::Symbol(name.clone());
             }
 
-            // Free variable — check definition env for hygiene
-            if let Some(val) = def_env.borrow().get(name) {
+            // Free variable — check definition env for hygiene.
+            // Skip Macro values: they must be resolved by symbol name at eval time
+            // because eval_list_tco dispatches macros via symbol-based env lookup.
+            if let Some(val) = def_env.borrow().get(name).filter(|v| !matches!(v, Value::Macro { .. })) {
                 return val;
             }
 
-            // Introduced identifier — use consistent gensym per expansion
-            let gensym = gensym_map
-                .entry(name.clone())
-                .or_insert_with(|| {
-                    let id = counter.get();
-                    counter.set(id + 1);
-                    format!("__{name}_{id}")
-                })
-                .clone();
-            Value::Symbol(gensym)
+            // Introduced identifier — leave as-is for runtime resolution
+            Value::Symbol(name.clone())
         }
         Value::List(elems) => expand_template_list(elems, bindings, macro_name, def_env, counter, gensym_map),
         other => other.clone(),
