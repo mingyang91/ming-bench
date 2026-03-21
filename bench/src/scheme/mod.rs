@@ -1,6 +1,7 @@
 mod builtins;
 pub mod error;
 mod eval;
+mod macros;
 mod parser;
 
 pub use error::EvalError;
@@ -37,6 +38,11 @@ pub(crate) enum Value {
     Continuation {
         id: u64,
     },
+    Macro {
+        rules: Vec<(Vec<Expr>, Expr)>,
+        literals: Vec<String>,
+        def_env: Env,
+    },
 }
 
 impl PartialEq for Value {
@@ -51,6 +57,7 @@ impl PartialEq for Value {
             (Value::Pair(a1, a2), Value::Pair(b1, b2)) => a1 == b1 && a2 == b2,
             (Value::Nil, Value::Nil) => true,
             (Value::Continuation { id: a }, Value::Continuation { id: b }) => a == b,
+            (Value::Macro { .. }, Value::Macro { .. }) => false,
             _ => false,
         }
     }
@@ -68,7 +75,9 @@ impl std::fmt::Display for Value {
             Value::Nil => write!(f, "()"),
             Value::List(items) => write!(f, "({})", fmt_list(items)),
             Value::Pair(car, cdr) => write!(f, "({car} . {cdr})"),
-            Value::Lambda { .. } | Value::Continuation { .. } => write!(f, "#<procedure>"),
+            Value::Lambda { .. } | Value::Continuation { .. } | Value::Macro { .. } => {
+                write!(f, "#<procedure>")
+            }
         }
     }
 }

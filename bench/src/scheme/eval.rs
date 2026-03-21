@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 
 use super::{
-    atom_to_value, builtins, env_define, env_get, env_set, quote_expr, DisplayValue, Env,
+    atom_to_value, builtins, env_define, env_get, env_set, macros, quote_expr, DisplayValue, Env,
     EvalError, Expr, Span, Value,
 };
 
@@ -27,6 +27,8 @@ pub(crate) struct EvalCtx {
     pub cont_registry: HashMap<u64, ContinuationInfo>,
     /// Value of next_cont_id at the start of the current top-level expression.
     pub cont_id_at_expr_start: u64,
+    /// Counter for generating unique hygienic macro variable names.
+    pub gensym_counter: u64,
 }
 
 impl EvalCtx {
@@ -40,6 +42,7 @@ impl EvalCtx {
             all_exprs: false,
             cont_registry: HashMap::new(),
             cont_id_at_expr_start: 0,
+            gensym_counter: 0,
         }
     }
 }
@@ -340,7 +343,24 @@ fn eval_list_step(
             "call/cc" | "call-with-current-continuation" => {
                 return eval_callcc(args, env, ctx);
             }
+            "define-syntax" => {
+                return eval_define_syntax(args, env).map(Trampoline::Done);
+            }
             _ => {}
+        }
+    }
+    // Check for macro invocation (before evaluating args)
+    if let Expr::Atom(op, _) = operator {
+        if let Some(Value::Macro {
+            rules,
+            literals,
+            def_env,
+        }) = env_get(env, op)
+        {
+            let (expanded, injections) =
+                macros::expand(&rules, &literals, args, &def_env, &mut ctx.gensym_counter)?;
+            env.extend(injections);
+            return eval_step(&expanded, env, ctx);
         }
     }
     // Higher-order builtins that need function application
@@ -935,6 +955,62 @@ fn eval_string_set(_args: &[Expr]) -> Result<Value, EvalError> {
     Err(EvalError::Immutable {
         message: "strings are immutable".to_string(),
     })
+}
+
+/// Evaluate `(define-syntax name (syntax-rules (literals...) (pattern template) ...))`.
+fn eval_define_syntax(args: &[Expr], env: &mut Env) -> Result<Value, EvalError> {
+    let [Expr::Atom(name, _), sr_expr] = args else {
+        return Err(EvalError::Parse {
+            message: "define-syntax requires a name and syntax-rules".to_string(),
+        });
+    };
+    let Expr::List(sr_items, _) = sr_expr else {
+        return Err(EvalError::Parse {
+            message: "expected syntax-rules expression".to_string(),
+        });
+    };
+    let [Expr::Atom(kw, _), Expr::List(lit_exprs, _), rules @ ..] = sr_items.as_slice() else {
+        return Err(EvalError::Parse {
+            message: "malformed syntax-rules".to_string(),
+        });
+    };
+    if kw != "syntax-rules" {
+        return Err(EvalError::Parse {
+            message: format!("expected syntax-rules, got {kw}"),
+        });
+    }
+    let literals: Vec<String> = lit_exprs
+        .iter()
+        .map(|e| match e {
+            Expr::Atom(n, _) => Ok(n.clone()),
+            _ => Err(EvalError::Parse {
+                message: "literal must be an identifier".to_string(),
+            }),
+        })
+        .collect::<Result<_, _>>()?;
+    let parsed_rules: Vec<(Vec<Expr>, Expr)> = rules
+        .iter()
+        .map(|rule| {
+            let Expr::List(parts, _) = rule else {
+                return Err(EvalError::Parse {
+                    message: "syntax rule must be a list".to_string(),
+                });
+            };
+            let [Expr::List(pattern, _), template] = parts.as_slice() else {
+                return Err(EvalError::Parse {
+                    message: "syntax rule must be (pattern template)".to_string(),
+                });
+            };
+            Ok((pattern.clone(), template.clone()))
+        })
+        .collect::<Result<_, _>>()?;
+    let macro_val = Value::Macro {
+        rules: parsed_rules,
+        literals,
+        def_env: env.clone(),
+    };
+    env_define(env, name.clone(), macro_val);
+    Ok(Value::Nil)
 }
 
 /// Evaluate `(newline)` — prints a newline character.
