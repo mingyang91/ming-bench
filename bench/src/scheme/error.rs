@@ -28,4 +28,6 @@ pub enum EvalError {
     TypeError(String, Span),
     #[error("division by zero at {0}")]
     DivisionByZero(Span),
+    #[error("continuation invoked")]
+    ContinuationReturn,
 }

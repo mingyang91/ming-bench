@@ -3,12 +3,30 @@ pub mod error;
 pub use error::EvalError;
 use error::Span;
 
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
 use std::rc::Rc;
 
+struct ContinuationData {
+    id: u64,
+    value: Value,
+    remaining_forms: Vec<Value>,
+}
+
 thread_local! {
     static OUTPUT: RefCell<String> = RefCell::new(String::new());
+    static REMAINING_FORMS: RefCell<Vec<Value>> = RefCell::new(Vec::new());
+    static CONT_DATA: RefCell<Option<ContinuationData>> = RefCell::new(None);
+    static REPLAY_VALUE: RefCell<Option<Value>> = RefCell::new(None);
+    static CONT_ID_COUNTER: Cell<u64> = Cell::new(0);
+}
+
+fn next_cont_id() -> u64 {
+    CONT_ID_COUNTER.with(|c| {
+        let id = c.get();
+        c.set(id + 1);
+        id
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -31,6 +49,11 @@ enum Value {
         span: Span,
     },
     Builtin(String, Span),
+    Continuation {
+        id: u64,
+        remaining_forms: Vec<Value>,
+        span: Span,
+    },
     Void,
 }
 
@@ -44,7 +67,7 @@ impl Value {
             | Value::Char(_, s)
             | Value::List(_, s)
             | Value::Builtin(_, s) => *s,
-            Value::Lambda { span, .. } => *span,
+            Value::Lambda { span, .. } | Value::Continuation { span, .. } => *span,
             Value::Void => Span::default(),
         }
     }
@@ -61,7 +84,7 @@ impl Value {
                 let inner: Vec<String> = elems.iter().map(|v| v.display_scheme()).collect();
                 format!("({})", inner.join(" "))
             }
-            Value::Lambda { .. } | Value::Builtin(..) => "#<procedure>".to_string(),
+            Value::Lambda { .. } | Value::Builtin(..) | Value::Continuation { .. } => "#<procedure>".to_string(),
             Value::Void => "".to_string(),
         }
     }
@@ -139,6 +162,7 @@ fn default_env() -> Env {
         "substring", "string->number", "number->string", "symbol->string",
         "string->symbol", "string-ref", "string-copy", "string->list",
         "list->string", "char->integer", "integer->char", "map", "apply",
+        "call/cc", "call-with-current-continuation",
     ];
     for name in &builtins {
         env_set(&env, name.to_string(), Value::Builtin(name.to_string(), sp));
@@ -397,7 +421,7 @@ fn eval(expr: &Value, env: &Env) -> Result<Value, EvalError> {
                     .ok_or_else(|| EvalError::UnboundVariable(name.clone(), *span));
             }
             Value::Void => return Ok(Value::Void),
-            Value::Lambda { .. } | Value::Builtin(..) => return Ok(current_expr),
+            Value::Lambda { .. } | Value::Builtin(..) | Value::Continuation { .. } => return Ok(current_expr),
             Value::List(elems, span) => {
                 let form_span = *span;
                 if elems.is_empty() {
@@ -672,6 +696,18 @@ fn eval(expr: &Value, env: &Env) -> Result<Value, EvalError> {
                     .map(|a| eval(a, &current_env))
                     .collect::<Result<_, _>>()?;
                 match func {
+                    Value::Builtin(ref name, _) if name == "call/cc" || name == "call-with-current-continuation" => {
+                        if args.len() != 1 {
+                            return Err(EvalError::WrongArgCount { expected: "1".into(), got: args.len(), at: form_span });
+                        }
+                        return eval_callcc(&args[0], form_span);
+                    }
+                    Value::Continuation { id, ref remaining_forms, .. } => {
+                        if args.len() != 1 {
+                            return Err(EvalError::WrongArgCount { expected: "1".into(), got: args.len(), at: form_span });
+                        }
+                        return invoke_continuation(id, remaining_forms, args[0].clone());
+                    }
                     Value::Lambda {
                         ref params,
                         ref rest_param,
@@ -727,6 +763,46 @@ fn eval(expr: &Value, env: &Env) -> Result<Value, EvalError> {
     }
 }
 
+fn eval_callcc(proc: &Value, form_span: Span) -> Result<Value, EvalError> {
+    let replay = REPLAY_VALUE.with(|rv| rv.borrow_mut().take());
+    if let Some(val) = replay {
+        return Ok(val);
+    }
+    let id = next_cont_id();
+    let remaining = REMAINING_FORMS.with(|rf| rf.borrow().clone());
+    let cont = Value::Continuation {
+        id,
+        remaining_forms: remaining,
+        span: form_span,
+    };
+    match apply_function(proc, &[cont], form_span) {
+        Ok(val) => Ok(val),
+        Err(EvalError::ContinuationReturn) => {
+            let matches = CONT_DATA.with(|cd| {
+                cd.borrow().as_ref().map(|d| d.id) == Some(id)
+            });
+            if matches {
+                let data = CONT_DATA.with(|cd| cd.borrow_mut().take()).unwrap();
+                Ok(data.value)
+            } else {
+                Err(EvalError::ContinuationReturn)
+            }
+        }
+        Err(e) => Err(e),
+    }
+}
+
+fn invoke_continuation(id: u64, remaining_forms: &[Value], value: Value) -> Result<Value, EvalError> {
+    CONT_DATA.with(|cd| {
+        *cd.borrow_mut() = Some(ContinuationData {
+            id,
+            value,
+            remaining_forms: remaining_forms.to_vec(),
+        })
+    });
+    Err(EvalError::ContinuationReturn)
+}
+
 fn apply_function(func: &Value, args: &[Value], call_span: Span) -> Result<Value, EvalError> {
     match func {
         Value::Lambda {
@@ -760,6 +836,18 @@ fn apply_function(func: &Value, args: &[Value], call_span: Span) -> Result<Value
                 result = eval(expr, &local_env)?;
             }
             Ok(result)
+        }
+        Value::Builtin(ref name, _) if name == "call/cc" || name == "call-with-current-continuation" => {
+            if args.len() != 1 {
+                return Err(EvalError::WrongArgCount { expected: "1".into(), got: args.len(), at: call_span });
+            }
+            eval_callcc(&args[0], call_span)
+        }
+        Value::Continuation { id, ref remaining_forms, .. } => {
+            if args.len() != 1 {
+                return Err(EvalError::WrongArgCount { expected: "1".into(), got: args.len(), at: call_span });
+            }
+            invoke_continuation(*id, remaining_forms, args[0].clone())
         }
         Value::Builtin(name, _) => eval_builtin_with_values(name, args, call_span),
         _ => Err(EvalError::NotAProcedure(
@@ -1586,27 +1674,60 @@ fn expect_integer(v: &Value) -> Result<i64, EvalError> {
 /// Evaluate one or more Scheme expressions and return the string
 /// representation of the last result.
 pub fn eval_str(input: &str) -> Result<String, EvalError> {
+    // Clear continuation state
+    CONT_DATA.with(|cd| *cd.borrow_mut() = None);
+    REPLAY_VALUE.with(|rv| *rv.borrow_mut() = None);
+    REMAINING_FORMS.with(|rf| rf.borrow_mut().clear());
+    CONT_ID_COUNTER.with(|c| c.set(0));
+
     let exprs = parse_all(input)?;
     let env = default_env();
-    let mut last = Value::Void;
-    for expr in &exprs {
-        last = eval(expr, &env)?;
-    }
-    Ok(last.display_scheme())
+    let result = eval_top_level(&exprs, &env)?;
+    Ok(result.display_scheme())
 }
 
 /// Evaluate Scheme expressions, returning both the result value and
 /// any output produced by `display`, `write`, or `newline`.
 pub fn eval_str_with_output(input: &str) -> Result<(String, String), EvalError> {
     OUTPUT.with(|o| o.borrow_mut().clear());
+    // Clear continuation state
+    CONT_DATA.with(|cd| *cd.borrow_mut() = None);
+    REPLAY_VALUE.with(|rv| *rv.borrow_mut() = None);
+    REMAINING_FORMS.with(|rf| rf.borrow_mut().clear());
+    CONT_ID_COUNTER.with(|c| c.set(0));
+
     let exprs = parse_all(input)?;
     let env = default_env();
-    let mut last = Value::Void;
-    for expr in &exprs {
-        last = eval(expr, &env)?;
-    }
+    let result = eval_top_level(&exprs, &env)?;
     let output = OUTPUT.with(|o| o.borrow().clone());
-    Ok((last.display_scheme(), output))
+    Ok((result.display_scheme(), output))
+}
+
+fn eval_top_level(exprs: &[Value], env: &Env) -> Result<Value, EvalError> {
+    let mut forms = exprs.to_vec();
+    let mut i = 0;
+    let mut last = Value::Void;
+    loop {
+        if i >= forms.len() {
+            return Ok(last);
+        }
+        REMAINING_FORMS.with(|rf| *rf.borrow_mut() = forms[i..].to_vec());
+        match eval(&forms[i], env) {
+            Ok(val) => {
+                last = val;
+                i += 1;
+            }
+            Err(EvalError::ContinuationReturn) => {
+                let data = CONT_DATA.with(|cd| cd.borrow_mut().take())
+                    .expect("ContinuationReturn without data");
+                REPLAY_VALUE.with(|rv| *rv.borrow_mut() = Some(data.value));
+                CONT_ID_COUNTER.with(|c| c.set(0));
+                forms = data.remaining_forms;
+                i = 0;
+            }
+            Err(e) => return Err(e),
+        }
+    }
 }
 
 #[cfg(test)]
