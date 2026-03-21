@@ -123,9 +123,13 @@ type WindState = Option<WindRef>;
 type HandlerRef = Rc<HandlerFrame>;
 type HandlerState = Option<HandlerRef>;
 type BindingRef = Rc<RefCell<Value>>;
+type ParameterCellRef = Rc<RefCell<ParameterCell>>;
 type NativeProcedureRef = Rc<NativeProcedure>;
 type RecordTypeRef = Rc<RecordType>;
 type RecordRef = Rc<RecordValue>;
+
+const PARAMETER_SET_BUILTIN_NAME: &str = "__ming:parameter-set!";
+const PARAMETER_RESTORE_BUILTIN_NAME: &str = "__ming:parameter-restore!";
 
 #[derive(Debug)]
 struct PairCell {
@@ -143,6 +147,12 @@ struct RecordType {
 struct RecordValue {
     record_type: RecordTypeRef,
     fields: Vec<Value>,
+}
+
+#[derive(Debug)]
+struct ParameterCell {
+    current: Value,
+    converter: Option<Value>,
 }
 
 #[derive(Debug)]
@@ -168,6 +178,9 @@ enum NativeProcedureKind {
     RecordAccessor {
         record_type: RecordTypeRef,
         field_index: usize,
+    },
+    Parameter {
+        cell: ParameterCellRef,
     },
     ComposedAccessor {
         ops: Vec<AccessorOp>,
@@ -340,6 +353,9 @@ enum Builtin {
     Values,
     CallWithValues,
     DynamicWind,
+    MakeParameter,
+    ParameterSet,
+    ParameterRestore,
     Raise,
     WithExceptionHandler,
     Length,
@@ -443,6 +459,9 @@ impl Builtin {
         Self::Values,
         Self::CallWithValues,
         Self::DynamicWind,
+        Self::MakeParameter,
+        Self::ParameterSet,
+        Self::ParameterRestore,
         Self::Raise,
         Self::WithExceptionHandler,
         Self::Length,
@@ -546,6 +565,9 @@ impl Builtin {
             Self::Values => "values",
             Self::CallWithValues => "call-with-values",
             Self::DynamicWind => "dynamic-wind",
+            Self::MakeParameter => "make-parameter",
+            Self::ParameterSet => PARAMETER_SET_BUILTIN_NAME,
+            Self::ParameterRestore => PARAMETER_RESTORE_BUILTIN_NAME,
             Self::Raise => "raise",
             Self::WithExceptionHandler => "with-exception-handler",
             Self::Length => "length",
@@ -926,6 +948,10 @@ enum MachineContinuation {
         result: Value,
         next: ContinuationRef,
     },
+    ParameterSet {
+        cell: ParameterCellRef,
+        next: ContinuationRef,
+    },
     WindTransferExit {
         value: Value,
         target: CapturedContinuationRef,
@@ -1124,6 +1150,37 @@ fn run_machine(exprs: &[Expr], env: EnvRef, ctx: &mut EvalContext) -> Result<Val
                         next: cont.clone(),
                     });
                 }
+                Value::Builtin(Builtin::ParameterSet) => {
+                    if args.len() != 2 {
+                        return Err(wrong_arg_count(
+                            PARAMETER_SET_BUILTIN_NAME,
+                            "exactly 2",
+                            args.len(),
+                        )
+                        .with_position(pos));
+                    }
+
+                    let cell = expect_parameter_cell(PARAMETER_SET_BUILTIN_NAME, &args[0])
+                        .map_err(|err| err.with_position(pos))?;
+                    let (next_control, next_cont) =
+                        schedule_parameter_set(cell, args[1].clone(), pos, cont.clone());
+                    control = next_control;
+                    cont = next_cont;
+                }
+                Value::Builtin(Builtin::ParameterRestore) => {
+                    if args.len() != 2 {
+                        return Err(wrong_arg_count(
+                            PARAMETER_RESTORE_BUILTIN_NAME,
+                            "exactly 2",
+                            args.len(),
+                        )
+                        .with_position(pos));
+                    }
+
+                    let cell = expect_parameter_cell(PARAMETER_RESTORE_BUILTIN_NAME, &args[0])
+                        .map_err(|err| err.with_position(pos))?;
+                    control = MachineControl::Value(store_parameter_value(&cell, args[1].clone()));
+                }
                 Value::Builtin(Builtin::Raise) => {
                     if args.len() != 1 {
                         return Err(
@@ -1172,9 +1229,32 @@ fn run_machine(exprs: &[Expr], env: EnvRef, ctx: &mut EvalContext) -> Result<Val
                     control = MachineControl::Value(value);
                 }
                 Value::NativeProcedure(procedure) => {
-                    let value = apply_native_procedure(&procedure, &args)
-                        .map_err(|err| err.with_position(pos))?;
-                    control = MachineControl::Value(value);
+                    match &procedure.kind {
+                        NativeProcedureKind::Parameter { cell } => {
+                            if args.len() > 1 {
+                                return Err(wrong_arg_count(&procedure.name, "0 or 1", args.len())
+                                    .with_position(pos));
+                            }
+
+                            if let Some(value) = args.first() {
+                                let (next_control, next_cont) = schedule_parameter_set(
+                                    cell.clone(),
+                                    value.clone(),
+                                    pos,
+                                    cont.clone(),
+                                );
+                                control = next_control;
+                                cont = next_cont;
+                            } else {
+                                control = MachineControl::Value(parameter_current_value(cell));
+                            }
+                        }
+                        _ => {
+                            let value = apply_native_procedure(&procedure, &args)
+                                .map_err(|err| err.with_position(pos))?;
+                            control = MachineControl::Value(value);
+                        }
+                    }
                 }
                 Value::Procedure(procedure) => {
                     let call =
@@ -1309,6 +1389,11 @@ fn run_machine(exprs: &[Expr], env: EnvRef, ctx: &mut EvalContext) -> Result<Val
                 }
                 MachineContinuation::DynamicWindComplete { result, next } => {
                     control = MachineControl::Value(result.clone());
+                    cont = next.clone();
+                }
+                MachineContinuation::ParameterSet { cell, next } => {
+                    let value = expect_single_value(value)?;
+                    control = MachineControl::Value(store_parameter_value(cell, value));
                     cont = next.clone();
                 }
                 MachineContinuation::WindTransferExit {
@@ -1665,6 +1750,27 @@ fn split_values(value: Value) -> Vec<Value> {
     }
 }
 
+fn schedule_parameter_set(
+    cell: ParameterCellRef,
+    value: Value,
+    pos: SourcePos,
+    next: ContinuationRef,
+) -> (MachineControl, ContinuationRef) {
+    let converter = cell.borrow().converter.clone();
+
+    match converter {
+        Some(converter) => (
+            MachineControl::Apply {
+                function: converter,
+                args: vec![value],
+                pos,
+            },
+            Rc::new(MachineContinuation::ParameterSet { cell, next }),
+        ),
+        None => (MachineControl::Value(store_parameter_value(&cell, value)), next),
+    }
+}
+
 fn schedule_sequence(
     exprs: &[Expr],
     env: EnvRef,
@@ -1800,6 +1906,10 @@ fn schedule_list_eval(
         }
         ExprKind::Symbol(name) if name == "let-values" => Ok((
             MachineControl::Expr(expand_let_values_form(args, pos, ctx)?, env),
+            next,
+        )),
+        ExprKind::Symbol(name) if name == "parameterize" => Ok((
+            MachineControl::Expr(expand_parameterize_form(args, pos, ctx)?, env),
             next,
         )),
         ExprKind::Symbol(name) if name == "receive" => Ok((
@@ -2257,6 +2367,9 @@ fn eval_list(
         ExprKind::Symbol(name) if name == "let-values" => {
             eval_expr(&expand_let_values_form(args, pos, ctx)?, env, ctx)
         }
+        ExprKind::Symbol(name) if name == "parameterize" => {
+            eval_expr(&expand_parameterize_form(args, pos, ctx)?, env, ctx)
+        }
         ExprKind::Symbol(name) if name == "receive" => {
             eval_expr(&expand_receive_form(args, pos)?, env, ctx)
         }
@@ -2334,6 +2447,9 @@ fn eval_tail_list(
         ExprKind::Symbol(name) if name == "if" => eval_tail_if(args, env, ctx),
         ExprKind::Symbol(name) if name == "let-values" => {
             eval_tail_expr(&expand_let_values_form(args, pos, ctx)?, env, ctx)
+        }
+        ExprKind::Symbol(name) if name == "parameterize" => {
+            eval_tail_expr(&expand_parameterize_form(args, pos, ctx)?, env, ctx)
         }
         ExprKind::Symbol(name) if name == "receive" => {
             eval_tail_expr(&expand_receive_form(args, pos)?, env, ctx)
@@ -4316,6 +4432,7 @@ fn is_syntax_keyword(name: &str) -> bool {
             | "guard"
             | "if"
             | "let-values"
+            | "parameterize"
             | "receive"
             | "let"
             | "do"
@@ -4505,6 +4622,99 @@ fn build_lambda_expr(params: Expr, body: Vec<Expr>, pos: SourcePos) -> Expr {
     items.push(params);
     items.extend(body);
     list_expr(items, pos)
+}
+
+fn parse_parameterize_bindings(expr: &Expr) -> Result<Vec<(Expr, Expr)>, EvalError> {
+    let ExprKind::List(bindings) = &expr.kind else {
+        return Err(EvalError::Syntax("parameterize bindings must be a list".into()));
+    };
+
+    bindings
+        .iter()
+        .map(|binding| {
+            let ExprKind::List(parts) = &binding.kind else {
+                return Err(EvalError::Syntax(
+                    "parameterize binding must be a (parameter expr) pair".into(),
+                ));
+            };
+
+            match parts.as_slice() {
+                [parameter, value] => Ok((parameter.clone(), value.clone())),
+                _ => Err(EvalError::Syntax(
+                    "parameterize binding must be a (parameter expr) pair".into(),
+                )),
+            }
+        })
+        .collect()
+}
+
+fn expand_parameterize_form(
+    args: &[Expr],
+    pos: SourcePos,
+    ctx: &mut EvalContext,
+) -> Result<Expr, EvalError> {
+    let (bindings_expr, body) = parse_binding_body_form("parameterize", args)?;
+    let bindings = parse_parameterize_bindings(bindings_expr)?;
+
+    if bindings.is_empty() {
+        return Ok(build_begin_expr(body.to_vec(), pos));
+    }
+
+    let mut let_bindings = Vec::with_capacity(bindings.len() * 2);
+    let mut old_bindings = Vec::with_capacity(bindings.len());
+    let mut before_body = Vec::with_capacity(bindings.len());
+    let mut after_body = Vec::with_capacity(bindings.len());
+
+    for (parameter, value) in bindings {
+        let parameter_name = ctx.fresh_generated_name("parameterize_param");
+        let value_name = ctx.fresh_generated_name("parameterize_value");
+        let old_name = ctx.fresh_generated_name("parameterize_old");
+
+        let parameter_ref = symbol_expr(parameter_name, pos);
+        let value_ref = symbol_expr(value_name, pos);
+        let old_ref = symbol_expr(old_name, pos);
+
+        let_bindings.push(list_expr(vec![parameter_ref.clone(), parameter], pos));
+        let_bindings.push(list_expr(vec![value_ref.clone(), value], pos));
+        old_bindings.push(list_expr(
+            vec![old_ref.clone(), list_expr(vec![parameter_ref.clone()], pos)],
+            pos,
+        ));
+        before_body.push(list_expr(
+            vec![
+                symbol_expr(PARAMETER_SET_BUILTIN_NAME, pos),
+                parameter_ref.clone(),
+                value_ref,
+            ],
+            pos,
+        ));
+        after_body.push(list_expr(
+            vec![
+                symbol_expr(PARAMETER_RESTORE_BUILTIN_NAME, pos),
+                parameter_ref,
+                old_ref,
+            ],
+            pos,
+        ));
+    }
+
+    let empty_params = list_expr(Vec::new(), pos);
+    let before = build_lambda_expr(empty_params.clone(), before_body, pos);
+    let body_thunk = build_lambda_expr(empty_params.clone(), body.to_vec(), pos);
+    let after = build_lambda_expr(empty_params, after_body, pos);
+    let dynamic_wind = list_expr(
+        vec![symbol_expr("dynamic-wind", pos), before, body_thunk, after],
+        pos,
+    );
+    let inner_let = list_expr(
+        vec![symbol_expr("let", pos), list_expr(old_bindings, pos), dynamic_wind],
+        pos,
+    );
+
+    Ok(list_expr(
+        vec![symbol_expr("let", pos), list_expr(let_bindings, pos), inner_let],
+        pos,
+    ))
 }
 
 fn parse_receive_form<'a>(args: &'a [Expr]) -> Result<(&'a Expr, &'a Expr, &'a [Expr]), EvalError> {
@@ -4915,8 +5125,11 @@ fn dispatch_call(
     ctx: &mut EvalContext,
 ) -> Result<TailOutcome, EvalError> {
     match function {
+        Value::Builtin(builtin) if builtin_requires_machine(builtin) => {
+            apply_via_machine(Value::Builtin(builtin), args, pos, ctx).map(TailOutcome::Value)
+        }
         Value::Builtin(builtin) => dispatch_builtin_call(builtin, args, pos, ctx),
-        Value::NativeProcedure(procedure) => apply_native_procedure(&procedure, &args)
+        Value::NativeProcedure(procedure) => apply_native_procedure_call(&procedure, &args, pos, ctx)
             .map(TailOutcome::Value)
             .map_err(|err| err.with_position(pos)),
         Value::Procedure(procedure) => Ok(TailOutcome::TailCall {
@@ -4924,7 +5137,60 @@ fn dispatch_call(
             args,
             pos,
         }),
+        Value::Continuation(saved) => {
+            apply_via_machine(Value::Continuation(saved), args, pos, ctx).map(TailOutcome::Value)
+        }
         other => Err(EvalError::NotAProcedure(other.to_string()).with_position(pos)),
+    }
+}
+
+fn builtin_requires_machine(builtin: Builtin) -> bool {
+    matches!(
+        builtin,
+        Builtin::CallCc
+            | Builtin::DynamicWind
+            | Builtin::ParameterSet
+            | Builtin::ParameterRestore
+            | Builtin::Raise
+            | Builtin::WithExceptionHandler
+    )
+}
+
+fn apply_via_machine(
+    function: Value,
+    args: Vec<Value>,
+    pos: SourcePos,
+    ctx: &mut EvalContext,
+) -> Result<Value, EvalError> {
+    let env = Env::child(Env::global());
+    let function_name = ctx.fresh_generated_name("apply_fn");
+    Env::define(&env, function_name.clone(), function);
+
+    let mut items = Vec::with_capacity(args.len() + 1);
+    items.push(symbol_expr(function_name, pos));
+
+    for (index, arg) in args.into_iter().enumerate() {
+        let arg_name = ctx.fresh_generated_name(&format!("apply_arg_{index}"));
+        Env::define(&env, arg_name.clone(), arg);
+        items.push(symbol_expr(arg_name, pos));
+    }
+
+    run_machine(&[list_expr(items, pos)], env, ctx)
+}
+
+fn apply_native_procedure_call(
+    procedure: &NativeProcedure,
+    args: &[Value],
+    pos: SourcePos,
+    ctx: &mut EvalContext,
+) -> Result<Value, EvalError> {
+    match &procedure.kind {
+        NativeProcedureKind::Parameter { cell } => match args {
+            [] => Ok(parameter_current_value(cell)),
+            [value] => apply_parameter_value(&procedure.name, cell, value.clone(), pos, ctx),
+            _ => Err(wrong_arg_count(&procedure.name, "0 or 1", args.len())),
+        },
+        _ => apply_native_procedure(procedure, args),
     }
 }
 
@@ -4971,6 +5237,9 @@ fn apply_native_procedure(procedure: &NativeProcedure, args: &[Value]) -> Result
                 ))
             })
         }
+        NativeProcedureKind::Parameter { .. } => {
+            unreachable!("parameter procedures require the evaluation context")
+        }
         NativeProcedureKind::ComposedAccessor { ops } => {
             if args.len() != 1 {
                 return Err(wrong_arg_count(&procedure.name, "exactly 1", args.len()));
@@ -5014,10 +5283,99 @@ fn dispatch_builtin_call(
         Builtin::Map => apply_map_builtin(&args, pos, ctx)
             .map(TailOutcome::Value)
             .map_err(|err| err.with_position(pos)),
-        _ => apply_builtin(builtin, &args, ctx)
+        _ => apply_builtin(builtin, &args, pos, ctx)
             .map(TailOutcome::Value)
             .map_err(|err| err.with_position(pos)),
     }
+}
+
+fn is_procedure_value(value: &Value) -> bool {
+    matches!(
+        value,
+        Value::Builtin(_)
+            | Value::Procedure(_)
+            | Value::NativeProcedure(_)
+            | Value::Continuation(_)
+    )
+}
+
+fn expect_parameter_cell(name: &str, value: &Value) -> Result<ParameterCellRef, EvalError> {
+    let Value::NativeProcedure(procedure) = value else {
+        return Err(EvalError::TypeMismatch {
+            expected: format!("parameter object for {name}"),
+            found: value.type_name().to_string(),
+        });
+    };
+
+    match &procedure.kind {
+        NativeProcedureKind::Parameter { cell } => Ok(cell.clone()),
+        _ => Err(EvalError::TypeMismatch {
+            expected: format!("parameter object for {name}"),
+            found: value.type_name().to_string(),
+        }),
+    }
+}
+
+fn parameter_current_value(cell: &ParameterCellRef) -> Value {
+    cell.borrow().current.clone()
+}
+
+fn store_parameter_value(cell: &ParameterCellRef, value: Value) -> Value {
+    cell.borrow_mut().current = value.clone();
+    value
+}
+
+fn apply_parameter_value(
+    _name: &str,
+    cell: &ParameterCellRef,
+    value: Value,
+    pos: SourcePos,
+    ctx: &mut EvalContext,
+) -> Result<Value, EvalError> {
+    let converter = cell.borrow().converter.clone();
+    let value = match converter {
+        Some(converter) => expect_single_value(apply_allow_values(
+            converter,
+            std::slice::from_ref(&value),
+            pos,
+            ctx,
+        )?)
+        .map_err(|err| err.with_position(pos))?,
+        None => value,
+    };
+
+    Ok(store_parameter_value(cell, value))
+}
+
+fn make_parameter_builtin(
+    args: &[Value],
+    pos: SourcePos,
+    ctx: &mut EvalContext,
+) -> Result<Value, EvalError> {
+    if !(1..=2).contains(&args.len()) {
+        return Err(wrong_arg_count("make-parameter", "1 or 2", args.len()));
+    }
+
+    let converter = args.get(1).cloned();
+    if let Some(converter) = converter.as_ref() {
+        if !is_procedure_value(converter) {
+            return Err(EvalError::TypeMismatch {
+                expected: "procedure for make-parameter converter".into(),
+                found: converter.type_name().to_string(),
+            });
+        }
+    }
+
+    let cell = Rc::new(RefCell::new(ParameterCell {
+        current: Value::Void,
+        converter,
+    }));
+    let _ = apply_parameter_value("parameter", &cell, args[0].clone(), pos, ctx)?;
+
+    Ok(Value::NativeProcedure(Rc::new(NativeProcedure {
+        name: "parameter".into(),
+        kind: NativeProcedureKind::Parameter { cell },
+    })))
 }
 
 fn bind_call_env(
@@ -5098,11 +5456,13 @@ fn expand_apply_args(args: &[Value]) -> Result<(Value, Vec<Value>), EvalError> {
 fn apply_builtin(
     builtin: Builtin,
     args: &[Value],
+    pos: SourcePos,
     ctx: &mut EvalContext,
 ) -> Result<Value, EvalError> {
     let name = builtin.name();
     match builtin {
         Builtin::Values => Ok(Value::Multi(args.to_vec())),
+        Builtin::MakeParameter => make_parameter_builtin(args, pos, ctx),
         Builtin::Add => {
             let numbers = expect_numbers(name, args)?;
             let sum = numbers
@@ -5380,6 +5740,10 @@ fn apply_builtin(
             unreachable!("call-with-values is handled by dispatch_builtin_call")
         }
         Builtin::DynamicWind => unreachable!("dynamic-wind is handled by the machine runtime"),
+        Builtin::ParameterSet => unreachable!("parameter-set is handled by the machine runtime"),
+        Builtin::ParameterRestore => {
+            unreachable!("parameter-restore is handled by the machine runtime")
+        }
         Builtin::Raise => unreachable!("raise is handled by the machine runtime"),
         Builtin::WithExceptionHandler => {
             unreachable!("with-exception-handler is handled by the machine runtime")
@@ -5697,15 +6061,7 @@ fn apply_builtin(
         Builtin::SymbolPred => {
             unary_predicate(name, args, |value| matches!(value, Value::Symbol(_)))
         }
-        Builtin::ProcedurePred => unary_predicate(name, args, |value| {
-            matches!(
-                value,
-                Value::Builtin(_)
-                    | Value::Procedure(_)
-                    | Value::NativeProcedure(_)
-                    | Value::Continuation(_)
-            )
-        }),
+        Builtin::ProcedurePred => unary_predicate(name, args, is_procedure_value),
     }
 }
 
