@@ -1314,7 +1314,8 @@ fn is_builtin(name: &str) -> bool {
         "vector" | "make-vector" | "vector-ref" | "vector-set!" |
         "vector-length" | "vector?" | "vector->list" | "list->vector" |
         "abs" | "modulo" | "remainder" | "quotient" | "min" | "max" | "expt" |
-        "zero?" | "positive?" | "negative?" | "odd?" | "even?"
+        "zero?" | "positive?" | "negative?" | "odd?" | "even?" |
+        "list-ref" | "list-tail" | "list?" | "assoc"
     )
 }
 
@@ -1356,20 +1357,24 @@ fn call_builtin(name: &str, args: Vec<Value>, env: &Env, pos: Pos) -> Result<Val
             }
         }
         "map" => {
-            if args.len() != 2 {
-                return Err(runtime_err(pos, "map requires 2 arguments"));
+            if args.len() < 2 {
+                return Err(runtime_err(pos, "map requires at least 2 arguments"));
             }
             let func = &args[0];
-            match &args[1] {
-                Value::List(items) => {
-                    let mut results = Vec::new();
-                    for item in items {
-                        results.push(apply_proc(func, "map", &[item.clone()], env, pos)?);
-                    }
-                    Ok(Value::List(results))
+            let mut lists: Vec<&Vec<Value>> = Vec::new();
+            for arg in &args[1..] {
+                match arg {
+                    Value::List(items) => lists.push(items),
+                    _ => return Err(runtime_err(pos, "map: arguments must be lists")),
                 }
-                _ => Err(runtime_err(pos, "map: second argument must be a list")),
             }
+            let len = lists[0].len();
+            let mut results = Vec::new();
+            for i in 0..len {
+                let map_args: Vec<Value> = lists.iter().map(|l| l[i].clone()).collect();
+                results.push(apply_proc(func, "map", &map_args, env, pos)?);
+            }
+            Ok(Value::List(results))
         }
         _ => apply_builtin_vals(name, &args, pos),
     }
@@ -1515,6 +1520,72 @@ fn apply_builtin_vals(op: &str, vals: &[Value], pos: Pos) -> Result<Value, EvalE
             match &vals[0] {
                 Value::List(elems) => Ok(Value::Integer(elems.len() as i64)),
                 _ => Err(runtime_err(pos, "length: not a list")),
+            }
+        }
+        "list-ref" => {
+            if vals.len() != 2 {
+                return Err(runtime_err(pos, "list-ref requires 2 arguments"));
+            }
+            let idx = expect_int(&vals[1], pos)? as usize;
+            match &vals[0] {
+                Value::List(elems) => {
+                    if idx < elems.len() {
+                        Ok(elems[idx].clone())
+                    } else {
+                        Err(runtime_err(pos, "list-ref: index out of range"))
+                    }
+                }
+                _ => Err(runtime_err(pos, "list-ref: not a list")),
+            }
+        }
+        "list-tail" => {
+            if vals.len() != 2 {
+                return Err(runtime_err(pos, "list-tail requires 2 arguments"));
+            }
+            let idx = expect_int(&vals[1], pos)? as usize;
+            match &vals[0] {
+                Value::List(elems) => {
+                    if idx <= elems.len() {
+                        Ok(Value::List(elems[idx..].to_vec()))
+                    } else {
+                        Err(runtime_err(pos, "list-tail: index out of range"))
+                    }
+                }
+                _ => Err(runtime_err(pos, "list-tail: not a list")),
+            }
+        }
+        "list?" => {
+            if vals.len() != 1 {
+                return Err(runtime_err(pos, "list? requires 1 argument"));
+            }
+            match &vals[0] {
+                Value::List(elems) => {
+                    // A dotted pair like (cons 1 2) is stored as [1, Symbol("."), 2]
+                    let is_proper = elems.is_empty()
+                        || elems.len() < 3
+                        || !matches!(&elems[elems.len() - 2], Value::Symbol(s) if s == ".");
+                    Ok(Value::Boolean(is_proper))
+                }
+                _ => Ok(Value::Boolean(false)),
+            }
+        }
+        "assoc" => {
+            if vals.len() != 2 {
+                return Err(runtime_err(pos, "assoc requires 2 arguments"));
+            }
+            let key = &vals[0];
+            match &vals[1] {
+                Value::List(alist) => {
+                    for entry in alist {
+                        if let Value::List(pair) = entry {
+                            if !pair.is_empty() && values_equal(&pair[0], key) {
+                                return Ok(entry.clone());
+                            }
+                        }
+                    }
+                    Ok(Value::Boolean(false))
+                }
+                _ => Err(runtime_err(pos, "assoc: second argument must be a list")),
             }
         }
         "string?" => {
