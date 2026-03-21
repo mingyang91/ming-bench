@@ -34,6 +34,7 @@ fn parse_expr(
 
     match chars.peek() {
         None => Err(ParseError::UnexpectedEof),
+        Some('\'') => parse_quote_shorthand(chars),
         Some('(') => parse_list(chars),
         Some('"') => parse_string(chars),
         Some('#') => parse_boolean(chars),
@@ -86,10 +87,6 @@ fn is_symbol_start(c: char) -> bool {
         || c.is_ascii_alphabetic()
 }
 
-fn is_symbol_char(c: char) -> bool {
-    is_symbol_start(c) || c == '-' || c.is_ascii_digit()
-}
-
 fn parse_symbol(
     chars: &mut std::iter::Peekable<std::str::Chars<'_>>,
 ) -> Result<Value, ParseError> {
@@ -104,6 +101,14 @@ fn parse_symbol(
     }
 
     Ok(Value::Symbol(token))
+}
+
+fn parse_quote_shorthand(
+    chars: &mut std::iter::Peekable<std::str::Chars<'_>>,
+) -> Result<Value, ParseError> {
+    chars.next(); // consume '\''
+    let inner = parse_expr(chars)?;
+    Ok(Value::List(vec![Value::Symbol("quote".to_string()), inner]))
 }
 
 fn parse_list(
