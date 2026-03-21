@@ -84,6 +84,8 @@ fn is_builtin(name: &str) -> bool {
             | "reverse"
             | "with-exception-handler"
             | "raise"
+            | "values"
+            | "call-with-values"
     )
 }
 
@@ -167,7 +169,7 @@ pub fn eval(
                 Bounce::TailCall { expr, env } => { cur_expr = expr; cur_env = env; }
             },
             Value::Lambda { .. } | Value::Continuation(_) | Value::Macro { .. }
-            | Value::Vector(_) | Value::Pair(..) => {
+            | Value::Vector(_) | Value::Pair(..) | Value::Values(_) => {
                 return Ok(cur_expr);
             }
             Value::Void => return Ok(Value::Void),
@@ -274,6 +276,27 @@ fn apply_tco(
                 });
             };
             eval_with_exception_handler(handler, thunk, span, ctx).map(Bounce::Done)
+        }
+        Value::Symbol(name) if name == "values" => {
+            match args {
+                [single] => Ok(Bounce::Done(single.clone())),
+                _ => Ok(Bounce::Done(Value::Values(args.to_vec()))),
+            }
+        }
+        Value::Symbol(name) if name == "call-with-values" => {
+            let [producer, consumer] = args else {
+                return Err(EvalError::WrongArgCount {
+                    expected: 2,
+                    got: args.len(),
+                    span,
+                });
+            };
+            let produced = apply(producer, &[], span, ctx)?;
+            let consumer_args = match produced {
+                Value::Values(vals) => vals,
+                other => vec![other],
+            };
+            apply_tco(consumer, &consumer_args, span, ctx)
         }
         Value::Symbol(name) if name == "dynamic-wind" => {
             let [in_thunk, body_thunk, out_thunk] = args else {

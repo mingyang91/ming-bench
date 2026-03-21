@@ -43,6 +43,8 @@ pub enum Value {
         rules: Vec<(Value, Value)>,
         def_env: Rc<RefCell<Env>>,
     },
+    /// Multiple return values from `values`.
+    Values(Vec<Value>),
     Void,
 }
 
@@ -57,6 +59,7 @@ impl PartialEq for Value {
             (Value::List(a), Value::List(b)) => a == b,
             (Value::Pair(a1, a2), Value::Pair(b1, b2)) => a1 == b1 && a2 == b2,
             (Value::Vector(a), Value::Vector(b)) => Rc::ptr_eq(a, b),
+            (Value::Values(a), Value::Values(b)) => a == b,
             (Value::Void, Value::Void) => true,
             (Value::Lambda { .. }, Value::Lambda { .. }) => false,
             (Value::Macro { .. }, Value::Macro { .. }) => false,
@@ -64,6 +67,17 @@ impl PartialEq for Value {
             _ => false,
         }
     }
+}
+
+fn fmt_values(vals: &[Value], f: &mut fmt::Formatter<'_>) -> fmt::Result {
+    let [first, rest @ ..] = vals else {
+        return Ok(());
+    };
+    write!(f, "{first}")?;
+    for v in rest {
+        write!(f, "\n{v}")?;
+    }
+    Ok(())
 }
 
 fn fmt_vector(elems: &[Value], f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -105,6 +119,7 @@ impl Value {
                 format!("#({})", inner.join(" "))
             }
             Value::Macro { .. } => "#<macro>".to_string(),
+            Value::Values(vals) => vals.iter().map(|v| v.display_str()).collect::<Vec<_>>().join("\n"),
             other => other.to_string(),
         }
     }
@@ -122,6 +137,7 @@ impl fmt::Display for Value {
             Value::List(elems) => fmt_list(elems, f),
             Value::Pair(car, cdr) => write!(f, "({car} . {cdr})"),
             Value::Vector(cells) => fmt_vector(&cells.borrow(), f),
+            Value::Values(vals) => fmt_values(vals, f),
             Value::Lambda { .. } | Value::Continuation(_) => write!(f, "#<procedure>"),
             Value::Macro { .. } => write!(f, "#<macro>"),
             Value::Void => write!(f, ""),
