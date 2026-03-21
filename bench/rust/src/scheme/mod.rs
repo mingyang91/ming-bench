@@ -109,6 +109,7 @@ enum ExprKind {
 }
 
 type StringRef = Rc<RefCell<String>>;
+type VectorRef = Rc<RefCell<Vec<Value>>>;
 type ContinuationRef = Rc<MachineContinuation>;
 type BindingRef = Rc<RefCell<Value>>;
 
@@ -121,6 +122,7 @@ enum Value {
     Symbol(String),
     List(Vec<Value>),
     Pair(Box<(Value, Value)>),
+    Vector(VectorRef),
     Builtin(Builtin),
     Procedure(Rc<LambdaProcedure>),
     Continuation(ContinuationRef),
@@ -145,6 +147,7 @@ impl Value {
             Self::Symbol(_) => "symbol",
             Self::List(_) => "list",
             Self::Pair(_) => "pair",
+            Self::Vector(_) => "vector",
             Self::Builtin(_) | Self::Procedure(_) | Self::Continuation(_) => "procedure",
             Self::Void => "void",
         }
@@ -180,6 +183,15 @@ impl Value {
                 format!("({rendered})")
             }
             Self::Pair(pair) => render_pair(&pair.0, &pair.1, mode),
+            Self::Vector(items) => {
+                let rendered = items
+                    .borrow()
+                    .iter()
+                    .map(|item| item.render(mode))
+                    .collect::<Vec<_>>()
+                    .join(" ");
+                format!("#({rendered})")
+            }
             Self::Builtin(_) | Self::Procedure(_) | Self::Continuation(_) => {
                 "#<procedure>".to_string()
             }
@@ -212,6 +224,7 @@ enum Builtin {
     LessEqual,
     GreaterEqual,
     Eq,
+    Eqv,
     EqualPred,
     Not,
     Abs,
@@ -273,6 +286,14 @@ enum Builtin {
     BooleanPred,
     PairPred,
     SymbolPred,
+    Vector,
+    MakeVector,
+    VectorRef,
+    VectorSet,
+    VectorLength,
+    VectorPred,
+    VectorToList,
+    ListToVector,
 }
 
 impl Builtin {
@@ -287,6 +308,7 @@ impl Builtin {
         Self::LessEqual,
         Self::GreaterEqual,
         Self::Eq,
+        Self::Eqv,
         Self::EqualPred,
         Self::Not,
         Self::Abs,
@@ -348,6 +370,14 @@ impl Builtin {
         Self::BooleanPred,
         Self::PairPred,
         Self::SymbolPred,
+        Self::Vector,
+        Self::MakeVector,
+        Self::VectorRef,
+        Self::VectorSet,
+        Self::VectorLength,
+        Self::VectorPred,
+        Self::VectorToList,
+        Self::ListToVector,
     ];
 
     fn name(self) -> &'static str {
@@ -362,6 +392,7 @@ impl Builtin {
             Self::LessEqual => "<=",
             Self::GreaterEqual => ">=",
             Self::Eq => "eq?",
+            Self::Eqv => "eqv?",
             Self::EqualPred => "equal?",
             Self::Not => "not",
             Self::Abs => "abs",
@@ -423,6 +454,14 @@ impl Builtin {
             Self::BooleanPred => "boolean?",
             Self::PairPred => "pair?",
             Self::SymbolPred => "symbol?",
+            Self::Vector => "vector",
+            Self::MakeVector => "make-vector",
+            Self::VectorRef => "vector-ref",
+            Self::VectorSet => "vector-set!",
+            Self::VectorLength => "vector-length",
+            Self::VectorPred => "vector?",
+            Self::VectorToList => "vector->list",
+            Self::ListToVector => "list->vector",
         }
     }
 }
@@ -531,6 +570,12 @@ struct LetForm<'a> {
     body: &'a [Expr],
 }
 
+#[derive(Debug, Clone, Copy)]
+enum RecursiveBindingMode {
+    Parallel,
+    Sequential,
+}
+
 #[derive(Debug, Clone)]
 struct MacroDefinition {
     literals: HashSet<String>,
@@ -604,7 +649,7 @@ enum MachineContinuation {
     },
     If {
         consequent: Expr,
-        alternate: Expr,
+        alternate: Option<Expr>,
         env: EnvRef,
         next: ContinuationRef,
     },
@@ -809,12 +854,13 @@ fn run_machine(exprs: &[Expr], env: EnvRef, ctx: &mut EvalContext) -> Result<Val
                     env,
                     next,
                 } => {
-                    let branch = if value.is_truthy() {
-                        consequent.clone()
+                    if value.is_truthy() {
+                        control = MachineControl::Expr(consequent.clone(), env.clone());
+                    } else if let Some(alternate) = alternate {
+                        control = MachineControl::Expr(alternate.clone(), env.clone());
                     } else {
-                        alternate.clone()
-                    };
-                    control = MachineControl::Expr(branch, env.clone());
+                        control = MachineControl::Value(Value::Void);
+                    }
                     cont = next.clone();
                 }
                 MachineContinuation::And {
@@ -1083,23 +1129,40 @@ fn schedule_list_eval(
         ExprKind::Symbol(name) if name == "and" => Ok(schedule_and(args, env, next)),
         ExprKind::Symbol(name) if name == "or" => Ok(schedule_or(args, env, next)),
         ExprKind::Symbol(name) if name == "if" => {
-            if args.len() != 3 {
-                return Err(wrong_arg_count("if", "exactly 3", args.len()));
+            if !(2..=3).contains(&args.len()) {
+                return Err(wrong_arg_count("if", "2 or 3", args.len()));
             }
 
             Ok((
                 MachineControl::Expr(args[0].clone(), env.clone()),
                 Rc::new(MachineContinuation::If {
                     consequent: args[1].clone(),
-                    alternate: args[2].clone(),
+                    alternate: args.get(2).cloned(),
                     env,
                     next,
                 }),
             ))
         }
         ExprKind::Symbol(name) if name == "let" => schedule_let(args, pos, env, next),
+        ExprKind::Symbol(name) if name == "letrec" => Ok((
+            MachineControl::Value(eval_letrec(args, "letrec", RecursiveBindingMode::Parallel, env, ctx)?),
+            next,
+        )),
+        ExprKind::Symbol(name) if name == "letrec*" => Ok((
+            MachineControl::Value(eval_letrec(
+                args,
+                "letrec*",
+                RecursiveBindingMode::Sequential,
+                env,
+                ctx,
+            )?),
+            next,
+        )),
         ExprKind::Symbol(name) if name == "begin" => Ok(schedule_sequence(args, env, next)),
         ExprKind::Symbol(name) if name == "cond" => schedule_cond(args, 0, env, next),
+        ExprKind::Symbol(name) if name == "case" => {
+            Ok((MachineControl::Value(eval_case(args, env, ctx)?), next))
+        }
         ExprKind::Symbol(name) if name == "quote" => {
             Ok((MachineControl::Value(eval_quote(args)?), next))
         }
@@ -1467,8 +1530,15 @@ fn eval_list(
         ExprKind::Symbol(name) if name == "or" => eval_or(args, env, ctx),
         ExprKind::Symbol(name) if name == "if" => eval_if(args, env, ctx),
         ExprKind::Symbol(name) if name == "let" => eval_let(args, pos, env, ctx),
+        ExprKind::Symbol(name) if name == "letrec" => {
+            eval_letrec(args, "letrec", RecursiveBindingMode::Parallel, env, ctx)
+        }
+        ExprKind::Symbol(name) if name == "letrec*" => {
+            eval_letrec(args, "letrec*", RecursiveBindingMode::Sequential, env, ctx)
+        }
         ExprKind::Symbol(name) if name == "begin" => eval_begin(args, env, ctx),
         ExprKind::Symbol(name) if name == "cond" => eval_cond(args, env, ctx),
+        ExprKind::Symbol(name) if name == "case" => eval_case(args, env, ctx),
         ExprKind::Symbol(name) if name == "quote" => eval_quote(args),
         ExprKind::Symbol(name) if name == "define" => eval_define(args, env, ctx),
         ExprKind::Symbol(name) if name == "define-syntax" => eval_define_syntax(args, env, ctx),
@@ -1504,8 +1574,15 @@ fn eval_tail_list(
         ExprKind::Symbol(name) if name == "or" => eval_tail_or(args, env, ctx),
         ExprKind::Symbol(name) if name == "if" => eval_tail_if(args, env, ctx),
         ExprKind::Symbol(name) if name == "let" => eval_tail_let(args, pos, env, ctx),
+        ExprKind::Symbol(name) if name == "letrec" => {
+            eval_tail_letrec(args, "letrec", RecursiveBindingMode::Parallel, env, ctx)
+        }
+        ExprKind::Symbol(name) if name == "letrec*" => {
+            eval_tail_letrec(args, "letrec*", RecursiveBindingMode::Sequential, env, ctx)
+        }
         ExprKind::Symbol(name) if name == "begin" => eval_tail_begin(args, env, ctx),
         ExprKind::Symbol(name) if name == "cond" => eval_tail_cond(args, env, ctx),
+        ExprKind::Symbol(name) if name == "case" => eval_tail_case(args, env, ctx),
         ExprKind::Symbol(name) if name == "quote" => eval_quote(args).map(TailOutcome::Value),
         ExprKind::Symbol(name) if name == "define" => {
             eval_define(args, env, ctx).map(TailOutcome::Value)
@@ -1552,15 +1629,18 @@ fn eval_or(args: &[Expr], env: EnvRef, ctx: &mut EvalContext) -> Result<Value, E
 }
 
 fn eval_if(args: &[Expr], env: EnvRef, ctx: &mut EvalContext) -> Result<Value, EvalError> {
-    if args.len() != 3 {
-        return Err(wrong_arg_count("if", "exactly 3", args.len()));
+    if !(2..=3).contains(&args.len()) {
+        return Err(wrong_arg_count("if", "2 or 3", args.len()));
     }
 
     let condition = eval_expr(&args[0], env.clone(), ctx)?;
     if condition.is_truthy() {
         eval_expr(&args[1], env, ctx)
     } else {
-        eval_expr(&args[2], env, ctx)
+        match args.get(2) {
+            Some(alternate) => eval_expr(alternate, env, ctx),
+            None => Ok(Value::Void),
+        }
     }
 }
 
@@ -1607,15 +1687,18 @@ fn eval_tail_if(
     env: EnvRef,
     ctx: &mut EvalContext,
 ) -> Result<TailOutcome, EvalError> {
-    if args.len() != 3 {
-        return Err(wrong_arg_count("if", "exactly 3", args.len()));
+    if !(2..=3).contains(&args.len()) {
+        return Err(wrong_arg_count("if", "2 or 3", args.len()));
     }
 
     let condition = eval_expr(&args[0], env.clone(), ctx)?;
     if condition.is_truthy() {
         eval_tail_expr(&args[1], env, ctx)
     } else {
-        eval_tail_expr(&args[2], env, ctx)
+        match args.get(2) {
+            Some(alternate) => eval_tail_expr(alternate, env, ctx),
+            None => Ok(TailOutcome::Value(Value::Void)),
+        }
     }
 }
 
@@ -1698,6 +1781,28 @@ fn eval_tail_let(
             eval_tail_sequence(form.body, local_env, ctx)
         }
     }
+}
+
+fn eval_letrec(
+    args: &[Expr],
+    name: &str,
+    mode: RecursiveBindingMode,
+    env: EnvRef,
+    ctx: &mut EvalContext,
+) -> Result<Value, EvalError> {
+    let (local_env, body) = eval_recursive_bindings(args, name, mode, env, ctx)?;
+    eval_sequence(body, local_env, ctx)
+}
+
+fn eval_tail_letrec(
+    args: &[Expr],
+    name: &str,
+    mode: RecursiveBindingMode,
+    env: EnvRef,
+    ctx: &mut EvalContext,
+) -> Result<TailOutcome, EvalError> {
+    let (local_env, body) = eval_recursive_bindings(args, name, mode, env, ctx)?;
+    eval_tail_sequence(body, local_env, ctx)
 }
 
 fn eval_begin(args: &[Expr], env: EnvRef, ctx: &mut EvalContext) -> Result<Value, EvalError> {
@@ -1788,6 +1893,20 @@ fn eval_tail_cond(
     }
 
     Ok(TailOutcome::Value(Value::Void))
+}
+
+fn eval_case(args: &[Expr], env: EnvRef, ctx: &mut EvalContext) -> Result<Value, EvalError> {
+    let (key, clauses) = eval_case_key_and_clauses(args, env.clone(), ctx)?;
+    eval_case_clauses(&key, clauses, env, ctx)
+}
+
+fn eval_tail_case(
+    args: &[Expr],
+    env: EnvRef,
+    ctx: &mut EvalContext,
+) -> Result<TailOutcome, EvalError> {
+    let (key, clauses) = eval_case_key_and_clauses(args, env.clone(), ctx)?;
+    eval_tail_case_clauses(&key, clauses, env, ctx)
 }
 
 fn eval_quote(args: &[Expr]) -> Result<Value, EvalError> {
@@ -2715,6 +2834,164 @@ fn eval_let_bindings(
     Ok((names, values))
 }
 
+fn parse_binding_body_form<'a>(
+    name: &str,
+    args: &'a [Expr],
+) -> Result<(&'a Expr, &'a [Expr]), EvalError> {
+    let Some((bindings_expr, body)) = args.split_first() else {
+        return Err(wrong_arg_count(name, "at least 2", args.len()));
+    };
+    if body.is_empty() {
+        return Err(wrong_arg_count(name, "at least 2", args.len()));
+    }
+
+    Ok((bindings_expr, body))
+}
+
+fn eval_recursive_bindings<'a>(
+    args: &'a [Expr],
+    name: &str,
+    mode: RecursiveBindingMode,
+    env: EnvRef,
+    ctx: &mut EvalContext,
+) -> Result<(EnvRef, &'a [Expr]), EvalError> {
+    let (bindings_expr, body) = parse_binding_body_form(name, args)?;
+    let bindings = parse_let_bindings(bindings_expr)?;
+    let local_env = Env::child(env);
+
+    for (binding_name, _) in &bindings {
+        Env::define(&local_env, binding_name.clone(), Value::Void);
+    }
+
+    match mode {
+        RecursiveBindingMode::Parallel => {
+            let mut values = Vec::with_capacity(bindings.len());
+            for (_, expr) in &bindings {
+                values.push(eval_expr(expr, local_env.clone(), ctx)?);
+            }
+
+            for ((binding_name, _), value) in bindings.into_iter().zip(values) {
+                Env::set(&local_env, &binding_name, value)?;
+            }
+        }
+        RecursiveBindingMode::Sequential => {
+            for (binding_name, expr) in bindings {
+                let value = eval_expr(&expr, local_env.clone(), ctx)?;
+                Env::set(&local_env, &binding_name, value)?;
+            }
+        }
+    }
+
+    Ok((local_env, body))
+}
+
+fn eval_case_key_and_clauses<'a>(
+    args: &'a [Expr],
+    env: EnvRef,
+    ctx: &mut EvalContext,
+) -> Result<(Value, &'a [Expr]), EvalError> {
+    if args.len() < 2 {
+        return Err(wrong_arg_count("case", "at least 2", args.len()));
+    }
+
+    let key = eval_expr(&args[0], env, ctx)?;
+    Ok((key, &args[1..]))
+}
+
+fn eval_case_clauses(
+    key: &Value,
+    clauses: &[Expr],
+    env: EnvRef,
+    ctx: &mut EvalContext,
+) -> Result<Value, EvalError> {
+    for (index, clause) in clauses.iter().enumerate() {
+        let ExprKind::List(items) = &clause.kind else {
+            return Err(EvalError::Syntax("case clauses must be lists".into())
+                .with_position(clause.pos));
+        };
+        let Some((datums_expr, body)) = items.split_first() else {
+            return Err(EvalError::Syntax("case clauses cannot be empty".into())
+                .with_position(clause.pos));
+        };
+
+        match &datums_expr.kind {
+            ExprKind::Symbol(name) if name == "else" => {
+                if index + 1 != clauses.len() {
+                    return Err(EvalError::Syntax("case else clause must be last".into())
+                        .with_position(clause.pos));
+                }
+                if body.is_empty() {
+                    return Err(EvalError::Syntax("case else clause requires a body".into())
+                        .with_position(clause.pos));
+                }
+                return eval_sequence(body, env, ctx);
+            }
+            ExprKind::List(datums) => {
+                if datums.iter().any(|datum| values_eqv(key, &quote_expr(datum))) {
+                    if body.is_empty() {
+                        return Err(EvalError::Syntax("case clause requires a body".into())
+                            .with_position(clause.pos));
+                    }
+                    return eval_sequence(body, env, ctx);
+                }
+            }
+            _ => {
+                return Err(EvalError::Syntax("case clause datums must be a list".into())
+                    .with_position(datums_expr.pos));
+            }
+        }
+    }
+
+    Ok(Value::Void)
+}
+
+fn eval_tail_case_clauses(
+    key: &Value,
+    clauses: &[Expr],
+    env: EnvRef,
+    ctx: &mut EvalContext,
+) -> Result<TailOutcome, EvalError> {
+    for (index, clause) in clauses.iter().enumerate() {
+        let ExprKind::List(items) = &clause.kind else {
+            return Err(EvalError::Syntax("case clauses must be lists".into())
+                .with_position(clause.pos));
+        };
+        let Some((datums_expr, body)) = items.split_first() else {
+            return Err(EvalError::Syntax("case clauses cannot be empty".into())
+                .with_position(clause.pos));
+        };
+
+        match &datums_expr.kind {
+            ExprKind::Symbol(name) if name == "else" => {
+                if index + 1 != clauses.len() {
+                    return Err(EvalError::Syntax("case else clause must be last".into())
+                        .with_position(clause.pos));
+                }
+                if body.is_empty() {
+                    return Err(EvalError::Syntax("case else clause requires a body".into())
+                        .with_position(clause.pos));
+                }
+                return eval_tail_sequence(body, env, ctx);
+            }
+            ExprKind::List(datums) => {
+                if datums.iter().any(|datum| values_eqv(key, &quote_expr(datum))) {
+                    if body.is_empty() {
+                        return Err(EvalError::Syntax("case clause requires a body".into())
+                            .with_position(clause.pos));
+                    }
+                    return eval_tail_sequence(body, env, ctx);
+                }
+            }
+            _ => {
+                return Err(EvalError::Syntax("case clause datums must be a list".into())
+                    .with_position(datums_expr.pos));
+            }
+        }
+    }
+
+    Ok(TailOutcome::Value(Value::Void))
+}
+
 fn parse_parameters(items: &[Expr]) -> Result<Parameters, EvalError> {
     let dot_index = items
         .iter()
@@ -2944,7 +3221,9 @@ fn apply_builtin(
         Builtin::Equal => compare_numbers(name, args, |left, right| left == right),
         Builtin::LessEqual => compare_numbers(name, args, |left, right| left <= right),
         Builtin::GreaterEqual => compare_numbers(name, args, |left, right| left >= right),
-        Builtin::Eq | Builtin::EqualPred => compare_values_builtin(name, args),
+        Builtin::Eq => compare_values_builtin(name, args, values_equal),
+        Builtin::Eqv => compare_values_builtin(name, args, values_eqv),
+        Builtin::EqualPred => compare_values_builtin(name, args, values_equal),
         Builtin::Not => {
             if args.len() != 1 {
                 return Err(wrong_arg_count(name, "exactly 1", args.len()));
@@ -3048,7 +3327,96 @@ fn apply_builtin(
                 matches!(&args[0], Value::List(items) if items.is_empty()),
             ))
         }
+        Builtin::Vector => Ok(Value::Vector(Rc::new(RefCell::new(args.to_vec())))),
+        Builtin::MakeVector => {
+            if !(1..=2).contains(&args.len()) {
+                return Err(wrong_arg_count(name, "1 or 2", args.len()));
+            }
+
+            let len_value = expect_number_value(name, &args[0])?;
+            if len_value < 0 {
+                return Err(EvalError::InvalidArgument(
+                    "make-vector requires a non-negative length".into(),
+                ));
+            }
+
+            let len = usize::try_from(len_value).map_err(|_| EvalError::IntegerOverflow)?;
+            let fill = args.get(1).cloned().unwrap_or(Value::Void);
+            Ok(Value::Vector(Rc::new(RefCell::new(vec![fill; len]))))
+        }
+        Builtin::VectorRef => {
+            if args.len() != 2 {
+                return Err(wrong_arg_count(name, "exactly 2", args.len()));
+            }
+
+            let vector = expect_vector_value(name, &args[0])?;
+            let index = expect_number_value(name, &args[1])?;
+            let items = vector.borrow();
+            let len = items.len();
+
+            if index < 0 {
+                return Err(EvalError::IndexOutOfBounds { index, len });
+            }
+
+            let index = usize::try_from(index).map_err(|_| EvalError::IntegerOverflow)?;
+            let value = items.get(index).cloned().ok_or(EvalError::IndexOutOfBounds {
+                index: i64::try_from(index).map_err(|_| EvalError::IntegerOverflow)?,
+                len,
+            })?;
+            Ok(value)
+        }
+        Builtin::VectorSet => {
+            if args.len() != 3 {
+                return Err(wrong_arg_count(name, "exactly 3", args.len()));
+            }
+
+            let vector = expect_vector_value(name, &args[0])?;
+            let index = expect_number_value(name, &args[1])?;
+            let mut items = vector.borrow_mut();
+            let len = items.len();
+
+            if index < 0 {
+                return Err(EvalError::IndexOutOfBounds { index, len });
+            }
+
+            let index = usize::try_from(index).map_err(|_| EvalError::IntegerOverflow)?;
+            let slot = items.get_mut(index).ok_or(EvalError::IndexOutOfBounds {
+                index: i64::try_from(index).map_err(|_| EvalError::IntegerOverflow)?,
+                len,
+            })?;
+            *slot = args[2].clone();
+            Ok(Value::Void)
+        }
+        Builtin::VectorLength => {
+            if args.len() != 1 {
+                return Err(wrong_arg_count(name, "exactly 1", args.len()));
+            }
+
+            let vector = expect_vector_value(name, &args[0])?;
+            let len = i64::try_from(vector.borrow().len()).map_err(|_| EvalError::IntegerOverflow)?;
+            Ok(Value::Number(len))
+        }
+        Builtin::VectorPred => {
+            unary_predicate(name, args, |value| matches!(value, Value::Vector(_)))
+        }
+        Builtin::VectorToList => {
+            if args.len() != 1 {
+                return Err(wrong_arg_count(name, "exactly 1", args.len()));
+            }
+
+            let vector = expect_vector_value(name, &args[0])?;
+            let items = vector.borrow().clone();
+            Ok(Value::List(items))
+        }
         Builtin::List => Ok(Value::List(args.to_vec())),
+        Builtin::ListToVector => {
+            if args.len() != 1 {
+                return Err(wrong_arg_count(name, "exactly 1", args.len()));
+            }
+
+            let list = expect_list_value(name, &args[0])?;
+            Ok(Value::Vector(Rc::new(RefCell::new(list.to_vec()))))
+        }
         Builtin::ListRef => {
             let (list, index) = expect_list_and_index(name, args)?;
             Ok(list[index].clone())
@@ -3329,12 +3697,16 @@ fn compare_numbers(
     Ok(Value::Bool(is_true))
 }
 
-fn compare_values_builtin(name: &str, args: &[Value]) -> Result<Value, EvalError> {
+fn compare_values_builtin(
+    name: &str,
+    args: &[Value],
+    predicate: impl Fn(&Value, &Value) -> bool,
+) -> Result<Value, EvalError> {
     if args.len() != 2 {
         return Err(wrong_arg_count(name, "exactly 2", args.len()));
     }
 
-    Ok(Value::Bool(values_equal(&args[0], &args[1])))
+    Ok(Value::Bool(predicate(&args[0], &args[1])))
 }
 
 fn fold_numeric_extrema(
@@ -3666,6 +4038,44 @@ fn expect_symbol_value<'a>(name: &str, value: &'a Value) -> Result<&'a str, Eval
     }
 }
 
+fn expect_vector_value(name: &str, value: &Value) -> Result<VectorRef, EvalError> {
+    match value {
+        Value::Vector(vector) => Ok(vector.clone()),
+        other => Err(EvalError::TypeMismatch {
+            expected: format!("vector for {name}"),
+            found: other.type_name().to_string(),
+        }),
+    }
+}
+
+fn values_eqv(left: &Value, right: &Value) -> bool {
+    match (left, right) {
+        (Value::Bool(left), Value::Bool(right)) => left == right,
+        (Value::Number(left), Value::Number(right)) => left == right,
+        (Value::String(left), Value::String(right)) => {
+            left.borrow().as_str() == right.borrow().as_str()
+        }
+        (Value::Char(left), Value::Char(right)) => left == right,
+        (Value::Symbol(left), Value::Symbol(right)) => left == right,
+        (Value::List(left), Value::List(right)) => {
+            left.len() == right.len()
+                && left
+                    .iter()
+                    .zip(right.iter())
+                    .all(|(left, right)| values_eqv(left, right))
+        }
+        (Value::Pair(left), Value::Pair(right)) => {
+            values_eqv(&left.0, &right.0) && values_eqv(&left.1, &right.1)
+        }
+        (Value::Vector(left), Value::Vector(right)) => Rc::ptr_eq(left, right),
+        (Value::Builtin(left), Value::Builtin(right)) => left == right,
+        (Value::Procedure(left), Value::Procedure(right)) => Rc::ptr_eq(left, right),
+        (Value::Continuation(left), Value::Continuation(right)) => Rc::ptr_eq(left, right),
+        (Value::Void, Value::Void) => true,
+        _ => false,
+    }
+}
+
 fn values_equal(left: &Value, right: &Value) -> bool {
     match (left, right) {
         (Value::Bool(left), Value::Bool(right)) => left == right,
@@ -3684,6 +4094,15 @@ fn values_equal(left: &Value, right: &Value) -> bool {
         }
         (Value::Pair(left), Value::Pair(right)) => {
             values_equal(&left.0, &right.0) && values_equal(&left.1, &right.1)
+        }
+        (Value::Vector(left), Value::Vector(right)) => {
+            let left = left.borrow();
+            let right = right.borrow();
+            left.len() == right.len()
+                && left
+                    .iter()
+                    .zip(right.iter())
+                    .all(|(left, right)| values_equal(left, right))
         }
         (Value::Builtin(left), Value::Builtin(right)) => left == right,
         (Value::Procedure(left), Value::Procedure(right)) => Rc::ptr_eq(left, right),
