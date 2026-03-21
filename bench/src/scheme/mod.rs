@@ -1,7 +1,10 @@
 mod builtins;
 pub mod error;
+mod parser;
 
 pub use error::EvalError;
+
+use std::collections::HashMap;
 
 /// A Scheme value.
 #[derive(Debug, Clone, PartialEq)]
@@ -10,6 +13,8 @@ enum Value {
     Boolean(bool),
     String(String),
     Symbol(String),
+    List(Vec<Value>),
+    Nil,
 }
 
 impl std::fmt::Display for Value {
@@ -20,9 +25,23 @@ impl std::fmt::Display for Value {
             Value::Boolean(false) => write!(f, "#f"),
             Value::String(s) => write!(f, "\"{s}\""),
             Value::Symbol(s) => write!(f, "{s}"),
+            Value::Nil => write!(f, "()"),
+            Value::List(items) => write!(f, "({})", fmt_list(items)),
         }
     }
 }
+
+/// Format a slice of values as a space-separated string.
+fn fmt_list(items: &[Value]) -> String {
+    items
+        .iter()
+        .map(ToString::to_string)
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+/// Environment for variable bindings.
+type Env = HashMap<String, Value>;
 
 /// An S-expression AST node.
 #[derive(Debug, Clone)]
@@ -31,106 +50,7 @@ enum Expr {
     List(Vec<Expr>),
 }
 
-/// Read a string literal (opening `"` already consumed) from `chars`.
-fn read_string_literal(chars: &mut std::iter::Peekable<std::str::Chars<'_>>) -> String {
-    let mut s = String::from('"');
-    loop {
-        match chars.next() {
-            Some('\\') => {
-                s.push('\\');
-                s.extend(chars.next());
-            }
-            Some('"') => {
-                s.push('"');
-                break;
-            }
-            Some(c) => s.push(c),
-            None => break,
-        }
-    }
-    s
-}
-
-/// Read an atom token (non-delimiter chars) from `chars`.
-fn read_atom(chars: &mut std::iter::Peekable<std::str::Chars<'_>>) -> String {
-    let mut tok = String::new();
-    while let Some(&c) = chars.peek() {
-        if c.is_whitespace() || c == '(' || c == ')' || c == '"' {
-            break;
-        }
-        tok.push(c);
-        chars.next();
-    }
-    tok
-}
-
-/// Tokenize input into a flat list of tokens (atoms, parens, strings).
-fn tokenize(input: &str) -> Vec<String> {
-    let mut tokens = Vec::new();
-    let mut chars = input.chars().peekable();
-    while let Some(&ch) = chars.peek() {
-        match ch {
-            _ if ch.is_whitespace() => {
-                chars.next();
-            }
-            '(' | ')' => {
-                tokens.push(ch.to_string());
-                chars.next();
-            }
-            '"' => {
-                chars.next();
-                tokens.push(read_string_literal(&mut chars));
-            }
-            _ => tokens.push(read_atom(&mut chars)),
-        }
-    }
-    tokens
-}
-
-/// Parse a list body (after the opening `(`) until the matching `)`.
-fn parse_list(tokens: &[String]) -> Result<(Vec<Expr>, &[String]), EvalError> {
-    let mut items = Vec::new();
-    let mut remaining = tokens;
-    loop {
-        if remaining.first().map(|s| s.as_str()) == Some(")") {
-            return Ok((items, &remaining[1..]));
-        }
-        let (expr, rest) = parse(remaining)?;
-        items.push(expr);
-        remaining = rest;
-    }
-}
-
-/// Parse tokens into S-expression ASTs.
-fn parse(tokens: &[String]) -> Result<(Expr, &[String]), EvalError> {
-    let [first, rest @ ..] = tokens else {
-        return Err(EvalError::Parse {
-            message: "unexpected end of input".to_string(),
-        });
-    };
-    if first == "(" {
-        let (items, remaining) = parse_list(rest)?;
-        Ok((Expr::List(items), remaining))
-    } else if first == ")" {
-        Err(EvalError::Parse {
-            message: "unexpected ')'".to_string(),
-        })
-    } else {
-        Ok((Expr::Atom(first.clone()), rest))
-    }
-}
-
-/// Parse all top-level expressions from token stream.
-fn parse_all(tokens: &[String]) -> Result<Vec<Expr>, EvalError> {
-    let mut exprs = Vec::new();
-    let mut remaining = tokens;
-    while !remaining.is_empty() {
-        let (expr, rest) = parse(remaining)?;
-        exprs.push(expr);
-        remaining = rest;
-    }
-    Ok(exprs)
-}
+use parser::{parse_all, tokenize};
 
 /// Parse an atom token into a Value.
 fn atom_to_value(token: &str) -> Result<Value, EvalError> {
@@ -150,16 +70,43 @@ fn atom_to_value(token: &str) -> Result<Value, EvalError> {
     Ok(Value::Symbol(token.to_string()))
 }
 
-/// Evaluate an expression.
-fn eval(expr: &Expr) -> Result<Value, EvalError> {
+/// Convert an Expr into a quoted Value (no evaluation).
+fn quote_expr(expr: &Expr) -> Result<Value, EvalError> {
     match expr {
         Expr::Atom(token) => atom_to_value(token),
-        Expr::List(items) => eval_list(items),
+        Expr::List(items) => {
+            let values: Vec<Value> = items.iter().map(quote_expr).collect::<Result<_, _>>()?;
+            Ok(Value::List(values))
+        }
+    }
+}
+
+/// Evaluate an expression in the given environment.
+fn eval(expr: &Expr, env: &mut Env) -> Result<Value, EvalError> {
+    match expr {
+        Expr::Atom(token) => {
+            // Try literal first, then variable lookup
+            if token.starts_with('"')
+                || token.parse::<i64>().is_ok()
+                || token == "#t"
+                || token == "#f"
+            {
+                atom_to_value(token)
+            } else if let Some(val) = env.get(token) {
+                Ok(val.clone())
+            } else {
+                // Return as symbol for now (unbound)
+                Err(EvalError::UnboundVariable {
+                    name: token.clone(),
+                })
+            }
+        }
+        Expr::List(items) => eval_list(items, env),
     }
 }
 
 /// Evaluate a list expression (function application or special form).
-fn eval_list(items: &[Expr]) -> Result<Value, EvalError> {
+fn eval_list(items: &[Expr], env: &mut Env) -> Result<Value, EvalError> {
     let [operator, args @ ..] = items else {
         return Err(EvalError::Parse {
             message: "empty list".to_string(),
@@ -171,10 +118,16 @@ fn eval_list(items: &[Expr]) -> Result<Value, EvalError> {
         });
     };
     match op.as_str() {
-        "and" => eval_and(args),
-        "or" => eval_or(args),
+        "define" => eval_define(args, env),
+        "if" => eval_if(args, env),
+        "quote" => eval_quote(args),
+        "and" => eval_and(args, env),
+        "or" => eval_or(args, env),
         _ => {
-            let evaluated: Vec<Value> = args.iter().map(eval).collect::<Result<_, _>>()?;
+            let evaluated: Vec<Value> = args
+                .iter()
+                .map(|a| eval(a, env))
+                .collect::<Result<_, _>>()?;
             apply_builtin(op, &evaluated)
         }
     }
@@ -199,11 +152,54 @@ fn apply_builtin(op: &str, args: &[Value]) -> Result<Value, EvalError> {
     }
 }
 
+/// Evaluate `(define name value)`.
+fn eval_define(args: &[Expr], env: &mut Env) -> Result<Value, EvalError> {
+    let [Expr::Atom(name), val_expr] = args else {
+        return Err(EvalError::Parse {
+            message: "define requires a name and a value".to_string(),
+        });
+    };
+    let val = eval(val_expr, env)?;
+    env.insert(name.clone(), val.clone());
+    Ok(val)
+}
+
+/// Evaluate `(if cond then else)`.
+fn eval_if(args: &[Expr], env: &mut Env) -> Result<Value, EvalError> {
+    let (cond, then_expr, else_expr) = match args {
+        [c, t, e] => (c, t, Some(e)),
+        [c, t] => (c, t, None),
+        _ => {
+            return Err(EvalError::Parse {
+                message: "if requires 2 or 3 arguments".to_string(),
+            })
+        }
+    };
+    let cond_val = eval(cond, env)?;
+    if cond_val != Value::Boolean(false) {
+        eval(then_expr, env)
+    } else if let Some(e) = else_expr {
+        eval(e, env)
+    } else {
+        Ok(Value::Nil)
+    }
+}
+
+/// Evaluate `(quote expr)`.
+fn eval_quote(args: &[Expr]) -> Result<Value, EvalError> {
+    let [expr] = args else {
+        return Err(EvalError::Parse {
+            message: "quote requires exactly 1 argument".to_string(),
+        });
+    };
+    quote_expr(expr)
+}
+
 /// Short-circuit `and`: returns last truthy value, or first falsy value.
-fn eval_and(args: &[Expr]) -> Result<Value, EvalError> {
+fn eval_and(args: &[Expr], env: &mut Env) -> Result<Value, EvalError> {
     let mut result = Value::Boolean(true);
     for arg in args {
-        result = eval(arg)?;
+        result = eval(arg, env)?;
         if result == Value::Boolean(false) {
             return Ok(result);
         }
@@ -212,10 +208,10 @@ fn eval_and(args: &[Expr]) -> Result<Value, EvalError> {
 }
 
 /// Short-circuit `or`: returns first truthy value, or last falsy value.
-fn eval_or(args: &[Expr]) -> Result<Value, EvalError> {
+fn eval_or(args: &[Expr], env: &mut Env) -> Result<Value, EvalError> {
     let mut result = Value::Boolean(false);
     for arg in args {
-        result = eval(arg)?;
+        result = eval(arg, env)?;
         if result != Value::Boolean(false) {
             return Ok(result);
         }
@@ -233,9 +229,10 @@ pub fn eval_str(input: &str) -> Result<String, EvalError> {
         });
     }
     let exprs = parse_all(&tokens)?;
+    let mut env = Env::new();
     let mut last = None;
     for expr in &exprs {
-        last = Some(eval(expr)?);
+        last = Some(eval(expr, &mut env)?);
     }
     Ok(last.expect("exprs is non-empty").to_string())
 }
