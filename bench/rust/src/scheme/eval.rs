@@ -39,6 +39,8 @@ pub struct InterpState {
     pub gensym_counter: u64,
     /// Stack of body frames currently being evaluated.
     pub body_stack: Vec<BodyFrame>,
+    /// Counter for generating unique record type IDs.
+    pub next_record_type_id: u64,
 }
 
 impl InterpState {
@@ -52,6 +54,7 @@ impl InterpState {
             current_expr_idx: 0,
             gensym_counter: 0,
             body_stack: Vec::new(),
+            next_record_type_id: 0,
         }
     }
 }
@@ -99,7 +102,8 @@ pub fn eval(expr: &Value, env: &Rc<RefCell<Env>>, out: &Output) -> Result<Value,
         match &current_expr {
             Value::Integer(_) | Value::Float(_) | Value::Rational(_, _)
             | Value::Boolean(_) | Value::Str(_) | Value::Char(_)
-            | Value::Void | Value::Vector(_) | Value::Pair(_, _) | Value::Values(_) => {
+            | Value::Void | Value::Vector(_) | Value::Pair(_, _) | Value::Values(_)
+            | Value::Record { .. } => {
                 return Ok(current_expr)
             }
             Value::Lambda { .. } | Value::Builtin(_) | Value::Continuation(_)
@@ -160,6 +164,10 @@ fn eval_list_tail(
             }
             "define-syntax" => {
                 return eval_define_syntax(&items[1..], env).map(TailAction::Return)
+            }
+            "define-record-type" => {
+                return eval_define_record_type(&items[1..], env, out)
+                    .map(TailAction::Return)
             }
             "guard" => return eval_guard(&items[1..], env, out),
             "raise" => return eval_raise(&items[1..], env, out).map(TailAction::Return),
@@ -909,6 +917,9 @@ fn is_builtin(name: &str) -> bool {
             | "exact?" | "inexact?" | "rational?" | "integer?"
             | "exact->inexact" | "inexact->exact"
             | "numerator" | "denominator"
+            | "__make-record-internal"
+            | "__record-predicate-internal"
+            | "__record-accessor-internal"
     )
 }
 
@@ -1010,10 +1021,123 @@ fn eval_builtin(
         "inexact->exact" => eval_inexact_to_exact(args, env, out),
         "numerator" => eval_numerator(args, env, out),
         "denominator" => eval_denominator(args, env, out),
+        "__make-record-internal" => eval_make_record_internal(args, env, out),
+        "__record-predicate-internal" => eval_record_predicate_internal(args, env, out),
+        "__record-accessor-internal" => eval_record_accessor_internal(args, env, out),
         _ => Err(EvalError::UnknownProcedure {
             name: name.into(),
         }),
     }
+}
+
+fn eval_make_record_internal(
+    args: &[Value],
+    env: &Rc<RefCell<Env>>,
+    out: &Output,
+) -> Result<Value, EvalError> {
+    // args: [type_id_literal, type_name_literal, field_name_str..., field_value_expr...]
+    // First arg is the type_id (integer literal), second is type_name (string literal)
+    // Then pairs of (field_name_str, field_value_expr)
+    if args.len() < 2 {
+        return Err(EvalError::Parse {
+            message: "__make-record-internal: bad args".into(),
+        });
+    }
+    let type_id = match eval(&args[0], env, out)? {
+        Value::Integer(n) => n as u64,
+        _ => {
+            return Err(EvalError::TypeError {
+                expected: "integer".into(),
+                got: "other".into(),
+            })
+        }
+    };
+    let Value::Str(type_name) = eval(&args[1], env, out)? else {
+        return Err(EvalError::TypeError {
+            expected: "string".into(),
+            got: "other".into(),
+        });
+    };
+    let remaining = &args[2..];
+    let n_fields = remaining.len() / 2;
+    let field_names = &remaining[..n_fields];
+    let field_values = &remaining[n_fields..];
+    let fields: Vec<(String, Value)> = field_names
+        .iter()
+        .zip(field_values)
+        .map(|(name_expr, val_expr)| {
+            let Value::Str(fname) = eval(name_expr, env, out)? else {
+                return Err(EvalError::TypeError {
+                    expected: "string".into(),
+                    got: "other".into(),
+                });
+            };
+            let val = eval(val_expr, env, out)?;
+            Ok((fname, val))
+        })
+        .collect::<Result<_, EvalError>>()?;
+    Ok(Value::Record {
+        type_id,
+        type_name,
+        fields,
+    })
+}
+
+fn eval_record_predicate_internal(
+    args: &[Value],
+    env: &Rc<RefCell<Env>>,
+    out: &Output,
+) -> Result<Value, EvalError> {
+    // args: [type_id_literal, value_expr]
+    let expected_id = match eval(&args[0], env, out)? {
+        Value::Integer(n) => n as u64,
+        _ => {
+            return Err(EvalError::TypeError {
+                expected: "integer".into(),
+                got: "other".into(),
+            })
+        }
+    };
+    let val = eval(&args[1], env, out)?;
+    let result = matches!(&val, Value::Record { type_id, .. } if *type_id == expected_id);
+    Ok(Value::Boolean(result))
+}
+
+fn eval_record_accessor_internal(
+    args: &[Value],
+    env: &Rc<RefCell<Env>>,
+    out: &Output,
+) -> Result<Value, EvalError> {
+    // args: [type_id_literal, field_name_str, value_expr]
+    let _expected_id = match eval(&args[0], env, out)? {
+        Value::Integer(n) => n as u64,
+        _ => {
+            return Err(EvalError::TypeError {
+                expected: "integer".into(),
+                got: "other".into(),
+            })
+        }
+    };
+    let Value::Str(field_name) = eval(&args[1], env, out)? else {
+        return Err(EvalError::TypeError {
+            expected: "string".into(),
+            got: "other".into(),
+        });
+    };
+    let record = eval(&args[2], env, out)?;
+    let Value::Record { fields, .. } = &record else {
+        return Err(EvalError::TypeError {
+            expected: "record".into(),
+            got: format!("{record}"),
+        });
+    };
+    fields
+        .iter()
+        .find_map(|(name, val)| (name == &field_name).then(|| val.clone()))
+        .ok_or_else(|| EvalError::TypeError {
+            expected: format!("field {field_name}"),
+            got: "not found".into(),
+        })
 }
 
 /// Evaluate a sequence of body expressions, returning the last.
@@ -1174,6 +1298,155 @@ fn eval_define_syntax(
         def_env: Rc::clone(env),
     };
     env.borrow_mut().define(name.clone(), macro_val);
+    Ok(Value::Void)
+}
+
+/// Implement R7RS `define-record-type`.
+/// Syntax: (define-record-type <name> (<constructor> <field-name> ...) <predicate> (<field-name> <accessor>) ...)
+fn eval_define_record_type(
+    args: &[Value],
+    env: &Rc<RefCell<Env>>,
+    out: &Output,
+) -> Result<Value, EvalError> {
+    // args: [<name>, (<constructor> <field-names>...), <predicate>, (<field> <accessor>)...]
+    if args.len() < 3 {
+        return Err(EvalError::Parse {
+            message: "define-record-type: expected at least type name, constructor, and predicate"
+                .into(),
+        });
+    }
+    let Value::Symbol(type_name) = &args[0] else {
+        return Err(EvalError::Parse {
+            message: "define-record-type: expected type name symbol".into(),
+        });
+    };
+    let Value::List(ctor_form) = &args[1] else {
+        return Err(EvalError::Parse {
+            message: "define-record-type: expected constructor form".into(),
+        });
+    };
+    if ctor_form.is_empty() {
+        return Err(EvalError::Parse {
+            message: "define-record-type: constructor form must have a name".into(),
+        });
+    }
+    let Value::Symbol(ctor_name) = &ctor_form[0] else {
+        return Err(EvalError::Parse {
+            message: "define-record-type: constructor name must be a symbol".into(),
+        });
+    };
+    let ctor_fields: Vec<String> = ctor_form[1..]
+        .iter()
+        .map(|v| match v {
+            Value::Symbol(s) => Ok(s.clone()),
+            _ => Err(EvalError::Parse {
+                message: "define-record-type: constructor field must be a symbol".into(),
+            }),
+        })
+        .collect::<Result<_, _>>()?;
+
+    let Value::Symbol(pred_name) = &args[2] else {
+        return Err(EvalError::Parse {
+            message: "define-record-type: predicate must be a symbol".into(),
+        });
+    };
+
+    // Parse field specs: (<field-name> <accessor-name>)
+    let field_specs: Vec<(String, String)> = args[3..]
+        .iter()
+        .map(|spec| {
+            let Value::List(parts) = spec else {
+                return Err(EvalError::Parse {
+                    message: "define-record-type: field spec must be a list".into(),
+                });
+            };
+            if parts.len() < 2 {
+                return Err(EvalError::Parse {
+                    message: "define-record-type: field spec must have name and accessor".into(),
+                });
+            }
+            let Value::Symbol(fname) = &parts[0] else {
+                return Err(EvalError::Parse {
+                    message: "define-record-type: field name must be a symbol".into(),
+                });
+            };
+            let Value::Symbol(accessor) = &parts[1] else {
+                return Err(EvalError::Parse {
+                    message: "define-record-type: accessor must be a symbol".into(),
+                });
+            };
+            Ok((fname.clone(), accessor.clone()))
+        })
+        .collect::<Result<_, _>>()?;
+
+    // Allocate unique type ID
+    let type_id = {
+        let mut st = out.borrow_mut();
+        let id = st.next_record_type_id;
+        st.next_record_type_id += 1;
+        id
+    };
+
+    let type_name_owned = type_name.clone();
+
+    // Define constructor as a lambda that calls internal record-creation builtin
+    {
+        let params = ctor_fields.clone();
+        let mut body_list = vec![
+            Value::Symbol("__make-record-internal".into()),
+            Value::Integer(type_id as i64),
+            Value::Str(type_name_owned.clone()),
+        ];
+        // Add field names as strings
+        for fname in &ctor_fields {
+            body_list.push(Value::Str(fname.clone()));
+        }
+        // Add field value references
+        for fname in &ctor_fields {
+            body_list.push(Value::Symbol(fname.clone()));
+        }
+        let body = vec![Value::List(body_list)];
+        let ctor_val = Value::Lambda {
+            params,
+            rest_param: None,
+            body,
+            closure: Rc::clone(env),
+        };
+        env.borrow_mut().define(ctor_name.clone(), ctor_val);
+    }
+
+    // Predicate lambda: (lambda (x) (__record-predicate-internal type_id x))
+    {
+        let pred_val = Value::Lambda {
+            params: vec!["__x".into()],
+            rest_param: None,
+            body: vec![Value::List(vec![
+                Value::Symbol("__record-predicate-internal".into()),
+                Value::Integer(type_id as i64),
+                Value::Symbol("__x".into()),
+            ])],
+            closure: Rc::clone(env),
+        };
+        env.borrow_mut().define(pred_name.clone(), pred_val);
+    }
+
+    // Accessor lambdas
+    for (field_name, accessor_name) in &field_specs {
+        let acc_val = Value::Lambda {
+            params: vec!["__x".into()],
+            rest_param: None,
+            body: vec![Value::List(vec![
+                Value::Symbol("__record-accessor-internal".into()),
+                Value::Integer(type_id as i64),
+                Value::Str(field_name.clone()),
+                Value::Symbol("__x".into()),
+            ])],
+            closure: Rc::clone(env),
+        };
+        env.borrow_mut()
+            .define(accessor_name.clone(), acc_val);
+    }
+
     Ok(Value::Void)
 }
 

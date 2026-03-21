@@ -34,6 +34,12 @@ pub enum Value {
     Void,
     /// Multiple return values from `(values ...)`.
     Values(Vec<Value>),
+    /// Record instance: (type_id, type_name, field_names, field_values).
+    Record {
+        type_id: u64,
+        type_name: String,
+        fields: Vec<(String, Value)>,
+    },
 }
 
 impl PartialEq for Value {
@@ -54,6 +60,7 @@ impl PartialEq for Value {
             (Value::Macro { .. }, Value::Macro { .. }) => false,
             (Value::Values(a), Value::Values(b)) => a == b,
             (Value::Void, Value::Void) => true,
+            (Value::Record { type_id: a, .. }, Value::Record { type_id: b, .. }) => a == b,
             _ => false,
         }
     }
@@ -163,6 +170,12 @@ impl Value {
             (Value::Values(a), Value::Values(b)) => {
                 a.len() == b.len() && a.iter().zip(b).all(|(x, y)| x.deep_equal(y))
             }
+            (Value::Record { type_id: a_id, fields: a_fields, .. },
+             Value::Record { type_id: b_id, fields: b_fields, .. }) => {
+                a_id == b_id
+                    && a_fields.len() == b_fields.len()
+                    && a_fields.iter().zip(b_fields).all(|((_, av), (_, bv))| av.deep_equal(bv))
+            }
             (Value::Void, Value::Void) => true,
             _ => false,
         }
@@ -192,6 +205,7 @@ impl fmt::Display for Value {
             | Value::Macro { .. } => {
                 write!(f, "#<procedure>")
             }
+            Value::Record { type_name, .. } => write!(f, "#<record:{type_name}>"),
             Value::Void => write!(f, "#<void>"),
             Value::Values(vals) => write_values(f, vals),
         }
