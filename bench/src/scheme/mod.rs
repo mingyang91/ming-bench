@@ -335,250 +335,319 @@ pub fn eval_str(input: &str) -> Result<String, EvalError> {
     Ok(result.display())
 }
 
-fn eval(expr: Value, env: &Env, pos: Pos) -> Result<Value, EvalError> {
-    match expr {
-        Value::Integer(_) | Value::Boolean(_) | Value::Str(_) | Value::Char(_) | Value::Lambda { .. } => Ok(expr),
-        Value::Symbol(s) => {
-            env_get(env, &s).ok_or_else(|| runtime_err(pos, format!("unbound symbol: {}", s)))
-        }
-        Value::List(elems) => {
-            if elems.is_empty() {
-                return Err(runtime_err(pos, "empty application"));
+fn eval(mut expr: Value, env: &Env, pos: Pos) -> Result<Value, EvalError> {
+    let mut current_env = env.clone();
+    let current_pos = pos;
+
+    loop {
+        let current = std::mem::replace(&mut expr, Value::Boolean(false));
+        match current {
+            Value::Integer(_) | Value::Boolean(_) | Value::Str(_) | Value::Char(_) | Value::Lambda { .. } => return Ok(current),
+            Value::Symbol(s) => {
+                return env_get(&current_env, &s).ok_or_else(|| runtime_err(current_pos, format!("unbound symbol: {}", s)));
             }
-            let first = &elems[0];
-            match first {
-                Value::Symbol(op) => match op.as_str() {
-                    "define" => {
-                        if elems.len() < 3 {
-                            return Err(runtime_err(pos, "define requires 2 arguments"));
-                        }
-                        // Shorthand: (define (f x) body) => (define f (lambda (x) body))
-                        match &elems[1] {
-                            Value::Symbol(name) => {
-                                let val = eval(elems[2].clone(), env, pos)?;
-                                env_set(env, name.clone(), val.clone());
-                                Ok(val)
+            Value::List(elems) => {
+                if elems.is_empty() {
+                    return Err(runtime_err(current_pos, "empty application"));
+                }
+                let first = &elems[0];
+                match first {
+                    Value::Symbol(op) => match op.as_str() {
+                        "define" => {
+                            if elems.len() < 3 {
+                                return Err(runtime_err(current_pos, "define requires 2 arguments"));
                             }
-                            Value::List(sig) => {
-                                if sig.is_empty() {
-                                    return Err(runtime_err(pos, "define: empty signature"));
+                            match &elems[1] {
+                                Value::Symbol(name) => {
+                                    let val = eval(elems[2].clone(), &current_env, current_pos)?;
+                                    env_set(&current_env, name.clone(), val.clone());
+                                    return Ok(val);
                                 }
-                                let name = match &sig[0] {
-                                    Value::Symbol(s) => s.clone(),
-                                    _ => {
-                                        return Err(runtime_err(pos, "define: expected symbol"))
+                                Value::List(sig) => {
+                                    if sig.is_empty() {
+                                        return Err(runtime_err(current_pos, "define: empty signature"));
                                     }
-                                };
-                                let params: Result<Vec<String>, _> = sig[1..]
-                                    .iter()
-                                    .map(|v| match v {
-                                        Value::Symbol(s) => Ok(s.clone()),
-                                        _ => Err(runtime_err(
-                                            pos,
-                                            "define: expected symbol in params",
-                                        )),
-                                    })
-                                    .collect();
-                                let lambda = Value::Lambda {
-                                    params: params?,
-                                    body: elems[2..].to_vec(),
-                                    env: env.clone(),
-                                };
-                                env_set(env, name, lambda.clone());
-                                Ok(lambda)
-                            }
-                            _ => Err(runtime_err(
-                                pos,
-                                "define: first argument must be a symbol or list",
-                            )),
-                        }
-                    }
-                    "lambda" => {
-                        if elems.len() < 3 {
-                            return Err(runtime_err(
-                                pos,
-                                "lambda requires at least 2 arguments",
-                            ));
-                        }
-                        let params = match &elems[1] {
-                            Value::List(ps) => {
-                                let mut names = Vec::new();
-                                for p in ps {
-                                    match p {
-                                        Value::Symbol(s) => names.push(s.clone()),
+                                    let name = match &sig[0] {
+                                        Value::Symbol(s) => s.clone(),
                                         _ => {
-                                            return Err(runtime_err(
-                                                pos,
-                                                "lambda: expected symbol in params",
-                                            ))
+                                            return Err(runtime_err(current_pos, "define: expected symbol"))
+                                        }
+                                    };
+                                    let params: Result<Vec<String>, _> = sig[1..]
+                                        .iter()
+                                        .map(|v| match v {
+                                            Value::Symbol(s) => Ok(s.clone()),
+                                            _ => Err(runtime_err(
+                                                current_pos,
+                                                "define: expected symbol in params",
+                                            )),
+                                        })
+                                        .collect();
+                                    let lambda = Value::Lambda {
+                                        params: params?,
+                                        body: elems[2..].to_vec(),
+                                        env: current_env.clone(),
+                                    };
+                                    env_set(&current_env, name, lambda.clone());
+                                    return Ok(lambda);
+                                }
+                                _ => return Err(runtime_err(
+                                    current_pos,
+                                    "define: first argument must be a symbol or list",
+                                )),
+                            }
+                        }
+                        "lambda" => {
+                            if elems.len() < 3 {
+                                return Err(runtime_err(
+                                    current_pos,
+                                    "lambda requires at least 2 arguments",
+                                ));
+                            }
+                            let params = match &elems[1] {
+                                Value::List(ps) => {
+                                    let mut names = Vec::new();
+                                    for p in ps {
+                                        match p {
+                                            Value::Symbol(s) => names.push(s.clone()),
+                                            _ => {
+                                                return Err(runtime_err(
+                                                    current_pos,
+                                                    "lambda: expected symbol in params",
+                                                ))
+                                            }
                                         }
                                     }
+                                    names
                                 }
-                                names
+                                _ => {
+                                    return Err(runtime_err(
+                                        current_pos,
+                                        "lambda: expected parameter list",
+                                    ))
+                                }
+                            };
+                            return Ok(Value::Lambda {
+                                params,
+                                body: elems[2..].to_vec(),
+                                env: current_env.clone(),
+                            });
+                        }
+                        "if" => {
+                            if elems.len() < 3 || elems.len() > 4 {
+                                return Err(runtime_err(current_pos, "if requires 2 or 3 arguments"));
                             }
-                            _ => {
-                                return Err(runtime_err(
-                                    pos,
-                                    "lambda: expected parameter list",
-                                ))
-                            }
-                        };
-                        Ok(Value::Lambda {
-                            params,
-                            body: elems[2..].to_vec(),
-                            env: env.clone(),
-                        })
-                    }
-                    "if" => {
-                        if elems.len() < 3 || elems.len() > 4 {
-                            return Err(runtime_err(pos, "if requires 2 or 3 arguments"));
-                        }
-                        let cond = eval(elems[1].clone(), env, pos)?;
-                        if cond != Value::Boolean(false) {
-                            eval(elems[2].clone(), env, pos)
-                        } else if elems.len() == 4 {
-                            eval(elems[3].clone(), env, pos)
-                        } else {
-                            Ok(Value::Boolean(false))
-                        }
-                    }
-                    "quote" => {
-                        if elems.len() != 2 {
-                            return Err(runtime_err(pos, "quote requires 1 argument"));
-                        }
-                        Ok(elems[1].clone())
-                    }
-                    "and" => {
-                        let mut result = Value::Boolean(true);
-                        for arg in &elems[1..] {
-                            result = eval(arg.clone(), env, pos)?;
-                            if result == Value::Boolean(false) {
+                            let cond = eval(elems[1].clone(), &current_env, current_pos)?;
+                            if cond != Value::Boolean(false) {
+                                // TCO: tail position
+                                expr = elems[2].clone();
+                                continue;
+                            } else if elems.len() == 4 {
+                                expr = elems[3].clone();
+                                continue;
+                            } else {
                                 return Ok(Value::Boolean(false));
                             }
                         }
-                        Ok(result)
-                    }
-                    "or" => {
-                        for arg in &elems[1..] {
-                            let result = eval(arg.clone(), env, pos)?;
-                            if result != Value::Boolean(false) {
-                                return Ok(result);
+                        "quote" => {
+                            if elems.len() != 2 {
+                                return Err(runtime_err(current_pos, "quote requires 1 argument"));
+                            }
+                            return Ok(elems[1].clone());
+                        }
+                        "and" => {
+                            if elems.len() <= 1 {
+                                return Ok(Value::Boolean(true));
+                            }
+                            for arg in &elems[1..elems.len() - 1] {
+                                let result = eval(arg.clone(), &current_env, current_pos)?;
+                                if result == Value::Boolean(false) {
+                                    return Ok(Value::Boolean(false));
+                                }
+                            }
+                            // TCO: last arg is tail position
+                            expr = elems.last().unwrap().clone();
+                            continue;
+                        }
+                        "or" => {
+                            if elems.len() <= 1 {
+                                return Ok(Value::Boolean(false));
+                            }
+                            for arg in &elems[1..elems.len() - 1] {
+                                let result = eval(arg.clone(), &current_env, current_pos)?;
+                                if result != Value::Boolean(false) {
+                                    return Ok(result);
+                                }
+                            }
+                            expr = elems.last().unwrap().clone();
+                            continue;
+                        }
+                        "begin" => {
+                            if elems.len() <= 1 {
+                                return Ok(Value::Boolean(false));
+                            }
+                            for e in &elems[1..elems.len() - 1] {
+                                eval(e.clone(), &current_env, current_pos)?;
+                            }
+                            // TCO: last expr is tail position
+                            expr = elems.last().unwrap().clone();
+                            continue;
+                        }
+                        "let" => {
+                            if elems.len() < 3 {
+                                return Err(runtime_err(current_pos, "let requires bindings and body"));
+                            }
+                            let bindings = match &elems[1] {
+                                Value::List(bs) => bs,
+                                _ => {
+                                    return Err(runtime_err(current_pos, "let: expected bindings list"))
+                                }
+                            };
+                            let let_env = new_env(Some(current_env.clone()));
+                            for b in bindings {
+                                match b {
+                                    Value::List(pair) if pair.len() == 2 => {
+                                        let name = match &pair[0] {
+                                            Value::Symbol(s) => s.clone(),
+                                            _ => {
+                                                return Err(runtime_err(
+                                                    current_pos,
+                                                    "let: expected symbol",
+                                                ))
+                                            }
+                                        };
+                                        let val = eval(pair[1].clone(), &current_env, current_pos)?;
+                                        env_set(&let_env, name, val);
+                                    }
+                                    _ => {
+                                        return Err(runtime_err(current_pos, "let: invalid binding"))
+                                    }
+                                }
+                            }
+                            // Eval all but last, then TCO on last
+                            for e in &elems[2..elems.len() - 1] {
+                                eval(e.clone(), &let_env, current_pos)?;
+                            }
+                            expr = elems.last().unwrap().clone();
+                            current_env = let_env;
+                            continue;
+                        }
+                        "cond" => {
+                            let mut found = false;
+                            for clause in &elems[1..] {
+                                match clause {
+                                    Value::List(parts) if parts.len() >= 2 => {
+                                        if parts[0] == Value::Symbol("else".to_string()) {
+                                            for e in &parts[1..parts.len() - 1] {
+                                                eval(e.clone(), &current_env, current_pos)?;
+                                            }
+                                            expr = parts.last().unwrap().clone();
+                                            found = true;
+                                            break;
+                                        }
+                                        let test = eval(parts[0].clone(), &current_env, current_pos)?;
+                                        if test != Value::Boolean(false) {
+                                            for e in &parts[1..parts.len() - 1] {
+                                                eval(e.clone(), &current_env, current_pos)?;
+                                            }
+                                            expr = parts.last().unwrap().clone();
+                                            found = true;
+                                            break;
+                                        }
+                                    }
+                                    _ => {
+                                        return Err(runtime_err(current_pos, "cond: invalid clause"))
+                                    }
+                                }
+                            }
+                            if found {
+                                continue;
+                            }
+                            return Ok(Value::Boolean(false));
+                        }
+                        "string-set!" => {
+                            return Err(runtime_err(current_pos, "string-set!: strings are immutable"));
+                        }
+                        "map" => {
+                            if elems.len() != 3 {
+                                return Err(runtime_err(current_pos, "map requires 2 arguments"));
+                            }
+                            let func = eval(elems[1].clone(), &current_env, current_pos)?;
+                            let lst = eval(elems[2].clone(), &current_env, current_pos)?;
+                            match lst {
+                                Value::List(items) => {
+                                    let mut results = Vec::new();
+                                    for item in &items {
+                                        results.push(apply_proc(&func, "map", &[item.clone()], &current_env, current_pos)?);
+                                    }
+                                    return Ok(Value::List(results));
+                                }
+                                _ => return Err(runtime_err(current_pos, "map: second argument must be a list")),
                             }
                         }
-                        Ok(Value::Boolean(false))
-                    }
-                    "begin" => {
-                        let mut result = Value::Boolean(false);
-                        for expr in &elems[1..] {
-                            result = eval(expr.clone(), env, pos)?;
-                        }
-                        Ok(result)
-                    }
-                    "let" => {
-                        if elems.len() < 3 {
-                            return Err(runtime_err(pos, "let requires bindings and body"));
-                        }
-                        let bindings = match &elems[1] {
-                            Value::List(bs) => bs,
-                            _ => {
-                                return Err(runtime_err(pos, "let: expected bindings list"))
+                        _ => {
+                            let mut args = Vec::new();
+                            for arg in &elems[1..] {
+                                args.push(eval(arg.clone(), &current_env, current_pos)?);
                             }
-                        };
-                        let let_env = new_env(Some(env.clone()));
-                        for b in bindings {
-                            match b {
-                                Value::List(pair) if pair.len() == 2 => {
-                                    let name = match &pair[0] {
-                                        Value::Symbol(s) => s.clone(),
-                                        _ => {
+                            // Try as variable (user-defined procedure) first, then builtin
+                            if let Some(proc) = env_get(&current_env, op) {
+                                match proc {
+                                    Value::Lambda { params, body, env: closure_env } => {
+                                        if args.len() != params.len() {
                                             return Err(runtime_err(
-                                                pos,
-                                                "let: expected symbol",
-                                            ))
+                                                current_pos,
+                                                format!("{}: expected {} arguments, got {}", op, params.len(), args.len()),
+                                            ));
                                         }
-                                    };
-                                    let val = eval(pair[1].clone(), env, pos)?;
-                                    env_set(&let_env, name, val);
-                                }
-                                _ => {
-                                    return Err(runtime_err(pos, "let: invalid binding"))
-                                }
-                            }
-                        }
-                        let mut result = Value::Boolean(false);
-                        for expr in &elems[2..] {
-                            result = eval(expr.clone(), &let_env, pos)?;
-                        }
-                        Ok(result)
-                    }
-                    "cond" => {
-                        for clause in &elems[1..] {
-                            match clause {
-                                Value::List(parts) if parts.len() >= 2 => {
-                                    if parts[0] == Value::Symbol("else".to_string()) {
-                                        let mut result = Value::Boolean(false);
-                                        for expr in &parts[1..] {
-                                            result = eval(expr.clone(), env, pos)?;
+                                        let call_env = new_env(Some(closure_env));
+                                        for (param, arg) in params.iter().zip(args.iter()) {
+                                            env_set(&call_env, param.clone(), arg.clone());
                                         }
-                                        return Ok(result);
+                                        // Eval all but last body expr, then TCO on last
+                                        for e in &body[..body.len().saturating_sub(1)] {
+                                            eval(e.clone(), &call_env, current_pos)?;
+                                        }
+                                        expr = body.last().cloned().unwrap_or(Value::Boolean(false));
+                                        current_env = call_env;
+                                        continue;
                                     }
-                                    let test = eval(parts[0].clone(), env, pos)?;
-                                    if test != Value::Boolean(false) {
-                                        let mut result = Value::Boolean(false);
-                                        for expr in &parts[1..] {
-                                            result = eval(expr.clone(), env, pos)?;
-                                        }
-                                        return Ok(result);
-                                    }
+                                    _ => return Err(runtime_err(current_pos, format!("{} is not a procedure", op))),
                                 }
-                                _ => {
-                                    return Err(runtime_err(pos, "cond: invalid clause"))
-                                }
+                            } else {
+                                return apply_builtin_vals(op, &args, current_pos);
                             }
                         }
-                        Ok(Value::Boolean(false))
-                    }
-                    "string-set!" => {
-                        Err(runtime_err(pos, "string-set!: strings are immutable"))
-                    }
-                    "map" => {
-                        if elems.len() != 3 {
-                            return Err(runtime_err(pos, "map requires 2 arguments"));
-                        }
-                        let func = eval(elems[1].clone(), env, pos)?;
-                        let lst = eval(elems[2].clone(), env, pos)?;
-                        match lst {
-                            Value::List(items) => {
-                                let mut results = Vec::new();
-                                for item in &items {
-                                    results.push(apply_proc(&func, "map", &[item.clone()], env, pos)?);
-                                }
-                                Ok(Value::List(results))
-                            }
-                            _ => Err(runtime_err(pos, "map: second argument must be a list")),
-                        }
-                    }
+                    },
                     _ => {
+                        // Evaluate the operator position (e.g., ((lambda ...) args))
+                        let proc = eval(elems[0].clone(), &current_env, current_pos)?;
                         let mut args = Vec::new();
                         for arg in &elems[1..] {
-                            args.push(eval(arg.clone(), env, pos)?);
+                            args.push(eval(arg.clone(), &current_env, current_pos)?);
                         }
-                        // Try as variable (user-defined procedure) first, then builtin
-                        if let Some(proc) = env_get(env, op) {
-                            apply_proc(&proc, op, &args, env, pos)
-                        } else {
-                            apply_builtin_vals(op, &args, pos)
+                        match proc {
+                            Value::Lambda { params, body, env: closure_env } => {
+                                if args.len() != params.len() {
+                                    return Err(runtime_err(
+                                        current_pos,
+                                        format!("<anonymous>: expected {} arguments, got {}", params.len(), args.len()),
+                                    ));
+                                }
+                                let call_env = new_env(Some(closure_env));
+                                for (param, arg) in params.iter().zip(args.iter()) {
+                                    env_set(&call_env, param.clone(), arg.clone());
+                                }
+                                for e in &body[..body.len().saturating_sub(1)] {
+                                    eval(e.clone(), &call_env, current_pos)?;
+                                }
+                                expr = body.last().cloned().unwrap_or(Value::Boolean(false));
+                                current_env = call_env;
+                                continue;
+                            }
+                            _ => return Err(runtime_err(current_pos, format!("<anonymous> is not a procedure"))),
                         }
                     }
-                },
-                _ => {
-                    // Evaluate the operator position (e.g., ((lambda ...) args))
-                    let proc = eval(elems[0].clone(), env, pos)?;
-                    let mut args = Vec::new();
-                    for arg in &elems[1..] {
-                        args.push(eval(arg.clone(), env, pos)?);
-                    }
-                    apply_proc(&proc, "<anonymous>", &args, env, pos)
                 }
             }
         }
