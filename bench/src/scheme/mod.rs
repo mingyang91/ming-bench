@@ -238,7 +238,12 @@ fn eval(expr: &Value, env: &Env) -> Result<Value, EvalError> {
                     "lambda" => return eval_lambda(&elems[1..], env),
                     "and" => return eval_and(&elems[1..], env),
                     "or" => return eval_or(&elems[1..], env),
-                    "+" | "-" | "*" | "/" | "<" | ">" | "=" | "<=" | ">=" | "not" => {
+                    "let" => return eval_let(&elems[1..], env),
+                    "begin" => return eval_begin(&elems[1..], env),
+                    "cond" => return eval_cond(&elems[1..], env),
+                    "+" | "-" | "*" | "/" | "<" | ">" | "=" | "<=" | ">="
+                    | "not" | "cons" | "car" | "cdr" | "null?" | "list" | "length"
+                    | "string?" | "number?" | "boolean?" | "pair?" | "symbol?" => {
                         return eval_builtin(op, &elems[1..], env);
                     }
                     _ => {}
@@ -408,6 +413,96 @@ fn eval_builtin(op: &str, args: &[Value], env: &Env) -> Result<Value, EvalError>
             let val = eval(&args[0], env)?;
             Ok(Value::Boolean(!val.is_truthy()))
         }
+        "cons" => {
+            if args.len() != 2 {
+                return Err(EvalError::WrongArgCount { expected: "2".into(), got: args.len() });
+            }
+            let head = eval(&args[0], env)?;
+            let tail = eval(&args[1], env)?;
+            match tail {
+                Value::List(mut elems) => {
+                    elems.insert(0, head);
+                    Ok(Value::List(elems))
+                }
+                _ => Err(EvalError::TypeError("cons: second argument must be a list".into())),
+            }
+        }
+        "car" => {
+            if args.len() != 1 {
+                return Err(EvalError::WrongArgCount { expected: "1".into(), got: args.len() });
+            }
+            let val = eval(&args[0], env)?;
+            match val {
+                Value::List(elems) if !elems.is_empty() => Ok(elems[0].clone()),
+                _ => Err(EvalError::TypeError("car: expected non-empty list".into())),
+            }
+        }
+        "cdr" => {
+            if args.len() != 1 {
+                return Err(EvalError::WrongArgCount { expected: "1".into(), got: args.len() });
+            }
+            let val = eval(&args[0], env)?;
+            match val {
+                Value::List(elems) if !elems.is_empty() => Ok(Value::List(elems[1..].to_vec())),
+                _ => Err(EvalError::TypeError("cdr: expected non-empty list".into())),
+            }
+        }
+        "null?" => {
+            if args.len() != 1 {
+                return Err(EvalError::WrongArgCount { expected: "1".into(), got: args.len() });
+            }
+            let val = eval(&args[0], env)?;
+            Ok(Value::Boolean(matches!(val, Value::List(ref e) if e.is_empty())))
+        }
+        "list" => {
+            let vals: Vec<Value> = args.iter().map(|a| eval(a, env)).collect::<Result<_, _>>()?;
+            Ok(Value::List(vals))
+        }
+        "length" => {
+            if args.len() != 1 {
+                return Err(EvalError::WrongArgCount { expected: "1".into(), got: args.len() });
+            }
+            let val = eval(&args[0], env)?;
+            match val {
+                Value::List(elems) => Ok(Value::Integer(elems.len() as i64)),
+                _ => Err(EvalError::TypeError("length: expected list".into())),
+            }
+        }
+        "string?" => {
+            if args.len() != 1 {
+                return Err(EvalError::WrongArgCount { expected: "1".into(), got: args.len() });
+            }
+            let val = eval(&args[0], env)?;
+            Ok(Value::Boolean(matches!(val, Value::Str(_))))
+        }
+        "number?" => {
+            if args.len() != 1 {
+                return Err(EvalError::WrongArgCount { expected: "1".into(), got: args.len() });
+            }
+            let val = eval(&args[0], env)?;
+            Ok(Value::Boolean(matches!(val, Value::Integer(_))))
+        }
+        "boolean?" => {
+            if args.len() != 1 {
+                return Err(EvalError::WrongArgCount { expected: "1".into(), got: args.len() });
+            }
+            let val = eval(&args[0], env)?;
+            Ok(Value::Boolean(matches!(val, Value::Boolean(_))))
+        }
+        "pair?" => {
+            if args.len() != 1 {
+                return Err(EvalError::WrongArgCount { expected: "1".into(), got: args.len() });
+            }
+            let val = eval(&args[0], env)?;
+            Ok(Value::Boolean(matches!(val, Value::List(ref e) if !e.is_empty())))
+        }
+        "symbol?" => {
+            if args.len() != 1 {
+                return Err(EvalError::WrongArgCount { expected: "1".into(), got: args.len() });
+            }
+            let val = eval(&args[0], env)?;
+            Ok(Value::Boolean(matches!(val, Value::Symbol(_))))
+        }
         _ => Err(EvalError::UnboundVariable(op.to_string())),
     }
 }
@@ -438,6 +533,69 @@ fn eval_or(args: &[Value], env: &Env) -> Result<Value, EvalError> {
         }
     }
     Ok(result)
+}
+
+fn eval_let(args: &[Value], env: &Env) -> Result<Value, EvalError> {
+    if args.len() < 2 {
+        return Err(EvalError::Parse("let: expected bindings and body".into()));
+    }
+    let bindings = match &args[0] {
+        Value::List(b) => b,
+        _ => return Err(EvalError::Parse("let: expected bindings list".into())),
+    };
+    let local_env = new_env(Some(env.clone()));
+    for binding in bindings {
+        match binding {
+            Value::List(pair) if pair.len() == 2 => {
+                let name = match &pair[0] {
+                    Value::Symbol(s) => s.clone(),
+                    _ => return Err(EvalError::Parse("let: expected symbol in binding".into())),
+                };
+                let val = eval(&pair[1], env)?;
+                env_set(&local_env, name, val);
+            }
+            _ => return Err(EvalError::Parse("let: invalid binding".into())),
+        }
+    }
+    let mut result = Value::Void;
+    for expr in &args[1..] {
+        result = eval(expr, &local_env)?;
+    }
+    Ok(result)
+}
+
+fn eval_begin(args: &[Value], env: &Env) -> Result<Value, EvalError> {
+    let mut result = Value::Void;
+    for expr in args {
+        result = eval(expr, env)?;
+    }
+    Ok(result)
+}
+
+fn eval_cond(args: &[Value], env: &Env) -> Result<Value, EvalError> {
+    for clause in args {
+        match clause {
+            Value::List(elems) if elems.len() >= 2 => {
+                if matches!(&elems[0], Value::Symbol(s) if s == "else") {
+                    let mut result = Value::Void;
+                    for expr in &elems[1..] {
+                        result = eval(expr, env)?;
+                    }
+                    return Ok(result);
+                }
+                let test = eval(&elems[0], env)?;
+                if test.is_truthy() {
+                    let mut result = Value::Void;
+                    for expr in &elems[1..] {
+                        result = eval(expr, env)?;
+                    }
+                    return Ok(result);
+                }
+            }
+            _ => return Err(EvalError::Parse("cond: invalid clause".into())),
+        }
+    }
+    Ok(Value::Void)
 }
 
 fn compare_op(args: &[Value], env: &Env, cmp: fn(i64, i64) -> bool) -> Result<Value, EvalError> {
