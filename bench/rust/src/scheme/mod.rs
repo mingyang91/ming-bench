@@ -802,6 +802,20 @@ struct LetForm<'a> {
     body: &'a [Expr],
 }
 
+struct DoForm<'a> {
+    bindings: Vec<DoBinding<'a>>,
+    test: &'a Expr,
+    result_exprs: &'a [Expr],
+    body: &'a [Expr],
+}
+
+struct DoBinding<'a> {
+    name: String,
+    name_pos: SourcePos,
+    init: &'a Expr,
+    step: Option<&'a Expr>,
+}
+
 #[derive(Debug, Clone, Copy)]
 enum RecursiveBindingMode {
     Parallel,
@@ -1052,12 +1066,8 @@ fn run_machine(exprs: &[Expr], env: EnvRef, ctx: &mut EvalContext) -> Result<Val
                 }
                 Value::Builtin(Builtin::CallWithValues) => {
                     if args.len() != 2 {
-                        return Err(wrong_arg_count(
-                            "call-with-values",
-                            "exactly 2",
-                            args.len(),
-                        )
-                        .with_position(pos));
+                        return Err(wrong_arg_count("call-with-values", "exactly 2", args.len())
+                            .with_position(pos));
                     }
 
                     control = MachineControl::Apply {
@@ -1803,6 +1813,10 @@ fn schedule_list_eval(
                 }),
             ))
         }
+        ExprKind::Symbol(name) if name == "do" => Ok((
+            MachineControl::Expr(expand_do_form(args, pos, ctx)?, env),
+            next,
+        )),
         ExprKind::Symbol(name) if name == "let" => schedule_let(args, pos, env, next),
         ExprKind::Symbol(name) if name == "letrec" => Ok((
             MachineControl::Value(eval_letrec(
@@ -2233,6 +2247,7 @@ fn eval_list(
         ExprKind::Symbol(name) if name == "or" => eval_or(args, env, ctx),
         ExprKind::Symbol(name) if name == "if" => eval_if(args, env, ctx),
         ExprKind::Symbol(name) if name == "let" => eval_let(args, pos, env, ctx),
+        ExprKind::Symbol(name) if name == "do" => eval_do(args, pos, env, ctx),
         ExprKind::Symbol(name) if name == "letrec" => {
             eval_letrec(args, "letrec", RecursiveBindingMode::Parallel, env, ctx)
         }
@@ -2304,6 +2319,7 @@ fn eval_tail_list(
         ExprKind::Symbol(name) if name == "or" => eval_tail_or(args, env, ctx),
         ExprKind::Symbol(name) if name == "if" => eval_tail_if(args, env, ctx),
         ExprKind::Symbol(name) if name == "let" => eval_tail_let(args, pos, env, ctx),
+        ExprKind::Symbol(name) if name == "do" => eval_tail_do(args, pos, env, ctx),
         ExprKind::Symbol(name) if name == "letrec" => {
             eval_tail_letrec(args, "letrec", RecursiveBindingMode::Parallel, env, ctx)
         }
@@ -2318,9 +2334,7 @@ fn eval_tail_list(
             eval_syntax(args, env).map(TailOutcome::Value)
         }
         ExprKind::Symbol(name) if name == "syntax-case" => eval_tail_syntax_case(args, env, ctx),
-        ExprKind::Symbol(name) if name == "with-syntax" => {
-            eval_tail_with_syntax(args, env, ctx)
-        }
+        ExprKind::Symbol(name) if name == "with-syntax" => eval_tail_with_syntax(args, env, ctx),
         ExprKind::Symbol(name) if name == "define" => {
             eval_define(args, env, ctx).map(TailOutcome::Value)
         }
@@ -2502,6 +2516,26 @@ fn eval_let(
             eval_sequence(form.body, local_env, ctx)
         }
     }
+}
+
+fn eval_do(
+    args: &[Expr],
+    pos: SourcePos,
+    env: EnvRef,
+    ctx: &mut EvalContext,
+) -> Result<Value, EvalError> {
+    let expanded = expand_do_form(args, pos, ctx)?;
+    eval_expr(&expanded, env, ctx)
+}
+
+fn eval_tail_do(
+    args: &[Expr],
+    pos: SourcePos,
+    env: EnvRef,
+    ctx: &mut EvalContext,
+) -> Result<TailOutcome, EvalError> {
+    let expanded = expand_do_form(args, pos, ctx)?;
+    eval_tail_expr(&expanded, env, ctx)
 }
 
 fn eval_tail_let(
@@ -2882,7 +2916,9 @@ fn eval_case_lambda(args: &[Expr], env: EnvRef) -> Result<Value, EvalError> {
 
 fn parse_case_lambda_clause(expr: &Expr) -> Result<LambdaClause, EvalError> {
     let ExprKind::List(items) = &expr.kind else {
-        return Err(EvalError::Syntax("case-lambda clause must be a list".into()));
+        return Err(EvalError::Syntax(
+            "case-lambda clause must be a list".into(),
+        ));
     };
 
     let Some((params_expr, body)) = items.split_first() else {
@@ -3027,11 +3063,7 @@ fn bind_syntax_case_bindings(parent: EnvRef, bindings: HashMap<String, MatchBind
     env
 }
 
-fn eval_with_syntax(
-    args: &[Expr],
-    env: EnvRef,
-    ctx: &mut EvalContext,
-) -> Result<Value, EvalError> {
+fn eval_with_syntax(args: &[Expr], env: EnvRef, ctx: &mut EvalContext) -> Result<Value, EvalError> {
     let (bindings_expr, body) = parse_binding_body_form("with-syntax", args)?;
     let bindings = parse_with_syntax_bindings(bindings_expr)?;
     let local_env = Env::child(env.clone());
@@ -3090,7 +3122,10 @@ fn parse_with_syntax_bindings(expr: &Expr) -> Result<Vec<(String, Expr)>, EvalEr
             };
 
             match parts.as_slice() {
-                [name, value] => Ok((expect_symbol(name, "with-syntax binding name")?, value.clone())),
+                [name, value] => Ok((
+                    expect_symbol(name, "with-syntax binding name")?,
+                    value.clone(),
+                )),
                 _ => Err(EvalError::Syntax(
                     "with-syntax binding must be a (name expr) pair".into(),
                 )),
@@ -3259,9 +3294,7 @@ fn syntax_to_datum_value(syntax: &SyntaxExpr) -> Value {
 fn generated_syntax_from_expr(expr: &Expr) -> SyntaxExpr {
     match &expr.kind {
         ExprKind::Bool(value) => SyntaxExpr::generated(SyntaxExprKind::Bool(*value), expr.pos),
-        ExprKind::Number(value) => {
-            SyntaxExpr::generated(SyntaxExprKind::Number(*value), expr.pos)
-        }
+        ExprKind::Number(value) => SyntaxExpr::generated(SyntaxExprKind::Number(*value), expr.pos),
         ExprKind::Char(value) => SyntaxExpr::generated(SyntaxExprKind::Char(*value), expr.pos),
         ExprKind::String(value) => {
             SyntaxExpr::generated(SyntaxExprKind::String(value.clone()), expr.pos)
@@ -3578,8 +3611,7 @@ fn expand_macro_invocation(
             procedure,
             definition_env,
         } => {
-            let invocation =
-                Expr::new(ExprKind::List(items.to_vec()), pos);
+            let invocation = Expr::new(ExprKind::List(items.to_vec()), pos);
             let transformed = apply(
                 procedure.clone(),
                 &[Value::Syntax(SyntaxExpr::raw(invocation))],
@@ -4222,6 +4254,7 @@ fn is_syntax_keyword(name: &str) -> bool {
             | "guard"
             | "if"
             | "let"
+            | "do"
             | "begin"
             | "cond"
             | "quote"
@@ -4283,6 +4316,115 @@ fn parse_let_form<'a>(args: &'a [Expr]) -> Result<LetForm<'a>, EvalError> {
             })
         }
     }
+}
+
+fn parse_do_form<'a>(args: &'a [Expr]) -> Result<DoForm<'a>, EvalError> {
+    if args.len() < 2 {
+        return Err(wrong_arg_count("do", "at least 2", args.len()));
+    }
+
+    let ExprKind::List(binding_exprs) = &args[0].kind else {
+        return Err(EvalError::Syntax("do bindings must be a list".into()));
+    };
+
+    let ExprKind::List(test_clause) = &args[1].kind else {
+        return Err(EvalError::Syntax("do test clause must be a list".into()));
+    };
+    let Some((test, result_exprs)) = test_clause.split_first() else {
+        return Err(EvalError::Syntax("do test clause cannot be empty".into()));
+    };
+
+    let mut bindings = Vec::with_capacity(binding_exprs.len());
+    for binding in binding_exprs {
+        let ExprKind::List(parts) = &binding.kind else {
+            return Err(EvalError::Syntax(
+                "do binding must be (name init) or (name init step)".into(),
+            ));
+        };
+
+        if !(2..=3).contains(&parts.len()) {
+            return Err(EvalError::Syntax(
+                "do binding must be (name init) or (name init step)".into(),
+            ));
+        }
+
+        let name = &parts[0];
+        bindings.push(DoBinding {
+            name: expect_symbol(name, "do binding name")?,
+            name_pos: name.pos,
+            init: &parts[1],
+            step: parts.get(2),
+        });
+    }
+
+    Ok(DoForm {
+        bindings,
+        test,
+        result_exprs,
+        body: &args[2..],
+    })
+}
+
+fn expand_do_form(args: &[Expr], pos: SourcePos, ctx: &mut EvalContext) -> Result<Expr, EvalError> {
+    let form = parse_do_form(args)?;
+    let loop_name = ctx.fresh_generated_name("do");
+    let loop_symbol = Expr::new(ExprKind::Symbol(loop_name.clone()), pos);
+
+    let mut let_bindings = Vec::with_capacity(form.bindings.len());
+    let mut step_args = Vec::with_capacity(form.bindings.len());
+    for binding in form.bindings {
+        let name_expr = Expr::new(ExprKind::Symbol(binding.name.clone()), binding.name_pos);
+        let let_binding_pos = binding.init.pos;
+        let_bindings.push(Expr::new(
+            ExprKind::List(vec![name_expr.clone(), binding.init.clone()]),
+            let_binding_pos,
+        ));
+        step_args.push(match binding.step {
+            Some(step) => step.clone(),
+            None => Expr::new(ExprKind::Symbol(binding.name), binding.name_pos),
+        });
+    }
+
+    let mut loop_call_items = Vec::with_capacity(step_args.len() + 1);
+    loop_call_items.push(loop_symbol.clone());
+    loop_call_items.extend(step_args);
+    let loop_call = Expr::new(ExprKind::List(loop_call_items), pos);
+
+    let termination_expr = build_begin_expr(form.result_exprs.iter().cloned().collect(), pos);
+    let body_expr = if form.body.is_empty() {
+        loop_call
+    } else {
+        let mut body = form.body.to_vec();
+        body.push(loop_call);
+        build_begin_expr(body, pos)
+    };
+
+    let if_expr = Expr::new(
+        ExprKind::List(vec![
+            Expr::new(ExprKind::Symbol("if".to_string()), pos),
+            form.test.clone(),
+            termination_expr,
+            body_expr,
+        ]),
+        pos,
+    );
+
+    Ok(Expr::new(
+        ExprKind::List(vec![
+            Expr::new(ExprKind::Symbol("let".to_string()), pos),
+            loop_symbol,
+            Expr::new(ExprKind::List(let_bindings), pos),
+            if_expr,
+        ]),
+        pos,
+    ))
+}
+
+fn build_begin_expr(exprs: Vec<Expr>, pos: SourcePos) -> Expr {
+    let mut items = Vec::with_capacity(exprs.len() + 1);
+    items.push(Expr::new(ExprKind::Symbol("begin".to_string()), pos));
+    items.extend(exprs);
+    Expr::new(ExprKind::List(items), pos)
 }
 
 fn parse_let_bindings(expr: &Expr) -> Result<Vec<(String, Expr)>, EvalError> {
@@ -6033,7 +6175,9 @@ fn values_equal_with_mode(
             }
         },
         (Value::Record(left), Value::Record(right)) => Rc::ptr_eq(left, right),
-        (Value::Syntax(left), Value::Syntax(right)) => syntax_to_expr(left) == syntax_to_expr(right),
+        (Value::Syntax(left), Value::Syntax(right)) => {
+            syntax_to_expr(left) == syntax_to_expr(right)
+        }
         (Value::SyntaxList(left), Value::SyntaxList(right)) => {
             left.len() == right.len()
                 && left
