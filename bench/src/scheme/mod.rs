@@ -227,287 +227,312 @@ fn ast_to_value(ast: &Ast) -> Value {
     }
 }
 
-/// Evaluate a parsed Scheme expression.
+/// Evaluate a parsed Scheme expression with tail call optimization.
 fn eval(ast: &Ast, env: &mut Env, out: &mut String) -> Result<Value, EvalError> {
-    let line = ast.line;
-    let col = ast.col;
-    match &ast.kind {
-        AstKind::Integer(n) => Ok(Value::Integer(*n)),
-        AstKind::Boolean(b) => Ok(Value::Boolean(*b)),
-        AstKind::Str(s) => Ok(Value::Str(s.clone())),
-        AstKind::Char(c) => Ok(Value::Char(*c)),
-        AstKind::Symbol(s) => env
-            .get(s)
-            .cloned()
-            .ok_or_else(|| EvalError::UndefinedVariable(s.clone()).with_position(line, col)),
-        AstKind::List(items) => {
-            if items.is_empty() {
-                return Err(EvalError::Parse("empty application".into())
-                    .with_position(line, col));
+    let mut cur_ast = ast.clone();
+    let mut tco_env: Option<Env> = None;
+
+    'tco: loop {
+        let e = match &mut tco_env {
+            Some(le) => le,
+            None => env,
+        };
+        let line = cur_ast.line;
+        let col = cur_ast.col;
+        match cur_ast.kind.clone() {
+            AstKind::Integer(n) => return Ok(Value::Integer(n)),
+            AstKind::Boolean(b) => return Ok(Value::Boolean(b)),
+            AstKind::Str(s) => return Ok(Value::Str(s)),
+            AstKind::Char(c) => return Ok(Value::Char(c)),
+            AstKind::Symbol(s) => {
+                return e
+                    .get(&s)
+                    .cloned()
+                    .ok_or_else(|| EvalError::UndefinedVariable(s).with_position(line, col));
             }
-            // Check for special forms by symbol name
-            if let AstKind::Symbol(op) = &items[0].kind {
-                match op.as_str() {
-                    "define" => {
-                        if items.len() < 3 {
-                            return Err(EvalError::Arity.with_position(line, col));
-                        }
-                        match &items[1].kind {
-                            AstKind::Symbol(name) => {
-                                if items.len() != 3 {
-                                    return Err(EvalError::Arity.with_position(line, col));
+            AstKind::List(items) => {
+                if items.is_empty() {
+                    return Err(EvalError::Parse("empty application".into())
+                        .with_position(line, col));
+                }
+                // Check for special forms by symbol name
+                if let AstKind::Symbol(ref op) = items[0].kind {
+                    match op.as_str() {
+                        "define" => {
+                            if items.len() < 3 {
+                                return Err(EvalError::Arity.with_position(line, col));
+                            }
+                            match &items[1].kind {
+                                AstKind::Symbol(name) => {
+                                    if items.len() != 3 {
+                                        return Err(EvalError::Arity.with_position(line, col));
+                                    }
+                                    let val = eval(&items[2], e, out)?;
+                                    e.insert(name.clone(), val);
+                                    return Ok(Value::Symbol("ok".into()));
                                 }
-                                let val = eval(&items[2], env, out)?;
-                                env.insert(name.clone(), val);
+                                AstKind::List(sig) => {
+                                    if sig.is_empty() {
+                                        return Err(EvalError::Parse(
+                                            "define: empty signature".into(),
+                                        ).with_position(line, col));
+                                    }
+                                    let name = match &sig[0].kind {
+                                        AstKind::Symbol(s) => s.clone(),
+                                        _ => {
+                                            return Err(EvalError::TypeError(
+                                                "define expects symbol".into(),
+                                            ).with_position(line, col))
+                                        }
+                                    };
+                                    let params: Result<Vec<String>, _> = sig[1..]
+                                        .iter()
+                                        .map(|v| match &v.kind {
+                                            AstKind::Symbol(s) => Ok(s.clone()),
+                                            _ => Err(EvalError::TypeError(
+                                                "parameter must be symbol".into(),
+                                            ).with_position(v.line, v.col)),
+                                        })
+                                        .collect();
+                                    let params = params?;
+                                    let body = if items.len() == 3 {
+                                        items[2].clone()
+                                    } else {
+                                        let mut begin_items = vec![Ast {
+                                            kind: AstKind::Symbol("begin".into()),
+                                            line,
+                                            col,
+                                        }];
+                                        begin_items.extend(items[2..].iter().cloned());
+                                        Ast {
+                                            kind: AstKind::List(begin_items),
+                                            line,
+                                            col,
+                                        }
+                                    };
+                                    let lambda = Value::Lambda {
+                                        params: params.clone(),
+                                        body: Box::new(body.clone()),
+                                        env: e.clone(),
+                                    };
+                                    e.insert(name.clone(), lambda);
+                                    let lambda = Value::Lambda {
+                                        params,
+                                        body: Box::new(body),
+                                        env: e.clone(),
+                                    };
+                                    e.insert(name, lambda);
+                                    return Ok(Value::Symbol("ok".into()));
+                                }
+                                _ => {
+                                    return Err(EvalError::TypeError(
+                                        "define expects symbol or list".into(),
+                                    ).with_position(line, col))
+                                }
+                            }
+                        }
+                        "lambda" => {
+                            if items.len() < 3 {
+                                return Err(EvalError::Arity.with_position(line, col));
+                            }
+                            let param_list = match &items[1].kind {
+                                AstKind::List(ps) => ps,
+                                _ => {
+                                    return Err(EvalError::TypeError(
+                                        "lambda params must be a list".into(),
+                                    ).with_position(line, col))
+                                }
+                            };
+                            let params: Result<Vec<String>, _> = param_list
+                                .iter()
+                                .map(|v| match &v.kind {
+                                    AstKind::Symbol(s) => Ok(s.clone()),
+                                    _ => Err(EvalError::TypeError(
+                                        "parameter must be symbol".into(),
+                                    ).with_position(v.line, v.col)),
+                                })
+                                .collect();
+                            let body = if items.len() == 3 {
+                                items[2].clone()
+                            } else {
+                                let mut begin_items = vec![Ast {
+                                    kind: AstKind::Symbol("begin".into()),
+                                    line,
+                                    col,
+                                }];
+                                begin_items.extend(items[2..].iter().cloned());
+                                Ast {
+                                    kind: AstKind::List(begin_items),
+                                    line,
+                                    col,
+                                }
+                            };
+                            return Ok(Value::Lambda {
+                                params: params?,
+                                body: Box::new(body),
+                                env: e.clone(),
+                            });
+                        }
+                        "if" => {
+                            if items.len() < 3 {
+                                return Err(EvalError::Arity.with_position(line, col));
+                            }
+                            let cond = eval(&items[1], e, out)?;
+                            if cond != Value::Boolean(false) {
+                                cur_ast = items[2].clone();
+                                continue;
+                            } else if items.len() > 3 {
+                                cur_ast = items[3].clone();
+                                continue;
+                            } else {
                                 return Ok(Value::Symbol("ok".into()));
                             }
-                            AstKind::List(sig) => {
-                                if sig.is_empty() {
-                                    return Err(EvalError::Parse(
-                                        "define: empty signature".into(),
-                                    ).with_position(line, col));
+                        }
+                        "quote" => {
+                            if items.len() != 2 {
+                                return Err(EvalError::Arity.with_position(line, col));
+                            }
+                            return Ok(ast_to_value(&items[1]));
+                        }
+                        "and" => {
+                            if items.len() <= 1 {
+                                return Ok(Value::Boolean(true));
+                            }
+                            for a in &items[1..items.len() - 1] {
+                                let result = eval(a, e, out)?;
+                                if result == Value::Boolean(false) {
+                                    return Ok(result);
                                 }
-                                let name = match &sig[0].kind {
-                                    AstKind::Symbol(s) => s.clone(),
-                                    _ => {
-                                        return Err(EvalError::TypeError(
-                                            "define expects symbol".into(),
-                                        ).with_position(line, col))
-                                    }
-                                };
-                                let params: Result<Vec<String>, _> = sig[1..]
-                                    .iter()
-                                    .map(|v| match &v.kind {
-                                        AstKind::Symbol(s) => Ok(s.clone()),
-                                        _ => Err(EvalError::TypeError(
-                                            "parameter must be symbol".into(),
-                                        ).with_position(v.line, v.col)),
-                                    })
-                                    .collect();
-                                let params = params?;
-                                let body = if items.len() == 3 {
-                                    items[2].clone()
-                                } else {
-                                    let mut begin_items = vec![Ast {
-                                        kind: AstKind::Symbol("begin".into()),
-                                        line,
-                                        col,
-                                    }];
-                                    begin_items.extend(items[2..].iter().cloned());
-                                    Ast {
-                                        kind: AstKind::List(begin_items),
-                                        line,
-                                        col,
-                                    }
-                                };
-                                let lambda = Value::Lambda {
-                                    params: params.clone(),
-                                    body: Box::new(body.clone()),
-                                    env: env.clone(),
-                                };
-                                env.insert(name.clone(), lambda);
-                                let lambda = Value::Lambda {
-                                    params,
-                                    body: Box::new(body),
-                                    env: env.clone(),
-                                };
-                                env.insert(name, lambda);
+                            }
+                            cur_ast = items.last().unwrap().clone();
+                            continue;
+                        }
+                        "or" => {
+                            if items.len() <= 1 {
+                                return Ok(Value::Boolean(false));
+                            }
+                            for a in &items[1..items.len() - 1] {
+                                let result = eval(a, e, out)?;
+                                if result != Value::Boolean(false) {
+                                    return Ok(result);
+                                }
+                            }
+                            cur_ast = items.last().unwrap().clone();
+                            continue;
+                        }
+                        "begin" => {
+                            if items.len() <= 1 {
                                 return Ok(Value::Symbol("ok".into()));
                             }
-                            _ => {
-                                return Err(EvalError::TypeError(
-                                    "define expects symbol or list".into(),
-                                ).with_position(line, col))
+                            for expr in &items[1..items.len() - 1] {
+                                eval(expr, e, out)?;
                             }
+                            cur_ast = items.last().unwrap().clone();
+                            continue;
                         }
-                    }
-                    "lambda" => {
-                        if items.len() < 3 {
-                            return Err(EvalError::Arity.with_position(line, col));
-                        }
-                        let param_list = match &items[1].kind {
-                            AstKind::List(ps) => ps,
-                            _ => {
-                                return Err(EvalError::TypeError(
-                                    "lambda params must be a list".into(),
-                                ).with_position(line, col))
+                        "let" => {
+                            if items.len() < 3 {
+                                return Err(EvalError::Arity.with_position(line, col));
                             }
-                        };
-                        let params: Result<Vec<String>, _> = param_list
-                            .iter()
-                            .map(|v| match &v.kind {
-                                AstKind::Symbol(s) => Ok(s.clone()),
-                                _ => Err(EvalError::TypeError(
-                                    "parameter must be symbol".into(),
-                                ).with_position(v.line, v.col)),
-                            })
-                            .collect();
-                        let body = if items.len() == 3 {
-                            items[2].clone()
-                        } else {
-                            let mut begin_items = vec![Ast {
-                                kind: AstKind::Symbol("begin".into()),
-                                line,
-                                col,
-                            }];
-                            begin_items.extend(items[2..].iter().cloned());
-                            Ast {
-                                kind: AstKind::List(begin_items),
-                                line,
-                                col,
+                            let bindings = match &items[1].kind {
+                                AstKind::List(bs) => bs,
+                                _ => return Err(EvalError::TypeError("let: bindings must be a list".into())
+                                    .with_position(line, col)),
+                            };
+                            let mut local_env = e.clone();
+                            for b in bindings {
+                                match &b.kind {
+                                    AstKind::List(pair) if pair.len() == 2 => {
+                                        let name = match &pair[0].kind {
+                                            AstKind::Symbol(s) => s.clone(),
+                                            _ => return Err(EvalError::TypeError("let: binding name must be symbol".into())
+                                                .with_position(pair[0].line, pair[0].col)),
+                                        };
+                                        let val = eval(&pair[1], e, out)?;
+                                        local_env.insert(name, val);
+                                    }
+                                    _ => return Err(EvalError::TypeError("let: bad binding".into())
+                                        .with_position(b.line, b.col)),
+                                }
                             }
-                        };
-                        return Ok(Value::Lambda {
-                            params: params?,
-                            body: Box::new(body),
-                            env: env.clone(),
-                        });
-                    }
-                    "if" => {
-                        if items.len() < 3 {
-                            return Err(EvalError::Arity.with_position(line, col));
+                            for expr in &items[2..items.len() - 1] {
+                                eval(expr, &mut local_env, out)?;
+                            }
+                            cur_ast = items.last().unwrap().clone();
+                            tco_env = Some(local_env);
+                            continue;
                         }
-                        let cond = eval(&items[1], env, out)?;
-                        if cond != Value::Boolean(false) {
-                            return eval(&items[2], env, out);
-                        } else if items.len() > 3 {
-                            return eval(&items[3], env, out);
-                        } else {
+                        "string-set!" => {
+                            return Err(EvalError::TypeError(
+                                "string-set!: strings are immutable".into(),
+                            ).with_position(line, col));
+                        }
+                        "cond" => {
+                            for clause in &items[1..] {
+                                match &clause.kind {
+                                    AstKind::List(parts) if parts.len() >= 2 => {
+                                        if let AstKind::Symbol(s) = &parts[0].kind {
+                                            if s == "else" {
+                                                for expr in &parts[1..parts.len() - 1] {
+                                                    eval(expr, e, out)?;
+                                                }
+                                                cur_ast = parts.last().unwrap().clone();
+                                                continue 'tco;
+                                            }
+                                        }
+                                        let test = eval(&parts[0], e, out)?;
+                                        if test != Value::Boolean(false) {
+                                            for expr in &parts[1..parts.len() - 1] {
+                                                eval(expr, e, out)?;
+                                            }
+                                            cur_ast = parts.last().unwrap().clone();
+                                            continue 'tco;
+                                        }
+                                    }
+                                    _ => return Err(EvalError::TypeError("cond: bad clause".into())
+                                        .with_position(clause.line, clause.col)),
+                                }
+                            }
                             return Ok(Value::Symbol("ok".into()));
                         }
+                        _ => {}
                     }
-                    "quote" => {
-                        if items.len() != 2 {
+                }
+                // General application: evaluate operator and arguments
+                let mut args = Vec::new();
+                for a in &items[1..] {
+                    args.push(eval(a, e, out)?);
+                }
+                // Try builtin first if operator is a symbol not in env
+                if let AstKind::Symbol(s) = &items[0].kind {
+                    if !e.contains_key(s.as_str()) {
+                        return apply_builtin(s, &args, out)
+                            .map_err(|err| err.with_position(line, col));
+                    }
+                }
+                let func = eval(&items[0], e, out)?;
+                match func {
+                    Value::Lambda {
+                        params,
+                        body,
+                        env: closed_env,
+                    } => {
+                        if args.len() != params.len() {
                             return Err(EvalError::Arity.with_position(line, col));
                         }
-                        return Ok(ast_to_value(&items[1]));
-                    }
-                    "and" => {
-                        let mut result = Value::Boolean(true);
-                        for a in &items[1..] {
-                            result = eval(a, env, out)?;
-                            if result == Value::Boolean(false) {
-                                return Ok(result);
-                            }
+                        let mut local_env = e.clone();
+                        for (k, v) in &closed_env {
+                            local_env.insert(k.clone(), v.clone());
                         }
-                        return Ok(result);
-                    }
-                    "or" => {
-                        let mut result = Value::Boolean(false);
-                        for a in &items[1..] {
-                            result = eval(a, env, out)?;
-                            if result != Value::Boolean(false) {
-                                return Ok(result);
-                            }
+                        for (p, a) in params.iter().zip(args) {
+                            local_env.insert(p.clone(), a);
                         }
-                        return Ok(result);
+                        cur_ast = *body;
+                        tco_env = Some(local_env);
+                        continue;
                     }
-                    "begin" => {
-                        let mut result = Value::Symbol("ok".into());
-                        for expr in &items[1..] {
-                            result = eval(expr, env, out)?;
-                        }
-                        return Ok(result);
-                    }
-                    "let" => {
-                        if items.len() < 3 {
-                            return Err(EvalError::Arity.with_position(line, col));
-                        }
-                        let bindings = match &items[1].kind {
-                            AstKind::List(bs) => bs,
-                            _ => return Err(EvalError::TypeError("let: bindings must be a list".into())
-                                .with_position(line, col)),
-                        };
-                        let mut local_env = env.clone();
-                        for b in bindings {
-                            match &b.kind {
-                                AstKind::List(pair) if pair.len() == 2 => {
-                                    let name = match &pair[0].kind {
-                                        AstKind::Symbol(s) => s.clone(),
-                                        _ => return Err(EvalError::TypeError("let: binding name must be symbol".into())
-                                            .with_position(pair[0].line, pair[0].col)),
-                                    };
-                                    let val = eval(&pair[1], env, out)?;
-                                    local_env.insert(name, val);
-                                }
-                                _ => return Err(EvalError::TypeError("let: bad binding".into())
-                                    .with_position(b.line, b.col)),
-                            }
-                        }
-                        let mut result = Value::Symbol("ok".into());
-                        for expr in &items[2..] {
-                            result = eval(expr, &mut local_env, out)?;
-                        }
-                        return Ok(result);
-                    }
-                    "string-set!" => {
-                        return Err(EvalError::TypeError(
-                            "string-set!: strings are immutable".into(),
-                        ).with_position(line, col));
-                    }
-                    "cond" => {
-                        for clause in &items[1..] {
-                            match &clause.kind {
-                                AstKind::List(parts) if parts.len() >= 2 => {
-                                    if let AstKind::Symbol(s) = &parts[0].kind {
-                                        if s == "else" {
-                                            let mut result = Value::Symbol("ok".into());
-                                            for expr in &parts[1..] {
-                                                result = eval(expr, env, out)?;
-                                            }
-                                            return Ok(result);
-                                        }
-                                    }
-                                    let test = eval(&parts[0], env, out)?;
-                                    if test != Value::Boolean(false) {
-                                        let mut result = Value::Symbol("ok".into());
-                                        for expr in &parts[1..] {
-                                            result = eval(expr, env, out)?;
-                                        }
-                                        return Ok(result);
-                                    }
-                                }
-                                _ => return Err(EvalError::TypeError("cond: bad clause".into())
-                                    .with_position(clause.line, clause.col)),
-                            }
-                        }
-                        return Ok(Value::Symbol("ok".into()));
-                    }
-                    _ => {}
+                    _ => return Err(EvalError::NotAProcedure.with_position(items[0].line, items[0].col)),
                 }
-            }
-            // General application: evaluate operator and arguments
-            let mut args = Vec::new();
-            for a in &items[1..] {
-                args.push(eval(a, env, out)?);
-            }
-            // Try builtin first if operator is a symbol not in env
-            if let AstKind::Symbol(s) = &items[0].kind {
-                if !env.contains_key(s.as_str()) {
-                    return apply_builtin(s, &args, out)
-                        .map_err(|e| e.with_position(line, col));
-                }
-            }
-            let func = eval(&items[0], env, out)?;
-            match func {
-                Value::Lambda {
-                    params,
-                    body,
-                    env: closed_env,
-                } => {
-                    if args.len() != params.len() {
-                        return Err(EvalError::Arity.with_position(line, col));
-                    }
-                    let mut local_env = env.clone();
-                    for (k, v) in &closed_env {
-                        local_env.insert(k.clone(), v.clone());
-                    }
-                    for (p, a) in params.iter().zip(args) {
-                        local_env.insert(p.clone(), a);
-                    }
-                    eval(&body, &mut local_env, out)
-                }
-                _ => Err(EvalError::NotAProcedure.with_position(items[0].line, items[0].col)),
             }
         }
     }
