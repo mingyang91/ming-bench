@@ -79,6 +79,7 @@ enum Value {
         def_env: Env,
         span: Span,
     },
+    DottedPair(Box<Value>, Box<Value>, Span),
     Vector(Rc<RefCell<Vec<Value>>>, Span),
     Void,
 }
@@ -93,6 +94,7 @@ impl Value {
             | Value::Char(_, s)
             | Value::List(_, s)
             | Value::Builtin(_, s)
+            | Value::DottedPair(_, _, s)
             | Value::Vector(_, s) => *s,
             Value::Lambda { span, .. } | Value::Continuation { span, .. } | Value::Macro { span, .. } => *span,
             Value::Void => Span::default(),
@@ -104,13 +106,19 @@ impl Value {
             Value::Integer(n, _) => n.to_string(),
             Value::Boolean(true, _) => "#t".to_string(),
             Value::Boolean(false, _) => "#f".to_string(),
-            Value::Char(c, _) => format!("#\\{}", c),
+            Value::Char(c, _) => match c {
+                ' ' => "#\\space".to_string(),
+                '\n' => "#\\newline".to_string(),
+                '\t' => "#\\tab".to_string(),
+                _ => format!("#\\{}", c),
+            },
             Value::Str(s, _) => format!("\"{}\"", s),
             Value::Symbol(s, _) => s.clone(),
             Value::List(elems, _) => {
                 let inner: Vec<String> = elems.iter().map(|v| v.display_scheme()).collect();
                 format!("({})", inner.join(" "))
             }
+            Value::DottedPair(a, b, _) => format!("({} . {})", a.display_scheme(), b.display_scheme()),
             Value::Vector(elems, _) => {
                 let inner: Vec<String> = elems.borrow().iter().map(|v| v.display_scheme()).collect();
                 format!("#({})", inner.join(" "))
@@ -197,6 +205,12 @@ fn default_env() -> Env {
         "equal?", "eqv?", "eq?",
         "vector", "make-vector", "vector-ref", "vector-set!", "vector-length",
         "vector?", "vector->list", "list->vector",
+        "abs", "modulo", "remainder", "quotient", "min", "max", "expt",
+        "zero?", "positive?", "negative?", "odd?", "even?",
+        "list-ref", "list-tail", "list?", "assoc",
+        "char-alphabetic?", "char-numeric?", "char-upcase", "char-downcase",
+        "char=?", "char<?",
+        "string=?", "string<?", "string-ci=?", "string-upcase", "string-downcase",
     ];
     for name in &builtins {
         env_set(&env, name.to_string(), Value::Builtin(name.to_string(), sp));
@@ -447,7 +461,7 @@ fn eval(expr: &Value, env: &Env) -> Result<Value, EvalError> {
 
     loop {
         match &current_expr {
-            Value::Integer(..) | Value::Boolean(..) | Value::Str(..) | Value::Char(..) | Value::Vector(..) => {
+            Value::Integer(..) | Value::Boolean(..) | Value::Str(..) | Value::Char(..) | Value::Vector(..) | Value::DottedPair(..) => {
                 return Ok(current_expr);
             }
             Value::Symbol(name, span) => {
@@ -1620,10 +1634,7 @@ fn eval_builtin(
                     elems.insert(0, head);
                     Ok(Value::List(elems, sp))
                 }
-                _ => Err(EvalError::TypeError(
-                    "cons: second argument must be a list".into(),
-                    sp,
-                )),
+                _ => Ok(Value::DottedPair(Box::new(head), Box::new(tail), sp)),
             }
         }
         "car" => {
@@ -1637,6 +1648,7 @@ fn eval_builtin(
             let val = eval(&args[0], env)?;
             match val {
                 Value::List(elems, _) if !elems.is_empty() => Ok(elems[0].clone()),
+                Value::DottedPair(a, _, _) => Ok(*a),
                 _ => Err(EvalError::TypeError(
                     "car: expected non-empty list".into(),
                     sp,
@@ -1656,6 +1668,7 @@ fn eval_builtin(
                 Value::List(elems, _) if !elems.is_empty() => {
                     Ok(Value::List(elems[1..].to_vec(), sp))
                 }
+                Value::DottedPair(_, b, _) => Ok(*b),
                 _ => Err(EvalError::TypeError(
                     "cdr: expected non-empty list".into(),
                     sp,
@@ -1737,7 +1750,7 @@ fn eval_builtin(
             }
             let val = eval(&args[0], env)?;
             Ok(Value::Boolean(
-                matches!(val, Value::List(ref e, _) if !e.is_empty()),
+                matches!(val, Value::List(ref e, _) if !e.is_empty()) || matches!(val, Value::DottedPair(..)),
                 sp,
             ))
         }
@@ -2116,16 +2129,222 @@ fn eval_builtin(
                 });
             }
             let func = eval(&args[0], env)?;
-            let list_val = eval(&args[1], env)?;
-            match list_val {
-                Value::List(elems, _) => {
-                    let results: Vec<Value> = elems
-                        .iter()
-                        .map(|e| apply_function(&func, &[e.clone()], sp))
-                        .collect::<Result<_, _>>()?;
-                    Ok(Value::List(results, sp))
+            let mut lists: Vec<Vec<Value>> = Vec::new();
+            for a in &args[1..] {
+                match eval(a, env)? {
+                    Value::List(elems, _) => lists.push(elems),
+                    _ => return Err(EvalError::TypeError("map: expected list".into(), sp)),
                 }
-                _ => Err(EvalError::TypeError("map: expected list".into(), sp)),
+            }
+            let len = lists[0].len();
+            let mut results = Vec::new();
+            for i in 0..len {
+                let call_args: Vec<Value> = lists.iter().map(|l| l[i].clone()).collect();
+                results.push(apply_function(&func, &call_args, sp)?);
+            }
+            Ok(Value::List(results, sp))
+        }
+        "abs" => {
+            if args.len() != 1 { return Err(EvalError::WrongArgCount { expected: "1".into(), got: args.len(), at: sp }); }
+            let n = expect_integer(&eval(&args[0], env)?)?;
+            Ok(Value::Integer(n.abs(), sp))
+        }
+        "modulo" => {
+            if args.len() != 2 { return Err(EvalError::WrongArgCount { expected: "2".into(), got: args.len(), at: sp }); }
+            let a = expect_integer(&eval(&args[0], env)?)?;
+            let b = expect_integer(&eval(&args[1], env)?)?;
+            if b == 0 { return Err(EvalError::DivisionByZero(sp)); }
+            Ok(Value::Integer(((a % b) + b) % b, sp))
+        }
+        "remainder" => {
+            if args.len() != 2 { return Err(EvalError::WrongArgCount { expected: "2".into(), got: args.len(), at: sp }); }
+            let a = expect_integer(&eval(&args[0], env)?)?;
+            let b = expect_integer(&eval(&args[1], env)?)?;
+            if b == 0 { return Err(EvalError::DivisionByZero(sp)); }
+            Ok(Value::Integer(a % b, sp))
+        }
+        "quotient" => {
+            if args.len() != 2 { return Err(EvalError::WrongArgCount { expected: "2".into(), got: args.len(), at: sp }); }
+            let a = expect_integer(&eval(&args[0], env)?)?;
+            let b = expect_integer(&eval(&args[1], env)?)?;
+            if b == 0 { return Err(EvalError::DivisionByZero(sp)); }
+            Ok(Value::Integer(a / b, sp))
+        }
+        "min" => {
+            if args.is_empty() { return Err(EvalError::WrongArgCount { expected: "1+".into(), got: 0, at: sp }); }
+            let mut result = expect_integer(&eval(&args[0], env)?)?;
+            for a in &args[1..] { result = result.min(expect_integer(&eval(a, env)?)?); }
+            Ok(Value::Integer(result, sp))
+        }
+        "max" => {
+            if args.is_empty() { return Err(EvalError::WrongArgCount { expected: "1+".into(), got: 0, at: sp }); }
+            let mut result = expect_integer(&eval(&args[0], env)?)?;
+            for a in &args[1..] { result = result.max(expect_integer(&eval(a, env)?)?); }
+            Ok(Value::Integer(result, sp))
+        }
+        "expt" => {
+            if args.len() != 2 { return Err(EvalError::WrongArgCount { expected: "2".into(), got: args.len(), at: sp }); }
+            let base = expect_integer(&eval(&args[0], env)?)?;
+            let exp = expect_integer(&eval(&args[1], env)?)?;
+            Ok(Value::Integer(base.pow(exp as u32), sp))
+        }
+        "zero?" => {
+            if args.len() != 1 { return Err(EvalError::WrongArgCount { expected: "1".into(), got: args.len(), at: sp }); }
+            let n = expect_integer(&eval(&args[0], env)?)?;
+            Ok(Value::Boolean(n == 0, sp))
+        }
+        "positive?" => {
+            if args.len() != 1 { return Err(EvalError::WrongArgCount { expected: "1".into(), got: args.len(), at: sp }); }
+            let n = expect_integer(&eval(&args[0], env)?)?;
+            Ok(Value::Boolean(n > 0, sp))
+        }
+        "negative?" => {
+            if args.len() != 1 { return Err(EvalError::WrongArgCount { expected: "1".into(), got: args.len(), at: sp }); }
+            let n = expect_integer(&eval(&args[0], env)?)?;
+            Ok(Value::Boolean(n < 0, sp))
+        }
+        "odd?" => {
+            if args.len() != 1 { return Err(EvalError::WrongArgCount { expected: "1".into(), got: args.len(), at: sp }); }
+            let n = expect_integer(&eval(&args[0], env)?)?;
+            Ok(Value::Boolean(n % 2 != 0, sp))
+        }
+        "even?" => {
+            if args.len() != 1 { return Err(EvalError::WrongArgCount { expected: "1".into(), got: args.len(), at: sp }); }
+            let n = expect_integer(&eval(&args[0], env)?)?;
+            Ok(Value::Boolean(n % 2 == 0, sp))
+        }
+        "list-ref" => {
+            if args.len() != 2 { return Err(EvalError::WrongArgCount { expected: "2".into(), got: args.len(), at: sp }); }
+            let list = eval(&args[0], env)?;
+            let idx = expect_integer(&eval(&args[1], env)?)? as usize;
+            match list {
+                Value::List(elems, _) => {
+                    if idx >= elems.len() { return Err(EvalError::TypeError("list-ref: index out of range".into(), sp)); }
+                    Ok(elems[idx].clone())
+                }
+                _ => Err(EvalError::TypeError("list-ref: expected list".into(), sp)),
+            }
+        }
+        "list-tail" => {
+            if args.len() != 2 { return Err(EvalError::WrongArgCount { expected: "2".into(), got: args.len(), at: sp }); }
+            let list = eval(&args[0], env)?;
+            let idx = expect_integer(&eval(&args[1], env)?)? as usize;
+            match list {
+                Value::List(elems, _) => {
+                    if idx > elems.len() { return Err(EvalError::TypeError("list-tail: index out of range".into(), sp)); }
+                    Ok(Value::List(elems[idx..].to_vec(), sp))
+                }
+                _ => Err(EvalError::TypeError("list-tail: expected list".into(), sp)),
+            }
+        }
+        "list?" => {
+            if args.len() != 1 { return Err(EvalError::WrongArgCount { expected: "1".into(), got: args.len(), at: sp }); }
+            let val = eval(&args[0], env)?;
+            Ok(Value::Boolean(matches!(val, Value::List(..)), sp))
+        }
+        "assoc" => {
+            if args.len() != 2 { return Err(EvalError::WrongArgCount { expected: "2".into(), got: args.len(), at: sp }); }
+            let key = eval(&args[0], env)?;
+            let alist = eval(&args[1], env)?;
+            match alist {
+                Value::List(elems, _) => {
+                    for elem in &elems {
+                        if let Value::List(pair, _) = elem {
+                            if !pair.is_empty() && values_equal(&pair[0], &key) {
+                                return Ok(elem.clone());
+                            }
+                        }
+                    }
+                    Ok(Value::Boolean(false, sp))
+                }
+                _ => Err(EvalError::TypeError("assoc: expected list".into(), sp)),
+            }
+        }
+        "char-alphabetic?" => {
+            if args.len() != 1 { return Err(EvalError::WrongArgCount { expected: "1".into(), got: args.len(), at: sp }); }
+            match eval(&args[0], env)? {
+                Value::Char(c, _) => Ok(Value::Boolean(c.is_alphabetic(), sp)),
+                _ => Err(EvalError::TypeError("char-alphabetic?: expected character".into(), sp)),
+            }
+        }
+        "char-numeric?" => {
+            if args.len() != 1 { return Err(EvalError::WrongArgCount { expected: "1".into(), got: args.len(), at: sp }); }
+            match eval(&args[0], env)? {
+                Value::Char(c, _) => Ok(Value::Boolean(c.is_ascii_digit(), sp)),
+                _ => Err(EvalError::TypeError("char-numeric?: expected character".into(), sp)),
+            }
+        }
+        "char-upcase" => {
+            if args.len() != 1 { return Err(EvalError::WrongArgCount { expected: "1".into(), got: args.len(), at: sp }); }
+            match eval(&args[0], env)? {
+                Value::Char(c, _) => Ok(Value::Char(c.to_ascii_uppercase(), sp)),
+                _ => Err(EvalError::TypeError("char-upcase: expected character".into(), sp)),
+            }
+        }
+        "char-downcase" => {
+            if args.len() != 1 { return Err(EvalError::WrongArgCount { expected: "1".into(), got: args.len(), at: sp }); }
+            match eval(&args[0], env)? {
+                Value::Char(c, _) => Ok(Value::Char(c.to_ascii_lowercase(), sp)),
+                _ => Err(EvalError::TypeError("char-downcase: expected character".into(), sp)),
+            }
+        }
+        "char=?" => {
+            if args.len() != 2 { return Err(EvalError::WrongArgCount { expected: "2".into(), got: args.len(), at: sp }); }
+            let a = eval(&args[0], env)?;
+            let b = eval(&args[1], env)?;
+            match (&a, &b) {
+                (Value::Char(x, _), Value::Char(y, _)) => Ok(Value::Boolean(x == y, sp)),
+                _ => Err(EvalError::TypeError("char=?: expected characters".into(), sp)),
+            }
+        }
+        "char<?" => {
+            if args.len() != 2 { return Err(EvalError::WrongArgCount { expected: "2".into(), got: args.len(), at: sp }); }
+            let a = eval(&args[0], env)?;
+            let b = eval(&args[1], env)?;
+            match (&a, &b) {
+                (Value::Char(x, _), Value::Char(y, _)) => Ok(Value::Boolean(x < y, sp)),
+                _ => Err(EvalError::TypeError("char<?: expected characters".into(), sp)),
+            }
+        }
+        "string=?" => {
+            if args.len() != 2 { return Err(EvalError::WrongArgCount { expected: "2".into(), got: args.len(), at: sp }); }
+            let a = eval(&args[0], env)?;
+            let b = eval(&args[1], env)?;
+            match (&a, &b) {
+                (Value::Str(x, _), Value::Str(y, _)) => Ok(Value::Boolean(x == y, sp)),
+                _ => Err(EvalError::TypeError("string=?: expected strings".into(), sp)),
+            }
+        }
+        "string<?" => {
+            if args.len() != 2 { return Err(EvalError::WrongArgCount { expected: "2".into(), got: args.len(), at: sp }); }
+            let a = eval(&args[0], env)?;
+            let b = eval(&args[1], env)?;
+            match (&a, &b) {
+                (Value::Str(x, _), Value::Str(y, _)) => Ok(Value::Boolean(x < y, sp)),
+                _ => Err(EvalError::TypeError("string<?: expected strings".into(), sp)),
+            }
+        }
+        "string-ci=?" => {
+            if args.len() != 2 { return Err(EvalError::WrongArgCount { expected: "2".into(), got: args.len(), at: sp }); }
+            let a = eval(&args[0], env)?;
+            let b = eval(&args[1], env)?;
+            match (&a, &b) {
+                (Value::Str(x, _), Value::Str(y, _)) => Ok(Value::Boolean(x.to_lowercase() == y.to_lowercase(), sp)),
+                _ => Err(EvalError::TypeError("string-ci=?: expected strings".into(), sp)),
+            }
+        }
+        "string-upcase" => {
+            if args.len() != 1 { return Err(EvalError::WrongArgCount { expected: "1".into(), got: args.len(), at: sp }); }
+            match eval(&args[0], env)? {
+                Value::Str(s, _) => Ok(Value::Str(s.to_uppercase(), sp)),
+                _ => Err(EvalError::TypeError("string-upcase: expected string".into(), sp)),
+            }
+        }
+        "string-downcase" => {
+            if args.len() != 1 { return Err(EvalError::WrongArgCount { expected: "1".into(), got: args.len(), at: sp }); }
+            match eval(&args[0], env)? {
+                Value::Str(s, _) => Ok(Value::Str(s.to_lowercase(), sp)),
+                _ => Err(EvalError::TypeError("string-downcase: expected string".into(), sp)),
             }
         }
         _ => Err(EvalError::UnboundVariable(op.to_string(), sp)),
@@ -2190,13 +2409,14 @@ fn eval_builtin_with_values(op: &str, args: &[Value], sp: Span) -> Result<Value,
                     new_elems.extend(elems.iter().cloned());
                     Ok(Value::List(new_elems, sp))
                 }
-                _ => Err(EvalError::TypeError("cons: second argument must be a list".into(), sp)),
+                _ => Ok(Value::DottedPair(Box::new(args[0].clone()), Box::new(args[1].clone()), sp)),
             }
         }
         "car" => {
             if args.len() != 1 { return Err(EvalError::WrongArgCount { expected: "1".into(), got: args.len(), at: sp }); }
             match &args[0] {
                 Value::List(elems, _) if !elems.is_empty() => Ok(elems[0].clone()),
+                Value::DottedPair(a, _, _) => Ok(*a.clone()),
                 _ => Err(EvalError::TypeError("car: expected non-empty list".into(), sp)),
             }
         }
@@ -2204,6 +2424,7 @@ fn eval_builtin_with_values(op: &str, args: &[Value], sp: Span) -> Result<Value,
             if args.len() != 1 { return Err(EvalError::WrongArgCount { expected: "1".into(), got: args.len(), at: sp }); }
             match &args[0] {
                 Value::List(elems, _) if !elems.is_empty() => Ok(Value::List(elems[1..].to_vec(), sp)),
+                Value::DottedPair(_, b, _) => Ok(*b.clone()),
                 _ => Err(EvalError::TypeError("cdr: expected non-empty list".into(), sp)),
             }
         }
@@ -2315,6 +2536,206 @@ fn eval_builtin_with_values(op: &str, args: &[Value], sp: Span) -> Result<Value,
                 Value::Lambda { .. } => apply_function(func, &all_args, sp),
                 _ => Err(EvalError::NotAProcedure(func.display_scheme(), sp)),
             }
+        }
+        "abs" => {
+            if args.len() != 1 { return Err(EvalError::WrongArgCount { expected: "1".into(), got: args.len(), at: sp }); }
+            Ok(Value::Integer(expect_integer(&args[0])?.abs(), sp))
+        }
+        "modulo" => {
+            if args.len() != 2 { return Err(EvalError::WrongArgCount { expected: "2".into(), got: args.len(), at: sp }); }
+            let a = expect_integer(&args[0])?;
+            let b = expect_integer(&args[1])?;
+            if b == 0 { return Err(EvalError::DivisionByZero(sp)); }
+            Ok(Value::Integer(((a % b) + b) % b, sp))
+        }
+        "remainder" => {
+            if args.len() != 2 { return Err(EvalError::WrongArgCount { expected: "2".into(), got: args.len(), at: sp }); }
+            let a = expect_integer(&args[0])?;
+            let b = expect_integer(&args[1])?;
+            if b == 0 { return Err(EvalError::DivisionByZero(sp)); }
+            Ok(Value::Integer(a % b, sp))
+        }
+        "quotient" => {
+            if args.len() != 2 { return Err(EvalError::WrongArgCount { expected: "2".into(), got: args.len(), at: sp }); }
+            let a = expect_integer(&args[0])?;
+            let b = expect_integer(&args[1])?;
+            if b == 0 { return Err(EvalError::DivisionByZero(sp)); }
+            Ok(Value::Integer(a / b, sp))
+        }
+        "min" => {
+            if args.is_empty() { return Err(EvalError::WrongArgCount { expected: "1+".into(), got: 0, at: sp }); }
+            let mut result = expect_integer(&args[0])?;
+            for a in &args[1..] { result = result.min(expect_integer(a)?); }
+            Ok(Value::Integer(result, sp))
+        }
+        "max" => {
+            if args.is_empty() { return Err(EvalError::WrongArgCount { expected: "1+".into(), got: 0, at: sp }); }
+            let mut result = expect_integer(&args[0])?;
+            for a in &args[1..] { result = result.max(expect_integer(a)?); }
+            Ok(Value::Integer(result, sp))
+        }
+        "expt" => {
+            if args.len() != 2 { return Err(EvalError::WrongArgCount { expected: "2".into(), got: args.len(), at: sp }); }
+            let base = expect_integer(&args[0])?;
+            let exp = expect_integer(&args[1])?;
+            Ok(Value::Integer(base.pow(exp as u32), sp))
+        }
+        "zero?" => {
+            if args.len() != 1 { return Err(EvalError::WrongArgCount { expected: "1".into(), got: args.len(), at: sp }); }
+            Ok(Value::Boolean(expect_integer(&args[0])? == 0, sp))
+        }
+        "positive?" => {
+            if args.len() != 1 { return Err(EvalError::WrongArgCount { expected: "1".into(), got: args.len(), at: sp }); }
+            Ok(Value::Boolean(expect_integer(&args[0])? > 0, sp))
+        }
+        "negative?" => {
+            if args.len() != 1 { return Err(EvalError::WrongArgCount { expected: "1".into(), got: args.len(), at: sp }); }
+            Ok(Value::Boolean(expect_integer(&args[0])? < 0, sp))
+        }
+        "odd?" => {
+            if args.len() != 1 { return Err(EvalError::WrongArgCount { expected: "1".into(), got: args.len(), at: sp }); }
+            Ok(Value::Boolean(expect_integer(&args[0])? % 2 != 0, sp))
+        }
+        "even?" => {
+            if args.len() != 1 { return Err(EvalError::WrongArgCount { expected: "1".into(), got: args.len(), at: sp }); }
+            Ok(Value::Boolean(expect_integer(&args[0])? % 2 == 0, sp))
+        }
+        "list-ref" => {
+            if args.len() != 2 { return Err(EvalError::WrongArgCount { expected: "2".into(), got: args.len(), at: sp }); }
+            let idx = expect_integer(&args[1])? as usize;
+            match &args[0] {
+                Value::List(elems, _) => {
+                    if idx >= elems.len() { return Err(EvalError::TypeError("list-ref: index out of range".into(), sp)); }
+                    Ok(elems[idx].clone())
+                }
+                _ => Err(EvalError::TypeError("list-ref: expected list".into(), sp)),
+            }
+        }
+        "list-tail" => {
+            if args.len() != 2 { return Err(EvalError::WrongArgCount { expected: "2".into(), got: args.len(), at: sp }); }
+            let idx = expect_integer(&args[1])? as usize;
+            match &args[0] {
+                Value::List(elems, _) => {
+                    if idx > elems.len() { return Err(EvalError::TypeError("list-tail: index out of range".into(), sp)); }
+                    Ok(Value::List(elems[idx..].to_vec(), sp))
+                }
+                _ => Err(EvalError::TypeError("list-tail: expected list".into(), sp)),
+            }
+        }
+        "list?" => {
+            if args.len() != 1 { return Err(EvalError::WrongArgCount { expected: "1".into(), got: args.len(), at: sp }); }
+            Ok(Value::Boolean(matches!(args[0], Value::List(..)), sp))
+        }
+        "assoc" => {
+            if args.len() != 2 { return Err(EvalError::WrongArgCount { expected: "2".into(), got: args.len(), at: sp }); }
+            match &args[1] {
+                Value::List(elems, _) => {
+                    for elem in elems {
+                        if let Value::List(pair, _) = elem {
+                            if !pair.is_empty() && values_equal(&pair[0], &args[0]) {
+                                return Ok(elem.clone());
+                            }
+                        }
+                    }
+                    Ok(Value::Boolean(false, sp))
+                }
+                _ => Err(EvalError::TypeError("assoc: expected list".into(), sp)),
+            }
+        }
+        "char-alphabetic?" => {
+            if args.len() != 1 { return Err(EvalError::WrongArgCount { expected: "1".into(), got: args.len(), at: sp }); }
+            match &args[0] {
+                Value::Char(c, _) => Ok(Value::Boolean(c.is_alphabetic(), sp)),
+                _ => Err(EvalError::TypeError("char-alphabetic?: expected character".into(), sp)),
+            }
+        }
+        "char-numeric?" => {
+            if args.len() != 1 { return Err(EvalError::WrongArgCount { expected: "1".into(), got: args.len(), at: sp }); }
+            match &args[0] {
+                Value::Char(c, _) => Ok(Value::Boolean(c.is_ascii_digit(), sp)),
+                _ => Err(EvalError::TypeError("char-numeric?: expected character".into(), sp)),
+            }
+        }
+        "char-upcase" => {
+            if args.len() != 1 { return Err(EvalError::WrongArgCount { expected: "1".into(), got: args.len(), at: sp }); }
+            match &args[0] {
+                Value::Char(c, _) => Ok(Value::Char(c.to_ascii_uppercase(), sp)),
+                _ => Err(EvalError::TypeError("char-upcase: expected character".into(), sp)),
+            }
+        }
+        "char-downcase" => {
+            if args.len() != 1 { return Err(EvalError::WrongArgCount { expected: "1".into(), got: args.len(), at: sp }); }
+            match &args[0] {
+                Value::Char(c, _) => Ok(Value::Char(c.to_ascii_lowercase(), sp)),
+                _ => Err(EvalError::TypeError("char-downcase: expected character".into(), sp)),
+            }
+        }
+        "char=?" => {
+            if args.len() != 2 { return Err(EvalError::WrongArgCount { expected: "2".into(), got: args.len(), at: sp }); }
+            match (&args[0], &args[1]) {
+                (Value::Char(x, _), Value::Char(y, _)) => Ok(Value::Boolean(x == y, sp)),
+                _ => Err(EvalError::TypeError("char=?: expected characters".into(), sp)),
+            }
+        }
+        "char<?" => {
+            if args.len() != 2 { return Err(EvalError::WrongArgCount { expected: "2".into(), got: args.len(), at: sp }); }
+            match (&args[0], &args[1]) {
+                (Value::Char(x, _), Value::Char(y, _)) => Ok(Value::Boolean(x < y, sp)),
+                _ => Err(EvalError::TypeError("char<?: expected characters".into(), sp)),
+            }
+        }
+        "string=?" => {
+            if args.len() != 2 { return Err(EvalError::WrongArgCount { expected: "2".into(), got: args.len(), at: sp }); }
+            match (&args[0], &args[1]) {
+                (Value::Str(x, _), Value::Str(y, _)) => Ok(Value::Boolean(x == y, sp)),
+                _ => Err(EvalError::TypeError("string=?: expected strings".into(), sp)),
+            }
+        }
+        "string<?" => {
+            if args.len() != 2 { return Err(EvalError::WrongArgCount { expected: "2".into(), got: args.len(), at: sp }); }
+            match (&args[0], &args[1]) {
+                (Value::Str(x, _), Value::Str(y, _)) => Ok(Value::Boolean(x < y, sp)),
+                _ => Err(EvalError::TypeError("string<?: expected strings".into(), sp)),
+            }
+        }
+        "string-ci=?" => {
+            if args.len() != 2 { return Err(EvalError::WrongArgCount { expected: "2".into(), got: args.len(), at: sp }); }
+            match (&args[0], &args[1]) {
+                (Value::Str(x, _), Value::Str(y, _)) => Ok(Value::Boolean(x.to_lowercase() == y.to_lowercase(), sp)),
+                _ => Err(EvalError::TypeError("string-ci=?: expected strings".into(), sp)),
+            }
+        }
+        "string-upcase" => {
+            if args.len() != 1 { return Err(EvalError::WrongArgCount { expected: "1".into(), got: args.len(), at: sp }); }
+            match &args[0] {
+                Value::Str(s, _) => Ok(Value::Str(s.to_uppercase(), sp)),
+                _ => Err(EvalError::TypeError("string-upcase: expected string".into(), sp)),
+            }
+        }
+        "string-downcase" => {
+            if args.len() != 1 { return Err(EvalError::WrongArgCount { expected: "1".into(), got: args.len(), at: sp }); }
+            match &args[0] {
+                Value::Str(s, _) => Ok(Value::Str(s.to_lowercase(), sp)),
+                _ => Err(EvalError::TypeError("string-downcase: expected string".into(), sp)),
+            }
+        }
+        "map" => {
+            if args.len() < 2 { return Err(EvalError::WrongArgCount { expected: "2+".into(), got: args.len(), at: sp }); }
+            let func = &args[0];
+            let mut lists: Vec<Vec<Value>> = Vec::new();
+            for a in &args[1..] {
+                match a {
+                    Value::List(elems, _) => lists.push(elems.clone()),
+                    _ => return Err(EvalError::TypeError("map: expected list".into(), sp)),
+                }
+            }
+            let len = lists[0].len();
+            let mut results = Vec::new();
+            for i in 0..len {
+                let call_args: Vec<Value> = lists.iter().map(|l| l[i].clone()).collect();
+                results.push(apply_function(func, &call_args, sp)?);
+            }
+            Ok(Value::List(results, sp))
         }
         _ => Err(EvalError::UnboundVariable(op.to_string(), sp)),
     }
