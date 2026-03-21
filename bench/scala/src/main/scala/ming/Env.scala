@@ -6,20 +6,29 @@ final case class Env(
   parent: Option[Env]
 ):
 
-  def lookup(name: String): Value =
+  def lookup(
+    name: String,
+    pos: Option[(Int, Int)] = None
+  ): Value =
     bindings.get(name) match
       case Some(v) => v
       case None =>
         parent match
-          case Some(p) => p.lookup(name)
-          case None    => throw new EvalError(s"unbound variable: $name")
+          case Some(p) => p.lookup(name, pos)
+          case None =>
+            throw EvalError.withPos(s"unbound variable: $name", pos)
 
   def define(name: String, value: Value): Env =
     Env(bindings.updated(name, value), parent)
 
-  def extend(params: List[String], args: List[Value]): Env =
+  def extend(
+    params: List[String],
+    args: List[Value],
+    pos: Option[(Int, Int)] = None
+  ): Env =
     if params.length != args.length then
-      throw new EvalError(
-        s"wrong number of arguments: expected ${params.length}, got ${args.length}"
+      throw EvalError.withPos(
+        s"wrong number of arguments: expected ${params.length}, got ${args.length}",
+        pos
       )
     Env(params.zip(args).toMap, Some(this))

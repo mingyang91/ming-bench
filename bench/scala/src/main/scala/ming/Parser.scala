@@ -6,91 +6,114 @@ import scala.annotation.tailrec
 object Parser:
 
   enum Token:
-    case LParen
-    case RParen
-    case Quote
-    case Atom(value: String)
+    case LParen(line: Int, col: Int)
+    case RParen(line: Int, col: Int)
+    case Quote(line: Int, col: Int)
+    case Atom(value: String, line: Int, col: Int)
 
   def parse(input: String): List[Value] =
     val tokens = tokenize(input)
     parseAll(tokens, List.empty)
 
   @tailrec
-  private def parseAll(tokens: List[Token], acc: List[Value]): List[Value] =
+  private def parseAll(
+    tokens: List[Token],
+    acc: List[Value]
+  ): List[Value] =
     tokens match
       case Nil => acc
       case _ =>
         val (value, rest) = parseExpr(tokens)
         parseAll(rest, acc :+ value)
 
-  private def parseExpr(tokens: List[Token]): (Value, List[Token]) =
+  private def parseExpr(
+    tokens: List[Token]
+  ): (Value, List[Token]) =
     tokens match
       case Nil =>
         throw new EvalError("unexpected end of input")
-      case Token.Quote :: rest =>
+      case Token.Quote(l, c) :: rest =>
         val (value, remaining) = parseExpr(rest)
-        (Value.PairVal(Value.Symbol("quote"), Value.PairVal(value, Value.NilVal)), remaining)
-      case Token.LParen :: rest =>
-        parseList(rest, List.empty)
-      case Token.RParen :: _ =>
+        val inner              = Value.PairVal(value, Value.NilVal)
+        val outer =
+          Value.PairVal(Value.Symbol("quote"), inner, Some((l, c)))
+        (outer, remaining)
+      case Token.LParen(l, c) :: rest =>
+        parseList(rest, List.empty, (l, c))
+      case Token.RParen(_, _) :: _ =>
         throw new EvalError("unexpected )")
-      case Token.Atom(s) :: rest =>
-        (parseAtom(s), rest)
+      case Token.Atom(s, l, c) :: rest =>
+        (parseAtom(s, l, c), rest)
 
   @tailrec
   private def parseList(
     tokens: List[Token],
-    acc: List[Value]
+    acc: List[Value],
+    startPos: (Int, Int)
   ): (Value, List[Token]) =
     tokens match
       case Nil =>
         throw new EvalError("unexpected end of input, expected )")
-      case Token.RParen :: rest =>
-        val list = acc.foldRight(Value.NilVal: Value)(Value.PairVal(_, _))
-        (list, rest)
+      case Token.RParen(_, _) :: rest =>
+        val list =
+          acc.foldRight(Value.NilVal: Value)((h, t) => Value.PairVal(h, t))
+        val result = list match
+          case Value.PairVal(car, cdr, _) =>
+            Value.PairVal(car, cdr, Some(startPos))
+          case other => other
+        (result, rest)
       case _ =>
         val (value, rest) = parseExpr(tokens)
-        parseList(rest, acc :+ value)
+        parseList(rest, acc :+ value, startPos)
 
-  private def parseAtom(s: String): Value =
+  private def parseAtom(s: String, line: Int, col: Int): Value =
     if s == "#t" then Value.BoolVal(true)
     else if s == "#f" then Value.BoolVal(false)
     else if s.startsWith("\"") && s.endsWith("\"") then Value.StringVal(s.substring(1, s.length - 1))
     else
       s.toLongOption match
         case Some(n) => Value.IntVal(n)
-        case None    => Value.Symbol(s)
+        case None    => Value.Symbol(s, Some((line, col)))
+
+  private def posOf(input: String, offset: Int): (Int, Int) =
+    input.take(offset).foldLeft((1, 1)) {
+      case ((line, _), '\n') => (line + 1, 1)
+      case ((line, col), _)  => (line, col + 1)
+    }
 
   private def tokenize(input: String): List[Token] =
     tokenizeLoop(input, 0, List.empty)
 
   private def tokenizeChar(
     input: String,
-    pos: Int,
+    offset: Int,
     ch: Char
   ): (Option[Token], Int) =
+    val (line, col) = posOf(input, offset)
     ch match
-      case _ if ch.isWhitespace => (None, pos + 1)
-      case ';'                  => (None, skipLineComment(input, pos + 1))
-      case '('                  => (Some(Token.LParen), pos + 1)
-      case ')'                  => (Some(Token.RParen), pos + 1)
-      case '\''                 => (Some(Token.Quote), pos + 1)
+      case _ if ch.isWhitespace => (None, offset + 1)
+      case ';'                  => (None, skipLineComment(input, offset + 1))
+      case '('                  => (Some(Token.LParen(line, col)), offset + 1)
+      case ')'                  => (Some(Token.RParen(line, col)), offset + 1)
+      case '\''                 => (Some(Token.Quote(line, col)), offset + 1)
       case '"' =>
-        val (str, next) = readString(input, pos + 1, pos + 1)
-        (Some(Token.Atom("\"" + str + "\"")), next)
+        val (str, next) = readString(input, offset + 1, offset + 1)
+        (Some(Token.Atom("\"" + str + "\"", line, col)), next)
       case _ =>
-        val end = readAtomEnd(input, pos)
-        (Some(Token.Atom(input.substring(pos, end))), end)
+        val end = readAtomEnd(input, offset)
+        val tok = Token.Atom(input.substring(offset, end), line, col)
+        (Some(tok), end)
 
   @tailrec
   private def tokenizeLoop(
     input: String,
-    pos: Int,
+    offset: Int,
     acc: List[Token]
   ): List[Token] =
-    if pos >= input.length then acc
+    if offset >= input.length then acc
     else
-      val (token, next) = tokenizeChar(input, pos, input.charAt(pos))
+      val (token, next) =
+        tokenizeChar(input, offset, input.charAt(offset))
       token match
         case Some(t) => tokenizeLoop(input, next, acc :+ t)
         case None    => tokenizeLoop(input, next, acc)
