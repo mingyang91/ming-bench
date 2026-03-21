@@ -32,7 +32,7 @@ object Evaluator:
         capturedEnv.set("__callcc_replay__", Value.PairVal(ci.value, Value.NilVal), None)
         evalTopLevel(ci.remaining, capturedEnv, ci.capturedOut)
 
-  private def evalAll(
+  private[ming] def evalAll(
     exprs: List[Value],
     env: Env,
     out: String
@@ -43,22 +43,24 @@ object Evaluator:
         try eval(head, env, out)
         catch
           case setup: CallCCSetup =>
-            replayCallCC(setup, head, Nil, env, out)
+            Continuations.replayCallCC(setup, head, Nil, env, out)
           case ci: ContinuationInvoked =>
-            resumeContinuation(ci)
+            Continuations.resumeContinuation(ci)
       case head :: tail =>
         try
           val (_, newEnv, out2) = eval(head, env, out)
           val nextEnv = head match
             case Value.PairVal(Value.Symbol("define", _), _, _) =>
               patchClosures(newEnv)
+            case Value.PairVal(Value.Symbol("define-syntax", _), _, _) =>
+              newEnv
             case _ => env
           evalAll(tail, nextEnv, out2)
         catch
           case setup: CallCCSetup =>
-            replayCallCC(setup, head, tail, env, out)
+            Continuations.replayCallCC(setup, head, tail, env, out)
           case ci: ContinuationInvoked =>
-            resumeContinuation(ci)
+            Continuations.resumeContinuation(ci)
 
   /** Tie-the-knot: update named lambdas' closures so they can see all current bindings (enables mutual recursion at top
     * level).
@@ -95,8 +97,9 @@ object Evaluator:
       case head :: tail =>
         val (_, newEnv, out2) = eval(head, env, out)
         val nextEnv = head match
-          case Value.PairVal(Value.Symbol("define", _), _, _) => newEnv
-          case _                                              => env
+          case Value.PairVal(Value.Symbol("define", _), _, _)        => newEnv
+          case Value.PairVal(Value.Symbol("define-syntax", _), _, _) => newEnv
+          case _                                                     => env
         evalBodyTail(tail, nextEnv, out2)
 
   /** Trampoline: evaluate expr, looping on Bounce until Done. */
@@ -126,6 +129,7 @@ object Evaluator:
       case _: Value.MutableStringVal => Done(expr, env, out)
       case _: Value.LambdaVal        => Done(expr, env, out)
       case _: Value.ContinuationVal  => Done(expr, env, out)
+      case _: Value.MacroVal         => Done(expr, env, out)
       case Value.Symbol(name, pos) =>
         Done(env.lookup(name, pos), env, out)
       case Value.PairVal(car, _, pos) =>
@@ -161,12 +165,20 @@ object Evaluator:
       case Value.Symbol("newline", _) =>
         Done(Value.VoidVal, env, out + "\n")
       case Value.Symbol("call/cc" | "call-with-current-continuation", _) =>
-        handleCallCCForm(args, env, out)
+        Continuations.handleCallCCForm(args, env, out)
+      case Value.Symbol("define-syntax", _) =>
+        handleDefineSyntax(args, env, pos, out)
       case _ =>
         val (proc, _, out2) = eval(op, env, out)
         proc match
+          case m: Value.MacroVal =>
+            val (expanded, envBinds) = Macros.expand(m, op :: args)
+            val expEnv = envBinds.foldLeft(env) { case (e, (k, v)) =>
+              e.define(k, v)
+            }
+            Bounce(expanded, expEnv, out)
           case Value.Symbol("call/cc" | "call-with-current-continuation", _) =>
-            handleCallCCForm(args, env, out2)
+            Continuations.handleCallCCForm(args, env, out2)
           case _ =>
             val (evaledArgs, out3) = evalArgs(args, env, out2)
             applyProcTail(proc, evaledArgs, pos, out3)
@@ -242,48 +254,21 @@ object Evaluator:
     val listArgs   = toList(lastArg)
     applyProcTail(proc, prefixArgs ++ listArgs, pos, out)
 
-  /** Check if call/cc should replay or throw setup. */
-  private def handleCallCCForm(
+  private def handleDefineSyntax(
     args: List[Value],
     env: Env,
+    pos: Option[(Int, Int)],
     out: String
   ): EvalResult =
-    env.lookup("__callcc_replay__") match
-      case Value.PairVal(v, _, _) =>
-        env.set("__callcc_replay__", Value.NilVal, None)
-        Done(v, env, out)
+    args match
+      case Value.Symbol(name, _) :: transformer :: Nil =>
+        val parsed = Macros.parseSyntaxRules(transformer, env)
+        lazy val selfMacro: Value.MacroVal =
+          Value.MacroVal(parsed.rules, parsed.literals, () => selfEnv)
+        lazy val selfEnv: Env = env.define(name, selfMacro)
+        Done(Value.VoidVal, selfEnv, out)
       case _ =>
-        if args.length != 1 then throw new EvalError("call/cc requires 1 argument")
-        val (proc, _, out2) = eval(args.head, env, out)
-        throw new CallCCSetup(proc, out2, None)
-
-  /** Handle CallCCSetup: create continuation, call lambda, replay. */
-  private def replayCallCC(
-    setup: CallCCSetup,
-    currentExpr: Value,
-    remainingExprs: List[Value],
-    env: Env,
-    out: String
-  ): (Value, Env, String) =
-    val tag       = new Object()
-    val remaining = currentExpr :: remainingExprs
-    val cont      = Value.ContinuationVal(tag, remaining, () => env, out)
-    val callccResult: Value =
-      try
-        applyProcTail(setup.proc, List(cont), setup.pos, setup.output) match
-          case Done(v, _, _)       => v
-          case Bounce(e2, env2, o) => eval(e2, env2, o)._1
-      catch case ci: ContinuationInvoked if ci.tag eq tag => ci.value
-    env.set("__callcc_replay__", Value.PairVal(callccResult, Value.NilVal), None)
-    evalAll(remaining, env, out)
-
-  /** Resume a saved continuation. */
-  private def resumeContinuation(
-    ci: ContinuationInvoked
-  ): (Value, Env, String) =
-    val env = ci.envThunk()
-    env.set("__callcc_replay__", Value.PairVal(ci.value, Value.NilVal), None)
-    evalAll(ci.remaining, env, ci.capturedOut)
+        throw EvalError.withPos("bad define-syntax", pos)
 
   private[ming] def isFalsy(v: Value): Boolean = v match
     case Value.BoolVal(false) => true

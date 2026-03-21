@@ -27,6 +27,12 @@ enum Value:
     capturedOut: String
   )
 
+  case MacroVal(
+    rules: List[(Value, Value)],
+    literals: List[String],
+    defEnv: () => Env
+  )
+
   /** Extract string content from either StringVal or MutableStringVal. */
   def stringContent: Option[String] = this match
     case StringVal(s)         => Some(s)
@@ -45,6 +51,7 @@ enum Value:
     case PairVal(_, _, _)     => formatList(_.display)
     case _: LambdaVal         => "#<procedure>"
     case _: ContinuationVal   => "#<continuation>"
+    case _: MacroVal          => "#<macro>"
     case VoidVal              => ""
 
   /** Display representation (strings without quotes). */
