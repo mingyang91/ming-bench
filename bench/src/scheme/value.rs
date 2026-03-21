@@ -1,5 +1,7 @@
+use std::cell::RefCell;
 use std::collections::HashMap;
 use std::fmt;
+use std::rc::Rc;
 
 /// Source position tracking for error reporting.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Hash)]
@@ -26,7 +28,7 @@ pub enum Value {
     Lambda {
         params: Vec<String>,
         body: Vec<Value>,
-        env: HashMap<String, Value>,
+        env: HashMap<String, Rc<RefCell<Value>>>,
     },
 }
 

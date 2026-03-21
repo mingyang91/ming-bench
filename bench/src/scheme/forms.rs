@@ -1,6 +1,8 @@
 use super::{eval, is_truthy, Bounce, Env};
 use crate::scheme::error::EvalError;
 use crate::scheme::value::{Span, Value};
+use std::cell::RefCell;
+use std::rc::Rc;
 
 pub(crate) fn eval_define(
     args: &[Value],
@@ -12,7 +14,7 @@ pub(crate) fn eval_define(
         // (define x expr)
         [Value::Symbol(name, _), expr] => {
             let val = eval(expr, env, output)?;
-            env.insert(name.clone(), val);
+            env.insert(name.clone(), Rc::new(RefCell::new(val)));
             Ok(Value::Symbol(name.clone(), span))
         }
         // (define (f params...) body...)
@@ -29,7 +31,7 @@ pub(crate) fn eval_define(
                 body: body.to_vec(),
                 env: env.clone(),
             };
-            env.insert(name.clone(), lambda);
+            env.insert(name.clone(), Rc::new(RefCell::new(lambda)));
             Ok(Value::Symbol(name.clone(), span))
         }
         _ => Err(EvalError::Parse {
@@ -125,7 +127,7 @@ pub(crate) fn eval_let_step(
             });
         };
         let val = eval(expr, env, output)?;
-        local_env.insert(name.clone(), val);
+        local_env.insert(name.clone(), Rc::new(RefCell::new(val)));
     }
     eval_body_step(body, Value::Boolean(false), &mut local_env, output)
         .map(|b| match b {
@@ -225,6 +227,29 @@ pub(crate) fn eval_body_step(
         eval(expr, env, output)?;
     }
     Ok(Bounce::Continue(last.clone()))
+}
+
+pub(crate) fn eval_set(
+    args: &[Value],
+    env: &mut Env,
+    span: Span,
+    output: &mut String,
+) -> Result<Value, EvalError> {
+    let [Value::Symbol(name, name_span), expr] = args else {
+        return Err(EvalError::Parse {
+            message: "set! requires a variable name and an expression".to_string(),
+            span,
+        });
+    };
+    let val = eval(expr, env, output)?;
+    let Some(cell) = env.get(name) else {
+        return Err(EvalError::UnboundVariable {
+            name: name.clone(),
+            span: *name_span,
+        });
+    };
+    *cell.borrow_mut() = val;
+    Ok(Value::Boolean(false))
 }
 
 pub(crate) fn eval_string_set(

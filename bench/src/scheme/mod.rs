@@ -8,12 +8,14 @@ pub use error::EvalError;
 use builtins::{apply_builtin, is_builtin};
 use forms::{
     eval_and, eval_begin_step, eval_body_step, eval_cond_step, eval_define, eval_if_step,
-    eval_lambda, eval_let_step, eval_or, eval_quote, eval_string_set,
+    eval_lambda, eval_let_step, eval_or, eval_quote, eval_set, eval_string_set,
 };
+use std::cell::RefCell;
 use std::collections::HashMap;
+use std::rc::Rc;
 use value::{Span, Value};
 
-type Env = HashMap<String, Value>;
+type Env = HashMap<String, Rc<RefCell<Value>>>;
 
 /// Trampoline result for tail-call optimization.
 pub(crate) enum Bounce {
@@ -90,8 +92,7 @@ fn eval_step(value: &Value, env: &mut Env, output: &mut String) -> Result<Bounce
         | Value::Lambda { .. } => Ok(Bounce::Done(value.clone())),
         Value::Symbol(name, span) => env
             .get(name)
-            .cloned()
-            .map(Bounce::Done)
+            .map(|rc| Bounce::Done(rc.borrow().clone()))
             .ok_or_else(|| EvalError::UnboundVariable {
                 name: name.clone(),
                 span: *span,
@@ -124,6 +125,7 @@ fn eval_list_step(
             "let" => return eval_let_step(args, env, span, output),
             "begin" => return eval_begin_step(args, env, span, output),
             "cond" => return eval_cond_step(args, env, span, output),
+            "set!" => return eval_set(args, env, span, output).map(Bounce::Done),
             "string-set!" => return eval_string_set(args, env, span, output).map(Bounce::Done),
             _ => {}
         }
@@ -166,9 +168,9 @@ fn apply_step(
                 });
             }
             let mut local_env = env.clone();
-            local_env.extend(captured_env.clone());
+            local_env.extend(captured_env.iter().map(|(k, v)| (k.clone(), Rc::clone(v))));
             for (param, arg) in params.iter().zip(args) {
-                local_env.insert(param.clone(), arg.clone());
+                local_env.insert(param.clone(), Rc::new(RefCell::new(arg.clone())));
             }
             eval_body_step(body, Value::Boolean(false), &mut local_env, output)
                 .map(|b| match b {
