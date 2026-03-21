@@ -23,6 +23,7 @@ enum Value {
     },
     Builtin(String),
     Continuation { id: usize, top_expr_idx: usize, call_line: usize, call_col: usize },
+    DottedPair(Box<Value>, Box<Value>),
     Vector(Rc<RefCell<Vec<Value>>>),
     Macro {
         literals: Vec<String>,
@@ -72,6 +73,7 @@ impl Value {
                 let parts: Vec<String> = items.iter().map(|v| v.to_scheme_string()).collect();
                 format!("({})", parts.join(" "))
             }
+            Value::DottedPair(a, b) => format!("({} . {})", a.to_scheme_string(), b.to_scheme_string()),
         }
     }
 }
@@ -278,6 +280,9 @@ fn values_equal(a: &Value, b: &Value) -> bool {
             let ys = ys.borrow();
             xs.len() == ys.len() && xs.iter().zip(ys.iter()).all(|(a, b)| values_equal(a, b))
         }
+        (Value::DottedPair(a1, b1), Value::DottedPair(a2, b2)) => {
+            values_equal(a1, a2) && values_equal(b1, b2)
+        }
         _ => false,
     }
 }
@@ -290,6 +295,7 @@ fn is_builtin(name: &str) -> bool {
         "string-append" | "string-length" | "substring" |
         "string->number" | "number->string" | "symbol->string" | "string->symbol" |
         "string-copy" | "string-ref" | "char?" | "map" |
+        "list-ref" | "list-tail" | "list?" | "assoc" |
         "string->list" | "list->string" | "char->integer" | "integer->char" |
         "apply" | "call/cc" | "call-with-current-continuation" |
         "equal?" | "eq?" | "eqv?" |
@@ -1324,7 +1330,7 @@ fn apply_builtin(op: &str, args: &[Value], out: &mut String) -> Result<Value, Ev
                     new_list.extend(tail.iter().cloned());
                     Ok(Value::List(new_list))
                 }
-                _ => Err(EvalError::TypeError("cons: second argument must be a list".into())),
+                _ => Ok(Value::DottedPair(Box::new(args[0].clone()), Box::new(args[1].clone()))),
             }
         }
         "car" => {
@@ -1332,6 +1338,7 @@ fn apply_builtin(op: &str, args: &[Value], out: &mut String) -> Result<Value, Ev
             match &args[0] {
                 Value::List(items) if !items.is_empty() => Ok(items[0].clone()),
                 Value::List(_) => Err(EvalError::TypeError("car: empty list".into())),
+                Value::DottedPair(a, _) => Ok((**a).clone()),
                 _ => Err(EvalError::TypeError("car: not a pair".into())),
             }
         }
@@ -1340,6 +1347,7 @@ fn apply_builtin(op: &str, args: &[Value], out: &mut String) -> Result<Value, Ev
             match &args[0] {
                 Value::List(items) if !items.is_empty() => Ok(Value::List(items[1..].to_vec())),
                 Value::List(_) => Err(EvalError::TypeError("cdr: empty list".into())),
+                Value::DottedPair(_, b) => Ok((**b).clone()),
                 _ => Err(EvalError::TypeError("cdr: not a pair".into())),
             }
         }
@@ -1371,7 +1379,7 @@ fn apply_builtin(op: &str, args: &[Value], out: &mut String) -> Result<Value, Ev
         }
         "pair?" => {
             if args.len() != 1 { return Err(EvalError::Arity); }
-            Ok(Value::Boolean(matches!(&args[0], Value::List(items) if !items.is_empty())))
+            Ok(Value::Boolean(matches!(&args[0], Value::List(items) if !items.is_empty()) || matches!(&args[0], Value::DottedPair(_, _))))
         }
         "symbol?" => {
             if args.len() != 1 { return Err(EvalError::Arity); }
@@ -1494,27 +1502,96 @@ fn apply_builtin(op: &str, args: &[Value], out: &mut String) -> Result<Value, Ev
             Ok(Value::Boolean(matches!(&args[0], Value::Char(_))))
         }
         "map" => {
-            if args.len() != 2 { return Err(EvalError::Arity); }
+            if args.len() < 2 { return Err(EvalError::Arity); }
             let func = &args[0];
-            let items = match &args[1] {
-                Value::List(items) => items,
-                _ => return Err(EvalError::TypeError("map: expected list".into())),
-            };
+            let mut lists: Vec<&Vec<Value>> = Vec::new();
+            for a in &args[1..] {
+                match a {
+                    Value::List(items) => lists.push(items),
+                    _ => return Err(EvalError::TypeError("map: expected list".into())),
+                }
+            }
+            let len = lists[0].len();
             let mut results = Vec::new();
-            for item in items {
+            for i in 0..len {
+                let call_args: Vec<Value> = lists.iter().map(|l| l[i].clone()).collect();
                 match func {
-                    Value::Lambda { params, body, env: closed_env, .. } => {
-                        if params.len() != 1 {
-                            return Err(EvalError::Arity);
-                        }
+                    Value::Lambda { params, body, env: closed_env, rest_param, .. } => {
                         let mut local_env = closed_env.clone();
-                        env_set(&mut local_env, params[0].clone(), item.clone());
+                        for (p, v) in params.iter().zip(call_args.iter()) {
+                            env_set(&mut local_env, p.clone(), v.clone());
+                        }
+                        if let Some(rp) = rest_param {
+                            let rest = call_args[params.len()..].to_vec();
+                            env_set(&mut local_env, rp.clone(), Value::List(rest));
+                        }
                         results.push(eval(&body, &mut local_env, out)?);
+                    }
+                    Value::Builtin(name) => {
+                        results.push(apply_builtin(name, &call_args, out)?);
                     }
                     _ => return Err(EvalError::NotAProcedure),
                 }
             }
             Ok(Value::List(results))
+        }
+        "list-ref" => {
+            if args.len() != 2 { return Err(EvalError::Arity); }
+            let items = match &args[0] {
+                Value::List(items) => items,
+                _ => return Err(EvalError::TypeError("list-ref: expected list".into())),
+            };
+            let idx = match &args[1] {
+                Value::Integer(n) => *n as usize,
+                _ => return Err(EvalError::TypeError("list-ref: expected integer".into())),
+            };
+            if idx >= items.len() {
+                return Err(EvalError::TypeError("list-ref: index out of range".into()));
+            }
+            Ok(items[idx].clone())
+        }
+        "list-tail" => {
+            if args.len() != 2 { return Err(EvalError::Arity); }
+            let items = match &args[0] {
+                Value::List(items) => items,
+                _ => return Err(EvalError::TypeError("list-tail: expected list".into())),
+            };
+            let idx = match &args[1] {
+                Value::Integer(n) => *n as usize,
+                _ => return Err(EvalError::TypeError("list-tail: expected integer".into())),
+            };
+            if idx > items.len() {
+                return Err(EvalError::TypeError("list-tail: index out of range".into()));
+            }
+            Ok(Value::List(items[idx..].to_vec()))
+        }
+        "list?" => {
+            if args.len() != 1 { return Err(EvalError::Arity); }
+            Ok(Value::Boolean(matches!(&args[0], Value::List(_))))
+        }
+        "assoc" => {
+            if args.len() != 2 { return Err(EvalError::Arity); }
+            let key = &args[0];
+            let alist = match &args[1] {
+                Value::List(items) => items,
+                _ => return Err(EvalError::TypeError("assoc: expected list".into())),
+            };
+            for entry in alist {
+                match entry {
+                    Value::List(pair) if !pair.is_empty() => {
+                        if values_equal(&pair[0], key) {
+                            return Ok(entry.clone());
+                        }
+                    }
+                    Value::DottedPair(a, _) => {
+                        if values_equal(a, key) {
+                            return Ok(entry.clone());
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            Ok(Value::Boolean(false))
         }
         "string->list" => {
             if args.len() != 1 { return Err(EvalError::Arity); }
