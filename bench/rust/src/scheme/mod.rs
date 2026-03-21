@@ -81,11 +81,12 @@ enum RenderMode {
 }
 
 type EnvRef = Rc<Environment>;
+type BindingRef = Rc<RefCell<Value>>;
 
 #[derive(Debug)]
 struct Environment {
     parent: Option<EnvRef>,
-    bindings: RefCell<HashMap<String, Value>>,
+    bindings: RefCell<HashMap<String, BindingRef>>,
     output: Rc<RefCell<String>>,
 }
 
@@ -205,15 +206,32 @@ impl Environment {
     }
 
     fn define(&self, name: impl Into<String>, value: Value) {
-        self.bindings.borrow_mut().insert(name.into(), value);
+        self.bindings
+            .borrow_mut()
+            .insert(name.into(), Rc::new(RefCell::new(value)));
+    }
+
+    fn lookup_binding(&self, name: &str) -> Option<BindingRef> {
+        let binding = self.bindings.borrow().get(name).cloned();
+        binding.or_else(|| {
+            self.parent
+                .as_ref()
+                .and_then(|parent| parent.lookup_binding(name))
+        })
     }
 
     fn lookup(&self, name: &str) -> Option<Value> {
-        if let Some(value) = self.bindings.borrow().get(name).cloned() {
-            return Some(value);
-        }
+        self.lookup_binding(name)
+            .map(|binding| binding.borrow().clone())
+    }
 
-        self.parent.as_ref().and_then(|parent| parent.lookup(name))
+    fn set(&self, name: &str, value: Value) -> bool {
+        if let Some(binding) = self.lookup_binding(name) {
+            *binding.borrow_mut() = value;
+            true
+        } else {
+            false
+        }
     }
 }
 
@@ -609,6 +627,7 @@ fn eval_list(items: &[Expr], list_pos: SourcePos, env: &EnvRef) -> Result<Value,
     if let Expr::Symbol(name, pos) = head {
         match name.as_str() {
             "define" => return eval_define(&items[1..], *pos, env),
+            "set!" => return eval_set(&items[1..], *pos, env),
             "if" => return eval_if(&items[1..], *pos, env),
             "quote" => return eval_quote(&items[1..], *pos),
             "lambda" => return eval_lambda(&items[1..], *pos, env),
@@ -674,6 +693,23 @@ fn eval_if(parts: &[Expr], pos: SourcePos, env: &EnvRef) -> Result<Value, EvalEr
         eval_expr(consequent, env)
     } else {
         eval_expr(alternate, env)
+    }
+}
+
+fn eval_set(parts: &[Expr], pos: SourcePos, env: &EnvRef) -> Result<Value, EvalError> {
+    let [target, value_expr] = parts else {
+        return Err(wrong_arity(pos, "set!", "exactly 2", parts.len()));
+    };
+
+    let Expr::Symbol(name, name_pos) = target else {
+        return Err(syntax_error(target.pos(), "set! target must be a symbol"));
+    };
+
+    let value = eval_expr(value_expr, env)?;
+    if env.set(name, value) {
+        Ok(Value::Void)
+    } else {
+        Err(unbound_variable(*name_pos, name.clone()))
     }
 }
 
@@ -971,6 +1007,13 @@ fn eval_tail_expr(mut expr: &Expr, env: &EnvRef) -> Result<TailOutcome, EvalErro
                     match name.as_str() {
                         "define" => {
                             return Ok(TailOutcome::Value(eval_define(
+                                &items[1..],
+                                *pos,
+                                &current_env,
+                            )?))
+                        }
+                        "set!" => {
+                            return Ok(TailOutcome::Value(eval_set(
                                 &items[1..],
                                 *pos,
                                 &current_env,
