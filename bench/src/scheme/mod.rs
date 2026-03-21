@@ -295,7 +295,8 @@ fn is_builtin(name: &str) -> bool {
         "equal?" | "eq?" | "eqv?" |
         "vector" | "make-vector" | "vector-ref" | "vector-set!" | "vector-length" |
         "vector?" | "vector->list" | "list->vector" |
-        "abs" | "modulo" | "remainder" | "quotient" | "min" | "max" | "expt")
+        "abs" | "modulo" | "remainder" | "quotient" | "min" | "max" | "expt" |
+        "zero?" | "positive?" | "negative?" | "odd?" | "even?")
 }
 
 fn parse_params(param_asts: &[Ast]) -> Result<(Vec<String>, Option<String>), EvalError> {
@@ -1662,6 +1663,26 @@ fn apply_builtin(op: &str, args: &[Value], out: &mut String) -> Result<Value, Ev
             let exp = expect_integer(&args[1])?;
             if exp < 0 { return Err(EvalError::TypeError("expt: negative exponent".into())); }
             Ok(Value::Integer(base.pow(exp as u32)))
+        }
+        "zero?" => {
+            if args.len() != 1 { return Err(EvalError::Arity); }
+            Ok(Value::Boolean(expect_integer(&args[0])? == 0))
+        }
+        "positive?" => {
+            if args.len() != 1 { return Err(EvalError::Arity); }
+            Ok(Value::Boolean(expect_integer(&args[0])? > 0))
+        }
+        "negative?" => {
+            if args.len() != 1 { return Err(EvalError::Arity); }
+            Ok(Value::Boolean(expect_integer(&args[0])? < 0))
+        }
+        "odd?" => {
+            if args.len() != 1 { return Err(EvalError::Arity); }
+            Ok(Value::Boolean(expect_integer(&args[0])? % 2 != 0))
+        }
+        "even?" => {
+            if args.len() != 1 { return Err(EvalError::Arity); }
+            Ok(Value::Boolean(expect_integer(&args[0])? % 2 == 0))
         }
         _ => Err(EvalError::UndefinedVariable(op.to_string())),
     }
