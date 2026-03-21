@@ -1,4 +1,5 @@
 use std::cell::RefCell;
+use std::collections::HashSet;
 use std::fmt;
 use std::rc::Rc;
 
@@ -14,7 +15,7 @@ pub enum Value {
     String(String),
     Symbol(String),
     Char(char),
-    Pair(Box<Value>, Box<Value>),
+    Pair(Rc<RefCell<(Value, Value)>>),
     List(Vec<Value>),
     Vector(Rc<RefCell<Vec<Value>>>),
     Lambda {
@@ -72,7 +73,11 @@ impl PartialEq for Value {
             (Value::String(a), Value::String(b)) => a == b,
             (Value::Symbol(a), Value::Symbol(b)) => a == b,
             (Value::Char(a), Value::Char(b)) => a == b,
-            (Value::Pair(a1, a2), Value::Pair(b1, b2)) => a1 == b1 && a2 == b2,
+            (Value::Pair(a), Value::Pair(b)) => {
+                let ab = a.borrow();
+                let bb = b.borrow();
+                ab.0 == bb.0 && ab.1 == bb.1
+            }
             (Value::List(a), Value::List(b)) => a == b,
             (Value::Vector(a), Value::Vector(b)) => *a.borrow() == *b.borrow(),
             (Value::Builtin(a), Value::Builtin(b)) => a == b,
@@ -102,7 +107,7 @@ impl fmt::Display for Value {
             Value::Boolean(false) => write!(f, "#f"),
             Value::String(s) => write!(f, "\"{s}\""),
             Value::Char(c) => write!(f, "#\\{c}"),
-            Value::Pair(car, cdr) => write!(f, "({car} . {cdr})"),
+            Value::Pair(p) => fmt_pair_chain(f, p),
             Value::Symbol(s) => write!(f, "{s}"),
             Value::List(items) => fmt_list(f, items),
             Value::Vector(v) => fmt_vector(f, &v.borrow()),
@@ -115,6 +120,36 @@ impl fmt::Display for Value {
             Value::Void => write!(f, ""),
         }
     }
+}
+
+/// Format a pair chain, detecting proper lists and cycles.
+fn fmt_pair_chain(f: &mut fmt::Formatter<'_>, start: &Rc<RefCell<(Value, Value)>>) -> fmt::Result {
+    let mut seen = HashSet::new();
+    write!(f, "(")?;
+
+    let borrowed = start.borrow();
+    write!(f, "{}", borrowed.0)?;
+    seen.insert(Rc::as_ptr(start) as usize);
+
+    let mut cur = borrowed.1.clone();
+    drop(borrowed);
+
+    loop {
+        let p = match cur {
+            Value::Pair(p) => p,
+            Value::List(items) if items.is_empty() => { let _ = items; break; }
+            other => { write!(f, " . {other}")?; break; }
+        };
+        let ptr = Rc::as_ptr(&p) as usize;
+        if !seen.insert(ptr) {
+            write!(f, " . ...")?;
+            break;
+        }
+        let b = p.borrow();
+        write!(f, " {}", b.0)?;
+        cur = b.1.clone();
+    }
+    write!(f, ")")
 }
 
 fn fmt_values(f: &mut fmt::Formatter<'_>, vals: &[Value]) -> fmt::Result {
@@ -159,13 +194,44 @@ fn fmt_list(f: &mut fmt::Formatter<'_>, items: &[Value]) -> fmt::Result {
 }
 
 impl Value {
+    /// Create a new mutable pair.
+    pub fn new_pair(car: Value, cdr: Value) -> Value {
+        Value::Pair(Rc::new(RefCell::new((car, cdr))))
+    }
+
+    /// Build a proper list from a Vec of values (pair chain ending in nil).
+    pub fn make_list(items: Vec<Value>) -> Value {
+        items.into_iter().rev().fold(
+            Value::List(vec![]),
+            |acc, item| Value::new_pair(item, acc),
+        )
+    }
+
+    /// Collect a proper list into a Vec. Returns None for improper/circular lists.
+    pub fn collect_list(&self) -> Option<Vec<Value>> {
+        match self {
+            Value::List(items) => Some(items.clone()),
+            Value::Pair(_) => collect_pair_chain(self),
+            _ => None,
+        }
+    }
+
+    /// Check if this is a proper list (empty or pair chain ending in nil), with cycle detection.
+    pub fn is_proper_list(&self) -> bool {
+        match self {
+            Value::List(_) => true,
+            Value::Pair(_) => self.collect_list().is_some(),
+            _ => false,
+        }
+    }
+
     pub fn is_truthy(&self) -> bool {
         !matches!(self, Value::Boolean(false))
     }
 
     /// Check if this value is a pair (non-empty list or dotted pair).
     pub fn is_pair(&self) -> bool {
-        matches!(self, Value::List(l) if !l.is_empty()) || matches!(self, Value::Pair(_, _))
+        matches!(self, Value::List(l) if !l.is_empty()) || matches!(self, Value::Pair(_))
     }
 
     /// Check if this value is a number (integer, rational, or float).
@@ -178,18 +244,17 @@ impl Value {
         matches!(self, Value::Integer(_))
     }
 
+    /// Check if this is nil (empty list).
+    pub fn is_nil(&self) -> bool {
+        matches!(self, Value::List(items) if items.is_empty())
+    }
+
     /// Format for `display` — strings without quotes, chars as plain characters.
     pub fn display_fmt(&self, buf: &mut String) {
         match self {
             Value::String(s) => buf.push_str(s),
             Value::Char(c) => buf.push(*c),
-            Value::Pair(car, cdr) => {
-                buf.push('(');
-                car.display_fmt(buf);
-                buf.push_str(" . ");
-                cdr.display_fmt(buf);
-                buf.push(')');
-            }
+            Value::Pair(p) => display_pair_chain(p, buf),
             Value::List(items) => Self::display_list(items, buf),
             Value::Vector(v) => Self::display_vector(&v.borrow(), buf),
             Value::Continuation { .. } | Value::Macro { .. } => buf.push_str("#<procedure>"),
@@ -245,4 +310,55 @@ impl Value {
         }
         buf.push(')');
     }
+}
+
+/// Walk a pair chain, collecting values into a Vec.
+/// Returns None for improper or circular lists.
+fn collect_pair_chain(start: &Value) -> Option<Vec<Value>> {
+    let mut result = Vec::new();
+    let mut cur = start.clone();
+    let mut seen = HashSet::new();
+    loop {
+        let p = match cur {
+            Value::Pair(p) => p,
+            Value::List(items) if items.is_empty() => { let _ = items; return Some(result); }
+            _ => return None,
+        };
+        let ptr = Rc::as_ptr(&p) as usize;
+        if !seen.insert(ptr) { return None; }
+        let b = p.borrow();
+        result.push(b.0.clone());
+        cur = b.1.clone();
+    }
+}
+
+/// Display a pair chain with cycle detection for `display` output.
+fn display_pair_chain(start: &Rc<RefCell<(Value, Value)>>, buf: &mut String) {
+    let mut seen = HashSet::new();
+    buf.push('(');
+
+    let borrowed = start.borrow();
+    borrowed.0.display_fmt(buf);
+    seen.insert(Rc::as_ptr(start) as usize);
+
+    let mut cur = borrowed.1.clone();
+    drop(borrowed);
+
+    loop {
+        let p = match cur {
+            Value::Pair(p) => p,
+            Value::List(items) if items.is_empty() => { let _ = items; break; }
+            other => { buf.push_str(" . "); other.display_fmt(buf); break; }
+        };
+        let ptr = Rc::as_ptr(&p) as usize;
+        if !seen.insert(ptr) {
+            buf.push_str(" . ...");
+            break;
+        }
+        let b = p.borrow();
+        buf.push(' ');
+        b.0.display_fmt(buf);
+        cur = b.1.clone();
+    }
+    buf.push(')');
 }
