@@ -1,10 +1,12 @@
 mod builtins;
 pub mod error;
+mod forms;
 pub mod parser;
 pub mod value;
 
 pub use error::EvalError;
 use builtins::{apply_builtin, is_builtin};
+use forms::{eval_and, eval_begin, eval_body, eval_cond, eval_define, eval_if, eval_lambda, eval_let, eval_or, eval_quote};
 use std::collections::HashMap;
 use value::Value;
 
@@ -61,6 +63,9 @@ fn eval_list(items: &[Value], env: &mut Env) -> Result<Value, EvalError> {
             "and" => return eval_and(args, env),
             "or" => return eval_or(args, env),
             "lambda" => return eval_lambda(args, env),
+            "let" => return eval_let(args, env),
+            "begin" => return eval_begin(args, env),
+            "cond" => return eval_cond(args, env),
             _ => {}
         }
     }
@@ -80,98 +85,6 @@ fn eval_list(items: &[Value], env: &mut Env) -> Result<Value, EvalError> {
         .collect::<Result<_, _>>()?;
 
     apply(proc, &evaluated_args, env)
-}
-
-fn eval_define(args: &[Value], env: &mut Env) -> Result<Value, EvalError> {
-    match args {
-        // (define x expr)
-        [Value::Symbol(name), expr] => {
-            let val = eval(expr, env)?;
-            env.insert(name.clone(), val);
-            Ok(Value::Symbol(name.clone()))
-        }
-        // (define (f params...) body...)
-        [Value::List(signature), body @ ..] if !signature.is_empty() && !body.is_empty() => {
-            let [Value::Symbol(name), param_vals @ ..] = signature.as_slice() else {
-                return Err(EvalError::Parse {
-                    message: "define: first element of signature must be a symbol".to_string(),
-                });
-            };
-            let params: Vec<String> = param_vals
-                .iter()
-                .map(|v| match v {
-                    Value::Symbol(s) => Ok(s.clone()),
-                    other => Err(EvalError::TypeError {
-                        expected: "symbol".to_string(),
-                        got: format!("{other}"),
-                    }),
-                })
-                .collect::<Result<_, _>>()?;
-            let lambda = Value::Lambda {
-                params,
-                body: body.to_vec(),
-                env: env.clone(),
-            };
-            env.insert(name.clone(), lambda);
-            Ok(Value::Symbol(name.clone()))
-        }
-        _ => Err(EvalError::Parse {
-            message: "define requires a symbol and an expression".to_string(),
-        }),
-    }
-}
-
-fn eval_if(args: &[Value], env: &mut Env) -> Result<Value, EvalError> {
-    let [condition, consequent, alternative] = args else {
-        return Err(EvalError::WrongArgCount {
-            expected: 3,
-            got: args.len(),
-        });
-    };
-    let cond_val = eval(condition, env)?;
-    if is_truthy(&cond_val) {
-        eval(consequent, env)
-    } else {
-        eval(alternative, env)
-    }
-}
-
-fn eval_quote(args: &[Value]) -> Result<Value, EvalError> {
-    let [expr] = args else {
-        return Err(EvalError::WrongArgCount {
-            expected: 1,
-            got: args.len(),
-        });
-    };
-    Ok(expr.clone())
-}
-
-fn eval_lambda(args: &[Value], env: &Env) -> Result<Value, EvalError> {
-    let [Value::List(param_list), body @ ..] = args else {
-        return Err(EvalError::Parse {
-            message: "lambda requires a parameter list and body".to_string(),
-        });
-    };
-    if body.is_empty() {
-        return Err(EvalError::Parse {
-            message: "lambda requires a body".to_string(),
-        });
-    }
-    let params: Vec<String> = param_list
-        .iter()
-        .map(|v| match v {
-            Value::Symbol(s) => Ok(s.clone()),
-            other => Err(EvalError::TypeError {
-                expected: "symbol".to_string(),
-                got: format!("{other}"),
-            }),
-        })
-        .collect::<Result<_, _>>()?;
-    Ok(Value::Lambda {
-        params,
-        body: body.to_vec(),
-        env: env.clone(),
-    })
 }
 
 fn apply(proc: Value, args: &[Value], env: &mut Env) -> Result<Value, EvalError> {
@@ -194,11 +107,7 @@ fn apply(proc: Value, args: &[Value], env: &mut Env) -> Result<Value, EvalError>
             for (param, arg) in params.iter().zip(args) {
                 local_env.insert(param.clone(), arg.clone());
             }
-            let mut result = Value::Boolean(false);
-            for expr in &body {
-                result = eval(expr, &mut local_env)?;
-            }
-            Ok(result)
+            eval_body(&body, Value::Boolean(false), &mut local_env)
         }
         other => Err(EvalError::TypeError {
             expected: "procedure".to_string(),
@@ -219,28 +128,6 @@ pub(crate) fn eval_to_integer(value: &Value, env: &mut Env) -> Result<i64, EvalE
 
 pub(crate) fn is_truthy(value: &Value) -> bool {
     !matches!(value, Value::Boolean(false))
-}
-
-fn eval_and(args: &[Value], env: &mut Env) -> Result<Value, EvalError> {
-    let mut result = Value::Boolean(true);
-    for arg in args {
-        result = eval(arg, env)?;
-        if !is_truthy(&result) {
-            return Ok(result);
-        }
-    }
-    Ok(result)
-}
-
-fn eval_or(args: &[Value], env: &mut Env) -> Result<Value, EvalError> {
-    let mut result = Value::Boolean(false);
-    for arg in args {
-        result = eval(arg, env)?;
-        if is_truthy(&result) {
-            return Ok(result);
-        }
-    }
-    Ok(result)
 }
 
 #[cfg(test)]
