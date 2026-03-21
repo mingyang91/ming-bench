@@ -146,6 +146,11 @@ pub enum EvalError {
         location: SourceLocation,
         name: String,
     },
+    #[error("{location}: uncaught exception: {value}")]
+    UncaughtException {
+        location: SourceLocation,
+        value: String,
+    },
     #[error("{location}: division by zero")]
     DivisionByZero { location: SourceLocation },
     #[error("{location}: unsupported exponent: {exponent}")]

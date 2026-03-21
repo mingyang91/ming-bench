@@ -48,6 +48,39 @@ impl DynamicWind {
 }
 
 #[derive(Clone)]
+pub(crate) struct RaisedException {
+    value: Value,
+    location: SourceLocation,
+}
+
+impl RaisedException {
+    pub(crate) fn new(value: Value, location: SourceLocation) -> Self {
+        Self { value, location }
+    }
+
+    pub(crate) fn value(&self) -> &Value {
+        &self.value
+    }
+
+    pub(crate) fn location(&self) -> SourceLocation {
+        self.location
+    }
+}
+
+#[derive(Clone)]
+pub(crate) enum ExceptionHandler {
+    Procedure {
+        callable: Value,
+        location: SourceLocation,
+    },
+    Guard {
+        variable: String,
+        clauses: Vec<Expr>,
+        environment: Environment,
+    },
+}
+
+#[derive(Clone)]
 pub(crate) enum Frame {
     Sequence {
         remaining_rev: Vec<Expr>,
@@ -122,12 +155,28 @@ pub(crate) enum Frame {
     DynamicWindContext {
         wind: Rc<DynamicWind>,
     },
+    ExceptionHandler {
+        handler: ExceptionHandler,
+    },
+    ExceptionTransition {
+        active_winds: Vec<Rc<DynamicWind>>,
+        exit_winds: Vec<Rc<DynamicWind>>,
+        target_continuation: Vec<Frame>,
+        handler: ExceptionHandler,
+        exception: RaisedException,
+    },
     ContinuationTransition {
         active_winds: Vec<Rc<DynamicWind>>,
         exit_winds: Vec<Rc<DynamicWind>>,
         enter_winds: Vec<Rc<DynamicWind>>,
         target_continuation: Vec<Frame>,
         value: Value,
+    },
+    GuardClause {
+        body: Vec<Expr>,
+        remaining_clauses_rev: Vec<Expr>,
+        environment: Environment,
+        exception: RaisedException,
     },
     RecursiveLet {
         binding_name: String,

@@ -29,6 +29,8 @@ pub enum Value {
     Builtin(BuiltinProcedure),
     CallWithCurrentContinuation,
     DynamicWind,
+    Raise,
+    WithExceptionHandler,
     Continuation(Rc<CapturedContinuation>),
     Closure(Closure),
     Void,
@@ -94,6 +96,8 @@ impl Value {
             Self::Builtin(procedure) => format!("#<procedure:{}>", procedure.name()),
             Self::CallWithCurrentContinuation => "#<procedure:call/cc>".into(),
             Self::DynamicWind => "#<procedure:dynamic-wind>".into(),
+            Self::Raise => "#<procedure:raise>".into(),
+            Self::WithExceptionHandler => "#<procedure:with-exception-handler>".into(),
             Self::Continuation(_) => "#<continuation>".into(),
             Self::Closure(closure) => render_closure(closure),
             Self::Void => "#<void>".into(),
@@ -173,6 +177,8 @@ impl Value {
             Self::Builtin(_)
             | Self::CallWithCurrentContinuation
             | Self::DynamicWind
+            | Self::Raise
+            | Self::WithExceptionHandler
             | Self::Continuation(_)
             | Self::Closure(_) => "procedure",
             Self::Void => "void",

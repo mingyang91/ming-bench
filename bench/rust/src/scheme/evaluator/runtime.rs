@@ -3,7 +3,9 @@ use std::rc::Rc;
 
 use crate::scheme::ast::{Expr, SourceLocation};
 use crate::scheme::builtins::{apply_builtin, install_builtins};
-use crate::scheme::continuation::{CapturedContinuation, DynamicWind, Frame};
+use crate::scheme::continuation::{
+    CapturedContinuation, DynamicWind, ExceptionHandler, Frame, RaisedException,
+};
 use crate::scheme::environment::Environment;
 use crate::scheme::equality::is_eqv;
 use crate::scheme::error::{ArgCount, EvalError};
@@ -22,6 +24,10 @@ enum State {
         callable: Value,
         arguments: Vec<Value>,
         location: SourceLocation,
+        continuation: ContinuationFrames,
+    },
+    Raise {
+        exception: RaisedException,
         continuation: ContinuationFrames,
     },
     Return {
@@ -111,6 +117,8 @@ fn install_runtime_procedures(environment: &Environment) {
         Value::CallWithCurrentContinuation,
     );
     environment.define("dynamic-wind", Value::DynamicWind);
+    environment.define("raise", Value::Raise);
+    environment.define("with-exception-handler", Value::WithExceptionHandler);
 }
 
 fn run(
@@ -131,6 +139,10 @@ fn run(
                 location,
                 continuation,
             } => apply_value(callable, arguments, location, continuation, output)?,
+            State::Raise {
+                exception,
+                continuation,
+            } => raise_exception(exception, continuation)?,
             State::Return {
                 value,
                 continuation,
@@ -299,6 +311,7 @@ fn eval_special_form(
         "begin" => eval_sequence(arguments.to_vec(), environment, continuation).map(Some),
         "cond" => eval_cond(arguments.to_vec(), environment, continuation).map(Some),
         "case" => eval_case(arguments, location, environment, continuation).map(Some),
+        "guard" => eval_guard(arguments, location, environment, continuation).map(Some),
         _ => Ok(None),
     }
 }
@@ -905,6 +918,41 @@ fn eval_case(
     })
 }
 
+fn eval_guard(
+    arguments: &[Expr],
+    location: SourceLocation,
+    environment: Environment,
+    mut continuation: ContinuationFrames,
+) -> Result<State, EvalError> {
+    let Some((specification, body)) = arguments.split_first() else {
+        return Err(EvalError::WrongArgumentCount {
+            location,
+            procedure: "guard",
+            expected: ArgCount::AtLeast(2),
+            got: 0,
+        });
+    };
+    if body.is_empty() {
+        return Err(EvalError::WrongArgumentCount {
+            location,
+            procedure: "guard",
+            expected: ArgCount::AtLeast(2),
+            got: 1,
+        });
+    }
+
+    let (variable, clauses) = parse_guard_spec(specification, location)?;
+    continuation.push(Frame::ExceptionHandler {
+        handler: ExceptionHandler::Guard {
+            variable,
+            clauses,
+            environment: environment.clone(),
+        },
+    });
+
+    eval_required_sequence(body.to_vec(), environment, "guard", location, continuation)
+}
+
 fn eval_sequence(
     expressions: Vec<Expr>,
     environment: Environment,
@@ -955,11 +1003,108 @@ fn eval_required_sequence(
     eval_sequence(body, environment, continuation)
 }
 
+fn eval_guard_handler(
+    variable: String,
+    clauses: Vec<Expr>,
+    environment: Environment,
+    exception: RaisedException,
+    continuation: ContinuationFrames,
+) -> Result<State, EvalError> {
+    let scope = environment.child();
+    scope.define(variable, exception.value().clone());
+
+    let mut remaining_clauses_rev = clauses;
+    remaining_clauses_rev.reverse();
+    eval_reversed_guard_clauses(remaining_clauses_rev, scope, exception, continuation)
+}
+
+fn eval_reversed_guard_clauses(
+    mut remaining_clauses_rev: Vec<Expr>,
+    environment: Environment,
+    exception: RaisedException,
+    mut continuation: ContinuationFrames,
+) -> Result<State, EvalError> {
+    let Some(clause) = remaining_clauses_rev.pop() else {
+        return Ok(State::Raise {
+            exception,
+            continuation,
+        });
+    };
+
+    let clause_location = clause.location();
+    let Expr::List { items, .. } = clause else {
+        return Err(EvalError::MalformedSpecialForm {
+            location: clause_location,
+            form: "guard",
+        });
+    };
+    let Some((test, body)) = split_first(items) else {
+        return Err(EvalError::MalformedSpecialForm {
+            location: clause_location,
+            form: "guard",
+        });
+    };
+
+    if matches!(&test, Expr::Symbol { name, .. } if name == "else") {
+        if !remaining_clauses_rev.is_empty() {
+            return Err(EvalError::MalformedSpecialForm {
+                location: test.location(),
+                form: "guard",
+            });
+        }
+        return eval_required_sequence(body, environment, "guard", clause_location, continuation);
+    }
+
+    continuation.push(Frame::GuardClause {
+        body,
+        remaining_clauses_rev,
+        environment: environment.clone(),
+        exception,
+    });
+
+    Ok(State::Eval {
+        expression: test,
+        environment,
+        continuation,
+    })
+}
+
 fn continue_with_frame(
     frame: Frame,
     value: Value,
     continuation: ContinuationFrames,
     macro_environment: &MacroEnvironment,
+) -> Result<State, EvalError> {
+    match frame {
+        Frame::Sequence { .. }
+        | Frame::If { .. }
+        | Frame::Define { .. }
+        | Frame::Set { .. }
+        | Frame::And { .. }
+        | Frame::Or { .. } => continue_control_frame(frame, value, continuation),
+        Frame::ApplyOperator { .. } | Frame::ApplyArgument { .. } => {
+            continue_apply_frame(frame, value, continuation)
+        }
+        Frame::StandardLet { .. } | Frame::NamedLet { .. } | Frame::RecursiveLet { .. } => {
+            continue_binding_frame(frame, value, continuation, macro_environment)
+        }
+        Frame::CondClause { .. } | Frame::GuardClause { .. } | Frame::Case { .. } => {
+            continue_branch_frame(frame, value, continuation)
+        }
+        Frame::DynamicWindBefore { .. }
+        | Frame::DynamicWindExit { .. }
+        | Frame::DynamicWindAfter { .. }
+        | Frame::DynamicWindContext { .. }
+        | Frame::ExceptionHandler { .. }
+        | Frame::ExceptionTransition { .. }
+        | Frame::ContinuationTransition { .. } => continue_effect_frame(frame, value, continuation),
+    }
+}
+
+fn continue_control_frame(
+    frame: Frame,
+    value: Value,
+    continuation: ContinuationFrames,
 ) -> Result<State, EvalError> {
     match frame {
         Frame::Sequence {
@@ -987,6 +1132,16 @@ fn continue_with_frame(
             remaining_rev,
             environment,
         } => continue_or(remaining_rev, environment, value, continuation),
+        _ => unreachable!("non-control frame routed to continue_control_frame"),
+    }
+}
+
+fn continue_apply_frame(
+    frame: Frame,
+    value: Value,
+    continuation: ContinuationFrames,
+) -> Result<State, EvalError> {
+    match frame {
         Frame::ApplyOperator {
             arguments,
             environment,
@@ -1007,6 +1162,17 @@ fn continue_with_frame(
             value,
             continuation,
         ),
+        _ => unreachable!("non-apply frame routed to continue_apply_frame"),
+    }
+}
+
+fn continue_binding_frame(
+    frame: Frame,
+    value: Value,
+    continuation: ContinuationFrames,
+    macro_environment: &MacroEnvironment,
+) -> Result<State, EvalError> {
+    match frame {
         Frame::StandardLet {
             names,
             pending,
@@ -1048,36 +1214,6 @@ fn continue_with_frame(
             continuation,
             macro_environment,
         ),
-        Frame::CondClause {
-            body,
-            remaining_clauses_rev,
-            environment,
-        } => continue_cond_clause(
-            body,
-            remaining_clauses_rev,
-            environment,
-            value,
-            continuation,
-        ),
-        Frame::DynamicWindBefore { body, wind } => {
-            continue_dynamic_wind_before(body, wind, continuation)
-        }
-        Frame::DynamicWindExit { wind } => continue_dynamic_wind_exit(wind, value, continuation),
-        Frame::DynamicWindAfter { value } => continue_dynamic_wind_after(value, continuation),
-        Frame::DynamicWindContext { .. } => continue_dynamic_wind_context(value, continuation),
-        Frame::ContinuationTransition {
-            active_winds,
-            exit_winds,
-            enter_winds,
-            target_continuation,
-            value,
-        } => continue_continuation_transition(
-            active_winds,
-            exit_winds,
-            enter_winds,
-            target_continuation,
-            value,
-        ),
         Frame::RecursiveLet {
             binding_name,
             pending_rev,
@@ -1097,10 +1233,88 @@ fn continue_with_frame(
             value,
             continuation,
         ),
+        _ => unreachable!("non-binding frame routed to continue_binding_frame"),
+    }
+}
+
+fn continue_branch_frame(
+    frame: Frame,
+    value: Value,
+    continuation: ContinuationFrames,
+) -> Result<State, EvalError> {
+    match frame {
+        Frame::CondClause {
+            body,
+            remaining_clauses_rev,
+            environment,
+        } => continue_cond_clause(
+            body,
+            remaining_clauses_rev,
+            environment,
+            value,
+            continuation,
+        ),
+        Frame::GuardClause {
+            body,
+            remaining_clauses_rev,
+            environment,
+            exception,
+        } => continue_guard_clause(
+            body,
+            remaining_clauses_rev,
+            environment,
+            exception,
+            value,
+            continuation,
+        ),
         Frame::Case {
             clauses_rev,
             environment,
         } => continue_case(clauses_rev, environment, value, continuation),
+        _ => unreachable!("non-branch frame routed to continue_branch_frame"),
+    }
+}
+
+fn continue_effect_frame(
+    frame: Frame,
+    value: Value,
+    continuation: ContinuationFrames,
+) -> Result<State, EvalError> {
+    match frame {
+        Frame::DynamicWindBefore { body, wind } => {
+            continue_dynamic_wind_before(body, wind, continuation)
+        }
+        Frame::DynamicWindExit { wind } => continue_dynamic_wind_exit(wind, value, continuation),
+        Frame::DynamicWindAfter { value } => continue_dynamic_wind_after(value, continuation),
+        Frame::DynamicWindContext { .. } => continue_dynamic_wind_context(value, continuation),
+        Frame::ExceptionHandler { .. } => continue_exception_handler(value, continuation),
+        Frame::ExceptionTransition {
+            active_winds,
+            exit_winds,
+            target_continuation,
+            handler,
+            exception,
+        } => continue_exception_transition(
+            active_winds,
+            exit_winds,
+            target_continuation,
+            handler,
+            exception,
+        ),
+        Frame::ContinuationTransition {
+            active_winds,
+            exit_winds,
+            enter_winds,
+            target_continuation,
+            value,
+        } => continue_continuation_transition(
+            active_winds,
+            exit_winds,
+            enter_winds,
+            target_continuation,
+            value,
+        ),
+        _ => unreachable!("non-effect frame routed to continue_effect_frame"),
     }
 }
 
@@ -1366,6 +1580,33 @@ fn continue_cond_clause(
     eval_sequence(body, environment, continuation)
 }
 
+fn continue_guard_clause(
+    body: Vec<Expr>,
+    remaining_clauses_rev: Vec<Expr>,
+    environment: Environment,
+    exception: RaisedException,
+    value: Value,
+    continuation: ContinuationFrames,
+) -> Result<State, EvalError> {
+    if !value.is_truthy() {
+        return eval_reversed_guard_clauses(
+            remaining_clauses_rev,
+            environment,
+            exception,
+            continuation,
+        );
+    }
+
+    if body.is_empty() {
+        return Ok(State::Return {
+            value,
+            continuation,
+        });
+    }
+
+    eval_sequence(body, environment, continuation)
+}
+
 fn continue_dynamic_wind_before(
     body: Value,
     wind: Rc<DynamicWind>,
@@ -1412,6 +1653,53 @@ fn continue_dynamic_wind_context(
         value,
         continuation,
     })
+}
+
+fn continue_exception_handler(
+    value: Value,
+    continuation: ContinuationFrames,
+) -> Result<State, EvalError> {
+    Ok(State::Return {
+        value,
+        continuation,
+    })
+}
+
+fn continue_exception_transition(
+    mut active_winds: Vec<Rc<DynamicWind>>,
+    mut exit_winds: Vec<Rc<DynamicWind>>,
+    target_continuation: ContinuationFrames,
+    handler: ExceptionHandler,
+    exception: RaisedException,
+) -> Result<State, EvalError> {
+    if let Some(wind) = exit_winds.first().cloned() {
+        let popped = active_winds
+            .pop()
+            .expect("exception transition should only exit active winds");
+        debug_assert!(
+            Rc::ptr_eq(&popped, &wind),
+            "exception transition should unwind from innermost wind"
+        );
+        exit_winds.remove(0);
+        let continuation = transition_continuation(
+            &active_winds,
+            Frame::ExceptionTransition {
+                active_winds: active_winds.clone(),
+                exit_winds,
+                target_continuation,
+                handler,
+                exception,
+            },
+        );
+        return Ok(State::Apply {
+            callable: wind.after(),
+            arguments: Vec::new(),
+            location: wind.location(),
+            continuation,
+        });
+    }
+
+    invoke_exception_handler(handler, exception, target_continuation)
 }
 
 fn continue_continuation_transition(
@@ -1535,6 +1823,10 @@ fn apply_value(
             apply_call_with_current_continuation(arguments, location, continuation)
         }
         Value::DynamicWind => apply_dynamic_wind(arguments, location, continuation),
+        Value::Raise => apply_raise(arguments, location, continuation),
+        Value::WithExceptionHandler => {
+            apply_with_exception_handler(arguments, location, continuation)
+        }
         Value::Continuation(captured) => {
             apply_continuation(captured, arguments, location, continuation)
         }
@@ -1634,6 +1926,55 @@ fn apply_dynamic_wind(
     })
 }
 
+fn apply_raise(
+    arguments: Vec<Value>,
+    location: SourceLocation,
+    continuation: ContinuationFrames,
+) -> Result<State, EvalError> {
+    let [value] = arguments.as_slice() else {
+        return Err(EvalError::WrongArgumentCount {
+            location,
+            procedure: "raise",
+            expected: ArgCount::Exactly(1),
+            got: arguments.len(),
+        });
+    };
+
+    Ok(State::Raise {
+        exception: RaisedException::new(value.clone(), location),
+        continuation,
+    })
+}
+
+fn apply_with_exception_handler(
+    arguments: Vec<Value>,
+    location: SourceLocation,
+    mut continuation: ContinuationFrames,
+) -> Result<State, EvalError> {
+    let [handler, thunk] = arguments.as_slice() else {
+        return Err(EvalError::WrongArgumentCount {
+            location,
+            procedure: "with-exception-handler",
+            expected: ArgCount::Exactly(2),
+            got: arguments.len(),
+        });
+    };
+
+    continuation.push(Frame::ExceptionHandler {
+        handler: ExceptionHandler::Procedure {
+            callable: handler.clone(),
+            location,
+        },
+    });
+
+    Ok(State::Apply {
+        callable: thunk.clone(),
+        arguments: Vec::new(),
+        location,
+        continuation,
+    })
+}
+
 fn apply_continuation(
     captured: Rc<CapturedContinuation>,
     arguments: Vec<Value>,
@@ -1654,6 +1995,68 @@ fn apply_continuation(
         normalize_resumed_continuation(captured.frames(), value),
         value.clone(),
     )
+}
+
+fn raise_exception(
+    exception: RaisedException,
+    continuation: ContinuationFrames,
+) -> Result<State, EvalError> {
+    let Some((handler, target_continuation)) =
+        split_continuation_at_exception_handler(continuation.clone())
+    else {
+        return Err(EvalError::UncaughtException {
+            location: exception.location(),
+            value: exception.value().render(),
+        });
+    };
+
+    let current_winds = continuation_winds(&continuation);
+    let target_winds = continuation_winds(&target_continuation);
+    let shared_prefix = shared_wind_prefix(&current_winds, &target_winds);
+
+    continue_exception_transition(
+        current_winds.clone(),
+        current_winds[shared_prefix..]
+            .iter()
+            .rev()
+            .cloned()
+            .collect(),
+        target_continuation,
+        handler,
+        exception,
+    )
+}
+
+fn split_continuation_at_exception_handler(
+    mut continuation: ContinuationFrames,
+) -> Option<(ExceptionHandler, ContinuationFrames)> {
+    while let Some(frame) = continuation.pop() {
+        if let Frame::ExceptionHandler { handler } = frame {
+            return Some((handler, continuation));
+        }
+    }
+
+    None
+}
+
+fn invoke_exception_handler(
+    handler: ExceptionHandler,
+    exception: RaisedException,
+    continuation: ContinuationFrames,
+) -> Result<State, EvalError> {
+    match handler {
+        ExceptionHandler::Procedure { callable, location } => Ok(State::Apply {
+            callable,
+            arguments: vec![exception.value().clone()],
+            location,
+            continuation,
+        }),
+        ExceptionHandler::Guard {
+            variable,
+            clauses,
+            environment,
+        } => eval_guard_handler(variable, clauses, environment, exception, continuation),
+    }
 }
 
 fn resume_continuation(
@@ -1831,6 +2234,32 @@ fn malformed_case(location: SourceLocation) -> EvalError {
         location,
         form: "case",
     }
+}
+
+fn parse_guard_spec(
+    specification: &Expr,
+    location: SourceLocation,
+) -> Result<(String, Vec<Expr>), EvalError> {
+    let Expr::List { items, .. } = specification else {
+        return Err(EvalError::MalformedSpecialForm {
+            location,
+            form: "guard",
+        });
+    };
+    let Some((variable, clauses)) = items.split_first() else {
+        return Err(EvalError::MalformedSpecialForm {
+            location,
+            form: "guard",
+        });
+    };
+    let Expr::Symbol { name, .. } = variable else {
+        return Err(EvalError::MalformedSpecialForm {
+            location: variable.location(),
+            form: "guard",
+        });
+    };
+
+    Ok((name.clone(), clauses.to_vec()))
 }
 
 fn define_function(
