@@ -2,7 +2,7 @@ use std::cell::RefCell;
 use std::rc::Rc;
 
 use crate::scheme::env::Env;
-use crate::scheme::error::EvalError;
+use crate::scheme::error::{EvalError, Span};
 use crate::scheme::value::Value;
 
 /// Check if a name is a builtin procedure.
@@ -26,83 +26,78 @@ fn is_builtin(name: &str) -> bool {
 }
 
 /// Evaluate a single expression in the given environment.
-pub fn eval(expr: &Value, env: &Rc<RefCell<Env>>) -> Result<Value, EvalError> {
+pub fn eval(expr: &Value, env: &Rc<RefCell<Env>>, span: Span) -> Result<Value, EvalError> {
     match expr {
         Value::Integer(_) | Value::Boolean(_) | Value::String(_) => Ok(expr.clone()),
-        Value::Symbol(name) => {
-            // Try environment first, then check builtins
-            match env.borrow().get(name) {
-                Ok(val) => Ok(val),
-                Err(_) if is_builtin(name) => Ok(Value::Symbol(name.clone())),
-                Err(e) => Err(e),
-            }
-        }
-        Value::List(elems) => eval_list(elems, env),
+        Value::Symbol(name) => match env.borrow().get(name) {
+            Some(val) => Ok(val),
+            None if is_builtin(name) => Ok(Value::Symbol(name.clone())),
+            None => Err(EvalError::UnboundVariable {
+                name: name.clone(),
+                span,
+            }),
+        },
+        Value::List(elems) => eval_list(elems, env, span),
         Value::Lambda { .. } => Ok(expr.clone()),
         Value::Void => Ok(Value::Void),
     }
 }
 
-fn eval_list(elems: &[Value], env: &Rc<RefCell<Env>>) -> Result<Value, EvalError> {
+fn eval_list(elems: &[Value], env: &Rc<RefCell<Env>>, span: Span) -> Result<Value, EvalError> {
     let [head, args @ ..] = elems else {
         return Ok(Value::List(vec![]));
     };
 
-    // Check for special forms when head is a symbol
     if let Value::Symbol(name) = head {
         match name.as_str() {
-            "and" => return eval_and(args, env),
-            "or" => return eval_or(args, env),
-            "if" => return eval_if(args, env),
-            "define" => return eval_define(args, env),
-            "quote" => return eval_quote(args),
-            "lambda" => return eval_lambda(args, env),
-            "let" => return eval_let(args, env),
-            "begin" => return eval_begin(args, env),
-            "cond" => return eval_cond(args, env),
+            "and" => return eval_and(args, env, span),
+            "or" => return eval_or(args, env, span),
+            "if" => return eval_if(args, env, span),
+            "define" => return eval_define(args, env, span),
+            "quote" => return eval_quote(args, span),
+            "lambda" => return eval_lambda(args, env, span),
+            "let" => return eval_let(args, env, span),
+            "begin" => return eval_begin(args, env, span),
+            "cond" => return eval_cond(args, env, span),
             _ => {}
         }
     }
 
-    // Evaluate head to get the procedure
-    let proc = eval(head, env)?;
-
-    // Evaluate arguments
-    let evaluated_args: Vec<Value> = args.iter().map(|a| eval(a, env)).collect::<Result<_, _>>()?;
-
-    apply(&proc, &evaluated_args)
+    let proc = eval(head, env, span)?;
+    let evaluated_args: Vec<Value> =
+        args.iter().map(|a| eval(a, env, span)).collect::<Result<_, _>>()?;
+    apply(&proc, &evaluated_args, span)
 }
 
-fn apply(proc: &Value, args: &[Value]) -> Result<Value, EvalError> {
+fn apply(proc: &Value, args: &[Value], span: Span) -> Result<Value, EvalError> {
     match proc {
-        Value::Symbol(name) => apply_builtin(name, args),
+        Value::Symbol(name) => apply_builtin(name, args, span),
         Value::Lambda { params, body, env } => {
             if params.len() != args.len() {
                 return Err(EvalError::WrongArgCount {
                     expected: params.len(),
                     got: args.len(),
+                    span,
                 });
             }
             let local_env = Env::with_parent(env);
             for (param, arg) in params.iter().zip(args) {
                 local_env.borrow_mut().define(param.clone(), arg.clone());
             }
-            let mut result = Value::Void;
-            for expr in body {
-                result = eval(expr, &local_env)?;
-            }
-            Ok(result)
+            body.iter()
+                .try_fold(Value::Void, |_, expr| eval(expr, &local_env, span))
         }
         other => Err(EvalError::TypeError {
             message: format!("not a procedure: {other}"),
+            span,
         }),
     }
 }
 
-fn eval_and(args: &[Value], env: &Rc<RefCell<Env>>) -> Result<Value, EvalError> {
+fn eval_and(args: &[Value], env: &Rc<RefCell<Env>>, span: Span) -> Result<Value, EvalError> {
     let mut result = Value::Boolean(true);
     for arg in args {
-        result = eval(arg, env)?;
+        result = eval(arg, env, span)?;
         if !is_truthy(&result) {
             return Ok(result);
         }
@@ -110,10 +105,10 @@ fn eval_and(args: &[Value], env: &Rc<RefCell<Env>>) -> Result<Value, EvalError> 
     Ok(result)
 }
 
-fn eval_or(args: &[Value], env: &Rc<RefCell<Env>>) -> Result<Value, EvalError> {
+fn eval_or(args: &[Value], env: &Rc<RefCell<Env>>, span: Span) -> Result<Value, EvalError> {
     let mut result = Value::Boolean(false);
     for arg in args {
-        result = eval(arg, env)?;
+        result = eval(arg, env, span)?;
         if is_truthy(&result) {
             return Ok(result);
         }
@@ -121,39 +116,40 @@ fn eval_or(args: &[Value], env: &Rc<RefCell<Env>>) -> Result<Value, EvalError> {
     Ok(result)
 }
 
-fn eval_if(args: &[Value], env: &Rc<RefCell<Env>>) -> Result<Value, EvalError> {
+fn eval_if(args: &[Value], env: &Rc<RefCell<Env>>, span: Span) -> Result<Value, EvalError> {
     let (condition, consequent, alternate) = match args {
         [cond, cons, alt] => (cond, cons, Some(alt)),
         [cond, cons] => (cond, cons, None),
         _ => {
-            return Err(EvalError::TypeError {
-                message: "if requires 2 or 3 arguments".into(),
+            return Err(EvalError::WrongArgCount {
+                expected: 2,
+                got: args.len(),
+                span,
             });
         }
     };
 
-    if is_truthy(&eval(condition, env)?) {
-        eval(consequent, env)
+    if is_truthy(&eval(condition, env, span)?) {
+        eval(consequent, env, span)
     } else if let Some(alt) = alternate {
-        eval(alt, env)
+        eval(alt, env, span)
     } else {
         Ok(Value::Void)
     }
 }
 
-fn eval_define(args: &[Value], env: &Rc<RefCell<Env>>) -> Result<Value, EvalError> {
+fn eval_define(args: &[Value], env: &Rc<RefCell<Env>>, span: Span) -> Result<Value, EvalError> {
     match args {
-        // (define x expr)
         [Value::Symbol(name), expr] => {
-            let val = eval(expr, env)?;
+            let val = eval(expr, env, span)?;
             env.borrow_mut().define(name.clone(), val);
             Ok(Value::Void)
         }
-        // (define (f params...) body...)
         [Value::List(sig), body @ ..] if !sig.is_empty() => {
             let Value::Symbol(name) = &sig[0] else {
                 return Err(EvalError::TypeError {
                     message: "define: expected function name".into(),
+                    span,
                 });
             };
             let params: Vec<String> = sig[1..]
@@ -162,6 +158,7 @@ fn eval_define(args: &[Value], env: &Rc<RefCell<Env>>) -> Result<Value, EvalErro
                     Value::Symbol(s) => Ok(s.clone()),
                     other => Err(EvalError::TypeError {
                         message: format!("define: expected parameter name, got {other}"),
+                        span,
                     }),
                 })
                 .collect::<Result<_, _>>()?;
@@ -175,29 +172,33 @@ fn eval_define(args: &[Value], env: &Rc<RefCell<Env>>) -> Result<Value, EvalErro
         }
         _ => Err(EvalError::TypeError {
             message: "define: invalid syntax".into(),
+            span,
         }),
     }
 }
 
-fn eval_quote(args: &[Value]) -> Result<Value, EvalError> {
+fn eval_quote(args: &[Value], span: Span) -> Result<Value, EvalError> {
     let [datum] = args else {
         return Err(EvalError::WrongArgCount {
             expected: 1,
             got: args.len(),
+            span,
         });
     };
     Ok(datum.clone())
 }
 
-fn eval_lambda(args: &[Value], env: &Rc<RefCell<Env>>) -> Result<Value, EvalError> {
+fn eval_lambda(args: &[Value], env: &Rc<RefCell<Env>>, span: Span) -> Result<Value, EvalError> {
     let [Value::List(param_list), body @ ..] = args else {
         return Err(EvalError::TypeError {
             message: "lambda: expected parameter list".into(),
+            span,
         });
     };
     if body.is_empty() {
         return Err(EvalError::TypeError {
             message: "lambda: expected body".into(),
+            span,
         });
     }
     let params: Vec<String> = param_list
@@ -206,6 +207,7 @@ fn eval_lambda(args: &[Value], env: &Rc<RefCell<Env>>) -> Result<Value, EvalErro
             Value::Symbol(s) => Ok(s.clone()),
             other => Err(EvalError::TypeError {
                 message: format!("lambda: expected parameter name, got {other}"),
+                span,
             }),
         })
         .collect::<Result<_, _>>()?;
@@ -216,15 +218,17 @@ fn eval_lambda(args: &[Value], env: &Rc<RefCell<Env>>) -> Result<Value, EvalErro
     })
 }
 
-fn eval_let(args: &[Value], env: &Rc<RefCell<Env>>) -> Result<Value, EvalError> {
+fn eval_let(args: &[Value], env: &Rc<RefCell<Env>>, span: Span) -> Result<Value, EvalError> {
     let [Value::List(bindings), body @ ..] = args else {
         return Err(EvalError::TypeError {
             message: "let: expected bindings list".into(),
+            span,
         });
     };
     if body.is_empty() {
         return Err(EvalError::TypeError {
             message: "let: expected body".into(),
+            span,
         });
     }
     let local_env = Env::with_parent(env);
@@ -232,74 +236,74 @@ fn eval_let(args: &[Value], env: &Rc<RefCell<Env>>) -> Result<Value, EvalError> 
         let Value::List(pair) = binding else {
             return Err(EvalError::TypeError {
                 message: "let: binding must be a list".into(),
+                span,
             });
         };
         let [Value::Symbol(name), val_expr] = pair.as_slice() else {
             return Err(EvalError::TypeError {
                 message: "let: binding must be (name expr)".into(),
+                span,
             });
         };
-        let val = eval(val_expr, env)?;
+        let val = eval(val_expr, env, span)?;
         local_env.borrow_mut().define(name.clone(), val);
     }
-    let mut result = Value::Void;
-    for expr in body {
-        result = eval(expr, &local_env)?;
-    }
-    Ok(result)
+    body.iter()
+        .try_fold(Value::Void, |_, expr| eval(expr, &local_env, span))
 }
 
-fn eval_begin(args: &[Value], env: &Rc<RefCell<Env>>) -> Result<Value, EvalError> {
-    let mut result = Value::Void;
-    for expr in args {
-        result = eval(expr, env)?;
-    }
-    Ok(result)
+fn eval_begin(args: &[Value], env: &Rc<RefCell<Env>>, span: Span) -> Result<Value, EvalError> {
+    args.iter()
+        .try_fold(Value::Void, |_, expr| eval(expr, env, span))
 }
 
-fn eval_cond(args: &[Value], env: &Rc<RefCell<Env>>) -> Result<Value, EvalError> {
+fn eval_cond(args: &[Value], env: &Rc<RefCell<Env>>, span: Span) -> Result<Value, EvalError> {
     for clause in args {
         let Value::List(elems) = clause else {
             return Err(EvalError::TypeError {
                 message: "cond: clause must be a list".into(),
+                span,
             });
         };
         let [test, body @ ..] = elems.as_slice() else {
             return Err(EvalError::TypeError {
                 message: "cond: empty clause".into(),
+                span,
             });
         };
-        if matches!(test, Value::Symbol(s) if s == "else") || is_truthy(&eval(test, env)?) {
-            return eval_body(body, env);
+        if matches!(test, Value::Symbol(s) if s == "else") || is_truthy(&eval(test, env, span)?) {
+            return eval_body(body, env, span);
         }
     }
     Ok(Value::Void)
 }
 
-fn eval_body(body: &[Value], env: &Rc<RefCell<Env>>) -> Result<Value, EvalError> {
-    body.iter().try_fold(Value::Void, |_, expr| eval(expr, env))
+fn eval_body(body: &[Value], env: &Rc<RefCell<Env>>, span: Span) -> Result<Value, EvalError> {
+    body.iter()
+        .try_fold(Value::Void, |_, expr| eval(expr, env, span))
 }
 
 fn is_truthy(val: &Value) -> bool {
     !matches!(val, Value::Boolean(false))
 }
 
-fn apply_builtin(name: &str, args: &[Value]) -> Result<Value, EvalError> {
+fn apply_builtin(name: &str, args: &[Value], span: Span) -> Result<Value, EvalError> {
     match name {
-        "+" => arith_variadic(args, 0, |a, b| Ok(a + b)),
-        "*" => arith_variadic(args, 1, |a, b| Ok(a * b)),
-        "-" => eval_sub(args),
-        "/" => eval_div(args),
-        "<" => compare_op(args, |a, b| a < b),
-        ">" => compare_op(args, |a, b| a > b),
-        "=" => compare_op(args, |a, b| a == b),
-        "<=" => compare_op(args, |a, b| a <= b),
-        ">=" => compare_op(args, |a, b| a >= b),
+        "+" => arith_variadic(args, 0, |a, b| Ok(a + b), span),
+        "*" => arith_variadic(args, 1, |a, b| Ok(a * b), span),
+        "-" => eval_sub(args, span),
+        "/" => eval_div(args, span),
+        "<" => compare_op(args, |a, b| a < b, span),
+        ">" => compare_op(args, |a, b| a > b, span),
+        "=" => compare_op(args, |a, b| a == b, span),
+        "<=" => compare_op(args, |a, b| a <= b, span),
+        ">=" => compare_op(args, |a, b| a >= b, span),
         "not" => {
             let [arg] = args else {
                 return Err(EvalError::WrongArgCount {
                     expected: 1,
                     got: args.len(),
+                    span,
                 });
             };
             Ok(Value::Boolean(!is_truthy(arg)))
@@ -309,6 +313,7 @@ fn apply_builtin(name: &str, args: &[Value]) -> Result<Value, EvalError> {
                 return Err(EvalError::WrongArgCount {
                     expected: 2,
                     got: args.len(),
+                    span,
                 });
             };
             match cdr {
@@ -325,12 +330,14 @@ fn apply_builtin(name: &str, args: &[Value]) -> Result<Value, EvalError> {
                 return Err(EvalError::WrongArgCount {
                     expected: 1,
                     got: args.len(),
+                    span,
                 });
             };
             match arg {
                 Value::List(elems) if !elems.is_empty() => Ok(elems[0].clone()),
                 _ => Err(EvalError::TypeError {
                     message: format!("car: expected non-empty pair, got {arg}"),
+                    span,
                 }),
             }
         }
@@ -339,12 +346,14 @@ fn apply_builtin(name: &str, args: &[Value]) -> Result<Value, EvalError> {
                 return Err(EvalError::WrongArgCount {
                     expected: 1,
                     got: args.len(),
+                    span,
                 });
             };
             match arg {
                 Value::List(elems) if !elems.is_empty() => Ok(Value::List(elems[1..].to_vec())),
                 _ => Err(EvalError::TypeError {
                     message: format!("cdr: expected non-empty pair, got {arg}"),
+                    span,
                 }),
             }
         }
@@ -353,9 +362,13 @@ fn apply_builtin(name: &str, args: &[Value]) -> Result<Value, EvalError> {
                 return Err(EvalError::WrongArgCount {
                     expected: 1,
                     got: args.len(),
+                    span,
                 });
             };
-            Ok(Value::Boolean(matches!(arg, Value::List(elems) if elems.is_empty())))
+            Ok(Value::Boolean(matches!(
+                arg,
+                Value::List(elems) if elems.is_empty()
+            )))
         }
         "list" => Ok(Value::List(args.to_vec())),
         "length" => {
@@ -363,31 +376,37 @@ fn apply_builtin(name: &str, args: &[Value]) -> Result<Value, EvalError> {
                 return Err(EvalError::WrongArgCount {
                     expected: 1,
                     got: args.len(),
+                    span,
                 });
             };
             match arg {
                 Value::List(elems) => Ok(Value::Integer(elems.len() as i64)),
                 _ => Err(EvalError::TypeError {
                     message: format!("length: expected list, got {arg}"),
+                    span,
                 }),
             }
         }
         "string?" => Ok(Value::Boolean(matches!(args, [Value::String(_)]))),
         "number?" => Ok(Value::Boolean(matches!(args, [Value::Integer(_)]))),
         "boolean?" => Ok(Value::Boolean(matches!(args, [Value::Boolean(_)]))),
-        "pair?" => Ok(Value::Boolean(matches!(args, [Value::List(e)] if !e.is_empty()))),
+        "pair?" => Ok(Value::Boolean(
+            matches!(args, [Value::List(e)] if !e.is_empty()),
+        )),
         "symbol?" => Ok(Value::Boolean(matches!(args, [Value::Symbol(_)]))),
         _ => Err(EvalError::UnboundVariable {
             name: name.to_string(),
+            span,
         }),
     }
 }
 
-fn require_integer(val: &Value) -> Result<i64, EvalError> {
+fn require_integer(val: &Value, span: Span) -> Result<i64, EvalError> {
     match val {
         Value::Integer(n) => Ok(*n),
         other => Err(EvalError::TypeError {
             message: format!("expected integer, got {other}"),
+            span,
         }),
     }
 }
@@ -396,60 +415,71 @@ fn arith_variadic(
     args: &[Value],
     identity: i64,
     op: impl Fn(i64, i64) -> Result<i64, EvalError>,
+    span: Span,
 ) -> Result<Value, EvalError> {
     args.iter()
-        .try_fold(identity, |acc, val| op(acc, require_integer(val)?))
+        .try_fold(identity, |acc, val| op(acc, require_integer(val, span)?))
         .map(Value::Integer)
 }
 
-fn eval_sub(args: &[Value]) -> Result<Value, EvalError> {
+fn eval_sub(args: &[Value], span: Span) -> Result<Value, EvalError> {
     match args {
         [] => Err(EvalError::WrongArgCount {
             expected: 1,
             got: 0,
+            span,
         }),
-        [single] => Ok(Value::Integer(-require_integer(single)?)),
+        [single] => Ok(Value::Integer(-require_integer(single, span)?)),
         [first, rest @ ..] => rest
             .iter()
-            .try_fold(require_integer(first)?, |acc, val| {
-                Ok(acc - require_integer(val)?)
+            .try_fold(require_integer(first, span)?, |acc, val| {
+                Ok(acc - require_integer(val, span)?)
             })
             .map(Value::Integer),
     }
 }
 
-fn checked_div(a: i64, b: i64) -> Result<i64, EvalError> {
+fn checked_div(a: i64, b: i64, span: Span) -> Result<i64, EvalError> {
     if b == 0 {
-        return Err(EvalError::DivisionByZero);
+        return Err(EvalError::DivisionByZero { span });
     }
     Ok(a / b)
 }
 
-fn eval_div(args: &[Value]) -> Result<Value, EvalError> {
+fn eval_div(args: &[Value], span: Span) -> Result<Value, EvalError> {
     match args {
         [] => Err(EvalError::WrongArgCount {
             expected: 1,
             got: 0,
+            span,
         }),
-        [single] => checked_div(1, require_integer(single)?).map(Value::Integer),
+        [single] => checked_div(1, require_integer(single, span)?, span).map(Value::Integer),
         [first, rest @ ..] => rest
             .iter()
-            .try_fold(require_integer(first)?, |acc, val| {
-                checked_div(acc, require_integer(val)?)
+            .try_fold(require_integer(first, span)?, |acc, val| {
+                checked_div(acc, require_integer(val, span)?, span)
             })
             .map(Value::Integer),
     }
 }
 
-fn compare_op(args: &[Value], op: impl Fn(i64, i64) -> bool) -> Result<Value, EvalError> {
+fn compare_op(
+    args: &[Value],
+    op: impl Fn(i64, i64) -> bool,
+    span: Span,
+) -> Result<Value, EvalError> {
     if args.len() < 2 {
         return Err(EvalError::WrongArgCount {
             expected: 2,
             got: args.len(),
+            span,
         });
     }
 
-    let nums: Vec<i64> = args.iter().map(require_integer).collect::<Result<_, _>>()?;
+    let nums: Vec<i64> = args
+        .iter()
+        .map(|v| require_integer(v, span))
+        .collect::<Result<_, _>>()?;
     let result = nums.windows(2).all(|w| op(w[0], w[1]));
     Ok(Value::Boolean(result))
 }

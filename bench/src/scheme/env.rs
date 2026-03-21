@@ -2,7 +2,6 @@ use std::cell::RefCell;
 use std::collections::HashMap;
 use std::rc::Rc;
 
-use crate::scheme::error::EvalError;
 use crate::scheme::value::Value;
 
 #[derive(Debug, Clone)]
@@ -26,15 +25,13 @@ impl Env {
         }))
     }
 
-    pub fn get(&self, name: &str) -> Result<Value, EvalError> {
+    pub fn get(&self, name: &str) -> Option<Value> {
         if let Some(val) = self.bindings.get(name) {
-            Ok(val.clone())
+            Some(val.clone())
         } else if let Some(parent) = &self.parent {
             parent.borrow().get(name)
         } else {
-            Err(EvalError::UnboundVariable {
-                name: name.to_string(),
-            })
+            None
         }
     }
 
