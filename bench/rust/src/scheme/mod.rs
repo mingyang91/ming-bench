@@ -98,6 +98,18 @@ fn env_set(env: &Env, name: String, val: Val) {
     env.borrow_mut().bindings.insert(name, val);
 }
 
+fn env_update(env: &Env, name: &str, val: Val) -> bool {
+    let mut inner = env.borrow_mut();
+    if inner.bindings.contains_key(name) {
+        inner.bindings.insert(name.to_string(), val);
+        true
+    } else if let Some(ref parent) = inner.parent {
+        env_update(parent, name, val)
+    } else {
+        false
+    }
+}
+
 fn default_env() -> Env {
     let env = new_env(None);
     for name in &[
@@ -444,6 +456,26 @@ fn eval(expr: &Expr, env: &Env, out: &Output) -> Result<Val, EvalError> {
                             }
                         }
                         "define" => return eval_define(&elems[1..], &cur_env, p, out),
+                        "set!" => {
+                            if elems.len() != 3 {
+                                return Err(EvalError::Arity {
+                                    msg: "set! requires exactly 2 arguments".to_string(),
+                                    pos: p,
+                                });
+                            }
+                            let name = match &elems[1].kind {
+                                ExprKind::Symbol(s) => s.clone(),
+                                _ => return Err(EvalError::Type {
+                                    msg: "set! requires a symbol as first argument".to_string(),
+                                    pos: p,
+                                }),
+                            };
+                            let val = eval(&elems[2], &cur_env, out)?;
+                            if !env_update(&cur_env, &name, val) {
+                                return Err(EvalError::UnboundVariable { name, pos: p });
+                            }
+                            return Ok(Val::Void);
+                        }
                         "quote" => return eval_quote(&elems[1..], p),
                         "lambda" => return eval_lambda(&elems[1..], &cur_env, p),
                         "and" => {
