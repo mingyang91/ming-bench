@@ -836,6 +836,11 @@ enum MachineContinuation {
     CallCcReturn {
         resume: ContinuationRef,
     },
+    CallWithValues {
+        consumer: Value,
+        pos: SourcePos,
+        next: ContinuationRef,
+    },
     WithExceptionHandlerReturn {
         frame: HandlerRef,
         next: ContinuationRef,
@@ -1003,6 +1008,27 @@ fn run_machine(exprs: &[Expr], env: EnvRef, ctx: &mut EvalContext) -> Result<Val
                         pos,
                     };
                 }
+                Value::Builtin(Builtin::CallWithValues) => {
+                    if args.len() != 2 {
+                        return Err(wrong_arg_count(
+                            "call-with-values",
+                            "exactly 2",
+                            args.len(),
+                        )
+                        .with_position(pos));
+                    }
+
+                    control = MachineControl::Apply {
+                        function: args[0].clone(),
+                        args: Vec::new(),
+                        pos,
+                    };
+                    cont = Rc::new(MachineContinuation::CallWithValues {
+                        consumer: args[1].clone(),
+                        pos,
+                        next: cont.clone(),
+                    });
+                }
                 Value::Builtin(Builtin::CallCc) => {
                     if args.len() != 1 {
                         return Err(
@@ -1115,13 +1141,11 @@ fn run_machine(exprs: &[Expr], env: EnvRef, ctx: &mut EvalContext) -> Result<Val
                     cont = next_cont;
                 }
                 Value::Continuation(saved) => {
-                    if args.len() != 1 {
-                        return Err(wrong_arg_count("continuation", "exactly 1", args.len())
-                            .with_position(pos));
-                    }
-
                     let (next_control, next_cont) = prepare_continuation_jump(
-                        args[0].clone(),
+                        match args.as_slice() {
+                            [value] => value.clone(),
+                            _ => Value::Multi(args),
+                        },
                         saved,
                         &mut winds,
                         &mut handlers,
@@ -1142,6 +1166,18 @@ fn run_machine(exprs: &[Expr], env: EnvRef, ctx: &mut EvalContext) -> Result<Val
                 MachineContinuation::CallCcReturn { resume } => {
                     control = MachineControl::Value(value.clone());
                     cont = resume.clone();
+                }
+                MachineContinuation::CallWithValues {
+                    consumer,
+                    pos,
+                    next,
+                } => {
+                    control = MachineControl::Apply {
+                        function: consumer.clone(),
+                        args: split_values(value),
+                        pos: *pos,
+                    };
+                    cont = next.clone();
                 }
                 MachineContinuation::WithExceptionHandlerReturn { frame, next } => {
                     handlers = frame.parent.clone();
@@ -2178,6 +2214,7 @@ fn eval_list(
                 procedure,
                 Value::Builtin(
                     Builtin::CallCc
+                        | Builtin::CallWithValues
                         | Builtin::DynamicWind
                         | Builtin::Raise
                         | Builtin::WithExceptionHandler
@@ -2259,6 +2296,7 @@ fn eval_tail_list(
                 procedure,
                 Value::Builtin(
                     Builtin::CallCc
+                        | Builtin::CallWithValues
                         | Builtin::DynamicWind
                         | Builtin::Raise
                         | Builtin::WithExceptionHandler
@@ -3376,7 +3414,7 @@ fn parse_syntax_rule_literals(expr: &Expr) -> Result<HashSet<String>, EvalError>
         .collect()
 }
 
-fn parse_macro_rule(expr: &Expr, macro_name: &str) -> Result<MacroRule, EvalError> {
+fn parse_macro_rule(expr: &Expr, _macro_name: &str) -> Result<MacroRule, EvalError> {
     let ExprKind::List(items) = &expr.kind else {
         return Err(EvalError::Syntax(
             "syntax-rules clause must be a (pattern template) pair".into(),
@@ -3400,12 +3438,7 @@ fn parse_macro_rule(expr: &Expr, macro_name: &str) -> Result<MacroRule, EvalErro
         ));
     };
 
-    let head = expect_symbol(head, "syntax-rules pattern head")?;
-    if head != macro_name {
-        return Err(EvalError::Syntax(
-            "syntax-rules pattern must start with the macro name".into(),
-        ));
-    }
+    let _ = expect_symbol(head, "syntax-rules pattern head")?;
 
     Ok(MacroRule {
         pattern_args: pattern_args.to_vec(),
