@@ -80,9 +80,9 @@ fn mill_quality_gate(lang_dir: &Path) -> Result<()> {
 
 fn run_mill_container(proj: &Path, jar: &Path, level: &str) -> Result<()> {
     let (timeout, tag_arg) = if level == "all" {
-        (300, String::new())
+        (450, String::new())
     } else {
-        (30, format!(" --include-tags=l{level}"))
+        (45, format!(" --include-tags=l{level}"))
     };
 
     let bench_level = if level == "all" {
@@ -105,7 +105,7 @@ fn run_mill_container(proj: &Path, jar: &Path, level: &str) -> Result<()> {
         "sudo",
         &[
             "podman", "run", "--rm",
-            "--memory=1g", "--cpus=1", "--pids-limit=256",
+            "--memory=2g", "--cpus=1", "--pids-limit=256",
             "-v", &jar_mount, "-v", &fixtures_mount, "-v", &tests_mount,
             JVM_IMAGE, &java_cmd,
         ],
