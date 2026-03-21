@@ -365,6 +365,66 @@ fn eval(expr: Value, env: &Env) -> Result<Value, EvalError> {
                         }
                         Ok(Value::Boolean(false))
                     }
+                    "begin" => {
+                        let mut result = Value::Boolean(false);
+                        for expr in &elems[1..] {
+                            result = eval(expr.clone(), env)?;
+                        }
+                        Ok(result)
+                    }
+                    "let" => {
+                        if elems.len() < 3 {
+                            return Err(EvalError::Runtime("let requires bindings and body".to_string()));
+                        }
+                        let bindings = match &elems[1] {
+                            Value::List(bs) => bs,
+                            _ => return Err(EvalError::Runtime("let: expected bindings list".to_string())),
+                        };
+                        let let_env = new_env(Some(env.clone()));
+                        for b in bindings {
+                            match b {
+                                Value::List(pair) if pair.len() == 2 => {
+                                    let name = match &pair[0] {
+                                        Value::Symbol(s) => s.clone(),
+                                        _ => return Err(EvalError::Runtime("let: expected symbol".to_string())),
+                                    };
+                                    let val = eval(pair[1].clone(), env)?;
+                                    env_set(&let_env, name, val);
+                                }
+                                _ => return Err(EvalError::Runtime("let: invalid binding".to_string())),
+                            }
+                        }
+                        let mut result = Value::Boolean(false);
+                        for expr in &elems[2..] {
+                            result = eval(expr.clone(), &let_env)?;
+                        }
+                        Ok(result)
+                    }
+                    "cond" => {
+                        for clause in &elems[1..] {
+                            match clause {
+                                Value::List(parts) if parts.len() >= 2 => {
+                                    if parts[0] == Value::Symbol("else".to_string()) {
+                                        let mut result = Value::Boolean(false);
+                                        for expr in &parts[1..] {
+                                            result = eval(expr.clone(), env)?;
+                                        }
+                                        return Ok(result);
+                                    }
+                                    let test = eval(parts[0].clone(), env)?;
+                                    if test != Value::Boolean(false) {
+                                        let mut result = Value::Boolean(false);
+                                        for expr in &parts[1..] {
+                                            result = eval(expr.clone(), env)?;
+                                        }
+                                        return Ok(result);
+                                    }
+                                }
+                                _ => return Err(EvalError::Runtime("cond: invalid clause".to_string())),
+                            }
+                        }
+                        Ok(Value::Boolean(false))
+                    }
                     _ => {
                         let mut args = Vec::new();
                         for arg in &elems[1..] {
