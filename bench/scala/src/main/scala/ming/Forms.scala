@@ -172,6 +172,74 @@ private[ming] object Forms:
       case _ =>
         throw new EvalError("not requires exactly 1 argument")
 
+  def evalDo(
+    args: List[Value],
+    env: Env,
+    out: String
+  ): EvalResult =
+    args match
+      case bindings :: testClause :: body =>
+        val bindingList = Evaluator.toList(bindings)
+        val parsed      = bindingList.map(parseDoBinding(_, env))
+        val (names, inits, steps, out2) =
+          parsed.foldLeft(
+            (List.empty[String], List.empty[Value], List.empty[Option[Value]], out)
+          ) { case ((ns, is, ss, o), (n, initExpr, stepExpr)) =>
+            val (v, _, o2) = Evaluator.eval(initExpr, env, o)
+            (ns :+ n, is :+ v, ss :+ stepExpr, o2)
+          }
+        val testParts = Evaluator.toList(testClause)
+        val (testExpr, resultExprs) = testParts match
+          case t :: rest => (t, rest)
+          case _         => throw new EvalError("bad do test clause")
+        doLoop(names, steps, testExpr, resultExprs, body, env, inits, out2)
+      case _ => throw new EvalError("bad do syntax")
+
+  private def parseDoBinding(
+    binding: Value,
+    env: Env
+  ): (String, Value, Option[Value]) =
+    Evaluator.toList(binding) match
+      case Value.Symbol(name, _) :: init :: step :: Nil =>
+        (name, init, Some(step))
+      case Value.Symbol(name, _) :: init :: Nil =>
+        (name, init, None)
+      case _ => throw new EvalError("bad do binding")
+
+  @scala.annotation.tailrec
+  private def doLoop(
+    names: List[String],
+    steps: List[Option[Value]],
+    testExpr: Value,
+    resultExprs: List[Value],
+    body: List[Value],
+    outerEnv: Env,
+    vals: List[Value],
+    out: String
+  ): EvalResult =
+    val loopEnv = names.zip(vals).foldLeft(outerEnv) { case (e, (n, v)) =>
+      e.define(n, v)
+    }
+    val (testVal, _, out2) = Evaluator.eval(testExpr, loopEnv, out)
+    if !Evaluator.isFalsy(testVal) then
+      resultExprs match
+        case Nil      => Done(Value.VoidVal, loopEnv, out2)
+        case _ :: Nil => Bounce(resultExprs.head, loopEnv, out2)
+        case _ =>
+          Evaluator.evalBodyTail(resultExprs, loopEnv, out2)
+    else
+      val out3 = body.foldLeft(out2) { (o, expr) =>
+        val (_, _, o2) = Evaluator.eval(expr, loopEnv, o)
+        o2
+      }
+      val newVals = names.zip(steps).zip(vals).map {
+        case ((_, Some(stepExpr)), _) =>
+          val (v, _, _) = Evaluator.eval(stepExpr, loopEnv, out3)
+          v
+        case ((_, None), oldVal) => oldVal
+      }
+      doLoop(names, steps, testExpr, resultExprs, body, outerEnv, newVals, out3)
+
   def evalLet(
     args: List[Value],
     env: Env,

@@ -167,6 +167,7 @@ object Evaluator:
         Done(Forms.makeLambda(args, env), env, out)
       case Value.Symbol("case-lambda", _) =>
         Done(Forms.makeCaseLambda(args, env), env, out)
+      case Value.Symbol("do", _)      => Forms.evalDo(args, env, out)
       case Value.Symbol("let", _)     => Forms.evalLet(args, env, out)
       case Value.Symbol("letrec", _)  => CondForms.evalLetrec(args, env, out)
       case Value.Symbol("letrec*", _) => CondForms.evalLetrecStar(args, env, out)

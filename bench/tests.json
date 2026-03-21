@@ -1525,5 +1525,40 @@
     "fixture": "l24_case_lambda_rest.scm",
     "kind": "eval_str_ok",
     "expected": "#t"
+  },
+  {
+    "name": "l25_do_basic",
+    "level": 25,
+    "fixture": "l25_do_basic.scm",
+    "kind": "eval_str_ok",
+    "expected": "10"
+  },
+  {
+    "name": "l25_do_fibonacci",
+    "level": 25,
+    "fixture": "l25_do_fibonacci.scm",
+    "kind": "eval_str_ok",
+    "expected": "55"
+  },
+  {
+    "name": "l25_do_no_step",
+    "level": 25,
+    "fixture": "l25_do_no_step.scm",
+    "kind": "eval_str_ok",
+    "expected": "#t"
+  },
+  {
+    "name": "l25_do_parallel_step",
+    "level": 25,
+    "fixture": "l25_do_parallel_step.scm",
+    "kind": "eval_str_ok",
+    "expected": "#t"
+  },
+  {
+    "name": "l25_do_vector_fill",
+    "level": 25,
+    "fixture": "l25_do_vector_fill.scm",
+    "kind": "eval_str_ok",
+    "expected": "#(0 1 4 9 16)"
   }
 ]
