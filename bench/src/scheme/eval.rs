@@ -82,6 +82,8 @@ fn is_builtin(name: &str) -> bool {
             | "string-downcase"
             | "dynamic-wind"
             | "reverse"
+            | "with-exception-handler"
+            | "raise"
     )
 }
 
@@ -205,6 +207,7 @@ fn eval_list_tco(
             "define-syntax" => {
                 return eval_define_syntax(args, env, span).map(Bounce::Done);
             }
+            "guard" => return eval_guard_tco(args, env, span, ctx),
             _ => {}
         }
 
@@ -251,6 +254,26 @@ fn apply_tco(
                 });
             };
             eval_callcc(lambda, span, ctx).map(Bounce::Done)
+        }
+        Value::Symbol(name) if name == "raise" => {
+            let [value] = args else {
+                return Err(EvalError::WrongArgCount {
+                    expected: 1,
+                    got: args.len(),
+                    span,
+                });
+            };
+            Err(EvalError::RaisedException(value.clone()))
+        }
+        Value::Symbol(name) if name == "with-exception-handler" => {
+            let [handler, thunk] = args else {
+                return Err(EvalError::WrongArgCount {
+                    expected: 2,
+                    got: args.len(),
+                    span,
+                });
+            };
+            eval_with_exception_handler(handler, thunk, span, ctx).map(Bounce::Done)
         }
         Value::Symbol(name) if name == "dynamic-wind" => {
             let [in_thunk, body_thunk, out_thunk] = args else {
@@ -374,6 +397,105 @@ fn eval_dynamic_wind(
     ctx.wind_depth.set(ctx.wind_depth.get() - 1);
     apply(out_thunk, &[], span, ctx)?;
     body_result
+}
+
+/// Evaluate `with-exception-handler`: install handler, run thunk.
+fn eval_with_exception_handler(
+    handler: &Value,
+    thunk: &Value,
+    span: Span,
+    ctx: &EvalContext,
+) -> Result<Value, EvalError> {
+    match apply(thunk, &[], span, ctx) {
+        Ok(val) => Ok(val),
+        Err(EvalError::RaisedException(exn)) => apply(handler, &[exn], span, ctx),
+        Err(e) => Err(e),
+    }
+}
+
+/// Evaluate `guard` special form:
+/// (guard (var clause ...) body ...)
+/// Evaluate body; if it raises, bind var to the exception and test clauses.
+fn eval_guard_tco(
+    args: &[Value],
+    env: &Rc<RefCell<Env>>,
+    span: Span,
+    ctx: &EvalContext,
+) -> Result<Bounce, EvalError> {
+    let [clauses_form, body @ ..] = args else {
+        return Err(EvalError::TypeError {
+            message: "guard: missing clauses".into(),
+            span,
+        });
+    };
+    let Value::List(clause_list) = clauses_form else {
+        return Err(EvalError::TypeError {
+            message: "guard: clauses must be a list".into(),
+            span,
+        });
+    };
+    let [Value::Symbol(var), clauses @ ..] = clause_list.as_slice() else {
+        return Err(EvalError::TypeError {
+            message: "guard: first element must be a variable name".into(),
+            span,
+        });
+    };
+
+    // Evaluate body; if no exception, return the result
+    let body_result = eval_body(body, env, span, ctx);
+    let exn = match body_result {
+        Ok(val) => return Ok(Bounce::Done(val)),
+        Err(EvalError::RaisedException(exn)) => exn,
+        Err(e) => return Err(e),
+    };
+
+    // Bind the exception value to var
+    let guard_env = Env::with_parent(env);
+    guard_env.borrow_mut().define(var.clone(), exn.clone());
+
+    // Test clauses like cond
+    for clause in clauses {
+        let Value::List(parts) = clause else {
+            return Err(EvalError::TypeError {
+                message: "guard: clause must be a list".into(),
+                span,
+            });
+        };
+        let [test, body_exprs @ ..] = parts.as_slice() else {
+            return Err(EvalError::TypeError {
+                message: "guard: empty clause".into(),
+                span,
+            });
+        };
+        // else clause
+        if matches!(test, Value::Symbol(s) if s == "else") {
+            return eval_body_tco(body_exprs, &guard_env, span, ctx);
+        }
+        let test_val = eval(test, &guard_env, span, ctx)?;
+        if !is_truthy(&test_val) {
+            continue;
+        }
+        if body_exprs.is_empty() {
+            return Ok(Bounce::Done(test_val));
+        }
+        return eval_body_tco(body_exprs, &guard_env, span, ctx);
+    }
+
+    // No clause matched — re-raise
+    Err(EvalError::RaisedException(exn))
+}
+
+/// Evaluate a body (sequence), returning the last value (non-TCO version).
+fn eval_body(
+    body: &[Value],
+    env: &Rc<RefCell<Env>>,
+    span: Span,
+    ctx: &EvalContext,
+) -> Result<Value, EvalError> {
+    match eval_body_tco(body, env, span, ctx)? {
+        Bounce::Done(v) => Ok(v),
+        Bounce::TailCall { expr, env } => eval(&expr, &env, span, ctx),
+    }
 }
 
 /// Apply a lambda procedure to arguments, binding params and returning a TCO bounce.

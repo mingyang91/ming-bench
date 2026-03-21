@@ -49,4 +49,7 @@ pub enum EvalError {
 
     #[error("continuation return")]
     ContinuationReturn,
+
+    #[error("unhandled exception: {0}")]
+    RaisedException(crate::scheme::value::Value),
 }
