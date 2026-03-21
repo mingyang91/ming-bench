@@ -195,6 +195,7 @@ enum Builtin {
     Cdr,
     Null,
     List,
+    Apply,
     Length,
     Display,
     Write,
@@ -218,7 +219,7 @@ enum Builtin {
 }
 
 impl Builtin {
-    const ALL: [Self; 34] = [
+    const ALL: [Self; 35] = [
         Self::Add,
         Self::Sub,
         Self::Mul,
@@ -233,6 +234,7 @@ impl Builtin {
         Self::Cdr,
         Self::Null,
         Self::List,
+        Self::Apply,
         Self::Length,
         Self::Display,
         Self::Write,
@@ -271,6 +273,7 @@ impl Builtin {
             Self::Cdr => "cdr",
             Self::Null => "null?",
             Self::List => "list",
+            Self::Apply => "apply",
             Self::Length => "length",
             Self::Display => "display",
             Self::Write => "write",
@@ -362,9 +365,15 @@ impl Env {
 #[derive(Debug)]
 struct LambdaProcedure {
     name: Option<String>,
-    params: Vec<String>,
+    params: Parameters,
     body: Vec<Expr>,
     env: EnvRef,
+}
+
+#[derive(Debug)]
+struct Parameters {
+    required: Vec<String>,
+    rest: Option<String>,
 }
 
 #[derive(Debug)]
@@ -634,7 +643,10 @@ fn eval_let(
             let local_env = Env::child(env);
             let procedure = Rc::new(LambdaProcedure {
                 name: Some(name.to_string()),
-                params: names,
+                params: Parameters {
+                    required: names,
+                    rest: None,
+                },
                 body: form.body.to_vec(),
                 env: local_env.clone(),
             });
@@ -673,7 +685,10 @@ fn eval_tail_let(
             let local_env = Env::child(env);
             let procedure = Rc::new(LambdaProcedure {
                 name: Some(name.to_string()),
-                params: names,
+                params: Parameters {
+                    required: names,
+                    rest: None,
+                },
                 body: form.body.to_vec(),
                 env: local_env.clone(),
             });
@@ -869,11 +884,15 @@ fn eval_set(args: &[Expr], env: EnvRef, ctx: &mut EvalContext) -> Result<Value, 
     Ok(Value::Void)
 }
 
-fn parse_parameter_list(expr: &Expr) -> Result<Vec<String>, EvalError> {
+fn parse_parameter_list(expr: &Expr) -> Result<Parameters, EvalError> {
     match &expr.kind {
         ExprKind::List(items) => parse_parameters(items),
+        ExprKind::Symbol(name) => Ok(Parameters {
+            required: Vec::new(),
+            rest: Some(parse_parameter_name(name)?),
+        }),
         _ => Err(EvalError::Syntax(
-            "lambda parameter list must be a list".into(),
+            "lambda parameter list must be a list or symbol".into(),
         )),
     }
 }
@@ -953,11 +972,36 @@ fn eval_let_bindings(
     Ok((names, values))
 }
 
-fn parse_parameters(items: &[Expr]) -> Result<Vec<String>, EvalError> {
-    items
+fn parse_parameters(items: &[Expr]) -> Result<Parameters, EvalError> {
+    let dot_index = items
         .iter()
-        .map(|expr| expect_symbol(expr, "parameter"))
-        .collect()
+        .position(|expr| matches!(&expr.kind, ExprKind::Symbol(name) if name == "."));
+
+    match dot_index {
+        None => Ok(Parameters {
+            required: items
+                .iter()
+                .map(expect_parameter_symbol)
+                .collect::<Result<Vec<_>, _>>()?,
+            rest: None,
+        }),
+        Some(index) => {
+            if index + 2 != items.len() {
+                return Err(EvalError::Syntax(
+                    "parameter list may contain at most one '.' before a final rest parameter"
+                        .into(),
+                ));
+            }
+
+            Ok(Parameters {
+                required: items[..index]
+                    .iter()
+                    .map(expect_parameter_symbol)
+                    .collect::<Result<Vec<_>, _>>()?,
+                rest: Some(expect_parameter_symbol(&items[index + 1])?),
+            })
+        }
+    }
 }
 
 fn expect_symbol(expr: &Expr, context: &str) -> Result<String, EvalError> {
@@ -967,26 +1011,26 @@ fn expect_symbol(expr: &Expr, context: &str) -> Result<String, EvalError> {
     }
 }
 
+fn expect_parameter_symbol(expr: &Expr) -> Result<String, EvalError> {
+    let name = expect_symbol(expr, "parameter")?;
+    parse_parameter_name(&name)
+}
+
+fn parse_parameter_name(name: &str) -> Result<String, EvalError> {
+    if name == "." {
+        return Err(EvalError::Syntax("parameter name must not be '.'".into()));
+    }
+
+    Ok(name.to_string())
+}
+
 fn apply(
     function: Value,
     args: &[Value],
     pos: SourcePos,
     ctx: &mut EvalContext,
 ) -> Result<Value, EvalError> {
-    match function {
-        Value::Builtin(builtin) => {
-            apply_builtin(builtin, args, ctx).map_err(|err| err.with_position(pos))
-        }
-        Value::Procedure(procedure) => resolve_tail_outcome(
-            TailOutcome::TailCall {
-                procedure,
-                args: args.to_vec(),
-                pos,
-            },
-            ctx,
-        ),
-        other => Err(EvalError::NotAProcedure(other.to_string()).with_position(pos)),
-    }
+    resolve_tail_outcome(dispatch_call(function, args.to_vec(), pos, ctx)?, ctx)
 }
 
 fn apply_in_tail_position(
@@ -995,10 +1039,17 @@ fn apply_in_tail_position(
     pos: SourcePos,
     ctx: &mut EvalContext,
 ) -> Result<TailOutcome, EvalError> {
+    dispatch_call(function, args, pos, ctx)
+}
+
+fn dispatch_call(
+    function: Value,
+    args: Vec<Value>,
+    pos: SourcePos,
+    ctx: &mut EvalContext,
+) -> Result<TailOutcome, EvalError> {
     match function {
-        Value::Builtin(builtin) => apply_builtin(builtin, &args, ctx)
-            .map(TailOutcome::Value)
-            .map_err(|err| err.with_position(pos)),
+        Value::Builtin(builtin) => dispatch_builtin_call(builtin, args, pos, ctx),
         Value::Procedure(procedure) => Ok(TailOutcome::TailCall {
             procedure,
             args,
@@ -1008,14 +1059,60 @@ fn apply_in_tail_position(
     }
 }
 
-fn bind_call_env(procedure: &Rc<LambdaProcedure>, args: &[Value]) -> Result<EnvRef, EvalError> {
-    if args.len() != procedure.params.len() {
-        let expected = format!("exactly {}", procedure.params.len());
-        let name = procedure.name.as_deref().unwrap_or("lambda");
-        return Err(wrong_arg_count(name, &expected, args.len()));
+fn dispatch_builtin_call(
+    builtin: Builtin,
+    args: Vec<Value>,
+    pos: SourcePos,
+    ctx: &mut EvalContext,
+) -> Result<TailOutcome, EvalError> {
+    match builtin {
+        Builtin::Apply => {
+            let (function, applied_args) =
+                expand_apply_args(&args).map_err(|err| err.with_position(pos))?;
+            dispatch_call(function, applied_args, pos, ctx)
+        }
+        _ => apply_builtin(builtin, &args, ctx)
+            .map(TailOutcome::Value)
+            .map_err(|err| err.with_position(pos)),
     }
+}
 
-    Ok(bind_names(procedure.env.clone(), &procedure.params, args))
+fn bind_call_env(procedure: &Rc<LambdaProcedure>, args: &[Value]) -> Result<EnvRef, EvalError> {
+    let required = procedure.params.required.len();
+    let name = procedure.name.as_deref().unwrap_or("lambda");
+
+    match procedure.params.rest.as_ref() {
+        Some(rest) => {
+            if args.len() < required {
+                let expected = format!("at least {required}");
+                return Err(wrong_arg_count(name, &expected, args.len()));
+            }
+
+            let local_env = bind_names(
+                procedure.env.clone(),
+                &procedure.params.required,
+                &args[..required],
+            );
+            Env::define(
+                &local_env,
+                rest.clone(),
+                Value::List(args[required..].to_vec()),
+            );
+            Ok(local_env)
+        }
+        None => {
+            if args.len() != required {
+                let expected = format!("exactly {required}");
+                return Err(wrong_arg_count(name, &expected, args.len()));
+            }
+
+            Ok(bind_names(
+                procedure.env.clone(),
+                &procedure.params.required,
+                args,
+            ))
+        }
+    }
 }
 
 fn bind_names(parent: EnvRef, names: &[String], values: &[Value]) -> EnvRef {
@@ -1024,6 +1121,19 @@ fn bind_names(parent: EnvRef, names: &[String], values: &[Value]) -> EnvRef {
         Env::define(&local_env, name.clone(), value.clone());
     }
     local_env
+}
+
+fn expand_apply_args(args: &[Value]) -> Result<(Value, Vec<Value>), EvalError> {
+    if args.len() < 2 {
+        return Err(wrong_arg_count("apply", "at least 2", args.len()));
+    }
+
+    let function = args[0].clone();
+    let tail_args = expect_list_value("apply", &args[args.len() - 1])?;
+    let mut applied_args = Vec::with_capacity(args.len() + tail_args.len() - 2);
+    applied_args.extend_from_slice(&args[1..args.len() - 1]);
+    applied_args.extend_from_slice(tail_args);
+    Ok((function, applied_args))
 }
 
 fn apply_builtin(
@@ -1140,6 +1250,7 @@ fn apply_builtin(
             ))
         }
         Builtin::List => Ok(Value::List(args.to_vec())),
+        Builtin::Apply => unreachable!("apply is handled by dispatch_builtin_call"),
         Builtin::Length => {
             if args.len() != 1 {
                 return Err(wrong_arg_count(name, "exactly 1", args.len()));
