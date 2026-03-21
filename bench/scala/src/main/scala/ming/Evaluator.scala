@@ -1,43 +1,128 @@
 package ming
 
-/** Scheme interpreter entry point. Agents implement this object. */
+/** Scheme interpreter entry point. */
 object Evaluator:
 
-  /** Evaluate one or more Scheme expressions and return the string representation of the last result.
-    */
   def evalStr(input: String): String =
     val exprs = Parser.parse(input)
     if exprs.isEmpty then throw new EvalError("no expressions")
-    exprs.map(eval).last.display
+    val (lastVal, _) = evalAll(exprs, defaultEnv)
+    lastVal.display
 
-  /** Evaluate Scheme expressions and return both the result string and any captured output from display/write/newline.
-    */
   def evalStrWithOutput(input: String): (String, String) =
     val result = evalStr(input)
     (result, "")
 
-  private def eval(value: Value): Value = value match
-    case Value.IntVal(_)    => value
-    case Value.BoolVal(_)   => value
-    case Value.StringVal(_) => value
-    case Value.NilVal       => value
-    case Value.Symbol(name) =>
-      throw new EvalError(s"unbound variable: $name")
-    case Value.PairVal(car, _) => evalCall(car, value)
+  private def evalAll(
+    exprs: List[Value],
+    env: Env
+  ): (Value, Env) =
+    exprs match
+      case Nil         => (Value.VoidVal, env)
+      case head :: Nil => eval(head, env)
+      case head :: tail =>
+        val (_, newEnv) = eval(head, env)
+        evalAll(tail, newEnv)
 
-  private def evalCall(operator: Value, expr: Value): Value =
-    operator match
-      case Value.Symbol(name) => evalSpecialOrCall(name, toList(expr).tail)
-      case _                  => throw new EvalError("not a procedure")
+  private def eval(expr: Value, env: Env): (Value, Env) =
+    expr match
+      case Value.IntVal(_)    => (expr, env)
+      case Value.BoolVal(_)   => (expr, env)
+      case Value.StringVal(_) => (expr, env)
+      case Value.NilVal       => (expr, env)
+      case Value.VoidVal      => (expr, env)
+      case _: Value.LambdaVal => (expr, env)
+      case Value.Symbol(name) => (env.lookup(name), env)
+      case Value.PairVal(car, _) =>
+        val args = toList(expr).tail
+        evalForm(car, args, env)
 
-  private def evalSpecialOrCall(name: String, args: List[Value]): Value =
-    name match
-      case "and" => evalAnd(args)
-      case "or"  => evalOr(args)
-      case "not" => evalNot(args)
-      case _     => evalBuiltin(name, args.map(eval))
+  private def evalForm(
+    op: Value,
+    args: List[Value],
+    env: Env
+  ): (Value, Env) =
+    op match
+      case Value.Symbol("define") => evalDefine(args, env)
+      case Value.Symbol("if")     => evalIf(args, env)
+      case Value.Symbol("quote")  => evalQuote(args, env)
+      case Value.Symbol("lambda") => evalLambda(args, env)
+      case Value.Symbol("and")    => (evalAnd(args, env), env)
+      case Value.Symbol("or")     => (evalOr(args, env), env)
+      case Value.Symbol("not")    => (evalNot(args, env), env)
+      case _ =>
+        val (proc, _)  = eval(op, env)
+        val evaledArgs = args.map(a => eval(a, env)._1)
+        (applyProc(proc, evaledArgs), env)
 
-  private def evalBuiltin(name: String, args: List[Value]): Value =
+  private def evalDefine(
+    args: List[Value],
+    env: Env
+  ): (Value, Env) =
+    args match
+      case Value.PairVal(Value.Symbol(name), paramsList) :: body =>
+        val params = toList(paramsList).map {
+          case Value.Symbol(s) => s
+          case other           => throw new EvalError(s"expected symbol in parameter list, got: ${other.display}")
+        }
+        val lambda = Value.LambdaVal(params, body, env, Some(name))
+        (Value.VoidVal, env.define(name, lambda))
+      case Value.Symbol(name) :: valueExpr :: Nil =>
+        val (v, _) = eval(valueExpr, env)
+        (Value.VoidVal, env.define(name, v))
+      case _ =>
+        throw new EvalError("bad define syntax")
+
+  private def evalIf(args: List[Value], env: Env): (Value, Env) =
+    args match
+      case cond :: thenBranch :: elseBranch =>
+        val (condVal, _) = eval(cond, env)
+        if !isFalsy(condVal) then eval(thenBranch, env)
+        else
+          elseBranch match
+            case eb :: Nil => eval(eb, env)
+            case Nil       => (Value.VoidVal, env)
+            case _         => throw new EvalError("bad if syntax")
+      case _ => throw new EvalError("bad if syntax")
+
+  private def evalQuote(
+    args: List[Value],
+    env: Env
+  ): (Value, Env) =
+    args match
+      case datum :: Nil => (datum, env)
+      case _            => throw new EvalError("quote requires exactly 1 argument")
+
+  private def evalLambda(
+    args: List[Value],
+    env: Env
+  ): (Value, Env) =
+    args match
+      case paramExpr :: body if body.nonEmpty =>
+        val params = toList(paramExpr).map {
+          case Value.Symbol(s) => s
+          case other           => throw new EvalError(s"expected symbol in parameter list, got: ${other.display}")
+        }
+        (Value.LambdaVal(params, body, env, None), env)
+      case _ => throw new EvalError("bad lambda syntax")
+
+  private def applyProc(
+    proc: Value,
+    args: List[Value]
+  ): Value =
+    proc match
+      case lam @ Value.LambdaVal(params, body, closure, nameOpt) =>
+        val closureWithSelf = nameOpt match
+          case Some(n) => closure.define(n, lam)
+          case None    => closure
+        val localEnv    = closureWithSelf.extend(params, args)
+        val (result, _) = evalAll(body, localEnv)
+        result
+      case Value.Symbol(name) => applyBuiltin(name, args)
+      case _ =>
+        throw new EvalError(s"not a procedure: ${proc.display}")
+
+  private def applyBuiltin(name: String, args: List[Value]): Value =
     name match
       case "+"  => evalAdd(args)
       case "-"  => evalSub(args)
@@ -49,6 +134,40 @@ object Evaluator:
       case "<=" => evalCmp(args, _ <= _)
       case ">=" => evalCmp(args, _ >= _)
       case _    => throw new EvalError(s"unknown procedure: $name")
+
+  private def evalAnd(args: List[Value], env: Env): Value =
+    args match
+      case Nil         => Value.BoolVal(true)
+      case head :: Nil => eval(head, env)._1
+      case head :: tail =>
+        val v = eval(head, env)._1
+        if isFalsy(v) then v else evalAnd(tail, env)
+
+  private def evalOr(args: List[Value], env: Env): Value =
+    args match
+      case Nil         => Value.BoolVal(false)
+      case head :: Nil => eval(head, env)._1
+      case head :: tail =>
+        val v = eval(head, env)._1
+        if !isFalsy(v) then v else evalOr(tail, env)
+
+  private def evalNot(args: List[Value], env: Env): Value =
+    args match
+      case head :: Nil => Value.BoolVal(isFalsy(eval(head, env)._1))
+      case _           => throw new EvalError("not requires exactly 1 argument")
+
+  private def isFalsy(v: Value): Boolean = v match
+    case Value.BoolVal(false) => true
+    case _                    => false
+
+  private def asInt(v: Value): Long = v match
+    case Value.IntVal(n) => n
+    case other           => throw new EvalError(s"expected integer, got: ${other.display}")
+
+  private def toList(v: Value): List[Value] = v match
+    case Value.NilVal        => Nil
+    case Value.PairVal(h, t) => h :: toList(t)
+    case other               => List(other)
 
   private def evalAdd(args: List[Value]): Value =
     Value.IntVal(args.foldLeft(0L)((acc, v) => acc + asInt(v)))
@@ -74,33 +193,13 @@ object Evaluator:
       case a :: b :: Nil => Value.BoolVal(op(asInt(a), asInt(b)))
       case _             => throw new EvalError("comparison requires exactly 2 arguments")
 
-  private def evalAnd(args: List[Value]): Value = args match
-    case Nil         => Value.BoolVal(true)
-    case head :: Nil => eval(head)
-    case head :: tail =>
-      val v = eval(head)
-      if isFalsy(v) then v else evalAnd(tail)
-
-  private def evalOr(args: List[Value]): Value = args match
-    case Nil         => Value.BoolVal(false)
-    case head :: Nil => eval(head)
-    case head :: tail =>
-      val v = eval(head)
-      if !isFalsy(v) then v else evalOr(tail)
-
-  private def evalNot(args: List[Value]): Value = args match
-    case head :: Nil => Value.BoolVal(isFalsy(eval(head)))
-    case _           => throw new EvalError("not requires exactly 1 argument")
-
-  private def isFalsy(v: Value): Boolean = v match
-    case Value.BoolVal(false) => true
-    case _                    => false
-
-  private def asInt(v: Value): Long = v match
-    case Value.IntVal(n) => n
-    case other           => throw new EvalError(s"expected integer, got: ${other.display}")
-
-  private def toList(v: Value): List[Value] = v match
-    case Value.NilVal        => Nil
-    case Value.PairVal(h, t) => h :: toList(t)
-    case other               => List(other)
+  private val defaultEnv: Env = Env(Map.empty, None)
+    .define("+", Value.Symbol("+"))
+    .define("-", Value.Symbol("-"))
+    .define("*", Value.Symbol("*"))
+    .define("/", Value.Symbol("/"))
+    .define("<", Value.Symbol("<"))
+    .define(">", Value.Symbol(">"))
+    .define("=", Value.Symbol("="))
+    .define("<=", Value.Symbol("<="))
+    .define(">=", Value.Symbol(">="))

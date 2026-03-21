@@ -8,6 +8,8 @@ enum Value:
   case Symbol(name: String)
   case PairVal(car: Value, cdr: Value)
   case NilVal
+  case LambdaVal(params: List[String], body: List[Value], closure: Env, name: Option[String])
+  case VoidVal
 
   def display: String = this match
     case IntVal(n)     => n.toString
@@ -16,6 +18,8 @@ enum Value:
     case Symbol(name)  => name
     case NilVal        => "()"
     case PairVal(_, _) => displayList(this)
+    case _: LambdaVal  => "#<procedure>"
+    case VoidVal       => ""
 
   private def displayList(v: Value): String =
     val (elems, tail) = collectList(v, List.empty)

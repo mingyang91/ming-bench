@@ -8,6 +8,7 @@ object Parser:
   enum Token:
     case LParen
     case RParen
+    case Quote
     case Atom(value: String)
 
   def parse(input: String): List[Value] =
@@ -26,6 +27,9 @@ object Parser:
     tokens match
       case Nil =>
         throw new EvalError("unexpected end of input")
+      case Token.Quote :: rest =>
+        val (value, remaining) = parseExpr(rest)
+        (Value.PairVal(Value.Symbol("quote"), Value.PairVal(value, Value.NilVal)), remaining)
       case Token.LParen :: rest =>
         parseList(rest, List.empty)
       case Token.RParen :: _ =>
@@ -70,6 +74,7 @@ object Parser:
       case ';'                  => (None, skipLineComment(input, pos + 1))
       case '('                  => (Some(Token.LParen), pos + 1)
       case ')'                  => (Some(Token.RParen), pos + 1)
+      case '\''                 => (Some(Token.Quote), pos + 1)
       case '"' =>
         val (str, next) = readString(input, pos + 1, pos + 1)
         (Some(Token.Atom("\"" + str + "\"")), next)
