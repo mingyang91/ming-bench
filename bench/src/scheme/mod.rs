@@ -20,7 +20,7 @@ enum Value {
     Lambda {
         name: Option<String>,
         params: Vec<String>,
-        body: Expr,
+        body: Vec<Expr>,
         closure_env: Env,
     },
 }

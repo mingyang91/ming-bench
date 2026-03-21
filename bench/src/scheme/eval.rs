@@ -92,6 +92,15 @@ fn apply_func(func: &Value, args: &[Value]) -> Result<Value, EvalError> {
     }
 }
 
+/// Evaluate a sequence of body expressions, returning the last result.
+fn eval_body(body: &[Expr], env: &mut Env) -> Result<Value, EvalError> {
+    let mut result = Value::Nil;
+    for expr in body {
+        result = eval(expr, env)?;
+    }
+    Ok(result)
+}
+
 /// Apply a lambda closure to arguments.
 fn apply_lambda(func: &Value, args: &[Value]) -> Result<Value, EvalError> {
     let Value::Lambda { name, params, body, closure_env } = func else {
@@ -111,16 +120,21 @@ fn apply_lambda(func: &Value, args: &[Value]) -> Result<Value, EvalError> {
     for (param, arg) in params.iter().zip(args) {
         local_env.insert(param.clone(), arg.clone());
     }
-    eval(body, &mut local_env)
+    eval_body(body, &mut local_env)
 }
 
-/// Evaluate `(lambda (params...) body)`.
+/// Evaluate `(lambda (params...) body...)`.
 fn eval_lambda(args: &[Expr], env: &Env) -> Result<Value, EvalError> {
-    let [params_expr, body] = args else {
+    let [params_expr, body @ ..] = args else {
         return Err(EvalError::Parse {
             message: "lambda requires params and body".to_string(),
         });
     };
+    if body.is_empty() {
+        return Err(EvalError::Parse {
+            message: "lambda requires params and body".to_string(),
+        });
+    }
     let Expr::List(param_exprs) = params_expr else {
         return Err(EvalError::Parse {
             message: "lambda params must be a list".to_string(),
@@ -138,21 +152,31 @@ fn eval_lambda(args: &[Expr], env: &Env) -> Result<Value, EvalError> {
     Ok(Value::Lambda {
         name: None,
         params,
-        body: body.clone(),
+        body: body.to_vec(),
         closure_env: env.clone(),
     })
 }
 
-/// Evaluate `(define name value)` or `(define (name params...) body)`.
+/// Evaluate `(define name value)` or `(define (name params...) body...)`.
 fn eval_define(args: &[Expr], env: &mut Env) -> Result<Value, EvalError> {
-    let [target, body] = args else {
+    let [target, body @ ..] = args else {
         return Err(EvalError::Parse {
             message: "define requires a name and a value".to_string(),
         });
     };
+    if body.is_empty() {
+        return Err(EvalError::Parse {
+            message: "define requires a name and a value".to_string(),
+        });
+    }
     match target {
         Expr::Atom(name) => {
-            let val = eval(body, env)?;
+            let [value_expr] = body else {
+                return Err(EvalError::Parse {
+                    message: "define variable form takes exactly one value".to_string(),
+                });
+            };
+            let val = eval(value_expr, env)?;
             env.insert(name.clone(), val.clone());
             Ok(val)
         }
@@ -174,7 +198,7 @@ fn eval_define(args: &[Expr], env: &mut Env) -> Result<Value, EvalError> {
             let lambda = Value::Lambda {
                 name: Some(name.clone()),
                 params,
-                body: body.clone(),
+                body: body.to_vec(),
                 closure_env: env.clone(),
             };
             env.insert(name.clone(), lambda);
