@@ -1,37 +1,53 @@
+use std::fmt;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct SourcePos {
+    pub line: usize,
+    pub col: usize,
+}
+
+impl fmt::Display for SourcePos {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}:{}", self.line, self.col)
+    }
+}
+
 /// Evaluation error type for the Scheme interpreter.
 ///
 /// Agents must add domain-specific variants here. Using `String` as the
 /// error type is not possible — the `eval_str` signature requires this type.
 #[derive(Debug, PartialEq, thiserror::Error)]
 pub enum EvalError {
-    #[error("syntax error: {message}")]
-    SyntaxError { message: String },
+    #[error("syntax error at {pos}: {message}")]
+    SyntaxError { pos: SourcePos, message: String },
 
-    #[error("unexpected end of input")]
-    UnexpectedEof,
+    #[error("unexpected end of input at {pos}")]
+    UnexpectedEof { pos: SourcePos },
 
-    #[error("unbound variable: {name}")]
-    UnboundVariable { name: String },
+    #[error("unbound variable at {pos}: {name}")]
+    UnboundVariable { pos: SourcePos, name: String },
 
-    #[error("unknown operator: {name}")]
-    UnknownOperator { name: String },
+    #[error("unknown operator at {pos}: {name}")]
+    UnknownOperator { pos: SourcePos, name: String },
 
-    #[error("wrong number of arguments for {name}: expected {expected}, got {got}")]
+    #[error("wrong number of arguments at {pos} for {name}: expected {expected}, got {got}")]
     WrongArity {
+        pos: SourcePos,
         name: String,
         expected: String,
         got: usize,
     },
 
-    #[error("type error: expected {expected}, got {found}")]
+    #[error("type error at {pos}: expected {expected}, got {found}")]
     TypeError {
+        pos: SourcePos,
         expected: &'static str,
         found: &'static str,
     },
 
-    #[error("division by zero")]
-    DivisionByZero,
+    #[error("division by zero at {pos}")]
+    DivisionByZero { pos: SourcePos },
 
-    #[error("cannot call non-function: {found}")]
-    NotCallable { found: &'static str },
+    #[error("cannot call non-function at {pos}: {found}")]
+    NotCallable { pos: SourcePos, found: &'static str },
 }
