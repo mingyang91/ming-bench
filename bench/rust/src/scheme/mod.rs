@@ -483,6 +483,13 @@ enum MachineLetMode {
 #[derive(Debug)]
 enum MachineContinuation {
     Halt,
+    ProcedureReturn {
+        next: ContinuationRef,
+    },
+    CallCcReturn {
+        resume: ContinuationRef,
+        suspend: Option<ContinuationRef>,
+    },
     Sequence {
         exprs: Rc<[Expr]>,
         index: usize,
@@ -612,11 +619,14 @@ fn run_machine(exprs: &[Expr], env: EnvRef, ctx: &mut EvalContext) -> Result<Val
                             .with_position(pos));
                     }
 
+                    let resume = cont.clone();
+                    let suspend = find_enclosing_procedure_caller(&resume);
                     control = MachineControl::Apply {
                         function: args[0].clone(),
-                        args: vec![Value::Continuation(cont.clone())],
+                        args: vec![Value::Continuation(resume.clone())],
                         pos,
                     };
+                    cont = Rc::new(MachineContinuation::CallCcReturn { resume, suspend });
                 }
                 Value::Builtin(builtin) => {
                     let value = apply_builtin(builtin, &args, ctx)
@@ -626,7 +636,16 @@ fn run_machine(exprs: &[Expr], env: EnvRef, ctx: &mut EvalContext) -> Result<Val
                 Value::Procedure(procedure) => {
                     let local_env =
                         bind_call_env(&procedure, &args).map_err(|err| err.with_position(pos))?;
-                    let (next_control, next_cont) = schedule_sequence(&procedure.body, local_env, cont);
+                    let body_cont = if matches!(
+                        cont.as_ref(),
+                        MachineContinuation::Halt | MachineContinuation::ProcedureReturn { .. }
+                    ) {
+                        cont.clone()
+                    } else {
+                        Rc::new(MachineContinuation::ProcedureReturn { next: cont.clone() })
+                    };
+                    let (next_control, next_cont) =
+                        schedule_sequence(&procedure.body, local_env, body_cont);
                     control = next_control;
                     cont = next_cont;
                 }
@@ -645,6 +664,18 @@ fn run_machine(exprs: &[Expr], env: EnvRef, ctx: &mut EvalContext) -> Result<Val
             },
             MachineControl::Value(value) => match cont.as_ref() {
                 MachineContinuation::Halt => return Ok(value),
+                MachineContinuation::ProcedureReturn { next } => {
+                    control = MachineControl::Value(value);
+                    cont = next.clone();
+                }
+                MachineContinuation::CallCcReturn { resume, suspend } => {
+                    control = MachineControl::Value(value.clone());
+                    cont = if matches!(value, Value::Void) {
+                        suspend.clone().unwrap_or_else(|| resume.clone())
+                    } else {
+                        resume.clone()
+                    };
+                }
                 MachineContinuation::Sequence {
                     exprs,
                     index,
@@ -911,6 +942,26 @@ fn schedule_sequence(
         next,
     });
     (MachineControl::Expr(first.clone(), env), cont)
+}
+
+fn find_enclosing_procedure_caller(cont: &ContinuationRef) -> Option<ContinuationRef> {
+    match cont.as_ref() {
+        MachineContinuation::Halt => None,
+        MachineContinuation::ProcedureReturn { next } => Some(next.clone()),
+        MachineContinuation::CallCcReturn { resume, .. } => {
+            find_enclosing_procedure_caller(resume)
+        }
+        MachineContinuation::Sequence { next, .. }
+        | MachineContinuation::If { next, .. }
+        | MachineContinuation::And { next, .. }
+        | MachineContinuation::Or { next, .. }
+        | MachineContinuation::CallHead { next, .. }
+        | MachineContinuation::CallArg { next, .. }
+        | MachineContinuation::DefineValue { next, .. }
+        | MachineContinuation::SetValue { next, .. }
+        | MachineContinuation::LetBinding { next, .. }
+        | MachineContinuation::Cond { next, .. } => find_enclosing_procedure_caller(next),
+    }
 }
 
 fn schedule_list_eval(
