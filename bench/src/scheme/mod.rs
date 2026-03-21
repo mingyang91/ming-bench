@@ -289,6 +289,61 @@ fn eval(value: &Value, env: &mut Env) -> Result<Value, EvalError> {
                         }
                         return Ok(result);
                     }
+                    "let" => {
+                        if items.len() < 3 {
+                            return Err(EvalError::Arity);
+                        }
+                        let bindings = match &items[1] {
+                            Value::List(bs) => bs,
+                            _ => return Err(EvalError::TypeError("let: bindings must be a list".into())),
+                        };
+                        let mut local_env = env.clone();
+                        for b in bindings {
+                            match b {
+                                Value::List(pair) if pair.len() == 2 => {
+                                    let name = match &pair[0] {
+                                        Value::Symbol(s) => s.clone(),
+                                        _ => return Err(EvalError::TypeError("let: binding name must be symbol".into())),
+                                    };
+                                    let val = eval(&pair[1], env)?;
+                                    local_env.insert(name, val);
+                                }
+                                _ => return Err(EvalError::TypeError("let: bad binding".into())),
+                            }
+                        }
+                        let mut result = Value::Symbol("ok".into());
+                        for expr in &items[2..] {
+                            result = eval(expr, &mut local_env)?;
+                        }
+                        return Ok(result);
+                    }
+                    "cond" => {
+                        for clause in &items[1..] {
+                            match clause {
+                                Value::List(parts) if parts.len() >= 2 => {
+                                    if let Value::Symbol(s) = &parts[0] {
+                                        if s == "else" {
+                                            let mut result = Value::Symbol("ok".into());
+                                            for expr in &parts[1..] {
+                                                result = eval(expr, env)?;
+                                            }
+                                            return Ok(result);
+                                        }
+                                    }
+                                    let test = eval(&parts[0], env)?;
+                                    if test != Value::Boolean(false) {
+                                        let mut result = Value::Symbol("ok".into());
+                                        for expr in &parts[1..] {
+                                            result = eval(expr, env)?;
+                                        }
+                                        return Ok(result);
+                                    }
+                                }
+                                _ => return Err(EvalError::TypeError("cond: bad clause".into())),
+                            }
+                        }
+                        return Ok(Value::Symbol("ok".into()));
+                    }
                     _ => {}
                 }
             }
