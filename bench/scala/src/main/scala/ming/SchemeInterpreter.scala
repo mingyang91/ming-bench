@@ -4,12 +4,8 @@ import scala.annotation.tailrec
 
 object SchemeInterpreter:
 
-  def evaluateProgram(input: String): Value =
-    evaluateProgramWithOutput(input)._1
-
-  def evaluateProgramWithOutput(input: String): (Value, String) =
-    val (state, value) = evaluateSequence(SchemeReader.readAll(input), EvalState.empty)
-    (value, state.renderedOutput)
+  def evaluateProgram(input: String): (EvalState, Value) =
+    evaluateSequence(SchemeReader.readAll(input), EvalState.empty)
 
   private def evaluateSequence(expressions: List[Expr], state: EvalState): (EvalState, Value) = expressions match
     case Nil =>
@@ -229,7 +225,7 @@ object SchemeInterpreter:
     procedure match
       case Value.Builtin(name) =>
         val (nextState, evaluatedArgs) = evaluateArguments(arguments, state)
-        applyBuiltin(name, evaluatedArgs, nextState, position)
+        BuiltinProcedure(name, evaluatedArgs, nextState, position)
       case Value.Closure(parameters, body, closureEnv) =>
         val (nextState, evaluatedArgs) = evaluateArguments(arguments, state)
         val argumentValues             = evaluatedArgs.map(_.value)
@@ -250,15 +246,6 @@ object SchemeInterpreter:
 
   private def lookup(name: String, env: Env): Option[Value] =
     env.lookup(name).orElse(BuiltinProcedure.resolve(name))
-
-  private def applyBuiltin(
-    name: String,
-    arguments: List[EvaluatedArg],
-    state: EvalState,
-    position: SourcePos
-  ): (EvalState, Value) =
-    val result = BuiltinProcedure(name, arguments, position)
-    (state.appendOutput(result.output), result.value)
 
   private def evaluateArguments(
     arguments: List[Expr],

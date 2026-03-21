@@ -34,6 +34,8 @@ object BuiltinCatalog:
     "symbol->string",
     "string->symbol",
     "string-ref",
+    "string-copy",
+    "string-set!",
     "char?"
   )
 

@@ -1,6 +1,11 @@
 package ming
 
-final case class EvalState(env: Env, outputRev: List[String]):
+final case class EvalState(
+  env: Env,
+  outputRev: List[String],
+  strings: Map[Int, String],
+  nextStringId: Int
+):
 
   def withEnv(nextEnv: Env): EvalState =
     copy(env = nextEnv)
@@ -11,6 +16,23 @@ final case class EvalState(env: Env, outputRev: List[String]):
   def renderedOutput: String =
     outputRev.reverse.mkString
 
+  def readString(value: StringStorage): String = value match
+    case StringStorage.Immutable(text) =>
+      text
+    case StringStorage.Mutable(id) =>
+      strings.getOrElse(id, throw new IllegalStateException(s"unknown string id: $id"))
+
+  def allocateMutableString(value: String): (EvalState, Value) =
+    val id = nextStringId
+    (
+      copy(strings = strings.updated(id, value), nextStringId = id + 1),
+      Value.Str(StringStorage.Mutable(id))
+    )
+
+  def writeMutableString(id: Int, value: String): EvalState =
+    require(strings.contains(id), s"unknown string id: $id")
+    copy(strings = strings.updated(id, value))
+
 object EvalState:
 
-  val empty: EvalState = EvalState(Env.empty, Nil)
+  val empty: EvalState = EvalState(Env.empty, Nil, Map.empty, 0)

@@ -112,7 +112,7 @@ object SchemeReader:
         remaining
       )
     case Token.Str(value, position) :: rest =>
-      (Expr.Literal(Value.Str(value), position), rest)
+      (Expr.Literal(Value.immutableString(value), position), rest)
     case Token.Atom(value, position) :: rest =>
       (parseAtom(value, position), rest)
 
@@ -130,10 +130,21 @@ object SchemeReader:
     value match
       case "#t" => Expr.Literal(Value.Bool(true), position)
       case "#f" => Expr.Literal(Value.Bool(false), position)
+      case atom if atom.startsWith("#\\") =>
+        Expr.Literal(Value.Character(parseCharacter(atom, position)), position)
       case _ =>
         parseInteger(value) match
           case Some(number) => Expr.Literal(Value.Number(number), position)
           case None         => Expr.Symbol(value, position)
+
+  private def parseCharacter(value: String, position: SourcePos): Char =
+    value.drop(2) match
+      case "space"   => ' '
+      case "newline" => '\n'
+      case chars if chars.length == 1 =>
+        chars.head
+      case _ =>
+        throw EvalError.at(position, "invalid character literal")
 
   private def parseInteger(value: String): Option[BigInt] =
     if value.nonEmpty && value.forall(_.isDigit) then Some(BigInt(value))

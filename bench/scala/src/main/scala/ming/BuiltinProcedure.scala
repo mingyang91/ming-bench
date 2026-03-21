@@ -3,147 +3,103 @@ package ming
 import scala.annotation.tailrec
 
 final case class EvaluatedArg(value: Value, position: SourcePos)
-final case class BuiltinResult(value: Value, output: String = "")
 
 object BuiltinProcedure:
 
   def resolve(name: String): Option[Value] =
     BuiltinCatalog.resolve(name)
 
-  def apply(name: String, arguments: List[EvaluatedArg], position: SourcePos): BuiltinResult =
+  def apply(
+    name: String,
+    arguments: List[EvaluatedArg],
+    state: EvalState,
+    position: SourcePos
+  ): (EvalState, Value) =
     name match
       case "+" | "*" | "-" | "/" | "<" | ">" | "=" | "<=" | "not" =>
-        applyNumericBuiltin(name, arguments, position)
+        pure(state, applyNumericBuiltin(name, arguments, position))
       case "cons" | "car" | "cdr" | "null?" | "list" | "length" | "string?" | "number?" | "boolean?" | "pair?" |
           "symbol?" | "char?" =>
-        applyCoreBuiltin(name, arguments, position)
+        pure(state, applyCoreBuiltin(name, arguments, position))
       case "display" | "write" | "newline" | "string-append" | "string-length" | "substring" | "string->number" |
-          "number->string" | "symbol->string" | "string->symbol" | "string-ref" =>
-        applyStringBuiltin(name, arguments, position)
+          "number->string" | "symbol->string" | "string->symbol" | "string-ref" | "string-copy" | "string-set!" =>
+        StringProcedure(name, arguments, state, position)
       case _ =>
         throw EvalError.at(position, s"unknown operator '$name'")
 
-  private def pure(value: Value): BuiltinResult =
-    BuiltinResult(value)
+  private def pure(state: EvalState, value: Value): (EvalState, Value) =
+    (state, value)
 
   private def applyNumericBuiltin(
     name: String,
     arguments: List[EvaluatedArg],
     position: SourcePos
-  ): BuiltinResult =
+  ): Value =
     name match
       case "+" =>
-        pure(Value.Number(expectNumbers(arguments).foldLeft(BigInt(0))(_ + _)))
+        Value.Number(expectNumbers(arguments).foldLeft(BigInt(0))(_ + _))
       case "*" =>
-        pure(Value.Number(expectNumbers(arguments).foldLeft(BigInt(1))(_ * _)))
+        Value.Number(expectNumbers(arguments).foldLeft(BigInt(1))(_ * _))
       case "-" =>
-        pure(Value.Number(evaluateSub(arguments, position)))
+        Value.Number(evaluateSub(arguments, position))
       case "/" =>
-        pure(Value.Number(evaluateDiv(arguments, position)))
+        Value.Number(evaluateDiv(arguments, position))
       case "<" =>
-        pure(Value.Bool(compare(arguments, position)(_ < _)))
+        Value.Bool(compare(arguments, position)(_ < _))
       case ">" =>
-        pure(Value.Bool(compare(arguments, position)(_ > _)))
+        Value.Bool(compare(arguments, position)(_ > _))
       case "=" =>
-        pure(Value.Bool(compare(arguments, position)(_ == _)))
+        Value.Bool(compare(arguments, position)(_ == _))
       case "<=" =>
-        pure(Value.Bool(compare(arguments, position)(_ <= _)))
+        Value.Bool(compare(arguments, position)(_ <= _))
       case "not" =>
-        pure(evaluateNot(arguments, position))
+        evaluateNot(arguments, position)
 
   private def applyCoreBuiltin(
     name: String,
     arguments: List[EvaluatedArg],
     position: SourcePos
-  ): BuiltinResult =
+  ): Value =
     name match
       case "cons" =>
         val pairArgs = expectExactArity(arguments, 2, "cons", position)
-        pure(Value.Pair(pairArgs.head.value, pairArgs(1).value))
+        Value.Pair(pairArgs.head.value, pairArgs(1).value)
       case "car" =>
         val argument = expectSingleArg(arguments, "car", position)
-        pure(expectPair(argument)._1)
+        expectPair(argument)._1
       case "cdr" =>
         val argument = expectSingleArg(arguments, "cdr", position)
-        pure(expectPair(argument)._2)
+        expectPair(argument)._2
       case "null?" =>
-        pure(Value.Bool(expectSingleArg(arguments, "null?", position).value == Value.EmptyList))
+        Value.Bool(expectSingleArg(arguments, "null?", position).value == Value.EmptyList)
       case "list" =>
-        pure(listFrom(arguments.map(_.value)))
+        listFrom(arguments.map(_.value))
       case "length" =>
-        pure(Value.Number(properListLength(expectSingleArg(arguments, "length", position))))
+        Value.Number(properListLength(expectSingleArg(arguments, "length", position)))
       case "string?" =>
-        pure(
-          evaluatePredicate(arguments, "string?", position):
-            case Value.Str(_) => true
-            case _            => false
-        )
+        evaluatePredicate(arguments, "string?", position):
+          case Value.Str(_) => true
+          case _            => false
       case "number?" =>
-        pure(
-          evaluatePredicate(arguments, "number?", position):
-            case Value.Number(_) => true
-            case _               => false
-        )
+        evaluatePredicate(arguments, "number?", position):
+          case Value.Number(_) => true
+          case _               => false
       case "boolean?" =>
-        pure(
-          evaluatePredicate(arguments, "boolean?", position):
-            case Value.Bool(_) => true
-            case _             => false
-        )
+        evaluatePredicate(arguments, "boolean?", position):
+          case Value.Bool(_) => true
+          case _             => false
       case "pair?" =>
-        pure(
-          evaluatePredicate(arguments, "pair?", position):
-            case Value.Pair(_, _) => true
-            case _                => false
-        )
+        evaluatePredicate(arguments, "pair?", position):
+          case Value.Pair(_, _) => true
+          case _                => false
       case "symbol?" =>
-        pure(
-          evaluatePredicate(arguments, "symbol?", position):
-            case Value.Symbol(_) => true
-            case _               => false
-        )
+        evaluatePredicate(arguments, "symbol?", position):
+          case Value.Symbol(_) => true
+          case _               => false
       case "char?" =>
-        pure(
-          evaluatePredicate(arguments, "char?", position):
-            case Value.Character(_) => true
-            case _                  => false
-        )
-
-  private def applyStringBuiltin(
-    name: String,
-    arguments: List[EvaluatedArg],
-    position: SourcePos
-  ): BuiltinResult =
-    name match
-      case "display" =>
-        BuiltinResult(
-          Value.Void,
-          expectSingleArg(arguments, "display", position).value.renderDisplay
-        )
-      case "write" =>
-        BuiltinResult(
-          Value.Void,
-          expectSingleArg(arguments, "write", position).value.render
-        )
-      case "newline" =>
-        expectExactArity(arguments, 0, "newline", position)
-        BuiltinResult(Value.Void, "\n")
-      case "string-append" =>
-        pure(Value.Str(arguments.map(expectString).mkString))
-      case "string-length" =>
-        pure(Value.Number(expectString(expectSingleArg(arguments, "string-length", position)).length))
-      case "substring" =>
-        pure(evaluateSubstring(arguments, position))
-      case "string->number" =>
-        pure(evaluateStringToNumber(arguments, position))
-      case "number->string" =>
-        pure(Value.Str(expectNumber(expectSingleArg(arguments, "number->string", position)).toString))
-      case "symbol->string" =>
-        pure(Value.Str(expectSymbol(expectSingleArg(arguments, "symbol->string", position))))
-      case "string->symbol" =>
-        pure(Value.Symbol(expectString(expectSingleArg(arguments, "string->symbol", position))))
-      case "string-ref" =>
-        pure(evaluateStringRef(arguments, position))
+        evaluatePredicate(arguments, "char?", position):
+          case Value.Character(_) => true
+          case _                  => false
 
   private def evaluatePredicate(arguments: List[EvaluatedArg], name: String, position: SourcePos)(
     predicate: Value => Boolean
@@ -188,16 +144,6 @@ object BuiltinProcedure:
 
   private def expectNumbers(arguments: List[EvaluatedArg]): List[BigInt] =
     arguments.map(expectNumber)
-
-  private def expectString(argument: EvaluatedArg): String =
-    argument.value match
-      case Value.Str(value) => value
-      case _                => throw EvalError.at(argument.position, "expected string")
-
-  private def expectSymbol(argument: EvaluatedArg): String =
-    argument.value match
-      case Value.Symbol(name) => name
-      case _                  => throw EvalError.at(argument.position, "expected symbol")
 
   private def evaluateSub(arguments: List[EvaluatedArg], position: SourcePos): BigInt =
     expectNumbers(arguments) match
@@ -258,39 +204,3 @@ object BuiltinProcedure:
     argument.value match
       case Value.Number(number) => number
       case _                    => throw EvalError.at(argument.position, "expected number")
-
-  private def expectIndex(argument: EvaluatedArg): Int =
-    expectNumber(argument) match
-      case index if index >= 0 && index.isValidInt =>
-        index.toInt
-      case _ =>
-        throw EvalError.at(argument.position, "expected non-negative integer index")
-
-  private def evaluateSubstring(arguments: List[EvaluatedArg], position: SourcePos): Value =
-    val substringArgs      = expectExactArity(arguments, 3, "substring", position)
-    val value              = expectString(substringArgs.head)
-    val startIndex         = expectIndex(substringArgs(1))
-    val endIndex           = expectIndex(substringArgs(2))
-    val indicesAreInBounds = startIndex <= endIndex && endIndex <= value.length
-
-    if indicesAreInBounds then Value.Str(value.substring(startIndex, endIndex))
-    else throw EvalError.at(position, "substring indices out of bounds")
-
-  private def evaluateStringToNumber(arguments: List[EvaluatedArg], position: SourcePos): Value =
-    parseInteger(expectString(expectSingleArg(arguments, "string->number", position))) match
-      case Some(number) => Value.Number(number)
-      case None         => Value.Bool(false)
-
-  private def evaluateStringRef(arguments: List[EvaluatedArg], position: SourcePos): Value =
-    val refArgs         = expectExactArity(arguments, 2, "string-ref", position)
-    val value           = expectString(refArgs.head)
-    val index           = expectIndex(refArgs(1))
-    val indexIsInBounds = index < value.length
-
-    if indexIsInBounds then Value.Character(value.charAt(index))
-    else throw EvalError.at(refArgs(1).position, "string index out of bounds")
-
-  private def parseInteger(value: String): Option[BigInt] =
-    if value.nonEmpty && value.forall(_.isDigit) then Some(BigInt(value))
-    else if value.startsWith("-") && value.length > 1 && value.tail.forall(_.isDigit) then Some(BigInt(value))
-    else None
