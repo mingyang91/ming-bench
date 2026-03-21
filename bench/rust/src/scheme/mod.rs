@@ -118,6 +118,7 @@ enum ExprKind {
     Boolean(bool),
     Str(String),
     Symbol(String),
+    Char(char),
     List(Vec<Expr>),
 }
 
@@ -156,6 +157,18 @@ impl Env {
 
     fn set(&mut self, name: String, val: Value) {
         self.bindings.insert(name, val);
+    }
+
+    /// Mutate an existing binding in the nearest scope that contains it.
+    fn set_existing(&mut self, name: &str, val: Value) -> bool {
+        if self.bindings.contains_key(name) {
+            self.bindings.insert(name.to_string(), val);
+            true
+        } else if let Some(ref mut parent) = self.parent {
+            parent.set_existing(name, val)
+        } else {
+            false
+        }
     }
 }
 
@@ -319,15 +332,34 @@ impl Parser {
     fn parse_hash(&mut self) -> Result<Expr, EvalError> {
         let start = self.current_pos();
         self.next_char(); // consume '#'
-        match self.next_char() {
-            Some('t') => Ok(Expr {
-                kind: ExprKind::Boolean(true),
-                pos: start,
-            }),
-            Some('f') => Ok(Expr {
-                kind: ExprKind::Boolean(false),
-                pos: start,
-            }),
+        match self.peek() {
+            Some('t') => {
+                self.next_char();
+                Ok(Expr {
+                    kind: ExprKind::Boolean(true),
+                    pos: start,
+                })
+            }
+            Some('f') => {
+                self.next_char();
+                Ok(Expr {
+                    kind: ExprKind::Boolean(false),
+                    pos: start,
+                })
+            }
+            Some('\\') => {
+                self.next_char(); // consume '\'
+                match self.next_char() {
+                    Some(c) => Ok(Expr {
+                        kind: ExprKind::Char(c),
+                        pos: start,
+                    }),
+                    None => Err(EvalError::Parse(format!(
+                        "unterminated character literal at {}",
+                        start.fmt()
+                    ))),
+                }
+            }
             _ => Err(EvalError::Parse(format!(
                 "invalid # literal at {}",
                 start.fmt()
@@ -382,6 +414,7 @@ fn eval(expr: &Expr, env: &mut Env, out: &mut String) -> Result<Value, EvalError
         ExprKind::Integer(n) => Ok(Value::Integer(*n)),
         ExprKind::Boolean(b) => Ok(Value::Boolean(*b)),
         ExprKind::Str(s) => Ok(Value::Str(s.clone())),
+        ExprKind::Char(c) => Ok(Value::Char(*c)),
         ExprKind::Symbol(name) => env
             .get(name)
             .ok_or_else(|| EvalError::UnboundVariable(format!("{} at {}", name, pos.fmt()))),
@@ -404,6 +437,7 @@ fn eval(expr: &Expr, env: &mut Env, out: &mut String) -> Result<Value, EvalError
                     "let" => return eval_let(&items[1..], pos, env, out),
                     "begin" => return eval_begin(&items[1..], env, out),
                     "cond" => return eval_cond(&items[1..], env, out),
+                    "string-set!" => return eval_string_set(&items[1..], pos, env, out),
                     _ => {}
                 }
             }
@@ -563,6 +597,7 @@ fn expr_to_value(expr: &Expr) -> Value {
         ExprKind::Boolean(b) => Value::Boolean(*b),
         ExprKind::Str(s) => Value::Str(s.clone()),
         ExprKind::Symbol(s) => Value::Symbol(s.clone()),
+        ExprKind::Char(c) => Value::Char(*c),
         ExprKind::List(items) => {
             let mut result = Value::Nil;
             for item in items.iter().rev() {
@@ -728,6 +763,50 @@ fn eval_cond(args: &[Expr], env: &mut Env, out: &mut String) -> Result<Value, Ev
         }
     }
     Ok(Value::Nil)
+}
+
+fn eval_string_set(args: &[Expr], pos: Pos, env: &mut Env, out: &mut String) -> Result<Value, EvalError> {
+    if args.len() != 3 {
+        return Err(EvalError::Arity(format!(
+            "string-set! requires 3 arguments at {}",
+            pos.fmt()
+        )));
+    }
+    let name = match &args[0].kind {
+        ExprKind::Symbol(s) => s.clone(),
+        _ => {
+            return Err(EvalError::Type(format!(
+                "string-set!: first argument must be a variable at {}",
+                pos.fmt()
+            )))
+        }
+    };
+    let idx = eval(&args[1], env, out)?.as_integer(pos)? as usize;
+    let ch = match eval(&args[2], env, out)? {
+        Value::Char(c) => c,
+        _ => {
+            return Err(EvalError::Type(format!(
+                "string-set!: third argument must be a character at {}",
+                pos.fmt()
+            )))
+        }
+    };
+    let val = env.get(&name).ok_or_else(|| {
+        EvalError::UnboundVariable(format!("{} at {}", name, pos.fmt()))
+    })?;
+    match val {
+        Value::Str(s) => {
+            let mut chars: Vec<char> = s.chars().collect();
+            chars[idx] = ch;
+            let new_s: String = chars.into_iter().collect();
+            env.set_existing(&name, Value::Str(new_s));
+            Ok(Value::Nil)
+        }
+        _ => Err(EvalError::Type(format!(
+            "string-set!: expected string at {}",
+            pos.fmt()
+        ))),
+    }
 }
 
 fn apply_builtin(op: &str, args: &[Value], pos: Pos, out: &mut String) -> Result<Option<Value>, EvalError> {
@@ -1056,6 +1135,21 @@ fn apply_builtin(op: &str, args: &[Value], pos: Pos, out: &mut String) -> Result
                 Value::Str(s) => Ok(Some(Value::Symbol(s.clone()))),
                 _ => Err(EvalError::Type(format!(
                     "string->symbol: expected string at {}",
+                    pos.fmt()
+                ))),
+            }
+        }
+        "string-copy" => {
+            if args.len() != 1 {
+                return Err(EvalError::Arity(format!(
+                    "string-copy requires 1 argument at {}",
+                    pos.fmt()
+                )));
+            }
+            match &args[0] {
+                Value::Str(s) => Ok(Some(Value::Str(s.clone()))),
+                _ => Err(EvalError::Type(format!(
+                    "string-copy: expected string at {}",
                     pos.fmt()
                 ))),
             }
