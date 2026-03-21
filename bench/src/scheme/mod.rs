@@ -2,7 +2,9 @@ pub mod error;
 
 pub use error::EvalError;
 
+use std::cell::RefCell;
 use std::collections::HashMap;
+use std::rc::Rc;
 
 /// A Scheme value.
 #[derive(Debug, Clone, PartialEq)]
@@ -20,7 +22,16 @@ enum Value {
     },
 }
 
-type Env = HashMap<String, Value>;
+type EnvCell = Rc<RefCell<Value>>;
+type Env = HashMap<String, EnvCell>;
+
+fn env_get(env: &Env, name: &str) -> Option<Value> {
+    env.get(name).map(|cell| cell.borrow().clone())
+}
+
+fn env_set(env: &mut Env, name: String, val: Value) {
+    env.insert(name, Rc::new(RefCell::new(val)));
+}
 
 impl Value {
     fn to_scheme_string(&self) -> String {
@@ -245,9 +256,7 @@ fn eval(ast: &Ast, env: &mut Env, out: &mut String) -> Result<Value, EvalError> 
             AstKind::Str(s) => return Ok(Value::Str(s)),
             AstKind::Char(c) => return Ok(Value::Char(c)),
             AstKind::Symbol(s) => {
-                return e
-                    .get(&s)
-                    .cloned()
+                return env_get(e, &s)
                     .ok_or_else(|| EvalError::UndefinedVariable(s).with_position(line, col));
             }
             AstKind::List(items) => {
@@ -268,7 +277,7 @@ fn eval(ast: &Ast, env: &mut Env, out: &mut String) -> Result<Value, EvalError> 
                                         return Err(EvalError::Arity.with_position(line, col));
                                     }
                                     let val = eval(&items[2], e, out)?;
-                                    e.insert(name.clone(), val);
+                                    env_set(e, name.clone(), val);
                                     return Ok(Value::Symbol("ok".into()));
                                 }
                                 AstKind::List(sig) => {
@@ -315,19 +324,43 @@ fn eval(ast: &Ast, env: &mut Env, out: &mut String) -> Result<Value, EvalError> 
                                         body: Box::new(body.clone()),
                                         env: e.clone(),
                                     };
-                                    e.insert(name.clone(), lambda);
+                                    env_set(e, name.clone(), lambda);
+                                    // Re-capture env so recursive calls see the binding
+                                    // Mutate the existing cell so the Rc in the closure's env updates too
                                     let lambda = Value::Lambda {
                                         params,
                                         body: Box::new(body),
                                         env: e.clone(),
                                     };
-                                    e.insert(name, lambda);
+                                    *e.get(&name).unwrap().borrow_mut() = lambda;
                                     return Ok(Value::Symbol("ok".into()));
                                 }
                                 _ => {
                                     return Err(EvalError::TypeError(
                                         "define expects symbol or list".into(),
                                     ).with_position(line, col))
+                                }
+                            }
+                        }
+                        "set!" => {
+                            if items.len() != 3 {
+                                return Err(EvalError::Arity.with_position(line, col));
+                            }
+                            let name = match &items[1].kind {
+                                AstKind::Symbol(s) => s.clone(),
+                                _ => return Err(EvalError::TypeError(
+                                    "set!: expected symbol".into(),
+                                ).with_position(line, col)),
+                            };
+                            let val = eval(&items[2], e, out)?;
+                            match e.get(&name) {
+                                Some(cell) => {
+                                    *cell.borrow_mut() = val;
+                                    return Ok(Value::Symbol("ok".into()));
+                                }
+                                None => {
+                                    return Err(EvalError::UndefinedVariable(name)
+                                        .with_position(line, col));
                                 }
                             }
                         }
@@ -449,7 +482,7 @@ fn eval(ast: &Ast, env: &mut Env, out: &mut String) -> Result<Value, EvalError> 
                                                 .with_position(pair[0].line, pair[0].col)),
                                         };
                                         let val = eval(&pair[1], e, out)?;
-                                        local_env.insert(name, val);
+                                        env_set(&mut local_env, name, val);
                                     }
                                     _ => return Err(EvalError::TypeError("let: bad binding".into())
                                         .with_position(b.line, b.col)),
@@ -520,12 +553,9 @@ fn eval(ast: &Ast, env: &mut Env, out: &mut String) -> Result<Value, EvalError> 
                         if args.len() != params.len() {
                             return Err(EvalError::Arity.with_position(line, col));
                         }
-                        let mut local_env = e.clone();
-                        for (k, v) in &closed_env {
-                            local_env.insert(k.clone(), v.clone());
-                        }
+                        let mut local_env = closed_env.clone();
                         for (p, a) in params.iter().zip(args) {
-                            local_env.insert(p.clone(), a);
+                            env_set(&mut local_env, p.clone(), a);
                         }
                         cur_ast = *body;
                         tco_env = Some(local_env);
@@ -788,7 +818,7 @@ fn apply_builtin(op: &str, args: &[Value], out: &mut String) -> Result<Value, Ev
                             return Err(EvalError::Arity);
                         }
                         let mut local_env = closed_env.clone();
-                        local_env.insert(params[0].clone(), item.clone());
+                        env_set(&mut local_env, params[0].clone(), item.clone());
                         results.push(eval(&body, &mut local_env, out)?);
                     }
                     _ => return Err(EvalError::NotAProcedure),
