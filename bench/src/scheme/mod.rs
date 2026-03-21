@@ -402,7 +402,8 @@ fn eval(expr: &Value, env: &Env) -> Result<Value, EvalError> {
                     | "string-append" | "string-length" | "substring"
                     | "string->number" | "number->string"
                     | "symbol->string" | "string->symbol" | "string-ref"
-                    | "string-copy" => {
+                    | "string-copy" | "string->list" | "list->string"
+                    | "char->integer" | "integer->char" | "map" => {
                         return eval_builtin(op, &elems[1..], env, form_span);
                     }
                     _ => {}
@@ -974,42 +975,99 @@ fn eval_builtin(
                 _ => Err(EvalError::TypeError("string-copy: expected string".into(), sp)),
             }
         }
+        "string->list" => {
+            if args.len() != 1 {
+                return Err(EvalError::WrongArgCount {
+                    expected: "1".into(),
+                    got: args.len(),
+                    at: sp,
+                });
+            }
+            let val = eval(&args[0], env)?;
+            match val {
+                Value::Str(s, _) => {
+                    let chars: Vec<Value> = s.chars().map(|c| Value::Char(c, sp)).collect();
+                    Ok(Value::List(chars, sp))
+                }
+                _ => Err(EvalError::TypeError("string->list: expected string".into(), sp)),
+            }
+        }
+        "list->string" => {
+            if args.len() != 1 {
+                return Err(EvalError::WrongArgCount {
+                    expected: "1".into(),
+                    got: args.len(),
+                    at: sp,
+                });
+            }
+            let val = eval(&args[0], env)?;
+            match &val {
+                Value::List(elems, _) => {
+                    let mut s = String::new();
+                    for e in elems {
+                        match e {
+                            Value::Char(c, _) => s.push(*c),
+                            _ => return Err(EvalError::TypeError("list->string: expected list of characters".into(), sp)),
+                        }
+                    }
+                    Ok(Value::Str(s, sp))
+                }
+                _ => Err(EvalError::TypeError("list->string: expected list".into(), sp)),
+            }
+        }
+        "char->integer" => {
+            if args.len() != 1 {
+                return Err(EvalError::WrongArgCount {
+                    expected: "1".into(),
+                    got: args.len(),
+                    at: sp,
+                });
+            }
+            let val = eval(&args[0], env)?;
+            match val {
+                Value::Char(c, _) => Ok(Value::Integer(c as i64, sp)),
+                _ => Err(EvalError::TypeError("char->integer: expected character".into(), sp)),
+            }
+        }
+        "integer->char" => {
+            if args.len() != 1 {
+                return Err(EvalError::WrongArgCount {
+                    expected: "1".into(),
+                    got: args.len(),
+                    at: sp,
+                });
+            }
+            let val = eval(&args[0], env)?;
+            let n = expect_integer(&val)?;
+            Ok(Value::Char(char::from_u32(n as u32).unwrap_or('\0'), sp))
+        }
+        "map" => {
+            if args.len() < 2 {
+                return Err(EvalError::WrongArgCount {
+                    expected: "2+".into(),
+                    got: args.len(),
+                    at: sp,
+                });
+            }
+            let func = eval(&args[0], env)?;
+            let list_val = eval(&args[1], env)?;
+            match list_val {
+                Value::List(elems, _) => {
+                    let results: Vec<Value> = elems
+                        .iter()
+                        .map(|e| apply_function(&func, &[e.clone()], sp))
+                        .collect::<Result<_, _>>()?;
+                    Ok(Value::List(results, sp))
+                }
+                _ => Err(EvalError::TypeError("map: expected list".into(), sp)),
+            }
+        }
         _ => Err(EvalError::UnboundVariable(op.to_string(), sp)),
     }
 }
 
-fn eval_string_set(args: &[Value], env: &Env, form_span: Span) -> Result<Value, EvalError> {
-    if args.len() != 3 {
-        return Err(EvalError::WrongArgCount {
-            expected: "3".into(),
-            got: args.len(),
-            at: form_span,
-        });
-    }
-    let var_name = match &args[0] {
-        Value::Symbol(name, _) => name.clone(),
-        _ => return Err(EvalError::TypeError("string-set!: first argument must be a variable".into(), form_span)),
-    };
-    let idx = expect_integer(&eval(&args[1], env)?)? as usize;
-    let ch = match eval(&args[2], env)? {
-        Value::Char(c, _) => c,
-        _ => return Err(EvalError::TypeError("string-set!: third argument must be a character".into(), form_span)),
-    };
-    let current = env_get(env, &var_name)
-        .ok_or_else(|| EvalError::UnboundVariable(var_name.clone(), form_span))?;
-    match current {
-        Value::Str(s, s_span) => {
-            let mut chars: Vec<char> = s.chars().collect();
-            if idx >= chars.len() {
-                return Err(EvalError::TypeError("string-set!: index out of range".into(), form_span));
-            }
-            chars[idx] = ch;
-            let new_str: String = chars.into_iter().collect();
-            env_set_existing(env, &var_name, Value::Str(new_str, s_span));
-            Ok(Value::Void)
-        }
-        _ => Err(EvalError::TypeError("string-set!: expected string".into(), form_span)),
-    }
+fn eval_string_set(_args: &[Value], _env: &Env, form_span: Span) -> Result<Value, EvalError> {
+    Err(EvalError::TypeError("string-set!: strings are immutable".into(), form_span))
 }
 
 fn eval_and(args: &[Value], env: &Env) -> Result<Value, EvalError> {
