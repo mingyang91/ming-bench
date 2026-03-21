@@ -12,6 +12,7 @@ struct StringState {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum StringMutability {
     Immutable,
+    #[allow(dead_code)]
     Mutable,
 }
 
@@ -26,6 +27,7 @@ impl SchemeString {
         Self::new(value.into(), StringMutability::Immutable)
     }
 
+    #[allow(dead_code)]
     pub fn mutable(value: impl Into<String>) -> Self {
         Self::new(value.into(), StringMutability::Mutable)
     }
@@ -54,6 +56,7 @@ impl SchemeString {
         Self::immutable(characters)
     }
 
+    #[allow(dead_code)]
     pub fn mutable_copy(&self) -> Self {
         Self::mutable(self.as_string())
     }

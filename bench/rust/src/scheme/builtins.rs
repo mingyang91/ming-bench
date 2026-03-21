@@ -1,5 +1,6 @@
 use crate::scheme::ast::SourceLocation;
 use crate::scheme::environment::Environment;
+use crate::scheme::evaluator::apply_callable;
 use crate::scheme::error::{ArgCount, EvalError};
 use crate::scheme::string_value::StringMutationError;
 use crate::scheme::value::Value;
@@ -14,6 +15,7 @@ pub enum BuiltinProcedure {
     GreaterThan,
     Equal,
     LessEqual,
+    GreaterEqual,
     Not,
     Cons,
     Car,
@@ -40,6 +42,11 @@ pub enum BuiltinProcedure {
     StringCopy,
     StringSet,
     CharPred,
+    StringToList,
+    ListToString,
+    CharToInteger,
+    IntegerToChar,
+    Map,
 }
 
 impl BuiltinProcedure {
@@ -53,6 +60,7 @@ impl BuiltinProcedure {
             Self::GreaterThan => ">",
             Self::Equal => "=",
             Self::LessEqual => "<=",
+            Self::GreaterEqual => ">=",
             Self::Not => "not",
             Self::Cons => "cons",
             Self::Car => "car",
@@ -79,6 +87,11 @@ impl BuiltinProcedure {
             Self::StringCopy => "string-copy",
             Self::StringSet => "string-set!",
             Self::CharPred => "char?",
+            Self::StringToList => "string->list",
+            Self::ListToString => "list->string",
+            Self::CharToInteger => "char->integer",
+            Self::IntegerToChar => "integer->char",
+            Self::Map => "map",
         }
     }
 }
@@ -93,6 +106,7 @@ pub fn install_builtins(environment: &Environment) {
         BuiltinProcedure::GreaterThan,
         BuiltinProcedure::Equal,
         BuiltinProcedure::LessEqual,
+        BuiltinProcedure::GreaterEqual,
         BuiltinProcedure::Not,
         BuiltinProcedure::Cons,
         BuiltinProcedure::Car,
@@ -119,6 +133,11 @@ pub fn install_builtins(environment: &Environment) {
         BuiltinProcedure::StringCopy,
         BuiltinProcedure::StringSet,
         BuiltinProcedure::CharPred,
+        BuiltinProcedure::StringToList,
+        BuiltinProcedure::ListToString,
+        BuiltinProcedure::CharToInteger,
+        BuiltinProcedure::IntegerToChar,
+        BuiltinProcedure::Map,
     ];
 
     BUILTIN_PROCEDURES.iter().copied().for_each(|procedure| {
@@ -148,6 +167,9 @@ pub fn apply_builtin(
         }
         BuiltinProcedure::LessEqual => {
             eval_comparison("<=", arguments, location, |left, right| left <= right)
+        }
+        BuiltinProcedure::GreaterEqual => {
+            eval_comparison(">=", arguments, location, |left, right| left >= right)
         }
         BuiltinProcedure::Not => eval_not(arguments, location),
         BuiltinProcedure::Cons => eval_cons(arguments, location),
@@ -183,6 +205,11 @@ pub fn apply_builtin(
         BuiltinProcedure::StringCopy => eval_string_copy(arguments, location),
         BuiltinProcedure::StringSet => eval_string_set(arguments, location),
         BuiltinProcedure::CharPred => eval_type_predicate("char?", arguments, location, is_char),
+        BuiltinProcedure::StringToList => eval_string_to_list(arguments, location),
+        BuiltinProcedure::ListToString => eval_list_to_string(arguments, location),
+        BuiltinProcedure::CharToInteger => eval_char_to_integer(arguments, location),
+        BuiltinProcedure::IntegerToChar => eval_integer_to_char(arguments, location),
+        BuiltinProcedure::Map => eval_map(arguments, location, output),
     }
 }
 
@@ -514,7 +541,7 @@ fn eval_string_ref(arguments: &[Value], location: SourceLocation) -> Result<Valu
 
 fn eval_string_copy(arguments: &[Value], location: SourceLocation) -> Result<Value, EvalError> {
     let string = unary_argument("string-copy", arguments, location)?.expect_string(location)?;
-    Ok(Value::String(string.mutable_copy()))
+    Ok(Value::immutable_string(string.as_string()))
 }
 
 fn eval_string_set(arguments: &[Value], location: SourceLocation) -> Result<Value, EvalError> {
@@ -554,6 +581,65 @@ fn eval_string_set(arguments: &[Value], location: SourceLocation) -> Result<Valu
     }
 }
 
+fn eval_string_to_list(arguments: &[Value], location: SourceLocation) -> Result<Value, EvalError> {
+    let string = unary_argument("string->list", arguments, location)?.expect_string(location)?;
+    let characters: Vec<_> = string
+        .as_string()
+        .chars()
+        .map(Value::Character)
+        .collect();
+    Ok(eval_list(&characters))
+}
+
+fn eval_list_to_string(arguments: &[Value], location: SourceLocation) -> Result<Value, EvalError> {
+    let list = unary_argument("list->string", arguments, location)?;
+    let characters = proper_list_items(list, location)?
+        .into_iter()
+        .map(|value| value.expect_char(location))
+        .collect::<Result<String, _>>()?;
+
+    Ok(Value::immutable_string(characters))
+}
+
+fn eval_char_to_integer(arguments: &[Value], location: SourceLocation) -> Result<Value, EvalError> {
+    let character = unary_argument("char->integer", arguments, location)?.expect_char(location)?;
+    Ok(Value::Integer(i64::from(u32::from(character))))
+}
+
+fn eval_integer_to_char(arguments: &[Value], location: SourceLocation) -> Result<Value, EvalError> {
+    let value = unary_argument("integer->char", arguments, location)?.expect_number(location)?;
+    let Some(code_point) = u32::try_from(value).ok() else {
+        return Err(EvalError::InvalidCharacterCodePoint { location, value });
+    };
+    let Some(character) = char::from_u32(code_point) else {
+        return Err(EvalError::InvalidCharacterCodePoint { location, value });
+    };
+
+    Ok(Value::Character(character))
+}
+
+fn eval_map(
+    arguments: &[Value],
+    location: SourceLocation,
+    output: &mut String,
+) -> Result<Value, EvalError> {
+    let [procedure, list] = arguments else {
+        return Err(EvalError::WrongArgumentCount {
+            location,
+            procedure: "map",
+            expected: ArgCount::Exactly(2),
+            got: arguments.len(),
+        });
+    };
+
+    let mapped_values = proper_list_items(list, location)?
+        .into_iter()
+        .map(|value| apply_callable(procedure.clone(), &[value], location, output))
+        .collect::<Result<Vec<_>, _>>()?;
+
+    Ok(eval_list(&mapped_values))
+}
+
 fn eval_type_predicate(
     procedure: &'static str,
     arguments: &[Value],
@@ -586,6 +672,28 @@ fn number_arguments(arguments: &[Value], location: SourceLocation) -> Result<Vec
         .iter()
         .map(|argument| argument.expect_number(location))
         .collect()
+}
+
+fn proper_list_items(value: &Value, location: SourceLocation) -> Result<Vec<Value>, EvalError> {
+    let mut items = Vec::new();
+    let mut current = value;
+
+    loop {
+        match current {
+            Value::EmptyList => return Ok(items),
+            Value::Pair(car, cdr) => {
+                items.push((**car).clone());
+                current = cdr.as_ref();
+            }
+            _ => {
+                return Err(EvalError::TypeMismatch {
+                    location,
+                    expected: "list",
+                    found: current.type_name(),
+                });
+            }
+        }
+    }
 }
 
 fn list_length(value: &Value, location: SourceLocation) -> Result<usize, EvalError> {

@@ -421,7 +421,7 @@ fn eval_arguments(
     )
 }
 
-fn apply_callable(
+pub(crate) fn apply_callable(
     callable: Value,
     arguments: &[Value],
     location: SourceLocation,

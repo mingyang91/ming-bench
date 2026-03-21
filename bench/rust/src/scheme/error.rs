@@ -105,6 +105,11 @@ pub enum EvalError {
         end: i64,
         length: usize,
     },
+    #[error("{location}: invalid character code point: {value}")]
+    InvalidCharacterCodePoint {
+        location: SourceLocation,
+        value: i64,
+    },
     #[error("{location}: cannot mutate immutable string with {procedure}")]
     ImmutableString {
         location: SourceLocation,
