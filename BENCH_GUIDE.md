@@ -8,7 +8,7 @@ This file is for **humans supervising agent runs**. It is NOT read by agents.
 # One-time setup
 cargo xtask setup
 
-# Single full run (agent does L1→L23 in one session)
+# Single full run (agent does L1→L27 in one session)
 cargo xtask run-agent --name claude-r1
 
 # Level-by-level run (fresh agent per level, fail-fast)
@@ -99,7 +99,7 @@ cargo xtask results
 
 ### Full Mode (default)
 
-One agent session tackles all 23 levels. Simple, but if the agent gets stuck it may burn budget.
+One agent session tackles all 27 levels. Simple, but if the agent gets stuck it may burn budget.
 
 ```bash
 cargo xtask run-agent --name claude-r1 --mode full
@@ -121,16 +121,18 @@ Benefits:
 
 ### Turn Limits
 
-| Levels | Default turns |
-|--------|--------------|
-| L01-L03 | 45 |
-| L04-L07 | 30 |
-| L08-L10 | 45 |
-| L11-L13 | 90 |
-| L14-L15 | 60 |
-| L16-L18 | 60 |
-| L19-L20 | 75 |
-| L21-L23 | 90 |
+| Levels | Tier | Default turns |
+|--------|------|--------------|
+| L01-L03 | Foundation | 45 |
+| L04-L06 | Error/Strings/Mutable | 30 |
+| L07-L09 | TCO/set!/Variadic | 45 |
+| L10-L12 | call/cc/Macros/Integration | 90 |
+| L13-L14 | Builtins/String Immutability | 45 |
+| L15 | Equality/Letrec/Case/Vectors | 60 |
+| L16-L18 | dynamic-wind/guard/values | 60 |
+| L19-L20 | Rationals/Records | 75 |
+| L21-L23 | Pair Mutation/syntax-case/Final Integration | 90 |
+| L24-L27 | Tech-debt: case-lambda/do/let-values/parameterize | 60 |
 
 Override with `--max-turns N`. Quality-gate cleanup pass: 15 turns.
 

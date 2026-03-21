@@ -18,7 +18,7 @@ Multi-language support adds another dimension: **does language choice affect age
 
 The agent receives:
 - A function signature (language-specific): `evalStr(input) → result`
-- 188 test cases across 23 levels (each test loads Scheme code from a `.scm` fixture file)
+- 214 test cases across 27 levels (each test loads Scheme code from a `.scm` fixture file)
 - Instructions in `CLAUDE.md` (the only file the agent reads for guidance)
 
 The agent implements a complete Scheme interpreter from scratch — lexer, parser, environment, evaluator, tail-call optimization, continuations, and hygienic macros. No starter code. No external parsing libraries.
@@ -85,7 +85,7 @@ Per-language strategies live in `bench/strategies/{lang}/`. The orchestrator pic
 
 Each agent run uses one of two modes:
 
-- **Full mode** — one agent session tackles all 23 levels. Simpler, but if the agent gets stuck it burns budget.
+- **Full mode** — one agent session tackles all 27 levels. Simpler, but if the agent gets stuck it burns budget.
 - **Levels mode** — orchestrator runs a fresh agent per level. Fail-fast: stops on first failure. Per-level session data for granular analysis.
 
 ### Sandboxed Testing
