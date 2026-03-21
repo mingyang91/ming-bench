@@ -1092,6 +1092,7 @@ fn is_builtin(name: &str) -> bool {
             | "map"
             | "vector" | "make-vector" | "vector-ref" | "vector-set!"
             | "vector-length" | "vector?" | "vector->list" | "list->vector"
+            | "abs" | "modulo" | "remainder" | "quotient" | "min" | "max" | "expt"
     )
 }
 
@@ -1122,6 +1123,9 @@ fn eval_builtin(
         "map" => eval_map(args, env, out),
         "vector" | "make-vector" | "vector-ref" | "vector-set!" | "vector-length"
         | "vector?" | "vector->list" | "list->vector" => eval_vector_builtin(name, args, env, out),
+        "abs" | "modulo" | "remainder" | "quotient" | "min" | "max" | "expt" => {
+            eval_numeric_util(name, args, env, out)
+        }
         "display" => eval_display(args, env, out),
         "write" => eval_write(args, env, out),
         "newline" => eval_newline(args, out),
@@ -1180,6 +1184,92 @@ fn compute_arithmetic(op: &str, values: &[i64]) -> Result<Value, EvalError> {
         _ => unreachable!("unexpected arithmetic operator: {op}"),
     };
     Ok(Value::Integer(result))
+}
+
+fn eval_to_int(arg: &Value, env: &mut Env, out: &mut String) -> Result<i64, EvalError> {
+    match eval(arg, env, out)? {
+        Value::Integer(n) => Ok(n),
+        other => Err(EvalError::TypeError {
+            expected: "integer".to_string(),
+            got: other.display(),
+        }),
+    }
+}
+
+fn eval_numeric_util(
+    name: &str,
+    args: &[Value],
+    env: &mut Env,
+    out: &mut String,
+) -> Result<Value, EvalError> {
+    match name {
+        "abs" => {
+            let [arg] = args else {
+                return Err(EvalError::WrongArgCount { expected: 1, got: args.len() });
+            };
+            Ok(Value::Integer(eval_to_int(arg, env, out)?.abs()))
+        }
+        "modulo" => {
+            let [a, b] = args else {
+                return Err(EvalError::WrongArgCount { expected: 2, got: args.len() });
+            };
+            let a = eval_to_int(a, env, out)?;
+            let b = eval_to_int(b, env, out)?;
+            if b == 0 { return Err(EvalError::DivisionByZero); }
+            // Scheme modulo: result has sign of divisor (floored division)
+            let r = a % b;
+            let result = if r != 0 && (r ^ b) < 0 { r + b } else { r };
+            Ok(Value::Integer(result))
+        }
+        "remainder" => {
+            let [a, b] = args else {
+                return Err(EvalError::WrongArgCount { expected: 2, got: args.len() });
+            };
+            let a = eval_to_int(a, env, out)?;
+            let b = eval_to_int(b, env, out)?;
+            if b == 0 { return Err(EvalError::DivisionByZero); }
+            Ok(Value::Integer(a % b))
+        }
+        "quotient" => {
+            let [a, b] = args else {
+                return Err(EvalError::WrongArgCount { expected: 2, got: args.len() });
+            };
+            let a = eval_to_int(a, env, out)?;
+            let b = eval_to_int(b, env, out)?;
+            if b == 0 { return Err(EvalError::DivisionByZero); }
+            Ok(Value::Integer(a / b))
+        }
+        "min" | "max" => {
+            if args.is_empty() {
+                return Err(EvalError::WrongArgCount { expected: 1, got: 0 });
+            }
+            let values: Vec<i64> = args
+                .iter()
+                .map(|a| eval_to_int(a, env, out))
+                .collect::<Result<_, _>>()?;
+            let result = if name == "min" {
+                values.iter().copied().reduce(i64::min)
+            } else {
+                values.iter().copied().reduce(i64::max)
+            };
+            Ok(Value::Integer(result.expect("non-empty args")))
+        }
+        "expt" => {
+            let [base, exp] = args else {
+                return Err(EvalError::WrongArgCount { expected: 2, got: args.len() });
+            };
+            let base = eval_to_int(base, env, out)?;
+            let exp = eval_to_int(exp, env, out)?;
+            if exp < 0 {
+                return Err(EvalError::TypeError {
+                    expected: "non-negative integer exponent".to_string(),
+                    got: format!("{exp}"),
+                });
+            }
+            Ok(Value::Integer(base.pow(exp as u32)))
+        }
+        _ => unreachable!("unexpected numeric util: {name}"),
+    }
 }
 
 fn eval_comparison(
