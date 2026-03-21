@@ -4,6 +4,57 @@ use crate::scheme::expr::Expr;
 use crate::scheme::reader::read_all;
 use crate::scheme::source::SourcePos;
 use crate::scheme::value::{Builtin, Value};
+use std::ptr::NonNull;
+use std::rc::Rc;
+
+enum ExprOwner<'a> {
+    Borrowed(&'a Expr),
+    Body(Rc<[Expr]>),
+}
+
+struct CurrentExpr<'a> {
+    owner: ExprOwner<'a>,
+    ptr: NonNull<Expr>,
+}
+
+impl<'a> CurrentExpr<'a> {
+    fn borrowed(expr: &'a Expr) -> Self {
+        Self {
+            owner: ExprOwner::Borrowed(expr),
+            ptr: NonNull::from(expr),
+        }
+    }
+
+    fn from_body(body: Rc<[Expr]>, index: usize) -> Self {
+        Self {
+            ptr: NonNull::from(&body[index]),
+            owner: ExprOwner::Body(body),
+        }
+    }
+
+    fn child(&self, expr: &Expr) -> Self {
+        let owner = match &self.owner {
+            ExprOwner::Borrowed(root) => ExprOwner::Borrowed(root),
+            ExprOwner::Body(body) => ExprOwner::Body(body.clone()),
+        };
+
+        Self {
+            owner,
+            ptr: NonNull::from(expr),
+        }
+    }
+
+    fn expr(&self) -> &Expr {
+        // SAFETY: `ptr` is only created from expressions owned by `owner`
+        // and the AST is immutable, so the pointed-to node stays valid.
+        unsafe { self.ptr.as_ref() }
+    }
+}
+
+enum EvalControl<'a> {
+    Value(Value),
+    Tail { expr: CurrentExpr<'a>, env: Env },
+}
 
 pub fn evaluate_program(input: &str) -> Result<(Value, String), EvalError> {
     let expressions = read_all(input)?;
@@ -44,34 +95,54 @@ fn define_form(expr: &Expr) -> Option<(&[Expr], SourcePos)> {
 }
 
 fn eval(expr: &Expr, env: &Env, output: &mut String) -> Result<Value, EvalError> {
-    match expr {
-        Expr::Literal(value, _) => Ok(value.clone()),
-        Expr::Symbol(name, position) => env
-            .lookup(name)
-            .ok_or_else(|| EvalError::at(*position, format!("unbound symbol '{name}'"))),
-        Expr::List(items, position) => eval_list(items, env, output, *position),
+    let mut current = CurrentExpr::borrowed(expr);
+    let mut current_env = env.clone();
+
+    loop {
+        match current.expr() {
+            Expr::Literal(value, _) => return Ok(value.clone()),
+            Expr::Symbol(name, position) => {
+                return current_env
+                    .lookup(name)
+                    .ok_or_else(|| EvalError::at(*position, format!("unbound symbol '{name}'")));
+            }
+            Expr::List(items, position) => {
+                match eval_list(items, &current, &current_env, output, *position)? {
+                    EvalControl::Value(value) => return Ok(value),
+                    EvalControl::Tail { expr, env } => {
+                        current = expr;
+                        current_env = env;
+                    }
+                }
+            }
+        }
     }
 }
 
-fn eval_list(
+fn eval_list<'a>(
     items: &[Expr],
+    current: &CurrentExpr<'a>,
     env: &Env,
     output: &mut String,
     position: SourcePos,
-) -> Result<Value, EvalError> {
+) -> Result<EvalControl<'a>, EvalError> {
     let Some((operator, arguments)) = items.split_first() else {
         return Err(EvalError::at(position, "cannot evaluate empty list"));
     };
 
     match operator {
-        Expr::Symbol(name, _) if name == "if" => eval_if(arguments, env, output, position),
-        Expr::Symbol(name, _) if name == "quote" => eval_quote(arguments, position),
-        Expr::Symbol(name, _) if name == "lambda" => eval_lambda(arguments, env, position),
-        Expr::Symbol(name, _) if name == "and" => eval_and(arguments, env, output),
-        Expr::Symbol(name, _) if name == "or" => eval_or(arguments, env, output),
-        Expr::Symbol(name, _) if name == "let" => eval_let(arguments, env, output, position),
-        Expr::Symbol(name, _) if name == "begin" => eval_sequence(arguments, env, output),
-        Expr::Symbol(name, _) if name == "cond" => eval_cond(arguments, env, output, position),
+        Expr::Symbol(name, _) if name == "if" => eval_if(arguments, current, env, output, position),
+        Expr::Symbol(name, _) if name == "quote" => {
+            Ok(EvalControl::Value(eval_quote(arguments, position)?))
+        }
+        Expr::Symbol(name, _) if name == "lambda" => {
+            Ok(EvalControl::Value(eval_lambda(arguments, env, position)?))
+        }
+        Expr::Symbol(name, _) if name == "and" => eval_and(arguments, current, env, output),
+        Expr::Symbol(name, _) if name == "or" => eval_or(arguments, current, env, output),
+        Expr::Symbol(name, _) if name == "let" => eval_let(arguments, current, env, output, position),
+        Expr::Symbol(name, _) if name == "begin" => eval_tail_sequence(arguments, current, env, output),
+        Expr::Symbol(name, _) if name == "cond" => eval_cond(arguments, current, env, output),
         Expr::Symbol(name, _) if name == "define" => {
             Err(EvalError::at(position, "define is only allowed in a sequence"))
         }
@@ -102,7 +173,7 @@ fn eval_define(
 
             let closure = Value::Closure {
                 parameters: read_parameters(parameters)?,
-                body: body.to_vec(),
+                body: body.to_vec().into(),
                 env: env.clone(),
             };
             env.define(name.clone(), closure);
@@ -112,18 +183,25 @@ fn eval_define(
     }
 }
 
-fn eval_if(
+fn eval_if<'a>(
     arguments: &[Expr],
+    current: &CurrentExpr<'a>,
     env: &Env,
     output: &mut String,
     position: SourcePos,
-) -> Result<Value, EvalError> {
+) -> Result<EvalControl<'a>, EvalError> {
     match arguments {
         [condition, then_branch, else_branch] => {
             if eval(condition, env, output)?.is_truthy() {
-                eval(then_branch, env, output)
+                Ok(EvalControl::Tail {
+                    expr: current.child(then_branch),
+                    env: env.clone(),
+                })
             } else {
-                eval(else_branch, env, output)
+                Ok(EvalControl::Tail {
+                    expr: current.child(else_branch),
+                    env: env.clone(),
+                })
             }
         }
         _ => Err(EvalError::at(position, "'if' expects exactly 3 arguments")),
@@ -152,47 +230,81 @@ fn eval_lambda(arguments: &[Expr], env: &Env, position: SourcePos) -> Result<Val
 
     Ok(Value::Closure {
         parameters: read_parameters(parameters)?,
-        body: body.to_vec(),
+        body: body.to_vec().into(),
         env: env.clone(),
     })
 }
 
-fn eval_and(arguments: &[Expr], env: &Env, output: &mut String) -> Result<Value, EvalError> {
-    let mut current = Value::Bool(true);
-
-    for argument in arguments {
-        current = eval(argument, env, output)?;
-        if !current.is_truthy() {
-            return Ok(current);
-        }
-    }
-
-    Ok(current)
-}
-
-fn eval_or(arguments: &[Expr], env: &Env, output: &mut String) -> Result<Value, EvalError> {
-    let mut current = Value::Bool(false);
-
-    for argument in arguments {
-        current = eval(argument, env, output)?;
-        if current.is_truthy() {
-            return Ok(current);
-        }
-    }
-
-    Ok(current)
-}
-
-fn eval_let(
+fn eval_and<'a>(
     arguments: &[Expr],
+    current: &CurrentExpr<'a>,
+    env: &Env,
+    output: &mut String,
+) -> Result<EvalControl<'a>, EvalError> {
+    let Some((last, prefix)) = arguments.split_last() else {
+        return Ok(EvalControl::Value(Value::Bool(true)));
+    };
+
+    for argument in prefix {
+        let value = eval(argument, env, output)?;
+        if !value.is_truthy() {
+            return Ok(EvalControl::Value(value));
+        }
+    }
+
+    Ok(EvalControl::Tail {
+        expr: current.child(last),
+        env: env.clone(),
+    })
+}
+
+fn eval_or<'a>(
+    arguments: &[Expr],
+    current: &CurrentExpr<'a>,
+    env: &Env,
+    output: &mut String,
+) -> Result<EvalControl<'a>, EvalError> {
+    let Some((last, prefix)) = arguments.split_last() else {
+        return Ok(EvalControl::Value(Value::Bool(false)));
+    };
+
+    for argument in prefix {
+        let value = eval(argument, env, output)?;
+        if value.is_truthy() {
+            return Ok(EvalControl::Value(value));
+        }
+    }
+
+    Ok(EvalControl::Tail {
+        expr: current.child(last),
+        env: env.clone(),
+    })
+}
+
+fn eval_let<'a>(
+    arguments: &[Expr],
+    current: &CurrentExpr<'a>,
     env: &Env,
     output: &mut String,
     position: SourcePos,
-) -> Result<Value, EvalError> {
-    let Some((binding_expr, body)) = arguments.split_first() else {
-        return Err(EvalError::at(position, "invalid let form"));
-    };
+) -> Result<EvalControl<'a>, EvalError> {
+    match arguments {
+        [Expr::Symbol(name, _), binding_expr, body @ ..] => {
+            eval_named_let(name, binding_expr, body, env, output, position)
+        }
+        [binding_expr, body @ ..] => eval_plain_let(binding_expr, body, current, env, output, position),
+        _ => Err(EvalError::at(position, "invalid let form")),
+    }
+}
 
+fn eval_plain_let<'a>(
+    binding_expr: &Expr,
+    body: &[Expr],
+    current: &CurrentExpr<'a>,
+    env: &Env,
+    output: &mut String,
+    position: SourcePos,
+) -> Result<EvalControl<'a>, EvalError> {
     if body.is_empty() {
         return Err(EvalError::at(position, "invalid let form"));
     }
@@ -202,29 +314,57 @@ fn eval_let(
     };
 
     let child = Env::child(env);
-
-    for binding in bindings {
-        match binding {
-            Expr::List(items, binding_pos) => match items.as_slice() {
-                [Expr::Symbol(name, _), value_expr] => {
-                    let value = eval(value_expr, env, output)?;
-                    child.define(name.clone(), value);
-                }
-                _ => return Err(EvalError::at(*binding_pos, "invalid let binding")),
-            },
-            _ => return Err(EvalError::at(binding.position(), "invalid let binding")),
-        }
+    for (name, value) in read_let_bindings(bindings, env, output)? {
+        child.define(name, value);
     }
 
-    eval_sequence(body, &child, output)
+    eval_tail_sequence(body, current, &child, output)
 }
 
-fn eval_cond(
-    arguments: &[Expr],
+fn eval_named_let<'a>(
+    name: &str,
+    binding_expr: &Expr,
+    body: &[Expr],
     env: &Env,
     output: &mut String,
-    _position: SourcePos,
-) -> Result<Value, EvalError> {
+    position: SourcePos,
+) -> Result<EvalControl<'a>, EvalError> {
+    if body.is_empty() {
+        return Err(EvalError::at(position, "invalid let form"));
+    }
+
+    let Expr::List(bindings, _) = binding_expr else {
+        return Err(EvalError::at(position, "let bindings must be a list"));
+    };
+
+    let values = read_let_bindings(bindings, env, output)?;
+    let parameters = values.iter().map(|(parameter, _)| parameter.clone()).collect();
+    let body: Rc<[Expr]> = body.to_vec().into();
+    let named_env = Env::child(env);
+
+    named_env.define(
+        name.to_string(),
+        Value::Closure {
+            parameters,
+            body: body.clone(),
+            env: named_env.clone(),
+        },
+    );
+
+    let child = Env::child(&named_env);
+    for (parameter, value) in values {
+        child.define(parameter, value);
+    }
+
+    eval_tail_body(body, &child, output)
+}
+
+fn eval_cond<'a>(
+    arguments: &[Expr],
+    current: &CurrentExpr<'a>,
+    env: &Env,
+    output: &mut String,
+) -> Result<EvalControl<'a>, EvalError> {
     for clause in arguments {
         let Expr::List(items, clause_pos) = clause else {
             return Err(EvalError::at(clause.position(), "cond clause must be a list"));
@@ -235,27 +375,70 @@ fn eval_cond(
         };
 
         if matches!(test, Expr::Symbol(name, _) if name == "else") {
-            return eval_cond_body(body, env, output);
+            return eval_tail_sequence(body, current, env, output);
         }
 
         let test_value = eval(test, env, output)?;
         if test_value.is_truthy() {
             return if body.is_empty() {
-                Ok(test_value)
+                Ok(EvalControl::Value(test_value))
             } else {
-                eval_cond_body(body, env, output)
+                eval_tail_sequence(body, current, env, output)
             };
         }
     }
 
-    Ok(Value::Void)
+    Ok(EvalControl::Value(Value::Void))
 }
 
-fn eval_cond_body(body: &[Expr], env: &Env, output: &mut String) -> Result<Value, EvalError> {
-    if body.is_empty() {
-        Ok(Value::Void)
+fn eval_tail_sequence<'a>(
+    expressions: &[Expr],
+    current: &CurrentExpr<'a>,
+    env: &Env,
+    output: &mut String,
+) -> Result<EvalControl<'a>, EvalError> {
+    let Some((last, prefix)) = expressions.split_last() else {
+        return Ok(EvalControl::Value(Value::Void));
+    };
+
+    for expr in prefix {
+        eval_sequence_expr(expr, env, output)?;
+    }
+
+    if let Some((arguments, position)) = define_form(last) {
+        eval_define(arguments, env, output, position)?;
+        Ok(EvalControl::Value(Value::Void))
     } else {
-        eval_sequence(body, env, output)
+        Ok(EvalControl::Tail {
+            expr: current.child(last),
+            env: env.clone(),
+        })
+    }
+}
+
+fn eval_tail_body<'a>(
+    body: Rc<[Expr]>,
+    env: &Env,
+    output: &mut String,
+) -> Result<EvalControl<'a>, EvalError> {
+    if body.is_empty() {
+        return Ok(EvalControl::Value(Value::Void));
+    }
+
+    let last_index = body.len() - 1;
+    for expr in &body[..last_index] {
+        eval_sequence_expr(expr, env, output)?;
+    }
+
+    let last = &body[last_index];
+    if let Some((arguments, position)) = define_form(last) {
+        eval_define(arguments, env, output, position)?;
+        Ok(EvalControl::Value(Value::Void))
+    } else {
+        Ok(EvalControl::Tail {
+            expr: CurrentExpr::from_body(body, last_index),
+            env: env.clone(),
+        })
     }
 }
 
@@ -267,14 +450,19 @@ fn quote_to_value(expr: &Expr) -> Value {
     }
 }
 
-fn apply_procedure(
+fn apply_procedure<'a>(
     procedure: Value,
     arguments: Vec<(Value, SourcePos)>,
     position: SourcePos,
     output: &mut String,
-) -> Result<Value, EvalError> {
+) -> Result<EvalControl<'a>, EvalError> {
     match procedure {
-        Value::Builtin(name) => apply_builtin(name, &arguments, position, output),
+        Value::Builtin(name) => Ok(EvalControl::Value(apply_builtin(
+            name,
+            &arguments,
+            position,
+            output,
+        )?)),
         Value::Closure {
             parameters,
             body,
@@ -296,7 +484,7 @@ fn apply_procedure(
                 child.define(parameter, value);
             }
 
-            eval_sequence(&body, &child, output)
+            eval_tail_body(body, &child, output)
         }
         _ => Err(EvalError::at(position, "attempted to call a non-procedure")),
     }
@@ -360,6 +548,25 @@ fn eval_arguments(
     arguments
         .iter()
         .map(|argument| eval(argument, env, output).map(|value| (value, argument.position())))
+        .collect()
+}
+
+fn read_let_bindings(
+    bindings: &[Expr],
+    env: &Env,
+    output: &mut String,
+) -> Result<Vec<(String, Value)>, EvalError> {
+    bindings
+        .iter()
+        .map(|binding| match binding {
+            Expr::List(items, binding_pos) => match items.as_slice() {
+                [Expr::Symbol(name, _), value_expr] => {
+                    eval(value_expr, env, output).map(|value| (name.clone(), value))
+                }
+                _ => Err(EvalError::at(*binding_pos, "invalid let binding")),
+            },
+            _ => Err(EvalError::at(binding.position(), "invalid let binding")),
+        })
         .collect()
 }
 

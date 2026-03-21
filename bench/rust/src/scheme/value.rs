@@ -1,5 +1,6 @@
 use crate::scheme::env::Env;
 use crate::scheme::expr::Expr;
+use std::rc::Rc;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Builtin {
@@ -90,7 +91,7 @@ pub enum Value {
     Builtin(Builtin),
     Closure {
         parameters: Vec<String>,
-        body: Vec<Expr>,
+        body: Rc<[Expr]>,
         env: Env,
     },
     Void,
