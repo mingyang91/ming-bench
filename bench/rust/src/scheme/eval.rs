@@ -78,7 +78,11 @@ fn is_builtin(name: &str) -> bool {
         name,
         "+" | "-" | "*" | "/" | "<" | ">" | "=" | "<=" | ">=" | "not" | "and" | "or"
             | "cons" | "car" | "cdr" | "null?" | "list" | "length"
-            | "string?" | "number?" | "boolean?" | "pair?" | "symbol?"
+            | "string?" | "number?" | "boolean?" | "pair?" | "symbol?" | "char?"
+            | "display" | "write" | "newline"
+            | "string-append" | "string-length" | "substring"
+            | "string->number" | "number->string"
+            | "string-ref" | "symbol->string" | "string->symbol"
     )
 }
 
@@ -107,6 +111,18 @@ fn eval_builtin(op: &str, args: &[Expr], env: &Env) -> Result<Value, EvalError> 
         "boolean?" => eval_type_pred(args, env, |v| matches!(v, Value::Boolean(_))),
         "pair?" => eval_type_pred(args, env, |v| matches!(v, Value::List(l) if !l.is_empty())),
         "symbol?" => eval_type_pred(args, env, |v| matches!(v, Value::Symbol(_))),
+        "char?" => eval_type_pred(args, env, |v| matches!(v, Value::Char(_))),
+        "display" => eval_display(args, env),
+        "write" => eval_write(args, env),
+        "newline" => eval_newline(args, env),
+        "string-append" => eval_string_append(args, env),
+        "string-length" => eval_string_length(args, env),
+        "substring" => eval_substring(args, env),
+        "string->number" => eval_string_to_number(args, env),
+        "number->string" => eval_number_to_string(args, env),
+        "string-ref" => eval_string_ref(args, env),
+        "symbol->string" => eval_symbol_to_string(args, env),
+        "string->symbol" => eval_string_to_symbol(args, env),
         _ => Err(EvalError::UnboundVariable { name: op.into() }),
     }
 }
@@ -502,6 +518,174 @@ fn eval_body(exprs: &[Expr], env: &Env) -> Result<Value, EvalError> {
         result = eval(expr, env)?;
     }
     Ok(result)
+}
+
+fn eval_display(args: &[Expr], env: &Env) -> Result<Value, EvalError> {
+    let [arg] = args else {
+        return Err(EvalError::WrongArgCount { expected: 1, got: args.len() });
+    };
+    let val = eval(arg, env)?;
+    let mut buf = String::new();
+    val.display_fmt(&mut buf);
+    env.write_output(&buf);
+    Ok(Value::Void)
+}
+
+fn eval_write(args: &[Expr], env: &Env) -> Result<Value, EvalError> {
+    let [arg] = args else {
+        return Err(EvalError::WrongArgCount { expected: 1, got: args.len() });
+    };
+    let val = eval(arg, env)?;
+    env.write_output(&val.to_string());
+    Ok(Value::Void)
+}
+
+fn eval_newline(args: &[Expr], env: &Env) -> Result<Value, EvalError> {
+    if !args.is_empty() {
+        return Err(EvalError::WrongArgCount { expected: 0, got: args.len() });
+    }
+    env.write_output("\n");
+    Ok(Value::Void)
+}
+
+fn eval_string_append(args: &[Expr], env: &Env) -> Result<Value, EvalError> {
+    let result: String = args
+        .iter()
+        .map(|a| {
+            let val = eval(a, env)?;
+            let Value::String(s) = val else {
+                return Err(EvalError::TypeError {
+                    expected: "string".into(),
+                    got: format!("{val}"),
+                });
+            };
+            Ok(s)
+        })
+        .collect::<Result<Vec<_>, _>>()?
+        .join("");
+    Ok(Value::String(result))
+}
+
+fn eval_string_length(args: &[Expr], env: &Env) -> Result<Value, EvalError> {
+    let [arg] = args else {
+        return Err(EvalError::WrongArgCount { expected: 1, got: args.len() });
+    };
+    let val = eval(arg, env)?;
+    let Value::String(s) = val else {
+        return Err(EvalError::TypeError {
+            expected: "string".into(),
+            got: format!("{val}"),
+        });
+    };
+    Ok(Value::Integer(s.len() as i64))
+}
+
+fn eval_substring(args: &[Expr], env: &Env) -> Result<Value, EvalError> {
+    let [s_expr, start_expr, end_expr] = args else {
+        return Err(EvalError::WrongArgCount { expected: 3, got: args.len() });
+    };
+    let val = eval(s_expr, env)?;
+    let Value::String(s) = val else {
+        return Err(EvalError::TypeError {
+            expected: "string".into(),
+            got: format!("{val}"),
+        });
+    };
+    let Value::Integer(start) = eval(start_expr, env)? else {
+        return Err(EvalError::TypeError { expected: "integer".into(), got: "non-integer".into() });
+    };
+    let Value::Integer(end) = eval(end_expr, env)? else {
+        return Err(EvalError::TypeError { expected: "integer".into(), got: "non-integer".into() });
+    };
+    let start = start as usize;
+    let end = end as usize;
+    if start > end || end > s.len() {
+        return Err(EvalError::TypeError {
+            expected: "valid substring indices".into(),
+            got: format!("start={start}, end={end}, len={}", s.len()),
+        });
+    }
+    Ok(Value::String(s[start..end].to_string()))
+}
+
+fn eval_string_to_number(args: &[Expr], env: &Env) -> Result<Value, EvalError> {
+    let [arg] = args else {
+        return Err(EvalError::WrongArgCount { expected: 1, got: args.len() });
+    };
+    let val = eval(arg, env)?;
+    let Value::String(s) = val else {
+        return Err(EvalError::TypeError {
+            expected: "string".into(),
+            got: format!("{val}"),
+        });
+    };
+    match s.parse::<i64>() {
+        Ok(n) => Ok(Value::Integer(n)),
+        Err(_) => Ok(Value::Boolean(false)),
+    }
+}
+
+fn eval_number_to_string(args: &[Expr], env: &Env) -> Result<Value, EvalError> {
+    let [arg] = args else {
+        return Err(EvalError::WrongArgCount { expected: 1, got: args.len() });
+    };
+    let val = eval(arg, env)?;
+    let Value::Integer(n) = val else {
+        return Err(EvalError::TypeError {
+            expected: "integer".into(),
+            got: format!("{val}"),
+        });
+    };
+    Ok(Value::String(n.to_string()))
+}
+
+fn eval_string_ref(args: &[Expr], env: &Env) -> Result<Value, EvalError> {
+    let [s_expr, idx_expr] = args else {
+        return Err(EvalError::WrongArgCount { expected: 2, got: args.len() });
+    };
+    let val = eval(s_expr, env)?;
+    let Value::String(s) = val else {
+        return Err(EvalError::TypeError {
+            expected: "string".into(),
+            got: format!("{val}"),
+        });
+    };
+    let Value::Integer(idx) = eval(idx_expr, env)? else {
+        return Err(EvalError::TypeError { expected: "integer".into(), got: "non-integer".into() });
+    };
+    let idx = idx as usize;
+    s.chars().nth(idx).map(Value::Char).ok_or_else(|| EvalError::TypeError {
+        expected: "valid string index".into(),
+        got: format!("index {idx} out of range for string of length {}", s.len()),
+    })
+}
+
+fn eval_symbol_to_string(args: &[Expr], env: &Env) -> Result<Value, EvalError> {
+    let [arg] = args else {
+        return Err(EvalError::WrongArgCount { expected: 1, got: args.len() });
+    };
+    let val = eval(arg, env)?;
+    let Value::Symbol(s) = val else {
+        return Err(EvalError::TypeError {
+            expected: "symbol".into(),
+            got: format!("{val}"),
+        });
+    };
+    Ok(Value::String(s))
+}
+
+fn eval_string_to_symbol(args: &[Expr], env: &Env) -> Result<Value, EvalError> {
+    let [arg] = args else {
+        return Err(EvalError::WrongArgCount { expected: 1, got: args.len() });
+    };
+    let val = eval(arg, env)?;
+    let Value::String(s) = val else {
+        return Err(EvalError::TypeError {
+            expected: "string".into(),
+            got: format!("{val}"),
+        });
+    };
+    Ok(Value::Symbol(s))
 }
 
 fn eval_cond(args: &[Expr], env: &Env) -> Result<Value, EvalError> {

@@ -8,6 +8,7 @@ use crate::scheme::value::Value;
 pub struct Env {
     bindings: Rc<RefCell<HashMap<String, Value>>>,
     parent: Option<Box<Env>>,
+    output: Rc<RefCell<String>>,
 }
 
 impl Default for Env {
@@ -21,6 +22,7 @@ impl Env {
         Env {
             bindings: Rc::new(RefCell::new(HashMap::new())),
             parent: None,
+            output: Rc::new(RefCell::new(String::new())),
         }
     }
 
@@ -28,7 +30,16 @@ impl Env {
         Env {
             bindings: Rc::new(RefCell::new(HashMap::new())),
             parent: Some(Box::new(parent.clone())),
+            output: Rc::clone(&parent.output),
         }
+    }
+
+    pub fn write_output(&self, s: &str) {
+        self.output.borrow_mut().push_str(s);
+    }
+
+    pub fn take_output(&self) -> String {
+        self.output.borrow_mut().split_off(0)
     }
 
     pub fn get(&self, name: &str) -> Option<Value> {

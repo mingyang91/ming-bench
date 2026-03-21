@@ -23,8 +23,17 @@ pub fn eval_str(input: &str) -> Result<String, EvalError> {
 /// Evaluate Scheme expressions, returning both the result value and
 /// any output produced by `display`, `write`, or `newline`.
 pub fn eval_str_with_output(input: &str) -> Result<(String, String), EvalError> {
-    let result = eval_str(input)?;
-    Ok((result, String::new()))
+    let exprs = parser::parse(input)?;
+    let env = env::Env::new();
+    let mut result = None;
+    for expr in &exprs {
+        result = Some(eval::eval(expr, &env)?);
+    }
+    let output = env.take_output();
+    let result_str = result
+        .map(|v| v.to_string())
+        .ok_or_else(|| EvalError::Parse("empty input".into()))?;
+    Ok((result_str, output))
 }
 
 #[cfg(test)]
