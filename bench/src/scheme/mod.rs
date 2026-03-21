@@ -613,6 +613,36 @@ fn apply_builtin_vals(op: &str, vals: &[Value]) -> Result<Value, EvalError> {
                 _ => Err(EvalError::Runtime("length: not a list".to_string())),
             }
         }
+        "string?" => {
+            if vals.len() != 1 {
+                return Err(EvalError::Runtime("string? requires 1 argument".to_string()));
+            }
+            Ok(Value::Boolean(matches!(&vals[0], Value::Str(_))))
+        }
+        "number?" => {
+            if vals.len() != 1 {
+                return Err(EvalError::Runtime("number? requires 1 argument".to_string()));
+            }
+            Ok(Value::Boolean(matches!(&vals[0], Value::Integer(_))))
+        }
+        "boolean?" => {
+            if vals.len() != 1 {
+                return Err(EvalError::Runtime("boolean? requires 1 argument".to_string()));
+            }
+            Ok(Value::Boolean(matches!(&vals[0], Value::Boolean(_))))
+        }
+        "pair?" => {
+            if vals.len() != 1 {
+                return Err(EvalError::Runtime("pair? requires 1 argument".to_string()));
+            }
+            Ok(Value::Boolean(matches!(&vals[0], Value::List(elems) if !elems.is_empty())))
+        }
+        "symbol?" => {
+            if vals.len() != 1 {
+                return Err(EvalError::Runtime("symbol? requires 1 argument".to_string()));
+            }
+            Ok(Value::Boolean(matches!(&vals[0], Value::Symbol(_))))
+        }
         _ => Err(EvalError::Runtime(format!("unknown procedure: {}", op))),
     }
 }
