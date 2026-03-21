@@ -158,7 +158,7 @@ fn eval(value: &Value, env: &mut Env) -> Result<Value, EvalError> {
                                 return Ok(Value::Symbol("ok".into()));
                             }
                             Value::List(sig) => {
-                                // (define (name params...) body)
+                                // (define (name params...) body ...)
                                 if sig.is_empty() {
                                     return Err(EvalError::Parse(
                                         "define: empty signature".into(),
@@ -182,7 +182,13 @@ fn eval(value: &Value, env: &mut Env) -> Result<Value, EvalError> {
                                     })
                                     .collect();
                                 let params = params?;
-                                let body = items[2].clone();
+                                let body = if items.len() == 3 {
+                                    items[2].clone()
+                                } else {
+                                    let mut begin_items = vec![Value::Symbol("begin".into())];
+                                    begin_items.extend(items[2..].iter().cloned());
+                                    Value::List(begin_items)
+                                };
                                 // Insert a placeholder first so the closure captures itself
                                 let lambda = Value::Lambda {
                                     params: params.clone(),
@@ -207,7 +213,7 @@ fn eval(value: &Value, env: &mut Env) -> Result<Value, EvalError> {
                         }
                     }
                     "lambda" => {
-                        if items.len() != 3 {
+                        if items.len() < 3 {
                             return Err(EvalError::Arity);
                         }
                         let param_list = match &items[1] {
@@ -227,9 +233,16 @@ fn eval(value: &Value, env: &mut Env) -> Result<Value, EvalError> {
                                 )),
                             })
                             .collect();
+                        let body = if items.len() == 3 {
+                            items[2].clone()
+                        } else {
+                            let mut begin_items = vec![Value::Symbol("begin".into())];
+                            begin_items.extend(items[2..].iter().cloned());
+                            Value::List(begin_items)
+                        };
                         return Ok(Value::Lambda {
                             params: params?,
-                            body: Box::new(items[2].clone()),
+                            body: Box::new(body),
                             env: env.clone(),
                         });
                     }
@@ -266,6 +279,13 @@ fn eval(value: &Value, env: &mut Env) -> Result<Value, EvalError> {
                             if result != Value::Boolean(false) {
                                 return Ok(result);
                             }
+                        }
+                        return Ok(result);
+                    }
+                    "begin" => {
+                        let mut result = Value::Symbol("ok".into());
+                        for expr in &items[1..] {
+                            result = eval(expr, env)?;
                         }
                         return Ok(result);
                     }
