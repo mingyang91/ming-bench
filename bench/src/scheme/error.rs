@@ -15,4 +15,12 @@ pub enum EvalError {
 
     #[error("division by zero")]
     DivisionByZero,
+
+    #[error("at {line}:{col}: {source}")]
+    AtPosition {
+        line: usize,
+        col: usize,
+        #[source]
+        source: Box<EvalError>,
+    },
 }

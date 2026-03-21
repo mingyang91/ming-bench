@@ -7,6 +7,13 @@ pub use error::EvalError;
 
 use std::collections::HashMap;
 
+/// Source position in the input.
+#[derive(Debug, Clone, Copy, Default)]
+pub(crate) struct Span {
+    pub line: usize,
+    pub col: usize,
+}
+
 /// A Scheme value.
 #[derive(Debug, Clone)]
 enum Value {
@@ -68,11 +75,19 @@ fn fmt_list(items: &[Value]) -> String {
 /// Environment for variable bindings.
 type Env = HashMap<String, Value>;
 
-/// An S-expression AST node.
+/// An S-expression AST node with source position.
 #[derive(Debug, Clone)]
 enum Expr {
-    Atom(String),
-    List(Vec<Expr>),
+    Atom(String, Span),
+    List(Vec<Expr>, Span),
+}
+
+impl Expr {
+    fn span(&self) -> Span {
+        match self {
+            Expr::Atom(_, span) | Expr::List(_, span) => *span,
+        }
+    }
 }
 
 use parser::{parse_all, tokenize};
@@ -98,9 +113,9 @@ fn atom_to_value(token: &str) -> Result<Value, EvalError> {
 /// Convert an Expr into a quoted Value (no evaluation).
 fn quote_expr(expr: &Expr) -> Result<Value, EvalError> {
     match expr {
-        Expr::Atom(token) => atom_to_value(token),
-        Expr::List(items) if items.is_empty() => Ok(Value::Nil),
-        Expr::List(items) => {
+        Expr::Atom(token, _) => atom_to_value(token),
+        Expr::List(items, _) if items.is_empty() => Ok(Value::Nil),
+        Expr::List(items, _) => {
             let values: Vec<Value> = items.iter().map(quote_expr).collect::<Result<_, _>>()?;
             Ok(Value::List(values))
         }

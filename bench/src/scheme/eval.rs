@@ -1,10 +1,36 @@
-use super::{atom_to_value, builtins, quote_expr, Env, EvalError, Expr, Value};
+use super::{atom_to_value, builtins, quote_expr, Env, EvalError, Expr, Span, Value};
+
+/// Extract an unbound variable name from an error (possibly wrapped in AtPosition).
+fn as_unbound_variable(err: &EvalError) -> Option<&str> {
+    match err {
+        EvalError::UnboundVariable { name } => Some(name),
+        EvalError::AtPosition { source, .. } => as_unbound_variable(source),
+        _ => None,
+    }
+}
+
+/// Wrap an error with source position, unless it already has one.
+fn with_span(span: Span, err: EvalError) -> EvalError {
+    match err {
+        EvalError::AtPosition { .. } => err,
+        _ => EvalError::AtPosition {
+            line: span.line,
+            col: span.col,
+            source: Box::new(err),
+        },
+    }
+}
 
 /// Evaluate an expression in the given environment.
 pub fn eval(expr: &Expr, env: &mut Env) -> Result<Value, EvalError> {
+    let span = expr.span();
+    eval_inner(expr, env).map_err(|e| with_span(span, e))
+}
+
+/// Core evaluation logic (without position wrapping).
+fn eval_inner(expr: &Expr, env: &mut Env) -> Result<Value, EvalError> {
     match expr {
-        Expr::Atom(token) => {
-            // Try literal first, then variable lookup
+        Expr::Atom(token, _) => {
             if token.starts_with('"')
                 || token.parse::<i64>().is_ok()
                 || token == "#t"
@@ -19,7 +45,7 @@ pub fn eval(expr: &Expr, env: &mut Env) -> Result<Value, EvalError> {
                 })
             }
         }
-        Expr::List(items) => eval_list(items, env),
+        Expr::List(items, _) => eval_list(items, env),
     }
 }
 
@@ -31,7 +57,7 @@ fn eval_list(items: &[Expr], env: &mut Env) -> Result<Value, EvalError> {
         });
     };
     // Check for special forms (operator must be an atom)
-    if let Expr::Atom(op) = operator {
+    if let Expr::Atom(op, _) = operator {
         match op.as_str() {
             "define" => return eval_define(args, env),
             "if" => return eval_if(args, env),
@@ -53,7 +79,9 @@ fn eval_list(items: &[Expr], env: &mut Env) -> Result<Value, EvalError> {
     // Try evaluating operator; fall back to builtin for atoms
     match eval(operator, env) {
         Ok(func) => apply_func(&func, &evaluated),
-        Err(EvalError::UnboundVariable { ref name }) => apply_builtin(name, &evaluated),
+        Err(ref e) if as_unbound_variable(e).is_some() => {
+            apply_builtin(as_unbound_variable(e).expect("checked above"), &evaluated)
+        }
         Err(e) => Err(e),
     }
 }
@@ -115,7 +143,13 @@ fn eval_body(body: &[Expr], env: &mut Env) -> Result<Value, EvalError> {
 
 /// Apply a lambda closure to arguments.
 fn apply_lambda(func: &Value, args: &[Value]) -> Result<Value, EvalError> {
-    let Value::Lambda { name, params, body, closure_env } = func else {
+    let Value::Lambda {
+        name,
+        params,
+        body,
+        closure_env,
+    } = func
+    else {
         unreachable!("apply_lambda called with non-lambda");
     };
     if params.len() != args.len() {
@@ -147,7 +181,7 @@ fn eval_lambda(args: &[Expr], env: &Env) -> Result<Value, EvalError> {
             message: "lambda requires params and body".to_string(),
         });
     }
-    let Expr::List(param_exprs) = params_expr else {
+    let Expr::List(param_exprs, _) = params_expr else {
         return Err(EvalError::Parse {
             message: "lambda params must be a list".to_string(),
         });
@@ -155,7 +189,7 @@ fn eval_lambda(args: &[Expr], env: &Env) -> Result<Value, EvalError> {
     let params: Vec<String> = param_exprs
         .iter()
         .map(|e| match e {
-            Expr::Atom(name) => Ok(name.clone()),
+            Expr::Atom(name, _) => Ok(name.clone()),
             _ => Err(EvalError::Parse {
                 message: "lambda param must be a symbol".to_string(),
             }),
@@ -182,7 +216,7 @@ fn eval_define(args: &[Expr], env: &mut Env) -> Result<Value, EvalError> {
         });
     }
     match target {
-        Expr::Atom(name) => {
+        Expr::Atom(name, _) => {
             let [value_expr] = body else {
                 return Err(EvalError::Parse {
                     message: "define variable form takes exactly one value".to_string(),
@@ -192,8 +226,8 @@ fn eval_define(args: &[Expr], env: &mut Env) -> Result<Value, EvalError> {
             env.insert(name.clone(), val.clone());
             Ok(val)
         }
-        Expr::List(parts) => {
-            let [Expr::Atom(name), param_exprs @ ..] = parts.as_slice() else {
+        Expr::List(parts, _) => {
+            let [Expr::Atom(name, _), param_exprs @ ..] = parts.as_slice() else {
                 return Err(EvalError::Parse {
                     message: "define function form requires a name".to_string(),
                 });
@@ -201,7 +235,7 @@ fn eval_define(args: &[Expr], env: &mut Env) -> Result<Value, EvalError> {
             let params: Vec<String> = param_exprs
                 .iter()
                 .map(|e| match e {
-                    Expr::Atom(s) => Ok(s.clone()),
+                    Expr::Atom(s, _) => Ok(s.clone()),
                     _ => Err(EvalError::Parse {
                         message: "parameter must be a symbol".to_string(),
                     }),
@@ -274,7 +308,7 @@ fn eval_let(args: &[Expr], env: &mut Env) -> Result<Value, EvalError> {
             message: "let requires bindings and body".to_string(),
         });
     }
-    let Expr::List(bindings) = bindings_expr else {
+    let Expr::List(bindings, _) = bindings_expr else {
         return Err(EvalError::Parse {
             message: "let bindings must be a list".to_string(),
         });
@@ -283,12 +317,12 @@ fn eval_let(args: &[Expr], env: &mut Env) -> Result<Value, EvalError> {
     let pairs: Vec<(String, Value)> = bindings
         .iter()
         .map(|b| {
-            let Expr::List(pair) = b else {
+            let Expr::List(pair, _) = b else {
                 return Err(EvalError::Parse {
                     message: "let binding must be a list".to_string(),
                 });
             };
-            let [Expr::Atom(name), val_expr] = pair.as_slice() else {
+            let [Expr::Atom(name, _), val_expr] = pair.as_slice() else {
                 return Err(EvalError::Parse {
                     message: "let binding must be (name value)".to_string(),
                 });
@@ -307,7 +341,7 @@ fn eval_let(args: &[Expr], env: &mut Env) -> Result<Value, EvalError> {
 /// Evaluate `(cond (test expr) ... (else expr))`.
 fn eval_cond(args: &[Expr], env: &mut Env) -> Result<Value, EvalError> {
     for clause in args {
-        let Expr::List(parts) = clause else {
+        let Expr::List(parts, _) = clause else {
             return Err(EvalError::Parse {
                 message: "cond clause must be a list".to_string(),
             });
@@ -318,7 +352,7 @@ fn eval_cond(args: &[Expr], env: &mut Env) -> Result<Value, EvalError> {
             });
         };
         // Check for else clause
-        if matches!(test_expr, Expr::Atom(s) if s == "else") {
+        if matches!(test_expr, Expr::Atom(s, _) if s == "else") {
             return eval_body(body, env);
         }
         let test_val = eval(test_expr, env)?;
