@@ -1,0 +1,5 @@
+(and (= (let-values (((x y z) (values 1 2 3))) (+ x y z)) 6)
+     (= (let-values (((a) (values 10))
+                     ((b c) (values 20 30)))
+          (+ a b c))
+        60))

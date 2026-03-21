@@ -1,203 +1,139 @@
 use crate::scheme::eval_str;
 
-// ===== Level 15: Numeric/Char/String Utilities =====
+// ===== Level 15: Deep Equality, Letrec, Case & Vectors =====
 
 #[test]
-fn test_l15_abs() {
+fn test_l15_equal_numbers() {
     assert_eq!(
-        eval_str(include_str!("fixtures/l15_abs.scm").trim()),
-        Ok("5".into())
-    );
-}
-
-#[test]
-fn test_l15_modulo() {
-    assert_eq!(
-        eval_str(include_str!("fixtures/l15_modulo.scm").trim()),
+        eval_str(include_str!("fixtures/l15_equal_numbers.scm").trim()),
         Ok("#t".into())
     );
 }
 
 #[test]
-fn test_l15_remainder() {
+fn test_l15_equal_strings() {
     assert_eq!(
-        eval_str(include_str!("fixtures/l15_remainder.scm").trim()),
+        eval_str(include_str!("fixtures/l15_equal_strings.scm").trim()),
         Ok("#t".into())
     );
 }
 
 #[test]
-fn test_l15_quotient() {
+fn test_l15_equal_nested_lists() {
     assert_eq!(
-        eval_str(include_str!("fixtures/l15_quotient.scm").trim()),
+        eval_str(include_str!("fixtures/l15_equal_nested_lists.scm").trim()),
         Ok("#t".into())
     );
 }
 
 #[test]
-fn test_l15_min_max() {
+fn test_l15_equal_different_types() {
     assert_eq!(
-        eval_str(include_str!("fixtures/l15_min_max.scm").trim()),
+        eval_str(include_str!("fixtures/l15_equal_different_types.scm").trim()),
+        Ok("#f".into())
+    );
+}
+
+#[test]
+fn test_l15_letrec_simple() {
+    assert_eq!(
+        eval_str(include_str!("fixtures/l15_letrec_simple.scm").trim()),
+        Ok("120".into())
+    );
+}
+
+#[test]
+fn test_l15_letrec_mutual() {
+    assert_eq!(
+        eval_str(include_str!("fixtures/l15_letrec_mutual.scm").trim()),
         Ok("#t".into())
     );
 }
 
 #[test]
-fn test_l15_expt() {
+fn test_l15_letrec_star() {
     assert_eq!(
-        eval_str(include_str!("fixtures/l15_expt.scm").trim()),
+        eval_str(include_str!("fixtures/l15_letrec_star.scm").trim()),
+        Ok("2".into())
+    );
+}
+
+#[test]
+fn test_l15_letrec_shadow() {
+    assert_eq!(
+        eval_str(include_str!("fixtures/l15_letrec_shadow.scm").trim()),
+        Ok("42".into())
+    );
+}
+
+#[test]
+fn test_l15_case_symbol() {
+    assert_eq!(
+        eval_str(include_str!("fixtures/l15_case_symbol.scm").trim()),
+        Ok("2".into())
+    );
+}
+
+#[test]
+fn test_l15_case_number() {
+    assert_eq!(
+        eval_str(include_str!("fixtures/l15_case_number.scm").trim()),
+        Ok("\"two\"".into())
+    );
+}
+
+#[test]
+fn test_l15_case_else() {
+    assert_eq!(
+        eval_str(include_str!("fixtures/l15_case_else.scm").trim()),
+        Ok("0".into())
+    );
+}
+
+#[test]
+fn test_l15_case_no_match() {
+    assert_eq!(
+        eval_str(include_str!("fixtures/l15_case_no_match.scm").trim()),
         Ok("#t".into())
     );
 }
 
 #[test]
-fn test_l15_zero() {
+fn test_l15_vector_create_ref() {
     assert_eq!(
-        eval_str(include_str!("fixtures/l15_zero.scm").trim()),
-        Ok("#t".into())
+        eval_str(include_str!("fixtures/l15_vector_create_ref.scm").trim()),
+        Ok("2".into())
     );
 }
 
 #[test]
-fn test_l15_positive_negative() {
+fn test_l15_vector_set() {
     assert_eq!(
-        eval_str(include_str!("fixtures/l15_positive_negative.scm").trim()),
-        Ok("#t".into())
+        eval_str(include_str!("fixtures/l15_vector_set.scm").trim()),
+        Ok("42".into())
     );
 }
 
 #[test]
-fn test_l15_odd_even() {
+fn test_l15_vector_predicate() {
     assert_eq!(
-        eval_str(include_str!("fixtures/l15_odd_even.scm").trim()),
-        Ok("#t".into())
+        eval_str(include_str!("fixtures/l15_vector_predicate.scm").trim()),
+        Ok("(#t #f 3)".into())
     );
 }
 
 #[test]
-fn test_l15_combined() {
+fn test_l15_vector_conversion() {
     assert_eq!(
-        eval_str(include_str!("fixtures/l15_combined.scm").trim()),
-        Ok("#t".into())
+        eval_str(include_str!("fixtures/l15_vector_conversion.scm").trim()),
+        Ok("(1 2 3)".into())
     );
 }
 
 #[test]
-fn test_l15_list_ref() {
+fn test_l15_vector_nested() {
     assert_eq!(
-        eval_str(include_str!("fixtures/l15_list_ref.scm").trim()),
-        Ok("#t".into())
-    );
-}
-
-#[test]
-fn test_l15_list_tail() {
-    assert_eq!(
-        eval_str(include_str!("fixtures/l15_list_tail.scm").trim()),
-        Ok("#t".into())
-    );
-}
-
-#[test]
-fn test_l15_list_pred() {
-    assert_eq!(
-        eval_str(include_str!("fixtures/l15_list_pred.scm").trim()),
-        Ok("#t".into())
-    );
-}
-
-#[test]
-fn test_l15_assoc() {
-    assert_eq!(
-        eval_str(include_str!("fixtures/l15_assoc.scm").trim()),
-        Ok("#t".into())
-    );
-}
-
-#[test]
-fn test_l15_map_multi() {
-    assert_eq!(
-        eval_str(include_str!("fixtures/l15_map_multi.scm").trim()),
-        Ok("#t".into())
-    );
-}
-
-#[test]
-fn test_l15_char_alpha() {
-    assert_eq!(
-        eval_str(include_str!("fixtures/l15_char_alpha.scm").trim()),
-        Ok("#t".into())
-    );
-}
-
-#[test]
-fn test_l15_char_numeric() {
-    assert_eq!(
-        eval_str(include_str!("fixtures/l15_char_numeric.scm").trim()),
-        Ok("#t".into())
-    );
-}
-
-#[test]
-fn test_l15_char_case() {
-    assert_eq!(
-        eval_str(include_str!("fixtures/l15_char_case.scm").trim()),
-        Ok("#t".into())
-    );
-}
-
-#[test]
-fn test_l15_char_compare() {
-    assert_eq!(
-        eval_str(include_str!("fixtures/l15_char_compare.scm").trim()),
-        Ok("#t".into())
-    );
-}
-
-#[test]
-fn test_l15_char_literal() {
-    assert_eq!(
-        eval_str(include_str!("fixtures/l15_char_literal.scm").trim()),
-        Ok("#t".into())
-    );
-}
-
-#[test]
-fn test_l15_string_equal() {
-    assert_eq!(
-        eval_str(include_str!("fixtures/l15_string_equal.scm").trim()),
-        Ok("#t".into())
-    );
-}
-
-#[test]
-fn test_l15_string_less() {
-    assert_eq!(
-        eval_str(include_str!("fixtures/l15_string_less.scm").trim()),
-        Ok("#t".into())
-    );
-}
-
-#[test]
-fn test_l15_string_ci() {
-    assert_eq!(
-        eval_str(include_str!("fixtures/l15_string_ci.scm").trim()),
-        Ok("#t".into())
-    );
-}
-
-#[test]
-fn test_l15_string_upcase() {
-    assert_eq!(
-        eval_str(include_str!("fixtures/l15_string_upcase.scm").trim()),
-        Ok("#t".into())
-    );
-}
-
-#[test]
-fn test_l15_string_downcase() {
-    assert_eq!(
-        eval_str(include_str!("fixtures/l15_string_downcase.scm").trim()),
-        Ok("#t".into())
+        eval_str(include_str!("fixtures/l15_vector_nested.scm").trim()),
+        Ok("3".into())
     );
 }

@@ -1,67 +1,40 @@
 use crate::scheme::eval_str;
 
-// ===== Level 8: Tail Call Optimization (All Forms) =====
+// ===== Level 8: set! & Mutation =====
 
 #[test]
-fn test_l08_tco_loop() {
+fn test_l08_set_basic() {
     assert_eq!(
-        eval_str(include_str!("fixtures/l08_tco_loop.scm").trim()),
-        Ok("done".into())
+        eval_str(include_str!("fixtures/l08_set_basic.scm").trim()),
+        Ok("2".into())
     );
 }
 
 #[test]
-fn test_l08_tco_fact_iter() {
+fn test_l08_set_unbound_error() {
+    assert!(eval_str(include_str!("fixtures/l08_set_unbound_error.scm").trim()).is_err());
+}
+
+#[test]
+fn test_l08_counter() {
     assert_eq!(
-        eval_str(include_str!("fixtures/l08_tco_fact_iter.scm").trim()),
-        Ok("2432902008176640000".into())
+        eval_str(include_str!("fixtures/l08_counter.scm").trim()),
+        Ok("3".into())
     );
 }
 
 #[test]
-fn test_l08_tco_mutual_recursion() {
+fn test_l08_shared_state() {
     assert_eq!(
-        eval_str(include_str!("fixtures/l08_tco_mutual_recursion.scm").trim()),
-        Ok("#t".into())
+        eval_str(include_str!("fixtures/l08_shared_state.scm").trim()),
+        Ok("42".into())
     );
 }
 
 #[test]
-fn test_l08_tco_cond() {
+fn test_l08_set_in_loop() {
     assert_eq!(
-        eval_str(include_str!("fixtures/l08_tco_cond.scm").trim()),
-        Ok("done".into())
-    );
-}
-
-#[test]
-fn test_l08_tco_named_let() {
-    assert_eq!(
-        eval_str(include_str!("fixtures/l08_tco_named_let.scm").trim()),
-        Ok("done".into())
-    );
-}
-
-#[test]
-fn test_l08_tco_and_or() {
-    assert_eq!(
-        eval_str(include_str!("fixtures/l08_tco_and_or.scm").trim()),
-        Ok("#t".into())
-    );
-}
-
-#[test]
-fn test_l08_tco_begin() {
-    assert_eq!(
-        eval_str(include_str!("fixtures/l08_tco_begin.scm").trim()),
-        Ok("done".into())
-    );
-}
-
-#[test]
-fn test_l08_tco_let_body() {
-    assert_eq!(
-        eval_str(include_str!("fixtures/l08_tco_let_body.scm").trim()),
-        Ok("done".into())
+        eval_str(include_str!("fixtures/l08_set_in_loop.scm").trim()),
+        Ok("55".into())
     );
 }

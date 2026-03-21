@@ -1,7 +1,7 @@
 use crate::scheme::eval_str;
 
 // ===== Level 6: Mutable Strings (R5RS) =====
-// Requirement-change level: string-set! is deprecated at L07 (strings become immutable).
+// Requirement-change level: string-set! is deprecated at L14 (strings become immutable).
 
 fn current_level() -> u32 {
     std::env::var("BENCH_LEVEL")
@@ -12,9 +12,9 @@ fn current_level() -> u32 {
 
 #[test]
 fn test_l06_string_set() {
-    if current_level() > 6 {
+    if current_level() > 13 {
         return;
-    } // deprecated at L07
+    } // deprecated at L14
     assert_eq!(
         eval_str(include_str!("fixtures/l06_string_set.scm").trim()),
         Ok("\"Horld\"".into())
@@ -32,9 +32,9 @@ fn test_l06_string_copy() {
 
 #[test]
 fn test_l06_string_set_multiple() {
-    if current_level() > 6 {
+    if current_level() > 13 {
         return;
-    } // deprecated at L07
+    } // deprecated at L14
     assert_eq!(
         eval_str(include_str!("fixtures/l06_string_set_multiple.scm").trim()),
         Ok("\"HELLO\"".into())

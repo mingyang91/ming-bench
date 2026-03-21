@@ -1,33 +1,67 @@
 use crate::scheme::eval_str;
 
-// ===== Level 7: Immutable Strings (R7RS) =====
+// ===== Level 7: Tail Call Optimization (All Forms) =====
 
 #[test]
-fn test_l07_string_set_error() {
-    let err = eval_str(include_str!("fixtures/l07_string_set_error.scm").trim());
-    assert!(err.is_err(), "string-set! should error on immutable strings");
-}
-
-#[test]
-fn test_l07_string_to_list() {
+fn test_l07_tco_loop() {
     assert_eq!(
-        eval_str(include_str!("fixtures/l07_string_to_list.scm").trim()),
-        Ok("(#\\h #\\e #\\l #\\l #\\o)".into())
+        eval_str(include_str!("fixtures/l07_tco_loop.scm").trim()),
+        Ok("done".into())
     );
 }
 
 #[test]
-fn test_l07_list_to_string() {
+fn test_l07_tco_fact_iter() {
     assert_eq!(
-        eval_str(include_str!("fixtures/l07_list_to_string.scm").trim()),
-        Ok("\"hello\"".into())
+        eval_str(include_str!("fixtures/l07_tco_fact_iter.scm").trim()),
+        Ok("2432902008176640000".into())
     );
 }
 
 #[test]
-fn test_l07_string_transform_via_list() {
+fn test_l07_tco_mutual_recursion() {
     assert_eq!(
-        eval_str(include_str!("fixtures/l07_string_transform_via_list.scm").trim()),
-        Ok("\"HELLO\"".into())
+        eval_str(include_str!("fixtures/l07_tco_mutual_recursion.scm").trim()),
+        Ok("#t".into())
+    );
+}
+
+#[test]
+fn test_l07_tco_cond() {
+    assert_eq!(
+        eval_str(include_str!("fixtures/l07_tco_cond.scm").trim()),
+        Ok("done".into())
+    );
+}
+
+#[test]
+fn test_l07_tco_named_let() {
+    assert_eq!(
+        eval_str(include_str!("fixtures/l07_tco_named_let.scm").trim()),
+        Ok("done".into())
+    );
+}
+
+#[test]
+fn test_l07_tco_and_or() {
+    assert_eq!(
+        eval_str(include_str!("fixtures/l07_tco_and_or.scm").trim()),
+        Ok("#t".into())
+    );
+}
+
+#[test]
+fn test_l07_tco_begin() {
+    assert_eq!(
+        eval_str(include_str!("fixtures/l07_tco_begin.scm").trim()),
+        Ok("done".into())
+    );
+}
+
+#[test]
+fn test_l07_tco_let_body() {
+    assert_eq!(
+        eval_str(include_str!("fixtures/l07_tco_let_body.scm").trim()),
+        Ok("done".into())
     );
 }

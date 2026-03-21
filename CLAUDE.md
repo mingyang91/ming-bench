@@ -54,7 +54,7 @@ Each language has a self-contained directory under `bench/`:
 | Scala | `bench/scala/` | sbt | munit | `ming-jvm` |
 
 **Shared resources:**
-- `bench/SPEC.md` — Language-agnostic interpreter specification (23 levels)
+- `bench/SPEC.md` — Language-agnostic interpreter specification (27 levels)
 - `bench/fixtures/*.scm` — Test fixture files (Scheme source code)
 - `bench/tests.json` — Test manifest mapping test names to fixtures and expected values
 
@@ -98,7 +98,7 @@ Session analysis tools parse Claude Code JSONL sessions from `results/`. The sha
 - **`/compare` skill** — Guides narrative analysis: runs compare, identifies struggle levels, reads thinking blocks, produces verdict.
 - **`/compliance` skill** — Analyzes whether an agent followed its strategy rules.
 
-Turn limits: L01-L03 = 45, L04-L07 = 30, L08-L10 = 45, L11-L13 = 90, L14-L15 = 60, L16-L18 = 60, L19-L20 = 75, L21-L23 = 90. Quality-gate levels get an additional 15-turn cleanup pass. Failed levels auto-retry up to 2 times if the failure was infrastructure (timeout/529/crash), not turns exhaustion.
+Turn limits: L01-L03 = 45, L04-L06 = 30, L07-L09 = 45, L10-L12 = 90, L13-L14 = 45, L15 = 60, L16-L18 = 60, L19-L20 = 75, L21-L23 = 90, L24-L27 = 60. Quality-gate levels get an additional 15-turn cleanup pass. Failed levels auto-retry up to 2 times if the failure was infrastructure (timeout/529/crash), not turns exhaustion.
 
 ## Key Conventions
 

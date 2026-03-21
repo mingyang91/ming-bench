@@ -1,83 +1,51 @@
 use crate::scheme::eval_str;
 
-// ===== Level 11: First-Class Continuations (call/cc) =====
+// ===== Level 11: Hygienic Macros =====
 
 #[test]
-fn test_l11_callcc_nonlocal_exit() {
+fn test_l11_simple_macro() {
     assert_eq!(
-        eval_str(include_str!("fixtures/l11_callcc_nonlocal_exit.scm").trim()),
-        Ok("42".into())
+        eval_str(include_str!("fixtures/l11_simple_macro.scm").trim()),
+        Ok("1".into())
     );
 }
 
 #[test]
-fn test_l11_callcc_no_escape() {
+fn test_l11_my_and_macro() {
     assert_eq!(
-        eval_str(include_str!("fixtures/l11_callcc_no_escape.scm").trim()),
-        Ok("7".into())
-    );
-}
-
-#[test]
-fn test_l11_callcc_early_return() {
-    assert_eq!(
-        eval_str(include_str!("fixtures/l11_callcc_early_return.scm").trim()),
-        Ok("-2".into())
-    );
-}
-
-#[test]
-fn test_l11_callcc_saved_continuation() {
-    assert_eq!(
-        eval_str(include_str!("fixtures/l11_callcc_saved_continuation.scm").trim()),
-        Ok("42".into())
-    );
-}
-
-#[test]
-fn test_l11_callcc_as_value() {
-    assert_eq!(
-        eval_str(include_str!("fixtures/l11_callcc_as_value.scm").trim()),
-        Ok("11".into())
-    );
-}
-
-#[test]
-fn test_l11_callcc_reentrant() {
-    assert_eq!(
-        eval_str(include_str!("fixtures/l11_callcc_reentrant.scm").trim()),
+        eval_str(include_str!("fixtures/l11_my_and_macro.scm").trim()),
         Ok("3".into())
     );
 }
 
 #[test]
-fn test_l11_callcc_exception_handler() {
+fn test_l11_swap_hygiene() {
     assert_eq!(
-        eval_str(include_str!("fixtures/l11_callcc_exception_handler.scm").trim()),
-        Ok("(error 42)".into())
+        eval_str(include_str!("fixtures/l11_swap_hygiene.scm").trim()),
+        Ok("(2 1)".into())
     );
 }
 
 #[test]
-fn test_l11_callcc_is_first_class() {
+fn test_l11_variadic_pattern() {
     assert_eq!(
-        eval_str(include_str!("fixtures/l11_callcc_is_first_class.scm").trim()),
-        Ok("7".into())
+        eval_str(include_str!("fixtures/l11_variadic_pattern.scm").trim()),
+        Ok("(1 2 3)".into())
     );
 }
 
 #[test]
-fn test_l11_callcc_resumes_lambda_body() {
+fn test_l11_nested_macro() {
     assert_eq!(
-        eval_str(include_str!("fixtures/l11_callcc_resumes_lambda_body.scm").trim()),
-        Ok("3".into())
+        eval_str(include_str!("fixtures/l11_nested_macro.scm").trim()),
+        Ok("2".into())
     );
 }
 
 #[test]
-fn test_l11_callcc_resumes_pending_application() {
+fn test_l11_macro_keeps_definition_site_binding() {
     assert_eq!(
-        eval_str(include_str!("fixtures/l11_callcc_resumes_pending_application.scm").trim()),
-        Ok("43".into())
+        eval_str(include_str!("fixtures/l11_macro_keeps_definition_site_binding.scm").trim()),
+        Ok("10".into())
     );
 }

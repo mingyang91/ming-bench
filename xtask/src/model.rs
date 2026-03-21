@@ -383,10 +383,10 @@ pub fn elapsed_secs(meta: &MetaJson) -> Option<u64> {
 // Level constants
 // ---------------------------------------------------------------------------
 
-pub const LEVELS: [&str; 23] = [
+pub const LEVELS: [&str; 27] = [
     "01", "02", "03", "04", "05", "06", "07", "08", "09",
     "10", "11", "12", "13", "14", "15", "16", "17", "18",
-    "19", "20", "21", "22", "23",
+    "19", "20", "21", "22", "23", "24", "25", "26", "27",
 ];
 
 // ---------------------------------------------------------------------------
@@ -395,28 +395,33 @@ pub const LEVELS: [&str; 23] = [
 
 /// Default turn limit for a given level number.
 ///
-/// Tiers based on difficulty:
-///   L01-L03 (foundation, merged)              → 45 turns
-///   L04-L07 (single-feature levels)           → 30 turns
-///   L08-L10 (TCO, mutation, apply)            → 45 turns
-///   L11-L13 (call/cc, macros, integration)    → 90 turns
-///   L14-L15 (merged 4-5 old levels each)      → 60 turns
-///   L16-L18 (dynamic-wind, guard, values)     → 60 turns
-///   L19-L20 (exact arith, records)            → 75 turns
+/// Tiers based on difficulty (v2 reordered):
+///   L01-L03 (foundation)                       → 45 turns
+///   L04-L06 (error quality, strings, mutable)  → 30 turns
+///   L07-L09 (TCO, set!, variadic)              → 45 turns
+///   L10-L12 (call/cc, macros, integration)     → 90 turns
+///   L13     (builtin grab bag)                 → 45 turns
+///   L14     (string immutability req-change)   → 45 turns
+///   L15     (equality, letrec, case, vectors)  → 60 turns
+///   L16-L18 (dynamic-wind, guard, values)      → 60 turns
+///   L19-L20 (exact arith, records)             → 75 turns
 ///   L21-L23 (pair mutation, syntax-case, integration) → 90 turns
+///   L24-L27 (tech-debt: case-lambda, do, let-values, parameterize) → 60 turns
 pub fn turns_for_level(level_num: u32, max_turns: Option<u32>) -> u32 {
     if let Some(t) = max_turns {
         return t;
     }
     match level_num {
         1..=3 => 45,
-        4..=7 => 30,
-        8..=10 => 45,
-        11..=13 => 90,  // call/cc, macros, integration — R11: both agents blew 75
-        14..=15 => 60,  // merged 4-5 old levels — R11: A blew 45 on L15
-        16..=18 => 60,  // dynamic-wind, guard, values
-        19..=20 => 75,  // exact arith, records
-        21..=23 => 90,  // pair mutation, syntax-case — R11: both at/over 75
+        4..=6 => 30,   // error quality, strings, mutable strings
+        7..=9 => 45,   // TCO, set!, variadic
+        10..=12 => 90, // call/cc, macros, integration
+        13..=14 => 45, // builtins, string immutability (req change)
+        15 => 60,       // equality, letrec, case, vectors
+        16..=18 => 60, // dynamic-wind, guard, values
+        19..=20 => 75, // exact arith, records
+        21..=23 => 90, // pair mutation, syntax-case, final integration
+        24..=27 => 60, // tech-debt: case-lambda, do, let-values, parameterize
         _ => 75,
     }
 }

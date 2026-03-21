@@ -1,51 +1,43 @@
 use crate::scheme::eval_str;
 
-// ===== Level 12: Hygienic Macros =====
+// ===== Level 12: Integration =====
 
 #[test]
-fn test_l12_simple_macro() {
+fn test_l12_callcc_with_mutation() {
     assert_eq!(
-        eval_str(include_str!("fixtures/l12_simple_macro.scm").trim()),
-        Ok("1".into())
+        eval_str(include_str!("fixtures/l12_callcc_with_mutation.scm").trim()),
+        Ok("4".into())
     );
 }
 
 #[test]
-fn test_l12_my_and_macro() {
+fn test_l12_macro_tco_loop() {
     assert_eq!(
-        eval_str(include_str!("fixtures/l12_my_and_macro.scm").trim()),
-        Ok("3".into())
+        eval_str(include_str!("fixtures/l12_macro_tco_loop.scm").trim()),
+        Ok("1000000".into())
     );
 }
 
 #[test]
-fn test_l12_swap_hygiene() {
+fn test_l12_callcc_try_catch() {
     assert_eq!(
-        eval_str(include_str!("fixtures/l12_swap_hygiene.scm").trim()),
-        Ok("(2 1)".into())
+        eval_str(include_str!("fixtures/l12_callcc_try_catch.scm").trim()),
+        Ok("(caught 42)".into())
     );
 }
 
 #[test]
-fn test_l12_variadic_pattern() {
+fn test_l12_coroutine_scheduler() {
     assert_eq!(
-        eval_str(include_str!("fixtures/l12_variadic_pattern.scm").trim()),
-        Ok("(1 2 3)".into())
+        eval_str(include_str!("fixtures/l12_coroutine_scheduler.scm").trim()),
+        Ok("4".into())
     );
 }
 
 #[test]
-fn test_l12_nested_macro() {
+fn test_l12_church_booleans_with_callcc() {
     assert_eq!(
-        eval_str(include_str!("fixtures/l12_nested_macro.scm").trim()),
-        Ok("2".into())
-    );
-}
-
-#[test]
-fn test_l12_macro_keeps_definition_site_binding() {
-    assert_eq!(
-        eval_str(include_str!("fixtures/l12_macro_keeps_definition_site_binding.scm").trim()),
-        Ok("10".into())
+        eval_str(include_str!("fixtures/l12_church_booleans_with_callcc.scm").trim()),
+        Ok("yes".into())
     );
 }

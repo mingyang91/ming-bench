@@ -47,32 +47,32 @@ All error messages must include source position info (line:col). Errors for unde
 ### Level 6 — Mutable Strings (R5RS)
 `string-set!` mutates a character in a string by index. `string-copy` returns a mutable copy of a string. Strings created by `string-copy` are mutable.
 
-### Level 7 — String Immutability (R7RS)
-Strings are now immutable. `string-set!` must raise an error. Use `string->list` and `list->string` for character-level transformations. `string-copy` still works (returns an immutable copy). `char->integer` and `integer->char` convert between characters and their integer code points.
-
-### Level 8 — Tail Call Optimization (All Forms)
+### Level 7 — Tail Call Optimization (All Forms)
 Tail-position calls must not grow the stack. `(loop 1000000)` with a tail-recursive body must not overflow. TCO must work through `cond`, named `let`, `and`, `or`, `begin`, and `let` body — not just `if`.
 
-### Level 9 — set! & Mutation
+### Level 8 — set! & Mutation
 `set!` mutates an existing binding (error if unbound). Closures that share a binding observe each other's mutations.
 
-### Level 10 — Variadic & Apply
+### Level 9 — Variadic & Apply
 Dot notation for rest parameters: `(define (f x . rest) rest)`. `apply` calls a function with an argument list. `apply` accepts prefix arguments: `(apply + 1 2 '(3 4))`.
 
-### Level 11 — First-Class Continuations
+### Level 10 — First-Class Continuations
 `call/cc` (call-with-current-continuation) captures the current continuation as a first-class value. Supports: non-local exit, saving and resuming continuations, continuations as values passed to higher-order functions.
 
-### Level 12 — Hygienic Macros
+### Level 11 — Hygienic Macros
 `define-syntax` + `syntax-rules`. Pattern matching with literals and ellipsis (`...`). Macro-introduced bindings do not capture user bindings (hygiene). Definition-site bindings are preserved.
 
-### Level 13 — Integration
+### Level 12 — Integration
 Combined use of continuations, macros, mutation, and tail calls.
 
-### Level 14 — Deep Equality, Letrec, Case & Vectors
-`equal?` compares values recursively. Works on numbers, strings, booleans, symbols, lists, and nested structures. `letrec` and `letrec*`. All bindings in `letrec` are mutually visible. `letrec*` bindings are visible sequentially. `case` dispatches on datum equality (`eqv?`). Also requires `eqv?` builtin. `vector`, `make-vector`, `vector-ref`, `vector-set!`, `vector-length`, `vector?`. Fixed-size mutable arrays. `vector->list` and `list->vector` for conversion.
-
-### Level 15 — Numeric/Char/String Utilities
+### Level 13 — Numeric/Char/String Utilities
 `abs` returns absolute value. `modulo` and `remainder` compute division remainders (they differ in sign for negative operands — `modulo` takes the sign of the divisor, `remainder` takes the sign of the dividend). `quotient` returns integer division truncated toward zero. `min` and `max` are variadic. `expt` computes integer exponentiation. `zero?`, `positive?`, `negative?` test the sign of a number. `odd?`, `even?` test integer parity. `list-ref` returns the element at a given index. `list-tail` returns the sublist starting at a given index. `list?` returns `#t` for proper lists (including `'()`), `#f` for dotted pairs and non-pairs. `assoc` searches an association list using `equal?`. Built-in `map` supports multiple list arguments: `(map + '(1 2) '(3 4))` → `(4 6)`. Character literals: `#\a`, `#\Z`, `#\5`, `#\space`, `#\newline`. `char-alphabetic?` and `char-numeric?` are character class predicates. `char-upcase` and `char-downcase` convert case. `char=?` and `char<?` compare characters by code point. `string=?` tests string equality. `string<?` compares lexicographically. `string-ci=?` is case-insensitive equality. `string-upcase` and `string-downcase` return a new string with all characters converted.
+
+### Level 14 — String Immutability (R7RS)
+Strings are now immutable. `string-set!` must raise an error. Use `string->list` and `list->string` for character-level transformations. `string-copy` still works (returns an immutable copy). `char->integer` and `integer->char` convert between characters and their integer code points.
+
+### Level 15 — Deep Equality, Letrec, Case & Vectors
+`equal?` compares values recursively. Works on numbers, strings, booleans, symbols, lists, and nested structures. `letrec` and `letrec*`. All bindings in `letrec` are mutually visible. `letrec*` bindings are visible sequentially. `case` dispatches on datum equality (`eqv?`). Also requires `eqv?` builtin. `vector`, `make-vector`, `vector-ref`, `vector-set!`, `vector-length`, `vector?`. Fixed-size mutable arrays. `vector->list` and `list->vector` for conversion.
 
 ### Level 16 — dynamic-wind
 `dynamic-wind` takes three thunks: in-thunk, body-thunk, out-thunk. The in-thunk runs before the body, the out-thunk runs after — even on non-local exit via `call/cc`. On continuation re-entry, the in-thunk fires again. Nested `dynamic-wind` must unwind/rewind in the correct order. `dynamic-wind` returns the body's value.
@@ -97,3 +97,15 @@ R7RS `define-record-type` creates a new disjoint type with a constructor, predic
 
 ### Level 23 — Final Integration
 Combined use of all features: dynamic-wind + guard for resource cleanup on exceptions, values + call/cc for multi-value continuations, records as exception payloads, rationals in data structures (lists, vectors, record fields), macros generating record-based code, TCO inside guard bodies, and a full pipeline combining macros + records + exceptions + values + continuations.
+
+### Level 24 — case-lambda
+`case-lambda` creates a procedure with multiple clauses, each with different arity. When called, the clause matching the argument count is selected. Supports rest parameters with dot notation in individual clauses. `(procedure? (case-lambda ...))` returns `#t`. Wrong arity (no matching clause) raises an error. Works with `apply`, higher-order functions, and recursion.
+
+### Level 25 — do Loops
+`(do ((var init step) ...) (test expr ...) body ...)` is an iteration construct. Variables are bound to their init values, then on each iteration all step expressions are evaluated using the *previous* iteration's values (parallel update, like `let` not `let*`). When test is true, the expr values are evaluated and the last is returned. Variables with no step expression keep their value across iterations. The body is in tail position.
+
+### Level 26 — let-values & receive
+`let-values` destructures multiple return values into bindings: `(let-values (((a b) (values 1 2))) ...)`. Multiple clauses are supported. `receive` (SRFI-8) is shorthand for a single-clause destructure: `(receive (a b c) (values 1 2 3) body)`. `receive` supports rest parameters: `(receive (a . rest) (values 1 2 3) rest)` → `(2 3)`.
+
+### Level 27 — parameterize & make-parameter
+`make-parameter` creates a parameter object (a procedure that returns its current value). `parameterize` dynamically rebinds parameters within its body, restoring the previous value on exit — even on non-local exit via `call/cc`. Nested `parameterize` forms stack. `make-parameter` accepts an optional converter procedure that transforms values before storing: `(make-parameter "hello" string-length)` → parameter returns `5`.
