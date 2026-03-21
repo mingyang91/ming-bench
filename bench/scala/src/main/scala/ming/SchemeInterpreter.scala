@@ -5,28 +5,33 @@ import scala.annotation.tailrec
 object SchemeInterpreter:
 
   def evaluateProgram(input: String): Value =
-    evaluateAll(SchemeReader.readAll(input), Env.empty)
+    evaluateSequence(SchemeReader.readAll(input), Env.empty)._2
 
-  final private case class EvaluatedArg(value: Value, position: SourcePos)
-
-  private def evaluateAll(expressions: List[Expr], env: Env): Value = expressions match
+  private def evaluateSequence(expressions: List[Expr], env: Env): (Env, Value) = expressions match
     case Nil =>
-      throw EvalError("expected at least one expression")
+      (env, Value.Void)
     case head :: tail =>
-      val (nextEnv, value) = evaluateTopLevel(head, env)
-      evaluateRemaining(tail, nextEnv, value)
+      val (nextEnv, value) = evaluateSequenceStep(head, env)
+      evaluateSequenceTail(tail, nextEnv, value)
 
   @tailrec
-  private def evaluateRemaining(remaining: List[Expr], env: Env, current: Value): Value =
+  private def evaluateSequenceTail(
+    remaining: List[Expr],
+    env: Env,
+    current: Value
+  ): (Env, Value) =
     remaining match
-      case Nil => current
+      case Nil =>
+        (env, current)
       case head :: tail =>
-        val (nextEnv, value) = evaluateTopLevel(head, env)
-        evaluateRemaining(tail, nextEnv, value)
+        val (nextEnv, value) = evaluateSequenceStep(head, env)
+        evaluateSequenceTail(tail, nextEnv, value)
 
-  private def evaluateTopLevel(expr: Expr, env: Env): (Env, Value) = expr match
+  private def evaluateSequenceStep(expr: Expr, env: Env): (Env, Value) = expr match
     case Expr.ListExpr(Expr.Symbol("define", position) :: arguments, _) =>
       (evaluateDefine(arguments, env, position), Value.Void)
+    case Expr.ListExpr(Expr.Symbol("begin", _) :: arguments, _) =>
+      evaluateSequence(arguments, env)
     case _ =>
       (env, evaluate(expr, env))
 
@@ -49,8 +54,14 @@ object SchemeInterpreter:
           evaluateAnd(arguments, env)
         case Expr.Symbol("or", _) =>
           evaluateOr(arguments, env)
+        case Expr.Symbol("begin", _) =>
+          evaluateBegin(arguments, env)
+        case Expr.Symbol("let", position) =>
+          evaluateLet(arguments, env, position)
+        case Expr.Symbol("cond", _) =>
+          evaluateCond(arguments, env)
         case Expr.Symbol("define", position) =>
-          throw EvalError.at(position, "define is only allowed at the program top level")
+          throw EvalError.at(position, "define is only allowed within a sequence")
         case _ =>
           applyProcedure(evaluate(operator, env), arguments, env, operator.sourcePos)
 
@@ -67,6 +78,9 @@ object SchemeInterpreter:
   private def bindRecursive(env: Env, name: String)(build: Env => Value): Env =
     lazy val recursiveEnv: Env = env.define(name, build(recursiveEnv))
     recursiveEnv
+
+  private def evaluateBegin(arguments: List[Expr], env: Env): Value =
+    evaluateSequence(arguments, env)._2
 
   private def evaluateIf(arguments: List[Expr], env: Env, position: SourcePos): Value =
     arguments match
@@ -89,6 +103,50 @@ object SchemeInterpreter:
         Value.Closure(readParameters(parameterExpr, position), body, env)
       case _ =>
         throw EvalError.at(position, "invalid lambda form")
+
+  private def evaluateLet(arguments: List[Expr], env: Env, position: SourcePos): Value =
+    arguments match
+      case bindingsExpr :: body if body.nonEmpty =>
+        val bindings = readLetBindings(bindingsExpr, env, position)
+        evaluateBody(body, env.extend(bindings))
+      case _ =>
+        throw EvalError.at(position, "invalid let form")
+
+  private def readLetBindings(
+    bindingsExpr: Expr,
+    env: Env,
+    position: SourcePos
+  ): List[(String, Value)] = bindingsExpr match
+    case Expr.ListExpr(bindings, _) =>
+      bindings.map(readLetBinding(_, env))
+    case _ =>
+      throw EvalError.at(position, "let bindings must be a list")
+
+  private def readLetBinding(binding: Expr, env: Env): (String, Value) = binding match
+    case Expr.ListExpr(Expr.Symbol(name, _) :: valueExpr :: Nil, _) =>
+      (name, evaluate(valueExpr, env))
+    case _ =>
+      throw EvalError.at(binding.sourcePos, "invalid let binding")
+
+  private def evaluateCond(arguments: List[Expr], env: Env): Value = arguments match
+    case Nil =>
+      Value.Void
+    case clause :: remaining =>
+      evaluateCondClause(clause, remaining, env)
+
+  private def evaluateCondClause(clause: Expr, remaining: List[Expr], env: Env): Value = clause match
+    case Expr.ListExpr(Nil, clausePosition) =>
+      throw EvalError.at(clausePosition, "cond clause cannot be empty")
+    case Expr.ListExpr(Expr.Symbol("else", clausePosition) :: body, _) =>
+      if remaining.nonEmpty then throw EvalError.at(clausePosition, "else clause must be last")
+      else if body.isEmpty then throw EvalError.at(clausePosition, "else clause must not be empty")
+      else evaluateBody(body, env)
+    case Expr.ListExpr(test :: body, _) =>
+      val conditionValue = evaluate(test, env)
+      if conditionValue.isTruthy then if body.isEmpty then conditionValue else evaluateBody(body, env)
+      else evaluateCond(remaining, env)
+    case _ =>
+      throw EvalError.at(clause.sourcePos, "cond clause must be a list")
 
   private def readParameters(parameterExpr: Expr, position: SourcePos): List[String] =
     parameterExpr match
@@ -129,108 +187,17 @@ object SchemeInterpreter:
   private def evaluateBody(expressions: List[Expr], env: Env): Value = expressions match
     case Nil =>
       Value.Void
-    case head :: tail =>
-      evaluateBodyTail(tail, env, evaluate(head, env))
-
-  @tailrec
-  private def evaluateBodyTail(remaining: List[Expr], env: Env, current: Value): Value =
-    remaining match
-      case Nil          => current
-      case head :: tail => evaluateBodyTail(tail, env, evaluate(head, env))
+    case _ =>
+      evaluateSequence(expressions, env)._2
 
   private def lookup(name: String, env: Env): Option[Value] =
-    env.lookup(name).orElse(builtin(name))
-
-  private def builtin(name: String): Option[Value] =
-    name match
-      case "+" | "-" | "*" | "/" | "<" | ">" | "=" | "<=" | "not" =>
-        Some(Value.Builtin(name))
-      case _ =>
-        None
+    env.lookup(name).orElse(BuiltinProcedure.resolve(name))
 
   private def applyBuiltin(name: String, arguments: List[EvaluatedArg], position: SourcePos): Value =
-    name match
-      case "+" =>
-        Value.Number(expectNumbers(arguments).foldLeft(BigInt(0))(_ + _))
-      case "*" =>
-        Value.Number(expectNumbers(arguments).foldLeft(BigInt(1))(_ * _))
-      case "-" =>
-        Value.Number(evaluateSub(arguments, position))
-      case "/" =>
-        Value.Number(evaluateDiv(arguments, position))
-      case "<" =>
-        Value.Bool(compare(arguments, position)(_ < _))
-      case ">" =>
-        Value.Bool(compare(arguments, position)(_ > _))
-      case "=" =>
-        Value.Bool(compare(arguments, position)(_ == _))
-      case "<=" =>
-        Value.Bool(compare(arguments, position)(_ <= _))
-      case "not" =>
-        evaluateNot(arguments, position)
-      case _ =>
-        throw EvalError.at(position, s"unknown operator '$name'")
+    BuiltinProcedure(name, arguments, position)
 
   private def evaluateArguments(arguments: List[Expr], env: Env): List[EvaluatedArg] =
     arguments.map(argument => EvaluatedArg(evaluate(argument, env), argument.sourcePos))
-
-  private def expectNumbers(arguments: List[EvaluatedArg]): List[BigInt] =
-    arguments.map(expectNumber)
-
-  private def evaluateSub(arguments: List[EvaluatedArg], position: SourcePos): BigInt =
-    expectNumbers(arguments) match
-      case Nil =>
-        throw EvalError.at(position, "'-' expects at least 1 argument")
-      case head :: Nil =>
-        -head
-      case head :: tail =>
-        tail.foldLeft(head)(_ - _)
-
-  private def evaluateDiv(arguments: List[EvaluatedArg], position: SourcePos): BigInt =
-    expectNumbers(arguments) match
-      case _ :: Nil | Nil =>
-        throw EvalError.at(position, "'/' expects at least 2 arguments")
-      case head :: tail =>
-        divide(head, tail, position)
-
-  @tailrec
-  private def divide(current: BigInt, remaining: List[BigInt], position: SourcePos): BigInt =
-    remaining match
-      case Nil =>
-        current
-      case head :: _ if head == 0 =>
-        throw EvalError.at(position, "division by zero")
-      case head :: tail =>
-        divide(current / head, tail, position)
-
-  private def compare(arguments: List[EvaluatedArg], position: SourcePos)(
-    predicate: (BigInt, BigInt) => Boolean
-  ): Boolean =
-    expectNumbers(arguments) match
-      case left :: right :: rest =>
-        compareChain(right, rest, left, predicate)
-      case _ =>
-        throw EvalError.at(position, "comparison expects at least 2 arguments")
-
-  @tailrec
-  private def compareChain(
-    current: BigInt,
-    remaining: List[BigInt],
-    previous: BigInt,
-    predicate: (BigInt, BigInt) => Boolean
-  ): Boolean =
-    if !predicate(previous, current) then false
-    else
-      remaining match
-        case Nil          => true
-        case head :: tail => compareChain(head, tail, current, predicate)
-
-  private def evaluateNot(arguments: List[EvaluatedArg], position: SourcePos): Value =
-    arguments match
-      case argument :: Nil =>
-        Value.Bool(!argument.value.isTruthy)
-      case _ =>
-        throw EvalError.at(position, "'not' expects exactly 1 argument")
 
   private def evaluateAnd(arguments: List[Expr], env: Env): Value =
     arguments match
@@ -251,8 +218,3 @@ object SchemeInterpreter:
       case argument :: rest =>
         val value = evaluate(argument, env)
         if value.isTruthy then value else evaluateOr(rest, env)
-
-  private def expectNumber(argument: EvaluatedArg): BigInt =
-    argument.value match
-      case Value.Number(number) => number
-      case _                    => throw EvalError.at(argument.position, "expected number")

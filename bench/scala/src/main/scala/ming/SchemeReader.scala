@@ -7,6 +7,7 @@ object SchemeReader:
   private enum Token:
     case LeftParen(position: SourcePos)
     case RightParen(position: SourcePos)
+    case Quote(position: SourcePos)
     case Atom(value: String, position: SourcePos)
     case Str(value: String, position: SourcePos)
 
@@ -42,6 +43,8 @@ object SchemeReader:
             loop(cursor.advance, Token.LeftParen(cursor.position) :: acc)
           case ')' =>
             loop(cursor.advance, Token.RightParen(cursor.position) :: acc)
+          case '\'' =>
+            loop(cursor.advance, Token.Quote(cursor.position) :: acc)
           case '"' =>
             val start              = cursor.position
             val (nextCursor, body) = readString(cursor.advance, start, Nil)
@@ -99,6 +102,15 @@ object SchemeReader:
       (Expr.ListExpr(items, position), remaining)
     case Token.RightParen(position) :: _ =>
       throw EvalError.at(position, "unexpected ')'")
+    case Token.Quote(position) :: rest =>
+      val (quotedExpr, remaining) = parseExpr(rest)
+      (
+        Expr.ListExpr(
+          List(Expr.Symbol("quote", position), quotedExpr),
+          position
+        ),
+        remaining
+      )
     case Token.Str(value, position) :: rest =>
       (Expr.Literal(Value.Str(value), position), rest)
     case Token.Atom(value, position) :: rest =>

@@ -1,0 +1,1025 @@
+--- ../rust/helpers.md	2026-03-21 13:59:35.824274980 +0000
++++ /tmp/cx-scala-qg-r13-shadow/bench/rust/helpers.md	2026-03-21 14:49:39.808270428 +0000
+@@ -10,7 +10,8 @@
+ 
+ ## Rust Helpers (src/scheme/)
+ 
+-(none yet)
++### eval_sequence (src/scheme/interpreter.rs) — Evaluate a body/program in order while allowing local or top-level `define` forms to mutate the current lexical frame
++### proper_list_len (src/scheme/interpreter.rs) — Validate that a value is a proper list and count its elements for `length`
+ 
+ ## Python Helpers (scripts/)
+ 
+diff -ruN ../rust/src/scheme/env.rs /tmp/cx-scala-qg-r13-shadow/bench/rust/src/scheme/env.rs
+--- ../rust/src/scheme/env.rs	1970-01-01 00:00:00.000000000 +0000
++++ /tmp/cx-scala-qg-r13-shadow/bench/rust/src/scheme/env.rs	2026-03-21 14:49:39.808270428 +0000
+@@ -0,0 +1,46 @@
++use std::cell::RefCell;
++use std::collections::HashMap;
++use std::rc::Rc;
++
++use crate::scheme::value::{Builtin, Value};
++
++#[derive(Debug, Clone)]
++pub struct Env(Rc<RefCell<Frame>>);
++
++#[derive(Debug)]
++struct Frame {
++    bindings: HashMap<String, Value>,
++    parent: Option<Env>,
++}
++
++impl Env {
++    pub fn with_builtins() -> Self {
++        let env = Self::new(None);
++        Builtin::bind_all(&env);
++        env
++    }
++
++    pub fn child(parent: &Self) -> Self {
++        Self::new(Some(parent.clone()))
++    }
++
++    pub fn lookup(&self, name: &str) -> Option<Value> {
++        let (binding, parent) = {
++            let frame = self.0.borrow();
++            (frame.bindings.get(name).cloned(), frame.parent.clone())
++        };
++
++        binding.or_else(|| parent.and_then(|outer| outer.lookup(name)))
++    }
++
++    pub fn define(&self, name: String, value: Value) {
++        self.0.borrow_mut().bindings.insert(name, value);
++    }
++
++    fn new(parent: Option<Self>) -> Self {
++        Self(Rc::new(RefCell::new(Frame {
++            bindings: HashMap::new(),
++            parent,
++        })))
++    }
++}
+diff -ruN ../rust/src/scheme/error.rs /tmp/cx-scala-qg-r13-shadow/bench/rust/src/scheme/error.rs
+--- ../rust/src/scheme/error.rs	2026-03-21 13:59:35.824274980 +0000
++++ /tmp/cx-scala-qg-r13-shadow/bench/rust/src/scheme/error.rs	2026-03-21 14:49:39.808270428 +0000
+@@ -1,10 +1,31 @@
++use crate::scheme::source::SourcePos;
++
+ /// Evaluation error type for the Scheme interpreter.
+-///
+-/// Agents must add domain-specific variants here. Using `String` as the
+-/// error type is not possible — the `eval_str` signature requires this type.
+-#[derive(Debug, PartialEq, thiserror::Error)]
++#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+ pub enum EvalError {
+-    // Add variants as needed, e.g.:
+-    // #[error("unbound variable: {name}")]
+-    // UnboundVariable { name: String },
++    #[error("{message}")]
++    Message { message: String },
++
++    #[error("{line}:{column}: {message}")]
++    At {
++        line: usize,
++        column: usize,
++        message: String,
++    },
++}
++
++impl EvalError {
++    pub fn message(message: impl Into<String>) -> Self {
++        Self::Message {
++            message: message.into(),
++        }
++    }
++
++    pub fn at(position: SourcePos, message: impl Into<String>) -> Self {
++        Self::At {
++            line: position.line,
++            column: position.column,
++            message: message.into(),
++        }
++    }
+ }
+diff -ruN ../rust/src/scheme/expr.rs /tmp/cx-scala-qg-r13-shadow/bench/rust/src/scheme/expr.rs
+--- ../rust/src/scheme/expr.rs	1970-01-01 00:00:00.000000000 +0000
++++ /tmp/cx-scala-qg-r13-shadow/bench/rust/src/scheme/expr.rs	2026-03-21 14:49:39.808270428 +0000
+@@ -0,0 +1,23 @@
++use crate::scheme::source::SourcePos;
++use crate::scheme::value::Value;
++
++#[derive(Debug, Clone)]
++pub enum Expr {
++    Literal(Value, SourcePos),
++    Symbol(String, SourcePos),
++    List(Vec<Expr>, SourcePos),
++}
++
++impl Expr {
++    pub fn position(&self) -> SourcePos {
++        match self {
++            Self::Literal(_, position) | Self::Symbol(_, position) | Self::List(_, position) => {
++                *position
++            }
++        }
++    }
++
++    pub fn quote_symbol(position: SourcePos) -> Self {
++        Self::Symbol("quote".to_string(), position)
++    }
++}
+diff -ruN ../rust/src/scheme/interpreter.rs /tmp/cx-scala-qg-r13-shadow/bench/rust/src/scheme/interpreter.rs
+--- ../rust/src/scheme/interpreter.rs	1970-01-01 00:00:00.000000000 +0000
++++ /tmp/cx-scala-qg-r13-shadow/bench/rust/src/scheme/interpreter.rs	2026-03-21 14:49:39.808270428 +0000
+@@ -0,0 +1,475 @@
++use crate::scheme::env::Env;
++use crate::scheme::error::EvalError;
++use crate::scheme::expr::Expr;
++use crate::scheme::reader::read_all;
++use crate::scheme::source::SourcePos;
++use crate::scheme::value::{Builtin, Value};
++
++pub fn evaluate_program(input: &str) -> Result<Value, EvalError> {
++    let expressions = read_all(input)?;
++    let env = Env::with_builtins();
++    eval_sequence(&expressions, &env)
++}
++
++fn eval_sequence(expressions: &[Expr], env: &Env) -> Result<Value, EvalError> {
++    let mut current = Value::Void;
++
++    for expr in expressions {
++        current = eval_sequence_expr(expr, env)?;
++    }
++
++    Ok(current)
++}
++
++fn eval_sequence_expr(expr: &Expr, env: &Env) -> Result<Value, EvalError> {
++    if let Some((arguments, position)) = define_form(expr) {
++        eval_define(arguments, env, position)?;
++        Ok(Value::Void)
++    } else {
++        eval(expr, env)
++    }
++}
++
++fn define_form(expr: &Expr) -> Option<(&[Expr], SourcePos)> {
++    let Expr::List(items, position) = expr else {
++        return None;
++    };
++
++    match items.as_slice() {
++        [Expr::Symbol(name, _), arguments @ ..] if name == "define" => Some((arguments, *position)),
++        _ => None,
++    }
++}
++
++fn eval(expr: &Expr, env: &Env) -> Result<Value, EvalError> {
++    match expr {
++        Expr::Literal(value, _) => Ok(value.clone()),
++        Expr::Symbol(name, position) => env
++            .lookup(name)
++            .ok_or_else(|| EvalError::at(*position, format!("unbound symbol '{name}'"))),
++        Expr::List(items, position) => eval_list(items, env, *position),
++    }
++}
++
++fn eval_list(items: &[Expr], env: &Env, position: SourcePos) -> Result<Value, EvalError> {
++    let Some((operator, arguments)) = items.split_first() else {
++        return Err(EvalError::at(position, "cannot evaluate empty list"));
++    };
++
++    match operator {
++        Expr::Symbol(name, _) if name == "if" => eval_if(arguments, env, position),
++        Expr::Symbol(name, _) if name == "quote" => eval_quote(arguments, position),
++        Expr::Symbol(name, _) if name == "lambda" => eval_lambda(arguments, env, position),
++        Expr::Symbol(name, _) if name == "and" => eval_and(arguments, env),
++        Expr::Symbol(name, _) if name == "or" => eval_or(arguments, env),
++        Expr::Symbol(name, _) if name == "let" => eval_let(arguments, env, position),
++        Expr::Symbol(name, _) if name == "begin" => eval_sequence(arguments, env),
++        Expr::Symbol(name, _) if name == "cond" => eval_cond(arguments, env, position),
++        Expr::Symbol(name, _) if name == "define" => {
++            Err(EvalError::at(position, "define is only allowed in a sequence"))
++        }
++        _ => {
++            let procedure = eval(operator, env)?;
++            let evaluated_arguments = eval_arguments(arguments, env)?;
++            apply_procedure(procedure, evaluated_arguments, position)
++        }
++    }
++}
++
++fn eval_define(arguments: &[Expr], env: &Env, position: SourcePos) -> Result<(), EvalError> {
++    match arguments {
++        [Expr::Symbol(name, _), value_expr] => {
++            let value = eval(value_expr, env)?;
++            env.define(name.clone(), value);
++            Ok(())
++        }
++        [Expr::List(signature, _), body @ ..] if !body.is_empty() => {
++            let Some((Expr::Symbol(name, _), parameters)) = signature.split_first() else {
++                return Err(EvalError::at(position, "invalid define form"));
++            };
++
++            let closure = Value::Closure {
++                parameters: read_parameters(parameters)?,
++                body: body.to_vec(),
++                env: env.clone(),
++            };
++            env.define(name.clone(), closure);
++            Ok(())
++        }
++        _ => Err(EvalError::at(position, "invalid define form")),
++    }
++}
++
++fn eval_if(arguments: &[Expr], env: &Env, position: SourcePos) -> Result<Value, EvalError> {
++    match arguments {
++        [condition, then_branch, else_branch] => {
++            if eval(condition, env)?.is_truthy() {
++                eval(then_branch, env)
++            } else {
++                eval(else_branch, env)
++            }
++        }
++        _ => Err(EvalError::at(position, "'if' expects exactly 3 arguments")),
++    }
++}
++
++fn eval_quote(arguments: &[Expr], position: SourcePos) -> Result<Value, EvalError> {
++    match arguments {
++        [datum] => Ok(quote_to_value(datum)),
++        _ => Err(EvalError::at(position, "'quote' expects exactly 1 argument")),
++    }
++}
++
++fn eval_lambda(arguments: &[Expr], env: &Env, position: SourcePos) -> Result<Value, EvalError> {
++    let Some((parameter_expr, body)) = arguments.split_first() else {
++        return Err(EvalError::at(position, "invalid lambda form"));
++    };
++
++    if body.is_empty() {
++        return Err(EvalError::at(position, "invalid lambda form"));
++    }
++
++    let Expr::List(parameters, _) = parameter_expr else {
++        return Err(EvalError::at(position, "lambda parameters must be a list"));
++    };
++
++    Ok(Value::Closure {
++        parameters: read_parameters(parameters)?,
++        body: body.to_vec(),
++        env: env.clone(),
++    })
++}
++
++fn eval_and(arguments: &[Expr], env: &Env) -> Result<Value, EvalError> {
++    let mut current = Value::Bool(true);
++
++    for argument in arguments {
++        current = eval(argument, env)?;
++        if !current.is_truthy() {
++            return Ok(current);
++        }
++    }
++
++    Ok(current)
++}
++
++fn eval_or(arguments: &[Expr], env: &Env) -> Result<Value, EvalError> {
++    let mut current = Value::Bool(false);
++
++    for argument in arguments {
++        current = eval(argument, env)?;
++        if current.is_truthy() {
++            return Ok(current);
++        }
++    }
++
++    Ok(current)
++}
++
++fn eval_let(arguments: &[Expr], env: &Env, position: SourcePos) -> Result<Value, EvalError> {
++    let Some((binding_expr, body)) = arguments.split_first() else {
++        return Err(EvalError::at(position, "invalid let form"));
++    };
++
++    if body.is_empty() {
++        return Err(EvalError::at(position, "invalid let form"));
++    }
++
++    let Expr::List(bindings, _) = binding_expr else {
++        return Err(EvalError::at(position, "let bindings must be a list"));
++    };
++
++    let child = Env::child(env);
++
++    for binding in bindings {
++        match binding {
++            Expr::List(items, binding_pos) => match items.as_slice() {
++                [Expr::Symbol(name, _), value_expr] => {
++                    let value = eval(value_expr, env)?;
++                    child.define(name.clone(), value);
++                }
++                _ => return Err(EvalError::at(*binding_pos, "invalid let binding")),
++            },
++            _ => return Err(EvalError::at(binding.position(), "invalid let binding")),
++        }
++    }
++
++    eval_sequence(body, &child)
++}
++
++fn eval_cond(arguments: &[Expr], env: &Env, position: SourcePos) -> Result<Value, EvalError> {
++    for clause in arguments {
++        let Expr::List(items, clause_pos) = clause else {
++            return Err(EvalError::at(clause.position(), "cond clause must be a list"));
++        };
++
++        let Some((test, body)) = items.split_first() else {
++            return Err(EvalError::at(*clause_pos, "cond clause cannot be empty"));
++        };
++
++        if matches!(test, Expr::Symbol(name, _) if name == "else") {
++            return eval_cond_body(body, env);
++        }
++
++        let test_value = eval(test, env)?;
++        if test_value.is_truthy() {
++            return if body.is_empty() {
++                Ok(test_value)
++            } else {
++                eval_cond_body(body, env)
++            };
++        }
++    }
++
++    let _ = position;
++    Ok(Value::Void)
++}
++
++fn eval_cond_body(body: &[Expr], env: &Env) -> Result<Value, EvalError> {
++    if body.is_empty() {
++        Ok(Value::Void)
++    } else {
++        eval_sequence(body, env)
++    }
++}
++
++fn quote_to_value(expr: &Expr) -> Value {
++    match expr {
++        Expr::Literal(value, _) => value.clone(),
++        Expr::Symbol(name, _) => Value::Symbol(name.clone()),
++        Expr::List(items, _) => items.iter().rev().fold(Value::EmptyList, |tail, item| {
++            Value::Pair(Box::new(quote_to_value(item)), Box::new(tail))
++        }),
++    }
++}
++
++fn apply_procedure(
++    procedure: Value,
++    arguments: Vec<(Value, SourcePos)>,
++    position: SourcePos,
++) -> Result<Value, EvalError> {
++    match procedure {
++        Value::Builtin(name) => apply_builtin(name, &arguments, position),
++        Value::Closure {
++            parameters,
++            body,
++            env,
++        } => {
++            if parameters.len() != arguments.len() {
++                return Err(EvalError::at(
++                    position,
++                    format!(
++                        "wrong argument count: expected {}, got {}",
++                        parameters.len(),
++                        arguments.len()
++                    ),
++                ));
++            }
++
++            let child = Env::child(&env);
++            for (parameter, (value, _)) in parameters.into_iter().zip(arguments.into_iter()) {
++                child.define(parameter, value);
++            }
++
++            eval_sequence(&body, &child)
++        }
++        _ => Err(EvalError::at(position, "attempted to call a non-procedure")),
++    }
++}
++
++fn apply_builtin(
++    builtin: Builtin,
++    arguments: &[(Value, SourcePos)],
++    position: SourcePos,
++) -> Result<Value, EvalError> {
++    match builtin {
++        Builtin::Add => Ok(Value::Number(expect_numbers(arguments)?.into_iter().sum())),
++        Builtin::Mul => Ok(Value::Number(
++            expect_numbers(arguments)?.into_iter().product::<i64>(),
++        )),
++        Builtin::Sub => eval_sub(arguments, position),
++        Builtin::Div => eval_div(arguments, position),
++        Builtin::LessThan => eval_compare(arguments, position, |left, right| left < right),
++        Builtin::GreaterThan => eval_compare(arguments, position, |left, right| left > right),
++        Builtin::Equal => eval_compare(arguments, position, |left, right| left == right),
++        Builtin::LessEqual => eval_compare(arguments, position, |left, right| left <= right),
++        Builtin::Not => eval_not(arguments, position),
++        Builtin::Cons => eval_cons(arguments, position),
++        Builtin::Car => eval_car(arguments, position),
++        Builtin::Cdr => eval_cdr(arguments, position),
++        Builtin::NullPred => eval_null_pred(arguments, position),
++        Builtin::List => Ok(Value::from_list(arguments.iter().map(|(value, _)| value.clone()).collect())),
++        Builtin::Length => eval_length(arguments, position),
++        Builtin::StringPred => eval_predicate(arguments, position, |value| matches!(value, Value::Str(_))),
++        Builtin::NumberPred => eval_predicate(arguments, position, |value| matches!(value, Value::Number(_))),
++        Builtin::BooleanPred => {
++            eval_predicate(arguments, position, |value| matches!(value, Value::Bool(_)))
++        }
++        Builtin::PairPred => eval_predicate(arguments, position, |value| matches!(value, Value::Pair(_, _))),
++        Builtin::SymbolPred => {
++            eval_predicate(arguments, position, |value| matches!(value, Value::Symbol(_)))
++        }
++    }
++}
++
++fn eval_arguments(arguments: &[Expr], env: &Env) -> Result<Vec<(Value, SourcePos)>, EvalError> {
++    arguments
++        .iter()
++        .map(|argument| eval(argument, env).map(|value| (value, argument.position())))
++        .collect()
++}
++
++fn read_parameters(parameters: &[Expr]) -> Result<Vec<String>, EvalError> {
++    parameters
++        .iter()
++        .map(|parameter| match parameter {
++            Expr::Symbol(name, _) => Ok(name.clone()),
++            _ => Err(EvalError::at(
++                parameter.position(),
++                "parameter must be a symbol",
++            )),
++        })
++        .collect()
++}
++
++fn expect_numbers(arguments: &[(Value, SourcePos)]) -> Result<Vec<i64>, EvalError> {
++    arguments
++        .iter()
++        .map(|(value, position)| match value {
++            Value::Number(number) => Ok(*number),
++            _ => Err(EvalError::at(*position, "expected number")),
++        })
++        .collect()
++}
++
++fn eval_sub(arguments: &[(Value, SourcePos)], position: SourcePos) -> Result<Value, EvalError> {
++    let numbers = expect_numbers(arguments)?;
++
++    match numbers.as_slice() {
++        [] => Err(EvalError::at(position, "'-' expects at least 1 argument")),
++        [single] => Ok(Value::Number(-single)),
++        [head, tail @ ..] => Ok(Value::Number(tail.iter().fold(*head, |current, number| current - number))),
++    }
++}
++
++fn eval_div(arguments: &[(Value, SourcePos)], position: SourcePos) -> Result<Value, EvalError> {
++    let numbers = expect_numbers(arguments)?;
++
++    match numbers.as_slice() {
++        [] | [_] => Err(EvalError::at(position, "'/' expects at least 2 arguments")),
++        [head, tail @ ..] => {
++            let mut current = *head;
++            for number in tail {
++                if *number == 0 {
++                    return Err(EvalError::at(position, "division by zero"));
++                }
++                current /= number;
++            }
++            Ok(Value::Number(current))
++        }
++    }
++}
++
++fn eval_compare(
++    arguments: &[(Value, SourcePos)],
++    position: SourcePos,
++    predicate: fn(i64, i64) -> bool,
++) -> Result<Value, EvalError> {
++    let numbers = expect_numbers(arguments)?;
++
++    match numbers.as_slice() {
++        [] | [_] => Err(EvalError::at(
++            position,
++            "comparison expects at least 2 arguments",
++        )),
++        [first, rest @ ..] => {
++            let mut previous = *first;
++            for current in rest {
++                if !predicate(previous, *current) {
++                    return Ok(Value::Bool(false));
++                }
++                previous = *current;
++            }
++            Ok(Value::Bool(true))
++        }
++    }
++}
++
++fn eval_not(arguments: &[(Value, SourcePos)], position: SourcePos) -> Result<Value, EvalError> {
++    match arguments {
++        [(value, _)] => Ok(Value::Bool(!value.is_truthy())),
++        _ => Err(EvalError::at(position, "'not' expects exactly 1 argument")),
++    }
++}
++
++fn eval_cons(arguments: &[(Value, SourcePos)], position: SourcePos) -> Result<Value, EvalError> {
++    match arguments {
++        [(car, _), (cdr, _)] => Ok(Value::Pair(Box::new(car.clone()), Box::new(cdr.clone()))),
++        _ => Err(EvalError::at(position, "'cons' expects exactly 2 arguments")),
++    }
++}
++
++fn eval_car(arguments: &[(Value, SourcePos)], position: SourcePos) -> Result<Value, EvalError> {
++    match arguments {
++        [(Value::Pair(car, _), _)] => Ok((**car).clone()),
++        [(_, arg_position)] => Err(EvalError::at(*arg_position, "expected pair")),
++        _ => Err(EvalError::at(position, "'car' expects exactly 1 argument")),
++    }
++}
++
++fn eval_cdr(arguments: &[(Value, SourcePos)], position: SourcePos) -> Result<Value, EvalError> {
++    match arguments {
++        [(Value::Pair(_, cdr), _)] => Ok((**cdr).clone()),
++        [(_, arg_position)] => Err(EvalError::at(*arg_position, "expected pair")),
++        _ => Err(EvalError::at(position, "'cdr' expects exactly 1 argument")),
++    }
++}
++
++fn eval_null_pred(arguments: &[(Value, SourcePos)], position: SourcePos) -> Result<Value, EvalError> {
++    match arguments {
++        [(value, _)] => Ok(Value::Bool(matches!(value, Value::EmptyList))),
++        _ => Err(EvalError::at(position, "'null?' expects exactly 1 argument")),
++    }
++}
++
++fn eval_length(arguments: &[(Value, SourcePos)], position: SourcePos) -> Result<Value, EvalError> {
++    match arguments {
++        [(value, arg_position)] => Ok(Value::Number(proper_list_len(value, *arg_position)? as i64)),
++        _ => Err(EvalError::at(position, "'length' expects exactly 1 argument")),
++    }
++}
++
++fn eval_predicate(
++    arguments: &[(Value, SourcePos)],
++    position: SourcePos,
++    predicate: fn(&Value) -> bool,
++) -> Result<Value, EvalError> {
++    match arguments {
++        [(value, _)] => Ok(Value::Bool(predicate(value))),
++        _ => Err(EvalError::at(position, "predicate expects exactly 1 argument")),
++    }
++}
++
++fn proper_list_len(value: &Value, position: SourcePos) -> Result<usize, EvalError> {
++    let mut current = value;
++    let mut length = 0;
++
++    loop {
++        match current {
++            Value::EmptyList => return Ok(length),
++            Value::Pair(_, cdr) => {
++                length += 1;
++                current = cdr.as_ref();
++            }
++            _ => return Err(EvalError::at(position, "expected proper list")),
++        }
++    }
++}
++
++impl Value {
++    fn from_list(items: Vec<Value>) -> Self {
++        items.into_iter().rev().fold(Self::EmptyList, |tail, item| {
++            Self::Pair(Box::new(item), Box::new(tail))
++        })
++    }
++}
+diff -ruN ../rust/src/scheme/mod.rs /tmp/cx-scala-qg-r13-shadow/bench/rust/src/scheme/mod.rs
+--- ../rust/src/scheme/mod.rs	2026-03-21 13:59:35.824274980 +0000
++++ /tmp/cx-scala-qg-r13-shadow/bench/rust/src/scheme/mod.rs	2026-03-21 14:49:39.808270428 +0000
+@@ -1,7 +1,15 @@
++mod env;
+ pub mod error;
++mod expr;
++mod interpreter;
++mod reader;
++mod source;
++mod value;
+ 
+ pub use error::EvalError;
+ 
++use interpreter::evaluate_program;
++
+ /// Evaluate one or more Scheme expressions and return the string
+ /// representation of the last result.
+ ///
+@@ -10,14 +18,14 @@
+ /// use ming::scheme::eval_str;
+ /// assert_eq!(eval_str("(+ 1 2)"), Ok("3".into()));
+ /// ```
+-pub fn eval_str(_input: &str) -> Result<String, EvalError> {
+-    todo!()
++pub fn eval_str(input: &str) -> Result<String, EvalError> {
++    evaluate_program(input).map(|value| value.render())
+ }
+ 
+ /// Evaluate Scheme expressions, returning both the result value and
+ /// any output produced by `display`, `write`, or `newline`.
+-pub fn eval_str_with_output(_input: &str) -> Result<(String, String), EvalError> {
+-    todo!()
++pub fn eval_str_with_output(input: &str) -> Result<(String, String), EvalError> {
++    evaluate_program(input).map(|value| (value.render(), String::new()))
+ }
+ 
+ #[cfg(test)]
+diff -ruN ../rust/src/scheme/reader.rs /tmp/cx-scala-qg-r13-shadow/bench/rust/src/scheme/reader.rs
+--- ../rust/src/scheme/reader.rs	1970-01-01 00:00:00.000000000 +0000
++++ /tmp/cx-scala-qg-r13-shadow/bench/rust/src/scheme/reader.rs	2026-03-21 14:49:39.808270428 +0000
+@@ -0,0 +1,226 @@
++use crate::scheme::error::EvalError;
++use crate::scheme::expr::Expr;
++use crate::scheme::source::SourcePos;
++use crate::scheme::value::Value;
++
++#[derive(Debug, Clone)]
++enum Token {
++    LeftParen(SourcePos),
++    RightParen(SourcePos),
++    Quote(SourcePos),
++    Atom(String, SourcePos),
++    Str(String, SourcePos),
++}
++
++#[derive(Clone, Copy)]
++struct Cursor<'a> {
++    input: &'a str,
++    offset: usize,
++    line: usize,
++    column: usize,
++}
++
++impl<'a> Cursor<'a> {
++    fn at_end(self) -> bool {
++        self.offset >= self.input.len()
++    }
++
++    fn position(self) -> SourcePos {
++        SourcePos::new(self.line, self.column)
++    }
++
++    fn current(self) -> char {
++        self.input.as_bytes()[self.offset] as char
++    }
++
++    fn advance(self) -> Self {
++        if self.current() == '\n' {
++            Self {
++                input: self.input,
++                offset: self.offset + 1,
++                line: self.line + 1,
++                column: 1,
++            }
++        } else {
++            Self {
++                input: self.input,
++                offset: self.offset + 1,
++                line: self.line,
++                column: self.column + 1,
++            }
++        }
++    }
++}
++
++pub fn read_all(input: &str) -> Result<Vec<Expr>, EvalError> {
++    let tokens = tokenize(input)?;
++    let (expressions, index) = parse_all(&tokens, 0)?;
++
++    if index != tokens.len() {
++        return Err(EvalError::message("unexpected trailing tokens"));
++    }
++
++    if expressions.is_empty() {
++        return Err(EvalError::message("expected at least one expression"));
++    }
++
++    Ok(expressions)
++}
++
++fn tokenize(input: &str) -> Result<Vec<Token>, EvalError> {
++    let mut tokens = Vec::new();
++    let mut cursor = Cursor {
++        input,
++        offset: 0,
++        line: 1,
++        column: 1,
++    };
++
++    while !cursor.at_end() {
++        match cursor.current() {
++            ch if ch.is_ascii_whitespace() => cursor = cursor.advance(),
++            ';' => cursor = skip_comment(cursor),
++            '(' => {
++                tokens.push(Token::LeftParen(cursor.position()));
++                cursor = cursor.advance();
++            }
++            ')' => {
++                tokens.push(Token::RightParen(cursor.position()));
++                cursor = cursor.advance();
++            }
++            '\'' => {
++                tokens.push(Token::Quote(cursor.position()));
++                cursor = cursor.advance();
++            }
++            '"' => {
++                let start = cursor.position();
++                let (next, body) = read_string(cursor.advance(), start, String::new())?;
++                tokens.push(Token::Str(body, start));
++                cursor = next;
++            }
++            _ => {
++                let start = cursor.position();
++                let (next, atom) = read_atom(cursor, String::new());
++                tokens.push(Token::Atom(atom, start));
++                cursor = next;
++            }
++        }
++    }
++
++    Ok(tokens)
++}
++
++fn skip_comment(mut cursor: Cursor<'_>) -> Cursor<'_> {
++    while !cursor.at_end() && cursor.current() != '\n' {
++        cursor = cursor.advance();
++    }
++
++    cursor
++}
++
++fn read_atom(mut cursor: Cursor<'_>, mut atom: String) -> (Cursor<'_>, String) {
++    while !cursor.at_end() && !is_delimiter(cursor.current()) {
++        atom.push(cursor.current());
++        cursor = cursor.advance();
++    }
++
++    (cursor, atom)
++}
++
++fn read_string(
++    mut cursor: Cursor<'_>,
++    start: SourcePos,
++    mut body: String,
++) -> Result<(Cursor<'_>, String), EvalError> {
++    while !cursor.at_end() {
++        match cursor.current() {
++            '"' => return Ok((cursor.advance(), body)),
++            '\\' => {
++                cursor = cursor.advance();
++                if cursor.at_end() {
++                    return Err(EvalError::at(start, "unterminated string"));
++                }
++                body.push(match cursor.current() {
++                    '"' => '"',
++                    '\\' => '\\',
++                    'n' => '\n',
++                    't' => '\t',
++                    other => other,
++                });
++                cursor = cursor.advance();
++            }
++            ch => {
++                body.push(ch);
++                cursor = cursor.advance();
++            }
++        }
++    }
++
++    Err(EvalError::at(start, "unterminated string"))
++}
++
++fn parse_all(tokens: &[Token], mut index: usize) -> Result<(Vec<Expr>, usize), EvalError> {
++    let mut expressions = Vec::new();
++
++    while index < tokens.len() {
++        let (expr, next) = parse_expr(tokens, index)?;
++        expressions.push(expr);
++        index = next;
++    }
++
++    Ok((expressions, index))
++}
++
++fn parse_expr(tokens: &[Token], index: usize) -> Result<(Expr, usize), EvalError> {
++    let Some(token) = tokens.get(index) else {
++        return Err(EvalError::message("unexpected end of input"));
++    };
++
++    match token {
++        Token::LeftParen(position) => parse_list(tokens, index + 1, *position),
++        Token::RightParen(position) => Err(EvalError::at(*position, "unexpected ')'")),
++        Token::Quote(position) => {
++            let (quoted, next) = parse_expr(tokens, index + 1)?;
++            Ok((
++                Expr::List(vec![Expr::quote_symbol(*position), quoted], *position),
++                next,
++            ))
++        }
++        Token::Str(value, position) => Ok((
++            Expr::Literal(Value::Str(value.clone()), *position),
++            index + 1,
++        )),
++        Token::Atom(value, position) => Ok((parse_atom(value, *position), index + 1)),
++    }
++}
++
++fn parse_list(tokens: &[Token], mut index: usize, start: SourcePos) -> Result<(Expr, usize), EvalError> {
++    let mut items = Vec::new();
++
++    while let Some(token) = tokens.get(index) {
++        if matches!(token, Token::RightParen(_)) {
++            return Ok((Expr::List(items, start), index + 1));
++        }
++
++        let (expr, next) = parse_expr(tokens, index)?;
++        items.push(expr);
++        index = next;
++    }
++
++    Err(EvalError::at(start, "unterminated list"))
++}
++
++fn parse_atom(value: &str, position: SourcePos) -> Expr {
++    match value {
++        "#t" => Expr::Literal(Value::Bool(true), position),
++        "#f" => Expr::Literal(Value::Bool(false), position),
++        _ => match value.parse::<i64>() {
++            Ok(number) => Expr::Literal(Value::Number(number), position),
++            Err(_) => Expr::Symbol(value.to_string(), position),
++        },
++    }
++}
++
++fn is_delimiter(ch: char) -> bool {
++    ch.is_ascii_whitespace() || matches!(ch, '(' | ')' | '\'' | ';')
++}
+diff -ruN ../rust/src/scheme/source.rs /tmp/cx-scala-qg-r13-shadow/bench/rust/src/scheme/source.rs
+--- ../rust/src/scheme/source.rs	1970-01-01 00:00:00.000000000 +0000
++++ /tmp/cx-scala-qg-r13-shadow/bench/rust/src/scheme/source.rs	2026-03-21 14:49:39.808270428 +0000
+@@ -0,0 +1,11 @@
++#[derive(Debug, Clone, Copy, PartialEq, Eq)]
++pub struct SourcePos {
++    pub line: usize,
++    pub column: usize,
++}
++
++impl SourcePos {
++    pub const fn new(line: usize, column: usize) -> Self {
++        Self { line, column }
++    }
++}
+diff -ruN ../rust/src/scheme/value.rs /tmp/cx-scala-qg-r13-shadow/bench/rust/src/scheme/value.rs
+--- ../rust/src/scheme/value.rs	1970-01-01 00:00:00.000000000 +0000
++++ /tmp/cx-scala-qg-r13-shadow/bench/rust/src/scheme/value.rs	2026-03-21 14:49:39.808270428 +0000
+@@ -0,0 +1,128 @@
++use crate::scheme::env::Env;
++use crate::scheme::expr::Expr;
++
++#[derive(Debug, Clone, Copy, PartialEq, Eq)]
++pub enum Builtin {
++    Add,
++    Sub,
++    Mul,
++    Div,
++    LessThan,
++    GreaterThan,
++    Equal,
++    LessEqual,
++    Not,
++    Cons,
++    Car,
++    Cdr,
++    NullPred,
++    List,
++    Length,
++    StringPred,
++    NumberPred,
++    BooleanPred,
++    PairPred,
++    SymbolPred,
++}
++
++impl Builtin {
++    pub fn bind_all(env: &Env) {
++        for (name, builtin) in [
++            ("+", Self::Add),
++            ("-", Self::Sub),
++            ("*", Self::Mul),
++            ("/", Self::Div),
++            ("<", Self::LessThan),
++            (">", Self::GreaterThan),
++            ("=", Self::Equal),
++            ("<=", Self::LessEqual),
++            ("not", Self::Not),
++            ("cons", Self::Cons),
++            ("car", Self::Car),
++            ("cdr", Self::Cdr),
++            ("null?", Self::NullPred),
++            ("list", Self::List),
++            ("length", Self::Length),
++            ("string?", Self::StringPred),
++            ("number?", Self::NumberPred),
++            ("boolean?", Self::BooleanPred),
++            ("pair?", Self::PairPred),
++            ("symbol?", Self::SymbolPred),
++        ] {
++            env.define(name.to_string(), Value::Builtin(builtin));
++        }
++    }
++}
++
++#[derive(Debug, Clone)]
++pub enum Value {
++    Number(i64),
++    Bool(bool),
++    Str(String),
++    Symbol(String),
++    EmptyList,
++    Pair(Box<Value>, Box<Value>),
++    Builtin(Builtin),
++    Closure {
++        parameters: Vec<String>,
++        body: Vec<Expr>,
++        env: Env,
++    },
++    Void,
++}
++
++impl Value {
++    pub fn is_truthy(&self) -> bool {
++        !matches!(self, Self::Bool(false))
++    }
++
++    pub fn render(&self) -> String {
++        match self {
++            Self::Number(value) => value.to_string(),
++            Self::Bool(true) => "#t".to_string(),
++            Self::Bool(false) => "#f".to_string(),
++            Self::Str(value) => format!("\"{}\"", escape_string(value)),
++            Self::Symbol(name) => name.clone(),
++            Self::EmptyList => "()".to_string(),
++            Self::Pair(_, _) => format!("({})", render_pair(self)),
++            Self::Builtin(_) | Self::Closure { .. } => "#<procedure>".to_string(),
++            Self::Void => "#<void>".to_string(),
++        }
++    }
++}
++
++fn render_pair(pair: &Value) -> String {
++    let mut parts = Vec::new();
++    let mut current = pair;
++
++    loop {
++        match current {
++            Value::Pair(car, cdr) => {
++                parts.push(car.render());
++                current = cdr.as_ref();
++            }
++            Value::EmptyList => return parts.join(" "),
++            other => {
++                parts.push(".".to_string());
++                parts.push(other.render());
++                return parts.join(" ");
++            }
++        }
++    }
++}
++
++fn escape_string(value: &str) -> String {
++    let mut escaped = String::new();
++
++    for ch in value.chars() {
++        match ch {
++            '"' => escaped.push_str("\\\""),
++            '\\' => escaped.push_str("\\\\"),
++            '\n' => escaped.push_str("\\n"),
++            '\t' => escaped.push_str("\\t"),
++            other => escaped.push(other),
++        }
++    }
++
++    escaped
++}
