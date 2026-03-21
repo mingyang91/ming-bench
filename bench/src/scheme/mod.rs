@@ -4,7 +4,7 @@ pub use error::EvalError;
 use error::Span;
 
 use std::cell::{Cell, RefCell};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::rc::Rc;
 
 struct ContinuationData {
@@ -19,6 +19,7 @@ thread_local! {
     static CONT_DATA: RefCell<Option<ContinuationData>> = RefCell::new(None);
     static REPLAY_VALUE: RefCell<Option<Value>> = RefCell::new(None);
     static CONT_ID_COUNTER: Cell<u64> = Cell::new(0);
+    static GENSYM_COUNTER: Cell<u64> = Cell::new(0);
 }
 
 fn next_cont_id() -> u64 {
@@ -26,6 +27,14 @@ fn next_cont_id() -> u64 {
         let id = c.get();
         c.set(id + 1);
         id
+    })
+}
+
+fn gensym(base: &str) -> String {
+    GENSYM_COUNTER.with(|c| {
+        let id = c.get();
+        c.set(id + 1);
+        format!("{}__hyg_{}", base, id)
     })
 }
 
@@ -54,6 +63,12 @@ enum Value {
         remaining_forms: Vec<Value>,
         span: Span,
     },
+    Macro {
+        literals: Vec<String>,
+        rules: Vec<(Value, Value)>,
+        def_env: Env,
+        span: Span,
+    },
     Void,
 }
 
@@ -67,7 +82,7 @@ impl Value {
             | Value::Char(_, s)
             | Value::List(_, s)
             | Value::Builtin(_, s) => *s,
-            Value::Lambda { span, .. } | Value::Continuation { span, .. } => *span,
+            Value::Lambda { span, .. } | Value::Continuation { span, .. } | Value::Macro { span, .. } => *span,
             Value::Void => Span::default(),
         }
     }
@@ -84,7 +99,7 @@ impl Value {
                 let inner: Vec<String> = elems.iter().map(|v| v.display_scheme()).collect();
                 format!("({})", inner.join(" "))
             }
-            Value::Lambda { .. } | Value::Builtin(..) | Value::Continuation { .. } => "#<procedure>".to_string(),
+            Value::Lambda { .. } | Value::Builtin(..) | Value::Continuation { .. } | Value::Macro { .. } => "#<procedure>".to_string(),
             Value::Void => "".to_string(),
         }
     }
@@ -421,7 +436,7 @@ fn eval(expr: &Value, env: &Env) -> Result<Value, EvalError> {
                     .ok_or_else(|| EvalError::UnboundVariable(name.clone(), *span));
             }
             Value::Void => return Ok(Value::Void),
-            Value::Lambda { .. } | Value::Builtin(..) | Value::Continuation { .. } => return Ok(current_expr),
+            Value::Lambda { .. } | Value::Builtin(..) | Value::Continuation { .. } | Value::Macro { .. } => return Ok(current_expr),
             Value::List(elems, span) => {
                 let form_span = *span;
                 if elems.is_empty() {
@@ -686,7 +701,54 @@ fn eval(expr: &Value, env: &Env) -> Result<Value, EvalError> {
                             current_env = local_env;
                             continue;
                         }
-                        _ => {}
+                        "define-syntax" => {
+                            if elems.len() != 3 {
+                                return Err(EvalError::Parse("define-syntax: expected name and transformer".into(), form_span));
+                            }
+                            let name = match &elems[1] {
+                                Value::Symbol(s, _) => s.clone(),
+                                _ => return Err(EvalError::Parse("define-syntax: expected symbol".into(), form_span)),
+                            };
+                            let transformer = &elems[2];
+                            let telems = match transformer {
+                                Value::List(te, _) => te,
+                                _ => return Err(EvalError::Parse("define-syntax: expected syntax-rules".into(), form_span)),
+                            };
+                            if telems.is_empty() || !matches!(&telems[0], Value::Symbol(s, _) if s == "syntax-rules") {
+                                return Err(EvalError::Parse("define-syntax: expected syntax-rules".into(), form_span));
+                            }
+                            let literals = match &telems[1] {
+                                Value::List(lits, _) => lits.iter().filter_map(|l| match l {
+                                    Value::Symbol(s, _) => Some(s.clone()),
+                                    _ => None,
+                                }).collect::<Vec<_>>(),
+                                _ => return Err(EvalError::Parse("syntax-rules: expected literal list".into(), form_span)),
+                            };
+                            let rules: Vec<(Value, Value)> = telems[2..].iter().map(|rule| {
+                                match rule {
+                                    Value::List(relems, _) if relems.len() == 2 => Ok((relems[0].clone(), relems[1].clone())),
+                                    _ => Err(EvalError::Parse("syntax-rules: invalid rule".into(), form_span)),
+                                }
+                            }).collect::<Result<_, _>>()?;
+                            let macro_val = Value::Macro {
+                                literals,
+                                rules,
+                                def_env: current_env.clone(),
+                                span: form_span,
+                            };
+                            env_set(&current_env, name, macro_val);
+                            return Ok(Value::Void);
+                        }
+                        _ => {
+                            // Check if this is a macro application
+                            if let Some(macro_val) = env_get(&current_env, op) {
+                                if let Value::Macro { ref literals, ref rules, ref def_env, .. } = macro_val {
+                                    let expanded = expand_macro(&elems, literals, rules, def_env, &current_env, form_span)?;
+                                    current_expr = expanded;
+                                    continue;
+                                }
+                            }
+                        }
                     }
                 }
                 // General function application
@@ -963,6 +1025,213 @@ fn eval_lambda(args: &[Value], env: &Env, form_span: Span) -> Result<Value, Eval
         env: env.clone(),
         span: form_span,
     })
+}
+
+// ---------------------------------------------------------------------------
+// Hygienic Macros (define-syntax / syntax-rules)
+// ---------------------------------------------------------------------------
+
+fn is_special_form(s: &str) -> bool {
+    matches!(s, "define" | "set!" | "quote" | "lambda" | "if" | "begin"
+        | "and" | "or" | "cond" | "let" | "define-syntax" | "syntax-rules"
+        | "string-set!" | "else")
+}
+
+#[derive(Clone)]
+enum PatternBinding {
+    Single(Value),
+    Ellipsis(Vec<Value>),
+}
+
+fn collect_pattern_vars(pattern: &Value, literals: &[String], vars: &mut HashSet<String>) {
+    match pattern {
+        Value::Symbol(s, _) if s != "..." && s != "_" && !literals.contains(s) => {
+            vars.insert(s.clone());
+        }
+        Value::List(elems, _) => {
+            for e in elems {
+                collect_pattern_vars(e, literals, vars);
+            }
+        }
+        _ => {}
+    }
+}
+
+fn match_pattern_elems(
+    pat: &[Value], input: &[Value], literals: &[String],
+) -> Option<HashMap<String, PatternBinding>> {
+    let mut bindings = HashMap::new();
+
+    // Check for trailing ellipsis: ... as the last element
+    let has_ellipsis = pat.len() >= 2
+        && matches!(&pat[pat.len() - 1], Value::Symbol(s, _) if s == "...");
+
+    if has_ellipsis {
+        let fixed = &pat[..pat.len() - 2];
+        let var_pat = &pat[pat.len() - 2];
+        if input.len() < fixed.len() {
+            return None;
+        }
+        for (p, inp) in fixed.iter().zip(input.iter()) {
+            match_single(p, inp, literals, &mut bindings)?;
+        }
+        let var_name = match var_pat {
+            Value::Symbol(s, _) => s.clone(),
+            _ => return None,
+        };
+        bindings.insert(var_name, PatternBinding::Ellipsis(input[fixed.len()..].to_vec()));
+    } else {
+        if pat.len() != input.len() {
+            return None;
+        }
+        for (p, inp) in pat.iter().zip(input.iter()) {
+            match_single(p, inp, literals, &mut bindings)?;
+        }
+    }
+    Some(bindings)
+}
+
+fn match_single(
+    pat: &Value, input: &Value, literals: &[String],
+    bindings: &mut HashMap<String, PatternBinding>,
+) -> Option<()> {
+    match pat {
+        Value::Symbol(s, _) if literals.contains(s) => {
+            match input {
+                Value::Symbol(is, _) if is == s => Some(()),
+                _ => None,
+            }
+        }
+        Value::Symbol(s, _) if s == "_" => Some(()),
+        Value::Symbol(s, _) => {
+            bindings.insert(s.clone(), PatternBinding::Single(input.clone()));
+            Some(())
+        }
+        _ => None,
+    }
+}
+
+fn collect_template_free_vars(
+    template: &Value, pattern_vars: &HashSet<String>, free_vars: &mut HashSet<String>,
+) {
+    match template {
+        Value::Symbol(s, _) if s != "..." && !pattern_vars.contains(s) && !is_special_form(s) => {
+            free_vars.insert(s.clone());
+        }
+        Value::List(elems, _) => {
+            for e in elems {
+                collect_template_free_vars(e, pattern_vars, free_vars);
+            }
+        }
+        _ => {}
+    }
+}
+
+fn find_ellipsis_var(tmpl: &Value, bindings: &HashMap<String, PatternBinding>) -> Option<String> {
+    match tmpl {
+        Value::Symbol(s, _) => {
+            if matches!(bindings.get(s.as_str()), Some(PatternBinding::Ellipsis(_))) {
+                Some(s.clone())
+            } else {
+                None
+            }
+        }
+        Value::List(elems, _) => {
+            for e in elems {
+                if let Some(v) = find_ellipsis_var(e, bindings) {
+                    return Some(v);
+                }
+            }
+            None
+        }
+        _ => None,
+    }
+}
+
+fn expand_template(
+    template: &Value,
+    bindings: &HashMap<String, PatternBinding>,
+    gensyms: &HashMap<String, String>,
+) -> Value {
+    match template {
+        Value::Symbol(s, span) => {
+            if let Some(PatternBinding::Single(val)) = bindings.get(s.as_str()) {
+                val.clone()
+            } else if let Some(gs) = gensyms.get(s.as_str()) {
+                Value::Symbol(gs.clone(), *span)
+            } else {
+                template.clone()
+            }
+        }
+        Value::List(elems, span) => {
+            let mut result = Vec::new();
+            let mut i = 0;
+            while i < elems.len() {
+                if i + 1 < elems.len()
+                    && matches!(&elems[i + 1], Value::Symbol(s, _) if s == "...")
+                {
+                    let tmpl_elem = &elems[i];
+                    if let Some(var_name) = find_ellipsis_var(tmpl_elem, bindings) {
+                        if let Some(PatternBinding::Ellipsis(vals)) = bindings.get(&var_name) {
+                            for val in vals {
+                                let mut sub = bindings.clone();
+                                sub.insert(var_name.clone(), PatternBinding::Single(val.clone()));
+                                result.push(expand_template(tmpl_elem, &sub, gensyms));
+                            }
+                        }
+                    }
+                    i += 2;
+                } else {
+                    result.push(expand_template(&elems[i], bindings, gensyms));
+                    i += 1;
+                }
+            }
+            Value::List(result, *span)
+        }
+        _ => template.clone(),
+    }
+}
+
+fn expand_macro(
+    input: &[Value],
+    literals: &[String],
+    rules: &[(Value, Value)],
+    def_env: &Env,
+    call_env: &Env,
+    span: Span,
+) -> Result<Value, EvalError> {
+    for (pattern, template) in rules {
+        let pat_elems = match pattern {
+            Value::List(elems, _) => elems,
+            _ => continue,
+        };
+        // Skip first element (macro name) in both pattern and input
+        if let Some(bindings) = match_pattern_elems(&pat_elems[1..], &input[1..], literals) {
+            let mut pattern_vars = HashSet::new();
+            for e in &pat_elems[1..] {
+                collect_pattern_vars(e, literals, &mut pattern_vars);
+            }
+            let mut free_vars = HashSet::new();
+            collect_template_free_vars(template, &pattern_vars, &mut free_vars);
+
+            let mut gensym_map = HashMap::new();
+            for fv in &free_vars {
+                gensym_map.insert(fv.clone(), gensym(fv));
+            }
+
+            let expanded = expand_template(template, &bindings, &gensym_map);
+
+            // Bind gensyms to definition-site values
+            for (original, gs) in &gensym_map {
+                if let Some(val) = env_get(def_env, original) {
+                    env_set(call_env, gs.clone(), val);
+                }
+            }
+
+            return Ok(expanded);
+        }
+    }
+    Err(EvalError::Parse("no matching pattern for macro".into(), span))
 }
 
 fn eval_builtin(
@@ -1679,6 +1948,7 @@ pub fn eval_str(input: &str) -> Result<String, EvalError> {
     REPLAY_VALUE.with(|rv| *rv.borrow_mut() = None);
     REMAINING_FORMS.with(|rf| rf.borrow_mut().clear());
     CONT_ID_COUNTER.with(|c| c.set(0));
+    GENSYM_COUNTER.with(|c| c.set(0));
 
     let exprs = parse_all(input)?;
     let env = default_env();
@@ -1695,6 +1965,7 @@ pub fn eval_str_with_output(input: &str) -> Result<(String, String), EvalError> 
     REPLAY_VALUE.with(|rv| *rv.borrow_mut() = None);
     REMAINING_FORMS.with(|rf| rf.borrow_mut().clear());
     CONT_ID_COUNTER.with(|c| c.set(0));
+    GENSYM_COUNTER.with(|c| c.set(0));
 
     let exprs = parse_all(input)?;
     let env = default_env();
