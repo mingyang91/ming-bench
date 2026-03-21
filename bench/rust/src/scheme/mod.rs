@@ -1319,6 +1319,116 @@ fn eval_tco(expr: &Expr, env: &Env, out: &mut String) -> Result<Value, EvalError
                                 }
                             }
                         }
+                        "let-values" => {
+                            // (let-values (((a b) expr) ...) body ...)
+                            let args = &items[1..];
+                            if args.len() < 2 {
+                                break 'tco Err(EvalError::Arity(format!(
+                                    "let-values requires bindings and body at {}",
+                                    pos.fmt()
+                                )));
+                            }
+                            let clauses = match &args[0].kind {
+                                ExprKind::List(cs) => cs,
+                                _ => break 'tco Err(EvalError::Type(format!(
+                                    "let-values: bindings must be a list at {}",
+                                    pos.fmt()
+                                ))),
+                            };
+                            let new_env = Env::with_parent(&cur_env);
+                            for clause in clauses {
+                                let parts = match &clause.kind {
+                                    ExprKind::List(p) if p.len() == 2 => p,
+                                    _ => break 'tco Err(EvalError::Type(format!(
+                                        "let-values: invalid clause at {}",
+                                        clause.pos.fmt()
+                                    ))),
+                                };
+                                let formals = match &parts[0].kind {
+                                    ExprKind::List(fs) => fs,
+                                    _ => break 'tco Err(EvalError::Type(format!(
+                                        "let-values: formals must be a list at {}",
+                                        parts[0].pos.fmt()
+                                    ))),
+                                };
+                                let val = eval(&parts[1], &cur_env, out)?;
+                                let vals = match val {
+                                    Value::Values(vs) => vs,
+                                    single => vec![single],
+                                };
+                                if vals.len() != formals.len() {
+                                    break 'tco Err(EvalError::Arity(format!(
+                                        "let-values: expected {} values, got {} at {}",
+                                        formals.len(), vals.len(), clause.pos.fmt()
+                                    )));
+                                }
+                                for (f, v) in formals.iter().zip(vals.into_iter()) {
+                                    let name = match &f.kind {
+                                        ExprKind::Symbol(s) => s.clone(),
+                                        _ => break 'tco Err(EvalError::Type(format!(
+                                            "let-values: formal must be a symbol at {}",
+                                            f.pos.fmt()
+                                        ))),
+                                    };
+                                    new_env.set(name, v);
+                                }
+                            }
+                            let body = &args[1..];
+                            for e in &body[..body.len() - 1] {
+                                eval(e, &new_env, out)?;
+                            }
+                            cur_expr = body.last().unwrap().clone();
+                            cur_env = new_env;
+                            continue 'tco;
+                        }
+                        "receive" => {
+                            // (receive formals expr body ...)
+                            let args = &items[1..];
+                            if args.len() < 3 {
+                                break 'tco Err(EvalError::Arity(format!(
+                                    "receive requires formals, expression, and body at {}",
+                                    pos.fmt()
+                                )));
+                            }
+                            // Parse formals using parse_params (handles dotted notation)
+                            let (param_names, rest_param) = match &args[0].kind {
+                                ExprKind::List(fs) => parse_params(fs, pos)?,
+                                ExprKind::Symbol(s) => (vec![], Some(s.clone())),
+                                _ => break 'tco Err(EvalError::Type(format!(
+                                    "receive: invalid formals at {}",
+                                    args[0].pos.fmt()
+                                ))),
+                            };
+                            let val = eval(&args[1], &cur_env, out)?;
+                            let vals = match val {
+                                Value::Values(vs) => vs,
+                                single => vec![single],
+                            };
+                            if vals.len() < param_names.len() {
+                                break 'tco Err(EvalError::Arity(format!(
+                                    "receive: expected at least {} values, got {} at {}",
+                                    param_names.len(), vals.len(), pos.fmt()
+                                )));
+                            }
+                            let new_env = Env::with_parent(&cur_env);
+                            for (i, name) in param_names.iter().enumerate() {
+                                new_env.set(name.clone(), vals[i].clone());
+                            }
+                            if let Some(ref rp) = rest_param {
+                                let rest_vals = &vals[param_names.len()..];
+                                let rest_list = rest_vals.iter().rev().fold(Value::Nil, |acc, v| {
+                                    Value::Pair(Rc::new(RefCell::new((v.clone(), acc))))
+                                });
+                                new_env.set(rp.clone(), rest_list);
+                            }
+                            let body = &args[2..];
+                            for e in &body[..body.len() - 1] {
+                                eval(e, &new_env, out)?;
+                            }
+                            cur_expr = body.last().unwrap().clone();
+                            cur_env = new_env;
+                            continue 'tco;
+                        }
                         "case" => {
                             if items.len() < 2 {
                                 break 'tco Err(EvalError::Arity(format!(
@@ -3903,6 +4013,7 @@ fn is_keyword(name: &str) -> bool {
             | "raise" | "guard" | "with-exception-handler"
             | "define-record-type" | "syntax-case" | "syntax"
             | "with-syntax" | "case-lambda" | "do"
+            | "let-values" | "receive"
     ) || Value::is_builtin_name(name)
 }
 
