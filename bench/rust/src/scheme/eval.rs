@@ -307,6 +307,8 @@ fn eval_special_form(
             .map(Bounce::Done)
             .map(Some),
         "do" => eval_do(args, span, env).map(Some),
+        "let-values" => eval_let_values(args, span, env).map(Some),
+        "receive" => eval_receive(args, span, env).map(Some),
         _ => Ok(None),
     }
 }
@@ -471,6 +473,86 @@ fn parse_do_binding(binding: &Expr, span: Span) -> Result<(String, Option<Expr>)
         _ => Err(EvalError::Parse("do binding must be (var init) or (var init step)".into())
             .at(span)),
     }
+}
+
+/// Destructure a `Value` (possibly `Value::Values`) into a formals list,
+/// binding into `target_env`. `formals` are plain param names; `rest` is
+/// an optional rest-parameter name.
+fn bind_values(
+    formals: &[String],
+    rest: &Option<String>,
+    val: Value,
+    target_env: &Env,
+    span: Span,
+) -> Result<(), EvalError> {
+    let vals: Vec<Value> = match val {
+        Value::Values(vs) => vs,
+        single => vec![single],
+    };
+    let n_formals = formals.len();
+    if rest.is_some() {
+        if vals.len() < n_formals {
+            return Err(EvalError::WrongArgCount {
+                expected: n_formals,
+                got: vals.len(),
+            }
+            .at(span));
+        }
+    } else if vals.len() != n_formals {
+        return Err(EvalError::WrongArgCount {
+            expected: n_formals,
+            got: vals.len(),
+        }
+        .at(span));
+    }
+    for (name, v) in formals.iter().zip(vals.iter()) {
+        target_env.define(name.clone(), v.clone());
+    }
+    if let Some(rest_name) = rest {
+        let rest_vals = vals[n_formals..].to_vec();
+        target_env.define(rest_name.clone(), Value::make_list(rest_vals));
+    }
+    Ok(())
+}
+
+/// `(let-values (((a b) producer) ...) body ...)`
+fn eval_let_values(args: &[Expr], span: Span, env: &Env) -> Result<Bounce, EvalError> {
+    let [Expr::List(ref clauses, _), ref body @ ..] = args else {
+        return Err(EvalError::Parse("invalid let-values form".into()).at(span));
+    };
+    if body.is_empty() {
+        return Err(EvalError::Parse("let-values requires a body".into()).at(span));
+    }
+    let lv_env = Env::extend(env);
+    for clause in clauses {
+        let Expr::List(ref parts, _) = clause else {
+            return Err(EvalError::Parse("let-values clause must be a list".into()).at(span));
+        };
+        let [Expr::List(ref formals_expr, _), ref producer] = parts.as_slice() else {
+            return Err(
+                EvalError::Parse("let-values clause must be (formals producer)".into()).at(span),
+            );
+        };
+        let (formals, rest) = parse_params(formals_expr, span)?;
+        let val = eval(producer, env)?;
+        bind_values(&formals, &rest, val, &lv_env, span)?;
+    }
+    eval_body_tco(body, lv_env)
+}
+
+/// `(receive formals producer body ...)`
+fn eval_receive(args: &[Expr], span: Span, env: &Env) -> Result<Bounce, EvalError> {
+    let [Expr::List(ref formals_expr, _), ref producer, ref body @ ..] = args else {
+        return Err(EvalError::Parse("invalid receive form".into()).at(span));
+    };
+    if body.is_empty() {
+        return Err(EvalError::Parse("receive requires a body".into()).at(span));
+    }
+    let (formals, rest) = parse_params(formals_expr, span)?;
+    let val = eval(producer, env)?;
+    let recv_env = Env::extend(env);
+    bind_values(&formals, &rest, val, &recv_env, span)?;
+    eval_body_tco(body, recv_env)
 }
 
 fn eval_begin(args: &[Expr], env: &Env) -> Result<Bounce, EvalError> {
