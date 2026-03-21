@@ -127,12 +127,21 @@ pub struct EvalContext {
     record_type_counter: Cell<u64>,
     /// Stack of syntax-case pattern bindings for `syntax` template expansion.
     syntax_frames: RefCell<Vec<SyntaxFrame>>,
+    /// Stack of guard handlers for trampoline-based exception catching (TCO in guard bodies).
+    guard_handlers: RefCell<Vec<GuardHandler>>,
 }
 
 /// A frame of syntax-case bindings for template expansion.
 pub struct SyntaxFrame {
     pub bindings: HashMap<String, Binding>,
     pub macro_name: String,
+}
+
+/// Saved guard handler for trampoline-based exception catching.
+struct GuardHandler {
+    var: String,
+    clauses: Vec<Value>,
+    env: Rc<RefCell<Env>>,
 }
 
 pub struct ContReturnData {
@@ -154,6 +163,7 @@ impl EvalContext {
             wind_depth: Cell::new(0),
             record_type_counter: Cell::new(0),
             syntax_frames: RefCell::new(Vec::new()),
+            guard_handlers: RefCell::new(Vec::new()),
         }
     }
 
@@ -176,6 +186,52 @@ enum Bounce {
     TailCall { expr: Value, env: Rc<RefCell<Env>> },
 }
 
+/// Outcome of evaluating a list expression with guard handler recovery.
+enum ListOutcome {
+    Done(Result<Value, EvalError>),
+    TailCall { expr: Value, env: Rc<RefCell<Env>> },
+}
+
+/// Evaluate a list form, attempting guard handler recovery on raised exceptions.
+fn eval_list_with_guards(
+    elems: &[Value],
+    env: &Rc<RefCell<Env>>,
+    guard_mark: usize,
+    span: Span,
+    ctx: &EvalContext,
+) -> ListOutcome {
+    match eval_list_tco(elems, env, span, ctx) {
+        Ok(Bounce::Done(v)) => ListOutcome::Done(Ok(v)),
+        Ok(Bounce::TailCall { expr, env }) => ListOutcome::TailCall { expr, env },
+        Err(err) => try_guard_recovery(err, guard_mark, span, ctx),
+    }
+}
+
+/// Attempt to recover from an exception using guard handlers.
+fn try_guard_recovery(
+    mut err: EvalError,
+    guard_mark: usize,
+    span: Span,
+    ctx: &EvalContext,
+) -> ListOutcome {
+    while let EvalError::RaisedException(exn) = err {
+        if ctx.guard_handlers.borrow().len() <= guard_mark {
+            return ListOutcome::Done(Err(EvalError::RaisedException(exn)));
+        }
+        let handler = ctx.guard_handlers.borrow_mut().pop()
+            .expect("length checked above");
+        match eval_guard_clauses(
+            &handler.var, &handler.clauses, &handler.env,
+            exn, span, ctx,
+        ) {
+            Ok(Bounce::Done(v)) => return ListOutcome::Done(Ok(v)),
+            Ok(Bounce::TailCall { expr, env }) => return ListOutcome::TailCall { expr, env },
+            Err(e) => { err = e; }
+        }
+    }
+    ListOutcome::Done(Err(err))
+}
+
 /// Evaluate a single expression in the given environment (trampoline loop).
 pub fn eval(
     expr: &Value,
@@ -183,17 +239,18 @@ pub fn eval(
     span: Span,
     ctx: &EvalContext,
 ) -> Result<Value, EvalError> {
+    let guard_mark = ctx.guard_handlers.borrow().len();
     let mut cur_expr = expr.clone();
     let mut cur_env = Rc::clone(env);
 
-    loop {
+    let result = loop {
         match &cur_expr {
             Value::Integer(_) | Value::Rational(..) | Value::Float(_)
             | Value::Boolean(_) | Value::String(_) | Value::Char(_) => {
-                return Ok(cur_expr);
+                break Ok(cur_expr);
             }
             Value::Symbol(name) => {
-                return match cur_env.borrow().get(name) {
+                break match cur_env.borrow().get(name) {
                     Some(val) => Ok(val),
                     None if is_builtin(name) => Ok(Value::Symbol(name.clone())),
                     None => Err(EvalError::UnboundVariable {
@@ -202,20 +259,27 @@ pub fn eval(
                     }),
                 };
             }
-            Value::List(elems) => match eval_list_tco(&elems.clone(), &cur_env, span, ctx)? {
-                Bounce::Done(v) => return Ok(v),
-                Bounce::TailCall { expr, env } => { cur_expr = expr; cur_env = env; }
-            },
+            Value::List(elems) => match eval_list_with_guards(&elems.clone(), &cur_env, guard_mark, span, ctx) {
+                ListOutcome::Done(result) => break result,
+                ListOutcome::TailCall { expr, env } => {
+                    cur_expr = expr;
+                    cur_env = env;
+                }
+            }
             Value::Lambda { .. } | Value::Continuation(_) | Value::Macro { .. }
             | Value::SyntaxCaseMacro { .. }
             | Value::Vector(_) | Value::Pair(..) | Value::Values(_)
             | Value::Record { .. } | Value::RecordConstructor { .. }
             | Value::RecordPredicate { .. } | Value::RecordAccessor { .. } => {
-                return Ok(cur_expr);
+                break Ok(cur_expr);
             }
-            Value::Void => return Ok(Value::Void),
+            Value::Void => break Ok(Value::Void),
         }
-    }
+    };
+
+    // Clean up any guard handlers pushed during this eval invocation
+    ctx.guard_handlers.borrow_mut().truncate(guard_mark);
+    result
 }
 
 /// Try to expand a macro bound to the head symbol of a list form.
@@ -457,25 +521,24 @@ fn apply_continuation(
     span: Span,
     ctx: &EvalContext,
 ) -> Result<Bounce, EvalError> {
-    let [value] = args else {
-        return Err(EvalError::WrongArgCount {
-            expected: 1,
-            got: args.len(),
-            span,
-        });
+    // Continuations accept 0 or more values (R7RS multi-value support)
+    let value = match args {
+        [] => Value::Void,
+        [single] => single.clone(),
+        multiple => Value::Values(multiple.to_vec()),
     };
     let Some(body_cont) = &data.body_continuation else {
         *ctx.cont_return_data.borrow_mut() = Some(ContReturnData {
             cont_id: data.id,
             expr_idx: data.expr_idx,
-            value: value.clone(),
+            value,
         });
         return Err(EvalError::ContinuationReturn);
     };
     let body = &body_cont.remaining;
     let env = &body_cont.env;
     let [init @ .., last_expr] = body.as_slice() else {
-        return Ok(Bounce::Done(value.clone()));
+        return Ok(Bounce::Done(value));
     };
     for expr in init {
         eval(expr, env, span, ctx)?;
@@ -591,19 +654,38 @@ fn eval_guard_tco(
         });
     };
 
-    // Evaluate body; if no exception, return the result
-    let body_result = eval_body(body, env, span, ctx);
-    let exn = match body_result {
-        Ok(val) => return Ok(Bounce::Done(val)),
+    // Evaluate body; if no exception, return the result.
+    // For TailCall, push a guard handler so the trampoline can catch exceptions (enables TCO).
+    let exn = match eval_body_tco(body, env, span, ctx) {
+        Ok(Bounce::Done(val)) => return Ok(Bounce::Done(val)),
+        Ok(Bounce::TailCall { expr, env: tc_env }) => {
+            ctx.guard_handlers.borrow_mut().push(GuardHandler {
+                var: var.clone(),
+                clauses: clauses.to_vec(),
+                env: Rc::clone(env),
+            });
+            return Ok(Bounce::TailCall { expr, env: tc_env });
+        }
         Err(EvalError::RaisedException(exn)) => exn,
         Err(e) => return Err(e),
     };
 
-    // Bind the exception value to var
-    let guard_env = Env::with_parent(env);
-    guard_env.borrow_mut().define(var.clone(), exn.clone());
+    eval_guard_clauses(var, clauses, env, exn, span, ctx)
+}
 
-    // Test clauses like cond
+/// Evaluate guard clauses against a caught exception. Shared by eval_guard_tco (synchronous)
+/// and the trampoline (deferred guard handlers for TCO).
+fn eval_guard_clauses(
+    var: &str,
+    clauses: &[Value],
+    env: &Rc<RefCell<Env>>,
+    exn: Value,
+    span: Span,
+    ctx: &EvalContext,
+) -> Result<Bounce, EvalError> {
+    let guard_env = Env::with_parent(env);
+    guard_env.borrow_mut().define(var.to_string(), exn.clone());
+
     for clause in clauses {
         let Value::List(parts) = clause else {
             return Err(EvalError::TypeError {
@@ -617,7 +699,6 @@ fn eval_guard_tco(
                 span,
             });
         };
-        // else clause
         if matches!(test, Value::Symbol(s) if s == "else") {
             return eval_body_tco(body_exprs, &guard_env, span, ctx);
         }
@@ -631,21 +712,7 @@ fn eval_guard_tco(
         return eval_body_tco(body_exprs, &guard_env, span, ctx);
     }
 
-    // No clause matched — re-raise
     Err(EvalError::RaisedException(exn))
-}
-
-/// Evaluate a body (sequence), returning the last value (non-TCO version).
-fn eval_body(
-    body: &[Value],
-    env: &Rc<RefCell<Env>>,
-    span: Span,
-    ctx: &EvalContext,
-) -> Result<Value, EvalError> {
-    match eval_body_tco(body, env, span, ctx)? {
-        Bounce::Done(v) => Ok(v),
-        Bounce::TailCall { expr, env } => eval(&expr, &env, span, ctx),
-    }
 }
 
 /// Apply a lambda procedure to arguments, binding params and returning a TCO bounce.
