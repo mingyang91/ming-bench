@@ -448,6 +448,76 @@ pub fn apply_integer_to_char(args: &[Value]) -> Result<Value, EvalError> {
     Ok(Value::Char(ch))
 }
 
+fn extract_char(val: &Value) -> Result<char, EvalError> {
+    match val {
+        Value::Char(c) => Ok(*c),
+        _ => Err(EvalError::TypeError {
+            expected: "char".to_string(),
+            got: format!("{val}"),
+        }),
+    }
+}
+
+pub fn apply_char_eq(args: &[Value]) -> Result<Value, EvalError> {
+    let [a, b] = args else {
+        return Err(EvalError::WrongArgCount {
+            expected: 2,
+            got: args.len(),
+        });
+    };
+    Ok(Value::Boolean(extract_char(a)? == extract_char(b)?))
+}
+
+pub fn apply_char_lt(args: &[Value]) -> Result<Value, EvalError> {
+    let [a, b] = args else {
+        return Err(EvalError::WrongArgCount {
+            expected: 2,
+            got: args.len(),
+        });
+    };
+    Ok(Value::Boolean(extract_char(a)? < extract_char(b)?))
+}
+
+pub fn apply_char_alphabetic(args: &[Value]) -> Result<Value, EvalError> {
+    let [val] = args else {
+        return Err(EvalError::WrongArgCount {
+            expected: 1,
+            got: args.len(),
+        });
+    };
+    Ok(Value::Boolean(extract_char(val)?.is_alphabetic()))
+}
+
+pub fn apply_char_numeric(args: &[Value]) -> Result<Value, EvalError> {
+    let [val] = args else {
+        return Err(EvalError::WrongArgCount {
+            expected: 1,
+            got: args.len(),
+        });
+    };
+    Ok(Value::Boolean(extract_char(val)?.is_ascii_digit()))
+}
+
+pub fn apply_char_upcase(args: &[Value]) -> Result<Value, EvalError> {
+    let [val] = args else {
+        return Err(EvalError::WrongArgCount {
+            expected: 1,
+            got: args.len(),
+        });
+    };
+    Ok(Value::Char(extract_char(val)?.to_ascii_uppercase()))
+}
+
+pub fn apply_char_downcase(args: &[Value]) -> Result<Value, EvalError> {
+    let [val] = args else {
+        return Err(EvalError::WrongArgCount {
+            expected: 1,
+            got: args.len(),
+        });
+    };
+    Ok(Value::Char(extract_char(val)?.to_ascii_lowercase()))
+}
+
 pub fn apply_abs(args: &[Value]) -> Result<Value, EvalError> {
     let [val] = args else {
         return Err(EvalError::WrongArgCount {

@@ -107,6 +107,12 @@ fn is_builtin(name: &str) -> bool {
             | "pair?"
             | "symbol?"
             | "char?"
+            | "char=?"
+            | "char<?"
+            | "char-alphabetic?"
+            | "char-numeric?"
+            | "char-upcase"
+            | "char-downcase"
             | "string-length"
             | "string-ref"
             | "string-append"
@@ -602,6 +608,12 @@ fn apply_builtin(op: &str, args: &[Value]) -> Result<Value, EvalError> {
         "list->string" => builtins::apply_list_to_string(args),
         "char->integer" => builtins::apply_char_to_integer(args),
         "integer->char" => builtins::apply_integer_to_char(args),
+        "char=?" => builtins::apply_char_eq(args),
+        "char<?" => builtins::apply_char_lt(args),
+        "char-alphabetic?" => builtins::apply_char_alphabetic(args),
+        "char-numeric?" => builtins::apply_char_numeric(args),
+        "char-upcase" => builtins::apply_char_upcase(args),
+        "char-downcase" => builtins::apply_char_downcase(args),
         "vector" => builtins::apply_vector(args),
         "make-vector" => builtins::apply_make_vector(args),
         "vector-ref" => builtins::apply_vector_ref(args),
