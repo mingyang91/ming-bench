@@ -40,12 +40,14 @@ enum Builtin {
     GreaterThan,
     Equal,
     LessEqual,
+    GreaterEqual,
     Not,
     Cons,
     Car,
     Cdr,
     IsNull,
     List,
+    Map,
     Length,
     IsString,
     IsNumber,
@@ -62,10 +64,14 @@ enum Builtin {
     NumberToString,
     SymbolToString,
     StringToSymbol,
+    StringToList,
+    ListToString,
     StringRef,
     StringCopy,
     StringSet,
     IsChar,
+    CharToInteger,
+    IntegerToChar,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -112,15 +118,6 @@ impl SchemeString {
 
     fn char_at(&self, index: usize) -> Option<char> {
         self.0.borrow().get(index).copied()
-    }
-
-    fn set_char(&self, index: usize, value: char) -> bool {
-        let mut chars = self.0.borrow_mut();
-        let Some(slot) = chars.get_mut(index) else {
-            return false;
-        };
-        *slot = value;
-        true
     }
 }
 
@@ -174,7 +171,7 @@ impl Value {
                     RenderMode::Write => render_string(&rendered),
                     RenderMode::Display => rendered,
                 }
-            },
+            }
             Self::Symbol(value) => value.clone(),
             Self::Char(value) => render_char(*value, mode),
             Self::List(items) => render_list(items, mode),
@@ -403,7 +400,10 @@ fn syntax_error(pos: SourcePos, message: impl Into<String>) -> EvalError {
 
 fn parse_char_literal(token: &str, pos: SourcePos) -> Result<char, EvalError> {
     let Some(literal) = token.strip_prefix("#\\") else {
-        return Err(syntax_error(pos, format!("invalid character literal: {token}")));
+        return Err(syntax_error(
+            pos,
+            format!("invalid character literal: {token}"),
+        ));
     };
 
     match literal {
@@ -416,7 +416,10 @@ fn parse_char_literal(token: &str, pos: SourcePos) -> Result<char, EvalError> {
             };
 
             if chars.next().is_some() {
-                return Err(syntax_error(pos, format!("invalid character literal: {token}")));
+                return Err(syntax_error(
+                    pos,
+                    format!("invalid character literal: {token}"),
+                ));
             }
 
             Ok(value)
@@ -478,6 +481,14 @@ fn not_callable(pos: SourcePos, found: &'static str) -> EvalError {
     EvalError::NotCallable { pos, found }
 }
 
+fn immutable_string(pos: SourcePos) -> EvalError {
+    EvalError::ImmutableString { pos }
+}
+
+fn invalid_character_code(pos: SourcePos, value: i64) -> EvalError {
+    EvalError::InvalidCharacterCode { pos, value }
+}
+
 fn expr_pos_or(parts: &[Expr], default: SourcePos) -> SourcePos {
     parts.first().map(Expr::pos).unwrap_or(default)
 }
@@ -528,12 +539,14 @@ fn default_env() -> EnvRef {
         (">", Builtin::GreaterThan),
         ("=", Builtin::Equal),
         ("<=", Builtin::LessEqual),
+        (">=", Builtin::GreaterEqual),
         ("not", Builtin::Not),
         ("cons", Builtin::Cons),
         ("car", Builtin::Car),
         ("cdr", Builtin::Cdr),
         ("null?", Builtin::IsNull),
         ("list", Builtin::List),
+        ("map", Builtin::Map),
         ("length", Builtin::Length),
         ("string?", Builtin::IsString),
         ("number?", Builtin::IsNumber),
@@ -550,10 +563,14 @@ fn default_env() -> EnvRef {
         ("number->string", Builtin::NumberToString),
         ("symbol->string", Builtin::SymbolToString),
         ("string->symbol", Builtin::StringToSymbol),
+        ("string->list", Builtin::StringToList),
+        ("list->string", Builtin::ListToString),
         ("string-ref", Builtin::StringRef),
         ("string-copy", Builtin::StringCopy),
         ("string-set!", Builtin::StringSet),
         ("char?", Builtin::IsChar),
+        ("char->integer", Builtin::CharToInteger),
+        ("integer->char", Builtin::IntegerToChar),
     ] {
         env.define(name, Value::Builtin(builtin));
     }
@@ -824,12 +841,14 @@ fn apply_builtin(
         Builtin::GreaterThan => eval_compare(args, ">", pos, |left, right| left > right),
         Builtin::Equal => eval_compare(args, "=", pos, |left, right| left == right),
         Builtin::LessEqual => eval_compare(args, "<=", pos, |left, right| left <= right),
+        Builtin::GreaterEqual => eval_compare(args, ">=", pos, |left, right| left >= right),
         Builtin::Not => eval_not(args, pos),
         Builtin::Cons => eval_cons(args, pos),
         Builtin::Car => eval_car(args, pos),
         Builtin::Cdr => eval_cdr(args, pos),
         Builtin::IsNull => eval_null(args, pos),
         Builtin::List => eval_list_builtin(args, pos),
+        Builtin::Map => eval_map(args, pos, output),
         Builtin::Length => eval_length(args, pos),
         Builtin::IsString => eval_type_predicate(args, "string?", pos, |value| {
             matches!(value, Value::String(_))
@@ -859,12 +878,16 @@ fn apply_builtin(
         Builtin::NumberToString => eval_number_to_string(args, pos),
         Builtin::SymbolToString => eval_symbol_to_string(args, pos),
         Builtin::StringToSymbol => eval_string_to_symbol(args, pos),
+        Builtin::StringToList => eval_string_to_list(args, pos),
+        Builtin::ListToString => eval_list_to_string(args, pos),
         Builtin::StringRef => eval_string_ref(args, pos),
         Builtin::StringCopy => eval_string_copy(args, pos),
         Builtin::StringSet => eval_string_set(args, pos),
         Builtin::IsChar => {
             eval_type_predicate(args, "char?", pos, |value| matches!(value, Value::Char(_)))
         }
+        Builtin::CharToInteger => eval_char_to_integer(args, pos),
+        Builtin::IntegerToChar => eval_integer_to_char(args, pos),
     }
 }
 
@@ -1024,6 +1047,32 @@ fn eval_list_builtin(args: &[Value], _pos: SourcePos) -> Result<Value, EvalError
     Ok(Value::List(args.to_vec()))
 }
 
+fn eval_map(
+    args: &[Value],
+    pos: SourcePos,
+    output: &Rc<RefCell<String>>,
+) -> Result<Value, EvalError> {
+    let [procedure, list] = args else {
+        return Err(wrong_arity(pos, "map", "exactly 2", args.len()));
+    };
+
+    let Value::List(items) = list else {
+        return Err(type_error(pos, "list", list.type_name()));
+    };
+
+    let mut mapped = Vec::with_capacity(items.len());
+    for item in items {
+        mapped.push(apply_value(
+            procedure.clone(),
+            &[item.clone()],
+            pos,
+            output,
+        )?);
+    }
+
+    Ok(Value::List(mapped))
+}
+
 fn eval_length(args: &[Value], pos: SourcePos) -> Result<Value, EvalError> {
     let [value] = args else {
         return Err(wrong_arity(pos, "length", "exactly 1", args.len()));
@@ -1155,6 +1204,39 @@ fn eval_string_to_symbol(args: &[Value], pos: SourcePos) -> Result<Value, EvalEr
     Ok(Value::Symbol(expect_string(value, pos)?.to_plain_string()))
 }
 
+fn eval_string_to_list(args: &[Value], pos: SourcePos) -> Result<Value, EvalError> {
+    let [value] = args else {
+        return Err(wrong_arity(pos, "string->list", "exactly 1", args.len()));
+    };
+
+    let chars = expect_string(value, pos)?
+        .to_plain_string()
+        .chars()
+        .map(Value::Char)
+        .collect();
+    Ok(Value::List(chars))
+}
+
+fn eval_list_to_string(args: &[Value], pos: SourcePos) -> Result<Value, EvalError> {
+    let [value] = args else {
+        return Err(wrong_arity(pos, "list->string", "exactly 1", args.len()));
+    };
+
+    let Value::List(items) = value else {
+        return Err(type_error(pos, "list", value.type_name()));
+    };
+
+    let mut rendered = String::with_capacity(items.len());
+    for item in items {
+        let Value::Char(ch) = item else {
+            return Err(type_error(pos, "char", item.type_name()));
+        };
+        rendered.push(*ch);
+    }
+
+    Ok(Value::String(SchemeString::new(rendered)))
+}
+
 fn eval_string_ref(args: &[Value], pos: SourcePos) -> Result<Value, EvalError> {
     let [value, index] = args else {
         return Err(wrong_arity(pos, "string-ref", "exactly 2", args.len()));
@@ -1183,21 +1265,33 @@ fn eval_string_copy(args: &[Value], pos: SourcePos) -> Result<Value, EvalError> 
 }
 
 fn eval_string_set(args: &[Value], pos: SourcePos) -> Result<Value, EvalError> {
-    let [value, index, ch] = args else {
+    let [value, _, _] = args else {
         return Err(wrong_arity(pos, "string-set!", "exactly 3", args.len()));
     };
 
-    let string = expect_string(value, pos)?;
-    let index = expect_integer(index, pos)?;
-    let ch = expect_char(ch, pos)?;
-    let len = string.len();
+    let _ = expect_string(value, pos)?;
+    Err(immutable_string(pos))
+}
 
-    if index < 0 || index as usize >= len {
-        return Err(index_out_of_bounds(pos, index, len));
-    }
+fn eval_char_to_integer(args: &[Value], pos: SourcePos) -> Result<Value, EvalError> {
+    let [value] = args else {
+        return Err(wrong_arity(pos, "char->integer", "exactly 1", args.len()));
+    };
 
-    let _ = string.set_char(index as usize, ch);
-    Ok(Value::Void)
+    Ok(Value::Int(expect_char(value, pos)? as i64))
+}
+
+fn eval_integer_to_char(args: &[Value], pos: SourcePos) -> Result<Value, EvalError> {
+    let [value] = args else {
+        return Err(wrong_arity(pos, "integer->char", "exactly 1", args.len()));
+    };
+
+    let code = expect_integer(value, pos)?;
+    let Some(ch) = u32::try_from(code).ok().and_then(char::from_u32) else {
+        return Err(invalid_character_code(pos, code));
+    };
+
+    Ok(Value::Char(ch))
 }
 
 fn eval_type_predicate<F>(

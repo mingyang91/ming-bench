@@ -65,4 +65,10 @@ pub enum EvalError {
 
     #[error("cannot call non-function at {pos}: {found}")]
     NotCallable { pos: SourcePos, found: &'static str },
+
+    #[error("immutable string at {pos}")]
+    ImmutableString { pos: SourcePos },
+
+    #[error("invalid character code at {pos}: {value}")]
+    InvalidCharacterCode { pos: SourcePos, value: i64 },
 }
