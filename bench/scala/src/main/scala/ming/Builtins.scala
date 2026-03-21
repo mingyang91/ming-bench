@@ -135,7 +135,9 @@ object Builtins:
       case "procedure?" =>
         typePred(
           args,
-          v => v.isInstanceOf[Value.LambdaVal] || v.isInstanceOf[Value.CaseLambdaVal] || v.isInstanceOf[Value.Symbol]
+          v =>
+            v.isInstanceOf[Value.LambdaVal] || v.isInstanceOf[Value.CaseLambdaVal] || v
+              .isInstanceOf[Value.Symbol] || v.isInstanceOf[Value.ParameterVal]
         )
       case "eqv?"          => StringBuiltins.evalEq(args)
       case "vector"        => VectorBuiltins.evalVector(args)

@@ -146,6 +146,7 @@ object Evaluator:
       case _: Value.MultipleValues      => Done(expr, env, out)
       case _: Value.RecordVal           => Done(expr, env, out)
       case _: Value.NativeProcVal       => Done(expr, env, out)
+      case _: Value.ParameterVal        => Done(expr, env, out)
       case Value.Symbol(name, pos) =>
         Done(env.lookup(name, pos), env, out)
       case Value.PairVal(car, _, pos) =>
@@ -210,6 +211,10 @@ object Evaluator:
         BindingForms.evalLetValues(args, env, out)
       case Value.Symbol("receive", _) =>
         BindingForms.evalReceive(args, env, out)
+      case Value.Symbol("parameterize", _) =>
+        Parameters.evalParameterize(args, env, out)
+      case Value.Symbol("make-parameter", _) =>
+        Parameters.evalMakeParameter(args, env, out)
       case _ =>
         val (proc, _, out2) = eval(op, env, out)
         proc match

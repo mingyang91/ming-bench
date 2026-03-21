@@ -54,6 +54,8 @@ enum Value:
 
   case TransformerMacroVal(proc: Value, defEnv: () => Env)
 
+  case ParameterVal(cell: Array[Value], converter: Option[Value])
+
   case SyntaxBindingsVal(
     bindings: Map[String, Macros.Binding],
     defEnv: Env
@@ -83,6 +85,7 @@ enum Value:
     case _: LambdaVal           => "#<procedure>"
     case _: CaseLambdaVal       => "#<procedure>"
     case _: NativeProcVal       => "#<procedure>"
+    case _: ParameterVal        => "#<procedure>"
     case _: ContinuationVal     => "#<continuation>"
     case _: MacroVal            => "#<macro>"
     case _: TransformerMacroVal => "#<macro>"

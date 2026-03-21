@@ -1595,5 +1595,40 @@
     "fixture": "l26_receive_rest.scm",
     "kind": "eval_str_ok",
     "expected": "(2 3)"
+  },
+  {
+    "name": "l27_make_parameter",
+    "level": 27,
+    "fixture": "l27_make_parameter.scm",
+    "kind": "eval_str_ok",
+    "expected": "#t"
+  },
+  {
+    "name": "l27_parameterize_basic",
+    "level": 27,
+    "fixture": "l27_parameterize_basic.scm",
+    "kind": "eval_str_ok",
+    "expected": "#t"
+  },
+  {
+    "name": "l27_parameterize_nested",
+    "level": 27,
+    "fixture": "l27_parameterize_nested.scm",
+    "kind": "eval_str_ok",
+    "expected": "#t"
+  },
+  {
+    "name": "l27_parameterize_callcc",
+    "level": 27,
+    "fixture": "l27_parameterize_callcc.scm",
+    "kind": "eval_str_ok",
+    "expected": "42"
+  },
+  {
+    "name": "l27_parameterize_converter",
+    "level": 27,
+    "fixture": "l27_parameterize_converter.scm",
+    "kind": "eval_str_ok",
+    "expected": "#t"
   }
 ]

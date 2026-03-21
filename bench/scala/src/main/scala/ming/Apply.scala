@@ -33,6 +33,9 @@ object Apply:
         applyCaseLambda(cl, clauses, closureThunk, nameOpt, args, pos, out)
       case Value.NativeProcVal(_, fn) =>
         Done(fn(args), Env(Map.empty, None), out)
+      case Value.ParameterVal(cell, _) =>
+        if args.isEmpty then Done(cell(0), Env(Map.empty, None), out)
+        else throw new EvalError("parameter: wrong number of arguments")
       case Value.Symbol("apply", _) =>
         HigherOrder.evalApply(args, pos, out)
       case Value.Symbol("map", _) =>
