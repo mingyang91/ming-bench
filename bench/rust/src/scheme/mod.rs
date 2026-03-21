@@ -39,13 +39,19 @@ fn handle_continuation(
     value: value::Value,
     out: &Rc<RefCell<eval::InterpState>>,
 ) -> usize {
-    let expr_idx = out
-        .borrow()
+    let st = out.borrow();
+    let expr_idx = st
         .cont_captures
         .get(&id)
         .copied()
         .expect("continuation not registered");
-    out.borrow_mut().resume = Some(value);
+    let path = st
+        .cont_paths
+        .get(&id)
+        .cloned()
+        .unwrap_or_default();
+    drop(st);
+    out.borrow_mut().resume = Some((path, value));
     expr_idx
 }
 
@@ -72,8 +78,14 @@ fn eval_expr_sequence(
     let mut result = value::Value::Void;
     for (i, (expr, (line, col))) in exprs.iter().enumerate().skip(start_idx) {
         match eval_one_expr(expr, *line, *col, i, env, out) {
-            Ok(val) => result = val,
+            Ok(val) => {
+                result = val;
+                // Clear any stale resume that was never consumed during
+                // this expression's evaluation.
+                out.borrow_mut().resume = None;
+            }
             Err(EvalError::ContinuationReturn { id, value }) => {
+                out.borrow_mut().body_stack.clear();
                 let idx = handle_continuation(id, *value, out);
                 return Ok(EvalStep::Restart(idx));
             }

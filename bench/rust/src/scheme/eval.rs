@@ -7,14 +7,37 @@ use crate::scheme::error::EvalError;
 use crate::scheme::macros;
 use crate::scheme::value::Value;
 
+/// A snapshot of a body being evaluated — used for continuation path matching.
+pub struct BodyFrame {
+    pub env: Rc<RefCell<Env>>,
+    /// Index of the expression currently being evaluated.
+    pub current_pos: usize,
+}
+
+/// Identity path of a call/cc site: sequence of (body_pos, env_ptr).
+/// Two call/cc invocations with the same path are the "same" call/cc.
+type CallPath = Vec<(usize, usize)>;
+
+fn make_call_path(body_stack: &[BodyFrame]) -> CallPath {
+    body_stack
+        .iter()
+        .map(|f| (f.current_pos, Rc::as_ptr(&f.env) as usize))
+        .collect()
+}
+
 /// Shared interpreter state: output buffer + continuation registry.
 pub struct InterpState {
     pub output: String,
     pub next_cont_id: u64,
     pub cont_captures: HashMap<u64, usize>,
-    pub resume: Option<Value>,
+    /// Call path recorded at each continuation capture.
+    pub cont_paths: HashMap<u64, CallPath>,
+    /// Targeted resume: (call-path of the target call/cc, value).
+    pub resume: Option<(CallPath, Value)>,
     pub current_expr_idx: usize,
     pub gensym_counter: u64,
+    /// Stack of body frames currently being evaluated.
+    pub body_stack: Vec<BodyFrame>,
 }
 
 impl InterpState {
@@ -23,10 +46,27 @@ impl InterpState {
             output: String::new(),
             next_cont_id: 0,
             cont_captures: HashMap::new(),
+            cont_paths: HashMap::new(),
             resume: None,
             current_expr_idx: 0,
             gensym_counter: 0,
+            body_stack: Vec::new(),
         }
+    }
+}
+
+/// Check if the current body_stack path matches the targeted resume.
+/// If so, consume and return the value. Otherwise leave resume in place.
+fn try_consume_resume(out: &Output) -> Option<Value> {
+    let st = out.borrow();
+    let (target_path, _) = st.resume.as_ref()?;
+    let current_path = make_call_path(&st.body_stack);
+    if current_path == *target_path {
+        drop(st);
+        let (_, value) = out.borrow_mut().resume.take().expect("checked above");
+        Some(value)
+    } else {
+        None
     }
 }
 
@@ -219,7 +259,7 @@ fn eval_callcc(
             got: args.len(),
         });
     };
-    if let Some(value) = out.borrow_mut().resume.take() {
+    if let Some(value) = try_consume_resume(out) {
         return Ok(value);
     }
     let proc = eval(proc_arg, env, out)?;
@@ -236,8 +276,10 @@ fn eval_callcc_core(
         let mut st = out.borrow_mut();
         let id = st.next_cont_id;
         let expr_idx = st.current_expr_idx;
+        let path = make_call_path(&st.body_stack);
         st.next_cont_id += 1;
         st.cont_captures.insert(id, expr_idx);
+        st.cont_paths.insert(id, path);
         id
     };
     let cont = Value::Continuation(id);
@@ -305,7 +347,7 @@ fn eval_application_tail(
                 got: items.len() - 1,
             });
         };
-        if let Some(value) = out.borrow_mut().resume.take() {
+        if let Some(value) = try_consume_resume(out) {
             return Ok(TailAction::Return(value));
         }
         let proc_val = eval(proc_arg, env, out)?;
@@ -396,7 +438,7 @@ fn call_builtin_with_values(
                 got: values.len(),
             });
         };
-        if let Some(value) = out.borrow_mut().resume.take() {
+        if let Some(value) = try_consume_resume(out) {
             return Ok(value);
         }
         return eval_callcc_core(proc.clone(), env, out);
@@ -514,21 +556,38 @@ fn eval_cond_tail(
     Ok(TailAction::Return(Value::Void))
 }
 
+/// Evaluate the non-tail prefix of a body sequence for side effects.
+fn eval_body_prefix(
+    prefix: &[Value],
+    env: &Rc<RefCell<Env>>,
+    out: &Output,
+) -> Result<(), EvalError> {
+    let frame_idx = out.borrow().body_stack.len();
+    out.borrow_mut().body_stack.push(BodyFrame {
+        env: Rc::clone(env),
+        current_pos: 0,
+    });
+    for (i, expr) in prefix.iter().enumerate() {
+        out.borrow_mut().body_stack[frame_idx].current_pos = i;
+        eval(expr, env, out)?;
+    }
+    out.borrow_mut().body_stack.truncate(frame_idx);
+    Ok(())
+}
+
 /// Evaluate a body sequence, returning a tail action for the last expression.
 fn eval_body_tail(
     body: &[Value],
     env: &Rc<RefCell<Env>>,
     out: &Output,
 ) -> Result<TailAction, EvalError> {
-    match body.split_last() {
-        None => Ok(TailAction::Return(Value::Void)),
-        Some((last, rest)) => {
-            for expr in rest {
-                eval(expr, env, out)?;
-            }
-            Ok(TailAction::TailEval(last.clone(), Rc::clone(env)))
-        }
+    let Some((last, rest)) = body.split_last() else {
+        return Ok(TailAction::Return(Value::Void));
+    };
+    if !rest.is_empty() {
+        eval_body_prefix(rest, env, out)?;
     }
+    Ok(TailAction::TailEval(last.clone(), Rc::clone(env)))
 }
 
 /// Parse a single let binding `(name expr)` into its param name and init expression.
@@ -746,10 +805,17 @@ fn eval_builtin(
 
 /// Evaluate a sequence of body expressions, returning the last.
 fn eval_body(body: &[Value], env: &Rc<RefCell<Env>>, out: &Output) -> Result<Value, EvalError> {
+    let frame_idx = out.borrow().body_stack.len();
+    out.borrow_mut().body_stack.push(BodyFrame {
+        env: Rc::clone(env),
+        current_pos: 0,
+    });
     let mut result = Value::Void;
-    for expr in body {
+    for (i, expr) in body.iter().enumerate() {
+        out.borrow_mut().body_stack[frame_idx].current_pos = i;
         result = eval(expr, env, out)?;
     }
+    out.borrow_mut().body_stack.truncate(frame_idx);
     Ok(result)
 }
 
