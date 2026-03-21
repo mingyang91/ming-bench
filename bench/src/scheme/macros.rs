@@ -252,6 +252,8 @@ fn is_special_or_builtin(name: &str) -> bool {
             | "string-ref" | "string-copy"
             | "string->list" | "list->string"
             | "char->integer" | "integer->char"
+            | "char=?" | "char<?" | "char-numeric?" | "char-alphabetic?"
+            | "char-upcase" | "char-downcase"
             | "map" | "apply"
             | "zero?" | "positive?" | "negative?" | "odd?" | "even?"
     )

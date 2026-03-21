@@ -1140,6 +1140,8 @@ fn is_builtin(name: &str) -> bool {
             | "cons" | "car" | "cdr" | "null?" | "list" | "list?" | "length"
             | "list-tail" | "list-ref" | "assoc"
             | "string?" | "number?" | "boolean?" | "pair?" | "symbol?" | "char?"
+            | "char=?" | "char<?" | "char-numeric?" | "char-alphabetic?"
+            | "char-upcase" | "char-downcase"
             | "display" | "write" | "newline"
             | "string-append" | "string-length" | "substring"
             | "string->number" | "number->string"
@@ -1173,6 +1175,8 @@ fn eval_builtin(
         "string?" | "number?" | "boolean?" | "pair?" | "symbol?" | "char?" => {
             eval_type_pred(name, args, env, out)
         }
+        "char=?" | "char<?" | "char-numeric?" | "char-alphabetic?"
+        | "char-upcase" | "char-downcase" => eval_char_builtin(name, args, env, out),
         "string-append" | "string-length" | "substring" | "string->number"
         | "number->string" | "symbol->string" | "string->symbol" | "string-ref"
         | "string-copy" | "string->list" | "list->string"
@@ -1686,6 +1690,64 @@ fn eval_type_pred(
         _ => unreachable!("unexpected type predicate: {name}"),
     };
     Ok(Value::Boolean(result))
+}
+
+fn eval_to_char(arg: &Value, env: &mut Env, out: &mut String) -> Result<char, EvalError> {
+    match eval(arg, env, out)? {
+        Value::Char(c) => Ok(c),
+        other => Err(EvalError::TypeError {
+            expected: "char".to_string(),
+            got: other.display(),
+        }),
+    }
+}
+
+fn eval_char_builtin(
+    name: &str,
+    args: &[Value],
+    env: &mut Env,
+    out: &mut String,
+) -> Result<Value, EvalError> {
+    match name {
+        "char=?" | "char<?" => {
+            let [a, b] = args else {
+                return Err(EvalError::WrongArgCount { expected: 2, got: args.len() });
+            };
+            let ca = eval_to_char(a, env, out)?;
+            let cb = eval_to_char(b, env, out)?;
+            let result = match name {
+                "char=?" => ca == cb,
+                "char<?" => ca < cb,
+                _ => unreachable!(),
+            };
+            Ok(Value::Boolean(result))
+        }
+        "char-numeric?" | "char-alphabetic?" => {
+            let [a] = args else {
+                return Err(EvalError::WrongArgCount { expected: 1, got: args.len() });
+            };
+            let c = eval_to_char(a, env, out)?;
+            let result = match name {
+                "char-numeric?" => c.is_ascii_digit(),
+                "char-alphabetic?" => c.is_alphabetic(),
+                _ => unreachable!(),
+            };
+            Ok(Value::Boolean(result))
+        }
+        "char-upcase" | "char-downcase" => {
+            let [a] = args else {
+                return Err(EvalError::WrongArgCount { expected: 1, got: args.len() });
+            };
+            let c = eval_to_char(a, env, out)?;
+            let result = match name {
+                "char-upcase" => c.to_ascii_uppercase(),
+                "char-downcase" => c.to_ascii_lowercase(),
+                _ => unreachable!(),
+            };
+            Ok(Value::Char(result))
+        }
+        _ => unreachable!("unexpected char builtin: {name}"),
+    }
 }
 
 fn eval_numeric_pred(
