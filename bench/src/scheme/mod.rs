@@ -294,7 +294,8 @@ fn is_builtin(name: &str) -> bool {
         "apply" | "call/cc" | "call-with-current-continuation" |
         "equal?" | "eq?" | "eqv?" |
         "vector" | "make-vector" | "vector-ref" | "vector-set!" | "vector-length" |
-        "vector?" | "vector->list" | "list->vector")
+        "vector?" | "vector->list" | "list->vector" |
+        "abs" | "modulo" | "remainder" | "quotient" | "min" | "max" | "expt")
 }
 
 fn parse_params(param_asts: &[Ast]) -> Result<(Vec<String>, Option<String>), EvalError> {
@@ -1611,6 +1612,56 @@ fn apply_builtin(op: &str, args: &[Value], out: &mut String) -> Result<Value, Ev
                 Value::List(items) => Ok(Value::Vector(Rc::new(RefCell::new(items.clone())))),
                 _ => Err(EvalError::TypeError("list->vector: expected list".into())),
             }
+        }
+        "abs" => {
+            if args.len() != 1 { return Err(EvalError::Arity); }
+            Ok(Value::Integer(expect_integer(&args[0])?.abs()))
+        }
+        "modulo" => {
+            if args.len() != 2 { return Err(EvalError::Arity); }
+            let a = expect_integer(&args[0])?;
+            let b = expect_integer(&args[1])?;
+            if b == 0 { return Err(EvalError::DivisionByZero); }
+            Ok(Value::Integer(((a % b) + b) % b))
+        }
+        "remainder" => {
+            if args.len() != 2 { return Err(EvalError::Arity); }
+            let a = expect_integer(&args[0])?;
+            let b = expect_integer(&args[1])?;
+            if b == 0 { return Err(EvalError::DivisionByZero); }
+            Ok(Value::Integer(a % b))
+        }
+        "quotient" => {
+            if args.len() != 2 { return Err(EvalError::Arity); }
+            let a = expect_integer(&args[0])?;
+            let b = expect_integer(&args[1])?;
+            if b == 0 { return Err(EvalError::DivisionByZero); }
+            Ok(Value::Integer(a / b))
+        }
+        "min" => {
+            if args.is_empty() { return Err(EvalError::Arity); }
+            let mut result = expect_integer(&args[0])?;
+            for a in &args[1..] {
+                let v = expect_integer(a)?;
+                if v < result { result = v; }
+            }
+            Ok(Value::Integer(result))
+        }
+        "max" => {
+            if args.is_empty() { return Err(EvalError::Arity); }
+            let mut result = expect_integer(&args[0])?;
+            for a in &args[1..] {
+                let v = expect_integer(a)?;
+                if v > result { result = v; }
+            }
+            Ok(Value::Integer(result))
+        }
+        "expt" => {
+            if args.len() != 2 { return Err(EvalError::Arity); }
+            let base = expect_integer(&args[0])?;
+            let exp = expect_integer(&args[1])?;
+            if exp < 0 { return Err(EvalError::TypeError("expt: negative exponent".into())); }
+            Ok(Value::Integer(base.pow(exp as u32)))
         }
         _ => Err(EvalError::UndefinedVariable(op.to_string())),
     }
