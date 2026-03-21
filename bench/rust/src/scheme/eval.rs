@@ -21,6 +21,8 @@ fn is_builtin(name: &str) -> bool {
     matches!(
         name,
         "+" | "-" | "*" | "/" | "<" | ">" | "=" | "<=" | ">=" | "not"
+            | "cons" | "car" | "cdr" | "null?" | "list" | "length"
+            | "string?" | "number?" | "boolean?" | "pair?" | "symbol?"
     )
 }
 
@@ -36,6 +38,9 @@ fn eval_list(items: &[Value], env: &Rc<RefCell<Env>>) -> Result<Value, EvalError
             "if" => return eval_if(&items[1..], env),
             "quote" => return eval_quote(&items[1..]),
             "lambda" => return eval_lambda(&items[1..], env),
+            "let" => return eval_let(&items[1..], env),
+            "begin" => return eval_body(&items[1..], env),
+            "cond" => return eval_cond(&items[1..], env),
             "and" => return eval_and(&items[1..], env),
             "or" => return eval_or(&items[1..], env),
             s if is_builtin(s) => return eval_builtin(s, &items[1..], env),
@@ -96,6 +101,17 @@ fn eval_builtin(
         "<=" => eval_cmp(args, env, |a, b| a <= b),
         ">=" => eval_cmp(args, env, |a, b| a >= b),
         "not" => eval_not(args, env),
+        "cons" => eval_cons(args, env),
+        "car" => eval_car(args, env),
+        "cdr" => eval_cdr(args, env),
+        "null?" => eval_null_pred(args, env),
+        "list" => eval_list_builtin(args, env),
+        "length" => eval_length(args, env),
+        "string?" => eval_type_pred(args, env, |v| matches!(v, Value::Str(_))),
+        "number?" => eval_type_pred(args, env, |v| matches!(v, Value::Integer(_))),
+        "boolean?" => eval_type_pred(args, env, |v| matches!(v, Value::Boolean(_))),
+        "pair?" => eval_type_pred(args, env, |v| matches!(v, Value::List(items) if !items.is_empty())),
+        "symbol?" => eval_type_pred(args, env, |v| matches!(v, Value::Symbol(_))),
         _ => Err(EvalError::UnknownProcedure {
             name: name.into(),
         }),
@@ -310,4 +326,126 @@ fn eval_cmp(
     }
     let result = nums.windows(2).all(|w| cmp(w[0], w[1]));
     Ok(Value::Boolean(result))
+}
+
+fn eval_cons(args: &[Value], env: &Rc<RefCell<Env>>) -> Result<Value, EvalError> {
+    let [head, tail] = args else {
+        return Err(EvalError::WrongArgCount { expected: 2, got: args.len() });
+    };
+    let head_val = eval(head, env)?;
+    let tail_val = eval(tail, env)?;
+    match tail_val {
+        Value::List(mut items) => {
+            items.insert(0, head_val);
+            Ok(Value::List(items))
+        }
+        _ => Err(EvalError::TypeError {
+            expected: "list".into(),
+            got: format!("{tail_val}"),
+        }),
+    }
+}
+
+fn eval_car(args: &[Value], env: &Rc<RefCell<Env>>) -> Result<Value, EvalError> {
+    let [arg] = args else {
+        return Err(EvalError::WrongArgCount { expected: 1, got: args.len() });
+    };
+    match eval(arg, env)? {
+        Value::List(items) if !items.is_empty() => Ok(items.into_iter().next().expect("non-empty")),
+        other => Err(EvalError::TypeError {
+            expected: "pair".into(),
+            got: format!("{other}"),
+        }),
+    }
+}
+
+fn eval_cdr(args: &[Value], env: &Rc<RefCell<Env>>) -> Result<Value, EvalError> {
+    let [arg] = args else {
+        return Err(EvalError::WrongArgCount { expected: 1, got: args.len() });
+    };
+    match eval(arg, env)? {
+        Value::List(items) if !items.is_empty() => Ok(Value::List(items[1..].to_vec())),
+        other => Err(EvalError::TypeError {
+            expected: "pair".into(),
+            got: format!("{other}"),
+        }),
+    }
+}
+
+fn eval_null_pred(args: &[Value], env: &Rc<RefCell<Env>>) -> Result<Value, EvalError> {
+    let [arg] = args else {
+        return Err(EvalError::WrongArgCount { expected: 1, got: args.len() });
+    };
+    let val = eval(arg, env)?;
+    Ok(Value::Boolean(matches!(val, Value::List(ref items) if items.is_empty())))
+}
+
+fn eval_list_builtin(args: &[Value], env: &Rc<RefCell<Env>>) -> Result<Value, EvalError> {
+    let items: Vec<Value> = args.iter().map(|a| eval(a, env)).collect::<Result<_, _>>()?;
+    Ok(Value::List(items))
+}
+
+fn eval_length(args: &[Value], env: &Rc<RefCell<Env>>) -> Result<Value, EvalError> {
+    let [arg] = args else {
+        return Err(EvalError::WrongArgCount { expected: 1, got: args.len() });
+    };
+    match eval(arg, env)? {
+        Value::List(items) => Ok(Value::Integer(items.len() as i64)),
+        other => Err(EvalError::TypeError {
+            expected: "list".into(),
+            got: format!("{other}"),
+        }),
+    }
+}
+
+fn eval_type_pred(
+    args: &[Value],
+    env: &Rc<RefCell<Env>>,
+    pred: fn(&Value) -> bool,
+) -> Result<Value, EvalError> {
+    let [arg] = args else {
+        return Err(EvalError::WrongArgCount { expected: 1, got: args.len() });
+    };
+    let val = eval(arg, env)?;
+    Ok(Value::Boolean(pred(&val)))
+}
+
+fn eval_let(args: &[Value], env: &Rc<RefCell<Env>>) -> Result<Value, EvalError> {
+    if args.len() < 2 {
+        return Err(EvalError::Parse { message: "let: expected bindings and body".into() });
+    }
+    let Value::List(bindings) = &args[0] else {
+        return Err(EvalError::Parse { message: "let: expected binding list".into() });
+    };
+    let child = Env::extend(env);
+    for binding in bindings {
+        let Value::List(pair) = binding else {
+            return Err(EvalError::Parse { message: "let: expected binding pair".into() });
+        };
+        let [Value::Symbol(name), expr] = pair.as_slice() else {
+            return Err(EvalError::Parse { message: "let: expected (name expr)".into() });
+        };
+        let val = eval(expr, env)?;
+        child.borrow_mut().define(name.clone(), val);
+    }
+    eval_body(&args[1..], &child)
+}
+
+fn eval_cond(clauses: &[Value], env: &Rc<RefCell<Env>>) -> Result<Value, EvalError> {
+    for clause in clauses {
+        let Value::List(parts) = clause else {
+            return Err(EvalError::Parse { message: "cond: expected clause".into() });
+        };
+        if parts.is_empty() {
+            return Err(EvalError::Parse { message: "cond: empty clause".into() });
+        }
+        if matches!(&parts[0], Value::Symbol(s) if s == "else") {
+            return eval_body(&parts[1..], env);
+        }
+        let test_val = eval(&parts[0], env)?;
+        if test_val != Value::Boolean(false) {
+            return eval_body(&parts[1..], env);
+        }
+    }
+    Ok(Value::Void)
 }

@@ -6,6 +6,7 @@ use crate::scheme::value::Value;
 enum Token {
     LParen,
     RParen,
+    Quote,
     Symbol(String),
     Integer(i64),
     Boolean(bool),
@@ -24,6 +25,7 @@ fn tokenize(input: &str) -> Result<Vec<Token>, EvalError> {
             ';' => i = skip_line_comment(&chars, i),
             '(' => { tokens.push(Token::LParen); i += 1; }
             ')' => { tokens.push(Token::RParen); i += 1; }
+            '\'' => { tokens.push(Token::Quote); i += 1; }
             '#' => { let (tok, next) = tokenize_hash(&chars, i)?; tokens.push(tok); i = next; }
             '"' => { let (tok, next) = tokenize_string(&chars, i)?; tokens.push(tok); i = next; }
             _ => { let (tok, next) = tokenize_atom(&chars, i); tokens.push(tok); i = next; }
@@ -124,6 +126,10 @@ fn parse_expr(tokens: &[Token], pos: usize) -> Result<(Value, usize), EvalError>
         Token::Boolean(b) => Ok((Value::Boolean(*b), pos + 1)),
         Token::Str(s) => Ok((Value::Str(s.clone()), pos + 1)),
         Token::Symbol(s) => Ok((Value::Symbol(s.clone()), pos + 1)),
+        Token::Quote => {
+            let (inner, next) = parse_expr(tokens, pos + 1)?;
+            Ok((Value::List(vec![Value::Symbol("quote".into()), inner]), next))
+        }
         Token::LParen => parse_list(tokens, pos + 1),
         Token::RParen => Err(EvalError::Parse {
             message: "unexpected closing parenthesis".into(),
