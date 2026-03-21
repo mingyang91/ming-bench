@@ -45,7 +45,8 @@ fn eval_program(input: &str, ctx: &mut EvalContext) -> Result<Value, EvalError> 
     }
 
     let env = Env::global();
-    eval_sequence(&program, env, ctx)
+    let outcome = eval_tail_sequence(&program, env, ctx)?;
+    resolve_tail_outcome(outcome, ctx)
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -350,12 +351,84 @@ struct LambdaProcedure {
     env: EnvRef,
 }
 
+#[derive(Debug)]
+enum TailOutcome {
+    Value(Value),
+    TailCall {
+        procedure: Rc<LambdaProcedure>,
+        args: Vec<Value>,
+        pos: SourcePos,
+    },
+}
+
+struct LetForm<'a> {
+    name: Option<&'a str>,
+    bindings_expr: &'a Expr,
+    body: &'a [Expr],
+}
+
 fn eval_sequence(exprs: &[Expr], env: EnvRef, ctx: &mut EvalContext) -> Result<Value, EvalError> {
     let mut last = Value::Void;
     for expr in exprs {
         last = eval_expr(expr, env.clone(), ctx)?;
     }
     Ok(last)
+}
+
+fn eval_tail_sequence(
+    exprs: &[Expr],
+    env: EnvRef,
+    ctx: &mut EvalContext,
+) -> Result<TailOutcome, EvalError> {
+    let Some((last, prefix)) = exprs.split_last() else {
+        return Ok(TailOutcome::Value(Value::Void));
+    };
+
+    for expr in prefix {
+        eval_expr(expr, env.clone(), ctx)?;
+    }
+
+    eval_tail_expr(last, env, ctx)
+}
+
+fn resolve_tail_outcome(
+    mut outcome: TailOutcome,
+    ctx: &mut EvalContext,
+) -> Result<Value, EvalError> {
+    loop {
+        match outcome {
+            TailOutcome::Value(value) => return Ok(value),
+            TailOutcome::TailCall {
+                procedure,
+                args,
+                pos,
+            } => {
+                let local_env =
+                    bind_call_env(&procedure, &args).map_err(|err| err.with_position(pos))?;
+                outcome = eval_tail_sequence(&procedure.body, local_env, ctx)
+                    .map_err(|err| err.with_position(pos))?;
+            }
+        }
+    }
+}
+
+fn eval_tail_expr(
+    expr: &Expr,
+    env: EnvRef,
+    ctx: &mut EvalContext,
+) -> Result<TailOutcome, EvalError> {
+    match &expr.kind {
+        ExprKind::Bool(value) => Ok(TailOutcome::Value(Value::Bool(*value))),
+        ExprKind::Number(value) => Ok(TailOutcome::Value(Value::Number(*value))),
+        ExprKind::Char(value) => Ok(TailOutcome::Value(Value::Char(*value))),
+        ExprKind::String(value) => Ok(TailOutcome::Value(Value::string(value.clone()))),
+        ExprKind::Symbol(name) => Env::lookup(&env, name)
+            .map(TailOutcome::Value)
+            .ok_or_else(|| EvalError::UnboundSymbol(name.clone()).with_position(expr.pos)),
+        ExprKind::List(items) => {
+            eval_tail_list(items, expr.pos, env, ctx).map_err(|err| err.with_position(expr.pos))
+        }
+    }
 }
 
 fn eval_expr(expr: &Expr, env: EnvRef, ctx: &mut EvalContext) -> Result<Value, EvalError> {
@@ -386,7 +459,7 @@ fn eval_list(
         ExprKind::Symbol(name) if name == "and" => eval_and(args, env, ctx),
         ExprKind::Symbol(name) if name == "or" => eval_or(args, env, ctx),
         ExprKind::Symbol(name) if name == "if" => eval_if(args, env, ctx),
-        ExprKind::Symbol(name) if name == "let" => eval_let(args, env, ctx),
+        ExprKind::Symbol(name) if name == "let" => eval_let(args, pos, env, ctx),
         ExprKind::Symbol(name) if name == "begin" => eval_begin(args, env, ctx),
         ExprKind::Symbol(name) if name == "cond" => eval_cond(args, env, ctx),
         ExprKind::Symbol(name) if name == "quote" => eval_quote(args),
@@ -399,6 +472,41 @@ fn eval_list(
                 evaluated.push(eval_expr(arg, env.clone(), ctx)?);
             }
             apply(procedure, &evaluated, pos, ctx)
+        }
+    }
+}
+
+fn eval_tail_list(
+    items: &[Expr],
+    pos: SourcePos,
+    env: EnvRef,
+    ctx: &mut EvalContext,
+) -> Result<TailOutcome, EvalError> {
+    let Some((head, args)) = items.split_first() else {
+        return Err(EvalError::Syntax("cannot evaluate an empty list".into()).with_position(pos));
+    };
+
+    match &head.kind {
+        ExprKind::Symbol(name) if name == "and" => eval_tail_and(args, env, ctx),
+        ExprKind::Symbol(name) if name == "or" => eval_tail_or(args, env, ctx),
+        ExprKind::Symbol(name) if name == "if" => eval_tail_if(args, env, ctx),
+        ExprKind::Symbol(name) if name == "let" => eval_tail_let(args, pos, env, ctx),
+        ExprKind::Symbol(name) if name == "begin" => eval_tail_begin(args, env, ctx),
+        ExprKind::Symbol(name) if name == "cond" => eval_tail_cond(args, env, ctx),
+        ExprKind::Symbol(name) if name == "quote" => eval_quote(args).map(TailOutcome::Value),
+        ExprKind::Symbol(name) if name == "define" => {
+            eval_define(args, env, ctx).map(TailOutcome::Value)
+        }
+        ExprKind::Symbol(name) if name == "lambda" => {
+            eval_lambda(args, env).map(TailOutcome::Value)
+        }
+        _ => {
+            let procedure = eval_expr(head, env.clone(), ctx)?;
+            let mut evaluated = Vec::with_capacity(args.len());
+            for arg in args {
+                evaluated.push(eval_expr(arg, env.clone(), ctx)?);
+            }
+            apply_in_tail_position(procedure, evaluated, pos, ctx)
         }
     }
 }
@@ -437,30 +545,146 @@ fn eval_if(args: &[Expr], env: EnvRef, ctx: &mut EvalContext) -> Result<Value, E
     }
 }
 
-fn eval_let(args: &[Expr], env: EnvRef, ctx: &mut EvalContext) -> Result<Value, EvalError> {
-    let Some((bindings_expr, body)) = args.split_first() else {
-        return Err(wrong_arg_count("let", "at least 2", args.len()));
+fn eval_tail_and(
+    args: &[Expr],
+    env: EnvRef,
+    ctx: &mut EvalContext,
+) -> Result<TailOutcome, EvalError> {
+    let Some((last, prefix)) = args.split_last() else {
+        return Ok(TailOutcome::Value(Value::Bool(true)));
     };
-    if body.is_empty() {
-        return Err(wrong_arg_count("let", "at least 2", args.len()));
+
+    for arg in prefix {
+        let value = eval_expr(arg, env.clone(), ctx)?;
+        if !value.is_truthy() {
+            return Ok(TailOutcome::Value(value));
+        }
     }
 
-    let bindings = parse_let_bindings(bindings_expr)?;
-    let mut values = Vec::with_capacity(bindings.len());
-    for (_, expr) in &bindings {
-        values.push(eval_expr(expr, env.clone(), ctx)?);
+    eval_tail_expr(last, env, ctx)
+}
+
+fn eval_tail_or(
+    args: &[Expr],
+    env: EnvRef,
+    ctx: &mut EvalContext,
+) -> Result<TailOutcome, EvalError> {
+    let Some((last, prefix)) = args.split_last() else {
+        return Ok(TailOutcome::Value(Value::Bool(false)));
+    };
+
+    for arg in prefix {
+        let value = eval_expr(arg, env.clone(), ctx)?;
+        if value.is_truthy() {
+            return Ok(TailOutcome::Value(value));
+        }
     }
 
-    let local_env = Env::child(env);
-    for ((name, _), value) in bindings.into_iter().zip(values) {
-        Env::define(&local_env, name, value);
+    eval_tail_expr(last, env, ctx)
+}
+
+fn eval_tail_if(
+    args: &[Expr],
+    env: EnvRef,
+    ctx: &mut EvalContext,
+) -> Result<TailOutcome, EvalError> {
+    if args.len() != 3 {
+        return Err(wrong_arg_count("if", "exactly 3", args.len()));
     }
 
-    eval_sequence(body, local_env, ctx)
+    let condition = eval_expr(&args[0], env.clone(), ctx)?;
+    if condition.is_truthy() {
+        eval_tail_expr(&args[1], env, ctx)
+    } else {
+        eval_tail_expr(&args[2], env, ctx)
+    }
+}
+
+fn eval_let(
+    args: &[Expr],
+    pos: SourcePos,
+    env: EnvRef,
+    ctx: &mut EvalContext,
+) -> Result<Value, EvalError> {
+    let form = parse_let_form(args)?;
+    let (names, values) = eval_let_bindings(form.bindings_expr, env.clone(), ctx)?;
+
+    match form.name {
+        Some(name) => {
+            let local_env = Env::child(env);
+            let procedure = Rc::new(LambdaProcedure {
+                name: Some(name.to_string()),
+                params: names,
+                body: form.body.to_vec(),
+                env: local_env.clone(),
+            });
+            Env::define(
+                &local_env,
+                name.to_string(),
+                Value::Procedure(procedure.clone()),
+            );
+            resolve_tail_outcome(
+                TailOutcome::TailCall {
+                    procedure,
+                    args: values,
+                    pos,
+                },
+                ctx,
+            )
+        }
+        None => {
+            let local_env = bind_names(env, &names, &values);
+            eval_sequence(form.body, local_env, ctx)
+        }
+    }
+}
+
+fn eval_tail_let(
+    args: &[Expr],
+    pos: SourcePos,
+    env: EnvRef,
+    ctx: &mut EvalContext,
+) -> Result<TailOutcome, EvalError> {
+    let form = parse_let_form(args)?;
+    let (names, values) = eval_let_bindings(form.bindings_expr, env.clone(), ctx)?;
+
+    match form.name {
+        Some(name) => {
+            let local_env = Env::child(env);
+            let procedure = Rc::new(LambdaProcedure {
+                name: Some(name.to_string()),
+                params: names,
+                body: form.body.to_vec(),
+                env: local_env.clone(),
+            });
+            Env::define(
+                &local_env,
+                name.to_string(),
+                Value::Procedure(procedure.clone()),
+            );
+            Ok(TailOutcome::TailCall {
+                procedure,
+                args: values,
+                pos,
+            })
+        }
+        None => {
+            let local_env = bind_names(env, &names, &values);
+            eval_tail_sequence(form.body, local_env, ctx)
+        }
+    }
 }
 
 fn eval_begin(args: &[Expr], env: EnvRef, ctx: &mut EvalContext) -> Result<Value, EvalError> {
     eval_sequence(args, env, ctx)
+}
+
+fn eval_tail_begin(
+    args: &[Expr],
+    env: EnvRef,
+    ctx: &mut EvalContext,
+) -> Result<TailOutcome, EvalError> {
+    eval_tail_sequence(args, env, ctx)
 }
 
 fn eval_cond(args: &[Expr], env: EnvRef, ctx: &mut EvalContext) -> Result<Value, EvalError> {
@@ -498,6 +722,47 @@ fn eval_cond(args: &[Expr], env: EnvRef, ctx: &mut EvalContext) -> Result<Value,
     }
 
     Ok(Value::Void)
+}
+
+fn eval_tail_cond(
+    args: &[Expr],
+    env: EnvRef,
+    ctx: &mut EvalContext,
+) -> Result<TailOutcome, EvalError> {
+    for (index, clause) in args.iter().enumerate() {
+        let ExprKind::List(items) = &clause.kind else {
+            return Err(EvalError::Syntax("cond clauses must be lists".into()));
+        };
+
+        let Some((test, body)) = items.split_first() else {
+            return Err(EvalError::Syntax("cond clauses cannot be empty".into()));
+        };
+
+        match &test.kind {
+            ExprKind::Symbol(name) if name == "else" => {
+                if index + 1 != args.len() {
+                    return Err(EvalError::Syntax("cond else clause must be last".into()));
+                }
+
+                if body.is_empty() {
+                    return Err(EvalError::Syntax("cond else clause requires a body".into()));
+                }
+
+                return eval_tail_sequence(body, env, ctx);
+            }
+            _ => {
+                let result = eval_expr(test, env.clone(), ctx)?;
+                if result.is_truthy() {
+                    if body.is_empty() {
+                        return Ok(TailOutcome::Value(result));
+                    }
+                    return eval_tail_sequence(body, env, ctx);
+                }
+            }
+        }
+    }
+
+    Ok(TailOutcome::Value(Value::Void))
 }
 
 fn eval_quote(args: &[Expr]) -> Result<Value, EvalError> {
@@ -582,6 +847,40 @@ fn parse_parameter_list(expr: &Expr) -> Result<Vec<String>, EvalError> {
     }
 }
 
+fn parse_let_form<'a>(args: &'a [Expr]) -> Result<LetForm<'a>, EvalError> {
+    let Some((first, rest)) = args.split_first() else {
+        return Err(wrong_arg_count("let", "at least 2", args.len()));
+    };
+
+    match &first.kind {
+        ExprKind::Symbol(name) => {
+            let Some((bindings_expr, body)) = rest.split_first() else {
+                return Err(wrong_arg_count("let", "at least 3", args.len()));
+            };
+            if body.is_empty() {
+                return Err(wrong_arg_count("let", "at least 3", args.len()));
+            }
+
+            Ok(LetForm {
+                name: Some(name),
+                bindings_expr,
+                body,
+            })
+        }
+        _ => {
+            if rest.is_empty() {
+                return Err(wrong_arg_count("let", "at least 2", args.len()));
+            }
+
+            Ok(LetForm {
+                name: None,
+                bindings_expr: first,
+                body: rest,
+            })
+        }
+    }
+}
+
 fn parse_let_bindings(expr: &Expr) -> Result<Vec<(String, Expr)>, EvalError> {
     let ExprKind::List(bindings) = &expr.kind else {
         return Err(EvalError::Syntax("let bindings must be a list".into()));
@@ -604,6 +903,23 @@ fn parse_let_bindings(expr: &Expr) -> Result<Vec<(String, Expr)>, EvalError> {
             }
         })
         .collect()
+}
+
+fn eval_let_bindings(
+    expr: &Expr,
+    env: EnvRef,
+    ctx: &mut EvalContext,
+) -> Result<(Vec<String>, Vec<Value>), EvalError> {
+    let bindings = parse_let_bindings(expr)?;
+    let mut names = Vec::with_capacity(bindings.len());
+    let mut values = Vec::with_capacity(bindings.len());
+
+    for (name, expr) in bindings {
+        names.push(name);
+        values.push(eval_expr(&expr, env.clone(), ctx)?);
+    }
+
+    Ok((names, values))
 }
 
 fn parse_parameters(items: &[Expr]) -> Result<Vec<String>, EvalError> {
@@ -630,30 +946,53 @@ fn apply(
         Value::Builtin(builtin) => {
             apply_builtin(builtin, args, ctx).map_err(|err| err.with_position(pos))
         }
-        Value::Procedure(procedure) => {
-            apply_lambda(&procedure, args, ctx).map_err(|err| err.with_position(pos))
-        }
+        Value::Procedure(procedure) => resolve_tail_outcome(
+            TailOutcome::TailCall {
+                procedure,
+                args: args.to_vec(),
+                pos,
+            },
+            ctx,
+        ),
         other => Err(EvalError::NotAProcedure(other.to_string()).with_position(pos)),
     }
 }
 
-fn apply_lambda(
-    procedure: &Rc<LambdaProcedure>,
-    args: &[Value],
+fn apply_in_tail_position(
+    function: Value,
+    args: Vec<Value>,
+    pos: SourcePos,
     ctx: &mut EvalContext,
-) -> Result<Value, EvalError> {
+) -> Result<TailOutcome, EvalError> {
+    match function {
+        Value::Builtin(builtin) => apply_builtin(builtin, &args, ctx)
+            .map(TailOutcome::Value)
+            .map_err(|err| err.with_position(pos)),
+        Value::Procedure(procedure) => Ok(TailOutcome::TailCall {
+            procedure,
+            args,
+            pos,
+        }),
+        other => Err(EvalError::NotAProcedure(other.to_string()).with_position(pos)),
+    }
+}
+
+fn bind_call_env(procedure: &Rc<LambdaProcedure>, args: &[Value]) -> Result<EnvRef, EvalError> {
     if args.len() != procedure.params.len() {
         let expected = format!("exactly {}", procedure.params.len());
         let name = procedure.name.as_deref().unwrap_or("lambda");
         return Err(wrong_arg_count(name, &expected, args.len()));
     }
 
-    let local_env = Env::child(procedure.env.clone());
-    for (param, arg) in procedure.params.iter().zip(args.iter()) {
-        Env::define(&local_env, param.clone(), arg.clone());
-    }
+    Ok(bind_names(procedure.env.clone(), &procedure.params, args))
+}
 
-    eval_sequence(&procedure.body, local_env, ctx)
+fn bind_names(parent: EnvRef, names: &[String], values: &[Value]) -> EnvRef {
+    let local_env = Env::child(parent);
+    for (name, value) in names.iter().zip(values.iter()) {
+        Env::define(&local_env, name.clone(), value.clone());
+    }
+    local_env
 }
 
 fn apply_builtin(
