@@ -53,6 +53,33 @@ fn is_builtin(name: &str) -> bool {
             | "vector?"
             | "vector->list"
             | "list->vector"
+            | "abs"
+            | "modulo"
+            | "remainder"
+            | "quotient"
+            | "min"
+            | "max"
+            | "expt"
+            | "zero?"
+            | "positive?"
+            | "negative?"
+            | "odd?"
+            | "even?"
+            | "list-ref"
+            | "list-tail"
+            | "list?"
+            | "assoc"
+            | "char-alphabetic?"
+            | "char-numeric?"
+            | "char-upcase"
+            | "char-downcase"
+            | "char=?"
+            | "char<?"
+            | "string=?"
+            | "string<?"
+            | "string-ci=?"
+            | "string-upcase"
+            | "string-downcase"
     )
 }
 
@@ -133,7 +160,7 @@ pub fn eval(
                 Bounce::TailCall { expr, env } => { cur_expr = expr; cur_env = env; }
             },
             Value::Lambda { .. } | Value::Continuation(_) | Value::Macro { .. }
-            | Value::Vector(_) => {
+            | Value::Vector(_) | Value::Pair(..) => {
                 return Ok(cur_expr);
             }
             Value::Void => return Ok(Value::Void),
@@ -854,24 +881,13 @@ fn apply_builtin(
         "number?" => Ok(Value::Boolean(matches!(args, [Value::Integer(_)]))),
         "boolean?" => Ok(Value::Boolean(matches!(args, [Value::Boolean(_)]))),
         "pair?" => Ok(Value::Boolean(
-            matches!(args, [Value::List(e)] if !e.is_empty()),
+            matches!(args, [Value::List(e)] if !e.is_empty())
+                || matches!(args, [Value::Pair(..)])
         )),
         "symbol?" => Ok(Value::Boolean(matches!(args, [Value::Symbol(_)]))),
         "char?" => Ok(Value::Boolean(matches!(args, [Value::Char(_)]))),
         "apply" => eval_apply(args, span, ctx),
-        "map" => {
-            let [proc, Value::List(elems)] = args else {
-                return Err(EvalError::TypeError {
-                    message: "map: expected procedure and list".into(),
-                    span,
-                });
-            };
-            let results: Vec<Value> = elems
-                .iter()
-                .map(|elem| apply(proc, std::slice::from_ref(elem), span, ctx))
-                .collect::<Result<_, _>>()?;
-            Ok(Value::List(results))
-        }
+        "map" => apply_map(args, span, ctx),
         "display" => {
             let [arg] = args else {
                 return Err(EvalError::WrongArgCount {
@@ -912,6 +928,18 @@ fn apply_builtin(
         "equal?" | "eqv?" | "eq?" => apply_equality_builtin(name, args, span),
         "vector" | "make-vector" | "vector-ref" | "vector-length" | "vector?"
         | "vector->list" | "list->vector" => apply_vector_builtin(name, args, span),
+        "abs" | "modulo" | "remainder" | "quotient" | "min" | "max" | "expt" | "zero?"
+        | "positive?" | "negative?" | "odd?" | "even?" => {
+            apply_numeric_extra(name, args, span)
+        }
+        "list-ref" | "list-tail" | "list?" | "assoc" => {
+            apply_list_extra(name, args, span)
+        }
+        "char-alphabetic?" | "char-numeric?" | "char-upcase" | "char-downcase" | "char=?"
+        | "char<?" => apply_char_builtin(name, args, span),
+        "string=?" | "string<?" | "string-ci=?" | "string-upcase" | "string-downcase" => {
+            apply_string_builtin(name, args, span)
+        }
         _ => Err(EvalError::UnboundVariable {
             name: name.to_string(),
             span,
@@ -1018,7 +1046,11 @@ fn apply_list_builtin(name: &str, args: &[Value], span: Span) -> Result<Value, E
                     new_list.extend(elems.iter().cloned());
                     Ok(Value::List(new_list))
                 }
-                _ => Ok(Value::List(vec![car.clone(), cdr.clone()])),
+                Value::Pair(..) => Ok(Value::Pair(
+                    Box::new(car.clone()),
+                    Box::new(cdr.clone()),
+                )),
+                _ => Ok(Value::Pair(Box::new(car.clone()), Box::new(cdr.clone()))),
             }
         }
         "car" => {
@@ -1031,6 +1063,7 @@ fn apply_list_builtin(name: &str, args: &[Value], span: Span) -> Result<Value, E
             };
             match arg {
                 Value::List(elems) if !elems.is_empty() => Ok(elems[0].clone()),
+                Value::Pair(car, _) => Ok(*car.clone()),
                 _ => Err(EvalError::TypeError {
                     message: format!("car: expected non-empty pair, got {arg}"),
                     span,
@@ -1047,6 +1080,7 @@ fn apply_list_builtin(name: &str, args: &[Value], span: Span) -> Result<Value, E
             };
             match arg {
                 Value::List(elems) if !elems.is_empty() => Ok(Value::List(elems[1..].to_vec())),
+                Value::Pair(_, cdr) => Ok(*cdr.clone()),
                 _ => Err(EvalError::TypeError {
                     message: format!("cdr: expected non-empty pair, got {arg}"),
                     span,
@@ -1181,6 +1215,12 @@ fn apply_string_builtin(name: &str, args: &[Value], span: Span) -> Result<Value,
             })?;
             Ok(Value::Char(c))
         }
+        _ => apply_string_builtin_ext(name, args, span),
+    }
+}
+
+fn apply_string_builtin_ext(name: &str, args: &[Value], span: Span) -> Result<Value, EvalError> {
+    match name {
         "string-copy" => {
             let [Value::String(s)] = args else {
                 return Err(EvalError::TypeError {
@@ -1219,7 +1259,52 @@ fn apply_string_builtin(name: &str, args: &[Value], span: Span) -> Result<Value,
             Ok(Value::String(s))
         }
         "char->integer" | "integer->char" => apply_char_builtin(name, args, span),
-        _ => unreachable!("apply_string_builtin called with non-string builtin: {name}"),
+        "string=?" => {
+            let [Value::String(a), Value::String(b)] = args else {
+                return Err(EvalError::TypeError {
+                    message: "string=?: expected two string arguments".into(),
+                    span,
+                });
+            };
+            Ok(Value::Boolean(a == b))
+        }
+        "string<?" => {
+            let [Value::String(a), Value::String(b)] = args else {
+                return Err(EvalError::TypeError {
+                    message: "string<?: expected two string arguments".into(),
+                    span,
+                });
+            };
+            Ok(Value::Boolean(a < b))
+        }
+        "string-ci=?" => {
+            let [Value::String(a), Value::String(b)] = args else {
+                return Err(EvalError::TypeError {
+                    message: "string-ci=?: expected two string arguments".into(),
+                    span,
+                });
+            };
+            Ok(Value::Boolean(a.to_lowercase() == b.to_lowercase()))
+        }
+        "string-upcase" => {
+            let [Value::String(s)] = args else {
+                return Err(EvalError::TypeError {
+                    message: "string-upcase: expected one string argument".into(),
+                    span,
+                });
+            };
+            Ok(Value::String(s.to_uppercase()))
+        }
+        "string-downcase" => {
+            let [Value::String(s)] = args else {
+                return Err(EvalError::TypeError {
+                    message: "string-downcase: expected one string argument".into(),
+                    span,
+                });
+            };
+            Ok(Value::String(s.to_lowercase()))
+        }
+        _ => unreachable!("apply_string_builtin_ext called with non-string builtin: {name}"),
     }
 }
 
@@ -1249,7 +1334,269 @@ fn apply_char_builtin(name: &str, args: &[Value], span: Span) -> Result<Value, E
             })?;
             Ok(Value::Char(c))
         }
+        "char-alphabetic?" => {
+            let [Value::Char(c)] = args else {
+                return Err(EvalError::TypeError {
+                    message: "char-alphabetic?: expected one char argument".into(),
+                    span,
+                });
+            };
+            Ok(Value::Boolean(c.is_alphabetic()))
+        }
+        "char-numeric?" => {
+            let [Value::Char(c)] = args else {
+                return Err(EvalError::TypeError {
+                    message: "char-numeric?: expected one char argument".into(),
+                    span,
+                });
+            };
+            Ok(Value::Boolean(c.is_ascii_digit()))
+        }
+        "char-upcase" => {
+            let [Value::Char(c)] = args else {
+                return Err(EvalError::TypeError {
+                    message: "char-upcase: expected one char argument".into(),
+                    span,
+                });
+            };
+            Ok(Value::Char(c.to_ascii_uppercase()))
+        }
+        "char-downcase" => {
+            let [Value::Char(c)] = args else {
+                return Err(EvalError::TypeError {
+                    message: "char-downcase: expected one char argument".into(),
+                    span,
+                });
+            };
+            Ok(Value::Char(c.to_ascii_lowercase()))
+        }
+        "char=?" => {
+            let [Value::Char(a), Value::Char(b)] = args else {
+                return Err(EvalError::TypeError {
+                    message: "char=?: expected two char arguments".into(),
+                    span,
+                });
+            };
+            Ok(Value::Boolean(a == b))
+        }
+        "char<?" => {
+            let [Value::Char(a), Value::Char(b)] = args else {
+                return Err(EvalError::TypeError {
+                    message: "char<?: expected two char arguments".into(),
+                    span,
+                });
+            };
+            Ok(Value::Boolean(a < b))
+        }
         _ => unreachable!("apply_char_builtin called with non-char builtin: {name}"),
+    }
+}
+
+// ===== Level 15: Numeric/Char/String Utilities =====
+
+fn apply_map(
+    args: &[Value],
+    span: Span,
+    ctx: &EvalContext,
+) -> Result<Value, EvalError> {
+    if args.len() < 2 {
+        return Err(EvalError::TypeError {
+            message: "map: expected procedure and at least one list".into(),
+            span,
+        });
+    }
+    let proc = &args[0];
+    if args.len() == 2 {
+        let Value::List(elems) = &args[1] else {
+            return Err(EvalError::TypeError {
+                message: "map: expected list argument".into(),
+                span,
+            });
+        };
+        let results: Vec<Value> = elems
+            .iter()
+            .map(|elem| apply(proc, std::slice::from_ref(elem), span, ctx))
+            .collect::<Result<_, _>>()?;
+        return Ok(Value::List(results));
+    }
+    let lists: Vec<&Vec<Value>> = args[1..]
+        .iter()
+        .map(|a| match a {
+            Value::List(elems) => Ok(elems),
+            _ => Err(EvalError::TypeError {
+                message: "map: expected list argument".into(),
+                span,
+            }),
+        })
+        .collect::<Result<_, _>>()?;
+    let len = lists[0].len();
+    let results: Vec<Value> = (0..len)
+        .map(|i| {
+            let call_args: Vec<Value> = lists.iter().map(|l| l[i].clone()).collect();
+            apply(proc, &call_args, span, ctx)
+        })
+        .collect::<Result<_, _>>()?;
+    Ok(Value::List(results))
+}
+
+fn apply_numeric_extra(
+    name: &str,
+    args: &[Value],
+    span: Span,
+) -> Result<Value, EvalError> {
+    match name {
+        "abs" => {
+            let [arg] = args else {
+                return Err(EvalError::WrongArgCount { expected: 1, got: args.len(), span });
+            };
+            Ok(Value::Integer(require_integer(arg, span)?.abs()))
+        }
+        "modulo" => {
+            let [a_val, b_val] = args else {
+                return Err(EvalError::WrongArgCount { expected: 2, got: args.len(), span });
+            };
+            let a = require_integer(a_val, span)?;
+            let b = require_integer(b_val, span)?;
+            if b == 0 {
+                return Err(EvalError::DivisionByZero { span });
+            }
+            Ok(Value::Integer(((a % b) + b) % b))
+        }
+        "remainder" => {
+            let [a_val, b_val] = args else {
+                return Err(EvalError::WrongArgCount { expected: 2, got: args.len(), span });
+            };
+            let a = require_integer(a_val, span)?;
+            let b = require_integer(b_val, span)?;
+            if b == 0 {
+                return Err(EvalError::DivisionByZero { span });
+            }
+            Ok(Value::Integer(a % b))
+        }
+        "quotient" => {
+            let [a_val, b_val] = args else {
+                return Err(EvalError::WrongArgCount { expected: 2, got: args.len(), span });
+            };
+            let a = require_integer(a_val, span)?;
+            let b = require_integer(b_val, span)?;
+            if b == 0 {
+                return Err(EvalError::DivisionByZero { span });
+            }
+            Ok(Value::Integer(a / b))
+        }
+        "min" => {
+            if args.is_empty() {
+                return Err(EvalError::WrongArgCount { expected: 1, got: 0, span });
+            }
+            let nums: Vec<i64> = args.iter().map(|v| require_integer(v, span)).collect::<Result<_, _>>()?;
+            Ok(Value::Integer(*nums.iter().min().expect("non-empty")))
+        }
+        "max" => {
+            if args.is_empty() {
+                return Err(EvalError::WrongArgCount { expected: 1, got: 0, span });
+            }
+            let nums: Vec<i64> = args.iter().map(|v| require_integer(v, span)).collect::<Result<_, _>>()?;
+            Ok(Value::Integer(*nums.iter().max().expect("non-empty")))
+        }
+        "expt" => {
+            let [base_val, exp_val] = args else {
+                return Err(EvalError::WrongArgCount { expected: 2, got: args.len(), span });
+            };
+            let base = require_integer(base_val, span)?;
+            let exp = require_integer(exp_val, span)?;
+            Ok(Value::Integer(base.pow(exp as u32)))
+        }
+        "zero?" => {
+            let [arg] = args else {
+                return Err(EvalError::WrongArgCount { expected: 1, got: args.len(), span });
+            };
+            Ok(Value::Boolean(require_integer(arg, span)? == 0))
+        }
+        "positive?" => {
+            let [arg] = args else {
+                return Err(EvalError::WrongArgCount { expected: 1, got: args.len(), span });
+            };
+            Ok(Value::Boolean(require_integer(arg, span)? > 0))
+        }
+        "negative?" => {
+            let [arg] = args else {
+                return Err(EvalError::WrongArgCount { expected: 1, got: args.len(), span });
+            };
+            Ok(Value::Boolean(require_integer(arg, span)? < 0))
+        }
+        "odd?" => {
+            let [arg] = args else {
+                return Err(EvalError::WrongArgCount { expected: 1, got: args.len(), span });
+            };
+            Ok(Value::Boolean(require_integer(arg, span)? % 2 != 0))
+        }
+        "even?" => {
+            let [arg] = args else {
+                return Err(EvalError::WrongArgCount { expected: 1, got: args.len(), span });
+            };
+            Ok(Value::Boolean(require_integer(arg, span)? % 2 == 0))
+        }
+        _ => unreachable!(),
+    }
+}
+
+fn apply_list_extra(
+    name: &str,
+    args: &[Value],
+    span: Span,
+) -> Result<Value, EvalError> {
+    match name {
+        "list-ref" => {
+            let [Value::List(elems), idx_val] = args else {
+                return Err(EvalError::TypeError {
+                    message: "list-ref: expected list and integer".into(),
+                    span,
+                });
+            };
+            let idx = require_integer(idx_val, span)? as usize;
+            elems.get(idx).cloned().ok_or_else(|| EvalError::TypeError {
+                message: format!("list-ref: index {idx} out of range"),
+                span,
+            })
+        }
+        "list-tail" => {
+            let [Value::List(elems), idx_val] = args else {
+                return Err(EvalError::TypeError {
+                    message: "list-tail: expected list and integer".into(),
+                    span,
+                });
+            };
+            let idx = require_integer(idx_val, span)? as usize;
+            if idx > elems.len() {
+                return Err(EvalError::TypeError {
+                    message: format!("list-tail: index {idx} out of range"),
+                    span,
+                });
+            }
+            Ok(Value::List(elems[idx..].to_vec()))
+        }
+        "list?" => {
+            let [arg] = args else {
+                return Err(EvalError::WrongArgCount { expected: 1, got: args.len(), span });
+            };
+            match arg {
+                Value::List(_) => Ok(Value::Boolean(true)),
+                _ => Ok(Value::Boolean(false)),
+            }
+        }
+        "assoc" => {
+            let [key, Value::List(alist)] = args else {
+                return Err(EvalError::TypeError {
+                    message: "assoc: expected key and association list".into(),
+                    span,
+                });
+            };
+            let found = alist.iter().find(|entry| {
+                matches!(entry, Value::List(pair) if !pair.is_empty() && values_equal(&pair[0], key))
+            });
+            Ok(found.cloned().unwrap_or(Value::Boolean(false)))
+        }
+        _ => unreachable!(),
     }
 }
 
@@ -1326,6 +1673,9 @@ fn values_equal(a: &Value, b: &Value) -> bool {
         (Value::List(xs), Value::List(ys)) => {
             xs.len() == ys.len() && xs.iter().zip(ys).all(|(a, b)| values_equal(a, b))
         }
+        (Value::Pair(a1, a2), Value::Pair(b1, b2)) => {
+            values_equal(a1, b1) && values_equal(a2, b2)
+        }
         (Value::Vector(xs), Value::Vector(ys)) => {
             let xs = xs.borrow();
             let ys = ys.borrow();
@@ -1345,6 +1695,7 @@ fn values_eqv(a: &Value, b: &Value) -> bool {
         (Value::Symbol(x), Value::Symbol(y)) => x == y,
         (Value::Char(x), Value::Char(y)) => x == y,
         (Value::List(xs), Value::List(ys)) => xs.is_empty() && ys.is_empty(),
+        (Value::Pair(..), Value::Pair(..)) => false,
         (Value::Vector(x), Value::Vector(y)) => Rc::ptr_eq(x, y),
         (Value::Void, Value::Void) => true,
         _ => false,
