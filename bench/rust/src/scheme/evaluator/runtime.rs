@@ -3,7 +3,7 @@ use std::rc::Rc;
 
 use crate::scheme::ast::{Expr, SourceLocation};
 use crate::scheme::builtins::{apply_builtin, install_builtins};
-use crate::scheme::continuation::{CapturedContinuation, Frame};
+use crate::scheme::continuation::{CapturedContinuation, DynamicWind, Frame};
 use crate::scheme::environment::Environment;
 use crate::scheme::equality::is_eqv;
 use crate::scheme::error::{ArgCount, EvalError};
@@ -110,6 +110,7 @@ fn install_runtime_procedures(environment: &Environment) {
         "call-with-current-continuation",
         Value::CallWithCurrentContinuation,
     );
+    environment.define("dynamic-wind", Value::DynamicWind);
 }
 
 fn run(
@@ -1058,6 +1059,25 @@ fn continue_with_frame(
             value,
             continuation,
         ),
+        Frame::DynamicWindBefore { body, wind } => {
+            continue_dynamic_wind_before(body, wind, continuation)
+        }
+        Frame::DynamicWindExit { wind } => continue_dynamic_wind_exit(wind, value, continuation),
+        Frame::DynamicWindAfter { value } => continue_dynamic_wind_after(value, continuation),
+        Frame::DynamicWindContext { .. } => continue_dynamic_wind_context(value, continuation),
+        Frame::ContinuationTransition {
+            active_winds,
+            exit_winds,
+            enter_winds,
+            target_continuation,
+            value,
+        } => continue_continuation_transition(
+            active_winds,
+            exit_winds,
+            enter_winds,
+            target_continuation,
+            value,
+        ),
         Frame::RecursiveLet {
             binding_name,
             pending_rev,
@@ -1346,6 +1366,126 @@ fn continue_cond_clause(
     eval_sequence(body, environment, continuation)
 }
 
+fn continue_dynamic_wind_before(
+    body: Value,
+    wind: Rc<DynamicWind>,
+    mut continuation: ContinuationFrames,
+) -> Result<State, EvalError> {
+    continuation.push(Frame::DynamicWindExit { wind: wind.clone() });
+    Ok(State::Apply {
+        callable: body,
+        arguments: Vec::new(),
+        location: wind.location(),
+        continuation,
+    })
+}
+
+fn continue_dynamic_wind_exit(
+    wind: Rc<DynamicWind>,
+    value: Value,
+    mut continuation: ContinuationFrames,
+) -> Result<State, EvalError> {
+    continuation.push(Frame::DynamicWindAfter { value });
+    Ok(State::Apply {
+        callable: wind.after(),
+        arguments: Vec::new(),
+        location: wind.location(),
+        continuation,
+    })
+}
+
+fn continue_dynamic_wind_after(
+    value: Value,
+    continuation: ContinuationFrames,
+) -> Result<State, EvalError> {
+    Ok(State::Return {
+        value,
+        continuation,
+    })
+}
+
+fn continue_dynamic_wind_context(
+    value: Value,
+    continuation: ContinuationFrames,
+) -> Result<State, EvalError> {
+    Ok(State::Return {
+        value,
+        continuation,
+    })
+}
+
+fn continue_continuation_transition(
+    mut active_winds: Vec<Rc<DynamicWind>>,
+    mut exit_winds: Vec<Rc<DynamicWind>>,
+    mut enter_winds: Vec<Rc<DynamicWind>>,
+    target_continuation: ContinuationFrames,
+    value: Value,
+) -> Result<State, EvalError> {
+    if let Some(wind) = exit_winds.first().cloned() {
+        let popped = active_winds
+            .pop()
+            .expect("continuation transition should only exit active winds");
+        debug_assert!(
+            Rc::ptr_eq(&popped, &wind),
+            "continuation transition should unwind from innermost wind"
+        );
+        exit_winds.remove(0);
+        let continuation = transition_continuation(
+            &active_winds,
+            Frame::ContinuationTransition {
+                active_winds: active_winds.clone(),
+                exit_winds,
+                enter_winds,
+                target_continuation,
+                value,
+            },
+        );
+        return Ok(State::Apply {
+            callable: wind.after(),
+            arguments: Vec::new(),
+            location: wind.location(),
+            continuation,
+        });
+    }
+
+    if let Some(wind) = enter_winds.first().cloned() {
+        let mut next_active = active_winds.clone();
+        next_active.push(wind.clone());
+        enter_winds.remove(0);
+        let continuation = transition_continuation(
+            &active_winds,
+            Frame::ContinuationTransition {
+                active_winds: next_active,
+                exit_winds,
+                enter_winds,
+                target_continuation,
+                value,
+            },
+        );
+        return Ok(State::Apply {
+            callable: wind.before(),
+            arguments: Vec::new(),
+            location: wind.location(),
+            continuation,
+        });
+    }
+
+    Ok(State::Return {
+        value,
+        continuation: target_continuation,
+    })
+}
+
+fn transition_continuation(active_winds: &[Rc<DynamicWind>], frame: Frame) -> ContinuationFrames {
+    let mut continuation = active_winds
+        .iter()
+        .cloned()
+        .map(|wind| Frame::DynamicWindContext { wind })
+        .collect::<Vec<_>>();
+    continuation.push(frame);
+    continuation
+}
+
 fn continue_recursive_let(
     binding_name: String,
     progress: RecursiveLetProgress,
@@ -1394,7 +1534,10 @@ fn apply_value(
         Value::CallWithCurrentContinuation => {
             apply_call_with_current_continuation(arguments, location, continuation)
         }
-        Value::Continuation(captured) => apply_continuation(captured, arguments, location),
+        Value::DynamicWind => apply_dynamic_wind(arguments, location, continuation),
+        Value::Continuation(captured) => {
+            apply_continuation(captured, arguments, location, continuation)
+        }
         other => Err(EvalError::NotCallable {
             location,
             expression: other.render(),
@@ -1463,10 +1606,39 @@ fn apply_call_with_current_continuation(
     })
 }
 
+fn apply_dynamic_wind(
+    arguments: Vec<Value>,
+    location: SourceLocation,
+    mut continuation: ContinuationFrames,
+) -> Result<State, EvalError> {
+    let [before, body, after] = arguments.as_slice() else {
+        return Err(EvalError::WrongArgumentCount {
+            location,
+            procedure: "dynamic-wind",
+            expected: ArgCount::Exactly(3),
+            got: arguments.len(),
+        });
+    };
+
+    let wind = Rc::new(DynamicWind::new(before.clone(), after.clone(), location));
+    continuation.push(Frame::DynamicWindBefore {
+        body: body.clone(),
+        wind,
+    });
+
+    Ok(State::Apply {
+        callable: before.clone(),
+        arguments: Vec::new(),
+        location,
+        continuation,
+    })
+}
+
 fn apply_continuation(
     captured: Rc<CapturedContinuation>,
     arguments: Vec<Value>,
     location: SourceLocation,
+    continuation: ContinuationFrames,
 ) -> Result<State, EvalError> {
     let [value] = arguments.as_slice() else {
         return Err(EvalError::WrongArgumentCount {
@@ -1477,10 +1649,54 @@ fn apply_continuation(
         });
     };
 
-    Ok(State::Return {
-        value: value.clone(),
-        continuation: normalize_resumed_continuation(captured.frames(), value),
-    })
+    resume_continuation(
+        continuation,
+        normalize_resumed_continuation(captured.frames(), value),
+        value.clone(),
+    )
+}
+
+fn resume_continuation(
+    current_continuation: ContinuationFrames,
+    target_continuation: ContinuationFrames,
+    value: Value,
+) -> Result<State, EvalError> {
+    let current_winds = continuation_winds(&current_continuation);
+    let target_winds = continuation_winds(&target_continuation);
+    let shared_prefix = shared_wind_prefix(&current_winds, &target_winds);
+
+    continue_continuation_transition(
+        current_winds.clone(),
+        current_winds[shared_prefix..]
+            .iter()
+            .rev()
+            .cloned()
+            .collect(),
+        target_winds[shared_prefix..].to_vec(),
+        target_continuation,
+        value,
+    )
+}
+
+fn continuation_winds(continuation: &[Frame]) -> Vec<Rc<DynamicWind>> {
+    continuation
+        .iter()
+        .filter_map(active_dynamic_wind)
+        .collect()
+}
+
+fn active_dynamic_wind(frame: &Frame) -> Option<Rc<DynamicWind>> {
+    match frame {
+        Frame::DynamicWindExit { wind } | Frame::DynamicWindContext { wind } => Some(wind.clone()),
+        _ => None,
+    }
+}
+
+fn shared_wind_prefix(left: &[Rc<DynamicWind>], right: &[Rc<DynamicWind>]) -> usize {
+    left.iter()
+        .zip(right)
+        .take_while(|(left, right)| Rc::ptr_eq(left, right))
+        .count()
 }
 
 fn normalize_resumed_continuation(

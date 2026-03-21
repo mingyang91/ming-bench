@@ -28,6 +28,7 @@ pub enum Value {
     Vector(SchemeVector),
     Builtin(BuiltinProcedure),
     CallWithCurrentContinuation,
+    DynamicWind,
     Continuation(Rc<CapturedContinuation>),
     Closure(Closure),
     Void,
@@ -92,6 +93,7 @@ impl Value {
             Self::Vector(vector) => render_vector(vector, mode),
             Self::Builtin(procedure) => format!("#<procedure:{}>", procedure.name()),
             Self::CallWithCurrentContinuation => "#<procedure:call/cc>".into(),
+            Self::DynamicWind => "#<procedure:dynamic-wind>".into(),
             Self::Continuation(_) => "#<continuation>".into(),
             Self::Closure(closure) => render_closure(closure),
             Self::Void => "#<void>".into(),
@@ -170,6 +172,7 @@ impl Value {
             Self::Vector(_) => "vector",
             Self::Builtin(_)
             | Self::CallWithCurrentContinuation
+            | Self::DynamicWind
             | Self::Continuation(_)
             | Self::Closure(_) => "procedure",
             Self::Void => "void",

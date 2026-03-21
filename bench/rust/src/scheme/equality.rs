@@ -17,6 +17,7 @@ pub fn is_eqv(left: &Value, right: &Value) -> bool {
         (Value::Vector(left), Value::Vector(right)) => left.is_same_object(right),
         (Value::Builtin(left), Value::Builtin(right)) => left == right,
         (Value::CallWithCurrentContinuation, Value::CallWithCurrentContinuation) => true,
+        (Value::DynamicWind, Value::DynamicWind) => true,
         (Value::Continuation(left), Value::Continuation(right)) => Rc::ptr_eq(left, right),
         (Value::Void, Value::Void) => true,
         (Value::Uninitialized, Value::Uninitialized) => true,

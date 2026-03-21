@@ -40,6 +40,7 @@ pub enum BuiltinProcedure {
     ListTail,
     ListPred,
     Length,
+    Reverse,
     Assoc,
     StringPred,
     NumberPred,
@@ -124,6 +125,7 @@ impl BuiltinProcedure {
             Self::ListTail => "list-tail",
             Self::ListPred => "list?",
             Self::Length => "length",
+            Self::Reverse => "reverse",
             Self::Assoc => "assoc",
             Self::StringPred => "string?",
             Self::NumberPred => "number?",
@@ -209,6 +211,7 @@ pub fn install_builtins(environment: &Environment) {
         BuiltinProcedure::ListTail,
         BuiltinProcedure::ListPred,
         BuiltinProcedure::Length,
+        BuiltinProcedure::Reverse,
         BuiltinProcedure::Assoc,
         BuiltinProcedure::StringPred,
         BuiltinProcedure::NumberPred,
@@ -322,6 +325,7 @@ pub fn apply_builtin(
         BuiltinProcedure::ListTail => eval_list_tail(arguments, location),
         BuiltinProcedure::ListPred => eval_list_pred(arguments, location),
         BuiltinProcedure::Length => eval_length(arguments, location),
+        BuiltinProcedure::Reverse => eval_reverse(arguments, location),
         BuiltinProcedure::Assoc => eval_assoc(arguments, location),
         BuiltinProcedure::StringPred => {
             eval_type_predicate("string?", arguments, location, is_string)
@@ -608,6 +612,13 @@ fn eval_null(arguments: &[Value], location: SourceLocation) -> Result<Value, Eva
 
 fn eval_list(arguments: &[Value]) -> Value {
     list_from_values(arguments)
+}
+
+fn eval_reverse(arguments: &[Value], location: SourceLocation) -> Result<Value, EvalError> {
+    let list = unary_argument("reverse", arguments, location)?;
+    let mut items = proper_list_items(list, location)?;
+    items.reverse();
+    Ok(list_from_values(&items))
 }
 
 fn eval_length(arguments: &[Value], location: SourceLocation) -> Result<Value, EvalError> {
