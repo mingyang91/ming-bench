@@ -64,6 +64,15 @@ fn env_set(env: &Env, name: String, val: Value) {
     env.borrow_mut().bindings.insert(name, val);
 }
 
+fn env_set_existing(env: &Env, name: &str, val: Value) {
+    let mut inner = env.borrow_mut();
+    if inner.bindings.contains_key(name) {
+        inner.bindings.insert(name.to_string(), val);
+    } else if let Some(ref parent) = inner.parent {
+        env_set_existing(parent, name, val);
+    }
+}
+
 impl Value {
     fn display(&self) -> String {
         match self {
@@ -272,6 +281,19 @@ fn parse(tokens: &[Token], pos: usize) -> Result<(Value, usize), EvalError> {
             Value::List(vec![Value::Symbol("quote".to_string()), inner]),
             next,
         ));
+    }
+
+    // Character literal: #\x, #\space, #\newline
+    if token.starts_with("#\\") && token.len() >= 3 {
+        let char_name = &token[2..];
+        let c = match char_name {
+            "space" => ' ',
+            "newline" => '\n',
+            "tab" => '\t',
+            _ if char_name.len() == 1 => char_name.chars().next().unwrap(),
+            _ => return Err(EvalError::Parse(format!("unknown character: {}", token))),
+        };
+        return Ok((Value::Char(c), pos + 1));
     }
 
     // Symbol
@@ -514,6 +536,32 @@ fn eval(expr: Value, env: &Env, pos: Pos) -> Result<Value, EvalError> {
                                 }
                             }
                         }
+                        Ok(Value::Boolean(false))
+                    }
+                    "string-set!" => {
+                        if elems.len() != 4 {
+                            return Err(runtime_err(pos, "string-set! requires 3 arguments"));
+                        }
+                        let var_name = match &elems[1] {
+                            Value::Symbol(s) => s.clone(),
+                            _ => return Err(runtime_err(pos, "string-set!: first arg must be a variable")),
+                        };
+                        let idx = expect_int(&eval(elems[2].clone(), env, pos)?, pos)? as usize;
+                        let ch = match eval(elems[3].clone(), env, pos)? {
+                            Value::Char(c) => c,
+                            _ => return Err(runtime_err(pos, "string-set!: third arg must be a char")),
+                        };
+                        let mut s = match env_get(env, &var_name) {
+                            Some(Value::Str(s)) => s,
+                            _ => return Err(runtime_err(pos, "string-set!: variable is not a string")),
+                        };
+                        let mut chars: Vec<char> = s.chars().collect();
+                        if idx >= chars.len() {
+                            return Err(runtime_err(pos, "string-set!: index out of bounds"));
+                        }
+                        chars[idx] = ch;
+                        s = chars.into_iter().collect();
+                        env_set_existing(env, &var_name, Value::Str(s));
                         Ok(Value::Boolean(false))
                     }
                     _ => {
@@ -863,6 +911,15 @@ fn apply_builtin_vals(op: &str, vals: &[Value], pos: Pos) -> Result<Value, EvalE
                 return Err(runtime_err(pos, "string-ref: index out of bounds"));
             }
             Ok(Value::Char(s.chars().nth(idx).unwrap()))
+        }
+        "string-copy" => {
+            if vals.len() != 1 {
+                return Err(runtime_err(pos, "string-copy requires 1 argument"));
+            }
+            match &vals[0] {
+                Value::Str(s) => Ok(Value::Str(s.clone())),
+                _ => Err(runtime_err(pos, "string-copy: expected string")),
+            }
         }
         "char?" => {
             if vals.len() != 1 {
