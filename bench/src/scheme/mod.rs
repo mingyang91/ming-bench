@@ -499,6 +499,56 @@ fn apply_builtin_vals(op: &str, vals: &[Value]) -> Result<Value, EvalError> {
             }
             Ok(Value::Boolean(vals[0] == Value::Boolean(false)))
         }
+        "cons" => {
+            if vals.len() != 2 {
+                return Err(EvalError::Runtime("cons requires 2 arguments".to_string()));
+            }
+            match &vals[1] {
+                Value::List(tail) => {
+                    let mut new_list = vec![vals[0].clone()];
+                    new_list.extend(tail.iter().cloned());
+                    Ok(Value::List(new_list))
+                }
+                _ => {
+                    // Dotted pair - represent as a 2-element special case for now
+                    Ok(Value::List(vec![vals[0].clone(), Value::Symbol(".".to_string()), vals[1].clone()]))
+                }
+            }
+        }
+        "car" => {
+            if vals.len() != 1 {
+                return Err(EvalError::Runtime("car requires 1 argument".to_string()));
+            }
+            match &vals[0] {
+                Value::List(elems) if !elems.is_empty() => Ok(elems[0].clone()),
+                _ => Err(EvalError::Runtime("car: not a pair".to_string())),
+            }
+        }
+        "cdr" => {
+            if vals.len() != 1 {
+                return Err(EvalError::Runtime("cdr requires 1 argument".to_string()));
+            }
+            match &vals[0] {
+                Value::List(elems) if !elems.is_empty() => Ok(Value::List(elems[1..].to_vec())),
+                _ => Err(EvalError::Runtime("cdr: not a pair".to_string())),
+            }
+        }
+        "null?" => {
+            if vals.len() != 1 {
+                return Err(EvalError::Runtime("null? requires 1 argument".to_string()));
+            }
+            Ok(Value::Boolean(matches!(&vals[0], Value::List(elems) if elems.is_empty())))
+        }
+        "list" => Ok(Value::List(vals.to_vec())),
+        "length" => {
+            if vals.len() != 1 {
+                return Err(EvalError::Runtime("length requires 1 argument".to_string()));
+            }
+            match &vals[0] {
+                Value::List(elems) => Ok(Value::Integer(elems.len() as i64)),
+                _ => Err(EvalError::Runtime("length: not a list".to_string())),
+            }
+        }
         _ => Err(EvalError::Runtime(format!("unknown procedure: {}", op))),
     }
 }
