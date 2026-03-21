@@ -73,3 +73,18 @@ Combined use of continuations, macros, mutation, and tail calls.
 
 ### Level 15 — Numeric/Char/String Utilities
 `abs` returns absolute value. `modulo` and `remainder` compute division remainders (they differ in sign for negative operands — `modulo` takes the sign of the divisor, `remainder` takes the sign of the dividend). `quotient` returns integer division truncated toward zero. `min` and `max` are variadic. `expt` computes integer exponentiation. `zero?`, `positive?`, `negative?` test the sign of a number. `odd?`, `even?` test integer parity. `list-ref` returns the element at a given index. `list-tail` returns the sublist starting at a given index. `list?` returns `#t` for proper lists (including `'()`), `#f` for dotted pairs and non-pairs. `assoc` searches an association list using `equal?`. Built-in `map` supports multiple list arguments: `(map + '(1 2) '(3 4))` → `(4 6)`. Character literals: `#\a`, `#\Z`, `#\5`, `#\space`, `#\newline`. `char-alphabetic?` and `char-numeric?` are character class predicates. `char-upcase` and `char-downcase` convert case. `char=?` and `char<?` compare characters by code point. `string=?` tests string equality. `string<?` compares lexicographically. `string-ci=?` is case-insensitive equality. `string-upcase` and `string-downcase` return a new string with all characters converted.
+
+### Level 16 — dynamic-wind
+`dynamic-wind` takes three thunks: in-thunk, body-thunk, out-thunk. The in-thunk runs before the body, the out-thunk runs after — even on non-local exit via `call/cc`. On continuation re-entry, the in-thunk fires again. Nested `dynamic-wind` must unwind/rewind in the correct order. `dynamic-wind` returns the body's value.
+
+### Level 17 — guard, raise & with-exception-handler
+`raise` signals an exception with an arbitrary value. `guard` catches exceptions with cond-like clauses that test the raised value. If no clause matches and there is no `else`, the exception is re-raised. `with-exception-handler` installs a low-level handler. `guard` + `dynamic-wind` must cooperate: out-thunks run when an exception unwinds the stack.
+
+### Level 18 — values & call-with-values
+`values` returns zero or more values. A single value is transparent — `(+ 1 (values 41))` → `42`. `call-with-values` takes a producer thunk and a consumer procedure; the producer's values become the consumer's arguments. Zero values are valid: `(call-with-values (lambda () (values)) (lambda () 42))` → `42`. Nested `call-with-values` composes.
+
+### Level 19 — Exact Arithmetic & Rationals
+Numbers are either exact or inexact. Integers are exact. Division of exact integers produces exact rationals: `(/ 1 3)` → `1/3`. Rational arithmetic preserves exactness and always simplifies: `(/ 6 4)` → `3/2`. `exact?`, `inexact?` test exactness. `exact->inexact` and `inexact->exact` convert between representations. `numerator` and `denominator` extract parts of a rational. `integer?` returns `#f` for non-integer rationals but `#t` for `4/2`. `rational?` returns `#t` for all exact numbers. Cross-tower comparison: `(= 1/2 0.5)` → `#t`.
+
+### Level 20 — define-record-type
+R7RS `define-record-type` creates a new disjoint type with a constructor, predicate, and field accessors. Each record type is distinct — `(point? '(1 2))` → `#f`. Multiple record types can coexist. Records work with higher-order functions and can contain other records.
