@@ -23,6 +23,7 @@ enum Value {
     },
     Builtin(String),
     Continuation { id: usize, top_expr_idx: usize, call_line: usize, call_col: usize },
+    Vector(Rc<RefCell<Vec<Value>>>),
     Macro {
         literals: Vec<String>,
         rules: Vec<(Ast, Ast)>,
@@ -60,6 +61,11 @@ impl Value {
             Value::Char(c) => format!("#\\{}", c),
             Value::Lambda { .. } => "#<procedure>".to_string(),
             Value::Builtin(_) => "#<procedure>".to_string(),
+            Value::Vector(v) => {
+                let items = v.borrow();
+                let parts: Vec<String> = items.iter().map(|v| v.to_scheme_string()).collect();
+                format!("#({})", parts.join(" "))
+            }
             Value::Continuation { .. } => "#<continuation>".to_string(),
             Value::Macro { .. } => "#<macro>".to_string(),
             Value::List(items) => {
@@ -267,6 +273,11 @@ fn values_equal(a: &Value, b: &Value) -> bool {
         (Value::List(xs), Value::List(ys)) => {
             xs.len() == ys.len() && xs.iter().zip(ys.iter()).all(|(a, b)| values_equal(a, b))
         }
+        (Value::Vector(xs), Value::Vector(ys)) => {
+            let xs = xs.borrow();
+            let ys = ys.borrow();
+            xs.len() == ys.len() && xs.iter().zip(ys.iter()).all(|(a, b)| values_equal(a, b))
+        }
         _ => false,
     }
 }
@@ -281,7 +292,9 @@ fn is_builtin(name: &str) -> bool {
         "string-copy" | "string-ref" | "char?" | "map" |
         "string->list" | "list->string" | "char->integer" | "integer->char" |
         "apply" | "call/cc" | "call-with-current-continuation" |
-        "equal?" | "eq?" | "eqv?")
+        "equal?" | "eq?" | "eqv?" |
+        "vector" | "make-vector" | "vector-ref" | "vector-set!" | "vector-length" |
+        "vector?" | "vector->list" | "list->vector")
 }
 
 fn parse_params(param_asts: &[Ast]) -> Result<(Vec<String>, Option<String>), EvalError> {
@@ -1535,6 +1548,69 @@ fn apply_builtin(op: &str, args: &[Value], out: &mut String) -> Result<Value, Ev
             if args.len() != 1 { return Err(EvalError::Arity); }
             let n = expect_integer(&args[0])?;
             Ok(Value::Char(char::from_u32(n as u32).unwrap_or('\0')))
+        }
+        "vector" => {
+            Ok(Value::Vector(Rc::new(RefCell::new(args.to_vec()))))
+        }
+        "make-vector" => {
+            if args.is_empty() || args.len() > 2 { return Err(EvalError::Arity); }
+            let len = expect_integer(&args[0])? as usize;
+            let fill = if args.len() == 2 { args[1].clone() } else { Value::Integer(0) };
+            Ok(Value::Vector(Rc::new(RefCell::new(vec![fill; len]))))
+        }
+        "vector-ref" => {
+            if args.len() != 2 { return Err(EvalError::Arity); }
+            match &args[0] {
+                Value::Vector(v) => {
+                    let idx = expect_integer(&args[1])? as usize;
+                    let items = v.borrow();
+                    if idx >= items.len() {
+                        return Err(EvalError::TypeError("vector-ref: index out of range".into()));
+                    }
+                    Ok(items[idx].clone())
+                }
+                _ => Err(EvalError::TypeError("vector-ref: expected vector".into())),
+            }
+        }
+        "vector-set!" => {
+            if args.len() != 3 { return Err(EvalError::Arity); }
+            match &args[0] {
+                Value::Vector(v) => {
+                    let idx = expect_integer(&args[1])? as usize;
+                    let mut items = v.borrow_mut();
+                    if idx >= items.len() {
+                        return Err(EvalError::TypeError("vector-set!: index out of range".into()));
+                    }
+                    items[idx] = args[2].clone();
+                    Ok(Value::Symbol("ok".into()))
+                }
+                _ => Err(EvalError::TypeError("vector-set!: expected vector".into())),
+            }
+        }
+        "vector-length" => {
+            if args.len() != 1 { return Err(EvalError::Arity); }
+            match &args[0] {
+                Value::Vector(v) => Ok(Value::Integer(v.borrow().len() as i64)),
+                _ => Err(EvalError::TypeError("vector-length: expected vector".into())),
+            }
+        }
+        "vector?" => {
+            if args.len() != 1 { return Err(EvalError::Arity); }
+            Ok(Value::Boolean(matches!(&args[0], Value::Vector(_))))
+        }
+        "vector->list" => {
+            if args.len() != 1 { return Err(EvalError::Arity); }
+            match &args[0] {
+                Value::Vector(v) => Ok(Value::List(v.borrow().clone())),
+                _ => Err(EvalError::TypeError("vector->list: expected vector".into())),
+            }
+        }
+        "list->vector" => {
+            if args.len() != 1 { return Err(EvalError::Arity); }
+            match &args[0] {
+                Value::List(items) => Ok(Value::Vector(Rc::new(RefCell::new(items.clone())))),
+                _ => Err(EvalError::TypeError("list->vector: expected list".into())),
+            }
         }
         _ => Err(EvalError::UndefinedVariable(op.to_string())),
     }
