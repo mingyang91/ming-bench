@@ -6,16 +6,23 @@ use std::cell::RefCell;
 use std::collections::HashMap;
 use std::rc::Rc;
 
-thread_local! {
-    static OUTPUT_BUFFER: RefCell<String> = RefCell::new(String::new());
+type Pos = (usize, usize);
+
+#[derive(Debug, Clone, PartialEq)]
+struct EnvInner {
+    bindings: HashMap<String, Value>,
+    parent: Option<Env>,
 }
 
-fn output_write(s: &str) {
-    OUTPUT_BUFFER.with(|buf| buf.borrow_mut().push_str(s));
-}
+type Env = Rc<RefCell<EnvInner>>;
 
-fn output_take() -> String {
-    OUTPUT_BUFFER.with(|buf| buf.borrow_mut().split_off(0))
+/// Data captured by a first-class continuation.
+#[derive(Debug, Clone, PartialEq)]
+struct ContinuationData {
+    replay_expr: Value,
+    replay_pos: Pos,
+    remaining_exprs: Vec<(Value, Pos)>,
+    env: Env,
 }
 
 /// A Scheme value.
@@ -34,15 +41,23 @@ enum Value {
         env: Env,
     },
     Builtin(String),
+    Continuation(Rc<ContinuationData>),
 }
 
-#[derive(Debug, Clone, PartialEq)]
-struct EnvInner {
-    bindings: HashMap<String, Value>,
-    parent: Option<Env>,
+thread_local! {
+    static OUTPUT_BUFFER: RefCell<String> = RefCell::new(String::new());
+    static CONT_RETURN: RefCell<Option<Value>> = RefCell::new(None);
+    static CONT_CONTEXT: RefCell<Option<(Value, Pos, Vec<(Value, Pos)>, Env)>> = RefCell::new(None);
+    static CONT_INVOKE_DATA: RefCell<Option<(Rc<ContinuationData>, Value)>> = RefCell::new(None);
 }
 
-type Env = Rc<RefCell<EnvInner>>;
+fn output_write(s: &str) {
+    OUTPUT_BUFFER.with(|buf| buf.borrow_mut().push_str(s));
+}
+
+fn output_take() -> String {
+    OUTPUT_BUFFER.with(|buf| buf.borrow_mut().split_off(0))
+}
 
 fn new_env(parent: Option<Env>) -> Env {
     Rc::new(RefCell::new(EnvInner {
@@ -87,7 +102,7 @@ impl Value {
             Value::Str(s) => format!("\"{}\"", s),
             Value::Symbol(s) => s.clone(),
             Value::Char(c) => format!("#\\{}", c),
-            Value::Lambda { .. } | Value::Builtin(_) => "#<procedure>".to_string(),
+            Value::Lambda { .. } | Value::Builtin(_) | Value::Continuation(_) => "#<procedure>".to_string(),
             Value::List(elems) => {
                 let inner: Vec<String> = elems.iter().map(|v| v.display()).collect();
                 format!("({})", inner.join(" "))
@@ -114,8 +129,6 @@ struct Token {
     line: usize,
     col: usize,
 }
-
-type Pos = (usize, usize);
 
 fn runtime_err(pos: Pos, msg: impl std::fmt::Display) -> EvalError {
     EvalError::Runtime(format!("{}:{}: {}", pos.0, pos.1, msg))
@@ -333,11 +346,43 @@ pub fn eval_str(input: &str) -> Result<String, EvalError> {
         return Err(EvalError::Parse("empty input".to_string()));
     }
     let env = new_env(None);
+    eval_top_level(&exprs, &env).map(|v| v.display())
+}
+
+/// Evaluate a sequence of top-level expressions, handling continuation invocations.
+fn eval_top_level(exprs: &[(Value, Pos)], env: &Env) -> Result<Value, EvalError> {
     let mut result = Value::Boolean(false);
-    for (expr, pos) in exprs {
-        result = eval(expr, &env, pos)?;
+    let mut i = 0;
+    while i < exprs.len() {
+        // Set continuation context so call/cc can capture the current position
+        CONT_CONTEXT.with(|c| {
+            *c.borrow_mut() = Some((
+                exprs[i].0.clone(),
+                exprs[i].1,
+                exprs[i + 1..].to_vec(),
+                env.clone(),
+            ));
+        });
+
+        match eval(exprs[i].0.clone(), env, exprs[i].1) {
+            Ok(v) => {
+                result = v;
+                i += 1;
+            }
+            Err(EvalError::ContinuationInvoke) => {
+                // A continuation was invoked — replay from its capture point
+                let (data, value) = CONT_INVOKE_DATA
+                    .with(|d| d.borrow_mut().take())
+                    .expect("ContinuationInvoke without data");
+                CONT_RETURN.with(|c| *c.borrow_mut() = Some(value));
+                let mut replay = vec![(data.replay_expr.clone(), data.replay_pos)];
+                replay.extend(data.remaining_exprs.iter().cloned());
+                return eval_top_level(&replay, &data.env);
+            }
+            Err(e) => return Err(e),
+        }
     }
-    Ok(result.display())
+    Ok(result)
 }
 
 fn eval(mut expr: Value, env: &Env, pos: Pos) -> Result<Value, EvalError> {
@@ -347,7 +392,7 @@ fn eval(mut expr: Value, env: &Env, pos: Pos) -> Result<Value, EvalError> {
     loop {
         let current = std::mem::replace(&mut expr, Value::Boolean(false));
         match current {
-            Value::Integer(_) | Value::Boolean(_) | Value::Str(_) | Value::Char(_) | Value::Lambda { .. } | Value::Builtin(_) => return Ok(current),
+            Value::Integer(_) | Value::Boolean(_) | Value::Str(_) | Value::Char(_) | Value::Lambda { .. } | Value::Builtin(_) | Value::Continuation(_) => return Ok(current),
             Value::Symbol(s) => {
                 return env_get(&current_env, &s)
                     .or_else(|| if is_builtin(&s) { Some(Value::Builtin(s.clone())) } else { None })
@@ -617,6 +662,17 @@ fn eval(mut expr: Value, env: &Env, pos: Pos) -> Result<Value, EvalError> {
                             }
                             return Ok(Value::Boolean(false));
                         }
+                        "call/cc" | "call-with-current-continuation" => {
+                            if elems.len() != 2 {
+                                return Err(runtime_err(current_pos, "call/cc requires 1 argument"));
+                            }
+                            let pending = CONT_RETURN.with(|c| c.borrow_mut().take());
+                            if let Some(val) = pending {
+                                return Ok(val);
+                            }
+                            let proc = eval(elems[1].clone(), &current_env, current_pos)?;
+                            return handle_callcc(&proc, &current_env, current_pos);
+                        }
                         "string-set!" => {
                             return Err(runtime_err(current_pos, "string-set!: strings are immutable"));
                         }
@@ -644,8 +700,21 @@ fn eval(mut expr: Value, env: &Env, pos: Pos) -> Result<Value, EvalError> {
                                         current_env = call_env;
                                         continue;
                                     }
+                                    Value::Builtin(ref name) if name == "call/cc" || name == "call-with-current-continuation" => {
+                                        if args.len() != 1 {
+                                            return Err(runtime_err(current_pos, "call/cc requires 1 argument"));
+                                        }
+                                        let pending = CONT_RETURN.with(|c| c.borrow_mut().take());
+                                        if let Some(val) = pending {
+                                            return Ok(val);
+                                        }
+                                        return handle_callcc(&args[0], &current_env, current_pos);
+                                    }
                                     Value::Builtin(name) => {
                                         return call_builtin(&name, args, &current_env, current_pos);
+                                    }
+                                    Value::Continuation(data) => {
+                                        return invoke_continuation(&data, &args, current_pos);
                                     }
                                     _ => return Err(runtime_err(current_pos, format!("{} is not a procedure", op))),
                                 }
@@ -671,8 +740,21 @@ fn eval(mut expr: Value, env: &Env, pos: Pos) -> Result<Value, EvalError> {
                                 current_env = call_env;
                                 continue;
                             }
+                            Value::Builtin(ref name) if name == "call/cc" || name == "call-with-current-continuation" => {
+                                if args.len() != 1 {
+                                    return Err(runtime_err(current_pos, "call/cc requires 1 argument"));
+                                }
+                                let pending = CONT_RETURN.with(|c| c.borrow_mut().take());
+                                if let Some(val) = pending {
+                                    return Ok(val);
+                                }
+                                return handle_callcc(&args[0], &current_env, current_pos);
+                            }
                             Value::Builtin(name) => {
                                 return call_builtin(&name, args, &current_env, current_pos);
+                            }
+                            Value::Continuation(data) => {
+                                return invoke_continuation(&data, &args, current_pos);
                             }
                             _ => return Err(runtime_err(current_pos, "<anonymous> is not a procedure")),
                         }
@@ -706,6 +788,9 @@ fn apply_proc(
         }
         Value::Builtin(bname) => {
             apply_builtin_vals(bname, args, pos)
+        }
+        Value::Continuation(data) => {
+            invoke_continuation(data, args, pos)
         }
         _ => Err(runtime_err(
             pos,
@@ -765,6 +850,41 @@ fn bind_args(
     Ok(call_env)
 }
 
+/// Invoke a continuation: stores data in thread-local and returns ContinuationInvoke error.
+fn invoke_continuation(data: &Rc<ContinuationData>, args: &[Value], pos: Pos) -> Result<Value, EvalError> {
+    if args.len() != 1 {
+        return Err(runtime_err(pos, "continuation requires 1 argument"));
+    }
+    CONT_INVOKE_DATA.with(|d| *d.borrow_mut() = Some((data.clone(), args[0].clone())));
+    Err(EvalError::ContinuationInvoke)
+}
+
+/// Handle call/cc: check for pending return or create a continuation and call the proc.
+fn handle_callcc(proc: &Value, env: &Env, pos: Pos) -> Result<Value, EvalError> {
+    // Check for pending return (we're in a replay)
+    let pending = CONT_RETURN.with(|c| c.borrow_mut().take());
+    if let Some(val) = pending {
+        return Ok(val);
+    }
+
+    // Create continuation from current context
+    let ctx = CONT_CONTEXT.with(|c| c.borrow().clone());
+    let cont = match ctx {
+        Some((replay_expr, replay_pos, remaining, cont_env)) => {
+            Value::Continuation(Rc::new(ContinuationData {
+                replay_expr,
+                replay_pos,
+                remaining_exprs: remaining,
+                env: cont_env,
+            }))
+        }
+        None => return Err(runtime_err(pos, "call/cc: no continuation context")),
+    };
+
+    // Call proc with the continuation
+    apply_proc(proc, "call/cc", &[cont], env, pos)
+}
+
 fn is_builtin(name: &str) -> bool {
     matches!(name,
         "+" | "-" | "*" | "/" | "<" | ">" | "=" | "<=" | ">=" |
@@ -775,12 +895,23 @@ fn is_builtin(name: &str) -> bool {
         "string->number" | "number->string" | "symbol->string" | "string->symbol" |
         "string-ref" | "string-copy" | "char?" | "string->list" | "list->string" |
         "char->integer" | "integer->char" |
-        "apply" | "map"
+        "apply" | "map" |
+        "call/cc" | "call-with-current-continuation"
     )
 }
 
 fn call_builtin(name: &str, args: Vec<Value>, env: &Env, pos: Pos) -> Result<Value, EvalError> {
     match name {
+        "call/cc" | "call-with-current-continuation" => {
+            if args.len() != 1 {
+                return Err(runtime_err(pos, "call/cc requires 1 argument"));
+            }
+            let pending = CONT_RETURN.with(|c| c.borrow_mut().take());
+            if let Some(val) = pending {
+                return Ok(val);
+            }
+            handle_callcc(&args[0], env, pos)
+        }
         "apply" => {
             if args.len() < 2 {
                 return Err(runtime_err(pos, "apply requires at least 2 arguments"));
@@ -802,6 +933,7 @@ fn call_builtin(name: &str, args: Vec<Value>, env: &Env, pos: Pos) -> Result<Val
                     Ok(result)
                 }
                 Value::Builtin(bname) => apply_builtin_vals(bname, &all_args, pos),
+                Value::Continuation(data) => invoke_continuation(data, &all_args, pos),
                 _ => Err(runtime_err(pos, "apply: first argument must be a procedure")),
             }
         }
@@ -1177,17 +1309,13 @@ fn expect_int(v: &Value, pos: Pos) -> Result<i64, EvalError> {
 /// Evaluate Scheme expressions, returning both the result value and
 /// any output produced by `display`, `write`, or `newline`.
 pub fn eval_str_with_output(input: &str) -> Result<(String, String), EvalError> {
-    // Clear any prior output
     output_take();
     let exprs = parse_all(input)?;
     if exprs.is_empty() {
         return Err(EvalError::Parse("empty input".to_string()));
     }
     let env = new_env(None);
-    let mut result = Value::Boolean(false);
-    for (expr, pos) in exprs {
-        result = eval(expr, &env, pos)?;
-    }
+    let result = eval_top_level(&exprs, &env)?;
     let output = output_take();
     Ok((result.display(), output))
 }
