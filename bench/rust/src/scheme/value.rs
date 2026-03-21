@@ -31,6 +31,7 @@ pub enum Value {
 pub struct Closure {
     pub name: Option<String>,
     pub parameters: Vec<String>,
+    pub rest_parameter: Option<String>,
     pub body: Vec<Expr>,
     pub environment: Environment,
 }
@@ -39,12 +40,14 @@ impl Closure {
     pub fn new(
         name: Option<String>,
         parameters: Vec<String>,
+        rest_parameter: Option<String>,
         body: Vec<Expr>,
         environment: Environment,
     ) -> Self {
         Self {
             name,
             parameters,
+            rest_parameter,
             body,
             environment,
         }
@@ -146,6 +149,16 @@ impl Value {
             Self::Void => "void",
         }
     }
+}
+
+pub fn list_from_values(values: &[Value]) -> Value {
+    values
+        .iter()
+        .rev()
+        .cloned()
+        .fold(Value::EmptyList, |tail, value| {
+            Value::Pair(Box::new(value), Box::new(tail))
+        })
 }
 
 fn render_boolean(value: bool) -> String {

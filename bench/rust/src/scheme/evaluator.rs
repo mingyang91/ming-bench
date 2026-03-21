@@ -2,7 +2,7 @@ use crate::scheme::ast::{Expr, SourceLocation};
 use crate::scheme::builtins::{apply_builtin, install_builtins};
 use crate::scheme::environment::Environment;
 use crate::scheme::error::{ArgCount, EvalError};
-use crate::scheme::value::{Closure, Value};
+use crate::scheme::value::{list_from_values, Closure, Value};
 
 enum EvalAction {
     Value(Value),
@@ -11,6 +11,11 @@ enum EvalAction {
         arguments: Vec<Value>,
         location: SourceLocation,
     },
+}
+
+struct ParsedFormals {
+    required_parameters: Vec<String>,
+    rest_parameter: Option<String>,
 }
 
 pub fn eval_program(expressions: &[Expr]) -> Result<Value, EvalError> {
@@ -252,10 +257,11 @@ fn define_function(
             form: "define",
         });
     };
+    let formals = parse_formals(parameters, "define")?;
 
     let closure = build_closure(
         Some(name.clone()),
-        parameters,
+        formals,
         body,
         environment.clone(),
         "define",
@@ -291,20 +297,11 @@ fn eval_lambda(
             got: 0,
         });
     };
-
-    let Expr::List {
-        items: parameters, ..
-    } = parameters
-    else {
-        return Err(EvalError::InvalidParameterList {
-            location,
-            form: "lambda",
-        });
-    };
+    let formals = parse_lambda_formals(parameters, "lambda", location)?;
 
     let closure = build_closure(
         None,
-        parameters,
+        formals,
         body,
         environment.clone(),
         "lambda",
@@ -378,6 +375,7 @@ fn eval_named_let(
     let closure = build_closure_from_names(
         Some(name.to_string()),
         parameters,
+        None,
         body,
         closure_environment.clone(),
         "let",
@@ -486,29 +484,27 @@ fn eval_tail_cond_clause(
 
 fn build_closure(
     name: Option<String>,
-    parameters: &[Expr],
+    formals: ParsedFormals,
     body: &[Expr],
     environment: Environment,
     form: &'static str,
     location: SourceLocation,
 ) -> Result<Closure, EvalError> {
-    let parameters = parameters
-        .iter()
-        .map(|parameter| match parameter {
-            Expr::Symbol { name, .. } => Ok(name.clone()),
-            _ => Err(EvalError::NonSymbolParameter {
-                location: parameter.location(),
-                form,
-            }),
-        })
-        .collect::<Result<_, _>>()?;
-
-    build_closure_from_names(name, parameters, body, environment, form, location)
+    build_closure_from_names(
+        name,
+        formals.required_parameters,
+        formals.rest_parameter,
+        body,
+        environment,
+        form,
+        location,
+    )
 }
 
 fn build_closure_from_names(
     name: Option<String>,
     parameters: Vec<String>,
+    rest_parameter: Option<String>,
     body: &[Expr],
     environment: Environment,
     form: &'static str,
@@ -518,7 +514,74 @@ fn build_closure_from_names(
         return Err(EvalError::MissingBody { location, form });
     }
 
-    Ok(Closure::new(name, parameters, body.to_vec(), environment))
+    Ok(Closure::new(
+        name,
+        parameters,
+        rest_parameter,
+        body.to_vec(),
+        environment,
+    ))
+}
+
+fn parse_lambda_formals(
+    parameters: &Expr,
+    form: &'static str,
+    location: SourceLocation,
+) -> Result<ParsedFormals, EvalError> {
+    match parameters {
+        Expr::Symbol { .. } => Ok(ParsedFormals {
+            required_parameters: Vec::new(),
+            rest_parameter: Some(parse_parameter_name(parameters, form)?),
+        }),
+        Expr::List { items, .. } => parse_formals(items, form),
+        _ => Err(EvalError::InvalidParameterList { location, form }),
+    }
+}
+
+fn parse_formals(parameters: &[Expr], form: &'static str) -> Result<ParsedFormals, EvalError> {
+    let Some(dot_index) = parameters.iter().position(is_dot_parameter) else {
+        return parameters
+            .iter()
+            .map(|parameter| parse_parameter_name(parameter, form))
+            .collect::<Result<Vec<_>, _>>()
+            .map(|required_parameters| ParsedFormals {
+                required_parameters,
+                rest_parameter: None,
+            });
+    };
+    let (required_parameters, dotted_tail) = parameters.split_at(dot_index);
+    let [_, rest_parameter] = dotted_tail else {
+        return Err(EvalError::InvalidParameterList {
+            location: parameters[dot_index].location(),
+            form,
+        });
+    };
+
+    Ok(ParsedFormals {
+        required_parameters: required_parameters
+            .iter()
+            .map(|parameter| parse_parameter_name(parameter, form))
+            .collect::<Result<_, _>>()?,
+        rest_parameter: Some(parse_parameter_name(rest_parameter, form)?),
+    })
+}
+
+fn parse_parameter_name(parameter: &Expr, form: &'static str) -> Result<String, EvalError> {
+    match parameter {
+        Expr::Symbol { name, location } if name == "." => Err(EvalError::InvalidParameterList {
+            location: *location,
+            form,
+        }),
+        Expr::Symbol { name, .. } => Ok(name.clone()),
+        _ => Err(EvalError::NonSymbolParameter {
+            location: parameter.location(),
+            form,
+        }),
+    }
+}
+
+fn is_dot_parameter(parameter: &Expr) -> bool {
+    matches!(parameter, Expr::Symbol { name, .. } if name == ".")
 }
 
 fn quote_expression(expression: &Expr) -> Value {
@@ -585,21 +648,49 @@ fn apply_tail_closure(
     location: SourceLocation,
     output: &mut String,
 ) -> Result<EvalAction, EvalError> {
-    if arguments.len() != closure.parameters.len() {
+    if !closure_accepts_argument_count(&closure, arguments.len()) {
         return Err(EvalError::WrongArgumentCount {
             location,
             procedure: "lambda",
-            expected: ArgCount::Exactly(closure.parameters.len()),
+            expected: closure_expected_arg_count(&closure),
             got: arguments.len(),
         });
     }
 
     let call_environment = closure.environment.child();
-    for (name, value) in closure.parameters.iter().cloned().zip(arguments) {
+    let (required_arguments, rest_arguments) = arguments.split_at(closure.parameters.len());
+
+    for (name, value) in closure
+        .parameters
+        .iter()
+        .cloned()
+        .zip(required_arguments.iter().cloned())
+    {
         call_environment.define(name, value);
+    }
+    if let Some(rest_parameter) = &closure.rest_parameter {
+        call_environment.define(rest_parameter.clone(), list_from_values(rest_arguments));
     }
 
     eval_required_sequence_tail(&closure.body, &call_environment, "lambda", location, output)
+}
+
+fn closure_accepts_argument_count(closure: &Closure, provided: usize) -> bool {
+    closure
+        .rest_parameter
+        .as_ref()
+        .map_or(provided == closure.parameters.len(), |_| {
+            provided >= closure.parameters.len()
+        })
+}
+
+fn closure_expected_arg_count(closure: &Closure) -> ArgCount {
+    closure
+        .rest_parameter
+        .as_ref()
+        .map_or(ArgCount::Exactly(closure.parameters.len()), |_| {
+            ArgCount::AtLeast(closure.parameters.len())
+        })
 }
 
 fn eval_required_sequence_tail(

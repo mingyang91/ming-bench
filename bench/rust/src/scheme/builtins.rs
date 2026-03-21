@@ -3,7 +3,7 @@ use crate::scheme::environment::Environment;
 use crate::scheme::evaluator::apply_callable;
 use crate::scheme::error::{ArgCount, EvalError};
 use crate::scheme::string_value::StringMutationError;
-use crate::scheme::value::Value;
+use crate::scheme::value::{list_from_values, Value};
 
 #[derive(Debug, Clone, Copy)]
 pub enum BuiltinProcedure {
@@ -47,6 +47,7 @@ pub enum BuiltinProcedure {
     CharToInteger,
     IntegerToChar,
     Map,
+    Apply,
 }
 
 impl BuiltinProcedure {
@@ -92,6 +93,7 @@ impl BuiltinProcedure {
             Self::CharToInteger => "char->integer",
             Self::IntegerToChar => "integer->char",
             Self::Map => "map",
+            Self::Apply => "apply",
         }
     }
 }
@@ -138,6 +140,7 @@ pub fn install_builtins(environment: &Environment) {
         BuiltinProcedure::CharToInteger,
         BuiltinProcedure::IntegerToChar,
         BuiltinProcedure::Map,
+        BuiltinProcedure::Apply,
     ];
 
     BUILTIN_PROCEDURES.iter().copied().for_each(|procedure| {
@@ -210,6 +213,7 @@ pub fn apply_builtin(
         BuiltinProcedure::CharToInteger => eval_char_to_integer(arguments, location),
         BuiltinProcedure::IntegerToChar => eval_integer_to_char(arguments, location),
         BuiltinProcedure::Map => eval_map(arguments, location, output),
+        BuiltinProcedure::Apply => eval_apply(arguments, location, output),
     }
 }
 
@@ -353,13 +357,7 @@ fn eval_null(arguments: &[Value], location: SourceLocation) -> Result<Value, Eva
 }
 
 fn eval_list(arguments: &[Value]) -> Value {
-    arguments
-        .iter()
-        .rev()
-        .cloned()
-        .fold(Value::EmptyList, |tail, value| {
-            Value::Pair(Box::new(value), Box::new(tail))
-        })
+    list_from_values(arguments)
 }
 
 fn eval_length(arguments: &[Value], location: SourceLocation) -> Result<Value, EvalError> {
@@ -638,6 +636,37 @@ fn eval_map(
         .collect::<Result<Vec<_>, _>>()?;
 
     Ok(eval_list(&mapped_values))
+}
+
+fn eval_apply(
+    arguments: &[Value],
+    location: SourceLocation,
+    output: &mut String,
+) -> Result<Value, EvalError> {
+    let Some((procedure, list_and_prefix_arguments)) = arguments.split_first() else {
+        return Err(EvalError::WrongArgumentCount {
+            location,
+            procedure: "apply",
+            expected: ArgCount::AtLeast(2),
+            got: 0,
+        });
+    };
+    let Some((list_argument, prefix_arguments)) = list_and_prefix_arguments.split_last() else {
+        return Err(EvalError::WrongArgumentCount {
+            location,
+            procedure: "apply",
+            expected: ArgCount::AtLeast(2),
+            got: 1,
+        });
+    };
+
+    let applied_arguments = prefix_arguments
+        .iter()
+        .cloned()
+        .chain(proper_list_items(list_argument, location)?)
+        .collect::<Vec<_>>();
+
+    apply_callable(procedure.clone(), &applied_arguments, location, output)
 }
 
 fn eval_type_predicate(
