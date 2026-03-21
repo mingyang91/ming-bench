@@ -1,5 +1,5 @@
 use std::cell::{Cell, RefCell};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::rc::Rc;
 
 use crate::scheme::value::Value;
@@ -13,6 +13,7 @@ pub struct Env {
     pending_cont: Rc<RefCell<Option<(u64, Value)>>>,
     current_expr_index: Rc<Cell<usize>>,
     gensym_counter: Rc<Cell<u64>>,
+    active_callcc: Rc<RefCell<HashSet<u64>>>,
 }
 
 impl Default for Env {
@@ -31,6 +32,7 @@ impl Env {
             pending_cont: Rc::new(RefCell::new(None)),
             current_expr_index: Rc::new(Cell::new(0)),
             gensym_counter: Rc::new(Cell::new(0)),
+            active_callcc: Rc::new(RefCell::new(HashSet::new())),
         }
     }
 
@@ -43,6 +45,7 @@ impl Env {
             pending_cont: Rc::clone(&parent.pending_cont),
             current_expr_index: Rc::clone(&parent.current_expr_index),
             gensym_counter: Rc::clone(&parent.gensym_counter),
+            active_callcc: Rc::clone(&parent.active_callcc),
         }
     }
 
@@ -109,5 +112,17 @@ impl Env {
         let id = self.gensym_counter.get();
         self.gensym_counter.set(id + 1);
         id
+    }
+
+    pub fn activate_callcc(&self, id: u64) {
+        self.active_callcc.borrow_mut().insert(id);
+    }
+
+    pub fn deactivate_callcc(&self, id: u64) {
+        self.active_callcc.borrow_mut().remove(&id);
+    }
+
+    pub fn is_callcc_active(&self, id: u64) -> bool {
+        self.active_callcc.borrow().contains(&id)
     }
 }

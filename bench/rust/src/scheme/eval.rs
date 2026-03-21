@@ -328,17 +328,31 @@ fn eval_application(
                 .at(span));
             };
             let value = eval(arg_expr, env)?;
-            Err(EvalError::ContinuationReturn {
-                cont_id: id,
-                value: Box::new(value),
-                expr_index,
-            })
+            invoke_continuation(id, value, expr_index, env)
         }
         _ => Err(EvalError::TypeError {
             expected: "procedure".into(),
             got: format!("{op_val}"),
         }
         .at(span)),
+    }
+}
+
+/// Invoke a continuation: escape if active, restart if from different expr, return if same expr.
+fn invoke_continuation(
+    id: u64,
+    value: Value,
+    expr_index: usize,
+    env: &Env,
+) -> Result<Bounce, EvalError> {
+    if env.is_callcc_active(id) || expr_index != env.current_expr_index() {
+        Err(EvalError::ContinuationReturn {
+            cont_id: id,
+            value: Box::new(value),
+            expr_index,
+        })
+    } else {
+        Ok(Bounce::Done(value))
     }
 }
 
@@ -428,11 +442,12 @@ fn eval_apply(args: &[Value], span: Span, env: &Env) -> Result<Bounce, EvalError
                 }
                 .at(span));
             }
-            Err(EvalError::ContinuationReturn {
-                cont_id: *id,
-                value: Box::new(combined.into_iter().next().expect("len checked")),
-                expr_index: *expr_index,
-            })
+            invoke_continuation(
+                *id,
+                combined.into_iter().next().expect("len checked"),
+                *expr_index,
+                env,
+            )
         }
         Value::Builtin(ref name) => {
             apply_builtin_values(name, &combined).map(Bounce::Done).map_err(|e| e.at(span))
@@ -467,6 +482,7 @@ fn eval_callcc_with_proc(proc: Value, span: Span, env: &Env) -> Result<Value, Ev
     let expr_index = env.current_expr_index();
     let cont = Value::Continuation { id, expr_index };
 
+    env.activate_callcc(id);
     let result = if matches!(proc, Value::Lambda { .. }) {
         match apply_lambda_values(proc, &[cont], span) {
             Ok(Bounce::Done(val)) => Ok(val),
@@ -474,12 +490,14 @@ fn eval_callcc_with_proc(proc: Value, span: Span, env: &Env) -> Result<Value, Ev
             Err(e) => Err(e),
         }
     } else {
-        Err(EvalError::TypeError {
+        env.deactivate_callcc(id);
+        return Err(EvalError::TypeError {
             expected: "procedure".into(),
             got: format!("{proc}"),
         }
-        .at(span))
+        .at(span));
     };
+    env.deactivate_callcc(id);
 
     match result {
         Err(EvalError::ContinuationReturn {
