@@ -2,6 +2,8 @@ pub mod error;
 
 pub use error::EvalError;
 
+use std::collections::HashMap;
+
 /// A Scheme value.
 #[derive(Debug, Clone, PartialEq)]
 enum Value {
@@ -11,6 +13,8 @@ enum Value {
     Symbol(String),
     List(Vec<Value>),
 }
+
+type Env = HashMap<String, Value>;
 
 impl Value {
     fn to_scheme_string(&self) -> String {
@@ -98,6 +102,9 @@ fn parse(tokens: &[String], pos: usize) -> Result<(Value, usize), EvalError> {
             return Err(EvalError::Parse("missing closing paren".into()));
         }
         Ok((Value::List(items), i + 1))
+    } else if token == "'" {
+        let (inner, next) = parse(tokens, pos + 1)?;
+        Ok((Value::List(vec![Value::Symbol("quote".into()), inner]), next))
     } else if token == ")" {
         Err(EvalError::Parse("unexpected )".into()))
     } else if token == "#t" {
@@ -115,10 +122,13 @@ fn parse(tokens: &[String], pos: usize) -> Result<(Value, usize), EvalError> {
 }
 
 /// Evaluate a parsed Scheme expression.
-fn eval(value: &Value) -> Result<Value, EvalError> {
+fn eval(value: &Value, env: &mut Env) -> Result<Value, EvalError> {
     match value {
         Value::Integer(_) | Value::Boolean(_) | Value::Str(_) => Ok(value.clone()),
-        Value::Symbol(s) => Err(EvalError::UndefinedVariable(s.clone())),
+        Value::Symbol(s) => env
+            .get(s)
+            .cloned()
+            .ok_or_else(|| EvalError::UndefinedVariable(s.clone())),
         Value::List(items) => {
             if items.is_empty() {
                 return Err(EvalError::Parse("empty application".into()));
@@ -127,12 +137,40 @@ fn eval(value: &Value) -> Result<Value, EvalError> {
                 Value::Symbol(s) => s.as_str(),
                 _ => return Err(EvalError::NotAProcedure),
             };
-            // Special forms with short-circuit evaluation
+            // Special forms
             match op {
+                "define" => {
+                    if items.len() != 3 {
+                        return Err(EvalError::Arity);
+                    }
+                    let name = match &items[1] {
+                        Value::Symbol(s) => s.clone(),
+                        _ => return Err(EvalError::TypeError("define expects symbol".into())),
+                    };
+                    let val = eval(&items[2], env)?;
+                    env.insert(name, val);
+                    return Ok(Value::Symbol("ok".into()));
+                }
+                "if" => {
+                    let cond = eval(&items[1], env)?;
+                    if cond != Value::Boolean(false) {
+                        return eval(&items[2], env);
+                    } else if items.len() > 3 {
+                        return eval(&items[3], env);
+                    } else {
+                        return Ok(Value::Symbol("ok".into()));
+                    }
+                }
+                "quote" => {
+                    if items.len() != 2 {
+                        return Err(EvalError::Arity);
+                    }
+                    return Ok(items[1].clone());
+                }
                 "and" => {
                     let mut result = Value::Boolean(true);
                     for a in &items[1..] {
-                        result = eval(a)?;
+                        result = eval(a, env)?;
                         if result == Value::Boolean(false) {
                             return Ok(result);
                         }
@@ -142,7 +180,7 @@ fn eval(value: &Value) -> Result<Value, EvalError> {
                 "or" => {
                     let mut result = Value::Boolean(false);
                     for a in &items[1..] {
-                        result = eval(a)?;
+                        result = eval(a, env)?;
                         if result != Value::Boolean(false) {
                             return Ok(result);
                         }
@@ -151,7 +189,7 @@ fn eval(value: &Value) -> Result<Value, EvalError> {
                 }
                 _ => {}
             }
-            let args: Result<Vec<Value>, _> = items[1..].iter().map(|a| eval(a)).collect();
+            let args: Result<Vec<Value>, _> = items[1..].iter().map(|a| eval(a, env)).collect();
             let args = args?;
             apply_builtin(op, &args)
         }
@@ -242,9 +280,10 @@ pub fn eval_str(input: &str) -> Result<String, EvalError> {
     let tokens = tokenize(input);
     let mut pos = 0;
     let mut last_result = None;
+    let mut env = Env::new();
     while pos < tokens.len() {
         let (val, next) = parse(&tokens, pos)?;
-        let result = eval(&val)?;
+        let result = eval(&val, &mut env)?;
         last_result = Some(result);
         pos = next;
     }
