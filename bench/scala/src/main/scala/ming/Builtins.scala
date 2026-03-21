@@ -132,17 +132,21 @@ object Builtins:
       case "string-upcase"    => StringBuiltins.strCase(args, _.toUpperCase)
       case "string-downcase"  => StringBuiltins.strCase(args, _.toLowerCase)
       case "integer?"         => typePred(args, MathBuiltins.isInteger)
-      case "procedure?"       => typePred(args, v => v.isInstanceOf[Value.LambdaVal] || v.isInstanceOf[Value.Symbol])
-      case "eqv?"             => StringBuiltins.evalEq(args)
-      case "vector"           => VectorBuiltins.evalVector(args)
-      case "make-vector"      => VectorBuiltins.evalMakeVector(args)
-      case "vector-ref"       => VectorBuiltins.evalVectorRef(args)
-      case "vector-set!"      => VectorBuiltins.evalVectorSet(args)
-      case "vector-length"    => VectorBuiltins.evalVectorLength(args)
-      case "vector?"          => typePred(args, _.isInstanceOf[Value.VectorVal])
-      case "vector->list"     => VectorBuiltins.evalVectorToList(args)
-      case "list->vector"     => VectorBuiltins.evalListToVector(args)
-      case "reverse"          => ListBuiltins.evalReverse(args)
+      case "procedure?" =>
+        typePred(
+          args,
+          v => v.isInstanceOf[Value.LambdaVal] || v.isInstanceOf[Value.CaseLambdaVal] || v.isInstanceOf[Value.Symbol]
+        )
+      case "eqv?"          => StringBuiltins.evalEq(args)
+      case "vector"        => VectorBuiltins.evalVector(args)
+      case "make-vector"   => VectorBuiltins.evalMakeVector(args)
+      case "vector-ref"    => VectorBuiltins.evalVectorRef(args)
+      case "vector-set!"   => VectorBuiltins.evalVectorSet(args)
+      case "vector-length" => VectorBuiltins.evalVectorLength(args)
+      case "vector?"       => typePred(args, _.isInstanceOf[Value.VectorVal])
+      case "vector->list"  => VectorBuiltins.evalVectorToList(args)
+      case "list->vector"  => VectorBuiltins.evalListToVector(args)
+      case "reverse"       => ListBuiltins.evalReverse(args)
       case "set-car!" =>
         args match
           case Value.MutablePairVal(cell) :: v :: Nil => cell(0) = v; Value.VoidVal

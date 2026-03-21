@@ -138,6 +138,7 @@ object Evaluator:
       case _: Value.VectorVal           => Done(expr, env, out)
       case _: Value.MutablePairVal      => Done(expr, env, out)
       case _: Value.LambdaVal           => Done(expr, env, out)
+      case _: Value.CaseLambdaVal       => Done(expr, env, out)
       case _: Value.ContinuationVal     => Done(expr, env, out)
       case _: Value.MacroVal            => Done(expr, env, out)
       case _: Value.TransformerMacroVal => Done(expr, env, out)
@@ -164,6 +165,8 @@ object Evaluator:
       case Value.Symbol("quote", _)  => Forms.evalQuote(args, env, out)
       case Value.Symbol("lambda", _) =>
         Done(Forms.makeLambda(args, env), env, out)
+      case Value.Symbol("case-lambda", _) =>
+        Done(Forms.makeCaseLambda(args, env), env, out)
       case Value.Symbol("let", _)     => Forms.evalLet(args, env, out)
       case Value.Symbol("letrec", _)  => CondForms.evalLetrec(args, env, out)
       case Value.Symbol("letrec*", _) => CondForms.evalLetrecStar(args, env, out)

@@ -29,6 +29,8 @@ object Apply:
         val localEnv =
           closureWithSelf.extendVariadic(params, restParam, args, pos)
         Evaluator.evalBodyTail(body, localEnv, out)
+      case cl @ Value.CaseLambdaVal(clauses, closureThunk, nameOpt) =>
+        applyCaseLambda(cl, clauses, closureThunk, nameOpt, args, pos, out)
       case Value.NativeProcVal(_, fn) =>
         Done(fn(args), Env(Map.empty, None), out)
       case Value.Symbol("apply", _) =>
@@ -98,6 +100,34 @@ object Apply:
       case gb: Evaluator.GuardBounce => ExceptionHandling.guardLoop(gb)
       case Bounce(e2, env2, o) =>
         trampolineResult(Evaluator.evalStep(e2, env2, o))
+
+  private def applyCaseLambda(
+    cl: Value.CaseLambdaVal,
+    clauses: List[(List[String], Option[String], List[Value])],
+    closureThunk: () => Env,
+    nameOpt: Option[String],
+    args: List[Value],
+    pos: Option[(Int, Int)],
+    out: String
+  ): EvalResult =
+    val matching = clauses.find { case (params, rest, _) =>
+      rest match
+        case Some(_) => args.length >= params.length
+        case None    => args.length == params.length
+    }
+    matching match
+      case Some((params, rest, body)) =>
+        val closure = closureThunk()
+        val closureWithSelf = nameOpt match
+          case Some(n) => closure.define(n, cl)
+          case None    => closure
+        val localEnv = closureWithSelf.extendVariadic(params, rest, args, pos)
+        Evaluator.evalBodyTail(body, localEnv, out)
+      case None =>
+        throw EvalError.withPos(
+          s"no matching clause for ${args.length} arguments",
+          pos
+        )
 
   private[ming] def isFalsy(v: Value): Boolean = v match
     case Value.BoolVal(false) => true

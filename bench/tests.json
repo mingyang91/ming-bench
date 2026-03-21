@@ -1490,5 +1490,40 @@
     "fixture": "l23_full_integration.scm",
     "kind": "eval_str_ok",
     "expected": "(#t 10/3 #f \"division by zero\")"
+  },
+  {
+    "name": "l24_case_lambda_basic",
+    "level": 24,
+    "fixture": "l24_case_lambda_basic.scm",
+    "kind": "eval_str_ok",
+    "expected": "#t"
+  },
+  {
+    "name": "l24_case_lambda_procedure",
+    "level": 24,
+    "fixture": "l24_case_lambda_procedure.scm",
+    "kind": "eval_str_ok",
+    "expected": "#t"
+  },
+  {
+    "name": "l24_case_lambda_higher_order",
+    "level": 24,
+    "fixture": "l24_case_lambda_higher_order.scm",
+    "kind": "eval_str_ok",
+    "expected": "#t"
+  },
+  {
+    "name": "l24_case_lambda_recursive",
+    "level": 24,
+    "fixture": "l24_case_lambda_recursive.scm",
+    "kind": "eval_str_ok",
+    "expected": "3"
+  },
+  {
+    "name": "l24_case_lambda_rest",
+    "level": 24,
+    "fixture": "l24_case_lambda_rest.scm",
+    "kind": "eval_str_ok",
+    "expected": "#t"
   }
 ]

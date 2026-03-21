@@ -50,7 +50,10 @@ private[ming] object Forms:
         Done(Value.VoidVal, env.define(name, lambda), out)
       case Value.Symbol(name, _) :: valueExpr :: Nil =>
         val (v, _, out2) = Evaluator.eval(valueExpr, env, out)
-        Done(Value.VoidVal, env.define(name, v), out2)
+        val named = v match
+          case cl: Value.CaseLambdaVal => cl.copy(name = Some(name))
+          case other                   => other
+        Done(Value.VoidVal, env.define(name, named), out2)
       case _ =>
         throw EvalError.withPos("bad define syntax", pos)
 
@@ -89,6 +92,18 @@ private[ming] object Forms:
         val envRef         = () => env
         Value.LambdaVal(params, body, envRef, None, rest)
       case _ => throw new EvalError("bad lambda syntax")
+
+  def makeCaseLambda(args: List[Value], env: Env): Value =
+    val clauses = args.map { clause =>
+      val elems = Evaluator.toList(clause)
+      elems match
+        case paramExpr :: body if body.nonEmpty =>
+          val (params, rest) = extractParamsWithRest(paramExpr)
+          (params, rest, body)
+        case _ => throw new EvalError("bad case-lambda clause")
+    }
+    val envRef = () => env
+    Value.CaseLambdaVal(clauses, envRef, None)
 
   private def extractParams(paramExpr: Value): List[String] =
     extractParamsWithRest(paramExpr)._1

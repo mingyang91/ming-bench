@@ -44,6 +44,12 @@ enum Value:
 
   case RecordVal(typeTag: AnyRef, fieldNames: List[String], fields: Array[Value])
 
+  case CaseLambdaVal(
+    clauses: List[(List[String], Option[String], List[Value])],
+    closure: () => Env,
+    name: Option[String]
+  )
+
   case NativeProcVal(name: String, fn: List[Value] => Value)
 
   case TransformerMacroVal(proc: Value, defEnv: () => Env)
@@ -75,6 +81,7 @@ enum Value:
     case VectorVal(elems) =>
       "#(" + elems.map(_.display).mkString(" ") + ")"
     case _: LambdaVal           => "#<procedure>"
+    case _: CaseLambdaVal       => "#<procedure>"
     case _: NativeProcVal       => "#<procedure>"
     case _: ContinuationVal     => "#<continuation>"
     case _: MacroVal            => "#<macro>"
