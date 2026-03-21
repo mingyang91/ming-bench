@@ -7,10 +7,10 @@ object Macros:
 
   private val counter = AtomicLong(0)
 
-  private def gensym(base: String): String =
+  private[ming] def gensym(base: String): String =
     s"__m_${base}_${counter.getAndIncrement()}__"
 
-  private val specialForms: Set[String] = Set(
+  private[ming] val specialForms: Set[String] = Set(
     "define",
     "if",
     "quote",
@@ -32,7 +32,10 @@ object Macros:
     "else",
     "apply",
     "let*",
-    "letrec"
+    "letrec",
+    "syntax-case",
+    "syntax",
+    "with-syntax"
   )
 
   sealed trait Binding
@@ -82,7 +85,7 @@ object Macros:
       Map.empty
     )
 
-  private def matchElems(
+  private[ming] def matchElems(
     pats: List[Value],
     inps: List[Value],
     lits: List[String],
@@ -159,11 +162,11 @@ object Macros:
     }
     (subst(tmpl, binds, gsMap), envBinds)
 
-  private def safeLookup(env: Env, name: String): Option[Value] =
+  private[ming] def safeLookup(env: Env, name: String): Option[Value] =
     try Some(env.lookup(name))
     catch case _: EvalError => None
 
-  private def collectFree(
+  private[ming] def collectFree(
     tmpl: Value,
     patVars: Set[String]
   ): Set[String] =
@@ -176,7 +179,7 @@ object Macros:
         }
       case _ => Set.empty
 
-  private def subst(
+  private[ming] def subst(
     tmpl: Value,
     binds: Map[String, Binding],
     gsMap: Map[String, String]
@@ -195,7 +198,7 @@ object Macros:
         listToValue(substList(Evaluator.toList(tmpl), binds, gsMap))
       case _ => tmpl
 
-  private def substList(
+  private[ming] def substList(
     elems: List[Value],
     binds: Map[String, Binding],
     gsMap: Map[String, String]
@@ -243,5 +246,5 @@ object Macros:
         }
       case _ => Map.empty
 
-  private def listToValue(elems: List[Value]): Value =
+  private[ming] def listToValue(elems: List[Value]): Value =
     elems.foldRight(Value.NilVal: Value)(Value.PairVal(_, _))

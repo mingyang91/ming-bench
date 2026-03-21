@@ -9,6 +9,7 @@ object Parser:
     case LParen(line: Int, col: Int)
     case RParen(line: Int, col: Int)
     case Quote(line: Int, col: Int)
+    case SyntaxQuote(line: Int, col: Int)
     case Atom(value: String, line: Int, col: Int)
 
   def parse(input: String): List[Value] =
@@ -37,6 +38,12 @@ object Parser:
         val inner              = Value.PairVal(value, Value.NilVal)
         val outer =
           Value.PairVal(Value.Symbol("quote"), inner, Some((l, c)))
+        (outer, remaining)
+      case Token.SyntaxQuote(l, c) :: rest =>
+        val (value, remaining) = parseExpr(rest)
+        val inner              = Value.PairVal(value, Value.NilVal)
+        val outer =
+          Value.PairVal(Value.Symbol("syntax"), inner, Some((l, c)))
         (outer, remaining)
       case Token.LParen(l, c) :: rest =>
         parseList(rest, List.empty, (l, c))
@@ -136,6 +143,8 @@ object Parser:
       case '('                  => (Some(Token.LParen(line, col)), offset + 1)
       case ')'                  => (Some(Token.RParen(line, col)), offset + 1)
       case '\''                 => (Some(Token.Quote(line, col)), offset + 1)
+      case '#' if offset + 1 < input.length && input.charAt(offset + 1) == '\'' =>
+        (Some(Token.SyntaxQuote(line, col)), offset + 2)
       case '"' =>
         val (str, next) = readString(input, offset + 1, offset + 1)
         (Some(Token.Atom("\"" + str + "\"", line, col)), next)

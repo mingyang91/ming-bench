@@ -46,6 +46,13 @@ enum Value:
 
   case NativeProcVal(name: String, fn: List[Value] => Value)
 
+  case TransformerMacroVal(proc: Value, defEnv: () => Env)
+
+  case SyntaxBindingsVal(
+    bindings: Map[String, Macros.Binding],
+    defEnv: Env
+  )
+
   /** Extract string content from either StringVal or MutableStringVal. */
   def stringContent: Option[String] = this match
     case StringVal(s)         => Some(s)
@@ -67,13 +74,15 @@ enum Value:
     case _: MutablePairVal     => formatList(_.display)
     case VectorVal(elems) =>
       "#(" + elems.map(_.display).mkString(" ") + ")"
-    case _: LambdaVal       => "#<procedure>"
-    case _: NativeProcVal   => "#<procedure>"
-    case _: ContinuationVal => "#<continuation>"
-    case _: MacroVal        => "#<macro>"
-    case _: RecordVal       => "#<record>"
-    case VoidVal            => ""
-    case MultipleValues(vs) => vs.map(_.display).mkString(" ")
+    case _: LambdaVal           => "#<procedure>"
+    case _: NativeProcVal       => "#<procedure>"
+    case _: ContinuationVal     => "#<continuation>"
+    case _: MacroVal            => "#<macro>"
+    case _: TransformerMacroVal => "#<macro>"
+    case _: SyntaxBindingsVal   => "#<syntax-bindings>"
+    case _: RecordVal           => "#<record>"
+    case VoidVal                => ""
+    case MultipleValues(vs)     => vs.map(_.display).mkString(" ")
 
   /** Display representation (strings without quotes). */
   def displayRepr: String = this match

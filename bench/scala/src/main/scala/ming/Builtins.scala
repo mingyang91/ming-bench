@@ -151,7 +151,9 @@ object Builtins:
         args match
           case Value.MutablePairVal(cell) :: v :: Nil => cell(1) = v; Value.VoidVal
           case _ => throw new EvalError("set-cdr! requires a mutable pair and a value")
-      case _ => throw new EvalError(s"unknown procedure: $name")
+      case "syntax->datum" => SyntaxCase.syntaxToDatum(args)
+      case "datum->syntax" => SyntaxCase.datumToSyntax(args)
+      case _               => throw new EvalError(s"unknown procedure: $name")
 
   private def pairCar(v: Value): Value = v match
     case Value.PairVal(h, _, _)     => h
@@ -281,3 +283,5 @@ object Builtins:
     .define("numerator", Value.Symbol("numerator"))
     .define("denominator", Value.Symbol("denominator"))
     .define("rational?", Value.Symbol("rational?"))
+    .define("syntax->datum", Value.Symbol("syntax->datum"))
+    .define("datum->syntax", Value.Symbol("datum->syntax"))

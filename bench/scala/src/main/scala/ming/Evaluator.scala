@@ -5,7 +5,6 @@ import scala.annotation.tailrec
 /** Scheme interpreter entry point. */
 object Evaluator:
 
-  /** Internal result type for trampoline-based TCO. */
   sealed private[ming] trait EvalResult
   private[ming] case class Done(value: Value, env: Env, out: String)  extends EvalResult
   private[ming] case class Bounce(expr: Value, env: Env, out: String) extends EvalResult
@@ -61,14 +60,7 @@ object Evaluator:
         headEval match
           case Left(result) => result
           case Right((_, newEnv, out2)) =>
-            val nextEnv = head match
-              case Value.PairVal(Value.Symbol("define", _), _, _) =>
-                patchClosures(newEnv)
-              case Value.PairVal(Value.Symbol("define-syntax", _), _, _) =>
-                newEnv
-              case Value.PairVal(Value.Symbol("define-record-type", _), _, _) =>
-                newEnv
-              case _ => env
+            val nextEnv = envAfterForm(head, env, newEnv)
             evalAll(tail, nextEnv, out2)
 
   /** Tie-the-knot: update named lambdas' closures so they can see all current bindings (enables mutual recursion at top
@@ -94,7 +86,6 @@ object Evaluator:
     )
     patched
 
-  /** Evaluate body exprs, returning Bounce for the last (tail position). */
   private[ming] def evalBodyTail(
     exprs: List[Value],
     env: Env,
@@ -125,10 +116,11 @@ object Evaluator:
           case Value.PairVal(Value.Symbol("define", _), _, _)             => newEnv
           case Value.PairVal(Value.Symbol("define-syntax", _), _, _)      => newEnv
           case Value.PairVal(Value.Symbol("define-record-type", _), _, _) => newEnv
-          case _                                                          => env
+          case _ =>
+            if newEnv.bindings.contains(MacroDefinedTag) then Env(newEnv.bindings - MacroDefinedTag, newEnv.parent)
+            else env
         evalBodyTail(tail, nextEnv, out2, replayMode)
 
-  /** Trampoline: evaluate expr, looping on Bounce until Done. */
   @tailrec
   private[ming] def eval(
     expr: Value,
@@ -139,30 +131,31 @@ object Evaluator:
       case Done(v, e, o)       => (v, e, o)
       case Bounce(e2, env2, o) => eval(e2, env2, o)
 
-  /** Single evaluation step — returns Bounce for tail positions. */
   private[ming] def evalStep(
     expr: Value,
     env: Env,
     out: String
   ): EvalResult =
     expr match
-      case Value.IntVal(_)           => Done(expr, env, out)
-      case Value.RationalVal(_, _)   => Done(expr, env, out)
-      case Value.DoubleVal(_)        => Done(expr, env, out)
-      case Value.BoolVal(_)          => Done(expr, env, out)
-      case Value.StringVal(_)        => Done(expr, env, out)
-      case Value.CharVal(_)          => Done(expr, env, out)
-      case Value.NilVal              => Done(expr, env, out)
-      case Value.VoidVal             => Done(expr, env, out)
-      case _: Value.MutableStringVal => Done(expr, env, out)
-      case _: Value.VectorVal        => Done(expr, env, out)
-      case _: Value.MutablePairVal   => Done(expr, env, out)
-      case _: Value.LambdaVal        => Done(expr, env, out)
-      case _: Value.ContinuationVal  => Done(expr, env, out)
-      case _: Value.MacroVal         => Done(expr, env, out)
-      case _: Value.MultipleValues   => Done(expr, env, out)
-      case _: Value.RecordVal        => Done(expr, env, out)
-      case _: Value.NativeProcVal    => Done(expr, env, out)
+      case Value.IntVal(_)              => Done(expr, env, out)
+      case Value.RationalVal(_, _)      => Done(expr, env, out)
+      case Value.DoubleVal(_)           => Done(expr, env, out)
+      case Value.BoolVal(_)             => Done(expr, env, out)
+      case Value.StringVal(_)           => Done(expr, env, out)
+      case Value.CharVal(_)             => Done(expr, env, out)
+      case Value.NilVal                 => Done(expr, env, out)
+      case Value.VoidVal                => Done(expr, env, out)
+      case _: Value.MutableStringVal    => Done(expr, env, out)
+      case _: Value.VectorVal           => Done(expr, env, out)
+      case _: Value.MutablePairVal      => Done(expr, env, out)
+      case _: Value.LambdaVal           => Done(expr, env, out)
+      case _: Value.ContinuationVal     => Done(expr, env, out)
+      case _: Value.MacroVal            => Done(expr, env, out)
+      case _: Value.TransformerMacroVal => Done(expr, env, out)
+      case _: Value.SyntaxBindingsVal   => Done(expr, env, out)
+      case _: Value.MultipleValues      => Done(expr, env, out)
+      case _: Value.RecordVal           => Done(expr, env, out)
+      case _: Value.NativeProcVal       => Done(expr, env, out)
       case Value.Symbol(name, pos) =>
         Done(env.lookup(name, pos), env, out)
       case Value.PairVal(car, _, pos) =>
@@ -212,6 +205,12 @@ object Evaluator:
         ExceptionHandling.evalWithExceptionHandler(args, env, out)
       case Value.Symbol("define-syntax", _) =>
         Continuations.handleDefineSyntax(args, env, pos, out)
+      case Value.Symbol("syntax-case", _) =>
+        SyntaxCase.evalSyntaxCase(args, env, out)
+      case Value.Symbol("syntax", _) =>
+        SyntaxCase.evalSyntax(args, env, out)
+      case Value.Symbol("with-syntax", _) =>
+        SyntaxCase.evalWithSyntax(args, env, out)
       case Value.Symbol("define-record-type", _) =>
         Records.evalDefineRecordType(args, env, pos, out)
       case _ =>
@@ -223,6 +222,8 @@ object Evaluator:
               e.define(k, v)
             }
             Bounce(expanded, expEnv, out)
+          case m: Value.TransformerMacroVal =>
+            expandTransformerMacro(m, op :: args, env, out2)
           case Value.Symbol("call/cc" | "call-with-current-continuation", _) =>
             Continuations.handleCallCCForm(args, env, out2)
           case _ =>
@@ -239,7 +240,6 @@ object Evaluator:
       (acc :+ v, o2)
     }
 
-  /** Delegate to Apply object. */
   private[ming] def applyProcTail(
     proc: Value,
     args: List[Value],
@@ -250,3 +250,50 @@ object Evaluator:
   private[ming] def isFalsy(v: Value): Boolean = Apply.isFalsy(v)
 
   private[ming] def toList(v: Value): List[Value] = Apply.toList(v)
+
+  private val MacroDefinedTag = "__macro_defined__"
+
+  private def expandTransformerMacro(
+    m: Value.TransformerMacroVal,
+    inputElems: List[Value],
+    env: Env,
+    out: String
+  ): EvalResult =
+    val inputForm = Macros.listToValue(inputElems)
+    val result = Apply.applyProcTail(
+      m.proc,
+      List(inputForm),
+      None,
+      out
+    )
+    val (expanded, _, out2) = result match
+      case Done(v, e, o)       => (v, e, o)
+      case Bounce(e2, env2, o) => eval(e2, env2, o)
+    expanded match
+      case Value.PairVal(Value.Symbol("define" | "define-syntax", _), _, _) =>
+        val (v, defEnv, out3) = eval(expanded, env, out2)
+        Done(v, defEnv.define(MacroDefinedTag, Value.BoolVal(true)), out3)
+      case _ =>
+        Bounce(expanded, env, out2)
+
+  /** Decide env after evaluating a form: use newEnv for defines. */
+  private def envAfterForm(
+    head: Value,
+    origEnv: Env,
+    newEnv: Env
+  ): Env =
+    head match
+      case Value.PairVal(Value.Symbol("define", _), _, _) =>
+        patchClosures(newEnv)
+      case Value.PairVal(Value.Symbol("define-syntax", _), _, _) =>
+        newEnv
+      case Value.PairVal(Value.Symbol("define-record-type", _), _, _) =>
+        newEnv
+      case _ =>
+        if newEnv.bindings.contains(MacroDefinedTag) then
+          val cleaned = Env(
+            newEnv.bindings - MacroDefinedTag,
+            newEnv.parent
+          )
+          patchClosures(cleaned)
+        else origEnv

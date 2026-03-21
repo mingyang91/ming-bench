@@ -121,10 +121,20 @@ object Continuations:
   ): EvalResult =
     args match
       case Value.Symbol(name, _) :: transformer :: Nil =>
-        val parsed = Macros.parseSyntaxRules(transformer, env)
-        lazy val selfMacro: Value.MacroVal =
-          Value.MacroVal(parsed.rules, parsed.literals, () => selfEnv)
-        lazy val selfEnv: Env = env.define(name, selfMacro)
-        Done(Value.VoidVal, selfEnv, out)
+        if isSyntaxRulesForm(transformer) then
+          val parsed = Macros.parseSyntaxRules(transformer, env)
+          lazy val selfMacro: Value.MacroVal =
+            Value.MacroVal(parsed.rules, parsed.literals, () => selfEnv)
+          lazy val selfEnv: Env = env.define(name, selfMacro)
+          Done(Value.VoidVal, selfEnv, out)
+        else
+          val (proc, _, out2) = Evaluator.eval(transformer, env, out)
+          val macro_          = Value.TransformerMacroVal(proc, () => env)
+          Done(Value.VoidVal, env.define(name, macro_), out2)
       case _ =>
         throw EvalError.withPos("bad define-syntax", pos)
+
+  private def isSyntaxRulesForm(v: Value): Boolean =
+    v match
+      case Value.PairVal(Value.Symbol("syntax-rules", _), _, _) => true
+      case _                                                    => false
