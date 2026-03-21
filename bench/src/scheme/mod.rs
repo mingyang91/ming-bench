@@ -1,6 +1,7 @@
 pub mod error;
 mod env;
 mod eval;
+mod macros;
 mod parser;
 mod value;
 

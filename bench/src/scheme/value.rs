@@ -27,6 +27,12 @@ pub enum Value {
         env: Rc<RefCell<Env>>,
     },
     Continuation(Rc<ContinuationData>),
+    Macro {
+        name: std::string::String,
+        keywords: Vec<std::string::String>,
+        rules: Vec<(Value, Value)>,
+        def_env: Rc<RefCell<Env>>,
+    },
     Void,
 }
 
@@ -41,6 +47,7 @@ impl PartialEq for Value {
             (Value::List(a), Value::List(b)) => a == b,
             (Value::Void, Value::Void) => true,
             (Value::Lambda { .. }, Value::Lambda { .. }) => false,
+            (Value::Macro { .. }, Value::Macro { .. }) => false,
             (Value::Continuation(a), Value::Continuation(b)) => a.id == b.id,
             _ => false,
         }
@@ -68,6 +75,7 @@ impl Value {
                 let inner: Vec<String> = elems.iter().map(|e| e.display_str()).collect();
                 format!("({})", inner.join(" "))
             }
+            Value::Macro { .. } => "#<macro>".to_string(),
             other => other.to_string(),
         }
     }
@@ -84,6 +92,7 @@ impl fmt::Display for Value {
             Value::Char(c) => write!(f, "#\\{c}"),
             Value::List(elems) => fmt_list(elems, f),
             Value::Lambda { .. } | Value::Continuation(_) => write!(f, "#<procedure>"),
+            Value::Macro { .. } => write!(f, "#<macro>"),
             Value::Void => write!(f, ""),
         }
     }

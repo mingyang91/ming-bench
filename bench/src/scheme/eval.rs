@@ -56,6 +56,7 @@ pub struct EvalContext {
     /// Index of the top-level expression currently being evaluated.
     pub current_expr_idx: Cell<usize>,
     next_id: Cell<u64>,
+    pub gensym_counter: Cell<u64>,
 }
 
 pub struct ContReturnData {
@@ -72,6 +73,7 @@ impl EvalContext {
             cont_return_data: RefCell::new(None),
             current_expr_idx: Cell::new(0),
             next_id: Cell::new(0),
+            gensym_counter: Cell::new(0),
         }
     }
 
@@ -117,7 +119,9 @@ pub fn eval(
                 Bounce::Done(v) => return Ok(v),
                 Bounce::TailCall { expr, env } => { cur_expr = expr; cur_env = env; }
             },
-            Value::Lambda { .. } | Value::Continuation(_) => return Ok(cur_expr),
+            Value::Lambda { .. } | Value::Continuation(_) | Value::Macro { .. } => {
+                return Ok(cur_expr);
+            }
             Value::Void => return Ok(Value::Void),
         }
     }
@@ -146,7 +150,27 @@ fn eval_list_tco(
             "cond" => return eval_cond_tco(args, env, span, ctx),
             "set!" => return eval_set(args, env, span, ctx).map(Bounce::Done),
             "string-set!" => return eval_string_set(args, env, span, ctx).map(Bounce::Done),
+            "define-syntax" => {
+                return eval_define_syntax(args, env, span).map(Bounce::Done);
+            }
             _ => {}
+        }
+
+        // Check if this symbol is bound to a macro (outside match to reduce nesting)
+        if let Some(Value::Macro {
+            ref name,
+            ref keywords,
+            ref rules,
+            ref def_env,
+        }) = env.borrow().get(name)
+        {
+            let expanded = crate::scheme::macros::expand_macro(
+                name, keywords, rules, def_env, elems, span, &ctx.gensym_counter,
+            )?;
+            return Ok(Bounce::TailCall {
+                expr: expanded,
+                env: Rc::clone(env),
+            });
         }
     }
 
@@ -431,6 +455,77 @@ fn eval_define(
             span,
         }),
     }
+}
+
+fn eval_define_syntax(
+    args: &[Value],
+    env: &Rc<RefCell<Env>>,
+    span: Span,
+) -> Result<Value, EvalError> {
+    let [Value::Symbol(name), transformer] = args else {
+        return Err(EvalError::TypeError {
+            message: "define-syntax: expected (define-syntax name transformer)".into(),
+            span,
+        });
+    };
+    let Value::List(sr_elems) = transformer else {
+        return Err(EvalError::TypeError {
+            message: "define-syntax: expected syntax-rules form".into(),
+            span,
+        });
+    };
+    let [Value::Symbol(sr_kw), Value::List(keywords_list), rules @ ..] = sr_elems.as_slice()
+    else {
+        return Err(EvalError::TypeError {
+            message: "syntax-rules: expected (syntax-rules (keywords...) rules...)".into(),
+            span,
+        });
+    };
+    if sr_kw != "syntax-rules" {
+        return Err(EvalError::TypeError {
+            message: "define-syntax: expected syntax-rules".into(),
+            span,
+        });
+    }
+
+    let keywords: Vec<String> = keywords_list
+        .iter()
+        .map(|v| match v {
+            Value::Symbol(s) => Ok(s.clone()),
+            other => Err(EvalError::TypeError {
+                message: format!("syntax-rules: keyword must be a symbol, got {other}"),
+                span,
+            }),
+        })
+        .collect::<Result<_, _>>()?;
+
+    let parsed_rules: Vec<(Value, Value)> = rules
+        .iter()
+        .map(|rule| {
+            let Value::List(pair) = rule else {
+                return Err(EvalError::TypeError {
+                    message: "syntax-rules: rule must be a list".into(),
+                    span,
+                });
+            };
+            let [pattern, template] = pair.as_slice() else {
+                return Err(EvalError::TypeError {
+                    message: "syntax-rules: rule must be (pattern template)".into(),
+                    span,
+                });
+            };
+            Ok((pattern.clone(), template.clone()))
+        })
+        .collect::<Result<_, _>>()?;
+
+    let macro_val = Value::Macro {
+        name: name.clone(),
+        keywords,
+        rules: parsed_rules,
+        def_env: Rc::clone(env),
+    };
+    env.borrow_mut().define(name.clone(), macro_val);
+    Ok(Value::Void)
 }
 
 fn eval_set(
