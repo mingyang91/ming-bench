@@ -1707,6 +1707,27 @@ fn apply_builtin(name: &str, args: &[Value], span: Span, out: &OutputBuf) -> Res
             match &args[0] { Value::Str(s) => Ok(Value::Str(s.clone())), _ => Err(err_at(span, "string-copy: expected string")) }
         }
         "string-set!" => Err(err_at(span, "string-set!: strings are immutable")),
+        "string=?" => {
+            let a = match &args[0] { Value::Str(s) => s, _ => return Err(err_at(span, "string=?: expected string")) };
+            let b = match &args[1] { Value::Str(s) => s, _ => return Err(err_at(span, "string=?: expected string")) };
+            Ok(Value::Boolean(a == b))
+        }
+        "string<?" => {
+            let a = match &args[0] { Value::Str(s) => s, _ => return Err(err_at(span, "string<?: expected string")) };
+            let b = match &args[1] { Value::Str(s) => s, _ => return Err(err_at(span, "string<?: expected string")) };
+            Ok(Value::Boolean(a < b))
+        }
+        "string-ci=?" => {
+            let a = match &args[0] { Value::Str(s) => s, _ => return Err(err_at(span, "string-ci=?: expected string")) };
+            let b = match &args[1] { Value::Str(s) => s, _ => return Err(err_at(span, "string-ci=?: expected string")) };
+            Ok(Value::Boolean(a.to_lowercase() == b.to_lowercase()))
+        }
+        "string-upcase" => {
+            match &args[0] { Value::Str(s) => Ok(Value::Str(s.to_uppercase())), _ => Err(err_at(span, "string-upcase: expected string")) }
+        }
+        "string-downcase" => {
+            match &args[0] { Value::Str(s) => Ok(Value::Str(s.to_lowercase())), _ => Err(err_at(span, "string-downcase: expected string")) }
+        }
         "string->list" => {
             match &args[0] { Value::Str(s) => Ok(Value::List(s.chars().map(Value::Char).collect())), _ => Err(err_at(span, "string->list: expected string")) }
         }
@@ -1973,6 +1994,7 @@ fn init_builtins(env: &EnvRef) {
         "string-append", "string-length", "substring", "string->number",
         "number->string", "symbol->string", "string->symbol",
         "string-ref", "string-copy", "string-set!", "string->list", "list->string",
+        "string=?", "string<?", "string-ci=?", "string-upcase", "string-downcase",
         "char->integer", "integer->char",
         "char-alphabetic?", "char-numeric?", "char-upcase", "char-downcase", "char=?", "char<?",
         "equal?", "eqv?", "eq?",
