@@ -77,6 +77,10 @@ enum Value {
         type_name: String,
         fields: Rc<RefCell<Vec<Value>>>,
     },
+    CaseLambda {
+        clauses: Rc<Vec<(Vec<String>, Option<String>, Vec<Expr>)>>,
+        env: Env,
+    },
 }
 
 fn gcd(a: i64, b: i64) -> i64 {
@@ -270,7 +274,7 @@ impl Value {
                 out.push(')');
                 out
             }
-            Value::Lambda { .. } => "<procedure>".to_string(),
+            Value::Lambda { .. } | Value::CaseLambda { .. } => "<procedure>".to_string(),
             Value::Builtin(name) => format!("<builtin:{}>", name),
             Value::Continuation(_, _) => "<continuation>".to_string(),
             Value::Macro { .. } => "<macro>".to_string(),
@@ -319,6 +323,7 @@ impl Value {
                 | "exact?" | "inexact?" | "exact->inexact" | "inexact->exact"
                 | "numerator" | "denominator" | "rational?" | "integer?"
                 | "syntax->datum" | "datum->syntax"
+                | "procedure?"
         )
     }
 
@@ -907,6 +912,9 @@ fn eval_tco(expr: &Expr, env: &Env, out: &mut String) -> Result<Value, EvalError
                         }
                         "lambda" => {
                             break 'tco eval_lambda(&items[1..], pos, &cur_env);
+                        }
+                        "case-lambda" => {
+                            break 'tco eval_case_lambda(&items[1..], pos, &cur_env);
                         }
                         "and" => {
                             let args = &items[1..];
@@ -1728,6 +1736,34 @@ fn eval_tco(expr: &Expr, env: &Env, out: &mut String) -> Result<Value, EvalError
                             continue 'tco;
                         }
                     }
+                    Value::CaseLambda { clauses, env: closure_env } => {
+                        let (params, rest_param, body) = dispatch_case_lambda(&clauses, args.len(), pos)?;
+                        let new_env = Env::with_parent(&closure_env);
+                        cur_env.copy_all_into_if_absent(&new_env);
+                        if let Some(ref rp) = rest_param {
+                            for (p, a) in params.iter().zip(args.iter()) {
+                                new_env.set(p.clone(), a.clone());
+                            }
+                            let mut rest = Value::Nil;
+                            for a in args[params.len()..].iter().rev() {
+                                rest = make_pair(a.clone(), rest);
+                            }
+                            new_env.set(rp.clone(), rest);
+                        } else {
+                            for (p, a) in params.iter().zip(args.into_iter()) {
+                                new_env.set(p.clone(), a);
+                            }
+                        }
+                        if body.is_empty() {
+                            break 'tco Ok(Value::Nil);
+                        }
+                        for e in &body[..body.len() - 1] {
+                            eval(e, &new_env, out)?;
+                        }
+                        cur_expr = body.last().unwrap().clone();
+                        cur_env = new_env;
+                        continue 'tco;
+                    }
                     _ => {
                         break 'tco Err(EvalError::Type(format!(
                             "not a procedure at {}",
@@ -1994,6 +2030,62 @@ fn eval_lambda(args: &[Expr], pos: Pos, env: &Env) -> Result<Value, EvalError> {
     }
 }
 
+fn eval_case_lambda(clauses: &[Expr], pos: Pos, env: &Env) -> Result<Value, EvalError> {
+    let mut parsed_clauses = Vec::new();
+    for clause in clauses {
+        match &clause.kind {
+            ExprKind::List(parts) if parts.len() >= 2 => {
+                let params_expr = &parts[0];
+                let body = parts[1..].to_vec();
+                match &params_expr.kind {
+                    ExprKind::List(param_parts) => {
+                        let (params, rest_param) = parse_params(param_parts, pos)?;
+                        parsed_clauses.push((params, rest_param, body));
+                    }
+                    _ => {
+                        return Err(EvalError::Type(format!(
+                            "case-lambda: clause params must be a list at {}",
+                            pos.fmt()
+                        )));
+                    }
+                }
+            }
+            _ => {
+                return Err(EvalError::Type(format!(
+                    "case-lambda: invalid clause at {}",
+                    pos.fmt()
+                )));
+            }
+        }
+    }
+    Ok(Value::CaseLambda {
+        clauses: Rc::new(parsed_clauses),
+        env: env.clone(),
+    })
+}
+
+fn dispatch_case_lambda<'a>(
+    clauses: &'a [(Vec<String>, Option<String>, Vec<Expr>)],
+    nargs: usize,
+    pos: Pos,
+) -> Result<&'a (Vec<String>, Option<String>, Vec<Expr>), EvalError> {
+    for clause in clauses {
+        let (params, rest_param, _) = clause;
+        if rest_param.is_some() {
+            if nargs >= params.len() {
+                return Ok(clause);
+            }
+        } else if nargs == params.len() {
+            return Ok(clause);
+        }
+    }
+    Err(EvalError::Arity(format!(
+        "case-lambda: no matching clause for {} arguments at {}",
+        nargs,
+        pos.fmt()
+    )))
+}
+
 /// Call a zero-argument thunk (used by dynamic-wind).
 fn call_thunk(thunk: &Value, pos: Pos, env: &Env, out: &mut String) -> Result<Value, EvalError> {
     match thunk {
@@ -2078,6 +2170,32 @@ fn apply_func(func: Value, args: Vec<Value>, pos: Pos, env: &Env, out: &mut Stri
                         pos.fmt()
                     )));
                 }
+                for (p, a) in params.iter().zip(args.into_iter()) {
+                    new_env.set(p.clone(), a);
+                }
+            }
+            if body.is_empty() {
+                return Ok(Value::Nil);
+            }
+            for e in &body[..body.len() - 1] {
+                eval(e, &new_env, out)?;
+            }
+            eval(body.last().unwrap(), &new_env, out)
+        }
+        Value::CaseLambda { clauses, env: closure_env } => {
+            let (params, rest_param, body) = dispatch_case_lambda(&clauses, args.len(), pos)?;
+            let new_env = Env::with_parent(&closure_env);
+            env.copy_all_into_if_absent(&new_env);
+            if let Some(ref rp) = rest_param {
+                for (p, a) in params.iter().zip(args.iter()) {
+                    new_env.set(p.clone(), a.clone());
+                }
+                let mut rest = Value::Nil;
+                for a in args[params.len()..].iter().rev() {
+                    rest = make_pair(a.clone(), rest);
+                }
+                new_env.set(rp.clone(), rest);
+            } else {
                 for (p, a) in params.iter().zip(args.into_iter()) {
                     new_env.set(p.clone(), a);
                 }
@@ -2284,6 +2402,32 @@ fn call_apply(args: &[Value], pos: Pos, env: &Env, out: &mut String) -> Result<V
                         pos.fmt()
                     )));
                 }
+                for (p, a) in params.iter().zip(call_args.into_iter()) {
+                    new_env.set(p.clone(), a);
+                }
+            }
+            if body.is_empty() {
+                return Ok(Value::Nil);
+            }
+            for e in &body[..body.len() - 1] {
+                eval(e, &new_env, out)?;
+            }
+            eval(body.last().unwrap(), &new_env, out)
+        }
+        Value::CaseLambda { clauses, env: closure_env } => {
+            let (params, rest_param, body) = dispatch_case_lambda(clauses, call_args.len(), pos)?;
+            let new_env = Env::with_parent(closure_env);
+            env.copy_all_into_if_absent(&new_env);
+            if let Some(ref rp) = rest_param {
+                for (p, a) in params.iter().zip(call_args.iter()) {
+                    new_env.set(p.clone(), a.clone());
+                }
+                let mut rest = Value::Nil;
+                for a in call_args[params.len()..].iter().rev() {
+                    rest = make_pair(a.clone(), rest);
+                }
+                new_env.set(rp.clone(), rest);
+            } else {
                 for (p, a) in params.iter().zip(call_args.into_iter()) {
                     new_env.set(p.clone(), a);
                 }
@@ -2667,6 +2811,15 @@ fn apply_builtin(op: &str, args: &[Value], pos: Pos, out: &mut String) -> Result
                 )));
             }
             Ok(Some(Value::Boolean(matches!(args[0], Value::Boolean(_)))))
+        }
+        "procedure?" => {
+            if args.len() != 1 {
+                return Err(EvalError::Arity(format!(
+                    "procedure? requires 1 argument at {}",
+                    pos.fmt()
+                )));
+            }
+            Ok(Some(Value::Boolean(matches!(args[0], Value::Lambda { .. } | Value::Builtin(_) | Value::Continuation(_, _) | Value::CaseLambda { .. }))))
         }
         "pair?" => {
             if args.len() != 1 {
@@ -3644,7 +3797,7 @@ fn is_keyword(name: &str) -> bool {
             | "define-syntax" | "syntax-rules" | "dynamic-wind"
             | "raise" | "guard" | "with-exception-handler"
             | "define-record-type" | "syntax-case" | "syntax"
-            | "with-syntax"
+            | "with-syntax" | "case-lambda"
     ) || Value::is_builtin_name(name)
 }
 
