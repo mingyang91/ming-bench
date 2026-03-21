@@ -2,6 +2,7 @@ pub mod error;
 
 pub use error::EvalError;
 
+use std::cell::RefCell;
 use std::collections::HashMap;
 use std::rc::Rc;
 
@@ -126,61 +127,70 @@ enum ExprKind {
 // ── Environment ────────────────────────────────────────────────────
 
 #[derive(Debug, Clone)]
-struct Env {
+struct Env(Rc<RefCell<EnvInner>>);
+
+#[derive(Debug)]
+struct EnvInner {
     bindings: HashMap<String, Value>,
-    parent: Option<Box<Env>>,
+    parent: Option<Env>,
 }
 
 impl Env {
     fn new() -> Self {
-        Env {
+        Env(Rc::new(RefCell::new(EnvInner {
             bindings: HashMap::new(),
             parent: None,
-        }
+        })))
     }
 
     fn with_parent(parent: &Env) -> Self {
-        Env {
+        Env(Rc::new(RefCell::new(EnvInner {
             bindings: HashMap::new(),
-            parent: Some(Box::new(parent.clone())),
-        }
+            parent: Some(parent.clone()),
+        })))
     }
 
     fn get(&self, name: &str) -> Option<Value> {
-        if let Some(val) = self.bindings.get(name) {
+        let inner = self.0.borrow();
+        if let Some(val) = inner.bindings.get(name) {
             Some(val.clone())
-        } else if let Some(ref parent) = self.parent {
+        } else if let Some(ref parent) = inner.parent {
             parent.get(name)
         } else {
             None
         }
     }
 
-    fn set(&mut self, name: String, val: Value) {
-        self.bindings.insert(name, val);
+    fn set(&self, name: String, val: Value) {
+        self.0.borrow_mut().bindings.insert(name, val);
     }
 
     /// Mutate an existing binding in the nearest scope that contains it.
-    fn set_existing(&mut self, name: &str, val: Value) -> bool {
-        if self.bindings.contains_key(name) {
-            self.bindings.insert(name.to_string(), val);
+    fn set_existing(&self, name: &str, val: Value) -> bool {
+        let has_key = self.0.borrow().bindings.contains_key(name);
+        if has_key {
+            self.0.borrow_mut().bindings.insert(name.to_string(), val);
             true
-        } else if let Some(ref mut parent) = self.parent {
-            parent.set_existing(name, val)
         } else {
-            false
+            let parent = self.0.borrow().parent.clone();
+            if let Some(parent) = parent {
+                parent.set_existing(name, val)
+            } else {
+                false
+            }
         }
     }
 
     /// Copy all bindings from this env chain into target, skipping any
     /// that already exist in target's chain (preserves lexical scoping).
-    fn copy_all_into_if_absent(&self, target: &mut Env) {
-        for (k, v) in &self.bindings {
+    fn copy_all_into_if_absent(&self, target: &Env) {
+        let inner = self.0.borrow();
+        for (k, v) in &inner.bindings {
             if target.get(k).is_none() {
                 target.set(k.clone(), v.clone());
             }
         }
-        if let Some(ref parent) = self.parent {
+        if let Some(ref parent) = inner.parent {
             parent.copy_all_into_if_absent(target);
         }
     }
@@ -422,10 +432,9 @@ impl Parser {
 
 // ── Evaluator ───────────────────────────────────────────────────────
 
-fn eval(expr: &Expr, env: &mut Env, out: &mut String) -> Result<Value, EvalError> {
+fn eval(expr: &Expr, env: &Env, out: &mut String) -> Result<Value, EvalError> {
     let mut cur_expr = expr.clone();
     let mut cur_env = env.clone();
-    let mut in_tco = false;
 
     let result = 'tco: loop {
         let pos = cur_expr.pos;
@@ -459,7 +468,7 @@ fn eval(expr: &Expr, env: &mut Env, out: &mut String) -> Result<Value, EvalError
                                     pos.fmt()
                                 )));
                             }
-                            let cond = eval(&args[0], &mut cur_env, out)?;
+                            let cond = eval(&args[0], &cur_env, out)?;
                             if cond.is_truthy() {
                                 cur_expr = args[1].clone();
                                 continue 'tco;
@@ -471,7 +480,7 @@ fn eval(expr: &Expr, env: &mut Env, out: &mut String) -> Result<Value, EvalError
                             }
                         }
                         "define" => {
-                            break 'tco eval_define(&items[1..], pos, &mut cur_env, out);
+                            break 'tco eval_define(&items[1..], pos, &cur_env, out);
                         }
                         "quote" => {
                             break 'tco eval_quote(&items[1..], pos);
@@ -485,7 +494,7 @@ fn eval(expr: &Expr, env: &mut Env, out: &mut String) -> Result<Value, EvalError
                                 break 'tco Ok(Value::Boolean(true));
                             }
                             for a in &args[..args.len() - 1] {
-                                let v = eval(a, &mut cur_env, out)?;
+                                let v = eval(a, &cur_env, out)?;
                                 if !v.is_truthy() {
                                     break 'tco Ok(v);
                                 }
@@ -499,7 +508,7 @@ fn eval(expr: &Expr, env: &mut Env, out: &mut String) -> Result<Value, EvalError
                                 break 'tco Ok(Value::Boolean(false));
                             }
                             for a in &args[..args.len() - 1] {
-                                let v = eval(a, &mut cur_env, out)?;
+                                let v = eval(a, &cur_env, out)?;
                                 if v.is_truthy() {
                                     break 'tco Ok(v);
                                 }
@@ -542,7 +551,7 @@ fn eval(expr: &Expr, env: &mut Env, out: &mut String) -> Result<Value, EvalError
                                                     pair[0].pos.fmt()
                                                 ))),
                                             };
-                                            let val = eval(&pair[1], &mut cur_env, out)?;
+                                            let val = eval(&pair[1], &cur_env, out)?;
                                             params.push(pname);
                                             init_vals.push(val);
                                         }
@@ -553,7 +562,7 @@ fn eval(expr: &Expr, env: &mut Env, out: &mut String) -> Result<Value, EvalError
                                     }
                                 }
                                 let body = Rc::new(args[2..].to_vec());
-                                let mut new_env = Env::with_parent(&cur_env);
+                                let new_env = Env::with_parent(&cur_env);
                                 for (p, v) in params.iter().zip(init_vals.into_iter()) {
                                     new_env.set(p.clone(), v);
                                 }
@@ -564,12 +573,11 @@ fn eval(expr: &Expr, env: &mut Env, out: &mut String) -> Result<Value, EvalError
                                 };
                                 new_env.set(loop_name.clone(), lambda);
                                 for e in &body[..body.len() - 1] {
-                                    eval(e, &mut new_env, out)?;
+                                    eval(e, &new_env, out)?;
                                 }
                                 cur_expr = body.last().unwrap().clone();
                                 cur_env = new_env;
-                                in_tco = true;
-                                continue 'tco;
+                                    continue 'tco;
                             }
                             // Regular let
                             let bindings = match &args[0].kind {
@@ -579,7 +587,7 @@ fn eval(expr: &Expr, env: &mut Env, out: &mut String) -> Result<Value, EvalError
                                     pos.fmt()
                                 ))),
                             };
-                            let mut local_env = Env::with_parent(&cur_env);
+                            let local_env = Env::with_parent(&cur_env);
                             for b in bindings {
                                 match &b.kind {
                                     ExprKind::List(pair) if pair.len() == 2 => {
@@ -590,7 +598,7 @@ fn eval(expr: &Expr, env: &mut Env, out: &mut String) -> Result<Value, EvalError
                                                 pair[0].pos.fmt()
                                             ))),
                                         };
-                                        let val = eval(&pair[1], &mut cur_env, out)?;
+                                        let val = eval(&pair[1], &cur_env, out)?;
                                         local_env.set(bname, val);
                                     }
                                     _ => break 'tco Err(EvalError::Type(format!(
@@ -601,11 +609,10 @@ fn eval(expr: &Expr, env: &mut Env, out: &mut String) -> Result<Value, EvalError
                             }
                             let body = &args[1..];
                             for e in &body[..body.len() - 1] {
-                                eval(e, &mut local_env, out)?;
+                                eval(e, &local_env, out)?;
                             }
                             cur_expr = body.last().unwrap().clone();
                             cur_env = local_env;
-                            in_tco = true;
                             continue 'tco;
                         }
                         "begin" => {
@@ -614,7 +621,7 @@ fn eval(expr: &Expr, env: &mut Env, out: &mut String) -> Result<Value, EvalError
                                 break 'tco Ok(Value::Nil);
                             }
                             for e in &args[..args.len() - 1] {
-                                eval(e, &mut cur_env, out)?;
+                                eval(e, &cur_env, out)?;
                             }
                             cur_expr = args.last().unwrap().clone();
                             continue 'tco;
@@ -630,10 +637,10 @@ fn eval(expr: &Expr, env: &mut Env, out: &mut String) -> Result<Value, EvalError
                                             ExprKind::Symbol(ref s) if s == "else"
                                         );
                                         if is_else
-                                            || eval(&parts[0], &mut cur_env, out)?.is_truthy()
+                                            || eval(&parts[0], &cur_env, out)?.is_truthy()
                                         {
                                             for e in &parts[1..parts.len() - 1] {
-                                                eval(e, &mut cur_env, out)?;
+                                                eval(e, &cur_env, out)?;
                                             }
                                             cur_expr = parts.last().unwrap().clone();
                                             found = true;
@@ -653,11 +660,35 @@ fn eval(expr: &Expr, env: &mut Env, out: &mut String) -> Result<Value, EvalError
                             }
                             break 'tco Ok(Value::Nil);
                         }
+                        "set!" => {
+                            if items.len() != 3 {
+                                break 'tco Err(EvalError::Arity(format!(
+                                    "set! requires 2 arguments at {}",
+                                    pos.fmt()
+                                )));
+                            }
+                            let name = match &items[1].kind {
+                                ExprKind::Symbol(s) => s.clone(),
+                                _ => break 'tco Err(EvalError::Type(format!(
+                                    "set!: first argument must be a symbol at {}",
+                                    pos.fmt()
+                                ))),
+                            };
+                            let val = eval(&items[2], &cur_env, out)?;
+                            if !cur_env.set_existing(&name, val) {
+                                break 'tco Err(EvalError::UnboundVariable(format!(
+                                    "{} at {}",
+                                    name,
+                                    pos.fmt()
+                                )));
+                            }
+                            break 'tco Ok(Value::Nil);
+                        }
                         "string-set!" => {
                             break 'tco eval_string_set(
                                 &items[1..],
                                 pos,
-                                &mut cur_env,
+                                &cur_env,
                                 out,
                             );
                         }
@@ -670,7 +701,7 @@ fn eval(expr: &Expr, env: &mut Env, out: &mut String) -> Result<Value, EvalError
                     _ => None,
                 };
                 let args: Result<Vec<Value>, _> =
-                    items[1..].iter().map(|a| eval(a, &mut cur_env, out)).collect();
+                    items[1..].iter().map(|a| eval(a, &cur_env, out)).collect();
                 let args = args?;
                 if let Some(ref name) = func_name {
                     if let Some(result) = apply_builtin(name, &args, pos, out)? {
@@ -682,7 +713,7 @@ fn eval(expr: &Expr, env: &mut Env, out: &mut String) -> Result<Value, EvalError
                         EvalError::UnboundVariable(format!("{} at {}", name, pos.fmt()))
                     })?
                 } else {
-                    eval(&items[0], &mut cur_env, out)?
+                    eval(&items[0], &cur_env, out)?
                 };
                 match func {
                     Value::Lambda {
@@ -698,9 +729,9 @@ fn eval(expr: &Expr, env: &mut Env, out: &mut String) -> Result<Value, EvalError
                                 pos.fmt()
                             )));
                         }
-                        let mut new_env = Env::with_parent(&closure_env);
+                        let new_env = Env::with_parent(&closure_env);
                         // Copy calling env bindings for mutual recursion support
-                        cur_env.copy_all_into_if_absent(&mut new_env);
+                        cur_env.copy_all_into_if_absent(&new_env);
                         for (p, a) in params.iter().zip(args.into_iter()) {
                             new_env.set(p.clone(), a);
                         }
@@ -708,11 +739,10 @@ fn eval(expr: &Expr, env: &mut Env, out: &mut String) -> Result<Value, EvalError
                             break 'tco Ok(Value::Nil);
                         }
                         for e in &body[..body.len() - 1] {
-                            eval(e, &mut new_env, out)?;
+                            eval(e, &new_env, out)?;
                         }
                         cur_expr = body.last().unwrap().clone();
                         cur_env = new_env;
-                        in_tco = true;
                         continue 'tco;
                     }
                     _ => {
@@ -725,13 +755,10 @@ fn eval(expr: &Expr, env: &mut Env, out: &mut String) -> Result<Value, EvalError
             }
         }
     };
-    if !in_tco {
-        *env = cur_env;
-    }
     result
 }
 
-fn eval_define(args: &[Expr], pos: Pos, env: &mut Env, out: &mut String) -> Result<Value, EvalError> {
+fn eval_define(args: &[Expr], pos: Pos, env: &Env, out: &mut String) -> Result<Value, EvalError> {
     if args.is_empty() {
         return Err(EvalError::Arity(format!(
             "define requires arguments at {}",
@@ -859,7 +886,7 @@ fn eval_lambda(args: &[Expr], pos: Pos, env: &Env) -> Result<Value, EvalError> {
 
 
 
-fn eval_string_set(args: &[Expr], pos: Pos, env: &mut Env, out: &mut String) -> Result<Value, EvalError> {
+fn eval_string_set(args: &[Expr], pos: Pos, env: &Env, out: &mut String) -> Result<Value, EvalError> {
     if args.len() != 3 {
         return Err(EvalError::Arity(format!(
             "string-set! requires 3 arguments at {}",
@@ -1300,11 +1327,11 @@ pub fn eval_str(input: &str) -> Result<String, EvalError> {
     if exprs.is_empty() {
         return Err(EvalError::Parse("no expressions".into()));
     }
-    let mut env = Env::new();
+    let env = Env::new();
     let mut out = String::new();
     let mut result = Value::Boolean(false);
     for expr in &exprs {
-        result = eval(expr, &mut env, &mut out)?;
+        result = eval(expr, &env, &mut out)?;
     }
     Ok(result.display())
 }
@@ -1317,11 +1344,11 @@ pub fn eval_str_with_output(input: &str) -> Result<(String, String), EvalError> 
     if exprs.is_empty() {
         return Err(EvalError::Parse("no expressions".into()));
     }
-    let mut env = Env::new();
+    let env = Env::new();
     let mut out = String::new();
     let mut result = Value::Boolean(false);
     for expr in &exprs {
-        result = eval(expr, &mut env, &mut out)?;
+        result = eval(expr, &env, &mut out)?;
     }
     Ok((result.display(), out))
 }
