@@ -97,7 +97,9 @@ pub fn eval(expr: &Value, env: &Rc<RefCell<Env>>, out: &Output) -> Result<Value,
     loop {
         match &current_expr {
             Value::Integer(_) | Value::Boolean(_) | Value::Str(_) | Value::Char(_)
-            | Value::Void | Value::Vector(_) | Value::Pair(_, _) => return Ok(current_expr),
+            | Value::Void | Value::Vector(_) | Value::Pair(_, _) | Value::Values(_) => {
+                return Ok(current_expr)
+            }
             Value::Lambda { .. } | Value::Builtin(_) | Value::Continuation(_)
             | Value::Macro { .. } => {
                 return Ok(current_expr)
@@ -629,6 +631,18 @@ fn call_builtin_with_values(
         };
         return eval_dynamic_wind_core(in_thunk, body_thunk, out_thunk, env, out);
     }
+    if name == "values" {
+        return eval_values_core(values);
+    }
+    if name == "call-with-values" {
+        let [producer, consumer] = values.as_slice() else {
+            return Err(EvalError::WrongArgCount {
+                expected: 2,
+                got: values.len(),
+            });
+        };
+        return eval_call_with_values_core(producer, consumer, env, out);
+    }
     let quoted_args: Vec<Value> = values
         .into_iter()
         .map(|v| Value::List(vec![Value::Symbol("quote".into()), v]))
@@ -889,6 +903,7 @@ fn is_builtin(name: &str) -> bool {
             | "char=?" | "char<?"
             | "string=?" | "string<?" | "string-ci=?"
             | "string-upcase" | "string-downcase"
+            | "values" | "call-with-values"
     )
 }
 
@@ -980,6 +995,8 @@ fn eval_builtin(
         "string-ci=?" => eval_string_ci_eq(args, env, out),
         "string-upcase" => eval_string_case(args, env, out, true),
         "string-downcase" => eval_string_case(args, env, out, false),
+        "values" => eval_values(args, env, out),
+        "call-with-values" => eval_call_with_values(args, env, out),
         _ => Err(EvalError::UnknownProcedure {
             name: name.into(),
         }),
@@ -2469,6 +2486,54 @@ fn eval_string_case(
     Ok(Value::Str(result))
 }
 
+// --- L18: values & call-with-values ---
+
+fn eval_values(
+    args: &[Value],
+    env: &Rc<RefCell<Env>>,
+    out: &Output,
+) -> Result<Value, EvalError> {
+    let vals: Vec<Value> = args.iter().map(|a| eval(a, env, out)).collect::<Result<_, _>>()?;
+    eval_values_core(vals)
+}
+
+fn eval_values_core(vals: Vec<Value>) -> Result<Value, EvalError> {
+    match vals.len() {
+        1 => Ok(vals.into_iter().next().expect("checked length")),
+        _ => Ok(Value::Values(vals)),
+    }
+}
+
+fn eval_call_with_values(
+    args: &[Value],
+    env: &Rc<RefCell<Env>>,
+    out: &Output,
+) -> Result<Value, EvalError> {
+    let [producer_expr, consumer_expr] = args else {
+        return Err(EvalError::WrongArgCount {
+            expected: 2,
+            got: args.len(),
+        });
+    };
+    let producer = eval(producer_expr, env, out)?;
+    let consumer = eval(consumer_expr, env, out)?;
+    eval_call_with_values_core(&producer, &consumer, env, out)
+}
+
+fn eval_call_with_values_core(
+    producer: &Value,
+    consumer: &Value,
+    env: &Rc<RefCell<Env>>,
+    out: &Output,
+) -> Result<Value, EvalError> {
+    let produced = apply_values(producer, vec![], env, out)?;
+    let args = match produced {
+        Value::Values(vals) => vals,
+        single => vec![single],
+    };
+    apply_values(consumer, args, env, out)
+}
+
 /// Seed all builtin procedures into the environment as first-class values.
 pub fn seed_builtins(env: &Rc<RefCell<Env>>) {
     let names = [
@@ -2495,6 +2560,7 @@ pub fn seed_builtins(env: &Rc<RefCell<Env>>) {
         "char=?", "char<?",
         "string=?", "string<?", "string-ci=?",
         "string-upcase", "string-downcase",
+        "values", "call-with-values",
     ];
     let mut env_ref = env.borrow_mut();
     for name in names {

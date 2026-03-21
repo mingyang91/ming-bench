@@ -29,6 +29,8 @@ pub enum Value {
         def_env: Rc<RefCell<Env>>,
     },
     Void,
+    /// Multiple return values from `(values ...)`.
+    Values(Vec<Value>),
 }
 
 impl PartialEq for Value {
@@ -45,6 +47,7 @@ impl PartialEq for Value {
             (Value::Builtin(a), Value::Builtin(b)) => a == b,
             (Value::Continuation(a), Value::Continuation(b)) => a == b,
             (Value::Macro { .. }, Value::Macro { .. }) => false,
+            (Value::Values(a), Value::Values(b)) => a == b,
             (Value::Void, Value::Void) => true,
             _ => false,
         }
@@ -77,6 +80,16 @@ fn write_pair(f: &mut fmt::Formatter<'_>, car: &Value, cdr: &Value) -> fmt::Resu
 fn write_list_tail(f: &mut fmt::Formatter<'_>, items: &[Value]) -> fmt::Result {
     for item in items {
         write!(f, " {item}")?;
+    }
+    Ok(())
+}
+
+fn write_values(f: &mut fmt::Formatter<'_>, vals: &[Value]) -> fmt::Result {
+    for (i, v) in vals.iter().enumerate() {
+        if i > 0 {
+            writeln!(f)?;
+        }
+        write!(f, "{v}")?;
     }
     Ok(())
 }
@@ -131,6 +144,9 @@ impl Value {
                 let b = b.borrow();
                 a.len() == b.len() && a.iter().zip(b.iter()).all(|(x, y)| x.deep_equal(y))
             }
+            (Value::Values(a), Value::Values(b)) => {
+                a.len() == b.len() && a.iter().zip(b).all(|(x, y)| x.deep_equal(y))
+            }
             (Value::Void, Value::Void) => true,
             _ => false,
         }
@@ -159,6 +175,7 @@ impl fmt::Display for Value {
                 write!(f, "#<procedure>")
             }
             Value::Void => write!(f, "#<void>"),
+            Value::Values(vals) => write_values(f, vals),
         }
     }
 }
