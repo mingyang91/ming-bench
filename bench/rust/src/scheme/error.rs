@@ -80,4 +80,10 @@ pub enum EvalError {
 
     #[error("uninitialized binding at {pos}: {name}")]
     UninitializedBinding { pos: SourcePos, name: String },
+
+    #[error("exception handler returned from raise at {pos}")]
+    ExceptionHandlerReturned { pos: SourcePos },
+
+    #[error("uncaught exception at {pos}: {value}")]
+    UncaughtException { pos: SourcePos, value: String },
 }

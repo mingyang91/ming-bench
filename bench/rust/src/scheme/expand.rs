@@ -1,6 +1,4 @@
-use super::{
-    internal_builtin_name, syntax_error, BUILTIN_BINDINGS, EvalError, Expr, SourcePos,
-};
+use super::{internal_builtin_name, syntax_error, EvalError, Expr, SourcePos, BUILTIN_BINDINGS};
 use std::collections::{HashMap, HashSet};
 
 const INTERNAL_PREFIX: &str = "#%";
@@ -166,7 +164,9 @@ impl Expander {
             Expr::Int(_, _) | Expr::Bool(_, _) | Expr::String(_, _) | Expr::Char(_, _) => {
                 Ok(expr.clone())
             }
-            Expr::Symbol(name, pos) => Ok(Expr::Symbol(self.resolve_source_symbol(name, env), *pos)),
+            Expr::Symbol(name, pos) => {
+                Ok(Expr::Symbol(self.resolve_source_symbol(name, env), *pos))
+            }
             Expr::List(items, pos) => {
                 let Some(head) = items.first() else {
                     return Ok(expr.clone());
@@ -201,6 +201,7 @@ impl Expander {
                     }
                     Some("cond") => self.expand_cond(items, *pos, env),
                     Some("case") => self.expand_case(items, *pos, env),
+                    Some("guard") => self.expand_guard(items, *pos, env),
                     _ => self.expand_application(items, *pos, env),
                 }
             }
@@ -294,13 +295,8 @@ impl Expander {
             .map(|(name, binding)| (name.clone(), binding.internal.clone()))
             .collect::<HashMap<_, _>>();
 
-        let macro_def = self.parse_syntax_rules(
-            name,
-            &internal_name,
-            transformer,
-            &def_vars,
-            &def_macros,
-        )?;
+        let macro_def =
+            self.parse_syntax_rules(name, &internal_name, transformer, &def_vars, &def_macros)?;
         self.macros.insert(internal_name, macro_def);
         Ok(())
     }
@@ -474,7 +470,11 @@ impl Expander {
 
         let mut result = Vec::with_capacity(expanded_body.len() + 2);
         result.push(Expr::Symbol(
-            if sequential { "letrec*".into() } else { "letrec".into() },
+            if sequential {
+                "letrec*".into()
+            } else {
+                "letrec".into()
+            },
             pos,
         ));
         result.push(Expr::List(expanded_bindings, bindings_expr.pos()));
@@ -562,6 +562,77 @@ impl Expander {
         Ok(Expr::List(result, pos))
     }
 
+    fn expand_guard(
+        &mut self,
+        items: &[Expr],
+        pos: SourcePos,
+        env: &ExpandEnv,
+    ) -> Result<Expr, EvalError> {
+        let Some((_, rest)) = items.split_first() else {
+            return Err(syntax_error(pos, "guard requires a variable and body"));
+        };
+        let Some((spec, body)) = rest.split_first() else {
+            return Err(syntax_error(pos, "guard requires a variable and body"));
+        };
+        if body.is_empty() {
+            return Err(syntax_error(pos, "guard requires a body"));
+        }
+
+        let Expr::List(spec_items, spec_pos) = spec else {
+            return Err(syntax_error(
+                spec.pos(),
+                "guard requires a variable and clauses",
+            ));
+        };
+        let Some((var_expr, clauses)) = spec_items.split_first() else {
+            return Err(syntax_error(
+                spec.pos(),
+                "guard requires an exception variable",
+            ));
+        };
+        let Expr::Symbol(name, name_pos) = var_expr else {
+            return Err(syntax_error(
+                var_expr.pos(),
+                "guard exception variable must be a symbol",
+            ));
+        };
+
+        let mut clause_env = self.child_env(env);
+        let internal = self.bind_var(&mut clause_env, name);
+        let mut expanded_spec = Vec::with_capacity(spec_items.len());
+        expanded_spec.push(Expr::Symbol(internal, *name_pos));
+
+        for clause in clauses {
+            let Expr::List(parts, clause_pos) = clause else {
+                return Err(syntax_error(clause.pos(), "guard clause must be a list"));
+            };
+            let Some((test, clause_body)) = parts.split_first() else {
+                return Err(syntax_error(clause.pos(), "guard clause cannot be empty"));
+            };
+
+            let mut clause_items = Vec::with_capacity(parts.len());
+            if matches!(symbol_name(test), Some("else")) {
+                clause_items.push(test.clone());
+            } else {
+                clause_items.push(self.expand_expr(test, &clause_env)?);
+            }
+
+            let mut clause_body_env = clause_env.clone();
+            let expanded_body = self.expand_sequence(clause_body, &mut clause_body_env)?;
+            clause_items.extend(expanded_body);
+            expanded_spec.push(Expr::List(clause_items, *clause_pos));
+        }
+
+        let mut body_env = env.clone();
+        let expanded_body = self.expand_sequence(body, &mut body_env)?;
+
+        let mut result = Vec::with_capacity(expanded_body.len() + 2);
+        result.push(Expr::Symbol("guard".into(), pos));
+        result.push(Expr::List(expanded_spec, *spec_pos));
+        result.extend(expanded_body);
+        Ok(Expr::List(result, pos))
+    }
+
     fn expand_application(
         &mut self,
         items: &[Expr],
@@ -594,7 +665,10 @@ impl Expander {
                 ));
             };
             let Expr::Symbol(name, name_pos) = name_expr else {
-                return Err(syntax_error(name_expr.pos(), "let binding name must be a symbol"));
+                return Err(syntax_error(
+                    name_expr.pos(),
+                    "let binding name must be a symbol",
+                ));
             };
 
             let value = self.expand_expr(value_expr, value_env)?;
@@ -625,7 +699,10 @@ impl Expander {
                 ));
             };
             let Expr::Symbol(name, name_pos) = name_expr else {
-                return Err(syntax_error(name_expr.pos(), "let binding name must be a symbol"));
+                return Err(syntax_error(
+                    name_expr.pos(),
+                    "let binding name must be a symbol",
+                ));
             };
 
             let internal = self.bind_var(body_env, name);
@@ -664,7 +741,10 @@ impl Expander {
                 ));
             };
             let Expr::Symbol(name, name_pos) = name_expr else {
-                return Err(syntax_error(name_expr.pos(), "let binding name must be a symbol"));
+                return Err(syntax_error(
+                    name_expr.pos(),
+                    "let binding name must be a symbol",
+                ));
             };
 
             let internal = self.bind_var(body_env, name);
@@ -709,12 +789,7 @@ impl Expander {
                 Expr::Symbol(name, pos) => {
                     expanded.push(Expr::Symbol(self.bind_var(env, name), *pos));
                 }
-                _ => {
-                    return Err(syntax_error(
-                        item.pos(),
-                        "parameter names must be symbols",
-                    ))
-                }
+                _ => return Err(syntax_error(item.pos(), "parameter names must be symbols")),
             }
         }
         Ok(expanded)
@@ -771,7 +846,10 @@ impl Expander {
         }
 
         if rules.is_empty() {
-            return Err(syntax_error(*pos, "syntax-rules requires at least one rule"));
+            return Err(syntax_error(
+                *pos,
+                "syntax-rules requires at least one rule",
+            ));
         }
 
         let mut parsed_rules = Vec::with_capacity(rules.len());
@@ -815,8 +893,13 @@ impl Expander {
 
         for rule in &macro_def.rules {
             if let Some(bindings) = self.match_rule(rule, items, &macro_def, env)? {
-                let expanded =
-                    self.expand_template(&rule.template, &macro_def, &bindings, None, &IntroEnv::default())?;
+                let expanded = self.expand_template(
+                    &rule.template,
+                    &macro_def,
+                    &bindings,
+                    None,
+                    &IntroEnv::default(),
+                )?;
                 return self.expand_expr(&expanded, env);
             }
         }
@@ -913,7 +996,8 @@ impl Expander {
             ));
         }
 
-        let repeated = pattern_index + 1 < patterns.len() && is_ellipsis(&patterns[pattern_index + 1]);
+        let repeated =
+            pattern_index + 1 < patterns.len() && is_ellipsis(&patterns[pattern_index + 1]);
         if repeated {
             let min_rest = min_required_pattern_items(&patterns[pattern_index + 2..]);
             if inputs.len() < input_index + min_rest {
@@ -1005,16 +1089,15 @@ impl Expander {
         match pattern {
             Expr::Int(value, _) => Ok(matches!(input, Expr::Int(found, _) if found == value)),
             Expr::Bool(value, _) => Ok(matches!(input, Expr::Bool(found, _) if found == value)),
-            Expr::String(value, _) => {
-                Ok(matches!(input, Expr::String(found, _) if found == value))
-            }
+            Expr::String(value, _) => Ok(matches!(input, Expr::String(found, _) if found == value)),
             Expr::Char(value, _) => Ok(matches!(input, Expr::Char(found, _) if found == value)),
             Expr::Symbol(name, _) => {
                 if name == "_" {
                     return Ok(true);
                 }
 
-                let resolved = resolve_definition_identifier(name, &macro_def.def_vars, &macro_def.def_macros);
+                let resolved =
+                    resolve_definition_identifier(name, &macro_def.def_vars, &macro_def.def_macros);
                 if literals.contains(&resolved) {
                     return Ok(match input {
                         Expr::Symbol(found, _) => {
@@ -1035,7 +1118,14 @@ impl Expander {
                 let Expr::List(input_items, _) = input else {
                     return Ok(false);
                 };
-                self.match_list_pattern(pattern_items, input_items, literals, macro_def, env, bindings)
+                self.match_list_pattern(
+                    pattern_items,
+                    input_items,
+                    literals,
+                    macro_def,
+                    env,
+                    bindings,
+                )
             }
         }
     }
@@ -1052,30 +1142,65 @@ impl Expander {
             Expr::Int(_, _) | Expr::Bool(_, _) | Expr::String(_, _) | Expr::Char(_, _) => {
                 Ok(template.clone())
             }
-            Expr::Symbol(name, pos) => self.expand_template_symbol(
-                name,
-                *pos,
-                macro_def,
-                bindings,
-                repeat_index,
-                intro,
-            ),
+            Expr::Symbol(name, pos) => {
+                self.expand_template_symbol(name, *pos, macro_def, bindings, repeat_index, intro)
+            }
             Expr::List(items, pos) => {
                 let Some(head) = items.first() else {
                     return Ok(template.clone());
                 };
 
                 match symbol_name(head) {
-                    Some("lambda") => self.expand_template_lambda(items, *pos, macro_def, bindings, repeat_index, intro),
-                    Some("let") => self.expand_template_let(items, *pos, macro_def, bindings, repeat_index, intro),
-                    Some("letrec") => {
-                        self.expand_template_letrec(items, *pos, macro_def, bindings, repeat_index, intro, false)
-                    }
-                    Some("letrec*") => {
-                        self.expand_template_letrec(items, *pos, macro_def, bindings, repeat_index, intro, true)
-                    }
-                    Some("case") => self.expand_template_case(items, *pos, macro_def, bindings, repeat_index, intro),
-                    Some("define") => self.expand_template_define(items, *pos, macro_def, bindings, repeat_index, intro),
+                    Some("lambda") => self.expand_template_lambda(
+                        items,
+                        *pos,
+                        macro_def,
+                        bindings,
+                        repeat_index,
+                        intro,
+                    ),
+                    Some("let") => self.expand_template_let(
+                        items,
+                        *pos,
+                        macro_def,
+                        bindings,
+                        repeat_index,
+                        intro,
+                    ),
+                    Some("letrec") => self.expand_template_letrec(
+                        items,
+                        *pos,
+                        macro_def,
+                        bindings,
+                        repeat_index,
+                        intro,
+                        false,
+                    ),
+                    Some("letrec*") => self.expand_template_letrec(
+                        items,
+                        *pos,
+                        macro_def,
+                        bindings,
+                        repeat_index,
+                        intro,
+                        true,
+                    ),
+                    Some("case") => self.expand_template_case(
+                        items,
+                        *pos,
+                        macro_def,
+                        bindings,
+                        repeat_index,
+                        intro,
+                    ),
+                    Some("define") => self.expand_template_define(
+                        items,
+                        *pos,
+                        macro_def,
+                        bindings,
+                        repeat_index,
+                        intro,
+                    ),
                     _ => {
                         let mut expanded = Vec::new();
                         let mut index = 0;
@@ -1159,10 +1284,20 @@ impl Expander {
         };
 
         let mut body_intro = intro.clone();
-        let formals =
-            self.expand_template_formals_expr(formals_expr, macro_def, bindings, repeat_index, &mut body_intro)?;
-        let expanded_body =
-            self.expand_template_sequence(body, macro_def, bindings, repeat_index, &mut body_intro)?;
+        let formals = self.expand_template_formals_expr(
+            formals_expr,
+            macro_def,
+            bindings,
+            repeat_index,
+            &mut body_intro,
+        )?;
+        let expanded_body = self.expand_template_sequence(
+            body,
+            macro_def,
+            bindings,
+            repeat_index,
+            &mut body_intro,
+        )?;
 
         let mut expanded = Vec::with_capacity(expanded_body.len() + 2);
         expanded.push(Expr::Symbol("lambda".into(), pos));
@@ -1286,7 +1421,11 @@ impl Expander {
 
         let mut result = Vec::with_capacity(items.len());
         result.push(Expr::Symbol(
-            if sequential { "letrec*".into() } else { "letrec".into() },
+            if sequential {
+                "letrec*".into()
+            } else {
+                "letrec".into()
+            },
             pos,
         ));
         result.push(Expr::List(expanded_bindings, bindings_expr.pos()));
@@ -1318,13 +1457,7 @@ impl Expander {
 
         let mut result = Vec::with_capacity(items.len());
         result.push(Expr::Symbol("case".into(), pos));
-        result.push(self.expand_template(
-            key,
-            macro_def,
-            bindings,
-            repeat_index,
-            intro,
-        )?);
+        result.push(self.expand_template(key, macro_def, bindings, repeat_index, intro)?);
 
         for clause in clauses {
             let Expr::List(parts, clause_pos) = clause else {
@@ -1399,13 +1532,8 @@ impl Expander {
                     repeat_index,
                     intro,
                 )?;
-                let value = self.expand_template(
-                    value_expr,
-                    macro_def,
-                    bindings,
-                    repeat_index,
-                    intro,
-                )?;
+                let value =
+                    self.expand_template(value_expr, macro_def, bindings, repeat_index, intro)?;
                 Ok(Expr::List(
                     vec![Expr::Symbol("define".into(), pos), target, value],
                     pos,
@@ -1419,8 +1547,13 @@ impl Expander {
                     ));
                 };
 
-                let target =
-                    self.bind_template_identifier(name_expr, macro_def, bindings, repeat_index, intro)?;
+                let target = self.bind_template_identifier(
+                    name_expr,
+                    macro_def,
+                    bindings,
+                    repeat_index,
+                    intro,
+                )?;
                 let mut body_intro = intro.clone();
                 let expanded_formals = self.expand_template_formals(
                     formals,
@@ -1475,13 +1608,7 @@ impl Expander {
                 }
             }
 
-            expanded.push(self.expand_template(
-                expr,
-                macro_def,
-                bindings,
-                repeat_index,
-                intro,
-            )?);
+            expanded.push(self.expand_template(expr, macro_def, bindings, repeat_index, intro)?);
         }
         Ok(expanded)
     }
@@ -1506,13 +1633,8 @@ impl Expander {
                     "let binding must contain a name and value",
                 ));
             };
-            let value = self.expand_template(
-                value_expr,
-                macro_def,
-                bindings,
-                repeat_index,
-                value_intro,
-            )?;
+            let value =
+                self.expand_template(value_expr, macro_def, bindings, repeat_index, value_intro)?;
             let name = self.bind_template_identifier(
                 name_expr,
                 macro_def,
@@ -1545,13 +1667,8 @@ impl Expander {
                 ));
             };
 
-            let name = self.bind_template_identifier(
-                name_expr,
-                macro_def,
-                bindings,
-                repeat_index,
-                intro,
-            )?;
+            let name =
+                self.bind_template_identifier(name_expr, macro_def, bindings, repeat_index, intro)?;
             parsed.push((name, value_expr.clone(), *binding_pos));
         }
 
@@ -1595,20 +1712,10 @@ impl Expander {
                 ));
             };
 
-            let name = self.bind_template_identifier(
-                name_expr,
-                macro_def,
-                bindings,
-                repeat_index,
-                intro,
-            )?;
-            let value = self.expand_template(
-                value_expr,
-                macro_def,
-                bindings,
-                repeat_index,
-                intro,
-            )?;
+            let name =
+                self.bind_template_identifier(name_expr, macro_def, bindings, repeat_index, intro)?;
+            let value =
+                self.expand_template(value_expr, macro_def, bindings, repeat_index, intro)?;
             expanded.push(Expr::List(vec![name, value], *binding_pos));
         }
         Ok(expanded)
@@ -1671,7 +1778,10 @@ impl Expander {
         intro: &mut IntroEnv,
     ) -> Result<Expr, EvalError> {
         let Expr::Symbol(name, pos) = expr else {
-            return Err(syntax_error(expr.pos(), "binding identifier must be a symbol"));
+            return Err(syntax_error(
+                expr.pos(),
+                "binding identifier must be a symbol",
+            ));
         };
 
         if let Some(internal) = intro.pattern_overrides.get(name) {
@@ -1682,10 +1792,8 @@ impl Expander {
         }
 
         if binding_exists(bindings, name) {
-            let bound_expr =
-                lookup_binding_expr(bindings, name, repeat_index)?.ok_or_else(|| {
-                    syntax_error(*pos, "pattern variable used outside of ellipsis")
-                })?;
+            let bound_expr = lookup_binding_expr(bindings, name, repeat_index)?
+                .ok_or_else(|| syntax_error(*pos, "pattern variable used outside of ellipsis"))?;
             let Expr::Symbol(bound_name, _) = bound_expr else {
                 return Err(syntax_error(*pos, "binding identifier must be a symbol"));
             };
@@ -1801,7 +1909,10 @@ fn lookup_binding_expr(
     if let Some(values) = bindings.repeated.get(name) {
         let Some(index) = repeat_index else {
             return Err(syntax_error(
-                values.first().map(Expr::pos).unwrap_or(SourcePos { line: 1, col: 1 }),
+                values
+                    .first()
+                    .map(Expr::pos)
+                    .unwrap_or(SourcePos { line: 1, col: 1 }),
                 "pattern variable used outside of ellipsis",
             ));
         };
@@ -1931,6 +2042,7 @@ fn is_special_form_name(name: &str) -> bool {
             | "begin"
             | "cond"
             | "case"
+            | "guard"
     )
 }
 
@@ -1946,7 +2058,10 @@ fn expr_eq(left: &Expr, right: &Expr) -> bool {
         (Expr::Char(a, _), Expr::Char(b, _)) => a == b,
         (Expr::Symbol(a, _), Expr::Symbol(b, _)) => a == b,
         (Expr::List(a, _), Expr::List(b, _)) => {
-            a.len() == b.len() && a.iter().zip(b.iter()).all(|(left, right)| expr_eq(left, right))
+            a.len() == b.len()
+                && a.iter()
+                    .zip(b.iter())
+                    .all(|(left, right)| expr_eq(left, right))
         }
         _ => false,
     }

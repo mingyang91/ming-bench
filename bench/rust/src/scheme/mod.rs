@@ -47,6 +47,8 @@ enum Builtin {
     Apply,
     CallCc,
     DynamicWind,
+    Raise,
+    WithExceptionHandler,
     Eq,
     Eqv,
     EqualDeep,
@@ -132,6 +134,8 @@ const BUILTIN_BINDINGS: &[(&str, Builtin)] = &[
     ("apply", Builtin::Apply),
     ("call/cc", Builtin::CallCc),
     ("dynamic-wind", Builtin::DynamicWind),
+    ("raise", Builtin::Raise),
+    ("with-exception-handler", Builtin::WithExceptionHandler),
     ("eq?", Builtin::Eq),
     ("eqv?", Builtin::Eqv),
     ("equal?", Builtin::EqualDeep),
@@ -372,6 +376,29 @@ enum Continuation {
     ProcedureReturn {
         next: Rc<Continuation>,
     },
+    Guard {
+        var: String,
+        clauses: Rc<Vec<Expr>>,
+        env: EnvRef,
+        winds: Vec<WindFrameRef>,
+        next: Rc<Continuation>,
+    },
+    WithExceptionHandler {
+        handler: Value,
+        pos: SourcePos,
+        winds: Vec<WindFrameRef>,
+        output: Rc<RefCell<String>>,
+        next: Rc<Continuation>,
+    },
+    RaiseResume {
+        exception: Value,
+        raised_pos: SourcePos,
+        handler_cont: Option<Rc<Continuation>>,
+    },
+    RaiseHandlerReturned {
+        pos: SourcePos,
+        next: Rc<Continuation>,
+    },
     CallCcReturn {
         normal: Rc<Continuation>,
         suspend: Rc<Continuation>,
@@ -421,6 +448,15 @@ enum Continuation {
         next: Rc<Continuation>,
     },
     CondTest {
+        clauses: Rc<Vec<Expr>>,
+        next_index: usize,
+        body: Rc<Vec<Expr>>,
+        env: EnvRef,
+        next: Rc<Continuation>,
+    },
+    GuardTest {
+        exception: Value,
+        raised_pos: SourcePos,
         clauses: Rc<Vec<Expr>>,
         next_index: usize,
         body: Rc<Vec<Expr>>,
@@ -679,16 +715,182 @@ fn invoke_captured_continuation(
     let shared = common_dynamic_wind_prefix_len(current_winds.as_slice(), saved.winds.as_slice());
     let mut steps = Vec::with_capacity(current_winds.len() + saved.winds.len() - (shared * 2));
 
-    steps.extend(current_winds[shared..].iter().rev().cloned().map(|frame| WindStep {
-        action: WindAction::Exit,
-        frame,
-    }));
+    steps.extend(
+        current_winds[shared..]
+            .iter()
+            .rev()
+            .cloned()
+            .map(|frame| WindStep {
+                action: WindAction::Exit,
+                frame,
+            }),
+    );
     steps.extend(saved.winds[shared..].iter().cloned().map(|frame| WindStep {
         action: WindAction::Enter,
         frame,
     }));
 
     continue_wind_transition(Rc::new(steps), 0, value, saved.cont.clone())
+}
+
+fn continuation_parent(cont: &Rc<Continuation>) -> Option<Rc<Continuation>> {
+    match cont.as_ref() {
+        Continuation::Halt => None,
+        Continuation::DefineValue { next, .. }
+        | Continuation::SetValue { next, .. }
+        | Continuation::ProcedureReturn { next }
+        | Continuation::Guard { next, .. }
+        | Continuation::WithExceptionHandler { next, .. }
+        | Continuation::RaiseHandlerReturned { next, .. }
+        | Continuation::DynamicWindAfterIn { next, .. }
+        | Continuation::DynamicWindAfterBody { next, .. }
+        | Continuation::DynamicWindAfterOut { next, .. }
+        | Continuation::If { next, .. }
+        | Continuation::Sequence { next, .. }
+        | Continuation::And { next, .. }
+        | Continuation::Or { next, .. }
+        | Continuation::CondTest { next, .. }
+        | Continuation::GuardTest { next, .. }
+        | Continuation::LetBinding { next, .. }
+        | Continuation::NamedLetBinding { next, .. }
+        | Continuation::LetRecBinding { next, .. }
+        | Continuation::Case { next, .. }
+        | Continuation::Operator { next, .. }
+        | Continuation::Argument { next, .. }
+        | Continuation::Map { next, .. } => Some(next.clone()),
+        Continuation::CallCcReturn { normal, .. } => Some(normal.clone()),
+        Continuation::WindStepDone { final_cont, .. } => Some(final_cont.clone()),
+        Continuation::RaiseResume { handler_cont, .. } => {
+            handler_cont.as_ref().and_then(exception_handler_outer_cont)
+        }
+    }
+}
+
+fn exception_handler_outer_cont(handler_cont: &Rc<Continuation>) -> Option<Rc<Continuation>> {
+    match handler_cont.as_ref() {
+        Continuation::Guard { next, .. } | Continuation::WithExceptionHandler { next, .. } => {
+            Some(next.clone())
+        }
+        _ => None,
+    }
+}
+
+fn exception_handler_winds(handler_cont: &Rc<Continuation>) -> Vec<WindFrameRef> {
+    match handler_cont.as_ref() {
+        Continuation::Guard { winds, .. } | Continuation::WithExceptionHandler { winds, .. } => {
+            winds.clone()
+        }
+        _ => Vec::new(),
+    }
+}
+
+fn find_exception_handler_cont(cont: &Rc<Continuation>) -> Option<Rc<Continuation>> {
+    let mut current = Some(cont.clone());
+
+    while let Some(candidate) = current {
+        match candidate.as_ref() {
+            Continuation::Guard { .. } | Continuation::WithExceptionHandler { .. } => {
+                return Some(candidate);
+            }
+            _ => current = continuation_parent(&candidate),
+        }
+    }
+
+    None
+}
+
+fn resume_exception_dispatch(
+    exception: Value,
+    raised_pos: SourcePos,
+    handler_cont: Option<Rc<Continuation>>,
+) -> Result<MachineState, EvalError> {
+    let Some(handler_cont) = handler_cont else {
+        return Err(uncaught_exception(raised_pos, &exception));
+    };
+
+    match handler_cont.as_ref() {
+        Continuation::Guard {
+            var,
+            clauses,
+            env,
+            next,
+            ..
+        } => {
+            let local_env = Environment::new(Some(env.clone()));
+            local_env.define(var.clone(), exception.clone());
+            eval_guard_clauses(
+                exception,
+                raised_pos,
+                clauses.clone(),
+                0,
+                local_env,
+                next.clone(),
+            )
+        }
+        Continuation::WithExceptionHandler {
+            handler,
+            pos,
+            output,
+            next,
+            ..
+        } => dispatch_apply(
+            handler.clone(),
+            vec![exception],
+            *pos,
+            output.clone(),
+            Rc::new(Continuation::RaiseHandlerReturned {
+                pos: raised_pos,
+                next: next.clone(),
+            }),
+        ),
+        _ => unreachable!("exception dispatch requires a handler continuation"),
+    }
+}
+
+fn raise_exception(
+    exception: Value,
+    pos: SourcePos,
+    cont: Rc<Continuation>,
+) -> Result<MachineState, EvalError> {
+    let handler_cont = find_exception_handler_cont(&cont);
+    let target_winds = handler_cont
+        .as_ref()
+        .map(exception_handler_winds)
+        .unwrap_or_default();
+    let current_winds = current_dynamic_wind_stack();
+    let shared = common_dynamic_wind_prefix_len(current_winds.as_slice(), target_winds.as_slice());
+    let mut steps = Vec::with_capacity(current_winds.len() + target_winds.len() - (shared * 2));
+
+    steps.extend(
+        current_winds[shared..]
+            .iter()
+            .rev()
+            .cloned()
+            .map(|frame| WindStep {
+                action: WindAction::Exit,
+                frame,
+            }),
+    );
+    steps.extend(
+        target_winds[shared..]
+            .iter()
+            .cloned()
+            .map(|frame| WindStep {
+                action: WindAction::Enter,
+                frame,
+            }),
+    );
+
+    continue_wind_transition(
+        Rc::new(steps),
+        0,
+        Value::Void,
+        Rc::new(Continuation::RaiseResume {
+            exception,
+            raised_pos: pos,
+            handler_cont,
+        }),
+    )
 }
 
 struct Parser<'a> {
@@ -1003,6 +1205,17 @@ fn uninitialized_binding(pos: SourcePos, name: impl Into<String>) -> EvalError {
     }
 }
 
+fn exception_handler_returned(pos: SourcePos) -> EvalError {
+    EvalError::ExceptionHandlerReturned { pos }
+}
+
+fn uncaught_exception(pos: SourcePos, value: &Value) -> EvalError {
+    EvalError::UncaughtException {
+        pos,
+        value: value.render(),
+    }
+}
+
 fn expr_pos_or(parts: &[Expr], default: SourcePos) -> SourcePos {
     parts.first().map(Expr::pos).unwrap_or(default)
 }
@@ -1151,16 +1364,14 @@ fn eval_expr(expr: &Expr, env: &EnvRef) -> Result<Value, EvalError> {
 
 fn run_machine(mut state: MachineState) -> Result<Value, EvalError> {
     reset_dynamic_wind_stack();
-    let result = (|| {
-        loop {
-            state = match state {
-                MachineState::Eval { expr, env, cont } => eval_expr_state(expr, env, cont)?,
-                MachineState::Return { value, cont } => match cont.as_ref() {
-                    Continuation::Halt => return Ok(value),
-                    _ => continue_with_value(value, cont)?,
-                },
-            };
-        }
+    let result = (|| loop {
+        state = match state {
+            MachineState::Eval { expr, env, cont } => eval_expr_state(expr, env, cont)?,
+            MachineState::Return { value, cont } => match cont.as_ref() {
+                Continuation::Halt => return Ok(value),
+                _ => continue_with_value(value, cont)?,
+            },
+        };
     })();
     reset_dynamic_wind_stack();
     result
@@ -1246,6 +1457,7 @@ fn eval_list_state(
             }
             "cond" => return eval_cond_state(&items[1..], env, cont),
             "case" => return eval_case_state(&items[1..], *pos, env, cont),
+            "guard" => return eval_guard_state(&items[1..], *pos, env, cont),
             _ => {}
         }
     }
@@ -1532,6 +1744,52 @@ fn eval_case_state(
     })
 }
 
+fn eval_guard_state(
+    parts: &[Expr],
+    pos: SourcePos,
+    env: EnvRef,
+    cont: Rc<Continuation>,
+) -> Result<MachineState, EvalError> {
+    let [spec, body @ ..] = parts else {
+        return Err(wrong_arity(pos, "guard", "at least 2", parts.len()));
+    };
+    if body.is_empty() {
+        return Err(syntax_error(pos, "guard requires a body"));
+    }
+
+    let Expr::List(spec_items, _) = spec else {
+        return Err(syntax_error(
+            spec.pos(),
+            "guard requires a variable and clauses",
+        ));
+    };
+    let Some((var_expr, clauses)) = spec_items.split_first() else {
+        return Err(syntax_error(
+            spec.pos(),
+            "guard requires an exception variable",
+        ));
+    };
+    let Expr::Symbol(var, _) = var_expr else {
+        return Err(syntax_error(
+            var_expr.pos(),
+            "guard exception variable must be a symbol",
+        ));
+    };
+
+    Ok(eval_sequence_state(
+        Rc::new(body.to_vec()),
+        0,
+        env.clone(),
+        Rc::new(Continuation::Guard {
+            var: var.clone(),
+            clauses: Rc::new(clauses.to_vec()),
+            env,
+            winds: current_dynamic_wind_stack(),
+            next: cont,
+        }),
+    ))
+}
+
 fn eval_cond_clauses(
     clauses: Rc<Vec<Expr>>,
     index: usize,
@@ -1577,6 +1835,58 @@ fn eval_cond_clauses(
         expr: test_expr.clone(),
         env: env.clone(),
         cont: Rc::new(Continuation::CondTest {
+            clauses: clauses.clone(),
+            next_index: index + 1,
+            body: Rc::new(body.to_vec()),
+            env,
+            next: cont,
+        }),
+    })
+}
+
+fn eval_guard_clauses(
+    exception: Value,
+    raised_pos: SourcePos,
+    clauses: Rc<Vec<Expr>>,
+    index: usize,
+    env: EnvRef,
+    cont: Rc<Continuation>,
+) -> Result<MachineState, EvalError> {
+    let Some(clause) = clauses.get(index) else {
+        return raise_exception(exception, raised_pos, cont);
+    };
+
+    let Expr::List(items, _) = clause else {
+        return Err(syntax_error(clause.pos(), "guard clause must be a list"));
+    };
+    let Some((test_expr, body)) = items.split_first() else {
+        return Err(syntax_error(clause.pos(), "guard clause cannot be empty"));
+    };
+
+    if let Expr::Symbol(name, _) = test_expr {
+        if name == "else" {
+            if index + 1 != clauses.len() {
+                return Err(syntax_error(
+                    test_expr.pos(),
+                    "guard else clause must be last",
+                ));
+            }
+            if body.is_empty() {
+                return Err(syntax_error(
+                    clause.pos(),
+                    "guard else clause requires a body",
+                ));
+            }
+            return Ok(eval_sequence_state(Rc::new(body.to_vec()), 0, env, cont));
+        }
+    }
+
+    Ok(MachineState::Eval {
+        expr: test_expr.clone(),
+        env: env.clone(),
+        cont: Rc::new(Continuation::GuardTest {
+            exception,
+            raised_pos,
             clauses: clauses.clone(),
             next_index: index + 1,
             body: Rc::new(body.to_vec()),
@@ -1778,6 +2088,18 @@ fn continue_with_value(value: Value, cont: Rc<Continuation>) -> Result<MachineSt
             value,
             cont: next.clone(),
         }),
+        Continuation::Guard { next, .. } | Continuation::WithExceptionHandler { next, .. } => {
+            Ok(MachineState::Return {
+                value,
+                cont: next.clone(),
+            })
+        }
+        Continuation::RaiseResume {
+            exception,
+            raised_pos,
+            handler_cont,
+        } => resume_exception_dispatch(exception.clone(), *raised_pos, handler_cont.clone()),
+        Continuation::RaiseHandlerReturned { pos, .. } => Err(exception_handler_returned(*pos)),
         Continuation::CallCcReturn {
             normal,
             suspend,
@@ -1932,6 +2254,40 @@ fn continue_with_value(value: Value, cont: Rc<Continuation>) -> Result<MachineSt
                 }
             } else {
                 eval_cond_clauses(clauses.clone(), *next_index, env.clone(), next.clone())
+            }
+        }
+        Continuation::GuardTest {
+            exception,
+            raised_pos,
+            clauses,
+            next_index,
+            body,
+            env,
+            next,
+        } => {
+            if value.is_truthy() {
+                if body.is_empty() {
+                    Ok(MachineState::Return {
+                        value,
+                        cont: next.clone(),
+                    })
+                } else {
+                    Ok(eval_sequence_state(
+                        body.clone(),
+                        0,
+                        env.clone(),
+                        next.clone(),
+                    ))
+                }
+            } else {
+                eval_guard_clauses(
+                    exception.clone(),
+                    *raised_pos,
+                    clauses.clone(),
+                    *next_index,
+                    env.clone(),
+                    next.clone(),
+                )
             }
         }
         Continuation::LetBinding {
@@ -2215,7 +2571,8 @@ fn apply_builtin_state(
 
             let prefix = &rest[..rest.len() - 1];
             let last = &rest[rest.len() - 1];
-            let spliced = proper_list_to_vec(last).ok_or_else(|| type_error(pos, "list", last.type_name()))?;
+            let spliced = proper_list_to_vec(last)
+                .ok_or_else(|| type_error(pos, "list", last.type_name()))?;
 
             let mut expanded_args = Vec::with_capacity(prefix.len() + spliced.len());
             expanded_args.extend(prefix.iter().cloned());
@@ -2270,6 +2627,35 @@ fn apply_builtin_state(
                 }),
             );
         }
+        Builtin::Raise => {
+            let [exception] = args.as_slice() else {
+                return Err(wrong_arity(pos, "raise", "exactly 1", args.len()));
+            };
+            return raise_exception(exception.clone(), pos, cont);
+        }
+        Builtin::WithExceptionHandler => {
+            let [handler, thunk] = args.as_slice() else {
+                return Err(wrong_arity(
+                    pos,
+                    "with-exception-handler",
+                    "exactly 2",
+                    args.len(),
+                ));
+            };
+            return dispatch_apply(
+                thunk.clone(),
+                Vec::new(),
+                pos,
+                output.clone(),
+                Rc::new(Continuation::WithExceptionHandler {
+                    handler: handler.clone(),
+                    pos,
+                    winds: current_dynamic_wind_stack(),
+                    output,
+                    next: cont,
+                }),
+            );
+        }
         Builtin::Eq => Some(eval_eqv_like(&args, pos, "eq?", values_eq)?),
         Builtin::Eqv => Some(eval_eqv_like(&args, pos, "eqv?", values_eqv)?),
         Builtin::EqualDeep => Some(eval_eqv_like(&args, pos, "equal?", values_equal)?),
@@ -2297,7 +2683,8 @@ fn apply_builtin_state(
             let lists = list_args
                 .iter()
                 .map(|value| {
-                    proper_list_to_vec(value).ok_or_else(|| type_error(pos, "list", value.type_name()))
+                    proper_list_to_vec(value)
+                        .ok_or_else(|| type_error(pos, "list", value.type_name()))
                 })
                 .collect::<Result<Vec<_>, _>>()?;
 
@@ -2341,26 +2728,25 @@ fn apply_builtin_state(
         Builtin::IsBoolean => Some(eval_type_predicate(&args, "boolean?", pos, |value| {
             matches!(value, Value::Bool(_))
         })?),
-        Builtin::IsPair => Some(eval_type_predicate(
-            &args,
-            "pair?",
-            pos,
-            is_pair,
-        )?),
+        Builtin::IsPair => Some(eval_type_predicate(&args, "pair?", pos, is_pair)?),
         Builtin::IsSymbol => Some(eval_type_predicate(&args, "symbol?", pos, |value| {
             matches!(value, Value::Symbol(_))
         })?),
-        Builtin::IsZero => Some(eval_number_predicate(&args, "zero?", pos, |value| value == 0)?),
-        Builtin::IsPositive => {
-            Some(eval_number_predicate(&args, "positive?", pos, |value| value > 0)?)
-        }
-        Builtin::IsNegative => {
-            Some(eval_number_predicate(&args, "negative?", pos, |value| value < 0)?)
-        }
-        Builtin::IsOdd => Some(eval_number_predicate(&args, "odd?", pos, |value| value % 2 != 0)?),
-        Builtin::IsEven => {
-            Some(eval_number_predicate(&args, "even?", pos, |value| value % 2 == 0)?)
-        }
+        Builtin::IsZero => Some(eval_number_predicate(&args, "zero?", pos, |value| {
+            value == 0
+        })?),
+        Builtin::IsPositive => Some(eval_number_predicate(&args, "positive?", pos, |value| {
+            value > 0
+        })?),
+        Builtin::IsNegative => Some(eval_number_predicate(&args, "negative?", pos, |value| {
+            value < 0
+        })?),
+        Builtin::IsOdd => Some(eval_number_predicate(&args, "odd?", pos, |value| {
+            value % 2 != 0
+        })?),
+        Builtin::IsEven => Some(eval_number_predicate(&args, "even?", pos, |value| {
+            value % 2 == 0
+        })?),
         Builtin::Display => Some(eval_display(&args, pos, &output)?),
         Builtin::Write => Some(eval_write(&args, pos, &output)?),
         Builtin::Newline => Some(eval_newline(&args, pos, &output)?),
@@ -2387,21 +2773,15 @@ fn apply_builtin_state(
             pos,
             |value| value.is_alphabetic(),
         )?),
-        Builtin::CharNumeric => Some(eval_char_predicate(
-            &args,
-            "char-numeric?",
-            pos,
-            |value| value.is_numeric(),
-        )?),
+        Builtin::CharNumeric => Some(eval_char_predicate(&args, "char-numeric?", pos, |value| {
+            value.is_numeric()
+        })?),
         Builtin::CharUpcase => Some(eval_char_transform(&args, "char-upcase", pos, |value| {
             value.to_uppercase().next().unwrap_or(value)
         })?),
-        Builtin::CharDowncase => Some(eval_char_transform(
-            &args,
-            "char-downcase",
-            pos,
-            |value| value.to_lowercase().next().unwrap_or(value),
-        )?),
+        Builtin::CharDowncase => Some(eval_char_transform(&args, "char-downcase", pos, |value| {
+            value.to_lowercase().next().unwrap_or(value)
+        })?),
         Builtin::CharEqual => Some(eval_char_compare(&args, "char=?", pos, |left, right| {
             left == right
         })?),
@@ -2429,12 +2809,11 @@ fn apply_builtin_state(
         Builtin::StringUpcase => Some(eval_string_case(&args, "string-upcase", pos, |value| {
             value.chars().flat_map(char::to_uppercase).collect()
         })?),
-        Builtin::StringDowncase => Some(eval_string_case(
-            &args,
-            "string-downcase",
-            pos,
-            |value| value.chars().flat_map(char::to_lowercase).collect(),
-        )?),
+        Builtin::StringDowncase => {
+            Some(eval_string_case(&args, "string-downcase", pos, |value| {
+                value.chars().flat_map(char::to_lowercase).collect()
+            })?)
+        }
         Builtin::Vector => Some(eval_vector(&args, pos)?),
         Builtin::MakeVector => Some(eval_make_vector(&args, pos)?),
         Builtin::VectorRef => Some(eval_vector_ref(&args, pos)?),
@@ -2516,27 +2895,8 @@ fn expr_uses_symbol_outside_nested_lambda(expr: &Expr, name: &str) -> bool {
 
 fn enclosing_procedure_cont(cont: &Rc<Continuation>) -> Option<Rc<Continuation>> {
     match cont.as_ref() {
-        Continuation::Halt => None,
-        Continuation::DefineValue { next, .. }
-        | Continuation::SetValue { next, .. }
-        | Continuation::DynamicWindAfterIn { next, .. }
-        | Continuation::DynamicWindAfterBody { next, .. }
-        | Continuation::DynamicWindAfterOut { next, .. }
-        | Continuation::If { next, .. }
-        | Continuation::Sequence { next, .. }
-        | Continuation::And { next, .. }
-        | Continuation::Or { next, .. }
-        | Continuation::CondTest { next, .. }
-        | Continuation::LetBinding { next, .. }
-        | Continuation::NamedLetBinding { next, .. }
-        | Continuation::LetRecBinding { next, .. }
-        | Continuation::Case { next, .. }
-        | Continuation::Operator { next, .. }
-        | Continuation::Argument { next, .. }
-        | Continuation::Map { next, .. } => enclosing_procedure_cont(next),
         Continuation::ProcedureReturn { next } => Some(next.clone()),
-        Continuation::CallCcReturn { normal, .. } => enclosing_procedure_cont(normal),
-        Continuation::WindStepDone { final_cont, .. } => enclosing_procedure_cont(final_cont),
+        _ => continuation_parent(cont).and_then(|next| enclosing_procedure_cont(&next)),
     }
 }
 
@@ -2721,8 +3081,8 @@ fn eval_expt(args: &[Value], pos: SourcePos) -> Result<Value, EvalError> {
 
     let base = expect_integer(base, pos)?;
     let exponent = expect_integer(exponent, pos)?;
-    let exponent =
-        u32::try_from(exponent).map_err(|_| invalid_argument(pos, "expt requires a non-negative exponent"))?;
+    let exponent = u32::try_from(exponent)
+        .map_err(|_| invalid_argument(pos, "expt requires a non-negative exponent"))?;
     Ok(Value::Int(base.pow(exponent)))
 }
 
@@ -2741,7 +3101,8 @@ fn eval_apply(
 
     let prefix = &rest[..rest.len() - 1];
     let last = &rest[rest.len() - 1];
-    let spliced = proper_list_to_vec(last).ok_or_else(|| type_error(pos, "list", last.type_name()))?;
+    let spliced =
+        proper_list_to_vec(last).ok_or_else(|| type_error(pos, "list", last.type_name()))?;
 
     let mut expanded_args = Vec::with_capacity(prefix.len() + spliced.len());
     expanded_args.extend_from_slice(prefix);
@@ -2829,7 +3190,8 @@ fn values_eqv(left: &Value, right: &Value) -> bool {
 }
 
 fn values_equal(left: &Value, right: &Value) -> bool {
-    if let (Some(left_items), Some(right_items)) = (proper_list_to_vec(left), proper_list_to_vec(right))
+    if let (Some(left_items), Some(right_items)) =
+        (proper_list_to_vec(left), proper_list_to_vec(right))
     {
         return left_items.len() == right_items.len()
             && left_items
@@ -2918,7 +3280,8 @@ fn eval_reverse(args: &[Value], pos: SourcePos) -> Result<Value, EvalError> {
         return Err(wrong_arity(pos, "reverse", "exactly 1", args.len()));
     };
 
-    let mut items = proper_list_to_vec(value).ok_or_else(|| type_error(pos, "list", value.type_name()))?;
+    let mut items =
+        proper_list_to_vec(value).ok_or_else(|| type_error(pos, "list", value.type_name()))?;
     items.reverse();
     Ok(Value::List(items))
 }
@@ -2933,7 +3296,8 @@ fn eval_list_ref(args: &[Value], pos: SourcePos) -> Result<Value, EvalError> {
         return Err(index_out_of_bounds(pos, index, 0));
     }
 
-    let items = proper_list_to_vec(list).ok_or_else(|| type_error(pos, "list", list.type_name()))?;
+    let items =
+        proper_list_to_vec(list).ok_or_else(|| type_error(pos, "list", list.type_name()))?;
     items
         .get(index as usize)
         .cloned()
@@ -2950,7 +3314,8 @@ fn eval_list_tail(args: &[Value], pos: SourcePos) -> Result<Value, EvalError> {
         return Err(index_out_of_bounds(pos, index, 0));
     }
 
-    let items = proper_list_to_vec(list).ok_or_else(|| type_error(pos, "list", list.type_name()))?;
+    let items =
+        proper_list_to_vec(list).ok_or_else(|| type_error(pos, "list", list.type_name()))?;
     if index as usize > items.len() {
         return Err(index_out_of_bounds(pos, index, items.len()));
     }
@@ -2963,7 +3328,8 @@ fn eval_assoc(args: &[Value], pos: SourcePos) -> Result<Value, EvalError> {
         return Err(wrong_arity(pos, "assoc", "exactly 2", args.len()));
     };
 
-    let entries = proper_list_to_vec(alist).ok_or_else(|| type_error(pos, "list", alist.type_name()))?;
+    let entries =
+        proper_list_to_vec(alist).ok_or_else(|| type_error(pos, "list", alist.type_name()))?;
     for entry in entries {
         let Some(found_key) = pair_car(&entry) else {
             return Err(type_error(pos, "pair", entry.type_name()));
@@ -3000,7 +3366,10 @@ fn eval_map(
     let len = lists.iter().map(Vec::len).min().unwrap_or(0);
     let mut mapped = Vec::with_capacity(len);
     for index in 0..len {
-        let row = lists.iter().map(|list| list[index].clone()).collect::<Vec<_>>();
+        let row = lists
+            .iter()
+            .map(|list| list[index].clone())
+            .collect::<Vec<_>>();
         mapped.push(apply_value(procedure.clone(), &row, pos, output)?);
     }
 
@@ -3012,7 +3381,8 @@ fn eval_length(args: &[Value], pos: SourcePos) -> Result<Value, EvalError> {
         return Err(wrong_arity(pos, "length", "exactly 1", args.len()));
     };
 
-    let items = proper_list_to_vec(value).ok_or_else(|| type_error(pos, "list", value.type_name()))?;
+    let items =
+        proper_list_to_vec(value).ok_or_else(|| type_error(pos, "list", value.type_name()))?;
     Ok(Value::Int(items.len() as i64))
 }
 
@@ -3154,7 +3524,8 @@ fn eval_list_to_string(args: &[Value], pos: SourcePos) -> Result<Value, EvalErro
         return Err(wrong_arity(pos, "list->string", "exactly 1", args.len()));
     };
 
-    let items = proper_list_to_vec(value).ok_or_else(|| type_error(pos, "list", value.type_name()))?;
+    let items =
+        proper_list_to_vec(value).ok_or_else(|| type_error(pos, "list", value.type_name()))?;
 
     let mut rendered = String::with_capacity(items.len());
     for item in &items {
@@ -3405,7 +3776,8 @@ fn eval_list_to_vector(args: &[Value], pos: SourcePos) -> Result<Value, EvalErro
         return Err(wrong_arity(pos, "list->vector", "exactly 1", args.len()));
     };
 
-    let items = proper_list_to_vec(value).ok_or_else(|| type_error(pos, "list", value.type_name()))?;
+    let items =
+        proper_list_to_vec(value).ok_or_else(|| type_error(pos, "list", value.type_name()))?;
 
     Ok(Value::Vector(SchemeVector::new(items)))
 }
