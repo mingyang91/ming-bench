@@ -5,7 +5,10 @@ use crate::scheme::eval_str;
 #[test]
 fn test_l07_string_set_error() {
     let err = eval_str(include_str!("fixtures/l07_string_set_error.scm").trim());
-    assert!(err.is_err(), "string-set! should error on immutable strings");
+    assert!(
+        err.is_err(),
+        "string-set! should error on immutable strings"
+    );
 }
 
 #[test]

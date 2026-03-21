@@ -18,6 +18,10 @@ use parser::parse_program;
 /// use ming::scheme::eval_str;
 /// assert_eq!(eval_str("(+ 1 2)"), Ok("3".into()));
 /// ```
+///
+/// # Errors
+///
+/// Returns [`EvalError`] when parsing fails or evaluation encounters an error.
 pub fn eval_str(input: &str) -> Result<String, EvalError> {
     let program = parse_program(input)?;
     let value = eval_program(&program)?;
@@ -26,6 +30,10 @@ pub fn eval_str(input: &str) -> Result<String, EvalError> {
 
 /// Evaluate Scheme expressions, returning both the result value and
 /// any output produced by `display`, `write`, or `newline`.
+///
+/// # Errors
+///
+/// Returns [`EvalError`] when parsing fails or evaluation encounters an error.
 pub fn eval_str_with_output(input: &str) -> Result<(String, String), EvalError> {
     eval_str(input).map(|result| (result, String::new()))
 }

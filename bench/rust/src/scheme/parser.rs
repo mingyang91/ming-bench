@@ -32,8 +32,9 @@ impl<'src> Parser<'src> {
         match ch {
             '(' => self.parse_list(),
             ')' => Err(ParseError::UnexpectedClosingParenthesis),
+            '\'' => self.parse_quote(),
             '"' => self.parse_string(),
-            _ => self.parse_atom(),
+            _ => Ok(self.parse_atom()),
         }
     }
 
@@ -61,6 +62,15 @@ impl<'src> Parser<'src> {
         }
     }
 
+    fn parse_quote(&mut self) -> Result<Expr, ParseError> {
+        self.consume_char();
+
+        Ok(Expr::List(vec![
+            Expr::Symbol("quote".into()),
+            self.parse_expr()?,
+        ]))
+    }
+
     fn parse_escape_sequence(&mut self) -> Result<char, ParseError> {
         let Some(ch) = self.consume_char() else {
             return Err(ParseError::UnterminatedStringLiteral);
@@ -76,15 +86,15 @@ impl<'src> Parser<'src> {
         }
     }
 
-    fn parse_atom(&mut self) -> Result<Expr, ParseError> {
+    fn parse_atom(&mut self) -> Expr {
         let token = self.take_while(|ch| !ch.is_whitespace() && ch != '(' && ch != ')');
 
         match token {
-            "#t" => Ok(Expr::Boolean(true)),
-            "#f" => Ok(Expr::Boolean(false)),
+            "#t" => Expr::Boolean(true),
+            "#f" => Expr::Boolean(false),
             _ => match token.parse::<i64>() {
-                Ok(value) => Ok(Expr::Integer(value)),
-                Err(_) => Ok(Expr::Symbol(token.to_string())),
+                Ok(value) => Expr::Integer(value),
+                Err(_) => Expr::Symbol(token.to_string()),
             },
         }
     }

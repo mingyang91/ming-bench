@@ -114,11 +114,10 @@ fn escape_string_contents(value: &str) -> String {
 }
 
 fn render_closure(closure: &Closure) -> String {
-    closure
-        .name
-        .as_ref()
-        .map(|name| format!("#<procedure:{name}>"))
-        .unwrap_or_else(|| "#<procedure>".into())
+    closure.name.as_ref().map_or_else(
+        || "#<procedure>".into(),
+        |name| format!("#<procedure:{name}>"),
+    )
 }
 
 fn render_pair(car: &Value, cdr: &Value) -> String {
@@ -133,9 +132,9 @@ fn render_pair_contents(car: &Value, cdr: &Value, rendered: &mut String) {
 
     match cdr {
         Value::EmptyList => {}
-        Value::Pair(next_car, next_cdr) => {
+        Value::Pair(item, remainder) => {
             rendered.push(' ');
-            render_pair_contents(next_car, next_cdr, rendered);
+            render_pair_contents(item, remainder, rendered);
         }
         other => {
             rendered.push_str(" . ");
