@@ -113,6 +113,15 @@ fn env_set(env: &Env, name: String, val: Value) {
     env.borrow_mut().bindings.insert(name, val);
 }
 
+fn env_set_existing(env: &Env, name: &str, val: Value) {
+    let mut inner = env.borrow_mut();
+    if inner.bindings.contains_key(name) {
+        inner.bindings.insert(name.to_string(), val);
+    } else if let Some(ref parent) = inner.parent {
+        env_set_existing(parent, name, val);
+    }
+}
+
 fn default_env() -> Env {
     new_env(None)
 }
@@ -130,6 +139,7 @@ enum Token {
     Integer(i64),
     Boolean(bool),
     Str(String),
+    Char(char),
 }
 
 fn tokenize(input: &str) -> Result<Vec<(Token, Span)>, EvalError> {
@@ -219,6 +229,29 @@ fn tokenize(input: &str) -> Result<Vec<(Token, Span)>, EvalError> {
                             i += 2;
                             col += 2;
                         }
+                        '\\' => {
+                            // Character literal: #\x or #\space etc.
+                            i += 2;
+                            col += 2;
+                            if i >= chars.len() {
+                                return Err(EvalError::Parse("unexpected end of character literal".into(), span));
+                            }
+                            // Check for named characters
+                            let start = i;
+                            while i < chars.len() && !matches!(chars[i], ' ' | '\t' | '\n' | '\r' | '(' | ')' | '"' | ';' | '\'') {
+                                i += 1;
+                                col += 1;
+                            }
+                            let name: String = chars[start..i].iter().collect();
+                            let ch = match name.as_str() {
+                                "space" => ' ',
+                                "newline" => '\n',
+                                "tab" => '\t',
+                                s if s.chars().count() == 1 => s.chars().next().unwrap(),
+                                _ => return Err(EvalError::Parse(format!("unknown character name: {}", name), span)),
+                            };
+                            tokens.push((Token::Char(ch), span));
+                        }
                         _ => {
                             return Err(EvalError::Parse(
                                 format!("unexpected #{}", chars[i + 1]),
@@ -284,6 +317,11 @@ fn parse(tokens: &[(Token, Span)], pos: &mut usize) -> Result<Value, EvalError> 
         }
         Token::Symbol(s) => {
             let v = Value::Symbol(s.clone(), span);
+            *pos += 1;
+            Ok(v)
+        }
+        Token::Char(c) => {
+            let v = Value::Char(*c, span);
             *pos += 1;
             Ok(v)
         }
@@ -356,13 +394,15 @@ fn eval(expr: &Value, env: &Env) -> Result<Value, EvalError> {
                     "let" => return eval_let(&elems[1..], env, form_span),
                     "begin" => return eval_begin(&elems[1..], env),
                     "cond" => return eval_cond(&elems[1..], env),
+                    "string-set!" => return eval_string_set(&elems[1..], env, form_span),
                     "+" | "-" | "*" | "/" | "<" | ">" | "=" | "<=" | ">=" | "not" | "cons"
                     | "car" | "cdr" | "null?" | "list" | "length" | "string?" | "number?"
                     | "boolean?" | "pair?" | "symbol?" | "char?"
                     | "display" | "write" | "newline"
                     | "string-append" | "string-length" | "substring"
                     | "string->number" | "number->string"
-                    | "symbol->string" | "string->symbol" | "string-ref" => {
+                    | "symbol->string" | "string->symbol" | "string-ref"
+                    | "string-copy" => {
                         return eval_builtin(op, &elems[1..], env, form_span);
                     }
                     _ => {}
@@ -920,7 +960,55 @@ fn eval_builtin(
                 _ => Err(EvalError::TypeError("string-ref: expected string".into(), sp)),
             }
         }
+        "string-copy" => {
+            if args.len() != 1 {
+                return Err(EvalError::WrongArgCount {
+                    expected: "1".into(),
+                    got: args.len(),
+                    at: sp,
+                });
+            }
+            let val = eval(&args[0], env)?;
+            match val {
+                Value::Str(s, _) => Ok(Value::Str(s, sp)),
+                _ => Err(EvalError::TypeError("string-copy: expected string".into(), sp)),
+            }
+        }
         _ => Err(EvalError::UnboundVariable(op.to_string(), sp)),
+    }
+}
+
+fn eval_string_set(args: &[Value], env: &Env, form_span: Span) -> Result<Value, EvalError> {
+    if args.len() != 3 {
+        return Err(EvalError::WrongArgCount {
+            expected: "3".into(),
+            got: args.len(),
+            at: form_span,
+        });
+    }
+    let var_name = match &args[0] {
+        Value::Symbol(name, _) => name.clone(),
+        _ => return Err(EvalError::TypeError("string-set!: first argument must be a variable".into(), form_span)),
+    };
+    let idx = expect_integer(&eval(&args[1], env)?)? as usize;
+    let ch = match eval(&args[2], env)? {
+        Value::Char(c, _) => c,
+        _ => return Err(EvalError::TypeError("string-set!: third argument must be a character".into(), form_span)),
+    };
+    let current = env_get(env, &var_name)
+        .ok_or_else(|| EvalError::UnboundVariable(var_name.clone(), form_span))?;
+    match current {
+        Value::Str(s, s_span) => {
+            let mut chars: Vec<char> = s.chars().collect();
+            if idx >= chars.len() {
+                return Err(EvalError::TypeError("string-set!: index out of range".into(), form_span));
+            }
+            chars[idx] = ch;
+            let new_str: String = chars.into_iter().collect();
+            env_set_existing(env, &var_name, Value::Str(new_str, s_span));
+            Ok(Value::Void)
+        }
+        _ => Err(EvalError::TypeError("string-set!: expected string".into(), form_span)),
     }
 }
 
