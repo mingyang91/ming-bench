@@ -167,13 +167,13 @@ fn default_env() -> Env {
         "symbol->string", "string->symbol",
         "string-ref", "char?", "string-copy",
         "string->list", "list->string", "char->integer", "integer->char",
-        "map", "apply", "call/cc",
+        "map", "apply", "call/cc", "dynamic-wind",
         "equal?", "eqv?", "eq?",
         "vector", "make-vector", "vector-ref", "vector-set!", "vector-length",
         "vector?", "vector->list", "list->vector",
         "abs", "modulo", "remainder", "quotient", "min", "max", "expt",
         "zero?", "positive?", "negative?", "odd?", "even?",
-        "list-ref", "list-tail", "list?", "assoc",
+        "list-ref", "list-tail", "list?", "assoc", "reverse", "append",
         "char-alphabetic?", "char-numeric?", "char-upcase", "char-downcase",
         "char=?", "char<?",
         "string=?", "string<?", "string-ci=?", "string-upcase", "string-downcase",
@@ -2124,6 +2124,35 @@ fn apply_builtin(name: &str, args: &[Val], pos: Pos, out: &Output) -> Result<Val
             all_args.extend(tail);
             apply_func(func, &all_args, pos, out)
         }
+        "dynamic-wind" => {
+            if args.len() != 3 {
+                return Err(EvalError::Arity { msg: "dynamic-wind requires 3 arguments".into(), pos });
+            }
+            let in_thunk = &args[0];
+            let body_thunk = &args[1];
+            let out_thunk = &args[2];
+            // Run in-thunk
+            apply_func(in_thunk, &[], pos, out)?;
+            // Run body-thunk, catching non-local exit to ensure out-thunk runs
+            let body_result = match apply_func(body_thunk, &[], pos, out) {
+                Ok(val) => {
+                    // Normal exit: run out-thunk, return body value
+                    apply_func(out_thunk, &[], pos, out)?;
+                    Ok(val)
+                }
+                Err(EvalError::ContinuationReturn) => {
+                    // Non-local exit: run out-thunk, then re-raise
+                    apply_func(out_thunk, &[], pos, out)?;
+                    Err(EvalError::ContinuationReturn)
+                }
+                Err(e) => {
+                    // Other error: run out-thunk, then re-raise
+                    let _ = apply_func(out_thunk, &[], pos, out);
+                    Err(e)
+                }
+            };
+            body_result
+        }
         "equal?" => {
             if args.len() != 2 {
                 return Err(EvalError::Arity { msg: "equal? requires 2 arguments".into(), pos });
@@ -2345,6 +2374,43 @@ fn apply_builtin(name: &str, args: &[Val], pos: Pos, out: &Output) -> Result<Val
                 }
                 _ => Err(EvalError::Type { msg: "assoc: expected list".into(), pos }),
             }
+        }
+        "reverse" => {
+            if args.len() != 1 {
+                return Err(EvalError::Arity { msg: "reverse requires 1 argument".into(), pos });
+            }
+            match &args[0] {
+                Val::List(elems) => {
+                    let mut rev = elems.clone();
+                    rev.reverse();
+                    Ok(Val::List(rev))
+                }
+                _ => Err(EvalError::Type { msg: "reverse: expected list".into(), pos }),
+            }
+        }
+        "append" => {
+            let mut result = Vec::new();
+            for (i, arg) in args.iter().enumerate() {
+                if i == args.len() - 1 {
+                    // Last argument can be any value (improper list tail)
+                    match arg {
+                        Val::List(elems) => result.extend(elems.iter().cloned()),
+                        other => {
+                            if result.is_empty() {
+                                return Ok(other.clone());
+                            }
+                            // For now, just add as element (proper list)
+                            result.push(other.clone());
+                        }
+                    }
+                } else {
+                    match arg {
+                        Val::List(elems) => result.extend(elems.iter().cloned()),
+                        _ => return Err(EvalError::Type { msg: "append: expected list".into(), pos }),
+                    }
+                }
+            }
+            Ok(Val::List(result))
         }
         // ===== Level 15: Character utilities =====
         "char-alphabetic?" => {
