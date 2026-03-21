@@ -1214,9 +1214,85 @@ fn equal_vals(a: &Val, b: &Val) -> bool {
 
 // ---------- Evaluator ----------
 
+struct GuardFrame {
+    var_name: String,
+    clauses: Vec<Expr>,
+    env: Env,
+}
+
 fn eval(expr: &Expr, env: &Env, out: &Output) -> Result<Val, EvalError> {
     let mut cur_expr = expr.clone();
     let mut cur_env = env.clone();
+    let mut guard_frame: Option<GuardFrame> = None;
+
+    loop {
+        match eval_inner(cur_expr.clone(), cur_env.clone(), out, &mut guard_frame) {
+            Ok(val) => return Ok(val),
+            Err(EvalError::RaisedException) if guard_frame.is_some() => {
+                let gf = guard_frame.take().unwrap();
+                let exn_val = EXCEPTION_VAL.with(|ev| ev.borrow_mut().take())
+                    .unwrap_or(Val::Void);
+                let guard_env = new_env(Some(gf.env));
+                env_set(&guard_env, gf.var_name.clone(), exn_val.clone());
+                let mut matched = false;
+                for clause in &gf.clauses {
+                    let parts = match &clause.kind {
+                        ExprKind::List(p) => p,
+                        _ => return Err(EvalError::Parse {
+                            msg: "guard: expected clause list".into(),
+                            pos: clause.pos,
+                        }),
+                    };
+                    if parts.is_empty() {
+                        return Err(EvalError::Parse {
+                            msg: "guard: empty clause".into(),
+                            pos: clause.pos,
+                        });
+                    }
+                    if let ExprKind::Symbol(s) = &parts[0].kind {
+                        if s == "else" {
+                            for expr in &parts[1..parts.len() - 1] {
+                                eval(expr, &guard_env, out)?;
+                            }
+                            if parts.len() > 1 {
+                                cur_expr = parts[parts.len() - 1].clone();
+                                cur_env = guard_env;
+                                matched = true;
+                                break;
+                            } else {
+                                return Ok(Val::Void);
+                            }
+                        }
+                    }
+                    let test = eval(&parts[0], &guard_env, out)?;
+                    if test.is_truthy() {
+                        if parts.len() == 1 {
+                            return Ok(test);
+                        }
+                        for expr in &parts[1..parts.len() - 1] {
+                            eval(expr, &guard_env, out)?;
+                        }
+                        cur_expr = parts[parts.len() - 1].clone();
+                        cur_env = guard_env;
+                        matched = true;
+                        break;
+                    }
+                }
+                if matched {
+                    continue;
+                }
+                // No clause matched, re-raise
+                EXCEPTION_VAL.with(|ev| *ev.borrow_mut() = Some(exn_val));
+                return Err(EvalError::RaisedException);
+            }
+            Err(e) => return Err(e),
+        }
+    }
+}
+
+fn eval_inner(init_expr: Expr, init_env: Env, out: &Output, guard_frame: &mut Option<GuardFrame>) -> Result<Val, EvalError> {
+    let mut cur_expr = init_expr;
+    let mut cur_env = init_env;
 
     'tco: loop {
         let p = cur_expr.pos;
@@ -1685,77 +1761,27 @@ fn eval(expr: &Expr, env: &Env, out: &Output) -> Result<Val, EvalError> {
                             let clauses = &guard_spec[1..];
                             let body = &elems[2..];
 
-                            // Evaluate body expressions, catching raised exceptions
-                            let body_result = (|| -> Result<Val, EvalError> {
-                                let mut res = Val::Void;
-                                for expr in body {
-                                    res = eval(expr, &cur_env, out)?;
-                                }
-                                Ok(res)
-                            })();
-
-                            match body_result {
-                                Ok(val) => return Ok(val),
-                                Err(EvalError::RaisedException) => {
-                                    let exn_val = EXCEPTION_VAL.with(|ev| ev.borrow_mut().take())
-                                        .unwrap_or(Val::Void);
-                                    // Bind var to exception value and evaluate clauses
-                                    let guard_env = new_env(Some(cur_env.clone()));
-                                    env_set(&guard_env, var_name.clone(), exn_val.clone());
-                                    let mut matched = false;
-                                    for clause in clauses {
-                                        let parts = match &clause.kind {
-                                            ExprKind::List(p) => p,
-                                            _ => return Err(EvalError::Parse {
-                                                msg: "guard: expected clause list".into(),
-                                                pos: clause.pos,
-                                            }),
-                                        };
-                                        if parts.is_empty() {
-                                            return Err(EvalError::Parse {
-                                                msg: "guard: empty clause".into(),
-                                                pos: clause.pos,
-                                            });
-                                        }
-                                        // Check for else clause
-                                        if let ExprKind::Symbol(s) = &parts[0].kind {
-                                            if s == "else" {
-                                                for expr in &parts[1..parts.len() - 1] {
-                                                    eval(expr, &guard_env, out)?;
-                                                }
-                                                if parts.len() > 1 {
-                                                    cur_expr = parts[parts.len() - 1].clone();
-                                                    cur_env = guard_env;
-                                                    matched = true;
-                                                    break;
-                                                } else {
-                                                    return Ok(Val::Void);
-                                                }
-                                            }
-                                        }
-                                        let test = eval(&parts[0], &guard_env, out)?;
-                                        if test.is_truthy() {
-                                            if parts.len() == 1 {
-                                                return Ok(test);
-                                            }
-                                            for expr in &parts[1..parts.len() - 1] {
-                                                eval(expr, &guard_env, out)?;
-                                            }
-                                            cur_expr = parts[parts.len() - 1].clone();
-                                            cur_env = guard_env;
-                                            matched = true;
-                                            break;
-                                        }
-                                    }
-                                    if matched {
-                                        continue;
-                                    }
-                                    // No clause matched, re-raise
-                                    EXCEPTION_VAL.with(|ev| *ev.borrow_mut() = Some(exn_val));
-                                    return Err(EvalError::RaisedException);
-                                }
-                                Err(e) => return Err(e),
+                            if body.is_empty() {
+                                return Ok(Val::Void);
                             }
+
+                            // Set guard frame so the outer eval loop can catch exceptions
+                            *guard_frame = Some(GuardFrame {
+                                var_name,
+                                clauses: clauses.to_vec(),
+                                env: cur_env.clone(),
+                            });
+
+                            // Evaluate all body expressions except the last with eval()
+                            // If any raises, the ? propagates to eval_inner's caller,
+                            // which checks guard_frame
+                            for expr in &body[..body.len() - 1] {
+                                eval(expr, &cur_env, out)?;
+                            }
+
+                            // Last body expression: tail position via TCO loop
+                            cur_expr = body[body.len() - 1].clone();
+                            continue 'tco;
                         }
                         "syntax-case" => {
                             // (syntax-case stx-expr (literals...) clause...)
@@ -2255,13 +2281,12 @@ fn eval(expr: &Expr, env: &Env, out: &Output) -> Result<Val, EvalError> {
                         return callcc_exec(&args[0], p, out);
                     }
                     Val::Continuation(id) => {
-                        if args.len() != 1 {
-                            return Err(EvalError::Arity {
-                                msg: "continuation requires 1 argument".into(),
-                                pos: p,
-                            });
-                        }
-                        return Err(invoke_continuation(id, args[0].clone()));
+                        let val = if args.len() == 1 {
+                            args[0].clone()
+                        } else {
+                            Val::Values(args.clone())
+                        };
+                        return Err(invoke_continuation(id, val));
                     }
                     Val::Builtin(name) => return apply_builtin(&name, &args, p, out),
                     Val::Lambda {
@@ -2325,13 +2350,12 @@ fn apply_func(func: &Val, args: &[Val], pos: Pos, out: &Output) -> Result<Val, E
             callcc_exec(&args[0], pos, out)
         }
         Val::Continuation(id) => {
-            if args.len() != 1 {
-                return Err(EvalError::Arity {
-                    msg: "continuation requires 1 argument".into(),
-                    pos,
-                });
-            }
-            Err(invoke_continuation(*id, args[0].clone()))
+            let val = if args.len() == 1 {
+                args[0].clone()
+            } else {
+                Val::Values(args.to_vec())
+            };
+            Err(invoke_continuation(*id, val))
         }
         Val::Builtin(name) => apply_builtin(name, args, pos, out),
         Val::Lambda {
