@@ -46,6 +46,7 @@ enum Value {
         rules: Vec<(Value, Value)>,
         def_env: Env,
     },
+    Vector(Rc<RefCell<Vec<Value>>>),
 }
 
 thread_local! {
@@ -107,6 +108,10 @@ impl Value {
             Value::Symbol(s) => s.clone(),
             Value::Char(c) => format!("#\\{}", c),
             Value::Lambda { .. } | Value::Builtin(_) | Value::Continuation(_) | Value::Macro { .. } => "#<procedure>".to_string(),
+            Value::Vector(v) => {
+                let inner: Vec<String> = v.borrow().iter().map(|v| v.display()).collect();
+                format!("#({})", inner.join(" "))
+            }
             Value::List(elems) => {
                 let inner: Vec<String> = elems.iter().map(|v| v.display()).collect();
                 format!("({})", inner.join(" "))
@@ -411,7 +416,7 @@ fn eval(mut expr: Value, env: &Env, pos: Pos) -> Result<Value, EvalError> {
     loop {
         let current = std::mem::replace(&mut expr, Value::Boolean(false));
         match current {
-            Value::Integer(_) | Value::Boolean(_) | Value::Str(_) | Value::Char(_) | Value::Lambda { .. } | Value::Builtin(_) | Value::Continuation(_) | Value::Macro { .. } => return Ok(current),
+            Value::Integer(_) | Value::Boolean(_) | Value::Str(_) | Value::Char(_) | Value::Lambda { .. } | Value::Builtin(_) | Value::Continuation(_) | Value::Macro { .. } | Value::Vector(_) => return Ok(current),
             Value::Symbol(s) => {
                 return env_get(&current_env, &s)
                     .or_else(|| if is_builtin(&s) { Some(Value::Builtin(s.clone())) } else { None })
@@ -1305,7 +1310,9 @@ fn is_builtin(name: &str) -> bool {
         "char->integer" | "integer->char" |
         "eq?" | "eqv?" | "equal?" |
         "apply" | "map" |
-        "call/cc" | "call-with-current-continuation"
+        "call/cc" | "call-with-current-continuation" |
+        "vector" | "make-vector" | "vector-ref" | "vector-set!" |
+        "vector-length" | "vector?" | "vector->list" | "list->vector"
     )
 }
 
@@ -1721,6 +1728,80 @@ fn apply_builtin_vals(op: &str, vals: &[Value], pos: Pos) -> Result<Value, EvalE
             }
             let n = expect_int(&vals[0], pos)?;
             Ok(Value::Char(char::from_u32(n as u32).unwrap_or('\u{FFFD}')))
+        }
+        "vector" => {
+            Ok(Value::Vector(Rc::new(RefCell::new(vals.to_vec()))))
+        }
+        "make-vector" => {
+            if vals.is_empty() || vals.len() > 2 {
+                return Err(runtime_err(pos, "make-vector requires 1 or 2 arguments"));
+            }
+            let n = expect_int(&vals[0], pos)? as usize;
+            let fill = if vals.len() == 2 { vals[1].clone() } else { Value::Integer(0) };
+            Ok(Value::Vector(Rc::new(RefCell::new(vec![fill; n]))))
+        }
+        "vector-ref" => {
+            if vals.len() != 2 {
+                return Err(runtime_err(pos, "vector-ref requires 2 arguments"));
+            }
+            match &vals[0] {
+                Value::Vector(v) => {
+                    let idx = expect_int(&vals[1], pos)? as usize;
+                    let vec = v.borrow();
+                    vec.get(idx).cloned().ok_or_else(|| runtime_err(pos, "vector-ref: index out of bounds"))
+                }
+                _ => Err(runtime_err(pos, "vector-ref: expected vector")),
+            }
+        }
+        "vector-set!" => {
+            if vals.len() != 3 {
+                return Err(runtime_err(pos, "vector-set! requires 3 arguments"));
+            }
+            match &vals[0] {
+                Value::Vector(v) => {
+                    let idx = expect_int(&vals[1], pos)? as usize;
+                    let mut vec = v.borrow_mut();
+                    if idx >= vec.len() {
+                        return Err(runtime_err(pos, "vector-set!: index out of bounds"));
+                    }
+                    vec[idx] = vals[2].clone();
+                    Ok(Value::Boolean(false))
+                }
+                _ => Err(runtime_err(pos, "vector-set!: expected vector")),
+            }
+        }
+        "vector-length" => {
+            if vals.len() != 1 {
+                return Err(runtime_err(pos, "vector-length requires 1 argument"));
+            }
+            match &vals[0] {
+                Value::Vector(v) => Ok(Value::Integer(v.borrow().len() as i64)),
+                _ => Err(runtime_err(pos, "vector-length: expected vector")),
+            }
+        }
+        "vector?" => {
+            if vals.len() != 1 {
+                return Err(runtime_err(pos, "vector? requires 1 argument"));
+            }
+            Ok(Value::Boolean(matches!(&vals[0], Value::Vector(_))))
+        }
+        "vector->list" => {
+            if vals.len() != 1 {
+                return Err(runtime_err(pos, "vector->list requires 1 argument"));
+            }
+            match &vals[0] {
+                Value::Vector(v) => Ok(Value::List(v.borrow().clone())),
+                _ => Err(runtime_err(pos, "vector->list: expected vector")),
+            }
+        }
+        "list->vector" => {
+            if vals.len() != 1 {
+                return Err(runtime_err(pos, "list->vector requires 1 argument"));
+            }
+            match &vals[0] {
+                Value::List(l) => Ok(Value::Vector(Rc::new(RefCell::new(l.clone())))),
+                _ => Err(runtime_err(pos, "list->vector: expected list")),
+            }
         }
         _ => Err(runtime_err(pos, format!("unknown procedure: {}", op))),
     }
