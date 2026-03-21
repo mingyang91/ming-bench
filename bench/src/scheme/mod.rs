@@ -648,6 +648,76 @@ fn eval(mut expr: Value, env: &Env, pos: Pos) -> Result<Value, EvalError> {
                             current_env = let_env;
                             continue;
                         }
+                        "letrec" => {
+                            if elems.len() < 3 {
+                                return Err(runtime_err(current_pos, "letrec requires bindings and body"));
+                            }
+                            let bindings = match &elems[1] {
+                                Value::List(bs) => bs,
+                                _ => return Err(runtime_err(current_pos, "letrec: expected bindings list")),
+                            };
+                            let let_env = new_env(Some(current_env.clone()));
+                            // First pass: bind all names to uninitialized placeholder
+                            let mut names = Vec::new();
+                            let mut init_exprs = Vec::new();
+                            for b in bindings {
+                                match b {
+                                    Value::List(pair) if pair.len() == 2 => {
+                                        let name = match &pair[0] {
+                                            Value::Symbol(s) => s.clone(),
+                                            _ => return Err(runtime_err(current_pos, "letrec: expected symbol")),
+                                        };
+                                        env_set(&let_env, name.clone(), Value::Boolean(false));
+                                        names.push(name);
+                                        init_exprs.push(pair[1].clone());
+                                    }
+                                    _ => return Err(runtime_err(current_pos, "letrec: invalid binding")),
+                                }
+                            }
+                            // Second pass: eval all inits in let_env, then assign
+                            let mut vals = Vec::new();
+                            for init in &init_exprs {
+                                vals.push(eval(init.clone(), &let_env, current_pos)?);
+                            }
+                            for (name, val) in names.into_iter().zip(vals) {
+                                env_set(&let_env, name, val);
+                            }
+                            for e in &elems[2..elems.len() - 1] {
+                                eval(e.clone(), &let_env, current_pos)?;
+                            }
+                            expr = elems.last().unwrap().clone();
+                            current_env = let_env;
+                            continue;
+                        }
+                        "letrec*" => {
+                            if elems.len() < 3 {
+                                return Err(runtime_err(current_pos, "letrec* requires bindings and body"));
+                            }
+                            let bindings = match &elems[1] {
+                                Value::List(bs) => bs,
+                                _ => return Err(runtime_err(current_pos, "letrec*: expected bindings list")),
+                            };
+                            let let_env = new_env(Some(current_env.clone()));
+                            for b in bindings {
+                                match b {
+                                    Value::List(pair) if pair.len() == 2 => {
+                                        let name = match &pair[0] {
+                                            Value::Symbol(s) => s.clone(),
+                                            _ => return Err(runtime_err(current_pos, "letrec*: expected symbol")),
+                                        };
+                                        let val = eval(pair[1].clone(), &let_env, current_pos)?;
+                                        env_set(&let_env, name, val);
+                                    }
+                                    _ => return Err(runtime_err(current_pos, "letrec*: invalid binding")),
+                                }
+                            }
+                            for e in &elems[2..elems.len() - 1] {
+                                eval(e.clone(), &let_env, current_pos)?;
+                            }
+                            expr = elems.last().unwrap().clone();
+                            current_env = let_env;
+                            continue;
+                        }
                         "cond" => {
                             let mut found = false;
                             for clause in &elems[1..] {
@@ -959,7 +1029,7 @@ fn gensym(base: &str) -> String {
 fn is_special_form(s: &str) -> bool {
     matches!(s,
         "set!" | "define" | "lambda" | "if" | "quote" | "and" | "or" | "begin" |
-        "let" | "cond" | "call/cc" | "call-with-current-continuation" | "string-set!" |
+        "let" | "letrec" | "letrec*" | "cond" | "call/cc" | "call-with-current-continuation" | "string-set!" |
         "apply" | "map" | "define-syntax" | "syntax-rules" | "quasiquote" |
         "unquote" | "unquote-splicing" | "else"
     )
