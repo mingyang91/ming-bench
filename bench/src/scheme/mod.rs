@@ -8,6 +8,8 @@ enum Value {
     Integer(i64),
     Boolean(bool),
     Str(String),
+    Symbol(String),
+    List(Vec<Value>),
 }
 
 impl Value {
@@ -17,6 +19,11 @@ impl Value {
             Value::Boolean(true) => "#t".to_string(),
             Value::Boolean(false) => "#f".to_string(),
             Value::Str(s) => format!("\"{}\"", s),
+            Value::Symbol(s) => s.clone(),
+            Value::List(items) => {
+                let parts: Vec<String> = items.iter().map(|v| v.to_scheme_string()).collect();
+                format!("({})", parts.join(" "))
+            }
         }
     }
 }
@@ -79,24 +86,106 @@ fn parse(tokens: &[String], pos: usize) -> Result<(Value, usize), EvalError> {
         return Err(EvalError::Parse("unexpected end of input".into()));
     }
     let token = &tokens[pos];
-    if token == "#t" {
+    if token == "(" {
+        let mut items = Vec::new();
+        let mut i = pos + 1;
+        while i < tokens.len() && tokens[i] != ")" {
+            let (val, next) = parse(tokens, i)?;
+            items.push(val);
+            i = next;
+        }
+        if i >= tokens.len() {
+            return Err(EvalError::Parse("missing closing paren".into()));
+        }
+        Ok((Value::List(items), i + 1))
+    } else if token == ")" {
+        Err(EvalError::Parse("unexpected )".into()))
+    } else if token == "#t" {
         Ok((Value::Boolean(true), pos + 1))
     } else if token == "#f" {
         Ok((Value::Boolean(false), pos + 1))
     } else if token.starts_with('"') {
-        // String literal — strip surrounding quotes
         let inner = &token[1..token.len() - 1];
         Ok((Value::Str(inner.to_string()), pos + 1))
     } else if let Ok(n) = token.parse::<i64>() {
         Ok((Value::Integer(n), pos + 1))
     } else {
-        Err(EvalError::Parse(format!("unexpected token: {}", token)))
+        Ok((Value::Symbol(token.clone()), pos + 1))
     }
 }
 
-/// Evaluate a single parsed value (for L1, values are self-evaluating).
+/// Evaluate a parsed Scheme expression.
 fn eval(value: &Value) -> Result<Value, EvalError> {
-    Ok(value.clone())
+    match value {
+        Value::Integer(_) | Value::Boolean(_) | Value::Str(_) => Ok(value.clone()),
+        Value::Symbol(s) => Err(EvalError::UndefinedVariable(s.clone())),
+        Value::List(items) => {
+            if items.is_empty() {
+                return Err(EvalError::Parse("empty application".into()));
+            }
+            let op = match &items[0] {
+                Value::Symbol(s) => s.as_str(),
+                _ => return Err(EvalError::NotAProcedure),
+            };
+            let args: Result<Vec<Value>, _> = items[1..].iter().map(|a| eval(a)).collect();
+            let args = args?;
+            apply_builtin(op, &args)
+        }
+    }
+}
+
+fn expect_integer(v: &Value) -> Result<i64, EvalError> {
+    match v {
+        Value::Integer(n) => Ok(*n),
+        _ => Err(EvalError::TypeError("expected integer".into())),
+    }
+}
+
+fn apply_builtin(op: &str, args: &[Value]) -> Result<Value, EvalError> {
+    match op {
+        "+" => {
+            let mut sum: i64 = 0;
+            for a in args {
+                sum += expect_integer(a)?;
+            }
+            Ok(Value::Integer(sum))
+        }
+        "-" => {
+            if args.is_empty() {
+                return Err(EvalError::Arity);
+            }
+            if args.len() == 1 {
+                return Ok(Value::Integer(-expect_integer(&args[0])?));
+            }
+            let mut result = expect_integer(&args[0])?;
+            for a in &args[1..] {
+                result -= expect_integer(a)?;
+            }
+            Ok(Value::Integer(result))
+        }
+        "*" => {
+            let mut product: i64 = 1;
+            for a in args {
+                product *= expect_integer(a)?;
+            }
+            Ok(Value::Integer(product))
+        }
+        "/" => {
+            if args.is_empty() {
+                return Err(EvalError::Arity);
+            }
+            let mut result = expect_integer(&args[0])?;
+            for a in &args[1..] {
+                let d = expect_integer(a)?;
+                if d == 0 {
+                    return Err(EvalError::DivisionByZero);
+                }
+                result /= d;
+            }
+            Ok(Value::Integer(result))
+        }
+        _ => Err(EvalError::UndefinedVariable(op.to_string())),
+    }
 }
 
 /// Evaluate one or more Scheme expressions and return the string
