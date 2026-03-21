@@ -177,6 +177,7 @@ fn default_env() -> Env {
         "char-alphabetic?", "char-numeric?", "char-upcase", "char-downcase",
         "char=?", "char<?",
         "string=?", "string<?", "string-ci=?", "string-upcase", "string-downcase",
+        "raise", "with-exception-handler",
     ] {
         env_set(&env, name.to_string(), Val::Builtin(name.to_string()));
     }
@@ -271,6 +272,7 @@ impl ContState {
 
 thread_local! {
     static CONT_STATE: RefCell<ContState> = RefCell::new(ContState::new());
+    static EXCEPTION_VAL: RefCell<Option<Val>> = RefCell::new(None);
 }
 
 fn callcc_exec(proc: &Val, pos: Pos, out: &Output) -> Result<Val, EvalError> {
@@ -836,6 +838,7 @@ fn is_special_form(s: &str) -> bool {
             | "define-syntax"
             | "syntax-rules"
             | "string-set!"
+            | "guard"
     )
 }
 
@@ -1311,6 +1314,109 @@ fn eval(expr: &Expr, env: &Env, out: &Output) -> Result<Val, EvalError> {
                             return Ok(Val::Void);
                         }
                         "string-set!" => return eval_string_set(&elems[1..], &cur_env, p, out),
+                        "guard" => {
+                            // (guard (var clause ...) body ...)
+                            if elems.len() < 3 {
+                                return Err(EvalError::Arity {
+                                    msg: "guard requires variable/clauses and body".into(),
+                                    pos: p,
+                                });
+                            }
+                            let guard_spec = match &elems[1].kind {
+                                ExprKind::List(parts) => parts,
+                                _ => return Err(EvalError::Parse {
+                                    msg: "guard: expected (var clause ...) list".into(),
+                                    pos: elems[1].pos,
+                                }),
+                            };
+                            if guard_spec.is_empty() {
+                                return Err(EvalError::Parse {
+                                    msg: "guard: expected variable name".into(),
+                                    pos: elems[1].pos,
+                                });
+                            }
+                            let var_name = match &guard_spec[0].kind {
+                                ExprKind::Symbol(s) => s.clone(),
+                                _ => return Err(EvalError::Parse {
+                                    msg: "guard: expected symbol as variable".into(),
+                                    pos: guard_spec[0].pos,
+                                }),
+                            };
+                            let clauses = &guard_spec[1..];
+                            let body = &elems[2..];
+
+                            // Evaluate body expressions, catching raised exceptions
+                            let body_result = (|| -> Result<Val, EvalError> {
+                                let mut res = Val::Void;
+                                for expr in body {
+                                    res = eval(expr, &cur_env, out)?;
+                                }
+                                Ok(res)
+                            })();
+
+                            match body_result {
+                                Ok(val) => return Ok(val),
+                                Err(EvalError::RaisedException) => {
+                                    let exn_val = EXCEPTION_VAL.with(|ev| ev.borrow_mut().take())
+                                        .unwrap_or(Val::Void);
+                                    // Bind var to exception value and evaluate clauses
+                                    let guard_env = new_env(Some(cur_env.clone()));
+                                    env_set(&guard_env, var_name.clone(), exn_val.clone());
+                                    let mut matched = false;
+                                    for clause in clauses {
+                                        let parts = match &clause.kind {
+                                            ExprKind::List(p) => p,
+                                            _ => return Err(EvalError::Parse {
+                                                msg: "guard: expected clause list".into(),
+                                                pos: clause.pos,
+                                            }),
+                                        };
+                                        if parts.is_empty() {
+                                            return Err(EvalError::Parse {
+                                                msg: "guard: empty clause".into(),
+                                                pos: clause.pos,
+                                            });
+                                        }
+                                        // Check for else clause
+                                        if let ExprKind::Symbol(s) = &parts[0].kind {
+                                            if s == "else" {
+                                                for expr in &parts[1..parts.len() - 1] {
+                                                    eval(expr, &guard_env, out)?;
+                                                }
+                                                if parts.len() > 1 {
+                                                    cur_expr = parts[parts.len() - 1].clone();
+                                                    cur_env = guard_env;
+                                                    matched = true;
+                                                    break;
+                                                } else {
+                                                    return Ok(Val::Void);
+                                                }
+                                            }
+                                        }
+                                        let test = eval(&parts[0], &guard_env, out)?;
+                                        if test.is_truthy() {
+                                            if parts.len() == 1 {
+                                                return Ok(test);
+                                            }
+                                            for expr in &parts[1..parts.len() - 1] {
+                                                eval(expr, &guard_env, out)?;
+                                            }
+                                            cur_expr = parts[parts.len() - 1].clone();
+                                            cur_env = guard_env;
+                                            matched = true;
+                                            break;
+                                        }
+                                    }
+                                    if matched {
+                                        continue;
+                                    }
+                                    // No clause matched, re-raise
+                                    EXCEPTION_VAL.with(|ev| *ev.borrow_mut() = Some(exn_val));
+                                    return Err(EvalError::RaisedException);
+                                }
+                                Err(e) => return Err(e),
+                            }
+                        }
                         "define-syntax" => {
                             if elems.len() != 3 {
                                 return Err(EvalError::Arity {
@@ -2145,6 +2251,11 @@ fn apply_builtin(name: &str, args: &[Val], pos: Pos, out: &Output) -> Result<Val
                     apply_func(out_thunk, &[], pos, out)?;
                     Err(EvalError::ContinuationReturn)
                 }
+                Err(EvalError::RaisedException) => {
+                    // Exception: run out-thunk, then re-raise
+                    apply_func(out_thunk, &[], pos, out)?;
+                    Err(EvalError::RaisedException)
+                }
                 Err(e) => {
                     // Other error: run out-thunk, then re-raise
                     let _ = apply_func(out_thunk, &[], pos, out);
@@ -2152,6 +2263,29 @@ fn apply_builtin(name: &str, args: &[Val], pos: Pos, out: &Output) -> Result<Val
                 }
             };
             body_result
+        }
+        "raise" => {
+            if args.len() != 1 {
+                return Err(EvalError::Arity { msg: "raise requires 1 argument".into(), pos });
+            }
+            EXCEPTION_VAL.with(|ev| *ev.borrow_mut() = Some(args[0].clone()));
+            Err(EvalError::RaisedException)
+        }
+        "with-exception-handler" => {
+            if args.len() != 2 {
+                return Err(EvalError::Arity { msg: "with-exception-handler requires 2 arguments".into(), pos });
+            }
+            let handler = &args[0];
+            let thunk = &args[1];
+            match apply_func(thunk, &[], pos, out) {
+                Ok(val) => Ok(val),
+                Err(EvalError::RaisedException) => {
+                    let exn_val = EXCEPTION_VAL.with(|ev| ev.borrow_mut().take())
+                        .unwrap_or(Val::Void);
+                    apply_func(handler, &[exn_val], pos, out)
+                }
+                Err(e) => Err(e),
+            }
         }
         "equal?" => {
             if args.len() != 2 {

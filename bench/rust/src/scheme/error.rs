@@ -37,4 +37,7 @@ pub enum EvalError {
 
     #[error("continuation invoked")]
     ContinuationReturn,
+
+    #[error("unhandled exception")]
+    RaisedException,
 }
