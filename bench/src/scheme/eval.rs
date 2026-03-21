@@ -9,7 +9,19 @@ use crate::scheme::value::Value;
 fn is_builtin(name: &str) -> bool {
     matches!(
         name,
-        "+" | "-" | "*" | "/" | "<" | ">" | "=" | "<=" | ">=" | "not"
+        "+" | "-" | "*" | "/" | "<" | ">" | "=" | "<=" | ">="
+            | "not"
+            | "cons"
+            | "car"
+            | "cdr"
+            | "null?"
+            | "list"
+            | "length"
+            | "string?"
+            | "number?"
+            | "boolean?"
+            | "pair?"
+            | "symbol?"
     )
 }
 
@@ -45,6 +57,9 @@ fn eval_list(elems: &[Value], env: &Rc<RefCell<Env>>) -> Result<Value, EvalError
             "define" => return eval_define(args, env),
             "quote" => return eval_quote(args),
             "lambda" => return eval_lambda(args, env),
+            "let" => return eval_let(args, env),
+            "begin" => return eval_begin(args, env),
+            "cond" => return eval_cond(args, env),
             _ => {}
         }
     }
@@ -201,6 +216,70 @@ fn eval_lambda(args: &[Value], env: &Rc<RefCell<Env>>) -> Result<Value, EvalErro
     })
 }
 
+fn eval_let(args: &[Value], env: &Rc<RefCell<Env>>) -> Result<Value, EvalError> {
+    let [Value::List(bindings), body @ ..] = args else {
+        return Err(EvalError::TypeError {
+            message: "let: expected bindings list".into(),
+        });
+    };
+    if body.is_empty() {
+        return Err(EvalError::TypeError {
+            message: "let: expected body".into(),
+        });
+    }
+    let local_env = Env::with_parent(env);
+    for binding in bindings {
+        let Value::List(pair) = binding else {
+            return Err(EvalError::TypeError {
+                message: "let: binding must be a list".into(),
+            });
+        };
+        let [Value::Symbol(name), val_expr] = pair.as_slice() else {
+            return Err(EvalError::TypeError {
+                message: "let: binding must be (name expr)".into(),
+            });
+        };
+        let val = eval(val_expr, env)?;
+        local_env.borrow_mut().define(name.clone(), val);
+    }
+    let mut result = Value::Void;
+    for expr in body {
+        result = eval(expr, &local_env)?;
+    }
+    Ok(result)
+}
+
+fn eval_begin(args: &[Value], env: &Rc<RefCell<Env>>) -> Result<Value, EvalError> {
+    let mut result = Value::Void;
+    for expr in args {
+        result = eval(expr, env)?;
+    }
+    Ok(result)
+}
+
+fn eval_cond(args: &[Value], env: &Rc<RefCell<Env>>) -> Result<Value, EvalError> {
+    for clause in args {
+        let Value::List(elems) = clause else {
+            return Err(EvalError::TypeError {
+                message: "cond: clause must be a list".into(),
+            });
+        };
+        let [test, body @ ..] = elems.as_slice() else {
+            return Err(EvalError::TypeError {
+                message: "cond: empty clause".into(),
+            });
+        };
+        if matches!(test, Value::Symbol(s) if s == "else") || is_truthy(&eval(test, env)?) {
+            return eval_body(body, env);
+        }
+    }
+    Ok(Value::Void)
+}
+
+fn eval_body(body: &[Value], env: &Rc<RefCell<Env>>) -> Result<Value, EvalError> {
+    body.iter().try_fold(Value::Void, |_, expr| eval(expr, env))
+}
+
 fn is_truthy(val: &Value) -> bool {
     !matches!(val, Value::Boolean(false))
 }
@@ -225,6 +304,79 @@ fn apply_builtin(name: &str, args: &[Value]) -> Result<Value, EvalError> {
             };
             Ok(Value::Boolean(!is_truthy(arg)))
         }
+        "cons" => {
+            let [car, cdr] = args else {
+                return Err(EvalError::WrongArgCount {
+                    expected: 2,
+                    got: args.len(),
+                });
+            };
+            match cdr {
+                Value::List(elems) => {
+                    let mut new_list = vec![car.clone()];
+                    new_list.extend(elems.iter().cloned());
+                    Ok(Value::List(new_list))
+                }
+                _ => Ok(Value::List(vec![car.clone(), cdr.clone()])),
+            }
+        }
+        "car" => {
+            let [arg] = args else {
+                return Err(EvalError::WrongArgCount {
+                    expected: 1,
+                    got: args.len(),
+                });
+            };
+            match arg {
+                Value::List(elems) if !elems.is_empty() => Ok(elems[0].clone()),
+                _ => Err(EvalError::TypeError {
+                    message: format!("car: expected non-empty pair, got {arg}"),
+                }),
+            }
+        }
+        "cdr" => {
+            let [arg] = args else {
+                return Err(EvalError::WrongArgCount {
+                    expected: 1,
+                    got: args.len(),
+                });
+            };
+            match arg {
+                Value::List(elems) if !elems.is_empty() => Ok(Value::List(elems[1..].to_vec())),
+                _ => Err(EvalError::TypeError {
+                    message: format!("cdr: expected non-empty pair, got {arg}"),
+                }),
+            }
+        }
+        "null?" => {
+            let [arg] = args else {
+                return Err(EvalError::WrongArgCount {
+                    expected: 1,
+                    got: args.len(),
+                });
+            };
+            Ok(Value::Boolean(matches!(arg, Value::List(elems) if elems.is_empty())))
+        }
+        "list" => Ok(Value::List(args.to_vec())),
+        "length" => {
+            let [arg] = args else {
+                return Err(EvalError::WrongArgCount {
+                    expected: 1,
+                    got: args.len(),
+                });
+            };
+            match arg {
+                Value::List(elems) => Ok(Value::Integer(elems.len() as i64)),
+                _ => Err(EvalError::TypeError {
+                    message: format!("length: expected list, got {arg}"),
+                }),
+            }
+        }
+        "string?" => Ok(Value::Boolean(matches!(args, [Value::String(_)]))),
+        "number?" => Ok(Value::Boolean(matches!(args, [Value::Integer(_)]))),
+        "boolean?" => Ok(Value::Boolean(matches!(args, [Value::Boolean(_)]))),
+        "pair?" => Ok(Value::Boolean(matches!(args, [Value::List(e)] if !e.is_empty()))),
+        "symbol?" => Ok(Value::Boolean(matches!(args, [Value::Symbol(_)]))),
         _ => Err(EvalError::UnboundVariable {
             name: name.to_string(),
         }),
