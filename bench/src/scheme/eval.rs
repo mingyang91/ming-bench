@@ -1,7 +1,48 @@
+use std::collections::HashMap;
+
 use super::{
     atom_to_value, builtins, env_define, env_get, env_set, quote_expr, DisplayValue, Env,
     EvalError, Expr, Span, Value,
 };
+
+/// Information about a captured continuation for re-execution.
+pub(crate) struct ContinuationInfo {
+    pub expr_index: usize,
+    pub cont_id_at_expr_start: u64,
+}
+
+/// Evaluation context threaded through the evaluator.
+pub(crate) struct EvalCtx {
+    pub out: String,
+    pub next_cont_id: u64,
+    /// Side channel: value from the most recent continuation invocation.
+    pub cont_return_value: Option<Value>,
+    /// Override: if set, the next call/cc with this ID returns this value immediately.
+    pub cont_override: Option<(u64, Value)>,
+    /// Current top-level expression index (set by eval_str).
+    pub current_expr_index: usize,
+    /// All top-level expressions (set by eval_str).
+    pub all_exprs: bool,
+    /// Registered continuations for re-execution.
+    pub cont_registry: HashMap<u64, ContinuationInfo>,
+    /// Value of next_cont_id at the start of the current top-level expression.
+    pub cont_id_at_expr_start: u64,
+}
+
+impl EvalCtx {
+    pub fn new() -> Self {
+        Self {
+            out: String::new(),
+            next_cont_id: 0,
+            cont_return_value: None,
+            cont_override: None,
+            current_expr_index: 0,
+            all_exprs: false,
+            cont_registry: HashMap::new(),
+            cont_id_at_expr_start: 0,
+        }
+    }
+}
 
 /// Result of one evaluation step: either a final value or a tail call to continue.
 enum Trampoline {
@@ -21,7 +62,7 @@ fn as_unbound_variable(err: &EvalError) -> Option<&str> {
 /// Wrap an error with source position, unless it already has one.
 fn with_span(span: Span, err: EvalError) -> EvalError {
     match err {
-        EvalError::AtPosition { .. } => err,
+        EvalError::AtPosition { .. } | EvalError::ContinuationReturn { .. } => err,
         _ => EvalError::AtPosition {
             line: span.line,
             col: span.col,
@@ -70,19 +111,21 @@ fn is_builtin(name: &str) -> bool {
             | "integer->char"
             | "apply"
             | "map"
+            | "call/cc"
+            | "call-with-current-continuation"
     )
 }
 
 /// Parse parameter list, detecting dot notation for rest params.
-/// E.g., `(x y . rest)` → params=["x","y"], rest_param=Some("rest")
 fn parse_params(exprs: &[Expr]) -> Result<(Vec<String>, Option<String>), EvalError> {
     parse_params_from_slice(exprs)
 }
 
 /// Parse a slice of param exprs, handling dot notation.
 fn parse_params_from_slice(exprs: &[Expr]) -> Result<(Vec<String>, Option<String>), EvalError> {
-    // Find the dot position
-    let dot_pos = exprs.iter().position(|e| matches!(e, Expr::Atom(s, _) if s == "."));
+    let dot_pos = exprs
+        .iter()
+        .position(|e| matches!(e, Expr::Atom(s, _) if s == "."));
     match dot_pos {
         Some(pos) => {
             let params: Vec<String> = exprs[..pos]
@@ -175,7 +218,7 @@ fn value_to_list(val: &Value) -> Result<Vec<Value>, EvalError> {
 fn eval_apply_values(
     args: &[Value],
     env: &Env,
-    out: &mut String,
+    ctx: &mut EvalCtx,
 ) -> Result<Trampoline, EvalError> {
     let [proc_val, rest @ ..] = args else {
         return Err(EvalError::WrongArgCount {
@@ -193,10 +236,12 @@ fn eval_apply_values(
     let mut all_args: Vec<Value> = prefix.to_vec();
     all_args.extend(tail_items);
     match proc_val {
-        Value::Lambda { .. } => {
-            apply_lambda_step(proc_val, &all_args, &env.clone(), out)
+        Value::Lambda { .. } => apply_lambda_step(proc_val, &all_args, &env.clone(), ctx),
+        Value::Continuation { id } => invoke_continuation(*id, &all_args, ctx),
+        Value::Symbol(name) if name == "apply" => eval_apply_values(&all_args, env, ctx),
+        Value::Symbol(name) if name == "call/cc" || name == "call-with-current-continuation" => {
+            eval_callcc_applied(&all_args, ctx)
         }
-        Value::Symbol(name) if name == "apply" => eval_apply_values(&all_args, env, out),
         Value::Symbol(name) => apply_builtin(name, &all_args).map(Trampoline::Done),
         other => Err(EvalError::TypeError {
             expected: "procedure".to_string(),
@@ -205,14 +250,30 @@ fn eval_apply_values(
     }
 }
 
+/// Invoke a continuation value, returning a ContinuationReturn error.
+fn invoke_continuation(
+    id: u64,
+    args: &[Value],
+    ctx: &mut EvalCtx,
+) -> Result<Trampoline, EvalError> {
+    let [arg] = args else {
+        return Err(EvalError::WrongArgCount {
+            expected: 1,
+            got: args.len(),
+        });
+    };
+    ctx.cont_return_value = Some(arg.clone());
+    Err(EvalError::ContinuationReturn { id })
+}
+
 /// Evaluate an expression in the given environment (trampoline loop for TCO).
-pub fn eval(expr: &Expr, env: &mut Env, out: &mut String) -> Result<Value, EvalError> {
+pub fn eval(expr: &Expr, env: &mut Env, ctx: &mut EvalCtx) -> Result<Value, EvalError> {
     let span = expr.span();
-    match eval_step(expr, env, out).map_err(|e| with_span(span, e))? {
+    match eval_step(expr, env, ctx).map_err(|e| with_span(span, e))? {
         Trampoline::Done(val) => Ok(val),
         Trampoline::Continue(mut cur_expr, mut cur_env) => loop {
             let span = cur_expr.span();
-            match eval_step(&cur_expr, &mut cur_env, out).map_err(|e| with_span(span, e))? {
+            match eval_step(&cur_expr, &mut cur_env, ctx).map_err(|e| with_span(span, e))? {
                 Trampoline::Done(val) => return Ok(val),
                 Trampoline::Continue(next_expr, next_env) => {
                     cur_expr = next_expr;
@@ -224,7 +285,7 @@ pub fn eval(expr: &Expr, env: &mut Env, out: &mut String) -> Result<Value, EvalE
 }
 
 /// One step of evaluation. Returns Continue for tail-position expressions.
-fn eval_step(expr: &Expr, env: &mut Env, out: &mut String) -> Result<Trampoline, EvalError> {
+fn eval_step(expr: &Expr, env: &mut Env, ctx: &mut EvalCtx) -> Result<Trampoline, EvalError> {
     match expr {
         Expr::Atom(token, _) => {
             if token.starts_with('"')
@@ -244,7 +305,7 @@ fn eval_step(expr: &Expr, env: &mut Env, out: &mut String) -> Result<Trampoline,
                 })
             }
         }
-        Expr::List(items, _) => eval_list_step(items, env, out),
+        Expr::List(items, _) => eval_list_step(items, env, ctx),
     }
 }
 
@@ -252,7 +313,7 @@ fn eval_step(expr: &Expr, env: &mut Env, out: &mut String) -> Result<Trampoline,
 fn eval_list_step(
     items: &[Expr],
     env: &mut Env,
-    out: &mut String,
+    ctx: &mut EvalCtx,
 ) -> Result<Trampoline, EvalError> {
     let [operator, args @ ..] = items else {
         return Err(EvalError::Parse {
@@ -262,40 +323,49 @@ fn eval_list_step(
     // Check for special forms (operator must be an atom)
     if let Expr::Atom(op, _) = operator {
         match op.as_str() {
-            "define" => return eval_define(args, env, out).map(Trampoline::Done),
-            "if" => return eval_if_step(args, env, out),
+            "define" => return eval_define(args, env, ctx).map(Trampoline::Done),
+            "if" => return eval_if_step(args, env, ctx),
             "quote" => return eval_quote(args).map(Trampoline::Done),
-            "and" => return eval_and_step(args, env, out),
-            "or" => return eval_or_step(args, env, out),
+            "and" => return eval_and_step(args, env, ctx),
+            "or" => return eval_or_step(args, env, ctx),
             "lambda" => return eval_lambda(args, env).map(Trampoline::Done),
-            "let" => return eval_let_step(args, env, out),
-            "begin" => return eval_body_step(args, env, out),
-            "cond" => return eval_cond_step(args, env, out),
-            "display" => return eval_display(args, env, out).map(Trampoline::Done),
-            "write" => return eval_write(args, env, out).map(Trampoline::Done),
-            "newline" => return eval_newline(args, out).map(Trampoline::Done),
-            "set!" => return eval_set(args, env, out).map(Trampoline::Done),
-            "string-set!" => return eval_string_set(args, env, out).map(Trampoline::Done),
+            "let" => return eval_let_step(args, env, ctx),
+            "begin" => return eval_body_step(args, env, ctx),
+            "cond" => return eval_cond_step(args, env, ctx),
+            "display" => return eval_display(args, env, ctx).map(Trampoline::Done),
+            "write" => return eval_write(args, env, ctx).map(Trampoline::Done),
+            "newline" => return eval_newline(args, &mut ctx.out).map(Trampoline::Done),
+            "set!" => return eval_set(args, env, ctx).map(Trampoline::Done),
+            "string-set!" => return eval_string_set(args).map(Trampoline::Done),
+            "call/cc" | "call-with-current-continuation" => {
+                return eval_callcc(args, env, ctx);
+            }
             _ => {}
         }
     }
     // Higher-order builtins that need function application
     if let Expr::Atom(op, _) = operator {
         if op == "map" && !env.contains_key("map") {
-            return eval_builtin_map(args, env, out).map(Trampoline::Done);
+            return eval_builtin_map(args, env, ctx).map(Trampoline::Done);
         }
     }
     // General function application
     let evaluated: Vec<Value> = args
         .iter()
-        .map(|a| eval(a, env, out))
+        .map(|a| eval(a, env, ctx))
         .collect::<Result<_, _>>()?;
     // Try evaluating operator; fall back to builtin for atoms
-    match eval(operator, env, out) {
-        Ok(func @ Value::Lambda { .. }) => apply_lambda_step(&func, &evaluated, env, out),
+    match eval(operator, env, ctx) {
+        Ok(func @ Value::Lambda { .. }) => apply_lambda_step(&func, &evaluated, env, ctx),
         Ok(Value::Symbol(ref name)) if name == "apply" => {
-            eval_apply_values(&evaluated, env, out)
+            eval_apply_values(&evaluated, env, ctx)
         }
+        Ok(Value::Symbol(ref name))
+            if name == "call/cc" || name == "call-with-current-continuation" =>
+        {
+            eval_callcc_applied(&evaluated, ctx)
+        }
+        Ok(Value::Continuation { id }) => invoke_continuation(id, &evaluated, ctx),
         Ok(Value::Symbol(ref name)) => apply_builtin(name, &evaluated).map(Trampoline::Done),
         Ok(ref other) => Err(EvalError::TypeError {
             expected: "procedure".to_string(),
@@ -309,12 +379,82 @@ fn eval_list_step(
     }
 }
 
+/// Evaluate `(call/cc func-expr)` as a special form.
+fn eval_callcc(
+    args: &[Expr],
+    env: &mut Env,
+    ctx: &mut EvalCtx,
+) -> Result<Trampoline, EvalError> {
+    let [func_expr] = args else {
+        return Err(EvalError::WrongArgCount {
+            expected: 1,
+            got: args.len(),
+        });
+    };
+    let func = eval(func_expr, env, ctx)?;
+    eval_callcc_with_func(&func, ctx)
+}
+
+/// Handle call/cc when applied as a first-class value (already-evaluated args).
+fn eval_callcc_applied(
+    evaluated: &[Value],
+    ctx: &mut EvalCtx,
+) -> Result<Trampoline, EvalError> {
+    let [func_val] = evaluated else {
+        return Err(EvalError::WrongArgCount {
+            expected: 1,
+            got: evaluated.len(),
+        });
+    };
+    eval_callcc_with_func(func_val, ctx)
+}
+
+/// Core call/cc logic: create continuation, call func with it, catch escape returns.
+fn eval_callcc_with_func(func: &Value, ctx: &mut EvalCtx) -> Result<Trampoline, EvalError> {
+    let id = ctx.next_cont_id;
+    ctx.next_cont_id += 1;
+
+    // Register continuation for reentrant invocation
+    if ctx.all_exprs {
+        ctx.cont_registry.insert(
+            id,
+            ContinuationInfo {
+                expr_index: ctx.current_expr_index,
+                cont_id_at_expr_start: ctx.cont_id_at_expr_start,
+            },
+        );
+    }
+
+    // Check for override (re-execution path)
+    if let Some((override_id, _)) = &ctx.cont_override {
+        if *override_id == id {
+            let (_, val) = ctx.cont_override.take().expect("checked above");
+            return Ok(Trampoline::Done(val));
+        }
+    }
+
+    let cont_val = Value::Continuation { id };
+
+    // Fully evaluate func(cont) to catch escape continuation returns
+    match apply_lambda(func, &[cont_val], ctx) {
+        Ok(val) => Ok(Trampoline::Done(val)),
+        Err(EvalError::ContinuationReturn { id: ret_id }) if ret_id == id => {
+            let val = ctx
+                .cont_return_value
+                .take()
+                .expect("set by continuation invoker");
+            Ok(Trampoline::Done(val))
+        }
+        Err(e) => Err(e),
+    }
+}
+
 /// Set up a lambda's local env and return Continue for its body (tail call).
 fn apply_lambda_step(
     func: &Value,
     args: &[Value],
     caller_env: &Env,
-    out: &mut String,
+    ctx: &mut EvalCtx,
 ) -> Result<Trampoline, EvalError> {
     let Value::Lambda {
         name,
@@ -327,17 +467,15 @@ fn apply_lambda_step(
         unreachable!("apply_lambda_step called with non-lambda");
     };
     validate_lambda_args(params, rest_param, args.len())?;
-    // Build local env: caller env as base (for mutual recursion), overlay closure, bind params
     let mut local_env = caller_env.clone();
     for (k, v) in closure_env {
         local_env.insert(k.clone(), v.clone());
     }
-    // Inject self-reference for recursion
     if let Some(n) = name {
         env_define(&mut local_env, n.clone(), func.clone());
     }
     bind_lambda_params(params, rest_param, args, &mut local_env);
-    eval_body_step(body, &mut local_env, out)
+    eval_body_step(body, &mut local_env, ctx)
 }
 
 /// Apply a built-in operator.
@@ -382,7 +520,6 @@ fn apply_builtin(op: &str, args: &[Value]) -> Result<Value, EvalError> {
         "list->string" => builtins::apply_list_to_string(args),
         "char->integer" => builtins::apply_char_to_integer(args),
         "integer->char" => builtins::apply_integer_to_char(args),
-        // map is handled in eval_list_step as a higher-order function
         _ => Err(EvalError::UnboundVariable {
             name: op.to_string(),
         }),
@@ -390,9 +527,19 @@ fn apply_builtin(op: &str, args: &[Value]) -> Result<Value, EvalError> {
 }
 
 /// Apply a function value (lambda or builtin lookup) — fully resolves (no TCO).
-fn apply_func(func: &Value, args: &[Value], out: &mut String) -> Result<Value, EvalError> {
+fn apply_func(func: &Value, args: &[Value], ctx: &mut EvalCtx) -> Result<Value, EvalError> {
     match func {
-        Value::Lambda { .. } => apply_lambda(func, args, out),
+        Value::Lambda { .. } => apply_lambda(func, args, ctx),
+        Value::Continuation { id } => {
+            let [arg] = args else {
+                return Err(EvalError::WrongArgCount {
+                    expected: 1,
+                    got: args.len(),
+                });
+            };
+            ctx.cont_return_value = Some(arg.clone());
+            Err(EvalError::ContinuationReturn { id: *id })
+        }
         Value::Symbol(name) => apply_builtin(name, args),
         other => Err(EvalError::TypeError {
             expected: "procedure".to_string(),
@@ -402,10 +549,10 @@ fn apply_func(func: &Value, args: &[Value], out: &mut String) -> Result<Value, E
 }
 
 /// Evaluate a sequence of body expressions, returning the last result (no TCO).
-fn eval_body(body: &[Expr], env: &mut Env, out: &mut String) -> Result<Value, EvalError> {
+fn eval_body(body: &[Expr], env: &mut Env, ctx: &mut EvalCtx) -> Result<Value, EvalError> {
     let mut result = Value::Nil;
     for expr in body {
-        result = eval(expr, env, out)?;
+        result = eval(expr, env, ctx)?;
     }
     Ok(result)
 }
@@ -414,19 +561,19 @@ fn eval_body(body: &[Expr], env: &mut Env, out: &mut String) -> Result<Value, Ev
 fn eval_body_step(
     body: &[Expr],
     env: &mut Env,
-    out: &mut String,
+    ctx: &mut EvalCtx,
 ) -> Result<Trampoline, EvalError> {
     let [rest @ .., last] = body else {
         return Ok(Trampoline::Done(Value::Nil));
     };
     for expr in rest {
-        eval(expr, env, out)?;
+        eval(expr, env, ctx)?;
     }
     Ok(Trampoline::Continue(last.clone(), env.clone()))
 }
 
-/// Apply a lambda closure to arguments (fully resolves — used by map).
-fn apply_lambda(func: &Value, args: &[Value], out: &mut String) -> Result<Value, EvalError> {
+/// Apply a lambda closure to arguments (fully resolves — used by map and call/cc).
+fn apply_lambda(func: &Value, args: &[Value], ctx: &mut EvalCtx) -> Result<Value, EvalError> {
     let Value::Lambda {
         name,
         params,
@@ -439,12 +586,11 @@ fn apply_lambda(func: &Value, args: &[Value], out: &mut String) -> Result<Value,
     };
     validate_lambda_args(params, rest_param, args.len())?;
     let mut local_env = closure_env.clone();
-    // Inject self-reference for recursion
     if let Some(n) = name {
         env_define(&mut local_env, n.clone(), func.clone());
     }
     bind_lambda_params(params, rest_param, args, &mut local_env);
-    eval_body(body, &mut local_env, out)
+    eval_body(body, &mut local_env, ctx)
 }
 
 /// Evaluate `(lambda (params...) body...)`.
@@ -475,7 +621,7 @@ fn eval_lambda(args: &[Expr], env: &Env) -> Result<Value, EvalError> {
 }
 
 /// Evaluate `(define name value)` or `(define (name params...) body...)`.
-fn eval_define(args: &[Expr], env: &mut Env, out: &mut String) -> Result<Value, EvalError> {
+fn eval_define(args: &[Expr], env: &mut Env, ctx: &mut EvalCtx) -> Result<Value, EvalError> {
     let [target, body @ ..] = args else {
         return Err(EvalError::Parse {
             message: "define requires a name and a value".to_string(),
@@ -493,7 +639,7 @@ fn eval_define(args: &[Expr], env: &mut Env, out: &mut String) -> Result<Value, 
                     message: "define variable form takes exactly one value".to_string(),
                 });
             };
-            let val = eval(value_expr, env, out)?;
+            let val = eval(value_expr, env, ctx)?;
             env_define(env, name.clone(), val.clone());
             Ok(val)
         }
@@ -521,7 +667,7 @@ fn eval_define(args: &[Expr], env: &mut Env, out: &mut String) -> Result<Value, 
 fn eval_if_step(
     args: &[Expr],
     env: &mut Env,
-    out: &mut String,
+    ctx: &mut EvalCtx,
 ) -> Result<Trampoline, EvalError> {
     let (cond, then_expr, else_expr) = match args {
         [c, t, e] => (c, t, Some(e)),
@@ -532,7 +678,7 @@ fn eval_if_step(
             })
         }
     };
-    let cond_val = eval(cond, env, out)?;
+    let cond_val = eval(cond, env, ctx)?;
     if cond_val != Value::Boolean(false) {
         Ok(Trampoline::Continue(then_expr.clone(), env.clone()))
     } else if let Some(e) = else_expr {
@@ -553,12 +699,16 @@ fn eval_quote(args: &[Expr]) -> Result<Value, EvalError> {
 }
 
 /// Short-circuit `and` with TCO: last expression is in tail position.
-fn eval_and_step(args: &[Expr], env: &mut Env, out: &mut String) -> Result<Trampoline, EvalError> {
+fn eval_and_step(
+    args: &[Expr],
+    env: &mut Env,
+    ctx: &mut EvalCtx,
+) -> Result<Trampoline, EvalError> {
     let [rest @ .., last] = args else {
         return Ok(Trampoline::Done(Value::Boolean(true)));
     };
     for arg in rest {
-        let val = eval(arg, env, out)?;
+        let val = eval(arg, env, ctx)?;
         if val == Value::Boolean(false) {
             return Ok(Trampoline::Done(val));
         }
@@ -570,12 +720,12 @@ fn eval_and_step(args: &[Expr], env: &mut Env, out: &mut String) -> Result<Tramp
 fn eval_let_step(
     args: &[Expr],
     env: &mut Env,
-    out: &mut String,
+    ctx: &mut EvalCtx,
 ) -> Result<Trampoline, EvalError> {
     // Check for named let: (let name ((var val) ...) body...)
     if let [Expr::Atom(name, _), Expr::List(bindings, _), body @ ..] = args {
         if !body.is_empty() {
-            return eval_named_let_step(name, bindings, body, env, out);
+            return eval_named_let_step(name, bindings, body, env, ctx);
         }
     }
     let [bindings_expr, body @ ..] = args else {
@@ -593,7 +743,6 @@ fn eval_let_step(
             message: "let bindings must be a list".to_string(),
         });
     };
-    // Evaluate all values in the outer env, then bind simultaneously
     let pairs: Vec<(String, Value)> = bindings
         .iter()
         .map(|b| {
@@ -607,7 +756,7 @@ fn eval_let_step(
                     message: "let binding must be (name value)".to_string(),
                 });
             };
-            let val = eval(val_expr, env, out)?;
+            let val = eval(val_expr, env, ctx)?;
             Ok((name.clone(), val))
         })
         .collect::<Result<_, _>>()?;
@@ -615,17 +764,16 @@ fn eval_let_step(
     for (name, val) in pairs {
         env_define(&mut local_env, name, val);
     }
-    eval_body_step(body, &mut local_env, out)
+    eval_body_step(body, &mut local_env, ctx)
 }
 
 /// Evaluate named let: `(let name ((var val) ...) body...)`.
-/// Desugars to a recursive lambda call with TCO.
 fn eval_named_let_step(
     name: &str,
     bindings: &[Expr],
     body: &[Expr],
     env: &mut Env,
-    out: &mut String,
+    ctx: &mut EvalCtx,
 ) -> Result<Trampoline, EvalError> {
     let mut params = Vec::new();
     let mut init_vals = Vec::new();
@@ -641,7 +789,7 @@ fn eval_named_let_step(
             });
         };
         params.push(param.clone());
-        init_vals.push(eval(val_expr, env, out)?);
+        init_vals.push(eval(val_expr, env, ctx)?);
     }
     let lambda = Value::Lambda {
         name: Some(name.to_string()),
@@ -650,14 +798,14 @@ fn eval_named_let_step(
         body: body.to_vec(),
         closure_env: env.clone(),
     };
-    apply_lambda_step(&lambda, &init_vals, env, out)
+    apply_lambda_step(&lambda, &init_vals, env, ctx)
 }
 
 /// Evaluate `(cond (test expr) ... (else expr))` — returns Continue for body (TCO).
 fn eval_cond_step(
     args: &[Expr],
     env: &mut Env,
-    out: &mut String,
+    ctx: &mut EvalCtx,
 ) -> Result<Trampoline, EvalError> {
     for clause in args {
         let Expr::List(parts, _) = clause else {
@@ -670,25 +818,28 @@ fn eval_cond_step(
                 message: "cond clause must have a test and body".to_string(),
             });
         };
-        // Check for else clause
         if matches!(test_expr, Expr::Atom(s, _) if s == "else") {
-            return eval_body_step(body, env, out);
+            return eval_body_step(body, env, ctx);
         }
-        let test_val = eval(test_expr, env, out)?;
+        let test_val = eval(test_expr, env, ctx)?;
         if test_val != Value::Boolean(false) {
-            return eval_body_step(body, env, out);
+            return eval_body_step(body, env, ctx);
         }
     }
     Ok(Trampoline::Done(Value::Nil))
 }
 
 /// Short-circuit `or` with TCO: last expression is in tail position.
-fn eval_or_step(args: &[Expr], env: &mut Env, out: &mut String) -> Result<Trampoline, EvalError> {
+fn eval_or_step(
+    args: &[Expr],
+    env: &mut Env,
+    ctx: &mut EvalCtx,
+) -> Result<Trampoline, EvalError> {
     let [rest @ .., last] = args else {
         return Ok(Trampoline::Done(Value::Boolean(false)));
     };
     for arg in rest {
-        let val = eval(arg, env, out)?;
+        let val = eval(arg, env, ctx)?;
         if val != Value::Boolean(false) {
             return Ok(Trampoline::Done(val));
         }
@@ -697,43 +848,55 @@ fn eval_or_step(args: &[Expr], env: &mut Env, out: &mut String) -> Result<Trampo
 }
 
 /// Evaluate `(display expr)` — prints value without quotes on strings.
-fn eval_display(args: &[Expr], env: &mut Env, out: &mut String) -> Result<Value, EvalError> {
+fn eval_display(
+    args: &[Expr],
+    env: &mut Env,
+    ctx: &mut EvalCtx,
+) -> Result<Value, EvalError> {
     let [expr] = args else {
         return Err(EvalError::WrongArgCount {
             expected: 1,
             got: args.len(),
         });
     };
-    let val = eval(expr, env, out)?;
+    let val = eval(expr, env, ctx)?;
     use std::fmt::Write;
-    write!(out, "{}", DisplayValue(&val)).expect("write to String cannot fail");
+    write!(ctx.out, "{}", DisplayValue(&val)).expect("write to String cannot fail");
     Ok(Value::Nil)
 }
 
 /// Evaluate `(write expr)` — prints value with quotes on strings.
-fn eval_write(args: &[Expr], env: &mut Env, out: &mut String) -> Result<Value, EvalError> {
+fn eval_write(
+    args: &[Expr],
+    env: &mut Env,
+    ctx: &mut EvalCtx,
+) -> Result<Value, EvalError> {
     let [expr] = args else {
         return Err(EvalError::WrongArgCount {
             expected: 1,
             got: args.len(),
         });
     };
-    let val = eval(expr, env, out)?;
+    let val = eval(expr, env, ctx)?;
     use std::fmt::Write;
-    write!(out, "{val}").expect("write to String cannot fail");
+    write!(ctx.out, "{val}").expect("write to String cannot fail");
     Ok(Value::Nil)
 }
 
 /// Evaluate builtin `(map func list)`.
-fn eval_builtin_map(args: &[Expr], env: &mut Env, out: &mut String) -> Result<Value, EvalError> {
+fn eval_builtin_map(
+    args: &[Expr],
+    env: &mut Env,
+    ctx: &mut EvalCtx,
+) -> Result<Value, EvalError> {
     let [func_expr, list_expr] = args else {
         return Err(EvalError::WrongArgCount {
             expected: 2,
             got: args.len(),
         });
     };
-    let func = eval(func_expr, env, out)?;
-    let list_val = eval(list_expr, env, out)?;
+    let func = eval(func_expr, env, ctx)?;
+    let list_val = eval(list_expr, env, ctx)?;
     let items = match &list_val {
         Value::Nil => return Ok(Value::Nil),
         Value::List(items) => items,
@@ -746,7 +909,7 @@ fn eval_builtin_map(args: &[Expr], env: &mut Env, out: &mut String) -> Result<Va
     };
     let results: Vec<Value> = items
         .iter()
-        .map(|item| apply_func(&func, std::slice::from_ref(item), out))
+        .map(|item| apply_func(&func, std::slice::from_ref(item), ctx))
         .collect::<Result<_, _>>()?;
     if results.is_empty() {
         Ok(Value::Nil)
@@ -756,19 +919,19 @@ fn eval_builtin_map(args: &[Expr], env: &mut Env, out: &mut String) -> Result<Va
 }
 
 /// Evaluate `(set! name value)` — mutate an existing binding.
-fn eval_set(args: &[Expr], env: &mut Env, out: &mut String) -> Result<Value, EvalError> {
+fn eval_set(args: &[Expr], env: &mut Env, ctx: &mut EvalCtx) -> Result<Value, EvalError> {
     let [Expr::Atom(name, _), value_expr] = args else {
         return Err(EvalError::Parse {
             message: "set! requires a variable name and a value".to_string(),
         });
     };
-    let val = eval(value_expr, env, out)?;
+    let val = eval(value_expr, env, ctx)?;
     env_set(env, name, val)?;
     Ok(Value::Nil)
 }
 
 /// Evaluate `(string-set! ...)` — strings are immutable in R7RS.
-fn eval_string_set(_args: &[Expr], _env: &mut Env, _out: &mut String) -> Result<Value, EvalError> {
+fn eval_string_set(_args: &[Expr]) -> Result<Value, EvalError> {
     Err(EvalError::Immutable {
         message: "strings are immutable".to_string(),
     })

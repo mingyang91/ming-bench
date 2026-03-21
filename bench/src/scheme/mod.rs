@@ -34,6 +34,9 @@ pub(crate) enum Value {
         body: Vec<Expr>,
         closure_env: Env,
     },
+    Continuation {
+        id: u64,
+    },
 }
 
 impl PartialEq for Value {
@@ -47,6 +50,7 @@ impl PartialEq for Value {
             (Value::List(a), Value::List(b)) => a == b,
             (Value::Pair(a1, a2), Value::Pair(b1, b2)) => a1 == b1 && a2 == b2,
             (Value::Nil, Value::Nil) => true,
+            (Value::Continuation { id: a }, Value::Continuation { id: b }) => a == b,
             _ => false,
         }
     }
@@ -64,7 +68,7 @@ impl std::fmt::Display for Value {
             Value::Nil => write!(f, "()"),
             Value::List(items) => write!(f, "({})", fmt_list(items)),
             Value::Pair(car, cdr) => write!(f, "({car} . {cdr})"),
-            Value::Lambda { .. } => write!(f, "#<procedure>"),
+            Value::Lambda { .. } | Value::Continuation { .. } => write!(f, "#<procedure>"),
         }
     }
 }
@@ -200,6 +204,45 @@ fn quote_expr(expr: &Expr) -> Result<Value, EvalError> {
     }
 }
 
+/// Run a sequence of expressions with continuation support.
+/// Returns the last value evaluated.
+fn eval_exprs(
+    exprs: Vec<Expr>,
+    env: &mut Env,
+    ctx: &mut eval::EvalCtx,
+) -> Result<Value, EvalError> {
+    ctx.all_exprs = true;
+    let mut last = Value::Nil;
+    let mut i = 0;
+    while i < exprs.len() {
+        ctx.cont_id_at_expr_start = ctx.next_cont_id;
+        ctx.current_expr_index = i;
+        match eval::eval(&exprs[i], env, ctx) {
+            Ok(val) => {
+                last = val;
+                i += 1;
+            }
+            Err(EvalError::ContinuationReturn { id }) => {
+                let value = ctx
+                    .cont_return_value
+                    .take()
+                    .expect("set by continuation invoker");
+                let info = ctx
+                    .cont_registry
+                    .get(&id)
+                    .expect("registered continuation");
+                let resume_index = info.expr_index;
+                let cont_id_reset = info.cont_id_at_expr_start;
+                ctx.next_cont_id = cont_id_reset;
+                ctx.cont_override = Some((id, value));
+                i = resume_index;
+            }
+            Err(e) => return Err(e),
+        }
+    }
+    Ok(last)
+}
+
 /// Evaluate one or more Scheme expressions and return the string
 /// representation of the last result.
 pub fn eval_str(input: &str) -> Result<String, EvalError> {
@@ -211,12 +254,9 @@ pub fn eval_str(input: &str) -> Result<String, EvalError> {
     }
     let exprs = parse_all(&tokens)?;
     let mut env = Env::new();
-    let mut output = String::new();
-    let mut last = None;
-    for expr in &exprs {
-        last = Some(eval::eval(expr, &mut env, &mut output)?);
-    }
-    Ok(last.expect("exprs is non-empty").to_string())
+    let mut ctx = eval::EvalCtx::new();
+    let last = eval_exprs(exprs, &mut env, &mut ctx)?;
+    Ok(last.to_string())
 }
 
 /// Evaluate Scheme expressions, returning both the result value and
@@ -230,13 +270,9 @@ pub fn eval_str_with_output(input: &str) -> Result<(String, String), EvalError> 
     }
     let exprs = parse_all(&tokens)?;
     let mut env = Env::new();
-    let mut output = String::new();
-    let mut last = None;
-    for expr in &exprs {
-        last = Some(eval::eval(expr, &mut env, &mut output)?);
-    }
-    let result = last.expect("exprs is non-empty").to_string();
-    Ok((result, output))
+    let mut ctx = eval::EvalCtx::new();
+    let last = eval_exprs(exprs, &mut env, &mut ctx)?;
+    Ok((last.to_string(), ctx.out))
 }
 
 #[cfg(test)]
