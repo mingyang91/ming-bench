@@ -41,6 +41,10 @@ enum Value:
 
   case MultipleValues(vals: List[Value])
 
+  case RecordVal(typeTag: AnyRef, fieldNames: List[String], fields: Array[Value])
+
+  case NativeProcVal(name: String, fn: List[Value] => Value)
+
   /** Extract string content from either StringVal or MutableStringVal. */
   def stringContent: Option[String] = this match
     case StringVal(s)         => Some(s)
@@ -62,8 +66,10 @@ enum Value:
     case VectorVal(elems) =>
       "#(" + elems.map(_.display).mkString(" ") + ")"
     case _: LambdaVal       => "#<procedure>"
+    case _: NativeProcVal   => "#<procedure>"
     case _: ContinuationVal => "#<continuation>"
     case _: MacroVal        => "#<macro>"
+    case _: RecordVal       => "#<record>"
     case VoidVal            => ""
     case MultipleValues(vs) => vs.map(_.display).mkString(" ")
 

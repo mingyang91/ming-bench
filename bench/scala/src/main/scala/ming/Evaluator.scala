@@ -66,6 +66,8 @@ object Evaluator:
                 patchClosures(newEnv)
               case Value.PairVal(Value.Symbol("define-syntax", _), _, _) =>
                 newEnv
+              case Value.PairVal(Value.Symbol("define-record-type", _), _, _) =>
+                newEnv
               case _ => env
             evalAll(tail, nextEnv, out2)
 
@@ -120,9 +122,10 @@ object Evaluator:
                 eval(ci.remaining.head, cEnv, ci.capturedOut)
         val (_, newEnv, out2) = headResult
         val nextEnv = head match
-          case Value.PairVal(Value.Symbol("define", _), _, _)        => newEnv
-          case Value.PairVal(Value.Symbol("define-syntax", _), _, _) => newEnv
-          case _                                                     => env
+          case Value.PairVal(Value.Symbol("define", _), _, _)             => newEnv
+          case Value.PairVal(Value.Symbol("define-syntax", _), _, _)      => newEnv
+          case Value.PairVal(Value.Symbol("define-record-type", _), _, _) => newEnv
+          case _                                                          => env
         evalBodyTail(tail, nextEnv, out2, replayMode)
 
   /** Trampoline: evaluate expr, looping on Bounce until Done. */
@@ -157,6 +160,8 @@ object Evaluator:
       case _: Value.ContinuationVal  => Done(expr, env, out)
       case _: Value.MacroVal         => Done(expr, env, out)
       case _: Value.MultipleValues   => Done(expr, env, out)
+      case _: Value.RecordVal        => Done(expr, env, out)
+      case _: Value.NativeProcVal    => Done(expr, env, out)
       case Value.Symbol(name, pos) =>
         Done(env.lookup(name, pos), env, out)
       case Value.PairVal(car, _, pos) =>
@@ -206,6 +211,8 @@ object Evaluator:
         ExceptionHandling.evalWithExceptionHandler(args, env, out)
       case Value.Symbol("define-syntax", _) =>
         Continuations.handleDefineSyntax(args, env, pos, out)
+      case Value.Symbol("define-record-type", _) =>
+        Records.evalDefineRecordType(args, env, pos, out)
       case _ =>
         val (proc, _, out2) = eval(op, env, out)
         proc match

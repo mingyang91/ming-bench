@@ -29,6 +29,8 @@ object Apply:
         val localEnv =
           closureWithSelf.extendVariadic(params, restParam, args, pos)
         Evaluator.evalBodyTail(body, localEnv, out)
+      case Value.NativeProcVal(_, fn) =>
+        Done(fn(args), Env(Map.empty, None), out)
       case Value.Symbol("apply", _) =>
         HigherOrder.evalApply(args, pos, out)
       case Value.Symbol("map", _) =>
