@@ -7,11 +7,18 @@ use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::rc::Rc;
 
+struct GuardFrame {
+    var_name: String,
+    clauses: Vec<Expr>,
+    env: Env,
+}
+
 thread_local! {
     static CALLCC_PENDING: RefCell<Option<(Pos, Value)>> = RefCell::new(None);
     static CALLCC_TOP_IDX: Cell<usize> = Cell::new(0);
     static CONT_RETURN: RefCell<Option<(Pos, usize, Value)>> = RefCell::new(None);
     static RAISED_VALUE: RefCell<Option<Value>> = RefCell::new(None);
+    static GUARD_HANDLERS: RefCell<Vec<GuardFrame>> = RefCell::new(Vec::new());
 }
 
 static GENSYM_COUNTER: AtomicUsize = AtomicUsize::new(0);
@@ -755,6 +762,93 @@ impl Parser {
 // ── Evaluator ───────────────────────────────────────────────────────
 
 fn eval(expr: &Expr, env: &Env, out: &mut String) -> Result<Value, EvalError> {
+    let guard_depth = GUARD_HANDLERS.with(|gh| gh.borrow().len());
+    let result = eval_tco(expr, env, out);
+    // Check if there are guard handlers from this eval frame that need to handle a Raised error
+    match result {
+        Err(EvalError::Raised) => {
+            let current = GUARD_HANDLERS.with(|gh| gh.borrow().len());
+            if current > guard_depth {
+                handle_guard_raised(guard_depth, out)
+            } else {
+                Err(EvalError::Raised)
+            }
+        }
+        Ok(val) => {
+            GUARD_HANDLERS.with(|gh| gh.borrow_mut().truncate(guard_depth));
+            Ok(val)
+        }
+        Err(e) => {
+            GUARD_HANDLERS.with(|gh| gh.borrow_mut().truncate(guard_depth));
+            Err(e)
+        }
+    }
+}
+
+fn handle_guard_raised(guard_depth: usize, out: &mut String) -> Result<Value, EvalError> {
+    loop {
+        let current = GUARD_HANDLERS.with(|gh| gh.borrow().len());
+        if current <= guard_depth {
+            return Err(EvalError::Raised);
+        }
+        let frame = GUARD_HANDLERS.with(|gh| gh.borrow_mut().pop().unwrap());
+        let exn = RAISED_VALUE.with(|rv| rv.borrow_mut().take()).unwrap_or(Value::Nil);
+        let guard_env = Env::with_parent(&frame.env);
+        guard_env.set(frame.var_name.clone(), exn);
+
+        let mut matched = false;
+        let mut clause_result: Result<Value, EvalError> = Ok(Value::Nil);
+        for clause in &frame.clauses {
+            match &clause.kind {
+                ExprKind::List(parts) if !parts.is_empty() => {
+                    if let ExprKind::Symbol(ref s) = parts[0].kind {
+                        if s == "else" {
+                            for p in &parts[1..] {
+                                clause_result = eval(p, &guard_env, out);
+                                if clause_result.is_err() { break; }
+                            }
+                            matched = true;
+                            break;
+                        }
+                    }
+                    let test = match eval(&parts[0], &guard_env, out) {
+                        Ok(v) => v,
+                        Err(e) => {
+                            clause_result = Err(e);
+                            matched = true;
+                            break;
+                        }
+                    };
+                    if test.is_truthy() {
+                        if parts.len() > 1 {
+                            for p in &parts[1..] {
+                                clause_result = eval(p, &guard_env, out);
+                                if clause_result.is_err() { break; }
+                            }
+                        } else {
+                            clause_result = Ok(test);
+                        }
+                        matched = true;
+                        break;
+                    }
+                }
+                _ => {}
+            }
+        }
+
+        if matched {
+            GUARD_HANDLERS.with(|gh| gh.borrow_mut().truncate(guard_depth));
+            return clause_result;
+        } else {
+            // No clause matched — re-raise and try next handler
+            let exn_val = guard_env.get(&frame.var_name).unwrap_or(Value::Nil);
+            RAISED_VALUE.with(|rv| *rv.borrow_mut() = Some(exn_val));
+            // Loop back to check next handler
+        }
+    }
+}
+
+fn eval_tco(expr: &Expr, env: &Env, out: &mut String) -> Result<Value, EvalError> {
     let mut cur_expr = expr.clone();
     let mut cur_env = env.clone();
 
@@ -1209,65 +1303,20 @@ fn eval(expr: &Expr, env: &Env, out: &mut String) -> Result<Value, EvalError> {
                                     pos.fmt()
                                 ))),
                             };
-                            let clauses = &clauses_expr[1..];
-                            // Evaluate body expressions
-                            let mut body_result = Ok(Value::Nil);
-                            for body_expr in &items[2..] {
-                                body_result = eval(body_expr, &cur_env, out);
-                                if body_result.is_err() {
-                                    break;
-                                }
+                            let clauses: Vec<Expr> = clauses_expr[1..].to_vec();
+                            // Push guard handler onto thread-local stack for TCO
+                            GUARD_HANDLERS.with(|gh| gh.borrow_mut().push(GuardFrame {
+                                var_name,
+                                clauses,
+                                env: cur_env.clone(),
+                            }));
+                            // Evaluate non-tail body expressions
+                            for body_expr in &items[2..items.len()-1] {
+                                eval(body_expr, &cur_env, out)?;
                             }
-                            match body_result {
-                                Ok(val) => break 'tco Ok(val),
-                                Err(EvalError::Raised) => {
-                                    let exn = RAISED_VALUE.with(|rv| rv.borrow_mut().take())
-                                        .unwrap_or(Value::Nil);
-                                    // Bind exception to var and test clauses
-                                    let guard_env = Env::with_parent(&cur_env);
-                                    guard_env.set(var_name.clone(), exn);
-                                    let mut matched = false;
-                                    let mut result = Value::Nil;
-                                    for clause in clauses {
-                                        match &clause.kind {
-                                            ExprKind::List(parts) if !parts.is_empty() => {
-                                                if let ExprKind::Symbol(ref s) = parts[0].kind {
-                                                    if s == "else" {
-                                                        // else clause
-                                                        for p in &parts[1..] {
-                                                            result = eval(p, &guard_env, out)?;
-                                                        }
-                                                        matched = true;
-                                                        break;
-                                                    }
-                                                }
-                                                let test = eval(&parts[0], &guard_env, out)?;
-                                                if test.is_truthy() {
-                                                    if parts.len() > 1 {
-                                                        for p in &parts[1..] {
-                                                            result = eval(p, &guard_env, out)?;
-                                                        }
-                                                    } else {
-                                                        result = test;
-                                                    }
-                                                    matched = true;
-                                                    break;
-                                                }
-                                            }
-                                            _ => {}
-                                        }
-                                    }
-                                    if matched {
-                                        break 'tco Ok(result);
-                                    } else {
-                                        // Re-raise
-                                        let exn = guard_env.get(&var_name).unwrap_or(Value::Nil);
-                                        RAISED_VALUE.with(|rv| *rv.borrow_mut() = Some(exn));
-                                        break 'tco Err(EvalError::Raised);
-                                    }
-                                }
-                                Err(e) => break 'tco Err(e),
-                            }
+                            // TCO the last body expression
+                            cur_expr = items.last().unwrap().clone();
+                            continue 'tco;
                         }
                         "with-exception-handler" => {
                             if items.len() != 3 {
@@ -1569,14 +1618,13 @@ fn eval(expr: &Expr, env: &Env, out: &mut String) -> Result<Value, EvalError> {
                 };
                 match func {
                     Value::Continuation(cc_pos, top_idx) => {
-                        if args.len() != 1 {
-                            break 'tco Err(EvalError::Arity(format!(
-                                "continuation requires 1 argument at {}",
-                                pos.fmt()
-                            )));
-                        }
+                        let val = if args.len() == 1 {
+                            args.into_iter().next().unwrap()
+                        } else {
+                            Value::Values(args)
+                        };
                         CONT_RETURN.with(|cr| {
-                            *cr.borrow_mut() = Some((cc_pos, top_idx, args.into_iter().next().unwrap()));
+                            *cr.borrow_mut() = Some((cc_pos, top_idx, val));
                         });
                         break 'tco Err(EvalError::ContinuationReturn);
                     }
@@ -2043,14 +2091,13 @@ fn apply_func(func: Value, args: Vec<Value>, pos: Pos, env: &Env, out: &mut Stri
             eval(body.last().unwrap(), &new_env, out)
         }
         Value::Continuation(cc_pos, top_idx) => {
-            if args.len() != 1 {
-                return Err(EvalError::Arity(format!(
-                    "continuation requires 1 argument at {}",
-                    pos.fmt()
-                )));
-            }
+            let val = if args.len() == 1 {
+                args.into_iter().next().unwrap()
+            } else {
+                Value::Values(args)
+            };
             CONT_RETURN.with(|cr| {
-                *cr.borrow_mut() = Some((cc_pos, top_idx, args.into_iter().next().unwrap()));
+                *cr.borrow_mut() = Some((cc_pos, top_idx, val));
             });
             Err(EvalError::ContinuationReturn)
         }
@@ -2177,14 +2224,13 @@ fn call_apply(args: &[Value], pos: Pos, env: &Env, out: &mut String) -> Result<V
 
     match func {
         Value::Continuation(cc_pos, top_idx) => {
-            if call_args.len() != 1 {
-                return Err(EvalError::Arity(format!(
-                    "continuation requires 1 argument at {}",
-                    pos.fmt()
-                )));
-            }
+            let val = if call_args.len() == 1 {
+                call_args.into_iter().next().unwrap()
+            } else {
+                Value::Values(call_args)
+            };
             CONT_RETURN.with(|cr| {
-                *cr.borrow_mut() = Some((*cc_pos, *top_idx, call_args.into_iter().next().unwrap()));
+                *cr.borrow_mut() = Some((*cc_pos, *top_idx, val));
             });
             Err(EvalError::ContinuationReturn)
         }
