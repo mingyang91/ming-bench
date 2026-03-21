@@ -1705,6 +1705,46 @@ fn apply_builtin(name: &str, args: &[Value], span: Span, out: &OutputBuf) -> Res
                 _ => Err(err_at(span, "vector->list: expected vector")),
             }
         }
+        "abs" => {
+            let v = require_int(&args[0], span)?;
+            Ok(Value::Integer(v.abs()))
+        }
+        "modulo" => {
+            let a = require_int(&args[0], span)?;
+            let b = require_int(&args[1], span)?;
+            if b == 0 { return Err(err_at(span, "modulo: division by zero")); }
+            Ok(Value::Integer(((a % b) + b) % b))
+        }
+        "remainder" => {
+            let a = require_int(&args[0], span)?;
+            let b = require_int(&args[1], span)?;
+            if b == 0 { return Err(err_at(span, "remainder: division by zero")); }
+            Ok(Value::Integer(a % b))
+        }
+        "quotient" => {
+            let a = require_int(&args[0], span)?;
+            let b = require_int(&args[1], span)?;
+            if b == 0 { return Err(err_at(span, "quotient: division by zero")); }
+            Ok(Value::Integer((a as f64 / b as f64).trunc() as i64))
+        }
+        "min" => {
+            if args.is_empty() { return Err(err_at(span, "min requires at least one argument")); }
+            let mut result = require_int(&args[0], span)?;
+            for arg in &args[1..] { result = result.min(require_int(arg, span)?); }
+            Ok(Value::Integer(result))
+        }
+        "max" => {
+            if args.is_empty() { return Err(err_at(span, "max requires at least one argument")); }
+            let mut result = require_int(&args[0], span)?;
+            for arg in &args[1..] { result = result.max(require_int(arg, span)?); }
+            Ok(Value::Integer(result))
+        }
+        "expt" => {
+            let base = require_int(&args[0], span)?;
+            let exp = require_int(&args[1], span)?;
+            if exp < 0 { return Err(err_at(span, "expt: negative exponent not supported for integers")); }
+            Ok(Value::Integer(base.pow(exp as u32)))
+        }
         _ => Err(err_at(span, format!("unknown builtin: {}", name))),
     }
 }
@@ -1835,6 +1875,7 @@ fn init_builtins(env: &EnvRef) {
         "equal?", "eqv?", "eq?",
         "call/cc", "call-with-current-continuation",
         "vector", "make-vector", "vector-ref", "vector-set!", "vector?", "vector-length", "vector->list",
+        "abs", "modulo", "remainder", "quotient", "min", "max", "expt",
     ] {
         EnvFrame::set(env, name.to_string(), Value::Builtin(name.to_string()));
     }
