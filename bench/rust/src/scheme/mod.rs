@@ -114,6 +114,7 @@ enum ExprKind {
 
 type StringRef = Rc<RefCell<String>>;
 type VectorRef = Rc<RefCell<Vec<Value>>>;
+type PairRef = Rc<RefCell<PairCell>>;
 type ContinuationRef = Rc<MachineContinuation>;
 type CapturedContinuationRef = Rc<CapturedContinuation>;
 type WindRef = Rc<WindFrame>;
@@ -124,6 +125,12 @@ type BindingRef = Rc<RefCell<Value>>;
 type NativeProcedureRef = Rc<NativeProcedure>;
 type RecordTypeRef = Rc<RecordType>;
 type RecordRef = Rc<RecordValue>;
+
+#[derive(Debug)]
+struct PairCell {
+    car: Value,
+    cdr: Value,
+}
 
 #[derive(Debug)]
 struct RecordType {
@@ -143,6 +150,12 @@ struct NativeProcedure {
     kind: NativeProcedureKind,
 }
 
+#[derive(Debug, Clone, Copy)]
+enum AccessorOp {
+    Car,
+    Cdr,
+}
+
 #[derive(Debug)]
 enum NativeProcedureKind {
     RecordConstructor {
@@ -155,6 +168,9 @@ enum NativeProcedureKind {
         record_type: RecordTypeRef,
         field_index: usize,
     },
+    ComposedAccessor {
+        ops: Vec<AccessorOp>,
+    },
 }
 
 #[derive(Debug, Clone)]
@@ -165,7 +181,7 @@ enum Value {
     Char(char),
     Symbol(String),
     List(Vec<Value>),
-    Pair(Box<(Value, Value)>),
+    Pair(PairRef),
     Vector(VectorRef),
     Record(RecordRef),
     Multi(Vec<Value>),
@@ -210,6 +226,11 @@ impl Value {
     }
 
     fn render(&self, mode: RenderMode) -> String {
+        let mut state = RenderState::default();
+        self.render_with_state(mode, &mut state)
+    }
+
+    fn render_with_state(&self, mode: RenderMode, state: &mut RenderState) -> String {
         match self {
             Self::Bool(true) => "#t".to_string(),
             Self::Bool(false) => "#f".to_string(),
@@ -226,28 +247,13 @@ impl Value {
                 RenderMode::Write => render_char(*ch),
             },
             Self::Symbol(value) => value.clone(),
-            Self::List(items) => {
-                let rendered = items
-                    .iter()
-                    .map(|item| item.render(mode))
-                    .collect::<Vec<_>>()
-                    .join(" ");
-                format!("({rendered})")
-            }
-            Self::Pair(pair) => render_pair(&pair.0, &pair.1, mode),
-            Self::Vector(items) => {
-                let rendered = items
-                    .borrow()
-                    .iter()
-                    .map(|item| item.render(mode))
-                    .collect::<Vec<_>>()
-                    .join(" ");
-                format!("#({rendered})")
-            }
+            Self::List(items) => render_list_items(items, mode, state),
+            Self::Pair(pair) => render_pair(pair, mode, state),
+            Self::Vector(items) => render_vector(items, mode, state),
             Self::Record(record) => format!("#<record {}>", record.record_type.name.as_str()),
             Self::Multi(values) => match values.as_slice() {
                 [] => "#<multiple-values>".to_string(),
-                [value] => value.render(mode),
+                [value] => value.render_with_state(mode, state),
                 _ => "#<multiple-values>".to_string(),
             },
             Self::Builtin(_)
@@ -257,6 +263,17 @@ impl Value {
             Self::Void => "#<void>".to_string(),
         }
     }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+enum AggregateId {
+    Pair(usize),
+    Vector(usize),
+}
+
+#[derive(Debug, Default)]
+struct RenderState {
+    active: HashSet<AggregateId>,
 }
 
 impl fmt::Display for Value {
@@ -301,6 +318,8 @@ enum Builtin {
     Cons,
     Car,
     Cdr,
+    SetCar,
+    SetCdr,
     Null,
     List,
     ListRef,
@@ -399,6 +418,8 @@ impl Builtin {
         Self::Cons,
         Self::Car,
         Self::Cdr,
+        Self::SetCar,
+        Self::SetCdr,
         Self::Null,
         Self::List,
         Self::ListRef,
@@ -497,6 +518,8 @@ impl Builtin {
             Self::Cons => "cons",
             Self::Car => "car",
             Self::Cdr => "cdr",
+            Self::SetCar => "set-car!",
+            Self::SetCdr => "set-cdr!",
             Self::Null => "null?",
             Self::List => "list",
             Self::ListRef => "list-ref",
@@ -628,7 +651,9 @@ impl Env {
     }
 
     fn lookup(env: &EnvRef, name: &str) -> Option<Value> {
-        Self::lookup_cell(env, name).map(|binding| binding.borrow().clone())
+        Self::lookup_cell(env, name)
+            .map(|binding| binding.borrow().clone())
+            .or_else(|| composed_accessor_value(name))
     }
 
     fn lookup_cell(env: &EnvRef, name: &str) -> Option<BindingRef> {
@@ -2652,7 +2677,7 @@ fn quote_expr(expr: &Expr) -> Value {
         ExprKind::Char(value) => Value::Char(*value),
         ExprKind::String(value) => Value::string(value.clone()),
         ExprKind::Symbol(value) => Value::Symbol(value.clone()),
-        ExprKind::List(items) => Value::List(items.iter().map(quote_expr).collect()),
+        ExprKind::List(items) => list_from_vec(items.iter().map(quote_expr).collect()),
     }
 }
 
@@ -4000,6 +4025,20 @@ fn apply_native_procedure(procedure: &NativeProcedure, args: &[Value]) -> Result
                 ))
             })
         }
+        NativeProcedureKind::ComposedAccessor { ops } => {
+            if args.len() != 1 {
+                return Err(wrong_arg_count(&procedure.name, "exactly 1", args.len()));
+            }
+
+            let mut value = args[0].clone();
+            for op in ops {
+                value = match op {
+                    AccessorOp::Car => pair_car(&procedure.name, &value)?,
+                    AccessorOp::Cdr => pair_cdr(&procedure.name, &value)?,
+                };
+            }
+            Ok(value)
+        }
     }
 }
 
@@ -4051,11 +4090,7 @@ fn bind_call_env(procedure: &Rc<LambdaProcedure>, args: &[Value]) -> Result<EnvR
                 &procedure.params.required,
                 &args[..required],
             );
-            Env::define(
-                &local_env,
-                rest.clone(),
-                Value::List(args[required..].to_vec()),
-            );
+            Env::define(&local_env, rest.clone(), list_from_slice(&args[required..]));
             Ok(local_env)
         }
         None => {
@@ -4090,7 +4125,7 @@ fn expand_apply_args(args: &[Value]) -> Result<(Value, Vec<Value>), EvalError> {
     let tail_args = expect_list_value("apply", &args[args.len() - 1])?;
     let mut applied_args = Vec::with_capacity(args.len() + tail_args.len() - 2);
     applied_args.extend_from_slice(&args[1..args.len() - 1]);
-    applied_args.extend_from_slice(tail_args);
+    applied_args.extend_from_slice(&tail_args);
     Ok((function, applied_args))
 }
 
@@ -4217,57 +4252,39 @@ fn apply_builtin(
                 return Err(wrong_arg_count(name, "exactly 2", args.len()));
             }
 
-            match &args[1] {
-                Value::List(list) => {
-                    let mut items = Vec::with_capacity(list.len() + 1);
-                    items.push(args[0].clone());
-                    items.extend(list.iter().cloned());
-                    Ok(Value::List(items))
-                }
-                other => Ok(Value::Pair(Box::new((args[0].clone(), other.clone())))),
-            }
+            Ok(make_pair(args[0].clone(), args[1].clone()))
         }
         Builtin::Car => {
             if args.len() != 1 {
                 return Err(wrong_arg_count(name, "exactly 1", args.len()));
             }
 
-            match &args[0] {
-                Value::List(list) => list
-                    .first()
-                    .cloned()
-                    .ok_or_else(|| EvalError::TypeMismatch {
-                        expected: "non-empty pair for car".into(),
-                        found: "empty list".into(),
-                    }),
-                Value::Pair(pair) => Ok(pair.0.clone()),
-                other => Err(EvalError::TypeMismatch {
-                    expected: "pair for car".into(),
-                    found: other.type_name().to_string(),
-                }),
-            }
+            pair_car(name, &args[0])
         }
         Builtin::Cdr => {
             if args.len() != 1 {
                 return Err(wrong_arg_count(name, "exactly 1", args.len()));
             }
 
-            match &args[0] {
-                Value::List(list) => {
-                    if list.is_empty() {
-                        return Err(EvalError::TypeMismatch {
-                            expected: "non-empty pair for cdr".into(),
-                            found: "empty list".into(),
-                        });
-                    }
-                    Ok(Value::List(list[1..].to_vec()))
-                }
-                Value::Pair(pair) => Ok(pair.1.clone()),
-                other => Err(EvalError::TypeMismatch {
-                    expected: "pair for cdr".into(),
-                    found: other.type_name().to_string(),
-                }),
+            pair_cdr(name, &args[0])
+        }
+        Builtin::SetCar => {
+            if args.len() != 2 {
+                return Err(wrong_arg_count(name, "exactly 2", args.len()));
             }
+
+            let pair = expect_mutable_pair(name, &args[0])?;
+            pair.borrow_mut().car = args[1].clone();
+            Ok(Value::Void)
+        }
+        Builtin::SetCdr => {
+            if args.len() != 2 {
+                return Err(wrong_arg_count(name, "exactly 2", args.len()));
+            }
+
+            let pair = expect_mutable_pair(name, &args[0])?;
+            pair.borrow_mut().cdr = args[1].clone();
+            Ok(Value::Void)
         }
         Builtin::Null => {
             if args.len() != 1 {
@@ -4360,35 +4377,35 @@ fn apply_builtin(
 
             let vector = expect_vector_value(name, &args[0])?;
             let items = vector.borrow().clone();
-            Ok(Value::List(items))
+            Ok(list_from_vec(items))
         }
-        Builtin::List => Ok(Value::List(args.to_vec())),
+        Builtin::List => Ok(list_from_slice(args)),
         Builtin::ListToVector => {
             if args.len() != 1 {
                 return Err(wrong_arg_count(name, "exactly 1", args.len()));
             }
 
             let list = expect_list_value(name, &args[0])?;
-            Ok(Value::Vector(Rc::new(RefCell::new(list.to_vec()))))
+            Ok(Value::Vector(Rc::new(RefCell::new(list))))
         }
         Builtin::ListRef => {
             let (list, index) = expect_list_and_index(name, args)?;
             Ok(list[index].clone())
         }
         Builtin::ListTail => {
-            let (list, index) = expect_list_and_tail_index(name, args)?;
-            Ok(Value::List(list[index..].to_vec()))
+            let index = expect_tail_index(name, args)?;
+            list_tail_value(name, &args[0], index)
         }
-        Builtin::ListPred => unary_predicate(name, args, |value| matches!(value, Value::List(_))),
+        Builtin::ListPred => unary_predicate(name, args, is_proper_list),
         Builtin::Assoc => assoc_builtin(name, args),
         Builtin::Reverse => {
             if args.len() != 1 {
                 return Err(wrong_arg_count(name, "exactly 1", args.len()));
             }
 
-            let mut items = expect_list_value(name, &args[0])?.to_vec();
+            let mut items = expect_list_value(name, &args[0])?;
             items.reverse();
-            Ok(Value::List(items))
+            Ok(list_from_vec(items))
         }
         Builtin::Map => unreachable!("map is handled by dispatch_builtin_call"),
         Builtin::Apply => unreachable!("apply is handled by dispatch_builtin_call"),
@@ -4579,7 +4596,7 @@ fn apply_builtin(
 
             let string = expect_string_value(name, &args[0])?;
             let chars = string.borrow().chars().map(Value::Char).collect();
-            Ok(Value::List(chars))
+            Ok(list_from_vec(chars))
         }
         Builtin::ListToString => {
             if args.len() != 1 {
@@ -4588,7 +4605,7 @@ fn apply_builtin(
 
             let list = expect_list_value(name, &args[0])?;
             let mut result = String::with_capacity(list.len());
-            for value in list {
+            for value in &list {
                 result.push(expect_char_value(name, value)?);
             }
             Ok(Value::string(result))
@@ -4890,20 +4907,163 @@ fn compare_strings(
     Ok(Value::Bool(true))
 }
 
-fn expect_list_value<'a>(name: &str, value: &'a Value) -> Result<&'a [Value], EvalError> {
+fn make_pair(car: Value, cdr: Value) -> Value {
+    Value::Pair(Rc::new(RefCell::new(PairCell { car, cdr })))
+}
+
+fn list_from_vec(items: Vec<Value>) -> Value {
+    items
+        .into_iter()
+        .rev()
+        .fold(Value::List(Vec::new()), |tail, item| make_pair(item, tail))
+}
+
+fn list_from_slice(items: &[Value]) -> Value {
+    list_from_vec(items.to_vec())
+}
+
+fn pair_id(pair: &PairRef) -> usize {
+    Rc::as_ptr(pair) as usize
+}
+
+fn vector_id(vector: &VectorRef) -> usize {
+    Rc::as_ptr(vector) as usize
+}
+
+fn composed_accessor_value(name: &str) -> Option<Value> {
+    parse_composed_accessor_name(name).map(|ops| {
+        Value::NativeProcedure(Rc::new(NativeProcedure {
+            name: name.to_string(),
+            kind: NativeProcedureKind::ComposedAccessor { ops },
+        }))
+    })
+}
+
+fn parse_composed_accessor_name(name: &str) -> Option<Vec<AccessorOp>> {
+    if name.len() < 4 || !name.starts_with('c') || !name.ends_with('r') {
+        return None;
+    }
+
+    let mut ops = Vec::with_capacity(name.len().saturating_sub(2));
+    for ch in name[1..name.len() - 1].chars().rev() {
+        match ch {
+            'a' => ops.push(AccessorOp::Car),
+            'd' => ops.push(AccessorOp::Cdr),
+            _ => return None,
+        }
+    }
+
+    (!ops.is_empty()).then_some(ops)
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ListStatus {
+    Proper,
+    Improper,
+    Circular,
+}
+
+fn list_status(value: &Value) -> ListStatus {
+    let mut current = value.clone();
+    let mut seen = HashSet::new();
+
+    loop {
+        match current {
+            Value::List(_) => return ListStatus::Proper,
+            Value::Pair(pair) => {
+                if !seen.insert(pair_id(&pair)) {
+                    return ListStatus::Circular;
+                }
+                current = pair.borrow().cdr.clone();
+            }
+            _ => return ListStatus::Improper,
+        }
+    }
+}
+
+fn is_proper_list(value: &Value) -> bool {
+    matches!(list_status(value), ListStatus::Proper)
+}
+
+fn list_type_mismatch(name: &str, found: impl Into<String>) -> EvalError {
+    EvalError::TypeMismatch {
+        expected: format!("list for {name}"),
+        found: found.into(),
+    }
+}
+
+fn expect_list_value(name: &str, value: &Value) -> Result<Vec<Value>, EvalError> {
+    let mut current = value.clone();
+    let mut seen = HashSet::new();
+    let mut items = Vec::new();
+
+    loop {
+        match current {
+            Value::List(tail) => {
+                items.extend(tail);
+                return Ok(items);
+            }
+            Value::Pair(pair) => {
+                if !seen.insert(pair_id(&pair)) {
+                    return Err(list_type_mismatch(name, "circular pair"));
+                }
+
+                let cell = pair.borrow();
+                items.push(cell.car.clone());
+                current = cell.cdr.clone();
+            }
+            other => return Err(list_type_mismatch(name, other.type_name().to_string())),
+        }
+    }
+}
+
+fn pair_car(name: &str, value: &Value) -> Result<Value, EvalError> {
     match value {
-        Value::List(items) => Ok(items),
+        Value::List(list) => list
+            .first()
+            .cloned()
+            .ok_or_else(|| EvalError::TypeMismatch {
+                expected: format!("non-empty pair for {name}"),
+                found: "empty list".into(),
+            }),
+        Value::Pair(pair) => Ok(pair.borrow().car.clone()),
         other => Err(EvalError::TypeMismatch {
-            expected: format!("list for {name}"),
+            expected: format!("pair for {name}"),
             found: other.type_name().to_string(),
         }),
     }
 }
 
-fn expect_list_and_index<'a>(
-    name: &str,
-    args: &'a [Value],
-) -> Result<(&'a [Value], usize), EvalError> {
+fn pair_cdr(name: &str, value: &Value) -> Result<Value, EvalError> {
+    match value {
+        Value::List(list) => {
+            if list.is_empty() {
+                return Err(EvalError::TypeMismatch {
+                    expected: format!("non-empty pair for {name}"),
+                    found: "empty list".into(),
+                });
+            }
+            Ok(list_from_slice(&list[1..]))
+        }
+        Value::Pair(pair) => Ok(pair.borrow().cdr.clone()),
+        other => Err(EvalError::TypeMismatch {
+            expected: format!("pair for {name}"),
+            found: other.type_name().to_string(),
+        }),
+    }
+}
+
+fn expect_mutable_pair(name: &str, value: &Value) -> Result<PairRef, EvalError> {
+    match value {
+        Value::Pair(pair) => Ok(pair.clone()),
+        other => Err(EvalError::TypeMismatch {
+            expected: format!("pair for {name}"),
+            found: other.type_name().to_string(),
+        }),
+    }
+}
+
+fn expect_list_and_index(name: &str, args: &[Value]) -> Result<(Vec<Value>, usize), EvalError> {
     if args.len() != 2 {
         return Err(wrong_arg_count(name, "exactly 2", args.len()));
     }
@@ -4927,10 +5087,7 @@ fn expect_list_and_index<'a>(
     Ok((list, index))
 }
 
-fn expect_list_and_tail_index<'a>(
-    name: &str,
-    args: &'a [Value],
-) -> Result<(&'a [Value], usize), EvalError> {
+fn expect_tail_index(name: &str, args: &[Value]) -> Result<usize, EvalError> {
     if args.len() != 2 {
         return Err(wrong_arg_count(name, "exactly 2", args.len()));
     }
@@ -4951,7 +5108,31 @@ fn expect_list_and_tail_index<'a>(
         });
     }
 
-    Ok((list, index))
+    Ok(index)
+}
+
+fn list_tail_value(name: &str, value: &Value, index: usize) -> Result<Value, EvalError> {
+    let mut current = value.clone();
+    let mut remaining = index;
+    let mut seen = HashSet::new();
+
+    loop {
+        if remaining == 0 {
+            return Ok(current);
+        }
+
+        match current {
+            Value::List(items) => return Ok(list_from_vec(items[remaining..].to_vec())),
+            Value::Pair(pair) => {
+                if !seen.insert(pair_id(&pair)) {
+                    return Err(list_type_mismatch(name, "circular pair"));
+                }
+                current = pair.borrow().cdr.clone();
+                remaining -= 1;
+            }
+            other => return Err(list_type_mismatch(name, other.type_name().to_string())),
+        }
+    }
 }
 
 fn assoc_builtin(name: &str, args: &[Value]) -> Result<Value, EvalError> {
@@ -4961,7 +5142,7 @@ fn assoc_builtin(name: &str, args: &[Value]) -> Result<Value, EvalError> {
 
     let key = &args[0];
     let alist = expect_list_value(name, &args[1])?;
-    for entry in alist {
+    for entry in &alist {
         match entry {
             Value::List(items) if !items.is_empty() => {
                 if values_equal(key, &items[0]) {
@@ -4969,7 +5150,7 @@ fn assoc_builtin(name: &str, args: &[Value]) -> Result<Value, EvalError> {
                 }
             }
             Value::Pair(pair) => {
-                if values_equal(key, &pair.0) {
+                if values_equal(key, &pair.borrow().car) {
                     return Ok(entry.clone());
                 }
             }
@@ -5005,7 +5186,7 @@ fn apply_map_builtin(
         result.push(apply(function.clone(), &element_args, pos, ctx)?);
     }
 
-    Ok(Value::List(result))
+    Ok(list_from_vec(result))
 }
 
 fn unary_predicate(
@@ -5110,7 +5291,45 @@ fn expect_record_value(
     }
 }
 
+#[derive(Debug, Clone, Copy)]
+enum EqualityMode {
+    Eqv,
+    Equal,
+}
+
+#[derive(Debug, Default)]
+struct EqualityState {
+    seen_pairs: HashSet<(usize, usize)>,
+    seen_vectors: HashSet<(usize, usize)>,
+}
+
+#[derive(Debug)]
+enum PairLike {
+    Empty,
+    Cons {
+        id: Option<usize>,
+        car: Value,
+        cdr: Value,
+    },
+    Other,
+}
+
 fn values_eqv(left: &Value, right: &Value) -> bool {
+    let mut state = EqualityState::default();
+    values_equal_with_mode(left, right, EqualityMode::Eqv, &mut state)
+}
+
+fn values_equal(left: &Value, right: &Value) -> bool {
+    let mut state = EqualityState::default();
+    values_equal_with_mode(left, right, EqualityMode::Equal, &mut state)
+}
+
+fn values_equal_with_mode(
+    left: &Value,
+    right: &Value,
+    mode: EqualityMode,
+    state: &mut EqualityState,
+) -> bool {
     match (left, right) {
         (Value::Bool(left), Value::Bool(right)) => left == right,
         (Value::Number(left), Value::Number(right)) => left.numeric_eq(*right),
@@ -5119,24 +5338,37 @@ fn values_eqv(left: &Value, right: &Value) -> bool {
         }
         (Value::Char(left), Value::Char(right)) => left == right,
         (Value::Symbol(left), Value::Symbol(right)) => left == right,
-        (Value::List(left), Value::List(right)) => {
-            left.len() == right.len()
-                && left
-                    .iter()
-                    .zip(right.iter())
-                    .all(|(left, right)| values_eqv(left, right))
+        (Value::List(_) | Value::Pair(_), Value::List(_) | Value::Pair(_)) => {
+            pair_like_equal(left, right, mode, state)
         }
-        (Value::Pair(left), Value::Pair(right)) => {
-            values_eqv(&left.0, &right.0) && values_eqv(&left.1, &right.1)
-        }
-        (Value::Vector(left), Value::Vector(right)) => Rc::ptr_eq(left, right),
+        (Value::Vector(left), Value::Vector(right)) => match mode {
+            EqualityMode::Eqv => Rc::ptr_eq(left, right),
+            EqualityMode::Equal => {
+                if Rc::ptr_eq(left, right) {
+                    return true;
+                }
+
+                let key = (vector_id(left), vector_id(right));
+                if !state.seen_vectors.insert(key) {
+                    return true;
+                }
+
+                let left = left.borrow();
+                let right = right.borrow();
+                left.len() == right.len()
+                    && left
+                        .iter()
+                        .zip(right.iter())
+                        .all(|(left, right)| values_equal_with_mode(left, right, mode, state))
+            }
+        },
         (Value::Record(left), Value::Record(right)) => Rc::ptr_eq(left, right),
         (Value::Multi(left), Value::Multi(right)) => {
             left.len() == right.len()
                 && left
                     .iter()
                     .zip(right.iter())
-                    .all(|(left, right)| values_eqv(left, right))
+                    .all(|(left, right)| values_equal_with_mode(left, right, mode, state))
         }
         (Value::Builtin(left), Value::Builtin(right)) => left == right,
         (Value::Procedure(left), Value::Procedure(right)) => Rc::ptr_eq(left, right),
@@ -5147,48 +5379,58 @@ fn values_eqv(left: &Value, right: &Value) -> bool {
     }
 }
 
-fn values_equal(left: &Value, right: &Value) -> bool {
-    match (left, right) {
-        (Value::Bool(left), Value::Bool(right)) => left == right,
-        (Value::Number(left), Value::Number(right)) => left.numeric_eq(*right),
-        (Value::String(left), Value::String(right)) => {
-            left.borrow().as_str() == right.borrow().as_str()
+fn pair_like_equal(
+    left: &Value,
+    right: &Value,
+    mode: EqualityMode,
+    state: &mut EqualityState,
+) -> bool {
+    match (decompose_pair_like(left), decompose_pair_like(right)) {
+        (PairLike::Empty, PairLike::Empty) => true,
+        (
+            PairLike::Cons {
+                id: left_id,
+                car: left_car,
+                cdr: left_cdr,
+            },
+            PairLike::Cons {
+                id: right_id,
+                car: right_car,
+                cdr: right_cdr,
+            },
+        ) => {
+            if let (Some(left_id), Some(right_id)) = (left_id, right_id) {
+                if !state.seen_pairs.insert((left_id, right_id)) {
+                    return true;
+                }
+            }
+
+            values_equal_with_mode(&left_car, &right_car, mode, state)
+                && values_equal_with_mode(&left_cdr, &right_cdr, mode, state)
         }
-        (Value::Char(left), Value::Char(right)) => left == right,
-        (Value::Symbol(left), Value::Symbol(right)) => left == right,
-        (Value::List(left), Value::List(right)) => {
-            left.len() == right.len()
-                && left
-                    .iter()
-                    .zip(right.iter())
-                    .all(|(left, right)| values_equal(left, right))
-        }
-        (Value::Pair(left), Value::Pair(right)) => {
-            values_equal(&left.0, &right.0) && values_equal(&left.1, &right.1)
-        }
-        (Value::Vector(left), Value::Vector(right)) => {
-            let left = left.borrow();
-            let right = right.borrow();
-            left.len() == right.len()
-                && left
-                    .iter()
-                    .zip(right.iter())
-                    .all(|(left, right)| values_equal(left, right))
-        }
-        (Value::Record(left), Value::Record(right)) => Rc::ptr_eq(left, right),
-        (Value::Multi(left), Value::Multi(right)) => {
-            left.len() == right.len()
-                && left
-                    .iter()
-                    .zip(right.iter())
-                    .all(|(left, right)| values_equal(left, right))
-        }
-        (Value::Builtin(left), Value::Builtin(right)) => left == right,
-        (Value::Procedure(left), Value::Procedure(right)) => Rc::ptr_eq(left, right),
-        (Value::NativeProcedure(left), Value::NativeProcedure(right)) => Rc::ptr_eq(left, right),
-        (Value::Continuation(left), Value::Continuation(right)) => Rc::ptr_eq(left, right),
-        (Value::Void, Value::Void) => true,
         _ => false,
+    }
+}
+
+fn decompose_pair_like(value: &Value) -> PairLike {
+    match value {
+        Value::List(items) => match items.split_first() {
+            Some((first, rest)) => PairLike::Cons {
+                id: None,
+                car: first.clone(),
+                cdr: list_from_slice(rest),
+            },
+            None => PairLike::Empty,
+        },
+        Value::Pair(pair) => {
+            let cell = pair.borrow();
+            PairLike::Cons {
+                id: Some(pair_id(pair)),
+                car: cell.car.clone(),
+                cdr: cell.cdr.clone(),
+            }
+        }
+        _ => PairLike::Other,
     }
 }
 
@@ -5223,23 +5465,77 @@ fn render_char(ch: char) -> String {
     }
 }
 
-fn render_pair(car: &Value, cdr: &Value, mode: RenderMode) -> String {
-    let mut rendered = vec![car.render(mode)];
-    let mut tail = cdr;
+fn render_list_items(items: &[Value], mode: RenderMode, state: &mut RenderState) -> String {
+    let rendered = items
+        .iter()
+        .map(|item| item.render_with_state(mode, state))
+        .collect::<Vec<_>>()
+        .join(" ");
+    format!("({rendered})")
+}
+
+fn render_vector(items: &VectorRef, mode: RenderMode, state: &mut RenderState) -> String {
+    let id = AggregateId::Vector(vector_id(items));
+    if !state.active.insert(id) {
+        return "#<cycle>".to_string();
+    }
+
+    let rendered = {
+        let items = items.borrow();
+        items
+            .iter()
+            .map(|item| item.render_with_state(mode, state))
+            .collect::<Vec<_>>()
+            .join(" ")
+    };
+
+    state.active.remove(&id);
+    format!("#({rendered})")
+}
+
+fn render_pair(pair: &PairRef, mode: RenderMode, state: &mut RenderState) -> String {
+    let mut rendered = Vec::new();
+    let mut current = pair.clone();
+    let mut active_pairs = Vec::new();
 
     loop {
-        match tail {
+        let id = AggregateId::Pair(pair_id(&current));
+        if !state.active.insert(id) {
+            for active_id in active_pairs {
+                state.active.remove(&active_id);
+            }
+
+            let prefix = rendered.join(" ");
+            return if prefix.is_empty() {
+                "(#<cycle>)".to_string()
+            } else {
+                format!("({prefix} . #<cycle>)")
+            };
+        }
+
+        active_pairs.push(id);
+        let (car, cdr) = {
+            let cell = current.borrow();
+            (cell.car.clone(), cell.cdr.clone())
+        };
+        rendered.push(car.render_with_state(mode, state));
+
+        match cdr {
             Value::List(items) => {
-                rendered.extend(items.iter().map(|item| item.render(mode)));
+                rendered.extend(items.iter().map(|item| item.render_with_state(mode, state)));
+                for active_id in active_pairs {
+                    state.active.remove(&active_id);
+                }
                 return format!("({})", rendered.join(" "));
             }
-            Value::Pair(pair) => {
-                rendered.push(pair.0.render(mode));
-                tail = &pair.1;
-            }
+            Value::Pair(next) => current = next,
             other => {
+                let tail = other.render_with_state(mode, state);
+                for active_id in active_pairs {
+                    state.active.remove(&active_id);
+                }
                 let prefix = rendered.join(" ");
-                return format!("({prefix} . {})", other.render(mode));
+                return format!("({prefix} . {tail})");
             }
         }
     }
