@@ -211,6 +211,7 @@ fn default_env() -> Env {
         "char-alphabetic?", "char-numeric?", "char-upcase", "char-downcase",
         "char=?", "char<?",
         "string=?", "string<?", "string-ci=?", "string-upcase", "string-downcase",
+        "dynamic-wind", "reverse",
     ];
     for name in &builtins {
         env_set(&env, name.to_string(), Value::Builtin(name.to_string(), sp));
@@ -975,6 +976,12 @@ fn eval(expr: &Value, env: &Env) -> Result<Value, EvalError> {
                         }
                         return eval_callcc(&args[0], form_span);
                     }
+                    Value::Builtin(ref name, _) if name == "dynamic-wind" => {
+                        if args.len() != 3 {
+                            return Err(EvalError::WrongArgCount { expected: "3".into(), got: args.len(), at: form_span });
+                        }
+                        return eval_dynamic_wind(&args[0], &args[1], &args[2], form_span);
+                    }
                     Value::Continuation { id, ref remaining_forms, ref body_frames, span, .. } => {
                         if args.len() != 1 {
                             return Err(EvalError::WrongArgCount { expected: "1".into(), got: args.len(), at: form_span });
@@ -1100,6 +1107,22 @@ fn eval_callcc(proc: &Value, form_span: Span) -> Result<Value, EvalError> {
     }
 }
 
+fn eval_dynamic_wind(in_thunk: &Value, body_thunk: &Value, out_thunk: &Value, span: Span) -> Result<Value, EvalError> {
+    apply_function(in_thunk, &[], span)?;
+    let body_result = apply_function(body_thunk, &[], span);
+    match body_result {
+        Ok(val) => {
+            apply_function(out_thunk, &[], span)?;
+            Ok(val)
+        }
+        Err(EvalError::ContinuationReturn) => {
+            apply_function(out_thunk, &[], span)?;
+            Err(EvalError::ContinuationReturn)
+        }
+        Err(e) => Err(e),
+    }
+}
+
 fn invoke_continuation(id: u64, remaining_forms: &[Value], body_frames: &[BodyFrame], callcc_span: Span, value: Value) -> Result<Value, EvalError> {
     CONT_DATA.with(|cd| {
         *cd.borrow_mut() = Some(ContinuationData {
@@ -1176,6 +1199,12 @@ fn apply_function(func: &Value, args: &[Value], call_span: Span) -> Result<Value
                 return Err(EvalError::WrongArgCount { expected: "1".into(), got: args.len(), at: call_span });
             }
             eval_callcc(&args[0], call_span)
+        }
+        Value::Builtin(ref name, _) if name == "dynamic-wind" => {
+            if args.len() != 3 {
+                return Err(EvalError::WrongArgCount { expected: "3".into(), got: args.len(), at: call_span });
+            }
+            eval_dynamic_wind(&args[0], &args[1], &args[2], call_span)
         }
         Value::Continuation { id, ref remaining_forms, ref body_frames, span, .. } => {
             if args.len() != 1 {
@@ -2347,6 +2376,16 @@ fn eval_builtin(
                 _ => Err(EvalError::TypeError("string-downcase: expected string".into(), sp)),
             }
         }
+        "reverse" => {
+            if args.len() != 1 { return Err(EvalError::WrongArgCount { expected: "1".into(), got: args.len(), at: sp }); }
+            match eval(&args[0], env)? {
+                Value::List(mut elems, _) => {
+                    elems.reverse();
+                    Ok(Value::List(elems, sp))
+                }
+                _ => Err(EvalError::TypeError("reverse: expected list".into(), sp)),
+            }
+        }
         _ => Err(EvalError::UnboundVariable(op.to_string(), sp)),
     }
 }
@@ -2736,6 +2775,17 @@ fn eval_builtin_with_values(op: &str, args: &[Value], sp: Span) -> Result<Value,
                 results.push(apply_function(func, &call_args, sp)?);
             }
             Ok(Value::List(results, sp))
+        }
+        "reverse" => {
+            if args.len() != 1 { return Err(EvalError::WrongArgCount { expected: "1".into(), got: args.len(), at: sp }); }
+            match &args[0] {
+                Value::List(elems, _) => {
+                    let mut rev = elems.clone();
+                    rev.reverse();
+                    Ok(Value::List(rev, sp))
+                }
+                _ => Err(EvalError::TypeError("reverse: expected list".into(), sp)),
+            }
         }
         _ => Err(EvalError::UnboundVariable(op.to_string(), sp)),
     }
