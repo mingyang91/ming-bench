@@ -16,6 +16,7 @@ pub fn is_builtin(name: &str) -> bool {
             | "string-copy"
             | "string->list" | "list->string"
             | "char->integer" | "integer->char"
+            | "equal?" | "eq?" | "eqv?"
             | "map"
             | "apply"
     )
@@ -54,6 +55,8 @@ pub fn apply_builtin(
         "list->string" => apply_list_to_string(args, env, span, output),
         "char->integer" => apply_char_to_integer(args, env, span, output),
         "integer->char" => apply_integer_to_char(args, env, span, output),
+        "equal?" => apply_equal(args, env, span, output),
+        "eq?" | "eqv?" => apply_eq(args, env, span, output),
         "map" => apply_map(args, env, span, output),
         "apply" => apply_apply(args, env, span, output),
         "display" => apply_display(args, env, span, output),
@@ -1084,6 +1087,56 @@ fn integer_to_char_values(args: &[Value], span: Span) -> Result<Value, EvalError
         span,
     })?;
     Ok(Value::Char(c))
+}
+
+fn values_equal(a: &Value, b: &Value) -> bool {
+    match (a, b) {
+        (Value::Integer(x), Value::Integer(y)) => x == y,
+        (Value::Boolean(x), Value::Boolean(y)) => x == y,
+        (Value::String(x), Value::String(y)) => x == y,
+        (Value::Char(x), Value::Char(y)) => x == y,
+        (Value::Symbol(x, _), Value::Symbol(y, _)) => x == y,
+        (Value::List(xs, _), Value::List(ys, _)) => {
+            xs.len() == ys.len() && xs.iter().zip(ys.iter()).all(|(x, y)| values_equal(x, y))
+        }
+        _ => false,
+    }
+}
+
+fn apply_equal(
+    args: &[Value],
+    env: &mut Env,
+    span: Span,
+    output: &mut String,
+) -> Result<Value, EvalError> {
+    let [a_expr, b_expr] = args else {
+        return Err(EvalError::WrongArgCount { expected: 2, got: args.len(), span });
+    };
+    let a = eval(a_expr, env, output)?;
+    let b = eval(b_expr, env, output)?;
+    Ok(Value::Boolean(values_equal(&a, &b)))
+}
+
+fn apply_eq(
+    args: &[Value],
+    env: &mut Env,
+    span: Span,
+    output: &mut String,
+) -> Result<Value, EvalError> {
+    let [a_expr, b_expr] = args else {
+        return Err(EvalError::WrongArgCount { expected: 2, got: args.len(), span });
+    };
+    let a = eval(a_expr, env, output)?;
+    let b = eval(b_expr, env, output)?;
+    let result = match (&a, &b) {
+        (Value::Integer(x), Value::Integer(y)) => x == y,
+        (Value::Boolean(x), Value::Boolean(y)) => x == y,
+        (Value::Symbol(x, _), Value::Symbol(y, _)) => x == y,
+        (Value::Char(x), Value::Char(y)) => x == y,
+        (Value::List(xs, _), Value::List(ys, _)) => xs.is_empty() && ys.is_empty(),
+        _ => std::ptr::eq(a_expr, b_expr),
+    };
+    Ok(Value::Boolean(result))
 }
 
 fn apply_apply(
