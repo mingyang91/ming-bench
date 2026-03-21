@@ -1,4 +1,5 @@
 pub mod error;
+mod expand;
 
 pub use error::EvalError;
 
@@ -75,6 +76,51 @@ enum Builtin {
     CharToInteger,
     IntegerToChar,
 }
+
+const BUILTIN_BINDINGS: &[(&str, Builtin)] = &[
+    ("+", Builtin::Add),
+    ("-", Builtin::Sub),
+    ("*", Builtin::Mul),
+    ("/", Builtin::Div),
+    ("apply", Builtin::Apply),
+    ("call/cc", Builtin::CallCc),
+    ("<", Builtin::LessThan),
+    (">", Builtin::GreaterThan),
+    ("=", Builtin::Equal),
+    ("<=", Builtin::LessEqual),
+    (">=", Builtin::GreaterEqual),
+    ("not", Builtin::Not),
+    ("cons", Builtin::Cons),
+    ("car", Builtin::Car),
+    ("cdr", Builtin::Cdr),
+    ("null?", Builtin::IsNull),
+    ("list", Builtin::List),
+    ("map", Builtin::Map),
+    ("length", Builtin::Length),
+    ("string?", Builtin::IsString),
+    ("number?", Builtin::IsNumber),
+    ("boolean?", Builtin::IsBoolean),
+    ("pair?", Builtin::IsPair),
+    ("symbol?", Builtin::IsSymbol),
+    ("display", Builtin::Display),
+    ("write", Builtin::Write),
+    ("newline", Builtin::Newline),
+    ("string-append", Builtin::StringAppend),
+    ("string-length", Builtin::StringLength),
+    ("substring", Builtin::Substring),
+    ("string->number", Builtin::StringToNumber),
+    ("number->string", Builtin::NumberToString),
+    ("symbol->string", Builtin::SymbolToString),
+    ("string->symbol", Builtin::StringToSymbol),
+    ("string->list", Builtin::StringToList),
+    ("list->string", Builtin::ListToString),
+    ("string-ref", Builtin::StringRef),
+    ("string-copy", Builtin::StringCopy),
+    ("string-set!", Builtin::StringSet),
+    ("char?", Builtin::IsChar),
+    ("char->integer", Builtin::CharToInteger),
+    ("integer->char", Builtin::IntegerToChar),
+];
 
 #[derive(Clone, Copy, Debug)]
 enum RenderMode {
@@ -630,7 +676,7 @@ pub fn eval_str(input: &str) -> Result<String, EvalError> {
 
 fn eval_program(input: &str) -> Result<(Value, String), EvalError> {
     let mut parser = Parser::new(input);
-    let exprs = parser.parse_program()?;
+    let exprs = expand::expand_program(parser.parse_program()?)?;
     let env = default_env();
     let value = run_machine(eval_sequence_state(
         Rc::new(exprs),
@@ -651,54 +697,16 @@ pub fn eval_str_with_output(input: &str) -> Result<(String, String), EvalError> 
 fn default_env() -> EnvRef {
     let env = Environment::new(None);
 
-    for (name, builtin) in [
-        ("+", Builtin::Add),
-        ("-", Builtin::Sub),
-        ("*", Builtin::Mul),
-        ("/", Builtin::Div),
-        ("apply", Builtin::Apply),
-        ("call/cc", Builtin::CallCc),
-        ("<", Builtin::LessThan),
-        (">", Builtin::GreaterThan),
-        ("=", Builtin::Equal),
-        ("<=", Builtin::LessEqual),
-        (">=", Builtin::GreaterEqual),
-        ("not", Builtin::Not),
-        ("cons", Builtin::Cons),
-        ("car", Builtin::Car),
-        ("cdr", Builtin::Cdr),
-        ("null?", Builtin::IsNull),
-        ("list", Builtin::List),
-        ("map", Builtin::Map),
-        ("length", Builtin::Length),
-        ("string?", Builtin::IsString),
-        ("number?", Builtin::IsNumber),
-        ("boolean?", Builtin::IsBoolean),
-        ("pair?", Builtin::IsPair),
-        ("symbol?", Builtin::IsSymbol),
-        ("display", Builtin::Display),
-        ("write", Builtin::Write),
-        ("newline", Builtin::Newline),
-        ("string-append", Builtin::StringAppend),
-        ("string-length", Builtin::StringLength),
-        ("substring", Builtin::Substring),
-        ("string->number", Builtin::StringToNumber),
-        ("number->string", Builtin::NumberToString),
-        ("symbol->string", Builtin::SymbolToString),
-        ("string->symbol", Builtin::StringToSymbol),
-        ("string->list", Builtin::StringToList),
-        ("list->string", Builtin::ListToString),
-        ("string-ref", Builtin::StringRef),
-        ("string-copy", Builtin::StringCopy),
-        ("string-set!", Builtin::StringSet),
-        ("char?", Builtin::IsChar),
-        ("char->integer", Builtin::CharToInteger),
-        ("integer->char", Builtin::IntegerToChar),
-    ] {
+    for &(name, builtin) in BUILTIN_BINDINGS {
         env.define(name, Value::Builtin(builtin));
+        env.define(internal_builtin_name(name), Value::Builtin(builtin));
     }
 
     env
+}
+
+fn internal_builtin_name(name: &str) -> String {
+    format!("#%builtin:{name}")
 }
 
 fn parse_formals(params_expr: &Expr) -> Result<(Vec<String>, Option<String>), EvalError> {
