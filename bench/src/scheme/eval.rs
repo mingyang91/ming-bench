@@ -37,7 +37,7 @@ fn eval_bounce(value: &Value, env: &mut Env, out: &mut String) -> Result<Bounce,
     match value {
         Value::Integer(_) | Value::Boolean(_) | Value::String(_) | Value::Char(_)
         | Value::Lambda { .. } | Value::BuiltinProc(_) | Value::Continuation { .. }
-        | Value::CcState(_) => Ok(Bounce::Done(value.clone())),
+        | Value::CcState(_) | Value::SyntaxRules { .. } => Ok(Bounce::Done(value.clone())),
         Value::Nil => Ok(Bounce::Done(Value::Nil)),
         Value::Symbol(name) => {
             if let Some(rc) = env.get(name) {
@@ -87,6 +87,7 @@ fn eval_pair_bounce(
             "call/cc" | "call-with-current-continuation" => {
                 eval_callcc_bounce(args, env, out)
             }
+            "define-syntax" => eval_define_syntax(args, env).map(Bounce::Done),
             _ => eval_symbol_call_bounce(name, args, env, out),
         };
     }
@@ -118,6 +119,24 @@ fn eval_symbol_call_bounce(
         .ok_or_else(|| EvalError::UnboundVariable {
             name: name.to_string(),
         })?;
+
+    // Check for macro — expand on unevaluated args
+    {
+        let proc_ref = proc_rc.borrow();
+        if let Value::SyntaxRules {
+            name: macro_name,
+            literals,
+            rules,
+            def_env,
+        } = &*proc_ref
+        {
+            let expanded = super::macros::expand_macro(
+                macro_name, literals, rules, def_env, args, env,
+            )?;
+            return Ok(Bounce::Continue(expanded));
+        }
+    }
+
     let evaled_args: Vec<Value> =
         args.iter().map(|a| eval(a, env, out)).collect::<Result<_, _>>()?;
 
@@ -492,6 +511,38 @@ fn extract_params(value: &Value) -> Result<(Vec<String>, Option<String>), EvalEr
             }
         }
     }
+}
+
+fn eval_define_syntax(args: &[Value], env: &mut Env) -> Result<Value, EvalError> {
+    let [Value::Symbol(name), sr_form] = args else {
+        return Err(EvalError::TypeError {
+            expected: "(define-syntax name (syntax-rules ...))".to_string(),
+            got: format!("{} args", args.len()),
+        });
+    };
+
+    let sr_items = sr_form.to_list_vec().ok_or_else(|| EvalError::TypeError {
+        expected: "syntax-rules form".to_string(),
+        got: sr_form.display(),
+    })?;
+
+    let [Value::Symbol(keyword), sr_args @ ..] = sr_items.as_slice() else {
+        return Err(EvalError::TypeError {
+            expected: "syntax-rules".to_string(),
+            got: sr_form.display(),
+        });
+    };
+
+    if keyword != "syntax-rules" {
+        return Err(EvalError::TypeError {
+            expected: "syntax-rules".to_string(),
+            got: keyword.clone(),
+        });
+    }
+
+    let macro_val = super::macros::parse_syntax_rules(sr_args, name, env)?;
+    env.insert(name.clone(), Rc::new(RefCell::new(macro_val)));
+    Ok(Value::Symbol(name.clone()))
 }
 
 fn eval_define(args: &[Value], env: &mut Env, out: &mut String) -> Result<Value, EvalError> {

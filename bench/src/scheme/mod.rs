@@ -1,5 +1,6 @@
 pub mod error;
 mod eval;
+mod macros;
 mod parse;
 
 pub use error::EvalError;
@@ -54,6 +55,12 @@ enum Value {
         cc: Rc<RefCell<CcStateInner>>,
     },
     CcState(Rc<RefCell<CcStateInner>>),
+    SyntaxRules {
+        name: String,
+        literals: Vec<String>,
+        rules: Vec<(Value, Value)>,
+        def_env: Env,
+    },
 }
 
 impl Value {
@@ -69,6 +76,7 @@ impl Value {
             Value::Lambda { .. } | Value::BuiltinProc(_) | Value::Continuation { .. } => {
                 "#<procedure>".to_string()
             }
+            Value::SyntaxRules { .. } => "#<syntax>".to_string(),
             Value::CcState(_) => "#<cc-state>".to_string(),
             Value::Pair(..) => self.fmt_list(false),
         }
@@ -139,6 +147,7 @@ impl PartialEq for Value {
                 Value::Continuation { expr_idx: a, .. },
                 Value::Continuation { expr_idx: b, .. },
             ) => a == b,
+            (Value::SyntaxRules { name: a, .. }, Value::SyntaxRules { name: b, .. }) => a == b,
             _ => false,
         }
     }
