@@ -16,7 +16,7 @@ enum Value {
     List(Vec<Value>),
     Lambda {
         params: Vec<String>,
-        body: Box<Value>,
+        body: Vec<Value>,
         env: Env,
     },
 }
@@ -279,7 +279,7 @@ fn eval(expr: Value, env: &Env) -> Result<Value, EvalError> {
                                     .collect();
                                 let lambda = Value::Lambda {
                                     params: params?,
-                                    body: Box::new(elems[2].clone()),
+                                    body: elems[2..].to_vec(),
                                     env: env.clone(),
                                 };
                                 env_set(env, name, lambda.clone());
@@ -291,9 +291,9 @@ fn eval(expr: Value, env: &Env) -> Result<Value, EvalError> {
                         }
                     }
                     "lambda" => {
-                        if elems.len() != 3 {
+                        if elems.len() < 3 {
                             return Err(EvalError::Runtime(
-                                "lambda requires 2 arguments".to_string(),
+                                "lambda requires at least 2 arguments".to_string(),
                             ));
                         }
                         let params = match &elems[1] {
@@ -319,7 +319,7 @@ fn eval(expr: Value, env: &Env) -> Result<Value, EvalError> {
                         };
                         Ok(Value::Lambda {
                             params,
-                            body: Box::new(elems[2].clone()),
+                            body: elems[2..].to_vec(),
                             env: env.clone(),
                         })
                     }
@@ -411,7 +411,11 @@ fn apply_proc(proc: &Value, name: &str, args: &[Value], _env: &Env) -> Result<Va
             for (param, arg) in params.iter().zip(args.iter()) {
                 env_set(&call_env, param.clone(), arg.clone());
             }
-            eval(body.as_ref().clone(), &call_env)
+            let mut result = Value::Boolean(false);
+            for expr in body.iter() {
+                result = eval(expr.clone(), &call_env)?;
+            }
+            Ok(result)
         }
         _ => {
             // Try as builtin
