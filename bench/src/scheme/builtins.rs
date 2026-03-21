@@ -13,6 +13,7 @@ pub fn is_builtin(name: &str) -> bool {
             | "string->number" | "number->string"
             | "string->symbol" | "symbol->string"
             | "string-ref"
+            | "string-copy"
     )
 }
 
@@ -44,6 +45,7 @@ pub fn apply_builtin(
         "string->symbol" => apply_string_to_symbol(args, env, span, output),
         "symbol->string" => apply_symbol_to_string(args, env, span, output),
         "string-ref" => apply_string_ref(args, env, span, output),
+        "string-copy" => apply_string_copy(args, env, span, output),
         "display" => apply_display(args, env, span, output),
         "write" => apply_write(args, env, span, output),
         "newline" => apply_newline(args, span, output),
@@ -511,4 +513,17 @@ fn apply_string_ref(
         span,
     })?;
     Ok(Value::Char(ch))
+}
+
+fn apply_string_copy(
+    args: &[Value],
+    env: &mut Env,
+    span: Span,
+    output: &mut String,
+) -> Result<Value, EvalError> {
+    let [arg] = args else {
+        return Err(EvalError::WrongArgCount { expected: 1, got: args.len(), span });
+    };
+    let s = eval_to_string(arg, env, span, output)?;
+    Ok(Value::String(s))
 }

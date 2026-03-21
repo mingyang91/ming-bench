@@ -1,4 +1,4 @@
-use super::{eval, is_truthy, Env};
+use super::{eval, eval_to_integer, is_truthy, Env};
 use crate::scheme::error::EvalError;
 use crate::scheme::value::{Span, Value};
 
@@ -213,6 +213,62 @@ pub(crate) fn eval_body(
 ) -> Result<Value, EvalError> {
     body.iter()
         .try_fold(default, |_, expr| eval(expr, env, output))
+}
+
+pub(crate) fn eval_string_set(
+    args: &[Value],
+    env: &mut Env,
+    span: Span,
+    output: &mut String,
+) -> Result<Value, EvalError> {
+    let [name_arg, idx_arg, char_arg] = args else {
+        return Err(EvalError::WrongArgCount {
+            expected: 3,
+            got: args.len(),
+            span,
+        });
+    };
+    let Value::Symbol(name, name_span) = name_arg else {
+        return Err(EvalError::TypeError {
+            expected: "symbol".to_string(),
+            got: format!("{name_arg}"),
+            span,
+        });
+    };
+    let idx = eval_to_integer(idx_arg, env, output)? as usize;
+    let ch = match eval(char_arg, env, output)? {
+        Value::Char(c) => c,
+        other => {
+            return Err(EvalError::TypeError {
+                expected: "char".to_string(),
+                got: format!("{other}"),
+                span,
+            })
+        }
+    };
+    let s = env.get(name).ok_or_else(|| EvalError::UnboundVariable {
+        name: name.clone(),
+        span: *name_span,
+    })?;
+    let Value::String(ref str_val) = s else {
+        return Err(EvalError::TypeError {
+            expected: "string".to_string(),
+            got: format!("{s}"),
+            span,
+        });
+    };
+    let mut chars: Vec<char> = str_val.chars().collect();
+    if idx >= chars.len() {
+        return Err(EvalError::TypeError {
+            expected: format!("index < {}", chars.len()),
+            got: format!("{idx}"),
+            span,
+        });
+    }
+    chars[idx] = ch;
+    let new_str: String = chars.into_iter().collect();
+    env.insert(name.clone(), Value::String(new_str));
+    Ok(Value::Boolean(false))
 }
 
 fn extract_params(param_vals: &[Value], span: Span) -> Result<Vec<String>, EvalError> {

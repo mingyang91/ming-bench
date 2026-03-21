@@ -8,7 +8,7 @@ pub use error::EvalError;
 use builtins::{apply_builtin, is_builtin};
 use forms::{
     eval_and, eval_begin, eval_body, eval_cond, eval_define, eval_if, eval_lambda, eval_let,
-    eval_or, eval_quote,
+    eval_or, eval_quote, eval_string_set,
 };
 use std::collections::HashMap;
 use value::{Span, Value};
@@ -92,6 +92,7 @@ fn eval_list(
             "let" => return eval_let(args, env, span, output),
             "begin" => return eval_begin(args, env, span, output),
             "cond" => return eval_cond(args, env, span, output),
+            "string-set!" => return eval_string_set(args, env, span, output),
             _ => {}
         }
     }

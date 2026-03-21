@@ -53,7 +53,7 @@ impl<'a> Parser<'a> {
             Some('\'') => self.parse_quote_shorthand(span),
             Some('(') => self.parse_list(span),
             Some('"') => self.parse_string(span),
-            Some('#') => self.parse_boolean(span),
+            Some('#') => self.parse_hash_literal(span),
             Some(&c) if is_symbol_start(c) => self.parse_symbol(span),
             Some(&c) if c == '-' || c.is_ascii_digit() => self.parse_number_or_symbol(span),
             Some(&c) => Err(ParseError::UnexpectedChar { ch: c }),
@@ -81,14 +81,43 @@ impl<'a> Parser<'a> {
         }
     }
 
-    fn parse_boolean(&mut self, _span: Span) -> Result<Value, ParseError> {
+    fn parse_hash_literal(&mut self, _span: Span) -> Result<Value, ParseError> {
         self.advance(); // consume '#'
-        match self.advance() {
-            Some('t') => Ok(Value::Boolean(true)),
-            Some('f') => Ok(Value::Boolean(false)),
-            Some(c) => Err(ParseError::UnexpectedChar { ch: c }),
-            None => Err(ParseError::UnexpectedEof),
+        match self.peek() {
+            Some('\\') => self.parse_char_literal(),
+            _ => match self.advance() {
+                Some('t') => Ok(Value::Boolean(true)),
+                Some('f') => Ok(Value::Boolean(false)),
+                Some(c) => Err(ParseError::UnexpectedChar { ch: c }),
+                None => Err(ParseError::UnexpectedEof),
+            },
         }
+    }
+
+    fn parse_char_literal(&mut self) -> Result<Value, ParseError> {
+        self.advance(); // consume '\\'
+        let ch = self.advance().ok_or(ParseError::UnexpectedEof)?;
+        if !ch.is_ascii_alphabetic() {
+            return Ok(Value::Char(ch));
+        }
+        let name = self.read_char_name(ch);
+        if name.len() == 1 {
+            return Ok(Value::Char(ch));
+        }
+        match name.as_str() {
+            "space" => Ok(Value::Char(' ')),
+            "newline" => Ok(Value::Char('\n')),
+            "tab" => Ok(Value::Char('\t')),
+            _ => Err(ParseError::UnexpectedChar { ch }),
+        }
+    }
+
+    fn read_char_name(&mut self, first: char) -> String {
+        let mut name = String::from(first);
+        while self.peek().is_some_and(|c| c.is_ascii_alphabetic()) {
+            name.push(self.advance().expect("peeked"));
+        }
+        name
     }
 
     fn parse_symbol(&mut self, span: Span) -> Result<Value, ParseError> {
