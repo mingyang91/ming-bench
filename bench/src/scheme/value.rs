@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::fmt;
 
 /// A Scheme value.
@@ -8,6 +9,11 @@ pub enum Value {
     String(String),
     Symbol(String),
     List(Vec<Value>),
+    Lambda {
+        params: Vec<String>,
+        body: Vec<Value>,
+        env: HashMap<String, Value>,
+    },
 }
 
 fn fmt_list(f: &mut fmt::Formatter<'_>, items: &[Value]) -> fmt::Result {
@@ -30,6 +36,7 @@ impl fmt::Display for Value {
             Value::String(s) => write!(f, "\"{s}\""),
             Value::Symbol(s) => write!(f, "{s}"),
             Value::List(items) => fmt_list(f, items),
+            Value::Lambda { .. } => write!(f, "#<procedure>"),
         }
     }
 }

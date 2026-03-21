@@ -1,8 +1,10 @@
+mod builtins;
 pub mod error;
 pub mod parser;
 pub mod value;
 
 pub use error::EvalError;
+use builtins::{apply_builtin, is_builtin};
 use std::collections::HashMap;
 use value::Value;
 
@@ -31,9 +33,11 @@ pub fn eval_str_with_output(_input: &str) -> Result<(String, String), EvalError>
     todo!()
 }
 
-fn eval(value: &Value, env: &mut Env) -> Result<Value, EvalError> {
+pub(crate) fn eval(value: &Value, env: &mut Env) -> Result<Value, EvalError> {
     match value {
-        Value::Integer(_) | Value::Boolean(_) | Value::String(_) => Ok(value.clone()),
+        Value::Integer(_) | Value::Boolean(_) | Value::String(_) | Value::Lambda { .. } => {
+            Ok(value.clone())
+        }
         Value::Symbol(name) => env.get(name).cloned().ok_or_else(|| EvalError::UnboundVariable {
             name: name.clone(),
         }),
@@ -48,31 +52,73 @@ fn eval_list(items: &[Value], env: &mut Env) -> Result<Value, EvalError> {
         });
     };
 
-    match operator {
-        Value::Symbol(name) => match name.as_str() {
-            "define" => eval_define(args, env),
-            "if" => eval_if(args, env),
-            "quote" => eval_quote(args),
-            "and" => eval_and(args, env),
-            "or" => eval_or(args, env),
-            _ => apply_builtin(name, args, env),
-        },
-        _ => Err(EvalError::TypeError {
-            expected: "procedure".to_string(),
-            got: format!("{operator}"),
-        }),
+    // Handle special forms first (unevaluated operator)
+    if let Value::Symbol(name) = operator {
+        match name.as_str() {
+            "define" => return eval_define(args, env),
+            "if" => return eval_if(args, env),
+            "quote" => return eval_quote(args),
+            "and" => return eval_and(args, env),
+            "or" => return eval_or(args, env),
+            "lambda" => return eval_lambda(args, env),
+            _ => {}
+        }
     }
+
+    // Try builtin functions for known symbol names not in env
+    if let Value::Symbol(name) = operator {
+        if is_builtin(name) {
+            return apply_builtin(name, args, env);
+        }
+    }
+
+    // Evaluate operator and apply
+    let proc = eval(operator, env)?;
+    let evaluated_args: Vec<Value> = args
+        .iter()
+        .map(|a| eval(a, env))
+        .collect::<Result<_, _>>()?;
+
+    apply(proc, &evaluated_args, env)
 }
 
 fn eval_define(args: &[Value], env: &mut Env) -> Result<Value, EvalError> {
-    let [Value::Symbol(name), expr] = args else {
-        return Err(EvalError::Parse {
+    match args {
+        // (define x expr)
+        [Value::Symbol(name), expr] => {
+            let val = eval(expr, env)?;
+            env.insert(name.clone(), val);
+            Ok(Value::Symbol(name.clone()))
+        }
+        // (define (f params...) body...)
+        [Value::List(signature), body @ ..] if !signature.is_empty() && !body.is_empty() => {
+            let [Value::Symbol(name), param_vals @ ..] = signature.as_slice() else {
+                return Err(EvalError::Parse {
+                    message: "define: first element of signature must be a symbol".to_string(),
+                });
+            };
+            let params: Vec<String> = param_vals
+                .iter()
+                .map(|v| match v {
+                    Value::Symbol(s) => Ok(s.clone()),
+                    other => Err(EvalError::TypeError {
+                        expected: "symbol".to_string(),
+                        got: format!("{other}"),
+                    }),
+                })
+                .collect::<Result<_, _>>()?;
+            let lambda = Value::Lambda {
+                params,
+                body: body.to_vec(),
+                env: env.clone(),
+            };
+            env.insert(name.clone(), lambda);
+            Ok(Value::Symbol(name.clone()))
+        }
+        _ => Err(EvalError::Parse {
             message: "define requires a symbol and an expression".to_string(),
-        });
-    };
-    let val = eval(expr, env)?;
-    env.insert(name.clone(), val);
-    Ok(Value::Symbol(name.clone()))
+        }),
+    }
 }
 
 fn eval_if(args: &[Value], env: &mut Env) -> Result<Value, EvalError> {
@@ -100,18 +146,68 @@ fn eval_quote(args: &[Value]) -> Result<Value, EvalError> {
     Ok(expr.clone())
 }
 
-fn apply_builtin(name: &str, args: &[Value], env: &mut Env) -> Result<Value, EvalError> {
-    match name {
-        "+" | "-" | "*" | "/" => apply_arithmetic(name, args, env),
-        "<" | ">" | "=" | "<=" | ">=" => apply_comparison(name, args, env),
-        "not" => apply_not(args, env),
-        _ => Err(EvalError::UnboundVariable {
-            name: name.to_string(),
+fn eval_lambda(args: &[Value], env: &Env) -> Result<Value, EvalError> {
+    let [Value::List(param_list), body @ ..] = args else {
+        return Err(EvalError::Parse {
+            message: "lambda requires a parameter list and body".to_string(),
+        });
+    };
+    if body.is_empty() {
+        return Err(EvalError::Parse {
+            message: "lambda requires a body".to_string(),
+        });
+    }
+    let params: Vec<String> = param_list
+        .iter()
+        .map(|v| match v {
+            Value::Symbol(s) => Ok(s.clone()),
+            other => Err(EvalError::TypeError {
+                expected: "symbol".to_string(),
+                got: format!("{other}"),
+            }),
+        })
+        .collect::<Result<_, _>>()?;
+    Ok(Value::Lambda {
+        params,
+        body: body.to_vec(),
+        env: env.clone(),
+    })
+}
+
+fn apply(proc: Value, args: &[Value], env: &mut Env) -> Result<Value, EvalError> {
+    match proc {
+        Value::Lambda {
+            params,
+            body,
+            env: captured_env,
+        } => {
+            if args.len() != params.len() {
+                return Err(EvalError::WrongArgCount {
+                    expected: params.len(),
+                    got: args.len(),
+                });
+            }
+            // Caller's env as base (provides global defs for recursion),
+            // captured env overlays (lexical scoping), params on top.
+            let mut local_env = env.clone();
+            local_env.extend(captured_env);
+            for (param, arg) in params.iter().zip(args) {
+                local_env.insert(param.clone(), arg.clone());
+            }
+            let mut result = Value::Boolean(false);
+            for expr in &body {
+                result = eval(expr, &mut local_env)?;
+            }
+            Ok(result)
+        }
+        other => Err(EvalError::TypeError {
+            expected: "procedure".to_string(),
+            got: format!("{other}"),
         }),
     }
 }
 
-fn eval_to_integer(value: &Value, env: &mut Env) -> Result<i64, EvalError> {
+pub(crate) fn eval_to_integer(value: &Value, env: &mut Env) -> Result<i64, EvalError> {
     match eval(value, env)? {
         Value::Integer(n) => Ok(n),
         other => Err(EvalError::TypeError {
@@ -121,46 +217,7 @@ fn eval_to_integer(value: &Value, env: &mut Env) -> Result<i64, EvalError> {
     }
 }
 
-fn checked_div(acc: i64, x: i64) -> Result<i64, EvalError> {
-    if x == 0 {
-        Err(EvalError::DivisionByZero)
-    } else {
-        Ok(acc / x)
-    }
-}
-
-fn apply_arithmetic(op: &str, args: &[Value], env: &mut Env) -> Result<Value, EvalError> {
-    let evaluated: Vec<i64> = args
-        .iter()
-        .map(|a| eval_to_integer(a, env))
-        .collect::<Result<_, _>>()?;
-
-    let result = match op {
-        "+" => evaluated.iter().sum(),
-        "*" => evaluated.iter().product(),
-        "-" => {
-            let [first, rest @ ..] = evaluated.as_slice() else {
-                return Err(EvalError::WrongArgCount { expected: 1, got: 0 });
-            };
-            if rest.is_empty() {
-                -first
-            } else {
-                rest.iter().fold(*first, |acc, &x| acc - x)
-            }
-        }
-        "/" => {
-            let [first, rest @ ..] = evaluated.as_slice() else {
-                return Err(EvalError::WrongArgCount { expected: 1, got: 0 });
-            };
-            rest.iter().try_fold(*first, |acc, &x| checked_div(acc, x))?
-        }
-        _ => unreachable!("apply_arithmetic called with non-arithmetic op"),
-    };
-
-    Ok(Value::Integer(result))
-}
-
-fn is_truthy(value: &Value) -> bool {
+pub(crate) fn is_truthy(value: &Value) -> bool {
     !matches!(value, Value::Boolean(false))
 }
 
@@ -184,38 +241,6 @@ fn eval_or(args: &[Value], env: &mut Env) -> Result<Value, EvalError> {
         }
     }
     Ok(result)
-}
-
-fn apply_not(args: &[Value], env: &mut Env) -> Result<Value, EvalError> {
-    let [arg] = args else {
-        return Err(EvalError::WrongArgCount {
-            expected: 1,
-            got: args.len(),
-        });
-    };
-    let val = eval(arg, env)?;
-    Ok(Value::Boolean(!is_truthy(&val)))
-}
-
-fn apply_comparison(op: &str, args: &[Value], env: &mut Env) -> Result<Value, EvalError> {
-    let [left, right] = args else {
-        return Err(EvalError::WrongArgCount {
-            expected: 2,
-            got: args.len(),
-        });
-    };
-    let a = eval_to_integer(left, env)?;
-    let b = eval_to_integer(right, env)?;
-
-    let result = match op {
-        "<" => a < b,
-        ">" => a > b,
-        "=" => a == b,
-        "<=" => a <= b,
-        ">=" => a >= b,
-        _ => unreachable!("apply_comparison called with non-comparison op"),
-    };
-    Ok(Value::Boolean(result))
 }
 
 #[cfg(test)]
