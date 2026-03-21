@@ -45,6 +45,8 @@ enum Builtin {
     Max,
     Expt,
     Apply,
+    Values,
+    CallWithValues,
     CallCc,
     DynamicWind,
     Raise,
@@ -132,6 +134,8 @@ const BUILTIN_BINDINGS: &[(&str, Builtin)] = &[
     ("max", Builtin::Max),
     ("expt", Builtin::Expt),
     ("apply", Builtin::Apply),
+    ("values", Builtin::Values),
+    ("call-with-values", Builtin::CallWithValues),
     ("call/cc", Builtin::CallCc),
     ("dynamic-wind", Builtin::DynamicWind),
     ("raise", Builtin::Raise),
@@ -335,6 +339,7 @@ enum Value {
     Builtin(Builtin),
     Procedure(Rc<Procedure>),
     Continuation(Rc<CapturedContinuation>),
+    Values(Vec<Value>),
     Uninitialized(String),
     Void,
 }
@@ -387,6 +392,12 @@ enum Continuation {
         handler: Value,
         pos: SourcePos,
         winds: Vec<WindFrameRef>,
+        output: Rc<RefCell<String>>,
+        next: Rc<Continuation>,
+    },
+    CallWithValuesProducer {
+        consumer: Value,
+        pos: SourcePos,
         output: Rc<RefCell<String>>,
         next: Rc<Continuation>,
     },
@@ -545,6 +556,7 @@ impl Value {
             Self::Pair(_) => "pair",
             Self::Vector(_) => "vector",
             Self::Builtin(_) | Self::Procedure(_) | Self::Continuation(_) => "procedure",
+            Self::Values(_) => "values",
             Self::Uninitialized(_) => "uninitialized",
             Self::Void => "void",
         }
@@ -580,6 +592,7 @@ impl Value {
             Self::Pair(pair) => render_pair(pair, mode),
             Self::Vector(items) => render_vector(items, mode),
             Self::Builtin(_) | Self::Procedure(_) | Self::Continuation(_) => "#<procedure>".into(),
+            Self::Values(items) => render_values(items, mode),
             Self::Uninitialized(_) => "#<uninitialized>".into(),
             Self::Void => "#<void>".into(),
         }
@@ -741,6 +754,7 @@ fn continuation_parent(cont: &Rc<Continuation>) -> Option<Rc<Continuation>> {
         | Continuation::ProcedureReturn { next }
         | Continuation::Guard { next, .. }
         | Continuation::WithExceptionHandler { next, .. }
+        | Continuation::CallWithValuesProducer { next, .. }
         | Continuation::RaiseHandlerReturned { next, .. }
         | Continuation::DynamicWindAfterIn { next, .. }
         | Continuation::DynamicWindAfterBody { next, .. }
@@ -2094,6 +2108,18 @@ fn continue_with_value(value: Value, cont: Rc<Continuation>) -> Result<MachineSt
                 cont: next.clone(),
             })
         }
+        Continuation::CallWithValuesProducer {
+            consumer,
+            pos,
+            output,
+            next,
+        } => dispatch_apply(
+            consumer.clone(),
+            flatten_values(value),
+            *pos,
+            output.clone(),
+            next.clone(),
+        ),
         Continuation::RaiseResume {
             exception,
             raised_pos,
@@ -2578,6 +2604,34 @@ fn apply_builtin_state(
             expanded_args.extend(prefix.iter().cloned());
             expanded_args.extend(spliced);
             return dispatch_apply(operator.clone(), expanded_args, pos, output, cont);
+        }
+        Builtin::Values => Some(if args.len() == 1 {
+            args[0].clone()
+        } else {
+            Value::Values(args)
+        }),
+        Builtin::CallWithValues => {
+            let [producer, consumer] = args.as_slice() else {
+                return Err(wrong_arity(
+                    pos,
+                    "call-with-values",
+                    "exactly 2",
+                    args.len(),
+                ));
+            };
+
+            return dispatch_apply(
+                producer.clone(),
+                Vec::new(),
+                pos,
+                output.clone(),
+                Rc::new(Continuation::CallWithValuesProducer {
+                    consumer: consumer.clone(),
+                    pos,
+                    output,
+                    next: cont,
+                }),
+            );
         }
         Builtin::CallCc => {
             let [procedure] = args.as_slice() else {
@@ -3906,6 +3960,13 @@ fn proper_list_to_vec(value: &Value) -> Option<Vec<Value>> {
     }
 }
 
+fn flatten_values(value: Value) -> Vec<Value> {
+    match value {
+        Value::Values(items) => items,
+        other => vec![other],
+    }
+}
+
 fn render_list(items: &[Value], mode: RenderMode) -> String {
     let mut rendered = String::from("(");
 
@@ -3970,6 +4031,14 @@ fn render_vector(items: &SchemeVector, mode: RenderMode) -> String {
 
     rendered.push(')');
     rendered
+}
+
+fn render_values(items: &[Value], mode: RenderMode) -> String {
+    if items.len() == 1 {
+        return items[0].render_with_mode(mode);
+    }
+
+    "#<values>".into()
 }
 
 fn render_string(value: &str) -> String {
