@@ -12,6 +12,11 @@ enum Value {
     Str(String),
     Symbol(String),
     List(Vec<Value>),
+    Lambda {
+        params: Vec<String>,
+        body: Box<Value>,
+        env: Env,
+    },
 }
 
 type Env = HashMap<String, Value>;
@@ -24,6 +29,7 @@ impl Value {
             Value::Boolean(false) => "#f".to_string(),
             Value::Str(s) => format!("\"{}\"", s),
             Value::Symbol(s) => s.clone(),
+            Value::Lambda { .. } => "#<procedure>".to_string(),
             Value::List(items) => {
                 let parts: Vec<String> = items.iter().map(|v| v.to_scheme_string()).collect();
                 format!("({})", parts.join(" "))
@@ -124,7 +130,9 @@ fn parse(tokens: &[String], pos: usize) -> Result<(Value, usize), EvalError> {
 /// Evaluate a parsed Scheme expression.
 fn eval(value: &Value, env: &mut Env) -> Result<Value, EvalError> {
     match value {
-        Value::Integer(_) | Value::Boolean(_) | Value::Str(_) => Ok(value.clone()),
+        Value::Integer(_) | Value::Boolean(_) | Value::Str(_) | Value::Lambda { .. } => {
+            Ok(value.clone())
+        }
         Value::Symbol(s) => env
             .get(s)
             .cloned()
@@ -133,65 +141,169 @@ fn eval(value: &Value, env: &mut Env) -> Result<Value, EvalError> {
             if items.is_empty() {
                 return Err(EvalError::Parse("empty application".into()));
             }
-            let op = match &items[0] {
-                Value::Symbol(s) => s.as_str(),
-                _ => return Err(EvalError::NotAProcedure),
-            };
-            // Special forms
-            match op {
-                "define" => {
-                    if items.len() != 3 {
-                        return Err(EvalError::Arity);
-                    }
-                    let name = match &items[1] {
-                        Value::Symbol(s) => s.clone(),
-                        _ => return Err(EvalError::TypeError("define expects symbol".into())),
-                    };
-                    let val = eval(&items[2], env)?;
-                    env.insert(name, val);
-                    return Ok(Value::Symbol("ok".into()));
-                }
-                "if" => {
-                    let cond = eval(&items[1], env)?;
-                    if cond != Value::Boolean(false) {
-                        return eval(&items[2], env);
-                    } else if items.len() > 3 {
-                        return eval(&items[3], env);
-                    } else {
-                        return Ok(Value::Symbol("ok".into()));
-                    }
-                }
-                "quote" => {
-                    if items.len() != 2 {
-                        return Err(EvalError::Arity);
-                    }
-                    return Ok(items[1].clone());
-                }
-                "and" => {
-                    let mut result = Value::Boolean(true);
-                    for a in &items[1..] {
-                        result = eval(a, env)?;
-                        if result == Value::Boolean(false) {
-                            return Ok(result);
+            // Check for special forms by symbol name
+            if let Value::Symbol(op) = &items[0] {
+                match op.as_str() {
+                    "define" => {
+                        if items.len() < 3 {
+                            return Err(EvalError::Arity);
+                        }
+                        match &items[1] {
+                            Value::Symbol(name) => {
+                                if items.len() != 3 {
+                                    return Err(EvalError::Arity);
+                                }
+                                let val = eval(&items[2], env)?;
+                                env.insert(name.clone(), val);
+                                return Ok(Value::Symbol("ok".into()));
+                            }
+                            Value::List(sig) => {
+                                // (define (name params...) body)
+                                if sig.is_empty() {
+                                    return Err(EvalError::Parse(
+                                        "define: empty signature".into(),
+                                    ));
+                                }
+                                let name = match &sig[0] {
+                                    Value::Symbol(s) => s.clone(),
+                                    _ => {
+                                        return Err(EvalError::TypeError(
+                                            "define expects symbol".into(),
+                                        ))
+                                    }
+                                };
+                                let params: Result<Vec<String>, _> = sig[1..]
+                                    .iter()
+                                    .map(|v| match v {
+                                        Value::Symbol(s) => Ok(s.clone()),
+                                        _ => Err(EvalError::TypeError(
+                                            "parameter must be symbol".into(),
+                                        )),
+                                    })
+                                    .collect();
+                                let params = params?;
+                                let body = items[2].clone();
+                                // Insert a placeholder first so the closure captures itself
+                                let lambda = Value::Lambda {
+                                    params: params.clone(),
+                                    body: Box::new(body.clone()),
+                                    env: env.clone(),
+                                };
+                                env.insert(name.clone(), lambda);
+                                // Recreate with updated env so closure has self-reference
+                                let lambda = Value::Lambda {
+                                    params,
+                                    body: Box::new(body),
+                                    env: env.clone(),
+                                };
+                                env.insert(name, lambda);
+                                return Ok(Value::Symbol("ok".into()));
+                            }
+                            _ => {
+                                return Err(EvalError::TypeError(
+                                    "define expects symbol or list".into(),
+                                ))
+                            }
                         }
                     }
-                    return Ok(result);
-                }
-                "or" => {
-                    let mut result = Value::Boolean(false);
-                    for a in &items[1..] {
-                        result = eval(a, env)?;
-                        if result != Value::Boolean(false) {
-                            return Ok(result);
+                    "lambda" => {
+                        if items.len() != 3 {
+                            return Err(EvalError::Arity);
+                        }
+                        let param_list = match &items[1] {
+                            Value::List(ps) => ps,
+                            _ => {
+                                return Err(EvalError::TypeError(
+                                    "lambda params must be a list".into(),
+                                ))
+                            }
+                        };
+                        let params: Result<Vec<String>, _> = param_list
+                            .iter()
+                            .map(|v| match v {
+                                Value::Symbol(s) => Ok(s.clone()),
+                                _ => Err(EvalError::TypeError(
+                                    "parameter must be symbol".into(),
+                                )),
+                            })
+                            .collect();
+                        return Ok(Value::Lambda {
+                            params: params?,
+                            body: Box::new(items[2].clone()),
+                            env: env.clone(),
+                        });
+                    }
+                    "if" => {
+                        let cond = eval(&items[1], env)?;
+                        if cond != Value::Boolean(false) {
+                            return eval(&items[2], env);
+                        } else if items.len() > 3 {
+                            return eval(&items[3], env);
+                        } else {
+                            return Ok(Value::Symbol("ok".into()));
                         }
                     }
-                    return Ok(result);
+                    "quote" => {
+                        if items.len() != 2 {
+                            return Err(EvalError::Arity);
+                        }
+                        return Ok(items[1].clone());
+                    }
+                    "and" => {
+                        let mut result = Value::Boolean(true);
+                        for a in &items[1..] {
+                            result = eval(a, env)?;
+                            if result == Value::Boolean(false) {
+                                return Ok(result);
+                            }
+                        }
+                        return Ok(result);
+                    }
+                    "or" => {
+                        let mut result = Value::Boolean(false);
+                        for a in &items[1..] {
+                            result = eval(a, env)?;
+                            if result != Value::Boolean(false) {
+                                return Ok(result);
+                            }
+                        }
+                        return Ok(result);
+                    }
+                    _ => {}
                 }
-                _ => {}
             }
-            let args: Result<Vec<Value>, _> = items[1..].iter().map(|a| eval(a, env)).collect();
+            // General application: evaluate operator and arguments
+            let args: Result<Vec<Value>, _> =
+                items[1..].iter().map(|a| eval(a, env)).collect();
             let args = args?;
-            apply_builtin(op, &args)
+            // Try builtin first if operator is a symbol not in env
+            if let Value::Symbol(s) = &items[0] {
+                if !env.contains_key(s.as_str()) {
+                    return apply_builtin(s, &args);
+                }
+            }
+            let func = eval(&items[0], env)?;
+            match func {
+                Value::Lambda {
+                    params,
+                    body,
+                    env: closed_env,
+                } => {
+                    if args.len() != params.len() {
+                        return Err(EvalError::Arity);
+                    }
+                    // Start with caller's env, overlay closure env, then params
+                    let mut local_env = env.clone();
+                    for (k, v) in &closed_env {
+                        local_env.insert(k.clone(), v.clone());
+                    }
+                    for (p, a) in params.iter().zip(args) {
+                        local_env.insert(p.clone(), a);
+                    }
+                    eval(&body, &mut local_env)
+                }
+                _ => Err(EvalError::NotAProcedure),
+            }
         }
     }
 }
