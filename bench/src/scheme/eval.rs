@@ -113,6 +113,8 @@ pub struct EvalContext {
     body_continuation: RefCell<Option<BodyContinuation>>,
     /// Nesting depth of active dynamic-wind calls.
     wind_depth: Cell<u64>,
+    /// Counter for generating unique record type IDs.
+    record_type_counter: Cell<u64>,
 }
 
 pub struct ContReturnData {
@@ -132,7 +134,14 @@ impl EvalContext {
             gensym_counter: Cell::new(0),
             body_continuation: RefCell::new(None),
             wind_depth: Cell::new(0),
+            record_type_counter: Cell::new(0),
         }
+    }
+
+    fn next_record_type_id(&self) -> u64 {
+        let id = self.record_type_counter.get();
+        self.record_type_counter.set(id + 1);
+        id
     }
 
     fn next_cont_id(&self) -> u64 {
@@ -179,7 +188,9 @@ pub fn eval(
                 Bounce::TailCall { expr, env } => { cur_expr = expr; cur_env = env; }
             },
             Value::Lambda { .. } | Value::Continuation(_) | Value::Macro { .. }
-            | Value::Vector(_) | Value::Pair(..) | Value::Values(_) => {
+            | Value::Vector(_) | Value::Pair(..) | Value::Values(_)
+            | Value::Record { .. } | Value::RecordConstructor { .. }
+            | Value::RecordPredicate { .. } | Value::RecordAccessor { .. } => {
                 return Ok(cur_expr);
             }
             Value::Void => return Ok(Value::Void),
@@ -220,6 +231,9 @@ fn eval_list_tco(
                 return eval_define_syntax(args, env, span).map(Bounce::Done);
             }
             "guard" => return eval_guard_tco(args, env, span, ctx),
+            "define-record-type" => {
+                return eval_define_record_type(args, env, span, ctx).map(Bounce::Done);
+            }
             _ => {}
         }
 
@@ -326,6 +340,49 @@ fn apply_tco(
             env,
         } => apply_lambda(params, rest_param.as_deref(), body, env, args, span, ctx),
         Value::Continuation(data) => apply_continuation(data, args, span, ctx),
+        Value::RecordConstructor { type_id, type_name, field_count } => {
+            if args.len() != *field_count {
+                return Err(EvalError::WrongArgCount {
+                    expected: *field_count,
+                    got: args.len(),
+                    span,
+                });
+            }
+            Ok(Bounce::Done(Value::Record {
+                type_id: *type_id,
+                type_name: type_name.clone(),
+                fields: args.to_vec(),
+            }))
+        }
+        Value::RecordPredicate { type_id } => {
+            let [val] = args else {
+                return Err(EvalError::WrongArgCount {
+                    expected: 1,
+                    got: args.len(),
+                    span,
+                });
+            };
+            let result = matches!(val, Value::Record { type_id: id, .. } if *id == *type_id);
+            Ok(Bounce::Done(Value::Boolean(result)))
+        }
+        Value::RecordAccessor { type_id, field_index } => {
+            let [val] = args else {
+                return Err(EvalError::WrongArgCount {
+                    expected: 1,
+                    got: args.len(),
+                    span,
+                });
+            };
+            match val {
+                Value::Record { type_id: id, fields, .. } if *id == *type_id => {
+                    Ok(Bounce::Done(fields[*field_index].clone()))
+                }
+                _ => Err(EvalError::TypeError {
+                    message: format!("expected record, got {val}"),
+                    span,
+                }),
+            }
+        }
         other => Err(EvalError::TypeError {
             message: format!("not a procedure: {other}"),
             span,
@@ -2248,4 +2305,138 @@ fn apply_vector_builtin(
         }
         _ => unreachable!("apply_vector_builtin called with: {name}"),
     }
+}
+
+/// Evaluate `define-record-type` special form.
+/// Syntax: (define-record-type <name> (constructor field ...) predicate (field accessor) ...)
+fn eval_define_record_type(
+    args: &[Value],
+    env: &Rc<RefCell<Env>>,
+    span: Span,
+    ctx: &EvalContext,
+) -> Result<Value, EvalError> {
+    let [_type_name_val, constructor_form, predicate_name_val, field_specs @ ..] = args else {
+        return Err(EvalError::TypeError {
+            message: "define-record-type: expected at least 3 arguments".into(),
+            span,
+        });
+    };
+
+    let type_id = ctx.next_record_type_id();
+
+    // Extract type name (strip angle brackets for display)
+    let type_name = match _type_name_val {
+        Value::Symbol(s) => s.clone(),
+        _ => {
+            return Err(EvalError::TypeError {
+                message: "define-record-type: expected symbol for type name".into(),
+                span,
+            });
+        }
+    };
+
+    // Parse constructor form: (constructor-name field1 field2 ...)
+    let Value::List(ctor_elems) = constructor_form else {
+        return Err(EvalError::TypeError {
+            message: "define-record-type: expected constructor form".into(),
+            span,
+        });
+    };
+    let [ctor_name_val, ctor_fields @ ..] = ctor_elems.as_slice() else {
+        return Err(EvalError::TypeError {
+            message: "define-record-type: constructor form must have a name".into(),
+            span,
+        });
+    };
+    let Value::Symbol(ctor_name) = ctor_name_val else {
+        return Err(EvalError::TypeError {
+            message: "define-record-type: expected symbol for constructor name".into(),
+            span,
+        });
+    };
+    let ctor_field_names: Vec<String> = ctor_fields
+        .iter()
+        .map(|f| match f {
+            Value::Symbol(s) => Ok(s.clone()),
+            _ => Err(EvalError::TypeError {
+                message: "define-record-type: expected symbol in constructor fields".into(),
+                span,
+            }),
+        })
+        .collect::<Result<_, _>>()?;
+
+    // Parse predicate name
+    let Value::Symbol(pred_name) = predicate_name_val else {
+        return Err(EvalError::TypeError {
+            message: "define-record-type: expected symbol for predicate name".into(),
+            span,
+        });
+    };
+
+    // Parse field specs: (field-name accessor-name)
+    // Build mapping from field name to index in constructor args
+    let field_index_map: std::collections::HashMap<&str, usize> = ctor_field_names
+        .iter()
+        .enumerate()
+        .map(|(i, name)| (name.as_str(), i))
+        .collect();
+
+    // Define constructor
+    env.borrow_mut().define(
+        ctor_name.clone(),
+        Value::RecordConstructor {
+            type_id,
+            type_name: type_name.clone(),
+            field_count: ctor_field_names.len(),
+        },
+    );
+
+    // Define predicate
+    env.borrow_mut().define(
+        pred_name.clone(),
+        Value::RecordPredicate { type_id },
+    );
+
+    // Define accessors
+    for spec in field_specs {
+        let Value::List(spec_elems) = spec else {
+            return Err(EvalError::TypeError {
+                message: "define-record-type: expected list for field spec".into(),
+                span,
+            });
+        };
+        let [field_name_val, accessor_name_val] = spec_elems.as_slice() else {
+            return Err(EvalError::TypeError {
+                message: "define-record-type: field spec must have (field accessor)".into(),
+                span,
+            });
+        };
+        let Value::Symbol(field_name) = field_name_val else {
+            return Err(EvalError::TypeError {
+                message: "define-record-type: expected symbol for field name".into(),
+                span,
+            });
+        };
+        let Value::Symbol(accessor_name) = accessor_name_val else {
+            return Err(EvalError::TypeError {
+                message: "define-record-type: expected symbol for accessor name".into(),
+                span,
+            });
+        };
+        let Some(&field_idx) = field_index_map.get(field_name.as_str()) else {
+            return Err(EvalError::TypeError {
+                message: format!("define-record-type: unknown field {field_name}"),
+                span,
+            });
+        };
+        env.borrow_mut().define(
+            accessor_name.clone(),
+            Value::RecordAccessor {
+                type_id,
+                field_index: field_idx,
+            },
+        );
+    }
+
+    Ok(Value::Void)
 }

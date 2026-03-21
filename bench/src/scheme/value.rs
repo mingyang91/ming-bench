@@ -48,6 +48,27 @@ pub enum Value {
     },
     /// Multiple return values from `values`.
     Values(Vec<Value>),
+    /// A record instance created by `define-record-type`.
+    Record {
+        type_id: u64,
+        type_name: std::string::String,
+        fields: Vec<Value>,
+    },
+    /// Constructor procedure for a record type.
+    RecordConstructor {
+        type_id: u64,
+        type_name: std::string::String,
+        field_count: usize,
+    },
+    /// Predicate procedure for a record type.
+    RecordPredicate {
+        type_id: u64,
+    },
+    /// Accessor procedure for a record field.
+    RecordAccessor {
+        type_id: u64,
+        field_index: usize,
+    },
     Void,
 }
 
@@ -69,6 +90,10 @@ impl PartialEq for Value {
             (Value::Lambda { .. }, Value::Lambda { .. }) => false,
             (Value::Macro { .. }, Value::Macro { .. }) => false,
             (Value::Continuation(a), Value::Continuation(b)) => a.id == b.id,
+            (
+                Value::Record { type_id: a_id, fields: a_fields, .. },
+                Value::Record { type_id: b_id, fields: b_fields, .. },
+            ) => a_id == b_id && a_fields == b_fields,
             _ => false,
         }
     }
@@ -125,6 +150,9 @@ impl Value {
             }
             Value::Macro { .. } => "#<macro>".to_string(),
             Value::Values(vals) => vals.iter().map(|v| v.display_str()).collect::<Vec<_>>().join("\n"),
+            Value::RecordConstructor { .. }
+            | Value::RecordPredicate { .. }
+            | Value::RecordAccessor { .. } => "#<procedure>".to_string(),
             other => other.to_string(),
         }
     }
@@ -146,6 +174,10 @@ impl fmt::Display for Value {
             Value::Vector(cells) => fmt_vector(&cells.borrow(), f),
             Value::Values(vals) => fmt_values(vals, f),
             Value::Lambda { .. } | Value::Continuation(_) => write!(f, "#<procedure>"),
+            Value::RecordConstructor { .. }
+            | Value::RecordPredicate { .. }
+            | Value::RecordAccessor { .. } => write!(f, "#<procedure>"),
+            Value::Record { type_name, .. } => write!(f, "#<record:{type_name}>"),
             Value::Macro { .. } => write!(f, "#<macro>"),
             Value::Void => write!(f, ""),
         }
