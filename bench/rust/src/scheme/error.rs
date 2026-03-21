@@ -1,10 +1,31 @@
+use crate::scheme::source::SourcePos;
+
 /// Evaluation error type for the Scheme interpreter.
-///
-/// Agents must add domain-specific variants here. Using `String` as the
-/// error type is not possible — the `eval_str` signature requires this type.
-#[derive(Debug, PartialEq, thiserror::Error)]
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum EvalError {
-    // Add variants as needed, e.g.:
-    // #[error("unbound variable: {name}")]
-    // UnboundVariable { name: String },
+    #[error("{message}")]
+    Message { message: String },
+
+    #[error("{line}:{column}: {message}")]
+    At {
+        line: usize,
+        column: usize,
+        message: String,
+    },
+}
+
+impl EvalError {
+    pub fn message(message: impl Into<String>) -> Self {
+        Self::Message {
+            message: message.into(),
+        }
+    }
+
+    pub fn at(position: SourcePos, message: impl Into<String>) -> Self {
+        Self::At {
+            line: position.line,
+            column: position.column,
+            message: message.into(),
+        }
+    }
 }

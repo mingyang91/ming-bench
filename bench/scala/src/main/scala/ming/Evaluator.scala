@@ -11,4 +11,5 @@ object Evaluator:
   /** Evaluate Scheme expressions and return both the result string and any captured output from display/write/newline.
     */
   def evalStrWithOutput(input: String): (String, String) =
-    (evalStr(input), "")
+    val (value, output) = SchemeInterpreter.evaluateProgramWithOutput(input)
+    (value.render, output)

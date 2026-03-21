@@ -5,88 +5,112 @@ import scala.annotation.tailrec
 object SchemeInterpreter:
 
   def evaluateProgram(input: String): Value =
-    evaluateSequence(SchemeReader.readAll(input), Env.empty)._2
+    evaluateProgramWithOutput(input)._1
 
-  private def evaluateSequence(expressions: List[Expr], env: Env): (Env, Value) = expressions match
+  def evaluateProgramWithOutput(input: String): (Value, String) =
+    val (state, value) = evaluateSequence(SchemeReader.readAll(input), EvalState.empty)
+    (value, state.renderedOutput)
+
+  private def evaluateSequence(expressions: List[Expr], state: EvalState): (EvalState, Value) = expressions match
     case Nil =>
-      (env, Value.Void)
+      (state, Value.Void)
     case head :: tail =>
-      val (nextEnv, value) = evaluateSequenceStep(head, env)
-      evaluateSequenceTail(tail, nextEnv, value)
+      val (nextState, value) = evaluateSequenceStep(head, state)
+      evaluateSequenceTail(tail, nextState, value)
 
   @tailrec
   private def evaluateSequenceTail(
     remaining: List[Expr],
-    env: Env,
+    state: EvalState,
     current: Value
-  ): (Env, Value) =
+  ): (EvalState, Value) =
     remaining match
       case Nil =>
-        (env, current)
+        (state, current)
       case head :: tail =>
-        val (nextEnv, value) = evaluateSequenceStep(head, env)
-        evaluateSequenceTail(tail, nextEnv, value)
+        val (nextState, value) = evaluateSequenceStep(head, state)
+        evaluateSequenceTail(tail, nextState, value)
 
-  private def evaluateSequenceStep(expr: Expr, env: Env): (Env, Value) = expr match
+  private def evaluateSequenceStep(expr: Expr, state: EvalState): (EvalState, Value) = expr match
     case Expr.ListExpr(Expr.Symbol("define", position) :: arguments, _) =>
-      (evaluateDefine(arguments, env, position), Value.Void)
+      (evaluateDefine(arguments, state, position), Value.Void)
     case Expr.ListExpr(Expr.Symbol("begin", _) :: arguments, _) =>
-      evaluateSequence(arguments, env)
+      evaluateSequence(arguments, state)
     case _ =>
-      (env, evaluate(expr, env))
+      evaluate(expr, state)
 
-  private def evaluate(expr: Expr, env: Env): Value = expr match
+  private def evaluate(expr: Expr, state: EvalState): (EvalState, Value) = expr match
     case Expr.Literal(value, _) =>
-      value
+      (state, value)
     case Expr.Symbol(name, position) =>
-      lookup(name, env).getOrElse(throw EvalError.at(position, s"unbound symbol '$name'"))
+      (
+        state,
+        lookup(name, state.env).getOrElse(throw EvalError.at(position, s"unbound symbol '$name'"))
+      )
     case Expr.ListExpr(Nil, position) =>
       throw EvalError.at(position, "cannot evaluate empty list")
     case Expr.ListExpr(operator :: arguments, _) =>
       operator match
         case Expr.Symbol("if", position) =>
-          evaluateIf(arguments, env, position)
+          evaluateIf(arguments, state, position)
         case Expr.Symbol("quote", position) =>
-          evaluateQuote(arguments, position)
+          (state, evaluateQuote(arguments, position))
         case Expr.Symbol("lambda", position) =>
-          evaluateLambda(arguments, env, position)
+          (state, evaluateLambda(arguments, state.env, position))
         case Expr.Symbol("and", _) =>
-          evaluateAnd(arguments, env)
+          evaluateAnd(arguments, state)
         case Expr.Symbol("or", _) =>
-          evaluateOr(arguments, env)
+          evaluateOr(arguments, state)
         case Expr.Symbol("begin", _) =>
-          evaluateBegin(arguments, env)
+          evaluateBegin(arguments, state)
         case Expr.Symbol("let", position) =>
-          evaluateLet(arguments, env, position)
+          evaluateLet(arguments, state, position)
         case Expr.Symbol("cond", _) =>
-          evaluateCond(arguments, env)
+          evaluateCond(arguments, state)
         case Expr.Symbol("define", position) =>
           throw EvalError.at(position, "define is only allowed within a sequence")
         case _ =>
-          applyProcedure(evaluate(operator, env), arguments, env, operator.sourcePos)
+          val (nextState, procedure) = evaluate(operator, state)
+          applyProcedure(procedure, arguments, nextState, operator.sourcePos)
 
-  private def evaluateDefine(arguments: List[Expr], env: Env, position: SourcePos): Env =
+  private def evaluateDefine(arguments: List[Expr], state: EvalState, position: SourcePos): EvalState =
     arguments match
       case Expr.Symbol(name, _) :: valueExpr :: Nil =>
-        bindRecursive(env, name)(recursiveEnv => evaluate(valueExpr, recursiveEnv))
+        evaluateValueDefine(name, valueExpr, state)
       case Expr.ListExpr(Expr.Symbol(name, _) :: parameters, _) :: body if body.nonEmpty =>
         val parameterNames = parameters.map(expectParameterName)
-        bindRecursive(env, name)(recursiveEnv => Value.Closure(parameterNames, body, recursiveEnv))
+        state.withEnv(
+          bindRecursive(state.env, name)(recursiveEnv => Value.Closure(parameterNames, body, recursiveEnv))
+        )
       case _ =>
         throw EvalError.at(position, "invalid define form")
+
+  private def evaluateValueDefine(name: String, valueExpr: Expr, state: EvalState): EvalState =
+    lazy val evaluated: (EvalState, Value) =
+      evaluate(valueExpr, state.withEnv(recursiveEnv))
+    lazy val recursiveEnv: Env =
+      state.env.define(name, evaluated._2)
+
+    val (nextState, _) = evaluated
+    nextState.withEnv(recursiveEnv)
 
   private def bindRecursive(env: Env, name: String)(build: Env => Value): Env =
     lazy val recursiveEnv: Env = env.define(name, build(recursiveEnv))
     recursiveEnv
 
-  private def evaluateBegin(arguments: List[Expr], env: Env): Value =
-    evaluateSequence(arguments, env)._2
+  private def evaluateBegin(arguments: List[Expr], state: EvalState): (EvalState, Value) =
+    withScopedEnv(state, state.env)(evaluateSequence(arguments, _))
 
-  private def evaluateIf(arguments: List[Expr], env: Env, position: SourcePos): Value =
+  private def evaluateIf(
+    arguments: List[Expr],
+    state: EvalState,
+    position: SourcePos
+  ): (EvalState, Value) =
     arguments match
       case condition :: thenBranch :: elseBranch :: Nil =>
-        if evaluate(condition, env).isTruthy then evaluate(thenBranch, env)
-        else evaluate(elseBranch, env)
+        val (nextState, conditionValue) = evaluate(condition, state)
+        if conditionValue.isTruthy then evaluate(thenBranch, nextState)
+        else evaluate(elseBranch, nextState)
       case _ =>
         throw EvalError.at(position, "'if' expects exactly 3 arguments")
 
@@ -104,47 +128,74 @@ object SchemeInterpreter:
       case _ =>
         throw EvalError.at(position, "invalid lambda form")
 
-  private def evaluateLet(arguments: List[Expr], env: Env, position: SourcePos): Value =
+  private def evaluateLet(
+    arguments: List[Expr],
+    state: EvalState,
+    position: SourcePos
+  ): (EvalState, Value) =
     arguments match
       case bindingsExpr :: body if body.nonEmpty =>
-        val bindings = readLetBindings(bindingsExpr, env, position)
-        evaluateBody(body, env.extend(bindings))
+        val (bindingState, bindings) = readLetBindings(bindingsExpr, state, position)
+        withScopedEnv(bindingState, state.env.extend(bindings))(evaluateBody(body, _))
       case _ =>
         throw EvalError.at(position, "invalid let form")
 
   private def readLetBindings(
     bindingsExpr: Expr,
-    env: Env,
+    state: EvalState,
     position: SourcePos
-  ): List[(String, Value)] = bindingsExpr match
+  ): (EvalState, List[(String, Value)]) = bindingsExpr match
     case Expr.ListExpr(bindings, _) =>
-      bindings.map(readLetBinding(_, env))
+      readLetBindingList(bindings, state, state.env)
     case _ =>
       throw EvalError.at(position, "let bindings must be a list")
 
-  private def readLetBinding(binding: Expr, env: Env): (String, Value) = binding match
+  private def readLetBindingList(
+    bindings: List[Expr],
+    state: EvalState,
+    baseEnv: Env
+  ): (EvalState, List[(String, Value)]) = bindings match
+    case Nil =>
+      (state, Nil)
+    case binding :: tail =>
+      val (nextState, entry)    = readLetBinding(binding, state, baseEnv)
+      val (finalState, entries) = readLetBindingList(tail, nextState, baseEnv)
+      (finalState, entry :: entries)
+
+  private def readLetBinding(
+    binding: Expr,
+    state: EvalState,
+    baseEnv: Env
+  ): (EvalState, (String, Value)) = binding match
     case Expr.ListExpr(Expr.Symbol(name, _) :: valueExpr :: Nil, _) =>
-      (name, evaluate(valueExpr, env))
+      val (nextState, value) = withScopedEnv(state, baseEnv)(evaluate(valueExpr, _))
+      (nextState, (name, value))
     case _ =>
       throw EvalError.at(binding.sourcePos, "invalid let binding")
 
-  private def evaluateCond(arguments: List[Expr], env: Env): Value = arguments match
+  private def evaluateCond(arguments: List[Expr], state: EvalState): (EvalState, Value) = arguments match
     case Nil =>
-      Value.Void
+      (state, Value.Void)
     case clause :: remaining =>
-      evaluateCondClause(clause, remaining, env)
+      evaluateCondClause(clause, remaining, state)
 
-  private def evaluateCondClause(clause: Expr, remaining: List[Expr], env: Env): Value = clause match
+  private def evaluateCondClause(
+    clause: Expr,
+    remaining: List[Expr],
+    state: EvalState
+  ): (EvalState, Value) = clause match
     case Expr.ListExpr(Nil, clausePosition) =>
       throw EvalError.at(clausePosition, "cond clause cannot be empty")
     case Expr.ListExpr(Expr.Symbol("else", clausePosition) :: body, _) =>
       if remaining.nonEmpty then throw EvalError.at(clausePosition, "else clause must be last")
       else if body.isEmpty then throw EvalError.at(clausePosition, "else clause must not be empty")
-      else evaluateBody(body, env)
+      else withScopedEnv(state, state.env)(evaluateBody(body, _))
     case Expr.ListExpr(test :: body, _) =>
-      val conditionValue = evaluate(test, env)
-      if conditionValue.isTruthy then if body.isEmpty then conditionValue else evaluateBody(body, env)
-      else evaluateCond(remaining, env)
+      val (nextState, conditionValue) = evaluate(test, state)
+      if conditionValue.isTruthy then
+        if body.isEmpty then (nextState, conditionValue)
+        else withScopedEnv(nextState, nextState.env)(evaluateBody(body, _))
+      else evaluateCond(remaining, nextState)
     case _ =>
       throw EvalError.at(clause.sourcePos, "cond clause must be a list")
 
@@ -169,52 +220,79 @@ object SchemeInterpreter:
         Value.Pair(quoteToValue(item), tail)
       }
 
-  private def applyProcedure(procedure: Value, arguments: List[Expr], env: Env, position: SourcePos): Value =
+  private def applyProcedure(
+    procedure: Value,
+    arguments: List[Expr],
+    state: EvalState,
+    position: SourcePos
+  ): (EvalState, Value) =
     procedure match
       case Value.Builtin(name) =>
-        applyBuiltin(name, evaluateArguments(arguments, env), position)
+        val (nextState, evaluatedArgs) = evaluateArguments(arguments, state)
+        applyBuiltin(name, evaluatedArgs, nextState, position)
       case Value.Closure(parameters, body, closureEnv) =>
-        val argumentValues = evaluateArguments(arguments, env).map(_.value)
+        val (nextState, evaluatedArgs) = evaluateArguments(arguments, state)
+        val argumentValues             = evaluatedArgs.map(_.value)
         if parameters.length != argumentValues.length then
           throw EvalError.at(
             position,
             s"wrong argument count: expected ${parameters.length}, got ${argumentValues.length}"
           )
-        else evaluateBody(body, closureEnv.extend(parameters.zip(argumentValues)))
+        else withScopedEnv(nextState, closureEnv.extend(parameters.zip(argumentValues)))(evaluateBody(body, _))
       case _ =>
         throw EvalError.at(position, "attempted to call a non-procedure")
 
-  private def evaluateBody(expressions: List[Expr], env: Env): Value = expressions match
+  private def evaluateBody(expressions: List[Expr], state: EvalState): (EvalState, Value) = expressions match
     case Nil =>
-      Value.Void
+      (state, Value.Void)
     case _ =>
-      evaluateSequence(expressions, env)._2
+      evaluateSequence(expressions, state)
 
   private def lookup(name: String, env: Env): Option[Value] =
     env.lookup(name).orElse(BuiltinProcedure.resolve(name))
 
-  private def applyBuiltin(name: String, arguments: List[EvaluatedArg], position: SourcePos): Value =
-    BuiltinProcedure(name, arguments, position)
+  private def applyBuiltin(
+    name: String,
+    arguments: List[EvaluatedArg],
+    state: EvalState,
+    position: SourcePos
+  ): (EvalState, Value) =
+    val result = BuiltinProcedure(name, arguments, position)
+    (state.appendOutput(result.output), result.value)
 
-  private def evaluateArguments(arguments: List[Expr], env: Env): List[EvaluatedArg] =
-    arguments.map(argument => EvaluatedArg(evaluate(argument, env), argument.sourcePos))
+  private def evaluateArguments(
+    arguments: List[Expr],
+    state: EvalState
+  ): (EvalState, List[EvaluatedArg]) = arguments match
+    case Nil =>
+      (state, Nil)
+    case argument :: remaining =>
+      val (nextState, value) = evaluate(argument, state)
+      val (finalState, rest) = evaluateArguments(remaining, nextState)
+      (finalState, EvaluatedArg(value, argument.sourcePos) :: rest)
 
-  private def evaluateAnd(arguments: List[Expr], env: Env): Value =
+  private def evaluateAnd(arguments: List[Expr], state: EvalState): (EvalState, Value) =
     arguments match
       case Nil =>
-        Value.Bool(true)
+        (state, Value.Bool(true))
       case argument :: Nil =>
-        evaluate(argument, env)
+        evaluate(argument, state)
       case argument :: rest =>
-        val value = evaluate(argument, env)
-        if value.isTruthy then evaluateAnd(rest, env) else value
+        val (nextState, value) = evaluate(argument, state)
+        if value.isTruthy then evaluateAnd(rest, nextState) else (nextState, value)
 
-  private def evaluateOr(arguments: List[Expr], env: Env): Value =
+  private def evaluateOr(arguments: List[Expr], state: EvalState): (EvalState, Value) =
     arguments match
       case Nil =>
-        Value.Bool(false)
+        (state, Value.Bool(false))
       case argument :: Nil =>
-        evaluate(argument, env)
+        evaluate(argument, state)
       case argument :: rest =>
-        val value = evaluate(argument, env)
-        if value.isTruthy then value else evaluateOr(rest, env)
+        val (nextState, value) = evaluate(argument, state)
+        if value.isTruthy then (nextState, value) else evaluateOr(rest, nextState)
+
+  private def withScopedEnv[A](state: EvalState, scopedEnv: Env)(
+    evaluateScope: EvalState => (EvalState, A)
+  ): (EvalState, A) =
+    val (scopedState, value) = evaluateScope(state.withEnv(scopedEnv))
+    (scopedState.withEnv(state.env), value)
