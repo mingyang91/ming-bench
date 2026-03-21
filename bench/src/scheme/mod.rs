@@ -501,6 +501,54 @@ fn eval(mut expr: Value, env: &Env, pos: Pos) -> Result<Value, EvalError> {
                             if elems.len() < 3 {
                                 return Err(runtime_err(current_pos, "let requires bindings and body"));
                             }
+                            // Named let: (let name ((var init) ...) body ...)
+                            if let Value::Symbol(loop_name) = &elems[1] {
+                                if elems.len() < 4 {
+                                    return Err(runtime_err(current_pos, "named let requires bindings and body"));
+                                }
+                                let loop_name = loop_name.clone();
+                                let bindings = match &elems[2] {
+                                    Value::List(bs) => bs,
+                                    _ => return Err(runtime_err(current_pos, "let: expected bindings list")),
+                                };
+                                let mut param_names = Vec::new();
+                                let mut init_vals = Vec::new();
+                                for b in bindings {
+                                    match b {
+                                        Value::List(pair) if pair.len() == 2 => {
+                                            let pname = match &pair[0] {
+                                                Value::Symbol(s) => s.clone(),
+                                                _ => return Err(runtime_err(current_pos, "let: expected symbol")),
+                                            };
+                                            let val = eval(pair[1].clone(), &current_env, current_pos)?;
+                                            param_names.push(pname);
+                                            init_vals.push(val);
+                                        }
+                                        _ => return Err(runtime_err(current_pos, "let: invalid binding")),
+                                    }
+                                }
+                                let body = elems[3..].to_vec();
+                                let let_env = new_env(Some(current_env.clone()));
+                                // Bind the loop name to a lambda
+                                let lambda = Value::Lambda {
+                                    params: param_names.clone(),
+                                    rest_param: None,
+                                    body: body.clone(),
+                                    env: let_env.clone(),
+                                };
+                                env_set(&let_env, loop_name, lambda);
+                                // Bind initial values
+                                for (pname, val) in param_names.iter().zip(init_vals.iter()) {
+                                    env_set(&let_env, pname.clone(), val.clone());
+                                }
+                                // Eval body with TCO
+                                for e in &body[..body.len().saturating_sub(1)] {
+                                    eval(e.clone(), &let_env, current_pos)?;
+                                }
+                                expr = body.last().cloned().unwrap_or(Value::Boolean(false));
+                                current_env = let_env;
+                                continue;
+                            }
                             let bindings = match &elems[1] {
                                 Value::List(bs) => bs,
                                 _ => {
