@@ -89,18 +89,34 @@ object Evaluator:
   private[ming] def evalBodyTail(
     exprs: List[Value],
     env: Env,
-    out: String
+    out: String,
+    replayMode: Boolean = false
   ): EvalResult =
     exprs match
-      case Nil         => Done(Value.VoidVal, env, out)
-      case last :: Nil => Bounce(last, env, out)
+      case Nil => Done(Value.VoidVal, env, out)
+      case last :: Nil =>
+        if replayMode && Continuations.isCallCCForm(last) then
+          val (v, e, o) =
+            Continuations.evalBodyCallCC(last, Nil, env, out, replayMode)
+          Done(v, e, o)
+        else Bounce(last, env, out)
       case head :: tail =>
-        val (_, newEnv, out2) = eval(head, env, out)
+        val headResult = head match
+          case _ if Continuations.isCallCCForm(head) =>
+            Continuations.evalBodyCallCC(head, tail, env, out, replayMode)
+          case _ =>
+            try eval(head, env, out)
+            catch
+              case ci: ContinuationInvoked if ci.bodyLevel =>
+                val cEnv = ci.envThunk()
+                cEnv.set("__callcc_replay__", Value.PairVal(ci.value, Value.NilVal), None)
+                eval(ci.remaining.head, cEnv, ci.capturedOut)
+        val (_, newEnv, out2) = headResult
         val nextEnv = head match
           case Value.PairVal(Value.Symbol("define", _), _, _)        => newEnv
           case Value.PairVal(Value.Symbol("define-syntax", _), _, _) => newEnv
           case _                                                     => env
-        evalBodyTail(tail, nextEnv, out2)
+        evalBodyTail(tail, nextEnv, out2, replayMode)
 
   /** Trampoline: evaluate expr, looping on Bounce until Done. */
   @tailrec
@@ -167,7 +183,7 @@ object Evaluator:
       case Value.Symbol("call/cc" | "call-with-current-continuation", _) =>
         Continuations.handleCallCCForm(args, env, out)
       case Value.Symbol("define-syntax", _) =>
-        handleDefineSyntax(args, env, pos, out)
+        Continuations.handleDefineSyntax(args, env, pos, out)
       case _ =>
         val (proc, _, out2) = eval(op, env, out)
         proc match
@@ -225,7 +241,8 @@ object Evaluator:
           out,
           cv.remaining,
           cv.envThunk,
-          cv.capturedOut
+          cv.capturedOut,
+          cv.bodyLevel
         )
       case Value.Symbol("call/cc" | "call-with-current-continuation", _) =>
         if args.length != 1 then throw EvalError.withPos("call/cc requires 1 argument", pos)
@@ -253,22 +270,6 @@ object Evaluator:
     val lastArg    = args.last
     val listArgs   = toList(lastArg)
     applyProcTail(proc, prefixArgs ++ listArgs, pos, out)
-
-  private def handleDefineSyntax(
-    args: List[Value],
-    env: Env,
-    pos: Option[(Int, Int)],
-    out: String
-  ): EvalResult =
-    args match
-      case Value.Symbol(name, _) :: transformer :: Nil =>
-        val parsed = Macros.parseSyntaxRules(transformer, env)
-        lazy val selfMacro: Value.MacroVal =
-          Value.MacroVal(parsed.rules, parsed.literals, () => selfEnv)
-        lazy val selfEnv: Env = env.define(name, selfMacro)
-        Done(Value.VoidVal, selfEnv, out)
-      case _ =>
-        throw EvalError.withPos("bad define-syntax", pos)
 
   private[ming] def isFalsy(v: Value): Boolean = v match
     case Value.BoolVal(false) => true

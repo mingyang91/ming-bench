@@ -155,7 +155,7 @@ object Macros:
         val gs = gensym(name)
         safeLookup(defEnv, name) match
           case Some(v) => (gm + (name -> gs), eb + (gs -> v))
-          case None    => (gm + (name -> gs), eb)
+          case None    => (gm, eb)
     }
     (subst(tmpl, binds, gsMap), envBinds)
 

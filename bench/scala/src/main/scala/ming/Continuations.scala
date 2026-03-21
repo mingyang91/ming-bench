@@ -46,4 +46,80 @@ object Continuations:
   ): (Value, Env, String) =
     val env = ci.envThunk()
     env.set("__callcc_replay__", Value.PairVal(ci.value, Value.NilVal), None)
-    Evaluator.evalAll(ci.remaining, env, ci.capturedOut)
+    if ci.bodyLevel then
+      Evaluator.evalBodyTail(ci.remaining, env, ci.capturedOut, replayMode = true) match
+        case Done(v, e, o)       => (v, e, o)
+        case Bounce(e2, env2, o) => Evaluator.eval(e2, env2, o)
+    else Evaluator.evalAll(ci.remaining, env, ci.capturedOut)
+
+  /** Check if an expression is a call/cc form. */
+  private[ming] def isCallCCForm(v: Value): Boolean = v match
+    case Value.PairVal(
+          Value.Symbol("call/cc" | "call-with-current-continuation", _),
+          _,
+          _
+        ) =>
+      true
+    case _ => false
+
+  /** Handle call/cc directly in a body.
+    *
+    * In replayMode, skips fresh call/cc (returns void).
+    */
+  private[ming] def evalBodyCallCC(
+    head: Value,
+    tail: List[Value],
+    env: Env,
+    out: String,
+    replayMode: Boolean = false
+  ): (Value, Env, String) =
+    try
+      env.lookup("__callcc_replay__") match
+        case Value.PairVal(v, _, _) =>
+          env.set("__callcc_replay__", Value.NilVal, None)
+          (v, env, out)
+        case _ =>
+          if replayMode then (Value.VoidVal, env, out)
+          else freshBodyCallCC(head, tail, env, out)
+    catch
+      case _: EvalError =>
+        if replayMode then (Value.VoidVal, env, out)
+        else freshBodyCallCC(head, tail, env, out)
+
+  private def freshBodyCallCC(
+    head: Value,
+    tail: List[Value],
+    env: Env,
+    out: String
+  ): (Value, Env, String) =
+    val args = Evaluator.toList(head).tail
+    if args.length != 1 then throw new EvalError("call/cc requires 1 argument")
+    val (proc, _, out2) = Evaluator.eval(args.head, env, out)
+    val tag             = new Object()
+    val remaining       = head :: tail
+    val cont =
+      Value.ContinuationVal(tag, remaining, () => env, out, bodyLevel = true)
+    val callccResult: Value =
+      try
+        Evaluator.applyProcTail(proc, List(cont), None, out2) match
+          case Done(v, _, _)       => v
+          case Bounce(e2, env2, o) => Evaluator.eval(e2, env2, o)._1
+      catch case ci: ContinuationInvoked if ci.tag eq tag => ci.value
+    (callccResult, env, out2)
+
+  /** Handle define-syntax form. */
+  private[ming] def handleDefineSyntax(
+    args: List[Value],
+    env: Env,
+    pos: Option[(Int, Int)],
+    out: String
+  ): EvalResult =
+    args match
+      case Value.Symbol(name, _) :: transformer :: Nil =>
+        val parsed = Macros.parseSyntaxRules(transformer, env)
+        lazy val selfMacro: Value.MacroVal =
+          Value.MacroVal(parsed.rules, parsed.literals, () => selfEnv)
+        lazy val selfEnv: Env = env.define(name, selfMacro)
+        Done(Value.VoidVal, selfEnv, out)
+      case _ =>
+        throw EvalError.withPos("bad define-syntax", pos)

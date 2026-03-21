@@ -22,5 +22,6 @@ class ContinuationInvoked(
   val output: String,
   val remaining: List[Value],
   val envThunk: () => Env,
-  val capturedOut: String
+  val capturedOut: String,
+  val bodyLevel: Boolean = false
 ) extends RuntimeException(null, null, true, false)

@@ -24,7 +24,8 @@ enum Value:
     tag: AnyRef,
     remaining: List[Value],
     envThunk: () => Env,
-    capturedOut: String
+    capturedOut: String,
+    bodyLevel: Boolean = false
   )
 
   case MacroVal(
