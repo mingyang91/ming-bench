@@ -9,20 +9,301 @@ use crate::scheme::value::Value;
 pub type Output = Rc<RefCell<String>>;
 
 /// Evaluate a single parsed expression in the given environment.
+/// Uses a trampoline loop for tail call optimization.
 pub fn eval(expr: &Value, env: &Rc<RefCell<Env>>, out: &Output) -> Result<Value, EvalError> {
-    match expr {
-        Value::Integer(_) | Value::Boolean(_) | Value::Str(_) | Value::Char(_) | Value::Void => {
-            Ok(expr.clone())
+    let mut current_expr = expr.clone();
+    let mut current_env = Rc::clone(env);
+
+    loop {
+        match &current_expr {
+            Value::Integer(_) | Value::Boolean(_) | Value::Str(_) | Value::Char(_)
+            | Value::Void => return Ok(current_expr),
+            Value::Lambda { .. } => return Ok(current_expr),
+            Value::Symbol(name) => {
+                return current_env
+                    .borrow()
+                    .get(name)
+                    .ok_or_else(|| EvalError::UnboundVariable {
+                        name: name.clone(),
+                    })
+            }
+            Value::List(items) => match eval_list_tail(items, &current_env, out)? {
+                TailAction::Return(val) => return Ok(val),
+                TailAction::TailEval(expr, env) => {
+                    current_expr = expr;
+                    current_env = env;
+                    continue;
+                }
+            },
         }
-        Value::Lambda { .. } => Ok(expr.clone()),
-        Value::Symbol(name) => env
-            .borrow()
-            .get(name)
-            .ok_or_else(|| EvalError::UnboundVariable {
-                name: name.clone(),
-            }),
-        Value::List(items) => eval_list(items, env, out),
     }
+}
+
+/// Evaluate a list form, returning a tail action for the trampoline.
+fn eval_list_tail(
+    items: &[Value],
+    env: &Rc<RefCell<Env>>,
+    out: &Output,
+) -> Result<TailAction, EvalError> {
+    if items.is_empty() {
+        return Ok(TailAction::Return(Value::List(vec![])));
+    }
+
+    if let Value::Symbol(name) = &items[0] {
+        match name.as_str() {
+            "define" => return eval_define(&items[1..], env, out).map(TailAction::Return),
+            "quote" => return eval_quote(&items[1..]).map(TailAction::Return),
+            "lambda" => return eval_lambda(&items[1..], env).map(TailAction::Return),
+            "string-set!" => return Err(EvalError::ImmutableString),
+            "if" => return eval_if_tail(&items[1..], env, out),
+            "begin" => return eval_body_tail(&items[1..], env, out),
+            "cond" => return eval_cond_tail(&items[1..], env, out),
+            "and" => return eval_and_tail(&items[1..], env, out),
+            "or" => return eval_or_tail(&items[1..], env, out),
+            "let" => return eval_let_tail(&items[1..], env, out),
+            s if is_builtin(s) => {
+                return eval_builtin(s, &items[1..], env, out).map(TailAction::Return)
+            }
+            _ => {}
+        }
+    }
+
+    eval_application_tail(items, env, out)
+}
+
+/// Evaluate an `if` form, returning a tail action.
+fn eval_if_tail(
+    args: &[Value],
+    env: &Rc<RefCell<Env>>,
+    out: &Output,
+) -> Result<TailAction, EvalError> {
+    let (cond, then, els) = match args {
+        [c, t, e] => (c, t, Some(e)),
+        [c, t] => (c, t, None),
+        _ => {
+            return Err(EvalError::Parse {
+                message: "if: expected 2 or 3 arguments".into(),
+            })
+        }
+    };
+    let cond_val = eval(cond, env, out)?;
+    if cond_val != Value::Boolean(false) {
+        Ok(TailAction::TailEval(then.clone(), Rc::clone(env)))
+    } else {
+        match els {
+            Some(e) => Ok(TailAction::TailEval(e.clone(), Rc::clone(env))),
+            None => Ok(TailAction::Return(Value::Void)),
+        }
+    }
+}
+
+/// Evaluate `and` form, returning a tail action for the last expression.
+fn eval_and_tail(
+    args: &[Value],
+    env: &Rc<RefCell<Env>>,
+    out: &Output,
+) -> Result<TailAction, EvalError> {
+    if args.is_empty() {
+        return Ok(TailAction::Return(Value::Boolean(true)));
+    }
+    let (last, rest) = args.split_last().expect("non-empty");
+    for arg in rest {
+        let val = eval(arg, env, out)?;
+        if val == Value::Boolean(false) {
+            return Ok(TailAction::Return(Value::Boolean(false)));
+        }
+    }
+    Ok(TailAction::TailEval(last.clone(), Rc::clone(env)))
+}
+
+/// Evaluate `or` form, returning a tail action for the last expression.
+fn eval_or_tail(
+    args: &[Value],
+    env: &Rc<RefCell<Env>>,
+    out: &Output,
+) -> Result<TailAction, EvalError> {
+    if args.is_empty() {
+        return Ok(TailAction::Return(Value::Boolean(false)));
+    }
+    let (last, rest) = args.split_last().expect("non-empty");
+    for arg in rest {
+        let val = eval(arg, env, out)?;
+        if val != Value::Boolean(false) {
+            return Ok(TailAction::Return(val));
+        }
+    }
+    Ok(TailAction::TailEval(last.clone(), Rc::clone(env)))
+}
+
+/// Evaluate a function application, returning a tail action for lambda calls.
+fn eval_application_tail(
+    items: &[Value],
+    env: &Rc<RefCell<Env>>,
+    out: &Output,
+) -> Result<TailAction, EvalError> {
+    let proc = eval(&items[0], env, out)?;
+    let args: Vec<Value> = items[1..]
+        .iter()
+        .map(|a| eval(a, env, out))
+        .collect::<Result<_, _>>()?;
+
+    let Value::Lambda {
+        params,
+        body,
+        closure,
+    } = proc
+    else {
+        return Err(EvalError::TypeError {
+            expected: "procedure".into(),
+            got: format!("{proc}"),
+        });
+    };
+
+    if args.len() != params.len() {
+        return Err(EvalError::WrongArgCount {
+            expected: params.len(),
+            got: args.len(),
+        });
+    }
+    let child = Env::extend(&closure);
+    for (param, val) in params.iter().zip(args) {
+        child.borrow_mut().define(param.clone(), val);
+    }
+    eval_body_tail(&body, &child, out)
+}
+
+/// Result of evaluating a form that may produce a tail call.
+enum TailAction {
+    Return(Value),
+    TailEval(Value, Rc<RefCell<Env>>),
+}
+
+/// Evaluate cond clauses, returning a tail action for the matching clause's last expr.
+fn eval_cond_tail(
+    clauses: &[Value],
+    env: &Rc<RefCell<Env>>,
+    out: &Output,
+) -> Result<TailAction, EvalError> {
+    for clause in clauses {
+        let Value::List(parts) = clause else {
+            return Err(EvalError::Parse {
+                message: "cond: expected clause".into(),
+            });
+        };
+        if parts.is_empty() {
+            return Err(EvalError::Parse {
+                message: "cond: empty clause".into(),
+            });
+        }
+        if matches!(&parts[0], Value::Symbol(s) if s == "else") {
+            return eval_body_tail(&parts[1..], env, out);
+        }
+        let test_val = eval(&parts[0], env, out)?;
+        if test_val != Value::Boolean(false) {
+            return eval_body_tail(&parts[1..], env, out);
+        }
+    }
+    Ok(TailAction::Return(Value::Void))
+}
+
+/// Evaluate a body sequence, returning a tail action for the last expression.
+fn eval_body_tail(
+    body: &[Value],
+    env: &Rc<RefCell<Env>>,
+    out: &Output,
+) -> Result<TailAction, EvalError> {
+    match body.split_last() {
+        None => Ok(TailAction::Return(Value::Void)),
+        Some((last, rest)) => {
+            for expr in rest {
+                eval(expr, env, out)?;
+            }
+            Ok(TailAction::TailEval(last.clone(), Rc::clone(env)))
+        }
+    }
+}
+
+/// Parse a single let binding `(name expr)` into its param name and init expression.
+fn parse_let_binding(binding: &Value) -> Result<(&str, &Value), EvalError> {
+    let Value::List(pair) = binding else {
+        return Err(EvalError::Parse {
+            message: "let: expected binding pair".into(),
+        });
+    };
+    let [Value::Symbol(param), init_expr] = pair.as_slice() else {
+        return Err(EvalError::Parse {
+            message: "let: expected (name expr)".into(),
+        });
+    };
+    Ok((param.as_str(), init_expr))
+}
+
+/// Evaluate let (regular or named), returning a tail action for the body's last expr.
+fn eval_let_tail(
+    args: &[Value],
+    env: &Rc<RefCell<Env>>,
+    out: &Output,
+) -> Result<TailAction, EvalError> {
+    if args.len() < 2 {
+        return Err(EvalError::Parse {
+            message: "let: expected bindings and body".into(),
+        });
+    }
+
+    if let Value::Symbol(name) = &args[0] {
+        return eval_named_let_tail(name, &args[1..], env, out);
+    }
+
+    let Value::List(bindings) = &args[0] else {
+        return Err(EvalError::Parse {
+            message: "let: expected binding list".into(),
+        });
+    };
+    let child = Env::extend(env);
+    for binding in bindings {
+        let (name, expr) = parse_let_binding(binding)?;
+        let val = eval(expr, env, out)?;
+        child.borrow_mut().define(name.to_string(), val);
+    }
+    eval_body_tail(&args[1..], &child, out)
+}
+
+/// Evaluate named let: `(let name ((var init) ...) body ...)`
+fn eval_named_let_tail(
+    name: &str,
+    args: &[Value],
+    env: &Rc<RefCell<Env>>,
+    out: &Output,
+) -> Result<TailAction, EvalError> {
+    if args.len() < 2 {
+        return Err(EvalError::Parse {
+            message: "named let: expected bindings and body".into(),
+        });
+    }
+    let Value::List(bindings) = &args[0] else {
+        return Err(EvalError::Parse {
+            message: "named let: expected binding list".into(),
+        });
+    };
+    let mut params = Vec::new();
+    let mut init_vals = Vec::new();
+    for binding in bindings {
+        let (param, init_expr) = parse_let_binding(binding)?;
+        params.push(param.to_string());
+        init_vals.push(eval(init_expr, env, out)?);
+    }
+    let body = args[1..].to_vec();
+    let child = Env::extend(env);
+    let lambda = Value::Lambda {
+        params: params.clone(),
+        body,
+        closure: Rc::clone(&child),
+    };
+    child.borrow_mut().define(name.to_string(), lambda);
+    for (param, val) in params.iter().zip(init_vals) {
+        child.borrow_mut().define(param.clone(), val);
+    }
+    eval_body_tail(&args[1..], &child, out)
 }
 
 fn is_builtin(name: &str) -> bool {
@@ -45,33 +326,7 @@ fn is_builtin(name: &str) -> bool {
     )
 }
 
-fn eval_list(items: &[Value], env: &Rc<RefCell<Env>>, out: &Output) -> Result<Value, EvalError> {
-    if items.is_empty() {
-        return Ok(Value::List(vec![]));
-    }
-
-    if let Value::Symbol(name) = &items[0] {
-        match name.as_str() {
-            "define" => return eval_define(&items[1..], env, out),
-            "if" => return eval_if(&items[1..], env, out),
-            "quote" => return eval_quote(&items[1..]),
-            "lambda" => return eval_lambda(&items[1..], env),
-            "let" => return eval_let(&items[1..], env, out),
-            "begin" => return eval_body(&items[1..], env, out),
-            "cond" => return eval_cond(&items[1..], env, out),
-            "and" => return eval_and(&items[1..], env, out),
-            "or" => return eval_or(&items[1..], env, out),
-            "string-set!" => return Err(EvalError::ImmutableString),
-            s if is_builtin(s) => return eval_builtin(s, &items[1..], env, out),
-            _ => {}
-        }
-    }
-
-    let proc = eval(&items[0], env, out)?;
-    let args = &items[1..];
-    call_proc(&proc, args, env, out)
-}
-
+/// Non-tail call into a procedure (used by map and similar).
 fn call_proc(
     proc: &Value,
     args: &[Value],
@@ -210,27 +465,6 @@ fn eval_define(
     }
 }
 
-fn eval_if(args: &[Value], env: &Rc<RefCell<Env>>, out: &Output) -> Result<Value, EvalError> {
-    let (cond, then, els) = match args {
-        [c, t, e] => (c, t, Some(e)),
-        [c, t] => (c, t, None),
-        _ => {
-            return Err(EvalError::Parse {
-                message: "if: expected 2 or 3 arguments".into(),
-            })
-        }
-    };
-    let cond_val = eval(cond, env, out)?;
-    if cond_val != Value::Boolean(false) {
-        eval(then, env, out)
-    } else {
-        match els {
-            Some(e) => eval(e, env, out),
-            None => Ok(Value::Void),
-        }
-    }
-}
-
 fn eval_quote(args: &[Value]) -> Result<Value, EvalError> {
     let [datum] = args else {
         return Err(EvalError::Parse {
@@ -265,28 +499,6 @@ fn eval_lambda(args: &[Value], env: &Rc<RefCell<Env>>) -> Result<Value, EvalErro
         body: args[1..].to_vec(),
         closure: Rc::clone(env),
     })
-}
-
-fn eval_and(args: &[Value], env: &Rc<RefCell<Env>>, out: &Output) -> Result<Value, EvalError> {
-    let mut result = Value::Boolean(true);
-    for arg in args {
-        result = eval(arg, env, out)?;
-        if result == Value::Boolean(false) {
-            return Ok(Value::Boolean(false));
-        }
-    }
-    Ok(result)
-}
-
-fn eval_or(args: &[Value], env: &Rc<RefCell<Env>>, out: &Output) -> Result<Value, EvalError> {
-    let mut result = Value::Boolean(false);
-    for arg in args {
-        result = eval(arg, env, out)?;
-        if result != Value::Boolean(false) {
-            return Ok(result);
-        }
-    }
-    Ok(result)
 }
 
 fn eval_not(args: &[Value], env: &Rc<RefCell<Env>>, out: &Output) -> Result<Value, EvalError> {
@@ -490,66 +702,6 @@ fn eval_type_pred(
     };
     let val = eval(arg, env, out)?;
     Ok(Value::Boolean(pred(&val)))
-}
-
-fn eval_let(
-    args: &[Value],
-    env: &Rc<RefCell<Env>>,
-    out: &Output,
-) -> Result<Value, EvalError> {
-    if args.len() < 2 {
-        return Err(EvalError::Parse {
-            message: "let: expected bindings and body".into(),
-        });
-    }
-    let Value::List(bindings) = &args[0] else {
-        return Err(EvalError::Parse {
-            message: "let: expected binding list".into(),
-        });
-    };
-    let child = Env::extend(env);
-    for binding in bindings {
-        let Value::List(pair) = binding else {
-            return Err(EvalError::Parse {
-                message: "let: expected binding pair".into(),
-            });
-        };
-        let [Value::Symbol(name), expr] = pair.as_slice() else {
-            return Err(EvalError::Parse {
-                message: "let: expected (name expr)".into(),
-            });
-        };
-        let val = eval(expr, env, out)?;
-        child.borrow_mut().define(name.clone(), val);
-    }
-    eval_body(&args[1..], &child, out)
-}
-
-fn eval_cond(
-    clauses: &[Value],
-    env: &Rc<RefCell<Env>>,
-    out: &Output,
-) -> Result<Value, EvalError> {
-    for clause in clauses {
-        let Value::List(parts) = clause else {
-            return Err(EvalError::Parse {
-                message: "cond: expected clause".into(),
-            });
-        };
-        if parts.is_empty() {
-            return Err(EvalError::Parse {
-                message: "cond: empty clause".into(),
-            });
-        }
-        if matches!(&parts[0], Value::Symbol(s) if s == "else") {
-            return eval_body(&parts[1..], env, out);
-        }
-        let test_val = eval(&parts[0], env, out)?;
-        if test_val != Value::Boolean(false) {
-            return eval_body(&parts[1..], env, out);
-        }
-    }
-    Ok(Value::Void)
 }
 
 // --- L05: Output builtins ---
