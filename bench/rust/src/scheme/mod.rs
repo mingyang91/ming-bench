@@ -67,6 +67,7 @@ enum TokenKind {
     Quote,
     Bool(bool),
     Number(i64),
+    Char(char),
     String(String),
     Symbol(String),
 }
@@ -87,16 +88,19 @@ impl Expr {
 enum ExprKind {
     Bool(bool),
     Number(i64),
+    Char(char),
     String(String),
     Symbol(String),
     List(Vec<Expr>),
 }
 
+type StringRef = Rc<RefCell<String>>;
+
 #[derive(Debug, Clone)]
 enum Value {
     Bool(bool),
     Number(i64),
-    String(String),
+    String(StringRef),
     Char(char),
     Symbol(String),
     List(Vec<Value>),
@@ -106,6 +110,10 @@ enum Value {
 }
 
 impl Value {
+    fn string(value: impl Into<String>) -> Self {
+        Self::String(Rc::new(RefCell::new(value.into())))
+    }
+
     fn is_truthy(&self) -> bool {
         !matches!(self, Self::Bool(false))
     }
@@ -133,8 +141,11 @@ impl Value {
             Self::Bool(false) => "#f".to_string(),
             Self::Number(value) => value.to_string(),
             Self::String(value) => match mode {
-                RenderMode::Display => value.clone(),
-                RenderMode::Write => format!("\"{}\"", escape_string(value)),
+                RenderMode::Display => value.borrow().clone(),
+                RenderMode::Write => {
+                    let value = value.borrow();
+                    format!("\"{}\"", escape_string(value.as_str()))
+                }
             },
             Self::Char(ch) => match mode {
                 RenderMode::Display => ch.to_string(),
@@ -189,6 +200,8 @@ enum Builtin {
     Newline,
     StringAppend,
     StringLength,
+    StringCopy,
+    StringSet,
     Substring,
     StringToNumber,
     NumberToString,
@@ -204,7 +217,7 @@ enum Builtin {
 }
 
 impl Builtin {
-    const ALL: [Self; 32] = [
+    const ALL: [Self; 34] = [
         Self::Add,
         Self::Sub,
         Self::Mul,
@@ -225,6 +238,8 @@ impl Builtin {
         Self::Newline,
         Self::StringAppend,
         Self::StringLength,
+        Self::StringCopy,
+        Self::StringSet,
         Self::Substring,
         Self::StringToNumber,
         Self::NumberToString,
@@ -261,6 +276,8 @@ impl Builtin {
             Self::Newline => "newline",
             Self::StringAppend => "string-append",
             Self::StringLength => "string-length",
+            Self::StringCopy => "string-copy",
+            Self::StringSet => "string-set!",
             Self::Substring => "substring",
             Self::StringToNumber => "string->number",
             Self::NumberToString => "number->string",
@@ -345,7 +362,8 @@ fn eval_expr(expr: &Expr, env: EnvRef, ctx: &mut EvalContext) -> Result<Value, E
     match &expr.kind {
         ExprKind::Bool(value) => Ok(Value::Bool(*value)),
         ExprKind::Number(value) => Ok(Value::Number(*value)),
-        ExprKind::String(value) => Ok(Value::String(value.clone())),
+        ExprKind::Char(value) => Ok(Value::Char(*value)),
+        ExprKind::String(value) => Ok(Value::string(value.clone())),
         ExprKind::Symbol(name) => Env::lookup(&env, name)
             .ok_or_else(|| EvalError::UnboundSymbol(name.clone()).with_position(expr.pos)),
         ExprKind::List(items) => {
@@ -494,7 +512,8 @@ fn quote_expr(expr: &Expr) -> Value {
     match &expr.kind {
         ExprKind::Bool(value) => Value::Bool(*value),
         ExprKind::Number(value) => Value::Number(*value),
-        ExprKind::String(value) => Value::String(value.clone()),
+        ExprKind::Char(value) => Value::Char(*value),
+        ExprKind::String(value) => Value::string(value.clone()),
         ExprKind::Symbol(value) => Value::Symbol(value.clone()),
         ExprKind::List(items) => Value::List(items.iter().map(quote_expr).collect()),
     }
@@ -784,9 +803,10 @@ fn apply_builtin(
         Builtin::StringAppend => {
             let mut result = String::new();
             for arg in args {
-                result.push_str(expect_string_value(name, arg)?);
+                let string = expect_string_value(name, arg)?;
+                result.push_str(string.borrow().as_str());
             }
-            Ok(Value::String(result))
+            Ok(Value::string(result))
         }
         Builtin::StringLength => {
             if args.len() != 1 {
@@ -794,9 +814,48 @@ fn apply_builtin(
             }
 
             let string = expect_string_value(name, &args[0])?;
-            let length =
-                i64::try_from(string.chars().count()).map_err(|_| EvalError::IntegerOverflow)?;
+            let length = i64::try_from(string.borrow().chars().count())
+                .map_err(|_| EvalError::IntegerOverflow)?;
             Ok(Value::Number(length))
+        }
+        Builtin::StringCopy => {
+            if args.len() != 1 {
+                return Err(wrong_arg_count(name, "exactly 1", args.len()));
+            }
+
+            let string = expect_string_value(name, &args[0])?;
+            let copied = string.borrow().clone();
+            Ok(Value::string(copied))
+        }
+        Builtin::StringSet => {
+            if args.len() != 3 {
+                return Err(wrong_arg_count(name, "exactly 3", args.len()));
+            }
+
+            let string = expect_string_value(name, &args[0])?;
+            let index = expect_number_value(name, &args[1])?;
+            let ch = expect_char_value(name, &args[2])?;
+            let mut chars = {
+                let value = string.borrow();
+                value.chars().collect::<Vec<_>>()
+            };
+            let len = chars.len();
+
+            if index < 0 {
+                return Err(EvalError::IndexOutOfBounds { index, len });
+            }
+
+            let index = usize::try_from(index).map_err(|_| EvalError::IntegerOverflow)?;
+            if index >= len {
+                return Err(EvalError::IndexOutOfBounds {
+                    index: i64::try_from(index).map_err(|_| EvalError::IntegerOverflow)?,
+                    len,
+                });
+            }
+
+            chars[index] = ch;
+            *string.borrow_mut() = chars.into_iter().collect();
+            Ok(Value::Void)
         }
         Builtin::Substring => {
             if args.len() != 3 {
@@ -806,7 +865,8 @@ fn apply_builtin(
             let string = expect_string_value(name, &args[0])?;
             let start = expect_number_value(name, &args[1])?;
             let end = expect_number_value(name, &args[2])?;
-            let len = string.chars().count();
+            let value = string.borrow();
+            let len = value.chars().count();
             let len_i64 = i64::try_from(len).map_err(|_| EvalError::IntegerOverflow)?;
 
             if start < 0 || end < start || end > len_i64 {
@@ -814,12 +874,9 @@ fn apply_builtin(
             }
 
             let start = usize::try_from(start).map_err(|_| EvalError::IntegerOverflow)?;
-            let count = usize::try_from(
-                end - i64::try_from(start).map_err(|_| EvalError::IntegerOverflow)?,
-            )
-            .map_err(|_| EvalError::IntegerOverflow)?;
-            let result = string.chars().skip(start).take(count).collect();
-            Ok(Value::String(result))
+            let end = usize::try_from(end).map_err(|_| EvalError::IntegerOverflow)?;
+            let result: String = value.chars().skip(start).take(end - start).collect();
+            Ok(Value::string(result))
         }
         Builtin::StringToNumber => {
             if args.len() != 1 {
@@ -827,7 +884,8 @@ fn apply_builtin(
             }
 
             let string = expect_string_value(name, &args[0])?;
-            match string.parse::<i64>() {
+            let value = string.borrow().clone();
+            match value.parse::<i64>() {
                 Ok(value) => Ok(Value::Number(value)),
                 Err(_) => Ok(Value::Bool(false)),
             }
@@ -838,7 +896,7 @@ fn apply_builtin(
             }
 
             let number = expect_number_value(name, &args[0])?;
-            Ok(Value::String(number.to_string()))
+            Ok(Value::string(number.to_string()))
         }
         Builtin::SymbolToString => {
             if args.len() != 1 {
@@ -846,7 +904,7 @@ fn apply_builtin(
             }
 
             let symbol = expect_symbol_value(name, &args[0])?;
-            Ok(Value::String(symbol.to_string()))
+            Ok(Value::string(symbol.to_string()))
         }
         Builtin::StringToSymbol => {
             if args.len() != 1 {
@@ -854,7 +912,8 @@ fn apply_builtin(
             }
 
             let string = expect_string_value(name, &args[0])?;
-            Ok(Value::Symbol(string.to_string()))
+            let symbol = string.borrow().clone();
+            Ok(Value::Symbol(symbol))
         }
         Builtin::StringRef => {
             if args.len() != 2 {
@@ -863,14 +922,15 @@ fn apply_builtin(
 
             let string = expect_string_value(name, &args[0])?;
             let index = expect_number_value(name, &args[1])?;
-            let len = string.chars().count();
+            let value = string.borrow();
+            let len = value.chars().count();
 
             if index < 0 {
                 return Err(EvalError::IndexOutOfBounds { index, len });
             }
 
             let index = usize::try_from(index).map_err(|_| EvalError::IntegerOverflow)?;
-            let ch = string
+            let ch = value
                 .chars()
                 .nth(index)
                 .ok_or(EvalError::IndexOutOfBounds {
@@ -952,11 +1012,21 @@ fn expect_number_value(name: &str, value: &Value) -> Result<i64, EvalError> {
     }
 }
 
-fn expect_string_value<'a>(name: &str, value: &'a Value) -> Result<&'a str, EvalError> {
+fn expect_string_value(name: &str, value: &Value) -> Result<StringRef, EvalError> {
     match value {
-        Value::String(string) => Ok(string),
+        Value::String(string) => Ok(string.clone()),
         other => Err(EvalError::TypeMismatch {
             expected: format!("string for {name}"),
+            found: other.type_name().to_string(),
+        }),
+    }
+}
+
+fn expect_char_value(name: &str, value: &Value) -> Result<char, EvalError> {
+    match value {
+        Value::Char(ch) => Ok(*ch),
+        other => Err(EvalError::TypeMismatch {
+            expected: format!("char for {name}"),
             found: other.type_name().to_string(),
         }),
     }
@@ -1146,10 +1216,30 @@ fn parse_atom(atom: &str) -> TokenKind {
     match atom {
         "#t" => TokenKind::Bool(true),
         "#f" => TokenKind::Bool(false),
-        _ => match atom.parse::<i64>() {
-            Ok(value) => TokenKind::Number(value),
-            Err(_) => TokenKind::Symbol(atom.to_string()),
+        _ => match parse_char_literal(atom) {
+            Some(value) => TokenKind::Char(value),
+            None => match atom.parse::<i64>() {
+                Ok(value) => TokenKind::Number(value),
+                Err(_) => TokenKind::Symbol(atom.to_string()),
+            },
         },
+    }
+}
+
+fn parse_char_literal(atom: &str) -> Option<char> {
+    let literal = atom.strip_prefix("#\\")?;
+    match literal {
+        "space" => Some(' '),
+        "newline" => Some('\n'),
+        _ => {
+            let mut chars = literal.chars();
+            let ch = chars.next()?;
+            if chars.next().is_none() {
+                Some(ch)
+            } else {
+                None
+            }
+        }
     }
 }
 
@@ -1214,6 +1304,7 @@ impl Parser {
             }
             TokenKind::Bool(value) => Ok(Expr::new(ExprKind::Bool(value), token.pos)),
             TokenKind::Number(value) => Ok(Expr::new(ExprKind::Number(value), token.pos)),
+            TokenKind::Char(value) => Ok(Expr::new(ExprKind::Char(value), token.pos)),
             TokenKind::String(value) => Ok(Expr::new(ExprKind::String(value), token.pos)),
             TokenKind::Symbol(name) => Ok(Expr::new(ExprKind::Symbol(name), token.pos)),
         }
