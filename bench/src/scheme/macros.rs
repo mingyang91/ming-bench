@@ -115,6 +115,11 @@ fn build_rename_map(
     let mut rename_map = HashMap::new();
     collect_template_free_vars(template, &pattern_vars, macro_name, &mut rename_map);
 
+    // Only rename variables that exist in the definition environment.
+    // Variables not in def_env (e.g., forward-referenced macros) are left
+    // as-is and resolved at expansion time in the use-site environment.
+    rename_map.retain(|orig, _| def_env.contains_key(orig));
+
     for (orig, renamed) in &rename_map {
         if let Some(val_rc) = def_env.get(orig) {
             env.insert(renamed.clone(), val_rc.clone());

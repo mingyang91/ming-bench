@@ -160,6 +160,7 @@ type Env = HashMap<String, Rc<RefCell<Value>>>;
 /// Evaluate expressions from `start_idx`, updating `last` with each result.
 /// Returns `Some((replay_idx, value))` on continuation escape, `None` if all
 /// expressions completed normally.
+/// Returns `Some((source_idx, target_idx, value))` on continuation escape.
 fn eval_exprs_until_escape(
     exprs: &[(Value, Span)],
     start_idx: usize,
@@ -167,19 +168,19 @@ fn eval_exprs_until_escape(
     env: &mut Env,
     output: &mut String,
     last: &mut Option<Value>,
-) -> Result<Option<(usize, Value)>, EvalError> {
+) -> Result<Option<(usize, usize, Value)>, EvalError> {
     for (idx, (expr, span)) in exprs.iter().enumerate().skip(start_idx) {
         cc_state.borrow_mut().expr_idx = idx;
 
         match eval::eval(expr, env, output) {
             Ok(val) => *last = Some(val),
             Err(EvalError::ContinuationEscape) => {
-                let data = cc_state
+                let (target_idx, value) = cc_state
                     .borrow_mut()
                     .return_data
                     .take()
                     .expect("ContinuationEscape without return data");
-                return Ok(Some(data));
+                return Ok(Some((idx, target_idx, value)));
             }
             Err(e) => {
                 return Err(EvalError::AtPosition {
@@ -231,13 +232,18 @@ pub fn eval_str_with_output(input: &str) -> Result<(String, String), EvalError> 
             &mut last,
         )?;
 
-        match cont_return {
-            Some((replay_idx, value)) => {
-                cc_state.borrow_mut().override_value = Some(value);
-                start_idx = replay_idx;
-            }
-            None => break,
+        let Some((source_idx, target_idx, value)) = cont_return else {
+            break;
+        };
+        // Only deliver override_value when the escape originates from
+        // a different expression than the target. When source == target,
+        // the continuation was invoked within the same top-level
+        // expression and the override would be consumed by the wrong
+        // call/cc during replay.
+        if source_idx != target_idx {
+            cc_state.borrow_mut().override_value = Some(value);
         }
+        start_idx = target_idx;
     }
 
     let last = last.ok_or(EvalError::EmptyInput)?;
