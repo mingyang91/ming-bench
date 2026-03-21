@@ -1,3 +1,4 @@
+use crate::codex;
 use crate::model::{
     compact_timestamp, iso_now, project_dir, run_cmd, run_cmd_capture, uuid_v4, write_meta, Error,
     Result, LEVELS,
@@ -35,6 +36,7 @@ Work through levels 1 through 23 in order.
 After implementing each level, run cargo xtask test NN to verify.
 Fix failures before proceeding. Do not skip levels.";
 
+#[allow(clippy::too_many_lines)]
 pub fn run(args: RunAgentArgs) -> Result<()> {
     install_signal_handlers();
 
@@ -49,10 +51,11 @@ pub fn run(args: RunAgentArgs) -> Result<()> {
         .expect("project has no parent dir")
         .join("workspace")
         .join(&args.name);
-    let parsed_lang = crate::model::Lang::from_str(&args.lang).map_err(|msg| Error::CommandFailed {
-        cmd: msg,
-        exit_code: 1,
-    })?;
+    let parsed_lang =
+        crate::model::Lang::from_str(&args.lang).map_err(|msg| Error::CommandFailed {
+            cmd: msg,
+            exit_code: 1,
+        })?;
     let agent_workdir = worktree_dir.join("bench").join(parsed_lang.dir_name());
 
     let results_dir = if args.resume {
@@ -64,7 +67,15 @@ pub fn run(args: RunAgentArgs) -> Result<()> {
     let start_time = resume_start_time(args.resume, &results_dir);
 
     if !args.resume {
-        write_initial_meta(&args, &results_dir, &session_uuid, &mode, prompt, &start_time, &timestamp)?;
+        write_initial_meta(
+            &args,
+            &results_dir,
+            &session_uuid,
+            &mode,
+            prompt,
+            &start_time,
+            &timestamp,
+        )?;
     }
 
     print_run_banner(&args, &session_uuid, &results_dir, &worktree_dir, &mode);
@@ -85,22 +96,31 @@ pub fn run(args: RunAgentArgs) -> Result<()> {
     };
 
     let (agent_exit, level_times) = execute_mode(
-        &mode, &args, &agent_workdir, &worktree_dir, &results_dir,
-        prompt, &session_uuid,
+        &mode,
+        &args,
+        &agent_workdir,
+        &worktree_dir,
+        &results_dir,
+        prompt,
+        &session_uuid,
     )?;
 
     let score = run_scoring(&args, &proj)?;
 
-    finalize_run(&args, &results_dir, &FinalizeContext {
-        session_uuid: &session_uuid,
-        mode: &mode,
-        prompt,
-        start_time: &start_time,
-        timestamp: &timestamp,
-        agent_exit,
-        score: &score,
-        level_times: &level_times,
-    })?;
+    finalize_run(
+        &args,
+        &results_dir,
+        &FinalizeContext {
+            session_uuid: &session_uuid,
+            mode: &mode,
+            prompt,
+            start_time: &start_time,
+            timestamp: &timestamp,
+            agent_exit,
+            score: &score,
+            level_times: &level_times,
+        },
+    )?;
 
     push_branch(&args.name, &worktree_dir);
 
@@ -115,8 +135,13 @@ pub fn run(args: RunAgentArgs) -> Result<()> {
 }
 
 fn write_initial_meta(
-    args: &RunAgentArgs, results_dir: &Path, session_uuid: &str,
-    mode: &str, prompt: &str, start_time: &str, timestamp: &str,
+    args: &RunAgentArgs,
+    results_dir: &Path,
+    session_uuid: &str,
+    mode: &str,
+    prompt: &str,
+    start_time: &str,
+    timestamp: &str,
 ) -> Result<()> {
     let meta = serde_json::json!({
         "base": args.base,
@@ -134,8 +159,11 @@ fn write_initial_meta(
 }
 
 fn print_run_banner(
-    args: &RunAgentArgs, session_uuid: &str, results_dir: &Path,
-    worktree_dir: &Path, mode: &str,
+    args: &RunAgentArgs,
+    session_uuid: &str,
+    results_dir: &Path,
+    worktree_dir: &Path,
+    mode: &str,
 ) {
     println!("=== Agent Run: {} ===", args.name);
     println!("Base:       {}", args.base);
@@ -151,15 +179,22 @@ fn print_run_banner(
 }
 
 fn create_worktree(
-    args: &RunAgentArgs, proj: &Path, worktree_dir: &Path, agent_workdir: &Path,
+    args: &RunAgentArgs,
+    proj: &Path,
+    worktree_dir: &Path,
+    agent_workdir: &Path,
 ) -> Result<()> {
     println!("Creating worktree from '{}'...", args.base);
     let exit = run_cmd(
         "git",
         &[
-            "worktree", "add", "-b", &args.name,
+            "worktree",
+            "add",
+            "-b",
+            &args.name,
             worktree_dir.to_str().expect("worktree path not utf8"),
-            &args.base, "--quiet",
+            &args.base,
+            "--quiet",
         ],
         proj,
     )?;
@@ -196,7 +231,9 @@ fn symlink_strategy(args: &RunAgentArgs, agent_workdir: &Path) -> Result<()> {
         return Err(Error::CommandFailed {
             cmd: format!(
                 "strategy file not found: {} or {} (in {})",
-                lang_rel, base_rel, bench_dir.display()
+                lang_rel,
+                base_rel,
+                bench_dir.display()
             ),
             exit_code: 1,
         });
@@ -211,8 +248,7 @@ fn symlink_strategy(args: &RunAgentArgs, agent_workdir: &Path) -> Result<()> {
         .map_err(|e| Error::io(&claude_md, e))?;
     let agents_md = agent_workdir.join("AGENTS.md");
     let _ = fs::remove_file(&agents_md);
-    std::os::unix::fs::symlink("CLAUDE.md", &agents_md)
-        .map_err(|e| Error::io(&agents_md, e))?;
+    std::os::unix::fs::symlink("CLAUDE.md", &agents_md).map_err(|e| Error::io(&agents_md, e))?;
     println!("Strategy:   {strategy_rel} → CLAUDE.md");
     Ok(())
 }
@@ -222,13 +258,11 @@ fn copy_strategy_clippy(args: &RunAgentArgs, agent_workdir: &Path) -> Result<()>
     let strategy_clippy = bench_dir.join(format!("strategies/{}.clippy.toml", args.strategy));
     let clippy_toml = agent_workdir.join("clippy.toml");
     if strategy_clippy.is_file() {
-        fs::copy(&strategy_clippy, &clippy_toml)
-            .map_err(|e| Error::io(&clippy_toml, e))?;
+        fs::copy(&strategy_clippy, &clippy_toml).map_err(|e| Error::io(&clippy_toml, e))?;
         println!("Copied {}.clippy.toml → clippy.toml", args.strategy);
     }
     Ok(())
 }
-
 
 fn warm_cache(worktree_dir: &Path) {
     println!("Pre-building dependencies in worktree (release mode)...");
@@ -240,14 +274,25 @@ fn warm_cache(worktree_dir: &Path) {
 }
 
 fn execute_mode(
-    mode: &str, args: &RunAgentArgs, agent_workdir: &Path,
-    worktree_dir: &Path, results_dir: &Path,
-    prompt: &str, session_uuid: &str,
+    mode: &str,
+    args: &RunAgentArgs,
+    agent_workdir: &Path,
+    worktree_dir: &Path,
+    results_dir: &Path,
+    prompt: &str,
+    session_uuid: &str,
 ) -> Result<(i32, LevelTimes)> {
     if mode == "levels" {
         run_levels_mode(args, agent_workdir, worktree_dir, results_dir)
     } else if mode == "full" {
-        let exit = run_full_mode(args, agent_workdir, worktree_dir, results_dir, prompt, session_uuid);
+        let exit = run_full_mode(
+            args,
+            agent_workdir,
+            worktree_dir,
+            results_dir,
+            prompt,
+            session_uuid,
+        );
         Ok((exit, Vec::new()))
     } else {
         eprintln!("ERROR: Unknown mode '{mode}'. Use 'full' or 'levels'.");
@@ -259,32 +304,44 @@ fn execute_mode(
 }
 
 fn run_full_mode(
-    args: &RunAgentArgs, agent_workdir: &Path, worktree_dir: &Path,
-    results_dir: &Path, prompt: &str, session_uuid: &str,
+    args: &RunAgentArgs,
+    agent_workdir: &Path,
+    worktree_dir: &Path,
+    results_dir: &Path,
+    prompt: &str,
+    session_uuid: &str,
 ) -> i32 {
     println!("=== Full run mode ===");
+    let output_file = results_dir.join("agent-output.txt");
 
     let agent_exit = launch_agent(
-        &args.agent, agent_workdir, prompt, session_uuid,
-        &results_dir.join("agent-output.txt"), args.max_turns, args.model.as_deref(),
+        &args.agent,
+        agent_workdir,
+        prompt,
+        session_uuid,
+        &output_file,
+        args.max_turns,
+        args.model.as_deref(),
     );
 
     println!();
     println!("Agent exited with code: {agent_exit}");
 
-    let _ = run_cmd("git", &["add", "-A"], worktree_dir);
+    let _ = run_cmd("git", &["add", "bench/"], worktree_dir);
     let _ = run_cmd(
         "git",
         &["commit", "-m", "agent: full run complete", "--allow-empty"],
         worktree_dir,
     );
 
-    capture_session(&args.agent, session_uuid, results_dir);
+    capture_session(&args.agent, session_uuid, &output_file, results_dir);
     agent_exit
 }
 
 fn run_levels_mode(
-    args: &RunAgentArgs, agent_workdir: &Path, worktree_dir: &Path,
+    args: &RunAgentArgs,
+    agent_workdir: &Path,
+    worktree_dir: &Path,
     results_dir: &Path,
 ) -> Result<(i32, LevelTimes)> {
     println!("=== Level-by-level mode ===");
@@ -373,8 +430,11 @@ fn agent_exhausted_turns(output_file: &Path) -> bool {
 
 /// Returns (agent_exit, duration_secs, status_label).
 fn run_single_level(
-    args: &RunAgentArgs, agent_workdir: &Path, worktree_dir: &Path,
-    level_dir: &Path, level: &str,
+    args: &RunAgentArgs,
+    agent_workdir: &Path,
+    worktree_dir: &Path,
+    level_dir: &Path,
+    level: &str,
 ) -> Result<(i32, i64, String)> {
     let level_start = Instant::now();
     let mut attempt = 0u32;
@@ -389,6 +449,7 @@ fn run_single_level(
         let level_num: u32 = level.parse().expect("level constant not a number");
         let level_uuid = uuid_v4();
         let level_turns = turns_for_level(level_num, args.max_turns);
+        let output_file = level_dir.join("agent-output.txt");
 
         if attempt == 0 {
             println!();
@@ -398,18 +459,28 @@ fn run_single_level(
             println!("--- Level {level} RETRY {attempt}/{MAX_INFRA_RETRIES} (max {level_turns} turns) ---");
         }
 
-        let level_prompt = build_level_prompt(level, worktree_dir, level_dir.parent().expect("level_dir has parent"));
+        let level_prompt = build_level_prompt(
+            level,
+            worktree_dir,
+            level_dir.parent().expect("level_dir has parent"),
+        );
         let agent_exit = launch_agent(
-            &args.agent, agent_workdir, &level_prompt, &level_uuid,
-            &level_dir.join("agent-output.txt"), Some(level_turns), args.model.as_deref(),
+            &args.agent,
+            agent_workdir,
+            &level_prompt,
+            &level_uuid,
+            &output_file,
+            Some(level_turns),
+            args.model.as_deref(),
         );
 
-        capture_session(&args.agent, &level_uuid, level_dir);
+        capture_session(&args.agent, &level_uuid, &output_file, level_dir);
 
         let mut test_exit = run_level_tests(worktree_dir, level, &args.lang);
 
         if test_exit == 0 && args.strategy.contains("quality-gate") {
-            test_exit = run_quality_gate_cleanup(args, agent_workdir, worktree_dir, level_dir, level);
+            test_exit =
+                run_quality_gate_cleanup(args, agent_workdir, worktree_dir, level_dir, level);
         }
 
         if test_exit == 0 {
@@ -440,7 +511,11 @@ fn run_single_level(
 }
 
 fn failure_reason(exhausted: bool) -> &'static str {
-    if exhausted { "turns exhausted" } else { "max retries reached" }
+    if exhausted {
+        "turns exhausted"
+    } else {
+        "max retries reached"
+    }
 }
 
 fn run_level_tests(worktree_dir: &Path, level: &str, lang: &str) -> i32 {
@@ -455,10 +530,7 @@ fn run_level_tests(worktree_dir: &Path, level: &str, lang: &str) -> i32 {
 /// an outdated xtask that may lack new flags (e.g. --lang, --gate). Instead we run the
 /// host's binary directly and set PROJECT_DIR so `project_dir()` resolves to the worktree.
 fn run_host_xtask(args: &[&str], worktree_dir: &Path) -> Result<i32> {
-    let host_bin = project_dir()
-        .join("target")
-        .join("debug")
-        .join("xtask");
+    let host_bin = project_dir().join("target").join("debug").join("xtask");
     if !host_bin.is_file() {
         return Err(Error::BinaryNotFound {
             name: format!("host xtask at {}", host_bin.display()),
@@ -477,8 +549,11 @@ fn run_host_xtask(args: &[&str], worktree_dir: &Path) -> Result<i32> {
 }
 
 fn run_quality_gate_cleanup(
-    args: &RunAgentArgs, agent_workdir: &Path, worktree_dir: &Path,
-    level_dir: &Path, level: &str,
+    args: &RunAgentArgs,
+    agent_workdir: &Path,
+    worktree_dir: &Path,
+    level_dir: &Path,
+    level: &str,
 ) -> i32 {
     println!("--- Level {level} cleanup (max 15 turns) ---");
     let cleanup_uuid = uuid_v4();
@@ -487,19 +562,35 @@ fn run_quality_gate_cleanup(
          Run `cargo xtask test {level} --lang {} --gate` to verify. Do not change test behavior.",
         args.lang
     );
+    let output_file = level_dir.join("agent-output-cleanup.txt");
     let _cleanup_exit = launch_agent(
-        &args.agent, agent_workdir, &cleanup_prompt, &cleanup_uuid,
-        &level_dir.join("agent-output-cleanup.txt"), Some(15), args.model.as_deref(),
+        &args.agent,
+        agent_workdir,
+        &cleanup_prompt,
+        &cleanup_uuid,
+        &output_file,
+        Some(15),
+        args.model.as_deref(),
     );
-    capture_session_as(&args.agent, &cleanup_uuid, level_dir, "session-cleanup.jsonl");
+    capture_session_as(
+        &args.agent,
+        &cleanup_uuid,
+        &output_file,
+        level_dir,
+        "session-cleanup.jsonl",
+    );
 
-    run_host_xtask(&["test", level, "--lang", &args.lang, "--gate"], worktree_dir).unwrap_or(1)
+    run_host_xtask(
+        &["test", level, "--lang", &args.lang, "--gate"],
+        worktree_dir,
+    )
+    .unwrap_or(1)
 }
 
 fn commit_checkpoint(level: &str, status: &str, duration: i64, worktree_dir: &Path) {
     println!("Committing checkpoint for L{level}...");
     let commit_msg = format!("checkpoint: L{level} {status} ({duration}s)");
-    let _ = run_cmd("git", &["add", "-A"], worktree_dir);
+    let _ = run_cmd("git", &["add", "bench/"], worktree_dir);
     let _ = run_cmd(
         "git",
         &["commit", "-m", &commit_msg, "--allow-empty"],
@@ -543,9 +634,7 @@ struct FinalizeContext<'a> {
     level_times: &'a [(String, i64, String)],
 }
 
-fn finalize_run(
-    args: &RunAgentArgs, results_dir: &Path, ctx: &FinalizeContext,
-) -> Result<()> {
+fn finalize_run(args: &RunAgentArgs, results_dir: &Path, ctx: &FinalizeContext) -> Result<()> {
     let end_time = iso_now();
 
     // Build level_times from disk first (covers original run + previous resumes),
@@ -556,9 +645,15 @@ fn finalize_run(
         if !name.starts_with('L') || !entry.path().is_dir() {
             continue;
         }
-        let Ok(content) = fs::read_to_string(entry.path().join("status.txt")) else { continue };
+        let Ok(content) = fs::read_to_string(entry.path().join("status.txt")) else {
+            continue;
+        };
         let duration = parse_status_duration(&content);
-        let status = if content.contains("PASSED") { "PASSED" } else { "FAILED" };
+        let status = if content.contains("PASSED") {
+            "PASSED"
+        } else {
+            "FAILED"
+        };
         level_times_json.insert(
             name,
             serde_json::json!({"duration_s": duration, "status": status}),
@@ -639,7 +734,16 @@ fn find_resume_dir(proj: &Path, strategy: &str, name: &str) -> Result<PathBuf> {
 fn clean_stale_worktree(proj: &Path, worktree_dir: &Path, name: &str) -> Result<()> {
     if worktree_dir.is_dir() {
         println!("--clean: removing worktree dir {}", worktree_dir.display());
-        let _ = run_cmd("git", &["worktree", "remove", "--force", &worktree_dir.to_string_lossy()], proj);
+        let _ = run_cmd(
+            "git",
+            &[
+                "worktree",
+                "remove",
+                "--force",
+                &worktree_dir.to_string_lossy(),
+            ],
+            proj,
+        );
         if worktree_dir.is_dir() {
             fs::remove_dir_all(worktree_dir).map_err(|e| Error::io(worktree_dir, e))?;
         }
@@ -794,7 +898,9 @@ fn resolve_agent_binary(name: &str) -> Result<String> {
         }
     }
     Err(Error::BinaryNotFound {
-        name: format!("{name} not found in PATH — ensure ~/.local/bin and ~/.cargo/bin are in PATH"),
+        name: format!(
+            "{name} not found in PATH — ensure ~/.local/bin and ~/.cargo/bin are in PATH"
+        ),
     })
 }
 
@@ -850,9 +956,14 @@ fn run_agent_with_tee(cmd: &str, args: &[&str], workdir: &Path, output_file: &Pa
         .spawn()
         .map_err(|e| {
             if e.kind() == std::io::ErrorKind::NotFound {
-                Error::BinaryNotFound { name: cmd.to_string() }
+                Error::BinaryNotFound {
+                    name: cmd.to_string(),
+                }
             } else {
-                Error::Io { path: PathBuf::from(cmd), source: e }
+                Error::Io {
+                    path: PathBuf::from(cmd),
+                    source: e,
+                }
             }
         })?;
 
@@ -890,7 +1001,9 @@ fn run_agent_with_tee(cmd: &str, args: &[&str], workdir: &Path, output_file: &Pa
 use crate::model::turns_for_level;
 
 fn append_file_listing(summary: &mut String, scheme_dir: &Path) {
-    let Ok(entries) = fs::read_dir(scheme_dir) else { return };
+    let Ok(entries) = fs::read_dir(scheme_dir) else {
+        return;
+    };
     let mut files: Vec<(String, usize)> = entries
         .flatten()
         .filter_map(|e| {
@@ -951,34 +1064,62 @@ fn build_level_prompt(level: &str, worktree_dir: &Path, results_dir: &Path) -> S
 // ---------------------------------------------------------------------------
 
 /// Capture session with a custom output filename (for cleanup passes).
-fn capture_session_as(agent: &str, session_id: &str, dest: &Path, filename: &str) {
-    if agent != "claude" {
-        return;
-    }
-    let home = std::env::var("HOME").unwrap_or_default();
-    let projects_dir = PathBuf::from(&home).join(".claude/projects");
-    let Some(found) = find_session_jsonl(&projects_dir, session_id) else {
-        eprintln!("WARNING: Session JSONL not found for {session_id}");
-        return;
-    };
-    let target = dest.join(filename);
-    match fs::copy(&found, &target) {
-        Ok(_) => println!("Session captured: {}", target.display()),
-        Err(e) => eprintln!("WARNING: Failed to copy session: {e}"),
+fn capture_session_as(
+    agent: &str,
+    session_id: &str,
+    output_file: &Path,
+    dest: &Path,
+    filename: &str,
+) {
+    match agent {
+        "claude" => {
+            let home = std::env::var("HOME").unwrap_or_default();
+            let projects_dir = PathBuf::from(&home).join(".claude/projects");
+            let Some(found) = find_session_jsonl(&projects_dir, session_id) else {
+                eprintln!("WARNING: Session JSONL not found for {session_id}");
+                return;
+            };
+            copy_captured_session(&found, &dest.join(filename), "Session");
+        }
+        "codex" => capture_codex_session(output_file, &dest.join(filename)),
+        _ => {}
     }
 }
 
-fn capture_session(agent: &str, session_id: &str, dest: &Path) {
+fn capture_session(agent: &str, session_id: &str, output_file: &Path, dest: &Path) {
     match agent {
-        "claude" => capture_session_as(agent, session_id, dest, "session.jsonl"),
-        "codex" => capture_newest_session("codex", ".codex", "log", "session.log", dest),
+        "claude" | "codex" => {
+            capture_session_as(agent, session_id, output_file, dest, "session.jsonl")
+        }
         "opencode" => capture_newest_session("opencode", ".opencode", "json", "session.json", dest),
         _ => {}
     }
 }
 
+fn capture_codex_session(output_file: &Path, target: &Path) {
+    let Some(found) = codex::resolve_rollout_from_output_file(output_file) else {
+        eprintln!(
+            "WARNING: Codex rollout not found for output file {}",
+            output_file.display()
+        );
+        return;
+    };
+    copy_captured_session(&found, target, "Codex");
+}
+
+fn copy_captured_session(found: &Path, target: &Path, label: &str) {
+    match fs::copy(found, target) {
+        Ok(_) => println!("{label} session captured: {}", target.display()),
+        Err(e) => eprintln!("WARNING: Failed to copy session: {e}"),
+    }
+}
+
 fn capture_newest_session(
-    label: &str, home_subdir: &str, ext: &str, target_name: &str, dest: &Path,
+    label: &str,
+    home_subdir: &str,
+    ext: &str,
+    target_name: &str,
+    dest: &Path,
 ) {
     let home = std::env::var("HOME").unwrap_or_default();
     let dir = PathBuf::from(&home).join(home_subdir);
@@ -990,7 +1131,12 @@ fn capture_newest_session(
     };
     let target = dest.join(target_name);
     let _ = fs::copy(&latest, &target);
-    let label_cap = label.chars().next().unwrap_or('?').to_uppercase().to_string()
+    let label_cap = label
+        .chars()
+        .next()
+        .unwrap_or('?')
+        .to_uppercase()
+        .to_string()
         + &label[1..];
     println!("{label_cap} session captured: {}", target.display());
 }
@@ -1019,7 +1165,9 @@ fn newest_file(dir: &Path, extension: &str) -> Option<PathBuf> {
             continue;
         }
         let Ok(meta) = path.metadata() else { continue };
-        let Ok(modified) = meta.modified() else { continue };
+        let Ok(modified) = meta.modified() else {
+            continue;
+        };
         if best.as_ref().is_none_or(|(_, prev)| modified > *prev) {
             best = Some((path, modified));
         }
@@ -1032,7 +1180,9 @@ fn extract_score_from_log(log_path: &Path) -> String {
         return "unknown".to_string();
     };
     for line in content.lines() {
-        let Some(pos) = line.find("Score: ") else { continue };
+        let Some(pos) = line.find("Score: ") else {
+            continue;
+        };
         let rest = &line[pos + 7..];
         let score: String = rest
             .chars()
@@ -1102,10 +1252,15 @@ impl Drop for CleanupContext {
 
 fn commit_and_push_interrupted(worktree_dir: &Path, name: &str) {
     eprintln!("Committing agent work before exit...");
-    let _ = run_cmd("git", &["add", "-A"], worktree_dir);
+    let _ = run_cmd("git", &["add", "bench/"], worktree_dir);
     let _ = run_cmd(
         "git",
-        &["commit", "-m", "checkpoint: interrupted/cleanup", "--allow-empty"],
+        &[
+            "commit",
+            "-m",
+            "checkpoint: interrupted/cleanup",
+            "--allow-empty",
+        ],
         worktree_dir,
     );
     let _ = run_cmd("git", &["push", "-u", "origin", name], worktree_dir);

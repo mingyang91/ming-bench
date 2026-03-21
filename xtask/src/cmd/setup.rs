@@ -1,16 +1,28 @@
 use crate::model::{command_exists, project_dir, run_cmd, Result};
 
+#[allow(clippy::excessive_nesting)]
 pub fn run() -> Result<()> {
     let proj = project_dir();
+    let mut failures: Vec<String> = vec![];
 
     println!("=== MING Setup ===");
 
-    // 1. Install podman + jq if missing
-    for pkg in &["podman", "jq"] {
+    // 1. Install required packages
+    let mut need_update = true;
+    for pkg in &["podman", "jq", "openjdk-21-jdk-headless"] {
         if !command_exists(pkg) {
+            if need_update {
+                println!("Updating package index...");
+                let _ = run_cmd("sudo", &["apt-get", "update", "-qq"], &proj);
+                need_update = false;
+            }
             println!("Installing {pkg}...");
-            run_cmd("sudo", &["apt-get", "update", "-qq"], &proj)?;
-            run_cmd("sudo", &["apt-get", "install", "-y", "-qq", pkg], &proj)?;
+            let exit =
+                run_cmd("sudo", &["apt-get", "install", "-y", "-qq", pkg], &proj).unwrap_or(1);
+            if exit != 0 {
+                eprintln!("WARNING: Failed to install {pkg} (exit {exit})");
+                failures.push(format!("apt install {pkg}"));
+            }
         }
     }
 
@@ -35,18 +47,24 @@ pub fn run() -> Result<()> {
             "sudo",
             &["podman", "build", "-t", name, "-f", dockerfile, "."],
             &proj,
-        )?;
+        )
+        .unwrap_or(1);
         if exit != 0 {
-            return Err(crate::model::Error::CommandFailed {
-                cmd: format!("podman build {name}"),
-                exit_code: exit,
-            });
+            eprintln!("WARNING: Failed to build image '{name}' (exit {exit})");
+            failures.push(format!("podman build {name}"));
+            continue;
         }
         println!("Image '{name}' built successfully.");
     }
 
-    println!("=== Setup complete ===");
-    println!("Run benchmarks with: cargo xtask bench <branch>");
+    if failures.is_empty() {
+        println!("\n=== Setup complete ===");
+    } else {
+        eprintln!("\n=== Setup completed with errors ===");
+        for f in &failures {
+            eprintln!("  FAILED: {f}");
+        }
+    }
 
     Ok(())
 }

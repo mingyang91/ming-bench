@@ -11,6 +11,7 @@ bench/*/AGENTS.md
 
 ## mill / scala
 out/
+mill.*
 .metals/
 .bsp/
 node_modules/
