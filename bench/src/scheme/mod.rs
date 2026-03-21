@@ -6,9 +6,12 @@ pub mod value;
 
 pub use error::EvalError;
 use builtins::{apply_builtin, is_builtin};
-use forms::{eval_and, eval_begin, eval_body, eval_cond, eval_define, eval_if, eval_lambda, eval_let, eval_or, eval_quote};
+use forms::{
+    eval_and, eval_begin, eval_body, eval_cond, eval_define, eval_if, eval_lambda, eval_let,
+    eval_or, eval_quote,
+};
 use std::collections::HashMap;
-use value::Value;
+use value::{Span, Value};
 
 type Env = HashMap<String, Value>;
 
@@ -19,6 +22,7 @@ pub fn eval_str(input: &str) -> Result<String, EvalError> {
     if exprs.is_empty() {
         return Err(EvalError::Parse {
             message: "empty input".to_string(),
+            span: Span { line: 1, col: 1 },
         });
     }
     let mut env = Env::new();
@@ -40,40 +44,44 @@ pub(crate) fn eval(value: &Value, env: &mut Env) -> Result<Value, EvalError> {
         Value::Integer(_) | Value::Boolean(_) | Value::String(_) | Value::Lambda { .. } => {
             Ok(value.clone())
         }
-        Value::Symbol(name) => env.get(name).cloned().ok_or_else(|| EvalError::UnboundVariable {
-            name: name.clone(),
-        }),
-        Value::List(items) => eval_list(items, env),
+        Value::Symbol(name, span) => {
+            env.get(name).cloned().ok_or_else(|| EvalError::UnboundVariable {
+                name: name.clone(),
+                span: *span,
+            })
+        }
+        Value::List(items, span) => eval_list(items, *span, env),
     }
 }
 
-fn eval_list(items: &[Value], env: &mut Env) -> Result<Value, EvalError> {
+fn eval_list(items: &[Value], span: Span, env: &mut Env) -> Result<Value, EvalError> {
     let [operator, args @ ..] = items else {
         return Err(EvalError::Parse {
             message: "empty application".to_string(),
+            span,
         });
     };
 
     // Handle special forms first (unevaluated operator)
-    if let Value::Symbol(name) = operator {
+    if let Value::Symbol(name, _) = operator {
         match name.as_str() {
-            "define" => return eval_define(args, env),
-            "if" => return eval_if(args, env),
-            "quote" => return eval_quote(args),
+            "define" => return eval_define(args, env, span),
+            "if" => return eval_if(args, env, span),
+            "quote" => return eval_quote(args, span),
             "and" => return eval_and(args, env),
             "or" => return eval_or(args, env),
-            "lambda" => return eval_lambda(args, env),
-            "let" => return eval_let(args, env),
-            "begin" => return eval_begin(args, env),
-            "cond" => return eval_cond(args, env),
+            "lambda" => return eval_lambda(args, env, span),
+            "let" => return eval_let(args, env, span),
+            "begin" => return eval_begin(args, env, span),
+            "cond" => return eval_cond(args, env, span),
             _ => {}
         }
     }
 
     // Try builtin functions for known symbol names not in env
-    if let Value::Symbol(name) = operator {
+    if let Value::Symbol(name, _) = operator {
         if is_builtin(name) {
-            return apply_builtin(name, args, env);
+            return apply_builtin(name, args, env, span);
         }
     }
 
@@ -84,11 +92,11 @@ fn eval_list(items: &[Value], env: &mut Env) -> Result<Value, EvalError> {
         .map(|a| eval(a, env))
         .collect::<Result<_, _>>()?;
 
-    apply(proc, &evaluated_args, env)
+    apply(proc, &evaluated_args, env, span)
 }
 
-fn apply(proc: Value, args: &[Value], env: &mut Env) -> Result<Value, EvalError> {
-    match proc {
+fn apply(proc: Value, args: &[Value], env: &mut Env, span: Span) -> Result<Value, EvalError> {
+    match &proc {
         Value::Lambda {
             params,
             body,
@@ -98,31 +106,43 @@ fn apply(proc: Value, args: &[Value], env: &mut Env) -> Result<Value, EvalError>
                 return Err(EvalError::WrongArgCount {
                     expected: params.len(),
                     got: args.len(),
+                    span,
                 });
             }
             // Caller's env as base (provides global defs for recursion),
             // captured env overlays (lexical scoping), params on top.
             let mut local_env = env.clone();
-            local_env.extend(captured_env);
+            local_env.extend(captured_env.clone());
             for (param, arg) in params.iter().zip(args) {
                 local_env.insert(param.clone(), arg.clone());
             }
-            eval_body(&body, Value::Boolean(false), &mut local_env)
+            eval_body(body, Value::Boolean(false), &mut local_env)
         }
         other => Err(EvalError::TypeError {
             expected: "procedure".to_string(),
             got: format!("{other}"),
+            span,
         }),
     }
 }
 
 pub(crate) fn eval_to_integer(value: &Value, env: &mut Env) -> Result<i64, EvalError> {
-    match eval(value, env)? {
-        Value::Integer(n) => Ok(n),
+    let result = eval(value, env)?;
+    match &result {
+        Value::Integer(n) => Ok(*n),
         other => Err(EvalError::TypeError {
             expected: "integer".to_string(),
             got: format!("{other}"),
+            span: span_of(value),
         }),
+    }
+}
+
+/// Extract the span from a Value if it carries one, otherwise return default.
+fn span_of(value: &Value) -> Span {
+    match value {
+        Value::Symbol(_, span) | Value::List(_, span) => *span,
+        _ => Span::default(),
     }
 }
 

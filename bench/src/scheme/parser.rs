@@ -1,85 +1,145 @@
 use crate::scheme::error::ParseError;
-use crate::scheme::value::Value;
+use crate::scheme::value::{Span, Value};
 
-/// Parse all expressions from the input string.
-pub fn parse(input: &str) -> Result<Vec<Value>, ParseError> {
-    let mut chars = input.chars().peekable();
-    let mut exprs = Vec::new();
-
-    loop {
-        skip_whitespace(&mut chars);
-        if chars.peek().is_none() {
-            break;
-        }
-        exprs.push(parse_expr(&mut chars)?);
-    }
-
-    Ok(exprs)
+struct Parser<'a> {
+    chars: std::iter::Peekable<std::str::Chars<'a>>,
+    line: usize,
+    col: usize,
 }
 
-fn skip_whitespace(chars: &mut std::iter::Peekable<std::str::Chars<'_>>) {
-    while let Some(&c) = chars.peek() {
-        if c.is_whitespace() {
-            chars.next();
+impl<'a> Parser<'a> {
+    fn new(input: &'a str) -> Self {
+        Self {
+            chars: input.chars().peekable(),
+            line: 1,
+            col: 1,
+        }
+    }
+
+    fn span(&self) -> Span {
+        Span {
+            line: self.line,
+            col: self.col,
+        }
+    }
+
+    fn advance(&mut self) -> Option<char> {
+        let c = self.chars.next()?;
+        if c == '\n' {
+            self.line += 1;
+            self.col = 1;
         } else {
-            break;
+            self.col += 1;
+        }
+        Some(c)
+    }
+
+    fn peek(&mut self) -> Option<&char> {
+        self.chars.peek()
+    }
+
+    fn skip_whitespace(&mut self) {
+        while self.peek().is_some_and(|c| c.is_whitespace()) {
+            self.advance();
         }
     }
-}
 
-fn parse_expr(
-    chars: &mut std::iter::Peekable<std::str::Chars<'_>>,
-) -> Result<Value, ParseError> {
-    skip_whitespace(chars);
+    fn parse_expr(&mut self) -> Result<Value, ParseError> {
+        self.skip_whitespace();
+        let span = self.span();
 
-    match chars.peek() {
-        None => Err(ParseError::UnexpectedEof),
-        Some('\'') => parse_quote_shorthand(chars),
-        Some('(') => parse_list(chars),
-        Some('"') => parse_string(chars),
-        Some('#') => parse_boolean(chars),
-        Some(&c) if is_symbol_start(c) => parse_symbol(chars),
-        Some(&c) if c == '-' || c.is_ascii_digit() => parse_number_or_symbol(chars),
-        Some(&c) => Err(ParseError::UnexpectedChar { ch: c }),
+        match self.peek() {
+            None => Err(ParseError::UnexpectedEof),
+            Some('\'') => self.parse_quote_shorthand(span),
+            Some('(') => self.parse_list(span),
+            Some('"') => self.parse_string(span),
+            Some('#') => self.parse_boolean(span),
+            Some(&c) if is_symbol_start(c) => self.parse_symbol(span),
+            Some(&c) if c == '-' || c.is_ascii_digit() => self.parse_number_or_symbol(span),
+            Some(&c) => Err(ParseError::UnexpectedChar { ch: c }),
+        }
     }
-}
 
-fn parse_string(
-    chars: &mut std::iter::Peekable<std::str::Chars<'_>>,
-) -> Result<Value, ParseError> {
-    chars.next(); // consume opening quote
-    let mut s = String::new();
+    fn parse_string(&mut self, _span: Span) -> Result<Value, ParseError> {
+        self.advance(); // consume opening quote
+        let mut s = String::new();
 
-    loop {
-        match chars.next() {
-            None => return Err(ParseError::UnterminatedString),
-            Some('"') => return Ok(Value::String(s)),
-            Some('\\') => match chars.next() {
-                Some('n') => s.push('\n'),
-                Some('t') => s.push('\t'),
-                Some('\\') => s.push('\\'),
-                Some('"') => s.push('"'),
-                Some(c) => {
-                    s.push('\\');
-                    s.push(c);
-                }
+        loop {
+            match self.advance() {
                 None => return Err(ParseError::UnterminatedString),
-            },
-            Some(c) => s.push(c),
+                Some('"') => return Ok(Value::String(s)),
+                Some('\\') => match self.advance() {
+                    Some('n') => s.push('\n'),
+                    Some('t') => s.push('\t'),
+                    Some('\\') => s.push('\\'),
+                    Some('"') => s.push('"'),
+                    Some(c) => s.extend(['\\', c]),
+                    None => return Err(ParseError::UnterminatedString),
+                },
+                Some(c) => s.push(c),
+            }
+        }
+    }
+
+    fn parse_boolean(&mut self, _span: Span) -> Result<Value, ParseError> {
+        self.advance(); // consume '#'
+        match self.advance() {
+            Some('t') => Ok(Value::Boolean(true)),
+            Some('f') => Ok(Value::Boolean(false)),
+            Some(c) => Err(ParseError::UnexpectedChar { ch: c }),
+            None => Err(ParseError::UnexpectedEof),
+        }
+    }
+
+    fn parse_symbol(&mut self, span: Span) -> Result<Value, ParseError> {
+        let token = self.read_token();
+        Ok(Value::Symbol(token, span))
+    }
+
+    fn parse_quote_shorthand(&mut self, span: Span) -> Result<Value, ParseError> {
+        self.advance(); // consume '\''
+        let inner = self.parse_expr()?;
+        Ok(Value::List(
+            vec![Value::Symbol("quote".to_string(), span), inner],
+            span,
+        ))
+    }
+
+    fn parse_list(&mut self, span: Span) -> Result<Value, ParseError> {
+        self.advance(); // consume '('
+        let mut items = Vec::new();
+
+        loop {
+            self.skip_whitespace();
+            match self.peek() {
+                None => return Err(ParseError::UnexpectedEof),
+                Some(')') => break,
+                _ => items.push(self.parse_expr()?),
+            }
+        }
+        self.advance(); // consume ')'
+        Ok(Value::List(items, span))
+    }
+
+    fn read_token(&mut self) -> String {
+        let mut token = String::new();
+        while self.peek().is_some_and(|c| !is_delimiter(*c)) {
+            token.push(self.advance().expect("peeked"));
+        }
+        token
+    }
+
+    fn parse_number_or_symbol(&mut self, span: Span) -> Result<Value, ParseError> {
+        let token = self.read_token();
+        match token.parse::<i64>() {
+            Ok(n) => Ok(Value::Integer(n)),
+            Err(_) => Ok(Value::Symbol(token, span)),
         }
     }
 }
 
-fn parse_boolean(
-    chars: &mut std::iter::Peekable<std::str::Chars<'_>>,
-) -> Result<Value, ParseError> {
-    chars.next(); // consume '#'
-    match chars.next() {
-        Some('t') => Ok(Value::Boolean(true)),
-        Some('f') => Ok(Value::Boolean(false)),
-        Some(c) => Err(ParseError::UnexpectedChar { ch: c }),
-        None => Err(ParseError::UnexpectedEof),
-    }
+fn is_delimiter(c: char) -> bool {
+    c.is_whitespace() || c == '(' || c == ')'
 }
 
 fn is_symbol_start(c: char) -> bool {
@@ -87,64 +147,18 @@ fn is_symbol_start(c: char) -> bool {
         || c.is_ascii_alphabetic()
 }
 
-fn parse_symbol(
-    chars: &mut std::iter::Peekable<std::str::Chars<'_>>,
-) -> Result<Value, ParseError> {
-    let mut token = String::new();
-
-    while let Some(&c) = chars.peek() {
-        if c.is_whitespace() || c == '(' || c == ')' {
-            break;
-        }
-        token.push(c);
-        chars.next();
-    }
-
-    Ok(Value::Symbol(token))
-}
-
-fn parse_quote_shorthand(
-    chars: &mut std::iter::Peekable<std::str::Chars<'_>>,
-) -> Result<Value, ParseError> {
-    chars.next(); // consume '\''
-    let inner = parse_expr(chars)?;
-    Ok(Value::List(vec![Value::Symbol("quote".to_string()), inner]))
-}
-
-fn parse_list(
-    chars: &mut std::iter::Peekable<std::str::Chars<'_>>,
-) -> Result<Value, ParseError> {
-    chars.next(); // consume '('
-    let mut items = Vec::new();
+/// Parse all expressions from the input string.
+pub fn parse(input: &str) -> Result<Vec<Value>, ParseError> {
+    let mut parser = Parser::new(input);
+    let mut exprs = Vec::new();
 
     loop {
-        skip_whitespace(chars);
-        match chars.peek() {
-            None => return Err(ParseError::UnexpectedEof),
-            Some(')') => {
-                chars.next();
-                return Ok(Value::List(items));
-            }
-            _ => items.push(parse_expr(chars)?),
-        }
-    }
-}
-
-fn parse_number_or_symbol(
-    chars: &mut std::iter::Peekable<std::str::Chars<'_>>,
-) -> Result<Value, ParseError> {
-    let mut token = String::new();
-
-    while let Some(&c) = chars.peek() {
-        if c.is_whitespace() || c == '(' || c == ')' {
+        parser.skip_whitespace();
+        if parser.peek().is_none() {
             break;
         }
-        token.push(c);
-        chars.next();
+        exprs.push(parser.parse_expr()?);
     }
 
-    match token.parse::<i64>() {
-        Ok(n) => Ok(Value::Integer(n)),
-        Err(_) => Ok(Value::Symbol(token)),
-    }
+    Ok(exprs)
 }

@@ -1,20 +1,30 @@
+use crate::scheme::value::Span;
+
 /// Evaluation error type for the Scheme interpreter.
 #[derive(Debug, PartialEq, thiserror::Error)]
 pub enum EvalError {
-    #[error("parse error: {message}")]
-    Parse { message: String },
+    #[error("parse error at {span}: {message}")]
+    Parse { message: String, span: Span },
 
-    #[error("unbound variable: {name}")]
-    UnboundVariable { name: String },
+    #[error("unbound variable '{name}' at {span}")]
+    UnboundVariable { name: String, span: Span },
 
-    #[error("wrong number of arguments: expected {expected}, got {got}")]
-    WrongArgCount { expected: usize, got: usize },
+    #[error("wrong number of arguments at {span}: expected {expected}, got {got}")]
+    WrongArgCount {
+        expected: usize,
+        got: usize,
+        span: Span,
+    },
 
-    #[error("type error: expected {expected}, got {got}")]
-    TypeError { expected: String, got: String },
+    #[error("type error at {span}: expected {expected}, got {got}")]
+    TypeError {
+        expected: String,
+        got: String,
+        span: Span,
+    },
 
-    #[error("division by zero")]
-    DivisionByZero,
+    #[error("division by zero at {span}")]
+    DivisionByZero { span: Span },
 }
 
 /// Parse error type for the Scheme reader.
@@ -34,6 +44,7 @@ impl From<ParseError> for EvalError {
     fn from(e: ParseError) -> Self {
         EvalError::Parse {
             message: e.to_string(),
+            span: Span { line: 1, col: 1 },
         }
     }
 }
