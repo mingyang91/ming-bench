@@ -9,6 +9,34 @@ object CpsSpecialForms:
 
   import CpsEval.{applyK, evalBodyK, evalK, evalSequenceK, Cont, Env}
 
+  def evalDefineSyntaxK(
+    rest: List[SchemeValue],
+    pos: Option[(Int, Int)],
+    env: Env,
+    out: Array[String],
+    k: Cont
+  ): Bounce =
+    rest match
+      case SymbolVal(name, _) ::
+          ListVal(
+            SymbolVal("syntax-rules", _) :: ListVal(literals, _) :: rules,
+            _
+          ) :: Nil =>
+        val literalNames = literals.map {
+          case SymbolVal(n, _) => n
+          case _ =>
+            throw new EvalError("syntax-rules: literals must be identifiers")
+        }
+        val parsedRules = rules.map {
+          case ListVal(ListVal(pattern, _) :: template :: Nil, _) =>
+            (pattern, template)
+          case _ => throw new EvalError("syntax-rules: invalid rule")
+        }
+        val macroVal = MacroVal(literalNames, parsedRules, env)
+        More(() => k(Void, env + (name -> makeCell(macroVal))))
+      case _ =>
+        throw new EvalError(s"define-syntax: bad syntax${fmtPos(pos)}")
+
   def evalIfK(
     rest: List[SchemeValue],
     pos: Option[(Int, Int)],

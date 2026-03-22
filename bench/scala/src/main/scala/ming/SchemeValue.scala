@@ -19,6 +19,12 @@ enum SchemeValue:
   )
   case Cell(content: Array[SchemeValue])
   case ContinuationVal(k: (SchemeValue, Map[String, SchemeValue]) => Bounce)
+
+  case MacroVal(
+    literals: List[String],
+    rules: List[(List[SchemeValue], SchemeValue)],
+    defEnv: Map[String, SchemeValue]
+  )
   case Void
 
   /** write-style display (strings get quotes) — used for evalStr results. */
@@ -33,6 +39,7 @@ enum SchemeValue:
     case p: PairVal           => "(" + displayPairInner(p) + ")"
     case _: LambdaVal         => "#<procedure>"
     case _: ContinuationVal   => "#<continuation>"
+    case _: MacroVal          => "#<macro>"
     case Cell(arr)            => arr(0).display
     case Void                 => ""
 

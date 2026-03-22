@@ -18,8 +18,9 @@ object InterpreterUtils:
     }
 
   def isDefine(expr: SchemeValue): Boolean = expr match
-    case ListVal(SymbolVal("define", _) :: _, _) => true
-    case _                                       => false
+    case ListVal(SymbolVal("define", _) :: _, _)        => true
+    case ListVal(SymbolVal("define-syntax", _) :: _, _) => true
+    case _                                              => false
 
   def makeCell(v: SchemeValue): Cell = Cell(Array(v))
 

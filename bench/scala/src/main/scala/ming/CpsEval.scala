@@ -53,6 +53,20 @@ object CpsEval:
         evalSequenceK(body, env, out, k)
       case ListVal(SymbolVal("cond", _) :: clauses, _) =>
         CpsSpecialForms.evalCondK(clauses, env, out, k)
+      case ListVal(SymbolVal("define-syntax", _) :: rest, pos) =>
+        CpsSpecialForms.evalDefineSyntaxK(rest, pos, env, out, k)
+      case ListVal((head @ SymbolVal(name, _)) :: args, pos) =>
+        env.get(name).map(deref) match
+          case Some(MacroVal(literals, rules, defEnv)) =>
+            val (expanded, extraBindings) = Macros.expand(
+              literals,
+              rules,
+              args,
+              defEnv
+            )
+            evalK(expanded, env ++ extraBindings, out, k)
+          case _ =>
+            evalApplicationK(head, args, pos, env, out, k)
       case ListVal(head :: args, pos) =>
         evalApplicationK(head, args, pos, env, out, k)
       case _: LambdaVal       => More(() => k(expr, env))
@@ -146,7 +160,7 @@ object CpsEval:
       (func, _) =>
         func match
           case SymbolVal("call/cc" | "call-with-current-continuation", _) =>
-            handleCallCCInline(args, env, out, k, pos)
+            CpsApply.handleCallCCInline(args, env, out, k, pos)
           case _ =>
             evalArgsK(
               args,
@@ -159,28 +173,6 @@ object CpsEval:
                     throw new EvalError(s"${e.getMessage}${fmtPos(pos)}")
             )
     )
-
-  private def handleCallCCInline(
-    args: List[SchemeValue],
-    env: Env,
-    out: Array[String],
-    k: Cont,
-    pos: Option[(Int, Int)]
-  ): Bounce =
-    args match
-      case fExpr :: Nil =>
-        evalK(
-          fExpr,
-          env,
-          out,
-          (f, _) =>
-            val contVal = ContinuationVal(k)
-            applyK(f, List(contVal), env, out, k, pos)
-        )
-      case _ =>
-        throw new EvalError(
-          s"call/cc: expected 1 argument, got ${args.length}${fmtPos(pos)}"
-        )
 
   private def evalArgsK(
     args: List[SchemeValue],
@@ -217,7 +209,7 @@ object CpsEval:
   ): Bounce =
     func match
       case lam @ LambdaVal(params, body, closure, selfName, restParam) =>
-        checkArity(params.length, args.length, restParam, pos)
+        CpsApply.checkArity(params.length, args.length, restParam, pos)
         val merged            = callingEnv ++ closure
         val envWithSelf       = selfName.fold(merged)(n => merged + (n -> makeCell(lam)))
         val (required, extra) = args.splitAt(params.length)
@@ -238,60 +230,12 @@ object CpsEval:
 
       case SymbolVal(name, _) =>
         name match
-          case "apply" => handleApplyK(args, callingEnv, out, k)
+          case "apply" => CpsApply.handleApplyK(args, callingEnv, out, k)
           case "call/cc" | "call-with-current-continuation" =>
-            handleCallCCAsValue(args, callingEnv, out, k, pos)
+            CpsApply.handleCallCCAsValue(args, callingEnv, out, k, pos)
           case _ =>
             val (rv, builtinOut) = Builtins.applyBuiltin(name, args)
             out(0) = out(0) + builtinOut
             More(() => k(rv, callingEnv))
 
       case _ => throw new EvalError(s"not a procedure${fmtPos(pos)}")
-
-  private def handleCallCCAsValue(
-    args: List[SchemeValue],
-    env: Env,
-    out: Array[String],
-    k: Cont,
-    pos: Option[(Int, Int)]
-  ): Bounce =
-    args match
-      case f :: Nil =>
-        val contVal = ContinuationVal(k)
-        applyK(f, List(contVal), env, out, k, pos)
-      case _ =>
-        throw new EvalError(
-          s"call/cc: expected 1 argument, got ${args.length}"
-        )
-
-  private def handleApplyK(
-    args: List[SchemeValue],
-    callingEnv: Env,
-    out: Array[String],
-    k: Cont
-  ): Bounce =
-    args match
-      case func :: rest if rest.nonEmpty =>
-        val prefixArgs = rest.init
-        val lastArg    = rest.last
-        val listArgs   = schemeListToList(lastArg)
-        applyK(func, prefixArgs ++ listArgs, callingEnv, out, k, None)
-      case _ => throw new EvalError("apply: need at least 2 arguments")
-
-  private def checkArity(
-    expected: Int,
-    got: Int,
-    restParam: Option[String],
-    pos: Option[(Int, Int)]
-  ): Unit =
-    restParam match
-      case None =>
-        if got != expected then
-          throw new EvalError(
-            s"wrong number of arguments: expected $expected, got $got"
-          )
-      case Some(_) =>
-        if got < expected then
-          throw new EvalError(
-            s"wrong number of arguments: expected at least $expected, got $got"
-          )
