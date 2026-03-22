@@ -24,6 +24,100 @@ public class Interpreter {
             if (args.size() != 1) throw new EvalError("not: expected 1 argument, got " + args.size());
             return new SchemeValue.BoolVal(!args.getFirst().isTruthy());
         });
+        builtin("cons", args -> {
+            if (args.size() != 2) throw new EvalError("cons: expected 2 arguments");
+            return new SchemeValue.PairVal(args.get(0), args.get(1));
+        });
+        builtin("car", args -> {
+            if (args.size() != 1) throw new EvalError("car: expected 1 argument");
+            SchemeValue v = args.getFirst();
+            if (v instanceof SchemeValue.PairVal p) return p.car();
+            if (v instanceof SchemeValue.ListVal l && !l.elements().isEmpty()) return l.elements().getFirst();
+            throw new EvalError("car: expected pair, got: " + v.display());
+        });
+        builtin("cdr", args -> {
+            if (args.size() != 1) throw new EvalError("cdr: expected 1 argument");
+            SchemeValue v = args.getFirst();
+            if (v instanceof SchemeValue.PairVal p) return p.cdr();
+            if (v instanceof SchemeValue.ListVal l && !l.elements().isEmpty()) {
+                return new SchemeValue.ListVal(l.elements().subList(1, l.elements().size()));
+            }
+            throw new EvalError("cdr: expected pair, got: " + v.display());
+        });
+        builtin("null?", args -> {
+            if (args.size() != 1) throw new EvalError("null?: expected 1 argument");
+            SchemeValue v = args.getFirst();
+            return new SchemeValue.BoolVal(v instanceof SchemeValue.ListVal l && l.elements().isEmpty());
+        });
+        builtin("list", args -> {
+            if (args.isEmpty()) return new SchemeValue.ListVal(List.of());
+            SchemeValue result = new SchemeValue.ListVal(List.of());
+            for (int i = args.size() - 1; i >= 0; i--) {
+                result = new SchemeValue.PairVal(args.get(i), result);
+            }
+            return result;
+        });
+        builtin("length", args -> {
+            if (args.size() != 1) throw new EvalError("length: expected 1 argument");
+            SchemeValue v = args.getFirst();
+            long count = 0;
+            while (true) {
+                if (v instanceof SchemeValue.ListVal l) {
+                    count += l.elements().size();
+                    break;
+                } else if (v instanceof SchemeValue.PairVal p) {
+                    count++;
+                    v = p.cdr();
+                } else {
+                    throw new EvalError("length: expected list");
+                }
+            }
+            return new SchemeValue.IntVal(count);
+        });
+        builtin("append", args -> {
+            SchemeValue result = new SchemeValue.ListVal(List.of());
+            for (int i = args.size() - 1; i >= 0; i--) {
+                SchemeValue lst = args.get(i);
+                var elems = new ArrayList<SchemeValue>();
+                while (true) {
+                    if (lst instanceof SchemeValue.PairVal p) {
+                        elems.add(p.car());
+                        lst = p.cdr();
+                    } else if (lst instanceof SchemeValue.ListVal l) {
+                        elems.addAll(l.elements());
+                        break;
+                    } else {
+                        break;
+                    }
+                }
+                for (int j = elems.size() - 1; j >= 0; j--) {
+                    result = new SchemeValue.PairVal(elems.get(j), result);
+                }
+            }
+            return result;
+        });
+        builtin("string?", args -> {
+            if (args.size() != 1) throw new EvalError("string?: expected 1 argument");
+            return new SchemeValue.BoolVal(args.getFirst() instanceof SchemeValue.StringVal);
+        });
+        builtin("number?", args -> {
+            if (args.size() != 1) throw new EvalError("number?: expected 1 argument");
+            return new SchemeValue.BoolVal(args.getFirst() instanceof SchemeValue.IntVal);
+        });
+        builtin("boolean?", args -> {
+            if (args.size() != 1) throw new EvalError("boolean?: expected 1 argument");
+            return new SchemeValue.BoolVal(args.getFirst() instanceof SchemeValue.BoolVal);
+        });
+        builtin("pair?", args -> {
+            if (args.size() != 1) throw new EvalError("pair?: expected 1 argument");
+            SchemeValue v = args.getFirst();
+            return new SchemeValue.BoolVal(v instanceof SchemeValue.PairVal ||
+                (v instanceof SchemeValue.ListVal l && !l.elements().isEmpty()));
+        });
+        builtin("symbol?", args -> {
+            if (args.size() != 1) throw new EvalError("symbol?: expected 1 argument");
+            return new SchemeValue.BoolVal(args.getFirst() instanceof SchemeValue.SymbolVal);
+        });
     }
 
     @FunctionalInterface
@@ -52,6 +146,7 @@ public class Interpreter {
             case SchemeValue.StringVal v -> v;
             case SchemeValue.LambdaVal v -> v;
             case SchemeValue.BuiltinVal v -> v;
+            case SchemeValue.PairVal v -> v;
             case SchemeValue.SymbolVal v -> env.get(v.name());
             case SchemeValue.ListVal v -> evalList(v.elements(), env);
         };
@@ -74,6 +169,9 @@ public class Interpreter {
                     return elements.get(1);
                 }
                 case "lambda" -> { return evalLambda(elements, env); }
+                case "let" -> { return evalLet(elements, env); }
+                case "begin" -> { return evalBegin(elements, env); }
+                case "cond" -> { return evalCond(elements, env); }
             }
         }
         // Evaluate head and call as procedure
@@ -183,6 +281,85 @@ public class Interpreter {
             if (result.isTruthy()) return result;
         }
         return result;
+    }
+
+    private SchemeValue evalLet(List<SchemeValue> elements, Environment env) throws EvalError {
+        if (elements.size() < 3) throw new EvalError("let: bad syntax");
+        // Named let: (let name ((var init) ...) body ...)
+        if (elements.get(1) instanceof SchemeValue.SymbolVal nameSym) {
+            if (elements.size() < 4) throw new EvalError("let: bad syntax");
+            if (!(elements.get(2) instanceof SchemeValue.ListVal bl)) throw new EvalError("let: expected bindings list");
+            var params = new ArrayList<String>();
+            var inits = new ArrayList<SchemeValue>();
+            for (var binding : bl.elements()) {
+                if (!(binding instanceof SchemeValue.ListVal b) || b.elements().size() != 2) {
+                    throw new EvalError("let: bad binding");
+                }
+                if (!(b.elements().getFirst() instanceof SchemeValue.SymbolVal sym)) {
+                    throw new EvalError("let: expected symbol in binding");
+                }
+                params.add(sym.name());
+                inits.add(eval(b.elements().get(1), env));
+            }
+            var body = elements.subList(3, elements.size());
+            var localEnv = new Environment(env);
+            var lambda = new SchemeValue.LambdaVal(params, body, localEnv);
+            localEnv.define(nameSym.name(), lambda);
+            var evalledInits = new ArrayList<SchemeValue>();
+            for (var init : inits) evalledInits.add(init);
+            return apply(lambda, evalledInits);
+        }
+        // Regular let
+        if (!(elements.get(1) instanceof SchemeValue.ListVal bl)) throw new EvalError("let: expected bindings list");
+        var localEnv = new Environment(env);
+        for (var binding : bl.elements()) {
+            if (!(binding instanceof SchemeValue.ListVal b) || b.elements().size() != 2) {
+                throw new EvalError("let: bad binding");
+            }
+            if (!(b.elements().getFirst() instanceof SchemeValue.SymbolVal sym)) {
+                throw new EvalError("let: expected symbol in binding");
+            }
+            localEnv.define(sym.name(), eval(b.elements().get(1), env));
+        }
+        SchemeValue result = null;
+        for (int i = 2; i < elements.size(); i++) {
+            result = eval(elements.get(i), localEnv);
+        }
+        return result;
+    }
+
+    private SchemeValue evalBegin(List<SchemeValue> elements, Environment env) throws EvalError {
+        SchemeValue result = null;
+        for (int i = 1; i < elements.size(); i++) {
+            result = eval(elements.get(i), env);
+        }
+        if (result == null) throw new EvalError("begin: empty body");
+        return result;
+    }
+
+    private SchemeValue evalCond(List<SchemeValue> elements, Environment env) throws EvalError {
+        for (int i = 1; i < elements.size(); i++) {
+            if (!(elements.get(i) instanceof SchemeValue.ListVal clause) || clause.elements().isEmpty()) {
+                throw new EvalError("cond: bad clause");
+            }
+            SchemeValue test = clause.elements().getFirst();
+            if (test instanceof SchemeValue.SymbolVal sym && sym.name().equals("else")) {
+                SchemeValue result = null;
+                for (int j = 1; j < clause.elements().size(); j++) {
+                    result = eval(clause.elements().get(j), env);
+                }
+                return result;
+            }
+            SchemeValue testResult = eval(test, env);
+            if (testResult.isTruthy()) {
+                SchemeValue result = testResult;
+                for (int j = 1; j < clause.elements().size(); j++) {
+                    result = eval(clause.elements().get(j), env);
+                }
+                return result;
+            }
+        }
+        return new SchemeValue.BoolVal(false);
     }
 
     private SchemeValue arithPlus(List<SchemeValue> args) throws EvalError {
