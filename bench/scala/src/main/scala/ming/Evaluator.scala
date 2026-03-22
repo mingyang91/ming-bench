@@ -29,7 +29,19 @@ object Evaluator:
     "=",
     "<=",
     ">=",
-    "not"
+    "not",
+    "cons",
+    "car",
+    "cdr",
+    "null?",
+    "list",
+    "length",
+    "pair?",
+    "number?",
+    "boolean?",
+    "string?",
+    "symbol?",
+    "append"
   )
 
   private val builtinEnv: Map[String, SchemeValue] =

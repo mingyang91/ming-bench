@@ -60,6 +60,38 @@ object Interpreter:
       case ListVal(SymbolVal("and") :: args) => (evalAnd(args, env), env)
       case ListVal(SymbolVal("or") :: args)  => (evalOr(args, env), env)
 
+      // named let: (let name ((var init) ...) body ...)
+      case ListVal(SymbolVal("let") :: SymbolVal(name) :: ListVal(bindings) :: body) =>
+        val (paramNames, initVals) = bindings.map {
+          case ListVal(SymbolVal(p) :: valExpr :: Nil) =>
+            val (v, _) = eval(valExpr, env)
+            (p, v)
+          case _ => throw new EvalError("invalid let binding")
+        }.unzip
+        val lambda = LambdaVal(paramNames, body, env, Some(name))
+        val result = applyFunc(lambda, initVals)
+        (result, env)
+
+      // let
+      case ListVal(SymbolVal("let") :: ListVal(bindings) :: body) =>
+        val letEnv = bindings.foldLeft(env) { (e, binding) =>
+          binding match
+            case ListVal(SymbolVal(name) :: valExpr :: Nil) =>
+              val (v, _) = eval(valExpr, env)
+              e + (name -> v)
+            case _ => throw new EvalError("invalid let binding")
+        }
+        (evalBody(body, letEnv), env)
+
+      // begin
+      case ListVal(SymbolVal("begin") :: body) =>
+        val (result, newEnv) = evalSequence(body, env)
+        (result, newEnv)
+
+      // cond
+      case ListVal(SymbolVal("cond") :: clauses) =>
+        (evalCond(clauses, env), env)
+
       // function application
       case ListVal(head :: args) =>
         val (func, _)  = eval(head, env)
@@ -67,6 +99,7 @@ object Interpreter:
         (applyFunc(func, evaledArgs), env)
 
       case _: LambdaVal => (expr, env)
+      case _: PairVal   => (expr, env)
 
   private def applyFunc(
     func: SchemeValue,
@@ -81,16 +114,78 @@ object Interpreter:
         val envWithSelf = selfName.fold(closure)(n => closure + (n -> lam))
         val localEnv    = envWithSelf ++ params.zip(args).toMap
         evalBody(body, localEnv)
-      case SymbolVal(name) => applyBuiltin(name, args)
+      case SymbolVal(name) => Builtins.applyBuiltin(name, args)
       case _               => throw new EvalError("not a procedure")
 
   private def evalBody(body: List[SchemeValue], env: Env): SchemeValue =
+    // Pre-scan for internal defines so they are mutually visible (letrec-like)
+    val (defines, rest) = body.span(isDefine)
+    val bodyEnv =
+      if defines.isEmpty then env
+      else
+        // First pass: bind all names to Void placeholders
+        val names               = defines.map(extractDefineName)
+        val envWithPlaceholders = names.foldLeft(env)((e, n) => e + (n -> Void))
+        // Second pass: evaluate definitions with all names in scope
+        val envAfterDefs = defines.foldLeft(envWithPlaceholders) { (e, d) =>
+          val (_, newE) = eval(d, e)
+          newE
+        }
+        // Third pass: update lambda closures to include all siblings (mutual recursion)
+        val finalEnv = names.foldLeft(envAfterDefs) { (e, name) =>
+          e(name) match
+            case LambdaVal(params, body, closure, selfName) =>
+              val updatedClosure = closure ++ names.map(n => n -> e(n)).toMap
+              e + (name -> LambdaVal(params, body, updatedClosure, selfName))
+            case _ => e
+        }
+        finalEnv
+    rest match
+      case Nil         => Void
+      case last :: Nil => eval(last, bodyEnv)._1
+      case head :: tail =>
+        val (_, newEnv) = eval(head, bodyEnv)
+        evalBodySeq(tail, newEnv)
+
+  private def evalBodySeq(body: List[SchemeValue], env: Env): SchemeValue =
     body match
       case Nil         => Void
       case last :: Nil => eval(last, env)._1
       case head :: tail =>
-        eval(head, env)
-        evalBody(tail, env)
+        val (_, newEnv) = eval(head, env)
+        evalBodySeq(tail, newEnv)
+
+  private def isDefine(expr: SchemeValue): Boolean = expr match
+    case ListVal(SymbolVal("define") :: _) => true
+    case _                                 => false
+
+  private def extractDefineName(expr: SchemeValue): String = expr match
+    case ListVal(SymbolVal("define") :: SymbolVal(name) :: _)               => name
+    case ListVal(SymbolVal("define") :: ListVal(SymbolVal(name) :: _) :: _) => name
+    case _                                                                  => throw new EvalError("invalid define")
+
+  /** Evaluate a sequence of expressions, threading env (for begin with defines). */
+  private def evalSequence(
+    exprs: List[SchemeValue],
+    env: Env
+  ): (SchemeValue, Env) =
+    exprs match
+      case Nil         => (Void, env)
+      case last :: Nil => eval(last, env)
+      case head :: tail =>
+        val (_, newEnv) = eval(head, env)
+        evalSequence(tail, newEnv)
+
+  private def evalCond(clauses: List[SchemeValue], env: Env): SchemeValue =
+    clauses match
+      case Nil => Void
+      case ListVal(SymbolVal("else") :: body) :: _ =>
+        evalBody(body, env)
+      case ListVal(test :: body) :: rest =>
+        val (tv, _) = eval(test, env)
+        if tv.isTruthy then evalBody(body, env)
+        else evalCond(rest, env)
+      case _ => throw new EvalError("invalid cond clause")
 
   private def evalAnd(args: List[SchemeValue], env: Env): SchemeValue =
     args match
@@ -109,56 +204,3 @@ object Interpreter:
         val result = eval(head, env)._1
         if result.isTruthy then result
         else evalOr(tail, env)
-
-  private def applyBuiltin(
-    name: String,
-    args: List[SchemeValue]
-  ): SchemeValue =
-    name match
-      case "+" => arithOp(args, 0L, _ + _)
-      case "-" =>
-        args match
-          case Nil              => throw new EvalError("-: need at least 1 argument")
-          case IntVal(n) :: Nil => IntVal(-n)
-          case _                => arithOp(args.tail, asInt(args.head), _ - _)
-      case "*" => arithOp(args, 1L, _ * _)
-      case "/" =>
-        args match
-          case Nil => throw new EvalError("/: need at least 1 argument")
-          case _ =>
-            args.tail.foldLeft(asInt(args.head)) { (acc, v) =>
-              val d = asInt(v)
-              if d == 0 then throw new EvalError("division by zero")
-              else acc / d
-            } |> IntVal.apply
-      case "<"  => cmpOp(args, _ < _)
-      case ">"  => cmpOp(args, _ > _)
-      case "="  => cmpOp(args, _ == _)
-      case "<=" => cmpOp(args, _ <= _)
-      case ">=" => cmpOp(args, _ >= _)
-      case "not" =>
-        args match
-          case v :: Nil => BoolVal(!v.isTruthy)
-          case _        => throw new EvalError("not: expects 1 argument")
-      case _ => throw new EvalError(s"unknown procedure: $name")
-
-  private def asInt(v: SchemeValue): Long = v match
-    case IntVal(n) => n
-    case other     => throw new EvalError(s"expected number, got: ${other.display}")
-
-  private def arithOp(
-    args: List[SchemeValue],
-    init: Long,
-    op: (Long, Long) => Long
-  ): SchemeValue =
-    IntVal(args.foldLeft(init)((acc, v) => op(acc, asInt(v))))
-
-  private def cmpOp(
-    args: List[SchemeValue],
-    op: (Long, Long) => Boolean
-  ): SchemeValue =
-    args match
-      case a :: b :: Nil => BoolVal(op(asInt(a), asInt(b)))
-      case _             => throw new EvalError("comparison expects 2 arguments")
-
-  extension [A](a: A) private def |>[B](f: A => B): B = f(a)
