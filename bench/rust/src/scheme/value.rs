@@ -27,7 +27,8 @@ pub enum Value {
         rules: Vec<(Value, Value)>,
         def_env: Rc<RefCell<Env>>,
     },
-    Pair(Box<Value>, Box<Value>),
+    Pair(Rc<RefCell<Value>>, Rc<RefCell<Value>>),
+    Vector(Rc<RefCell<Vec<Value>>>),
     Void,
 }
 
@@ -40,7 +41,8 @@ impl PartialEq for Value {
             (Value::Symbol(a), Value::Symbol(b)) => a == b,
             (Value::Char(a), Value::Char(b)) => a == b,
             (Value::List(a), Value::List(b)) => a == b,
-            (Value::Pair(a1, a2), Value::Pair(b1, b2)) => a1 == b1 && a2 == b2,
+            (Value::Pair(a1, a2), Value::Pair(b1, b2)) => *a1.borrow() == *b1.borrow() && *a2.borrow() == *b2.borrow(),
+            (Value::Vector(a), Value::Vector(b)) => *a.borrow() == *b.borrow(),
             (Value::Continuation { id: a }, Value::Continuation { id: b }) => a == b,
             (Value::Void, Value::Void) => true,
             _ => false,
@@ -67,7 +69,36 @@ impl fmt::Display for Value {
                 }
                 write!(f, ")")
             }
-            Value::Pair(car, cdr) => write!(f, "({car} . {cdr})"),
+            Value::Pair(car, cdr) => {
+                write!(f, "(")?;
+                write!(f, "{}", car.borrow())?;
+                let mut current = cdr.borrow().clone();
+                loop {
+                    match current {
+                        Value::Pair(next_car, next_cdr) => {
+                            write!(f, " {}", next_car.borrow())?;
+                            current = next_cdr.borrow().clone();
+                        }
+                        Value::List(ref items) if items.is_empty() => break,
+                        _ => {
+                            write!(f, " . {current}")?;
+                            break;
+                        }
+                    }
+                }
+                write!(f, ")")
+            }
+            Value::Vector(elems) => {
+                write!(f, "#(")?;
+                let elems = elems.borrow();
+                for (i, item) in elems.iter().enumerate() {
+                    if i > 0 {
+                        write!(f, " ")?;
+                    }
+                    write!(f, "{item}")?;
+                }
+                write!(f, ")")
+            }
             Value::Continuation { .. } => write!(f, "#<continuation>"),
             Value::Lambda { .. } => write!(f, "#<procedure>"),
             Value::SyntaxRules { .. } => write!(f, "#<syntax>"),
@@ -99,9 +130,34 @@ impl Value {
             }
             Value::Pair(car, cdr) => {
                 out.push('(');
-                car.display_fmt(out);
-                out.push_str(" . ");
-                cdr.display_fmt(out);
+                car.borrow().display_fmt(out);
+                let mut current = cdr.borrow().clone();
+                loop {
+                    match current {
+                        Value::Pair(next_car, next_cdr) => {
+                            out.push(' ');
+                            next_car.borrow().display_fmt(out);
+                            current = next_cdr.borrow().clone();
+                        }
+                        Value::List(ref items) if items.is_empty() => break,
+                        _ => {
+                            out.push_str(" . ");
+                            current.display_fmt(out);
+                            break;
+                        }
+                    }
+                }
+                out.push(')');
+            }
+            Value::Vector(elems) => {
+                out.push_str("#(");
+                let elems = elems.borrow();
+                for (i, item) in elems.iter().enumerate() {
+                    if i > 0 {
+                        out.push(' ');
+                    }
+                    item.display_fmt(out);
+                }
                 out.push(')');
             }
             Value::Continuation { .. } => out.push_str("#<continuation>"),

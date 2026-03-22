@@ -24,8 +24,11 @@ const BUILTINS: &[&str] = &[
     "call/cc", "call-with-current-continuation",
     "abs", "modulo", "remainder", "quotient", "min", "max", "expt",
     "zero?", "positive?", "negative?", "odd?", "even?",
-    "list-ref", "list-tail", "list?", "assoc", "equal?", "eq?",
+    "list-ref", "list-tail", "list?", "assoc", "equal?", "eq?", "eqv?",
     "map",
+    "vector", "make-vector", "vector-ref", "vector-set!", "vector-length",
+    "vector?", "vector->list", "list->vector",
+    "set-car!", "set-cdr!",
     "char-alphabetic?", "char-numeric?", "char-upcase", "char-downcase",
     "char=?", "char<?",
     "string=?", "string<?", "string-ci=?", "string-upcase", "string-downcase",
@@ -317,6 +320,7 @@ pub fn eval(
             Value::Continuation { .. } => return Ok(current_expr),
             Value::SyntaxRules { .. } => return Ok(current_expr),
             Value::Pair(_, _) => return Ok(current_expr),
+            Value::Vector(_) => return Ok(current_expr),
             Value::Void => return Ok(Value::Void),
         }
     }
@@ -350,7 +354,14 @@ fn eval_list_tco(
             "quote" => return Ok(Trampoline::Done(eval_quote(&items[1..])?)),
             "lambda" => return Ok(Trampoline::Done(eval_lambda(&items[1..], env)?)),
             "let" => return eval_let_tco(&items[1..], env, out, cc),
+            "letrec" => return eval_letrec_tco(&items[1..], env, out, cc),
+            "letrec*" => return eval_letrec_star_tco(&items[1..], env, out, cc),
             "begin" => return eval_begin_tco(&items[1..], env, out, cc),
+            "case" => return eval_case_tco(&items[1..], env, out, cc),
+            "do" => {
+                let val = eval_do(&items[1..], env, out, cc)?;
+                return Ok(Trampoline::Done(val));
+            }
             "cond" => return eval_cond_tco(&items[1..], env, out, cc),
             "set!" => {
                 let val = eval_set(&items[1..], env, out, cc)?;
@@ -418,13 +429,11 @@ fn apply_tco(
             }
             let proc = &args[0];
             let last = &args[args.len() - 1];
-            let Value::List(tail_args) = last else {
-                return Err(EvalError::type_err(format!(
-                    "apply: last argument must be a list, got {last}"
-                )));
-            };
+            let tail_args = to_list(last).ok_or_else(|| EvalError::type_err(format!(
+                "apply: last argument must be a list, got {last}"
+            )))?;
             let mut all_args: Vec<Value> = args[1..args.len() - 1].to_vec();
-            all_args.extend(tail_args.iter().cloned());
+            all_args.extend(tail_args);
             apply_tco(proc, &all_args, out, cc)
         }
         Value::Symbol(ref name) if name == "call/cc" || name == "call-with-current-continuation" => {
@@ -439,12 +448,9 @@ fn apply_tco(
                 return Err(EvalError::arity("map requires at least 2 arguments"));
             }
             let proc = &args[0];
-            let lists: Vec<&Vec<Value>> = args[1..]
+            let lists: Vec<Vec<Value>> = args[1..]
                 .iter()
-                .map(|a| match a {
-                    Value::List(items) => Ok(items),
-                    _ => Err(EvalError::type_err("map: expected list")),
-                })
+                .map(|a| to_list(a).ok_or_else(|| EvalError::type_err("map: expected list")))
                 .collect::<Result<_, _>>()?;
             let len = lists[0].len();
             for l in &lists[1..] {
@@ -599,17 +605,10 @@ fn apply_builtin(name: &str, args: &[Value], out: &mut String) -> Result<Value, 
             if args.len() != 2 {
                 return Err(EvalError::arity("cons requires exactly 2 arguments"));
             }
-            match &args[1] {
-                Value::List(tail) => {
-                    let mut new_list = vec![args[0].clone()];
-                    new_list.extend(tail.iter().cloned());
-                    Ok(Value::List(new_list))
-                }
-                _ => Ok(Value::Pair(
-                    Box::new(args[0].clone()),
-                    Box::new(args[1].clone()),
-                )),
-            }
+            Ok(Value::Pair(
+                Rc::new(RefCell::new(args[0].clone())),
+                Rc::new(RefCell::new(args[1].clone())),
+            ))
         }
         "car" => {
             if args.len() != 1 {
@@ -617,7 +616,7 @@ fn apply_builtin(name: &str, args: &[Value], out: &mut String) -> Result<Value, 
             }
             match &args[0] {
                 Value::List(items) if !items.is_empty() => Ok(items[0].clone()),
-                Value::Pair(car, _) => Ok(*car.clone()),
+                Value::Pair(car, _) => Ok(car.borrow().clone()),
                 _ => Err(EvalError::type_err(format!(
                     "car: expected non-empty list, got {}", args[0]
                 ))),
@@ -631,7 +630,7 @@ fn apply_builtin(name: &str, args: &[Value], out: &mut String) -> Result<Value, 
                 Value::List(items) if !items.is_empty() => {
                     Ok(Value::List(items[1..].to_vec()))
                 }
-                Value::Pair(_, cdr) => Ok(*cdr.clone()),
+                Value::Pair(_, cdr) => Ok(cdr.borrow().clone()),
                 _ => Err(EvalError::type_err(format!(
                     "cdr: expected non-empty list, got {}", args[0]
                 ))),
@@ -641,16 +640,17 @@ fn apply_builtin(name: &str, args: &[Value], out: &mut String) -> Result<Value, 
             if args.len() != 1 {
                 return Err(EvalError::arity("null? requires exactly 1 argument"));
             }
-            Ok(Value::Boolean(matches!(&args[0], Value::List(items) if items.is_empty())))
+            let is_null = matches!(&args[0], Value::List(items) if items.is_empty());
+            Ok(Value::Boolean(is_null))
         }
         "list" => Ok(Value::List(args.to_vec())),
         "length" => {
             if args.len() != 1 {
                 return Err(EvalError::arity("length requires exactly 1 argument"));
             }
-            match &args[0] {
-                Value::List(items) => Ok(Value::Integer(items.len() as i64)),
-                _ => Err(EvalError::type_err(format!(
+            match to_list(&args[0]) {
+                Some(items) => Ok(Value::Integer(items.len() as i64)),
+                None => Err(EvalError::type_err(format!(
                     "length: expected list, got {}", args[0]
                 ))),
             }
@@ -658,9 +658,9 @@ fn apply_builtin(name: &str, args: &[Value], out: &mut String) -> Result<Value, 
         "append" => {
             let mut result = Vec::new();
             for arg in args {
-                match arg {
-                    Value::List(items) => result.extend(items.iter().cloned()),
-                    _ => {
+                match to_list(arg) {
+                    Some(items) => result.extend(items),
+                    None => {
                         return Err(EvalError::type_err(format!(
                             "append: expected list, got {arg}"
                         )));
@@ -731,9 +731,7 @@ fn apply_builtin(name: &str, args: &[Value], out: &mut String) -> Result<Value, 
             if args.len() != 2 {
                 return Err(EvalError::arity("list-ref requires exactly 2 arguments"));
             }
-            let Value::List(items) = &args[0] else {
-                return Err(EvalError::type_err("list-ref: expected list"));
-            };
+            let items = to_list(&args[0]).ok_or_else(|| EvalError::type_err("list-ref: expected list"))?;
             let idx = require_int(&args[1], "list-ref")? as usize;
             match items.get(idx) {
                 Some(val) => Ok(val.clone()),
@@ -746,9 +744,7 @@ fn apply_builtin(name: &str, args: &[Value], out: &mut String) -> Result<Value, 
             if args.len() != 2 {
                 return Err(EvalError::arity("list-tail requires exactly 2 arguments"));
             }
-            let Value::List(items) = &args[0] else {
-                return Err(EvalError::type_err("list-tail: expected list"));
-            };
+            let items = to_list(&args[0]).ok_or_else(|| EvalError::type_err("list-tail: expected list"))?;
             let idx = require_int(&args[1], "list-tail")? as usize;
             if idx > items.len() {
                 return Err(EvalError::type_err(format!(
@@ -761,22 +757,25 @@ fn apply_builtin(name: &str, args: &[Value], out: &mut String) -> Result<Value, 
             if args.len() != 1 {
                 return Err(EvalError::arity("list? requires exactly 1 argument"));
             }
-            Ok(Value::Boolean(matches!(&args[0], Value::List(_))))
+            Ok(Value::Boolean(to_list(&args[0]).is_some()))
         }
         "assoc" => {
             if args.len() != 2 {
                 return Err(EvalError::arity("assoc requires exactly 2 arguments"));
             }
             let key = &args[0];
-            let Value::List(alist) = &args[1] else {
-                return Err(EvalError::type_err("assoc: expected list"));
-            };
-            for entry in alist {
-                let Value::List(pair) = entry else {
+            let alist = to_list(&args[1]).ok_or_else(|| EvalError::type_err("assoc: expected list"))?;
+            for entry in &alist {
+                if let Some(pair) = to_list(entry) {
+                    if !pair.is_empty() && pair[0] == *key {
+                        return Ok(entry.clone());
+                    }
+                } else if let Value::Pair(car, _) = entry {
+                    if *car.borrow() == *key {
+                        return Ok(entry.clone());
+                    }
+                } else {
                     return Err(EvalError::type_err("assoc: expected list of pairs"));
-                };
-                if !pair.is_empty() && pair[0] == *key {
-                    return Ok(entry.clone());
                 }
             }
             Ok(Value::Boolean(false))
@@ -801,6 +800,123 @@ fn apply_builtin(name: &str, args: &[Value], out: &mut String) -> Result<Value, 
                 _ => false,
             };
             Ok(Value::Boolean(result))
+        }
+        "eqv?" => {
+            if args.len() != 2 {
+                return Err(EvalError::arity("eqv? requires exactly 2 arguments"));
+            }
+            let result = match (&args[0], &args[1]) {
+                (Value::Symbol(a), Value::Symbol(b)) => a == b,
+                (Value::Boolean(a), Value::Boolean(b)) => a == b,
+                (Value::Integer(a), Value::Integer(b)) => a == b,
+                (Value::Char(a), Value::Char(b)) => a == b,
+                (Value::List(a), Value::List(b)) => a.is_empty() && b.is_empty(),
+                (Value::Void, Value::Void) => true,
+                _ => false,
+            };
+            Ok(Value::Boolean(result))
+        }
+        // Vector builtins
+        "vector" => {
+            Ok(Value::Vector(Rc::new(RefCell::new(args.to_vec()))))
+        }
+        "make-vector" => {
+            if args.is_empty() || args.len() > 2 {
+                return Err(EvalError::arity("make-vector requires 1 or 2 arguments"));
+            }
+            let len = require_int(&args[0], "make-vector")? as usize;
+            let fill = if args.len() == 2 { args[1].clone() } else { Value::Integer(0) };
+            Ok(Value::Vector(Rc::new(RefCell::new(vec![fill; len]))))
+        }
+        "vector-ref" => {
+            if args.len() != 2 {
+                return Err(EvalError::arity("vector-ref requires exactly 2 arguments"));
+            }
+            let Value::Vector(elems) = &args[0] else {
+                return Err(EvalError::type_err("vector-ref: expected vector"));
+            };
+            let idx = require_int(&args[1], "vector-ref")? as usize;
+            let elems = elems.borrow();
+            match elems.get(idx) {
+                Some(val) => Ok(val.clone()),
+                None => Err(EvalError::type_err(format!(
+                    "vector-ref: index {idx} out of range"
+                ))),
+            }
+        }
+        "vector-length" => {
+            if args.len() != 1 {
+                return Err(EvalError::arity("vector-length requires exactly 1 argument"));
+            }
+            let Value::Vector(elems) = &args[0] else {
+                return Err(EvalError::type_err("vector-length: expected vector"));
+            };
+            Ok(Value::Integer(elems.borrow().len() as i64))
+        }
+        "vector?" => {
+            if args.len() != 1 {
+                return Err(EvalError::arity("vector? requires exactly 1 argument"));
+            }
+            Ok(Value::Boolean(matches!(&args[0], Value::Vector(_))))
+        }
+        "vector->list" => {
+            if args.len() != 1 {
+                return Err(EvalError::arity("vector->list requires exactly 1 argument"));
+            }
+            let Value::Vector(elems) = &args[0] else {
+                return Err(EvalError::type_err("vector->list: expected vector"));
+            };
+            Ok(Value::List(elems.borrow().clone()))
+        }
+        "list->vector" => {
+            if args.len() != 1 {
+                return Err(EvalError::arity("list->vector requires exactly 1 argument"));
+            }
+            let Value::List(items) = &args[0] else {
+                return Err(EvalError::type_err("list->vector: expected list"));
+            };
+            Ok(Value::Vector(Rc::new(RefCell::new(items.clone()))))
+        }
+        "vector-set!" => {
+            if args.len() != 3 {
+                return Err(EvalError::arity("vector-set! requires exactly 3 arguments"));
+            }
+            let Value::Vector(elems) = &args[0] else {
+                return Err(EvalError::type_err("vector-set!: expected vector"));
+            };
+            let idx = require_int(&args[1], "vector-set!")? as usize;
+            let mut elems = elems.borrow_mut();
+            if idx >= elems.len() {
+                return Err(EvalError::type_err(format!(
+                    "vector-set!: index {idx} out of range"
+                )));
+            }
+            elems[idx] = args[2].clone();
+            Ok(Value::Void)
+        }
+        "set-car!" => {
+            if args.len() != 2 {
+                return Err(EvalError::arity("set-car! requires exactly 2 arguments"));
+            }
+            match &args[0] {
+                Value::Pair(car, _) => {
+                    *car.borrow_mut() = args[1].clone();
+                    Ok(Value::Void)
+                }
+                _ => Err(EvalError::type_err("set-car!: expected pair")),
+            }
+        }
+        "set-cdr!" => {
+            if args.len() != 2 {
+                return Err(EvalError::arity("set-cdr! requires exactly 2 arguments"));
+            }
+            match &args[0] {
+                Value::Pair(_, cdr) => {
+                    *cdr.borrow_mut() = args[1].clone();
+                    Ok(Value::Void)
+                }
+                _ => Err(EvalError::type_err("set-cdr!: expected pair")),
+            }
         }
         // Character and string comparison utilities
         "char-alphabetic?" | "char-numeric?" | "char-upcase" | "char-downcase"
@@ -1653,6 +1769,277 @@ fn eval_cond_tco(
         }
     }
     Ok(Trampoline::Done(Value::Void))
+}
+
+fn eval_letrec_tco(
+    args: &[Value],
+    env: &Rc<RefCell<Env>>,
+    out: &mut String,
+    cc: &CcCtx,
+) -> Result<Trampoline, EvalError> {
+    if args.len() < 2 {
+        return Err(EvalError::arity("letrec requires at least 2 arguments"));
+    }
+    let Value::List(bindings) = &args[0] else {
+        return Err(EvalError::type_err("letrec: expected bindings list"));
+    };
+    let local = Env::with_parent(env);
+    // First pass: bind all names to Void so they're visible during init
+    let mut names = Vec::new();
+    for binding in bindings {
+        let Value::List(pair) = binding else {
+            return Err(EvalError::type_err("letrec: expected binding pair"));
+        };
+        if pair.len() != 2 {
+            return Err(EvalError::arity("letrec: binding must have 2 elements"));
+        }
+        let Value::Symbol(name) = &pair[0] else {
+            return Err(EvalError::type_err("letrec: expected variable name"));
+        };
+        local.borrow_mut().set(name.clone(), Value::Void);
+        names.push(name.clone());
+    }
+    // Second pass: evaluate init expressions in the local env and update
+    for (i, binding) in bindings.iter().enumerate() {
+        let Value::List(pair) = binding else { unreachable!() };
+        let val = eval(&pair[1], &local, out, cc)?;
+        local.borrow_mut().set(names[i].clone(), val);
+    }
+    let body = &args[1..];
+    if body.len() > 1 {
+        cc.push_frame(body.to_vec(), Rc::clone(&local), FrameKind::LetOrBegin);
+        for (idx, expr) in body[..body.len() - 1].iter().enumerate() {
+            let saved_tail = cc.in_lambda_tail.get();
+            cc.in_lambda_tail.set(false);
+            cc.set_frame_index(idx);
+            eval(expr, &local, out, cc)?;
+            cc.in_lambda_tail.set(saved_tail);
+        }
+        cc.pop_frame();
+    }
+    Ok(Trampoline::TailCall {
+        expr: body[body.len() - 1].clone(),
+        env: local,
+    })
+}
+
+fn eval_letrec_star_tco(
+    args: &[Value],
+    env: &Rc<RefCell<Env>>,
+    out: &mut String,
+    cc: &CcCtx,
+) -> Result<Trampoline, EvalError> {
+    if args.len() < 2 {
+        return Err(EvalError::arity("letrec* requires at least 2 arguments"));
+    }
+    let Value::List(bindings) = &args[0] else {
+        return Err(EvalError::type_err("letrec*: expected bindings list"));
+    };
+    let local = Env::with_parent(env);
+    // Bind all to Void first
+    for binding in bindings {
+        let Value::List(pair) = binding else {
+            return Err(EvalError::type_err("letrec*: expected binding pair"));
+        };
+        if pair.len() != 2 {
+            return Err(EvalError::arity("letrec*: binding must have 2 elements"));
+        }
+        let Value::Symbol(name) = &pair[0] else {
+            return Err(EvalError::type_err("letrec*: expected variable name"));
+        };
+        local.borrow_mut().set(name.clone(), Value::Void);
+    }
+    // Evaluate sequentially — each init sees prior bindings
+    for binding in bindings {
+        let Value::List(pair) = binding else { unreachable!() };
+        let Value::Symbol(name) = &pair[0] else { unreachable!() };
+        let val = eval(&pair[1], &local, out, cc)?;
+        local.borrow_mut().set(name.clone(), val);
+    }
+    let body = &args[1..];
+    if body.len() > 1 {
+        cc.push_frame(body.to_vec(), Rc::clone(&local), FrameKind::LetOrBegin);
+        for (idx, expr) in body[..body.len() - 1].iter().enumerate() {
+            let saved_tail = cc.in_lambda_tail.get();
+            cc.in_lambda_tail.set(false);
+            cc.set_frame_index(idx);
+            eval(expr, &local, out, cc)?;
+            cc.in_lambda_tail.set(saved_tail);
+        }
+        cc.pop_frame();
+    }
+    Ok(Trampoline::TailCall {
+        expr: body[body.len() - 1].clone(),
+        env: local,
+    })
+}
+
+fn eval_case_tco(
+    args: &[Value],
+    env: &Rc<RefCell<Env>>,
+    out: &mut String,
+    cc: &CcCtx,
+) -> Result<Trampoline, EvalError> {
+    if args.is_empty() {
+        return Err(EvalError::arity("case requires at least 1 argument"));
+    }
+    let key = eval(&args[0], env, out, cc)?;
+    for clause in &args[1..] {
+        let Value::List(parts) = clause else {
+            return Err(EvalError::type_err("case: expected clause"));
+        };
+        if parts.is_empty() {
+            return Err(EvalError::arity("case: empty clause"));
+        }
+        // Check for else clause
+        if let Value::Symbol(s) = &parts[0] {
+            if s == "else" {
+                if parts.len() == 1 {
+                    return Ok(Trampoline::Done(Value::Void));
+                }
+                for expr in &parts[1..parts.len() - 1] {
+                    eval(expr, env, out, cc)?;
+                }
+                return Ok(Trampoline::TailCall {
+                    expr: parts[parts.len() - 1].clone(),
+                    env: Rc::clone(env),
+                });
+            }
+        }
+        // Datum list: ((datum ...) expr ...)
+        let Value::List(datums) = &parts[0] else {
+            return Err(EvalError::type_err("case: expected datum list"));
+        };
+        let matched = datums.iter().any(|d| eqv_match(&key, d));
+        if matched {
+            if parts.len() == 1 {
+                return Ok(Trampoline::Done(Value::Void));
+            }
+            for expr in &parts[1..parts.len() - 1] {
+                eval(expr, env, out, cc)?;
+            }
+            return Ok(Trampoline::TailCall {
+                expr: parts[parts.len() - 1].clone(),
+                env: Rc::clone(env),
+            });
+        }
+    }
+    // No match, no else — return void
+    Ok(Trampoline::Done(Value::Void))
+}
+
+fn eval_do(
+    args: &[Value],
+    env: &Rc<RefCell<Env>>,
+    out: &mut String,
+    cc: &CcCtx,
+) -> Result<Value, EvalError> {
+    if args.len() < 2 {
+        return Err(EvalError::arity("do requires at least 2 arguments"));
+    }
+    let Value::List(bindings) = &args[0] else {
+        return Err(EvalError::type_err("do: expected bindings list"));
+    };
+    let Value::List(test_clause) = &args[1] else {
+        return Err(EvalError::type_err("do: expected test clause"));
+    };
+    if test_clause.is_empty() {
+        return Err(EvalError::arity("do: test clause must have at least a test"));
+    }
+    let commands = &args[2..];
+
+    // Parse bindings: (var init step)
+    let mut var_names = Vec::new();
+    let mut steps: Vec<Option<Value>> = Vec::new();
+
+    let local = Env::with_parent(env);
+    for binding in bindings {
+        let Value::List(parts) = binding else {
+            return Err(EvalError::type_err("do: expected binding (var init step)"));
+        };
+        if parts.len() < 2 || parts.len() > 3 {
+            return Err(EvalError::arity("do: binding must have 2 or 3 elements"));
+        }
+        let Value::Symbol(name) = &parts[0] else {
+            return Err(EvalError::type_err("do: expected variable name"));
+        };
+        let init_val = eval(&parts[1], env, out, cc)?;
+        local.borrow_mut().set(name.clone(), init_val);
+        var_names.push(name.clone());
+        if parts.len() == 3 {
+            steps.push(Some(parts[2].clone()));
+        } else {
+            steps.push(None);
+        }
+    }
+
+    // Loop
+    loop {
+        // Evaluate test
+        let test_result = eval(&test_clause[0], &local, out, cc)?;
+        if test_result.is_truthy() {
+            // Test passed — evaluate result expressions
+            if test_clause.len() == 1 {
+                return Ok(Value::Void);
+            }
+            let mut result = Value::Void;
+            for expr in &test_clause[1..] {
+                result = eval(expr, &local, out, cc)?;
+            }
+            return Ok(result);
+        }
+
+        // Execute commands (body)
+        for cmd in commands {
+            eval(cmd, &local, out, cc)?;
+        }
+
+        // Evaluate step expressions and update all at once
+        let mut new_vals = Vec::new();
+        for (i, step) in steps.iter().enumerate() {
+            if let Some(step_expr) = step {
+                new_vals.push((var_names[i].clone(), eval(step_expr, &local, out, cc)?));
+            }
+        }
+        for (name, val) in new_vals {
+            local.borrow_mut().set(name, val);
+        }
+    }
+}
+
+/// eqv? comparison for case dispatch on literal datums.
+fn eqv_match(key: &Value, datum: &Value) -> bool {
+    match (key, datum) {
+        (Value::Symbol(a), Value::Symbol(b)) => a == b,
+        (Value::Boolean(a), Value::Boolean(b)) => a == b,
+        (Value::Integer(a), Value::Integer(b)) => a == b,
+        (Value::Char(a), Value::Char(b)) => a == b,
+        (Value::Str(a), Value::Str(b)) => a == b,
+        _ => false,
+    }
+}
+
+/// Convert a value (List or Pair chain) to a Vec of elements.
+/// Returns None if not a proper list.
+fn to_list(val: &Value) -> Option<Vec<Value>> {
+    match val {
+        Value::List(items) => Some(items.clone()),
+        Value::Pair(car, cdr) => {
+            let mut result = vec![car.borrow().clone()];
+            let mut current = cdr.borrow().clone();
+            loop {
+                match current {
+                    Value::Pair(next_car, next_cdr) => {
+                        result.push(next_car.borrow().clone());
+                        current = next_cdr.borrow().clone();
+                    }
+                    Value::List(items) if items.is_empty() => return Some(result),
+                    _ => return None, // improper list
+                }
+            }
+        }
+        _ => None,
+    }
 }
 
 fn require_int(val: &Value, op: &str) -> Result<i64, EvalError> {
