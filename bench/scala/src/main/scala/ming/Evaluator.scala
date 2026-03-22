@@ -67,12 +67,13 @@ object Evaluator:
     expr: SchemeValue,
     env: Env
   ): (SchemeValue, Env, String) = expr match
-    case SchemeInt(_)          => (expr, env, "")
-    case SchemeBool(_)         => (expr, env, "")
-    case SchemeString(_)       => (expr, env, "")
-    case SchemeChar(_)         => (expr, env, "")
-    case SchemeVoid            => (expr, env, "")
-    case SchemeLambda(_, _, _) => (expr, env, "")
+    case SchemeInt(_)           => (expr, env, "")
+    case SchemeBool(_)          => (expr, env, "")
+    case SchemeString(_)        => (expr, env, "")
+    case _: SchemeMutableString => (expr, env, "")
+    case SchemeChar(_)          => (expr, env, "")
+    case SchemeVoid             => (expr, env, "")
+    case SchemeLambda(_, _, _)  => (expr, env, "")
     case SchemeSymbol(name) =>
       try (env.lookup(name), env, "")
       catch

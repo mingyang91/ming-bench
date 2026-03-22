@@ -110,7 +110,18 @@ object Parser:
     if token == "#t" then SchemeBool(true)
     else if token == "#f" then SchemeBool(false)
     else if token.startsWith("\"") then SchemeString(token.drop(1).dropRight(1))
+    else if token.startsWith("#\\") then parseCharLiteral(token)
     else
       token.toLongOption match
         case Some(n) => SchemeInt(n)
         case None    => SchemeSymbol(token, pos)
+
+  private def parseCharLiteral(token: String): SchemeValue =
+    val name = token.drop(2)
+    if name.length == 1 then SchemeChar(name.charAt(0))
+    else
+      name match
+        case "space"   => SchemeChar(' ')
+        case "newline" => SchemeChar('\n')
+        case "tab"     => SchemeChar('\t')
+        case _         => throw new EvalError(s"unknown character name: $name")

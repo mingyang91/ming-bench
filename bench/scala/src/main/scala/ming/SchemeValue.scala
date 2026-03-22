@@ -18,6 +18,10 @@ object SchemeValue:
     def display: String                = "\"" + value + "\""
     override def displayOutput: String = value
 
+  class SchemeMutableString(val chars: Array[Char]) extends SchemeValue:
+    def display: String                = "\"" + String(chars) + "\""
+    override def displayOutput: String = String(chars)
+
   class SchemeSymbol(val name: String, override val pos: SourcePos = SourcePos.None) extends SchemeValue:
     def display: String = name
 
