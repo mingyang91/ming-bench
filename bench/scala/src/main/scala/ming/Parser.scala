@@ -27,6 +27,7 @@ object Parser:
         case '"' =>
           val (str, next) = readString(input, pos + 1, new StringBuilder)
           tokenizeLoop(input, next, s""""$str"""" :: acc)
+        case '\'' => tokenizeLoop(input, pos + 1, "'" :: acc)
         case _ =>
           val (tok, next) = readAtom(input, pos, new StringBuilder)
           tokenizeLoop(input, next, tok :: acc)
@@ -76,6 +77,9 @@ object Parser:
       case Nil         => throw new EvalError("unexpected end of input")
       case "(" :: rest => readList(rest, Nil)
       case ")" :: _    => throw new EvalError("unexpected )")
+      case "'" :: rest =>
+        val (quoted, remaining) = readExpr(rest)
+        (SchemeList(List(SchemeSymbol("quote"), quoted)), remaining)
       case tok :: rest => (parseAtom(tok), rest)
 
   @scala.annotation.tailrec
