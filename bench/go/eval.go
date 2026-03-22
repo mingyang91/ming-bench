@@ -475,7 +475,10 @@ func applyBuiltin(name string, args []*Value, expr *Expr, env *Env) (*Value, err
 		if len(args) != 1 {
 			return nil, errAtf(expr, "procedure?: expected 1 argument, got %d", len(args))
 		}
-		return BooleanValue(args[0].Type == TypeLambda), nil
+		a := args[0]
+		isProc := a.Type == TypeLambda || a.Type == TypeContinuation ||
+			(a.Type == TypeSymbol && len(a.StrVal) >= 10 && a.StrVal[:10] == "__builtin:")
+		return BooleanValue(isProc), nil
 	case "procedure-name":
 		if len(args) != 1 {
 			return nil, errAtf(expr, "procedure-name: expected 1 argument, got %d", len(args))
