@@ -10,7 +10,7 @@ object Evaluator:
   def evalStr(input: String): String =
     val exprs = Parser.parseAll(input)
     if exprs.isEmpty then throw new EvalError("no expressions")
-    val (lastVal, _, _) = evalSequence(exprs, Interpreter.defaultEnv, "")
+    val (lastVal, _, _) = evalSequence(exprs, Builtins.defaultEnv, "")
     lastVal.display
 
   /** Evaluate Scheme expressions and return both the result string and any captured output from display/write/newline.
@@ -19,7 +19,7 @@ object Evaluator:
     val exprs = Parser.parseAll(input)
     if exprs.isEmpty then throw new EvalError("no expressions")
     val (lastVal, _, output) =
-      evalSequence(exprs, Interpreter.defaultEnv, "")
+      evalSequence(exprs, Builtins.defaultEnv, "")
     (lastVal.display, output)
 
   @tailrec

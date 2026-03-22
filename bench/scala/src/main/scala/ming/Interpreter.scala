@@ -7,48 +7,6 @@ object Interpreter:
 
   import SchemeValue.*
 
-  private val builtinNames: Set[String] =
-    Set(
-      "+",
-      "-",
-      "*",
-      "/",
-      "<",
-      ">",
-      "=",
-      "<=",
-      ">=",
-      "not",
-      "cons",
-      "car",
-      "cdr",
-      "null?",
-      "list",
-      "length",
-      "string?",
-      "number?",
-      "boolean?",
-      "pair?",
-      "symbol?",
-      "char?",
-      "display",
-      "write",
-      "newline",
-      "string-append",
-      "string-length",
-      "substring",
-      "string->number",
-      "number->string",
-      "symbol->string",
-      "string->symbol",
-      "string-ref"
-    )
-
-  val defaultEnv: Environment =
-    builtinNames.foldLeft(Environment.empty) { (env, name) =>
-      env.define(name, SchemeSymbol(name))
-    }
-
   /** Recursively strip all SchemeLocated wrappers from a value. */
   private def strip(v: SchemeValue): SchemeValue = v match
     case SchemeLocated(inner, _, _) => strip(inner)
@@ -62,13 +20,14 @@ object Interpreter:
     env: Environment
   ): (SchemeValue, Environment, String) =
     expr match
-      case SchemeInt(_)    => (expr, env, "")
-      case SchemeBool(_)   => (expr, env, "")
-      case SchemeString(_) => (expr, env, "")
-      case SchemeNil       => (expr, env, "")
-      case SchemeVoid      => (expr, env, "")
-      case _: SchemeLambda => (expr, env, "")
-      case SchemeChar(_)   => (expr, env, "")
+      case SchemeInt(_)           => (expr, env, "")
+      case SchemeBool(_)          => (expr, env, "")
+      case SchemeString(_)        => (expr, env, "")
+      case _: SchemeMutableString => (expr, env, "")
+      case SchemeNil              => (expr, env, "")
+      case SchemeVoid             => (expr, env, "")
+      case _: SchemeLambda        => (expr, env, "")
+      case SchemeChar(_)          => (expr, env, "")
       case SchemeLocated(inner, line, col) =>
         try eval(inner, env)
         catch

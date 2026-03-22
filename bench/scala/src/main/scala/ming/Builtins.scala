@@ -5,27 +5,75 @@ object Builtins:
 
   import SchemeValue.*
 
+  private val builtinNames: Set[String] =
+    Set(
+      "+",
+      "-",
+      "*",
+      "/",
+      "<",
+      ">",
+      "=",
+      "<=",
+      ">=",
+      "not",
+      "cons",
+      "car",
+      "cdr",
+      "null?",
+      "list",
+      "length",
+      "string?",
+      "number?",
+      "boolean?",
+      "pair?",
+      "symbol?",
+      "char?",
+      "display",
+      "write",
+      "newline",
+      "string-append",
+      "string-length",
+      "substring",
+      "string->number",
+      "number->string",
+      "symbol->string",
+      "string->symbol",
+      "string-ref",
+      "string-copy",
+      "string-set!"
+    )
+
+  val defaultEnv: Environment =
+    builtinNames.foldLeft(Environment.empty) { (env, name) =>
+      env.define(name, SchemeSymbol(name))
+    }
+
   def applyNamedBuiltin(
     name: String,
     args: List[SchemeValue]
   ): SchemeValue = name match
-    case "+"        => arithmeticOp(args, _ + _, 0)
-    case "*"        => arithmeticOp(args, _ * _, 1)
-    case "-"        => subtractOp(args)
-    case "/"        => divideOp(args)
-    case "<"        => comparisonOp(args, _ < _)
-    case ">"        => comparisonOp(args, _ > _)
-    case "="        => comparisonOp(args, _ == _)
-    case "<="       => comparisonOp(args, _ <= _)
-    case ">="       => comparisonOp(args, _ >= _)
-    case "not"      => evalNot(args)
-    case "cons"     => evalCons(args)
-    case "car"      => evalCar(args)
-    case "cdr"      => evalCdr(args)
-    case "null?"    => evalNullPred(args)
-    case "list"     => SchemeList(args)
-    case "length"   => evalLength(args)
-    case "string?"  => typePred(args, _.isInstanceOf[SchemeString])
+    case "+"      => arithmeticOp(args, _ + _, 0)
+    case "*"      => arithmeticOp(args, _ * _, 1)
+    case "-"      => subtractOp(args)
+    case "/"      => divideOp(args)
+    case "<"      => comparisonOp(args, _ < _)
+    case ">"      => comparisonOp(args, _ > _)
+    case "="      => comparisonOp(args, _ == _)
+    case "<="     => comparisonOp(args, _ <= _)
+    case ">="     => comparisonOp(args, _ >= _)
+    case "not"    => evalNot(args)
+    case "cons"   => evalCons(args)
+    case "car"    => evalCar(args)
+    case "cdr"    => evalCdr(args)
+    case "null?"  => evalNullPred(args)
+    case "list"   => SchemeList(args)
+    case "length" => evalLength(args)
+    case "string?" =>
+      typePred(
+        args,
+        { case _: SchemeString | _: SchemeMutableString => true; case _ => false }
+      )
     case "number?"  => typePred(args, _.isInstanceOf[SchemeInt])
     case "boolean?" => typePred(args, _.isInstanceOf[SchemeBool])
     case "pair?" =>
@@ -35,17 +83,19 @@ object Builtins:
       )
     case "symbol?"        => typePred(args, _.isInstanceOf[SchemeSymbol])
     case "char?"          => typePred(args, _.isInstanceOf[SchemeChar])
-    case "string-append"  => evalStringAppend(args)
-    case "string-length"  => evalStringLength(args)
-    case "substring"      => evalSubstring(args)
-    case "string->number" => evalStringToNumber(args)
-    case "number->string" => evalNumberToString(args)
-    case "symbol->string" => evalSymbolToString(args)
-    case "string->symbol" => evalStringToSymbol(args)
-    case "string-ref"     => evalStringRef(args)
+    case "string-append"  => StringBuiltins.evalStringAppend(args)
+    case "string-length"  => StringBuiltins.evalStringLength(args)
+    case "substring"      => StringBuiltins.evalSubstring(args)
+    case "string->number" => StringBuiltins.evalStringToNumber(args)
+    case "number->string" => StringBuiltins.evalNumberToString(args)
+    case "symbol->string" => StringBuiltins.evalSymbolToString(args)
+    case "string->symbol" => StringBuiltins.evalStringToSymbol(args)
+    case "string-ref"     => StringBuiltins.evalStringRef(args)
+    case "string-copy"    => StringBuiltins.evalStringCopy(args)
+    case "string-set!"    => StringBuiltins.evalStringSet(args)
     case _                => throw new EvalError(s"unbound variable: $name")
 
-  private def requireInt(v: SchemeValue): Long = v match
+  def requireInt(v: SchemeValue): Long = v match
     case SchemeInt(n) => n
     case _ =>
       throw new EvalError(s"expected number, got: ${v.display}")
@@ -138,66 +188,6 @@ object Builtins:
       case List(SchemeNil)         => SchemeInt(0)
       case List(SchemeList(elems)) => SchemeInt(elems.length.toLong)
       case _                       => throw new EvalError("length: not a list")
-
-  private def requireString(v: SchemeValue): String = v match
-    case SchemeString(s) => s
-    case _ =>
-      throw new EvalError(s"expected string, got: ${v.display}")
-
-  private def evalStringAppend(args: List[SchemeValue]): SchemeValue =
-    SchemeString(args.map(requireString).mkString)
-
-  private def evalStringLength(args: List[SchemeValue]): SchemeValue =
-    args match
-      case List(v) => SchemeInt(requireString(v).length.toLong)
-      case _       => throw new EvalError("string-length expects 1 argument")
-
-  private def evalSubstring(args: List[SchemeValue]): SchemeValue =
-    args match
-      case List(s, start, end) =>
-        SchemeString(
-          requireString(s).substring(
-            requireInt(start).toInt,
-            requireInt(end).toInt
-          )
-        )
-      case _ => throw new EvalError("substring expects 3 arguments")
-
-  private def evalStringToNumber(args: List[SchemeValue]): SchemeValue =
-    args match
-      case List(v) =>
-        requireString(v).toLongOption match
-          case Some(n) => SchemeInt(n)
-          case None    => SchemeBool(false)
-      case _ =>
-        throw new EvalError("string->number expects 1 argument")
-
-  private def evalNumberToString(args: List[SchemeValue]): SchemeValue =
-    args match
-      case List(v) => SchemeString(requireInt(v).toString)
-      case _ =>
-        throw new EvalError("number->string expects 1 argument")
-
-  private def evalSymbolToString(args: List[SchemeValue]): SchemeValue =
-    args match
-      case List(SchemeSymbol(name)) => SchemeString(name)
-      case _ =>
-        throw new EvalError("symbol->string expects a symbol")
-
-  private def evalStringToSymbol(args: List[SchemeValue]): SchemeValue =
-    args match
-      case List(v) => SchemeSymbol(requireString(v))
-      case _ =>
-        throw new EvalError("string->symbol expects 1 argument")
-
-  private def evalStringRef(args: List[SchemeValue]): SchemeValue =
-    args match
-      case List(s, idx) =>
-        val str = requireString(s)
-        val i   = requireInt(idx).toInt
-        SchemeChar(str.charAt(i))
-      case _ =>
-        throw new EvalError("string-ref expects 2 arguments")
 
   private def typePred(
     args: List[SchemeValue],

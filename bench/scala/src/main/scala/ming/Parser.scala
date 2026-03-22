@@ -124,11 +124,23 @@ object Parser:
   private def parseAtom(token: String): SchemeValue =
     if token == "#t" then SchemeValue.SchemeBool(true)
     else if token == "#f" then SchemeValue.SchemeBool(false)
+    else if token.startsWith("#\\") then parseCharLiteral(token)
     else if token.startsWith("\"") then SchemeValue.SchemeString(token.substring(1, token.length - 1))
     else
       token.toLongOption match
         case Some(n) => SchemeValue.SchemeInt(n)
         case None    => SchemeValue.SchemeSymbol(token)
+
+  private def parseCharLiteral(token: String): SchemeValue =
+    val name = token.substring(2)
+    if name.length == 1 then SchemeValue.SchemeChar(name.charAt(0))
+    else
+      name.toLowerCase match
+        case "space"   => SchemeValue.SchemeChar(' ')
+        case "newline" => SchemeValue.SchemeChar('\n')
+        case "tab"     => SchemeValue.SchemeChar('\t')
+        case _ =>
+          throw new EvalError(s"unknown character name: $name")
 
   private def posToLineCol(input: String, offset: Int): (Int, Int) =
     input.substring(0, offset.min(input.length)).foldLeft((1, 1)) {
