@@ -17,21 +17,40 @@ const (
 	typeString
 	typeSymbol
 	typeVoid
+	typePair
+	typeNull
+	typeLambda
 )
 
+type pair struct {
+	car, cdr value
+}
+
+type lambda struct {
+	params []string
+	body   []*expr
+	env    *env
+}
+
 type value struct {
-	typ    valueType
-	intVal int64
-	boolV  bool
-	strVal string
+	typ       valueType
+	intVal    int64
+	boolV     bool
+	strVal    string
+	pairVal   *pair
+	lambdaVal *lambda
 }
 
 var voidValue = value{typ: typeVoid}
+var nullValue = value{typ: typeNull}
 
-func intValue(n int64) value   { return value{typ: typeInt, intVal: n} }
-func boolValue(b bool) value   { return value{typ: typeBool, boolV: b} }
+func intValue(n int64) value     { return value{typ: typeInt, intVal: n} }
+func boolValue(b bool) value     { return value{typ: typeBool, boolV: b} }
 func stringValue(s string) value { return value{typ: typeString, strVal: s} }
 func symbolValue(s string) value { return value{typ: typeSymbol, strVal: s} }
+func pairValue(car, cdr value) value {
+	return value{typ: typePair, pairVal: &pair{car: car, cdr: cdr}}
+}
 
 func (v value) String() string {
 	switch v.typ {
@@ -48,8 +67,35 @@ func (v value) String() string {
 		return v.strVal
 	case typeVoid:
 		return ""
+	case typeNull:
+		return "()"
+	case typePair:
+		return formatList(v)
+	case typeLambda:
+		return "#<procedure>"
 	}
 	return ""
+}
+
+func formatList(v value) string {
+	var sb strings.Builder
+	sb.WriteByte('(')
+	first := true
+	cur := v
+	for cur.typ == typePair {
+		if !first {
+			sb.WriteByte(' ')
+		}
+		first = false
+		sb.WriteString(cur.pairVal.car.String())
+		cur = cur.pairVal.cdr
+	}
+	if cur.typ != typeNull {
+		sb.WriteString(" . ")
+		sb.WriteString(cur.String())
+	}
+	sb.WriteByte(')')
+	return sb.String()
 }
 
 func isTruthy(v value) bool {
@@ -59,7 +105,7 @@ func isTruthy(v value) bool {
 // ---------- Tokenizer ----------
 
 type token struct {
-	kind string // "lparen", "rparen", "atom"
+	kind string // "lparen", "rparen", "atom", "quote"
 	text string
 	line int
 	col  int
@@ -91,6 +137,13 @@ func tokenize(input string) ([]token, error) {
 			for i < len(input) && input[i] != '\n' {
 				i++
 			}
+			continue
+		}
+
+		if ch == '\'' {
+			tokens = append(tokens, token{kind: "quote", text: "'", line: line, col: col})
+			i++
+			col++
 			continue
 		}
 
@@ -153,7 +206,7 @@ func tokenize(input string) ([]token, error) {
 		// Atom (number, symbol, boolean)
 		startCol := col
 		start := i
-		for i < len(input) && input[i] != ' ' && input[i] != '\t' && input[i] != '\n' && input[i] != '\r' && input[i] != '(' && input[i] != ')' && input[i] != ';' && input[i] != '"' {
+		for i < len(input) && input[i] != ' ' && input[i] != '\t' && input[i] != '\n' && input[i] != '\r' && input[i] != '(' && input[i] != ')' && input[i] != ';' && input[i] != '"' && input[i] != '\'' {
 			i++
 			col++
 		}
@@ -165,11 +218,11 @@ func tokenize(input string) ([]token, error) {
 // ---------- Parser ----------
 
 type expr struct {
-	kind     string // "atom", "list"
-	atom     value
-	list     []*expr
-	line     int
-	col      int
+	kind string // "atom", "list"
+	atom value
+	list []*expr
+	line int
+	col  int
 }
 
 func parse(tokens []token) ([]*expr, error) {
@@ -191,6 +244,24 @@ func parseExpr(tokens []token, pos int) (*expr, int, error) {
 		return nil, pos, fmt.Errorf("unexpected end of input")
 	}
 	tok := tokens[pos]
+
+	if tok.kind == "quote" {
+		// 'x => (quote x)
+		inner, newPos, err := parseExpr(tokens, pos+1)
+		if err != nil {
+			return nil, 0, err
+		}
+		quoteExpr := &expr{
+			kind: "list",
+			list: []*expr{
+				{kind: "atom", atom: symbolValue("quote"), line: tok.line, col: tok.col},
+				inner,
+			},
+			line: tok.line,
+			col:  tok.col,
+		}
+		return quoteExpr, newPos, nil
+	}
 
 	if tok.kind == "lparen" {
 		var elems []*expr
@@ -231,12 +302,6 @@ func parseAtom(text string) value {
 	}
 	if n, err := strconv.ParseInt(text, 10, 64); err == nil {
 		return intValue(n)
-	}
-	// Check for negative numbers with leading -
-	if len(text) > 1 && text[0] == '-' && isAllDigits(text[1:]) {
-		if n, err := strconv.ParseInt(text, 10, 64); err == nil {
-			return intValue(n)
-		}
 	}
 	return symbolValue(text)
 }
@@ -299,27 +364,158 @@ func evalExpr(e *expr, environ *env) (value, error) {
 			return evalAnd(e, environ)
 		case "or":
 			return evalOr(e, environ)
+		case "define":
+			return evalDefine(e, environ)
+		case "if":
+			return evalIf(e, environ)
+		case "quote":
+			if len(e.list) != 2 {
+				return value{}, fmt.Errorf("%d:%d: quote: expected 1 argument", head.line, head.col)
+			}
+			return quoteExpr(e.list[1]), nil
+		case "lambda":
+			return evalLambda(e, environ)
 		}
 	}
 
-	// Evaluate all elements
-	vals := make([]value, len(e.list))
-	for i, sub := range e.list {
+	// Evaluate the operator
+	opVal, err := evalExpr(head, environ)
+	if err != nil {
+		return value{}, err
+	}
+
+	// Evaluate arguments
+	args := make([]value, len(e.list)-1)
+	for i, sub := range e.list[1:] {
 		v, err := evalExpr(sub, environ)
 		if err != nil {
 			return value{}, err
 		}
-		vals[i] = v
+		args[i] = v
 	}
 
-	op := vals[0]
-	args := vals[1:]
+	return applyProc(opVal, args, e)
+}
 
-	if op.typ != typeSymbol {
-		return value{}, fmt.Errorf("%d:%d: not a procedure: %s", head.line, head.col, op.String())
+func applyProc(proc value, args []value, e *expr) (value, error) {
+	head := e.list[0]
+	switch proc.typ {
+	case typeLambda:
+		return applyLambda(proc.lambdaVal, args, e)
+	case typeSymbol:
+		return applyBuiltin(proc.strVal, args, e)
+	default:
+		return value{}, fmt.Errorf("%d:%d: not a procedure: %s", head.line, head.col, proc.String())
+	}
+}
+
+func applyLambda(lam *lambda, args []value, e *expr) (value, error) {
+	if len(args) != len(lam.params) {
+		return value{}, fmt.Errorf("%d:%d: expected %d arguments, got %d", e.line, e.col, len(lam.params), len(args))
+	}
+	callEnv := newEnv(lam.env)
+	for i, p := range lam.params {
+		callEnv.set(p, args[i])
+	}
+	var result value
+	var err error
+	for _, body := range lam.body {
+		result, err = evalExpr(body, callEnv)
+		if err != nil {
+			return value{}, err
+		}
+	}
+	return result, nil
+}
+
+func evalDefine(e *expr, environ *env) (value, error) {
+	if len(e.list) < 3 {
+		return value{}, fmt.Errorf("%d:%d: define: bad syntax", e.list[0].line, e.list[0].col)
+	}
+	target := e.list[1]
+
+	// (define (f params...) body...)
+	if target.kind == "list" {
+		if len(target.list) == 0 {
+			return value{}, fmt.Errorf("%d:%d: define: bad syntax", e.list[0].line, e.list[0].col)
+		}
+		name := target.list[0]
+		if name.kind != "atom" || name.atom.typ != typeSymbol {
+			return value{}, fmt.Errorf("%d:%d: define: expected symbol", name.line, name.col)
+		}
+		params := make([]string, len(target.list)-1)
+		for i, p := range target.list[1:] {
+			if p.kind != "atom" || p.atom.typ != typeSymbol {
+				return value{}, fmt.Errorf("%d:%d: define: expected symbol", p.line, p.col)
+			}
+			params[i] = p.atom.strVal
+		}
+		lam := &lambda{params: params, body: e.list[2:], env: environ}
+		environ.set(name.atom.strVal, value{typ: typeLambda, lambdaVal: lam})
+		return voidValue, nil
 	}
 
-	return applyBuiltin(op.strVal, args, e)
+	// (define x expr)
+	if target.kind != "atom" || target.atom.typ != typeSymbol {
+		return value{}, fmt.Errorf("%d:%d: define: expected symbol", target.line, target.col)
+	}
+	if len(e.list) != 3 {
+		return value{}, fmt.Errorf("%d:%d: define: bad syntax", e.list[0].line, e.list[0].col)
+	}
+	val, err := evalExpr(e.list[2], environ)
+	if err != nil {
+		return value{}, err
+	}
+	environ.set(target.atom.strVal, val)
+	return voidValue, nil
+}
+
+func evalIf(e *expr, environ *env) (value, error) {
+	if len(e.list) < 3 || len(e.list) > 4 {
+		return value{}, fmt.Errorf("%d:%d: if: bad syntax", e.list[0].line, e.list[0].col)
+	}
+	cond, err := evalExpr(e.list[1], environ)
+	if err != nil {
+		return value{}, err
+	}
+	if isTruthy(cond) {
+		return evalExpr(e.list[2], environ)
+	}
+	if len(e.list) == 4 {
+		return evalExpr(e.list[3], environ)
+	}
+	return voidValue, nil
+}
+
+func evalLambda(e *expr, environ *env) (value, error) {
+	if len(e.list) < 3 {
+		return value{}, fmt.Errorf("%d:%d: lambda: bad syntax", e.list[0].line, e.list[0].col)
+	}
+	paramExpr := e.list[1]
+	if paramExpr.kind != "list" {
+		return value{}, fmt.Errorf("%d:%d: lambda: expected parameter list", paramExpr.line, paramExpr.col)
+	}
+	params := make([]string, len(paramExpr.list))
+	for i, p := range paramExpr.list {
+		if p.kind != "atom" || p.atom.typ != typeSymbol {
+			return value{}, fmt.Errorf("%d:%d: lambda: expected symbol", p.line, p.col)
+		}
+		params[i] = p.atom.strVal
+	}
+	lam := &lambda{params: params, body: e.list[2:], env: environ}
+	return value{typ: typeLambda, lambdaVal: lam}, nil
+}
+
+func quoteExpr(e *expr) value {
+	if e.kind == "atom" {
+		return e.atom
+	}
+	// List => build a proper list from elements
+	result := nullValue
+	for i := len(e.list) - 1; i >= 0; i-- {
+		result = pairValue(quoteExpr(e.list[i]), result)
+	}
+	return result
 }
 
 func evalAnd(e *expr, environ *env) (value, error) {
@@ -474,7 +670,7 @@ func EvalStr(input string) (string, error) {
 
 	environ := newEnv(nil)
 	// Pre-bind builtins as symbols
-	for _, name := range []string{"+", "-", "*", "/", "<", ">", "=", "<=", ">=", "not", "and", "or"} {
+	for _, name := range []string{"+", "-", "*", "/", "<", ">", "=", "<=", ">=", "not"} {
 		environ.set(name, symbolValue(name))
 	}
 
@@ -487,6 +683,9 @@ func EvalStr(input string) (string, error) {
 		last = v
 	}
 
+	if last.typ == typeVoid {
+		return "", nil
+	}
 	return last.String(), nil
 }
 
