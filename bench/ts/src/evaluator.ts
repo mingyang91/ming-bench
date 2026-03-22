@@ -386,8 +386,26 @@ class MultipleValues {
   constructor(public vals: Value[]) {}
 }
 
+class ContinuationJumpMulti {
+  constructor(
+    public id: number,
+    public values: Value[],
+    public exprPos: string,
+    public topIdx: number,
+  ) {}
+}
+
 // Exception handler stack
 const exceptionHandlers: ((val: Value) => Value)[] = [];
+
+// Guard frame stack for TCO-compatible guard handling
+interface GuardFrame {
+  guardVar: string;
+  clauses: Expr[];
+  env: Env;
+  pos: Pos;
+}
+const guardFrames: GuardFrame[] = [];
 
 // ── eqv? comparison (used by case) ───────────────────────────────────
 
@@ -996,8 +1014,11 @@ function makeGlobalEnv(output: string[] = []): Env {
       return result;
     }
     if (proc.tag === 'continuation') {
-      if (collected.length !== 1) throw new EvalError('continuation: expected 1 argument');
-      throw new ContinuationJump(proc.id, collected[0], proc.exprPos, proc.topIdx);
+      if (collected.length === 0) throw new EvalError('continuation: expected at least 1 argument');
+      if (collected.length === 1) {
+        throw new ContinuationJump(proc.id, collected[0], proc.exprPos, proc.topIdx);
+      }
+      throw new ContinuationJumpMulti(proc.id, collected, proc.exprPos, proc.topIdx);
     }
     throw new EvalError('apply: first argument must be a procedure');
   }});
@@ -1213,8 +1234,11 @@ function applyFn(fn: Value, args: Value[], pos: Pos): Value {
     return result;
   }
   if (fn.tag === 'continuation') {
-    if (args.length !== 1) throw new EvalError('continuation: expected 1 argument');
-    throw new ContinuationJump(fn.id, args[0], fn.exprPos, fn.topIdx);
+    if (args.length === 0) throw new EvalError('continuation: expected at least 1 argument');
+    if (args.length === 1) {
+      throw new ContinuationJump(fn.id, args[0], fn.exprPos, fn.topIdx);
+    }
+    throw new ContinuationJumpMulti(fn.id, args, fn.exprPos, fn.topIdx);
   }
   throw new EvalError(`${fmtPos(pos)}: not a procedure`);
 }
@@ -1230,6 +1254,8 @@ const SPECIAL_FORMS = new Set([
   'if', 'define', 'set!', 'quote', 'lambda', 'and', 'or',
   'let', 'begin', 'cond', 'define-syntax', 'syntax-rules',
   'syntax-case', 'syntax', 'with-syntax',
+  'guard', 'raise', 'letrec', 'letrec*', 'case',
+  'define-record-type', 'dynamic-wind', 'values', 'call-with-values',
 ]);
 
 function collectPatternVars(patternItems: Expr[], literals: Set<string>): Set<string> {
@@ -1472,7 +1498,10 @@ function expandSyntax(
 
 function evaluate(expr: Expr, env: Env): Value {
   // Trampoline loop for TCO — tail positions reassign expr/env and continue
+  const guardBase = guardFrames.length;
+  try {
   trampoline: while (true) {
+  try {
   switch (expr.tag) {
     case 'number': return { tag: 'number', value: expr.value, exact: expr.exact, num: expr.num, den: expr.den };
     case 'boolean': return { tag: 'boolean', value: expr.value };
@@ -1952,45 +1981,15 @@ function evaluate(expr: Expr, env: Env): Value {
             const clauses = clauseList.items.slice(1);
             const bodyExprs = items.slice(2);
 
-            let bodyResult: Value;
-            try {
-              let res: Value = { tag: 'nil' };
-              for (const b of bodyExprs) {
-                res = evaluate(b, env);
-              }
-              bodyResult = res;
-            } catch (e) {
-              if (e instanceof SchemeRaise) {
-                const guardEnv = new Env(env);
-                guardEnv.define(guardVar, e.value);
-                // Try each clause
-                for (let ci = 0; ci < clauses.length; ci++) {
-                  const clause = clauses[ci];
-                  if (clause.tag !== 'list' || clause.items.length < 1)
-                    throw new EvalError(`${fmtPos(expr.pos)}: guard: bad clause`);
-                  // else clause
-                  if (clause.items[0].tag === 'symbol' && clause.items[0].name === 'else') {
-                    if (clause.items.length === 1) return { tag: 'nil' };
-                    for (let j = 1; j < clause.items.length - 1; j++) {
-                      evaluate(clause.items[j], guardEnv);
-                    }
-                    return evaluate(clause.items[clause.items.length - 1], guardEnv);
-                  }
-                  const test = evaluate(clause.items[0], guardEnv);
-                  if (isTruthy(test)) {
-                    if (clause.items.length === 1) return test;
-                    for (let j = 1; j < clause.items.length - 1; j++) {
-                      evaluate(clause.items[j], guardEnv);
-                    }
-                    return evaluate(clause.items[clause.items.length - 1], guardEnv);
-                  }
-                }
-                // No clause matched — re-raise
-                throw e;
-              }
-              throw e;
+            // Push guard frame for TCO-compatible exception handling
+            guardFrames.push({ guardVar, clauses, env, pos: expr.pos });
+            // Evaluate non-tail body expressions
+            for (let i = 0; i < bodyExprs.length - 1; i++) {
+              evaluate(bodyExprs[i], env);
             }
-            return bodyResult;
+            // Trampoline last body expression — exceptions caught by outer try/catch
+            expr = bodyExprs[bodyExprs.length - 1];
+            continue;
           }
         }
       }
@@ -2033,6 +2032,10 @@ function evaluate(expr: Expr, env: Env): Value {
         } catch (e) {
           if (e instanceof ContinuationJump && e.id === id) {
             return e.value;
+          }
+          if (e instanceof ContinuationJumpMulti && e.id === id) {
+            // Multi-value continuation: throw MultipleValues so call-with-values catches it
+            throw new MultipleValues(e.values);
           }
           throw e;
         }
@@ -2095,8 +2098,14 @@ function evaluate(expr: Expr, env: Env): Value {
 
       // Continuation invocation
       if (fn.tag === 'continuation') {
-        if (args.length !== 1) throw new EvalError(`${fmtPos(expr.pos)}: continuation: expected 1 argument`);
-        throw new ContinuationJump(fn.id, args[0], fn.exprPos, fn.topIdx);
+        if (args.length === 0) throw new EvalError(`${fmtPos(expr.pos)}: continuation: expected at least 1 argument`);
+        if (args.length === 1) {
+          throw new ContinuationJump(fn.id, args[0], fn.exprPos, fn.topIdx);
+        }
+        // Multiple args: the continuation jump carries first value,
+        // but we also throw MultipleValues so call-with-values can catch it.
+        // We wrap in a special value that the catch site unwraps.
+        throw new ContinuationJumpMulti(fn.id, args, fn.exprPos, fn.topIdx);
       }
 
       if (fn.tag === 'builtin') {
@@ -2129,7 +2138,36 @@ function evaluate(expr: Expr, env: Env): Value {
       throw new EvalError(`${fmtPos(expr.pos)}: not a procedure`);
     }
   }
+  } catch (e) {
+    // Guard frame exception handling for TCO-compatible guard
+    if (e instanceof SchemeRaise && guardFrames.length > guardBase) {
+      const frame = guardFrames[guardFrames.length - 1];
+      guardFrames.pop();
+      const guardEnv = new Env(frame.env);
+      guardEnv.define(frame.guardVar, e.value);
+      for (let ci = 0; ci < frame.clauses.length; ci++) {
+        const clause = frame.clauses[ci];
+        if (clause.tag !== 'list' || clause.items.length < 1) continue;
+        if (clause.items[0].tag === 'symbol' && clause.items[0].name === 'else') {
+          if (clause.items.length === 1) { expr = { tag: 'boolean', value: false, pos: frame.pos }; env = frame.env; continue trampoline; }
+          for (let j = 1; j < clause.items.length - 1; j++) evaluate(clause.items[j], guardEnv);
+          expr = clause.items[clause.items.length - 1]; env = guardEnv; continue trampoline;
+        }
+        const test = evaluate(clause.items[0], guardEnv);
+        if (isTruthy(test)) {
+          if (clause.items.length === 1) return test;
+          for (let j = 1; j < clause.items.length - 1; j++) evaluate(clause.items[j], guardEnv);
+          expr = clause.items[clause.items.length - 1]; env = guardEnv; continue trampoline;
+        }
+      }
+      // No clause matched — re-raise
+    }
+    throw e;
+  }
   } // end while
+  } finally {
+    guardFrames.length = guardBase;
+  }
 }
 
 /**
@@ -2142,6 +2180,7 @@ function evalProgram(exprs: Expr[], env: Env): Value {
   gensymCounter = 0;
   pendingContReturn = null;
   exceptionHandlers.length = 0;
+  guardFrames.length = 0;
   syntaxFrames.length = 0;
   for (let i = 0; i < exprs.length; i++) {
     currentTopIdx = i;
@@ -2151,6 +2190,11 @@ function evalProgram(exprs: Expr[], env: Env): Value {
       if (e instanceof ContinuationJump) {
         pendingContReturn = { exprPos: e.exprPos, value: e.value };
         i = e.topIdx - 1; // -1 because for loop increments
+        continue;
+      }
+      if (e instanceof ContinuationJumpMulti) {
+        pendingContReturn = { exprPos: e.exprPos, value: e.values[0] };
+        i = e.topIdx - 1;
         continue;
       }
       throw e;
