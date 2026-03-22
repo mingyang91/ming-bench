@@ -24,6 +24,17 @@ public sealed interface SchemeValue {
     record LambdaVal(List<String> params, List<SchemeValue> body, Environment env) implements SchemeValue {}
     record BuiltinVal(String name, Function<List<SchemeValue>, SchemeValue> fn) implements SchemeValue {}
     record PairVal(SchemeValue car, SchemeValue cdr) implements SchemeValue {}
+    record VoidVal() implements SchemeValue {}
+    record CharVal(char value) implements SchemeValue {}
+
+    /** Scheme `display` output: no quotes on strings, chars as bare characters. */
+    default String displayStr() {
+        return switch (this) {
+            case StringVal v -> v.value();
+            case CharVal v -> String.valueOf(v.value());
+            default -> display();
+        };
+    }
 
     default String display() {
         return switch (this) {
@@ -33,6 +44,8 @@ public sealed interface SchemeValue {
             case SymbolVal v -> v.name();
             case LambdaVal v -> "#<procedure>";
             case BuiltinVal v -> "#<procedure:" + v.name() + ">";
+            case VoidVal v -> "";
+            case CharVal v -> "#\\" + (v.value() == ' ' ? "space" : v.value() == '\n' ? "newline" : String.valueOf(v.value()));
             case ListVal v -> {
                 if (v.elements().isEmpty()) yield "()";
                 var sb = new StringBuilder("(");

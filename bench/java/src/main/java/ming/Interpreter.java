@@ -5,9 +5,14 @@ import java.util.List;
 
 public class Interpreter {
     private final Environment globalEnv = new Environment();
+    private final StringBuilder outputBuffer = new StringBuilder();
 
     public Interpreter() {
         registerBuiltins();
+    }
+
+    public String getOutput() {
+        return outputBuffer.toString();
     }
 
     private void registerBuiltins() {
@@ -118,6 +123,76 @@ public class Interpreter {
             if (args.size() != 1) throw new EvalError("symbol?: expected 1 argument");
             return new SchemeValue.BoolVal(args.getFirst() instanceof SchemeValue.SymbolVal);
         });
+        builtin("char?", args -> {
+            if (args.size() != 1) throw new EvalError("char?: expected 1 argument");
+            return new SchemeValue.BoolVal(args.getFirst() instanceof SchemeValue.CharVal);
+        });
+        // Display/Write/Newline
+        builtin("display", args -> {
+            if (args.size() != 1) throw new EvalError("display: expected 1 argument");
+            outputBuffer.append(args.getFirst().displayStr());
+            return new SchemeValue.VoidVal();
+        });
+        builtin("write", args -> {
+            if (args.size() != 1) throw new EvalError("write: expected 1 argument");
+            outputBuffer.append(args.getFirst().display());
+            return new SchemeValue.VoidVal();
+        });
+        builtin("newline", args -> {
+            if (!args.isEmpty()) throw new EvalError("newline: expected 0 arguments");
+            outputBuffer.append('\n');
+            return new SchemeValue.VoidVal();
+        });
+        // String operations
+        builtin("string-append", args -> {
+            var sb = new StringBuilder();
+            for (var arg : args) {
+                if (!(arg instanceof SchemeValue.StringVal s)) throw new EvalError("string-append: expected string");
+                sb.append(s.value());
+            }
+            return new SchemeValue.StringVal(sb.toString());
+        });
+        builtin("string-length", args -> {
+            if (args.size() != 1) throw new EvalError("string-length: expected 1 argument");
+            if (!(args.getFirst() instanceof SchemeValue.StringVal s)) throw new EvalError("string-length: expected string");
+            return new SchemeValue.IntVal(s.value().length());
+        });
+        builtin("substring", args -> {
+            if (args.size() != 3) throw new EvalError("substring: expected 3 arguments");
+            if (!(args.get(0) instanceof SchemeValue.StringVal s)) throw new EvalError("substring: expected string");
+            long start = requireInt(args.get(1));
+            long end = requireInt(args.get(2));
+            return new SchemeValue.StringVal(s.value().substring((int) start, (int) end));
+        });
+        builtin("string->number", args -> {
+            if (args.size() != 1) throw new EvalError("string->number: expected 1 argument");
+            if (!(args.getFirst() instanceof SchemeValue.StringVal s)) throw new EvalError("string->number: expected string");
+            try {
+                return new SchemeValue.IntVal(Long.parseLong(s.value()));
+            } catch (NumberFormatException e) {
+                return new SchemeValue.BoolVal(false);
+            }
+        });
+        builtin("number->string", args -> {
+            if (args.size() != 1) throw new EvalError("number->string: expected 1 argument");
+            return new SchemeValue.StringVal(String.valueOf(requireInt(args.getFirst())));
+        });
+        builtin("symbol->string", args -> {
+            if (args.size() != 1) throw new EvalError("symbol->string: expected 1 argument");
+            if (!(args.getFirst() instanceof SchemeValue.SymbolVal s)) throw new EvalError("symbol->string: expected symbol");
+            return new SchemeValue.StringVal(s.name());
+        });
+        builtin("string->symbol", args -> {
+            if (args.size() != 1) throw new EvalError("string->symbol: expected 1 argument");
+            if (!(args.getFirst() instanceof SchemeValue.StringVal s)) throw new EvalError("string->symbol: expected string");
+            return new SchemeValue.SymbolVal(s.value());
+        });
+        builtin("string-ref", args -> {
+            if (args.size() != 2) throw new EvalError("string-ref: expected 2 arguments");
+            if (!(args.get(0) instanceof SchemeValue.StringVal s)) throw new EvalError("string-ref: expected string");
+            long idx = requireInt(args.get(1));
+            return new SchemeValue.CharVal(s.value().charAt((int) idx));
+        });
     }
 
     @FunctionalInterface
@@ -152,6 +227,8 @@ public class Interpreter {
             case SchemeValue.LambdaVal v -> v;
             case SchemeValue.BuiltinVal v -> v;
             case SchemeValue.PairVal v -> v;
+            case SchemeValue.VoidVal v -> v;
+            case SchemeValue.CharVal v -> v;
             case SchemeValue.SymbolVal v -> {
                 try {
                     yield env.get(v.name());
@@ -234,7 +311,7 @@ public class Interpreter {
         if (target instanceof SchemeValue.SymbolVal sym) {
             SchemeValue val = eval(elements.get(2), env);
             env.define(sym.name(), val);
-            return val;
+            return new SchemeValue.VoidVal();
         } else if (target instanceof SchemeValue.ListVal nameAndParams) {
             if (nameAndParams.elements().isEmpty()) throw new EvalError(posPrefix(listVal) + "define: bad syntax");
             SchemeValue nameVal = nameAndParams.elements().getFirst();
@@ -251,7 +328,7 @@ public class Interpreter {
             var body = elements.subList(2, elements.size());
             var lambda = new SchemeValue.LambdaVal(params, body, env);
             env.define(nameSym.name(), lambda);
-            return lambda;
+            return new SchemeValue.VoidVal();
         }
         throw new EvalError(posPrefix(listVal) + "define: bad syntax");
     }
