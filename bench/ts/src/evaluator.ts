@@ -1,65 +1,90 @@
 import { EvalError } from './evalError.js';
 
+// ── Source Position ──────────────────────────────────────────────────
+
+interface Pos {
+  line: number;
+  col: number;
+}
+
+function fmtPos(pos: Pos): string {
+  return `${pos.line}:${pos.col}`;
+}
+
 // ── AST ──────────────────────────────────────────────────────────────
 
 type Expr =
-  | { tag: 'number'; value: number }
-  | { tag: 'boolean'; value: boolean }
-  | { tag: 'string'; value: string }
-  | { tag: 'symbol'; name: string }
-  | { tag: 'list'; items: Expr[] };
+  | { tag: 'number'; value: number; pos: Pos }
+  | { tag: 'boolean'; value: boolean; pos: Pos }
+  | { tag: 'string'; value: string; pos: Pos }
+  | { tag: 'symbol'; name: string; pos: Pos }
+  | { tag: 'list'; items: Expr[]; pos: Pos };
 
 // ── Parser ───────────────────────────────────────────────────────────
 
-function tokenize(input: string): string[] {
-  const tokens: string[] = [];
+interface Token {
+  text: string;
+  pos: Pos;
+}
+
+function tokenize(input: string): Token[] {
+  const tokens: Token[] = [];
   let i = 0;
+  let line = 1;
+  let col = 1;
+
+  function advance(): void {
+    if (input[i] === '\n') { line++; col = 1; } else { col++; }
+    i++;
+  }
+
   while (i < input.length) {
     const ch = input[i];
     // whitespace
     if (ch === ' ' || ch === '\t' || ch === '\n' || ch === '\r') {
-      i++;
+      advance();
       continue;
     }
     // comment
     if (ch === ';') {
-      while (i < input.length && input[i] !== '\n') i++;
+      while (i < input.length && input[i] !== '\n') advance();
       continue;
     }
+    const startPos: Pos = { line, col };
     // parens
     if (ch === '(' || ch === ')') {
-      tokens.push(ch);
-      i++;
+      tokens.push({ text: ch, pos: startPos });
+      advance();
       continue;
     }
     // quote shorthand
     if (ch === "'") {
-      tokens.push("'");
-      i++;
+      tokens.push({ text: "'", pos: startPos });
+      advance();
       continue;
     }
     // string literal
     if (ch === '"') {
       let s = '"';
-      i++;
+      advance();
       while (i < input.length && input[i] !== '"') {
         if (input[i] === '\\') {
           s += input[i];
-          i++;
+          advance();
           if (i < input.length) {
             s += input[i];
-            i++;
+            advance();
           }
           continue;
         }
         s += input[i];
-        i++;
+        advance();
       }
       if (i < input.length) {
         s += '"';
-        i++; // closing quote
+        advance(); // closing quote
       }
-      tokens.push(s);
+      tokens.push({ text: s, pos: startPos });
       continue;
     }
     // atom
@@ -76,61 +101,62 @@ function tokenize(input: string): string[] {
       input[i] !== "'"
     ) {
       atom += input[i];
-      i++;
+      advance();
     }
-    tokens.push(atom);
+    tokens.push({ text: atom, pos: startPos });
   }
   return tokens;
 }
 
-function parseTokens(tokens: string[], pos: number): [Expr, number] {
-  if (pos >= tokens.length) {
+function parseTokens(tokens: Token[], idx: number): [Expr, number] {
+  if (idx >= tokens.length) {
     throw new EvalError('unexpected end of input');
   }
-  const token = tokens[pos];
+  const tok = tokens[idx];
+  const p = tok.pos;
 
-  if (token === "'") {
-    const [inner, next] = parseTokens(tokens, pos + 1);
-    return [{ tag: 'list', items: [{ tag: 'symbol', name: 'quote' }, inner] }, next];
+  if (tok.text === "'") {
+    const [inner, next] = parseTokens(tokens, idx + 1);
+    return [{ tag: 'list', items: [{ tag: 'symbol', name: 'quote', pos: p }, inner], pos: p }, next];
   }
 
-  if (token === '(') {
+  if (tok.text === '(') {
     const items: Expr[] = [];
-    pos++;
-    while (pos < tokens.length && tokens[pos] !== ')') {
-      const [expr, next] = parseTokens(tokens, pos);
+    idx++;
+    while (idx < tokens.length && tokens[idx].text !== ')') {
+      const [expr, next] = parseTokens(tokens, idx);
       items.push(expr);
-      pos = next;
+      idx = next;
     }
-    if (pos >= tokens.length) {
-      throw new EvalError('missing closing parenthesis');
+    if (idx >= tokens.length) {
+      throw new EvalError(`${fmtPos(p)}: missing closing parenthesis`);
     }
-    pos++; // skip ')'
-    return [{ tag: 'list', items }, pos];
+    idx++; // skip ')'
+    return [{ tag: 'list', items, pos: p }, idx];
   }
 
-  if (token === ')') {
-    throw new EvalError('unexpected )');
+  if (tok.text === ')') {
+    throw new EvalError(`${fmtPos(p)}: unexpected )`);
   }
 
   // boolean
-  if (token === '#t') return [{ tag: 'boolean', value: true }, pos + 1];
-  if (token === '#f') return [{ tag: 'boolean', value: false }, pos + 1];
+  if (tok.text === '#t') return [{ tag: 'boolean', value: true, pos: p }, idx + 1];
+  if (tok.text === '#f') return [{ tag: 'boolean', value: false, pos: p }, idx + 1];
 
   // number
-  if (/^-?\d+$/.test(token)) {
-    return [{ tag: 'number', value: parseInt(token, 10) }, pos + 1];
+  if (/^-?\d+$/.test(tok.text)) {
+    return [{ tag: 'number', value: parseInt(tok.text, 10), pos: p }, idx + 1];
   }
 
   // string
-  if (token.startsWith('"') && token.endsWith('"')) {
-    const raw = token.slice(1, -1);
+  if (tok.text.startsWith('"') && tok.text.endsWith('"')) {
+    const raw = tok.text.slice(1, -1);
     const value = raw.replace(/\\n/g, '\n').replace(/\\t/g, '\t').replace(/\\"/g, '"').replace(/\\\\/g, '\\');
-    return [{ tag: 'string', value }, pos + 1];
+    return [{ tag: 'string', value, pos: p }, idx + 1];
   }
 
   // symbol
-  return [{ tag: 'symbol', name: token }, pos + 1];
+  return [{ tag: 'symbol', name: tok.text, pos: p }, idx + 1];
 }
 
 function parse(input: string): Expr[] {
@@ -151,11 +177,12 @@ class Env {
   bindings: Map<string, Value> = new Map();
   constructor(public parent: Env | null = null) {}
 
-  get(name: string): Value {
+  get(name: string, pos?: Pos): Value {
     const v = this.bindings.get(name);
     if (v !== undefined) return v;
-    if (this.parent) return this.parent.get(name);
-    throw new EvalError(`unbound variable: ${name}`);
+    if (this.parent) return this.parent.get(name, pos);
+    const prefix = pos ? `${fmtPos(pos)}: ` : '';
+    throw new EvalError(`${prefix}unbound variable: ${name}`);
   }
 
   define(name: string, value: Value): void {
@@ -368,16 +395,17 @@ function evaluate(expr: Expr, env: Env): Value {
     case 'number': return { tag: 'number', value: expr.value };
     case 'boolean': return { tag: 'boolean', value: expr.value };
     case 'string': return { tag: 'string', value: expr.value };
-    case 'symbol': return env.get(expr.name);
+    case 'symbol': return env.get(expr.name, expr.pos);
     case 'list': {
       const items = expr.items;
-      if (items.length === 0) throw new EvalError('empty application');
+      if (items.length === 0) throw new EvalError(`${fmtPos(expr.pos)}: empty application`);
 
       const head = items[0];
       if (head.tag === 'symbol') {
         // Special forms
         switch (head.name) {
           case 'if': {
+            if (items.length < 3) throw new EvalError(`${fmtPos(expr.pos)}: if: too few arguments`);
             const cond = evaluate(items[1], env);
             if (isTruthy(cond)) {
               return evaluate(items[2], env);
@@ -389,6 +417,7 @@ function evaluate(expr: Expr, env: Env): Value {
           }
 
           case 'define': {
+            if (items.length < 2) throw new EvalError(`${fmtPos(expr.pos)}: define: bad syntax`);
             const target = items[1];
             if (target.tag === 'symbol') {
               // (define x expr)
@@ -399,7 +428,7 @@ function evaluate(expr: Expr, env: Env): Value {
             if (target.tag === 'list') {
               // (define (f params...) body...)
               const nameExpr = target.items[0];
-              if (nameExpr.tag !== 'symbol') throw new EvalError('define: expected symbol');
+              if (nameExpr.tag !== 'symbol') throw new EvalError(`${fmtPos(expr.pos)}: define: expected symbol`);
               const params = target.items.slice(1).map(p => {
                 if (p.tag !== 'symbol') throw new EvalError('define: expected symbol');
                 return p.name;
@@ -409,7 +438,7 @@ function evaluate(expr: Expr, env: Env): Value {
               env.define(nameExpr.name, lambda);
               return { tag: 'nil' };
             }
-            throw new EvalError('define: bad syntax');
+            throw new EvalError(`${fmtPos(expr.pos)}: define: bad syntax`);
           }
 
           case 'quote':
@@ -417,7 +446,7 @@ function evaluate(expr: Expr, env: Env): Value {
 
           case 'lambda': {
             const paramsExpr = items[1];
-            if (paramsExpr.tag !== 'list') throw new EvalError('lambda: expected parameter list');
+            if (paramsExpr.tag !== 'list') throw new EvalError(`${fmtPos(expr.pos)}: lambda: expected parameter list`);
             const params = paramsExpr.items.map(p => {
               if (p.tag !== 'symbol') throw new EvalError('lambda: expected symbol');
               return p.name;
@@ -501,7 +530,14 @@ function evaluate(expr: Expr, env: Env): Value {
       const fn = evaluate(head, env);
       const args = items.slice(1).map(a => evaluate(a, env));
       if (fn.tag === 'builtin') {
-        return fn.fn(args);
+        try {
+          return fn.fn(args);
+        } catch (e) {
+          if (e instanceof EvalError && !e.message.match(/^\d+:/)) {
+            throw new EvalError(`${fmtPos(expr.pos)}: ${e.message}`);
+          }
+          throw e;
+        }
       }
       if (fn.tag === 'lambda') {
         const callEnv = new Env(fn.env);
@@ -514,7 +550,7 @@ function evaluate(expr: Expr, env: Env): Value {
         }
         return result;
       }
-      throw new EvalError('not a procedure');
+      throw new EvalError(`${fmtPos(expr.pos)}: not a procedure`);
     }
   }
 }
