@@ -87,6 +87,8 @@ pub enum Value {
         def_env: Env,
     },
     Vector(Rc<RefCell<Vec<Value>>>),
+    /// Multiple return values from `values`.
+    Values(Vec<Value>),
 }
 
 impl Value {
@@ -109,6 +111,7 @@ impl PartialEq for Value {
             (Value::Builtin(a), Value::Builtin(b)) => a == b,
             (Value::Continuation { id: a, .. }, Value::Continuation { id: b, .. }) => a == b,
             (Value::Vector(a), Value::Vector(b)) => *a.borrow() == *b.borrow(),
+            (Value::Values(a), Value::Values(b)) => a == b,
             (Value::Macro { .. }, Value::Macro { .. }) => false,
             _ => false,
         }
@@ -133,6 +136,11 @@ impl Value {
                     elem.display_fmt(buf);
                 }
                 buf.push(')');
+            }
+            Value::Values(vals) => {
+                if let Some(last) = vals.last() {
+                    last.display_fmt(buf);
+                }
             }
             Value::Builtin(_)
             | Value::Lambda { .. }
@@ -176,6 +184,13 @@ impl fmt::Display for Value {
             Value::Builtin(name) => write!(f, "#<procedure:{name}>"),
             Value::Continuation { .. } => write!(f, "#<continuation>"),
             Value::Macro { .. } => write!(f, "#<macro>"),
+            Value::Values(vals) => {
+                if let Some(last) = vals.last() {
+                    write!(f, "{last}")
+                } else {
+                    write!(f, "")
+                }
+            }
         }
     }
 }

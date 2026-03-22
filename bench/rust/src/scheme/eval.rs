@@ -180,6 +180,19 @@ fn eval_list_step(
 
     // Check for builtin functions by name before evaluating
     if let ExprKind::Symbol(name) = &elements[0].kind {
+        if name == "call-with-values" {
+            let args: Vec<Value> = elements[1..]
+                .iter()
+                .map(|e| eval(e, env, output, ctx))
+                .collect::<Result<Vec<_>, _>>()?;
+            return apply_step(
+                &Value::Builtin("call-with-values".into()),
+                &args,
+                &elements[0].span,
+                output,
+                ctx,
+            );
+        }
         if name == "map" {
             let args: Vec<Value> = elements[1..]
                 .iter()
@@ -287,6 +300,8 @@ fn is_builtin(name: &str) -> bool {
             | "vector->list"
             | "list->vector"
             | "reverse"
+            | "values"
+            | "call-with-values"
     )
 }
 
@@ -364,6 +379,30 @@ fn apply_step(
                 }
                 let result = do_callcc(&args[0], span, output, ctx)?;
                 Ok(TcoAction::Result(result))
+            }
+            "call-with-values" => {
+                if args.len() != 2 {
+                    return Err(EvalErrorKind::Arity {
+                        name: "call-with-values".into(),
+                        expected: "2".into(),
+                        got: args.len(),
+                    }
+                    .at(span));
+                }
+                let producer = &args[0];
+                let consumer = &args[1];
+                // Call the producer with no arguments
+                let produced = apply_step(producer, &[], span, output, ctx)?;
+                let produced_val = match produced {
+                    TcoAction::Result(v) => v,
+                    TcoAction::TailCall { expr, env } => eval(&expr, &env, output, ctx)?,
+                };
+                // Unpack Values into argument list
+                let consumer_args = match produced_val {
+                    Value::Values(vals) => vals,
+                    single => vec![single],
+                };
+                apply_step(consumer, &consumer_args, span, output, ctx)
             }
             "map" => {
                 let v = eval_map(args, span, output, ctx)?;
@@ -798,6 +837,13 @@ fn eval_builtin(
         "vector->list" => eval_vector_to_list(args, span),
         "list->vector" => eval_list_to_vector(args, span),
         "reverse" => eval_reverse(args, span),
+        "values" => {
+            if args.len() == 1 {
+                Ok(args[0].clone())
+            } else {
+                Ok(Value::Values(args.to_vec()))
+            }
+        }
         _ => Err(EvalErrorKind::UnboundVariable {
             name: name.to_string(),
         }
