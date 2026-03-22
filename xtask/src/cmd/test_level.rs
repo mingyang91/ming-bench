@@ -3,6 +3,7 @@ use std::fs;
 use std::path::Path;
 
 const IMAGE_NAME: &str = "ming";
+const NODE_IMAGE: &str = "ming-node";
 
 pub fn run(level: &str, gate: bool, lang: &str) -> Result<()> {
     let parsed_lang = crate::model::Lang::from_str(lang).map_err(|msg| Error::CommandFailed {
@@ -14,7 +15,8 @@ pub fn run(level: &str, gate: bool, lang: &str) -> Result<()> {
         crate::model::Lang::Rust => run_rust(level, gate),
         crate::model::Lang::Scala => run_mill(level, gate),
         crate::model::Lang::Java => run_gradle(level, gate),
-        _ => run_script(level, gate, &parsed_lang),
+        crate::model::Lang::Go => run_go(level, gate),
+        crate::model::Lang::TypeScript => run_ts(level, gate),
     }
 }
 
@@ -200,54 +202,160 @@ fn run_jvm_container(proj: &Path, jar: &Path, level: &str, lang_label: &str) -> 
     Ok(())
 }
 
-/// Run tests for non-Rust languages by calling build.sh + test.sh scripts.
-fn run_script(level: &str, gate: bool, lang: &crate::model::Lang) -> Result<()> {
+/// Run Go tests: compile static binary on host, execute in container.
+fn run_go(level: &str, gate: bool) -> Result<()> {
     let proj = project_dir();
-    let lang_dir = lang.bench_dir(&proj);
+    let lang_dir = proj.join("bench/go");
 
-    if !lang_dir.is_dir() {
-        return Err(Error::CommandFailed {
-            cmd: format!("bench/{} directory not found", lang.dir_name()),
-            exit_code: 1,
-        });
-    }
-
-    // Build
-    let build_script = lang_dir.join("build.sh");
-    if build_script.is_file() {
-        println!("Building {} tests...", lang.display_name());
-        let exit = run_cmd("bash", &["build.sh"], &lang_dir)?;
-        if exit != 0 {
-            return Err(Error::CommandFailed {
-                cmd: format!("build.sh ({})", lang.display_name()),
-                exit_code: exit,
-            });
-        }
-    }
-
-    // Test
-    let test_script = lang_dir.join("test.sh");
-    if !test_script.is_file() {
-        return Err(Error::CommandFailed {
-            cmd: format!("bench/{}/test.sh not found", lang.dir_name()),
-            exit_code: 1,
-        });
-    }
-
-    println!("Running {} tests (level {level})...", lang.display_name());
-    let mut test_args = vec!["test.sh", level];
-    if gate {
-        test_args.push("--gate");
-    }
-    let exit = run_cmd("bash", &test_args, &lang_dir)?;
-
+    // Build test binary on host
+    println!("Building Go test binary...");
+    let exit = run_cmd("bash", &["build.sh"], &lang_dir)?;
     if exit != 0 {
         return Err(Error::CommandFailed {
-            cmd: format!("test.sh ({})", lang.display_name()),
+            cmd: "build.sh (Go)".to_string(),
             exit_code: exit,
         });
     }
 
+    let test_bin = lang_dir.join("test_bin");
+    if !test_bin.is_file() {
+        return Err(Error::CommandFailed {
+            cmd: "Go test binary not found after build".to_string(),
+            exit_code: 1,
+        });
+    }
+
+    if gate {
+        println!("No quality gate configured for Go (skipping).");
+    }
+
+    run_go_container(&proj, &lang_dir, level)
+}
+
+fn run_go_container(proj: &Path, lang_dir: &Path, level: &str) -> Result<()> {
+    let (timeout, filter) = if level == "all" {
+        (300, String::new())
+    } else {
+        (30, format!("TestL{level}"))
+    };
+
+    let bench_level = if level == "all" {
+        LEVELS.last().expect("no levels defined").to_string()
+    } else {
+        level.to_string()
+    };
+
+    let bench_dir = proj.join("bench");
+    let bin_mount = format!("{}:/bench/go/test_bin:ro,Z", lang_dir.join("test_bin").display());
+    let fixtures_mount = format!("{}:/bench/fixtures:ro,Z", bench_dir.join("fixtures").display());
+    let tests_mount = format!("{}:/bench/tests.json:ro,Z", bench_dir.join("tests.json").display());
+    let bench_level_env = format!("BENCH_LEVEL={bench_level}");
+
+    let bash_cmd = if filter.is_empty() {
+        format!("cd /bench/go && timeout {timeout}s ./test_bin -test.v -test.timeout {timeout}s 2>&1")
+    } else {
+        format!("cd /bench/go && timeout {timeout}s ./test_bin -test.run '{filter}' -test.v -test.timeout {timeout}s 2>&1")
+    };
+
+    println!("Running Go tests (level {level}) in container...");
+    let exit = run_cmd(
+        "sudo",
+        &[
+            "podman", "run", "--rm",
+            "--memory=1g", "--cpus=1", "--pids-limit=256",
+            "-v", &bin_mount,
+            "-v", &fixtures_mount,
+            "-v", &tests_mount,
+            "-e", &bench_level_env,
+            IMAGE_NAME,
+            &bash_cmd,
+        ],
+        proj,
+    )?;
+    if exit != 0 {
+        return Err(Error::CommandFailed {
+            cmd: "podman run (Go test)".to_string(),
+            exit_code: exit,
+        });
+    }
+    Ok(())
+}
+
+/// Run TypeScript tests: npm install on host, execute vitest in container.
+fn run_ts(level: &str, gate: bool) -> Result<()> {
+    let proj = project_dir();
+    let lang_dir = proj.join("bench/ts");
+
+    // Build (npm install + tsc) on host
+    println!("Building TypeScript tests...");
+    let exit = run_cmd("bash", &["build.sh"], &lang_dir)?;
+    if exit != 0 {
+        return Err(Error::CommandFailed {
+            cmd: "build.sh (TypeScript)".to_string(),
+            exit_code: exit,
+        });
+    }
+
+    if !lang_dir.join("node_modules").is_dir() {
+        return Err(Error::CommandFailed {
+            cmd: "node_modules not found after build".to_string(),
+            exit_code: 1,
+        });
+    }
+
+    if gate {
+        println!("No quality gate configured for TypeScript (skipping).");
+    }
+
+    run_node_container(&proj, &lang_dir, level)
+}
+
+fn run_node_container(proj: &Path, lang_dir: &Path, level: &str) -> Result<()> {
+    let (timeout, name_pattern) = if level == "all" {
+        (300, String::new())
+    } else {
+        (30, format!("l{level}"))
+    };
+
+    let bench_level = if level == "all" {
+        LEVELS.last().expect("no levels defined").to_string()
+    } else {
+        level.to_string()
+    };
+
+    let bench_dir = proj.join("bench");
+    let ts_mount = format!("{}:/bench/ts:Z", lang_dir.display());
+    let fixtures_mount = format!("{}:/bench/fixtures:ro,Z", bench_dir.join("fixtures").display());
+    let tests_mount = format!("{}:/bench/tests.json:ro,Z", bench_dir.join("tests.json").display());
+    let bench_level_env = format!("BENCH_LEVEL={bench_level}");
+
+    let bash_cmd = if name_pattern.is_empty() {
+        format!("cd /bench/ts && timeout {timeout}s npx vitest run --reporter=verbose 2>&1")
+    } else {
+        format!("cd /bench/ts && timeout {timeout}s npx vitest run --reporter=verbose --testNamePattern '{name_pattern}' 2>&1")
+    };
+
+    println!("Running TypeScript tests (level {level}) in container...");
+    let exit = run_cmd(
+        "sudo",
+        &[
+            "podman", "run", "--rm",
+            "--memory=2g", "--cpus=1", "--pids-limit=256",
+            "-v", &ts_mount,
+            "-v", &fixtures_mount,
+            "-v", &tests_mount,
+            "-e", &bench_level_env,
+            NODE_IMAGE,
+            &bash_cmd,
+        ],
+        proj,
+    )?;
+    if exit != 0 {
+        return Err(Error::CommandFailed {
+            cmd: "podman run (TypeScript test)".to_string(),
+            exit_code: exit,
+        });
+    }
     Ok(())
 }
 
