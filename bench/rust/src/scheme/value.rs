@@ -1,6 +1,7 @@
 use std::fmt;
 
 use crate::scheme::env::Env;
+use crate::scheme::macro_expand::SyntaxRulesDef;
 use crate::scheme::parser::Expr;
 
 /// A saved evaluation context frame for continuation resumption.
@@ -73,6 +74,10 @@ pub enum Value {
         id: u64,
         frames: Vec<ResumeFrame>,
     },
+    Macro {
+        syntax_rules: SyntaxRulesDef,
+        def_env: Env,
+    },
 }
 
 impl Value {
@@ -94,6 +99,7 @@ impl PartialEq for Value {
             (Value::Pair(a1, a2), Value::Pair(b1, b2)) => a1 == b1 && a2 == b2,
             (Value::Builtin(a), Value::Builtin(b)) => a == b,
             (Value::Continuation { id: a, .. }, Value::Continuation { id: b, .. }) => a == b,
+            (Value::Macro { .. }, Value::Macro { .. }) => false,
             _ => false,
         }
     }
@@ -110,7 +116,8 @@ impl Value {
             }
             Value::Builtin(_)
             | Value::Lambda { .. }
-            | Value::Continuation { .. } => buf.push_str(&self.to_string()),
+            | Value::Continuation { .. }
+            | Value::Macro { .. } => buf.push_str(&self.to_string()),
             other => buf.push_str(&other.to_string()),
         }
     }
@@ -138,6 +145,7 @@ impl fmt::Display for Value {
             Value::Lambda { .. } => write!(f, "#<procedure>"),
             Value::Builtin(name) => write!(f, "#<procedure:{name}>"),
             Value::Continuation { .. } => write!(f, "#<continuation>"),
+            Value::Macro { .. } => write!(f, "#<macro>"),
         }
     }
 }

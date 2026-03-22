@@ -1,5 +1,6 @@
 use crate::scheme::env::Env;
 use crate::scheme::error::{EvalError, EvalErrorKind, Span};
+use crate::scheme::macro_expand;
 use crate::scheme::parser::{Expr, ExprKind};
 use crate::scheme::value::{ContCtx, ResumeFrame, Value};
 
@@ -120,7 +121,38 @@ fn eval_list_step(
                 let v = eval_callcc_form(&elements[1..], kw_span, env, output, ctx)?;
                 return Ok(TcoAction::Result(v));
             }
+            "define-syntax" => {
+                let v = eval_define_syntax(&elements[1..], kw_span, env)?;
+                return Ok(TcoAction::Result(v));
+            }
             _ => {}
+        }
+    }
+
+    // Check for macros before builtins
+    if let ExprKind::Symbol(name) = &elements[0].kind {
+        if let Ok(Value::Macro {
+            syntax_rules,
+            def_env,
+        }) = env.lookup(name)
+        {
+            let hygiene_id = ctx.next_id();
+            let (expanded, introduced) = macro_expand::expand_macro(
+                &syntax_rules,
+                elements,
+                hygiene_id,
+                list_span,
+            )?;
+            let expansion_env = Env::with_parent(env);
+            for (gensym, original) in &introduced {
+                if let Ok(val) = def_env.lookup(original) {
+                    expansion_env.define(gensym.clone(), val);
+                }
+            }
+            return Ok(TcoAction::TailCall {
+                expr: expanded,
+                env: expansion_env,
+            });
         }
     }
 
@@ -278,6 +310,10 @@ fn apply_step(
             ctx.resume_frames = Some(frames.clone());
             Err(EvalErrorKind::ContinuationReturn { id: *id }.at(span))
         }
+        Value::Macro { .. } => Err(EvalErrorKind::NotAProcedure {
+            value: "#<macro>".into(),
+        }
+        .at(span)),
         _ => Err(EvalErrorKind::NotAProcedure {
             value: op.to_string(),
         }
@@ -1341,6 +1377,51 @@ fn eval_string_copy(args: &[Value], span: &Span) -> Result<Value, EvalError> {
     }
     let s = require_string(&args[0], span)?;
     Ok(Value::SchemeString(s.to_string()))
+}
+
+fn eval_define_syntax(args: &[Expr], span: &Span, env: &Env) -> Result<Value, EvalError> {
+    if args.len() != 2 {
+        return Err(EvalErrorKind::Parse {
+            message: "define-syntax requires a name and a transformer".into(),
+        }
+        .at(span));
+    }
+    let name = match &args[0].kind {
+        ExprKind::Symbol(n) => n.clone(),
+        _ => {
+            return Err(EvalErrorKind::Parse {
+                message: "define-syntax: expected symbol as name".into(),
+            }
+            .at(span))
+        }
+    };
+    // args[1] should be (syntax-rules (literals...) rules...)
+    match &args[1].kind {
+        ExprKind::List(sr_parts) if !sr_parts.is_empty() => {
+            if let ExprKind::Symbol(kw) = &sr_parts[0].kind {
+                if kw == "syntax-rules" {
+                    let syntax_rules =
+                        macro_expand::parse_syntax_rules(&sr_parts[1..], span)?;
+                    env.define(
+                        name,
+                        Value::Macro {
+                            syntax_rules,
+                            def_env: env.clone(),
+                        },
+                    );
+                    return Ok(Value::Nil);
+                }
+            }
+            Err(EvalErrorKind::Parse {
+                message: "define-syntax: expected syntax-rules transformer".into(),
+            }
+            .at(span))
+        }
+        _ => Err(EvalErrorKind::Parse {
+            message: "define-syntax: expected syntax-rules transformer".into(),
+        }
+        .at(span)),
+    }
 }
 
 fn eval_string_set(
