@@ -6,10 +6,14 @@ import java.util.List;
 public class Parser {
     private final String input;
     private int pos;
+    private int line;
+    private int col;
 
     public Parser(String input) {
         this.input = input;
         this.pos = 0;
+        this.line = 1;
+        this.col = 1;
     }
 
     public List<SchemeValue> parseAll() throws EvalError {
@@ -25,6 +29,22 @@ public class Parser {
         return exprs;
     }
 
+    private char advance() {
+        char c = input.charAt(pos);
+        pos++;
+        if (c == '\n') {
+            line++;
+            col = 1;
+        } else {
+            col++;
+        }
+        return c;
+    }
+
+    private SourcePos currentPos() {
+        return new SourcePos(line, col);
+    }
+
     private SchemeValue parseExpr() throws EvalError {
         skipWhitespace();
         if (pos >= input.length()) {
@@ -38,16 +58,18 @@ public class Parser {
         } else if (c == '#') {
             return parseHash();
         } else if (c == '\'') {
-            pos++;
+            SourcePos sp = currentPos();
+            advance();
             var quoted = parseExpr();
-            return new SchemeValue.ListVal(List.of(new SchemeValue.SymbolVal("quote"), quoted));
+            return new SchemeValue.ListVal(List.of(new SchemeValue.SymbolVal("quote"), quoted)).withPos(sp);
         } else {
             return parseAtom();
         }
     }
 
     private SchemeValue parseList() throws EvalError {
-        pos++; // skip '('
+        SourcePos sp = currentPos();
+        advance(); // skip '('
         var elements = new ArrayList<SchemeValue>();
         skipWhitespace();
         while (pos < input.length() && input.charAt(pos) != ')') {
@@ -55,19 +77,20 @@ public class Parser {
             skipWhitespace();
         }
         if (pos >= input.length()) {
-            throw new EvalError("unmatched '('");
+            throw new EvalError("unmatched '(' at " + sp);
         }
-        pos++; // skip ')'
-        return new SchemeValue.ListVal(elements);
+        advance(); // skip ')'
+        return new SchemeValue.ListVal(elements).withPos(sp);
     }
 
     private SchemeValue parseString() throws EvalError {
-        pos++; // skip opening '"'
+        SourcePos sp = currentPos();
+        advance(); // skip opening '"'
         var sb = new StringBuilder();
         while (pos < input.length() && input.charAt(pos) != '"') {
             if (input.charAt(pos) == '\\') {
-                pos++;
-                if (pos >= input.length()) throw new EvalError("unterminated string");
+                advance();
+                if (pos >= input.length()) throw new EvalError("unterminated string at " + sp);
                 char esc = input.charAt(pos);
                 switch (esc) {
                     case 'n' -> sb.append('\n');
@@ -79,45 +102,47 @@ public class Parser {
             } else {
                 sb.append(input.charAt(pos));
             }
-            pos++;
+            advance();
         }
         if (pos >= input.length()) {
-            throw new EvalError("unterminated string");
+            throw new EvalError("unterminated string at " + sp);
         }
-        pos++; // skip closing '"'
-        return new SchemeValue.StringVal(sb.toString());
+        advance(); // skip closing '"'
+        return new SchemeValue.StringVal(sb.toString()).withPos(sp);
     }
 
     private SchemeValue parseHash() throws EvalError {
-        pos++; // skip '#'
-        if (pos >= input.length()) throw new EvalError("unexpected end after #");
+        SourcePos sp = currentPos();
+        advance(); // skip '#'
+        if (pos >= input.length()) throw new EvalError("unexpected end after # at " + sp);
         char c = input.charAt(pos);
         if (c == 't') {
-            pos++;
-            return new SchemeValue.BoolVal(true);
+            advance();
+            return new SchemeValue.BoolVal(true).withPos(sp);
         } else if (c == 'f') {
-            pos++;
-            return new SchemeValue.BoolVal(false);
+            advance();
+            return new SchemeValue.BoolVal(false).withPos(sp);
         } else {
-            throw new EvalError("unknown hash literal: #" + c);
+            throw new EvalError("unknown hash literal: #" + c + " at " + sp);
         }
     }
 
     private SchemeValue parseAtom() throws EvalError {
+        SourcePos sp = currentPos();
         int start = pos;
         while (pos < input.length() && !isDelimiter(input.charAt(pos))) {
-            pos++;
+            advance();
         }
         String token = input.substring(start, pos);
         if (token.isEmpty()) {
-            throw new EvalError("unexpected character: " + input.charAt(pos));
+            throw new EvalError("unexpected character: " + input.charAt(pos) + " at " + sp);
         }
         // Try parsing as integer
         try {
             long val = Long.parseLong(token);
-            return new SchemeValue.IntVal(val);
+            return new SchemeValue.IntVal(val).withPos(sp);
         } catch (NumberFormatException e) {
-            return new SchemeValue.SymbolVal(token);
+            return new SchemeValue.SymbolVal(token).withPos(sp);
         }
     }
 
@@ -126,9 +151,9 @@ public class Parser {
             char c = input.charAt(pos);
             if (c == ';') {
                 // skip line comment
-                while (pos < input.length() && input.charAt(pos) != '\n') pos++;
+                while (pos < input.length() && input.charAt(pos) != '\n') advance();
             } else if (Character.isWhitespace(c)) {
-                pos++;
+                advance();
             } else {
                 break;
             }

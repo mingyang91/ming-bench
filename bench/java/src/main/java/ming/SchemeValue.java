@@ -1,9 +1,21 @@
 package ming;
 
+import java.util.IdentityHashMap;
 import java.util.List;
+import java.util.Map;
 import java.util.function.Function;
 
 public sealed interface SchemeValue {
+    Map<SchemeValue, SourcePos> POS_MAP = new IdentityHashMap<>();
+
+    default SchemeValue withPos(SourcePos pos) {
+        if (pos != null) POS_MAP.put(this, pos);
+        return this;
+    }
+
+    default SourcePos pos() {
+        return POS_MAP.get(this);
+    }
     record IntVal(long value) implements SchemeValue {}
     record BoolVal(boolean value) implements SchemeValue {}
     record StringVal(String value) implements SchemeValue {}
