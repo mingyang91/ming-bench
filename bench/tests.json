@@ -1560,5 +1560,40 @@
     "fixture": "l25_procedure_name_case_lambda.scm",
     "kind": "eval_str_ok",
     "expected": "#t"
+  },
+  {
+    "name": "l26_procedure_lambda",
+    "level": 26,
+    "fixture": "l26_procedure_lambda.scm",
+    "kind": "eval_str_ok",
+    "expected": "#t"
+  },
+  {
+    "name": "l26_procedure_case_lambda",
+    "level": 26,
+    "fixture": "l26_procedure_case_lambda.scm",
+    "kind": "eval_str_ok",
+    "expected": "#t"
+  },
+  {
+    "name": "l26_procedure_builtin",
+    "level": 26,
+    "fixture": "l26_procedure_builtin.scm",
+    "kind": "eval_str_ok",
+    "expected": "#t"
+  },
+  {
+    "name": "l26_procedure_continuation",
+    "level": 26,
+    "fixture": "l26_procedure_continuation.scm",
+    "kind": "eval_str_ok",
+    "expected": "#t"
+  },
+  {
+    "name": "l26_procedure_non_callable",
+    "level": 26,
+    "fixture": "l26_procedure_non_callable.scm",
+    "kind": "eval_str_ok",
+    "expected": "#t"
   }
 ]
