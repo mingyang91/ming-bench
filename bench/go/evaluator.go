@@ -41,6 +41,18 @@ func (e *Env) set(name string, val *Value) {
 	e.bindings[name] = val
 }
 
+// setExisting mutates an existing binding in the nearest enclosing scope.
+func (e *Env) setExisting(name string, val *Value) bool {
+	if _, ok := e.bindings[name]; ok {
+		e.bindings[name] = val
+		return true
+	}
+	if e.parent != nil {
+		return e.parent.setExisting(name, val)
+	}
+	return false
+}
+
 func makeGlobalEnv() *Env {
 	env := newEnv(nil)
 	env.set("+", builtinVal("+", builtinAdd))
@@ -143,6 +155,8 @@ func evalList(expr *Value, env *Env) (*Value, error) {
 			return evalBegin(expr.Cdr, env)
 		case "cond":
 			return evalCond(expr.Cdr, env)
+		case "set!":
+			return evalSetBang(expr.Cdr, env, expr)
 		case "display":
 			return evalDisplay(expr.Cdr, env)
 		case "write":
@@ -278,6 +292,24 @@ func evalDefine(args *Value, env *Env, expr *Value) (*Value, error) {
 		return voidVal(), nil
 	}
 	return nil, posError(expr, "define: bad syntax")
+}
+
+func evalSetBang(args *Value, env *Env, expr *Value) (*Value, error) {
+	if args.Kind == KindNull || args.Cdr.Kind == KindNull {
+		return nil, posError(expr, "set!: bad syntax")
+	}
+	name := args.Car
+	if name.Kind != KindSymbol {
+		return nil, posError(expr, "set!: expected symbol")
+	}
+	val, err := eval(args.Cdr.Car, env)
+	if err != nil {
+		return nil, err
+	}
+	if !env.setExisting(name.Str, val) {
+		return nil, posError(expr, fmt.Sprintf("set!: unbound variable: %s", name.Str))
+	}
+	return voidVal(), nil
 }
 
 func evalLambda(args *Value, env *Env) (*Value, error) {
