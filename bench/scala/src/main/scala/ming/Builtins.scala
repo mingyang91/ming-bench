@@ -103,7 +103,8 @@ object Builtins:
     "string>?",
     "string<=?",
     "string>=?",
-    "procedure?"
+    "procedure?",
+    "dynamic-wind"
   )
 
   def evalBuiltin(

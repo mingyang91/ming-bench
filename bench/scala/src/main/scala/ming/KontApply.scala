@@ -106,7 +106,26 @@ private[ming] object KontApply:
         case group :: rest =>
           ProcApply.applyProc(proc, group, Kont.ForEachK(proc, rest, nextK), out)
 
+    case dk: (Kont.DynWindInK | Kont.DynWindMark | Kont.DynWindRetK | Kont.DynUnwindK | Kont.DynRewindK) =>
+      applyDynWindKont(value, dk, out)
+
   // --- applyKont helpers ---
+
+  private def applyDynWindKont(
+    value: SchemeValue,
+    dk: Kont.DynWindInK | Kont.DynWindMark | Kont.DynWindRetK | Kont.DynUnwindK | Kont.DynRewindK,
+    out: String
+  ): Step = dk match
+    case Kont.DynWindInK(bodyThunk, entry, nextK) =>
+      ProcApply.applyProc(bodyThunk, Nil, Kont.DynWindMark(entry, nextK), out)
+    case Kont.DynWindMark(entry, nextK) =>
+      ProcApply.applyProc(entry.outThunk, Nil, Kont.DynWindRetK(value, nextK), out)
+    case Kont.DynWindRetK(bodyValue, nextK) =>
+      ReturnS(bodyValue, nextK, out)
+    case Kont.DynUnwindK(remaining, toRewind, savedValue, targetK) =>
+      ProcApply.startUnwind(remaining, toRewind, savedValue, targetK, out)
+    case Kont.DynRewindK(remaining, savedValue, targetK) =>
+      ProcApply.startRewind(remaining, savedValue, targetK, out)
 
   private def applyLetrecInit(
     value: SchemeValue,

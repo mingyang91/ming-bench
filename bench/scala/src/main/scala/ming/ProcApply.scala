@@ -17,7 +17,7 @@ private[ming] object ProcApply:
       SpecialForms.startSequence(body, localEnv, k, out)
     case SchemeContinuation(savedK) =>
       if args.length != 1 then throw new EvalError("continuation: expected 1 argument")
-      ReturnS(args.head, savedK, out)
+      windTransition(k, savedK, args.head, out)
     case SchemeBuiltinProc("call/cc") | SchemeBuiltinProc("call-with-current-continuation") =>
       if args.length != 1 then throw new EvalError("call/cc: expected 1 argument")
       val kontVal = SchemeContinuation(k)
@@ -28,6 +28,8 @@ private[ming] object ProcApply:
       applyMap(args, k, out)
     case SchemeBuiltinProc("for-each") =>
       applyForEach(args, k, out)
+    case SchemeBuiltinProc("dynamic-wind") =>
+      applyDynamicWind(args, k, out)
     case SchemeBuiltinProc(name) =>
       val (result, bo) = Builtins.evalBuiltin(name, args)
       ReturnS(result, k, out + bo)
@@ -105,3 +107,103 @@ private[ming] object ProcApply:
           case first :: rest =>
             applyProc(proc, first, Kont.ForEachK(proc, rest, k), out)
           case Nil => ReturnS(SchemeVoid, k, out)
+
+  private def applyDynamicWind(
+    args: List[SchemeValue],
+    k: Kont,
+    out: String
+  ): Step =
+    if args.length != 3 then throw new EvalError("dynamic-wind: expected 3 arguments")
+    val inThunk   = args(0)
+    val bodyThunk = args(1)
+    val outThunk  = args(2)
+    val entry     = new WinderEntry(inThunk, outThunk)
+    applyProc(inThunk, Nil, Kont.DynWindInK(bodyThunk, entry, k), out)
+
+  private def windTransition(
+    currentK: Kont,
+    targetK: Kont,
+    value: SchemeValue,
+    out: String
+  ): Step =
+    val currentWinders       = extractWinders(currentK)
+    val targetWinders        = extractWinders(targetK)
+    val (toUnwind, toRewind) = computeWindDiff(currentWinders, targetWinders)
+    if toUnwind.isEmpty && toRewind.isEmpty then ReturnS(value, targetK, out)
+    else startUnwind(toUnwind, toRewind, value, targetK, out)
+
+  private[ming] def startUnwind(
+    toUnwind: List[WinderEntry],
+    toRewind: List[WinderEntry],
+    value: SchemeValue,
+    targetK: Kont,
+    out: String
+  ): Step = toUnwind match
+    case Nil => startRewind(toRewind, value, targetK, out)
+    case entry :: rest =>
+      applyProc(entry.outThunk, Nil, Kont.DynUnwindK(rest, toRewind, value, targetK), out)
+
+  private[ming] def startRewind(
+    toRewind: List[WinderEntry],
+    value: SchemeValue,
+    targetK: Kont,
+    out: String
+  ): Step = toRewind match
+    case Nil => ReturnS(value, targetK, out)
+    case entry :: rest =>
+      applyProc(entry.inThunk, Nil, Kont.DynRewindK(rest, value, targetK), out)
+
+  private def extractWinders(k: Kont): List[WinderEntry] =
+    @scala.annotation.tailrec
+    def loop(k: Kont, acc: List[WinderEntry]): List[WinderEntry] = k match
+      case Kont.DynWindMark(entry, next) => loop(next, entry :: acc)
+      case Kont.Halt                     => acc.reverse
+      case other                         => loop(parentKont(other), acc)
+    loop(k, Nil)
+
+  private def parentKont(k: Kont): Kont = k match
+    case Kont.Halt                                  => Kont.Halt
+    case Kont.Seq(_, _, next)                       => next
+    case Kont.EvalOp(_, _, next, _)                 => next
+    case Kont.EvalArg(_, _, _, _, next, _)          => next
+    case Kont.IfK(_, _, _, next)                    => next
+    case Kont.SetK(_, _, next)                      => next
+    case Kont.DefineK(_, _, next)                   => next
+    case Kont.AndK(_, _, next)                      => next
+    case Kont.OrK(_, _, next)                       => next
+    case Kont.CallCCK(next)                         => next
+    case Kont.CondK(_, _, _, next)                  => next
+    case Kont.LetInitK(_, _, _, _, _, next)         => next
+    case Kont.NamedLetInitK(_, _, _, _, _, _, next) => next
+    case Kont.MapK(_, _, _, next)                   => next
+    case Kont.LetrecInitK(_, _, _, _, _, next)      => next
+    case Kont.LetStarInitK(_, _, _, _, next)        => next
+    case Kont.CaseK(_, _, next)                     => next
+    case Kont.ForEachK(_, _, next)                  => next
+    case Kont.DynWindMark(_, next)                  => next
+    case Kont.DynWindInK(_, _, next)                => next
+    case Kont.DynWindRetK(_, next)                  => next
+    case Kont.DynUnwindK(_, _, _, next)             => next
+    case Kont.DynRewindK(_, _, next)                => next
+
+  private def computeWindDiff(
+    current: List[WinderEntry],
+    target: List[WinderEntry]
+  ): (List[WinderEntry], List[WinderEntry]) =
+    val lc = current.length
+    val lt = target.length
+    val (cc, tt) =
+      if lc > lt then (current.drop(lc - lt), target)
+      else (current, target.drop(lt - lc))
+
+    @scala.annotation.tailrec
+    def findCommonLen(a: List[WinderEntry], b: List[WinderEntry]): Int =
+      (a, b) match
+        case (ah :: at, bh :: bt) =>
+          if ah eq bh then a.length else findCommonLen(at, bt)
+        case _ => 0
+
+    val commonLen = findCommonLen(cc, tt)
+    val toUnwind  = current.take(lc - commonLen)
+    val toRewind  = target.take(lt - commonLen).reverse
+    (toUnwind, toRewind)

@@ -97,3 +97,35 @@ object Kont:
     remainingGroups: List[List[SchemeValue]],
     k: Kont
   ) extends Kont
+
+  case class DynWindInK(
+    bodyThunk: SchemeValue,
+    entry: WinderEntry,
+    k: Kont
+  ) extends Kont
+
+  case class DynWindMark(
+    entry: WinderEntry,
+    k: Kont
+  ) extends Kont
+
+  case class DynWindRetK(
+    bodyValue: SchemeValue,
+    k: Kont
+  ) extends Kont
+
+  case class DynUnwindK(
+    toUnwind: List[WinderEntry],
+    toRewind: List[WinderEntry],
+    value: SchemeValue,
+    targetK: Kont
+  ) extends Kont
+
+  case class DynRewindK(
+    toRewind: List[WinderEntry],
+    value: SchemeValue,
+    targetK: Kont
+  ) extends Kont
+
+/** Identity-based entry for dynamic-wind winder tracking. */
+class WinderEntry(val inThunk: SchemeValue, val outThunk: SchemeValue)
