@@ -23,7 +23,13 @@ public class Evaluator {
         int length() { return chars.length; }
     }
     record CharVal(char value) implements SchemeVal {}
-    record ListVal(List<SchemeVal> elements) implements SchemeVal {}
+    static final class ListVal implements SchemeVal {
+        final List<SchemeVal> elements;
+        final boolean improper;
+        ListVal(List<SchemeVal> elements) { this(elements, false); }
+        ListVal(List<SchemeVal> elements, boolean improper) { this.elements = elements; this.improper = improper; }
+        List<SchemeVal> elements() { return elements; }
+    }
     record SymbolVal(String name) implements SchemeVal {}
     record VoidVal() implements SchemeVal {}
     record LambdaVal(List<String> params, String restParam, List<SchemeVal> body, Env env) implements SchemeVal {}
@@ -117,7 +123,13 @@ public class Evaluator {
             "string-append", "string-length", "substring", "string->number", "number->string",
             "symbol->string", "string->symbol", "string-ref", "char?",
             "string-copy", "string-set!", "apply",
-            "call/cc", "call-with-current-continuation"};
+            "call/cc", "call-with-current-continuation",
+            "abs", "modulo", "remainder", "quotient", "min", "max", "expt",
+            "zero?", "positive?", "negative?", "odd?", "even?",
+            "list-ref", "list-tail", "list?", "assoc", "map",
+            "eq?", "equal?",
+            "char-alphabetic?", "char-numeric?", "char-upcase", "char-downcase", "char=?", "char<?",
+            "string=?", "string<?", "string-ci=?", "string-upcase", "string-downcase"};
         for (String b : builtins) {
             env.define(b, new BuiltinVal(b));
         }
@@ -963,13 +975,12 @@ public class Evaluator {
                     List<SchemeVal> newElems = new ArrayList<>();
                     newElems.add(carVal);
                     newElems.addAll(lst.elements());
-                    yield new ListVal(newElems);
+                    yield new ListVal(newElems, lst.improper);
                 }
-                // Improper pair - for now just store as 2-element list with dot notation later
                 List<SchemeVal> pair = new ArrayList<>();
                 pair.add(carVal);
                 pair.add(cdrVal);
-                yield new ListVal(pair); // simplified for L03
+                yield new ListVal(pair, true);
             }
             case "car" -> {
                 if (args.size() != 1) throw new EvalError("car requires exactly 1 argument");
@@ -981,7 +992,10 @@ public class Evaluator {
             case "cdr" -> {
                 if (args.size() != 1) throw new EvalError("cdr requires exactly 1 argument");
                 if (args.getFirst() instanceof ListVal lst && !lst.elements().isEmpty()) {
-                    yield new ListVal(new ArrayList<>(lst.elements().subList(1, lst.elements().size())));
+                    if (lst.improper && lst.elements().size() == 2) {
+                        yield lst.elements().get(1);
+                    }
+                    yield new ListVal(new ArrayList<>(lst.elements().subList(1, lst.elements().size())), lst.improper);
                 }
                 throw new EvalError("cdr: not a pair");
             }
@@ -1001,6 +1015,7 @@ public class Evaluator {
             }
             case "append" -> {
                 List<SchemeVal> result = new ArrayList<>();
+                boolean improper = false;
                 for (int i = 0; i < args.size(); i++) {
                     if (i < args.size() - 1) {
                         if (args.get(i) instanceof ListVal lst) {
@@ -1011,13 +1026,14 @@ public class Evaluator {
                     } else {
                         if (args.get(i) instanceof ListVal lst) {
                             result.addAll(lst.elements());
+                            improper = lst.improper;
                         } else {
-                            // last arg can be non-list for improper lists
                             result.add(args.get(i));
+                            improper = true;
                         }
                     }
                 }
-                yield new ListVal(result);
+                yield new ListVal(result, improper);
             }
             case "string?" -> {
                 if (args.size() != 1) throw new EvalError("string? requires exactly 1 argument");
@@ -1124,6 +1140,180 @@ public class Evaluator {
                 s.setChar(idx, c.value());
                 yield VOID;
             }
+            case "abs" -> {
+                if (args.size() != 1) throw new EvalError("abs requires exactly 1 argument");
+                yield new IntVal(Math.abs(asLong(args.getFirst())));
+            }
+            case "modulo" -> {
+                if (args.size() != 2) throw new EvalError("modulo requires exactly 2 arguments");
+                long a = asLong(args.get(0)), b = asLong(args.get(1));
+                yield new IntVal(Math.floorMod(a, b));
+            }
+            case "remainder" -> {
+                if (args.size() != 2) throw new EvalError("remainder requires exactly 2 arguments");
+                yield new IntVal(asLong(args.get(0)) % asLong(args.get(1)));
+            }
+            case "quotient" -> {
+                if (args.size() != 2) throw new EvalError("quotient requires exactly 2 arguments");
+                long a = asLong(args.get(0)), b = asLong(args.get(1));
+                if (b == 0) throw new EvalError("division by zero");
+                long q = a / b;
+                // truncate toward zero (Java's default for long division)
+                yield new IntVal(q);
+            }
+            case "min" -> {
+                if (args.isEmpty()) throw new EvalError("min requires at least 1 argument");
+                long m = asLong(args.getFirst());
+                for (int i = 1; i < args.size(); i++) m = Math.min(m, asLong(args.get(i)));
+                yield new IntVal(m);
+            }
+            case "max" -> {
+                if (args.isEmpty()) throw new EvalError("max requires at least 1 argument");
+                long m = asLong(args.getFirst());
+                for (int i = 1; i < args.size(); i++) m = Math.max(m, asLong(args.get(i)));
+                yield new IntVal(m);
+            }
+            case "expt" -> {
+                if (args.size() != 2) throw new EvalError("expt requires exactly 2 arguments");
+                long base = asLong(args.get(0)), exp = asLong(args.get(1));
+                long result = 1;
+                for (long i = 0; i < exp; i++) result *= base;
+                yield new IntVal(result);
+            }
+            case "zero?" -> {
+                if (args.size() != 1) throw new EvalError("zero? requires exactly 1 argument");
+                yield new BoolVal(asLong(args.getFirst()) == 0);
+            }
+            case "positive?" -> {
+                if (args.size() != 1) throw new EvalError("positive? requires exactly 1 argument");
+                yield new BoolVal(asLong(args.getFirst()) > 0);
+            }
+            case "negative?" -> {
+                if (args.size() != 1) throw new EvalError("negative? requires exactly 1 argument");
+                yield new BoolVal(asLong(args.getFirst()) < 0);
+            }
+            case "odd?" -> {
+                if (args.size() != 1) throw new EvalError("odd? requires exactly 1 argument");
+                yield new BoolVal(asLong(args.getFirst()) % 2 != 0);
+            }
+            case "even?" -> {
+                if (args.size() != 1) throw new EvalError("even? requires exactly 1 argument");
+                yield new BoolVal(asLong(args.getFirst()) % 2 == 0);
+            }
+            case "list-ref" -> {
+                if (args.size() != 2) throw new EvalError("list-ref requires exactly 2 arguments");
+                if (!(args.get(0) instanceof ListVal lst)) throw new EvalError("list-ref: not a list");
+                int idx = (int) asLong(args.get(1));
+                yield lst.elements().get(idx);
+            }
+            case "list-tail" -> {
+                if (args.size() != 2) throw new EvalError("list-tail requires exactly 2 arguments");
+                if (!(args.get(0) instanceof ListVal lst)) throw new EvalError("list-tail: not a list");
+                int idx = (int) asLong(args.get(1));
+                yield new ListVal(new ArrayList<>(lst.elements().subList(idx, lst.elements().size())));
+            }
+            case "list?" -> {
+                if (args.size() != 1) throw new EvalError("list? requires exactly 1 argument");
+                yield new BoolVal(args.getFirst() instanceof ListVal lst && !lst.improper);
+            }
+            case "assoc" -> {
+                if (args.size() != 2) throw new EvalError("assoc requires exactly 2 arguments");
+                SchemeVal key = args.get(0);
+                if (!(args.get(1) instanceof ListVal alist)) throw new EvalError("assoc: not a list");
+                for (SchemeVal entry : alist.elements()) {
+                    if (entry instanceof ListVal pair && !pair.elements().isEmpty()) {
+                        if (schemeEqual(key, pair.elements().getFirst())) {
+                            yield pair;
+                        }
+                    }
+                }
+                yield new BoolVal(false);
+            }
+            case "map" -> {
+                if (args.size() < 2) throw new EvalError("map requires at least 2 arguments");
+                SchemeVal proc = args.get(0);
+                List<ListVal> lists = new ArrayList<>();
+                for (int i = 1; i < args.size(); i++) {
+                    if (!(args.get(i) instanceof ListVal l)) throw new EvalError("map: not a list");
+                    lists.add(l);
+                }
+                int len = lists.getFirst().elements().size();
+                List<SchemeVal> result = new ArrayList<>();
+                for (int i = 0; i < len; i++) {
+                    List<SchemeVal> callArgs = new ArrayList<>();
+                    for (ListVal l : lists) callArgs.add(l.elements().get(i));
+                    result.add(applyProc(proc, callArgs));
+                }
+                yield new ListVal(result);
+            }
+            case "eq?" -> {
+                if (args.size() != 2) throw new EvalError("eq? requires exactly 2 arguments");
+                yield new BoolVal(schemeEq(args.get(0), args.get(1)));
+            }
+            case "equal?" -> {
+                if (args.size() != 2) throw new EvalError("equal? requires exactly 2 arguments");
+                yield new BoolVal(schemeEqual(args.get(0), args.get(1)));
+            }
+            case "char-alphabetic?" -> {
+                if (args.size() != 1) throw new EvalError("char-alphabetic? requires exactly 1 argument");
+                if (!(args.getFirst() instanceof CharVal c)) throw new EvalError("char-alphabetic?: not a character");
+                yield new BoolVal(Character.isLetter(c.value()));
+            }
+            case "char-numeric?" -> {
+                if (args.size() != 1) throw new EvalError("char-numeric? requires exactly 1 argument");
+                if (!(args.getFirst() instanceof CharVal c)) throw new EvalError("char-numeric?: not a character");
+                yield new BoolVal(Character.isDigit(c.value()));
+            }
+            case "char-upcase" -> {
+                if (args.size() != 1) throw new EvalError("char-upcase requires exactly 1 argument");
+                if (!(args.getFirst() instanceof CharVal c)) throw new EvalError("char-upcase: not a character");
+                yield new CharVal(Character.toUpperCase(c.value()));
+            }
+            case "char-downcase" -> {
+                if (args.size() != 1) throw new EvalError("char-downcase requires exactly 1 argument");
+                if (!(args.getFirst() instanceof CharVal c)) throw new EvalError("char-downcase: not a character");
+                yield new CharVal(Character.toLowerCase(c.value()));
+            }
+            case "char=?" -> {
+                if (args.size() != 2) throw new EvalError("char=? requires exactly 2 arguments");
+                if (!(args.get(0) instanceof CharVal a) || !(args.get(1) instanceof CharVal b))
+                    throw new EvalError("char=?: not a character");
+                yield new BoolVal(a.value() == b.value());
+            }
+            case "char<?" -> {
+                if (args.size() != 2) throw new EvalError("char<? requires exactly 2 arguments");
+                if (!(args.get(0) instanceof CharVal a) || !(args.get(1) instanceof CharVal b))
+                    throw new EvalError("char<?: not a character");
+                yield new BoolVal(a.value() < b.value());
+            }
+            case "string=?" -> {
+                if (args.size() != 2) throw new EvalError("string=? requires exactly 2 arguments");
+                if (!(args.get(0) instanceof StrVal a) || !(args.get(1) instanceof StrVal b))
+                    throw new EvalError("string=?: not a string");
+                yield new BoolVal(a.value().equals(b.value()));
+            }
+            case "string<?" -> {
+                if (args.size() != 2) throw new EvalError("string<? requires exactly 2 arguments");
+                if (!(args.get(0) instanceof StrVal a) || !(args.get(1) instanceof StrVal b))
+                    throw new EvalError("string<?: not a string");
+                yield new BoolVal(a.value().compareTo(b.value()) < 0);
+            }
+            case "string-ci=?" -> {
+                if (args.size() != 2) throw new EvalError("string-ci=? requires exactly 2 arguments");
+                if (!(args.get(0) instanceof StrVal a) || !(args.get(1) instanceof StrVal b))
+                    throw new EvalError("string-ci=?: not a string");
+                yield new BoolVal(a.value().equalsIgnoreCase(b.value()));
+            }
+            case "string-upcase" -> {
+                if (args.size() != 1) throw new EvalError("string-upcase requires exactly 1 argument");
+                if (!(args.getFirst() instanceof StrVal s)) throw new EvalError("string-upcase: not a string");
+                yield new StrVal(s.value().toUpperCase());
+            }
+            case "string-downcase" -> {
+                if (args.size() != 1) throw new EvalError("string-downcase requires exactly 1 argument");
+                if (!(args.getFirst() instanceof StrVal s)) throw new EvalError("string-downcase: not a string");
+                yield new StrVal(s.value().toLowerCase());
+            }
             default -> throw new EvalError("unbound variable: " + name);
         };
     }
@@ -1133,13 +1323,44 @@ public class Evaluator {
         throw new EvalError("expected number, got: " + display(val));
     }
 
+    private boolean schemeEqual(SchemeVal a, SchemeVal b) {
+        if (a instanceof IntVal ai && b instanceof IntVal bi) return ai.value() == bi.value();
+        if (a instanceof BoolVal ab && b instanceof BoolVal bb) return ab.value() == bb.value();
+        if (a instanceof StrVal as && b instanceof StrVal bs) return as.value().equals(bs.value());
+        if (a instanceof CharVal ac && b instanceof CharVal bc) return ac.value() == bc.value();
+        if (a instanceof SymbolVal as && b instanceof SymbolVal bs) return as.name().equals(bs.name());
+        if (a instanceof ListVal al && b instanceof ListVal bl) {
+            if (al.elements().size() != bl.elements().size()) return false;
+            if (al.improper != bl.improper) return false;
+            for (int i = 0; i < al.elements().size(); i++) {
+                if (!schemeEqual(al.elements().get(i), bl.elements().get(i))) return false;
+            }
+            return true;
+        }
+        return a == b;
+    }
+
+    private boolean schemeEq(SchemeVal a, SchemeVal b) {
+        if (a instanceof SymbolVal as && b instanceof SymbolVal bs) return as.name().equals(bs.name());
+        if (a instanceof IntVal ai && b instanceof IntVal bi) return ai.value() == bi.value();
+        if (a instanceof BoolVal ab && b instanceof BoolVal bb) return ab.value() == bb.value();
+        if (a instanceof CharVal ac && b instanceof CharVal bc) return ac.value() == bc.value();
+        return a == b;
+    }
+
     // ---- Display (write-style, with quotes) ----
     private String display(SchemeVal val) {
         return switch (val) {
             case IntVal v -> String.valueOf(v.value());
             case BoolVal v -> v.value() ? "#t" : "#f";
             case StrVal v -> "\"" + v.value() + "\"";
-            case CharVal v -> "#\\" + v.value();
+            case CharVal v -> {
+                char c = v.value();
+                if (c == ' ') yield "#\\space";
+                if (c == '\n') yield "#\\newline";
+                if (c == '\t') yield "#\\tab";
+                yield "#\\" + c;
+            }
             case SymbolVal v -> v.name();
             case VoidVal v -> "";
             case LambdaVal v -> "#<procedure>";
@@ -1148,8 +1369,10 @@ public class Evaluator {
             case MacroVal v -> "#<macro:" + v.name() + ">";
             case ListVal v -> {
                 StringBuilder sb = new StringBuilder("(");
-                for (int i = 0; i < v.elements().size(); i++) {
+                int size = v.elements().size();
+                for (int i = 0; i < size; i++) {
                     if (i > 0) sb.append(" ");
+                    if (v.improper && i == size - 1 && size > 1) sb.append(". ");
                     sb.append(display(v.elements().get(i)));
                 }
                 sb.append(")");
@@ -1162,10 +1385,13 @@ public class Evaluator {
     private String displayVal(SchemeVal val) {
         return switch (val) {
             case StrVal v -> v.value();
+            case CharVal v -> String.valueOf(v.value());
             case ListVal v -> {
                 StringBuilder sb = new StringBuilder("(");
-                for (int i = 0; i < v.elements().size(); i++) {
+                int size = v.elements().size();
+                for (int i = 0; i < size; i++) {
                     if (i > 0) sb.append(" ");
+                    if (v.improper && i == size - 1 && size > 1) sb.append(". ");
                     sb.append(displayVal(v.elements().get(i)));
                 }
                 sb.append(")");
