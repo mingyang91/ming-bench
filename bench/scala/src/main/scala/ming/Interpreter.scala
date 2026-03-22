@@ -8,7 +8,29 @@ object Interpreter:
   import SchemeValue.*
 
   private val builtinNames: Set[String] =
-    Set("+", "-", "*", "/", "<", ">", "=", "<=", ">=", "not")
+    Set(
+      "+",
+      "-",
+      "*",
+      "/",
+      "<",
+      ">",
+      "=",
+      "<=",
+      ">=",
+      "not",
+      "cons",
+      "car",
+      "cdr",
+      "null?",
+      "list",
+      "length",
+      "string?",
+      "number?",
+      "boolean?",
+      "pair?",
+      "symbol?"
+    )
 
   val defaultEnv: Environment =
     builtinNames.foldLeft(Environment.empty) { (env, name) =>
@@ -47,6 +69,9 @@ object Interpreter:
       case SchemeSymbol("and") :: args    => (evalAnd(args, env), env)
       case SchemeSymbol("or") :: args     => (evalOr(args, env), env)
       case SchemeSymbol("lambda") :: rest => (evalLambda(rest, env), env)
+      case SchemeSymbol("let") :: rest    => evalLet(rest, env)
+      case SchemeSymbol("begin") :: rest  => evalBegin(rest, env)
+      case SchemeSymbol("cond") :: rest   => evalCond(rest, env)
       case head :: args =>
         val (func, _)     = eval(head, env)
         val evaluatedArgs = args.map(a => eval(a, env)._1)
@@ -146,6 +171,61 @@ object Interpreter:
         SchemeLambda(paramNames, body, env)
       case _ => throw new EvalError("bad lambda syntax")
 
+  private def evalLet(
+    args: List[SchemeValue],
+    env: Environment
+  ): (SchemeValue, Environment) =
+    args match
+      case SchemeList(bindings) :: body if body.nonEmpty =>
+        val letEnv = bindings.foldLeft(env) {
+          case (acc, SchemeList(List(SchemeSymbol(name), expr))) =>
+            val (v, _) = eval(expr, env)
+            acc.define(name, v)
+          case _ => throw new EvalError("bad let binding")
+        }
+        (evalBodyWithEnv(body, letEnv), env)
+      case _ => throw new EvalError("bad let syntax")
+
+  private def evalBegin(
+    exprs: List[SchemeValue],
+    env: Environment
+  ): (SchemeValue, Environment) =
+    exprs match
+      case Nil         => (SchemeVoid, env)
+      case last :: Nil => eval(last, env)
+      case head :: tail =>
+        val (_, newEnv) = eval(head, env)
+        evalBegin(tail, newEnv)
+
+  @tailrec
+  private def evalCond(
+    clauses: List[SchemeValue],
+    env: Environment
+  ): (SchemeValue, Environment) =
+    clauses match
+      case Nil => (SchemeVoid, env)
+      case SchemeList(SchemeSymbol("else") :: body) :: _ =>
+        (evalBodyWithEnv(body, env), env)
+      case SchemeList(test :: body) :: rest =>
+        val (testVal, _) = eval(test, env)
+        testVal match
+          case SchemeBool(false) => evalCond(rest, env)
+          case _ =>
+            if body.isEmpty then (testVal, env)
+            else (evalBodyWithEnv(body, env), env)
+      case _ => throw new EvalError("bad cond syntax")
+
+  private def evalBodyWithEnv(
+    body: List[SchemeValue],
+    env: Environment
+  ): SchemeValue =
+    body match
+      case Nil         => SchemeVoid
+      case last :: Nil => eval(last, env)._1
+      case head :: tail =>
+        val (_, newEnv) = eval(head, env)
+        evalBodyWithEnv(tail, newEnv)
+
   def evalBody(
     body: List[SchemeValue],
     env: Environment
@@ -154,15 +234,16 @@ object Interpreter:
       case Nil         => SchemeVoid
       case last :: Nil => eval(last, env)._1
       case head :: tail =>
-        eval(head, env)
-        evalBody(tail, env)
+        val (_, newEnv) = eval(head, env)
+        evalBody(tail, newEnv)
 
   def applyProc(
     func: SchemeValue,
     args: List[SchemeValue]
   ): SchemeValue =
     func match
-      case SchemeSymbol(name) => applyNamedBuiltin(name, args)
+      case SchemeSymbol(name) =>
+        Builtins.applyNamedBuiltin(name, args)
       case lam @ SchemeLambda(params, body, closure, nameOpt) =>
         if params.length != args.length then
           throw new EvalError(
@@ -175,83 +256,3 @@ object Interpreter:
         evalBody(body, innerEnv)
       case _ =>
         throw new EvalError(s"not a procedure: ${func.display}")
-
-  private def applyNamedBuiltin(
-    name: String,
-    args: List[SchemeValue]
-  ): SchemeValue = name match
-    case "+"   => arithmeticOp(args, _ + _, 0)
-    case "*"   => arithmeticOp(args, _ * _, 1)
-    case "-"   => subtractOp(args)
-    case "/"   => divideOp(args)
-    case "<"   => comparisonOp(args, _ < _)
-    case ">"   => comparisonOp(args, _ > _)
-    case "="   => comparisonOp(args, _ == _)
-    case "<="  => comparisonOp(args, _ <= _)
-    case ">="  => comparisonOp(args, _ >= _)
-    case "not" => evalNot(args)
-    case _     => throw new EvalError(s"unbound variable: $name")
-
-  private def requireInt(v: SchemeValue): Long = v match
-    case SchemeInt(n) => n
-    case _ =>
-      throw new EvalError(s"expected number, got: ${v.display}")
-
-  private def arithmeticOp(
-    args: List[SchemeValue],
-    op: (Long, Long) => Long,
-    identity: Long
-  ): SchemeValue =
-    SchemeInt(
-      args.foldLeft(identity)((acc, v) => op(acc, requireInt(v)))
-    )
-
-  private def subtractOp(args: List[SchemeValue]): SchemeValue =
-    args match
-      case Nil          => throw new EvalError("- requires at least 1 argument")
-      case List(single) => SchemeInt(-requireInt(single))
-      case head :: tail =>
-        val first = requireInt(head)
-        SchemeInt(
-          tail.foldLeft(first)((acc, v) => acc - requireInt(v))
-        )
-
-  private def divideOp(args: List[SchemeValue]): SchemeValue =
-    args match
-      case Nil =>
-        throw new EvalError("/ requires at least 1 argument")
-      case List(single) =>
-        val n = requireInt(single)
-        if n == 0 then throw new EvalError("division by zero")
-        SchemeInt(1 / n)
-      case head :: tail =>
-        val first = requireInt(head)
-        SchemeInt(tail.foldLeft(first) { (acc, v) =>
-          val n = requireInt(v)
-          if n == 0 then throw new EvalError("division by zero")
-          acc / n
-        })
-
-  private def comparisonOp(
-    args: List[SchemeValue],
-    op: (Long, Long) => Boolean
-  ): SchemeValue =
-    args match
-      case Nil | _ :: Nil =>
-        throw new EvalError(
-          "comparison requires at least 2 arguments"
-        )
-      case _ =>
-        val nums = args.map(requireInt)
-        SchemeBool(
-          nums.zip(nums.tail).forall((a, b) => op(a, b))
-        )
-
-  private def evalNot(args: List[SchemeValue]): SchemeValue =
-    args match
-      case List(single) =>
-        single match
-          case SchemeBool(false) => SchemeBool(true)
-          case _                 => SchemeBool(false)
-      case _ =>
-        throw new EvalError("not expects exactly 1 argument")
