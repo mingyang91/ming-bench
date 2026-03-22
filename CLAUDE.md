@@ -54,7 +54,7 @@ Each language has a self-contained directory under `bench/`:
 | Scala | `bench/scala/` | sbt | munit | `ming-jvm` |
 
 **Shared resources:**
-- `bench/SPEC.md` — Language-agnostic interpreter specification (26 levels)
+- `bench/SPEC.md` — Language-agnostic interpreter specification (27 levels)
 - `bench/fixtures/*.scm` — Test fixture files (Scheme source code)
 - `bench/tests.json` — Test manifest mapping test names to fixtures and expected values
 
@@ -112,6 +112,7 @@ Turn limits (by level tier):
 | L19-L20 | Rationals/Records | 75 |
 | L21-L23 | Pair Mutation/syntax-case/Final Integration | 90 |
 | L24-L26 | Tech-debt: case-lambda/procedure?/do | 60 |
+| L27     | Real-world integration stress        | 90 |
 
 Quality-gate levels get an additional 15-turn cleanup pass. Failed levels auto-retry up to 2 times if the failure was infrastructure (timeout/529/crash), not turns exhaustion.
 

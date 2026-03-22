@@ -1,6 +1,6 @@
 # MING — Ming Interpreter Nurture Gauntlet
 
-A benchmark framework for measuring how **prompt engineering strategies** affect coding agent performance. Agents build a Scheme interpreter from scratch — 214 tests across 27 difficulty levels, from basic arithmetic to first-class continuations, hygienic macros, and exact arithmetic. Supports **5 languages**: Rust, Go, Java, TypeScript, and Scala.
+A benchmark framework for measuring how **prompt engineering strategies** affect coding agent performance. Agents build a Scheme interpreter from scratch — 240+ tests across 27 difficulty levels, from basic arithmetic to first-class continuations, hygienic macros, and exact arithmetic. Supports **5 languages**: Rust, Go, Java, TypeScript, and Scala.
 
 ## Why This Exists
 
@@ -18,7 +18,7 @@ Multi-language support adds another dimension: **does language choice affect age
 
 The agent receives:
 - A function signature (language-specific): `evalStr(input) → result`
-- 221+ test cases across 26 levels (each test loads Scheme code from a `.scm` fixture file)
+- 240+ test cases across 27 levels (each test loads Scheme code from a `.scm` fixture file)
 - Instructions in `CLAUDE.md` (the only file the agent reads for guidance)
 
 The agent implements a complete Scheme interpreter from scratch — lexer, parser, environment, evaluator, tail-call optimization, continuations, and hygienic macros. No starter code. No external parsing libraries.
@@ -85,7 +85,7 @@ Per-language strategies live in `bench/strategies/{lang}/`. The orchestrator pic
 
 Each agent run uses one of two modes:
 
-- **Full mode** — one agent session tackles all 26 levels. Simpler, but if the agent gets stuck it burns budget.
+- **Full mode** — one agent session tackles all 27 levels. Simpler, but if the agent gets stuck it burns budget.
 - **Levels mode** — orchestrator runs a fresh agent per level. After each level passes, all prior levels are re-run to catch regressions. If regressions are detected, a 15-turn fix-it pass is launched; if unfixable, the run halts. Per-level session data for granular analysis.
 
 ### Sandboxed Testing
@@ -130,8 +130,9 @@ All containers: 1 CPU, 256 PIDs. OOM or timeout = test failure. This prevents ag
 | 24 | **case-lambda** | 5 | Multi-arity closures — **forces closure restructure** |
 | 25 | **procedure?** | 5 | Must return `#t` for all callable types (lambda, case-lambda, builtins, continuations) |
 | 26 | **do loops** | 5 | Iteration with parallel step — **tests env model** |
+| 27 | **Real-world integration** | 1 | 1000+ line macro expander — **stress-tests all features at scale** |
 
-**Level design philosophy:** Levels are ordered to maximize tech-debt exposure. L06 plants mutable strings, then L14 (8 levels later) reverses the requirement. L24-L26 force restructuring of core infrastructure (closures, procedure naming, callable type unification, eval loop) established 10-20 levels earlier. Quality-gate agents that build clean architecture early should handle these transitions cheaper than default agents.
+**Level design philosophy:** Levels are ordered to maximize tech-debt exposure. L06 plants mutable strings, then L14 (8 levels later) reverses the requirement. L24-L26 force restructuring of core infrastructure (closures, procedure naming, callable type unification, eval loop) established 10-20 levels earlier. L27 hits the agent with real-world programs (1000+ lines) that exercise all features simultaneously — maximum distance from when features were first implemented.
 
 ## Tooling
 

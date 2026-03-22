@@ -422,9 +422,9 @@ pub fn fixtures_dir() -> PathBuf {
 // Level constants
 // ---------------------------------------------------------------------------
 
-pub const LEVELS: [&str; 26] = [
+pub const LEVELS: [&str; 27] = [
     "01", "02", "03", "04", "05", "06", "07", "08", "09", "10", "11", "12", "13", "14", "15", "16",
-    "17", "18", "19", "20", "21", "22", "23", "24", "25", "26",
+    "17", "18", "19", "20", "21", "22", "23", "24", "25", "26", "27",
 ];
 
 // ---------------------------------------------------------------------------
@@ -445,6 +445,7 @@ pub const LEVELS: [&str; 26] = [
 ///   L19-L20 (exact arith, records)             → 75 turns
 ///   L21-L23 (pair mutation, syntax-case, integration) → 90 turns
 ///   L24-L26 (tech-debt: case-lambda, procedure?, do) → 60 turns
+///   L27     (real-world integration stress)           → 90 turns
 pub fn turns_for_level(level_num: u32, max_turns: Option<u32>) -> u32 {
     if let Some(t) = max_turns {
         return t;
@@ -460,6 +461,7 @@ pub fn turns_for_level(level_num: u32, max_turns: Option<u32>) -> u32 {
         19..=20 => 75, // exact arith, records
         21..=23 => 90, // pair mutation, syntax-case, final integration
         24..=26 => 60, // tech-debt: case-lambda, procedure?, do
+        27 => 90,      // real-world integration stress
         _ => 75,
     }
 }

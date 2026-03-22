@@ -106,3 +106,6 @@ Combined use of all features: dynamic-wind + guard for resource cleanup on excep
 
 ### Level 26 — do Loops
 `(do ((var init step) ...) (test expr ...) body ...)` is an iteration construct. Variables are bound to their init values, then on each iteration all step expressions are evaluated using the *previous* iteration's values (parallel update, like `let` not `let*`). When test is true, the expr values are evaluated and the last is returned. Variables with no step expression keep their value across iterations.
+
+### Level 27 — Real-World Integration Stress
+All features from L1-L26 are exercised together by large (1000+ line) real-world Scheme programs. No new language features — this level tests whether your interpreter handles real code at scale. Programs include a complete macro expander (alexpander, ~1,950 lines) that stress closures, continuations, mutation, vectors, and macros simultaneously.
