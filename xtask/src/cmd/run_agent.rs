@@ -652,7 +652,7 @@ fn run_scoring(args: &RunAgentArgs, proj: &Path) -> Result<String> {
     let bench_log = proj.join("results/bench.log");
     let bench_exit = run_cmd(
         "cargo",
-        &["xtask", "bench", &args.name, "--run-id", "bench"],
+        &["xtask", "bench", &args.name, "--run-id", "bench", "--lang", &args.lang],
         proj,
     )
     .unwrap_or(1);

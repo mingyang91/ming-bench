@@ -115,8 +115,12 @@ impl Lang {
         }
     }
 
-    pub fn bench_dir(&self, proj: &std::path::Path) -> PathBuf {
-        proj.join("bench").join(self.dir_name())
+    pub fn container_image(&self) -> &str {
+        match self {
+            Self::Rust | Self::Go => "ming",
+            Self::Java | Self::Scala => "ming-jvm",
+            Self::TypeScript => "ming-node",
+        }
     }
 }
 

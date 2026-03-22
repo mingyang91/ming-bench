@@ -534,6 +534,246 @@ fn run_container_test(proj: &Path, bin: &str, level: &str) -> Result<i32> {
     )
 }
 
+// ---------------------------------------------------------------------------
+// Capture API — used by bench.rs for scoring (build + run, return output)
+// ---------------------------------------------------------------------------
+
+use crate::model::Lang;
+
+/// Build and run tests for a single level, capturing output.
+/// `proj` is the project root (may be a worktree, not `project_dir()`).
+/// Returns `(exit_code, captured_output)`.
+pub fn run_level_capture(level: &str, lang: &Lang, proj: &Path) -> Result<(i32, String)> {
+    match lang {
+        Lang::Rust => run_rust_capture(level, proj),
+        Lang::Go => run_go_capture(level, proj),
+        Lang::Java => run_gradle_capture(level, proj),
+        Lang::TypeScript => run_ts_capture(level, proj),
+        Lang::Scala => run_mill_capture(level, proj),
+    }
+}
+
+fn run_rust_capture(level: &str, proj: &Path) -> Result<(i32, String)> {
+    let bin = find_test_binary_in(proj)?;
+    run_container_test_capture(proj, &bin, level)
+}
+
+fn run_container_test_capture(proj: &Path, bin: &str, level: &str) -> Result<(i32, String)> {
+    let (filter, timeout) = if level == "all" {
+        (String::new(), 300)
+    } else {
+        (format!("test_l{level}"), 30)
+    };
+
+    let timeout_str = format!("{timeout}s");
+    let mount_spec = format!("./{bin}:/bench/test_bin:ro,Z");
+    let bash_cmd = if filter.is_empty() {
+        format!("timeout {timeout_str} /bench/test_bin --test-threads=1 2>&1")
+    } else {
+        format!("timeout {timeout_str} /bench/test_bin {filter} --test-threads=1 2>&1")
+    };
+
+    let bench_level = if level == "all" {
+        LEVELS.last().expect("no levels defined").to_string()
+    } else {
+        level.to_string()
+    };
+    let bench_level_env = format!("BENCH_LEVEL={bench_level}");
+
+    run_cmd_capture_all(
+        "sudo",
+        &[
+            "podman", "run", "--rm",
+            "--memory=1g", "--cpus=1", "--pids-limit=256",
+            "-v", &mount_spec,
+            "-e", &bench_level_env,
+            IMAGE_NAME,
+            &bash_cmd,
+        ],
+        proj,
+    )
+}
+
+fn run_go_capture(level: &str, proj: &Path) -> Result<(i32, String)> {
+    let lang_dir = proj.join("bench/go");
+
+    let exit = run_cmd("bash", &["build.sh"], &lang_dir)?;
+    if exit != 0 {
+        return Ok((exit, "Go build failed".to_string()));
+    }
+
+    let (timeout, filter) = if level == "all" {
+        (300, String::new())
+    } else {
+        (30, format!("TestL{level}"))
+    };
+    let bench_level = if level == "all" {
+        LEVELS.last().expect("no levels defined").to_string()
+    } else {
+        level.to_string()
+    };
+
+    let bench_dir = proj.join("bench");
+    let bin_mount = format!("{}:/bench/go/test_bin:ro,Z", lang_dir.join("test_bin").display());
+    let fixtures_mount = format!("{}:/bench/fixtures:ro,Z", bench_dir.join("fixtures").display());
+    let tests_mount = format!("{}:/bench/tests.json:ro,Z", bench_dir.join("tests.json").display());
+    let bench_level_env = format!("BENCH_LEVEL={bench_level}");
+
+    let bash_cmd = if filter.is_empty() {
+        format!("cd /bench/go && timeout {timeout}s ./test_bin -test.v -test.timeout {timeout}s 2>&1")
+    } else {
+        format!("cd /bench/go && timeout {timeout}s ./test_bin -test.run '{filter}' -test.v -test.timeout {timeout}s 2>&1")
+    };
+
+    run_cmd_capture_all(
+        "sudo",
+        &[
+            "podman", "run", "--rm",
+            "--memory=1g", "--cpus=1", "--pids-limit=256",
+            "-v", &bin_mount,
+            "-v", &fixtures_mount,
+            "-v", &tests_mount,
+            "-e", &bench_level_env,
+            IMAGE_NAME,
+            &bash_cmd,
+        ],
+        proj,
+    )
+}
+
+fn run_gradle_capture(level: &str, proj: &Path) -> Result<(i32, String)> {
+    let lang_dir = proj.join("bench/java");
+
+    let exit = run_cmd("./gradlew", &["shadowJar"], &lang_dir)?;
+    if exit != 0 {
+        return Ok((exit, "Java build failed".to_string()));
+    }
+
+    let jar = lang_dir.join("build/libs/ming-test.jar");
+    if !jar.is_file() {
+        return Ok((1, "shadow JAR not found after build".to_string()));
+    }
+
+    run_jvm_container_capture(proj, &jar, level)
+}
+
+fn run_mill_capture(level: &str, proj: &Path) -> Result<(i32, String)> {
+    let lang_dir = proj.join("bench/scala");
+
+    let exit = run_cmd("./mill", &["assembly"], &lang_dir)?;
+    if exit != 0 {
+        return Ok((exit, "Scala build failed".to_string()));
+    }
+
+    let jar = lang_dir.join("out/assembly.dest/out.jar");
+    if !jar.is_file() {
+        return Ok((1, "assembly JAR not found after build".to_string()));
+    }
+
+    run_jvm_container_capture(proj, &jar, level)
+}
+
+fn run_jvm_container_capture(proj: &Path, jar: &Path, level: &str) -> Result<(i32, String)> {
+    let (timeout, level_arg) = if level == "all" {
+        (450, "all".to_string())
+    } else {
+        (45, level.to_string())
+    };
+
+    let bench_dir = proj.join("bench");
+    let jar_mount = format!("{}:/bench/test.jar:ro,Z", jar.display());
+    let fixtures_mount = format!("{}:/bench/fixtures:ro,Z", bench_dir.join("fixtures").display());
+    let tests_mount = format!("{}:/bench/tests.json:ro,Z", bench_dir.join("tests.json").display());
+    let java_cmd = format!("timeout {timeout}s java -jar /bench/test.jar {level_arg}");
+
+    run_cmd_capture_all(
+        "sudo",
+        &[
+            "podman", "run", "--rm",
+            "--memory=2g", "--cpus=1", "--pids-limit=256",
+            "-v", &jar_mount,
+            "-v", &fixtures_mount,
+            "-v", &tests_mount,
+            "-e", "TESTS_JSON=/bench/tests.json",
+            "-e", "FIXTURES_DIR=/bench/fixtures",
+            JVM_IMAGE,
+            &java_cmd,
+        ],
+        proj,
+    )
+}
+
+fn run_ts_capture(level: &str, proj: &Path) -> Result<(i32, String)> {
+    let lang_dir = proj.join("bench/ts");
+
+    let exit = run_cmd("bash", &["build.sh"], &lang_dir)?;
+    if exit != 0 {
+        return Ok((exit, "TypeScript build failed".to_string()));
+    }
+
+    let (timeout, name_pattern) = if level == "all" {
+        (300, String::new())
+    } else {
+        (30, format!("l{level}"))
+    };
+    let bench_level = if level == "all" {
+        LEVELS.last().expect("no levels defined").to_string()
+    } else {
+        level.to_string()
+    };
+
+    let bench_dir = proj.join("bench");
+    let ts_mount = format!("{}:/bench/ts:Z", lang_dir.display());
+    let fixtures_mount = format!("{}:/bench/fixtures:ro,Z", bench_dir.join("fixtures").display());
+    let tests_mount = format!("{}:/bench/tests.json:ro,Z", bench_dir.join("tests.json").display());
+    let bench_level_env = format!("BENCH_LEVEL={bench_level}");
+
+    let bash_cmd = if name_pattern.is_empty() {
+        format!("cd /bench/ts && timeout {timeout}s npx vitest run --reporter=verbose 2>&1")
+    } else {
+        format!("cd /bench/ts && timeout {timeout}s npx vitest run --reporter=verbose --testNamePattern '{name_pattern}' 2>&1")
+    };
+
+    run_cmd_capture_all(
+        "sudo",
+        &[
+            "podman", "run", "--rm",
+            "--memory=2g", "--cpus=1", "--pids-limit=256",
+            "-v", &ts_mount,
+            "-v", &fixtures_mount,
+            "-v", &tests_mount,
+            "-e", &bench_level_env,
+            NODE_IMAGE,
+            &bash_cmd,
+        ],
+        proj,
+    )
+}
+
+/// Find test binary — used by both run_rust() and run_rust_capture().
+fn find_test_binary_in(proj: &Path) -> Result<String> {
+    let (exit, output) = run_cmd_capture_all("cargo", &["test", "--no-run", "--release"], proj)?;
+
+    for line in output.lines() {
+        let Some(start) = line.find("target/release/deps/ming-") else {
+            continue;
+        };
+        let bin: String = line[start..]
+            .chars()
+            .take_while(|c| c.is_alphanumeric() || matches!(c, '/' | '-' | '_' | '.'))
+            .collect();
+        if proj.join(&bin).is_file() {
+            return Ok(bin);
+        }
+    }
+
+    if exit != 0 {
+        eprintln!("Build output:\n{output}");
+    }
+
+    Err(Error::TestBinaryNotFound)
+}
+
 fn find_test_binary(proj: &Path) -> Result<String> {
     // Build test binary in release mode
     let (exit, output) = run_cmd_capture_all("cargo", &["test", "--no-run", "--release"], proj)?;

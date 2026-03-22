@@ -1,10 +1,10 @@
-use crate::model::{compact_timestamp, project_dir, run_cmd_capture_all, Error, Result, LEVELS};
+use crate::cmd::test_level;
+use crate::model::{compact_timestamp, project_dir, run_cmd_capture_all, Error, Lang, Result, LEVELS};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::Instant;
 
-const IMAGE_NAME: &str = "ming";
-const TIMEOUT: u32 = 30;
+const TIMEOUT: u32 = 45;
 
 struct BenchLevelResult {
     status: &'static str,
@@ -14,32 +14,13 @@ struct BenchLevelResult {
     output: String,
 }
 
-fn run_bench_level(proj: &Path, test_bin: &Path, level: &str) -> Result<BenchLevelResult> {
+fn run_bench_level(proj: &Path, level: &str, lang: &Lang) -> Result<BenchLevelResult> {
     let start = Instant::now();
 
-    let bash_cmd =
-        format!("timeout {TIMEOUT}s /bench/test_bin test_l{level} --test-threads=1 2>&1");
-    let mount_spec = format!("{}:/bench/test_bin:ro,Z", test_bin.display());
-
-    let (exit_code, output) = run_cmd_capture_all(
-        "sudo",
-        &[
-            "podman",
-            "run",
-            "--rm",
-            "--memory=1g",
-            "--cpus=1",
-            "--pids-limit=256",
-            "-v",
-            &mount_spec,
-            IMAGE_NAME,
-            &bash_cmd,
-        ],
-        proj,
-    )?;
+    let (exit_code, output) = test_level::run_level_capture(level, lang, proj)?;
 
     let duration = start.elapsed().as_secs();
-    let (passed, failed) = parse_test_result(&output);
+    let (passed, failed) = parse_test_output(&output, lang);
 
     let status = if exit_code == 124 || duration >= TIMEOUT as u64 {
         "TIMEOUT"
@@ -63,8 +44,9 @@ fn setup_bench(
     branch: &str,
     worktree_dir: &Path,
     worktree_branch: &str,
-) -> Result<PathBuf> {
-    println!("=== MING Bench: branch={branch} ===");
+    lang: &Lang,
+) -> Result<()> {
+    println!("=== MING Bench: branch={branch} lang={} ===", lang.display_name());
     println!("Creating worktree from '{branch}'...");
 
     let exit = crate::model::run_cmd(
@@ -87,20 +69,18 @@ fn setup_bench(
         });
     }
 
+    let image = lang.container_image();
     let (img_exit, _) =
-        run_cmd_capture_all("sudo", &["podman", "image", "exists", IMAGE_NAME], proj)?;
+        run_cmd_capture_all("sudo", &["podman", "image", "exists", image], proj)?;
     if img_exit != 0 {
-        eprintln!("Image '{IMAGE_NAME}' not found. Run `cargo xtask setup` first.");
+        eprintln!("Image '{image}' not found. Run `cargo xtask setup` first.");
         return Err(Error::CommandFailed {
             cmd: "podman image exists".to_string(),
             exit_code: img_exit,
         });
     }
 
-    println!("Compiling tests on host...");
-    let test_bin = find_test_binary(worktree_dir)?;
-    println!("Test binary: {}", test_bin.display());
-    Ok(test_bin)
+    Ok(())
 }
 
 fn log_level_output(log: &mut String, level: &str, output: &str) {
@@ -117,7 +97,11 @@ fn append_log(log: &mut String, msg: &str) {
     log.push('\n');
 }
 
-pub fn run(branch: &str, run_id: Option<&str>) -> Result<()> {
+pub fn run(branch: &str, run_id: Option<&str>, lang_str: &str) -> Result<()> {
+    let lang = Lang::from_str(lang_str).map_err(|msg| Error::CommandFailed {
+        cmd: msg,
+        exit_code: 1,
+    })?;
     let proj = project_dir();
     let run_id = bench_run_id(run_id);
     let timestamp = compact_timestamp();
@@ -136,10 +120,10 @@ pub fn run(branch: &str, run_id: Option<&str>) -> Result<()> {
         branch_name: worktree_branch.clone(),
     };
 
-    let test_bin = setup_bench(&proj, branch, &worktree_dir, &worktree_branch)?;
+    setup_bench(&proj, branch, &worktree_dir, &worktree_branch, &lang)?;
 
-    let mut log = bench_log_header(branch, &run_id);
-    let summary = run_all_levels(&proj, &test_bin, &mut log)?;
+    let mut log = bench_log_header(branch, &run_id, &lang);
+    let summary = run_all_levels(&worktree_dir, &lang, &mut log)?;
     append_summary(&mut log, &summary, &result_file);
 
     fs::write(&result_file, &log).map_err(|e| Error::io(&result_file, e))?;
@@ -154,18 +138,22 @@ fn bench_run_id(run_id: Option<&str>) -> String {
         .unwrap_or_else(|| format!("run-{}", crate::model::now_epoch()))
 }
 
-fn bench_log_header(branch: &str, run_id: &str) -> String {
+fn bench_log_header(branch: &str, run_id: &str, lang: &Lang) -> String {
     println!("Branch: {branch}");
+    println!("Lang:   {}", lang.display_name());
     println!("Run ID: {run_id}");
     println!("Timeout: {TIMEOUT}s per level");
     println!("---");
-    format!("Branch: {branch}\nRun ID: {run_id}\nTimeout: {TIMEOUT}s per level\n---\n")
+    format!(
+        "Branch: {branch}\nLang: {}\nRun ID: {run_id}\nTimeout: {TIMEOUT}s per level\n---\n",
+        lang.display_name()
+    )
 }
 
-fn run_all_levels(proj: &Path, test_bin: &Path, log: &mut String) -> Result<BenchSummary> {
+fn run_all_levels(proj: &Path, lang: &Lang, log: &mut String) -> Result<BenchSummary> {
     let mut summary = BenchSummary::default();
     for level in &LEVELS {
-        let result = run_bench_level(proj, test_bin, level)?;
+        let result = run_bench_level(proj, level, lang)?;
         summary.record(level, &result);
         append_level_result(log, level, &result);
     }
@@ -233,8 +221,21 @@ impl BenchSummary {
     }
 }
 
-fn parse_test_result(output: &str) -> (u32, u32) {
-    // Look for "test result: ok. N passed; M failed; ..."
+// ---------------------------------------------------------------------------
+// Per-language test output parsers
+// ---------------------------------------------------------------------------
+
+fn parse_test_output(output: &str, lang: &Lang) -> (u32, u32) {
+    match lang {
+        Lang::Rust => parse_rust_output(output),
+        Lang::Go => parse_go_output(output),
+        Lang::Java | Lang::Scala => parse_jvm_output(output),
+        Lang::TypeScript => parse_ts_output(output),
+    }
+}
+
+/// Rust: "test result: ok. N passed; M failed; ..."
+fn parse_rust_output(output: &str) -> (u32, u32) {
     for line in output.lines().rev() {
         if line.starts_with("test result:") {
             let passed = extract_count(line, "passed");
@@ -245,6 +246,68 @@ fn parse_test_result(output: &str) -> (u32, u32) {
     (0, 0)
 }
 
+/// Go: count "--- PASS:" and "--- FAIL:" lines
+fn parse_go_output(output: &str) -> (u32, u32) {
+    let mut passed = 0u32;
+    let mut failed = 0u32;
+    for line in output.lines() {
+        let trimmed = line.trim();
+        if trimmed.starts_with("--- PASS:") {
+            passed += 1;
+        } else if trimmed.starts_with("--- FAIL:") {
+            failed += 1;
+        }
+    }
+    (passed, failed)
+}
+
+/// Java/Scala TestRunner: "N passed, M failed out of T tests"
+fn parse_jvm_output(output: &str) -> (u32, u32) {
+    for line in output.lines().rev() {
+        if line.contains("passed") && line.contains("failed") && line.contains("out of") {
+            let passed = extract_count(line, "passed,");
+            let failed = extract_count(line, "failed");
+            return (passed, failed);
+        }
+    }
+    (0, 0)
+}
+
+/// TypeScript vitest: parse summary line or count individual results
+fn parse_ts_output(output: &str) -> (u32, u32) {
+    // Try summary line first: "Tests  5 passed | 2 failed (7)"
+    if let Some(summary) = parse_ts_summary(output) {
+        return summary;
+    }
+    // Fallback: count individual "✓" / "×" lines
+    let mut passed = 0u32;
+    let mut failed = 0u32;
+    for line in output.lines() {
+        let trimmed = line.trim();
+        if trimmed.starts_with('✓') || trimmed.starts_with('√') {
+            passed += 1;
+        } else if trimmed.starts_with('×') || trimmed.starts_with('✗') {
+            failed += 1;
+        }
+    }
+    (passed, failed)
+}
+
+fn parse_ts_summary(output: &str) -> Option<(u32, u32)> {
+    for line in output.lines() {
+        let trimmed = line.trim();
+        if !trimmed.contains("Tests") || !trimmed.contains("passed") {
+            continue;
+        }
+        let p = extract_count(trimmed, "passed");
+        let f = extract_count(trimmed, "failed");
+        if p > 0 || f > 0 {
+            return Some((p, f));
+        }
+    }
+    None
+}
+
 fn extract_count(line: &str, label: &str) -> u32 {
     line.split_whitespace()
         .collect::<Vec<_>>()
@@ -252,75 +315,6 @@ fn extract_count(line: &str, label: &str) -> u32 {
         .filter(|w| w[1] == label || w[1].starts_with(label))
         .find_map(|w| w[0].parse::<u32>().ok())
         .unwrap_or(0)
-}
-
-fn is_path_char(c: char) -> bool {
-    c.is_alphanumeric() || c == '/' || c == '-' || c == '_' || c == '.'
-}
-
-/// Extract a test binary path from `cargo test --no-run --message-format=json` output.
-fn parse_json_test_binary(json_output: &str) -> Option<PathBuf> {
-    for line in json_output.lines() {
-        let Ok(obj) = serde_json::from_str::<serde_json::Value>(line) else {
-            continue;
-        };
-        if obj.get("reason").and_then(|r| r.as_str()) != Some("compiler-artifact") {
-            continue;
-        }
-        let is_lib = obj
-            .get("target")
-            .and_then(|t| t.get("kind"))
-            .and_then(|k| k.as_array())
-            .is_some_and(|kinds| kinds.iter().any(|k| k.as_str() == Some("lib")));
-        if !is_lib {
-            continue;
-        }
-        let exe = obj.get("executable").and_then(|e| e.as_str()).unwrap_or("");
-        if exe.is_empty() {
-            continue;
-        }
-        let path = PathBuf::from(exe);
-        if path.is_file() {
-            return Some(path);
-        }
-    }
-    None
-}
-
-/// Extract a test binary path by grepping `cargo test --no-run` output for target/ paths.
-fn parse_fallback_test_binary(output: &str, base: &Path) -> Option<PathBuf> {
-    for line in output.lines() {
-        let Some(start) = line.find("target/") else {
-            continue;
-        };
-        let bin: String = line[start..]
-            .chars()
-            .take_while(|c| is_path_char(*c))
-            .collect();
-        let path = base.join(&bin);
-        if path.is_file() {
-            return Some(path);
-        }
-    }
-    None
-}
-
-fn find_test_binary(worktree_dir: &Path) -> Result<PathBuf> {
-    let (_, json_output) = run_cmd_capture_all(
-        "cargo",
-        &["test", "--no-run", "--message-format=json"],
-        worktree_dir,
-    )?;
-    if let Some(bin) = parse_json_test_binary(&json_output) {
-        return Ok(bin);
-    }
-
-    let (_, fallback_output) = run_cmd_capture_all("cargo", &["test", "--no-run"], worktree_dir)?;
-    if let Some(bin) = parse_fallback_test_binary(&fallback_output, worktree_dir) {
-        return Ok(bin);
-    }
-
-    Err(Error::TestBinaryNotFound)
 }
 
 /// RAII guard that removes the temporary worktree on drop.

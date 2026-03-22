@@ -80,6 +80,9 @@ enum Commands {
         /// Run ID (default: auto-generated)
         #[arg(long)]
         run_id: Option<String>,
+        /// Language: rust (default), java, go, ts, scala
+        #[arg(long, default_value = "rust")]
+        lang: String,
     },
     /// Run an agent on the benchmark
     RunAgent {
@@ -256,7 +259,8 @@ fn dispatch_non_agent(command: Commands) -> model::Result<()> {
         Commands::Bench {
             ref branch,
             ref run_id,
-        } => cmd::bench::run(branch, run_id.as_deref()),
+            ref lang,
+        } => cmd::bench::run(branch, run_id.as_deref(), lang),
         Commands::Analyze { runs, all } => cmd::analyze::run(runs, all),
         Commands::Verify => cmd::verify::run(),
         other => dispatch_session_command(other),
