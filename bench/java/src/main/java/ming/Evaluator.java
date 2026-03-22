@@ -9,10 +9,11 @@ import java.util.Map;
 public class Evaluator {
 
     // ---- Value types ----
-    sealed interface SchemeVal permits IntVal, BoolVal, StrVal, ListVal, SymbolVal, LambdaVal, VoidVal, BuiltinVal {}
+    sealed interface SchemeVal permits IntVal, BoolVal, StrVal, CharVal, ListVal, SymbolVal, LambdaVal, VoidVal, BuiltinVal {}
     record IntVal(long value) implements SchemeVal {}
     record BoolVal(boolean value) implements SchemeVal {}
     record StrVal(String value) implements SchemeVal {}
+    record CharVal(char value) implements SchemeVal {}
     record ListVal(List<SchemeVal> elements) implements SchemeVal {}
     record SymbolVal(String name) implements SchemeVal {}
     record VoidVal() implements SchemeVal {}
@@ -20,6 +21,9 @@ public class Evaluator {
     record BuiltinVal(String name) implements SchemeVal {}
 
     private static final SchemeVal VOID = new VoidVal();
+
+    // ---- Output capture ----
+    private StringBuilder outputBuffer;
 
     // ---- Source positions ----
     record SourcePos(int line, int col) {}
@@ -49,7 +53,10 @@ public class Evaluator {
         Env env = new Env(null);
         String[] builtins = {"+", "-", "*", "/", "<", ">", "=", "<=", ">=", "not",
             "cons", "car", "cdr", "null?", "list", "length", "append",
-            "string?", "number?", "boolean?", "pair?", "symbol?", "procedure?", "integer?"};
+            "string?", "number?", "boolean?", "pair?", "symbol?", "procedure?", "integer?",
+            "display", "write", "newline",
+            "string-append", "string-length", "substring", "string->number", "number->string",
+            "symbol->string", "string->symbol", "string-ref", "char?"};
         for (String b : builtins) {
             env.define(b, new BuiltinVal(b));
         }
@@ -221,6 +228,7 @@ public class Evaluator {
             case IntVal v -> v;
             case BoolVal v -> v;
             case StrVal v -> v;
+            case CharVal v -> v;
             case VoidVal v -> v;
             case LambdaVal v -> v;
             case BuiltinVal v -> v;
@@ -580,6 +588,74 @@ public class Evaluator {
                 if (args.size() != 1) throw new EvalError("procedure? requires exactly 1 argument");
                 yield new BoolVal(args.getFirst() instanceof LambdaVal || args.getFirst() instanceof BuiltinVal);
             }
+            case "display" -> {
+                if (args.size() != 1) throw new EvalError("display requires exactly 1 argument");
+                if (outputBuffer != null) outputBuffer.append(displayVal(args.getFirst()));
+                yield VOID;
+            }
+            case "write" -> {
+                if (args.size() != 1) throw new EvalError("write requires exactly 1 argument");
+                if (outputBuffer != null) outputBuffer.append(display(args.getFirst()));
+                yield VOID;
+            }
+            case "newline" -> {
+                if (args.size() != 0) throw new EvalError("newline requires exactly 0 arguments");
+                if (outputBuffer != null) outputBuffer.append("\n");
+                yield VOID;
+            }
+            case "string-append" -> {
+                StringBuilder sb = new StringBuilder();
+                for (SchemeVal a : args) {
+                    if (!(a instanceof StrVal s)) throw new EvalError("string-append: not a string");
+                    sb.append(s.value());
+                }
+                yield new StrVal(sb.toString());
+            }
+            case "string-length" -> {
+                if (args.size() != 1) throw new EvalError("string-length requires exactly 1 argument");
+                if (!(args.getFirst() instanceof StrVal s)) throw new EvalError("string-length: not a string");
+                yield new IntVal(s.value().length());
+            }
+            case "substring" -> {
+                if (args.size() != 3) throw new EvalError("substring requires exactly 3 arguments");
+                if (!(args.get(0) instanceof StrVal s)) throw new EvalError("substring: not a string");
+                int start = (int) asLong(args.get(1));
+                int end = (int) asLong(args.get(2));
+                yield new StrVal(s.value().substring(start, end));
+            }
+            case "string->number" -> {
+                if (args.size() != 1) throw new EvalError("string->number requires exactly 1 argument");
+                if (!(args.getFirst() instanceof StrVal s)) throw new EvalError("string->number: not a string");
+                try {
+                    yield new IntVal(Long.parseLong(s.value()));
+                } catch (NumberFormatException e) {
+                    yield new BoolVal(false);
+                }
+            }
+            case "number->string" -> {
+                if (args.size() != 1) throw new EvalError("number->string requires exactly 1 argument");
+                yield new StrVal(String.valueOf(asLong(args.getFirst())));
+            }
+            case "symbol->string" -> {
+                if (args.size() != 1) throw new EvalError("symbol->string requires exactly 1 argument");
+                if (!(args.getFirst() instanceof SymbolVal s)) throw new EvalError("symbol->string: not a symbol");
+                yield new StrVal(s.name());
+            }
+            case "string->symbol" -> {
+                if (args.size() != 1) throw new EvalError("string->symbol requires exactly 1 argument");
+                if (!(args.getFirst() instanceof StrVal s)) throw new EvalError("string->symbol: not a string");
+                yield new SymbolVal(s.value());
+            }
+            case "string-ref" -> {
+                if (args.size() != 2) throw new EvalError("string-ref requires exactly 2 arguments");
+                if (!(args.get(0) instanceof StrVal s)) throw new EvalError("string-ref: not a string");
+                int idx = (int) asLong(args.get(1));
+                yield new CharVal(s.value().charAt(idx));
+            }
+            case "char?" -> {
+                if (args.size() != 1) throw new EvalError("char? requires exactly 1 argument");
+                yield new BoolVal(args.getFirst() instanceof CharVal);
+            }
             default -> throw new EvalError("unbound variable: " + name);
         };
     }
@@ -589,12 +665,13 @@ public class Evaluator {
         throw new EvalError("expected number, got: " + display(val));
     }
 
-    // ---- Display ----
+    // ---- Display (write-style, with quotes) ----
     private String display(SchemeVal val) {
         return switch (val) {
             case IntVal v -> String.valueOf(v.value());
             case BoolVal v -> v.value() ? "#t" : "#f";
             case StrVal v -> "\"" + v.value() + "\"";
+            case CharVal v -> "#\\" + v.value();
             case SymbolVal v -> v.name();
             case VoidVal v -> "";
             case LambdaVal v -> "#<procedure>";
@@ -608,6 +685,23 @@ public class Evaluator {
                 sb.append(")");
                 yield sb.toString();
             }
+        };
+    }
+
+    // ---- Display (display-style, no quotes on strings) ----
+    private String displayVal(SchemeVal val) {
+        return switch (val) {
+            case StrVal v -> v.value();
+            case ListVal v -> {
+                StringBuilder sb = new StringBuilder("(");
+                for (int i = 0; i < v.elements().size(); i++) {
+                    if (i > 0) sb.append(" ");
+                    sb.append(displayVal(v.elements().get(i)));
+                }
+                sb.append(")");
+                yield sb.toString();
+            }
+            default -> display(val);
         };
     }
 
@@ -629,6 +723,22 @@ public class Evaluator {
     }
 
     public EvalResult evalStrWithOutput(String input) throws EvalError {
-        throw new EvalError("not implemented");
+        List<Token> tokens = tokenize(input);
+        if (tokens.isEmpty()) throw new EvalError("empty input");
+
+        posMap = new IdentityHashMap<>();
+        currentPos = null;
+        outputBuffer = new StringBuilder();
+        Env env = makeGlobalEnv();
+        int[] pos = {0};
+        SchemeVal result = null;
+        while (pos[0] < tokens.size()) {
+            result = eval(parse(tokens, pos), env);
+        }
+        if (result == null) throw new EvalError("empty input");
+        String output = outputBuffer.toString();
+        outputBuffer = null;
+        String resultStr = (result instanceof VoidVal) ? "" : display(result);
+        return new EvalResult(resultStr, output);
     }
 }
