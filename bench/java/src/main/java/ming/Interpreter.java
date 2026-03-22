@@ -719,9 +719,39 @@ public class Interpreter {
             } catch (ContinuationException e) {
                 callThunk(outThunk, "dynamic-wind");
                 throw e;
+            } catch (SchemeException e) {
+                callThunk(outThunk, "dynamic-wind");
+                throw e;
             }
             callThunk(outThunk, "dynamic-wind");
             return result;
+        });
+        globalEnv.define("raise", new SchemeValue.BuiltinVal("raise", args -> {
+            if (args.size() != 1) throw new RuntimeException(new EvalError("raise: expected 1 argument"));
+            throw new SchemeException(args.getFirst());
+        }));
+        builtin("with-exception-handler", args -> {
+            if (args.size() != 2) throw new EvalError("with-exception-handler: expected 2 arguments");
+            SchemeValue handler = args.get(0);
+            SchemeValue thunk = args.get(1);
+            try {
+                return callThunk(thunk, "with-exception-handler");
+            } catch (SchemeException e) {
+                if (handler instanceof SchemeValue.LambdaVal lambda) {
+                    var localEnv = applyLambda(lambda, List.of(e.value), "with-exception-handler: ");
+                    SchemeValue r = null;
+                    for (var bodyExpr : lambda.body()) r = eval(bodyExpr, localEnv);
+                    return r;
+                } else if (handler instanceof SchemeValue.BuiltinVal builtin) {
+                    try {
+                        return builtin.fn().apply(List.of(e.value));
+                    } catch (RuntimeException re) {
+                        if (re.getCause() instanceof EvalError ee) throw ee;
+                        throw re;
+                    }
+                }
+                throw new EvalError("with-exception-handler: handler is not a procedure");
+            }
         });
     }
 
@@ -1047,6 +1077,63 @@ public class Interpreter {
                                     for (int i = 0; i < varNames.size(); i++) {
                                         localEnv.set(varNames.get(i), newVals.get(i));
                                     }
+                                }
+                                continue;
+                            }
+                            case "guard" -> {
+                                // (guard (var clause ...) body ...)
+                                if (elements.size() < 3) throw new EvalError("guard: bad syntax");
+                                if (!(elements.get(1) instanceof SchemeValue.ListVal clauseList) || clauseList.elements().isEmpty())
+                                    throw new EvalError("guard: bad syntax");
+                                if (!(clauseList.elements().getFirst() instanceof SchemeValue.SymbolVal varSym))
+                                    throw new EvalError("guard: expected symbol");
+                                String varName = varSym.name();
+                                var clauses = clauseList.elements().subList(1, clauseList.elements().size());
+                                var bodyExprs = elements.subList(2, elements.size());
+                                SchemeValue bodyResult = null;
+                                boolean raised = false;
+                                SchemeValue raisedValue = null;
+                                try {
+                                    for (int i = 0; i < bodyExprs.size() - 1; i++) {
+                                        eval(bodyExprs.get(i), env);
+                                    }
+                                    bodyResult = eval(bodyExprs.getLast(), env);
+                                } catch (SchemeException e) {
+                                    raised = true;
+                                    raisedValue = e.value;
+                                }
+                                if (!raised) return bodyResult;
+                                // Match clauses
+                                var guardEnv = new Environment(env);
+                                guardEnv.define(varName, raisedValue);
+                                boolean clauseMatched = false;
+                                for (var clause : clauses) {
+                                    if (!(clause instanceof SchemeValue.ListVal cl) || cl.elements().isEmpty())
+                                        throw new EvalError("guard: bad clause");
+                                    SchemeValue test = cl.elements().getFirst();
+                                    if (test instanceof SchemeValue.SymbolVal s && s.name().equals("else")) {
+                                        for (int j = 1; j < cl.elements().size() - 1; j++) {
+                                            eval(cl.elements().get(j), guardEnv);
+                                        }
+                                        expr = cl.elements().getLast();
+                                        env = guardEnv;
+                                        clauseMatched = true;
+                                        break;
+                                    }
+                                    SchemeValue testResult = eval(test, guardEnv);
+                                    if (testResult.isTruthy()) {
+                                        if (cl.elements().size() == 1) return testResult;
+                                        for (int j = 1; j < cl.elements().size() - 1; j++) {
+                                            eval(cl.elements().get(j), guardEnv);
+                                        }
+                                        expr = cl.elements().getLast();
+                                        env = guardEnv;
+                                        clauseMatched = true;
+                                        break;
+                                    }
+                                }
+                                if (!clauseMatched) {
+                                    throw new SchemeException(raisedValue);
                                 }
                                 continue;
                             }
