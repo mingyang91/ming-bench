@@ -80,12 +80,14 @@ func makeGlobalEnv() *Env {
 	env.set("symbol->string", builtinVal("symbol->string", builtinSymbolToString))
 	env.set("string->symbol", builtinVal("string->symbol", builtinStringToSymbol))
 	env.set("string-ref", builtinVal("string-ref", builtinStringRef))
+	env.set("string-set!", builtinVal("string-set!", builtinStringSet))
+	env.set("string-copy", builtinVal("string-copy", builtinStringCopy))
 	return env
 }
 
 func eval(expr *Value, env *Env) (*Value, error) {
 	switch expr.Kind {
-	case KindInteger, KindBoolean, KindString:
+	case KindInteger, KindBoolean, KindString, KindChar:
 		return expr, nil
 	case KindSymbol:
 		v, ok := env.get(expr.Str)
@@ -696,6 +698,27 @@ func builtinStringRef(args []*Value) (*Value, error) {
 		return nil, &EvalError{Message: "string-ref: index out of range"}
 	}
 	return charVal(runes[idx]), nil
+}
+
+func builtinStringSet(args []*Value) (*Value, error) {
+	if len(args) != 3 || args[0].Kind != KindString || args[1].Kind != KindInteger || args[2].Kind != KindChar {
+		return nil, &EvalError{Message: "string-set!: expected string, index, and char"}
+	}
+	runes := []rune(args[0].Str)
+	idx := int(args[1].Int)
+	if idx < 0 || idx >= len(runes) {
+		return nil, &EvalError{Message: "string-set!: index out of range"}
+	}
+	runes[idx] = rune(args[2].Int)
+	args[0].Str = string(runes)
+	return voidVal(), nil
+}
+
+func builtinStringCopy(args []*Value) (*Value, error) {
+	if len(args) != 1 || args[0].Kind != KindString {
+		return nil, &EvalError{Message: "string-copy: expected string"}
+	}
+	return strVal(args[0].Str), nil
 }
 
 // EvalStr evaluates one or more Scheme expressions and returns the string

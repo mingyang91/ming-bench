@@ -259,6 +259,22 @@ func parseAtom(s string) *Value {
 	if s == "#f" {
 		return boolVal(false)
 	}
+	// Character literal: #\x or #\space, #\newline, #\tab
+	if len(s) >= 3 && s[0] == '#' && s[1] == '\\' {
+		name := s[2:]
+		switch strings.ToLower(name) {
+		case "space":
+			return charVal(' ')
+		case "newline":
+			return charVal('\n')
+		case "tab":
+			return charVal('\t')
+		default:
+			if len([]rune(name)) == 1 {
+				return charVal([]rune(name)[0])
+			}
+		}
+	}
 	// Try integer
 	if n, err := strconv.ParseInt(s, 10, 64); err == nil {
 		return intVal(n)
