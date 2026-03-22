@@ -5,32 +5,45 @@ import SchemeValue.*
 /** Tokenizer and S-expression parser for Scheme source code. */
 object Parser:
 
+  private case class Token(text: String, pos: SourcePos)
+
   def parse(input: String): List[SchemeValue] =
     val tokens = tokenize(input)
     readAll(tokens, Nil)
 
+  // --- Position helper ---
+
+  private def posAt(input: String, offset: Int): SourcePos =
+    val prefix = input.substring(0, offset)
+    val line   = prefix.count(_ == '\n') + 1
+    val col    = offset - prefix.lastIndexOf('\n')
+    SourcePos(line, col)
+
   // --- Tokenizer ---
 
-  private def tokenize(input: String): List[String] =
+  private def tokenize(input: String): List[Token] =
     tokenizeLoop(input, 0, Nil)
 
   @scala.annotation.tailrec
-  private def tokenizeLoop(input: String, pos: Int, acc: List[String]): List[String] =
+  private def tokenizeLoop(input: String, pos: Int, acc: List[Token]): List[Token] =
     if pos >= input.length then acc.reverse
     else
       val ch = input.charAt(pos)
       ch match
         case ' ' | '\t' | '\n' | '\r' => tokenizeLoop(input, pos + 1, acc)
         case ';'                      => tokenizeLoop(input, skipLineComment(input, pos + 1), acc)
-        case '('                      => tokenizeLoop(input, pos + 1, "(" :: acc)
-        case ')'                      => tokenizeLoop(input, pos + 1, ")" :: acc)
+        case '(' =>
+          tokenizeLoop(input, pos + 1, Token("(", posAt(input, pos)) :: acc)
+        case ')' =>
+          tokenizeLoop(input, pos + 1, Token(")", posAt(input, pos)) :: acc)
         case '"' =>
           val (str, next) = readString(input, pos + 1, new StringBuilder)
-          tokenizeLoop(input, next, s""""$str"""" :: acc)
-        case '\'' => tokenizeLoop(input, pos + 1, "'" :: acc)
+          tokenizeLoop(input, next, Token(s""""$str"""", posAt(input, pos)) :: acc)
+        case '\'' =>
+          tokenizeLoop(input, pos + 1, Token("'", posAt(input, pos)) :: acc)
         case _ =>
           val (tok, next) = readAtom(input, pos, new StringBuilder)
-          tokenizeLoop(input, next, tok :: acc)
+          tokenizeLoop(input, next, Token(tok, posAt(input, pos)) :: acc)
 
   @scala.annotation.tailrec
   private def skipLineComment(input: String, pos: Int): Int =
@@ -65,37 +78,39 @@ object Parser:
   // --- Reader ---
 
   @scala.annotation.tailrec
-  private def readAll(tokens: List[String], acc: List[SchemeValue]): List[SchemeValue] =
+  private def readAll(tokens: List[Token], acc: List[SchemeValue]): List[SchemeValue] =
     tokens match
       case Nil => acc.reverse
       case _ =>
         val (value, rest) = readExpr(tokens)
         readAll(rest, value :: acc)
 
-  private def readExpr(tokens: List[String]): (SchemeValue, List[String]) =
+  private def readExpr(tokens: List[Token]): (SchemeValue, List[Token]) =
     tokens match
-      case Nil         => throw new EvalError("unexpected end of input")
-      case "(" :: rest => readList(rest, Nil)
-      case ")" :: _    => throw new EvalError("unexpected )")
-      case "'" :: rest =>
+      case Nil => throw new EvalError("unexpected end of input")
+      case Token("(", pos) :: rest =>
+        val (elems, remaining) = readList(rest, Nil)
+        (SchemeList(elems, pos), remaining)
+      case Token(")", _) :: _ => throw new EvalError("unexpected )")
+      case Token("'", pos) :: rest =>
         val (quoted, remaining) = readExpr(rest)
-        (SchemeList(List(SchemeSymbol("quote"), quoted)), remaining)
-      case tok :: rest => (parseAtom(tok), rest)
+        (SchemeList(List(SchemeSymbol("quote", pos), quoted), pos), remaining)
+      case Token(tok, pos) :: rest => (parseAtom(tok, pos), rest)
 
   @scala.annotation.tailrec
-  private def readList(tokens: List[String], acc: List[SchemeValue]): (SchemeValue, List[String]) =
+  private def readList(tokens: List[Token], acc: List[SchemeValue]): (List[SchemeValue], List[Token]) =
     tokens match
-      case Nil         => throw new EvalError("unterminated list")
-      case ")" :: rest => (SchemeList(acc.reverse), rest)
+      case Nil                   => throw new EvalError("unterminated list")
+      case Token(")", _) :: rest => (acc.reverse, rest)
       case _ =>
         val (value, rest) = readExpr(tokens)
         readList(rest, value :: acc)
 
-  private def parseAtom(token: String): SchemeValue =
+  private def parseAtom(token: String, pos: SourcePos): SchemeValue =
     if token == "#t" then SchemeBool(true)
     else if token == "#f" then SchemeBool(false)
     else if token.startsWith("\"") then SchemeString(token.drop(1).dropRight(1))
     else
       token.toLongOption match
         case Some(n) => SchemeInt(n)
-        case None    => SchemeSymbol(token)
+        case None    => SchemeSymbol(token, pos)

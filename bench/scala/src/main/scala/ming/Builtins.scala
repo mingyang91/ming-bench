@@ -39,7 +39,10 @@ object Builtins:
 
   private def evalDivide(args: List[SchemeValue]): SchemeValue =
     if args.length < 2 then throw new EvalError("/: expected at least 2 arguments")
-    else SchemeInt(args.map(asInt).reduceLeft(_ / _))
+    else
+      val nums = args.map(asInt)
+      if nums.tail.contains(0L) then throw new EvalError("/: division by zero")
+      else SchemeInt(nums.reduceLeft(_ / _))
 
   private def evalCons(args: List[SchemeValue]): SchemeValue =
     if args.length != 2 then throw new EvalError("cons: expected 2 arguments")

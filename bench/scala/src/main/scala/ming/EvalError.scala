@@ -1,3 +1,8 @@
 package ming
 
-class EvalError(message: String) extends Exception(message)
+class EvalError(
+  val baseMessage: String,
+  val sourcePos: SourcePos = SourcePos.None
+) extends Exception(
+      if sourcePos.isKnown then s"$baseMessage [${sourcePos}]" else baseMessage
+    )

@@ -36,7 +36,7 @@ object Evaluator:
     acc: List[(String, List[String], List[SchemeValue])]
   ): (List[(String, List[String], List[SchemeValue])], List[SchemeValue]) =
     exprs match
-      case SchemeList(SchemeSymbol("define") :: rest) :: tail =>
+      case (defExpr @ SchemeList(SchemeSymbol("define") :: rest)) :: tail =>
         rest match
           case SchemeSymbol(name) :: valueExpr :: Nil =>
             collectDefines(tail, (name, Nil, List(valueExpr)) :: acc)
@@ -46,7 +46,7 @@ object Evaluator:
               case other           => throw new EvalError(s"bad parameter: ${other.display}")
             }
             collectDefines(tail, (name, paramNames, body) :: acc)
-          case _ => throw new EvalError("bad define syntax")
+          case _ => throw new EvalError("bad define syntax", defExpr.pos)
       case _ => (acc.reverse, exprs)
 
   @scala.annotation.tailrec
@@ -70,14 +70,28 @@ object Evaluator:
     case SchemeString(_)       => (expr, env)
     case SchemeVoid            => (expr, env)
     case SchemeLambda(_, _, _) => (expr, env)
-    case SchemeSymbol(name)    => (env.lookup(name), env)
-    case SchemeList(Nil)       => throw new EvalError("empty application")
+    case SchemeSymbol(name) =>
+      try (env.lookup(name), env)
+      catch
+        case e: EvalError if e.sourcePos == SourcePos.None =>
+          throw new EvalError(e.baseMessage, expr.pos)
+    case SchemeList(Nil) =>
+      throw new EvalError("empty application", expr.pos)
     case SchemeList(SchemeSymbol(op) :: args) =>
-      evalSpecialOrCall(op, args, env)
+      try evalSpecialOrCall(op, args, env)
+      catch
+        case e: EvalError if e.sourcePos == SourcePos.None =>
+          throw new EvalError(e.baseMessage, expr.pos)
     case SchemeList(head :: args) =>
-      val (proc, _)  = evalWithEnv(head, env)
-      val evaledArgs = args.map(a => eval(a, env))
-      (applyProc(proc, evaledArgs), env)
+      try
+        val (proc, _)  = evalWithEnv(head, env)
+        val evaledArgs = args.map(a => eval(a, env))
+        (applyProc(proc, evaledArgs), env)
+      catch
+        case e: EvalError if e.sourcePos == SourcePos.None =>
+          throw new EvalError(e.baseMessage, expr.pos)
+    case other =>
+      throw new EvalError(s"cannot evaluate: ${other.display}", other.pos)
 
   private[ming] def eval(expr: SchemeValue, env: Env): SchemeValue =
     evalWithEnv(expr, env)._1

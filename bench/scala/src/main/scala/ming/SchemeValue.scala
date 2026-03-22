@@ -1,20 +1,59 @@
 package ming
 
 /** Scheme value representation. */
-enum SchemeValue:
-  case SchemeInt(value: Long)
-  case SchemeBool(value: Boolean)
-  case SchemeString(value: String)
-  case SchemeList(elements: List[SchemeValue])
-  case SchemeSymbol(name: String)
-  case SchemeLambda(params: List[String], body: List[SchemeValue], closure: Env)
-  case SchemeVoid
+sealed trait SchemeValue:
+  def display: String
+  def pos: SourcePos = SourcePos.None
 
-  def display: String = this match
-    case SchemeInt(v)          => v.toString
-    case SchemeBool(v)         => if v then "#t" else "#f"
-    case SchemeString(v)       => s""""$v""""
-    case SchemeSymbol(n)       => n
-    case SchemeList(es)        => s"(${es.map(_.display).mkString(" ")})"
-    case SchemeLambda(_, _, _) => "#<procedure>"
-    case SchemeVoid            => "#<void>"
+object SchemeValue:
+
+  case class SchemeInt(value: Long) extends SchemeValue:
+    def display: String = value.toString
+
+  case class SchemeBool(value: Boolean) extends SchemeValue:
+    def display: String = if value then "#t" else "#f"
+
+  case class SchemeString(value: String) extends SchemeValue:
+    def display: String = "\"" + value + "\""
+
+  class SchemeSymbol(val name: String, override val pos: SourcePos = SourcePos.None) extends SchemeValue:
+    def display: String = name
+
+    override def equals(other: Any): Boolean = other match
+      case s: SchemeSymbol => s.name == name
+      case _               => false
+    override def hashCode: Int    = name.hashCode
+    override def toString: String = s"SchemeSymbol($name)"
+
+  object SchemeSymbol:
+
+    def apply(name: String, pos: SourcePos = SourcePos.None): SchemeSymbol =
+      new SchemeSymbol(name, pos)
+
+    def unapply(v: SchemeValue): Option[String] = v match
+      case s: SchemeSymbol => Some(s.name)
+      case _               => scala.None
+
+  class SchemeList(val elements: List[SchemeValue], override val pos: SourcePos = SourcePos.None) extends SchemeValue:
+    def display: String = s"(${elements.map(_.display).mkString(" ")})"
+
+    override def equals(other: Any): Boolean = other match
+      case l: SchemeList => l.elements == elements
+      case _             => false
+    override def hashCode: Int    = elements.hashCode
+    override def toString: String = s"SchemeList(${elements.mkString(", ")})"
+
+  object SchemeList:
+
+    def apply(elements: List[SchemeValue], pos: SourcePos = SourcePos.None): SchemeList =
+      new SchemeList(elements, pos)
+
+    def unapply(v: SchemeValue): Option[List[SchemeValue]] = v match
+      case l: SchemeList => Some(l.elements)
+      case _             => scala.None
+
+  case class SchemeLambda(params: List[String], body: List[SchemeValue], closure: Env) extends SchemeValue:
+    def display: String = "#<procedure>"
+
+  case object SchemeVoid extends SchemeValue:
+    def display: String = "#<void>"
