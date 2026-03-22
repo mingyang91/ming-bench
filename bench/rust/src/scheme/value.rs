@@ -113,6 +113,7 @@ pub enum Value {
         rest_param: Option<String>,
         body: Vec<Expr>,
         env: Env,
+        name: Option<String>,
     },
     Builtin(String),
     Continuation {
@@ -141,6 +142,7 @@ pub enum Value {
     CaseLambda {
         clauses: Vec<(Vec<String>, Option<String>, Vec<Expr>)>,
         env: Env,
+        name: Option<String>,
     },
     /// A record instance.
     Record {

@@ -356,6 +356,7 @@ fn is_builtin(name: &str) -> bool {
             | "syntax->datum"
             | "datum->syntax"
             | "procedure?"
+            | "procedure-name"
     )
 }
 
@@ -372,6 +373,7 @@ fn apply_step(
             rest_param,
             body,
             env: closure_env,
+            ..
         } => {
             match rest_param {
                 None => {
@@ -420,7 +422,7 @@ fn apply_step(
                 env: call_env,
             })
         }
-        Value::CaseLambda { clauses, env: closure_env } => {
+        Value::CaseLambda { clauses, env: closure_env, .. } => {
             // Find the matching clause by arity
             for (params, rest_param, body) in clauses {
                 match rest_param {
@@ -767,7 +769,7 @@ fn eval_raise(
         .at(span));
     }
     let value = eval(&args[0], env, output, ctx)?;
-    Err(EvalErrorKind::SchemeRaise { value }.at(span))
+    Err(EvalErrorKind::SchemeRaise { value: Box::new(value) }.at(span))
 }
 
 fn eval_guard_step(
@@ -847,7 +849,7 @@ fn eval_guard_step(
             if let EvalErrorKind::SchemeRaise { value } = e.kind {
                 // Bind the exception value to the variable
                 let guard_env = Env::with_parent(env);
-                guard_env.define(var_name, value.clone());
+                guard_env.define(var_name, (*value).clone());
 
                 // Evaluate clauses like cond
                 for clause in clauses {
@@ -889,6 +891,7 @@ fn eval_guard_step(
 
                 // No clause matched, re-raise
                 Err(EvalErrorKind::SchemeRaise { value }.at(span))
+
             } else {
                 Err(e)
             }
@@ -932,7 +935,7 @@ fn eval_with_exception_handler(
         Ok(val) => Ok(val),
         Err(e) => {
             if let EvalErrorKind::SchemeRaise { value } = e.kind {
-                apply_func(&handler, &[value], span, output, ctx)
+                apply_func(&handler, &[*value], span, output, ctx)
             } else {
                 Err(e)
             }
@@ -1124,6 +1127,25 @@ fn eval_builtin(
                 | Value::RecordAccessor { .. }
             )))
         }
+        "procedure-name" => {
+            if args.len() != 1 {
+                return Err(EvalErrorKind::Arity { name: "procedure-name".into(), expected: "1".into(), got: args.len() }.at(span));
+            }
+            match &args[0] {
+                Value::Lambda { name, .. } | Value::CaseLambda { name, .. } => {
+                    match name {
+                        Some(n) => Ok(Value::Symbol(n.clone())),
+                        None => Ok(Value::Boolean(false)),
+                    }
+                }
+                Value::Builtin(n) => Ok(Value::Symbol(n.clone())),
+                Value::Continuation { .. } => Ok(Value::Boolean(false)),
+                Value::RecordConstructor { type_name, .. } => Ok(Value::Symbol(format!("make-{type_name}"))),
+                Value::RecordPredicate { .. } => Ok(Value::Boolean(false)),
+                Value::RecordAccessor { .. } => Ok(Value::Boolean(false)),
+                _ => Err(EvalErrorKind::Type { expected: "procedure".into(), got: format!("{}", args[0]) }.at(span)),
+            }
+        }
         "set-car!" => eval_set_car(args, span),
         "set-cdr!" => eval_set_cdr(args, span),
         "cddr" => eval_cddr(args, span),
@@ -1216,7 +1238,17 @@ fn eval_define(
                 }
                 .at(span));
             }
-            let val = eval(&args[1], env, output, ctx)?;
+            let mut val = eval(&args[1], env, output, ctx)?;
+            // Propagate the name to anonymous lambdas/case-lambdas
+            match &mut val {
+                Value::Lambda { name: ref mut n, .. } if n.is_none() => {
+                    *n = Some(name.clone());
+                }
+                Value::CaseLambda { name: ref mut n, .. } if n.is_none() => {
+                    *n = Some(name.clone());
+                }
+                _ => {}
+            }
             env.define(name.clone(), val);
             Ok(Value::Nil)
         }
@@ -1244,6 +1276,7 @@ fn eval_define(
                 rest_param,
                 body,
                 env: env.clone(),
+                name: Some(name.clone()),
             };
             env.define(name, lambda);
             Ok(Value::Nil)
@@ -1521,6 +1554,7 @@ fn eval_lambda(args: &[Expr], span: &Span, env: &Env) -> Result<Value, EvalError
         rest_param,
         body,
         env: env.clone(),
+        name: None,
     })
 }
 
@@ -1565,6 +1599,7 @@ fn eval_case_lambda(args: &[Expr], span: &Span, env: &Env) -> Result<Value, Eval
     Ok(Value::CaseLambda {
         clauses,
         env: env.clone(),
+        name: None,
     })
 }
 
@@ -2144,6 +2179,7 @@ fn eval_let_step(
             rest_param: None,
             body,
             env: let_env.clone(),
+            name: Some(name.clone()),
         };
         let_env.define(name.clone(), lambda);
         // Bind initial values
