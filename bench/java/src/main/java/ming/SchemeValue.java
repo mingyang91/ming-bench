@@ -38,6 +38,7 @@ public sealed interface SchemeValue {
     record ContinuationVal(int id) implements SchemeValue {}
     record SyntaxRulesVal(List<String> literals, List<SchemeValue> patterns, List<SchemeValue> templates, Environment defEnv) implements SchemeValue {}
     record VectorVal(SchemeValue[] elements) implements SchemeValue {}
+    record ValuesVal(List<SchemeValue> values) implements SchemeValue {}
 
     /** Scheme `display` output: no quotes on strings, chars as bare characters. */
     default String displayStr() {
@@ -61,6 +62,7 @@ public sealed interface SchemeValue {
             case ContinuationVal v -> "#<continuation>";
             case SyntaxRulesVal v -> "#<syntax>";
             case VoidVal v -> "";
+            case ValuesVal v -> v.values().isEmpty() ? "" : v.values().getFirst().display();
             case CharVal v -> "#\\" + (v.value() == ' ' ? "space" : v.value() == '\n' ? "newline" : String.valueOf(v.value()));
             case ListVal v -> {
                 if (v.elements().isEmpty()) yield "()";

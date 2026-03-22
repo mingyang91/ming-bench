@@ -726,6 +726,36 @@ public class Interpreter {
             callThunk(outThunk, "dynamic-wind");
             return result;
         });
+        builtin("values", args -> {
+            if (args.size() == 1) return args.getFirst();
+            return new SchemeValue.ValuesVal(args);
+        });
+        builtin("call-with-values", args -> {
+            if (args.size() != 2) throw new EvalError("call-with-values: expected 2 arguments");
+            SchemeValue producer = args.get(0);
+            SchemeValue consumer = args.get(1);
+            SchemeValue produced = callThunk(producer, "call-with-values");
+            List<SchemeValue> vals;
+            if (produced instanceof SchemeValue.ValuesVal mv) {
+                vals = mv.values();
+            } else {
+                vals = List.of(produced);
+            }
+            if (consumer instanceof SchemeValue.LambdaVal lambda) {
+                var localEnv = applyLambda(lambda, vals, "call-with-values: ");
+                SchemeValue r = null;
+                for (var bodyExpr : lambda.body()) r = eval(bodyExpr, localEnv);
+                return r;
+            } else if (consumer instanceof SchemeValue.BuiltinVal builtin) {
+                try {
+                    return builtin.fn().apply(vals);
+                } catch (RuntimeException re) {
+                    if (re.getCause() instanceof EvalError ee) throw ee;
+                    throw re;
+                }
+            }
+            throw new EvalError("call-with-values: consumer is not a procedure");
+        });
         globalEnv.define("raise", new SchemeValue.BuiltinVal("raise", args -> {
             if (args.size() != 1) throw new RuntimeException(new EvalError("raise: expected 1 argument"));
             throw new SchemeException(args.getFirst());
@@ -794,6 +824,7 @@ public class Interpreter {
                 case SchemeValue.ContinuationVal v -> { return v; }
                 case SchemeValue.SyntaxRulesVal v -> { return v; }
                 case SchemeValue.VectorVal v -> { return v; }
+                case SchemeValue.ValuesVal v -> { return v; }
                 case SchemeValue.SymbolVal v -> {
                     try {
                         return env.get(v.name());
