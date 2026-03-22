@@ -10,6 +10,7 @@ pub enum Value {
     Boolean(bool),
     SchemeString(String),
     Symbol(String),
+    Char(char),
     Nil,
     Pair(Box<Value>, Box<Value>),
     Lambda {
@@ -33,10 +34,30 @@ impl PartialEq for Value {
             (Value::Boolean(a), Value::Boolean(b)) => a == b,
             (Value::SchemeString(a), Value::SchemeString(b)) => a == b,
             (Value::Symbol(a), Value::Symbol(b)) => a == b,
+            (Value::Char(a), Value::Char(b)) => a == b,
             (Value::Nil, Value::Nil) => true,
             (Value::Pair(a1, a2), Value::Pair(b1, b2)) => a1 == b1 && a2 == b2,
             _ => false,
         }
+    }
+}
+
+impl Value {
+    /// Format value for `display` (no quotes on strings).
+    pub fn display_fmt(&self, buf: &mut String) {
+        match self {
+            Value::SchemeString(s) => buf.push_str(s),
+            Value::Pair(_, _) => {
+                buf.push('(');
+                display_list(buf, self);
+            }
+            other => buf.push_str(&other.to_string()),
+        }
+    }
+
+    /// Format value for `write` (quotes on strings).
+    pub fn write_fmt(&self, buf: &mut String) {
+        buf.push_str(&self.to_string());
     }
 }
 
@@ -48,6 +69,7 @@ impl fmt::Display for Value {
             Value::Boolean(false) => write!(f, "#f"),
             Value::SchemeString(s) => write!(f, "\"{s}\""),
             Value::Symbol(s) => write!(f, "{s}"),
+            Value::Char(c) => write!(f, "#\\{c}"),
             Value::Nil => write!(f, "()"),
             Value::Pair(_, _) => {
                 write!(f, "(")?;
@@ -72,5 +94,26 @@ fn write_list(f: &mut fmt::Formatter<'_>, val: &Value) -> fmt::Result {
             }
         }
         _ => write!(f, ")"),
+    }
+}
+
+fn display_list(buf: &mut String, val: &Value) {
+    match val {
+        Value::Pair(car, cdr) => {
+            car.display_fmt(buf);
+            match cdr.as_ref() {
+                Value::Nil => buf.push(')'),
+                Value::Pair(_, _) => {
+                    buf.push(' ');
+                    display_list(buf, cdr);
+                }
+                other => {
+                    buf.push_str(" . ");
+                    other.display_fmt(buf);
+                    buf.push(')');
+                }
+            }
+        }
+        _ => buf.push(')'),
     }
 }

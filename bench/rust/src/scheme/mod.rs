@@ -17,17 +17,31 @@ pub fn eval_str(input: &str) -> Result<String, EvalError> {
         .into());
     }
     let env = env::Env::new();
+    let mut output = String::new();
     let mut result = None;
     for expr in &exprs {
-        result = Some(eval::eval(expr, &env)?);
+        result = Some(eval::eval(expr, &env, &mut output)?);
     }
     Ok(result.expect("at least one expression was parsed").to_string())
 }
 
 /// Evaluate Scheme expressions, returning both the result value and
 /// any output produced by `display`, `write`, or `newline`.
-pub fn eval_str_with_output(_input: &str) -> Result<(String, String), EvalError> {
-    todo!()
+pub fn eval_str_with_output(input: &str) -> Result<(String, String), EvalError> {
+    let exprs = parser::parse(input)?;
+    if exprs.is_empty() {
+        return Err(error::EvalErrorKind::Parse {
+            message: "no expressions".into(),
+        }
+        .into());
+    }
+    let env = env::Env::new();
+    let mut output = String::new();
+    let mut result = None;
+    for expr in &exprs {
+        result = Some(eval::eval(expr, &env, &mut output)?);
+    }
+    Ok((result.expect("at least one expression was parsed").to_string(), output))
 }
 
 #[cfg(test)]
