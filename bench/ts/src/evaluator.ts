@@ -17,6 +17,7 @@ type Expr =
   | { tag: 'number'; value: number; pos: Pos }
   | { tag: 'boolean'; value: boolean; pos: Pos }
   | { tag: 'string'; value: string; pos: Pos }
+  | { tag: 'char'; value: string; pos: Pos }
   | { tag: 'symbol'; name: string; pos: Pos }
   | { tag: 'list'; items: Expr[]; pos: Pos };
 
@@ -142,6 +143,17 @@ function parseTokens(tokens: Token[], idx: number): [Expr, number] {
   // boolean
   if (tok.text === '#t') return [{ tag: 'boolean', value: true, pos: p }, idx + 1];
   if (tok.text === '#f') return [{ tag: 'boolean', value: false, pos: p }, idx + 1];
+
+  // character literal
+  if (tok.text.startsWith('#\\')) {
+    const charName = tok.text.slice(2);
+    let ch: string;
+    if (charName === 'space') ch = ' ';
+    else if (charName === 'newline') ch = '\n';
+    else if (charName === 'tab') ch = '\t';
+    else ch = charName;
+    return [{ tag: 'char', value: ch, pos: p }, idx + 1];
+  }
 
   // number
   if (/^-?\d+$/.test(tok.text)) {
@@ -447,6 +459,19 @@ function makeGlobalEnv(output: string[] = []): Env {
       throw new EvalError('string-ref: expected string and number');
     return { tag: 'char', value: args[0].value[args[1].value] };
   }});
+  env.define('string-copy', { tag: 'builtin', name: 'string-copy', fn(args) {
+    if (args.length !== 1 || args[0].tag !== 'string') throw new EvalError('string-copy: expected string');
+    return { tag: 'string', value: args[0].value };
+  }});
+  env.define('string-set!', { tag: 'builtin', name: 'string-set!', fn(args) {
+    if (args.length !== 3 || args[0].tag !== 'string' || args[1].tag !== 'number' || args[2].tag !== 'char')
+      throw new EvalError('string-set!: expected string, number, char');
+    const s = args[0];
+    const idx = args[1].value;
+    const ch = args[2].value;
+    s.value = s.value.substring(0, idx) + ch + s.value.substring(idx + 1);
+    return { tag: 'nil' };
+  }});
 
   return env;
 }
@@ -458,6 +483,7 @@ function exprToValue(expr: Expr): Value {
     case 'number': return { tag: 'number', value: expr.value };
     case 'boolean': return { tag: 'boolean', value: expr.value };
     case 'string': return { tag: 'string', value: expr.value };
+    case 'char': return { tag: 'char', value: expr.value };
     case 'symbol': return { tag: 'symbol', name: expr.name };
     case 'list': {
       let result: Value = { tag: 'nil' };
@@ -476,6 +502,7 @@ function evaluate(expr: Expr, env: Env): Value {
     case 'number': return { tag: 'number', value: expr.value };
     case 'boolean': return { tag: 'boolean', value: expr.value };
     case 'string': return { tag: 'string', value: expr.value };
+    case 'char': return { tag: 'char', value: expr.value };
     case 'symbol': return env.get(expr.name, expr.pos);
     case 'list': {
       const items = expr.items;
