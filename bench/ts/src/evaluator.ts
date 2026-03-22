@@ -17,7 +17,8 @@ type SchemeVal =
   | { tag: 'lambda'; params: string[]; restParam?: string; body: SchemeVal[]; env: Env; pos?: Pos }
   | { tag: 'builtin'; fn: (args: SchemeVal[]) => SchemeVal; pos?: Pos }
   | { tag: 'continuation'; id: symbol; callPos: string; exprIndex: number; bodyInfo?: { body: SchemeVal[]; idx: number; env: Env }; pos?: Pos }
-  | { tag: 'callcc'; pos?: Pos };
+  | { tag: 'callcc'; pos?: Pos }
+  | { tag: 'macro'; literals: string[]; clauses: { pattern: SchemeVal; template: SchemeVal }[]; defEnv: Env; pos?: Pos };
 
 // --- Continuation support ---
 
@@ -293,6 +294,231 @@ function applyLambda(proc: SchemeVal & { tag: 'lambda' }, args: SchemeVal[], pos
   return callEnv;
 }
 
+// --- Macro support ---
+
+const SPECIAL_FORMS = new Set([
+  'quote', 'if', 'define', 'lambda', 'and', 'or', 'not',
+  'let', 'set!', 'begin', 'cond', 'define-syntax',
+]);
+
+let gensymCounter = 0;
+function gensym(base: string): string {
+  return `${base}$$${++gensymCounter}`;
+}
+
+type Bindings = Map<string, SchemeVal | SchemeVal[]>;
+
+function collectPatternVars(pat: SchemeVal, literals: string[]): Set<string> {
+  const vars = new Set<string>();
+  function walk(p: SchemeVal) {
+    if (p.tag === 'symbol') {
+      if (p.value !== '...' && p.value !== '_' && !literals.includes(p.value)) {
+        vars.add(p.value);
+      }
+    } else if (p.tag === 'list') {
+      for (const e of p.elements) walk(e);
+    }
+  }
+  walk(pat);
+  return vars;
+}
+
+function matchPattern(pat: SchemeVal, input: SchemeVal, literals: string[], bindings: Bindings): boolean {
+  if (pat.tag === 'symbol') {
+    if (pat.value === '_') return true;
+    if (pat.value === '...') return true;
+    if (literals.includes(pat.value)) {
+      return input.tag === 'symbol' && input.value === pat.value;
+    }
+    bindings.set(pat.value, input);
+    return true;
+  }
+  if (pat.tag === 'list' && input.tag === 'list') {
+    return matchListElems(pat.elements, input.elements, literals, bindings);
+  }
+  if (pat.tag === 'number' && input.tag === 'number') return pat.value === input.value;
+  if (pat.tag === 'boolean' && input.tag === 'boolean') return pat.value === input.value;
+  return false;
+}
+
+function matchListElems(pats: SchemeVal[], inputs: SchemeVal[], literals: string[], bindings: Bindings): boolean {
+  let ellipsisAt = -1;
+  for (let i = 1; i < pats.length; i++) {
+    const p = pats[i];
+    if (p.tag === 'symbol' && p.value === '...') {
+      ellipsisAt = i;
+      break;
+    }
+  }
+
+  if (ellipsisAt === -1) {
+    if (pats.length !== inputs.length) return false;
+    for (let i = 0; i < pats.length; i++) {
+      if (!matchPattern(pats[i], inputs[i], literals, bindings)) return false;
+    }
+    return true;
+  }
+
+  const beforeCount = ellipsisAt - 1;
+  const afterCount = pats.length - ellipsisAt - 1;
+  const ellipsisPat = pats[ellipsisAt - 1];
+
+  if (inputs.length < beforeCount + afterCount) return false;
+
+  for (let i = 0; i < beforeCount; i++) {
+    if (!matchPattern(pats[i], inputs[i], literals, bindings)) return false;
+  }
+
+  const repeatCount = inputs.length - beforeCount - afterCount;
+  if (ellipsisPat.tag === 'symbol' && !literals.includes(ellipsisPat.value) && ellipsisPat.value !== '_') {
+    const matches: SchemeVal[] = [];
+    for (let i = 0; i < repeatCount; i++) {
+      matches.push(inputs[beforeCount + i]);
+    }
+    bindings.set(ellipsisPat.value, matches);
+  }
+
+  for (let i = 0; i < afterCount; i++) {
+    if (!matchPattern(afterPats(pats, ellipsisAt, i), inputs[inputs.length - afterCount + i], literals, bindings)) return false;
+  }
+
+  return true;
+}
+
+function afterPats(pats: SchemeVal[], ellipsisAt: number, i: number): SchemeVal {
+  return pats[ellipsisAt + 1 + i];
+}
+
+function findEllipsisVars(tmpl: SchemeVal, bindings: Bindings): string[] {
+  const result: string[] = [];
+  function walk(t: SchemeVal) {
+    if (t.tag === 'symbol' && bindings.has(t.value) && Array.isArray(bindings.get(t.value))) {
+      if (!result.includes(t.value)) result.push(t.value);
+    } else if (t.tag === 'list') {
+      for (const e of t.elements) walk(e);
+    }
+  }
+  walk(tmpl);
+  return result;
+}
+
+function instantiateTemplate(tmpl: SchemeVal, bindings: Bindings): SchemeVal {
+  if (tmpl.tag === 'symbol') {
+    if (bindings.has(tmpl.value)) {
+      const val = bindings.get(tmpl.value)!;
+      if (Array.isArray(val)) {
+        throw new EvalError('ellipsis variable used outside ellipsis context');
+      }
+      return val;
+    }
+    return tmpl;
+  }
+  if (tmpl.tag === 'list') {
+    const result: SchemeVal[] = [];
+    for (let i = 0; i < tmpl.elements.length; i++) {
+      const elem = tmpl.elements[i];
+      const next = i + 1 < tmpl.elements.length ? tmpl.elements[i + 1] : null;
+      if (next && next.tag === 'symbol' && next.value === '...') {
+        const ellVars = findEllipsisVars(elem, bindings);
+        if (ellVars.length > 0) {
+          const listBinding = bindings.get(ellVars[0]);
+          if (Array.isArray(listBinding)) {
+            for (let j = 0; j < listBinding.length; j++) {
+              const subBindings = new Map(bindings);
+              for (const v of ellVars) {
+                const vBinding = bindings.get(v);
+                if (Array.isArray(vBinding)) {
+                  subBindings.set(v, vBinding[j]);
+                }
+              }
+              result.push(instantiateTemplate(elem, subBindings));
+            }
+          }
+        }
+        i++; // skip ...
+        continue;
+      }
+      result.push(instantiateTemplate(elem, bindings));
+    }
+    return { tag: 'list', elements: result, pos: tmpl.pos };
+  }
+  return tmpl;
+}
+
+function collectIntroducedSymbols(tmpl: SchemeVal, patVars: Set<string>): Set<string> {
+  const syms = new Set<string>();
+  function walk(t: SchemeVal) {
+    if (t.tag === 'symbol' && !patVars.has(t.value) && !SPECIAL_FORMS.has(t.value) && t.value !== '...') {
+      syms.add(t.value);
+    } else if (t.tag === 'list') {
+      // Don't walk into quote
+      if (t.elements.length > 0 && t.elements[0].tag === 'symbol' && t.elements[0].value === 'quote') return;
+      for (const e of t.elements) walk(e);
+    }
+  }
+  walk(tmpl);
+  return syms;
+}
+
+function renameSymbols(ast: SchemeVal, renames: Map<string, string>): SchemeVal {
+  if (ast.tag === 'symbol' && renames.has(ast.value)) {
+    return { tag: 'symbol', value: renames.get(ast.value)!, pos: ast.pos };
+  }
+  if (ast.tag === 'list') {
+    // Don't rename inside quote
+    if (ast.elements.length > 0 && ast.elements[0].tag === 'symbol' && ast.elements[0].value === 'quote') return ast;
+    return { tag: 'list', elements: ast.elements.map(e => renameSymbols(e, renames)), pos: ast.pos };
+  }
+  return ast;
+}
+
+function expandMacro(macro: SchemeVal & { tag: 'macro' }, form: SchemeVal[], useEnv: Env): { expanded: SchemeVal; hygieneEnv: Env } {
+  for (const clause of macro.clauses) {
+    const bindings: Bindings = new Map();
+    const patElems = (clause.pattern as { tag: 'list'; elements: SchemeVal[] }).elements;
+    // Match skipping macro name (first element)
+    if (matchListElems(patElems.slice(1), form.slice(1), macro.literals, bindings)) {
+      const patVars = collectPatternVars(clause.pattern, macro.literals);
+      // Remove the macro name from patVars (first element of pattern)
+      if (patElems[0].tag === 'symbol') patVars.delete(patElems[0].value);
+
+      let expanded = instantiateTemplate(clause.template, bindings);
+
+      // Hygiene: rename introduced symbols
+      const introduced = collectIntroducedSymbols(clause.template, patVars);
+      const renames = new Map<string, string>();
+      const hygieneBindings = new Map<string, SchemeVal>();
+
+      for (const sym of introduced) {
+        const fresh = gensym(sym);
+        renames.set(sym, fresh);
+        // Try to resolve in definition env
+        try {
+          const val = envLookup(macro.defEnv, sym);
+          hygieneBindings.set(fresh, val);
+        } catch (_) {
+          // Not found in def env - that's fine, it's a locally introduced name
+        }
+      }
+
+      if (renames.size > 0) {
+        expanded = renameSymbols(expanded, renames);
+      }
+
+      let hygieneEnv = useEnv;
+      if (hygieneBindings.size > 0) {
+        hygieneEnv = makeEnv(useEnv);
+        for (const [name, val] of hygieneBindings) {
+          envDefine(hygieneEnv, name, val);
+        }
+      }
+
+      return { expanded, hygieneEnv };
+    }
+  }
+  throw new EvalError('no matching pattern in syntax-rules');
+}
+
 // --- Evaluator ---
 
 function isTruthy(val: SchemeVal): boolean {
@@ -468,7 +694,41 @@ function evalExpr(expr: SchemeVal, env: Env): SchemeVal {
             if (found) continue; // TCO
             return { tag: 'void' };
           }
+          case 'define-syntax': {
+            if (elems.length !== 3) throw new EvalError(`${posStr(expr.pos)}: define-syntax: expected 2 arguments`);
+            const nameNode = elems[1];
+            if (nameNode.tag !== 'symbol') throw new EvalError(`${posStr(expr.pos)}: define-syntax: expected symbol`);
+            const transformer = elems[2];
+            if (transformer.tag !== 'list' || transformer.elements.length < 2 ||
+                transformer.elements[0].tag !== 'symbol' || transformer.elements[0].value !== 'syntax-rules') {
+              throw new EvalError(`${posStr(expr.pos)}: define-syntax: expected syntax-rules`);
+            }
+            const srElems = transformer.elements;
+            // (syntax-rules (literals...) clause...)
+            if (srElems[1].tag !== 'list') throw new EvalError(`${posStr(expr.pos)}: syntax-rules: expected literal list`);
+            const literals = srElems[1].elements.map(e => {
+              if (e.tag !== 'symbol') throw new EvalError(`${posStr(expr.pos)}: syntax-rules: literal must be a symbol`);
+              return e.value;
+            });
+            const macClauses: { pattern: SchemeVal; template: SchemeVal }[] = [];
+            for (let ci = 2; ci < srElems.length; ci++) {
+              const c = srElems[ci];
+              if (c.tag !== 'list' || c.elements.length !== 2) throw new EvalError(`${posStr(expr.pos)}: syntax-rules: invalid clause`);
+              macClauses.push({ pattern: c.elements[0], template: c.elements[1] });
+            }
+            const macroVal: SchemeVal = { tag: 'macro', literals, clauses: macClauses, defEnv: env, pos: expr.pos };
+            envDefine(env, nameNode.value, macroVal);
+            return { tag: 'void' };
+          }
         }
+        // Check if head symbol resolves to a macro
+        try {
+          const headVal = envLookup(env, head.value);
+          if (headVal.tag === 'macro') {
+            const { expanded, hygieneEnv } = expandMacro(headVal, elems, env);
+            expr = expanded; env = hygieneEnv; continue; // TCO
+          }
+        } catch (_) { /* not bound or not a macro, fall through */ }
       }
       // Procedure application
       const proc = evalExpr(head, env);
@@ -825,6 +1085,7 @@ function displayVal(val: SchemeVal): string {
     case 'lambda': return '#<procedure>';
     case 'continuation': return '#<procedure>';
     case 'callcc': return '#<procedure>';
+    case 'macro': return '#<macro>';
     default: return '#<builtin>';
   }
 }
