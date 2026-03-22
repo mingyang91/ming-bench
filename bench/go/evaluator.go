@@ -29,6 +29,7 @@ type pair struct {
 
 type lambda struct {
 	params []string
+	rest   string // rest parameter name (empty if none)
 	body   []*expr
 	env    *env
 }
@@ -619,12 +620,25 @@ func evalExpr(e *expr, environ *env) (value, error) {
 		switch opVal.typ {
 		case typeLambda:
 			lam := opVal.lambdaVal
-			if len(args) != len(lam.params) {
-				return value{}, fmt.Errorf("%d:%d: expected %d arguments, got %d", e.line, e.col, len(lam.params), len(args))
+			if lam.rest == "" {
+				if len(args) != len(lam.params) {
+					return value{}, fmt.Errorf("%d:%d: expected %d arguments, got %d", e.line, e.col, len(lam.params), len(args))
+				}
+			} else {
+				if len(args) < len(lam.params) {
+					return value{}, fmt.Errorf("%d:%d: expected at least %d arguments, got %d", e.line, e.col, len(lam.params), len(args))
+				}
 			}
 			callEnv := newEnv(lam.env)
 			for i, p := range lam.params {
 				callEnv.set(p, args[i])
+			}
+			if lam.rest != "" {
+				rest := nullValue
+				for i := len(args) - 1; i >= len(lam.params); i-- {
+					rest = pairValue(args[i], rest)
+				}
+				callEnv.set(lam.rest, rest)
 			}
 			// Evaluate all but last body, then tail-call last
 			for _, body := range lam.body[:len(lam.body)-1] {
@@ -725,7 +739,7 @@ func evalDefine(e *expr, environ *env) (value, error) {
 	}
 	target := e.list[1]
 
-	// (define (f params...) body...)
+	// (define (f params...) body...) or (define (f x . rest) body...)
 	if target.kind == "list" {
 		if len(target.list) == 0 {
 			return value{}, fmt.Errorf("%d:%d: define: bad syntax", e.list[0].line, e.list[0].col)
@@ -734,14 +748,11 @@ func evalDefine(e *expr, environ *env) (value, error) {
 		if name.kind != "atom" || name.atom.typ != typeSymbol {
 			return value{}, fmt.Errorf("%d:%d: define: expected symbol", name.line, name.col)
 		}
-		params := make([]string, len(target.list)-1)
-		for i, p := range target.list[1:] {
-			if p.kind != "atom" || p.atom.typ != typeSymbol {
-				return value{}, fmt.Errorf("%d:%d: define: expected symbol", p.line, p.col)
-			}
-			params[i] = p.atom.strVal
+		params, rest, err := parseDotParams(target.list[1:])
+		if err != nil {
+			return value{}, err
 		}
-		lam := &lambda{params: params, body: e.list[2:], env: environ}
+		lam := &lambda{params: params, rest: rest, body: e.list[2:], env: environ}
 		environ.set(name.atom.strVal, value{typ: typeLambda, lambdaVal: lam})
 		return voidValue, nil
 	}
@@ -767,18 +778,60 @@ func evalLambda(e *expr, environ *env) (value, error) {
 		return value{}, fmt.Errorf("%d:%d: lambda: bad syntax", e.list[0].line, e.list[0].col)
 	}
 	paramExpr := e.list[1]
+	// (lambda args body) — single symbol captures all args
+	if paramExpr.kind == "atom" && paramExpr.atom.typ == typeSymbol {
+		lam := &lambda{rest: paramExpr.atom.strVal, body: e.list[2:], env: environ}
+		return value{typ: typeLambda, lambdaVal: lam}, nil
+	}
 	if paramExpr.kind != "list" {
 		return value{}, fmt.Errorf("%d:%d: lambda: expected parameter list", paramExpr.line, paramExpr.col)
 	}
-	params := make([]string, len(paramExpr.list))
-	for i, p := range paramExpr.list {
+	params, rest, err := parseDotParams(paramExpr.list)
+	if err != nil {
+		return value{}, err
+	}
+	lam := &lambda{params: params, rest: rest, body: e.list[2:], env: environ}
+	return value{typ: typeLambda, lambdaVal: lam}, nil
+}
+
+// parseDotParams extracts regular params and an optional rest param from a parameter list.
+// E.g., [x, ., rest] => (["x"], "rest", nil)
+func parseDotParams(paramList []*expr) ([]string, string, error) {
+	dotIdx := -1
+	for i, p := range paramList {
+		if p.kind == "atom" && p.atom.typ == typeSymbol && p.atom.strVal == "." {
+			dotIdx = i
+			break
+		}
+	}
+	if dotIdx == -1 {
+		// No dot — all regular params
+		params := make([]string, len(paramList))
+		for i, p := range paramList {
+			if p.kind != "atom" || p.atom.typ != typeSymbol {
+				return nil, "", fmt.Errorf("%d:%d: expected symbol", p.line, p.col)
+			}
+			params[i] = p.atom.strVal
+		}
+		return params, "", nil
+	}
+	// Dot found — must have exactly one symbol after it
+	if dotIdx+1 >= len(paramList) || dotIdx+2 != len(paramList) {
+		return nil, "", fmt.Errorf("%d:%d: bad dot syntax in parameter list", paramList[dotIdx].line, paramList[dotIdx].col)
+	}
+	restExpr := paramList[dotIdx+1]
+	if restExpr.kind != "atom" || restExpr.atom.typ != typeSymbol {
+		return nil, "", fmt.Errorf("%d:%d: expected symbol after dot", restExpr.line, restExpr.col)
+	}
+	params := make([]string, dotIdx)
+	for i := 0; i < dotIdx; i++ {
+		p := paramList[i]
 		if p.kind != "atom" || p.atom.typ != typeSymbol {
-			return value{}, fmt.Errorf("%d:%d: lambda: expected symbol", p.line, p.col)
+			return nil, "", fmt.Errorf("%d:%d: expected symbol", p.line, p.col)
 		}
 		params[i] = p.atom.strVal
 	}
-	lam := &lambda{params: params, body: e.list[2:], env: environ}
-	return value{typ: typeLambda, lambdaVal: lam}, nil
+	return params, restExpr.atom.strVal, nil
 }
 
 func quoteExpr(e *expr) value {
@@ -1129,6 +1182,60 @@ func applyBuiltin(name string, args []value, e *expr, environ *env) (value, erro
 			return value{}, fmt.Errorf("%d:%d: char?: expected 1 argument, got %d", head.line, head.col, len(args))
 		}
 		return boolValue(args[0].typ == typeChar), nil
+
+	case "apply":
+		if len(args) < 2 {
+			return value{}, fmt.Errorf("%d:%d: apply: expected at least 2 arguments", head.line, head.col)
+		}
+		fn := args[0]
+		// Last arg must be a list; prefix args are prepended
+		lastArg := args[len(args)-1]
+		var applyArgs []value
+		for _, a := range args[1 : len(args)-1] {
+			applyArgs = append(applyArgs, a)
+		}
+		// Unpack the trailing list
+		cur := lastArg
+		for cur.typ == typePair {
+			applyArgs = append(applyArgs, cur.pairVal.car)
+			cur = cur.pairVal.cdr
+		}
+		// Apply the function
+		switch fn.typ {
+		case typeLambda:
+			lam := fn.lambdaVal
+			if lam.rest == "" {
+				if len(applyArgs) != len(lam.params) {
+					return value{}, fmt.Errorf("%d:%d: apply: expected %d arguments, got %d", head.line, head.col, len(lam.params), len(applyArgs))
+				}
+			} else {
+				if len(applyArgs) < len(lam.params) {
+					return value{}, fmt.Errorf("%d:%d: apply: expected at least %d arguments, got %d", head.line, head.col, len(lam.params), len(applyArgs))
+				}
+			}
+			callEnv := newEnv(lam.env)
+			for i, p := range lam.params {
+				callEnv.set(p, applyArgs[i])
+			}
+			if lam.rest != "" {
+				rest := nullValue
+				for i := len(applyArgs) - 1; i >= len(lam.params); i-- {
+					rest = pairValue(applyArgs[i], rest)
+				}
+				callEnv.set(lam.rest, rest)
+			}
+			for _, body := range lam.body[:len(lam.body)-1] {
+				_, err := evalExpr(body, callEnv)
+				if err != nil {
+					return value{}, err
+				}
+			}
+			return evalExpr(lam.body[len(lam.body)-1], callEnv)
+		case typeSymbol:
+			return applyBuiltin(fn.strVal, applyArgs, e, environ)
+		default:
+			return value{}, fmt.Errorf("%d:%d: apply: not a procedure", head.line, head.col)
+		}
 	}
 
 	return value{}, fmt.Errorf("%d:%d: unbound variable: %s", head.line, head.col, name)
@@ -1180,7 +1287,7 @@ func EvalStr(input string) (string, error) {
 
 	environ := newEnv(nil)
 	// Pre-bind builtins as symbols
-	for _, name := range []string{"+", "-", "*", "/", "<", ">", "=", "<=", ">=", "not", "cons", "car", "cdr", "null?", "list", "length", "append", "string?", "number?", "boolean?", "pair?", "symbol?", "display", "write", "newline", "string-append", "string-length", "substring", "string->number", "number->string", "symbol->string", "string->symbol", "string-ref", "char?", "string-copy", "string-set!"} {
+	for _, name := range []string{"+", "-", "*", "/", "<", ">", "=", "<=", ">=", "not", "cons", "car", "cdr", "null?", "list", "length", "append", "string?", "number?", "boolean?", "pair?", "symbol?", "display", "write", "newline", "string-append", "string-length", "substring", "string->number", "number->string", "symbol->string", "string->symbol", "string-ref", "char?", "string-copy", "string-set!", "apply"} {
 		environ.set(name, symbolValue(name))
 	}
 
@@ -1217,7 +1324,7 @@ func EvalStrWithOutput(input string) (result string, output string, err error) {
 	var outBuf strings.Builder
 	environ := newEnv(nil)
 	environ.output = &outBuf
-	for _, name := range []string{"+", "-", "*", "/", "<", ">", "=", "<=", ">=", "not", "cons", "car", "cdr", "null?", "list", "length", "append", "string?", "number?", "boolean?", "pair?", "symbol?", "display", "write", "newline", "string-append", "string-length", "substring", "string->number", "number->string", "symbol->string", "string->symbol", "string-ref", "char?", "string-copy", "string-set!"} {
+	for _, name := range []string{"+", "-", "*", "/", "<", ">", "=", "<=", ">=", "not", "cons", "car", "cdr", "null?", "list", "length", "append", "string?", "number?", "boolean?", "pair?", "symbol?", "display", "write", "newline", "string-append", "string-length", "substring", "string->number", "number->string", "symbol->string", "string->symbol", "string-ref", "char?", "string-copy", "string-set!", "apply"} {
 		environ.set(name, symbolValue(name))
 	}
 
