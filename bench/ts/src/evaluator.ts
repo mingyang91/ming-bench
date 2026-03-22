@@ -2,17 +2,23 @@ import { EvalError } from './evalError.js';
 
 // --- Types ---
 
+interface Pos { line: number; col: number }
+
 type SchemeVal =
-  | { tag: 'number'; value: number }
-  | { tag: 'boolean'; value: boolean }
-  | { tag: 'string'; value: string }
-  | { tag: 'symbol'; value: string }
-  | { tag: 'list'; elements: SchemeVal[] }  // AST only (parsed s-expr)
-  | { tag: 'pair'; car: SchemeVal; cdr: SchemeVal }
-  | { tag: 'nil' }
-  | { tag: 'void' }
-  | { tag: 'lambda'; params: string[]; body: SchemeVal[]; env: Env }
-  | { tag: 'builtin'; fn: (args: SchemeVal[]) => SchemeVal };
+  | { tag: 'number'; value: number; pos?: Pos }
+  | { tag: 'boolean'; value: boolean; pos?: Pos }
+  | { tag: 'string'; value: string; pos?: Pos }
+  | { tag: 'symbol'; value: string; pos?: Pos }
+  | { tag: 'list'; elements: SchemeVal[]; pos?: Pos }  // AST only (parsed s-expr)
+  | { tag: 'pair'; car: SchemeVal; cdr: SchemeVal; pos?: Pos }
+  | { tag: 'nil'; pos?: Pos }
+  | { tag: 'void'; pos?: Pos }
+  | { tag: 'lambda'; params: string[]; body: SchemeVal[]; env: Env; pos?: Pos }
+  | { tag: 'builtin'; fn: (args: SchemeVal[]) => SchemeVal; pos?: Pos };
+
+function posStr(pos?: Pos): string {
+  return pos ? `${pos.line}:${pos.col}` : '?:?';
+}
 
 const NIL: SchemeVal = { tag: 'nil' };
 
@@ -27,14 +33,14 @@ function makeEnv(parent: Env | null): Env {
   return { bindings: new Map(), parent };
 }
 
-function envLookup(env: Env, name: string): SchemeVal {
+function envLookup(env: Env, name: string, p?: Pos): SchemeVal {
   let cur: Env | null = env;
   while (cur) {
     const val = cur.bindings.get(name);
     if (val !== undefined) return val;
     cur = cur.parent;
   }
-  throw new EvalError(`unbound variable: ${name}`);
+  throw new EvalError(`${posStr(p)}: unbound variable: ${name}`);
 }
 
 function envDefine(env: Env, name: string, val: SchemeVal): void {
@@ -43,59 +49,70 @@ function envDefine(env: Env, name: string, val: SchemeVal): void {
 
 // --- Tokenizer ---
 
-function tokenize(input: string): string[] {
-  const tokens: string[] = [];
+interface Token { text: string; pos: Pos }
+
+function tokenize(input: string): Token[] {
+  const tokens: Token[] = [];
   let i = 0;
+  let line = 1;
+  let col = 1;
+
+  function advance() {
+    if (input[i] === '\n') { line++; col = 1; } else { col++; }
+    i++;
+  }
+
   while (i < input.length) {
     const ch = input[i];
     if (ch === ' ' || ch === '\t' || ch === '\n' || ch === '\r') {
-      i++;
+      advance();
       continue;
     }
     if (ch === ';') {
-      while (i < input.length && input[i] !== '\n') i++;
+      while (i < input.length && input[i] !== '\n') advance();
       continue;
     }
+    const startPos: Pos = { line, col };
     if (ch === "'") {
-      tokens.push("'");
-      i++;
+      tokens.push({ text: "'", pos: startPos });
+      advance();
       continue;
     }
     if (ch === '(' || ch === ')') {
-      tokens.push(ch);
-      i++;
+      tokens.push({ text: ch, pos: startPos });
+      advance();
       continue;
     }
     if (ch === '"') {
       let s = '"';
-      i++;
+      advance();
       while (i < input.length && input[i] !== '"') {
         if (input[i] === '\\') {
           s += input[i];
-          i++;
+          advance();
           if (i < input.length) {
             s += input[i];
-            i++;
+            advance();
           }
           continue;
         }
         s += input[i];
-        i++;
+        advance();
       }
       if (i < input.length) {
         s += '"';
-        i++;
+        advance();
       }
-      tokens.push(s);
+      tokens.push({ text: s, pos: startPos });
       continue;
     }
     let atom = '';
     while (i < input.length && !' \t\n\r();"\''.includes(input[i])) {
       atom += input[i];
-      i++;
+      advance();
     }
     if (atom.length > 0) {
-      tokens.push(atom);
+      tokens.push({ text: atom, pos: startPos });
     }
   }
   return tokens;
@@ -103,58 +120,58 @@ function tokenize(input: string): string[] {
 
 // --- Parser ---
 
-function parse(tokens: string[]): SchemeVal[] {
-  let pos = 0;
+function parse(tokens: Token[]): SchemeVal[] {
+  let idx = 0;
 
   function parseExpr(): SchemeVal {
-    if (pos >= tokens.length) {
+    if (idx >= tokens.length) {
       throw new EvalError('unexpected end of input');
     }
-    const token = tokens[pos];
-    if (token === "'") {
-      pos++;
+    const tok = tokens[idx];
+    if (tok.text === "'") {
+      idx++;
       const inner = parseExpr();
-      return { tag: 'list', elements: [{ tag: 'symbol', value: 'quote' }, inner] };
+      return { tag: 'list', elements: [{ tag: 'symbol', value: 'quote', pos: tok.pos }, inner], pos: tok.pos };
     }
-    if (token === '(') {
-      pos++;
+    if (tok.text === '(') {
+      idx++;
       const elements: SchemeVal[] = [];
-      while (pos < tokens.length && tokens[pos] !== ')') {
+      while (idx < tokens.length && tokens[idx].text !== ')') {
         elements.push(parseExpr());
       }
-      if (pos >= tokens.length) {
-        throw new EvalError('missing closing parenthesis');
+      if (idx >= tokens.length) {
+        throw new EvalError(`${posStr(tok.pos)}: missing closing parenthesis`);
       }
-      pos++;
-      return { tag: 'list', elements };
+      idx++;
+      return { tag: 'list', elements, pos: tok.pos };
     }
-    if (token === ')') {
-      throw new EvalError('unexpected )');
+    if (tok.text === ')') {
+      throw new EvalError(`${posStr(tok.pos)}: unexpected )`);
     }
-    pos++;
-    return parseAtom(token);
+    idx++;
+    return parseAtom(tok.text, tok.pos);
   }
 
-  function parseAtom(token: string): SchemeVal {
-    if (token === '#t') return { tag: 'boolean', value: true };
-    if (token === '#f') return { tag: 'boolean', value: false };
+  function parseAtom(token: string, p: Pos): SchemeVal {
+    if (token === '#t') return { tag: 'boolean', value: true, pos: p };
+    if (token === '#f') return { tag: 'boolean', value: false, pos: p };
     if (token.startsWith('"') && token.endsWith('"')) {
       const inner = token.slice(1, -1)
         .replace(/\\n/g, '\n')
         .replace(/\\t/g, '\t')
         .replace(/\\"/g, '"')
         .replace(/\\\\/g, '\\');
-      return { tag: 'string', value: inner };
+      return { tag: 'string', value: inner, pos: p };
     }
     const num = Number(token);
     if (!isNaN(num) && token !== '') {
-      return { tag: 'number', value: num };
+      return { tag: 'number', value: num, pos: p };
     }
-    return { tag: 'symbol', value: token };
+    return { tag: 'symbol', value: token, pos: p };
   }
 
   const exprs: SchemeVal[] = [];
-  while (pos < tokens.length) {
+  while (idx < tokens.length) {
     exprs.push(parseExpr());
   }
   return exprs;
@@ -207,21 +224,21 @@ function evalExpr(expr: SchemeVal, env: Env): SchemeVal {
     case 'string':
       return expr;
     case 'symbol':
-      return envLookup(env, expr.value);
+      return envLookup(env, expr.value, expr.pos);
     case 'list': {
       const elems = expr.elements;
       if (elems.length === 0) {
-        throw new EvalError('empty application');
+        throw new EvalError(`${posStr(expr.pos)}: empty application`);
       }
       const head = elems[0];
       if (head.tag === 'symbol') {
         switch (head.value) {
           case 'quote': {
-            if (elems.length !== 2) throw new EvalError('quote: expected 1 argument');
+            if (elems.length !== 2) throw new EvalError(`${posStr(expr.pos)}: quote: expected 1 argument`);
             return quoteDatum(elems[1]);
           }
           case 'if': {
-            if (elems.length < 3 || elems.length > 4) throw new EvalError('if: expected 2 or 3 arguments');
+            if (elems.length < 3 || elems.length > 4) throw new EvalError(`${posStr(expr.pos)}: if: expected 2 or 3 arguments`);
             const cond = evalExpr(elems[1], env);
             if (isTruthy(cond)) {
               return evalExpr(elems[2], env);
@@ -231,7 +248,7 @@ function evalExpr(expr: SchemeVal, env: Env): SchemeVal {
             return { tag: 'void' };
           }
           case 'define': {
-            if (elems.length < 3) throw new EvalError('define: expected at least 2 arguments');
+            if (elems.length < 3) throw new EvalError(`${posStr(expr.pos)}: define: expected at least 2 arguments`);
             const target = elems[1];
             if (target.tag === 'symbol') {
               const val = evalExpr(elems[2], env);
@@ -241,33 +258,33 @@ function evalExpr(expr: SchemeVal, env: Env): SchemeVal {
             if (target.tag === 'list' && target.elements.length >= 1 && target.elements[0].tag === 'symbol') {
               const name = target.elements[0].value;
               const params = target.elements.slice(1).map(p => {
-                if (p.tag !== 'symbol') throw new EvalError('define: parameter must be a symbol');
+                if (p.tag !== 'symbol') throw new EvalError(`${posStr(expr.pos)}: define: parameter must be a symbol`);
                 return p.value;
               });
               const body = elems.slice(2);
-              const lambda: SchemeVal = { tag: 'lambda', params, body, env };
+              const lambda: SchemeVal = { tag: 'lambda', params, body, env, pos: expr.pos };
               envDefine(env, name, lambda);
               return { tag: 'void' };
             }
-            throw new EvalError('define: invalid syntax');
+            throw new EvalError(`${posStr(expr.pos)}: define: invalid syntax`);
           }
           case 'lambda': {
-            if (elems.length < 3) throw new EvalError('lambda: expected at least 2 arguments');
+            if (elems.length < 3) throw new EvalError(`${posStr(expr.pos)}: lambda: expected at least 2 arguments`);
             const paramList = elems[1];
-            if (paramList.tag !== 'list') throw new EvalError('lambda: parameters must be a list');
+            if (paramList.tag !== 'list') throw new EvalError(`${posStr(expr.pos)}: lambda: parameters must be a list`);
             const params = paramList.elements.map(p => {
-              if (p.tag !== 'symbol') throw new EvalError('lambda: parameter must be a symbol');
+              if (p.tag !== 'symbol') throw new EvalError(`${posStr(expr.pos)}: lambda: parameter must be a symbol`);
               return p.value;
             });
             const body = elems.slice(2);
-            return { tag: 'lambda', params, body, env };
+            return { tag: 'lambda', params, body, env, pos: expr.pos };
           }
           case 'and':
             return evalAnd(elems.slice(1), env);
           case 'or':
             return evalOr(elems.slice(1), env);
           case 'not': {
-            if (elems.length !== 2) throw new EvalError('not: expected 1 argument');
+            if (elems.length !== 2) throw new EvalError(`${posStr(expr.pos)}: not: expected 1 argument`);
             const val = evalExpr(elems[1], env);
             return { tag: 'boolean', value: !isTruthy(val) };
           }
@@ -283,20 +300,27 @@ function evalExpr(expr: SchemeVal, env: Env): SchemeVal {
       const proc = evalExpr(head, env);
       if (proc.tag === 'builtin') {
         const args = elems.slice(1).map(e => evalExpr(e, env));
-        return proc.fn(args);
+        try {
+          return proc.fn(args);
+        } catch (e) {
+          if (e instanceof EvalError && !/^\d/.test(e.message)) {
+            throw new EvalError(`${posStr(expr.pos)}: ${e.message}`);
+          }
+          throw e;
+        }
       }
       const args = elems.slice(1).map(e => evalExpr(e, env));
-      return applyProc(proc, args);
+      return applyProc(proc, args, expr.pos);
     }
     default:
       return expr;
   }
 }
 
-function applyProc(proc: SchemeVal, args: SchemeVal[]): SchemeVal {
+function applyProc(proc: SchemeVal, args: SchemeVal[], callPos?: Pos): SchemeVal {
   if (proc.tag === 'lambda') {
     if (args.length !== proc.params.length) {
-      throw new EvalError(`lambda: expected ${proc.params.length} arguments, got ${args.length}`);
+      throw new EvalError(`${posStr(callPos)}: expected ${proc.params.length} arguments, got ${args.length}`);
     }
     const callEnv = makeEnv(proc.env);
     for (let i = 0; i < proc.params.length; i++) {
@@ -311,7 +335,7 @@ function applyProc(proc: SchemeVal, args: SchemeVal[]): SchemeVal {
   if (proc.tag === 'builtin') {
     return proc.fn(args);
   }
-  throw new EvalError('not a procedure');
+  throw new EvalError(`${posStr(callPos)}: not a procedure`);
 }
 
 // --- Special forms ---
