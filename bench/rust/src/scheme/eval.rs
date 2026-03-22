@@ -163,6 +163,10 @@ fn eval_list_step(
             "with-syntax" => {
                 return eval_with_syntax_step(&elements[1..], kw_span, env, output, ctx);
             }
+            "case-lambda" => {
+                let v = eval_case_lambda(&elements[1..], kw_span, env)?;
+                return Ok(TcoAction::Result(v));
+            }
             _ => {}
         }
     }
@@ -351,6 +355,7 @@ fn is_builtin(name: &str) -> bool {
             | "cadr"
             | "syntax->datum"
             | "datum->syntax"
+            | "procedure?"
     )
 }
 
@@ -414,6 +419,58 @@ fn apply_step(
                 expr: body[body.len() - 1].clone(),
                 env: call_env,
             })
+        }
+        Value::CaseLambda { clauses, env: closure_env } => {
+            // Find the matching clause by arity
+            for (params, rest_param, body) in clauses {
+                match rest_param {
+                    None => {
+                        if args.len() != params.len() {
+                            continue;
+                        }
+                    }
+                    Some(_) => {
+                        if args.len() < params.len() {
+                            continue;
+                        }
+                    }
+                }
+                // Match found — apply like Lambda
+                let call_env = Env::with_parent(closure_env);
+                for (param, arg) in params.iter().zip(args.iter()) {
+                    call_env.define(param.clone(), arg.clone());
+                }
+                if let Some(rest) = rest_param {
+                    let rest_args = &args[params.len()..];
+                    let mut list = Value::Nil;
+                    for arg in rest_args.iter().rev() {
+                        list = Value::pair(arg.clone(), list);
+                    }
+                    call_env.define(rest.clone(), list);
+                }
+                if body.is_empty() {
+                    return Ok(TcoAction::Result(Value::Nil));
+                }
+                for expr in &body[..body.len() - 1] {
+                    eval(expr, &call_env, output, ctx)?;
+                }
+                return Ok(TcoAction::TailCall {
+                    expr: body[body.len() - 1].clone(),
+                    env: call_env,
+                });
+            }
+            // No clause matched
+            Err(EvalErrorKind::Arity {
+                name: "#<case-lambda>".into(),
+                expected: clauses.iter().map(|(p, r, _)| {
+                    if r.is_some() {
+                        format!("{}+", p.len())
+                    } else {
+                        p.len().to_string()
+                    }
+                }).collect::<Vec<_>>().join(" or "),
+                got: args.len(),
+            }.at(span))
         }
         Value::Builtin(name) => match name.as_str() {
             "apply" => eval_apply(args, span, output, ctx),
@@ -1053,6 +1110,20 @@ fn eval_builtin(
             }
             Ok(Value::Boolean(matches!(&args[0], Value::Integer(_))))
         }
+        "procedure?" => {
+            if args.len() != 1 {
+                return Err(EvalErrorKind::Arity { name: "procedure?".into(), expected: "1".into(), got: args.len() }.at(span));
+            }
+            Ok(Value::Boolean(matches!(&args[0],
+                Value::Lambda { .. }
+                | Value::CaseLambda { .. }
+                | Value::Builtin(_)
+                | Value::Continuation { .. }
+                | Value::RecordConstructor { .. }
+                | Value::RecordPredicate { .. }
+                | Value::RecordAccessor { .. }
+            )))
+        }
         "set-car!" => eval_set_car(args, span),
         "set-cdr!" => eval_set_cdr(args, span),
         "cddr" => eval_cddr(args, span),
@@ -1449,6 +1520,50 @@ fn eval_lambda(args: &[Expr], span: &Span, env: &Env) -> Result<Value, EvalError
         params,
         rest_param,
         body,
+        env: env.clone(),
+    })
+}
+
+fn eval_case_lambda(args: &[Expr], span: &Span, env: &Env) -> Result<Value, EvalError> {
+    if args.is_empty() {
+        return Err(EvalErrorKind::Parse {
+            message: "case-lambda requires at least one clause".into(),
+        }
+        .at(span));
+    }
+    let mut clauses = Vec::new();
+    for clause in args {
+        match &clause.kind {
+            ExprKind::List(elems) => {
+                if elems.len() < 2 {
+                    return Err(EvalErrorKind::Parse {
+                        message: "case-lambda clause requires formals and body".into(),
+                    }
+                    .at(span));
+                }
+                let (params, rest_param) = match &elems[0].kind {
+                    ExprKind::List(param_exprs) => parse_params(param_exprs, span)?,
+                    ExprKind::Symbol(s) => (Vec::new(), Some(s.clone())),
+                    _ => {
+                        return Err(EvalErrorKind::Parse {
+                            message: "case-lambda: expected parameter list".into(),
+                        }
+                        .at(span))
+                    }
+                };
+                let body = elems[1..].to_vec();
+                clauses.push((params, rest_param, body));
+            }
+            _ => {
+                return Err(EvalErrorKind::Parse {
+                    message: "case-lambda: expected clause list".into(),
+                }
+                .at(span))
+            }
+        }
+    }
+    Ok(Value::CaseLambda {
+        clauses,
         env: env.clone(),
     })
 }

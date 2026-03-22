@@ -137,6 +137,11 @@ pub enum Value {
         body: Vec<Expr>,
         def_env: Env,
     },
+    /// A case-lambda (multiple-arity procedure).
+    CaseLambda {
+        clauses: Vec<(Vec<String>, Option<String>, Vec<Expr>)>,
+        env: Env,
+    },
     /// A record instance.
     Record {
         type_id: u64,
@@ -190,6 +195,7 @@ impl PartialEq for Value {
             (Value::Continuation { id: a, .. }, Value::Continuation { id: b, .. }) => a == b,
             (Value::Vector(a), Value::Vector(b)) => *a.borrow() == *b.borrow(),
             (Value::Values(a), Value::Values(b)) => a == b,
+            (Value::CaseLambda { .. }, Value::CaseLambda { .. }) => false,
             (Value::Macro { .. }, Value::Macro { .. }) => false,
             (Value::SyntaxObject(a), Value::SyntaxObject(b)) => a.expr == b.expr,
             (Value::SyntaxCaseMacro { .. }, Value::SyntaxCaseMacro { .. }) => false,
@@ -253,6 +259,7 @@ impl Value {
             }
             Value::Builtin(_)
             | Value::Lambda { .. }
+            | Value::CaseLambda { .. }
             | Value::Continuation { .. }
             | Value::Macro { .. }
             | Value::SyntaxObject(_)
@@ -305,6 +312,7 @@ impl fmt::Display for Value {
                 write!(f, ")")
             }
             Value::Lambda { .. } => write!(f, "#<procedure>"),
+            Value::CaseLambda { .. } => write!(f, "#<procedure>"),
             Value::Builtin(name) => write!(f, "#<procedure:{name}>"),
             Value::Continuation { .. } => write!(f, "#<continuation>"),
             Value::Macro { .. } => write!(f, "#<macro>"),
