@@ -300,6 +300,11 @@ class SchemeRaise {
   constructor(public value: Value) {}
 }
 
+// Multiple return values wrapper (for values / call-with-values)
+class MultipleValues {
+  constructor(public vals: Value[]) {}
+}
+
 // Exception handler stack
 const exceptionHandlers: ((val: Value) => Value)[] = [];
 
@@ -908,6 +913,15 @@ function makeGlobalEnv(output: string[] = []): Env {
     if (args.length !== 1) throw new EvalError('raise: expected 1 argument');
     throw new SchemeRaise(args[0]);
   }});
+
+  // values — returns multiple values; single value is transparent
+  env.define('values', { tag: 'builtin', name: 'values', fn(args) {
+    if (args.length === 1) return args[0];
+    throw new MultipleValues(args);
+  }});
+
+  // call-with-values — handled specially by the evaluator
+  env.define('call-with-values', { tag: 'builtin', name: 'call-with-values', fn() { throw new EvalError('call-with-values: internal'); } });
 
   return env;
 }
@@ -1564,6 +1578,24 @@ function evaluate(expr: Expr, env: Env): Value {
           }
           throw e;
         }
+      }
+
+      // call-with-values handling
+      if (fn.tag === 'builtin' && fn.name === 'call-with-values') {
+        if (args.length !== 2) throw new EvalError(`${fmtPos(expr.pos)}: call-with-values: expected 2 arguments`);
+        const [producer, consumer] = args;
+        let producerArgs: Value[];
+        try {
+          const result = applyFn(producer, [], expr.pos);
+          producerArgs = [result];
+        } catch (e) {
+          if (e instanceof MultipleValues) {
+            producerArgs = e.vals;
+          } else {
+            throw e;
+          }
+        }
+        return applyFn(consumer, producerArgs, expr.pos);
       }
 
       // Continuation invocation
