@@ -4,7 +4,17 @@ import (
 	"fmt"
 	"strconv"
 	"strings"
+	"sync/atomic"
 )
+
+// continuationJump is the panic value used for continuation invocation.
+type continuationJump struct {
+	value     *Value
+	exprIndex int
+	contID    int64
+}
+
+var contIDCounter int64
 
 func Eval(expr *Expr, env *Env) (*Value, error) {
 	for {
@@ -157,6 +167,13 @@ func evalListTCO(expr *Expr, env *Env) (*Expr, *Env, *Value, error, bool) {
 func applyFuncTCO(op *Value, args []*Value, expr *Expr, env *Env) (*Expr, *Env, *Value, error, bool) {
 	if op.Type == TypeLambda {
 		return applyLambdaTCO(op, args, expr)
+	}
+	if op.Type == TypeContinuation {
+		if len(args) != 1 {
+			return nil, nil, nil, errAtf(expr, "continuation: expected 1 argument, got %d", len(args)), false
+		}
+		op.ContFunc(args[0]) // panics, never returns
+		panic("unreachable")
 	}
 	if op.Type != TypeSymbol || len(op.StrVal) < 10 || op.StrVal[:10] != "__builtin:" {
 		return nil, nil, nil, errAtf(expr, "not a procedure"), false
@@ -372,6 +389,8 @@ func applyBuiltin(name string, args []*Value, expr *Expr, env *Env) (*Value, err
 		return CharValue(runes[idx]), nil
 	case "apply":
 		return builtinApply(args, expr, env)
+	case "call/cc", "call-with-current-continuation":
+		return builtinCallCC(args, expr, env)
 	case "string-set!":
 		if len(args) != 3 {
 			return nil, errAtf(expr, "string-set!: expected 3 arguments, got %d", len(args))
@@ -440,6 +459,65 @@ func builtinApply(args []*Value, expr *Expr, env *Env) (*Value, error) {
 		return Eval(tailExpr, tailEnv)
 	}
 	return val, nil
+}
+
+func builtinCallCC(args []*Value, expr *Expr, env *Env) (*Value, error) {
+	if len(args) != 1 {
+		return nil, errAtf(expr, "call/cc: expected 1 argument, got %d", len(args))
+	}
+	proc := args[0]
+
+	// If resuming a saved continuation, return the resume value immediately
+	if ctx := env.getEvalCtx(); ctx != nil && ctx.resuming {
+		ctx.resuming = false
+		v := ctx.resumeValue
+		ctx.resumeValue = nil
+		return v, nil
+	}
+
+	// Capture the current top-level expression index for re-entrant support
+	exprIdx := 0
+	if ctx := env.getEvalCtx(); ctx != nil {
+		exprIdx = ctx.currentIndex
+	}
+
+	contID := atomic.AddInt64(&contIDCounter, 1)
+
+	cont := &Value{
+		Type: TypeContinuation,
+		ContFunc: func(val *Value) {
+			panic(continuationJump{value: val, exprIndex: exprIdx, contID: contID})
+		},
+	}
+
+	// Call proc with the continuation; recover in-extent escapes
+	var result *Value
+	var evalErr error
+
+	func() {
+		defer func() {
+			if r := recover(); r != nil {
+				if j, ok := r.(continuationJump); ok && j.contID == contID {
+					result = j.value
+				} else {
+					panic(r) // re-panic for other continuations or real panics
+				}
+			}
+		}()
+
+		te, tenv, v, err, isTail := applyFuncTCO(proc, []*Value{cont}, expr, env)
+		if err != nil {
+			evalErr = err
+			return
+		}
+		if isTail {
+			result, evalErr = Eval(te, tenv)
+		} else {
+			result = v
+		}
+	}()
+
+	return result, evalErr
 }
 
 func builtinAdd(args []*Value, expr *Expr) (*Value, error) {
@@ -884,7 +962,8 @@ func makeDefaultEnv() *Env {
 		"symbol->string", "string->symbol",
 		"string-ref",
 		"string-set!", "string-copy",
-		"apply"}
+		"apply",
+		"call/cc", "call-with-current-continuation"}
 	for _, name := range builtins {
 		env.Set(name, &Value{Type: TypeSymbol, StrVal: fmt.Sprintf("__builtin:%s", name)})
 	}

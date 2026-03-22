@@ -18,6 +18,7 @@ const (
 	TypeVoid
 	TypeLambda
 	TypeChar
+	TypeContinuation
 )
 
 // Value represents a Scheme value.
@@ -34,6 +35,8 @@ type Value struct {
 	RestParam string // variadic rest parameter name (empty if none)
 	Body      []*Expr
 	Closure   *Env
+	// Continuation fields
+	ContFunc func(*Value) // invoked when continuation is called; always panics
 }
 
 // StrContent returns the string content, preferring mutable Runes if set.
@@ -125,6 +128,8 @@ func (v *Value) String() string {
 		}
 	case TypeLambda:
 		return "#<procedure>"
+	case TypeContinuation:
+		return "#<continuation>"
 	case TypePair:
 		var buf strings.Builder
 		buf.WriteByte('(')

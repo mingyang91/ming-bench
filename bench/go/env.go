@@ -5,11 +5,20 @@ import (
 	"strings"
 )
 
+// evalContext tracks state for the top-level evaluation trampoline (call/cc support).
+type evalContext struct {
+	exprs        []*Expr
+	currentIndex int
+	resumeValue  *Value
+	resuming     bool
+}
+
 // Env represents a Scheme environment (scope).
 type Env struct {
 	bindings map[string]*Value
 	parent   *Env
 	output   *strings.Builder // shared output buffer (only set on root)
+	evalCtx  *evalContext     // set on root env for call/cc support
 }
 
 func NewEnv(parent *Env) *Env {
@@ -41,6 +50,16 @@ func (e *Env) SetExisting(name string, val *Value) bool {
 		return e.parent.SetExisting(name, val)
 	}
 	return false
+}
+
+// getEvalCtx returns the evalContext, walking up to root.
+func (e *Env) getEvalCtx() *evalContext {
+	for cur := e; cur != nil; cur = cur.parent {
+		if cur.evalCtx != nil {
+			return cur.evalCtx
+		}
+	}
+	return nil
 }
 
 // Output returns the shared output buffer, walking up to root.
