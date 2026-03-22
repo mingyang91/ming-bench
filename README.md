@@ -132,7 +132,7 @@ All containers: 1 CPU, 256 PIDs. OOM or timeout = test failure. This prevents ag
 | 26 | **procedure?** | 5 | Must return `#t` for all callable types (lambda, case-lambda, builtins, continuations) |
 | 27 | **do loops** | 5 | Iteration with parallel step — **tests env model** |
 
-**Level design philosophy:** Levels are ordered to maximize tech-debt exposure. L06 plants mutable strings, then L14 (8 levels later) reverses the requirement. L24-L27 force restructuring of core infrastructure (closures, eval loop, values, dynamic-wind) established 10-20 levels earlier. Quality-gate agents that build clean architecture early should handle these transitions cheaper than default agents.
+**Level design philosophy:** Levels are ordered to maximize tech-debt exposure. L06 plants mutable strings, then L14 (8 levels later) reverses the requirement. L24-L27 force restructuring of core infrastructure (closures, procedure naming, callable type unification, eval loop) established 10-20 levels earlier. Quality-gate agents that build clean architecture early should handle these transitions cheaper than default agents.
 
 ## Tooling
 

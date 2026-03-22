@@ -132,7 +132,7 @@ Benefits:
 | L16-L18 | dynamic-wind/guard/values | 60 |
 | L19-L20 | Rationals/Records | 75 |
 | L21-L23 | Pair Mutation/syntax-case/Final Integration | 90 |
-| L24-L27 | Tech-debt: case-lambda/do/let-values/parameterize | 60 |
+| L24-L27 | Tech-debt: case-lambda/procedure-name/procedure?/do | 60 |
 
 Override with `--max-turns N`. Quality-gate cleanup pass: 15 turns. Regression fix-it pass: 15 turns.
 
