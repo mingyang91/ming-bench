@@ -1,3 +1,4 @@
+use super::parser::Span;
 use super::{eval, eval_args, Env, EvalError, Value};
 
 pub(super) fn builtin_cons(args: &[Value], env: &mut Env, output: &mut String) -> Result<Value, EvalError> {
@@ -448,5 +449,286 @@ pub(super) fn builtin_string_ops(
             }
         }
         other => unreachable!("unknown string op: {other}"),
+    }
+}
+
+/// Dispatch a builtin call with already-evaluated arguments.
+pub(super) fn dispatch_builtin(
+    name: &str,
+    args: Vec<Value>,
+    span: Span,
+    output: &mut String,
+) -> Result<Value, EvalError> {
+    let (line, col) = span;
+    match name {
+        "+" => {
+            let mut sum: i64 = 0;
+            for v in &args {
+                sum += v.as_integer("+")?;
+            }
+            Ok(Value::Integer(sum))
+        }
+        "-" => {
+            if args.is_empty() {
+                return Err(EvalError::Arity {
+                    procedure: "-".to_string(),
+                    expected: "at least 1".to_string(),
+                    got: 0,
+                    line,
+                    col,
+                });
+            }
+            if args.len() == 1 {
+                return Ok(Value::Integer(-args[0].as_integer("-")?));
+            }
+            let mut result = args[0].as_integer("-")?;
+            for v in &args[1..] {
+                result -= v.as_integer("-")?;
+            }
+            Ok(Value::Integer(result))
+        }
+        "*" => {
+            let mut product: i64 = 1;
+            for v in &args {
+                product *= v.as_integer("*")?;
+            }
+            Ok(Value::Integer(product))
+        }
+        "/" => {
+            if args.len() != 2 {
+                return Err(EvalError::Arity {
+                    procedure: "/".to_string(),
+                    expected: "2".to_string(),
+                    got: args.len(),
+                    line,
+                    col,
+                });
+            }
+            let a = args[0].as_integer("/")?;
+            let b = args[1].as_integer("/")?;
+            if b == 0 {
+                return Err(EvalError::DivisionByZero { line, col });
+            }
+            Ok(Value::Integer(a / b))
+        }
+        "<" | ">" | "=" | "<=" | ">=" => {
+            if args.len() != 2 {
+                return Err(EvalError::Arity {
+                    procedure: name.to_string(),
+                    expected: "2".to_string(),
+                    got: args.len(),
+                    line,
+                    col,
+                });
+            }
+            let a = args[0].as_integer(name)?;
+            let b = args[1].as_integer(name)?;
+            let result = match name {
+                "<" => a < b,
+                ">" => a > b,
+                "=" => a == b,
+                "<=" => a <= b,
+                ">=" => a >= b,
+                _ => unreachable!(),
+            };
+            Ok(Value::Boolean(result))
+        }
+        "not" => {
+            if args.len() != 1 {
+                return Err(EvalError::Arity {
+                    procedure: "not".to_string(),
+                    expected: "1".to_string(),
+                    got: args.len(),
+                    line,
+                    col,
+                });
+            }
+            Ok(Value::Boolean(!args[0].is_truthy()))
+        }
+        "cons" => {
+            if args.len() != 2 {
+                return Err(EvalError::Arity {
+                    procedure: "cons".to_string(),
+                    expected: "2".to_string(),
+                    got: args.len(),
+                    line,
+                    col,
+                });
+            }
+            match &args[1] {
+                Value::List(tail, _) => {
+                    let mut new_list = vec![args[0].clone()];
+                    new_list.extend(tail.iter().cloned());
+                    Ok(Value::List(new_list, (0, 0)))
+                }
+                _ => Ok(Value::List(vec![args[0].clone(), args[1].clone()], (0, 0))),
+            }
+        }
+        "car" => {
+            if args.len() != 1 {
+                return Err(EvalError::Arity {
+                    procedure: "car".to_string(),
+                    expected: "1".to_string(),
+                    got: args.len(),
+                    line,
+                    col,
+                });
+            }
+            match &args[0] {
+                Value::List(items, _) if !items.is_empty() => Ok(items[0].clone()),
+                Value::List(..) => Err(EvalError::TypeError {
+                    message: "car: empty list".to_string(),
+                    line,
+                    col,
+                }),
+                other => Err(EvalError::TypeError {
+                    message: format!("car: expected pair, got {}", other.type_name()),
+                    line,
+                    col,
+                }),
+            }
+        }
+        "cdr" => {
+            if args.len() != 1 {
+                return Err(EvalError::Arity {
+                    procedure: "cdr".to_string(),
+                    expected: "1".to_string(),
+                    got: args.len(),
+                    line,
+                    col,
+                });
+            }
+            match &args[0] {
+                Value::List(items, _) if !items.is_empty() => {
+                    Ok(Value::List(items[1..].to_vec(), (0, 0)))
+                }
+                Value::List(..) => Err(EvalError::TypeError {
+                    message: "cdr: empty list".to_string(),
+                    line,
+                    col,
+                }),
+                other => Err(EvalError::TypeError {
+                    message: format!("cdr: expected pair, got {}", other.type_name()),
+                    line,
+                    col,
+                }),
+            }
+        }
+        "null?" => {
+            if args.len() != 1 {
+                return Err(EvalError::Arity {
+                    procedure: "null?".to_string(),
+                    expected: "1".to_string(),
+                    got: args.len(),
+                    line,
+                    col,
+                });
+            }
+            Ok(Value::Boolean(matches!(
+                &args[0],
+                Value::List(items, _) if items.is_empty()
+            )))
+        }
+        "list" => Ok(Value::List(args, (0, 0))),
+        "length" => {
+            if args.len() != 1 {
+                return Err(EvalError::Arity {
+                    procedure: "length".to_string(),
+                    expected: "1".to_string(),
+                    got: args.len(),
+                    line,
+                    col,
+                });
+            }
+            match &args[0] {
+                Value::List(items, _) => Ok(Value::Integer(items.len() as i64)),
+                other => Err(EvalError::TypeError {
+                    message: format!("length: expected list, got {}", other.type_name()),
+                    line,
+                    col,
+                }),
+            }
+        }
+        "append" => {
+            let mut result = Vec::new();
+            for v in &args {
+                match v {
+                    Value::List(items, _) => result.extend(items.iter().cloned()),
+                    other => {
+                        return Err(EvalError::TypeError {
+                            message: format!("append: expected list, got {}", other.type_name()),
+                            line,
+                            col,
+                        })
+                    }
+                }
+            }
+            Ok(Value::List(result, (0, 0)))
+        }
+        "string?" | "number?" | "boolean?" | "pair?" | "symbol?" | "char?" => {
+            if args.len() != 1 {
+                return Err(EvalError::Arity {
+                    procedure: name.to_string(),
+                    expected: "1".to_string(),
+                    got: args.len(),
+                    line,
+                    col,
+                });
+            }
+            let result = match name {
+                "string?" => matches!(&args[0], Value::Str(_)),
+                "number?" => matches!(&args[0], Value::Integer(_)),
+                "boolean?" => matches!(&args[0], Value::Boolean(_)),
+                "pair?" => matches!(&args[0], Value::List(items, _) if !items.is_empty()),
+                "symbol?" => matches!(&args[0], Value::Symbol(..)),
+                "char?" => matches!(&args[0], Value::Char(_)),
+                _ => unreachable!(),
+            };
+            Ok(Value::Boolean(result))
+        }
+        "display" => {
+            if args.len() != 1 {
+                return Err(EvalError::Arity {
+                    procedure: "display".to_string(),
+                    expected: "1".to_string(),
+                    got: args.len(),
+                    line,
+                    col,
+                });
+            }
+            output.push_str(&args[0].display_repr());
+            Ok(Value::Void)
+        }
+        "write" => {
+            if args.len() != 1 {
+                return Err(EvalError::Arity {
+                    procedure: "write".to_string(),
+                    expected: "1".to_string(),
+                    got: args.len(),
+                    line,
+                    col,
+                });
+            }
+            output.push_str(&args[0].display());
+            Ok(Value::Void)
+        }
+        "newline" => {
+            if !args.is_empty() {
+                return Err(EvalError::Arity {
+                    procedure: "newline".to_string(),
+                    expected: "0".to_string(),
+                    got: args.len(),
+                    line,
+                    col,
+                });
+            }
+            output.push('\n');
+            Ok(Value::Void)
+        }
+        other => Err(EvalError::TypeError {
+            message: format!("cannot apply builtin: {other}"),
+            line,
+            col,
+        }),
     }
 }

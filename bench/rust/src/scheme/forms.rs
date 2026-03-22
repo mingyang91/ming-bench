@@ -1,8 +1,68 @@
+use crate::scheme::builtins::dispatch_builtin;
 use crate::scheme::error::EvalError;
 use crate::scheme::parser::Span;
 use crate::scheme::{eval, Env, Tail, Value};
 use std::cell::RefCell;
 use std::rc::Rc;
+
+fn parse_params_with_rest(
+    param_list: &[Value],
+    span: Span,
+) -> Result<(Vec<String>, Option<String>), EvalError> {
+    let (line, col) = span;
+    let mut params = Vec::new();
+    let mut rest_param = None;
+    let mut i = 0;
+    while i < param_list.len() {
+        match &param_list[i] {
+            Value::Symbol(s, _) if s == "." => {
+                if i + 1 >= param_list.len() {
+                    return Err(EvalError::Parse {
+                        message: "missing rest parameter after .".to_string(),
+                        line,
+                        col,
+                    });
+                }
+                if i + 2 < param_list.len() {
+                    return Err(EvalError::Parse {
+                        message: "unexpected parameters after rest parameter".to_string(),
+                        line,
+                        col,
+                    });
+                }
+                match &param_list[i + 1] {
+                    Value::Symbol(rest, _) => rest_param = Some(rest.clone()),
+                    other => {
+                        return Err(EvalError::TypeError {
+                            message: format!(
+                                "expected symbol for rest parameter, got {}",
+                                other.type_name()
+                            ),
+                            line,
+                            col,
+                        })
+                    }
+                }
+                break;
+            }
+            Value::Symbol(s, _) => {
+                params.push(s.clone());
+                i += 1;
+            }
+            other => {
+                return Err(EvalError::TypeError {
+                    message: format!(
+                        "expected symbol for parameter, got {}",
+                        other.type_name()
+                    ),
+                    line,
+                    col,
+                })
+            }
+        }
+    }
+    Ok((params, rest_param))
+}
 
 fn wrap(val: Value) -> Rc<RefCell<Value>> {
     Rc::new(RefCell::new(val))
@@ -78,6 +138,7 @@ pub(crate) fn eval_let(
         let lambda = Value::Lambda {
             name: Some(name.clone()),
             params: params.clone(),
+            rest_param: None,
             body: body.clone(),
             closure_env: env.clone(),
         };
@@ -205,24 +266,12 @@ pub(crate) fn eval_define(
                     })
                 }
             };
-            let params: Vec<String> = sig[1..]
-                .iter()
-                .map(|p| match p {
-                    Value::Symbol(s, _) => Ok(s.clone()),
-                    other => Err(EvalError::TypeError {
-                        message: format!(
-                            "define: expected symbol for parameter, got {}",
-                            other.type_name()
-                        ),
-                        line,
-                        col,
-                    }),
-                })
-                .collect::<Result<_, _>>()?;
+            let (params, rest_param) = parse_params_with_rest(&sig[1..], (line, col))?;
             let body: Vec<Value> = items[2..].to_vec();
             let closure = Value::Lambda {
                 name: Some(name.clone()),
                 params,
+                rest_param,
                 body,
                 closure_env: env.clone(),
             };
@@ -402,21 +451,12 @@ pub(crate) fn eval_lambda(
             col,
         });
     }
-    let params = match &items[1] {
-        Value::List(param_list, _) => param_list
-            .iter()
-            .map(|p| match p {
-                Value::Symbol(s, _) => Ok(s.clone()),
-                other => Err(EvalError::TypeError {
-                    message: format!(
-                        "lambda: expected symbol for parameter, got {}",
-                        other.type_name()
-                    ),
-                    line,
-                    col,
-                }),
-            })
-            .collect::<Result<Vec<_>, _>>()?,
+    let (params, rest_param) = match &items[1] {
+        Value::List(param_list, _) => parse_params_with_rest(param_list, (line, col))?,
+        Value::Symbol(s, _) => {
+            // (lambda args body) — single symbol captures all args
+            (Vec::new(), Some(s.clone()))
+        }
         other => {
             return Err(EvalError::TypeError {
                 message: format!(
@@ -432,6 +472,7 @@ pub(crate) fn eval_lambda(
     Ok(Value::Lambda {
         name: None,
         params,
+        rest_param,
         body,
         closure_env: env.clone(),
     })
@@ -470,17 +511,33 @@ pub(crate) fn apply_lambda(
         Value::Lambda {
             ref name,
             ref params,
+            ref rest_param,
             ref body,
             ref closure_env,
         } => {
-            if params.len() != args.len() {
-                return Err(EvalError::Arity {
-                    procedure: name.as_deref().unwrap_or("lambda").to_string(),
-                    expected: params.len().to_string(),
-                    got: args.len(),
-                    line,
-                    col,
-                });
+            match rest_param {
+                Some(_) => {
+                    if args.len() < params.len() {
+                        return Err(EvalError::Arity {
+                            procedure: name.as_deref().unwrap_or("lambda").to_string(),
+                            expected: format!("at least {}", params.len()),
+                            got: args.len(),
+                            line,
+                            col,
+                        });
+                    }
+                }
+                None => {
+                    if params.len() != args.len() {
+                        return Err(EvalError::Arity {
+                            procedure: name.as_deref().unwrap_or("lambda").to_string(),
+                            expected: params.len().to_string(),
+                            got: args.len(),
+                            line,
+                            col,
+                        });
+                    }
+                }
             }
             let mut new_env = closure_env.clone();
             for (k, v) in caller_env.iter() {
@@ -489,8 +546,16 @@ pub(crate) fn apply_lambda(
             if let Some(fn_name) = name {
                 new_env.insert(fn_name.clone(), wrap(func.clone()));
             }
-            for (param, arg) in params.iter().zip(args) {
-                new_env.insert(param.clone(), wrap(arg));
+            let mut args_iter = args.into_iter();
+            for param in params {
+                new_env.insert(
+                    param.clone(),
+                    wrap(args_iter.next().expect("arity checked")),
+                );
+            }
+            if let Some(rest_name) = rest_param {
+                let rest_vals: Vec<Value> = args_iter.collect();
+                new_env.insert(rest_name.clone(), wrap(Value::List(rest_vals, (0, 0))));
             }
 
             // Scan for internal defines
@@ -520,6 +585,37 @@ pub(crate) fn apply_lambda(
                 })
             } else {
                 Ok(Tail::Done(Value::Boolean(false)))
+            }
+        }
+        Value::Builtin { ref name } => {
+            if name == "apply" {
+                if args.len() < 2 {
+                    return Err(EvalError::Arity {
+                        procedure: "apply".to_string(),
+                        expected: "at least 2".to_string(),
+                        got: args.len(),
+                        line,
+                        col,
+                    });
+                }
+                let inner_func = args[0].clone();
+                let mut all_args: Vec<Value> = args[1..args.len() - 1].to_vec();
+                match &args[args.len() - 1] {
+                    Value::List(elems, _) => all_args.extend(elems.iter().cloned()),
+                    other => {
+                        return Err(EvalError::TypeError {
+                            message: format!(
+                                "apply: last argument must be a list, got {}",
+                                other.type_name()
+                            ),
+                            line,
+                            col,
+                        })
+                    }
+                }
+                apply_lambda(inner_func, all_args, caller_env, span, output)
+            } else {
+                Ok(Tail::Done(dispatch_builtin(name, args, span, output)?))
             }
         }
         other => Err(EvalError::TypeError {

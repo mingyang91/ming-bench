@@ -31,9 +31,11 @@ pub(crate) enum Value {
     Lambda {
         name: Option<String>,
         params: Vec<String>,
+        rest_param: Option<String>,
         body: Vec<Value>,
         closure_env: Env,
     },
+    Builtin { name: String },
 }
 
 /// Result of a form evaluation that may be a tail expression.
@@ -68,7 +70,7 @@ impl Value {
             Value::Symbol(..) => "symbol",
             Value::List(..) => "list",
             Value::Void => "void",
-            Value::Lambda { .. } => "procedure",
+            Value::Lambda { .. } | Value::Builtin { .. } => "procedure",
         }
     }
 
@@ -86,7 +88,7 @@ impl Value {
                 format!("({})", inner.join(" "))
             }
             Value::Void => "#<void>".to_string(),
-            Value::Lambda { .. } => "#<procedure>".to_string(),
+            Value::Lambda { .. } | Value::Builtin { .. } => "#<procedure>".to_string(),
         }
     }
 
@@ -102,7 +104,7 @@ impl Value {
         match self {
             Value::Symbol(_, span) | Value::List(_, span) => *span,
             Value::Integer(_) | Value::Boolean(_) | Value::Str(_) | Value::Char(_)
-            | Value::Void | Value::Lambda { .. } => (0, 0),
+            | Value::Void | Value::Lambda { .. } | Value::Builtin { .. } => (0, 0),
         }
     }
 }
@@ -110,7 +112,24 @@ impl Value {
 // --- Evaluator ---
 
 fn default_env() -> Env {
-    Env::new()
+    let mut env = Env::new();
+    let builtins = [
+        "+", "-", "*", "/", "<", ">", "=", "<=", ">=",
+        "not", "cons", "car", "cdr", "null?", "list", "length", "append",
+        "string?", "number?", "boolean?", "pair?", "symbol?", "char?",
+        "display", "write", "newline",
+        "string-append", "string-length", "substring",
+        "string->number", "number->string", "symbol->string", "string->symbol",
+        "string-ref", "string-copy", "string-set!",
+        "apply",
+    ];
+    for name in builtins {
+        env.insert(
+            name.to_string(),
+            Rc::new(RefCell::new(Value::Builtin { name: name.to_string() })),
+        );
+    }
+    env
 }
 
 /// Handle a `Tail` result inside the trampoline loop. Returns `Some(value)` for
@@ -142,7 +161,7 @@ pub(crate) fn eval(expr: &Value, env: &mut Env, output: &mut String) -> Result<V
 
         match current {
             val @ (Value::Integer(_) | Value::Boolean(_) | Value::Str(_) | Value::Char(_)
-            | Value::Void | Value::Lambda { .. }) => return Ok(val),
+            | Value::Void | Value::Lambda { .. } | Value::Builtin { .. }) => return Ok(val),
 
             Value::Symbol(ref name, span) => {
                 return active_env
@@ -376,6 +395,41 @@ pub(crate) fn eval(expr: &Value, env: &mut Env, output: &mut String) -> Result<V
                         }
                         "string-set!" => {
                             return eval_string_set(&items, active_env, (line, col), output);
+                        }
+                        "apply" => {
+                            if items.len() < 3 {
+                                return Err(EvalError::Arity {
+                                    procedure: "apply".to_string(),
+                                    expected: "at least 2".to_string(),
+                                    got: items.len() - 1,
+                                    line,
+                                    col,
+                                });
+                            }
+                            let func = eval(&items[1], active_env, output)?;
+                            let mut all_args = Vec::new();
+                            for item in &items[2..items.len() - 1] {
+                                all_args.push(eval(item, active_env, output)?);
+                            }
+                            let last = eval(&items[items.len() - 1], active_env, output)?;
+                            match last {
+                                Value::List(elems, _) => all_args.extend(elems),
+                                other => {
+                                    return Err(EvalError::TypeError {
+                                        message: format!(
+                                            "apply: last argument must be a list, got {}",
+                                            other.type_name()
+                                        ),
+                                        line,
+                                        col,
+                                    })
+                                }
+                            }
+                            dispatch_tail!(
+                                apply_lambda(func, all_args, active_env, (line, col), output)?,
+                                current,
+                                owned_env
+                            );
                         }
                         _ => {}
                     }
