@@ -1,7 +1,8 @@
 pub mod error;
+pub mod env;
 mod eval;
 mod parser;
-mod value;
+pub mod value;
 
 pub use error::EvalError;
 
@@ -14,9 +15,10 @@ pub fn eval_str(input: &str) -> Result<String, EvalError> {
             message: "no expressions".into(),
         });
     }
+    let env = env::Env::new();
     let mut result = None;
     for expr in &exprs {
-        result = Some(eval::eval(expr)?);
+        result = Some(eval::eval(expr, &env)?);
     }
     Ok(result.expect("at least one expression was parsed").to_string())
 }
