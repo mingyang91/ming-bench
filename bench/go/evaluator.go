@@ -94,6 +94,7 @@ func makeGlobalEnv() *Env {
 	env.set("string-ref", builtinVal("string-ref", builtinStringRef))
 	env.set("string-set!", builtinVal("string-set!", builtinStringSet))
 	env.set("string-copy", builtinVal("string-copy", builtinStringCopy))
+	env.set("apply", builtinVal("apply", builtinApply))
 	return env
 }
 
@@ -280,11 +281,12 @@ func evalDefine(args *Value, env *Env, expr *Value) (*Value, error) {
 	if target.Kind == KindPair {
 		// (define (name params...) body...)
 		name := target.Car.Str
-		params := listToStrings(target.Cdr)
+		params, rest := parseParams(target.Cdr)
 		body := listToSlice(args.Cdr)
 		fn := &Value{
 			Kind:       KindLambda,
 			Params:     params,
+			RestParam:  rest,
 			Body:       body,
 			ClosureEnv: env,
 		}
@@ -313,23 +315,37 @@ func evalSetBang(args *Value, env *Env, expr *Value) (*Value, error) {
 }
 
 func evalLambda(args *Value, env *Env) (*Value, error) {
-	params := listToStrings(args.Car)
+	params, rest := parseParams(args.Car)
 	body := listToSlice(args.Cdr)
 	return &Value{
 		Kind:       KindLambda,
 		Params:     params,
+		RestParam:  rest,
 		Body:       body,
 		ClosureEnv: env,
 	}, nil
 }
 
 func applyLambda(fn *Value, args []*Value) (*Value, error) {
-	if len(args) != len(fn.Params) {
-		return nil, &EvalError{Message: fmt.Sprintf("expected %d arguments, got %d", len(fn.Params), len(args))}
+	if fn.RestParam == "" {
+		if len(args) != len(fn.Params) {
+			return nil, &EvalError{Message: fmt.Sprintf("expected %d arguments, got %d", len(fn.Params), len(args))}
+		}
+	} else {
+		if len(args) < len(fn.Params) {
+			return nil, &EvalError{Message: fmt.Sprintf("expected at least %d arguments, got %d", len(fn.Params), len(args))}
+		}
 	}
 	localEnv := newEnv(fn.ClosureEnv)
 	for i, p := range fn.Params {
 		localEnv.set(p, args[i])
+	}
+	if fn.RestParam != "" {
+		rest := nullVal()
+		for i := len(args) - 1; i >= len(fn.Params); i-- {
+			rest = pairVal(args[i], rest)
+		}
+		localEnv.set(fn.RestParam, rest)
 	}
 	// Evaluate all body expressions except the last
 	for i := 0; i < len(fn.Body)-1; i++ {
@@ -340,6 +356,20 @@ func applyLambda(fn *Value, args []*Value) (*Value, error) {
 	}
 	// Return tail call for the last body expression
 	return tailCallVal(fn.Body[len(fn.Body)-1], localEnv), nil
+}
+
+// parseParams extracts parameter names and optional rest parameter from a
+// potentially dotted parameter list like (x y . rest) or a bare symbol (all rest).
+func parseParams(v *Value) (params []string, rest string) {
+	cur := v
+	for cur.Kind == KindPair {
+		params = append(params, cur.Car.Str)
+		cur = cur.Cdr
+	}
+	if cur.Kind == KindSymbol {
+		rest = cur.Str
+	}
+	return
 }
 
 func listToStrings(v *Value) []string {
@@ -771,6 +801,32 @@ func builtinStringCopy(args []*Value) (*Value, error) {
 		return nil, &EvalError{Message: "string-copy: expected string"}
 	}
 	return strVal(args[0].Str), nil
+}
+
+func builtinApply(args []*Value) (*Value, error) {
+	if len(args) < 2 {
+		return nil, &EvalError{Message: "apply: expected at least 2 arguments"}
+	}
+	fn := args[0]
+	// Last argument must be a list; prefix arguments are prepended
+	last := args[len(args)-1]
+	var allArgs []*Value
+	for _, a := range args[1 : len(args)-1] {
+		allArgs = append(allArgs, a)
+	}
+	// Flatten the last argument (a list) into allArgs
+	cur := last
+	for cur.Kind == KindPair {
+		allArgs = append(allArgs, cur.Car)
+		cur = cur.Cdr
+	}
+	if fn.Kind == KindBuiltin {
+		return fn.Builtin(allArgs)
+	}
+	if fn.Kind == KindLambda {
+		return applyLambda(fn, allArgs)
+	}
+	return nil, &EvalError{Message: fmt.Sprintf("apply: not a procedure: %s", fn.String())}
 }
 
 // EvalStr evaluates one or more Scheme expressions and returns the string

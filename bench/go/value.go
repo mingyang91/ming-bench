@@ -32,8 +32,9 @@ type Value struct {
 	Cdr     *Value
 	Builtin BuiltinFunc
 	// Lambda fields
-	Params []string
-	Body   []*Value
+	Params    []string
+	RestParam string // variadic rest parameter name (empty if none)
+	Body      []*Value
 	ClosureEnv *Env
 	// Source position
 	Line int
