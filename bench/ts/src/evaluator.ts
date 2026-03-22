@@ -423,6 +423,18 @@ function makeGlobalEnv(output: string[] = []): Env {
     return { tag: 'number', value: count };
   }});
 
+  env.define('reverse', { tag: 'builtin', name: 'reverse', fn(args) {
+    if (args.length !== 1) throw new EvalError('reverse: expected 1 argument');
+    let result: Value = { tag: 'nil' };
+    let cur = args[0];
+    while (cur.tag === 'pair') {
+      result = { tag: 'pair', car: cur.car, cdr: result };
+      cur = cur.cdr;
+    }
+    if (cur.tag !== 'nil') throw new EvalError('reverse: expected proper list');
+    return result;
+  }});
+
   // Type predicates
   env.define('string?', { tag: 'builtin', name: 'string?', fn(args) {
     if (args.length !== 1) throw new EvalError('string?: expected 1 argument');
@@ -876,6 +888,9 @@ function makeGlobalEnv(output: string[] = []): Env {
   // call/cc — handled specially by the evaluator
   env.define('call/cc', { tag: 'builtin', name: 'call/cc', fn() { throw new EvalError('call/cc: internal'); } });
   env.define('call-with-current-continuation', { tag: 'builtin', name: 'call/cc', fn() { throw new EvalError('call/cc: internal'); } });
+
+  // dynamic-wind — handled specially by the evaluator
+  env.define('dynamic-wind', { tag: 'builtin', name: 'dynamic-wind', fn() { throw new EvalError('dynamic-wind: internal'); } });
 
   return env;
 }
@@ -1436,6 +1451,25 @@ function evaluate(expr: Expr, env: Env): Value {
           }
           throw e;
         }
+      }
+
+      // dynamic-wind handling
+      if (fn.tag === 'builtin' && fn.name === 'dynamic-wind') {
+        if (args.length !== 3) throw new EvalError(`${fmtPos(expr.pos)}: dynamic-wind: expected 3 arguments`);
+        const [inThunk, bodyThunk, outThunk] = args;
+        // Run in-thunk
+        applyFn(inThunk, [], expr.pos);
+        // Run body-thunk, ensuring out-thunk runs even on non-local exit
+        let result: Value;
+        try {
+          result = applyFn(bodyThunk, [], expr.pos);
+        } catch (e) {
+          applyFn(outThunk, [], expr.pos);
+          throw e;
+        }
+        // Run out-thunk on normal exit
+        applyFn(outThunk, [], expr.pos);
+        return result;
       }
 
       // Continuation invocation
