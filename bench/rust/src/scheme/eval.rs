@@ -22,41 +22,76 @@ fn is_builtin(name: &str) -> bool {
 }
 
 /// Evaluate a Scheme expression in the given environment.
+/// Uses a trampoline loop for tail call optimization.
 pub fn eval(expr: &Value, env: &Rc<RefCell<Env>>, out: &mut String) -> Result<Value, EvalError> {
-    match expr {
-        Value::Integer(_) | Value::Boolean(_) | Value::Str(_) | Value::Char(_) => Ok(expr.clone()),
-        Value::Symbol(name) => {
-            match env.borrow().get(name) {
-                Ok(val) => Ok(val),
-                Err(_) if is_builtin(name) => Ok(expr.clone()),
-                Err(e) => Err(e),
+    let mut current_expr = expr.clone();
+    let mut current_env = Rc::clone(env);
+
+    loop {
+        match current_expr {
+            Value::Integer(_) | Value::Boolean(_) | Value::Str(_) | Value::Char(_) => {
+                return Ok(current_expr);
             }
-        }
-        Value::List(items) => {
-            if items.is_empty() {
-                return Err(EvalError::parse("empty application"));
+            Value::Symbol(ref name) => {
+                return match current_env.borrow().get(name) {
+                    Ok(val) => Ok(val),
+                    Err(_) if is_builtin(name) => Ok(current_expr),
+                    Err(e) => Err(e),
+                };
             }
-            eval_list(items, env, out)
+            Value::List(ref items) => {
+                if items.is_empty() {
+                    return Err(EvalError::parse("empty application"));
+                }
+                let items = items.clone();
+                match eval_list_tco(&items, &current_env, out)? {
+                    Trampoline::Done(val) => return Ok(val),
+                    Trampoline::TailCall { expr, env } => {
+                        current_expr = expr;
+                        current_env = env;
+                        continue;
+                    }
+                }
+            }
+            Value::Lambda { .. } => return Ok(current_expr),
+            Value::Void => return Ok(Value::Void),
         }
-        Value::Lambda { .. } => Ok(expr.clone()),
-        Value::Void => Ok(Value::Void),
     }
 }
 
-fn eval_list(items: &[Value], env: &Rc<RefCell<Env>>, out: &mut String) -> Result<Value, EvalError> {
+/// Result of evaluating in a tail-call-aware context.
+enum Trampoline {
+    Done(Value),
+    TailCall {
+        expr: Value,
+        env: Rc<RefCell<Env>>,
+    },
+}
+
+fn eval_list_tco(
+    items: &[Value],
+    env: &Rc<RefCell<Env>>,
+    out: &mut String,
+) -> Result<Trampoline, EvalError> {
     // Check for special forms first
     if let Value::Symbol(op) = &items[0] {
         match op.as_str() {
-            "and" => return eval_and(&items[1..], env, out),
-            "or" => return eval_or(&items[1..], env, out),
-            "if" => return eval_if(&items[1..], env, out),
-            "define" => return eval_define(&items[1..], env, out),
-            "quote" => return eval_quote(&items[1..]),
-            "lambda" => return eval_lambda(&items[1..], env),
-            "let" => return eval_let(&items[1..], env, out),
-            "begin" => return eval_begin(&items[1..], env, out),
-            "cond" => return eval_cond(&items[1..], env, out),
-            "string-set!" => return eval_string_set(&items[1..], env, out),
+            "and" => return eval_and_tco(&items[1..], env, out),
+            "or" => return eval_or_tco(&items[1..], env, out),
+            "if" => return eval_if_tco(&items[1..], env, out),
+            "define" => {
+                let val = eval_define(&items[1..], env, out)?;
+                return Ok(Trampoline::Done(val));
+            }
+            "quote" => return Ok(Trampoline::Done(eval_quote(&items[1..])?)),
+            "lambda" => return Ok(Trampoline::Done(eval_lambda(&items[1..], env)?)),
+            "let" => return eval_let_tco(&items[1..], env, out),
+            "begin" => return eval_begin_tco(&items[1..], env, out),
+            "cond" => return eval_cond_tco(&items[1..], env, out),
+            "string-set!" => {
+                let val = eval_string_set(&items[1..], env, out)?;
+                return Ok(Trampoline::Done(val));
+            }
             _ => {}
         }
     }
@@ -70,12 +105,19 @@ fn eval_list(items: &[Value], env: &Rc<RefCell<Env>>, out: &mut String) -> Resul
         .map(|a| eval(a, env, out))
         .collect::<Result<Vec<_>, _>>()?;
 
-    apply(&operator, &args, out)
+    apply_tco(&operator, &args, out)
 }
 
-fn apply(operator: &Value, args: &[Value], out: &mut String) -> Result<Value, EvalError> {
+fn apply_tco(
+    operator: &Value,
+    args: &[Value],
+    out: &mut String,
+) -> Result<Trampoline, EvalError> {
     match operator {
-        Value::Symbol(name) => apply_builtin(name, args, out),
+        Value::Symbol(name) => {
+            let val = apply_builtin(name, args, out)?;
+            Ok(Trampoline::Done(val))
+        }
         Value::Lambda {
             params,
             body,
@@ -92,11 +134,14 @@ fn apply(operator: &Value, args: &[Value], out: &mut String) -> Result<Value, Ev
             for (param, arg) in params.iter().zip(args.iter()) {
                 local.borrow_mut().set(param.clone(), arg.clone());
             }
-            let mut result = Value::Void;
-            for expr in body {
-                result = eval(expr, &local, out)?;
+            // Evaluate all but last in body, then tail-call the last
+            for expr in &body[..body.len() - 1] {
+                eval(expr, &local, out)?;
             }
-            Ok(result)
+            Ok(Trampoline::TailCall {
+                expr: body[body.len() - 1].clone(),
+                env: local,
+            })
         }
         _ => Err(EvalError::type_err(format!("not a procedure: {operator}"))),
     }
@@ -280,6 +325,15 @@ fn apply_builtin(name: &str, args: &[Value], out: &mut String) -> Result<Value, 
             Ok(Value::Void)
         }
         // String builtins
+        "string-append" | "string-length" | "substring" | "string->number"
+        | "number->string" | "symbol->string" | "string->symbol" | "string-ref"
+        | "char?" | "string-copy" => apply_string_builtin(name, args),
+        _ => Err(EvalError::unbound(name)),
+    }
+}
+
+fn apply_string_builtin(name: &str, args: &[Value]) -> Result<Value, EvalError> {
+    match name {
         "string-append" => {
             let mut result = String::new();
             for a in args {
@@ -404,56 +458,85 @@ fn apply_builtin(name: &str, args: &[Value], out: &mut String) -> Result<Value, 
                 ))),
             }
         }
-        _ => Err(EvalError::unbound(name)),    }
+        _ => Err(EvalError::unbound(name)),
+    }
 }
 
-fn eval_and(exprs: &[Value], env: &Rc<RefCell<Env>>, out: &mut String) -> Result<Value, EvalError> {
+fn eval_and_tco(
+    exprs: &[Value],
+    env: &Rc<RefCell<Env>>,
+    out: &mut String,
+) -> Result<Trampoline, EvalError> {
     if exprs.is_empty() {
-        return Ok(Value::Boolean(true));
+        return Ok(Trampoline::Done(Value::Boolean(true)));
     }
-    let mut result = Value::Boolean(true);
-    for expr in exprs {
-        result = eval(expr, env, out)?;
+    for expr in &exprs[..exprs.len() - 1] {
+        let result = eval(expr, env, out)?;
         if !result.is_truthy() {
-            return Ok(result);
+            return Ok(Trampoline::Done(result));
         }
     }
-    Ok(result)
+    // Tail position: last expression
+    Ok(Trampoline::TailCall {
+        expr: exprs[exprs.len() - 1].clone(),
+        env: Rc::clone(env),
+    })
 }
 
-fn eval_or(exprs: &[Value], env: &Rc<RefCell<Env>>, out: &mut String) -> Result<Value, EvalError> {
+fn eval_or_tco(
+    exprs: &[Value],
+    env: &Rc<RefCell<Env>>,
+    out: &mut String,
+) -> Result<Trampoline, EvalError> {
     if exprs.is_empty() {
-        return Ok(Value::Boolean(false));
+        return Ok(Trampoline::Done(Value::Boolean(false)));
     }
-    for expr in exprs {
+    for expr in &exprs[..exprs.len() - 1] {
         let result = eval(expr, env, out)?;
         if result.is_truthy() {
-            return Ok(result);
+            return Ok(Trampoline::Done(result));
         }
     }
-    Ok(Value::Boolean(false))
+    // Tail position: last expression
+    Ok(Trampoline::TailCall {
+        expr: exprs[exprs.len() - 1].clone(),
+        env: Rc::clone(env),
+    })
 }
 
-fn eval_if(args: &[Value], env: &Rc<RefCell<Env>>, out: &mut String) -> Result<Value, EvalError> {
+fn eval_if_tco(
+    args: &[Value],
+    env: &Rc<RefCell<Env>>,
+    out: &mut String,
+) -> Result<Trampoline, EvalError> {
     if args.len() < 2 || args.len() > 3 {
         return Err(EvalError::arity("if requires 2 or 3 arguments"));
     }
     let cond = eval(&args[0], env, out)?;
     if cond.is_truthy() {
-        eval(&args[1], env, out)
+        Ok(Trampoline::TailCall {
+            expr: args[1].clone(),
+            env: Rc::clone(env),
+        })
     } else if args.len() == 3 {
-        eval(&args[2], env, out)
+        Ok(Trampoline::TailCall {
+            expr: args[2].clone(),
+            env: Rc::clone(env),
+        })
     } else {
-        Ok(Value::Void)
+        Ok(Trampoline::Done(Value::Void))
     }
 }
 
-fn eval_define(args: &[Value], env: &Rc<RefCell<Env>>, out: &mut String) -> Result<Value, EvalError> {
+fn eval_define(
+    args: &[Value],
+    env: &Rc<RefCell<Env>>,
+    out: &mut String,
+) -> Result<Value, EvalError> {
     if args.is_empty() {
         return Err(EvalError::arity("define requires at least 2 arguments"));
     }
     match &args[0] {
-        // (define x expr)
         Value::Symbol(name) => {
             if args.len() != 2 {
                 return Err(EvalError::arity("define requires exactly 2 arguments"));
@@ -462,7 +545,6 @@ fn eval_define(args: &[Value], env: &Rc<RefCell<Env>>, out: &mut String) -> Resu
             env.borrow_mut().set(name.clone(), val);
             Ok(Value::Void)
         }
-        // (define (f params...) body...)
         Value::List(sig) => {
             if sig.is_empty() {
                 return Err(EvalError::parse("define: empty signature"));
@@ -519,7 +601,11 @@ fn eval_lambda(args: &[Value], env: &Rc<RefCell<Env>>) -> Result<Value, EvalErro
     })
 }
 
-fn eval_let(args: &[Value], env: &Rc<RefCell<Env>>, out: &mut String) -> Result<Value, EvalError> {
+fn eval_let_tco(
+    args: &[Value],
+    env: &Rc<RefCell<Env>>,
+    out: &mut String,
+) -> Result<Trampoline, EvalError> {
     if args.len() < 2 {
         return Err(EvalError::arity("let requires at least 2 arguments"));
     }
@@ -555,9 +641,9 @@ fn eval_let(args: &[Value], env: &Rc<RefCell<Env>>, out: &mut String) -> Result<
             closure: Rc::clone(&local),
         };
         local.borrow_mut().set(name.clone(), lambda);
-        // Evaluate init values and call
+        // Bind init values and tail-call into body
         let func = local.borrow().get(name).expect("just defined");
-        return apply(&func, &init_vals, out);
+        return apply_tco(&func, &init_vals, out);
     }
 
     // Regular let: (let ((var init) ...) body ...)
@@ -578,14 +664,22 @@ fn eval_let(args: &[Value], env: &Rc<RefCell<Env>>, out: &mut String) -> Result<
         let val = eval(&pair[1], env, out)?;
         local.borrow_mut().set(name.clone(), val);
     }
-    let mut result = Value::Void;
-    for expr in &args[1..] {
-        result = eval(expr, &local, out)?;
+    // Evaluate all but last, then tail-call last
+    let body = &args[1..];
+    for expr in &body[..body.len() - 1] {
+        eval(expr, &local, out)?;
     }
-    Ok(result)
+    Ok(Trampoline::TailCall {
+        expr: body[body.len() - 1].clone(),
+        env: local,
+    })
 }
 
-fn eval_string_set(args: &[Value], env: &Rc<RefCell<Env>>, out: &mut String) -> Result<Value, EvalError> {
+fn eval_string_set(
+    args: &[Value],
+    env: &Rc<RefCell<Env>>,
+    out: &mut String,
+) -> Result<Value, EvalError> {
     if args.len() != 3 {
         return Err(EvalError::arity("string-set! requires exactly 3 arguments"));
     }
@@ -618,15 +712,28 @@ fn eval_string_set(args: &[Value], env: &Rc<RefCell<Env>>, out: &mut String) -> 
     Ok(Value::Void)
 }
 
-fn eval_begin(args: &[Value], env: &Rc<RefCell<Env>>, out: &mut String) -> Result<Value, EvalError> {
-    let mut result = Value::Void;
-    for expr in args {
-        result = eval(expr, env, out)?;
+fn eval_begin_tco(
+    args: &[Value],
+    env: &Rc<RefCell<Env>>,
+    out: &mut String,
+) -> Result<Trampoline, EvalError> {
+    if args.is_empty() {
+        return Ok(Trampoline::Done(Value::Void));
     }
-    Ok(result)
+    for expr in &args[..args.len() - 1] {
+        eval(expr, env, out)?;
+    }
+    Ok(Trampoline::TailCall {
+        expr: args[args.len() - 1].clone(),
+        env: Rc::clone(env),
+    })
 }
 
-fn eval_cond(clauses: &[Value], env: &Rc<RefCell<Env>>, out: &mut String) -> Result<Value, EvalError> {
+fn eval_cond_tco(
+    clauses: &[Value],
+    env: &Rc<RefCell<Env>>,
+    out: &mut String,
+) -> Result<Trampoline, EvalError> {
     for clause in clauses {
         let Value::List(parts) = clause else {
             return Err(EvalError::type_err("cond: expected clause"));
@@ -637,23 +744,33 @@ fn eval_cond(clauses: &[Value], env: &Rc<RefCell<Env>>, out: &mut String) -> Res
         // Check for else clause
         if let Value::Symbol(s) = &parts[0] {
             if s == "else" {
-                let mut result = Value::Void;
-                for expr in &parts[1..] {
-                    result = eval(expr, env, out)?;
+                if parts.len() == 1 {
+                    return Ok(Trampoline::Done(Value::Void));
                 }
-                return Ok(result);
+                for expr in &parts[1..parts.len() - 1] {
+                    eval(expr, env, out)?;
+                }
+                return Ok(Trampoline::TailCall {
+                    expr: parts[parts.len() - 1].clone(),
+                    env: Rc::clone(env),
+                });
             }
         }
         let test = eval(&parts[0], env, out)?;
         if test.is_truthy() {
-            let mut result = test;
-            for expr in &parts[1..] {
-                result = eval(expr, env, out)?;
+            if parts.len() == 1 {
+                return Ok(Trampoline::Done(test));
             }
-            return Ok(result);
+            for expr in &parts[1..parts.len() - 1] {
+                eval(expr, env, out)?;
+            }
+            return Ok(Trampoline::TailCall {
+                expr: parts[parts.len() - 1].clone(),
+                env: Rc::clone(env),
+            });
         }
     }
-    Ok(Value::Void)
+    Ok(Trampoline::Done(Value::Void))
 }
 
 fn require_int(val: &Value, op: &str) -> Result<i64, EvalError> {
