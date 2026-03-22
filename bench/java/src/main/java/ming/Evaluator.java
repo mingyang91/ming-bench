@@ -9,7 +9,7 @@ import java.util.Map;
 public class Evaluator {
 
     // ---- Value types ----
-    sealed interface SchemeVal permits IntVal, BoolVal, StrVal, CharVal, ListVal, SymbolVal, LambdaVal, VoidVal, BuiltinVal {}
+    sealed interface SchemeVal permits IntVal, BoolVal, StrVal, CharVal, ListVal, SymbolVal, LambdaVal, VoidVal, BuiltinVal, ContinuationVal {}
     record IntVal(long value) implements SchemeVal {}
     record BoolVal(boolean value) implements SchemeVal {}
     static final class StrVal implements SchemeVal {
@@ -26,8 +26,46 @@ public class Evaluator {
     record VoidVal() implements SchemeVal {}
     record LambdaVal(List<String> params, String restParam, List<SchemeVal> body, Env env) implements SchemeVal {}
     record BuiltinVal(String name) implements SchemeVal {}
+    static final class ContinuationVal implements SchemeVal {
+        final Object tag = new Object();
+        final int topLevelIndex;
+        final List<SchemeVal> resumeBody;
+        final int resumeStart;
+        final Env resumeEnv;
+        ContinuationVal(int topLevelIndex, List<SchemeVal> resumeBody, int resumeStart, Env resumeEnv) {
+            this.topLevelIndex = topLevelIndex;
+            this.resumeBody = resumeBody;
+            this.resumeStart = resumeStart;
+            this.resumeEnv = resumeEnv;
+        }
+    }
 
     private static final SchemeVal VOID = new VoidVal();
+
+    // ---- Continuation support ----
+    static class ContinuationReturn extends RuntimeException {
+        final Object tag;
+        final SchemeVal value;
+        final int topLevelIndex;
+        final List<SchemeVal> resumeBody;
+        final int resumeStart;
+        final Env resumeEnv;
+        ContinuationReturn(ContinuationVal cont, SchemeVal value) {
+            super(null, null, true, false);
+            this.tag = cont.tag;
+            this.value = value;
+            this.topLevelIndex = cont.topLevelIndex;
+            this.resumeBody = cont.resumeBody;
+            this.resumeStart = cont.resumeStart;
+            this.resumeEnv = cont.resumeEnv;
+        }
+    }
+    private SchemeVal pendingReturn = null;
+    private int currentTopLevelIndex = 0;
+    // Body context tracking for continuation capture
+    private List<SchemeVal> currentBodyExprs = null;
+    private int currentBodyIdx = 0;
+    private Env currentBodyEnv = null;
 
     // ---- Output capture ----
     private StringBuilder outputBuffer;
@@ -70,7 +108,8 @@ public class Evaluator {
             "display", "write", "newline",
             "string-append", "string-length", "substring", "string->number", "number->string",
             "symbol->string", "string->symbol", "string-ref", "char?",
-            "string-copy", "string-set!", "apply"};
+            "string-copy", "string-set!", "apply",
+            "call/cc", "call-with-current-continuation"};
         for (String b : builtins) {
             env.define(b, new BuiltinVal(b));
         }
@@ -375,9 +414,14 @@ public class Evaluator {
                                 for (int i = 0; i < params.size(); i++) {
                                     callEnv.define(params.get(i), eval(inits.get(i), env));
                                 }
+                                List<SchemeVal> prevBE = currentBodyExprs; int prevBI = currentBodyIdx; Env prevBEnv = currentBodyEnv;
+                                currentBodyExprs = body; currentBodyEnv = callEnv;
                                 for (int j = 0; j < body.size() - 1; j++) {
+                                    currentBodyIdx = j;
                                     eval(body.get(j), callEnv);
                                 }
+                                currentBodyIdx = body.size() - 1;
+                                currentBodyExprs = prevBE; currentBodyIdx = prevBI; currentBodyEnv = prevBEnv;
                                 expr = body.getLast();
                                 env = callEnv;
                                 continue trampoline;
@@ -392,10 +436,16 @@ public class Evaluator {
                                 SchemeVal val = eval(bpair.elements().get(1), env);
                                 letEnv.define(varName, val);
                             }
-                            for (int i = 2; i < elems.size() - 1; i++) {
-                                eval(elems.get(i), letEnv);
+                            List<SchemeVal> letBody = new ArrayList<>(elems.subList(2, elems.size()));
+                            List<SchemeVal> prevBE = currentBodyExprs; int prevBI = currentBodyIdx; Env prevBEnv = currentBodyEnv;
+                            currentBodyExprs = letBody; currentBodyEnv = letEnv;
+                            for (int i = 0; i < letBody.size() - 1; i++) {
+                                currentBodyIdx = i;
+                                eval(letBody.get(i), letEnv);
                             }
-                            expr = elems.getLast();
+                            currentBodyIdx = letBody.size() - 1;
+                            currentBodyExprs = prevBE; currentBodyIdx = prevBI; currentBodyEnv = prevBEnv;
+                            expr = letBody.getLast();
                             env = letEnv;
                             continue trampoline;
                         }
@@ -434,6 +484,12 @@ public class Evaluator {
                             }
                             return condResult;
                         }
+                        case "call/cc":
+                        case "call-with-current-continuation": {
+                            if (elems.size() != 2) throw new EvalError("call/cc requires 1 argument");
+                            SchemeVal proc = eval(elems.get(1), env);
+                            return doCallCC(proc);
+                        }
                         default: {
                             // fall through to procedure call
                             break;
@@ -455,11 +511,19 @@ public class Evaluator {
                     expr = lambda.body().getLast();
                     env = callEnv;
                     continue trampoline;
+                } else if (proc instanceof ContinuationVal cont) {
+                    if (args.size() != 1) throw new EvalError("continuation requires exactly 1 argument");
+                    throw new ContinuationReturn(cont, args.get(0));
                 } else if (proc instanceof BuiltinVal b) {
-                    if (b.name().equals("apply")) {
+                    String bname = b.name();
+                    if (bname.equals("call/cc") || bname.equals("call-with-current-continuation")) {
+                        if (args.size() != 1) throw new EvalError("call/cc requires 1 argument");
+                        return doCallCC(args.get(0));
+                    }
+                    if (bname.equals("apply")) {
                         return doApply(args);
                     }
-                    return applyBuiltin(b.name(), args);
+                    return applyBuiltin(bname, args);
                 }
                 throw new EvalError("not a procedure: " + display(proc));
             } catch (EvalError e) {
@@ -492,12 +556,38 @@ public class Evaluator {
         return callEnv;
     }
 
+    private SchemeVal doCallCC(SchemeVal proc) throws EvalError {
+        if (pendingReturn != null) {
+            SchemeVal val = pendingReturn;
+            pendingReturn = null;
+            return val;
+        }
+        ContinuationVal cont = new ContinuationVal(currentTopLevelIndex,
+            currentBodyExprs, currentBodyIdx, currentBodyEnv);
+        try {
+            return applyProc(proc, List.of(cont));
+        } catch (ContinuationReturn cr) {
+            if (cr.tag == cont.tag) {
+                return cr.value;
+            }
+            throw cr;
+        }
+    }
+
     private SchemeVal applyProc(SchemeVal proc, List<SchemeVal> args) throws EvalError {
-        if (proc instanceof BuiltinVal b) {
-            if (b.name().equals("apply")) {
+        if (proc instanceof ContinuationVal cont) {
+            if (args.size() != 1) throw new EvalError("continuation requires exactly 1 argument");
+            throw new ContinuationReturn(cont, args.get(0));
+        } else if (proc instanceof BuiltinVal b) {
+            String bname = b.name();
+            if (bname.equals("call/cc") || bname.equals("call-with-current-continuation")) {
+                if (args.size() != 1) throw new EvalError("call/cc requires 1 argument");
+                return doCallCC(args.get(0));
+            }
+            if (bname.equals("apply")) {
                 return doApply(args);
             }
-            return applyBuiltin(b.name(), args);
+            return applyBuiltin(bname, args);
         } else if (proc instanceof LambdaVal lambda) {
             Env callEnv = bindLambdaArgs(lambda, args);
             SchemeVal result = VOID;
@@ -686,7 +776,7 @@ public class Evaluator {
             }
             case "procedure?" -> {
                 if (args.size() != 1) throw new EvalError("procedure? requires exactly 1 argument");
-                yield new BoolVal(args.getFirst() instanceof LambdaVal || args.getFirst() instanceof BuiltinVal);
+                yield new BoolVal(args.getFirst() instanceof LambdaVal || args.getFirst() instanceof BuiltinVal || args.getFirst() instanceof ContinuationVal);
             }
             case "display" -> {
                 if (args.size() != 1) throw new EvalError("display requires exactly 1 argument");
@@ -789,6 +879,7 @@ public class Evaluator {
             case VoidVal v -> "";
             case LambdaVal v -> "#<procedure>";
             case BuiltinVal v -> "#<procedure:" + v.name() + ">";
+            case ContinuationVal v -> "#<continuation>";
             case ListVal v -> {
                 StringBuilder sb = new StringBuilder("(");
                 for (int i = 0; i < v.elements().size(); i++) {
@@ -819,35 +910,80 @@ public class Evaluator {
     }
 
     // ---- Public API ----
-    public String evalStr(String input) throws EvalError {
+    private SchemeVal evalTopLevel(String input, Env env) throws EvalError {
         List<Token> tokens = tokenize(input);
         if (tokens.isEmpty()) throw new EvalError("empty input");
 
         posMap = new IdentityHashMap<>();
         currentPos = null;
-        Env env = makeGlobalEnv();
+
+        // Parse all top-level expressions first
+        List<SchemeVal> exprs = new ArrayList<>();
         int[] pos = {0};
-        SchemeVal result = null;
         while (pos[0] < tokens.size()) {
-            result = eval(parse(tokens, pos), env);
+            exprs.add(parse(tokens, pos));
         }
+        if (exprs.isEmpty()) throw new EvalError("empty input");
+
+        // Evaluate with continuation re-entry support
+        SchemeVal result = null;
+        int idx = 0;
+        while (idx < exprs.size()) {
+            currentTopLevelIndex = idx;
+            try {
+                result = eval(exprs.get(idx), env);
+                idx++;
+            } catch (ContinuationReturn cr) {
+                pendingReturn = cr.value;
+                if (cr.resumeBody != null) {
+                    // Body-level re-entry: evaluate saved body in saved env
+                    // Loop to handle repeated continuation invocations within the body
+                    List<SchemeVal> rBody = cr.resumeBody;
+                    int rStart = cr.resumeStart;
+                    Env rEnv = cr.resumeEnv;
+                    int rTopIdx = cr.topLevelIndex;
+                    boolean done = false;
+                    while (!done) {
+                        try {
+                            SchemeVal bodyResult = VOID;
+                            for (int i = rStart; i < rBody.size(); i++) {
+                                bodyResult = eval(rBody.get(i), rEnv);
+                            }
+                            result = bodyResult;
+                            idx = rTopIdx + 1;
+                            done = true;
+                        } catch (ContinuationReturn cr2) {
+                            pendingReturn = cr2.value;
+                            if (cr2.resumeBody != null) {
+                                rBody = cr2.resumeBody;
+                                rStart = cr2.resumeStart;
+                                rEnv = cr2.resumeEnv;
+                                rTopIdx = cr2.topLevelIndex;
+                            } else {
+                                idx = cr2.topLevelIndex;
+                                done = true;
+                            }
+                        }
+                    }
+                } else {
+                    idx = cr.topLevelIndex;
+                }
+            }
+        }
+        return result;
+    }
+
+    public String evalStr(String input) throws EvalError {
+        Env env = makeGlobalEnv();
+        SchemeVal result = evalTopLevel(input, env);
         if (result == null) throw new EvalError("empty input");
         return display(result);
     }
 
     public EvalResult evalStrWithOutput(String input) throws EvalError {
-        List<Token> tokens = tokenize(input);
-        if (tokens.isEmpty()) throw new EvalError("empty input");
-
-        posMap = new IdentityHashMap<>();
-        currentPos = null;
         outputBuffer = new StringBuilder();
         Env env = makeGlobalEnv();
-        int[] pos = {0};
-        SchemeVal result = null;
-        while (pos[0] < tokens.size()) {
-            result = eval(parse(tokens, pos), env);
-        }
+        SchemeVal result = evalTopLevel(input, env);
         if (result == null) throw new EvalError("empty input");
         String output = outputBuffer.toString();
         outputBuffer = null;
