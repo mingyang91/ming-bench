@@ -244,10 +244,12 @@ func applyFuncTCO(op *Value, args []*Value, expr *Expr, env *Env) (*Expr, *Env, 
 		return applyLambdaTCO(op, args, expr)
 	}
 	if op.Type == TypeContinuation {
-		if len(args) != 1 {
-			return nil, nil, nil, errAtf(expr, "continuation: expected 1 argument, got %d", len(args)), false
+		if len(args) == 1 {
+			op.ContFunc(args[0]) // panics, never returns
+		} else {
+			mv := &Value{Type: TypeMultipleValues, Values: args}
+			op.ContFunc(mv) // panics, never returns
 		}
-		op.ContFunc(args[0]) // panics, never returns
 		panic("unreachable")
 	}
 	if op.Type != TypeSymbol || len(op.StrVal) < 10 || op.StrVal[:10] != "__builtin:" {
