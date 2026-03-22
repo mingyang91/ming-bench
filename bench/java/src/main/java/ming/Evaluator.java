@@ -54,6 +54,12 @@ public class Evaluator {
         void define(String name, SchemeVal val) {
             bindings.put(name, val);
         }
+
+        void set(String name, SchemeVal val) throws EvalError {
+            if (bindings.containsKey(name)) { bindings.put(name, val); return; }
+            if (parent != null) { parent.set(name, val); return; }
+            throw new EvalError("unbound variable: " + name);
+        }
     }
 
     private static Env makeGlobalEnv() {
@@ -373,6 +379,14 @@ public class Evaluator {
                             expr = elems.getLast();
                             env = letEnv;
                             continue trampoline;
+                        }
+                        case "set!": {
+                            if (elems.size() != 3) throw new EvalError("set! requires 2 arguments");
+                            if (!(elems.get(1) instanceof SymbolVal target))
+                                throw new EvalError("set!: not a symbol");
+                            SchemeVal val = eval(elems.get(2), env);
+                            env.set(target.name(), val);
+                            return VOID;
                         }
                         case "begin": {
                             if (elems.size() == 1) return VOID;
