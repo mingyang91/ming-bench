@@ -199,6 +199,15 @@ func evalListTCO(expr *Expr, env *Env) (*Expr, *Env, *Value, error, bool) {
 		case "with-syntax":
 			v, err := evalWithSyntax(expr, env)
 			return nil, nil, v, err, false
+		case "do":
+			e, ev, v, err := evalDoTCO(expr, env)
+			if err != nil {
+				return nil, nil, nil, err, false
+			}
+			if e != nil {
+				return e, ev, nil, nil, true
+			}
+			return nil, nil, v, nil, false
 		}
 
 		// Check for macro application
@@ -2255,6 +2264,104 @@ func schemeEqv(a, b *Value) bool {
 		return true
 	default:
 		return a == b
+	}
+}
+
+// evalDoTCO implements (do ((var init step) ...) (test expr ...) body ...)
+func evalDoTCO(expr *Expr, env *Env) (*Expr, *Env, *Value, error) {
+	if len(expr.List) < 3 {
+		return nil, nil, nil, errAt(expr, "do: bad syntax")
+	}
+	bindings := expr.List[1]
+	if bindings.Type != ExprList {
+		return nil, nil, nil, errAt(expr, "do: bindings must be a list")
+	}
+	testClause := expr.List[2]
+	if testClause.Type != ExprList || len(testClause.List) < 1 {
+		return nil, nil, nil, errAt(expr, "do: test clause must be a list")
+	}
+	body := expr.List[3:]
+
+	// Parse variable specs
+	type doVar struct {
+		name string
+		step *Expr // nil if no step
+	}
+	vars := make([]doVar, len(bindings.List))
+	initVals := make([]*Value, len(bindings.List))
+
+	for i, b := range bindings.List {
+		if b.Type != ExprList || len(b.List) < 2 || len(b.List) > 3 {
+			return nil, nil, nil, errAt(b, "do: bad variable spec")
+		}
+		if b.List[0].Type != ExprSymbol {
+			return nil, nil, nil, errAt(b, "do: variable name must be a symbol")
+		}
+		vars[i].name = b.List[0].StrVal
+		val, err := Eval(b.List[1], env)
+		if err != nil {
+			return nil, nil, nil, err
+		}
+		initVals[i] = val
+		if len(b.List) == 3 {
+			vars[i].step = b.List[2]
+		}
+	}
+
+	// Create loop environment
+	loopEnv := NewEnv(env)
+	for i, v := range vars {
+		loopEnv.Set(v.name, initVals[i])
+	}
+
+	for {
+		// Evaluate test
+		testVal, err := Eval(testClause.List[0], loopEnv)
+		if err != nil {
+			return nil, nil, nil, err
+		}
+		if testVal.Type != TypeBoolean || testVal.BoolVal {
+			// Test is true — evaluate exprs and return last
+			if len(testClause.List) > 1 {
+				for _, e := range testClause.List[1 : len(testClause.List)-1] {
+					_, err := Eval(e, loopEnv)
+					if err != nil {
+						return nil, nil, nil, err
+					}
+				}
+				// Tail position: return last expr
+				return testClause.List[len(testClause.List)-1], loopEnv, nil, nil
+			}
+			return nil, nil, Void, nil
+		}
+
+		// Evaluate body (for side effects)
+		for _, b := range body {
+			_, err := Eval(b, loopEnv)
+			if err != nil {
+				return nil, nil, nil, err
+			}
+		}
+
+		// Evaluate all step expressions with current values (parallel)
+		newVals := make([]*Value, len(vars))
+		for i, v := range vars {
+			if v.step != nil {
+				val, err := Eval(v.step, loopEnv)
+				if err != nil {
+					return nil, nil, nil, err
+				}
+				newVals[i] = val
+			} else {
+				cur, _ := loopEnv.Get(v.name)
+				newVals[i] = cur
+			}
+		}
+
+		// Update all variables simultaneously
+		for i, v := range vars {
+			loopEnv.Set(v.name, newVals[i])
+		}
 	}
 }
 

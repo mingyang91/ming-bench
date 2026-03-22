@@ -1595,5 +1595,40 @@
     "fixture": "l26_procedure_non_callable.scm",
     "kind": "eval_str_ok",
     "expected": "#t"
+  },
+  {
+    "name": "l27_do_basic",
+    "level": 27,
+    "fixture": "l27_do_basic.scm",
+    "kind": "eval_str_ok",
+    "expected": "10"
+  },
+  {
+    "name": "l27_do_fibonacci",
+    "level": 27,
+    "fixture": "l27_do_fibonacci.scm",
+    "kind": "eval_str_ok",
+    "expected": "#t"
+  },
+  {
+    "name": "l27_do_no_step",
+    "level": 27,
+    "fixture": "l27_do_no_step.scm",
+    "kind": "eval_str_ok",
+    "expected": "#t"
+  },
+  {
+    "name": "l27_do_parallel_step",
+    "level": 27,
+    "fixture": "l27_do_parallel_step.scm",
+    "kind": "eval_str_ok",
+    "expected": "#t"
+  },
+  {
+    "name": "l27_do_vector_fill",
+    "level": 27,
+    "fixture": "l27_do_vector_fill.scm",
+    "kind": "eval_str_ok",
+    "expected": "#(0 1 4 9 16)"
   }
 ]
