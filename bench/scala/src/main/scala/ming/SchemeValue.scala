@@ -9,11 +9,21 @@ enum SchemeValue:
   case SchemeList(elements: List[SchemeValue])
   case SchemeNil
 
+  case SchemeLambda(
+    params: List[String],
+    body: List[SchemeValue],
+    closure: Environment,
+    name: Option[String] = None
+  )
+  case SchemeVoid
+
   def display: String = this match
     case SchemeInt(v)    => v.toString
     case SchemeBool(v)   => if v then "#t" else "#f"
     case SchemeString(v) => s"\"$v\""
     case SchemeSymbol(n) => n
     case SchemeNil       => "()"
+    case SchemeVoid      => ""
+    case _: SchemeLambda => "#<procedure>"
     case SchemeList(elems) =>
       elems.map(_.display).mkString("(", " ", ")")
