@@ -15,8 +15,11 @@ public class Interpreter {
     final Map<Integer, ContData> continuationData = new HashMap<>();
     final IdentityHashMap<SchemeValue, SchemeValue> pendingReturns = new IdentityHashMap<>();
     int topLevelIndex = 0;
-    private List<SchemeValue> currentLetBody;
-    private int currentLetBodyIndex;
+    // Tracks the outermost let body for continuation restart.
+    // Only set once (first let encountered); inner lets don't overwrite it.
+    private List<SchemeValue> outerLetBody;
+    private int outerLetBodyIndex;
+    private Environment outerLetEnv;
 
     static class ContData {
         final SchemeValue callccExpr;
@@ -405,15 +408,16 @@ public class Interpreter {
                                     localEnv.define(s.name(), eval(b.elements().get(1), env));
                                 }
                                 var letBody = elements.subList(2, elements.size());
+                                boolean isOuterLet = (outerLetBody == null);
+                                if (isOuterLet) {
+                                    outerLetBody = letBody;
+                                    outerLetEnv = localEnv;
+                                }
                                 for (int i = 0; i < letBody.size() - 1; i++) {
-                                    currentLetBody = letBody;
-                                    currentLetBodyIndex = i;
-                                    currentLetBodyEnv = localEnv;
+                                    if (isOuterLet) outerLetBodyIndex = i;
                                     eval(letBody.get(i), localEnv);
                                 }
-                                currentLetBody = letBody;
-                                currentLetBodyIndex = letBody.size() - 1;
-                                currentLetBodyEnv = localEnv;
+                                if (isOuterLet) outerLetBodyIndex = letBody.size() - 1;
                                 expr = letBody.getLast();
                                 env = localEnv;
                                 continue;
@@ -725,9 +729,8 @@ public class Interpreter {
         int contId = nextContId++;
         var contVal = new SchemeValue.ContinuationVal(contId);
 
-        // Store continuation data — capture current let body context and its environment
-        Environment letEnv = (currentLetBody != null) ? findLetBodyEnv() : null;
-        continuationData.put(contId, new ContData(callccExpr, currentLetBody, currentLetBodyIndex, letEnv, topLevelIndex));
+        // Store continuation data — capture outermost let body context
+        continuationData.put(contId, new ContData(callccExpr, outerLetBody, outerLetBodyIndex, outerLetEnv, topLevelIndex));
 
         // Call the thunk with the continuation
         try {
@@ -750,14 +753,6 @@ public class Interpreter {
         }
     }
 
-    // The let body env is the env used to evaluate the let body expressions.
-    // We track it via a field set during let body evaluation.
-    private Environment currentLetBodyEnv;
-
-    private Environment findLetBodyEnv() {
-        return currentLetBodyEnv;
-    }
-
     /**
      * Restart a let body from a given index (used for reentrant continuations).
      * Called from Evaluator when a ContinuationException targets a let body.
@@ -768,9 +763,9 @@ public class Interpreter {
             try {
                 SchemeValue result = null;
                 for (int i = idx; i < body.size(); i++) {
-                    currentLetBody = body;
-                    currentLetBodyIndex = i;
-                    currentLetBodyEnv = env;
+                    outerLetBody = body;
+                    outerLetBodyIndex = i;
+                    outerLetEnv = env;
                     result = eval(body.get(i), env);
                 }
                 return result != null ? result : new SchemeValue.VoidVal();
