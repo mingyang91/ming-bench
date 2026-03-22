@@ -7,6 +7,7 @@ enum SchemeValue:
   case CharVal(value: Char)
   case SymbolVal(name: String, pos: Option[(Int, Int)] = None)
   case ListVal(elements: List[SchemeValue], pos: Option[(Int, Int)] = None)
+  case MutableStringVal(chars: Array[Char])
   case PairVal(car: SchemeValue, cdr: SchemeValue)
 
   case LambdaVal(
@@ -19,21 +20,23 @@ enum SchemeValue:
 
   /** write-style display (strings get quotes) — used for evalStr results. */
   def display: String = this match
-    case IntVal(n)       => n.toString
-    case BoolVal(b)      => if b then "#t" else "#f"
-    case StringVal(s)    => "\"" + s + "\""
-    case CharVal(c)      => s"#\\$c"
-    case SymbolVal(n, _) => n
-    case ListVal(es, _)  => "(" + es.map(_.display).mkString(" ") + ")"
-    case p: PairVal      => "(" + displayPairInner(p) + ")"
-    case _: LambdaVal    => "#<procedure>"
-    case Void            => ""
+    case IntVal(n)            => n.toString
+    case BoolVal(b)           => if b then "#t" else "#f"
+    case StringVal(s)         => "\"" + s + "\""
+    case MutableStringVal(cs) => "\"" + String(cs) + "\""
+    case CharVal(c)           => s"#\\$c"
+    case SymbolVal(n, _)      => n
+    case ListVal(es, _)       => "(" + es.map(_.display).mkString(" ") + ")"
+    case p: PairVal           => "(" + displayPairInner(p) + ")"
+    case _: LambdaVal         => "#<procedure>"
+    case Void                 => ""
 
   /** display-style output (strings without quotes). */
   def displayOut: String = this match
-    case StringVal(s) => s
-    case CharVal(c)   => c.toString
-    case other        => other.display
+    case StringVal(s)         => s
+    case MutableStringVal(cs) => String(cs)
+    case CharVal(c)           => c.toString
+    case other                => other.display
 
   def isTruthy: Boolean = this match
     case BoolVal(false) => false

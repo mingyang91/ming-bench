@@ -133,9 +133,19 @@ object Parser:
   ): SchemeValue =
     if token == "#t" then BoolVal(true)
     else if token == "#f" then BoolVal(false)
+    else if token.startsWith("#\\") then parseCharLiteral(token)
     else
       token.toLongOption match
         case Some(n) => IntVal(n)
         case None =>
           if token.startsWith("\"") then StringVal(token.substring(1, token.length - 1))
           else SymbolVal(token, pos)
+
+  private def parseCharLiteral(token: String): SchemeValue =
+    val name = token.substring(2)
+    name match
+      case "space"            => CharVal(' ')
+      case "newline"          => CharVal('\n')
+      case "tab"              => CharVal('\t')
+      case s if s.length == 1 => CharVal(s.charAt(0))
+      case _                  => throw new EvalError(s"invalid character literal: $token")

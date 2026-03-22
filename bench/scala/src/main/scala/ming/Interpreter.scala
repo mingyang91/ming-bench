@@ -13,7 +13,7 @@ object Interpreter:
   /** Evaluate an expression, returning (result, updated-env, output). */
   def eval(expr: SchemeValue, env: Env): (SchemeValue, Env, Output) =
     expr match
-      case IntVal(_) | BoolVal(_) | StringVal(_) | CharVal(_) | Void =>
+      case IntVal(_) | BoolVal(_) | StringVal(_) | MutableStringVal(_) | CharVal(_) | Void =>
         (expr, env, "")
       case SymbolVal(name, pos) =>
         val v = env.getOrElse(

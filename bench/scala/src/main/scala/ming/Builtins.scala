@@ -92,18 +92,21 @@ object Builtins:
       case "symbol->string" => (symbolToString(args), "")
       case "string->symbol" => (stringToSymbol(args), "")
       case "string-ref"     => (stringRef(args), "")
+      case "string-copy"    => (stringCopy(args), "")
+      case "string-set!"    => (stringSet(args), "")
       case "char?"          => (typeCheck(name, args), "")
       case _                => throw new EvalError(s"unknown procedure: $name")
 
   private def typeCheck(name: String, args: List[SchemeValue]): SchemeValue =
     val result = (name, args) match
-      case ("number?", (_: IntVal) :: Nil)    => true
-      case ("boolean?", (_: BoolVal) :: Nil)  => true
-      case ("string?", (_: StringVal) :: Nil) => true
-      case ("symbol?", (_: SymbolVal) :: Nil) => true
-      case ("char?", (_: CharVal) :: Nil)     => true
-      case (_, _ :: Nil)                      => false
-      case _                                  => throw new EvalError(s"$name: expects 1 argument")
+      case ("number?", (_: IntVal) :: Nil)           => true
+      case ("boolean?", (_: BoolVal) :: Nil)         => true
+      case ("string?", (_: StringVal) :: Nil)        => true
+      case ("string?", (_: MutableStringVal) :: Nil) => true
+      case ("symbol?", (_: SymbolVal) :: Nil)        => true
+      case ("char?", (_: CharVal) :: Nil)            => true
+      case (_, _ :: Nil)                             => false
+      case _                                         => throw new EvalError(s"$name: expects 1 argument")
     BoolVal(result)
 
   def isNull(v: SchemeValue): Boolean = v match
@@ -136,8 +139,9 @@ object Builtins:
     case other     => throw new EvalError(s"expected number, got: ${other.display}")
 
   private def asString(v: SchemeValue): String = v match
-    case StringVal(s) => s
-    case other        => throw new EvalError(s"expected string, got: ${other.display}")
+    case StringVal(s)         => s
+    case MutableStringVal(cs) => String(cs)
+    case other                => throw new EvalError(s"expected string, got: ${other.display}")
 
   private def arithOp(
     args: List[SchemeValue],
@@ -195,8 +199,37 @@ object Builtins:
   private def stringRef(args: List[SchemeValue]): SchemeValue =
     args match
       case s :: idx :: Nil =>
-        val str = asString(s)
-        val i   = asInt(idx).toInt
-        if i < 0 || i >= str.length then throw new EvalError("string-ref: index out of range")
+        val (str, len) = asStringContent(s)
+        val i          = asInt(idx).toInt
+        if i < 0 || i >= len then throw new EvalError("string-ref: index out of range")
         CharVal(str.charAt(i))
       case _ => throw new EvalError("string-ref: expects 2 arguments")
+
+  private def stringCopy(args: List[SchemeValue]): SchemeValue =
+    args match
+      case v :: Nil =>
+        v match
+          case StringVal(s)         => MutableStringVal(s.toCharArray)
+          case MutableStringVal(cs) => MutableStringVal(cs.clone())
+          case other                => throw new EvalError(s"string-copy: expected string, got: ${other.display}")
+      case _ => throw new EvalError("string-copy: expects 1 argument")
+
+  private def stringSet(args: List[SchemeValue]): SchemeValue =
+    args match
+      case s :: idx :: c :: Nil =>
+        s match
+          case MutableStringVal(cs) =>
+            val i = asInt(idx).toInt
+            if i < 0 || i >= cs.length then throw new EvalError("string-set!: index out of range")
+            val ch = c match
+              case CharVal(ch) => ch
+              case other       => throw new EvalError(s"string-set!: expected char, got: ${other.display}")
+            cs(i) = ch
+            Void
+          case _ => throw new EvalError("string-set!: expected mutable string")
+      case _ => throw new EvalError("string-set!: expects 3 arguments")
+
+  private def asStringContent(v: SchemeValue): (String, Int) = v match
+    case StringVal(s)         => (s, s.length)
+    case MutableStringVal(cs) => (String(cs), cs.length)
+    case other                => throw new EvalError(s"expected string, got: ${other.display}")
