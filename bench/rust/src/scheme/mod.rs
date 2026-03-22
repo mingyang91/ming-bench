@@ -568,7 +568,8 @@ fn eval(expr: &Expr, env: &Env, out: &Output) -> Result<Value, EvalError> {
                         | "string-append" | "string-length" | "substring"
                         | "string->number" | "number->string"
                         | "symbol->string" | "string->symbol"
-                        | "string-ref" | "string-copy"
+                        | "string-ref" | "string-copy" | "string->list" | "list->string"
+                        | "char->integer" | "integer->char"
                         | "eq?" | "equal?" | "append"
                         | "abs" | "modulo" | "remainder" | "quotient" | "expt"
                         | "min" | "max"
@@ -855,50 +856,8 @@ fn eval_set(args: &[Expr], env: &Env, span: Span, out: &Output) -> Result<Value,
     Ok(Value::Boolean(false))
 }
 
-fn eval_string_set(args: &[Expr], env: &Env, span: Span, out: &Output) -> Result<Value, EvalError> {
-    if args.len() != 3 {
-        return Err(EvalError::Arity(span.fmt("string-set! requires 3 arguments")));
-    }
-    let name = match &args[0].kind {
-        ExprKind::Symbol(s) => s.clone(),
-        _ => return Err(EvalError::Type(span.fmt("string-set!: expected symbol"))),
-    };
-    let idx = match eval(&args[1], env, out)? {
-        Value::Integer(n) => n as usize,
-        _ => return Err(EvalError::Type(span.fmt("string-set!: expected integer index"))),
-    };
-    let ch = match eval(&args[2], env, out)? {
-        Value::Char(c) => c,
-        _ => return Err(EvalError::Type(span.fmt("string-set!: expected char"))),
-    };
-    // Look up the string, mutate it, write it back
-    let current = env_get(env, &name).ok_or_else(|| EvalError::UnboundVariable(span.fmt(&name)))?;
-    match current {
-        Value::String(mut s) => {
-            let mut chars: Vec<char> = s.chars().collect();
-            if idx >= chars.len() {
-                return Err(EvalError::Type(span.fmt("string-set!: index out of bounds")));
-            }
-            chars[idx] = ch;
-            s = chars.into_iter().collect();
-            // Update in env
-            fn env_update(env: &Env, name: &str, val: Value) -> Result<(), ()> {
-                let mut inner = env.borrow_mut();
-                if inner.bindings.contains_key(name) {
-                    inner.bindings.insert(name.to_string(), val);
-                    Ok(())
-                } else if let Some(ref parent) = inner.parent {
-                    env_update(parent, name, val)
-                } else {
-                    Err(())
-                }
-            }
-            env_update(env, &name, Value::String(s))
-                .map_err(|_| EvalError::UnboundVariable(span.fmt(&name)))?;
-            Ok(Value::Boolean(false))
-        }
-        _ => Err(EvalError::Type(span.fmt("string-set!: expected string"))),
-    }
+fn eval_string_set(_args: &[Expr], _env: &Env, span: Span, _out: &Output) -> Result<Value, EvalError> {
+    Err(EvalError::Type(span.fmt("string-set!: strings are immutable")))
 }
 
 
@@ -1457,6 +1416,46 @@ fn eval_builtin(op: &str, args: &[Value], span: Span) -> Result<Value, EvalError
                 _ => Err(EvalError::Type(span.fmt("string-copy: expected string"))),
             }
         }
+        "string->list" => {
+            if args.len() != 1 { return Err(EvalError::Arity(span.fmt("string->list requires 1 argument"))); }
+            match &args[0] {
+                Value::String(s) => Ok(Value::List(s.chars().map(Value::Char).collect())),
+                _ => Err(EvalError::Type(span.fmt("string->list: expected string"))),
+            }
+        }
+        "list->string" => {
+            if args.len() != 1 { return Err(EvalError::Arity(span.fmt("list->string requires 1 argument"))); }
+            match &args[0] {
+                Value::List(items) => {
+                    let mut s = String::new();
+                    for item in items {
+                        match item {
+                            Value::Char(c) => s.push(*c),
+                            _ => return Err(EvalError::Type(span.fmt("list->string: expected list of chars"))),
+                        }
+                    }
+                    Ok(Value::String(s))
+                }
+                _ => Err(EvalError::Type(span.fmt("list->string: expected list"))),
+            }
+        }
+        "char->integer" => {
+            if args.len() != 1 { return Err(EvalError::Arity(span.fmt("char->integer requires 1 argument"))); }
+            match &args[0] {
+                Value::Char(c) => Ok(Value::Integer(*c as i64)),
+                _ => Err(EvalError::Type(span.fmt("char->integer: expected char"))),
+            }
+        }
+        "integer->char" => {
+            if args.len() != 1 { return Err(EvalError::Arity(span.fmt("integer->char requires 1 argument"))); }
+            match &args[0] {
+                Value::Integer(n) => {
+                    let c = char::from_u32(*n as u32).ok_or_else(|| EvalError::Type(span.fmt("integer->char: invalid code point")))?;
+                    Ok(Value::Char(c))
+                }
+                _ => Err(EvalError::Type(span.fmt("integer->char: expected integer"))),
+            }
+        }
         "string-ref" => {
             if args.len() != 2 { return Err(EvalError::Arity(span.fmt("string-ref requires 2 arguments"))); }
             let s = match &args[0] {
@@ -1715,7 +1714,8 @@ fn make_default_env() -> Env {
         "string-append", "string-length", "substring",
         "string->number", "number->string",
         "symbol->string", "string->symbol",
-        "string-ref", "string-copy",
+        "string-ref", "string-copy", "string->list", "list->string",
+        "char->integer", "integer->char",
         "eq?", "equal?", "append",
         "abs", "modulo", "remainder", "quotient", "expt", "min", "max",
         "zero?", "positive?", "negative?", "odd?", "even?",
