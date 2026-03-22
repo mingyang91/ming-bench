@@ -98,7 +98,7 @@ pub enum Value {
     Symbol(String),
     Char(char),
     Nil,
-    Pair(Box<Value>, Box<Value>),
+    Pair(Rc<RefCell<(Value, Value)>>),
     Lambda {
         params: Vec<String>,
         rest_param: Option<String>,
@@ -144,6 +144,11 @@ impl Value {
     pub fn is_truthy(&self) -> bool {
         !matches!(self, Value::Boolean(false))
     }
+
+    /// Construct a mutable pair.
+    pub fn pair(car: Value, cdr: Value) -> Value {
+        Value::Pair(Rc::new(RefCell::new((car, cdr))))
+    }
 }
 
 impl PartialEq for Value {
@@ -157,7 +162,11 @@ impl PartialEq for Value {
             (Value::Symbol(a), Value::Symbol(b)) => a == b,
             (Value::Char(a), Value::Char(b)) => a == b,
             (Value::Nil, Value::Nil) => true,
-            (Value::Pair(a1, a2), Value::Pair(b1, b2)) => a1 == b1 && a2 == b2,
+            (Value::Pair(a), Value::Pair(b)) => {
+                let ab = a.borrow();
+                let bb = b.borrow();
+                ab.0 == bb.0 && ab.1 == bb.1
+            }
             (Value::Builtin(a), Value::Builtin(b)) => a == b,
             (Value::Continuation { id: a, .. }, Value::Continuation { id: b, .. }) => a == b,
             (Value::Vector(a), Value::Vector(b)) => *a.borrow() == *b.borrow(),
@@ -202,9 +211,9 @@ impl Value {
     pub fn display_fmt(&self, buf: &mut String) {
         match self {
             Value::SchemeString(s) => buf.push_str(s),
-            Value::Pair(_, _) => {
+            Value::Pair(_) => {
                 buf.push('(');
-                display_list(buf, self);
+                display_list(buf, self, 0);
             }
             Value::Vector(v) => {
                 buf.push_str("#(");
@@ -258,9 +267,9 @@ impl fmt::Display for Value {
             Value::Symbol(s) => write!(f, "{s}"),
             Value::Char(c) => write!(f, "#\\{c}"),
             Value::Nil => write!(f, "()"),
-            Value::Pair(_, _) => {
+            Value::Pair(_) => {
                 write!(f, "(")?;
-                write_list(f, self)
+                write_list(f, self, 0)
             }
             Value::Vector(v) => {
                 write!(f, "#(")?;
@@ -293,15 +302,23 @@ impl fmt::Display for Value {
     }
 }
 
-fn write_list(f: &mut fmt::Formatter<'_>, val: &Value) -> fmt::Result {
+const MAX_LIST_DEPTH: usize = 1000;
+
+fn write_list(f: &mut fmt::Formatter<'_>, val: &Value, depth: usize) -> fmt::Result {
+    if depth > MAX_LIST_DEPTH {
+        return write!(f, "...)");
+    }
     match val {
-        Value::Pair(car, cdr) => {
-            write!(f, "{car}")?;
-            match cdr.as_ref() {
+        Value::Pair(p) => {
+            let pair = p.borrow();
+            write!(f, "{}", pair.0)?;
+            match &pair.1 {
                 Value::Nil => write!(f, ")"),
-                Value::Pair(_, _) => {
+                Value::Pair(_) => {
                     write!(f, " ")?;
-                    write_list(f, cdr)
+                    let cdr = pair.1.clone();
+                    drop(pair);
+                    write_list(f, &cdr, depth + 1)
                 }
                 other => write!(f, " . {other})"),
             }
@@ -310,15 +327,22 @@ fn write_list(f: &mut fmt::Formatter<'_>, val: &Value) -> fmt::Result {
     }
 }
 
-fn display_list(buf: &mut String, val: &Value) {
+fn display_list(buf: &mut String, val: &Value, depth: usize) {
+    if depth > MAX_LIST_DEPTH {
+        buf.push_str("...)");
+        return;
+    }
     match val {
-        Value::Pair(car, cdr) => {
-            car.display_fmt(buf);
-            match cdr.as_ref() {
+        Value::Pair(p) => {
+            let pair = p.borrow();
+            pair.0.display_fmt(buf);
+            match &pair.1 {
                 Value::Nil => buf.push(')'),
-                Value::Pair(_, _) => {
+                Value::Pair(_) => {
                     buf.push(' ');
-                    display_list(buf, cdr);
+                    let cdr = pair.1.clone();
+                    drop(pair);
+                    display_list(buf, &cdr, depth + 1);
                 }
                 other => {
                     buf.push_str(" . ");

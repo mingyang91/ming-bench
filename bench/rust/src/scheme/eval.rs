@@ -316,6 +316,10 @@ fn is_builtin(name: &str) -> bool {
             | "denominator"
             | "rational?"
             | "integer?"
+            | "set-car!"
+            | "set-cdr!"
+            | "cddr"
+            | "cadr"
     )
 }
 
@@ -363,7 +367,7 @@ fn apply_step(
                 let rest_args = &args[params.len()..];
                 let mut list = Value::Nil;
                 for arg in rest_args.iter().rev() {
-                    list = Value::Pair(Box::new(arg.clone()), Box::new(list));
+                    list = Value::pair(arg.clone(), list);
                 }
                 call_env.define(rest.clone(), list);
             }
@@ -842,7 +846,7 @@ fn eval_builtin(
         "list" => eval_list_builtin(args),
         "length" => eval_length(args, span),
         "pair?" => Ok(Value::Boolean(
-            matches!(args.first(), Some(Value::Pair(_, _))) && args.len() == 1,
+            matches!(args.first(), Some(Value::Pair(_))) && args.len() == 1,
         )),
         "string?" => Ok(Value::Boolean(
             matches!(args.first(), Some(Value::SchemeString(_))) && args.len() == 1,
@@ -989,6 +993,10 @@ fn eval_builtin(
             }
             Ok(Value::Boolean(matches!(&args[0], Value::Integer(_))))
         }
+        "set-car!" => eval_set_car(args, span),
+        "set-cdr!" => eval_set_cdr(args, span),
+        "cddr" => eval_cddr(args, span),
+        "cadr" => eval_cadr(args, span),
         _ => Err(EvalErrorKind::UnboundVariable {
             name: name.to_string(),
         }
@@ -1293,7 +1301,7 @@ fn expr_to_value(expr: &Expr) -> Result<Value, EvalError> {
             let mut result = Value::Nil;
             for elem in elements.iter().rev() {
                 let val = expr_to_value(elem)?;
-                result = Value::Pair(Box::new(val), Box::new(result));
+                result = Value::pair(val, result);
             }
             Ok(result)
         }
@@ -1655,10 +1663,7 @@ fn eval_cons(args: &[Value], span: &Span) -> Result<Value, EvalError> {
         }
         .at(span));
     }
-    Ok(Value::Pair(
-        Box::new(args[0].clone()),
-        Box::new(args[1].clone()),
-    ))
+    Ok(Value::pair(args[0].clone(), args[1].clone()))
 }
 
 fn eval_car(args: &[Value], span: &Span) -> Result<Value, EvalError> {
@@ -1671,7 +1676,7 @@ fn eval_car(args: &[Value], span: &Span) -> Result<Value, EvalError> {
         .at(span));
     }
     match &args[0] {
-        Value::Pair(car, _) => Ok(*car.clone()),
+        Value::Pair(p) => Ok(p.borrow().0.clone()),
         other => Err(EvalErrorKind::Type {
             expected: "pair".into(),
             got: format!("{other}"),
@@ -1690,7 +1695,109 @@ fn eval_cdr(args: &[Value], span: &Span) -> Result<Value, EvalError> {
         .at(span));
     }
     match &args[0] {
-        Value::Pair(_, cdr) => Ok(*cdr.clone()),
+        Value::Pair(p) => Ok(p.borrow().1.clone()),
+        other => Err(EvalErrorKind::Type {
+            expected: "pair".into(),
+            got: format!("{other}"),
+        }
+        .at(span)),
+    }
+}
+
+fn eval_set_car(args: &[Value], span: &Span) -> Result<Value, EvalError> {
+    if args.len() != 2 {
+        return Err(EvalErrorKind::Arity {
+            name: "set-car!".into(),
+            expected: "2".into(),
+            got: args.len(),
+        }
+        .at(span));
+    }
+    match &args[0] {
+        Value::Pair(p) => {
+            p.borrow_mut().0 = args[1].clone();
+            Ok(Value::Nil)
+        }
+        other => Err(EvalErrorKind::Type {
+            expected: "pair".into(),
+            got: format!("{other}"),
+        }
+        .at(span)),
+    }
+}
+
+fn eval_set_cdr(args: &[Value], span: &Span) -> Result<Value, EvalError> {
+    if args.len() != 2 {
+        return Err(EvalErrorKind::Arity {
+            name: "set-cdr!".into(),
+            expected: "2".into(),
+            got: args.len(),
+        }
+        .at(span));
+    }
+    match &args[0] {
+        Value::Pair(p) => {
+            p.borrow_mut().1 = args[1].clone();
+            Ok(Value::Nil)
+        }
+        other => Err(EvalErrorKind::Type {
+            expected: "pair".into(),
+            got: format!("{other}"),
+        }
+        .at(span)),
+    }
+}
+
+fn eval_cddr(args: &[Value], span: &Span) -> Result<Value, EvalError> {
+    if args.len() != 1 {
+        return Err(EvalErrorKind::Arity {
+            name: "cddr".into(),
+            expected: "1".into(),
+            got: args.len(),
+        }
+        .at(span));
+    }
+    match &args[0] {
+        Value::Pair(p1) => {
+            let cdr1 = p1.borrow().1.clone();
+            match &cdr1 {
+                Value::Pair(p2) => Ok(p2.borrow().1.clone()),
+                other => Err(EvalErrorKind::Type {
+                    expected: "pair".into(),
+                    got: format!("{other}"),
+                }
+                .at(span)),
+            }
+        }
+        other => Err(EvalErrorKind::Type {
+            expected: "pair".into(),
+            got: format!("{other}"),
+        }
+        .at(span)),
+    }
+}
+
+fn eval_cadr(args: &[Value], span: &Span) -> Result<Value, EvalError> {
+    if args.len() != 1 {
+        return Err(EvalErrorKind::Arity {
+            name: "cadr".into(),
+            expected: "1".into(),
+            got: args.len(),
+        }
+        .at(span));
+    }
+    match &args[0] {
+        Value::Pair(p1) => {
+            let cdr1 = p1.borrow().1.clone();
+            match &cdr1 {
+                Value::Pair(p2) => Ok(p2.borrow().0.clone()),
+                other => Err(EvalErrorKind::Type {
+                    expected: "pair".into(),
+                    got: format!("{other}"),
+                }
+                .at(span)),
+            }
+        }
         other => Err(EvalErrorKind::Type {
             expected: "pair".into(),
             got: format!("{other}"),
@@ -1714,19 +1821,23 @@ fn eval_null_pred(args: &[Value], span: &Span) -> Result<Value, EvalError> {
 fn eval_list_builtin(args: &[Value]) -> Result<Value, EvalError> {
     let mut result = Value::Nil;
     for arg in args.iter().rev() {
-        result = Value::Pair(Box::new(arg.clone()), Box::new(result));
+        result = Value::pair(arg.clone(), result);
     }
     Ok(result)
 }
 
 fn value_list_to_vec(val: &Value, span: &Span) -> Result<Vec<Value>, EvalError> {
     let mut result = Vec::new();
-    let mut current = val;
+    let mut current = val.clone();
     loop {
-        match current {
+        match &current {
             Value::Nil => return Ok(result),
-            Value::Pair(car, cdr) => {
-                result.push(*car.clone());
+            Value::Pair(p) => {
+                let pair = p.borrow();
+                let car = pair.0.clone();
+                let cdr = pair.1.clone();
+                drop(pair);
+                result.push(car);
                 current = cdr;
             }
             other => {
@@ -1772,13 +1883,13 @@ fn eval_length(args: &[Value], span: &Span) -> Result<Value, EvalError> {
         .at(span));
     }
     let mut count: i64 = 0;
-    let mut current = &args[0];
+    let mut current = args[0].clone();
     loop {
         match current {
             Value::Nil => return Ok(Value::Integer(count)),
-            Value::Pair(_, cdr) => {
+            Value::Pair(p) => {
                 count += 1;
-                current = cdr;
+                current = p.borrow().1.clone();
             }
             other => {
                 return Err(EvalErrorKind::Type {
@@ -2314,10 +2425,10 @@ fn eval_list_ref(args: &[Value], span: &Span) -> Result<Value, EvalError> {
         .at(span));
     }
     let idx = require_integer(&args[1], span)? as usize;
-    let mut current = &args[0];
+    let mut current = args[0].clone();
     for _ in 0..idx {
-        match current {
-            Value::Pair(_, cdr) => current = cdr,
+        let next = match &current {
+            Value::Pair(p) => p.borrow().1.clone(),
             _ => {
                 return Err(EvalErrorKind::Type {
                     expected: "pair".into(),
@@ -2325,10 +2436,11 @@ fn eval_list_ref(args: &[Value], span: &Span) -> Result<Value, EvalError> {
                 }
                 .at(span))
             }
-        }
+        };
+        current = next;
     }
-    match current {
-        Value::Pair(car, _) => Ok(*car.clone()),
+    match &current {
+        Value::Pair(p) => Ok(p.borrow().0.clone()),
         _ => Err(EvalErrorKind::Type {
             expected: "pair".into(),
             got: format!("{current}"),
@@ -2347,10 +2459,10 @@ fn eval_list_tail(args: &[Value], span: &Span) -> Result<Value, EvalError> {
         .at(span));
     }
     let idx = require_integer(&args[1], span)? as usize;
-    let mut current = &args[0];
+    let mut current = args[0].clone();
     for _ in 0..idx {
-        match current {
-            Value::Pair(_, cdr) => current = cdr,
+        let next = match &current {
+            Value::Pair(p) => p.borrow().1.clone(),
             _ => {
                 return Err(EvalErrorKind::Type {
                     expected: "pair".into(),
@@ -2358,9 +2470,10 @@ fn eval_list_tail(args: &[Value], span: &Span) -> Result<Value, EvalError> {
                 }
                 .at(span))
             }
-        }
+        };
+        current = next;
     }
-    Ok(current.clone())
+    Ok(current)
 }
 
 fn eval_list_pred(args: &[Value], span: &Span) -> Result<Value, EvalError> {
@@ -2372,12 +2485,31 @@ fn eval_list_pred(args: &[Value], span: &Span) -> Result<Value, EvalError> {
         }
         .at(span));
     }
-    let mut current = &args[0];
+    // Tortoise-hare cycle detection
+    let mut slow = args[0].clone();
+    let mut fast = args[0].clone();
     loop {
-        match current {
+        // Advance fast by 2 steps
+        fast = match fast {
             Value::Nil => return Ok(Value::Boolean(true)),
-            Value::Pair(_, cdr) => current = cdr,
+            Value::Pair(p) => p.borrow().1.clone(),
             _ => return Ok(Value::Boolean(false)),
+        };
+        fast = match fast {
+            Value::Nil => return Ok(Value::Boolean(true)),
+            Value::Pair(p) => p.borrow().1.clone(),
+            _ => return Ok(Value::Boolean(false)),
+        };
+        // Advance slow by 1 step
+        slow = match slow {
+            Value::Pair(p) => p.borrow().1.clone(),
+            _ => return Ok(Value::Boolean(false)),
+        };
+        // Check if they point to the same pair (cycle)
+        if let (Value::Pair(sp), Value::Pair(fp)) = (&slow, &fast) {
+            if std::rc::Rc::ptr_eq(sp, fp) {
+                return Ok(Value::Boolean(false));
+            }
         }
     }
 }
@@ -2392,14 +2524,18 @@ fn eval_assoc(args: &[Value], span: &Span) -> Result<Value, EvalError> {
         .at(span));
     }
     let key = &args[0];
-    let mut alist = &args[1];
+    let mut alist = args[1].clone();
     loop {
-        match alist {
+        match &alist {
             Value::Nil => return Ok(Value::Boolean(false)),
-            Value::Pair(car, cdr) => {
-                if let Value::Pair(entry_key, _) = car.as_ref() {
-                    if entry_key.as_ref() == key {
-                        return Ok(*car.clone());
+            Value::Pair(p) => {
+                let pair = p.borrow();
+                let car = pair.0.clone();
+                let cdr = pair.1.clone();
+                drop(pair);
+                if let Value::Pair(entry_p) = &car {
+                    if entry_p.borrow().0 == *key {
+                        return Ok(car);
                     }
                 }
                 alist = cdr;
@@ -2430,6 +2566,8 @@ fn eval_eq(args: &[Value], span: &Span) -> Result<Value, EvalError> {
         (Value::Symbol(a), Value::Symbol(b)) => a == b,
         (Value::Char(a), Value::Char(b)) => a == b,
         (Value::Nil, Value::Nil) => true,
+        (Value::Pair(a), Value::Pair(b)) => std::rc::Rc::ptr_eq(a, b),
+        (Value::Vector(a), Value::Vector(b)) => std::rc::Rc::ptr_eq(a, b),
         _ => false,
     };
     Ok(Value::Boolean(result))
@@ -2484,7 +2622,7 @@ fn eval_map(
     }
     let mut result = Value::Nil;
     for val in result_vec.into_iter().rev() {
-        result = Value::Pair(Box::new(val), Box::new(result));
+        result = Value::pair(val, result);
     }
     Ok(result)
 }
@@ -2652,7 +2790,7 @@ fn eval_string_to_list(args: &[Value], span: &Span) -> Result<Value, EvalError> 
     let s = require_string(&args[0], span)?;
     let mut result = Value::Nil;
     for ch in s.chars().rev() {
-        result = Value::Pair(Box::new(Value::Char(ch)), Box::new(result));
+        result = Value::pair(Value::Char(ch), result);
     }
     Ok(result)
 }
@@ -2667,12 +2805,13 @@ fn eval_list_to_string(args: &[Value], span: &Span) -> Result<Value, EvalError> 
         .at(span));
     }
     let mut s = String::new();
-    let mut current = &args[0];
+    let mut current = args[0].clone();
     loop {
-        match current {
+        match &current {
             Value::Nil => break,
-            Value::Pair(car, cdr) => {
-                match car.as_ref() {
+            Value::Pair(p) => {
+                let pair = p.borrow();
+                match &pair.0 {
                     Value::Char(c) => s.push(*c),
                     other => {
                         return Err(EvalErrorKind::Type {
@@ -2682,7 +2821,9 @@ fn eval_list_to_string(args: &[Value], span: &Span) -> Result<Value, EvalError> 
                         .at(span))
                     }
                 }
-                current = cdr.as_ref();
+                let next = pair.1.clone();
+                drop(pair);
+                current = next;
             }
             other => {
                 return Err(EvalErrorKind::Type {
@@ -3108,7 +3249,7 @@ fn eval_vector_to_list(args: &[Value], span: &Span) -> Result<Value, EvalError> 
             let vec = v.borrow();
             let mut result = Value::Nil;
             for elem in vec.iter().rev() {
-                result = Value::Pair(Box::new(elem.clone()), Box::new(result));
+                result = Value::pair(elem.clone(), result);
             }
             Ok(result)
         }
@@ -3132,7 +3273,7 @@ fn eval_reverse(args: &[Value], span: &Span) -> Result<Value, EvalError> {
     let elems = value_list_to_vec(&args[0], span)?;
     let mut result = Value::Nil;
     for elem in elems {
-        result = Value::Pair(Box::new(elem), Box::new(result));
+        result = Value::pair(elem, result);
     }
     Ok(result)
 }
