@@ -159,6 +159,14 @@ function parse(tokens: Token[]): SchemeVal[] {
   function parseAtom(token: string, p: Pos): SchemeVal {
     if (token === '#t') return { tag: 'boolean', value: true, pos: p };
     if (token === '#f') return { tag: 'boolean', value: false, pos: p };
+    if (token.startsWith('#\\')) {
+      const charName = token.slice(2);
+      if (charName === 'space') return { tag: 'char', value: ' ', pos: p };
+      if (charName === 'newline') return { tag: 'char', value: '\n', pos: p };
+      if (charName === 'tab') return { tag: 'char', value: '\t', pos: p };
+      if (charName.length === 1) return { tag: 'char', value: charName, pos: p };
+      throw new EvalError(`${posStr(p)}: unknown character name: ${charName}`);
+    }
     if (token.startsWith('"') && token.endsWith('"')) {
       const inner = token.slice(1, -1)
         .replace(/\\n/g, '\n')
@@ -627,6 +635,21 @@ function makeGlobalEnv(): Env {
   defBuiltin('char?', args => {
     if (args.length !== 1) throw new EvalError('char?: expected 1 argument');
     return { tag: 'boolean', value: args[0].tag === 'char' };
+  });
+  defBuiltin('string-copy', args => {
+    if (args.length !== 1 || args[0].tag !== 'string') throw new EvalError('string-copy: expected string');
+    return { tag: 'string', value: args[0].value };
+  });
+  defBuiltin('string-set!', args => {
+    if (args.length !== 3) throw new EvalError('string-set!: expected 3 arguments');
+    if (args[0].tag !== 'string') throw new EvalError('string-set!: expected string');
+    if (args[1].tag !== 'number') throw new EvalError('string-set!: expected number');
+    if (args[2].tag !== 'char') throw new EvalError('string-set!: expected char');
+    const idx = args[1].value;
+    const str = args[0].value;
+    if (idx < 0 || idx >= str.length) throw new EvalError('string-set!: index out of range');
+    (args[0] as any).value = str.substring(0, idx) + args[2].value + str.substring(idx + 1);
+    return { tag: 'void' };
   });
 
   return env;
