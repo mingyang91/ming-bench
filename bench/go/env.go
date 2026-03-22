@@ -30,6 +30,19 @@ func (e *Env) Set(name string, val *Value) {
 	e.bindings[name] = val
 }
 
+// SetExisting mutates an existing binding, walking up the scope chain.
+// Returns false if the binding is not found in any scope.
+func (e *Env) SetExisting(name string, val *Value) bool {
+	if _, ok := e.bindings[name]; ok {
+		e.bindings[name] = val
+		return true
+	}
+	if e.parent != nil {
+		return e.parent.SetExisting(name, val)
+	}
+	return false
+}
+
 // Output returns the shared output buffer, walking up to root.
 func (e *Env) Output() *strings.Builder {
 	if e.output != nil {

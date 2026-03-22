@@ -73,6 +73,22 @@ func evalListTCO(expr *Expr, env *Env) (*Expr, *Env, *Value, error, bool) {
 		case "define":
 			v, err := evalDefine(expr, env)
 			return nil, nil, v, err, false
+		case "set!":
+			if len(expr.List) != 3 {
+				return nil, nil, nil, errAt(expr, "set!: expected 2 arguments"), false
+			}
+			sym := expr.List[1]
+			if sym.Type != ExprSymbol {
+				return nil, nil, nil, errAt(sym, "set!: first argument must be a symbol"), false
+			}
+			val, err := Eval(expr.List[2], env)
+			if err != nil {
+				return nil, nil, nil, err, false
+			}
+			if !env.SetExisting(sym.StrVal, val) {
+				return nil, nil, nil, errAtf(expr, "set!: unbound variable '%s'", sym.StrVal), false
+			}
+			return nil, nil, Void, nil, false
 		case "if":
 			e, ev, v, err := evalIfTCO(expr, env)
 			if err != nil {
