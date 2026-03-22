@@ -1,2 +1,2 @@
-(define h (case-lambda (() 0) ((x) x)))
-(eq? (procedure-name h) 'h)
+(define h (case-lambda ((x) x) ((x y) (+ x y))))
+(procedure-name h)

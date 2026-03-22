@@ -67,6 +67,8 @@ type Value struct {
 	CaseClauses []*Value
 	// Environment reference (for internal use)
 	EnvRef *Env
+	// Procedure name (set by define; empty if anonymous)
+	ProcName string
 	// Native Go function (when set on TypeLambda, called instead of Body)
 	GoFunc func([]*Value) (*Value, error)
 }

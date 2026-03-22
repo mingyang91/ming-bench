@@ -476,6 +476,19 @@ func applyBuiltin(name string, args []*Value, expr *Expr, env *Env) (*Value, err
 			return nil, errAtf(expr, "procedure?: expected 1 argument, got %d", len(args))
 		}
 		return BooleanValue(args[0].Type == TypeLambda), nil
+	case "procedure-name":
+		if len(args) != 1 {
+			return nil, errAtf(expr, "procedure-name: expected 1 argument, got %d", len(args))
+		}
+		a := args[0]
+		switch {
+		case a.Type == TypeLambda && a.ProcName != "":
+			return SymbolValue(a.ProcName), nil
+		case a.Type == TypeSymbol && len(a.StrVal) > 10 && a.StrVal[:10] == "__builtin:":
+			return SymbolValue(a.StrVal[10:]), nil
+		default:
+			return False, nil
+		}
 	case "display":
 		if len(args) != 1 {
 			return nil, errAtf(expr, "display: expected 1 argument, got %d", len(args))
@@ -1591,6 +1604,10 @@ func evalDefine(expr *Expr, env *Env) (*Value, error) {
 		if err != nil {
 			return nil, err
 		}
+		// Propagate name to lambda/case-lambda if anonymous
+		if val.Type == TypeLambda && val.ProcName == "" {
+			val.ProcName = target.StrVal
+		}
 		env.Set(target.StrVal, val)
 		return Void, nil
 	}
@@ -1608,6 +1625,7 @@ func evalDefine(expr *Expr, env *Env) (*Value, error) {
 			RestParam: restParam,
 			Body:      expr.List[2:],
 			Closure:   env,
+			ProcName:  name,
 		}
 		env.Set(name, lambda)
 		return Void, nil
@@ -2272,7 +2290,8 @@ func makeDefaultEnv() *Env {
 		"integer?", "rational?", "exact?", "inexact?",
 		"exact->inexact", "inexact->exact",
 		"numerator", "denominator",
-		"syntax->datum", "datum->syntax"}
+		"syntax->datum", "datum->syntax",
+		"procedure-name"}
 	for _, name := range builtins {
 		env.Set(name, &Value{Type: TypeSymbol, StrVal: fmt.Sprintf("__builtin:%s", name)})
 	}
