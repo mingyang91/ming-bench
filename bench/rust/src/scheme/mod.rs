@@ -1,19 +1,22 @@
 mod builtins;
 pub mod error;
+mod parser;
 
 pub use error::EvalError;
 
 use builtins::{
-    builtin_add, builtin_and, builtin_cmp, builtin_div, builtin_mul, builtin_not, builtin_or,
-    builtin_sub,
+    builtin_add, builtin_and, builtin_append, builtin_car, builtin_cdr, builtin_cmp,
+    builtin_cons, builtin_div, builtin_length, builtin_list, builtin_mul, builtin_not,
+    builtin_null, builtin_or, builtin_sub, builtin_type_pred,
 };
+use parser::parse_all;
 use std::collections::HashMap;
 
 type Env = HashMap<String, Value>;
 
 /// A Scheme value.
 #[derive(Debug, Clone)]
-enum Value {
+pub(crate) enum Value {
     Integer(i64),
     Boolean(bool),
     Str(String),
@@ -66,170 +69,6 @@ impl Value {
             Value::Lambda { .. } => "#<procedure>".to_string(),
         }
     }
-}
-
-// --- Tokenizer ---
-
-#[derive(Debug, Clone, PartialEq)]
-enum Token {
-    LParen,
-    RParen,
-    Quote,
-    Symbol(String),
-    Integer(i64),
-    Boolean(bool),
-    Str(String),
-}
-
-fn tokenize(input: &str) -> Result<Vec<Token>, EvalError> {
-    let mut tokens = Vec::new();
-    let chars: Vec<char> = input.chars().collect();
-    let mut i = 0;
-
-    while i < chars.len() {
-        match chars[i] {
-            ' ' | '\t' | '\n' | '\r' => i += 1,
-            ';' => {
-                while i < chars.len() && chars[i] != '\n' {
-                    i += 1;
-                }
-            }
-            '(' => {
-                tokens.push(Token::LParen);
-                i += 1;
-            }
-            ')' => {
-                tokens.push(Token::RParen);
-                i += 1;
-            }
-            '\'' => {
-                tokens.push(Token::Quote);
-                i += 1;
-            }
-            '"' => {
-                i += 1;
-                let mut s = String::new();
-                while i < chars.len() && chars[i] != '"' {
-                    if chars[i] == '\\' && i + 1 < chars.len() {
-                        i += 1;
-                        match chars[i] {
-                            'n' => s.push('\n'),
-                            't' => s.push('\t'),
-                            '\\' => s.push('\\'),
-                            '"' => s.push('"'),
-                            c => {
-                                s.push('\\');
-                                s.push(c);
-                            }
-                        }
-                    } else {
-                        s.push(chars[i]);
-                    }
-                    i += 1;
-                }
-                if i >= chars.len() {
-                    return Err(EvalError::Parse {
-                        message: "unterminated string".to_string(),
-                    });
-                }
-                i += 1; // closing quote
-                tokens.push(Token::Str(s));
-            }
-            '#' => {
-                if i + 1 < chars.len() {
-                    match chars[i + 1] {
-                        't' => {
-                            tokens.push(Token::Boolean(true));
-                            i += 2;
-                        }
-                        'f' => {
-                            tokens.push(Token::Boolean(false));
-                            i += 2;
-                        }
-                        _ => {
-                            return Err(EvalError::Parse {
-                                message: format!("unexpected character after #: {}", chars[i + 1]),
-                            });
-                        }
-                    }
-                } else {
-                    return Err(EvalError::Parse {
-                        message: "unexpected end after #".to_string(),
-                    });
-                }
-            }
-            _ => {
-                // Symbol or number
-                let start = i;
-                while i < chars.len()
-                    && !matches!(chars[i], ' ' | '\t' | '\n' | '\r' | '(' | ')' | '"' | ';')
-                {
-                    i += 1;
-                }
-                let word: String = chars[start..i].iter().collect();
-                if let Ok(n) = word.parse::<i64>() {
-                    tokens.push(Token::Integer(n));
-                } else {
-                    tokens.push(Token::Symbol(word));
-                }
-            }
-        }
-    }
-
-    Ok(tokens)
-}
-
-// --- Parser ---
-
-fn parse(tokens: &[Token], pos: usize) -> Result<(Value, usize), EvalError> {
-    if pos >= tokens.len() {
-        return Err(EvalError::Parse {
-            message: "unexpected end of input".to_string(),
-        });
-    }
-
-    match &tokens[pos] {
-        Token::Integer(n) => Ok((Value::Integer(*n), pos + 1)),
-        Token::Boolean(b) => Ok((Value::Boolean(*b), pos + 1)),
-        Token::Str(s) => Ok((Value::Str(s.clone()), pos + 1)),
-        Token::Symbol(s) => Ok((Value::Symbol(s.clone()), pos + 1)),
-        Token::LParen => {
-            let mut items = Vec::new();
-            let mut i = pos + 1;
-            loop {
-                if i >= tokens.len() {
-                    return Err(EvalError::Parse {
-                        message: "unclosed parenthesis".to_string(),
-                    });
-                }
-                if tokens[i] == Token::RParen {
-                    return Ok((Value::List(items), i + 1));
-                }
-                let (val, next) = parse(tokens, i)?;
-                items.push(val);
-                i = next;
-            }
-        }
-        Token::Quote => {
-            let (val, next) = parse(tokens, pos + 1)?;
-            Ok((Value::List(vec![Value::Symbol("quote".to_string()), val]), next))
-        }
-        Token::RParen => Err(EvalError::Parse {
-            message: "unexpected )".to_string(),
-        }),
-    }
-}
-
-fn parse_all(input: &str) -> Result<Vec<Value>, EvalError> {
-    let tokens = tokenize(input)?;
-    let mut exprs = Vec::new();
-    let mut pos = 0;
-    while pos < tokens.len() {
-        let (expr, next) = parse(&tokens, pos)?;
-        exprs.push(expr);
-        pos = next;
-    }
-    Ok(exprs)
 }
 
 // --- Evaluator ---
@@ -371,6 +210,25 @@ fn eval(expr: &Value, env: &mut Env) -> Result<Value, EvalError> {
                     "not" => return builtin_not(&items[1..], env),
                     "and" => return builtin_and(&items[1..], env),
                     "or" => return builtin_or(&items[1..], env),
+                    "cons" => return builtin_cons(&items[1..], env),
+                    "car" => return builtin_car(&items[1..], env),
+                    "cdr" => return builtin_cdr(&items[1..], env),
+                    "null?" => return builtin_null(&items[1..], env),
+                    "list" => return builtin_list(&items[1..], env),
+                    "length" => return builtin_length(&items[1..], env),
+                    "append" => return builtin_append(&items[1..], env),
+                    "string?" | "number?" | "boolean?" | "pair?" | "symbol?" => {
+                        return builtin_type_pred(&items[1..], env, op.as_str());
+                    }
+                    "let" => return eval_let(&items[1..], env),
+                    "begin" => {
+                        let mut result = Value::Boolean(false);
+                        for expr in &items[1..] {
+                            result = eval(expr, env)?;
+                        }
+                        return Ok(result);
+                    }
+                    "cond" => return eval_cond(&items[1..], env),
                     _ => {}
                 }
             }
@@ -381,6 +239,140 @@ fn eval(expr: &Value, env: &mut Env) -> Result<Value, EvalError> {
             apply_function(&func, &args)
         }
     }
+}
+
+fn eval_let(args: &[Value], env: &mut Env) -> Result<Value, EvalError> {
+    if args.is_empty() {
+        return Err(EvalError::Parse {
+            message: "let: missing bindings".to_string(),
+        });
+    }
+
+    // Named let: (let name ((var init) ...) body ...)
+    if let Value::Symbol(name) = &args[0] {
+        if args.len() < 3 {
+            return Err(EvalError::Parse {
+                message: "named let: missing bindings or body".to_string(),
+            });
+        }
+        let bindings = match &args[1] {
+            Value::List(b) => b,
+            other => return Err(EvalError::TypeError {
+                message: format!("named let: expected bindings list, got {}", other.type_name()),
+            }),
+        };
+        let mut params = Vec::new();
+        let mut init_vals = Vec::new();
+        for binding in bindings {
+            match binding {
+                Value::List(pair) if pair.len() == 2 => {
+                    match &pair[0] {
+                        Value::Symbol(s) => params.push(s.clone()),
+                        other => return Err(EvalError::TypeError {
+                            message: format!("let: expected symbol, got {}", other.type_name()),
+                        }),
+                    }
+                    init_vals.push(eval(&pair[1], env)?);
+                }
+                other => return Err(EvalError::Parse {
+                    message: format!("let: bad binding: {}", other.display()),
+                }),
+            }
+        }
+        let body: Vec<Value> = args[2..].to_vec();
+        let lambda = Value::Lambda {
+            name: Some(name.clone()),
+            params,
+            body,
+            closure_env: env.clone(),
+        };
+        let mut local_env = env.clone();
+        local_env.insert(name.clone(), lambda.clone());
+        // Apply the named lambda with initial values
+        match &lambda {
+            Value::Lambda { params, body, .. } => {
+                for (param, val) in params.iter().zip(init_vals.iter()) {
+                    local_env.insert(param.clone(), val.clone());
+                }
+                let mut result = Value::Boolean(false);
+                for expr in body {
+                    result = eval(expr, &mut local_env)?;
+                }
+                Ok(result)
+            }
+            _ => unreachable!(),
+        }
+    } else {
+        // Regular let: (let ((var init) ...) body ...)
+        let bindings = match &args[0] {
+            Value::List(b) => b,
+            other => return Err(EvalError::TypeError {
+                message: format!("let: expected bindings list, got {}", other.type_name()),
+            }),
+        };
+        if args.len() < 2 {
+            return Err(EvalError::Parse {
+                message: "let: missing body".to_string(),
+            });
+        }
+        let mut local_env = env.clone();
+        for binding in bindings {
+            match binding {
+                Value::List(pair) if pair.len() == 2 => {
+                    let name = match &pair[0] {
+                        Value::Symbol(s) => s.clone(),
+                        other => return Err(EvalError::TypeError {
+                            message: format!("let: expected symbol, got {}", other.type_name()),
+                        }),
+                    };
+                    let val = eval(&pair[1], env)?;
+                    local_env.insert(name, val);
+                }
+                other => return Err(EvalError::Parse {
+                    message: format!("let: bad binding: {}", other.display()),
+                }),
+            }
+        }
+        let mut result = Value::Boolean(false);
+        for expr in &args[1..] {
+            result = eval(expr, &mut local_env)?;
+        }
+        Ok(result)
+    }
+}
+
+fn eval_cond(clauses: &[Value], env: &mut Env) -> Result<Value, EvalError> {
+    for clause in clauses {
+        match clause {
+            Value::List(items) if !items.is_empty() => {
+                // Check for else clause
+                if let Value::Symbol(s) = &items[0] {
+                    if s == "else" {
+                        let mut result = Value::Boolean(false);
+                        for expr in &items[1..] {
+                            result = eval(expr, env)?;
+                        }
+                        return Ok(result);
+                    }
+                }
+                let test = eval(&items[0], env)?;
+                if test.is_truthy() {
+                    if items.len() == 1 {
+                        return Ok(test);
+                    }
+                    let mut result = Value::Boolean(false);
+                    for expr in &items[1..] {
+                        result = eval(expr, env)?;
+                    }
+                    return Ok(result);
+                }
+            }
+            other => return Err(EvalError::Parse {
+                message: format!("cond: bad clause: {}", other.display()),
+            }),
+        }
+    }
+    Ok(Value::Boolean(false))
 }
 
 fn apply_function(func: &Value, args: &[Value]) -> Result<Value, EvalError> {
@@ -401,8 +393,40 @@ fn apply_function(func: &Value, args: &[Value]) -> Result<Value, EvalError> {
             for (param, arg) in params.iter().zip(args.iter()) {
                 local_env.insert(param.clone(), arg.clone());
             }
+            // Scan for internal defines and pre-bind them so they're mutually visible
+            let mut internal_defs = Vec::new();
+            let mut body_start = 0;
+            for (i, expr) in body.iter().enumerate() {
+                if let Value::List(items) = expr {
+                    if let Some(Value::Symbol(s)) = items.first() {
+                        if s == "define" {
+                            internal_defs.push(i);
+                            body_start = i + 1;
+                            continue;
+                        }
+                    }
+                }
+                break;
+            }
+
+            if !internal_defs.is_empty() {
+                // First pass: evaluate all internal defines
+                for &idx in &internal_defs {
+                    eval(&body[idx], &mut local_env)?;
+                }
+                // Patch closures of all defined lambdas to see each other
+                let snapshot = local_env.clone();
+                for val in local_env.values_mut() {
+                    if let Value::Lambda { closure_env, .. } = val {
+                        for (k, v) in &snapshot {
+                            closure_env.entry(k.clone()).or_insert_with(|| v.clone());
+                        }
+                    }
+                }
+            }
+
             let mut result = Value::Boolean(false);
-            for expr in body {
+            for expr in &body[body_start..] {
                 result = eval(expr, &mut local_env)?;
             }
             Ok(result)
