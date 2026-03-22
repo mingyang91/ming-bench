@@ -27,6 +27,7 @@ pub enum Value {
         rules: Vec<(Value, Value)>,
         def_env: Rc<RefCell<Env>>,
     },
+    Pair(Box<Value>, Box<Value>),
     Void,
 }
 
@@ -39,6 +40,7 @@ impl PartialEq for Value {
             (Value::Symbol(a), Value::Symbol(b)) => a == b,
             (Value::Char(a), Value::Char(b)) => a == b,
             (Value::List(a), Value::List(b)) => a == b,
+            (Value::Pair(a1, a2), Value::Pair(b1, b2)) => a1 == b1 && a2 == b2,
             (Value::Continuation { id: a }, Value::Continuation { id: b }) => a == b,
             (Value::Void, Value::Void) => true,
             _ => false,
@@ -65,6 +67,7 @@ impl fmt::Display for Value {
                 }
                 write!(f, ")")
             }
+            Value::Pair(car, cdr) => write!(f, "({car} . {cdr})"),
             Value::Continuation { .. } => write!(f, "#<continuation>"),
             Value::Lambda { .. } => write!(f, "#<procedure>"),
             Value::SyntaxRules { .. } => write!(f, "#<syntax>"),
@@ -92,6 +95,13 @@ impl Value {
                     }
                     item.display_fmt(out);
                 }
+                out.push(')');
+            }
+            Value::Pair(car, cdr) => {
+                out.push('(');
+                car.display_fmt(out);
+                out.push_str(" . ");
+                cdr.display_fmt(out);
                 out.push(')');
             }
             Value::Continuation { .. } => out.push_str("#<continuation>"),
