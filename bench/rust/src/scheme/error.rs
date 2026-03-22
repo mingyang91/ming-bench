@@ -32,6 +32,9 @@ pub enum EvalErrorKind {
 
     #[error("continuation return")]
     ContinuationReturn { id: u64 },
+
+    #[error("scheme raise: {value}")]
+    SchemeRaise { value: crate::scheme::value::Value },
 }
 
 impl PartialEq for EvalErrorKind {
@@ -72,6 +75,10 @@ impl PartialEq for EvalErrorKind {
             (
                 EvalErrorKind::ContinuationReturn { id: a },
                 EvalErrorKind::ContinuationReturn { id: b },
+            ) => a == b,
+            (
+                EvalErrorKind::SchemeRaise { value: a },
+                EvalErrorKind::SchemeRaise { value: b },
             ) => a == b,
             _ => false,
         }

@@ -135,6 +135,18 @@ fn eval_list_step(
                 let v = eval_dynamic_wind(&elements[1..], kw_span, env, output, ctx)?;
                 return Ok(TcoAction::Result(v));
             }
+            "raise" => {
+                let v = eval_raise(&elements[1..], kw_span, env, output, ctx)?;
+                return Ok(TcoAction::Result(v));
+            }
+            "guard" => {
+                let v = eval_guard(&elements[1..], kw_span, env, output, ctx)?;
+                return Ok(TcoAction::Result(v));
+            }
+            "with-exception-handler" => {
+                let v = eval_with_exception_handler(&elements[1..], kw_span, env, output, ctx)?;
+                return Ok(TcoAction::Result(v));
+            }
             _ => {}
         }
     }
@@ -511,11 +523,180 @@ fn eval_dynamic_wind(
             Ok(body_val)
         }
         Err(e) => {
-            if matches!(&e.kind, EvalErrorKind::ContinuationReturn { .. }) {
+            if matches!(&e.kind, EvalErrorKind::ContinuationReturn { .. } | EvalErrorKind::SchemeRaise { .. }) {
                 // Non-local exit: run out-thunk before re-throwing
                 apply_func(&out_thunk, &[], span, output, ctx)?;
             }
             Err(e)
+        }
+    }
+}
+
+// ===== raise, guard, with-exception-handler =====
+
+fn eval_raise(
+    args: &[Expr],
+    span: &Span,
+    env: &Env,
+    output: &mut String,
+    ctx: &mut ContCtx,
+) -> Result<Value, EvalError> {
+    if args.len() != 1 {
+        return Err(EvalErrorKind::Arity {
+            name: "raise".into(),
+            expected: "1".into(),
+            got: args.len(),
+        }
+        .at(span));
+    }
+    let value = eval(&args[0], env, output, ctx)?;
+    Err(EvalErrorKind::SchemeRaise { value }.at(span))
+}
+
+fn eval_guard(
+    args: &[Expr],
+    span: &Span,
+    env: &Env,
+    output: &mut String,
+    ctx: &mut ContCtx,
+) -> Result<Value, EvalError> {
+    // (guard (var clause ...) body ...)
+    // clause = (test expr ...) | (else expr ...)
+    if args.is_empty() {
+        return Err(EvalErrorKind::Parse {
+            message: "guard requires at least a clause list".into(),
+        }
+        .at(span));
+    }
+    let clauses_expr = &args[0];
+    let body = &args[1..];
+
+    let clause_elements = match &clauses_expr.kind {
+        ExprKind::List(elems) => elems,
+        _ => {
+            return Err(EvalErrorKind::Parse {
+                message: "guard clauses must be a list".into(),
+            }
+            .at(span));
+        }
+    };
+
+    if clause_elements.is_empty() {
+        return Err(EvalErrorKind::Parse {
+            message: "guard requires a variable name".into(),
+        }
+        .at(span));
+    }
+
+    let var_name = match &clause_elements[0].kind {
+        ExprKind::Symbol(name) => name.clone(),
+        _ => {
+            return Err(EvalErrorKind::Parse {
+                message: "guard variable must be a symbol".into(),
+            }
+            .at(span));
+        }
+    };
+
+    let clauses = &clause_elements[1..];
+
+    // Evaluate body, catching SchemeRaise
+    let body_result = eval_body_sequence(body, env, output, ctx);
+
+    match body_result {
+        Ok(val) => Ok(val),
+        Err(e) => {
+            if let EvalErrorKind::SchemeRaise { value } = e.kind {
+                // Bind the exception value to the variable
+                let guard_env = Env::with_parent(env);
+                guard_env.define(var_name, value.clone());
+
+                // Evaluate clauses like cond
+                for clause in clauses {
+                    let clause_elems = match &clause.kind {
+                        ExprKind::List(elems) => elems,
+                        _ => {
+                            return Err(EvalErrorKind::Parse {
+                                message: "guard clause must be a list".into(),
+                            }
+                            .at(span));
+                        }
+                    };
+
+                    if clause_elems.is_empty() {
+                        continue;
+                    }
+
+                    // Check for else clause
+                    let is_else = matches!(&clause_elems[0].kind, ExprKind::Symbol(s) if s == "else");
+                    if is_else {
+                        return eval_body_sequence(&clause_elems[1..], &guard_env, output, ctx);
+                    }
+
+                    // Evaluate test
+                    let test_val = eval(&clause_elems[0], &guard_env, output, ctx)?;
+                    if test_val.is_truthy() {
+                        // Evaluate handler expressions
+                        if clause_elems.len() == 1 {
+                            return Ok(test_val);
+                        }
+                        let mut result = Value::Nil;
+                        for expr in &clause_elems[1..] {
+                            result = eval(expr, &guard_env, output, ctx)?;
+                        }
+                        return Ok(result);
+                    }
+                }
+
+                // No clause matched, re-raise
+                Err(EvalErrorKind::SchemeRaise { value }.at(span))
+            } else {
+                Err(e)
+            }
+        }
+    }
+}
+
+fn eval_body_sequence(
+    exprs: &[Expr],
+    env: &Env,
+    output: &mut String,
+    ctx: &mut ContCtx,
+) -> Result<Value, EvalError> {
+    let mut result = Value::Nil;
+    for expr in exprs {
+        result = eval(expr, env, output, ctx)?;
+    }
+    Ok(result)
+}
+
+fn eval_with_exception_handler(
+    args: &[Expr],
+    span: &Span,
+    env: &Env,
+    output: &mut String,
+    ctx: &mut ContCtx,
+) -> Result<Value, EvalError> {
+    if args.len() != 2 {
+        return Err(EvalErrorKind::Arity {
+            name: "with-exception-handler".into(),
+            expected: "2".into(),
+            got: args.len(),
+        }
+        .at(span));
+    }
+    let handler = eval(&args[0], env, output, ctx)?;
+    let thunk = eval(&args[1], env, output, ctx)?;
+
+    // Run the thunk, catch SchemeRaise
+    match apply_func(&thunk, &[], span, output, ctx) {
+        Ok(val) => Ok(val),
+        Err(e) => {
+            if let EvalErrorKind::SchemeRaise { value } = e.kind {
+                apply_func(&handler, &[value], span, output, ctx)
+            } else {
+                Err(e)
+            }
         }
     }
 }
