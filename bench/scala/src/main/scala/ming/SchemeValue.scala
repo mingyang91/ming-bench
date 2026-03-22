@@ -79,3 +79,17 @@ object SchemeValue:
 
   case object SchemeVoid extends SchemeValue:
     def display: String = "#<void>"
+
+  case class SchemeMacro(
+    literals: List[String],
+    rules: List[(SchemeValue, SchemeValue)],
+    defEnv: Env
+  ) extends SchemeValue:
+    def display: String = "#<macro>"
+
+  class SchemeResolvedSymbol(
+    val name: String,
+    val resolveEnv: Env,
+    override val pos: SourcePos = SourcePos.None
+  ) extends SchemeValue:
+    def display: String = name

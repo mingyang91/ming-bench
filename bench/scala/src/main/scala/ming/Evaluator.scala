@@ -65,6 +65,11 @@ object Evaluator:
           if isKnownName(name) then SchemeBuiltinProc(name)
           else throw new EvalError(s"unbound variable: $name", expr.pos)
       ReturnS(v, k, out)
+    case rs: SchemeResolvedSymbol =>
+      val v = rs.resolveEnv.get(rs.name) match
+        case Some(v) => v
+        case None    => throw new EvalError(s"unbound variable: ${rs.name}")
+      ReturnS(v, k, out)
     case SchemeList(Nil) =>
       throw new EvalError("empty application", expr.pos)
     case SchemeList(SchemeSymbol(op) :: args) if isSpecialForm(op) =>
@@ -73,10 +78,14 @@ object Evaluator:
         case e: EvalError if e.sourcePos == SourcePos.None =>
           throw new EvalError(e.baseMessage, expr.pos)
     case SchemeList(head :: args) =>
-      try EvalS(head, env, Kont.EvalOp(args, env, k, expr.pos), out)
-      catch
-        case e: EvalError if e.sourcePos == SourcePos.None =>
-          throw new EvalError(e.baseMessage, expr.pos)
+      lookupMacro(head, env) match
+        case Some(m) =>
+          EvalS(Macros.expand(m, head :: args), env, k, out)
+        case None =>
+          try EvalS(head, env, Kont.EvalOp(args, env, k, expr.pos), out)
+          catch
+            case e: EvalError if e.sourcePos == SourcePos.None =>
+              throw new EvalError(e.baseMessage, expr.pos)
     case _ =>
       ReturnS(expr, k, out)
 
@@ -84,7 +93,7 @@ object Evaluator:
 
   private def isSpecialForm(op: String): Boolean = op match
     case "define" | "if" | "quote" | "lambda" | "and" | "or" | "not" | "let" | "begin" | "cond" | "set!" | "call/cc" |
-        "call-with-current-continuation" =>
+        "call-with-current-continuation" | "define-syntax" =>
       true
     case _ => false
 
@@ -101,3 +110,11 @@ object Evaluator:
   private[ming] def updateSeqEnv(k: Kont, env: Env): Kont = k match
     case Kont.Seq(remaining, _, nextK) => Kont.Seq(remaining, env, nextK)
     case other                         => other
+
+  private def lookupMacro(head: SchemeValue, env: Env): Option[SchemeMacro] =
+    head match
+      case SchemeSymbol(name) =>
+        env.get(name) match
+          case Some(m: SchemeMacro) => Some(m)
+          case _                    => None
+      case _ => None
