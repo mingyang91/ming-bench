@@ -37,8 +37,10 @@ object StringCharBuiltins:
   def evalNumberToString(args: List[SchemeValue]): SchemeValue =
     if args.length != 1 then throw new EvalError("number->string: expected 1 argument")
     args.head match
-      case SchemeInt(n) => SchemeString(n.toString)
-      case other        => throw new EvalError(s"number->string: not a number: ${other.display}")
+      case SchemeInt(n)         => SchemeString(n.toString)
+      case SchemeRational(n, d) => SchemeString(s"$n/$d")
+      case SchemeFloat(f)       => SchemeString(f.toString)
+      case other                => throw new EvalError(s"number->string: not a number: ${other.display}")
 
   def evalSymbolToString(args: List[SchemeValue]): SchemeValue =
     if args.length != 1 then throw new EvalError("symbol->string: expected 1 argument")

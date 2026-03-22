@@ -122,6 +122,15 @@ object SchemeValue:
     def display: String                = s"#(${elements.map(_.display).mkString(" ")})"
     override def displayOutput: String = s"#(${elements.map(_.displayOutput).mkString(" ")})"
 
+  case class SchemeRational(num: Long, den: Long) extends SchemeValue:
+    def display: String = s"$num/$den"
+
+  case class SchemeFloat(value: Double) extends SchemeValue:
+
+    def display: String =
+      val s = value.toString
+      if s.endsWith(".0") && !s.contains("E") then s else s
+
   case class SchemeMultipleValues(values: List[SchemeValue]) extends SchemeValue:
     def display: String = values.map(_.display).mkString(", ")
 

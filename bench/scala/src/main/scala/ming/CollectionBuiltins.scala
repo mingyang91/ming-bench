@@ -157,8 +157,10 @@ private[ming] object CollectionBuiltins:
   def evalTruncate(args: List[SchemeValue]): SchemeValue =
     if args.length != 1 then throw new EvalError("truncate: expected 1 argument")
     args.head match
-      case n: SchemeInt => n
-      case other        => throw new EvalError(s"truncate: not a number: ${other.display}")
+      case n: SchemeInt         => n
+      case SchemeFloat(f)       => SchemeFloat(f.toLong.toDouble)
+      case SchemeRational(n, d) => SchemeInt(n / d)
+      case other                => throw new EvalError(s"truncate: not a number: ${other.display}")
 
   def evalProcedureQ(args: List[SchemeValue]): SchemeValue =
     if args.length != 1 then throw new EvalError("procedure?: expected 1 argument")
@@ -184,19 +186,23 @@ private[ming] object CollectionBuiltins:
   // --- Equality helpers ---
 
   def schemeEq(a: SchemeValue, b: SchemeValue): Boolean = (a, b) match
-    case (SchemeInt(x), SchemeInt(y))       => x == y
-    case (SchemeBool(x), SchemeBool(y))     => x == y
-    case (SchemeSymbol(x), SchemeSymbol(y)) => x == y
-    case (SchemeChar(x), SchemeChar(y))     => x == y
-    case (SchemeList(Nil), SchemeList(Nil)) => true
-    case _                                  => a eq b
+    case (SchemeInt(x), SchemeInt(y))                     => x == y
+    case (SchemeRational(n1, d1), SchemeRational(n2, d2)) => n1 == n2 && d1 == d2
+    case (SchemeFloat(x), SchemeFloat(y))                 => x == y
+    case (SchemeBool(x), SchemeBool(y))                   => x == y
+    case (SchemeSymbol(x), SchemeSymbol(y))               => x == y
+    case (SchemeChar(x), SchemeChar(y))                   => x == y
+    case (SchemeList(Nil), SchemeList(Nil))               => true
+    case _                                                => a eq b
 
   def schemeEqual(a: SchemeValue, b: SchemeValue): Boolean = (a, b) match
-    case (SchemeInt(x), SchemeInt(y))       => x == y
-    case (SchemeBool(x), SchemeBool(y))     => x == y
-    case (SchemeSymbol(x), SchemeSymbol(y)) => x == y
-    case (SchemeChar(x), SchemeChar(y))     => x == y
-    case (SchemeString(x), SchemeString(y)) => x == y
+    case (SchemeInt(x), SchemeInt(y))                     => x == y
+    case (SchemeRational(n1, d1), SchemeRational(n2, d2)) => n1 == n2 && d1 == d2
+    case (SchemeFloat(x), SchemeFloat(y))                 => x == y
+    case (SchemeBool(x), SchemeBool(y))                   => x == y
+    case (SchemeSymbol(x), SchemeSymbol(y))               => x == y
+    case (SchemeChar(x), SchemeChar(y))                   => x == y
+    case (SchemeString(x), SchemeString(y))               => x == y
     case (v1: SchemeVector, v2: SchemeVector) =>
       v1.elements.length == v2.elements.length &&
       v1.elements.zip(v2.elements).forall(schemeEqual(_, _))

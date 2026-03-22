@@ -111,10 +111,29 @@ object Parser:
     else if token == "#f" then SchemeBool(false)
     else if token.startsWith("\"") then SchemeString(token.drop(1).dropRight(1))
     else if token.startsWith("#\\") then parseCharLiteral(token)
+    else parseNumericOrSymbol(token, pos)
+
+  private def parseNumericOrSymbol(token: String, pos: SourcePos): SchemeValue =
+    token.toLongOption match
+      case Some(n) => SchemeInt(n)
+      case None    => parseFloatOrSymbol(token, pos)
+
+  private def parseFloatOrSymbol(token: String, pos: SourcePos): SchemeValue =
+    token.toDoubleOption match
+      case Some(d) if token.exists(c => c == '.' || c == 'e' || c == 'E') =>
+        SchemeFloat(d)
+      case _ =>
+        parseRational(token).getOrElse(SchemeSymbol(token, pos))
+
+  private def parseRational(token: String): Option[SchemeValue] =
+    val idx = token.indexOf('/')
+    if idx <= 0 || idx == token.length - 1 then None
     else
-      token.toLongOption match
-        case Some(n) => SchemeInt(n)
-        case None    => SchemeSymbol(token, pos)
+      val numStr = token.substring(0, idx)
+      val denStr = token.substring(idx + 1)
+      (numStr.toLongOption, denStr.toLongOption) match
+        case (Some(n), Some(d)) if d != 0 => Some(NumericBuiltins.makeRational(n, d))
+        case _                            => None
 
   private def parseCharLiteral(token: String): SchemeValue =
     val name = token.drop(2)
