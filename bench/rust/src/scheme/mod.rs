@@ -59,6 +59,10 @@ enum Value {
     },
     Syntax(Box<Expr>),
     MacroTransformer(Box<Value>),
+    CaseLambda {
+        clauses: Vec<(Vec<String>, Option<String>, Vec<Expr>)>, // (params, rest_param, body)
+        env: Env,
+    },
 }
 
 fn gcd(mut a: i64, mut b: i64) -> i64 {
@@ -232,7 +236,7 @@ impl Value {
                     format!("({})", parts.join(" "))
                 }
             }
-            Value::Lambda { .. } => "#<procedure>".into(),
+            Value::Lambda { .. } | Value::CaseLambda { .. } => "#<procedure>".into(),
             Value::Builtin(name) => format!("#<procedure:{}>", name),
             Value::Continuation { .. } => "#<continuation>".into(),
             Value::SyntaxRules { .. } => "#<syntax>".into(),
@@ -584,6 +588,7 @@ fn eval(expr: &Expr, env: &Env, out: &Output) -> Result<Value, EvalError> {
                             return Ok(expr_to_value(&items[1]));
                         }
                         "lambda" => return eval_lambda(&items[1..], &cur_env, span),
+                        "case-lambda" => return eval_case_lambda(&items[1..], &cur_env, span),
                         "let" => {
                             let args = &items[1..];
                             if args.len() < 2 {
@@ -1009,6 +1014,16 @@ fn eval(expr: &Expr, env: &Env, out: &Output) -> Result<Value, EvalError> {
                         cur_env = local_env;
                         continue;
                     }
+                    Value::CaseLambda { ref clauses, ref env } => {
+                        let (params, rest_param, body) = dispatch_case_lambda(clauses, args.len(), span)?;
+                        let local_env = apply_lambda(params, rest_param, body, env, &args, span)?;
+                        for expr in &body[..body.len() - 1] {
+                            eval(expr, &local_env, out)?;
+                        }
+                        cur_expr = body.last().unwrap().clone();
+                        cur_env = local_env;
+                        continue;
+                    }
                     Value::Builtin(ref name) if name == "call/cc" || name == "call-with-current-continuation" => {
                         if args.len() != 1 {
                             return Err(EvalError::Arity(span.fmt("call/cc requires 1 argument")));
@@ -1207,6 +1222,49 @@ fn eval_lambda(args: &[Expr], env: &Env, span: Span) -> Result<Value, EvalError>
     }
 }
 
+fn eval_case_lambda(clauses: &[Expr], env: &Env, span: Span) -> Result<Value, EvalError> {
+    let mut parsed_clauses = Vec::new();
+    for clause in clauses {
+        match &clause.kind {
+            ExprKind::List(items) if items.len() >= 2 => {
+                let (params, rest_param) = match &items[0].kind {
+                    ExprKind::List(param_exprs) => parse_param_list(param_exprs)?,
+                    ExprKind::Symbol(s) => (vec![], Some(s.clone())),
+                    _ => return Err(EvalError::Type(span.fmt("case-lambda: expected parameter list"))),
+                };
+                let body = items[1..].to_vec();
+                parsed_clauses.push((params, rest_param, body));
+            }
+            ExprKind::List(items) if items.len() == 1 => {
+                // clause with just params and no body — body defaults to unspecified
+                return Err(EvalError::Arity(span.fmt("case-lambda: clause must have body")));
+            }
+            _ => return Err(EvalError::Type(span.fmt("case-lambda: expected clause"))),
+        }
+    }
+    Ok(Value::CaseLambda { clauses: parsed_clauses, env: env.clone() })
+}
+
+fn dispatch_case_lambda<'a>(
+    clauses: &'a [(Vec<String>, Option<String>, Vec<Expr>)],
+    n_args: usize,
+    span: Span,
+) -> Result<&'a (Vec<String>, Option<String>, Vec<Expr>), EvalError> {
+    for clause in clauses {
+        let (ref params, ref rest_param, _) = clause;
+        if rest_param.is_some() {
+            if n_args >= params.len() {
+                return Ok(clause);
+            }
+        } else if n_args == params.len() {
+            return Ok(clause);
+        }
+    }
+    Err(EvalError::Arity(span.fmt(&format!(
+        "case-lambda: no matching clause for {} arguments", n_args
+    ))))
+}
+
 /// Parse a parameter list that may contain dot notation for rest params.
 /// E.g. `(x y . rest)` → (vec!["x","y"], Some("rest"))
 /// E.g. `(x y)` → (vec!["x","y"], None)
@@ -1293,6 +1351,15 @@ fn eval_apply(args: &[Value], span: Span, out: &Output) -> Result<Value, EvalErr
             }
             Ok(result)
         }
+        Value::CaseLambda { clauses, env } => {
+            let (params, rest_param, body) = dispatch_case_lambda(clauses, all_args.len(), span)?;
+            let local_env = apply_lambda(params, rest_param, body, env, &all_args, span)?;
+            let mut result = Value::Boolean(false);
+            for expr in body {
+                result = eval(expr, &local_env, out)?;
+            }
+            Ok(result)
+        }
         Value::Builtin(ref name) if name == "apply" => {
             eval_apply(&all_args, span, out)
         }
@@ -1340,6 +1407,15 @@ fn eval_callcc(proc: Value, span: Span, out: &Output) -> Result<Value, EvalError
 fn call_thunk(thunk: &Value, span: Span, out: &Output) -> Result<Value, EvalError> {
     match thunk {
         Value::Lambda { params, rest_param, body, env } => {
+            let local_env = apply_lambda(params, rest_param, body, env, &[], span)?;
+            let mut result = Value::Boolean(false);
+            for expr in body {
+                result = eval(expr, &local_env, out)?;
+            }
+            Ok(result)
+        }
+        Value::CaseLambda { clauses, env } => {
+            let (params, rest_param, body) = dispatch_case_lambda(clauses, 0, span)?;
             let local_env = apply_lambda(params, rest_param, body, env, &[], span)?;
             let mut result = Value::Boolean(false);
             for expr in body {
@@ -1395,18 +1471,7 @@ fn eval_with_exception_handler(handler: Value, thunk: Value, span: Span, out: &O
             let raised = RAISED_VALUE.with(|v| v.borrow_mut().take())
                 .unwrap_or(Value::Boolean(false));
             // Call the handler with the raised value
-            match handler {
-                Value::Lambda { ref params, ref rest_param, ref body, ref env } => {
-                    let local_env = apply_lambda(params, rest_param, body, env, &[raised], span)?;
-                    let mut result = Value::Boolean(false);
-                    for expr in body {
-                        result = eval(expr, &local_env, out)?;
-                    }
-                    Ok(result)
-                }
-                Value::Builtin(ref name) => eval_builtin(name, &[raised], span),
-                _ => Err(EvalError::Type(span.fmt("with-exception-handler: expected procedure"))),
-            }
+            call_value(handler, &[raised], span, out)
         }
         Err(e) => Err(e),
     }
@@ -1906,6 +1971,15 @@ fn expand_macro_transformer(
 fn call_value(func: Value, args: &[Value], span: Span, out: &Output) -> Result<Value, EvalError> {
     match func {
         Value::Lambda { ref params, ref rest_param, ref body, ref env } => {
+            let local_env = apply_lambda(params, rest_param, body, env, args, span)?;
+            let mut result = Value::Boolean(false);
+            for expr in body {
+                result = eval(expr, &local_env, out)?;
+            }
+            Ok(result)
+        }
+        Value::CaseLambda { ref clauses, ref env } => {
+            let (params, rest_param, body) = dispatch_case_lambda(clauses, args.len(), span)?;
             let local_env = apply_lambda(params, rest_param, body, env, args, span)?;
             let mut result = Value::Boolean(false);
             for expr in body {
