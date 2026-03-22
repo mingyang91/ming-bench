@@ -493,13 +493,42 @@ function makeGlobalEnv(output: string[] = []): Env {
     return { tag: 'string', value: args[0].value };
   }});
   env.define('string-set!', { tag: 'builtin', name: 'string-set!', fn(args) {
-    if (args.length !== 3 || args[0].tag !== 'string' || args[1].tag !== 'number' || args[2].tag !== 'char')
-      throw new EvalError('string-set!: expected string, number, char');
-    const s = args[0];
-    const idx = args[1].value;
-    const ch = args[2].value;
-    s.value = s.value.substring(0, idx) + ch + s.value.substring(idx + 1);
-    return { tag: 'nil' };
+    throw new EvalError('string-set!: strings are immutable');
+  }});
+
+  env.define('string->list', { tag: 'builtin', name: 'string->list', fn(args) {
+    if (args.length < 1 || args[0].tag !== 'string')
+      throw new EvalError('string->list: expected string');
+    const s = args[0].value;
+    let result: Value = { tag: 'nil' };
+    for (let i = s.length - 1; i >= 0; i--) {
+      result = { tag: 'pair', car: { tag: 'char', value: s[i] }, cdr: result };
+    }
+    return result;
+  }});
+
+  env.define('list->string', { tag: 'builtin', name: 'list->string', fn(args) {
+    if (args.length !== 1) throw new EvalError('list->string: expected one argument');
+    let result = '';
+    let cur = args[0];
+    while (cur.tag === 'pair') {
+      if (cur.car.tag !== 'char') throw new EvalError('list->string: expected list of chars');
+      result += cur.car.value;
+      cur = cur.cdr;
+    }
+    return { tag: 'string', value: result };
+  }});
+
+  env.define('char->integer', { tag: 'builtin', name: 'char->integer', fn(args) {
+    if (args.length !== 1 || args[0].tag !== 'char')
+      throw new EvalError('char->integer: expected char');
+    return { tag: 'number', value: args[0].value.charCodeAt(0) };
+  }});
+
+  env.define('integer->char', { tag: 'builtin', name: 'integer->char', fn(args) {
+    if (args.length !== 1 || args[0].tag !== 'number')
+      throw new EvalError('integer->char: expected number');
+    return { tag: 'char', value: String.fromCharCode(args[0].value) };
   }});
 
   // Equality
