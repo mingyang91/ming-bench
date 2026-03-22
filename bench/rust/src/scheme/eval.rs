@@ -167,6 +167,9 @@ fn eval_list_step(
                 let v = eval_case_lambda(&elements[1..], kw_span, env)?;
                 return Ok(TcoAction::Result(v));
             }
+            "do" => {
+                return eval_do_step(&elements[1..], kw_span, env, output, ctx);
+            }
             _ => {}
         }
     }
@@ -1601,6 +1604,124 @@ fn eval_case_lambda(args: &[Expr], span: &Span, env: &Env) -> Result<Value, Eval
         env: env.clone(),
         name: None,
     })
+}
+
+fn eval_do_step(
+    args: &[Expr],
+    span: &Span,
+    env: &Env,
+    output: &mut String,
+    ctx: &mut ContCtx,
+) -> Result<TcoAction, EvalError> {
+    // (do ((var init step) ...) (test expr ...) body ...)
+    if args.len() < 2 {
+        return Err(EvalErrorKind::Parse {
+            message: "do requires bindings and test clause".into(),
+        }
+        .at(span));
+    }
+
+    // Parse variable bindings
+    let bindings_expr = match &args[0].kind {
+        ExprKind::List(b) => b,
+        _ => {
+            return Err(EvalErrorKind::Parse {
+                message: "do: expected binding list".into(),
+            }
+            .at(span))
+        }
+    };
+
+    struct DoBinding {
+        name: String,
+        step: Option<Expr>,
+    }
+
+    let mut bindings = Vec::new();
+    let do_env = Env::with_parent(env);
+
+    for binding in bindings_expr {
+        match &binding.kind {
+            ExprKind::List(elems) if elems.len() == 2 || elems.len() == 3 => {
+                let name = match &elems[0].kind {
+                    ExprKind::Symbol(s) => s.clone(),
+                    _ => {
+                        return Err(EvalErrorKind::Parse {
+                            message: "do: expected symbol in binding".into(),
+                        }
+                        .at(span))
+                    }
+                };
+                let init_val = eval(&elems[1], env, output, ctx)?;
+                let step = if elems.len() == 3 {
+                    Some(elems[2].clone())
+                } else {
+                    None
+                };
+                do_env.define(name.clone(), init_val);
+                bindings.push(DoBinding { name, step });
+            }
+            _ => {
+                return Err(EvalErrorKind::Parse {
+                    message: "do: invalid binding (expected (var init) or (var init step))".into(),
+                }
+                .at(span))
+            }
+        }
+    }
+
+    // Parse test clause: (test expr ...)
+    let test_clause = match &args[1].kind {
+        ExprKind::List(t) if !t.is_empty() => t,
+        _ => {
+            return Err(EvalErrorKind::Parse {
+                message: "do: expected non-empty test clause".into(),
+            }
+            .at(span))
+        }
+    };
+    let test_expr = &test_clause[0];
+    let result_exprs = &test_clause[1..];
+    let body = &args[2..];
+
+    loop {
+        // Evaluate test
+        let test_val = eval(test_expr, &do_env, output, ctx)?;
+        if test_val.is_truthy() {
+            // Test passed — evaluate result expressions and return last
+            if result_exprs.is_empty() {
+                return Ok(TcoAction::Result(Value::Nil));
+            }
+            for expr in &result_exprs[..result_exprs.len() - 1] {
+                eval(expr, &do_env, output, ctx)?;
+            }
+            return Ok(TcoAction::TailCall {
+                expr: result_exprs[result_exprs.len() - 1].clone(),
+                env: do_env,
+            });
+        }
+
+        // Evaluate body (for side effects)
+        for b in body {
+            eval(b, &do_env, output, ctx)?;
+        }
+
+        // Evaluate all step expressions using current values (parallel update)
+        let new_vals: Vec<Option<Value>> = bindings
+            .iter()
+            .map(|b| match &b.step {
+                Some(step_expr) => eval(step_expr, &do_env, output, ctx).map(Some),
+                None => Ok(None),
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+
+        // Update all variables simultaneously
+        for (binding, new_val) in bindings.iter().zip(new_vals.into_iter()) {
+            if let Some(val) = new_val {
+                do_env.set(&binding.name, val).map_err(|e| e.with_span(span))?;
+            }
+        }
+    }
 }
 
 fn eval_and_step(
