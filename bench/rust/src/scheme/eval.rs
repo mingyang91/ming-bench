@@ -158,6 +158,14 @@ fn eval_list_step(
 
     // Check for builtin functions by name before evaluating
     if let ExprKind::Symbol(name) = &elements[0].kind {
+        if name == "map" {
+            let args: Vec<Value> = elements[1..]
+                .iter()
+                .map(|e| eval(e, env, output, ctx))
+                .collect::<Result<Vec<_>, _>>()?;
+            let v = eval_map(&args, &elements[0].span, output, ctx)?;
+            return Ok(TcoAction::Result(v));
+        }
         if is_builtin(name) {
             let args: Vec<Value> = elements[1..]
                 .iter()
@@ -213,6 +221,36 @@ fn is_builtin(name: &str) -> bool {
             | "string->symbol"
             | "string-ref"
             | "string-copy"
+            | "abs"
+            | "modulo"
+            | "remainder"
+            | "quotient"
+            | "min"
+            | "max"
+            | "expt"
+            | "zero?"
+            | "positive?"
+            | "negative?"
+            | "odd?"
+            | "even?"
+            | "list-ref"
+            | "list-tail"
+            | "list?"
+            | "assoc"
+            | "map"
+            | "eq?"
+            | "equal?"
+            | "char-alphabetic?"
+            | "char-numeric?"
+            | "char-upcase"
+            | "char-downcase"
+            | "char=?"
+            | "char<?"
+            | "string=?"
+            | "string<?"
+            | "string-ci=?"
+            | "string-upcase"
+            | "string-downcase"
     )
 }
 
@@ -290,6 +328,10 @@ fn apply_step(
                 }
                 let result = do_callcc(&args[0], span, output, ctx)?;
                 Ok(TcoAction::Result(result))
+            }
+            "map" => {
+                let v = eval_map(args, span, output, ctx)?;
+                Ok(TcoAction::Result(v))
             }
             _ => {
                 let v = eval_builtin(name, args, span, output)?;
@@ -465,6 +507,35 @@ fn eval_builtin(
         "string->symbol" => eval_string_to_symbol(args, span),
         "string-ref" => eval_string_ref(args, span),
         "string-copy" => eval_string_copy(args, span),
+        "abs" => eval_abs(args, span),
+        "modulo" => eval_modulo(args, span),
+        "remainder" => eval_remainder(args, span),
+        "quotient" => eval_quotient(args, span),
+        "min" => eval_min_max(args, "min", span, |a, b| a < b),
+        "max" => eval_min_max(args, "max", span, |a, b| a > b),
+        "expt" => eval_expt(args, span),
+        "zero?" => eval_num_pred(args, "zero?", span, |n| n == 0),
+        "positive?" => eval_num_pred(args, "positive?", span, |n| n > 0),
+        "negative?" => eval_num_pred(args, "negative?", span, |n| n < 0),
+        "odd?" => eval_num_pred(args, "odd?", span, |n| n % 2 != 0),
+        "even?" => eval_num_pred(args, "even?", span, |n| n % 2 == 0),
+        "list-ref" => eval_list_ref(args, span),
+        "list-tail" => eval_list_tail(args, span),
+        "list?" => eval_list_pred(args, span),
+        "assoc" => eval_assoc(args, span),
+        "eq?" => eval_eq(args, span),
+        "equal?" => eval_equal(args, span),
+        "char-alphabetic?" => eval_char_pred(args, "char-alphabetic?", span, |c| c.is_alphabetic()),
+        "char-numeric?" => eval_char_pred(args, "char-numeric?", span, |c| c.is_ascii_digit()),
+        "char-upcase" => eval_char_case(args, "char-upcase", span, |c| c.to_uppercase().next().unwrap_or(c)),
+        "char-downcase" => eval_char_case(args, "char-downcase", span, |c| c.to_lowercase().next().unwrap_or(c)),
+        "char=?" => eval_char_cmp(args, "char=?", span, |a, b| a == b),
+        "char<?" => eval_char_cmp(args, "char<?", span, |a, b| a < b),
+        "string=?" => eval_string_cmp(args, "string=?", span, |a, b| a == b),
+        "string<?" => eval_string_cmp(args, "string<?", span, |a, b| a < b),
+        "string-ci=?" => eval_string_ci_eq(args, span),
+        "string-upcase" => eval_string_case(args, "string-upcase", span, |s| s.to_uppercase()),
+        "string-downcase" => eval_string_case(args, "string-downcase", span, |s| s.to_lowercase()),
         _ => Err(EvalErrorKind::UnboundVariable {
             name: name.to_string(),
         }
@@ -1396,6 +1467,433 @@ fn eval_string_copy(args: &[Value], span: &Span) -> Result<Value, EvalError> {
     }
     let s = require_string(&args[0], span)?;
     Ok(Value::SchemeString(s.to_string()))
+}
+
+// ===== L13: Numeric/Char/String Utilities =====
+
+fn require_char(v: &Value, span: &Span) -> Result<char, EvalError> {
+    match v {
+        Value::Char(c) => Ok(*c),
+        other => Err(EvalErrorKind::Type {
+            expected: "char".into(),
+            got: format!("{other}"),
+        }
+        .at(span)),
+    }
+}
+
+fn eval_abs(args: &[Value], span: &Span) -> Result<Value, EvalError> {
+    if args.len() != 1 {
+        return Err(EvalErrorKind::Arity {
+            name: "abs".into(),
+            expected: "1".into(),
+            got: args.len(),
+        }
+        .at(span));
+    }
+    let n = require_integer(&args[0], span)?;
+    Ok(Value::Integer(n.abs()))
+}
+
+fn eval_modulo(args: &[Value], span: &Span) -> Result<Value, EvalError> {
+    if args.len() != 2 {
+        return Err(EvalErrorKind::Arity {
+            name: "modulo".into(),
+            expected: "2".into(),
+            got: args.len(),
+        }
+        .at(span));
+    }
+    let a = require_integer(&args[0], span)?;
+    let b = require_integer(&args[1], span)?;
+    if b == 0 {
+        return Err(EvalErrorKind::DivisionByZero.at(span));
+    }
+    Ok(Value::Integer(((a % b) + b) % b))
+}
+
+fn eval_remainder(args: &[Value], span: &Span) -> Result<Value, EvalError> {
+    if args.len() != 2 {
+        return Err(EvalErrorKind::Arity {
+            name: "remainder".into(),
+            expected: "2".into(),
+            got: args.len(),
+        }
+        .at(span));
+    }
+    let a = require_integer(&args[0], span)?;
+    let b = require_integer(&args[1], span)?;
+    if b == 0 {
+        return Err(EvalErrorKind::DivisionByZero.at(span));
+    }
+    Ok(Value::Integer(a % b))
+}
+
+fn eval_quotient(args: &[Value], span: &Span) -> Result<Value, EvalError> {
+    if args.len() != 2 {
+        return Err(EvalErrorKind::Arity {
+            name: "quotient".into(),
+            expected: "2".into(),
+            got: args.len(),
+        }
+        .at(span));
+    }
+    let a = require_integer(&args[0], span)?;
+    let b = require_integer(&args[1], span)?;
+    if b == 0 {
+        return Err(EvalErrorKind::DivisionByZero.at(span));
+    }
+    Ok(Value::Integer(a / b))
+}
+
+fn eval_min_max(
+    args: &[Value],
+    name: &str,
+    span: &Span,
+    is_better: fn(i64, i64) -> bool,
+) -> Result<Value, EvalError> {
+    if args.is_empty() {
+        return Err(EvalErrorKind::Arity {
+            name: name.into(),
+            expected: "at least 1".into(),
+            got: 0,
+        }
+        .at(span));
+    }
+    let mut best = require_integer(&args[0], span)?;
+    for arg in &args[1..] {
+        let n = require_integer(arg, span)?;
+        if is_better(n, best) {
+            best = n;
+        }
+    }
+    Ok(Value::Integer(best))
+}
+
+fn eval_expt(args: &[Value], span: &Span) -> Result<Value, EvalError> {
+    if args.len() != 2 {
+        return Err(EvalErrorKind::Arity {
+            name: "expt".into(),
+            expected: "2".into(),
+            got: args.len(),
+        }
+        .at(span));
+    }
+    let base = require_integer(&args[0], span)?;
+    let exp = require_integer(&args[1], span)?;
+    if exp < 0 {
+        return Ok(Value::Integer(0)); // integer exponentiation truncates
+    }
+    Ok(Value::Integer(base.pow(exp as u32)))
+}
+
+fn eval_num_pred(
+    args: &[Value],
+    name: &str,
+    span: &Span,
+    pred: fn(i64) -> bool,
+) -> Result<Value, EvalError> {
+    if args.len() != 1 {
+        return Err(EvalErrorKind::Arity {
+            name: name.into(),
+            expected: "1".into(),
+            got: args.len(),
+        }
+        .at(span));
+    }
+    let n = require_integer(&args[0], span)?;
+    Ok(Value::Boolean(pred(n)))
+}
+
+fn eval_list_ref(args: &[Value], span: &Span) -> Result<Value, EvalError> {
+    if args.len() != 2 {
+        return Err(EvalErrorKind::Arity {
+            name: "list-ref".into(),
+            expected: "2".into(),
+            got: args.len(),
+        }
+        .at(span));
+    }
+    let idx = require_integer(&args[1], span)? as usize;
+    let mut current = &args[0];
+    for _ in 0..idx {
+        match current {
+            Value::Pair(_, cdr) => current = cdr,
+            _ => {
+                return Err(EvalErrorKind::Type {
+                    expected: "pair".into(),
+                    got: format!("{current}"),
+                }
+                .at(span))
+            }
+        }
+    }
+    match current {
+        Value::Pair(car, _) => Ok(*car.clone()),
+        _ => Err(EvalErrorKind::Type {
+            expected: "pair".into(),
+            got: format!("{current}"),
+        }
+        .at(span)),
+    }
+}
+
+fn eval_list_tail(args: &[Value], span: &Span) -> Result<Value, EvalError> {
+    if args.len() != 2 {
+        return Err(EvalErrorKind::Arity {
+            name: "list-tail".into(),
+            expected: "2".into(),
+            got: args.len(),
+        }
+        .at(span));
+    }
+    let idx = require_integer(&args[1], span)? as usize;
+    let mut current = &args[0];
+    for _ in 0..idx {
+        match current {
+            Value::Pair(_, cdr) => current = cdr,
+            _ => {
+                return Err(EvalErrorKind::Type {
+                    expected: "pair".into(),
+                    got: format!("{current}"),
+                }
+                .at(span))
+            }
+        }
+    }
+    Ok(current.clone())
+}
+
+fn eval_list_pred(args: &[Value], span: &Span) -> Result<Value, EvalError> {
+    if args.len() != 1 {
+        return Err(EvalErrorKind::Arity {
+            name: "list?".into(),
+            expected: "1".into(),
+            got: args.len(),
+        }
+        .at(span));
+    }
+    let mut current = &args[0];
+    loop {
+        match current {
+            Value::Nil => return Ok(Value::Boolean(true)),
+            Value::Pair(_, cdr) => current = cdr,
+            _ => return Ok(Value::Boolean(false)),
+        }
+    }
+}
+
+fn eval_assoc(args: &[Value], span: &Span) -> Result<Value, EvalError> {
+    if args.len() != 2 {
+        return Err(EvalErrorKind::Arity {
+            name: "assoc".into(),
+            expected: "2".into(),
+            got: args.len(),
+        }
+        .at(span));
+    }
+    let key = &args[0];
+    let mut alist = &args[1];
+    loop {
+        match alist {
+            Value::Nil => return Ok(Value::Boolean(false)),
+            Value::Pair(car, cdr) => {
+                if let Value::Pair(entry_key, _) = car.as_ref() {
+                    if entry_key.as_ref() == key {
+                        return Ok(*car.clone());
+                    }
+                }
+                alist = cdr;
+            }
+            _ => {
+                return Err(EvalErrorKind::Type {
+                    expected: "proper list".into(),
+                    got: format!("{alist}"),
+                }
+                .at(span))
+            }
+        }
+    }
+}
+
+fn eval_eq(args: &[Value], span: &Span) -> Result<Value, EvalError> {
+    if args.len() != 2 {
+        return Err(EvalErrorKind::Arity {
+            name: "eq?".into(),
+            expected: "2".into(),
+            got: args.len(),
+        }
+        .at(span));
+    }
+    let result = match (&args[0], &args[1]) {
+        (Value::Integer(a), Value::Integer(b)) => a == b,
+        (Value::Boolean(a), Value::Boolean(b)) => a == b,
+        (Value::Symbol(a), Value::Symbol(b)) => a == b,
+        (Value::Char(a), Value::Char(b)) => a == b,
+        (Value::Nil, Value::Nil) => true,
+        _ => false,
+    };
+    Ok(Value::Boolean(result))
+}
+
+fn eval_equal(args: &[Value], span: &Span) -> Result<Value, EvalError> {
+    if args.len() != 2 {
+        return Err(EvalErrorKind::Arity {
+            name: "equal?".into(),
+            expected: "2".into(),
+            got: args.len(),
+        }
+        .at(span));
+    }
+    Ok(Value::Boolean(args[0] == args[1]))
+}
+
+fn eval_map(
+    args: &[Value],
+    span: &Span,
+    output: &mut String,
+    ctx: &mut ContCtx,
+) -> Result<Value, EvalError> {
+    if args.len() < 2 {
+        return Err(EvalErrorKind::Arity {
+            name: "map".into(),
+            expected: "at least 2".into(),
+            got: args.len(),
+        }
+        .at(span));
+    }
+    let func = &args[0];
+    let mut lists: Vec<Vec<Value>> = Vec::new();
+    for arg in &args[1..] {
+        lists.push(value_list_to_vec(arg, span)?);
+    }
+    let len = lists[0].len();
+    for list in &lists[1..] {
+        if list.len() != len {
+            return Err(EvalErrorKind::Type {
+                expected: "lists of equal length".into(),
+                got: "lists of different lengths".into(),
+            }
+            .at(span));
+        }
+    }
+    let mut result_vec = Vec::new();
+    for i in 0..len {
+        let call_args: Vec<Value> = lists.iter().map(|l| l[i].clone()).collect();
+        let val = apply_func(func, &call_args, span, output, ctx)?;
+        result_vec.push(val);
+    }
+    let mut result = Value::Nil;
+    for val in result_vec.into_iter().rev() {
+        result = Value::Pair(Box::new(val), Box::new(result));
+    }
+    Ok(result)
+}
+
+fn eval_char_pred(
+    args: &[Value],
+    name: &str,
+    span: &Span,
+    pred: fn(char) -> bool,
+) -> Result<Value, EvalError> {
+    if args.len() != 1 {
+        return Err(EvalErrorKind::Arity {
+            name: name.into(),
+            expected: "1".into(),
+            got: args.len(),
+        }
+        .at(span));
+    }
+    let c = require_char(&args[0], span)?;
+    Ok(Value::Boolean(pred(c)))
+}
+
+fn eval_char_case(
+    args: &[Value],
+    name: &str,
+    span: &Span,
+    convert: fn(char) -> char,
+) -> Result<Value, EvalError> {
+    if args.len() != 1 {
+        return Err(EvalErrorKind::Arity {
+            name: name.into(),
+            expected: "1".into(),
+            got: args.len(),
+        }
+        .at(span));
+    }
+    let c = require_char(&args[0], span)?;
+    Ok(Value::Char(convert(c)))
+}
+
+fn eval_char_cmp(
+    args: &[Value],
+    name: &str,
+    span: &Span,
+    cmp: fn(char, char) -> bool,
+) -> Result<Value, EvalError> {
+    if args.len() != 2 {
+        return Err(EvalErrorKind::Arity {
+            name: name.into(),
+            expected: "2".into(),
+            got: args.len(),
+        }
+        .at(span));
+    }
+    let a = require_char(&args[0], span)?;
+    let b = require_char(&args[1], span)?;
+    Ok(Value::Boolean(cmp(a, b)))
+}
+
+fn eval_string_cmp(
+    args: &[Value],
+    name: &str,
+    span: &Span,
+    cmp: fn(&str, &str) -> bool,
+) -> Result<Value, EvalError> {
+    if args.len() != 2 {
+        return Err(EvalErrorKind::Arity {
+            name: name.into(),
+            expected: "2".into(),
+            got: args.len(),
+        }
+        .at(span));
+    }
+    let a = require_string(&args[0], span)?;
+    let b = require_string(&args[1], span)?;
+    Ok(Value::Boolean(cmp(a, b)))
+}
+
+fn eval_string_ci_eq(args: &[Value], span: &Span) -> Result<Value, EvalError> {
+    if args.len() != 2 {
+        return Err(EvalErrorKind::Arity {
+            name: "string-ci=?".into(),
+            expected: "2".into(),
+            got: args.len(),
+        }
+        .at(span));
+    }
+    let a = require_string(&args[0], span)?;
+    let b = require_string(&args[1], span)?;
+    Ok(Value::Boolean(a.to_lowercase() == b.to_lowercase()))
+}
+
+fn eval_string_case(
+    args: &[Value],
+    name: &str,
+    span: &Span,
+    convert: fn(&str) -> String,
+) -> Result<Value, EvalError> {
+    if args.len() != 1 {
+        return Err(EvalErrorKind::Arity {
+            name: name.into(),
+            expected: "1".into(),
+            got: args.len(),
+        }
+        .at(span));
+    }
+    let s = require_string(&args[0], span)?;
+    Ok(Value::SchemeString(convert(s)))
 }
 
 fn eval_define_syntax(args: &[Expr], span: &Span, env: &Env) -> Result<Value, EvalError> {
