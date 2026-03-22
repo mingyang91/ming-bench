@@ -12,6 +12,7 @@ type continuationJump struct {
 	value     *Value
 	exprIndex int
 	contID    int64
+	callExpr  *Expr // the call/cc expression that created this continuation
 }
 
 var contIDCounter int64
@@ -480,10 +481,12 @@ func builtinCallCC(args []*Value, expr *Expr, env *Env) (*Value, error) {
 	proc := args[0]
 
 	// If resuming a saved continuation, return the resume value immediately
-	if ctx := env.getEvalCtx(); ctx != nil && ctx.resuming {
+	// Only consume if this is the exact call/cc expression that created the continuation
+	if ctx := env.getEvalCtx(); ctx != nil && ctx.resuming && ctx.resumeExpr == expr {
 		ctx.resuming = false
 		v := ctx.resumeValue
 		ctx.resumeValue = nil
+		ctx.resumeExpr = nil
 		return v, nil
 	}
 
@@ -498,7 +501,7 @@ func builtinCallCC(args []*Value, expr *Expr, env *Env) (*Value, error) {
 	cont := &Value{
 		Type: TypeContinuation,
 		ContFunc: func(val *Value) {
-			panic(continuationJump{value: val, exprIndex: exprIdx, contID: contID})
+			panic(continuationJump{value: val, exprIndex: exprIdx, contID: contID, callExpr: expr})
 		},
 	}
 

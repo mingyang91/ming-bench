@@ -46,6 +46,7 @@ func evalTopLevel(exprs []*Expr, env *Env) (*Value, error) {
 			startIndex = jump.exprIndex
 			ctx.resuming = true
 			ctx.resumeValue = jump.value
+			ctx.resumeExpr = jump.callExpr
 			continue
 		}
 

@@ -11,6 +11,7 @@ type evalContext struct {
 	currentIndex int
 	resumeValue  *Value
 	resuming     bool
+	resumeExpr   *Expr // the call/cc expression to resume into
 }
 
 // Env represents a Scheme environment (scope).
