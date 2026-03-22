@@ -107,7 +107,22 @@ object Evaluator:
     "string->list",
     "list->string",
     "char->integer",
-    "integer->char"
+    "integer->char",
+    // L15: vectors
+    "vector",
+    "make-vector",
+    "vector-ref",
+    "vector-set!",
+    "vector-length",
+    "vector?",
+    "vector->list",
+    "list->vector",
+    // L15: pair mutation
+    "set-car!",
+    "set-cdr!",
+    // L15: misc
+    "error",
+    "procedure?"
   )
 
   private val builtinEnv: Map[String, SchemeValue] =

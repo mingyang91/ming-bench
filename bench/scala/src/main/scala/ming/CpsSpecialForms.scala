@@ -223,6 +223,182 @@ object CpsSpecialForms:
         )
       case _ => throw new EvalError("invalid let binding")
 
+  def evalLetStarK(
+    rest: List[SchemeValue],
+    env: Env,
+    out: Array[String],
+    k: Cont
+  ): Bounce =
+    rest match
+      case ListVal(bindings, _) :: body =>
+        evalLetStarBindingsK(
+          bindings,
+          env,
+          out,
+          letEnv => evalBodyK(body, letEnv, out, k)
+        )
+      case _ => throw new EvalError("invalid let* syntax")
+
+  private def evalLetStarBindingsK(
+    bindings: List[SchemeValue],
+    env: Env,
+    out: Array[String],
+    k: Env => Bounce
+  ): Bounce =
+    bindings match
+      case Nil => More(() => k(env))
+      case ListVal(SymbolVal(name, _) :: valExpr :: Nil, _) :: rest =>
+        evalK(
+          valExpr,
+          env,
+          out,
+          (v, _) =>
+            val newEnv = env + (name -> makeCell(v))
+            evalLetStarBindingsK(rest, newEnv, out, k)
+        )
+      case _ => throw new EvalError("invalid let* binding")
+
+  def evalLetrecK(
+    rest: List[SchemeValue],
+    env: Env,
+    out: Array[String],
+    k: Cont
+  ): Bounce =
+    rest match
+      case ListVal(bindings, _) :: body =>
+        val names = bindings.map {
+          case ListVal(SymbolVal(n, _) :: _ :: Nil, _) => n
+          case _ => throw new EvalError("invalid letrec binding")
+        }
+        val recEnv = names.foldLeft(env)((e, n) => e + (n -> makeCell(Void)))
+        evalLetrecBindingsK(
+          bindings,
+          recEnv,
+          out,
+          names,
+          finalEnv => evalBodyK(body, finalEnv, out, k)
+        )
+      case _ => throw new EvalError("invalid letrec syntax")
+
+  private def evalLetrecBindingsK(
+    bindings: List[SchemeValue],
+    env: Env,
+    out: Array[String],
+    allNames: List[String],
+    k: Env => Bounce
+  ): Bounce =
+    bindings match
+      case Nil =>
+        patchLetrecClosures(env, allNames)
+        More(() => k(env))
+      case ListVal(SymbolVal(name, _) :: valExpr :: Nil, _) :: rest =>
+        evalK(
+          valExpr,
+          env,
+          out,
+          (v, _) =>
+            env(name) match
+              case Cell(arr) => arr(0) = v
+              case _         => ()
+            evalLetrecBindingsK(rest, env, out, allNames, k)
+        )
+      case _ => throw new EvalError("invalid letrec binding")
+
+  private def patchLetrecClosures(env: Env, names: List[String]): Unit =
+    names.foreach { name =>
+      env(name) match
+        case Cell(arr) =>
+          arr(0) match
+            case LambdaVal(params, body, closure, selfName, restParam) =>
+              val updatedClosure = closure ++ names.map(n => n -> env(n)).toMap
+              arr(0) = LambdaVal(params, body, updatedClosure, selfName, restParam)
+            case _ => ()
+        case _ => ()
+    }
+
+  def evalLetrecStarK(
+    rest: List[SchemeValue],
+    env: Env,
+    out: Array[String],
+    k: Cont
+  ): Bounce =
+    rest match
+      case ListVal(bindings, _) :: body =>
+        val names = bindings.map {
+          case ListVal(SymbolVal(n, _) :: _ :: Nil, _) => n
+          case _ => throw new EvalError("invalid letrec* binding")
+        }
+        val recEnv = names.foldLeft(env)((e, n) => e + (n -> makeCell(Void)))
+        evalLetrecStarBindingsK(
+          bindings,
+          recEnv,
+          out,
+          finalEnv => evalBodyK(body, finalEnv, out, k)
+        )
+      case _ => throw new EvalError("invalid letrec* syntax")
+
+  private def evalLetrecStarBindingsK(
+    bindings: List[SchemeValue],
+    env: Env,
+    out: Array[String],
+    k: Env => Bounce
+  ): Bounce =
+    bindings match
+      case Nil => More(() => k(env))
+      case ListVal(SymbolVal(name, _) :: valExpr :: Nil, _) :: rest =>
+        evalK(
+          valExpr,
+          env,
+          out,
+          (v, _) =>
+            env(name) match
+              case Cell(arr) => arr(0) = v
+              case _         => ()
+            evalLetrecStarBindingsK(rest, env, out, k)
+        )
+      case _ => throw new EvalError("invalid letrec* binding")
+
+  def evalCaseK(
+    rest: List[SchemeValue],
+    env: Env,
+    out: Array[String],
+    k: Cont
+  ): Bounce =
+    rest match
+      case keyExpr :: clauses =>
+        evalK(
+          keyExpr,
+          env,
+          out,
+          (keyVal, _) => matchCaseClausesK(keyVal, clauses, env, out, k)
+        )
+      case _ => throw new EvalError("case: bad syntax")
+
+  private def matchCaseClausesK(
+    keyVal: SchemeValue,
+    clauses: List[SchemeValue],
+    env: Env,
+    out: Array[String],
+    k: Cont
+  ): Bounce =
+    clauses match
+      case Nil => More(() => k(Void, env))
+      case ListVal(SymbolVal("else", _) :: body, _) :: _ =>
+        evalBodyK(body, env, out, k)
+      case ListVal(ListVal(datums, _) :: body, _) :: rest =>
+        if datums.exists(d => eqvMatch(keyVal, d)) then evalBodyK(body, env, out, k)
+        else matchCaseClausesK(keyVal, rest, env, out, k)
+      case _ => throw new EvalError("case: invalid clause")
+
+  private def eqvMatch(a: SchemeValue, b: SchemeValue): Boolean =
+    (a, b) match
+      case (IntVal(x), IntVal(y))             => x == y
+      case (BoolVal(x), BoolVal(y))           => x == y
+      case (CharVal(x), CharVal(y))           => x == y
+      case (SymbolVal(x, _), SymbolVal(y, _)) => x == y
+      case (StringVal(x), StringVal(y))       => x == y
+      case _                                  => false
+
   private def evalLetBindingsK(
     bindings: List[SchemeValue],
     origEnv: Env,

@@ -18,7 +18,8 @@ object CpsEval:
     expr match
       case IntVal(_) | BoolVal(_) | StringVal(_) | MutableStringVal(_) | CharVal(_) | Void =>
         More(() => k(expr, env))
-      case _: Cell => More(() => k(expr, env))
+      case _: Cell      => More(() => k(expr, env))
+      case _: VectorVal => More(() => k(expr, env))
       case SymbolVal(name, pos) =>
         val raw = env.getOrElse(
           name,
@@ -43,16 +44,31 @@ object CpsEval:
           ) =>
         val (ps, rp) = extractParamsWithRest(params)
         More(() => k(LambdaVal(ps, body, env, restParam = rp), env))
+      case ListVal(
+            SymbolVal("lambda", _) :: SymbolVal(restName, _) :: body,
+            _
+          ) =>
+        More(() => k(LambdaVal(Nil, body, env, restParam = Some(restName)), env))
       case ListVal(SymbolVal("and", _) :: args, _) =>
         CpsSpecialForms.evalAndK(args, env, out, k)
       case ListVal(SymbolVal("or", _) :: args, _) =>
         CpsSpecialForms.evalOrK(args, env, out, k)
       case ListVal(SymbolVal("let", _) :: rest, _) =>
         CpsSpecialForms.evalLetK(rest, env, out, k)
+      case ListVal(SymbolVal("let*", _) :: rest, _) =>
+        CpsSpecialForms.evalLetStarK(rest, env, out, k)
+      case ListVal(SymbolVal("letrec", _) :: rest, _) =>
+        CpsSpecialForms.evalLetrecK(rest, env, out, k)
+      case ListVal(SymbolVal("letrec*", _) :: rest, _) =>
+        CpsSpecialForms.evalLetrecStarK(rest, env, out, k)
       case ListVal(SymbolVal("begin", _) :: body, _) =>
         evalSequenceK(body, env, out, k)
       case ListVal(SymbolVal("cond", _) :: clauses, _) =>
         CpsSpecialForms.evalCondK(clauses, env, out, k)
+      case ListVal(SymbolVal("case", _) :: rest, _) =>
+        CpsSpecialForms.evalCaseK(rest, env, out, k)
+      case ListVal(SymbolVal("do", _) :: rest, _) =>
+        CpsDoForm.evalDoK(rest, env, out, k)
       case ListVal(SymbolVal("define-syntax", _) :: rest, pos) =>
         CpsSpecialForms.evalDefineSyntaxK(rest, pos, env, out, k)
       case ListVal((head @ SymbolVal(name, _)) :: args, pos) =>
@@ -71,6 +87,7 @@ object CpsEval:
         evalApplicationK(head, args, pos, env, out, k)
       case _: LambdaVal       => More(() => k(expr, env))
       case _: PairVal         => More(() => k(expr, env))
+      case _: MutablePairVal  => More(() => k(expr, env))
       case _: ContinuationVal => More(() => k(expr, env))
 
   def evalSequenceK(

@@ -49,7 +49,7 @@ object BuiltinsL13:
       case "list->string"  => (listToString(args), "")
       case "char->integer" => (charToInteger(args), "")
       case "integer->char" => (integerToChar(args), "")
-      case _               => throw new EvalError(s"unknown procedure: $name")
+      case _ => BuiltinsL15.applyL15(name, args)
 
   // --- numeric utilities ---
 
@@ -128,7 +128,7 @@ object BuiltinsL13:
   @scala.annotation.tailrec
   private def listRefHelper(v: SchemeValue, target: Int, current: Int): SchemeValue =
     v match
-      case PairVal(car, cdr) =>
+      case AnyPair(car, cdr) =>
         if current == target then car
         else listRefHelper(cdr, target, current + 1)
       case ListVal(es, _) if es.nonEmpty =>
@@ -149,7 +149,7 @@ object BuiltinsL13:
     if current == target then v
     else
       v match
-        case PairVal(_, cdr) => listTailHelper(cdr, target, current + 1)
+        case AnyPair(_, cdr) => listTailHelper(cdr, target, current + 1)
         case ListVal(es, _) if es.nonEmpty =>
           val localIdx = target - current
           if localIdx <= es.length then Builtins.listToPairs(es.drop(localIdx))
@@ -165,7 +165,7 @@ object BuiltinsL13:
   private def isProperList(v: SchemeValue): Boolean = v match
     case ListVal(Nil, _) => true
     case ListVal(_, _)   => true
-    case PairVal(_, cdr) => isProperList(cdr)
+    case AnyPair(_, cdr) => isProperList(cdr)
     case _               => false
 
   private def assocOp(args: List[SchemeValue]): SchemeValue =
@@ -177,9 +177,9 @@ object BuiltinsL13:
   private def assocSearch(key: SchemeValue, lst: SchemeValue): SchemeValue =
     lst match
       case ListVal(Nil, _) => BoolVal(false)
-      case PairVal(pair, rest) =>
+      case AnyPair(pair, rest) =>
         pair match
-          case PairVal(k, _) if BuiltinsEquality.schemeEqual(k, key)      => pair
+          case AnyPair(k, _) if BuiltinsEquality.schemeEqual(k, key)      => pair
           case ListVal(k :: _, _) if BuiltinsEquality.schemeEqual(k, key) => pair
           case _                                                          => assocSearch(key, rest)
       case ListVal(elems, _) if elems.nonEmpty =>
@@ -270,8 +270,8 @@ object BuiltinsL13:
   private def collectChars(v: SchemeValue, acc: List[Char] = Nil): List[Char] =
     v match
       case ListVal(Nil, _)           => acc.reverse
-      case PairVal(CharVal(c), rest) => collectChars(rest, c :: acc)
-      case PairVal(other, _) =>
+      case AnyPair(CharVal(c), rest) => collectChars(rest, c :: acc)
+      case AnyPair(other, _) =>
         throw new EvalError(s"list->string: expected char, got: ${other.display}")
       case ListVal(elems, _) =>
         collectChars(Builtins.listToPairs(elems), acc)

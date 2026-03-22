@@ -65,7 +65,8 @@ object Interpreter:
       case ListVal(head :: args, pos) => evalApplication(head, args, pos, env)
 
       case _: LambdaVal => (expr, env, "")
-      case _: PairVal   => (expr, env, "")
+      case _: PairVal        => (expr, env, "")
+      case _: MutablePairVal => (expr, env, "")
 
   // ---------------------------------------------------------------------------
   // Non-tail helpers (used by eval)

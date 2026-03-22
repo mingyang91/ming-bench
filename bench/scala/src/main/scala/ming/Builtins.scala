@@ -39,16 +39,16 @@ object Builtins:
           case _        => throw new EvalError("not: expects 1 argument")
       case "cons" =>
         args match
-          case a :: b :: Nil => (PairVal(a, b), "")
+          case a :: b :: Nil => (makePair(a, b), "")
           case _             => throw new EvalError("cons: expects 2 arguments")
       case "car" =>
         args match
-          case PairVal(a, _) :: Nil      => (a, "")
+          case AnyPair(a, _) :: Nil => (a, "")
           case ListVal(h :: _, _) :: Nil => (h, "")
           case _                         => throw new EvalError("car: expects a pair")
       case "cdr" =>
         args match
-          case PairVal(_, d) :: Nil      => (d, "")
+          case AnyPair(_, d) :: Nil      => (d, "")
           case ListVal(_ :: t, _) :: Nil => (listToPairs(t), "")
           case _                         => throw new EvalError("cdr: expects a pair")
       case "null?" =>
@@ -115,23 +115,27 @@ object Builtins:
 
   def isPair(v: SchemeValue): Boolean = v match
     case _: PairVal         => true
+    case _: MutablePairVal  => true
     case ListVal(_ :: _, _) => true
     case _                  => false
 
+  def makePair(car: SchemeValue, cdr: SchemeValue): MutablePairVal =
+    MutablePairVal(Array(car, cdr))
+
   def listToPairs(elements: List[SchemeValue]): SchemeValue =
-    elements.foldRight(ListVal(Nil): SchemeValue)((el, acc) => PairVal(el, acc))
+    elements.foldRight(ListVal(Nil): SchemeValue)((el, acc) => makePair(el, acc))
 
   private def pairLength(v: SchemeValue): Long = v match
-    case ListVal(Nil, _) => 0
-    case ListVal(es, _)  => es.length.toLong
-    case PairVal(_, cdr) => 1 + pairLength(cdr)
-    case _               => throw new EvalError("length: not a proper list")
+    case ListVal(Nil, _)  => 0
+    case ListVal(es, _)   => es.length.toLong
+    case AnyPair(_, cdr)  => 1 + pairLength(cdr)
+    case _                => throw new EvalError("length: not a proper list")
 
   private def appendLists(a: SchemeValue, b: SchemeValue): SchemeValue =
     a match
       case ListVal(Nil, _)    => b
-      case PairVal(h, t)      => PairVal(h, appendLists(t, b))
-      case ListVal(h :: t, _) => PairVal(h, appendLists(listToPairs(t), b))
+      case AnyPair(h, t)      => makePair(h, appendLists(t, b))
+      case ListVal(h :: t, _) => makePair(h, appendLists(listToPairs(t), b))
       case _                  => throw new EvalError("append: not a proper list")
 
   private def asInt(v: SchemeValue): Long = v match

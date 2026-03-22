@@ -8,7 +8,9 @@ enum SchemeValue:
   case SymbolVal(name: String, pos: Option[(Int, Int)] = None)
   case ListVal(elements: List[SchemeValue], pos: Option[(Int, Int)] = None)
   case MutableStringVal(chars: Array[Char])
+  case VectorVal(elements: Array[SchemeValue])
   case PairVal(car: SchemeValue, cdr: SchemeValue)
+  case MutablePairVal(cell: Array[SchemeValue])
 
   case LambdaVal(
     params: List[String],
@@ -33,10 +35,11 @@ enum SchemeValue:
     case BoolVal(b)           => if b then "#t" else "#f"
     case StringVal(s)         => "\"" + s + "\""
     case MutableStringVal(cs) => "\"" + String(cs) + "\""
+    case VectorVal(es)        => "#(" + es.map(_.display).mkString(" ") + ")"
     case CharVal(c)           => s"#\\$c"
     case SymbolVal(n, _)      => n
     case ListVal(es, _)       => "(" + es.map(_.display).mkString(" ") + ")"
-    case p: PairVal           => "(" + displayPairInner(p) + ")"
+    case AnyPair(_, _)        => "(" + displayAnyPairInner(this) + ")"
     case _: LambdaVal         => "#<procedure>"
     case _: ContinuationVal   => "#<continuation>"
     case _: MacroVal          => "#<macro>"
@@ -48,6 +51,7 @@ enum SchemeValue:
     case StringVal(s)         => s
     case MutableStringVal(cs) => String(cs)
     case CharVal(c)           => c.toString
+    case VectorVal(es)        => "#(" + es.map(_.display).mkString(" ") + ")"
     case Cell(arr)            => arr(0).displayOut
     case other                => other.display
 
@@ -57,9 +61,20 @@ enum SchemeValue:
     case _: ContinuationVal => true
     case _                  => true
 
-  private def displayPairInner(p: PairVal): String =
-    p.cdr match
-      case ListVal(Nil, _) => p.car.display
-      case p2: PairVal     => p.car.display + " " + displayPairInner(p2)
-      case ListVal(es, _)  => p.car.display + " " + es.map(_.display).mkString(" ")
-      case other           => p.car.display + " . " + other.display
+  private def displayAnyPairInner(p: SchemeValue): String =
+    val (hd, tl) = p match
+      case PairVal(a, b)        => (a, b)
+      case MutablePairVal(data) => (data(0), data(1))
+      case _                    => return p.display
+    tl match
+      case ListVal(Nil, _) => hd.display
+      case AnyPair(_, _)   => hd.display + " " + displayAnyPairInner(tl)
+      case ListVal(es, _)  => hd.display + " " + es.map(_.display).mkString(" ")
+      case other           => hd.display + " . " + other.display
+
+/** Extractor for both PairVal and MutablePairVal. */
+object AnyPair:
+  def unapply(v: SchemeValue): Option[(SchemeValue, SchemeValue)] = v match
+    case SchemeValue.PairVal(a, b)        => Some((a, b))
+    case SchemeValue.MutablePairVal(data) => Some((data(0), data(1)))
+    case _                                => None

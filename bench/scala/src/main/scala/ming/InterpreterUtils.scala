@@ -44,7 +44,7 @@ object InterpreterUtils:
     v match
       case ListVal(Nil, _)   => Nil
       case ListVal(es, _)    => es
-      case PairVal(car, cdr) => car :: schemeListToList(cdr)
+      case AnyPair(car, cdr) => car :: schemeListToList(cdr)
       case _                 => throw new EvalError("apply: last argument must be a list")
 
   def extractDefineName(expr: SchemeValue): String = expr match
