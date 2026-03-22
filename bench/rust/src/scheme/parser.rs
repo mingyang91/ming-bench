@@ -1,8 +1,8 @@
-use crate::scheme::EvalError;
+use crate::scheme::error::{EvalError, EvalErrorKind, Span};
 
-/// A parsed S-expression.
+/// A parsed S-expression kind.
 #[derive(Debug, Clone, PartialEq)]
-pub enum Expr {
+pub enum ExprKind {
     Integer(i64),
     Boolean(bool),
     SchemeString(String),
@@ -10,47 +10,87 @@ pub enum Expr {
     List(Vec<Expr>),
 }
 
-/// Tokenize input into a list of token strings.
-fn tokenize(input: &str) -> Vec<String> {
+/// A parsed S-expression with source position.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Expr {
+    pub kind: ExprKind,
+    pub span: Span,
+}
+
+/// A token with source position.
+struct Token {
+    text: String,
+    span: Span,
+}
+
+/// Tokenize input into a list of tokens with position info.
+fn tokenize(input: &str) -> Vec<Token> {
     let mut tokens = Vec::new();
     let chars: Vec<char> = input.chars().collect();
     let mut i = 0;
+    let mut line = 1usize;
+    let mut col = 1usize;
 
     while i < chars.len() {
         match chars[i] {
-            // Skip whitespace
             c if c.is_whitespace() => {
+                if c == '\n' {
+                    line += 1;
+                    col = 1;
+                } else {
+                    col += 1;
+                }
                 i += 1;
             }
-            // Skip line comments
             ';' => {
                 while i < chars.len() && chars[i] != '\n' {
                     i += 1;
                 }
             }
             '(' => {
-                tokens.push("(".into());
+                tokens.push(Token {
+                    text: "(".into(),
+                    span: Span { line, col },
+                });
                 i += 1;
+                col += 1;
             }
             ')' => {
-                tokens.push(")".into());
+                tokens.push(Token {
+                    text: ")".into(),
+                    span: Span { line, col },
+                });
                 i += 1;
+                col += 1;
             }
             '\'' => {
-                tokens.push("'".into());
+                tokens.push(Token {
+                    text: "'".into(),
+                    span: Span { line, col },
+                });
                 i += 1;
+                col += 1;
             }
-            // String literal
             '"' => {
+                let start_line = line;
+                let start_col = col;
                 let mut s = String::new();
                 s.push('"');
                 i += 1;
+                col += 1;
                 while i < chars.len() && chars[i] != '"' {
                     if chars[i] == '\\' && i + 1 < chars.len() {
                         s.push(chars[i]);
                         s.push(chars[i + 1]);
                         i += 2;
+                        col += 2;
                     } else {
+                        if chars[i] == '\n' {
+                            line += 1;
+                            col = 1;
+                        } else {
+                            col += 1;
+                        }
                         s.push(chars[i]);
                         i += 1;
                     }
@@ -58,22 +98,41 @@ fn tokenize(input: &str) -> Vec<String> {
                 if i < chars.len() {
                     s.push('"');
                     i += 1;
+                    col += 1;
                 }
-                tokens.push(s);
+                tokens.push(Token {
+                    text: s,
+                    span: Span {
+                        line: start_line,
+                        col: start_col,
+                    },
+                });
             }
-            // #t, #f, #\char
             '#' => {
+                let start_col = col;
                 let mut tok = String::new();
                 tok.push('#');
                 i += 1;
-                while i < chars.len() && !chars[i].is_whitespace() && chars[i] != '(' && chars[i] != ')' {
+                col += 1;
+                while i < chars.len()
+                    && !chars[i].is_whitespace()
+                    && chars[i] != '('
+                    && chars[i] != ')'
+                {
                     tok.push(chars[i]);
                     i += 1;
+                    col += 1;
                 }
-                tokens.push(tok);
+                tokens.push(Token {
+                    text: tok,
+                    span: Span {
+                        line,
+                        col: start_col,
+                    },
+                });
             }
-            // Symbol or number
             _ => {
+                let start_col = col;
                 let mut tok = String::new();
                 while i < chars.len()
                     && !chars[i].is_whitespace()
@@ -84,8 +143,15 @@ fn tokenize(input: &str) -> Vec<String> {
                 {
                     tok.push(chars[i]);
                     i += 1;
+                    col += 1;
                 }
-                tokens.push(tok);
+                tokens.push(Token {
+                    text: tok,
+                    span: Span {
+                        line,
+                        col: start_col,
+                    },
+                });
             }
         }
     }
@@ -93,58 +159,83 @@ fn tokenize(input: &str) -> Vec<String> {
     tokens
 }
 
-/// Parse a single expression from the token stream, returning the expr
-/// and the number of tokens consumed.
-fn parse_expr(tokens: &[String], pos: usize) -> Result<(Expr, usize), EvalError> {
+/// Parse a single expression from the token stream.
+fn parse_expr(tokens: &[Token], pos: usize) -> Result<(Expr, usize), EvalError> {
     if pos >= tokens.len() {
-        return Err(EvalError::Parse {
+        return Err(EvalErrorKind::Parse {
             message: "unexpected end of input".into(),
-        });
+        }
+        .into());
     }
 
     let token = &tokens[pos];
 
-    match token.as_str() {
+    match token.text.as_str() {
         "(" => {
+            let span = token.span.clone();
             let mut elements = Vec::new();
             let mut i = pos + 1;
-            while i < tokens.len() && tokens[i] != ")" {
+            while i < tokens.len() && tokens[i].text != ")" {
                 let (expr, next) = parse_expr(tokens, i)?;
                 elements.push(expr);
                 i = next;
             }
             if i >= tokens.len() {
-                return Err(EvalError::Parse {
+                return Err(EvalErrorKind::Parse {
                     message: "missing closing parenthesis".into(),
-                });
+                }
+                .at(&span));
             }
-            Ok((Expr::List(elements), i + 1))
+            Ok((
+                Expr {
+                    kind: ExprKind::List(elements),
+                    span,
+                },
+                i + 1,
+            ))
         }
-        ")" => Err(EvalError::Parse {
+        ")" => Err(EvalErrorKind::Parse {
             message: "unexpected closing parenthesis".into(),
-        }),
-        "'" => {
-            let (expr, next) = parse_expr(tokens, pos + 1)?;
-            Ok((Expr::List(vec![Expr::Symbol("quote".into()), expr]), next))
         }
-        _ => Ok((parse_atom(token)?, pos + 1)),
+        .at(&token.span)),
+        "'" => {
+            let span = token.span.clone();
+            let (expr, next) = parse_expr(tokens, pos + 1)?;
+            Ok((
+                Expr {
+                    kind: ExprKind::List(vec![
+                        Expr {
+                            kind: ExprKind::Symbol("quote".into()),
+                            span: span.clone(),
+                        },
+                        expr,
+                    ]),
+                    span,
+                },
+                next,
+            ))
+        }
+        _ => {
+            let span = token.span.clone();
+            let kind = parse_atom(&token.text)?;
+            Ok((Expr { kind, span }, pos + 1))
+        }
     }
 }
 
-/// Parse an atom token into an Expr.
-fn parse_atom(token: &str) -> Result<Expr, EvalError> {
+/// Parse an atom token into an ExprKind.
+fn parse_atom(token: &str) -> Result<ExprKind, EvalError> {
     // Booleans
     if token == "#t" {
-        return Ok(Expr::Boolean(true));
+        return Ok(ExprKind::Boolean(true));
     }
     if token == "#f" {
-        return Ok(Expr::Boolean(false));
+        return Ok(ExprKind::Boolean(false));
     }
 
     // String literal
     if token.starts_with('"') && token.ends_with('"') && token.len() >= 2 {
         let inner = &token[1..token.len() - 1];
-        // Handle escape sequences
         let mut result = String::new();
         let chars: Vec<char> = inner.chars().collect();
         let mut i = 0;
@@ -166,16 +257,16 @@ fn parse_atom(token: &str) -> Result<Expr, EvalError> {
                 i += 1;
             }
         }
-        return Ok(Expr::SchemeString(result));
+        return Ok(ExprKind::SchemeString(result));
     }
 
     // Integer
     if let Ok(n) = token.parse::<i64>() {
-        return Ok(Expr::Integer(n));
+        return Ok(ExprKind::Integer(n));
     }
 
     // Symbol
-    Ok(Expr::Symbol(token.to_string()))
+    Ok(ExprKind::Symbol(token.to_string()))
 }
 
 /// Parse the full input into a list of top-level expressions.

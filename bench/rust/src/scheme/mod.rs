@@ -11,9 +11,10 @@ pub use error::EvalError;
 pub fn eval_str(input: &str) -> Result<String, EvalError> {
     let exprs = parser::parse(input)?;
     if exprs.is_empty() {
-        return Err(EvalError::Parse {
+        return Err(error::EvalErrorKind::Parse {
             message: "no expressions".into(),
-        });
+        }
+        .into());
     }
     let env = env::Env::new();
     let mut result = None;

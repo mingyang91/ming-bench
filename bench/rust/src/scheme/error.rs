@@ -1,6 +1,13 @@
-/// Evaluation error type for the Scheme interpreter.
+/// Source position information.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Span {
+    pub line: usize,
+    pub col: usize,
+}
+
+/// Evaluation error kind.
 #[derive(Debug, PartialEq, thiserror::Error)]
-pub enum EvalError {
+pub enum EvalErrorKind {
     #[error("parse error: {message}")]
     Parse { message: String },
 
@@ -22,4 +29,46 @@ pub enum EvalError {
 
     #[error("not a procedure: {value}")]
     NotAProcedure { value: String },
+}
+
+impl EvalErrorKind {
+    pub fn at(self, span: &Span) -> EvalError {
+        EvalError {
+            kind: self,
+            span: Some(span.clone()),
+        }
+    }
+}
+
+/// Evaluation error with optional source position.
+#[derive(Debug, PartialEq)]
+pub struct EvalError {
+    pub kind: EvalErrorKind,
+    pub span: Option<Span>,
+}
+
+impl std::fmt::Display for EvalError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match &self.span {
+            Some(span) => write!(f, "{} at {}:{}", self.kind, span.line, span.col),
+            None => write!(f, "{}", self.kind),
+        }
+    }
+}
+
+impl std::error::Error for EvalError {}
+
+impl EvalError {
+    pub fn with_span(mut self, span: &Span) -> Self {
+        if self.span.is_none() {
+            self.span = Some(span.clone());
+        }
+        self
+    }
+}
+
+impl From<EvalErrorKind> for EvalError {
+    fn from(kind: EvalErrorKind) -> Self {
+        EvalError { kind, span: None }
+    }
 }

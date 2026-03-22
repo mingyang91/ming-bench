@@ -2,7 +2,7 @@ use std::cell::RefCell;
 use std::collections::HashMap;
 use std::rc::Rc;
 
-use crate::scheme::error::EvalError;
+use crate::scheme::error::{EvalError, EvalErrorKind};
 use crate::scheme::value::Value;
 
 #[derive(Debug, Clone)]
@@ -46,9 +46,10 @@ impl Env {
         } else if let Some(parent) = &inner.parent {
             parent.lookup(name)
         } else {
-            Err(EvalError::UnboundVariable {
+            Err(EvalErrorKind::UnboundVariable {
                 name: name.to_string(),
-            })
+            }
+            .into())
         }
     }
 }
