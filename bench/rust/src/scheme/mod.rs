@@ -49,6 +49,7 @@ enum Value {
         env: Env,
     },
     Vector(Rc<RefCell<Vec<Value>>>),
+    Values(Vec<Value>),
 }
 
 type Output = Rc<RefCell<std::string::String>>;
@@ -93,6 +94,10 @@ impl Value {
             Value::Vector(v) => {
                 let items: Vec<String> = v.borrow().iter().map(|v| v.display()).collect();
                 format!("#({})", items.join(" "))
+            }
+            Value::Values(vals) => {
+                let inner: Vec<String> = vals.iter().map(|v| v.display()).collect();
+                inner.join("\n")
             }
         }
     }
@@ -812,6 +817,9 @@ fn eval(expr: &Expr, env: &Env, out: &Output) -> Result<Value, EvalError> {
                     }
                     Value::Builtin(ref name) if name == "for-each" => {
                         return eval_for_each(&args, span, out);
+                    }
+                    Value::Builtin(ref name) if name == "call-with-values" => {
+                        return eval_call_with_values(&args, span, out);
                     }
                     Value::Builtin(ref name) => {
                         return eval_builtin(name, &args, span);
@@ -1536,6 +1544,16 @@ fn call_func(func: &Value, args: &[Value], span: Span, out: &Output) -> Result<V
             }
             Ok(result)
         }
+        Value::Builtin(ref name) if name == "call-with-values" => {
+            eval_call_with_values(args, span, out)
+        }
+        Value::Builtin(ref name) if name == "values" => {
+            if args.len() == 1 {
+                Ok(args[0].clone())
+            } else {
+                Ok(Value::Values(args.to_vec()))
+            }
+        }
         Value::Builtin(ref name) => eval_builtin(name, args, span),
         _ => Err(EvalError::Type(span.fmt("not a procedure"))),
     }
@@ -1574,6 +1592,20 @@ fn eval_for_each(args: &[Value], span: Span, out: &Output) -> Result<Value, Eval
         call_func(func, &call_args, span, out)?;
     }
     Ok(Value::Boolean(false))
+}
+
+fn eval_call_with_values(args: &[Value], span: Span, out: &Output) -> Result<Value, EvalError> {
+    if args.len() != 2 {
+        return Err(EvalError::Arity(span.fmt("call-with-values requires 2 arguments")));
+    }
+    let producer = &args[0];
+    let consumer = &args[1];
+    let produced = call_func(producer, &[], span, out)?;
+    let call_args = match produced {
+        Value::Values(vals) => vals,
+        other => vec![other],
+    };
+    call_func(consumer, &call_args, span, out)
 }
 
 fn eval_builtin(op: &str, args: &[Value], span: Span) -> Result<Value, EvalError> {
@@ -2093,6 +2125,13 @@ fn eval_builtin(op: &str, args: &[Value], span: Span) -> Result<Value, EvalError
                 _ => Err(EvalError::Type(span.fmt("list->vector: expected list"))),
             }
         }
+        "values" => {
+            if args.len() == 1 {
+                Ok(args[0].clone())
+            } else {
+                Ok(Value::Values(args.to_vec()))
+            }
+        }
         _ => Err(EvalError::UnboundVariable(span.fmt(op))),
     }
 }
@@ -2139,6 +2178,7 @@ fn make_default_env() -> Env {
         "vector", "make-vector", "vector-ref", "vector-set!",
         "vector-length", "vector?", "vector->list", "list->vector",
         "raise", "with-exception-handler",
+        "values", "call-with-values",
     ] {
         env_set(&env, name.to_string(), Value::Builtin(name.to_string()));
     }
