@@ -14,7 +14,7 @@ function fmtPos(pos: Pos): string {
 // ── AST ──────────────────────────────────────────────────────────────
 
 type Expr =
-  | { tag: 'number'; value: number; pos: Pos }
+  | { tag: 'number'; value: number; pos: Pos; exact?: boolean; num?: number; den?: number }
   | { tag: 'boolean'; value: boolean; pos: Pos }
   | { tag: 'string'; value: string; pos: Pos }
   | { tag: 'char'; value: string; pos: Pos }
@@ -155,9 +155,23 @@ function parseTokens(tokens: Token[], idx: number): [Expr, number] {
     return [{ tag: 'char', value: ch, pos: p }, idx + 1];
   }
 
-  // number
+  // rational literal: e.g. 1/3, -5/2
+  if (/^-?\d+\/\d+$/.test(tok.text)) {
+    const parts = tok.text.split('/');
+    const num = parseInt(parts[0], 10);
+    const den = parseInt(parts[1], 10);
+    const simplified = mkExact(num, den);
+    return [{ tag: 'number', value: simplified.value, pos: p, exact: true, num: simplified.num, den: simplified.den } as Expr & { tag: 'number' }, idx + 1];
+  }
+
+  // number (integer)
   if (/^-?\d+$/.test(tok.text)) {
     return [{ tag: 'number', value: parseInt(tok.text, 10), pos: p }, idx + 1];
+  }
+
+  // float literal: e.g. 1.5, -0.5
+  if (/^-?\d+\.\d+$/.test(tok.text)) {
+    return [{ tag: 'number', value: parseFloat(tok.text), pos: p, exact: false }, idx + 1];
   }
 
   // string
@@ -215,7 +229,7 @@ class Env {
 // ── Values ───────────────────────────────────────────────────────────
 
 type Value =
-  | { tag: 'number'; value: number }
+  | { tag: 'number'; value: number; exact?: boolean; num?: number; den?: number }
   | { tag: 'boolean'; value: boolean }
   | { tag: 'string'; value: string }
   | { tag: 'char'; value: string }
@@ -232,9 +246,59 @@ function isTruthy(v: Value): boolean {
   return !(v.tag === 'boolean' && v.value === false);
 }
 
+// ── Rational number helpers ─────────────────────────────────────────
+
+function gcd(a: number, b: number): number {
+  a = Math.abs(a); b = Math.abs(b);
+  while (b) { [a, b] = [b, a % b]; }
+  return a;
+}
+
+function mkExact(num: number, den: number): Value & { tag: 'number' } {
+  if (den === 0) throw new EvalError('division by zero');
+  if (den < 0) { num = -num; den = -den; }
+  const g = gcd(num, den);
+  num = num / g; den = den / g;
+  return { tag: 'number', value: num / den, exact: true, num, den };
+}
+
+function mkExactInt(n: number): Value & { tag: 'number' } {
+  return { tag: 'number', value: n, exact: true, num: n, den: 1 };
+}
+
+function mkInexact(v: number): Value & { tag: 'number' } {
+  return { tag: 'number', value: v, exact: false };
+}
+
+function isExactVal(v: Value & { tag: 'number' }): boolean {
+  return v.exact !== false;
+}
+
+function getNum(v: Value & { tag: 'number' }): number {
+  return v.num ?? v.value;
+}
+
+function getDen(v: Value & { tag: 'number' }): number {
+  return v.den ?? 1;
+}
+
+function displayNumber(v: Value & { tag: 'number' }): string {
+  if (v.exact === false) {
+    // Inexact: show as float
+    const s = String(v.value);
+    if (Number.isFinite(v.value) && !s.includes('.') && !s.includes('e')) return s + '.0';
+    return s;
+  }
+  // Exact
+  const den = getDen(v);
+  const num = getNum(v);
+  if (den === 1) return String(num);
+  return `${num}/${den}`;
+}
+
 function displayValue(v: Value): string {
   switch (v.tag) {
-    case 'number': return String(v.value);
+    case 'number': return displayNumber(v);
     case 'boolean': return v.value ? '#t' : '#f';
     case 'string': return `"${v.value}"`;
     case 'char': return `#\\${v.value}`;
@@ -311,6 +375,7 @@ const exceptionHandlers: ((val: Value) => Value)[] = [];
 // ── eqv? comparison (used by case) ───────────────────────────────────
 
 function eqvCompare(a: Value, b: Value): boolean {
+  if (a.tag === 'number' && b.tag === 'number') return a.value === b.value;
   if (a.tag !== b.tag) return false;
   switch (a.tag) {
     case 'number': return a.value === (b as typeof a).value;
@@ -332,31 +397,75 @@ function requireNumbers(args: Value[], name: string): number[] {
   });
 }
 
+function requireNumVals(args: Value[], name: string): (Value & { tag: 'number' })[] {
+  return args.map(a => {
+    if (a.tag !== 'number') throw new EvalError(`${name}: expected number`);
+    return a as Value & { tag: 'number' };
+  });
+}
+
+function allExact(vs: (Value & { tag: 'number' })[]): boolean {
+  return vs.every(v => isExactVal(v));
+}
+
+function ratAdd(a: Value & { tag: 'number' }, b: Value & { tag: 'number' }): Value {
+  if (isExactVal(a) && isExactVal(b)) {
+    const an = getNum(a), ad = getDen(a), bn = getNum(b), bd = getDen(b);
+    return mkExact(an * bd + bn * ad, ad * bd);
+  }
+  return mkInexact(a.value + b.value);
+}
+
+function ratSub(a: Value & { tag: 'number' }, b: Value & { tag: 'number' }): Value {
+  if (isExactVal(a) && isExactVal(b)) {
+    const an = getNum(a), ad = getDen(a), bn = getNum(b), bd = getDen(b);
+    return mkExact(an * bd - bn * ad, ad * bd);
+  }
+  return mkInexact(a.value - b.value);
+}
+
+function ratMul(a: Value & { tag: 'number' }, b: Value & { tag: 'number' }): Value {
+  if (isExactVal(a) && isExactVal(b)) {
+    return mkExact(getNum(a) * getNum(b), getDen(a) * getDen(b));
+  }
+  return mkInexact(a.value * b.value);
+}
+
+function ratDiv(a: Value & { tag: 'number' }, b: Value & { tag: 'number' }): Value {
+  if (b.value === 0) throw new EvalError('division by zero');
+  if (isExactVal(a) && isExactVal(b)) {
+    return mkExact(getNum(a) * getDen(b), getDen(a) * getNum(b));
+  }
+  return mkInexact(a.value / b.value);
+}
+
 function makeGlobalEnv(output: string[] = []): Env {
   const env = new Env();
 
   const numBuiltins: Record<string, (args: Value[]) => Value> = {
     '+'(args) {
-      const nums = requireNumbers(args, '+');
-      return { tag: 'number', value: nums.reduce((a, b) => a + b, 0) };
+      const vs = requireNumVals(args, '+');
+      if (vs.length === 0) return mkExactInt(0);
+      return vs.reduce((a, b) => ratAdd(a, b) as Value & { tag: 'number' });
     },
     '-'(args) {
       if (args.length === 0) throw new EvalError('-: need at least 1 argument');
-      const nums = requireNumbers(args, '-');
-      if (nums.length === 1) return { tag: 'number', value: -nums[0] };
-      return { tag: 'number', value: nums.slice(1).reduce((a, b) => a - b, nums[0]) };
+      const vs = requireNumVals(args, '-');
+      if (vs.length === 1) {
+        if (isExactVal(vs[0])) return mkExact(-getNum(vs[0]), getDen(vs[0]));
+        return mkInexact(-vs[0].value);
+      }
+      return vs.slice(1).reduce((a, b) => ratSub(a, b) as Value & { tag: 'number' }, vs[0]);
     },
     '*'(args) {
-      const nums = requireNumbers(args, '*');
-      return { tag: 'number', value: nums.reduce((a, b) => a * b, 1) };
+      const vs = requireNumVals(args, '*');
+      if (vs.length === 0) return mkExactInt(1);
+      return vs.reduce((a, b) => ratMul(a, b) as Value & { tag: 'number' });
     },
     '/'(args) {
       if (args.length < 2) throw new EvalError('/: need at least 2 arguments');
-      const nums = requireNumbers(args, '/');
-      return { tag: 'number', value: nums.slice(1).reduce((a, b) => {
-        if (b === 0) throw new EvalError('division by zero');
-        return Math.trunc(a / b);
-      }, nums[0]) };
+      const vs = requireNumVals(args, '/');
+      return vs.slice(1).reduce((a, b) => ratDiv(a, b) as Value & { tag: 'number' }, vs[0]);
     },
     '<'(args) {
       const nums = requireNumbers(args, '<');
@@ -515,7 +624,7 @@ function makeGlobalEnv(output: string[] = []): Env {
   }});
   env.define('number->string', { tag: 'builtin', name: 'number->string', fn(args) {
     if (args.length !== 1 || args[0].tag !== 'number') throw new EvalError('number->string: expected number');
-    return { tag: 'string', value: String(args[0].value) };
+    return { tag: 'string', value: displayNumber(args[0]) };
   }});
   env.define('symbol->string', { tag: 'builtin', name: 'symbol->string', fn(args) {
     if (args.length !== 1 || args[0].tag !== 'symbol') throw new EvalError('symbol->string: expected symbol');
@@ -898,6 +1007,56 @@ function makeGlobalEnv(output: string[] = []): Env {
     return { tag: 'vector', items };
   }});
 
+  // L19: exact/inexact and rational builtins
+  env.define('exact?', { tag: 'builtin', name: 'exact?', fn(args) {
+    if (args.length !== 1 || args[0].tag !== 'number') throw new EvalError('exact?: expected number');
+    return { tag: 'boolean', value: isExactVal(args[0]) };
+  }});
+  env.define('inexact?', { tag: 'builtin', name: 'inexact?', fn(args) {
+    if (args.length !== 1 || args[0].tag !== 'number') throw new EvalError('inexact?: expected number');
+    return { tag: 'boolean', value: !isExactVal(args[0]) };
+  }});
+  env.define('exact->inexact', { tag: 'builtin', name: 'exact->inexact', fn(args) {
+    if (args.length !== 1 || args[0].tag !== 'number') throw new EvalError('exact->inexact: expected number');
+    return mkInexact(args[0].value);
+  }});
+  env.define('inexact->exact', { tag: 'builtin', name: 'inexact->exact', fn(args) {
+    if (args.length !== 1 || args[0].tag !== 'number') throw new EvalError('inexact->exact: expected number');
+    // Convert float to exact rational via continued fraction approximation
+    const v = args[0].value;
+    if (Number.isInteger(v)) return mkExactInt(v);
+    // Use simple rational approximation: multiply by power of 10, then simplify
+    const str = String(v);
+    const dotIdx = str.indexOf('.');
+    if (dotIdx >= 0) {
+      const decimals = str.length - dotIdx - 1;
+      const den = Math.pow(10, decimals);
+      const num = Math.round(v * den);
+      return mkExact(num, den);
+    }
+    return mkExactInt(v);
+  }});
+  env.define('numerator', { tag: 'builtin', name: 'numerator', fn(args) {
+    if (args.length !== 1 || args[0].tag !== 'number') throw new EvalError('numerator: expected number');
+    if (isExactVal(args[0])) return mkExactInt(getNum(args[0]));
+    return mkInexact(args[0].value); // for inexact, numerator is the value itself if integer-valued
+  }});
+  env.define('denominator', { tag: 'builtin', name: 'denominator', fn(args) {
+    if (args.length !== 1 || args[0].tag !== 'number') throw new EvalError('denominator: expected number');
+    if (isExactVal(args[0])) return mkExactInt(getDen(args[0]));
+    return mkInexact(1.0);
+  }});
+  env.define('rational?', { tag: 'builtin', name: 'rational?', fn(args) {
+    if (args.length !== 1) throw new EvalError('rational?: expected 1 argument');
+    return { tag: 'boolean', value: args[0].tag === 'number' };
+  }});
+  env.define('integer?', { tag: 'builtin', name: 'integer?', fn(args) {
+    if (args.length !== 1) throw new EvalError('integer?: expected 1 argument');
+    if (args[0].tag !== 'number') return { tag: 'boolean', value: false };
+    if (isExactVal(args[0])) return { tag: 'boolean', value: getDen(args[0]) === 1 };
+    return { tag: 'boolean', value: Number.isInteger(args[0].value) };
+  }});
+
   // call/cc — handled specially by the evaluator
   env.define('call/cc', { tag: 'builtin', name: 'call/cc', fn() { throw new EvalError('call/cc: internal'); } });
   env.define('call-with-current-continuation', { tag: 'builtin', name: 'call/cc', fn() { throw new EvalError('call/cc: internal'); } });
@@ -930,7 +1089,7 @@ function makeGlobalEnv(output: string[] = []): Env {
 
 function exprToValue(expr: Expr): Value {
   switch (expr.tag) {
-    case 'number': return { tag: 'number', value: expr.value };
+    case 'number': return { tag: 'number', value: expr.value, exact: expr.exact, num: expr.num, den: expr.den };
     case 'boolean': return { tag: 'boolean', value: expr.value };
     case 'string': return { tag: 'string', value: expr.value };
     case 'char': return { tag: 'char', value: expr.value };
@@ -1184,7 +1343,7 @@ function evaluate(expr: Expr, env: Env): Value {
   // Trampoline loop for TCO — tail positions reassign expr/env and continue
   trampoline: while (true) {
   switch (expr.tag) {
-    case 'number': return { tag: 'number', value: expr.value };
+    case 'number': return { tag: 'number', value: expr.value, exact: expr.exact, num: expr.num, den: expr.den };
     case 'boolean': return { tag: 'boolean', value: expr.value };
     case 'string': return { tag: 'string', value: expr.value };
     case 'char': return { tag: 'char', value: expr.value };
