@@ -15,6 +15,12 @@ public class Interpreter {
     final Map<Integer, ContData> continuationData = new HashMap<>();
     final IdentityHashMap<SchemeValue, SchemeValue> pendingReturns = new IdentityHashMap<>();
     int topLevelIndex = 0;
+    // syntax-case bindings stack
+    MacroExpander.Bindings currentSyntaxBindings;
+    Environment currentSyntaxDefEnv;
+    Environment currentTransformerDefEnv;
+    java.util.Set<String> currentTransformerBoundNames;
+
     // Tracks the outermost let body for continuation restart.
     // Only set once (first let encountered); inner lets don't overwrite it.
     private List<SchemeValue> outerLetBody;
@@ -221,6 +227,15 @@ public class Interpreter {
         builtin("string->symbol", args -> {
             if (args.size() != 1) throw new EvalError("string->symbol: expected 1 argument");
             return new SchemeValue.SymbolVal(requireString(args.getFirst(), "string->symbol"));
+        });
+        builtin("syntax->datum", args -> {
+            if (args.size() != 1) throw new EvalError("syntax->datum: expected 1 argument");
+            return syntaxToDatum(args.getFirst());
+        });
+        builtin("datum->syntax", args -> {
+            if (args.size() != 2) throw new EvalError("datum->syntax: expected 2 arguments");
+            // (datum->syntax template-id datum) — datum is already a scheme value
+            return args.get(1);
         });
         builtin("string-ref", args -> {
             if (args.size() != 2) throw new EvalError("string-ref: expected 2 arguments");
@@ -935,6 +950,7 @@ public class Interpreter {
                 case SchemeValue.MutableStringVal v -> { return v; }
                 case SchemeValue.ContinuationVal v -> { return v; }
                 case SchemeValue.SyntaxRulesVal v -> { return v; }
+                case SchemeValue.TransformerVal v -> { return v; }
                 case SchemeValue.VectorVal v -> { return v; }
                 case SchemeValue.ValuesVal v -> { return v; }
                 case SchemeValue.RecordVal v -> { return v; }
@@ -1076,7 +1092,18 @@ public class Interpreter {
                                 if (elements.size() != 3) throw new EvalError(posPrefix(listVal) + "define-syntax: bad syntax");
                                 if (!(elements.get(1) instanceof SchemeValue.SymbolVal nameSym))
                                     throw new EvalError(posPrefix(listVal) + "define-syntax: expected symbol");
-                                SchemeValue transformer = evalSyntaxRules(elements.get(2), env);
+                                SchemeValue transformerExpr = elements.get(2);
+                                SchemeValue transformer;
+                                if (transformerExpr instanceof SchemeValue.ListVal tl
+                                    && !tl.elements().isEmpty()
+                                    && tl.elements().getFirst() instanceof SchemeValue.SymbolVal ts
+                                    && ts.name().equals("syntax-rules")) {
+                                    transformer = evalSyntaxRules(transformerExpr, env);
+                                } else {
+                                    // Evaluate as expression (e.g., lambda transformer for syntax-case)
+                                    SchemeValue proc = eval(transformerExpr, env);
+                                    transformer = new SchemeValue.TransformerVal(proc, env, env.boundNames());
+                                }
                                 env.define(nameSym.name(), transformer);
                                 return new SchemeValue.VoidVal();
                             }
@@ -1324,6 +1351,92 @@ public class Interpreter {
                                 if (matched) continue;
                                 return new SchemeValue.BoolVal(false);
                             }
+                            case "syntax-case" -> {
+                                // (syntax-case stx-expr (literal ...) clause ...)
+                                // clause = (pattern body) or (pattern fender body)
+                                if (elements.size() < 4) throw new EvalError("syntax-case: bad syntax");
+                                SchemeValue stxObj = eval(elements.get(1), env);
+                                var literals = new ArrayList<String>();
+                                if (elements.get(2) instanceof SchemeValue.ListVal litList) {
+                                    for (var lit : litList.elements()) {
+                                        if (lit instanceof SchemeValue.SymbolVal ls) literals.add(ls.name());
+                                    }
+                                }
+                                for (int ci = 3; ci < elements.size(); ci++) {
+                                    if (!(elements.get(ci) instanceof SchemeValue.ListVal clause))
+                                        throw new EvalError("syntax-case: bad clause");
+                                    var clauseElems = clause.elements();
+                                    if (clauseElems.size() < 2) throw new EvalError("syntax-case: bad clause");
+                                    SchemeValue pattern = clauseElems.get(0);
+                                    SchemeValue fender = clauseElems.size() == 3 ? clauseElems.get(1) : null;
+                                    SchemeValue body = clauseElems.getLast();
+
+                                    var bindings = new MacroExpander.Bindings();
+                                    if (MacroExpander.matchPattern(pattern, stxObj, literals, bindings)) {
+                                        // Check fender if present
+                                        if (fender != null) {
+                                            var fenderEnv = new Environment(env);
+                                            bindSyntaxVars(fenderEnv, bindings);
+                                            SchemeValue fenderResult = eval(fender, fenderEnv);
+                                            if (!fenderResult.isTruthy()) continue;
+                                        }
+                                        // Push syntax bindings and evaluate body
+                                        var prevBindings = currentSyntaxBindings;
+                                        var prevDefEnv = currentSyntaxDefEnv;
+                                        var merged = mergeSyntaxBindings(prevBindings, bindings);
+                                        currentSyntaxBindings = merged;
+                                        currentSyntaxDefEnv = currentTransformerDefEnv != null ? currentTransformerDefEnv : env;
+                                        try {
+                                            return eval(body, env);
+                                        } finally {
+                                            currentSyntaxBindings = prevBindings;
+                                            currentSyntaxDefEnv = prevDefEnv;
+                                        }
+                                    }
+                                }
+                                throw new EvalError("syntax-case: no matching pattern");
+                            }
+                            case "syntax-quote" -> {
+                                // #'template — expand template with current syntax-case bindings
+                                if (elements.size() != 2) throw new EvalError("syntax-quote: expected 1 argument");
+                                if (currentSyntaxBindings == null)
+                                    throw new EvalError("syntax-quote: not in syntax-case context");
+                                int mark = MacroExpander.nextMark();
+                                var renames = new java.util.HashMap<String, String>();
+                                return MacroExpander.expandTemplate(elements.get(1), currentSyntaxBindings,
+                                    currentSyntaxDefEnv != null ? currentSyntaxDefEnv : env, mark, renames,
+                                    currentTransformerBoundNames);
+                            }
+                            case "with-syntax" -> {
+                                // (with-syntax ((pat expr) ...) body ...)
+                                if (elements.size() < 3) throw new EvalError("with-syntax: bad syntax");
+                                if (!(elements.get(1) instanceof SchemeValue.ListVal bindingsList))
+                                    throw new EvalError("with-syntax: expected bindings list");
+                                var extraBindings = new MacroExpander.Bindings();
+                                for (var binding : bindingsList.elements()) {
+                                    if (!(binding instanceof SchemeValue.ListVal bl) || bl.elements().size() != 2)
+                                        throw new EvalError("with-syntax: bad binding");
+                                    SchemeValue pat = bl.elements().get(0);
+                                    SchemeValue val = eval(bl.elements().get(1), env);
+                                    if (pat instanceof SchemeValue.SymbolVal sv) {
+                                        extraBindings.regular.put(sv.name(), val);
+                                    }
+                                }
+                                var prevBindings = currentSyntaxBindings;
+                                var prevDefEnv = currentSyntaxDefEnv;
+                                currentSyntaxBindings = mergeSyntaxBindings(prevBindings, extraBindings);
+                                if (currentSyntaxDefEnv == null) currentSyntaxDefEnv = env;
+                                try {
+                                    SchemeValue result = null;
+                                    for (int i = 2; i < elements.size(); i++) {
+                                        result = eval(elements.get(i), env);
+                                    }
+                                    return result;
+                                } finally {
+                                    currentSyntaxBindings = prevBindings;
+                                    currentSyntaxDefEnv = prevDefEnv;
+                                }
+                            }
                             default -> {
                                 // fall through to procedure call below
                             }
@@ -1334,6 +1447,20 @@ public class Interpreter {
                     // Macro expansion
                     if (proc instanceof SchemeValue.SyntaxRulesVal macro) {
                         expr = MacroExpander.expand(macro, listVal);
+                        continue;
+                    }
+                    if (proc instanceof SchemeValue.TransformerVal transformer) {
+                        // Call the transformer procedure with the syntax object (the original form)
+                        var prevTransformerDefEnv = currentTransformerDefEnv;
+                        var prevTransformerBoundNames = currentTransformerBoundNames;
+                        currentTransformerDefEnv = transformer.defEnv();
+                        currentTransformerBoundNames = transformer.defBoundNames();
+                        try {
+                            expr = callProc(transformer.proc(), List.of(listVal), posPrefix(listVal));
+                        } finally {
+                            currentTransformerDefEnv = prevTransformerDefEnv;
+                            currentTransformerBoundNames = prevTransformerBoundNames;
+                        }
                         continue;
                     }
                     var args = new ArrayList<SchemeValue>();
@@ -1403,6 +1530,45 @@ public class Interpreter {
             templates.add(rule.elements().get(1));
         }
         return new SchemeValue.SyntaxRulesVal(literals, patterns, templates, env);
+    }
+
+    private static SchemeValue syntaxToDatum(SchemeValue stx) {
+        // syntax->datum strips syntax information, returning bare data
+        // In our representation, syntax objects ARE data, so this is identity
+        // except for symbols which may have gensym marks — we return as-is
+        return stx;
+    }
+
+    private SchemeValue callProc(SchemeValue proc, List<SchemeValue> args, String posPrefix) throws EvalError {
+        if (proc instanceof SchemeValue.LambdaVal lambda) {
+            var localEnv = applyLambda(lambda, args, posPrefix);
+            SchemeValue result = null;
+            for (var bodyExpr : lambda.body()) {
+                result = eval(bodyExpr, localEnv);
+            }
+            return result;
+        }
+        if (proc instanceof SchemeValue.BuiltinVal builtin) {
+            return builtin.fn().apply(args);
+        }
+        throw new EvalError("not a procedure: " + proc.display());
+    }
+
+    private void bindSyntaxVars(Environment env, MacroExpander.Bindings bindings) {
+        for (var entry : bindings.regular.entrySet()) {
+            env.define(entry.getKey(), entry.getValue());
+        }
+    }
+
+    private MacroExpander.Bindings mergeSyntaxBindings(MacroExpander.Bindings prev, MacroExpander.Bindings next) {
+        var merged = new MacroExpander.Bindings();
+        if (prev != null) {
+            merged.regular.putAll(prev.regular);
+            merged.ellipsis.putAll(prev.ellipsis);
+        }
+        merged.regular.putAll(next.regular);
+        merged.ellipsis.putAll(next.ellipsis);
+        return merged;
     }
 
     private SchemeValue evalDefine(SchemeValue.ListVal listVal, List<SchemeValue> elements, Environment env) throws EvalError {

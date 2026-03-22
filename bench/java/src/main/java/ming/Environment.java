@@ -29,6 +29,16 @@ public class Environment {
         bindings.put(name, value);
     }
 
+    public java.util.Set<String> boundNames() {
+        var names = new java.util.HashSet<String>();
+        Environment e = this;
+        while (e != null) {
+            names.addAll(e.bindings.keySet());
+            e = e.parent;
+        }
+        return names;
+    }
+
     public void set(String name, SchemeValue value) throws EvalError {
         if (bindings.containsKey(name)) {
             bindings.put(name, value);

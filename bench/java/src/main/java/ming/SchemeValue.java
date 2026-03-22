@@ -37,6 +37,7 @@ public sealed interface SchemeValue {
     }
     record ContinuationVal(int id) implements SchemeValue {}
     record SyntaxRulesVal(List<String> literals, List<SchemeValue> patterns, List<SchemeValue> templates, Environment defEnv) implements SchemeValue {}
+    record TransformerVal(SchemeValue proc, Environment defEnv, java.util.Set<String> defBoundNames) implements SchemeValue {}
     record VectorVal(SchemeValue[] elements) implements SchemeValue {}
     record ValuesVal(List<SchemeValue> values) implements SchemeValue {}
     record DoubleVal(double value) implements SchemeValue {}
@@ -99,6 +100,7 @@ public sealed interface SchemeValue {
             case BuiltinVal v -> "#<procedure:" + v.name() + ">";
             case ContinuationVal v -> "#<continuation>";
             case SyntaxRulesVal v -> "#<syntax>";
+            case TransformerVal v -> "#<syntax>";
             case RecordVal v -> "#<record:" + v.typeName + ">";
             case VoidVal v -> "";
             case ValuesVal v -> v.values().isEmpty() ? "" : v.values().getFirst().display();

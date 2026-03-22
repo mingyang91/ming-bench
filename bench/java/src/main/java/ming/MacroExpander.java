@@ -8,7 +8,8 @@ public class MacroExpander {
     private static final Set<String> SPECIAL_FORMS = Set.of(
         "if", "let", "let*", "letrec", "begin", "set!", "define", "lambda",
         "quote", "cond", "and", "or", "call/cc", "call-with-current-continuation",
-        "define-syntax", "syntax-rules", "quasiquote", "unquote", "unquote-splicing"
+        "define-syntax", "syntax-rules", "quasiquote", "unquote", "unquote-splicing",
+        "syntax-case", "syntax-quote", "with-syntax"
     );
 
     public static SchemeValue expand(SchemeValue.SyntaxRulesVal macro, SchemeValue.ListVal form) throws EvalError {
@@ -23,12 +24,14 @@ public class MacroExpander {
         throw new EvalError("syntax error: no matching pattern for macro");
     }
 
-    static class Bindings {
+    public static class Bindings {
         final Map<String, SchemeValue> regular = new HashMap<>();
         final Map<String, List<SchemeValue>> ellipsis = new HashMap<>();
     }
 
-    private static boolean matchPattern(SchemeValue pattern, SchemeValue form,
+    public static int nextMark() { return ++gensymCounter; }
+
+    public static boolean matchPattern(SchemeValue pattern, SchemeValue form,
                                         List<String> literals, Bindings bindings) {
         if (pattern instanceof SchemeValue.SymbolVal sym) {
             String name = sym.name();
@@ -93,9 +96,16 @@ public class MacroExpander {
         return false;
     }
 
-    private static SchemeValue expandTemplate(SchemeValue template, Bindings bindings,
+    public static SchemeValue expandTemplate(SchemeValue template, Bindings bindings,
                                                Environment defEnv, int mark,
                                                Map<String, String> renames) throws EvalError {
+        return expandTemplate(template, bindings, defEnv, mark, renames, null);
+    }
+
+    public static SchemeValue expandTemplate(SchemeValue template, Bindings bindings,
+                                               Environment defEnv, int mark,
+                                               Map<String, String> renames,
+                                               Set<String> defBoundNames) throws EvalError {
         if (template instanceof SchemeValue.SymbolVal sym) {
             String name = sym.name();
             if (bindings.regular.containsKey(name)) {
@@ -109,9 +119,23 @@ public class MacroExpander {
             }
             // Hygiene: try definition environment
             try {
-                return defEnv.get(name);
+                SchemeValue val = defEnv.get(name);
+                if (defBoundNames == null || defBoundNames.contains(name)) {
+                    // Name existed at definition time — use def-site binding
+                    return val;
+                }
+                // Name exists now but was NOT bound at definition time.
+                // If it's a procedure/builtin, it's likely a forward-referenced helper — keep it as symbol
+                // If it's a value, it's likely user-defined after macro — gensym for hygiene
+                if (val instanceof SchemeValue.LambdaVal || val instanceof SchemeValue.BuiltinVal
+                    || val instanceof SchemeValue.SyntaxRulesVal || val instanceof SchemeValue.TransformerVal) {
+                    return val;
+                }
+                // It's a non-procedure value defined after the macro — gensym for hygiene
+                String gensym = renames.computeIfAbsent(name, k -> "__m" + mark + "_" + k);
+                return new SchemeValue.SymbolVal(gensym);
             } catch (EvalError e) {
-                // Introduced symbol — gensym it
+                // Not defined anywhere — gensym it
                 String gensym = renames.computeIfAbsent(name, k -> "__m" + mark + "_" + k);
                 return new SchemeValue.SymbolVal(gensym);
             }
@@ -119,6 +143,10 @@ public class MacroExpander {
 
         if (template instanceof SchemeValue.ListVal listVal) {
             var elems = listVal.elements();
+            // Don't expand inside quote
+            if (!elems.isEmpty() && elems.getFirst() instanceof SchemeValue.SymbolVal qs && qs.name().equals("quote")) {
+                return template;
+            }
             var result = new ArrayList<SchemeValue>();
 
             for (int i = 0; i < elems.size(); i++) {
@@ -140,12 +168,12 @@ public class MacroExpander {
                                 List<SchemeValue> vv = bindings.ellipsis.get(v);
                                 if (j < vv.size()) iter.regular.put(v, vv.get(j));
                             }
-                            result.add(expandTemplate(elemTemplate, iter, defEnv, mark, renames));
+                            result.add(expandTemplate(elemTemplate, iter, defEnv, mark, renames, defBoundNames));
                         }
                     }
                     i++; // skip ...
                 } else {
-                    result.add(expandTemplate(elems.get(i), bindings, defEnv, mark, renames));
+                    result.add(expandTemplate(elems.get(i), bindings, defEnv, mark, renames, defBoundNames));
                 }
             }
             return new SchemeValue.ListVal(result);

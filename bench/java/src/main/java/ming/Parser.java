@@ -141,6 +141,10 @@ public class Parser {
                 case "tab" -> new SchemeValue.CharVal('\t').withPos(sp);
                 default -> throw new EvalError("unknown character name: " + name + " at " + sp);
             };
+        } else if (c == '\'') {
+            advance(); // skip '
+            var quoted = parseExpr();
+            return new SchemeValue.ListVal(List.of(new SchemeValue.SymbolVal("syntax-quote"), quoted)).withPos(sp);
         } else {
             throw new EvalError("unknown hash literal: #" + c + " at " + sp);
         }
