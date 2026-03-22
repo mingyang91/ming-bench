@@ -16,6 +16,15 @@ mill.*
 .bsp/
 node_modules/
 
+## java / gradle
+.gradle/
+bench/java/.gradle/
+bench/java/build/
+bench/java/gradle/wrapper/gradle-wrapper.jar
+
+## logs
+logs/
+
 ## python
 __pycache__/
 *.pyc
