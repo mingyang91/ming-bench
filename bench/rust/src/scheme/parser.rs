@@ -1,5 +1,7 @@
 use super::{EvalError, Value};
 
+pub(super) type Span = (usize, usize);
+
 #[derive(Debug, Clone, PartialEq)]
 enum Token {
     LParen,
@@ -11,37 +13,55 @@ enum Token {
     Str(String),
 }
 
-fn tokenize(input: &str) -> Result<Vec<Token>, EvalError> {
+fn tokenize(input: &str) -> Result<Vec<(Token, Span)>, EvalError> {
     let mut tokens = Vec::new();
     let chars: Vec<char> = input.chars().collect();
     let mut i = 0;
+    let mut line = 1usize;
+    let mut col = 1usize;
 
     while i < chars.len() {
         match chars[i] {
-            ' ' | '\t' | '\n' | '\r' => i += 1,
+            '\n' => {
+                i += 1;
+                line += 1;
+                col = 1;
+            }
+            ' ' | '\t' | '\r' => {
+                i += 1;
+                col += 1;
+            }
             ';' => {
                 while i < chars.len() && chars[i] != '\n' {
                     i += 1;
+                    col += 1;
                 }
             }
             '(' => {
-                tokens.push(Token::LParen);
+                tokens.push((Token::LParen, (line, col)));
                 i += 1;
+                col += 1;
             }
             ')' => {
-                tokens.push(Token::RParen);
+                tokens.push((Token::RParen, (line, col)));
                 i += 1;
+                col += 1;
             }
             '\'' => {
-                tokens.push(Token::Quote);
+                tokens.push((Token::Quote, (line, col)));
                 i += 1;
+                col += 1;
             }
             '"' => {
+                let start_line = line;
+                let start_col = col;
                 i += 1;
+                col += 1;
                 let mut s = String::new();
                 while i < chars.len() && chars[i] != '"' {
                     if chars[i] == '\\' && i + 1 < chars.len() {
                         i += 1;
+                        col += 1;
                         match chars[i] {
                             'n' => s.push('\n'),
                             't' => s.push('\t'),
@@ -52,55 +72,75 @@ fn tokenize(input: &str) -> Result<Vec<Token>, EvalError> {
                                 s.push(c);
                             }
                         }
+                    } else if chars[i] == '\n' {
+                        s.push(chars[i]);
+                        line += 1;
+                        col = 0; // will be incremented below
                     } else {
                         s.push(chars[i]);
                     }
                     i += 1;
+                    col += 1;
                 }
                 if i >= chars.len() {
                     return Err(EvalError::Parse {
                         message: "unterminated string".to_string(),
+                        line: start_line,
+                        col: start_col,
                     });
                 }
                 i += 1; // closing quote
-                tokens.push(Token::Str(s));
+                col += 1;
+                tokens.push((Token::Str(s), (start_line, start_col)));
             }
             '#' => {
+                let start_col = col;
                 if i + 1 < chars.len() {
                     match chars[i + 1] {
                         't' => {
-                            tokens.push(Token::Boolean(true));
+                            tokens.push((Token::Boolean(true), (line, start_col)));
                             i += 2;
+                            col += 2;
                         }
                         'f' => {
-                            tokens.push(Token::Boolean(false));
+                            tokens.push((Token::Boolean(false), (line, start_col)));
                             i += 2;
+                            col += 2;
                         }
                         _ => {
                             return Err(EvalError::Parse {
-                                message: format!("unexpected character after #: {}", chars[i + 1]),
+                                message: format!(
+                                    "unexpected character after #: {}",
+                                    chars[i + 1]
+                                ),
+                                line,
+                                col: start_col,
                             });
                         }
                     }
                 } else {
                     return Err(EvalError::Parse {
                         message: "unexpected end after #".to_string(),
+                        line,
+                        col: start_col,
                     });
                 }
             }
             _ => {
                 // Symbol or number
                 let start = i;
+                let start_col = col;
                 while i < chars.len()
                     && !matches!(chars[i], ' ' | '\t' | '\n' | '\r' | '(' | ')' | '"' | ';')
                 {
                     i += 1;
+                    col += 1;
                 }
                 let word: String = chars[start..i].iter().collect();
                 if let Ok(n) = word.parse::<i64>() {
-                    tokens.push(Token::Integer(n));
+                    tokens.push((Token::Integer(n), (line, start_col)));
                 } else {
-                    tokens.push(Token::Symbol(word));
+                    tokens.push((Token::Symbol(word), (line, start_col)));
                 }
             }
         }
@@ -109,29 +149,36 @@ fn tokenize(input: &str) -> Result<Vec<Token>, EvalError> {
     Ok(tokens)
 }
 
-fn parse(tokens: &[Token], pos: usize) -> Result<(Value, usize), EvalError> {
+fn parse(tokens: &[(Token, Span)], pos: usize) -> Result<(Value, usize), EvalError> {
     if pos >= tokens.len() {
         return Err(EvalError::Parse {
             message: "unexpected end of input".to_string(),
+            line: 0,
+            col: 0,
         });
     }
 
-    match &tokens[pos] {
+    let (token, span) = &tokens[pos];
+
+    match token {
         Token::Integer(n) => Ok((Value::Integer(*n), pos + 1)),
         Token::Boolean(b) => Ok((Value::Boolean(*b), pos + 1)),
         Token::Str(s) => Ok((Value::Str(s.clone()), pos + 1)),
-        Token::Symbol(s) => Ok((Value::Symbol(s.clone()), pos + 1)),
+        Token::Symbol(s) => Ok((Value::Symbol(s.clone(), *span), pos + 1)),
         Token::LParen => {
+            let list_span = *span;
             let mut items = Vec::new();
             let mut i = pos + 1;
             loop {
                 if i >= tokens.len() {
                     return Err(EvalError::Parse {
                         message: "unclosed parenthesis".to_string(),
+                        line: list_span.0,
+                        col: list_span.1,
                     });
                 }
-                if tokens[i] == Token::RParen {
-                    return Ok((Value::List(items), i + 1));
+                if tokens[i].0 == Token::RParen {
+                    return Ok((Value::List(items, list_span), i + 1));
                 }
                 let (val, next) = parse(tokens, i)?;
                 items.push(val);
@@ -139,11 +186,20 @@ fn parse(tokens: &[Token], pos: usize) -> Result<(Value, usize), EvalError> {
             }
         }
         Token::Quote => {
+            let quote_span = *span;
             let (val, next) = parse(tokens, pos + 1)?;
-            Ok((Value::List(vec![Value::Symbol("quote".to_string()), val]), next))
+            Ok((
+                Value::List(
+                    vec![Value::Symbol("quote".to_string(), quote_span), val],
+                    quote_span,
+                ),
+                next,
+            ))
         }
         Token::RParen => Err(EvalError::Parse {
             message: "unexpected )".to_string(),
+            line: span.0,
+            col: span.1,
         }),
     }
 }
