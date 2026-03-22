@@ -1,23 +1,21 @@
 package ming;
 
-/**
- * Scheme interpreter entry point.
- * Agents implement this class.
- */
+import java.util.List;
+
 public class Evaluator {
-    /**
-     * Evaluate one or more Scheme expressions and return the string
-     * representation of the last result.
-     */
     public String evalStr(String input) throws EvalError {
-        throw new EvalError("not implemented");
+        var parser = new Parser(input);
+        List<SchemeValue> exprs = parser.parseAll();
+        var interpreter = new Interpreter();
+        SchemeValue result = null;
+        for (var expr : exprs) {
+            result = interpreter.eval(expr);
+        }
+        return result.display();
     }
 
-    /**
-     * Evaluate Scheme expressions and return both the result string
-     * and any captured output from display/write/newline.
-     */
     public EvalResult evalStrWithOutput(String input) throws EvalError {
-        throw new EvalError("not implemented");
+        String result = evalStr(input);
+        return new EvalResult(result, "");
     }
 }
