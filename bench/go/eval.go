@@ -124,6 +124,9 @@ func evalListTCO(expr *Expr, env *Env) (*Expr, *Env, *Value, error, bool) {
 		case "lambda":
 			v, err := evalLambda(expr, env)
 			return nil, nil, v, err, false
+		case "case-lambda":
+			v, err := evalCaseLambda(expr, env)
+			return nil, nil, v, err, false
 		case "let":
 			e, ev, v, err := evalLetTCO(expr, env)
 			if err != nil {
@@ -468,6 +471,11 @@ func applyBuiltin(name string, args []*Value, expr *Expr, env *Env) (*Value, err
 			return nil, errAtf(expr, "char?: expected 1 argument, got %d", len(args))
 		}
 		return BooleanValue(args[0].Type == TypeChar), nil
+	case "procedure?":
+		if len(args) != 1 {
+			return nil, errAtf(expr, "procedure?: expected 1 argument, got %d", len(args))
+		}
+		return BooleanValue(args[0].Type == TypeLambda), nil
 	case "display":
 		if len(args) != 1 {
 			return nil, errAtf(expr, "display: expected 1 argument, got %d", len(args))
@@ -1720,8 +1728,53 @@ func evalLambda(expr *Expr, env *Env) (*Value, error) {
 	}, nil
 }
 
+// evalCaseLambda handles (case-lambda (formals body...) ...)
+func evalCaseLambda(expr *Expr, env *Env) (*Value, error) {
+	if len(expr.List) < 2 {
+		return nil, errAt(expr, "case-lambda: expected at least one clause")
+	}
+	var clauses []*Value
+	for _, clauseExpr := range expr.List[1:] {
+		if clauseExpr.Type != ExprList || len(clauseExpr.List) < 2 {
+			return nil, errAt(clauseExpr, "case-lambda: each clause must be (formals body ...)")
+		}
+		params, restParam, err := parseLambdaParams(clauseExpr.List[0])
+		if err != nil {
+			return nil, err
+		}
+		clause := &Value{
+			Type:      TypeLambda,
+			Params:    params,
+			RestParam: restParam,
+			Body:      clauseExpr.List[1:],
+			Closure:   env,
+		}
+		clauses = append(clauses, clause)
+	}
+	return &Value{
+		Type:        TypeLambda,
+		CaseClauses: clauses,
+		Closure:     env,
+	}, nil
+}
+
 // applyLambdaTCO sets up the lambda env and returns a tail call to its last body expr.
 func applyLambdaTCO(fn *Value, args []*Value, expr *Expr) (*Expr, *Env, *Value, error, bool) {
+	// case-lambda dispatch: find matching clause
+	if fn.CaseClauses != nil {
+		for _, clause := range fn.CaseClauses {
+			if clause.RestParam != "" {
+				if len(args) >= len(clause.Params) {
+					return applyLambdaTCO(clause, args, expr)
+				}
+			} else {
+				if len(args) == len(clause.Params) {
+					return applyLambdaTCO(clause, args, expr)
+				}
+			}
+		}
+		return nil, nil, nil, errAtf(expr, "case-lambda: no matching clause for %d arguments", len(args)), false
+	}
 	if fn.GoFunc != nil {
 		v, err := fn.GoFunc(args)
 		return nil, nil, v, err, false
@@ -2189,7 +2242,7 @@ func makeDefaultEnv() *Env {
 	builtins := []string{"+", "-", "*", "/", "<", ">", "=", "<=", ">=", "not",
 		"cons", "car", "cdr", "caar", "cadr", "cdar", "cddr",
 		"set-car!", "set-cdr!", "null?", "list", "length", "reverse",
-		"pair?", "number?", "string?", "boolean?", "symbol?", "char?",
+		"pair?", "number?", "string?", "boolean?", "symbol?", "char?", "procedure?",
 		"display", "write", "newline",
 		"string-append", "string-length", "substring",
 		"string->number", "number->string",

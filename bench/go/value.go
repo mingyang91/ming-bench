@@ -63,6 +63,8 @@ type Value struct {
 	// Syntax object fields
 	SyntaxExpr  *Expr   // for TypeSyntax: wrapped expression
 	SyntaxExprs []*Expr // for TypeSyntax: list of expressions (ellipsis binding)
+	// case-lambda clauses: each is a TypeLambda with Params/RestParam/Body
+	CaseClauses []*Value
 	// Environment reference (for internal use)
 	EnvRef *Env
 	// Native Go function (when set on TypeLambda, called instead of Body)
