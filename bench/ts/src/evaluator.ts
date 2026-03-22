@@ -1326,6 +1326,7 @@ const SPECIAL_FORMS = new Set([
   'syntax-case', 'syntax', 'with-syntax',
   'guard', 'raise', 'letrec', 'letrec*', 'case',
   'define-record-type', 'dynamic-wind', 'values', 'call-with-values',
+  'do',
 ]);
 
 function collectPatternVars(patternItems: Expr[], literals: Set<string>): Set<string> {
@@ -2081,6 +2082,75 @@ function evaluate(expr: Expr, env: Env): Value {
             // Trampoline last body expression — exceptions caught by outer try/catch
             expr = bodyExprs[bodyExprs.length - 1];
             continue;
+          }
+
+          case 'do': {
+            // (do ((var init step) ...) (test expr ...) body ...)
+            if (items.length < 3) throw new EvalError(`${fmtPos(expr.pos)}: do: bad syntax`);
+            const bindings = items[1];
+            if (bindings.tag !== 'list') throw new EvalError(`${fmtPos(expr.pos)}: do: expected bindings list`);
+            const testClause = items[2];
+            if (testClause.tag !== 'list' || testClause.items.length < 1)
+              throw new EvalError(`${fmtPos(expr.pos)}: do: expected test clause`);
+            const bodyExprs = items.slice(3);
+
+            // Parse bindings: each is (var init) or (var init step)
+            const vars: string[] = [];
+            const initExprs: Expr[] = [];
+            const stepExprs: (Expr | null)[] = [];
+            for (const b of bindings.items) {
+              if (b.tag !== 'list' || b.items.length < 2 || b.items.length > 3)
+                throw new EvalError(`${fmtPos(expr.pos)}: do: bad binding`);
+              if (b.items[0].tag !== 'symbol')
+                throw new EvalError(`${fmtPos(expr.pos)}: do: expected symbol in binding`);
+              vars.push(b.items[0].name);
+              initExprs.push(b.items[1]);
+              stepExprs.push(b.items.length === 3 ? b.items[2] : null);
+            }
+
+            // Evaluate init values and create loop env
+            const doEnv = new Env(env);
+            for (let i = 0; i < vars.length; i++) {
+              doEnv.define(vars[i], evaluate(initExprs[i], env));
+            }
+
+            // Iteration loop
+            const testExpr = testClause.items[0];
+            const resultExprs = testClause.items.slice(1);
+
+            for (;;) {
+              // Check test condition
+              const testVal = evaluate(testExpr, doEnv);
+              if (testVal.tag !== 'boolean' || testVal.value !== false) {
+                // Test is true — evaluate result expressions
+                if (resultExprs.length === 0) return { tag: 'nil' };
+                for (let i = 0; i < resultExprs.length - 1; i++) {
+                  evaluate(resultExprs[i], doEnv);
+                }
+                // TCO: trampoline last result expr
+                expr = resultExprs[resultExprs.length - 1];
+                env = doEnv;
+                continue trampoline;
+              }
+
+              // Execute body for side effects
+              for (const b of bodyExprs) {
+                evaluate(b, doEnv);
+              }
+
+              // Parallel step: evaluate all steps with current values, then update
+              const newVals: Value[] = [];
+              for (let i = 0; i < vars.length; i++) {
+                if (stepExprs[i] !== null) {
+                  newVals.push(evaluate(stepExprs[i]!, doEnv));
+                } else {
+                  newVals.push(doEnv.get(vars[i]));
+                }
+              }
+              for (let i = 0; i < vars.length; i++) {
+                doEnv.define(vars[i], newVals[i]);
+              }
+            }
           }
         }
       }
