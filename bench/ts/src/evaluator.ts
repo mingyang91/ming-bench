@@ -7,9 +7,14 @@ type SchemeVal =
   | { tag: 'boolean'; value: boolean }
   | { tag: 'string'; value: string }
   | { tag: 'symbol'; value: string }
-  | { tag: 'list'; elements: SchemeVal[] }
+  | { tag: 'list'; elements: SchemeVal[] }  // AST only (parsed s-expr)
+  | { tag: 'pair'; car: SchemeVal; cdr: SchemeVal }
+  | { tag: 'nil' }
   | { tag: 'void' }
-  | { tag: 'lambda'; params: string[]; body: SchemeVal[]; env: Env };
+  | { tag: 'lambda'; params: string[]; body: SchemeVal[]; env: Env }
+  | { tag: 'builtin'; fn: (args: SchemeVal[]) => SchemeVal };
+
+const NIL: SchemeVal = { tag: 'nil' };
 
 // --- Environment ---
 
@@ -51,7 +56,6 @@ function tokenize(input: string): string[] {
       while (i < input.length && input[i] !== '\n') i++;
       continue;
     }
-    // Quote shorthand
     if (ch === "'") {
       tokens.push("'");
       i++;
@@ -156,6 +160,40 @@ function parse(tokens: string[]): SchemeVal[] {
   return exprs;
 }
 
+// --- Quote: convert AST list to runtime pair chain ---
+
+function quoteDatum(val: SchemeVal): SchemeVal {
+  if (val.tag === 'list') {
+    let result: SchemeVal = NIL;
+    for (let i = val.elements.length - 1; i >= 0; i--) {
+      result = { tag: 'pair', car: quoteDatum(val.elements[i]), cdr: result };
+    }
+    return result;
+  }
+  return val;
+}
+
+// --- Helpers ---
+
+function listToArray(val: SchemeVal): SchemeVal[] {
+  const result: SchemeVal[] = [];
+  let cur = val;
+  while (cur.tag === 'pair') {
+    result.push(cur.car);
+    cur = cur.cdr;
+  }
+  if (cur.tag !== 'nil') throw new EvalError('not a proper list');
+  return result;
+}
+
+function arrayToList(arr: SchemeVal[]): SchemeVal {
+  let result: SchemeVal = NIL;
+  for (let i = arr.length - 1; i >= 0; i--) {
+    result = { tag: 'pair', car: arr[i], cdr: result };
+  }
+  return result;
+}
+
 // --- Evaluator ---
 
 function isTruthy(val: SchemeVal): boolean {
@@ -180,7 +218,7 @@ function evalExpr(expr: SchemeVal, env: Env): SchemeVal {
         switch (head.value) {
           case 'quote': {
             if (elems.length !== 2) throw new EvalError('quote: expected 1 argument');
-            return elems[1];
+            return quoteDatum(elems[1]);
           }
           case 'if': {
             if (elems.length < 3 || elems.length > 4) throw new EvalError('if: expected 2 or 3 arguments');
@@ -200,7 +238,6 @@ function evalExpr(expr: SchemeVal, env: Env): SchemeVal {
               envDefine(env, target.value, val);
               return { tag: 'void' };
             }
-            // (define (f params...) body...)
             if (target.tag === 'list' && target.elements.length >= 1 && target.elements[0].tag === 'symbol') {
               const name = target.elements[0].value;
               const params = target.elements.slice(1).map(p => {
@@ -234,18 +271,20 @@ function evalExpr(expr: SchemeVal, env: Env): SchemeVal {
             const val = evalExpr(elems[1], env);
             return { tag: 'boolean', value: !isTruthy(val) };
           }
-        }
-      }
-      // Check for built-in procedure by name before general eval
-      if (head.tag === 'symbol') {
-        const builtin = lookupBuiltin(head.value);
-        if (builtin) {
-          const args = elems.slice(1).map(e => evalExpr(e, env));
-          return builtin(args);
+          case 'let':
+            return evalLet(elems, env);
+          case 'begin':
+            return evalBegin(elems.slice(1), env);
+          case 'cond':
+            return evalCond(elems.slice(1), env);
         }
       }
       // Procedure application
       const proc = evalExpr(head, env);
+      if (proc.tag === 'builtin') {
+        const args = elems.slice(1).map(e => evalExpr(e, env));
+        return proc.fn(args);
+      }
       const args = elems.slice(1).map(e => evalExpr(e, env));
       return applyProc(proc, args);
     }
@@ -269,9 +308,13 @@ function applyProc(proc: SchemeVal, args: SchemeVal[]): SchemeVal {
     }
     return result;
   }
-  // Built-in procedures by name won't reach here; handle them via symbol dispatch
+  if (proc.tag === 'builtin') {
+    return proc.fn(args);
+  }
   throw new EvalError('not a procedure');
 }
+
+// --- Special forms ---
 
 function evalAnd(exprs: SchemeVal[], env: Env): SchemeVal {
   let result: SchemeVal = { tag: 'boolean', value: true };
@@ -290,6 +333,78 @@ function evalOr(exprs: SchemeVal[], env: Env): SchemeVal {
   }
   return result;
 }
+
+function evalLet(elems: SchemeVal[], env: Env): SchemeVal {
+  // (let bindings body...) or (let name bindings body...) for named let
+  let idx = 1;
+  let loopName: string | null = null;
+  const first = elems[idx];
+  if (first.tag === 'symbol') {
+    loopName = first.value;
+    idx++;
+  }
+  const bindingList = elems[idx];
+  if (bindingList.tag !== 'list') throw new EvalError('let: bindings must be a list');
+  idx++;
+  const body = elems.slice(idx);
+
+  const paramNames: string[] = [];
+  const initVals: SchemeVal[] = [];
+  for (const b of bindingList.elements) {
+    if (b.tag !== 'list' || b.elements.length !== 2) throw new EvalError('let: invalid binding');
+    if (b.elements[0].tag !== 'symbol') throw new EvalError('let: binding name must be a symbol');
+    paramNames.push(b.elements[0].value);
+    initVals.push(evalExpr(b.elements[1], env));
+  }
+
+  const letEnv = makeEnv(env);
+  if (loopName) {
+    // Named let: create a lambda and bind it
+    const lambda: SchemeVal = { tag: 'lambda', params: paramNames, body, env: letEnv };
+    envDefine(letEnv, loopName, lambda);
+  }
+  for (let i = 0; i < paramNames.length; i++) {
+    envDefine(letEnv, paramNames[i], initVals[i]);
+  }
+  let result: SchemeVal = { tag: 'void' };
+  for (const bodyExpr of body) {
+    result = evalExpr(bodyExpr, letEnv);
+  }
+  return result;
+}
+
+function evalBegin(exprs: SchemeVal[], env: Env): SchemeVal {
+  let result: SchemeVal = { tag: 'void' };
+  for (const expr of exprs) {
+    result = evalExpr(expr, env);
+  }
+  return result;
+}
+
+function evalCond(clauses: SchemeVal[], env: Env): SchemeVal {
+  for (const clause of clauses) {
+    if (clause.tag !== 'list' || clause.elements.length < 2) throw new EvalError('cond: invalid clause');
+    const test = clause.elements[0];
+    if (test.tag === 'symbol' && test.value === 'else') {
+      let result: SchemeVal = { tag: 'void' };
+      for (let i = 1; i < clause.elements.length; i++) {
+        result = evalExpr(clause.elements[i], env);
+      }
+      return result;
+    }
+    const testVal = evalExpr(test, env);
+    if (isTruthy(testVal)) {
+      let result: SchemeVal = testVal;
+      for (let i = 1; i < clause.elements.length; i++) {
+        result = evalExpr(clause.elements[i], env);
+      }
+      return result;
+    }
+  }
+  return { tag: 'void' };
+}
+
+// --- Arithmetic & Comparison ---
 
 function requireNumbers(args: SchemeVal[], name: string): number[] {
   return args.map(a => {
@@ -323,7 +438,7 @@ function arith(args: SchemeVal[], op: string): SchemeVal {
   return { tag: 'number', value: result };
 }
 
-function compare(args: SchemeVal[], op: string): SchemeVal {
+function schemeCompare(args: SchemeVal[], op: string): SchemeVal {
   if (args.length !== 2) throw new EvalError(`${op}: expected 2 arguments`);
   const nums = requireNumbers(args, op);
   let result: boolean;
@@ -337,19 +452,87 @@ function compare(args: SchemeVal[], op: string): SchemeVal {
   return { tag: 'boolean', value: result };
 }
 
-// Built-in procedure lookup
-function lookupBuiltin(name: string): ((args: SchemeVal[]) => SchemeVal) | null {
-  switch (name) {
-    case '+': return args => arith(args, '+');
-    case '-': return args => arith(args, '-');
-    case '*': return args => arith(args, '*');
-    case '/': return args => arith(args, '/');
-    case '<': return args => compare(args, '<');
-    case '>': return args => compare(args, '>');
-    case '=': return args => compare(args, '=');
-    case '<=': return args => compare(args, '<=');
-    default: return null;
+// --- Builtins ---
+
+function schemeAppend(args: SchemeVal[]): SchemeVal {
+  if (args.length === 0) return NIL;
+  if (args.length === 1) return args[0];
+  // append all lists
+  let result = args[args.length - 1];
+  for (let i = args.length - 2; i >= 0; i--) {
+    const elems = listToArray(args[i]);
+    for (let j = elems.length - 1; j >= 0; j--) {
+      result = { tag: 'pair', car: elems[j], cdr: result };
+    }
   }
+  return result;
+}
+
+function makeGlobalEnv(): Env {
+  const env = makeEnv(null);
+
+  function defBuiltin(name: string, fn: (args: SchemeVal[]) => SchemeVal) {
+    env.bindings.set(name, { tag: 'builtin', fn });
+  }
+
+  defBuiltin('+', args => arith(args, '+'));
+  defBuiltin('-', args => arith(args, '-'));
+  defBuiltin('*', args => arith(args, '*'));
+  defBuiltin('/', args => arith(args, '/'));
+  defBuiltin('<', args => schemeCompare(args, '<'));
+  defBuiltin('>', args => schemeCompare(args, '>'));
+  defBuiltin('=', args => schemeCompare(args, '='));
+  defBuiltin('<=', args => schemeCompare(args, '<='));
+
+  defBuiltin('cons', args => {
+    if (args.length !== 2) throw new EvalError('cons: expected 2 arguments');
+    return { tag: 'pair', car: args[0], cdr: args[1] };
+  });
+  defBuiltin('car', args => {
+    if (args.length !== 1) throw new EvalError('car: expected 1 argument');
+    if (args[0].tag !== 'pair') throw new EvalError('car: expected pair');
+    return args[0].car;
+  });
+  defBuiltin('cdr', args => {
+    if (args.length !== 1) throw new EvalError('cdr: expected 1 argument');
+    if (args[0].tag !== 'pair') throw new EvalError('cdr: expected pair');
+    return args[0].cdr;
+  });
+  defBuiltin('null?', args => {
+    if (args.length !== 1) throw new EvalError('null?: expected 1 argument');
+    return { tag: 'boolean', value: args[0].tag === 'nil' };
+  });
+  defBuiltin('list', args => arrayToList(args));
+  defBuiltin('length', args => {
+    if (args.length !== 1) throw new EvalError('length: expected 1 argument');
+    const elems = listToArray(args[0]);
+    return { tag: 'number', value: elems.length };
+  });
+  defBuiltin('append', args => schemeAppend(args));
+
+  // Type predicates
+  defBuiltin('string?', args => {
+    if (args.length !== 1) throw new EvalError('string?: expected 1 argument');
+    return { tag: 'boolean', value: args[0].tag === 'string' };
+  });
+  defBuiltin('number?', args => {
+    if (args.length !== 1) throw new EvalError('number?: expected 1 argument');
+    return { tag: 'boolean', value: args[0].tag === 'number' };
+  });
+  defBuiltin('boolean?', args => {
+    if (args.length !== 1) throw new EvalError('boolean?: expected 1 argument');
+    return { tag: 'boolean', value: args[0].tag === 'boolean' };
+  });
+  defBuiltin('pair?', args => {
+    if (args.length !== 1) throw new EvalError('pair?: expected 1 argument');
+    return { tag: 'boolean', value: args[0].tag === 'pair' };
+  });
+  defBuiltin('symbol?', args => {
+    if (args.length !== 1) throw new EvalError('symbol?: expected 1 argument');
+    return { tag: 'boolean', value: args[0].tag === 'symbol' };
+  });
+
+  return env;
 }
 
 // --- Display ---
@@ -360,17 +543,31 @@ function displayVal(val: SchemeVal): string {
     case 'boolean': return val.value ? '#t' : '#f';
     case 'string': return `"${val.value}"`;
     case 'symbol': return val.value;
+    case 'nil': return '()';
+    case 'pair': {
+      let s = '(';
+      let cur: SchemeVal = val;
+      let first = true;
+      while (cur.tag === 'pair') {
+        if (!first) s += ' ';
+        s += displayVal(cur.car);
+        cur = cur.cdr;
+        first = false;
+      }
+      if (cur.tag !== 'nil') {
+        s += ' . ' + displayVal(cur);
+      }
+      s += ')';
+      return s;
+    }
     case 'list': return `(${val.elements.map(displayVal).join(' ')})`;
     case 'void': return '#<void>';
     case 'lambda': return '#<procedure>';
+    default: return '#<builtin>';
   }
 }
 
 // --- Public API ---
-
-function makeGlobalEnv(): Env {
-  return makeEnv(null);
-}
 
 export function evalStr(input: string): string {
   const tokens = tokenize(input);
@@ -383,7 +580,6 @@ export function evalStr(input: string): string {
   for (const expr of exprs) {
     result = evalExpr(expr, env);
   }
-  // If last result is void (from define), still display it
   return displayVal(result!);
 }
 
