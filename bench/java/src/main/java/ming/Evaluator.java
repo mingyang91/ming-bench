@@ -226,65 +226,59 @@ public class Evaluator {
         return e.getMessage().matches(".*\\d+:\\d+.*");
     }
 
-    // ---- Evaluator ----
+    // ---- Evaluator (trampolined for TCO) ----
     private SchemeVal eval(SchemeVal expr, Env env) throws EvalError {
-        SourcePos pos = posMap != null ? posMap.get(expr) : null;
-        if (pos != null) currentPos = pos;
-        SourcePos savedPos = currentPos;
-        try {
-            return evalInner(expr, env);
-        } catch (EvalError e) {
-            if (savedPos != null && !hasPosition(e)) {
-                throw posError(e.getMessage(), savedPos);
-            }
-            throw e;
-        }
-    }
+        trampoline:
+        while (true) {
+            SourcePos pos = posMap != null ? posMap.get(expr) : null;
+            if (pos != null) currentPos = pos;
+            SourcePos savedPos = currentPos;
+            try {
+                if (expr instanceof IntVal || expr instanceof BoolVal || expr instanceof StrVal
+                        || expr instanceof CharVal || expr instanceof VoidVal || expr instanceof LambdaVal
+                        || expr instanceof BuiltinVal) {
+                    return expr;
+                }
+                if (expr instanceof SymbolVal sym) {
+                    return env.get(sym.name());
+                }
+                if (!(expr instanceof ListVal listExpr)) {
+                    throw new EvalError("unexpected expression type");
+                }
 
-    private SchemeVal evalInner(SchemeVal expr, Env env) throws EvalError {
-        return switch (expr) {
-            case IntVal v -> v;
-            case BoolVal v -> v;
-            case StrVal v -> v;
-            case CharVal v -> v;
-            case VoidVal v -> v;
-            case LambdaVal v -> v;
-            case BuiltinVal v -> v;
-            case SymbolVal v -> env.get(v.name());
-            case ListVal v -> {
-                List<SchemeVal> elems = v.elements();
+                List<SchemeVal> elems = listExpr.elements();
                 if (elems.isEmpty()) throw new EvalError("empty application");
-
                 SchemeVal head = elems.getFirst();
 
                 // Special forms
                 if (head instanceof SymbolVal sym) {
                     switch (sym.name()) {
-                        case "quote" -> {
+                        case "quote": {
                             if (elems.size() != 2) throw new EvalError("quote requires 1 argument");
-                            yield elems.get(1);
+                            return elems.get(1);
                         }
-                        case "if" -> {
+                        case "if": {
                             if (elems.size() < 3 || elems.size() > 4)
                                 throw new EvalError("if requires 2 or 3 arguments");
                             SchemeVal cond = eval(elems.get(1), env);
                             if (!isFalse(cond)) {
-                                yield eval(elems.get(2), env);
+                                expr = elems.get(2);
+                                continue trampoline;
                             } else if (elems.size() == 4) {
-                                yield eval(elems.get(3), env);
+                                expr = elems.get(3);
+                                continue trampoline;
                             } else {
-                                yield VOID;
+                                return VOID;
                             }
                         }
-                        case "define" -> {
+                        case "define": {
                             if (elems.size() < 3) throw new EvalError("define requires at least 2 arguments");
                             SchemeVal target = elems.get(1);
                             if (target instanceof SymbolVal name) {
                                 SchemeVal val = eval(elems.get(2), env);
                                 env.define(name.name(), val);
-                                yield VOID;
+                                return VOID;
                             } else if (target instanceof ListVal nameAndParams) {
-                                // (define (f x y) body...)
                                 if (nameAndParams.elements().isEmpty())
                                     throw new EvalError("define: empty name list");
                                 String fname = ((SymbolVal) nameAndParams.elements().getFirst()).name();
@@ -294,12 +288,12 @@ public class Evaluator {
                                 }
                                 List<SchemeVal> body = new ArrayList<>(elems.subList(2, elems.size()));
                                 env.define(fname, new LambdaVal(params, body, env));
-                                yield VOID;
+                                return VOID;
                             } else {
                                 throw new EvalError("define: invalid syntax");
                             }
                         }
-                        case "lambda" -> {
+                        case "lambda": {
                             if (elems.size() < 3) throw new EvalError("lambda requires params and body");
                             SchemeVal paramSpec = elems.get(1);
                             List<String> params = new ArrayList<>();
@@ -311,25 +305,27 @@ public class Evaluator {
                                 throw new EvalError("lambda: invalid parameter list");
                             }
                             List<SchemeVal> body = new ArrayList<>(elems.subList(2, elems.size()));
-                            yield new LambdaVal(params, body, env);
+                            return new LambdaVal(params, body, env);
                         }
-                        case "and" -> {
-                            SchemeVal result = new BoolVal(true);
-                            for (int i = 1; i < elems.size(); i++) {
-                                result = eval(elems.get(i), env);
-                                if (isFalse(result)) yield result;
+                        case "and": {
+                            if (elems.size() == 1) return new BoolVal(true);
+                            for (int i = 1; i < elems.size() - 1; i++) {
+                                SchemeVal result = eval(elems.get(i), env);
+                                if (isFalse(result)) return result;
                             }
-                            yield result;
+                            expr = elems.getLast();
+                            continue trampoline;
                         }
-                        case "or" -> {
-                            SchemeVal result = new BoolVal(false);
-                            for (int i = 1; i < elems.size(); i++) {
-                                result = eval(elems.get(i), env);
-                                if (!isFalse(result)) yield result;
+                        case "or": {
+                            if (elems.size() == 1) return new BoolVal(false);
+                            for (int i = 1; i < elems.size() - 1; i++) {
+                                SchemeVal result = eval(elems.get(i), env);
+                                if (!isFalse(result)) return result;
                             }
-                            yield result;
+                            expr = elems.getLast();
+                            continue trampoline;
                         }
-                        case "let" -> {
+                        case "let": {
                             if (elems.size() < 3) throw new EvalError("let requires bindings and body");
                             SchemeVal second = elems.get(1);
                             // Named let: (let name ((var init) ...) body...)
@@ -349,9 +345,17 @@ public class Evaluator {
                                 Env letEnv = new Env(env);
                                 LambdaVal loopFn = new LambdaVal(params, body, letEnv);
                                 letEnv.define(loopName.name(), loopFn);
-                                List<SchemeVal> evaledInits = new ArrayList<>();
-                                for (SchemeVal init : inits) evaledInits.add(eval(init, env));
-                                yield applyProc(loopFn, evaledInits);
+                                // Apply the loop function with TCO
+                                Env callEnv = new Env(letEnv);
+                                for (int i = 0; i < params.size(); i++) {
+                                    callEnv.define(params.get(i), eval(inits.get(i), env));
+                                }
+                                for (int j = 0; j < body.size() - 1; j++) {
+                                    eval(body.get(j), callEnv);
+                                }
+                                expr = body.getLast();
+                                env = callEnv;
+                                continue trampoline;
                             }
                             // Regular let: (let ((var init) ...) body...)
                             if (!(second instanceof ListVal bl)) throw new EvalError("let: invalid bindings");
@@ -363,48 +367,43 @@ public class Evaluator {
                                 SchemeVal val = eval(bpair.elements().get(1), env);
                                 letEnv.define(varName, val);
                             }
-                            SchemeVal letResult = VOID;
-                            for (int i = 2; i < elems.size(); i++) {
-                                letResult = eval(elems.get(i), letEnv);
+                            for (int i = 2; i < elems.size() - 1; i++) {
+                                eval(elems.get(i), letEnv);
                             }
-                            yield letResult;
+                            expr = elems.getLast();
+                            env = letEnv;
+                            continue trampoline;
                         }
-                        case "begin" -> {
-                            SchemeVal beginResult = VOID;
-                            for (int i = 1; i < elems.size(); i++) {
-                                beginResult = eval(elems.get(i), env);
+                        case "begin": {
+                            if (elems.size() == 1) return VOID;
+                            for (int i = 1; i < elems.size() - 1; i++) {
+                                eval(elems.get(i), env);
                             }
-                            yield beginResult;
+                            expr = elems.getLast();
+                            continue trampoline;
                         }
-                        case "cond" -> {
+                        case "cond": {
                             SchemeVal condResult = VOID;
-                            boolean matched = false;
                             for (int i = 1; i < elems.size(); i++) {
                                 if (!(elems.get(i) instanceof ListVal clause) || clause.elements().isEmpty())
                                     throw new EvalError("cond: invalid clause");
                                 SchemeVal test = clause.elements().get(0);
-                                if (test instanceof SymbolVal s && s.name().equals("else")) {
-                                    condResult = VOID;
-                                    for (int j = 1; j < clause.elements().size(); j++) {
-                                        condResult = eval(clause.elements().get(j), env);
-                                    }
-                                    matched = true;
-                                    break;
-                                }
-                                SchemeVal testResult = eval(test, env);
+                                boolean isElse = test instanceof SymbolVal s && s.name().equals("else");
+                                SchemeVal testResult = isElse ? new BoolVal(true) : eval(test, env);
                                 if (!isFalse(testResult)) {
-                                    condResult = testResult;
-                                    for (int j = 1; j < clause.elements().size(); j++) {
-                                        condResult = eval(clause.elements().get(j), env);
+                                    if (clause.elements().size() == 1) return testResult;
+                                    for (int j = 1; j < clause.elements().size() - 1; j++) {
+                                        eval(clause.elements().get(j), env);
                                     }
-                                    matched = true;
-                                    break;
+                                    expr = clause.elements().getLast();
+                                    continue trampoline;
                                 }
                             }
-                            yield condResult;
+                            return condResult;
                         }
-                        default -> {
+                        default: {
                             // fall through to procedure call
+                            break;
                         }
                     }
                 }
@@ -415,9 +414,31 @@ public class Evaluator {
                 for (int i = 1; i < elems.size(); i++) {
                     args.add(eval(elems.get(i), env));
                 }
-                yield applyProc(proc, args);
+                if (proc instanceof LambdaVal lambda) {
+                    if (args.size() != lambda.params().size()) {
+                        throw new EvalError("wrong number of arguments: expected " + lambda.params().size() + ", got " + args.size());
+                    }
+                    Env callEnv = new Env(lambda.env());
+                    for (int i = 0; i < lambda.params().size(); i++) {
+                        callEnv.define(lambda.params().get(i), args.get(i));
+                    }
+                    for (int j = 0; j < lambda.body().size() - 1; j++) {
+                        eval(lambda.body().get(j), callEnv);
+                    }
+                    expr = lambda.body().getLast();
+                    env = callEnv;
+                    continue trampoline;
+                } else if (proc instanceof BuiltinVal b) {
+                    return applyBuiltin(b.name(), args);
+                }
+                throw new EvalError("not a procedure: " + display(proc));
+            } catch (EvalError e) {
+                if (savedPos != null && !hasPosition(e)) {
+                    throw posError(e.getMessage(), savedPos);
+                }
+                throw e;
             }
-        };
+        }
     }
 
     private SchemeVal applyProc(SchemeVal proc, List<SchemeVal> args) throws EvalError {
