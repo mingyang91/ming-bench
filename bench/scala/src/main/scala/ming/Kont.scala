@@ -127,5 +127,30 @@ object Kont:
     targetK: Kont
   ) extends Kont
 
+  case class ExceptionHandlerK(handler: SchemeValue, k: Kont) extends Kont
+
+  case class GuardK(
+    variable: String,
+    clauses: List[SchemeValue],
+    env: Env,
+    k: Kont
+  ) extends Kont
+
+  case class GuardTestK(
+    exnValue: SchemeValue,
+    body: List[SchemeValue],
+    remainingClauses: List[SchemeValue],
+    variable: String,
+    env: Env,
+    raiseK: Kont,
+    guardK: Kont
+  ) extends Kont
+
+  case class GuardClauseK(
+    body: List[SchemeValue],
+    env: Env,
+    k: Kont
+  ) extends Kont
+
 /** Identity-based entry for dynamic-wind winder tracking. */
 class WinderEntry(val inThunk: SchemeValue, val outThunk: SchemeValue)

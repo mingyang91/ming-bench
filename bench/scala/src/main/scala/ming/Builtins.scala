@@ -104,7 +104,9 @@ object Builtins:
     "string<=?",
     "string>=?",
     "procedure?",
-    "dynamic-wind"
+    "dynamic-wind",
+    "raise",
+    "with-exception-handler"
   )
 
   def evalBuiltin(

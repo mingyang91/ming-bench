@@ -1,7 +1,7 @@
 package ming
 
 import SchemeValue.*
-import Evaluator.{EvalS, ReturnS, Step}
+import Evaluator.{EvalS, RaiseS, ReturnS, Step}
 
 /** Procedure application: lambda calls, apply, map, for-each. */
 private[ming] object ProcApply:
@@ -30,6 +30,12 @@ private[ming] object ProcApply:
       applyForEach(args, k, out)
     case SchemeBuiltinProc("dynamic-wind") =>
       applyDynamicWind(args, k, out)
+    case SchemeBuiltinProc("raise") =>
+      if args.length != 1 then throw new EvalError("raise: expected 1 argument")
+      RaiseS(args.head, k, out)
+    case SchemeBuiltinProc("with-exception-handler") =>
+      if args.length != 2 then throw new EvalError("with-exception-handler: expected 2 arguments")
+      applyProc(args(1), Nil, Kont.ExceptionHandlerK(args(0), k), out)
     case SchemeBuiltinProc(name) =>
       val (result, bo) = Builtins.evalBuiltin(name, args)
       ReturnS(result, k, out + bo)
@@ -120,7 +126,7 @@ private[ming] object ProcApply:
     val entry     = new WinderEntry(inThunk, outThunk)
     applyProc(inThunk, Nil, Kont.DynWindInK(bodyThunk, entry, k), out)
 
-  private def windTransition(
+  private[ming] def windTransition(
     currentK: Kont,
     targetK: Kont,
     value: SchemeValue,
@@ -185,6 +191,10 @@ private[ming] object ProcApply:
     case Kont.DynWindRetK(_, next)                  => next
     case Kont.DynUnwindK(_, _, _, next)             => next
     case Kont.DynRewindK(_, _, next)                => next
+    case Kont.ExceptionHandlerK(_, next)            => next
+    case Kont.GuardK(_, _, _, next)                 => next
+    case Kont.GuardTestK(_, _, _, _, _, _, next)    => next
+    case Kont.GuardClauseK(_, _, next)              => next
 
   private def computeWindDiff(
     current: List[WinderEntry],

@@ -76,26 +76,13 @@ private[ming] object KontApply:
       applyNamedLetInit(value, name, params, evaled, remaining, body, letEnv, nextK, out)
 
     case Kont.MapK(proc, remainingGroups, accumulated, nextK) =>
-      val newAcc = accumulated :+ value
-      remainingGroups match
-        case Nil => ReturnS(SchemeList(newAcc), nextK, out)
-        case group :: rest =>
-          ProcApply.applyProc(proc, group, Kont.MapK(proc, rest, newAcc, nextK), out)
+      applyMapK(value, proc, remainingGroups, accumulated, nextK, out)
 
     case Kont.LetrecInitK(curName, remNames, remInits, body, frame, nextK) =>
       applyLetrecInit(value, curName, remNames, remInits, body, frame, nextK, out)
 
     case Kont.LetStarInitK(name, remaining, body, lsEnv, nextK) =>
-      val newEnv = lsEnv.extend(name, value)
-      remaining match
-        case Nil => SpecialForms.startSequence(body, newEnv, nextK, out)
-        case (nextName, nextInit) :: rest =>
-          EvalS(
-            nextInit,
-            newEnv,
-            Kont.LetStarInitK(nextName, rest, body, newEnv, nextK),
-            out
-          )
+      applyLetStarInit(value, name, remaining, body, lsEnv, nextK, out)
 
     case Kont.CaseK(clauses, caseEnv, nextK) =>
       DerivedForms.evalCaseClauses(value, clauses, caseEnv, nextK, out)
@@ -108,6 +95,18 @@ private[ming] object KontApply:
 
     case dk: (Kont.DynWindInK | Kont.DynWindMark | Kont.DynWindRetK | Kont.DynUnwindK | Kont.DynRewindK) =>
       applyDynWindKont(value, dk, out)
+
+    case Kont.ExceptionHandlerK(_, nextK) =>
+      ReturnS(value, nextK, out)
+
+    case Kont.GuardK(_, _, _, nextK) =>
+      ReturnS(value, nextK, out)
+
+    case Kont.GuardTestK(exnValue, body, remaining, variable, env, raiseK, guardK) =>
+      ExceptionHandling.applyGuardTest(value, exnValue, body, remaining, variable, env, raiseK, guardK, out)
+
+    case Kont.GuardClauseK(body, env, nextK) =>
+      SpecialForms.startSequence(body, env, nextK, out)
 
   // --- applyKont helpers ---
 
@@ -219,6 +218,40 @@ private[ming] object KontApply:
           Kont.LetInitK(params, newEvaled, rest, body, letEnv, nextK),
           out
         )
+
+  private def applyLetStarInit(
+    value: SchemeValue,
+    name: String,
+    remaining: List[(String, SchemeValue)],
+    body: List[SchemeValue],
+    lsEnv: Env,
+    nextK: Kont,
+    out: String
+  ): Step =
+    val newEnv = lsEnv.extend(name, value)
+    remaining match
+      case Nil => SpecialForms.startSequence(body, newEnv, nextK, out)
+      case (nextName, nextInit) :: rest =>
+        EvalS(
+          nextInit,
+          newEnv,
+          Kont.LetStarInitK(nextName, rest, body, newEnv, nextK),
+          out
+        )
+
+  private def applyMapK(
+    value: SchemeValue,
+    proc: SchemeValue,
+    remainingGroups: List[List[SchemeValue]],
+    accumulated: List[SchemeValue],
+    nextK: Kont,
+    out: String
+  ): Step =
+    val newAcc = accumulated :+ value
+    remainingGroups match
+      case Nil => ReturnS(SchemeList(newAcc), nextK, out)
+      case group :: rest =>
+        ProcApply.applyProc(proc, group, Kont.MapK(proc, rest, newAcc, nextK), out)
 
   private def applyNamedLetInit(
     value: SchemeValue,

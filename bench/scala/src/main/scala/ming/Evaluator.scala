@@ -10,6 +10,7 @@ object Evaluator:
   private[ming] case class EvalS(expr: SchemeValue, env: Env, k: Kont, out: String) extends Step
   private[ming] case class ReturnS(value: SchemeValue, k: Kont, out: String)        extends Step
   private[ming] case class DoneS(value: SchemeValue, out: String)                   extends Step
+  private[ming] case class RaiseS(value: SchemeValue, k: Kont, out: String)         extends Step
 
   // --- Public API ---
 
@@ -49,6 +50,7 @@ object Evaluator:
     case DoneS(v, o)            => (v, o)
     case EvalS(expr, env, k, o) => run(evalStep(expr, env, k, o))
     case ReturnS(v, k, o)       => run(KontApply.applyKont(v, k, o))
+    case RaiseS(v, k, o)        => run(ExceptionHandling.handleRaise(v, k, o))
 
   // --- Single evaluation step ---
 
@@ -93,7 +95,8 @@ object Evaluator:
 
   private def isSpecialForm(op: String): Boolean = op match
     case "define" | "if" | "quote" | "lambda" | "and" | "or" | "let" | "let*" | "letrec" | "letrec*" | "begin" |
-        "cond" | "case" | "do" | "set!" | "call/cc" | "call-with-current-continuation" | "define-syntax" | "when" =>
+        "cond" | "case" | "do" | "set!" | "call/cc" | "call-with-current-continuation" | "define-syntax" | "when" |
+        "guard" =>
       true
     case _ => false
 
