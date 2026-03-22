@@ -15,6 +15,7 @@ const BUILTINS: &[&str] = &[
     "symbol->string", "string->symbol",
     "string-ref", "char?",
     "string-copy",
+    "apply",
 ];
 
 fn is_builtin(name: &str) -> bool {
@@ -118,34 +119,72 @@ fn apply_tco(
     out: &mut String,
 ) -> Result<Trampoline, EvalError> {
     match operator {
+        Value::Symbol(ref name) if name == "apply" => {
+            if args.len() < 2 {
+                return Err(EvalError::arity("apply requires at least 2 arguments"));
+            }
+            let proc = &args[0];
+            let last = &args[args.len() - 1];
+            let Value::List(tail_args) = last else {
+                return Err(EvalError::type_err(format!(
+                    "apply: last argument must be a list, got {last}"
+                )));
+            };
+            let mut all_args: Vec<Value> = args[1..args.len() - 1].to_vec();
+            all_args.extend(tail_args.iter().cloned());
+            apply_tco(proc, &all_args, out)
+        }
         Value::Symbol(name) => {
             let val = apply_builtin(name, args, out)?;
             Ok(Trampoline::Done(val))
         }
         Value::Lambda {
             params,
+            rest_param,
             body,
             closure,
         } => {
-            if args.len() != params.len() {
-                return Err(EvalError::arity(format!(
-                    "expected {} arguments, got {}",
-                    params.len(),
-                    args.len()
-                )));
+            if let Some(ref rest_name) = rest_param {
+                if args.len() < params.len() {
+                    return Err(EvalError::arity(format!(
+                        "expected at least {} arguments, got {}",
+                        params.len(),
+                        args.len()
+                    )));
+                }
+                let local = Env::with_parent(closure);
+                for (param, arg) in params.iter().zip(args.iter()) {
+                    local.borrow_mut().set(param.clone(), arg.clone());
+                }
+                let rest = Value::List(args[params.len()..].to_vec());
+                local.borrow_mut().set(rest_name.clone(), rest);
+                for expr in &body[..body.len() - 1] {
+                    eval(expr, &local, out)?;
+                }
+                Ok(Trampoline::TailCall {
+                    expr: body[body.len() - 1].clone(),
+                    env: local,
+                })
+            } else {
+                if args.len() != params.len() {
+                    return Err(EvalError::arity(format!(
+                        "expected {} arguments, got {}",
+                        params.len(),
+                        args.len()
+                    )));
+                }
+                let local = Env::with_parent(closure);
+                for (param, arg) in params.iter().zip(args.iter()) {
+                    local.borrow_mut().set(param.clone(), arg.clone());
+                }
+                for expr in &body[..body.len() - 1] {
+                    eval(expr, &local, out)?;
+                }
+                Ok(Trampoline::TailCall {
+                    expr: body[body.len() - 1].clone(),
+                    env: local,
+                })
             }
-            let local = Env::with_parent(closure);
-            for (param, arg) in params.iter().zip(args.iter()) {
-                local.borrow_mut().set(param.clone(), arg.clone());
-            }
-            // Evaluate all but last in body, then tail-call the last
-            for expr in &body[..body.len() - 1] {
-                eval(expr, &local, out)?;
-            }
-            Ok(Trampoline::TailCall {
-                expr: body[body.len() - 1].clone(),
-                env: local,
-            })
         }
         _ => Err(EvalError::type_err(format!("not a procedure: {operator}"))),
     }
@@ -556,16 +595,11 @@ fn eval_define(
             let Value::Symbol(name) = &sig[0] else {
                 return Err(EvalError::type_err("define: expected function name"));
             };
-            let params: Vec<String> = sig[1..]
-                .iter()
-                .map(|p| match p {
-                    Value::Symbol(s) => Ok(s.clone()),
-                    _ => Err(EvalError::type_err("define: expected parameter name")),
-                })
-                .collect::<Result<Vec<_>, _>>()?;
+            let (params, rest_param) = parse_params(&sig[1..], "define")?;
             let body = args[1..].to_vec();
             let lambda = Value::Lambda {
                 params,
+                rest_param,
                 body,
                 closure: Rc::clone(env),
             };
@@ -573,6 +607,41 @@ fn eval_define(
             Ok(Value::Void)
         }
         _ => Err(EvalError::type_err("define: expected symbol or list")),
+    }
+}
+
+/// Parse a parameter list, handling dot notation for rest params.
+/// `(x y . rest)` → params=["x","y"], rest=Some("rest")
+/// `(x y)` → params=["x","y"], rest=None
+fn parse_params(param_list: &[Value], context: &str) -> Result<(Vec<String>, Option<String>), EvalError> {
+    let dot_pos = param_list.iter().position(|v| matches!(v, Value::Symbol(s) if s == "."));
+    match dot_pos {
+        Some(pos) => {
+            if pos + 2 != param_list.len() {
+                return Err(EvalError::parse(format!("{context}: invalid dot notation")));
+            }
+            let params: Vec<String> = param_list[..pos]
+                .iter()
+                .map(|p| match p {
+                    Value::Symbol(s) => Ok(s.clone()),
+                    _ => Err(EvalError::type_err(format!("{context}: expected parameter name"))),
+                })
+                .collect::<Result<Vec<_>, _>>()?;
+            let Value::Symbol(rest) = &param_list[pos + 1] else {
+                return Err(EvalError::type_err(format!("{context}: expected rest parameter name")));
+            };
+            Ok((params, Some(rest.clone())))
+        }
+        None => {
+            let params: Vec<String> = param_list
+                .iter()
+                .map(|p| match p {
+                    Value::Symbol(s) => Ok(s.clone()),
+                    _ => Err(EvalError::type_err(format!("{context}: expected parameter name"))),
+                })
+                .collect::<Result<Vec<_>, _>>()?;
+            Ok((params, None))
+        }
     }
 }
 
@@ -590,16 +659,11 @@ fn eval_lambda(args: &[Value], env: &Rc<RefCell<Env>>) -> Result<Value, EvalErro
     let Value::List(param_list) = &args[0] else {
         return Err(EvalError::type_err("lambda: expected parameter list"));
     };
-    let params: Vec<String> = param_list
-        .iter()
-        .map(|p| match p {
-            Value::Symbol(s) => Ok(s.clone()),
-            _ => Err(EvalError::type_err("lambda: expected parameter name")),
-        })
-        .collect::<Result<Vec<_>, _>>()?;
+    let (params, rest_param) = parse_params(param_list, "lambda")?;
     let body = args[1..].to_vec();
     Ok(Value::Lambda {
         params,
+        rest_param,
         body,
         closure: Rc::clone(env),
     })
@@ -641,6 +705,7 @@ fn eval_let_tco(
         let local = Env::with_parent(env);
         let lambda = Value::Lambda {
             params: params.clone(),
+            rest_param: None,
             body,
             closure: Rc::clone(&local),
         };
