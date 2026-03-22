@@ -223,7 +223,7 @@ type Value =
   | { tag: 'nil' }
   | { tag: 'pair'; car: Value; cdr: Value }
   | { tag: 'builtin'; name: string; fn: (args: Value[]) => Value }
-  | { tag: 'lambda'; params: string[]; body: Expr[]; env: Env };
+  | { tag: 'lambda'; params: string[]; rest: string | null; body: Expr[]; env: Env };
 
 function isTruthy(v: Value): boolean {
   return !(v.tag === 'boolean' && v.value === false);
@@ -483,6 +483,44 @@ function makeGlobalEnv(output: string[] = []): Env {
     return { tag: 'nil' };
   }});
 
+  // apply
+  env.define('apply', { tag: 'builtin', name: 'apply', fn(args) {
+    if (args.length < 2) throw new EvalError('apply: need at least 2 arguments');
+    const proc = args[0];
+    // Last arg must be a list; prefix args are prepended
+    let lastArg = args[args.length - 1];
+    const collected: Value[] = [];
+    for (let i = 1; i < args.length - 1; i++) {
+      collected.push(args[i]);
+    }
+    // Flatten the last argument (a list) into collected
+    while (lastArg.tag === 'pair') {
+      collected.push(lastArg.car);
+      lastArg = lastArg.cdr;
+    }
+    if (lastArg.tag !== 'nil') throw new EvalError('apply: last argument must be a proper list');
+    if (proc.tag === 'builtin') return proc.fn(collected);
+    if (proc.tag === 'lambda') {
+      const callEnv = new Env(proc.env);
+      for (let i = 0; i < proc.params.length; i++) {
+        callEnv.define(proc.params[i], collected[i]);
+      }
+      if (proc.rest !== null) {
+        let restList: Value = { tag: 'nil' };
+        for (let i = collected.length - 1; i >= proc.params.length; i--) {
+          restList = { tag: 'pair', car: collected[i], cdr: restList };
+        }
+        callEnv.define(proc.rest, restList);
+      }
+      let result: Value = { tag: 'nil' };
+      for (const bodyExpr of proc.body) {
+        result = evaluate(bodyExpr, callEnv);
+      }
+      return result;
+    }
+    throw new EvalError('apply: first argument must be a procedure');
+  }});
+
   return env;
 }
 
@@ -503,6 +541,31 @@ function exprToValue(expr: Expr): Value {
       return result;
     }
   }
+}
+
+// ── Parameter parsing helper ─────────────────────────────────────────
+
+function parseParams(exprs: Expr[]): { params: string[]; rest: string | null } {
+  const dotIdx = exprs.findIndex(e => e.tag === 'symbol' && e.name === '.');
+  if (dotIdx === -1) {
+    return {
+      params: exprs.map(p => {
+        if (p.tag !== 'symbol') throw new EvalError('expected symbol in parameter list');
+        return p.name;
+      }),
+      rest: null,
+    };
+  }
+  if (dotIdx !== exprs.length - 2) throw new EvalError('bad dot in parameter list');
+  const restExpr = exprs[exprs.length - 1];
+  if (restExpr.tag !== 'symbol') throw new EvalError('expected symbol after dot');
+  return {
+    params: exprs.slice(0, dotIdx).map(p => {
+      if (p.tag !== 'symbol') throw new EvalError('expected symbol in parameter list');
+      return p.name;
+    }),
+    rest: restExpr.name,
+  };
 }
 
 // ── Eval ─────────────────────────────────────────────────────────────
@@ -547,12 +610,9 @@ function evaluate(expr: Expr, env: Env): Value {
             if (target.tag === 'list') {
               const nameExpr = target.items[0];
               if (nameExpr.tag !== 'symbol') throw new EvalError(`${fmtPos(expr.pos)}: define: expected symbol`);
-              const params = target.items.slice(1).map(p => {
-                if (p.tag !== 'symbol') throw new EvalError('define: expected symbol');
-                return p.name;
-              });
+              const { params, rest } = parseParams(target.items.slice(1));
               const body = items.slice(2);
-              const lambda: Value = { tag: 'lambda', params, body, env };
+              const lambda: Value = { tag: 'lambda', params, rest, body, env };
               env.define(nameExpr.name, lambda);
               return { tag: 'nil' };
             }
@@ -573,13 +633,14 @@ function evaluate(expr: Expr, env: Env): Value {
 
           case 'lambda': {
             const paramsExpr = items[1];
+            if (paramsExpr.tag === 'symbol') {
+              // (lambda args body...) — all args as rest
+              return { tag: 'lambda', params: [], rest: paramsExpr.name, body: items.slice(2), env };
+            }
             if (paramsExpr.tag !== 'list') throw new EvalError(`${fmtPos(expr.pos)}: lambda: expected parameter list`);
-            const params = paramsExpr.items.map(p => {
-              if (p.tag !== 'symbol') throw new EvalError('lambda: expected symbol');
-              return p.name;
-            });
+            const { params, rest } = parseParams(paramsExpr.items);
             const body = items.slice(2);
-            return { tag: 'lambda', params, body, env };
+            return { tag: 'lambda', params, rest, body, env };
           }
 
           case 'and': {
@@ -615,7 +676,7 @@ function evaluate(expr: Expr, env: Env): Value {
                 inits.push(evaluate(b.items[1], env));
               }
               const body = items.slice(3);
-              const loopLambda: Value = { tag: 'lambda', params, body, env };
+              const loopLambda: Value = { tag: 'lambda', params, rest: null, body, env };
               // The lambda's env needs to include itself for recursion
               const loopEnv = new Env(env);
               loopEnv.define(loopName, loopLambda);
@@ -695,6 +756,13 @@ function evaluate(expr: Expr, env: Env): Value {
         const callEnv = new Env(fn.env);
         for (let i = 0; i < fn.params.length; i++) {
           callEnv.define(fn.params[i], args[i]);
+        }
+        if (fn.rest !== null) {
+          let restList: Value = { tag: 'nil' };
+          for (let i = args.length - 1; i >= fn.params.length; i--) {
+            restList = { tag: 'pair', car: args[i], cdr: restList };
+          }
+          callEnv.define(fn.rest, restList);
         }
         for (let i = 0; i < fn.body.length - 1; i++) {
           evaluate(fn.body[i], callEnv);
