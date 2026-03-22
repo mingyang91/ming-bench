@@ -291,100 +291,244 @@ fn expr_to_value(expr: &Expr) -> Value {
 }
 
 fn eval(expr: &Expr, env: &Env, out: &Output) -> Result<Value, EvalError> {
-    let span = expr.span;
-    match &expr.kind {
-        ExprKind::Integer(n) => Ok(Value::Integer(*n)),
-        ExprKind::Boolean(b) => Ok(Value::Boolean(*b)),
-        ExprKind::Char(c) => Ok(Value::Char(*c)),
-        ExprKind::String(s) => Ok(Value::String(s.clone())),
-        ExprKind::Symbol(name) => {
-            env_get(env, name).ok_or_else(|| EvalError::UnboundVariable(span.fmt(name)))
-        }
-        ExprKind::List(items) => {
-            if items.is_empty() {
-                return Err(EvalError::Type(span.fmt("empty application")));
+    let mut cur_expr = expr.clone();
+    let mut cur_env = env.clone();
+
+    loop {
+        let span = cur_expr.span;
+        let kind = cur_expr.kind.clone();
+        match kind {
+            ExprKind::Integer(n) => return Ok(Value::Integer(n)),
+            ExprKind::Boolean(b) => return Ok(Value::Boolean(b)),
+            ExprKind::Char(c) => return Ok(Value::Char(c)),
+            ExprKind::String(s) => return Ok(Value::String(s)),
+            ExprKind::Symbol(ref name) => {
+                return env_get(&cur_env, name)
+                    .ok_or_else(|| EvalError::UnboundVariable(span.fmt(name)));
             }
-            if let ExprKind::Symbol(op) = &items[0].kind {
-                match op.as_str() {
-                    "define" => return eval_define(&items[1..], env, span, out),
-                    "if" => return eval_if(&items[1..], env, span, out),
-                    "quote" => {
-                        if items.len() != 2 {
-                            return Err(EvalError::Arity(span.fmt("quote requires 1 argument")));
-                        }
-                        return Ok(expr_to_value(&items[1]));
-                    }
-                    "lambda" => return eval_lambda(&items[1..], env, span),
-                    "let" => return eval_let(&items[1..], env, span, out),
-                    "begin" => {
-                        let mut result = Value::Boolean(false);
-                        for item in &items[1..] {
-                            result = eval(item, env, out)?;
-                        }
-                        return Ok(result);
-                    }
-                    "cond" => return eval_cond(&items[1..], env, span, out),
-                    "and" => {
-                        let mut result = Value::Boolean(true);
-                        for arg in &items[1..] {
-                            result = eval(arg, env, out)?;
-                            if !result.is_truthy() {
-                                return Ok(result);
+            ExprKind::List(items) => {
+                if items.is_empty() {
+                    return Err(EvalError::Type(span.fmt("empty application")));
+                }
+                if let ExprKind::Symbol(ref op) = items[0].kind {
+                    match op.as_str() {
+                        "define" => return eval_define(&items[1..], &cur_env, span, out),
+                        "if" => {
+                            let args = &items[1..];
+                            if args.len() < 2 || args.len() > 3 {
+                                return Err(EvalError::Arity(span.fmt("if requires 2 or 3 arguments")));
+                            }
+                            let cond = eval(&args[0], &cur_env, out)?;
+                            if cond.is_truthy() {
+                                cur_expr = args[1].clone();
+                                continue;
+                            } else if args.len() == 3 {
+                                cur_expr = args[2].clone();
+                                continue;
+                            } else {
+                                return Ok(Value::Boolean(false));
                             }
                         }
-                        return Ok(result);
-                    }
-                    "or" => {
-                        let mut result = Value::Boolean(false);
-                        for arg in &items[1..] {
-                            result = eval(arg, env, out)?;
-                            if result.is_truthy() {
-                                return Ok(result);
+                        "quote" => {
+                            if items.len() != 2 {
+                                return Err(EvalError::Arity(span.fmt("quote requires 1 argument")));
                             }
+                            return Ok(expr_to_value(&items[1]));
                         }
-                        return Ok(result);
-                    }
-                    "set!" => return eval_set(&items[1..], env, span, out),
-                    "string-set!" => return eval_string_set(&items[1..], env, span, out),
-                    "display" => {
-                        if items.len() != 2 {
-                            return Err(EvalError::Arity(span.fmt("display requires 1 argument")));
+                        "lambda" => return eval_lambda(&items[1..], &cur_env, span),
+                        "let" => {
+                            let args = &items[1..];
+                            if args.len() < 2 {
+                                return Err(EvalError::Arity(span.fmt("let requires bindings and body")));
+                            }
+                            // Named let: (let name ((var init) ...) body ...)
+                            if let ExprKind::Symbol(ref name) = args[0].kind {
+                                let bindings = match &args[1].kind {
+                                    ExprKind::List(b) => b,
+                                    _ => return Err(EvalError::Type(span.fmt("named let: expected binding list"))),
+                                };
+                                let mut params = Vec::new();
+                                let mut init_vals = Vec::new();
+                                for binding in bindings {
+                                    match &binding.kind {
+                                        ExprKind::List(pair) if pair.len() == 2 => {
+                                            let pname = match &pair[0].kind {
+                                                ExprKind::Symbol(s) => s.clone(),
+                                                _ => return Err(EvalError::Type(binding.span.fmt("let: expected symbol"))),
+                                            };
+                                            let val = eval(&pair[1], &cur_env, out)?;
+                                            params.push(pname);
+                                            init_vals.push(val);
+                                        }
+                                        _ => return Err(EvalError::Type(binding.span.fmt("let: bad binding"))),
+                                    }
+                                }
+                                let body = args[2..].to_vec();
+                                let local_env = new_env(Some(cur_env.clone()));
+                                let lambda = Value::Lambda { params: params.clone(), body: body.clone(), env: local_env.clone() };
+                                env_set(&local_env, name.clone(), lambda);
+                                for (p, v) in params.iter().zip(init_vals.iter()) {
+                                    env_set(&local_env, p.clone(), v.clone());
+                                }
+                                for expr in &body[..body.len() - 1] {
+                                    eval(expr, &local_env, out)?;
+                                }
+                                cur_expr = body.last().unwrap().clone();
+                                cur_env = local_env;
+                                continue;
+                            }
+                            // Regular let
+                            let bindings = match &args[0].kind {
+                                ExprKind::List(b) => b,
+                                _ => return Err(EvalError::Type(span.fmt("let: expected binding list"))),
+                            };
+                            let local_env = new_env(Some(cur_env.clone()));
+                            for binding in bindings {
+                                match &binding.kind {
+                                    ExprKind::List(pair) if pair.len() == 2 => {
+                                        let name = match &pair[0].kind {
+                                            ExprKind::Symbol(s) => s.clone(),
+                                            _ => return Err(EvalError::Type(binding.span.fmt("let: expected symbol"))),
+                                        };
+                                        let val = eval(&pair[1], &cur_env, out)?;
+                                        env_set(&local_env, name, val);
+                                    }
+                                    _ => return Err(EvalError::Type(binding.span.fmt("let: bad binding"))),
+                                }
+                            }
+                            let body = &args[1..];
+                            for expr in &body[..body.len() - 1] {
+                                eval(expr, &local_env, out)?;
+                            }
+                            cur_expr = body.last().unwrap().clone();
+                            cur_env = local_env;
+                            continue;
                         }
-                        let val = eval(&items[1], env, out)?;
-                        out.borrow_mut().push_str(&val.display_output());
-                        return Ok(Value::Boolean(false));
-                    }
-                    "write" => {
-                        if items.len() != 2 {
-                            return Err(EvalError::Arity(span.fmt("write requires 1 argument")));
+                        "begin" => {
+                            let body = &items[1..];
+                            if body.is_empty() {
+                                return Ok(Value::Boolean(false));
+                            }
+                            for item in &body[..body.len() - 1] {
+                                eval(item, &cur_env, out)?;
+                            }
+                            cur_expr = body.last().unwrap().clone();
+                            continue;
                         }
-                        let val = eval(&items[1], env, out)?;
-                        out.borrow_mut().push_str(&val.write_output());
-                        return Ok(Value::Boolean(false));
-                    }
-                    "newline" => {
-                        if items.len() != 1 {
-                            return Err(EvalError::Arity(span.fmt("newline takes 0 arguments")));
+                        "cond" => {
+                            let clauses = &items[1..];
+                            let mut found = false;
+                            for clause in clauses {
+                                match &clause.kind {
+                                    ExprKind::List(parts) if parts.len() >= 2 => {
+                                        let is_else = matches!(&parts[0].kind, ExprKind::Symbol(s) if s == "else");
+                                        if is_else || eval(&parts[0], &cur_env, out)?.is_truthy() {
+                                            for expr in &parts[1..parts.len() - 1] {
+                                                eval(expr, &cur_env, out)?;
+                                            }
+                                            cur_expr = parts.last().unwrap().clone();
+                                            found = true;
+                                            break;
+                                        }
+                                    }
+                                    _ => return Err(EvalError::Type(clause.span.fmt("cond: bad clause"))),
+                                }
+                            }
+                            if found {
+                                continue;
+                            }
+                            return Ok(Value::Boolean(false));
                         }
-                        out.borrow_mut().push('\n');
-                        return Ok(Value::Boolean(false));
+                        "and" => {
+                            let args = &items[1..];
+                            if args.is_empty() {
+                                return Ok(Value::Boolean(true));
+                            }
+                            for arg in &args[..args.len() - 1] {
+                                let val = eval(arg, &cur_env, out)?;
+                                if !val.is_truthy() {
+                                    return Ok(val);
+                                }
+                            }
+                            cur_expr = args.last().unwrap().clone();
+                            continue;
+                        }
+                        "or" => {
+                            let args = &items[1..];
+                            if args.is_empty() {
+                                return Ok(Value::Boolean(false));
+                            }
+                            for arg in &args[..args.len() - 1] {
+                                let val = eval(arg, &cur_env, out)?;
+                                if val.is_truthy() {
+                                    return Ok(val);
+                                }
+                            }
+                            cur_expr = args.last().unwrap().clone();
+                            continue;
+                        }
+                        "set!" => return eval_set(&items[1..], &cur_env, span, out),
+                        "string-set!" => return eval_string_set(&items[1..], &cur_env, span, out),
+                        "display" => {
+                            if items.len() != 2 {
+                                return Err(EvalError::Arity(span.fmt("display requires 1 argument")));
+                            }
+                            let val = eval(&items[1], &cur_env, out)?;
+                            out.borrow_mut().push_str(&val.display_output());
+                            return Ok(Value::Boolean(false));
+                        }
+                        "write" => {
+                            if items.len() != 2 {
+                                return Err(EvalError::Arity(span.fmt("write requires 1 argument")));
+                            }
+                            let val = eval(&items[1], &cur_env, out)?;
+                            out.borrow_mut().push_str(&val.write_output());
+                            return Ok(Value::Boolean(false));
+                        }
+                        "newline" => {
+                            if items.len() != 1 {
+                                return Err(EvalError::Arity(span.fmt("newline takes 0 arguments")));
+                            }
+                            out.borrow_mut().push('\n');
+                            return Ok(Value::Boolean(false));
+                        }
+                        "cons" | "car" | "cdr" | "null?" | "list" | "length"
+                        | "string?" | "number?" | "boolean?" | "pair?" | "symbol?" | "char?"
+                        | "string-append" | "string-length" | "substring"
+                        | "string->number" | "number->string"
+                        | "symbol->string" | "string->symbol"
+                        | "string-ref" | "string-copy"
+                        | "+" | "-" | "*" | "/" | "<" | ">" | "=" | "<=" | ">=" | "not" => {
+                            let args: Vec<Value> = items[1..].iter().map(|a| eval(a, &cur_env, out)).collect::<Result<_, _>>()?;
+                            return eval_builtin(op, &args, span);
+                        }
+                        _ => {}
                     }
-                    "cons" | "car" | "cdr" | "null?" | "list" | "length"
-                    | "string?" | "number?" | "boolean?" | "pair?" | "symbol?" | "char?"
-                    | "string-append" | "string-length" | "substring"
-                    | "string->number" | "number->string"
-                    | "symbol->string" | "string->symbol"
-                    | "string-ref" | "string-copy"
-                    | "+" | "-" | "*" | "/" | "<" | ">" | "=" | "<=" | ">=" | "not" => {
-                        let args: Vec<Value> = items[1..].iter().map(|a| eval(a, env, out)).collect::<Result<_, _>>()?;
-                        return eval_builtin(op, &args, span);
+                }
+                // Function application with TCO
+                let func = eval(&items[0], &cur_env, out)?;
+                let args: Vec<Value> = items[1..].iter().map(|a| eval(a, &cur_env, out)).collect::<Result<_, _>>()?;
+                match func {
+                    Value::Lambda { params, body, env: closure_env } => {
+                        if args.len() != params.len() {
+                            return Err(EvalError::Arity(span.fmt(&format!(
+                                "expected {} arguments, got {}", params.len(), args.len()
+                            ))));
+                        }
+                        let local_env = new_env(Some(closure_env));
+                        for (p, a) in params.iter().zip(args.iter()) {
+                            env_set(&local_env, p.clone(), a.clone());
+                        }
+                        for expr in &body[..body.len() - 1] {
+                            eval(expr, &local_env, out)?;
+                        }
+                        cur_expr = body.last().unwrap().clone();
+                        cur_env = local_env;
+                        continue;
                     }
-                    _ => {}
+                    _ => return Err(EvalError::Type(span.fmt("not a procedure"))),
                 }
             }
-            let func = eval(&items[0], env, out)?;
-            let args: Vec<Value> = items[1..].iter().map(|a| eval(a, env, out)).collect::<Result<_, _>>()?;
-            apply(&func, &args, span, out)
         }
     }
 }
@@ -423,19 +567,6 @@ fn eval_define(args: &[Expr], env: &Env, span: Span, out: &Output) -> Result<Val
     }
 }
 
-fn eval_if(args: &[Expr], env: &Env, span: Span, out: &Output) -> Result<Value, EvalError> {
-    if args.len() < 2 || args.len() > 3 {
-        return Err(EvalError::Arity(span.fmt("if requires 2 or 3 arguments")));
-    }
-    let cond = eval(&args[0], env, out)?;
-    if cond.is_truthy() {
-        eval(&args[1], env, out)
-    } else if args.len() == 3 {
-        eval(&args[2], env, out)
-    } else {
-        Ok(Value::Boolean(false))
-    }
-}
 
 fn eval_lambda(args: &[Expr], env: &Env, span: Span) -> Result<Value, EvalError> {
     if args.len() < 2 {
@@ -454,63 +585,6 @@ fn eval_lambda(args: &[Expr], env: &Env, span: Span) -> Result<Value, EvalError>
     Ok(Value::Lambda { params, body, env: env.clone() })
 }
 
-fn eval_let(args: &[Expr], env: &Env, span: Span, out: &Output) -> Result<Value, EvalError> {
-    if args.len() < 2 {
-        return Err(EvalError::Arity(span.fmt("let requires bindings and body")));
-    }
-    let bindings = match &args[0].kind {
-        ExprKind::List(b) => b,
-        _ => return Err(EvalError::Type(span.fmt("let: expected binding list"))),
-    };
-    let local_env = new_env(Some(env.clone()));
-    for binding in bindings {
-        match &binding.kind {
-            ExprKind::List(pair) if pair.len() == 2 => {
-                let name = match &pair[0].kind {
-                    ExprKind::Symbol(s) => s.clone(),
-                    _ => return Err(EvalError::Type(binding.span.fmt("let: expected symbol"))),
-                };
-                let val = eval(&pair[1], env, out)?;
-                env_set(&local_env, name, val);
-            }
-            _ => return Err(EvalError::Type(binding.span.fmt("let: bad binding"))),
-        }
-    }
-    let mut result = Value::Boolean(false);
-    for expr in &args[1..] {
-        result = eval(expr, &local_env, out)?;
-    }
-    Ok(result)
-}
-
-fn eval_cond(clauses: &[Expr], env: &Env, span: Span, out: &Output) -> Result<Value, EvalError> {
-    for clause in clauses {
-        match &clause.kind {
-            ExprKind::List(parts) if parts.len() >= 2 => {
-                if let ExprKind::Symbol(s) = &parts[0].kind {
-                    if s == "else" {
-                        let mut result = Value::Boolean(false);
-                        for expr in &parts[1..] {
-                            result = eval(expr, env, out)?;
-                        }
-                        return Ok(result);
-                    }
-                }
-                let test = eval(&parts[0], env, out)?;
-                if test.is_truthy() {
-                    let mut result = Value::Boolean(false);
-                    for expr in &parts[1..] {
-                        result = eval(expr, env, out)?;
-                    }
-                    return Ok(result);
-                }
-            }
-            _ => return Err(EvalError::Type(clause.span.fmt("cond: bad clause"))),
-        }
-    }
-    let _ = span;
-    Ok(Value::Boolean(false))
-}
 
 fn eval_set(args: &[Expr], env: &Env, span: Span, out: &Output) -> Result<Value, EvalError> {
     if args.len() != 2 {
@@ -582,27 +656,6 @@ fn eval_string_set(args: &[Expr], env: &Env, span: Span, out: &Output) -> Result
     }
 }
 
-fn apply(func: &Value, args: &[Value], span: Span, out: &Output) -> Result<Value, EvalError> {
-    match func {
-        Value::Lambda { params, body, env } => {
-            if args.len() != params.len() {
-                return Err(EvalError::Arity(span.fmt(&format!(
-                    "expected {} arguments, got {}", params.len(), args.len()
-                ))));
-            }
-            let local_env = new_env(Some(env.clone()));
-            for (p, a) in params.iter().zip(args.iter()) {
-                env_set(&local_env, p.clone(), a.clone());
-            }
-            let mut result = Value::Boolean(false);
-            for expr in body {
-                result = eval(expr, &local_env, out)?;
-            }
-            Ok(result)
-        }
-        _ => Err(EvalError::Type(span.fmt("not a procedure"))),
-    }
-}
 
 fn as_int(v: &Value, span: Span) -> Result<i64, EvalError> {
     match v {
