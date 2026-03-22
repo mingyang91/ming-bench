@@ -74,5 +74,8 @@ object SchemeValue:
     def display: String                = s"#\\$value"
     override def displayOutput: String = value.toString
 
+  case class SchemeContinuation(k: Kont) extends SchemeValue:
+    def display: String = "#<continuation>"
+
   case object SchemeVoid extends SchemeValue:
     def display: String = "#<void>"

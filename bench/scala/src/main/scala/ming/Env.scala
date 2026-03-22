@@ -79,16 +79,19 @@ object Env:
 
     def init(): Unit =
       // First pass: initialize function defines (no evaluation needed)
-      defines.foreach {
-        case (name, Some((params, restParam)), body) =>
-          cells(name)(0) = SchemeLambda(params, restParam, body, this)
-        case _ => ()
-      }
+      initFunctions()
       // Second pass: initialize variable defines (may reference functions)
       defines.foreach {
         case (name, None, body) =>
           import ming.Evaluator as E
           cells(name)(0) = E.eval(body.head, this)
+        case _ => ()
+      }
+
+    def initFunctions(): Unit =
+      defines.foreach {
+        case (name, Some((params, restParam)), body) =>
+          cells(name)(0) = SchemeLambda(params, restParam, body, this)
         case _ => ()
       }
 

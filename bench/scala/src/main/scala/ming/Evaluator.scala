@@ -2,18 +2,14 @@ package ming
 
 import SchemeValue.*
 
-/** Scheme interpreter entry point with trampoline-based TCO. */
+/** Scheme interpreter with CPS trampoline for full call/cc support. */
 object Evaluator:
 
-  // --- Trampoline types (package-private for SpecialForms) ---
-  sealed private[ming] trait EvalResult
-  private[ming] case class Done(value: SchemeValue, env: Env, output: String) extends EvalResult
-
-  private[ming] case class Bounce(
-    expr: SchemeValue,
-    env: Env,
-    accOutput: String
-  ) extends EvalResult
+  // --- CPS Trampoline types (package-visible for helper objects) ---
+  sealed private[ming] trait Step
+  private[ming] case class EvalS(expr: SchemeValue, env: Env, k: Kont, out: String) extends Step
+  private[ming] case class ReturnS(value: SchemeValue, k: Kont, out: String)        extends Step
+  private[ming] case class DoneS(value: SchemeValue, out: String)                   extends Step
 
   // --- Public API ---
 
@@ -23,270 +19,85 @@ object Evaluator:
   def evalStrWithOutput(input: String): (String, String) =
     val exprs = Parser.parse(input)
     if exprs.isEmpty then throw new EvalError("empty input")
-    val (lastVal, _, output) = evalSequence(exprs, Env.empty)
-    (lastVal.display, output)
+    val (value, output) = evalProgram(exprs, Env.empty)
+    (value.display, output)
 
-  // --- Sequence evaluation (top-level / body with defines) ---
+  /** Legacy eval used by LetrecFrame.init(). */
+  private[ming] def eval(expr: SchemeValue, env: Env): SchemeValue =
+    run(EvalS(expr, env, Kont.Halt, ""))._1
 
-  /** A collected define: name, optional params (None=variable, Some=(fixed,rest)), body. */
-  private[ming] type Define = (String, Option[(List[String], Option[String])], List[SchemeValue])
+  // --- Program evaluation ---
 
-  /** Parse parameter list that may contain dot notation for rest params. */
-  private[ming] def parseParams(rawParams: List[SchemeValue]): (List[String], Option[String]) =
-    val dotIdx = rawParams.indexWhere {
-      case SchemeSymbol(".") => true
-      case _                 => false
-    }
-    if dotIdx < 0 then
-      val names = rawParams.map {
-        case SchemeSymbol(n) => n
-        case other           => throw new EvalError(s"bad parameter: ${other.display}")
-      }
-      (names, None)
+  private def evalProgram(
+    exprs: List[SchemeValue],
+    env: Env
+  ): (SchemeValue, String) =
+    val (defines, body) = SpecialForms.collectDefines(exprs, Nil)
+    if defines.isEmpty then run(SpecialForms.startBody(body, env, Kont.Halt, ""))
     else
-      val fixed = rawParams.take(dotIdx).map {
-        case SchemeSymbol(n) => n
-        case other           => throw new EvalError(s"bad parameter: ${other.display}")
+      val frame = new Env.LetrecFrame(defines, env)
+      frame.initFunctions()
+      val varInits = defines.collect { case (name, None, List(valueExpr)) =>
+        SchemeList(List(SchemeSymbol("set!"), SchemeSymbol(name), valueExpr))
       }
-      rawParams.drop(dotIdx + 1) match
-        case SchemeSymbol(rest) :: Nil => (fixed, Some(rest))
-        case _                         => throw new EvalError("bad dot syntax in parameters")
+      run(SpecialForms.startBody(varInits ++ body, frame, Kont.Halt, ""))
 
-  private[ming] def evalSequence(
-    exprs: List[SchemeValue],
-    env: Env
-  ): (SchemeValue, Env, String) =
-    val (defines, body) = collectDefines(exprs, Nil)
-    val bodyEnv =
-      if defines.isEmpty then env
-      else
-        val frame = new Env.LetrecFrame(defines, env)
-        frame.init()
-        frame
-    evalSeqLoop(body, bodyEnv, "")
+  // --- Trampoline ---
 
   @scala.annotation.tailrec
-  private def collectDefines(
-    exprs: List[SchemeValue],
-    acc: List[Define]
-  ): (List[Define], List[SchemeValue]) =
-    exprs match
-      case (defExpr @ SchemeList(
-            SchemeSymbol("define") :: rest
-          )) :: tail =>
-        rest match
-          case SchemeSymbol(name) :: valueExpr :: Nil =>
-            collectDefines(tail, (name, None, List(valueExpr)) :: acc)
-          case SchemeList(SchemeSymbol(name) :: rawParams) :: body =>
-            val (paramNames, restParam) = parseParams(rawParams)
-            collectDefines(
-              tail,
-              (name, Some((paramNames, restParam)), body) :: acc
-            )
-          case _ =>
-            throw new EvalError("bad define syntax", defExpr.pos)
-      case _ => (acc.reverse, exprs)
+  private def run(step: Step): (SchemeValue, String) = step match
+    case DoneS(v, o)            => (v, o)
+    case EvalS(expr, env, k, o) => run(evalStep(expr, env, k, o))
+    case ReturnS(v, k, o)       => run(KontApply.applyKont(v, k, o))
 
-  @scala.annotation.tailrec
-  private def evalSeqLoop(
-    exprs: List[SchemeValue],
-    env: Env,
-    accOutput: String
-  ): (SchemeValue, Env, String) =
-    exprs match
-      case Nil => (SchemeVoid, env, accOutput)
-      case last :: Nil =>
-        val (v, e, o) = evalWithEnv(last, env)
-        (v, e, accOutput + o)
-      case head :: tail =>
-        val (_, nextEnv, o) = evalWithEnv(head, env)
-        evalSeqLoop(tail, nextEnv, accOutput + o)
+  // --- Single evaluation step ---
 
-  // --- Trampoline-based eval ---
-
-  private[ming] def evalWithEnv(
-    expr: SchemeValue,
-    env: Env
-  ): (SchemeValue, Env, String) =
-    trampoline(evalOnce(expr, env, ""))
-
-  @scala.annotation.tailrec
-  private def trampoline(
-    result: EvalResult
-  ): (SchemeValue, Env, String) = result match
-    case Done(v, e, o)          => (v, e, o)
-    case Bounce(expr, env, acc) => trampoline(evalOnce(expr, env, acc))
-
-  private[ming] def eval(
-    expr: SchemeValue,
-    env: Env
-  ): SchemeValue =
-    evalWithEnv(expr, env)._1
-
-  private[ming] def evalArgs(
-    args: List[SchemeValue],
-    env: Env
-  ): (List[SchemeValue], String) =
-    val (reversedVals, out) =
-      args.foldLeft((List.empty[SchemeValue], "")) { case ((vals, accOut), arg) =>
-        val (v, _, o) = evalWithEnv(arg, env)
-        (v :: vals, accOut + o)
-      }
-    (reversedVals.reverse, out)
-
-  // --- Single evaluation step (returns Bounce for tail positions) ---
-
-  private def evalOnce(
+  private def evalStep(
     expr: SchemeValue,
     env: Env,
-    accOut: String
-  ): EvalResult = expr match
-    case SchemeInt(_)             => Done(expr, env, accOut)
-    case SchemeBool(_)            => Done(expr, env, accOut)
-    case SchemeString(_)          => Done(expr, env, accOut)
-    case _: SchemeMutableString   => Done(expr, env, accOut)
-    case SchemeChar(_)            => Done(expr, env, accOut)
-    case SchemeVoid               => Done(expr, env, accOut)
-    case SchemeLambda(_, _, _, _) => Done(expr, env, accOut)
-    case SchemeBuiltinProc(_)     => Done(expr, env, accOut)
+    k: Kont,
+    out: String
+  ): Step = expr match
     case SchemeSymbol(name) =>
-      env.get(name) match
-        case Some(v) => Done(v, env, accOut)
+      val v = env.get(name) match
+        case Some(v) => v
         case None =>
-          if Builtins.knownNames.contains(name) then Done(SchemeBuiltinProc(name), env, accOut)
+          if isKnownName(name) then SchemeBuiltinProc(name)
           else throw new EvalError(s"unbound variable: $name", expr.pos)
+      ReturnS(v, k, out)
     case SchemeList(Nil) =>
       throw new EvalError("empty application", expr.pos)
-    case SchemeList(SchemeSymbol(op) :: args) =>
-      try evalSpecialOrCallOnce(op, args, env, accOut)
+    case SchemeList(SchemeSymbol(op) :: args) if isSpecialForm(op) =>
+      try SpecialForms.evalSpecial(op, args, env, k, out)
       catch
         case e: EvalError if e.sourcePos == SourcePos.None =>
           throw new EvalError(e.baseMessage, expr.pos)
     case SchemeList(head :: args) =>
-      try
-        val (proc, _, ho)       = evalWithEnv(head, env)
-        val (evaledArgs, aoStr) = evalArgs(args, env)
-        applyProcTail(proc, evaledArgs, env, accOut + ho + aoStr)
+      try EvalS(head, env, Kont.EvalOp(args, env, k, expr.pos), out)
       catch
         case e: EvalError if e.sourcePos == SourcePos.None =>
           throw new EvalError(e.baseMessage, expr.pos)
-    case other =>
-      throw new EvalError(
-        s"cannot evaluate: ${other.display}",
-        other.pos
-      )
-
-  // --- Special form / call dispatch (tail-aware) ---
-
-  private def evalSpecialOrCallOnce(
-    op: String,
-    args: List[SchemeValue],
-    env: Env,
-    accOut: String
-  ): EvalResult = op match
-    case "define" =>
-      val (v, e, o) = SpecialForms.evalDefine(args, env)
-      Done(v, e, accOut + o)
-    case "if"     => SpecialForms.evalIfOnce(args, env, accOut)
-    case "quote"  => SpecialForms.evalQuoteOnce(args, env, accOut)
-    case "lambda" => Done(SpecialForms.evalLambda(args, env), env, accOut)
-    case "and"    => SpecialForms.evalAndOnce(args, env, accOut)
-    case "or"     => SpecialForms.evalOrOnce(args, env, accOut)
-    case "not"    => SpecialForms.evalNotOnce(args, env, accOut)
-    case "let"    => SpecialForms.evalLetOnce(args, env, accOut)
-    case "begin"  => SpecialForms.evalBeginOnce(args, env, accOut)
-    case "cond"   => SpecialForms.evalCondOnce(args, env, accOut)
-    case "set!"   => SpecialForms.evalSetOnce(args, env, accOut)
     case _ =>
-      val (evaledArgs, ao) = evalArgs(args, env)
-      env.get(op) match
-        case Some(proc) =>
-          applyProcTail(proc, evaledArgs, env, accOut + ao)
-        case None =>
-          if op == "apply" then applyApply(evaledArgs, env, accOut + ao)
-          else
-            val (result, bo) =
-              Builtins.evalBuiltin(op, evaledArgs)
-            Done(result, env, accOut + ao + bo)
+      ReturnS(expr, k, out)
 
-  // --- Procedure application (tail-aware) ---
+  // --- Dispatch helpers ---
 
-  private def applyProcTail(
-    proc: SchemeValue,
-    args: List[SchemeValue],
-    callerEnv: Env,
-    accOut: String
-  ): EvalResult = proc match
-    case SchemeLambda(params, restParam, body, closure) =>
-      restParam match
-        case None =>
-          if params.length != args.length then
-            throw new EvalError(
-              s"expected ${params.length} arguments, got ${args.length}"
-            )
-          val localEnv = closure.extend(params, args)
-          evalSequenceOnce(body, localEnv, accOut)
-        case Some(rest) =>
-          if args.length < params.length then
-            throw new EvalError(
-              s"expected at least ${params.length} arguments, got ${args.length}"
-            )
-          val (fixed, remaining) = args.splitAt(params.length)
-          val localEnv = closure.extend(
-            params :+ rest,
-            fixed :+ SchemeList(remaining)
-          )
-          evalSequenceOnce(body, localEnv, accOut)
-    case SchemeBuiltinProc(name) =>
-      if name == "apply" then applyApply(args, callerEnv, accOut)
-      else
-        val (result, bo) = Builtins.evalBuiltin(name, args)
-        Done(result, callerEnv, accOut + bo)
-    case other =>
-      throw new EvalError(s"not a procedure: ${other.display}")
+  private def isSpecialForm(op: String): Boolean = op match
+    case "define" | "if" | "quote" | "lambda" | "and" | "or" | "not" | "let" | "begin" | "cond" | "set!" | "call/cc" |
+        "call-with-current-continuation" =>
+      true
+    case _ => false
 
-  private def applyApply(
-    args: List[SchemeValue],
-    callerEnv: Env,
-    accOut: String
-  ): EvalResult =
-    if args.length < 2 then throw new EvalError("apply: expected at least 2 arguments")
-    val proc       = args.head
-    val lastArg    = args.last
-    val prefixArgs = args.drop(1).dropRight(1)
-    val allArgs = lastArg match
-      case SchemeList(es) => prefixArgs ++ es
-      case other =>
-        throw new EvalError(
-          s"apply: last argument must be a list, got ${other.display}"
-        )
-    applyProcTail(proc, allArgs, callerEnv, accOut)
+  private[ming] def isKnownName(name: String): Boolean =
+    Builtins.knownNames.contains(name) ||
+      name == "call/cc" || name == "call-with-current-continuation"
 
-  // --- Tail-aware sequence (with defines) ---
+  // --- Shared helpers ---
 
-  private[ming] def evalSequenceOnce(
-    exprs: List[SchemeValue],
-    env: Env,
-    accOut: String
-  ): EvalResult =
-    val (defines, body) = collectDefines(exprs, Nil)
-    val bodyEnv =
-      if defines.isEmpty then env
-      else
-        val frame = new Env.LetrecFrame(defines, env)
-        frame.init()
-        frame
-    evalBodyOnce(body, bodyEnv, accOut)
+  private[ming] def isFalsy(v: SchemeValue): Boolean = v match
+    case SchemeBool(false) => true
+    case _                 => false
 
-  @scala.annotation.tailrec
-  private[ming] def evalBodyOnce(
-    exprs: List[SchemeValue],
-    env: Env,
-    accOut: String
-  ): EvalResult =
-    exprs match
-      case Nil         => Done(SchemeVoid, env, accOut)
-      case last :: Nil => Bounce(last, env, accOut)
-      case head :: tail =>
-        val (_, nextEnv, o) = evalWithEnv(head, env)
-        evalBodyOnce(tail, nextEnv, accOut + o)
+  private[ming] def updateSeqEnv(k: Kont, env: Env): Kont = k match
+    case Kont.Seq(remaining, _, nextK) => Kont.Seq(remaining, env, nextK)
+    case other                         => other
