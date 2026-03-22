@@ -18,10 +18,15 @@ const (
 	KindBuiltin
 	KindLambda
 	KindChar
-	KindTailCall // internal: trampoline for TCO
+	KindTailCall     // internal: trampoline for TCO
+	KindContinuation // first-class continuation
+	KindCallCC       // call/cc as first-class value
 )
 
 type BuiltinFunc func(args []*Value) (*Value, error)
+
+// ContFunc is a continuation function that takes a value and returns the result.
+type ContFunc func(val *Value) (*Value, error)
 
 type Value struct {
 	Kind    ValueKind
@@ -31,6 +36,7 @@ type Value struct {
 	Car     *Value
 	Cdr     *Value
 	Builtin BuiltinFunc
+	ContFn  ContFunc // for KindContinuation
 	// Lambda fields
 	Params    []string
 	RestParam string // variadic rest parameter name (empty if none)
@@ -86,6 +92,10 @@ func (v *Value) String() string {
 		return fmt.Sprintf("#<procedure:%s>", v.Str)
 	case KindLambda:
 		return "#<procedure>"
+	case KindContinuation:
+		return "#<continuation>"
+	case KindCallCC:
+		return "#<procedure:call/cc>"
 	case KindPair:
 		return printList(v)
 	case KindChar:

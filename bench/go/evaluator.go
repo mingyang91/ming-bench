@@ -6,11 +6,19 @@ import (
 	"strings"
 )
 
+// continuationEscape is panicked when a continuation is invoked within
+// the dynamic extent of callWithCont.
+type continuationEscape struct {
+	cont  *Value
+	value *Value
+}
+
+
 // Env holds variable bindings.
 type Env struct {
 	bindings map[string]*Value
 	parent   *Env
-	output   *strings.Builder // shared output buffer (only on root env)
+	output   *strings.Builder    // shared output buffer (only on root env)
 }
 
 func (e *Env) getOutput() *strings.Builder {
@@ -22,6 +30,7 @@ func (e *Env) getOutput() *strings.Builder {
 	}
 	return nil
 }
+
 
 func newEnv(parent *Env) *Env {
 	return &Env{bindings: make(map[string]*Value), parent: parent}
@@ -82,7 +91,8 @@ func makeGlobalEnv() *Env {
 		if len(args) != 1 {
 			return nil, &EvalError{Message: "procedure?: expected 1 argument"}
 		}
-		return boolVal(args[0].Kind == KindBuiltin || args[0].Kind == KindLambda), nil
+		k := args[0].Kind
+		return boolVal(k == KindBuiltin || k == KindLambda || k == KindContinuation || k == KindCallCC), nil
 	}))
 	env.set("string-append", builtinVal("string-append", builtinStringAppend))
 	env.set("string-length", builtinVal("string-length", builtinStringLength))
@@ -95,6 +105,8 @@ func makeGlobalEnv() *Env {
 	env.set("string-set!", builtinVal("string-set!", builtinStringSet))
 	env.set("string-copy", builtinVal("string-copy", builtinStringCopy))
 	env.set("apply", builtinVal("apply", builtinApply))
+	env.set("call/cc", &Value{Kind: KindCallCC})
+	env.set("call-with-current-continuation", &Value{Kind: KindCallCC})
 	return env
 }
 
@@ -158,6 +170,8 @@ func evalList(expr *Value, env *Env) (*Value, error) {
 			return evalCond(expr.Cdr, env)
 		case "set!":
 			return evalSetBang(expr.Cdr, env, expr)
+		case "call/cc", "call-with-current-continuation":
+			return evalCallCC(expr.Cdr, env, expr)
 		case "display":
 			return evalDisplay(expr.Cdr, env)
 		case "write":
@@ -179,18 +193,31 @@ func evalList(expr *Value, env *Env) (*Value, error) {
 		return nil, err
 	}
 
-	if fn.Kind == KindBuiltin {
+	return applyProc(fn, args, expr, env)
+}
+
+func applyProc(fn *Value, args []*Value, expr *Value, env *Env) (*Value, error) {
+	switch fn.Kind {
+	case KindCallCC:
+		if len(args) != 1 {
+			return nil, posError(expr, "call/cc: expected 1 argument")
+		}
+		return evalCallCCWithFn(args[0], expr, env)
+	case KindBuiltin:
 		result, err := fn.Builtin(args)
 		if err != nil {
 			return nil, wrapErrorPos(err, expr)
 		}
 		return result, nil
-	}
-
-	if fn.Kind == KindLambda {
+	case KindLambda:
 		return applyLambda(fn, args)
+	case KindContinuation:
+		if len(args) != 1 {
+			return nil, &EvalError{Message: "continuation: expected 1 argument"}
+		}
+		// Call the continuation's function (sends to channel and blocks forever)
+		return fn.ContFn(args[0])
 	}
-
 	return nil, posError(expr, fmt.Sprintf("not a procedure: %s", fn.String()))
 }
 
@@ -390,6 +417,146 @@ func listToSlice(v *Value) []*Value {
 		cur = cur.Cdr
 	}
 	return result
+}
+
+type contResult struct {
+	val *Value
+	err error
+}
+
+func evalCallCC(args *Value, env *Env, callSite *Value) (*Value, error) {
+	fn, err := eval(args.Car, env)
+	if err != nil {
+		return nil, err
+	}
+	return evalCallCCWithFn(fn, callSite, env)
+}
+
+// contOverride stores the override for a continuation during replay.
+type contOverride struct {
+	callSite *Value // AST node identifying the call/cc site
+	value    *Value // value to return instead of running body
+	env      *Env   // captured environment to restore
+}
+
+var pendingOverride *contOverride
+
+// evalCallCCWithFn implements call/cc. Within the dynamic extent of call/cc,
+// continuation invocation panics and is caught. For saved continuations,
+// the panic propagates to evalProgramLoop which catches it and replays.
+func evalCallCCWithFn(fn *Value, callSite *Value, env *Env) (*Value, error) {
+	// Check if we have a pending override for this call site (replay mode)
+	if pendingOverride != nil && pendingOverride.callSite == callSite {
+		override := pendingOverride
+		pendingOverride = nil // consume it
+
+		// Restore the captured environment's bindings to the current scope
+		if override.env != nil {
+			restoreEnv(env, override.env)
+		}
+
+		return override.value, nil
+	}
+
+	cont := &Value{Kind: KindContinuation}
+	cont.ContFn = func(val *Value) (*Value, error) {
+		panic(continuationEscape{cont: cont, value: val})
+	}
+	// Store the call site and captured env on the continuation for replay
+	cont.ClosureEnv = env
+	cont.Car = callSite
+
+	result, err := callWithCont(fn, cont)
+	return result, err
+}
+
+// restoreEnv copies all bindings from src into dst (shallow copy of bindings map).
+func restoreEnv(dst, src *Env) {
+	for k, v := range src.bindings {
+		dst.bindings[k] = v
+	}
+}
+
+func callWithCont(fn *Value, cont *Value) (result *Value, err error) {
+	defer func() {
+		if r := recover(); r != nil {
+			if esc, ok := r.(continuationEscape); ok && esc.cont == cont {
+				result = esc.value
+				err = nil
+			} else {
+				panic(r)
+			}
+		}
+	}()
+	return applyCallable(fn, []*Value{cont})
+}
+
+func applyCallable(fn *Value, args []*Value) (*Value, error) {
+	if fn.Kind == KindBuiltin {
+		return fn.Builtin(args)
+	}
+	if fn.Kind == KindLambda {
+		tc, err := applyLambda(fn, args)
+		if err != nil {
+			return nil, err
+		}
+		for tc.Kind == KindTailCall {
+			tc, err = eval(tc.Car, tc.ClosureEnv)
+			if err != nil {
+				return nil, err
+			}
+		}
+		return tc, nil
+	}
+	return nil, &EvalError{Message: fmt.Sprintf("not a procedure: %s", fn.String())}
+}
+
+// evalProgram runs the program in a goroutine. When a saved continuation
+// is invoked (panic escapes outside call/cc's dynamic extent), the goroutine
+// catches it and replays the program with the continuation returning the new value.
+func evalProgram(exprs []*Value, env *Env) (*Value, error) {
+	resCh := make(chan contResult, 1)
+
+	go evalProgramLoop(exprs, env, resCh)
+
+	res := <-resCh
+	return res.val, res.err
+}
+
+func evalProgramLoop(exprs []*Value, env *Env, resCh chan contResult) {
+	for {
+		result, err, escape := evalProgramOnce(exprs, env)
+		if escape == nil {
+			resCh <- contResult{val: result, err: err}
+			return
+		}
+		// A saved continuation was invoked. Set the override and replay.
+		pendingOverride = &contOverride{
+			callSite: escape.cont.Car,    // the call/cc AST node
+			value:    escape.value,
+			env:      escape.cont.ClosureEnv, // captured environment
+		}
+	}
+}
+
+func evalProgramOnce(exprs []*Value, env *Env) (result *Value, err error, escape *continuationEscape) {
+	defer func() {
+		if r := recover(); r != nil {
+			if esc, ok := r.(continuationEscape); ok {
+				escape = &esc
+			} else {
+				err = &EvalError{Message: fmt.Sprintf("panic: %v", r)}
+			}
+		}
+	}()
+
+	for _, expr := range exprs {
+		result, err = eval(expr, env)
+		if err != nil {
+			return nil, err, nil
+		}
+	}
+	return result, nil, nil
 }
 
 // Builtin implementations
@@ -826,6 +993,18 @@ func builtinApply(args []*Value) (*Value, error) {
 	if fn.Kind == KindLambda {
 		return applyLambda(fn, allArgs)
 	}
+	if fn.Kind == KindContinuation {
+		if len(allArgs) != 1 {
+			return nil, &EvalError{Message: "continuation: expected 1 argument"}
+		}
+		return fn.ContFn(allArgs[0])
+	}
+	if fn.Kind == KindCallCC {
+		if len(allArgs) != 1 {
+			return nil, &EvalError{Message: "call/cc: expected 1 argument"}
+		}
+		return evalCallCCWithFn(allArgs[0], nil, nil)
+	}
 	return nil, &EvalError{Message: fmt.Sprintf("apply: not a procedure: %s", fn.String())}
 }
 
@@ -842,12 +1021,9 @@ func EvalStr(input string) (string, error) {
 
 	env := makeGlobalEnv()
 	env.output = &strings.Builder{}
-	var result *Value
-	for _, expr := range exprs {
-		result, err = eval(expr, env)
-		if err != nil {
-			return "", err
-		}
+	result, err := evalProgram(exprs, env)
+	if err != nil {
+		return "", err
 	}
 
 	if result.Kind == KindVoid {
@@ -871,12 +1047,9 @@ func EvalStrWithOutput(input string) (resultStr string, output string, err error
 	var buf strings.Builder
 	env.output = &buf
 
-	var result *Value
-	for _, expr := range exprs {
-		result, err = eval(expr, env)
-		if err != nil {
-			return "", "", err
-		}
+	result, err := evalProgram(exprs, env)
+	if err != nil {
+		return "", "", err
 	}
 
 	if result.Kind == KindVoid {
