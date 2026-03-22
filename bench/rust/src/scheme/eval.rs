@@ -80,6 +80,10 @@ fn eval_list_step(
             "let" => return eval_let_step(&elements[1..], kw_span, env, output),
             "begin" => return eval_begin_step(&elements[1..], env, output),
             "cond" => return eval_cond_step(&elements[1..], kw_span, env, output),
+            "set!" => {
+                let v = eval_set(&elements[1..], kw_span, env, output)?;
+                return Ok(TcoAction::Result(v));
+            }
             "string-set!" => {
                 let v = eval_string_set(&elements[1..], kw_span, env, output)?;
                 return Ok(TcoAction::Result(v));
@@ -277,6 +281,32 @@ fn eval_if_step(
     } else {
         Ok(TcoAction::Result(Value::Nil))
     }
+}
+
+fn eval_set(
+    args: &[Expr],
+    span: &Span,
+    env: &Env,
+    output: &mut String,
+) -> Result<Value, EvalError> {
+    if args.len() != 2 {
+        return Err(EvalErrorKind::Parse {
+            message: "set! requires exactly 2 arguments".into(),
+        }
+        .at(span));
+    }
+    let name = match &args[0].kind {
+        ExprKind::Symbol(n) => n,
+        _ => {
+            return Err(EvalErrorKind::Parse {
+                message: "set!: first argument must be a symbol".into(),
+            }
+            .at(span))
+        }
+    };
+    let val = eval(&args[1], env, output)?;
+    env.set(name, val).map_err(|e| e.with_span(span))?;
+    Ok(Value::Nil)
 }
 
 fn eval_define(
