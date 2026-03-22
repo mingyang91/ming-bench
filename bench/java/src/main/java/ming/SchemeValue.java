@@ -39,6 +39,24 @@ public sealed interface SchemeValue {
     record SyntaxRulesVal(List<String> literals, List<SchemeValue> patterns, List<SchemeValue> templates, Environment defEnv) implements SchemeValue {}
     record VectorVal(SchemeValue[] elements) implements SchemeValue {}
     record ValuesVal(List<SchemeValue> values) implements SchemeValue {}
+    record DoubleVal(double value) implements SchemeValue {}
+    record RationalVal(long num, long den) implements SchemeValue {
+        public RationalVal {
+            if (den == 0) throw new ArithmeticException("division by zero");
+            if (den < 0) { num = -num; den = -den; }
+            long g = gcd(Math.abs(num), den);
+            num /= g;
+            den /= g;
+        }
+        private static long gcd(long a, long b) {
+            while (b != 0) { long t = b; b = a % b; a = t; }
+            return a;
+        }
+        public boolean isInteger() { return den == 1; }
+        public SchemeValue simplify() {
+            return den == 1 ? new IntVal(num) : this;
+        }
+    }
 
     /** Scheme `display` output: no quotes on strings, chars as bare characters. */
     default String displayStr() {
@@ -53,6 +71,15 @@ public sealed interface SchemeValue {
     default String display() {
         return switch (this) {
             case IntVal v -> String.valueOf(v.value());
+            case DoubleVal v -> {
+                double d = v.value();
+                if (d == Math.floor(d) && !Double.isInfinite(d)) {
+                    // Format as e.g. "5.0"
+                    yield String.valueOf(d);
+                }
+                yield String.valueOf(d);
+            }
+            case RationalVal v -> v.num() + "/" + v.den();
             case BoolVal v -> v.value() ? "#t" : "#f";
             case StringVal v -> "\"" + v.value() + "\"";
             case MutableStringVal v -> "\"" + v.value() + "\"";

@@ -137,7 +137,7 @@ public class Interpreter {
         });
         builtin("number?", args -> {
             if (args.size() != 1) throw new EvalError("number?: expected 1 argument");
-            return new SchemeValue.BoolVal(args.getFirst() instanceof SchemeValue.IntVal);
+            return new SchemeValue.BoolVal(isNumber(args.getFirst()));
         });
         builtin("boolean?", args -> {
             if (args.size() != 1) throw new EvalError("boolean?: expected 1 argument");
@@ -203,7 +203,7 @@ public class Interpreter {
         });
         builtin("number->string", args -> {
             if (args.size() != 1) throw new EvalError("number->string: expected 1 argument");
-            return new SchemeValue.StringVal(String.valueOf(requireInt(args.getFirst())));
+            return new SchemeValue.StringVal(args.getFirst().display());
         });
         builtin("symbol->string", args -> {
             if (args.size() != 1) throw new EvalError("symbol->string: expected 1 argument");
@@ -576,7 +576,75 @@ public class Interpreter {
         // Additional builtins needed by L15 realworld tests
         builtin("integer?", args -> {
             if (args.size() != 1) throw new EvalError("integer?: expected 1 argument");
-            return new SchemeValue.BoolVal(args.getFirst() instanceof SchemeValue.IntVal);
+            SchemeValue v = args.getFirst();
+            if (v instanceof SchemeValue.IntVal) return new SchemeValue.BoolVal(true);
+            if (v instanceof SchemeValue.RationalVal rv) return new SchemeValue.BoolVal(rv.isInteger());
+            if (v instanceof SchemeValue.DoubleVal dv) {
+                double d = dv.value();
+                return new SchemeValue.BoolVal(d == Math.floor(d) && !Double.isInfinite(d));
+            }
+            return new SchemeValue.BoolVal(false);
+        });
+        builtin("exact?", args -> {
+            if (args.size() != 1) throw new EvalError("exact?: expected 1 argument");
+            return new SchemeValue.BoolVal(isExact(args.getFirst()));
+        });
+        builtin("inexact?", args -> {
+            if (args.size() != 1) throw new EvalError("inexact?: expected 1 argument");
+            return new SchemeValue.BoolVal(args.getFirst() instanceof SchemeValue.DoubleVal);
+        });
+        builtin("rational?", args -> {
+            if (args.size() != 1) throw new EvalError("rational?: expected 1 argument");
+            return new SchemeValue.BoolVal(isExact(args.getFirst()));
+        });
+        builtin("exact->inexact", args -> {
+            if (args.size() != 1) throw new EvalError("exact->inexact: expected 1 argument");
+            return new SchemeValue.DoubleVal(toDouble(args.getFirst()));
+        });
+        builtin("inexact->exact", args -> {
+            if (args.size() != 1) throw new EvalError("inexact->exact: expected 1 argument");
+            SchemeValue v = args.getFirst();
+            if (isExact(v)) return v;
+            if (v instanceof SchemeValue.DoubleVal dv) {
+                double d = dv.value();
+                // Convert to rational via continued fraction / simple approach
+                // Use the fact that doubles are rationals: multiply by power of 2
+                if (d == Math.floor(d) && !Double.isInfinite(d)) {
+                    return new SchemeValue.IntVal((long) d);
+                }
+                // Convert double to exact rational
+                long bits = Double.doubleToLongBits(d);
+                boolean negative = (bits >>> 63) != 0;
+                int exp = (int)((bits >>> 52) & 0x7FFL) - 1023;
+                long mantissa = (bits & 0xFFFFFFFFFFFFFL) | (1L << 52);
+                // value = mantissa * 2^(exp - 52)
+                int shift = exp - 52;
+                long num, den;
+                if (shift >= 0) {
+                    num = mantissa << shift;
+                    den = 1;
+                } else {
+                    num = mantissa;
+                    den = 1L << (-shift);
+                }
+                if (negative) num = -num;
+                return makeExact(num, den);
+            }
+            throw new EvalError("inexact->exact: expected number, got: " + v.display());
+        });
+        builtin("numerator", args -> {
+            if (args.size() != 1) throw new EvalError("numerator: expected 1 argument");
+            SchemeValue v = args.getFirst();
+            if (v instanceof SchemeValue.IntVal iv) return new SchemeValue.IntVal(iv.value());
+            if (v instanceof SchemeValue.RationalVal rv) return new SchemeValue.IntVal(rv.num());
+            throw new EvalError("numerator: expected exact number, got: " + v.display());
+        });
+        builtin("denominator", args -> {
+            if (args.size() != 1) throw new EvalError("denominator: expected 1 argument");
+            SchemeValue v = args.getFirst();
+            if (v instanceof SchemeValue.IntVal) return new SchemeValue.IntVal(1);
+            if (v instanceof SchemeValue.RationalVal rv) return new SchemeValue.IntVal(rv.den());
+            throw new EvalError("denominator: expected exact number, got: " + v.display());
         });
         builtin("procedure?", args -> {
             if (args.size() != 1) throw new EvalError("procedure?: expected 1 argument");
@@ -813,6 +881,8 @@ public class Interpreter {
         while (true) {
             switch (expr) {
                 case SchemeValue.IntVal v -> { return v; }
+                case SchemeValue.DoubleVal v -> { return v; }
+                case SchemeValue.RationalVal v -> { return v; }
                 case SchemeValue.BoolVal v -> { return v; }
                 case SchemeValue.StringVal v -> { return v; }
                 case SchemeValue.LambdaVal v -> { return v; }
@@ -1403,46 +1473,132 @@ public class Interpreter {
         }
     }
 
+    // --- Number helpers ---
+    private boolean isNumber(SchemeValue v) {
+        return v instanceof SchemeValue.IntVal || v instanceof SchemeValue.DoubleVal || v instanceof SchemeValue.RationalVal;
+    }
+
+    private boolean isExact(SchemeValue v) {
+        return v instanceof SchemeValue.IntVal || v instanceof SchemeValue.RationalVal;
+    }
+
+    private boolean hasInexact(List<SchemeValue> args) {
+        for (var a : args) if (a instanceof SchemeValue.DoubleVal) return true;
+        return false;
+    }
+
+    private double toDouble(SchemeValue v) throws EvalError {
+        if (v instanceof SchemeValue.IntVal iv) return (double) iv.value();
+        if (v instanceof SchemeValue.DoubleVal dv) return dv.value();
+        if (v instanceof SchemeValue.RationalVal rv) return (double) rv.num() / rv.den();
+        throw new EvalError("expected number, got: " + v.display());
+    }
+
+    // Return as [num, den] for exact values
+    private long[] toRational(SchemeValue v) throws EvalError {
+        if (v instanceof SchemeValue.IntVal iv) return new long[]{iv.value(), 1};
+        if (v instanceof SchemeValue.RationalVal rv) return new long[]{rv.num(), rv.den()};
+        throw new EvalError("expected exact number, got: " + v.display());
+    }
+
+    private SchemeValue makeExact(long num, long den) {
+        if (den == 0) throw new ArithmeticException("division by zero");
+        var r = new SchemeValue.RationalVal(num, den);
+        return r.simplify();
+    }
+
     private SchemeValue arithPlus(List<SchemeValue> args) throws EvalError {
-        long result = 0;
-        for (var arg : args) result += requireInt(arg);
-        return new SchemeValue.IntVal(result);
+        if (hasInexact(args)) {
+            double result = 0;
+            for (var arg : args) result += toDouble(arg);
+            return new SchemeValue.DoubleVal(result);
+        }
+        long num = 0, den = 1;
+        for (var arg : args) {
+            long[] r = toRational(arg);
+            num = num * r[1] + r[0] * den;
+            den = den * r[1];
+        }
+        return makeExact(num, den);
     }
 
     private SchemeValue arithMinus(List<SchemeValue> args) throws EvalError {
         if (args.isEmpty()) throw new EvalError("-: expected at least 1 argument");
-        if (args.size() == 1) return new SchemeValue.IntVal(-requireInt(args.getFirst()));
-        long result = requireInt(args.getFirst());
-        for (int i = 1; i < args.size(); i++) result -= requireInt(args.get(i));
-        return new SchemeValue.IntVal(result);
+        if (hasInexact(args)) {
+            if (args.size() == 1) return new SchemeValue.DoubleVal(-toDouble(args.getFirst()));
+            double result = toDouble(args.getFirst());
+            for (int i = 1; i < args.size(); i++) result -= toDouble(args.get(i));
+            return new SchemeValue.DoubleVal(result);
+        }
+        if (args.size() == 1) {
+            long[] r = toRational(args.getFirst());
+            return makeExact(-r[0], r[1]);
+        }
+        long[] acc = toRational(args.getFirst());
+        long num = acc[0], den = acc[1];
+        for (int i = 1; i < args.size(); i++) {
+            long[] r = toRational(args.get(i));
+            num = num * r[1] - r[0] * den;
+            den = den * r[1];
+        }
+        return makeExact(num, den);
     }
 
     private SchemeValue arithMul(List<SchemeValue> args) throws EvalError {
-        long result = 1;
-        for (var arg : args) result *= requireInt(arg);
-        return new SchemeValue.IntVal(result);
+        if (hasInexact(args)) {
+            double result = 1;
+            for (var arg : args) result *= toDouble(arg);
+            return new SchemeValue.DoubleVal(result);
+        }
+        long num = 1, den = 1;
+        for (var arg : args) {
+            long[] r = toRational(arg);
+            num *= r[0];
+            den *= r[1];
+        }
+        return makeExact(num, den);
     }
 
     private SchemeValue arithDiv(List<SchemeValue> args) throws EvalError {
         if (args.isEmpty()) throw new EvalError("/: expected at least 1 argument");
-        long result = requireInt(args.getFirst());
-        for (int i = 1; i < args.size(); i++) {
-            long divisor = requireInt(args.get(i));
-            if (divisor == 0) throw new EvalError("division by zero");
-            result /= divisor;
+        if (hasInexact(args)) {
+            if (args.size() == 1) {
+                double d = toDouble(args.getFirst());
+                if (d == 0) throw new EvalError("division by zero");
+                return new SchemeValue.DoubleVal(1.0 / d);
+            }
+            double result = toDouble(args.getFirst());
+            for (int i = 1; i < args.size(); i++) {
+                double d = toDouble(args.get(i));
+                if (d == 0) throw new EvalError("division by zero");
+                result /= d;
+            }
+            return new SchemeValue.DoubleVal(result);
         }
-        return new SchemeValue.IntVal(result);
+        long[] acc = toRational(args.getFirst());
+        long num = acc[0], den = acc[1];
+        if (args.size() == 1) {
+            if (num == 0) throw new EvalError("division by zero");
+            return makeExact(den, num);
+        }
+        for (int i = 1; i < args.size(); i++) {
+            long[] r = toRational(args.get(i));
+            if (r[0] == 0) throw new EvalError("division by zero");
+            num *= r[1];
+            den *= r[0];
+        }
+        return makeExact(num, den);
     }
 
     @FunctionalInterface
-    interface LongBiPredicate {
-        boolean test(long a, long b);
+    interface DoubleBiPredicate {
+        boolean test(double a, double b);
     }
 
-    private SchemeValue compare(List<SchemeValue> args, LongBiPredicate pred) throws EvalError {
+    private SchemeValue compare(List<SchemeValue> args, DoubleBiPredicate pred) throws EvalError {
         if (args.size() < 2) throw new EvalError("comparison: expected at least 2 arguments");
         for (int i = 0; i < args.size() - 1; i++) {
-            if (!pred.test(requireInt(args.get(i)), requireInt(args.get(i + 1)))) {
+            if (!pred.test(toDouble(args.get(i)), toDouble(args.get(i + 1)))) {
                 return new SchemeValue.BoolVal(false);
             }
         }
@@ -1456,11 +1612,18 @@ public class Interpreter {
 
     private long requireInt(SchemeValue v) throws EvalError {
         if (v instanceof SchemeValue.IntVal iv) return iv.value();
-        throw new EvalError("expected number, got: " + v.display());
+        if (v instanceof SchemeValue.RationalVal rv && rv.isInteger()) return rv.num();
+        if (v instanceof SchemeValue.DoubleVal dv) {
+            double d = dv.value();
+            if (d == Math.floor(d) && !Double.isInfinite(d)) return (long) d;
+        }
+        throw new EvalError("expected integer, got: " + v.display());
     }
 
     private boolean schemeEqv(SchemeValue a, SchemeValue b) {
         if (a instanceof SchemeValue.IntVal ia && b instanceof SchemeValue.IntVal ib) return ia.value() == ib.value();
+        if (a instanceof SchemeValue.DoubleVal da && b instanceof SchemeValue.DoubleVal db) return da.value() == db.value();
+        if (a instanceof SchemeValue.RationalVal ra && b instanceof SchemeValue.RationalVal rb) return ra.num() == rb.num() && ra.den() == rb.den();
         if (a instanceof SchemeValue.BoolVal ba && b instanceof SchemeValue.BoolVal bb) return ba.value() == bb.value();
         if (a instanceof SchemeValue.SymbolVal sa && b instanceof SchemeValue.SymbolVal sb) return sa.name().equals(sb.name());
         if (a instanceof SchemeValue.CharVal ca && b instanceof SchemeValue.CharVal cb) return ca.value() == cb.value();
@@ -1470,7 +1633,9 @@ public class Interpreter {
     }
 
     private boolean schemeEqual(SchemeValue a, SchemeValue b) {
-        if (a instanceof SchemeValue.IntVal ia && b instanceof SchemeValue.IntVal ib) return ia.value() == ib.value();
+        if (isNumber(a) && isNumber(b)) {
+            try { return toDouble(a) == toDouble(b); } catch (EvalError e) { return false; }
+        }
         if (a instanceof SchemeValue.BoolVal ba && b instanceof SchemeValue.BoolVal bb) return ba.value() == bb.value();
         if (a instanceof SchemeValue.SymbolVal sa && b instanceof SchemeValue.SymbolVal sb) return sa.name().equals(sb.name());
         if (a instanceof SchemeValue.CharVal ca && b instanceof SchemeValue.CharVal cb) return ca.value() == cb.value();

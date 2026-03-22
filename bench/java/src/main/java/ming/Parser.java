@@ -161,6 +161,22 @@ public class Parser {
             long val = Long.parseLong(token);
             return new SchemeValue.IntVal(val).withPos(sp);
         } catch (NumberFormatException e) {
+            // Try rational: digits/digits
+            int slashIdx = token.indexOf('/');
+            if (slashIdx > 0 && slashIdx < token.length() - 1) {
+                try {
+                    long num = Long.parseLong(token.substring(0, slashIdx));
+                    long den = Long.parseLong(token.substring(slashIdx + 1));
+                    if (den == 0) throw new EvalError("division by zero in literal: " + token);
+                    var r = new SchemeValue.RationalVal(num, den);
+                    return ((SchemeValue) r.simplify()).withPos(sp);
+                } catch (NumberFormatException ignored) {}
+            }
+            // Try floating point
+            try {
+                double val = Double.parseDouble(token);
+                return new SchemeValue.DoubleVal(val).withPos(sp);
+            } catch (NumberFormatException ignored) {}
             return new SchemeValue.SymbolVal(token).withPos(sp);
         }
     }
