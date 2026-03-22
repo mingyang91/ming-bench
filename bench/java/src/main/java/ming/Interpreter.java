@@ -195,6 +195,28 @@ public class Interpreter {
             String str = requireString(args.getFirst(), "string-copy");
             return new SchemeValue.MutableStringVal(new StringBuilder(str));
         });
+        builtin("apply", args -> {
+            if (args.size() < 2) throw new EvalError("apply: expected at least 2 arguments");
+            SchemeValue proc = args.getFirst();
+            // Last arg must be a list; prefix args are prepended
+            List<SchemeValue> lastList = toJavaList(args.getLast());
+            var allArgs = new ArrayList<SchemeValue>();
+            for (int i = 1; i < args.size() - 1; i++) {
+                allArgs.add(args.get(i));
+            }
+            allArgs.addAll(lastList);
+            if (proc instanceof SchemeValue.LambdaVal lambda) {
+                var localEnv = applyLambda(lambda, allArgs, "");
+                SchemeValue result = null;
+                for (var bodyExpr : lambda.body()) {
+                    result = eval(bodyExpr, localEnv);
+                }
+                return result;
+            } else if (proc instanceof SchemeValue.BuiltinVal builtin) {
+                return builtin.fn().apply(allArgs);
+            }
+            throw new EvalError("apply: not a procedure: " + proc.display());
+        });
         builtin("string-set!", args -> {
             if (args.size() != 3) throw new EvalError("string-set!: expected 3 arguments");
             if (!(args.get(0) instanceof SchemeValue.MutableStringVal ms)) {
@@ -323,7 +345,7 @@ public class Interpreter {
                                     }
                                     var body = elements.subList(3, elements.size());
                                     var localEnv = new Environment(env);
-                                    var lambda = new SchemeValue.LambdaVal(params, body, localEnv);
+                                    var lambda = new SchemeValue.LambdaVal(params, null, body, localEnv);
                                     localEnv.define(nameSym.name(), lambda);
                                     // TCO: set up apply inline
                                     for (int i = 0; i < params.size(); i++) {
@@ -402,13 +424,7 @@ public class Interpreter {
                     }
                     // TCO for lambda calls
                     if (proc instanceof SchemeValue.LambdaVal lambda) {
-                        if (lambda.params().size() != args.size()) {
-                            throw new EvalError(posPrefix(listVal) + "expected " + lambda.params().size() + " arguments, got " + args.size());
-                        }
-                        var localEnv = new Environment(lambda.env());
-                        for (int i = 0; i < lambda.params().size(); i++) {
-                            localEnv.define(lambda.params().get(i), args.get(i));
-                        }
+                        var localEnv = applyLambda(lambda, args, posPrefix(listVal));
                         for (int i = 0; i < lambda.body().size() - 1; i++) {
                             eval(lambda.body().get(i), localEnv);
                         }
@@ -451,14 +467,23 @@ public class Interpreter {
                 throw new EvalError(posPrefix(listVal) + "define: expected symbol as function name");
             }
             var params = new ArrayList<String>();
-            for (int i = 1; i < nameAndParams.elements().size(); i++) {
-                if (!(nameAndParams.elements().get(i) instanceof SchemeValue.SymbolVal p)) {
+            String restParam = null;
+            var pElems = nameAndParams.elements();
+            for (int i = 1; i < pElems.size(); i++) {
+                if (pElems.get(i) instanceof SchemeValue.SymbolVal s && s.name().equals(".")) {
+                    if (i + 1 >= pElems.size()) throw new EvalError(posPrefix(listVal) + "define: bad syntax");
+                    if (!(pElems.get(i + 1) instanceof SchemeValue.SymbolVal rp))
+                        throw new EvalError(posPrefix(listVal) + "define: expected symbol after dot");
+                    restParam = rp.name();
+                    break;
+                }
+                if (!(pElems.get(i) instanceof SchemeValue.SymbolVal p)) {
                     throw new EvalError(posPrefix(listVal) + "define: expected symbol as parameter");
                 }
                 params.add(p.name());
             }
             var body = elements.subList(2, elements.size());
-            var lambda = new SchemeValue.LambdaVal(params, body, env);
+            var lambda = new SchemeValue.LambdaVal(params, restParam, body, env);
             env.define(nameSym.name(), lambda);
             return new SchemeValue.VoidVal();
         }
@@ -469,20 +494,78 @@ public class Interpreter {
     private SchemeValue evalLambda(SchemeValue.ListVal listVal, List<SchemeValue> elements, Environment env) throws EvalError {
         if (elements.size() < 3) throw new EvalError(posPrefix(listVal) + "lambda: bad syntax");
         SchemeValue paramList = elements.get(1);
+        // Single symbol = all-rest parameter: (lambda args ...)
+        if (paramList instanceof SchemeValue.SymbolVal restSym) {
+            var body = elements.subList(2, elements.size());
+            return new SchemeValue.LambdaVal(List.of(), restSym.name(), body, env);
+        }
         if (!(paramList instanceof SchemeValue.ListVal pList)) {
             throw new EvalError(posPrefix(listVal) + "lambda: expected parameter list");
         }
         var params = new ArrayList<String>();
-        for (var p : pList.elements()) {
+        String restParam = null;
+        for (int i = 0; i < pList.elements().size(); i++) {
+            var p = pList.elements().get(i);
+            if (p instanceof SchemeValue.SymbolVal s && s.name().equals(".")) {
+                if (i + 1 >= pList.elements().size()) throw new EvalError(posPrefix(listVal) + "lambda: bad syntax");
+                if (!(pList.elements().get(i + 1) instanceof SchemeValue.SymbolVal rp))
+                    throw new EvalError(posPrefix(listVal) + "lambda: expected symbol after dot");
+                restParam = rp.name();
+                break;
+            }
             if (!(p instanceof SchemeValue.SymbolVal sym)) {
                 throw new EvalError(posPrefix(listVal) + "lambda: expected symbol as parameter");
             }
             params.add(sym.name());
         }
         var body = elements.subList(2, elements.size());
-        return new SchemeValue.LambdaVal(params, body, env);
+        return new SchemeValue.LambdaVal(params, restParam, body, env);
     }
 
+
+    private Environment applyLambda(SchemeValue.LambdaVal lambda, List<SchemeValue> args, String errPrefix) throws EvalError {
+        int nFixed = lambda.params().size();
+        if (lambda.restParam() != null) {
+            if (args.size() < nFixed) {
+                throw new EvalError(errPrefix + "expected at least " + nFixed + " arguments, got " + args.size());
+            }
+        } else {
+            if (args.size() != nFixed) {
+                throw new EvalError(errPrefix + "expected " + nFixed + " arguments, got " + args.size());
+            }
+        }
+        var localEnv = new Environment(lambda.env());
+        for (int i = 0; i < nFixed; i++) {
+            localEnv.define(lambda.params().get(i), args.get(i));
+        }
+        if (lambda.restParam() != null) {
+            localEnv.define(lambda.restParam(), schemeList(args.subList(nFixed, args.size())));
+        }
+        return localEnv;
+    }
+
+    private SchemeValue schemeList(List<SchemeValue> elems) {
+        SchemeValue result = new SchemeValue.ListVal(List.of());
+        for (int i = elems.size() - 1; i >= 0; i--) {
+            result = new SchemeValue.PairVal(elems.get(i), result);
+        }
+        return result;
+    }
+
+    private List<SchemeValue> toJavaList(SchemeValue v) throws EvalError {
+        var result = new ArrayList<SchemeValue>();
+        while (true) {
+            if (v instanceof SchemeValue.ListVal l) {
+                result.addAll(l.elements());
+                return result;
+            } else if (v instanceof SchemeValue.PairVal p) {
+                result.add(p.car());
+                v = p.cdr();
+            } else {
+                throw new EvalError("apply: expected proper list");
+            }
+        }
+    }
 
     private SchemeValue arithPlus(List<SchemeValue> args) throws EvalError {
         long result = 0;

@@ -21,7 +21,7 @@ public sealed interface SchemeValue {
     record StringVal(String value) implements SchemeValue {}
     record SymbolVal(String name) implements SchemeValue {}
     record ListVal(List<SchemeValue> elements) implements SchemeValue {}
-    record LambdaVal(List<String> params, List<SchemeValue> body, Environment env) implements SchemeValue {}
+    record LambdaVal(List<String> params, String restParam, List<SchemeValue> body, Environment env) implements SchemeValue {}
     record BuiltinVal(String name, Function<List<SchemeValue>, SchemeValue> fn) implements SchemeValue {}
     record PairVal(SchemeValue car, SchemeValue cdr) implements SchemeValue {}
     record VoidVal() implements SchemeValue {}
