@@ -2,6 +2,8 @@ package ming
 
 import SchemeValue.*
 import InterpreterUtils.*
+import TcoResult.*
+import scala.annotation.tailrec
 
 object Interpreter:
 
@@ -39,28 +41,30 @@ object Interpreter:
 
       // and / or
       case ListVal(SymbolVal("and", _) :: args, _) =>
-        val (r, o) = evalAnd(args, env)
-        (r, env, o)
+        resolveToValue(TailEval.evalAndTail(args, env), env)
       case ListVal(SymbolVal("or", _) :: args, _) =>
-        val (r, o) = evalOr(args, env)
-        (r, env, o)
+        resolveToValue(TailEval.evalOrTail(args, env), env)
 
       // named let / let
-      case ListVal(SymbolVal("let", _) :: rest, _) => evalLet(rest, env)
+      case ListVal(SymbolVal("let", _) :: rest, _) =>
+        resolveToValue(TailEval.evalLetTail(rest, env), env)
 
       // begin
       case ListVal(SymbolVal("begin", _) :: body, _) => evalSequence(body, env)
 
       // cond
       case ListVal(SymbolVal("cond", _) :: clauses, _) =>
-        val (r, o) = evalCond(clauses, env)
-        (r, env, o)
+        resolveToValue(TailEval.evalCondTail(clauses, env), env)
 
       // function application
       case ListVal(head :: args, pos) => evalApplication(head, args, pos, env)
 
       case _: LambdaVal => (expr, env, "")
       case _: PairVal   => (expr, env, "")
+
+  // ---------------------------------------------------------------------------
+  // Non-tail helpers (used by eval)
+  // ---------------------------------------------------------------------------
 
   private def evalIf(
     rest: List[SchemeValue],
@@ -81,7 +85,7 @@ object Interpreter:
         else (Void, env, o1)
       case _ => throw new EvalError(s"if: bad syntax${fmtPos(pos)}")
 
-  private def evalDefine(
+  private[ming] def evalDefine(
     rest: List[SchemeValue],
     pos: Option[(Int, Int)],
     env: Env
@@ -99,38 +103,6 @@ object Interpreter:
         (Void, env + (name -> lambda), "")
       case _ => throw new EvalError(s"define: bad syntax${fmtPos(pos)}")
 
-  private def evalLet(
-    rest: List[SchemeValue],
-    env: Env
-  ): (SchemeValue, Env, Output) =
-    rest match
-      // named let
-      case SymbolVal(name, _) :: ListVal(bindings, _) :: body =>
-        val (paramNames, initVals, bindOutput) =
-          bindings.foldLeft((List.empty[String], List.empty[SchemeValue], "")) { case ((ps, vs, o), binding) =>
-            binding match
-              case ListVal(SymbolVal(p, _) :: valExpr :: Nil, _) =>
-                val (v, _, vo) = eval(valExpr, env)
-                (ps :+ p, vs :+ v, o + vo)
-              case _ => throw new EvalError("invalid let binding")
-          }
-        val lambda   = LambdaVal(paramNames, body, env, Some(name))
-        val (rv, ro) = applyFunc(lambda, initVals)
-        (rv, env, bindOutput + ro)
-      // regular let
-      case ListVal(bindings, _) :: body =>
-        val (letEnv, bindOutput) =
-          bindings.foldLeft((env, "")) { case ((e, o), binding) =>
-            binding match
-              case ListVal(SymbolVal(name, _) :: valExpr :: Nil, _) =>
-                val (v, _, vo) = eval(valExpr, env)
-                (e + (name -> v), o + vo)
-              case _ => throw new EvalError("invalid let binding")
-          }
-        val (rv, ro) = evalBodyWithOutput(body, letEnv)
-        (rv, env, bindOutput + ro)
-      case _ => throw new EvalError("invalid let syntax")
-
   private def evalApplication(
     head: SchemeValue,
     args: List[SchemeValue],
@@ -140,13 +112,13 @@ object Interpreter:
     val (func, _, o1)    = eval(head, env)
     val (evaledArgs, o2) = evalArgs(args, env)
     try
-      val (rv, o3) = applyFunc(func, evaledArgs)
+      val (rv, o3) = applyFunc(func, evaledArgs, env)
       (rv, env, o1 + o2 + o3)
     catch
       case e: EvalError if !hasPos(e.getMessage) =>
         throw new EvalError(s"${e.getMessage}${fmtPos(pos)}")
 
-  private def evalArgs(
+  private[ming] def evalArgs(
     args: List[SchemeValue],
     env: Env
   ): (List[SchemeValue], Output) =
@@ -154,73 +126,6 @@ object Interpreter:
       val (v, _, vo) = eval(arg, env)
       (vs :+ v, o + vo)
     }
-
-  private def applyFunc(
-    func: SchemeValue,
-    args: List[SchemeValue]
-  ): (SchemeValue, Output) =
-    func match
-      case lam @ LambdaVal(params, body, closure, selfName) =>
-        if params.length != args.length then
-          throw new EvalError(
-            s"wrong number of arguments: expected ${params.length}, got ${args.length}"
-          )
-        val envWithSelf = selfName.fold(closure)(n => closure + (n -> lam))
-        val localEnv    = envWithSelf ++ params.zip(args).toMap
-        evalBodyWithOutput(body, localEnv)
-      case SymbolVal(name, _) => Builtins.applyBuiltin(name, args)
-      case _                  => throw new EvalError("not a procedure")
-
-  private def evalBodyWithOutput(
-    body: List[SchemeValue],
-    env: Env
-  ): (SchemeValue, Output) =
-    // Pre-scan for internal defines so they are mutually visible (letrec-like)
-    val (defines, rest) = body.span(isDefine)
-    val (bodyEnv, defOutput) =
-      if defines.isEmpty then (env, "")
-      else
-        // First pass: bind all names to Void placeholders
-        val names               = defines.map(extractDefineName)
-        val envWithPlaceholders = names.foldLeft(env)((e, n) => e + (n -> Void))
-        // Second pass: evaluate definitions with all names in scope
-        val (envAfterDefs, o) =
-          defines.foldLeft((envWithPlaceholders, "")) { case ((e, o), d) =>
-            val (_, newE, dOut) = eval(d, e)
-            (newE, o + dOut)
-          }
-        // Third pass: update lambda closures to include all siblings
-        val finalEnv = names.foldLeft(envAfterDefs) { (e, name) =>
-          e(name) match
-            case LambdaVal(params, body, closure, selfName) =>
-              val updatedClosure = closure ++ names.map(n => n -> e(n)).toMap
-              e + (name -> LambdaVal(params, body, updatedClosure, selfName))
-            case _ => e
-        }
-        (finalEnv, o)
-    rest match
-      case Nil => (Void, defOutput)
-      case last :: Nil =>
-        val (rv, _, o) = eval(last, bodyEnv)
-        (rv, defOutput + o)
-      case head :: tail =>
-        val (_, newEnv, o) = eval(head, bodyEnv)
-        val (rv, ro)       = evalBodySeqWithOutput(tail, newEnv)
-        (rv, defOutput + o + ro)
-
-  private def evalBodySeqWithOutput(
-    body: List[SchemeValue],
-    env: Env
-  ): (SchemeValue, Output) =
-    body match
-      case Nil => (Void, "")
-      case last :: Nil =>
-        val (rv, _, o) = eval(last, env)
-        (rv, o)
-      case head :: tail =>
-        val (_, newEnv, o) = eval(head, env)
-        val (rv, ro)       = evalBodySeqWithOutput(tail, newEnv)
-        (rv, o + ro)
 
   /** Evaluate a sequence of expressions, threading env. */
   private def evalSequence(
@@ -235,52 +140,72 @@ object Interpreter:
         val (rv, re, ro)   = evalSequence(tail, newEnv)
         (rv, re, o + ro)
 
-  private def evalCond(
-    clauses: List[SchemeValue],
-    env: Env
-  ): (SchemeValue, Output) =
-    clauses match
-      case Nil => (Void, "")
-      case ListVal(SymbolVal("else", _) :: body, _) :: _ =>
-        evalBodyWithOutput(body, env)
-      case ListVal(test :: body, _) :: rest =>
-        val (tv, _, o1) = eval(test, env)
-        if tv.isTruthy then
-          val (rv, o2) = evalBodyWithOutput(body, env)
-          (rv, o1 + o2)
-        else
-          val (rv, o2) = evalCond(rest, env)
-          (rv, o1 + o2)
-      case _ => throw new EvalError("invalid cond clause")
+  // ---------------------------------------------------------------------------
+  // Trampoline for TCO
+  // ---------------------------------------------------------------------------
 
-  private def evalAnd(
+  private def applyFunc(
+    func: SchemeValue,
     args: List[SchemeValue],
-    env: Env
+    callingEnv: Env
   ): (SchemeValue, Output) =
-    args match
-      case Nil => (BoolVal(true), "")
-      case last :: Nil =>
-        val (rv, _, o) = eval(last, env)
-        (rv, o)
-      case head :: tail =>
-        val (result, _, o1) = eval(head, env)
-        if result.isTruthy then
-          val (rv, o2) = evalAnd(tail, env)
-          (rv, o1 + o2)
-        else (result, o1)
+    trampolineLoop(applyStep(func, args, callingEnv), "")
 
-  private def evalOr(
+  @tailrec
+  private def trampolineLoop(result: TcoResult, accOut: Output): (SchemeValue, Output) =
+    result match
+      case Value(v, o) => (v, accOut + o)
+      case TailCall(func, args, callingEnv, o) =>
+        trampolineLoop(applyStep(func, args, callingEnv), accOut + o)
+
+  private[ming] def applyStep(
+    func: SchemeValue,
     args: List[SchemeValue],
+    callingEnv: Env
+  ): TcoResult =
+    func match
+      case lam @ LambdaVal(params, body, closure, selfName) =>
+        if params.length != args.length then
+          throw new EvalError(
+            s"wrong number of arguments: expected ${params.length}, got ${args.length}"
+          )
+        val merged      = callingEnv ++ closure
+        val envWithSelf = selfName.fold(merged)(n => merged + (n -> lam))
+        val localEnv    = envWithSelf ++ params.zip(args).toMap
+        TailEval.evalBodyTail(body, localEnv)
+      case SymbolVal(name, _) =>
+        val (rv, o) = Builtins.applyBuiltin(name, args)
+        Value(rv, o)
+      case _ => throw new EvalError("not a procedure")
+
+  /** Resolve a TcoResult in a non-tail context, using callerEnv. */
+  private def resolveToValue(
+    result: TcoResult,
+    callerEnv: Env
+  ): (SchemeValue, Env, Output) =
+    result match
+      case Value(v, o) => (v, callerEnv, o)
+      case TailCall(func, args, callingEnv, o) =>
+        val (rv, ro) = applyFunc(func, args, callingEnv)
+        (rv, callerEnv, o + ro)
+
+  /** Process internal defines for letrec-like mutual visibility. */
+  private[ming] def processDefines(
+    defines: List[SchemeValue],
     env: Env
-  ): (SchemeValue, Output) =
-    args match
-      case Nil => (BoolVal(false), "")
-      case last :: Nil =>
-        val (rv, _, o) = eval(last, env)
-        (rv, o)
-      case head :: tail =>
-        val (result, _, o1) = eval(head, env)
-        if result.isTruthy then (result, o1)
-        else
-          val (rv, o2) = evalOr(tail, env)
-          (rv, o1 + o2)
+  ): (Env, Output) =
+    val names               = defines.map(extractDefineName)
+    val envWithPlaceholders = names.foldLeft(env)((e, n) => e + (n -> Void))
+    val (envAfterDefs, o) =
+      defines.foldLeft((envWithPlaceholders, "")) { case ((e, o), d) =>
+        val (_, newE, dOut) = eval(d, e)
+        (newE, o + dOut)
+      }
+    val finalEnv = names.foldLeft(envAfterDefs) { (e, name) =>
+      e(name) match
+        case LambdaVal(params, body, closure, selfName) =>
+          val updatedClosure = closure ++ names.map(n => n -> e(n)).toMap
+          e + (name -> LambdaVal(params, body, updatedClosure, selfName))
+        case _ => e
+    }
+    (finalEnv, o)
