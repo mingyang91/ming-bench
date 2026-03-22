@@ -4,6 +4,8 @@ use crate::scheme::error::{EvalError, EvalErrorKind, Span};
 #[derive(Debug, Clone, PartialEq)]
 pub enum ExprKind {
     Integer(i64),
+    Float(f64),
+    Rational(i64, i64),
     Boolean(bool),
     SchemeString(String),
     Symbol(String),
@@ -281,6 +283,22 @@ fn parse_atom(token: &str) -> Result<ExprKind, EvalError> {
     // Integer
     if let Ok(n) = token.parse::<i64>() {
         return Ok(ExprKind::Integer(n));
+    }
+
+    // Rational literal: digits/digits (e.g. 1/3, -5/2)
+    if let Some(slash_pos) = token.find('/') {
+        let num_str = &token[..slash_pos];
+        let den_str = &token[slash_pos + 1..];
+        if let (Ok(num), Ok(den)) = (num_str.parse::<i64>(), den_str.parse::<i64>()) {
+            if den != 0 {
+                return Ok(ExprKind::Rational(num, den));
+            }
+        }
+    }
+
+    // Float literal
+    if let Ok(f) = token.parse::<f64>() {
+        return Ok(ExprKind::Float(f));
     }
 
     // Symbol

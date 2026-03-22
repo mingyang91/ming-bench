@@ -60,10 +60,39 @@ impl ContCtx {
     }
 }
 
+/// Compute GCD of two non-negative integers.
+fn gcd(mut a: i64, mut b: i64) -> i64 {
+    a = a.abs();
+    b = b.abs();
+    while b != 0 {
+        let t = b;
+        b = a % b;
+        a = t;
+    }
+    a
+}
+
+/// Construct a rational or integer value, always simplified.
+pub fn make_rational(num: i64, den: i64) -> Value {
+    let sign = if den < 0 { -1 } else { 1 };
+    let num = num * sign;
+    let den = den.abs();
+    let g = gcd(num.abs(), den);
+    let num = num / g;
+    let den = den / g;
+    if den == 1 {
+        Value::Integer(num)
+    } else {
+        Value::Rational(num, den)
+    }
+}
+
 /// A Scheme value.
 #[derive(Debug, Clone)]
 pub enum Value {
     Integer(i64),
+    Float(f64),
+    Rational(i64, i64),
     Boolean(bool),
     SchemeString(String),
     Symbol(String),
@@ -102,6 +131,8 @@ impl PartialEq for Value {
     fn eq(&self, other: &Self) -> bool {
         match (self, other) {
             (Value::Integer(a), Value::Integer(b)) => a == b,
+            (Value::Float(a), Value::Float(b)) => a == b,
+            (Value::Rational(an, ad), Value::Rational(bn, bd)) => an == bn && ad == bd,
             (Value::Boolean(a), Value::Boolean(b)) => a == b,
             (Value::SchemeString(a), Value::SchemeString(b)) => a == b,
             (Value::Symbol(a), Value::Symbol(b)) => a == b,
@@ -160,6 +191,15 @@ impl fmt::Display for Value {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Value::Integer(n) => write!(f, "{n}"),
+            Value::Float(val) => {
+                let s = format!("{val}");
+                if s.contains('.') || s.contains('e') || s.contains('E') {
+                    write!(f, "{s}")
+                } else {
+                    write!(f, "{s}.0")
+                }
+            }
+            Value::Rational(num, den) => write!(f, "{num}/{den}"),
             Value::Boolean(true) => write!(f, "#t"),
             Value::Boolean(false) => write!(f, "#f"),
             Value::SchemeString(s) => write!(f, "\"{s}\""),
