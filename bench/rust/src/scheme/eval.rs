@@ -28,17 +28,32 @@ fn is_builtin(name: &str) -> bool {
     BUILTINS.contains(&name)
 }
 
-/// Body context captured by continuations for body-level replay.
+/// Whether a frame comes from a lambda body or a let/begin body.
+#[derive(Clone, Copy, PartialEq)]
+enum FrameKind {
+    Lambda,
+    LetOrBegin,
+}
+
+/// A captured continuation frame — one level of body nesting.
 #[derive(Clone)]
-struct BodyContext {
-    exprs: Vec<Value>,
+struct ContFrame {
+    body: Vec<Value>,
+    index: usize,
     env: Rc<RefCell<Env>>,
+    kind: FrameKind,
 }
 
 /// Info stored for each continuation.
 struct ContInfo {
     toplevel_idx: usize,
-    body: Option<BodyContext>,
+    frames: Vec<ContFrame>,
+    /// True when a Lambda frame was stripped during registration.
+    /// When true, the innermost frame's current expression is a function
+    /// call that eventually reached call/cc — skip it during replay.
+    /// When false, call/cc is directly inside the current expression —
+    /// re-evaluate it so call/cc can consume the pending value.
+    lambda_stripped: bool,
 }
 
 /// Continuation context for saved/reentrant continuations.
@@ -46,8 +61,10 @@ pub struct CcCtx {
     registry: RefCell<HashMap<u64, ContInfo>>,
     current_idx: Cell<usize>,
     pending: RefCell<Option<Value>>,
-    /// The innermost body context (set by let/lambda body evaluators).
-    current_body: RefCell<Option<BodyContext>>,
+    /// Stack of body frames for continuation capture.
+    frame_stack: RefCell<Vec<ContFrame>>,
+    /// True when we've popped a Lambda frame and are in its tail-call chain.
+    in_lambda_tail: Cell<bool>,
 }
 
 impl CcCtx {
@@ -56,15 +73,28 @@ impl CcCtx {
             registry: RefCell::new(HashMap::new()),
             current_idx: Cell::new(0),
             pending: RefCell::new(None),
-            current_body: RefCell::new(None),
+            frame_stack: RefCell::new(Vec::new()),
+            in_lambda_tail: Cell::new(false),
         }
     }
 
     fn register(&self, id: u64) {
-        let body = self.current_body.borrow().clone();
+        let mut frames = self.frame_stack.borrow().clone();
+        // lambda_stripped is true if call/cc was reached via a Lambda body
+        // (either directly in the body loop, or via a tail-call chain).
+        let mut lambda_stripped = self.in_lambda_tail.get();
+        // Exclude the topmost lambda-body frame: the continuation resumes
+        // from call/cc's return point, not from the lambda's remaining body.
+        if let Some(last) = frames.last() {
+            if last.kind == FrameKind::Lambda {
+                frames.pop();
+                lambda_stripped = true;
+            }
+        }
         self.registry.borrow_mut().insert(id, ContInfo {
             toplevel_idx: self.current_idx.get(),
-            body,
+            frames,
+            lambda_stripped,
         });
     }
 
@@ -72,8 +102,9 @@ impl CcCtx {
         self.registry.borrow().get(&id).map(|info| info.toplevel_idx)
     }
 
-    fn lookup_body(&self, id: u64) -> Option<BodyContext> {
-        self.registry.borrow().get(&id).and_then(|info| info.body.clone())
+    fn lookup_cont(&self, id: u64) -> Option<(Vec<ContFrame>, bool)> {
+        self.registry.borrow().get(&id)
+            .map(|info| (info.frames.clone(), info.lambda_stripped))
     }
 
     fn take_pending(&self) -> Option<Value> {
@@ -88,8 +119,22 @@ impl CcCtx {
         self.current_idx.set(idx);
     }
 
-    fn set_body(&self, body: BodyContext) {
-        *self.current_body.borrow_mut() = Some(body);
+    fn push_frame(&self, body: Vec<Value>, env: Rc<RefCell<Env>>, kind: FrameKind) {
+        self.frame_stack.borrow_mut().push(ContFrame { body, index: 0, env, kind });
+    }
+
+    fn set_frame_index(&self, index: usize) {
+        if let Some(frame) = self.frame_stack.borrow_mut().last_mut() {
+            frame.index = index;
+        }
+    }
+
+    fn pop_frame(&self) {
+        if let Some(frame) = self.frame_stack.borrow_mut().pop() {
+            if frame.kind == FrameKind::Lambda {
+                self.in_lambda_tail.set(true);
+            }
+        }
     }
 }
 
@@ -115,21 +160,79 @@ fn handle_continuation_return(
         Some(idx) => idx,
         None => return ToplevelAction::Err(EvalError::continuation_return(id, value)),
     };
-    if target_idx == current_idx {
-        if let Some(body) = cc.lookup_body(id) {
-            return match handle_body_replay(&body, value, out, cc) {
-                BodyReplayResult::Ok(val) => ToplevelAction::Advance(val),
-                BodyReplayResult::Redirect { idx, pending } => {
-                    cc.set_pending(pending);
-                    ToplevelAction::Redirect(idx)
+    let (frames, lambda_stripped) = cc.lookup_cont(id).unwrap_or((Vec::new(), false));
+    if target_idx == current_idx && !frames.is_empty() {
+        match replay_frames(&frames, lambda_stripped, value, out, cc) {
+            Ok(val) => ToplevelAction::Advance(val),
+            Err(e) => {
+                if let ErrorKind::ContinuationReturn { id: id2, value: val2 } = e.kind {
+                    return handle_continuation_return(id2, *val2, current_idx, out, cc);
                 }
-                BodyReplayResult::Err(e2) => ToplevelAction::Err(e2),
-            };
+                ToplevelAction::Err(e)
+            }
+        }
+    } else {
+        // Different expression or no frames — top-level replay
+        cc.set_pending(value);
+        cc.frame_stack.borrow_mut().clear();
+        ToplevelAction::Redirect(target_idx)
+    }
+}
+
+/// Replay a continuation by evaluating remaining expressions from each captured frame.
+/// Frames are ordered outermost (index 0) to innermost (last).
+fn replay_frames(
+    frames: &[ContFrame],
+    lambda_stripped: bool,
+    value: Value,
+    out: &mut String,
+    cc: &CcCtx,
+) -> Result<Value, EvalError> {
+    let mut result = value.clone();
+
+    // Process from innermost (last) to outermost (first).
+    for fi in (0..frames.len()).rev() {
+        let frame = &frames[fi];
+        let is_innermost = fi == frames.len() - 1;
+        // For the innermost frame, if no Lambda frame was stripped, call/cc
+        // is directly inside the current expression — re-evaluate it so
+        // call/cc can pick up the pending value (e.g. `(set! x (call/cc ...))`).
+        // Otherwise, the current expression is a function call — skip it.
+        let start = if is_innermost && !lambda_stripped {
+            cc.set_pending(value.clone());
+            frame.index
+        } else {
+            frame.index + 1
+        };
+        let remaining = &frame.body[start..];
+
+        if remaining.is_empty() {
+            continue;
+        }
+
+        // Restore frame_stack to outer frames so new continuations captured
+        // during replay include the correct context.
+        *cc.frame_stack.borrow_mut() = frames[..fi].to_vec();
+
+        // Push a frame for this level so new continuations see this body.
+        cc.push_frame(frame.body.clone(), Rc::clone(&frame.env), frame.kind);
+        for (ei, expr) in remaining.iter().enumerate() {
+            let saved_tail = cc.in_lambda_tail.get();
+            cc.in_lambda_tail.set(false);
+            cc.set_frame_index(start + ei);
+            result = eval(expr, &frame.env, out, cc)?;
+            cc.in_lambda_tail.set(saved_tail);
+        }
+        cc.pop_frame();
+
+        // After processing the innermost frame, clear any unconsumed pending
+        // value so outer frames' call/ccs don't accidentally pick it up.
+        if is_innermost {
+            cc.take_pending();
         }
     }
-    // Different expression or no body — top-level replay
-    cc.set_pending(value);
-    ToplevelAction::Redirect(target_idx)
+
+    Ok(result)
 }
 
 /// Evaluate a top-level sequence of expressions, handling saved continuations via replay.
@@ -164,78 +267,6 @@ pub fn eval_toplevel(
     Ok(last)
 }
 
-/// Replay a continuation's body with the given value.
-/// Loops to handle reentrant continuations that are invoked multiple times.
-enum BodyReplayResult {
-    Ok(Value),
-    Redirect { idx: usize, pending: Value },
-    Err(EvalError),
-}
-
-fn handle_body_replay(
-    body: &BodyContext,
-    value: Value,
-    out: &mut String,
-    cc: &CcCtx,
-) -> BodyReplayResult {
-    match body_replay(body, value, out, cc) {
-        Ok(val) => BodyReplayResult::Ok(val),
-        Err(e2) => {
-            if let ErrorKind::ContinuationReturn { id: id2, value: val2 } = e2.kind {
-                if let Some(t2) = cc.lookup_idx(id2) {
-                    return BodyReplayResult::Redirect { idx: t2, pending: *val2 };
-                }
-                return BodyReplayResult::Err(EvalError::continuation_return(id2, *val2));
-            }
-            BodyReplayResult::Err(e2)
-        }
-    }
-}
-
-fn body_replay(
-    body: &BodyContext,
-    mut cont_value: Value,
-    out: &mut String,
-    cc: &CcCtx,
-) -> Result<Value, EvalError> {
-    loop {
-        cc.set_pending(cont_value);
-        // Re-set the body context so re-captured continuations get the same body
-        cc.set_body(body.clone());
-        match eval_body(&body.exprs, &body.env, out, cc) {
-            Ok(val) => return Ok(val),
-            Err(e) => {
-                if let ErrorKind::ContinuationReturn { id, value } = e.kind {
-                    // Check if this is the same body (same top-level expression)
-                    if let Some(target_idx) = cc.lookup_idx(id) {
-                        if target_idx == cc.current_idx.get() {
-                            // Same expression — loop with new value
-                            cont_value = *value;
-                            continue;
-                        }
-                    }
-                    // Different expression — propagate
-                    return Err(EvalError::continuation_return(id, *value));
-                }
-                return Err(e);
-            }
-        }
-    }
-}
-
-/// Evaluate a sequence of expressions, returning the last value.
-fn eval_body(
-    exprs: &[Value],
-    env: &Rc<RefCell<Env>>,
-    out: &mut String,
-    cc: &CcCtx,
-) -> Result<Value, EvalError> {
-    let mut last = Value::Void;
-    for expr in exprs {
-        last = eval(expr, env, out, cc)?;
-    }
-    Ok(last)
-}
 
 /// Evaluate a Scheme expression in the given environment.
 /// Uses a trampoline loop for tail call optimization.
@@ -418,12 +449,16 @@ fn apply_tco(
                 }
                 let rest = Value::List(args[params.len()..].to_vec());
                 local.borrow_mut().set(rest_name.clone(), rest);
-                cc.set_body(BodyContext {
-                    exprs: body.clone(),
-                    env: Rc::clone(&local),
-                });
-                for expr in &body[..body.len() - 1] {
-                    eval(expr, &local, out, cc)?;
+                if body.len() > 1 {
+                    cc.push_frame(body.clone(), Rc::clone(&local), FrameKind::Lambda);
+                    for (idx, expr) in body[..body.len() - 1].iter().enumerate() {
+                        let saved_tail = cc.in_lambda_tail.get();
+                        cc.in_lambda_tail.set(false);
+                        cc.set_frame_index(idx);
+                        eval(expr, &local, out, cc)?;
+                        cc.in_lambda_tail.set(saved_tail);
+                    }
+                    cc.pop_frame();
                 }
                 Ok(Trampoline::TailCall {
                     expr: body[body.len() - 1].clone(),
@@ -441,12 +476,16 @@ fn apply_tco(
                 for (param, arg) in params.iter().zip(args.iter()) {
                     local.borrow_mut().set(param.clone(), arg.clone());
                 }
-                cc.set_body(BodyContext {
-                    exprs: body.clone(),
-                    env: Rc::clone(&local),
-                });
-                for expr in &body[..body.len() - 1] {
-                    eval(expr, &local, out, cc)?;
+                if body.len() > 1 {
+                    cc.push_frame(body.clone(), Rc::clone(&local), FrameKind::Lambda);
+                    for (idx, expr) in body[..body.len() - 1].iter().enumerate() {
+                        let saved_tail = cc.in_lambda_tail.get();
+                        cc.in_lambda_tail.set(false);
+                        cc.set_frame_index(idx);
+                        eval(expr, &local, out, cc)?;
+                        cc.in_lambda_tail.set(saved_tail);
+                    }
+                    cc.pop_frame();
                 }
                 Ok(Trampoline::TailCall {
                     expr: body[body.len() - 1].clone(),
@@ -1058,13 +1097,16 @@ fn eval_let_tco(
         local.borrow_mut().set(name.clone(), val);
     }
     let body = &args[1..];
-    // Set body context for continuation capture
-    cc.set_body(BodyContext {
-        exprs: body.to_vec(),
-        env: Rc::clone(&local),
-    });
-    for expr in &body[..body.len() - 1] {
-        eval(expr, &local, out, cc)?;
+    if body.len() > 1 {
+        cc.push_frame(body.to_vec(), Rc::clone(&local), FrameKind::LetOrBegin);
+        for (idx, expr) in body[..body.len() - 1].iter().enumerate() {
+            let saved_tail = cc.in_lambda_tail.get();
+            cc.in_lambda_tail.set(false);
+            cc.set_frame_index(idx);
+            eval(expr, &local, out, cc)?;
+            cc.in_lambda_tail.set(saved_tail);
+        }
+        cc.pop_frame();
     }
     Ok(Trampoline::TailCall {
         expr: body[body.len() - 1].clone(),
@@ -1136,8 +1178,16 @@ fn eval_begin_tco(
     if args.is_empty() {
         return Ok(Trampoline::Done(Value::Void));
     }
-    for expr in &args[..args.len() - 1] {
-        eval(expr, env, out, cc)?;
+    if args.len() > 1 {
+        cc.push_frame(args.to_vec(), Rc::clone(env), FrameKind::LetOrBegin);
+        for (idx, expr) in args[..args.len() - 1].iter().enumerate() {
+            let saved_tail = cc.in_lambda_tail.get();
+            cc.in_lambda_tail.set(false);
+            cc.set_frame_index(idx);
+            eval(expr, env, out, cc)?;
+            cc.in_lambda_tail.set(saved_tail);
+        }
+        cc.pop_frame();
     }
     Ok(Trampoline::TailCall {
         expr: args[args.len() - 1].clone(),
