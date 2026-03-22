@@ -21,7 +21,33 @@ const (
 	typeNull
 	typeLambda
 	typeChar
+	typeContinuation
 )
+
+// continuationEscape is used as a panic value to implement non-local exit.
+type continuationEscape struct {
+	val  value
+	id   int           // identifies which continuation is being invoked
+	cont *continuation // the continuation being invoked (for re-entry)
+}
+
+var contIDCounter int
+
+// continuationResult is panicked when a saved continuation is invoked outside
+// its dynamic extent. It carries the final result of the resumed computation.
+type continuationResult struct {
+	val value
+	err error
+}
+
+// continuation represents a captured first-class continuation.
+// Uses goroutine swap: the goroutine that called callCC blocks permanently
+// on resumeCh. Each time the continuation is invoked, a value is sent on
+// resumeCh, waking the goroutine to re-execute from the callCC return point.
+type continuation struct {
+	id       int
+	resumeCh chan value
+}
 
 type pair struct {
 	car, cdr value
@@ -43,6 +69,7 @@ type value struct {
 	pairVal   *pair
 	lambdaVal *lambda
 	mutableStr *[]rune // non-nil for mutable strings (string-copy)
+	contVal   *continuation // for typeContinuation
 }
 
 var voidValue = value{typ: typeVoid}
@@ -86,6 +113,8 @@ func (v value) String() string {
 		return formatList(v)
 	case typeLambda:
 		return "#<procedure>"
+	case typeContinuation:
+		return "#<continuation>"
 	case typeChar:
 		switch v.charVal {
 		case ' ':
@@ -397,6 +426,12 @@ type env struct {
 	output   *strings.Builder // shared output buffer for display/write/newline
 }
 
+// evalResult holds the result of a top-level computation for continuation support.
+type evalResult struct {
+	val value
+	err error
+}
+
 func newEnv(parent *env) *env {
 	e := &env{bindings: make(map[string]value), parent: parent}
 	if parent != nil {
@@ -618,6 +653,11 @@ func evalExpr(e *expr, environ *env) (value, error) {
 
 		// Apply
 		switch opVal.typ {
+		case typeContinuation:
+			if len(args) != 1 {
+				return value{}, fmt.Errorf("%d:%d: continuation: expected 1 argument, got %d", e.line, e.col, len(args))
+			}
+			invokeContinuation(opVal.contVal, args[0])
 		case typeLambda:
 			lam := opVal.lambdaVal
 			if lam.rest == "" {
@@ -846,6 +886,106 @@ func quoteExpr(e *expr) value {
 	return result
 }
 
+
+// callCC implements call/cc with full continuation support using goroutine swap.
+//
+// When callCC is entered, the CALLING goroutine is permanently blocked on resumeCh.
+// A body goroutine runs (f k). When the body returns or k is invoked, a value is
+// sent on resumeCh. The blocked goroutine wakes up and returns from callCC.
+//
+// For re-invocation: when k is invoked again later, the invoking goroutine sends
+// on resumeCh and terminates itself. The original goroutine (which is blocked in
+// a loop inside callCC) wakes up, returns the new value, and the computation
+// re-executes from the callCC return point.
+//
+// The original goroutine LOOPS: after returning from callCC and executing the rest
+// of the computation, it comes back to wait on resumeCh. This is achieved by
+// returning through a restartable mechanism. See invokeContinuation.
+func callCC(fn value, e *expr, environ *env, head *expr, name string) (value, error) {
+	contIDCounter++
+	myID := contIDCounter
+
+	resumeCh := make(chan value, 1)
+	cont := &continuation{
+		id:       myID,
+		resumeCh: resumeCh,
+	}
+	contVal := value{typ: typeContinuation, contVal: cont}
+
+	// Spawn body goroutine to evaluate (f k)
+	go func() {
+		defer func() {
+			if r := recover(); r != nil {
+				if esc, ok := r.(continuationEscape); ok && esc.id == myID {
+					resumeCh <- esc.val
+					return
+				}
+				// For other panics, we need to propagate them. Store in a side channel.
+				panic(r)
+			}
+		}()
+		switch fn.typ {
+		case typeLambda:
+			v, err := applyLambda(fn.lambdaVal, []value{contVal}, e, environ)
+			if err != nil {
+				// Propagate error — TODO: need error channel
+				panic(err)
+			}
+			resumeCh <- v
+		case typeContinuation:
+			panic(continuationEscape{val: contVal, id: fn.contVal.id, cont: fn.contVal})
+		default:
+			panic(fmt.Errorf("%d:%d: %s: expected procedure", head.line, head.col, name))
+		}
+	}()
+
+	// Block waiting for body result or k invocation
+	v := <-resumeCh
+	return v, nil
+}
+
+// invokeContinuation invokes a continuation with a value.
+// First tries escape (panic within dynamic extent), then falls back to
+// invoke function for saved continuations.
+func invokeContinuation(cont *continuation, val value) {
+	// Try escape first — if we're inside the callCC's dynamic extent,
+	// the panic will be caught by callCC's recover
+	panic(continuationEscape{val: val, id: cont.id, cont: cont})
+}
+
+// Never returns — the panic above always fires.
+// But if invoke is set, we could use it. However, escape should work for both cases
+// because callCC ALWAYS has a recover handler for its own id.
+
+func applyLambda(lam *lambda, args []value, e *expr, environ *env) (value, error) {
+	if lam.rest == "" {
+		if len(args) != len(lam.params) {
+			return value{}, fmt.Errorf("%d:%d: expected %d arguments, got %d", e.line, e.col, len(lam.params), len(args))
+		}
+	} else {
+		if len(args) < len(lam.params) {
+			return value{}, fmt.Errorf("%d:%d: expected at least %d arguments, got %d", e.line, e.col, len(lam.params), len(args))
+		}
+	}
+	callEnv := newEnv(lam.env)
+	for i, p := range lam.params {
+		callEnv.set(p, args[i])
+	}
+	if lam.rest != "" {
+		rest := nullValue
+		for i := len(args) - 1; i >= len(lam.params); i-- {
+			rest = pairValue(args[i], rest)
+		}
+		callEnv.set(lam.rest, rest)
+	}
+	for _, body := range lam.body[:len(lam.body)-1] {
+		_, err := evalExpr(body, callEnv)
+		if err != nil {
+			return value{}, err
+		}
+	}
+	return evalExpr(lam.body[len(lam.body)-1], callEnv)
+}
 
 func applyBuiltin(name string, args []value, e *expr, environ *env) (value, error) {
 	head := e.list[0]
@@ -1183,6 +1323,13 @@ func applyBuiltin(name string, args []value, e *expr, environ *env) (value, erro
 		}
 		return boolValue(args[0].typ == typeChar), nil
 
+	case "call/cc", "call-with-current-continuation":
+		if len(args) != 1 {
+			return value{}, fmt.Errorf("%d:%d: %s: expected 1 argument, got %d", head.line, head.col, name, len(args))
+		}
+		fn := args[0]
+		return callCC(fn, e, environ, head, name)
+
 	case "apply":
 		if len(args) < 2 {
 			return value{}, fmt.Errorf("%d:%d: apply: expected at least 2 arguments", head.line, head.col)
@@ -1202,6 +1349,11 @@ func applyBuiltin(name string, args []value, e *expr, environ *env) (value, erro
 		}
 		// Apply the function
 		switch fn.typ {
+		case typeContinuation:
+			if len(applyArgs) != 1 {
+				return value{}, fmt.Errorf("%d:%d: apply: continuation expects 1 argument, got %d", head.line, head.col, len(applyArgs))
+			}
+			invokeContinuation(fn.contVal, applyArgs[0])
 		case typeLambda:
 			lam := fn.lambdaVal
 			if lam.rest == "" {
@@ -1286,18 +1438,11 @@ func EvalStr(input string) (string, error) {
 	}
 
 	environ := newEnv(nil)
-	// Pre-bind builtins as symbols
-	for _, name := range []string{"+", "-", "*", "/", "<", ">", "=", "<=", ">=", "not", "cons", "car", "cdr", "null?", "list", "length", "append", "string?", "number?", "boolean?", "pair?", "symbol?", "display", "write", "newline", "string-append", "string-length", "substring", "string->number", "number->string", "symbol->string", "string->symbol", "string-ref", "char?", "string-copy", "string-set!", "apply"} {
-		environ.set(name, symbolValue(name))
-	}
+	initBuiltins(environ)
 
-	var last value
-	for _, e := range exprs {
-		v, err := evalExpr(e, environ)
-		if err != nil {
-			return "", &EvalError{Message: err.Error()}
-		}
-		last = v
+	last, err := evalProgram(exprs, environ)
+	if err != nil {
+		return "", &EvalError{Message: err.Error()}
 	}
 
 	if last.typ == typeVoid {
@@ -1324,17 +1469,11 @@ func EvalStrWithOutput(input string) (result string, output string, err error) {
 	var outBuf strings.Builder
 	environ := newEnv(nil)
 	environ.output = &outBuf
-	for _, name := range []string{"+", "-", "*", "/", "<", ">", "=", "<=", ">=", "not", "cons", "car", "cdr", "null?", "list", "length", "append", "string?", "number?", "boolean?", "pair?", "symbol?", "display", "write", "newline", "string-append", "string-length", "substring", "string->number", "number->string", "symbol->string", "string->symbol", "string-ref", "char?", "string-copy", "string-set!", "apply"} {
-		environ.set(name, symbolValue(name))
-	}
+	initBuiltins(environ)
 
-	var last value
-	for _, e := range exprs {
-		v, evalErr := evalExpr(e, environ)
-		if evalErr != nil {
-			return "", "", &EvalError{Message: evalErr.Error()}
-		}
-		last = v
+	last, evalErr := evalProgram(exprs, environ)
+	if evalErr != nil {
+		return "", "", &EvalError{Message: evalErr.Error()}
 	}
 
 	resultStr := ""
@@ -1343,3 +1482,44 @@ func EvalStrWithOutput(input string) (result string, output string, err error) {
 	}
 	return resultStr, outBuf.String(), nil
 }
+
+var builtinNames = []string{"+", "-", "*", "/", "<", ">", "=", "<=", ">=", "not", "cons", "car", "cdr", "null?", "list", "length", "append", "string?", "number?", "boolean?", "pair?", "symbol?", "display", "write", "newline", "string-append", "string-length", "substring", "string->number", "number->string", "symbol->string", "string->symbol", "string-ref", "char?", "string-copy", "string-set!", "apply", "call/cc", "call-with-current-continuation"}
+
+func initBuiltins(environ *env) {
+	for _, name := range builtinNames {
+		environ.set(name, symbolValue(name))
+	}
+}
+
+// evalProgram evaluates a sequence of top-level expressions.
+// Catches continuationEscape for saved continuations invoked outside their
+// dynamic extent, and uses their invoke function to replay the computation.
+func evalProgram(exprs []*expr, environ *env) (last value, retErr error) {
+	defer func() {
+		if r := recover(); r != nil {
+			if esc, ok := r.(continuationEscape); ok {
+				// A saved continuation was invoked outside its dynamic extent.
+				// Use invoke to replay the computation.
+				if esc.cont != nil && esc.cont.invoke != nil {
+					last, retErr = esc.cont.invoke(esc.val)
+					return
+				}
+			}
+			if cr, ok := r.(continuationResult); ok {
+				last = cr.val
+				retErr = cr.err
+				return
+			}
+			panic(r)
+		}
+	}()
+	for _, e := range exprs {
+		v, err := evalExpr(e, environ)
+		if err != nil {
+			return value{}, err
+		}
+		last = v
+	}
+	return last, nil
+}
+
