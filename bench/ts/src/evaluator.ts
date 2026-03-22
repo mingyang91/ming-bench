@@ -295,6 +295,14 @@ class ContinuationJump {
   ) {}
 }
 
+// Scheme-level raise: carries an arbitrary Scheme value
+class SchemeRaise {
+  constructor(public value: Value) {}
+}
+
+// Exception handler stack
+const exceptionHandlers: ((val: Value) => Value)[] = [];
+
 // ── eqv? comparison (used by case) ───────────────────────────────────
 
 function eqvCompare(a: Value, b: Value): boolean {
@@ -892,6 +900,15 @@ function makeGlobalEnv(output: string[] = []): Env {
   // dynamic-wind — handled specially by the evaluator
   env.define('dynamic-wind', { tag: 'builtin', name: 'dynamic-wind', fn() { throw new EvalError('dynamic-wind: internal'); } });
 
+  // with-exception-handler — handled specially by the evaluator
+  env.define('with-exception-handler', { tag: 'builtin', name: 'with-exception-handler', fn() { throw new EvalError('with-exception-handler: internal'); } });
+
+  // raise as a builtin too (in case it's passed as a value)
+  env.define('raise', { tag: 'builtin', name: 'raise', fn(args) {
+    if (args.length !== 1) throw new EvalError('raise: expected 1 argument');
+    throw new SchemeRaise(args[0]);
+  }});
+
   return env;
 }
 
@@ -1413,6 +1430,65 @@ function evaluate(expr: Expr, env: Env): Value {
             }
             return { tag: 'nil' };
           }
+
+          case 'raise': {
+            if (items.length !== 2) throw new EvalError(`${fmtPos(expr.pos)}: raise: expected 1 argument`);
+            const val = evaluate(items[1], env);
+            throw new SchemeRaise(val);
+          }
+
+          case 'guard': {
+            // (guard (var clause ...) body ...)
+            if (items.length < 3) throw new EvalError(`${fmtPos(expr.pos)}: guard: bad syntax`);
+            const clauseList = items[1];
+            if (clauseList.tag !== 'list' || clauseList.items.length < 1)
+              throw new EvalError(`${fmtPos(expr.pos)}: guard: bad syntax`);
+            const varExpr = clauseList.items[0];
+            if (varExpr.tag !== 'symbol') throw new EvalError(`${fmtPos(expr.pos)}: guard: expected symbol`);
+            const guardVar = varExpr.name;
+            const clauses = clauseList.items.slice(1);
+            const bodyExprs = items.slice(2);
+
+            let bodyResult: Value;
+            try {
+              let res: Value = { tag: 'nil' };
+              for (const b of bodyExprs) {
+                res = evaluate(b, env);
+              }
+              bodyResult = res;
+            } catch (e) {
+              if (e instanceof SchemeRaise) {
+                const guardEnv = new Env(env);
+                guardEnv.define(guardVar, e.value);
+                // Try each clause
+                for (let ci = 0; ci < clauses.length; ci++) {
+                  const clause = clauses[ci];
+                  if (clause.tag !== 'list' || clause.items.length < 1)
+                    throw new EvalError(`${fmtPos(expr.pos)}: guard: bad clause`);
+                  // else clause
+                  if (clause.items[0].tag === 'symbol' && clause.items[0].name === 'else') {
+                    if (clause.items.length === 1) return { tag: 'nil' };
+                    for (let j = 1; j < clause.items.length - 1; j++) {
+                      evaluate(clause.items[j], guardEnv);
+                    }
+                    return evaluate(clause.items[clause.items.length - 1], guardEnv);
+                  }
+                  const test = evaluate(clause.items[0], guardEnv);
+                  if (isTruthy(test)) {
+                    if (clause.items.length === 1) return test;
+                    for (let j = 1; j < clause.items.length - 1; j++) {
+                      evaluate(clause.items[j], guardEnv);
+                    }
+                    return evaluate(clause.items[clause.items.length - 1], guardEnv);
+                  }
+                }
+                // No clause matched — re-raise
+                throw e;
+              }
+              throw e;
+            }
+            return bodyResult;
+          }
         }
       }
 
@@ -1472,6 +1548,24 @@ function evaluate(expr: Expr, env: Env): Value {
         return result;
       }
 
+      // with-exception-handler handling
+      if (fn.tag === 'builtin' && fn.name === 'with-exception-handler') {
+        if (args.length !== 2) throw new EvalError(`${fmtPos(expr.pos)}: with-exception-handler: expected 2 arguments`);
+        const [handler, thunk] = args;
+        exceptionHandlers.push((val: Value) => applyFn(handler, [val], expr.pos));
+        try {
+          const result = applyFn(thunk, [], expr.pos);
+          exceptionHandlers.pop();
+          return result;
+        } catch (e) {
+          exceptionHandlers.pop();
+          if (e instanceof SchemeRaise) {
+            return applyFn(handler, [e.value], expr.pos);
+          }
+          throw e;
+        }
+      }
+
       // Continuation invocation
       if (fn.tag === 'continuation') {
         if (args.length !== 1) throw new EvalError(`${fmtPos(expr.pos)}: continuation: expected 1 argument`);
@@ -1520,6 +1614,7 @@ function evalProgram(exprs: Expr[], env: Env): Value {
   nextContId = 0;
   gensymCounter = 0;
   pendingContReturn = null;
+  exceptionHandlers.length = 0;
   for (let i = 0; i < exprs.length; i++) {
     currentTopIdx = i;
     try {
