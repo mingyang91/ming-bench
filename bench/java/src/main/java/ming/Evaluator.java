@@ -39,7 +39,9 @@ public class Evaluator {
 
     private static Env makeGlobalEnv() {
         Env env = new Env(null);
-        String[] builtins = {"+", "-", "*", "/", "<", ">", "=", "<=", ">=", "not"};
+        String[] builtins = {"+", "-", "*", "/", "<", ">", "=", "<=", ">=", "not",
+            "cons", "car", "cdr", "null?", "list", "length", "append",
+            "string?", "number?", "boolean?", "pair?", "symbol?", "procedure?", "integer?"};
         for (String b : builtins) {
             env.define(b, new BuiltinVal(b));
         }
@@ -237,6 +239,80 @@ public class Evaluator {
                             }
                             yield result;
                         }
+                        case "let" -> {
+                            if (elems.size() < 3) throw new EvalError("let requires bindings and body");
+                            SchemeVal second = elems.get(1);
+                            // Named let: (let name ((var init) ...) body...)
+                            if (second instanceof SymbolVal loopName) {
+                                if (elems.size() < 4) throw new EvalError("named let requires bindings and body");
+                                SchemeVal bindingsVal = elems.get(2);
+                                if (!(bindingsVal instanceof ListVal bl)) throw new EvalError("let: invalid bindings");
+                                List<String> params = new ArrayList<>();
+                                List<SchemeVal> inits = new ArrayList<>();
+                                for (SchemeVal binding : bl.elements()) {
+                                    if (!(binding instanceof ListVal bpair) || bpair.elements().size() != 2)
+                                        throw new EvalError("let: invalid binding");
+                                    params.add(((SymbolVal) bpair.elements().get(0)).name());
+                                    inits.add(bpair.elements().get(1));
+                                }
+                                List<SchemeVal> body = new ArrayList<>(elems.subList(3, elems.size()));
+                                Env letEnv = new Env(env);
+                                LambdaVal loopFn = new LambdaVal(params, body, letEnv);
+                                letEnv.define(loopName.name(), loopFn);
+                                List<SchemeVal> evaledInits = new ArrayList<>();
+                                for (SchemeVal init : inits) evaledInits.add(eval(init, env));
+                                yield applyProc(loopFn, evaledInits);
+                            }
+                            // Regular let: (let ((var init) ...) body...)
+                            if (!(second instanceof ListVal bl)) throw new EvalError("let: invalid bindings");
+                            Env letEnv = new Env(env);
+                            for (SchemeVal binding : bl.elements()) {
+                                if (!(binding instanceof ListVal bpair) || bpair.elements().size() != 2)
+                                    throw new EvalError("let: invalid binding");
+                                String varName = ((SymbolVal) bpair.elements().get(0)).name();
+                                SchemeVal val = eval(bpair.elements().get(1), env);
+                                letEnv.define(varName, val);
+                            }
+                            SchemeVal letResult = VOID;
+                            for (int i = 2; i < elems.size(); i++) {
+                                letResult = eval(elems.get(i), letEnv);
+                            }
+                            yield letResult;
+                        }
+                        case "begin" -> {
+                            SchemeVal beginResult = VOID;
+                            for (int i = 1; i < elems.size(); i++) {
+                                beginResult = eval(elems.get(i), env);
+                            }
+                            yield beginResult;
+                        }
+                        case "cond" -> {
+                            SchemeVal condResult = VOID;
+                            boolean matched = false;
+                            for (int i = 1; i < elems.size(); i++) {
+                                if (!(elems.get(i) instanceof ListVal clause) || clause.elements().isEmpty())
+                                    throw new EvalError("cond: invalid clause");
+                                SchemeVal test = clause.elements().get(0);
+                                if (test instanceof SymbolVal s && s.name().equals("else")) {
+                                    condResult = VOID;
+                                    for (int j = 1; j < clause.elements().size(); j++) {
+                                        condResult = eval(clause.elements().get(j), env);
+                                    }
+                                    matched = true;
+                                    break;
+                                }
+                                SchemeVal testResult = eval(test, env);
+                                if (!isFalse(testResult)) {
+                                    condResult = testResult;
+                                    for (int j = 1; j < clause.elements().size(); j++) {
+                                        condResult = eval(clause.elements().get(j), env);
+                                    }
+                                    matched = true;
+                                    break;
+                                }
+                            }
+                            yield condResult;
+                        }
                         default -> {
                             // fall through to procedure call
                         }
@@ -351,6 +427,94 @@ public class Evaluator {
             case "not" -> {
                 if (args.size() != 1) throw new EvalError("not requires exactly 1 argument");
                 yield new BoolVal(isFalse(args.getFirst()));
+            }
+            case "cons" -> {
+                if (args.size() != 2) throw new EvalError("cons requires exactly 2 arguments");
+                SchemeVal carVal = args.get(0);
+                SchemeVal cdrVal = args.get(1);
+                if (cdrVal instanceof ListVal lst) {
+                    List<SchemeVal> newElems = new ArrayList<>();
+                    newElems.add(carVal);
+                    newElems.addAll(lst.elements());
+                    yield new ListVal(newElems);
+                }
+                // Improper pair - for now just store as 2-element list with dot notation later
+                List<SchemeVal> pair = new ArrayList<>();
+                pair.add(carVal);
+                pair.add(cdrVal);
+                yield new ListVal(pair); // simplified for L03
+            }
+            case "car" -> {
+                if (args.size() != 1) throw new EvalError("car requires exactly 1 argument");
+                if (args.getFirst() instanceof ListVal lst && !lst.elements().isEmpty()) {
+                    yield lst.elements().getFirst();
+                }
+                throw new EvalError("car: not a pair");
+            }
+            case "cdr" -> {
+                if (args.size() != 1) throw new EvalError("cdr requires exactly 1 argument");
+                if (args.getFirst() instanceof ListVal lst && !lst.elements().isEmpty()) {
+                    yield new ListVal(new ArrayList<>(lst.elements().subList(1, lst.elements().size())));
+                }
+                throw new EvalError("cdr: not a pair");
+            }
+            case "null?" -> {
+                if (args.size() != 1) throw new EvalError("null? requires exactly 1 argument");
+                yield new BoolVal(args.getFirst() instanceof ListVal lst && lst.elements().isEmpty());
+            }
+            case "list" -> {
+                yield new ListVal(new ArrayList<>(args));
+            }
+            case "length" -> {
+                if (args.size() != 1) throw new EvalError("length requires exactly 1 argument");
+                if (args.getFirst() instanceof ListVal lst) {
+                    yield new IntVal(lst.elements().size());
+                }
+                throw new EvalError("length: not a list");
+            }
+            case "append" -> {
+                List<SchemeVal> result = new ArrayList<>();
+                for (int i = 0; i < args.size(); i++) {
+                    if (i < args.size() - 1) {
+                        if (args.get(i) instanceof ListVal lst) {
+                            result.addAll(lst.elements());
+                        } else {
+                            throw new EvalError("append: not a list");
+                        }
+                    } else {
+                        if (args.get(i) instanceof ListVal lst) {
+                            result.addAll(lst.elements());
+                        } else {
+                            // last arg can be non-list for improper lists
+                            result.add(args.get(i));
+                        }
+                    }
+                }
+                yield new ListVal(result);
+            }
+            case "string?" -> {
+                if (args.size() != 1) throw new EvalError("string? requires exactly 1 argument");
+                yield new BoolVal(args.getFirst() instanceof StrVal);
+            }
+            case "number?", "integer?" -> {
+                if (args.size() != 1) throw new EvalError(name + " requires exactly 1 argument");
+                yield new BoolVal(args.getFirst() instanceof IntVal);
+            }
+            case "boolean?" -> {
+                if (args.size() != 1) throw new EvalError("boolean? requires exactly 1 argument");
+                yield new BoolVal(args.getFirst() instanceof BoolVal);
+            }
+            case "pair?" -> {
+                if (args.size() != 1) throw new EvalError("pair? requires exactly 1 argument");
+                yield new BoolVal(args.getFirst() instanceof ListVal lst && !lst.elements().isEmpty());
+            }
+            case "symbol?" -> {
+                if (args.size() != 1) throw new EvalError("symbol? requires exactly 1 argument");
+                yield new BoolVal(args.getFirst() instanceof SymbolVal);
+            }
+            case "procedure?" -> {
+                if (args.size() != 1) throw new EvalError("procedure? requires exactly 1 argument");
+                yield new BoolVal(args.getFirst() instanceof LambdaVal || args.getFirst() instanceof BuiltinVal);
             }
             default -> throw new EvalError("unbound variable: " + name);
         };
