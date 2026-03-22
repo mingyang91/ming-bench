@@ -1,7 +1,8 @@
+use crate::cmd::test_level;
 use crate::codex;
 use crate::model::{
     compact_timestamp, iso_now, project_dir, run_cmd, run_cmd_capture, uuid_v4, write_meta, Error,
-    Result, LEVELS,
+    Lang, Result, LEVELS,
 };
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -382,6 +383,96 @@ fn run_full_mode(
     agent_exit
 }
 
+// ---------------------------------------------------------------------------
+// Regression checking
+// ---------------------------------------------------------------------------
+
+/// Maximum turns for a regression-fix agent pass.
+const REGRESSION_FIX_TURNS: u32 = 15;
+
+/// Run all previously-passed levels against the current worktree code.
+/// Returns a list of (level_label, test_output) for any that now fail.
+fn regression_check(
+    passed_levels: &[&str],
+    lang: &Lang,
+    worktree_dir: &Path,
+) -> Result<Vec<(String, String)>> {
+    let mut failures = Vec::new();
+    for level in passed_levels {
+        let (exit_code, output) = test_level::run_level_capture(level, lang, worktree_dir)?;
+        if exit_code != 0 {
+            failures.push((format!("L{level}"), output));
+        }
+    }
+    Ok(failures)
+}
+
+/// Build a prompt telling the agent which levels regressed and asking it to fix them.
+fn build_regression_prompt(
+    regressions: &[(String, String)],
+    current_level: &str,
+    lang: &str,
+) -> String {
+    let mut prompt = format!(
+        "REGRESSION DETECTED: Your level {current_level} changes broke earlier tests.\n\
+         Fix the regressions below while keeping level {current_level} tests passing.\n\
+         Do NOT remove or skip any tests. Do NOT make all strings immutable.\n\n"
+    );
+    for (level, output) in regressions {
+        prompt.push_str(&format!("=== {level} FAILING ===\n"));
+        // Include last 40 lines of test output (enough for failure details)
+        let lines: Vec<&str> = output.lines().collect();
+        let start = lines.len().saturating_sub(40);
+        for line in &lines[start..] {
+            prompt.push_str(line);
+            prompt.push('\n');
+        }
+        prompt.push('\n');
+    }
+    prompt.push_str(&format!(
+        "Run `cargo xtask test <NN> --lang {lang}` for each failing level to verify your fix.\n\
+         Then run `cargo xtask test {current_level} --lang {lang}` to confirm no new breakage."
+    ));
+    prompt
+}
+
+/// Launch an agent pass to fix regressions, returning the agent exit code.
+fn run_regression_fix(
+    args: &RunAgentArgs,
+    agent_workdir: &Path,
+    level_dir: &Path,
+    regressions: &[(String, String)],
+    current_level: &str,
+) -> i32 {
+    let prompt = build_regression_prompt(regressions, current_level, &args.lang);
+    let regression_uuid = uuid_v4();
+    let output_file = level_dir.join("agent-output-regression.txt");
+
+    let agent_exit = launch_agent(
+        &args.agent,
+        agent_workdir,
+        &prompt,
+        &regression_uuid,
+        &output_file,
+        Some(REGRESSION_FIX_TURNS),
+        args.model.as_deref(),
+    );
+
+    capture_session_as(
+        &args.agent,
+        &regression_uuid,
+        &output_file,
+        level_dir,
+        "session-regression.jsonl",
+    );
+
+    agent_exit
+}
+
+// ---------------------------------------------------------------------------
+// Level-by-level mode
+// ---------------------------------------------------------------------------
+
 fn run_levels_mode(
     args: &RunAgentArgs,
     agent_workdir: &Path,
@@ -396,8 +487,14 @@ fn run_levels_mode(
         .and_then(|s| s.parse().ok())
         .unwrap_or(1);
 
+    let lang = Lang::from_str(&args.lang).map_err(|msg| Error::CommandFailed {
+        cmd: msg,
+        exit_code: 1,
+    })?;
+
     let mut agent_exit = 0i32;
     let mut level_times: Vec<(String, i64, String)> = Vec::new();
+    let mut passed_levels: Vec<&str> = Vec::new();
 
     for level in &LEVELS {
         if INTERRUPTED.load(Ordering::Relaxed) {
@@ -408,11 +505,14 @@ fn run_levels_mode(
         let level_num: u32 = level.parse().expect("level constant not a number");
         if level_num < start_level {
             println!("Skipping L{level} (before --from-level {start_level})");
+            // Still track as passed for regression checks
+            passed_levels.push(level);
             continue;
         }
 
         let level_dir = results_dir.join(format!("L{level}"));
         if should_skip_level(args.resume, &level_dir, level) {
+            passed_levels.push(level);
             continue;
         }
 
@@ -426,6 +526,66 @@ fn run_levels_mode(
             println!("Level {level} FAILED — stopping");
             break;
         }
+
+        // --- Regression check: re-run all prior levels ---
+        if !passed_levels.is_empty() {
+            println!();
+            println!("--- Regression check: L01..L{} ---", passed_levels.last().unwrap());
+            let regressions = regression_check(&passed_levels, &lang, worktree_dir)?;
+
+            if !regressions.is_empty() {
+                let regressed_names: Vec<&str> =
+                    regressions.iter().map(|(l, _)| l.as_str()).collect();
+                println!(
+                    "WARNING: Regressions detected in: {}",
+                    regressed_names.join(", ")
+                );
+
+                // Fix-it pass
+                println!(
+                    "--- Regression fix pass ({REGRESSION_FIX_TURNS} turns) ---"
+                );
+                let _fix_exit = run_regression_fix(
+                    args,
+                    agent_workdir,
+                    &level_dir,
+                    &regressions,
+                    level,
+                );
+
+                // Re-check all levels including current
+                let mut all_check: Vec<&str> = passed_levels.clone();
+                all_check.push(level);
+                let still_broken = regression_check(&all_check, &lang, worktree_dir)?;
+
+                if !still_broken.is_empty() {
+                    let broken_names: Vec<&str> =
+                        still_broken.iter().map(|(l, _)| l.as_str()).collect();
+                    println!(
+                        "Regressions unfixed: {} — halting run",
+                        broken_names.join(", ")
+                    );
+                    let status_msg = format!(
+                        "Level {level} REGRESSION (regressions in {})",
+                        broken_names.join(", ")
+                    );
+                    let _ = fs::write(level_dir.join("status.txt"), &status_msg);
+                    commit_checkpoint(level, "REGRESSION", result.1, worktree_dir);
+                    // Update level_times to reflect regression status
+                    if let Some(last) = level_times.last_mut() {
+                        last.2 = "REGRESSION".to_string();
+                    }
+                    break;
+                }
+
+                println!("Regressions fixed successfully");
+                commit_checkpoint(level, "REGFIX", 0, worktree_dir);
+            } else {
+                println!("No regressions");
+            }
+        }
+
+        passed_levels.push(level);
     }
 
     Ok((agent_exit, level_times))
@@ -693,7 +853,9 @@ fn finalize_run(args: &RunAgentArgs, results_dir: &Path, ctx: &FinalizeContext) 
             continue;
         };
         let duration = parse_status_duration(&content);
-        let status = if content.contains("PASSED") {
+        let status = if content.contains("REGRESSION") {
+            "REGRESSION"
+        } else if content.contains("PASSED") {
             "PASSED"
         } else {
             "FAILED"
