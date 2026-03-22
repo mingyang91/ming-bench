@@ -1490,5 +1490,33 @@
     "fixture": "l23_full_integration.scm",
     "kind": "eval_str_ok",
     "expected": "(#t 10/3 #f \"division by zero\")"
+  },
+  {
+    "name": "l03_stress_nqueens",
+    "level": 3,
+    "fixture": "l03_stress_nqueens.scm",
+    "kind": "eval_str_ok",
+    "expected": "#t"
+  },
+  {
+    "name": "l10_stress_ctak",
+    "level": 10,
+    "fixture": "l10_stress_ctak.scm",
+    "kind": "eval_str_ok",
+    "expected": "#t"
+  },
+  {
+    "name": "l23_stress_browse",
+    "level": 23,
+    "fixture": "l23_stress_browse.scm",
+    "kind": "eval_str_ok",
+    "expected": "#t"
+  },
+  {
+    "name": "l23_stress_peval",
+    "level": 23,
+    "fixture": "l23_stress_peval.scm",
+    "kind": "eval_str_ok",
+    "expected": "#t"
   }
 ]

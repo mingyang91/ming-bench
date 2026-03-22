@@ -193,3 +193,11 @@ fn test_l03_symbol_pred() {
         Ok("#t".into())
     );
 }
+
+#[test]
+fn test_l03_stress_nqueens() {
+    assert_eq!(
+        eval_str(include_str!("fixtures/l03_stress_nqueens.scm").trim()),
+        Ok("#t".into())
+    );
+}

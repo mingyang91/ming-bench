@@ -81,3 +81,11 @@ fn test_l10_callcc_resumes_pending_application() {
         Ok("43".into())
     );
 }
+
+#[test]
+fn test_l10_stress_ctak() {
+    assert_eq!(
+        eval_str(include_str!("fixtures/l10_stress_ctak.scm").trim()),
+        Ok("#t".into())
+    );
+}

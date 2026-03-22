@@ -65,3 +65,19 @@ fn test_l23_full_integration() {
         Ok("(#t 10/3 #f \"division by zero\")".into())
     );
 }
+
+#[test]
+fn test_l23_stress_browse() {
+    assert_eq!(
+        eval_str(include_str!("fixtures/l23_stress_browse.scm").trim()),
+        Ok("#t".into())
+    );
+}
+
+#[test]
+fn test_l23_stress_peval() {
+    assert_eq!(
+        eval_str(include_str!("fixtures/l23_stress_peval.scm").trim()),
+        Ok("#t".into())
+    );
+}
