@@ -619,7 +619,14 @@ function evalExpr(expr, env) {
                             const prevBodyInfo = currentBodyInfo;
                             for (let i = 0; i < body.length - 1; i++) {
                                 currentBodyInfo = { body, idx: i, env: letEnv };
-                                evalExpr(body[i], letEnv);
+                                try {
+                                    evalExpr(body[i], letEnv);
+                                }
+                                catch (e) {
+                                    if (e instanceof ContinuationJump)
+                                        continue;
+                                    throw e;
+                                }
                             }
                             currentBodyInfo = { body, idx: body.length - 1, env: letEnv };
                             expr = body[body.length - 1];
@@ -643,7 +650,14 @@ function evalExpr(expr, env) {
                             const prevBodyInfoBegin = currentBodyInfo;
                             for (let i = 0; i < bodyExprs.length - 1; i++) {
                                 currentBodyInfo = { body: bodyExprs, idx: i, env };
-                                evalExpr(bodyExprs[i], env);
+                                try {
+                                    evalExpr(bodyExprs[i], env);
+                                }
+                                catch (e) {
+                                    if (e instanceof ContinuationJump)
+                                        continue;
+                                    throw e;
+                                }
                             }
                             currentBodyInfo = { body: bodyExprs, idx: bodyExprs.length - 1, env };
                             expr = bodyExprs[bodyExprs.length - 1];
@@ -773,7 +787,14 @@ function evalExpr(expr, env) {
                     const prevBodyInfo2 = currentBodyInfo;
                     for (let i = 0; i < proc.body.length - 1; i++) {
                         currentBodyInfo = { body: proc.body, idx: i, env: callEnv };
-                        evalExpr(proc.body[i], callEnv);
+                        try {
+                            evalExpr(proc.body[i], callEnv);
+                        }
+                        catch (e) {
+                            if (e instanceof ContinuationJump)
+                                continue;
+                            throw e;
+                        }
                     }
                     currentBodyInfo = { body: proc.body, idx: proc.body.length - 1, env: callEnv };
                     expr = proc.body[proc.body.length - 1];
