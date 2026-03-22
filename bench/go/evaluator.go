@@ -429,97 +429,264 @@ func (e *env) set(name string, v value) {
 }
 
 func evalExpr(e *expr, environ *env) (value, error) {
-	if e.kind == "atom" {
-		if e.atom.typ == typeSymbol {
-			v, ok := environ.get(e.atom.strVal)
-			if !ok {
-				return value{}, fmt.Errorf("%d:%d: unbound variable: %s", e.line, e.col, e.atom.strVal)
+	for {
+		if e.kind == "atom" {
+			if e.atom.typ == typeSymbol {
+				v, ok := environ.get(e.atom.strVal)
+				if !ok {
+					return value{}, fmt.Errorf("%d:%d: unbound variable: %s", e.line, e.col, e.atom.strVal)
+				}
+				return v, nil
 			}
-			return v, nil
+			return e.atom, nil
 		}
-		return e.atom, nil
-	}
 
-	// List expression (function call or special form)
-	if len(e.list) == 0 {
-		return value{}, fmt.Errorf("%d:%d: empty application", e.line, e.col)
-	}
+		// List expression (function call or special form)
+		if len(e.list) == 0 {
+			return value{}, fmt.Errorf("%d:%d: empty application", e.line, e.col)
+		}
 
-	head := e.list[0]
-	if head.kind == "atom" && head.atom.typ == typeSymbol {
-		switch head.atom.strVal {
-		case "and":
-			return evalAnd(e, environ)
-		case "or":
-			return evalOr(e, environ)
-		case "define":
-			return evalDefine(e, environ)
-		case "if":
-			return evalIf(e, environ)
-		case "quote":
-			if len(e.list) != 2 {
-				return value{}, fmt.Errorf("%d:%d: quote: expected 1 argument", head.line, head.col)
+		head := e.list[0]
+		if head.kind == "atom" && head.atom.typ == typeSymbol {
+			switch head.atom.strVal {
+			case "and":
+				// TCO: tail-call the last expression in and
+				if len(e.list) == 1 {
+					return boolValue(true), nil
+				}
+				for _, sub := range e.list[1 : len(e.list)-1] {
+					v, err := evalExpr(sub, environ)
+					if err != nil {
+						return value{}, err
+					}
+					if !isTruthy(v) {
+						return v, nil
+					}
+				}
+				e = e.list[len(e.list)-1]
+				continue
+
+			case "or":
+				// TCO: tail-call the last expression in or
+				if len(e.list) == 1 {
+					return boolValue(false), nil
+				}
+				for _, sub := range e.list[1 : len(e.list)-1] {
+					v, err := evalExpr(sub, environ)
+					if err != nil {
+						return value{}, err
+					}
+					if isTruthy(v) {
+						return v, nil
+					}
+				}
+				e = e.list[len(e.list)-1]
+				continue
+
+			case "define":
+				return evalDefine(e, environ)
+
+			case "if":
+				if len(e.list) < 3 || len(e.list) > 4 {
+					return value{}, fmt.Errorf("%d:%d: if: bad syntax", head.line, head.col)
+				}
+				cond, err := evalExpr(e.list[1], environ)
+				if err != nil {
+					return value{}, err
+				}
+				if isTruthy(cond) {
+					e = e.list[2]
+					continue
+				}
+				if len(e.list) == 4 {
+					e = e.list[3]
+					continue
+				}
+				return voidValue, nil
+
+			case "quote":
+				if len(e.list) != 2 {
+					return value{}, fmt.Errorf("%d:%d: quote: expected 1 argument", head.line, head.col)
+				}
+				return quoteExpr(e.list[1]), nil
+
+			case "lambda":
+				return evalLambda(e, environ)
+
+			case "let":
+				newE, newEnv, err := setupLet(e, environ)
+				if err != nil {
+					return value{}, err
+				}
+				e = newE
+				environ = newEnv
+				continue
+
+			case "begin":
+				if len(e.list) < 2 {
+					return voidValue, nil
+				}
+				for _, body := range e.list[1 : len(e.list)-1] {
+					_, err := evalExpr(body, environ)
+					if err != nil {
+						return value{}, err
+					}
+				}
+				e = e.list[len(e.list)-1]
+				continue
+
+			case "cond":
+				found := false
+				for _, clause := range e.list[1:] {
+					if clause.kind != "list" || len(clause.list) < 2 {
+						return value{}, fmt.Errorf("%d:%d: cond: bad clause", clause.line, clause.col)
+					}
+					isElse := clause.list[0].kind == "atom" && clause.list[0].atom.typ == typeSymbol && clause.list[0].atom.strVal == "else"
+					if !isElse {
+						test, err := evalExpr(clause.list[0], environ)
+						if err != nil {
+							return value{}, err
+						}
+						if !isTruthy(test) {
+							continue
+						}
+					}
+					// Evaluate all but last body, then tail-call last
+					for _, body := range clause.list[1 : len(clause.list)-1] {
+						_, err := evalExpr(body, environ)
+						if err != nil {
+							return value{}, err
+						}
+					}
+					e = clause.list[len(clause.list)-1]
+					found = true
+					break
+				}
+				if !found {
+					return voidValue, nil
+				}
+				continue
 			}
-			return quoteExpr(e.list[1]), nil
-		case "lambda":
-			return evalLambda(e, environ)
-		case "let":
-			return evalLet(e, environ)
-		case "begin":
-			return evalBegin(e, environ)
-		case "cond":
-			return evalCond(e, environ)
 		}
-	}
 
-	// Evaluate the operator
-	opVal, err := evalExpr(head, environ)
-	if err != nil {
-		return value{}, err
-	}
-
-	// Evaluate arguments
-	args := make([]value, len(e.list)-1)
-	for i, sub := range e.list[1:] {
-		v, err := evalExpr(sub, environ)
+		// Evaluate the operator
+		opVal, err := evalExpr(head, environ)
 		if err != nil {
 			return value{}, err
 		}
-		args[i] = v
-	}
 
-	return applyProc(opVal, args, e, environ)
-}
+		// Evaluate arguments
+		args := make([]value, len(e.list)-1)
+		for i, sub := range e.list[1:] {
+			v, err := evalExpr(sub, environ)
+			if err != nil {
+				return value{}, err
+			}
+			args[i] = v
+		}
 
-func applyProc(proc value, args []value, e *expr, environ *env) (value, error) {
-	head := e.list[0]
-	switch proc.typ {
-	case typeLambda:
-		return applyLambda(proc.lambdaVal, args, e)
-	case typeSymbol:
-		return applyBuiltin(proc.strVal, args, e, environ)
-	default:
-		return value{}, fmt.Errorf("%d:%d: not a procedure: %s", head.line, head.col, proc.String())
-	}
-}
-
-func applyLambda(lam *lambda, args []value, e *expr) (value, error) {
-	if len(args) != len(lam.params) {
-		return value{}, fmt.Errorf("%d:%d: expected %d arguments, got %d", e.line, e.col, len(lam.params), len(args))
-	}
-	callEnv := newEnv(lam.env)
-	for i, p := range lam.params {
-		callEnv.set(p, args[i])
-	}
-	var result value
-	var err error
-	for _, body := range lam.body {
-		result, err = evalExpr(body, callEnv)
-		if err != nil {
-			return value{}, err
+		// Apply
+		switch opVal.typ {
+		case typeLambda:
+			lam := opVal.lambdaVal
+			if len(args) != len(lam.params) {
+				return value{}, fmt.Errorf("%d:%d: expected %d arguments, got %d", e.line, e.col, len(lam.params), len(args))
+			}
+			callEnv := newEnv(lam.env)
+			for i, p := range lam.params {
+				callEnv.set(p, args[i])
+			}
+			// Evaluate all but last body, then tail-call last
+			for _, body := range lam.body[:len(lam.body)-1] {
+				_, err := evalExpr(body, callEnv)
+				if err != nil {
+					return value{}, err
+				}
+			}
+			e = lam.body[len(lam.body)-1]
+			environ = callEnv
+			continue
+		case typeSymbol:
+			return applyBuiltin(opVal.strVal, args, e, environ)
+		default:
+			return value{}, fmt.Errorf("%d:%d: not a procedure: %s", head.line, head.col, opVal.String())
 		}
 	}
-	return result, nil
+}
+
+// setupLet prepares the let environment and returns the last body expression for TCO.
+func setupLet(e *expr, environ *env) (*expr, *env, error) {
+	if len(e.list) < 3 {
+		return nil, nil, fmt.Errorf("%d:%d: let: bad syntax", e.list[0].line, e.list[0].col)
+	}
+
+	// Named let: (let name ((var init) ...) body ...)
+	nameIdx := 1
+	bodyStart := 2
+	var namedLetName string
+	if e.list[1].kind == "atom" && e.list[1].atom.typ == typeSymbol {
+		if len(e.list) < 4 {
+			return nil, nil, fmt.Errorf("%d:%d: let: bad syntax", e.list[0].line, e.list[0].col)
+		}
+		namedLetName = e.list[1].atom.strVal
+		nameIdx = 2
+		bodyStart = 3
+	}
+
+	bindings := e.list[nameIdx]
+	if bindings.kind != "list" {
+		return nil, nil, fmt.Errorf("%d:%d: let: expected bindings list", bindings.line, bindings.col)
+	}
+
+	params := make([]string, len(bindings.list))
+	initVals := make([]value, len(bindings.list))
+	for i, b := range bindings.list {
+		if b.kind != "list" || len(b.list) != 2 {
+			return nil, nil, fmt.Errorf("%d:%d: let: bad binding", b.line, b.col)
+		}
+		if b.list[0].kind != "atom" || b.list[0].atom.typ != typeSymbol {
+			return nil, nil, fmt.Errorf("%d:%d: let: expected symbol", b.list[0].line, b.list[0].col)
+		}
+		params[i] = b.list[0].atom.strVal
+		val, err := evalExpr(b.list[1], environ)
+		if err != nil {
+			return nil, nil, err
+		}
+		initVals[i] = val
+	}
+
+	bodyExprs := e.list[bodyStart:]
+
+	if namedLetName != "" {
+		letEnv := newEnv(environ)
+		lam := &lambda{params: params, body: bodyExprs, env: letEnv}
+		letEnv.set(namedLetName, value{typ: typeLambda, lambdaVal: lam})
+		callEnv := newEnv(letEnv)
+		for i, p := range params {
+			callEnv.set(p, initVals[i])
+		}
+		// Evaluate all but last body
+		for _, body := range bodyExprs[:len(bodyExprs)-1] {
+			_, err := evalExpr(body, callEnv)
+			if err != nil {
+				return nil, nil, err
+			}
+		}
+		return bodyExprs[len(bodyExprs)-1], callEnv, nil
+	}
+
+	letEnv := newEnv(environ)
+	for i, p := range params {
+		letEnv.set(p, initVals[i])
+	}
+	// Evaluate all but last body
+	for _, body := range bodyExprs[:len(bodyExprs)-1] {
+		_, err := evalExpr(body, letEnv)
+		if err != nil {
+			return nil, nil, err
+		}
+	}
+	return bodyExprs[len(bodyExprs)-1], letEnv, nil
 }
 
 func evalDefine(e *expr, environ *env) (value, error) {
@@ -564,22 +731,6 @@ func evalDefine(e *expr, environ *env) (value, error) {
 	return voidValue, nil
 }
 
-func evalIf(e *expr, environ *env) (value, error) {
-	if len(e.list) < 3 || len(e.list) > 4 {
-		return value{}, fmt.Errorf("%d:%d: if: bad syntax", e.list[0].line, e.list[0].col)
-	}
-	cond, err := evalExpr(e.list[1], environ)
-	if err != nil {
-		return value{}, err
-	}
-	if isTruthy(cond) {
-		return evalExpr(e.list[2], environ)
-	}
-	if len(e.list) == 4 {
-		return evalExpr(e.list[3], environ)
-	}
-	return voidValue, nil
-}
 
 func evalLambda(e *expr, environ *env) (value, error) {
 	if len(e.list) < 3 {
@@ -612,165 +763,6 @@ func quoteExpr(e *expr) value {
 	return result
 }
 
-func evalAnd(e *expr, environ *env) (value, error) {
-	if len(e.list) == 1 {
-		return boolValue(true), nil
-	}
-	var result value
-	for _, sub := range e.list[1:] {
-		v, err := evalExpr(sub, environ)
-		if err != nil {
-			return value{}, err
-		}
-		result = v
-		if !isTruthy(v) {
-			return v, nil
-		}
-	}
-	return result, nil
-}
-
-func evalOr(e *expr, environ *env) (value, error) {
-	if len(e.list) == 1 {
-		return boolValue(false), nil
-	}
-	for _, sub := range e.list[1:] {
-		v, err := evalExpr(sub, environ)
-		if err != nil {
-			return value{}, err
-		}
-		if isTruthy(v) {
-			return v, nil
-		}
-	}
-	return boolValue(false), nil
-}
-
-func evalLet(e *expr, environ *env) (value, error) {
-	if len(e.list) < 3 {
-		return value{}, fmt.Errorf("%d:%d: let: bad syntax", e.list[0].line, e.list[0].col)
-	}
-
-	// Named let: (let name ((var init) ...) body ...)
-	nameIdx := 1
-	bodyStart := 2
-	var namedLetName string
-	if e.list[1].kind == "atom" && e.list[1].atom.typ == typeSymbol {
-		if len(e.list) < 4 {
-			return value{}, fmt.Errorf("%d:%d: let: bad syntax", e.list[0].line, e.list[0].col)
-		}
-		namedLetName = e.list[1].atom.strVal
-		nameIdx = 2
-		bodyStart = 3
-	}
-
-	bindings := e.list[nameIdx]
-	if bindings.kind != "list" {
-		return value{}, fmt.Errorf("%d:%d: let: expected bindings list", bindings.line, bindings.col)
-	}
-
-	params := make([]string, len(bindings.list))
-	initVals := make([]value, len(bindings.list))
-	for i, b := range bindings.list {
-		if b.kind != "list" || len(b.list) != 2 {
-			return value{}, fmt.Errorf("%d:%d: let: bad binding", b.line, b.col)
-		}
-		if b.list[0].kind != "atom" || b.list[0].atom.typ != typeSymbol {
-			return value{}, fmt.Errorf("%d:%d: let: expected symbol", b.list[0].line, b.list[0].col)
-		}
-		params[i] = b.list[0].atom.strVal
-		val, err := evalExpr(b.list[1], environ)
-		if err != nil {
-			return value{}, err
-		}
-		initVals[i] = val
-	}
-
-	if namedLetName != "" {
-		// Named let: create a recursive lambda and call it
-		letEnv := newEnv(environ)
-		lam := &lambda{params: params, body: e.list[bodyStart:], env: letEnv}
-		letEnv.set(namedLetName, value{typ: typeLambda, lambdaVal: lam})
-		// Call the lambda with init values
-		callEnv := newEnv(letEnv)
-		for i, p := range params {
-			callEnv.set(p, initVals[i])
-		}
-		var result value
-		var err error
-		for _, body := range e.list[bodyStart:] {
-			result, err = evalExpr(body, callEnv)
-			if err != nil {
-				return value{}, err
-			}
-		}
-		return result, nil
-	}
-
-	letEnv := newEnv(environ)
-	for i, p := range params {
-		letEnv.set(p, initVals[i])
-	}
-	var result value
-	var err error
-	for _, body := range e.list[bodyStart:] {
-		result, err = evalExpr(body, letEnv)
-		if err != nil {
-			return value{}, err
-		}
-	}
-	return result, nil
-}
-
-func evalBegin(e *expr, environ *env) (value, error) {
-	if len(e.list) < 2 {
-		return voidValue, nil
-	}
-	var result value
-	var err error
-	for _, body := range e.list[1:] {
-		result, err = evalExpr(body, environ)
-		if err != nil {
-			return value{}, err
-		}
-	}
-	return result, nil
-}
-
-func evalCond(e *expr, environ *env) (value, error) {
-	for _, clause := range e.list[1:] {
-		if clause.kind != "list" || len(clause.list) < 2 {
-			return value{}, fmt.Errorf("%d:%d: cond: bad clause", clause.line, clause.col)
-		}
-		// Check for else clause
-		if clause.list[0].kind == "atom" && clause.list[0].atom.typ == typeSymbol && clause.list[0].atom.strVal == "else" {
-			var result value
-			var err error
-			for _, body := range clause.list[1:] {
-				result, err = evalExpr(body, environ)
-				if err != nil {
-					return value{}, err
-				}
-			}
-			return result, nil
-		}
-		test, err := evalExpr(clause.list[0], environ)
-		if err != nil {
-			return value{}, err
-		}
-		if isTruthy(test) {
-			var result value
-			for _, body := range clause.list[1:] {
-				result, err = evalExpr(body, environ)
-				if err != nil {
-					return value{}, err
-				}
-			}
-			return result, nil
-		}
-	}
-	return voidValue, nil
-}
 
 func applyBuiltin(name string, args []value, e *expr, environ *env) (value, error) {
 	head := e.list[0]
