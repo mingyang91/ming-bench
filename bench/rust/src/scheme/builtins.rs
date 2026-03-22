@@ -274,28 +274,6 @@ pub(super) fn builtin_not(args: &[Value], env: &mut Env, output: &mut String) ->
     Ok(Value::Boolean(!val.is_truthy()))
 }
 
-pub(super) fn builtin_and(args: &[Value], env: &mut Env, output: &mut String) -> Result<Value, EvalError> {
-    let mut result = Value::Boolean(true);
-    for arg in args {
-        result = eval(arg, env, output)?;
-        if !result.is_truthy() {
-            return Ok(result);
-        }
-    }
-    Ok(result)
-}
-
-pub(super) fn builtin_or(args: &[Value], env: &mut Env, output: &mut String) -> Result<Value, EvalError> {
-    let mut result = Value::Boolean(false);
-    for arg in args {
-        result = eval(arg, env, output)?;
-        if result.is_truthy() {
-            return Ok(result);
-        }
-    }
-    Ok(result)
-}
-
 pub(super) fn builtin_string_ops(
     args: &[Value],
     env: &mut Env,

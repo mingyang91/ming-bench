@@ -1,13 +1,13 @@
 use crate::scheme::error::EvalError;
 use crate::scheme::parser::Span;
-use crate::scheme::{eval, Env, Value};
+use crate::scheme::{eval, Env, Tail, Value};
 
 pub(crate) fn eval_let(
     args: &[Value],
     env: &mut Env,
     span: Span,
     output: &mut String,
-) -> Result<Value, EvalError> {
+) -> Result<Tail, EvalError> {
     let (line, col) = span;
     if args.is_empty() {
         return Err(EvalError::Parse {
@@ -71,31 +71,25 @@ pub(crate) fn eval_let(
         let body: Vec<Value> = args[2..].to_vec();
         let lambda = Value::Lambda {
             name: Some(name.clone()),
-            params,
-            body,
+            params: params.clone(),
+            body: body.clone(),
             closure_env: env.clone(),
         };
         let mut local_env = env.clone();
-        local_env.insert(name.clone(), lambda.clone());
-        match &lambda {
-            Value::Lambda { params, body, .. } => {
-                for (param, val) in params.iter().zip(init_vals.iter()) {
-                    local_env.insert(param.clone(), val.clone());
-                }
-                let mut result = Value::Boolean(false);
-                for expr in body {
-                    result = eval(expr, &mut local_env, output)?;
-                }
-                Ok(result)
-            }
-            Value::Integer(_)
-            | Value::Boolean(_)
-            | Value::Str(_)
-            | Value::Char(_)
-            | Value::Symbol(..)
-            | Value::List(..)
-            | Value::Void => unreachable!(),
+        local_env.insert(name.clone(), lambda);
+        for (param, val) in params.iter().zip(init_vals.iter()) {
+            local_env.insert(param.clone(), val.clone());
         }
+        if body.is_empty() {
+            return Ok(Tail::Done(Value::Boolean(false)));
+        }
+        for expr in &body[..body.len() - 1] {
+            eval(expr, &mut local_env, output)?;
+        }
+        Ok(Tail::Call {
+            expr: body[body.len() - 1].clone(),
+            env: local_env,
+        })
     } else {
         // Regular let: (let ((var init) ...) body ...)
         let bindings = match &args[0] {
@@ -144,11 +138,17 @@ pub(crate) fn eval_let(
                 }
             }
         }
-        let mut result = Value::Boolean(false);
-        for expr in &args[1..] {
-            result = eval(expr, &mut local_env, output)?;
+        let body = &args[1..];
+        if body.is_empty() {
+            return Ok(Tail::Done(Value::Boolean(false)));
         }
-        Ok(result)
+        for expr in &body[..body.len() - 1] {
+            eval(expr, &mut local_env, output)?;
+        }
+        Ok(Tail::Call {
+            expr: body[body.len() - 1].clone(),
+            env: local_env,
+        })
     }
 }
 
@@ -306,33 +306,68 @@ pub(crate) fn eval_string_set(
     }
 }
 
+pub(crate) fn eval_and(
+    items: &[Value],
+    env: &mut Env,
+    output: &mut String,
+) -> Result<Tail, EvalError> {
+    if items.len() <= 1 {
+        return Ok(Tail::Done(Value::Boolean(true)));
+    }
+    for item in &items[1..items.len() - 1] {
+        let val = eval(item, env, output)?;
+        if !val.is_truthy() {
+            return Ok(Tail::Done(val));
+        }
+    }
+    Ok(Tail::Expr(items[items.len() - 1].clone()))
+}
+
+pub(crate) fn eval_or(
+    items: &[Value],
+    env: &mut Env,
+    output: &mut String,
+) -> Result<Tail, EvalError> {
+    if items.len() <= 1 {
+        return Ok(Tail::Done(Value::Boolean(false)));
+    }
+    for item in &items[1..items.len() - 1] {
+        let val = eval(item, env, output)?;
+        if val.is_truthy() {
+            return Ok(Tail::Done(val));
+        }
+    }
+    Ok(Tail::Expr(items[items.len() - 1].clone()))
+}
+
 pub(crate) fn eval_cond(
     clauses: &[Value],
     env: &mut Env,
     output: &mut String,
-) -> Result<Value, EvalError> {
+) -> Result<Tail, EvalError> {
     for clause in clauses {
         match clause {
             Value::List(items, _) if !items.is_empty() => {
                 if let Value::Symbol(s, _) = &items[0] {
                     if s == "else" {
-                        let mut result = Value::Boolean(false);
-                        for expr in &items[1..] {
-                            result = eval(expr, env, output)?;
+                        if items.len() <= 1 {
+                            return Ok(Tail::Done(Value::Boolean(false)));
                         }
-                        return Ok(result);
+                        for expr in &items[1..items.len() - 1] {
+                            eval(expr, env, output)?;
+                        }
+                        return Ok(Tail::Expr(items[items.len() - 1].clone()));
                     }
                 }
                 let test = eval(&items[0], env, output)?;
                 if test.is_truthy() {
                     if items.len() == 1 {
-                        return Ok(test);
+                        return Ok(Tail::Done(test));
                     }
-                    let mut result = Value::Boolean(false);
-                    for expr in &items[1..] {
-                        result = eval(expr, env, output)?;
+                    for expr in &items[1..items.len() - 1] {
+                        eval(expr, env, output)?;
                     }
-                    return Ok(result);
+                    return Ok(Tail::Expr(items[items.len() - 1].clone()));
                 }
             }
             other => {
@@ -344,5 +379,145 @@ pub(crate) fn eval_cond(
             }
         }
     }
-    Ok(Value::Boolean(false))
+    Ok(Tail::Done(Value::Boolean(false)))
+}
+
+pub(crate) fn eval_lambda(
+    items: &[Value],
+    env: &Env,
+    span: Span,
+) -> Result<Value, EvalError> {
+    let (line, col) = span;
+    if items.len() < 3 {
+        return Err(EvalError::Parse {
+            message: "lambda requires params and body".to_string(),
+            line,
+            col,
+        });
+    }
+    let params = match &items[1] {
+        Value::List(param_list, _) => param_list
+            .iter()
+            .map(|p| match p {
+                Value::Symbol(s, _) => Ok(s.clone()),
+                other => Err(EvalError::TypeError {
+                    message: format!(
+                        "lambda: expected symbol for parameter, got {}",
+                        other.type_name()
+                    ),
+                    line,
+                    col,
+                }),
+            })
+            .collect::<Result<Vec<_>, _>>()?,
+        other => {
+            return Err(EvalError::TypeError {
+                message: format!(
+                    "lambda: expected parameter list, got {}",
+                    other.type_name()
+                ),
+                line,
+                col,
+            })
+        }
+    };
+    let body: Vec<Value> = items[2..].to_vec();
+    Ok(Value::Lambda {
+        name: None,
+        params,
+        body,
+        closure_env: env.clone(),
+    })
+}
+
+fn is_define_form(expr: &Value) -> bool {
+    if let Value::List(items, _) = expr {
+        if let Some(Value::Symbol(s, _)) = items.first() {
+            return s == "define";
+        }
+    }
+    false
+}
+
+fn patch_closures(env: &mut Env) {
+    let snapshot = env.clone();
+    for val in env.values_mut() {
+        if let Value::Lambda { closure_env, .. } = val {
+            for (k, v) in &snapshot {
+                closure_env.entry(k.clone()).or_insert_with(|| v.clone());
+            }
+        }
+    }
+}
+
+pub(crate) fn apply_lambda(
+    func: Value,
+    args: Vec<Value>,
+    caller_env: &Env,
+    span: Span,
+    output: &mut String,
+) -> Result<Tail, EvalError> {
+    let (line, col) = span;
+    match func {
+        Value::Lambda {
+            ref name,
+            ref params,
+            ref body,
+            ref closure_env,
+        } => {
+            if params.len() != args.len() {
+                return Err(EvalError::Arity {
+                    procedure: name.as_deref().unwrap_or("lambda").to_string(),
+                    expected: params.len().to_string(),
+                    got: args.len(),
+                    line,
+                    col,
+                });
+            }
+            let mut new_env = closure_env.clone();
+            for (k, v) in caller_env.iter() {
+                new_env.entry(k.clone()).or_insert_with(|| v.clone());
+            }
+            if let Some(fn_name) = name {
+                new_env.insert(fn_name.clone(), func.clone());
+            }
+            for (param, arg) in params.iter().zip(args) {
+                new_env.insert(param.clone(), arg);
+            }
+
+            // Scan for internal defines
+            let mut body_start = 0;
+            for (i, expr) in body.iter().enumerate() {
+                if is_define_form(expr) {
+                    body_start = i + 1;
+                    continue;
+                }
+                break;
+            }
+
+            if body_start > 0 {
+                for item in body.iter().take(body_start) {
+                    eval(item, &mut new_env, output)?;
+                }
+                patch_closures(&mut new_env);
+            }
+
+            if body.len() > body_start {
+                for expr in &body[body_start..body.len() - 1] {
+                    eval(expr, &mut new_env, output)?;
+                }
+                Ok(Tail::Call {
+                    expr: body[body.len() - 1].clone(),
+                    env: new_env,
+                })
+            } else {
+                Ok(Tail::Done(Value::Boolean(false)))
+            }
+        }
+        other => Err(EvalError::TypeError {
+            message: format!("not a procedure: {}", other.display()),
+            line,
+            col,
+        }),
+    }
 }

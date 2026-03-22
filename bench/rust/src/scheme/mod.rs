@@ -6,11 +6,11 @@ mod parser;
 pub use error::EvalError;
 
 use builtins::{
-    builtin_add, builtin_and, builtin_append, builtin_car, builtin_cdr, builtin_cmp,
+    builtin_add, builtin_append, builtin_car, builtin_cdr, builtin_cmp,
     builtin_cons, builtin_div, builtin_length, builtin_list, builtin_mul, builtin_not,
-    builtin_null, builtin_or, builtin_string_ops, builtin_sub, builtin_type_pred,
+    builtin_null, builtin_string_ops, builtin_sub, builtin_type_pred,
 };
-use forms::{eval_cond, eval_define, eval_let, eval_string_set};
+use forms::{apply_lambda, eval_and, eval_define, eval_lambda, eval_or, eval_string_set};
 use parser::{parse_all, Span};
 use std::collections::HashMap;
 
@@ -32,6 +32,13 @@ pub(crate) enum Value {
         body: Vec<Value>,
         closure_env: Env,
     },
+}
+
+/// Result of a form evaluation that may be a tail expression.
+pub(crate) enum Tail {
+    Done(Value),
+    Expr(Value),
+    Call { expr: Value, env: Env },
 }
 
 impl Value {
@@ -104,277 +111,249 @@ fn default_env() -> Env {
     Env::new()
 }
 
-pub(crate) fn eval(expr: &Value, env: &mut Env, output: &mut String) -> Result<Value, EvalError> {
-    match expr {
-        Value::Integer(_) | Value::Boolean(_) | Value::Str(_) | Value::Char(_)
-        | Value::Void | Value::Lambda { .. } => Ok(expr.clone()),
-        Value::Symbol(name, span) => {
-            env.get(name).cloned().ok_or_else(|| EvalError::UnboundVariable {
-                name: name.clone(),
-                line: span.0,
-                col: span.1,
-            })
+/// Handle a `Tail` result inside the trampoline loop. Returns `Some(value)` for
+/// `Done`, or `None` when the caller should `continue` the loop (after updating
+/// `current` and optionally `owned_env`).
+macro_rules! dispatch_tail {
+    ($tail:expr, $current:ident, $owned_env:ident) => {
+        match $tail {
+            Tail::Done(val) => return Ok(val),
+            Tail::Expr(expr) => {
+                $current = expr;
+                continue;
+            }
+            Tail::Call { expr, env: new_env } => {
+                $current = expr;
+                $owned_env = Some(new_env);
+                continue;
+            }
         }
-        Value::List(items, span) => {
-            let (line, col) = *span;
-            if items.is_empty() {
-                return Err(EvalError::Parse {
-                    message: "empty application".to_string(),
-                    line,
-                    col,
+    };
+}
+
+pub(crate) fn eval(expr: &Value, env: &mut Env, output: &mut String) -> Result<Value, EvalError> {
+    let mut current = expr.clone();
+    let mut owned_env: Option<Env> = None;
+
+    loop {
+        let active_env = owned_env.as_mut().unwrap_or(env);
+
+        match current {
+            val @ (Value::Integer(_) | Value::Boolean(_) | Value::Str(_) | Value::Char(_)
+            | Value::Void | Value::Lambda { .. }) => return Ok(val),
+
+            Value::Symbol(ref name, span) => {
+                return active_env.get(name).cloned().ok_or_else(|| EvalError::UnboundVariable {
+                    name: name.clone(),
+                    line: span.0,
+                    col: span.1,
                 });
             }
 
-            if let Value::Symbol(op, _) = &items[0] {
-                match op.as_str() {
-                    "quote" => {
-                        if items.len() != 2 {
-                            return Err(EvalError::Arity {
-                                procedure: "quote".to_string(),
-                                expected: "1".to_string(),
-                                got: items.len() - 1,
-                                line,
-                                col,
-                            });
+            Value::List(items, span) => {
+                let (line, col) = span;
+                if items.is_empty() {
+                    return Err(EvalError::Parse {
+                        message: "empty application".to_string(),
+                        line,
+                        col,
+                    });
+                }
+
+                let op_name: Option<String> = match &items[0] {
+                    Value::Symbol(s, _) => Some(s.clone()),
+                    _ => None,
+                };
+
+                if let Some(ref op) = op_name {
+                    match op.as_str() {
+                        "quote" => {
+                            if items.len() != 2 {
+                                return Err(EvalError::Arity {
+                                    procedure: "quote".to_string(),
+                                    expected: "1".to_string(),
+                                    got: items.len() - 1,
+                                    line,
+                                    col,
+                                });
+                            }
+                            return Ok(items[1].clone());
                         }
-                        return Ok(items[1].clone());
-                    }
-                    "if" => {
-                        if items.len() < 3 || items.len() > 4 {
-                            return Err(EvalError::Parse {
-                                message: "if requires 2 or 3 arguments".to_string(),
-                                line,
-                                col,
-                            });
+                        "if" => {
+                            if items.len() < 3 || items.len() > 4 {
+                                return Err(EvalError::Parse {
+                                    message: "if requires 2 or 3 arguments".to_string(),
+                                    line,
+                                    col,
+                                });
+                            }
+                            let cond = eval(&items[1], active_env, output)?;
+                            if cond.is_truthy() {
+                                current = items[2].clone();
+                                continue;
+                            } else if items.len() == 4 {
+                                current = items[3].clone();
+                                continue;
+                            }
+                            return Ok(Value::Boolean(false));
                         }
-                        let cond = eval(&items[1], env, output)?;
-                        if cond.is_truthy() {
-                            return eval(&items[2], env, output);
-                        } else if items.len() == 4 {
-                            return eval(&items[3], env, output);
+                        "define" => return eval_define(&items, active_env, (line, col), output),
+                        "lambda" => return eval_lambda(&items, active_env, (line, col)),
+                        "begin" => {
+                            if items.len() <= 1 {
+                                return Ok(Value::Boolean(false));
+                            }
+                            for item in &items[1..items.len() - 1] {
+                                eval(item, active_env, output)?;
+                            }
+                            current = items[items.len() - 1].clone();
+                            continue;
                         }
-                        return Ok(Value::Boolean(false));
-                    }
-                    "define" => return eval_define(items, env, (line, col), output),
-                    "lambda" => {
-                        if items.len() < 3 {
-                            return Err(EvalError::Parse {
-                                message: "lambda requires params and body".to_string(),
-                                line,
-                                col,
-                            });
+                        "and" => {
+                            dispatch_tail!(eval_and(&items, active_env, output)?, current, owned_env);
                         }
-                        let params = match &items[1] {
-                            Value::List(param_list, _) => param_list
-                                .iter()
-                                .map(|p| match p {
-                                    Value::Symbol(s, _) => Ok(s.clone()),
-                                    other => Err(EvalError::TypeError {
-                                        message: format!(
-                                            "lambda: expected symbol for parameter, got {}",
-                                            other.type_name()
-                                        ),
-                                        line,
-                                        col,
-                                    }),
-                                })
-                                .collect::<Result<Vec<_>, _>>()?,
-                            other => {
-                                return Err(EvalError::TypeError {
+                        "or" => {
+                            dispatch_tail!(eval_or(&items, active_env, output)?, current, owned_env);
+                        }
+                        "cond" => {
+                            dispatch_tail!(
+                                forms::eval_cond(&items[1..], active_env, output)?,
+                                current,
+                                owned_env
+                            );
+                        }
+                        "let" => {
+                            dispatch_tail!(
+                                forms::eval_let(&items[1..], active_env, (line, col), output)?,
+                                current,
+                                owned_env
+                            );
+                        }
+                        "+" => return builtin_add(&items[1..], active_env, output)
+                            .map_err(|e| e.with_position(line, col)),
+                        "-" => return builtin_sub(&items[1..], active_env, output)
+                            .map_err(|e| e.with_position(line, col)),
+                        "*" => return builtin_mul(&items[1..], active_env, output)
+                            .map_err(|e| e.with_position(line, col)),
+                        "/" => return builtin_div(&items[1..], active_env, output)
+                            .map_err(|e| e.with_position(line, col)),
+                        "<" => return builtin_cmp(&items[1..], active_env, "<", output)
+                            .map_err(|e| e.with_position(line, col)),
+                        ">" => return builtin_cmp(&items[1..], active_env, ">", output)
+                            .map_err(|e| e.with_position(line, col)),
+                        "=" => return builtin_cmp(&items[1..], active_env, "=", output)
+                            .map_err(|e| e.with_position(line, col)),
+                        "<=" => return builtin_cmp(&items[1..], active_env, "<=", output)
+                            .map_err(|e| e.with_position(line, col)),
+                        ">=" => return builtin_cmp(&items[1..], active_env, ">=", output)
+                            .map_err(|e| e.with_position(line, col)),
+                        "not" => return builtin_not(&items[1..], active_env, output)
+                            .map_err(|e| e.with_position(line, col)),
+                        "cons" => return builtin_cons(&items[1..], active_env, output)
+                            .map_err(|e| e.with_position(line, col)),
+                        "car" => return builtin_car(&items[1..], active_env, output)
+                            .map_err(|e| e.with_position(line, col)),
+                        "cdr" => return builtin_cdr(&items[1..], active_env, output)
+                            .map_err(|e| e.with_position(line, col)),
+                        "null?" => return builtin_null(&items[1..], active_env, output)
+                            .map_err(|e| e.with_position(line, col)),
+                        "list" => return builtin_list(&items[1..], active_env, output)
+                            .map_err(|e| e.with_position(line, col)),
+                        "length" => return builtin_length(&items[1..], active_env, output)
+                            .map_err(|e| e.with_position(line, col)),
+                        "append" => return builtin_append(&items[1..], active_env, output)
+                            .map_err(|e| e.with_position(line, col)),
+                        "string?" | "number?" | "boolean?" | "pair?" | "symbol?" | "char?" => {
+                            return builtin_type_pred(&items[1..], active_env, op.as_str(), output)
+                                .map_err(|e| e.with_position(line, col));
+                        }
+                        "display" => {
+                            if items.len() != 2 {
+                                return Err(EvalError::Arity {
+                                    procedure: "display".to_string(),
+                                    expected: "1".to_string(),
+                                    got: items.len() - 1,
+                                    line,
+                                    col,
+                                });
+                            }
+                            let val = eval(&items[1], active_env, output)?;
+                            output.push_str(&val.display_repr());
+                            return Ok(Value::Void);
+                        }
+                        "write" => {
+                            if items.len() != 2 {
+                                return Err(EvalError::Arity {
+                                    procedure: "write".to_string(),
+                                    expected: "1".to_string(),
+                                    got: items.len() - 1,
+                                    line,
+                                    col,
+                                });
+                            }
+                            let val = eval(&items[1], active_env, output)?;
+                            output.push_str(&val.display());
+                            return Ok(Value::Void);
+                        }
+                        "newline" => {
+                            if items.len() != 1 {
+                                return Err(EvalError::Arity {
+                                    procedure: "newline".to_string(),
+                                    expected: "0".to_string(),
+                                    got: items.len() - 1,
+                                    line,
+                                    col,
+                                });
+                            }
+                            output.push('\n');
+                            return Ok(Value::Void);
+                        }
+                        "string-append" | "string-length" | "substring"
+                        | "string->number" | "number->string"
+                        | "symbol->string" | "string->symbol" | "string-ref" => {
+                            return builtin_string_ops(&items[1..], active_env, op.as_str(), output)
+                                .map_err(|e| e.with_position(line, col));
+                        }
+                        "string-copy" => {
+                            if items.len() != 2 {
+                                return Err(EvalError::Arity {
+                                    procedure: "string-copy".to_string(),
+                                    expected: "1".to_string(),
+                                    got: items.len() - 1,
+                                    line,
+                                    col,
+                                });
+                            }
+                            let val = eval(&items[1], active_env, output)?;
+                            match val {
+                                Value::Str(s) => return Ok(Value::Str(s)),
+                                other => return Err(EvalError::TypeError {
                                     message: format!(
-                                        "lambda: expected parameter list, got {}",
+                                        "string-copy: expected string, got {}",
                                         other.type_name()
                                     ),
                                     line,
                                     col,
-                                })
+                                }),
                             }
-                        };
-                        let body: Vec<Value> = items[2..].to_vec();
-                        return Ok(Value::Lambda {
-                            name: None,
-                            params,
-                            body,
-                            closure_env: env.clone(),
-                        });
-                    }
-                    "+" => return builtin_add(&items[1..], env, output).map_err(|e| e.with_position(line, col)),
-                    "-" => return builtin_sub(&items[1..], env, output).map_err(|e| e.with_position(line, col)),
-                    "*" => return builtin_mul(&items[1..], env, output).map_err(|e| e.with_position(line, col)),
-                    "/" => return builtin_div(&items[1..], env, output).map_err(|e| e.with_position(line, col)),
-                    "<" => return builtin_cmp(&items[1..], env, "<", output).map_err(|e| e.with_position(line, col)),
-                    ">" => return builtin_cmp(&items[1..], env, ">", output).map_err(|e| e.with_position(line, col)),
-                    "=" => return builtin_cmp(&items[1..], env, "=", output).map_err(|e| e.with_position(line, col)),
-                    "<=" => return builtin_cmp(&items[1..], env, "<=", output).map_err(|e| e.with_position(line, col)),
-                    ">=" => return builtin_cmp(&items[1..], env, ">=", output).map_err(|e| e.with_position(line, col)),
-                    "not" => return builtin_not(&items[1..], env, output).map_err(|e| e.with_position(line, col)),
-                    "and" => return builtin_and(&items[1..], env, output).map_err(|e| e.with_position(line, col)),
-                    "or" => return builtin_or(&items[1..], env, output).map_err(|e| e.with_position(line, col)),
-                    "cons" => return builtin_cons(&items[1..], env, output).map_err(|e| e.with_position(line, col)),
-                    "car" => return builtin_car(&items[1..], env, output).map_err(|e| e.with_position(line, col)),
-                    "cdr" => return builtin_cdr(&items[1..], env, output).map_err(|e| e.with_position(line, col)),
-                    "null?" => return builtin_null(&items[1..], env, output).map_err(|e| e.with_position(line, col)),
-                    "list" => return builtin_list(&items[1..], env, output).map_err(|e| e.with_position(line, col)),
-                    "length" => return builtin_length(&items[1..], env, output).map_err(|e| e.with_position(line, col)),
-                    "append" => return builtin_append(&items[1..], env, output).map_err(|e| e.with_position(line, col)),
-                    "string?" | "number?" | "boolean?" | "pair?" | "symbol?" | "char?" => {
-                        return builtin_type_pred(&items[1..], env, op.as_str(), output)
-                            .map_err(|e| e.with_position(line, col));
-                    }
-                    "display" => {
-                        if items.len() != 2 {
-                            return Err(EvalError::Arity {
-                                procedure: "display".to_string(),
-                                expected: "1".to_string(),
-                                got: items.len() - 1,
-                                line,
-                                col,
-                            });
                         }
-                        let val = eval(&items[1], env, output)?;
-                        output.push_str(&val.display_repr());
-                        return Ok(Value::Void);
-                    }
-                    "write" => {
-                        if items.len() != 2 {
-                            return Err(EvalError::Arity {
-                                procedure: "write".to_string(),
-                                expected: "1".to_string(),
-                                got: items.len() - 1,
-                                line,
-                                col,
-                            });
+                        "string-set!" => {
+                            return eval_string_set(&items, active_env, (line, col), output);
                         }
-                        let val = eval(&items[1], env, output)?;
-                        output.push_str(&val.display());
-                        return Ok(Value::Void);
+                        _ => {}
                     }
-                    "newline" => {
-                        if items.len() != 1 {
-                            return Err(EvalError::Arity {
-                                procedure: "newline".to_string(),
-                                expected: "0".to_string(),
-                                got: items.len() - 1,
-                                line,
-                                col,
-                            });
-                        }
-                        output.push('\n');
-                        return Ok(Value::Void);
-                    }
-                    "string-append" | "string-length" | "substring"
-                    | "string->number" | "number->string"
-                    | "symbol->string" | "string->symbol" | "string-ref" => {
-                        return builtin_string_ops(&items[1..], env, op.as_str(), output)
-                            .map_err(|e| e.with_position(line, col));
-                    }
-                    "string-copy" => {
-                        if items.len() != 2 {
-                            return Err(EvalError::Arity {
-                                procedure: "string-copy".to_string(),
-                                expected: "1".to_string(),
-                                got: items.len() - 1,
-                                line,
-                                col,
-                            });
-                        }
-                        let val = eval(&items[1], env, output)?;
-                        match val {
-                            Value::Str(s) => return Ok(Value::Str(s)),
-                            other => return Err(EvalError::TypeError {
-                                message: format!("string-copy: expected string, got {}", other.type_name()),
-                                line,
-                                col,
-                            }),
-                        }
-                    }
-                    "string-set!" => return eval_string_set(items, env, (line, col), output),
-                    "let" => return eval_let(&items[1..], env, (line, col), output),
-                    "begin" => {
-                        let mut result = Value::Boolean(false);
-                        for expr in &items[1..] {
-                            result = eval(expr, env, output)?;
-                        }
-                        return Ok(result);
-                    }
-                    "cond" => return eval_cond(&items[1..], env, output),
-                    _ => {}
                 }
-            }
 
-            // Function application
-            let func = eval(&items[0], env, output)?;
-            let args = eval_args(&items[1..], env, output)?;
-            apply_function(&func, &args, output).map_err(|e| e.with_position(line, col))
+                // Function application
+                let func = eval(&items[0], active_env, output)?;
+                let args = eval_args(&items[1..], active_env, output)?;
+                dispatch_tail!(
+                    apply_lambda(func, args, active_env, (line, col), output)?,
+                    current,
+                    owned_env
+                );
+            }
         }
-    }
-}
-
-fn apply_function(func: &Value, args: &[Value], output: &mut String) -> Result<Value, EvalError> {
-    match func {
-        Value::Lambda {
-            name,
-            params,
-            body,
-            closure_env,
-        } => {
-            if params.len() != args.len() {
-                return Err(EvalError::Arity {
-                    procedure: name.as_deref().unwrap_or("lambda").to_string(),
-                    expected: params.len().to_string(),
-                    got: args.len(),
-                    line: 0,
-                    col: 0,
-                });
-            }
-            let mut local_env = closure_env.clone();
-            if let Some(fn_name) = name {
-                local_env.insert(fn_name.clone(), func.clone());
-            }
-            for (param, arg) in params.iter().zip(args.iter()) {
-                local_env.insert(param.clone(), arg.clone());
-            }
-            // Scan for internal defines
-            let mut internal_defs = Vec::new();
-            let mut body_start = 0;
-            for (i, expr) in body.iter().enumerate() {
-                if let Value::List(items, _) = expr {
-                    if let Some(Value::Symbol(s, _)) = items.first() {
-                        if s == "define" {
-                            internal_defs.push(i);
-                            body_start = i + 1;
-                            continue;
-                        }
-                    }
-                }
-                break;
-            }
-
-            if !internal_defs.is_empty() {
-                for &idx in &internal_defs {
-                    eval(&body[idx], &mut local_env, output)?;
-                }
-                let snapshot = local_env.clone();
-                for val in local_env.values_mut() {
-                    if let Value::Lambda { closure_env, .. } = val {
-                        for (k, v) in &snapshot {
-                            closure_env.entry(k.clone()).or_insert_with(|| v.clone());
-                        }
-                    }
-                }
-            }
-
-            let mut result = Value::Boolean(false);
-            for expr in &body[body_start..] {
-                result = eval(expr, &mut local_env, output)?;
-            }
-            Ok(result)
-        }
-        other => Err(EvalError::TypeError {
-            message: format!("not a procedure: {}", other.display()),
-            line: 0,
-            col: 0,
-        }),
     }
 }
 
