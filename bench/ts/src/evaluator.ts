@@ -502,6 +502,230 @@ function makeGlobalEnv(output: string[] = []): Env {
     return { tag: 'nil' };
   }});
 
+  // Equality
+  function valuesEqual(a: Value, b: Value): boolean {
+    if (a.tag !== b.tag) return false;
+    switch (a.tag) {
+      case 'number': return a.value === (b as typeof a).value;
+      case 'boolean': return a.value === (b as typeof a).value;
+      case 'string': return a.value === (b as typeof a).value;
+      case 'char': return a.value === (b as typeof a).value;
+      case 'symbol': return a.name === (b as typeof a).name;
+      case 'nil': return true;
+      case 'pair': return valuesEqual(a.car, (b as typeof a).car) && valuesEqual(a.cdr, (b as typeof a).cdr);
+      default: return a === b;
+    }
+  }
+
+  env.define('eq?', { tag: 'builtin', name: 'eq?', fn(args) {
+    if (args.length !== 2) throw new EvalError('eq?: expected 2 arguments');
+    const a = args[0], b = args[1];
+    if (a.tag !== b.tag) return { tag: 'boolean', value: false };
+    switch (a.tag) {
+      case 'number': return { tag: 'boolean', value: a.value === (b as typeof a).value };
+      case 'boolean': return { tag: 'boolean', value: a.value === (b as typeof a).value };
+      case 'symbol': return { tag: 'boolean', value: a.name === (b as typeof a).name };
+      case 'char': return { tag: 'boolean', value: a.value === (b as typeof a).value };
+      case 'nil': return { tag: 'boolean', value: true };
+      default: return { tag: 'boolean', value: a === b };
+    }
+  }});
+  env.define('equal?', { tag: 'builtin', name: 'equal?', fn(args) {
+    if (args.length !== 2) throw new EvalError('equal?: expected 2 arguments');
+    return { tag: 'boolean', value: valuesEqual(args[0], args[1]) };
+  }});
+  env.define('eqv?', { tag: 'builtin', name: 'eqv?', fn(args) {
+    if (args.length !== 2) throw new EvalError('eqv?: expected 2 arguments');
+    const a = args[0], b = args[1];
+    if (a.tag !== b.tag) return { tag: 'boolean', value: false };
+    switch (a.tag) {
+      case 'number': return { tag: 'boolean', value: a.value === (b as typeof a).value };
+      case 'boolean': return { tag: 'boolean', value: a.value === (b as typeof a).value };
+      case 'symbol': return { tag: 'boolean', value: a.name === (b as typeof a).name };
+      case 'char': return { tag: 'boolean', value: a.value === (b as typeof a).value };
+      case 'nil': return { tag: 'boolean', value: true };
+      default: return { tag: 'boolean', value: a === b };
+    }
+  }});
+
+  // L13 Numeric builtins
+  env.define('abs', { tag: 'builtin', name: 'abs', fn(args) {
+    if (args.length !== 1 || args[0].tag !== 'number') throw new EvalError('abs: expected number');
+    return { tag: 'number', value: Math.abs(args[0].value) };
+  }});
+  env.define('modulo', { tag: 'builtin', name: 'modulo', fn(args) {
+    const nums = requireNumbers(args, 'modulo');
+    if (nums.length !== 2) throw new EvalError('modulo: expected 2 arguments');
+    const [a, b] = nums;
+    return { tag: 'number', value: ((a % b) + b) % b };
+  }});
+  env.define('remainder', { tag: 'builtin', name: 'remainder', fn(args) {
+    const nums = requireNumbers(args, 'remainder');
+    if (nums.length !== 2) throw new EvalError('remainder: expected 2 arguments');
+    return { tag: 'number', value: nums[0] % nums[1] };
+  }});
+  env.define('quotient', { tag: 'builtin', name: 'quotient', fn(args) {
+    const nums = requireNumbers(args, 'quotient');
+    if (nums.length !== 2) throw new EvalError('quotient: expected 2 arguments');
+    return { tag: 'number', value: Math.trunc(nums[0] / nums[1]) };
+  }});
+  env.define('min', { tag: 'builtin', name: 'min', fn(args) {
+    if (args.length === 0) throw new EvalError('min: need at least 1 argument');
+    const nums = requireNumbers(args, 'min');
+    return { tag: 'number', value: Math.min(...nums) };
+  }});
+  env.define('max', { tag: 'builtin', name: 'max', fn(args) {
+    if (args.length === 0) throw new EvalError('max: need at least 1 argument');
+    const nums = requireNumbers(args, 'max');
+    return { tag: 'number', value: Math.max(...nums) };
+  }});
+  env.define('expt', { tag: 'builtin', name: 'expt', fn(args) {
+    const nums = requireNumbers(args, 'expt');
+    if (nums.length !== 2) throw new EvalError('expt: expected 2 arguments');
+    return { tag: 'number', value: Math.pow(nums[0], nums[1]) };
+  }});
+  env.define('zero?', { tag: 'builtin', name: 'zero?', fn(args) {
+    if (args.length !== 1 || args[0].tag !== 'number') throw new EvalError('zero?: expected number');
+    return { tag: 'boolean', value: args[0].value === 0 };
+  }});
+  env.define('positive?', { tag: 'builtin', name: 'positive?', fn(args) {
+    if (args.length !== 1 || args[0].tag !== 'number') throw new EvalError('positive?: expected number');
+    return { tag: 'boolean', value: args[0].value > 0 };
+  }});
+  env.define('negative?', { tag: 'builtin', name: 'negative?', fn(args) {
+    if (args.length !== 1 || args[0].tag !== 'number') throw new EvalError('negative?: expected number');
+    return { tag: 'boolean', value: args[0].value < 0 };
+  }});
+  env.define('odd?', { tag: 'builtin', name: 'odd?', fn(args) {
+    if (args.length !== 1 || args[0].tag !== 'number') throw new EvalError('odd?: expected number');
+    return { tag: 'boolean', value: Math.abs(args[0].value) % 2 === 1 };
+  }});
+  env.define('even?', { tag: 'builtin', name: 'even?', fn(args) {
+    if (args.length !== 1 || args[0].tag !== 'number') throw new EvalError('even?: expected number');
+    return { tag: 'boolean', value: args[0].value % 2 === 0 };
+  }});
+
+  // L13 List builtins
+  env.define('list-ref', { tag: 'builtin', name: 'list-ref', fn(args) {
+    if (args.length !== 2 || args[1].tag !== 'number') throw new EvalError('list-ref: expected list and number');
+    let cur = args[0];
+    let idx = args[1].value;
+    while (idx > 0) {
+      if (cur.tag !== 'pair') throw new EvalError('list-ref: index out of range');
+      cur = cur.cdr;
+      idx--;
+    }
+    if (cur.tag !== 'pair') throw new EvalError('list-ref: index out of range');
+    return cur.car;
+  }});
+  env.define('list-tail', { tag: 'builtin', name: 'list-tail', fn(args) {
+    if (args.length !== 2 || args[1].tag !== 'number') throw new EvalError('list-tail: expected list and number');
+    let cur = args[0];
+    let idx = args[1].value;
+    while (idx > 0) {
+      if (cur.tag !== 'pair') throw new EvalError('list-tail: index out of range');
+      cur = cur.cdr;
+      idx--;
+    }
+    return cur;
+  }});
+  env.define('list?', { tag: 'builtin', name: 'list?', fn(args) {
+    if (args.length !== 1) throw new EvalError('list?: expected 1 argument');
+    let cur = args[0];
+    while (cur.tag === 'pair') cur = cur.cdr;
+    return { tag: 'boolean', value: cur.tag === 'nil' };
+  }});
+  env.define('assoc', { tag: 'builtin', name: 'assoc', fn(args) {
+    if (args.length !== 2) throw new EvalError('assoc: expected 2 arguments');
+    const key = args[0];
+    let alist = args[1];
+    while (alist.tag === 'pair') {
+      const entry = alist.car;
+      if (entry.tag === 'pair' && valuesEqual(entry.car, key)) return entry;
+      alist = alist.cdr;
+    }
+    return { tag: 'boolean', value: false };
+  }});
+
+  // map (supports multiple list arguments)
+  env.define('map', { tag: 'builtin', name: 'map', fn(args) {
+    if (args.length < 2) throw new EvalError('map: need at least 2 arguments');
+    const proc = args[0];
+    // Collect all lists into arrays
+    const lists: Value[][] = [];
+    for (let i = 1; i < args.length; i++) {
+      const arr: Value[] = [];
+      let cur = args[i];
+      while (cur.tag === 'pair') { arr.push(cur.car); cur = cur.cdr; }
+      lists.push(arr);
+    }
+    const len = lists[0].length;
+    let result: Value = { tag: 'nil' };
+    const results: Value[] = [];
+    for (let i = 0; i < len; i++) {
+      const callArgs = lists.map(l => l[i]);
+      if (proc.tag === 'builtin') {
+        results.push(proc.fn(callArgs));
+      } else if (proc.tag === 'lambda') {
+        results.push(applyFn(proc, callArgs, { line: 0, col: 0 }));
+      } else {
+        throw new EvalError('map: first argument must be a procedure');
+      }
+    }
+    for (let i = results.length - 1; i >= 0; i--) {
+      result = { tag: 'pair', car: results[i], cdr: result };
+    }
+    return result;
+  }});
+
+  // L13 Character builtins
+  env.define('char-alphabetic?', { tag: 'builtin', name: 'char-alphabetic?', fn(args) {
+    if (args.length !== 1 || args[0].tag !== 'char') throw new EvalError('char-alphabetic?: expected char');
+    return { tag: 'boolean', value: /^[a-zA-Z]$/.test(args[0].value) };
+  }});
+  env.define('char-numeric?', { tag: 'builtin', name: 'char-numeric?', fn(args) {
+    if (args.length !== 1 || args[0].tag !== 'char') throw new EvalError('char-numeric?: expected char');
+    return { tag: 'boolean', value: /^[0-9]$/.test(args[0].value) };
+  }});
+  env.define('char-upcase', { tag: 'builtin', name: 'char-upcase', fn(args) {
+    if (args.length !== 1 || args[0].tag !== 'char') throw new EvalError('char-upcase: expected char');
+    return { tag: 'char', value: args[0].value.toUpperCase() };
+  }});
+  env.define('char-downcase', { tag: 'builtin', name: 'char-downcase', fn(args) {
+    if (args.length !== 1 || args[0].tag !== 'char') throw new EvalError('char-downcase: expected char');
+    return { tag: 'char', value: args[0].value.toLowerCase() };
+  }});
+  env.define('char=?', { tag: 'builtin', name: 'char=?', fn(args) {
+    if (args.length !== 2 || args[0].tag !== 'char' || args[1].tag !== 'char') throw new EvalError('char=?: expected chars');
+    return { tag: 'boolean', value: args[0].value === args[1].value };
+  }});
+  env.define('char<?', { tag: 'builtin', name: 'char<?', fn(args) {
+    if (args.length !== 2 || args[0].tag !== 'char' || args[1].tag !== 'char') throw new EvalError('char<?: expected chars');
+    return { tag: 'boolean', value: args[0].value < args[1].value };
+  }});
+
+  // L13 String builtins
+  env.define('string=?', { tag: 'builtin', name: 'string=?', fn(args) {
+    if (args.length !== 2 || args[0].tag !== 'string' || args[1].tag !== 'string') throw new EvalError('string=?: expected strings');
+    return { tag: 'boolean', value: args[0].value === args[1].value };
+  }});
+  env.define('string<?', { tag: 'builtin', name: 'string<?', fn(args) {
+    if (args.length !== 2 || args[0].tag !== 'string' || args[1].tag !== 'string') throw new EvalError('string<?: expected strings');
+    return { tag: 'boolean', value: args[0].value < args[1].value };
+  }});
+  env.define('string-ci=?', { tag: 'builtin', name: 'string-ci=?', fn(args) {
+    if (args.length !== 2 || args[0].tag !== 'string' || args[1].tag !== 'string') throw new EvalError('string-ci=?: expected strings');
+    return { tag: 'boolean', value: args[0].value.toLowerCase() === args[1].value.toLowerCase() };
+  }});
+  env.define('string-upcase', { tag: 'builtin', name: 'string-upcase', fn(args) {
+    if (args.length !== 1 || args[0].tag !== 'string') throw new EvalError('string-upcase: expected string');
+    return { tag: 'string', value: args[0].value.toUpperCase() };
+  }});
+  env.define('string-downcase', { tag: 'builtin', name: 'string-downcase', fn(args) {
+    if (args.length !== 1 || args[0].tag !== 'string') throw new EvalError('string-downcase: expected string');
+    return { tag: 'string', value: args[0].value.toLowerCase() };
+  }});
+
   // apply
   env.define('apply', { tag: 'builtin', name: 'apply', fn(args) {
     if (args.length < 2) throw new EvalError('apply: need at least 2 arguments');
