@@ -280,6 +280,14 @@ public class Interpreter {
                                 continue;
                             }
                             case "define" -> { return evalDefine(listVal, elements, env); }
+                            case "set!" -> {
+                                if (elements.size() != 3) throw new EvalError(posPrefix(listVal) + "set!: bad syntax");
+                                if (!(elements.get(1) instanceof SchemeValue.SymbolVal sym2))
+                                    throw new EvalError(posPrefix(listVal) + "set!: expected symbol");
+                                SchemeValue val = eval(elements.get(2), env);
+                                env.set(sym2.name(), val);
+                                return new SchemeValue.VoidVal();
+                            }
                             case "if" -> {
                                 if (elements.size() < 3 || elements.size() > 4) throw new EvalError(posPrefix(listVal) + "if: bad syntax");
                                 SchemeValue cond = eval(elements.get(1), env);
