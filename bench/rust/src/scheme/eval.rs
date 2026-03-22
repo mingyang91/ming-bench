@@ -88,6 +88,10 @@ fn eval_list_tco(
             "let" => return eval_let_tco(&items[1..], env, out),
             "begin" => return eval_begin_tco(&items[1..], env, out),
             "cond" => return eval_cond_tco(&items[1..], env, out),
+            "set!" => {
+                let val = eval_set(&items[1..], env, out)?;
+                return Ok(Trampoline::Done(val));
+            }
             "string-set!" => {
                 let val = eval_string_set(&items[1..], env, out)?;
                 return Ok(Trampoline::Done(val));
@@ -673,6 +677,22 @@ fn eval_let_tco(
         expr: body[body.len() - 1].clone(),
         env: local,
     })
+}
+
+fn eval_set(
+    args: &[Value],
+    env: &Rc<RefCell<Env>>,
+    out: &mut String,
+) -> Result<Value, EvalError> {
+    if args.len() != 2 {
+        return Err(EvalError::arity("set! requires exactly 2 arguments"));
+    }
+    let Value::Symbol(name) = &args[0] else {
+        return Err(EvalError::type_err("set!: first argument must be a symbol"));
+    };
+    let val = eval(&args[1], env, out)?;
+    env.borrow_mut().update(name, val)?;
+    Ok(Value::Void)
 }
 
 fn eval_string_set(
