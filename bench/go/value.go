@@ -17,6 +17,7 @@ const (
 	KindVoid
 	KindBuiltin
 	KindLambda
+	KindChar
 )
 
 type BuiltinFunc func(args []*Value) (*Value, error)
@@ -44,6 +45,7 @@ func strVal(s string) *Value  { return &Value{Kind: KindString, Str: s} }
 func symVal(s string) *Value  { return &Value{Kind: KindSymbol, Str: s} }
 func nullVal() *Value         { return &Value{Kind: KindNull} }
 func voidVal() *Value         { return &Value{Kind: KindVoid} }
+func charVal(ch rune) *Value  { return &Value{Kind: KindChar, Int: int64(ch)} }
 
 func (v *Value) withPos(line, col int) *Value {
 	v.Line = line
@@ -84,8 +86,45 @@ func (v *Value) String() string {
 		return "#<procedure>"
 	case KindPair:
 		return printList(v)
+	case KindChar:
+		return fmt.Sprintf("#\\%c", rune(v.Int))
 	}
 	return ""
+}
+
+// Display returns the display representation (no quotes on strings).
+func (v *Value) Display() string {
+	switch v.Kind {
+	case KindString:
+		return v.Str
+	case KindChar:
+		return string(rune(v.Int))
+	case KindPair:
+		return displayList(v)
+	default:
+		return v.String()
+	}
+}
+
+func displayList(v *Value) string {
+	var buf strings.Builder
+	buf.WriteByte('(')
+	cur := v
+	first := true
+	for cur.Kind == KindPair {
+		if !first {
+			buf.WriteByte(' ')
+		}
+		buf.WriteString(cur.Car.Display())
+		first = false
+		cur = cur.Cdr
+	}
+	if cur.Kind != KindNull {
+		buf.WriteString(" . ")
+		buf.WriteString(cur.Display())
+	}
+	buf.WriteByte(')')
+	return buf.String()
 }
 
 func printList(v *Value) string {

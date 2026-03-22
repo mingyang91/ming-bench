@@ -1,11 +1,26 @@
 package ming
 
-import "fmt"
+import (
+	"fmt"
+	"strconv"
+	"strings"
+)
 
 // Env holds variable bindings.
 type Env struct {
 	bindings map[string]*Value
 	parent   *Env
+	output   *strings.Builder // shared output buffer (only on root env)
+}
+
+func (e *Env) getOutput() *strings.Builder {
+	if e.output != nil {
+		return e.output
+	}
+	if e.parent != nil {
+		return e.parent.getOutput()
+	}
+	return nil
 }
 
 func newEnv(parent *Env) *Env {
@@ -50,6 +65,21 @@ func makeGlobalEnv() *Env {
 	env.set("boolean?", builtinVal("boolean?", makeTypePred(KindBoolean)))
 	env.set("pair?", builtinVal("pair?", makeTypePred(KindPair)))
 	env.set("symbol?", builtinVal("symbol?", makeTypePred(KindSymbol)))
+	env.set("char?", builtinVal("char?", makeTypePred(KindChar)))
+	env.set("procedure?", builtinVal("procedure?", func(args []*Value) (*Value, error) {
+		if len(args) != 1 {
+			return nil, &EvalError{Message: "procedure?: expected 1 argument"}
+		}
+		return boolVal(args[0].Kind == KindBuiltin || args[0].Kind == KindLambda), nil
+	}))
+	env.set("string-append", builtinVal("string-append", builtinStringAppend))
+	env.set("string-length", builtinVal("string-length", builtinStringLength))
+	env.set("substring", builtinVal("substring", builtinSubstring))
+	env.set("string->number", builtinVal("string->number", builtinStringToNumber))
+	env.set("number->string", builtinVal("number->string", builtinNumberToString))
+	env.set("symbol->string", builtinVal("symbol->string", builtinSymbolToString))
+	env.set("string->symbol", builtinVal("string->symbol", builtinStringToSymbol))
+	env.set("string-ref", builtinVal("string-ref", builtinStringRef))
 	return env
 }
 
@@ -95,6 +125,12 @@ func evalList(expr *Value, env *Env) (*Value, error) {
 			return evalBegin(expr.Cdr, env)
 		case "cond":
 			return evalCond(expr.Cdr, env)
+		case "display":
+			return evalDisplay(expr.Cdr, env)
+		case "write":
+			return evalWrite(expr.Cdr, env)
+		case "newline":
+			return evalNewline(env)
 		}
 	}
 
@@ -554,6 +590,114 @@ func makeTypePred(kind ValueKind) BuiltinFunc {
 	}
 }
 
+// I/O special forms
+
+func evalDisplay(args *Value, env *Env) (*Value, error) {
+	val, err := eval(args.Car, env)
+	if err != nil {
+		return nil, err
+	}
+	if out := env.getOutput(); out != nil {
+		out.WriteString(val.Display())
+	}
+	return voidVal(), nil
+}
+
+func evalWrite(args *Value, env *Env) (*Value, error) {
+	val, err := eval(args.Car, env)
+	if err != nil {
+		return nil, err
+	}
+	if out := env.getOutput(); out != nil {
+		out.WriteString(val.String())
+	}
+	return voidVal(), nil
+}
+
+func evalNewline(env *Env) (*Value, error) {
+	if out := env.getOutput(); out != nil {
+		out.WriteByte('\n')
+	}
+	return voidVal(), nil
+}
+
+// String builtins
+
+func builtinStringAppend(args []*Value) (*Value, error) {
+	var buf strings.Builder
+	for _, a := range args {
+		if a.Kind != KindString {
+			return nil, &EvalError{Message: "string-append: expected string"}
+		}
+		buf.WriteString(a.Str)
+	}
+	return strVal(buf.String()), nil
+}
+
+func builtinStringLength(args []*Value) (*Value, error) {
+	if len(args) != 1 || args[0].Kind != KindString {
+		return nil, &EvalError{Message: "string-length: expected string"}
+	}
+	return intVal(int64(len([]rune(args[0].Str)))), nil
+}
+
+func builtinSubstring(args []*Value) (*Value, error) {
+	if len(args) != 3 || args[0].Kind != KindString || args[1].Kind != KindInteger || args[2].Kind != KindInteger {
+		return nil, &EvalError{Message: "substring: expected string, start, end"}
+	}
+	runes := []rune(args[0].Str)
+	start := int(args[1].Int)
+	end := int(args[2].Int)
+	if start < 0 || end > len(runes) || start > end {
+		return nil, &EvalError{Message: "substring: index out of range"}
+	}
+	return strVal(string(runes[start:end])), nil
+}
+
+func builtinStringToNumber(args []*Value) (*Value, error) {
+	if len(args) != 1 || args[0].Kind != KindString {
+		return nil, &EvalError{Message: "string->number: expected string"}
+	}
+	n, err := strconv.ParseInt(args[0].Str, 10, 64)
+	if err != nil {
+		return boolVal(false), nil
+	}
+	return intVal(n), nil
+}
+
+func builtinNumberToString(args []*Value) (*Value, error) {
+	if len(args) != 1 || args[0].Kind != KindInteger {
+		return nil, &EvalError{Message: "number->string: expected number"}
+	}
+	return strVal(strconv.FormatInt(args[0].Int, 10)), nil
+}
+
+func builtinSymbolToString(args []*Value) (*Value, error) {
+	if len(args) != 1 || args[0].Kind != KindSymbol {
+		return nil, &EvalError{Message: "symbol->string: expected symbol"}
+	}
+	return strVal(args[0].Str), nil
+}
+
+func builtinStringToSymbol(args []*Value) (*Value, error) {
+	if len(args) != 1 || args[0].Kind != KindString {
+		return nil, &EvalError{Message: "string->symbol: expected string"}
+	}
+	return symVal(args[0].Str), nil
+}
+
+func builtinStringRef(args []*Value) (*Value, error) {
+	if len(args) != 2 || args[0].Kind != KindString || args[1].Kind != KindInteger {
+		return nil, &EvalError{Message: "string-ref: expected string and index"}
+	}
+	runes := []rune(args[0].Str)
+	idx := int(args[1].Int)
+	if idx < 0 || idx >= len(runes) {
+		return nil, &EvalError{Message: "string-ref: index out of range"}
+	}
+	return charVal(runes[idx]), nil
+}
+
 // EvalStr evaluates one or more Scheme expressions and returns the string
 // representation of the last result.
 func EvalStr(input string) (string, error) {
@@ -566,6 +710,7 @@ func EvalStr(input string) (string, error) {
 	}
 
 	env := makeGlobalEnv()
+	env.output = &strings.Builder{}
 	var result *Value
 	for _, expr := range exprs {
 		result, err = eval(expr, env)
@@ -582,6 +727,29 @@ func EvalStr(input string) (string, error) {
 
 // EvalStrWithOutput evaluates Scheme expressions and returns both the result
 // string and any captured output from display/write/newline.
-func EvalStrWithOutput(input string) (result string, output string, err error) {
-	return "", "", &EvalError{Message: "not implemented"}
+func EvalStrWithOutput(input string) (resultStr string, output string, err error) {
+	exprs, parseErr := parse(input)
+	if parseErr != nil {
+		return "", "", &EvalError{Message: parseErr.Error()}
+	}
+	if len(exprs) == 0 {
+		return "", "", &EvalError{Message: "no expressions"}
+	}
+
+	env := makeGlobalEnv()
+	var buf strings.Builder
+	env.output = &buf
+
+	var result *Value
+	for _, expr := range exprs {
+		result, err = eval(expr, env)
+		if err != nil {
+			return "", "", err
+		}
+	}
+
+	if result.Kind == KindVoid {
+		return "", buf.String(), nil
+	}
+	return result.String(), buf.String(), nil
 }
