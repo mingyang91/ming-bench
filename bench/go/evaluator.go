@@ -41,6 +41,7 @@ type value struct {
 	charVal   rune
 	pairVal   *pair
 	lambdaVal *lambda
+	mutableStr *[]rune // non-nil for mutable strings (string-copy)
 }
 
 var voidValue = value{typ: typeVoid}
@@ -51,6 +52,14 @@ func boolValue(b bool) value     { return value{typ: typeBool, boolV: b} }
 func stringValue(s string) value { return value{typ: typeString, strVal: s} }
 func symbolValue(s string) value { return value{typ: typeSymbol, strVal: s} }
 func charValue(c rune) value     { return value{typ: typeChar, charVal: c} }
+
+// getStr returns the current string content, respecting mutable backing.
+func (v value) getStr() string {
+	if v.mutableStr != nil {
+		return string(*v.mutableStr)
+	}
+	return v.strVal
+}
 func pairValue(car, cdr value) value {
 	return value{typ: typePair, pairVal: &pair{car: car, cdr: cdr}}
 }
@@ -65,7 +74,7 @@ func (v value) String() string {
 		}
 		return "#f"
 	case typeString:
-		return `"` + v.strVal + `"`
+		return `"` + v.getStr() + `"`
 	case typeSymbol:
 		return v.strVal
 	case typeVoid:
@@ -95,7 +104,7 @@ func (v value) String() string {
 func displayString(v value) string {
 	switch v.typ {
 	case typeString:
-		return v.strVal
+		return v.getStr()
 	case typeChar:
 		return string(v.charVal)
 	case typePair:
@@ -348,6 +357,21 @@ func parseAtom(text string) value {
 	}
 	if len(text) >= 2 && text[0] == '"' && text[len(text)-1] == '"' {
 		return stringValue(text[1 : len(text)-1])
+	}
+	if strings.HasPrefix(text, `#\`) {
+		name := text[2:]
+		switch name {
+		case "space":
+			return charValue(' ')
+		case "newline":
+			return charValue('\n')
+		case "tab":
+			return charValue('\t')
+		default:
+			if len([]rune(name)) == 1 {
+				return charValue([]rune(name)[0])
+			}
+		}
 	}
 	if n, err := strconv.ParseInt(text, 10, 64); err == nil {
 		return intValue(n)
@@ -955,7 +979,7 @@ func applyBuiltin(name string, args []value, e *expr, environ *env) (value, erro
 			if a.typ != typeString {
 				return value{}, fmt.Errorf("%d:%d: string-append: expected string", e.list[i+1].line, e.list[i+1].col)
 			}
-			sb.WriteString(a.strVal)
+			sb.WriteString(a.getStr())
 		}
 		return stringValue(sb.String()), nil
 
@@ -966,7 +990,7 @@ func applyBuiltin(name string, args []value, e *expr, environ *env) (value, erro
 		if args[0].typ != typeString {
 			return value{}, fmt.Errorf("%d:%d: string-length: expected string", head.line, head.col)
 		}
-		return intValue(int64(len([]rune(args[0].strVal)))), nil
+		return intValue(int64(len([]rune(args[0].getStr())))), nil
 
 	case "substring":
 		if len(args) != 3 {
@@ -978,7 +1002,7 @@ func applyBuiltin(name string, args []value, e *expr, environ *env) (value, erro
 		if args[1].typ != typeInt || args[2].typ != typeInt {
 			return value{}, fmt.Errorf("%d:%d: substring: expected integer indices", head.line, head.col)
 		}
-		runes := []rune(args[0].strVal)
+		runes := []rune(args[0].getStr())
 		start := int(args[1].intVal)
 		end := int(args[2].intVal)
 		if start < 0 || end < start || end > len(runes) {
@@ -993,7 +1017,7 @@ func applyBuiltin(name string, args []value, e *expr, environ *env) (value, erro
 		if args[0].typ != typeString {
 			return value{}, fmt.Errorf("%d:%d: string->number: expected string", head.line, head.col)
 		}
-		n, err := strconv.ParseInt(args[0].strVal, 10, 64)
+		n, err := strconv.ParseInt(args[0].getStr(), 10, 64)
 		if err != nil {
 			return boolValue(false), nil
 		}
@@ -1024,7 +1048,7 @@ func applyBuiltin(name string, args []value, e *expr, environ *env) (value, erro
 		if args[0].typ != typeString {
 			return value{}, fmt.Errorf("%d:%d: string->symbol: expected string", head.line, head.col)
 		}
-		return symbolValue(args[0].strVal), nil
+		return symbolValue(args[0].getStr()), nil
 
 	case "string-ref":
 		if len(args) != 2 {
@@ -1036,12 +1060,47 @@ func applyBuiltin(name string, args []value, e *expr, environ *env) (value, erro
 		if args[1].typ != typeInt {
 			return value{}, fmt.Errorf("%d:%d: string-ref: expected integer index", head.line, head.col)
 		}
-		runes := []rune(args[0].strVal)
+		runes := []rune(args[0].getStr())
 		idx := int(args[1].intVal)
 		if idx < 0 || idx >= len(runes) {
 			return value{}, fmt.Errorf("%d:%d: string-ref: index out of range", head.line, head.col)
 		}
 		return charValue(runes[idx]), nil
+
+	case "string-copy":
+		if len(args) != 1 {
+			return value{}, fmt.Errorf("%d:%d: string-copy: expected 1 argument, got %d", head.line, head.col, len(args))
+		}
+		if args[0].typ != typeString {
+			return value{}, fmt.Errorf("%d:%d: string-copy: expected string", head.line, head.col)
+		}
+		runes := []rune(args[0].getStr())
+		cp := make([]rune, len(runes))
+		copy(cp, runes)
+		return value{typ: typeString, mutableStr: &cp}, nil
+
+	case "string-set!":
+		if len(args) != 3 {
+			return value{}, fmt.Errorf("%d:%d: string-set!: expected 3 arguments, got %d", head.line, head.col, len(args))
+		}
+		if args[0].typ != typeString {
+			return value{}, fmt.Errorf("%d:%d: string-set!: expected string", head.line, head.col)
+		}
+		if args[0].mutableStr == nil {
+			return value{}, fmt.Errorf("%d:%d: string-set!: string is immutable", head.line, head.col)
+		}
+		if args[1].typ != typeInt {
+			return value{}, fmt.Errorf("%d:%d: string-set!: expected integer index", head.line, head.col)
+		}
+		if args[2].typ != typeChar {
+			return value{}, fmt.Errorf("%d:%d: string-set!: expected character", head.line, head.col)
+		}
+		idx := int(args[1].intVal)
+		if idx < 0 || idx >= len(*args[0].mutableStr) {
+			return value{}, fmt.Errorf("%d:%d: string-set!: index out of range", head.line, head.col)
+		}
+		(*args[0].mutableStr)[idx] = args[2].charVal
+		return voidValue, nil
 
 	case "char?":
 		if len(args) != 1 {
@@ -1099,7 +1158,7 @@ func EvalStr(input string) (string, error) {
 
 	environ := newEnv(nil)
 	// Pre-bind builtins as symbols
-	for _, name := range []string{"+", "-", "*", "/", "<", ">", "=", "<=", ">=", "not", "cons", "car", "cdr", "null?", "list", "length", "append", "string?", "number?", "boolean?", "pair?", "symbol?", "display", "write", "newline", "string-append", "string-length", "substring", "string->number", "number->string", "symbol->string", "string->symbol", "string-ref", "char?"} {
+	for _, name := range []string{"+", "-", "*", "/", "<", ">", "=", "<=", ">=", "not", "cons", "car", "cdr", "null?", "list", "length", "append", "string?", "number?", "boolean?", "pair?", "symbol?", "display", "write", "newline", "string-append", "string-length", "substring", "string->number", "number->string", "symbol->string", "string->symbol", "string-ref", "char?", "string-copy", "string-set!"} {
 		environ.set(name, symbolValue(name))
 	}
 
@@ -1136,7 +1195,7 @@ func EvalStrWithOutput(input string) (result string, output string, err error) {
 	var outBuf strings.Builder
 	environ := newEnv(nil)
 	environ.output = &outBuf
-	for _, name := range []string{"+", "-", "*", "/", "<", ">", "=", "<=", ">=", "not", "cons", "car", "cdr", "null?", "list", "length", "append", "string?", "number?", "boolean?", "pair?", "symbol?", "display", "write", "newline", "string-append", "string-length", "substring", "string->number", "number->string", "symbol->string", "string->symbol", "string-ref", "char?"} {
+	for _, name := range []string{"+", "-", "*", "/", "<", ">", "=", "<=", ">=", "not", "cons", "car", "cdr", "null?", "list", "length", "append", "string?", "number?", "boolean?", "pair?", "symbol?", "display", "write", "newline", "string-append", "string-length", "substring", "string->number", "number->string", "symbol->string", "string->symbol", "string-ref", "char?", "string-copy", "string-set!"} {
 		environ.set(name, symbolValue(name))
 	}
 
