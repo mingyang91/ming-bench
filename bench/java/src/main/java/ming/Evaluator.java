@@ -31,15 +31,21 @@ public class Evaluator {
     static final class ContinuationVal implements SchemeVal {
         final Object tag = new Object();
         final int topLevelIndex;
-        final List<SchemeVal> resumeBody;
-        final int resumeStart;
-        final Env resumeEnv;
-        ContinuationVal(int topLevelIndex, List<SchemeVal> resumeBody, int resumeStart, Env resumeEnv) {
+        final List<BodyFrame> frames;
+        ContinuationVal(int topLevelIndex, List<BodyFrame> frames) {
             this.topLevelIndex = topLevelIndex;
-            this.resumeBody = resumeBody;
-            this.resumeStart = resumeStart;
-            this.resumeEnv = resumeEnv;
+            this.frames = frames;
         }
+    }
+
+    static class BodyFrame {
+        final List<SchemeVal> exprs;
+        int idx;
+        final Env env;
+        BodyFrame(List<SchemeVal> exprs, int idx, Env env) {
+            this.exprs = exprs; this.idx = idx; this.env = env;
+        }
+        BodyFrame copy() { return new BodyFrame(exprs, idx, env); }
     }
 
     record MacroVal(String name, List<List<SchemeVal>> rules, Env defEnv, List<String> literals) implements SchemeVal {}
@@ -51,25 +57,19 @@ public class Evaluator {
         final Object tag;
         final SchemeVal value;
         final int topLevelIndex;
-        final List<SchemeVal> resumeBody;
-        final int resumeStart;
-        final Env resumeEnv;
+        final List<BodyFrame> frames;
         ContinuationReturn(ContinuationVal cont, SchemeVal value) {
             super(null, null, true, false);
             this.tag = cont.tag;
             this.value = value;
             this.topLevelIndex = cont.topLevelIndex;
-            this.resumeBody = cont.resumeBody;
-            this.resumeStart = cont.resumeStart;
-            this.resumeEnv = cont.resumeEnv;
+            this.frames = cont.frames;
         }
     }
     private SchemeVal pendingReturn = null;
     private int currentTopLevelIndex = 0;
-    // Body context tracking for continuation capture
-    private List<SchemeVal> currentBodyExprs = null;
-    private int currentBodyIdx = 0;
-    private Env currentBodyEnv = null;
+    // Body frame stack for continuation capture
+    private final List<BodyFrame> bodyFrameStack = new ArrayList<>();
 
     // ---- Gensym for macro hygiene ----
     private int gensymCounter = 0;
@@ -281,6 +281,12 @@ public class Evaluator {
 
     // ---- Evaluator (trampolined for TCO) ----
     private SchemeVal eval(SchemeVal expr, Env env) throws EvalError {
+        int frameBase = bodyFrameStack.size();
+        try { return evalInner(expr, env); }
+        finally { while (bodyFrameStack.size() > frameBase) bodyFrameStack.removeLast(); }
+    }
+
+    private SchemeVal evalInner(SchemeVal expr, Env env) throws EvalError {
         trampoline:
         while (true) {
             SourcePos pos = posMap != null ? posMap.get(expr) : null;
@@ -422,14 +428,13 @@ public class Evaluator {
                                 for (int i = 0; i < params.size(); i++) {
                                     callEnv.define(params.get(i), eval(inits.get(i), env));
                                 }
-                                List<SchemeVal> prevBE = currentBodyExprs; int prevBI = currentBodyIdx; Env prevBEnv = currentBodyEnv;
-                                currentBodyExprs = body; currentBodyEnv = callEnv;
+                                bodyFrameStack.add(new BodyFrame(body, 0, callEnv));
                                 for (int j = 0; j < body.size() - 1; j++) {
-                                    currentBodyIdx = j;
+                                    bodyFrameStack.getLast().idx = j;
                                     eval(body.get(j), callEnv);
                                 }
-                                currentBodyIdx = body.size() - 1;
-                                currentBodyExprs = prevBE; currentBodyIdx = prevBI; currentBodyEnv = prevBEnv;
+                                bodyFrameStack.getLast().idx = body.size() - 1;
+                                // Don't pop - eval's try-finally handles cleanup
                                 expr = body.getLast();
                                 env = callEnv;
                                 continue trampoline;
@@ -445,14 +450,13 @@ public class Evaluator {
                                 letEnv.define(varName, val);
                             }
                             List<SchemeVal> letBody = new ArrayList<>(elems.subList(2, elems.size()));
-                            List<SchemeVal> prevBE = currentBodyExprs; int prevBI = currentBodyIdx; Env prevBEnv = currentBodyEnv;
-                            currentBodyExprs = letBody; currentBodyEnv = letEnv;
+                            bodyFrameStack.add(new BodyFrame(letBody, 0, letEnv));
                             for (int i = 0; i < letBody.size() - 1; i++) {
-                                currentBodyIdx = i;
+                                bodyFrameStack.getLast().idx = i;
                                 eval(letBody.get(i), letEnv);
                             }
-                            currentBodyIdx = letBody.size() - 1;
-                            currentBodyExprs = prevBE; currentBodyIdx = prevBI; currentBodyEnv = prevBEnv;
+                            bodyFrameStack.getLast().idx = letBody.size() - 1;
+                            // Don't pop - eval's try-finally handles cleanup
                             expr = letBody.getLast();
                             env = letEnv;
                             continue trampoline;
@@ -544,9 +548,16 @@ public class Evaluator {
                 }
                 if (proc instanceof LambdaVal lambda) {
                     Env callEnv = bindLambdaArgs(lambda, args);
+                    boolean pushFrame = lambda.body().size() > 1 && !bodyFrameStack.isEmpty();
+                    if (pushFrame) {
+                        bodyFrameStack.add(new BodyFrame(lambda.body(), 0, callEnv));
+                    }
                     for (int j = 0; j < lambda.body().size() - 1; j++) {
+                        if (pushFrame) bodyFrameStack.getLast().idx = j;
                         eval(lambda.body().get(j), callEnv);
                     }
+                    if (pushFrame) bodyFrameStack.getLast().idx = lambda.body().size() - 1;
+                    // Don't pop frame - eval's try-finally handles cleanup
                     expr = lambda.body().getLast();
                     env = callEnv;
                     continue trampoline;
@@ -595,14 +606,59 @@ public class Evaluator {
         return callEnv;
     }
 
+    private static boolean isDirectCallCC(SchemeVal expr) {
+        if (expr instanceof ListVal list && !list.elements().isEmpty()) {
+            SchemeVal head = list.elements().getFirst();
+            if (head instanceof SymbolVal sym) {
+                return sym.name().equals("call/cc") || sym.name().equals("call-with-current-continuation");
+            }
+        }
+        return false;
+    }
+
+    private SchemeVal resumeFrames(List<BodyFrame> frames, SchemeVal value) throws EvalError {
+        pendingReturn = value;
+        SchemeVal result = VOID;
+        // frames[0] = outermost, frames[last] = innermost
+        int stackBase = bodyFrameStack.size();
+        // Push all frames with their original captured indices
+        for (BodyFrame frame : frames) {
+            bodyFrameStack.add(frame.copy());
+        }
+        // Resume from innermost to outermost
+        for (int f = frames.size() - 1; f >= 0; f--) {
+            BodyFrame frame = frames.get(f);
+            int startIdx;
+            if (f == frames.size() - 1) {
+                // Innermost: if the captured expression IS a direct call/cc, skip it;
+                // otherwise re-evaluate it (call/cc is nested inside and pendingReturn handles it)
+                boolean direct = frame.idx < frame.exprs.size() && isDirectCallCC(frame.exprs.get(frame.idx));
+                startIdx = direct ? frame.idx + 1 : frame.idx;
+            } else {
+                startIdx = frame.idx + 1;
+            }
+            for (int i = startIdx; i < frame.exprs.size(); i++) {
+                bodyFrameStack.get(stackBase + f).idx = i;
+                result = eval(frame.exprs.get(i), frame.env);
+            }
+            if (f == frames.size() - 1) {
+                pendingReturn = null; // Clear unconsumed pendingReturn after innermost frame
+            }
+            // Pop this processed frame
+            bodyFrameStack.remove(stackBase + f);
+        }
+        return result;
+    }
+
     private SchemeVal doCallCC(SchemeVal proc) throws EvalError {
         if (pendingReturn != null) {
             SchemeVal val = pendingReturn;
             pendingReturn = null;
             return val;
         }
-        ContinuationVal cont = new ContinuationVal(currentTopLevelIndex,
-            currentBodyExprs, currentBodyIdx, currentBodyEnv);
+        List<BodyFrame> framesCopy = new ArrayList<>();
+        for (BodyFrame f : bodyFrameStack) framesCopy.add(f.copy());
+        ContinuationVal cont = new ContinuationVal(currentTopLevelIndex, framesCopy);
         try {
             return applyProc(proc, List.of(cont));
         } catch (ContinuationReturn cr) {
@@ -630,8 +686,15 @@ public class Evaluator {
         } else if (proc instanceof LambdaVal lambda) {
             Env callEnv = bindLambdaArgs(lambda, args);
             SchemeVal result = VOID;
-            for (SchemeVal bodyExpr : lambda.body()) {
-                result = eval(bodyExpr, callEnv);
+            boolean pushFrame = lambda.body().size() > 1;
+            if (pushFrame) bodyFrameStack.add(new BodyFrame(lambda.body(), 0, callEnv));
+            try {
+                for (int i = 0; i < lambda.body().size(); i++) {
+                    if (pushFrame) bodyFrameStack.getLast().idx = i;
+                    result = eval(lambda.body().get(i), callEnv);
+                }
+            } finally {
+                if (pushFrame) bodyFrameStack.removeLast();
             }
             return result;
         }
@@ -1137,39 +1200,24 @@ public class Evaluator {
                 result = eval(exprs.get(idx), env);
                 idx++;
             } catch (ContinuationReturn cr) {
-                pendingReturn = cr.value;
-                if (cr.resumeBody != null) {
-                    // Body-level re-entry: evaluate saved body in saved env
-                    // Loop to handle repeated continuation invocations within the body
-                    List<SchemeVal> rBody = cr.resumeBody;
-                    int rStart = cr.resumeStart;
-                    Env rEnv = cr.resumeEnv;
-                    int rTopIdx = cr.topLevelIndex;
-                    boolean done = false;
-                    while (!done) {
+                // Resume from the continuation's frame stack
+                ContinuationReturn current = cr;
+                boolean resolved = false;
+                while (!resolved) {
+                    if (current.frames.isEmpty()) {
+                        // Top-level continuation: re-evaluate from topLevelIndex with pendingReturn
+                        pendingReturn = current.value;
+                        idx = current.topLevelIndex;
+                        resolved = true;
+                    } else {
                         try {
-                            SchemeVal bodyResult = VOID;
-                            for (int i = rStart; i < rBody.size(); i++) {
-                                bodyResult = eval(rBody.get(i), rEnv);
-                            }
-                            result = bodyResult;
-                            idx = rTopIdx + 1;
-                            done = true;
+                            result = resumeFrames(current.frames, current.value);
+                            idx = current.topLevelIndex + 1;
+                            resolved = true;
                         } catch (ContinuationReturn cr2) {
-                            pendingReturn = cr2.value;
-                            if (cr2.resumeBody != null) {
-                                rBody = cr2.resumeBody;
-                                rStart = cr2.resumeStart;
-                                rEnv = cr2.resumeEnv;
-                                rTopIdx = cr2.topLevelIndex;
-                            } else {
-                                idx = cr2.topLevelIndex;
-                                done = true;
-                            }
+                            current = cr2;
                         }
                     }
-                } else {
-                    idx = cr.topLevelIndex;
                 }
             }
         }
