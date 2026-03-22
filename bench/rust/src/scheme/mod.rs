@@ -8,7 +8,7 @@ use std::rc::Rc;
 
 // ── Span ──
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq)]
 struct Span {
     line: usize,
     col: usize,
@@ -41,7 +41,7 @@ enum Value {
         env: Env,
     },
     Builtin(String),
-    Continuation { id: u64, top_level_idx: usize },
+    Continuation { id: u64, top_level_idx: usize, callcc_span: Span },
     SyntaxRules {
         literals: Vec<String>,
         rules: Vec<(Expr, Expr)>,
@@ -53,7 +53,8 @@ type Output = Rc<RefCell<std::string::String>>;
 
 thread_local! {
     static CONT_RETURN_VALUE: RefCell<Option<Value>> = RefCell::new(None);
-    static CALLCC_OVERRIDE: RefCell<Option<Value>> = RefCell::new(None);
+    static CALLCC_OVERRIDE: RefCell<Option<(Span, Value)>> = RefCell::new(None);
+    static CONT_CALLCC_SPAN: RefCell<Option<Span>> = RefCell::new(None);
     static NEXT_CONT_ID: Cell<u64> = Cell::new(0);
     static TOP_LEVEL_IDX: Cell<usize> = Cell::new(0);
     static GENSYM_COUNTER: Cell<u64> = Cell::new(0);
@@ -496,7 +497,13 @@ fn eval(expr: &Expr, env: &Env, out: &Output) -> Result<Value, EvalError> {
                             if items.len() != 2 {
                                 return Err(EvalError::Arity(span.fmt("call/cc requires 1 argument")));
                             }
-                            let override_val = CALLCC_OVERRIDE.with(|o| o.borrow_mut().take());
+                            let override_val = CALLCC_OVERRIDE.with(|o| {
+                                let mut guard = o.borrow_mut();
+                                if let Some((ref s, _)) = *guard {
+                                    if *s == span { return guard.take().map(|(_, v)| v); }
+                                }
+                                None
+                            });
                             if let Some(val) = override_val {
                                 return Ok(val);
                             }
@@ -578,7 +585,13 @@ fn eval(expr: &Expr, env: &Env, out: &Output) -> Result<Value, EvalError> {
                         if args.len() != 1 {
                             return Err(EvalError::Arity(span.fmt("call/cc requires 1 argument")));
                         }
-                        let override_val = CALLCC_OVERRIDE.with(|o| o.borrow_mut().take());
+                        let override_val = CALLCC_OVERRIDE.with(|o| {
+                            let mut guard = o.borrow_mut();
+                            if let Some((ref s, _)) = *guard {
+                                if *s == span { return guard.take().map(|(_, v)| v); }
+                            }
+                            None
+                        });
                         if let Some(val) = override_val {
                             return Ok(val);
                         }
@@ -590,11 +603,12 @@ fn eval(expr: &Expr, env: &Env, out: &Output) -> Result<Value, EvalError> {
                     Value::Builtin(ref name) => {
                         return eval_builtin(name, &args, span);
                     }
-                    Value::Continuation { id, top_level_idx } => {
+                    Value::Continuation { id, top_level_idx, callcc_span } => {
                         if args.len() != 1 {
                             return Err(EvalError::Arity(span.fmt("continuation requires 1 argument")));
                         }
                         CONT_RETURN_VALUE.with(|v| *v.borrow_mut() = Some(args[0].clone()));
+                        CONT_CALLCC_SPAN.with(|v| *v.borrow_mut() = Some(callcc_span));
                         return Err(EvalError::ContinuationInvoked(id, top_level_idx));
                     }
                     _ => return Err(EvalError::Type(span.fmt("not a procedure"))),
@@ -757,7 +771,7 @@ fn eval_apply(args: &[Value], span: Span, out: &Output) -> Result<Value, EvalErr
 fn eval_callcc(proc: Value, span: Span, out: &Output) -> Result<Value, EvalError> {
     let id = NEXT_CONT_ID.with(|c| { let v = c.get(); c.set(v + 1); v });
     let top_idx = TOP_LEVEL_IDX.with(|c| c.get());
-    let cont = Value::Continuation { id, top_level_idx: top_idx };
+    let cont = Value::Continuation { id, top_level_idx: top_idx, callcc_span: span };
 
     let result = match proc {
         Value::Lambda { ref params, ref rest_param, ref body, ref env } => {
@@ -1414,7 +1428,8 @@ pub fn eval_str(input: &str) -> Result<String, EvalError> {
         }
         if let Some((_id, top_idx)) = cont_err {
             let value = CONT_RETURN_VALUE.with(|v| v.borrow_mut().take()).unwrap();
-            CALLCC_OVERRIDE.with(|o| *o.borrow_mut() = Some(value));
+            let cc_span = CONT_CALLCC_SPAN.with(|v| v.borrow_mut().take()).unwrap();
+            CALLCC_OVERRIDE.with(|o| *o.borrow_mut() = Some((cc_span, value)));
             start_idx = top_idx;
             continue;
         }
@@ -1448,7 +1463,8 @@ pub fn eval_str_with_output(input: &str) -> Result<(String, String), EvalError> 
         }
         if let Some((_id, top_idx)) = cont_err {
             let value = CONT_RETURN_VALUE.with(|v| v.borrow_mut().take()).unwrap();
-            CALLCC_OVERRIDE.with(|o| *o.borrow_mut() = Some(value));
+            let cc_span = CONT_CALLCC_SPAN.with(|v| v.borrow_mut().take()).unwrap();
+            CALLCC_OVERRIDE.with(|o| *o.borrow_mut() = Some((cc_span, value)));
             start_idx = top_idx;
             continue;
         }
