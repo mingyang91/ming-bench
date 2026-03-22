@@ -38,6 +38,18 @@ func makeGlobalEnv() *Env {
 	env.set("<=", builtinVal("<=", makeCompare("<=", func(a, b int64) bool { return a <= b })))
 	env.set(">=", builtinVal(">=", makeCompare(">=", func(a, b int64) bool { return a >= b })))
 	env.set("not", builtinVal("not", builtinNot))
+	env.set("cons", builtinVal("cons", builtinCons))
+	env.set("car", builtinVal("car", builtinCar))
+	env.set("cdr", builtinVal("cdr", builtinCdr))
+	env.set("null?", builtinVal("null?", builtinNullQ))
+	env.set("list", builtinVal("list", builtinList))
+	env.set("length", builtinVal("length", builtinLength))
+	env.set("append", builtinVal("append", builtinAppend))
+	env.set("string?", builtinVal("string?", makeTypePred(KindString)))
+	env.set("number?", builtinVal("number?", makeTypePred(KindInteger)))
+	env.set("boolean?", builtinVal("boolean?", makeTypePred(KindBoolean)))
+	env.set("pair?", builtinVal("pair?", makeTypePred(KindPair)))
+	env.set("symbol?", builtinVal("symbol?", makeTypePred(KindSymbol)))
 	return env
 }
 
@@ -77,6 +89,12 @@ func evalList(expr *Value, env *Env) (*Value, error) {
 			return expr.Cdr.Car, nil
 		case "lambda":
 			return evalLambda(expr.Cdr, env)
+		case "let":
+			return evalLet(expr.Cdr, env)
+		case "begin":
+			return evalBegin(expr.Cdr, env)
+		case "cond":
+			return evalCond(expr.Cdr, env)
 		}
 	}
 
@@ -332,6 +350,198 @@ func builtinNot(args []*Value) (*Value, error) {
 		return nil, &EvalError{Message: "not: expected 1 argument"}
 	}
 	return boolVal(!args[0].isTruthy()), nil
+}
+
+func evalLet(args *Value, env *Env) (*Value, error) {
+	// Named let: (let name ((var init) ...) body ...)
+	if args.Car.Kind == KindSymbol {
+		name := args.Car.Str
+		bindings := args.Cdr.Car
+		body := listToSlice(args.Cdr.Cdr)
+		var params []string
+		var inits []*Value
+		cur := bindings
+		for cur.Kind == KindPair {
+			b := cur.Car
+			params = append(params, b.Car.Str)
+			val, err := eval(b.Cdr.Car, env)
+			if err != nil {
+				return nil, err
+			}
+			inits = append(inits, val)
+			cur = cur.Cdr
+		}
+		localEnv := newEnv(env)
+		fn := &Value{
+			Kind:       KindLambda,
+			Params:     params,
+			Body:       body,
+			ClosureEnv: localEnv,
+		}
+		localEnv.set(name, fn)
+		return applyLambda(fn, inits)
+	}
+	// Regular let
+	bindings := args.Car
+	body := args.Cdr
+	localEnv := newEnv(env)
+	cur := bindings
+	for cur.Kind == KindPair {
+		binding := cur.Car
+		name := binding.Car.Str
+		val, err := eval(binding.Cdr.Car, env)
+		if err != nil {
+			return nil, err
+		}
+		localEnv.set(name, val)
+		cur = cur.Cdr
+	}
+	var result *Value
+	var err error
+	bcur := body
+	for bcur.Kind == KindPair {
+		result, err = eval(bcur.Car, localEnv)
+		if err != nil {
+			return nil, err
+		}
+		bcur = bcur.Cdr
+	}
+	return result, nil
+}
+
+func evalBegin(args *Value, env *Env) (*Value, error) {
+	var result *Value
+	var err error
+	cur := args
+	for cur.Kind == KindPair {
+		result, err = eval(cur.Car, env)
+		if err != nil {
+			return nil, err
+		}
+		cur = cur.Cdr
+	}
+	if result == nil {
+		return voidVal(), nil
+	}
+	return result, nil
+}
+
+func evalCond(args *Value, env *Env) (*Value, error) {
+	cur := args
+	for cur.Kind == KindPair {
+		clause := cur.Car
+		test := clause.Car
+		if test.Kind == KindSymbol && test.Str == "else" {
+			// evaluate body
+			return evalBody(clause.Cdr, env)
+		}
+		cond, err := eval(test, env)
+		if err != nil {
+			return nil, err
+		}
+		if cond.isTruthy() {
+			return evalBody(clause.Cdr, env)
+		}
+		cur = cur.Cdr
+	}
+	return voidVal(), nil
+}
+
+func evalBody(body *Value, env *Env) (*Value, error) {
+	var result *Value
+	var err error
+	cur := body
+	for cur.Kind == KindPair {
+		result, err = eval(cur.Car, env)
+		if err != nil {
+			return nil, err
+		}
+		cur = cur.Cdr
+	}
+	if result == nil {
+		return voidVal(), nil
+	}
+	return result, nil
+}
+
+func builtinCons(args []*Value) (*Value, error) {
+	if len(args) != 2 {
+		return nil, &EvalError{Message: "cons: expected 2 arguments"}
+	}
+	return pairVal(args[0], args[1]), nil
+}
+
+func builtinCar(args []*Value) (*Value, error) {
+	if len(args) != 1 || args[0].Kind != KindPair {
+		return nil, &EvalError{Message: "car: expected pair"}
+	}
+	return args[0].Car, nil
+}
+
+func builtinCdr(args []*Value) (*Value, error) {
+	if len(args) != 1 || args[0].Kind != KindPair {
+		return nil, &EvalError{Message: "cdr: expected pair"}
+	}
+	return args[0].Cdr, nil
+}
+
+func builtinNullQ(args []*Value) (*Value, error) {
+	if len(args) != 1 {
+		return nil, &EvalError{Message: "null?: expected 1 argument"}
+	}
+	return boolVal(args[0].Kind == KindNull), nil
+}
+
+func builtinList(args []*Value) (*Value, error) {
+	result := nullVal()
+	for i := len(args) - 1; i >= 0; i-- {
+		result = pairVal(args[i], result)
+	}
+	return result, nil
+}
+
+func builtinLength(args []*Value) (*Value, error) {
+	if len(args) != 1 {
+		return nil, &EvalError{Message: "length: expected 1 argument"}
+	}
+	n := int64(0)
+	cur := args[0]
+	for cur.Kind == KindPair {
+		n++
+		cur = cur.Cdr
+	}
+	return intVal(n), nil
+}
+
+func builtinAppend(args []*Value) (*Value, error) {
+	if len(args) == 0 {
+		return nullVal(), nil
+	}
+	if len(args) == 1 {
+		return args[0], nil
+	}
+	// Append all lists
+	result := args[len(args)-1]
+	for i := len(args) - 2; i >= 0; i-- {
+		result = appendList(args[i], result)
+	}
+	return result, nil
+}
+
+func appendList(a, b *Value) *Value {
+	if a.Kind == KindNull {
+		return b
+	}
+	return pairVal(a.Car, appendList(a.Cdr, b))
+}
+
+func makeTypePred(kind ValueKind) BuiltinFunc {
+	return func(args []*Value) (*Value, error) {
+		if len(args) != 1 {
+			return nil, &EvalError{Message: "type predicate: expected 1 argument"}
+		}
+		return boolVal(args[0].Kind == kind), nil
+	}
 }
 
 // EvalStr evaluates one or more Scheme expressions and returns the string
