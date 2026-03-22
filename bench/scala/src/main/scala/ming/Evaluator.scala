@@ -3,29 +3,28 @@ package ming
 /** Scheme interpreter entry point. Agents implement this object. */
 object Evaluator:
 
-  /** Evaluate one or more Scheme expressions and return the string representation of the last result.
-    */
   def evalStr(input: String): String =
     val exprs = Parser.parse(input)
     if exprs.isEmpty then throw new EvalError("empty input")
-    val env = builtinEnv
-    val (result, _, _) = exprs.foldLeft((SchemeValue.Void: SchemeValue, env, "")) { case ((_, e, accOut), expr) =>
-      val (v, newE, o) = Interpreter.eval(expr, e)
-      (v, newE, accOut + o)
-    }
+    val out         = Array("")
+    val (result, _) = evalProgram(exprs, builtinEnv, out)
     result.display
 
-  /** Evaluate Scheme expressions and return both the result string and any captured output from display/write/newline.
-    */
   def evalStrWithOutput(input: String): (String, String) =
     val exprs = Parser.parse(input)
     if exprs.isEmpty then throw new EvalError("empty input")
-    val env = builtinEnv
-    val (result, _, output) = exprs.foldLeft((SchemeValue.Void: SchemeValue, env, "")) { case ((_, e, accOut), expr) =>
-      val (v, newE, o) = Interpreter.eval(expr, e)
-      (v, newE, accOut + o)
-    }
-    (result.display, output)
+    val out         = Array("")
+    val (result, _) = evalProgram(exprs, builtinEnv, out)
+    (result.display, out(0))
+
+  private def evalProgram(
+    exprs: List[SchemeValue],
+    env: Map[String, SchemeValue],
+    out: Array[String]
+  ): (SchemeValue, Map[String, SchemeValue]) =
+    val k: CpsEval.Cont = (v, e) => Bounce.Done(v, e)
+    val bounce          = CpsEval.evalSequenceK(exprs, env, out, k)
+    CpsEval.run(bounce)
 
   private val builtinNames: List[String] = List(
     "+",
@@ -64,7 +63,9 @@ object Evaluator:
     "string-copy",
     "string-set!",
     "char?",
-    "apply"
+    "apply",
+    "call/cc",
+    "call-with-current-continuation"
   )
 
   private val builtinEnv: Map[String, SchemeValue] =

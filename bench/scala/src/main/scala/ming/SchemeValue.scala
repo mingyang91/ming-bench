@@ -18,6 +18,7 @@ enum SchemeValue:
     restParam: Option[String] = None
   )
   case Cell(content: Array[SchemeValue])
+  case ContinuationVal(k: (SchemeValue, Map[String, SchemeValue]) => Bounce)
   case Void
 
   /** write-style display (strings get quotes) — used for evalStr results. */
@@ -31,6 +32,7 @@ enum SchemeValue:
     case ListVal(es, _)       => "(" + es.map(_.display).mkString(" ") + ")"
     case p: PairVal           => "(" + displayPairInner(p) + ")"
     case _: LambdaVal         => "#<procedure>"
+    case _: ContinuationVal   => "#<continuation>"
     case Cell(arr)            => arr(0).display
     case Void                 => ""
 
@@ -43,9 +45,10 @@ enum SchemeValue:
     case other                => other.display
 
   def isTruthy: Boolean = this match
-    case BoolVal(false) => false
-    case Cell(arr)      => arr(0).isTruthy
-    case _              => true
+    case BoolVal(false)     => false
+    case Cell(arr)          => arr(0).isTruthy
+    case _: ContinuationVal => true
+    case _                  => true
 
   private def displayPairInner(p: PairVal): String =
     p.cdr match
