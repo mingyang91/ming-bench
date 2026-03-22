@@ -1134,7 +1134,13 @@ public class Evaluator {
                 yield new StrVal(s.value());
             }
             case "string-set!" -> {
-                throw new EvalError("string-set!: strings are immutable");
+                if (args.size() != 3) throw new EvalError("string-set! requires exactly 3 arguments");
+                if (!(args.get(0) instanceof StrVal s)) throw new EvalError("string-set!: not a string");
+                int idx = (int) asLong(args.get(1));
+                if (!(args.get(2) instanceof CharVal cv)) throw new EvalError("string-set!: not a character");
+                if (idx < 0 || idx >= s.length()) throw new EvalError("string-set!: index out of range");
+                s.setChar(idx, cv.value());
+                yield new VoidVal();
             }
             case "abs" -> {
                 if (args.size() != 1) throw new EvalError("abs requires exactly 1 argument");
