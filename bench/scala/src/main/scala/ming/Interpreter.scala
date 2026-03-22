@@ -77,6 +77,7 @@ object Interpreter:
       case SchemeSymbol("let") :: rest   => SpecialForms.evalLetStep(rest, env)
       case SchemeSymbol("begin") :: rest => evalBeginStep(rest, env, "")
       case SchemeSymbol("cond") :: rest  => SpecialForms.evalCondStep(rest, env, "")
+      case SchemeSymbol("set!") :: rest => evalSetStep(rest, env)
       case head :: args =>
         val (func, _, funcOut)       = eval(head, env)
         val (evaluatedArgs, argsOut) = evalArgs(args, env)
@@ -98,8 +99,7 @@ object Interpreter:
           case Some(n) => closure.define(n, lam)
           case None    => closure
         val innerEnv = closureWithSelf
-          .extend(params, args)
-          .copy(fallback = Some(callerEnv))
+          .extend(params, args, Some(callerEnv))
         evalBodyBounce(body, innerEnv, prefixOut)
       case _ =>
         val (result, resultOut) = Builtins.applyProc(func, args)
@@ -139,6 +139,19 @@ object Interpreter:
         EvalResult.Done(SchemeVoid, newEnv, out)
       case _ =>
         throw new EvalError("bad define syntax")
+
+  private def evalSetStep(
+    args: List[SchemeValue],
+    env: Environment
+  ): EvalResult =
+    args match
+      case SchemeSymbol(name) :: valueExpr :: Nil =>
+        val (value, _, out) = eval(valueExpr, env)
+        if !env.set(name, value) then
+          throw new EvalError(s"set!: unbound variable: $name")
+        EvalResult.Done(SchemeVoid, env, out)
+      case _ =>
+        throw new EvalError("bad set! syntax")
 
   private def extractParamNames(
     params: List[SchemeValue]

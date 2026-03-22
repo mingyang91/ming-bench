@@ -22,10 +22,12 @@ object SpecialForms:
         val lambda              = SchemeLambda(paramNames, body, env, Some(name))
         Interpreter.applyProcStep(lambda, initVals, env, initOut)
       case SchemeList(bindings) :: body if body.nonEmpty =>
-        val (letEnv, bindOut) = bindings.foldLeft((env, "")) {
-          case ((acc, accOut), SchemeList(List(SchemeSymbol(name), expr))) =>
+        val letEnv = env.extend(Nil, Nil)
+        val bindOut = bindings.foldLeft("") {
+          case (accOut, SchemeList(List(SchemeSymbol(name), expr))) =>
             val (v, _, o) = Interpreter.eval(expr, env)
-            (acc.define(name, v), accOut + o)
+            letEnv.define(name, v)
+            accOut + o
           case _ => throw new EvalError("bad let binding")
         }
         Interpreter.evalBodyBounce(body, letEnv, bindOut)
