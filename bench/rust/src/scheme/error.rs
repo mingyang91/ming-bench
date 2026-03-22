@@ -6,7 +6,7 @@ pub struct Span {
 }
 
 /// Evaluation error kind.
-#[derive(Debug, PartialEq, thiserror::Error)]
+#[derive(Debug, thiserror::Error)]
 pub enum EvalErrorKind {
     #[error("parse error: {message}")]
     Parse { message: String },
@@ -29,6 +29,53 @@ pub enum EvalErrorKind {
 
     #[error("not a procedure: {value}")]
     NotAProcedure { value: String },
+
+    #[error("continuation return")]
+    ContinuationReturn { id: u64 },
+}
+
+impl PartialEq for EvalErrorKind {
+    fn eq(&self, other: &Self) -> bool {
+        match (self, other) {
+            (EvalErrorKind::Parse { message: a }, EvalErrorKind::Parse { message: b }) => a == b,
+            (
+                EvalErrorKind::Type {
+                    expected: ae,
+                    got: ag,
+                },
+                EvalErrorKind::Type {
+                    expected: be,
+                    got: bg,
+                },
+            ) => ae == be && ag == bg,
+            (
+                EvalErrorKind::Arity {
+                    name: an,
+                    expected: ae,
+                    got: ag,
+                },
+                EvalErrorKind::Arity {
+                    name: bn,
+                    expected: be,
+                    got: bg,
+                },
+            ) => an == bn && ae == be && ag == bg,
+            (
+                EvalErrorKind::UnboundVariable { name: a },
+                EvalErrorKind::UnboundVariable { name: b },
+            ) => a == b,
+            (EvalErrorKind::DivisionByZero, EvalErrorKind::DivisionByZero) => true,
+            (
+                EvalErrorKind::NotAProcedure { value: a },
+                EvalErrorKind::NotAProcedure { value: b },
+            ) => a == b,
+            (
+                EvalErrorKind::ContinuationReturn { id: a },
+                EvalErrorKind::ContinuationReturn { id: b },
+            ) => a == b,
+            _ => false,
+        }
+    }
 }
 
 impl EvalErrorKind {

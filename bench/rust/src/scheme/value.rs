@@ -3,6 +3,55 @@ use std::fmt;
 use crate::scheme::env::Env;
 use crate::scheme::parser::Expr;
 
+/// A saved evaluation context frame for continuation resumption.
+#[derive(Debug, Clone)]
+pub struct ResumeFrame {
+    pub exprs: Vec<Expr>,
+    pub env: Env,
+}
+
+/// Evaluation context threaded through the interpreter for continuation support.
+pub struct ContCtx {
+    /// Stack of resume frames (innermost = last).
+    pub frames: Vec<ResumeFrame>,
+    /// Pending value for a resuming continuation (consumed by the next call/cc).
+    pub pending: Option<Value>,
+    /// Frames from the most recently invoked saved continuation.
+    pub resume_frames: Option<Vec<ResumeFrame>>,
+    next_id: u64,
+}
+
+impl Default for ContCtx {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl ContCtx {
+    pub fn new() -> Self {
+        ContCtx {
+            frames: Vec::new(),
+            pending: None,
+            resume_frames: None,
+            next_id: 0,
+        }
+    }
+
+    pub fn next_id(&mut self) -> u64 {
+        let id = self.next_id;
+        self.next_id += 1;
+        id
+    }
+
+    pub fn push_frame(&mut self, frame: ResumeFrame) {
+        self.frames.push(frame);
+    }
+
+    pub fn pop_frame(&mut self) {
+        self.frames.pop();
+    }
+}
+
 /// A Scheme value.
 #[derive(Debug, Clone)]
 pub enum Value {
@@ -20,6 +69,10 @@ pub enum Value {
         env: Env,
     },
     Builtin(String),
+    Continuation {
+        id: u64,
+        frames: Vec<ResumeFrame>,
+    },
 }
 
 impl Value {
@@ -40,6 +93,7 @@ impl PartialEq for Value {
             (Value::Nil, Value::Nil) => true,
             (Value::Pair(a1, a2), Value::Pair(b1, b2)) => a1 == b1 && a2 == b2,
             (Value::Builtin(a), Value::Builtin(b)) => a == b,
+            (Value::Continuation { id: a, .. }, Value::Continuation { id: b, .. }) => a == b,
             _ => false,
         }
     }
@@ -54,7 +108,9 @@ impl Value {
                 buf.push('(');
                 display_list(buf, self);
             }
-            Value::Builtin(_) => buf.push_str(&self.to_string()),
+            Value::Builtin(_)
+            | Value::Lambda { .. }
+            | Value::Continuation { .. } => buf.push_str(&self.to_string()),
             other => buf.push_str(&other.to_string()),
         }
     }
@@ -81,6 +137,7 @@ impl fmt::Display for Value {
             }
             Value::Lambda { .. } => write!(f, "#<procedure>"),
             Value::Builtin(name) => write!(f, "#<procedure:{name}>"),
+            Value::Continuation { .. } => write!(f, "#<continuation>"),
         }
     }
 }

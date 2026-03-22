@@ -1,7 +1,7 @@
 use crate::scheme::env::Env;
 use crate::scheme::error::{EvalError, EvalErrorKind, Span};
 use crate::scheme::parser::{Expr, ExprKind};
-use crate::scheme::value::Value;
+use crate::scheme::value::{ContCtx, ResumeFrame, Value};
 
 /// Trampoline action for tail-call optimization.
 enum TcoAction {
@@ -10,16 +10,41 @@ enum TcoAction {
 }
 
 /// Evaluate an expression in the given environment (trampoline entry point).
-pub fn eval(expr: &Expr, env: &Env, output: &mut String) -> Result<Value, EvalError> {
-    let mut action = eval_step(expr, env, output)?;
+pub fn eval(
+    expr: &Expr,
+    env: &Env,
+    output: &mut String,
+    ctx: &mut ContCtx,
+) -> Result<Value, EvalError> {
+    let mut action = eval_step(expr, env, output, ctx)?;
     loop {
         match action {
             TcoAction::Result(v) => return Ok(v),
             TcoAction::TailCall { expr, env } => {
-                action = eval_step(&expr, &env, output)?;
+                action = eval_step(&expr, &env, output, ctx)?;
             }
         }
     }
+}
+
+/// Evaluate a sequence of expressions, pushing continuation frames for each.
+/// Returns the value of the last expression.
+pub fn eval_sequence(
+    exprs: &[Expr],
+    env: &Env,
+    output: &mut String,
+    ctx: &mut ContCtx,
+) -> Result<Value, EvalError> {
+    let mut result = Value::Nil;
+    for (i, expr) in exprs.iter().enumerate() {
+        ctx.push_frame(ResumeFrame {
+            exprs: exprs[i..].to_vec(),
+            env: env.clone(),
+        });
+        result = eval(expr, env, output, ctx)?;
+        ctx.pop_frame();
+    }
+    Ok(result)
 }
 
 /// Single evaluation step — returns either a final value or a tail call to bounce.
@@ -27,22 +52,19 @@ fn eval_step(
     expr: &Expr,
     env: &Env,
     output: &mut String,
+    ctx: &mut ContCtx,
 ) -> Result<TcoAction, EvalError> {
     match &expr.kind {
         ExprKind::Integer(n) => Ok(TcoAction::Result(Value::Integer(*n))),
         ExprKind::Boolean(b) => Ok(TcoAction::Result(Value::Boolean(*b))),
         ExprKind::SchemeString(s) => Ok(TcoAction::Result(Value::SchemeString(s.clone()))),
         ExprKind::Char(c) => Ok(TcoAction::Result(Value::Char(*c))),
-        ExprKind::Symbol(name) => {
-            match env.lookup(name) {
-                Ok(val) => Ok(TcoAction::Result(val)),
-                Err(_) if is_builtin(name) => {
-                    Ok(TcoAction::Result(Value::Builtin(name.clone())))
-                }
-                Err(e) => Err(e.with_span(&expr.span)),
-            }
-        }
-        ExprKind::List(elements) => eval_list_step(elements, &expr.span, env, output),
+        ExprKind::Symbol(name) => match env.lookup(name) {
+            Ok(val) => Ok(TcoAction::Result(val)),
+            Err(_) if is_builtin(name) => Ok(TcoAction::Result(Value::Builtin(name.clone()))),
+            Err(e) => Err(e.with_span(&expr.span)),
+        },
+        ExprKind::List(elements) => eval_list_step(elements, &expr.span, env, output, ctx),
     }
 }
 
@@ -51,6 +73,7 @@ fn eval_list_step(
     list_span: &Span,
     env: &Env,
     output: &mut String,
+    ctx: &mut ContCtx,
 ) -> Result<TcoAction, EvalError> {
     if elements.is_empty() {
         return Err(EvalErrorKind::Parse {
@@ -63,9 +86,9 @@ fn eval_list_step(
     if let ExprKind::Symbol(name) = &elements[0].kind {
         let kw_span = &elements[0].span;
         match name.as_str() {
-            "if" => return eval_if_step(&elements[1..], kw_span, env, output),
+            "if" => return eval_if_step(&elements[1..], kw_span, env, output, ctx),
             "define" => {
-                let v = eval_define(&elements[1..], kw_span, env, output)?;
+                let v = eval_define(&elements[1..], kw_span, env, output, ctx)?;
                 return Ok(TcoAction::Result(v));
             }
             "quote" => {
@@ -76,21 +99,25 @@ fn eval_list_step(
                 let v = eval_lambda(&elements[1..], kw_span, env)?;
                 return Ok(TcoAction::Result(v));
             }
-            "and" => return eval_and_step(&elements[1..], env, output),
-            "or" => return eval_or_step(&elements[1..], env, output),
+            "and" => return eval_and_step(&elements[1..], env, output, ctx),
+            "or" => return eval_or_step(&elements[1..], env, output, ctx),
             "not" => {
-                let v = eval_not(&elements[1..], kw_span, env, output)?;
+                let v = eval_not(&elements[1..], kw_span, env, output, ctx)?;
                 return Ok(TcoAction::Result(v));
             }
-            "let" => return eval_let_step(&elements[1..], kw_span, env, output),
-            "begin" => return eval_begin_step(&elements[1..], env, output),
-            "cond" => return eval_cond_step(&elements[1..], kw_span, env, output),
+            "let" => return eval_let_step(&elements[1..], kw_span, env, output, ctx),
+            "begin" => return eval_begin_step(&elements[1..], env, output, ctx),
+            "cond" => return eval_cond_step(&elements[1..], kw_span, env, output, ctx),
             "set!" => {
-                let v = eval_set(&elements[1..], kw_span, env, output)?;
+                let v = eval_set(&elements[1..], kw_span, env, output, ctx)?;
                 return Ok(TcoAction::Result(v));
             }
             "string-set!" => {
-                let v = eval_string_set(&elements[1..], kw_span, env, output)?;
+                let v = eval_string_set(&elements[1..], kw_span, env, output, ctx)?;
+                return Ok(TcoAction::Result(v));
+            }
+            "call/cc" | "call-with-current-continuation" => {
+                let v = eval_callcc_form(&elements[1..], kw_span, env, output, ctx)?;
                 return Ok(TcoAction::Result(v));
             }
             _ => {}
@@ -102,7 +129,7 @@ fn eval_list_step(
         if is_builtin(name) {
             let args: Vec<Value> = elements[1..]
                 .iter()
-                .map(|e| eval(e, env, output))
+                .map(|e| eval(e, env, output, ctx))
                 .collect::<Result<Vec<_>, _>>()?;
             let v = eval_builtin(name, &args, &elements[0].span, output)?;
             return Ok(TcoAction::Result(v));
@@ -110,13 +137,13 @@ fn eval_list_step(
     }
 
     // Evaluate operator and arguments
-    let op = eval(&elements[0], env, output)?;
+    let op = eval(&elements[0], env, output, ctx)?;
     let args: Vec<Value> = elements[1..]
         .iter()
-        .map(|e| eval(e, env, output))
+        .map(|e| eval(e, env, output, ctx))
         .collect::<Result<Vec<_>, _>>()?;
 
-    apply_step(&op, &args, list_span, output)
+    apply_step(&op, &args, list_span, output, ctx)
 }
 
 fn is_builtin(name: &str) -> bool {
@@ -162,6 +189,7 @@ fn apply_step(
     args: &[Value],
     span: &Span,
     output: &mut String,
+    ctx: &mut ContCtx,
 ) -> Result<TcoAction, EvalError> {
     match op {
         Value::Lambda {
@@ -209,7 +237,7 @@ fn apply_step(
                 return Ok(TcoAction::Result(Value::Nil));
             }
             for expr in &body[..body.len() - 1] {
-                eval(expr, &call_env, output)?;
+                eval(expr, &call_env, output, ctx)?;
             }
             // Tail call: return the last body expression for trampoline
             Ok(TcoAction::TailCall {
@@ -217,19 +245,116 @@ fn apply_step(
                 env: call_env,
             })
         }
-        Value::Builtin(name) => {
-            match name.as_str() {
-                "apply" => eval_apply(args, span, output),
-                _ => {
-                    let v = eval_builtin(name, args, span, output)?;
-                    Ok(TcoAction::Result(v))
+        Value::Builtin(name) => match name.as_str() {
+            "apply" => eval_apply(args, span, output, ctx),
+            "call/cc" => {
+                if args.len() != 1 {
+                    return Err(EvalErrorKind::Arity {
+                        name: "call/cc".into(),
+                        expected: "1".into(),
+                        got: args.len(),
+                    }
+                    .at(span));
                 }
+                let result = do_callcc(&args[0], span, output, ctx)?;
+                Ok(TcoAction::Result(result))
             }
+            _ => {
+                let v = eval_builtin(name, args, span, output)?;
+                Ok(TcoAction::Result(v))
+            }
+        },
+        Value::Continuation { id, frames } => {
+            if args.len() != 1 {
+                return Err(EvalErrorKind::Arity {
+                    name: "#<continuation>".into(),
+                    expected: "1".into(),
+                    got: args.len(),
+                }
+                .at(span));
+            }
+            // Store the value and frames for the resume handler to pick up
+            ctx.pending = Some(args[0].clone());
+            ctx.resume_frames = Some(frames.clone());
+            Err(EvalErrorKind::ContinuationReturn { id: *id }.at(span))
         }
         _ => Err(EvalErrorKind::NotAProcedure {
             value: op.to_string(),
         }
         .at(span)),
+    }
+}
+
+// ===== call/cc implementation =====
+
+/// Handle (call/cc <func>) as a special form.
+fn eval_callcc_form(
+    args: &[Expr],
+    span: &Span,
+    env: &Env,
+    output: &mut String,
+    ctx: &mut ContCtx,
+) -> Result<Value, EvalError> {
+    if args.len() != 1 {
+        return Err(EvalErrorKind::Arity {
+            name: "call/cc".into(),
+            expected: "1".into(),
+            got: args.len(),
+        }
+        .at(span));
+    }
+    let func = eval(&args[0], env, output, ctx)?;
+    do_callcc(&func, span, output, ctx)
+}
+
+/// Core call/cc logic shared between the special form and the first-class value.
+fn do_callcc(
+    func: &Value,
+    span: &Span,
+    output: &mut String,
+    ctx: &mut ContCtx,
+) -> Result<Value, EvalError> {
+    // If we're resuming a saved continuation, return the pending value
+    if let Some(pending) = ctx.pending.take() {
+        return Ok(pending);
+    }
+
+    // Normal call/cc: capture current continuation and call the function
+    let id = ctx.next_id();
+    let frames = ctx.frames.clone();
+    let cont = Value::Continuation { id, frames };
+
+    match apply_func(func, &[cont], span, output, ctx) {
+        Ok(v) => Ok(v),
+        Err(e) => {
+            if let EvalErrorKind::ContinuationReturn { id: ret_id } = &e.kind {
+                if *ret_id == id {
+                    // Escape continuation: invoked within call/cc's function.
+                    // The value was stored in ctx.pending by apply_step.
+                    ctx.resume_frames.take();
+                    return Ok(ctx
+                        .pending
+                        .take()
+                        .expect("continuation value should be set"));
+                }
+            }
+            Err(e)
+        }
+    }
+}
+
+/// Apply a function to arguments, resolving any tail calls via the trampoline.
+fn apply_func(
+    func: &Value,
+    args: &[Value],
+    span: &Span,
+    output: &mut String,
+    ctx: &mut ContCtx,
+) -> Result<Value, EvalError> {
+    let action = apply_step(func, args, span, output, ctx)?;
+    match action {
+        TcoAction::Result(v) => Ok(v),
+        TcoAction::TailCall { expr, env } => eval(&expr, &env, output, ctx),
     }
 }
 
@@ -297,6 +422,7 @@ fn eval_if_step(
     span: &Span,
     env: &Env,
     output: &mut String,
+    ctx: &mut ContCtx,
 ) -> Result<TcoAction, EvalError> {
     if args.len() < 2 || args.len() > 3 {
         return Err(EvalErrorKind::Parse {
@@ -304,7 +430,7 @@ fn eval_if_step(
         }
         .at(span));
     }
-    let cond = eval(&args[0], env, output)?;
+    let cond = eval(&args[0], env, output, ctx)?;
     if cond.is_truthy() {
         Ok(TcoAction::TailCall {
             expr: args[1].clone(),
@@ -325,6 +451,7 @@ fn eval_set(
     span: &Span,
     env: &Env,
     output: &mut String,
+    ctx: &mut ContCtx,
 ) -> Result<Value, EvalError> {
     if args.len() != 2 {
         return Err(EvalErrorKind::Parse {
@@ -341,7 +468,7 @@ fn eval_set(
             .at(span))
         }
     };
-    let val = eval(&args[1], env, output)?;
+    let val = eval(&args[1], env, output, ctx)?;
     env.set(name, val).map_err(|e| e.with_span(span))?;
     Ok(Value::Nil)
 }
@@ -351,6 +478,7 @@ fn eval_define(
     span: &Span,
     env: &Env,
     output: &mut String,
+    ctx: &mut ContCtx,
 ) -> Result<Value, EvalError> {
     if args.is_empty() {
         return Err(EvalErrorKind::Parse {
@@ -368,7 +496,7 @@ fn eval_define(
                 }
                 .at(span));
             }
-            let val = eval(&args[1], env, output)?;
+            let val = eval(&args[1], env, output, ctx)?;
             env.define(name.clone(), val);
             Ok(Value::Nil)
         }
@@ -435,14 +563,20 @@ fn expr_to_value(expr: &Expr) -> Result<Value, EvalError> {
     }
 }
 
-fn parse_params(param_exprs: &[Expr], span: &Span) -> Result<(Vec<String>, Option<String>), EvalError> {
+fn parse_params(
+    param_exprs: &[Expr],
+    span: &Span,
+) -> Result<(Vec<String>, Option<String>), EvalError> {
     // Look for dot notation: (a b . rest)
-    let dot_pos = param_exprs.iter().position(|e| matches!(&e.kind, ExprKind::Symbol(s) if s == "."));
+    let dot_pos = param_exprs
+        .iter()
+        .position(|e| matches!(&e.kind, ExprKind::Symbol(s) if s == "."));
     match dot_pos {
         Some(pos) => {
             if pos + 1 != param_exprs.len() - 1 {
                 return Err(EvalErrorKind::Parse {
-                    message: "improper parameter list: expected exactly one symbol after dot".into(),
+                    message:
+                        "improper parameter list: expected exactly one symbol after dot".into(),
                 }
                 .at(span));
             }
@@ -516,13 +650,14 @@ fn eval_and_step(
     args: &[Expr],
     env: &Env,
     output: &mut String,
+    ctx: &mut ContCtx,
 ) -> Result<TcoAction, EvalError> {
     if args.is_empty() {
         return Ok(TcoAction::Result(Value::Boolean(true)));
     }
     // Evaluate all but the last; short-circuit on false
     for arg in &args[..args.len() - 1] {
-        let result = eval(arg, env, output)?;
+        let result = eval(arg, env, output, ctx)?;
         if !result.is_truthy() {
             return Ok(TcoAction::Result(result));
         }
@@ -538,13 +673,14 @@ fn eval_or_step(
     args: &[Expr],
     env: &Env,
     output: &mut String,
+    ctx: &mut ContCtx,
 ) -> Result<TcoAction, EvalError> {
     if args.is_empty() {
         return Ok(TcoAction::Result(Value::Boolean(false)));
     }
     // Evaluate all but the last; short-circuit on true
     for arg in &args[..args.len() - 1] {
-        let result = eval(arg, env, output)?;
+        let result = eval(arg, env, output, ctx)?;
         if result.is_truthy() {
             return Ok(TcoAction::Result(result));
         }
@@ -561,6 +697,7 @@ fn eval_not(
     span: &Span,
     env: &Env,
     output: &mut String,
+    ctx: &mut ContCtx,
 ) -> Result<Value, EvalError> {
     if args.len() != 1 {
         return Err(EvalErrorKind::Arity {
@@ -570,7 +707,7 @@ fn eval_not(
         }
         .at(span));
     }
-    let val = eval(&args[0], env, output)?;
+    let val = eval(&args[0], env, output, ctx)?;
     Ok(Value::Boolean(!val.is_truthy()))
 }
 
@@ -782,6 +919,7 @@ fn eval_apply(
     args: &[Value],
     span: &Span,
     output: &mut String,
+    ctx: &mut ContCtx,
 ) -> Result<TcoAction, EvalError> {
     if args.len() < 2 {
         return Err(EvalErrorKind::Arity {
@@ -796,7 +934,7 @@ fn eval_apply(
     let tail_args = value_list_to_vec(last, span)?;
     let mut all_args: Vec<Value> = args[1..args.len() - 1].to_vec();
     all_args.extend(tail_args);
-    apply_step(func, &all_args, span, output)
+    apply_step(func, &all_args, span, output, ctx)
 }
 
 fn eval_length(args: &[Value], span: &Span) -> Result<Value, EvalError> {
@@ -833,6 +971,7 @@ fn eval_let_step(
     span: &Span,
     env: &Env,
     output: &mut String,
+    ctx: &mut ContCtx,
 ) -> Result<TcoAction, EvalError> {
     if args.len() < 2 {
         return Err(EvalErrorKind::Parse {
@@ -872,7 +1011,7 @@ fn eval_let_step(
                             .at(span))
                         }
                     };
-                    let val = eval(&pair[1], env, output)?;
+                    let val = eval(&pair[1], env, output, ctx)?;
                     params.push(param);
                     init_vals.push(val);
                 }
@@ -904,7 +1043,7 @@ fn eval_let_step(
             return Ok(TcoAction::Result(Value::Nil));
         }
         for expr in &body_exprs[..body_exprs.len() - 1] {
-            eval(expr, &let_env, output)?;
+            eval(expr, &let_env, output, ctx)?;
         }
         return Ok(TcoAction::TailCall {
             expr: body_exprs[body_exprs.len() - 1].clone(),
@@ -935,7 +1074,7 @@ fn eval_let_step(
                         .at(span))
                     }
                 };
-                let val = eval(&pair[1], env, output)?;
+                let val = eval(&pair[1], env, output, ctx)?;
                 let_env.define(name, val);
             }
             _ => {
@@ -951,7 +1090,7 @@ fn eval_let_step(
         return Ok(TcoAction::Result(Value::Nil));
     }
     for expr in &body[..body.len() - 1] {
-        eval(expr, &let_env, output)?;
+        eval(expr, &let_env, output, ctx)?;
     }
     Ok(TcoAction::TailCall {
         expr: body[body.len() - 1].clone(),
@@ -963,12 +1102,13 @@ fn eval_begin_step(
     args: &[Expr],
     env: &Env,
     output: &mut String,
+    ctx: &mut ContCtx,
 ) -> Result<TcoAction, EvalError> {
     if args.is_empty() {
         return Ok(TcoAction::Result(Value::Nil));
     }
     for expr in &args[..args.len() - 1] {
-        eval(expr, env, output)?;
+        eval(expr, env, output, ctx)?;
     }
     Ok(TcoAction::TailCall {
         expr: args[args.len() - 1].clone(),
@@ -981,6 +1121,7 @@ fn eval_cond_step(
     span: &Span,
     env: &Env,
     output: &mut String,
+    ctx: &mut ContCtx,
 ) -> Result<TcoAction, EvalError> {
     for clause in clauses {
         match &clause.kind {
@@ -989,7 +1130,7 @@ fn eval_cond_step(
                 if let ExprKind::Symbol(s) = &parts[0].kind {
                     if s == "else" {
                         for expr in &parts[1..parts.len() - 1] {
-                            eval(expr, env, output)?;
+                            eval(expr, env, output, ctx)?;
                         }
                         return Ok(TcoAction::TailCall {
                             expr: parts[parts.len() - 1].clone(),
@@ -997,10 +1138,10 @@ fn eval_cond_step(
                         });
                     }
                 }
-                let test = eval(&parts[0], env, output)?;
+                let test = eval(&parts[0], env, output, ctx)?;
                 if test.is_truthy() {
                     for expr in &parts[1..parts.len() - 1] {
-                        eval(expr, env, output)?;
+                        eval(expr, env, output, ctx)?;
                     }
                     return Ok(TcoAction::TailCall {
                         expr: parts[parts.len() - 1].clone(),
@@ -1207,6 +1348,7 @@ fn eval_string_set(
     span: &Span,
     env: &Env,
     output: &mut String,
+    ctx: &mut ContCtx,
 ) -> Result<Value, EvalError> {
     if args.len() != 3 {
         return Err(EvalErrorKind::Arity {
@@ -1226,9 +1368,9 @@ fn eval_string_set(
             .at(span))
         }
     };
-    let idx_val = eval(&args[1], env, output)?;
+    let idx_val = eval(&args[1], env, output, ctx)?;
     let idx = require_integer(&idx_val, span)? as usize;
-    let char_val = eval(&args[2], env, output)?;
+    let char_val = eval(&args[2], env, output, ctx)?;
     let ch = match &char_val {
         Value::Char(c) => *c,
         other => {
