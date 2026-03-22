@@ -1,8 +1,15 @@
+mod builtins;
 pub mod error;
 
 pub use error::EvalError;
 
+use builtins::{
+    builtin_add, builtin_and, builtin_cmp, builtin_div, builtin_mul, builtin_not, builtin_or,
+    builtin_sub,
+};
 use std::collections::HashMap;
+
+type Env = HashMap<String, Value>;
 
 /// A Scheme value.
 #[derive(Debug, Clone)]
@@ -12,6 +19,12 @@ enum Value {
     Str(String),
     Symbol(String),
     List(Vec<Value>),
+    Lambda {
+        name: Option<String>,
+        params: Vec<String>,
+        body: Vec<Value>,
+        closure_env: Env,
+    },
 }
 
 impl Value {
@@ -35,6 +48,7 @@ impl Value {
             Value::Str(_) => "string",
             Value::Symbol(_) => "symbol",
             Value::List(_) => "list",
+            Value::Lambda { .. } => "procedure",
         }
     }
 
@@ -49,6 +63,7 @@ impl Value {
                 let inner: Vec<String> = items.iter().map(|v| v.display()).collect();
                 format!("({})", inner.join(" "))
             }
+            Value::Lambda { .. } => "#<procedure>".to_string(),
         }
     }
 }
@@ -59,6 +74,7 @@ impl Value {
 enum Token {
     LParen,
     RParen,
+    Quote,
     Symbol(String),
     Integer(i64),
     Boolean(bool),
@@ -84,6 +100,10 @@ fn tokenize(input: &str) -> Result<Vec<Token>, EvalError> {
             }
             ')' => {
                 tokens.push(Token::RParen);
+                i += 1;
+            }
+            '\'' => {
+                tokens.push(Token::Quote);
                 i += 1;
             }
             '"' => {
@@ -190,6 +210,10 @@ fn parse(tokens: &[Token], pos: usize) -> Result<(Value, usize), EvalError> {
                 i = next;
             }
         }
+        Token::Quote => {
+            let (val, next) = parse(tokens, pos + 1)?;
+            Ok((Value::List(vec![Value::Symbol("quote".to_string()), val]), next))
+        }
         Token::RParen => Err(EvalError::Parse {
             message: "unexpected )".to_string(),
         }),
@@ -210,15 +234,13 @@ fn parse_all(input: &str) -> Result<Vec<Value>, EvalError> {
 
 // --- Evaluator ---
 
-type Env = HashMap<String, Value>;
-
 fn default_env() -> Env {
     Env::new()
 }
 
 fn eval(expr: &Value, env: &mut Env) -> Result<Value, EvalError> {
     match expr {
-        Value::Integer(_) | Value::Boolean(_) | Value::Str(_) => Ok(expr.clone()),
+        Value::Integer(_) | Value::Boolean(_) | Value::Str(_) | Value::Lambda { .. } => Ok(expr.clone()),
         Value::Symbol(name) => env.get(name).cloned().ok_or_else(|| EvalError::UnboundVariable {
             name: name.clone(),
         }),
@@ -232,6 +254,111 @@ fn eval(expr: &Value, env: &mut Env) -> Result<Value, EvalError> {
             // Check for special forms
             if let Value::Symbol(op) = &items[0] {
                 match op.as_str() {
+                    "quote" => {
+                        if items.len() != 2 {
+                            return Err(EvalError::Arity {
+                                procedure: "quote".to_string(),
+                                expected: "1".to_string(),
+                                got: items.len() - 1,
+                            });
+                        }
+                        return Ok(items[1].clone());
+                    }
+                    "if" => {
+                        if items.len() < 3 || items.len() > 4 {
+                            return Err(EvalError::Parse {
+                                message: "if requires 2 or 3 arguments".to_string(),
+                            });
+                        }
+                        let cond = eval(&items[1], env)?;
+                        if cond.is_truthy() {
+                            return eval(&items[2], env);
+                        } else if items.len() == 4 {
+                            return eval(&items[3], env);
+                        }
+                        return Ok(Value::Boolean(false));
+                    }
+                    "define" => {
+                        if items.len() < 3 {
+                            return Err(EvalError::Parse {
+                                message: "define requires at least 2 arguments".to_string(),
+                            });
+                        }
+                        match &items[1] {
+                            Value::Symbol(name) => {
+                                let mut val = eval(&items[2], env)?;
+                                // Tag lambdas with their name for self-recursion
+                                if let Value::Lambda { name: ref mut n, .. } = val {
+                                    *n = Some(name.clone());
+                                }
+                                env.insert(name.clone(), val);
+                                return Ok(Value::Boolean(false));
+                            }
+                            Value::List(sig) => {
+                                // (define (f params...) body...)
+                                if sig.is_empty() {
+                                    return Err(EvalError::Parse {
+                                        message: "define: empty signature".to_string(),
+                                    });
+                                }
+                                let name = match &sig[0] {
+                                    Value::Symbol(n) => n.clone(),
+                                    other => return Err(EvalError::TypeError {
+                                        message: format!("define: expected symbol for name, got {}", other.type_name()),
+                                    }),
+                                };
+                                let params: Vec<String> = sig[1..].iter().map(|p| {
+                                    match p {
+                                        Value::Symbol(s) => Ok(s.clone()),
+                                        other => Err(EvalError::TypeError {
+                                            message: format!("define: expected symbol for parameter, got {}", other.type_name()),
+                                        }),
+                                    }
+                                }).collect::<Result<_, _>>()?;
+                                let body: Vec<Value> = items[2..].to_vec();
+                                let closure = Value::Lambda {
+                                    name: Some(name.clone()),
+                                    params,
+                                    body,
+                                    closure_env: env.clone(),
+                                };
+                                env.insert(name, closure);
+                                return Ok(Value::Boolean(false));
+                            }
+                            other => return Err(EvalError::TypeError {
+                                message: format!("define: expected symbol or list, got {}", other.type_name()),
+                            }),
+                        }
+                    }
+                    "lambda" => {
+                        if items.len() < 3 {
+                            return Err(EvalError::Parse {
+                                message: "lambda requires params and body".to_string(),
+                            });
+                        }
+                        let params = match &items[1] {
+                            Value::List(param_list) => {
+                                param_list.iter().map(|p| {
+                                    match p {
+                                        Value::Symbol(s) => Ok(s.clone()),
+                                        other => Err(EvalError::TypeError {
+                                            message: format!("lambda: expected symbol for parameter, got {}", other.type_name()),
+                                        }),
+                                    }
+                                }).collect::<Result<Vec<_>, _>>()?
+                            }
+                            other => return Err(EvalError::TypeError {
+                                message: format!("lambda: expected parameter list, got {}", other.type_name()),
+                            }),
+                        };
+                        let body: Vec<Value> = items[2..].to_vec();
+                        return Ok(Value::Lambda {
+                            name: None,
+                            params,
+                            body,
+                            closure_env: env.clone(),
+                        });
+                    }
                     "+" => return builtin_add(&items[1..], env),
                     "-" => return builtin_sub(&items[1..], env),
                     "*" => return builtin_mul(&items[1..], env),
@@ -240,6 +367,7 @@ fn eval(expr: &Value, env: &mut Env) -> Result<Value, EvalError> {
                     ">" => return builtin_cmp(&items[1..], env, ">"),
                     "=" => return builtin_cmp(&items[1..], env, "="),
                     "<=" => return builtin_cmp(&items[1..], env, "<="),
+                    ">=" => return builtin_cmp(&items[1..], env, ">="),
                     "not" => return builtin_not(&items[1..], env),
                     "and" => return builtin_and(&items[1..], env),
                     "or" => return builtin_or(&items[1..], env),
@@ -247,125 +375,46 @@ fn eval(expr: &Value, env: &mut Env) -> Result<Value, EvalError> {
                 }
             }
 
-            Err(EvalError::UnboundVariable {
-                name: items[0].display(),
-            })
+            // Function application
+            let func = eval(&items[0], env)?;
+            let args = eval_args(&items[1..], env)?;
+            apply_function(&func, &args)
         }
+    }
+}
+
+fn apply_function(func: &Value, args: &[Value]) -> Result<Value, EvalError> {
+    match func {
+        Value::Lambda { name, params, body, closure_env } => {
+            if params.len() != args.len() {
+                return Err(EvalError::Arity {
+                    procedure: name.as_deref().unwrap_or("lambda").to_string(),
+                    expected: params.len().to_string(),
+                    got: args.len(),
+                });
+            }
+            let mut local_env = closure_env.clone();
+            // Inject self-reference for recursion
+            if let Some(fn_name) = name {
+                local_env.insert(fn_name.clone(), func.clone());
+            }
+            for (param, arg) in params.iter().zip(args.iter()) {
+                local_env.insert(param.clone(), arg.clone());
+            }
+            let mut result = Value::Boolean(false);
+            for expr in body {
+                result = eval(expr, &mut local_env)?;
+            }
+            Ok(result)
+        }
+        other => Err(EvalError::TypeError {
+            message: format!("not a procedure: {}", other.display()),
+        }),
     }
 }
 
 fn eval_args(args: &[Value], env: &mut Env) -> Result<Vec<Value>, EvalError> {
     args.iter().map(|a| eval(a, env)).collect()
-}
-
-fn builtin_add(args: &[Value], env: &mut Env) -> Result<Value, EvalError> {
-    let vals = eval_args(args, env)?;
-    let mut sum: i64 = 0;
-    for v in &vals {
-        sum += v.as_integer("+")?;
-    }
-    Ok(Value::Integer(sum))
-}
-
-fn builtin_sub(args: &[Value], env: &mut Env) -> Result<Value, EvalError> {
-    let vals = eval_args(args, env)?;
-    if vals.is_empty() {
-        return Err(EvalError::Arity {
-            procedure: "-".to_string(),
-            expected: "at least 1".to_string(),
-            got: 0,
-        });
-    }
-    if vals.len() == 1 {
-        return Ok(Value::Integer(-vals[0].as_integer("-")?));
-    }
-    let mut result = vals[0].as_integer("-")?;
-    for v in &vals[1..] {
-        result -= v.as_integer("-")?;
-    }
-    Ok(Value::Integer(result))
-}
-
-fn builtin_mul(args: &[Value], env: &mut Env) -> Result<Value, EvalError> {
-    let vals = eval_args(args, env)?;
-    let mut product: i64 = 1;
-    for v in &vals {
-        product *= v.as_integer("*")?;
-    }
-    Ok(Value::Integer(product))
-}
-
-fn builtin_div(args: &[Value], env: &mut Env) -> Result<Value, EvalError> {
-    let vals = eval_args(args, env)?;
-    if vals.len() != 2 {
-        return Err(EvalError::Arity {
-            procedure: "/".to_string(),
-            expected: "2".to_string(),
-            got: vals.len(),
-        });
-    }
-    let a = vals[0].as_integer("/")?;
-    let b = vals[1].as_integer("/")?;
-    if b == 0 {
-        return Err(EvalError::DivisionByZero);
-    }
-    Ok(Value::Integer(a / b))
-}
-
-fn builtin_cmp(args: &[Value], env: &mut Env, op: &str) -> Result<Value, EvalError> {
-    let vals = eval_args(args, env)?;
-    if vals.len() != 2 {
-        return Err(EvalError::Arity {
-            procedure: op.to_string(),
-            expected: "2".to_string(),
-            got: vals.len(),
-        });
-    }
-    let a = vals[0].as_integer(op)?;
-    let b = vals[1].as_integer(op)?;
-    let result = match op {
-        "<" => a < b,
-        ">" => a > b,
-        "=" => a == b,
-        "<=" => a <= b,
-        ">=" => a >= b,
-        other => unreachable!("unknown comparison operator: {other}"),
-    };
-    Ok(Value::Boolean(result))
-}
-
-fn builtin_not(args: &[Value], env: &mut Env) -> Result<Value, EvalError> {
-    if args.len() != 1 {
-        return Err(EvalError::Arity {
-            procedure: "not".to_string(),
-            expected: "1".to_string(),
-            got: args.len(),
-        });
-    }
-    let val = eval(&args[0], env)?;
-    Ok(Value::Boolean(!val.is_truthy()))
-}
-
-fn builtin_and(args: &[Value], env: &mut Env) -> Result<Value, EvalError> {
-    let mut result = Value::Boolean(true);
-    for arg in args {
-        result = eval(arg, env)?;
-        if !result.is_truthy() {
-            return Ok(result);
-        }
-    }
-    Ok(result)
-}
-
-fn builtin_or(args: &[Value], env: &mut Env) -> Result<Value, EvalError> {
-    let mut result = Value::Boolean(false);
-    for arg in args {
-        result = eval(arg, env)?;
-        if result.is_truthy() {
-            return Ok(result);
-        }
-    }
-    Ok(result)
 }
 
 /// Evaluate one or more Scheme expressions and return the string
