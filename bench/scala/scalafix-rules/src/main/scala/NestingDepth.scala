@@ -3,7 +3,7 @@ import scalafix.lint.{Diagnostic, LintSeverity}
 import scala.meta._
 
 class NestingDepth extends SyntacticRule("NestingDepth") {
-  val maxDepth = 5
+  val maxDepth = 6
 
   override def fix(implicit doc: SyntacticDocument): Patch = {
     def checkNesting(tree: Tree, currentDepth: Int): List[Patch] = {

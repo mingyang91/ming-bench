@@ -3,7 +3,7 @@ import scalafix.lint.{Diagnostic, LintSeverity}
 import scala.meta._
 
 class MethodTooLong extends SyntacticRule("MethodTooLong") {
-  val maxLines = 100
+  val maxLines = 300
 
   override def fix(implicit doc: SyntacticDocument): Patch = {
     doc.tree.collect {

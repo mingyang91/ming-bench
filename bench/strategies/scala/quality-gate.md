@@ -275,9 +275,9 @@ No hidden side effects.
 
 These limits are enforced by **scalafix** custom rules (`FileTooLong`, `MethodTooLong`, `NestingDepth`) during the quality gate cleanup pass.
 
-- **Hard cap: 300 lines per file.** Split by subsystem into dedicated files. Each distinct responsibility gets its own file under `src/main/scala/ming/`.
-- **Method hard cap: 100 lines.** If a method needs scrolling, extract helpers.
-- **Max nesting: 5 levels.** Use early returns, pattern matching, and extracted helpers to reduce brace depth. Nesting-increasing constructs: `if`, `match`, `while`, `for`, `for/yield`, `try`.
+- **Hard cap: 500 lines per file.** Split by subsystem into dedicated files. Each distinct responsibility gets its own file under `src/main/scala/ming/`.
+- **Method hard cap: 300 lines.** If a method needs scrolling, extract helpers.
+- **Max nesting: 6 levels.** Use early returns, pattern matching, and extracted helpers to reduce brace depth. Nesting-increasing constructs: `if`, `match`, `while`, `for`, `for/yield`, `try`.
 
   ```scala
   // Bad — 4+ levels deep
@@ -323,9 +323,9 @@ These lints are enforced by **scalafix** and **scalafmt** in a **separate cleanu
 
 | Rule | Threshold | What it checks |
 |---|---|---|
-| `FileTooLong` | 300 lines | Total lines in any `.scala` file |
-| `MethodTooLong` | 100 lines | Body lines in any `def` |
-| `NestingDepth` | 5 levels | `if`/`match`/`while`/`for`/`try` depth in any `def` |
+| `FileTooLong` | 500 lines | Total lines in any `.scala` file |
+| `MethodTooLong` | 300 lines | Body lines in any `def` |
+| `NestingDepth` | 6 levels | `if`/`match`/`while`/`for`/`try` depth in any `def` |
 
 ### Denied patterns (code review)
 

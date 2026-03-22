@@ -13,6 +13,7 @@ pub fn run(level: &str, gate: bool, lang: &str) -> Result<()> {
     match parsed_lang {
         crate::model::Lang::Rust => run_rust(level, gate),
         crate::model::Lang::Scala => run_mill(level, gate),
+        crate::model::Lang::Java => run_gradle(level, gate),
         _ => run_script(level, gate, &parsed_lang),
     }
 }
@@ -79,61 +80,7 @@ fn mill_quality_gate(lang_dir: &Path) -> Result<()> {
 }
 
 fn run_mill_container(proj: &Path, jar: &Path, level: &str) -> Result<()> {
-    let (timeout, tag_arg) = if level == "all" {
-        (450, String::new())
-    } else {
-        (45, format!(" --include-tags=l{level}"))
-    };
-
-    let bench_level = if level == "all" {
-        LEVELS.last().expect("no levels defined").to_string()
-    } else {
-        level.to_string()
-    };
-
-    let bench_dir = proj.join("bench");
-    let jar_mount = format!("{}:/bench/test.jar:ro,Z", jar.display());
-    let fixtures_mount = format!(
-        "{}:/bench/fixtures:ro,Z",
-        bench_dir.join("fixtures").display()
-    );
-    let tests_mount = format!(
-        "{}:/bench/tests.json:ro,Z",
-        bench_dir.join("tests.json").display()
-    );
-
-    let java_cmd = format!(
-        "timeout {timeout}s java -Dbench.dir=/bench -jar /bench/test.jar --bench-level {bench_level}{tag_arg}"
-    );
-
-    println!("Running Scala tests (level {level}) in container...");
-    let exit = run_cmd(
-        "sudo",
-        &[
-            "podman",
-            "run",
-            "--rm",
-            "--memory=2g",
-            "--cpus=1",
-            "--pids-limit=256",
-            "-v",
-            &jar_mount,
-            "-v",
-            &fixtures_mount,
-            "-v",
-            &tests_mount,
-            JVM_IMAGE,
-            &java_cmd,
-        ],
-        proj,
-    )?;
-    if exit != 0 {
-        return Err(Error::CommandFailed {
-            cmd: "podman run (scala test)".to_string(),
-            exit_code: exit,
-        });
-    }
-    Ok(())
+    run_jvm_container(proj, jar, level, "Scala")
 }
 
 /// Run Scala tests: compile + assembly on host, execute JAR in container.
@@ -163,6 +110,94 @@ fn run_mill(level: &str, gate: bool) -> Result<()> {
     }
 
     run_mill_container(&proj, &jar, level)
+}
+
+/// Run Java tests: gradle shadowJar on host, execute fat JAR in container.
+fn run_gradle(level: &str, gate: bool) -> Result<()> {
+    let proj = project_dir();
+    let lang_dir = proj.join("bench/java");
+
+    // Build shadow JAR
+    println!("Building Java shadow JAR...");
+    let exit = run_cmd("./gradlew", &["shadowJar"], &lang_dir)?;
+    if exit != 0 {
+        return Err(Error::CommandFailed {
+            cmd: "gradlew shadowJar".to_string(),
+            exit_code: exit,
+        });
+    }
+
+    let jar = lang_dir.join("build/libs/ming-test.jar");
+    if !jar.is_file() {
+        return Err(Error::CommandFailed {
+            cmd: "shadow JAR not found after build".to_string(),
+            exit_code: 1,
+        });
+    }
+
+    if gate {
+        // Java quality gate: placeholder for future linter integration
+        println!("No quality gate configured for Java (skipping).");
+    }
+
+    run_jvm_container(&proj, &jar, level, "Java")
+}
+
+/// Run a fat JAR inside the JVM container (shared by Java and Scala).
+fn run_jvm_container(proj: &Path, jar: &Path, level: &str, lang_label: &str) -> Result<()> {
+    let (timeout, level_arg) = if level == "all" {
+        (450, "all".to_string())
+    } else {
+        (45, level.to_string())
+    };
+
+    let bench_dir = proj.join("bench");
+    let jar_mount = format!("{}:/bench/test.jar:ro,Z", jar.display());
+    let fixtures_mount = format!(
+        "{}:/bench/fixtures:ro,Z",
+        bench_dir.join("fixtures").display()
+    );
+    let tests_mount = format!(
+        "{}:/bench/tests.json:ro,Z",
+        bench_dir.join("tests.json").display()
+    );
+
+    let java_cmd = format!(
+        "timeout {timeout}s java -jar /bench/test.jar {level_arg}"
+    );
+
+    println!("Running {lang_label} tests (level {level}) in container...");
+    let exit = run_cmd(
+        "sudo",
+        &[
+            "podman",
+            "run",
+            "--rm",
+            "--memory=2g",
+            "--cpus=1",
+            "--pids-limit=256",
+            "-v",
+            &jar_mount,
+            "-v",
+            &fixtures_mount,
+            "-v",
+            &tests_mount,
+            "-e",
+            "TESTS_JSON=/bench/tests.json",
+            "-e",
+            "FIXTURES_DIR=/bench/fixtures",
+            JVM_IMAGE,
+            &java_cmd,
+        ],
+        proj,
+    )?;
+    if exit != 0 {
+        return Err(Error::CommandFailed {
+            cmd: format!("podman run ({lang_label} test)"),
+            exit_code: exit,
+        });
+    }
+    Ok(())
 }
 
 /// Run tests for non-Rust languages by calling build.sh + test.sh scripts.
