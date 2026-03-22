@@ -357,7 +357,8 @@ fn eval_list_tco(
                 return Ok(Trampoline::Done(val));
             }
             "string-set!" => {
-                return Err(EvalError::type_err("string-set!: strings are immutable"));
+                let val = eval_string_set(&items[1..], env, out, cc)?;
+                return Ok(Trampoline::Done(val));
             }
             "call/cc" | "call-with-current-continuation" => {
                 return eval_callcc(&items[1..], env, out, cc);
@@ -1546,6 +1547,43 @@ fn eval_set(
     Ok(Value::Void)
 }
 
+fn eval_string_set(
+    args: &[Value],
+    env: &Rc<RefCell<Env>>,
+    out: &mut String,
+    cc: &CcCtx,
+) -> Result<Value, EvalError> {
+    if args.len() != 3 {
+        return Err(EvalError::arity("string-set! requires exactly 3 arguments"));
+    }
+    let Value::Symbol(var_name) = &args[0] else {
+        return Err(EvalError::type_err("string-set!: first argument must be a variable"));
+    };
+    let idx_val = eval(&args[1], env, out, cc)?;
+    let idx = require_int(&idx_val, "string-set!")? as usize;
+    let char_val = eval(&args[2], env, out, cc)?;
+    let Value::Char(ch) = char_val else {
+        return Err(EvalError::type_err(format!(
+            "string-set!: expected char, got {char_val}"
+        )));
+    };
+    let current = env.borrow().get(var_name)?;
+    let Value::Str(s) = current else {
+        return Err(EvalError::type_err(format!(
+            "string-set!: expected string, got {current}"
+        )));
+    };
+    let mut chars: Vec<char> = s.chars().collect();
+    if idx >= chars.len() {
+        return Err(EvalError::type_err(format!(
+            "string-set!: index {idx} out of range for string of length {}", chars.len()
+        )));
+    }
+    chars[idx] = ch;
+    let new_str: String = chars.into_iter().collect();
+    env.borrow_mut().set(var_name.clone(), Value::Str(new_str));
+    Ok(Value::Void)
+}
 
 fn eval_begin_tco(
     args: &[Value],
