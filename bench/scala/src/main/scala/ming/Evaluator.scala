@@ -92,8 +92,8 @@ object Evaluator:
   // --- Dispatch helpers ---
 
   private def isSpecialForm(op: String): Boolean = op match
-    case "define" | "if" | "quote" | "lambda" | "and" | "or" | "not" | "let" | "begin" | "cond" | "set!" | "call/cc" |
-        "call-with-current-continuation" | "define-syntax" =>
+    case "define" | "if" | "quote" | "lambda" | "and" | "or" | "let" | "let*" | "letrec" | "letrec*" | "begin" |
+        "cond" | "case" | "do" | "set!" | "call/cc" | "call-with-current-continuation" | "define-syntax" | "when" =>
       true
     case _ => false
 

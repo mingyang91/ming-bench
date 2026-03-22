@@ -3,7 +3,7 @@ package ming
 import SchemeValue.*
 import Evaluator.{DoneS, EvalS, ReturnS, Step}
 
-/** Continuation application and procedure dispatch. */
+/** Continuation application. */
 private[ming] object KontApply:
 
   def applyKont(
@@ -60,12 +60,9 @@ private[ming] object KontApply:
             EvalS(head, orEnv, Kont.OrK(tail, orEnv, nextK), out)
           case Nil => ReturnS(value, nextK, out)
 
-    case Kont.NotK(nextK) =>
-      ReturnS(SchemeBool(Evaluator.isFalsy(value)), nextK, out)
-
     case Kont.CallCCK(nextK) =>
       val kontVal = SchemeContinuation(nextK)
-      applyProc(value, List(kontVal), nextK, out)
+      ProcApply.applyProc(value, List(kontVal), nextK, out)
 
     case Kont.CondK(body, remaining, condEnv, nextK) =>
       if Evaluator.isFalsy(value) then SpecialForms.evalCondClauses(remaining, condEnv, nextK, out)
@@ -83,9 +80,57 @@ private[ming] object KontApply:
       remainingGroups match
         case Nil => ReturnS(SchemeList(newAcc), nextK, out)
         case group :: rest =>
-          applyProc(proc, group, Kont.MapK(proc, rest, newAcc, nextK), out)
+          ProcApply.applyProc(proc, group, Kont.MapK(proc, rest, newAcc, nextK), out)
 
-  // --- applyKont helpers for complex cases ---
+    case Kont.LetrecInitK(curName, remNames, remInits, body, frame, nextK) =>
+      applyLetrecInit(value, curName, remNames, remInits, body, frame, nextK, out)
+
+    case Kont.LetStarInitK(name, remaining, body, lsEnv, nextK) =>
+      val newEnv = lsEnv.extend(name, value)
+      remaining match
+        case Nil => SpecialForms.startSequence(body, newEnv, nextK, out)
+        case (nextName, nextInit) :: rest =>
+          EvalS(
+            nextInit,
+            newEnv,
+            Kont.LetStarInitK(nextName, rest, body, newEnv, nextK),
+            out
+          )
+
+    case Kont.CaseK(clauses, caseEnv, nextK) =>
+      DerivedForms.evalCaseClauses(value, clauses, caseEnv, nextK, out)
+
+    case Kont.ForEachK(proc, remainingGroups, nextK) =>
+      remainingGroups match
+        case Nil => ReturnS(SchemeVoid, nextK, out)
+        case group :: rest =>
+          ProcApply.applyProc(proc, group, Kont.ForEachK(proc, rest, nextK), out)
+
+  // --- applyKont helpers ---
+
+  private def applyLetrecInit(
+    value: SchemeValue,
+    curName: String,
+    remNames: List[String],
+    remInits: List[SchemeValue],
+    body: List[SchemeValue],
+    frame: Env,
+    nextK: Kont,
+    out: String
+  ): Step =
+    frame.set(curName, value)
+    remNames match
+      case Nil => SpecialForms.startSequence(body, frame, nextK, out)
+      case nextName :: tailNames =>
+        remInits match
+          case nextInit :: tailInits =>
+            EvalS(
+              nextInit,
+              frame,
+              Kont.LetrecInitK(nextName, tailNames, tailInits, body, frame, nextK),
+              out
+            )
+          case Nil => SpecialForms.startSequence(body, frame, nextK, out)
 
   private def applyEvalOp(
     proc: SchemeValue,
@@ -97,7 +142,7 @@ private[ming] object KontApply:
   ): Step =
     argExprs.reverse match
       case Nil =>
-        try applyProc(proc, Nil, nextK, out)
+        try ProcApply.applyProc(proc, Nil, nextK, out)
         catch
           case e: EvalError if e.sourcePos == SourcePos.None =>
             throw new EvalError(e.baseMessage, callPos)
@@ -122,7 +167,7 @@ private[ming] object KontApply:
     val newEvaled = value :: evaled
     remaining match
       case Nil =>
-        try applyProc(proc, newEvaled, nextK, out)
+        try ProcApply.applyProc(proc, newEvaled, nextK, out)
         catch
           case e: EvalError if e.sourcePos == SourcePos.None =>
             throw new EvalError(e.baseMessage, callPos)
@@ -183,91 +228,3 @@ private[ming] object KontApply:
           Kont.NamedLetInitK(name, params, newEvaled, rest, body, letEnv, nextK),
           out
         )
-
-  // --- Procedure application ---
-
-  def applyProc(
-    proc: SchemeValue,
-    args: List[SchemeValue],
-    k: Kont,
-    out: String
-  ): Step = proc match
-    case SchemeLambda(params, restParam, body, closure) =>
-      val localEnv = bindArgs(params, restParam, args, closure)
-      SpecialForms.startSequence(body, localEnv, k, out)
-    case SchemeContinuation(savedK) =>
-      if args.length != 1 then throw new EvalError("continuation: expected 1 argument")
-      ReturnS(args.head, savedK, out)
-    case SchemeBuiltinProc("call/cc") | SchemeBuiltinProc("call-with-current-continuation") =>
-      if args.length != 1 then throw new EvalError("call/cc: expected 1 argument")
-      val kontVal = SchemeContinuation(k)
-      applyProc(args.head, List(kontVal), k, out)
-    case SchemeBuiltinProc("apply") =>
-      applyApply(args, k, out)
-    case SchemeBuiltinProc("map") =>
-      applyMap(args, k, out)
-    case SchemeBuiltinProc(name) =>
-      val (result, bo) = Builtins.evalBuiltin(name, args)
-      ReturnS(result, k, out + bo)
-    case other =>
-      throw new EvalError(s"not a procedure: ${other.display}")
-
-  private def bindArgs(
-    params: List[String],
-    restParam: Option[String],
-    args: List[SchemeValue],
-    closure: Env
-  ): Env = restParam match
-    case None =>
-      if params.length != args.length then
-        throw new EvalError(
-          s"expected ${params.length} arguments, got ${args.length}"
-        )
-      closure.extend(params, args)
-    case Some(rest) =>
-      if args.length < params.length then
-        throw new EvalError(
-          s"expected at least ${params.length} arguments, got ${args.length}"
-        )
-      val (fixed, remaining) = args.splitAt(params.length)
-      closure.extend(params :+ rest, fixed :+ SchemeList(remaining))
-
-  private def applyApply(
-    args: List[SchemeValue],
-    k: Kont,
-    out: String
-  ): Step =
-    if args.length < 2 then throw new EvalError("apply: expected at least 2 arguments")
-    val proc       = args.head
-    val lastArg    = args.last
-    val prefixArgs = args.drop(1).dropRight(1)
-    val allArgs = lastArg match
-      case SchemeList(es) => prefixArgs ++ es
-      case other =>
-        throw new EvalError(
-          s"apply: last argument must be a list, got ${other.display}"
-        )
-    applyProc(proc, allArgs, k, out)
-
-  private def applyMap(
-    args: List[SchemeValue],
-    k: Kont,
-    out: String
-  ): Step =
-    if args.length < 2 then throw new EvalError("map: expected at least 2 arguments")
-    val proc = args.head
-    val lists = args.tail.map {
-      case SchemeList(es) => es
-      case other          => throw new EvalError(s"map: not a list: ${other.display}")
-    }
-    if lists.isEmpty then ReturnS(SchemeList(Nil), k, out)
-    else
-      val len = lists.head.length
-      if !lists.tail.forall(_.length == len) then throw new EvalError("map: lists must have same length")
-      if len == 0 then ReturnS(SchemeList(Nil), k, out)
-      else
-        val groups = (0 until len).toList.map(i => lists.map(_(i)))
-        groups match
-          case first :: rest =>
-            applyProc(proc, first, Kont.MapK(proc, rest, Nil, k), out)
-          case Nil => ReturnS(SchemeList(Nil), k, out)

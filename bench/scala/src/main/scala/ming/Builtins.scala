@@ -28,6 +28,8 @@ object Builtins:
     "pair?",
     "symbol?",
     "char?",
+    "not",
+    "eqv?",
     "string-append",
     "string-length",
     "substring",
@@ -43,6 +45,7 @@ object Builtins:
     "newline",
     "apply",
     "map",
+    "for-each",
     "abs",
     "modulo",
     "remainder",
@@ -61,6 +64,18 @@ object Builtins:
     "assoc",
     "eq?",
     "equal?",
+    "set-car!",
+    "set-cdr!",
+    "reverse",
+    "error",
+    "vector",
+    "make-vector",
+    "vector-ref",
+    "vector-set!",
+    "vector-length",
+    "vector?",
+    "vector->list",
+    "list->vector",
     "char-alphabetic?",
     "char-numeric?",
     "char-upcase",
@@ -75,7 +90,20 @@ object Builtins:
     "string->list",
     "list->string",
     "char->integer",
-    "integer->char"
+    "integer->char",
+    "member",
+    "assv",
+    "integer?",
+    "gcd",
+    "lcm",
+    "truncate",
+    "round",
+    "make-string",
+    "string",
+    "string>?",
+    "string<=?",
+    "string>=?",
+    "procedure?"
   )
 
   def evalBuiltin(
@@ -100,19 +128,21 @@ object Builtins:
     case "="                => NumericBuiltins.compareOp(args, _ == _)
     case "<="               => NumericBuiltins.compareOp(args, _ <= _)
     case ">="               => NumericBuiltins.compareOp(args, _ >= _)
-    case "cons"             => evalCons(args)
-    case "car"              => evalCar(args)
-    case "cdr"              => evalCdr(args)
-    case "null?"            => evalNullQ(args)
+    case "cons"             => CollectionBuiltins.evalCons(args)
+    case "car"              => CollectionBuiltins.evalCar(args)
+    case "cdr"              => CollectionBuiltins.evalCdr(args)
+    case "null?"            => CollectionBuiltins.evalNullQ(args)
     case "list"             => SchemeList(args)
-    case "append"           => evalAppend(args)
-    case "length"           => evalLength(args)
-    case "string?"          => typeCheck(args, _.isInstanceOf[SchemeString])
+    case "append"           => CollectionBuiltins.evalAppend(args)
+    case "length"           => CollectionBuiltins.evalLength(args)
+    case "string?"          => typeCheck(args, isSchemeString)
     case "number?"          => typeCheck(args, _.isInstanceOf[SchemeInt])
     case "boolean?"         => typeCheck(args, _.isInstanceOf[SchemeBool])
-    case "pair?"            => evalPairQ(args)
+    case "pair?"            => CollectionBuiltins.evalPairQ(args)
     case "symbol?"          => typeCheck(args, _.isInstanceOf[SchemeSymbol])
     case "char?"            => typeCheck(args, _.isInstanceOf[SchemeChar])
+    case "not"              => CollectionBuiltins.evalNot(args)
+    case "eqv?"             => CollectionBuiltins.evalEqQ(args)
     case "string-append"    => StringCharBuiltins.evalStringAppend(args)
     case "string-length"    => StringCharBuiltins.evalStringLength(args)
     case "substring"        => StringCharBuiltins.evalSubstring(args)
@@ -135,12 +165,37 @@ object Builtins:
     case "negative?"        => NumericBuiltins.numPred(args, _ < 0)
     case "odd?"             => NumericBuiltins.numPred(args, n => math.abs(n % 2) == 1)
     case "even?"            => NumericBuiltins.numPred(args, _ % 2 == 0)
-    case "list-ref"         => evalListRef(args)
-    case "list-tail"        => evalListTail(args)
-    case "list?"            => evalListPred(args)
-    case "assoc"            => evalAssoc(args)
-    case "eq?"              => evalEqQ(args)
-    case "equal?"           => evalEqualQ(args)
+    case "list-ref"         => CollectionBuiltins.evalListRef(args)
+    case "list-tail"        => CollectionBuiltins.evalListTail(args)
+    case "list?"            => CollectionBuiltins.evalListPred(args)
+    case "assoc"            => CollectionBuiltins.evalAssoc(args)
+    case "eq?"              => CollectionBuiltins.evalEqQ(args)
+    case "equal?"           => CollectionBuiltins.evalEqualQ(args)
+    case "set-car!"         => CollectionBuiltins.evalSetCar(args)
+    case "set-cdr!"         => CollectionBuiltins.evalSetCdr(args)
+    case "reverse"          => CollectionBuiltins.evalReverse(args)
+    case "error"            => CollectionBuiltins.evalError(args)
+    case "vector"           => new SchemeVector(args.toArray)
+    case "make-vector"      => CollectionBuiltins.evalMakeVector(args)
+    case "vector-ref"       => CollectionBuiltins.evalVectorRef(args)
+    case "vector-set!"      => CollectionBuiltins.evalVectorSet(args)
+    case "vector-length"    => CollectionBuiltins.evalVectorLength(args)
+    case "vector?"          => typeCheck(args, _.isInstanceOf[SchemeVector])
+    case "vector->list"     => CollectionBuiltins.evalVectorToList(args)
+    case "list->vector"     => CollectionBuiltins.evalListToVector(args)
+    case "member"           => CollectionBuiltins.evalMember(args)
+    case "assv"             => CollectionBuiltins.evalAssv(args)
+    case "integer?"         => typeCheck(args, _.isInstanceOf[SchemeInt])
+    case "gcd"              => NumericBuiltins.evalGcd(args)
+    case "lcm"              => NumericBuiltins.evalLcm(args)
+    case "truncate"         => CollectionBuiltins.evalTruncate(args)
+    case "round"            => CollectionBuiltins.evalTruncate(args)
+    case "make-string"      => StringCharBuiltins.evalMakeString(args)
+    case "string"           => StringCharBuiltins.evalString(args)
+    case "string>?"         => StringCharBuiltins.strCmp(args, (a, b) => a.compareTo(b) > 0)
+    case "string<=?"        => StringCharBuiltins.strCmp(args, (a, b) => a.compareTo(b) <= 0)
+    case "string>=?"        => StringCharBuiltins.strCmp(args, (a, b) => a.compareTo(b) >= 0)
+    case "procedure?"       => CollectionBuiltins.evalProcedureQ(args)
     case "char-alphabetic?" => StringCharBuiltins.charPred(args, _.isLetter)
     case "char-numeric?"    => StringCharBuiltins.charPred(args, _.isDigit)
     case "char-upcase"      => StringCharBuiltins.evalCharUpcase(args)
@@ -166,117 +221,27 @@ object Builtins:
     if args.length != 1 then throw new EvalError("write: expected 1 argument")
     (SchemeVoid, args.head.display)
 
-  private def evalCons(args: List[SchemeValue]): SchemeValue =
-    if args.length != 2 then throw new EvalError("cons: expected 2 arguments")
-    args(1) match
-      case SchemeList(es) => SchemeList(args.head :: es)
-      case other          => SchemePair(args.head, other)
-
-  private def evalCar(args: List[SchemeValue]): SchemeValue =
-    if args.length != 1 then throw new EvalError("car: expected 1 argument")
-    args.head match
-      case SchemeList(h :: _) => h
-      case SchemePair(h, _)   => h
-      case other              => throw new EvalError(s"car: not a pair: ${other.display}")
-
-  private def evalCdr(args: List[SchemeValue]): SchemeValue =
-    if args.length != 1 then throw new EvalError("cdr: expected 1 argument")
-    args.head match
-      case SchemeList(_ :: t) => SchemeList(t)
-      case SchemePair(_, t)   => t
-      case other              => throw new EvalError(s"cdr: not a pair: ${other.display}")
-
-  private def evalNullQ(args: List[SchemeValue]): SchemeValue =
-    if args.length != 1 then throw new EvalError("null?: expected 1 argument")
-    SchemeBool(args.head == SchemeList(Nil))
-
-  private def evalAppend(args: List[SchemeValue]): SchemeValue =
-    val combined = args.foldLeft(List.empty[SchemeValue]) { (acc, arg) =>
-      arg match
-        case SchemeList(es) => acc ++ es
-        case other =>
-          throw new EvalError(s"append: not a list: ${other.display}")
-    }
-    SchemeList(combined)
-
-  private def evalLength(args: List[SchemeValue]): SchemeValue =
-    if args.length != 1 then throw new EvalError("length: expected 1 argument")
-    args.head match
-      case SchemeList(es) => SchemeInt(es.length.toLong)
-      case other =>
-        throw new EvalError(s"length: not a list: ${other.display}")
-
-  private def evalPairQ(args: List[SchemeValue]): SchemeValue =
-    SchemeBool(args.length == 1 && (args.head match
-      case SchemeList(_ :: _) => true
-      case _: SchemePair      => true
-      case _                  => false))
-
   private def typeCheck(
     args: List[SchemeValue],
     pred: SchemeValue => Boolean
   ): SchemeValue =
     SchemeBool(args.length == 1 && pred(args.head))
 
-  private def evalListRef(args: List[SchemeValue]): SchemeValue =
-    if args.length != 2 then throw new EvalError("list-ref: expected 2 arguments")
-    (args.head, args(1)) match
-      case (SchemeList(es), SchemeInt(idx)) =>
-        if idx < 0 || idx >= es.length then throw new EvalError("list-ref: index out of bounds")
-        es(idx.toInt)
-      case _ => throw new EvalError("list-ref: invalid arguments")
+  def asList(v: SchemeValue): List[SchemeValue] =
+    @scala.annotation.tailrec
+    def loop(v: SchemeValue, acc: List[SchemeValue]): List[SchemeValue] = v match
+      case SchemeList(es) => acc.reverse ++ es
+      case p: SchemePair  => loop(p.cdr, p.car :: acc)
+      case _              => throw new EvalError(s"not a proper list: ${v.display}")
+    loop(v, Nil)
 
-  private def evalListTail(args: List[SchemeValue]): SchemeValue =
-    if args.length != 2 then throw new EvalError("list-tail: expected 2 arguments")
-    (args.head, args(1)) match
-      case (SchemeList(es), SchemeInt(idx)) =>
-        if idx < 0 || idx > es.length then throw new EvalError("list-tail: index out of bounds")
-        SchemeList(es.drop(idx.toInt))
-      case _ => throw new EvalError("list-tail: invalid arguments")
+  def schemeEqv(a: SchemeValue, b: SchemeValue): Boolean =
+    CollectionBuiltins.schemeEqv(a, b)
 
-  private def evalListPred(args: List[SchemeValue]): SchemeValue =
-    if args.length != 1 then throw new EvalError("list?: expected 1 argument")
-    SchemeBool(args.head match
-      case SchemeList(_) => true
-      case _             => false)
-
-  private def evalAssoc(args: List[SchemeValue]): SchemeValue =
-    if args.length != 2 then throw new EvalError("assoc: expected 2 arguments")
-    val key = args.head
-    args(1) match
-      case SchemeList(alist) =>
-        alist
-          .collectFirst {
-            case pair @ SchemeList(k :: _) if schemeEqual(k, key) => pair
-          }
-          .getOrElse(SchemeBool(false))
-      case other => throw new EvalError(s"assoc: not a list: ${other.display}")
-
-  private def evalEqQ(args: List[SchemeValue]): SchemeValue =
-    if args.length != 2 then throw new EvalError("eq?: expected 2 arguments")
-    SchemeBool(schemeEq(args.head, args(1)))
-
-  private def schemeEq(a: SchemeValue, b: SchemeValue): Boolean = (a, b) match
-    case (SchemeInt(x), SchemeInt(y))       => x == y
-    case (SchemeBool(x), SchemeBool(y))     => x == y
-    case (SchemeSymbol(x), SchemeSymbol(y)) => x == y
-    case (SchemeChar(x), SchemeChar(y))     => x == y
-    case (SchemeList(Nil), SchemeList(Nil)) => true
-    case _                                  => a eq b
-
-  private def evalEqualQ(args: List[SchemeValue]): SchemeValue =
-    if args.length != 2 then throw new EvalError("equal?: expected 2 arguments")
-    SchemeBool(schemeEqual(args.head, args(1)))
-
-  private def schemeEqual(a: SchemeValue, b: SchemeValue): Boolean = (a, b) match
-    case (SchemeInt(x), SchemeInt(y))             => x == y
-    case (SchemeBool(x), SchemeBool(y))           => x == y
-    case (SchemeSymbol(x), SchemeSymbol(y))       => x == y
-    case (SchemeChar(x), SchemeChar(y))           => x == y
-    case (SchemeString(x), SchemeString(y))       => x == y
-    case (SchemeList(xs), SchemeList(ys))         => xs.length == ys.length && xs.zip(ys).forall(schemeEqual(_, _))
-    case (SchemePair(a1, d1), SchemePair(a2, d2)) => schemeEqual(a1, a2) && schemeEqual(d1, d2)
-    case _                                        => a eq b
+  private def isSchemeString(v: SchemeValue): Boolean = v match
+    case _: SchemeString        => true
+    case _: SchemeMutableString => true
+    case _                      => false
 
   def asInt(v: SchemeValue): Long = v match
     case SchemeInt(n) => n

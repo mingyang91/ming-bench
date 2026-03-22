@@ -34,7 +34,6 @@ object Kont:
   case class DefineK(name: String, env: Env, k: Kont)              extends Kont
   case class AndK(remaining: List[SchemeValue], env: Env, k: Kont) extends Kont
   case class OrK(remaining: List[SchemeValue], env: Env, k: Kont)  extends Kont
-  case class NotK(k: Kont)                                         extends Kont
   case class CallCCK(k: Kont)                                      extends Kont
 
   case class CondK(
@@ -67,5 +66,34 @@ object Kont:
     proc: SchemeValue,
     remainingGroups: List[List[SchemeValue]],
     accumulated: List[SchemeValue],
+    k: Kont
+  ) extends Kont
+
+  case class LetrecInitK(
+    currentName: String,
+    remainingNames: List[String],
+    remainingInits: List[SchemeValue],
+    body: List[SchemeValue],
+    frame: Env,
+    k: Kont
+  ) extends Kont
+
+  case class LetStarInitK(
+    name: String,
+    remaining: List[(String, SchemeValue)],
+    body: List[SchemeValue],
+    env: Env,
+    k: Kont
+  ) extends Kont
+
+  case class CaseK(
+    clauses: List[SchemeValue],
+    env: Env,
+    k: Kont
+  ) extends Kont
+
+  case class ForEachK(
+    proc: SchemeValue,
+    remainingGroups: List[List[SchemeValue]],
     k: Kont
   ) extends Kont

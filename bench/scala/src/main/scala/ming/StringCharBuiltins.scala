@@ -154,3 +154,21 @@ object StringCharBuiltins:
     args.head match
       case SchemeInt(n) => SchemeChar(n.toChar)
       case other        => throw new EvalError(s"integer->char: not an integer: ${other.display}")
+
+  def evalMakeString(args: List[SchemeValue]): SchemeValue =
+    if args.isEmpty || args.length > 2 then throw new EvalError("make-string: expected 1-2 arguments")
+    val n = Builtins.asInt(args.head).toInt
+    val fill =
+      if args.length == 2 then
+        args(1) match
+          case SchemeChar(c) => c
+          case _             => throw new EvalError("make-string: fill must be a char")
+      else ' '
+    SchemeString(fill.toString * n)
+
+  def evalString(args: List[SchemeValue]): SchemeValue =
+    val chars = args.map {
+      case SchemeChar(c) => c
+      case other         => throw new EvalError(s"string: not a char: ${other.display}")
+    }
+    SchemeString(chars.mkString)

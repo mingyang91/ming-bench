@@ -64,3 +64,18 @@ object NumericBuiltins:
   def numPred(args: List[SchemeValue], pred: Long => Boolean): SchemeValue =
     if args.length != 1 then throw new EvalError("numeric predicate: expected 1 argument")
     SchemeBool(pred(Builtins.asInt(args.head)))
+
+  def evalGcd(args: List[SchemeValue]): SchemeValue =
+    if args.isEmpty then SchemeInt(0)
+    else SchemeInt(args.map(Builtins.asInt).map(math.abs).reduceLeft(gcd))
+
+  def evalLcm(args: List[SchemeValue]): SchemeValue =
+    if args.isEmpty then SchemeInt(1)
+    else SchemeInt(args.map(Builtins.asInt).map(math.abs).reduceLeft(lcm))
+
+  @scala.annotation.tailrec
+  private def gcd(a: Long, b: Long): Long =
+    if b == 0 then a else gcd(b, a % b)
+
+  private def lcm(a: Long, b: Long): Long =
+    if a == 0 || b == 0 then 0 else math.abs(a / gcd(a, b) * b)

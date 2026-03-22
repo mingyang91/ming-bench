@@ -92,21 +92,35 @@ object SchemeValue:
   ) extends SchemeValue:
     def display: String = "#<macro>"
 
-  case class SchemePair(car: SchemeValue, cdr: SchemeValue) extends SchemeValue:
+  class SchemePair(val cell: Array[SchemeValue]) extends SchemeValue:
+    def car: SchemeValue             = cell(0)
+    def cdr: SchemeValue             = cell(1)
+    def setCar(v: SchemeValue): Unit = cell(0) = v
+    def setCdr(v: SchemeValue): Unit = cell(1) = v
 
-    def display: String =
-      val carStr = car.display
-      cdr match
-        case SchemeList(Nil) => s"($carStr)"
-        case SchemeList(es)  => s"($carStr ${es.map(_.display).mkString(" ")})"
-        case _: SchemePair   => s"($carStr ${pairTail(cdr)})"
-        case _               => s"($carStr . ${cdr.display})"
+    def display: String                = s"(${formatElems(_.display)})"
+    override def displayOutput: String = s"(${formatElems(_.displayOutput)})"
 
-    private def pairTail(v: SchemeValue): String = v match
-      case SchemePair(a, SchemeList(Nil)) => a.display
-      case SchemePair(a, d: SchemePair)   => s"${a.display} ${pairTail(d)}"
-      case SchemePair(a, d)               => s"${a.display} . ${d.display}"
-      case _                              => s". ${v.display}"
+    private def formatElems(fmt: SchemeValue => String): String =
+      @scala.annotation.tailrec
+      def loop(v: SchemeValue, acc: List[String]): List[String] = v match
+        case SchemeList(Nil) => acc.reverse
+        case SchemeList(es)  => acc.reverse ++ es.map(fmt)
+        case p: SchemePair   => loop(p.cdr, fmt(p.car) :: acc)
+        case d               => (s". ${fmt(d)}" :: acc).reverse
+      loop(cdr, List(fmt(car))).mkString(" ")
+
+  object SchemePair:
+
+    def apply(car: SchemeValue, cdr: SchemeValue): SchemePair =
+      new SchemePair(Array(car, cdr))
+
+    def unapply(p: SchemePair): Some[(SchemeValue, SchemeValue)] =
+      Some((p.car, p.cdr))
+
+  class SchemeVector(val elements: Array[SchemeValue]) extends SchemeValue:
+    def display: String                = s"#(${elements.map(_.display).mkString(" ")})"
+    override def displayOutput: String = s"#(${elements.map(_.displayOutput).mkString(" ")})"
 
   class SchemeResolvedSymbol(
     val name: String,
