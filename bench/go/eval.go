@@ -142,6 +142,33 @@ func evalListTCO(expr *Expr, env *Env) (*Expr, *Env, *Value, error, bool) {
 				return e, ev, nil, nil, true
 			}
 			return nil, nil, v, nil, false
+		case "letrec":
+			e, ev, v, err := evalLetrecTCO(expr, env, false)
+			if err != nil {
+				return nil, nil, nil, err, false
+			}
+			if e != nil {
+				return e, ev, nil, nil, true
+			}
+			return nil, nil, v, nil, false
+		case "letrec*":
+			e, ev, v, err := evalLetrecTCO(expr, env, true)
+			if err != nil {
+				return nil, nil, nil, err, false
+			}
+			if e != nil {
+				return e, ev, nil, nil, true
+			}
+			return nil, nil, v, nil, false
+		case "case":
+			e, ev, v, err := evalCaseTCO(expr, env)
+			if err != nil {
+				return nil, nil, nil, err, false
+			}
+			if e != nil {
+				return e, ev, nil, nil, true
+			}
+			return nil, nil, v, nil, false
 		case "define-syntax":
 			v, err := evalDefineSyntax(expr, env)
 			return nil, nil, v, err, false
@@ -709,6 +736,76 @@ func applyBuiltin(name string, args []*Value, expr *Expr, env *Env) (*Value, err
 			return nil, errAtf(expr, "integer->char: expected 1 integer argument")
 		}
 		return CharValue(rune(args[0].IntVal)), nil
+	case "vector":
+		elems := make([]*Value, len(args))
+		copy(elems, args)
+		return &Value{Type: TypeVector, VecElems: elems}, nil
+	case "make-vector":
+		if len(args) < 1 || len(args) > 2 || args[0].Type != TypeInteger {
+			return nil, errAtf(expr, "make-vector: expected integer length and optional fill")
+		}
+		n := int(args[0].IntVal)
+		fill := IntegerValue(0)
+		if len(args) == 2 {
+			fill = args[1]
+		}
+		elems := make([]*Value, n)
+		for i := range elems {
+			elems[i] = fill
+		}
+		return &Value{Type: TypeVector, VecElems: elems}, nil
+	case "vector-ref":
+		if len(args) != 2 || args[0].Type != TypeVector || args[1].Type != TypeInteger {
+			return nil, errAtf(expr, "vector-ref: expected vector and integer")
+		}
+		idx := int(args[1].IntVal)
+		if idx < 0 || idx >= len(args[0].VecElems) {
+			return nil, errAtf(expr, "vector-ref: index out of range")
+		}
+		return args[0].VecElems[idx], nil
+	case "vector-set!":
+		if len(args) != 3 || args[0].Type != TypeVector || args[1].Type != TypeInteger {
+			return nil, errAtf(expr, "vector-set!: expected vector, integer, and value")
+		}
+		idx := int(args[1].IntVal)
+		if idx < 0 || idx >= len(args[0].VecElems) {
+			return nil, errAtf(expr, "vector-set!: index out of range")
+		}
+		args[0].VecElems[idx] = args[2]
+		return Void, nil
+	case "vector-length":
+		if len(args) != 1 || args[0].Type != TypeVector {
+			return nil, errAtf(expr, "vector-length: expected vector")
+		}
+		return IntegerValue(int64(len(args[0].VecElems))), nil
+	case "vector?":
+		if len(args) != 1 {
+			return nil, errAtf(expr, "vector?: expected 1 argument")
+		}
+		return BooleanValue(args[0].Type == TypeVector), nil
+	case "vector->list":
+		if len(args) != 1 || args[0].Type != TypeVector {
+			return nil, errAtf(expr, "vector->list: expected vector")
+		}
+		result := Null
+		for i := len(args[0].VecElems) - 1; i >= 0; i-- {
+			result = PairValue(args[0].VecElems[i], result)
+		}
+		return result, nil
+	case "list->vector":
+		if len(args) != 1 {
+			return nil, errAtf(expr, "list->vector: expected 1 argument")
+		}
+		var elems []*Value
+		cur := args[0]
+		for cur.Type == TypePair {
+			elems = append(elems, cur.Car)
+			cur = cur.Cdr
+		}
+		if cur.Type != TypeNull {
+			return nil, errAtf(expr, "list->vector: expected proper list")
+		}
+		return &Value{Type: TypeVector, VecElems: elems}, nil
 	default:
 		return nil, errAtf(expr, "unknown procedure: %s", name)
 	}
@@ -1278,6 +1375,16 @@ func schemeEqual(a, b *Value) bool {
 		return true
 	case TypePair:
 		return schemeEqual(a.Car, b.Car) && schemeEqual(a.Cdr, b.Cdr)
+	case TypeVector:
+		if len(a.VecElems) != len(b.VecElems) {
+			return false
+		}
+		for i := range a.VecElems {
+			if !schemeEqual(a.VecElems[i], b.VecElems[i]) {
+				return false
+			}
+		}
+		return true
 	default:
 		return a == b
 	}
@@ -1401,6 +1508,118 @@ func builtinForEach(args []*Value, expr *Expr, env *Env) (*Value, error) {
 	return Void, nil
 }
 
+func evalLetrecTCO(expr *Expr, env *Env, star bool) (*Expr, *Env, *Value, error) {
+	if len(expr.List) < 3 {
+		return nil, nil, nil, errAt(expr, "letrec: expected at least 2 arguments")
+	}
+	bindings := expr.List[1]
+	if bindings.Type != ExprList {
+		return nil, nil, nil, errAt(bindings, "letrec: bindings must be a list")
+	}
+	localEnv := NewEnv(env)
+	// Initialize all bindings to void
+	for _, b := range bindings.List {
+		if b.Type != ExprList || len(b.List) != 2 || b.List[0].Type != ExprSymbol {
+			return nil, nil, nil, errAt(b, "letrec: invalid binding")
+		}
+		localEnv.Set(b.List[0].StrVal, Void)
+	}
+	// Evaluate init expressions
+	for _, b := range bindings.List {
+		evalEnv := localEnv
+		if !star {
+			// For letrec, init exprs can see the bindings (for lambda captures)
+			evalEnv = localEnv
+		}
+		val, err := Eval(b.List[1], evalEnv)
+		if err != nil {
+			return nil, nil, nil, err
+		}
+		localEnv.Set(b.List[0].StrVal, val)
+	}
+	body := expr.List[2:]
+	for _, bodyExpr := range body[:len(body)-1] {
+		_, err := Eval(bodyExpr, localEnv)
+		if err != nil {
+			return nil, nil, nil, err
+		}
+	}
+	return body[len(body)-1], localEnv, nil, nil
+}
+
+func evalCaseTCO(expr *Expr, env *Env) (*Expr, *Env, *Value, error) {
+	if len(expr.List) < 3 {
+		return nil, nil, nil, errAt(expr, "case: expected at least 2 arguments")
+	}
+	key, err := Eval(expr.List[1], env)
+	if err != nil {
+		return nil, nil, nil, err
+	}
+	for _, clause := range expr.List[2:] {
+		if clause.Type != ExprList || len(clause.List) < 2 {
+			return nil, nil, nil, errAt(clause, "case: invalid clause")
+		}
+		datums := clause.List[0]
+		// else clause
+		if datums.Type == ExprSymbol && datums.StrVal == "else" {
+			body := clause.List[1:]
+			for _, e := range body[:len(body)-1] {
+				_, err := Eval(e, env)
+				if err != nil {
+					return nil, nil, nil, err
+				}
+			}
+			return body[len(body)-1], env, nil, nil
+		}
+		// Match datums
+		if datums.Type != ExprList {
+			return nil, nil, nil, errAt(datums, "case: datums must be a list")
+		}
+		matched := false
+		for _, d := range datums.List {
+			dv, err := exprToValue(d)
+			if err != nil {
+				return nil, nil, nil, err
+			}
+			if schemeEqv(key, dv) {
+				matched = true
+				break
+			}
+		}
+		if matched {
+			body := clause.List[1:]
+			for _, e := range body[:len(body)-1] {
+				_, err := Eval(e, env)
+				if err != nil {
+					return nil, nil, nil, err
+				}
+			}
+			return body[len(body)-1], env, nil, nil
+		}
+	}
+	return nil, nil, Void, nil
+}
+
+func schemeEqv(a, b *Value) bool {
+	if a.Type != b.Type {
+		return false
+	}
+	switch a.Type {
+	case TypeInteger:
+		return a.IntVal == b.IntVal
+	case TypeBoolean:
+		return a.BoolVal == b.BoolVal
+	case TypeSymbol:
+		return a.StrVal == b.StrVal
+	case TypeChar:
+		return a.IntVal == b.IntVal
+	case TypeNull:
+		return true
+	default:
+		return a == b
+	}
+}
+
 func makeDefaultEnv() *Env {
 	env := NewEnv(nil)
 	builtins := []string{"+", "-", "*", "/", "<", ">", "=", "<=", ">=", "not",
@@ -1426,7 +1645,9 @@ func makeDefaultEnv() *Env {
 		"char-upcase", "char-downcase",
 		"char=?", "char<?",
 		"string=?", "string<?", "string-ci=?",
-		"string-upcase", "string-downcase"}
+		"string-upcase", "string-downcase",
+		"vector", "make-vector", "vector-ref", "vector-set!", "vector-length", "vector?",
+		"vector->list", "list->vector"}
 	for _, name := range builtins {
 		env.Set(name, &Value{Type: TypeSymbol, StrVal: fmt.Sprintf("__builtin:%s", name)})
 	}

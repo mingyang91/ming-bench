@@ -20,6 +20,7 @@ const (
 	TypeChar
 	TypeContinuation
 	TypeMacro
+	TypeVector
 )
 
 // Value represents a Scheme value.
@@ -40,6 +41,8 @@ type Value struct {
 	ContFunc func(*Value) // invoked when continuation is called; always panics
 	// Macro fields
 	Macro *SyntaxRules
+	// Vector fields
+	VecElems []*Value
 }
 
 // StrContent returns the string content, preferring mutable Runes if set.
@@ -135,6 +138,17 @@ func (v *Value) String() string {
 		return "#<continuation>"
 	case TypeMacro:
 		return "#<macro>"
+	case TypeVector:
+		var buf strings.Builder
+		buf.WriteString("#(")
+		for i, elem := range v.VecElems {
+			if i > 0 {
+				buf.WriteByte(' ')
+			}
+			buf.WriteString(elem.String())
+		}
+		buf.WriteByte(')')
+		return buf.String()
 	case TypePair:
 		var buf strings.Builder
 		buf.WriteByte('(')
