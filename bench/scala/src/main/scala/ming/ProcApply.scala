@@ -205,6 +205,8 @@ private[ming] object ProcApply:
     case Kont.GuardTestK(_, _, _, _, _, _, next)    => next
     case Kont.GuardClauseK(_, _, next)              => next
     case Kont.CallWithValuesK(_, next)              => next
+    case Kont.SyntaxCaseK(_, _, _, next)            => next
+    case Kont.WithSyntaxK(_, _, _, _, next)         => next
 
   private def computeWindDiff(
     current: List[WinderEntry],

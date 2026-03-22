@@ -80,10 +80,13 @@ object Evaluator:
         case e: EvalError if e.sourcePos == SourcePos.None =>
           throw new EvalError(e.baseMessage, expr.pos)
     case SchemeList(head :: args) =>
-      lookupMacro(head, env) match
-        case Some(m) =>
+      lookupAnyMacro(head, env) match
+        case Some(m: SchemeMacro) =>
           EvalS(Macros.expand(m, head :: args), env, k, out)
-        case None =>
+        case Some(m: SchemeProcMacro) =>
+          val expanded = SyntaxCase.expandProcMacro(m, SchemeList(head :: args))
+          EvalS(expanded, env, k, out)
+        case _ =>
           try EvalS(head, env, Kont.EvalOp(args, env, k, expr.pos), out)
           catch
             case e: EvalError if e.sourcePos == SourcePos.None =>
@@ -96,7 +99,7 @@ object Evaluator:
   private def isSpecialForm(op: String): Boolean = op match
     case "define" | "if" | "quote" | "lambda" | "and" | "or" | "let" | "let*" | "letrec" | "letrec*" | "begin" |
         "cond" | "case" | "do" | "set!" | "call/cc" | "call-with-current-continuation" | "define-syntax" | "when" |
-        "guard" | "define-record-type" =>
+        "guard" | "define-record-type" | "syntax-case" | "syntax-quote" | "with-syntax" =>
       true
     case _ => false
 
@@ -114,10 +117,11 @@ object Evaluator:
     case Kont.Seq(remaining, _, nextK) => Kont.Seq(remaining, env, nextK)
     case other                         => other
 
-  private def lookupMacro(head: SchemeValue, env: Env): Option[SchemeMacro] =
+  private def lookupAnyMacro(head: SchemeValue, env: Env): Option[SchemeValue] =
     head match
       case SchemeSymbol(name) =>
         env.get(name) match
-          case Some(m: SchemeMacro) => Some(m)
-          case _                    => None
+          case Some(m: SchemeMacro)     => Some(m)
+          case Some(m: SchemeProcMacro) => Some(m)
+          case _                        => None
       case _ => None

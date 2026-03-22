@@ -72,7 +72,7 @@ private[ming] object KontApply:
       applyLetInit(value, params, evaled, remaining, body, letEnv, nextK, out)
 
     case Kont.NamedLetInitK(name, params, evaled, remaining, body, letEnv, nextK) =>
-      applyNamedLetInit(value, name, params, evaled, remaining, body, letEnv, nextK, out)
+      KontApplyExt.applyNamedLetInit(value, name, params, evaled, remaining, body, letEnv, nextK, out)
 
     case Kont.MapK(proc, remainingGroups, accumulated, nextK) =>
       applyMapK(value, proc, remainingGroups, accumulated, nextK, out)
@@ -103,6 +103,12 @@ private[ming] object KontApply:
 
     case Kont.CallWithValuesK(consumer, nextK) =>
       applyCallWithValues(value, consumer, nextK, out)
+
+    case Kont.SyntaxCaseK(literals, clauses, scEnv, nextK) =>
+      KontApplyExt.applySyntaxCase(value, literals, clauses, scEnv, nextK, out)
+
+    case Kont.WithSyntaxK(name, remaining, body, wsEnv, nextK) =>
+      KontApplyExt.applyWithSyntax(value, name, remaining, body, wsEnv, nextK, out)
 
   private def applyDynWindKont(
     value: SchemeValue,
@@ -268,31 +274,3 @@ private[ming] object KontApply:
       case SchemeMultipleValues(vals) => vals
       case single                     => List(single)
     ProcApply.applyProc(consumer, consumerArgs, nextK, out)
-
-  private def applyNamedLetInit(
-    value: SchemeValue,
-    name: String,
-    params: List[String],
-    evaled: List[SchemeValue],
-    remaining: List[SchemeValue],
-    body: List[SchemeValue],
-    letEnv: Env,
-    nextK: Kont,
-    out: String
-  ): Step =
-    val newEvaled = evaled :+ value
-    remaining match
-      case Nil =>
-        val recEnv = Env.RecursiveFrame(
-          name,
-          closure => SchemeLambda(params, None, body, closure),
-          letEnv
-        )
-        SpecialForms.startSequence(body, recEnv.extend(params, newEvaled), nextK, out)
-      case next :: rest =>
-        EvalS(
-          next,
-          letEnv,
-          Kont.NamedLetInitK(name, params, newEvaled, rest, body, letEnv, nextK),
-          out
-        )

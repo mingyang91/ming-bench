@@ -67,7 +67,10 @@ private[ming] object SpecialForms:
     case "call/cc" | "call-with-current-continuation" =>
       if args.length != 1 then throw new EvalError("call/cc: expected 1 argument")
       EvalS(args.head, env, Kont.CallCCK(k), out)
-    case "define-syntax"      => evalDefineSyntax(args, env, k, out)
+    case "define-syntax"      => SyntaxFormEval.evalDefineSyntax(args, env, k, out)
+    case "syntax-case"        => SyntaxFormEval.evalSyntaxCase(args, env, k, out)
+    case "syntax-quote"       => SyntaxFormEval.evalSyntaxQuote(args, env, k, out)
+    case "with-syntax"        => SyntaxFormEval.evalWithSyntax(args, env, k, out)
     case "guard"              => ExceptionHandling.evalGuard(args, env, k, out)
     case "define-record-type" => RecordTypes.evalDefineRecordType(args, env, k, out)
     case _                    => throw new EvalError(s"unknown special form: $op")
@@ -185,19 +188,6 @@ private[ming] object SpecialForms:
       EvalS(test, env, Kont.CondK(body, rest, env, k), out)
     case other :: _ =>
       throw new EvalError(s"cond: bad clause: ${other.display}")
-
-  private def evalDefineSyntax(
-    args: List[SchemeValue],
-    env: Env,
-    k: Kont,
-    out: String
-  ): Step = args match
-    case SchemeSymbol(name) :: syntaxForm :: Nil =>
-      val m        = Macros.parseSyntaxRules(syntaxForm, env)
-      val newEnv   = env.extend(name, m)
-      val updatedK = Evaluator.updateSeqEnv(k, newEnv)
-      ReturnS(SchemeVoid, updatedK, out)
-    case _ => throw new EvalError("bad define-syntax syntax")
 
   // --- Parsing helpers ---
 

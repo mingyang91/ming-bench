@@ -154,5 +154,20 @@ object Kont:
 
   case class CallWithValuesK(consumer: SchemeValue, k: Kont) extends Kont
 
+  case class SyntaxCaseK(
+    literals: List[String],
+    clauses: List[SchemeValue],
+    env: Env,
+    k: Kont
+  ) extends Kont
+
+  case class WithSyntaxK(
+    name: String,
+    remaining: List[(String, SchemeValue)],
+    body: List[SchemeValue],
+    env: Env,
+    k: Kont
+  ) extends Kont
+
 /** Identity-based entry for dynamic-wind winder tracking. */
 class WinderEntry(val inThunk: SchemeValue, val outThunk: SchemeValue)

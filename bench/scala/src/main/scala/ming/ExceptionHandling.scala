@@ -137,3 +137,5 @@ private[ming] object ExceptionHandling:
     case Kont.GuardTestK(_, _, _, _, _, _, next)    => next
     case Kont.GuardClauseK(_, _, next)              => next
     case Kont.CallWithValuesK(_, next)              => next
+    case Kont.SyntaxCaseK(_, _, _, next)            => next
+    case Kont.WithSyntaxK(_, _, _, _, next)         => next

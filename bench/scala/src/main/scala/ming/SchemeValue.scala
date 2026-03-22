@@ -152,3 +152,12 @@ object SchemeValue:
     override val pos: SourcePos = SourcePos.None
   ) extends SchemeValue:
     def display: String = name
+
+  case class SchemeProcMacro(transformer: SchemeLambda, defEnv: Env) extends SchemeValue:
+    def display: String = "#<macro>"
+
+  case class SchemeSyntaxBindings(
+    bindings: Map[String, SyntaxCase.Binding],
+    defEnv: Env
+  ) extends SchemeValue:
+    def display: String = "#<syntax-bindings>"

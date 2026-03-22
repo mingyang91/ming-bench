@@ -42,8 +42,11 @@ object Parser:
         case '\'' =>
           tokenizeLoop(input, pos + 1, Token("'", posAt(input, pos)) :: acc)
         case _ =>
-          val (tok, next) = readAtom(input, pos, new StringBuilder)
-          tokenizeLoop(input, next, Token(tok, posAt(input, pos)) :: acc)
+          if ch == '#' && pos + 1 < input.length && input.charAt(pos + 1) == '\'' then
+            tokenizeLoop(input, pos + 2, Token("#'", posAt(input, pos)) :: acc)
+          else
+            val (tok, next) = readAtom(input, pos, new StringBuilder)
+            tokenizeLoop(input, next, Token(tok, posAt(input, pos)) :: acc)
 
   @scala.annotation.tailrec
   private def skipLineComment(input: String, pos: Int): Int =
@@ -95,6 +98,9 @@ object Parser:
       case Token("'", pos) :: rest =>
         val (quoted, remaining) = readExpr(rest)
         (SchemeList(List(SchemeSymbol("quote", pos), quoted), pos), remaining)
+      case Token("#'", pos) :: rest =>
+        val (quoted, remaining) = readExpr(rest)
+        (SchemeList(List(SchemeSymbol("syntax-quote", pos), quoted), pos), remaining)
       case Token(tok, pos) :: rest => (parseAtom(tok, pos), rest)
 
   @scala.annotation.tailrec

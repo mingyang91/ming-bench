@@ -118,7 +118,9 @@ object Builtins:
     "rational?",
     "cddr",
     "memq",
-    "assq"
+    "assq",
+    "syntax->datum",
+    "datum->syntax"
   )
 
   def evalBuiltin(
@@ -193,6 +195,8 @@ object Builtins:
     case "cddr"           => CollectionBuiltins.evalCddr(args)
     case "memq"           => CollectionBuiltins.evalMemq(args)
     case "assq"           => CollectionBuiltins.evalAssq(args)
+    case "syntax->datum"  => evalSyntaxToDatum(args)
+    case "datum->syntax"  => evalDatumToSyntax(args)
     case _                => evalPureExtended(op, args)
 
   private def evalPureExtended(
@@ -282,3 +286,13 @@ object Builtins:
     case SchemeInt(n) => n
     case other =>
       throw new EvalError(s"expected integer, got: ${other.display}")
+
+  private def evalSyntaxToDatum(args: List[SchemeValue]): SchemeValue =
+    if args.length != 1 then throw new EvalError("syntax->datum: expected 1 argument")
+    args.head match
+      case rs: SchemeResolvedSymbol => SchemeSymbol(rs.name)
+      case other                    => other
+
+  private def evalDatumToSyntax(args: List[SchemeValue]): SchemeValue =
+    if args.length != 2 then throw new EvalError("datum->syntax: expected 2 arguments")
+    args(1)
