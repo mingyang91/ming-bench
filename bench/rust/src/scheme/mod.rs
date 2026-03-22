@@ -29,6 +29,8 @@ impl Span {
 #[derive(Debug, Clone)]
 enum Value {
     Integer(i64),
+    Float(f64),
+    Rational(i64, i64), // numerator, denominator (always reduced, denom > 0)
     Boolean(bool),
     Char(char),
     String(String),
@@ -52,6 +54,51 @@ enum Value {
     Values(Vec<Value>),
 }
 
+fn gcd(mut a: i64, mut b: i64) -> i64 {
+    a = a.abs();
+    b = b.abs();
+    while b != 0 {
+        let t = b;
+        b = a % b;
+        a = t;
+    }
+    a
+}
+
+fn make_rational(n: i64, d: i64) -> Value {
+    if d == 0 { panic!("division by zero in make_rational"); }
+    let sign = if (n < 0) != (d < 0) { -1 } else { 1 };
+    let n = n.abs();
+    let d = d.abs();
+    let g = gcd(n, d);
+    let n = sign * (n / g);
+    let d = d / g;
+    if d == 1 { Value::Integer(n) } else { Value::Rational(n, d) }
+}
+
+/// Convert a Value to an f64 for inexact arithmetic
+fn val_to_f64(v: &Value, span: Span) -> Result<f64, EvalError> {
+    match v {
+        Value::Integer(n) => Ok(*n as f64),
+        Value::Float(f) => Ok(*f),
+        Value::Rational(n, d) => Ok(*n as f64 / *d as f64),
+        _ => Err(EvalError::Type(span.fmt("expected number"))),
+    }
+}
+
+fn is_number(v: &Value) -> bool {
+    matches!(v, Value::Integer(_) | Value::Float(_) | Value::Rational(_, _))
+}
+
+fn is_exact(v: &Value) -> bool {
+    matches!(v, Value::Integer(_) | Value::Rational(_, _))
+}
+
+/// Check if any value in the slice is inexact
+fn any_inexact(args: &[Value]) -> bool {
+    args.iter().any(|v| matches!(v, Value::Float(_)))
+}
+
 type Output = Rc<RefCell<std::string::String>>;
 
 thread_local! {
@@ -73,6 +120,18 @@ impl Value {
     fn display(&self) -> String {
         match self {
             Value::Integer(n) => n.to_string(),
+            Value::Float(f) => {
+                if f.is_infinite() {
+                    if *f > 0.0 { "+inf.0".into() } else { "-inf.0".into() }
+                } else if f.is_nan() {
+                    "+nan.0".into()
+                } else {
+                    let s = format!("{}", f);
+                    // Ensure there's a decimal point
+                    if s.contains('.') { s } else { format!("{}.0", s) }
+                }
+            }
+            Value::Rational(n, d) => format!("{}/{}", n, d),
             Value::Boolean(b) => if *b { "#t".into() } else { "#f".into() },
             Value::Char(c) => match c {
                 ' ' => "#\\space".into(),
@@ -174,6 +233,8 @@ struct Expr {
 #[derive(Debug, Clone)]
 enum ExprKind {
     Integer(i64),
+    Float(f64),
+    Rational(i64, i64),
     Boolean(bool),
     Char(char),
     String(String),
@@ -307,6 +368,19 @@ fn parse_atom(token: &str, span: Span) -> Expr {
         ExprKind::String(inner.into())
     } else if let Ok(n) = token.parse::<i64>() {
         ExprKind::Integer(n)
+    } else if token.contains('/') && !token.starts_with('/') {
+        // Try rational literal: n/d
+        let parts: Vec<&str> = token.splitn(2, '/').collect();
+        if parts.len() == 2 {
+            if let (Ok(n), Ok(d)) = (parts[0].parse::<i64>(), parts[1].parse::<i64>()) {
+                if d != 0 {
+                    return Expr { kind: ExprKind::Rational(n, d), span };
+                }
+            }
+        }
+        ExprKind::Symbol(token.into())
+    } else if let Ok(f) = token.parse::<f64>() {
+        ExprKind::Float(f)
     } else {
         ExprKind::Symbol(token.into())
     };
@@ -328,6 +402,8 @@ fn parse(input: &str) -> Result<Vec<Expr>, EvalError> {
 fn expr_to_value(expr: &Expr) -> Value {
     match &expr.kind {
         ExprKind::Integer(n) => Value::Integer(*n),
+        ExprKind::Float(f) => Value::Float(*f),
+        ExprKind::Rational(n, d) => make_rational(*n, *d),
         ExprKind::Boolean(b) => Value::Boolean(*b),
         ExprKind::Char(c) => Value::Char(*c),
         ExprKind::String(s) => Value::String(s.clone()),
@@ -339,6 +415,8 @@ fn expr_to_value(expr: &Expr) -> Value {
 fn eqv_match(a: &Value, b: &Value) -> bool {
     match (a, b) {
         (Value::Integer(x), Value::Integer(y)) => x == y,
+        (Value::Float(x), Value::Float(y)) => x == y,
+        (Value::Rational(n1, d1), Value::Rational(n2, d2)) => n1 == n2 && d1 == d2,
         (Value::Boolean(x), Value::Boolean(y)) => x == y,
         (Value::Char(x), Value::Char(y)) => x == y,
         (Value::Symbol(x), Value::Symbol(y)) => x == y,
@@ -356,6 +434,8 @@ fn eval(expr: &Expr, env: &Env, out: &Output) -> Result<Value, EvalError> {
         let kind = cur_expr.kind.clone();
         match kind {
             ExprKind::Integer(n) => return Ok(Value::Integer(n)),
+            ExprKind::Float(f) => return Ok(Value::Float(f)),
+            ExprKind::Rational(n, d) => return Ok(make_rational(n, d)),
             ExprKind::Boolean(b) => return Ok(Value::Boolean(b)),
             ExprKind::Char(c) => return Ok(Value::Char(c)),
             ExprKind::String(s) => return Ok(Value::String(s)),
@@ -732,6 +812,9 @@ fn eval(expr: &Expr, env: &Env, out: &Output) -> Result<Value, EvalError> {
                         }
                         "cons" | "car" | "cdr" | "null?" | "list" | "length"
                         | "string?" | "number?" | "boolean?" | "pair?" | "symbol?" | "char?"
+                        | "exact?" | "inexact?" | "integer?" | "rational?"
+                        | "exact->inexact" | "inexact->exact"
+                        | "numerator" | "denominator"
                         | "string-append" | "string-length" | "substring"
                         | "string->number" | "number->string"
                         | "symbol->string" | "string->symbol"
@@ -1515,6 +1598,8 @@ fn as_int(v: &Value, span: Span) -> Result<i64, EvalError> {
 fn values_equal(a: &Value, b: &Value) -> bool {
     match (a, b) {
         (Value::Integer(x), Value::Integer(y)) => x == y,
+        (Value::Float(x), Value::Float(y)) => x == y,
+        (Value::Rational(n1, d1), Value::Rational(n2, d2)) => n1 == n2 && d1 == d2,
         (Value::Boolean(x), Value::Boolean(y)) => x == y,
         (Value::Char(x), Value::Char(y)) => x == y,
         (Value::String(x), Value::String(y)) => x == y,
@@ -1608,6 +1693,76 @@ fn eval_call_with_values(args: &[Value], span: Span, out: &Output) -> Result<Val
     call_func(consumer, &call_args, span, out)
 }
 
+/// Add two exact numbers (integer or rational), returning exact result
+fn num_add(a: &Value, b: &Value, span: Span) -> Result<Value, EvalError> {
+    if any_inexact(&[a.clone(), b.clone()]) {
+        return Ok(Value::Float(val_to_f64(a, span)? + val_to_f64(b, span)?));
+    }
+    let (an, ad) = to_rational(a, span)?;
+    let (bn, bd) = to_rational(b, span)?;
+    Ok(make_rational(an * bd + bn * ad, ad * bd))
+}
+
+fn num_sub(a: &Value, b: &Value, span: Span) -> Result<Value, EvalError> {
+    if any_inexact(&[a.clone(), b.clone()]) {
+        return Ok(Value::Float(val_to_f64(a, span)? - val_to_f64(b, span)?));
+    }
+    let (an, ad) = to_rational(a, span)?;
+    let (bn, bd) = to_rational(b, span)?;
+    Ok(make_rational(an * bd - bn * ad, ad * bd))
+}
+
+fn num_mul(a: &Value, b: &Value, span: Span) -> Result<Value, EvalError> {
+    if any_inexact(&[a.clone(), b.clone()]) {
+        return Ok(Value::Float(val_to_f64(a, span)? * val_to_f64(b, span)?));
+    }
+    let (an, ad) = to_rational(a, span)?;
+    let (bn, bd) = to_rational(b, span)?;
+    Ok(make_rational(an * bn, ad * bd))
+}
+
+fn num_div(a: &Value, b: &Value, span: Span) -> Result<Value, EvalError> {
+    if any_inexact(&[a.clone(), b.clone()]) {
+        let d = val_to_f64(b, span)?;
+        if d == 0.0 { return Err(EvalError::Type(span.fmt("division by zero"))); }
+        return Ok(Value::Float(val_to_f64(a, span)? / d));
+    }
+    let (an, ad) = to_rational(a, span)?;
+    let (bn, bd) = to_rational(b, span)?;
+    if bn == 0 { return Err(EvalError::Type(span.fmt("division by zero"))); }
+    Ok(make_rational(an * bd, ad * bn))
+}
+
+fn to_rational(v: &Value, span: Span) -> Result<(i64, i64), EvalError> {
+    match v {
+        Value::Integer(n) => Ok((*n, 1)),
+        Value::Rational(n, d) => Ok((*n, *d)),
+        _ => Err(EvalError::Type(span.fmt("expected number"))),
+    }
+}
+
+fn num_cmp(a: &Value, b: &Value, span: Span) -> Result<std::cmp::Ordering, EvalError> {
+    // If either is inexact, compare as f64
+    if matches!(a, Value::Float(_)) || matches!(b, Value::Float(_)) {
+        let fa = val_to_f64(a, span)?;
+        let fb = val_to_f64(b, span)?;
+        return fa.partial_cmp(&fb).ok_or_else(|| EvalError::Type(span.fmt("cannot compare NaN")));
+    }
+    let (an, ad) = to_rational(a, span)?;
+    let (bn, bd) = to_rational(b, span)?;
+    // Compare an/ad vs bn/bd => an*bd vs bn*ad
+    Ok((an * bd).cmp(&(bn * ad)))
+}
+
+fn num_negate(v: &Value, span: Span) -> Result<Value, EvalError> {
+    match v {
+        Value::Integer(n) => Ok(Value::Integer(-n)),
+        Value::Float(f) => Ok(Value::Float(-f)),
+        Value::Rational(n, d) => Ok(Value::Rational(-n, *d)),
+        _ => Err(EvalError::Type(span.fmt("expected number"))),
+    }
+}
+
 fn eval_builtin(op: &str, args: &[Value], span: Span) -> Result<Value, EvalError> {
     match op {
         "cons" => {
@@ -1657,7 +1812,7 @@ fn eval_builtin(op: &str, args: &[Value], span: Span) -> Result<Value, EvalError
         }
         "number?" => {
             if args.len() != 1 { return Err(EvalError::Arity(span.fmt("number? requires 1 argument"))); }
-            Ok(Value::Boolean(matches!(&args[0], Value::Integer(_))))
+            Ok(Value::Boolean(is_number(&args[0])))
         }
         "boolean?" => {
             if args.len() != 1 { return Err(EvalError::Arity(span.fmt("boolean? requires 1 argument"))); }
@@ -1672,44 +1827,40 @@ fn eval_builtin(op: &str, args: &[Value], span: Span) -> Result<Value, EvalError
             Ok(Value::Boolean(matches!(&args[0], Value::Symbol(_))))
         }
         "+" => {
-            let mut sum: i64 = 0;
-            for a in args { sum += as_int(a, span)?; }
-            Ok(Value::Integer(sum))
+            let mut result: Value = Value::Integer(0);
+            for a in args { result = num_add(&result, a, span)?; }
+            Ok(result)
         }
         "-" => {
             if args.is_empty() {
                 return Err(EvalError::Arity(span.fmt("- requires at least 1 argument")));
             }
             if args.len() == 1 {
-                Ok(Value::Integer(-as_int(&args[0], span)?))
+                num_negate(&args[0], span)
             } else {
-                let mut result = as_int(&args[0], span)?;
-                for a in &args[1..] { result -= as_int(a, span)?; }
-                Ok(Value::Integer(result))
+                let mut result = args[0].clone();
+                for a in &args[1..] { result = num_sub(&result, a, span)?; }
+                Ok(result)
             }
         }
         "*" => {
-            let mut product: i64 = 1;
-            for a in args { product *= as_int(a, span)?; }
-            Ok(Value::Integer(product))
+            let mut result: Value = Value::Integer(1);
+            for a in args { result = num_mul(&result, a, span)?; }
+            Ok(result)
         }
         "/" => {
             if args.len() < 2 {
                 return Err(EvalError::Arity(span.fmt("/ requires at least 2 arguments")));
             }
-            let mut result = as_int(&args[0], span)?;
-            for a in &args[1..] {
-                let d = as_int(a, span)?;
-                if d == 0 { return Err(EvalError::Type(span.fmt("division by zero"))); }
-                result /= d;
-            }
-            Ok(Value::Integer(result))
+            let mut result = args[0].clone();
+            for a in &args[1..] { result = num_div(&result, a, span)?; }
+            Ok(result)
         }
-        "<" => cmp_vals(args, |a, b| a < b, span),
-        ">" => cmp_vals(args, |a, b| a > b, span),
-        "=" => cmp_vals(args, |a, b| a == b, span),
-        "<=" => cmp_vals(args, |a, b| a <= b, span),
-        ">=" => cmp_vals(args, |a, b| a >= b, span),
+        "<" => cmp_vals_num(args, |o| o == std::cmp::Ordering::Less, span),
+        ">" => cmp_vals_num(args, |o| o == std::cmp::Ordering::Greater, span),
+        "=" => cmp_vals_num(args, |o| o == std::cmp::Ordering::Equal, span),
+        "<=" => cmp_vals_num(args, |o| o != std::cmp::Ordering::Greater, span),
+        ">=" => cmp_vals_num(args, |o| o != std::cmp::Ordering::Less, span),
         "not" => {
             if args.len() != 1 {
                 return Err(EvalError::Arity(span.fmt("not requires 1 argument")));
@@ -1719,6 +1870,62 @@ fn eval_builtin(op: &str, args: &[Value], span: Span) -> Result<Value, EvalError
         "char?" => {
             if args.len() != 1 { return Err(EvalError::Arity(span.fmt("char? requires 1 argument"))); }
             Ok(Value::Boolean(matches!(&args[0], Value::Char(_))))
+        }
+        "exact?" => {
+            if args.len() != 1 { return Err(EvalError::Arity(span.fmt("exact? requires 1 argument"))); }
+            Ok(Value::Boolean(is_exact(&args[0])))
+        }
+        "inexact?" => {
+            if args.len() != 1 { return Err(EvalError::Arity(span.fmt("inexact? requires 1 argument"))); }
+            Ok(Value::Boolean(matches!(&args[0], Value::Float(_))))
+        }
+        "integer?" => {
+            if args.len() != 1 { return Err(EvalError::Arity(span.fmt("integer? requires 1 argument"))); }
+            match &args[0] {
+                Value::Integer(_) => Ok(Value::Boolean(true)),
+                Value::Float(f) => Ok(Value::Boolean(f.fract() == 0.0)),
+                Value::Rational(n, d) => Ok(Value::Boolean(n % d == 0)),
+                _ => Ok(Value::Boolean(false)),
+            }
+        }
+        "rational?" => {
+            if args.len() != 1 { return Err(EvalError::Arity(span.fmt("rational? requires 1 argument"))); }
+            Ok(Value::Boolean(matches!(&args[0], Value::Integer(_) | Value::Rational(_, _))))
+        }
+        "exact->inexact" => {
+            if args.len() != 1 { return Err(EvalError::Arity(span.fmt("exact->inexact requires 1 argument"))); }
+            Ok(Value::Float(val_to_f64(&args[0], span)?))
+        }
+        "inexact->exact" => {
+            if args.len() != 1 { return Err(EvalError::Arity(span.fmt("inexact->exact requires 1 argument"))); }
+            match &args[0] {
+                Value::Integer(n) => Ok(Value::Integer(*n)),
+                Value::Rational(n, d) => Ok(Value::Rational(*n, *d)),
+                Value::Float(f) => {
+                    // Convert f64 to exact rational using continued fraction approach
+                    // For simple cases like 0.5 -> 1/2
+                    let denom = 1_000_000_000_i64;
+                    let numer = (*f * denom as f64).round() as i64;
+                    Ok(make_rational(numer, denom))
+                }
+                _ => Err(EvalError::Type(span.fmt("inexact->exact: expected number"))),
+            }
+        }
+        "numerator" => {
+            if args.len() != 1 { return Err(EvalError::Arity(span.fmt("numerator requires 1 argument"))); }
+            match &args[0] {
+                Value::Integer(n) => Ok(Value::Integer(*n)),
+                Value::Rational(n, _) => Ok(Value::Integer(*n)),
+                _ => Err(EvalError::Type(span.fmt("numerator: expected rational"))),
+            }
+        }
+        "denominator" => {
+            if args.len() != 1 { return Err(EvalError::Arity(span.fmt("denominator requires 1 argument"))); }
+            match &args[0] {
+                Value::Integer(_) => Ok(Value::Integer(1)),
+                Value::Rational(_, d) => Ok(Value::Integer(*d)),
+                _ => Err(EvalError::Type(span.fmt("denominator: expected rational"))),
+            }
         }
         "string-append" => {
             let mut result = std::string::String::new();
@@ -1761,8 +1968,7 @@ fn eval_builtin(op: &str, args: &[Value], span: Span) -> Result<Value, EvalError
         }
         "number->string" => {
             if args.len() != 1 { return Err(EvalError::Arity(span.fmt("number->string requires 1 argument"))); }
-            let n = as_int(&args[0], span)?;
-            Ok(Value::String(n.to_string()))
+            Ok(Value::String(args[0].display()))
         }
         "symbol->string" => {
             if args.len() != 1 { return Err(EvalError::Arity(span.fmt("symbol->string requires 1 argument"))); }
@@ -1930,15 +2136,18 @@ fn eval_builtin(op: &str, args: &[Value], span: Span) -> Result<Value, EvalError
         }
         "zero?" => {
             if args.len() != 1 { return Err(EvalError::Arity(span.fmt("zero? requires 1 argument"))); }
-            Ok(Value::Boolean(as_int(&args[0], span)? == 0))
+            let r = num_cmp(&args[0], &Value::Integer(0), span)?;
+            Ok(Value::Boolean(r == std::cmp::Ordering::Equal))
         }
         "positive?" => {
             if args.len() != 1 { return Err(EvalError::Arity(span.fmt("positive? requires 1 argument"))); }
-            Ok(Value::Boolean(as_int(&args[0], span)? > 0))
+            let r = num_cmp(&args[0], &Value::Integer(0), span)?;
+            Ok(Value::Boolean(r == std::cmp::Ordering::Greater))
         }
         "negative?" => {
             if args.len() != 1 { return Err(EvalError::Arity(span.fmt("negative? requires 1 argument"))); }
-            Ok(Value::Boolean(as_int(&args[0], span)? < 0))
+            let r = num_cmp(&args[0], &Value::Integer(0), span)?;
+            Ok(Value::Boolean(r == std::cmp::Ordering::Less))
         }
         "odd?" => {
             if args.len() != 1 { return Err(EvalError::Arity(span.fmt("odd? requires 1 argument"))); }
@@ -2136,15 +2345,13 @@ fn eval_builtin(op: &str, args: &[Value], span: Span) -> Result<Value, EvalError
     }
 }
 
-fn cmp_vals(args: &[Value], f: fn(i64, i64) -> bool, span: Span) -> Result<Value, EvalError> {
+fn cmp_vals_num(args: &[Value], f: fn(std::cmp::Ordering) -> bool, span: Span) -> Result<Value, EvalError> {
     if args.len() < 2 {
         return Err(EvalError::Arity(span.fmt("comparison requires at least 2 arguments")));
     }
-    let mut prev = as_int(&args[0], span)?;
-    for a in &args[1..] {
-        let curr = as_int(a, span)?;
-        if !f(prev, curr) { return Ok(Value::Boolean(false)); }
-        prev = curr;
+    for i in 0..args.len() - 1 {
+        let ord = num_cmp(&args[i], &args[i + 1], span)?;
+        if !f(ord) { return Ok(Value::Boolean(false)); }
     }
     Ok(Value::Boolean(true))
 }
@@ -2161,6 +2368,9 @@ fn make_default_env() -> Env {
         "+", "-", "*", "/", "<", ">", "=", "<=", ">=", "not",
         "cons", "car", "cdr", "null?", "list", "length",
         "string?", "number?", "boolean?", "pair?", "symbol?", "char?",
+        "exact?", "inexact?", "integer?", "rational?",
+        "exact->inexact", "inexact->exact",
+        "numerator", "denominator",
         "string-append", "string-length", "substring",
         "string->number", "number->string",
         "symbol->string", "string->symbol",
