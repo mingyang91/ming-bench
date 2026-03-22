@@ -1,6 +1,7 @@
 use std::fmt;
 
 use crate::scheme::env::Env;
+use crate::scheme::error::Span;
 use crate::scheme::macro_expand::SyntaxRulesDef;
 use crate::scheme::parser::Expr;
 
@@ -15,8 +16,11 @@ pub struct ResumeFrame {
 pub struct ContCtx {
     /// Stack of resume frames (innermost = last).
     pub frames: Vec<ResumeFrame>,
-    /// Pending value for a resuming continuation (consumed by the next call/cc).
+    /// Pending value for a resuming continuation (consumed by the matching call/cc).
     pub pending: Option<Value>,
+    /// Span of the call/cc that originally captured the continuation being resumed.
+    /// Used to ensure the pending value is only consumed by the matching call/cc site.
+    pub resume_span: Option<Span>,
     /// Frames from the most recently invoked saved continuation.
     pub resume_frames: Option<Vec<ResumeFrame>>,
     next_id: u64,
@@ -33,6 +37,7 @@ impl ContCtx {
         ContCtx {
             frames: Vec::new(),
             pending: None,
+            resume_span: None,
             resume_frames: None,
             next_id: 0,
         }
@@ -73,6 +78,7 @@ pub enum Value {
     Continuation {
         id: u64,
         frames: Vec<ResumeFrame>,
+        capture_span: Span,
     },
     Macro {
         syntax_rules: SyntaxRulesDef,

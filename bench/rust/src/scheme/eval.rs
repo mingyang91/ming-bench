@@ -296,7 +296,11 @@ fn apply_step(
                 Ok(TcoAction::Result(v))
             }
         },
-        Value::Continuation { id, frames } => {
+        Value::Continuation {
+            id,
+            frames,
+            capture_span,
+        } => {
             if args.len() != 1 {
                 return Err(EvalErrorKind::Arity {
                     name: "#<continuation>".into(),
@@ -305,8 +309,9 @@ fn apply_step(
                 }
                 .at(span));
             }
-            // Store the value and frames for the resume handler to pick up
+            // Store the value, frames, and capture span for the resume handler to pick up
             ctx.pending = Some(args[0].clone());
+            ctx.resume_span = Some(capture_span.clone());
             ctx.resume_frames = Some(frames.clone());
             Err(EvalErrorKind::ContinuationReturn { id: *id }.at(span))
         }
@@ -350,15 +355,28 @@ fn do_callcc(
     output: &mut String,
     ctx: &mut ContCtx,
 ) -> Result<Value, EvalError> {
-    // If we're resuming a saved continuation, return the pending value
-    if let Some(pending) = ctx.pending.take() {
-        return Ok(pending);
+    // If we're resuming a saved continuation and this is the matching call/cc site,
+    // return the pending value directly instead of re-executing.
+    if ctx.pending.is_some() {
+        if let Some(ref resume_span) = ctx.resume_span {
+            if resume_span == span {
+                ctx.resume_span.take();
+                return Ok(ctx
+                    .pending
+                    .take()
+                    .expect("pending should be set when resume_span matches"));
+            }
+        }
     }
 
     // Normal call/cc: capture current continuation and call the function
     let id = ctx.next_id();
     let frames = ctx.frames.clone();
-    let cont = Value::Continuation { id, frames };
+    let cont = Value::Continuation {
+        id,
+        frames,
+        capture_span: span.clone(),
+    };
 
     match apply_func(func, &[cont], span, output, ctx) {
         Ok(v) => Ok(v),
@@ -367,6 +385,7 @@ fn do_callcc(
                 if *ret_id == id {
                     // Escape continuation: invoked within call/cc's function.
                     // The value was stored in ctx.pending by apply_step.
+                    ctx.resume_span.take();
                     ctx.resume_frames.take();
                     return Ok(ctx
                         .pending
