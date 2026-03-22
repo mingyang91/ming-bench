@@ -29,6 +29,7 @@ const BUILTINS: &[&str] = &[
     "char-alphabetic?", "char-numeric?", "char-upcase", "char-downcase",
     "char=?", "char<?",
     "string=?", "string<?", "string-ci=?", "string-upcase", "string-downcase",
+    "string->list", "list->string", "char->integer", "integer->char",
 ];
 
 fn is_builtin(name: &str) -> bool {
@@ -356,8 +357,7 @@ fn eval_list_tco(
                 return Ok(Trampoline::Done(val));
             }
             "string-set!" => {
-                let val = eval_string_set(&items[1..], env, out, cc)?;
-                return Ok(Trampoline::Done(val));
+                return Err(EvalError::type_err("string-set!: strings are immutable"));
             }
             "call/cc" | "call-with-current-continuation" => {
                 return eval_callcc(&items[1..], env, out, cc);
@@ -810,7 +810,8 @@ fn apply_builtin(name: &str, args: &[Value], out: &mut String) -> Result<Value, 
         // String builtins
         "string-append" | "string-length" | "substring" | "string->number"
         | "number->string" | "symbol->string" | "string->symbol" | "string-ref"
-        | "char?" | "string-copy" => apply_string_builtin(name, args),
+        | "char?" | "string-copy" | "string->list" | "list->string"
+        | "char->integer" | "integer->char" => apply_string_builtin(name, args),
         _ => Err(EvalError::unbound(name)),
     }
 }
@@ -1169,6 +1170,65 @@ fn apply_string_builtin(name: &str, args: &[Value]) -> Result<Value, EvalError> 
                 ))),
             }
         }
+        "string->list" => {
+            if args.len() != 1 {
+                return Err(EvalError::arity("string->list requires exactly 1 argument"));
+            }
+            match &args[0] {
+                Value::Str(s) => {
+                    let chars: Vec<Value> = s.chars().map(Value::Char).collect();
+                    Ok(Value::List(chars))
+                }
+                _ => Err(EvalError::type_err(format!(
+                    "string->list: expected string, got {}", args[0]
+                ))),
+            }
+        }
+        "list->string" => {
+            if args.len() != 1 {
+                return Err(EvalError::arity("list->string requires exactly 1 argument"));
+            }
+            match &args[0] {
+                Value::List(items) => {
+                    let mut s = String::new();
+                    for item in items {
+                        match item {
+                            Value::Char(c) => s.push(*c),
+                            _ => return Err(EvalError::type_err(format!(
+                                "list->string: expected char, got {}", item
+                            ))),
+                        }
+                    }
+                    Ok(Value::Str(s))
+                }
+                _ => Err(EvalError::type_err(format!(
+                    "list->string: expected list, got {}", args[0]
+                ))),
+            }
+        }
+        "char->integer" => {
+            if args.len() != 1 {
+                return Err(EvalError::arity("char->integer requires exactly 1 argument"));
+            }
+            match &args[0] {
+                Value::Char(c) => Ok(Value::Integer(*c as i64)),
+                _ => Err(EvalError::type_err(format!(
+                    "char->integer: expected char, got {}", args[0]
+                ))),
+            }
+        }
+        "integer->char" => {
+            if args.len() != 1 {
+                return Err(EvalError::arity("integer->char requires exactly 1 argument"));
+            }
+            let n = require_int(&args[0], "integer->char")?;
+            match char::from_u32(n as u32) {
+                Some(c) => Ok(Value::Char(c)),
+                None => Err(EvalError::type_err(format!(
+                    "integer->char: invalid code point {}", n
+                ))),
+            }
+        }
         _ => Err(EvalError::unbound(name)),
     }
 }
@@ -1486,43 +1546,6 @@ fn eval_set(
     Ok(Value::Void)
 }
 
-fn eval_string_set(
-    args: &[Value],
-    env: &Rc<RefCell<Env>>,
-    out: &mut String,
-    cc: &CcCtx,
-) -> Result<Value, EvalError> {
-    if args.len() != 3 {
-        return Err(EvalError::arity("string-set! requires exactly 3 arguments"));
-    }
-    let Value::Symbol(var_name) = &args[0] else {
-        return Err(EvalError::type_err("string-set!: first argument must be a variable"));
-    };
-    let idx_val = eval(&args[1], env, out, cc)?;
-    let idx = require_int(&idx_val, "string-set!")? as usize;
-    let char_val = eval(&args[2], env, out, cc)?;
-    let Value::Char(ch) = char_val else {
-        return Err(EvalError::type_err(format!(
-            "string-set!: expected char, got {char_val}"
-        )));
-    };
-    let current = env.borrow().get(var_name)?;
-    let Value::Str(s) = current else {
-        return Err(EvalError::type_err(format!(
-            "string-set!: expected string, got {current}"
-        )));
-    };
-    let mut chars: Vec<char> = s.chars().collect();
-    if idx >= chars.len() {
-        return Err(EvalError::type_err(format!(
-            "string-set!: index {idx} out of range for string of length {}", chars.len()
-        )));
-    }
-    chars[idx] = ch;
-    let new_str: String = chars.into_iter().collect();
-    env.borrow_mut().set(var_name.clone(), Value::Str(new_str));
-    Ok(Value::Void)
-}
 
 fn eval_begin_tco(
     args: &[Value],
