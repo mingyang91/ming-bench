@@ -80,8 +80,7 @@ object CpsApply:
     acc: List[SchemeValue],
     k: Cont
   ): Bounce =
-    if lists.exists(_.isEmpty) then
-      More(() => k(Builtins.listToPairs(acc.reverse), env))
+    if lists.exists(_.isEmpty) then More(() => k(Builtins.listToPairs(acc.reverse), env))
     else
       val heads = lists.map(_.head)
       val tails = lists.map(_.tail)
