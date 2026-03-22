@@ -1,27 +1,3 @@
-mod level01;
-mod level02;
-mod level03;
-mod level04;
-mod level05;
-mod level06;
-mod level07;
-mod level08;
-mod level09;
-mod level10;
-mod level11;
-mod level12;
-mod level13;
-mod level14;
-mod level15;
-mod level16;
-mod level17;
-mod level18;
-mod level19;
-mod level20;
-mod level21;
-mod level22;
-mod level23;
-mod level24;
-mod level25;
-mod level26;
-mod level27;
+// Test functions are auto-generated from bench/tests.json by build.rs.
+// Do NOT add test functions here manually — edit tests.json instead.
+include!(concat!(env!("OUT_DIR"), "/tests_generated.rs"));

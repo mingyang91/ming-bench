@@ -385,6 +385,40 @@ pub fn elapsed_secs(meta: &MetaJson) -> Option<u64> {
 }
 
 // ---------------------------------------------------------------------------
+// TestEntry — deserialized from bench/tests.json
+// ---------------------------------------------------------------------------
+
+#[derive(Deserialize, Debug, Clone)]
+pub struct TestEntry {
+    pub name: String,
+    pub level: u32,
+    pub fixture: String,
+    pub kind: String,
+    #[serde(default)]
+    pub expected: Option<String>,
+    #[serde(default)]
+    pub expected_output: Option<String>,
+    #[serde(default)]
+    pub deprecated_after: Option<u32>,
+}
+
+pub fn load_tests_json() -> Result<Vec<TestEntry>> {
+    let path = project_dir().join("bench/tests.json");
+    let json = fs::read_to_string(&path).map_err(|e| Error::CommandFailed {
+        cmd: format!("read {}", path.display()),
+        exit_code: e.raw_os_error().unwrap_or(1),
+    })?;
+    serde_json::from_str(&json).map_err(|e| Error::CommandFailed {
+        cmd: format!("parse tests.json: {e}"),
+        exit_code: 1,
+    })
+}
+
+pub fn fixtures_dir() -> PathBuf {
+    project_dir().join("bench/fixtures")
+}
+
+// ---------------------------------------------------------------------------
 // Level constants
 // ---------------------------------------------------------------------------
 

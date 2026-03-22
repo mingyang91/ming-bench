@@ -134,8 +134,15 @@ enum Commands {
         #[arg(long)]
         all: bool,
     },
-    /// Verify test cases against Guile ground truth
-    Verify,
+    /// Verify test cases against ground-truth Scheme implementation
+    Verify {
+        /// Only verify this level (e.g., "15")
+        #[arg(long)]
+        level: Option<String>,
+        /// Ground-truth implementation: guile (default), chez
+        #[arg(long, default_value = "guile")]
+        r#impl: String,
+    },
     /// Dump session content (thinking, text, tool calls)
     SessionDump {
         /// Run directory or name
@@ -262,7 +269,9 @@ fn dispatch_non_agent(command: Commands) -> model::Result<()> {
             ref lang,
         } => cmd::bench::run(branch, run_id.as_deref(), lang),
         Commands::Analyze { runs, all } => cmd::analyze::run(runs, all),
-        Commands::Verify => cmd::verify::run(),
+        Commands::Verify { ref level, ref r#impl } => {
+            cmd::verify::run(level.as_deref(), r#impl)
+        }
         other => dispatch_session_command(other),
     }
 }
@@ -299,7 +308,7 @@ fn dispatch_session_command(command: Commands) -> model::Result<()> {
         | Commands::Test { .. }
         | Commands::Bench { .. }
         | Commands::Analyze { .. }
-        | Commands::Verify => unreachable!("non-session command dispatched elsewhere"),
+        | Commands::Verify { .. } => unreachable!("non-session command dispatched elsewhere"),
     }
 }
 

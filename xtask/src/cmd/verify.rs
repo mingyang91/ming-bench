@@ -1,209 +1,177 @@
-use crate::model::{command_exists, run_cmd_capture, Error, Result};
+use crate::model::{command_exists, fixtures_dir, load_tests_json, run_cmd_capture, Error, Result, TestEntry};
+use std::path::Path;
 
-/// (label, guile_expression, expected_output)
-const TEST_CASES: &[(&str, &str, &str)] = &[
-    // Level 1: Atoms, Arithmetic & Comparisons
-    ("l01_integer",     "(display 42) (newline)",          "42"),
-    ("l01_negative",    "(display -7) (newline)",          "-7"),
-    ("l01_true",        "(display #t) (newline)",          "#t"),
-    ("l01_false",       "(display #f) (newline)",          "#f"),
-    ("l01_string",      "(write \"hello\") (newline)",     "\"hello\""),
-    ("l01_add",         "(display (+ 1 2)) (newline)",             "3"),
-    ("l01_sub",         "(display (- 10 3)) (newline)",            "7"),
-    ("l01_mul",         "(display (* 4 5)) (newline)",             "20"),
-    ("l01_div",         "(display (/ 10 2)) (newline)",            "5"),
-    ("l01_variadic",    "(display (+ 1 2 3 4)) (newline)",        "10"),
-    ("l01_unary_minus", "(display (- 10)) (newline)",              "-10"),
-    ("l01_nested",      "(display (+ (* 2 3) (- 10 4))) (newline)", "12"),
-    ("l01_lt",          "(display (< 1 2)) (newline)",             "#t"),
-    ("l01_gt",          "(display (> 1 2)) (newline)",             "#f"),
-    ("l01_eq",          "(display (= 3 3)) (newline)",             "#t"),
-    ("l01_le",          "(display (<= 2 2)) (newline)",            "#t"),
-    ("l01_not",         "(display (not #t)) (newline)",            "#f"),
-    ("l01_and",         "(display (and #t #t #f)) (newline)",      "#f"),
-    ("l01_or",          "(display (or #f #f 5)) (newline)",        "5"),
-
-    // Level 2: Variables, Conditionals & Lambda
-    ("l02_if_true",     "(display (if #t 1 2)) (newline)",        "1"),
-    ("l02_if_false",    "(display (if #f 1 2)) (newline)",        "2"),
-    ("l02_if_expr",     "(display (if (< 1 2) 10 20)) (newline)", "10"),
-    ("l02_define_var",  "(define x 5) (display x) (newline)",     "5"),
-    ("l02_define_use",  "(define x 3) (display (+ x 1)) (newline)", "4"),
-    ("l02_define_multi","(define x 10) (define y 20) (display (+ x y)) (newline)", "30"),
-    ("l02_quote",       "(display (quote (1 2 3))) (newline)",     "(1 2 3)"),
-    ("l02_lambda",      "(display ((lambda (x) (+ x 1)) 5)) (newline)", "6"),
-    ("l02_multi_param", "(display ((lambda (x y) (+ x y)) 3 4)) (newline)", "7"),
-    ("l02_define_fn",   "(define (square x) (* x x)) (display (square 5)) (newline)", "25"),
-    ("l02_closure",     "(define (make-adder n) (lambda (x) (+ x n))) (display ((make-adder 3) 4)) (newline)", "7"),
-    ("l02_higher_order","(define (apply-twice f x) (f (f x))) (display (apply-twice (lambda (x) (+ x 1)) 0)) (newline)", "2"),
-    ("l02_factorial",   "(define (fact n) (if (= n 0) 1 (* n (fact (- n 1))))) (display (fact 5)) (newline)", "120"),
-    ("l02_fibonacci",   "(define (fib n) (if (< n 2) n (+ (fib (- n 1)) (fib (- n 2))))) (display (fib 10)) (newline)", "55"),
-
-    // Level 3: Lists, Recursion, Let/Begin/Cond & Predicates
-    ("l03_cons",        "(display (cons 1 '())) (newline)",        "(1)"),
-    ("l03_cons_chain",  "(display (cons 1 (cons 2 (cons 3 '())))) (newline)", "(1 2 3)"),
-    ("l03_car",         "(display (car '(1 2 3))) (newline)",      "1"),
-    ("l03_cdr",         "(display (cdr '(1 2 3))) (newline)",      "(2 3)"),
-    ("l03_null_true",   "(display (null? '())) (newline)",         "#t"),
-    ("l03_null_false",  "(display (null? '(1))) (newline)",        "#f"),
-    ("l03_list",        "(display (list 1 2 3)) (newline)",        "(1 2 3)"),
-    ("l03_length",      "(display (length '(1 2 3))) (newline)",   "3"),
-    ("l03_count",       "(define (count lst) (if (null? lst) 0 (+ 1 (count (cdr lst))))) (display (count '(a b c))) (newline)", "3"),
-    ("l03_append",      "(define (my-append a b) (if (null? a) b (cons (car a) (my-append (cdr a) b)))) (display (my-append '(1 2) '(3 4))) (newline)", "(1 2 3 4)"),
-    ("l03_reverse",     "(define (my-reverse lst) (define (rev-iter l acc) (if (null? l) acc (rev-iter (cdr l) (cons (car l) acc)))) (rev-iter lst '())) (display (my-reverse '(1 2 3))) (newline)", "(3 2 1)"),
-    ("l03_map",         "(define (my-map f lst) (if (null? lst) '() (cons (f (car lst)) (my-map f (cdr lst))))) (display (my-map (lambda (x) (* x x)) '(1 2 3 4))) (newline)", "(1 4 9 16)"),
-    ("l03_filter",      "(define (my-filter pred lst) (if (null? lst) '() (if (pred (car lst)) (cons (car lst) (my-filter pred (cdr lst))) (my-filter pred (cdr lst))))) (display (my-filter (lambda (x) (> x 2)) '(1 2 3 4 5))) (newline)", "(3 4 5)"),
-    ("l03_let",         "(display (let ((x 1) (y 2)) (+ x y))) (newline)", "3"),
-    ("l03_nested_let",  "(display (let ((x 5)) (let ((y (+ x 1))) y))) (newline)", "6"),
-    ("l03_begin",       "(display (begin 1 2 3)) (newline)",       "3"),
-    ("l03_cond",        "(display (cond ((= 1 2) 10) ((= 1 1) 20) (else 30))) (newline)", "20"),
-    ("l03_cond_else",   "(display (cond (#f 1) (else 2))) (newline)", "2"),
-    ("l03_begin_define","(define x 0) (begin (define x 1) (define x 2) (display x)) (newline)", "2"),
-    ("l03_string_pred", "(display (string? \"hello\")) (newline)", "#t"),
-    ("l03_number_pred", "(display (number? 42)) (newline)",        "#t"),
-    ("l03_boolean_pred","(display (boolean? #t)) (newline)",       "#t"),
-    ("l03_pair_pred",   "(display (pair? '(1 2))) (newline)",      "#t"),
-    ("l03_symbol_pred", "(display (symbol? 'foo)) (newline)",      "#t"),
-
-    // Level 7: Tail Call Optimization
-    ("l07_loop",        "(define (loop n) (if (= n 0) (quote done) (loop (- n 1)))) (display (loop 1000000)) (newline)", "done"),
-    ("l07_fact_iter",   "(define (fact-iter n acc) (if (= n 0) acc (fact-iter (- n 1) (* n acc)))) (display (fact-iter 20 1)) (newline)", "2432902008176640000"),
-    ("l07_mutual",      "(define (my-even? n) (if (= n 0) #t (my-odd? (- n 1)))) (define (my-odd? n) (if (= n 0) #f (my-even? (- n 1)))) (display (my-even? 100000)) (newline)", "#t"),
-
-    // Level 13: Numeric/Char/String Utilities
-    ("l13_abs",         "(display (abs -5)) (newline)",               "5"),
-    ("l13_modulo",      "(display (modulo 10 3)) (newline)",          "1"),
-    ("l13_modulo_neg",  "(display (modulo -10 3)) (newline)",         "2"),
-    ("l13_remainder",   "(display (remainder -10 3)) (newline)",      "-1"),
-    ("l13_quotient",    "(display (quotient 10 3)) (newline)",        "3"),
-    ("l13_min",         "(display (min 3 1 4 1 5)) (newline)",        "1"),
-    ("l13_max",         "(display (max 3 1 4 1 5)) (newline)",        "5"),
-    ("l13_expt",        "(display (expt 2 10)) (newline)",            "1024"),
-    ("l13_zero_t",      "(display (zero? 0)) (newline)",              "#t"),
-    ("l13_zero_f",      "(display (zero? 1)) (newline)",              "#f"),
-    ("l13_positive",    "(display (positive? 5)) (newline)",          "#t"),
-    ("l13_negative",    "(display (negative? -3)) (newline)",         "#t"),
-    ("l13_odd",         "(display (odd? 3)) (newline)",               "#t"),
-    ("l13_even",        "(display (even? 4)) (newline)",              "#t"),
-    ("l13_list_ref",    "(display (list-ref '(a b c d) 2)) (newline)", "c"),
-    ("l13_list_tail",   "(display (list-tail '(a b c d) 2)) (newline)", "(c d)"),
-    ("l13_list_pred_t", "(display (list? '(1 2 3))) (newline)",       "#t"),
-    ("l13_list_pred_f", "(display (list? (cons 1 2))) (newline)",     "#f"),
-    ("l13_assoc",       "(display (assoc 'b '((a 1) (b 2) (c 3)))) (newline)", "(b 2)"),
-    ("l13_map_multi",   "(display (map + '(1 2 3) '(10 20 30))) (newline)", "(11 22 33)"),
-    ("l13_char_alpha",  "(display (char-alphabetic? #\\a)) (newline)", "#t"),
-    ("l13_char_num",    "(display (char-numeric? #\\5)) (newline)",   "#t"),
-    ("l13_char_up",     "(display (char-upcase #\\a)) (newline)",     "A"),
-    ("l13_char_down",   "(display (char-downcase #\\A)) (newline)",   "a"),
-    ("l13_char_eq",     "(display (char=? #\\a #\\a)) (newline)",     "#t"),
-    ("l13_char_lt",     "(display (char<? #\\a #\\b)) (newline)",     "#t"),
-    ("l13_str_eq",      "(display (string=? \"abc\" \"abc\")) (newline)", "#t"),
-    ("l13_str_lt",      "(display (string<? \"abc\" \"abd\")) (newline)", "#t"),
-    ("l13_str_ci",      "(display (string-ci=? \"ABC\" \"abc\")) (newline)", "#t"),
-    ("l13_str_up",      "(write (string-upcase \"hello\")) (newline)", "\"HELLO\""),
-    ("l13_str_down",    "(write (string-downcase \"HELLO\")) (newline)", "\"hello\""),
-
-    // Level 24: case-lambda
-    ("l24_basic_0",     "(define f (case-lambda (() 0) ((x) x) ((x y) (+ x y)))) (display (f)) (newline)", "0"),
-    ("l24_basic_1",     "(define f (case-lambda (() 0) ((x) x) ((x y) (+ x y)))) (display (f 5)) (newline)", "5"),
-    ("l24_basic_2",     "(define f (case-lambda (() 0) ((x) x) ((x y) (+ x y)))) (display (f 3 4)) (newline)", "7"),
-    ("l24_rest",        "(define f (case-lambda ((x y . rest) (apply + x y rest)))) (display (f 1 2 3 4)) (newline)", "10"),
-    ("l24_procedure",   "(display (procedure? (case-lambda (() 1) ((x) x)))) (newline)", "#t"),
-
-    // Level 25: procedure-name
-    ("l25_named",       "(define (f x) (+ x 1)) (display (eq? (procedure-name f) 'f)) (newline)", "#t"),
-    ("l25_anon",        "(display (eq? (procedure-name (lambda (x) x)) #f)) (newline)", "#t"),
-    ("l25_let_name",    "(define g (lambda (x) x)) (display (eq? (procedure-name g) 'g)) (newline)", "#t"),
-    ("l25_builtin",     "(display (symbol? (procedure-name +))) (newline)", "#t"),
-
-    // Level 26: procedure? on all callable types
-    ("l26_lambda",      "(display (procedure? (lambda (x) x))) (newline)", "#t"),
-    ("l26_case_lambda", "(display (procedure? (case-lambda (() 0)))) (newline)", "#t"),
-    ("l26_builtin",     "(display (procedure? +)) (newline)", "#t"),
-    ("l26_cont",        "(call-with-current-continuation (lambda (k) (display (procedure? k)) (newline)))", "#t"),
-    ("l26_non_proc",    "(display (procedure? 42)) (newline)", "#f"),
-
-    // Level 27: do loops
-    ("l27_basic",       "(display (do ((i 0 (+ i 1)) (sum 0 (+ sum i))) ((= i 5) sum))) (newline)", "10"),
-    ("l27_parallel",    "(display (do ((a 1 b) (b 2 a)) ((= a 2) (list a b)))) (newline)", "(2 1)"),
-    ("l27_fibonacci",   "(display (do ((i 0 (+ i 1)) (a 0 b) (b 1 (+ a b))) ((= i 10) a))) (newline)", "55"),
-];
-
-fn print_section_header<'a>(label: &'a str, current_section: &mut &'a str) {
-    let section = &label[..3];
-    if section == *current_section {
-        return;
-    }
-    *current_section = section;
-    let level_name = match section {
-        "l01" => "Level 1: Atoms, Arithmetic & Comparisons",
-        "l02" => "Level 2: Variables, Conditionals & Lambda",
-        "l03" => "Level 3: Lists, Recursion, Let/Begin/Cond & Predicates",
-        "l07" => "Level 7: Tail Call Optimization",
-        "l13" => "Level 13: Numeric/Char/String Utilities",
-        "l24" => "Level 24: case-lambda",
-        "l25" => "Level 25: procedure-name",
-        "l26" => "Level 26: procedure? on all types",
-        "l27" => "Level 27: do Loops",
-        _ => section,
-    };
-    println!("=== {level_name} ===");
-}
-
-/// Returns Ok(()) on pass, Err(message) on failure.
-fn check_result(
-    label: &str,
-    expr: &str,
-    expected: &str,
-    exit_code: i32,
-    actual: &str,
-) -> std::result::Result<(), String> {
-    if exit_code != 0 {
-        Err(format!("  FAIL {label}: guile error on: {expr}"))
-    } else if actual == expected {
-        Ok(())
-    } else {
-        Err(format!(
-            "  FAIL {label}: expected '{expected}', got '{actual}'"
-        ))
+/// Supported ground-truth Scheme implementations.
+fn impl_command(name: &str) -> Result<(&'static str, Vec<&'static str>)> {
+    match name {
+        "guile" => Ok(("guile", vec!["--no-auto-compile", "-c"])),
+        "chez" => Ok(("chez-scheme", vec!["--quiet", "--script"])),
+        _ => Err(Error::CommandFailed {
+            cmd: format!("unknown implementation: {name}"),
+            exit_code: 1,
+        }),
     }
 }
 
-pub fn run() -> Result<()> {
-    if !command_exists("guile") {
+/// Run a fixture file through the ground-truth implementation.
+/// Returns (exit_code, stdout).
+fn run_fixture(
+    bin: &str,
+    implementation: &str,
+    fixture_path: &std::path::Path,
+    kind: &str,
+    cwd: &std::path::Path,
+) -> std::result::Result<(i32, String), Error> {
+    match kind {
+        "eval_str_ok" => {
+            // Load the fixture, write the result.
+            // Guile: (write (load "path")) (newline)
+            let load_expr = format!(
+                "(write (load \"{}\")) (newline)",
+                fixture_path.display()
+            );
+            if implementation == "chez" {
+                run_chez(bin, &load_expr, cwd)
+            } else {
+                run_cmd_capture(bin, &["--no-auto-compile", "-c", &load_expr], cwd)
+            }
+        }
+        "eval_str_err" | "eval_str_err_with_position" => {
+            // Load the fixture — expect non-zero exit
+            let load_expr = format!("(load \"{}\")", fixture_path.display());
+            if implementation == "chez" {
+                run_chez(bin, &load_expr, cwd)
+            } else {
+                run_cmd_capture(bin, &["--no-auto-compile", "-c", &load_expr], cwd)
+            }
+        }
+        _ => {
+            // Default: just load
+            let load_expr = format!("(load \"{}\")", fixture_path.display());
+            if implementation == "chez" {
+                run_chez(bin, &load_expr, cwd)
+            } else {
+                run_cmd_capture(bin, &["--no-auto-compile", "-c", &load_expr], cwd)
+            }
+        }
+    }
+}
+
+pub fn run(level: Option<&str>, implementation: &str) -> Result<()> {
+    let (bin, _base_args) = impl_command(implementation)?;
+
+    if !command_exists(bin) {
         return Err(Error::BinaryNotFound {
-            name: "guile".to_string(),
+            name: bin.to_string(),
         });
     }
 
-    let cwd = std::env::current_dir().expect("cannot read current directory");
+    let tests = load_tests_json()?;
+    let fix_dir = fixtures_dir();
+    let cwd = std::env::current_dir().expect("cannot read cwd");
+
+    // Filter by level if specified
+    let filtered: Vec<&TestEntry> = tests
+        .iter()
+        .filter(|t| match level {
+            Some(l) => format!("{:02}", t.level) == l || t.level.to_string() == l,
+            None => true,
+        })
+        .collect();
+
+    if filtered.is_empty() {
+        println!("No tests match level filter '{}'", level.unwrap_or("all"));
+        return Ok(());
+    }
+
     let mut passed = 0u32;
     let mut failed = 0u32;
+    let mut skipped = 0u32;
     let mut errors: Vec<String> = Vec::new();
+    let mut current_level = 0u32;
 
-    let mut current_section = "";
+    for test in &filtered {
+        // Print section headers
+        if test.level != current_level {
+            current_level = test.level;
+            println!("=== Level {current_level} ===");
+        }
 
-    for (label, expr, expected) in TEST_CASES {
-        print_section_header(label, &mut current_section);
-        let verdict = match run_cmd_capture("guile", &["--no-auto-compile", "-c", expr], &cwd) {
+        // Load fixture
+        let fixture_path = fix_dir.join(&test.fixture);
+        if !fixture_path.is_file() {
+            skipped += 1;
+            errors.push(format!("  SKIP {}: fixture not found: {}", test.name, fixture_path.display()));
+            continue;
+        }
+
+        let result = run_fixture(bin, implementation, &fixture_path, &test.kind, &cwd);
+
+        match result {
             Ok((exit_code, actual)) => {
-                check_result(label, expr, expected, exit_code, actual.trim_end())
+                let actual = actual.trim_end();
+                match test.kind.as_str() {
+                    "eval_str_ok" => {
+                        let expected = test.expected.as_deref().unwrap_or("");
+                        if exit_code != 0 {
+                            failed += 1;
+                            errors.push(format!("  FAIL {}: {implementation} error (exit {exit_code})", test.name));
+                        } else if actual == expected {
+                            passed += 1;
+                        } else {
+                            failed += 1;
+                            errors.push(format!(
+                                "  FAIL {}: expected '{}', got '{actual}'",
+                                test.name, expected
+                            ));
+                        }
+                    }
+                    "eval_str_err" | "eval_str_err_with_position" => {
+                        if exit_code != 0 {
+                            passed += 1; // error expected
+                        } else {
+                            failed += 1;
+                            errors.push(format!(
+                                "  FAIL {}: expected error but got success: '{actual}'",
+                                test.name
+                            ));
+                        }
+                    }
+                    "eval_str_with_output" => {
+                        // Check expected_output against stdout
+                        let expected_output = test.expected_output.as_deref().unwrap_or("");
+                        if exit_code != 0 {
+                            failed += 1;
+                            errors.push(format!("  FAIL {}: {implementation} error (exit {exit_code})", test.name));
+                        } else if actual.contains(expected_output) {
+                            passed += 1;
+                        } else {
+                            failed += 1;
+                            errors.push(format!(
+                                "  FAIL {}: expected output containing '{}', got '{actual}'",
+                                test.name, expected_output
+                            ));
+                        }
+                    }
+                    _ => {
+                        skipped += 1;
+                    }
+                }
             }
-            Err(_) => Err(format!("  FAIL {label}: failed to run guile")),
-        };
-        match verdict {
-            Ok(()) => passed += 1,
-            Err(msg) => {
+            Err(_) => {
                 failed += 1;
-                errors.push(msg);
+                errors.push(format!("  FAIL {}: failed to run {implementation}", test.name));
             }
         }
     }
 
     println!();
-    println!("=== Results ===");
-    println!("  Passed: {passed}");
-    println!("  Failed: {failed}");
+    println!("=== Results ({implementation}) ===");
+    println!("  Passed:  {passed}");
+    println!("  Failed:  {failed}");
+    if skipped > 0 {
+        println!("  Skipped: {skipped}");
+    }
 
     if failed > 0 {
         for err in &errors {
@@ -214,7 +182,19 @@ pub fn run() -> Result<()> {
             exit_code: 1,
         })
     } else {
-        println!("  All tests match ground truth!");
+        println!("  All {passed} tests match ground truth!");
         Ok(())
     }
+}
+
+/// Chez Scheme needs a temp file (no -c flag for eval).
+fn run_chez(bin: &str, expr: &str, cwd: &Path) -> std::result::Result<(i32, String), Error> {
+    let tmp = std::env::temp_dir().join("ming_verify.scm");
+    std::fs::write(&tmp, expr).map_err(|e| Error::CommandFailed {
+        cmd: format!("write temp: {e}"),
+        exit_code: 1,
+    })?;
+    let result = run_cmd_capture(bin, &["--quiet", "--script", tmp.to_str().unwrap()], cwd);
+    let _ = std::fs::remove_file(&tmp);
+    result
 }
