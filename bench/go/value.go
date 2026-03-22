@@ -16,6 +16,7 @@ const (
 	KindNull
 	KindVoid
 	KindBuiltin
+	KindLambda
 )
 
 type BuiltinFunc func(args []*Value) (*Value, error)
@@ -28,6 +29,10 @@ type Value struct {
 	Car     *Value
 	Cdr     *Value
 	Builtin BuiltinFunc
+	// Lambda fields
+	Params []string
+	Body   []*Value
+	ClosureEnv *Env
 }
 
 func intVal(n int64) *Value   { return &Value{Kind: KindInteger, Int: n} }
@@ -66,6 +71,8 @@ func (v *Value) String() string {
 		return ""
 	case KindBuiltin:
 		return fmt.Sprintf("#<procedure:%s>", v.Str)
+	case KindLambda:
+		return "#<procedure>"
 	case KindPair:
 		return printList(v)
 	}

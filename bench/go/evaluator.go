@@ -69,6 +69,14 @@ func evalList(expr *Value, env *Env) (*Value, error) {
 			return evalAnd(expr.Cdr, env)
 		case "or":
 			return evalOr(expr.Cdr, env)
+		case "if":
+			return evalIf(expr.Cdr, env)
+		case "define":
+			return evalDefine(expr.Cdr, env)
+		case "quote":
+			return expr.Cdr.Car, nil
+		case "lambda":
+			return evalLambda(expr.Cdr, env)
 		}
 	}
 
@@ -86,6 +94,10 @@ func evalList(expr *Value, env *Env) (*Value, error) {
 
 	if fn.Kind == KindBuiltin {
 		return fn.Builtin(args)
+	}
+
+	if fn.Kind == KindLambda {
+		return applyLambda(fn, args)
 	}
 
 	return nil, &EvalError{Message: fmt.Sprintf("not a procedure: %s", fn.String())}
@@ -137,6 +149,99 @@ func evalOr(args *Value, env *Env) (*Value, error) {
 		cur = cur.Cdr
 	}
 	return result, nil
+}
+
+func evalIf(args *Value, env *Env) (*Value, error) {
+	cond, err := eval(args.Car, env)
+	if err != nil {
+		return nil, err
+	}
+	if cond.isTruthy() {
+		return eval(args.Cdr.Car, env)
+	}
+	// else branch (optional)
+	if args.Cdr.Cdr.Kind == KindNull {
+		return voidVal(), nil
+	}
+	return eval(args.Cdr.Cdr.Car, env)
+}
+
+func evalDefine(args *Value, env *Env) (*Value, error) {
+	target := args.Car
+	if target.Kind == KindSymbol {
+		// (define x expr)
+		val, err := eval(args.Cdr.Car, env)
+		if err != nil {
+			return nil, err
+		}
+		env.set(target.Str, val)
+		return voidVal(), nil
+	}
+	if target.Kind == KindPair {
+		// (define (name params...) body...)
+		name := target.Car.Str
+		params := listToStrings(target.Cdr)
+		body := listToSlice(args.Cdr)
+		fn := &Value{
+			Kind:       KindLambda,
+			Params:     params,
+			Body:       body,
+			ClosureEnv: env,
+		}
+		env.set(name, fn)
+		return voidVal(), nil
+	}
+	return nil, &EvalError{Message: "define: bad syntax"}
+}
+
+func evalLambda(args *Value, env *Env) (*Value, error) {
+	params := listToStrings(args.Car)
+	body := listToSlice(args.Cdr)
+	return &Value{
+		Kind:       KindLambda,
+		Params:     params,
+		Body:       body,
+		ClosureEnv: env,
+	}, nil
+}
+
+func applyLambda(fn *Value, args []*Value) (*Value, error) {
+	if len(args) != len(fn.Params) {
+		return nil, &EvalError{Message: fmt.Sprintf("expected %d arguments, got %d", len(fn.Params), len(args))}
+	}
+	localEnv := newEnv(fn.ClosureEnv)
+	for i, p := range fn.Params {
+		localEnv.set(p, args[i])
+	}
+	var result *Value
+	var err error
+	for _, expr := range fn.Body {
+		result, err = eval(expr, localEnv)
+		if err != nil {
+			return nil, err
+		}
+	}
+	return result, nil
+}
+
+func listToStrings(v *Value) []string {
+	var result []string
+	cur := v
+	for cur.Kind == KindPair {
+		result = append(result, cur.Car.Str)
+		cur = cur.Cdr
+	}
+	return result
+}
+
+func listToSlice(v *Value) []*Value {
+	var result []*Value
+	cur := v
+	for cur.Kind == KindPair {
+		result = append(result, cur.Car)
+		cur = cur.Cdr
+	}
+	return result
 }
 
 // Builtin implementations
