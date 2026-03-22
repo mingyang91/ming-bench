@@ -62,6 +62,21 @@ public class Parser {
             advance();
             var quoted = parseExpr();
             return new SchemeValue.ListVal(List.of(new SchemeValue.SymbolVal("quote"), quoted)).withPos(sp);
+        } else if (c == '`') {
+            SourcePos sp = currentPos();
+            advance();
+            var quoted = parseExpr();
+            return new SchemeValue.ListVal(List.of(new SchemeValue.SymbolVal("quasiquote"), quoted)).withPos(sp);
+        } else if (c == ',') {
+            SourcePos sp = currentPos();
+            advance();
+            if (pos < input.length() && input.charAt(pos) == '@') {
+                advance();
+                var quoted = parseExpr();
+                return new SchemeValue.ListVal(List.of(new SchemeValue.SymbolVal("unquote-splicing"), quoted)).withPos(sp);
+            }
+            var quoted = parseExpr();
+            return new SchemeValue.ListVal(List.of(new SchemeValue.SymbolVal("unquote"), quoted)).withPos(sp);
         } else {
             return parseAtom();
         }
@@ -73,6 +88,23 @@ public class Parser {
         var elements = new ArrayList<SchemeValue>();
         skipWhitespace();
         while (pos < input.length() && input.charAt(pos) != ')') {
+            // Check for dotted pair: ". expr)"
+            if (input.charAt(pos) == '.' && !elements.isEmpty()
+                    && pos + 1 < input.length() && isDelimiter(input.charAt(pos + 1))) {
+                advance(); // skip '.'
+                skipWhitespace();
+                SchemeValue tail = parseExpr();
+                skipWhitespace();
+                if (pos >= input.length() || input.charAt(pos) != ')')
+                    throw new EvalError("bad dotted pair at " + sp);
+                advance(); // skip ')'
+                // Build chain: (a b . c) -> PairVal(a, PairVal(b, c))
+                SchemeValue result = tail;
+                for (int i = elements.size() - 1; i >= 0; i--) {
+                    result = new SchemeValue.PairVal(elements.get(i), result);
+                }
+                return ((SchemeValue) result).withPos(sp);
+            }
             elements.add(parseExpr());
             skipWhitespace();
         }
@@ -145,6 +177,20 @@ public class Parser {
             advance(); // skip '
             var quoted = parseExpr();
             return new SchemeValue.ListVal(List.of(new SchemeValue.SymbolVal("syntax-quote"), quoted)).withPos(sp);
+        } else if (c == '(') {
+            // Vector literal #(...)
+            advance(); // skip '('
+            var elements = new ArrayList<SchemeValue>();
+            skipWhitespace();
+            while (pos < input.length() && input.charAt(pos) != ')') {
+                elements.add(parseExpr());
+                skipWhitespace();
+            }
+            if (pos >= input.length()) {
+                throw new EvalError("unmatched '#(' at " + sp);
+            }
+            advance(); // skip ')'
+            return new SchemeValue.VectorVal(elements.toArray(new SchemeValue[0])).withPos(sp);
         } else {
             throw new EvalError("unknown hash literal: #" + c + " at " + sp);
         }

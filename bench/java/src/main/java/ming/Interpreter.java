@@ -752,6 +752,21 @@ public class Interpreter {
                 } else return new SchemeValue.BoolVal(false);
             }
         });
+        builtin("memv", args -> {
+            if (args.size() != 2) throw new EvalError("memv: expected 2 arguments");
+            SchemeValue key = args.get(0);
+            SchemeValue lst = args.get(1);
+            while (true) {
+                if (lst instanceof SchemeValue.ListVal l && l.elements().isEmpty()) return new SchemeValue.BoolVal(false);
+                if (lst instanceof SchemeValue.PairVal p) {
+                    if (schemeEqv(key, p.car())) return lst;
+                    lst = p.cdr();
+                } else if (lst instanceof SchemeValue.ListVal l && !l.elements().isEmpty()) {
+                    if (schemeEqv(key, l.elements().getFirst())) return lst;
+                    lst = new SchemeValue.ListVal(l.elements().subList(1, l.elements().size()));
+                } else return new SchemeValue.BoolVal(false);
+            }
+        });
         builtin("assq", args -> {
             if (args.size() != 2) throw new EvalError("assq: expected 2 arguments");
             SchemeValue key = args.get(0);
@@ -897,6 +912,15 @@ public class Interpreter {
             if (args.size() != 1) throw new RuntimeException(new EvalError("raise: expected 1 argument"));
             throw new SchemeException(args.getFirst());
         }));
+        builtin("error", args -> {
+            if (args.isEmpty()) throw new EvalError("error: expected at least 1 argument");
+            var sb = new StringBuilder();
+            sb.append(args.getFirst().displayStr());
+            for (int i = 1; i < args.size(); i++) {
+                sb.append(" ").append(args.get(i).display());
+            }
+            throw new EvalError(sb.toString());
+        });
         builtin("with-exception-handler", args -> {
             if (args.size() != 2) throw new EvalError("with-exception-handler: expected 2 arguments");
             SchemeValue handler = args.get(0);
@@ -1032,6 +1056,10 @@ public class Interpreter {
                                 if (elements.size() != 2) throw new EvalError(posPrefix(listVal) + "quote: expected 1 argument");
                                 return elements.get(1);
                             }
+                            case "quasiquote" -> {
+                                if (elements.size() != 2) throw new EvalError(posPrefix(listVal) + "quasiquote: expected 1 argument");
+                                return expandQuasiquote(elements.get(1), env);
+                            }
                             case "lambda" -> { return evalLambda(listVal, elements, env); }
                             case "case-lambda" -> {
                                 var clauses = new ArrayList<SchemeValue.LambdaVal>();
@@ -1039,31 +1067,9 @@ public class Interpreter {
                                     if (!(elements.get(ci) instanceof SchemeValue.ListVal clauseList) || clauseList.elements().size() < 2)
                                         throw new EvalError(posPrefix(listVal) + "case-lambda: bad clause");
                                     var clauseElems = clauseList.elements();
-                                    // Parse formals (same as lambda)
-                                    SchemeValue paramList = clauseElems.getFirst();
-                                    List<String> params = new ArrayList<>();
-                                    String restParam = null;
-                                    if (paramList instanceof SchemeValue.SymbolVal restSym) {
-                                        restParam = restSym.name();
-                                    } else if (paramList instanceof SchemeValue.ListVal pList) {
-                                        for (int pi = 0; pi < pList.elements().size(); pi++) {
-                                            var p = pList.elements().get(pi);
-                                            if (p instanceof SchemeValue.SymbolVal s && s.name().equals(".")) {
-                                                if (pi + 1 >= pList.elements().size()) throw new EvalError(posPrefix(listVal) + "case-lambda: bad syntax");
-                                                if (!(pList.elements().get(pi + 1) instanceof SchemeValue.SymbolVal rp))
-                                                    throw new EvalError(posPrefix(listVal) + "case-lambda: expected symbol after dot");
-                                                restParam = rp.name();
-                                                break;
-                                            }
-                                            if (!(p instanceof SchemeValue.SymbolVal ps))
-                                                throw new EvalError(posPrefix(listVal) + "case-lambda: expected symbol as parameter");
-                                            params.add(ps.name());
-                                        }
-                                    } else {
-                                        throw new EvalError(posPrefix(listVal) + "case-lambda: expected parameter list");
-                                    }
+                                    var pi = extractParams(clauseElems.getFirst(), posPrefix(listVal) + "case-lambda: ");
                                     var body = clauseElems.subList(1, clauseElems.size());
-                                    clauses.add(new SchemeValue.LambdaVal(params, restParam, body, env));
+                                    clauses.add(new SchemeValue.LambdaVal(pi.params(), pi.restParam(), body, env));
                                 }
                                 return new SchemeValue.CaseLambdaVal(clauses);
                             }
@@ -1395,6 +1401,29 @@ public class Interpreter {
                                     SchemeValue testResult = eval(test, env);
                                     if (testResult.isTruthy()) {
                                         if (clause.elements().size() == 1) return testResult;
+                                        // Check for => syntax: (test => proc)
+                                        if (clause.elements().size() == 3 &&
+                                            clause.elements().get(1) instanceof SchemeValue.SymbolVal arrow &&
+                                            arrow.name().equals("=>")) {
+                                            SchemeValue proc = eval(clause.elements().get(2), env);
+                                            if (proc instanceof SchemeValue.CaseLambdaVal cl) {
+                                                proc = resolveCaseLambda(cl, 1, "cond =>: ");
+                                            }
+                                            if (proc instanceof SchemeValue.LambdaVal lambda) {
+                                                var localEnv = applyLambda(lambda, List.of(testResult), "cond =>: ");
+                                                for (int bi = 0; bi < lambda.body().size() - 1; bi++) {
+                                                    eval(lambda.body().get(bi), localEnv);
+                                                }
+                                                expr = lambda.body().getLast();
+                                                env = localEnv;
+                                            } else if (proc instanceof SchemeValue.BuiltinVal builtin) {
+                                                return builtin.fn().apply(List.of(testResult));
+                                            } else {
+                                                throw new EvalError("cond =>: not a procedure");
+                                            }
+                                            matched = true;
+                                            break;
+                                        }
                                         for (int j = 1; j < clause.elements().size() - 1; j++) {
                                             eval(clause.elements().get(j), env);
                                         }
@@ -1681,24 +1710,23 @@ public class Interpreter {
             if (!(nameVal instanceof SchemeValue.SymbolVal nameSym)) {
                 throw new EvalError(posPrefix(listVal) + "define: expected symbol as function name");
             }
-            var params = new ArrayList<String>();
-            String restParam = null;
-            var pElems = nameAndParams.elements();
-            for (int i = 1; i < pElems.size(); i++) {
-                if (pElems.get(i) instanceof SchemeValue.SymbolVal s && s.name().equals(".")) {
-                    if (i + 1 >= pElems.size()) throw new EvalError(posPrefix(listVal) + "define: bad syntax");
-                    if (!(pElems.get(i + 1) instanceof SchemeValue.SymbolVal rp))
-                        throw new EvalError(posPrefix(listVal) + "define: expected symbol after dot");
-                    restParam = rp.name();
-                    break;
-                }
-                if (!(pElems.get(i) instanceof SchemeValue.SymbolVal p)) {
-                    throw new EvalError(posPrefix(listVal) + "define: expected symbol as parameter");
-                }
-                params.add(p.name());
-            }
+            // Build a param list from the cdr of nameAndParams
+            SchemeValue paramList = nameAndParams.elements().size() == 1
+                ? new SchemeValue.ListVal(List.of())
+                : new SchemeValue.ListVal(nameAndParams.elements().subList(1, nameAndParams.elements().size()));
+            var pi = extractParams(paramList, posPrefix(listVal) + "define: ");
             var body = elements.subList(2, elements.size());
-            var lambda = new SchemeValue.LambdaVal(params, restParam, body, env);
+            var lambda = new SchemeValue.LambdaVal(pi.params(), pi.restParam(), body, env);
+            env.define(nameSym.name(), lambda);
+            return new SchemeValue.VoidVal();
+        } else if (target instanceof SchemeValue.PairVal targetPair) {
+            // (define (name . args) body) where target is a PairVal
+            if (!(targetPair.car() instanceof SchemeValue.SymbolVal nameSym)) {
+                throw new EvalError(posPrefix(listVal) + "define: expected symbol as function name");
+            }
+            var pi = extractParams(targetPair.cdr(), posPrefix(listVal) + "define: ");
+            var body = elements.subList(2, elements.size());
+            var lambda = new SchemeValue.LambdaVal(pi.params(), pi.restParam(), body, env);
             env.define(nameSym.name(), lambda);
             return new SchemeValue.VoidVal();
         }
@@ -1782,35 +1810,104 @@ public class Interpreter {
         return new SchemeValue.VoidVal();
     }
 
-    private SchemeValue evalLambda(SchemeValue.ListVal listVal, List<SchemeValue> elements, Environment env) throws EvalError {
-        if (elements.size() < 3) throw new EvalError(posPrefix(listVal) + "lambda: bad syntax");
-        SchemeValue paramList = elements.get(1);
-        // Single symbol = all-rest parameter: (lambda args ...)
+    // Extract params and rest param from a parameter list that may be a ListVal or PairVal (dotted pair)
+    private record ParamInfo(List<String> params, String restParam) {}
+    private ParamInfo extractParams(SchemeValue paramList, String errPrefix) throws EvalError {
+        // Single symbol = all-rest
         if (paramList instanceof SchemeValue.SymbolVal restSym) {
-            var body = elements.subList(2, elements.size());
-            return new SchemeValue.LambdaVal(List.of(), restSym.name(), body, env);
-        }
-        if (!(paramList instanceof SchemeValue.ListVal pList)) {
-            throw new EvalError(posPrefix(listVal) + "lambda: expected parameter list");
+            return new ParamInfo(List.of(), restSym.name());
         }
         var params = new ArrayList<String>();
         String restParam = null;
-        for (int i = 0; i < pList.elements().size(); i++) {
-            var p = pList.elements().get(i);
-            if (p instanceof SchemeValue.SymbolVal s && s.name().equals(".")) {
-                if (i + 1 >= pList.elements().size()) throw new EvalError(posPrefix(listVal) + "lambda: bad syntax");
-                if (!(pList.elements().get(i + 1) instanceof SchemeValue.SymbolVal rp))
-                    throw new EvalError(posPrefix(listVal) + "lambda: expected symbol after dot");
-                restParam = rp.name();
-                break;
-            }
-            if (!(p instanceof SchemeValue.SymbolVal sym)) {
-                throw new EvalError(posPrefix(listVal) + "lambda: expected symbol as parameter");
-            }
+        // Walk PairVal chain
+        SchemeValue current = paramList;
+        while (current instanceof SchemeValue.PairVal p) {
+            if (!(p.car() instanceof SchemeValue.SymbolVal sym))
+                throw new EvalError(errPrefix + "expected symbol as parameter");
             params.add(sym.name());
+            current = p.cdr();
         }
+        if (current instanceof SchemeValue.SymbolVal restSym) {
+            restParam = restSym.name();
+        } else if (current instanceof SchemeValue.ListVal l) {
+            // ListVal: check for old-style "." symbol (shouldn't happen with new parser, but handle ListVal params)
+            for (int i = 0; i < l.elements().size(); i++) {
+                var p = l.elements().get(i);
+                if (p instanceof SchemeValue.SymbolVal s && s.name().equals(".")) {
+                    if (i + 1 >= l.elements().size()) throw new EvalError(errPrefix + "bad syntax");
+                    if (!(l.elements().get(i + 1) instanceof SchemeValue.SymbolVal rp))
+                        throw new EvalError(errPrefix + "expected symbol after dot");
+                    restParam = rp.name();
+                    break;
+                }
+                if (!(p instanceof SchemeValue.SymbolVal sym))
+                    throw new EvalError(errPrefix + "expected symbol as parameter");
+                params.add(sym.name());
+            }
+        } else if (!(current instanceof SchemeValue.ListVal)) {
+            throw new EvalError(errPrefix + "expected parameter list");
+        }
+        return new ParamInfo(params, restParam);
+    }
+
+    private SchemeValue expandQuasiquote(SchemeValue template, Environment env) throws EvalError {
+        if (template instanceof SchemeValue.ListVal list) {
+            if (list.elements().isEmpty()) return template;
+            // Check for (unquote x)
+            if (list.elements().getFirst() instanceof SchemeValue.SymbolVal s && s.name().equals("unquote")) {
+                if (list.elements().size() != 2) throw new EvalError("unquote: expected 1 argument");
+                return eval(list.elements().get(1), env);
+            }
+            var result = new ArrayList<SchemeValue>();
+            for (var elem : list.elements()) {
+                if (elem instanceof SchemeValue.ListVal el &&
+                    !el.elements().isEmpty() &&
+                    el.elements().getFirst() instanceof SchemeValue.SymbolVal us &&
+                    us.name().equals("unquote-splicing")) {
+                    if (el.elements().size() != 2) throw new EvalError("unquote-splicing: expected 1 argument");
+                    SchemeValue spliced = eval(el.elements().get(1), env);
+                    // Splice the list into result
+                    for (var item : toJavaList(spliced)) {
+                        result.add(item);
+                    }
+                } else {
+                    result.add(expandQuasiquote(elem, env));
+                }
+            }
+            return schemeList(result);
+        }
+        if (template instanceof SchemeValue.PairVal pair) {
+            // Check for (unquote x) as pair
+            if (pair.car() instanceof SchemeValue.SymbolVal s && s.name().equals("unquote")) {
+                SchemeValue rest = pair.cdr();
+                if (rest instanceof SchemeValue.PairVal rp && (rp.cdr() instanceof SchemeValue.ListVal rl && rl.elements().isEmpty())) {
+                    return eval(rp.car(), env);
+                }
+                if (rest instanceof SchemeValue.ListVal rl && rl.elements().size() == 1) {
+                    return eval(rl.elements().getFirst(), env);
+                }
+            }
+            SchemeValue car = expandQuasiquote(pair.car(), env);
+            SchemeValue cdr = expandQuasiquote(pair.cdr(), env);
+            return new SchemeValue.PairVal(car, cdr);
+        }
+        if (template instanceof SchemeValue.VectorVal vec) {
+            var result = new SchemeValue[vec.elements().length];
+            for (int i = 0; i < vec.elements().length; i++) {
+                result[i] = expandQuasiquote(vec.elements()[i], env);
+            }
+            return new SchemeValue.VectorVal(result);
+        }
+        // Atoms: symbols, numbers, etc. — return as-is (like quote)
+        return template;
+    }
+
+    private SchemeValue evalLambda(SchemeValue.ListVal listVal, List<SchemeValue> elements, Environment env) throws EvalError {
+        if (elements.size() < 3) throw new EvalError(posPrefix(listVal) + "lambda: bad syntax");
+        SchemeValue paramList = elements.get(1);
+        var pi = extractParams(paramList, posPrefix(listVal) + "lambda: ");
         var body = elements.subList(2, elements.size());
-        return new SchemeValue.LambdaVal(params, restParam, body, env);
+        return new SchemeValue.LambdaVal(pi.params(), pi.restParam(), body, env);
     }
 
 
