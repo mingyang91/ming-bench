@@ -158,6 +158,9 @@ thread_local! {
     static SYNTAX_BINDINGS: RefCell<Vec<HashMap<String, MacroBinding>>> = RefCell::new(Vec::new());
     static SYNTAX_DEF_ENV: RefCell<Option<Env>> = RefCell::new(None);
     static SYNTAX_CALL_ENV: RefCell<Option<Env>> = RefCell::new(None);
+    // Guard TCO: depth counter and reentry info
+    static GUARD_BODY_DEPTH: Cell<usize> = Cell::new(0);
+    static GUARD_REENTRY: RefCell<Option<(Vec<Expr>, Env, Span)>> = RefCell::new(None);
 }
 
 fn gensym(base: &str) -> String {
@@ -889,6 +892,14 @@ fn eval(expr: &Expr, env: &Env, out: &Output) -> Result<Value, EvalError> {
                             return eval_dynamic_wind(in_thunk, body_thunk, out_thunk, span, out);
                         }
                         "guard" => {
+                            let depth = GUARD_BODY_DEPTH.with(|d| d.get());
+                            if depth > 0 {
+                                // Inside a guard body tail expression — signal reentry
+                                GUARD_REENTRY.with(|r| {
+                                    *r.borrow_mut() = Some((items[1..].to_vec(), cur_env.clone(), span));
+                                });
+                                return Ok(Value::Boolean(false)); // dummy, eval_guard checks GUARD_REENTRY
+                            }
                             return eval_guard(&items[1..], &cur_env, span, out);
                         }
                         "raise" if env_get(&cur_env, "raise").map_or(true, |v| matches!(v, Value::Builtin(ref n) if n == "raise")) => {
@@ -1046,10 +1057,12 @@ fn eval(expr: &Expr, env: &Env, out: &Output) -> Result<Value, EvalError> {
                         return eval_builtin(name, &args, span);
                     }
                     Value::Continuation { id, top_level_idx, callcc_span } => {
-                        if args.len() != 1 {
-                            return Err(EvalError::Arity(span.fmt("continuation requires 1 argument")));
-                        }
-                        CONT_RETURN_VALUE.with(|v| *v.borrow_mut() = Some(args[0].clone()));
+                        let cont_val = if args.len() == 1 {
+                            args[0].clone()
+                        } else {
+                            Value::Values(args)
+                        };
+                        CONT_RETURN_VALUE.with(|v| *v.borrow_mut() = Some(cont_val));
                         CONT_CALLCC_SPAN.with(|v| *v.borrow_mut() = Some(callcc_span));
                         return Err(EvalError::ContinuationInvoked(id, top_level_idx));
                     }
@@ -1399,81 +1412,101 @@ fn eval_with_exception_handler(handler: Value, thunk: Value, span: Span, out: &O
     }
 }
 
-fn eval_guard(args: &[Expr], env: &Env, span: Span, out: &Output) -> Result<Value, EvalError> {
-    // (guard (var clause1 clause2 ...) body ...)
-    if args.is_empty() {
-        return Err(EvalError::Arity(span.fmt("guard requires clauses and body")));
-    }
-    let clauses_expr = &args[0];
-    let body = &args[1..];
+fn eval_guard(initial_args: &[Expr], initial_env: &Env, initial_span: Span, out: &Output) -> Result<Value, EvalError> {
+    let mut cur_args = initial_args.to_vec();
+    let mut cur_env = initial_env.clone();
+    let mut cur_span = initial_span;
 
-    let clause_items = match &clauses_expr.kind {
-        ExprKind::List(items) if items.len() >= 2 => items,
-        _ => return Err(EvalError::Type(span.fmt("guard: expected (var clause ...)"))),
-    };
+    loop {
+        // (guard (var clause1 clause2 ...) body ...)
+        if cur_args.is_empty() {
+            return Err(EvalError::Arity(cur_span.fmt("guard requires clauses and body")));
+        }
+        let clauses_expr = &cur_args[0];
+        let body = &cur_args[1..];
 
-    let var_name = match &clause_items[0].kind {
-        ExprKind::Symbol(s) => s.clone(),
-        _ => return Err(EvalError::Type(span.fmt("guard: expected symbol as variable"))),
-    };
+        let clause_items = match &clauses_expr.kind {
+            ExprKind::List(items) if items.len() >= 2 => items,
+            _ => return Err(EvalError::Type(cur_span.fmt("guard: expected (var clause ...)"))),
+        };
 
-    let clauses = &clause_items[1..];
+        let var_name = match &clause_items[0].kind {
+            ExprKind::Symbol(s) => s.clone(),
+            _ => return Err(EvalError::Type(cur_span.fmt("guard: expected symbol as variable"))),
+        };
 
-    // Evaluate body, catching Raise
-    let mut body_result = Ok(Value::Boolean(false));
-    for expr in body {
-        body_result = eval(expr, env, out);
-        if body_result.is_err() {
-            break;
+        let clauses = &clause_items[1..];
+
+        // Evaluate non-last body expressions normally
+        for expr in &body[..body.len().saturating_sub(1)] {
+            match eval(expr, &cur_env, out) {
+                Ok(_) => {}
+                Err(EvalError::Raise) => {
+                    return eval_guard_clauses(clauses, &var_name, &cur_env, cur_span, out);
+                }
+                Err(e) => return Err(e),
+            }
+        }
+
+        // Evaluate last body expression with guard TCO enabled
+        GUARD_BODY_DEPTH.with(|d| d.set(d.get() + 1));
+        let body_result = eval(body.last().unwrap(), &cur_env, out);
+        GUARD_BODY_DEPTH.with(|d| d.set(d.get() - 1));
+
+        // Check if the body resolved to another guard form (TCO)
+        if let Some((new_args, new_env, new_span)) = GUARD_REENTRY.with(|r| r.borrow_mut().take()) {
+            cur_args = new_args;
+            cur_env = new_env;
+            cur_span = new_span;
+            continue;
+        }
+
+        match body_result {
+            Ok(val) => return Ok(val),
+            Err(EvalError::Raise) => {
+                return eval_guard_clauses(clauses, &var_name, &cur_env, cur_span, out);
+            }
+            Err(e) => return Err(e),
         }
     }
+}
 
-    match body_result {
-        Ok(val) => Ok(val),
-        Err(EvalError::Raise) => {
-            let raised = RAISED_VALUE.with(|v| v.borrow_mut().take())
-                .unwrap_or(Value::Boolean(false));
-            // Bind the raised value to var_name and test clauses
-            let guard_env = new_env(Some(env.clone()));
-            env_set(&guard_env, var_name, raised.clone());
+fn eval_guard_clauses(clauses: &[Expr], var_name: &str, env: &Env, span: Span, out: &Output) -> Result<Value, EvalError> {
+    let raised = RAISED_VALUE.with(|v| v.borrow_mut().take())
+        .unwrap_or(Value::Boolean(false));
+    let guard_env = new_env(Some(env.clone()));
+    env_set(&guard_env, var_name.to_string(), raised.clone());
 
-            for clause in clauses {
-                match &clause.kind {
-                    ExprKind::List(parts) if !parts.is_empty() => {
-                        // Check for else clause
-                        if let ExprKind::Symbol(s) = &parts[0].kind {
-                            if s == "else" {
-                                // Evaluate else body
-                                let mut result = Value::Boolean(false);
-                                for expr in &parts[1..] {
-                                    result = eval(expr, &guard_env, out)?;
-                                }
-                                return Ok(result);
-                            }
+    for clause in clauses {
+        match &clause.kind {
+            ExprKind::List(parts) if !parts.is_empty() => {
+                if let ExprKind::Symbol(s) = &parts[0].kind {
+                    if s == "else" {
+                        let mut result = Value::Boolean(false);
+                        for expr in &parts[1..] {
+                            result = eval(expr, &guard_env, out)?;
                         }
-                        // Test the clause condition
-                        let test_val = eval(&parts[0], &guard_env, out)?;
-                        if test_val.is_truthy() {
-                            if parts.len() > 1 {
-                                let mut result = Value::Boolean(false);
-                                for expr in &parts[1..] {
-                                    result = eval(expr, &guard_env, out)?;
-                                }
-                                return Ok(result);
-                            } else {
-                                return Ok(test_val);
-                            }
-                        }
+                        return Ok(result);
                     }
-                    _ => {}
+                }
+                let test_val = eval(&parts[0], &guard_env, out)?;
+                if test_val.is_truthy() {
+                    if parts.len() > 1 {
+                        let mut result = Value::Boolean(false);
+                        for expr in &parts[1..] {
+                            result = eval(expr, &guard_env, out)?;
+                        }
+                        return Ok(result);
+                    } else {
+                        return Ok(test_val);
+                    }
                 }
             }
-            // No clause matched — re-raise
-            RAISED_VALUE.with(|v| *v.borrow_mut() = Some(raised));
-            Err(EvalError::Raise)
+            _ => {}
         }
-        Err(e) => Err(e),
     }
+    RAISED_VALUE.with(|v| *v.borrow_mut() = Some(raised));
+    Err(EvalError::Raise)
 }
 
 fn eval_set(args: &[Expr], env: &Env, span: Span, out: &Output) -> Result<Value, EvalError> {
