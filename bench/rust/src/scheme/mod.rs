@@ -12,9 +12,11 @@ use builtins::{
 };
 use forms::{apply_lambda, eval_and, eval_define, eval_lambda, eval_or, eval_string_set};
 use parser::{parse_all, Span};
+use std::cell::RefCell;
 use std::collections::HashMap;
+use std::rc::Rc;
 
-type Env = HashMap<String, Value>;
+type Env = HashMap<String, Rc<RefCell<Value>>>;
 
 /// A Scheme value.
 #[derive(Debug, Clone)]
@@ -143,11 +145,14 @@ pub(crate) fn eval(expr: &Value, env: &mut Env, output: &mut String) -> Result<V
             | Value::Void | Value::Lambda { .. }) => return Ok(val),
 
             Value::Symbol(ref name, span) => {
-                return active_env.get(name).cloned().ok_or_else(|| EvalError::UnboundVariable {
-                    name: name.clone(),
-                    line: span.0,
-                    col: span.1,
-                });
+                return active_env
+                    .get(name)
+                    .map(|cell| cell.borrow().clone())
+                    .ok_or_else(|| EvalError::UnboundVariable {
+                        name: name.clone(),
+                        line: span.0,
+                        col: span.1,
+                    });
             }
 
             Value::List(items, span) => {
@@ -198,6 +203,38 @@ pub(crate) fn eval(expr: &Value, env: &mut Env, output: &mut String) -> Result<V
                             return Ok(Value::Boolean(false));
                         }
                         "define" => return eval_define(&items, active_env, (line, col), output),
+                        "set!" => {
+                            if items.len() != 3 {
+                                return Err(EvalError::Parse {
+                                    message: "set! requires 2 arguments".to_string(),
+                                    line,
+                                    col,
+                                });
+                            }
+                            let name = match &items[1] {
+                                Value::Symbol(s, _) => s.clone(),
+                                other => {
+                                    return Err(EvalError::TypeError {
+                                        message: format!(
+                                            "set!: expected symbol, got {}",
+                                            other.type_name()
+                                        ),
+                                        line,
+                                        col,
+                                    })
+                                }
+                            };
+                            let val = eval(&items[2], active_env, output)?;
+                            let cell = active_env.get(&name).ok_or_else(|| {
+                                EvalError::UnboundVariable {
+                                    name: name.clone(),
+                                    line,
+                                    col,
+                                }
+                            })?;
+                            *cell.borrow_mut() = val;
+                            return Ok(Value::Void);
+                        }
                         "lambda" => return eval_lambda(&items, active_env, (line, col)),
                         "begin" => {
                             if items.len() <= 1 {

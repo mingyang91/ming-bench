@@ -1,6 +1,12 @@
 use crate::scheme::error::EvalError;
 use crate::scheme::parser::Span;
 use crate::scheme::{eval, Env, Tail, Value};
+use std::cell::RefCell;
+use std::rc::Rc;
+
+fn wrap(val: Value) -> Rc<RefCell<Value>> {
+    Rc::new(RefCell::new(val))
+}
 
 pub(crate) fn eval_let(
     args: &[Value],
@@ -76,9 +82,9 @@ pub(crate) fn eval_let(
             closure_env: env.clone(),
         };
         let mut local_env = env.clone();
-        local_env.insert(name.clone(), lambda);
-        for (param, val) in params.iter().zip(init_vals.iter()) {
-            local_env.insert(param.clone(), val.clone());
+        local_env.insert(name.clone(), wrap(lambda));
+        for (param, val) in params.iter().zip(init_vals.into_iter()) {
+            local_env.insert(param.clone(), wrap(val));
         }
         if body.is_empty() {
             return Ok(Tail::Done(Value::Boolean(false)));
@@ -127,7 +133,7 @@ pub(crate) fn eval_let(
                         }
                     };
                     let val = eval(&pair[1], env, output)?;
-                    local_env.insert(name, val);
+                    local_env.insert(name, wrap(val));
                 }
                 other => {
                     return Err(EvalError::Parse {
@@ -175,7 +181,7 @@ pub(crate) fn eval_define(
             {
                 *n = Some(name.clone());
             }
-            env.insert(name.clone(), val);
+            env.insert(name.clone(), wrap(val));
             Ok(Value::Boolean(false))
         }
         Value::List(sig, _) => {
@@ -220,7 +226,7 @@ pub(crate) fn eval_define(
                 body,
                 closure_env: env.clone(),
             };
-            env.insert(name, closure);
+            env.insert(name, wrap(closure));
             Ok(Value::Boolean(false))
         }
         other => Err(EvalError::TypeError {
@@ -274,12 +280,13 @@ pub(crate) fn eval_string_set(
             })
         }
     };
-    let s = env.get_mut(&var_name).ok_or_else(|| EvalError::UnboundVariable {
+    let cell = env.get(&var_name).ok_or_else(|| EvalError::UnboundVariable {
         name: var_name.clone(),
         line,
         col,
     })?;
-    match s {
+    let mut val = cell.borrow_mut();
+    match &mut *val {
         Value::Str(ref mut string) => {
             let idx = idx as usize;
             if idx >= string.len() {
@@ -441,8 +448,9 @@ fn is_define_form(expr: &Value) -> bool {
 
 fn patch_closures(env: &mut Env) {
     let snapshot = env.clone();
-    for val in env.values_mut() {
-        if let Value::Lambda { closure_env, .. } = val {
+    for cell in env.values() {
+        let mut val = cell.borrow_mut();
+        if let Value::Lambda { closure_env, .. } = &mut *val {
             for (k, v) in &snapshot {
                 closure_env.entry(k.clone()).or_insert_with(|| v.clone());
             }
@@ -479,10 +487,10 @@ pub(crate) fn apply_lambda(
                 new_env.entry(k.clone()).or_insert_with(|| v.clone());
             }
             if let Some(fn_name) = name {
-                new_env.insert(fn_name.clone(), func.clone());
+                new_env.insert(fn_name.clone(), wrap(func.clone()));
             }
             for (param, arg) in params.iter().zip(args) {
-                new_env.insert(param.clone(), arg);
+                new_env.insert(param.clone(), wrap(arg));
             }
 
             // Scan for internal defines
