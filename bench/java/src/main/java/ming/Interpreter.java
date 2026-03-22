@@ -259,8 +259,8 @@ public class Interpreter {
             }
             allArgs.addAll(lastList);
             if (proc instanceof SchemeValue.ContinuationVal cont) {
-                if (allArgs.size() != 1) throw new EvalError("continuation: expected 1 argument");
-                throw new ContinuationException(cont.id(), allArgs.getFirst());
+                SchemeValue val = allArgs.size() == 1 ? allArgs.getFirst() : new SchemeValue.ValuesVal(new ArrayList<>(allArgs));
+                throw new ContinuationException(cont.id(), val);
             }
             if (proc instanceof SchemeValue.LambdaVal lambda) {
                 var localEnv = applyLambda(lambda, allArgs, "");
@@ -934,8 +934,11 @@ public class Interpreter {
         return eval(expr, globalEnv);
     }
 
+    private record GuardContext(String varName, List<SchemeValue> clauses, Environment env) {}
+
     public SchemeValue eval(SchemeValue expr, Environment env) throws EvalError {
-        while (true) {
+        java.util.ArrayDeque<GuardContext> guardStack = new java.util.ArrayDeque<>();
+        while (true) { try {
             switch (expr) {
                 case SchemeValue.IntVal v -> { return v; }
                 case SchemeValue.DoubleVal v -> { return v; }
@@ -1264,51 +1267,53 @@ public class Interpreter {
                                 String varName = varSym.name();
                                 var clauses = clauseList.elements().subList(1, clauseList.elements().size());
                                 var bodyExprs = elements.subList(2, elements.size());
-                                SchemeValue bodyResult = null;
+                                // Evaluate non-last body exprs in try/catch (not in tail position)
                                 boolean raised = false;
                                 SchemeValue raisedValue = null;
                                 try {
                                     for (int i = 0; i < bodyExprs.size() - 1; i++) {
                                         eval(bodyExprs.get(i), env);
                                     }
-                                    bodyResult = eval(bodyExprs.getLast(), env);
                                 } catch (SchemeException e) {
                                     raised = true;
                                     raisedValue = e.value;
                                 }
-                                if (!raised) return bodyResult;
-                                // Match clauses
-                                var guardEnv = new Environment(env);
-                                guardEnv.define(varName, raisedValue);
-                                boolean clauseMatched = false;
-                                for (var clause : clauses) {
-                                    if (!(clause instanceof SchemeValue.ListVal cl) || cl.elements().isEmpty())
-                                        throw new EvalError("guard: bad clause");
-                                    SchemeValue test = cl.elements().getFirst();
-                                    if (test instanceof SchemeValue.SymbolVal s && s.name().equals("else")) {
-                                        for (int j = 1; j < cl.elements().size() - 1; j++) {
-                                            eval(cl.elements().get(j), guardEnv);
+                                if (raised) {
+                                    // Match clauses for non-tail exception
+                                    var guardEnv = new Environment(env);
+                                    guardEnv.define(varName, raisedValue);
+                                    boolean clauseMatched = false;
+                                    for (var clause : clauses) {
+                                        if (!(clause instanceof SchemeValue.ListVal cl) || cl.elements().isEmpty())
+                                            throw new EvalError("guard: bad clause");
+                                        SchemeValue test = cl.elements().getFirst();
+                                        if (test instanceof SchemeValue.SymbolVal s && s.name().equals("else")) {
+                                            for (int j = 1; j < cl.elements().size() - 1; j++) {
+                                                eval(cl.elements().get(j), guardEnv);
+                                            }
+                                            expr = cl.elements().getLast();
+                                            env = guardEnv;
+                                            clauseMatched = true;
+                                            break;
                                         }
-                                        expr = cl.elements().getLast();
-                                        env = guardEnv;
-                                        clauseMatched = true;
-                                        break;
-                                    }
-                                    SchemeValue testResult = eval(test, guardEnv);
-                                    if (testResult.isTruthy()) {
-                                        if (cl.elements().size() == 1) return testResult;
-                                        for (int j = 1; j < cl.elements().size() - 1; j++) {
-                                            eval(cl.elements().get(j), guardEnv);
+                                        SchemeValue testResult = eval(test, guardEnv);
+                                        if (testResult.isTruthy()) {
+                                            if (cl.elements().size() == 1) return testResult;
+                                            for (int j = 1; j < cl.elements().size() - 1; j++) {
+                                                eval(cl.elements().get(j), guardEnv);
+                                            }
+                                            expr = cl.elements().getLast();
+                                            env = guardEnv;
+                                            clauseMatched = true;
+                                            break;
                                         }
-                                        expr = cl.elements().getLast();
-                                        env = guardEnv;
-                                        clauseMatched = true;
-                                        break;
                                     }
+                                    if (!clauseMatched) throw new SchemeException(raisedValue);
+                                    continue;
                                 }
-                                if (!clauseMatched) {
-                                    throw new SchemeException(raisedValue);
-                                }
+                                // Last body expr: TCO with guard context on stack
+                                guardStack.push(new GuardContext(varName, clauses, env));
+                                expr = bodyExprs.getLast();
                                 continue;
                             }
                             case "when" -> {
@@ -1469,8 +1474,8 @@ public class Interpreter {
                     }
                     // Handle continuation invocation
                     if (proc instanceof SchemeValue.ContinuationVal cont) {
-                        if (args.size() != 1) throw new EvalError(posPrefix(listVal) + "continuation: expected 1 argument");
-                        throw new ContinuationException(cont.id(), args.getFirst());
+                        SchemeValue val = args.size() == 1 ? args.getFirst() : new SchemeValue.ValuesVal(new ArrayList<>(args));
+                        throw new ContinuationException(cont.id(), val);
                     }
                     // Handle call/cc used as first-class value
                     if (proc instanceof SchemeValue.BuiltinVal bv &&
@@ -1505,7 +1510,42 @@ public class Interpreter {
                     throw new EvalError(posPrefix(listVal) + "not a procedure: " + proc.display());
                 }
             }
-        }
+        } catch (SchemeException e) {
+            if (!guardStack.isEmpty()) {
+                var ctx = guardStack.pop();
+                var guardEnv = new Environment(ctx.env());
+                guardEnv.define(ctx.varName(), e.value);
+                boolean clauseMatched = false;
+                for (var clause : ctx.clauses()) {
+                    if (!(clause instanceof SchemeValue.ListVal cl) || cl.elements().isEmpty())
+                        throw new EvalError("guard: bad clause");
+                    SchemeValue test = cl.elements().getFirst();
+                    if (test instanceof SchemeValue.SymbolVal s && s.name().equals("else")) {
+                        for (int j = 1; j < cl.elements().size() - 1; j++) {
+                            eval(cl.elements().get(j), guardEnv);
+                        }
+                        expr = cl.elements().getLast();
+                        env = guardEnv;
+                        clauseMatched = true;
+                        break;
+                    }
+                    SchemeValue testResult = eval(test, guardEnv);
+                    if (testResult.isTruthy()) {
+                        if (cl.elements().size() == 1) { expr = test; env = guardEnv; clauseMatched = true; break; }
+                        for (int j = 1; j < cl.elements().size() - 1; j++) {
+                            eval(cl.elements().get(j), guardEnv);
+                        }
+                        expr = cl.elements().getLast();
+                        env = guardEnv;
+                        clauseMatched = true;
+                        break;
+                    }
+                }
+                if (!clauseMatched) throw e;
+                continue;
+            }
+            throw e;
+        } }
     }
 
 

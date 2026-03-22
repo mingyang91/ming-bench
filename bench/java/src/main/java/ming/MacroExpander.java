@@ -9,7 +9,8 @@ public class MacroExpander {
         "if", "let", "let*", "letrec", "begin", "set!", "define", "lambda",
         "quote", "cond", "and", "or", "call/cc", "call-with-current-continuation",
         "define-syntax", "syntax-rules", "quasiquote", "unquote", "unquote-splicing",
-        "syntax-case", "syntax-quote", "with-syntax"
+        "syntax-case", "syntax-quote", "with-syntax",
+        "guard", "do", "when", "unless", "case", "define-record-type", "define-values"
     );
 
     public static SchemeValue expand(SchemeValue.SyntaxRulesVal macro, SchemeValue.ListVal form) throws EvalError {
