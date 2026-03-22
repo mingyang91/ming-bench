@@ -20,7 +20,7 @@ node_modules/
 .gradle/
 bench/java/.gradle/
 bench/java/build/
-bench/java/gradle/wrapper/gradle-wrapper.jar
+
 
 ## logs
 logs/
