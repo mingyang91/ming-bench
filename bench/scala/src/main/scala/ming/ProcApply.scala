@@ -18,8 +18,9 @@ private[ming] object ProcApply:
     case np: SchemeNativeProc =>
       ReturnS(np.fn(args), k, out)
     case SchemeContinuation(savedK) =>
-      if args.length != 1 then throw new EvalError("continuation: expected 1 argument")
-      windTransition(k, savedK, args.head, out)
+      if args.isEmpty then throw new EvalError("continuation: expected at least 1 argument")
+      val value = if args.length == 1 then args.head else SchemeMultipleValues(args)
+      windTransition(k, savedK, value, out)
     case SchemeBuiltinProc("call/cc") | SchemeBuiltinProc("call-with-current-continuation") =>
       if args.length != 1 then throw new EvalError("call/cc: expected 1 argument")
       val kontVal = SchemeContinuation(k)
