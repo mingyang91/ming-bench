@@ -254,7 +254,8 @@ type Value =
   | { tag: 'macro'; literals: string[]; rules: { pattern: Expr; template: Expr }[]; defEnv: Env }
   | { tag: 'record'; typeId: symbol; typeName: string; fields: Map<string, Value> }
   | { tag: 'syntax'; expr: Expr }
-  | { tag: 'transformer'; proc: Value; defEnv: Env };
+  | { tag: 'transformer'; proc: Value; defEnv: Env }
+  | { tag: 'case-lambda'; clauses: { params: string[]; rest: string | null; body: Expr[] }[]; env: Env };
 
 function isTruthy(v: Value): boolean {
   return !(v.tag === 'boolean' && v.value === false);
@@ -321,6 +322,7 @@ function displayValue(v: Value): string {
     case 'pair': return displayPair(v);
     case 'builtin': return `#<procedure:${v.name}>`;
     case 'lambda': return '#<procedure>';
+    case 'case-lambda': return '#<procedure>';
     case 'continuation': return '#<continuation>';
     case 'macro': return '#<macro>';
     case 'vector': return `#(${v.items.map(displayValue).join(' ')})`;
@@ -629,6 +631,11 @@ function makeGlobalEnv(output: string[] = []): Env {
     if (args.length !== 1) throw new EvalError('symbol?: expected 1 argument');
     return { tag: 'boolean', value: args[0].tag === 'symbol' };
   }});
+  env.define('procedure?', { tag: 'builtin', name: 'procedure?', fn(args) {
+    if (args.length !== 1) throw new EvalError('procedure?: expected 1 argument');
+    const t = args[0].tag;
+    return { tag: 'boolean', value: t === 'builtin' || t === 'lambda' || t === 'case-lambda' || t === 'continuation' };
+  }});
   env.define('char?', { tag: 'builtin', name: 'char?', fn(args) {
     if (args.length !== 1) throw new EvalError('char?: expected 1 argument');
     return { tag: 'boolean', value: args[0].tag === 'char' };
@@ -918,7 +925,7 @@ function makeGlobalEnv(output: string[] = []): Env {
       const callArgs = lists.map(l => l[i]);
       if (proc.tag === 'builtin') {
         results.push(proc.fn(callArgs));
-      } else if (proc.tag === 'lambda') {
+      } else if (proc.tag === 'lambda' || proc.tag === 'case-lambda') {
         results.push(applyFn(proc, callArgs, { line: 0, col: 0 }));
       } else {
         throw new EvalError('map: first argument must be a procedure');
@@ -1009,6 +1016,26 @@ function makeGlobalEnv(output: string[] = []): Env {
       }
       let result: Value = { tag: 'nil' };
       for (const bodyExpr of proc.body) {
+        result = evaluate(bodyExpr, callEnv);
+      }
+      return result;
+    }
+    if (proc.tag === 'case-lambda') {
+      const clause = matchCaseLambda(proc.clauses, collected.length);
+      if (!clause) throw new EvalError(`case-lambda: no matching clause for ${collected.length} arguments`);
+      const callEnv = new Env(proc.env);
+      for (let i = 0; i < clause.params.length; i++) {
+        callEnv.define(clause.params[i], collected[i]);
+      }
+      if (clause.rest !== null) {
+        let restList: Value = { tag: 'nil' };
+        for (let i = collected.length - 1; i >= clause.params.length; i--) {
+          restList = { tag: 'pair', car: collected[i], cdr: restList };
+        }
+        callEnv.define(clause.rest, restList);
+      }
+      let result: Value = { tag: 'nil' };
+      for (const bodyExpr of clause.body) {
         result = evaluate(bodyExpr, callEnv);
       }
       return result;
@@ -1199,6 +1226,19 @@ function parseParams(exprs: Expr[]): { params: string[]; rest: string | null } {
   };
 }
 
+// ── case-lambda dispatch helper ──────────────────────────────────────
+
+function matchCaseLambda(clauses: { params: string[]; rest: string | null; body: Expr[] }[], argc: number): { params: string[]; rest: string | null; body: Expr[] } | null {
+  for (const clause of clauses) {
+    if (clause.rest !== null) {
+      if (argc >= clause.params.length) return clause;
+    } else {
+      if (argc === clause.params.length) return clause;
+    }
+  }
+  return null;
+}
+
 // ── Apply helper (no TCO, used by call/cc) ──────────────────────────
 
 function applyFn(fn: Value, args: Value[], pos: Pos): Value {
@@ -1239,6 +1279,26 @@ function applyFn(fn: Value, args: Value[], pos: Pos): Value {
       throw new ContinuationJump(fn.id, args[0], fn.exprPos, fn.topIdx);
     }
     throw new ContinuationJumpMulti(fn.id, args, fn.exprPos, fn.topIdx);
+  }
+  if (fn.tag === 'case-lambda') {
+    const clause = matchCaseLambda(fn.clauses, args.length);
+    if (!clause) throw new EvalError(`${fmtPos(pos)}: case-lambda: no matching clause for ${args.length} arguments`);
+    const callEnv = new Env(fn.env);
+    for (let i = 0; i < clause.params.length; i++) {
+      callEnv.define(clause.params[i], args[i]);
+    }
+    if (clause.rest !== null) {
+      let restList: Value = { tag: 'nil' };
+      for (let i = args.length - 1; i >= clause.params.length; i--) {
+        restList = { tag: 'pair', car: args[i], cdr: restList };
+      }
+      callEnv.define(clause.rest, restList);
+    }
+    let result: Value = { tag: 'nil' };
+    for (const bodyExpr of clause.body) {
+      result = evaluate(bodyExpr, callEnv);
+    }
+    return result;
   }
   throw new EvalError(`${fmtPos(pos)}: not a procedure`);
 }
@@ -1570,6 +1630,24 @@ function evaluate(expr: Expr, env: Env): Value {
             const { params, rest } = parseParams(paramsExpr.items);
             const body = items.slice(2);
             return { tag: 'lambda', params, rest, body, env };
+          }
+
+          case 'case-lambda': {
+            const clauses: { params: string[]; rest: string | null; body: Expr[] }[] = [];
+            for (let i = 1; i < items.length; i++) {
+              const clause = items[i];
+              if (clause.tag !== 'list' || clause.items.length < 2) throw new EvalError(`${fmtPos(expr.pos)}: case-lambda: bad clause`);
+              const paramsExpr = clause.items[0];
+              if (paramsExpr.tag === 'list') {
+                const { params, rest } = parseParams(paramsExpr.items);
+                clauses.push({ params, rest, body: clause.items.slice(1) });
+              } else if (paramsExpr.tag === 'symbol') {
+                clauses.push({ params: [], rest: paramsExpr.name, body: clause.items.slice(1) });
+              } else {
+                throw new EvalError(`${fmtPos(expr.pos)}: case-lambda: expected parameter list`);
+              }
+            }
+            return { tag: 'case-lambda', clauses, env };
           }
 
           case 'and': {
@@ -2134,6 +2212,25 @@ function evaluate(expr: Expr, env: Env): Value {
           evaluate(fn.body[i], callEnv);
         }
         expr = fn.body[fn.body.length - 1]; env = callEnv; continue; // TCO
+      }
+      if (fn.tag === 'case-lambda') {
+        const clause = matchCaseLambda(fn.clauses, args.length);
+        if (!clause) throw new EvalError(`${fmtPos(expr.pos)}: case-lambda: no matching clause for ${args.length} arguments`);
+        const callEnv = new Env(fn.env);
+        for (let i = 0; i < clause.params.length; i++) {
+          callEnv.define(clause.params[i], args[i]);
+        }
+        if (clause.rest !== null) {
+          let restList: Value = { tag: 'nil' };
+          for (let i = args.length - 1; i >= clause.params.length; i--) {
+            restList = { tag: 'pair', car: args[i], cdr: restList };
+          }
+          callEnv.define(clause.rest, restList);
+        }
+        for (let i = 0; i < clause.body.length - 1; i++) {
+          evaluate(clause.body[i], callEnv);
+        }
+        expr = clause.body[clause.body.length - 1]; env = callEnv; continue; // TCO
       }
       throw new EvalError(`${fmtPos(expr.pos)}: not a procedure`);
     }
