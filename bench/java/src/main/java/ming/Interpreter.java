@@ -707,6 +707,22 @@ public class Interpreter {
             p.cdr = args.get(1);
             return new SchemeValue.VoidVal();
         });
+        builtin("dynamic-wind", args -> {
+            if (args.size() != 3) throw new EvalError("dynamic-wind: expected 3 arguments");
+            SchemeValue inThunk = args.get(0);
+            SchemeValue bodyThunk = args.get(1);
+            SchemeValue outThunk = args.get(2);
+            callThunk(inThunk, "dynamic-wind");
+            SchemeValue result;
+            try {
+                result = callThunk(bodyThunk, "dynamic-wind");
+            } catch (ContinuationException e) {
+                callThunk(outThunk, "dynamic-wind");
+                throw e;
+            }
+            callThunk(outThunk, "dynamic-wind");
+            return result;
+        });
     }
 
     @FunctionalInterface
@@ -1414,6 +1430,25 @@ public class Interpreter {
             }
             throw e;
         }
+    }
+
+    private SchemeValue callThunk(SchemeValue thunk, String context) throws EvalError {
+        if (thunk instanceof SchemeValue.LambdaVal lambda) {
+            var localEnv = applyLambda(lambda, List.of(), context + ": ");
+            SchemeValue result = null;
+            for (var bodyExpr : lambda.body()) {
+                result = eval(bodyExpr, localEnv);
+            }
+            return result != null ? result : new SchemeValue.VoidVal();
+        } else if (thunk instanceof SchemeValue.BuiltinVal builtin) {
+            try {
+                return builtin.fn().apply(List.of());
+            } catch (RuntimeException e) {
+                if (e.getCause() instanceof EvalError ee) throw ee;
+                throw e;
+            }
+        }
+        throw new EvalError(context + ": expected procedure");
     }
 
     /**
