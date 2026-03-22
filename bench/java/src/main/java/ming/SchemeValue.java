@@ -29,6 +29,7 @@ public sealed interface SchemeValue {
     record MutableStringVal(StringBuilder chars) implements SchemeValue {
         public String value() { return chars.toString(); }
     }
+    record ContinuationVal(int id) implements SchemeValue {}
 
     /** Scheme `display` output: no quotes on strings, chars as bare characters. */
     default String displayStr() {
@@ -49,6 +50,7 @@ public sealed interface SchemeValue {
             case SymbolVal v -> v.name();
             case LambdaVal v -> "#<procedure>";
             case BuiltinVal v -> "#<procedure:" + v.name() + ">";
+            case ContinuationVal v -> "#<continuation>";
             case VoidVal v -> "";
             case CharVal v -> "#\\" + (v.value() == ' ' ? "space" : v.value() == '\n' ? "newline" : String.valueOf(v.value()));
             case ListVal v -> {

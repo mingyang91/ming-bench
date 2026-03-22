@@ -1,11 +1,38 @@
 package ming;
 
 import java.util.ArrayList;
+import java.util.HashMap;
+import java.util.IdentityHashMap;
 import java.util.List;
+import java.util.Map;
 
 public class Interpreter {
     private final Environment globalEnv = new Environment();
     private final StringBuilder outputBuffer = new StringBuilder();
+
+    // Continuation support
+    private int nextContId = 0;
+    final Map<Integer, ContData> continuationData = new HashMap<>();
+    final IdentityHashMap<SchemeValue, SchemeValue> pendingReturns = new IdentityHashMap<>();
+    int topLevelIndex = 0;
+    private List<SchemeValue> currentLetBody;
+    private int currentLetBodyIndex;
+
+    static class ContData {
+        final SchemeValue callccExpr;
+        final List<SchemeValue> letBody;
+        final int letBodyIndex;
+        final Environment letBodyEnv;
+        final int topLevelIndex;
+
+        ContData(SchemeValue callccExpr, List<SchemeValue> letBody, int letBodyIndex, Environment letBodyEnv, int topLevelIndex) {
+            this.callccExpr = callccExpr;
+            this.letBody = letBody;
+            this.letBodyIndex = letBodyIndex;
+            this.letBodyEnv = letBodyEnv;
+            this.topLevelIndex = topLevelIndex;
+        }
+    }
 
     public Interpreter() {
         registerBuiltins();
@@ -205,6 +232,10 @@ public class Interpreter {
                 allArgs.add(args.get(i));
             }
             allArgs.addAll(lastList);
+            if (proc instanceof SchemeValue.ContinuationVal cont) {
+                if (allArgs.size() != 1) throw new EvalError("continuation: expected 1 argument");
+                throw new ContinuationException(cont.id(), allArgs.getFirst());
+            }
             if (proc instanceof SchemeValue.LambdaVal lambda) {
                 var localEnv = applyLambda(lambda, allArgs, "");
                 SchemeValue result = null;
@@ -217,6 +248,9 @@ public class Interpreter {
             }
             throw new EvalError("apply: not a procedure: " + proc.display());
         });
+        // call/cc registered as builtins for first-class usage; actual logic handled specially in eval
+        globalEnv.define("call/cc", new SchemeValue.BuiltinVal("call/cc", args -> { throw new RuntimeException("call/cc: internal error"); }));
+        globalEnv.define("call-with-current-continuation", new SchemeValue.BuiltinVal("call-with-current-continuation", args -> { throw new RuntimeException("internal error"); }));
         builtin("string-set!", args -> {
             if (args.size() != 3) throw new EvalError("string-set!: expected 3 arguments");
             if (!(args.get(0) instanceof SchemeValue.MutableStringVal ms)) {
@@ -267,6 +301,7 @@ public class Interpreter {
                 case SchemeValue.VoidVal v -> { return v; }
                 case SchemeValue.CharVal v -> { return v; }
                 case SchemeValue.MutableStringVal v -> { return v; }
+                case SchemeValue.ContinuationVal v -> { return v; }
                 case SchemeValue.SymbolVal v -> {
                     try {
                         return env.get(v.name());
@@ -368,10 +403,17 @@ public class Interpreter {
                                         throw new EvalError("let: expected symbol in binding");
                                     localEnv.define(s.name(), eval(b.elements().get(1), env));
                                 }
-                                for (int i = 2; i < elements.size() - 1; i++) {
-                                    eval(elements.get(i), localEnv);
+                                var letBody = elements.subList(2, elements.size());
+                                for (int i = 0; i < letBody.size() - 1; i++) {
+                                    currentLetBody = letBody;
+                                    currentLetBodyIndex = i;
+                                    currentLetBodyEnv = localEnv;
+                                    eval(letBody.get(i), localEnv);
                                 }
-                                expr = elements.getLast();
+                                currentLetBody = letBody;
+                                currentLetBodyIndex = letBody.size() - 1;
+                                currentLetBodyEnv = localEnv;
+                                expr = letBody.getLast();
                                 env = localEnv;
                                 continue;
                             }
@@ -382,6 +424,13 @@ public class Interpreter {
                                 }
                                 expr = elements.getLast();
                                 continue;
+                            }
+                            case "call/cc", "call-with-current-continuation" -> {
+                                SchemeValue pending = pendingReturns.remove(listVal);
+                                if (pending != null) return pending;
+                                if (elements.size() != 2) throw new EvalError(posPrefix(listVal) + "call/cc: expected 1 argument");
+                                SchemeValue proc = eval(elements.get(1), env);
+                                return handleCallCC(proc, listVal);
                             }
                             case "cond" -> {
                                 boolean matched = false;
@@ -421,6 +470,17 @@ public class Interpreter {
                     var args = new ArrayList<SchemeValue>();
                     for (int i = 1; i < elements.size(); i++) {
                         args.add(eval(elements.get(i), env));
+                    }
+                    // Handle continuation invocation
+                    if (proc instanceof SchemeValue.ContinuationVal cont) {
+                        if (args.size() != 1) throw new EvalError(posPrefix(listVal) + "continuation: expected 1 argument");
+                        throw new ContinuationException(cont.id(), args.getFirst());
+                    }
+                    // Handle call/cc used as first-class value
+                    if (proc instanceof SchemeValue.BuiltinVal bv &&
+                            (bv.name().equals("call/cc") || bv.name().equals("call-with-current-continuation"))) {
+                        if (args.size() != 1) throw new EvalError(posPrefix(listVal) + "call/cc: expected 1 argument");
+                        return handleCallCC(args.getFirst(), listVal);
                     }
                     // TCO for lambda calls
                     if (proc instanceof SchemeValue.LambdaVal lambda) {
@@ -622,5 +682,70 @@ public class Interpreter {
         if (v instanceof SchemeValue.StringVal s) return s.value();
         if (v instanceof SchemeValue.MutableStringVal s) return s.value();
         throw new EvalError(caller + ": expected string");
+    }
+
+    private SchemeValue handleCallCC(SchemeValue proc, SchemeValue callccExpr) throws EvalError {
+        int contId = nextContId++;
+        var contVal = new SchemeValue.ContinuationVal(contId);
+
+        // Store continuation data — capture current let body context and its environment
+        Environment letEnv = (currentLetBody != null) ? findLetBodyEnv() : null;
+        continuationData.put(contId, new ContData(callccExpr, currentLetBody, currentLetBodyIndex, letEnv, topLevelIndex));
+
+        // Call the thunk with the continuation
+        try {
+            if (proc instanceof SchemeValue.LambdaVal lambda) {
+                var localEnv = applyLambda(lambda, List.of(contVal), "");
+                SchemeValue result = null;
+                for (var bodyExpr : lambda.body()) {
+                    result = eval(bodyExpr, localEnv);
+                }
+                return result;
+            } else if (proc instanceof SchemeValue.BuiltinVal builtin) {
+                return builtin.fn().apply(List.of(contVal));
+            }
+            throw new EvalError("call/cc: expected procedure, got: " + proc.display());
+        } catch (ContinuationException e) {
+            if (e.contId == contId) {
+                return e.value; // escape continuation
+            }
+            throw e;
+        }
+    }
+
+    // The let body env is the env used to evaluate the let body expressions.
+    // We track it via a field set during let body evaluation.
+    private Environment currentLetBodyEnv;
+
+    private Environment findLetBodyEnv() {
+        return currentLetBodyEnv;
+    }
+
+    /**
+     * Restart a let body from a given index (used for reentrant continuations).
+     * Called from Evaluator when a ContinuationException targets a let body.
+     */
+    SchemeValue restartLetBody(List<SchemeValue> body, int startIndex, Environment env) throws EvalError {
+        int idx = startIndex;
+        while (true) {
+            try {
+                SchemeValue result = null;
+                for (int i = idx; i < body.size(); i++) {
+                    currentLetBody = body;
+                    currentLetBodyIndex = i;
+                    currentLetBodyEnv = env;
+                    result = eval(body.get(i), env);
+                }
+                return result != null ? result : new SchemeValue.VoidVal();
+            } catch (ContinuationException e) {
+                var cont = continuationData.get(e.contId);
+                if (cont != null && cont.letBody == body) {
+                    pendingReturns.put(cont.callccExpr, e.value);
+                    idx = cont.letBodyIndex;
+                } else {
+                    throw e;
+                }
+            }
+        }
     }
 }
