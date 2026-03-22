@@ -22,6 +22,8 @@ const (
 	TypeMacro
 	TypeVector
 	TypeMultipleValues
+	TypeRational
+	TypeFloat
 )
 
 // Value represents a Scheme value.
@@ -46,6 +48,11 @@ type Value struct {
 	VecElems []*Value
 	// Multiple values fields
 	Values []*Value
+	// Rational fields (Num/Den, always reduced, Den > 0)
+	Num int64
+	Den int64
+	// Float field
+	FloatVal float64
 }
 
 // StrContent returns the string content, preferring mutable Runes if set.
@@ -108,6 +115,10 @@ func (v *Value) IsTruthy() bool {
 // String returns the external representation of the value.
 func (v *Value) String() string {
 	switch v.Type {
+	case TypeRational:
+		return fmt.Sprintf("%d/%d", v.Num, v.Den)
+	case TypeFloat:
+		return formatFloat(v.FloatVal)
 	case TypeInteger:
 		return fmt.Sprintf("%d", v.IntVal)
 	case TypeBoolean:

@@ -194,8 +194,8 @@ func (t *Tokenizer) readAtom(line, col int) (Token, error) {
 		ch := t.advance()
 		return Token{}, fmt.Errorf("%d:%d: unexpected character: %c", line, col, ch)
 	}
-	// Check if it's a number
-	if isNumber(val) {
+	// Check if it's a number (integer, rational, or float)
+	if isNumber(val) || isRationalStr(val) || isFloatStr(val) {
 		return Token{Type: TokenNumber, Val: val, Line: line, Col: col}, nil
 	}
 	return Token{Type: TokenSymbol, Val: val, Line: line, Col: col}, nil

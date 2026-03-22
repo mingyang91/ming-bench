@@ -7,13 +7,16 @@ import (
 
 // Expr represents a parsed Scheme expression.
 type Expr struct {
-	Type   ExprType
-	IntVal int64
-	BoolVal bool
-	StrVal string
-	List   []*Expr
-	Line   int
-	Col    int
+	Type     ExprType
+	IntVal   int64
+	BoolVal  bool
+	StrVal   string
+	FloatVal float64
+	Num      int64
+	Den      int64
+	List     []*Expr
+	Line     int
+	Col      int
 }
 
 type ExprType int
@@ -25,6 +28,8 @@ const (
 	ExprSymbol
 	ExprList
 	ExprChar
+	ExprFloat
+	ExprRational
 )
 
 type Parser struct {
@@ -59,6 +64,14 @@ func (p *Parser) parseExpr() (*Expr, error) {
 	switch tok.Type {
 	case TokenNumber:
 		p.advance()
+		if isRationalStr(tok.Val) {
+			num, den := parseRational(tok.Val)
+			return &Expr{Type: ExprRational, Num: num, Den: den, Line: tok.Line, Col: tok.Col}, nil
+		}
+		if isFloatStr(tok.Val) {
+			f := parseFloatStr(tok.Val)
+			return &Expr{Type: ExprFloat, FloatVal: f, Line: tok.Line, Col: tok.Col}, nil
+		}
 		n, err := strconv.ParseInt(tok.Val, 10, 64)
 		if err != nil {
 			return nil, fmt.Errorf("%d:%d: invalid number: %s", tok.Line, tok.Col, tok.Val)

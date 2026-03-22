@@ -33,6 +33,10 @@ func Eval(expr *Expr, env *Env) (*Value, error) {
 			return StringValue(expr.StrVal), nil
 		case ExprChar:
 			return CharValue(rune(expr.IntVal)), nil
+		case ExprFloat:
+			return FloatValue(expr.FloatVal), nil
+		case ExprRational:
+			return RationalValue(expr.Num, expr.Den), nil
 		case ExprSymbol:
 			val, ok := env.Get(expr.StrVal)
 			if !ok {
@@ -246,15 +250,15 @@ func applyBuiltin(name string, args []*Value, expr *Expr, env *Env) (*Value, err
 	case "/":
 		return builtinDiv(args, expr)
 	case "<":
-		return builtinCmp(args, expr, func(a, b int64) bool { return a < b })
+		return builtinCmp(args, expr, "<")
 	case ">":
-		return builtinCmp(args, expr, func(a, b int64) bool { return a > b })
+		return builtinCmp(args, expr, ">")
 	case "=":
-		return builtinCmp(args, expr, func(a, b int64) bool { return a == b })
+		return builtinCmp(args, expr, "=")
 	case "<=":
-		return builtinCmp(args, expr, func(a, b int64) bool { return a <= b })
+		return builtinCmp(args, expr, "<=")
 	case ">=":
-		return builtinCmp(args, expr, func(a, b int64) bool { return a >= b })
+		return builtinCmp(args, expr, ">=")
 	case "not":
 		if len(args) != 1 {
 			return nil, errAtf(expr, "not: expected 1 argument, got %d", len(args))
@@ -329,7 +333,62 @@ func applyBuiltin(name string, args []*Value, expr *Expr, env *Env) (*Value, err
 		if len(args) != 1 {
 			return nil, errAtf(expr, "number?: expected 1 argument, got %d", len(args))
 		}
-		return BooleanValue(args[0].Type == TypeInteger), nil
+		return BooleanValue(isNumeric(args[0])), nil
+	case "integer?":
+		if len(args) != 1 {
+			return nil, errAtf(expr, "integer?: expected 1 argument, got %d", len(args))
+		}
+		return BooleanValue(isIntegerValue(args[0])), nil
+	case "rational?":
+		if len(args) != 1 {
+			return nil, errAtf(expr, "rational?: expected 1 argument, got %d", len(args))
+		}
+		return BooleanValue(args[0].Type == TypeInteger || args[0].Type == TypeRational), nil
+	case "exact?":
+		if len(args) != 1 {
+			return nil, errAtf(expr, "exact?: expected 1 argument, got %d", len(args))
+		}
+		return BooleanValue(isExact(args[0])), nil
+	case "inexact?":
+		if len(args) != 1 {
+			return nil, errAtf(expr, "inexact?: expected 1 argument, got %d", len(args))
+		}
+		return BooleanValue(args[0].Type == TypeFloat), nil
+	case "exact->inexact":
+		if len(args) != 1 {
+			return nil, errAtf(expr, "exact->inexact: expected 1 argument, got %d", len(args))
+		}
+		if !isNumeric(args[0]) {
+			return nil, errAtf(expr, "exact->inexact: expected number")
+		}
+		return FloatValue(toFloat(args[0])), nil
+	case "inexact->exact":
+		if len(args) != 1 {
+			return nil, errAtf(expr, "inexact->exact: expected 1 argument, got %d", len(args))
+		}
+		if !isNumeric(args[0]) {
+			return nil, errAtf(expr, "inexact->exact: expected number")
+		}
+		if isExact(args[0]) {
+			return args[0], nil
+		}
+		return floatToExact(args[0].FloatVal), nil
+	case "numerator":
+		if len(args) != 1 {
+			return nil, errAtf(expr, "numerator: expected 1 argument, got %d", len(args))
+		}
+		if !isExact(args[0]) {
+			return nil, errAtf(expr, "numerator: expected exact number")
+		}
+		return IntegerValue(numeratorOf(args[0])), nil
+	case "denominator":
+		if len(args) != 1 {
+			return nil, errAtf(expr, "denominator: expected 1 argument, got %d", len(args))
+		}
+		if !isExact(args[0]) {
+			return nil, errAtf(expr, "denominator: expected exact number")
+		}
+		return IntegerValue(denominatorOf(args[0])), nil
 	case "string?":
 		if len(args) != 1 {
 			return nil, errAtf(expr, "string?: expected 1 argument, got %d", len(args))
@@ -420,10 +479,10 @@ func applyBuiltin(name string, args []*Value, expr *Expr, env *Env) (*Value, err
 		if len(args) != 1 {
 			return nil, errAtf(expr, "number->string: expected 1 argument, got %d", len(args))
 		}
-		if args[0].Type != TypeInteger {
+		if !isNumeric(args[0]) {
 			return nil, errAtf(expr, "number->string: expected number")
 		}
-		return StringValue(strconv.FormatInt(args[0].IntVal, 10)), nil
+		return StringValue(args[0].String()), nil
 	case "symbol->string":
 		if len(args) != 1 {
 			return nil, errAtf(expr, "symbol->string: expected 1 argument, got %d", len(args))
@@ -1176,14 +1235,14 @@ func evalGuard(expr *Expr, env *Env) (*Value, error) {
 }
 
 func builtinAdd(args []*Value, expr *Expr) (*Value, error) {
-	var sum int64
+	result := IntegerValue(0)
 	for _, a := range args {
-		if a.Type != TypeInteger {
+		if !isNumeric(a) {
 			return nil, errAtf(expr, "+: expected number")
 		}
-		sum += a.IntVal
+		result = numAdd(result, a)
 	}
-	return IntegerValue(sum), nil
+	return result, nil
 }
 
 func builtinSub(args []*Value, expr *Expr) (*Value, error) {
@@ -1191,29 +1250,29 @@ func builtinSub(args []*Value, expr *Expr) (*Value, error) {
 		return nil, errAtf(expr, "-: expected at least 1 argument")
 	}
 	for _, a := range args {
-		if a.Type != TypeInteger {
+		if !isNumeric(a) {
 			return nil, errAtf(expr, "-: expected number")
 		}
 	}
 	if len(args) == 1 {
-		return IntegerValue(-args[0].IntVal), nil
+		return numNeg(args[0]), nil
 	}
-	result := args[0].IntVal
+	result := args[0]
 	for _, a := range args[1:] {
-		result -= a.IntVal
+		result = numSub(result, a)
 	}
-	return IntegerValue(result), nil
+	return result, nil
 }
 
 func builtinMul(args []*Value, expr *Expr) (*Value, error) {
-	var product int64 = 1
+	result := IntegerValue(1)
 	for _, a := range args {
-		if a.Type != TypeInteger {
+		if !isNumeric(a) {
 			return nil, errAtf(expr, "*: expected number")
 		}
-		product *= a.IntVal
+		result = numMul(result, a)
 	}
-	return IntegerValue(product), nil
+	return result, nil
 }
 
 func builtinDiv(args []*Value, expr *Expr) (*Value, error) {
@@ -1221,31 +1280,45 @@ func builtinDiv(args []*Value, expr *Expr) (*Value, error) {
 		return nil, errAtf(expr, "/: expected at least 2 arguments")
 	}
 	for _, a := range args {
-		if a.Type != TypeInteger {
+		if !isNumeric(a) {
 			return nil, errAtf(expr, "/: expected number")
 		}
 	}
-	result := args[0].IntVal
+	result := args[0]
 	for _, a := range args[1:] {
-		if a.IntVal == 0 {
+		if numIsZero(a) {
 			return nil, errAtf(expr, "/: division by zero")
 		}
-		result /= a.IntVal
+		result = numDiv(result, a)
 	}
-	return IntegerValue(result), nil
+	return result, nil
 }
 
-func builtinCmp(args []*Value, expr *Expr, cmp func(int64, int64) bool) (*Value, error) {
+func builtinCmp(args []*Value, expr *Expr, op string) (*Value, error) {
 	if len(args) < 2 {
 		return nil, errAtf(expr, "comparison: expected at least 2 arguments")
 	}
 	for _, a := range args {
-		if a.Type != TypeInteger {
+		if !isNumeric(a) {
 			return nil, errAtf(expr, "comparison: expected number")
 		}
 	}
 	for i := 0; i < len(args)-1; i++ {
-		if !cmp(args[i].IntVal, args[i+1].IntVal) {
+		a, b := args[i], args[i+1]
+		var ok bool
+		switch op {
+		case "=":
+			ok = numEqual(a, b)
+		case "<":
+			ok = numLess(a, b)
+		case ">":
+			ok = numGreater(a, b)
+		case "<=":
+			ok = numLess(a, b) || numEqual(a, b)
+		case ">=":
+			ok = numGreater(a, b) || numEqual(a, b)
+		}
+		if !ok {
 			return False, nil
 		}
 	}
@@ -1380,6 +1453,10 @@ func exprToValue(expr *Expr) (*Value, error) {
 		return StringValue(expr.StrVal), nil
 	case ExprChar:
 		return CharValue(rune(expr.IntVal)), nil
+	case ExprFloat:
+		return FloatValue(expr.FloatVal), nil
+	case ExprRational:
+		return RationalValue(expr.Num, expr.Den), nil
 	case ExprSymbol:
 		return SymbolValue(expr.StrVal), nil
 	case ExprList:
@@ -1628,6 +1705,10 @@ func evalCondTCO(expr *Expr, env *Env) (*Expr, *Env, *Value, error) {
 }
 
 func schemeEqual(a, b *Value) bool {
+	// Handle cross-type numeric comparison
+	if isNumeric(a) && isNumeric(b) {
+		return numEqual(a, b)
+	}
 	if a.Type != b.Type {
 		return false
 	}
@@ -1872,6 +1953,9 @@ func evalCaseTCO(expr *Expr, env *Env) (*Expr, *Env, *Value, error) {
 }
 
 func schemeEqv(a, b *Value) bool {
+	if isNumeric(a) && isNumeric(b) {
+		return numEqual(a, b)
+	}
 	if a.Type != b.Type {
 		return false
 	}
@@ -1921,7 +2005,10 @@ func makeDefaultEnv() *Env {
 		"vector->list", "list->vector",
 		"dynamic-wind",
 		"raise", "with-exception-handler",
-		"values", "call-with-values"}
+		"values", "call-with-values",
+		"integer?", "rational?", "exact?", "inexact?",
+		"exact->inexact", "inexact->exact",
+		"numerator", "denominator"}
 	for _, name := range builtins {
 		env.Set(name, &Value{Type: TypeSymbol, StrVal: fmt.Sprintf("__builtin:%s", name)})
 	}
