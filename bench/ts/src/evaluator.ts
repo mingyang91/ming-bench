@@ -223,7 +223,8 @@ type Value =
   | { tag: 'nil' }
   | { tag: 'pair'; car: Value; cdr: Value }
   | { tag: 'builtin'; name: string; fn: (args: Value[]) => Value }
-  | { tag: 'lambda'; params: string[]; rest: string | null; body: Expr[]; env: Env };
+  | { tag: 'lambda'; params: string[]; rest: string | null; body: Expr[]; env: Env }
+  | { tag: 'continuation'; id: number; exprPos: string; topIdx: number };
 
 function isTruthy(v: Value): boolean {
   return !(v.tag === 'boolean' && v.value === false);
@@ -240,6 +241,7 @@ function displayValue(v: Value): string {
     case 'pair': return displayPair(v);
     case 'builtin': return `#<procedure:${v.name}>`;
     case 'lambda': return '#<procedure>';
+    case 'continuation': return '#<continuation>';
   }
 }
 
@@ -272,6 +274,21 @@ function displayPair(p: { tag: 'pair'; car: Value; cdr: Value }): string {
     return `(${parts.join(' ')})`;
   }
   return `(${parts.join(' ')} . ${displayValue(cur)})`;
+}
+
+// ── Continuations ───────────────────────────────────────────────────
+
+let nextContId = 0;
+let currentTopIdx = 0;
+let pendingContReturn: { exprPos: string; value: Value } | null = null;
+
+class ContinuationJump {
+  constructor(
+    public id: number,
+    public value: Value,
+    public exprPos: string,
+    public topIdx: number,
+  ) {}
 }
 
 // ── Builtins ─────────────────────────────────────────────────────────
@@ -518,8 +535,16 @@ function makeGlobalEnv(output: string[] = []): Env {
       }
       return result;
     }
+    if (proc.tag === 'continuation') {
+      if (collected.length !== 1) throw new EvalError('continuation: expected 1 argument');
+      throw new ContinuationJump(proc.id, collected[0], proc.exprPos, proc.topIdx);
+    }
     throw new EvalError('apply: first argument must be a procedure');
   }});
+
+  // call/cc — handled specially by the evaluator
+  env.define('call/cc', { tag: 'builtin', name: 'call/cc', fn() { throw new EvalError('call/cc: internal'); } });
+  env.define('call-with-current-continuation', { tag: 'builtin', name: 'call/cc', fn() { throw new EvalError('call/cc: internal'); } });
 
   return env;
 }
@@ -566,6 +591,47 @@ function parseParams(exprs: Expr[]): { params: string[]; rest: string | null } {
     }),
     rest: restExpr.name,
   };
+}
+
+// ── Apply helper (no TCO, used by call/cc) ──────────────────────────
+
+function applyFn(fn: Value, args: Value[], pos: Pos): Value {
+  if (fn.tag === 'builtin') {
+    if (fn.name === 'call/cc') {
+      throw new EvalError(`${fmtPos(pos)}: call/cc: cannot be used inside apply`);
+    }
+    try {
+      return fn.fn(args);
+    } catch (e) {
+      if (e instanceof EvalError && !e.message.match(/^\d+:/)) {
+        throw new EvalError(`${fmtPos(pos)}: ${e.message}`);
+      }
+      throw e;
+    }
+  }
+  if (fn.tag === 'lambda') {
+    const callEnv = new Env(fn.env);
+    for (let i = 0; i < fn.params.length; i++) {
+      callEnv.define(fn.params[i], args[i]);
+    }
+    if (fn.rest !== null) {
+      let restList: Value = { tag: 'nil' };
+      for (let i = args.length - 1; i >= fn.params.length; i--) {
+        restList = { tag: 'pair', car: args[i], cdr: restList };
+      }
+      callEnv.define(fn.rest, restList);
+    }
+    let result: Value = { tag: 'nil' };
+    for (const bodyExpr of fn.body) {
+      result = evaluate(bodyExpr, callEnv);
+    }
+    return result;
+  }
+  if (fn.tag === 'continuation') {
+    if (args.length !== 1) throw new EvalError('continuation: expected 1 argument');
+    throw new ContinuationJump(fn.id, args[0], fn.exprPos, fn.topIdx);
+  }
+  throw new EvalError(`${fmtPos(pos)}: not a procedure`);
 }
 
 // ── Eval ─────────────────────────────────────────────────────────────
@@ -742,6 +808,35 @@ function evaluate(expr: Expr, env: Env): Value {
       // Function application
       const fn = evaluate(head, env);
       const args = items.slice(1).map(a => evaluate(a, env));
+
+      // call/cc handling
+      if (fn.tag === 'builtin' && fn.name === 'call/cc') {
+        const posKey = `${expr.pos.line}:${expr.pos.col}`;
+        if (pendingContReturn && pendingContReturn.exprPos === posKey) {
+          const val = pendingContReturn.value;
+          pendingContReturn = null;
+          return val;
+        }
+        if (args.length !== 1) throw new EvalError(`${fmtPos(expr.pos)}: call/cc: expected 1 argument`);
+        const proc = args[0];
+        const id = nextContId++;
+        const cont: Value = { tag: 'continuation', id, exprPos: posKey, topIdx: currentTopIdx };
+        try {
+          return applyFn(proc, [cont], expr.pos);
+        } catch (e) {
+          if (e instanceof ContinuationJump && e.id === id) {
+            return e.value;
+          }
+          throw e;
+        }
+      }
+
+      // Continuation invocation
+      if (fn.tag === 'continuation') {
+        if (args.length !== 1) throw new EvalError(`${fmtPos(expr.pos)}: continuation: expected 1 argument`);
+        throw new ContinuationJump(fn.id, args[0], fn.exprPos, fn.topIdx);
+      }
+
       if (fn.tag === 'builtin') {
         try {
           return fn.fn(args);
@@ -779,15 +874,31 @@ function evaluate(expr: Expr, env: Env): Value {
  * Evaluate one or more Scheme expressions and return the string
  * representation of the last result.
  */
+function evalProgram(exprs: Expr[], env: Env): Value {
+  let result: Value = { tag: 'nil' };
+  nextContId = 0;
+  pendingContReturn = null;
+  for (let i = 0; i < exprs.length; i++) {
+    currentTopIdx = i;
+    try {
+      result = evaluate(exprs[i], env);
+    } catch (e) {
+      if (e instanceof ContinuationJump) {
+        pendingContReturn = { exprPos: e.exprPos, value: e.value };
+        i = e.topIdx - 1; // -1 because for loop increments
+        continue;
+      }
+      throw e;
+    }
+  }
+  return result;
+}
+
 export function evalStr(input: string): string {
   const exprs = parse(input);
   if (exprs.length === 0) throw new EvalError('no expressions');
   const env = makeGlobalEnv();
-  let result: Value | undefined;
-  for (const expr of exprs) {
-    result = evaluate(expr, env);
-  }
-  return displayValue(result!);
+  return displayValue(evalProgram(exprs, env));
 }
 
 /**
@@ -799,9 +910,5 @@ export function evalStrWithOutput(input: string): { result: string; output: stri
   if (exprs.length === 0) throw new EvalError('no expressions');
   const output: string[] = [];
   const env = makeGlobalEnv(output);
-  let result: Value | undefined;
-  for (const expr of exprs) {
-    result = evaluate(expr, env);
-  }
-  return { result: displayValue(result!), output: output.join('') };
+  return { result: displayValue(evalProgram(exprs, env)), output: output.join('') };
 }
