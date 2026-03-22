@@ -302,6 +302,7 @@ public class Interpreter {
                 case SchemeValue.CharVal v -> { return v; }
                 case SchemeValue.MutableStringVal v -> { return v; }
                 case SchemeValue.ContinuationVal v -> { return v; }
+                case SchemeValue.SyntaxRulesVal v -> { return v; }
                 case SchemeValue.SymbolVal v -> {
                     try {
                         return env.get(v.name());
@@ -432,6 +433,14 @@ public class Interpreter {
                                 SchemeValue proc = eval(elements.get(1), env);
                                 return handleCallCC(proc, listVal);
                             }
+                            case "define-syntax" -> {
+                                if (elements.size() != 3) throw new EvalError(posPrefix(listVal) + "define-syntax: bad syntax");
+                                if (!(elements.get(1) instanceof SchemeValue.SymbolVal nameSym))
+                                    throw new EvalError(posPrefix(listVal) + "define-syntax: expected symbol");
+                                SchemeValue transformer = evalSyntaxRules(elements.get(2), env);
+                                env.define(nameSym.name(), transformer);
+                                return new SchemeValue.VoidVal();
+                            }
                             case "cond" -> {
                                 boolean matched = false;
                                 for (int i = 1; i < elements.size(); i++) {
@@ -467,6 +476,11 @@ public class Interpreter {
                     }
                     // Evaluate head and call as procedure
                     SchemeValue proc = eval(head, env);
+                    // Macro expansion
+                    if (proc instanceof SchemeValue.SyntaxRulesVal macro) {
+                        expr = MacroExpander.expand(macro, listVal);
+                        continue;
+                    }
                     var args = new ArrayList<SchemeValue>();
                     for (int i = 1; i < elements.size(); i++) {
                         args.add(eval(elements.get(i), env));
@@ -512,6 +526,29 @@ public class Interpreter {
         }
     }
 
+
+    private SchemeValue evalSyntaxRules(SchemeValue srExpr, Environment env) throws EvalError {
+        if (!(srExpr instanceof SchemeValue.ListVal list)) throw new EvalError("syntax-rules: bad syntax");
+        var elems = list.elements();
+        if (elems.isEmpty() || !(elems.getFirst() instanceof SchemeValue.SymbolVal s) || !s.name().equals("syntax-rules"))
+            throw new EvalError("syntax-rules: bad syntax");
+        if (elems.size() < 2) throw new EvalError("syntax-rules: bad syntax");
+        var literals = new ArrayList<String>();
+        if (elems.get(1) instanceof SchemeValue.ListVal litList) {
+            for (var lit : litList.elements()) {
+                if (lit instanceof SchemeValue.SymbolVal ls) literals.add(ls.name());
+            }
+        }
+        var patterns = new ArrayList<SchemeValue>();
+        var templates = new ArrayList<SchemeValue>();
+        for (int i = 2; i < elems.size(); i++) {
+            if (!(elems.get(i) instanceof SchemeValue.ListVal rule) || rule.elements().size() != 2)
+                throw new EvalError("syntax-rules: bad rule");
+            patterns.add(rule.elements().get(0));
+            templates.add(rule.elements().get(1));
+        }
+        return new SchemeValue.SyntaxRulesVal(literals, patterns, templates, env);
+    }
 
     private SchemeValue evalDefine(SchemeValue.ListVal listVal, List<SchemeValue> elements, Environment env) throws EvalError {
         if (elements.size() < 3) throw new EvalError(posPrefix(listVal) + "define: bad syntax");
