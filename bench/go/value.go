@@ -30,9 +30,10 @@ type Value struct {
 	Car     *Value
 	Cdr     *Value
 	// Lambda fields
-	Params  []string
-	Body    []*Expr
-	Closure *Env
+	Params    []string
+	RestParam string // variadic rest parameter name (empty if none)
+	Body      []*Expr
+	Closure   *Env
 }
 
 // StrContent returns the string content, preferring mutable Runes if set.

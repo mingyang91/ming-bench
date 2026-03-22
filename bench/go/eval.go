@@ -370,6 +370,8 @@ func applyBuiltin(name string, args []*Value, expr *Expr, env *Env) (*Value, err
 			return nil, errAtf(expr, "string-ref: index out of range")
 		}
 		return CharValue(runes[idx]), nil
+	case "apply":
+		return builtinApply(args, expr, env)
 	case "string-set!":
 		if len(args) != 3 {
 			return nil, errAtf(expr, "string-set!: expected 3 arguments, got %d", len(args))
@@ -406,6 +408,38 @@ func applyBuiltin(name string, args []*Value, expr *Expr, env *Env) (*Value, err
 	default:
 		return nil, errAtf(expr, "unknown procedure: %s", name)
 	}
+}
+
+func builtinApply(args []*Value, expr *Expr, env *Env) (*Value, error) {
+	if len(args) < 2 {
+		return nil, errAtf(expr, "apply: expected at least 2 arguments, got %d", len(args))
+	}
+	fn := args[0]
+	// Last argument must be a list; prefix args are prepended
+	lastArg := args[len(args)-1]
+	var finalArgs []*Value
+	// Collect prefix args (between fn and the last arg)
+	for _, a := range args[1 : len(args)-1] {
+		finalArgs = append(finalArgs, a)
+	}
+	// Unpack the last argument (a list)
+	cur := lastArg
+	for cur.Type == TypePair {
+		finalArgs = append(finalArgs, cur.Car)
+		cur = cur.Cdr
+	}
+	if cur.Type != TypeNull {
+		return nil, errAtf(expr, "apply: last argument must be a proper list")
+	}
+	// Apply the function
+	tailExpr, tailEnv, val, err, isTail := applyFuncTCO(fn, finalArgs, expr, env)
+	if err != nil {
+		return nil, err
+	}
+	if isTail {
+		return Eval(tailExpr, tailEnv)
+	}
+	return val, nil
 }
 
 func builtinAdd(args []*Value, expr *Expr) (*Value, error) {
@@ -540,18 +574,17 @@ func evalDefine(expr *Expr, env *Env) (*Value, error) {
 	if target.Type == ExprList && len(target.List) >= 1 && target.List[0].Type == ExprSymbol {
 		// (define (f params...) body...)
 		name := target.List[0].StrVal
-		params := make([]string, len(target.List)-1)
-		for i, p := range target.List[1:] {
-			if p.Type != ExprSymbol {
-				return nil, errAt(p, "define: parameter must be a symbol")
-			}
-			params[i] = p.StrVal
+		paramExpr := &Expr{Type: ExprList, List: target.List[1:], Line: target.Line, Col: target.Col}
+		params, restParam, err := parseLambdaParams(paramExpr)
+		if err != nil {
+			return nil, err
 		}
 		lambda := &Value{
-			Type:    TypeLambda,
-			Params:  params,
-			Body:    expr.List[2:],
-			Closure: env,
+			Type:      TypeLambda,
+			Params:    params,
+			RestParam: restParam,
+			Body:      expr.List[2:],
+			Closure:   env,
 		}
 		env.Set(name, lambda)
 		return Void, nil
@@ -614,37 +647,81 @@ func exprToValue(expr *Expr) (*Value, error) {
 	}
 }
 
+func parseLambdaParams(paramExpr *Expr) ([]string, string, error) {
+	if paramExpr.Type == ExprSymbol {
+		// (lambda args body) — all args collected as rest
+		return nil, paramExpr.StrVal, nil
+	}
+	if paramExpr.Type != ExprList {
+		return nil, "", errAt(paramExpr, "lambda: parameters must be a list")
+	}
+	// Check for dot notation: (x y . rest)
+	var params []string
+	var restParam string
+	for i, p := range paramExpr.List {
+		if p.Type != ExprSymbol {
+			return nil, "", errAt(p, "lambda: parameter must be a symbol")
+		}
+		if p.StrVal == "." {
+			if i+2 != len(paramExpr.List) {
+				return nil, "", errAt(p, "lambda: invalid dot in parameter list")
+			}
+			rest := paramExpr.List[i+1]
+			if rest.Type != ExprSymbol {
+				return nil, "", errAt(rest, "lambda: rest parameter must be a symbol")
+			}
+			restParam = rest.StrVal
+			break
+		}
+		params = append(params, p.StrVal)
+	}
+	if restParam == "" {
+		params = make([]string, len(paramExpr.List))
+		for i, p := range paramExpr.List {
+			params[i] = p.StrVal
+		}
+	}
+	return params, restParam, nil
+}
+
 func evalLambda(expr *Expr, env *Env) (*Value, error) {
 	if len(expr.List) < 3 {
 		return nil, errAt(expr, "lambda: expected at least 2 arguments")
 	}
-	paramExpr := expr.List[1]
-	if paramExpr.Type != ExprList {
-		return nil, errAt(paramExpr, "lambda: parameters must be a list")
-	}
-	params := make([]string, len(paramExpr.List))
-	for i, p := range paramExpr.List {
-		if p.Type != ExprSymbol {
-			return nil, errAt(p, "lambda: parameter must be a symbol")
-		}
-		params[i] = p.StrVal
+	params, restParam, err := parseLambdaParams(expr.List[1])
+	if err != nil {
+		return nil, err
 	}
 	return &Value{
-		Type:    TypeLambda,
-		Params:  params,
-		Body:    expr.List[2:],
-		Closure: env,
+		Type:      TypeLambda,
+		Params:    params,
+		RestParam: restParam,
+		Body:      expr.List[2:],
+		Closure:   env,
 	}, nil
 }
 
 // applyLambdaTCO sets up the lambda env and returns a tail call to its last body expr.
 func applyLambdaTCO(fn *Value, args []*Value, expr *Expr) (*Expr, *Env, *Value, error, bool) {
-	if len(args) != len(fn.Params) {
-		return nil, nil, nil, errAtf(expr, "expected %d arguments, got %d", len(fn.Params), len(args)), false
+	if fn.RestParam != "" {
+		if len(args) < len(fn.Params) {
+			return nil, nil, nil, errAtf(expr, "expected at least %d arguments, got %d", len(fn.Params), len(args)), false
+		}
+	} else {
+		if len(args) != len(fn.Params) {
+			return nil, nil, nil, errAtf(expr, "expected %d arguments, got %d", len(fn.Params), len(args)), false
+		}
 	}
 	localEnv := NewEnv(fn.Closure)
 	for i, param := range fn.Params {
 		localEnv.Set(param, args[i])
+	}
+	if fn.RestParam != "" {
+		rest := Null
+		for i := len(args) - 1; i >= len(fn.Params); i-- {
+			rest = PairValue(args[i], rest)
+		}
+		localEnv.Set(fn.RestParam, rest)
 	}
 	// Evaluate all but last body expression
 	for _, bodyExpr := range fn.Body[:len(fn.Body)-1] {
@@ -806,7 +883,8 @@ func makeDefaultEnv() *Env {
 		"string->number", "number->string",
 		"symbol->string", "string->symbol",
 		"string-ref",
-		"string-set!", "string-copy"}
+		"string-set!", "string-copy",
+		"apply"}
 	for _, name := range builtins {
 		env.Set(name, &Value{Type: TypeSymbol, StrVal: fmt.Sprintf("__builtin:%s", name)})
 	}
