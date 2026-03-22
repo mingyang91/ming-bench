@@ -28,6 +28,9 @@ object Evaluator:
 
   // --- Sequence evaluation (top-level / body with defines) ---
 
+  /** A collected define: name, optional params (None=variable, Some=function), body. */
+  private[ming] type Define = (String, Option[List[String]], List[SchemeValue])
+
   private[ming] def evalSequence(
     exprs: List[SchemeValue],
     env: Env
@@ -44,18 +47,15 @@ object Evaluator:
   @scala.annotation.tailrec
   private def collectDefines(
     exprs: List[SchemeValue],
-    acc: List[(String, List[String], List[SchemeValue])]
-  ): (
-    List[(String, List[String], List[SchemeValue])],
-    List[SchemeValue]
-  ) =
+    acc: List[Define]
+  ): (List[Define], List[SchemeValue]) =
     exprs match
       case (defExpr @ SchemeList(
             SchemeSymbol("define") :: rest
           )) :: tail =>
         rest match
           case SchemeSymbol(name) :: valueExpr :: Nil =>
-            collectDefines(tail, (name, Nil, List(valueExpr)) :: acc)
+            collectDefines(tail, (name, None, List(valueExpr)) :: acc)
           case SchemeList(SchemeSymbol(name) :: params) :: body =>
             val paramNames = params.map {
               case SchemeSymbol(n) => n
@@ -66,7 +66,7 @@ object Evaluator:
             }
             collectDefines(
               tail,
-              (name, paramNames, body) :: acc
+              (name, Some(paramNames), body) :: acc
             )
           case _ =>
             throw new EvalError("bad define syntax", defExpr.pos)
@@ -179,6 +179,7 @@ object Evaluator:
     case "let"    => SpecialForms.evalLetOnce(args, env, accOut)
     case "begin"  => SpecialForms.evalBeginOnce(args, env, accOut)
     case "cond"   => SpecialForms.evalCondOnce(args, env, accOut)
+    case "set!"   => SpecialForms.evalSetOnce(args, env, accOut)
     case _ =>
       val (evaledArgs, ao) = evalArgs(args, env)
       env.get(op) match
@@ -201,7 +202,7 @@ object Evaluator:
         throw new EvalError(
           s"expected ${params.length} arguments, got ${args.length}"
         )
-      val localEnv = Env.Frame(params.zip(args).toMap, closure)
+      val localEnv = closure.extend(params, args)
       evalSequenceOnce(body, localEnv, accOut)
     case other =>
       throw new EvalError(s"not a procedure: ${other.display}")

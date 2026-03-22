@@ -120,6 +120,17 @@ private[ming] object SpecialForms:
       Evaluator.evalSequenceOnce(body, localEnv, accOut + ioS)
     case _ => throw new EvalError("let: bad syntax")
 
+  def evalSetOnce(
+    args: List[SchemeValue],
+    env: Env,
+    accOut: String
+  ): EvalResult = args match
+    case SchemeSymbol(name) :: valueExpr :: Nil =>
+      val (v, _, o) = Evaluator.evalWithEnv(valueExpr, env)
+      env.set(name, v)
+      Done(SchemeVoid, env, accOut + o)
+    case _ => throw new EvalError("set!: bad syntax")
+
   def evalBeginOnce(
     args: List[SchemeValue],
     env: Env,

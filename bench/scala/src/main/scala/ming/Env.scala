@@ -1,34 +1,49 @@
 package ming
 
-/** Immutable environment with lexical scoping. */
+/** Environment with lexical scoping and mutable cells for set!. */
 sealed trait Env:
   def lookup(name: String): SchemeValue
   def get(name: String): Option[SchemeValue]
+  def set(name: String, value: SchemeValue): Unit
 
   def extend(name: String, value: SchemeValue): Env =
-    Env.Frame(Map(name -> value), this)
+    new Env.Frame(Map(name -> Array[SchemeValue](value)), this)
 
   def extend(names: List[String], values: List[SchemeValue]): Env =
-    Env.Frame(names.zip(values).toMap, this)
+    new Env.Frame(
+      names.zip(values.map(v => Array[SchemeValue](v))).toMap,
+      this
+    )
 
 object Env:
-  val empty: Env = Frame(Map.empty, null)
+  val empty: Env = new Frame(Map.empty, null)
 
-  case class Frame(bindings: Map[String, SchemeValue], parent: Env) extends Env:
+  class Frame(
+    val cells: Map[String, Array[SchemeValue]],
+    val parent: Env
+  ) extends Env:
 
     def lookup(name: String): SchemeValue =
-      bindings.get(name) match
-        case Some(v) => v
+      cells.get(name) match
+        case Some(cell) => cell(0)
         case None =>
           if parent == null then throw new EvalError(s"unbound variable: $name")
           else parent.lookup(name)
 
     def get(name: String): Option[SchemeValue] =
-      bindings
+      cells
         .get(name)
+        .map(_(0))
         .orElse(
           if parent == null then None else parent.get(name)
         )
+
+    def set(name: String, value: SchemeValue): Unit =
+      cells.get(name) match
+        case Some(cell) => cell(0) = value
+        case None =>
+          if parent == null then throw new EvalError(s"unbound variable: $name")
+          else parent.set(name, value)
 
   /** Environment that lazily resolves a recursive binding. */
   class RecursiveFrame(
@@ -46,40 +61,46 @@ object Env:
       if n == name then Some(self)
       else parent.get(n)
 
-  /** Letrec-style frame: all defines see each other via lazy initialization. */
+    def set(n: String, value: SchemeValue): Unit =
+      if n == name then throw new EvalError(s"cannot set! recursive binding: $n")
+      else parent.set(n, value)
+
+  /** Letrec-style frame: all defines see each other via mutable cells. */
   class LetrecFrame(
-    defines: List[(String, List[String], List[SchemeValue])],
+    defines: List[(String, Option[List[String]], List[SchemeValue])],
     val parent: Env
   ) extends Env:
     import SchemeValue.*
 
-    // Build bindings map lazily — each entry is computed on first access
-    private val bindings: Map[String, () => SchemeValue] =
-      defines.map { case (name, params, body) =>
-        if params.isEmpty then
-          // Variable define: (define x expr) — evaluate lazily in this frame
-          lazy val value: SchemeValue =
-            import ming.Evaluator as E
-            E.eval(body.head, this)
-          (name, () => value)
-        else
-          // Function define: create lambda with this frame as closure
-          lazy val lambda: SchemeValue = SchemeLambda(params, body, this)
-          (name, () => lambda)
+    private val cells: Map[String, Array[SchemeValue]] =
+      defines.map { case (name, _, _) =>
+        (name, Array[SchemeValue](SchemeVoid))
       }.toMap
 
-    // Force evaluation of all variable defines
     def init(): Unit =
-      defines.foreach { case (name, params, _) =>
-        if params.isEmpty then bindings(name)()
+      // First pass: initialize function defines (no evaluation needed)
+      defines.foreach {
+        case (name, Some(params), body) =>
+          cells(name)(0) = SchemeLambda(params, body, this)
+        case _ => ()
+      }
+      // Second pass: initialize variable defines (may reference functions)
+      defines.foreach {
+        case (name, None, body) =>
+          import ming.Evaluator as E
+          cells(name)(0) = E.eval(body.head, this)
+        case _ => ()
       }
 
     def lookup(n: String): SchemeValue =
-      bindings.get(n) match
-        case Some(thunk) => thunk()
-        case None        => parent.lookup(n)
+      cells.get(n) match
+        case Some(cell) => cell(0)
+        case None       => parent.lookup(n)
 
     def get(n: String): Option[SchemeValue] =
-      bindings.get(n) match
-        case Some(thunk) => Some(thunk())
-        case None        => parent.get(n)
+      cells.get(n).map(_(0)).orElse(parent.get(n))
+
+    def set(n: String, value: SchemeValue): Unit =
+      cells.get(n) match
+        case Some(cell) => cell(0) = value
+        case None       => parent.set(n, value)
