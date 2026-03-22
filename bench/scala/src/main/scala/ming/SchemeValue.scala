@@ -3,7 +3,8 @@ package ming
 /** Scheme value representation. */
 sealed trait SchemeValue:
   def display: String
-  def pos: SourcePos = SourcePos.None
+  def displayOutput: String = display
+  def pos: SourcePos        = SourcePos.None
 
 object SchemeValue:
 
@@ -14,7 +15,8 @@ object SchemeValue:
     def display: String = if value then "#t" else "#f"
 
   case class SchemeString(value: String) extends SchemeValue:
-    def display: String = "\"" + value + "\""
+    def display: String                = "\"" + value + "\""
+    override def displayOutput: String = value
 
   class SchemeSymbol(val name: String, override val pos: SourcePos = SourcePos.None) extends SchemeValue:
     def display: String = name
@@ -35,7 +37,8 @@ object SchemeValue:
       case _               => scala.None
 
   class SchemeList(val elements: List[SchemeValue], override val pos: SourcePos = SourcePos.None) extends SchemeValue:
-    def display: String = s"(${elements.map(_.display).mkString(" ")})"
+    def display: String                = s"(${elements.map(_.display).mkString(" ")})"
+    override def displayOutput: String = s"(${elements.map(_.displayOutput).mkString(" ")})"
 
     override def equals(other: Any): Boolean = other match
       case l: SchemeList => l.elements == elements
@@ -54,6 +57,10 @@ object SchemeValue:
 
   case class SchemeLambda(params: List[String], body: List[SchemeValue], closure: Env) extends SchemeValue:
     def display: String = "#<procedure>"
+
+  case class SchemeChar(value: Char) extends SchemeValue:
+    def display: String                = s"#\\$value"
+    override def displayOutput: String = value.toString
 
   case object SchemeVoid extends SchemeValue:
     def display: String = "#<void>"
