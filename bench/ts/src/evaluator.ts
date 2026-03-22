@@ -240,7 +240,8 @@ type Value =
   | { tag: 'builtin'; name: string; fn: (args: Value[]) => Value }
   | { tag: 'lambda'; params: string[]; rest: string | null; body: Expr[]; env: Env }
   | { tag: 'continuation'; id: number; exprPos: string; topIdx: number }
-  | { tag: 'macro'; literals: string[]; rules: { pattern: Expr; template: Expr }[]; defEnv: Env };
+  | { tag: 'macro'; literals: string[]; rules: { pattern: Expr; template: Expr }[]; defEnv: Env }
+  | { tag: 'record'; typeId: symbol; typeName: string; fields: Map<string, Value> };
 
 function isTruthy(v: Value): boolean {
   return !(v.tag === 'boolean' && v.value === false);
@@ -310,6 +311,7 @@ function displayValue(v: Value): string {
     case 'continuation': return '#<continuation>';
     case 'macro': return '#<macro>';
     case 'vector': return `#(${v.items.map(displayValue).join(' ')})`;
+    case 'record': return `#<record:${v.typeName}>`;
   }
 }
 
@@ -1506,6 +1508,70 @@ function evaluate(expr: Expr, env: Env): Value {
               macroRules.push({ pattern: rule.items[0], template: rule.items[1] });
             }
             env.define(dsName.name, { tag: 'macro', literals: lits, rules: macroRules, defEnv: env });
+            return { tag: 'nil' };
+          }
+
+          case 'define-record-type': {
+            // (define-record-type <name> (constructor field...) predicate (field accessor)...)
+            if (items.length < 4) throw new EvalError(`${fmtPos(expr.pos)}: define-record-type: bad syntax`);
+            const typeNameExpr = items[1];
+            if (typeNameExpr.tag !== 'symbol') throw new EvalError(`${fmtPos(expr.pos)}: define-record-type: expected type name`);
+            const typeName = typeNameExpr.name;
+            const typeId = Symbol(typeName);
+
+            const ctorExpr = items[2];
+            if (ctorExpr.tag !== 'list' || ctorExpr.items.length < 1)
+              throw new EvalError(`${fmtPos(expr.pos)}: define-record-type: bad constructor`);
+            const ctorName = ctorExpr.items[0];
+            if (ctorName.tag !== 'symbol') throw new EvalError(`${fmtPos(expr.pos)}: define-record-type: expected constructor name`);
+            const ctorFields = ctorExpr.items.slice(1).map(f => {
+              if (f.tag !== 'symbol') throw new EvalError(`${fmtPos(expr.pos)}: define-record-type: expected field name`);
+              return f.name;
+            });
+
+            const predExpr = items[3];
+            if (predExpr.tag !== 'symbol') throw new EvalError(`${fmtPos(expr.pos)}: define-record-type: expected predicate name`);
+
+            // Parse field accessors
+            const fieldAccessors: { field: string; accessor: string }[] = [];
+            for (let fi = 4; fi < items.length; fi++) {
+              const fieldSpec = items[fi];
+              if (fieldSpec.tag !== 'list' || fieldSpec.items.length < 2)
+                throw new EvalError(`${fmtPos(expr.pos)}: define-record-type: bad field spec`);
+              const fname = fieldSpec.items[0];
+              const facc = fieldSpec.items[1];
+              if (fname.tag !== 'symbol' || facc.tag !== 'symbol')
+                throw new EvalError(`${fmtPos(expr.pos)}: define-record-type: expected symbols in field spec`);
+              fieldAccessors.push({ field: fname.name, accessor: facc.name });
+            }
+
+            // Define constructor
+            env.define(ctorName.name, { tag: 'builtin', name: ctorName.name, fn(args: Value[]): Value {
+              if (args.length !== ctorFields.length)
+                throw new EvalError(`${ctorName.name}: expected ${ctorFields.length} arguments, got ${args.length}`);
+              const fields = new Map<string, Value>();
+              for (let i = 0; i < ctorFields.length; i++) {
+                fields.set(ctorFields[i], args[i]);
+              }
+              return { tag: 'record', typeId, typeName, fields };
+            }});
+
+            // Define predicate
+            env.define(predExpr.name, { tag: 'builtin', name: predExpr.name, fn(args: Value[]): Value {
+              if (args.length !== 1) throw new EvalError(`${predExpr.name}: expected 1 argument`);
+              return { tag: 'boolean', value: args[0].tag === 'record' && args[0].typeId === typeId };
+            }});
+
+            // Define field accessors
+            for (const { field, accessor } of fieldAccessors) {
+              env.define(accessor, { tag: 'builtin', name: accessor, fn(args: Value[]): Value {
+                if (args.length !== 1) throw new EvalError(`${accessor}: expected 1 argument`);
+                if (args[0].tag !== 'record' || args[0].typeId !== typeId)
+                  throw new EvalError(`${accessor}: expected ${typeName}`);
+                return args[0].fields.get(field)!;
+              }});
+            }
+
             return { tag: 'nil' };
           }
 
