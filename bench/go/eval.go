@@ -7,62 +7,121 @@ import (
 )
 
 func Eval(expr *Expr, env *Env) (*Value, error) {
-	switch expr.Type {
-	case ExprInteger:
-		return IntegerValue(expr.IntVal), nil
-	case ExprBoolean:
-		return BooleanValue(expr.BoolVal), nil
-	case ExprString:
-		return StringValue(expr.StrVal), nil
-	case ExprChar:
-		return CharValue(rune(expr.IntVal)), nil
-	case ExprSymbol:
-		val, ok := env.Get(expr.StrVal)
-		if !ok {
-			return nil, errAtf(expr, "unbound variable: %s", expr.StrVal)
+	for {
+		switch expr.Type {
+		case ExprInteger:
+			return IntegerValue(expr.IntVal), nil
+		case ExprBoolean:
+			return BooleanValue(expr.BoolVal), nil
+		case ExprString:
+			return StringValue(expr.StrVal), nil
+		case ExprChar:
+			return CharValue(rune(expr.IntVal)), nil
+		case ExprSymbol:
+			val, ok := env.Get(expr.StrVal)
+			if !ok {
+				return nil, errAtf(expr, "unbound variable: %s", expr.StrVal)
+			}
+			return val, nil
+		case ExprList:
+			if len(expr.List) == 0 {
+				return nil, errAt(expr, "empty application")
+			}
+			newExpr, newEnv, val, err, isTail := evalListTCO(expr, env)
+			if err != nil {
+				return nil, err
+			}
+			if !isTail {
+				return val, nil
+			}
+			expr = newExpr
+			env = newEnv
+			continue
+		default:
+			return nil, errAtf(expr, "unknown expression type")
 		}
-		return val, nil
-	case ExprList:
-		if len(expr.List) == 0 {
-			return nil, errAt(expr, "empty application")
-		}
-		return evalList(expr, env)
-	default:
-		return nil, errAtf(expr, "unknown expression type")
 	}
 }
 
-func evalList(expr *Expr, env *Env) (*Value, error) {
+// evalListTCO returns (tailExpr, tailEnv, value, error, isTailCall).
+// If isTailCall is true, the caller should loop with tailExpr/tailEnv.
+// If isTailCall is false, value is the result.
+func evalListTCO(expr *Expr, env *Env) (*Expr, *Env, *Value, error, bool) {
 	head := expr.List[0]
 
 	// Handle special forms
 	if head.Type == ExprSymbol {
 		switch head.StrVal {
 		case "and":
-			return evalAnd(expr, env)
+			e, ev, v, err := evalAndTCO(expr, env)
+			if err != nil {
+				return nil, nil, nil, err, false
+			}
+			if e != nil {
+				return e, ev, nil, nil, true
+			}
+			return nil, nil, v, nil, false
 		case "or":
-			return evalOr(expr, env)
+			e, ev, v, err := evalOrTCO(expr, env)
+			if err != nil {
+				return nil, nil, nil, err, false
+			}
+			if e != nil {
+				return e, ev, nil, nil, true
+			}
+			return nil, nil, v, nil, false
 		case "define":
-			return evalDefine(expr, env)
+			v, err := evalDefine(expr, env)
+			return nil, nil, v, err, false
 		case "if":
-			return evalIf(expr, env)
+			e, ev, v, err := evalIfTCO(expr, env)
+			if err != nil {
+				return nil, nil, nil, err, false
+			}
+			if e != nil {
+				return e, ev, nil, nil, true
+			}
+			return nil, nil, v, nil, false
 		case "quote":
-			return evalQuote(expr, env)
+			v, err := evalQuote(expr, env)
+			return nil, nil, v, err, false
 		case "lambda":
-			return evalLambda(expr, env)
+			v, err := evalLambda(expr, env)
+			return nil, nil, v, err, false
 		case "let":
-			return evalLet(expr, env)
+			e, ev, v, err := evalLetTCO(expr, env)
+			if err != nil {
+				return nil, nil, nil, err, false
+			}
+			if e != nil {
+				return e, ev, nil, nil, true
+			}
+			return nil, nil, v, nil, false
 		case "begin":
-			return evalBegin(expr, env)
+			e, ev, v, err := evalBeginTCO(expr.List[1:], env)
+			if err != nil {
+				return nil, nil, nil, err, false
+			}
+			if e != nil {
+				return e, ev, nil, nil, true
+			}
+			return nil, nil, v, nil, false
 		case "cond":
-			return evalCond(expr, env)
+			e, ev, v, err := evalCondTCO(expr, env)
+			if err != nil {
+				return nil, nil, nil, err, false
+			}
+			if e != nil {
+				return e, ev, nil, nil, true
+			}
+			return nil, nil, v, nil, false
 		}
 	}
 
 	// Function application
 	op, err := Eval(head, env)
 	if err != nil {
-		return nil, err
+		return nil, nil, nil, err, false
 	}
 
 	// Evaluate arguments
@@ -70,22 +129,27 @@ func evalList(expr *Expr, env *Env) (*Value, error) {
 	for i, argExpr := range expr.List[1:] {
 		val, err := Eval(argExpr, env)
 		if err != nil {
-			return nil, err
+			return nil, nil, nil, err, false
 		}
 		args[i] = val
 	}
 
-	return applyFunc(op, args, expr, env)
+	return applyFuncTCO(op, args, expr, env)
 }
 
-func applyFunc(op *Value, args []*Value, expr *Expr, env *Env) (*Value, error) {
+// applyFuncTCO returns a tail-call or a value.
+func applyFuncTCO(op *Value, args []*Value, expr *Expr, env *Env) (*Expr, *Env, *Value, error, bool) {
 	if op.Type == TypeLambda {
-		return applyLambda(op, args, expr)
+		return applyLambdaTCO(op, args, expr)
 	}
 	if op.Type != TypeSymbol || len(op.StrVal) < 10 || op.StrVal[:10] != "__builtin:" {
-		return nil, errAtf(expr, "not a procedure")
+		return nil, nil, nil, errAtf(expr, "not a procedure"), false
 	}
-	name := op.StrVal[10:]
+	v, err := applyBuiltin(op.StrVal[10:], args, expr, env)
+	return nil, nil, v, err, false
+}
+
+func applyBuiltin(name string, args []*Value, expr *Expr, env *Env) (*Value, error) {
 
 	switch name {
 	case "+":
@@ -405,38 +469,42 @@ func builtinCmp(args []*Value, expr *Expr, cmp func(int64, int64) bool) (*Value,
 	return True, nil
 }
 
-func evalAnd(expr *Expr, env *Env) (*Value, error) {
+// evalAndTCO returns (tailExpr, tailEnv, value, error). tailExpr != nil means tail call.
+func evalAndTCO(expr *Expr, env *Env) (*Expr, *Env, *Value, error) {
 	if len(expr.List) == 1 {
-		return True, nil
+		return nil, nil, True, nil
 	}
-	var result *Value = True
-	for _, e := range expr.List[1:] {
-		var err error
-		result, err = Eval(e, env)
-		if err != nil {
-			return nil, err
-		}
-		if !result.IsTruthy() {
-			return result, nil
-		}
-	}
-	return result, nil
-}
-
-func evalOr(expr *Expr, env *Env) (*Value, error) {
-	if len(expr.List) == 1 {
-		return False, nil
-	}
-	for _, e := range expr.List[1:] {
+	// Evaluate all but the last
+	for _, e := range expr.List[1 : len(expr.List)-1] {
 		result, err := Eval(e, env)
 		if err != nil {
-			return nil, err
+			return nil, nil, nil, err
 		}
-		if result.IsTruthy() {
-			return result, nil
+		if !result.IsTruthy() {
+			return nil, nil, result, nil
 		}
 	}
-	return False, nil
+	// Last expression is in tail position
+	return expr.List[len(expr.List)-1], env, nil, nil
+}
+
+// evalOrTCO returns (tailExpr, tailEnv, value, error). tailExpr != nil means tail call.
+func evalOrTCO(expr *Expr, env *Env) (*Expr, *Env, *Value, error) {
+	if len(expr.List) == 1 {
+		return nil, nil, False, nil
+	}
+	// Evaluate all but the last
+	for _, e := range expr.List[1 : len(expr.List)-1] {
+		result, err := Eval(e, env)
+		if err != nil {
+			return nil, nil, nil, err
+		}
+		if result.IsTruthy() {
+			return nil, nil, result, nil
+		}
+	}
+	// Last expression is in tail position
+	return expr.List[len(expr.List)-1], env, nil, nil
 }
 
 func evalDefine(expr *Expr, env *Env) (*Value, error) {
@@ -475,21 +543,21 @@ func evalDefine(expr *Expr, env *Env) (*Value, error) {
 	return nil, errAt(target, "define: invalid syntax")
 }
 
-func evalIf(expr *Expr, env *Env) (*Value, error) {
+func evalIfTCO(expr *Expr, env *Env) (*Expr, *Env, *Value, error) {
 	if len(expr.List) < 3 || len(expr.List) > 4 {
-		return nil, errAt(expr, "if: expected 2 or 3 arguments")
+		return nil, nil, nil, errAt(expr, "if: expected 2 or 3 arguments")
 	}
 	cond, err := Eval(expr.List[1], env)
 	if err != nil {
-		return nil, err
+		return nil, nil, nil, err
 	}
 	if cond.IsTruthy() {
-		return Eval(expr.List[2], env)
+		return expr.List[2], env, nil, nil
 	}
 	if len(expr.List) == 4 {
-		return Eval(expr.List[3], env)
+		return expr.List[3], env, nil, nil
 	}
-	return Void, nil
+	return nil, nil, Void, nil
 }
 
 func evalQuote(expr *Expr, env *Env) (*Value, error) {
@@ -553,106 +621,163 @@ func evalLambda(expr *Expr, env *Env) (*Value, error) {
 	}, nil
 }
 
-func applyLambda(fn *Value, args []*Value, expr *Expr) (*Value, error) {
+// applyLambdaTCO sets up the lambda env and returns a tail call to its last body expr.
+func applyLambdaTCO(fn *Value, args []*Value, expr *Expr) (*Expr, *Env, *Value, error, bool) {
 	if len(args) != len(fn.Params) {
-		return nil, errAtf(expr, "expected %d arguments, got %d", len(fn.Params), len(args))
+		return nil, nil, nil, errAtf(expr, "expected %d arguments, got %d", len(fn.Params), len(args)), false
 	}
 	localEnv := NewEnv(fn.Closure)
 	for i, param := range fn.Params {
 		localEnv.Set(param, args[i])
 	}
-	var result *Value
-	var err error
-	for _, bodyExpr := range fn.Body {
-		result, err = Eval(bodyExpr, localEnv)
+	// Evaluate all but last body expression
+	for _, bodyExpr := range fn.Body[:len(fn.Body)-1] {
+		_, err := Eval(bodyExpr, localEnv)
 		if err != nil {
-			return nil, err
+			return nil, nil, nil, err, false
 		}
 	}
-	return result, nil
+	// Tail call to last body expression
+	return fn.Body[len(fn.Body)-1], localEnv, nil, nil, true
 }
 
-func evalLet(expr *Expr, env *Env) (*Value, error) {
+func evalLetTCO(expr *Expr, env *Env) (*Expr, *Env, *Value, error) {
 	if len(expr.List) < 3 {
-		return nil, errAt(expr, "let: expected at least 2 arguments")
+		return nil, nil, nil, errAt(expr, "let: expected at least 2 arguments")
 	}
+
+	// Named let: (let name ((var init) ...) body...)
+	if expr.List[1].Type == ExprSymbol {
+		return evalNamedLetTCO(expr, env)
+	}
+
 	bindings := expr.List[1]
 	if bindings.Type != ExprList {
-		return nil, errAt(bindings, "let: bindings must be a list")
+		return nil, nil, nil, errAt(bindings, "let: bindings must be a list")
 	}
 	localEnv := NewEnv(env)
 	for _, b := range bindings.List {
 		if b.Type != ExprList || len(b.List) != 2 {
-			return nil, errAt(b, "let: invalid binding")
+			return nil, nil, nil, errAt(b, "let: invalid binding")
 		}
 		if b.List[0].Type != ExprSymbol {
-			return nil, errAt(b.List[0], "let: binding name must be a symbol")
+			return nil, nil, nil, errAt(b.List[0], "let: binding name must be a symbol")
 		}
 		val, err := Eval(b.List[1], env)
 		if err != nil {
-			return nil, err
+			return nil, nil, nil, err
 		}
 		localEnv.Set(b.List[0].StrVal, val)
 	}
-	var result *Value
-	var err error
-	for _, bodyExpr := range expr.List[2:] {
-		result, err = Eval(bodyExpr, localEnv)
+	body := expr.List[2:]
+	// Evaluate all but last
+	for _, bodyExpr := range body[:len(body)-1] {
+		_, err := Eval(bodyExpr, localEnv)
 		if err != nil {
-			return nil, err
+			return nil, nil, nil, err
 		}
 	}
-	return result, nil
+	// Tail call to last body expression
+	return body[len(body)-1], localEnv, nil, nil
 }
 
-func evalBegin(expr *Expr, env *Env) (*Value, error) {
-	if len(expr.List) < 2 {
-		return Void, nil
+func evalNamedLetTCO(expr *Expr, env *Env) (*Expr, *Env, *Value, error) {
+	name := expr.List[1].StrVal
+	bindingsExpr := expr.List[2]
+	if bindingsExpr.Type != ExprList {
+		return nil, nil, nil, errAt(bindingsExpr, "let: bindings must be a list")
 	}
-	var result *Value
-	var err error
-	for _, e := range expr.List[1:] {
-		result, err = Eval(e, env)
+	// Extract parameter names and initial values
+	params := make([]string, len(bindingsExpr.List))
+	initVals := make([]*Value, len(bindingsExpr.List))
+	for i, b := range bindingsExpr.List {
+		if b.Type != ExprList || len(b.List) != 2 {
+			return nil, nil, nil, errAt(b, "let: invalid binding")
+		}
+		if b.List[0].Type != ExprSymbol {
+			return nil, nil, nil, errAt(b.List[0], "let: binding name must be a symbol")
+		}
+		params[i] = b.List[0].StrVal
+		val, err := Eval(b.List[1], env)
 		if err != nil {
-			return nil, err
+			return nil, nil, nil, err
+		}
+		initVals[i] = val
+	}
+	// Create a lambda for the named let
+	body := expr.List[3:]
+	lambda := &Value{
+		Type:    TypeLambda,
+		Params:  params,
+		Body:    body,
+		Closure: env,
+	}
+	// Bind the name in the lambda's closure so it can recurse
+	localEnv := NewEnv(env)
+	localEnv.Set(name, lambda)
+	lambda.Closure = localEnv
+
+	// Now apply it with initial values
+	callEnv := NewEnv(localEnv)
+	for i, p := range params {
+		callEnv.Set(p, initVals[i])
+	}
+	// Evaluate all but last body
+	for _, bodyExpr := range body[:len(body)-1] {
+		_, err := Eval(bodyExpr, callEnv)
+		if err != nil {
+			return nil, nil, nil, err
 		}
 	}
-	return result, nil
+	return body[len(body)-1], callEnv, nil, nil
 }
 
-func evalCond(expr *Expr, env *Env) (*Value, error) {
+// evalBeginTCO takes a slice of body expressions (not including the 'begin' keyword).
+func evalBeginTCO(body []*Expr, env *Env) (*Expr, *Env, *Value, error) {
+	if len(body) == 0 {
+		return nil, nil, Void, nil
+	}
+	for _, e := range body[:len(body)-1] {
+		_, err := Eval(e, env)
+		if err != nil {
+			return nil, nil, nil, err
+		}
+	}
+	return body[len(body)-1], env, nil, nil
+}
+
+func evalCondTCO(expr *Expr, env *Env) (*Expr, *Env, *Value, error) {
 	for _, clause := range expr.List[1:] {
 		if clause.Type != ExprList || len(clause.List) < 2 {
-			return nil, errAt(clause, "cond: invalid clause")
+			return nil, nil, nil, errAt(clause, "cond: invalid clause")
 		}
 		// Check for else clause
 		if clause.List[0].Type == ExprSymbol && clause.List[0].StrVal == "else" {
-			var result *Value
-			var err error
-			for _, e := range clause.List[1:] {
-				result, err = Eval(e, env)
+			body := clause.List[1:]
+			for _, e := range body[:len(body)-1] {
+				_, err := Eval(e, env)
 				if err != nil {
-					return nil, err
+					return nil, nil, nil, err
 				}
 			}
-			return result, nil
+			return body[len(body)-1], env, nil, nil
 		}
 		test, err := Eval(clause.List[0], env)
 		if err != nil {
-			return nil, err
+			return nil, nil, nil, err
 		}
 		if test.IsTruthy() {
-			var result *Value
-			for _, e := range clause.List[1:] {
-				result, err = Eval(e, env)
+			body := clause.List[1:]
+			for _, e := range body[:len(body)-1] {
+				_, err := Eval(e, env)
 				if err != nil {
-					return nil, err
+					return nil, nil, nil, err
 				}
 			}
-			return result, nil
+			return body[len(body)-1], env, nil, nil
 		}
 	}
-	return Void, nil
+	return nil, nil, Void, nil
 }
 
 func makeDefaultEnv() *Env {
