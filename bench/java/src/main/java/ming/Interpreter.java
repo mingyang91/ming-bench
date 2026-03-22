@@ -475,7 +475,18 @@ public class Interpreter {
             return new SchemeValue.StringVal(requireString(args.getFirst(), "string-downcase").toLowerCase());
         });
         builtin("string-set!", args -> {
-            throw new EvalError("string-set!: strings are immutable");
+            if (args.size() != 3) throw new EvalError("string-set!: expected 3 arguments");
+            if (args.getFirst() instanceof SchemeValue.MutableStringVal ms) {
+                int idx = (int) requireInt(args.get(1));
+                if (!(args.get(2) instanceof SchemeValue.CharVal ch))
+                    throw new EvalError("string-set!: third argument must be a character");
+                ms.chars().setCharAt(idx, ch.value());
+                return new SchemeValue.VoidVal();
+            } else if (args.getFirst() instanceof SchemeValue.StringVal) {
+                throw new EvalError("string-set!: strings are immutable");
+            } else {
+                throw new EvalError("string-set!: first argument must be a string");
+            }
         });
         builtin("string->list", args -> {
             if (args.size() != 1) throw new EvalError("string->list: expected 1 argument");
