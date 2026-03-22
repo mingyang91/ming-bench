@@ -16,6 +16,7 @@ enum SchemeValue:
     closure: Map[String, SchemeValue],
     selfName: Option[String] = None
   )
+  case Cell(content: Array[SchemeValue])
   case Void
 
   /** write-style display (strings get quotes) — used for evalStr results. */
@@ -29,6 +30,7 @@ enum SchemeValue:
     case ListVal(es, _)       => "(" + es.map(_.display).mkString(" ") + ")"
     case p: PairVal           => "(" + displayPairInner(p) + ")"
     case _: LambdaVal         => "#<procedure>"
+    case Cell(arr)            => arr(0).display
     case Void                 => ""
 
   /** display-style output (strings without quotes). */
@@ -36,10 +38,12 @@ enum SchemeValue:
     case StringVal(s)         => s
     case MutableStringVal(cs) => String(cs)
     case CharVal(c)           => c.toString
+    case Cell(arr)            => arr(0).displayOut
     case other                => other.display
 
   def isTruthy: Boolean = this match
     case BoolVal(false) => false
+    case Cell(arr)      => arr(0).isTruthy
     case _              => true
 
   private def displayPairInner(p: PairVal): String =

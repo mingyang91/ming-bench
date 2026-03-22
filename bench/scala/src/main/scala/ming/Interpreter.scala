@@ -18,11 +18,11 @@ object Interpreter:
       case IntVal(_) | BoolVal(_) | StringVal(_) | MutableStringVal(_) | CharVal(_) | Void =>
         (expr, env, "")
       case SymbolVal(name, pos) =>
-        val v = env.getOrElse(
+        val raw = env.getOrElse(
           name,
           throw new EvalError(s"unbound variable: $name${fmtPos(pos)}")
         )
-        (v, env, "")
+        (deref(raw), env, "")
       case ListVal(Nil, _) => (expr, env, "")
 
       // quote
@@ -34,6 +34,10 @@ object Interpreter:
       // define
       case ListVal(SymbolVal("define", _) :: rest, pos) =>
         evalDefine(rest, pos, env)
+
+      // set!
+      case ListVal(SymbolVal("set!", _) :: SymbolVal(name, namePos) :: value :: Nil, _) =>
+        evalSetBang(name, namePos, value, env)
 
       // lambda
       case ListVal(SymbolVal("lambda", _) :: ListVal(params, _) :: body, _) =>
@@ -85,6 +89,23 @@ object Interpreter:
         else (Void, env, o1)
       case _ => throw new EvalError(s"if: bad syntax${fmtPos(pos)}")
 
+  private def evalSetBang(
+    name: String,
+    namePos: Option[(Int, Int)],
+    valueExpr: SchemeValue,
+    env: Env
+  ): (SchemeValue, Env, Output) =
+    val cell = env.getOrElse(
+      name,
+      throw new EvalError(s"set!: unbound variable: $name${fmtPos(namePos)}")
+    )
+    val (v, _, o) = eval(valueExpr, env)
+    cell match
+      case Cell(arr) =>
+        arr(0) = v
+        (Void, env, o)
+      case _ => throw new EvalError(s"set!: invalid binding for $name")
+
   private[ming] def evalDefine(
     rest: List[SchemeValue],
     pos: Option[(Int, Int)],
@@ -97,10 +118,10 @@ object Interpreter:
           case LambdaVal(params, body, closure, _) =>
             LambdaVal(params, body, closure, Some(name))
           case other => other
-        (Void, env + (name -> bound), o)
+        (Void, env + (name -> makeCell(bound)), o)
       case ListVal(SymbolVal(name, _) :: params, _) :: body =>
         val lambda = LambdaVal(extractParams(params), body, env, Some(name))
-        (Void, env + (name -> lambda), "")
+        (Void, env + (name -> makeCell(lambda)), "")
       case _ => throw new EvalError(s"define: bad syntax${fmtPos(pos)}")
 
   private def evalApplication(
@@ -170,8 +191,8 @@ object Interpreter:
             s"wrong number of arguments: expected ${params.length}, got ${args.length}"
           )
         val merged      = callingEnv ++ closure
-        val envWithSelf = selfName.fold(merged)(n => merged + (n -> lam))
-        val localEnv    = envWithSelf ++ params.zip(args).toMap
+        val envWithSelf = selfName.fold(merged)(n => merged + (n -> makeCell(lam)))
+        val localEnv    = envWithSelf ++ params.zip(args).map((p, a) => p -> makeCell(a)).toMap
         TailEval.evalBodyTail(body, localEnv)
       case SymbolVal(name, _) =>
         val (rv, o) = Builtins.applyBuiltin(name, args)
@@ -195,7 +216,7 @@ object Interpreter:
     env: Env
   ): (Env, Output) =
     val names               = defines.map(extractDefineName)
-    val envWithPlaceholders = names.foldLeft(env)((e, n) => e + (n -> Void))
+    val envWithPlaceholders = names.foldLeft(env)((e, n) => e + (n -> makeCell(Void)))
     val (envAfterDefs, o) =
       defines.foldLeft((envWithPlaceholders, "")) { case ((e, o), d) =>
         val (_, newE, dOut) = eval(d, e)
@@ -203,9 +224,13 @@ object Interpreter:
       }
     val finalEnv = names.foldLeft(envAfterDefs) { (e, name) =>
       e(name) match
-        case LambdaVal(params, body, closure, selfName) =>
-          val updatedClosure = closure ++ names.map(n => n -> e(n)).toMap
-          e + (name -> LambdaVal(params, body, updatedClosure, selfName))
+        case Cell(arr) =>
+          arr(0) match
+            case LambdaVal(params, body, closure, selfName) =>
+              val updatedClosure = closure ++ names.map(n => n -> e(n)).toMap
+              arr(0) = LambdaVal(params, body, updatedClosure, selfName)
+              e
+            case _ => e
         case _ => e
     }
     (finalEnv, o)

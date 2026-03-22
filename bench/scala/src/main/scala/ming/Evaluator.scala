@@ -67,4 +67,4 @@ object Evaluator:
   )
 
   private val builtinEnv: Map[String, SchemeValue] =
-    builtinNames.map(n => n -> SchemeValue.SymbolVal(n)).toMap
+    builtinNames.map(n => n -> SchemeValue.Cell(Array(SchemeValue.SymbolVal(n)))).toMap

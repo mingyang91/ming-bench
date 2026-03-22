@@ -16,6 +16,17 @@ private[ming] object TailEval:
       case ListVal(SymbolVal("define", _) :: rest, pos) =>
         val (v, _, o) = Interpreter.evalDefine(rest, pos, env)
         Value(v, o)
+      case ListVal(SymbolVal("set!", _) :: SymbolVal(name, namePos) :: value :: Nil, _) =>
+        val cell = env.getOrElse(
+          name,
+          throw new EvalError(s"set!: unbound variable: $name${fmtPos(namePos)}")
+        )
+        val (v, _, o) = Interpreter.eval(value, env)
+        cell match
+          case Cell(arr) =>
+            arr(0) = v
+            Value(Void, o)
+          case _ => throw new EvalError(s"set!: invalid binding for $name")
       case ListVal(SymbolVal("lambda", _) :: ListVal(params, _) :: body, _) =>
         Value(LambdaVal(extractParams(params), body, env), "")
 
@@ -127,7 +138,7 @@ private[ming] object TailEval:
             binding match
               case ListVal(SymbolVal(name, _) :: valExpr :: Nil, _) =>
                 val (v, _, vo) = Interpreter.eval(valExpr, env)
-                (e + (name -> v), o + vo)
+                (e + (name -> makeCell(v)), o + vo)
               case _ => throw new EvalError("invalid let binding")
           }
         prependOutput(evalBodyTail(body, letEnv), bindOutput)

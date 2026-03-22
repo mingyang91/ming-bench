@@ -21,6 +21,12 @@ object InterpreterUtils:
     case ListVal(SymbolVal("define", _) :: _, _) => true
     case _                                       => false
 
+  def makeCell(v: SchemeValue): Cell = Cell(Array(v))
+
+  def deref(v: SchemeValue): SchemeValue = v match
+    case Cell(arr) => arr(0)
+    case other     => other
+
   def extractDefineName(expr: SchemeValue): String = expr match
     case ListVal(SymbolVal("define", _) :: SymbolVal(name, _) :: _, _) => name
     case ListVal(
