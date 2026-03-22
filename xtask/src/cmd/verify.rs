@@ -27,8 +27,6 @@ const CHEZ_PREAMBLE: &str = r#"
 /// Tests to skip in Chez verification.
 fn should_skip(test_name: &str) -> Option<&'static str> {
     match test_name {
-        // procedure-name is our custom feature, not in R7RS/R6RS
-        n if n.starts_with("l25_procedure_name") => Some("custom feature (not in R7RS)"),
         // Chez allows string-set! (R6RS: strings are mutable; R7RS: immutable)
         "l14_string_set_error" => Some("Chez strings are mutable (R6RS)"),
         // Chez allows set! on unbound vars at all scopes

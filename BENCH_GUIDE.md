@@ -99,7 +99,7 @@ cargo xtask results
 
 ### Full Mode (default)
 
-One agent session tackles all 27 levels. Simple, but if the agent gets stuck it may burn budget.
+One agent session tackles all 26 levels. Simple, but if the agent gets stuck it may burn budget.
 
 ```bash
 cargo xtask run-agent --name claude-r1 --mode full
@@ -132,7 +132,7 @@ Benefits:
 | L16-L18 | dynamic-wind/guard/values | 60 |
 | L19-L20 | Rationals/Records | 75 |
 | L21-L23 | Pair Mutation/syntax-case/Final Integration | 90 |
-| L24-L27 | Tech-debt: case-lambda/procedure-name/procedure?/do | 60 |
+| L24-L26 | Tech-debt: case-lambda/procedure?/do | 60 |
 
 Override with `--max-turns N`. Quality-gate cleanup pass: 15 turns. Regression fix-it pass: 15 turns.
 

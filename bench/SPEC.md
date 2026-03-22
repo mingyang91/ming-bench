@@ -101,11 +101,8 @@ Combined use of all features: dynamic-wind + guard for resource cleanup on excep
 ### Level 24 — case-lambda
 `case-lambda` creates a procedure with multiple clauses, each with different arity. When called, the clause matching the argument count is selected. Supports rest parameters with dot notation in individual clauses. `(procedure? (case-lambda ...))` returns `#t`. Wrong arity (no matching clause) raises an error. Works with `apply`, higher-order functions, and recursion.
 
-### Level 25 — procedure-name
-`procedure-name` returns the name of a procedure as a symbol, or `#f` if anonymous. `(define (f x) x)` then `(procedure-name f)` → `f` (a symbol). `(procedure-name (lambda (x) x))` → `#f`. `(define g (lambda (x) x))` then `(procedure-name g)` → `g` — the name propagates from `define` to the lambda it binds. `case-lambda` procedures also carry names from `define`. Builtin procedures have names: `(symbol? (procedure-name +))` → `#t`.
-
-### Level 26 — procedure? on all callable types
+### Level 25 — procedure? on all callable types
 `procedure?` must return `#t` for every callable value: regular lambdas, `case-lambda` procedures (from L24), builtin procedures, and continuations captured by `call/cc`. It returns `#f` for all non-callable values (numbers, strings, booleans, lists, vectors, etc.).
 
-### Level 27 — do Loops
+### Level 26 — do Loops
 `(do ((var init step) ...) (test expr ...) body ...)` is an iteration construct. Variables are bound to their init values, then on each iteration all step expressions are evaluated using the *previous* iteration's values (parallel update, like `let` not `let*`). When test is true, the expr values are evaluated and the last is returned. Variables with no step expression keep their value across iterations.
