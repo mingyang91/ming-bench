@@ -129,6 +129,7 @@ struct Expr {
 enum ExprKind {
     Integer(i64),
     Boolean(bool),
+    Char(char),
     String(String),
     Symbol(String),
     List(Vec<Expr>),
@@ -245,6 +246,16 @@ fn parse_atom(token: &str, span: Span) -> Expr {
         ExprKind::Boolean(true)
     } else if token == "#f" {
         ExprKind::Boolean(false)
+    } else if token.starts_with("#\\") {
+        let ch_str = &token[2..];
+        let ch = match ch_str {
+            "space" => ' ',
+            "newline" => '\n',
+            "tab" => '\t',
+            s if s.len() == 1 => s.chars().next().unwrap(),
+            _ => return Expr { kind: ExprKind::Symbol(token.into()), span },
+        };
+        ExprKind::Char(ch)
     } else if token.starts_with('"') && token.ends_with('"') {
         let inner = &token[1..token.len() - 1];
         ExprKind::String(inner.into())
@@ -272,6 +283,7 @@ fn expr_to_value(expr: &Expr) -> Value {
     match &expr.kind {
         ExprKind::Integer(n) => Value::Integer(*n),
         ExprKind::Boolean(b) => Value::Boolean(*b),
+        ExprKind::Char(c) => Value::Char(*c),
         ExprKind::String(s) => Value::String(s.clone()),
         ExprKind::Symbol(s) => Value::Symbol(s.clone()),
         ExprKind::List(items) => Value::List(items.iter().map(expr_to_value).collect()),
@@ -283,6 +295,7 @@ fn eval(expr: &Expr, env: &Env, out: &Output) -> Result<Value, EvalError> {
     match &expr.kind {
         ExprKind::Integer(n) => Ok(Value::Integer(*n)),
         ExprKind::Boolean(b) => Ok(Value::Boolean(*b)),
+        ExprKind::Char(c) => Ok(Value::Char(*c)),
         ExprKind::String(s) => Ok(Value::String(s.clone())),
         ExprKind::Symbol(name) => {
             env_get(env, name).ok_or_else(|| EvalError::UnboundVariable(span.fmt(name)))
@@ -331,6 +344,8 @@ fn eval(expr: &Expr, env: &Env, out: &Output) -> Result<Value, EvalError> {
                         }
                         return Ok(result);
                     }
+                    "set!" => return eval_set(&items[1..], env, span, out),
+                    "string-set!" => return eval_string_set(&items[1..], env, span, out),
                     "display" => {
                         if items.len() != 2 {
                             return Err(EvalError::Arity(span.fmt("display requires 1 argument")));
@@ -359,7 +374,7 @@ fn eval(expr: &Expr, env: &Env, out: &Output) -> Result<Value, EvalError> {
                     | "string-append" | "string-length" | "substring"
                     | "string->number" | "number->string"
                     | "symbol->string" | "string->symbol"
-                    | "string-ref"
+                    | "string-ref" | "string-copy"
                     | "+" | "-" | "*" | "/" | "<" | ">" | "=" | "<=" | ">=" | "not" => {
                         let args: Vec<Value> = items[1..].iter().map(|a| eval(a, env, out)).collect::<Result<_, _>>()?;
                         return eval_builtin(op, &args, span);
@@ -495,6 +510,76 @@ fn eval_cond(clauses: &[Expr], env: &Env, span: Span, out: &Output) -> Result<Va
     }
     let _ = span;
     Ok(Value::Boolean(false))
+}
+
+fn eval_set(args: &[Expr], env: &Env, span: Span, out: &Output) -> Result<Value, EvalError> {
+    if args.len() != 2 {
+        return Err(EvalError::Arity(span.fmt("set! requires 2 arguments")));
+    }
+    let name = match &args[0].kind {
+        ExprKind::Symbol(s) => s.clone(),
+        _ => return Err(EvalError::Type(span.fmt("set!: expected symbol"))),
+    };
+    let val = eval(&args[1], env, out)?;
+    fn env_update(env: &Env, name: &str, val: Value) -> Result<(), ()> {
+        let mut inner = env.borrow_mut();
+        if inner.bindings.contains_key(name) {
+            inner.bindings.insert(name.to_string(), val);
+            Ok(())
+        } else if let Some(ref parent) = inner.parent {
+            env_update(parent, name, val)
+        } else {
+            Err(())
+        }
+    }
+    env_update(env, &name, val).map_err(|_| EvalError::UnboundVariable(span.fmt(&name)))?;
+    Ok(Value::Boolean(false))
+}
+
+fn eval_string_set(args: &[Expr], env: &Env, span: Span, out: &Output) -> Result<Value, EvalError> {
+    if args.len() != 3 {
+        return Err(EvalError::Arity(span.fmt("string-set! requires 3 arguments")));
+    }
+    let name = match &args[0].kind {
+        ExprKind::Symbol(s) => s.clone(),
+        _ => return Err(EvalError::Type(span.fmt("string-set!: expected symbol"))),
+    };
+    let idx = match eval(&args[1], env, out)? {
+        Value::Integer(n) => n as usize,
+        _ => return Err(EvalError::Type(span.fmt("string-set!: expected integer index"))),
+    };
+    let ch = match eval(&args[2], env, out)? {
+        Value::Char(c) => c,
+        _ => return Err(EvalError::Type(span.fmt("string-set!: expected char"))),
+    };
+    // Look up the string, mutate it, write it back
+    let current = env_get(env, &name).ok_or_else(|| EvalError::UnboundVariable(span.fmt(&name)))?;
+    match current {
+        Value::String(mut s) => {
+            let mut chars: Vec<char> = s.chars().collect();
+            if idx >= chars.len() {
+                return Err(EvalError::Type(span.fmt("string-set!: index out of bounds")));
+            }
+            chars[idx] = ch;
+            s = chars.into_iter().collect();
+            // Update in env
+            fn env_update(env: &Env, name: &str, val: Value) -> Result<(), ()> {
+                let mut inner = env.borrow_mut();
+                if inner.bindings.contains_key(name) {
+                    inner.bindings.insert(name.to_string(), val);
+                    Ok(())
+                } else if let Some(ref parent) = inner.parent {
+                    env_update(parent, name, val)
+                } else {
+                    Err(())
+                }
+            }
+            env_update(env, &name, Value::String(s))
+                .map_err(|_| EvalError::UnboundVariable(span.fmt(&name)))?;
+            Ok(Value::Boolean(false))
+        }
+        _ => Err(EvalError::Type(span.fmt("string-set!: expected string"))),
+    }
 }
 
 fn apply(func: &Value, args: &[Value], span: Span, out: &Output) -> Result<Value, EvalError> {
@@ -692,6 +777,13 @@ fn eval_builtin(op: &str, args: &[Value], span: Span) -> Result<Value, EvalError
             match &args[0] {
                 Value::String(s) => Ok(Value::Symbol(s.clone())),
                 _ => Err(EvalError::Type(span.fmt("string->symbol: expected string"))),
+            }
+        }
+        "string-copy" => {
+            if args.len() != 1 { return Err(EvalError::Arity(span.fmt("string-copy requires 1 argument"))); }
+            match &args[0] {
+                Value::String(s) => Ok(Value::String(s.clone())),
+                _ => Err(EvalError::Type(span.fmt("string-copy: expected string"))),
             }
         }
         "string-ref" => {
