@@ -102,12 +102,18 @@ object SchemeValue:
     override def displayOutput: String = s"(${formatElems(_.displayOutput)})"
 
     private def formatElems(fmt: SchemeValue => String): String =
+      val visited = new java.util.IdentityHashMap[SchemePair, java.lang.Boolean]()
       @scala.annotation.tailrec
       def loop(v: SchemeValue, acc: List[String]): List[String] = v match
         case SchemeList(Nil) => acc.reverse
         case SchemeList(es)  => acc.reverse ++ es.map(fmt)
-        case p: SchemePair   => loop(p.cdr, fmt(p.car) :: acc)
-        case d               => (s". ${fmt(d)}" :: acc).reverse
+        case p: SchemePair =>
+          if visited.containsKey(p) then (". ..." :: acc).reverse
+          else
+            visited.put(p, java.lang.Boolean.TRUE)
+            loop(p.cdr, fmt(p.car) :: acc)
+        case d => (s". ${fmt(d)}" :: acc).reverse
+      visited.put(this, java.lang.Boolean.TRUE)
       loop(cdr, List(fmt(car))).mkString(" ")
 
   object SchemePair:

@@ -31,7 +31,7 @@ private[ming] object CollectionBuiltins:
     val combined = args.foldLeft(List.empty[SchemeValue]) { (acc, arg) =>
       acc ++ Builtins.asList(arg)
     }
-    SchemeList(combined)
+    Builtins.toPairChain(combined)
 
   def evalLength(args: List[SchemeValue]): SchemeValue =
     if args.length != 1 then throw new EvalError("length: expected 1 argument")
@@ -60,9 +60,16 @@ private[ming] object CollectionBuiltins:
     if args.length != 2 then throw new EvalError("list-tail: expected 2 arguments")
     args(1) match
       case SchemeInt(idx) =>
-        val es = Builtins.asList(args.head)
-        if idx < 0 || idx > es.length then throw new EvalError("list-tail: index out of bounds")
-        SchemeList(es.drop(idx.toInt))
+        @scala.annotation.tailrec
+        def drop(v: SchemeValue, n: Long): SchemeValue =
+          if n == 0 then v
+          else
+            v match
+              case SchemeList(_ :: t) => drop(SchemeList(t), n - 1)
+              case p: SchemePair      => drop(p.cdr, n - 1)
+              case _                  => throw new EvalError("list-tail: index out of bounds")
+        if idx < 0 then throw new EvalError("list-tail: index out of bounds")
+        drop(args.head, idx)
       case _ => throw new EvalError("list-tail: invalid arguments")
 
   def evalListPred(args: List[SchemeValue]): SchemeValue =
@@ -85,6 +92,31 @@ private[ming] object CollectionBuiltins:
     if args.length != 2 then throw new EvalError("equal?: expected 2 arguments")
     SchemeBool(schemeEqual(args.head, args(1)))
 
+  def evalCddr(args: List[SchemeValue]): SchemeValue =
+    if args.length != 1 then throw new EvalError("cddr: expected 1 argument")
+    evalCdr(List(evalCdr(args).asInstanceOf[SchemeValue]))
+
+  def evalMemq(args: List[SchemeValue]): SchemeValue =
+    if args.length != 2 then throw new EvalError("memq: expected 2 arguments")
+    val key = args.head
+    @scala.annotation.tailrec
+    def loop(v: SchemeValue): SchemeValue = v match
+      case SchemeList(Nil) => SchemeBool(false)
+      case SchemeList(h :: t) =>
+        if schemeEq(h, key) then v else loop(SchemeList(t))
+      case p: SchemePair =>
+        if schemeEq(p.car, key) then v else loop(p.cdr)
+      case _ => SchemeBool(false)
+    loop(args(1))
+
+  def evalAssq(args: List[SchemeValue]): SchemeValue =
+    if args.length != 2 then throw new EvalError("assq: expected 2 arguments")
+    val key   = args.head
+    val alist = Builtins.asList(args(1))
+    alist
+      .collectFirst { case pair if schemeEq(listHead(pair), key) => pair }
+      .getOrElse(SchemeBool(false))
+
   def evalSetCar(args: List[SchemeValue]): SchemeValue =
     if args.length != 2 then throw new EvalError("set-car!: expected 2 arguments")
     args.head match
@@ -99,7 +131,7 @@ private[ming] object CollectionBuiltins:
 
   def evalReverse(args: List[SchemeValue]): SchemeValue =
     if args.length != 1 then throw new EvalError("reverse: expected 1 argument")
-    SchemeList(Builtins.asList(args.head).reverse)
+    Builtins.toPairChain(Builtins.asList(args.head).reverse)
 
   def evalError(args: List[SchemeValue]): SchemeValue =
     val msg = args.map(_.display).mkString(" ")
@@ -139,7 +171,7 @@ private[ming] object CollectionBuiltins:
   def evalVectorToList(args: List[SchemeValue]): SchemeValue =
     if args.length != 1 then throw new EvalError("vector->list: expected 1 argument")
     args.head match
-      case v: SchemeVector => SchemeList(v.elements.toList)
+      case v: SchemeVector => Builtins.toPairChain(v.elements.toList)
       case other           => throw new EvalError(s"vector->list: not a vector: ${other.display}")
 
   def evalListToVector(args: List[SchemeValue]): SchemeValue =
@@ -217,19 +249,29 @@ private[ming] object CollectionBuiltins:
   // --- Internal helpers ---
 
   private def isList(v: SchemeValue): Boolean =
+    val visited = new java.util.IdentityHashMap[SchemePair, java.lang.Boolean]()
     @scala.annotation.tailrec
     def loop(v: SchemeValue): Boolean = v match
       case SchemeList(_) => true
-      case p: SchemePair => loop(p.cdr)
-      case _             => false
+      case p: SchemePair =>
+        if visited.containsKey(p) then false
+        else
+          visited.put(p, java.lang.Boolean.TRUE)
+          loop(p.cdr)
+      case _ => false
     loop(v)
 
   private def toListOpt(v: SchemeValue): Option[List[SchemeValue]] =
+    val visited = new java.util.IdentityHashMap[SchemePair, java.lang.Boolean]()
     @scala.annotation.tailrec
     def loop(v: SchemeValue, acc: List[SchemeValue]): Option[List[SchemeValue]] = v match
       case SchemeList(es) => Some(acc.reverse ++ es)
-      case p: SchemePair  => loop(p.cdr, p.car :: acc)
-      case _              => None
+      case p: SchemePair =>
+        if visited.containsKey(p) then None
+        else
+          visited.put(p, java.lang.Boolean.TRUE)
+          loop(p.cdr, p.car :: acc)
+      case _ => None
     loop(v, Nil)
 
   private def listHead(v: SchemeValue): SchemeValue = v match

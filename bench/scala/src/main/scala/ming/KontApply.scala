@@ -243,7 +243,7 @@ private[ming] object KontApply:
   ): Step =
     val newAcc = accumulated :+ value
     remainingGroups match
-      case Nil => ReturnS(SchemeList(newAcc), nextK, out)
+      case Nil => ReturnS(Builtins.toPairChain(newAcc), nextK, out)
       case group :: rest =>
         ProcApply.applyProc(proc, group, Kont.MapK(proc, rest, newAcc, nextK), out)
 

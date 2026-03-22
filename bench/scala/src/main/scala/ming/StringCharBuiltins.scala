@@ -131,19 +131,17 @@ object StringCharBuiltins:
   def evalStringToList(args: List[SchemeValue]): SchemeValue =
     if args.length != 1 then throw new EvalError("string->list: expected 1 argument")
     args.head match
-      case SchemeString(s) => SchemeList(s.toList.map(SchemeChar(_)))
+      case SchemeString(s) => Builtins.toPairChain(s.toList.map(SchemeChar(_)))
       case other           => throw new EvalError(s"string->list: not a string: ${other.display}")
 
   def evalListToString(args: List[SchemeValue]): SchemeValue =
     if args.length != 1 then throw new EvalError("list->string: expected 1 argument")
-    args.head match
-      case SchemeList(elems) =>
-        val chars = elems.map {
-          case SchemeChar(c) => c
-          case other         => throw new EvalError(s"list->string: not a char: ${other.display}")
-        }
-        SchemeString(chars.mkString)
-      case other => throw new EvalError(s"list->string: not a list: ${other.display}")
+    val elems = Builtins.asList(args.head)
+    val chars = elems.map {
+      case SchemeChar(c) => c
+      case other         => throw new EvalError(s"list->string: not a char: ${other.display}")
+    }
+    SchemeString(chars.mkString)
 
   def evalCharToInteger(args: List[SchemeValue]): SchemeValue =
     if args.length != 1 then throw new EvalError("char->integer: expected 1 argument")

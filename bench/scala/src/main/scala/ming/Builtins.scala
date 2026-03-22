@@ -115,7 +115,10 @@ object Builtins:
     "inexact->exact",
     "numerator",
     "denominator",
-    "rational?"
+    "rational?",
+    "cddr",
+    "memq",
+    "assq"
   )
 
   def evalBuiltin(
@@ -144,7 +147,7 @@ object Builtins:
     case "car"            => CollectionBuiltins.evalCar(args)
     case "cdr"            => CollectionBuiltins.evalCdr(args)
     case "null?"          => CollectionBuiltins.evalNullQ(args)
-    case "list"           => SchemeList(args)
+    case "list"           => toPairChain(args)
     case "append"         => CollectionBuiltins.evalAppend(args)
     case "length"         => CollectionBuiltins.evalLength(args)
     case "string?"        => typeCheck(args, isSchemeString)
@@ -187,6 +190,9 @@ object Builtins:
     case "set-cdr!"       => CollectionBuiltins.evalSetCdr(args)
     case "reverse"        => CollectionBuiltins.evalReverse(args)
     case "error"          => CollectionBuiltins.evalError(args)
+    case "cddr"           => CollectionBuiltins.evalCddr(args)
+    case "memq"           => CollectionBuiltins.evalMemq(args)
+    case "assq"           => CollectionBuiltins.evalAssq(args)
     case _                => evalPureExtended(op, args)
 
   private def evalPureExtended(
@@ -251,6 +257,10 @@ object Builtins:
     pred: SchemeValue => Boolean
   ): SchemeValue =
     SchemeBool(args.length == 1 && pred(args.head))
+
+  def toPairChain(elems: List[SchemeValue]): SchemeValue =
+    if elems.isEmpty then SchemeList(Nil)
+    else elems.foldRight(SchemeList(Nil): SchemeValue)((h, t) => SchemePair(h, t))
 
   def asList(v: SchemeValue): List[SchemeValue] =
     @scala.annotation.tailrec

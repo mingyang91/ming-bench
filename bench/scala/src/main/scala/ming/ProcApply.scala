@@ -69,7 +69,7 @@ private[ming] object ProcApply:
           s"expected at least ${params.length} arguments, got ${args.length}"
         )
       val (fixed, remaining) = args.splitAt(params.length)
-      closure.extend(params :+ rest, fixed :+ SchemeList(remaining))
+      closure.extend(params :+ rest, fixed :+ Builtins.toPairChain(remaining))
 
   private def applyApply(
     args: List[SchemeValue],
