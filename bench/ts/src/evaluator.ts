@@ -527,6 +527,22 @@ function makeGlobalEnv(output: string[] = []): Env {
     if (args.length !== 1 || args[0].tag !== 'pair') throw new EvalError('cdr: expected pair');
     return args[0].cdr;
   }});
+  env.define('cddr', { tag: 'builtin', name: 'cddr', fn(args) {
+    if (args.length !== 1 || args[0].tag !== 'pair') throw new EvalError('cddr: expected pair');
+    const d = args[0].cdr;
+    if (d.tag !== 'pair') throw new EvalError('cddr: expected pair');
+    return d.cdr;
+  }});
+  env.define('set-car!', { tag: 'builtin', name: 'set-car!', fn(args) {
+    if (args.length !== 2 || args[0].tag !== 'pair') throw new EvalError('set-car!: expected pair');
+    (args[0] as any).car = args[1];
+    return { tag: 'nil' } as Value;
+  }});
+  env.define('set-cdr!', { tag: 'builtin', name: 'set-cdr!', fn(args) {
+    if (args.length !== 2 || args[0].tag !== 'pair') throw new EvalError('set-cdr!: expected pair');
+    (args[0] as any).cdr = args[1];
+    return { tag: 'nil' } as Value;
+  }});
   env.define('null?', { tag: 'builtin', name: 'null?', fn(args) {
     if (args.length !== 1) throw new EvalError('null?: expected 1 argument');
     return { tag: 'boolean', value: args[0].tag === 'nil' };
@@ -818,9 +834,16 @@ function makeGlobalEnv(output: string[] = []): Env {
   }});
   env.define('list?', { tag: 'builtin', name: 'list?', fn(args) {
     if (args.length !== 1) throw new EvalError('list?: expected 1 argument');
-    let cur = args[0];
-    while (cur.tag === 'pair') cur = cur.cdr;
-    return { tag: 'boolean', value: cur.tag === 'nil' };
+    let slow = args[0];
+    let fast = args[0];
+    while (fast.tag === 'pair') {
+      fast = fast.cdr;
+      if (fast.tag !== 'pair') break;
+      fast = fast.cdr;
+      slow = (slow as any).cdr;
+      if (slow === fast) return { tag: 'boolean', value: false };
+    }
+    return { tag: 'boolean', value: fast.tag === 'nil' };
   }});
   env.define('assoc', { tag: 'builtin', name: 'assoc', fn(args) {
     if (args.length !== 2) throw new EvalError('assoc: expected 2 arguments');
