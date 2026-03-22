@@ -28,8 +28,29 @@ object Evaluator:
 
   // --- Sequence evaluation (top-level / body with defines) ---
 
-  /** A collected define: name, optional params (None=variable, Some=function), body. */
-  private[ming] type Define = (String, Option[List[String]], List[SchemeValue])
+  /** A collected define: name, optional params (None=variable, Some=(fixed,rest)), body. */
+  private[ming] type Define = (String, Option[(List[String], Option[String])], List[SchemeValue])
+
+  /** Parse parameter list that may contain dot notation for rest params. */
+  private[ming] def parseParams(rawParams: List[SchemeValue]): (List[String], Option[String]) =
+    val dotIdx = rawParams.indexWhere {
+      case SchemeSymbol(".") => true
+      case _                 => false
+    }
+    if dotIdx < 0 then
+      val names = rawParams.map {
+        case SchemeSymbol(n) => n
+        case other           => throw new EvalError(s"bad parameter: ${other.display}")
+      }
+      (names, None)
+    else
+      val fixed = rawParams.take(dotIdx).map {
+        case SchemeSymbol(n) => n
+        case other           => throw new EvalError(s"bad parameter: ${other.display}")
+      }
+      rawParams.drop(dotIdx + 1) match
+        case SchemeSymbol(rest) :: Nil => (fixed, Some(rest))
+        case _                         => throw new EvalError("bad dot syntax in parameters")
 
   private[ming] def evalSequence(
     exprs: List[SchemeValue],
@@ -56,17 +77,11 @@ object Evaluator:
         rest match
           case SchemeSymbol(name) :: valueExpr :: Nil =>
             collectDefines(tail, (name, None, List(valueExpr)) :: acc)
-          case SchemeList(SchemeSymbol(name) :: params) :: body =>
-            val paramNames = params.map {
-              case SchemeSymbol(n) => n
-              case other =>
-                throw new EvalError(
-                  s"bad parameter: ${other.display}"
-                )
-            }
+          case SchemeList(SchemeSymbol(name) :: rawParams) :: body =>
+            val (paramNames, restParam) = parseParams(rawParams)
             collectDefines(
               tail,
-              (name, Some(paramNames), body) :: acc
+              (name, Some((paramNames, restParam)), body) :: acc
             )
           case _ =>
             throw new EvalError("bad define syntax", defExpr.pos)
@@ -126,18 +141,20 @@ object Evaluator:
     env: Env,
     accOut: String
   ): EvalResult = expr match
-    case SchemeInt(_)           => Done(expr, env, accOut)
-    case SchemeBool(_)          => Done(expr, env, accOut)
-    case SchemeString(_)        => Done(expr, env, accOut)
-    case _: SchemeMutableString => Done(expr, env, accOut)
-    case SchemeChar(_)          => Done(expr, env, accOut)
-    case SchemeVoid             => Done(expr, env, accOut)
-    case SchemeLambda(_, _, _)  => Done(expr, env, accOut)
+    case SchemeInt(_)             => Done(expr, env, accOut)
+    case SchemeBool(_)            => Done(expr, env, accOut)
+    case SchemeString(_)          => Done(expr, env, accOut)
+    case _: SchemeMutableString   => Done(expr, env, accOut)
+    case SchemeChar(_)            => Done(expr, env, accOut)
+    case SchemeVoid               => Done(expr, env, accOut)
+    case SchemeLambda(_, _, _, _) => Done(expr, env, accOut)
+    case SchemeBuiltinProc(_)     => Done(expr, env, accOut)
     case SchemeSymbol(name) =>
-      try Done(env.lookup(name), env, accOut)
-      catch
-        case e: EvalError if e.sourcePos == SourcePos.None =>
-          throw new EvalError(e.baseMessage, expr.pos)
+      env.get(name) match
+        case Some(v) => Done(v, env, accOut)
+        case None =>
+          if Builtins.knownNames.contains(name) then Done(SchemeBuiltinProc(name), env, accOut)
+          else throw new EvalError(s"unbound variable: $name", expr.pos)
     case SchemeList(Nil) =>
       throw new EvalError("empty application", expr.pos)
     case SchemeList(SchemeSymbol(op) :: args) =>
@@ -149,7 +166,7 @@ object Evaluator:
       try
         val (proc, _, ho)       = evalWithEnv(head, env)
         val (evaledArgs, aoStr) = evalArgs(args, env)
-        applyProcTail(proc, evaledArgs, accOut + ho + aoStr)
+        applyProcTail(proc, evaledArgs, env, accOut + ho + aoStr)
       catch
         case e: EvalError if e.sourcePos == SourcePos.None =>
           throw new EvalError(e.baseMessage, expr.pos)
@@ -184,28 +201,66 @@ object Evaluator:
       val (evaledArgs, ao) = evalArgs(args, env)
       env.get(op) match
         case Some(proc) =>
-          applyProcTail(proc, evaledArgs, accOut + ao)
+          applyProcTail(proc, evaledArgs, env, accOut + ao)
         case None =>
-          val (result, bo) =
-            Builtins.evalBuiltin(op, evaledArgs)
-          Done(result, env, accOut + ao + bo)
+          if op == "apply" then applyApply(evaledArgs, env, accOut + ao)
+          else
+            val (result, bo) =
+              Builtins.evalBuiltin(op, evaledArgs)
+            Done(result, env, accOut + ao + bo)
 
   // --- Procedure application (tail-aware) ---
 
   private def applyProcTail(
     proc: SchemeValue,
     args: List[SchemeValue],
+    callerEnv: Env,
     accOut: String
   ): EvalResult = proc match
-    case SchemeLambda(params, body, closure) =>
-      if params.length != args.length then
-        throw new EvalError(
-          s"expected ${params.length} arguments, got ${args.length}"
-        )
-      val localEnv = closure.extend(params, args)
-      evalSequenceOnce(body, localEnv, accOut)
+    case SchemeLambda(params, restParam, body, closure) =>
+      restParam match
+        case None =>
+          if params.length != args.length then
+            throw new EvalError(
+              s"expected ${params.length} arguments, got ${args.length}"
+            )
+          val localEnv = closure.extend(params, args)
+          evalSequenceOnce(body, localEnv, accOut)
+        case Some(rest) =>
+          if args.length < params.length then
+            throw new EvalError(
+              s"expected at least ${params.length} arguments, got ${args.length}"
+            )
+          val (fixed, remaining) = args.splitAt(params.length)
+          val localEnv = closure.extend(
+            params :+ rest,
+            fixed :+ SchemeList(remaining)
+          )
+          evalSequenceOnce(body, localEnv, accOut)
+    case SchemeBuiltinProc(name) =>
+      if name == "apply" then applyApply(args, callerEnv, accOut)
+      else
+        val (result, bo) = Builtins.evalBuiltin(name, args)
+        Done(result, callerEnv, accOut + bo)
     case other =>
       throw new EvalError(s"not a procedure: ${other.display}")
+
+  private def applyApply(
+    args: List[SchemeValue],
+    callerEnv: Env,
+    accOut: String
+  ): EvalResult =
+    if args.length < 2 then throw new EvalError("apply: expected at least 2 arguments")
+    val proc       = args.head
+    val lastArg    = args.last
+    val prefixArgs = args.drop(1).dropRight(1)
+    val allArgs = lastArg match
+      case SchemeList(es) => prefixArgs ++ es
+      case other =>
+        throw new EvalError(
+          s"apply: last argument must be a list, got ${other.display}"
+        )
+    applyProcTail(proc, allArgs, callerEnv, accOut)
 
   // --- Tail-aware sequence (with defines) ---
 

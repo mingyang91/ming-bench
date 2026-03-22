@@ -59,8 +59,16 @@ object SchemeValue:
       case l: SchemeList => Some(l.elements)
       case _             => scala.None
 
-  case class SchemeLambda(params: List[String], body: List[SchemeValue], closure: Env) extends SchemeValue:
+  case class SchemeLambda(
+    params: List[String],
+    restParam: Option[String],
+    body: List[SchemeValue],
+    closure: Env
+  ) extends SchemeValue:
     def display: String = "#<procedure>"
+
+  case class SchemeBuiltinProc(name: String) extends SchemeValue:
+    def display: String = s"#<procedure:$name>"
 
   case class SchemeChar(value: Char) extends SchemeValue:
     def display: String                = s"#\\$value"

@@ -67,7 +67,7 @@ object Env:
 
   /** Letrec-style frame: all defines see each other via mutable cells. */
   class LetrecFrame(
-    defines: List[(String, Option[List[String]], List[SchemeValue])],
+    defines: List[(String, Option[(List[String], Option[String])], List[SchemeValue])],
     val parent: Env
   ) extends Env:
     import SchemeValue.*
@@ -80,8 +80,8 @@ object Env:
     def init(): Unit =
       // First pass: initialize function defines (no evaluation needed)
       defines.foreach {
-        case (name, Some(params), body) =>
-          cells(name)(0) = SchemeLambda(params, body, this)
+        case (name, Some((params, restParam)), body) =>
+          cells(name)(0) = SchemeLambda(params, restParam, body, this)
         case _ => ()
       }
       // Second pass: initialize variable defines (may reference functions)

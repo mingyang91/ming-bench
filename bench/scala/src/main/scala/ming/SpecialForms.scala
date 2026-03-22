@@ -13,15 +13,11 @@ private[ming] object SpecialForms:
     case SchemeSymbol(name) :: valueExpr :: Nil =>
       val (v, _, o) = Evaluator.evalWithEnv(valueExpr, env)
       (SchemeVoid, env.extend(name, v), o)
-    case SchemeList(SchemeSymbol(name) :: params) :: body =>
-      val paramNames = params.map {
-        case SchemeSymbol(n) => n
-        case other =>
-          throw new EvalError(s"bad parameter: ${other.display}")
-      }
+    case SchemeList(SchemeSymbol(name) :: rawParams) :: body =>
+      val (paramNames, restParam) = Evaluator.parseParams(rawParams)
       val recEnv = Env.RecursiveFrame(
         name,
-        closure => SchemeLambda(paramNames, body, closure),
+        closure => SchemeLambda(paramNames, restParam, body, closure),
         env
       )
       (SchemeVoid, recEnv, "")
@@ -54,13 +50,11 @@ private[ming] object SpecialForms:
     args: List[SchemeValue],
     env: Env
   ): SchemeValue = args match
-    case SchemeList(params) :: body if body.nonEmpty =>
-      val paramNames = params.map {
-        case SchemeSymbol(n) => n
-        case other =>
-          throw new EvalError(s"bad parameter: ${other.display}")
-      }
-      SchemeLambda(paramNames, body, env)
+    case SchemeList(rawParams) :: body if body.nonEmpty =>
+      val (paramNames, restParam) = Evaluator.parseParams(rawParams)
+      SchemeLambda(paramNames, restParam, body, env)
+    case SchemeSymbol(restOnly) :: body if body.nonEmpty =>
+      SchemeLambda(Nil, Some(restOnly), body, env)
     case _ => throw new EvalError("lambda: bad syntax")
 
   @scala.annotation.tailrec
@@ -108,7 +102,7 @@ private[ming] object SpecialForms:
       val (evaledInits, ioS) = Evaluator.evalArgs(inits, env)
       val recEnv = Env.RecursiveFrame(
         name,
-        closure => SchemeLambda(params, body, closure),
+        closure => SchemeLambda(params, None, body, closure),
         env
       )
       val localEnv = recEnv.extend(params, evaledInits)

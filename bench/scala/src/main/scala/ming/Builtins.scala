@@ -5,6 +5,45 @@ import SchemeValue.*
 /** Built-in procedure implementations. */
 object Builtins:
 
+  val knownNames: Set[String] = Set(
+    "+",
+    "-",
+    "*",
+    "/",
+    "<",
+    ">",
+    "=",
+    "<=",
+    ">=",
+    "cons",
+    "car",
+    "cdr",
+    "null?",
+    "list",
+    "append",
+    "length",
+    "string?",
+    "number?",
+    "boolean?",
+    "pair?",
+    "symbol?",
+    "char?",
+    "string-append",
+    "string-length",
+    "substring",
+    "string->number",
+    "number->string",
+    "symbol->string",
+    "string->symbol",
+    "string-ref",
+    "string-copy",
+    "string-set!",
+    "display",
+    "write",
+    "newline",
+    "apply"
+  )
+
   def evalBuiltin(
     op: String,
     args: List[SchemeValue]
