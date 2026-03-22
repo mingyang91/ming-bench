@@ -71,7 +71,11 @@ object Builtins:
     "string<?",
     "string-ci=?",
     "string-upcase",
-    "string-downcase"
+    "string-downcase",
+    "string->list",
+    "list->string",
+    "char->integer",
+    "integer->char"
   )
 
   def evalBuiltin(
@@ -148,6 +152,10 @@ object Builtins:
     case "string-ci=?"      => StringCharBuiltins.evalStringCiEq(args)
     case "string-upcase"    => StringCharBuiltins.evalStringUpcase(args)
     case "string-downcase"  => StringCharBuiltins.evalStringDowncase(args)
+    case "string->list"     => StringCharBuiltins.evalStringToList(args)
+    case "list->string"     => StringCharBuiltins.evalListToString(args)
+    case "char->integer"    => StringCharBuiltins.evalCharToInteger(args)
+    case "integer->char"    => StringCharBuiltins.evalIntegerToChar(args)
     case _                  => throw new EvalError(s"unknown procedure: $op")
 
   private def evalDisplay(args: List[SchemeValue]): (SchemeValue, String) =

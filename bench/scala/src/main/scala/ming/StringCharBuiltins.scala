@@ -125,3 +125,32 @@ object StringCharBuiltins:
     args.head match
       case SchemeString(s) => SchemeString(s.toLowerCase)
       case other           => throw new EvalError(s"string-downcase: not a string: ${other.display}")
+
+  def evalStringToList(args: List[SchemeValue]): SchemeValue =
+    if args.length != 1 then throw new EvalError("string->list: expected 1 argument")
+    args.head match
+      case SchemeString(s) => SchemeList(s.toList.map(SchemeChar(_)))
+      case other           => throw new EvalError(s"string->list: not a string: ${other.display}")
+
+  def evalListToString(args: List[SchemeValue]): SchemeValue =
+    if args.length != 1 then throw new EvalError("list->string: expected 1 argument")
+    args.head match
+      case SchemeList(elems) =>
+        val chars = elems.map {
+          case SchemeChar(c) => c
+          case other         => throw new EvalError(s"list->string: not a char: ${other.display}")
+        }
+        SchemeString(chars.mkString)
+      case other => throw new EvalError(s"list->string: not a list: ${other.display}")
+
+  def evalCharToInteger(args: List[SchemeValue]): SchemeValue =
+    if args.length != 1 then throw new EvalError("char->integer: expected 1 argument")
+    args.head match
+      case SchemeChar(c) => SchemeInt(c.toLong)
+      case other         => throw new EvalError(s"char->integer: not a char: ${other.display}")
+
+  def evalIntegerToChar(args: List[SchemeValue]): SchemeValue =
+    if args.length != 1 then throw new EvalError("integer->char: expected 1 argument")
+    args.head match
+      case SchemeInt(n) => SchemeChar(n.toChar)
+      case other        => throw new EvalError(s"integer->char: not an integer: ${other.display}")
