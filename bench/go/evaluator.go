@@ -375,6 +375,12 @@ func evalExpr(e *expr, environ *env) (value, error) {
 			return quoteExpr(e.list[1]), nil
 		case "lambda":
 			return evalLambda(e, environ)
+		case "let":
+			return evalLet(e, environ)
+		case "begin":
+			return evalBegin(e, environ)
+		case "cond":
+			return evalCond(e, environ)
 		}
 	}
 
@@ -552,6 +558,132 @@ func evalOr(e *expr, environ *env) (value, error) {
 	return boolValue(false), nil
 }
 
+func evalLet(e *expr, environ *env) (value, error) {
+	if len(e.list) < 3 {
+		return value{}, fmt.Errorf("%d:%d: let: bad syntax", e.list[0].line, e.list[0].col)
+	}
+
+	// Named let: (let name ((var init) ...) body ...)
+	nameIdx := 1
+	bodyStart := 2
+	var namedLetName string
+	if e.list[1].kind == "atom" && e.list[1].atom.typ == typeSymbol {
+		if len(e.list) < 4 {
+			return value{}, fmt.Errorf("%d:%d: let: bad syntax", e.list[0].line, e.list[0].col)
+		}
+		namedLetName = e.list[1].atom.strVal
+		nameIdx = 2
+		bodyStart = 3
+	}
+
+	bindings := e.list[nameIdx]
+	if bindings.kind != "list" {
+		return value{}, fmt.Errorf("%d:%d: let: expected bindings list", bindings.line, bindings.col)
+	}
+
+	params := make([]string, len(bindings.list))
+	initVals := make([]value, len(bindings.list))
+	for i, b := range bindings.list {
+		if b.kind != "list" || len(b.list) != 2 {
+			return value{}, fmt.Errorf("%d:%d: let: bad binding", b.line, b.col)
+		}
+		if b.list[0].kind != "atom" || b.list[0].atom.typ != typeSymbol {
+			return value{}, fmt.Errorf("%d:%d: let: expected symbol", b.list[0].line, b.list[0].col)
+		}
+		params[i] = b.list[0].atom.strVal
+		val, err := evalExpr(b.list[1], environ)
+		if err != nil {
+			return value{}, err
+		}
+		initVals[i] = val
+	}
+
+	if namedLetName != "" {
+		// Named let: create a recursive lambda and call it
+		letEnv := newEnv(environ)
+		lam := &lambda{params: params, body: e.list[bodyStart:], env: letEnv}
+		letEnv.set(namedLetName, value{typ: typeLambda, lambdaVal: lam})
+		// Call the lambda with init values
+		callEnv := newEnv(letEnv)
+		for i, p := range params {
+			callEnv.set(p, initVals[i])
+		}
+		var result value
+		var err error
+		for _, body := range e.list[bodyStart:] {
+			result, err = evalExpr(body, callEnv)
+			if err != nil {
+				return value{}, err
+			}
+		}
+		return result, nil
+	}
+
+	letEnv := newEnv(environ)
+	for i, p := range params {
+		letEnv.set(p, initVals[i])
+	}
+	var result value
+	var err error
+	for _, body := range e.list[bodyStart:] {
+		result, err = evalExpr(body, letEnv)
+		if err != nil {
+			return value{}, err
+		}
+	}
+	return result, nil
+}
+
+func evalBegin(e *expr, environ *env) (value, error) {
+	if len(e.list) < 2 {
+		return voidValue, nil
+	}
+	var result value
+	var err error
+	for _, body := range e.list[1:] {
+		result, err = evalExpr(body, environ)
+		if err != nil {
+			return value{}, err
+		}
+	}
+	return result, nil
+}
+
+func evalCond(e *expr, environ *env) (value, error) {
+	for _, clause := range e.list[1:] {
+		if clause.kind != "list" || len(clause.list) < 2 {
+			return value{}, fmt.Errorf("%d:%d: cond: bad clause", clause.line, clause.col)
+		}
+		// Check for else clause
+		if clause.list[0].kind == "atom" && clause.list[0].atom.typ == typeSymbol && clause.list[0].atom.strVal == "else" {
+			var result value
+			var err error
+			for _, body := range clause.list[1:] {
+				result, err = evalExpr(body, environ)
+				if err != nil {
+					return value{}, err
+				}
+			}
+			return result, nil
+		}
+		test, err := evalExpr(clause.list[0], environ)
+		if err != nil {
+			return value{}, err
+		}
+		if isTruthy(test) {
+			var result value
+			for _, body := range clause.list[1:] {
+				result, err = evalExpr(body, environ)
+				if err != nil {
+					return value{}, err
+				}
+			}
+			return result, nil
+		}
+	}
+	return voidValue, nil
+}
+
 func applyBuiltin(name string, args []value, e *expr) (value, error) {
 	head := e.list[0]
 	switch name {
@@ -629,6 +761,102 @@ func applyBuiltin(name string, args []value, e *expr) (value, error) {
 			return value{}, fmt.Errorf("%d:%d: not: expected 1 argument, got %d", head.line, head.col, len(args))
 		}
 		return boolValue(!isTruthy(args[0])), nil
+
+	case "cons":
+		if len(args) != 2 {
+			return value{}, fmt.Errorf("%d:%d: cons: expected 2 arguments, got %d", head.line, head.col, len(args))
+		}
+		return pairValue(args[0], args[1]), nil
+
+	case "car":
+		if len(args) != 1 {
+			return value{}, fmt.Errorf("%d:%d: car: expected 1 argument, got %d", head.line, head.col, len(args))
+		}
+		if args[0].typ != typePair {
+			return value{}, fmt.Errorf("%d:%d: car: expected pair, got %s", head.line, head.col, args[0].String())
+		}
+		return args[0].pairVal.car, nil
+
+	case "cdr":
+		if len(args) != 1 {
+			return value{}, fmt.Errorf("%d:%d: cdr: expected 1 argument, got %d", head.line, head.col, len(args))
+		}
+		if args[0].typ != typePair {
+			return value{}, fmt.Errorf("%d:%d: cdr: expected pair, got %s", head.line, head.col, args[0].String())
+		}
+		return args[0].pairVal.cdr, nil
+
+	case "null?":
+		if len(args) != 1 {
+			return value{}, fmt.Errorf("%d:%d: null?: expected 1 argument, got %d", head.line, head.col, len(args))
+		}
+		return boolValue(args[0].typ == typeNull), nil
+
+	case "list":
+		result := nullValue
+		for i := len(args) - 1; i >= 0; i-- {
+			result = pairValue(args[i], result)
+		}
+		return result, nil
+
+	case "length":
+		if len(args) != 1 {
+			return value{}, fmt.Errorf("%d:%d: length: expected 1 argument, got %d", head.line, head.col, len(args))
+		}
+		count := int64(0)
+		cur := args[0]
+		for cur.typ == typePair {
+			count++
+			cur = cur.pairVal.cdr
+		}
+		if cur.typ != typeNull {
+			return value{}, fmt.Errorf("%d:%d: length: expected proper list", head.line, head.col)
+		}
+		return intValue(count), nil
+
+	case "string?":
+		if len(args) != 1 {
+			return value{}, fmt.Errorf("%d:%d: string?: expected 1 argument, got %d", head.line, head.col, len(args))
+		}
+		return boolValue(args[0].typ == typeString), nil
+
+	case "number?":
+		if len(args) != 1 {
+			return value{}, fmt.Errorf("%d:%d: number?: expected 1 argument, got %d", head.line, head.col, len(args))
+		}
+		return boolValue(args[0].typ == typeInt), nil
+
+	case "boolean?":
+		if len(args) != 1 {
+			return value{}, fmt.Errorf("%d:%d: boolean?: expected 1 argument, got %d", head.line, head.col, len(args))
+		}
+		return boolValue(args[0].typ == typeBool), nil
+
+	case "pair?":
+		if len(args) != 1 {
+			return value{}, fmt.Errorf("%d:%d: pair?: expected 1 argument, got %d", head.line, head.col, len(args))
+		}
+		return boolValue(args[0].typ == typePair), nil
+
+	case "symbol?":
+		if len(args) != 1 {
+			return value{}, fmt.Errorf("%d:%d: symbol?: expected 1 argument, got %d", head.line, head.col, len(args))
+		}
+		return boolValue(args[0].typ == typeSymbol), nil
+
+	case "append":
+		if len(args) == 0 {
+			return nullValue, nil
+		}
+		if len(args) == 1 {
+			return args[0], nil
+		}
+		// Append all lists together
+		result := args[len(args)-1]
+		for i := len(args) - 2; i >= 0; i-- {
+			result = appendList(args[i], result)
+		}
+		return result, nil
 	}
 
 	return value{}, fmt.Errorf("%d:%d: unbound variable: %s", head.line, head.col, name)
@@ -651,6 +879,16 @@ func compareInts(args []value, e *expr, cmp func(int64, int64) bool, name string
 	return boolValue(true), nil
 }
 
+func appendList(lst value, tail value) value {
+	if lst.typ == typeNull {
+		return tail
+	}
+	if lst.typ != typePair {
+		return tail
+	}
+	return pairValue(lst.pairVal.car, appendList(lst.pairVal.cdr, tail))
+}
+
 // ---------- Public API ----------
 
 // EvalStr evaluates one or more Scheme expressions and returns the string
@@ -670,7 +908,7 @@ func EvalStr(input string) (string, error) {
 
 	environ := newEnv(nil)
 	// Pre-bind builtins as symbols
-	for _, name := range []string{"+", "-", "*", "/", "<", ">", "=", "<=", ">=", "not"} {
+	for _, name := range []string{"+", "-", "*", "/", "<", ">", "=", "<=", ">=", "not", "cons", "car", "cdr", "null?", "list", "length", "append", "string?", "number?", "boolean?", "pair?", "symbol?"} {
 		environ.set(name, symbolValue(name))
 	}
 
