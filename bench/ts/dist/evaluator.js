@@ -1,4 +1,6 @@
 import { EvalError } from './evalError.js';
+// --- Output buffer (for display/write/newline) ---
+let outputBuffer = '';
 function posStr(pos) {
     return pos ? `${pos.line}:${pos.col}` : '?:?';
 }
@@ -547,14 +549,101 @@ function makeGlobalEnv() {
             throw new EvalError('symbol?: expected 1 argument');
         return { tag: 'boolean', value: args[0].tag === 'symbol' };
     });
+    // I/O builtins
+    defBuiltin('display', args => {
+        if (args.length !== 1)
+            throw new EvalError('display: expected 1 argument');
+        outputBuffer += displayValUnquoted(args[0]);
+        return { tag: 'void' };
+    });
+    defBuiltin('write', args => {
+        if (args.length !== 1)
+            throw new EvalError('write: expected 1 argument');
+        outputBuffer += displayVal(args[0]);
+        return { tag: 'void' };
+    });
+    defBuiltin('newline', args => {
+        if (args.length !== 0)
+            throw new EvalError('newline: expected 0 arguments');
+        outputBuffer += '\n';
+        return { tag: 'void' };
+    });
+    // String builtins
+    defBuiltin('string-append', args => {
+        let result = '';
+        for (const a of args) {
+            if (a.tag !== 'string')
+                throw new EvalError('string-append: expected string');
+            result += a.value;
+        }
+        return { tag: 'string', value: result };
+    });
+    defBuiltin('string-length', args => {
+        if (args.length !== 1 || args[0].tag !== 'string')
+            throw new EvalError('string-length: expected string');
+        return { tag: 'number', value: args[0].value.length };
+    });
+    defBuiltin('substring', args => {
+        if (args.length < 2 || args.length > 3)
+            throw new EvalError('substring: expected 2 or 3 arguments');
+        if (args[0].tag !== 'string')
+            throw new EvalError('substring: expected string');
+        if (args[1].tag !== 'number')
+            throw new EvalError('substring: expected number');
+        const start = args[1].value;
+        const end = args.length === 3 ? (args[2].tag === 'number' ? args[2].value : (() => { throw new EvalError('substring: expected number'); })()) : args[0].value.length;
+        return { tag: 'string', value: args[0].value.slice(start, end) };
+    });
+    defBuiltin('string->number', args => {
+        if (args.length !== 1 || args[0].tag !== 'string')
+            throw new EvalError('string->number: expected string');
+        const n = Number(args[0].value);
+        if (isNaN(n))
+            return { tag: 'boolean', value: false };
+        return { tag: 'number', value: n };
+    });
+    defBuiltin('number->string', args => {
+        if (args.length !== 1 || args[0].tag !== 'number')
+            throw new EvalError('number->string: expected number');
+        return { tag: 'string', value: String(args[0].value) };
+    });
+    defBuiltin('symbol->string', args => {
+        if (args.length !== 1 || args[0].tag !== 'symbol')
+            throw new EvalError('symbol->string: expected symbol');
+        return { tag: 'string', value: args[0].value };
+    });
+    defBuiltin('string->symbol', args => {
+        if (args.length !== 1 || args[0].tag !== 'string')
+            throw new EvalError('string->symbol: expected string');
+        return { tag: 'symbol', value: args[0].value };
+    });
+    defBuiltin('string-ref', args => {
+        if (args.length !== 2)
+            throw new EvalError('string-ref: expected 2 arguments');
+        if (args[0].tag !== 'string')
+            throw new EvalError('string-ref: expected string');
+        if (args[1].tag !== 'number')
+            throw new EvalError('string-ref: expected number');
+        const idx = args[1].value;
+        if (idx < 0 || idx >= args[0].value.length)
+            throw new EvalError('string-ref: index out of range');
+        return { tag: 'char', value: args[0].value[idx] };
+    });
+    defBuiltin('char?', args => {
+        if (args.length !== 1)
+            throw new EvalError('char?: expected 1 argument');
+        return { tag: 'boolean', value: args[0].tag === 'char' };
+    });
     return env;
 }
 // --- Display ---
+// displayVal: external representation (with quotes on strings)
 function displayVal(val) {
     switch (val.tag) {
         case 'number': return String(val.value);
         case 'boolean': return val.value ? '#t' : '#f';
         case 'string': return `"${val.value}"`;
+        case 'char': return `#\\${val.value === ' ' ? 'space' : val.value === '\n' ? 'newline' : val.value}`;
         case 'symbol': return val.value;
         case 'nil': return '()';
         case 'pair': {
@@ -580,6 +669,31 @@ function displayVal(val) {
         default: return '#<builtin>';
     }
 }
+// displayValUnquoted: display representation (no quotes on strings)
+function displayValUnquoted(val) {
+    switch (val.tag) {
+        case 'string': return val.value;
+        case 'char': return val.value;
+        case 'pair': {
+            let s = '(';
+            let cur = val;
+            let first = true;
+            while (cur.tag === 'pair') {
+                if (!first)
+                    s += ' ';
+                s += displayValUnquoted(cur.car);
+                cur = cur.cdr;
+                first = false;
+            }
+            if (cur.tag !== 'nil') {
+                s += ' . ' + displayValUnquoted(cur);
+            }
+            s += ')';
+            return s;
+        }
+        default: return displayVal(val);
+    }
+}
 // --- Public API ---
 export function evalStr(input) {
     const tokens = tokenize(input);
@@ -595,5 +709,16 @@ export function evalStr(input) {
     return displayVal(result);
 }
 export function evalStrWithOutput(input) {
-    return { result: evalStr(input), output: '' };
+    outputBuffer = '';
+    const tokens = tokenize(input);
+    const exprs = parse(tokens);
+    if (exprs.length === 0) {
+        throw new EvalError('no expressions');
+    }
+    const env = makeGlobalEnv();
+    let result;
+    for (const expr of exprs) {
+        result = evalExpr(expr, env);
+    }
+    return { result: displayVal(result), output: outputBuffer };
 }
