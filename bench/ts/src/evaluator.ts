@@ -200,6 +200,16 @@ class Env {
   define(name: string, value: Value): void {
     this.bindings.set(name, value);
   }
+
+  set(name: string, value: Value, pos?: Pos): void {
+    if (this.bindings.has(name)) {
+      this.bindings.set(name, value);
+      return;
+    }
+    if (this.parent) return this.parent.set(name, value, pos);
+    const prefix = pos ? `${fmtPos(pos)}: ` : '';
+    throw new EvalError(`${prefix}unbound variable: ${name}`);
+  }
 }
 
 // ── Values ───────────────────────────────────────────────────────────
@@ -547,6 +557,15 @@ function evaluate(expr: Expr, env: Env): Value {
               return { tag: 'nil' };
             }
             throw new EvalError(`${fmtPos(expr.pos)}: define: bad syntax`);
+          }
+
+          case 'set!': {
+            if (items.length !== 3) throw new EvalError(`${fmtPos(expr.pos)}: set!: bad syntax`);
+            const target = items[1];
+            if (target.tag !== 'symbol') throw new EvalError(`${fmtPos(expr.pos)}: set!: expected symbol`);
+            const val = evaluate(items[2], env);
+            env.set(target.name, val, expr.pos);
+            return { tag: 'nil' };
           }
 
           case 'quote':
