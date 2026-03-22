@@ -12,7 +12,14 @@ public class Evaluator {
     sealed interface SchemeVal permits IntVal, BoolVal, StrVal, CharVal, ListVal, SymbolVal, LambdaVal, VoidVal, BuiltinVal {}
     record IntVal(long value) implements SchemeVal {}
     record BoolVal(boolean value) implements SchemeVal {}
-    record StrVal(String value) implements SchemeVal {}
+    static final class StrVal implements SchemeVal {
+        private char[] chars;
+        StrVal(String value) { this.chars = value.toCharArray(); }
+        String value() { return new String(chars); }
+        char charAt(int i) { return chars[i]; }
+        void setChar(int i, char c) { chars[i] = c; }
+        int length() { return chars.length; }
+    }
     record CharVal(char value) implements SchemeVal {}
     record ListVal(List<SchemeVal> elements) implements SchemeVal {}
     record SymbolVal(String name) implements SchemeVal {}
@@ -56,7 +63,8 @@ public class Evaluator {
             "string?", "number?", "boolean?", "pair?", "symbol?", "procedure?", "integer?",
             "display", "write", "newline",
             "string-append", "string-length", "substring", "string->number", "number->string",
-            "symbol->string", "string->symbol", "string-ref", "char?"};
+            "symbol->string", "string->symbol", "string-ref", "char?",
+            "string-copy", "string-set!"};
         for (String b : builtins) {
             env.define(b, new BuiltinVal(b));
         }
@@ -183,6 +191,16 @@ public class Evaluator {
     private static SchemeVal parseAtom(String token) {
         if (token.equals("#t")) return new BoolVal(true);
         if (token.equals("#f")) return new BoolVal(false);
+        if (token.startsWith("#\\")) {
+            String charName = token.substring(2);
+            if (charName.length() == 1) return new CharVal(charName.charAt(0));
+            return switch (charName.toLowerCase()) {
+                case "space" -> new CharVal(' ');
+                case "newline" -> new CharVal('\n');
+                case "tab" -> new CharVal('\t');
+                default -> new CharVal(charName.charAt(0));
+            };
+        }
         if (token.startsWith("\"")) {
             String inner = token.substring(1, token.length() - 1);
             inner = inner.replace("\\n", "\n").replace("\\t", "\t")
@@ -650,11 +668,24 @@ public class Evaluator {
                 if (args.size() != 2) throw new EvalError("string-ref requires exactly 2 arguments");
                 if (!(args.get(0) instanceof StrVal s)) throw new EvalError("string-ref: not a string");
                 int idx = (int) asLong(args.get(1));
-                yield new CharVal(s.value().charAt(idx));
+                yield new CharVal(s.charAt(idx));
             }
             case "char?" -> {
                 if (args.size() != 1) throw new EvalError("char? requires exactly 1 argument");
                 yield new BoolVal(args.getFirst() instanceof CharVal);
+            }
+            case "string-copy" -> {
+                if (args.size() != 1) throw new EvalError("string-copy requires exactly 1 argument");
+                if (!(args.getFirst() instanceof StrVal s)) throw new EvalError("string-copy: not a string");
+                yield new StrVal(s.value());
+            }
+            case "string-set!" -> {
+                if (args.size() != 3) throw new EvalError("string-set! requires exactly 3 arguments");
+                if (!(args.get(0) instanceof StrVal s)) throw new EvalError("string-set!: not a string");
+                int idx = (int) asLong(args.get(1));
+                if (!(args.get(2) instanceof CharVal c)) throw new EvalError("string-set!: not a character");
+                s.setChar(idx, c.value());
+                yield VOID;
             }
             default -> throw new EvalError("unbound variable: " + name);
         };
