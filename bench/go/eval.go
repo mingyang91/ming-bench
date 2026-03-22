@@ -675,6 +675,40 @@ func applyBuiltin(name string, args []*Value, expr *Expr, env *Env) (*Value, err
 		cp := make([]rune, len(src))
 		copy(cp, src)
 		return &Value{Type: TypeString, Runes: cp}, nil
+	case "string->list":
+		if len(args) != 1 || args[0].Type != TypeString {
+			return nil, errAtf(expr, "string->list: expected 1 string argument")
+		}
+		runes := []rune(args[0].StrContent())
+		result := Null
+		for i := len(runes) - 1; i >= 0; i-- {
+			result = PairValue(CharValue(runes[i]), result)
+		}
+		return result, nil
+	case "list->string":
+		if len(args) != 1 {
+			return nil, errAtf(expr, "list->string: expected 1 argument")
+		}
+		var runes []rune
+		cur := args[0]
+		for cur != Null {
+			if cur.Type != TypePair || cur.Car.Type != TypeChar {
+				return nil, errAtf(expr, "list->string: expected list of chars")
+			}
+			runes = append(runes, rune(cur.Car.IntVal))
+			cur = cur.Cdr
+		}
+		return StringValue(string(runes)), nil
+	case "char->integer":
+		if len(args) != 1 || args[0].Type != TypeChar {
+			return nil, errAtf(expr, "char->integer: expected 1 char argument")
+		}
+		return IntegerValue(args[0].IntVal), nil
+	case "integer->char":
+		if len(args) != 1 || args[0].Type != TypeInteger {
+			return nil, errAtf(expr, "integer->char: expected 1 integer argument")
+		}
+		return CharValue(rune(args[0].IntVal)), nil
 	default:
 		return nil, errAtf(expr, "unknown procedure: %s", name)
 	}
@@ -1378,6 +1412,8 @@ func makeDefaultEnv() *Env {
 		"symbol->string", "string->symbol",
 		"string-ref",
 		"string-set!", "string-copy",
+		"string->list", "list->string",
+		"char->integer", "integer->char",
 		"apply",
 		"call/cc", "call-with-current-continuation",
 		"equal?", "eq?", "eqv?",
