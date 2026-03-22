@@ -18,6 +18,7 @@ const (
 	KindBuiltin
 	KindLambda
 	KindChar
+	KindTailCall // internal: trampoline for TCO
 )
 
 type BuiltinFunc func(args []*Value) (*Value, error)

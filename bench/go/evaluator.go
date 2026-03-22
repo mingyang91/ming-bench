@@ -85,22 +85,38 @@ func makeGlobalEnv() *Env {
 	return env
 }
 
+// tailCallVal creates a tail-call trampoline value.
+func tailCallVal(expr *Value, env *Env) *Value {
+	return &Value{Kind: KindTailCall, Car: expr, ClosureEnv: env}
+}
+
 func eval(expr *Value, env *Env) (*Value, error) {
-	switch expr.Kind {
-	case KindInteger, KindBoolean, KindString, KindChar:
-		return expr, nil
-	case KindSymbol:
-		v, ok := env.get(expr.Str)
-		if !ok {
-			return nil, posError(expr, fmt.Sprintf("unbound variable: %s", expr.Str))
+	for {
+		switch expr.Kind {
+		case KindInteger, KindBoolean, KindString, KindChar:
+			return expr, nil
+		case KindSymbol:
+			v, ok := env.get(expr.Str)
+			if !ok {
+				return nil, posError(expr, fmt.Sprintf("unbound variable: %s", expr.Str))
+			}
+			return v, nil
+		case KindPair:
+			result, err := evalList(expr, env)
+			if err != nil {
+				return nil, err
+			}
+			if result.Kind == KindTailCall {
+				expr = result.Car
+				env = result.ClosureEnv
+				continue
+			}
+			return result, nil
+		case KindNull:
+			return nil, posError(expr, "cannot evaluate empty list")
 		}
-		return v, nil
-	case KindPair:
-		return evalList(expr, env)
-	case KindNull:
-		return nil, posError(expr, "cannot evaluate empty list")
+		return nil, posError(expr, "unknown expression type")
 	}
-	return nil, posError(expr, "unknown expression type")
 }
 
 func evalList(expr *Value, env *Env) (*Value, error) {
@@ -178,9 +194,11 @@ func evalArgs(list *Value, env *Env) ([]*Value, error) {
 }
 
 func evalAnd(args *Value, env *Env) (*Value, error) {
-	result := boolVal(true)
+	if args.Kind == KindNull {
+		return boolVal(true), nil
+	}
 	cur := args
-	for cur.Kind == KindPair {
+	for cur.Cdr.Kind == KindPair {
 		v, err := eval(cur.Car, env)
 		if err != nil {
 			return nil, err
@@ -188,16 +206,18 @@ func evalAnd(args *Value, env *Env) (*Value, error) {
 		if !v.isTruthy() {
 			return v, nil
 		}
-		result = v
 		cur = cur.Cdr
 	}
-	return result, nil
+	// Tail call for the last expression
+	return tailCallVal(cur.Car, env), nil
 }
 
 func evalOr(args *Value, env *Env) (*Value, error) {
-	result := boolVal(false)
+	if args.Kind == KindNull {
+		return boolVal(false), nil
+	}
 	cur := args
-	for cur.Kind == KindPair {
+	for cur.Cdr.Kind == KindPair {
 		v, err := eval(cur.Car, env)
 		if err != nil {
 			return nil, err
@@ -205,10 +225,10 @@ func evalOr(args *Value, env *Env) (*Value, error) {
 		if v.isTruthy() {
 			return v, nil
 		}
-		result = v
 		cur = cur.Cdr
 	}
-	return result, nil
+	// Tail call for the last expression
+	return tailCallVal(cur.Car, env), nil
 }
 
 func evalIf(args *Value, env *Env, expr *Value) (*Value, error) {
@@ -220,13 +240,13 @@ func evalIf(args *Value, env *Env, expr *Value) (*Value, error) {
 		return nil, err
 	}
 	if cond.isTruthy() {
-		return eval(args.Cdr.Car, env)
+		return tailCallVal(args.Cdr.Car, env), nil
 	}
 	// else branch (optional)
 	if args.Cdr.Cdr.Kind == KindNull {
 		return voidVal(), nil
 	}
-	return eval(args.Cdr.Cdr.Car, env)
+	return tailCallVal(args.Cdr.Cdr.Car, env), nil
 }
 
 func evalDefine(args *Value, env *Env, expr *Value) (*Value, error) {
@@ -279,15 +299,15 @@ func applyLambda(fn *Value, args []*Value) (*Value, error) {
 	for i, p := range fn.Params {
 		localEnv.set(p, args[i])
 	}
-	var result *Value
-	var err error
-	for _, expr := range fn.Body {
-		result, err = eval(expr, localEnv)
+	// Evaluate all body expressions except the last
+	for i := 0; i < len(fn.Body)-1; i++ {
+		_, err := eval(fn.Body[i], localEnv)
 		if err != nil {
 			return nil, err
 		}
 	}
-	return result, nil
+	// Return tail call for the last body expression
+	return tailCallVal(fn.Body[len(fn.Body)-1], localEnv), nil
 }
 
 func listToStrings(v *Value) []string {
@@ -444,34 +464,35 @@ func evalLet(args *Value, env *Env) (*Value, error) {
 		localEnv.set(name, val)
 		cur = cur.Cdr
 	}
-	var result *Value
-	var err error
+	// Evaluate all but last, then tail call for last
+	if body.Kind == KindNull {
+		return voidVal(), nil
+	}
 	bcur := body
-	for bcur.Kind == KindPair {
-		result, err = eval(bcur.Car, localEnv)
+	for bcur.Cdr.Kind == KindPair {
+		_, err := eval(bcur.Car, localEnv)
 		if err != nil {
 			return nil, err
 		}
 		bcur = bcur.Cdr
 	}
-	return result, nil
+	return tailCallVal(bcur.Car, localEnv), nil
 }
 
 func evalBegin(args *Value, env *Env) (*Value, error) {
-	var result *Value
-	var err error
+	if args.Kind == KindNull {
+		return voidVal(), nil
+	}
 	cur := args
-	for cur.Kind == KindPair {
-		result, err = eval(cur.Car, env)
+	for cur.Cdr.Kind == KindPair {
+		_, err := eval(cur.Car, env)
 		if err != nil {
 			return nil, err
 		}
 		cur = cur.Cdr
 	}
-	if result == nil {
-		return voidVal(), nil
-	}
-	return result, nil
+	// Tail call for the last expression
+	return tailCallVal(cur.Car, env), nil
 }
 
 func evalCond(args *Value, env *Env) (*Value, error) {
@@ -496,20 +517,19 @@ func evalCond(args *Value, env *Env) (*Value, error) {
 }
 
 func evalBody(body *Value, env *Env) (*Value, error) {
-	var result *Value
-	var err error
+	if body.Kind == KindNull {
+		return voidVal(), nil
+	}
 	cur := body
-	for cur.Kind == KindPair {
-		result, err = eval(cur.Car, env)
+	for cur.Cdr.Kind == KindPair {
+		_, err := eval(cur.Car, env)
 		if err != nil {
 			return nil, err
 		}
 		cur = cur.Cdr
 	}
-	if result == nil {
-		return voidVal(), nil
-	}
-	return result, nil
+	// Tail call for the last expression
+	return tailCallVal(cur.Car, env), nil
 }
 
 func builtinCons(args []*Value) (*Value, error) {
