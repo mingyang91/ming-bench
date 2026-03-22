@@ -475,16 +475,41 @@ public class Interpreter {
             return new SchemeValue.StringVal(requireString(args.getFirst(), "string-downcase").toLowerCase());
         });
         builtin("string-set!", args -> {
-            if (args.size() != 3) throw new EvalError("string-set!: expected 3 arguments");
-            if (!(args.get(0) instanceof SchemeValue.MutableStringVal ms)) {
-                throw new EvalError("string-set!: expected mutable string");
+            throw new EvalError("string-set!: strings are immutable");
+        });
+        builtin("string->list", args -> {
+            if (args.size() != 1) throw new EvalError("string->list: expected 1 argument");
+            String str = requireString(args.getFirst(), "string->list");
+            SchemeValue result = new SchemeValue.ListVal(List.of());
+            for (int i = str.length() - 1; i >= 0; i--) {
+                result = new SchemeValue.PairVal(new SchemeValue.CharVal(str.charAt(i)), result);
             }
-            long idx = requireInt(args.get(1));
-            if (!(args.get(2) instanceof SchemeValue.CharVal ch)) {
-                throw new EvalError("string-set!: expected char as third argument");
+            return result;
+        });
+        builtin("list->string", args -> {
+            if (args.size() != 1) throw new EvalError("list->string: expected 1 argument");
+            StringBuilder sb = new StringBuilder();
+            SchemeValue cur = args.getFirst();
+            while (cur instanceof SchemeValue.PairVal p) {
+                if (!(p.car() instanceof SchemeValue.CharVal ch)) {
+                    throw new EvalError("list->string: expected list of characters");
+                }
+                sb.append(ch.value());
+                cur = p.cdr();
             }
-            ms.chars().setCharAt((int) idx, ch.value());
-            return new SchemeValue.VoidVal();
+            return new SchemeValue.StringVal(sb.toString());
+        });
+        builtin("char->integer", args -> {
+            if (args.size() != 1) throw new EvalError("char->integer: expected 1 argument");
+            if (!(args.getFirst() instanceof SchemeValue.CharVal ch)) {
+                throw new EvalError("char->integer: expected char");
+            }
+            return new SchemeValue.IntVal((long) ch.value());
+        });
+        builtin("integer->char", args -> {
+            if (args.size() != 1) throw new EvalError("integer->char: expected 1 argument");
+            long n = requireInt(args.getFirst());
+            return new SchemeValue.CharVal((char) n);
         });
     }
 
