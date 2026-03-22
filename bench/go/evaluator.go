@@ -60,15 +60,15 @@ func eval(expr *Value, env *Env) (*Value, error) {
 	case KindSymbol:
 		v, ok := env.get(expr.Str)
 		if !ok {
-			return nil, &EvalError{Message: fmt.Sprintf("unbound variable: %s", expr.Str)}
+			return nil, posError(expr, fmt.Sprintf("unbound variable: %s", expr.Str))
 		}
 		return v, nil
 	case KindPair:
 		return evalList(expr, env)
 	case KindNull:
-		return nil, &EvalError{Message: "cannot evaluate empty list"}
+		return nil, posError(expr, "cannot evaluate empty list")
 	}
-	return nil, &EvalError{Message: "unknown expression type"}
+	return nil, posError(expr, "unknown expression type")
 }
 
 func evalList(expr *Value, env *Env) (*Value, error) {
@@ -82,9 +82,9 @@ func evalList(expr *Value, env *Env) (*Value, error) {
 		case "or":
 			return evalOr(expr.Cdr, env)
 		case "if":
-			return evalIf(expr.Cdr, env)
+			return evalIf(expr.Cdr, env, expr)
 		case "define":
-			return evalDefine(expr.Cdr, env)
+			return evalDefine(expr.Cdr, env, expr)
 		case "quote":
 			return expr.Cdr.Car, nil
 		case "lambda":
@@ -111,14 +111,18 @@ func evalList(expr *Value, env *Env) (*Value, error) {
 	}
 
 	if fn.Kind == KindBuiltin {
-		return fn.Builtin(args)
+		result, err := fn.Builtin(args)
+		if err != nil {
+			return nil, wrapErrorPos(err, expr)
+		}
+		return result, nil
 	}
 
 	if fn.Kind == KindLambda {
 		return applyLambda(fn, args)
 	}
 
-	return nil, &EvalError{Message: fmt.Sprintf("not a procedure: %s", fn.String())}
+	return nil, posError(expr, fmt.Sprintf("not a procedure: %s", fn.String()))
 }
 
 func evalArgs(list *Value, env *Env) ([]*Value, error) {
@@ -169,7 +173,10 @@ func evalOr(args *Value, env *Env) (*Value, error) {
 	return result, nil
 }
 
-func evalIf(args *Value, env *Env) (*Value, error) {
+func evalIf(args *Value, env *Env, expr *Value) (*Value, error) {
+	if args.Kind == KindNull {
+		return nil, posError(expr, "if: bad syntax (missing condition)")
+	}
 	cond, err := eval(args.Car, env)
 	if err != nil {
 		return nil, err
@@ -184,7 +191,10 @@ func evalIf(args *Value, env *Env) (*Value, error) {
 	return eval(args.Cdr.Cdr.Car, env)
 }
 
-func evalDefine(args *Value, env *Env) (*Value, error) {
+func evalDefine(args *Value, env *Env, expr *Value) (*Value, error) {
+	if args.Kind == KindNull {
+		return nil, posError(expr, "define: bad syntax")
+	}
 	target := args.Car
 	if target.Kind == KindSymbol {
 		// (define x expr)
@@ -209,7 +219,7 @@ func evalDefine(args *Value, env *Env) (*Value, error) {
 		env.set(name, fn)
 		return voidVal(), nil
 	}
-	return nil, &EvalError{Message: "define: bad syntax"}
+	return nil, posError(expr, "define: bad syntax")
 }
 
 func evalLambda(args *Value, env *Env) (*Value, error) {

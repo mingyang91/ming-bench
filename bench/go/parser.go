@@ -198,20 +198,20 @@ func (p *parser) parseExpr() (*Value, error) {
 		if err != nil {
 			return nil, err
 		}
-		return pairVal(symVal("quote"), pairVal(expr, nullVal())), nil
+		return pairVal(symVal("quote").withPos(t.line, t.col), pairVal(expr, nullVal())).withPos(t.line, t.col), nil
 	case tokString:
 		p.next()
-		return strVal(t.val), nil
+		return strVal(t.val).withPos(t.line, t.col), nil
 	case tokAtom:
 		p.next()
-		return parseAtom(t.val), nil
+		return parseAtom(t.val).withPos(t.line, t.col), nil
 	default:
 		return nil, fmt.Errorf("unexpected token %q at %d:%d", t.val, t.line, t.col)
 	}
 }
 
 func (p *parser) parseList() (*Value, error) {
-	p.next() // consume '('
+	open := p.next() // consume '('
 
 	var elems []*Value
 	for p.peek().kind != tokRParen && p.peek().kind != tokEOF {
@@ -228,7 +228,7 @@ func (p *parser) parseList() (*Value, error) {
 			// Build the dotted pair
 			result := cdr
 			for i := len(elems) - 1; i >= 0; i-- {
-				result = pairVal(elems[i], result)
+				result = pairVal(elems[i], result).withPos(open.line, open.col)
 			}
 			return result, nil
 		}
@@ -247,7 +247,7 @@ func (p *parser) parseList() (*Value, error) {
 	// Build proper list
 	result := nullVal()
 	for i := len(elems) - 1; i >= 0; i-- {
-		result = pairVal(elems[i], result)
+		result = pairVal(elems[i], result).withPos(open.line, open.col)
 	}
 	return result, nil
 }

@@ -33,6 +33,9 @@ type Value struct {
 	Params []string
 	Body   []*Value
 	ClosureEnv *Env
+	// Source position
+	Line int
+	Col  int
 }
 
 func intVal(n int64) *Value   { return &Value{Kind: KindInteger, Int: n} }
@@ -41,6 +44,12 @@ func strVal(s string) *Value  { return &Value{Kind: KindString, Str: s} }
 func symVal(s string) *Value  { return &Value{Kind: KindSymbol, Str: s} }
 func nullVal() *Value         { return &Value{Kind: KindNull} }
 func voidVal() *Value         { return &Value{Kind: KindVoid} }
+
+func (v *Value) withPos(line, col int) *Value {
+	v.Line = line
+	v.Col = col
+	return v
+}
 func pairVal(car, cdr *Value) *Value {
 	return &Value{Kind: KindPair, Car: car, Cdr: cdr}
 }
