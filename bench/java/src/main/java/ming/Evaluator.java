@@ -129,7 +129,8 @@ public class Evaluator {
             "list-ref", "list-tail", "list?", "assoc", "map",
             "eq?", "equal?",
             "char-alphabetic?", "char-numeric?", "char-upcase", "char-downcase", "char=?", "char<?",
-            "string=?", "string<?", "string-ci=?", "string-upcase", "string-downcase"};
+            "string=?", "string<?", "string-ci=?", "string-upcase", "string-downcase",
+            "string->list", "list->string", "char->integer", "integer->char"};
         for (String b : builtins) {
             env.define(b, new BuiltinVal(b));
         }
@@ -1133,12 +1134,7 @@ public class Evaluator {
                 yield new StrVal(s.value());
             }
             case "string-set!" -> {
-                if (args.size() != 3) throw new EvalError("string-set! requires exactly 3 arguments");
-                if (!(args.get(0) instanceof StrVal s)) throw new EvalError("string-set!: not a string");
-                int idx = (int) asLong(args.get(1));
-                if (!(args.get(2) instanceof CharVal c)) throw new EvalError("string-set!: not a character");
-                s.setChar(idx, c.value());
-                yield VOID;
+                throw new EvalError("string-set!: strings are immutable");
             }
             case "abs" -> {
                 if (args.size() != 1) throw new EvalError("abs requires exactly 1 argument");
@@ -1313,6 +1309,32 @@ public class Evaluator {
                 if (args.size() != 1) throw new EvalError("string-downcase requires exactly 1 argument");
                 if (!(args.getFirst() instanceof StrVal s)) throw new EvalError("string-downcase: not a string");
                 yield new StrVal(s.value().toLowerCase());
+            }
+            case "string->list" -> {
+                if (args.size() != 1) throw new EvalError("string->list requires exactly 1 argument");
+                if (!(args.getFirst() instanceof StrVal s)) throw new EvalError("string->list: not a string");
+                List<SchemeVal> chars = new ArrayList<>();
+                for (char ch : s.value().toCharArray()) chars.add(new CharVal(ch));
+                yield new ListVal(chars);
+            }
+            case "list->string" -> {
+                if (args.size() != 1) throw new EvalError("list->string requires exactly 1 argument");
+                if (!(args.getFirst() instanceof ListVal lst)) throw new EvalError("list->string: not a list");
+                StringBuilder sb = new StringBuilder();
+                for (SchemeVal v : lst.elements) {
+                    if (!(v instanceof CharVal c)) throw new EvalError("list->string: not a character");
+                    sb.append(c.value());
+                }
+                yield new StrVal(sb.toString());
+            }
+            case "char->integer" -> {
+                if (args.size() != 1) throw new EvalError("char->integer requires exactly 1 argument");
+                if (!(args.getFirst() instanceof CharVal c)) throw new EvalError("char->integer: not a character");
+                yield new IntVal(c.value());
+            }
+            case "integer->char" -> {
+                if (args.size() != 1) throw new EvalError("integer->char requires exactly 1 argument");
+                yield new CharVal((char) asLong(args.getFirst()));
             }
             default -> throw new EvalError("unbound variable: " + name);
         };
