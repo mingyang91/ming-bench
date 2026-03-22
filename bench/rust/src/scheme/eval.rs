@@ -114,8 +114,11 @@ fn eval_list_step(
                 return Ok(TcoAction::Result(v));
             }
             "string-set!" => {
-                let v = eval_string_set(&elements[1..], kw_span, env, output, ctx)?;
-                return Ok(TcoAction::Result(v));
+                return Err(EvalErrorKind::Type {
+                    expected: "mutable string".into(),
+                    got: "immutable string (R7RS strings are immutable)".into(),
+                }
+                .at(kw_span));
             }
             "call/cc" | "call-with-current-continuation" => {
                 let v = eval_callcc_form(&elements[1..], kw_span, env, output, ctx)?;
@@ -221,6 +224,10 @@ fn is_builtin(name: &str) -> bool {
             | "string->symbol"
             | "string-ref"
             | "string-copy"
+            | "string->list"
+            | "list->string"
+            | "char->integer"
+            | "integer->char"
             | "abs"
             | "modulo"
             | "remainder"
@@ -507,6 +514,10 @@ fn eval_builtin(
         "string->symbol" => eval_string_to_symbol(args, span),
         "string-ref" => eval_string_ref(args, span),
         "string-copy" => eval_string_copy(args, span),
+        "string->list" => eval_string_to_list(args, span),
+        "list->string" => eval_list_to_string(args, span),
+        "char->integer" => eval_char_to_integer(args, span),
+        "integer->char" => eval_integer_to_char(args, span),
         "abs" => eval_abs(args, span),
         "modulo" => eval_modulo(args, span),
         "remainder" => eval_remainder(args, span),
@@ -1941,57 +1952,97 @@ fn eval_define_syntax(args: &[Expr], span: &Span, env: &Env) -> Result<Value, Ev
     }
 }
 
-fn eval_string_set(
-    args: &[Expr],
-    span: &Span,
-    env: &Env,
-    output: &mut String,
-    ctx: &mut ContCtx,
-) -> Result<Value, EvalError> {
-    if args.len() != 3 {
+fn eval_string_to_list(args: &[Value], span: &Span) -> Result<Value, EvalError> {
+    if args.len() != 1 {
         return Err(EvalErrorKind::Arity {
-            name: "string-set!".into(),
-            expected: "3".into(),
+            name: "string->list".into(),
+            expected: "1".into(),
             got: args.len(),
         }
         .at(span));
     }
-    let var_name = match &args[0].kind {
-        ExprKind::Symbol(name) => name.clone(),
-        _ => {
-            return Err(EvalErrorKind::Type {
-                expected: "symbol".into(),
-                got: "non-symbol".into(),
-            }
-            .at(span))
-        }
-    };
-    let idx_val = eval(&args[1], env, output, ctx)?;
-    let idx = require_integer(&idx_val, span)? as usize;
-    let char_val = eval(&args[2], env, output, ctx)?;
-    let ch = match &char_val {
-        Value::Char(c) => *c,
-        other => {
-            return Err(EvalErrorKind::Type {
-                expected: "char".into(),
-                got: format!("{other}"),
-            }
-            .at(span))
-        }
-    };
-    let current = env.lookup(&var_name).map_err(|e| e.with_span(span))?;
-    let s = require_string(&current, span)?;
-    if idx >= s.len() {
-        return Err(EvalErrorKind::Type {
-            expected: "valid string index".into(),
-            got: format!("index {idx} for string of length {}", s.len()),
+    let s = require_string(&args[0], span)?;
+    let mut result = Value::Nil;
+    for ch in s.chars().rev() {
+        result = Value::Pair(Box::new(Value::Char(ch)), Box::new(result));
+    }
+    Ok(result)
+}
+
+fn eval_list_to_string(args: &[Value], span: &Span) -> Result<Value, EvalError> {
+    if args.len() != 1 {
+        return Err(EvalErrorKind::Arity {
+            name: "list->string".into(),
+            expected: "1".into(),
+            got: args.len(),
         }
         .at(span));
     }
-    let mut chars: Vec<char> = s.chars().collect();
-    chars[idx] = ch;
-    let new_s: String = chars.into_iter().collect();
-    env.set(&var_name, Value::SchemeString(new_s))
-        .map_err(|e| e.with_span(span))?;
-    Ok(Value::Nil)
+    let mut s = String::new();
+    let mut current = &args[0];
+    loop {
+        match current {
+            Value::Nil => break,
+            Value::Pair(car, cdr) => {
+                match car.as_ref() {
+                    Value::Char(c) => s.push(*c),
+                    other => {
+                        return Err(EvalErrorKind::Type {
+                            expected: "char".into(),
+                            got: format!("{other}"),
+                        }
+                        .at(span))
+                    }
+                }
+                current = cdr.as_ref();
+            }
+            other => {
+                return Err(EvalErrorKind::Type {
+                    expected: "proper list of chars".into(),
+                    got: format!("{other}"),
+                }
+                .at(span))
+            }
+        }
+    }
+    Ok(Value::SchemeString(s))
+}
+
+fn eval_char_to_integer(args: &[Value], span: &Span) -> Result<Value, EvalError> {
+    if args.len() != 1 {
+        return Err(EvalErrorKind::Arity {
+            name: "char->integer".into(),
+            expected: "1".into(),
+            got: args.len(),
+        }
+        .at(span));
+    }
+    match &args[0] {
+        Value::Char(c) => Ok(Value::Integer(*c as i64)),
+        other => Err(EvalErrorKind::Type {
+            expected: "char".into(),
+            got: format!("{other}"),
+        }
+        .at(span)),
+    }
+}
+
+fn eval_integer_to_char(args: &[Value], span: &Span) -> Result<Value, EvalError> {
+    if args.len() != 1 {
+        return Err(EvalErrorKind::Arity {
+            name: "integer->char".into(),
+            expected: "1".into(),
+            got: args.len(),
+        }
+        .at(span));
+    }
+    let n = require_integer(&args[0], span)?;
+    match char::from_u32(n as u32) {
+        Some(c) => Ok(Value::Char(c)),
+        None => Err(EvalErrorKind::Type {
+            expected: "valid Unicode code point".into(),
+            got: format!("{n}"),
+        }
+        .at(span)),
+    }
 }
