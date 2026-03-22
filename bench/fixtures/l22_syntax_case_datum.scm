@@ -2,8 +2,8 @@
 (define-syntax make-adder
   (lambda (stx)
     (syntax-case stx ()
-      ((_ n)
-       (with-syntax ((name (datum->syntax #'n
+      ((kw n)
+       (with-syntax ((name (datum->syntax #'kw
                      (string->symbol
                        (string-append "add-" (number->string (syntax->datum #'n)))))))
          #'(define (name x) (+ x n)))))))

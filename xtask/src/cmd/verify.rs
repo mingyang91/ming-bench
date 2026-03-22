@@ -29,18 +29,15 @@ fn should_skip(test_name: &str) -> Option<&'static str> {
     match test_name {
         // procedure-name is our custom feature, not in R7RS/R6RS
         n if n.starts_with("l25_procedure_name") => Some("custom feature (not in R7RS)"),
-        // Chez allows string-set! on mutable strings; our spec says error (R7RS immutability)
-        "l14_string_set_error" => Some("Chez allows string-set! (strings are mutable)"),
-        // Chez allows set! on unbound top-level vars (creates binding)
-        "l08_set_unbound_error" => Some("Chez allows set! on unbound (top-level)"),
-        // Reentrant continuations loop in eval wrapper
-        "l10_callcc_reentrant" => Some("reentrant continuation loops in eval wrapper"),
-        // Coroutine continuation loops in eval wrapper
-        "l12_coroutine_scheduler" => Some("coroutine continuation loops in eval wrapper"),
-        // Chez datum->syntax requires identifier, not arbitrary syntax
-        "l22_syntax_case_datum" => Some("Chez datum->syntax stricter than R7RS"),
-        // Newline output comparison issue
-        "l05_newline" => Some("output comparison with newline character"),
+        // Chez allows string-set! (R6RS: strings are mutable; R7RS: immutable)
+        "l14_string_set_error" => Some("Chez strings are mutable (R6RS)"),
+        // Chez allows set! on unbound vars at all scopes
+        "l08_set_unbound_error" => Some("Chez allows set! on unbound"),
+        // Reentrant continuations cannot be verified via eval wrapper
+        "l10_callcc_reentrant" => Some("reentrant continuation in eval wrapper"),
+        "l12_coroutine_scheduler" => Some("coroutine continuation in eval wrapper"),
+        // Newline output comparison
+        "l05_newline" => Some("output newline comparison"),
         _ => None,
     }
 }
