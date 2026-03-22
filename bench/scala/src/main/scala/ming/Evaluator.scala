@@ -96,7 +96,7 @@ object Evaluator:
   private def isSpecialForm(op: String): Boolean = op match
     case "define" | "if" | "quote" | "lambda" | "and" | "or" | "let" | "let*" | "letrec" | "letrec*" | "begin" |
         "cond" | "case" | "do" | "set!" | "call/cc" | "call-with-current-continuation" | "define-syntax" | "when" |
-        "guard" =>
+        "guard" | "define-record-type" =>
       true
     case _ => false
 

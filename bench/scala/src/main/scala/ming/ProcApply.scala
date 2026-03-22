@@ -15,6 +15,8 @@ private[ming] object ProcApply:
     case SchemeLambda(params, restParam, body, closure) =>
       val localEnv = bindArgs(params, restParam, args, closure)
       SpecialForms.startSequence(body, localEnv, k, out)
+    case np: SchemeNativeProc =>
+      ReturnS(np.fn(args), k, out)
     case SchemeContinuation(savedK) =>
       if args.length != 1 then throw new EvalError("continuation: expected 1 argument")
       windTransition(k, savedK, args.head, out)

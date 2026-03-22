@@ -134,6 +134,12 @@ object SchemeValue:
   case class SchemeMultipleValues(values: List[SchemeValue]) extends SchemeValue:
     def display: String = values.map(_.display).mkString(", ")
 
+  class SchemeRecord(val tag: AnyRef, val typeName: String, val fields: Array[SchemeValue]) extends SchemeValue:
+    def display: String = s"#<record:$typeName>"
+
+  class SchemeNativeProc(val name: String, val fn: List[SchemeValue] => SchemeValue) extends SchemeValue:
+    def display: String = s"#<procedure:$name>"
+
   class SchemeResolvedSymbol(
     val name: String,
     val resolveEnv: Env,

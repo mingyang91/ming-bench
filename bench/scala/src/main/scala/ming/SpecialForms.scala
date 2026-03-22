@@ -67,9 +67,10 @@ private[ming] object SpecialForms:
     case "call/cc" | "call-with-current-continuation" =>
       if args.length != 1 then throw new EvalError("call/cc: expected 1 argument")
       EvalS(args.head, env, Kont.CallCCK(k), out)
-    case "define-syntax" => evalDefineSyntax(args, env, k, out)
-    case "guard"         => ExceptionHandling.evalGuard(args, env, k, out)
-    case _               => throw new EvalError(s"unknown special form: $op")
+    case "define-syntax"      => evalDefineSyntax(args, env, k, out)
+    case "guard"              => ExceptionHandling.evalGuard(args, env, k, out)
+    case "define-record-type" => RecordTypes.evalDefineRecordType(args, env, k, out)
+    case _                    => throw new EvalError(s"unknown special form: $op")
 
   // --- Special form implementations ---
 
