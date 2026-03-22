@@ -9,15 +9,23 @@ object Evaluator:
     val exprs = Parser.parse(input)
     if exprs.isEmpty then throw new EvalError("empty input")
     val env = builtinEnv
-    val result = exprs.foldLeft((SchemeValue.Void: SchemeValue, env)) { case ((_, e), expr) =>
-      Interpreter.eval(expr, e)
+    val (result, _, _) = exprs.foldLeft((SchemeValue.Void: SchemeValue, env, "")) { case ((_, e, accOut), expr) =>
+      val (v, newE, o) = Interpreter.eval(expr, e)
+      (v, newE, accOut + o)
     }
-    result._1.display
+    result.display
 
   /** Evaluate Scheme expressions and return both the result string and any captured output from display/write/newline.
     */
   def evalStrWithOutput(input: String): (String, String) =
-    (evalStr(input), "")
+    val exprs = Parser.parse(input)
+    if exprs.isEmpty then throw new EvalError("empty input")
+    val env = builtinEnv
+    val (result, _, output) = exprs.foldLeft((SchemeValue.Void: SchemeValue, env, "")) { case ((_, e, accOut), expr) =>
+      val (v, newE, o) = Interpreter.eval(expr, e)
+      (v, newE, accOut + o)
+    }
+    (result.display, output)
 
   private val builtinNames: List[String] = List(
     "+",
@@ -41,7 +49,19 @@ object Evaluator:
     "boolean?",
     "string?",
     "symbol?",
-    "append"
+    "append",
+    "display",
+    "write",
+    "newline",
+    "string-append",
+    "string-length",
+    "substring",
+    "string->number",
+    "number->string",
+    "symbol->string",
+    "string->symbol",
+    "string-ref",
+    "char?"
   )
 
   private val builtinEnv: Map[String, SchemeValue] =

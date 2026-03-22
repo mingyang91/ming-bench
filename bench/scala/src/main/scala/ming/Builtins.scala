@@ -7,17 +7,18 @@ object Builtins:
   def applyBuiltin(
     name: String,
     args: List[SchemeValue]
-  ): SchemeValue =
+  ): (SchemeValue, String) =
     name match
-      case "+" => arithOp(args, 0L, _ + _)
+      case "+" => (arithOp(args, 0L, _ + _), "")
       case "-" =>
-        args match
+        val r = args match
           case Nil              => throw new EvalError("-: need at least 1 argument")
           case IntVal(n) :: Nil => IntVal(-n)
           case _                => arithOp(args.tail, asInt(args.head), _ - _)
-      case "*" => arithOp(args, 1L, _ * _)
+        (r, "")
+      case "*" => (arithOp(args, 1L, _ * _), "")
       case "/" =>
-        args match
+        val r = args match
           case Nil => throw new EvalError("/: need at least 1 argument")
           case _ =>
             val result = args.tail.foldLeft(asInt(args.head)) { (acc, v) =>
@@ -26,67 +27,84 @@ object Builtins:
               else acc / d
             }
             IntVal(result)
-      case "<"  => cmpOp(args, _ < _)
-      case ">"  => cmpOp(args, _ > _)
-      case "="  => cmpOp(args, _ == _)
-      case "<=" => cmpOp(args, _ <= _)
-      case ">=" => cmpOp(args, _ >= _)
+        (r, "")
+      case "<"  => (cmpOp(args, _ < _), "")
+      case ">"  => (cmpOp(args, _ > _), "")
+      case "="  => (cmpOp(args, _ == _), "")
+      case "<=" => (cmpOp(args, _ <= _), "")
+      case ">=" => (cmpOp(args, _ >= _), "")
       case "not" =>
         args match
-          case v :: Nil => BoolVal(!v.isTruthy)
+          case v :: Nil => (BoolVal(!v.isTruthy), "")
           case _        => throw new EvalError("not: expects 1 argument")
       case "cons" =>
         args match
-          case a :: b :: Nil => PairVal(a, b)
+          case a :: b :: Nil => (PairVal(a, b), "")
           case _             => throw new EvalError("cons: expects 2 arguments")
       case "car" =>
         args match
-          case PairVal(a, _) :: Nil      => a
-          case ListVal(h :: _, _) :: Nil => h
+          case PairVal(a, _) :: Nil      => (a, "")
+          case ListVal(h :: _, _) :: Nil => (h, "")
           case _                         => throw new EvalError("car: expects a pair")
       case "cdr" =>
         args match
-          case PairVal(_, d) :: Nil      => d
-          case ListVal(_ :: t, _) :: Nil => listToPairs(t)
+          case PairVal(_, d) :: Nil      => (d, "")
+          case ListVal(_ :: t, _) :: Nil => (listToPairs(t), "")
           case _                         => throw new EvalError("cdr: expects a pair")
       case "null?" =>
         args match
-          case v :: Nil => BoolVal(isNull(v))
+          case v :: Nil => (BoolVal(isNull(v)), "")
           case _        => throw new EvalError("null?: expects 1 argument")
-      case "list" => listToPairs(args)
+      case "list" => (listToPairs(args), "")
       case "length" =>
         args match
-          case v :: Nil => IntVal(pairLength(v))
+          case v :: Nil => (IntVal(pairLength(v)), "")
           case _        => throw new EvalError("length: expects 1 argument")
       case "pair?" =>
         args match
-          case v :: Nil => BoolVal(isPair(v))
+          case v :: Nil => (BoolVal(isPair(v)), "")
           case _        => throw new EvalError("pair?: expects 1 argument")
-      case "number?" =>
-        args match
-          case (_: IntVal) :: Nil => BoolVal(true)
-          case _ :: Nil           => BoolVal(false)
-          case _                  => throw new EvalError("number?: expects 1 argument")
-      case "boolean?" =>
-        args match
-          case (_: BoolVal) :: Nil => BoolVal(true)
-          case _ :: Nil            => BoolVal(false)
-          case _                   => throw new EvalError("boolean?: expects 1 argument")
-      case "string?" =>
-        args match
-          case (_: StringVal) :: Nil => BoolVal(true)
-          case _ :: Nil              => BoolVal(false)
-          case _                     => throw new EvalError("string?: expects 1 argument")
-      case "symbol?" =>
-        args match
-          case (_: SymbolVal) :: Nil => BoolVal(true)
-          case _ :: Nil              => BoolVal(false)
-          case _                     => throw new EvalError("symbol?: expects 1 argument")
+      case "number?" | "boolean?" | "string?" | "symbol?" =>
+        (typeCheck(name, args), "")
       case "append" =>
         args match
-          case a :: b :: Nil => appendLists(a, b)
+          case a :: b :: Nil => (appendLists(a, b), "")
           case _             => throw new EvalError("append: expects 2 arguments")
-      case _ => throw new EvalError(s"unknown procedure: $name")
+      // L05: I/O
+      case "display" =>
+        args match
+          case v :: Nil => (Void, v.displayOut)
+          case _        => throw new EvalError("display: expects 1 argument")
+      case "write" =>
+        args match
+          case v :: Nil => (Void, v.display)
+          case _        => throw new EvalError("write: expects 1 argument")
+      case "newline" =>
+        args match
+          case Nil => (Void, "\n")
+          case _   => throw new EvalError("newline: expects 0 arguments")
+      // L05: string operations
+      case "string-append"  => (stringAppend(args), "")
+      case "string-length"  => (stringLength(args), "")
+      case "substring"      => (substringOp(args), "")
+      case "string->number" => (stringToNumber(args), "")
+      case "number->string" => (numberToString(args), "")
+      case "symbol->string" => (symbolToString(args), "")
+      case "string->symbol" => (stringToSymbol(args), "")
+      case "string-ref"     => (stringRef(args), "")
+      case "char?"          => (typeCheck(name, args), "")
+      case _                => throw new EvalError(s"unknown procedure: $name")
+
+  private def typeCheck(name: String, args: List[SchemeValue]): SchemeValue =
+    val result = (name, args) match
+      case ("number?", (_: IntVal) :: Nil)    => true
+      case ("boolean?", (_: BoolVal) :: Nil)  => true
+      case ("string?", (_: StringVal) :: Nil) => true
+      case ("symbol?", (_: SymbolVal) :: Nil) => true
+      case ("char?", (_: CharVal) :: Nil)     => true
+      case (_, _ :: Nil)                      => false
+      case _                                  => throw new EvalError(s"$name: expects 1 argument")
+    BoolVal(result)
 
   def isNull(v: SchemeValue): Boolean = v match
     case ListVal(Nil, _) => true
@@ -117,6 +135,10 @@ object Builtins:
     case IntVal(n) => n
     case other     => throw new EvalError(s"expected number, got: ${other.display}")
 
+  private def asString(v: SchemeValue): String = v match
+    case StringVal(s) => s
+    case other        => throw new EvalError(s"expected string, got: ${other.display}")
+
   private def arithOp(
     args: List[SchemeValue],
     init: Long,
@@ -131,3 +153,50 @@ object Builtins:
     args match
       case a :: b :: Nil => BoolVal(op(asInt(a), asInt(b)))
       case _             => throw new EvalError("comparison expects 2 arguments")
+
+  private def stringAppend(args: List[SchemeValue]): SchemeValue =
+    StringVal(args.map(asString).mkString)
+
+  private def stringLength(args: List[SchemeValue]): SchemeValue =
+    args match
+      case v :: Nil => IntVal(asString(v).length.toLong)
+      case _        => throw new EvalError("string-length: expects 1 argument")
+
+  private def substringOp(args: List[SchemeValue]): SchemeValue =
+    args match
+      case s :: start :: end :: Nil =>
+        StringVal(asString(s).substring(asInt(start).toInt, asInt(end).toInt))
+      case _ => throw new EvalError("substring: expects 3 arguments")
+
+  private def stringToNumber(args: List[SchemeValue]): SchemeValue =
+    args match
+      case v :: Nil =>
+        val s = asString(v)
+        try IntVal(s.toLong)
+        catch case _: NumberFormatException => BoolVal(false)
+      case _ => throw new EvalError("string->number: expects 1 argument")
+
+  private def numberToString(args: List[SchemeValue]): SchemeValue =
+    args match
+      case v :: Nil => StringVal(asInt(v).toString)
+      case _        => throw new EvalError("number->string: expects 1 argument")
+
+  private def symbolToString(args: List[SchemeValue]): SchemeValue =
+    args match
+      case SymbolVal(name, _) :: Nil => StringVal(name)
+      case _ :: Nil                  => throw new EvalError("symbol->string: not a symbol")
+      case _                         => throw new EvalError("symbol->string: expects 1 argument")
+
+  private def stringToSymbol(args: List[SchemeValue]): SchemeValue =
+    args match
+      case v :: Nil => SymbolVal(asString(v))
+      case _        => throw new EvalError("string->symbol: expects 1 argument")
+
+  private def stringRef(args: List[SchemeValue]): SchemeValue =
+    args match
+      case s :: idx :: Nil =>
+        val str = asString(s)
+        val i   = asInt(idx).toInt
+        if i < 0 || i >= str.length then throw new EvalError("string-ref: index out of range")
+        CharVal(str.charAt(i))
+      case _ => throw new EvalError("string-ref: expects 2 arguments")
