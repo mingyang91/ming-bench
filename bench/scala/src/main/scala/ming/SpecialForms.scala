@@ -73,6 +73,7 @@ private[ming] object SpecialForms:
     case "with-syntax"        => SyntaxFormEval.evalWithSyntax(args, env, k, out)
     case "guard"              => ExceptionHandling.evalGuard(args, env, k, out)
     case "define-record-type" => RecordTypes.evalDefineRecordType(args, env, k, out)
+    case "case-lambda"        => ReturnS(makeCaseLambda(args, env), k, out)
     case _                    => throw new EvalError(s"unknown special form: $op")
 
   // --- Special form implementations ---
@@ -254,3 +255,18 @@ private[ming] object SpecialForms:
     case SchemeSymbol(restOnly) :: body if body.nonEmpty =>
       SchemeLambda(Nil, Some(restOnly), body, env)
     case _ => throw new EvalError("lambda: bad syntax")
+
+  private def makeCaseLambda(
+    clauses: List[SchemeValue],
+    env: Env
+  ): SchemeValue =
+    val lambdas = clauses.map {
+      case SchemeList(SchemeList(rawParams) :: body) if body.nonEmpty =>
+        val (paramNames, restParam) = parseParams(rawParams)
+        SchemeLambda(paramNames, restParam, body, env)
+      case SchemeList(SchemeSymbol(restOnly) :: body) if body.nonEmpty =>
+        SchemeLambda(Nil, Some(restOnly), body, env)
+      case other =>
+        throw new EvalError(s"case-lambda: bad clause: ${other.display}")
+    }
+    SchemeCaseLambda(lambdas)

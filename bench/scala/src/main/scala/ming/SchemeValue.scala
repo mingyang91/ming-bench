@@ -153,6 +153,11 @@ object SchemeValue:
   ) extends SchemeValue:
     def display: String = name
 
+  case class SchemeCaseLambda(
+    clauses: List[SchemeLambda]
+  ) extends SchemeValue:
+    def display: String = "#<procedure>"
+
   case class SchemeProcMacro(transformer: SchemeLambda, defEnv: Env) extends SchemeValue:
     def display: String = "#<macro>"
 

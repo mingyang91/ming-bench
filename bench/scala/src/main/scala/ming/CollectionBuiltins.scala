@@ -198,6 +198,7 @@ private[ming] object CollectionBuiltins:
     if args.length != 1 then throw new EvalError("procedure?: expected 1 argument")
     SchemeBool(args.head match
       case _: SchemeLambda       => true
+      case _: SchemeCaseLambda   => true
       case _: SchemeBuiltinProc  => true
       case _: SchemeContinuation => true
       case _                     => false)

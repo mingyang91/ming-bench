@@ -15,6 +15,8 @@ private[ming] object ProcApply:
     case SchemeLambda(params, restParam, body, closure) =>
       val localEnv = bindArgs(params, restParam, args, closure)
       SpecialForms.startSequence(body, localEnv, k, out)
+    case SchemeCaseLambda(clauses) =>
+      applyCaseLambda(clauses, args, k, out)
     case np: SchemeNativeProc =>
       ReturnS(np.fn(args), k, out)
     case SchemeContinuation(savedK) =>
@@ -71,6 +73,24 @@ private[ming] object ProcApply:
         )
       val (fixed, remaining) = args.splitAt(params.length)
       closure.extend(params :+ rest, fixed :+ Builtins.toPairChain(remaining))
+
+  private def applyCaseLambda(
+    clauses: List[SchemeLambda],
+    args: List[SchemeValue],
+    k: Kont,
+    out: String
+  ): Step =
+    val matching = clauses.find { lam =>
+      lam.restParam match
+        case None    => args.length == lam.params.length
+        case Some(_) => args.length >= lam.params.length
+    }
+    matching match
+      case Some(lam) => applyProc(lam, args, k, out)
+      case None =>
+        throw new EvalError(
+          s"case-lambda: no matching clause for ${args.length} arguments"
+        )
 
   private def applyApply(
     args: List[SchemeValue],
