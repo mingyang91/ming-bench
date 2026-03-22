@@ -195,221 +195,227 @@ function isTruthy(val) {
     return !(val.tag === 'boolean' && val.value === false);
 }
 function evalExpr(expr, env) {
-    switch (expr.tag) {
-        case 'number':
-        case 'boolean':
-        case 'string':
-            return expr;
-        case 'symbol':
-            return envLookup(env, expr.value, expr.pos);
-        case 'list': {
-            const elems = expr.elements;
-            if (elems.length === 0) {
-                throw new EvalError(`${posStr(expr.pos)}: empty application`);
-            }
-            const head = elems[0];
-            if (head.tag === 'symbol') {
-                switch (head.value) {
-                    case 'quote': {
-                        if (elems.length !== 2)
-                            throw new EvalError(`${posStr(expr.pos)}: quote: expected 1 argument`);
-                        return quoteDatum(elems[1]);
-                    }
-                    case 'if': {
-                        if (elems.length < 3 || elems.length > 4)
-                            throw new EvalError(`${posStr(expr.pos)}: if: expected 2 or 3 arguments`);
-                        const cond = evalExpr(elems[1], env);
-                        if (isTruthy(cond)) {
-                            return evalExpr(elems[2], env);
+    while (true) {
+        switch (expr.tag) {
+            case 'number':
+            case 'boolean':
+            case 'string':
+                return expr;
+            case 'symbol':
+                return envLookup(env, expr.value, expr.pos);
+            case 'list': {
+                const elems = expr.elements;
+                if (elems.length === 0) {
+                    throw new EvalError(`${posStr(expr.pos)}: empty application`);
+                }
+                const head = elems[0];
+                if (head.tag === 'symbol') {
+                    switch (head.value) {
+                        case 'quote': {
+                            if (elems.length !== 2)
+                                throw new EvalError(`${posStr(expr.pos)}: quote: expected 1 argument`);
+                            return quoteDatum(elems[1]);
                         }
-                        else if (elems.length === 4) {
-                            return evalExpr(elems[3], env);
-                        }
-                        return { tag: 'void' };
-                    }
-                    case 'define': {
-                        if (elems.length < 3)
-                            throw new EvalError(`${posStr(expr.pos)}: define: expected at least 2 arguments`);
-                        const target = elems[1];
-                        if (target.tag === 'symbol') {
-                            const val = evalExpr(elems[2], env);
-                            envDefine(env, target.value, val);
+                        case 'if': {
+                            if (elems.length < 3 || elems.length > 4)
+                                throw new EvalError(`${posStr(expr.pos)}: if: expected 2 or 3 arguments`);
+                            const cond = evalExpr(elems[1], env);
+                            if (isTruthy(cond)) {
+                                expr = elems[2];
+                                continue; // TCO
+                            }
+                            else if (elems.length === 4) {
+                                expr = elems[3];
+                                continue; // TCO
+                            }
                             return { tag: 'void' };
                         }
-                        if (target.tag === 'list' && target.elements.length >= 1 && target.elements[0].tag === 'symbol') {
-                            const name = target.elements[0].value;
-                            const params = target.elements.slice(1).map(p => {
+                        case 'define': {
+                            if (elems.length < 3)
+                                throw new EvalError(`${posStr(expr.pos)}: define: expected at least 2 arguments`);
+                            const target = elems[1];
+                            if (target.tag === 'symbol') {
+                                const val = evalExpr(elems[2], env);
+                                envDefine(env, target.value, val);
+                                return { tag: 'void' };
+                            }
+                            if (target.tag === 'list' && target.elements.length >= 1 && target.elements[0].tag === 'symbol') {
+                                const name = target.elements[0].value;
+                                const params = target.elements.slice(1).map(p => {
+                                    if (p.tag !== 'symbol')
+                                        throw new EvalError(`${posStr(expr.pos)}: define: parameter must be a symbol`);
+                                    return p.value;
+                                });
+                                const body = elems.slice(2);
+                                const lambda = { tag: 'lambda', params, body, env, pos: expr.pos };
+                                envDefine(env, name, lambda);
+                                return { tag: 'void' };
+                            }
+                            throw new EvalError(`${posStr(expr.pos)}: define: invalid syntax`);
+                        }
+                        case 'lambda': {
+                            if (elems.length < 3)
+                                throw new EvalError(`${posStr(expr.pos)}: lambda: expected at least 2 arguments`);
+                            const paramList = elems[1];
+                            if (paramList.tag !== 'list')
+                                throw new EvalError(`${posStr(expr.pos)}: lambda: parameters must be a list`);
+                            const params = paramList.elements.map(p => {
                                 if (p.tag !== 'symbol')
-                                    throw new EvalError(`${posStr(expr.pos)}: define: parameter must be a symbol`);
+                                    throw new EvalError(`${posStr(expr.pos)}: lambda: parameter must be a symbol`);
                                 return p.value;
                             });
                             const body = elems.slice(2);
-                            const lambda = { tag: 'lambda', params, body, env, pos: expr.pos };
-                            envDefine(env, name, lambda);
+                            return { tag: 'lambda', params, body, env, pos: expr.pos };
+                        }
+                        case 'and': {
+                            const andExprs = elems.slice(1);
+                            if (andExprs.length === 0)
+                                return { tag: 'boolean', value: true };
+                            for (let i = 0; i < andExprs.length - 1; i++) {
+                                const result = evalExpr(andExprs[i], env);
+                                if (!isTruthy(result))
+                                    return result;
+                            }
+                            expr = andExprs[andExprs.length - 1];
+                            continue; // TCO
+                        }
+                        case 'or': {
+                            const orExprs = elems.slice(1);
+                            if (orExprs.length === 0)
+                                return { tag: 'boolean', value: false };
+                            for (let i = 0; i < orExprs.length - 1; i++) {
+                                const result = evalExpr(orExprs[i], env);
+                                if (isTruthy(result))
+                                    return result;
+                            }
+                            expr = orExprs[orExprs.length - 1];
+                            continue; // TCO
+                        }
+                        case 'not': {
+                            if (elems.length !== 2)
+                                throw new EvalError(`${posStr(expr.pos)}: not: expected 1 argument`);
+                            const val = evalExpr(elems[1], env);
+                            return { tag: 'boolean', value: !isTruthy(val) };
+                        }
+                        case 'let': {
+                            let idx = 1;
+                            let loopName = null;
+                            const first = elems[idx];
+                            if (first.tag === 'symbol') {
+                                loopName = first.value;
+                                idx++;
+                            }
+                            const bindingList = elems[idx];
+                            if (bindingList.tag !== 'list')
+                                throw new EvalError('let: bindings must be a list');
+                            idx++;
+                            const body = elems.slice(idx);
+                            const paramNames = [];
+                            const initVals = [];
+                            for (const b of bindingList.elements) {
+                                if (b.tag !== 'list' || b.elements.length !== 2)
+                                    throw new EvalError('let: invalid binding');
+                                if (b.elements[0].tag !== 'symbol')
+                                    throw new EvalError('let: binding name must be a symbol');
+                                paramNames.push(b.elements[0].value);
+                                initVals.push(evalExpr(b.elements[1], env));
+                            }
+                            const letEnv = makeEnv(env);
+                            if (loopName) {
+                                const lambda = { tag: 'lambda', params: paramNames, body, env: letEnv };
+                                envDefine(letEnv, loopName, lambda);
+                            }
+                            for (let i = 0; i < paramNames.length; i++) {
+                                envDefine(letEnv, paramNames[i], initVals[i]);
+                            }
+                            if (body.length === 0)
+                                return { tag: 'void' };
+                            for (let i = 0; i < body.length - 1; i++) {
+                                evalExpr(body[i], letEnv);
+                            }
+                            expr = body[body.length - 1];
+                            env = letEnv;
+                            continue; // TCO
+                        }
+                        case 'begin': {
+                            const bodyExprs = elems.slice(1);
+                            if (bodyExprs.length === 0)
+                                return { tag: 'void' };
+                            for (let i = 0; i < bodyExprs.length - 1; i++) {
+                                evalExpr(bodyExprs[i], env);
+                            }
+                            expr = bodyExprs[bodyExprs.length - 1];
+                            continue; // TCO
+                        }
+                        case 'cond': {
+                            const clauses = elems.slice(1);
+                            let found = false;
+                            for (const clause of clauses) {
+                                if (clause.tag !== 'list' || clause.elements.length < 2)
+                                    throw new EvalError('cond: invalid clause');
+                                const test = clause.elements[0];
+                                if (test.tag === 'symbol' && test.value === 'else') {
+                                    for (let i = 1; i < clause.elements.length - 1; i++) {
+                                        evalExpr(clause.elements[i], env);
+                                    }
+                                    expr = clause.elements[clause.elements.length - 1];
+                                    found = true;
+                                    break;
+                                }
+                                const testVal = evalExpr(test, env);
+                                if (isTruthy(testVal)) {
+                                    if (clause.elements.length === 1)
+                                        return testVal;
+                                    for (let i = 1; i < clause.elements.length - 1; i++) {
+                                        evalExpr(clause.elements[i], env);
+                                    }
+                                    expr = clause.elements[clause.elements.length - 1];
+                                    found = true;
+                                    break;
+                                }
+                            }
+                            if (found)
+                                continue; // TCO
                             return { tag: 'void' };
                         }
-                        throw new EvalError(`${posStr(expr.pos)}: define: invalid syntax`);
                     }
-                    case 'lambda': {
-                        if (elems.length < 3)
-                            throw new EvalError(`${posStr(expr.pos)}: lambda: expected at least 2 arguments`);
-                        const paramList = elems[1];
-                        if (paramList.tag !== 'list')
-                            throw new EvalError(`${posStr(expr.pos)}: lambda: parameters must be a list`);
-                        const params = paramList.elements.map(p => {
-                            if (p.tag !== 'symbol')
-                                throw new EvalError(`${posStr(expr.pos)}: lambda: parameter must be a symbol`);
-                            return p.value;
-                        });
-                        const body = elems.slice(2);
-                        return { tag: 'lambda', params, body, env, pos: expr.pos };
-                    }
-                    case 'and':
-                        return evalAnd(elems.slice(1), env);
-                    case 'or':
-                        return evalOr(elems.slice(1), env);
-                    case 'not': {
-                        if (elems.length !== 2)
-                            throw new EvalError(`${posStr(expr.pos)}: not: expected 1 argument`);
-                        const val = evalExpr(elems[1], env);
-                        return { tag: 'boolean', value: !isTruthy(val) };
-                    }
-                    case 'let':
-                        return evalLet(elems, env);
-                    case 'begin':
-                        return evalBegin(elems.slice(1), env);
-                    case 'cond':
-                        return evalCond(elems.slice(1), env);
                 }
-            }
-            // Procedure application
-            const proc = evalExpr(head, env);
-            if (proc.tag === 'builtin') {
-                const args = elems.slice(1).map(e => evalExpr(e, env));
-                try {
-                    return proc.fn(args);
-                }
-                catch (e) {
-                    if (e instanceof EvalError && !/^\d/.test(e.message)) {
-                        throw new EvalError(`${posStr(expr.pos)}: ${e.message}`);
+                // Procedure application
+                const proc = evalExpr(head, env);
+                if (proc.tag === 'builtin') {
+                    const args = elems.slice(1).map(e => evalExpr(e, env));
+                    try {
+                        return proc.fn(args);
                     }
-                    throw e;
+                    catch (e) {
+                        if (e instanceof EvalError && !/^\d/.test(e.message)) {
+                            throw new EvalError(`${posStr(expr.pos)}: ${e.message}`);
+                        }
+                        throw e;
+                    }
                 }
+                if (proc.tag === 'lambda') {
+                    const args = elems.slice(1).map(e => evalExpr(e, env));
+                    if (args.length !== proc.params.length) {
+                        throw new EvalError(`${posStr(expr.pos)}: expected ${proc.params.length} arguments, got ${args.length}`);
+                    }
+                    const callEnv = makeEnv(proc.env);
+                    for (let i = 0; i < proc.params.length; i++) {
+                        envDefine(callEnv, proc.params[i], args[i]);
+                    }
+                    for (let i = 0; i < proc.body.length - 1; i++) {
+                        evalExpr(proc.body[i], callEnv);
+                    }
+                    expr = proc.body[proc.body.length - 1];
+                    env = callEnv;
+                    continue; // TCO
+                }
+                throw new EvalError(`${posStr(expr.pos)}: not a procedure`);
             }
-            const args = elems.slice(1).map(e => evalExpr(e, env));
-            return applyProc(proc, args, expr.pos);
-        }
-        default:
-            return expr;
-    }
-}
-function applyProc(proc, args, callPos) {
-    if (proc.tag === 'lambda') {
-        if (args.length !== proc.params.length) {
-            throw new EvalError(`${posStr(callPos)}: expected ${proc.params.length} arguments, got ${args.length}`);
-        }
-        const callEnv = makeEnv(proc.env);
-        for (let i = 0; i < proc.params.length; i++) {
-            envDefine(callEnv, proc.params[i], args[i]);
-        }
-        let result = { tag: 'void' };
-        for (const bodyExpr of proc.body) {
-            result = evalExpr(bodyExpr, callEnv);
-        }
-        return result;
-    }
-    if (proc.tag === 'builtin') {
-        return proc.fn(args);
-    }
-    throw new EvalError(`${posStr(callPos)}: not a procedure`);
-}
-// --- Special forms ---
-function evalAnd(exprs, env) {
-    let result = { tag: 'boolean', value: true };
-    for (const expr of exprs) {
-        result = evalExpr(expr, env);
-        if (!isTruthy(result))
-            return result;
-    }
-    return result;
-}
-function evalOr(exprs, env) {
-    let result = { tag: 'boolean', value: false };
-    for (const expr of exprs) {
-        result = evalExpr(expr, env);
-        if (isTruthy(result))
-            return result;
-    }
-    return result;
-}
-function evalLet(elems, env) {
-    // (let bindings body...) or (let name bindings body...) for named let
-    let idx = 1;
-    let loopName = null;
-    const first = elems[idx];
-    if (first.tag === 'symbol') {
-        loopName = first.value;
-        idx++;
-    }
-    const bindingList = elems[idx];
-    if (bindingList.tag !== 'list')
-        throw new EvalError('let: bindings must be a list');
-    idx++;
-    const body = elems.slice(idx);
-    const paramNames = [];
-    const initVals = [];
-    for (const b of bindingList.elements) {
-        if (b.tag !== 'list' || b.elements.length !== 2)
-            throw new EvalError('let: invalid binding');
-        if (b.elements[0].tag !== 'symbol')
-            throw new EvalError('let: binding name must be a symbol');
-        paramNames.push(b.elements[0].value);
-        initVals.push(evalExpr(b.elements[1], env));
-    }
-    const letEnv = makeEnv(env);
-    if (loopName) {
-        // Named let: create a lambda and bind it
-        const lambda = { tag: 'lambda', params: paramNames, body, env: letEnv };
-        envDefine(letEnv, loopName, lambda);
-    }
-    for (let i = 0; i < paramNames.length; i++) {
-        envDefine(letEnv, paramNames[i], initVals[i]);
-    }
-    let result = { tag: 'void' };
-    for (const bodyExpr of body) {
-        result = evalExpr(bodyExpr, letEnv);
-    }
-    return result;
-}
-function evalBegin(exprs, env) {
-    let result = { tag: 'void' };
-    for (const expr of exprs) {
-        result = evalExpr(expr, env);
-    }
-    return result;
-}
-function evalCond(clauses, env) {
-    for (const clause of clauses) {
-        if (clause.tag !== 'list' || clause.elements.length < 2)
-            throw new EvalError('cond: invalid clause');
-        const test = clause.elements[0];
-        if (test.tag === 'symbol' && test.value === 'else') {
-            let result = { tag: 'void' };
-            for (let i = 1; i < clause.elements.length; i++) {
-                result = evalExpr(clause.elements[i], env);
-            }
-            return result;
-        }
-        const testVal = evalExpr(test, env);
-        if (isTruthy(testVal)) {
-            let result = testVal;
-            for (let i = 1; i < clause.elements.length; i++) {
-                result = evalExpr(clause.elements[i], env);
-            }
-            return result;
+            default:
+                return expr;
         }
     }
-    return { tag: 'void' };
 }
 // --- Arithmetic & Comparison ---
 function requireNumbers(args, name) {

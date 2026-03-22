@@ -230,6 +230,7 @@ function isTruthy(val: SchemeVal): boolean {
 }
 
 function evalExpr(expr: SchemeVal, env: Env): SchemeVal {
+  while (true) {
   switch (expr.tag) {
     case 'number':
     case 'boolean':
@@ -253,9 +254,9 @@ function evalExpr(expr: SchemeVal, env: Env): SchemeVal {
             if (elems.length < 3 || elems.length > 4) throw new EvalError(`${posStr(expr.pos)}: if: expected 2 or 3 arguments`);
             const cond = evalExpr(elems[1], env);
             if (isTruthy(cond)) {
-              return evalExpr(elems[2], env);
+              expr = elems[2]; continue; // TCO
             } else if (elems.length === 4) {
-              return evalExpr(elems[3], env);
+              expr = elems[3]; continue; // TCO
             }
             return { tag: 'void' };
           }
@@ -291,21 +292,99 @@ function evalExpr(expr: SchemeVal, env: Env): SchemeVal {
             const body = elems.slice(2);
             return { tag: 'lambda', params, body, env, pos: expr.pos };
           }
-          case 'and':
-            return evalAnd(elems.slice(1), env);
-          case 'or':
-            return evalOr(elems.slice(1), env);
+          case 'and': {
+            const andExprs = elems.slice(1);
+            if (andExprs.length === 0) return { tag: 'boolean', value: true };
+            for (let i = 0; i < andExprs.length - 1; i++) {
+              const result = evalExpr(andExprs[i], env);
+              if (!isTruthy(result)) return result;
+            }
+            expr = andExprs[andExprs.length - 1]; continue; // TCO
+          }
+          case 'or': {
+            const orExprs = elems.slice(1);
+            if (orExprs.length === 0) return { tag: 'boolean', value: false };
+            for (let i = 0; i < orExprs.length - 1; i++) {
+              const result = evalExpr(orExprs[i], env);
+              if (isTruthy(result)) return result;
+            }
+            expr = orExprs[orExprs.length - 1]; continue; // TCO
+          }
           case 'not': {
             if (elems.length !== 2) throw new EvalError(`${posStr(expr.pos)}: not: expected 1 argument`);
             const val = evalExpr(elems[1], env);
             return { tag: 'boolean', value: !isTruthy(val) };
           }
-          case 'let':
-            return evalLet(elems, env);
-          case 'begin':
-            return evalBegin(elems.slice(1), env);
-          case 'cond':
-            return evalCond(elems.slice(1), env);
+          case 'let': {
+            let idx = 1;
+            let loopName: string | null = null;
+            const first = elems[idx];
+            if (first.tag === 'symbol') {
+              loopName = first.value;
+              idx++;
+            }
+            const bindingList = elems[idx];
+            if (bindingList.tag !== 'list') throw new EvalError('let: bindings must be a list');
+            idx++;
+            const body = elems.slice(idx);
+            const paramNames: string[] = [];
+            const initVals: SchemeVal[] = [];
+            for (const b of bindingList.elements) {
+              if (b.tag !== 'list' || b.elements.length !== 2) throw new EvalError('let: invalid binding');
+              if (b.elements[0].tag !== 'symbol') throw new EvalError('let: binding name must be a symbol');
+              paramNames.push(b.elements[0].value);
+              initVals.push(evalExpr(b.elements[1], env));
+            }
+            const letEnv = makeEnv(env);
+            if (loopName) {
+              const lambda: SchemeVal = { tag: 'lambda', params: paramNames, body, env: letEnv };
+              envDefine(letEnv, loopName, lambda);
+            }
+            for (let i = 0; i < paramNames.length; i++) {
+              envDefine(letEnv, paramNames[i], initVals[i]);
+            }
+            if (body.length === 0) return { tag: 'void' };
+            for (let i = 0; i < body.length - 1; i++) {
+              evalExpr(body[i], letEnv);
+            }
+            expr = body[body.length - 1]; env = letEnv; continue; // TCO
+          }
+          case 'begin': {
+            const bodyExprs = elems.slice(1);
+            if (bodyExprs.length === 0) return { tag: 'void' };
+            for (let i = 0; i < bodyExprs.length - 1; i++) {
+              evalExpr(bodyExprs[i], env);
+            }
+            expr = bodyExprs[bodyExprs.length - 1]; continue; // TCO
+          }
+          case 'cond': {
+            const clauses = elems.slice(1);
+            let found = false;
+            for (const clause of clauses) {
+              if (clause.tag !== 'list' || clause.elements.length < 2) throw new EvalError('cond: invalid clause');
+              const test = clause.elements[0];
+              if (test.tag === 'symbol' && test.value === 'else') {
+                for (let i = 1; i < clause.elements.length - 1; i++) {
+                  evalExpr(clause.elements[i], env);
+                }
+                expr = clause.elements[clause.elements.length - 1];
+                found = true;
+                break;
+              }
+              const testVal = evalExpr(test, env);
+              if (isTruthy(testVal)) {
+                if (clause.elements.length === 1) return testVal;
+                for (let i = 1; i < clause.elements.length - 1; i++) {
+                  evalExpr(clause.elements[i], env);
+                }
+                expr = clause.elements[clause.elements.length - 1];
+                found = true;
+                break;
+              }
+            }
+            if (found) continue; // TCO
+            return { tag: 'void' };
+          }
         }
       }
       // Procedure application
@@ -321,124 +400,28 @@ function evalExpr(expr: SchemeVal, env: Env): SchemeVal {
           throw e;
         }
       }
-      const args = elems.slice(1).map(e => evalExpr(e, env));
-      return applyProc(proc, args, expr.pos);
+      if (proc.tag === 'lambda') {
+        const args = elems.slice(1).map(e => evalExpr(e, env));
+        if (args.length !== proc.params.length) {
+          throw new EvalError(`${posStr(expr.pos)}: expected ${proc.params.length} arguments, got ${args.length}`);
+        }
+        const callEnv = makeEnv(proc.env);
+        for (let i = 0; i < proc.params.length; i++) {
+          envDefine(callEnv, proc.params[i], args[i]);
+        }
+        for (let i = 0; i < proc.body.length - 1; i++) {
+          evalExpr(proc.body[i], callEnv);
+        }
+        expr = proc.body[proc.body.length - 1]; env = callEnv; continue; // TCO
+      }
+      throw new EvalError(`${posStr(expr.pos)}: not a procedure`);
     }
     default:
       return expr;
   }
+  }
 }
 
-function applyProc(proc: SchemeVal, args: SchemeVal[], callPos?: Pos): SchemeVal {
-  if (proc.tag === 'lambda') {
-    if (args.length !== proc.params.length) {
-      throw new EvalError(`${posStr(callPos)}: expected ${proc.params.length} arguments, got ${args.length}`);
-    }
-    const callEnv = makeEnv(proc.env);
-    for (let i = 0; i < proc.params.length; i++) {
-      envDefine(callEnv, proc.params[i], args[i]);
-    }
-    let result: SchemeVal = { tag: 'void' };
-    for (const bodyExpr of proc.body) {
-      result = evalExpr(bodyExpr, callEnv);
-    }
-    return result;
-  }
-  if (proc.tag === 'builtin') {
-    return proc.fn(args);
-  }
-  throw new EvalError(`${posStr(callPos)}: not a procedure`);
-}
-
-// --- Special forms ---
-
-function evalAnd(exprs: SchemeVal[], env: Env): SchemeVal {
-  let result: SchemeVal = { tag: 'boolean', value: true };
-  for (const expr of exprs) {
-    result = evalExpr(expr, env);
-    if (!isTruthy(result)) return result;
-  }
-  return result;
-}
-
-function evalOr(exprs: SchemeVal[], env: Env): SchemeVal {
-  let result: SchemeVal = { tag: 'boolean', value: false };
-  for (const expr of exprs) {
-    result = evalExpr(expr, env);
-    if (isTruthy(result)) return result;
-  }
-  return result;
-}
-
-function evalLet(elems: SchemeVal[], env: Env): SchemeVal {
-  // (let bindings body...) or (let name bindings body...) for named let
-  let idx = 1;
-  let loopName: string | null = null;
-  const first = elems[idx];
-  if (first.tag === 'symbol') {
-    loopName = first.value;
-    idx++;
-  }
-  const bindingList = elems[idx];
-  if (bindingList.tag !== 'list') throw new EvalError('let: bindings must be a list');
-  idx++;
-  const body = elems.slice(idx);
-
-  const paramNames: string[] = [];
-  const initVals: SchemeVal[] = [];
-  for (const b of bindingList.elements) {
-    if (b.tag !== 'list' || b.elements.length !== 2) throw new EvalError('let: invalid binding');
-    if (b.elements[0].tag !== 'symbol') throw new EvalError('let: binding name must be a symbol');
-    paramNames.push(b.elements[0].value);
-    initVals.push(evalExpr(b.elements[1], env));
-  }
-
-  const letEnv = makeEnv(env);
-  if (loopName) {
-    // Named let: create a lambda and bind it
-    const lambda: SchemeVal = { tag: 'lambda', params: paramNames, body, env: letEnv };
-    envDefine(letEnv, loopName, lambda);
-  }
-  for (let i = 0; i < paramNames.length; i++) {
-    envDefine(letEnv, paramNames[i], initVals[i]);
-  }
-  let result: SchemeVal = { tag: 'void' };
-  for (const bodyExpr of body) {
-    result = evalExpr(bodyExpr, letEnv);
-  }
-  return result;
-}
-
-function evalBegin(exprs: SchemeVal[], env: Env): SchemeVal {
-  let result: SchemeVal = { tag: 'void' };
-  for (const expr of exprs) {
-    result = evalExpr(expr, env);
-  }
-  return result;
-}
-
-function evalCond(clauses: SchemeVal[], env: Env): SchemeVal {
-  for (const clause of clauses) {
-    if (clause.tag !== 'list' || clause.elements.length < 2) throw new EvalError('cond: invalid clause');
-    const test = clause.elements[0];
-    if (test.tag === 'symbol' && test.value === 'else') {
-      let result: SchemeVal = { tag: 'void' };
-      for (let i = 1; i < clause.elements.length; i++) {
-        result = evalExpr(clause.elements[i], env);
-      }
-      return result;
-    }
-    const testVal = evalExpr(test, env);
-    if (isTruthy(testVal)) {
-      let result: SchemeVal = testVal;
-      for (let i = 1; i < clause.elements.length; i++) {
-        result = evalExpr(clause.elements[i], env);
-      }
-      return result;
-    }
-  }
-  return { tag: 'void' };
-}
 
 // --- Arithmetic & Comparison ---
 
