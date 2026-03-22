@@ -12,8 +12,8 @@ pub fn eval_str(input: &str) -> Result<String, EvalError> {
     let exprs = parser::parse(input)?;
     let global = env::Env::new();
     let mut last = value::Value::Void;
-    for expr in &exprs {
-        last = eval::eval(expr, &global)?;
+    for (expr, span) in &exprs {
+        last = eval::eval(expr, &global).map_err(|e| e.at(*span))?;
     }
     Ok(last.to_string())
 }

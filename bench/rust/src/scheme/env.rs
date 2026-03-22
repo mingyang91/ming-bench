@@ -32,9 +32,7 @@ impl Env {
         } else if let Some(ref parent) = self.parent {
             parent.borrow().get(name)
         } else {
-            Err(EvalError::UnboundVariable {
-                name: name.to_string(),
-            })
+            Err(EvalError::unbound(name))
         }
     }
 
