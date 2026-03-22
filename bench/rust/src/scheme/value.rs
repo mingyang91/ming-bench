@@ -11,6 +11,7 @@ pub enum Value {
     Boolean(bool),
     Str(String),
     Symbol(String),
+    Char(char),
     List(Vec<Value>),
     Lambda {
         params: Vec<String>,
@@ -27,6 +28,7 @@ impl PartialEq for Value {
             (Value::Boolean(a), Value::Boolean(b)) => a == b,
             (Value::Str(a), Value::Str(b)) => a == b,
             (Value::Symbol(a), Value::Symbol(b)) => a == b,
+            (Value::Char(a), Value::Char(b)) => a == b,
             (Value::List(a), Value::List(b)) => a == b,
             (Value::Void, Value::Void) => true,
             _ => false,
@@ -42,6 +44,7 @@ impl fmt::Display for Value {
             Value::Boolean(false) => write!(f, "#f"),
             Value::Str(s) => write!(f, "\"{}\"", s),
             Value::Symbol(s) => write!(f, "{s}"),
+            Value::Char(c) => write!(f, "#\\{c}"),
             Value::List(items) => {
                 write!(f, "(")?;
                 for (i, item) in items.iter().enumerate() {
@@ -62,5 +65,30 @@ impl Value {
     /// In Scheme, only #f is falsy.
     pub fn is_truthy(&self) -> bool {
         !matches!(self, Value::Boolean(false))
+    }
+
+    /// Format for `display` — strings without quotes, chars as raw character.
+    pub fn display_fmt(&self, out: &mut String) {
+        match self {
+            Value::Str(s) => out.push_str(s),
+            Value::Char(c) => out.push(*c),
+            Value::List(items) => {
+                out.push('(');
+                for (i, item) in items.iter().enumerate() {
+                    if i > 0 {
+                        out.push(' ');
+                    }
+                    item.display_fmt(out);
+                }
+                out.push(')');
+            }
+            other => out.push_str(&other.to_string()),
+        }
+    }
+
+    /// Format for `write` — strings with quotes (same as Display).
+    pub fn write_fmt(&self, out: &mut String) {
+        use std::fmt::Write;
+        let _ = write!(out, "{self}");
     }
 }

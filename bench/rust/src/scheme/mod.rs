@@ -11,17 +11,25 @@ pub use error::EvalError;
 pub fn eval_str(input: &str) -> Result<String, EvalError> {
     let exprs = parser::parse(input)?;
     let global = env::Env::new();
+    let mut out = String::new();
     let mut last = value::Value::Void;
     for (expr, span) in &exprs {
-        last = eval::eval(expr, &global).map_err(|e| e.at(*span))?;
+        last = eval::eval(expr, &global, &mut out).map_err(|e| e.at(*span))?;
     }
     Ok(last.to_string())
 }
 
 /// Evaluate Scheme expressions, returning both the result value and
 /// any output produced by `display`, `write`, or `newline`.
-pub fn eval_str_with_output(_input: &str) -> Result<(String, String), EvalError> {
-    todo!()
+pub fn eval_str_with_output(input: &str) -> Result<(String, String), EvalError> {
+    let exprs = parser::parse(input)?;
+    let global = env::Env::new();
+    let mut out = String::new();
+    let mut last = value::Value::Void;
+    for (expr, span) in &exprs {
+        last = eval::eval(expr, &global, &mut out).map_err(|e| e.at(*span))?;
+    }
+    Ok((last.to_string(), out))
 }
 
 #[cfg(test)]
