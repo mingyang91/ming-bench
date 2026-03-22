@@ -24,7 +24,7 @@ public class Evaluator {
     record ListVal(List<SchemeVal> elements) implements SchemeVal {}
     record SymbolVal(String name) implements SchemeVal {}
     record VoidVal() implements SchemeVal {}
-    record LambdaVal(List<String> params, List<SchemeVal> body, Env env) implements SchemeVal {}
+    record LambdaVal(List<String> params, String restParam, List<SchemeVal> body, Env env) implements SchemeVal {}
     record BuiltinVal(String name) implements SchemeVal {}
 
     private static final SchemeVal VOID = new VoidVal();
@@ -70,7 +70,7 @@ public class Evaluator {
             "display", "write", "newline",
             "string-append", "string-length", "substring", "string->number", "number->string",
             "symbol->string", "string->symbol", "string-ref", "char?",
-            "string-copy", "string-set!"};
+            "string-copy", "string-set!", "apply"};
         for (String b : builtins) {
             env.define(b, new BuiltinVal(b));
         }
@@ -289,11 +289,20 @@ public class Evaluator {
                                     throw new EvalError("define: empty name list");
                                 String fname = ((SymbolVal) nameAndParams.elements().getFirst()).name();
                                 List<String> params = new ArrayList<>();
-                                for (int i = 1; i < nameAndParams.elements().size(); i++) {
-                                    params.add(((SymbolVal) nameAndParams.elements().get(i)).name());
+                                String restParam = null;
+                                List<SchemeVal> pElems = nameAndParams.elements();
+                                for (int i = 1; i < pElems.size(); i++) {
+                                    String pName = ((SymbolVal) pElems.get(i)).name();
+                                    if (pName.equals(".")) {
+                                        if (i + 1 < pElems.size()) {
+                                            restParam = ((SymbolVal) pElems.get(i + 1)).name();
+                                        }
+                                        break;
+                                    }
+                                    params.add(pName);
                                 }
                                 List<SchemeVal> body = new ArrayList<>(elems.subList(2, elems.size()));
-                                env.define(fname, new LambdaVal(params, body, env));
+                                env.define(fname, new LambdaVal(params, restParam, body, env));
                                 return VOID;
                             } else {
                                 throw new EvalError("define: invalid syntax");
@@ -303,15 +312,25 @@ public class Evaluator {
                             if (elems.size() < 3) throw new EvalError("lambda requires params and body");
                             SchemeVal paramSpec = elems.get(1);
                             List<String> params = new ArrayList<>();
+                            String restParam = null;
                             if (paramSpec instanceof ListVal pl) {
-                                for (SchemeVal p : pl.elements()) {
-                                    params.add(((SymbolVal) p).name());
+                                for (int i = 0; i < pl.elements().size(); i++) {
+                                    String pName = ((SymbolVal) pl.elements().get(i)).name();
+                                    if (pName.equals(".")) {
+                                        if (i + 1 < pl.elements().size()) {
+                                            restParam = ((SymbolVal) pl.elements().get(i + 1)).name();
+                                        }
+                                        break;
+                                    }
+                                    params.add(pName);
                                 }
+                            } else if (paramSpec instanceof SymbolVal restOnly) {
+                                restParam = restOnly.name();
                             } else {
                                 throw new EvalError("lambda: invalid parameter list");
                             }
                             List<SchemeVal> body = new ArrayList<>(elems.subList(2, elems.size()));
-                            return new LambdaVal(params, body, env);
+                            return new LambdaVal(params, restParam, body, env);
                         }
                         case "and": {
                             if (elems.size() == 1) return new BoolVal(true);
@@ -349,7 +368,7 @@ public class Evaluator {
                                 }
                                 List<SchemeVal> body = new ArrayList<>(elems.subList(3, elems.size()));
                                 Env letEnv = new Env(env);
-                                LambdaVal loopFn = new LambdaVal(params, body, letEnv);
+                                LambdaVal loopFn = new LambdaVal(params, null, body, letEnv);
                                 letEnv.define(loopName.name(), loopFn);
                                 // Apply the loop function with TCO
                                 Env callEnv = new Env(letEnv);
@@ -429,13 +448,7 @@ public class Evaluator {
                     args.add(eval(elems.get(i), env));
                 }
                 if (proc instanceof LambdaVal lambda) {
-                    if (args.size() != lambda.params().size()) {
-                        throw new EvalError("wrong number of arguments: expected " + lambda.params().size() + ", got " + args.size());
-                    }
-                    Env callEnv = new Env(lambda.env());
-                    for (int i = 0; i < lambda.params().size(); i++) {
-                        callEnv.define(lambda.params().get(i), args.get(i));
-                    }
+                    Env callEnv = bindLambdaArgs(lambda, args);
                     for (int j = 0; j < lambda.body().size() - 1; j++) {
                         eval(lambda.body().get(j), callEnv);
                     }
@@ -443,6 +456,9 @@ public class Evaluator {
                     env = callEnv;
                     continue trampoline;
                 } else if (proc instanceof BuiltinVal b) {
+                    if (b.name().equals("apply")) {
+                        return doApply(args);
+                    }
                     return applyBuiltin(b.name(), args);
                 }
                 throw new EvalError("not a procedure: " + display(proc));
@@ -455,17 +471,35 @@ public class Evaluator {
         }
     }
 
-    private SchemeVal applyProc(SchemeVal proc, List<SchemeVal> args) throws EvalError {
-        if (proc instanceof BuiltinVal b) {
-            return applyBuiltin(b.name(), args);
-        } else if (proc instanceof LambdaVal lambda) {
+    private Env bindLambdaArgs(LambdaVal lambda, List<SchemeVal> args) throws EvalError {
+        if (lambda.restParam() != null) {
+            if (args.size() < lambda.params().size()) {
+                throw new EvalError("wrong number of arguments: expected at least " + lambda.params().size() + ", got " + args.size());
+            }
+        } else {
             if (args.size() != lambda.params().size()) {
                 throw new EvalError("wrong number of arguments: expected " + lambda.params().size() + ", got " + args.size());
             }
-            Env callEnv = new Env(lambda.env());
-            for (int i = 0; i < lambda.params().size(); i++) {
-                callEnv.define(lambda.params().get(i), args.get(i));
+        }
+        Env callEnv = new Env(lambda.env());
+        for (int i = 0; i < lambda.params().size(); i++) {
+            callEnv.define(lambda.params().get(i), args.get(i));
+        }
+        if (lambda.restParam() != null) {
+            List<SchemeVal> rest = new ArrayList<>(args.subList(lambda.params().size(), args.size()));
+            callEnv.define(lambda.restParam(), new ListVal(rest));
+        }
+        return callEnv;
+    }
+
+    private SchemeVal applyProc(SchemeVal proc, List<SchemeVal> args) throws EvalError {
+        if (proc instanceof BuiltinVal b) {
+            if (b.name().equals("apply")) {
+                return doApply(args);
             }
+            return applyBuiltin(b.name(), args);
+        } else if (proc instanceof LambdaVal lambda) {
+            Env callEnv = bindLambdaArgs(lambda, args);
             SchemeVal result = VOID;
             for (SchemeVal bodyExpr : lambda.body()) {
                 result = eval(bodyExpr, callEnv);
@@ -473,6 +507,19 @@ public class Evaluator {
             return result;
         }
         throw new EvalError("not a procedure: " + display(proc));
+    }
+
+    private SchemeVal doApply(List<SchemeVal> args) throws EvalError {
+        if (args.size() < 2) throw new EvalError("apply requires at least 2 arguments");
+        SchemeVal proc = args.get(0);
+        SchemeVal lastArg = args.get(args.size() - 1);
+        if (!(lastArg instanceof ListVal lastList)) throw new EvalError("apply: last argument must be a list");
+        List<SchemeVal> allArgs = new ArrayList<>();
+        for (int i = 1; i < args.size() - 1; i++) {
+            allArgs.add(args.get(i));
+        }
+        allArgs.addAll(lastList.elements());
+        return applyProc(proc, allArgs);
     }
 
     private boolean isFalse(SchemeVal val) {
