@@ -88,6 +88,12 @@ function tokenize(input: string): Token[] {
       tokens.push({ text: s, pos: startPos });
       continue;
     }
+    // syntax shorthand #'
+    if (ch === '#' && i + 1 < input.length && input[i + 1] === "'") {
+      tokens.push({ text: "#'", pos: startPos });
+      advance(); advance();
+      continue;
+    }
     // atom
     let atom = '';
     while (
@@ -119,6 +125,11 @@ function parseTokens(tokens: Token[], idx: number): [Expr, number] {
   if (tok.text === "'") {
     const [inner, next] = parseTokens(tokens, idx + 1);
     return [{ tag: 'list', items: [{ tag: 'symbol', name: 'quote', pos: p }, inner], pos: p }, next];
+  }
+
+  if (tok.text === "#'") {
+    const [inner, next] = parseTokens(tokens, idx + 1);
+    return [{ tag: 'list', items: [{ tag: 'symbol', name: 'syntax', pos: p }, inner], pos: p }, next];
   }
 
   if (tok.text === '(') {
@@ -241,7 +252,9 @@ type Value =
   | { tag: 'lambda'; params: string[]; rest: string | null; body: Expr[]; env: Env }
   | { tag: 'continuation'; id: number; exprPos: string; topIdx: number }
   | { tag: 'macro'; literals: string[]; rules: { pattern: Expr; template: Expr }[]; defEnv: Env }
-  | { tag: 'record'; typeId: symbol; typeName: string; fields: Map<string, Value> };
+  | { tag: 'record'; typeId: symbol; typeName: string; fields: Map<string, Value> }
+  | { tag: 'syntax'; expr: Expr }
+  | { tag: 'transformer'; proc: Value; defEnv: Env };
 
 function isTruthy(v: Value): boolean {
   return !(v.tag === 'boolean' && v.value === false);
@@ -312,6 +325,8 @@ function displayValue(v: Value): string {
     case 'macro': return '#<macro>';
     case 'vector': return `#(${v.items.map(displayValue).join(' ')})`;
     case 'record': return `#<record:${v.typeName}>`;
+    case 'syntax': return `#<syntax>`;
+    case 'transformer': return `#<transformer>`;
   }
 }
 
@@ -651,6 +666,15 @@ function makeGlobalEnv(output: string[] = []): Env {
   env.define('string->symbol', { tag: 'builtin', name: 'string->symbol', fn(args) {
     if (args.length !== 1 || args[0].tag !== 'string') throw new EvalError('string->symbol: expected string');
     return { tag: 'symbol', name: args[0].value };
+  }});
+  env.define('syntax->datum', { tag: 'builtin', name: 'syntax->datum', fn(args) {
+    if (args.length !== 1 || args[0].tag !== 'syntax') throw new EvalError('syntax->datum: expected syntax object');
+    return exprToValue(args[0].expr);
+  }});
+  env.define('datum->syntax', { tag: 'builtin', name: 'datum->syntax', fn(args) {
+    if (args.length !== 2) throw new EvalError('datum->syntax: expected 2 arguments');
+    const pos: Pos = args[0].tag === 'syntax' ? args[0].expr.pos : { line: 0, col: 0 };
+    return { tag: 'syntax' as const, expr: valueToExpr(args[1], pos) };
   }});
   env.define('string-ref', { tag: 'builtin', name: 'string-ref', fn(args) {
     if (args.length !== 2 || args[0].tag !== 'string' || args[1].tag !== 'number')
@@ -1205,6 +1229,7 @@ function gensym(name: string): string {
 const SPECIAL_FORMS = new Set([
   'if', 'define', 'set!', 'quote', 'lambda', 'and', 'or',
   'let', 'begin', 'cond', 'define-syntax', 'syntax-rules',
+  'syntax-case', 'syntax', 'with-syntax',
 ]);
 
 function collectPatternVars(patternItems: Expr[], literals: Set<string>): Set<string> {
@@ -1362,6 +1387,87 @@ function expandMacro(macro: Value & { tag: 'macro' }, form: Expr & { tag: 'list'
   throw new EvalError(`${fmtPos(form.pos)}: no matching pattern for macro`);
 }
 
+// ── syntax-case support ──────────────────────────────────────────────
+
+interface SyntaxFrame {
+  bindings: PatternBindings;
+  patternVars: Set<string>;
+  literals: Set<string>;
+  defEnv: Env;
+}
+
+const syntaxFrames: SyntaxFrame[] = [];
+
+function valueToExpr(v: Value, pos: Pos): Expr {
+  switch (v.tag) {
+    case 'number': return { tag: 'number', value: v.value, pos, exact: v.exact, num: v.num, den: v.den };
+    case 'boolean': return { tag: 'boolean', value: v.value, pos };
+    case 'string': return { tag: 'string', value: v.value, pos };
+    case 'char': return { tag: 'char', value: v.value, pos };
+    case 'symbol': return { tag: 'symbol', name: v.name, pos };
+    case 'nil': return { tag: 'list', items: [], pos };
+    case 'pair': {
+      const items: Expr[] = [];
+      let cur: Value = v;
+      while (cur.tag === 'pair') {
+        items.push(valueToExpr(cur.car, pos));
+        cur = cur.cdr;
+      }
+      if (cur.tag !== 'nil') throw new EvalError('datum->syntax: cannot convert improper list');
+      return { tag: 'list', items, pos };
+    }
+    case 'syntax': return v.expr;
+    default: throw new EvalError(`datum->syntax: cannot convert ${v.tag}`);
+  }
+}
+
+function expandSyntax(
+  template: Expr,
+  bindings: PatternBindings,
+  patternVars: Set<string>,
+  pos: Pos,
+): Expr {
+  if (template.tag === 'symbol') {
+    const name = template.name;
+    if (patternVars.has(name)) {
+      const val = bindings.get(name);
+      if (val !== undefined && !Array.isArray(val)) return val;
+      if (val === undefined) return template;
+      throw new EvalError('syntax: ellipsis variable used outside ellipsis context');
+    }
+    return template;
+  }
+
+  if (template.tag === 'list') {
+    const result: Expr[] = [];
+    for (let i = 0; i < template.items.length; i++) {
+      const nextTpl = i + 1 < template.items.length ? template.items[i + 1] : null;
+      if (nextTpl && nextTpl.tag === 'symbol' && nextTpl.name === '...') {
+        const subTemplate = template.items[i];
+        const ellipsisVars = findEllipsisVars(subTemplate, patternVars);
+        if (ellipsisVars.length > 0) {
+          const firstArr = bindings.get(ellipsisVars[0]);
+          const count = Array.isArray(firstArr) ? firstArr.length : 0;
+          for (let k = 0; k < count; k++) {
+            const iterBindings = new Map(bindings);
+            for (const ev of ellipsisVars) {
+              const arr = bindings.get(ev);
+              if (Array.isArray(arr)) iterBindings.set(ev, arr[k]);
+            }
+            result.push(expandSyntax(subTemplate, iterBindings, patternVars, pos));
+          }
+        }
+        i++; // skip ...
+        continue;
+      }
+      result.push(expandSyntax(template.items[i], bindings, patternVars, pos));
+    }
+    return { tag: 'list', items: result, pos: template.pos };
+  }
+
+  return template;
+}
+
 // ── Eval ─────────────────────────────────────────────────────────────
 
 function evaluate(expr: Expr, env: Env): Value {
@@ -1514,24 +1620,159 @@ function evaluate(expr: Expr, env: Env): Value {
             const dsName = items[1];
             if (dsName.tag !== 'symbol') throw new EvalError(`${fmtPos(expr.pos)}: define-syntax: expected symbol`);
             const transformer = items[2];
-            if (transformer.tag !== 'list' || transformer.items.length < 2 ||
-                transformer.items[0].tag !== 'symbol' || transformer.items[0].name !== 'syntax-rules') {
-              throw new EvalError(`${fmtPos(expr.pos)}: define-syntax: expected syntax-rules`);
+            if (transformer.tag === 'list' && transformer.items.length >= 2 &&
+                transformer.items[0].tag === 'symbol' && transformer.items[0].name === 'syntax-rules') {
+              const litExpr = transformer.items[1];
+              if (litExpr.tag !== 'list') throw new EvalError(`${fmtPos(expr.pos)}: syntax-rules: expected literals list`);
+              const lits = litExpr.items.map(l => {
+                if (l.tag !== 'symbol') throw new EvalError(`${fmtPos(expr.pos)}: syntax-rules: expected symbol in literals`);
+                return l.name;
+              });
+              const macroRules: { pattern: Expr; template: Expr }[] = [];
+              for (let ri = 2; ri < transformer.items.length; ri++) {
+                const rule = transformer.items[ri];
+                if (rule.tag !== 'list' || rule.items.length !== 2) throw new EvalError(`${fmtPos(expr.pos)}: syntax-rules: bad rule`);
+                macroRules.push({ pattern: rule.items[0], template: rule.items[1] });
+              }
+              env.define(dsName.name, { tag: 'macro', literals: lits, rules: macroRules, defEnv: env });
+            } else {
+              // syntax-case transformer: evaluate the expression (should be a lambda)
+              const proc = evaluate(transformer, env);
+              env.define(dsName.name, { tag: 'transformer', proc, defEnv: env });
             }
-            const litExpr = transformer.items[1];
-            if (litExpr.tag !== 'list') throw new EvalError(`${fmtPos(expr.pos)}: syntax-rules: expected literals list`);
-            const lits = litExpr.items.map(l => {
-              if (l.tag !== 'symbol') throw new EvalError(`${fmtPos(expr.pos)}: syntax-rules: expected symbol in literals`);
-              return l.name;
-            });
-            const macroRules: { pattern: Expr; template: Expr }[] = [];
-            for (let ri = 2; ri < transformer.items.length; ri++) {
-              const rule = transformer.items[ri];
-              if (rule.tag !== 'list' || rule.items.length !== 2) throw new EvalError(`${fmtPos(expr.pos)}: syntax-rules: bad rule`);
-              macroRules.push({ pattern: rule.items[0], template: rule.items[1] });
-            }
-            env.define(dsName.name, { tag: 'macro', literals: lits, rules: macroRules, defEnv: env });
             return { tag: 'nil' };
+          }
+
+          case 'syntax-case': {
+            // (syntax-case stx-expr (literal ...) clause ...)
+            if (items.length < 4) throw new EvalError(`${fmtPos(expr.pos)}: syntax-case: bad syntax`);
+            const stxVal = evaluate(items[1], env);
+            if (stxVal.tag !== 'syntax') throw new EvalError(`${fmtPos(expr.pos)}: syntax-case: expected syntax object`);
+            const stxExpr = stxVal.expr;
+
+            const scLitExpr = items[2];
+            if (scLitExpr.tag !== 'list') throw new EvalError(`${fmtPos(expr.pos)}: syntax-case: expected literals list`);
+            const scLiterals = new Set(scLitExpr.items.map(l => {
+              if (l.tag !== 'symbol') throw new EvalError(`${fmtPos(expr.pos)}: syntax-case: expected symbol in literals`);
+              return l.name;
+            }));
+
+            for (let ci = 3; ci < items.length; ci++) {
+              const clause = items[ci];
+              if (clause.tag !== 'list' || clause.items.length < 2 || clause.items.length > 3)
+                throw new EvalError(`${fmtPos(expr.pos)}: syntax-case: bad clause`);
+
+              const scPattern = clause.items[0];
+              const hasFender = clause.items.length === 3;
+              const scBody = clause.items[hasFender ? 2 : 1];
+
+              // Match pattern against stxExpr
+              let scInputItems: Expr[];
+              let scPatternItems: Expr[];
+              if (scPattern.tag === 'list' && stxExpr.tag === 'list') {
+                scPatternItems = scPattern.items;
+                scInputItems = stxExpr.items;
+              } else if (scPattern.tag === 'symbol' && scPattern.name !== '_') {
+                // Single symbol pattern — bind whole stx
+                const scBindings: PatternBindings = new Map();
+                scBindings.set(scPattern.name, stxExpr);
+                const scPVars = new Set([scPattern.name]);
+                syntaxFrames.push({ bindings: scBindings, patternVars: scPVars, literals: scLiterals, defEnv: env });
+                try {
+                  const scResult = evaluate(scBody, env);
+                  syntaxFrames.pop();
+                  return scResult;
+                } catch (e) {
+                  syntaxFrames.pop();
+                  throw e;
+                }
+              } else {
+                continue; // pattern doesn't match
+              }
+
+              const scBindings = matchPattern(scPatternItems, scInputItems, scLiterals);
+              if (scBindings === null) continue;
+
+              const scPVars = collectPatternVars(scPatternItems, scLiterals);
+              syntaxFrames.push({ bindings: scBindings, patternVars: scPVars, literals: scLiterals, defEnv: env });
+
+              // Evaluate fender if present
+              if (hasFender) {
+                const fenderResult = evaluate(clause.items[1], env);
+                if (!isTruthy(fenderResult)) {
+                  syntaxFrames.pop();
+                  continue;
+                }
+              }
+
+              try {
+                const scResult = evaluate(scBody, env);
+                syntaxFrames.pop();
+                return scResult;
+              } catch (e) {
+                syntaxFrames.pop();
+                throw e;
+              }
+            }
+            throw new EvalError(`${fmtPos(expr.pos)}: syntax-case: no matching pattern`);
+          }
+
+          case 'syntax': {
+            // (syntax template) — construct syntax object from template
+            if (items.length !== 2) throw new EvalError(`${fmtPos(expr.pos)}: syntax: bad syntax`);
+            const synTemplate = items[1];
+            const frame = syntaxFrames.length > 0 ? syntaxFrames[syntaxFrames.length - 1] : null;
+            if (!frame) {
+              return { tag: 'syntax', expr: synTemplate };
+            }
+            const expanded = expandSyntax(synTemplate, frame.bindings, frame.patternVars, synTemplate.pos);
+            return { tag: 'syntax', expr: expanded };
+          }
+
+          case 'with-syntax': {
+            // (with-syntax ((pattern expr) ...) body ...)
+            if (items.length < 3) throw new EvalError(`${fmtPos(expr.pos)}: with-syntax: bad syntax`);
+            const wsBindingsExpr = items[1];
+            if (wsBindingsExpr.tag !== 'list') throw new EvalError(`${fmtPos(expr.pos)}: with-syntax: expected bindings list`);
+
+            // Start with current frame's bindings if any
+            const parentFrame = syntaxFrames.length > 0 ? syntaxFrames[syntaxFrames.length - 1] : null;
+            const wsBindings: PatternBindings = new Map(parentFrame?.bindings);
+            const wsPVars = new Set<string>(parentFrame?.patternVars);
+            const wsLiterals = parentFrame?.literals ?? new Set<string>();
+            const wsDefEnv = parentFrame?.defEnv ?? env;
+
+            for (const binding of wsBindingsExpr.items) {
+              if (binding.tag !== 'list' || binding.items.length !== 2)
+                throw new EvalError(`${fmtPos(expr.pos)}: with-syntax: bad binding`);
+              const wsPat = binding.items[0];
+              const wsVal = evaluate(binding.items[1], env);
+              if (wsVal.tag !== 'syntax') throw new EvalError(`${fmtPos(expr.pos)}: with-syntax: expected syntax object`);
+              if (wsPat.tag === 'symbol') {
+                wsBindings.set(wsPat.name, wsVal.expr);
+                wsPVars.add(wsPat.name);
+              } else if (wsPat.tag === 'list') {
+                if (wsVal.expr.tag !== 'list') throw new EvalError(`${fmtPos(expr.pos)}: with-syntax: pattern mismatch`);
+                const wsMatch = matchPattern(wsPat.items, wsVal.expr.items, wsLiterals);
+                if (!wsMatch) throw new EvalError(`${fmtPos(expr.pos)}: with-syntax: pattern mismatch`);
+                const wsNewVars = collectPatternVars(wsPat.items, wsLiterals);
+                for (const [k, v] of wsMatch) wsBindings.set(k, v);
+                for (const v of wsNewVars) wsPVars.add(v);
+              }
+            }
+
+            syntaxFrames.push({ bindings: wsBindings, patternVars: wsPVars, literals: wsLiterals, defEnv: wsDefEnv });
+            try {
+              let wsResult: Value = { tag: 'nil' };
+              for (let wi = 2; wi < items.length; wi++) {
+                wsResult = evaluate(items[wi], env);
+              }
+              syntaxFrames.pop();
+              return wsResult;
+            } catch (e) {
+              syntaxFrames.pop();
+              throw e;
+            }
           }
 
           case 'define-record-type': {
@@ -1756,13 +1997,19 @@ function evaluate(expr: Expr, env: Env): Value {
 
       // Macro expansion check
       if (head.tag === 'symbol') {
-        try {
-          const maybeM = env.get(head.name);
-          if (maybeM.tag === 'macro') {
-            expr = expandMacro(maybeM, expr as Expr & { tag: 'list' }, env);
-            continue trampoline;
-          }
-        } catch { /* not bound — proceed to function application */ }
+        let maybeM: Value | null = null;
+        try { maybeM = env.get(head.name); } catch { /* not bound */ }
+        if (maybeM?.tag === 'macro') {
+          expr = expandMacro(maybeM, expr as Expr & { tag: 'list' }, env);
+          continue trampoline;
+        }
+        if (maybeM?.tag === 'transformer') {
+          const stx: Value = { tag: 'syntax', expr: expr };
+          const tResult = applyFn(maybeM.proc, [stx], expr.pos);
+          if (tResult.tag !== 'syntax') throw new EvalError(`${fmtPos(expr.pos)}: transformer must return syntax`);
+          expr = tResult.expr;
+          continue trampoline;
+        }
       }
 
       // Function application
@@ -1895,6 +2142,7 @@ function evalProgram(exprs: Expr[], env: Env): Value {
   gensymCounter = 0;
   pendingContReturn = null;
   exceptionHandlers.length = 0;
+  syntaxFrames.length = 0;
   for (let i = 0; i < exprs.length; i++) {
     currentTopIdx = i;
     try {
