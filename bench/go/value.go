@@ -24,6 +24,7 @@ const (
 	TypeMultipleValues
 	TypeRational
 	TypeFloat
+	TypeRecord
 )
 
 // Value represents a Scheme value.
@@ -53,6 +54,12 @@ type Value struct {
 	Den int64
 	// Float field
 	FloatVal float64
+	// Record fields
+	RecordTypeID   int64    // unique ID for this record type
+	RecordTypeName string   // name of the record type (e.g., "<point>")
+	RecordFields   []*Value // field values in constructor order
+	// Native Go function (when set on TypeLambda, called instead of Body)
+	GoFunc func([]*Value) (*Value, error)
 }
 
 // StrContent returns the string content, preferring mutable Runes if set.
@@ -179,6 +186,8 @@ func (v *Value) String() string {
 		}
 		buf.WriteByte(')')
 		return buf.String()
+	case TypeRecord:
+		return fmt.Sprintf("#<%s>", v.RecordTypeName)
 	default:
 		return "<unknown>"
 	}

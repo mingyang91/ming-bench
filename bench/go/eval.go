@@ -184,6 +184,9 @@ func evalListTCO(expr *Expr, env *Env) (*Expr, *Env, *Value, error, bool) {
 		case "guard":
 			v, err := evalGuard(expr, env)
 			return nil, nil, v, err, false
+		case "define-record-type":
+			v, err := evalDefineRecordType(expr, env)
+			return nil, nil, v, err, false
 		}
 
 		// Check for macro application
@@ -1384,6 +1387,103 @@ func evalDefineSyntax(expr *Expr, env *Env) (*Value, error) {
 	return Void, nil
 }
 
+var recordTypeIDCounter int64
+
+func evalDefineRecordType(expr *Expr, env *Env) (*Value, error) {
+	// (define-record-type <name> (constructor field-names...) predicate (field accessor)...)
+	if len(expr.List) < 4 {
+		return nil, errAt(expr, "define-record-type: invalid syntax")
+	}
+	typeNameExpr := expr.List[1]
+	if typeNameExpr.Type != ExprSymbol {
+		return nil, errAt(typeNameExpr, "define-record-type: expected type name symbol")
+	}
+	typeName := typeNameExpr.StrVal
+
+	ctorExpr := expr.List[2]
+	if ctorExpr.Type != ExprList || len(ctorExpr.List) < 1 {
+		return nil, errAt(ctorExpr, "define-record-type: expected constructor clause")
+	}
+	ctorName := ctorExpr.List[0].StrVal
+	ctorFields := make([]string, len(ctorExpr.List)-1)
+	for i := 1; i < len(ctorExpr.List); i++ {
+		ctorFields[i-1] = ctorExpr.List[i].StrVal
+	}
+
+	predExpr := expr.List[3]
+	if predExpr.Type != ExprSymbol {
+		return nil, errAt(predExpr, "define-record-type: expected predicate name")
+	}
+	predName := predExpr.StrVal
+
+	fieldIndex := make(map[string]int)
+	for i, f := range ctorFields {
+		fieldIndex[f] = i
+	}
+
+	typeID := atomic.AddInt64(&recordTypeIDCounter, 1)
+	nFields := len(ctorFields)
+
+	// Constructor: creates a new record value
+	env.Set(ctorName, &Value{
+		Type: TypeLambda,
+		GoFunc: func(args []*Value) (*Value, error) {
+			if len(args) != nFields {
+				return nil, fmt.Errorf("%s: expected %d arguments, got %d", ctorName, nFields, len(args))
+			}
+			fields := make([]*Value, nFields)
+			copy(fields, args)
+			return &Value{
+				Type:           TypeRecord,
+				RecordTypeID:   typeID,
+				RecordTypeName: typeName,
+				RecordFields:   fields,
+			}, nil
+		},
+	})
+
+	// Predicate: checks if value is this record type
+	env.Set(predName, &Value{
+		Type: TypeLambda,
+		GoFunc: func(args []*Value) (*Value, error) {
+			if len(args) != 1 {
+				return nil, fmt.Errorf("%s: expected 1 argument, got %d", predName, len(args))
+			}
+			return BooleanValue(args[0].Type == TypeRecord && args[0].RecordTypeID == typeID), nil
+		},
+	})
+
+	// Field accessors
+	for i := 4; i < len(expr.List); i++ {
+		fieldClause := expr.List[i]
+		if fieldClause.Type != ExprList || len(fieldClause.List) < 2 {
+			return nil, errAt(fieldClause, "define-record-type: invalid field clause")
+		}
+		fieldName := fieldClause.List[0].StrVal
+		accessorName := fieldClause.List[1].StrVal
+		idx, ok := fieldIndex[fieldName]
+		if !ok {
+			return nil, errAtf(fieldClause, "define-record-type: unknown field %s", fieldName)
+		}
+		accIdx := idx // capture for closure
+		accName := accessorName
+		env.Set(accessorName, &Value{
+			Type: TypeLambda,
+			GoFunc: func(args []*Value) (*Value, error) {
+				if len(args) != 1 {
+					return nil, fmt.Errorf("%s: expected 1 argument, got %d", accName, len(args))
+				}
+				if args[0].Type != TypeRecord {
+					return nil, fmt.Errorf("%s: expected record, got %s", accName, args[0].String())
+				}
+				return args[0].RecordFields[accIdx], nil
+			},
+		})
+	}
+
+	return Void, nil
+}
+
 func evalDefine(expr *Expr, env *Env) (*Value, error) {
 	if len(expr.List) < 3 {
 		return nil, errAt(expr, "define: expected at least 2 arguments")
@@ -1534,6 +1634,10 @@ func evalLambda(expr *Expr, env *Env) (*Value, error) {
 
 // applyLambdaTCO sets up the lambda env and returns a tail call to its last body expr.
 func applyLambdaTCO(fn *Value, args []*Value, expr *Expr) (*Expr, *Env, *Value, error, bool) {
+	if fn.GoFunc != nil {
+		v, err := fn.GoFunc(args)
+		return nil, nil, v, err, false
+	}
 	if fn.RestParam != "" {
 		if len(args) < len(fn.Params) {
 			return nil, nil, nil, errAtf(expr, "expected at least %d arguments, got %d", len(fn.Params), len(args)), false
