@@ -663,6 +663,15 @@ fn eval(expr: &Expr, env: &Env, out: &Output) -> Result<Value, EvalError> {
                             env_set(&cur_env, name, transformer);
                             return Ok(Value::Boolean(false));
                         }
+                        "dynamic-wind" => {
+                            if items.len() != 4 {
+                                return Err(EvalError::Arity(span.fmt("dynamic-wind requires 3 arguments")));
+                            }
+                            let in_thunk = eval(&items[1], &cur_env, out)?;
+                            let body_thunk = eval(&items[2], &cur_env, out)?;
+                            let out_thunk = eval(&items[3], &cur_env, out)?;
+                            return eval_dynamic_wind(in_thunk, body_thunk, out_thunk, span, out);
+                        }
                         "set!" => return eval_set(&items[1..], &cur_env, span, out),
                         "string-set!" => return eval_string_set(&items[1..], &cur_env, span, out),
                         "display" => {
@@ -703,7 +712,7 @@ fn eval(expr: &Expr, env: &Env, out: &Output) -> Result<Value, EvalError> {
                         | "symbol->string" | "string->symbol"
                         | "string-ref" | "string-copy" | "string->list" | "list->string"
                         | "char->integer" | "integer->char"
-                        | "eq?" | "eqv?" | "equal?" | "append"
+                        | "eq?" | "eqv?" | "equal?" | "append" | "reverse"
                         | "abs" | "modulo" | "remainder" | "quotient" | "expt"
                         | "min" | "max"
                         | "zero?" | "positive?" | "negative?" | "odd?" | "even?"
@@ -967,6 +976,52 @@ fn eval_callcc(proc: Value, span: Span, out: &Output) -> Result<Value, EvalError
     }
 }
 
+fn call_thunk(thunk: &Value, span: Span, out: &Output) -> Result<Value, EvalError> {
+    match thunk {
+        Value::Lambda { params, rest_param, body, env } => {
+            let local_env = apply_lambda(params, rest_param, body, env, &[], span)?;
+            let mut result = Value::Boolean(false);
+            for expr in body {
+                result = eval(expr, &local_env, out)?;
+            }
+            Ok(result)
+        }
+        Value::Builtin(name) => eval_builtin(name, &[], span),
+        _ => Err(EvalError::Type(span.fmt("dynamic-wind: expected thunk")))
+    }
+}
+
+fn eval_dynamic_wind(in_thunk: Value, body_thunk: Value, out_thunk: Value, span: Span, out: &Output) -> Result<Value, EvalError> {
+    // Run in-thunk
+    call_thunk(&in_thunk, span, out)?;
+
+    // Run body-thunk, catching continuation invocations
+    let body_result = call_thunk(&body_thunk, span, out);
+
+    // Run out-thunk (always, even on non-local exit)
+    match body_result {
+        Ok(val) => {
+            call_thunk(&out_thunk, span, out)?;
+            Ok(val)
+        }
+        Err(EvalError::ContinuationInvoked(id, top_idx)) => {
+            // Save the continuation value, run out-thunk, then re-propagate
+            let saved_val = CONT_RETURN_VALUE.with(|v| v.borrow_mut().take());
+            let saved_span = CONT_CALLCC_SPAN.with(|v| v.borrow_mut().take());
+            call_thunk(&out_thunk, span, out)?;
+            // Restore continuation state and re-propagate
+            CONT_RETURN_VALUE.with(|v| *v.borrow_mut() = saved_val);
+            CONT_CALLCC_SPAN.with(|v| *v.borrow_mut() = saved_span);
+            Err(EvalError::ContinuationInvoked(id, top_idx))
+        }
+        Err(e) => {
+            // Run out-thunk even on other errors? Standard says only for dynamic extent.
+            // For now, just propagate other errors without running out-thunk.
+            Err(e)
+        }
+    }
+}
+
 fn eval_set(args: &[Expr], env: &Env, span: Span, out: &Output) -> Result<Value, EvalError> {
     if args.len() != 2 {
         return Err(EvalError::Arity(span.fmt("set! requires 2 arguments")));
@@ -1223,7 +1278,7 @@ fn is_special_form(s: &str) -> bool {
     matches!(s, "if" | "begin" | "set!" | "let" | "lambda" | "define" | "quote"
         | "cond" | "and" | "or" | "call/cc" | "call-with-current-continuation"
         | "display" | "write" | "newline" | "define-syntax" | "syntax-rules"
-        | "string-set!")
+        | "string-set!" | "dynamic-wind")
 }
 
 fn find_free_vars(
@@ -1625,6 +1680,17 @@ fn eval_builtin(op: &str, args: &[Value], span: Span) -> Result<Value, EvalError
             if args.len() != 2 { return Err(EvalError::Arity(span.fmt("equal? requires 2 arguments"))); }
             Ok(Value::Boolean(values_equal(&args[0], &args[1])))
         }
+        "reverse" => {
+            if args.len() != 1 { return Err(EvalError::Arity(span.fmt("reverse requires 1 argument"))); }
+            match &args[0] {
+                Value::List(items) => {
+                    let mut reversed = items.clone();
+                    reversed.reverse();
+                    Ok(Value::List(reversed))
+                }
+                _ => Err(EvalError::Type(span.fmt("reverse: expected list")))
+            }
+        }
         "append" => {
             let mut result = Vec::new();
             for (i, a) in args.iter().enumerate() {
@@ -1919,7 +1985,7 @@ fn make_default_env() -> Env {
         "symbol->string", "string->symbol",
         "string-ref", "string-copy", "string->list", "list->string",
         "char->integer", "integer->char",
-        "eq?", "eqv?", "equal?", "append",
+        "eq?", "eqv?", "equal?", "append", "reverse",
         "abs", "modulo", "remainder", "quotient", "expt", "min", "max",
         "zero?", "positive?", "negative?", "odd?", "even?",
         "list-ref", "list-tail", "list?", "assoc",
