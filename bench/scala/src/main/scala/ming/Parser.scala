@@ -4,19 +4,27 @@ import SchemeValue.*
 
 object Parser:
 
+  private case class Token(text: String, offset: Int)
+
   def parse(input: String): List[SchemeValue] =
     val tokens = tokenize(input)
-    parseAll(tokens, Nil)
+    parseAll(tokens, Nil, input)
 
-  private def tokenize(input: String): List[String] =
+  private def positionAt(input: String, offset: Int): (Int, Int) =
+    input.substring(0, Math.min(offset, input.length)).foldLeft((1, 1)) {
+      case ((line, _), '\n') => (line + 1, 1)
+      case ((line, col), _)  => (line, col + 1)
+    }
+
+  private def tokenize(input: String): List[Token] =
     tokenizeLoop(input, 0, Nil).reverse
 
   @scala.annotation.tailrec
   private def tokenizeLoop(
     input: String,
     pos: Int,
-    acc: List[String]
-  ): List[String] =
+    acc: List[Token]
+  ): List[Token] =
     if pos >= input.length then acc
     else
       input.charAt(pos) match
@@ -25,15 +33,15 @@ object Parser:
           val end = input.indexOf('\n', pos)
           if end < 0 then acc
           else tokenizeLoop(input, end + 1, acc)
-        case '('  => tokenizeLoop(input, pos + 1, "(" :: acc)
-        case ')'  => tokenizeLoop(input, pos + 1, ")" :: acc)
-        case '\'' => tokenizeLoop(input, pos + 1, "'" :: acc)
+        case '('  => tokenizeLoop(input, pos + 1, Token("(", pos) :: acc)
+        case ')'  => tokenizeLoop(input, pos + 1, Token(")", pos) :: acc)
+        case '\'' => tokenizeLoop(input, pos + 1, Token("'", pos) :: acc)
         case '"' =>
           val (str, next) = readString(input, pos + 1)
-          tokenizeLoop(input, next, str :: acc)
+          tokenizeLoop(input, next, Token(str, pos) :: acc)
         case _ =>
           val (tok, next) = readAtom(input, pos)
-          tokenizeLoop(input, next, tok :: acc)
+          tokenizeLoop(input, next, Token(tok, pos) :: acc)
 
   private def readString(input: String, start: Int): (String, Int) =
     readStringLoop(input, start, new StringBuilder("\""))
@@ -73,44 +81,56 @@ object Parser:
 
   @scala.annotation.tailrec
   private def parseAll(
-    tokens: List[String],
-    acc: List[SchemeValue]
+    tokens: List[Token],
+    acc: List[SchemeValue],
+    input: String
   ): List[SchemeValue] =
     tokens match
       case Nil => acc.reverse
       case _ =>
-        val (value, rest) = parseExpr(tokens)
-        parseAll(rest, value :: acc)
+        val (value, rest) = parseExpr(tokens, input)
+        parseAll(rest, value :: acc, input)
 
-  private def parseExpr(tokens: List[String]): (SchemeValue, List[String]) =
+  private def parseExpr(
+    tokens: List[Token],
+    input: String
+  ): (SchemeValue, List[Token]) =
     tokens match
       case Nil =>
         throw new EvalError("unexpected end of input")
-      case "(" :: rest =>
-        parseList(rest, Nil)
-      case ")" :: _ =>
+      case Token("(", offset) :: rest =>
+        val pos = positionAt(input, offset)
+        parseList(rest, Nil, input, Some(pos))
+      case Token(")", _) :: _ =>
         throw new EvalError("unexpected )")
-      case "'" :: rest =>
-        val (quoted, remaining) = parseExpr(rest)
-        (ListVal(List(SymbolVal("quote"), quoted)), remaining)
-      case token :: rest =>
-        (parseAtom(token), rest)
+      case Token("'", offset) :: rest =>
+        val pos                 = positionAt(input, offset)
+        val (quoted, remaining) = parseExpr(rest, input)
+        (ListVal(List(SymbolVal("quote"), quoted), Some(pos)), remaining)
+      case Token(text, offset) :: rest =>
+        val pos = positionAt(input, offset)
+        (parseAtom(text, Some(pos)), rest)
 
   @scala.annotation.tailrec
   private def parseList(
-    tokens: List[String],
-    acc: List[SchemeValue]
-  ): (SchemeValue, List[String]) =
+    tokens: List[Token],
+    acc: List[SchemeValue],
+    input: String,
+    listPos: Option[(Int, Int)]
+  ): (SchemeValue, List[Token]) =
     tokens match
       case Nil =>
         throw new EvalError("unterminated list")
-      case ")" :: rest =>
-        (ListVal(acc.reverse), rest)
+      case Token(")", _) :: rest =>
+        (ListVal(acc.reverse, listPos), rest)
       case _ =>
-        val (value, remaining) = parseExpr(tokens)
-        parseList(remaining, value :: acc)
+        val (value, remaining) = parseExpr(tokens, input)
+        parseList(remaining, value :: acc, input, listPos)
 
-  private def parseAtom(token: String): SchemeValue =
+  private def parseAtom(
+    token: String,
+    pos: Option[(Int, Int)]
+  ): SchemeValue =
     if token == "#t" then BoolVal(true)
     else if token == "#f" then BoolVal(false)
     else
@@ -118,4 +138,4 @@ object Parser:
         case Some(n) => IntVal(n)
         case None =>
           if token.startsWith("\"") then StringVal(token.substring(1, token.length - 1))
-          else SymbolVal(token)
+          else SymbolVal(token, pos)

@@ -4,8 +4,8 @@ enum SchemeValue:
   case IntVal(value: Long)
   case BoolVal(value: Boolean)
   case StringVal(value: String)
-  case SymbolVal(name: String)
-  case ListVal(elements: List[SchemeValue])
+  case SymbolVal(name: String, pos: Option[(Int, Int)] = None)
+  case ListVal(elements: List[SchemeValue], pos: Option[(Int, Int)] = None)
   case PairVal(car: SchemeValue, cdr: SchemeValue)
 
   case LambdaVal(
@@ -17,14 +17,14 @@ enum SchemeValue:
   case Void
 
   def display: String = this match
-    case IntVal(n)    => n.toString
-    case BoolVal(b)   => if b then "#t" else "#f"
-    case StringVal(s) => "\"" + s + "\""
-    case SymbolVal(n) => n
-    case ListVal(es)  => "(" + es.map(_.display).mkString(" ") + ")"
-    case p: PairVal   => "(" + displayPairInner(p) + ")"
-    case _: LambdaVal => "#<procedure>"
-    case Void         => ""
+    case IntVal(n)       => n.toString
+    case BoolVal(b)      => if b then "#t" else "#f"
+    case StringVal(s)    => "\"" + s + "\""
+    case SymbolVal(n, _) => n
+    case ListVal(es, _)  => "(" + es.map(_.display).mkString(" ") + ")"
+    case p: PairVal      => "(" + displayPairInner(p) + ")"
+    case _: LambdaVal    => "#<procedure>"
+    case Void            => ""
 
   def isTruthy: Boolean = this match
     case BoolVal(false) => false
@@ -32,7 +32,7 @@ enum SchemeValue:
 
   private def displayPairInner(p: PairVal): String =
     p.cdr match
-      case ListVal(Nil) => p.car.display
-      case p2: PairVal  => p.car.display + " " + displayPairInner(p2)
-      case ListVal(es)  => p.car.display + " " + es.map(_.display).mkString(" ")
-      case other        => p.car.display + " . " + other.display
+      case ListVal(Nil, _) => p.car.display
+      case p2: PairVal     => p.car.display + " " + displayPairInner(p2)
+      case ListVal(es, _)  => p.car.display + " " + es.map(_.display).mkString(" ")
+      case other           => p.car.display + " . " + other.display
