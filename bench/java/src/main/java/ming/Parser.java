@@ -122,6 +122,25 @@ public class Parser {
         } else if (c == 'f') {
             advance();
             return new SchemeValue.BoolVal(false).withPos(sp);
+        } else if (c == '\\') {
+            advance(); // skip '\'
+            if (pos >= input.length()) throw new EvalError("unexpected end after #\\ at " + sp);
+            // Check for named characters
+            int start = pos;
+            while (pos < input.length() && !isDelimiter(input.charAt(pos))) {
+                advance();
+            }
+            String name = input.substring(start, pos);
+            if (name.isEmpty()) throw new EvalError("unexpected end after #\\ at " + sp);
+            if (name.length() == 1) {
+                return new SchemeValue.CharVal(name.charAt(0)).withPos(sp);
+            }
+            return switch (name.toLowerCase()) {
+                case "space" -> new SchemeValue.CharVal(' ').withPos(sp);
+                case "newline" -> new SchemeValue.CharVal('\n').withPos(sp);
+                case "tab" -> new SchemeValue.CharVal('\t').withPos(sp);
+                default -> throw new EvalError("unknown character name: " + name + " at " + sp);
+            };
         } else {
             throw new EvalError("unknown hash literal: #" + c + " at " + sp);
         }

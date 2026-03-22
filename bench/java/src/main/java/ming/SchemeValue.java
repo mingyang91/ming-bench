@@ -26,11 +26,15 @@ public sealed interface SchemeValue {
     record PairVal(SchemeValue car, SchemeValue cdr) implements SchemeValue {}
     record VoidVal() implements SchemeValue {}
     record CharVal(char value) implements SchemeValue {}
+    record MutableStringVal(StringBuilder chars) implements SchemeValue {
+        public String value() { return chars.toString(); }
+    }
 
     /** Scheme `display` output: no quotes on strings, chars as bare characters. */
     default String displayStr() {
         return switch (this) {
             case StringVal v -> v.value();
+            case MutableStringVal v -> v.value();
             case CharVal v -> String.valueOf(v.value());
             default -> display();
         };
@@ -41,6 +45,7 @@ public sealed interface SchemeValue {
             case IntVal v -> String.valueOf(v.value());
             case BoolVal v -> v.value() ? "#t" : "#f";
             case StringVal v -> "\"" + v.value() + "\"";
+            case MutableStringVal v -> "\"" + v.value() + "\"";
             case SymbolVal v -> v.name();
             case LambdaVal v -> "#<procedure>";
             case BuiltinVal v -> "#<procedure:" + v.name() + ">";
