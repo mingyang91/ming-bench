@@ -142,8 +142,7 @@ fn eval_list_step(
                 return Ok(TcoAction::Result(v));
             }
             "guard" => {
-                let v = eval_guard(&elements[1..], kw_span, env, output, ctx)?;
-                return Ok(TcoAction::Result(v));
+                return eval_guard_step(&elements[1..], kw_span, env, output, ctx);
             }
             "with-exception-handler" => {
                 let v = eval_with_exception_handler(&elements[1..], kw_span, env, output, ctx)?;
@@ -182,15 +181,14 @@ fn eval_list_step(
                 hygiene_id,
                 list_span,
             )?;
-            let expansion_env = Env::with_parent(env);
             for (gensym, original) in &introduced {
                 if let Ok(val) = def_env.lookup(original) {
-                    expansion_env.define(gensym.clone(), val);
+                    env.define(gensym.clone(), val);
                 }
             }
             return Ok(TcoAction::TailCall {
                 expr: expanded,
-                env: expansion_env,
+                env: env.clone(),
             });
         }
         // Check for syntax-case macros
@@ -469,16 +467,21 @@ fn apply_step(
             frames,
             capture_span,
         } => {
-            if args.len() != 1 {
+            if args.is_empty() {
                 return Err(EvalErrorKind::Arity {
                     name: "#<continuation>".into(),
-                    expected: "1".into(),
-                    got: args.len(),
+                    expected: "1+".into(),
+                    got: 0,
                 }
                 .at(span));
             }
             // Store the value, frames, and capture span for the resume handler to pick up
-            ctx.pending = Some(args[0].clone());
+            let value = if args.len() == 1 {
+                args[0].clone()
+            } else {
+                Value::Values(args.to_vec())
+            };
+            ctx.pending = Some(value);
             ctx.resume_span = Some(capture_span.clone());
             ctx.resume_frames = Some(frames.clone());
             Err(EvalErrorKind::ContinuationReturn { id: *id }.at(span))
@@ -710,13 +713,13 @@ fn eval_raise(
     Err(EvalErrorKind::SchemeRaise { value }.at(span))
 }
 
-fn eval_guard(
+fn eval_guard_step(
     args: &[Expr],
     span: &Span,
     env: &Env,
     output: &mut String,
     ctx: &mut ContCtx,
-) -> Result<Value, EvalError> {
+) -> Result<TcoAction, EvalError> {
     // (guard (var clause ...) body ...)
     // clause = (test expr ...) | (else expr ...)
     if args.is_empty() {
@@ -757,11 +760,32 @@ fn eval_guard(
 
     let clauses = &clause_elements[1..];
 
-    // Evaluate body, catching SchemeRaise
-    let body_result = eval_body_sequence(body, env, output, ctx);
+    // Evaluate body with TCO support for the last expression.
+    // All but the last body expression are evaluated normally;
+    // the last one is evaluated with eval_step so tail calls can escape.
+    let body_result = if body.is_empty() {
+        Ok(TcoAction::Result(Value::Nil))
+    } else {
+        let init = &body[..body.len() - 1];
+        let last = &body[body.len() - 1];
+        let mut r = Ok(());
+        for expr in init {
+            match eval(expr, env, output, ctx) {
+                Ok(_) => {}
+                Err(e) => {
+                    r = Err(e);
+                    break;
+                }
+            }
+        }
+        match r {
+            Err(e) => Err(e),
+            Ok(()) => eval_step(last, env, output, ctx),
+        }
+    };
 
     match body_result {
-        Ok(val) => Ok(val),
+        Ok(action) => Ok(action),
         Err(e) => {
             if let EvalErrorKind::SchemeRaise { value } = e.kind {
                 // Bind the exception value to the variable
@@ -787,7 +811,8 @@ fn eval_guard(
                     // Check for else clause
                     let is_else = matches!(&clause_elems[0].kind, ExprKind::Symbol(s) if s == "else");
                     if is_else {
-                        return eval_body_sequence(&clause_elems[1..], &guard_env, output, ctx);
+                        return eval_body_sequence(&clause_elems[1..], &guard_env, output, ctx)
+                            .map(TcoAction::Result);
                     }
 
                     // Evaluate test
@@ -795,13 +820,13 @@ fn eval_guard(
                     if test_val.is_truthy() {
                         // Evaluate handler expressions
                         if clause_elems.len() == 1 {
-                            return Ok(test_val);
+                            return Ok(TcoAction::Result(test_val));
                         }
                         let mut result = Value::Nil;
                         for expr in &clause_elems[1..] {
                             result = eval(expr, &guard_env, output, ctx)?;
                         }
-                        return Ok(result);
+                        return Ok(TcoAction::Result(result));
                     }
                 }
 
