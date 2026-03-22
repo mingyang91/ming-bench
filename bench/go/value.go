@@ -26,12 +26,21 @@ type Value struct {
 	IntVal  int64
 	BoolVal bool
 	StrVal  string
+	Runes   []rune // mutable string storage (used when non-nil)
 	Car     *Value
 	Cdr     *Value
 	// Lambda fields
 	Params  []string
 	Body    []*Expr
 	Closure *Env
+}
+
+// StrContent returns the string content, preferring mutable Runes if set.
+func (v *Value) StrContent() string {
+	if v.Runes != nil {
+		return string(v.Runes)
+	}
+	return v.StrVal
 }
 
 var Void = &Value{Type: TypeVoid}
@@ -70,7 +79,7 @@ func CharValue(c rune) *Value {
 func (v *Value) DisplayString() string {
 	switch v.Type {
 	case TypeString:
-		return v.StrVal
+		return v.StrContent()
 	case TypeChar:
 		return string(rune(v.IntVal))
 	default:
@@ -94,7 +103,7 @@ func (v *Value) String() string {
 		}
 		return "#f"
 	case TypeString:
-		return fmt.Sprintf("%q", v.StrVal)
+		return fmt.Sprintf("%q", v.StrContent())
 	case TypeSymbol:
 		return v.StrVal
 	case TypeNull:

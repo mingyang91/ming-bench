@@ -14,6 +14,8 @@ func Eval(expr *Expr, env *Env) (*Value, error) {
 		return BooleanValue(expr.BoolVal), nil
 	case ExprString:
 		return StringValue(expr.StrVal), nil
+	case ExprChar:
+		return CharValue(rune(expr.IntVal)), nil
 	case ExprSymbol:
 		val, ok := env.Get(expr.StrVal)
 		if !ok {
@@ -215,7 +217,7 @@ func applyFunc(op *Value, args []*Value, expr *Expr, env *Env) (*Value, error) {
 			if a.Type != TypeString {
 				return nil, errAtf(expr, "string-append: expected string")
 			}
-			buf.WriteString(a.StrVal)
+			buf.WriteString(a.StrContent())
 		}
 		return StringValue(buf.String()), nil
 	case "string-length":
@@ -225,7 +227,7 @@ func applyFunc(op *Value, args []*Value, expr *Expr, env *Env) (*Value, error) {
 		if args[0].Type != TypeString {
 			return nil, errAtf(expr, "string-length: expected string")
 		}
-		return IntegerValue(int64(len([]rune(args[0].StrVal)))), nil
+		return IntegerValue(int64(len([]rune(args[0].StrContent())))), nil
 	case "substring":
 		if len(args) != 3 {
 			return nil, errAtf(expr, "substring: expected 3 arguments, got %d", len(args))
@@ -233,7 +235,7 @@ func applyFunc(op *Value, args []*Value, expr *Expr, env *Env) (*Value, error) {
 		if args[0].Type != TypeString || args[1].Type != TypeInteger || args[2].Type != TypeInteger {
 			return nil, errAtf(expr, "substring: invalid argument types")
 		}
-		runes := []rune(args[0].StrVal)
+		runes := []rune(args[0].StrContent())
 		start, end := int(args[1].IntVal), int(args[2].IntVal)
 		if start < 0 || end < start || end > len(runes) {
 			return nil, errAtf(expr, "substring: index out of range")
@@ -246,7 +248,7 @@ func applyFunc(op *Value, args []*Value, expr *Expr, env *Env) (*Value, error) {
 		if args[0].Type != TypeString {
 			return nil, errAtf(expr, "string->number: expected string")
 		}
-		n, err := strconv.ParseInt(args[0].StrVal, 10, 64)
+		n, err := strconv.ParseInt(args[0].StrContent(), 10, 64)
 		if err != nil {
 			return False, nil
 		}
@@ -274,7 +276,7 @@ func applyFunc(op *Value, args []*Value, expr *Expr, env *Env) (*Value, error) {
 		if args[0].Type != TypeString {
 			return nil, errAtf(expr, "string->symbol: expected string")
 		}
-		return SymbolValue(args[0].StrVal), nil
+		return SymbolValue(args[0].StrContent()), nil
 	case "string-ref":
 		if len(args) != 2 {
 			return nil, errAtf(expr, "string-ref: expected 2 arguments, got %d", len(args))
@@ -282,12 +284,45 @@ func applyFunc(op *Value, args []*Value, expr *Expr, env *Env) (*Value, error) {
 		if args[0].Type != TypeString || args[1].Type != TypeInteger {
 			return nil, errAtf(expr, "string-ref: invalid argument types")
 		}
-		runes := []rune(args[0].StrVal)
+		runes := []rune(args[0].StrContent())
 		idx := int(args[1].IntVal)
 		if idx < 0 || idx >= len(runes) {
 			return nil, errAtf(expr, "string-ref: index out of range")
 		}
 		return CharValue(runes[idx]), nil
+	case "string-set!":
+		if len(args) != 3 {
+			return nil, errAtf(expr, "string-set!: expected 3 arguments, got %d", len(args))
+		}
+		if args[0].Type != TypeString {
+			return nil, errAtf(expr, "string-set!: expected string")
+		}
+		if args[1].Type != TypeInteger {
+			return nil, errAtf(expr, "string-set!: expected integer index")
+		}
+		if args[2].Type != TypeChar {
+			return nil, errAtf(expr, "string-set!: expected char")
+		}
+		if args[0].Runes == nil {
+			return nil, errAtf(expr, "string-set!: string is immutable")
+		}
+		idx := int(args[1].IntVal)
+		if idx < 0 || idx >= len(args[0].Runes) {
+			return nil, errAtf(expr, "string-set!: index out of range")
+		}
+		args[0].Runes[idx] = rune(args[2].IntVal)
+		return Void, nil
+	case "string-copy":
+		if len(args) != 1 {
+			return nil, errAtf(expr, "string-copy: expected 1 argument, got %d", len(args))
+		}
+		if args[0].Type != TypeString {
+			return nil, errAtf(expr, "string-copy: expected string")
+		}
+		src := []rune(args[0].StrContent())
+		cp := make([]rune, len(src))
+		copy(cp, src)
+		return &Value{Type: TypeString, Runes: cp}, nil
 	default:
 		return nil, errAtf(expr, "unknown procedure: %s", name)
 	}
@@ -472,6 +507,8 @@ func exprToValue(expr *Expr) (*Value, error) {
 		return BooleanValue(expr.BoolVal), nil
 	case ExprString:
 		return StringValue(expr.StrVal), nil
+	case ExprChar:
+		return CharValue(rune(expr.IntVal)), nil
 	case ExprSymbol:
 		return SymbolValue(expr.StrVal), nil
 	case ExprList:
@@ -627,7 +664,8 @@ func makeDefaultEnv() *Env {
 		"string-append", "string-length", "substring",
 		"string->number", "number->string",
 		"symbol->string", "string->symbol",
-		"string-ref"}
+		"string-ref",
+		"string-set!", "string-copy"}
 	for _, name := range builtins {
 		env.Set(name, &Value{Type: TypeSymbol, StrVal: fmt.Sprintf("__builtin:%s", name)})
 	}

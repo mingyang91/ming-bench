@@ -16,6 +16,7 @@ const (
 	TokenString
 	TokenSymbol
 	TokenQuote
+	TokenChar
 	TokenEOF
 )
 
@@ -102,12 +103,46 @@ func (t *Tokenizer) NextToken() (Token, error) {
 		if t.pos >= len(t.input) {
 			return Token{}, fmt.Errorf("%d:%d: unexpected end after #", line, col)
 		}
-		next := t.advance()
+		next := t.peek()
 		if next == 't' {
+			t.advance()
 			return Token{Type: TokenBoolean, Val: "#t", Line: line, Col: col}, nil
 		} else if next == 'f' {
+			t.advance()
 			return Token{Type: TokenBoolean, Val: "#f", Line: line, Col: col}, nil
+		} else if next == '\\' {
+			t.advance() // consume backslash
+			if t.pos >= len(t.input) {
+				return Token{}, fmt.Errorf("%d:%d: unexpected end after #\\", line, col)
+			}
+			// Read character name or single character
+			var buf strings.Builder
+			buf.WriteRune(t.advance())
+			// If first char is a letter, try to read a named character
+			if unicode.IsLetter(rune(buf.String()[0])) {
+				for t.pos < len(t.input) && unicode.IsLetter(t.peek()) {
+					buf.WriteRune(t.advance())
+				}
+			}
+			name := buf.String()
+			var charVal string
+			switch name {
+			case "space":
+				charVal = " "
+			case "newline":
+				charVal = "\n"
+			case "tab":
+				charVal = "\t"
+			default:
+				if len([]rune(name)) == 1 {
+					charVal = name
+				} else {
+					return Token{}, fmt.Errorf("%d:%d: unknown character name: %s", line, col, name)
+				}
+			}
+			return Token{Type: TokenChar, Val: charVal, Line: line, Col: col}, nil
 		}
+		t.advance()
 		return Token{}, fmt.Errorf("%d:%d: unexpected character after #: %c", line, col, next)
 	case ch == '"':
 		return t.readString(line, col)
