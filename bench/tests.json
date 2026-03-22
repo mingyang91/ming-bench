@@ -1525,5 +1525,40 @@
     "fixture": "l24_case_lambda_rest.scm",
     "kind": "eval_str_ok",
     "expected": "#t"
+  },
+  {
+    "name": "l25_procedure_name_define",
+    "level": 25,
+    "fixture": "l25_procedure_name_define.scm",
+    "kind": "eval_str_ok",
+    "expected": "#t"
+  },
+  {
+    "name": "l25_procedure_name_anonymous",
+    "level": 25,
+    "fixture": "l25_procedure_name_anonymous.scm",
+    "kind": "eval_str_ok",
+    "expected": "#t"
+  },
+  {
+    "name": "l25_procedure_name_let",
+    "level": 25,
+    "fixture": "l25_procedure_name_let.scm",
+    "kind": "eval_str_ok",
+    "expected": "#t"
+  },
+  {
+    "name": "l25_procedure_name_builtin",
+    "level": 25,
+    "fixture": "l25_procedure_name_builtin.scm",
+    "kind": "eval_str_ok",
+    "expected": "#t"
+  },
+  {
+    "name": "l25_procedure_name_case_lambda",
+    "level": 25,
+    "fixture": "l25_procedure_name_case_lambda.scm",
+    "kind": "eval_str_ok",
+    "expected": "#t"
   }
 ]

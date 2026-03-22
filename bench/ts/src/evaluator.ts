@@ -249,13 +249,13 @@ type Value =
   | { tag: 'pair'; car: Value; cdr: Value }
   | { tag: 'vector'; items: Value[] }
   | { tag: 'builtin'; name: string; fn: (args: Value[]) => Value }
-  | { tag: 'lambda'; params: string[]; rest: string | null; body: Expr[]; env: Env }
+  | { tag: 'lambda'; params: string[]; rest: string | null; body: Expr[]; env: Env; procName?: string }
   | { tag: 'continuation'; id: number; exprPos: string; topIdx: number }
   | { tag: 'macro'; literals: string[]; rules: { pattern: Expr; template: Expr }[]; defEnv: Env }
   | { tag: 'record'; typeId: symbol; typeName: string; fields: Map<string, Value> }
   | { tag: 'syntax'; expr: Expr }
   | { tag: 'transformer'; proc: Value; defEnv: Env }
-  | { tag: 'case-lambda'; clauses: { params: string[]; rest: string | null; body: Expr[] }[]; env: Env };
+  | { tag: 'case-lambda'; clauses: { params: string[]; rest: string | null; body: Expr[] }[]; env: Env; procName?: string };
 
 function isTruthy(v: Value): boolean {
   return !(v.tag === 'boolean' && v.value === false);
@@ -635,6 +635,16 @@ function makeGlobalEnv(output: string[] = []): Env {
     if (args.length !== 1) throw new EvalError('procedure?: expected 1 argument');
     const t = args[0].tag;
     return { tag: 'boolean', value: t === 'builtin' || t === 'lambda' || t === 'case-lambda' || t === 'continuation' };
+  }});
+  env.define('procedure-name', { tag: 'builtin', name: 'procedure-name', fn(args) {
+    if (args.length !== 1) throw new EvalError('procedure-name: expected 1 argument');
+    const a = args[0];
+    if (a.tag === 'builtin') return { tag: 'symbol', name: a.name };
+    if (a.tag === 'lambda' || a.tag === 'case-lambda') {
+      return a.procName ? { tag: 'symbol', name: a.procName } : { tag: 'boolean', value: false };
+    }
+    if (a.tag === 'continuation') return { tag: 'boolean', value: false };
+    throw new EvalError('procedure-name: expected procedure');
   }});
   env.define('char?', { tag: 'builtin', name: 'char?', fn(args) {
     if (args.length !== 1) throw new EvalError('char?: expected 1 argument');
@@ -1593,6 +1603,9 @@ function evaluate(expr: Expr, env: Env): Value {
             const target = items[1];
             if (target.tag === 'symbol') {
               const val = evaluate(items[2], env);
+              if ((val.tag === 'lambda' || val.tag === 'case-lambda') && !val.procName) {
+                val.procName = target.name;
+              }
               env.define(target.name, val);
               return { tag: 'nil' };
             }
@@ -1601,7 +1614,7 @@ function evaluate(expr: Expr, env: Env): Value {
               if (nameExpr.tag !== 'symbol') throw new EvalError(`${fmtPos(expr.pos)}: define: expected symbol`);
               const { params, rest } = parseParams(target.items.slice(1));
               const body = items.slice(2);
-              const lambda: Value = { tag: 'lambda', params, rest, body, env };
+              const lambda: Value = { tag: 'lambda', params, rest, body, env, procName: nameExpr.name };
               env.define(nameExpr.name, lambda);
               return { tag: 'nil' };
             }
