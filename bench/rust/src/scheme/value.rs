@@ -22,6 +22,11 @@ pub enum Value {
     Continuation {
         id: u64,
     },
+    SyntaxRules {
+        literals: Vec<String>,
+        rules: Vec<(Value, Value)>,
+        def_env: Rc<RefCell<Env>>,
+    },
     Void,
 }
 
@@ -62,6 +67,7 @@ impl fmt::Display for Value {
             }
             Value::Continuation { .. } => write!(f, "#<continuation>"),
             Value::Lambda { .. } => write!(f, "#<procedure>"),
+            Value::SyntaxRules { .. } => write!(f, "#<syntax>"),
             Value::Void => write!(f, ""),
         }
     }
@@ -89,6 +95,7 @@ impl Value {
                 out.push(')');
             }
             Value::Continuation { .. } => out.push_str("#<continuation>"),
+            Value::SyntaxRules { .. } => out.push_str("#<syntax>"),
             other => out.push_str(&other.to_string()),
         }
     }

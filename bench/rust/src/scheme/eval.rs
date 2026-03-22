@@ -5,6 +5,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use crate::scheme::env::Env;
 use crate::scheme::error::{EvalError, ErrorKind, Span};
+use crate::scheme::macro_expand;
 use crate::scheme::value::Value;
 
 static NEXT_CONT_ID: AtomicU64 = AtomicU64::new(1);
@@ -275,6 +276,7 @@ pub fn eval(
             }
             Value::Lambda { .. } => return Ok(current_expr),
             Value::Continuation { .. } => return Ok(current_expr),
+            Value::SyntaxRules { .. } => return Ok(current_expr),
             Value::Void => return Ok(Value::Void),
         }
     }
@@ -321,7 +323,22 @@ fn eval_list_tco(
             "call/cc" | "call-with-current-continuation" => {
                 return eval_callcc(&items[1..], env, out, cc);
             }
-            _ => {}
+            "define-syntax" => {
+                let val = eval_define_syntax(&items[1..], env)?;
+                return Ok(Trampoline::Done(val));
+            }
+            _ => {
+                // Check for macro expansion
+                if let Ok(Value::SyntaxRules { ref literals, ref rules, ref def_env, .. }) = env.borrow().get(op) {
+                    let expanded = macro_expand::expand_macro(
+                        items, literals, rules, def_env,
+                    )?;
+                    return Ok(Trampoline::TailCall {
+                        expr: expanded,
+                        env: Rc::clone(env),
+                    });
+                }
+            }
         }
     }
 
@@ -1190,4 +1207,51 @@ fn compare_nums(
     let first = require_int(&args[0], op)?;
     let second = require_int(&args[1], op)?;
     Ok(Value::Boolean(cmp(first, second)))
+}
+
+fn eval_define_syntax(
+    args: &[Value],
+    env: &Rc<RefCell<Env>>,
+) -> Result<Value, EvalError> {
+    if args.len() != 2 {
+        return Err(EvalError::arity("define-syntax requires exactly 2 arguments"));
+    }
+    let Value::Symbol(name) = &args[0] else {
+        return Err(EvalError::type_err("define-syntax: expected name"));
+    };
+    let Value::List(sr_form) = &args[1] else {
+        return Err(EvalError::type_err("define-syntax: expected syntax-rules"));
+    };
+    if sr_form.is_empty() || !matches!(&sr_form[0], Value::Symbol(s) if s == "syntax-rules") {
+        return Err(EvalError::parse("define-syntax: expected syntax-rules"));
+    }
+    if sr_form.len() < 3 {
+        return Err(EvalError::arity("syntax-rules requires literals and at least one rule"));
+    }
+    let Value::List(literals_list) = &sr_form[1] else {
+        return Err(EvalError::type_err("syntax-rules: expected literals list"));
+    };
+    let mut literals = Vec::new();
+    for lit in literals_list {
+        let Value::Symbol(s) = lit else {
+            return Err(EvalError::type_err("syntax-rules: literal must be a symbol"));
+        };
+        literals.push(s.clone());
+    }
+    let mut rules = Vec::new();
+    for rule in &sr_form[2..] {
+        let Value::List(pair) = rule else {
+            return Err(EvalError::type_err("syntax-rules: expected rule (pattern template)"));
+        };
+        if pair.len() != 2 {
+            return Err(EvalError::arity("syntax-rules: rule must have pattern and template"));
+        }
+        rules.push((pair[0].clone(), pair[1].clone()));
+    }
+    env.borrow_mut().set(name.clone(), Value::SyntaxRules {
+        literals,
+        rules,
+        def_env: Rc::clone(env),
+    });
+    Ok(Value::Void)
 }

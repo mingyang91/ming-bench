@@ -1,6 +1,7 @@
 pub mod error;
 mod env;
 mod eval;
+mod macro_expand;
 mod parser;
 pub mod value;
 
