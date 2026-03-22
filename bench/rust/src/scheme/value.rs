@@ -118,6 +118,25 @@ pub enum Value {
     Vector(Rc<RefCell<Vec<Value>>>),
     /// Multiple return values from `values`.
     Values(Vec<Value>),
+    /// A record instance.
+    Record {
+        type_id: u64,
+        type_name: String,
+        fields: Vec<Value>,
+    },
+    /// Constructor for a record type.
+    RecordConstructor {
+        type_id: u64,
+        type_name: String,
+        field_names: Vec<String>,
+    },
+    /// Predicate for a record type.
+    RecordPredicate { type_id: u64 },
+    /// Accessor for a record field.
+    RecordAccessor {
+        type_id: u64,
+        field_index: usize,
+    },
 }
 
 impl Value {
@@ -144,6 +163,35 @@ impl PartialEq for Value {
             (Value::Vector(a), Value::Vector(b)) => *a.borrow() == *b.borrow(),
             (Value::Values(a), Value::Values(b)) => a == b,
             (Value::Macro { .. }, Value::Macro { .. }) => false,
+            (
+                Value::Record {
+                    type_id: a_id,
+                    fields: a_fields,
+                    ..
+                },
+                Value::Record {
+                    type_id: b_id,
+                    fields: b_fields,
+                    ..
+                },
+            ) => a_id == b_id && a_fields == b_fields,
+            (
+                Value::RecordConstructor { type_id: a, .. },
+                Value::RecordConstructor { type_id: b, .. },
+            ) => a == b,
+            (Value::RecordPredicate { type_id: a }, Value::RecordPredicate { type_id: b }) => {
+                a == b
+            }
+            (
+                Value::RecordAccessor {
+                    type_id: a_id,
+                    field_index: a_idx,
+                },
+                Value::RecordAccessor {
+                    type_id: b_id,
+                    field_index: b_idx,
+                },
+            ) => a_id == b_id && a_idx == b_idx,
             _ => false,
         }
     }
@@ -176,7 +224,11 @@ impl Value {
             Value::Builtin(_)
             | Value::Lambda { .. }
             | Value::Continuation { .. }
-            | Value::Macro { .. } => buf.push_str(&self.to_string()),
+            | Value::Macro { .. }
+            | Value::Record { .. }
+            | Value::RecordConstructor { .. }
+            | Value::RecordPredicate { .. }
+            | Value::RecordAccessor { .. } => buf.push_str(&self.to_string()),
             other => buf.push_str(&other.to_string()),
         }
     }
@@ -224,6 +276,12 @@ impl fmt::Display for Value {
             Value::Builtin(name) => write!(f, "#<procedure:{name}>"),
             Value::Continuation { .. } => write!(f, "#<continuation>"),
             Value::Macro { .. } => write!(f, "#<macro>"),
+            Value::Record { type_name, .. } => write!(f, "#<record:{type_name}>"),
+            Value::RecordConstructor { type_name, .. } => {
+                write!(f, "#<procedure:make-{type_name}>")
+            }
+            Value::RecordPredicate { .. } => write!(f, "#<procedure>"),
+            Value::RecordAccessor { .. } => write!(f, "#<procedure>"),
             Value::Values(vals) => {
                 if let Some(last) = vals.last() {
                     write!(f, "{last}")

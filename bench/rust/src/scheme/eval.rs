@@ -149,6 +149,10 @@ fn eval_list_step(
                 let v = eval_with_exception_handler(&elements[1..], kw_span, env, output, ctx)?;
                 return Ok(TcoAction::Result(v));
             }
+            "define-record-type" => {
+                let v = eval_define_record_type(&elements[1..], kw_span, env, ctx)?;
+                return Ok(TcoAction::Result(v));
+            }
             _ => {}
         }
     }
@@ -444,6 +448,71 @@ fn apply_step(
         }
         Value::Macro { .. } => Err(EvalErrorKind::NotAProcedure {
             value: "#<macro>".into(),
+        }
+        .at(span)),
+        Value::RecordConstructor {
+            type_id,
+            type_name,
+            field_names,
+        } => {
+            if args.len() != field_names.len() {
+                return Err(EvalErrorKind::Arity {
+                    name: format!("make-{type_name}"),
+                    expected: field_names.len().to_string(),
+                    got: args.len(),
+                }
+                .at(span));
+            }
+            Ok(TcoAction::Result(Value::Record {
+                type_id: *type_id,
+                type_name: type_name.clone(),
+                fields: args.to_vec(),
+            }))
+        }
+        Value::RecordPredicate { type_id } => {
+            if args.len() != 1 {
+                return Err(EvalErrorKind::Arity {
+                    name: "#<record-predicate>".into(),
+                    expected: "1".into(),
+                    got: args.len(),
+                }
+                .at(span));
+            }
+            let result = matches!(&args[0], Value::Record { type_id: tid, .. } if tid == type_id);
+            Ok(TcoAction::Result(Value::Boolean(result)))
+        }
+        Value::RecordAccessor {
+            type_id,
+            field_index,
+        } => {
+            if args.len() != 1 {
+                return Err(EvalErrorKind::Arity {
+                    name: "#<record-accessor>".into(),
+                    expected: "1".into(),
+                    got: args.len(),
+                }
+                .at(span));
+            }
+            match &args[0] {
+                Value::Record {
+                    type_id: tid,
+                    fields,
+                    ..
+                } if tid == type_id => Ok(TcoAction::Result(
+                    fields
+                        .get(*field_index)
+                        .expect("record field index out of bounds")
+                        .clone(),
+                )),
+                other => Err(EvalErrorKind::Type {
+                    expected: "matching record type".into(),
+                    got: other.to_string(),
+                }
+                .at(span)),
+            }
+        }
+        Value::Record { .. } => Err(EvalErrorKind::NotAProcedure {
+            value: op.to_string(),
         }
         .at(span)),
         _ => Err(EvalErrorKind::NotAProcedure {
@@ -1043,6 +1112,162 @@ fn eval_define(
         }
         .at(span)),
     }
+}
+
+/// Evaluate (define-record-type <name> (constructor field...) predicate (field accessor)...)
+fn eval_define_record_type(
+    args: &[Expr],
+    span: &Span,
+    env: &Env,
+    ctx: &mut ContCtx,
+) -> Result<Value, EvalError> {
+    // args: [<name>, (constructor field...), predicate, (field accessor)...]
+    if args.len() < 3 {
+        return Err(EvalErrorKind::Parse {
+            message: "define-record-type requires type name, constructor, predicate, and field specs"
+                .into(),
+        }
+        .at(span));
+    }
+
+    // Parse type name (e.g., <point>)
+    let type_name = match &args[0].kind {
+        ExprKind::Symbol(name) => name.clone(),
+        _ => {
+            return Err(EvalErrorKind::Parse {
+                message: "define-record-type: expected symbol as type name".into(),
+            }
+            .at(span))
+        }
+    };
+
+    // Parse constructor: (make-point x y)
+    let (constructor_name, constructor_fields) = match &args[1].kind {
+        ExprKind::List(elems) => {
+            if elems.is_empty() {
+                return Err(EvalErrorKind::Parse {
+                    message: "define-record-type: empty constructor spec".into(),
+                }
+                .at(span));
+            }
+            let ctor_name = match &elems[0].kind {
+                ExprKind::Symbol(n) => n.clone(),
+                _ => {
+                    return Err(EvalErrorKind::Parse {
+                        message: "define-record-type: expected symbol as constructor name".into(),
+                    }
+                    .at(span))
+                }
+            };
+            let fields: Vec<String> = elems[1..]
+                .iter()
+                .map(|e| match &e.kind {
+                    ExprKind::Symbol(n) => Ok(n.clone()),
+                    _ => Err(EvalErrorKind::Parse {
+                        message: "define-record-type: expected symbol as field name".into(),
+                    }
+                    .at(span)),
+                })
+                .collect::<Result<_, _>>()?;
+            (ctor_name, fields)
+        }
+        _ => {
+            return Err(EvalErrorKind::Parse {
+                message: "define-record-type: expected list for constructor spec".into(),
+            }
+            .at(span))
+        }
+    };
+
+    // Parse predicate name
+    let predicate_name = match &args[2].kind {
+        ExprKind::Symbol(name) => name.clone(),
+        _ => {
+            return Err(EvalErrorKind::Parse {
+                message: "define-record-type: expected symbol as predicate name".into(),
+            }
+            .at(span))
+        }
+    };
+
+    // Parse field specs: (field-name accessor-name)
+    let mut field_accessors: Vec<(String, String)> = Vec::new();
+    for field_spec in &args[3..] {
+        match &field_spec.kind {
+            ExprKind::List(elems) => {
+                if elems.len() != 2 {
+                    return Err(EvalErrorKind::Parse {
+                        message: "define-record-type: field spec must be (field accessor)".into(),
+                    }
+                    .at(span));
+                }
+                let field_name = match &elems[0].kind {
+                    ExprKind::Symbol(n) => n.clone(),
+                    _ => {
+                        return Err(EvalErrorKind::Parse {
+                            message: "define-record-type: expected symbol in field spec".into(),
+                        }
+                        .at(span))
+                    }
+                };
+                let accessor_name = match &elems[1].kind {
+                    ExprKind::Symbol(n) => n.clone(),
+                    _ => {
+                        return Err(EvalErrorKind::Parse {
+                            message: "define-record-type: expected symbol in field spec".into(),
+                        }
+                        .at(span))
+                    }
+                };
+                field_accessors.push((field_name, accessor_name));
+            }
+            _ => {
+                return Err(EvalErrorKind::Parse {
+                    message: "define-record-type: expected list for field spec".into(),
+                }
+                .at(span))
+            }
+        }
+    }
+
+    let type_id = ctx.next_id();
+
+    // Define constructor
+    env.define(
+        constructor_name,
+        Value::RecordConstructor {
+            type_id,
+            type_name: type_name.clone(),
+            field_names: constructor_fields.clone(),
+        },
+    );
+
+    // Define predicate
+    env.define(predicate_name, Value::RecordPredicate { type_id });
+
+    // Define accessors — map field name to its index in the constructor field list
+    for (field_name, accessor_name) in &field_accessors {
+        let field_index = constructor_fields
+            .iter()
+            .position(|f| f == field_name)
+            .ok_or_else(|| {
+                EvalErrorKind::Parse {
+                    message: format!(
+                        "define-record-type: field '{field_name}' not in constructor"
+                    ),
+                }
+                .at(span)
+            })?;
+        env.define(
+            accessor_name.clone(),
+            Value::RecordAccessor {
+                type_id,
+                field_index,
+            },
+        );
+    }
+
+    Ok(Value::Nil)
 }
 
 fn eval_quote(args: &[Expr], span: &Span) -> Result<Value, EvalError> {
