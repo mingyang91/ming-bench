@@ -1,11 +1,15 @@
 package ming
 
-import "fmt"
+import (
+	"fmt"
+	"strings"
+)
 
 // Env represents a Scheme environment (scope).
 type Env struct {
 	bindings map[string]*Value
 	parent   *Env
+	output   *strings.Builder // shared output buffer (only set on root)
 }
 
 func NewEnv(parent *Env) *Env {
@@ -24,6 +28,17 @@ func (e *Env) Get(name string) (*Value, bool) {
 
 func (e *Env) Set(name string, val *Value) {
 	e.bindings[name] = val
+}
+
+// Output returns the shared output buffer, walking up to root.
+func (e *Env) Output() *strings.Builder {
+	if e.output != nil {
+		return e.output
+	}
+	if e.parent != nil {
+		return e.parent.Output()
+	}
+	return nil
 }
 
 type BuiltinFunc func(args []*Value, callExpr *Expr) (*Value, error)

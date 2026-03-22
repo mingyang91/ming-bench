@@ -17,6 +17,7 @@ const (
 	TypeNull
 	TypeVoid
 	TypeLambda
+	TypeChar
 )
 
 // Value represents a Scheme value.
@@ -61,6 +62,22 @@ func PairValue(car, cdr *Value) *Value {
 	return &Value{Type: TypePair, Car: car, Cdr: cdr}
 }
 
+func CharValue(c rune) *Value {
+	return &Value{Type: TypeChar, IntVal: int64(c)}
+}
+
+// DisplayString returns the display representation (no quotes on strings).
+func (v *Value) DisplayString() string {
+	switch v.Type {
+	case TypeString:
+		return v.StrVal
+	case TypeChar:
+		return string(rune(v.IntVal))
+	default:
+		return v.String()
+	}
+}
+
 // IsTruthy returns true for all values except #f.
 func (v *Value) IsTruthy() bool {
 	return !(v.Type == TypeBoolean && !v.BoolVal)
@@ -84,6 +101,18 @@ func (v *Value) String() string {
 		return "()"
 	case TypeVoid:
 		return ""
+	case TypeChar:
+		c := rune(v.IntVal)
+		switch c {
+		case ' ':
+			return "#\\space"
+		case '\n':
+			return "#\\newline"
+		case '\t':
+			return "#\\tab"
+		default:
+			return fmt.Sprintf("#\\%c", c)
+		}
 	case TypeLambda:
 		return "#<procedure>"
 	case TypePair:

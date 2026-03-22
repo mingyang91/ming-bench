@@ -1,6 +1,10 @@
 package ming
 
-import "fmt"
+import (
+	"fmt"
+	"strconv"
+	"strings"
+)
 
 func Eval(expr *Expr, env *Env) (*Value, error) {
 	switch expr.Type {
@@ -69,10 +73,10 @@ func evalList(expr *Expr, env *Env) (*Value, error) {
 		args[i] = val
 	}
 
-	return applyFunc(op, args, expr)
+	return applyFunc(op, args, expr, env)
 }
 
-func applyFunc(op *Value, args []*Value, expr *Expr) (*Value, error) {
+func applyFunc(op *Value, args []*Value, expr *Expr, env *Env) (*Value, error) {
 	if op.Type == TypeLambda {
 		return applyLambda(op, args, expr)
 	}
@@ -176,6 +180,114 @@ func applyFunc(op *Value, args []*Value, expr *Expr) (*Value, error) {
 			return nil, errAtf(expr, "symbol?: expected 1 argument, got %d", len(args))
 		}
 		return BooleanValue(args[0].Type == TypeSymbol), nil
+	case "char?":
+		if len(args) != 1 {
+			return nil, errAtf(expr, "char?: expected 1 argument, got %d", len(args))
+		}
+		return BooleanValue(args[0].Type == TypeChar), nil
+	case "display":
+		if len(args) != 1 {
+			return nil, errAtf(expr, "display: expected 1 argument, got %d", len(args))
+		}
+		if out := env.Output(); out != nil {
+			out.WriteString(args[0].DisplayString())
+		}
+		return Void, nil
+	case "write":
+		if len(args) != 1 {
+			return nil, errAtf(expr, "write: expected 1 argument, got %d", len(args))
+		}
+		if out := env.Output(); out != nil {
+			out.WriteString(args[0].String())
+		}
+		return Void, nil
+	case "newline":
+		if len(args) != 0 {
+			return nil, errAtf(expr, "newline: expected 0 arguments, got %d", len(args))
+		}
+		if out := env.Output(); out != nil {
+			out.WriteByte('\n')
+		}
+		return Void, nil
+	case "string-append":
+		var buf strings.Builder
+		for _, a := range args {
+			if a.Type != TypeString {
+				return nil, errAtf(expr, "string-append: expected string")
+			}
+			buf.WriteString(a.StrVal)
+		}
+		return StringValue(buf.String()), nil
+	case "string-length":
+		if len(args) != 1 {
+			return nil, errAtf(expr, "string-length: expected 1 argument, got %d", len(args))
+		}
+		if args[0].Type != TypeString {
+			return nil, errAtf(expr, "string-length: expected string")
+		}
+		return IntegerValue(int64(len([]rune(args[0].StrVal)))), nil
+	case "substring":
+		if len(args) != 3 {
+			return nil, errAtf(expr, "substring: expected 3 arguments, got %d", len(args))
+		}
+		if args[0].Type != TypeString || args[1].Type != TypeInteger || args[2].Type != TypeInteger {
+			return nil, errAtf(expr, "substring: invalid argument types")
+		}
+		runes := []rune(args[0].StrVal)
+		start, end := int(args[1].IntVal), int(args[2].IntVal)
+		if start < 0 || end < start || end > len(runes) {
+			return nil, errAtf(expr, "substring: index out of range")
+		}
+		return StringValue(string(runes[start:end])), nil
+	case "string->number":
+		if len(args) != 1 {
+			return nil, errAtf(expr, "string->number: expected 1 argument, got %d", len(args))
+		}
+		if args[0].Type != TypeString {
+			return nil, errAtf(expr, "string->number: expected string")
+		}
+		n, err := strconv.ParseInt(args[0].StrVal, 10, 64)
+		if err != nil {
+			return False, nil
+		}
+		return IntegerValue(n), nil
+	case "number->string":
+		if len(args) != 1 {
+			return nil, errAtf(expr, "number->string: expected 1 argument, got %d", len(args))
+		}
+		if args[0].Type != TypeInteger {
+			return nil, errAtf(expr, "number->string: expected number")
+		}
+		return StringValue(strconv.FormatInt(args[0].IntVal, 10)), nil
+	case "symbol->string":
+		if len(args) != 1 {
+			return nil, errAtf(expr, "symbol->string: expected 1 argument, got %d", len(args))
+		}
+		if args[0].Type != TypeSymbol {
+			return nil, errAtf(expr, "symbol->string: expected symbol")
+		}
+		return StringValue(args[0].StrVal), nil
+	case "string->symbol":
+		if len(args) != 1 {
+			return nil, errAtf(expr, "string->symbol: expected 1 argument, got %d", len(args))
+		}
+		if args[0].Type != TypeString {
+			return nil, errAtf(expr, "string->symbol: expected string")
+		}
+		return SymbolValue(args[0].StrVal), nil
+	case "string-ref":
+		if len(args) != 2 {
+			return nil, errAtf(expr, "string-ref: expected 2 arguments, got %d", len(args))
+		}
+		if args[0].Type != TypeString || args[1].Type != TypeInteger {
+			return nil, errAtf(expr, "string-ref: invalid argument types")
+		}
+		runes := []rune(args[0].StrVal)
+		idx := int(args[1].IntVal)
+		if idx < 0 || idx >= len(runes) {
+			return nil, errAtf(expr, "string-ref: index out of range")
+		}
+		return CharValue(runes[idx]), nil
 	default:
 		return nil, errAtf(expr, "unknown procedure: %s", name)
 	}
@@ -510,7 +622,12 @@ func makeDefaultEnv() *Env {
 	env := NewEnv(nil)
 	builtins := []string{"+", "-", "*", "/", "<", ">", "=", "<=", ">=", "not",
 		"cons", "car", "cdr", "null?", "list", "length",
-		"pair?", "number?", "string?", "boolean?", "symbol?"}
+		"pair?", "number?", "string?", "boolean?", "symbol?", "char?",
+		"display", "write", "newline",
+		"string-append", "string-length", "substring",
+		"string->number", "number->string",
+		"symbol->string", "string->symbol",
+		"string-ref"}
 	for _, name := range builtins {
 		env.Set(name, &Value{Type: TypeSymbol, StrVal: fmt.Sprintf("__builtin:%s", name)})
 	}
