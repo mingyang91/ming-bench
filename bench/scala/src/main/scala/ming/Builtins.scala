@@ -93,9 +93,10 @@ object Builtins:
       case "string->symbol" => (stringToSymbol(args), "")
       case "string-ref"     => (stringRef(args), "")
       case "string-copy"    => (stringCopy(args), "")
-      case "string-set!"    => (stringSet(args), "")
-      case "char?"          => (typeCheck(name, args), "")
-      case _                => BuiltinsL13.applyL13(name, args)
+      case "string-set!" =>
+        throw new EvalError("string-set!: strings are immutable")
+      case "char?" => (typeCheck(name, args), "")
+      case _       => BuiltinsL13.applyL13(name, args)
 
   private def typeCheck(name: String, args: List[SchemeValue]): SchemeValue =
     val result = (name, args) match

@@ -10,9 +10,9 @@ object BuiltinsL13:
   ): (SchemeValue, String) =
     name match
       // equality
-      case "eq?"    => (eqOp(args), "")
-      case "eqv?"   => (eqvOp(args), "")
-      case "equal?" => (equalOp(args), "")
+      case "eq?"    => (BuiltinsEquality.eqOp(args), "")
+      case "eqv?"   => (BuiltinsEquality.eqvOp(args), "")
+      case "equal?" => (BuiltinsEquality.equalOp(args), "")
       // numeric utilities
       case "abs"       => (absOp(args), "")
       case "modulo"    => (moduloOp(args), "")
@@ -44,84 +44,12 @@ object BuiltinsL13:
       case "string-ci=?"     => (strCiEq(args), "")
       case "string-upcase"   => (strCase(args, _.toUpperCase, "string-upcase"), "")
       case "string-downcase" => (strCase(args, _.toLowerCase, "string-downcase"), "")
-      case _                 => throw new EvalError(s"unknown procedure: $name")
-
-  // --- equality ---
-
-  private def eqOp(args: List[SchemeValue]): SchemeValue =
-    args match
-      case a :: b :: Nil => BoolVal(schemeEq(a, b))
-      case _             => throw new EvalError("eq?: expects 2 arguments")
-
-  private def eqvOp(args: List[SchemeValue]): SchemeValue =
-    args match
-      case a :: b :: Nil => BoolVal(schemeEqv(a, b))
-      case _             => throw new EvalError("eqv?: expects 2 arguments")
-
-  private def equalOp(args: List[SchemeValue]): SchemeValue =
-    args match
-      case a :: b :: Nil => BoolVal(schemeEqual(a, b))
-      case _             => throw new EvalError("equal?: expects 2 arguments")
-
-  private def schemeEq(a: SchemeValue, b: SchemeValue): Boolean =
-    (a, b) match
-      case (IntVal(x), IntVal(y))             => x == y
-      case (BoolVal(x), BoolVal(y))           => x == y
-      case (CharVal(x), CharVal(y))           => x == y
-      case (SymbolVal(x, _), SymbolVal(y, _)) => x == y
-      case (StringVal(x), StringVal(y))       => x eq y
-      case (ListVal(Nil, _), ListVal(Nil, _)) => true
-      case (Void, Void)                       => true
-      case _                                  => a eq b
-
-  private def schemeEqv(a: SchemeValue, b: SchemeValue): Boolean =
-    (a, b) match
-      case (IntVal(x), IntVal(y))             => x == y
-      case (BoolVal(x), BoolVal(y))           => x == y
-      case (CharVal(x), CharVal(y))           => x == y
-      case (SymbolVal(x, _), SymbolVal(y, _)) => x == y
-      case (StringVal(x), StringVal(y))       => x == y
-      case (ListVal(Nil, _), ListVal(Nil, _)) => true
-      case (Void, Void)                       => true
-      case _                                  => a eq b
-
-  def schemeEqual(a: SchemeValue, b: SchemeValue): Boolean =
-    (a, b) match
-      case (IntVal(x), IntVal(y))                     => x == y
-      case (BoolVal(x), BoolVal(y))                   => x == y
-      case (CharVal(x), CharVal(y))                   => x == y
-      case (SymbolVal(x, _), SymbolVal(y, _))         => x == y
-      case (StringVal(x), StringVal(y))               => x == y
-      case (MutableStringVal(x), MutableStringVal(y)) => java.util.Arrays.equals(x, y)
-      case (StringVal(x), MutableStringVal(y))        => x == String(y)
-      case (MutableStringVal(x), StringVal(y))        => String(x) == y
-      case (ListVal(Nil, _), ListVal(Nil, _))         => true
-      case (Void, Void)                               => true
-      case (PairVal(a1, d1), PairVal(a2, d2))         => schemeEqual(a1, a2) && schemeEqual(d1, d2)
-      case (ListVal(es1, _), ListVal(es2, _)) =>
-        es1.length == es2.length && es1.zip(es2).forall((x, y) => schemeEqual(x, y))
-      case (PairVal(_, _), ListVal(_, _)) =>
-        schemeEqual(a, normalizeToCanonical(a)) || equalAsPairs(a, b)
-      case (ListVal(_, _), PairVal(_, _)) =>
-        equalAsPairs(a, b)
-      case _ => false
-
-  private def equalAsPairs(a: SchemeValue, b: SchemeValue): Boolean =
-    (a, b) match
-      case (PairVal(a1, d1), PairVal(a2, d2)) => schemeEqual(a1, a2) && schemeEqual(d1, d2)
-      case (ListVal(Nil, _), ListVal(Nil, _)) => true
-      case (ListVal(h :: t, _), _)            => equalAsPairs(PairVal(h, Builtins.listToPairs(t)), b)
-      case (_, ListVal(h :: t, _))            => equalAsPairs(a, PairVal(h, Builtins.listToPairs(t)))
-      case _                                  => schemeEqual(a, b)
-
-  private def normalizeToCanonical(v: SchemeValue): SchemeValue = v match
-    case PairVal(car, cdr) =>
-      cdr match
-        case ListVal(Nil, _) => PairVal(car, ListVal(Nil))
-        case PairVal(_, _)   => PairVal(car, normalizeToCanonical(cdr))
-        case ListVal(es, _)  => PairVal(car, normalizeToCanonical(Builtins.listToPairs(es)))
-        case other           => PairVal(car, other)
-    case other => other
+      // L14: string/list conversion and char/integer conversion
+      case "string->list"  => (stringToList(args), "")
+      case "list->string"  => (listToString(args), "")
+      case "char->integer" => (charToInteger(args), "")
+      case "integer->char" => (integerToChar(args), "")
+      case _               => throw new EvalError(s"unknown procedure: $name")
 
   // --- numeric utilities ---
 
@@ -251,9 +179,9 @@ object BuiltinsL13:
       case ListVal(Nil, _) => BoolVal(false)
       case PairVal(pair, rest) =>
         pair match
-          case PairVal(k, _) if schemeEqual(k, key)      => pair
-          case ListVal(k :: _, _) if schemeEqual(k, key) => pair
-          case _                                         => assocSearch(key, rest)
+          case PairVal(k, _) if BuiltinsEquality.schemeEqual(k, key)      => pair
+          case ListVal(k :: _, _) if BuiltinsEquality.schemeEqual(k, key) => pair
+          case _                                                          => assocSearch(key, rest)
       case ListVal(elems, _) if elems.nonEmpty =>
         assocSearch(key, Builtins.listToPairs(elems))
       case _ => BoolVal(false)
@@ -321,3 +249,40 @@ object BuiltinsL13:
     args match
       case v :: Nil => StringVal(f(asString(v)))
       case _        => throw new EvalError(s"$name: expects 1 argument")
+
+  // --- L14: string/list and char/integer conversion ---
+
+  private def stringToList(args: List[SchemeValue]): SchemeValue =
+    args match
+      case v :: Nil =>
+        val chars = asString(v).toList.map(CharVal(_))
+        Builtins.listToPairs(chars)
+      case _ => throw new EvalError("string->list: expects 1 argument")
+
+  private def listToString(args: List[SchemeValue]): SchemeValue =
+    args match
+      case v :: Nil =>
+        val chars = collectChars(v)
+        StringVal(chars.mkString)
+      case _ => throw new EvalError("list->string: expects 1 argument")
+
+  @scala.annotation.tailrec
+  private def collectChars(v: SchemeValue, acc: List[Char] = Nil): List[Char] =
+    v match
+      case ListVal(Nil, _)           => acc.reverse
+      case PairVal(CharVal(c), rest) => collectChars(rest, c :: acc)
+      case PairVal(other, _) =>
+        throw new EvalError(s"list->string: expected char, got: ${other.display}")
+      case ListVal(elems, _) =>
+        collectChars(Builtins.listToPairs(elems), acc)
+      case _ => throw new EvalError("list->string: not a proper list of characters")
+
+  private def charToInteger(args: List[SchemeValue]): SchemeValue =
+    args match
+      case v :: Nil => IntVal(asChar(v).toLong)
+      case _        => throw new EvalError("char->integer: expects 1 argument")
+
+  private def integerToChar(args: List[SchemeValue]): SchemeValue =
+    args match
+      case v :: Nil => CharVal(asInt(v).toChar)
+      case _        => throw new EvalError("integer->char: expects 1 argument")

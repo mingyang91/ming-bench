@@ -102,7 +102,12 @@ object Evaluator:
     "string<?",
     "string-ci=?",
     "string-upcase",
-    "string-downcase"
+    "string-downcase",
+    // L14: string/list and char/integer conversion
+    "string->list",
+    "list->string",
+    "char->integer",
+    "integer->char"
   )
 
   private val builtinEnv: Map[String, SchemeValue] =
