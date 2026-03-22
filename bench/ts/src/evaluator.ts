@@ -222,6 +222,7 @@ type Value =
   | { tag: 'symbol'; name: string }
   | { tag: 'nil' }
   | { tag: 'pair'; car: Value; cdr: Value }
+  | { tag: 'vector'; items: Value[] }
   | { tag: 'builtin'; name: string; fn: (args: Value[]) => Value }
   | { tag: 'lambda'; params: string[]; rest: string | null; body: Expr[]; env: Env }
   | { tag: 'continuation'; id: number; exprPos: string; topIdx: number }
@@ -244,6 +245,7 @@ function displayValue(v: Value): string {
     case 'lambda': return '#<procedure>';
     case 'continuation': return '#<continuation>';
     case 'macro': return '#<macro>';
+    case 'vector': return `#(${v.items.map(displayValue).join(' ')})`;
   }
 }
 
@@ -291,6 +293,21 @@ class ContinuationJump {
     public exprPos: string,
     public topIdx: number,
   ) {}
+}
+
+// ── eqv? comparison (used by case) ───────────────────────────────────
+
+function eqvCompare(a: Value, b: Value): boolean {
+  if (a.tag !== b.tag) return false;
+  switch (a.tag) {
+    case 'number': return a.value === (b as typeof a).value;
+    case 'boolean': return a.value === (b as typeof a).value;
+    case 'symbol': return a.name === (b as typeof a).name;
+    case 'char': return a.value === (b as typeof a).value;
+    case 'string': return a.value === (b as typeof a).value;
+    case 'nil': return true;
+    default: return a === b;
+  }
 }
 
 // ── Builtins ─────────────────────────────────────────────────────────
@@ -542,6 +559,11 @@ function makeGlobalEnv(output: string[] = []): Env {
       case 'symbol': return a.name === (b as typeof a).name;
       case 'nil': return true;
       case 'pair': return valuesEqual(a.car, (b as typeof a).car) && valuesEqual(a.cdr, (b as typeof a).cdr);
+      case 'vector': {
+        const bv = b as typeof a;
+        if (a.items.length !== bv.items.length) return false;
+        return a.items.every((item, i) => valuesEqual(item, bv.items[i]));
+      }
       default: return a === b;
     }
   }
@@ -795,6 +817,60 @@ function makeGlobalEnv(output: string[] = []): Env {
       throw new ContinuationJump(proc.id, collected[0], proc.exprPos, proc.topIdx);
     }
     throw new EvalError('apply: first argument must be a procedure');
+  }});
+
+  // Vectors
+  env.define('vector', { tag: 'builtin', name: 'vector', fn(args) {
+    return { tag: 'vector', items: [...args] };
+  }});
+  env.define('make-vector', { tag: 'builtin', name: 'make-vector', fn(args) {
+    if (args.length < 1 || args[0].tag !== 'number') throw new EvalError('make-vector: expected number');
+    const len = args[0].value;
+    const fill: Value = args.length > 1 ? args[1] : { tag: 'number', value: 0 };
+    const items: Value[] = [];
+    for (let i = 0; i < len; i++) items.push(fill);
+    return { tag: 'vector', items };
+  }});
+  env.define('vector-ref', { tag: 'builtin', name: 'vector-ref', fn(args) {
+    if (args.length !== 2 || args[0].tag !== 'vector' || args[1].tag !== 'number')
+      throw new EvalError('vector-ref: expected vector and number');
+    const idx = args[1].value;
+    if (idx < 0 || idx >= args[0].items.length) throw new EvalError('vector-ref: index out of range');
+    return args[0].items[idx];
+  }});
+  env.define('vector-set!', { tag: 'builtin', name: 'vector-set!', fn(args) {
+    if (args.length !== 3 || args[0].tag !== 'vector' || args[1].tag !== 'number')
+      throw new EvalError('vector-set!: expected vector, number, and value');
+    const idx = args[1].value;
+    if (idx < 0 || idx >= args[0].items.length) throw new EvalError('vector-set!: index out of range');
+    args[0].items[idx] = args[2];
+    return { tag: 'nil' };
+  }});
+  env.define('vector?', { tag: 'builtin', name: 'vector?', fn(args) {
+    if (args.length !== 1) throw new EvalError('vector?: expected 1 argument');
+    return { tag: 'boolean', value: args[0].tag === 'vector' };
+  }});
+  env.define('vector-length', { tag: 'builtin', name: 'vector-length', fn(args) {
+    if (args.length !== 1 || args[0].tag !== 'vector') throw new EvalError('vector-length: expected vector');
+    return { tag: 'number', value: args[0].items.length };
+  }});
+  env.define('vector->list', { tag: 'builtin', name: 'vector->list', fn(args) {
+    if (args.length !== 1 || args[0].tag !== 'vector') throw new EvalError('vector->list: expected vector');
+    let result: Value = { tag: 'nil' };
+    for (let i = args[0].items.length - 1; i >= 0; i--) {
+      result = { tag: 'pair', car: args[0].items[i], cdr: result };
+    }
+    return result;
+  }});
+  env.define('list->vector', { tag: 'builtin', name: 'list->vector', fn(args) {
+    if (args.length !== 1) throw new EvalError('list->vector: expected 1 argument');
+    const items: Value[] = [];
+    let cur = args[0];
+    while (cur.tag === 'pair') {
+      items.push(cur.car);
+      cur = cur.cdr;
+    }
+    return { tag: 'vector', items };
   }});
 
   // call/cc — handled specially by the evaluator
@@ -1245,6 +1321,79 @@ function evaluate(expr: Expr, env: Env): Value {
                   evaluate(clause.items[j], env);
                 }
                 expr = clause.items[clause.items.length - 1]; continue trampoline; // TCO
+              }
+            }
+            return { tag: 'nil' };
+          }
+
+          case 'letrec': {
+            const bindingsExpr = items[1];
+            if (bindingsExpr.tag !== 'list') throw new EvalError('letrec: expected bindings list');
+            const letrecEnv = new Env(env);
+            // First define all names as undefined
+            const names: string[] = [];
+            for (const b of bindingsExpr.items) {
+              if (b.tag !== 'list' || b.items.length !== 2) throw new EvalError('letrec: bad binding');
+              if (b.items[0].tag !== 'symbol') throw new EvalError('letrec: expected symbol');
+              names.push(b.items[0].name);
+              letrecEnv.define(b.items[0].name, { tag: 'nil' });
+            }
+            // Then evaluate all init expressions in the letrec env
+            for (let i = 0; i < bindingsExpr.items.length; i++) {
+              const val = evaluate(bindingsExpr.items[i].tag === 'list' ? (bindingsExpr.items[i] as any).items[1] : bindingsExpr.items[i], letrecEnv);
+              letrecEnv.define(names[i], val);
+            }
+            for (let i = 2; i < items.length - 1; i++) {
+              evaluate(items[i], letrecEnv);
+            }
+            expr = items[items.length - 1]; env = letrecEnv; continue trampoline;
+          }
+
+          case 'letrec*': {
+            const bindingsExpr = items[1];
+            if (bindingsExpr.tag !== 'list') throw new EvalError('letrec*: expected bindings list');
+            const letrecStarEnv = new Env(env);
+            // Define all names first, then evaluate sequentially
+            for (const b of bindingsExpr.items) {
+              if (b.tag !== 'list' || b.items.length !== 2) throw new EvalError('letrec*: bad binding');
+              if (b.items[0].tag !== 'symbol') throw new EvalError('letrec*: expected symbol');
+              letrecStarEnv.define(b.items[0].name, { tag: 'nil' });
+            }
+            for (const b of bindingsExpr.items) {
+              const val = evaluate((b as any).items[1], letrecStarEnv);
+              letrecStarEnv.define((b as any).items[0].name, val);
+            }
+            for (let i = 2; i < items.length - 1; i++) {
+              evaluate(items[i], letrecStarEnv);
+            }
+            expr = items[items.length - 1]; env = letrecStarEnv; continue trampoline;
+          }
+
+          case 'case': {
+            const key = evaluate(items[1], env);
+            for (let i = 2; i < items.length; i++) {
+              const clause = items[i];
+              if (clause.tag !== 'list' || clause.items.length < 2) throw new EvalError('case: bad clause');
+              // else clause
+              if (clause.items[0].tag === 'symbol' && clause.items[0].name === 'else') {
+                for (let j = 1; j < clause.items.length - 1; j++) {
+                  evaluate(clause.items[j], env);
+                }
+                expr = clause.items[clause.items.length - 1]; continue trampoline;
+              }
+              // datum list
+              const datums = clause.items[0];
+              if (datums.tag !== 'list') throw new EvalError('case: expected datum list');
+              let matched = false;
+              for (const d of datums.items) {
+                const dv = exprToValue(d);
+                if (eqvCompare(key, dv)) { matched = true; break; }
+              }
+              if (matched) {
+                for (let j = 1; j < clause.items.length - 1; j++) {
+                  evaluate(clause.items[j], env);
+                }
+                expr = clause.items[clause.items.length - 1]; continue trampoline;
               }
             }
             return { tag: 'nil' };
