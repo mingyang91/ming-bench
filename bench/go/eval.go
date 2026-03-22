@@ -404,6 +404,244 @@ func applyBuiltin(name string, args []*Value, expr *Expr, env *Env) (*Value, err
 		return builtinApply(args, expr, env)
 	case "call/cc", "call-with-current-continuation":
 		return builtinCallCC(args, expr, env)
+	case "equal?":
+		if len(args) != 2 {
+			return nil, errAtf(expr, "equal?: expected 2 arguments, got %d", len(args))
+		}
+		return BooleanValue(schemeEqual(args[0], args[1])), nil
+	case "eq?", "eqv?":
+		if len(args) != 2 {
+			return nil, errAtf(expr, "%s: expected 2 arguments, got %d", name, len(args))
+		}
+		return BooleanValue(schemeEq(args[0], args[1])), nil
+	case "abs":
+		if len(args) != 1 || args[0].Type != TypeInteger {
+			return nil, errAtf(expr, "abs: expected 1 integer argument")
+		}
+		v := args[0].IntVal
+		if v < 0 {
+			v = -v
+		}
+		return IntegerValue(v), nil
+	case "modulo":
+		if len(args) != 2 || args[0].Type != TypeInteger || args[1].Type != TypeInteger {
+			return nil, errAtf(expr, "modulo: expected 2 integer arguments")
+		}
+		if args[1].IntVal == 0 {
+			return nil, errAtf(expr, "modulo: division by zero")
+		}
+		a, b := args[0].IntVal, args[1].IntVal
+		r := a % b
+		if r != 0 && (r > 0) != (b > 0) {
+			r += b
+		}
+		return IntegerValue(r), nil
+	case "remainder":
+		if len(args) != 2 || args[0].Type != TypeInteger || args[1].Type != TypeInteger {
+			return nil, errAtf(expr, "remainder: expected 2 integer arguments")
+		}
+		if args[1].IntVal == 0 {
+			return nil, errAtf(expr, "remainder: division by zero")
+		}
+		return IntegerValue(args[0].IntVal % args[1].IntVal), nil
+	case "quotient":
+		if len(args) != 2 || args[0].Type != TypeInteger || args[1].Type != TypeInteger {
+			return nil, errAtf(expr, "quotient: expected 2 integer arguments")
+		}
+		if args[1].IntVal == 0 {
+			return nil, errAtf(expr, "quotient: division by zero")
+		}
+		return IntegerValue(args[0].IntVal / args[1].IntVal), nil
+	case "min":
+		if len(args) == 0 {
+			return nil, errAtf(expr, "min: expected at least 1 argument")
+		}
+		m := args[0]
+		if m.Type != TypeInteger {
+			return nil, errAtf(expr, "min: expected number")
+		}
+		for _, a := range args[1:] {
+			if a.Type != TypeInteger {
+				return nil, errAtf(expr, "min: expected number")
+			}
+			if a.IntVal < m.IntVal {
+				m = a
+			}
+		}
+		return m, nil
+	case "max":
+		if len(args) == 0 {
+			return nil, errAtf(expr, "max: expected at least 1 argument")
+		}
+		m := args[0]
+		if m.Type != TypeInteger {
+			return nil, errAtf(expr, "max: expected number")
+		}
+		for _, a := range args[1:] {
+			if a.Type != TypeInteger {
+				return nil, errAtf(expr, "max: expected number")
+			}
+			if a.IntVal > m.IntVal {
+				m = a
+			}
+		}
+		return m, nil
+	case "expt":
+		if len(args) != 2 || args[0].Type != TypeInteger || args[1].Type != TypeInteger {
+			return nil, errAtf(expr, "expt: expected 2 integer arguments")
+		}
+		base, exp := args[0].IntVal, args[1].IntVal
+		result := int64(1)
+		for i := int64(0); i < exp; i++ {
+			result *= base
+		}
+		return IntegerValue(result), nil
+	case "zero?":
+		if len(args) != 1 || args[0].Type != TypeInteger {
+			return nil, errAtf(expr, "zero?: expected 1 integer argument")
+		}
+		return BooleanValue(args[0].IntVal == 0), nil
+	case "positive?":
+		if len(args) != 1 || args[0].Type != TypeInteger {
+			return nil, errAtf(expr, "positive?: expected 1 integer argument")
+		}
+		return BooleanValue(args[0].IntVal > 0), nil
+	case "negative?":
+		if len(args) != 1 || args[0].Type != TypeInteger {
+			return nil, errAtf(expr, "negative?: expected 1 integer argument")
+		}
+		return BooleanValue(args[0].IntVal < 0), nil
+	case "odd?":
+		if len(args) != 1 || args[0].Type != TypeInteger {
+			return nil, errAtf(expr, "odd?: expected 1 integer argument")
+		}
+		return BooleanValue(args[0].IntVal%2 != 0), nil
+	case "even?":
+		if len(args) != 1 || args[0].Type != TypeInteger {
+			return nil, errAtf(expr, "even?: expected 1 integer argument")
+		}
+		return BooleanValue(args[0].IntVal%2 == 0), nil
+	case "list-ref":
+		if len(args) != 2 || args[1].Type != TypeInteger {
+			return nil, errAtf(expr, "list-ref: expected list and integer")
+		}
+		cur := args[0]
+		idx := args[1].IntVal
+		for i := int64(0); i < idx; i++ {
+			if cur.Type != TypePair {
+				return nil, errAtf(expr, "list-ref: index out of range")
+			}
+			cur = cur.Cdr
+		}
+		if cur.Type != TypePair {
+			return nil, errAtf(expr, "list-ref: index out of range")
+		}
+		return cur.Car, nil
+	case "list-tail":
+		if len(args) != 2 || args[1].Type != TypeInteger {
+			return nil, errAtf(expr, "list-tail: expected list and integer")
+		}
+		cur := args[0]
+		idx := args[1].IntVal
+		for i := int64(0); i < idx; i++ {
+			if cur.Type != TypePair {
+				return nil, errAtf(expr, "list-tail: index out of range")
+			}
+			cur = cur.Cdr
+		}
+		return cur, nil
+	case "list?":
+		if len(args) != 1 {
+			return nil, errAtf(expr, "list?: expected 1 argument")
+		}
+		cur := args[0]
+		for cur.Type == TypePair {
+			cur = cur.Cdr
+		}
+		return BooleanValue(cur.Type == TypeNull), nil
+	case "assoc":
+		if len(args) != 2 {
+			return nil, errAtf(expr, "assoc: expected 2 arguments")
+		}
+		key := args[0]
+		cur := args[1]
+		for cur.Type == TypePair {
+			entry := cur.Car
+			if entry.Type == TypePair && schemeEqual(entry.Car, key) {
+				return entry, nil
+			}
+			cur = cur.Cdr
+		}
+		return False, nil
+	case "map":
+		return builtinMap(args, expr, env)
+	case "for-each":
+		return builtinForEach(args, expr, env)
+	case "char-alphabetic?":
+		if len(args) != 1 || args[0].Type != TypeChar {
+			return nil, errAtf(expr, "char-alphabetic?: expected 1 char argument")
+		}
+		c := rune(args[0].IntVal)
+		return BooleanValue((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z')), nil
+	case "char-numeric?":
+		if len(args) != 1 || args[0].Type != TypeChar {
+			return nil, errAtf(expr, "char-numeric?: expected 1 char argument")
+		}
+		c := rune(args[0].IntVal)
+		return BooleanValue(c >= '0' && c <= '9'), nil
+	case "char-upcase":
+		if len(args) != 1 || args[0].Type != TypeChar {
+			return nil, errAtf(expr, "char-upcase: expected 1 char argument")
+		}
+		c := rune(args[0].IntVal)
+		if c >= 'a' && c <= 'z' {
+			c = c - 'a' + 'A'
+		}
+		return CharValue(c), nil
+	case "char-downcase":
+		if len(args) != 1 || args[0].Type != TypeChar {
+			return nil, errAtf(expr, "char-downcase: expected 1 char argument")
+		}
+		c := rune(args[0].IntVal)
+		if c >= 'A' && c <= 'Z' {
+			c = c - 'A' + 'a'
+		}
+		return CharValue(c), nil
+	case "char=?":
+		if len(args) != 2 || args[0].Type != TypeChar || args[1].Type != TypeChar {
+			return nil, errAtf(expr, "char=?: expected 2 char arguments")
+		}
+		return BooleanValue(args[0].IntVal == args[1].IntVal), nil
+	case "char<?":
+		if len(args) != 2 || args[0].Type != TypeChar || args[1].Type != TypeChar {
+			return nil, errAtf(expr, "char<?: expected 2 char arguments")
+		}
+		return BooleanValue(args[0].IntVal < args[1].IntVal), nil
+	case "string=?":
+		if len(args) != 2 || args[0].Type != TypeString || args[1].Type != TypeString {
+			return nil, errAtf(expr, "string=?: expected 2 string arguments")
+		}
+		return BooleanValue(args[0].StrContent() == args[1].StrContent()), nil
+	case "string<?":
+		if len(args) != 2 || args[0].Type != TypeString || args[1].Type != TypeString {
+			return nil, errAtf(expr, "string<?: expected 2 string arguments")
+		}
+		return BooleanValue(args[0].StrContent() < args[1].StrContent()), nil
+	case "string-ci=?":
+		if len(args) != 2 || args[0].Type != TypeString || args[1].Type != TypeString {
+			return nil, errAtf(expr, "string-ci=?: expected 2 string arguments")
+		}
+		return BooleanValue(strings.EqualFold(args[0].StrContent(), args[1].StrContent())), nil
+	case "string-upcase":
+		if len(args) != 1 || args[0].Type != TypeString {
+			return nil, errAtf(expr, "string-upcase: expected 1 string argument")
+		}
+		return StringValue(strings.ToUpper(args[0].StrContent())), nil
+	case "string-downcase":
+		if len(args) != 1 || args[0].Type != TypeString {
+			return nil, errAtf(expr, "string-downcase: expected 1 string argument")
+		}
+		return StringValue(strings.ToLower(args[0].StrContent())), nil
 	case "string-set!":
 		if len(args) != 3 {
 			return nil, errAtf(expr, "string-set!: expected 3 arguments, got %d", len(args))
@@ -987,6 +1225,148 @@ func evalCondTCO(expr *Expr, env *Env) (*Expr, *Env, *Value, error) {
 	return nil, nil, Void, nil
 }
 
+func schemeEqual(a, b *Value) bool {
+	if a.Type != b.Type {
+		return false
+	}
+	switch a.Type {
+	case TypeInteger:
+		return a.IntVal == b.IntVal
+	case TypeBoolean:
+		return a.BoolVal == b.BoolVal
+	case TypeString:
+		return a.StrContent() == b.StrContent()
+	case TypeSymbol:
+		return a.StrVal == b.StrVal
+	case TypeChar:
+		return a.IntVal == b.IntVal
+	case TypeNull:
+		return true
+	case TypePair:
+		return schemeEqual(a.Car, b.Car) && schemeEqual(a.Cdr, b.Cdr)
+	default:
+		return a == b
+	}
+}
+
+func schemeEq(a, b *Value) bool {
+	if a == b {
+		return true
+	}
+	if a.Type != b.Type {
+		return false
+	}
+	switch a.Type {
+	case TypeInteger:
+		return a.IntVal == b.IntVal
+	case TypeBoolean:
+		return a.BoolVal == b.BoolVal
+	case TypeSymbol:
+		return a.StrVal == b.StrVal
+	case TypeChar:
+		return a.IntVal == b.IntVal
+	case TypeNull:
+		return true
+	default:
+		return false
+	}
+}
+
+func builtinMap(args []*Value, expr *Expr, env *Env) (*Value, error) {
+	if len(args) < 2 {
+		return nil, errAtf(expr, "map: expected at least 2 arguments")
+	}
+	fn := args[0]
+	lists := args[1:]
+	// Collect results
+	var results []*Value
+	for {
+		// Check if any list is exhausted
+		allPair := true
+		for _, l := range lists {
+			if l.Type == TypeNull {
+				allPair = false
+				break
+			}
+			if l.Type != TypePair {
+				return nil, errAtf(expr, "map: expected proper list")
+			}
+		}
+		if !allPair {
+			break
+		}
+		// Collect car of each list
+		mapArgs := make([]*Value, len(lists))
+		for i, l := range lists {
+			mapArgs[i] = l.Car
+		}
+		// Apply function
+		te, tenv, v, err, isTail := applyFuncTCO(fn, mapArgs, expr, env)
+		if err != nil {
+			return nil, err
+		}
+		if isTail {
+			v, err = Eval(te, tenv)
+			if err != nil {
+				return nil, err
+			}
+		}
+		results = append(results, v)
+		// Advance lists
+		for i, l := range lists {
+			lists[i] = l.Cdr
+		}
+	}
+	// Build result list
+	result := Null
+	for i := len(results) - 1; i >= 0; i-- {
+		result = PairValue(results[i], result)
+	}
+	return result, nil
+}
+
+func builtinForEach(args []*Value, expr *Expr, env *Env) (*Value, error) {
+	if len(args) < 2 {
+		return nil, errAtf(expr, "for-each: expected at least 2 arguments")
+	}
+	fn := args[0]
+	lists := args[1:]
+	for {
+		allPair := true
+		for _, l := range lists {
+			if l.Type == TypeNull {
+				allPair = false
+				break
+			}
+			if l.Type != TypePair {
+				return nil, errAtf(expr, "for-each: expected proper list")
+			}
+		}
+		if !allPair {
+			break
+		}
+		mapArgs := make([]*Value, len(lists))
+		for i, l := range lists {
+			mapArgs[i] = l.Car
+		}
+		te, tenv, v, err, isTail := applyFuncTCO(fn, mapArgs, expr, env)
+		if err != nil {
+			return nil, err
+		}
+		if isTail {
+			v, err = Eval(te, tenv)
+			if err != nil {
+				return nil, err
+			}
+		}
+		_ = v
+		for i, l := range lists {
+			lists[i] = l.Cdr
+		}
+	}
+	return Void, nil
+}
+
 func makeDefaultEnv() *Env {
 	env := NewEnv(nil)
 	builtins := []string{"+", "-", "*", "/", "<", ">", "=", "<=", ">=", "not",
@@ -999,7 +1379,18 @@ func makeDefaultEnv() *Env {
 		"string-ref",
 		"string-set!", "string-copy",
 		"apply",
-		"call/cc", "call-with-current-continuation"}
+		"call/cc", "call-with-current-continuation",
+		"equal?", "eq?", "eqv?",
+		"abs", "modulo", "remainder", "quotient",
+		"min", "max", "expt",
+		"zero?", "positive?", "negative?", "odd?", "even?",
+		"list-ref", "list-tail", "list?",
+		"assoc", "map", "for-each",
+		"char-alphabetic?", "char-numeric?",
+		"char-upcase", "char-downcase",
+		"char=?", "char<?",
+		"string=?", "string<?", "string-ci=?",
+		"string-upcase", "string-downcase"}
 	for _, name := range builtins {
 		env.Set(name, &Value{Type: TypeSymbol, StrVal: fmt.Sprintf("__builtin:%s", name)})
 	}
