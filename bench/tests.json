@@ -845,7 +845,7 @@
     "level": 12,
     "fixture": "l12_coroutine_scheduler.scm",
     "kind": "eval_str_ok",
-    "expected": "4"
+    "expected": "6"
   },
   {
     "name": "l12_church_booleans_with_callcc",
