@@ -2,7 +2,7 @@ use crate::scheme::env::Env;
 use crate::scheme::error::{EvalError, EvalErrorKind, Span};
 use crate::scheme::macro_expand;
 use crate::scheme::parser::{Expr, ExprKind};
-use crate::scheme::value::{make_rational, ContCtx, ResumeFrame, Value};
+use crate::scheme::value::{make_rational, ContCtx, ResumeFrame, SyntaxObjectData, Value};
 
 /// Trampoline action for tail-call optimization.
 enum TcoAction {
@@ -127,7 +127,7 @@ fn eval_list_step(
                 return Ok(TcoAction::Result(v));
             }
             "define-syntax" => {
-                let v = eval_define_syntax(&elements[1..], kw_span, env)?;
+                let v = eval_define_syntax(&elements[1..], kw_span, env, output, ctx)?;
                 return Ok(TcoAction::Result(v));
             }
             "letrec" => return eval_letrec_step(&elements[1..], kw_span, env, output, ctx),
@@ -152,6 +152,17 @@ fn eval_list_step(
             "define-record-type" => {
                 let v = eval_define_record_type(&elements[1..], kw_span, env, ctx)?;
                 return Ok(TcoAction::Result(v));
+            }
+            "syntax-case" => {
+                let v = eval_syntax_case(&elements[1..], kw_span, env, output, ctx)?;
+                return Ok(TcoAction::Result(v));
+            }
+            "syntax" => {
+                let v = eval_syntax_template(&elements[1..], kw_span, env)?;
+                return Ok(TcoAction::Result(v));
+            }
+            "with-syntax" => {
+                return eval_with_syntax_step(&elements[1..], kw_span, env, output, ctx);
             }
             _ => {}
         }
@@ -181,6 +192,26 @@ fn eval_list_step(
                 expr: expanded,
                 env: expansion_env,
             });
+        }
+        // Check for syntax-case macros
+        if let Ok(Value::SyntaxCaseMacro {
+            params,
+            body,
+            def_env,
+        }) = env.lookup(name)
+        {
+            return eval_syntax_case_macro_invocation(
+                &SyntaxCaseInvocation {
+                    params: &params,
+                    body: &body,
+                    def_env: &def_env,
+                    use_elements: elements,
+                    span: list_span,
+                    use_env: env,
+                },
+                output,
+                ctx,
+            );
         }
     }
 
@@ -320,6 +351,8 @@ fn is_builtin(name: &str) -> bool {
             | "set-cdr!"
             | "cddr"
             | "cadr"
+            | "syntax->datum"
+            | "datum->syntax"
     )
 }
 
@@ -450,10 +483,12 @@ fn apply_step(
             ctx.resume_frames = Some(frames.clone());
             Err(EvalErrorKind::ContinuationReturn { id: *id }.at(span))
         }
-        Value::Macro { .. } => Err(EvalErrorKind::NotAProcedure {
-            value: "#<macro>".into(),
+        Value::Macro { .. } | Value::SyntaxCaseMacro { .. } => {
+            Err(EvalErrorKind::NotAProcedure {
+                value: "#<macro>".into(),
+            }
+            .at(span))
         }
-        .at(span)),
         Value::RecordConstructor {
             type_id,
             type_name,
@@ -997,6 +1032,8 @@ fn eval_builtin(
         "set-cdr!" => eval_set_cdr(args, span),
         "cddr" => eval_cddr(args, span),
         "cadr" => eval_cadr(args, span),
+        "syntax->datum" => eval_syntax_to_datum(args, span),
+        "datum->syntax" => eval_datum_to_syntax(args, span),
         _ => Err(EvalErrorKind::UnboundVariable {
             name: name.to_string(),
         }
@@ -2733,7 +2770,13 @@ fn eval_string_case(
     Ok(Value::SchemeString(convert(s)))
 }
 
-fn eval_define_syntax(args: &[Expr], span: &Span, env: &Env) -> Result<Value, EvalError> {
+fn eval_define_syntax(
+    args: &[Expr],
+    span: &Span,
+    env: &Env,
+    output: &mut String,
+    ctx: &mut ContCtx,
+) -> Result<Value, EvalError> {
     if args.len() != 2 {
         return Err(EvalErrorKind::Parse {
             message: "define-syntax requires a name and a transformer".into(),
@@ -2749,13 +2792,13 @@ fn eval_define_syntax(args: &[Expr], span: &Span, env: &Env) -> Result<Value, Ev
             .at(span))
         }
     };
-    // args[1] should be (syntax-rules (literals...) rules...)
     match &args[1].kind {
-        ExprKind::List(sr_parts) if !sr_parts.is_empty() => {
-            if let ExprKind::Symbol(kw) = &sr_parts[0].kind {
+        ExprKind::List(parts) if !parts.is_empty() => {
+            if let ExprKind::Symbol(kw) = &parts[0].kind {
+                // (syntax-rules (literals...) rules...)
                 if kw == "syntax-rules" {
                     let syntax_rules =
-                        macro_expand::parse_syntax_rules(&sr_parts[1..], span)?;
+                        macro_expand::parse_syntax_rules(&parts[1..], span)?;
                     env.define(
                         name,
                         Value::Macro {
@@ -2765,14 +2808,54 @@ fn eval_define_syntax(args: &[Expr], span: &Span, env: &Env) -> Result<Value, Ev
                     );
                     return Ok(Value::Nil);
                 }
+                // (lambda (stx) body...) — syntax-case transformer
+                if kw == "lambda" {
+                    let transformer = eval_lambda(&parts[1..], span, env)?;
+                    if let Value::Lambda {
+                            params,
+                            body,
+                            env: lambda_env,
+                            ..
+                        } = transformer {
+                        env.define(
+                            name,
+                            Value::SyntaxCaseMacro {
+                                params,
+                                body,
+                                def_env: lambda_env,
+                            },
+                        );
+                        return Ok(Value::Nil);
+                    }
+                }
             }
-            Err(EvalErrorKind::Parse {
-                message: "define-syntax: expected syntax-rules transformer".into(),
+            // Fall through: try evaluating the transformer expression
+            let transformer = eval(&args[1], env, output, ctx)?;
+            match transformer {
+                Value::Lambda {
+                    params,
+                    body,
+                    env: lambda_env,
+                    ..
+                } => {
+                    env.define(
+                        name,
+                        Value::SyntaxCaseMacro {
+                            params,
+                            body,
+                            def_env: lambda_env,
+                        },
+                    );
+                    Ok(Value::Nil)
+                }
+                _ => Err(EvalErrorKind::Parse {
+                    message: "define-syntax: expected syntax-rules or lambda transformer".into(),
+                }
+                .at(span)),
             }
-            .at(span))
         }
         _ => Err(EvalErrorKind::Parse {
-            message: "define-syntax: expected syntax-rules transformer".into(),
+            message: "define-syntax: expected syntax-rules or lambda transformer".into(),
         }
         .at(span)),
     }
@@ -3291,4 +3374,709 @@ fn eval_list_to_vector(args: &[Value], span: &Span) -> Result<Value, EvalError> 
     Ok(Value::Vector(std::rc::Rc::new(std::cell::RefCell::new(
         elems,
     ))))
+}
+
+// ── syntax-case support ──────────────────────────────────────────────
+
+/// Create a simple SyntaxObject value wrapping an Expr (no hygiene data).
+fn make_syntax_object(expr: Expr) -> Value {
+    Value::SyntaxObject(Box::new(SyntaxObjectData {
+        expr,
+        introduced: Vec::new(),
+        template_env: None,
+    }))
+}
+
+/// Create a SyntaxObject with hygiene data.
+fn make_syntax_object_with_hygiene(
+    expr: Expr,
+    introduced: Vec<(String, String)>,
+    env: Env,
+) -> Value {
+    Value::SyntaxObject(Box::new(SyntaxObjectData {
+        expr,
+        introduced,
+        template_env: Some(env),
+    }))
+}
+
+/// Convert a Value to an Expr (for datum->syntax).
+fn value_to_expr(val: &Value, span: &Span) -> Expr {
+    let kind = match val {
+        Value::Integer(n) => ExprKind::Integer(*n),
+        Value::Float(f) => ExprKind::Float(*f),
+        Value::Rational(n, d) => ExprKind::Rational(*n, *d),
+        Value::Boolean(b) => ExprKind::Boolean(*b),
+        Value::SchemeString(s) => ExprKind::SchemeString(s.clone()),
+        Value::Char(c) => ExprKind::Char(*c),
+        Value::Symbol(s) => ExprKind::Symbol(s.clone()),
+        Value::Nil => ExprKind::List(vec![]),
+        Value::Pair(_) => {
+            let mut elems = Vec::new();
+            let mut cur = val.clone();
+            loop {
+                match cur {
+                    Value::Pair(p) => {
+                        let pair = p.borrow();
+                        elems.push(value_to_expr(&pair.0, span));
+                        cur = pair.1.clone();
+                    }
+                    Value::Nil => break,
+                    other => {
+                        // Improper list — not fully supported but handle gracefully
+                        elems.push(value_to_expr(&other, span));
+                        break;
+                    }
+                }
+            }
+            ExprKind::List(elems)
+        }
+        Value::SyntaxObject(data) => return data.expr.clone(),
+        _ => ExprKind::Symbol(format!("{val}")),
+    };
+    Expr {
+        kind,
+        span: span.clone(),
+    }
+}
+
+/// Convert a syntax-case pattern binding to a Value.
+fn syntax_binding_to_value(binding: &SyntaxBinding) -> Value {
+    match binding {
+        SyntaxBinding::Single(expr) => make_syntax_object(expr.clone()),
+        SyntaxBinding::Ellipsis(exprs) => {
+            let mut list = Value::Nil;
+            for e in exprs.iter().rev() {
+                list = Value::pair(make_syntax_object(e.clone()), list);
+            }
+            list
+        }
+    }
+}
+
+/// Arguments for invoking a syntax-case macro transformer.
+struct SyntaxCaseInvocation<'a> {
+    params: &'a [String],
+    body: &'a [Expr],
+    def_env: &'a Env,
+    use_elements: &'a [Expr],
+    span: &'a Span,
+    use_env: &'a Env,
+}
+
+/// Invoke a syntax-case macro transformer.
+fn eval_syntax_case_macro_invocation(
+    inv: &SyntaxCaseInvocation<'_>,
+    output: &mut String,
+    ctx: &mut ContCtx,
+) -> Result<TcoAction, EvalError> {
+    let SyntaxCaseInvocation { params, body, def_env, use_elements, span, use_env } = *inv;
+    // Build a syntax object from the use-site form
+    let stx_expr = Expr {
+        kind: ExprKind::List(use_elements.to_vec()),
+        span: span.clone(),
+    };
+    let stx_val = make_syntax_object(stx_expr);
+
+    // Call the transformer lambda: bind param, evaluate body
+    let call_env = Env::with_parent(def_env);
+    if !params.is_empty() {
+        call_env.define(params[0].clone(), stx_val);
+    }
+
+    // Evaluate the transformer body
+    let result = eval_sequence(body, &call_env, output, ctx)?;
+
+    // The result should be a SyntaxObject — extract the Expr and evaluate it
+    match result {
+        Value::SyntaxObject(data) => {
+            let template_env = data.template_env.as_ref().unwrap_or(&call_env);
+
+            // Set up hygiene bindings in the use-site env
+            for (gensym, original) in &data.introduced {
+                if let Ok(val) = template_env.lookup(original) {
+                    use_env.define(gensym.clone(), val);
+                }
+            }
+            Ok(TcoAction::TailCall {
+                expr: data.expr.clone(),
+                env: use_env.clone(),
+            })
+        }
+        _ => Err(EvalErrorKind::Parse {
+            message: "syntax-case transformer must return a syntax object".into(),
+        }
+        .at(span)),
+    }
+}
+
+/// Apply hygiene renaming to template-introduced identifiers in an expanded Expr.
+/// Pattern variable substitution has already happened (they contain use-site exprs).
+/// We only rename identifiers that are NOT keywords and NOT already from the use-site.
+/// Evaluate `(syntax-case expr (literals) clause ...)`.
+fn eval_syntax_case(
+    args: &[Expr],
+    span: &Span,
+    env: &Env,
+    output: &mut String,
+    ctx: &mut ContCtx,
+) -> Result<Value, EvalError> {
+    if args.len() < 2 {
+        return Err(EvalErrorKind::Parse {
+            message: "syntax-case requires an expression, literals, and at least one clause".into(),
+        }
+        .at(span));
+    }
+
+    // Evaluate the expression to get a syntax object
+    let stx_val = eval(&args[0], env, output, ctx)?;
+    let stx_expr = match &stx_val {
+        Value::SyntaxObject(data) => data.expr.clone(),
+        _ => value_to_expr(&stx_val, span),
+    };
+
+    // Parse literals
+    let literals = match &args[1].kind {
+        ExprKind::List(lits) => lits
+            .iter()
+            .map(|e| match &e.kind {
+                ExprKind::Symbol(s) => Ok(s.clone()),
+                _ => Err(EvalErrorKind::Parse {
+                    message: "syntax-case: literals must be symbols".into(),
+                }
+                .at(span)),
+            })
+            .collect::<Result<Vec<_>, _>>()?,
+        _ => {
+            return Err(EvalErrorKind::Parse {
+                message: "syntax-case: expected literal list".into(),
+            }
+            .at(span))
+        }
+    };
+
+    // Try each clause
+    let clauses = &args[2..];
+    for clause in clauses {
+        match &clause.kind {
+            ExprKind::List(parts) if parts.len() >= 2 => {
+                let pattern = &parts[0];
+                let (fender, template_expr) = if parts.len() == 3 {
+                    (Some(&parts[1]), &parts[2])
+                } else {
+                    (None, &parts[1])
+                };
+
+                // Try to match the pattern against the syntax object
+                let mut bindings: Vec<(String, SyntaxBinding)> = Vec::new();
+                if syntax_case_match(pattern, &stx_expr, &literals, &mut bindings) {
+                    // Bind pattern variables in a child env
+                    let match_env = Env::with_parent(env);
+                    for (name, binding) in &bindings {
+                        let val = syntax_binding_to_value(binding);
+                        match_env.define(name.clone(), val);
+                    }
+                    // Store binding metadata for the syntax template to use
+                    let binding_names: Vec<String> =
+                        bindings.iter().map(|(n, _)| n.clone()).collect();
+                    let ellipsis_names: Vec<String> = bindings
+                        .iter()
+                        .filter(|(_, b)| matches!(b, SyntaxBinding::Ellipsis(_)))
+                        .map(|(n, _)| n.clone())
+                        .collect();
+                    match_env.define(
+                        "##syntax-case-bindings##".into(),
+                        Value::Symbol(binding_names.join(",")),
+                    );
+                    match_env.define(
+                        "##syntax-case-ellipsis##".into(),
+                        Value::Symbol(ellipsis_names.join(",")),
+                    );
+
+                    // Evaluate fender if present
+                    if let Some(fender_expr) = fender {
+                        let fender_val = eval(fender_expr, &match_env, output, ctx)?;
+                        if !fender_val.is_truthy() {
+                            continue;
+                        }
+                    }
+
+                    // Evaluate the template expression
+                    return eval(template_expr, &match_env, output, ctx);
+                }
+            }
+            _ => {
+                return Err(EvalErrorKind::Parse {
+                    message: "syntax-case: invalid clause".into(),
+                }
+                .at(span))
+            }
+        }
+    }
+
+    Err(EvalErrorKind::Parse {
+        message: "syntax-case: no matching clause".into(),
+    }
+    .at(span))
+}
+
+/// A binding from syntax-case pattern matching.
+enum SyntaxBinding {
+    Single(Expr),
+    Ellipsis(Vec<Expr>),
+}
+
+/// Match a syntax-case pattern against a syntax object (Expr).
+/// The pattern includes the macro name as first element (matched by _).
+fn syntax_case_match(
+    pattern: &Expr,
+    stx: &Expr,
+    literals: &[String],
+    bindings: &mut Vec<(String, SyntaxBinding)>,
+) -> bool {
+    match &pattern.kind {
+        ExprKind::Symbol(name) if name == "_" => true,
+        ExprKind::Symbol(name) if literals.contains(name) => {
+            matches!(&stx.kind, ExprKind::Symbol(s) if s == name)
+        }
+        ExprKind::Symbol(name) => {
+            bindings.push((name.clone(), SyntaxBinding::Single(stx.clone())));
+            true
+        }
+        ExprKind::List(pat_elems) => {
+            match &stx.kind {
+                ExprKind::List(stx_elems) => {
+                    syntax_case_match_elements(pat_elems, stx_elems, literals, bindings)
+                }
+                _ => false,
+            }
+        }
+        _ => pattern.kind == stx.kind,
+    }
+}
+
+/// Match pattern elements against syntax elements (handling ellipsis).
+fn syntax_case_match_elements(
+    pat: &[Expr],
+    form: &[Expr],
+    literals: &[String],
+    bindings: &mut Vec<(String, SyntaxBinding)>,
+) -> bool {
+    // Find ellipsis position
+    let ellipsis_pos = pat
+        .iter()
+        .position(|e| matches!(&e.kind, ExprKind::Symbol(s) if s == "..."));
+
+    match ellipsis_pos {
+        Some(pos) if pos > 0 => {
+            let before_ellipsis = &pat[..pos - 1];
+            let ellipsis_var = &pat[pos - 1];
+            let after_ellipsis = &pat[pos + 1..];
+
+            if form.len() < before_ellipsis.len() + after_ellipsis.len() {
+                return false;
+            }
+
+            // Match fixed elements before
+            for (p, f) in before_ellipsis.iter().zip(form.iter()) {
+                if !syntax_case_match(p, f, literals, bindings) {
+                    return false;
+                }
+            }
+
+            // Match fixed elements after
+            let after_start = form.len() - after_ellipsis.len();
+            for (p, f) in after_ellipsis.iter().zip(form[after_start..].iter()) {
+                if !syntax_case_match(p, f, literals, bindings) {
+                    return false;
+                }
+            }
+
+            // The ellipsis variable matches everything in between
+            let ellipsis_forms = &form[before_ellipsis.len()..after_start];
+            match &ellipsis_var.kind {
+                ExprKind::Symbol(name) if !literals.contains(name) && name != "_" => {
+                    bindings.push((
+                        name.clone(),
+                        SyntaxBinding::Ellipsis(ellipsis_forms.to_vec()),
+                    ));
+                    true
+                }
+                _ => false,
+            }
+        }
+        _ => {
+            // No ellipsis — exact count
+            if pat.len() != form.len() {
+                return false;
+            }
+            for (p, f) in pat.iter().zip(form.iter()) {
+                if !syntax_case_match(p, f, literals, bindings) {
+                    return false;
+                }
+            }
+            true
+        }
+    }
+}
+
+/// Evaluate `(syntax template)` — construct a syntax object from a template.
+/// Pattern variables from syntax-case are substituted; template-introduced
+/// identifiers are renamed for hygiene.
+fn eval_syntax_template(args: &[Expr], span: &Span, env: &Env) -> Result<Value, EvalError> {
+    if args.len() != 1 {
+        return Err(EvalErrorKind::Parse {
+            message: "syntax requires exactly one argument".into(),
+        }
+        .at(span));
+    }
+
+    // Retrieve binding metadata from the environment
+    let binding_names: Vec<String> = match env.lookup("##syntax-case-bindings##") {
+        Ok(Value::Symbol(s)) if !s.is_empty() => s.split(',').map(|s| s.to_string()).collect(),
+        _ => Vec::new(),
+    };
+    let ellipsis_names: Vec<String> = match env.lookup("##syntax-case-ellipsis##") {
+        Ok(Value::Symbol(s)) if !s.is_empty() => s.split(',').map(|s| s.to_string()).collect(),
+        _ => Vec::new(),
+    };
+
+    let hygiene_id = match env.lookup("##syntax-hygiene-id##") {
+        Ok(Value::Integer(n)) => n as u64,
+        _ => 0,
+    };
+
+    let mut introduced = Vec::new();
+    let result_expr = instantiate_syntax_template(
+        &args[0],
+        &binding_names,
+        &ellipsis_names,
+        env,
+        span,
+        hygiene_id,
+        &mut introduced,
+    )?;
+
+    Ok(make_syntax_object_with_hygiene(result_expr, introduced, env.clone()))
+}
+
+/// Instantiate a syntax template, substituting pattern variables and
+/// renaming template-introduced identifiers.
+fn instantiate_syntax_template(
+    template: &Expr,
+    binding_names: &[String],
+    ellipsis_names: &[String],
+    env: &Env,
+    span: &Span,
+    hygiene_id: u64,
+    introduced: &mut Vec<(String, String)>,
+) -> Result<Expr, EvalError> {
+    match &template.kind {
+        ExprKind::Symbol(name) => {
+            if binding_names.contains(name) {
+                // Pattern variable — substitute with its binding
+                match env.lookup(name) {
+                    Ok(Value::SyntaxObject(data)) => Ok(data.expr.clone()),
+                    Ok(other) => Ok(value_to_expr(&other, span)),
+                    Err(_) => Ok(template.clone()),
+                }
+            } else if macro_expand::is_keyword(name) || is_builtin(name) || name == "syntax-case" || name == "syntax" || name == "with-syntax" {
+                Ok(template.clone())
+            } else {
+                // Template-introduced identifier: rename for hygiene
+                let gensym = format!("{name}##h{hygiene_id}");
+                introduced.push((gensym.clone(), name.clone()));
+                Ok(Expr {
+                    kind: ExprKind::Symbol(gensym),
+                    span: template.span.clone(),
+                })
+            }
+        }
+        ExprKind::List(elements) => {
+            // Don't recurse into quoted forms
+            if let Some(first) = elements.first() {
+                if matches!(&first.kind, ExprKind::Symbol(s) if s == "quote") {
+                    return Ok(template.clone());
+                }
+            }
+            let mut result = Vec::new();
+            let mut i = 0;
+            while i < elements.len() {
+                // Check if next element is `...`
+                if i + 1 < elements.len() {
+                    if let ExprKind::Symbol(s) = &elements[i + 1].kind {
+                        if s == "..." {
+                            // Expand the ellipsis
+                            let expanded = expand_syntax_ellipsis(
+                                &elements[i],
+                                binding_names,
+                                ellipsis_names,
+                                env,
+                                span,
+                                hygiene_id,
+                                introduced,
+                            )?;
+                            result.extend(expanded);
+                            i += 2;
+                            continue;
+                        }
+                    }
+                }
+                result.push(instantiate_syntax_template(
+                    &elements[i],
+                    binding_names,
+                    ellipsis_names,
+                    env,
+                    span,
+                    hygiene_id,
+                    introduced,
+                )?);
+                i += 1;
+            }
+            Ok(Expr {
+                kind: ExprKind::List(result),
+                span: template.span.clone(),
+            })
+        }
+        _ => Ok(template.clone()),
+    }
+}
+
+/// Expand an ellipsis-preceded template element.
+fn expand_syntax_ellipsis(
+    template_elem: &Expr,
+    binding_names: &[String],
+    ellipsis_names: &[String],
+    env: &Env,
+    span: &Span,
+    hygiene_id: u64,
+    introduced: &mut Vec<(String, String)>,
+) -> Result<Vec<Expr>, EvalError> {
+    // Find which ellipsis variable is used in the template element
+    let ellipsis_var = find_syntax_ellipsis_var(template_elem, ellipsis_names);
+
+    match ellipsis_var {
+        Some(var_name) => {
+            // Get the list of syntax objects for this variable
+            let list_val = env.lookup(&var_name).unwrap_or(Value::Nil);
+            let items = value_list_to_syntax_objects(&list_val);
+
+            let mut result = Vec::new();
+            for item in &items {
+                // Create a temporary env with this ellipsis var bound to a single item
+                let temp_env = Env::with_parent(env);
+                temp_env.define(var_name.clone(), item.clone());
+                // Copy binding metadata
+                if let Ok(v) = env.lookup("##syntax-case-bindings##") {
+                    temp_env.define("##syntax-case-bindings##".into(), v);
+                }
+                if let Ok(v) = env.lookup("##syntax-case-ellipsis##") {
+                    temp_env.define("##syntax-case-ellipsis##".into(), v);
+                }
+
+                result.push(instantiate_syntax_template(
+                    template_elem,
+                    binding_names,
+                    ellipsis_names,
+                    &temp_env,
+                    span,
+                    hygiene_id,
+                    introduced,
+                )?);
+            }
+            Ok(result)
+        }
+        None => Ok(Vec::new()),
+    }
+}
+
+/// Find an ellipsis pattern variable used in a template expression.
+fn find_syntax_ellipsis_var(template: &Expr, ellipsis_names: &[String]) -> Option<String> {
+    match &template.kind {
+        ExprKind::Symbol(name) if ellipsis_names.contains(name) => Some(name.clone()),
+        ExprKind::List(elements) => {
+            for elem in elements {
+                if let Some(var) = find_syntax_ellipsis_var(elem, ellipsis_names) {
+                    return Some(var);
+                }
+            }
+            None
+        }
+        _ => None,
+    }
+}
+
+/// Extract syntax objects from a Value list into a Vec.
+fn value_list_to_syntax_objects(val: &Value) -> Vec<Value> {
+    let mut result = Vec::new();
+    let mut cur = val.clone();
+    loop {
+        match cur {
+            Value::Pair(p) => {
+                let pair = p.borrow();
+                result.push(pair.0.clone());
+                cur = pair.1.clone();
+            }
+            Value::Nil => break,
+            other => {
+                result.push(other);
+                break;
+            }
+        }
+    }
+    result
+}
+
+/// Evaluate `(with-syntax ((pattern expr) ...) body ...)`.
+fn eval_with_syntax_step(
+    args: &[Expr],
+    span: &Span,
+    env: &Env,
+    output: &mut String,
+    ctx: &mut ContCtx,
+) -> Result<TcoAction, EvalError> {
+    if args.len() < 2 {
+        return Err(EvalErrorKind::Parse {
+            message: "with-syntax requires bindings and body".into(),
+        }
+        .at(span));
+    }
+
+    let bindings_expr = match &args[0].kind {
+        ExprKind::List(b) => b,
+        _ => {
+            return Err(EvalErrorKind::Parse {
+                message: "with-syntax: expected binding list".into(),
+            }
+            .at(span))
+        }
+    };
+
+    let ws_env = Env::with_parent(env);
+
+    // Copy syntax-case metadata from parent
+    if let Ok(v) = env.lookup("##syntax-case-bindings##") {
+        if let Value::Symbol(existing) = &v {
+            let mut names: Vec<String> = if existing.is_empty() {
+                Vec::new()
+            } else {
+                existing.split(',').map(|s| s.to_string()).collect()
+            };
+
+            // Process each binding
+            for binding in bindings_expr {
+                match &binding.kind {
+                    ExprKind::List(parts) if parts.len() == 2 => {
+                        let pat_name = match &parts[0].kind {
+                            ExprKind::Symbol(n) => n.clone(),
+                            _ => {
+                                return Err(EvalErrorKind::Parse {
+                                    message: "with-syntax: pattern must be a symbol".into(),
+                                }
+                                .at(span))
+                            }
+                        };
+                        let val = eval(&parts[1], env, output, ctx)?;
+                        ws_env.define(pat_name.clone(), val);
+                        if !names.contains(&pat_name) {
+                            names.push(pat_name);
+                        }
+                    }
+                    _ => {
+                        return Err(EvalErrorKind::Parse {
+                            message: "with-syntax: invalid binding".into(),
+                        }
+                        .at(span))
+                    }
+                }
+            }
+
+            ws_env.define(
+                "##syntax-case-bindings##".into(),
+                Value::Symbol(names.join(",")),
+            );
+        }
+    } else {
+        let mut names = Vec::new();
+        for binding in bindings_expr {
+            match &binding.kind {
+                ExprKind::List(parts) if parts.len() == 2 => {
+                    let pat_name = match &parts[0].kind {
+                        ExprKind::Symbol(n) => n.clone(),
+                        _ => {
+                            return Err(EvalErrorKind::Parse {
+                                message: "with-syntax: pattern must be a symbol".into(),
+                            }
+                            .at(span))
+                        }
+                    };
+                    let val = eval(&parts[1], env, output, ctx)?;
+                    ws_env.define(pat_name.clone(), val);
+                    names.push(pat_name);
+                }
+                _ => {
+                    return Err(EvalErrorKind::Parse {
+                        message: "with-syntax: invalid binding".into(),
+                    }
+                    .at(span))
+                }
+            }
+        }
+        ws_env.define(
+            "##syntax-case-bindings##".into(),
+            Value::Symbol(names.join(",")),
+        );
+    }
+
+    // Copy ellipsis metadata
+    if let Ok(v) = env.lookup("##syntax-case-ellipsis##") {
+        ws_env.define("##syntax-case-ellipsis##".into(), v);
+    } else {
+        ws_env.define("##syntax-case-ellipsis##".into(), Value::Symbol(String::new()));
+    }
+
+    // Evaluate body expressions
+    let body = &args[1..];
+    if body.is_empty() {
+        return Ok(TcoAction::Result(Value::Nil));
+    }
+    for expr in &body[..body.len() - 1] {
+        eval(expr, &ws_env, output, ctx)?;
+    }
+    Ok(TcoAction::TailCall {
+        expr: body[body.len() - 1].clone(),
+        env: ws_env,
+    })
+}
+
+/// Evaluate `(syntax->datum stx)` — convert syntax object to datum.
+fn eval_syntax_to_datum(args: &[Value], span: &Span) -> Result<Value, EvalError> {
+    if args.len() != 1 {
+        return Err(EvalErrorKind::Arity {
+            name: "syntax->datum".into(),
+            expected: "1".into(),
+            got: args.len(),
+        }
+        .at(span));
+    }
+    match &args[0] {
+        Value::SyntaxObject(data) => expr_to_value(&data.expr),
+        other => Ok(other.clone()),
+    }
+}
+
+/// Evaluate `(datum->syntax template-id datum)` — convert datum to syntax object.
+fn eval_datum_to_syntax(args: &[Value], span: &Span) -> Result<Value, EvalError> {
+    if args.len() != 2 {
+        return Err(EvalErrorKind::Arity {
+            name: "datum->syntax".into(),
+            expected: "2".into(),
+            got: args.len(),
+        }
+        .at(span));
+    }
+    // template-id is args[0] (used for lexical context, mostly ignored here)
+    // datum is args[1]
+    let expr = value_to_expr(&args[1], span);
+    Ok(make_syntax_object(expr))
 }

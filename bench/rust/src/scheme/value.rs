@@ -87,6 +87,15 @@ pub fn make_rational(num: i64, den: i64) -> Value {
     }
 }
 
+/// Data carried by a syntax object.
+#[derive(Debug, Clone)]
+#[allow(clippy::derived_hash_with_manual_eq)]
+pub struct SyntaxObjectData {
+    pub expr: Expr,
+    pub introduced: Vec<(String, String)>,
+    pub template_env: Option<Env>,
+}
+
 /// A Scheme value.
 #[derive(Debug, Clone)]
 pub enum Value {
@@ -118,6 +127,16 @@ pub enum Value {
     Vector(Rc<RefCell<Vec<Value>>>),
     /// Multiple return values from `values`.
     Values(Vec<Value>),
+    /// A syntax object wrapping a parsed expression (used by syntax-case).
+    /// Carries: Expr, introduced hygiene pairs [(gensym, original)], and
+    /// the environment for resolving hygiene bindings.
+    SyntaxObject(Box<SyntaxObjectData>),
+    /// A syntax-case macro transformer (lambda-based).
+    SyntaxCaseMacro {
+        params: Vec<String>,
+        body: Vec<Expr>,
+        def_env: Env,
+    },
     /// A record instance.
     Record {
         type_id: u64,
@@ -172,6 +191,8 @@ impl PartialEq for Value {
             (Value::Vector(a), Value::Vector(b)) => *a.borrow() == *b.borrow(),
             (Value::Values(a), Value::Values(b)) => a == b,
             (Value::Macro { .. }, Value::Macro { .. }) => false,
+            (Value::SyntaxObject(a), Value::SyntaxObject(b)) => a.expr == b.expr,
+            (Value::SyntaxCaseMacro { .. }, Value::SyntaxCaseMacro { .. }) => false,
             (
                 Value::Record {
                     type_id: a_id,
@@ -234,6 +255,8 @@ impl Value {
             | Value::Lambda { .. }
             | Value::Continuation { .. }
             | Value::Macro { .. }
+            | Value::SyntaxObject(_)
+            | Value::SyntaxCaseMacro { .. }
             | Value::Record { .. }
             | Value::RecordConstructor { .. }
             | Value::RecordPredicate { .. }
@@ -285,6 +308,8 @@ impl fmt::Display for Value {
             Value::Builtin(name) => write!(f, "#<procedure:{name}>"),
             Value::Continuation { .. } => write!(f, "#<continuation>"),
             Value::Macro { .. } => write!(f, "#<macro>"),
+            Value::SyntaxObject(_) => write!(f, "#<syntax>"),
+            Value::SyntaxCaseMacro { .. } => write!(f, "#<macro>"),
             Value::Record { type_name, .. } => write!(f, "#<record:{type_name}>"),
             Value::RecordConstructor { type_name, .. } => {
                 write!(f, "#<procedure:make-{type_name}>")

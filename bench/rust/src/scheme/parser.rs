@@ -113,26 +113,39 @@ fn tokenize(input: &str) -> Vec<Token> {
             }
             '#' => {
                 let start_col = col;
-                let mut tok = String::new();
-                tok.push('#');
-                i += 1;
-                col += 1;
-                while i < chars.len()
-                    && !chars[i].is_whitespace()
-                    && chars[i] != '('
-                    && chars[i] != ')'
-                {
-                    tok.push(chars[i]);
+                // Check for #' (syntax template shorthand)
+                if i + 1 < chars.len() && chars[i + 1] == '\'' {
+                    tokens.push(Token {
+                        text: "#'".into(),
+                        span: Span {
+                            line,
+                            col: start_col,
+                        },
+                    });
+                    i += 2;
+                    col += 2;
+                } else {
+                    let mut tok = String::new();
+                    tok.push('#');
                     i += 1;
                     col += 1;
+                    while i < chars.len()
+                        && !chars[i].is_whitespace()
+                        && chars[i] != '('
+                        && chars[i] != ')'
+                    {
+                        tok.push(chars[i]);
+                        i += 1;
+                        col += 1;
+                    }
+                    tokens.push(Token {
+                        text: tok,
+                        span: Span {
+                            line,
+                            col: start_col,
+                        },
+                    });
                 }
-                tokens.push(Token {
-                    text: tok,
-                    span: Span {
-                        line,
-                        col: start_col,
-                    },
-                });
             }
             _ => {
                 let start_col = col;
@@ -209,6 +222,23 @@ fn parse_expr(tokens: &[Token], pos: usize) -> Result<(Expr, usize), EvalError> 
                     kind: ExprKind::List(vec![
                         Expr {
                             kind: ExprKind::Symbol("quote".into()),
+                            span: span.clone(),
+                        },
+                        expr,
+                    ]),
+                    span,
+                },
+                next,
+            ))
+        }
+        "#'" => {
+            let span = token.span.clone();
+            let (expr, next) = parse_expr(tokens, pos + 1)?;
+            Ok((
+                Expr {
+                    kind: ExprKind::List(vec![
+                        Expr {
+                            kind: ExprKind::Symbol("syntax".into()),
                             span: span.clone(),
                         },
                         expr,

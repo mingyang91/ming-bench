@@ -342,7 +342,7 @@ fn find_ellipsis_var(template: &Expr, bindings: &HashMap<String, Binding>) -> Op
 
 /// Returns true if the symbol is a language keyword or builtin that should
 /// not be renamed during hygiene.
-fn is_keyword(name: &str) -> bool {
+pub fn is_keyword(name: &str) -> bool {
     matches!(
         name,
         // special forms
