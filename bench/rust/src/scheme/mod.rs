@@ -17,6 +17,7 @@ pub fn eval_str(input: &str) -> Result<String, EvalError> {
         .into());
     }
     let env = env::Env::new();
+    env.define("apply".into(), value::Value::Builtin("apply".into()));
     let mut output = String::new();
     let mut result = None;
     for expr in &exprs {
@@ -36,6 +37,7 @@ pub fn eval_str_with_output(input: &str) -> Result<(String, String), EvalError> 
         .into());
     }
     let env = env::Env::new();
+    env.define("apply".into(), value::Value::Builtin("apply".into()));
     let mut output = String::new();
     let mut result = None;
     for expr in &exprs {

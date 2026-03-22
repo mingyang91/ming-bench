@@ -15,9 +15,11 @@ pub enum Value {
     Pair(Box<Value>, Box<Value>),
     Lambda {
         params: Vec<String>,
+        rest_param: Option<String>,
         body: Vec<Expr>,
         env: Env,
     },
+    Builtin(String),
 }
 
 impl Value {
@@ -37,6 +39,7 @@ impl PartialEq for Value {
             (Value::Char(a), Value::Char(b)) => a == b,
             (Value::Nil, Value::Nil) => true,
             (Value::Pair(a1, a2), Value::Pair(b1, b2)) => a1 == b1 && a2 == b2,
+            (Value::Builtin(a), Value::Builtin(b)) => a == b,
             _ => false,
         }
     }
@@ -51,6 +54,7 @@ impl Value {
                 buf.push('(');
                 display_list(buf, self);
             }
+            Value::Builtin(_) => buf.push_str(&self.to_string()),
             other => buf.push_str(&other.to_string()),
         }
     }
@@ -76,6 +80,7 @@ impl fmt::Display for Value {
                 write_list(f, self)
             }
             Value::Lambda { .. } => write!(f, "#<procedure>"),
+            Value::Builtin(name) => write!(f, "#<procedure:{name}>"),
         }
     }
 }

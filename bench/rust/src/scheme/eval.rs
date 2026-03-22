@@ -34,8 +34,13 @@ fn eval_step(
         ExprKind::SchemeString(s) => Ok(TcoAction::Result(Value::SchemeString(s.clone()))),
         ExprKind::Char(c) => Ok(TcoAction::Result(Value::Char(*c))),
         ExprKind::Symbol(name) => {
-            let val = env.lookup(name).map_err(|e| e.with_span(&expr.span))?;
-            Ok(TcoAction::Result(val))
+            match env.lookup(name) {
+                Ok(val) => Ok(TcoAction::Result(val)),
+                Err(_) if is_builtin(name) => {
+                    Ok(TcoAction::Result(Value::Builtin(name.clone())))
+                }
+                Err(e) => Err(e.with_span(&expr.span)),
+            }
         }
         ExprKind::List(elements) => eval_list_step(elements, &expr.span, env, output),
     }
@@ -161,20 +166,43 @@ fn apply_step(
     match op {
         Value::Lambda {
             params,
+            rest_param,
             body,
             env: closure_env,
         } => {
-            if args.len() != params.len() {
-                return Err(EvalErrorKind::Arity {
-                    name: "#<procedure>".into(),
-                    expected: params.len().to_string(),
-                    got: args.len(),
+            match rest_param {
+                None => {
+                    if args.len() != params.len() {
+                        return Err(EvalErrorKind::Arity {
+                            name: "#<procedure>".into(),
+                            expected: params.len().to_string(),
+                            got: args.len(),
+                        }
+                        .at(span));
+                    }
                 }
-                .at(span));
+                Some(_) => {
+                    if args.len() < params.len() {
+                        return Err(EvalErrorKind::Arity {
+                            name: "#<procedure>".into(),
+                            expected: format!("at least {}", params.len()),
+                            got: args.len(),
+                        }
+                        .at(span));
+                    }
+                }
             }
             let call_env = Env::with_parent(closure_env);
             for (param, arg) in params.iter().zip(args.iter()) {
                 call_env.define(param.clone(), arg.clone());
+            }
+            if let Some(rest) = rest_param {
+                let rest_args = &args[params.len()..];
+                let mut list = Value::Nil;
+                for arg in rest_args.iter().rev() {
+                    list = Value::Pair(Box::new(arg.clone()), Box::new(list));
+                }
+                call_env.define(rest.clone(), list);
             }
             // Evaluate all body expressions except the last
             if body.is_empty() {
@@ -188,6 +216,15 @@ fn apply_step(
                 expr: body[body.len() - 1].clone(),
                 env: call_env,
             })
+        }
+        Value::Builtin(name) => {
+            match name.as_str() {
+                "apply" => eval_apply(args, span, output),
+                _ => {
+                    let v = eval_builtin(name, args, span, output)?;
+                    Ok(TcoAction::Result(v))
+                }
+            }
         }
         _ => Err(EvalErrorKind::NotAProcedure {
             value: op.to_string(),
@@ -352,19 +389,11 @@ fn eval_define(
                     .at(span))
                 }
             };
-            let params: Vec<String> = sig[1..]
-                .iter()
-                .map(|e| match &e.kind {
-                    ExprKind::Symbol(s) => Ok(s.clone()),
-                    _ => Err(EvalErrorKind::Parse {
-                        message: "define: expected symbol as parameter".into(),
-                    }
-                    .at(span)),
-                })
-                .collect::<Result<Vec<_>, _>>()?;
+            let (params, rest_param) = parse_params(&sig[1..], span)?;
             let body = args[1..].to_vec();
             let lambda = Value::Lambda {
                 params,
+                rest_param,
                 body,
                 env: env.clone(),
             };
@@ -406,6 +435,54 @@ fn expr_to_value(expr: &Expr) -> Result<Value, EvalError> {
     }
 }
 
+fn parse_params(param_exprs: &[Expr], span: &Span) -> Result<(Vec<String>, Option<String>), EvalError> {
+    // Look for dot notation: (a b . rest)
+    let dot_pos = param_exprs.iter().position(|e| matches!(&e.kind, ExprKind::Symbol(s) if s == "."));
+    match dot_pos {
+        Some(pos) => {
+            if pos + 1 != param_exprs.len() - 1 {
+                return Err(EvalErrorKind::Parse {
+                    message: "improper parameter list: expected exactly one symbol after dot".into(),
+                }
+                .at(span));
+            }
+            let params: Vec<String> = param_exprs[..pos]
+                .iter()
+                .map(|e| match &e.kind {
+                    ExprKind::Symbol(s) => Ok(s.clone()),
+                    _ => Err(EvalErrorKind::Parse {
+                        message: "expected symbol as parameter".into(),
+                    }
+                    .at(span)),
+                })
+                .collect::<Result<Vec<_>, _>>()?;
+            let rest = match &param_exprs[pos + 1].kind {
+                ExprKind::Symbol(s) => s.clone(),
+                _ => {
+                    return Err(EvalErrorKind::Parse {
+                        message: "expected symbol after dot in parameter list".into(),
+                    }
+                    .at(span))
+                }
+            };
+            Ok((params, Some(rest)))
+        }
+        None => {
+            let params: Vec<String> = param_exprs
+                .iter()
+                .map(|e| match &e.kind {
+                    ExprKind::Symbol(s) => Ok(s.clone()),
+                    _ => Err(EvalErrorKind::Parse {
+                        message: "expected symbol as parameter".into(),
+                    }
+                    .at(span)),
+                })
+                .collect::<Result<Vec<_>, _>>()?;
+            Ok((params, None))
+        }
+    }
+}
+
 fn eval_lambda(args: &[Expr], span: &Span, env: &Env) -> Result<Value, EvalError> {
     if args.len() < 2 {
         return Err(EvalErrorKind::Parse {
@@ -413,17 +490,12 @@ fn eval_lambda(args: &[Expr], span: &Span, env: &Env) -> Result<Value, EvalError
         }
         .at(span));
     }
-    let params = match &args[0].kind {
-        ExprKind::List(param_exprs) => param_exprs
-            .iter()
-            .map(|e| match &e.kind {
-                ExprKind::Symbol(s) => Ok(s.clone()),
-                _ => Err(EvalErrorKind::Parse {
-                    message: "lambda: expected symbol as parameter".into(),
-                }
-                .at(span)),
-            })
-            .collect::<Result<Vec<_>, _>>()?,
+    let (params, rest_param) = match &args[0].kind {
+        ExprKind::List(param_exprs) => parse_params(param_exprs, span)?,
+        ExprKind::Symbol(s) => {
+            // (lambda args body) — all args collected as rest
+            (Vec::new(), Some(s.clone()))
+        }
         _ => {
             return Err(EvalErrorKind::Parse {
                 message: "lambda: expected parameter list".into(),
@@ -434,6 +506,7 @@ fn eval_lambda(args: &[Expr], span: &Span, env: &Env) -> Result<Value, EvalError
     let body = args[1..].to_vec();
     Ok(Value::Lambda {
         params,
+        rest_param,
         body,
         env: env.clone(),
     })
@@ -684,6 +757,48 @@ fn eval_list_builtin(args: &[Value]) -> Result<Value, EvalError> {
     Ok(result)
 }
 
+fn value_list_to_vec(val: &Value, span: &Span) -> Result<Vec<Value>, EvalError> {
+    let mut result = Vec::new();
+    let mut current = val;
+    loop {
+        match current {
+            Value::Nil => return Ok(result),
+            Value::Pair(car, cdr) => {
+                result.push(*car.clone());
+                current = cdr;
+            }
+            other => {
+                return Err(EvalErrorKind::Type {
+                    expected: "proper list".into(),
+                    got: format!("{other}"),
+                }
+                .at(span))
+            }
+        }
+    }
+}
+
+fn eval_apply(
+    args: &[Value],
+    span: &Span,
+    output: &mut String,
+) -> Result<TcoAction, EvalError> {
+    if args.len() < 2 {
+        return Err(EvalErrorKind::Arity {
+            name: "apply".into(),
+            expected: "at least 2".into(),
+            got: args.len(),
+        }
+        .at(span));
+    }
+    let func = &args[0];
+    let last = &args[args.len() - 1];
+    let tail_args = value_list_to_vec(last, span)?;
+    let mut all_args: Vec<Value> = args[1..args.len() - 1].to_vec();
+    all_args.extend(tail_args);
+    apply_step(func, &all_args, span, output)
+}
+
 fn eval_length(args: &[Value], span: &Span) -> Result<Value, EvalError> {
     if args.len() != 1 {
         return Err(EvalErrorKind::Arity {
@@ -774,6 +889,7 @@ fn eval_let_step(
         let let_env = Env::with_parent(env);
         let lambda = Value::Lambda {
             params: params.clone(),
+            rest_param: None,
             body,
             env: let_env.clone(),
         };
