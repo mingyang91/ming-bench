@@ -23,7 +23,13 @@ public sealed interface SchemeValue {
     record ListVal(List<SchemeValue> elements) implements SchemeValue {}
     record LambdaVal(List<String> params, String restParam, List<SchemeValue> body, Environment env) implements SchemeValue {}
     record BuiltinVal(String name, Function<List<SchemeValue>, SchemeValue> fn) implements SchemeValue {}
-    record PairVal(SchemeValue car, SchemeValue cdr) implements SchemeValue {}
+    final class PairVal implements SchemeValue {
+        SchemeValue car;
+        SchemeValue cdr;
+        PairVal(SchemeValue car, SchemeValue cdr) { this.car = car; this.cdr = cdr; }
+        public SchemeValue car() { return car; }
+        public SchemeValue cdr() { return cdr; }
+    }
     record VoidVal() implements SchemeValue {}
     record CharVal(char value) implements SchemeValue {}
     record MutableStringVal(StringBuilder chars) implements SchemeValue {
@@ -31,6 +37,7 @@ public sealed interface SchemeValue {
     }
     record ContinuationVal(int id) implements SchemeValue {}
     record SyntaxRulesVal(List<String> literals, List<SchemeValue> patterns, List<SchemeValue> templates, Environment defEnv) implements SchemeValue {}
+    record VectorVal(SchemeValue[] elements) implements SchemeValue {}
 
     /** Scheme `display` output: no quotes on strings, chars as bare characters. */
     default String displayStr() {
@@ -61,6 +68,15 @@ public sealed interface SchemeValue {
                 for (int i = 0; i < v.elements().size(); i++) {
                     if (i > 0) sb.append(' ');
                     sb.append(v.elements().get(i).display());
+                }
+                sb.append(')');
+                yield sb.toString();
+            }
+            case VectorVal v -> {
+                var sb = new StringBuilder("#(");
+                for (int i = 0; i < v.elements().length; i++) {
+                    if (i > 0) sb.append(' ');
+                    sb.append(v.elements()[i].display());
                 }
                 sb.append(')');
                 yield sb.toString();
