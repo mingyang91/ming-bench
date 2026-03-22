@@ -44,6 +44,12 @@ func evalList(expr *Expr, env *Env) (*Value, error) {
 			return evalQuote(expr, env)
 		case "lambda":
 			return evalLambda(expr, env)
+		case "let":
+			return evalLet(expr, env)
+		case "begin":
+			return evalBegin(expr, env)
+		case "cond":
+			return evalCond(expr, env)
 		}
 	}
 
@@ -99,6 +105,77 @@ func applyFunc(op *Value, args []*Value, expr *Expr) (*Value, error) {
 			return nil, errAtf(expr, "not: expected 1 argument, got %d", len(args))
 		}
 		return BooleanValue(!args[0].IsTruthy()), nil
+	case "cons":
+		if len(args) != 2 {
+			return nil, errAtf(expr, "cons: expected 2 arguments, got %d", len(args))
+		}
+		return PairValue(args[0], args[1]), nil
+	case "car":
+		if len(args) != 1 {
+			return nil, errAtf(expr, "car: expected 1 argument, got %d", len(args))
+		}
+		if args[0].Type != TypePair {
+			return nil, errAtf(expr, "car: expected pair")
+		}
+		return args[0].Car, nil
+	case "cdr":
+		if len(args) != 1 {
+			return nil, errAtf(expr, "cdr: expected 1 argument, got %d", len(args))
+		}
+		if args[0].Type != TypePair {
+			return nil, errAtf(expr, "cdr: expected pair")
+		}
+		return args[0].Cdr, nil
+	case "null?":
+		if len(args) != 1 {
+			return nil, errAtf(expr, "null?: expected 1 argument, got %d", len(args))
+		}
+		return BooleanValue(args[0].Type == TypeNull), nil
+	case "list":
+		result := Null
+		for i := len(args) - 1; i >= 0; i-- {
+			result = PairValue(args[i], result)
+		}
+		return result, nil
+	case "length":
+		if len(args) != 1 {
+			return nil, errAtf(expr, "length: expected 1 argument, got %d", len(args))
+		}
+		count := int64(0)
+		cur := args[0]
+		for cur.Type == TypePair {
+			count++
+			cur = cur.Cdr
+		}
+		if cur.Type != TypeNull {
+			return nil, errAtf(expr, "length: expected proper list")
+		}
+		return IntegerValue(count), nil
+	case "pair?":
+		if len(args) != 1 {
+			return nil, errAtf(expr, "pair?: expected 1 argument, got %d", len(args))
+		}
+		return BooleanValue(args[0].Type == TypePair), nil
+	case "number?":
+		if len(args) != 1 {
+			return nil, errAtf(expr, "number?: expected 1 argument, got %d", len(args))
+		}
+		return BooleanValue(args[0].Type == TypeInteger), nil
+	case "string?":
+		if len(args) != 1 {
+			return nil, errAtf(expr, "string?: expected 1 argument, got %d", len(args))
+		}
+		return BooleanValue(args[0].Type == TypeString), nil
+	case "boolean?":
+		if len(args) != 1 {
+			return nil, errAtf(expr, "boolean?: expected 1 argument, got %d", len(args))
+		}
+		return BooleanValue(args[0].Type == TypeBoolean), nil
+	case "symbol?":
+		if len(args) != 1 {
+			return nil, errAtf(expr, "symbol?: expected 1 argument, got %d", len(args))
+		}
+		return BooleanValue(args[0].Type == TypeSymbol), nil
 	default:
 		return nil, errAtf(expr, "unknown procedure: %s", name)
 	}
@@ -346,9 +423,94 @@ func applyLambda(fn *Value, args []*Value, expr *Expr) (*Value, error) {
 	return result, nil
 }
 
+func evalLet(expr *Expr, env *Env) (*Value, error) {
+	if len(expr.List) < 3 {
+		return nil, errAt(expr, "let: expected at least 2 arguments")
+	}
+	bindings := expr.List[1]
+	if bindings.Type != ExprList {
+		return nil, errAt(bindings, "let: bindings must be a list")
+	}
+	localEnv := NewEnv(env)
+	for _, b := range bindings.List {
+		if b.Type != ExprList || len(b.List) != 2 {
+			return nil, errAt(b, "let: invalid binding")
+		}
+		if b.List[0].Type != ExprSymbol {
+			return nil, errAt(b.List[0], "let: binding name must be a symbol")
+		}
+		val, err := Eval(b.List[1], env)
+		if err != nil {
+			return nil, err
+		}
+		localEnv.Set(b.List[0].StrVal, val)
+	}
+	var result *Value
+	var err error
+	for _, bodyExpr := range expr.List[2:] {
+		result, err = Eval(bodyExpr, localEnv)
+		if err != nil {
+			return nil, err
+		}
+	}
+	return result, nil
+}
+
+func evalBegin(expr *Expr, env *Env) (*Value, error) {
+	if len(expr.List) < 2 {
+		return Void, nil
+	}
+	var result *Value
+	var err error
+	for _, e := range expr.List[1:] {
+		result, err = Eval(e, env)
+		if err != nil {
+			return nil, err
+		}
+	}
+	return result, nil
+}
+
+func evalCond(expr *Expr, env *Env) (*Value, error) {
+	for _, clause := range expr.List[1:] {
+		if clause.Type != ExprList || len(clause.List) < 2 {
+			return nil, errAt(clause, "cond: invalid clause")
+		}
+		// Check for else clause
+		if clause.List[0].Type == ExprSymbol && clause.List[0].StrVal == "else" {
+			var result *Value
+			var err error
+			for _, e := range clause.List[1:] {
+				result, err = Eval(e, env)
+				if err != nil {
+					return nil, err
+				}
+			}
+			return result, nil
+		}
+		test, err := Eval(clause.List[0], env)
+		if err != nil {
+			return nil, err
+		}
+		if test.IsTruthy() {
+			var result *Value
+			for _, e := range clause.List[1:] {
+				result, err = Eval(e, env)
+				if err != nil {
+					return nil, err
+				}
+			}
+			return result, nil
+		}
+	}
+	return Void, nil
+}
+
 func makeDefaultEnv() *Env {
 	env := NewEnv(nil)
-	builtins := []string{"+", "-", "*", "/", "<", ">", "=", "<=", ">=", "not"}
+	builtins := []string{"+", "-", "*", "/", "<", ">", "=", "<=", ">=", "not",
+		"cons", "car", "cdr", "null?", "list", "length",
+		"pair?", "number?", "string?", "boolean?", "symbol?"}
 	for _, name := range builtins {
 		env.Set(name, &Value{Type: TypeSymbol, StrVal: fmt.Sprintf("__builtin:%s", name)})
 	}
