@@ -428,6 +428,19 @@ func (e *env) set(name string, v value) {
 	e.bindings[name] = v
 }
 
+// setExisting mutates an existing binding, walking up the env chain.
+// Returns false if the variable is not bound anywhere.
+func (e *env) setExisting(name string, v value) bool {
+	if _, ok := e.bindings[name]; ok {
+		e.bindings[name] = v
+		return true
+	}
+	if e.parent != nil {
+		return e.parent.setExisting(name, v)
+	}
+	return false
+}
+
 func evalExpr(e *expr, environ *env) (value, error) {
 	for {
 		if e.kind == "atom" {
@@ -534,6 +547,23 @@ func evalExpr(e *expr, environ *env) (value, error) {
 				}
 				e = e.list[len(e.list)-1]
 				continue
+
+			case "set!":
+				if len(e.list) != 3 {
+					return value{}, fmt.Errorf("%d:%d: set!: bad syntax", head.line, head.col)
+				}
+				target := e.list[1]
+				if target.kind != "atom" || target.atom.typ != typeSymbol {
+					return value{}, fmt.Errorf("%d:%d: set!: expected symbol", target.line, target.col)
+				}
+				val, err := evalExpr(e.list[2], environ)
+				if err != nil {
+					return value{}, err
+				}
+				if !environ.setExisting(target.atom.strVal, val) {
+					return value{}, fmt.Errorf("%d:%d: set!: unbound variable: %s", target.line, target.col, target.atom.strVal)
+				}
+				return voidValue, nil
 
 			case "cond":
 				found := false
