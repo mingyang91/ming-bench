@@ -196,6 +196,7 @@ type Value =
   | { tag: 'number'; value: number }
   | { tag: 'boolean'; value: boolean }
   | { tag: 'string'; value: string }
+  | { tag: 'char'; value: string }
   | { tag: 'symbol'; name: string }
   | { tag: 'nil' }
   | { tag: 'pair'; car: Value; cdr: Value }
@@ -211,11 +212,30 @@ function displayValue(v: Value): string {
     case 'number': return String(v.value);
     case 'boolean': return v.value ? '#t' : '#f';
     case 'string': return `"${v.value}"`;
+    case 'char': return `#\\${v.value}`;
     case 'symbol': return v.name;
     case 'nil': return '()';
     case 'pair': return displayPair(v);
     case 'builtin': return `#<procedure:${v.name}>`;
     case 'lambda': return '#<procedure>';
+  }
+}
+
+function displayValueRaw(v: Value): string {
+  switch (v.tag) {
+    case 'string': return v.value;
+    case 'char': return String(v.value);
+    case 'pair': {
+      let parts: string[] = [];
+      let cur: Value = v;
+      while (cur.tag === 'pair') {
+        parts.push(displayValueRaw(cur.car));
+        cur = cur.cdr;
+      }
+      if (cur.tag === 'nil') return `(${parts.join(' ')})`;
+      return `(${parts.join(' ')} . ${displayValueRaw(cur)})`;
+    }
+    default: return displayValue(v);
   }
 }
 
@@ -241,7 +261,7 @@ function requireNumbers(args: Value[], name: string): number[] {
   });
 }
 
-function makeGlobalEnv(): Env {
+function makeGlobalEnv(output: string[] = []): Env {
   const env = new Env();
 
   const numBuiltins: Record<string, (args: Value[]) => Value> = {
@@ -365,6 +385,67 @@ function makeGlobalEnv(): Env {
   env.define('symbol?', { tag: 'builtin', name: 'symbol?', fn(args) {
     if (args.length !== 1) throw new EvalError('symbol?: expected 1 argument');
     return { tag: 'boolean', value: args[0].tag === 'symbol' };
+  }});
+  env.define('char?', { tag: 'builtin', name: 'char?', fn(args) {
+    if (args.length !== 1) throw new EvalError('char?: expected 1 argument');
+    return { tag: 'boolean', value: args[0].tag === 'char' };
+  }});
+
+  // Output builtins
+  env.define('display', { tag: 'builtin', name: 'display', fn(args) {
+    if (args.length !== 1) throw new EvalError('display: expected 1 argument');
+    output.push(displayValueRaw(args[0]));
+    return { tag: 'nil' };
+  }});
+  env.define('write', { tag: 'builtin', name: 'write', fn(args) {
+    if (args.length !== 1) throw new EvalError('write: expected 1 argument');
+    output.push(displayValue(args[0]));
+    return { tag: 'nil' };
+  }});
+  env.define('newline', { tag: 'builtin', name: 'newline', fn(args) {
+    output.push('\n');
+    return { tag: 'nil' };
+  }});
+
+  // String operations
+  env.define('string-append', { tag: 'builtin', name: 'string-append', fn(args) {
+    const strs = args.map(a => {
+      if (a.tag !== 'string') throw new EvalError('string-append: expected string');
+      return a.value;
+    });
+    return { tag: 'string', value: strs.join('') };
+  }});
+  env.define('string-length', { tag: 'builtin', name: 'string-length', fn(args) {
+    if (args.length !== 1 || args[0].tag !== 'string') throw new EvalError('string-length: expected string');
+    return { tag: 'number', value: args[0].value.length };
+  }});
+  env.define('substring', { tag: 'builtin', name: 'substring', fn(args) {
+    if (args.length !== 3 || args[0].tag !== 'string' || args[1].tag !== 'number' || args[2].tag !== 'number')
+      throw new EvalError('substring: expected string, number, number');
+    return { tag: 'string', value: args[0].value.slice(args[1].value, args[2].value) };
+  }});
+  env.define('string->number', { tag: 'builtin', name: 'string->number', fn(args) {
+    if (args.length !== 1 || args[0].tag !== 'string') throw new EvalError('string->number: expected string');
+    const n = Number(args[0].value);
+    if (isNaN(n)) return { tag: 'boolean', value: false };
+    return { tag: 'number', value: n };
+  }});
+  env.define('number->string', { tag: 'builtin', name: 'number->string', fn(args) {
+    if (args.length !== 1 || args[0].tag !== 'number') throw new EvalError('number->string: expected number');
+    return { tag: 'string', value: String(args[0].value) };
+  }});
+  env.define('symbol->string', { tag: 'builtin', name: 'symbol->string', fn(args) {
+    if (args.length !== 1 || args[0].tag !== 'symbol') throw new EvalError('symbol->string: expected symbol');
+    return { tag: 'string', value: args[0].name };
+  }});
+  env.define('string->symbol', { tag: 'builtin', name: 'string->symbol', fn(args) {
+    if (args.length !== 1 || args[0].tag !== 'string') throw new EvalError('string->symbol: expected string');
+    return { tag: 'symbol', name: args[0].value };
+  }});
+  env.define('string-ref', { tag: 'builtin', name: 'string-ref', fn(args) {
+    if (args.length !== 2 || args[0].tag !== 'string' || args[1].tag !== 'number')
+      throw new EvalError('string-ref: expected string and number');
+    return { tag: 'char', value: args[0].value[args[1].value] };
   }});
 
   return env;
@@ -575,6 +656,13 @@ export function evalStr(input: string): string {
  * and any captured output from display/write/newline.
  */
 export function evalStrWithOutput(input: string): { result: string; output: string } {
-  const result = evalStr(input);
-  return { result, output: '' };
+  const exprs = parse(input);
+  if (exprs.length === 0) throw new EvalError('no expressions');
+  const output: string[] = [];
+  const env = makeGlobalEnv(output);
+  let result: Value | undefined;
+  for (const expr of exprs) {
+    result = evaluate(expr, env);
+  }
+  return { result: displayValue(result!), output: output.join('') };
 }
