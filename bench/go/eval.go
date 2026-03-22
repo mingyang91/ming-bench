@@ -288,6 +288,44 @@ func applyBuiltin(name string, args []*Value, expr *Expr, env *Env) (*Value, err
 			return nil, errAtf(expr, "cdr: expected pair")
 		}
 		return args[0].Cdr, nil
+	case "caar":
+		if len(args) != 1 || args[0].Type != TypePair || args[0].Car.Type != TypePair {
+			return nil, errAtf(expr, "caar: expected pair of pairs")
+		}
+		return args[0].Car.Car, nil
+	case "cadr":
+		if len(args) != 1 || args[0].Type != TypePair || args[0].Cdr.Type != TypePair {
+			return nil, errAtf(expr, "cadr: expected pair")
+		}
+		return args[0].Cdr.Car, nil
+	case "cdar":
+		if len(args) != 1 || args[0].Type != TypePair || args[0].Car.Type != TypePair {
+			return nil, errAtf(expr, "cdar: expected pair of pairs")
+		}
+		return args[0].Car.Cdr, nil
+	case "cddr":
+		if len(args) != 1 || args[0].Type != TypePair || args[0].Cdr.Type != TypePair {
+			return nil, errAtf(expr, "cddr: expected pair")
+		}
+		return args[0].Cdr.Cdr, nil
+	case "set-car!":
+		if len(args) != 2 {
+			return nil, errAtf(expr, "set-car!: expected 2 arguments, got %d", len(args))
+		}
+		if args[0].Type != TypePair {
+			return nil, errAtf(expr, "set-car!: expected pair")
+		}
+		args[0].Car = args[1]
+		return Void, nil
+	case "set-cdr!":
+		if len(args) != 2 {
+			return nil, errAtf(expr, "set-cdr!: expected 2 arguments, got %d", len(args))
+		}
+		if args[0].Type != TypePair {
+			return nil, errAtf(expr, "set-cdr!: expected pair")
+		}
+		args[0].Cdr = args[1]
+		return Void, nil
 	case "null?":
 		if len(args) != 1 {
 			return nil, errAtf(expr, "null?: expected 1 argument, got %d", len(args))
@@ -679,11 +717,21 @@ func applyBuiltin(name string, args []*Value, expr *Expr, env *Env) (*Value, err
 		if len(args) != 1 {
 			return nil, errAtf(expr, "list?: expected 1 argument")
 		}
-		cur := args[0]
-		for cur.Type == TypePair {
-			cur = cur.Cdr
+		// Tortoise-and-hare cycle detection
+		slow := args[0]
+		fast := args[0]
+		for fast.Type == TypePair {
+			fast = fast.Cdr
+			if fast.Type != TypePair {
+				break
+			}
+			fast = fast.Cdr
+			slow = slow.Cdr
+			if slow == fast {
+				return False, nil // cycle detected
+			}
 		}
-		return BooleanValue(cur.Type == TypeNull), nil
+		return BooleanValue(fast.Type == TypeNull), nil
 	case "assoc":
 		if len(args) != 2 {
 			return nil, errAtf(expr, "assoc: expected 2 arguments")
@@ -1809,6 +1857,12 @@ func evalCondTCO(expr *Expr, env *Env) (*Expr, *Env, *Value, error) {
 }
 
 func schemeEqual(a, b *Value) bool {
+	return schemeEqualSeen(a, b, nil)
+}
+
+type pairKey struct{ a, b *Value }
+
+func schemeEqualSeen(a, b *Value, seen map[pairKey]bool) bool {
 	// Handle cross-type numeric comparison
 	if isNumeric(a) && isNumeric(b) {
 		return numEqual(a, b)
@@ -1830,13 +1884,24 @@ func schemeEqual(a, b *Value) bool {
 	case TypeNull:
 		return true
 	case TypePair:
-		return schemeEqual(a.Car, b.Car) && schemeEqual(a.Cdr, b.Cdr)
+		if a == b {
+			return true
+		}
+		k := pairKey{a, b}
+		if seen == nil {
+			seen = make(map[pairKey]bool)
+		}
+		if seen[k] {
+			return true // assume equal for cycles
+		}
+		seen[k] = true
+		return schemeEqualSeen(a.Car, b.Car, seen) && schemeEqualSeen(a.Cdr, b.Cdr, seen)
 	case TypeVector:
 		if len(a.VecElems) != len(b.VecElems) {
 			return false
 		}
 		for i := range a.VecElems {
-			if !schemeEqual(a.VecElems[i], b.VecElems[i]) {
+			if !schemeEqualSeen(a.VecElems[i], b.VecElems[i], seen) {
 				return false
 			}
 		}
@@ -2082,7 +2147,8 @@ func schemeEqv(a, b *Value) bool {
 func makeDefaultEnv() *Env {
 	env := NewEnv(nil)
 	builtins := []string{"+", "-", "*", "/", "<", ">", "=", "<=", ">=", "not",
-		"cons", "car", "cdr", "null?", "list", "length", "reverse",
+		"cons", "car", "cdr", "caar", "cadr", "cdar", "cddr",
+		"set-car!", "set-cdr!", "null?", "list", "length", "reverse",
 		"pair?", "number?", "string?", "boolean?", "symbol?", "char?",
 		"display", "write", "newline",
 		"string-append", "string-length", "substring",

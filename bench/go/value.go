@@ -175,12 +175,18 @@ func (v *Value) String() string {
 		buf.WriteByte('(')
 		buf.WriteString(v.Car.String())
 		cur := v.Cdr
+		seen := map[*Value]bool{v: true}
 		for cur.Type == TypePair {
+			if seen[cur] {
+				buf.WriteString(" ...")
+				break
+			}
+			seen[cur] = true
 			buf.WriteByte(' ')
 			buf.WriteString(cur.Car.String())
 			cur = cur.Cdr
 		}
-		if cur.Type != TypeNull {
+		if cur.Type != TypeNull && !seen[cur] {
 			buf.WriteString(" . ")
 			buf.WriteString(cur.String())
 		}
