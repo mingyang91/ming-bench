@@ -2,7 +2,7 @@ pub mod error;
 
 pub use error::EvalError;
 
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
 use std::rc::Rc;
 
@@ -41,9 +41,17 @@ enum Value {
         env: Env,
     },
     Builtin(String),
+    Continuation { id: u64, top_level_idx: usize },
 }
 
 type Output = Rc<RefCell<std::string::String>>;
+
+thread_local! {
+    static CONT_RETURN_VALUE: RefCell<Option<Value>> = RefCell::new(None);
+    static CALLCC_OVERRIDE: RefCell<Option<Value>> = RefCell::new(None);
+    static NEXT_CONT_ID: Cell<u64> = Cell::new(0);
+    static TOP_LEVEL_IDX: Cell<usize> = Cell::new(0);
+}
 
 impl Value {
     fn display(&self) -> String {
@@ -59,6 +67,7 @@ impl Value {
             }
             Value::Lambda { .. } => "#<procedure>".into(),
             Value::Builtin(name) => format!("#<procedure:{}>", name),
+            Value::Continuation { .. } => "#<continuation>".into(),
         }
     }
 
@@ -471,6 +480,17 @@ fn eval(expr: &Expr, env: &Env, out: &Output) -> Result<Value, EvalError> {
                             cur_expr = args.last().unwrap().clone();
                             continue;
                         }
+                        "call/cc" | "call-with-current-continuation" => {
+                            if items.len() != 2 {
+                                return Err(EvalError::Arity(span.fmt("call/cc requires 1 argument")));
+                            }
+                            let override_val = CALLCC_OVERRIDE.with(|o| o.borrow_mut().take());
+                            if let Some(val) = override_val {
+                                return Ok(val);
+                            }
+                            let arg = eval(&items[1], &cur_env, out)?;
+                            return eval_callcc(arg, span, out);
+                        }
                         "set!" => return eval_set(&items[1..], &cur_env, span, out),
                         "string-set!" => return eval_string_set(&items[1..], &cur_env, span, out),
                         "display" => {
@@ -522,11 +542,28 @@ fn eval(expr: &Expr, env: &Env, out: &Output) -> Result<Value, EvalError> {
                         cur_env = local_env;
                         continue;
                     }
+                    Value::Builtin(ref name) if name == "call/cc" || name == "call-with-current-continuation" => {
+                        if args.len() != 1 {
+                            return Err(EvalError::Arity(span.fmt("call/cc requires 1 argument")));
+                        }
+                        let override_val = CALLCC_OVERRIDE.with(|o| o.borrow_mut().take());
+                        if let Some(val) = override_val {
+                            return Ok(val);
+                        }
+                        return eval_callcc(args.into_iter().next().unwrap(), span, out);
+                    }
                     Value::Builtin(ref name) if name == "apply" => {
                         return eval_apply(&args, span, out);
                     }
                     Value::Builtin(ref name) => {
                         return eval_builtin(name, &args, span);
+                    }
+                    Value::Continuation { id, top_level_idx } => {
+                        if args.len() != 1 {
+                            return Err(EvalError::Arity(span.fmt("continuation requires 1 argument")));
+                        }
+                        CONT_RETURN_VALUE.with(|v| *v.borrow_mut() = Some(args[0].clone()));
+                        return Err(EvalError::ContinuationInvoked(id, top_level_idx));
                     }
                     _ => return Err(EvalError::Type(span.fmt("not a procedure"))),
                 }
@@ -684,6 +721,37 @@ fn eval_apply(args: &[Value], span: Span, out: &Output) -> Result<Value, EvalErr
     }
 }
 
+
+fn eval_callcc(proc: Value, span: Span, out: &Output) -> Result<Value, EvalError> {
+    let id = NEXT_CONT_ID.with(|c| { let v = c.get(); c.set(v + 1); v });
+    let top_idx = TOP_LEVEL_IDX.with(|c| c.get());
+    let cont = Value::Continuation { id, top_level_idx: top_idx };
+
+    let result = match proc {
+        Value::Lambda { ref params, ref rest_param, ref body, ref env } => {
+            let local_env = apply_lambda(params, rest_param, body, env, &[cont], span)?;
+            let mut result = Value::Boolean(false);
+            for expr in body {
+                result = eval(expr, &local_env, out)?;
+            }
+            Ok(result)
+        }
+        Value::Builtin(ref name) => {
+            // (call/cc some-builtin) — call the builtin with the continuation
+            eval_builtin(name, &[cont], span)
+        }
+        _ => Err(EvalError::Type(span.fmt("call/cc: expected procedure")))
+    };
+
+    match result {
+        Ok(val) => Ok(val),
+        Err(EvalError::ContinuationInvoked(inv_id, _)) if inv_id == id => {
+            let val = CONT_RETURN_VALUE.with(|v| v.borrow_mut().take()).unwrap();
+            Ok(val)
+        }
+        Err(e) => Err(e),
+    }
+}
 
 fn eval_set(args: &[Expr], env: &Env, span: Span, out: &Output) -> Result<Value, EvalError> {
     if args.len() != 2 {
@@ -969,6 +1037,8 @@ fn cmp_vals(args: &[Value], f: fn(i64, i64) -> bool, span: Span) -> Result<Value
 fn make_default_env() -> Env {
     let env = new_env(None);
     env_set(&env, "apply".into(), Value::Builtin("apply".into()));
+    env_set(&env, "call/cc".into(), Value::Builtin("call/cc".into()));
+    env_set(&env, "call-with-current-continuation".into(), Value::Builtin("call/cc".into()));
     // Register all builtins as first-class values
     for name in &[
         "+", "-", "*", "/", "<", ">", "=", "<=", ">=", "not",
@@ -988,11 +1058,31 @@ pub fn eval_str(input: &str) -> Result<String, EvalError> {
     let exprs = parse(input)?;
     let env = make_default_env();
     let out: Output = Rc::new(RefCell::new(std::string::String::new()));
-    let mut result = Value::Boolean(false);
-    for expr in &exprs {
-        result = eval(expr, &env, &out)?;
+    NEXT_CONT_ID.with(|c| c.set(0));
+
+    let mut start_idx = 0;
+    loop {
+        let mut result = Value::Boolean(false);
+        let mut cont_err = None;
+        for (i, expr) in exprs.iter().enumerate().skip(start_idx) {
+            TOP_LEVEL_IDX.with(|c| c.set(i));
+            match eval(expr, &env, &out) {
+                Ok(val) => result = val,
+                Err(EvalError::ContinuationInvoked(id, top_idx)) => {
+                    cont_err = Some((id, top_idx));
+                    break;
+                }
+                Err(e) => return Err(e),
+            }
+        }
+        if let Some((_id, top_idx)) = cont_err {
+            let value = CONT_RETURN_VALUE.with(|v| v.borrow_mut().take()).unwrap();
+            CALLCC_OVERRIDE.with(|o| *o.borrow_mut() = Some(value));
+            start_idx = top_idx;
+            continue;
+        }
+        return Ok(result.display());
     }
-    Ok(result.display())
 }
 
 /// Evaluate Scheme expressions, returning both the result value and
@@ -1001,12 +1091,32 @@ pub fn eval_str_with_output(input: &str) -> Result<(String, String), EvalError> 
     let exprs = parse(input)?;
     let env = make_default_env();
     let out: Output = Rc::new(RefCell::new(std::string::String::new()));
-    let mut result = Value::Boolean(false);
-    for expr in &exprs {
-        result = eval(expr, &env, &out)?;
+    NEXT_CONT_ID.with(|c| c.set(0));
+
+    let mut start_idx = 0;
+    loop {
+        let mut result = Value::Boolean(false);
+        let mut cont_err = None;
+        for (i, expr) in exprs.iter().enumerate().skip(start_idx) {
+            TOP_LEVEL_IDX.with(|c| c.set(i));
+            match eval(expr, &env, &out) {
+                Ok(val) => result = val,
+                Err(EvalError::ContinuationInvoked(id, top_idx)) => {
+                    cont_err = Some((id, top_idx));
+                    break;
+                }
+                Err(e) => return Err(e),
+            }
+        }
+        if let Some((_id, top_idx)) = cont_err {
+            let value = CONT_RETURN_VALUE.with(|v| v.borrow_mut().take()).unwrap();
+            CALLCC_OVERRIDE.with(|o| *o.borrow_mut() = Some(value));
+            start_idx = top_idx;
+            continue;
+        }
+        let output = out.borrow().clone();
+        return Ok((result.display(), output));
     }
-    let output = out.borrow().clone();
-    Ok((result.display(), output))
 }
 
 #[cfg(test)]

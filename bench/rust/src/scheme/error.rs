@@ -9,4 +9,6 @@ pub enum EvalError {
     Type(String),
     #[error("arity error: {0}")]
     Arity(String),
+    #[error("continuation invoked")]
+    ContinuationInvoked(u64, usize),
 }
