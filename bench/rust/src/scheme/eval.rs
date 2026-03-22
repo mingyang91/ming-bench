@@ -14,6 +14,7 @@ const BUILTINS: &[&str] = &[
     "string->number", "number->string",
     "symbol->string", "string->symbol",
     "string-ref", "char?",
+    "string-copy",
 ];
 
 fn is_builtin(name: &str) -> bool {
@@ -55,6 +56,7 @@ fn eval_list(items: &[Value], env: &Rc<RefCell<Env>>, out: &mut String) -> Resul
             "let" => return eval_let(&items[1..], env, out),
             "begin" => return eval_begin(&items[1..], env, out),
             "cond" => return eval_cond(&items[1..], env, out),
+            "string-set!" => return eval_string_set(&items[1..], env, out),
             _ => {}
         }
     }
@@ -391,8 +393,18 @@ fn apply_builtin(name: &str, args: &[Value], out: &mut String) -> Result<Value, 
             }
             Ok(Value::Boolean(matches!(&args[0], Value::Char(_))))
         }
-        _ => Err(EvalError::unbound(name)),
-    }
+        "string-copy" => {
+            if args.len() != 1 {
+                return Err(EvalError::arity("string-copy requires exactly 1 argument"));
+            }
+            match &args[0] {
+                Value::Str(s) => Ok(Value::Str(s.clone())),
+                _ => Err(EvalError::type_err(format!(
+                    "string-copy: expected string, got {}", args[0]
+                ))),
+            }
+        }
+        _ => Err(EvalError::unbound(name)),    }
 }
 
 fn eval_and(exprs: &[Value], env: &Rc<RefCell<Env>>, out: &mut String) -> Result<Value, EvalError> {
@@ -571,6 +583,39 @@ fn eval_let(args: &[Value], env: &Rc<RefCell<Env>>, out: &mut String) -> Result<
         result = eval(expr, &local, out)?;
     }
     Ok(result)
+}
+
+fn eval_string_set(args: &[Value], env: &Rc<RefCell<Env>>, out: &mut String) -> Result<Value, EvalError> {
+    if args.len() != 3 {
+        return Err(EvalError::arity("string-set! requires exactly 3 arguments"));
+    }
+    let Value::Symbol(var_name) = &args[0] else {
+        return Err(EvalError::type_err("string-set!: first argument must be a variable"));
+    };
+    let idx_val = eval(&args[1], env, out)?;
+    let idx = require_int(&idx_val, "string-set!")? as usize;
+    let char_val = eval(&args[2], env, out)?;
+    let Value::Char(ch) = char_val else {
+        return Err(EvalError::type_err(format!(
+            "string-set!: expected char, got {char_val}"
+        )));
+    };
+    let current = env.borrow().get(var_name)?;
+    let Value::Str(s) = current else {
+        return Err(EvalError::type_err(format!(
+            "string-set!: expected string, got {current}"
+        )));
+    };
+    let mut chars: Vec<char> = s.chars().collect();
+    if idx >= chars.len() {
+        return Err(EvalError::type_err(format!(
+            "string-set!: index {idx} out of range for string of length {}", chars.len()
+        )));
+    }
+    chars[idx] = ch;
+    let new_str: String = chars.into_iter().collect();
+    env.borrow_mut().set(var_name.clone(), Value::Str(new_str));
+    Ok(Value::Void)
 }
 
 fn eval_begin(args: &[Value], env: &Rc<RefCell<Env>>, out: &mut String) -> Result<Value, EvalError> {

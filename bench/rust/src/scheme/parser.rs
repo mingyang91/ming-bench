@@ -159,6 +159,16 @@ fn parse_atom(s: &str) -> Value {
     if s == "#f" {
         return Value::Boolean(false);
     }
+    if let Some(rest) = s.strip_prefix("#\\") {
+        let ch = match rest {
+            "space" => ' ',
+            "newline" => '\n',
+            "tab" => '\t',
+            _ if rest.len() == 1 => rest.chars().next().expect("single char after #\\"),
+            _ => return Value::Symbol(s.to_string()),
+        };
+        return Value::Char(ch);
+    }
     if let Ok(n) = s.parse::<i64>() {
         return Value::Integer(n);
     }
