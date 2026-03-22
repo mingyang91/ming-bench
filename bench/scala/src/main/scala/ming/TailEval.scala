@@ -28,7 +28,8 @@ private[ming] object TailEval:
             Value(Void, o)
           case _ => throw new EvalError(s"set!: invalid binding for $name")
       case ListVal(SymbolVal("lambda", _) :: ListVal(params, _) :: body, _) =>
-        Value(LambdaVal(extractParams(params), body, env), "")
+        val (ps, rp) = extractParamsWithRest(params)
+        Value(LambdaVal(ps, body, env, restParam = rp), "")
 
       // Tail-position forms
       case ListVal(SymbolVal("if", _) :: rest, pos) =>
@@ -154,11 +155,19 @@ private[ming] object TailEval:
     val (evaledArgs, o2) = Interpreter.evalArgs(args, env)
     try
       func match
-        case lam @ LambdaVal(params, _, _, _) =>
-          if params.length != evaledArgs.length then
-            throw new EvalError(
-              s"wrong number of arguments: expected ${params.length}, got ${evaledArgs.length}"
-            )
+        case lam @ LambdaVal(params, _, _, _, restParam) =>
+          val minArgs = params.length
+          restParam match
+            case None =>
+              if evaledArgs.length != minArgs then
+                throw new EvalError(
+                  s"wrong number of arguments: expected $minArgs, got ${evaledArgs.length}"
+                )
+            case Some(_) =>
+              if evaledArgs.length < minArgs then
+                throw new EvalError(
+                  s"wrong number of arguments: expected at least $minArgs, got ${evaledArgs.length}"
+                )
           TailCall(lam, evaledArgs, env, o1 + o2)
         case SymbolVal(name, _) =>
           val (rv, o3) = Builtins.applyBuiltin(name, evaledArgs)

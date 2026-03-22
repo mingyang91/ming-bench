@@ -15,7 +15,7 @@ object Interpreter:
   /** Evaluate an expression, returning (result, updated-env, output). */
   def eval(expr: SchemeValue, env: Env): (SchemeValue, Env, Output) =
     expr match
-      case IntVal(_) | BoolVal(_) | StringVal(_) | MutableStringVal(_) | CharVal(_) | Void =>
+      case IntVal(_) | BoolVal(_) | StringVal(_) | MutableStringVal(_) | CharVal(_) | Void | _: Cell =>
         (expr, env, "")
       case SymbolVal(name, pos) =>
         val raw = env.getOrElse(
@@ -41,7 +41,8 @@ object Interpreter:
 
       // lambda
       case ListVal(SymbolVal("lambda", _) :: ListVal(params, _) :: body, _) =>
-        (LambdaVal(extractParams(params), body, env), env, "")
+        val (ps, rp) = extractParamsWithRest(params)
+        (LambdaVal(ps, body, env, restParam = rp), env, "")
 
       // and / or
       case ListVal(SymbolVal("and", _) :: args, _) =>
@@ -115,12 +116,13 @@ object Interpreter:
       case SymbolVal(name, _) :: value :: Nil =>
         val (v, _, o) = eval(value, env)
         val bound = v match
-          case LambdaVal(params, body, closure, _) =>
-            LambdaVal(params, body, closure, Some(name))
+          case LambdaVal(params, body, closure, _, restParam) =>
+            LambdaVal(params, body, closure, Some(name), restParam)
           case other => other
         (Void, env + (name -> makeCell(bound)), o)
       case ListVal(SymbolVal(name, _) :: params, _) :: body =>
-        val lambda = LambdaVal(extractParams(params), body, env, Some(name))
+        val (ps, rp) = extractParamsWithRest(params)
+        val lambda   = LambdaVal(ps, body, env, Some(name), rp)
         (Void, env + (name -> makeCell(lambda)), "")
       case _ => throw new EvalError(s"define: bad syntax${fmtPos(pos)}")
 
@@ -185,19 +187,46 @@ object Interpreter:
     callingEnv: Env
   ): TcoResult =
     func match
-      case lam @ LambdaVal(params, body, closure, selfName) =>
-        if params.length != args.length then
-          throw new EvalError(
-            s"wrong number of arguments: expected ${params.length}, got ${args.length}"
-          )
-        val merged      = callingEnv ++ closure
-        val envWithSelf = selfName.fold(merged)(n => merged + (n -> makeCell(lam)))
-        val localEnv    = envWithSelf ++ params.zip(args).map((p, a) => p -> makeCell(a)).toMap
-        TailEval.evalBodyTail(body, localEnv)
+      case lam @ LambdaVal(params, body, closure, selfName, restParam) =>
+        val minArgs = params.length
+        restParam match
+          case None =>
+            if args.length != minArgs then
+              throw new EvalError(
+                s"wrong number of arguments: expected $minArgs, got ${args.length}"
+              )
+          case Some(_) =>
+            if args.length < minArgs then
+              throw new EvalError(
+                s"wrong number of arguments: expected at least $minArgs, got ${args.length}"
+              )
+        val merged            = callingEnv ++ closure
+        val envWithSelf       = selfName.fold(merged)(n => merged + (n -> makeCell(lam)))
+        val (required, extra) = args.splitAt(params.length)
+        val localEnv          = envWithSelf ++ params.zip(required).map((p, a) => p -> makeCell(a)).toMap
+        val finalEnv = restParam.fold(localEnv) { rp =>
+          localEnv + (rp -> makeCell(Builtins.listToPairs(extra)))
+        }
+        TailEval.evalBodyTail(body, finalEnv)
       case SymbolVal(name, _) =>
-        val (rv, o) = Builtins.applyBuiltin(name, args)
-        Value(rv, o)
+        name match
+          case "apply" => handleApply(args, callingEnv)
+          case _ =>
+            val (rv, o) = Builtins.applyBuiltin(name, args)
+            Value(rv, o)
       case _ => throw new EvalError("not a procedure")
+
+  private def handleApply(
+    args: List[SchemeValue],
+    callingEnv: Env
+  ): TcoResult =
+    args match
+      case func :: rest if rest.nonEmpty =>
+        val prefixArgs = rest.init
+        val lastArg    = rest.last
+        val listArgs   = schemeListToList(lastArg)
+        applyStep(func, prefixArgs ++ listArgs, callingEnv)
+      case _ => throw new EvalError("apply: need at least 2 arguments")
 
   /** Resolve a TcoResult in a non-tail context, using callerEnv. */
   private def resolveToValue(
@@ -226,9 +255,9 @@ object Interpreter:
       e(name) match
         case Cell(arr) =>
           arr(0) match
-            case LambdaVal(params, body, closure, selfName) =>
+            case LambdaVal(params, body, closure, selfName, restParam) =>
               val updatedClosure = closure ++ names.map(n => n -> e(n)).toMap
-              arr(0) = LambdaVal(params, body, updatedClosure, selfName)
+              arr(0) = LambdaVal(params, body, updatedClosure, selfName, restParam)
               e
             case _ => e
         case _ => e

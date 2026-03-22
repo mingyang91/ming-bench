@@ -14,7 +14,8 @@ enum SchemeValue:
     params: List[String],
     body: List[SchemeValue],
     closure: Map[String, SchemeValue],
-    selfName: Option[String] = None
+    selfName: Option[String] = None,
+    restParam: Option[String] = None
   )
   case Cell(content: Array[SchemeValue])
   case Void

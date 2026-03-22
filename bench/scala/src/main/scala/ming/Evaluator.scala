@@ -63,7 +63,8 @@ object Evaluator:
     "string-ref",
     "string-copy",
     "string-set!",
-    "char?"
+    "char?",
+    "apply"
   )
 
   private val builtinEnv: Map[String, SchemeValue] =
