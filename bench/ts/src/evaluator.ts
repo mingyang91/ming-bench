@@ -498,6 +498,8 @@ function exprToValue(expr: Expr): Value {
 // ── Eval ─────────────────────────────────────────────────────────────
 
 function evaluate(expr: Expr, env: Env): Value {
+  // Trampoline loop for TCO — tail positions reassign expr/env and continue
+  trampoline: while (true) {
   switch (expr.tag) {
     case 'number': return { tag: 'number', value: expr.value };
     case 'boolean': return { tag: 'boolean', value: expr.value };
@@ -516,10 +518,10 @@ function evaluate(expr: Expr, env: Env): Value {
             if (items.length < 3) throw new EvalError(`${fmtPos(expr.pos)}: if: too few arguments`);
             const cond = evaluate(items[1], env);
             if (isTruthy(cond)) {
-              return evaluate(items[2], env);
+              expr = items[2]; continue; // TCO
             }
             if (items.length > 3) {
-              return evaluate(items[3], env);
+              expr = items[3]; continue; // TCO
             }
             return { tag: 'nil' };
           }
@@ -528,13 +530,11 @@ function evaluate(expr: Expr, env: Env): Value {
             if (items.length < 2) throw new EvalError(`${fmtPos(expr.pos)}: define: bad syntax`);
             const target = items[1];
             if (target.tag === 'symbol') {
-              // (define x expr)
               const val = evaluate(items[2], env);
               env.define(target.name, val);
               return { tag: 'nil' };
             }
             if (target.tag === 'list') {
-              // (define (f params...) body...)
               const nameExpr = target.items[0];
               if (nameExpr.tag !== 'symbol') throw new EvalError(`${fmtPos(expr.pos)}: define: expected symbol`);
               const params = target.items.slice(1).map(p => {
@@ -565,25 +565,53 @@ function evaluate(expr: Expr, env: Env): Value {
 
           case 'and': {
             if (items.length === 1) return { tag: 'boolean', value: true };
-            let result: Value = { tag: 'boolean', value: true };
-            for (let i = 1; i < items.length; i++) {
-              result = evaluate(items[i], env);
-              if (!isTruthy(result)) return result;
+            for (let i = 1; i < items.length - 1; i++) {
+              const v = evaluate(items[i], env);
+              if (!isTruthy(v)) return v;
             }
-            return result;
+            expr = items[items.length - 1]; continue; // TCO last
           }
 
           case 'or': {
             if (items.length === 1) return { tag: 'boolean', value: false };
-            let result: Value = { tag: 'boolean', value: false };
-            for (let i = 1; i < items.length; i++) {
-              result = evaluate(items[i], env);
-              if (isTruthy(result)) return result;
+            for (let i = 1; i < items.length - 1; i++) {
+              const v = evaluate(items[i], env);
+              if (isTruthy(v)) return v;
             }
-            return result;
+            expr = items[items.length - 1]; continue; // TCO last
           }
 
           case 'let': {
+            // Named let: (let name ((var init) ...) body...)
+            if (items[1].tag === 'symbol') {
+              const loopName = items[1].name;
+              const bindingsExpr = items[2];
+              if (bindingsExpr.tag !== 'list') throw new EvalError('let: expected bindings list');
+              const params: string[] = [];
+              const inits: Value[] = [];
+              for (const b of bindingsExpr.items) {
+                if (b.tag !== 'list' || b.items.length !== 2) throw new EvalError('let: bad binding');
+                if (b.items[0].tag !== 'symbol') throw new EvalError('let: expected symbol');
+                params.push(b.items[0].name);
+                inits.push(evaluate(b.items[1], env));
+              }
+              const body = items.slice(3);
+              const loopLambda: Value = { tag: 'lambda', params, body, env };
+              // The lambda's env needs to include itself for recursion
+              const loopEnv = new Env(env);
+              loopEnv.define(loopName, loopLambda);
+              (loopLambda as any).env = loopEnv;
+              // Now call it with initial values
+              const callEnv = new Env(loopEnv);
+              for (let i = 0; i < params.length; i++) {
+                callEnv.define(params[i], inits[i]);
+              }
+              for (let i = 0; i < body.length - 1; i++) {
+                evaluate(body[i], callEnv);
+              }
+              expr = body[body.length - 1]; env = callEnv; continue; // TCO
+            }
+            // Regular let
             const bindingsExpr = items[1];
             if (bindingsExpr.tag !== 'list') throw new EvalError('let: expected bindings list');
             const letEnv = new Env(env);
@@ -593,19 +621,18 @@ function evaluate(expr: Expr, env: Env): Value {
               const val = evaluate(b.items[1], env);
               letEnv.define(b.items[0].name, val);
             }
-            let result: Value = { tag: 'nil' };
-            for (let i = 2; i < items.length; i++) {
-              result = evaluate(items[i], letEnv);
+            for (let i = 2; i < items.length - 1; i++) {
+              evaluate(items[i], letEnv);
             }
-            return result;
+            expr = items[items.length - 1]; env = letEnv; continue; // TCO
           }
 
           case 'begin': {
-            let result: Value = { tag: 'nil' };
-            for (let i = 1; i < items.length; i++) {
-              result = evaluate(items[i], env);
+            if (items.length === 1) return { tag: 'nil' };
+            for (let i = 1; i < items.length - 1; i++) {
+              evaluate(items[i], env);
             }
-            return result;
+            expr = items[items.length - 1]; continue; // TCO
           }
 
           case 'cond': {
@@ -613,20 +640,18 @@ function evaluate(expr: Expr, env: Env): Value {
               const clause = items[i];
               if (clause.tag !== 'list' || clause.items.length < 1) throw new EvalError('cond: bad clause');
               if (clause.items[0].tag === 'symbol' && clause.items[0].name === 'else') {
-                let result: Value = { tag: 'nil' };
-                for (let j = 1; j < clause.items.length; j++) {
-                  result = evaluate(clause.items[j], env);
+                for (let j = 1; j < clause.items.length - 1; j++) {
+                  evaluate(clause.items[j], env);
                 }
-                return result;
+                expr = clause.items[clause.items.length - 1]; continue trampoline; // TCO
               }
               const test = evaluate(clause.items[0], env);
               if (isTruthy(test)) {
                 if (clause.items.length === 1) return test;
-                let result: Value = { tag: 'nil' };
-                for (let j = 1; j < clause.items.length; j++) {
-                  result = evaluate(clause.items[j], env);
+                for (let j = 1; j < clause.items.length - 1; j++) {
+                  evaluate(clause.items[j], env);
                 }
-                return result;
+                expr = clause.items[clause.items.length - 1]; continue trampoline; // TCO
               }
             }
             return { tag: 'nil' };
@@ -652,15 +677,15 @@ function evaluate(expr: Expr, env: Env): Value {
         for (let i = 0; i < fn.params.length; i++) {
           callEnv.define(fn.params[i], args[i]);
         }
-        let result: Value = { tag: 'nil' };
-        for (const bodyExpr of fn.body) {
-          result = evaluate(bodyExpr, callEnv);
+        for (let i = 0; i < fn.body.length - 1; i++) {
+          evaluate(fn.body[i], callEnv);
         }
-        return result;
+        expr = fn.body[fn.body.length - 1]; env = callEnv; continue; // TCO
       }
       throw new EvalError(`${fmtPos(expr.pos)}: not a procedure`);
     }
   }
+  } // end while
 }
 
 /**
