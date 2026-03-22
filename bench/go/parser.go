@@ -104,6 +104,20 @@ func (p *Parser) parseExpr() (*Expr, error) {
 			},
 			Line: tok.Line, Col: tok.Col,
 		}, nil
+	case TokenSyntaxQuote:
+		p.advance()
+		inner, err := p.parseExpr()
+		if err != nil {
+			return nil, err
+		}
+		return &Expr{
+			Type: ExprList,
+			List: []*Expr{
+				{Type: ExprSymbol, StrVal: "syntax", Line: tok.Line, Col: tok.Col},
+				inner,
+			},
+			Line: tok.Line, Col: tok.Col,
+		}, nil
 	case TokenLParen:
 		return p.parseList()
 	case TokenEOF:

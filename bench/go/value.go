@@ -25,6 +25,7 @@ const (
 	TypeRational
 	TypeFloat
 	TypeRecord
+	TypeSyntax
 )
 
 // Value represents a Scheme value.
@@ -44,7 +45,8 @@ type Value struct {
 	// Continuation fields
 	ContFunc func(*Value) // invoked when continuation is called; always panics
 	// Macro fields
-	Macro *SyntaxRules
+	Macro     *SyntaxRules
+	MacroProc *Value // syntax-case transformer (a lambda)
 	// Vector fields
 	VecElems []*Value
 	// Multiple values fields
@@ -58,6 +60,11 @@ type Value struct {
 	RecordTypeID   int64    // unique ID for this record type
 	RecordTypeName string   // name of the record type (e.g., "<point>")
 	RecordFields   []*Value // field values in constructor order
+	// Syntax object fields
+	SyntaxExpr  *Expr   // for TypeSyntax: wrapped expression
+	SyntaxExprs []*Expr // for TypeSyntax: list of expressions (ellipsis binding)
+	// Environment reference (for internal use)
+	EnvRef *Env
 	// Native Go function (when set on TypeLambda, called instead of Body)
 	GoFunc func([]*Value) (*Value, error)
 }
@@ -194,6 +201,8 @@ func (v *Value) String() string {
 		return buf.String()
 	case TypeRecord:
 		return fmt.Sprintf("#<%s>", v.RecordTypeName)
+	case TypeSyntax:
+		return "#<syntax>"
 	default:
 		return "<unknown>"
 	}

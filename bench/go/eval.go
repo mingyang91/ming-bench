@@ -187,10 +187,26 @@ func evalListTCO(expr *Expr, env *Env) (*Expr, *Env, *Value, error, bool) {
 		case "define-record-type":
 			v, err := evalDefineRecordType(expr, env)
 			return nil, nil, v, err, false
+		case "syntax-case":
+			v, err := evalSyntaxCase(expr, env)
+			return nil, nil, v, err, false
+		case "syntax":
+			v, err := evalSyntaxTemplate(expr, env)
+			return nil, nil, v, err, false
+		case "with-syntax":
+			v, err := evalWithSyntax(expr, env)
+			return nil, nil, v, err, false
 		}
 
 		// Check for macro application
 		if val, ok := env.Get(head.StrVal); ok && val.Type == TypeMacro {
+			if val.MacroProc != nil {
+				expanded, err := applySyntaxCaseTransformer(val.MacroProc, expr, env)
+				if err != nil {
+					return nil, nil, nil, err, false
+				}
+				return expanded, env, nil, nil, true
+			}
 			expanded, err := val.Macro.expandMacro(expr, env)
 			if err != nil {
 				return nil, nil, nil, err, false
@@ -952,6 +968,19 @@ func applyBuiltin(name string, args []*Value, expr *Expr, env *Env) (*Value, err
 			return nil, errAtf(expr, "list->vector: expected proper list")
 		}
 		return &Value{Type: TypeVector, VecElems: elems}, nil
+	case "syntax->datum":
+		if len(args) != 1 {
+			return nil, errAtf(expr, "syntax->datum: expected 1 argument, got %d", len(args))
+		}
+		if args[0].Type != TypeSyntax {
+			return nil, errAtf(expr, "syntax->datum: expected syntax object")
+		}
+		return exprToValue(args[0].SyntaxExpr)
+	case "datum->syntax":
+		if len(args) != 2 {
+			return nil, errAtf(expr, "datum->syntax: expected 2 arguments, got %d", len(args))
+		}
+		return &Value{Type: TypeSyntax, SyntaxExpr: valueToExpr(args[1])}, nil
 	default:
 		return nil, errAtf(expr, "unknown procedure: %s", name)
 	}
@@ -1423,15 +1452,24 @@ func evalDefineSyntax(expr *Expr, env *Env) (*Value, error) {
 		return nil, errAt(name, "define-syntax: name must be a symbol")
 	}
 	transformer := expr.List[2]
-	if transformer.Type != ExprList || len(transformer.List) == 0 ||
-		transformer.List[0].Type != ExprSymbol || transformer.List[0].StrVal != "syntax-rules" {
-		return nil, errAt(transformer, "define-syntax: expected syntax-rules")
+	if transformer.Type == ExprList && len(transformer.List) > 0 &&
+		transformer.List[0].Type == ExprSymbol && transformer.List[0].StrVal == "syntax-rules" {
+		sr, err := parseSyntaxRules(transformer, env)
+		if err != nil {
+			return nil, err
+		}
+		env.Set(name.StrVal, &Value{Type: TypeMacro, Macro: sr})
+		return Void, nil
 	}
-	sr, err := parseSyntaxRules(transformer, env)
+	// Evaluate transformer (should be a lambda)
+	val, err := Eval(transformer, env)
 	if err != nil {
 		return nil, err
 	}
-	env.Set(name.StrVal, &Value{Type: TypeMacro, Macro: sr})
+	if val.Type != TypeLambda {
+		return nil, errAt(transformer, "define-syntax: transformer must be syntax-rules or a procedure")
+	}
+	env.Set(name.StrVal, &Value{Type: TypeMacro, MacroProc: val})
 	return Void, nil
 }
 
@@ -2178,7 +2216,8 @@ func makeDefaultEnv() *Env {
 		"values", "call-with-values",
 		"integer?", "rational?", "exact?", "inexact?",
 		"exact->inexact", "inexact->exact",
-		"numerator", "denominator"}
+		"numerator", "denominator",
+		"syntax->datum", "datum->syntax"}
 	for _, name := range builtins {
 		env.Set(name, &Value{Type: TypeSymbol, StrVal: fmt.Sprintf("__builtin:%s", name)})
 	}

@@ -16,6 +16,7 @@ const (
 	TokenString
 	TokenSymbol
 	TokenQuote
+	TokenSyntaxQuote
 	TokenChar
 	TokenEOF
 )
@@ -110,6 +111,9 @@ func (t *Tokenizer) NextToken() (Token, error) {
 		} else if next == 'f' {
 			t.advance()
 			return Token{Type: TokenBoolean, Val: "#f", Line: line, Col: col}, nil
+		} else if next == '\'' {
+			t.advance()
+			return Token{Type: TokenSyntaxQuote, Val: "#'", Line: line, Col: col}, nil
 		} else if next == '\\' {
 			t.advance() // consume backslash
 			if t.pos >= len(t.input) {

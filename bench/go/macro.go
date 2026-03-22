@@ -30,7 +30,7 @@ var specialForms = map[string]bool{
 	"define": true, "quote": true, "lambda": true, "cond": true,
 	"and": true, "or": true, "define-syntax": true, "syntax-rules": true,
 	"letrec": true, "let*": true, "do": true, "case": true,
-	"guard": true,
+	"guard": true, "syntax-case": true, "syntax": true, "with-syntax": true,
 }
 
 // parseSyntaxRules parses (syntax-rules (literals...) (pattern template) ...).
@@ -239,6 +239,10 @@ func expandTemplate(tmpl *Expr, bindings map[string]interface{}, hygieneMap map[
 }
 
 func expandTemplateList(tmpl *Expr, bindings map[string]interface{}, hygieneMap map[string]string) *Expr {
+	// Don't expand inside quote forms
+	if len(tmpl.List) >= 1 && tmpl.List[0].Type == ExprSymbol && tmpl.List[0].StrVal == "quote" {
+		return tmpl
+	}
 	var result []*Expr
 	for i := 0; i < len(tmpl.List); i++ {
 		// Check if followed by ellipsis
@@ -305,6 +309,10 @@ func collectFreeSymbolsInner(tmpl *Expr, patternVars map[string]bool, free map[s
 		}
 	}
 	if tmpl.Type == ExprList {
+		// Skip quote forms - symbols inside quote are data, not identifiers
+		if len(tmpl.List) >= 1 && tmpl.List[0].Type == ExprSymbol && tmpl.List[0].StrVal == "quote" {
+			return
+		}
 		for _, e := range tmpl.List {
 			collectFreeSymbolsInner(e, patternVars, free)
 		}
