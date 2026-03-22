@@ -22,6 +22,7 @@ public sealed interface SchemeValue {
     record SymbolVal(String name) implements SchemeValue {}
     record ListVal(List<SchemeValue> elements) implements SchemeValue {}
     record LambdaVal(List<String> params, String restParam, List<SchemeValue> body, Environment env) implements SchemeValue {}
+    record CaseLambdaVal(List<LambdaVal> clauses) implements SchemeValue {}
     record BuiltinVal(String name, Function<List<SchemeValue>, SchemeValue> fn) implements SchemeValue {}
     final class PairVal implements SchemeValue {
         SchemeValue car;
@@ -97,6 +98,7 @@ public sealed interface SchemeValue {
             case MutableStringVal v -> "\"" + v.value() + "\"";
             case SymbolVal v -> v.name();
             case LambdaVal v -> "#<procedure>";
+            case CaseLambdaVal v -> "#<procedure>";
             case BuiltinVal v -> "#<procedure:" + v.name() + ">";
             case ContinuationVal v -> "#<continuation>";
             case SyntaxRulesVal v -> "#<syntax>";
