@@ -59,6 +59,14 @@ public class Interpreter {
             if (args.size() != 1) throw new EvalError("not: expected 1 argument, got " + args.size());
             return new SchemeValue.BoolVal(!args.getFirst().isTruthy());
         });
+        // cxr accessors
+        builtin("caar", args -> { if (args.size()!=1) throw new EvalError("caar: expected 1 argument"); return schemeCar(schemeCar(args.getFirst())); });
+        builtin("cadr", args -> { if (args.size()!=1) throw new EvalError("cadr: expected 1 argument"); return schemeCar(schemeCdr(args.getFirst())); });
+        builtin("cdar", args -> { if (args.size()!=1) throw new EvalError("cdar: expected 1 argument"); return schemeCdr(schemeCar(args.getFirst())); });
+        builtin("cddr", args -> { if (args.size()!=1) throw new EvalError("cddr: expected 1 argument"); return schemeCdr(schemeCdr(args.getFirst())); });
+        builtin("caddr", args -> { if (args.size()!=1) throw new EvalError("caddr: expected 1 argument"); return schemeCar(schemeCdr(schemeCdr(args.getFirst()))); });
+        builtin("cdddr", args -> { if (args.size()!=1) throw new EvalError("cdddr: expected 1 argument"); return schemeCdr(schemeCdr(schemeCdr(args.getFirst()))); });
+        builtin("cadddr", args -> { if (args.size()!=1) throw new EvalError("cadddr: expected 1 argument"); return schemeCar(schemeCdr(schemeCdr(schemeCdr(args.getFirst())))); });
         builtin("cons", args -> {
             if (args.size() != 2) throw new EvalError("cons: expected 2 arguments");
             return new SchemeValue.PairVal(args.get(0), args.get(1));
@@ -703,6 +711,40 @@ public class Interpreter {
                 else if (pair instanceof SchemeValue.ListVal pl && !pl.elements().isEmpty()) pairKey = pl.elements().getFirst();
                 else throw new EvalError("assv: expected pair in alist");
                 if (schemeEqv(key, pairKey)) return pair;
+            }
+        });
+        builtin("memq", args -> {
+            if (args.size() != 2) throw new EvalError("memq: expected 2 arguments");
+            SchemeValue key = args.get(0);
+            SchemeValue lst = args.get(1);
+            while (true) {
+                if (lst instanceof SchemeValue.ListVal l && l.elements().isEmpty()) return new SchemeValue.BoolVal(false);
+                if (lst instanceof SchemeValue.PairVal p) {
+                    if (schemeEq(key, p.car())) return lst;
+                    lst = p.cdr();
+                } else if (lst instanceof SchemeValue.ListVal l && !l.elements().isEmpty()) {
+                    if (schemeEq(key, l.elements().getFirst())) return lst;
+                    lst = new SchemeValue.ListVal(l.elements().subList(1, l.elements().size()));
+                } else return new SchemeValue.BoolVal(false);
+            }
+        });
+        builtin("assq", args -> {
+            if (args.size() != 2) throw new EvalError("assq: expected 2 arguments");
+            SchemeValue key = args.get(0);
+            SchemeValue alist = args.get(1);
+            while (true) {
+                if (alist instanceof SchemeValue.ListVal l && l.elements().isEmpty()) return new SchemeValue.BoolVal(false);
+                SchemeValue pair;
+                if (alist instanceof SchemeValue.PairVal p) { pair = p.car(); alist = p.cdr(); }
+                else if (alist instanceof SchemeValue.ListVal l && !l.elements().isEmpty()) {
+                    pair = l.elements().getFirst();
+                    alist = new SchemeValue.ListVal(l.elements().subList(1, l.elements().size()));
+                } else throw new EvalError("assq: expected proper list");
+                SchemeValue pairKey;
+                if (pair instanceof SchemeValue.PairVal pp) pairKey = pp.car();
+                else if (pair instanceof SchemeValue.ListVal pl && !pl.elements().isEmpty()) pairKey = pl.elements().getFirst();
+                else throw new EvalError("assq: expected pair in alist");
+                if (schemeEq(key, pairKey)) return pair;
             }
         });
         builtin("gcd", args -> {
@@ -1700,6 +1742,29 @@ public class Interpreter {
         throw new EvalError("expected integer, got: " + v.display());
     }
 
+    private SchemeValue schemeCar(SchemeValue v) throws EvalError {
+        if (v instanceof SchemeValue.PairVal p) return p.car();
+        if (v instanceof SchemeValue.ListVal l && !l.elements().isEmpty()) return l.elements().getFirst();
+        throw new EvalError("car: expected pair, got: " + v.display());
+    }
+
+    private SchemeValue schemeCdr(SchemeValue v) throws EvalError {
+        if (v instanceof SchemeValue.PairVal p) return p.cdr();
+        if (v instanceof SchemeValue.ListVal l && !l.elements().isEmpty())
+            return new SchemeValue.ListVal(l.elements().subList(1, l.elements().size()));
+        throw new EvalError("cdr: expected pair, got: " + v.display());
+    }
+
+    private boolean schemeEq(SchemeValue a, SchemeValue b) {
+        if (a instanceof SchemeValue.BoolVal ba && b instanceof SchemeValue.BoolVal bb) return ba.value() == bb.value();
+        if (a instanceof SchemeValue.SymbolVal sa && b instanceof SchemeValue.SymbolVal sb) return sa.name().equals(sb.name());
+        if (a instanceof SchemeValue.IntVal ia && b instanceof SchemeValue.IntVal ib) return ia.value() == ib.value();
+        if (a instanceof SchemeValue.CharVal ca && b instanceof SchemeValue.CharVal cb) return ca.value() == cb.value();
+        if (a instanceof SchemeValue.ListVal la && la.elements().isEmpty() &&
+            b instanceof SchemeValue.ListVal lb && lb.elements().isEmpty()) return true;
+        return a == b;
+    }
+
     private boolean schemeEqv(SchemeValue a, SchemeValue b) {
         if (a instanceof SchemeValue.IntVal ia && b instanceof SchemeValue.IntVal ib) return ia.value() == ib.value();
         if (a instanceof SchemeValue.DoubleVal da && b instanceof SchemeValue.DoubleVal db) return da.value() == db.value();
@@ -1713,6 +1778,11 @@ public class Interpreter {
     }
 
     private boolean schemeEqual(SchemeValue a, SchemeValue b) {
+        return schemeEqualRec(a, b, java.util.Collections.newSetFromMap(new IdentityHashMap<>()));
+    }
+
+    private boolean schemeEqualRec(SchemeValue a, SchemeValue b, java.util.Set<Long> seen) {
+        if (a == b) return true;
         if (isNumber(a) && isNumber(b)) {
             try { return toDouble(a) == toDouble(b); } catch (EvalError e) { return false; }
         }
@@ -1742,11 +1812,16 @@ public class Interpreter {
             bCdr = lb.elements().size() == 1 ? new SchemeValue.ListVal(List.of()) :
                 new SchemeValue.ListVal(lb.elements().subList(1, lb.elements().size()));
         }
-        if (aCar != null && bCar != null) return schemeEqual(aCar, bCar) && schemeEqual(aCdr, bCdr);
+        if (aCar != null && bCar != null) {
+            // Cycle detection using identity pair encoding
+            long key = ((long) System.identityHashCode(a) << 32) | (System.identityHashCode(b) & 0xFFFFFFFFL);
+            if (!seen.add(key)) return true; // already comparing these — assume equal
+            return schemeEqualRec(aCar, bCar, seen) && schemeEqualRec(aCdr, bCdr, seen);
+        }
         if (a instanceof SchemeValue.VectorVal va && b instanceof SchemeValue.VectorVal vb) {
             if (va.elements().length != vb.elements().length) return false;
             for (int i = 0; i < va.elements().length; i++) {
-                if (!schemeEqual(va.elements()[i], vb.elements()[i])) return false;
+                if (!schemeEqualRec(va.elements()[i], vb.elements()[i], seen)) return false;
             }
             return true;
         }
@@ -1754,10 +1829,19 @@ public class Interpreter {
     }
 
     private boolean isProperList(SchemeValue v) {
+        // Tortoise-and-hare cycle detection
+        SchemeValue slow = v, fast = v;
         while (true) {
-            if (v instanceof SchemeValue.ListVal l) return true; // empty list or ListVal = proper
-            if (v instanceof SchemeValue.PairVal p) { v = p.cdr(); continue; }
-            return false;
+            if (slow instanceof SchemeValue.ListVal) return true;
+            if (!(slow instanceof SchemeValue.PairVal ps)) return false;
+            slow = ps.cdr();
+            // Advance fast twice
+            for (int i = 0; i < 2; i++) {
+                if (fast instanceof SchemeValue.ListVal) return true;
+                if (!(fast instanceof SchemeValue.PairVal pf)) return false;
+                fast = pf.cdr();
+            }
+            if (slow == fast) return false; // cycle detected
         }
     }
 

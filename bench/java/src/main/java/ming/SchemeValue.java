@@ -123,10 +123,13 @@ public sealed interface SchemeValue {
                 yield sb.toString();
             }
             case PairVal v -> {
+                var seen = java.util.Collections.newSetFromMap(new IdentityHashMap<SchemeValue, Boolean>());
                 var sb = new StringBuilder("(");
+                seen.add(v);
                 sb.append(v.car().display());
                 SchemeValue rest = v.cdr();
                 while (rest instanceof PairVal p) {
+                    if (!seen.add(p)) { sb.append(" ..."); break; }
                     sb.append(' ');
                     sb.append(p.car().display());
                     rest = p.cdr();
@@ -136,7 +139,7 @@ public sealed interface SchemeValue {
                         sb.append(' ');
                         sb.append(elem.display());
                     }
-                } else {
+                } else if (!(rest instanceof PairVal)) {
                     sb.append(" . ");
                     sb.append(rest.display());
                 }
