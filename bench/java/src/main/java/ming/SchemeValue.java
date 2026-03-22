@@ -40,6 +40,17 @@ public sealed interface SchemeValue {
     record VectorVal(SchemeValue[] elements) implements SchemeValue {}
     record ValuesVal(List<SchemeValue> values) implements SchemeValue {}
     record DoubleVal(double value) implements SchemeValue {}
+    final class RecordVal implements SchemeValue {
+        final String typeName;
+        final String[] fieldNames;
+        final SchemeValue[] fields;
+        RecordVal(String typeName, String[] fieldNames, SchemeValue[] fields) {
+            this.typeName = typeName;
+            this.fieldNames = fieldNames;
+            this.fields = fields;
+        }
+    }
+
     record RationalVal(long num, long den) implements SchemeValue {
         public RationalVal {
             if (den == 0) throw new ArithmeticException("division by zero");
@@ -88,6 +99,7 @@ public sealed interface SchemeValue {
             case BuiltinVal v -> "#<procedure:" + v.name() + ">";
             case ContinuationVal v -> "#<continuation>";
             case SyntaxRulesVal v -> "#<syntax>";
+            case RecordVal v -> "#<record:" + v.typeName + ">";
             case VoidVal v -> "";
             case ValuesVal v -> v.values().isEmpty() ? "" : v.values().getFirst().display();
             case CharVal v -> "#\\" + (v.value() == ' ' ? "space" : v.value() == '\n' ? "newline" : String.valueOf(v.value()));
