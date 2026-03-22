@@ -20,6 +20,7 @@ const (
 	typePair
 	typeNull
 	typeLambda
+	typeChar
 )
 
 type pair struct {
@@ -37,6 +38,7 @@ type value struct {
 	intVal    int64
 	boolV     bool
 	strVal    string
+	charVal   rune
 	pairVal   *pair
 	lambdaVal *lambda
 }
@@ -48,6 +50,7 @@ func intValue(n int64) value     { return value{typ: typeInt, intVal: n} }
 func boolValue(b bool) value     { return value{typ: typeBool, boolV: b} }
 func stringValue(s string) value { return value{typ: typeString, strVal: s} }
 func symbolValue(s string) value { return value{typ: typeSymbol, strVal: s} }
+func charValue(c rune) value     { return value{typ: typeChar, charVal: c} }
 func pairValue(car, cdr value) value {
 	return value{typ: typePair, pairVal: &pair{car: car, cdr: cdr}}
 }
@@ -73,8 +76,54 @@ func (v value) String() string {
 		return formatList(v)
 	case typeLambda:
 		return "#<procedure>"
+	case typeChar:
+		switch v.charVal {
+		case ' ':
+			return `#\space`
+		case '\n':
+			return `#\newline`
+		case '\t':
+			return `#\tab`
+		default:
+			return `#\` + string(v.charVal)
+		}
 	}
 	return ""
+}
+
+// displayString formats a value for display (no quotes on strings).
+func displayString(v value) string {
+	switch v.typ {
+	case typeString:
+		return v.strVal
+	case typeChar:
+		return string(v.charVal)
+	case typePair:
+		return displayList(v)
+	default:
+		return v.String()
+	}
+}
+
+func displayList(v value) string {
+	var sb strings.Builder
+	sb.WriteByte('(')
+	first := true
+	cur := v
+	for cur.typ == typePair {
+		if !first {
+			sb.WriteByte(' ')
+		}
+		first = false
+		sb.WriteString(displayString(cur.pairVal.car))
+		cur = cur.pairVal.cdr
+	}
+	if cur.typ != typeNull {
+		sb.WriteString(" . ")
+		sb.WriteString(displayString(cur))
+	}
+	sb.WriteByte(')')
+	return sb.String()
 }
 
 func formatList(v value) string {
@@ -320,10 +369,25 @@ func isAllDigits(s string) bool {
 type env struct {
 	bindings map[string]value
 	parent   *env
+	output   *strings.Builder // shared output buffer for display/write/newline
 }
 
 func newEnv(parent *env) *env {
-	return &env{bindings: make(map[string]value), parent: parent}
+	e := &env{bindings: make(map[string]value), parent: parent}
+	if parent != nil {
+		e.output = parent.output
+	}
+	return e
+}
+
+func (e *env) getOutput() *strings.Builder {
+	if e.output != nil {
+		return e.output
+	}
+	if e.parent != nil {
+		return e.parent.getOutput()
+	}
+	return nil
 }
 
 func (e *env) get(name string) (value, bool) {
@@ -400,16 +464,16 @@ func evalExpr(e *expr, environ *env) (value, error) {
 		args[i] = v
 	}
 
-	return applyProc(opVal, args, e)
+	return applyProc(opVal, args, e, environ)
 }
 
-func applyProc(proc value, args []value, e *expr) (value, error) {
+func applyProc(proc value, args []value, e *expr, environ *env) (value, error) {
 	head := e.list[0]
 	switch proc.typ {
 	case typeLambda:
 		return applyLambda(proc.lambdaVal, args, e)
 	case typeSymbol:
-		return applyBuiltin(proc.strVal, args, e)
+		return applyBuiltin(proc.strVal, args, e, environ)
 	default:
 		return value{}, fmt.Errorf("%d:%d: not a procedure: %s", head.line, head.col, proc.String())
 	}
@@ -684,7 +748,7 @@ func evalCond(e *expr, environ *env) (value, error) {
 	return voidValue, nil
 }
 
-func applyBuiltin(name string, args []value, e *expr) (value, error) {
+func applyBuiltin(name string, args []value, e *expr, environ *env) (value, error) {
 	head := e.list[0]
 	switch name {
 	case "+":
@@ -857,6 +921,133 @@ func applyBuiltin(name string, args []value, e *expr) (value, error) {
 			result = appendList(args[i], result)
 		}
 		return result, nil
+
+	case "display":
+		if len(args) != 1 {
+			return value{}, fmt.Errorf("%d:%d: display: expected 1 argument, got %d", head.line, head.col, len(args))
+		}
+		if out := environ.getOutput(); out != nil {
+			out.WriteString(displayString(args[0]))
+		}
+		return voidValue, nil
+
+	case "write":
+		if len(args) != 1 {
+			return value{}, fmt.Errorf("%d:%d: write: expected 1 argument, got %d", head.line, head.col, len(args))
+		}
+		if out := environ.getOutput(); out != nil {
+			out.WriteString(args[0].String())
+		}
+		return voidValue, nil
+
+	case "newline":
+		if len(args) != 0 {
+			return value{}, fmt.Errorf("%d:%d: newline: expected 0 arguments, got %d", head.line, head.col, len(args))
+		}
+		if out := environ.getOutput(); out != nil {
+			out.WriteByte('\n')
+		}
+		return voidValue, nil
+
+	case "string-append":
+		var sb strings.Builder
+		for i, a := range args {
+			if a.typ != typeString {
+				return value{}, fmt.Errorf("%d:%d: string-append: expected string", e.list[i+1].line, e.list[i+1].col)
+			}
+			sb.WriteString(a.strVal)
+		}
+		return stringValue(sb.String()), nil
+
+	case "string-length":
+		if len(args) != 1 {
+			return value{}, fmt.Errorf("%d:%d: string-length: expected 1 argument, got %d", head.line, head.col, len(args))
+		}
+		if args[0].typ != typeString {
+			return value{}, fmt.Errorf("%d:%d: string-length: expected string", head.line, head.col)
+		}
+		return intValue(int64(len([]rune(args[0].strVal)))), nil
+
+	case "substring":
+		if len(args) != 3 {
+			return value{}, fmt.Errorf("%d:%d: substring: expected 3 arguments, got %d", head.line, head.col, len(args))
+		}
+		if args[0].typ != typeString {
+			return value{}, fmt.Errorf("%d:%d: substring: expected string", head.line, head.col)
+		}
+		if args[1].typ != typeInt || args[2].typ != typeInt {
+			return value{}, fmt.Errorf("%d:%d: substring: expected integer indices", head.line, head.col)
+		}
+		runes := []rune(args[0].strVal)
+		start := int(args[1].intVal)
+		end := int(args[2].intVal)
+		if start < 0 || end < start || end > len(runes) {
+			return value{}, fmt.Errorf("%d:%d: substring: index out of range", head.line, head.col)
+		}
+		return stringValue(string(runes[start:end])), nil
+
+	case "string->number":
+		if len(args) != 1 {
+			return value{}, fmt.Errorf("%d:%d: string->number: expected 1 argument, got %d", head.line, head.col, len(args))
+		}
+		if args[0].typ != typeString {
+			return value{}, fmt.Errorf("%d:%d: string->number: expected string", head.line, head.col)
+		}
+		n, err := strconv.ParseInt(args[0].strVal, 10, 64)
+		if err != nil {
+			return boolValue(false), nil
+		}
+		return intValue(n), nil
+
+	case "number->string":
+		if len(args) != 1 {
+			return value{}, fmt.Errorf("%d:%d: number->string: expected 1 argument, got %d", head.line, head.col, len(args))
+		}
+		if args[0].typ != typeInt {
+			return value{}, fmt.Errorf("%d:%d: number->string: expected number", head.line, head.col)
+		}
+		return stringValue(strconv.FormatInt(args[0].intVal, 10)), nil
+
+	case "symbol->string":
+		if len(args) != 1 {
+			return value{}, fmt.Errorf("%d:%d: symbol->string: expected 1 argument, got %d", head.line, head.col, len(args))
+		}
+		if args[0].typ != typeSymbol {
+			return value{}, fmt.Errorf("%d:%d: symbol->string: expected symbol", head.line, head.col)
+		}
+		return stringValue(args[0].strVal), nil
+
+	case "string->symbol":
+		if len(args) != 1 {
+			return value{}, fmt.Errorf("%d:%d: string->symbol: expected 1 argument, got %d", head.line, head.col, len(args))
+		}
+		if args[0].typ != typeString {
+			return value{}, fmt.Errorf("%d:%d: string->symbol: expected string", head.line, head.col)
+		}
+		return symbolValue(args[0].strVal), nil
+
+	case "string-ref":
+		if len(args) != 2 {
+			return value{}, fmt.Errorf("%d:%d: string-ref: expected 2 arguments, got %d", head.line, head.col, len(args))
+		}
+		if args[0].typ != typeString {
+			return value{}, fmt.Errorf("%d:%d: string-ref: expected string", head.line, head.col)
+		}
+		if args[1].typ != typeInt {
+			return value{}, fmt.Errorf("%d:%d: string-ref: expected integer index", head.line, head.col)
+		}
+		runes := []rune(args[0].strVal)
+		idx := int(args[1].intVal)
+		if idx < 0 || idx >= len(runes) {
+			return value{}, fmt.Errorf("%d:%d: string-ref: index out of range", head.line, head.col)
+		}
+		return charValue(runes[idx]), nil
+
+	case "char?":
+		if len(args) != 1 {
+			return value{}, fmt.Errorf("%d:%d: char?: expected 1 argument, got %d", head.line, head.col, len(args))
+		}
+		return boolValue(args[0].typ == typeChar), nil
 	}
 
 	return value{}, fmt.Errorf("%d:%d: unbound variable: %s", head.line, head.col, name)
@@ -908,7 +1099,7 @@ func EvalStr(input string) (string, error) {
 
 	environ := newEnv(nil)
 	// Pre-bind builtins as symbols
-	for _, name := range []string{"+", "-", "*", "/", "<", ">", "=", "<=", ">=", "not", "cons", "car", "cdr", "null?", "list", "length", "append", "string?", "number?", "boolean?", "pair?", "symbol?"} {
+	for _, name := range []string{"+", "-", "*", "/", "<", ">", "=", "<=", ">=", "not", "cons", "car", "cdr", "null?", "list", "length", "append", "string?", "number?", "boolean?", "pair?", "symbol?", "display", "write", "newline", "string-append", "string-length", "substring", "string->number", "number->string", "symbol->string", "string->symbol", "string-ref", "char?"} {
 		environ.set(name, symbolValue(name))
 	}
 
@@ -930,5 +1121,37 @@ func EvalStr(input string) (string, error) {
 // EvalStrWithOutput evaluates Scheme expressions and returns both the result
 // string and any captured output from display/write/newline.
 func EvalStrWithOutput(input string) (result string, output string, err error) {
-	return "", "", &EvalError{Message: "not implemented"}
+	tokens, err := tokenize(input)
+	if err != nil {
+		return "", "", &EvalError{Message: err.Error()}
+	}
+	exprs, err := parse(tokens)
+	if err != nil {
+		return "", "", &EvalError{Message: err.Error()}
+	}
+	if len(exprs) == 0 {
+		return "", "", &EvalError{Message: "no expressions"}
+	}
+
+	var outBuf strings.Builder
+	environ := newEnv(nil)
+	environ.output = &outBuf
+	for _, name := range []string{"+", "-", "*", "/", "<", ">", "=", "<=", ">=", "not", "cons", "car", "cdr", "null?", "list", "length", "append", "string?", "number?", "boolean?", "pair?", "symbol?", "display", "write", "newline", "string-append", "string-length", "substring", "string->number", "number->string", "symbol->string", "string->symbol", "string-ref", "char?"} {
+		environ.set(name, symbolValue(name))
+	}
+
+	var last value
+	for _, e := range exprs {
+		v, evalErr := evalExpr(e, environ)
+		if evalErr != nil {
+			return "", "", &EvalError{Message: evalErr.Error()}
+		}
+		last = v
+	}
+
+	resultStr := ""
+	if last.typ != typeVoid {
+		resultStr = last.String()
+	}
+	return resultStr, outBuf.String(), nil
 }
