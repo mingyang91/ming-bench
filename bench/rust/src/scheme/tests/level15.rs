@@ -137,3 +137,19 @@ fn test_l15_vector_nested() {
         Ok("3".into())
     );
 }
+
+#[test]
+fn test_l15_stress_scheme_eval() {
+    assert_eq!(
+        eval_str(include_str!("fixtures/l15_stress_scheme_eval.scm").trim()),
+        Ok("#t".into())
+    );
+}
+
+#[test]
+fn test_l15_stress_sboyer() {
+    assert_eq!(
+        eval_str(include_str!("fixtures/l15_stress_sboyer.scm").trim()),
+        Ok("#t".into())
+    );
+}

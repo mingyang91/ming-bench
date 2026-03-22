@@ -42,3 +42,11 @@ fn test_l21_deep_recursion_no_leak() {
         Ok("done".into())
     );
 }
+
+#[test]
+fn test_l21_stress_conform() {
+    assert_eq!(
+        eval_str(include_str!("fixtures/l21_stress_conform.scm").trim()),
+        Ok("#t".into())
+    );
+}

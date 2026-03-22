@@ -1518,5 +1518,26 @@
     "fixture": "l23_stress_peval.scm",
     "kind": "eval_str_ok",
     "expected": "#t"
+  },
+  {
+    "name": "l15_stress_scheme_eval",
+    "level": 15,
+    "fixture": "l15_stress_scheme_eval.scm",
+    "kind": "eval_str_ok",
+    "expected": "#t"
+  },
+  {
+    "name": "l15_stress_sboyer",
+    "level": 15,
+    "fixture": "l15_stress_sboyer.scm",
+    "kind": "eval_str_ok",
+    "expected": "#t"
+  },
+  {
+    "name": "l21_stress_conform",
+    "level": 21,
+    "fixture": "l21_stress_conform.scm",
+    "kind": "eval_str_ok",
+    "expected": "#t"
   }
 ]
