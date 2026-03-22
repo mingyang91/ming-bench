@@ -5,12 +5,12 @@ mod parser;
 
 pub use error::EvalError;
 
-use forms::{eval_cond, eval_let};
 use builtins::{
     builtin_add, builtin_and, builtin_append, builtin_car, builtin_cdr, builtin_cmp,
     builtin_cons, builtin_div, builtin_length, builtin_list, builtin_mul, builtin_not,
-    builtin_null, builtin_or, builtin_sub, builtin_type_pred,
+    builtin_null, builtin_or, builtin_string_ops, builtin_sub, builtin_type_pred,
 };
+use forms::{eval_cond, eval_let};
 use parser::{parse_all, Span};
 use std::collections::HashMap;
 
@@ -22,8 +22,10 @@ pub(crate) enum Value {
     Integer(i64),
     Boolean(bool),
     Str(String),
+    Char(char),
     Symbol(String, Span),
     List(Vec<Value>, Span),
+    Void,
     Lambda {
         name: Option<String>,
         params: Vec<String>,
@@ -53,31 +55,45 @@ impl Value {
             Value::Integer(_) => "number",
             Value::Boolean(_) => "boolean",
             Value::Str(_) => "string",
+            Value::Char(_) => "character",
             Value::Symbol(..) => "symbol",
             Value::List(..) => "list",
+            Value::Void => "void",
             Value::Lambda { .. } => "procedure",
         }
     }
 
+    /// `write`-style representation (strings get quotes).
     fn display(&self) -> String {
         match self {
             Value::Integer(n) => n.to_string(),
             Value::Boolean(true) => "#t".to_string(),
             Value::Boolean(false) => "#f".to_string(),
             Value::Str(s) => format!("\"{}\"", s),
+            Value::Char(c) => format!("#\\{c}"),
             Value::Symbol(s, _) => s.clone(),
             Value::List(items, _) => {
                 let inner: Vec<String> = items.iter().map(|v| v.display()).collect();
                 format!("({})", inner.join(" "))
             }
+            Value::Void => "#<void>".to_string(),
             Value::Lambda { .. } => "#<procedure>".to_string(),
+        }
+    }
+
+    /// `display`-style representation (strings without quotes).
+    fn display_repr(&self) -> String {
+        match self {
+            Value::Str(s) => s.clone(),
+            other => other.display(),
         }
     }
 
     fn span(&self) -> Span {
         match self {
             Value::Symbol(_, span) | Value::List(_, span) => *span,
-            Value::Integer(_) | Value::Boolean(_) | Value::Str(_) | Value::Lambda { .. } => (0, 0),
+            Value::Integer(_) | Value::Boolean(_) | Value::Str(_) | Value::Char(_)
+            | Value::Void | Value::Lambda { .. } => (0, 0),
         }
     }
 }
@@ -88,11 +104,10 @@ fn default_env() -> Env {
     Env::new()
 }
 
-pub(crate) fn eval(expr: &Value, env: &mut Env) -> Result<Value, EvalError> {
+pub(crate) fn eval(expr: &Value, env: &mut Env, output: &mut String) -> Result<Value, EvalError> {
     match expr {
-        Value::Integer(_) | Value::Boolean(_) | Value::Str(_) | Value::Lambda { .. } => {
-            Ok(expr.clone())
-        }
+        Value::Integer(_) | Value::Boolean(_) | Value::Str(_) | Value::Char(_)
+        | Value::Void | Value::Lambda { .. } => Ok(expr.clone()),
         Value::Symbol(name, span) => {
             env.get(name).cloned().ok_or_else(|| EvalError::UnboundVariable {
                 name: name.clone(),
@@ -110,7 +125,6 @@ pub(crate) fn eval(expr: &Value, env: &mut Env) -> Result<Value, EvalError> {
                 });
             }
 
-            // Check for special forms
             if let Value::Symbol(op, _) = &items[0] {
                 match op.as_str() {
                     "quote" => {
@@ -133,11 +147,11 @@ pub(crate) fn eval(expr: &Value, env: &mut Env) -> Result<Value, EvalError> {
                                 col,
                             });
                         }
-                        let cond = eval(&items[1], env)?;
+                        let cond = eval(&items[1], env, output)?;
                         if cond.is_truthy() {
-                            return eval(&items[2], env);
+                            return eval(&items[2], env, output);
                         } else if items.len() == 4 {
-                            return eval(&items[3], env);
+                            return eval(&items[3], env, output);
                         }
                         return Ok(Value::Boolean(false));
                     }
@@ -151,8 +165,7 @@ pub(crate) fn eval(expr: &Value, env: &mut Env) -> Result<Value, EvalError> {
                         }
                         match &items[1] {
                             Value::Symbol(name, _) => {
-                                let mut val = eval(&items[2], env)?;
-                                // Tag lambdas with their name for self-recursion
+                                let mut val = eval(&items[2], env, output)?;
                                 if let Value::Lambda {
                                     name: ref mut n, ..
                                 } = val
@@ -163,7 +176,6 @@ pub(crate) fn eval(expr: &Value, env: &mut Env) -> Result<Value, EvalError> {
                                 return Ok(Value::Boolean(false));
                             }
                             Value::List(sig, _) => {
-                                // (define (f params...) body...)
                                 if sig.is_empty() {
                                     return Err(EvalError::Parse {
                                         message: "define: empty signature".to_string(),
@@ -262,51 +274,98 @@ pub(crate) fn eval(expr: &Value, env: &mut Env) -> Result<Value, EvalError> {
                             closure_env: env.clone(),
                         });
                     }
-                    "+" => return builtin_add(&items[1..], env).map_err(|e| e.with_position(line, col)),
-                    "-" => return builtin_sub(&items[1..], env).map_err(|e| e.with_position(line, col)),
-                    "*" => return builtin_mul(&items[1..], env).map_err(|e| e.with_position(line, col)),
-                    "/" => return builtin_div(&items[1..], env).map_err(|e| e.with_position(line, col)),
-                    "<" => return builtin_cmp(&items[1..], env, "<").map_err(|e| e.with_position(line, col)),
-                    ">" => return builtin_cmp(&items[1..], env, ">").map_err(|e| e.with_position(line, col)),
-                    "=" => return builtin_cmp(&items[1..], env, "=").map_err(|e| e.with_position(line, col)),
-                    "<=" => return builtin_cmp(&items[1..], env, "<=").map_err(|e| e.with_position(line, col)),
-                    ">=" => return builtin_cmp(&items[1..], env, ">=").map_err(|e| e.with_position(line, col)),
-                    "not" => return builtin_not(&items[1..], env).map_err(|e| e.with_position(line, col)),
-                    "and" => return builtin_and(&items[1..], env).map_err(|e| e.with_position(line, col)),
-                    "or" => return builtin_or(&items[1..], env).map_err(|e| e.with_position(line, col)),
-                    "cons" => return builtin_cons(&items[1..], env).map_err(|e| e.with_position(line, col)),
-                    "car" => return builtin_car(&items[1..], env).map_err(|e| e.with_position(line, col)),
-                    "cdr" => return builtin_cdr(&items[1..], env).map_err(|e| e.with_position(line, col)),
-                    "null?" => return builtin_null(&items[1..], env).map_err(|e| e.with_position(line, col)),
-                    "list" => return builtin_list(&items[1..], env).map_err(|e| e.with_position(line, col)),
-                    "length" => return builtin_length(&items[1..], env).map_err(|e| e.with_position(line, col)),
-                    "append" => return builtin_append(&items[1..], env).map_err(|e| e.with_position(line, col)),
-                    "string?" | "number?" | "boolean?" | "pair?" | "symbol?" => {
-                        return builtin_type_pred(&items[1..], env, op.as_str())
+                    "+" => return builtin_add(&items[1..], env, output).map_err(|e| e.with_position(line, col)),
+                    "-" => return builtin_sub(&items[1..], env, output).map_err(|e| e.with_position(line, col)),
+                    "*" => return builtin_mul(&items[1..], env, output).map_err(|e| e.with_position(line, col)),
+                    "/" => return builtin_div(&items[1..], env, output).map_err(|e| e.with_position(line, col)),
+                    "<" => return builtin_cmp(&items[1..], env, "<", output).map_err(|e| e.with_position(line, col)),
+                    ">" => return builtin_cmp(&items[1..], env, ">", output).map_err(|e| e.with_position(line, col)),
+                    "=" => return builtin_cmp(&items[1..], env, "=", output).map_err(|e| e.with_position(line, col)),
+                    "<=" => return builtin_cmp(&items[1..], env, "<=", output).map_err(|e| e.with_position(line, col)),
+                    ">=" => return builtin_cmp(&items[1..], env, ">=", output).map_err(|e| e.with_position(line, col)),
+                    "not" => return builtin_not(&items[1..], env, output).map_err(|e| e.with_position(line, col)),
+                    "and" => return builtin_and(&items[1..], env, output).map_err(|e| e.with_position(line, col)),
+                    "or" => return builtin_or(&items[1..], env, output).map_err(|e| e.with_position(line, col)),
+                    "cons" => return builtin_cons(&items[1..], env, output).map_err(|e| e.with_position(line, col)),
+                    "car" => return builtin_car(&items[1..], env, output).map_err(|e| e.with_position(line, col)),
+                    "cdr" => return builtin_cdr(&items[1..], env, output).map_err(|e| e.with_position(line, col)),
+                    "null?" => return builtin_null(&items[1..], env, output).map_err(|e| e.with_position(line, col)),
+                    "list" => return builtin_list(&items[1..], env, output).map_err(|e| e.with_position(line, col)),
+                    "length" => return builtin_length(&items[1..], env, output).map_err(|e| e.with_position(line, col)),
+                    "append" => return builtin_append(&items[1..], env, output).map_err(|e| e.with_position(line, col)),
+                    "string?" | "number?" | "boolean?" | "pair?" | "symbol?" | "char?" => {
+                        return builtin_type_pred(&items[1..], env, op.as_str(), output)
                             .map_err(|e| e.with_position(line, col));
                     }
-                    "let" => return eval_let(&items[1..], env, (line, col)),
+                    "display" => {
+                        if items.len() != 2 {
+                            return Err(EvalError::Arity {
+                                procedure: "display".to_string(),
+                                expected: "1".to_string(),
+                                got: items.len() - 1,
+                                line,
+                                col,
+                            });
+                        }
+                        let val = eval(&items[1], env, output)?;
+                        output.push_str(&val.display_repr());
+                        return Ok(Value::Void);
+                    }
+                    "write" => {
+                        if items.len() != 2 {
+                            return Err(EvalError::Arity {
+                                procedure: "write".to_string(),
+                                expected: "1".to_string(),
+                                got: items.len() - 1,
+                                line,
+                                col,
+                            });
+                        }
+                        let val = eval(&items[1], env, output)?;
+                        output.push_str(&val.display());
+                        return Ok(Value::Void);
+                    }
+                    "newline" => {
+                        if items.len() != 1 {
+                            return Err(EvalError::Arity {
+                                procedure: "newline".to_string(),
+                                expected: "0".to_string(),
+                                got: items.len() - 1,
+                                line,
+                                col,
+                            });
+                        }
+                        output.push('\n');
+                        return Ok(Value::Void);
+                    }
+                    "string-append" | "string-length" | "substring"
+                    | "string->number" | "number->string"
+                    | "symbol->string" | "string->symbol" | "string-ref" => {
+                        return builtin_string_ops(&items[1..], env, op.as_str(), output)
+                            .map_err(|e| e.with_position(line, col));
+                    }
+                    "let" => return eval_let(&items[1..], env, (line, col), output),
                     "begin" => {
                         let mut result = Value::Boolean(false);
                         for expr in &items[1..] {
-                            result = eval(expr, env)?;
+                            result = eval(expr, env, output)?;
                         }
                         return Ok(result);
                     }
-                    "cond" => return eval_cond(&items[1..], env),
+                    "cond" => return eval_cond(&items[1..], env, output),
                     _ => {}
                 }
             }
 
             // Function application
-            let func = eval(&items[0], env)?;
-            let args = eval_args(&items[1..], env)?;
-            apply_function(&func, &args).map_err(|e| e.with_position(line, col))
+            let func = eval(&items[0], env, output)?;
+            let args = eval_args(&items[1..], env, output)?;
+            apply_function(&func, &args, output).map_err(|e| e.with_position(line, col))
         }
     }
 }
 
-fn apply_function(func: &Value, args: &[Value]) -> Result<Value, EvalError> {
+fn apply_function(func: &Value, args: &[Value], output: &mut String) -> Result<Value, EvalError> {
     match func {
         Value::Lambda {
             name,
@@ -324,14 +383,13 @@ fn apply_function(func: &Value, args: &[Value]) -> Result<Value, EvalError> {
                 });
             }
             let mut local_env = closure_env.clone();
-            // Inject self-reference for recursion
             if let Some(fn_name) = name {
                 local_env.insert(fn_name.clone(), func.clone());
             }
             for (param, arg) in params.iter().zip(args.iter()) {
                 local_env.insert(param.clone(), arg.clone());
             }
-            // Scan for internal defines and pre-bind them so they're mutually visible
+            // Scan for internal defines
             let mut internal_defs = Vec::new();
             let mut body_start = 0;
             for (i, expr) in body.iter().enumerate() {
@@ -348,11 +406,9 @@ fn apply_function(func: &Value, args: &[Value]) -> Result<Value, EvalError> {
             }
 
             if !internal_defs.is_empty() {
-                // First pass: evaluate all internal defines
                 for &idx in &internal_defs {
-                    eval(&body[idx], &mut local_env)?;
+                    eval(&body[idx], &mut local_env, output)?;
                 }
-                // Patch closures of all defined lambdas to see each other
                 let snapshot = local_env.clone();
                 for val in local_env.values_mut() {
                     if let Value::Lambda { closure_env, .. } = val {
@@ -365,7 +421,7 @@ fn apply_function(func: &Value, args: &[Value]) -> Result<Value, EvalError> {
 
             let mut result = Value::Boolean(false);
             for expr in &body[body_start..] {
-                result = eval(expr, &mut local_env)?;
+                result = eval(expr, &mut local_env, output)?;
             }
             Ok(result)
         }
@@ -377,8 +433,8 @@ fn apply_function(func: &Value, args: &[Value]) -> Result<Value, EvalError> {
     }
 }
 
-fn eval_args(args: &[Value], env: &mut Env) -> Result<Vec<Value>, EvalError> {
-    args.iter().map(|a| eval(a, env)).collect()
+fn eval_args(args: &[Value], env: &mut Env, output: &mut String) -> Result<Vec<Value>, EvalError> {
+    args.iter().map(|a| eval(a, env, output)).collect()
 }
 
 /// Evaluate one or more Scheme expressions and return the string
@@ -393,17 +449,32 @@ pub fn eval_str(input: &str) -> Result<String, EvalError> {
         });
     }
     let mut env = default_env();
+    let mut output = String::new();
     let mut result = Value::Boolean(false);
     for expr in &exprs {
-        result = eval(expr, &mut env)?;
+        result = eval(expr, &mut env, &mut output)?;
     }
     Ok(result.display())
 }
 
 /// Evaluate Scheme expressions, returning both the result value and
 /// any output produced by `display`, `write`, or `newline`.
-pub fn eval_str_with_output(_input: &str) -> Result<(String, String), EvalError> {
-    todo!()
+pub fn eval_str_with_output(input: &str) -> Result<(String, String), EvalError> {
+    let exprs = parse_all(input)?;
+    if exprs.is_empty() {
+        return Err(EvalError::Parse {
+            message: "no expressions".to_string(),
+            line: 0,
+            col: 0,
+        });
+    }
+    let mut env = default_env();
+    let mut output = String::new();
+    let mut result = Value::Boolean(false);
+    for expr in &exprs {
+        result = eval(expr, &mut env, &mut output)?;
+    }
+    Ok((result.display(), output))
 }
 
 #[cfg(test)]

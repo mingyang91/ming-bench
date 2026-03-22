@@ -1,8 +1,13 @@
 use crate::scheme::error::EvalError;
-use crate::scheme::{eval, Env, Value};
 use crate::scheme::parser::Span;
+use crate::scheme::{eval, Env, Value};
 
-pub(crate) fn eval_let(args: &[Value], env: &mut Env, span: Span) -> Result<Value, EvalError> {
+pub(crate) fn eval_let(
+    args: &[Value],
+    env: &mut Env,
+    span: Span,
+    output: &mut String,
+) -> Result<Value, EvalError> {
     let (line, col) = span;
     if args.is_empty() {
         return Err(EvalError::Parse {
@@ -43,13 +48,16 @@ pub(crate) fn eval_let(args: &[Value], env: &mut Env, span: Span) -> Result<Valu
                         Value::Symbol(s, _) => params.push(s.clone()),
                         other => {
                             return Err(EvalError::TypeError {
-                                message: format!("let: expected symbol, got {}", other.type_name()),
+                                message: format!(
+                                    "let: expected symbol, got {}",
+                                    other.type_name()
+                                ),
                                 line,
                                 col,
                             })
                         }
                     }
-                    init_vals.push(eval(&pair[1], env)?);
+                    init_vals.push(eval(&pair[1], env, output)?);
                 }
                 other => {
                     return Err(EvalError::Parse {
@@ -69,7 +77,6 @@ pub(crate) fn eval_let(args: &[Value], env: &mut Env, span: Span) -> Result<Valu
         };
         let mut local_env = env.clone();
         local_env.insert(name.clone(), lambda.clone());
-        // Apply the named lambda with initial values
         match &lambda {
             Value::Lambda { params, body, .. } => {
                 for (param, val) in params.iter().zip(init_vals.iter()) {
@@ -77,15 +84,17 @@ pub(crate) fn eval_let(args: &[Value], env: &mut Env, span: Span) -> Result<Valu
                 }
                 let mut result = Value::Boolean(false);
                 for expr in body {
-                    result = eval(expr, &mut local_env)?;
+                    result = eval(expr, &mut local_env, output)?;
                 }
                 Ok(result)
             }
             Value::Integer(_)
             | Value::Boolean(_)
             | Value::Str(_)
+            | Value::Char(_)
             | Value::Symbol(..)
-            | Value::List(..) => unreachable!(),
+            | Value::List(..)
+            | Value::Void => unreachable!(),
         }
     } else {
         // Regular let: (let ((var init) ...) body ...)
@@ -114,13 +123,16 @@ pub(crate) fn eval_let(args: &[Value], env: &mut Env, span: Span) -> Result<Valu
                         Value::Symbol(s, _) => s.clone(),
                         other => {
                             return Err(EvalError::TypeError {
-                                message: format!("let: expected symbol, got {}", other.type_name()),
+                                message: format!(
+                                    "let: expected symbol, got {}",
+                                    other.type_name()
+                                ),
                                 line,
                                 col,
                             })
                         }
                     };
-                    let val = eval(&pair[1], env)?;
+                    let val = eval(&pair[1], env, output)?;
                     local_env.insert(name, val);
                 }
                 other => {
@@ -134,34 +146,37 @@ pub(crate) fn eval_let(args: &[Value], env: &mut Env, span: Span) -> Result<Valu
         }
         let mut result = Value::Boolean(false);
         for expr in &args[1..] {
-            result = eval(expr, &mut local_env)?;
+            result = eval(expr, &mut local_env, output)?;
         }
         Ok(result)
     }
 }
 
-pub(crate) fn eval_cond(clauses: &[Value], env: &mut Env) -> Result<Value, EvalError> {
+pub(crate) fn eval_cond(
+    clauses: &[Value],
+    env: &mut Env,
+    output: &mut String,
+) -> Result<Value, EvalError> {
     for clause in clauses {
         match clause {
             Value::List(items, _) if !items.is_empty() => {
-                // Check for else clause
                 if let Value::Symbol(s, _) = &items[0] {
                     if s == "else" {
                         let mut result = Value::Boolean(false);
                         for expr in &items[1..] {
-                            result = eval(expr, env)?;
+                            result = eval(expr, env, output)?;
                         }
                         return Ok(result);
                     }
                 }
-                let test = eval(&items[0], env)?;
+                let test = eval(&items[0], env, output)?;
                 if test.is_truthy() {
                     if items.len() == 1 {
                         return Ok(test);
                     }
                     let mut result = Value::Boolean(false);
                     for expr in &items[1..] {
-                        result = eval(expr, env)?;
+                        result = eval(expr, env, output)?;
                     }
                     return Ok(result);
                 }
