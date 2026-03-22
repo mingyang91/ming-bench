@@ -9,6 +9,7 @@ pub fn eval(expr: &Expr, env: &Env, output: &mut String) -> Result<Value, EvalEr
         ExprKind::Integer(n) => Ok(Value::Integer(*n)),
         ExprKind::Boolean(b) => Ok(Value::Boolean(*b)),
         ExprKind::SchemeString(s) => Ok(Value::SchemeString(s.clone())),
+        ExprKind::Char(c) => Ok(Value::Char(*c)),
         ExprKind::Symbol(name) => {
             env.lookup(name).map_err(|e| e.with_span(&expr.span))
         }
@@ -43,6 +44,7 @@ fn eval_list(
             "let" => return eval_let(&elements[1..], kw_span, env, output),
             "begin" => return eval_begin(&elements[1..], env, output),
             "cond" => return eval_cond(&elements[1..], kw_span, env, output),
+            "string-set!" => return eval_string_set(&elements[1..], kw_span, env, output),
             _ => {}
         }
     }
@@ -102,6 +104,7 @@ fn is_builtin(name: &str) -> bool {
             | "symbol->string"
             | "string->symbol"
             | "string-ref"
+            | "string-copy"
     )
 }
 
@@ -193,6 +196,7 @@ fn eval_builtin(
         "symbol->string" => eval_symbol_to_string(args, span),
         "string->symbol" => eval_string_to_symbol(args, span),
         "string-ref" => eval_string_ref(args, span),
+        "string-copy" => eval_string_copy(args, span),
         _ => Err(EvalErrorKind::UnboundVariable {
             name: name.to_string(),
         }
@@ -307,6 +311,7 @@ fn expr_to_value(expr: &Expr) -> Result<Value, EvalError> {
         ExprKind::Boolean(b) => Ok(Value::Boolean(*b)),
         ExprKind::SchemeString(s) => Ok(Value::SchemeString(s.clone())),
         ExprKind::Symbol(s) => Ok(Value::Symbol(s.clone())),
+        ExprKind::Char(c) => Ok(Value::Char(*c)),
         ExprKind::List(elements) => {
             let mut result = Value::Nil;
             for elem in elements.iter().rev() {
@@ -874,4 +879,73 @@ fn eval_string_ref(args: &[Value], span: &Span) -> Result<Value, EvalError> {
         }
         .at(span)),
     }
+}
+
+// ===== L06: Mutable Strings =====
+
+fn eval_string_copy(args: &[Value], span: &Span) -> Result<Value, EvalError> {
+    if args.len() != 1 {
+        return Err(EvalErrorKind::Arity {
+            name: "string-copy".into(),
+            expected: "1".into(),
+            got: args.len(),
+        }
+        .at(span));
+    }
+    let s = require_string(&args[0], span)?;
+    Ok(Value::SchemeString(s.to_string()))
+}
+
+fn eval_string_set(
+    args: &[Expr],
+    span: &Span,
+    env: &Env,
+    output: &mut String,
+) -> Result<Value, EvalError> {
+    if args.len() != 3 {
+        return Err(EvalErrorKind::Arity {
+            name: "string-set!".into(),
+            expected: "3".into(),
+            got: args.len(),
+        }
+        .at(span));
+    }
+    let var_name = match &args[0].kind {
+        ExprKind::Symbol(name) => name.clone(),
+        _ => {
+            return Err(EvalErrorKind::Type {
+                expected: "symbol".into(),
+                got: "non-symbol".into(),
+            }
+            .at(span))
+        }
+    };
+    let idx_val = eval(&args[1], env, output)?;
+    let idx = require_integer(&idx_val, span)? as usize;
+    let char_val = eval(&args[2], env, output)?;
+    let ch = match &char_val {
+        Value::Char(c) => *c,
+        other => {
+            return Err(EvalErrorKind::Type {
+                expected: "char".into(),
+                got: format!("{other}"),
+            }
+            .at(span))
+        }
+    };
+    let current = env.lookup(&var_name).map_err(|e| e.with_span(span))?;
+    let s = require_string(&current, span)?;
+    if idx >= s.len() {
+        return Err(EvalErrorKind::Type {
+            expected: "valid string index".into(),
+            got: format!("index {idx} for string of length {}", s.len()),
+        }
+        .at(span));
+    }
+    let mut chars: Vec<char> = s.chars().collect();
+    chars[idx] = ch;
+    let new_s: String = chars.into_iter().collect();
+    env.set(&var_name, Value::SchemeString(new_s))
+        .map_err(|e| e.with_span(span))?;
+    Ok(Value::Nil)
 }

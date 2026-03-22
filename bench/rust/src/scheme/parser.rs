@@ -7,6 +7,7 @@ pub enum ExprKind {
     Boolean(bool),
     SchemeString(String),
     Symbol(String),
+    Char(char),
     List(Vec<Expr>),
 }
 
@@ -231,6 +232,23 @@ fn parse_atom(token: &str) -> Result<ExprKind, EvalError> {
     }
     if token == "#f" {
         return Ok(ExprKind::Boolean(false));
+    }
+
+    // Character literal
+    if let Some(rest) = token.strip_prefix("#\\") {
+        let ch = match rest {
+            "space" => ' ',
+            "newline" => '\n',
+            "tab" => '\t',
+            s if s.len() == 1 => s.chars().next().expect("single char"),
+            _ => {
+                return Err(EvalErrorKind::Parse {
+                    message: format!("invalid character literal: {token}"),
+                }
+                .into())
+            }
+        };
+        return Ok(ExprKind::Char(ch));
     }
 
     // String literal
