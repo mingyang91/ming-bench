@@ -2,6 +2,7 @@ package ming;
 
 import java.util.ArrayList;
 import java.util.HashMap;
+import java.util.IdentityHashMap;
 import java.util.List;
 import java.util.Map;
 
@@ -19,6 +20,13 @@ public class Evaluator {
     record BuiltinVal(String name) implements SchemeVal {}
 
     private static final SchemeVal VOID = new VoidVal();
+
+    // ---- Source positions ----
+    record SourcePos(int line, int col) {}
+    record Token(String text, int line, int col) {}
+
+    private IdentityHashMap<SchemeVal, SourcePos> posMap;
+    private SourcePos currentPos;
 
     // ---- Environment ----
     static class Env {
@@ -49,37 +57,56 @@ public class Evaluator {
     }
 
     // ---- Tokenizer ----
-    private static List<String> tokenize(String input) {
-        List<String> tokens = new ArrayList<>();
+    private static List<Token> tokenize(String input) {
+        List<Token> tokens = new ArrayList<>();
         int i = 0;
+        int line = 1, col = 1;
         while (i < input.length()) {
             char c = input.charAt(i);
-            if (Character.isWhitespace(c)) {
+            if (c == '\n') {
                 i++;
+                line++;
+                col = 1;
+            } else if (Character.isWhitespace(c)) {
+                i++;
+                col++;
             } else if (c == ';') {
-                while (i < input.length() && input.charAt(i) != '\n') i++;
+                while (i < input.length() && input.charAt(i) != '\n') { i++; col++; }
             } else if (c == '(') {
-                tokens.add("(");
+                tokens.add(new Token("(", line, col));
                 i++;
+                col++;
             } else if (c == ')') {
-                tokens.add(")");
+                tokens.add(new Token(")", line, col));
                 i++;
+                col++;
             } else if (c == '\'') {
-                tokens.add("'");
+                tokens.add(new Token("'", line, col));
                 i++;
+                col++;
             } else if (c == '"') {
+                int startCol = col;
                 StringBuilder sb = new StringBuilder();
                 sb.append('"');
                 i++;
+                col++;
                 while (i < input.length() && input.charAt(i) != '"') {
                     if (input.charAt(i) == '\\') {
                         sb.append(input.charAt(i));
                         i++;
+                        col++;
                         if (i < input.length()) {
                             sb.append(input.charAt(i));
                             i++;
+                            col++;
                         }
                     } else {
+                        if (input.charAt(i) == '\n') {
+                            line++;
+                            col = 1;
+                        } else {
+                            col++;
+                        }
                         sb.append(input.charAt(i));
                         i++;
                     }
@@ -87,51 +114,62 @@ public class Evaluator {
                 if (i < input.length()) {
                     sb.append('"');
                     i++;
+                    col++;
                 }
-                tokens.add(sb.toString());
+                tokens.add(new Token(sb.toString(), line, startCol));
             } else {
+                int startCol = col;
                 StringBuilder sb = new StringBuilder();
                 while (i < input.length() && !Character.isWhitespace(input.charAt(i))
                         && input.charAt(i) != '(' && input.charAt(i) != ')'
                         && input.charAt(i) != '"' && input.charAt(i) != ';') {
                     sb.append(input.charAt(i));
                     i++;
+                    col++;
                 }
-                tokens.add(sb.toString());
+                tokens.add(new Token(sb.toString(), line, startCol));
             }
         }
         return tokens;
     }
 
     // ---- Parser ----
-    private static SchemeVal parse(List<String> tokens, int[] pos) throws EvalError {
+    private SchemeVal parse(List<Token> tokens, int[] pos) throws EvalError {
         if (pos[0] >= tokens.size()) {
             throw new EvalError("unexpected end of input");
         }
-        String token = tokens.get(pos[0]);
-        if (token.equals("'")) {
+        Token token = tokens.get(pos[0]);
+        if (token.text().equals("'")) {
             pos[0]++;
             SchemeVal quoted = parse(tokens, pos);
             List<SchemeVal> quoteExpr = new ArrayList<>();
-            quoteExpr.add(new SymbolVal("quote"));
+            SymbolVal quoteSym = new SymbolVal("quote");
+            quoteExpr.add(quoteSym);
             quoteExpr.add(quoted);
-            return new ListVal(quoteExpr);
-        } else if (token.equals("(")) {
+            ListVal result = new ListVal(quoteExpr);
+            posMap.put(quoteSym, new SourcePos(token.line(), token.col()));
+            posMap.put(result, new SourcePos(token.line(), token.col()));
+            return result;
+        } else if (token.text().equals("(")) {
             pos[0]++;
             List<SchemeVal> elems = new ArrayList<>();
-            while (pos[0] < tokens.size() && !tokens.get(pos[0]).equals(")")) {
+            while (pos[0] < tokens.size() && !tokens.get(pos[0]).text().equals(")")) {
                 elems.add(parse(tokens, pos));
             }
             if (pos[0] >= tokens.size()) {
                 throw new EvalError("missing closing parenthesis");
             }
             pos[0]++;
-            return new ListVal(elems);
-        } else if (token.equals(")")) {
+            ListVal result = new ListVal(elems);
+            posMap.put(result, new SourcePos(token.line(), token.col()));
+            return result;
+        } else if (token.text().equals(")")) {
             throw new EvalError("unexpected )");
         } else {
             pos[0]++;
-            return parseAtom(token);
+            SchemeVal result = parseAtom(token.text());
+            posMap.put(result, new SourcePos(token.line(), token.col()));
+            return result;
         }
     }
 
@@ -151,8 +189,34 @@ public class Evaluator {
         }
     }
 
+    // ---- Error helper ----
+    private EvalError posError(String msg, SourcePos pos) {
+        if (pos != null) {
+            return new EvalError(msg + " at " + pos.line() + ":" + pos.col());
+        }
+        return new EvalError(msg);
+    }
+
+    private static boolean hasPosition(EvalError e) {
+        return e.getMessage().matches(".*\\d+:\\d+.*");
+    }
+
     // ---- Evaluator ----
     private SchemeVal eval(SchemeVal expr, Env env) throws EvalError {
+        SourcePos pos = posMap != null ? posMap.get(expr) : null;
+        if (pos != null) currentPos = pos;
+        SourcePos savedPos = currentPos;
+        try {
+            return evalInner(expr, env);
+        } catch (EvalError e) {
+            if (savedPos != null && !hasPosition(e)) {
+                throw posError(e.getMessage(), savedPos);
+            }
+            throw e;
+        }
+    }
+
+    private SchemeVal evalInner(SchemeVal expr, Env env) throws EvalError {
         return switch (expr) {
             case IntVal v -> v;
             case BoolVal v -> v;
@@ -549,28 +613,18 @@ public class Evaluator {
 
     // ---- Public API ----
     public String evalStr(String input) throws EvalError {
-        List<String> tokens = tokenize(input);
+        List<Token> tokens = tokenize(input);
         if (tokens.isEmpty()) throw new EvalError("empty input");
 
+        posMap = new IdentityHashMap<>();
+        currentPos = null;
         Env env = makeGlobalEnv();
         int[] pos = {0};
         SchemeVal result = null;
-        SchemeVal lastNonVoid = null;
         while (pos[0] < tokens.size()) {
             result = eval(parse(tokens, pos), env);
-            if (!(result instanceof VoidVal)) {
-                lastNonVoid = result;
-            }
         }
         if (result == null) throw new EvalError("empty input");
-        // If the last expression was void but there was a non-void before, return that?
-        // No — spec says return last result. But void define followed by expr returns expr.
-        // Actually: multiple exprs, return last. If last is void, still return void display.
-        // But "(define x 5) x" → "5" means we eval both, last is x=5.
-        // The result var already tracks the last expression result correctly.
-        if (lastNonVoid != null && result instanceof VoidVal) {
-            // This shouldn't happen for well-formed programs — if define is last, return void
-        }
         return display(result);
     }
 
