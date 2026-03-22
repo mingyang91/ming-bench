@@ -201,6 +201,48 @@ function arrayToList(arr) {
     }
     return result;
 }
+// --- Parameter parsing (dot notation) ---
+function parseParamList(elements, pos) {
+    const dotIdx = elements.findIndex(e => e.tag === 'symbol' && e.value === '.');
+    if (dotIdx === -1) {
+        return { params: elements.map(p => {
+                if (p.tag !== 'symbol')
+                    throw new EvalError(`${posStr(pos)}: parameter must be a symbol`);
+                return p.value;
+            }) };
+    }
+    if (dotIdx !== elements.length - 2)
+        throw new EvalError(`${posStr(pos)}: invalid dot in parameter list`);
+    const last = elements[elements.length - 1];
+    if (last.tag !== 'symbol')
+        throw new EvalError(`${posStr(pos)}: rest parameter must be a symbol`);
+    const params = elements.slice(0, dotIdx).map(p => {
+        if (p.tag !== 'symbol')
+            throw new EvalError(`${posStr(pos)}: parameter must be a symbol`);
+        return p.value;
+    });
+    return { params, restParam: last.value };
+}
+function applyLambda(proc, args, pos) {
+    if (proc.restParam) {
+        if (args.length < proc.params.length) {
+            throw new EvalError(`${posStr(pos)}: expected at least ${proc.params.length} arguments, got ${args.length}`);
+        }
+    }
+    else {
+        if (args.length !== proc.params.length) {
+            throw new EvalError(`${posStr(pos)}: expected ${proc.params.length} arguments, got ${args.length}`);
+        }
+    }
+    const callEnv = makeEnv(proc.env);
+    for (let i = 0; i < proc.params.length; i++) {
+        envDefine(callEnv, proc.params[i], args[i]);
+    }
+    if (proc.restParam) {
+        envDefine(callEnv, proc.restParam, arrayToList(args.slice(proc.params.length)));
+    }
+    return callEnv;
+}
 // --- Evaluator ---
 function isTruthy(val) {
     return !(val.tag === 'boolean' && val.value === false);
@@ -252,13 +294,9 @@ function evalExpr(expr, env) {
                             }
                             if (target.tag === 'list' && target.elements.length >= 1 && target.elements[0].tag === 'symbol') {
                                 const name = target.elements[0].value;
-                                const params = target.elements.slice(1).map(p => {
-                                    if (p.tag !== 'symbol')
-                                        throw new EvalError(`${posStr(expr.pos)}: define: parameter must be a symbol`);
-                                    return p.value;
-                                });
+                                const { params: defParams, restParam: defRest } = parseParamList(target.elements.slice(1), expr.pos);
                                 const body = elems.slice(2);
-                                const lambda = { tag: 'lambda', params, body, env, pos: expr.pos };
+                                const lambda = { tag: 'lambda', params: defParams, restParam: defRest, body, env, pos: expr.pos };
                                 envDefine(env, name, lambda);
                                 return { tag: 'void' };
                             }
@@ -268,15 +306,16 @@ function evalExpr(expr, env) {
                             if (elems.length < 3)
                                 throw new EvalError(`${posStr(expr.pos)}: lambda: expected at least 2 arguments`);
                             const paramList = elems[1];
+                            if (paramList.tag === 'symbol') {
+                                // (lambda args body...) - all args as rest
+                                const body = elems.slice(2);
+                                return { tag: 'lambda', params: [], restParam: paramList.value, body, env, pos: expr.pos };
+                            }
                             if (paramList.tag !== 'list')
                                 throw new EvalError(`${posStr(expr.pos)}: lambda: parameters must be a list`);
-                            const params = paramList.elements.map(p => {
-                                if (p.tag !== 'symbol')
-                                    throw new EvalError(`${posStr(expr.pos)}: lambda: parameter must be a symbol`);
-                                return p.value;
-                            });
+                            const { params: lamParams, restParam: lamRest } = parseParamList(paramList.elements, expr.pos);
                             const body = elems.slice(2);
-                            return { tag: 'lambda', params, body, env, pos: expr.pos };
+                            return { tag: 'lambda', params: lamParams, restParam: lamRest, body, env, pos: expr.pos };
                         }
                         case 'and': {
                             const andExprs = elems.slice(1);
@@ -417,13 +456,7 @@ function evalExpr(expr, env) {
                 }
                 if (proc.tag === 'lambda') {
                     const args = elems.slice(1).map(e => evalExpr(e, env));
-                    if (args.length !== proc.params.length) {
-                        throw new EvalError(`${posStr(expr.pos)}: expected ${proc.params.length} arguments, got ${args.length}`);
-                    }
-                    const callEnv = makeEnv(proc.env);
-                    for (let i = 0; i < proc.params.length; i++) {
-                        envDefine(callEnv, proc.params[i], args[i]);
-                    }
+                    const callEnv = applyLambda(proc, args, expr.pos);
                     for (let i = 0; i < proc.body.length - 1; i++) {
                         evalExpr(proc.body[i], callEnv);
                     }
@@ -562,6 +595,27 @@ function makeGlobalEnv() {
         return { tag: 'number', value: elems.length };
     });
     defBuiltin('append', args => schemeAppend(args));
+    defBuiltin('apply', args => {
+        if (args.length < 2)
+            throw new EvalError('apply: expected at least 2 arguments');
+        const proc = args[0];
+        const lastArg = args[args.length - 1];
+        const tailArgs = listToArray(lastArg);
+        const prefixArgs = args.slice(1, -1);
+        const allArgs = [...prefixArgs, ...tailArgs];
+        if (proc.tag === 'builtin') {
+            return proc.fn(allArgs);
+        }
+        if (proc.tag === 'lambda') {
+            const callEnv = applyLambda(proc, allArgs);
+            let result = { tag: 'void' };
+            for (const bodyExpr of proc.body) {
+                result = evalExpr(bodyExpr, callEnv);
+            }
+            return result;
+        }
+        throw new EvalError('apply: first argument must be a procedure');
+    });
     // Type predicates
     defBuiltin('string?', args => {
         if (args.length !== 1)
