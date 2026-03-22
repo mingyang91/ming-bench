@@ -263,8 +263,7 @@ private[ming] object KontApply:
     if lists.isEmpty then ReturnS(SchemeList(Nil), k, out)
     else
       val len = lists.head.length
-      if !lists.tail.forall(_.length == len) then
-        throw new EvalError("map: lists must have same length")
+      if !lists.tail.forall(_.length == len) then throw new EvalError("map: lists must have same length")
       if len == 0 then ReturnS(SchemeList(Nil), k, out)
       else
         val groups = (0 until len).toList.map(i => lists.map(_(i)))

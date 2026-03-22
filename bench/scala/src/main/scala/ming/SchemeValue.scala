@@ -71,6 +71,7 @@ object SchemeValue:
     def display: String = s"#<procedure:$name>"
 
   case class SchemeChar(value: Char) extends SchemeValue:
+
     def display: String = value match
       case ' '  => "#\\space"
       case '\n' => "#\\newline"
@@ -92,6 +93,7 @@ object SchemeValue:
     def display: String = "#<macro>"
 
   case class SchemePair(car: SchemeValue, cdr: SchemeValue) extends SchemeValue:
+
     def display: String =
       val carStr = car.display
       cdr match
@@ -104,7 +106,7 @@ object SchemeValue:
       case SchemePair(a, SchemeList(Nil)) => a.display
       case SchemePair(a, d: SchemePair)   => s"${a.display} ${pairTail(d)}"
       case SchemePair(a, d)               => s"${a.display} . ${d.display}"
-      case _                               => s". ${v.display}"
+      case _                              => s". ${v.display}"
 
   class SchemeResolvedSymbol(
     val name: String,
