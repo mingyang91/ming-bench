@@ -51,6 +51,18 @@ function envDefine(env: Env, name: string, val: SchemeVal): void {
   env.bindings.set(name, val);
 }
 
+function envSet(env: Env, name: string, val: SchemeVal, p?: Pos): void {
+  let cur: Env | null = env;
+  while (cur) {
+    if (cur.bindings.has(name)) {
+      cur.bindings.set(name, val);
+      return;
+    }
+    cur = cur.parent;
+  }
+  throw new EvalError(`${posStr(p)}: set!: unbound variable: ${name}`);
+}
+
 // --- Tokenizer ---
 
 interface Token { text: string; pos: Pos }
@@ -348,6 +360,14 @@ function evalExpr(expr: SchemeVal, env: Env): SchemeVal {
               evalExpr(body[i], letEnv);
             }
             expr = body[body.length - 1]; env = letEnv; continue; // TCO
+          }
+          case 'set!': {
+            if (elems.length !== 3) throw new EvalError(`${posStr(expr.pos)}: set!: expected 2 arguments`);
+            const target = elems[1];
+            if (target.tag !== 'symbol') throw new EvalError(`${posStr(expr.pos)}: set!: expected symbol`);
+            const val = evalExpr(elems[2], env);
+            envSet(env, target.value, val, expr.pos);
+            return { tag: 'void' };
           }
           case 'begin': {
             const bodyExprs = elems.slice(1);
