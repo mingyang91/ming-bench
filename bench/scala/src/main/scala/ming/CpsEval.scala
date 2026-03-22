@@ -233,6 +233,10 @@ object CpsEval:
           case "apply" => CpsApply.handleApplyK(args, callingEnv, out, k)
           case "call/cc" | "call-with-current-continuation" =>
             CpsApply.handleCallCCAsValue(args, callingEnv, out, k, pos)
+          case "map" =>
+            CpsApply.handleMapK(args, callingEnv, out, k)
+          case "for-each" =>
+            CpsApply.handleForEachK(args, callingEnv, out, k)
           case _ =>
             val (rv, builtinOut) = Builtins.applyBuiltin(name, args)
             out(0) = out(0) + builtinOut

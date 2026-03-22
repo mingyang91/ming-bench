@@ -65,7 +65,44 @@ object Evaluator:
     "char?",
     "apply",
     "call/cc",
-    "call-with-current-continuation"
+    "call-with-current-continuation",
+    // L13: equality
+    "eq?",
+    "eqv?",
+    "equal?",
+    // L13: numeric
+    "abs",
+    "modulo",
+    "remainder",
+    "quotient",
+    "min",
+    "max",
+    "expt",
+    "zero?",
+    "positive?",
+    "negative?",
+    "odd?",
+    "even?",
+    // L13: list
+    "list-ref",
+    "list-tail",
+    "list?",
+    "assoc",
+    "map",
+    "for-each",
+    // L13: char
+    "char-alphabetic?",
+    "char-numeric?",
+    "char-upcase",
+    "char-downcase",
+    "char=?",
+    "char<?",
+    // L13: string
+    "string=?",
+    "string<?",
+    "string-ci=?",
+    "string-upcase",
+    "string-downcase"
   )
 
   private val builtinEnv: Map[String, SchemeValue] =
