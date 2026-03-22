@@ -30,6 +30,7 @@ var specialForms = map[string]bool{
 	"define": true, "quote": true, "lambda": true, "cond": true,
 	"and": true, "or": true, "define-syntax": true, "syntax-rules": true,
 	"letrec": true, "let*": true, "do": true, "case": true,
+	"guard": true,
 }
 
 // parseSyntaxRules parses (syntax-rules (literals...) (pattern template) ...).

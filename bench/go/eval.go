@@ -15,6 +15,11 @@ type continuationJump struct {
 	callExpr  *Expr // the call/cc expression that created this continuation
 }
 
+// schemeException is the panic value used for raise.
+type schemeException struct {
+	value *Value
+}
+
 var contIDCounter int64
 
 func Eval(expr *Expr, env *Env) (*Value, error) {
@@ -171,6 +176,9 @@ func evalListTCO(expr *Expr, env *Env) (*Expr, *Env, *Value, error, bool) {
 			return nil, nil, v, nil, false
 		case "define-syntax":
 			v, err := evalDefineSyntax(expr, env)
+			return nil, nil, v, err, false
+		case "guard":
+			v, err := evalGuard(expr, env)
 			return nil, nil, v, err, false
 		}
 
@@ -447,6 +455,10 @@ func applyBuiltin(name string, args []*Value, expr *Expr, env *Env) (*Value, err
 		return builtinCallCC(args, expr, env)
 	case "dynamic-wind":
 		return builtinDynamicWind(args, expr, env)
+	case "raise":
+		return builtinRaise(args, expr)
+	case "with-exception-handler":
+		return builtinWithExceptionHandler(args, expr, env)
 	case "equal?":
 		if len(args) != 2 {
 			return nil, errAtf(expr, "equal?: expected 2 arguments, got %d", len(args))
@@ -944,17 +956,21 @@ func builtinDynamicWind(args []*Value, expr *Expr, env *Env) (*Value, error) {
 		return nil, err
 	}
 
-	// Call body-thunk, catching continuation jumps so out-thunk always runs
+	// Call body-thunk, catching continuation/exception jumps so out-thunk always runs
 	var result *Value
 	var bodyErr error
 	var jump *continuationJump
+	var exc *schemeException
 
 	func() {
 		defer func() {
 			if r := recover(); r != nil {
-				if j, ok := r.(continuationJump); ok {
+				switch j := r.(type) {
+				case continuationJump:
 					jump = &j
-				} else {
+				case schemeException:
+					exc = &j
+				default:
 					panic(r)
 				}
 			}
@@ -962,14 +978,17 @@ func builtinDynamicWind(args []*Value, expr *Expr, env *Env) (*Value, error) {
 		result, bodyErr = callThunk(bodyThunk)
 	}()
 
-	// Out-thunk runs whether body completed normally or via continuation jump
+	// Out-thunk runs whether body completed normally or via jump
 	if _, err := callThunk(outThunk); err != nil {
 		return nil, err
 	}
 
-	// Re-panic after out-thunk if body exited via continuation jump
+	// Re-panic after out-thunk
 	if jump != nil {
 		panic(*jump)
+	}
+	if exc != nil {
+		panic(*exc)
 	}
 
 	if bodyErr != nil {
@@ -977,6 +996,175 @@ func builtinDynamicWind(args []*Value, expr *Expr, env *Env) (*Value, error) {
 	}
 
 	return result, nil
+}
+
+func builtinRaise(args []*Value, expr *Expr) (*Value, error) {
+	if len(args) != 1 {
+		return nil, errAtf(expr, "raise: expected 1 argument, got %d", len(args))
+	}
+	panic(schemeException{value: args[0]})
+}
+
+func builtinWithExceptionHandler(args []*Value, expr *Expr, env *Env) (*Value, error) {
+	if len(args) != 2 {
+		return nil, errAtf(expr, "with-exception-handler: expected 2 arguments, got %d", len(args))
+	}
+	handler := args[0]
+	thunk := args[1]
+
+	var result *Value
+	var evalErr error
+	var cjump *continuationJump
+
+	func() {
+		defer func() {
+			if r := recover(); r != nil {
+				switch exc := r.(type) {
+				case schemeException:
+					// Call the handler with the exception value
+					te, tenv, v, err, isTail := applyFuncTCO(handler, []*Value{exc.value}, expr, env)
+					if err != nil {
+						evalErr = err
+						return
+					}
+					if isTail {
+						result, evalErr = Eval(te, tenv)
+					} else {
+						result = v
+					}
+				case continuationJump:
+					cjump = &exc
+				default:
+					panic(r)
+				}
+			}
+		}()
+
+		te, tenv, v, err, isTail := applyFuncTCO(thunk, []*Value{}, expr, env)
+		if err != nil {
+			evalErr = err
+			return
+		}
+		if isTail {
+			result, evalErr = Eval(te, tenv)
+		} else {
+			result = v
+		}
+	}()
+
+	if cjump != nil {
+		panic(*cjump)
+	}
+
+	return result, evalErr
+}
+
+// evalGuard implements (guard (var clause ...) body ...)
+func evalGuard(expr *Expr, env *Env) (*Value, error) {
+	// (guard (var clause1 clause2 ...) body ...)
+	if len(expr.List) < 3 {
+		return nil, errAt(expr, "guard: bad syntax")
+	}
+	clauseList := expr.List[1]
+	if clauseList.Type != ExprList || len(clauseList.List) < 2 {
+		return nil, errAt(expr, "guard: bad syntax")
+	}
+	varSym := clauseList.List[0]
+	if varSym.Type != ExprSymbol {
+		return nil, errAt(expr, "guard: variable must be a symbol")
+	}
+	clauses := clauseList.List[1:]
+	body := expr.List[2:]
+
+	// Evaluate body, catching schemeException
+	var result *Value
+	var bodyErr error
+	var caught *schemeException
+	var cjump *continuationJump
+
+	func() {
+		defer func() {
+			if r := recover(); r != nil {
+				switch exc := r.(type) {
+				case schemeException:
+					caught = &exc
+				case continuationJump:
+					cjump = &exc
+				default:
+					panic(r)
+				}
+			}
+		}()
+
+		// Evaluate body expressions
+		for i, b := range body {
+			result, bodyErr = Eval(b, env)
+			if bodyErr != nil {
+				return
+			}
+			_ = i
+		}
+	}()
+
+	if cjump != nil {
+		panic(*cjump)
+	}
+
+	if bodyErr != nil {
+		return nil, bodyErr
+	}
+
+	if caught == nil {
+		// No exception — return body result
+		return result, nil
+	}
+
+	// Exception was caught — bind var and test clauses
+	guardEnv := NewEnv(env)
+	guardEnv.Set(varSym.StrVal, caught.value)
+
+	for _, clause := range clauses {
+		if clause.Type != ExprList || len(clause.List) == 0 {
+			return nil, errAt(clause, "guard: bad clause")
+		}
+
+		// Check for else clause
+		if clause.List[0].Type == ExprSymbol && clause.List[0].StrVal == "else" {
+			// Evaluate else body
+			var val *Value
+			for _, e := range clause.List[1:] {
+				var err error
+				val, err = Eval(e, guardEnv)
+				if err != nil {
+					return nil, err
+				}
+			}
+			return val, nil
+		}
+
+		// Evaluate test
+		test, err := Eval(clause.List[0], guardEnv)
+		if err != nil {
+			return nil, err
+		}
+		if test.IsTruthy() {
+			// Evaluate clause body (or return test if no body)
+			if len(clause.List) == 1 {
+				return test, nil
+			}
+			var val *Value
+			for _, e := range clause.List[1:] {
+				val, err = Eval(e, guardEnv)
+				if err != nil {
+					return nil, err
+				}
+			}
+			return val, nil
+		}
+	}
+
+	// No clause matched — re-raise
+	panic(schemeException{value: caught.value})
 }
 
 func builtinAdd(args []*Value, expr *Expr) (*Value, error) {
@@ -1723,7 +1911,8 @@ func makeDefaultEnv() *Env {
 		"string-upcase", "string-downcase",
 		"vector", "make-vector", "vector-ref", "vector-set!", "vector-length", "vector?",
 		"vector->list", "list->vector",
-		"dynamic-wind"}
+		"dynamic-wind",
+		"raise", "with-exception-handler"}
 	for _, name := range builtins {
 		env.Set(name, &Value{Type: TypeSymbol, StrVal: fmt.Sprintf("__builtin:%s", name)})
 	}
