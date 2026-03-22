@@ -3,11 +3,15 @@ package ming
 /** Immutable environment with lexical scoping. */
 final case class Environment(
   bindings: Map[String, SchemeValue],
-  parent: Option[Environment]
+  parent: Option[Environment],
+  fallback: Option[Environment] = None
 ):
 
   def lookup(name: String): Option[SchemeValue] =
-    bindings.get(name).orElse(parent.flatMap(_.lookup(name)))
+    bindings
+      .get(name)
+      .orElse(parent.flatMap(_.lookup(name)))
+      .orElse(fallback.flatMap(_.lookup(name)))
 
   def define(name: String, value: SchemeValue): Environment =
     copy(bindings = bindings + (name -> value))

@@ -7,29 +7,47 @@ object Interpreter:
 
   import SchemeValue.*
 
+  private[ming] enum EvalResult:
+    case Done(value: SchemeValue, env: Environment, output: String)
+    case Bounce(expr: SchemeValue, env: Environment, output: String)
+
   /** Recursively strip all SchemeLocated wrappers from a value. */
   private def strip(v: SchemeValue): SchemeValue = v match
     case SchemeLocated(inner, _, _) => strip(inner)
     case SchemeList(elems)          => SchemeList(elems.map(strip))
     case other                      => other
 
-  /** Evaluate an expression, returning the result, environment, and output.
-    */
+  private[ming] def prependOut(r: EvalResult, prefix: String): EvalResult =
+    if prefix.isEmpty then r
+    else
+      r match
+        case EvalResult.Done(v, e, o)   => EvalResult.Done(v, e, prefix + o)
+        case EvalResult.Bounce(x, e, o) => EvalResult.Bounce(x, e, prefix + o)
+
+  /** Evaluate an expression, returning the result, environment, and output. */
   def eval(
     expr: SchemeValue,
     env: Environment
   ): (SchemeValue, Environment, String) =
+    @tailrec
+    def trampoline(result: EvalResult, accOut: String): (SchemeValue, Environment, String) =
+      result match
+        case EvalResult.Done(v, e, o) => (v, e, accOut + o)
+        case EvalResult.Bounce(nextExpr, nextEnv, o) =>
+          trampoline(evalStep(nextExpr, nextEnv), accOut + o)
+    trampoline(evalStep(expr, env), "")
+
+  /** One evaluation step — may return Bounce for tail-position expressions. */
+  private def evalStep(
+    expr: SchemeValue,
+    env: Environment
+  ): EvalResult =
     expr match
-      case SchemeInt(_)           => (expr, env, "")
-      case SchemeBool(_)          => (expr, env, "")
-      case SchemeString(_)        => (expr, env, "")
-      case _: SchemeMutableString => (expr, env, "")
-      case SchemeNil              => (expr, env, "")
-      case SchemeVoid             => (expr, env, "")
-      case _: SchemeLambda        => (expr, env, "")
-      case SchemeChar(_)          => (expr, env, "")
+      case SchemeInt(_) | SchemeBool(_) | SchemeString(_) | _: SchemeMutableString | SchemeNil | SchemeVoid |
+          _: SchemeLambda | SchemeChar(_) =>
+        EvalResult.Done(expr, env, "")
       case SchemeLocated(inner, line, col) =>
-        try eval(inner, env)
+        try evalStep(inner, env)
         catch
           case e: EvalError if !e.hasPosition =>
             throw new EvalError(
@@ -38,48 +56,79 @@ object Interpreter:
             )
       case SchemeSymbol(name) =>
         env.lookup(name) match
-          case Some(v) => (v, env, "")
+          case Some(v) => EvalResult.Done(v, env, "")
           case None =>
             throw new EvalError(s"unbound variable: $name")
-      case SchemeList(elements) => evalList(elements.map(strip), env)
+      case SchemeList(elements) => evalListStep(elements.map(strip), env)
 
-  private def evalList(
+  private def evalListStep(
     elements: List[SchemeValue],
     env: Environment
-  ): (SchemeValue, Environment, String) =
+  ): EvalResult =
     elements match
-      case Nil                            => (SchemeNil, env, "")
-      case SchemeSymbol("define") :: rest => evalDefine(rest, env)
-      case SchemeSymbol("if") :: rest     => evalIf(rest, env)
-      case SchemeSymbol("quote") :: rest  => (evalQuote(rest), env, "")
-      case SchemeSymbol("and") :: args =>
-        val (v, o) = evalAnd(args, env)
-        (v, env, o)
-      case SchemeSymbol("or") :: args =>
-        val (v, o) = evalOr(args, env)
-        (v, env, o)
+      case Nil                            => EvalResult.Done(SchemeNil, env, "")
+      case SchemeSymbol("define") :: rest => evalDefineStep(rest, env)
+      case SchemeSymbol("if") :: rest     => evalIfStep(rest, env)
+      case SchemeSymbol("quote") :: rest  => EvalResult.Done(evalQuote(rest), env, "")
+      case SchemeSymbol("and") :: args    => evalAndStep(args, env)
+      case SchemeSymbol("or") :: args     => evalOrStep(args, env)
       case SchemeSymbol("lambda") :: rest =>
-        (evalLambda(rest, env), env, "")
-      case SchemeSymbol("let") :: rest   => evalLet(rest, env)
-      case SchemeSymbol("begin") :: rest => evalBegin(rest, env, "")
-      case SchemeSymbol("cond") :: rest  => evalCond(rest, env, "")
+        EvalResult.Done(evalLambda(rest, env), env, "")
+      case SchemeSymbol("let") :: rest   => SpecialForms.evalLetStep(rest, env)
+      case SchemeSymbol("begin") :: rest => evalBeginStep(rest, env, "")
+      case SchemeSymbol("cond") :: rest  => SpecialForms.evalCondStep(rest, env, "")
       case head :: args =>
         val (func, _, funcOut)       = eval(head, env)
         val (evaluatedArgs, argsOut) = evalArgs(args, env)
-        val (result, resultOut)      = Builtins.applyProc(func, evaluatedArgs)
-        (result, env, funcOut + argsOut + resultOut)
+        applyProcStep(func, evaluatedArgs, env, funcOut + argsOut)
 
-  private def evalDefine(
+  private[ming] def applyProcStep(
+    func: SchemeValue,
+    args: List[SchemeValue],
+    callerEnv: Environment,
+    prefixOut: String
+  ): EvalResult =
+    func match
+      case lam @ SchemeLambda(params, body, closure, nameOpt) =>
+        if params.length != args.length then
+          throw new EvalError(
+            s"expected ${params.length} args, got ${args.length}"
+          )
+        val closureWithSelf = nameOpt match
+          case Some(n) => closure.define(n, lam)
+          case None    => closure
+        val innerEnv = closureWithSelf
+          .extend(params, args)
+          .copy(fallback = Some(callerEnv))
+        evalBodyBounce(body, innerEnv, prefixOut)
+      case _ =>
+        val (result, resultOut) = Builtins.applyProc(func, args)
+        EvalResult.Done(result, callerEnv, prefixOut + resultOut)
+
+  @tailrec
+  private[ming] def evalBodyBounce(
+    body: List[SchemeValue],
+    env: Environment,
+    accOut: String
+  ): EvalResult =
+    body match
+      case Nil         => EvalResult.Done(SchemeVoid, env, accOut)
+      case last :: Nil => EvalResult.Bounce(last, env, accOut)
+      case head :: tail =>
+        val (_, newEnv, o) = eval(head, env)
+        evalBodyBounce(tail, newEnv, accOut + o)
+
+  private def evalDefineStep(
     args: List[SchemeValue],
     env: Environment
-  ): (SchemeValue, Environment, String) =
+  ): EvalResult =
     args match
       case SchemeList(SchemeSymbol(name) :: params) :: body =>
         val paramNames = extractParamNames(params)
         val lambda =
           SchemeLambda(paramNames, body, env, Some(name))
         val newEnv = env.define(name, lambda)
-        (SchemeVoid, newEnv, "")
+        EvalResult.Done(SchemeVoid, newEnv, "")
       case SchemeSymbol(name) :: valueExpr :: Nil =>
         val (value, _, out) = eval(valueExpr, env)
         val named = value match
@@ -87,7 +136,7 @@ object Interpreter:
             SchemeLambda(p, b, c, Some(name))
           case other => other
         val newEnv = env.define(name, named)
-        (SchemeVoid, newEnv, out)
+        EvalResult.Done(SchemeVoid, newEnv, out)
       case _ =>
         throw new EvalError("bad define syntax")
 
@@ -102,10 +151,11 @@ object Interpreter:
         )
     }
 
-  private def evalIf(
+  /** If: evaluate condition, then bounce into the chosen branch. */
+  private def evalIfStep(
     args: List[SchemeValue],
     env: Environment
-  ): (SchemeValue, Environment, String) =
+  ): EvalResult =
     args match
       case cond :: thenBranch :: elseBranch =>
         val (condVal, _, condOut) = eval(cond, env)
@@ -115,14 +165,11 @@ object Interpreter:
         if isFalse then
           elseBranch match
             case elseExpr :: Nil =>
-              val (v, _, o) = eval(elseExpr, env)
-              (v, env, condOut + o)
-            case Nil => (SchemeVoid, env, condOut)
+              prependOut(evalStep(elseExpr, env), condOut)
+            case Nil => EvalResult.Done(SchemeVoid, env, condOut)
             case _ =>
               throw new EvalError("if: too many arguments")
-        else
-          val (v, _, o) = eval(thenBranch, env)
-          (v, env, condOut + o)
+        else prependOut(evalStep(thenBranch, env), condOut)
       case _ =>
         throw new EvalError("if requires at least 2 arguments")
 
@@ -132,39 +179,37 @@ object Interpreter:
       case _ =>
         throw new EvalError("quote expects exactly 1 argument")
 
-  private def evalAnd(
+  /** And: short-circuit, tail-call last argument. */
+  private def evalAndStep(
     args: List[SchemeValue],
     env: Environment
-  ): (SchemeValue, String) =
+  ): EvalResult =
     args match
-      case Nil => (SchemeBool(true), "")
+      case Nil => EvalResult.Done(SchemeBool(true), env, "")
       case last :: Nil =>
-        val (v, _, o) = eval(last, env)
-        (v, o)
+        evalStep(last, env)
       case head :: tail =>
         val (v, _, o) = eval(head, env)
         v match
-          case SchemeBool(false) => (SchemeBool(false), o)
+          case SchemeBool(false) => EvalResult.Done(SchemeBool(false), env, o)
           case _ =>
-            val (result, tailOut) = evalAnd(tail, env)
-            (result, o + tailOut)
+            prependOut(evalAndStep(tail, env), o)
 
-  private def evalOr(
+  /** Or: short-circuit, tail-call last argument. */
+  private def evalOrStep(
     args: List[SchemeValue],
     env: Environment
-  ): (SchemeValue, String) =
+  ): EvalResult =
     args match
-      case Nil => (SchemeBool(false), "")
+      case Nil => EvalResult.Done(SchemeBool(false), env, "")
       case last :: Nil =>
-        val (v, _, o) = eval(last, env)
-        (v, o)
+        evalStep(last, env)
       case head :: tail =>
         val (result, _, o) = eval(head, env)
         result match
           case SchemeBool(false) =>
-            val (v, tailOut) = evalOr(tail, env)
-            (v, o + tailOut)
-          case _ => (result, o)
+            prependOut(evalOrStep(tail, env), o)
+          case _ => EvalResult.Done(result, env, o)
 
   private def evalLambda(
     args: List[SchemeValue],
@@ -176,73 +221,22 @@ object Interpreter:
         SchemeLambda(paramNames, body, env)
       case _ => throw new EvalError("bad lambda syntax")
 
-  private def evalLet(
-    args: List[SchemeValue],
-    env: Environment
-  ): (SchemeValue, Environment, String) =
-    args match
-      case SchemeList(bindings) :: body if body.nonEmpty =>
-        val (letEnv, bindOut) = bindings.foldLeft((env, "")) {
-          case ((acc, accOut), SchemeList(List(SchemeSymbol(name), expr))) =>
-            val (v, _, o) = eval(expr, env)
-            (acc.define(name, v), accOut + o)
-          case _ => throw new EvalError("bad let binding")
-        }
-        val (v, bodyOut) = evalBodyWithEnv(body, letEnv)
-        (v, env, bindOut + bodyOut)
-      case _ => throw new EvalError("bad let syntax")
-
-  private def evalBegin(
+  /** Begin: evaluate all-but-last, bounce last. */
+  @tailrec
+  private def evalBeginStep(
     exprs: List[SchemeValue],
     env: Environment,
     accOut: String
-  ): (SchemeValue, Environment, String) =
+  ): EvalResult =
     exprs match
-      case Nil => (SchemeVoid, env, accOut)
+      case Nil => EvalResult.Done(SchemeVoid, env, accOut)
       case last :: Nil =>
-        val (v, e, o) = eval(last, env)
-        (v, e, accOut + o)
+        prependOut(evalStep(last, env), accOut)
       case head :: tail =>
         val (_, newEnv, o) = eval(head, env)
-        evalBegin(tail, newEnv, accOut + o)
+        evalBeginStep(tail, newEnv, accOut + o)
 
-  @tailrec
-  private def evalCond(
-    clauses: List[SchemeValue],
-    env: Environment,
-    accOut: String
-  ): (SchemeValue, Environment, String) =
-    clauses match
-      case Nil => (SchemeVoid, env, accOut)
-      case SchemeList(SchemeSymbol("else") :: body) :: _ =>
-        val (v, o) = evalBody(body, env)
-        (v, env, accOut + o)
-      case SchemeList(test :: body) :: rest =>
-        val (testVal, _, testOut) = eval(test, env)
-        testVal match
-          case SchemeBool(false) =>
-            evalCond(rest, env, accOut + testOut)
-          case _ =>
-            if body.isEmpty then (testVal, env, accOut + testOut)
-            else
-              val (v, o) = evalBody(body, env)
-              (v, env, accOut + testOut + o)
-      case _ => throw new EvalError("bad cond syntax")
-
-  private def evalBodyWithEnv(
-    body: List[SchemeValue],
-    env: Environment
-  ): (SchemeValue, String) =
-    body match
-      case Nil => (SchemeVoid, "")
-      case last :: Nil =>
-        val (v, _, o) = eval(last, env)
-        (v, o)
-      case head :: tail =>
-        val (_, newEnv, o) = eval(head, env)
-        val (v, tailOut)   = evalBodyWithEnv(tail, newEnv)
-        (v, o + tailOut)
-
+  /** Evaluate a body (list of expressions) fully — no bouncing. Used by external callers. */
   def evalBody(
     body: List[SchemeValue],
     env: Environment
@@ -257,7 +251,7 @@ object Interpreter:
         val (v, tailOut)   = evalBody(tail, newEnv)
         (v, o + tailOut)
 
-  private def evalArgs(
+  private[ming] def evalArgs(
     args: List[SchemeValue],
     env: Environment
   ): (List[SchemeValue], String) =
