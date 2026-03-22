@@ -1,0 +1,1 @@
+(procedure? (case-lambda (() 0) ((x) x)))

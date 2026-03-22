@@ -1,5 +1,0 @@
-(define p (make-parameter 1))
-(= (parameterize ((p 2))
-     (parameterize ((p 3))
-       (p)))
-   3)

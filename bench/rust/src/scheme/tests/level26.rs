@@ -1,43 +1,43 @@
 use crate::scheme::eval_str;
 
-// ===== Level 26: let-values / receive =====
+// ===== Level 26: procedure? on all callable types =====
 
 #[test]
-fn test_l26_let_values_basic() {
+fn test_l26_procedure_lambda() {
     assert_eq!(
-        eval_str(include_str!("fixtures/l26_let_values_basic.scm").trim()),
-        Ok("6".into())
-    );
-}
-
-#[test]
-fn test_l26_let_values_multi() {
-    assert_eq!(
-        eval_str(include_str!("fixtures/l26_let_values_multi.scm").trim()),
+        eval_str(include_str!("fixtures/l26_procedure_lambda.scm").trim()),
         Ok("#t".into())
     );
 }
 
 #[test]
-fn test_l26_receive_basic() {
+fn test_l26_procedure_case_lambda() {
     assert_eq!(
-        eval_str(include_str!("fixtures/l26_receive_basic.scm").trim()),
-        Ok("(1 2 3)".into())
+        eval_str(include_str!("fixtures/l26_procedure_case_lambda.scm").trim()),
+        Ok("#t".into())
     );
 }
 
 #[test]
-fn test_l26_receive_rest() {
+fn test_l26_procedure_builtin() {
     assert_eq!(
-        eval_str(include_str!("fixtures/l26_receive_rest.scm").trim()),
-        Ok("(2 3)".into())
+        eval_str(include_str!("fixtures/l26_procedure_builtin.scm").trim()),
+        Ok("#t".into())
     );
 }
 
 #[test]
-fn test_l26_let_values_nested() {
+fn test_l26_procedure_continuation() {
     assert_eq!(
-        eval_str(include_str!("fixtures/l26_let_values_nested.scm").trim()),
+        eval_str(include_str!("fixtures/l26_procedure_continuation.scm").trim()),
+        Ok("#t".into())
+    );
+}
+
+#[test]
+fn test_l26_procedure_non_callable() {
+    assert_eq!(
+        eval_str(include_str!("fixtures/l26_procedure_non_callable.scm").trim()),
         Ok("#t".into())
     );
 }

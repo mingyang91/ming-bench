@@ -1,0 +1,1 @@
+(eq? (procedure-name (lambda (x) x)) #f)

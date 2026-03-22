@@ -1,43 +1,43 @@
 use crate::scheme::eval_str;
 
-// ===== Level 25: do loops =====
+// ===== Level 25: procedure-name =====
 
 #[test]
-fn test_l25_do_basic() {
+fn test_l25_procedure_name_define() {
     assert_eq!(
-        eval_str(include_str!("fixtures/l25_do_basic.scm").trim()),
-        Ok("10".into())
-    );
-}
-
-#[test]
-fn test_l25_do_parallel_step() {
-    assert_eq!(
-        eval_str(include_str!("fixtures/l25_do_parallel_step.scm").trim()),
+        eval_str(include_str!("fixtures/l25_procedure_name_define.scm").trim()),
         Ok("#t".into())
     );
 }
 
 #[test]
-fn test_l25_do_fibonacci() {
+fn test_l25_procedure_name_anonymous() {
     assert_eq!(
-        eval_str(include_str!("fixtures/l25_do_fibonacci.scm").trim()),
-        Ok("55".into())
+        eval_str(include_str!("fixtures/l25_procedure_name_anonymous.scm").trim()),
+        Ok("#t".into())
     );
 }
 
 #[test]
-fn test_l25_do_vector_fill() {
+fn test_l25_procedure_name_let() {
     assert_eq!(
-        eval_str(include_str!("fixtures/l25_do_vector_fill.scm").trim()),
-        Ok("#(0 1 4 9 16)".into())
+        eval_str(include_str!("fixtures/l25_procedure_name_let.scm").trim()),
+        Ok("#t".into())
     );
 }
 
 #[test]
-fn test_l25_do_no_step() {
+fn test_l25_procedure_name_case_lambda() {
     assert_eq!(
-        eval_str(include_str!("fixtures/l25_do_no_step.scm").trim()),
+        eval_str(include_str!("fixtures/l25_procedure_name_case_lambda.scm").trim()),
+        Ok("#t".into())
+    );
+}
+
+#[test]
+fn test_l25_procedure_name_builtin() {
+    assert_eq!(
+        eval_str(include_str!("fixtures/l25_procedure_name_builtin.scm").trim()),
         Ok("#t".into())
     );
 }

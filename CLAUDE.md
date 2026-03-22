@@ -111,7 +111,7 @@ Turn limits (by level tier):
 | L16-L18 | dynamic-wind/guard/values | 60 |
 | L19-L20 | Rationals/Records | 75 |
 | L21-L23 | Pair Mutation/syntax-case/Final Integration | 90 |
-| L24-L27 | Tech-debt: case-lambda/do/let-values/parameterize | 60 |
+| L24-L27 | Tech-debt: case-lambda/procedure-name/procedure?/do | 60 |
 
 Quality-gate levels get an additional 15-turn cleanup pass. Failed levels auto-retry up to 2 times if the failure was infrastructure (timeout/529/crash), not turns exhaustion.
 

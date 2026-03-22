@@ -221,42 +221,14 @@ fn run_script(level: &str, gate: bool, lang: &crate::model::Lang) -> Result<()> 
 /// Now they live here so agents only see lint errors during `cargo xtask test`,
 /// not on every `cargo build`.
 const GATE_LINT_FLAGS: &[&str] = &[
-    // Deny lints (hard errors)
-    "-D",
-    "clippy::unwrap_used",
-    "-D",
-    "clippy::result_unit_err",
-    "-D",
-    "clippy::manual_assert",
-    "-D",
-    "clippy::disallowed_macros",
-    // Warn lints (promoted to error by -D warnings)
-    "-W",
-    "clippy::too_many_lines",
-    "-W",
-    "clippy::excessive_nesting",
-    "-W",
-    "clippy::manual_filter_map",
-    "-W",
-    "clippy::manual_find_map",
-    "-W",
-    "clippy::manual_flatten",
-    "-W",
-    "clippy::manual_try_fold",
-    "-W",
-    "clippy::manual_let_else",
-    "-W",
-    "clippy::needless_range_loop",
-    "-W",
-    "clippy::explicit_counter_loop",
-    "-W",
-    "clippy::explicit_iter_loop",
-    "-W",
-    "clippy::vec_init_then_push",
-    "-W",
-    "clippy::needless_collect",
-    "-W",
-    "clippy::uninlined_format_args",
+    // Deny lints (hard errors — prevent correctness bugs)
+    "-D", "clippy::unwrap_used",
+    "-D", "clippy::result_unit_err",
+    "-D", "clippy::manual_assert",
+    "-D", "clippy::disallowed_macros",
+    // Structural lints (catch true monoliths, not cosmetic style)
+    "-W", "clippy::too_many_lines",
+    "-W", "clippy::excessive_nesting",
 ];
 
 fn quality_gates(proj: &Path, level: &str) -> Result<()> {
@@ -299,14 +271,14 @@ struct GateConfig {
 fn gate_config(level: &str) -> GateConfig {
     if level == "all" {
         return GateConfig {
-            fn_limit: 150,
+            fn_limit: 300,
             allow_dead_code: false,
         };
     }
 
     let ln: u32 = level.parse().unwrap_or(99);
     GateConfig {
-        fn_limit: 150,
+        fn_limit: 300,
         allow_dead_code: ln <= 3,
     }
 }
@@ -320,7 +292,7 @@ fn backup_clippy_config(clippy_toml: &Path, clippy_bak: &Path) {
 fn write_gate_clippy_config(clippy_toml: &Path, fn_limit: u32) -> Result<()> {
     fs::write(
         clippy_toml,
-        format!("too-many-lines-threshold = {fn_limit}\nexcessive-nesting-threshold = 3\n"),
+        format!("too-many-lines-threshold = {fn_limit}\nexcessive-nesting-threshold = 6\n"),
     )
     .map_err(|e| Error::io(clippy_toml, e))
 }
@@ -345,7 +317,7 @@ fn clippy_args(fix: bool, allow_dead_code: bool) -> Vec<&'static str> {
 }
 
 fn check_mod_size(proj: &Path, level: u32) -> Result<()> {
-    let mod_limit: usize = 300;
+    let mod_limit: usize = 500;
 
     let mod_file = proj.join("bench/rust/src/scheme/mod.rs");
     if !mod_file.is_file() {

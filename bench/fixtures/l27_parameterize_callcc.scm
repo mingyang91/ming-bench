@@ -1,5 +1,0 @@
-(define p (make-parameter 0))
-(define k #f)
-(parameterize ((p 42))
-  (call/cc (lambda (c) (set! k c)))
-  (p))

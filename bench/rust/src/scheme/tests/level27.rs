@@ -1,43 +1,43 @@
 use crate::scheme::eval_str;
 
-// ===== Level 27: parameterize + make-parameter =====
+// ===== Level 27: do loops =====
 
 #[test]
-fn test_l27_make_parameter() {
+fn test_l27_do_basic() {
     assert_eq!(
-        eval_str(include_str!("fixtures/l27_make_parameter.scm").trim()),
+        eval_str(include_str!("fixtures/l27_do_basic.scm").trim()),
+        Ok("10".into())
+    );
+}
+
+#[test]
+fn test_l27_do_parallel_step() {
+    assert_eq!(
+        eval_str(include_str!("fixtures/l27_do_parallel_step.scm").trim()),
         Ok("#t".into())
     );
 }
 
 #[test]
-fn test_l27_parameterize_basic() {
+fn test_l27_do_fibonacci() {
     assert_eq!(
-        eval_str(include_str!("fixtures/l27_parameterize_basic.scm").trim()),
+        eval_str(include_str!("fixtures/l27_do_fibonacci.scm").trim()),
         Ok("#t".into())
     );
 }
 
 #[test]
-fn test_l27_parameterize_nested() {
+fn test_l27_do_vector_fill() {
     assert_eq!(
-        eval_str(include_str!("fixtures/l27_parameterize_nested.scm").trim()),
-        Ok("#t".into())
+        eval_str(include_str!("fixtures/l27_do_vector_fill.scm").trim()),
+        Ok("#(0 1 4 9 16)".into())
     );
 }
 
 #[test]
-fn test_l27_parameterize_callcc() {
+fn test_l27_do_no_step() {
     assert_eq!(
-        eval_str(include_str!("fixtures/l27_parameterize_callcc.scm").trim()),
-        Ok("42".into())
-    );
-}
-
-#[test]
-fn test_l27_parameterize_converter() {
-    assert_eq!(
-        eval_str(include_str!("fixtures/l27_parameterize_converter.scm").trim()),
+        eval_str(include_str!("fixtures/l27_do_no_step.scm").trim()),
         Ok("#t".into())
     );
 }

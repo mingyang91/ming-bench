@@ -110,22 +110,23 @@ const TEST_CASES: &[(&str, &str, &str)] = &[
     ("l24_rest",        "(define f (case-lambda ((x y . rest) (apply + x y rest)))) (display (f 1 2 3 4)) (newline)", "10"),
     ("l24_procedure",   "(display (procedure? (case-lambda (() 1) ((x) x)))) (newline)", "#t"),
 
-    // Level 25: do loops
-    ("l25_basic",       "(display (do ((i 0 (+ i 1)) (sum 0 (+ sum i))) ((= i 5) sum))) (newline)", "10"),
-    ("l25_parallel",    "(display (do ((a 1 b) (b 2 a)) ((= a 2) (list a b)))) (newline)", "(2 1)"),
-    ("l25_fibonacci",   "(display (do ((i 0 (+ i 1)) (a 0 b) (b 1 (+ a b))) ((= i 10) a))) (newline)", "55"),
+    // Level 25: procedure-name
+    ("l25_named",       "(define (f x) (+ x 1)) (display (eq? (procedure-name f) 'f)) (newline)", "#t"),
+    ("l25_anon",        "(display (eq? (procedure-name (lambda (x) x)) #f)) (newline)", "#t"),
+    ("l25_let_name",    "(define g (lambda (x) x)) (display (eq? (procedure-name g) 'g)) (newline)", "#t"),
+    ("l25_builtin",     "(display (symbol? (procedure-name +))) (newline)", "#t"),
 
-    // Level 26: let-values & receive
-    ("l26_let_values",  "(use-modules (srfi srfi-11)) (display (let-values (((a b) (values 1 2)) ((c) (values 3))) (+ a b c))) (newline)", "6"),
-    ("l26_receive",     "(use-modules (srfi srfi-8)) (display (receive (a b c) (values 1 2 3) (list a b c))) (newline)", "(1 2 3)"),
-    ("l26_receive_rest","(use-modules (srfi srfi-8)) (display (receive (a . rest) (values 1 2 3) rest)) (newline)", "(2 3)"),
+    // Level 26: procedure? on all callable types
+    ("l26_lambda",      "(display (procedure? (lambda (x) x))) (newline)", "#t"),
+    ("l26_case_lambda", "(display (procedure? (case-lambda (() 0)))) (newline)", "#t"),
+    ("l26_builtin",     "(display (procedure? +)) (newline)", "#t"),
+    ("l26_cont",        "(call-with-current-continuation (lambda (k) (display (procedure? k)) (newline)))", "#t"),
+    ("l26_non_proc",    "(display (procedure? 42)) (newline)", "#f"),
 
-    // Level 27: parameterize & make-parameter
-    ("l27_basic",       "(define p (make-parameter 10)) (display (p)) (newline)", "10"),
-    ("l27_override",    "(define p (make-parameter 10)) (display (parameterize ((p 20)) (p))) (newline)", "20"),
-    ("l27_restore",     "(define p (make-parameter 10)) (parameterize ((p 20)) #f) (display (p)) (newline)", "10"),
-    ("l27_nested",      "(define p (make-parameter 1)) (display (parameterize ((p 2)) (parameterize ((p 3)) (p)))) (newline)", "3"),
-    ("l27_converter",   "(define p (make-parameter \"hello\" string-length)) (display (p)) (newline)", "5"),
+    // Level 27: do loops
+    ("l27_basic",       "(display (do ((i 0 (+ i 1)) (sum 0 (+ sum i))) ((= i 5) sum))) (newline)", "10"),
+    ("l27_parallel",    "(display (do ((a 1 b) (b 2 a)) ((= a 2) (list a b)))) (newline)", "(2 1)"),
+    ("l27_fibonacci",   "(display (do ((i 0 (+ i 1)) (a 0 b) (b 1 (+ a b))) ((= i 10) a))) (newline)", "55"),
 ];
 
 fn print_section_header<'a>(label: &'a str, current_section: &mut &'a str) {
@@ -141,9 +142,9 @@ fn print_section_header<'a>(label: &'a str, current_section: &mut &'a str) {
         "l07" => "Level 7: Tail Call Optimization",
         "l13" => "Level 13: Numeric/Char/String Utilities",
         "l24" => "Level 24: case-lambda",
-        "l25" => "Level 25: do Loops",
-        "l26" => "Level 26: let-values & receive",
-        "l27" => "Level 27: parameterize & make-parameter",
+        "l25" => "Level 25: procedure-name",
+        "l26" => "Level 26: procedure? on all types",
+        "l27" => "Level 27: do Loops",
         _ => section,
     };
     println!("=== {level_name} ===");
