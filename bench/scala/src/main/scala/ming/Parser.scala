@@ -8,19 +8,19 @@ object Parser:
   /** Parse all expressions from the input string. */
   def parseAll(input: String): List[SchemeValue] =
     val tokens = tokenize(input)
-    readAll(tokens, Nil)
+    readAll(input, tokens, Nil)
 
-  // --- Tokenizer ---
+  // --- Tokenizer (produces (text, charOffset) pairs) ---
 
-  private def tokenize(input: String): List[String] =
+  private def tokenize(input: String): List[(String, Int)] =
     tokenizeLoop(input, 0, Nil).reverse
 
   @tailrec
   private def tokenizeLoop(
     input: String,
     pos: Int,
-    acc: List[String]
-  ): List[String] =
+    acc: List[(String, Int)]
+  ): List[(String, Int)] =
     if pos >= input.length then acc
     else
       input.charAt(pos) match
@@ -29,22 +29,23 @@ object Parser:
           val end  = input.indexOf('\n', pos)
           val next = if end < 0 then input.length else end + 1
           tokenizeLoop(input, next, acc)
-        case '('  => tokenizeLoop(input, pos + 1, "(" :: acc)
-        case ')'  => tokenizeLoop(input, pos + 1, ")" :: acc)
-        case '\'' => tokenizeLoop(input, pos + 1, "'" :: acc)
-        case '"'  => readString(input, pos + 1, acc)
+        case '('  => tokenizeLoop(input, pos + 1, ("(", pos) :: acc)
+        case ')'  => tokenizeLoop(input, pos + 1, (")", pos) :: acc)
+        case '\'' => tokenizeLoop(input, pos + 1, ("'", pos) :: acc)
+        case '"'  => readString(input, pos + 1, pos, acc)
         case _    => readAtom(input, pos, acc)
 
   private def readString(
     input: String,
     pos: Int,
-    acc: List[String]
-  ): List[String] =
+    startPos: Int,
+    acc: List[(String, Int)]
+  ): List[(String, Int)] =
     if pos >= input.length then throw new EvalError("unterminated string")
     else
       val end   = findStringEnd(input, pos)
-      val token = input.substring(pos - 1, end + 1)
-      tokenizeLoop(input, end + 1, token :: acc)
+      val token = input.substring(startPos, end + 1)
+      tokenizeLoop(input, end + 1, (token, startPos) :: acc)
 
   @tailrec
   private def findStringEnd(input: String, pos: Int): Int =
@@ -56,11 +57,11 @@ object Parser:
   private def readAtom(
     input: String,
     pos: Int,
-    acc: List[String]
-  ): List[String] =
+    acc: List[(String, Int)]
+  ): List[(String, Int)] =
     val end   = findAtomEnd(input, pos)
     val token = input.substring(pos, end)
-    tokenizeLoop(input, end, token :: acc)
+    tokenizeLoop(input, end, (token, pos) :: acc)
 
   private def isDelimiter(ch: Char): Boolean =
     ch.isWhitespace || ch == '(' || ch == ')' || ch == '"' || ch == ';'
@@ -75,41 +76,50 @@ object Parser:
 
   @tailrec
   private def readAll(
-    tokens: List[String],
+    input: String,
+    tokens: List[(String, Int)],
     acc: List[SchemeValue]
   ): List[SchemeValue] =
     tokens match
       case Nil => acc.reverse
       case _ =>
-        val (value, rest) = readExpr(tokens)
-        readAll(rest, value :: acc)
+        val (value, rest) = readExpr(input, tokens)
+        readAll(input, rest, value :: acc)
 
-  private def readExpr(tokens: List[String]): (SchemeValue, List[String]) =
+  private def readExpr(
+    input: String,
+    tokens: List[(String, Int)]
+  ): (SchemeValue, List[(String, Int)]) =
     tokens match
-      case Nil         => throw new EvalError("unexpected end of input")
-      case "(" :: rest => readList(rest, Nil)
-      case "'" :: rest =>
-        val (quoted, remaining) = readExpr(rest)
-        (
-          SchemeValue.SchemeList(
-            List(SchemeValue.SchemeSymbol("quote"), quoted)
-          ),
-          remaining
+      case Nil => throw new EvalError("unexpected end of input")
+      case ("(", offset) :: rest =>
+        val (list, remaining) = readList(input, rest, Nil)
+        val (line, col)       = posToLineCol(input, offset)
+        (SchemeValue.SchemeLocated(list, line, col), remaining)
+      case ("'", offset) :: rest =>
+        val (quoted, remaining) = readExpr(input, rest)
+        val inner = SchemeValue.SchemeList(
+          List(SchemeValue.SchemeSymbol("quote"), quoted)
         )
-      case ")" :: _      => throw new EvalError("unexpected ')'")
-      case token :: rest => (parseAtom(token), rest)
+        val (line, col) = posToLineCol(input, offset)
+        (SchemeValue.SchemeLocated(inner, line, col), remaining)
+      case (")", _) :: _ => throw new EvalError("unexpected ')'")
+      case (token, offset) :: rest =>
+        val (line, col) = posToLineCol(input, offset)
+        (SchemeValue.SchemeLocated(parseAtom(token), line, col), rest)
 
   @tailrec
   private def readList(
-    tokens: List[String],
+    input: String,
+    tokens: List[(String, Int)],
     acc: List[SchemeValue]
-  ): (SchemeValue, List[String]) =
+  ): (SchemeValue, List[(String, Int)]) =
     tokens match
-      case Nil         => throw new EvalError("unterminated list")
-      case ")" :: rest => (SchemeValue.SchemeList(acc.reverse), rest)
+      case Nil              => throw new EvalError("unterminated list")
+      case (")", _) :: rest => (SchemeValue.SchemeList(acc.reverse), rest)
       case _ =>
-        val (value, rest) = readExpr(tokens)
-        readList(rest, value :: acc)
+        val (value, rest) = readExpr(input, tokens)
+        readList(input, rest, value :: acc)
 
   private def parseAtom(token: String): SchemeValue =
     if token == "#t" then SchemeValue.SchemeBool(true)
@@ -119,3 +129,9 @@ object Parser:
       token.toLongOption match
         case Some(n) => SchemeValue.SchemeInt(n)
         case None    => SchemeValue.SchemeSymbol(token)
+
+  private def posToLineCol(input: String, offset: Int): (Int, Int) =
+    input.substring(0, offset.min(input.length)).foldLeft((1, 1)) {
+      case ((l, _), '\n') => (l + 1, 1)
+      case ((l, c), _)    => (l, c + 1)
+    }

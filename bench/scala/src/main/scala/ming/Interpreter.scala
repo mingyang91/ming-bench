@@ -37,6 +37,12 @@ object Interpreter:
       env.define(name, SchemeSymbol(name))
     }
 
+  /** Recursively strip all SchemeLocated wrappers from a value. */
+  private def strip(v: SchemeValue): SchemeValue = v match
+    case SchemeLocated(inner, _, _) => strip(inner)
+    case SchemeList(elems)          => SchemeList(elems.map(strip))
+    case other                      => other
+
   /** Evaluate an expression, returning the result and (possibly updated) environment.
     */
   def eval(
@@ -50,12 +56,17 @@ object Interpreter:
       case SchemeNil       => (expr, env)
       case SchemeVoid      => (expr, env)
       case _: SchemeLambda => (expr, env)
+      case SchemeLocated(inner, line, col) =>
+        try eval(inner, env)
+        catch
+          case e: EvalError if !e.hasPosition =>
+            throw new EvalError(s"$line:$col: ${e.getMessage}", hasPosition = true)
       case SchemeSymbol(name) =>
         env.lookup(name) match
           case Some(v) => (v, env)
           case None =>
             throw new EvalError(s"unbound variable: $name")
-      case SchemeList(elements) => evalList(elements, env)
+      case SchemeList(elements) => evalList(elements.map(strip), env)
 
   private def evalList(
     elements: List[SchemeValue],

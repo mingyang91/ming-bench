@@ -16,14 +16,16 @@ enum SchemeValue:
     name: Option[String] = None
   )
   case SchemeVoid
+  case SchemeLocated(value: SchemeValue, line: Int, col: Int)
 
   def display: String = this match
-    case SchemeInt(v)    => v.toString
-    case SchemeBool(v)   => if v then "#t" else "#f"
-    case SchemeString(v) => s"\"$v\""
-    case SchemeSymbol(n) => n
-    case SchemeNil       => "()"
-    case SchemeVoid      => ""
-    case _: SchemeLambda => "#<procedure>"
+    case SchemeInt(v)           => v.toString
+    case SchemeBool(v)          => if v then "#t" else "#f"
+    case SchemeString(v)        => s"\"$v\""
+    case SchemeSymbol(n)        => n
+    case SchemeNil              => "()"
+    case SchemeVoid             => ""
+    case _: SchemeLambda        => "#<procedure>"
+    case SchemeLocated(v, _, _) => v.display
     case SchemeList(elems) =>
       elems.map(_.display).mkString("(", " ", ")")
