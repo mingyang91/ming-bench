@@ -209,6 +209,7 @@ private[ming] object ProcApply:
     case Kont.OrK(_, _, next)                       => next
     case Kont.CallCCK(next)                         => next
     case Kont.CondK(_, _, _, next)                  => next
+    case Kont.CondArrowK(_, next)                   => next
     case Kont.LetInitK(_, _, _, _, _, next)         => next
     case Kont.NamedLetInitK(_, _, _, _, _, _, next) => next
     case Kont.MapK(_, _, _, next)                   => next

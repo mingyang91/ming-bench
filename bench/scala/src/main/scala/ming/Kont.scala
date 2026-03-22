@@ -43,6 +43,8 @@ object Kont:
     k: Kont
   ) extends Kont
 
+  case class CondArrowK(testValue: SchemeValue, k: Kont) extends Kont
+
   case class LetInitK(
     params: List[String],
     evaled: List[SchemeValue],

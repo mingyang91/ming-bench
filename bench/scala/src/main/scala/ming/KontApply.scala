@@ -65,8 +65,15 @@ private[ming] object KontApply:
 
     case Kont.CondK(body, remaining, condEnv, nextK) =>
       if Evaluator.isFalsy(value) then SpecialForms.evalCondClauses(remaining, condEnv, nextK, out)
-      else if body.isEmpty then ReturnS(value, nextK, out)
-      else SpecialForms.startSequence(body, condEnv, nextK, out)
+      else
+        body match
+          case Nil => ReturnS(value, nextK, out)
+          case SchemeSymbol("=>") :: proc :: Nil =>
+            EvalS(proc, condEnv, Kont.CondArrowK(value, nextK), out)
+          case _ => SpecialForms.startSequence(body, condEnv, nextK, out)
+
+    case Kont.CondArrowK(testValue, nextK) =>
+      ProcApply.applyProc(value, List(testValue), nextK, out)
 
     case Kont.LetInitK(params, evaled, remaining, body, letEnv, nextK) =>
       applyLetInit(value, params, evaled, remaining, body, letEnv, nextK, out)

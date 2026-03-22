@@ -109,6 +109,19 @@ private[ming] object CollectionBuiltins:
       case _ => SchemeBool(false)
     loop(args(1))
 
+  def evalMemv(args: List[SchemeValue]): SchemeValue =
+    if args.length != 2 then throw new EvalError("memv: expected 2 arguments")
+    val key = args.head
+    @scala.annotation.tailrec
+    def loop(v: SchemeValue): SchemeValue = v match
+      case SchemeList(Nil) => SchemeBool(false)
+      case SchemeList(h :: t) =>
+        if Builtins.schemeEqv(h, key) then v else loop(SchemeList(t))
+      case p: SchemePair =>
+        if Builtins.schemeEqv(p.car, key) then v else loop(p.cdr)
+      case _ => SchemeBool(false)
+    loop(args(1))
+
   def evalAssq(args: List[SchemeValue]): SchemeValue =
     if args.length != 2 then throw new EvalError("assq: expected 2 arguments")
     val key   = args.head

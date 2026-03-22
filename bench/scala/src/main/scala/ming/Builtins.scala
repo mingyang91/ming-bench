@@ -118,6 +118,7 @@ object Builtins:
     "rational?",
     "cddr",
     "memq",
+    "memv",
     "assq",
     "syntax->datum",
     "datum->syntax"
@@ -194,6 +195,7 @@ object Builtins:
     case "error"          => CollectionBuiltins.evalError(args)
     case "cddr"           => CollectionBuiltins.evalCddr(args)
     case "memq"           => CollectionBuiltins.evalMemq(args)
+    case "memv"           => CollectionBuiltins.evalMemv(args)
     case "assq"           => CollectionBuiltins.evalAssq(args)
     case "syntax->datum"  => evalSyntaxToDatum(args)
     case "datum->syntax"  => evalDatumToSyntax(args)

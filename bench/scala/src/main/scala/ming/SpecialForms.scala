@@ -86,8 +86,9 @@ private[ming] object SpecialForms:
   ): Step = args match
     case SchemeSymbol(name) :: valueExpr :: Nil =>
       EvalS(valueExpr, env, Kont.DefineK(name, env, k), out)
-    case SchemeList(SchemeSymbol(name) :: rawParams) :: body =>
-      val (paramNames, restParam) = parseParams(rawParams)
+    case (head @ (SchemeList(_ :: _) | (_: SchemePair))) :: body =>
+      val (name, paramValue) = extractDefineNameAndParams(head)
+      val (paramNames, restParam) = parseParamValue(paramValue)
       val recEnv = Env.RecursiveFrame(
         name,
         closure => SchemeLambda(paramNames, restParam, body, closure),
@@ -95,6 +96,16 @@ private[ming] object SpecialForms:
       )
       val updatedK = Evaluator.updateSeqEnv(k, recEnv)
       ReturnS(SchemeVoid, updatedK, out)
+    case _ => throw new EvalError("bad define syntax")
+
+  /** Extract function name and parameter value from (name . params) or (name params...) */
+  private def extractDefineNameAndParams(v: SchemeValue): (String, SchemeValue) = v match
+    case SchemeList(SchemeSymbol(name) :: rawParams) =>
+      (name, SchemeList(rawParams))
+    case p: SchemePair =>
+      p.car match
+        case SchemeSymbol(name) => (name, p.cdr)
+        case _ => throw new EvalError("bad define syntax")
     case _ => throw new EvalError("bad define syntax")
 
   private def evalIf(
@@ -195,24 +206,40 @@ private[ming] object SpecialForms:
   private[ming] def parseParams(
     rawParams: List[SchemeValue]
   ): (List[String], Option[String]) =
-    val dotIdx = rawParams.indexWhere {
-      case SchemeSymbol(".") => true
-      case _                 => false
+    val names = rawParams.map {
+      case SchemeSymbol(n) => n
+      case other           => throw new EvalError(s"bad parameter: ${other.display}")
     }
-    if dotIdx < 0 then
-      val names = rawParams.map {
+    (names, None)
+
+  /** Extract parameter names from a value that may be a proper list, dotted pair chain, or single symbol. */
+  private[ming] def parseParamValue(
+    v: SchemeValue
+  ): (List[String], Option[String]) = v match
+    case SchemeList(elems) => parseParams(elems)
+    case SchemeSymbol(name) => (Nil, Some(name))
+    case p: SchemePair =>
+      extractPairParams(p, Nil)
+    case other => throw new EvalError(s"bad parameter list: ${other.display}")
+
+  @scala.annotation.tailrec
+  private def extractPairParams(
+    v: SchemeValue,
+    acc: List[String]
+  ): (List[String], Option[String]) = v match
+    case SchemeSymbol(name) => (acc.reverse, Some(name))
+    case SchemeList(Nil) => (acc.reverse, None)
+    case p: SchemePair =>
+      p.car match
+        case SchemeSymbol(name) => extractPairParams(p.cdr, name :: acc)
+        case other => throw new EvalError(s"bad parameter: ${other.display}")
+    case SchemeList(elems) =>
+      val names = elems.map {
         case SchemeSymbol(n) => n
-        case other           => throw new EvalError(s"bad parameter: ${other.display}")
+        case other => throw new EvalError(s"bad parameter: ${other.display}")
       }
-      (names, None)
-    else
-      val fixed = rawParams.take(dotIdx).map {
-        case SchemeSymbol(n) => n
-        case other           => throw new EvalError(s"bad parameter: ${other.display}")
-      }
-      rawParams.drop(dotIdx + 1) match
-        case SchemeSymbol(rest) :: Nil => (fixed, Some(rest))
-        case _                         => throw new EvalError("bad dot syntax in parameters")
+      (acc.reverse ++ names, None)
+    case other => throw new EvalError(s"bad parameter list: ${other.display}")
 
   @scala.annotation.tailrec
   def collectDefines(
@@ -226,8 +253,9 @@ private[ming] object SpecialForms:
         rest match
           case SchemeSymbol(name) :: valueExpr :: Nil =>
             collectDefines(tail, (name, None, List(valueExpr)) :: acc)
-          case SchemeList(SchemeSymbol(name) :: rawParams) :: body =>
-            val (paramNames, restParam) = parseParams(rawParams)
+          case (head @ (SchemeList(_ :: _) | (_: SchemePair))) :: body =>
+            val (name, paramValue) = extractDefineNameAndParams(head)
+            val (paramNames, restParam) = parseParamValue(paramValue)
             collectDefines(
               tail,
               (name, Some((paramNames, restParam)), body) :: acc
@@ -248,25 +276,24 @@ private[ming] object SpecialForms:
   private def makeLambda(
     args: List[SchemeValue],
     env: Env
-  ): SchemeValue = args match
-    case SchemeList(rawParams) :: body if body.nonEmpty =>
-      val (paramNames, restParam) = parseParams(rawParams)
-      SchemeLambda(paramNames, restParam, body, env)
-    case SchemeSymbol(restOnly) :: body if body.nonEmpty =>
-      SchemeLambda(Nil, Some(restOnly), body, env)
-    case _ => throw new EvalError("lambda: bad syntax")
+  ): SchemeValue =
+    if args.isEmpty || args.tail.isEmpty then throw new EvalError("lambda: bad syntax")
+    val (paramNames, restParam) = parseParamValue(args.head)
+    val body = args.tail
+    SchemeLambda(paramNames, restParam, body, env)
 
   private def makeCaseLambda(
     clauses: List[SchemeValue],
     env: Env
   ): SchemeValue =
-    val lambdas = clauses.map {
-      case SchemeList(SchemeList(rawParams) :: body) if body.nonEmpty =>
-        val (paramNames, restParam) = parseParams(rawParams)
-        SchemeLambda(paramNames, restParam, body, env)
-      case SchemeList(SchemeSymbol(restOnly) :: body) if body.nonEmpty =>
-        SchemeLambda(Nil, Some(restOnly), body, env)
-      case other =>
-        throw new EvalError(s"case-lambda: bad clause: ${other.display}")
+    val lambdas = clauses.map { clause =>
+      val elems = clause match
+        case SchemeList(e) => e
+        case p: SchemePair => Builtins.asList(p)
+        case _ => throw new EvalError(s"case-lambda: bad clause: ${clause.display}")
+      if elems.length < 2 then throw new EvalError(s"case-lambda: bad clause: ${clause.display}")
+      val (paramNames, restParam) = parseParamValue(elems.head)
+      val body = elems.tail
+      SchemeLambda(paramNames, restParam, body, env)
     }
     SchemeCaseLambda(lambdas)
