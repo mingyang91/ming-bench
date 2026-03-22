@@ -21,6 +21,7 @@ const (
 	TypeContinuation
 	TypeMacro
 	TypeVector
+	TypeMultipleValues
 )
 
 // Value represents a Scheme value.
@@ -43,6 +44,8 @@ type Value struct {
 	Macro *SyntaxRules
 	// Vector fields
 	VecElems []*Value
+	// Multiple values fields
+	Values []*Value
 }
 
 // StrContent returns the string content, preferring mutable Runes if set.

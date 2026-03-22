@@ -199,13 +199,17 @@ func evalListTCO(expr *Expr, env *Env) (*Expr, *Env, *Value, error, bool) {
 	}
 
 	// Evaluate arguments
-	args := make([]*Value, len(expr.List)-1)
-	for i, argExpr := range expr.List[1:] {
+	args := make([]*Value, 0, len(expr.List)-1)
+	for _, argExpr := range expr.List[1:] {
 		val, err := Eval(argExpr, env)
 		if err != nil {
 			return nil, nil, nil, err, false
 		}
-		args[i] = val
+		// Unwrap single multiple-values transparently
+		if val.Type == TypeMultipleValues && len(val.Values) == 1 {
+			val = val.Values[0]
+		}
+		args = append(args, val)
 	}
 
 	return applyFuncTCO(op, args, expr, env)
@@ -453,6 +457,10 @@ func applyBuiltin(name string, args []*Value, expr *Expr, env *Env) (*Value, err
 		return builtinApply(args, expr, env)
 	case "call/cc", "call-with-current-continuation":
 		return builtinCallCC(args, expr, env)
+	case "values":
+		return builtinValues(args, expr)
+	case "call-with-values":
+		return builtinCallWithValues(args, expr, env)
 	case "dynamic-wind":
 		return builtinDynamicWind(args, expr, env)
 	case "raise":
@@ -1912,9 +1920,52 @@ func makeDefaultEnv() *Env {
 		"vector", "make-vector", "vector-ref", "vector-set!", "vector-length", "vector?",
 		"vector->list", "list->vector",
 		"dynamic-wind",
-		"raise", "with-exception-handler"}
+		"raise", "with-exception-handler",
+		"values", "call-with-values"}
 	for _, name := range builtins {
 		env.Set(name, &Value{Type: TypeSymbol, StrVal: fmt.Sprintf("__builtin:%s", name)})
 	}
 	return env
+}
+
+func builtinValues(args []*Value, expr *Expr) (*Value, error) {
+	if len(args) == 1 {
+		return args[0], nil
+	}
+	return &Value{Type: TypeMultipleValues, Values: args}, nil
+}
+
+func builtinCallWithValues(args []*Value, expr *Expr, env *Env) (*Value, error) {
+	if len(args) != 2 {
+		return nil, errAtf(expr, "call-with-values: expected 2 arguments, got %d", len(args))
+	}
+	producer := args[0]
+	consumer := args[1]
+
+	// Call producer with no arguments
+	produced, err := applyFunc(producer, []*Value{}, expr, env)
+	if err != nil {
+		return nil, err
+	}
+
+	// Unpack multiple values into consumer arguments
+	var consumerArgs []*Value
+	if produced.Type == TypeMultipleValues {
+		consumerArgs = produced.Values
+	} else {
+		consumerArgs = []*Value{produced}
+	}
+
+	return applyFunc(consumer, consumerArgs, expr, env)
+}
+
+func applyFunc(op *Value, args []*Value, expr *Expr, env *Env) (*Value, error) {
+	nextExpr, nextEnv, val, err, isTailCall := applyFuncTCO(op, args, expr, env)
+	if err != nil {
+		return nil, err
+	}
+	if !isTailCall {
+		return val, nil
+	}
+	return Eval(nextExpr, nextEnv)
 }
