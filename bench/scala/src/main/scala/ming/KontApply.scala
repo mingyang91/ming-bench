@@ -78,6 +78,13 @@ private[ming] object KontApply:
     case Kont.NamedLetInitK(name, params, evaled, remaining, body, letEnv, nextK) =>
       applyNamedLetInit(value, name, params, evaled, remaining, body, letEnv, nextK, out)
 
+    case Kont.MapK(proc, remainingGroups, accumulated, nextK) =>
+      val newAcc = accumulated :+ value
+      remainingGroups match
+        case Nil => ReturnS(SchemeList(newAcc), nextK, out)
+        case group :: rest =>
+          applyProc(proc, group, Kont.MapK(proc, rest, newAcc, nextK), out)
+
   // --- applyKont helpers for complex cases ---
 
   private def applyEvalOp(
@@ -197,6 +204,8 @@ private[ming] object KontApply:
       applyProc(args.head, List(kontVal), k, out)
     case SchemeBuiltinProc("apply") =>
       applyApply(args, k, out)
+    case SchemeBuiltinProc("map") =>
+      applyMap(args, k, out)
     case SchemeBuiltinProc(name) =>
       val (result, bo) = Builtins.evalBuiltin(name, args)
       ReturnS(result, k, out + bo)
@@ -239,3 +248,27 @@ private[ming] object KontApply:
           s"apply: last argument must be a list, got ${other.display}"
         )
     applyProc(proc, allArgs, k, out)
+
+  private def applyMap(
+    args: List[SchemeValue],
+    k: Kont,
+    out: String
+  ): Step =
+    if args.length < 2 then throw new EvalError("map: expected at least 2 arguments")
+    val proc = args.head
+    val lists = args.tail.map {
+      case SchemeList(es) => es
+      case other          => throw new EvalError(s"map: not a list: ${other.display}")
+    }
+    if lists.isEmpty then ReturnS(SchemeList(Nil), k, out)
+    else
+      val len = lists.head.length
+      if !lists.tail.forall(_.length == len) then
+        throw new EvalError("map: lists must have same length")
+      if len == 0 then ReturnS(SchemeList(Nil), k, out)
+      else
+        val groups = (0 until len).toList.map(i => lists.map(_(i)))
+        groups match
+          case first :: rest =>
+            applyProc(proc, first, Kont.MapK(proc, rest, Nil, k), out)
+          case Nil => ReturnS(SchemeList(Nil), k, out)

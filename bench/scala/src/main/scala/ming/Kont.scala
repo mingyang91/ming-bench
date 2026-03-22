@@ -62,3 +62,10 @@ object Kont:
     env: Env,
     k: Kont
   ) extends Kont
+
+  case class MapK(
+    proc: SchemeValue,
+    remainingGroups: List[List[SchemeValue]],
+    accumulated: List[SchemeValue],
+    k: Kont
+  ) extends Kont
