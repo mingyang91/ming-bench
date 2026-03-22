@@ -285,6 +285,61 @@ function makeGlobalEnv(): Env {
     env.define(name, { tag: 'builtin', name, fn });
   }
 
+  // List builtins
+  env.define('cons', { tag: 'builtin', name: 'cons', fn(args) {
+    if (args.length !== 2) throw new EvalError('cons: expected 2 arguments');
+    return { tag: 'pair', car: args[0], cdr: args[1] };
+  }});
+  env.define('car', { tag: 'builtin', name: 'car', fn(args) {
+    if (args.length !== 1 || args[0].tag !== 'pair') throw new EvalError('car: expected pair');
+    return args[0].car;
+  }});
+  env.define('cdr', { tag: 'builtin', name: 'cdr', fn(args) {
+    if (args.length !== 1 || args[0].tag !== 'pair') throw new EvalError('cdr: expected pair');
+    return args[0].cdr;
+  }});
+  env.define('null?', { tag: 'builtin', name: 'null?', fn(args) {
+    if (args.length !== 1) throw new EvalError('null?: expected 1 argument');
+    return { tag: 'boolean', value: args[0].tag === 'nil' };
+  }});
+  env.define('list', { tag: 'builtin', name: 'list', fn(args) {
+    let result: Value = { tag: 'nil' };
+    for (let i = args.length - 1; i >= 0; i--) {
+      result = { tag: 'pair', car: args[i], cdr: result };
+    }
+    return result;
+  }});
+  env.define('length', { tag: 'builtin', name: 'length', fn(args) {
+    if (args.length !== 1) throw new EvalError('length: expected 1 argument');
+    let count = 0;
+    let cur = args[0];
+    while (cur.tag === 'pair') { count++; cur = cur.cdr; }
+    if (cur.tag !== 'nil') throw new EvalError('length: expected proper list');
+    return { tag: 'number', value: count };
+  }});
+
+  // Type predicates
+  env.define('string?', { tag: 'builtin', name: 'string?', fn(args) {
+    if (args.length !== 1) throw new EvalError('string?: expected 1 argument');
+    return { tag: 'boolean', value: args[0].tag === 'string' };
+  }});
+  env.define('number?', { tag: 'builtin', name: 'number?', fn(args) {
+    if (args.length !== 1) throw new EvalError('number?: expected 1 argument');
+    return { tag: 'boolean', value: args[0].tag === 'number' };
+  }});
+  env.define('boolean?', { tag: 'builtin', name: 'boolean?', fn(args) {
+    if (args.length !== 1) throw new EvalError('boolean?: expected 1 argument');
+    return { tag: 'boolean', value: args[0].tag === 'boolean' };
+  }});
+  env.define('pair?', { tag: 'builtin', name: 'pair?', fn(args) {
+    if (args.length !== 1) throw new EvalError('pair?: expected 1 argument');
+    return { tag: 'boolean', value: args[0].tag === 'pair' };
+  }});
+  env.define('symbol?', { tag: 'builtin', name: 'symbol?', fn(args) {
+    if (args.length !== 1) throw new EvalError('symbol?: expected 1 argument');
+    return { tag: 'boolean', value: args[0].tag === 'symbol' };
+  }});
+
   return env;
 }
 
@@ -389,6 +444,55 @@ function evaluate(expr: Expr, env: Env): Value {
               if (isTruthy(result)) return result;
             }
             return result;
+          }
+
+          case 'let': {
+            const bindingsExpr = items[1];
+            if (bindingsExpr.tag !== 'list') throw new EvalError('let: expected bindings list');
+            const letEnv = new Env(env);
+            for (const b of bindingsExpr.items) {
+              if (b.tag !== 'list' || b.items.length !== 2) throw new EvalError('let: bad binding');
+              if (b.items[0].tag !== 'symbol') throw new EvalError('let: expected symbol');
+              const val = evaluate(b.items[1], env);
+              letEnv.define(b.items[0].name, val);
+            }
+            let result: Value = { tag: 'nil' };
+            for (let i = 2; i < items.length; i++) {
+              result = evaluate(items[i], letEnv);
+            }
+            return result;
+          }
+
+          case 'begin': {
+            let result: Value = { tag: 'nil' };
+            for (let i = 1; i < items.length; i++) {
+              result = evaluate(items[i], env);
+            }
+            return result;
+          }
+
+          case 'cond': {
+            for (let i = 1; i < items.length; i++) {
+              const clause = items[i];
+              if (clause.tag !== 'list' || clause.items.length < 1) throw new EvalError('cond: bad clause');
+              if (clause.items[0].tag === 'symbol' && clause.items[0].name === 'else') {
+                let result: Value = { tag: 'nil' };
+                for (let j = 1; j < clause.items.length; j++) {
+                  result = evaluate(clause.items[j], env);
+                }
+                return result;
+              }
+              const test = evaluate(clause.items[0], env);
+              if (isTruthy(test)) {
+                if (clause.items.length === 1) return test;
+                let result: Value = { tag: 'nil' };
+                for (let j = 1; j < clause.items.length; j++) {
+                  result = evaluate(clause.items[j], env);
+                }
+                return result;
+              }
+            }
+            return { tag: 'nil' };
           }
         }
       }
