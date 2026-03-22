@@ -134,7 +134,20 @@ Benefits:
 | L21-L23 | Pair Mutation/syntax-case/Final Integration | 90 |
 | L24-L27 | Tech-debt: case-lambda/do/let-values/parameterize | 60 |
 
-Override with `--max-turns N`. Quality-gate cleanup pass: 15 turns.
+Override with `--max-turns N`. Quality-gate cleanup pass: 15 turns. Regression fix-it pass: 15 turns.
+
+### Regression Checking
+
+After each level passes, the orchestrator re-runs **all previously-passed levels** against the current code. This catches regressions like L14 breaking L06's `string-set!` or L17 breaking L10's `call/cc` exception handler.
+
+If regressions are detected:
+1. A **fix-it agent pass** (15 turns) is launched with the failing test output
+2. After the fix-it, all levels (including current) are re-checked
+3. If regressions persist, the run **halts** with `REGRESSION` status
+
+Checkpoint labels: `REGFIX` (regressions fixed and committed), `REGRESSION` (halted, unfixable).
+
+Estimated overhead: ~4-6 minutes total across a full 27-level run (~4% of wall time).
 
 ### Resume & Recovery
 
@@ -156,6 +169,8 @@ In levels mode, every passing level is automatically committed:
 ```
 checkpoint: L01 PASSED (130s)
 checkpoint: L02 PASSED (85s)
+checkpoint: L03 REGFIX (0s)        # regression detected and fixed
+checkpoint: L14 REGRESSION (326s)  # regression detected, fix-it failed — halted
 ...
 ```
 

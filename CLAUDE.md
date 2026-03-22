@@ -115,6 +115,8 @@ Turn limits (by level tier):
 
 Quality-gate levels get an additional 15-turn cleanup pass. Failed levels auto-retry up to 2 times if the failure was infrastructure (timeout/529/crash), not turns exhaustion.
 
+**Regression checking:** After each level passes, the orchestrator re-runs all previously-passed levels against the current code. If any regress (e.g., L14 breaking L06's `string-set!`), a 15-turn fix-it agent pass is launched. If the fix-it pass fails to resolve the regressions, the run halts with `REGRESSION` status. Checkpoints: `REGFIX` (regressions fixed), `REGRESSION` (halted).
+
 ## Key Conventions
 
 - Tests NEVER run on the host — always containerized via `cargo xtask test`

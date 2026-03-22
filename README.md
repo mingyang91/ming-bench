@@ -18,7 +18,7 @@ Multi-language support adds another dimension: **does language choice affect age
 
 The agent receives:
 - A function signature (language-specific): `evalStr(input) → result`
-- 214 test cases across 27 levels (each test loads Scheme code from a `.scm` fixture file)
+- 221+ test cases across 27 levels (each test loads Scheme code from a `.scm` fixture file)
 - Instructions in `CLAUDE.md` (the only file the agent reads for guidance)
 
 The agent implements a complete Scheme interpreter from scratch — lexer, parser, environment, evaluator, tail-call optimization, continuations, and hygienic macros. No starter code. No external parsing libraries.
@@ -86,7 +86,7 @@ Per-language strategies live in `bench/strategies/{lang}/`. The orchestrator pic
 Each agent run uses one of two modes:
 
 - **Full mode** — one agent session tackles all 27 levels. Simpler, but if the agent gets stuck it burns budget.
-- **Levels mode** — orchestrator runs a fresh agent per level. Fail-fast: stops on first failure. Per-level session data for granular analysis.
+- **Levels mode** — orchestrator runs a fresh agent per level. After each level passes, all prior levels are re-run to catch regressions. If regressions are detected, a 15-turn fix-it pass is launched; if unfixable, the run halts. Per-level session data for granular analysis.
 
 ### Sandboxed Testing
 
@@ -128,9 +128,9 @@ All containers: 1 CPU, 256 PIDs. OOM or timeout = test failure. This prevents ag
 | 22 | **syntax-case** | 5 | Advanced macro system with guards |
 | 23 | **Final integration** | 8 | All features combined |
 | 24 | **case-lambda** | 5 | Multi-arity closures — **forces closure restructure** |
-| 25 | **do loops** | 5 | Iteration with parallel step — **tests env model** |
-| 26 | **let-values & receive** | 5 | Multi-value destructuring — **tests values composability** |
-| 27 | **parameterize** | 5 | Dynamic parameters — **tests dynamic-wind generality** |
+| 25 | **procedure-name** | 5 | Name propagation from `define` — **forces closure restructure** |
+| 26 | **procedure?** | 5 | Must return `#t` for all callable types (lambda, case-lambda, builtins, continuations) |
+| 27 | **do loops** | 5 | Iteration with parallel step — **tests env model** |
 
 **Level design philosophy:** Levels are ordered to maximize tech-debt exposure. L06 plants mutable strings, then L14 (8 levels later) reverses the requirement. L24-L27 force restructuring of core infrastructure (closures, eval loop, values, dynamic-wind) established 10-20 levels earlier. Quality-gate agents that build clean architecture early should handle these transitions cheaper than default agents.
 
