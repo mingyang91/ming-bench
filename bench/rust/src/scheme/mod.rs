@@ -10,7 +10,7 @@ use builtins::{
     builtin_cons, builtin_div, builtin_length, builtin_list, builtin_mul, builtin_not,
     builtin_null, builtin_or, builtin_string_ops, builtin_sub, builtin_type_pred,
 };
-use forms::{eval_cond, eval_let};
+use forms::{eval_cond, eval_define, eval_let, eval_string_set};
 use parser::{parse_all, Span};
 use std::collections::HashMap;
 
@@ -155,83 +155,7 @@ pub(crate) fn eval(expr: &Value, env: &mut Env, output: &mut String) -> Result<V
                         }
                         return Ok(Value::Boolean(false));
                     }
-                    "define" => {
-                        if items.len() < 3 {
-                            return Err(EvalError::Parse {
-                                message: "define requires at least 2 arguments".to_string(),
-                                line,
-                                col,
-                            });
-                        }
-                        match &items[1] {
-                            Value::Symbol(name, _) => {
-                                let mut val = eval(&items[2], env, output)?;
-                                if let Value::Lambda {
-                                    name: ref mut n, ..
-                                } = val
-                                {
-                                    *n = Some(name.clone());
-                                }
-                                env.insert(name.clone(), val);
-                                return Ok(Value::Boolean(false));
-                            }
-                            Value::List(sig, _) => {
-                                if sig.is_empty() {
-                                    return Err(EvalError::Parse {
-                                        message: "define: empty signature".to_string(),
-                                        line,
-                                        col,
-                                    });
-                                }
-                                let name = match &sig[0] {
-                                    Value::Symbol(n, _) => n.clone(),
-                                    other => {
-                                        return Err(EvalError::TypeError {
-                                            message: format!(
-                                                "define: expected symbol for name, got {}",
-                                                other.type_name()
-                                            ),
-                                            line,
-                                            col,
-                                        })
-                                    }
-                                };
-                                let params: Vec<String> = sig[1..]
-                                    .iter()
-                                    .map(|p| match p {
-                                        Value::Symbol(s, _) => Ok(s.clone()),
-                                        other => Err(EvalError::TypeError {
-                                            message: format!(
-                                                "define: expected symbol for parameter, got {}",
-                                                other.type_name()
-                                            ),
-                                            line,
-                                            col,
-                                        }),
-                                    })
-                                    .collect::<Result<_, _>>()?;
-                                let body: Vec<Value> = items[2..].to_vec();
-                                let closure = Value::Lambda {
-                                    name: Some(name.clone()),
-                                    params,
-                                    body,
-                                    closure_env: env.clone(),
-                                };
-                                env.insert(name, closure);
-                                return Ok(Value::Boolean(false));
-                            }
-                            other => {
-                                return Err(EvalError::TypeError {
-                                    message: format!(
-                                        "define: expected symbol or list, got {}",
-                                        other.type_name()
-                                    ),
-                                    line,
-                                    col,
-                                })
-                            }
-                        }
-                    }
+                    "define" => return eval_define(items, env, (line, col), output),
                     "lambda" => {
                         if items.len() < 3 {
                             return Err(EvalError::Parse {
@@ -344,6 +268,27 @@ pub(crate) fn eval(expr: &Value, env: &mut Env, output: &mut String) -> Result<V
                         return builtin_string_ops(&items[1..], env, op.as_str(), output)
                             .map_err(|e| e.with_position(line, col));
                     }
+                    "string-copy" => {
+                        if items.len() != 2 {
+                            return Err(EvalError::Arity {
+                                procedure: "string-copy".to_string(),
+                                expected: "1".to_string(),
+                                got: items.len() - 1,
+                                line,
+                                col,
+                            });
+                        }
+                        let val = eval(&items[1], env, output)?;
+                        match val {
+                            Value::Str(s) => return Ok(Value::Str(s)),
+                            other => return Err(EvalError::TypeError {
+                                message: format!("string-copy: expected string, got {}", other.type_name()),
+                                line,
+                                col,
+                            }),
+                        }
+                    }
+                    "string-set!" => return eval_string_set(items, env, (line, col), output),
                     "let" => return eval_let(&items[1..], env, (line, col), output),
                     "begin" => {
                         let mut result = Value::Boolean(false);

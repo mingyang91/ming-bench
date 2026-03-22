@@ -11,6 +11,7 @@ enum Token {
     Integer(i64),
     Boolean(bool),
     Str(String),
+    Char(char),
 }
 
 fn tokenize(input: &str) -> Result<Vec<(Token, Span)>, EvalError> {
@@ -107,6 +108,42 @@ fn tokenize(input: &str) -> Result<Vec<(Token, Span)>, EvalError> {
                             i += 2;
                             col += 2;
                         }
+                        '\\' => {
+                            // Character literal: #\a, #\space, #\newline
+                            if i + 2 >= chars.len() {
+                                return Err(EvalError::Parse {
+                                    message: "unexpected end after #\\".to_string(),
+                                    line,
+                                    col: start_col,
+                                });
+                            }
+                            let char_start = i + 2;
+                            let mut char_end = char_start + 1;
+                            // Read a full word for named characters
+                            while char_end < chars.len()
+                                && chars[char_end].is_alphanumeric()
+                            {
+                                char_end += 1;
+                            }
+                            let name: String = chars[char_start..char_end].iter().collect();
+                            let ch = match name.as_str() {
+                                "space" => ' ',
+                                "newline" => '\n',
+                                "tab" => '\t',
+                                s if s.len() == 1 => s.chars().next().expect("single char"),
+                                other => {
+                                    return Err(EvalError::Parse {
+                                        message: format!("unknown character name: {other}"),
+                                        line,
+                                        col: start_col,
+                                    });
+                                }
+                            };
+                            tokens.push((Token::Char(ch), (line, start_col)));
+                            let consumed = 2 + name.len(); // #\ + name
+                            i += consumed;
+                            col += consumed;
+                        }
                         _ => {
                             return Err(EvalError::Parse {
                                 message: format!(
@@ -164,6 +201,7 @@ fn parse(tokens: &[(Token, Span)], pos: usize) -> Result<(Value, usize), EvalErr
         Token::Integer(n) => Ok((Value::Integer(*n), pos + 1)),
         Token::Boolean(b) => Ok((Value::Boolean(*b), pos + 1)),
         Token::Str(s) => Ok((Value::Str(s.clone()), pos + 1)),
+        Token::Char(c) => Ok((Value::Char(*c), pos + 1)),
         Token::Symbol(s) => Ok((Value::Symbol(s.clone(), *span), pos + 1)),
         Token::LParen => {
             let list_span = *span;

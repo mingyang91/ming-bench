@@ -152,6 +152,160 @@ pub(crate) fn eval_let(
     }
 }
 
+pub(crate) fn eval_define(
+    items: &[Value],
+    env: &mut Env,
+    span: Span,
+    output: &mut String,
+) -> Result<Value, EvalError> {
+    let (line, col) = span;
+    if items.len() < 3 {
+        return Err(EvalError::Parse {
+            message: "define requires at least 2 arguments".to_string(),
+            line,
+            col,
+        });
+    }
+    match &items[1] {
+        Value::Symbol(name, _) => {
+            let mut val = eval(&items[2], env, output)?;
+            if let Value::Lambda {
+                name: ref mut n, ..
+            } = val
+            {
+                *n = Some(name.clone());
+            }
+            env.insert(name.clone(), val);
+            Ok(Value::Boolean(false))
+        }
+        Value::List(sig, _) => {
+            if sig.is_empty() {
+                return Err(EvalError::Parse {
+                    message: "define: empty signature".to_string(),
+                    line,
+                    col,
+                });
+            }
+            let name = match &sig[0] {
+                Value::Symbol(n, _) => n.clone(),
+                other => {
+                    return Err(EvalError::TypeError {
+                        message: format!(
+                            "define: expected symbol for name, got {}",
+                            other.type_name()
+                        ),
+                        line,
+                        col,
+                    })
+                }
+            };
+            let params: Vec<String> = sig[1..]
+                .iter()
+                .map(|p| match p {
+                    Value::Symbol(s, _) => Ok(s.clone()),
+                    other => Err(EvalError::TypeError {
+                        message: format!(
+                            "define: expected symbol for parameter, got {}",
+                            other.type_name()
+                        ),
+                        line,
+                        col,
+                    }),
+                })
+                .collect::<Result<_, _>>()?;
+            let body: Vec<Value> = items[2..].to_vec();
+            let closure = Value::Lambda {
+                name: Some(name.clone()),
+                params,
+                body,
+                closure_env: env.clone(),
+            };
+            env.insert(name, closure);
+            Ok(Value::Boolean(false))
+        }
+        other => Err(EvalError::TypeError {
+            message: format!(
+                "define: expected symbol or list, got {}",
+                other.type_name()
+            ),
+            line,
+            col,
+        }),
+    }
+}
+
+pub(crate) fn eval_string_set(
+    items: &[Value],
+    env: &mut Env,
+    span: Span,
+    output: &mut String,
+) -> Result<Value, EvalError> {
+    let (line, col) = span;
+    if items.len() != 4 {
+        return Err(EvalError::Arity {
+            procedure: "string-set!".to_string(),
+            expected: "3".to_string(),
+            got: items.len() - 1,
+            line,
+            col,
+        });
+    }
+    let var_name = match &items[1] {
+        Value::Symbol(name, _) => name.clone(),
+        other => {
+            return Err(EvalError::TypeError {
+                message: format!("string-set!: expected variable, got {}", other.type_name()),
+                line,
+                col,
+            })
+        }
+    };
+    let idx = eval(&items[2], env, output)?.as_integer("string-set!")?;
+    let ch = match eval(&items[3], env, output)? {
+        Value::Char(c) => c,
+        other => {
+            return Err(EvalError::TypeError {
+                message: format!(
+                    "string-set!: expected character, got {}",
+                    other.type_name()
+                ),
+                line,
+                col,
+            })
+        }
+    };
+    let s = env.get_mut(&var_name).ok_or_else(|| EvalError::UnboundVariable {
+        name: var_name.clone(),
+        line,
+        col,
+    })?;
+    match s {
+        Value::Str(ref mut string) => {
+            let idx = idx as usize;
+            if idx >= string.len() {
+                return Err(EvalError::TypeError {
+                    message: format!(
+                        "string-set!: index {} out of range for string of length {}",
+                        idx,
+                        string.len()
+                    ),
+                    line,
+                    col,
+                });
+            }
+            let mut chars: Vec<char> = string.chars().collect();
+            chars[idx] = ch;
+            *string = chars.into_iter().collect();
+            Ok(Value::Void)
+        }
+        other => Err(EvalError::TypeError {
+            message: format!("string-set!: expected string, got {}", other.type_name()),
+            line,
+            col,
+        }),
+    }
+}
+
 pub(crate) fn eval_cond(
     clauses: &[Value],
     env: &mut Env,
