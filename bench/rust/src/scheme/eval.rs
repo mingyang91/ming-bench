@@ -7,6 +7,8 @@ use crate::scheme::value::Value;
 
 const BUILTINS: &[&str] = &[
     "+", "-", "*", "/", "<", ">", "=", "<=", ">=", "not",
+    "cons", "car", "cdr", "null?", "list", "length", "append",
+    "string?", "number?", "boolean?", "pair?", "symbol?",
 ];
 
 fn is_builtin(name: &str) -> bool {
@@ -47,6 +49,9 @@ fn eval_list(items: &[Value], env: &Rc<RefCell<Env>>) -> Result<Value, EvalError
             "define" => return eval_define(&items[1..], env),
             "quote" => return eval_quote(&items[1..]),
             "lambda" => return eval_lambda(&items[1..], env),
+            "let" => return eval_let(&items[1..], env),
+            "begin" => return eval_begin(&items[1..], env),
+            "cond" => return eval_cond(&items[1..], env),
             _ => {}
         }
     }
@@ -155,6 +160,132 @@ fn apply_builtin(name: &str, args: &[Value]) -> Result<Value, EvalError> {
                 });
             }
             Ok(Value::Boolean(!args[0].is_truthy()))
+        }
+        "cons" => {
+            if args.len() != 2 {
+                return Err(EvalError::Arity {
+                    message: "cons requires exactly 2 arguments".into(),
+                });
+            }
+            match &args[1] {
+                Value::List(tail) => {
+                    let mut new_list = vec![args[0].clone()];
+                    new_list.extend(tail.iter().cloned());
+                    Ok(Value::List(new_list))
+                }
+                _ => Err(EvalError::Type {
+                    message: format!("cons: second argument must be a list, got {}", args[1]),
+                }),
+            }
+        }
+        "car" => {
+            if args.len() != 1 {
+                return Err(EvalError::Arity {
+                    message: "car requires exactly 1 argument".into(),
+                });
+            }
+            match &args[0] {
+                Value::List(items) if !items.is_empty() => Ok(items[0].clone()),
+                _ => Err(EvalError::Type {
+                    message: format!("car: expected non-empty list, got {}", args[0]),
+                }),
+            }
+        }
+        "cdr" => {
+            if args.len() != 1 {
+                return Err(EvalError::Arity {
+                    message: "cdr requires exactly 1 argument".into(),
+                });
+            }
+            match &args[0] {
+                Value::List(items) if !items.is_empty() => {
+                    Ok(Value::List(items[1..].to_vec()))
+                }
+                _ => Err(EvalError::Type {
+                    message: format!("cdr: expected non-empty list, got {}", args[0]),
+                }),
+            }
+        }
+        "null?" => {
+            if args.len() != 1 {
+                return Err(EvalError::Arity {
+                    message: "null? requires exactly 1 argument".into(),
+                });
+            }
+            Ok(Value::Boolean(matches!(&args[0], Value::List(items) if items.is_empty())))
+        }
+        "list" => Ok(Value::List(args.to_vec())),
+        "length" => {
+            if args.len() != 1 {
+                return Err(EvalError::Arity {
+                    message: "length requires exactly 1 argument".into(),
+                });
+            }
+            match &args[0] {
+                Value::List(items) => Ok(Value::Integer(items.len() as i64)),
+                _ => Err(EvalError::Type {
+                    message: format!("length: expected list, got {}", args[0]),
+                }),
+            }
+        }
+        "append" => {
+            let mut result = Vec::new();
+            for (i, arg) in args.iter().enumerate() {
+                match arg {
+                    Value::List(items) => result.extend(items.iter().cloned()),
+                    _ if i == args.len() - 1 => {
+                        return Err(EvalError::Type {
+                            message: format!("append: expected list, got {arg}"),
+                        });
+                    }
+                    _ => {
+                        return Err(EvalError::Type {
+                            message: format!("append: expected list, got {arg}"),
+                        });
+                    }
+                }
+            }
+            Ok(Value::List(result))
+        }
+        "string?" => {
+            if args.len() != 1 {
+                return Err(EvalError::Arity {
+                    message: "string? requires exactly 1 argument".into(),
+                });
+            }
+            Ok(Value::Boolean(matches!(&args[0], Value::Str(_))))
+        }
+        "number?" => {
+            if args.len() != 1 {
+                return Err(EvalError::Arity {
+                    message: "number? requires exactly 1 argument".into(),
+                });
+            }
+            Ok(Value::Boolean(matches!(&args[0], Value::Integer(_))))
+        }
+        "boolean?" => {
+            if args.len() != 1 {
+                return Err(EvalError::Arity {
+                    message: "boolean? requires exactly 1 argument".into(),
+                });
+            }
+            Ok(Value::Boolean(matches!(&args[0], Value::Boolean(_))))
+        }
+        "pair?" => {
+            if args.len() != 1 {
+                return Err(EvalError::Arity {
+                    message: "pair? requires exactly 1 argument".into(),
+                });
+            }
+            Ok(Value::Boolean(matches!(&args[0], Value::List(items) if !items.is_empty())))
+        }
+        "symbol?" => {
+            if args.len() != 1 {
+                return Err(EvalError::Arity {
+                    message: "symbol? requires exactly 1 argument".into(),
+                });
+            }
+            Ok(Value::Boolean(matches!(&args[0], Value::Symbol(_))))
         }
         _ => Err(EvalError::UnboundVariable {
             name: name.to_string(),
@@ -294,6 +425,134 @@ fn eval_lambda(args: &[Value], env: &Rc<RefCell<Env>>) -> Result<Value, EvalErro
         body,
         closure: Rc::clone(env),
     })
+}
+
+fn eval_let(args: &[Value], env: &Rc<RefCell<Env>>) -> Result<Value, EvalError> {
+    if args.len() < 2 {
+        return Err(EvalError::Arity {
+            message: "let requires at least 2 arguments".into(),
+        });
+    }
+
+    // Named let: (let name ((var init) ...) body ...)
+    if let Value::Symbol(name) = &args[0] {
+        if args.len() < 3 {
+            return Err(EvalError::Arity {
+                message: "named let requires bindings and body".into(),
+            });
+        }
+        let Value::List(bindings) = &args[1] else {
+            return Err(EvalError::Type {
+                message: "named let: expected bindings list".into(),
+            });
+        };
+        let mut params = Vec::new();
+        let mut init_vals = Vec::new();
+        for binding in bindings {
+            let Value::List(pair) = binding else {
+                return Err(EvalError::Type {
+                    message: "let: expected binding pair".into(),
+                });
+            };
+            if pair.len() != 2 {
+                return Err(EvalError::Arity {
+                    message: "let: binding must have 2 elements".into(),
+                });
+            }
+            let Value::Symbol(param) = &pair[0] else {
+                return Err(EvalError::Type {
+                    message: "let: expected variable name".into(),
+                });
+            };
+            params.push(param.clone());
+            init_vals.push(eval(&pair[1], env)?);
+        }
+        let body = args[2..].to_vec();
+        let local = Env::with_parent(env);
+        let lambda = Value::Lambda {
+            params: params.clone(),
+            body,
+            closure: Rc::clone(&local),
+        };
+        local.borrow_mut().set(name.clone(), lambda);
+        // Evaluate init values and call
+        let func = local.borrow().get(name).expect("just defined");
+        return apply(&func, &init_vals);
+    }
+
+    // Regular let: (let ((var init) ...) body ...)
+    let Value::List(bindings) = &args[0] else {
+        return Err(EvalError::Type {
+            message: "let: expected bindings list".into(),
+        });
+    };
+    let local = Env::with_parent(env);
+    for binding in bindings {
+        let Value::List(pair) = binding else {
+            return Err(EvalError::Type {
+                message: "let: expected binding pair".into(),
+            });
+        };
+        if pair.len() != 2 {
+            return Err(EvalError::Arity {
+                message: "let: binding must have 2 elements".into(),
+            });
+        }
+        let Value::Symbol(name) = &pair[0] else {
+            return Err(EvalError::Type {
+                message: "let: expected variable name".into(),
+            });
+        };
+        let val = eval(&pair[1], env)?;
+        local.borrow_mut().set(name.clone(), val);
+    }
+    let mut result = Value::Void;
+    for expr in &args[1..] {
+        result = eval(expr, &local)?;
+    }
+    Ok(result)
+}
+
+fn eval_begin(args: &[Value], env: &Rc<RefCell<Env>>) -> Result<Value, EvalError> {
+    let mut result = Value::Void;
+    for expr in args {
+        result = eval(expr, env)?;
+    }
+    Ok(result)
+}
+
+fn eval_cond(clauses: &[Value], env: &Rc<RefCell<Env>>) -> Result<Value, EvalError> {
+    for clause in clauses {
+        let Value::List(parts) = clause else {
+            return Err(EvalError::Type {
+                message: "cond: expected clause".into(),
+            });
+        };
+        if parts.is_empty() {
+            return Err(EvalError::Arity {
+                message: "cond: empty clause".into(),
+            });
+        }
+        // Check for else clause
+        if let Value::Symbol(s) = &parts[0] {
+            if s == "else" {
+                let mut result = Value::Void;
+                for expr in &parts[1..] {
+                    result = eval(expr, env)?;
+                }
+                return Ok(result);
+            }
+        }
+        let test = eval(&parts[0], env)?;
+        if test.is_truthy() {
+            let mut result = test;
+            for expr in &parts[1..] {
+                result = eval(expr, env)?;
+            }
+            return Ok(result);
+        }
+    }
+    Ok(Value::Void)
 }
 
 fn require_int(val: &Value, op: &str) -> Result<i64, EvalError> {

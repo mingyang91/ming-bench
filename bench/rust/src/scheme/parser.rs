@@ -18,6 +18,7 @@ pub fn parse(input: &str) -> Result<Vec<Value>, EvalError> {
 enum Token {
     LParen,
     RParen,
+    Quote,
     Atom(String),
     StringLit(String),
 }
@@ -41,6 +42,10 @@ fn tokenize(input: &str) -> Result<Vec<Token>, EvalError> {
             }
             ')' => {
                 tokens.push(Token::RParen);
+                i += 1;
+            }
+            '\'' => {
+                tokens.push(Token::Quote);
                 i += 1;
             }
             '"' => {
@@ -114,6 +119,10 @@ fn parse_expr(tokens: &[Token], pos: usize) -> Result<(Value, usize), EvalError>
         Token::RParen => Err(EvalError::Parse {
             message: "unexpected ')'".into(),
         }),
+        Token::Quote => {
+            let (inner, next) = parse_expr(tokens, pos + 1)?;
+            Ok((Value::List(vec![Value::Symbol("quote".into()), inner]), next))
+        }
         Token::StringLit(s) => Ok((Value::Str(s.clone()), pos + 1)),
         Token::Atom(a) => Ok((parse_atom(a), pos + 1)),
     }
