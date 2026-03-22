@@ -15,7 +15,25 @@ type SchemeVal =
   | { tag: 'nil'; pos?: Pos }
   | { tag: 'void'; pos?: Pos }
   | { tag: 'lambda'; params: string[]; restParam?: string; body: SchemeVal[]; env: Env; pos?: Pos }
-  | { tag: 'builtin'; fn: (args: SchemeVal[]) => SchemeVal; pos?: Pos };
+  | { tag: 'builtin'; fn: (args: SchemeVal[]) => SchemeVal; pos?: Pos }
+  | { tag: 'continuation'; id: symbol; callPos: string; exprIndex: number; bodyInfo?: { body: SchemeVal[]; idx: number; env: Env }; pos?: Pos }
+  | { tag: 'callcc'; pos?: Pos };
+
+// --- Continuation support ---
+
+class ContinuationJump {
+  constructor(
+    public id: symbol,
+    public value: SchemeVal,
+    public exprIndex: number,
+    public callPos: string,
+    public bodyInfo?: { body: SchemeVal[]; idx: number; env: Env }
+  ) {}
+}
+
+let currentExprIndex = 0;
+let currentBodyInfo: { body: SchemeVal[]; idx: number; env: Env } | null = null;
+let pendingContinuation: { callPos: string; value: SchemeVal; exprIndex: number } | null = null;
 
 // --- Output buffer (for display/write/newline) ---
 let outputBuffer = '';
@@ -395,9 +413,12 @@ function evalExpr(expr: SchemeVal, env: Env): SchemeVal {
               envDefine(letEnv, paramNames[i], initVals[i]);
             }
             if (body.length === 0) return { tag: 'void' };
+            const prevBodyInfo = currentBodyInfo;
             for (let i = 0; i < body.length - 1; i++) {
+              currentBodyInfo = { body, idx: i, env: letEnv };
               evalExpr(body[i], letEnv);
             }
+            currentBodyInfo = { body, idx: body.length - 1, env: letEnv };
             expr = body[body.length - 1]; env = letEnv; continue; // TCO
           }
           case 'set!': {
@@ -411,9 +432,12 @@ function evalExpr(expr: SchemeVal, env: Env): SchemeVal {
           case 'begin': {
             const bodyExprs = elems.slice(1);
             if (bodyExprs.length === 0) return { tag: 'void' };
+            const prevBodyInfoBegin = currentBodyInfo;
             for (let i = 0; i < bodyExprs.length - 1; i++) {
+              currentBodyInfo = { body: bodyExprs, idx: i, env };
               evalExpr(bodyExprs[i], env);
             }
+            currentBodyInfo = { body: bodyExprs, idx: bodyExprs.length - 1, env };
             expr = bodyExprs[bodyExprs.length - 1]; continue; // TCO
           }
           case 'cond': {
@@ -448,11 +472,38 @@ function evalExpr(expr: SchemeVal, env: Env): SchemeVal {
       }
       // Procedure application
       const proc = evalExpr(head, env);
+      if (proc.tag === 'callcc') {
+        const callPosKey = posStr(expr.pos);
+        // Check for pending reentrant continuation at this source position
+        if (pendingContinuation && pendingContinuation.callPos === callPosKey) {
+          const val = pendingContinuation.value;
+          pendingContinuation = null;
+          return val;
+        }
+        const theLambda = evalExpr(elems[1], env);
+        const id = Symbol();
+        const capturedBodyInfo = currentBodyInfo ? { ...currentBodyInfo } : undefined;
+        const contVal: SchemeVal = { tag: 'continuation', id, callPos: callPosKey, exprIndex: currentExprIndex, bodyInfo: capturedBodyInfo };
+        // Apply the lambda to the continuation, with try/catch for escape
+        try {
+          return applyProcCallCC(theLambda, [contVal], expr.pos);
+        } catch (e) {
+          if (e instanceof ContinuationJump && e.id === id) {
+            return e.value;
+          }
+          throw e;
+        }
+      }
+      if (proc.tag === 'continuation') {
+        const args = elems.slice(1).map(e => evalExpr(e, env));
+        throw new ContinuationJump(proc.id, args[0] ?? { tag: 'void' }, proc.exprIndex, proc.callPos, proc.bodyInfo);
+      }
       if (proc.tag === 'builtin') {
         const args = elems.slice(1).map(e => evalExpr(e, env));
         try {
           return proc.fn(args);
         } catch (e) {
+          if (e instanceof ContinuationJump) throw e;
           if (e instanceof EvalError && !/^\d/.test(e.message)) {
             throw new EvalError(`${posStr(expr.pos)}: ${e.message}`);
           }
@@ -462,9 +513,12 @@ function evalExpr(expr: SchemeVal, env: Env): SchemeVal {
       if (proc.tag === 'lambda') {
         const args = elems.slice(1).map(e => evalExpr(e, env));
         const callEnv = applyLambda(proc, args, expr.pos);
+        const prevBodyInfo2 = currentBodyInfo;
         for (let i = 0; i < proc.body.length - 1; i++) {
+          currentBodyInfo = { body: proc.body, idx: i, env: callEnv };
           evalExpr(proc.body[i], callEnv);
         }
+        currentBodyInfo = { body: proc.body, idx: proc.body.length - 1, env: callEnv };
         expr = proc.body[proc.body.length - 1]; env = callEnv; continue; // TCO
       }
       throw new EvalError(`${posStr(expr.pos)}: not a procedure`);
@@ -475,6 +529,26 @@ function evalExpr(expr: SchemeVal, env: Env): SchemeVal {
   }
 }
 
+
+// --- Helper for call/cc: apply proc without TCO so try/catch works ---
+
+function applyProcCallCC(proc: SchemeVal, args: SchemeVal[], pos?: Pos): SchemeVal {
+  if (proc.tag === 'lambda') {
+    const callEnv = applyLambda(proc, args, pos);
+    let result: SchemeVal = { tag: 'void' };
+    for (const bodyExpr of proc.body) {
+      result = evalExpr(bodyExpr, callEnv);
+    }
+    return result;
+  }
+  if (proc.tag === 'builtin') {
+    return proc.fn(args);
+  }
+  if (proc.tag === 'continuation') {
+    throw new ContinuationJump(proc.id, args[0] ?? { tag: 'void' }, proc.exprIndex, proc.callPos);
+  }
+  throw new EvalError(`${posStr(pos)}: call/cc: argument must be a procedure`);
+}
 
 // --- Arithmetic & Comparison ---
 
@@ -600,6 +674,9 @@ function makeGlobalEnv(): Env {
       }
       return result;
     }
+    if (proc.tag === 'continuation') {
+      throw new ContinuationJump(proc.id, allArgs[0] ?? { tag: 'void' }, proc.exprIndex, proc.callPos, proc.bodyInfo);
+    }
     throw new EvalError('apply: first argument must be a procedure');
   });
 
@@ -709,6 +786,10 @@ function makeGlobalEnv(): Env {
     return { tag: 'void' };
   });
 
+  // call/cc as first-class value
+  env.bindings.set('call/cc', { tag: 'callcc' });
+  env.bindings.set('call-with-current-continuation', { tag: 'callcc' });
+
   return env;
 }
 
@@ -742,6 +823,8 @@ function displayVal(val: SchemeVal): string {
     case 'list': return `(${val.elements.map(displayVal).join(' ')})`;
     case 'void': return '#<void>';
     case 'lambda': return '#<procedure>';
+    case 'continuation': return '#<procedure>';
+    case 'callcc': return '#<procedure>';
     default: return '#<builtin>';
   }
 }
@@ -773,6 +856,70 @@ function displayValUnquoted(val: SchemeVal): string {
 
 // --- Public API ---
 
+function evalProgram(exprs: SchemeVal[], env: Env): SchemeVal {
+  let startIndex = 0;
+  pendingContinuation = null;
+  while (true) {
+    try {
+      let result: SchemeVal = { tag: 'void' };
+      for (let i = startIndex; i < exprs.length; i++) {
+        currentExprIndex = i;
+        result = evalExpr(exprs[i], env);
+      }
+      return result;
+    } catch (e) {
+      if (e instanceof ContinuationJump) {
+        // If the continuation was invoked within the same top-level expression
+        // and has body context, resume from the body (preserving let/lambda env)
+        if (e.bodyInfo && currentExprIndex === e.exprIndex) {
+          pendingContinuation = { callPos: e.callPos, value: e.value, exprIndex: e.exprIndex };
+          // Resume from the body context, then continue with remaining top-level exprs
+          let bodyResult: SchemeVal = { tag: 'void' };
+          let jumpInfo = e;
+          // Loop in case the continuation is invoked again within the body
+          while (true) {
+            try {
+              pendingContinuation = { callPos: jumpInfo.callPos, value: jumpInfo.value, exprIndex: jumpInfo.exprIndex };
+              bodyResult = { tag: 'void' };
+              for (let bi = jumpInfo.bodyInfo!.idx; bi < jumpInfo.bodyInfo!.body.length; bi++) {
+                currentExprIndex = jumpInfo.exprIndex;
+                bodyResult = evalExpr(jumpInfo.bodyInfo!.body[bi], jumpInfo.bodyInfo!.env);
+              }
+              // Body completed - continue with remaining top-level expressions
+              for (let i = jumpInfo.exprIndex + 1; i < exprs.length; i++) {
+                currentExprIndex = i;
+                bodyResult = evalExpr(exprs[i], env);
+              }
+              return bodyResult;
+            } catch (e2) {
+              if (e2 instanceof ContinuationJump && e2.bodyInfo) {
+                jumpInfo = e2;
+                continue;
+              }
+              if (e2 instanceof ContinuationJump) {
+                // No bodyInfo - fall through to re-execution
+                pendingContinuation = { callPos: e2.callPos, value: e2.value, exprIndex: e2.exprIndex };
+                startIndex = e2.exprIndex;
+                break;
+              }
+              throw e2;
+            }
+          }
+          continue; // continue the outer re-execution loop
+        }
+        pendingContinuation = {
+          callPos: e.callPos,
+          value: e.value,
+          exprIndex: e.exprIndex
+        };
+        startIndex = e.exprIndex;
+        continue;
+      }
+      throw e;
+    }
+  }
+}
+
 export function evalStr(input: string): string {
   const tokens = tokenize(input);
   const exprs = parse(tokens);
@@ -780,11 +927,8 @@ export function evalStr(input: string): string {
     throw new EvalError('no expressions');
   }
   const env = makeGlobalEnv();
-  let result: SchemeVal | undefined;
-  for (const expr of exprs) {
-    result = evalExpr(expr, env);
-  }
-  return displayVal(result!);
+  const result = evalProgram(exprs, env);
+  return displayVal(result);
 }
 
 export function evalStrWithOutput(input: string): { result: string; output: string } {
@@ -795,9 +939,6 @@ export function evalStrWithOutput(input: string): { result: string; output: stri
     throw new EvalError('no expressions');
   }
   const env = makeGlobalEnv();
-  let result: SchemeVal | undefined;
-  for (const expr of exprs) {
-    result = evalExpr(expr, env);
-  }
-  return { result: displayVal(result!), output: outputBuffer };
+  const result = evalProgram(exprs, env);
+  return { result: displayVal(result), output: outputBuffer };
 }

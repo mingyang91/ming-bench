@@ -1,4 +1,22 @@
 import { EvalError } from './evalError.js';
+// --- Continuation support ---
+class ContinuationJump {
+    id;
+    value;
+    exprIndex;
+    callPos;
+    bodyInfo;
+    constructor(id, value, exprIndex, callPos, bodyInfo) {
+        this.id = id;
+        this.value = value;
+        this.exprIndex = exprIndex;
+        this.callPos = callPos;
+        this.bodyInfo = bodyInfo;
+    }
+}
+let currentExprIndex = 0;
+let currentBodyInfo = null;
+let pendingContinuation = null;
 // --- Output buffer (for display/write/newline) ---
 let outputBuffer = '';
 function posStr(pos) {
@@ -380,9 +398,12 @@ function evalExpr(expr, env) {
                             }
                             if (body.length === 0)
                                 return { tag: 'void' };
+                            const prevBodyInfo = currentBodyInfo;
                             for (let i = 0; i < body.length - 1; i++) {
+                                currentBodyInfo = { body, idx: i, env: letEnv };
                                 evalExpr(body[i], letEnv);
                             }
+                            currentBodyInfo = { body, idx: body.length - 1, env: letEnv };
                             expr = body[body.length - 1];
                             env = letEnv;
                             continue; // TCO
@@ -401,9 +422,12 @@ function evalExpr(expr, env) {
                             const bodyExprs = elems.slice(1);
                             if (bodyExprs.length === 0)
                                 return { tag: 'void' };
+                            const prevBodyInfoBegin = currentBodyInfo;
                             for (let i = 0; i < bodyExprs.length - 1; i++) {
+                                currentBodyInfo = { body: bodyExprs, idx: i, env };
                                 evalExpr(bodyExprs[i], env);
                             }
+                            currentBodyInfo = { body: bodyExprs, idx: bodyExprs.length - 1, env };
                             expr = bodyExprs[bodyExprs.length - 1];
                             continue; // TCO
                         }
@@ -442,12 +466,41 @@ function evalExpr(expr, env) {
                 }
                 // Procedure application
                 const proc = evalExpr(head, env);
+                if (proc.tag === 'callcc') {
+                    const callPosKey = posStr(expr.pos);
+                    // Check for pending reentrant continuation at this source position
+                    if (pendingContinuation && pendingContinuation.callPos === callPosKey) {
+                        const val = pendingContinuation.value;
+                        pendingContinuation = null;
+                        return val;
+                    }
+                    const theLambda = evalExpr(elems[1], env);
+                    const id = Symbol();
+                    const capturedBodyInfo = currentBodyInfo ? { ...currentBodyInfo } : undefined;
+                    const contVal = { tag: 'continuation', id, callPos: callPosKey, exprIndex: currentExprIndex, bodyInfo: capturedBodyInfo };
+                    // Apply the lambda to the continuation, with try/catch for escape
+                    try {
+                        return applyProcCallCC(theLambda, [contVal], expr.pos);
+                    }
+                    catch (e) {
+                        if (e instanceof ContinuationJump && e.id === id) {
+                            return e.value;
+                        }
+                        throw e;
+                    }
+                }
+                if (proc.tag === 'continuation') {
+                    const args = elems.slice(1).map(e => evalExpr(e, env));
+                    throw new ContinuationJump(proc.id, args[0] ?? { tag: 'void' }, proc.exprIndex, proc.callPos, proc.bodyInfo);
+                }
                 if (proc.tag === 'builtin') {
                     const args = elems.slice(1).map(e => evalExpr(e, env));
                     try {
                         return proc.fn(args);
                     }
                     catch (e) {
+                        if (e instanceof ContinuationJump)
+                            throw e;
                         if (e instanceof EvalError && !/^\d/.test(e.message)) {
                             throw new EvalError(`${posStr(expr.pos)}: ${e.message}`);
                         }
@@ -457,9 +510,12 @@ function evalExpr(expr, env) {
                 if (proc.tag === 'lambda') {
                     const args = elems.slice(1).map(e => evalExpr(e, env));
                     const callEnv = applyLambda(proc, args, expr.pos);
+                    const prevBodyInfo2 = currentBodyInfo;
                     for (let i = 0; i < proc.body.length - 1; i++) {
+                        currentBodyInfo = { body: proc.body, idx: i, env: callEnv };
                         evalExpr(proc.body[i], callEnv);
                     }
+                    currentBodyInfo = { body: proc.body, idx: proc.body.length - 1, env: callEnv };
                     expr = proc.body[proc.body.length - 1];
                     env = callEnv;
                     continue; // TCO
@@ -470,6 +526,24 @@ function evalExpr(expr, env) {
                 return expr;
         }
     }
+}
+// --- Helper for call/cc: apply proc without TCO so try/catch works ---
+function applyProcCallCC(proc, args, pos) {
+    if (proc.tag === 'lambda') {
+        const callEnv = applyLambda(proc, args, pos);
+        let result = { tag: 'void' };
+        for (const bodyExpr of proc.body) {
+            result = evalExpr(bodyExpr, callEnv);
+        }
+        return result;
+    }
+    if (proc.tag === 'builtin') {
+        return proc.fn(args);
+    }
+    if (proc.tag === 'continuation') {
+        throw new ContinuationJump(proc.id, args[0] ?? { tag: 'void' }, proc.exprIndex, proc.callPos);
+    }
+    throw new EvalError(`${posStr(pos)}: call/cc: argument must be a procedure`);
 }
 // --- Arithmetic & Comparison ---
 function requireNumbers(args, name) {
@@ -614,6 +688,9 @@ function makeGlobalEnv() {
             }
             return result;
         }
+        if (proc.tag === 'continuation') {
+            throw new ContinuationJump(proc.id, allArgs[0] ?? { tag: 'void' }, proc.exprIndex, proc.callPos, proc.bodyInfo);
+        }
         throw new EvalError('apply: first argument must be a procedure');
     });
     // Type predicates
@@ -748,6 +825,9 @@ function makeGlobalEnv() {
         args[0].value = str.substring(0, idx) + args[2].value + str.substring(idx + 1);
         return { tag: 'void' };
     });
+    // call/cc as first-class value
+    env.bindings.set('call/cc', { tag: 'callcc' });
+    env.bindings.set('call-with-current-continuation', { tag: 'callcc' });
     return env;
 }
 // --- Display ---
@@ -780,6 +860,8 @@ function displayVal(val) {
         case 'list': return `(${val.elements.map(displayVal).join(' ')})`;
         case 'void': return '#<void>';
         case 'lambda': return '#<procedure>';
+        case 'continuation': return '#<procedure>';
+        case 'callcc': return '#<procedure>';
         default: return '#<builtin>';
     }
 }
@@ -809,6 +891,71 @@ function displayValUnquoted(val) {
     }
 }
 // --- Public API ---
+function evalProgram(exprs, env) {
+    let startIndex = 0;
+    pendingContinuation = null;
+    while (true) {
+        try {
+            let result = { tag: 'void' };
+            for (let i = startIndex; i < exprs.length; i++) {
+                currentExprIndex = i;
+                result = evalExpr(exprs[i], env);
+            }
+            return result;
+        }
+        catch (e) {
+            if (e instanceof ContinuationJump) {
+                // If the continuation was invoked within the same top-level expression
+                // and has body context, resume from the body (preserving let/lambda env)
+                if (e.bodyInfo && currentExprIndex === e.exprIndex) {
+                    pendingContinuation = { callPos: e.callPos, value: e.value, exprIndex: e.exprIndex };
+                    // Resume from the body context, then continue with remaining top-level exprs
+                    let bodyResult = { tag: 'void' };
+                    let jumpInfo = e;
+                    // Loop in case the continuation is invoked again within the body
+                    while (true) {
+                        try {
+                            pendingContinuation = { callPos: jumpInfo.callPos, value: jumpInfo.value, exprIndex: jumpInfo.exprIndex };
+                            bodyResult = { tag: 'void' };
+                            for (let bi = jumpInfo.bodyInfo.idx; bi < jumpInfo.bodyInfo.body.length; bi++) {
+                                currentExprIndex = jumpInfo.exprIndex;
+                                bodyResult = evalExpr(jumpInfo.bodyInfo.body[bi], jumpInfo.bodyInfo.env);
+                            }
+                            // Body completed - continue with remaining top-level expressions
+                            for (let i = jumpInfo.exprIndex + 1; i < exprs.length; i++) {
+                                currentExprIndex = i;
+                                bodyResult = evalExpr(exprs[i], env);
+                            }
+                            return bodyResult;
+                        }
+                        catch (e2) {
+                            if (e2 instanceof ContinuationJump && e2.bodyInfo) {
+                                jumpInfo = e2;
+                                continue;
+                            }
+                            if (e2 instanceof ContinuationJump) {
+                                // No bodyInfo - fall through to re-execution
+                                pendingContinuation = { callPos: e2.callPos, value: e2.value, exprIndex: e2.exprIndex };
+                                startIndex = e2.exprIndex;
+                                break;
+                            }
+                            throw e2;
+                        }
+                    }
+                    continue; // continue the outer re-execution loop
+                }
+                pendingContinuation = {
+                    callPos: e.callPos,
+                    value: e.value,
+                    exprIndex: e.exprIndex
+                };
+                startIndex = e.exprIndex;
+                continue;
+            }
+            throw e;
+        }
+    }
+}
 export function evalStr(input) {
     const tokens = tokenize(input);
     const exprs = parse(tokens);
@@ -816,10 +963,7 @@ export function evalStr(input) {
         throw new EvalError('no expressions');
     }
     const env = makeGlobalEnv();
-    let result;
-    for (const expr of exprs) {
-        result = evalExpr(expr, env);
-    }
+    const result = evalProgram(exprs, env);
     return displayVal(result);
 }
 export function evalStrWithOutput(input) {
@@ -830,9 +974,6 @@ export function evalStrWithOutput(input) {
         throw new EvalError('no expressions');
     }
     const env = makeGlobalEnv();
-    let result;
-    for (const expr of exprs) {
-        result = evalExpr(expr, env);
-    }
+    const result = evalProgram(exprs, env);
     return { result: displayVal(result), output: outputBuffer };
 }
