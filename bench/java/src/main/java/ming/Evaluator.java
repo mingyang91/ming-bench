@@ -4,12 +4,14 @@ import java.util.ArrayList;
 import java.util.HashMap;
 import java.util.IdentityHashMap;
 import java.util.List;
+import java.util.HashSet;
 import java.util.Map;
+import java.util.Set;
 
 public class Evaluator {
 
     // ---- Value types ----
-    sealed interface SchemeVal permits IntVal, BoolVal, StrVal, CharVal, ListVal, SymbolVal, LambdaVal, VoidVal, BuiltinVal, ContinuationVal {}
+    sealed interface SchemeVal permits IntVal, BoolVal, StrVal, CharVal, ListVal, SymbolVal, LambdaVal, VoidVal, BuiltinVal, ContinuationVal, MacroVal {}
     record IntVal(long value) implements SchemeVal {}
     record BoolVal(boolean value) implements SchemeVal {}
     static final class StrVal implements SchemeVal {
@@ -40,6 +42,8 @@ public class Evaluator {
         }
     }
 
+    record MacroVal(String name, List<List<SchemeVal>> rules, Env defEnv, List<String> literals) implements SchemeVal {}
+
     private static final SchemeVal VOID = new VoidVal();
 
     // ---- Continuation support ----
@@ -66,6 +70,10 @@ public class Evaluator {
     private List<SchemeVal> currentBodyExprs = null;
     private int currentBodyIdx = 0;
     private Env currentBodyEnv = null;
+
+    // ---- Gensym for macro hygiene ----
+    private int gensymCounter = 0;
+    private String gensym(String base) { return base + "##" + (gensymCounter++); }
 
     // ---- Output capture ----
     private StringBuilder outputBuffer;
@@ -490,7 +498,38 @@ public class Evaluator {
                             SchemeVal proc = eval(elems.get(1), env);
                             return doCallCC(proc);
                         }
+                        case "define-syntax": {
+                            if (elems.size() != 3) throw new EvalError("define-syntax requires 2 arguments");
+                            String macroName = ((SymbolVal) elems.get(1)).name();
+                            SchemeVal syntaxRulesExpr = elems.get(2);
+                            if (!(syntaxRulesExpr instanceof ListVal srList))
+                                throw new EvalError("define-syntax: expected syntax-rules");
+                            List<SchemeVal> srElems = srList.elements();
+                            if (srElems.isEmpty() || !(srElems.get(0) instanceof SymbolVal srSym)
+                                    || !srSym.name().equals("syntax-rules"))
+                                throw new EvalError("define-syntax: expected syntax-rules");
+                            List<String> literals = new ArrayList<>();
+                            if (srElems.get(1) instanceof ListVal litList) {
+                                for (SchemeVal lit : litList.elements())
+                                    literals.add(((SymbolVal) lit).name());
+                            }
+                            List<List<SchemeVal>> rules = new ArrayList<>();
+                            for (int i = 2; i < srElems.size(); i++) {
+                                ListVal rule = (ListVal) srElems.get(i);
+                                rules.add(rule.elements());
+                            }
+                            env.define(macroName, new MacroVal(macroName, rules, env, literals));
+                            return VOID;
+                        }
                         default: {
+                            // Check if it's a macro
+                            try {
+                                SchemeVal maybeM = env.get(sym.name());
+                                if (maybeM instanceof MacroVal macro) {
+                                    expr = expandMacro(macro, listExpr, env);
+                                    continue trampoline;
+                                }
+                            } catch (EvalError ignored) {}
                             // fall through to procedure call
                             break;
                         }
@@ -597,6 +636,169 @@ public class Evaluator {
             return result;
         }
         throw new EvalError("not a procedure: " + display(proc));
+    }
+
+    // ---- Macro expansion (define-syntax / syntax-rules) ----
+    private static final Set<String> SPECIAL_FORMS = Set.of(
+        "quote", "if", "define", "lambda", "and", "or", "let", "set!", "begin",
+        "cond", "call/cc", "call-with-current-continuation", "define-syntax",
+        "let*", "letrec", "letrec*", "do", "case", "when", "unless", "syntax-rules"
+    );
+
+    private SchemeVal expandMacro(MacroVal macro, ListVal form, Env useEnv) throws EvalError {
+        for (List<SchemeVal> rule : macro.rules()) {
+            SchemeVal pattern = rule.get(0);
+            SchemeVal template = rule.get(1);
+            Map<String, Object> bindings = matchPattern(pattern, form, macro.name(), macro.literals());
+            if (bindings != null) {
+                Map<String, String> renameMap = new HashMap<>();
+                return expandTemplate(template, bindings, macro.defEnv(), useEnv, renameMap, macro.name());
+            }
+        }
+        throw new EvalError("no matching pattern for macro " + macro.name());
+    }
+
+    @SuppressWarnings("unchecked")
+    private Map<String, Object> matchPattern(SchemeVal pattern, SchemeVal form,
+                                              String macroName, List<String> literals) {
+        if (pattern instanceof SymbolVal sym) {
+            String name = sym.name();
+            if (name.equals("_") || name.equals(macroName))
+                return new HashMap<>();
+            if (literals.contains(name)) {
+                if (form instanceof SymbolVal fs && fs.name().equals(name))
+                    return new HashMap<>();
+                return null;
+            }
+            Map<String, Object> b = new HashMap<>();
+            b.put(name, form);
+            return b;
+        }
+        if (pattern instanceof ListVal patList && form instanceof ListVal formList) {
+            List<SchemeVal> pats = patList.elements();
+            List<SchemeVal> forms = formList.elements();
+            Map<String, Object> bindings = new HashMap<>();
+            int pi = 0, fi = 0;
+            while (pi < pats.size()) {
+                if (pi + 1 < pats.size() && pats.get(pi + 1) instanceof SymbolVal s
+                        && s.name().equals("...")) {
+                    SchemeVal ellipPat = pats.get(pi);
+                    int remainingPats = 0;
+                    for (int k = pi + 2; k < pats.size(); k++) {
+                        if (k + 1 < pats.size() && pats.get(k + 1) instanceof SymbolVal es
+                                && es.name().equals("...")) {
+                            k++;
+                        } else {
+                            remainingPats++;
+                        }
+                    }
+                    int available = forms.size() - fi - remainingPats;
+                    if (available < 0) return null;
+                    Set<String> ellipVars = patternVars(ellipPat, macroName, literals);
+                    Map<String, List<SchemeVal>> ellipBindings = new HashMap<>();
+                    for (String v : ellipVars) ellipBindings.put(v, new ArrayList<>());
+                    for (int j = 0; j < available; j++) {
+                        Map<String, Object> sub = matchPattern(ellipPat, forms.get(fi + j), macroName, literals);
+                        if (sub == null) return null;
+                        for (String v : ellipVars) {
+                            Object val = sub.get(v);
+                            if (val instanceof SchemeVal sv) ellipBindings.get(v).add(sv);
+                        }
+                    }
+                    for (var e : ellipBindings.entrySet()) bindings.put(e.getKey(), e.getValue());
+                    fi += available;
+                    pi += 2;
+                } else {
+                    if (fi >= forms.size()) return null;
+                    Map<String, Object> sub = matchPattern(pats.get(pi), forms.get(fi), macroName, literals);
+                    if (sub == null) return null;
+                    bindings.putAll(sub);
+                    pi++;
+                    fi++;
+                }
+            }
+            if (fi != forms.size()) return null;
+            return bindings;
+        }
+        // Literal match
+        if (pattern instanceof BoolVal pb && form instanceof BoolVal fb && pb.value() == fb.value())
+            return new HashMap<>();
+        if (pattern instanceof IntVal pi && form instanceof IntVal fi && pi.value() == fi.value())
+            return new HashMap<>();
+        return null;
+    }
+
+    private Set<String> patternVars(SchemeVal pattern, String macroName, List<String> literals) {
+        Set<String> vars = new HashSet<>();
+        if (pattern instanceof SymbolVal sym) {
+            String name = sym.name();
+            if (!name.equals("_") && !name.equals(macroName) && !name.equals("...") && !literals.contains(name))
+                vars.add(name);
+        } else if (pattern instanceof ListVal list) {
+            for (SchemeVal e : list.elements()) vars.addAll(patternVars(e, macroName, literals));
+        }
+        return vars;
+    }
+
+    @SuppressWarnings("unchecked")
+    private SchemeVal expandTemplate(SchemeVal template, Map<String, Object> bindings,
+                                     Env defEnv, Env useEnv, Map<String, String> renameMap,
+                                     String macroName) throws EvalError {
+        if (template instanceof SymbolVal sym) {
+            String name = sym.name();
+            if (bindings.containsKey(name) && bindings.get(name) instanceof SchemeVal sv) return sv;
+            if (name.equals("...")) return template;
+            if (SPECIAL_FORMS.contains(name) || name.equals(macroName)) return template;
+            if (renameMap.containsKey(name)) return new SymbolVal(renameMap.get(name));
+            String gs = gensym(name);
+            renameMap.put(name, gs);
+            try {
+                SchemeVal defVal = defEnv.get(name);
+                useEnv.define(gs, defVal);
+            } catch (EvalError ignored) {}
+            return new SymbolVal(gs);
+        }
+        if (template instanceof ListVal list) {
+            List<SchemeVal> expanded = new ArrayList<>();
+            List<SchemeVal> elems = list.elements();
+            for (int i = 0; i < elems.size(); i++) {
+                if (i + 1 < elems.size() && elems.get(i + 1) instanceof SymbolVal s
+                        && s.name().equals("...")) {
+                    SchemeVal tmpl = elems.get(i);
+                    Set<String> ellipVars = findEllipsisVars(tmpl, bindings);
+                    if (!ellipVars.isEmpty()) {
+                        String firstVar = ellipVars.iterator().next();
+                        List<SchemeVal> vals = (List<SchemeVal>) bindings.get(firstVar);
+                        for (int j = 0; j < vals.size(); j++) {
+                            Map<String, Object> subBindings = new HashMap<>(bindings);
+                            for (String v : ellipVars) {
+                                List<SchemeVal> vList = (List<SchemeVal>) bindings.get(v);
+                                subBindings.put(v, vList.get(j));
+                            }
+                            expanded.add(expandTemplate(tmpl, subBindings, defEnv, useEnv, renameMap, macroName));
+                        }
+                    }
+                    i++; // skip ...
+                } else {
+                    expanded.add(expandTemplate(elems.get(i), bindings, defEnv, useEnv, renameMap, macroName));
+                }
+            }
+            return new ListVal(expanded);
+        }
+        return template;
+    }
+
+    @SuppressWarnings("unchecked")
+    private Set<String> findEllipsisVars(SchemeVal template, Map<String, Object> bindings) {
+        Set<String> vars = new HashSet<>();
+        if (template instanceof SymbolVal sym) {
+            String name = sym.name();
+            if (bindings.containsKey(name) && bindings.get(name) instanceof List)
+                vars.add(name);
+        } else if (template instanceof ListVal list) {
+            for (SchemeVal e : list.elements()) vars.addAll(findEllipsisVars(e, bindings));
+        }
+        return vars;
     }
 
     private SchemeVal doApply(List<SchemeVal> args) throws EvalError {
@@ -880,6 +1082,7 @@ public class Evaluator {
             case LambdaVal v -> "#<procedure>";
             case BuiltinVal v -> "#<procedure:" + v.name() + ">";
             case ContinuationVal v -> "#<continuation>";
+            case MacroVal v -> "#<macro:" + v.name() + ">";
             case ListVal v -> {
                 StringBuilder sb = new StringBuilder("(");
                 for (int i = 0; i < v.elements().size(); i++) {
