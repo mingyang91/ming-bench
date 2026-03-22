@@ -134,14 +134,11 @@ enum Commands {
         #[arg(long)]
         all: bool,
     },
-    /// Verify test cases against ground-truth Scheme implementation
+    /// Verify test cases against Chez Scheme ground truth
     Verify {
         /// Only verify this level (e.g., "15")
         #[arg(long)]
         level: Option<String>,
-        /// Ground-truth implementation: guile (default), chez
-        #[arg(long, default_value = "guile")]
-        r#impl: String,
     },
     /// Dump session content (thinking, text, tool calls)
     SessionDump {
@@ -269,9 +266,7 @@ fn dispatch_non_agent(command: Commands) -> model::Result<()> {
             ref lang,
         } => cmd::bench::run(branch, run_id.as_deref(), lang),
         Commands::Analyze { runs, all } => cmd::analyze::run(runs, all),
-        Commands::Verify { ref level, ref r#impl } => {
-            cmd::verify::run(level.as_deref(), r#impl)
-        }
+        Commands::Verify { ref level } => cmd::verify::run(level.as_deref()),
         other => dispatch_session_command(other),
     }
 }
