@@ -1,4 +1,6 @@
+use std::cell::RefCell;
 use std::fmt;
+use std::rc::Rc;
 
 use crate::scheme::env::Env;
 use crate::scheme::error::Span;
@@ -84,6 +86,7 @@ pub enum Value {
         syntax_rules: SyntaxRulesDef,
         def_env: Env,
     },
+    Vector(Rc<RefCell<Vec<Value>>>),
 }
 
 impl Value {
@@ -105,6 +108,7 @@ impl PartialEq for Value {
             (Value::Pair(a1, a2), Value::Pair(b1, b2)) => a1 == b1 && a2 == b2,
             (Value::Builtin(a), Value::Builtin(b)) => a == b,
             (Value::Continuation { id: a, .. }, Value::Continuation { id: b, .. }) => a == b,
+            (Value::Vector(a), Value::Vector(b)) => *a.borrow() == *b.borrow(),
             (Value::Macro { .. }, Value::Macro { .. }) => false,
             _ => false,
         }
@@ -119,6 +123,16 @@ impl Value {
             Value::Pair(_, _) => {
                 buf.push('(');
                 display_list(buf, self);
+            }
+            Value::Vector(v) => {
+                buf.push_str("#(");
+                for (i, elem) in v.borrow().iter().enumerate() {
+                    if i > 0 {
+                        buf.push(' ');
+                    }
+                    elem.display_fmt(buf);
+                }
+                buf.push(')');
             }
             Value::Builtin(_)
             | Value::Lambda { .. }
@@ -147,6 +161,16 @@ impl fmt::Display for Value {
             Value::Pair(_, _) => {
                 write!(f, "(")?;
                 write_list(f, self)
+            }
+            Value::Vector(v) => {
+                write!(f, "#(")?;
+                for (i, elem) in v.borrow().iter().enumerate() {
+                    if i > 0 {
+                        write!(f, " ")?;
+                    }
+                    write!(f, "{elem}")?;
+                }
+                write!(f, ")")
             }
             Value::Lambda { .. } => write!(f, "#<procedure>"),
             Value::Builtin(name) => write!(f, "#<procedure:{name}>"),
