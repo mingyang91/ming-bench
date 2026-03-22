@@ -31,6 +31,9 @@ fn eval_list(elements: &[Expr], env: &Env) -> Result<Value, EvalError> {
             "and" => return eval_and(&elements[1..], env),
             "or" => return eval_or(&elements[1..], env),
             "not" => return eval_not(&elements[1..], env),
+            "let" => return eval_let(&elements[1..], env),
+            "begin" => return eval_begin(&elements[1..], env),
+            "cond" => return eval_cond(&elements[1..], env),
             _ => {}
         }
     }
@@ -57,7 +60,28 @@ fn eval_list(elements: &[Expr], env: &Env) -> Result<Value, EvalError> {
 }
 
 fn is_builtin(name: &str) -> bool {
-    matches!(name, "+" | "-" | "*" | "/" | "<" | ">" | "=" | "<=" | ">=")
+    matches!(
+        name,
+        "+" | "-"
+            | "*"
+            | "/"
+            | "<"
+            | ">"
+            | "="
+            | "<="
+            | ">="
+            | "cons"
+            | "car"
+            | "cdr"
+            | "null?"
+            | "list"
+            | "length"
+            | "pair?"
+            | "string?"
+            | "number?"
+            | "boolean?"
+            | "symbol?"
+    )
 }
 
 fn apply(op: &Value, args: &[Value]) -> Result<Value, EvalError> {
@@ -101,6 +125,17 @@ fn eval_builtin(name: &str, args: &[Value]) -> Result<Value, EvalError> {
         "=" => eval_cmp(args, name, |a, b| a == b),
         "<=" => eval_cmp(args, name, |a, b| a <= b),
         ">=" => eval_cmp(args, name, |a, b| a >= b),
+        "cons" => eval_cons(args),
+        "car" => eval_car(args),
+        "cdr" => eval_cdr(args),
+        "null?" => eval_null_pred(args),
+        "list" => eval_list_builtin(args),
+        "length" => eval_length(args),
+        "pair?" => Ok(Value::Boolean(matches!(args.first(), Some(Value::Pair(_, _))) && args.len() == 1)),
+        "string?" => Ok(Value::Boolean(matches!(args.first(), Some(Value::SchemeString(_))) && args.len() == 1)),
+        "number?" => Ok(Value::Boolean(matches!(args.first(), Some(Value::Integer(_))) && args.len() == 1)),
+        "boolean?" => Ok(Value::Boolean(matches!(args.first(), Some(Value::Boolean(_))) && args.len() == 1)),
+        "symbol?" => Ok(Value::Boolean(matches!(args.first(), Some(Value::Symbol(_))) && args.len() == 1)),
         _ => Err(EvalError::UnboundVariable {
             name: name.to_string(),
         }),
@@ -195,7 +230,7 @@ fn expr_to_value(expr: &Expr) -> Result<Value, EvalError> {
         Expr::Integer(n) => Ok(Value::Integer(*n)),
         Expr::Boolean(b) => Ok(Value::Boolean(*b)),
         Expr::SchemeString(s) => Ok(Value::SchemeString(s.clone())),
-        Expr::Symbol(s) => Ok(Value::SchemeString(s.clone())), // symbols as strings for now
+        Expr::Symbol(s) => Ok(Value::Symbol(s.clone())),
         Expr::List(elements) => {
             let mut result = Value::Nil;
             for elem in elements.iter().rev() {
@@ -365,4 +400,182 @@ fn eval_cmp(args: &[Value], name: &str, cmp: fn(i64, i64) -> bool) -> Result<Val
         prev = curr;
     }
     Ok(Value::Boolean(true))
+}
+
+fn eval_cons(args: &[Value]) -> Result<Value, EvalError> {
+    if args.len() != 2 {
+        return Err(EvalError::Arity {
+            name: "cons".into(),
+            expected: "2".into(),
+            got: args.len(),
+        });
+    }
+    Ok(Value::Pair(
+        Box::new(args[0].clone()),
+        Box::new(args[1].clone()),
+    ))
+}
+
+fn eval_car(args: &[Value]) -> Result<Value, EvalError> {
+    if args.len() != 1 {
+        return Err(EvalError::Arity {
+            name: "car".into(),
+            expected: "1".into(),
+            got: args.len(),
+        });
+    }
+    match &args[0] {
+        Value::Pair(car, _) => Ok(*car.clone()),
+        other => Err(EvalError::Type {
+            expected: "pair".into(),
+            got: format!("{other}"),
+        }),
+    }
+}
+
+fn eval_cdr(args: &[Value]) -> Result<Value, EvalError> {
+    if args.len() != 1 {
+        return Err(EvalError::Arity {
+            name: "cdr".into(),
+            expected: "1".into(),
+            got: args.len(),
+        });
+    }
+    match &args[0] {
+        Value::Pair(_, cdr) => Ok(*cdr.clone()),
+        other => Err(EvalError::Type {
+            expected: "pair".into(),
+            got: format!("{other}"),
+        }),
+    }
+}
+
+fn eval_null_pred(args: &[Value]) -> Result<Value, EvalError> {
+    if args.len() != 1 {
+        return Err(EvalError::Arity {
+            name: "null?".into(),
+            expected: "1".into(),
+            got: args.len(),
+        });
+    }
+    Ok(Value::Boolean(matches!(&args[0], Value::Nil)))
+}
+
+fn eval_list_builtin(args: &[Value]) -> Result<Value, EvalError> {
+    let mut result = Value::Nil;
+    for arg in args.iter().rev() {
+        result = Value::Pair(Box::new(arg.clone()), Box::new(result));
+    }
+    Ok(result)
+}
+
+fn eval_length(args: &[Value]) -> Result<Value, EvalError> {
+    if args.len() != 1 {
+        return Err(EvalError::Arity {
+            name: "length".into(),
+            expected: "1".into(),
+            got: args.len(),
+        });
+    }
+    let mut count: i64 = 0;
+    let mut current = &args[0];
+    loop {
+        match current {
+            Value::Nil => return Ok(Value::Integer(count)),
+            Value::Pair(_, cdr) => {
+                count += 1;
+                current = cdr;
+            }
+            other => {
+                return Err(EvalError::Type {
+                    expected: "proper list".into(),
+                    got: format!("{other}"),
+                })
+            }
+        }
+    }
+}
+
+fn eval_let(args: &[Expr], env: &Env) -> Result<Value, EvalError> {
+    if args.len() < 2 {
+        return Err(EvalError::Parse {
+            message: "let requires bindings and body".into(),
+        });
+    }
+    let bindings = match &args[0] {
+        Expr::List(b) => b,
+        _ => {
+            return Err(EvalError::Parse {
+                message: "let: expected binding list".into(),
+            })
+        }
+    };
+    let let_env = Env::with_parent(env);
+    for binding in bindings {
+        match binding {
+            Expr::List(pair) if pair.len() == 2 => {
+                let name = match &pair[0] {
+                    Expr::Symbol(s) => s.clone(),
+                    _ => {
+                        return Err(EvalError::Parse {
+                            message: "let: expected symbol in binding".into(),
+                        })
+                    }
+                };
+                let val = eval(&pair[1], env)?;
+                let_env.define(name, val);
+            }
+            _ => {
+                return Err(EvalError::Parse {
+                    message: "let: invalid binding".into(),
+                })
+            }
+        }
+    }
+    let mut result = Value::Nil;
+    for expr in &args[1..] {
+        result = eval(expr, &let_env)?;
+    }
+    Ok(result)
+}
+
+fn eval_begin(args: &[Expr], env: &Env) -> Result<Value, EvalError> {
+    let mut result = Value::Nil;
+    for expr in args {
+        result = eval(expr, env)?;
+    }
+    Ok(result)
+}
+
+fn eval_cond(clauses: &[Expr], env: &Env) -> Result<Value, EvalError> {
+    for clause in clauses {
+        match clause {
+            Expr::List(parts) if parts.len() >= 2 => {
+                // Check for else clause
+                if let Expr::Symbol(s) = &parts[0] {
+                    if s == "else" {
+                        let mut result = Value::Nil;
+                        for expr in &parts[1..] {
+                            result = eval(expr, env)?;
+                        }
+                        return Ok(result);
+                    }
+                }
+                let test = eval(&parts[0], env)?;
+                if test.is_truthy() {
+                    let mut result = Value::Nil;
+                    for expr in &parts[1..] {
+                        result = eval(expr, env)?;
+                    }
+                    return Ok(result);
+                }
+            }
+            _ => {
+                return Err(EvalError::Parse {
+                    message: "cond: invalid clause".into(),
+                })
+            }
+        }
+    }
+    Ok(Value::Nil)
 }

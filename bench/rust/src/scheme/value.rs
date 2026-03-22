@@ -9,6 +9,7 @@ pub enum Value {
     Integer(i64),
     Boolean(bool),
     SchemeString(String),
+    Symbol(String),
     Nil,
     Pair(Box<Value>, Box<Value>),
     Lambda {
@@ -31,6 +32,7 @@ impl PartialEq for Value {
             (Value::Integer(a), Value::Integer(b)) => a == b,
             (Value::Boolean(a), Value::Boolean(b)) => a == b,
             (Value::SchemeString(a), Value::SchemeString(b)) => a == b,
+            (Value::Symbol(a), Value::Symbol(b)) => a == b,
             (Value::Nil, Value::Nil) => true,
             (Value::Pair(a1, a2), Value::Pair(b1, b2)) => a1 == b1 && a2 == b2,
             _ => false,
@@ -45,6 +47,7 @@ impl fmt::Display for Value {
             Value::Boolean(true) => write!(f, "#t"),
             Value::Boolean(false) => write!(f, "#f"),
             Value::SchemeString(s) => write!(f, "\"{s}\""),
+            Value::Symbol(s) => write!(f, "{s}"),
             Value::Nil => write!(f, "()"),
             Value::Pair(_, _) => {
                 write!(f, "(")?;
