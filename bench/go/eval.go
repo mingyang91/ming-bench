@@ -294,6 +294,20 @@ func applyBuiltin(name string, args []*Value, expr *Expr, env *Env) (*Value, err
 			return nil, errAtf(expr, "length: expected proper list")
 		}
 		return IntegerValue(count), nil
+	case "reverse":
+		if len(args) != 1 {
+			return nil, errAtf(expr, "reverse: expected 1 argument, got %d", len(args))
+		}
+		result := &Value{Type: TypeNull}
+		cur := args[0]
+		for cur.Type == TypePair {
+			result = PairValue(cur.Car, result)
+			cur = cur.Cdr
+		}
+		if cur.Type != TypeNull {
+			return nil, errAtf(expr, "reverse: expected proper list")
+		}
+		return result, nil
 	case "pair?":
 		if len(args) != 1 {
 			return nil, errAtf(expr, "pair?: expected 1 argument, got %d", len(args))
@@ -431,6 +445,8 @@ func applyBuiltin(name string, args []*Value, expr *Expr, env *Env) (*Value, err
 		return builtinApply(args, expr, env)
 	case "call/cc", "call-with-current-continuation":
 		return builtinCallCC(args, expr, env)
+	case "dynamic-wind":
+		return builtinDynamicWind(args, expr, env)
 	case "equal?":
 		if len(args) != 2 {
 			return nil, errAtf(expr, "equal?: expected 2 arguments, got %d", len(args))
@@ -902,6 +918,65 @@ func builtinCallCC(args []*Value, expr *Expr, env *Env) (*Value, error) {
 	}()
 
 	return result, evalErr
+}
+
+func builtinDynamicWind(args []*Value, expr *Expr, env *Env) (*Value, error) {
+	if len(args) != 3 {
+		return nil, errAtf(expr, "dynamic-wind: expected 3 arguments, got %d", len(args))
+	}
+	inThunk := args[0]
+	bodyThunk := args[1]
+	outThunk := args[2]
+
+	callThunk := func(thunk *Value) (*Value, error) {
+		te, tenv, v, err, isTail := applyFuncTCO(thunk, []*Value{}, expr, env)
+		if err != nil {
+			return nil, err
+		}
+		if isTail {
+			return Eval(te, tenv)
+		}
+		return v, nil
+	}
+
+	// Call in-thunk
+	if _, err := callThunk(inThunk); err != nil {
+		return nil, err
+	}
+
+	// Call body-thunk, catching continuation jumps so out-thunk always runs
+	var result *Value
+	var bodyErr error
+	var jump *continuationJump
+
+	func() {
+		defer func() {
+			if r := recover(); r != nil {
+				if j, ok := r.(continuationJump); ok {
+					jump = &j
+				} else {
+					panic(r)
+				}
+			}
+		}()
+		result, bodyErr = callThunk(bodyThunk)
+	}()
+
+	// Out-thunk runs whether body completed normally or via continuation jump
+	if _, err := callThunk(outThunk); err != nil {
+		return nil, err
+	}
+
+	// Re-panic after out-thunk if body exited via continuation jump
+	if jump != nil {
+		panic(*jump)
+	}
+
+	if bodyErr != nil {
+		return nil, bodyErr
+	}
+
+	return result, nil
 }
 
 func builtinAdd(args []*Value, expr *Expr) (*Value, error) {
@@ -1623,7 +1698,7 @@ func schemeEqv(a, b *Value) bool {
 func makeDefaultEnv() *Env {
 	env := NewEnv(nil)
 	builtins := []string{"+", "-", "*", "/", "<", ">", "=", "<=", ">=", "not",
-		"cons", "car", "cdr", "null?", "list", "length",
+		"cons", "car", "cdr", "null?", "list", "length", "reverse",
 		"pair?", "number?", "string?", "boolean?", "symbol?", "char?",
 		"display", "write", "newline",
 		"string-append", "string-length", "substring",
@@ -1647,7 +1722,8 @@ func makeDefaultEnv() *Env {
 		"string=?", "string<?", "string-ci=?",
 		"string-upcase", "string-downcase",
 		"vector", "make-vector", "vector-ref", "vector-set!", "vector-length", "vector?",
-		"vector->list", "list->vector"}
+		"vector->list", "list->vector",
+		"dynamic-wind"}
 	for _, name := range builtins {
 		env.Set(name, &Value{Type: TypeSymbol, StrVal: fmt.Sprintf("__builtin:%s", name)})
 	}
