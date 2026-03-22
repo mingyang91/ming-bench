@@ -19,6 +19,7 @@ const (
 	TypeLambda
 	TypeChar
 	TypeContinuation
+	TypeMacro
 )
 
 // Value represents a Scheme value.
@@ -37,6 +38,8 @@ type Value struct {
 	Closure   *Env
 	// Continuation fields
 	ContFunc func(*Value) // invoked when continuation is called; always panics
+	// Macro fields
+	Macro *SyntaxRules
 }
 
 // StrContent returns the string content, preferring mutable Runes if set.
@@ -130,6 +133,8 @@ func (v *Value) String() string {
 		return "#<procedure>"
 	case TypeContinuation:
 		return "#<continuation>"
+	case TypeMacro:
+		return "#<macro>"
 	case TypePair:
 		var buf strings.Builder
 		buf.WriteByte('(')

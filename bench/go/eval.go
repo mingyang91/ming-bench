@@ -141,6 +141,18 @@ func evalListTCO(expr *Expr, env *Env) (*Expr, *Env, *Value, error, bool) {
 				return e, ev, nil, nil, true
 			}
 			return nil, nil, v, nil, false
+		case "define-syntax":
+			v, err := evalDefineSyntax(expr, env)
+			return nil, nil, v, err, false
+		}
+
+		// Check for macro application
+		if val, ok := env.Get(head.StrVal); ok && val.Type == TypeMacro {
+			expanded, err := val.Macro.expandMacro(expr, env)
+			if err != nil {
+				return nil, nil, nil, err, false
+			}
+			return expanded, env, nil, nil, true
 		}
 	}
 
@@ -633,6 +645,27 @@ func evalOrTCO(expr *Expr, env *Env) (*Expr, *Env, *Value, error) {
 	}
 	// Last expression is in tail position
 	return expr.List[len(expr.List)-1], env, nil, nil
+}
+
+func evalDefineSyntax(expr *Expr, env *Env) (*Value, error) {
+	if len(expr.List) != 3 {
+		return nil, errAt(expr, "define-syntax: expected 2 arguments")
+	}
+	name := expr.List[1]
+	if name.Type != ExprSymbol {
+		return nil, errAt(name, "define-syntax: name must be a symbol")
+	}
+	transformer := expr.List[2]
+	if transformer.Type != ExprList || len(transformer.List) == 0 ||
+		transformer.List[0].Type != ExprSymbol || transformer.List[0].StrVal != "syntax-rules" {
+		return nil, errAt(transformer, "define-syntax: expected syntax-rules")
+	}
+	sr, err := parseSyntaxRules(transformer, env)
+	if err != nil {
+		return nil, err
+	}
+	env.Set(name.StrVal, &Value{Type: TypeMacro, Macro: sr})
+	return Void, nil
 }
 
 func evalDefine(expr *Expr, env *Env) (*Value, error) {
