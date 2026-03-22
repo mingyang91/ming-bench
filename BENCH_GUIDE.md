@@ -8,7 +8,7 @@ This file is for **humans supervising agent runs**. It is NOT read by agents.
 # One-time setup
 cargo xtask setup
 
-# Single full run (agent does L1→L27 in one session)
+# Single full run (agent does L1→L26 in one session)
 cargo xtask run-agent --name claude-r1
 
 # Level-by-level run (fresh agent per level, fail-fast)
