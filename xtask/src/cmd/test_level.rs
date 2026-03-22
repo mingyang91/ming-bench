@@ -146,6 +146,7 @@ fn run_gradle(level: &str, gate: bool) -> Result<()> {
 }
 
 /// Run a fat JAR inside the JVM container (shared by Java and Scala).
+/// Mounts bench/ as a single read-only volume.
 fn run_jvm_container(proj: &Path, jar: &Path, level: &str, lang_label: &str) -> Result<()> {
     let (timeout, level_arg) = if level == "all" {
         (450, "all".to_string())
@@ -153,41 +154,21 @@ fn run_jvm_container(proj: &Path, jar: &Path, level: &str, lang_label: &str) -> 
         (45, level.to_string())
     };
 
-    let bench_dir = proj.join("bench");
-    let jar_mount = format!("{}:/bench/test.jar:ro,Z", jar.display());
-    let fixtures_mount = format!(
-        "{}:/bench/fixtures:ro,Z",
-        bench_dir.join("fixtures").display()
-    );
-    let tests_mount = format!(
-        "{}:/bench/tests.json:ro,Z",
-        bench_dir.join("tests.json").display()
-    );
-
+    let bench_mount = format!("{}:/bench:ro,Z", proj.join("bench").display());
     let java_cmd = format!(
-        "timeout {timeout}s java -jar /bench/test.jar {level_arg}"
+        "timeout {timeout}s java -jar {} {level_arg}",
+        format!("/bench/{}", jar.strip_prefix(proj.join("bench")).unwrap_or(jar).display())
     );
 
     println!("Running {lang_label} tests (level {level}) in container...");
     let exit = run_cmd(
         "sudo",
         &[
-            "podman",
-            "run",
-            "--rm",
-            "--memory=2g",
-            "--cpus=1",
-            "--pids-limit=256",
-            "-v",
-            &jar_mount,
-            "-v",
-            &fixtures_mount,
-            "-v",
-            &tests_mount,
-            "-e",
-            "TESTS_JSON=/bench/tests.json",
-            "-e",
-            "FIXTURES_DIR=/bench/fixtures",
+            "podman", "run", "--rm",
+            "--memory=2g", "--cpus=1", "--pids-limit=256",
+            "-v", &bench_mount,
+            "-e", "TESTS_JSON=/bench/tests.json",
+            "-e", "FIXTURES_DIR=/bench/fixtures",
             JVM_IMAGE,
             &java_cmd,
         ],
@@ -232,7 +213,7 @@ fn run_go(level: &str, gate: bool) -> Result<()> {
     run_go_container(&proj, &lang_dir, level)
 }
 
-fn run_go_container(proj: &Path, lang_dir: &Path, level: &str) -> Result<()> {
+fn run_go_container(proj: &Path, _lang_dir: &Path, level: &str) -> Result<()> {
     let (timeout, filter) = if level == "all" {
         (300, String::new())
     } else {
@@ -245,10 +226,7 @@ fn run_go_container(proj: &Path, lang_dir: &Path, level: &str) -> Result<()> {
         level.to_string()
     };
 
-    let bench_dir = proj.join("bench");
-    let bin_mount = format!("{}:/bench/go/test_bin:ro,Z", lang_dir.join("test_bin").display());
-    let fixtures_mount = format!("{}:/bench/fixtures:ro,Z", bench_dir.join("fixtures").display());
-    let tests_mount = format!("{}:/bench/tests.json:ro,Z", bench_dir.join("tests.json").display());
+    let bench_mount = format!("{}:/bench:ro,Z", proj.join("bench").display());
     let bench_level_env = format!("BENCH_LEVEL={bench_level}");
 
     let bash_cmd = if filter.is_empty() {
@@ -263,9 +241,7 @@ fn run_go_container(proj: &Path, lang_dir: &Path, level: &str) -> Result<()> {
         &[
             "podman", "run", "--rm",
             "--memory=1g", "--cpus=1", "--pids-limit=256",
-            "-v", &bin_mount,
-            "-v", &fixtures_mount,
-            "-v", &tests_mount,
+            "-v", &bench_mount,
             "-e", &bench_level_env,
             IMAGE_NAME,
             &bash_cmd,
@@ -310,7 +286,7 @@ fn run_ts(level: &str, gate: bool) -> Result<()> {
     run_node_container(&proj, &lang_dir, level)
 }
 
-fn run_node_container(proj: &Path, lang_dir: &Path, level: &str) -> Result<()> {
+fn run_node_container(proj: &Path, _lang_dir: &Path, level: &str) -> Result<()> {
     let (timeout, name_pattern) = if level == "all" {
         (300, String::new())
     } else {
@@ -323,10 +299,8 @@ fn run_node_container(proj: &Path, lang_dir: &Path, level: &str) -> Result<()> {
         level.to_string()
     };
 
-    let bench_dir = proj.join("bench");
-    let ts_mount = format!("{}:/bench/ts:Z", lang_dir.display());
-    let fixtures_mount = format!("{}:/bench/fixtures:ro,Z", bench_dir.join("fixtures").display());
-    let tests_mount = format!("{}:/bench/tests.json:ro,Z", bench_dir.join("tests.json").display());
+    // TS needs read-write for node_modules/.cache
+    let bench_mount = format!("{}:/bench:Z", proj.join("bench").display());
     let bench_level_env = format!("BENCH_LEVEL={bench_level}");
 
     let bash_cmd = if name_pattern.is_empty() {
@@ -341,9 +315,7 @@ fn run_node_container(proj: &Path, lang_dir: &Path, level: &str) -> Result<()> {
         &[
             "podman", "run", "--rm",
             "--memory=2g", "--cpus=1", "--pids-limit=256",
-            "-v", &ts_mount,
-            "-v", &fixtures_mount,
-            "-v", &tests_mount,
+            "-v", &bench_mount,
             "-e", &bench_level_env,
             NODE_IMAGE,
             &bash_cmd,
