@@ -131,6 +131,10 @@ fn eval_list_step(
             "letrec" => return eval_letrec_step(&elements[1..], kw_span, env, output, ctx),
             "letrec*" => return eval_letrec_star_step(&elements[1..], kw_span, env, output, ctx),
             "case" => return eval_case_step(&elements[1..], kw_span, env, output, ctx),
+            "dynamic-wind" => {
+                let v = eval_dynamic_wind(&elements[1..], kw_span, env, output, ctx)?;
+                return Ok(TcoAction::Result(v));
+            }
             _ => {}
         }
     }
@@ -270,6 +274,7 @@ fn is_builtin(name: &str) -> bool {
             | "vector?"
             | "vector->list"
             | "list->vector"
+            | "reverse"
     )
 }
 
@@ -474,6 +479,47 @@ fn apply_func(
     }
 }
 
+// ===== dynamic-wind implementation =====
+
+fn eval_dynamic_wind(
+    args: &[Expr],
+    span: &Span,
+    env: &Env,
+    output: &mut String,
+    ctx: &mut ContCtx,
+) -> Result<Value, EvalError> {
+    if args.len() != 3 {
+        return Err(EvalErrorKind::Arity {
+            name: "dynamic-wind".into(),
+            expected: "3".into(),
+            got: args.len(),
+        }
+        .at(span));
+    }
+    let in_thunk = eval(&args[0], env, output, ctx)?;
+    let body_thunk = eval(&args[1], env, output, ctx)?;
+    let out_thunk = eval(&args[2], env, output, ctx)?;
+
+    // Run in-thunk
+    apply_func(&in_thunk, &[], span, output, ctx)?;
+
+    // Run body-thunk, catching continuation escapes to run out-thunk
+    match apply_func(&body_thunk, &[], span, output, ctx) {
+        Ok(body_val) => {
+            // Normal exit: run out-thunk, return body value
+            apply_func(&out_thunk, &[], span, output, ctx)?;
+            Ok(body_val)
+        }
+        Err(e) => {
+            if matches!(&e.kind, EvalErrorKind::ContinuationReturn { .. }) {
+                // Non-local exit: run out-thunk before re-throwing
+                apply_func(&out_thunk, &[], span, output, ctx)?;
+            }
+            Err(e)
+        }
+    }
+}
+
 fn eval_builtin(
     name: &str,
     args: &[Value],
@@ -570,6 +616,7 @@ fn eval_builtin(
         )),
         "vector->list" => eval_vector_to_list(args, span),
         "list->vector" => eval_list_to_vector(args, span),
+        "reverse" => eval_reverse(args, span),
         _ => Err(EvalErrorKind::UnboundVariable {
             name: name.to_string(),
         }
@@ -2449,6 +2496,23 @@ fn eval_vector_to_list(args: &[Value], span: &Span) -> Result<Value, EvalError> 
         }
         .at(span)),
     }
+}
+
+fn eval_reverse(args: &[Value], span: &Span) -> Result<Value, EvalError> {
+    if args.len() != 1 {
+        return Err(EvalErrorKind::Arity {
+            name: "reverse".into(),
+            expected: "1".into(),
+            got: args.len(),
+        }
+        .at(span));
+    }
+    let elems = value_list_to_vec(&args[0], span)?;
+    let mut result = Value::Nil;
+    for elem in elems {
+        result = Value::Pair(Box::new(elem), Box::new(result));
+    }
+    Ok(result)
 }
 
 fn eval_list_to_vector(args: &[Value], span: &Span) -> Result<Value, EvalError> {
