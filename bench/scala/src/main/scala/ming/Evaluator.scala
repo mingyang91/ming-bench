@@ -10,7 +10,7 @@ object Evaluator:
     if exprs.isEmpty then throw new EvalError("empty input")
     val env = builtinEnv
     val result = exprs.foldLeft((SchemeValue.Void: SchemeValue, env)) { case ((_, e), expr) =>
-      (Interpreter.eval(expr, e), e)
+      Interpreter.eval(expr, e)
     }
     result._1.display
 
