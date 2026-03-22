@@ -11,4 +11,6 @@ pub enum EvalError {
     Arity(String),
     #[error("continuation invoked")]
     ContinuationInvoked(u64, usize),
+    #[error("exception raised")]
+    Raise,
 }

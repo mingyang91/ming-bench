@@ -60,6 +60,7 @@ thread_local! {
     static NEXT_CONT_ID: Cell<u64> = Cell::new(0);
     static TOP_LEVEL_IDX: Cell<usize> = Cell::new(0);
     static GENSYM_COUNTER: Cell<u64> = Cell::new(0);
+    static RAISED_VALUE: RefCell<Option<Value>> = RefCell::new(None);
 }
 
 fn gensym(base: &str) -> String {
@@ -672,6 +673,25 @@ fn eval(expr: &Expr, env: &Env, out: &Output) -> Result<Value, EvalError> {
                             let out_thunk = eval(&items[3], &cur_env, out)?;
                             return eval_dynamic_wind(in_thunk, body_thunk, out_thunk, span, out);
                         }
+                        "guard" => {
+                            return eval_guard(&items[1..], &cur_env, span, out);
+                        }
+                        "raise" if env_get(&cur_env, "raise").map_or(true, |v| matches!(v, Value::Builtin(ref n) if n == "raise")) => {
+                            if items.len() != 2 {
+                                return Err(EvalError::Arity(span.fmt("raise requires 1 argument")));
+                            }
+                            let val = eval(&items[1], &cur_env, out)?;
+                            RAISED_VALUE.with(|v| *v.borrow_mut() = Some(val));
+                            return Err(EvalError::Raise);
+                        }
+                        "with-exception-handler" if env_get(&cur_env, "with-exception-handler").map_or(true, |v| matches!(v, Value::Builtin(ref n) if n == "with-exception-handler")) => {
+                            if items.len() != 3 {
+                                return Err(EvalError::Arity(span.fmt("with-exception-handler requires 2 arguments")));
+                            }
+                            let handler = eval(&items[1], &cur_env, out)?;
+                            let thunk = eval(&items[2], &cur_env, out)?;
+                            return eval_with_exception_handler(handler, thunk, span, out);
+                        }
                         "set!" => return eval_set(&items[1..], &cur_env, span, out),
                         "string-set!" => return eval_string_set(&items[1..], &cur_env, span, out),
                         "display" => {
@@ -767,6 +787,22 @@ fn eval(expr: &Expr, env: &Env, out: &Output) -> Result<Value, EvalError> {
                             return Ok(val);
                         }
                         return eval_callcc(args.into_iter().next().unwrap(), span, out);
+                    }
+                    Value::Builtin(ref name) if name == "raise" => {
+                        if args.len() != 1 {
+                            return Err(EvalError::Arity(span.fmt("raise requires 1 argument")));
+                        }
+                        RAISED_VALUE.with(|v| *v.borrow_mut() = Some(args.into_iter().next().unwrap()));
+                        return Err(EvalError::Raise);
+                    }
+                    Value::Builtin(ref name) if name == "with-exception-handler" => {
+                        if args.len() != 2 {
+                            return Err(EvalError::Arity(span.fmt("with-exception-handler requires 2 arguments")));
+                        }
+                        let mut it = args.into_iter();
+                        let handler = it.next().unwrap();
+                        let thunk = it.next().unwrap();
+                        return eval_with_exception_handler(handler, thunk, span, out);
                     }
                     Value::Builtin(ref name) if name == "apply" => {
                         return eval_apply(&args, span, out);
@@ -1014,11 +1050,117 @@ fn eval_dynamic_wind(in_thunk: Value, body_thunk: Value, out_thunk: Value, span:
             CONT_CALLCC_SPAN.with(|v| *v.borrow_mut() = saved_span);
             Err(EvalError::ContinuationInvoked(id, top_idx))
         }
+        Err(EvalError::Raise) => {
+            let saved_raised = RAISED_VALUE.with(|v| v.borrow_mut().take());
+            call_thunk(&out_thunk, span, out)?;
+            RAISED_VALUE.with(|v| *v.borrow_mut() = saved_raised);
+            Err(EvalError::Raise)
+        }
         Err(e) => {
-            // Run out-thunk even on other errors? Standard says only for dynamic extent.
-            // For now, just propagate other errors without running out-thunk.
             Err(e)
         }
+    }
+}
+
+fn eval_with_exception_handler(handler: Value, thunk: Value, span: Span, out: &Output) -> Result<Value, EvalError> {
+    let result = call_thunk(&thunk, span, out);
+    match result {
+        Ok(val) => Ok(val),
+        Err(EvalError::Raise) => {
+            let raised = RAISED_VALUE.with(|v| v.borrow_mut().take())
+                .unwrap_or(Value::Boolean(false));
+            // Call the handler with the raised value
+            match handler {
+                Value::Lambda { ref params, ref rest_param, ref body, ref env } => {
+                    let local_env = apply_lambda(params, rest_param, body, env, &[raised], span)?;
+                    let mut result = Value::Boolean(false);
+                    for expr in body {
+                        result = eval(expr, &local_env, out)?;
+                    }
+                    Ok(result)
+                }
+                Value::Builtin(ref name) => eval_builtin(name, &[raised], span),
+                _ => Err(EvalError::Type(span.fmt("with-exception-handler: expected procedure"))),
+            }
+        }
+        Err(e) => Err(e),
+    }
+}
+
+fn eval_guard(args: &[Expr], env: &Env, span: Span, out: &Output) -> Result<Value, EvalError> {
+    // (guard (var clause1 clause2 ...) body ...)
+    if args.is_empty() {
+        return Err(EvalError::Arity(span.fmt("guard requires clauses and body")));
+    }
+    let clauses_expr = &args[0];
+    let body = &args[1..];
+
+    let clause_items = match &clauses_expr.kind {
+        ExprKind::List(items) if items.len() >= 2 => items,
+        _ => return Err(EvalError::Type(span.fmt("guard: expected (var clause ...)"))),
+    };
+
+    let var_name = match &clause_items[0].kind {
+        ExprKind::Symbol(s) => s.clone(),
+        _ => return Err(EvalError::Type(span.fmt("guard: expected symbol as variable"))),
+    };
+
+    let clauses = &clause_items[1..];
+
+    // Evaluate body, catching Raise
+    let mut body_result = Ok(Value::Boolean(false));
+    for expr in body {
+        body_result = eval(expr, env, out);
+        if body_result.is_err() {
+            break;
+        }
+    }
+
+    match body_result {
+        Ok(val) => Ok(val),
+        Err(EvalError::Raise) => {
+            let raised = RAISED_VALUE.with(|v| v.borrow_mut().take())
+                .unwrap_or(Value::Boolean(false));
+            // Bind the raised value to var_name and test clauses
+            let guard_env = new_env(Some(env.clone()));
+            env_set(&guard_env, var_name, raised.clone());
+
+            for clause in clauses {
+                match &clause.kind {
+                    ExprKind::List(parts) if !parts.is_empty() => {
+                        // Check for else clause
+                        if let ExprKind::Symbol(s) = &parts[0].kind {
+                            if s == "else" {
+                                // Evaluate else body
+                                let mut result = Value::Boolean(false);
+                                for expr in &parts[1..] {
+                                    result = eval(expr, &guard_env, out)?;
+                                }
+                                return Ok(result);
+                            }
+                        }
+                        // Test the clause condition
+                        let test_val = eval(&parts[0], &guard_env, out)?;
+                        if test_val.is_truthy() {
+                            if parts.len() > 1 {
+                                let mut result = Value::Boolean(false);
+                                for expr in &parts[1..] {
+                                    result = eval(expr, &guard_env, out)?;
+                                }
+                                return Ok(result);
+                            } else {
+                                return Ok(test_val);
+                            }
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            // No clause matched — re-raise
+            RAISED_VALUE.with(|v| *v.borrow_mut() = Some(raised));
+            Err(EvalError::Raise)
+        }
+        Err(e) => Err(e),
     }
 }
 
@@ -1278,7 +1420,7 @@ fn is_special_form(s: &str) -> bool {
     matches!(s, "if" | "begin" | "set!" | "let" | "lambda" | "define" | "quote"
         | "cond" | "and" | "or" | "call/cc" | "call-with-current-continuation"
         | "display" | "write" | "newline" | "define-syntax" | "syntax-rules"
-        | "string-set!" | "dynamic-wind")
+        | "string-set!" | "dynamic-wind" | "guard")
 }
 
 fn find_free_vars(
@@ -1996,6 +2138,7 @@ fn make_default_env() -> Env {
         "string-upcase", "string-downcase",
         "vector", "make-vector", "vector-ref", "vector-set!",
         "vector-length", "vector?", "vector->list", "list->vector",
+        "raise", "with-exception-handler",
     ] {
         env_set(&env, name.to_string(), Value::Builtin(name.to_string()));
     }
