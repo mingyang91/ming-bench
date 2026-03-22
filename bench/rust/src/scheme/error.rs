@@ -28,6 +28,7 @@ pub enum ErrorKind {
     Type { message: String },
     Arity { message: String },
     DivisionByZero,
+    ContinuationReturn { id: u64, value: Box<crate::scheme::value::Value> },
 }
 
 impl EvalError {
@@ -51,6 +52,13 @@ impl EvalError {
         EvalError { kind: ErrorKind::DivisionByZero, span: Span::default() }
     }
 
+    pub fn continuation_return(id: u64, value: crate::scheme::value::Value) -> Self {
+        EvalError {
+            kind: ErrorKind::ContinuationReturn { id, value: Box::new(value) },
+            span: Span::default(),
+        }
+    }
+
     pub fn at(mut self, span: Span) -> Self {
         self.span = span;
         self
@@ -66,6 +74,7 @@ impl fmt::Display for EvalError {
             ErrorKind::Type { message } => write!(f, "type error at {pos}: {message}"),
             ErrorKind::Arity { message } => write!(f, "arity error at {pos}: {message}"),
             ErrorKind::DivisionByZero => write!(f, "division by zero at {pos}"),
+            ErrorKind::ContinuationReturn { .. } => write!(f, "unhandled continuation return"),
         }
     }
 }

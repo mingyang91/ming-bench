@@ -19,6 +19,9 @@ pub enum Value {
         body: Vec<Value>,
         closure: Rc<RefCell<Env>>,
     },
+    Continuation {
+        id: u64,
+    },
     Void,
 }
 
@@ -31,6 +34,7 @@ impl PartialEq for Value {
             (Value::Symbol(a), Value::Symbol(b)) => a == b,
             (Value::Char(a), Value::Char(b)) => a == b,
             (Value::List(a), Value::List(b)) => a == b,
+            (Value::Continuation { id: a }, Value::Continuation { id: b }) => a == b,
             (Value::Void, Value::Void) => true,
             _ => false,
         }
@@ -56,6 +60,7 @@ impl fmt::Display for Value {
                 }
                 write!(f, ")")
             }
+            Value::Continuation { .. } => write!(f, "#<continuation>"),
             Value::Lambda { .. } => write!(f, "#<procedure>"),
             Value::Void => write!(f, ""),
         }
@@ -83,6 +88,7 @@ impl Value {
                 }
                 out.push(')');
             }
+            Value::Continuation { .. } => out.push_str("#<continuation>"),
             other => out.push_str(&other.to_string()),
         }
     }
