@@ -1,16 +1,50 @@
 package ming;
 
 import java.util.ArrayList;
+import java.util.HashMap;
 import java.util.List;
+import java.util.Map;
 
 public class Evaluator {
 
     // ---- Value types ----
-    sealed interface SchemeVal permits IntVal, BoolVal, StrVal, ListVal, SymbolVal {}
+    sealed interface SchemeVal permits IntVal, BoolVal, StrVal, ListVal, SymbolVal, LambdaVal, VoidVal, BuiltinVal {}
     record IntVal(long value) implements SchemeVal {}
     record BoolVal(boolean value) implements SchemeVal {}
     record StrVal(String value) implements SchemeVal {}
     record ListVal(List<SchemeVal> elements) implements SchemeVal {}
+    record SymbolVal(String name) implements SchemeVal {}
+    record VoidVal() implements SchemeVal {}
+    record LambdaVal(List<String> params, List<SchemeVal> body, Env env) implements SchemeVal {}
+    record BuiltinVal(String name) implements SchemeVal {}
+
+    private static final SchemeVal VOID = new VoidVal();
+
+    // ---- Environment ----
+    static class Env {
+        final Map<String, SchemeVal> bindings = new HashMap<>();
+        final Env parent;
+        Env(Env parent) { this.parent = parent; }
+
+        SchemeVal get(String name) throws EvalError {
+            if (bindings.containsKey(name)) return bindings.get(name);
+            if (parent != null) return parent.get(name);
+            throw new EvalError("unbound variable: " + name);
+        }
+
+        void define(String name, SchemeVal val) {
+            bindings.put(name, val);
+        }
+    }
+
+    private static Env makeGlobalEnv() {
+        Env env = new Env(null);
+        String[] builtins = {"+", "-", "*", "/", "<", ">", "=", "<=", ">=", "not"};
+        for (String b : builtins) {
+            env.define(b, new BuiltinVal(b));
+        }
+        return env;
+    }
 
     // ---- Tokenizer ----
     private static List<String> tokenize(String input) {
@@ -21,7 +55,6 @@ public class Evaluator {
             if (Character.isWhitespace(c)) {
                 i++;
             } else if (c == ';') {
-                // Skip line comments
                 while (i < input.length() && input.charAt(i) != '\n') i++;
             } else if (c == '(') {
                 tokens.add("(");
@@ -33,7 +66,6 @@ public class Evaluator {
                 tokens.add("'");
                 i++;
             } else if (c == '"') {
-                // String literal
                 StringBuilder sb = new StringBuilder();
                 sb.append('"');
                 i++;
@@ -56,7 +88,6 @@ public class Evaluator {
                 }
                 tokens.add(sb.toString());
             } else {
-                // Atom (number, symbol, boolean)
                 StringBuilder sb = new StringBuilder();
                 while (i < input.length() && !Character.isWhitespace(input.charAt(i))
                         && input.charAt(i) != '(' && input.charAt(i) != ')'
@@ -71,14 +102,19 @@ public class Evaluator {
     }
 
     // ---- Parser ----
-    private static int[] parsePos = {0}; // thread-local hack avoided; use instance method
-
     private static SchemeVal parse(List<String> tokens, int[] pos) throws EvalError {
         if (pos[0] >= tokens.size()) {
             throw new EvalError("unexpected end of input");
         }
         String token = tokens.get(pos[0]);
-        if (token.equals("(")) {
+        if (token.equals("'")) {
+            pos[0]++;
+            SchemeVal quoted = parse(tokens, pos);
+            List<SchemeVal> quoteExpr = new ArrayList<>();
+            quoteExpr.add(new SymbolVal("quote"));
+            quoteExpr.add(quoted);
+            return new ListVal(quoteExpr);
+        } else if (token.equals("(")) {
             pos[0]++;
             List<SchemeVal> elems = new ArrayList<>();
             while (pos[0] < tokens.size() && !tokens.get(pos[0]).equals(")")) {
@@ -87,7 +123,7 @@ public class Evaluator {
             if (pos[0] >= tokens.size()) {
                 throw new EvalError("missing closing parenthesis");
             }
-            pos[0]++; // skip ')'
+            pos[0]++;
             return new ListVal(elems);
         } else if (token.equals(")")) {
             throw new EvalError("unexpected )");
@@ -101,7 +137,6 @@ public class Evaluator {
         if (token.equals("#t")) return new BoolVal(true);
         if (token.equals("#f")) return new BoolVal(false);
         if (token.startsWith("\"")) {
-            // Strip surrounding quotes and handle escapes
             String inner = token.substring(1, token.length() - 1);
             inner = inner.replace("\\n", "\n").replace("\\t", "\t")
                          .replace("\\\\", "\\").replace("\\\"", "\"");
@@ -110,37 +145,86 @@ public class Evaluator {
         try {
             return new IntVal(Long.parseLong(token));
         } catch (NumberFormatException e) {
-            // It's a symbol - represent as a ListVal with special marker? No, use a string-based symbol.
-            // For L01, symbols are only operator names used in function position.
-            // We'll represent them as StrVal with a special prefix, but actually let's just
-            // handle them inline in eval. We need a SymbolVal.
             return new SymbolVal(token);
         }
     }
 
-    // Add Symbol type
-    record SymbolVal(String name) implements SchemeVal {}
-
     // ---- Evaluator ----
-    private SchemeVal eval(SchemeVal expr) throws EvalError {
+    private SchemeVal eval(SchemeVal expr, Env env) throws EvalError {
         return switch (expr) {
             case IntVal v -> v;
             case BoolVal v -> v;
             case StrVal v -> v;
-            case SymbolVal v -> throw new EvalError("unbound variable: " + v.name());
+            case VoidVal v -> v;
+            case LambdaVal v -> v;
+            case BuiltinVal v -> v;
+            case SymbolVal v -> env.get(v.name());
             case ListVal v -> {
                 List<SchemeVal> elems = v.elements();
                 if (elems.isEmpty()) throw new EvalError("empty application");
 
                 SchemeVal head = elems.getFirst();
 
-                // Special forms: and, or
+                // Special forms
                 if (head instanceof SymbolVal sym) {
                     switch (sym.name()) {
+                        case "quote" -> {
+                            if (elems.size() != 2) throw new EvalError("quote requires 1 argument");
+                            yield elems.get(1);
+                        }
+                        case "if" -> {
+                            if (elems.size() < 3 || elems.size() > 4)
+                                throw new EvalError("if requires 2 or 3 arguments");
+                            SchemeVal cond = eval(elems.get(1), env);
+                            if (!isFalse(cond)) {
+                                yield eval(elems.get(2), env);
+                            } else if (elems.size() == 4) {
+                                yield eval(elems.get(3), env);
+                            } else {
+                                yield VOID;
+                            }
+                        }
+                        case "define" -> {
+                            if (elems.size() < 3) throw new EvalError("define requires at least 2 arguments");
+                            SchemeVal target = elems.get(1);
+                            if (target instanceof SymbolVal name) {
+                                SchemeVal val = eval(elems.get(2), env);
+                                env.define(name.name(), val);
+                                yield VOID;
+                            } else if (target instanceof ListVal nameAndParams) {
+                                // (define (f x y) body...)
+                                if (nameAndParams.elements().isEmpty())
+                                    throw new EvalError("define: empty name list");
+                                String fname = ((SymbolVal) nameAndParams.elements().getFirst()).name();
+                                List<String> params = new ArrayList<>();
+                                for (int i = 1; i < nameAndParams.elements().size(); i++) {
+                                    params.add(((SymbolVal) nameAndParams.elements().get(i)).name());
+                                }
+                                List<SchemeVal> body = new ArrayList<>(elems.subList(2, elems.size()));
+                                env.define(fname, new LambdaVal(params, body, env));
+                                yield VOID;
+                            } else {
+                                throw new EvalError("define: invalid syntax");
+                            }
+                        }
+                        case "lambda" -> {
+                            if (elems.size() < 3) throw new EvalError("lambda requires params and body");
+                            SchemeVal paramSpec = elems.get(1);
+                            List<String> params = new ArrayList<>();
+                            if (paramSpec instanceof ListVal pl) {
+                                for (SchemeVal p : pl.elements()) {
+                                    params.add(((SymbolVal) p).name());
+                                }
+                            } else {
+                                throw new EvalError("lambda: invalid parameter list");
+                            }
+                            List<SchemeVal> body = new ArrayList<>(elems.subList(2, elems.size()));
+                            yield new LambdaVal(params, body, env);
+                        }
                         case "and" -> {
                             SchemeVal result = new BoolVal(true);
                             for (int i = 1; i < elems.size(); i++) {
-                                result = eval(elems.get(i));
+                                result = eval(elems.get(i), env);
                                 if (isFalse(result)) yield result;
                             }
                             yield result;
@@ -148,27 +232,46 @@ public class Evaluator {
                         case "or" -> {
                             SchemeVal result = new BoolVal(false);
                             for (int i = 1; i < elems.size(); i++) {
-                                result = eval(elems.get(i));
+                                result = eval(elems.get(i), env);
                                 if (!isFalse(result)) yield result;
                             }
                             yield result;
                         }
-                        default -> {}
+                        default -> {
+                            // fall through to procedure call
+                        }
                     }
                 }
 
-                // Evaluate head and args
-                if (head instanceof SymbolVal sym) {
-                    List<SchemeVal> args = new ArrayList<>();
-                    for (int i = 1; i < elems.size(); i++) {
-                        args.add(eval(elems.get(i)));
-                    }
-                    yield applyBuiltin(sym.name(), args);
+                // Procedure call
+                SchemeVal proc = eval(head, env);
+                List<SchemeVal> args = new ArrayList<>();
+                for (int i = 1; i < elems.size(); i++) {
+                    args.add(eval(elems.get(i), env));
                 }
-
-                throw new EvalError("not a procedure: " + display(head));
+                yield applyProc(proc, args);
             }
         };
+    }
+
+    private SchemeVal applyProc(SchemeVal proc, List<SchemeVal> args) throws EvalError {
+        if (proc instanceof BuiltinVal b) {
+            return applyBuiltin(b.name(), args);
+        } else if (proc instanceof LambdaVal lambda) {
+            if (args.size() != lambda.params().size()) {
+                throw new EvalError("wrong number of arguments: expected " + lambda.params().size() + ", got " + args.size());
+            }
+            Env callEnv = new Env(lambda.env());
+            for (int i = 0; i < lambda.params().size(); i++) {
+                callEnv.define(lambda.params().get(i), args.get(i));
+            }
+            SchemeVal result = VOID;
+            for (SchemeVal bodyExpr : lambda.body()) {
+                result = eval(bodyExpr, callEnv);
+            }
+            return result;
+        }
+        throw new EvalError("not a procedure: " + display(proc));
     }
 
     private boolean isFalse(SchemeVal val) {
@@ -265,6 +368,9 @@ public class Evaluator {
             case BoolVal v -> v.value() ? "#t" : "#f";
             case StrVal v -> "\"" + v.value() + "\"";
             case SymbolVal v -> v.name();
+            case VoidVal v -> "";
+            case LambdaVal v -> "#<procedure>";
+            case BuiltinVal v -> "#<procedure:" + v.name() + ">";
             case ListVal v -> {
                 StringBuilder sb = new StringBuilder("(");
                 for (int i = 0; i < v.elements().size(); i++) {
@@ -282,12 +388,25 @@ public class Evaluator {
         List<String> tokens = tokenize(input);
         if (tokens.isEmpty()) throw new EvalError("empty input");
 
+        Env env = makeGlobalEnv();
         int[] pos = {0};
         SchemeVal result = null;
+        SchemeVal lastNonVoid = null;
         while (pos[0] < tokens.size()) {
-            result = eval(parse(tokens, pos));
+            result = eval(parse(tokens, pos), env);
+            if (!(result instanceof VoidVal)) {
+                lastNonVoid = result;
+            }
         }
         if (result == null) throw new EvalError("empty input");
+        // If the last expression was void but there was a non-void before, return that?
+        // No — spec says return last result. But void define followed by expr returns expr.
+        // Actually: multiple exprs, return last. If last is void, still return void display.
+        // But "(define x 5) x" → "5" means we eval both, last is x=5.
+        // The result var already tracks the last expression result correctly.
+        if (lastNonVoid != null && result instanceof VoidVal) {
+            // This shouldn't happen for well-formed programs — if define is last, return void
+        }
         return display(result);
     }
 
