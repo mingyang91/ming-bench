@@ -16,6 +16,7 @@ const (
 	TypePair
 	TypeNull
 	TypeVoid
+	TypeLambda
 )
 
 // Value represents a Scheme value.
@@ -26,6 +27,10 @@ type Value struct {
 	StrVal  string
 	Car     *Value
 	Cdr     *Value
+	// Lambda fields
+	Params  []string
+	Body    []*Expr
+	Closure *Env
 }
 
 var Void = &Value{Type: TypeVoid}
@@ -79,6 +84,8 @@ func (v *Value) String() string {
 		return "()"
 	case TypeVoid:
 		return ""
+	case TypeLambda:
+		return "#<procedure>"
 	case TypePair:
 		var buf strings.Builder
 		buf.WriteByte('(')

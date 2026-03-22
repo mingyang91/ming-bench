@@ -36,6 +36,14 @@ func evalList(expr *Expr, env *Env) (*Value, error) {
 			return evalAnd(expr, env)
 		case "or":
 			return evalOr(expr, env)
+		case "define":
+			return evalDefine(expr, env)
+		case "if":
+			return evalIf(expr, env)
+		case "quote":
+			return evalQuote(expr, env)
+		case "lambda":
+			return evalLambda(expr, env)
 		}
 	}
 
@@ -55,10 +63,13 @@ func evalList(expr *Expr, env *Env) (*Value, error) {
 		args[i] = val
 	}
 
-	return applyBuiltin(op, args, expr)
+	return applyFunc(op, args, expr)
 }
 
-func applyBuiltin(op *Value, args []*Value, expr *Expr) (*Value, error) {
+func applyFunc(op *Value, args []*Value, expr *Expr) (*Value, error) {
+	if op.Type == TypeLambda {
+		return applyLambda(op, args, expr)
+	}
 	if op.Type != TypeSymbol || len(op.StrVal) < 10 || op.StrVal[:10] != "__builtin:" {
 		return nil, errAtf(expr, "not a procedure")
 	}
@@ -202,6 +213,137 @@ func evalOr(expr *Expr, env *Env) (*Value, error) {
 		}
 	}
 	return False, nil
+}
+
+func evalDefine(expr *Expr, env *Env) (*Value, error) {
+	if len(expr.List) < 3 {
+		return nil, errAt(expr, "define: expected at least 2 arguments")
+	}
+	target := expr.List[1]
+	if target.Type == ExprSymbol {
+		// (define x expr)
+		val, err := Eval(expr.List[2], env)
+		if err != nil {
+			return nil, err
+		}
+		env.Set(target.StrVal, val)
+		return Void, nil
+	}
+	if target.Type == ExprList && len(target.List) >= 1 && target.List[0].Type == ExprSymbol {
+		// (define (f params...) body...)
+		name := target.List[0].StrVal
+		params := make([]string, len(target.List)-1)
+		for i, p := range target.List[1:] {
+			if p.Type != ExprSymbol {
+				return nil, errAt(p, "define: parameter must be a symbol")
+			}
+			params[i] = p.StrVal
+		}
+		lambda := &Value{
+			Type:    TypeLambda,
+			Params:  params,
+			Body:    expr.List[2:],
+			Closure: env,
+		}
+		env.Set(name, lambda)
+		return Void, nil
+	}
+	return nil, errAt(target, "define: invalid syntax")
+}
+
+func evalIf(expr *Expr, env *Env) (*Value, error) {
+	if len(expr.List) < 3 || len(expr.List) > 4 {
+		return nil, errAt(expr, "if: expected 2 or 3 arguments")
+	}
+	cond, err := Eval(expr.List[1], env)
+	if err != nil {
+		return nil, err
+	}
+	if cond.IsTruthy() {
+		return Eval(expr.List[2], env)
+	}
+	if len(expr.List) == 4 {
+		return Eval(expr.List[3], env)
+	}
+	return Void, nil
+}
+
+func evalQuote(expr *Expr, env *Env) (*Value, error) {
+	if len(expr.List) != 2 {
+		return nil, errAt(expr, "quote: expected 1 argument")
+	}
+	return exprToValue(expr.List[1])
+}
+
+func exprToValue(expr *Expr) (*Value, error) {
+	switch expr.Type {
+	case ExprInteger:
+		return IntegerValue(expr.IntVal), nil
+	case ExprBoolean:
+		return BooleanValue(expr.BoolVal), nil
+	case ExprString:
+		return StringValue(expr.StrVal), nil
+	case ExprSymbol:
+		return SymbolValue(expr.StrVal), nil
+	case ExprList:
+		if len(expr.List) == 0 {
+			return Null, nil
+		}
+		// Build a proper list from the elements
+		result := Null
+		for i := len(expr.List) - 1; i >= 0; i-- {
+			val, err := exprToValue(expr.List[i])
+			if err != nil {
+				return nil, err
+			}
+			result = PairValue(val, result)
+		}
+		return result, nil
+	default:
+		return nil, fmt.Errorf("cannot quote expression")
+	}
+}
+
+func evalLambda(expr *Expr, env *Env) (*Value, error) {
+	if len(expr.List) < 3 {
+		return nil, errAt(expr, "lambda: expected at least 2 arguments")
+	}
+	paramExpr := expr.List[1]
+	if paramExpr.Type != ExprList {
+		return nil, errAt(paramExpr, "lambda: parameters must be a list")
+	}
+	params := make([]string, len(paramExpr.List))
+	for i, p := range paramExpr.List {
+		if p.Type != ExprSymbol {
+			return nil, errAt(p, "lambda: parameter must be a symbol")
+		}
+		params[i] = p.StrVal
+	}
+	return &Value{
+		Type:    TypeLambda,
+		Params:  params,
+		Body:    expr.List[2:],
+		Closure: env,
+	}, nil
+}
+
+func applyLambda(fn *Value, args []*Value, expr *Expr) (*Value, error) {
+	if len(args) != len(fn.Params) {
+		return nil, errAtf(expr, "expected %d arguments, got %d", len(fn.Params), len(args))
+	}
+	localEnv := NewEnv(fn.Closure)
+	for i, param := range fn.Params {
+		localEnv.Set(param, args[i])
+	}
+	var result *Value
+	var err error
+	for _, bodyExpr := range fn.Body {
+		result, err = Eval(bodyExpr, localEnv)
+		if err != nil {
+			return nil, err
+		}
+	}
+	return result, nil
 }
 
 func makeDefaultEnv() *Env {
