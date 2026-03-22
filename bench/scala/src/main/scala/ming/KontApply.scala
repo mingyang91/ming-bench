@@ -3,7 +3,6 @@ package ming
 import SchemeValue.*
 import Evaluator.{DoneS, EvalS, ReturnS, Step}
 
-/** Continuation application. */
 private[ming] object KontApply:
 
   def applyKont(
@@ -88,19 +87,13 @@ private[ming] object KontApply:
       DerivedForms.evalCaseClauses(value, clauses, caseEnv, nextK, out)
 
     case Kont.ForEachK(proc, remainingGroups, nextK) =>
-      remainingGroups match
-        case Nil => ReturnS(SchemeVoid, nextK, out)
-        case group :: rest =>
-          ProcApply.applyProc(proc, group, Kont.ForEachK(proc, rest, nextK), out)
+      applyForEachK(value, proc, remainingGroups, nextK, out)
 
     case dk: (Kont.DynWindInK | Kont.DynWindMark | Kont.DynWindRetK | Kont.DynUnwindK | Kont.DynRewindK) =>
       applyDynWindKont(value, dk, out)
 
-    case Kont.ExceptionHandlerK(_, nextK) =>
-      ReturnS(value, nextK, out)
-
-    case Kont.GuardK(_, _, _, nextK) =>
-      ReturnS(value, nextK, out)
+    case Kont.ExceptionHandlerK(_, nextK) => ReturnS(value, nextK, out)
+    case Kont.GuardK(_, _, _, nextK)      => ReturnS(value, nextK, out)
 
     case Kont.GuardTestK(exnValue, body, remaining, variable, env, raiseK, guardK) =>
       ExceptionHandling.applyGuardTest(value, exnValue, body, remaining, variable, env, raiseK, guardK, out)
@@ -108,7 +101,8 @@ private[ming] object KontApply:
     case Kont.GuardClauseK(body, env, nextK) =>
       SpecialForms.startSequence(body, env, nextK, out)
 
-  // --- applyKont helpers ---
+    case Kont.CallWithValuesK(consumer, nextK) =>
+      applyCallWithValues(value, consumer, nextK, out)
 
   private def applyDynWindKont(
     value: SchemeValue,
@@ -252,6 +246,28 @@ private[ming] object KontApply:
       case Nil => ReturnS(SchemeList(newAcc), nextK, out)
       case group :: rest =>
         ProcApply.applyProc(proc, group, Kont.MapK(proc, rest, newAcc, nextK), out)
+
+  private def applyForEachK(
+    value: SchemeValue,
+    proc: SchemeValue,
+    remainingGroups: List[List[SchemeValue]],
+    nextK: Kont,
+    out: String
+  ): Step = remainingGroups match
+    case Nil => ReturnS(SchemeVoid, nextK, out)
+    case group :: rest =>
+      ProcApply.applyProc(proc, group, Kont.ForEachK(proc, rest, nextK), out)
+
+  private def applyCallWithValues(
+    value: SchemeValue,
+    consumer: SchemeValue,
+    nextK: Kont,
+    out: String
+  ): Step =
+    val consumerArgs = value match
+      case SchemeMultipleValues(vals) => vals
+      case single                     => List(single)
+    ProcApply.applyProc(consumer, consumerArgs, nextK, out)
 
   private def applyNamedLetInit(
     value: SchemeValue,

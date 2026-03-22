@@ -106,7 +106,9 @@ object Builtins:
     "procedure?",
     "dynamic-wind",
     "raise",
-    "with-exception-handler"
+    "with-exception-handler",
+    "values",
+    "call-with-values"
   )
 
   def evalBuiltin(

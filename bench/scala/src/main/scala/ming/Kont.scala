@@ -152,5 +152,7 @@ object Kont:
     k: Kont
   ) extends Kont
 
+  case class CallWithValuesK(consumer: SchemeValue, k: Kont) extends Kont
+
 /** Identity-based entry for dynamic-wind winder tracking. */
 class WinderEntry(val inThunk: SchemeValue, val outThunk: SchemeValue)

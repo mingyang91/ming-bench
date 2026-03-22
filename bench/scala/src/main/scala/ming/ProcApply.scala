@@ -36,6 +36,13 @@ private[ming] object ProcApply:
     case SchemeBuiltinProc("with-exception-handler") =>
       if args.length != 2 then throw new EvalError("with-exception-handler: expected 2 arguments")
       applyProc(args(1), Nil, Kont.ExceptionHandlerK(args(0), k), out)
+    case SchemeBuiltinProc("values") =>
+      args match
+        case single :: Nil => ReturnS(single, k, out)
+        case _             => ReturnS(SchemeMultipleValues(args), k, out)
+    case SchemeBuiltinProc("call-with-values") =>
+      if args.length != 2 then throw new EvalError("call-with-values: expected 2 arguments")
+      applyProc(args(0), Nil, Kont.CallWithValuesK(args(1), k), out)
     case SchemeBuiltinProc(name) =>
       val (result, bo) = Builtins.evalBuiltin(name, args)
       ReturnS(result, k, out + bo)
@@ -195,6 +202,7 @@ private[ming] object ProcApply:
     case Kont.GuardK(_, _, _, next)                 => next
     case Kont.GuardTestK(_, _, _, _, _, _, next)    => next
     case Kont.GuardClauseK(_, _, next)              => next
+    case Kont.CallWithValuesK(_, next)              => next
 
   private def computeWindDiff(
     current: List[WinderEntry],

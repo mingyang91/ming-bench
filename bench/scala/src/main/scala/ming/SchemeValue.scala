@@ -122,6 +122,9 @@ object SchemeValue:
     def display: String                = s"#(${elements.map(_.display).mkString(" ")})"
     override def displayOutput: String = s"#(${elements.map(_.displayOutput).mkString(" ")})"
 
+  case class SchemeMultipleValues(values: List[SchemeValue]) extends SchemeValue:
+    def display: String = values.map(_.display).mkString(", ")
+
   class SchemeResolvedSymbol(
     val name: String,
     val resolveEnv: Env,
