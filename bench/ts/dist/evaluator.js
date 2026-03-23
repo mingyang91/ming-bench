@@ -512,6 +512,14 @@ function evaluate(startExpr, startEnv) {
                 }
                 return { tag: 'void' };
             }
+            if (op === 'set!') {
+                const varExpr = items[1];
+                if (varExpr.tag !== 'symbol')
+                    throw new EvalError(`${posStr(expr.pos)}set!: bad syntax`);
+                const val = evaluate(items[2], env);
+                env.set(varExpr.value, val);
+                return { tag: 'void' };
+            }
             if (op === 'string-set!') {
                 const varExpr = items[1];
                 if (varExpr.tag !== 'symbol')
