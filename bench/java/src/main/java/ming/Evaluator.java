@@ -319,7 +319,27 @@ public class Evaluator {
                 try {
                     tokens.add(new Token(Long.parseLong(tok), line, startCol));
                 } catch (NumberFormatException e) {
-                    tokens.add(new Token(tok, line, startCol));
+                    boolean parsed = false;
+                    int slashIdx = tok.indexOf('/');
+                    if (slashIdx > 0 && slashIdx < tok.length() - 1) {
+                        try {
+                            long rn = Long.parseLong(tok.substring(0, slashIdx));
+                            long rd = Long.parseLong(tok.substring(slashIdx + 1));
+                            if (rd > 0) {
+                                tokens.add(new Token(makeRational(rn, rd), line, startCol));
+                                parsed = true;
+                            }
+                        } catch (NumberFormatException ignored) {}
+                    }
+                    if (!parsed) {
+                        try {
+                            if (tok.contains(".") || tok.contains("e") || tok.contains("E")) {
+                                tokens.add(new Token(Double.parseDouble(tok), line, startCol));
+                                parsed = true;
+                            }
+                        } catch (NumberFormatException ignored) {}
+                    }
+                    if (!parsed) tokens.add(new Token(tok, line, startCol));
                 }
             }
         }
@@ -382,7 +402,7 @@ public class Evaluator {
             return new More(() -> eval(loc.value(), env, k));
         }
 
-        if (expr instanceof Long || expr instanceof Boolean || expr instanceof SchemeString || expr instanceof SchemeChar) {
+        if (expr instanceof Long || expr instanceof Double || expr instanceof Rational || expr instanceof Boolean || expr instanceof SchemeString || expr instanceof SchemeChar) {
             return k.apply(expr);
         }
 
@@ -951,6 +971,8 @@ public class Evaluator {
     private boolean schemeEqv(Object a, Object b) {
         if (a == b) return true;
         if (a instanceof Long la && b instanceof Long lb) return la.equals(lb);
+        if (a instanceof Double da && b instanceof Double db) return da.equals(db);
+        if (a instanceof Rational ra && b instanceof Rational rb) return ra.equals(rb);
         if (a instanceof Boolean ba && b instanceof Boolean bb) return ba.equals(bb);
         if (a instanceof String sa && b instanceof String sb) return sa.equals(sb);
         if (a instanceof SchemeChar ca && b instanceof SchemeChar cb) return ca.value() == cb.value();
@@ -1251,7 +1273,9 @@ public class Evaluator {
             "string=?", "string<?", "string-ci=?", "string-upcase", "string-downcase",
             "map", "dynamic-wind", "reverse",
             "raise", "with-exception-handler",
-            "values", "call-with-values"
+            "values", "call-with-values",
+            "exact?", "inexact?", "exact->inexact", "inexact->exact",
+            "numerator", "denominator", "integer?", "rational?"
     );
 
     private boolean isPrimitive(String name) {
@@ -1261,37 +1285,38 @@ public class Evaluator {
     private Object applyPrimitive(String proc, List<Object> args) throws EvalError {
         return switch (proc) {
             case "+" -> {
-                long sum = 0;
-                for (Object a : args) sum += requireLong(a, "+");
+                Object sum = 0L;
+                for (Object a : args) { requireNumber(a, "+"); sum = numAdd(sum, a); }
                 yield sum;
             }
             case "-" -> {
                 if (args.isEmpty()) throw posError("-: expected at least 1 argument");
-                if (args.size() == 1) yield -requireLong(args.get(0), "-");
-                long result = requireLong(args.get(0), "-");
-                for (int i = 1; i < args.size(); i++) result -= requireLong(args.get(i), "-");
+                requireNumber(args.get(0), "-");
+                if (args.size() == 1) yield numNeg(args.get(0));
+                Object result = args.get(0);
+                for (int i = 1; i < args.size(); i++) { requireNumber(args.get(i), "-"); result = numSub(result, args.get(i)); }
                 yield result;
             }
             case "*" -> {
-                long product = 1;
-                for (Object a : args) product *= requireLong(a, "*");
+                Object product = 1L;
+                for (Object a : args) { requireNumber(a, "*"); product = numMul(product, a); }
                 yield product;
             }
             case "/" -> {
                 if (args.isEmpty()) throw posError("/: expected at least 1 argument");
-                long result = requireLong(args.get(0), "/");
-                for (int i = 1; i < args.size(); i++) {
-                    long divisor = requireLong(args.get(i), "/");
-                    if (divisor == 0) throw posError("division by zero");
-                    result /= divisor;
-                }
-                yield result;
+                requireNumber(args.get(0), "/");
+                try {
+                    if (args.size() == 1) yield numDiv(1L, args.get(0));
+                    Object result = args.get(0);
+                    for (int i = 1; i < args.size(); i++) { requireNumber(args.get(i), "/"); result = numDiv(result, args.get(i)); }
+                    yield result;
+                } catch (EvalError e) { throw posError("division by zero"); }
             }
-            case "<" -> { requireArgCount(args, 2, "<"); yield requireLong(args.get(0), "<") < requireLong(args.get(1), "<"); }
-            case ">" -> { requireArgCount(args, 2, ">"); yield requireLong(args.get(0), ">") > requireLong(args.get(1), ">"); }
-            case "=" -> { requireArgCount(args, 2, "="); yield requireLong(args.get(0), "=") == requireLong(args.get(1), "="); }
-            case "<=" -> { requireArgCount(args, 2, "<="); yield requireLong(args.get(0), "<=") <= requireLong(args.get(1), "<="); }
-            case ">=" -> { requireArgCount(args, 2, ">="); yield requireLong(args.get(0), ">=") >= requireLong(args.get(1), ">="); }
+            case "<" -> { requireArgCount(args, 2, "<"); requireNumber(args.get(0), "<"); requireNumber(args.get(1), "<"); yield numCompare(args.get(0), args.get(1)) < 0; }
+            case ">" -> { requireArgCount(args, 2, ">"); requireNumber(args.get(0), ">"); requireNumber(args.get(1), ">"); yield numCompare(args.get(0), args.get(1)) > 0; }
+            case "=" -> { requireArgCount(args, 2, "="); requireNumber(args.get(0), "="); requireNumber(args.get(1), "="); yield numCompare(args.get(0), args.get(1)) == 0; }
+            case "<=" -> { requireArgCount(args, 2, "<="); requireNumber(args.get(0), "<="); requireNumber(args.get(1), "<="); yield numCompare(args.get(0), args.get(1)) <= 0; }
+            case ">=" -> { requireArgCount(args, 2, ">="); requireNumber(args.get(0), ">="); requireNumber(args.get(1), ">="); yield numCompare(args.get(0), args.get(1)) >= 0; }
             case "cons" -> { requireArgCount(args, 2, "cons"); yield new Pair(args.get(0), args.get(1)); }
             case "car" -> {
                 requireArgCount(args, 1, "car");
@@ -1325,7 +1350,54 @@ public class Evaluator {
             }
             case "not" -> { requireArgCount(args, 1, "not"); yield isFalse(args.get(0)) ? Boolean.TRUE : Boolean.FALSE; }
             case "string?" -> { requireArgCount(args, 1, "string?"); yield args.get(0) instanceof SchemeString; }
-            case "number?" -> { requireArgCount(args, 1, "number?"); yield args.get(0) instanceof Long; }
+            case "number?" -> { requireArgCount(args, 1, "number?"); yield isSchemeNumber(args.get(0)); }
+            case "integer?" -> {
+                requireArgCount(args, 1, "integer?");
+                Object a = args.get(0);
+                if (a instanceof Long) yield true;
+                if (a instanceof Double d) yield d == Math.floor(d) && !Double.isInfinite(d);
+                yield false;
+            }
+            case "rational?" -> {
+                requireArgCount(args, 1, "rational?");
+                Object a = args.get(0);
+                yield a instanceof Long || a instanceof Rational;
+            }
+            case "exact?" -> {
+                requireArgCount(args, 1, "exact?");
+                Object a = args.get(0);
+                yield a instanceof Long || a instanceof Rational;
+            }
+            case "inexact?" -> {
+                requireArgCount(args, 1, "inexact?");
+                yield args.get(0) instanceof Double;
+            }
+            case "exact->inexact" -> {
+                requireArgCount(args, 1, "exact->inexact");
+                requireNumber(args.get(0), "exact->inexact");
+                yield toDouble(args.get(0));
+            }
+            case "inexact->exact" -> {
+                requireArgCount(args, 1, "inexact->exact");
+                Object a = args.get(0);
+                if (a instanceof Long || a instanceof Rational) yield a;
+                if (a instanceof Double d) yield inexactToExact(d);
+                throw posError("inexact->exact: expected number");
+            }
+            case "numerator" -> {
+                requireArgCount(args, 1, "numerator");
+                Object a = args.get(0);
+                if (a instanceof Long l) yield l;
+                if (a instanceof Rational r) yield r.num;
+                throw posError("numerator: expected exact number");
+            }
+            case "denominator" -> {
+                requireArgCount(args, 1, "denominator");
+                Object a = args.get(0);
+                if (a instanceof Long) yield 1L;
+                if (a instanceof Rational r) yield r.den;
+                throw posError("denominator: expected exact number");
+            }
             case "boolean?" -> { requireArgCount(args, 1, "boolean?"); yield args.get(0) instanceof Boolean; }
             case "pair?" -> { requireArgCount(args, 1, "pair?"); yield args.get(0) instanceof Pair; }
             case "symbol?" -> { requireArgCount(args, 1, "symbol?"); yield args.get(0) instanceof String; }
@@ -1373,11 +1445,20 @@ public class Evaluator {
             case "string->number" -> {
                 requireArgCount(args, 1, "string->number");
                 if (!(args.get(0) instanceof SchemeString s)) throw posError("string->number: expected string");
-                try { yield Long.parseLong(s.value()); } catch (NumberFormatException e) { yield Boolean.FALSE; }
+                String sv = s.value();
+                try { yield Long.parseLong(sv); } catch (NumberFormatException e) {
+                    try {
+                        if (sv.contains(".") || sv.contains("e") || sv.contains("E")) {
+                            yield Double.parseDouble(sv);
+                        }
+                    } catch (NumberFormatException ignored) {}
+                    yield Boolean.FALSE;
+                }
             }
             case "number->string" -> {
                 requireArgCount(args, 1, "number->string");
-                yield new SchemeString(String.valueOf(requireLong(args.get(0), "number->string")));
+                requireNumber(args.get(0), "number->string");
+                yield new SchemeString(numberToString(args.get(0)));
             }
             case "symbol->string" -> {
                 requireArgCount(args, 1, "symbol->string");
@@ -1535,6 +1616,7 @@ public class Evaluator {
                 requireArgCount(args, 2, "eq?");
                 Object a = args.get(0), b = args.get(1);
                 if (a instanceof Long la && b instanceof Long lb) yield la.equals(lb);
+                if (a instanceof Rational ra && b instanceof Rational rb) yield ra.equals(rb);
                 if (a instanceof String && b instanceof String) yield a.equals(b);
                 yield a == b;
             }
@@ -1856,6 +1938,8 @@ public class Evaluator {
     private boolean schemeEqual(Object a, Object b) {
         if (a == b) return true;
         if (a instanceof Long la && b instanceof Long lb) return la.equals(lb);
+        if (a instanceof Double da && b instanceof Double db) return da.equals(db);
+        if (a instanceof Rational ra && b instanceof Rational rb) return ra.equals(rb);
         if (a instanceof Boolean ba && b instanceof Boolean bb) return ba.equals(bb);
         if (a instanceof String sa && b instanceof String sb) return sa.equals(sb);
         if (a instanceof SchemeString sa && b instanceof SchemeString sb) return sa.value().equals(sb.value());
@@ -1894,8 +1978,17 @@ public class Evaluator {
         return schemeToString(val);
     }
 
+    private static String numberToString(Object val) {
+        if (val instanceof Long l) return l.toString();
+        if (val instanceof Double d) return Double.toString(d);
+        if (val instanceof Rational r) return r.num + "/" + r.den;
+        return val.toString();
+    }
+
     private String schemeToString(Object val) {
         if (val instanceof Long l) return l.toString();
+        if (val instanceof Double d) return Double.toString(d);
+        if (val instanceof Rational r) return r.num + "/" + r.den;
         if (val instanceof Boolean b) return b ? "#t" : "#f";
         if (val instanceof SchemeString s) return "\"" + s.value() + "\"";
         if (val instanceof SchemeChar c) {
@@ -1967,5 +2060,106 @@ public class Evaluator {
         int length() { return data.length; }
         Object ref(int i) { return data[i]; }
         void set(int i, Object v) { data[i] = v; }
+    }
+
+    // --- Rational numbers (exact arithmetic) ---
+
+    static class Rational {
+        final long num;
+        final long den;
+        Rational(long num, long den) { this.num = num; this.den = den; }
+        @Override public boolean equals(Object o) {
+            return o instanceof Rational r && num == r.num && den == r.den;
+        }
+        @Override public int hashCode() { return Long.hashCode(num) * 31 + Long.hashCode(den); }
+    }
+
+    private static long gcd(long a, long b) {
+        a = Math.abs(a); b = Math.abs(b);
+        while (b != 0) { long t = b; b = a % b; a = t; }
+        return a;
+    }
+
+    static Object makeRational(long num, long den) {
+        if (den < 0) { num = -num; den = -den; }
+        long g = gcd(num, den);
+        num /= g; den /= g;
+        if (den == 1) return num;
+        return new Rational(num, den);
+    }
+
+    private static boolean isSchemeNumber(Object o) {
+        return o instanceof Long || o instanceof Double || o instanceof Rational;
+    }
+
+    private static double toDouble(Object o) {
+        if (o instanceof Long l) return l.doubleValue();
+        if (o instanceof Double d) return d;
+        if (o instanceof Rational r) return (double) r.num / r.den;
+        throw new IllegalArgumentException("not a number");
+    }
+
+    private static long[] rparts(Object o) {
+        if (o instanceof Long l) return new long[]{l, 1};
+        if (o instanceof Rational r) return new long[]{r.num, r.den};
+        throw new IllegalArgumentException("not exact");
+    }
+
+    private static Object numAdd(Object a, Object b) {
+        if (a instanceof Double || b instanceof Double) return toDouble(a) + toDouble(b);
+        long[] ra = rparts(a), rb = rparts(b);
+        return makeRational(ra[0] * rb[1] + rb[0] * ra[1], ra[1] * rb[1]);
+    }
+
+    private static Object numSub(Object a, Object b) {
+        if (a instanceof Double || b instanceof Double) return toDouble(a) - toDouble(b);
+        long[] ra = rparts(a), rb = rparts(b);
+        return makeRational(ra[0] * rb[1] - rb[0] * ra[1], ra[1] * rb[1]);
+    }
+
+    private static Object numMul(Object a, Object b) {
+        if (a instanceof Double || b instanceof Double) return toDouble(a) * toDouble(b);
+        long[] ra = rparts(a), rb = rparts(b);
+        return makeRational(ra[0] * rb[0], ra[1] * rb[1]);
+    }
+
+    private static Object numDiv(Object a, Object b) throws EvalError {
+        if (a instanceof Double || b instanceof Double) {
+            double db = toDouble(b);
+            if (db == 0) throw new EvalError("division by zero");
+            return toDouble(a) / db;
+        }
+        long[] ra = rparts(a), rb = rparts(b);
+        if (rb[0] == 0) throw new EvalError("division by zero");
+        return makeRational(ra[0] * rb[1], ra[1] * rb[0]);
+    }
+
+    private static int numCompare(Object a, Object b) {
+        if (a instanceof Double || b instanceof Double) return Double.compare(toDouble(a), toDouble(b));
+        long[] ra = rparts(a), rb = rparts(b);
+        return Long.compare(ra[0] * rb[1], rb[0] * ra[1]);
+    }
+
+    private Object requireNumber(Object val, String context) throws EvalError {
+        if (isSchemeNumber(val)) return val;
+        throw posError(context + ": expected number, got " + schemeToString(val));
+    }
+
+    private static Object inexactToExact(double d) {
+        if (d == Math.floor(d) && !Double.isInfinite(d)) return (long) d;
+        long bits = Double.doubleToLongBits(d);
+        boolean negative = (bits >> 63) != 0;
+        int exp = (int) ((bits >> 52) & 0x7FFL) - 1023 - 52;
+        long mantissa = (bits & 0x000fffffffffffffL) | 0x0010000000000000L;
+        if (negative) mantissa = -mantissa;
+        if (exp >= 0) return mantissa * (1L << exp);
+        return makeRational(mantissa, 1L << (-exp));
+    }
+
+    private static Object numNeg(Object a) {
+        if (a instanceof Long l) return -l;
+        if (a instanceof Double d) return -d;
+        if (a instanceof Rational r) return new Rational(-r.num, r.den);
+        throw new IllegalArgumentException("not a number");
     }
 }
