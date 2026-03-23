@@ -36,6 +36,12 @@ class Env {
   set(name: string, val: SchemeVal): void {
     this.bindings.set(name, val);
   }
+
+  mutate(name: string, val: SchemeVal, pos?: Pos): void {
+    if (this.bindings.has(name)) { this.bindings.set(name, val); return; }
+    if (this.parent) { this.parent.mutate(name, val, pos); return; }
+    throw posError(`set!: unbound variable: ${name}`, pos);
+  }
 }
 
 // ── Parser ─────────────────────────────────────────────────────────
@@ -230,6 +236,14 @@ function evaluate(initExpr: SchemeVal, initEnv: Env): SchemeVal {
           expr = elems[elems.length - 1];
           env = letEnv2;
           continue;
+        }
+        case 'set!': {
+          if (elems.length !== 3) throw posError('set!: bad syntax', expr.pos);
+          const target = elems[1];
+          if (target.tag !== 'symbol') throw posError('set!: target must be a symbol', expr.pos);
+          const val = evaluate(elems[2], env);
+          env.mutate(target.value, val, expr.pos);
+          return { tag: 'void' };
         }
         case 'begin': {
           if (elems.length === 1) return { tag: 'void' };
