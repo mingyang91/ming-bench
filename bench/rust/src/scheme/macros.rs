@@ -16,7 +16,9 @@ fn gensym(base: &str) -> String {
 
 const KEYWORDS: &[&str] = &[
     "if", "define", "set!", "quote", "lambda", "begin", "and", "or",
-    "let", "cond", "define-syntax", "syntax-rules",
+    "let", "let*", "cond", "case", "letrec", "letrec*", "do",
+    "define-syntax", "syntax-rules", "define-record-type", "guard",
+    "syntax-case", "syntax-template", "with-syntax",
 ];
 
 pub enum Binding {
@@ -191,20 +193,14 @@ fn expand(
     let mut introduced: HashMap<String, String> = HashMap::new(); // original → gensym
     classify_symbols(template, bindings, def_env, &mut free_vars, &mut introduced);
 
-    // Create env with def-site bindings for free vars
-    let eval_env = if free_vars.is_empty() {
-        Rc::clone(call_env)
-    } else {
-        let mut names = Vec::new();
-        let mut values = Vec::new();
-        for (orig, gs) in &free_vars {
-            if let Some(val) = def_env.get(orig) {
-                names.push(gs.clone());
-                values.push(val);
-            }
+    // Define gensym'd free-var bindings directly in call_env so that
+    // any `define` inside the expansion is visible at the call site.
+    for (orig, gs) in &free_vars {
+        if let Some(val) = def_env.get(orig) {
+            call_env.define(gs.clone(), val);
         }
-        Env::extend(call_env, names, values)
-    };
+    }
+    let eval_env = Rc::clone(call_env);
 
     let mut renames: HashMap<String, String> = HashMap::new();
     renames.extend(free_vars);

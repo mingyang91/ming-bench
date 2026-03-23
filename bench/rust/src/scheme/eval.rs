@@ -202,6 +202,7 @@ enum HandlerEntry {
         guard_k: Vec<Frame>,
         guard_wind: Vec<WindEntry>,
         guard_handlers: Vec<HandlerEntry>,
+        guard_span: Span,
     },
 }
 
@@ -455,7 +456,7 @@ fn step_eval_list(
             "do" => return step_do(&elems[1..], env, k),
             "define-syntax" => return step_define_syntax(&elems[1..], env, k),
             "define-record-type" => return step_define_record_type(&elems[1..], env),
-            "guard" => return step_guard(&elems[1..], env, k, wind, handlers),
+            "guard" => return step_guard(&elems[1..], env, k, wind, handlers, span),
             "syntax-case" => return step_syntax_case(&elems[1..], env, k),
             "syntax-template" => return step_syntax_template(&elems[1..], env),
             "with-syntax" => return step_with_syntax(&elems[1..], env, k),
@@ -1198,6 +1199,7 @@ fn step_guard(
     k: &mut Vec<Frame>,
     wind: &[WindEntry],
     handlers: &mut Vec<HandlerEntry>,
+    span: Span,
 ) -> Result<State, EvalError> {
     if args.len() < 2 {
         return Err(ErrorKind::BadSyntax {
@@ -1229,6 +1231,39 @@ fn step_guard(
     let clauses = header[1..].to_vec();
     let body = args[1..].to_vec();
 
+    // TCO: if the top of k is PopHandler from a guard at the same source
+    // location (self-recursive tail call), reuse the previous guard's saved
+    // continuation instead of cloning the growing stack.
+    if matches!(k.last(), Some(Frame::PopHandler)) {
+        if let Some(HandlerEntry::Guard { guard_span: prev_span, .. }) = handlers.last() {
+            if *prev_span == span {
+                k.pop(); // remove old PopHandler
+                let old = handlers.pop().expect("checked above");
+                let (reuse_k, reuse_wind, reuse_handlers) = match old {
+                    HandlerEntry::Guard { guard_k, guard_wind, guard_handlers, .. } => {
+                        (guard_k, guard_wind, guard_handlers)
+                    }
+                    HandlerEntry::WithExceptionHandler { .. } => unreachable!(),
+                };
+                k.push(Frame::PopHandler);
+                handlers.push(HandlerEntry::Guard {
+                    var,
+                    clauses,
+                    env: Rc::clone(env),
+                    guard_k: reuse_k,
+                    guard_wind: reuse_wind,
+                    guard_handlers: reuse_handlers,
+                    guard_span: span,
+                });
+                return if body.is_empty() {
+                    Ok(State::Ret(Value::Void))
+                } else {
+                    Ok(begin_seq(&body, env, k))
+                };
+            }
+        }
+    }
+
     // Save guard continuation state (before pushing PopHandler)
     let guard_k = k.clone();
     let guard_wind = wind.to_vec();
@@ -1245,6 +1280,7 @@ fn step_guard(
         guard_k,
         guard_wind,
         guard_handlers,
+        guard_span: span,
     });
 
     // Evaluate body
@@ -2037,6 +2073,7 @@ fn step_apply(
                             guard_k,
                             guard_wind,
                             guard_handlers,
+                            ..
                         } => {
                             // Compute wind transfer ops
                             let common_len = wind
@@ -2218,14 +2255,11 @@ fn apply_continuation(
     span: Span,
     handlers: &mut Vec<HandlerEntry>,
 ) -> Result<State, EvalError> {
-    if args.len() != 1 {
-        return Err(ErrorKind::WrongArgCount {
-            expected: 1,
-            got: args.len(),
-        }
-        .into());
-    }
-    let val = args.into_iter().next().expect("checked len");
+    let val = match args.len() {
+        0 => Value::Void,
+        1 => args.into_iter().next().expect("checked len"),
+        _ => Value::MultipleValues(args),
+    };
     let (target_frames, target_wind, target_handlers) = captured
         .0
         .downcast_ref::<(Vec<Frame>, Vec<WindEntry>, Vec<HandlerEntry>)>()
