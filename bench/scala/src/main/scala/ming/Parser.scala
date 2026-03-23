@@ -32,7 +32,7 @@ object Parser:
     (sb.toString, i)
 
   private def isAtomChar(ch: Char): Boolean =
-    !ch.isWhitespace && ch != '(' && ch != ')' && ch != '"' && ch != ';'
+    !ch.isWhitespace && ch != '(' && ch != ')' && ch != '"' && ch != ';' && ch != '\''
 
   private def tokenize(input: String): List[String] =
     val result = scala.collection.mutable.ListBuffer.empty[String]
@@ -48,6 +48,9 @@ object Parser:
           i += 1
         case ')' =>
           result += ")"
+          i += 1
+        case '\'' =>
+          result += "'"
           i += 1
         case '"' =>
           val (tok, newPos) = scanString(input, i + 1)
@@ -69,18 +72,30 @@ object Parser:
         parseTokens(remaining, expr :: acc)
       case ")" :: _ =>
         throw new EvalError("unexpected )")
+      case "'" :: rest =>
+        val (quoted, remaining) = parseOne(rest)
+        parseTokens(remaining, SList(Sym("quote") :: quoted :: Nil) :: acc)
       case token :: rest =>
         parseTokens(rest, parseAtom(token) :: acc)
+
+  private def parseOne(tokens: List[String]): (Expr, List[String]) =
+    tokens match
+      case Nil => throw new EvalError("unexpected end of input")
+      case "(" :: rest =>
+        parseList(rest, Nil)
+      case "'" :: rest =>
+        val (quoted, remaining) = parseOne(rest)
+        (SList(Sym("quote") :: quoted :: Nil), remaining)
+      case token :: rest =>
+        (parseAtom(token), rest)
 
   private def parseList(tokens: List[String], acc: List[Expr]): (Expr, List[String]) =
     tokens match
       case Nil         => throw new EvalError("unexpected end of input")
       case ")" :: rest => (SList(acc.reverse), rest)
-      case "(" :: rest =>
-        val (inner, remaining) = parseList(rest, Nil)
-        parseList(remaining, inner :: acc)
-      case token :: rest =>
-        parseList(rest, parseAtom(token) :: acc)
+      case _ =>
+        val (expr, remaining) = parseOne(tokens)
+        parseList(remaining, expr :: acc)
 
   private def parseAtom(token: String): Expr =
     if token == "#t" then Bool(true)
