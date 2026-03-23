@@ -44,6 +44,7 @@ enum Value:
   case ValuesVal(values: List[Value])
   case RecordVal(tag: String, fields: Array[Value])
   case ProcMacroVal(transformer: Value, defEnv: Env)
+  case CaseLambdaVal(clauses: List[(List[String], Option[String], List[Expr])], closure: Env)
 
   def display: String = this match
     case IntVal(n)             => n.toString
@@ -64,6 +65,7 @@ enum Value:
     case ValuesVal(_)          => "#<values>"
     case RecordVal(tag, _)     => s"#<record:$tag>"
     case ProcMacroVal(_, _)    => "#<macro>"
+    case CaseLambdaVal(_, _)   => "#<procedure>"
 
   /** Display without quotes (for `display` builtin). */
   def displayNoQuotes: String = this match

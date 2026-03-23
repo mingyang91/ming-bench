@@ -104,23 +104,24 @@ object Evaluator extends EvalForms with EvalWind with EvalExceptions with EvalSy
 
   protected def eval(expr: Expr, env: Env, k: K): Bounce =
     expr match
-      case Num(n, _)                             => k(IntVal(n))
-      case Rat(n, d, _)                          => k(Value.makeRational(n, d))
-      case Flt(d, _)                             => k(FloatVal(d))
-      case Bool(b, _)                            => k(BoolVal(b))
-      case Str(s, _)                             => k(StrVal(s.toCharArray))
-      case Chr(c, _)                             => k(CharVal(c))
-      case Sym(name, pos)                        => k(env.lookup(name, pos))
-      case SList(Nil, pos)                       => evalError("empty application", pos)
-      case SList(Sym("if", _) :: args, pos)      => evalIf(args, env, pos, k)
-      case SList(Sym("define", _) :: args, pos)  => evalDefineCps(args, env, pos, k)
-      case SList(Sym("set!", _) :: args, pos)    => evalSetBang(args, env, pos, k)
-      case SList(Sym("quote", _) :: args, pos)   => k(evalQuote(args, pos))
-      case SList(Sym("lambda", _) :: args, pos)  => k(evalLambda(args, env, pos))
-      case SList(Sym("let", _) :: args, pos)     => evalLetCps(args, env, pos, k)
-      case SList(Sym("let*", _) :: args, pos)    => evalLetStarCps(args, env, pos, k)
-      case SList(Sym("letrec", _) :: args, pos)  => evalLetrecCps(args, env, pos, k)
-      case SList(Sym("letrec*", _) :: args, pos) => evalLetrecStarCps(args, env, pos, k)
+      case Num(n, _)                                    => k(IntVal(n))
+      case Rat(n, d, _)                                 => k(Value.makeRational(n, d))
+      case Flt(d, _)                                    => k(FloatVal(d))
+      case Bool(b, _)                                   => k(BoolVal(b))
+      case Str(s, _)                                    => k(StrVal(s.toCharArray))
+      case Chr(c, _)                                    => k(CharVal(c))
+      case Sym(name, pos)                               => k(env.lookup(name, pos))
+      case SList(Nil, pos)                              => evalError("empty application", pos)
+      case SList(Sym("if", _) :: args, pos)             => evalIf(args, env, pos, k)
+      case SList(Sym("define", _) :: args, pos)         => evalDefineCps(args, env, pos, k)
+      case SList(Sym("set!", _) :: args, pos)           => evalSetBang(args, env, pos, k)
+      case SList(Sym("quote", _) :: args, pos)          => k(evalQuote(args, pos))
+      case SList(Sym("lambda", _) :: args, pos)         => k(evalLambda(args, env, pos))
+      case SList(Sym("case-lambda", _) :: clauses, pos) => k(evalCaseLambda(clauses, env, pos))
+      case SList(Sym("let", _) :: args, pos)            => evalLetCps(args, env, pos, k)
+      case SList(Sym("let*", _) :: args, pos)           => evalLetStarCps(args, env, pos, k)
+      case SList(Sym("letrec", _) :: args, pos)         => evalLetrecCps(args, env, pos, k)
+      case SList(Sym("letrec*", _) :: args, pos)        => evalLetrecStarCps(args, env, pos, k)
       case SList(Sym("case", _) :: keyExpr :: clauses, pos) =>
         eval(keyExpr, env, keyVal => evalCaseCps(keyVal, clauses, env, pos, k))
       case SList(Sym("do", _) :: args, pos)                 => evalDoCps(args, env, pos, k)
@@ -216,10 +217,21 @@ object Evaluator extends EvalForms with EvalWind with EvalExceptions with EvalSy
         )
       case _ => evalError(s"$name: not a macro", pos)
 
+  private def evalCaseLambda(clauses: List[Expr], env: Env, pos: Option[Pos]): Value =
+    val parsed = clauses.map {
+      case SList(SList(params, _) :: body, _) if body.nonEmpty =>
+        val (paramNames, restParam) = parseParams(params, "case-lambda", pos)
+        (paramNames, restParam, body)
+      case _ => evalError("case-lambda: bad clause syntax", pos)
+    }
+    CaseLambdaVal(parsed, env)
+
   protected def applyProc(proc: Value, values: List[Value], pos: Option[Pos], k: K): Bounce =
     proc match
       case LambdaVal(params, restParam, body, closure) =>
         tailBody(body, closure.extendWithRest(params, restParam, values), k)
+      case CaseLambdaVal(clauses, closure) =>
+        applyCaseLambda(clauses, closure, values, pos, k)
       case ContinuationVal(invoke) =>
         values match
           case single :: Nil => invoke(single)
@@ -249,6 +261,24 @@ object Evaluator extends EvalForms with EvalWind with EvalExceptions with EvalSy
             else evalError(e.getMessage, pos)
           case e: ArithmeticException => evalError(e.getMessage, pos)
       case _ => evalError("not a procedure", pos)
+
+  private def applyCaseLambda(
+    clauses: List[(List[String], Option[String], List[Expr])],
+    closure: Env,
+    values: List[Value],
+    pos: Option[Pos],
+    k: K
+  ): Bounce =
+    val matched = clauses.find { case (params, restParam, _) =>
+      restParam match
+        case Some(_) => values.length >= params.length
+        case None    => values.length == params.length
+    }
+    matched match
+      case Some((params, restParam, body)) =>
+        tailBody(body, closure.extendWithRest(params, restParam, values), k)
+      case None =>
+        evalError(s"case-lambda: no matching clause for ${values.length} arguments", pos)
 
   private def applyCallWithValues(values: List[Value], pos: Option[Pos], k: K): Bounce =
     if values.length != 2 then evalError("call-with-values: expected 2 arguments", pos)

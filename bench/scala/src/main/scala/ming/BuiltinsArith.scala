@@ -142,7 +142,9 @@ private[ming] object BuiltinsArith:
           args =>
             typePred(
               args,
-              v => v.isInstanceOf[LambdaVal] || v.isInstanceOf[BuiltinVal] || v.isInstanceOf[ContinuationVal]
+              v =>
+                v.isInstanceOf[LambdaVal] || v.isInstanceOf[BuiltinVal] || v.isInstanceOf[ContinuationVal] || v
+                  .isInstanceOf[CaseLambdaVal]
             )
         ),
         ("symbol?", args => typePred(args, _.isInstanceOf[SymbolVal])),
