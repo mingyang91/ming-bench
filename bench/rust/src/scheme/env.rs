@@ -47,6 +47,8 @@ impl Env {
             "dynamic-wind", "reverse",
             "raise", "with-exception-handler",
             "values", "call-with-values",
+            "exact?", "inexact?", "exact->inexact", "inexact->exact",
+            "numerator", "denominator", "rational?", "integer?",
         ] {
             bindings.insert(name.into(), Value::Builtin(name.into()));
         }

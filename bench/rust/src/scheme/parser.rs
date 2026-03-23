@@ -4,6 +4,8 @@ use crate::scheme::error::{ErrorKind, EvalError, Span};
 #[derive(Debug, Clone, PartialEq)]
 pub enum ExprKind {
     Integer(i64),
+    Float(f64),
+    Rational(i64, i64),
     Boolean(bool),
     Str(String),
     Char(char),
@@ -233,6 +235,31 @@ impl Parser {
             return Ok(Expr { kind: ExprKind::Integer(n), span });
         }
 
+        // Try rational literal (e.g. 1/3, -5/2)
+        if let Some(slash_pos) = token.find('/') {
+            let num_str = &token[..slash_pos];
+            let den_str = &token[slash_pos + 1..];
+            if let (Ok(num), Ok(den)) = (num_str.parse::<i64>(), den_str.parse::<i64>()) {
+                if den != 0 {
+                    let g = gcd(num.unsigned_abs(), den.unsigned_abs()) as i64;
+                    let (mut n, mut d) = (num / g, den / g);
+                    if d < 0 {
+                        n = -n;
+                        d = -d;
+                    }
+                    if d == 1 {
+                        return Ok(Expr { kind: ExprKind::Integer(n), span });
+                    }
+                    return Ok(Expr { kind: ExprKind::Rational(n, d), span });
+                }
+            }
+        }
+
+        // Try float
+        if let Ok(f) = token.parse::<f64>() {
+            return Ok(Expr { kind: ExprKind::Float(f), span });
+        }
+
         // Otherwise it's a symbol
         Ok(Expr { kind: ExprKind::Symbol(token), span })
     }
@@ -254,4 +281,14 @@ impl Parser {
 
 fn is_delimiter(ch: char) -> bool {
     ch.is_whitespace() || ch == '(' || ch == ')' || ch == '"' || ch == ';'
+}
+
+/// Greatest common divisor (Euclidean algorithm).
+pub fn gcd(mut a: u64, mut b: u64) -> u64 {
+    while b != 0 {
+        let t = b;
+        b = a % b;
+        a = t;
+    }
+    a
 }

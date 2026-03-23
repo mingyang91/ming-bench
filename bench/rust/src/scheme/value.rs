@@ -26,6 +26,8 @@ pub enum StringMutability {
 #[derive(Debug, Clone)]
 pub enum Value {
     Integer(i64),
+    Float(f64),
+    Rational(i64, i64),
     Boolean(bool),
     Str(Rc<RefCell<String>>, StringMutability),
     Symbol(String),
@@ -69,6 +71,8 @@ impl PartialEq for Value {
     fn eq(&self, other: &Self) -> bool {
         match (self, other) {
             (Value::Integer(a), Value::Integer(b)) => a == b,
+            (Value::Float(a), Value::Float(b)) => a == b,
+            (Value::Rational(an, ad), Value::Rational(bn, bd)) => an == bn && ad == bd,
             (Value::Boolean(a), Value::Boolean(b)) => a == b,
             (Value::Str(a, _), Value::Str(b, _)) => *a.borrow() == *b.borrow(),
             (Value::Symbol(a), Value::Symbol(b)) => a == b,
@@ -91,6 +95,8 @@ impl Value {
     pub fn to_display_string(&self) -> String {
         match self {
             Value::Integer(n) => n.to_string(),
+            Value::Float(f) => format_float(*f),
+            Value::Rational(n, d) => format!("{}/{}", n, d),
             Value::Boolean(true) => "#t".into(),
             Value::Boolean(false) => "#f".into(),
             Value::Str(s, _) => format!("\"{}\"", s.borrow()),
@@ -146,5 +152,15 @@ impl Value {
 impl fmt::Display for Value {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(f, "{}", self.to_display_string())
+    }
+}
+
+/// Format a float for Scheme display. Ensures a decimal point is always present.
+fn format_float(f: f64) -> String {
+    let s = format!("{}", f);
+    if s.contains('.') || s.contains('e') || s.contains('E') {
+        s
+    } else {
+        format!("{}.0", s)
     }
 }

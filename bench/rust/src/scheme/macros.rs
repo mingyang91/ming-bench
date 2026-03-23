@@ -149,6 +149,8 @@ fn match_one(
         },
         ExprKind::Boolean(b) => matches!(&inp.kind, ExprKind::Boolean(b2) if b == b2),
         ExprKind::Integer(n) => matches!(&inp.kind, ExprKind::Integer(n2) if n == n2),
+        ExprKind::Float(f) => matches!(&inp.kind, ExprKind::Float(f2) if f == f2),
+        ExprKind::Rational(n, d) => matches!(&inp.kind, ExprKind::Rational(n2, d2) if n == n2 && d == d2),
         ExprKind::Str(s) => matches!(&inp.kind, ExprKind::Str(s2) if s == s2),
         ExprKind::Char(c) => matches!(&inp.kind, ExprKind::Char(c2) if c == c2),
     }
