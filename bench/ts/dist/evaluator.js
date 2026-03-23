@@ -577,6 +577,182 @@ function makeGlobalEnv() {
             throw new EvalError('string-copy: expected string');
         return { tag: 'string', value: args[0].value };
     });
+    // eq? / eqv? / equal?
+    function schemeEq(a, b) {
+        if (a.tag !== b.tag)
+            return false;
+        if (a.tag === 'nil')
+            return true;
+        if (a.tag === 'boolean' && b.tag === 'boolean')
+            return a.value === b.value;
+        if (a.tag === 'number' && b.tag === 'number')
+            return a.value === b.value;
+        if (a.tag === 'symbol' && b.tag === 'symbol')
+            return a.value === b.value;
+        if (a.tag === 'char' && b.tag === 'char')
+            return a.value === b.value;
+        if (a.tag === 'string' && b.tag === 'string')
+            return a.value === b.value;
+        return a === b;
+    }
+    function schemeEqual(a, b) {
+        if (a.tag === 'pair' && b.tag === 'pair') {
+            return schemeEqual(a.car, b.car) && schemeEqual(a.cdr, b.cdr);
+        }
+        return schemeEq(a, b);
+    }
+    defBuiltin('eq?', (args) => ({ tag: 'boolean', value: schemeEq(args[0], args[1]) }));
+    defBuiltin('eqv?', (args) => ({ tag: 'boolean', value: schemeEq(args[0], args[1]) }));
+    defBuiltin('equal?', (args) => ({ tag: 'boolean', value: schemeEqual(args[0], args[1]) }));
+    // map (supports multiple lists)
+    defBuiltin('map', (args) => {
+        const proc = args[0];
+        const lists = args.slice(1).map(pairsToArray);
+        const len = lists[0].length;
+        const result = [];
+        for (let i = 0; i < len; i++) {
+            const callArgs = lists.map(l => l[i]);
+            // Synchronous apply for builtins/lambdas
+            const r = runTrampoline(applyCPS(proc, callArgs, (v) => done(v)));
+            result.push(r);
+        }
+        return listToPairs(result);
+    });
+    // L13: Numeric utilities
+    defBuiltin('abs', (args) => ({ tag: 'number', value: Math.abs(expectNumber(args[0], 'abs')) }));
+    defBuiltin('modulo', (args) => {
+        const a = expectNumber(args[0], 'modulo');
+        const b = expectNumber(args[1], 'modulo');
+        return { tag: 'number', value: ((a % b) + b) % b };
+    });
+    defBuiltin('remainder', (args) => {
+        const a = expectNumber(args[0], 'remainder');
+        const b = expectNumber(args[1], 'remainder');
+        return { tag: 'number', value: a % b };
+    });
+    defBuiltin('quotient', (args) => {
+        const a = expectNumber(args[0], 'quotient');
+        const b = expectNumber(args[1], 'quotient');
+        return { tag: 'number', value: Math.trunc(a / b) };
+    });
+    defBuiltin('min', (args) => {
+        let m = expectNumber(args[0], 'min');
+        for (let i = 1; i < args.length; i++)
+            m = Math.min(m, expectNumber(args[i], 'min'));
+        return { tag: 'number', value: m };
+    });
+    defBuiltin('max', (args) => {
+        let m = expectNumber(args[0], 'max');
+        for (let i = 1; i < args.length; i++)
+            m = Math.max(m, expectNumber(args[i], 'max'));
+        return { tag: 'number', value: m };
+    });
+    defBuiltin('expt', (args) => {
+        const base = expectNumber(args[0], 'expt');
+        const exp = expectNumber(args[1], 'expt');
+        return { tag: 'number', value: Math.pow(base, exp) };
+    });
+    defBuiltin('zero?', (args) => ({ tag: 'boolean', value: expectNumber(args[0], 'zero?') === 0 }));
+    defBuiltin('positive?', (args) => ({ tag: 'boolean', value: expectNumber(args[0], 'positive?') > 0 }));
+    defBuiltin('negative?', (args) => ({ tag: 'boolean', value: expectNumber(args[0], 'negative?') < 0 }));
+    defBuiltin('odd?', (args) => ({ tag: 'boolean', value: Math.abs(expectNumber(args[0], 'odd?')) % 2 === 1 }));
+    defBuiltin('even?', (args) => ({ tag: 'boolean', value: expectNumber(args[0], 'even?') % 2 === 0 }));
+    // L13: List utilities
+    defBuiltin('list-ref', (args) => {
+        let cur = args[0];
+        let idx = expectNumber(args[1], 'list-ref');
+        while (idx > 0 && cur.tag === 'pair') {
+            cur = cur.cdr;
+            idx--;
+        }
+        if (cur.tag !== 'pair')
+            throw new EvalError('list-ref: index out of range');
+        return cur.car;
+    });
+    defBuiltin('list-tail', (args) => {
+        let cur = args[0];
+        let idx = expectNumber(args[1], 'list-tail');
+        while (idx > 0 && cur.tag === 'pair') {
+            cur = cur.cdr;
+            idx--;
+        }
+        if (idx > 0)
+            throw new EvalError('list-tail: index out of range');
+        return cur;
+    });
+    defBuiltin('list?', (args) => {
+        let cur = args[0];
+        while (cur.tag === 'pair')
+            cur = cur.cdr;
+        return { tag: 'boolean', value: cur.tag === 'nil' };
+    });
+    defBuiltin('assoc', (args) => {
+        const key = args[0];
+        let cur = args[1];
+        while (cur.tag === 'pair') {
+            if (cur.car.tag === 'pair' && schemeEqual(cur.car.car, key))
+                return cur.car;
+            cur = cur.cdr;
+        }
+        return { tag: 'boolean', value: false };
+    });
+    // L13: Character utilities
+    defBuiltin('char-alphabetic?', (args) => {
+        if (args[0].tag !== 'char')
+            throw new EvalError('char-alphabetic?: expected char');
+        return { tag: 'boolean', value: /^[a-zA-Z]$/.test(args[0].value) };
+    });
+    defBuiltin('char-numeric?', (args) => {
+        if (args[0].tag !== 'char')
+            throw new EvalError('char-numeric?: expected char');
+        return { tag: 'boolean', value: /^[0-9]$/.test(args[0].value) };
+    });
+    defBuiltin('char-upcase', (args) => {
+        if (args[0].tag !== 'char')
+            throw new EvalError('char-upcase: expected char');
+        return { tag: 'char', value: args[0].value.toUpperCase() };
+    });
+    defBuiltin('char-downcase', (args) => {
+        if (args[0].tag !== 'char')
+            throw new EvalError('char-downcase: expected char');
+        return { tag: 'char', value: args[0].value.toLowerCase() };
+    });
+    defBuiltin('char=?', (args) => {
+        if (args[0].tag !== 'char' || args[1].tag !== 'char')
+            throw new EvalError('char=?: expected char');
+        return { tag: 'boolean', value: args[0].value === args[1].value };
+    });
+    defBuiltin('char<?', (args) => {
+        if (args[0].tag !== 'char' || args[1].tag !== 'char')
+            throw new EvalError('char<?: expected char');
+        return { tag: 'boolean', value: args[0].value < args[1].value };
+    });
+    // L13: String comparison utilities
+    defBuiltin('string=?', (args) => {
+        if (args[0].tag !== 'string' || args[1].tag !== 'string')
+            throw new EvalError('string=?: expected string');
+        return { tag: 'boolean', value: args[0].value === args[1].value };
+    });
+    defBuiltin('string<?', (args) => {
+        if (args[0].tag !== 'string' || args[1].tag !== 'string')
+            throw new EvalError('string<?: expected string');
+        return { tag: 'boolean', value: args[0].value < args[1].value };
+    });
+    defBuiltin('string-ci=?', (args) => {
+        if (args[0].tag !== 'string' || args[1].tag !== 'string')
+            throw new EvalError('string-ci=?: expected string');
+        return { tag: 'boolean', value: args[0].value.toLowerCase() === args[1].value.toLowerCase() };
+    });
+    defBuiltin('string-upcase', (args) => {
+        if (args[0].tag !== 'string')
+            throw new EvalError('string-upcase: expected string');
+        return { tag: 'string', value: args[0].value.toUpperCase() };
+    });
+    defBuiltin('string-downcase', (args) => {
+        if (args[0].tag !== 'string')
+            throw new EvalError('string-downcase: expected string');
+        return { tag: 'string', value: args[0].value.toLowerCase() };
+    });
     return env;
 }
 // ── CPS Evaluator ──────────────────────────────────────────────────
@@ -874,7 +1050,15 @@ function writeVal(val) {
         case 'boolean': return val.value ? '#t' : '#f';
         case 'string': return `"${val.value}"`;
         case 'symbol': return val.value;
-        case 'char': return `#\\${val.value}`;
+        case 'char': {
+            if (val.value === ' ')
+                return '#\\space';
+            if (val.value === '\n')
+                return '#\\newline';
+            if (val.value === '\t')
+                return '#\\tab';
+            return `#\\${val.value}`;
+        }
         case 'list': return `(${val.value.map(writeVal).join(' ')})`;
         case 'nil': return '()';
         case 'pair': {
