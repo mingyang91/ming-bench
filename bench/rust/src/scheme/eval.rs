@@ -60,6 +60,88 @@ fn bind_closure_args(
     Ok(local_env)
 }
 
+/// Evaluate a sequence of expressions with continuation replay support.
+pub(crate) fn eval_body(exprs: &[Value], env: &Env) -> Result<Value, EvalError> {
+    let mut current_exprs = exprs.to_vec();
+
+    'replay: loop {
+        env.push_body_frame(current_exprs.clone());
+
+        let mut last = Value::Void;
+        let mut i = 0;
+        while i < current_exprs.len() {
+            env.set_body_index(i);
+            match eval(&current_exprs[i], env) {
+                Ok(val) => {
+                    last = val;
+                    i += 1;
+                }
+                Err(EvalError::ContinuationReturn { id, value }) => {
+                    env.pop_body_frame();
+                    if let Some(replay) = env.get_replay_for_env(id, env) {
+                        env.set_pending_return(value);
+                        current_exprs = replay.exprs;
+                        continue 'replay;
+                    }
+                    return Err(EvalError::ContinuationReturn { id, value });
+                }
+                Err(e) => {
+                    env.pop_body_frame();
+                    return Err(e);
+                }
+            }
+        }
+
+        env.pop_body_frame();
+        return Ok(last);
+    }
+}
+
+/// Handle call/cc: capture continuation and call the provided function with it.
+fn handle_callcc(args: &[Value], span: Span, env: &Env) -> Result<Value, EvalError> {
+    if args.len() != 1 {
+        return Err(EvalError::WrongArgCount {
+            expected: "1".to_string(),
+            got: args.len(),
+            span,
+        });
+    }
+
+    // During replay, short-circuit: return the pending value
+    if let Some(value) = env.take_pending_return() {
+        return Ok(value);
+    }
+
+    // Capture continuation
+    let id = env.capture_continuation();
+    let cont_val = Value::Continuation(id);
+
+    // Call the function with the continuation
+    let func = &args[0];
+    match func {
+        Value::Closure {
+            ref params,
+            ref rest_param,
+            ref body,
+            env: ref closure_env,
+        } => {
+            let local_env = bind_closure_args(params, rest_param, &[cont_val], closure_env, span)?;
+            match eval(body, &local_env) {
+                Ok(val) => Ok(val),
+                Err(EvalError::ContinuationReturn { id: ret_id, value }) if ret_id == id => {
+                    Ok(value)
+                }
+                Err(e) => Err(e),
+            }
+        }
+        other => Err(EvalError::TypeMismatch {
+            expected: "procedure".to_string(),
+            got: other.to_string(),
+            span: other.span(),
+        }),
+    }
+}
+
 pub fn eval(expr: &Value, env: &Env) -> Result<Value, EvalError> {
     let mut current_expr = expr.clone();
     let mut current_env = env.clone();
@@ -70,7 +152,8 @@ pub fn eval(expr: &Value, env: &Env) -> Result<Value, EvalError> {
             | Value::Boolean(_, _)
             | Value::String(_, _)
             | Value::Char(_, _)
-            | Value::Closure { .. } => return Ok(current_expr),
+            | Value::Closure { .. }
+            | Value::Continuation(_) => return Ok(current_expr),
             Value::Symbol(name, span) => {
                 if let Some(val) = current_env.get(name) {
                     return Ok(val);
@@ -87,7 +170,8 @@ pub fn eval(expr: &Value, env: &Env) -> Result<Value, EvalError> {
                     | "string->number" | "number->string"
                     | "symbol->string" | "string->symbol"
                     | "string-ref" | "string-set!" | "string-copy"
-                    | "char?" | "apply" => Ok(current_expr.clone()),
+                    | "char?" | "apply"
+                    | "call/cc" | "call-with-current-continuation" => Ok(current_expr.clone()),
                     _ => Err(EvalError::UnboundVariable {
                         name: name.clone(),
                         span: *span,
@@ -194,12 +278,12 @@ pub fn eval(expr: &Value, env: &Env) -> Result<Value, EvalError> {
                             // Regular let
                             let new_env = setup_let(&args[0], list_span, &current_env)?;
                             let body = &args[1..];
-                            for expr in &body[..body.len() - 1] {
-                                eval(expr, &new_env)?;
+                            if body.len() == 1 {
+                                current_expr = body[0].clone();
+                                current_env = new_env;
+                                continue;
                             }
-                            current_expr = body[body.len() - 1].clone();
-                            current_env = new_env;
-                            continue;
+                            return eval_body(body, &new_env);
                         }
                         "begin" => {
                             let exprs = &elems[1..];
@@ -234,53 +318,67 @@ pub fn eval(expr: &Value, env: &Env) -> Result<Value, EvalError> {
                     .collect::<Result<_, _>>()?;
 
                 // Handle apply: (apply fn prefix... arg-list)
-                if let Value::Symbol(ref name, _) = op {
-                    if name == "apply" {
-                        if args.len() < 2 {
-                            return Err(EvalError::WrongArgCount {
-                                expected: "at least 2".to_string(),
-                                got: args.len(),
-                                span: list_span,
-                            });
-                        }
-                        let func = args[0].clone();
-                        let last = &args[args.len() - 1];
-                        let Value::List(tail_list, _) = last else {
-                            return Err(EvalError::TypeMismatch {
-                                expected: "list".to_string(),
-                                got: last.to_string(),
-                                span: last.span(),
-                            });
-                        };
-                        let mut full_args: Vec<Value> = args[1..args.len() - 1].to_vec();
-                        full_args.extend(tail_list.iter().cloned());
+                if matches!(op, Value::Symbol(ref name, _) if name == "apply") {
+                    if args.len() < 2 {
+                        return Err(EvalError::WrongArgCount {
+                            expected: "at least 2".to_string(),
+                            got: args.len(),
+                            span: list_span,
+                        });
+                    }
+                    let func = args[0].clone();
+                    let last = &args[args.len() - 1];
+                    let Value::List(tail_list, _) = last else {
+                        return Err(EvalError::TypeMismatch {
+                            expected: "list".to_string(),
+                            got: last.to_string(),
+                            span: last.span(),
+                        });
+                    };
+                    let mut full_args: Vec<Value> = args[1..args.len() - 1].to_vec();
+                    full_args.extend(tail_list.iter().cloned());
 
-                        // Re-dispatch with the assembled args
-                        match func {
-                            Value::Symbol(ref bname, _) => return apply_builtin(bname, &full_args, list_span, &current_env),
-                            Value::Closure {
-                                ref params,
-                                ref rest_param,
-                                ref body,
-                                env: ref closure_env,
-                            } => {
-                                let local_env = bind_closure_args(params, rest_param, &full_args, closure_env, list_span)?;
-                                current_expr = *body.clone();
-                                current_env = local_env;
-                                continue;
-                            }
-                            other => {
-                                return Err(EvalError::NotAProcedure {
-                                    value: other.to_string(),
-                                    span: other.span(),
+                    // Re-dispatch with the assembled args
+                    match func {
+                        Value::Symbol(ref bname, _) if bname == "call/cc" || bname == "call-with-current-continuation" => {
+                            return handle_callcc(&full_args, list_span, &current_env);
+                        }
+                        Value::Symbol(ref bname, _) => return apply_builtin(bname, &full_args, list_span, &current_env),
+                        Value::Closure {
+                            ref params,
+                            ref rest_param,
+                            ref body,
+                            env: ref closure_env,
+                        } => {
+                            let local_env = bind_closure_args(params, rest_param, &full_args, closure_env, list_span)?;
+                            current_expr = *body.clone();
+                            current_env = local_env;
+                            continue;
+                        }
+                        Value::Continuation(id) => {
+                            if full_args.len() != 1 {
+                                return Err(EvalError::WrongArgCount {
+                                    expected: "1".to_string(),
+                                    got: full_args.len(),
+                                    span: list_span,
                                 });
                             }
+                            return Err(EvalError::ContinuationReturn { id, value: full_args.into_iter().next().expect("checked len") });
+                        }
+                        other => {
+                            return Err(EvalError::NotAProcedure {
+                                value: other.to_string(),
+                                span: other.span(),
+                            });
                         }
                     }
                 }
 
-                // Tail-call for closures
+                // Function application (including call/cc and continuations)
                 match op {
+                    Value::Symbol(ref name, _) if name == "call/cc" || name == "call-with-current-continuation" => {
+                        return handle_callcc(&args, list_span, &current_env);
+                    }
                     Value::Symbol(ref name, _) => return apply_builtin(name, &args, list_span, &current_env),
                     Value::Closure {
                         ref params,
@@ -292,6 +390,16 @@ pub fn eval(expr: &Value, env: &Env) -> Result<Value, EvalError> {
                         current_expr = *body.clone();
                         current_env = local_env;
                         continue;
+                    }
+                    Value::Continuation(id) => {
+                        if args.len() != 1 {
+                            return Err(EvalError::WrongArgCount {
+                                expected: "1".to_string(),
+                                got: args.len(),
+                                span: list_span,
+                            });
+                        }
+                        return Err(EvalError::ContinuationReturn { id, value: args[0].clone() });
                     }
                     other => {
                         return Err(EvalError::NotAProcedure {

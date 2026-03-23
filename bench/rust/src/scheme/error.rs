@@ -1,5 +1,7 @@
 use std::fmt;
 
+use crate::scheme::value::Value;
+
 /// Source position in the input.
 #[derive(Debug, Clone, Copy, PartialEq, Default)]
 pub struct Span {
@@ -47,4 +49,7 @@ pub enum EvalError {
 
     #[error("not a procedure at {span}: {value}")]
     NotAProcedure { value: String, span: Span },
+
+    #[error("continuation invoked")]
+    ContinuationReturn { id: u64, value: Value },
 }

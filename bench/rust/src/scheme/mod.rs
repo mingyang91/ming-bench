@@ -11,10 +11,7 @@ pub use error::EvalError;
 pub fn eval_str(input: &str) -> Result<String, EvalError> {
     let exprs = parser::parse(input)?;
     let env = env::Env::new();
-    let mut last = value::Value::Void;
-    for expr in &exprs {
-        last = eval::eval(expr, &env)?;
-    }
+    let last = eval::eval_body(&exprs, &env)?;
     Ok(last.to_string())
 }
 
@@ -23,10 +20,7 @@ pub fn eval_str(input: &str) -> Result<String, EvalError> {
 pub fn eval_str_with_output(input: &str) -> Result<(String, String), EvalError> {
     let exprs = parser::parse(input)?;
     let env = env::Env::new();
-    let mut last = value::Value::Void;
-    for expr in &exprs {
-        last = eval::eval(expr, &env)?;
-    }
+    let last = eval::eval_body(&exprs, &env)?;
     let output = env.take_output();
     Ok((last.to_string(), output))
 }

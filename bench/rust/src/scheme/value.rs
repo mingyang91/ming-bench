@@ -19,6 +19,7 @@ pub enum Value {
         body: Box<Value>,
         env: Env,
     },
+    Continuation(u64),
     Void,
 }
 
@@ -35,6 +36,7 @@ impl PartialEq for Value {
              Value::Closure { params: p2, rest_param: r2, body: b2, env: e2 }) => {
                 p1 == p2 && r1 == r2 && b1 == b2 && e1 == e2
             }
+            (Value::Continuation(a), Value::Continuation(b)) => a == b,
             (Value::Void, Value::Void) => true,
             _ => false,
         }
@@ -61,6 +63,7 @@ impl fmt::Display for Value {
                 write!(f, ")")
             }
             Value::Closure { .. } => write!(f, "#<procedure>"),
+            Value::Continuation(_) => write!(f, "#<continuation>"),
             Value::Void => write!(f, "#<void>"),
         }
     }
@@ -98,6 +101,7 @@ impl Value {
             | Value::Char(_, s)
             | Value::List(_, s) => *s,
             Value::Closure { .. } => Span::default(),
+            Value::Continuation(_) => Span::default(),
             Value::Void => Span::default(),
         }
     }
