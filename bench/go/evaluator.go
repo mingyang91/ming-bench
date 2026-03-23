@@ -2,6 +2,8 @@ package ming
 
 import (
 	"fmt"
+	"strconv"
+	"strings"
 )
 
 // TopEnv creates a new top-level environment with builtins.
@@ -10,6 +12,9 @@ func TopEnv() *Env {
 	for name, proc := range builtins {
 		env.Set(name, proc)
 	}
+	env.Set("display", &EnvBuiltinProc{Name: "display", Fn: builtinDisplay})
+	env.Set("write", &EnvBuiltinProc{Name: "write", Fn: builtinWrite})
+	env.Set("newline", &EnvBuiltinProc{Name: "newline", Fn: builtinNewline})
 	return env
 }
 
@@ -46,9 +51,42 @@ func EvalStr(input string) (string, error) {
 // EvalStrWithOutput evaluates Scheme expressions and returns both the result
 // string and any captured output from display/write/newline.
 func EvalStrWithOutput(input string) (result string, output string, err error) {
-	r, err := EvalStr(input)
-	return r, "", err
+	tokens, err := Tokenize(input)
+	if err != nil {
+		return "", "", &EvalError{Message: err.Error()}
+	}
+
+	parser := NewParser(tokens)
+	exprs, err := parser.ParseAll()
+	if err != nil {
+		return "", "", &EvalError{Message: err.Error()}
+	}
+
+	if len(exprs) == 0 {
+		return "", "", &EvalError{Message: "no expressions"}
+	}
+
+	env := TopEnv()
+	var buf strings.Builder
+	env.Set("$$output$$", &outputPort{buf: &buf})
+
+	var res SchemeValue
+	for _, expr := range exprs {
+		res, err = Eval(expr, env)
+		if err != nil {
+			return "", "", err
+		}
+	}
+
+	return res.String(), buf.String(), nil
 }
+
+// outputPort is an internal value that holds the output buffer.
+type outputPort struct {
+	buf *strings.Builder
+}
+
+func (o *outputPort) String() string { return "#<output-port>" }
 
 // Eval evaluates an expression in the given environment.
 func Eval(expr Expr, env *Env) (SchemeValue, error) {
@@ -122,6 +160,8 @@ func Eval(expr Expr, env *Env) (SchemeValue, error) {
 		switch fn := op.(type) {
 		case *BuiltinProc:
 			return fn.Fn(args, e)
+		case *EnvBuiltinProc:
+			return fn.Fn(args, e, env)
 		case *Lambda:
 			return applyLambda(fn, args, e)
 		}
@@ -376,6 +416,15 @@ func init() {
 	builtins["string?"] = &BuiltinProc{Name: "string?", Fn: builtinStringQ}
 	builtins["boolean?"] = &BuiltinProc{Name: "boolean?", Fn: builtinBooleanQ}
 	builtins["symbol?"] = &BuiltinProc{Name: "symbol?", Fn: builtinSymbolQ}
+	builtins["char?"] = &BuiltinProc{Name: "char?", Fn: builtinCharQ}
+	builtins["string-append"] = &BuiltinProc{Name: "string-append", Fn: builtinStringAppend}
+	builtins["string-length"] = &BuiltinProc{Name: "string-length", Fn: builtinStringLength}
+	builtins["substring"] = &BuiltinProc{Name: "substring", Fn: builtinSubstring}
+	builtins["string->number"] = &BuiltinProc{Name: "string->number", Fn: builtinStringToNumber}
+	builtins["number->string"] = &BuiltinProc{Name: "number->string", Fn: builtinNumberToString}
+	builtins["symbol->string"] = &BuiltinProc{Name: "symbol->string", Fn: builtinSymbolToString}
+	builtins["string->symbol"] = &BuiltinProc{Name: "string->symbol", Fn: builtinStringToSymbol}
+	builtins["string-ref"] = &BuiltinProc{Name: "string-ref", Fn: builtinStringRef}
 }
 
 func builtinAdd(args []SchemeValue, callExpr *ListExpr) (SchemeValue, error) {
@@ -802,4 +851,224 @@ func builtinSymbolQ(args []SchemeValue, callExpr *ListExpr) (SchemeValue, error)
 	}
 	_, ok := args[0].(*SchemeSymbol)
 	return &SchemeBool{Value: ok}, nil
+}
+
+func builtinCharQ(args []SchemeValue, callExpr *ListExpr) (SchemeValue, error) {
+	if len(args) != 1 {
+		line, col := callExpr.Pos()
+		return nil, &EvalError{Message: fmt.Sprintf("%d:%d: char?: requires exactly 1 argument", line, col)}
+	}
+	_, ok := args[0].(*SchemeChar)
+	return &SchemeBool{Value: ok}, nil
+}
+
+// EnvBuiltinProc is a builtin that needs access to the environment (for output).
+type EnvBuiltinProc struct {
+	Name string
+	Fn   func(args []SchemeValue, callExpr *ListExpr, env *Env) (SchemeValue, error)
+}
+
+func (b *EnvBuiltinProc) String() string {
+	return fmt.Sprintf("#<procedure %s>", b.Name)
+}
+
+func getOutputPort(env *Env) *strings.Builder {
+	if v, ok := env.Get("$$output$$"); ok {
+		if p, ok := v.(*outputPort); ok {
+			return p.buf
+		}
+	}
+	return nil
+}
+
+// displayValue writes a value in display format (no quotes on strings).
+func displayValue(v SchemeValue) string {
+	switch val := v.(type) {
+	case *SchemeString:
+		return val.Value
+	case *SchemePair:
+		return displayPair(val)
+	case *SchemeChar:
+		return string(val.Value)
+	default:
+		return v.String()
+	}
+}
+
+func displayPair(p *SchemePair) string {
+	var parts []string
+	cur := SchemeValue(p)
+	for {
+		switch c := cur.(type) {
+		case *SchemePair:
+			parts = append(parts, displayValue(c.Car))
+			cur = c.Cdr
+		case *SchemeEmpty:
+			return "(" + strings.Join(parts, " ") + ")"
+		default:
+			return "(" + strings.Join(parts, " ") + " . " + displayValue(cur) + ")"
+		}
+	}
+}
+
+func builtinDisplay(args []SchemeValue, callExpr *ListExpr, env *Env) (SchemeValue, error) {
+	if len(args) != 1 {
+		line, col := callExpr.Pos()
+		return nil, &EvalError{Message: fmt.Sprintf("%d:%d: display: requires exactly 1 argument", line, col)}
+	}
+	if buf := getOutputPort(env); buf != nil {
+		buf.WriteString(displayValue(args[0]))
+	}
+	return &SchemeVoid{}, nil
+}
+
+func builtinWrite(args []SchemeValue, callExpr *ListExpr, env *Env) (SchemeValue, error) {
+	if len(args) != 1 {
+		line, col := callExpr.Pos()
+		return nil, &EvalError{Message: fmt.Sprintf("%d:%d: write: requires exactly 1 argument", line, col)}
+	}
+	if buf := getOutputPort(env); buf != nil {
+		buf.WriteString(args[0].String())
+	}
+	return &SchemeVoid{}, nil
+}
+
+func builtinNewline(args []SchemeValue, callExpr *ListExpr, env *Env) (SchemeValue, error) {
+	if len(args) != 0 {
+		line, col := callExpr.Pos()
+		return nil, &EvalError{Message: fmt.Sprintf("%d:%d: newline: requires 0 arguments", line, col)}
+	}
+	if buf := getOutputPort(env); buf != nil {
+		buf.WriteString("\n")
+	}
+	return &SchemeVoid{}, nil
+}
+
+func builtinStringAppend(args []SchemeValue, callExpr *ListExpr) (SchemeValue, error) {
+	var sb strings.Builder
+	for _, a := range args {
+		s, ok := a.(*SchemeString)
+		if !ok {
+			line, col := callExpr.Pos()
+			return nil, &EvalError{Message: fmt.Sprintf("%d:%d: string-append: expected string", line, col)}
+		}
+		sb.WriteString(s.Value)
+	}
+	return &SchemeString{Value: sb.String()}, nil
+}
+
+func builtinStringLength(args []SchemeValue, callExpr *ListExpr) (SchemeValue, error) {
+	if len(args) != 1 {
+		line, col := callExpr.Pos()
+		return nil, &EvalError{Message: fmt.Sprintf("%d:%d: string-length: requires exactly 1 argument", line, col)}
+	}
+	s, ok := args[0].(*SchemeString)
+	if !ok {
+		line, col := callExpr.Pos()
+		return nil, &EvalError{Message: fmt.Sprintf("%d:%d: string-length: expected string", line, col)}
+	}
+	return &SchemeInt{Value: int64(len([]rune(s.Value)))}, nil
+}
+
+func builtinSubstring(args []SchemeValue, callExpr *ListExpr) (SchemeValue, error) {
+	if len(args) != 3 {
+		line, col := callExpr.Pos()
+		return nil, &EvalError{Message: fmt.Sprintf("%d:%d: substring: requires exactly 3 arguments", line, col)}
+	}
+	s, ok := args[0].(*SchemeString)
+	if !ok {
+		line, col := callExpr.Pos()
+		return nil, &EvalError{Message: fmt.Sprintf("%d:%d: substring: expected string", line, col)}
+	}
+	start, ok := args[1].(*SchemeInt)
+	if !ok {
+		line, col := callExpr.Pos()
+		return nil, &EvalError{Message: fmt.Sprintf("%d:%d: substring: expected number", line, col)}
+	}
+	end, ok := args[2].(*SchemeInt)
+	if !ok {
+		line, col := callExpr.Pos()
+		return nil, &EvalError{Message: fmt.Sprintf("%d:%d: substring: expected number", line, col)}
+	}
+	runes := []rune(s.Value)
+	return &SchemeString{Value: string(runes[start.Value:end.Value])}, nil
+}
+
+func builtinStringToNumber(args []SchemeValue, callExpr *ListExpr) (SchemeValue, error) {
+	if len(args) != 1 {
+		line, col := callExpr.Pos()
+		return nil, &EvalError{Message: fmt.Sprintf("%d:%d: string->number: requires exactly 1 argument", line, col)}
+	}
+	s, ok := args[0].(*SchemeString)
+	if !ok {
+		line, col := callExpr.Pos()
+		return nil, &EvalError{Message: fmt.Sprintf("%d:%d: string->number: expected string", line, col)}
+	}
+	n, err := strconv.ParseInt(s.Value, 10, 64)
+	if err != nil {
+		return &SchemeBool{Value: false}, nil
+	}
+	return &SchemeInt{Value: n}, nil
+}
+
+func builtinNumberToString(args []SchemeValue, callExpr *ListExpr) (SchemeValue, error) {
+	if len(args) != 1 {
+		line, col := callExpr.Pos()
+		return nil, &EvalError{Message: fmt.Sprintf("%d:%d: number->string: requires exactly 1 argument", line, col)}
+	}
+	n, ok := args[0].(*SchemeInt)
+	if !ok {
+		line, col := callExpr.Pos()
+		return nil, &EvalError{Message: fmt.Sprintf("%d:%d: number->string: expected number", line, col)}
+	}
+	return &SchemeString{Value: strconv.FormatInt(n.Value, 10)}, nil
+}
+
+func builtinSymbolToString(args []SchemeValue, callExpr *ListExpr) (SchemeValue, error) {
+	if len(args) != 1 {
+		line, col := callExpr.Pos()
+		return nil, &EvalError{Message: fmt.Sprintf("%d:%d: symbol->string: requires exactly 1 argument", line, col)}
+	}
+	s, ok := args[0].(*SchemeSymbol)
+	if !ok {
+		line, col := callExpr.Pos()
+		return nil, &EvalError{Message: fmt.Sprintf("%d:%d: symbol->string: expected symbol", line, col)}
+	}
+	return &SchemeString{Value: s.Name}, nil
+}
+
+func builtinStringToSymbol(args []SchemeValue, callExpr *ListExpr) (SchemeValue, error) {
+	if len(args) != 1 {
+		line, col := callExpr.Pos()
+		return nil, &EvalError{Message: fmt.Sprintf("%d:%d: string->symbol: requires exactly 1 argument", line, col)}
+	}
+	s, ok := args[0].(*SchemeString)
+	if !ok {
+		line, col := callExpr.Pos()
+		return nil, &EvalError{Message: fmt.Sprintf("%d:%d: string->symbol: expected string", line, col)}
+	}
+	return &SchemeSymbol{Name: s.Value}, nil
+}
+
+func builtinStringRef(args []SchemeValue, callExpr *ListExpr) (SchemeValue, error) {
+	if len(args) != 2 {
+		line, col := callExpr.Pos()
+		return nil, &EvalError{Message: fmt.Sprintf("%d:%d: string-ref: requires exactly 2 arguments", line, col)}
+	}
+	s, ok := args[0].(*SchemeString)
+	if !ok {
+		line, col := callExpr.Pos()
+		return nil, &EvalError{Message: fmt.Sprintf("%d:%d: string-ref: expected string", line, col)}
+	}
+	idx, ok := args[1].(*SchemeInt)
+	if !ok {
+		line, col := callExpr.Pos()
+		return nil, &EvalError{Message: fmt.Sprintf("%d:%d: string-ref: expected number", line, col)}
+	}
+	runes := []rune(s.Value)
+	if idx.Value < 0 || idx.Value >= int64(len(runes)) {
+		line, col := callExpr.Pos()
+		return nil, &EvalError{Message: fmt.Sprintf("%d:%d: string-ref: index out of range", line, col)}
+	}
+	return &SchemeChar{Value: runes[idx.Value]}, nil
 }

@@ -87,6 +87,23 @@ func (v *SchemePair) String() string {
 	}
 }
 
+type SchemeChar struct {
+	Value rune
+}
+
+func (v *SchemeChar) String() string {
+	switch v.Value {
+	case ' ':
+		return `#\space`
+	case '\n':
+		return `#\newline`
+	case '\t':
+		return `#\tab`
+	default:
+		return fmt.Sprintf(`#\%c`, v.Value)
+	}
+}
+
 type SchemeVoid struct{}
 
 func (v *SchemeVoid) String() string {
