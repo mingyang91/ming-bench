@@ -8,6 +8,9 @@ class Env(
   private val parent: Option[Env] = None
 ):
 
+  def lookupOption(name: String): Option[Value] =
+    bindings.get(name).orElse(parent.flatMap(_.lookupOption(name)))
+
   def lookup(name: String, pos: Option[Pos] = None): Value =
     bindings.get(name) match
       case Some(v) => v

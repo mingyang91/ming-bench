@@ -9,6 +9,7 @@ private[ming] trait EvalForms:
   protected def eval(expr: Expr, env: Env, k: Value => Bounce): Bounce
   protected def evalBody(exprs: List[Expr], env: Env, k: Value => Bounce): Bounce
   protected def tailBody(exprs: List[Expr], env: Env, k: Value => Bounce): Bounce
+  protected def trampoline(thunk: => Bounce): Bounce
 
   protected def evalDefineCps(
     args: List[Expr],
@@ -73,7 +74,7 @@ private[ming] trait EvalForms:
     bindings match
       case Nil => k(Nil)
       case SList(Sym(name, _) :: valExpr :: Nil, _) :: rest =>
-        eval(valExpr, env, v => evalBindingsCps(rest, env, pos, pairs => k((name, v) :: pairs)))
+        eval(valExpr, env, v => trampoline(evalBindingsCps(rest, env, pos, pairs => k((name, v) :: pairs))))
       case _ => evalError("let: bad binding", pos)
 
   protected def evalCondCps(
@@ -101,11 +102,11 @@ private[ming] trait EvalForms:
       case Nil         => k(BoolVal(true))
       case last :: Nil => eval(last, env, k)
       case head :: tail =>
-        eval(head, env, v => if !v.isTruthy then k(v) else evalAndCps(tail, env, k))
+        eval(head, env, v => if !v.isTruthy then k(v) else trampoline(evalAndCps(tail, env, k)))
 
   protected def evalOrCps(args: List[Expr], env: Env, k: Value => Bounce): Bounce =
     args match
       case Nil         => k(BoolVal(false))
       case last :: Nil => eval(last, env, k)
       case head :: tail =>
-        eval(head, env, v => if v.isTruthy then k(v) else evalOrCps(tail, env, k))
+        eval(head, env, v => if v.isTruthy then k(v) else trampoline(evalOrCps(tail, env, k)))

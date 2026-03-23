@@ -12,6 +12,7 @@ enum Value:
   case BuiltinVal(name: String, fn: List[Value] => Value)
   case CharVal(c: Char)
   case ContinuationVal(k: Value => Bounce)
+  case MacroVal(literals: List[String], rules: List[(List[Expr], Expr)], defEnv: Env)
 
   def display: String = this match
     case IntVal(n)             => n.toString
@@ -24,6 +25,7 @@ enum Value:
     case BuiltinVal(name, _)   => s"#<procedure:$name>"
     case CharVal(c)            => s"#\\$c"
     case ContinuationVal(_)    => "#<continuation>"
+    case MacroVal(_, _, _)     => "#<macro>"
 
   /** Display without quotes (for `display` builtin). */
   def displayNoQuotes: String = this match
