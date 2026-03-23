@@ -128,3 +128,8 @@ func (v *SchemeVector) String() string {
 type SchemeCallCC struct{}
 
 func (v *SchemeCallCC) String() string { return "#<procedure call/cc>" }
+
+// SchemeDynamicWind represents the dynamic-wind procedure as a first-class value.
+type SchemeDynamicWind struct{}
+
+func (v *SchemeDynamicWind) String() string { return "#<procedure dynamic-wind>" }

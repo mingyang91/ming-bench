@@ -21,6 +21,7 @@ func TopEnv() *Env {
 	callcc := &SchemeCallCC{}
 	env.Set("call/cc", callcc)
 	env.Set("call-with-current-continuation", callcc)
+	env.Set("dynamic-wind", &SchemeDynamicWind{})
 	return env
 }
 
@@ -446,6 +447,8 @@ func Eval(expr Expr, env *Env) (SchemeValue, error) {
 					return nil, &EvalError{Message: fmt.Sprintf("%d:%d: continuation expects 1 argument, got %d", line, col, len(args))}
 				}
 				return nil, &contJumpError{cont: fn, value: args[0]}
+			case *SchemeDynamicWind:
+				return applyFunc(fn, args, e, env)
 			}
 
 			line, col := e.Pos()
@@ -631,6 +634,33 @@ func applyFunc(proc SchemeValue, args []SchemeValue, callExpr *ListExpr, env *En
 			return nil, &EvalError{Message: fmt.Sprintf("%d:%d: continuation expects 1 argument, got %d", line, col, len(args))}
 		}
 		return nil, &contJumpError{cont: fn, value: args[0]}
+	case *SchemeDynamicWind:
+		if len(args) != 3 {
+			line, col := callExpr.Pos()
+			return nil, &EvalError{Message: fmt.Sprintf("%d:%d: dynamic-wind: requires exactly 3 arguments", line, col)}
+		}
+		inThunk, bodyThunk, outThunk := args[0], args[1], args[2]
+
+		// Call in-thunk
+		_, err := applyFunc(inThunk, []SchemeValue{}, callExpr, env)
+		if err != nil {
+			return nil, err
+		}
+
+		// Call body-thunk
+		result, err := applyFunc(bodyThunk, []SchemeValue{}, callExpr, env)
+		if err != nil {
+			// Run out-thunk even on non-local exit
+			applyFunc(outThunk, []SchemeValue{}, callExpr, env)
+			return nil, err
+		}
+
+		// Normal exit: call out-thunk
+		_, err = applyFunc(outThunk, []SchemeValue{}, callExpr, env)
+		if err != nil {
+			return nil, err
+		}
+		return result, nil
 	default:
 		line, col := callExpr.Pos()
 		return nil, &EvalError{Message: fmt.Sprintf("%d:%d: not a procedure", line, col)}
@@ -958,6 +988,7 @@ func init() {
 	builtins["list"] = &BuiltinProc{Name: "list", Fn: builtinList}
 	builtins["length"] = &BuiltinProc{Name: "length", Fn: builtinLength}
 	builtins["append"] = &BuiltinProc{Name: "append", Fn: builtinAppend}
+	builtins["reverse"] = &BuiltinProc{Name: "reverse", Fn: builtinReverse}
 	builtins["number?"] = &BuiltinProc{Name: "number?", Fn: builtinNumberQ}
 	builtins["string?"] = &BuiltinProc{Name: "string?", Fn: builtinStringQ}
 	builtins["boolean?"] = &BuiltinProc{Name: "boolean?", Fn: builtinBooleanQ}
@@ -1285,6 +1316,27 @@ func appendList(lst, tail SchemeValue) SchemeValue {
 		return &SchemePair{Car: l.Car, Cdr: appendList(l.Cdr, tail)}
 	default:
 		return tail
+	}
+}
+
+func builtinReverse(args []SchemeValue, callExpr *ListExpr) (SchemeValue, error) {
+	if len(args) != 1 {
+		line, col := callExpr.Pos()
+		return nil, &EvalError{Message: fmt.Sprintf("%d:%d: reverse: requires exactly 1 argument", line, col)}
+	}
+	var result SchemeValue = &SchemeEmpty{}
+	cur := args[0]
+	for {
+		switch v := cur.(type) {
+		case *SchemePair:
+			result = &SchemePair{Car: v.Car, Cdr: result}
+			cur = v.Cdr
+		case *SchemeEmpty:
+			return result, nil
+		default:
+			line, col := callExpr.Pos()
+			return nil, &EvalError{Message: fmt.Sprintf("%d:%d: reverse: not a proper list", line, col)}
+		}
 	}
 }
 
