@@ -702,12 +702,21 @@ type interp struct {
 	replayLetStack []letCtx
 	// Dynamic-wind stack
 	windStack []windEntry
+	// Step-limited evaluation
+	stepLimit int // 0 = unlimited
+	stepCount int
 }
 
 // ---------- Evaluator ----------
 
 func (ip *interp) eval(e *expr, envir *env) (*value, error) {
 	for {
+		if ip.stepLimit > 0 {
+			ip.stepCount++
+			if ip.stepCount > ip.stepLimit {
+				return nil, fmt.Errorf("step limit exceeded")
+			}
+		}
 		switch e.kind {
 		case "int":
 			return intVal(e.ival), nil
@@ -3760,6 +3769,10 @@ func makeGlobalEnv(ip *interp) *env {
 }
 
 func evalInput(input string) (last *value, ip *interp, err error) {
+	return evalInputWithLimit(input, 0)
+}
+
+func evalInputWithLimit(input string, stepLimit int) (last *value, ip *interp, err error) {
 	tokens := tokenize(input)
 	exprs, parseErr := parse(tokens)
 	if parseErr != nil {
@@ -3769,7 +3782,7 @@ func evalInput(input string) (last *value, ip *interp, err error) {
 		return nil, &interp{}, nil
 	}
 
-	ip = &interp{}
+	ip = &interp{stepLimit: stepLimit}
 	ip.exprs = exprs
 	globalEnv := makeGlobalEnv(ip)
 
@@ -3857,4 +3870,17 @@ func EvalStrWithOutput(input string) (result string, output string, err error) {
 		r = last.String()
 	}
 	return r, ip.output.String(), nil
+}
+
+// EvalStrWithLimit evaluates Scheme expressions with a step budget.
+// Each eval dispatch counts as one step. Returns an error if the budget is exhausted.
+func EvalStrWithLimit(input string, maxSteps int) (string, error) {
+	last, _, err := evalInputWithLimit(input, maxSteps)
+	if err != nil {
+		return "", err
+	}
+	if last == nil {
+		return "", nil
+	}
+	return last.String(), nil
 }
