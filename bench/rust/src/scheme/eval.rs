@@ -1,7 +1,7 @@
 use crate::scheme::env::Env;
 use crate::scheme::error::{EvalError, Span};
 use crate::scheme::macros;
-use crate::scheme::value::Value;
+use crate::scheme::value::{Mutability, Value};
 
 /// Evaluate non-tail expressions of `and`. Returns `Some(value)` for short-circuit, `None` for tail.
 fn eval_and_prefix(exprs: &[Value], env: &Env) -> Result<Option<Value>, EvalError> {
@@ -165,7 +165,7 @@ pub fn eval(expr: &Value, env: &Env) -> Result<Value, EvalError> {
         match &current_expr {
             Value::Integer(_, _)
             | Value::Boolean(_, _)
-            | Value::String(_, _)
+            | Value::String(_, _, _)
             | Value::Char(_, _)
             | Value::Closure { .. }
             | Value::Continuation(_)
@@ -186,6 +186,8 @@ pub fn eval(expr: &Value, env: &Env) -> Result<Value, EvalError> {
                     | "string->number" | "number->string"
                     | "symbol->string" | "string->symbol"
                     | "string-ref" | "string-set!" | "string-copy"
+                    | "string->list" | "list->string"
+                    | "char->integer" | "integer->char"
                     | "char?" | "char-alphabetic?" | "char-numeric?"
                     | "char-upcase" | "char-downcase" | "char=?" | "char<?"
                     | "string=?" | "string<?" | "string-ci=?"
@@ -615,7 +617,7 @@ fn apply_builtin(name: &str, args: &[Value], span: Span, env: &Env) -> Result<Va
         "length" => builtin_length(args, span),
         "append" => builtin_append(args),
         "pair?" => builtin_pair(args, span),
-        "string?" => Ok(Value::bool(matches!(args, [Value::String(_, _)]))),
+        "string?" => Ok(Value::bool(matches!(args, [Value::String(_, _, _)]))),
         "number?" => Ok(Value::bool(matches!(args, [Value::Integer(_, _)]))),
         "boolean?" => Ok(Value::bool(matches!(args, [Value::Boolean(_, _)]))),
         "symbol?" => Ok(Value::bool(matches!(args, [Value::Symbol(_, _)]))),
@@ -688,6 +690,10 @@ fn apply_builtin(name: &str, args: &[Value], span: Span, env: &Env) -> Result<Va
         "string-ref" => builtin_string_ref(args, span),
         "string-set!" => builtin_string_set(args, span),
         "string-copy" => builtin_string_copy(args, span),
+        "string->list" => builtin_string_to_list(args, span),
+        "list->string" => builtin_list_to_string(args, span),
+        "char->integer" => builtin_char_to_integer(args, span),
+        "integer->char" => builtin_integer_to_char(args, span),
         "char?" => Ok(Value::bool(matches!(args, [Value::Char(_, _)]))),
         "expt" => builtin_expt(args, span),
         "list-ref" => builtin_list_ref(args, span),
@@ -1276,7 +1282,7 @@ fn builtin_string_append(args: &[Value]) -> Result<Value, EvalError> {
     let mut result = String::new();
     for arg in args {
         match arg {
-            Value::String(s, _) => result.push_str(&s.borrow()),
+            Value::String(s, _, _) => result.push_str(&s.borrow()),
             other => {
                 return Err(EvalError::TypeMismatch {
                     expected: "string".to_string(),
@@ -1298,7 +1304,7 @@ fn builtin_string_length(args: &[Value], span: Span) -> Result<Value, EvalError>
         });
     }
     match &args[0] {
-        Value::String(s, _) => Ok(Value::int(s.borrow().chars().count() as i64)),
+        Value::String(s, _, _) => Ok(Value::int(s.borrow().chars().count() as i64)),
         other => Err(EvalError::TypeMismatch {
             expected: "string".to_string(),
             got: format!("{other}"),
@@ -1315,7 +1321,7 @@ fn builtin_substring(args: &[Value], span: Span) -> Result<Value, EvalError> {
             span,
         });
     }
-    let Value::String(s, _) = &args[0] else {
+    let Value::String(s, _, _) = &args[0] else {
         return Err(EvalError::TypeMismatch {
             expected: "string".to_string(),
             got: format!("{}", args[0]),
@@ -1353,7 +1359,7 @@ fn builtin_string_to_number(args: &[Value], span: Span) -> Result<Value, EvalErr
         });
     }
     match &args[0] {
-        Value::String(s, _) => match s.borrow().parse::<i64>() {
+        Value::String(s, _, _) => match s.borrow().parse::<i64>() {
             Ok(n) => Ok(Value::int(n)),
             Err(_) => Ok(Value::bool(false)),
         },
@@ -1410,7 +1416,7 @@ fn builtin_string_to_symbol(args: &[Value], span: Span) -> Result<Value, EvalErr
         });
     }
     match &args[0] {
-        Value::String(s, _) => Ok(Value::symbol(s.borrow().clone())),
+        Value::String(s, _, _) => Ok(Value::symbol(s.borrow().clone())),
         other => Err(EvalError::TypeMismatch {
             expected: "string".to_string(),
             got: format!("{other}"),
@@ -1427,7 +1433,7 @@ fn builtin_string_ref(args: &[Value], span: Span) -> Result<Value, EvalError> {
             span,
         });
     }
-    let Value::String(s, _) = &args[0] else {
+    let Value::String(s, _, _) = &args[0] else {
         return Err(EvalError::TypeMismatch {
             expected: "string".to_string(),
             got: format!("{}", args[0]),
@@ -1457,13 +1463,16 @@ fn builtin_string_set(args: &[Value], span: Span) -> Result<Value, EvalError> {
             span,
         });
     }
-    let Value::String(s, _) = &args[0] else {
+    let Value::String(s, mutability, _) = &args[0] else {
         return Err(EvalError::TypeMismatch {
             expected: "string".to_string(),
             got: format!("{}", args[0]),
             span: args[0].span(),
         });
     };
+    if *mutability == Mutability::Immutable {
+        return Err(EvalError::ImmutableString { span });
+    }
     let Value::Integer(idx, _) = &args[1] else {
         return Err(EvalError::TypeMismatch {
             expected: "integer".to_string(),
@@ -1480,17 +1489,18 @@ fn builtin_string_set(args: &[Value], span: Span) -> Result<Value, EvalError> {
     };
     let idx = *idx as usize;
     let mut borrowed = s.borrow_mut();
-    let chars: Vec<char> = borrowed.chars().collect();
-    if idx >= chars.len() {
-        return Err(EvalError::TypeMismatch {
-            expected: "valid index".to_string(),
-            got: format!("index {idx} out of bounds"),
-            span,
-        });
-    }
-    let mut new_chars = chars;
-    new_chars[idx] = *c;
-    *borrowed = new_chars.into_iter().collect();
+    let byte_offset = borrowed.char_indices().nth(idx).ok_or_else(|| EvalError::TypeMismatch {
+        expected: "valid index".to_string(),
+        got: format!("index {idx} out of bounds"),
+        span,
+    })?.0;
+    let old_char_len = borrowed[byte_offset..].chars().next().expect("valid char at index").len_utf8();
+    let mut buf = std::string::String::with_capacity(borrowed.len() - old_char_len + c.len_utf8());
+    buf.push_str(&borrowed[..byte_offset]);
+    buf.push(*c);
+    buf.push_str(&borrowed[byte_offset + old_char_len..]);
+    *borrowed = buf;
+    drop(borrowed);
     Ok(Value::Void)
 }
 
@@ -1502,7 +1512,7 @@ fn builtin_string_copy(args: &[Value], span: Span) -> Result<Value, EvalError> {
             span,
         });
     }
-    let Value::String(s, _) = &args[0] else {
+    let Value::String(s, _, _) = &args[0] else {
         return Err(EvalError::TypeMismatch {
             expected: "string".to_string(),
             got: format!("{}", args[0]),
@@ -1510,6 +1520,95 @@ fn builtin_string_copy(args: &[Value], span: Span) -> Result<Value, EvalError> {
         });
     };
     Ok(Value::string(s.borrow().clone()))
+}
+
+fn builtin_string_to_list(args: &[Value], span: Span) -> Result<Value, EvalError> {
+    if args.len() != 1 {
+        return Err(EvalError::WrongArgCount {
+            expected: "1".to_string(),
+            got: args.len(),
+            span,
+        });
+    }
+    let Value::String(s, _, _) = &args[0] else {
+        return Err(EvalError::TypeMismatch {
+            expected: "string".to_string(),
+            got: format!("{}", args[0]),
+            span: args[0].span(),
+        });
+    };
+    let chars: Vec<Value> = s.borrow().chars().map(|c| Value::Char(c, Span::default())).collect();
+    Ok(Value::list(chars))
+}
+
+fn builtin_list_to_string(args: &[Value], span: Span) -> Result<Value, EvalError> {
+    if args.len() != 1 {
+        return Err(EvalError::WrongArgCount {
+            expected: "1".to_string(),
+            got: args.len(),
+            span,
+        });
+    }
+    let Value::List(elems, _) = &args[0] else {
+        return Err(EvalError::TypeMismatch {
+            expected: "list".to_string(),
+            got: format!("{}", args[0]),
+            span: args[0].span(),
+        });
+    };
+    let mut result = String::new();
+    for elem in elems {
+        let Value::Char(c, _) = elem else {
+            return Err(EvalError::TypeMismatch {
+                expected: "char".to_string(),
+                got: format!("{elem}"),
+                span: elem.span(),
+            });
+        };
+        result.push(*c);
+    }
+    Ok(Value::string(result))
+}
+
+fn builtin_char_to_integer(args: &[Value], span: Span) -> Result<Value, EvalError> {
+    if args.len() != 1 {
+        return Err(EvalError::WrongArgCount {
+            expected: "1".to_string(),
+            got: args.len(),
+            span,
+        });
+    }
+    let Value::Char(c, _) = &args[0] else {
+        return Err(EvalError::TypeMismatch {
+            expected: "char".to_string(),
+            got: format!("{}", args[0]),
+            span: args[0].span(),
+        });
+    };
+    Ok(Value::int(*c as i64))
+}
+
+fn builtin_integer_to_char(args: &[Value], span: Span) -> Result<Value, EvalError> {
+    if args.len() != 1 {
+        return Err(EvalError::WrongArgCount {
+            expected: "1".to_string(),
+            got: args.len(),
+            span,
+        });
+    }
+    let Value::Integer(n, _) = &args[0] else {
+        return Err(EvalError::TypeMismatch {
+            expected: "integer".to_string(),
+            got: format!("{}", args[0]),
+            span: args[0].span(),
+        });
+    };
+    let c = char::from_u32(*n as u32).ok_or_else(|| EvalError::TypeMismatch {
+        expected: "valid Unicode code point".to_string(),
+        got: format!("{n}"),
+        span,
+    })?;
+    Ok(Value::Char(c, Span::default()))
 }
 
 fn builtin_expt(args: &[Value], span: Span) -> Result<Value, EvalError> {
@@ -1615,7 +1714,7 @@ fn values_equal(a: &Value, b: &Value) -> bool {
     match (a, b) {
         (Value::Integer(x, _), Value::Integer(y, _)) => x == y,
         (Value::Boolean(x, _), Value::Boolean(y, _)) => x == y,
-        (Value::String(x, _), Value::String(y, _)) => *x.borrow() == *y.borrow(),
+        (Value::String(x, _, _), Value::String(y, _, _)) => *x.borrow() == *y.borrow(),
         (Value::Symbol(x, _), Value::Symbol(y, _)) => x == y,
         (Value::Char(x, _), Value::Char(y, _)) => x == y,
         (Value::List(xs, _), Value::List(ys, _)) => {
@@ -1856,14 +1955,14 @@ fn builtin_string_eq(args: &[Value], span: Span) -> Result<Value, EvalError> {
             span,
         });
     }
-    let Value::String(a, _) = &args[0] else {
+    let Value::String(a, _, _) = &args[0] else {
         return Err(EvalError::TypeMismatch {
             expected: "string".to_string(),
             got: format!("{}", args[0]),
             span: args[0].span(),
         });
     };
-    let Value::String(b, _) = &args[1] else {
+    let Value::String(b, _, _) = &args[1] else {
         return Err(EvalError::TypeMismatch {
             expected: "string".to_string(),
             got: format!("{}", args[1]),
@@ -1881,14 +1980,14 @@ fn builtin_string_lt(args: &[Value], span: Span) -> Result<Value, EvalError> {
             span,
         });
     }
-    let Value::String(a, _) = &args[0] else {
+    let Value::String(a, _, _) = &args[0] else {
         return Err(EvalError::TypeMismatch {
             expected: "string".to_string(),
             got: format!("{}", args[0]),
             span: args[0].span(),
         });
     };
-    let Value::String(b, _) = &args[1] else {
+    let Value::String(b, _, _) = &args[1] else {
         return Err(EvalError::TypeMismatch {
             expected: "string".to_string(),
             got: format!("{}", args[1]),
@@ -1906,14 +2005,14 @@ fn builtin_string_ci_eq(args: &[Value], span: Span) -> Result<Value, EvalError> 
             span,
         });
     }
-    let Value::String(a, _) = &args[0] else {
+    let Value::String(a, _, _) = &args[0] else {
         return Err(EvalError::TypeMismatch {
             expected: "string".to_string(),
             got: format!("{}", args[0]),
             span: args[0].span(),
         });
     };
-    let Value::String(b, _) = &args[1] else {
+    let Value::String(b, _, _) = &args[1] else {
         return Err(EvalError::TypeMismatch {
             expected: "string".to_string(),
             got: format!("{}", args[1]),
@@ -1931,7 +2030,7 @@ fn builtin_string_upcase(args: &[Value], span: Span) -> Result<Value, EvalError>
             span,
         });
     }
-    let Value::String(s, _) = &args[0] else {
+    let Value::String(s, _, _) = &args[0] else {
         return Err(EvalError::TypeMismatch {
             expected: "string".to_string(),
             got: format!("{}", args[0]),
@@ -1949,7 +2048,7 @@ fn builtin_string_downcase(args: &[Value], span: Span) -> Result<Value, EvalErro
             span,
         });
     }
-    let Value::String(s, _) = &args[0] else {
+    let Value::String(s, _, _) = &args[0] else {
         return Err(EvalError::TypeMismatch {
             expected: "string".to_string(),
             got: format!("{}", args[0]),

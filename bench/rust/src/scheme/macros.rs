@@ -72,7 +72,7 @@ fn collect_pattern_vars_inner(pattern: &Value, literals: &[String], vars: &mut V
         Value::Symbol(_, _)
         | Value::Integer(_, _)
         | Value::Boolean(_, _)
-        | Value::String(_, _)
+        | Value::String(_, _, _)
         | Value::Char(_, _)
         | Value::Closure { .. }
         | Value::Continuation(_)
@@ -164,7 +164,7 @@ fn match_pattern(
         }
         Value::Integer(a, _) => matches!(input, Value::Integer(b, _) if a == b),
         Value::Boolean(a, _) => matches!(input, Value::Boolean(b, _) if a == b),
-        Value::String(_, _)
+        Value::String(_, _, _)
         | Value::Char(_, _)
         | Value::Closure { .. }
         | Value::Continuation(_)
@@ -217,7 +217,7 @@ fn expand_template(
         }
         Value::Integer(_, _)
         | Value::Boolean(_, _)
-        | Value::String(_, _)
+        | Value::String(_, _, _)
         | Value::Char(_, _)
         | Value::Closure { .. }
         | Value::Continuation(_)
@@ -286,7 +286,7 @@ fn template_symbols(template: &Value) -> Vec<String> {
         Value::Symbol(_, _)
         | Value::Integer(_, _)
         | Value::Boolean(_, _)
-        | Value::String(_, _)
+        | Value::String(_, _, _)
         | Value::Char(_, _)
         | Value::Closure { .. }
         | Value::Continuation(_)

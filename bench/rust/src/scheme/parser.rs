@@ -208,11 +208,7 @@ fn parse_expr(tokens: &[(Token, Span)], pos: usize) -> Result<(Value, usize), Ev
         Token::Integer(n) => Ok((Value::Integer(*n, *span), pos + 1)),
         Token::Boolean(b) => Ok((Value::Boolean(*b, *span), pos + 1)),
         Token::String(s) => {
-            let mut val = Value::string(s.clone());
-            if let Value::String(_, ref mut sp) = val {
-                *sp = *span;
-            }
-            Ok((val, pos + 1))
+            Ok((Value::immutable_string(s.clone(), *span), pos + 1))
         }
         Token::Symbol(s) => Ok((Value::Symbol(s.clone(), *span), pos + 1)),
         Token::Char(c) => Ok((Value::Char(*c, *span), pos + 1)),

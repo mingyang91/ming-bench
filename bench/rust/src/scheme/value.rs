@@ -5,6 +5,13 @@ use std::rc::Rc;
 use crate::scheme::env::Env;
 use crate::scheme::error::Span;
 
+/// Whether a Scheme string can be mutated via `string-set!`.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum Mutability {
+    Mutable,
+    Immutable,
+}
+
 #[derive(Debug, Clone)]
 pub struct SyntaxRules {
     pub literals: Vec<String>,
@@ -16,7 +23,7 @@ pub struct SyntaxRules {
 pub enum Value {
     Integer(i64, Span),
     Boolean(bool, Span),
-    String(Rc<RefCell<String>>, Span),
+    String(Rc<RefCell<String>>, Mutability, Span),
     Symbol(String, Span),
     Char(char, Span),
     List(Vec<Value>, Span),
@@ -36,7 +43,7 @@ impl PartialEq for Value {
         match (self, other) {
             (Value::Integer(a, _), Value::Integer(b, _)) => a == b,
             (Value::Boolean(a, _), Value::Boolean(b, _)) => a == b,
-            (Value::String(a, _), Value::String(b, _)) => *a.borrow() == *b.borrow(),
+            (Value::String(a, _, _), Value::String(b, _, _)) => *a.borrow() == *b.borrow(),
             (Value::Symbol(a, _), Value::Symbol(b, _)) => a == b,
             (Value::Char(a, _), Value::Char(b, _)) => a == b,
             (Value::List(a, _), Value::List(b, _)) => a == b,
@@ -57,7 +64,7 @@ impl fmt::Display for Value {
             Value::Integer(n, _) => write!(f, "{n}"),
             Value::Boolean(true, _) => write!(f, "#t"),
             Value::Boolean(false, _) => write!(f, "#f"),
-            Value::String(s, _) => write!(f, "\"{}\"", s.borrow()),
+            Value::String(s, _, _) => write!(f, "\"{}\"", s.borrow()),
             Value::Symbol(s, _) => write!(f, "{s}"),
             Value::Char(c, _) => write!(f, "#\\{c}"),
             Value::List(elems, _) => {
@@ -82,7 +89,7 @@ impl Value {
     /// Format for `display` — strings without quotes, chars as bare characters.
     pub fn display_string(&self) -> String {
         match self {
-            Value::String(s, _) => s.borrow().clone(),
+            Value::String(s, _, _) => s.borrow().clone(),
             Value::Char(c, _) => c.to_string(),
             Value::List(elems, _) => {
                 let mut out = String::from("(");
@@ -111,7 +118,7 @@ impl Value {
         match self {
             Value::Integer(_, s)
             | Value::Boolean(_, s)
-            | Value::String(_, s)
+            | Value::String(_, _, s)
             | Value::Symbol(_, s)
             | Value::Char(_, s)
             | Value::List(_, s) => *s,
@@ -134,7 +141,10 @@ impl Value {
         Value::Boolean(b, Span::default())
     }
     pub fn string(s: String) -> Self {
-        Value::String(Rc::new(RefCell::new(s)), Span::default())
+        Value::String(Rc::new(RefCell::new(s)), Mutability::Mutable, Span::default())
+    }
+    pub fn immutable_string(s: String, span: Span) -> Self {
+        Value::String(Rc::new(RefCell::new(s)), Mutability::Immutable, span)
     }
     pub fn symbol(s: String) -> Self {
         Value::Symbol(s, Span::default())

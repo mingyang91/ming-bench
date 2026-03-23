@@ -52,4 +52,7 @@ pub enum EvalError {
 
     #[error("continuation invoked")]
     ContinuationReturn { id: u64, value: Value },
+
+    #[error("string is immutable at {span}")]
+    ImmutableString { span: Span },
 }
