@@ -5,7 +5,7 @@ import java.util.List;
 
 public class Tokenizer {
     public enum TokenType {
-        LPAREN, RPAREN, QUOTE, SYMBOL, INTEGER, BOOLEAN, STRING, CHAR, EOF
+        LPAREN, RPAREN, QUOTE, SYMBOL, INTEGER, RATIONAL, DOUBLE, BOOLEAN, STRING, CHAR, EOF
     }
 
     public record Token(TokenType type, String value, int pos, int line, int col) {}
@@ -167,6 +167,17 @@ public class Tokenizer {
             Long.parseLong(val);
             return token(TokenType.INTEGER, val, start);
         } catch (NumberFormatException e) {
+            // Check rational: digits/digits (with optional leading minus)
+            if (val.matches("-?\\d+/\\d+")) {
+                return token(TokenType.RATIONAL, val, start);
+            }
+            // Check double/float literal
+            if (val.contains(".") || val.contains("e") || val.contains("E")) {
+                try {
+                    Double.parseDouble(val);
+                    return token(TokenType.DOUBLE, val, start);
+                } catch (NumberFormatException ignored) {}
+            }
             return token(TokenType.SYMBOL, val, start);
         }
     }

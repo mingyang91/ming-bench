@@ -85,31 +85,83 @@ public class Evaluator {
     private void registerBuiltins(Environment env) {
         // Arithmetic
         env.define("+", new SchemeValue.BuiltinVal("+", args -> {
-            long sum = 0;
-            for (SchemeValue arg : args) sum += requireInt(arg);
-            return new SchemeValue.IntVal(sum);
+            if (hasInexact(args)) {
+                double sum = 0;
+                for (SchemeValue arg : args) sum += numToDouble(arg);
+                return new SchemeValue.DoubleVal(sum);
+            }
+            long num = 0, den = 1;
+            for (SchemeValue arg : args) {
+                long[] r = numToRational(arg);
+                num = num * r[1] + r[0] * den;
+                den = den * r[1];
+                long g = gcd(Math.abs(num), Math.abs(den));
+                if (g > 0) { num /= g; den /= g; }
+            }
+            return SchemeValue.rational(num, den);
         }));
         env.define("-", new SchemeValue.BuiltinVal("-", args -> {
             if (args.isEmpty()) throw new EvalError("- requires at least 1 argument");
-            if (args.size() == 1) return new SchemeValue.IntVal(-requireInt(args.getFirst()));
-            long result = requireInt(args.getFirst());
-            for (int i = 1; i < args.size(); i++) result -= requireInt(args.get(i));
-            return new SchemeValue.IntVal(result);
+            if (hasInexact(args)) {
+                if (args.size() == 1) return new SchemeValue.DoubleVal(-numToDouble(args.getFirst()));
+                double result = numToDouble(args.getFirst());
+                for (int i = 1; i < args.size(); i++) result -= numToDouble(args.get(i));
+                return new SchemeValue.DoubleVal(result);
+            }
+            if (args.size() == 1) {
+                long[] r = numToRational(args.getFirst());
+                return SchemeValue.rational(-r[0], r[1]);
+            }
+            long[] acc = numToRational(args.getFirst());
+            long num = acc[0], den = acc[1];
+            for (int i = 1; i < args.size(); i++) {
+                long[] r = numToRational(args.get(i));
+                num = num * r[1] - r[0] * den;
+                den = den * r[1];
+                long g = gcd(Math.abs(num), Math.abs(den));
+                if (g > 0) { num /= g; den /= g; }
+            }
+            return SchemeValue.rational(num, den);
         }));
         env.define("*", new SchemeValue.BuiltinVal("*", args -> {
-            long product = 1;
-            for (SchemeValue arg : args) product *= requireInt(arg);
-            return new SchemeValue.IntVal(product);
+            if (hasInexact(args)) {
+                double product = 1;
+                for (SchemeValue arg : args) product *= numToDouble(arg);
+                return new SchemeValue.DoubleVal(product);
+            }
+            long num = 1, den = 1;
+            for (SchemeValue arg : args) {
+                long[] r = numToRational(arg);
+                num *= r[0];
+                den *= r[1];
+                long g = gcd(Math.abs(num), Math.abs(den));
+                if (g > 0) { num /= g; den /= g; }
+            }
+            return SchemeValue.rational(num, den);
         }));
         env.define("/", new SchemeValue.BuiltinVal("/", args -> {
             if (args.size() < 2) throw new EvalError("/ requires at least 2 arguments");
-            long result = requireInt(args.getFirst());
-            for (int i = 1; i < args.size(); i++) {
-                long divisor = requireInt(args.get(i));
-                if (divisor == 0) throw new EvalError("Division by zero");
-                result /= divisor;
+            if (hasInexact(args)) {
+                double result = numToDouble(args.getFirst());
+                for (int i = 1; i < args.size(); i++) {
+                    double divisor = numToDouble(args.get(i));
+                    if (divisor == 0) throw new EvalError("Division by zero");
+                    result /= divisor;
+                }
+                return new SchemeValue.DoubleVal(result);
             }
-            return new SchemeValue.IntVal(result);
+            long[] acc = numToRational(args.getFirst());
+            long num = acc[0], den = acc[1];
+            for (int i = 1; i < args.size(); i++) {
+                long[] r = numToRational(args.get(i));
+                if (r[0] == 0) throw new EvalError("Division by zero");
+                num = num * r[1];
+                den = den * r[0];
+                if (den < 0) { num = -num; den = -den; }
+                long g = gcd(Math.abs(num), den);
+                if (g > 0) { num /= g; den /= g; }
+            }
+            return SchemeValue.rational(num, den);
         }));
 
         env.define("modulo", new SchemeValue.BuiltinVal("modulo", args -> {
@@ -133,15 +185,15 @@ public class Evaluator {
 
         // Comparisons
         env.define("<", new SchemeValue.BuiltinVal("<", args ->
-            new SchemeValue.BoolVal(requireInt(args.get(0)) < requireInt(args.get(1)))));
+            new SchemeValue.BoolVal(numericCompare(args.get(0), args.get(1)) < 0)));
         env.define(">", new SchemeValue.BuiltinVal(">", args ->
-            new SchemeValue.BoolVal(requireInt(args.get(0)) > requireInt(args.get(1)))));
+            new SchemeValue.BoolVal(numericCompare(args.get(0), args.get(1)) > 0)));
         env.define("=", new SchemeValue.BuiltinVal("=", args ->
-            new SchemeValue.BoolVal(requireInt(args.get(0)) == requireInt(args.get(1)))));
+            new SchemeValue.BoolVal(numericEquals(args.get(0), args.get(1)))));
         env.define("<=", new SchemeValue.BuiltinVal("<=", args ->
-            new SchemeValue.BoolVal(requireInt(args.get(0)) <= requireInt(args.get(1)))));
+            new SchemeValue.BoolVal(numericCompare(args.get(0), args.get(1)) <= 0)));
         env.define(">=", new SchemeValue.BuiltinVal(">=", args ->
-            new SchemeValue.BoolVal(requireInt(args.get(0)) >= requireInt(args.get(1)))));
+            new SchemeValue.BoolVal(numericCompare(args.get(0), args.get(1)) >= 0)));
         env.define("not", new SchemeValue.BuiltinVal("not", args ->
             new SchemeValue.BoolVal(!args.getFirst().isTruthy())));
 
@@ -206,7 +258,7 @@ public class Evaluator {
         env.define("string?", new SchemeValue.BuiltinVal("string?", args ->
             new SchemeValue.BoolVal(args.getFirst() instanceof SchemeValue.StringVal)));
         env.define("number?", new SchemeValue.BuiltinVal("number?", args ->
-            new SchemeValue.BoolVal(args.getFirst() instanceof SchemeValue.IntVal)));
+            new SchemeValue.BoolVal(isNumeric(args.getFirst()))));
         env.define("boolean?", new SchemeValue.BuiltinVal("boolean?", args ->
             new SchemeValue.BoolVal(args.getFirst() instanceof SchemeValue.BoolVal)));
         env.define("pair?", new SchemeValue.BuiltinVal("pair?", args ->
@@ -271,8 +323,13 @@ public class Evaluator {
                 return new SchemeValue.BoolVal(false);
             }
         }));
-        env.define("number->string", new SchemeValue.BuiltinVal("number->string", args ->
-            new SchemeValue.StringVal(String.valueOf(requireInt(args.getFirst())))));
+        env.define("number->string", new SchemeValue.BuiltinVal("number->string", args -> {
+            SchemeValue v = args.getFirst();
+            if (v instanceof SchemeValue.IntVal i) return new SchemeValue.StringVal(String.valueOf(i.value()));
+            if (v instanceof SchemeValue.RationalVal r) return new SchemeValue.StringVal(r.num() + "/" + r.den());
+            if (v instanceof SchemeValue.DoubleVal d) return new SchemeValue.StringVal(String.valueOf(d.value()));
+            throw new EvalError("number->string: not a number");
+        }));
         env.define("symbol->string", new SchemeValue.BuiltinVal("symbol->string", args -> {
             if (!(args.getFirst() instanceof SchemeValue.SymbolVal s)) throw new EvalError("symbol->string: not a symbol");
             return new SchemeValue.StringVal(s.name());
@@ -387,6 +444,10 @@ public class Evaluator {
                 return new SchemeValue.BoolVal(sa.name().equals(sb.name()));
             if (a instanceof SchemeValue.IntVal ia && b instanceof SchemeValue.IntVal ib)
                 return new SchemeValue.BoolVal(ia.value() == ib.value());
+            if (a instanceof SchemeValue.RationalVal ra && b instanceof SchemeValue.RationalVal rb)
+                return new SchemeValue.BoolVal(ra.num() == rb.num() && ra.den() == rb.den());
+            if (a instanceof SchemeValue.DoubleVal da && b instanceof SchemeValue.DoubleVal db)
+                return new SchemeValue.BoolVal(da.value() == db.value());
             if (a instanceof SchemeValue.BoolVal ba && b instanceof SchemeValue.BoolVal bb)
                 return new SchemeValue.BoolVal(ba.value() == bb.value());
             if (a instanceof SchemeValue.CharVal ca && b instanceof SchemeValue.CharVal cb)
@@ -405,6 +466,10 @@ public class Evaluator {
                 return new SchemeValue.BoolVal(sa.name().equals(sb.name()));
             if (a instanceof SchemeValue.IntVal ia && b instanceof SchemeValue.IntVal ib)
                 return new SchemeValue.BoolVal(ia.value() == ib.value());
+            if (a instanceof SchemeValue.RationalVal ra && b instanceof SchemeValue.RationalVal rb)
+                return new SchemeValue.BoolVal(ra.num() == rb.num() && ra.den() == rb.den());
+            if (a instanceof SchemeValue.DoubleVal da && b instanceof SchemeValue.DoubleVal db)
+                return new SchemeValue.BoolVal(da.value() == db.value());
             if (a instanceof SchemeValue.BoolVal ba && b instanceof SchemeValue.BoolVal bb)
                 return new SchemeValue.BoolVal(ba.value() == bb.value());
             if (a instanceof SchemeValue.CharVal ca && b instanceof SchemeValue.CharVal cb)
@@ -693,6 +758,50 @@ public class Evaluator {
                 return k.apply(result);
             });
         }));
+
+        // L19: Exact/inexact predicates and conversions
+        env.define("exact?", new SchemeValue.BuiltinVal("exact?", args -> {
+            SchemeValue v = args.getFirst();
+            return new SchemeValue.BoolVal(v instanceof SchemeValue.IntVal || v instanceof SchemeValue.RationalVal);
+        }));
+        env.define("inexact?", new SchemeValue.BuiltinVal("inexact?", args -> {
+            SchemeValue v = args.getFirst();
+            return new SchemeValue.BoolVal(v instanceof SchemeValue.DoubleVal);
+        }));
+        env.define("exact->inexact", new SchemeValue.BuiltinVal("exact->inexact", args ->
+            new SchemeValue.DoubleVal(numToDouble(args.getFirst()))
+        ));
+        env.define("inexact->exact", new SchemeValue.BuiltinVal("inexact->exact", args -> {
+            SchemeValue v = args.getFirst();
+            if (v instanceof SchemeValue.IntVal) return v;
+            if (v instanceof SchemeValue.RationalVal) return v;
+            if (v instanceof SchemeValue.DoubleVal d) return inexactToExact(d.value());
+            throw new EvalError("inexact->exact: not a number");
+        }));
+        env.define("numerator", new SchemeValue.BuiltinVal("numerator", args -> {
+            SchemeValue v = args.getFirst();
+            if (v instanceof SchemeValue.IntVal) return v;
+            if (v instanceof SchemeValue.RationalVal r) return new SchemeValue.IntVal(r.num());
+            throw new EvalError("numerator: not an exact number");
+        }));
+        env.define("denominator", new SchemeValue.BuiltinVal("denominator", args -> {
+            SchemeValue v = args.getFirst();
+            if (v instanceof SchemeValue.IntVal) return new SchemeValue.IntVal(1);
+            if (v instanceof SchemeValue.RationalVal r) return new SchemeValue.IntVal(r.den());
+            throw new EvalError("denominator: not an exact number");
+        }));
+        env.define("integer?", new SchemeValue.BuiltinVal("integer?", args -> {
+            SchemeValue v = args.getFirst();
+            if (v instanceof SchemeValue.IntVal) return new SchemeValue.BoolVal(true);
+            if (v instanceof SchemeValue.RationalVal) return new SchemeValue.BoolVal(false);
+            if (v instanceof SchemeValue.DoubleVal d)
+                return new SchemeValue.BoolVal(d.value() == Math.floor(d.value()) && !Double.isInfinite(d.value()));
+            return new SchemeValue.BoolVal(false);
+        }));
+        env.define("rational?", new SchemeValue.BuiltinVal("rational?", args -> {
+            SchemeValue v = args.getFirst();
+            return new SchemeValue.BoolVal(v instanceof SchemeValue.IntVal || v instanceof SchemeValue.RationalVal);
+        }));
     }
 
     // ── CPS eval ──────────────────────────────────────────────────────
@@ -700,6 +809,8 @@ public class Evaluator {
     private Bounce eval(SchemeValue expr, Environment env, SchemeValue.Cont k) {
         return switch (expr) {
             case SchemeValue.IntVal v -> k.apply(v);
+            case SchemeValue.RationalVal v -> k.apply(v);
+            case SchemeValue.DoubleVal v -> k.apply(v);
             case SchemeValue.BoolVal v -> k.apply(v);
             case SchemeValue.StringVal v -> k.apply(v);
             case SchemeValue.CharVal v -> k.apply(v);
@@ -1235,6 +1346,10 @@ public class Evaluator {
             return sa.name().equals(sb.name());
         if (a instanceof SchemeValue.IntVal ia && b instanceof SchemeValue.IntVal ib)
             return ia.value() == ib.value();
+        if (a instanceof SchemeValue.RationalVal ra && b instanceof SchemeValue.RationalVal rb)
+            return ra.num() == rb.num() && ra.den() == rb.den();
+        if (a instanceof SchemeValue.DoubleVal da && b instanceof SchemeValue.DoubleVal db)
+            return da.value() == db.value();
         if (a instanceof SchemeValue.BoolVal ba && b instanceof SchemeValue.BoolVal bb)
             return ba.value() == bb.value();
         if (a instanceof SchemeValue.CharVal ca && b instanceof SchemeValue.CharVal cb)
@@ -1568,8 +1683,9 @@ public class Evaluator {
     }
 
     private boolean schemeEqual(SchemeValue a, SchemeValue b) {
-        if (a instanceof SchemeValue.IntVal ia && b instanceof SchemeValue.IntVal ib)
-            return ia.value() == ib.value();
+        if (isNumeric(a) && isNumeric(b)) {
+            try { return numericEquals(a, b); } catch (EvalError e) { return false; }
+        }
         if (a instanceof SchemeValue.BoolVal ba && b instanceof SchemeValue.BoolVal bb)
             return ba.value() == bb.value();
         if (a instanceof SchemeValue.StringVal sa && b instanceof SchemeValue.StringVal sb)
@@ -1624,5 +1740,85 @@ public class Evaluator {
     private long requireInt(SchemeValue val) throws EvalError {
         if (val instanceof SchemeValue.IntVal iv) return iv.value();
         throw new EvalError("Expected integer, got: " + val.display());
+    }
+
+    // ── Numeric helpers (L19) ────────────────────────────────────────
+
+    private static long gcd(long a, long b) {
+        a = Math.abs(a); b = Math.abs(b);
+        while (b != 0) { long t = b; b = a % b; a = t; }
+        return a;
+    }
+
+    private static boolean isNumeric(SchemeValue v) {
+        return v instanceof SchemeValue.IntVal || v instanceof SchemeValue.RationalVal || v instanceof SchemeValue.DoubleVal;
+    }
+
+    private static boolean hasInexact(List<SchemeValue> args) {
+        for (SchemeValue a : args) {
+            if (a instanceof SchemeValue.DoubleVal) return true;
+        }
+        return false;
+    }
+
+    private static double numToDouble(SchemeValue v) throws EvalError {
+        if (v instanceof SchemeValue.IntVal i) return (double) i.value();
+        if (v instanceof SchemeValue.RationalVal r) return (double) r.num() / r.den();
+        if (v instanceof SchemeValue.DoubleVal d) return d.value();
+        throw new EvalError("Expected number, got: " + v.display());
+    }
+
+    private static long[] numToRational(SchemeValue v) throws EvalError {
+        if (v instanceof SchemeValue.IntVal i) return new long[]{i.value(), 1};
+        if (v instanceof SchemeValue.RationalVal r) return new long[]{r.num(), r.den()};
+        throw new EvalError("Expected exact number, got: " + v.display());
+    }
+
+    private static boolean numericEquals(SchemeValue a, SchemeValue b) throws EvalError {
+        if (a instanceof SchemeValue.DoubleVal || b instanceof SchemeValue.DoubleVal) {
+            return numToDouble(a) == numToDouble(b);
+        }
+        long[] ra = numToRational(a), rb = numToRational(b);
+        return ra[0] * rb[1] == rb[0] * ra[1];
+    }
+
+    private static int numericCompare(SchemeValue a, SchemeValue b) throws EvalError {
+        if (a instanceof SchemeValue.DoubleVal || b instanceof SchemeValue.DoubleVal) {
+            return Double.compare(numToDouble(a), numToDouble(b));
+        }
+        long[] ra = numToRational(a), rb = numToRational(b);
+        return Long.compare(ra[0] * rb[1], rb[0] * ra[1]);
+    }
+
+    private static SchemeValue inexactToExact(double d) throws EvalError {
+        if (Double.isNaN(d) || Double.isInfinite(d))
+            throw new EvalError("inexact->exact: not a finite number");
+        if (d == 0.0) return new SchemeValue.IntVal(0);
+        if (d == Math.floor(d) && Math.abs(d) < (double) Long.MAX_VALUE) {
+            return new SchemeValue.IntVal((long) d);
+        }
+        long bits = Double.doubleToLongBits(d);
+        boolean negative = (bits >> 63) != 0;
+        int biasedExp = (int)((bits >> 52) & 0x7FFL);
+        long significand = bits & 0x000FFFFFFFFFFFFFL;
+        int exponent;
+        if (biasedExp == 0) {
+            exponent = -1022 - 52;
+        } else {
+            significand |= 0x0010000000000000L;
+            exponent = biasedExp - 1023 - 52;
+        }
+        long num, den;
+        if (exponent >= 0) {
+            num = significand << Math.min(exponent, 10);
+            den = 1;
+        } else {
+            num = significand;
+            int negExp = -exponent;
+            if (negExp > 62) throw new EvalError("inexact->exact: number too small");
+            den = 1L << negExp;
+        }
+        if (negative) num = -num;
+        return SchemeValue.rational(num, den);
     }
 }

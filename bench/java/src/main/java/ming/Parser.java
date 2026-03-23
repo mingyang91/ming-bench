@@ -30,6 +30,12 @@ public class Parser {
             }
             case LPAREN -> parseList();
             case INTEGER -> { advance(); yield new SchemeValue.IntVal(Long.parseLong(tok.value())); }
+            case RATIONAL -> {
+                advance();
+                String[] parts = tok.value().split("/");
+                yield SchemeValue.rational(Long.parseLong(parts[0]), Long.parseLong(parts[1]));
+            }
+            case DOUBLE -> { advance(); yield new SchemeValue.DoubleVal(Double.parseDouble(tok.value())); }
             case BOOLEAN -> { advance(); yield new SchemeValue.BoolVal(tok.value().equals("true")); }
             case STRING -> { advance(); yield new SchemeValue.StringVal(tok.value()); }
             case CHAR -> { advance(); yield new SchemeValue.CharVal(tok.value().charAt(0)); }

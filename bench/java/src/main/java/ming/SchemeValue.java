@@ -31,6 +31,23 @@ public sealed interface SchemeValue {
     }
     record CharVal(char value) implements SchemeValue {}
     record VoidVal() implements SchemeValue {}
+    record RationalVal(long num, long den) implements SchemeValue {}
+    record DoubleVal(double value) implements SchemeValue {}
+
+    static SchemeValue rational(long num, long den) {
+        if (den < 0) { num = -num; den = -den; }
+        if (num == 0) return new IntVal(0);
+        long g = gcd(Math.abs(num), den);
+        num /= g; den /= g;
+        if (den == 1) return new IntVal(num);
+        return new RationalVal(num, den);
+    }
+
+    private static long gcd(long a, long b) {
+        while (b != 0) { long t = b; b = a % b; a = t; }
+        return a;
+    }
+
     final class VectorVal implements SchemeValue {
         private final SchemeValue[] elements;
         VectorVal(SchemeValue[] elements) { this.elements = elements; }
@@ -72,6 +89,8 @@ public sealed interface SchemeValue {
     default String display() {
         return switch (this) {
             case IntVal v -> String.valueOf(v.value());
+            case RationalVal v -> v.num() + "/" + v.den();
+            case DoubleVal v -> String.valueOf(v.value());
             case BoolVal v -> v.value() ? "#t" : "#f";
             case StringVal v -> "\"" + v.value() + "\"";
             case SymbolVal v -> v.name();
