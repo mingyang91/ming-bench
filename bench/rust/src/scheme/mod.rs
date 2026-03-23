@@ -14,6 +14,7 @@ enum Value {
     Symbol(String),
     Char(char),
     List(Vec<Value>),
+    Pair(Box<Value>, Box<Value>),
     Void,
     Lambda {
         params: Vec<String>,
@@ -41,11 +42,40 @@ impl Value {
             Value::Boolean(true) => "#t".to_string(),
             Value::Boolean(false) => "#f".to_string(),
             Value::Str(s) => format!("\"{}\"", s),
-            Value::Char(c) => format!("#\\{}", c),
+            Value::Char(c) => match *c {
+                ' ' => "#\\space".to_string(),
+                '\n' => "#\\newline".to_string(),
+                '\t' => "#\\tab".to_string(),
+                _ => format!("#\\{}", c),
+            },
             Value::Symbol(s) => s.clone(),
             Value::List(items) => {
                 let inner: Vec<String> = items.iter().map(|v| v.display()).collect();
                 format!("({})", inner.join(" "))
+            }
+            Value::Pair(a, b) => {
+                let mut parts = vec![a.display()];
+                let mut cur = b.as_ref();
+                loop {
+                    match cur {
+                        Value::List(items) if items.is_empty() => break,
+                        Value::Pair(ca, cb) => {
+                            parts.push(ca.display());
+                            cur = cb.as_ref();
+                        }
+                        Value::List(items) => {
+                            for item in items {
+                                parts.push(item.display());
+                            }
+                            break;
+                        }
+                        other => {
+                            parts.push(format!(". {}", other.display()));
+                            break;
+                        }
+                    }
+                }
+                format!("({})", parts.join(" "))
             }
             Value::Void => "#<void>".to_string(),
             Value::Lambda { .. } => "#<procedure>".to_string(),
@@ -60,11 +90,41 @@ impl Value {
         match self {
             Value::Str(s) if write_mode => format!("\"{}\"", s),
             Value::Str(s) => s.clone(),
+            Value::Char(c) if write_mode => match *c {
+                ' ' => "#\\space".to_string(),
+                '\n' => "#\\newline".to_string(),
+                '\t' => "#\\tab".to_string(),
+                _ => format!("#\\{}", c),
+            },
+            Value::Char(c) => c.to_string(),
             Value::List(items) => {
                 let inner: Vec<String> = items.iter().map(|v| v.display_write(write_mode)).collect();
                 format!("({})", inner.join(" "))
             }
-            Value::Macro { .. } => self.display(),
+            Value::Pair(a, b) => {
+                let mut parts = vec![a.display_write(write_mode)];
+                let mut cur = b.as_ref();
+                loop {
+                    match cur {
+                        Value::List(items) if items.is_empty() => break,
+                        Value::Pair(ca, cb) => {
+                            parts.push(ca.display_write(write_mode));
+                            cur = cb.as_ref();
+                        }
+                        Value::List(items) => {
+                            for item in items {
+                                parts.push(item.display_write(write_mode));
+                            }
+                            break;
+                        }
+                        other => {
+                            parts.push(format!(". {}", other.display_write(write_mode)));
+                            break;
+                        }
+                    }
+                }
+                format!("({})", parts.join(" "))
+            }
             _ => self.display(),
         }
     }
@@ -396,6 +456,36 @@ fn is_builtin(name: &str) -> bool {
             | "apply"
             | "call/cc"
             | "call-with-current-continuation"
+            | "eq?"
+            | "equal?"
+            | "abs"
+            | "modulo"
+            | "remainder"
+            | "quotient"
+            | "min"
+            | "max"
+            | "expt"
+            | "zero?"
+            | "positive?"
+            | "negative?"
+            | "odd?"
+            | "even?"
+            | "list-ref"
+            | "list-tail"
+            | "list?"
+            | "assoc"
+            | "map"
+            | "char-alphabetic?"
+            | "char-numeric?"
+            | "char-upcase"
+            | "char-downcase"
+            | "char=?"
+            | "char<?"
+            | "string=?"
+            | "string<?"
+            | "string-ci=?"
+            | "string-upcase"
+            | "string-downcase"
     )
 }
 
@@ -778,6 +868,61 @@ fn apply_func(func: Value, args: Vec<Value>, kont: &mut Vec<KontFrame>, el: u32,
             let cont_val = Value::Continuation(kont.clone());
             let f = args.into_iter().next().unwrap();
             apply_func(f, vec![cont_val], kont, el, ec)
+        }
+        Value::Builtin(ref name) if name == "map" => {
+            if args.len() < 2 {
+                return Err(EvalError::Arity("map requires at least 2 arguments".into()).at(el, ec));
+            }
+            let func = args[0].clone();
+            let lists: Vec<&Vec<Value>> = args[1..].iter().map(|a| match a {
+                Value::List(items) => Ok(items),
+                _ => Err(EvalError::Type("map: argument is not a list".into()).at(el, ec)),
+            }).collect::<Result<Vec<_>, _>>()?;
+            if lists.is_empty() {
+                return Ok(Ctrl::Val(Value::List(vec![])));
+            }
+            let len = lists[0].len();
+            for l in &lists[1..] {
+                if l.len() != len {
+                    return Err(EvalError::Type("map: lists must have same length".into()).at(el, ec));
+                }
+            }
+            // Iterative map using the CEK machine: we'll build the result list
+            // by evaluating func on each set of elements. We do this by
+            // constructing an equivalent expression and evaluating it.
+            // Simpler approach: compute eagerly since we have all values.
+            let mut result = Vec::with_capacity(len);
+            for i in 0..len {
+                let call_args: Vec<Value> = lists.iter().map(|l| l[i].clone()).collect();
+                // We need to apply func to call_args. Since we're inside the CEK machine,
+                // we can't easily recurse. Instead, build the result iteratively.
+                // For simplicity, use a mini CEK call for each element.
+                let mini_result = match &func {
+                    Value::Lambda { params, rest_param, body, env } => {
+                        bind_lambda_args(params, rest_param, &call_args, env, el, ec)?;
+                        let local_env = new_env(Some(env.clone()));
+                        for (p, a) in params.iter().zip(&call_args) {
+                            env_set(&local_env, p.clone(), a.clone());
+                        }
+                        if let Some(ref rest) = rest_param {
+                            let rest_args = if call_args.len() > params.len() {
+                                call_args[params.len()..].to_vec()
+                            } else {
+                                Vec::new()
+                            };
+                            env_set(&local_env, rest.clone(), Value::List(rest_args));
+                        }
+                        let ctrl = eval_body(body, local_env, &mut Vec::new());
+                        run_cek(ctrl, Vec::new())?
+                    }
+                    Value::Builtin(ref bname) => {
+                        eval_builtin(bname, &call_args).map_err(|e| e.at(el, ec))?
+                    }
+                    _ => return Err(EvalError::Type("map: not a procedure".into()).at(el, ec)),
+                };
+                result.push(mini_result);
+            }
+            Ok(Ctrl::Val(Value::List(result)))
         }
         Value::Builtin(ref name) if name == "apply" => {
             if args.len() < 2 {
@@ -1344,8 +1489,7 @@ fn eval_builtin(op: &str, args: &[Value]) -> Result<Value, EvalError> {
                     Ok(Value::List(new_list))
                 }
                 _ => {
-                    // Improper pair - represent as 2-element list for now
-                    Ok(Value::List(vec![args[0].clone(), args[1].clone()]))
+                    Ok(Value::Pair(Box::new(args[0].clone()), Box::new(args[1].clone())))
                 }
             }
         }
@@ -1355,6 +1499,7 @@ fn eval_builtin(op: &str, args: &[Value]) -> Result<Value, EvalError> {
             }
             match &args[0] {
                 Value::List(items) if !items.is_empty() => Ok(items[0].clone()),
+                Value::Pair(a, _) => Ok(*a.clone()),
                 _ => Err(EvalError::Type("car: not a pair".into())),
             }
         }
@@ -1366,6 +1511,7 @@ fn eval_builtin(op: &str, args: &[Value]) -> Result<Value, EvalError> {
                 Value::List(items) if !items.is_empty() => {
                     Ok(Value::List(items[1..].to_vec()))
                 }
+                Value::Pair(_, b) => Ok(*b.clone()),
                 _ => Err(EvalError::Type("cdr: not a pair".into())),
             }
         }
@@ -1418,7 +1564,8 @@ fn eval_builtin(op: &str, args: &[Value]) -> Result<Value, EvalError> {
                 return Err(EvalError::Arity("pair? requires 1 argument".into()));
             }
             Ok(Value::Boolean(
-                matches!(&args[0], Value::List(items) if !items.is_empty()),
+                matches!(&args[0], Value::List(items) if !items.is_empty())
+                    || matches!(&args[0], Value::Pair(_, _)),
             ))
         }
         "symbol?" => {
@@ -1546,7 +1693,314 @@ fn eval_builtin(op: &str, args: &[Value]) -> Result<Value, EvalError> {
             }
             Ok(Value::Boolean(matches!(&args[0], Value::Char(_))))
         }
+        "eq?" => {
+            if args.len() != 2 {
+                return Err(EvalError::Arity("eq? requires 2 arguments".into()));
+            }
+            Ok(Value::Boolean(values_eq(&args[0], &args[1])))
+        }
+        "equal?" => {
+            if args.len() != 2 {
+                return Err(EvalError::Arity("equal? requires 2 arguments".into()));
+            }
+            Ok(Value::Boolean(values_equal(&args[0], &args[1])))
+        }
+        "abs" => {
+            if args.len() != 1 {
+                return Err(EvalError::Arity("abs requires 1 argument".into()));
+            }
+            Ok(Value::Integer(as_integer(&args[0])?.abs()))
+        }
+        "modulo" => {
+            if args.len() != 2 {
+                return Err(EvalError::Arity("modulo requires 2 arguments".into()));
+            }
+            let a = as_integer(&args[0])?;
+            let b = as_integer(&args[1])?;
+            if b == 0 {
+                return Err(EvalError::DivisionByZero(String::new()));
+            }
+            Ok(Value::Integer(((a % b) + b) % b))
+        }
+        "remainder" => {
+            if args.len() != 2 {
+                return Err(EvalError::Arity("remainder requires 2 arguments".into()));
+            }
+            let a = as_integer(&args[0])?;
+            let b = as_integer(&args[1])?;
+            if b == 0 {
+                return Err(EvalError::DivisionByZero(String::new()));
+            }
+            Ok(Value::Integer(a % b))
+        }
+        "quotient" => {
+            if args.len() != 2 {
+                return Err(EvalError::Arity("quotient requires 2 arguments".into()));
+            }
+            let a = as_integer(&args[0])?;
+            let b = as_integer(&args[1])?;
+            if b == 0 {
+                return Err(EvalError::DivisionByZero(String::new()));
+            }
+            Ok(Value::Integer(a / b))
+        }
+        "min" => {
+            if args.is_empty() {
+                return Err(EvalError::Arity("min requires at least 1 argument".into()));
+            }
+            let mut result = as_integer(&args[0])?;
+            for a in &args[1..] {
+                let v = as_integer(a)?;
+                if v < result {
+                    result = v;
+                }
+            }
+            Ok(Value::Integer(result))
+        }
+        "max" => {
+            if args.is_empty() {
+                return Err(EvalError::Arity("max requires at least 1 argument".into()));
+            }
+            let mut result = as_integer(&args[0])?;
+            for a in &args[1..] {
+                let v = as_integer(a)?;
+                if v > result {
+                    result = v;
+                }
+            }
+            Ok(Value::Integer(result))
+        }
+        "expt" => {
+            if args.len() != 2 {
+                return Err(EvalError::Arity("expt requires 2 arguments".into()));
+            }
+            let base = as_integer(&args[0])?;
+            let exp = as_integer(&args[1])?;
+            if exp < 0 {
+                return Err(EvalError::Type("expt: negative exponent".into()));
+            }
+            Ok(Value::Integer(base.pow(exp as u32)))
+        }
+        "zero?" => {
+            if args.len() != 1 {
+                return Err(EvalError::Arity("zero? requires 1 argument".into()));
+            }
+            Ok(Value::Boolean(as_integer(&args[0])? == 0))
+        }
+        "positive?" => {
+            if args.len() != 1 {
+                return Err(EvalError::Arity("positive? requires 1 argument".into()));
+            }
+            Ok(Value::Boolean(as_integer(&args[0])? > 0))
+        }
+        "negative?" => {
+            if args.len() != 1 {
+                return Err(EvalError::Arity("negative? requires 1 argument".into()));
+            }
+            Ok(Value::Boolean(as_integer(&args[0])? < 0))
+        }
+        "odd?" => {
+            if args.len() != 1 {
+                return Err(EvalError::Arity("odd? requires 1 argument".into()));
+            }
+            Ok(Value::Boolean(as_integer(&args[0])? % 2 != 0))
+        }
+        "even?" => {
+            if args.len() != 1 {
+                return Err(EvalError::Arity("even? requires 1 argument".into()));
+            }
+            Ok(Value::Boolean(as_integer(&args[0])? % 2 == 0))
+        }
+        "list-ref" => {
+            if args.len() != 2 {
+                return Err(EvalError::Arity("list-ref requires 2 arguments".into()));
+            }
+            let items = match &args[0] {
+                Value::List(items) => items,
+                _ => return Err(EvalError::Type("list-ref: not a list".into())),
+            };
+            let idx = as_integer(&args[1])? as usize;
+            items.get(idx).cloned().ok_or_else(|| EvalError::Type("list-ref: index out of range".into()))
+        }
+        "list-tail" => {
+            if args.len() != 2 {
+                return Err(EvalError::Arity("list-tail requires 2 arguments".into()));
+            }
+            let items = match &args[0] {
+                Value::List(items) => items,
+                _ => return Err(EvalError::Type("list-tail: not a list".into())),
+            };
+            let idx = as_integer(&args[1])? as usize;
+            if idx > items.len() {
+                return Err(EvalError::Type("list-tail: index out of range".into()));
+            }
+            Ok(Value::List(items[idx..].to_vec()))
+        }
+        "list?" => {
+            if args.len() != 1 {
+                return Err(EvalError::Arity("list? requires 1 argument".into()));
+            }
+            Ok(Value::Boolean(is_proper_list(&args[0])))
+        }
+        "assoc" => {
+            if args.len() != 2 {
+                return Err(EvalError::Arity("assoc requires 2 arguments".into()));
+            }
+            let key = &args[0];
+            let alist = match &args[1] {
+                Value::List(items) => items,
+                _ => return Err(EvalError::Type("assoc: not a list".into())),
+            };
+            for entry in alist {
+                match entry {
+                    Value::List(pair) if !pair.is_empty() => {
+                        if values_equal(key, &pair[0]) {
+                            return Ok(entry.clone());
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            Ok(Value::Boolean(false))
+        }
+        "char-alphabetic?" => {
+            if args.len() != 1 {
+                return Err(EvalError::Arity("char-alphabetic? requires 1 argument".into()));
+            }
+            match &args[0] {
+                Value::Char(c) => Ok(Value::Boolean(c.is_alphabetic())),
+                _ => Err(EvalError::Type("char-alphabetic?: not a character".into())),
+            }
+        }
+        "char-numeric?" => {
+            if args.len() != 1 {
+                return Err(EvalError::Arity("char-numeric? requires 1 argument".into()));
+            }
+            match &args[0] {
+                Value::Char(c) => Ok(Value::Boolean(c.is_ascii_digit())),
+                _ => Err(EvalError::Type("char-numeric?: not a character".into())),
+            }
+        }
+        "char-upcase" => {
+            if args.len() != 1 {
+                return Err(EvalError::Arity("char-upcase requires 1 argument".into()));
+            }
+            match &args[0] {
+                Value::Char(c) => Ok(Value::Char(c.to_ascii_uppercase())),
+                _ => Err(EvalError::Type("char-upcase: not a character".into())),
+            }
+        }
+        "char-downcase" => {
+            if args.len() != 1 {
+                return Err(EvalError::Arity("char-downcase requires 1 argument".into()));
+            }
+            match &args[0] {
+                Value::Char(c) => Ok(Value::Char(c.to_ascii_lowercase())),
+                _ => Err(EvalError::Type("char-downcase: not a character".into())),
+            }
+        }
+        "char=?" => {
+            if args.len() != 2 {
+                return Err(EvalError::Arity("char=? requires 2 arguments".into()));
+            }
+            match (&args[0], &args[1]) {
+                (Value::Char(a), Value::Char(b)) => Ok(Value::Boolean(a == b)),
+                _ => Err(EvalError::Type("char=?: not characters".into())),
+            }
+        }
+        "char<?" => {
+            if args.len() != 2 {
+                return Err(EvalError::Arity("char<? requires 2 arguments".into()));
+            }
+            match (&args[0], &args[1]) {
+                (Value::Char(a), Value::Char(b)) => Ok(Value::Boolean(a < b)),
+                _ => Err(EvalError::Type("char<?: not characters".into())),
+            }
+        }
+        "string=?" => {
+            if args.len() != 2 {
+                return Err(EvalError::Arity("string=? requires 2 arguments".into()));
+            }
+            match (&args[0], &args[1]) {
+                (Value::Str(a), Value::Str(b)) => Ok(Value::Boolean(a == b)),
+                _ => Err(EvalError::Type("string=?: not strings".into())),
+            }
+        }
+        "string<?" => {
+            if args.len() != 2 {
+                return Err(EvalError::Arity("string<? requires 2 arguments".into()));
+            }
+            match (&args[0], &args[1]) {
+                (Value::Str(a), Value::Str(b)) => Ok(Value::Boolean(a < b)),
+                _ => Err(EvalError::Type("string<?: not strings".into())),
+            }
+        }
+        "string-ci=?" => {
+            if args.len() != 2 {
+                return Err(EvalError::Arity("string-ci=? requires 2 arguments".into()));
+            }
+            match (&args[0], &args[1]) {
+                (Value::Str(a), Value::Str(b)) => {
+                    Ok(Value::Boolean(a.to_lowercase() == b.to_lowercase()))
+                }
+                _ => Err(EvalError::Type("string-ci=?: not strings".into())),
+            }
+        }
+        "string-upcase" => {
+            if args.len() != 1 {
+                return Err(EvalError::Arity("string-upcase requires 1 argument".into()));
+            }
+            match &args[0] {
+                Value::Str(s) => Ok(Value::Str(s.to_uppercase())),
+                _ => Err(EvalError::Type("string-upcase: not a string".into())),
+            }
+        }
+        "string-downcase" => {
+            if args.len() != 1 {
+                return Err(EvalError::Arity("string-downcase requires 1 argument".into()));
+            }
+            match &args[0] {
+                Value::Str(s) => Ok(Value::Str(s.to_lowercase())),
+                _ => Err(EvalError::Type("string-downcase: not a string".into())),
+            }
+        }
         _ => Err(EvalError::UnboundVariable(op.to_string())),
+    }
+}
+
+fn values_eq(a: &Value, b: &Value) -> bool {
+    match (a, b) {
+        (Value::Integer(x), Value::Integer(y)) => x == y,
+        (Value::Boolean(x), Value::Boolean(y)) => x == y,
+        (Value::Symbol(x), Value::Symbol(y)) => x == y,
+        (Value::Char(x), Value::Char(y)) => x == y,
+        (Value::List(x), Value::List(y)) if x.is_empty() && y.is_empty() => true,
+        _ => std::ptr::eq(a as *const _, b as *const _),
+    }
+}
+
+fn values_equal(a: &Value, b: &Value) -> bool {
+    match (a, b) {
+        (Value::Integer(x), Value::Integer(y)) => x == y,
+        (Value::Boolean(x), Value::Boolean(y)) => x == y,
+        (Value::Str(x), Value::Str(y)) => x == y,
+        (Value::Symbol(x), Value::Symbol(y)) => x == y,
+        (Value::Char(x), Value::Char(y)) => x == y,
+        (Value::List(x), Value::List(y)) => {
+            x.len() == y.len() && x.iter().zip(y.iter()).all(|(a, b)| values_equal(a, b))
+        }
+        (Value::Pair(a1, b1), Value::Pair(a2, b2)) => {
+            values_equal(a1, a2) && values_equal(b1, b2)
+        }
+        _ => false,
+    }
+}
+
+fn is_proper_list(v: &Value) -> bool {
+    match v {
+        Value::List(_) => true,
+        Value::Pair(_, b) => is_proper_list(b),
+        _ => false,
     }
 }
 
