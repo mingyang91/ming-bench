@@ -1,11 +1,25 @@
 package ming;
 
 import java.util.ArrayList;
+import java.util.HashMap;
+import java.util.HashSet;
 import java.util.List;
+import java.util.Map;
+import java.util.Set;
 import java.util.function.Function;
 
 public class Evaluator {
     private final StringBuilder outputBuffer = new StringBuilder();
+    private int gensymCounter = 0;
+
+    private String gensym(String prefix) {
+        return prefix + "__" + (gensymCounter++);
+    }
+
+    private static final Set<String> SPECIAL_FORMS = Set.of(
+        "quote", "set!", "define", "lambda", "if", "begin", "cond", "and", "or",
+        "let", "define-syntax", "syntax-rules"
+    );
 
     public String evalStr(String input) throws EvalError {
         var tokens = new Tokenizer(input).tokenize();
@@ -307,6 +321,7 @@ public class Evaluator {
             case SchemeValue.BuiltinVal v -> k.apply(v);
             case SchemeValue.CpsBuiltinVal v -> k.apply(v);
             case SchemeValue.ContinuationVal v -> k.apply(v);
+            case SchemeValue.SyntaxRulesVal v -> k.apply(v);
             case SchemeValue.SymbolVal v -> {
                 try {
                     yield k.apply(env.get(v.name()));
@@ -328,6 +343,15 @@ public class Evaluator {
         if (head instanceof SchemeValue.SymbolVal sym) {
             Bounce special = evalSpecialForm(sym.name(), elems, env, pos, k);
             if (special != null) return special;
+
+            // Check for macro invocation
+            try {
+                SchemeValue val = env.get(sym.name());
+                if (val instanceof SchemeValue.SyntaxRulesVal macro) {
+                    SchemeValue expanded = expandMacro(macro, elems, env);
+                    return new Bounce.More(() -> eval(expanded, env, k));
+                }
+            } catch (EvalError ignored) {}
         }
 
         // Procedure call: eval head, eval args (right-to-left for Guile compat), apply
@@ -391,6 +415,7 @@ public class Evaluator {
                 yield evalOr(elems, 1, env, k);
             }
             case "let" -> evalLet(elems, env, pos, k);
+            case "define-syntax" -> evalDefineSyntax(elems, env, pos, k);
             default -> null; // not a special form
         };
     }
@@ -684,6 +709,169 @@ public class Evaluator {
             callEnv.define(lambda.restParam(), rest);
         }
         return callEnv;
+    }
+
+    // ── Macro system (define-syntax / syntax-rules) ────────────────
+
+    private Bounce evalDefineSyntax(List<SchemeValue> elems, Environment env, String pos, SchemeValue.Cont k) {
+        if (elems.size() != 3)
+            return new Bounce.Err(new EvalError("define-syntax requires 2 arguments at " + pos));
+        if (!(elems.get(1) instanceof SchemeValue.SymbolVal nameSym))
+            return new Bounce.Err(new EvalError("define-syntax: expected symbol"));
+        SchemeValue transformer = elems.get(2);
+        if (!(transformer instanceof SchemeValue.ListVal tList) || tList.elements().isEmpty())
+            return new Bounce.Err(new EvalError("define-syntax: expected syntax-rules"));
+        List<SchemeValue> tElems = tList.elements();
+        if (!(tElems.getFirst() instanceof SchemeValue.SymbolVal sr) || !sr.name().equals("syntax-rules"))
+            return new Bounce.Err(new EvalError("define-syntax: expected syntax-rules"));
+        if (tElems.size() < 2)
+            return new Bounce.Err(new EvalError("syntax-rules requires literals list"));
+        // Parse literals list
+        if (!(tElems.get(1) instanceof SchemeValue.ListVal litList))
+            return new Bounce.Err(new EvalError("syntax-rules: expected literals list"));
+        List<String> literals = new ArrayList<>();
+        for (SchemeValue lit : litList.elements()) {
+            if (lit instanceof SchemeValue.SymbolVal s) literals.add(s.name());
+        }
+        // Parse pattern-template pairs
+        List<SchemeValue> patterns = new ArrayList<>();
+        List<SchemeValue> templates = new ArrayList<>();
+        for (int i = 2; i < tElems.size(); i++) {
+            if (!(tElems.get(i) instanceof SchemeValue.ListVal clause) || clause.elements().size() != 2)
+                return new Bounce.Err(new EvalError("syntax-rules: invalid clause"));
+            patterns.add(clause.elements().get(0));
+            templates.add(clause.elements().get(1));
+        }
+        env.define(nameSym.name(), new SchemeValue.SyntaxRulesVal(literals, patterns, templates, env));
+        return k.apply(new SchemeValue.VoidVal());
+    }
+
+    private SchemeValue expandMacro(SchemeValue.SyntaxRulesVal macro, List<SchemeValue> inputElems,
+                                     Environment env) throws EvalError {
+        for (int i = 0; i < macro.patterns().size(); i++) {
+            SchemeValue pattern = macro.patterns().get(i);
+            SchemeValue template = macro.templates().get(i);
+            if (!(pattern instanceof SchemeValue.ListVal patList)) continue;
+
+            Map<String, SchemeValue> singles = new HashMap<>();
+            Map<String, List<SchemeValue>> lists = new HashMap<>();
+            if (matchPattern(patList.elements(), inputElems, 1, 1, macro.literals(), singles, lists)) {
+                // Collect pattern variable names
+                Set<String> patVars = new HashSet<>(singles.keySet());
+                patVars.addAll(lists.keySet());
+
+                // Collect free symbols in template for hygiene
+                Set<String> freeSyms = new HashSet<>();
+                collectFreeSymbols(template, patVars, freeSyms);
+
+                // Generate renames for hygiene
+                Map<String, String> renames = new HashMap<>();
+                for (String sym : freeSyms) {
+                    renames.put(sym, gensym(sym));
+                }
+
+                // Expand template
+                SchemeValue expanded = expandTemplate(template, singles, lists, renames);
+
+                // Pre-bind renamed symbols from definition env
+                for (var entry : renames.entrySet()) {
+                    try {
+                        SchemeValue val = macro.defEnv().get(entry.getKey());
+                        env.define(entry.getValue(), val);
+                    } catch (EvalError ignored) {
+                        // Not in definition env — introduced binding, skip
+                    }
+                }
+                return expanded;
+            }
+        }
+        throw new EvalError("No matching pattern for macro");
+    }
+
+    private boolean matchPattern(List<SchemeValue> patElems, List<SchemeValue> inputElems,
+                                  int patStart, int inputStart, List<String> literals,
+                                  Map<String, SchemeValue> singles, Map<String, List<SchemeValue>> lists) {
+        int inputIdx = inputStart;
+        for (int i = patStart; i < patElems.size(); i++) {
+            SchemeValue pat = patElems.get(i);
+            // Check if next element is ellipsis
+            if (i + 1 < patElems.size() && isEllipsis(patElems.get(i + 1))) {
+                if (!(pat instanceof SchemeValue.SymbolVal sym)) return false;
+                List<SchemeValue> collected = new ArrayList<>();
+                while (inputIdx < inputElems.size()) {
+                    collected.add(inputElems.get(inputIdx++));
+                }
+                lists.put(sym.name(), collected);
+                i++; // skip ellipsis
+                continue;
+            }
+            if (inputIdx >= inputElems.size()) return false;
+            if (pat instanceof SchemeValue.SymbolVal sym) {
+                if (literals.contains(sym.name())) {
+                    // Literal: must match exactly
+                    if (!(inputElems.get(inputIdx) instanceof SchemeValue.SymbolVal inSym)
+                        || !inSym.name().equals(sym.name())) return false;
+                    inputIdx++;
+                } else {
+                    // Pattern variable
+                    singles.put(sym.name(), inputElems.get(inputIdx));
+                    inputIdx++;
+                }
+            } else if (pat instanceof SchemeValue.ListVal patNested) {
+                if (!(inputElems.get(inputIdx) instanceof SchemeValue.ListVal inNested)) return false;
+                if (!matchPattern(patNested.elements(), inNested.elements(), 0, 0, literals, singles, lists))
+                    return false;
+                inputIdx++;
+            } else {
+                // Literal value match
+                inputIdx++;
+            }
+        }
+        return inputIdx == inputElems.size();
+    }
+
+    private boolean isEllipsis(SchemeValue v) {
+        return v instanceof SchemeValue.SymbolVal s && s.name().equals("...");
+    }
+
+    private SchemeValue expandTemplate(SchemeValue template, Map<String, SchemeValue> singles,
+                                        Map<String, List<SchemeValue>> lists, Map<String, String> renames) {
+        if (template instanceof SchemeValue.SymbolVal sym) {
+            String name = sym.name();
+            if (singles.containsKey(name)) return singles.get(name);
+            if (renames.containsKey(name)) return new SchemeValue.SymbolVal(renames.get(name));
+            return template;
+        }
+        if (template instanceof SchemeValue.ListVal list) {
+            List<SchemeValue> expanded = new ArrayList<>();
+            List<SchemeValue> elems = list.elements();
+            for (int i = 0; i < elems.size(); i++) {
+                if (i + 1 < elems.size() && isEllipsis(elems.get(i + 1))) {
+                    SchemeValue elem = elems.get(i);
+                    if (elem instanceof SchemeValue.SymbolVal sym && lists.containsKey(sym.name())) {
+                        expanded.addAll(lists.get(sym.name()));
+                    }
+                    i++; // skip ellipsis
+                    continue;
+                }
+                expanded.add(expandTemplate(elems.get(i), singles, lists, renames));
+            }
+            return new SchemeValue.ListVal(expanded);
+        }
+        return template;
+    }
+
+    private void collectFreeSymbols(SchemeValue template, Set<String> patternVars, Set<String> result) {
+        if (template instanceof SchemeValue.SymbolVal sym) {
+            String name = sym.name();
+            if (!patternVars.contains(name) && !SPECIAL_FORMS.contains(name) && !name.equals("...")) {
+                result.add(name);
+            }
+        } else if (template instanceof SchemeValue.ListVal list) {
+            for (SchemeValue elem : list.elements()) {
+                collectFreeSymbols(elem, patternVars, result);
+            }
+        }
     }
 
     private long requireInt(SchemeValue val) throws EvalError {

@@ -48,6 +48,9 @@ public sealed interface SchemeValue {
     }
     record ContinuationVal(Cont k) implements SchemeValue {}
 
+    record SyntaxRulesVal(List<String> literals, List<SchemeValue> patterns,
+                           List<SchemeValue> templates, Environment defEnv) implements SchemeValue {}
+
     static SchemeValue NIL = new NilVal();
 
     default boolean isTruthy() {
@@ -77,6 +80,7 @@ public sealed interface SchemeValue {
             case BuiltinVal v -> "#<procedure:" + v.name() + ">";
             case CpsBuiltinVal v -> "#<procedure:" + v.name() + ">";
             case ContinuationVal v -> "#<procedure>";
+            case SyntaxRulesVal v -> "#<syntax>";
         };
     }
 
