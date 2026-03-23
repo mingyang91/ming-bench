@@ -5,9 +5,28 @@ pub use error::EvalError;
 use std::cell::RefCell;
 use std::collections::HashMap;
 use std::rc::Rc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 thread_local! {
     static OUTPUT_BUF: RefCell<String> = RefCell::new(String::new());
+    static WIND_STACK: RefCell<Vec<WindEntry>> = RefCell::new(Vec::new());
+}
+
+static WIND_ID_COUNTER: AtomicUsize = AtomicUsize::new(0);
+
+#[derive(Clone)]
+struct WindEntry {
+    id: usize,
+    in_thunk: Value,
+    out_thunk: Value,
+}
+
+fn wind_stack_snapshot() -> Vec<WindEntry> {
+    WIND_STACK.with(|ws| ws.borrow().clone())
+}
+
+fn wind_stack_reset() {
+    WIND_STACK.with(|ws| ws.borrow_mut().clear());
 }
 
 fn output_write(s: &str) {
@@ -45,8 +64,9 @@ enum Value {
     },
     Builtin(String, fn(&[Value]) -> Result<Value, EvalError>),
     CallCC,
+    DynamicWind,
     SchemeApply,
-    Continuation(Rc<Vec<Frame>>),
+    Continuation(Rc<Vec<Frame>>, Rc<Vec<WindEntry>>),
     Vector(Rc<RefCell<Vec<Value>>>),
     Macro {
         literals: Vec<String>,
@@ -69,8 +89,9 @@ impl std::fmt::Debug for Value {
             Value::Lambda { params, rest_param, .. } => write!(f, "Lambda({params:?}, rest={rest_param:?})"),
             Value::Builtin(name, _) => write!(f, "Builtin({name})"),
             Value::CallCC => write!(f, "CallCC"),
+            Value::DynamicWind => write!(f, "DynamicWind"),
             Value::SchemeApply => write!(f, "SchemeApply"),
-            Value::Continuation(_) => write!(f, "Continuation(...)"),
+            Value::Continuation(..) => write!(f, "Continuation(...)"),
             Value::Vector(v) => write!(f, "Vector({:?})", v.borrow()),
             Value::Macro { .. } => write!(f, "Macro(...)"),
         }
@@ -90,6 +111,7 @@ impl PartialEq for Value {
             (Value::Vector(a), Value::Vector(b)) => *a.borrow() == *b.borrow(),
             (Value::Void, Value::Void) => true,
             (Value::CallCC, Value::CallCC) => true,
+            (Value::DynamicWind, Value::DynamicWind) => true,
             (Value::SchemeApply, Value::SchemeApply) => true,
             _ => false,
         }
@@ -156,7 +178,7 @@ impl std::fmt::Display for Value {
                 }
                 write!(f, ")")
             }
-            Value::Lambda { .. } | Value::Builtin(..) | Value::CallCC | Value::SchemeApply | Value::Continuation(_) => write!(f, "#<procedure>"),
+            Value::Lambda { .. } | Value::Builtin(..) | Value::CallCC | Value::DynamicWind | Value::SchemeApply | Value::Continuation(..) => write!(f, "#<procedure>"),
             Value::Macro { .. } => write!(f, "#<macro>"),
         }
     }
@@ -326,6 +348,7 @@ fn default_env() -> Env {
     env_set(&env, "apply".to_string(), Value::SchemeApply);
     env_set(&env, "call/cc".to_string(), Value::CallCC);
     env_set(&env, "call-with-current-continuation".to_string(), Value::CallCC);
+    env_set(&env, "dynamic-wind".to_string(), Value::DynamicWind);
     // Install Scheme-level prelude (map, etc.)
     let prelude = r#"
 (define (__map1 f lst)
@@ -558,7 +581,6 @@ fn parse_atom(token: &str) -> ExprKind {
 
 // ── Macro Expansion (syntax-rules) ──
 
-use std::sync::atomic::{AtomicUsize, Ordering};
 static GENSYM_COUNTER: AtomicUsize = AtomicUsize::new(0);
 fn gensym(base: &str) -> String {
     let n = GENSYM_COUNTER.fetch_add(1, Ordering::Relaxed);
@@ -787,6 +809,12 @@ fn collect_many_vars(tmpl: &Expr, bindings: &HashMap<String, PatBinding>, vars: 
 
 // ── CEK Machine ──
 
+#[derive(Clone)]
+enum WindAction {
+    Unwind(Value),
+    Rewind(WindEntry),
+}
+
 /// Continuation frame for the CEK machine.
 #[derive(Clone)]
 enum Frame {
@@ -815,6 +843,10 @@ enum Frame {
         body: Vec<Expr>,
         env: Env,
     },
+    DynamicWindAfterIn { body_thunk: Value, out_thunk: Value, in_thunk: Value, wind_id: usize },
+    DynamicWindAfterBody { out_thunk: Value },
+    DynamicWindAfterOut { result: Value },
+    WindTransition { actions: Vec<WindAction>, value: Value },
 }
 
 enum Act {
@@ -1135,6 +1167,49 @@ fn step_ret(val: Value, frame: Frame, stack: &mut Vec<Frame>) -> Result<Act, Eva
                 sf_seq(&body, env, stack)
             }
         }
+        Frame::DynamicWindAfterIn { body_thunk, out_thunk, in_thunk, wind_id } => {
+            // in-thunk returned; push wind entry and call body
+            WIND_STACK.with(|ws| ws.borrow_mut().push(WindEntry {
+                id: wind_id, in_thunk, out_thunk: out_thunk.clone(),
+            }));
+            stack.push(Frame::DynamicWindAfterBody { out_thunk });
+            Ok(Act::Ap(body_thunk, vec![]))
+        }
+        Frame::DynamicWindAfterBody { out_thunk } => {
+            // body returned; pop wind, call out-thunk, remember body result
+            WIND_STACK.with(|ws| ws.borrow_mut().pop());
+            stack.push(Frame::DynamicWindAfterOut { result: val });
+            Ok(Act::Ap(out_thunk, vec![]))
+        }
+        Frame::DynamicWindAfterOut { result } => {
+            // out-thunk returned; return body's result
+            Ok(Act::Ret(result))
+        }
+        Frame::WindTransition { mut actions, value } => {
+            // A wind thunk just returned; continue with next action
+            if actions.is_empty() {
+                Ok(Act::Ret(value))
+            } else {
+                let action = actions.remove(0);
+                if !actions.is_empty() {
+                    stack.push(Frame::WindTransition { actions, value });
+                } else {
+                    // Last action — after it returns, return value
+                    stack.push(Frame::WindTransition { actions: vec![], value });
+                }
+                match action {
+                    WindAction::Unwind(out_thunk) => {
+                        WIND_STACK.with(|ws| ws.borrow_mut().pop());
+                        Ok(Act::Ap(out_thunk, vec![]))
+                    }
+                    WindAction::Rewind(entry) => {
+                        let in_thunk = entry.in_thunk.clone();
+                        WIND_STACK.with(|ws| ws.borrow_mut().push(entry));
+                        Ok(Act::Ap(in_thunk, vec![]))
+                    }
+                }
+            }
+        }
     }
 }
 
@@ -1170,8 +1245,20 @@ fn step_apply(func: Value, args: Vec<Value>, stack: &mut Vec<Frame>) -> Result<A
                 return Err(EvalError::Arity("call/cc expects 1 argument".into()));
             }
             let proc = args.into_iter().next().unwrap();
-            let cont = Value::Continuation(Rc::new(stack.clone()));
+            let cont = Value::Continuation(Rc::new(stack.clone()), Rc::new(wind_stack_snapshot()));
             Ok(Act::Ap(proc, vec![cont]))
+        }
+        Value::DynamicWind => {
+            if args.len() != 3 {
+                return Err(EvalError::Arity("dynamic-wind expects 3 arguments".into()));
+            }
+            let in_thunk = args[0].clone();
+            let body_thunk = args[1].clone();
+            let out_thunk = args[2].clone();
+            let wind_id = WIND_ID_COUNTER.fetch_add(1, Ordering::Relaxed);
+            let call_in = in_thunk.clone();
+            stack.push(Frame::DynamicWindAfterIn { body_thunk, out_thunk, in_thunk, wind_id });
+            Ok(Act::Ap(call_in, vec![]))
         }
         Value::SchemeApply => {
             if args.len() < 2 {
@@ -1187,12 +1274,50 @@ fn step_apply(func: Value, args: Vec<Value>, stack: &mut Vec<Frame>) -> Result<A
             full.extend(tail);
             Ok(Act::Ap(func, full))
         }
-        Value::Continuation(frames) => {
+        Value::Continuation(frames, target_winds) => {
             if args.is_empty() {
                 return Err(EvalError::Arity("continuation expects 1 argument".into()));
             }
+            let value = args.into_iter().next().unwrap();
+            let current_winds = wind_stack_snapshot();
+
+            // Find common prefix length
+            let common = current_winds.iter().zip(target_winds.iter())
+                .take_while(|(a, b)| a.id == b.id)
+                .count();
+
+            // Build wind transition actions
+            let mut actions: Vec<WindAction> = Vec::new();
+            // Unwind from innermost to common
+            for entry in current_winds[common..].iter().rev() {
+                actions.push(WindAction::Unwind(entry.out_thunk.clone()));
+            }
+            // Rewind from common to innermost
+            for entry in &target_winds[common..] {
+                actions.push(WindAction::Rewind(entry.clone()));
+            }
+
             *stack = (*frames).clone();
-            Ok(Act::Ret(args.into_iter().next().unwrap()))
+
+            if actions.is_empty() {
+                Ok(Act::Ret(value))
+            } else {
+                let first = actions.remove(0);
+                if !actions.is_empty() {
+                    stack.push(Frame::WindTransition { actions, value: value.clone() });
+                }
+                match first {
+                    WindAction::Unwind(out_thunk) => {
+                        WIND_STACK.with(|ws| ws.borrow_mut().pop());
+                        Ok(Act::Ap(out_thunk, vec![]))
+                    }
+                    WindAction::Rewind(entry) => {
+                        let in_thunk = entry.in_thunk.clone();
+                        WIND_STACK.with(|ws| ws.borrow_mut().push(entry));
+                        Ok(Act::Ap(in_thunk, vec![]))
+                    }
+                }
+            }
         }
         _ => Err(EvalError::Type(format!("not a procedure: {func}"))),
     }
@@ -1680,7 +1805,7 @@ fn builtin_type_pred(args: &[Value], name: &str) -> Result<Value, EvalError> {
         "symbol?" => matches!(&args[0], Value::Symbol(_)),
         "char?" => matches!(&args[0], Value::Char(_)),
         "vector?" => matches!(&args[0], Value::Vector(_)),
-        "procedure?" => matches!(&args[0], Value::Lambda { .. } | Value::Builtin(..) | Value::CallCC | Value::SchemeApply | Value::Continuation(_)),
+        "procedure?" => matches!(&args[0], Value::Lambda { .. } | Value::Builtin(..) | Value::CallCC | Value::DynamicWind | Value::SchemeApply | Value::Continuation(..)),
         _ => false,
     };
     Ok(Value::Boolean(result))
@@ -2292,6 +2417,7 @@ fn builtin_memq(args: &[Value]) -> Result<Value, EvalError> {
 /// Evaluate one or more Scheme expressions and return the string
 /// representation of the last result.
 pub fn eval_str(input: &str) -> Result<String, EvalError> {
+    wind_stack_reset();
     let mut parser = Parser::new(input);
     let exprs = parser.parse_all()?;
     if exprs.is_empty() {
@@ -2305,8 +2431,9 @@ pub fn eval_str(input: &str) -> Result<String, EvalError> {
 /// Evaluate Scheme expressions, returning both the result value and
 /// any output produced by `display`, `write`, or `newline`.
 pub fn eval_str_with_output(input: &str) -> Result<(String, String), EvalError> {
-    // Clear any stale output
+    // Clear any stale state
     output_take();
+    wind_stack_reset();
     let mut parser = Parser::new(input);
     let exprs = parser.parse_all()?;
     if exprs.is_empty() {
