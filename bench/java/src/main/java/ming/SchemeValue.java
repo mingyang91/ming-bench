@@ -88,6 +88,13 @@ public sealed interface SchemeValue {
         @Override public String display() { return "#<procedure>"; }
     }
 
+    final class ContinuationVal implements SchemeValue {
+        private final Object cont;
+        public ContinuationVal(Object cont) { this.cont = cont; }
+        public Object cont() { return cont; }
+        @Override public String display() { return "#<continuation>"; }
+    }
+
     String display();
 
     /** Format for Scheme's display (no quotes on strings, chars as raw chars) */

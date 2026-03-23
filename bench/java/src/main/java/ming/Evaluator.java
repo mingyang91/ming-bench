@@ -7,206 +7,174 @@ public class Evaluator {
     private final Environment globalEnv = new Environment();
     private StringBuilder outputBuffer;
 
-    public String evalStr(String input) throws EvalError {
-        var parser = new Parser(input);
-        List<SchemeValue> exprs = parser.parseAll();
-        if (exprs.isEmpty()) throw new EvalError("empty input");
+    // --- CPS + Trampoline infrastructure ---
 
-        SchemeValue result = null;
-        for (var expr : exprs) {
-            result = eval(expr, globalEnv);
-        }
-        return result.display();
+    sealed interface Bounce {
+        record Done(SchemeValue value) implements Bounce {}
+        record More(ThunkFn thunk) implements Bounce {}
     }
 
-    public EvalResult evalStrWithOutput(String input) throws EvalError {
-        outputBuffer = new StringBuilder();
-        var parser = new Parser(input);
-        List<SchemeValue> exprs = parser.parseAll();
-        if (exprs.isEmpty()) throw new EvalError("empty input");
+    @FunctionalInterface
+    interface ThunkFn { Bounce run(); }
 
-        SchemeValue result = null;
-        for (var expr : exprs) {
-            result = eval(expr, globalEnv);
+    @FunctionalInterface
+    interface Cont { Bounce apply(SchemeValue value); }
+
+    @FunctionalInterface
+    interface ArgsK { Bounce apply(List<SchemeValue> args); }
+
+    private static final class ContinuationReturn extends RuntimeException {
+        final Bounce bounce;
+        ContinuationReturn(Bounce bounce) {
+            super(null, null, true, false);
+            this.bounce = bounce;
         }
-        String output = outputBuffer.toString();
-        outputBuffer = null;
-        return new EvalResult(result.display(), output);
     }
 
-    private SchemeValue eval(SchemeValue expr, Environment env) throws EvalError {
+    private SchemeValue trampoline(Bounce b) {
         while (true) {
-            switch (expr) {
-                case SchemeValue.IntVal v -> { return v; }
-                case SchemeValue.BoolVal v -> { return v; }
-                case SchemeValue.StringVal v -> { return v; }
-                case SchemeValue.VoidVal v -> { return v; }
-                case SchemeValue.NilVal v -> { return v; }
-                case SchemeValue.PairVal v -> { return v; }
-                case SchemeValue.CharVal v -> { return v; }
-                case SchemeValue.LambdaVal v -> { return v; }
-                case SchemeValue.SymbolVal v -> {
-                    try {
-                        return env.get(v.name());
-                    } catch (EvalError e) {
-                        if (isBuiltin(v.name())) return new SchemeValue.SymbolVal(v.name());
-                        throw withPos(e, v.line(), v.col());
-                    }
+            try {
+                switch (b) {
+                    case Bounce.Done d -> { return d.value(); }
+                    case Bounce.More m -> { b = m.thunk().run(); }
                 }
-                case SchemeValue.ListVal list -> {
-                    if (list.elements().isEmpty()) throw withPos(new EvalError("empty application"), list.line(), list.col());
-
-                    var first = list.elements().getFirst();
-                    var args = list.elements().subList(1, list.elements().size());
-
-                    // Handle special forms
-                    if (first instanceof SchemeValue.SymbolVal sym) {
-                        try {
-                            switch (sym.name()) {
-                                case "if": {
-                                    if (args.size() < 2 || args.size() > 3) throw new EvalError("if: needs 2 or 3 arguments");
-                                    SchemeValue cond = eval(args.get(0), env);
-                                    if (cond.isTruthy()) {
-                                        expr = args.get(1); // TCO
-                                        continue;
-                                    } else if (args.size() == 3) {
-                                        expr = args.get(2); // TCO
-                                        continue;
-                                    }
-                                    return new SchemeValue.VoidVal();
-                                }
-                                case "set!": {
-                                    if (args.size() != 2) throw new EvalError("set!: needs exactly 2 arguments");
-                                    if (!(args.getFirst() instanceof SchemeValue.SymbolVal sym2))
-                                        throw new EvalError("set!: first argument must be a symbol");
-                                    env.set(sym2.name(), eval(args.get(1), env));
-                                    return new SchemeValue.VoidVal();
-                                }
-                                case "define": return evalDefine(args, env);
-                                case "quote": {
-                                    if (args.size() != 1) throw new EvalError("quote: needs exactly 1 argument");
-                                    return quoteDatum(args.getFirst());
-                                }
-                                case "lambda": return evalLambda(args, env);
-                                case "let": {
-                                    // Returns [newExpr, newEnv] for TCO
-                                    Object[] r = evalLetTCO(args, env);
-                                    expr = (SchemeValue) r[0];
-                                    env = (Environment) r[1];
-                                    continue;
-                                }
-                                case "begin": {
-                                    if (args.isEmpty()) return new SchemeValue.VoidVal();
-                                    for (int i = 0; i < args.size() - 1; i++) {
-                                        eval(args.get(i), env);
-                                    }
-                                    expr = args.getLast(); // TCO
-                                    continue;
-                                }
-                                case "cond": {
-                                    Object[] r = evalCondTCO(args, env);
-                                    if (r == null) return new SchemeValue.VoidVal();
-                                    expr = (SchemeValue) r[0];
-                                    env = (Environment) r[1];
-                                    continue;
-                                }
-                                case "and": {
-                                    if (args.isEmpty()) return new SchemeValue.BoolVal(true);
-                                    for (int i = 0; i < args.size() - 1; i++) {
-                                        SchemeValue v = eval(args.get(i), env);
-                                        if (!v.isTruthy()) return v;
-                                    }
-                                    expr = args.getLast(); // TCO
-                                    continue;
-                                }
-                                case "or": {
-                                    if (args.isEmpty()) return new SchemeValue.BoolVal(false);
-                                    for (int i = 0; i < args.size() - 1; i++) {
-                                        SchemeValue v = eval(args.get(i), env);
-                                        if (v.isTruthy()) return v;
-                                    }
-                                    expr = args.getLast(); // TCO
-                                    continue;
-                                }
-                                default: break;
-                            }
-                        } catch (EvalError e) {
-                            throw withPos(e, list.line(), list.col());
-                        }
-                    }
-
-                    // Procedure call
-                    SchemeValue proc;
-                    try {
-                        if (first instanceof SchemeValue.SymbolVal sym) {
-                            try {
-                                proc = env.get(sym.name());
-                            } catch (EvalError e) {
-                                if (isBuiltin(sym.name())) {
-                                    return applyBuiltin(sym.name(), args, env);
-                                }
-                                throw e;
-                            }
-                        } else {
-                            proc = eval(first, env);
-                        }
-                    } catch (EvalError e) {
-                        throw withPos(e, list.line(), list.col());
-                    }
-
-                    // Apply proc with TCO
-                    if (proc instanceof SchemeValue.SymbolVal symProc) {
-                        try {
-                            return applyBuiltin(symProc.name(), args, env);
-                        } catch (EvalError e) {
-                            throw withPos(e, list.line(), list.col());
-                        }
-                    }
-                    if (proc instanceof SchemeValue.LambdaVal lambda) {
-                        int nParams = lambda.params().size();
-                        boolean hasRest = lambda.restParam() != null;
-                        if (hasRest) {
-                            if (args.size() < nParams)
-                                throw withPos(new EvalError("wrong number of arguments: expected at least " + nParams + ", got " + args.size()), list.line(), list.col());
-                        } else {
-                            if (args.size() != nParams)
-                                throw withPos(new EvalError("wrong number of arguments: expected " + nParams + ", got " + args.size()), list.line(), list.col());
-                        }
-                        Environment callEnv = new Environment(lambda.env());
-                        try {
-                            for (int i = 0; i < nParams; i++) {
-                                callEnv.define(lambda.params().get(i), eval(args.get(i), env));
-                            }
-                            if (hasRest) {
-                                SchemeValue restList = new SchemeValue.NilVal();
-                                for (int i = args.size() - 1; i >= nParams; i--) {
-                                    restList = new SchemeValue.PairVal(eval(args.get(i), env), restList);
-                                }
-                                callEnv.define(lambda.restParam(), restList);
-                            }
-                        } catch (EvalError e) {
-                            throw withPos(e, list.line(), list.col());
-                        }
-                        // Eval all body exprs except last, then TCO the last
-                        for (int i = 0; i < lambda.body().size() - 1; i++) {
-                            eval(lambda.body().get(i), callEnv);
-                        }
-                        expr = lambda.body().getLast(); // TCO
-                        env = callEnv;
-                        continue;
-                    }
-                    throw withPos(new EvalError("not a procedure: " + proc.display()), list.line(), list.col());
-                }
+            } catch (ContinuationReturn cr) {
+                b = cr.bounce;
             }
         }
     }
 
-    private SchemeValue evalDefine(List<SchemeValue> args, Environment env) throws EvalError {
+    // --- Public API ---
+
+    public String evalStr(String input) throws EvalError {
+        var parser = new Parser(input);
+        List<SchemeValue> exprs = parser.parseAll();
+        if (exprs.isEmpty()) throw new EvalError("empty input");
+        Bounce b = evalSeq(exprs, globalEnv, v -> new Bounce.Done(v));
+        return trampoline(b).display();
+    }
+
+    public EvalResult evalStrWithOutput(String input) throws EvalError {
+        outputBuffer = new StringBuilder();
+        try {
+            var parser = new Parser(input);
+            List<SchemeValue> exprs = parser.parseAll();
+            if (exprs.isEmpty()) throw new EvalError("empty input");
+            Bounce b = evalSeq(exprs, globalEnv, v -> new Bounce.Done(v));
+            SchemeValue result = trampoline(b);
+            String output = outputBuffer.toString();
+            outputBuffer = null;
+            return new EvalResult(result.display(), output);
+        } catch (RuntimeException e) {
+            outputBuffer = null;
+            throw e;
+        }
+    }
+
+    // --- Core eval (CPS) ---
+
+    private Bounce eval(SchemeValue expr, Environment env, Cont k) {
+        return switch (expr) {
+            case SchemeValue.IntVal v -> k.apply(v);
+            case SchemeValue.BoolVal v -> k.apply(v);
+            case SchemeValue.StringVal v -> k.apply(v);
+            case SchemeValue.VoidVal v -> k.apply(v);
+            case SchemeValue.NilVal v -> k.apply(v);
+            case SchemeValue.PairVal v -> k.apply(v);
+            case SchemeValue.CharVal v -> k.apply(v);
+            case SchemeValue.LambdaVal v -> k.apply(v);
+            case SchemeValue.ContinuationVal v -> k.apply(v);
+            case SchemeValue.SymbolVal v -> {
+                try {
+                    yield k.apply(env.get(v.name()));
+                } catch (EvalError e) {
+                    if (isBuiltin(v.name())) yield k.apply(new SchemeValue.SymbolVal(v.name()));
+                    throw withPos(e, v.line(), v.col());
+                }
+            }
+            case SchemeValue.ListVal list -> evalList(list, env, k);
+        };
+    }
+
+    private Bounce evalList(SchemeValue.ListVal list, Environment env, Cont k) {
+        if (list.elements().isEmpty())
+            throw withPos(new EvalError("empty application"), list.line(), list.col());
+        var first = list.elements().getFirst();
+        var args = list.elements().subList(1, list.elements().size());
+
+        if (first instanceof SchemeValue.SymbolVal sym) {
+            try {
+                return switch (sym.name()) {
+                    case "if" -> evalIf(args, env, k);
+                    case "define" -> evalDefine(args, env, k);
+                    case "lambda" -> k.apply(makeLambda(args, env));
+                    case "quote" -> {
+                        if (args.size() != 1) throw new EvalError("quote: needs exactly 1 argument");
+                        yield k.apply(quoteDatum(args.getFirst()));
+                    }
+                    case "begin" -> {
+                        if (args.isEmpty()) yield k.apply(new SchemeValue.VoidVal());
+                        yield evalSeq(args, env, k);
+                    }
+                    case "let" -> evalLet(args, env, k);
+                    case "set!" -> evalSet(args, env, k);
+                    case "cond" -> evalCond(args, env, k);
+                    case "and" -> evalAnd(args, 0, env, k);
+                    case "or" -> evalOr(args, 0, env, k);
+                    case "call/cc", "call-with-current-continuation" -> evalCallCC(args, env, k);
+                    default -> evalCall(first, args, env, k, list.line(), list.col());
+                };
+            } catch (EvalError e) {
+                throw withPos(e, list.line(), list.col());
+            }
+        }
+        return evalCall(first, args, env, k, list.line(), list.col());
+    }
+
+    // --- Sequence & args ---
+
+    private Bounce evalSeq(List<SchemeValue> exprs, Environment env, Cont k) {
+        if (exprs.isEmpty()) return k.apply(new SchemeValue.VoidVal());
+        if (exprs.size() == 1) return eval(exprs.getFirst(), env, k);
+        return new Bounce.More(() -> eval(exprs.getFirst(), env,
+            _v -> evalSeq(exprs.subList(1, exprs.size()), env, k)));
+    }
+
+    private Bounce evalArgsList(List<SchemeValue> exprs, Environment env, ArgsK then) {
+        if (exprs.isEmpty()) return then.apply(List.of());
+        return evalArgsRTL(exprs, env, exprs.size() - 1, List.of(), then);
+    }
+
+    private Bounce evalArgsRTL(List<SchemeValue> exprs, Environment env, int i,
+                                List<SchemeValue> acc, ArgsK then) {
+        if (i < 0) return then.apply(acc);
+        return new Bounce.More(() -> eval(exprs.get(i), env, v -> {
+            var next = new ArrayList<SchemeValue>(acc.size() + 1);
+            next.add(v);
+            next.addAll(acc);
+            return evalArgsRTL(exprs, env, i - 1, next, then);
+        }));
+    }
+
+    // --- Special forms ---
+
+    private Bounce evalIf(List<SchemeValue> args, Environment env, Cont k) {
+        if (args.size() < 2 || args.size() > 3) throw new EvalError("if: needs 2 or 3 arguments");
+        return new Bounce.More(() -> eval(args.get(0), env, cond -> {
+            if (cond.isTruthy()) return new Bounce.More(() -> eval(args.get(1), env, k));
+            if (args.size() == 3) return new Bounce.More(() -> eval(args.get(2), env, k));
+            return k.apply(new SchemeValue.VoidVal());
+        }));
+    }
+
+    private Bounce evalDefine(List<SchemeValue> args, Environment env, Cont k) {
         if (args.size() < 2) throw new EvalError("define: needs at least 2 arguments");
         var target = args.getFirst();
         if (target instanceof SchemeValue.SymbolVal sym) {
-            env.define(sym.name(), eval(args.get(1), env));
-            return new SchemeValue.VoidVal();
+            return new Bounce.More(() -> eval(args.get(1), env, value -> {
+                env.define(sym.name(), value);
+                return k.apply(new SchemeValue.VoidVal());
+            }));
         }
         if (target instanceof SchemeValue.ListVal nameAndParams) {
             if (nameAndParams.elements().isEmpty()) throw new EvalError("define: empty name list");
@@ -229,15 +197,14 @@ public class Evaluator {
                     throw new EvalError("define: parameter must be a symbol");
                 params.add(p.name());
             }
-            List<SchemeValue> body = args.subList(1, args.size());
-            var lambda = new SchemeValue.LambdaVal(params, restParam, body, env);
+            var lambda = new SchemeValue.LambdaVal(params, restParam, args.subList(1, args.size()), env);
             env.define(nameSym.name(), lambda);
-            return new SchemeValue.VoidVal();
+            return k.apply(new SchemeValue.VoidVal());
         }
         throw new EvalError("define: invalid syntax");
     }
 
-    private SchemeValue evalLambda(List<SchemeValue> args, Environment env) throws EvalError {
+    private SchemeValue makeLambda(List<SchemeValue> args, Environment env) {
         if (args.size() < 2) throw new EvalError("lambda: needs params and body");
         var paramList = args.getFirst();
         if (!(paramList instanceof SchemeValue.ListVal plist))
@@ -258,114 +225,177 @@ public class Evaluator {
                 throw new EvalError("lambda: parameter must be a symbol");
             params.add(sym.name());
         }
-        List<SchemeValue> body = args.subList(1, args.size());
-        return new SchemeValue.LambdaVal(params, restParam, body, env);
+        return new SchemeValue.LambdaVal(params, restParam, args.subList(1, args.size()), env);
     }
 
-    // Returns [expr, env] for the trampoline to continue with
-    private Object[] evalLetTCO(List<SchemeValue> args, Environment env) throws EvalError {
+    private Bounce evalSet(List<SchemeValue> args, Environment env, Cont k) {
+        if (args.size() != 2) throw new EvalError("set!: needs exactly 2 arguments");
+        if (!(args.getFirst() instanceof SchemeValue.SymbolVal sym))
+            throw new EvalError("set!: first argument must be a symbol");
+        return new Bounce.More(() -> eval(args.get(1), env, value -> {
+            env.set(sym.name(), value);
+            return k.apply(new SchemeValue.VoidVal());
+        }));
+    }
+
+    private Bounce evalLet(List<SchemeValue> args, Environment env, Cont k) {
         if (args.size() < 2) throw new EvalError("let: needs bindings and body");
 
-        // Named let: (let name ((var init) ...) body ...)
+        // Named let
         if (args.getFirst() instanceof SchemeValue.SymbolVal nameSym) {
             if (args.size() < 3) throw new EvalError("let: named let needs bindings and body");
-            var bindingsList = args.get(1);
-            if (!(bindingsList instanceof SchemeValue.ListVal bl))
+            if (!(args.get(1) instanceof SchemeValue.ListVal bl))
                 throw new EvalError("let: bindings must be a list");
-
             List<String> params = new ArrayList<>();
-            List<SchemeValue> inits = new ArrayList<>();
+            List<SchemeValue> initExprs = new ArrayList<>();
             for (var binding : bl.elements()) {
                 if (!(binding instanceof SchemeValue.ListVal pair) || pair.elements().size() != 2)
                     throw new EvalError("let: invalid binding");
                 if (!(pair.elements().getFirst() instanceof SchemeValue.SymbolVal sym))
                     throw new EvalError("let: binding name must be a symbol");
                 params.add(sym.name());
-                inits.add(pair.elements().get(1));
+                initExprs.add(pair.elements().get(1));
             }
             List<SchemeValue> body = args.subList(2, args.size());
-
             Environment letEnv = new Environment(env);
             var lambda = new SchemeValue.LambdaVal(params, body, letEnv);
             letEnv.define(nameSym.name(), lambda);
-
-            Environment callEnv = new Environment(letEnv);
-            for (int i = 0; i < params.size(); i++) {
-                callEnv.define(params.get(i), eval(inits.get(i), env));
-            }
-            // Eval all body except last
-            for (int i = 0; i < body.size() - 1; i++) {
-                eval(body.get(i), callEnv);
-            }
-            return new Object[]{ body.getLast(), callEnv };
+            return evalArgsList(initExprs, env, vals -> {
+                Environment callEnv = new Environment(letEnv);
+                for (int i = 0; i < params.size(); i++) callEnv.define(params.get(i), vals.get(i));
+                return evalSeq(body, callEnv, k);
+            });
         }
 
         // Regular let
-        var bindingsList = args.getFirst();
-        if (!(bindingsList instanceof SchemeValue.ListVal bl))
+        if (!(args.getFirst() instanceof SchemeValue.ListVal bl))
             throw new EvalError("let: bindings must be a list");
-
-        Environment letEnv = new Environment(env);
+        List<String> names = new ArrayList<>();
+        List<SchemeValue> initExprs = new ArrayList<>();
         for (var binding : bl.elements()) {
             if (!(binding instanceof SchemeValue.ListVal pair) || pair.elements().size() != 2)
                 throw new EvalError("let: invalid binding");
             if (!(pair.elements().getFirst() instanceof SchemeValue.SymbolVal sym))
                 throw new EvalError("let: binding name must be a symbol");
-            letEnv.define(sym.name(), eval(pair.elements().get(1), env));
+            names.add(sym.name());
+            initExprs.add(pair.elements().get(1));
         }
-
         List<SchemeValue> body = args.subList(1, args.size());
-        for (int i = 0; i < body.size() - 1; i++) {
-            eval(body.get(i), letEnv);
-        }
-        return new Object[]{ body.getLast(), letEnv };
+        return evalArgsList(initExprs, env, vals -> {
+            Environment letEnv = new Environment(env);
+            for (int i = 0; i < names.size(); i++) letEnv.define(names.get(i), vals.get(i));
+            return evalSeq(body, letEnv, k);
+        });
     }
 
-    // Returns [expr, env] or null if no clause matched
-    private Object[] evalCondTCO(List<SchemeValue> args, Environment env) throws EvalError {
-        for (var clause : args) {
-            if (!(clause instanceof SchemeValue.ListVal cl) || cl.elements().isEmpty())
-                throw new EvalError("cond: invalid clause");
-            var test = cl.elements().getFirst();
-            if (test instanceof SchemeValue.SymbolVal sym && sym.name().equals("else")) {
-                if (cl.elements().size() == 1) return new Object[]{ new SchemeValue.VoidVal(), env };
-                for (int i = 1; i < cl.elements().size() - 1; i++) {
-                    eval(cl.elements().get(i), env);
-                }
-                return new Object[]{ cl.elements().getLast(), env };
-            }
-            SchemeValue testVal = eval(test, env);
+    private Bounce evalCond(List<SchemeValue> clauses, Environment env, Cont k) {
+        if (clauses.isEmpty()) return k.apply(new SchemeValue.VoidVal());
+        var clause = clauses.getFirst();
+        if (!(clause instanceof SchemeValue.ListVal cl) || cl.elements().isEmpty())
+            throw new EvalError("cond: invalid clause");
+        var test = cl.elements().getFirst();
+        if (test instanceof SchemeValue.SymbolVal sym && sym.name().equals("else")) {
+            if (cl.elements().size() == 1) return k.apply(new SchemeValue.VoidVal());
+            return evalSeq(cl.elements().subList(1, cl.elements().size()), env, k);
+        }
+        var rest = clauses.subList(1, clauses.size());
+        return new Bounce.More(() -> eval(test, env, testVal -> {
             if (testVal.isTruthy()) {
-                if (cl.elements().size() == 1) {
-                    // Return testVal directly - wrap as a quote-like thing
-                    // We can't TCO here, just return the value
-                    // Use a trick: return a quoted value
-                    return new Object[]{ wrapValue(testVal), env };
-                }
-                for (int i = 1; i < cl.elements().size() - 1; i++) {
-                    eval(cl.elements().get(i), env);
-                }
-                return new Object[]{ cl.elements().getLast(), env };
+                if (cl.elements().size() == 1) return k.apply(testVal);
+                return evalSeq(cl.elements().subList(1, cl.elements().size()), env, k);
+            }
+            return evalCond(rest, env, k);
+        }));
+    }
+
+    private Bounce evalAnd(List<SchemeValue> args, int i, Environment env, Cont k) {
+        if (args.isEmpty()) return k.apply(new SchemeValue.BoolVal(true));
+        if (i == args.size() - 1) return new Bounce.More(() -> eval(args.get(i), env, k));
+        return new Bounce.More(() -> eval(args.get(i), env, v -> {
+            if (!v.isTruthy()) return k.apply(v);
+            return evalAnd(args, i + 1, env, k);
+        }));
+    }
+
+    private Bounce evalOr(List<SchemeValue> args, int i, Environment env, Cont k) {
+        if (args.isEmpty()) return k.apply(new SchemeValue.BoolVal(false));
+        if (i == args.size() - 1) return new Bounce.More(() -> eval(args.get(i), env, k));
+        return new Bounce.More(() -> eval(args.get(i), env, v -> {
+            if (v.isTruthy()) return k.apply(v);
+            return evalOr(args, i + 1, env, k);
+        }));
+    }
+
+    private Bounce evalCallCC(List<SchemeValue> args, Environment env, Cont k) {
+        if (args.size() != 1) throw new EvalError("call/cc: needs exactly 1 argument");
+        return new Bounce.More(() -> eval(args.get(0), env, proc -> {
+            var contVal = new SchemeValue.ContinuationVal(k);
+            return applyProc(proc, List.of(contVal), k);
+        }));
+    }
+
+    // --- Procedure call ---
+
+    private Bounce evalCall(SchemeValue first, List<SchemeValue> argExprs,
+                            Environment env, Cont k, int line, int col) {
+        Cont withProc = proc -> evalArgsList(argExprs, env, eArgs -> {
+            try {
+                return applyProc(proc, eArgs, k);
+            } catch (EvalError e) {
+                throw withPos(e, line, col);
+            }
+        });
+
+        if (first instanceof SchemeValue.SymbolVal sym) {
+            try {
+                return withProc.apply(env.get(sym.name()));
+            } catch (EvalError e) {
+                if (isBuiltin(sym.name())) return withProc.apply(new SchemeValue.SymbolVal(sym.name()));
+                throw withPos(e, line, col);
             }
         }
-        return null;
+        return new Bounce.More(() -> eval(first, env, withProc));
     }
 
-    // Wrap an already-evaluated value so it passes through eval unchanged
-    private SchemeValue wrapValue(SchemeValue v) {
-        // Self-evaluating values pass through eval unchanged
-        if (v instanceof SchemeValue.IntVal || v instanceof SchemeValue.BoolVal ||
-            v instanceof SchemeValue.StringVal || v instanceof SchemeValue.VoidVal ||
-            v instanceof SchemeValue.NilVal || v instanceof SchemeValue.PairVal ||
-            v instanceof SchemeValue.CharVal || v instanceof SchemeValue.LambdaVal) {
-            return v;
+    private Bounce applyProc(SchemeValue proc, List<SchemeValue> args, Cont k) {
+        if (proc instanceof SchemeValue.ContinuationVal cont) {
+            if (args.size() != 1) throw new EvalError("continuation: needs exactly 1 argument");
+            throw new ContinuationReturn(((Cont) cont.cont()).apply(args.getFirst()));
         }
-        // For symbols, we'd need to quote them, but cond test values that are symbols
-        // would have already been evaluated
-        return v;
+        if (proc instanceof SchemeValue.LambdaVal lambda) {
+            return applyLambda(lambda, args, k);
+        }
+        if (proc instanceof SchemeValue.SymbolVal sym && isBuiltin(sym.name())) {
+            return applyBuiltin(sym.name(), args, k);
+        }
+        throw new EvalError("not a procedure: " + proc.display());
     }
 
-    // --- builtins ---
+    private Bounce applyLambda(SchemeValue.LambdaVal lambda, List<SchemeValue> args, Cont k) {
+        int nParams = lambda.params().size();
+        boolean hasRest = lambda.restParam() != null;
+        if (hasRest) {
+            if (args.size() < nParams)
+                throw new EvalError("wrong number of arguments: expected at least " + nParams + ", got " + args.size());
+        } else {
+            if (args.size() != nParams)
+                throw new EvalError("wrong number of arguments: expected " + nParams + ", got " + args.size());
+        }
+        Environment callEnv = new Environment(lambda.env());
+        for (int i = 0; i < nParams; i++) {
+            callEnv.define(lambda.params().get(i), args.get(i));
+        }
+        if (hasRest) {
+            SchemeValue restList = new SchemeValue.NilVal();
+            for (int i = args.size() - 1; i >= nParams; i--) {
+                restList = new SchemeValue.PairVal(args.get(i), restList);
+            }
+            callEnv.define(lambda.restParam(), restList);
+        }
+        return evalSeq(lambda.body(), callEnv, k);
+    }
+
+    // --- Builtins ---
 
     private static final java.util.Set<String> BUILTINS = java.util.Set.of(
         "+", "-", "*", "/", "<", ">", "=", "<=", ">=", "not",
@@ -378,391 +408,268 @@ public class Evaluator {
         "string->number", "number->string",
         "symbol->string", "string->symbol", "string-ref",
         "string-set!", "string-copy",
-        "apply"
+        "apply", "call/cc", "call-with-current-continuation"
     );
 
-    private boolean isBuiltin(String name) {
-        return BUILTINS.contains(name);
-    }
+    private boolean isBuiltin(String name) { return BUILTINS.contains(name); }
 
-    private SchemeValue applyBuiltin(String name, List<SchemeValue> args, Environment env) throws EvalError {
+    private Bounce applyBuiltin(String name, List<SchemeValue> a, Cont k) {
         return switch (name) {
-            case "+" -> arithOp(args, 0, Long::sum, env);
-            case "-" -> minusOp(args, env);
-            case "*" -> arithOp(args, 1, (a, b) -> a * b, env);
-            case "/" -> divOp(args, env);
-            case "<" -> cmpOp(args, (a, b) -> a < b, env);
-            case ">" -> cmpOp(args, (a, b) -> a > b, env);
-            case "=" -> cmpOp(args, (a, b) -> a == b, env);
-            case "<=" -> cmpOp(args, (a, b) -> a <= b, env);
-            case ">=" -> cmpOp(args, (a, b) -> a >= b, env);
-            case "not" -> notOp(args, env);
+            case "+" -> {
+                long s = 0; for (var x : a) s += asInt(x);
+                yield k.apply(new SchemeValue.IntVal(s));
+            }
+            case "-" -> {
+                if (a.isEmpty()) throw new EvalError("-: needs at least 1 argument");
+                if (a.size() == 1) yield k.apply(new SchemeValue.IntVal(-asInt(a.getFirst())));
+                long r = asInt(a.getFirst());
+                for (int i = 1; i < a.size(); i++) r -= asInt(a.get(i));
+                yield k.apply(new SchemeValue.IntVal(r));
+            }
+            case "*" -> {
+                long r = 1; for (var x : a) r *= asInt(x);
+                yield k.apply(new SchemeValue.IntVal(r));
+            }
+            case "/" -> {
+                if (a.isEmpty()) throw new EvalError("/: needs at least 1 argument");
+                long r = asInt(a.getFirst());
+                for (int i = 1; i < a.size(); i++) {
+                    long d = asInt(a.get(i)); if (d == 0) throw new EvalError("division by zero");
+                    r /= d;
+                }
+                yield k.apply(new SchemeValue.IntVal(r));
+            }
+            case "<" -> cmpOp(a, (x, y) -> x < y, k);
+            case ">" -> cmpOp(a, (x, y) -> x > y, k);
+            case "=" -> cmpOp(a, (x, y) -> x == y, k);
+            case "<=" -> cmpOp(a, (x, y) -> x <= y, k);
+            case ">=" -> cmpOp(a, (x, y) -> x >= y, k);
+            case "not" -> {
+                if (a.size() != 1) throw new EvalError("not: needs exactly 1 argument");
+                yield k.apply(new SchemeValue.BoolVal(!a.getFirst().isTruthy()));
+            }
             case "cons" -> {
-                if (args.size() != 2) throw new EvalError("cons: needs exactly 2 arguments");
-                yield new SchemeValue.PairVal(eval(args.get(0), env), eval(args.get(1), env));
+                if (a.size() != 2) throw new EvalError("cons: needs exactly 2 arguments");
+                yield k.apply(new SchemeValue.PairVal(a.get(0), a.get(1)));
             }
             case "car" -> {
-                if (args.size() != 1) throw new EvalError("car: needs exactly 1 argument");
-                var v = eval(args.getFirst(), env);
-                if (!(v instanceof SchemeValue.PairVal p)) throw new EvalError("car: not a pair");
-                yield p.car();
+                if (a.size() != 1) throw new EvalError("car: needs exactly 1 argument");
+                if (!(a.getFirst() instanceof SchemeValue.PairVal p)) throw new EvalError("car: not a pair");
+                yield k.apply(p.car());
             }
             case "cdr" -> {
-                if (args.size() != 1) throw new EvalError("cdr: needs exactly 1 argument");
-                var v = eval(args.getFirst(), env);
-                if (!(v instanceof SchemeValue.PairVal p)) throw new EvalError("cdr: not a pair");
-                yield p.cdr();
+                if (a.size() != 1) throw new EvalError("cdr: needs exactly 1 argument");
+                if (!(a.getFirst() instanceof SchemeValue.PairVal p)) throw new EvalError("cdr: not a pair");
+                yield k.apply(p.cdr());
             }
             case "null?" -> {
-                if (args.size() != 1) throw new EvalError("null?: needs exactly 1 argument");
-                yield new SchemeValue.BoolVal(eval(args.getFirst(), env) instanceof SchemeValue.NilVal);
+                if (a.size() != 1) throw new EvalError("null?: needs exactly 1 argument");
+                yield k.apply(new SchemeValue.BoolVal(a.getFirst() instanceof SchemeValue.NilVal));
             }
             case "list" -> {
-                SchemeValue result = new SchemeValue.NilVal();
-                for (int i = args.size() - 1; i >= 0; i--) {
-                    result = new SchemeValue.PairVal(eval(args.get(i), env), result);
-                }
-                yield result;
+                SchemeValue r = new SchemeValue.NilVal();
+                for (int i = a.size() - 1; i >= 0; i--) r = new SchemeValue.PairVal(a.get(i), r);
+                yield k.apply(r);
             }
             case "length" -> {
-                if (args.size() != 1) throw new EvalError("length: needs exactly 1 argument");
-                var v = eval(args.getFirst(), env);
-                long len = 0;
-                while (v instanceof SchemeValue.PairVal p) {
-                    len++;
-                    v = p.cdr();
-                }
-                yield new SchemeValue.IntVal(len);
+                if (a.size() != 1) throw new EvalError("length: needs exactly 1 argument");
+                var v = a.getFirst(); long len = 0;
+                while (v instanceof SchemeValue.PairVal p) { len++; v = p.cdr(); }
+                yield k.apply(new SchemeValue.IntVal(len));
             }
-            case "append" -> evalAppend(args, env);
-            case "string?" -> typePred(args, env, SchemeValue.StringVal.class);
-            case "number?" -> typePred(args, env, SchemeValue.IntVal.class);
-            case "boolean?" -> typePred(args, env, SchemeValue.BoolVal.class);
-            case "pair?" -> typePred(args, env, SchemeValue.PairVal.class);
-            case "symbol?" -> typePred(args, env, SchemeValue.SymbolVal.class);
+            case "append" -> {
+                if (a.isEmpty()) yield k.apply(new SchemeValue.NilVal());
+                SchemeValue r = a.getLast();
+                for (int i = a.size() - 2; i >= 0; i--) r = appendTwo(a.get(i), r);
+                yield k.apply(r);
+            }
+            case "string?" -> typePred(a, SchemeValue.StringVal.class, k);
+            case "number?" -> typePred(a, SchemeValue.IntVal.class, k);
+            case "boolean?" -> typePred(a, SchemeValue.BoolVal.class, k);
+            case "pair?" -> typePred(a, SchemeValue.PairVal.class, k);
+            case "symbol?" -> typePred(a, SchemeValue.SymbolVal.class, k);
+            case "char?" -> typePred(a, SchemeValue.CharVal.class, k);
             case "zero?" -> {
-                if (args.size() != 1) throw new EvalError("zero?: needs exactly 1 argument");
-                yield new SchemeValue.BoolVal(asInt(eval(args.getFirst(), env)) == 0);
+                if (a.size() != 1) throw new EvalError("zero?: needs exactly 1 argument");
+                yield k.apply(new SchemeValue.BoolVal(asInt(a.getFirst()) == 0));
             }
             case "positive?" -> {
-                if (args.size() != 1) throw new EvalError("positive?: needs exactly 1 argument");
-                yield new SchemeValue.BoolVal(asInt(eval(args.getFirst(), env)) > 0);
+                if (a.size() != 1) throw new EvalError("positive?: needs exactly 1 argument");
+                yield k.apply(new SchemeValue.BoolVal(asInt(a.getFirst()) > 0));
             }
             case "negative?" -> {
-                if (args.size() != 1) throw new EvalError("negative?: needs exactly 1 argument");
-                yield new SchemeValue.BoolVal(asInt(eval(args.getFirst(), env)) < 0);
+                if (a.size() != 1) throw new EvalError("negative?: needs exactly 1 argument");
+                yield k.apply(new SchemeValue.BoolVal(asInt(a.getFirst()) < 0));
             }
             case "abs" -> {
-                if (args.size() != 1) throw new EvalError("abs: needs exactly 1 argument");
-                yield new SchemeValue.IntVal(Math.abs(asInt(eval(args.getFirst(), env))));
+                if (a.size() != 1) throw new EvalError("abs: needs exactly 1 argument");
+                yield k.apply(new SchemeValue.IntVal(Math.abs(asInt(a.getFirst()))));
             }
             case "min" -> {
-                if (args.size() < 1) throw new EvalError("min: needs at least 1 argument");
-                long m = asInt(eval(args.getFirst(), env));
-                for (int i = 1; i < args.size(); i++) m = Math.min(m, asInt(eval(args.get(i), env)));
-                yield new SchemeValue.IntVal(m);
+                if (a.isEmpty()) throw new EvalError("min: needs at least 1 argument");
+                long m = asInt(a.getFirst());
+                for (int i = 1; i < a.size(); i++) m = Math.min(m, asInt(a.get(i)));
+                yield k.apply(new SchemeValue.IntVal(m));
             }
             case "max" -> {
-                if (args.size() < 1) throw new EvalError("max: needs at least 1 argument");
-                long m = asInt(eval(args.getFirst(), env));
-                for (int i = 1; i < args.size(); i++) m = Math.max(m, asInt(eval(args.get(i), env)));
-                yield new SchemeValue.IntVal(m);
+                if (a.isEmpty()) throw new EvalError("max: needs at least 1 argument");
+                long m = asInt(a.getFirst());
+                for (int i = 1; i < a.size(); i++) m = Math.max(m, asInt(a.get(i)));
+                yield k.apply(new SchemeValue.IntVal(m));
             }
             case "equal?", "eq?" -> {
-                if (args.size() != 2) throw new EvalError(name + ": needs exactly 2 arguments");
-                yield new SchemeValue.BoolVal(schemeEqual(eval(args.get(0), env), eval(args.get(1), env)));
+                if (a.size() != 2) throw new EvalError(name + ": needs exactly 2 arguments");
+                yield k.apply(new SchemeValue.BoolVal(schemeEqual(a.get(0), a.get(1))));
             }
             case "modulo" -> {
-                if (args.size() != 2) throw new EvalError("modulo: needs exactly 2 arguments");
-                long a = asInt(eval(args.get(0), env));
-                long b = asInt(eval(args.get(1), env));
-                if (b == 0) throw new EvalError("division by zero");
-                yield new SchemeValue.IntVal(Math.floorMod(a, b));
+                if (a.size() != 2) throw new EvalError("modulo: needs exactly 2 arguments");
+                long x = asInt(a.get(0)), y = asInt(a.get(1));
+                if (y == 0) throw new EvalError("division by zero");
+                yield k.apply(new SchemeValue.IntVal(Math.floorMod(x, y)));
             }
             case "remainder" -> {
-                if (args.size() != 2) throw new EvalError("remainder: needs exactly 2 arguments");
-                long a = asInt(eval(args.get(0), env));
-                long b = asInt(eval(args.get(1), env));
-                if (b == 0) throw new EvalError("division by zero");
-                yield new SchemeValue.IntVal(a % b);
+                if (a.size() != 2) throw new EvalError("remainder: needs exactly 2 arguments");
+                long x = asInt(a.get(0)), y = asInt(a.get(1));
+                if (y == 0) throw new EvalError("division by zero");
+                yield k.apply(new SchemeValue.IntVal(x % y));
             }
             case "even?" -> {
-                if (args.size() != 1) throw new EvalError("even?: needs exactly 1 argument");
-                yield new SchemeValue.BoolVal(asInt(eval(args.getFirst(), env)) % 2 == 0);
+                if (a.size() != 1) throw new EvalError("even?: needs exactly 1 argument");
+                yield k.apply(new SchemeValue.BoolVal(asInt(a.getFirst()) % 2 == 0));
             }
             case "odd?" -> {
-                if (args.size() != 1) throw new EvalError("odd?: needs exactly 1 argument");
-                yield new SchemeValue.BoolVal(asInt(eval(args.getFirst(), env)) % 2 != 0);
+                if (a.size() != 1) throw new EvalError("odd?: needs exactly 1 argument");
+                yield k.apply(new SchemeValue.BoolVal(asInt(a.getFirst()) % 2 != 0));
             }
             case "display" -> {
-                if (args.size() != 1) throw new EvalError("display: needs exactly 1 argument");
-                var v = eval(args.getFirst(), env);
-                if (outputBuffer != null) outputBuffer.append(v.displayOutput());
-                yield new SchemeValue.VoidVal();
+                if (a.size() != 1) throw new EvalError("display: needs exactly 1 argument");
+                if (outputBuffer != null) outputBuffer.append(a.getFirst().displayOutput());
+                yield k.apply(new SchemeValue.VoidVal());
             }
             case "write" -> {
-                if (args.size() != 1) throw new EvalError("write: needs exactly 1 argument");
-                var v = eval(args.getFirst(), env);
-                if (outputBuffer != null) outputBuffer.append(v.display());
-                yield new SchemeValue.VoidVal();
+                if (a.size() != 1) throw new EvalError("write: needs exactly 1 argument");
+                if (outputBuffer != null) outputBuffer.append(a.getFirst().display());
+                yield k.apply(new SchemeValue.VoidVal());
             }
             case "newline" -> {
                 if (outputBuffer != null) outputBuffer.append('\n');
-                yield new SchemeValue.VoidVal();
+                yield k.apply(new SchemeValue.VoidVal());
             }
             case "string-append" -> {
                 var sb = new StringBuilder();
-                for (var arg : args) {
-                    var v = eval(arg, env);
-                    if (!(v instanceof SchemeValue.StringVal s)) throw new EvalError("string-append: not a string");
-                    sb.append(s.value());
+                for (var x : a) {
+                    if (!(x instanceof SchemeValue.StringVal sv)) throw new EvalError("string-append: not a string");
+                    sb.append(sv.value());
                 }
-                yield new SchemeValue.StringVal(sb.toString());
+                yield k.apply(new SchemeValue.StringVal(sb.toString()));
             }
             case "string-length" -> {
-                if (args.size() != 1) throw new EvalError("string-length: needs exactly 1 argument");
-                var v = eval(args.getFirst(), env);
-                if (!(v instanceof SchemeValue.StringVal s)) throw new EvalError("string-length: not a string");
-                yield new SchemeValue.IntVal(s.length());
+                if (a.size() != 1) throw new EvalError("string-length: needs exactly 1 argument");
+                if (!(a.getFirst() instanceof SchemeValue.StringVal sv)) throw new EvalError("string-length: not a string");
+                yield k.apply(new SchemeValue.IntVal(sv.length()));
             }
             case "substring" -> {
-                if (args.size() != 3) throw new EvalError("substring: needs exactly 3 arguments");
-                var v = eval(args.get(0), env);
-                if (!(v instanceof SchemeValue.StringVal s)) throw new EvalError("substring: not a string");
-                int start = (int) asInt(eval(args.get(1), env));
-                int end = (int) asInt(eval(args.get(2), env));
-                yield new SchemeValue.StringVal(s.value().substring(start, end));
+                if (a.size() != 3) throw new EvalError("substring: needs exactly 3 arguments");
+                if (!(a.get(0) instanceof SchemeValue.StringVal sv)) throw new EvalError("substring: not a string");
+                yield k.apply(new SchemeValue.StringVal(sv.value().substring((int) asInt(a.get(1)), (int) asInt(a.get(2)))));
             }
             case "string->number" -> {
-                if (args.size() != 1) throw new EvalError("string->number: needs exactly 1 argument");
-                var v = eval(args.getFirst(), env);
-                if (!(v instanceof SchemeValue.StringVal s)) throw new EvalError("string->number: not a string");
-                try {
-                    yield new SchemeValue.IntVal(Long.parseLong(s.value()));
-                } catch (NumberFormatException e) {
-                    yield new SchemeValue.BoolVal(false);
-                }
+                if (a.size() != 1) throw new EvalError("string->number: needs exactly 1 argument");
+                if (!(a.getFirst() instanceof SchemeValue.StringVal sv)) throw new EvalError("string->number: not a string");
+                SchemeValue r2;
+                try { r2 = new SchemeValue.IntVal(Long.parseLong(sv.value())); }
+                catch (NumberFormatException e) { r2 = new SchemeValue.BoolVal(false); }
+                yield k.apply(r2);
             }
             case "number->string" -> {
-                if (args.size() != 1) throw new EvalError("number->string: needs exactly 1 argument");
-                yield new SchemeValue.StringVal(Long.toString(asInt(eval(args.getFirst(), env))));
+                if (a.size() != 1) throw new EvalError("number->string: needs exactly 1 argument");
+                yield k.apply(new SchemeValue.StringVal(Long.toString(asInt(a.getFirst()))));
             }
             case "symbol->string" -> {
-                if (args.size() != 1) throw new EvalError("symbol->string: needs exactly 1 argument");
-                var v = eval(args.getFirst(), env);
-                if (!(v instanceof SchemeValue.SymbolVal sym)) throw new EvalError("symbol->string: not a symbol");
-                yield new SchemeValue.StringVal(sym.name());
+                if (a.size() != 1) throw new EvalError("symbol->string: needs exactly 1 argument");
+                if (!(a.getFirst() instanceof SchemeValue.SymbolVal sv)) throw new EvalError("symbol->string: not a symbol");
+                yield k.apply(new SchemeValue.StringVal(sv.name()));
             }
             case "string->symbol" -> {
-                if (args.size() != 1) throw new EvalError("string->symbol: needs exactly 1 argument");
-                var v = eval(args.getFirst(), env);
-                if (!(v instanceof SchemeValue.StringVal s)) throw new EvalError("string->symbol: not a string");
-                yield new SchemeValue.SymbolVal(s.value());
+                if (a.size() != 1) throw new EvalError("string->symbol: needs exactly 1 argument");
+                if (!(a.getFirst() instanceof SchemeValue.StringVal sv)) throw new EvalError("string->symbol: not a string");
+                yield k.apply(new SchemeValue.SymbolVal(sv.value()));
             }
             case "string-ref" -> {
-                if (args.size() != 2) throw new EvalError("string-ref: needs exactly 2 arguments");
-                var v = eval(args.get(0), env);
-                if (!(v instanceof SchemeValue.StringVal s)) throw new EvalError("string-ref: not a string");
-                int idx = (int) asInt(eval(args.get(1), env));
-                yield new SchemeValue.CharVal(s.charAt(idx));
+                if (a.size() != 2) throw new EvalError("string-ref: needs exactly 2 arguments");
+                if (!(a.get(0) instanceof SchemeValue.StringVal sv)) throw new EvalError("string-ref: not a string");
+                yield k.apply(new SchemeValue.CharVal(sv.charAt((int) asInt(a.get(1)))));
             }
-            case "char?" -> typePred(args, env, SchemeValue.CharVal.class);
             case "string-set!" -> {
-                if (args.size() != 3) throw new EvalError("string-set!: needs exactly 3 arguments");
-                var v = eval(args.get(0), env);
-                if (!(v instanceof SchemeValue.StringVal s)) throw new EvalError("string-set!: not a string");
-                int idx = (int) asInt(eval(args.get(1), env));
-                var ch = eval(args.get(2), env);
-                if (!(ch instanceof SchemeValue.CharVal c)) throw new EvalError("string-set!: not a character");
-                s.setChar(idx, c.value());
-                yield new SchemeValue.VoidVal();
+                if (a.size() != 3) throw new EvalError("string-set!: needs exactly 3 arguments");
+                if (!(a.get(0) instanceof SchemeValue.StringVal sv)) throw new EvalError("string-set!: not a string");
+                if (!(a.get(2) instanceof SchemeValue.CharVal c)) throw new EvalError("string-set!: not a character");
+                sv.setChar((int) asInt(a.get(1)), c.value());
+                yield k.apply(new SchemeValue.VoidVal());
             }
             case "string-copy" -> {
-                if (args.size() != 1) throw new EvalError("string-copy: needs exactly 1 argument");
-                var v = eval(args.getFirst(), env);
-                if (!(v instanceof SchemeValue.StringVal s)) throw new EvalError("string-copy: not a string");
-                yield s.copy();
+                if (a.size() != 1) throw new EvalError("string-copy: needs exactly 1 argument");
+                if (!(a.getFirst() instanceof SchemeValue.StringVal sv)) throw new EvalError("string-copy: not a string");
+                yield k.apply(sv.copy());
             }
-            case "apply" -> evalApply(args, env);
+            case "apply" -> {
+                if (a.size() < 2) throw new EvalError("apply: needs at least 2 arguments");
+                SchemeValue proc = a.getFirst();
+                List<SchemeValue> allArgs = new ArrayList<>();
+                for (int i = 1; i < a.size() - 1; i++) allArgs.add(a.get(i));
+                SchemeValue cur = a.getLast();
+                while (cur instanceof SchemeValue.PairVal p) { allArgs.add(p.car()); cur = p.cdr(); }
+                yield applyProc(proc, allArgs, k);
+            }
+            case "call/cc", "call-with-current-continuation" -> {
+                if (a.size() != 1) throw new EvalError("call/cc: needs exactly 1 argument");
+                var contVal = new SchemeValue.ContinuationVal(k);
+                yield applyProc(a.getFirst(), List.of(contVal), k);
+            }
             default -> throw new EvalError("unknown procedure: " + name);
         };
     }
 
-    private long asInt(SchemeValue v) throws EvalError {
+    // --- Helpers ---
+
+    private long asInt(SchemeValue v) {
         if (v instanceof SchemeValue.IntVal i) return i.value();
         throw new EvalError("expected number, got " + v.display());
     }
 
-    @FunctionalInterface
-    interface LongBinOp { long apply(long a, long b); }
+    @FunctionalInterface interface LongCmp { boolean test(long a, long b); }
 
-    @FunctionalInterface
-    interface LongCmp { boolean test(long a, long b); }
-
-    private SchemeValue arithOp(List<SchemeValue> args, long identity, LongBinOp op, Environment env) throws EvalError {
-        long result = identity;
-        for (var arg : args) {
-            result = op.apply(result, asInt(eval(arg, env)));
-        }
-        return new SchemeValue.IntVal(result);
-    }
-
-    private SchemeValue minusOp(List<SchemeValue> args, Environment env) throws EvalError {
-        if (args.isEmpty()) throw new EvalError("-: needs at least 1 argument");
-        if (args.size() == 1) return new SchemeValue.IntVal(-asInt(eval(args.getFirst(), env)));
-        long result = asInt(eval(args.getFirst(), env));
-        for (int i = 1; i < args.size(); i++) {
-            result -= asInt(eval(args.get(i), env));
-        }
-        return new SchemeValue.IntVal(result);
-    }
-
-    private SchemeValue divOp(List<SchemeValue> args, Environment env) throws EvalError {
-        if (args.isEmpty()) throw new EvalError("/: needs at least 1 argument");
-        long result = asInt(eval(args.getFirst(), env));
-        for (int i = 1; i < args.size(); i++) {
-            long divisor = asInt(eval(args.get(i), env));
-            if (divisor == 0) throw new EvalError("division by zero");
-            result /= divisor;
-        }
-        return new SchemeValue.IntVal(result);
-    }
-
-    private SchemeValue cmpOp(List<SchemeValue> args, LongCmp cmp, Environment env) throws EvalError {
-        if (args.size() < 2) throw new EvalError("comparison needs at least 2 arguments");
-        long prev = asInt(eval(args.getFirst(), env));
-        for (int i = 1; i < args.size(); i++) {
-            long cur = asInt(eval(args.get(i), env));
-            if (!cmp.test(prev, cur)) return new SchemeValue.BoolVal(false);
+    private Bounce cmpOp(List<SchemeValue> a, LongCmp cmp, Cont k) {
+        if (a.size() < 2) throw new EvalError("comparison needs at least 2 arguments");
+        long prev = asInt(a.getFirst());
+        for (int i = 1; i < a.size(); i++) {
+            long cur = asInt(a.get(i));
+            if (!cmp.test(prev, cur)) return k.apply(new SchemeValue.BoolVal(false));
             prev = cur;
         }
-        return new SchemeValue.BoolVal(true);
+        return k.apply(new SchemeValue.BoolVal(true));
     }
 
-    private SchemeValue notOp(List<SchemeValue> args, Environment env) throws EvalError {
-        if (args.size() != 1) throw new EvalError("not: needs exactly 1 argument");
-        return new SchemeValue.BoolVal(!eval(args.getFirst(), env).isTruthy());
+    private Bounce typePred(List<SchemeValue> a, Class<? extends SchemeValue> type, Cont k) {
+        if (a.size() != 1) throw new EvalError("type predicate: needs exactly 1 argument");
+        return k.apply(new SchemeValue.BoolVal(type.isInstance(a.getFirst())));
     }
 
     private SchemeValue quoteDatum(SchemeValue v) {
         if (v instanceof SchemeValue.ListVal list) {
-            SchemeValue result = new SchemeValue.NilVal();
-            for (int i = list.elements().size() - 1; i >= 0; i--) {
-                result = new SchemeValue.PairVal(quoteDatum(list.elements().get(i)), result);
-            }
-            return result;
+            SchemeValue r = new SchemeValue.NilVal();
+            for (int i = list.elements().size() - 1; i >= 0; i--)
+                r = new SchemeValue.PairVal(quoteDatum(list.elements().get(i)), r);
+            return r;
         }
         return v;
     }
 
-    private SchemeValue evalAppend(List<SchemeValue> args, Environment env) throws EvalError {
-        if (args.isEmpty()) return new SchemeValue.NilVal();
-        if (args.size() == 1) return eval(args.getFirst(), env);
-
-        List<SchemeValue> evaluated = new ArrayList<>();
-        for (var arg : args) {
-            evaluated.add(eval(arg, env));
-        }
-
-        SchemeValue result = evaluated.getLast();
-        for (int i = evaluated.size() - 2; i >= 0; i--) {
-            result = appendTwo(evaluated.get(i), result);
-        }
-        return result;
-    }
-
-    private SchemeValue appendTwo(SchemeValue a, SchemeValue b) throws EvalError {
+    private SchemeValue appendTwo(SchemeValue a, SchemeValue b) {
         if (a instanceof SchemeValue.NilVal) return b;
-        if (a instanceof SchemeValue.PairVal p) {
+        if (a instanceof SchemeValue.PairVal p)
             return new SchemeValue.PairVal(p.car(), appendTwo(p.cdr(), b));
-        }
         throw new EvalError("append: not a proper list");
-    }
-
-    private SchemeValue typePred(List<SchemeValue> args, Environment env, Class<? extends SchemeValue> type) throws EvalError {
-        if (args.size() != 1) throw new EvalError("type predicate: needs exactly 1 argument");
-        return new SchemeValue.BoolVal(type.isInstance(eval(args.getFirst(), env)));
-    }
-
-    private static EvalError withPos(EvalError e, int line, int col) {
-        if (line == 0 && col == 0) return e;
-        String msg = e.getMessage();
-        if (msg != null && msg.matches(".*\\d+:\\d+.*")) return e;
-        return new EvalError(msg + " at " + line + ":" + col);
-    }
-
-    private SchemeValue evalApply(List<SchemeValue> args, Environment env) throws EvalError {
-        if (args.size() < 2) throw new EvalError("apply: needs at least 2 arguments");
-        SchemeValue proc = eval(args.getFirst(), env);
-        // Last arg must be a list; prefix args are prepended
-        SchemeValue lastArg = eval(args.getLast(), env);
-        // Collect prefix args (between proc and last)
-        List<SchemeValue> allArgs = new ArrayList<>();
-        for (int i = 1; i < args.size() - 1; i++) {
-            allArgs.add(eval(args.get(i), env));
-        }
-        // Flatten the last arg (a list) into allArgs
-        SchemeValue cur = lastArg;
-        while (cur instanceof SchemeValue.PairVal p) {
-            allArgs.add(p.car());
-            cur = p.cdr();
-        }
-        // Convert allArgs to SchemeValue literals (already evaluated) and call
-        // We need to apply proc to these already-evaluated args
-        // Build a synthetic call
-        if (proc instanceof SchemeValue.LambdaVal lambda) {
-            return applyLambda(lambda, allArgs);
-        }
-        if (proc instanceof SchemeValue.SymbolVal symProc) {
-            return applyBuiltinEvaluated(symProc.name(), allArgs);
-        }
-        // Check if proc is a builtin name retrieved from env
-        throw new EvalError("apply: not a procedure: " + proc.display());
-    }
-
-    private SchemeValue applyLambda(SchemeValue.LambdaVal lambda, List<SchemeValue> evaluatedArgs) throws EvalError {
-        int nParams = lambda.params().size();
-        boolean hasRest = lambda.restParam() != null;
-        if (hasRest) {
-            if (evaluatedArgs.size() < nParams)
-                throw new EvalError("wrong number of arguments: expected at least " + nParams + ", got " + evaluatedArgs.size());
-        } else {
-            if (evaluatedArgs.size() != nParams)
-                throw new EvalError("wrong number of arguments: expected " + nParams + ", got " + evaluatedArgs.size());
-        }
-        Environment callEnv = new Environment(lambda.env());
-        for (int i = 0; i < nParams; i++) {
-            callEnv.define(lambda.params().get(i), evaluatedArgs.get(i));
-        }
-        if (hasRest) {
-            SchemeValue restList = new SchemeValue.NilVal();
-            for (int i = evaluatedArgs.size() - 1; i >= nParams; i--) {
-                restList = new SchemeValue.PairVal(evaluatedArgs.get(i), restList);
-            }
-            callEnv.define(lambda.restParam(), restList);
-        }
-        SchemeValue result = null;
-        for (var bodyExpr : lambda.body()) {
-            result = eval(bodyExpr, callEnv);
-        }
-        return result;
-    }
-
-    private SchemeValue applyBuiltinEvaluated(String name, List<SchemeValue> evaluatedArgs) throws EvalError {
-        // Wrap evaluated args so they pass through eval unchanged (they're already values)
-        List<SchemeValue> wrappedArgs = evaluatedArgs; // self-evaluating values pass through eval
-        // Create a temporary env - we don't need it since args are already evaluated
-        // But applyBuiltin expects unevaluated args + env, so we use a trick:
-        // wrap each arg in a quote
-        List<SchemeValue> quotedArgs = new ArrayList<>();
-        for (var arg : evaluatedArgs) {
-            // Create (quote arg) list
-            var quoteList = new ArrayList<SchemeValue>();
-            quoteList.add(new SchemeValue.SymbolVal("quote"));
-            quoteList.add(arg);
-            quotedArgs.add(new SchemeValue.ListVal(quoteList));
-        }
-        return applyBuiltin(name, quotedArgs, globalEnv);
     }
 
     private boolean schemeEqual(SchemeValue a, SchemeValue b) {
@@ -774,5 +681,12 @@ public class Evaluator {
         if (a instanceof SchemeValue.PairVal pa && b instanceof SchemeValue.PairVal pb)
             return schemeEqual(pa.car(), pb.car()) && schemeEqual(pa.cdr(), pb.cdr());
         return false;
+    }
+
+    private static EvalError withPos(EvalError e, int line, int col) {
+        if (line == 0 && col == 0) return e;
+        String msg = e.getMessage();
+        if (msg != null && msg.matches(".*\\d+:\\d+.*")) return e;
+        return new EvalError(msg + " at " + line + ":" + col);
     }
 }
