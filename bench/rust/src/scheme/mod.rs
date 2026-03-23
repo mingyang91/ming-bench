@@ -1916,9 +1916,13 @@ fn step_apply(func: Value, args: Vec<Value>, stack: &mut Vec<Frame>) -> Result<A
         }
         Value::Continuation(frames, target_winds) => {
             if args.is_empty() {
-                return Err(EvalError::Arity("continuation expects 1 argument".into()));
+                return Err(EvalError::Arity("continuation expects at least 1 argument".into()));
             }
-            let value = args.into_iter().next().unwrap();
+            let value = if args.len() == 1 {
+                args.into_iter().next().unwrap()
+            } else {
+                Value::MultipleValues(args)
+            };
             let current_winds = wind_stack_snapshot();
 
             // Find common prefix length
