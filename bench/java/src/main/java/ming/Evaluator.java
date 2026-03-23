@@ -13,9 +13,10 @@ public class Evaluator {
     private int gensymCounter = 0;
 
     private static final Set<String> SPECIAL_FORMS = Set.of(
-        "if", "define", "lambda", "quote", "begin", "let", "set!",
+        "if", "define", "lambda", "quote", "begin", "let", "let*", "set!",
         "cond", "and", "or", "call/cc", "call-with-current-continuation",
-        "define-syntax", "else", "syntax-rules"
+        "define-syntax", "else", "syntax-rules",
+        "letrec", "letrec*", "case", "do"
     );
 
     // --- CPS + Trampoline infrastructure ---
@@ -96,6 +97,7 @@ public class Evaluator {
             case SchemeValue.LambdaVal v -> k.apply(v);
             case SchemeValue.ContinuationVal v -> k.apply(v);
             case SchemeValue.MacroVal v -> k.apply(v);
+            case SchemeValue.VectorVal v -> k.apply(v);
             case SchemeValue.SymbolVal v -> {
                 try {
                     yield k.apply(env.get(v.name()));
@@ -129,6 +131,11 @@ public class Evaluator {
                         yield evalSeq(args, env, k);
                     }
                     case "let" -> evalLet(args, env, k);
+                    case "let*" -> evalLetStar(args, env, k);
+                    case "letrec" -> evalLetrec(args, env, k);
+                    case "letrec*" -> evalLetrecStar(args, env, k);
+                    case "case" -> evalCase(args, env, k);
+                    case "do" -> evalDo(args, env, k);
                     case "set!" -> evalSet(args, env, k);
                     case "cond" -> evalCond(args, env, k);
                     case "and" -> evalAnd(args, 0, env, k);
@@ -347,6 +354,168 @@ public class Evaluator {
         }));
     }
 
+    private Bounce evalLetStar(List<SchemeValue> args, Environment env, Cont k) {
+        if (args.size() < 2) throw new EvalError("let*: needs bindings and body");
+        if (!(args.getFirst() instanceof SchemeValue.ListVal bl))
+            throw new EvalError("let*: bindings must be a list");
+        List<SchemeValue> body = args.subList(1, args.size());
+        Environment letEnv = new Environment(env);
+        return evalLetStarBindings(bl.elements(), 0, letEnv, body, k);
+    }
+
+    private Bounce evalLetStarBindings(List<SchemeValue> bindings, int i, Environment env,
+                                        List<SchemeValue> body, Cont k) {
+        if (i >= bindings.size()) return evalSeq(body, env, k);
+        if (!(bindings.get(i) instanceof SchemeValue.ListVal pair) || pair.elements().size() != 2)
+            throw new EvalError("let*: invalid binding");
+        if (!(pair.elements().getFirst() instanceof SchemeValue.SymbolVal sym))
+            throw new EvalError("let*: binding name must be a symbol");
+        return new Bounce.More(() -> eval(pair.elements().get(1), env, val -> {
+            env.define(sym.name(), val);
+            return evalLetStarBindings(bindings, i + 1, env, body, k);
+        }));
+    }
+
+    private Bounce evalLetrec(List<SchemeValue> args, Environment env, Cont k) {
+        if (args.size() < 2) throw new EvalError("letrec: needs bindings and body");
+        if (!(args.getFirst() instanceof SchemeValue.ListVal bl))
+            throw new EvalError("letrec: bindings must be a list");
+        List<String> names = new ArrayList<>();
+        List<SchemeValue> initExprs = new ArrayList<>();
+        for (var binding : bl.elements()) {
+            if (!(binding instanceof SchemeValue.ListVal pair) || pair.elements().size() != 2)
+                throw new EvalError("letrec: invalid binding");
+            if (!(pair.elements().getFirst() instanceof SchemeValue.SymbolVal sym))
+                throw new EvalError("letrec: binding name must be a symbol");
+            names.add(sym.name());
+            initExprs.add(pair.elements().get(1));
+        }
+        Environment letEnv = new Environment(env);
+        for (String name : names) letEnv.define(name, new SchemeValue.VoidVal());
+        List<SchemeValue> body = args.subList(1, args.size());
+        return evalArgsList(initExprs, letEnv, vals -> {
+            for (int i = 0; i < names.size(); i++) letEnv.define(names.get(i), vals.get(i));
+            return evalSeq(body, letEnv, k);
+        });
+    }
+
+    private Bounce evalLetrecStar(List<SchemeValue> args, Environment env, Cont k) {
+        if (args.size() < 2) throw new EvalError("letrec*: needs bindings and body");
+        if (!(args.getFirst() instanceof SchemeValue.ListVal bl))
+            throw new EvalError("letrec*: bindings must be a list");
+        Environment letEnv = new Environment(env);
+        List<SchemeValue> body = args.subList(1, args.size());
+        return evalLetrecStarBindings(bl.elements(), 0, letEnv, body, k);
+    }
+
+    private Bounce evalLetrecStarBindings(List<SchemeValue> bindings, int i, Environment env,
+                                            List<SchemeValue> body, Cont k) {
+        if (i >= bindings.size()) return evalSeq(body, env, k);
+        if (!(bindings.get(i) instanceof SchemeValue.ListVal pair) || pair.elements().size() != 2)
+            throw new EvalError("letrec*: invalid binding");
+        if (!(pair.elements().getFirst() instanceof SchemeValue.SymbolVal sym))
+            throw new EvalError("letrec*: binding name must be a symbol");
+        env.define(sym.name(), new SchemeValue.VoidVal());
+        return new Bounce.More(() -> eval(pair.elements().get(1), env, val -> {
+            env.define(sym.name(), val);
+            return evalLetrecStarBindings(bindings, i + 1, env, body, k);
+        }));
+    }
+
+    private Bounce evalCase(List<SchemeValue> args, Environment env, Cont k) {
+        if (args.size() < 2) throw new EvalError("case: needs key and clauses");
+        return new Bounce.More(() -> eval(args.get(0), env, key ->
+            evalCaseClauses(key, args.subList(1, args.size()), env, k)));
+    }
+
+    private Bounce evalCaseClauses(SchemeValue key, List<SchemeValue> clauses,
+                                     Environment env, Cont k) {
+        if (clauses.isEmpty()) return k.apply(new SchemeValue.VoidVal());
+        var clause = clauses.getFirst();
+        if (!(clause instanceof SchemeValue.ListVal cl) || cl.elements().isEmpty())
+            throw new EvalError("case: invalid clause");
+        var datums = cl.elements().getFirst();
+        if (datums instanceof SchemeValue.SymbolVal sym && sym.name().equals("else")) {
+            if (cl.elements().size() == 1) return k.apply(new SchemeValue.VoidVal());
+            return evalSeq(cl.elements().subList(1, cl.elements().size()), env, k);
+        }
+        if (!(datums instanceof SchemeValue.ListVal datumList))
+            throw new EvalError("case: datums must be a list");
+        for (var datum : datumList.elements()) {
+            SchemeValue d = quoteDatum(datum);
+            if (schemeEqv(key, d)) {
+                if (cl.elements().size() == 1) return k.apply(new SchemeValue.VoidVal());
+                return evalSeq(cl.elements().subList(1, cl.elements().size()), env, k);
+            }
+        }
+        return evalCaseClauses(key, clauses.subList(1, clauses.size()), env, k);
+    }
+
+    private Bounce evalDo(List<SchemeValue> args, Environment env, Cont k) {
+        if (args.size() < 2) throw new EvalError("do: needs variables, test, and optional body");
+        if (!(args.get(0) instanceof SchemeValue.ListVal varSpecs))
+            throw new EvalError("do: variable specs must be a list");
+        if (!(args.get(1) instanceof SchemeValue.ListVal testClause) || testClause.elements().isEmpty())
+            throw new EvalError("do: test clause must be a non-empty list");
+
+        List<String> varNames = new ArrayList<>();
+        List<SchemeValue> initExprs = new ArrayList<>();
+        List<SchemeValue> stepExprs = new ArrayList<>(); // null means no step
+        for (var spec : varSpecs.elements()) {
+            if (!(spec instanceof SchemeValue.ListVal sv) || sv.elements().size() < 2 || sv.elements().size() > 3)
+                throw new EvalError("do: invalid variable spec");
+            if (!(sv.elements().get(0) instanceof SchemeValue.SymbolVal sym))
+                throw new EvalError("do: variable name must be a symbol");
+            varNames.add(sym.name());
+            initExprs.add(sv.elements().get(1));
+            stepExprs.add(sv.elements().size() == 3 ? sv.elements().get(2) : null);
+        }
+
+        SchemeValue testExpr = testClause.elements().get(0);
+        List<SchemeValue> resultExprs = testClause.elements().subList(1, testClause.elements().size());
+        List<SchemeValue> body = args.subList(2, args.size());
+
+        return evalArgsList(initExprs, env, initVals -> {
+            Environment doEnv = new Environment(env);
+            for (int i = 0; i < varNames.size(); i++) doEnv.define(varNames.get(i), initVals.get(i));
+            return doLoop(varNames, stepExprs, testExpr, resultExprs, body, doEnv, k);
+        });
+    }
+
+    private Bounce doLoop(List<String> varNames, List<SchemeValue> stepExprs,
+                           SchemeValue testExpr, List<SchemeValue> resultExprs,
+                           List<SchemeValue> body, Environment doEnv, Cont k) {
+        return new Bounce.More(() -> eval(testExpr, doEnv, testVal -> {
+            if (testVal.isTruthy()) {
+                if (resultExprs.isEmpty()) return k.apply(new SchemeValue.VoidVal());
+                return evalSeq(resultExprs, doEnv, k);
+            }
+            // Execute body (for side effects), then step
+            Cont afterBody = _v -> {
+                // Evaluate all step expressions using current env (parallel)
+                List<SchemeValue> stepExprList = new ArrayList<>();
+                List<Integer> stepIndices = new ArrayList<>();
+                for (int i = 0; i < stepExprs.size(); i++) {
+                    if (stepExprs.get(i) != null) {
+                        stepExprList.add(stepExprs.get(i));
+                        stepIndices.add(i);
+                    }
+                }
+                if (stepExprList.isEmpty()) {
+                    return doLoop(varNames, stepExprs, testExpr, resultExprs, body, doEnv, k);
+                }
+                return evalArgsList(stepExprList, doEnv, stepVals -> {
+                    for (int j = 0; j < stepIndices.size(); j++) {
+                        doEnv.define(varNames.get(stepIndices.get(j)), stepVals.get(j));
+                    }
+                    return doLoop(varNames, stepExprs, testExpr, resultExprs, body, doEnv, k);
+                });
+            };
+            if (body.isEmpty()) return afterBody.apply(new SchemeValue.VoidVal());
+            return evalSeq(body, doEnv, afterBody);
+        }));
+    }
+
     private Bounce evalCallCC(List<SchemeValue> args, Environment env, Cont k) {
         if (args.size() != 1) throw new EvalError("call/cc: needs exactly 1 argument");
         return new Bounce.More(() -> eval(args.get(0), env, proc -> {
@@ -423,7 +592,7 @@ public class Evaluator {
         "cons", "car", "cdr", "null?", "list", "length", "append",
         "string?", "number?", "boolean?", "pair?", "symbol?", "char?",
         "zero?", "positive?", "negative?", "abs", "min", "max",
-        "equal?", "eq?", "modulo", "remainder", "even?", "odd?",
+        "equal?", "eq?", "eqv?", "modulo", "remainder", "even?", "odd?",
         "quotient", "expt",
         "list-ref", "list-tail", "list?", "assoc", "map",
         "display", "write", "newline",
@@ -437,6 +606,8 @@ public class Evaluator {
         "char-upcase", "char-downcase", "char=?", "char<?",
         "string=?", "string<?", "string-ci=?",
         "string-upcase", "string-downcase",
+        "vector", "make-vector", "vector-ref", "vector-set!",
+        "vector-length", "vector?", "vector->list", "list->vector",
         "apply", "call/cc", "call-with-current-continuation"
     );
 
@@ -546,9 +717,17 @@ public class Evaluator {
                 for (int i = 1; i < a.size(); i++) m = Math.max(m, asInt(a.get(i)));
                 yield k.apply(new SchemeValue.IntVal(m));
             }
-            case "equal?", "eq?" -> {
-                if (a.size() != 2) throw new EvalError(name + ": needs exactly 2 arguments");
+            case "equal?" -> {
+                if (a.size() != 2) throw new EvalError("equal?: needs exactly 2 arguments");
                 yield k.apply(new SchemeValue.BoolVal(schemeEqual(a.get(0), a.get(1))));
+            }
+            case "eq?" -> {
+                if (a.size() != 2) throw new EvalError("eq?: needs exactly 2 arguments");
+                yield k.apply(new SchemeValue.BoolVal(schemeEqv(a.get(0), a.get(1))));
+            }
+            case "eqv?" -> {
+                if (a.size() != 2) throw new EvalError("eqv?: needs exactly 2 arguments");
+                yield k.apply(new SchemeValue.BoolVal(schemeEqv(a.get(0), a.get(1))));
             }
             case "modulo" -> {
                 if (a.size() != 2) throw new EvalError("modulo: needs exactly 2 arguments");
@@ -795,6 +974,51 @@ public class Evaluator {
             case "integer->char" -> {
                 if (a.size() != 1) throw new EvalError("integer->char: needs exactly 1 argument");
                 yield k.apply(new SchemeValue.CharVal((char) asInt(a.getFirst())));
+            }
+            case "vector" -> {
+                var elems = new SchemeValue[a.size()];
+                for (int i = 0; i < a.size(); i++) elems[i] = a.get(i);
+                yield k.apply(new SchemeValue.VectorVal(elems));
+            }
+            case "make-vector" -> {
+                if (a.size() < 1 || a.size() > 2) throw new EvalError("make-vector: needs 1 or 2 arguments");
+                int sz = (int) asInt(a.get(0));
+                SchemeValue fill = a.size() == 2 ? a.get(1) : new SchemeValue.IntVal(0);
+                yield k.apply(new SchemeValue.VectorVal(sz, fill));
+            }
+            case "vector-ref" -> {
+                if (a.size() != 2) throw new EvalError("vector-ref: needs exactly 2 arguments");
+                if (!(a.get(0) instanceof SchemeValue.VectorVal vec)) throw new EvalError("vector-ref: not a vector");
+                yield k.apply(vec.get((int) asInt(a.get(1))));
+            }
+            case "vector-set!" -> {
+                if (a.size() != 3) throw new EvalError("vector-set!: needs exactly 3 arguments");
+                if (!(a.get(0) instanceof SchemeValue.VectorVal vec)) throw new EvalError("vector-set!: not a vector");
+                vec.set((int) asInt(a.get(1)), a.get(2));
+                yield k.apply(new SchemeValue.VoidVal());
+            }
+            case "vector-length" -> {
+                if (a.size() != 1) throw new EvalError("vector-length: needs exactly 1 argument");
+                if (!(a.getFirst() instanceof SchemeValue.VectorVal vec)) throw new EvalError("vector-length: not a vector");
+                yield k.apply(new SchemeValue.IntVal(vec.length()));
+            }
+            case "vector?" -> {
+                if (a.size() != 1) throw new EvalError("vector?: needs exactly 1 argument");
+                yield k.apply(new SchemeValue.BoolVal(a.getFirst() instanceof SchemeValue.VectorVal));
+            }
+            case "vector->list" -> {
+                if (a.size() != 1) throw new EvalError("vector->list: needs exactly 1 argument");
+                if (!(a.getFirst() instanceof SchemeValue.VectorVal vec)) throw new EvalError("vector->list: not a vector");
+                SchemeValue result = new SchemeValue.NilVal();
+                for (int i = vec.length() - 1; i >= 0; i--) result = new SchemeValue.PairVal(vec.get(i), result);
+                yield k.apply(result);
+            }
+            case "list->vector" -> {
+                if (a.size() != 1) throw new EvalError("list->vector: needs exactly 1 argument");
+                List<SchemeValue> elems = new ArrayList<>();
+                SchemeValue cur = a.getFirst();
+                while (cur instanceof SchemeValue.PairVal p) { elems.add(p.car()); cur = p.cdr(); }
+                yield k.apply(new SchemeValue.VectorVal(elems.toArray(new SchemeValue[0])));
             }
             case "apply" -> {
                 if (a.size() < 2) throw new EvalError("apply: needs at least 2 arguments");
@@ -1070,10 +1294,28 @@ public class Evaluator {
         if (a instanceof SchemeValue.BoolVal ba && b instanceof SchemeValue.BoolVal bb) return ba.value() == bb.value();
         if (a instanceof SchemeValue.StringVal sa && b instanceof SchemeValue.StringVal sb) return sa.value().equals(sb.value());
         if (a instanceof SchemeValue.SymbolVal sa && b instanceof SchemeValue.SymbolVal sb) return sa.name().equals(sb.name());
+        if (a instanceof SchemeValue.CharVal ca && b instanceof SchemeValue.CharVal cb) return ca.value() == cb.value();
         if (a instanceof SchemeValue.NilVal && b instanceof SchemeValue.NilVal) return true;
         if (a instanceof SchemeValue.PairVal pa && b instanceof SchemeValue.PairVal pb)
             return schemeEqual(pa.car(), pb.car()) && schemeEqual(pa.cdr(), pb.cdr());
+        if (a instanceof SchemeValue.VectorVal va && b instanceof SchemeValue.VectorVal vb) {
+            if (va.length() != vb.length()) return false;
+            for (int i = 0; i < va.length(); i++)
+                if (!schemeEqual(va.get(i), vb.get(i))) return false;
+            return true;
+        }
+        if (a instanceof SchemeValue.VoidVal && b instanceof SchemeValue.VoidVal) return true;
         return false;
+    }
+
+    private boolean schemeEqv(SchemeValue a, SchemeValue b) {
+        if (a instanceof SchemeValue.IntVal ia && b instanceof SchemeValue.IntVal ib) return ia.value() == ib.value();
+        if (a instanceof SchemeValue.BoolVal ba && b instanceof SchemeValue.BoolVal bb) return ba.value() == bb.value();
+        if (a instanceof SchemeValue.SymbolVal sa && b instanceof SchemeValue.SymbolVal sb) return sa.name().equals(sb.name());
+        if (a instanceof SchemeValue.CharVal ca && b instanceof SchemeValue.CharVal cb) return ca.value() == cb.value();
+        if (a instanceof SchemeValue.NilVal && b instanceof SchemeValue.NilVal) return true;
+        if (a instanceof SchemeValue.VoidVal && b instanceof SchemeValue.VoidVal) return true;
+        return a == b; // reference identity for mutable types
     }
 
     private static EvalError withPos(EvalError e, int line, int col) {

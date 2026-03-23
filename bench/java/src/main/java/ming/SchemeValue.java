@@ -98,6 +98,27 @@ public sealed interface SchemeValue {
         @Override public String display() { return "#<continuation>"; }
     }
 
+    final class VectorVal implements SchemeValue {
+        private final SchemeValue[] elements;
+        public VectorVal(SchemeValue[] elements) { this.elements = elements; }
+        public VectorVal(int size, SchemeValue fill) {
+            this.elements = new SchemeValue[size];
+            java.util.Arrays.fill(this.elements, fill);
+        }
+        public SchemeValue get(int i) { return elements[i]; }
+        public void set(int i, SchemeValue v) { elements[i] = v; }
+        public int length() { return elements.length; }
+        @Override public String display() {
+            var sb = new StringBuilder("#(");
+            for (int i = 0; i < elements.length; i++) {
+                if (i > 0) sb.append(' ');
+                sb.append(elements[i].display());
+            }
+            sb.append(')');
+            return sb.toString();
+        }
+    }
+
     record MacroVal(java.util.List<String> literals,
                     java.util.List<java.util.List<SchemeValue>> rules,
                     Environment defEnv) implements SchemeValue {

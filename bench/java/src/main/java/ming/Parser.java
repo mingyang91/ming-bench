@@ -130,6 +130,17 @@ public class Parser {
             pos++;
             return new SchemeValue.CharVal(ch);
         }
+        if (next == '(') {
+            pos++; // skip #
+            // parse as list then convert to vector literal form: (vector ...)
+            var list = parseList();
+            if (!(list instanceof SchemeValue.ListVal lv))
+                throw new EvalError("unexpected #(");
+            var elems = new ArrayList<SchemeValue>();
+            elems.add(new SchemeValue.SymbolVal("vector"));
+            elems.addAll(lv.elements());
+            return new SchemeValue.ListVal(elems);
+        }
         throw new EvalError("unexpected #" + next);
     }
 
