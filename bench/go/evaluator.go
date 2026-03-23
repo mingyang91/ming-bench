@@ -78,6 +78,15 @@ type value struct {
 	syntaxExpr *expr
 	// macro transformer (lambda-based, for syntax-case macros)
 	macroTransformer *value
+	// case-lambda clauses
+	caseClauses []caseClause
+}
+
+// caseClause represents one clause in a case-lambda
+type caseClause struct {
+	params    []string
+	restParam string
+	body      []*expr
 }
 
 // recordType holds metadata for a define-record-type
@@ -743,6 +752,9 @@ func (ip *interp) eval(e *expr, envir *env) (*value, error) {
 				case "lambda":
 					return evalLambda(e, envir)
 
+				case "case-lambda":
+					return evalCaseLambda(e, envir)
+
 				case "let":
 					newE, newEnvir, err := ip.setupLet(e, envir)
 					if err != nil {
@@ -1313,6 +1325,37 @@ func (ip *interp) evalWithExceptionHandler(e *expr, envir *env) (*value, error) 
 }
 
 func bindLambdaArgs(fn *value, args []*value, line, col int) (*env, error) {
+	// case-lambda: find matching clause
+	if fn.caseClauses != nil {
+		for _, cl := range fn.caseClauses {
+			if cl.restParam == "" {
+				if len(args) != len(cl.params) {
+					continue
+				}
+			} else {
+				if len(args) < len(cl.params) {
+					continue
+				}
+			}
+			// Match found — bind and set body on fn for caller to use
+			localEnv := newEnv(fn.closure)
+			for i, p := range cl.params {
+				localEnv.set(p, args[i])
+			}
+			if cl.restParam != "" {
+				rest := nilVal
+				for i := len(args) - 1; i >= len(cl.params); i-- {
+					rest = &value{typ: valPair, car: args[i], cdr: rest}
+				}
+				localEnv.set(cl.restParam, rest)
+			}
+			// Set the body on fn so callers can access it for TCO
+			fn.body = cl.body
+			return localEnv, nil
+		}
+		return nil, &EvalError{Message: fmt.Sprintf("%d:%d: wrong number of arguments: no matching clause for %d args", line, col, len(args))}
+	}
+
 	if fn.restParam == "" {
 		if len(args) != len(fn.params) {
 			return nil, &EvalError{Message: fmt.Sprintf("%d:%d: wrong number of arguments: expected %d, got %d", line, col, len(fn.params), len(args))}
@@ -1547,6 +1590,32 @@ func evalLambda(e *expr, envir *env) (*value, error) {
 		restParam: restParam,
 		body:      e.items[2:],
 		closure:   envir,
+	}, nil
+}
+
+func evalCaseLambda(e *expr, envir *env) (*value, error) {
+	if len(e.items) < 2 {
+		return nil, &EvalError{Message: fmt.Sprintf("%d:%d: case-lambda: bad syntax", e.line, e.col)}
+	}
+	var clauses []caseClause
+	for _, clause := range e.items[1:] {
+		if clause.kind != "list" || len(clause.items) < 2 {
+			return nil, &EvalError{Message: fmt.Sprintf("%d:%d: case-lambda: bad clause", e.line, e.col)}
+		}
+		params, restParam, perr := parseLambdaParams(clause.items[0])
+		if perr != nil {
+			return nil, &EvalError{Message: fmt.Sprintf("%d:%d: case-lambda: %s", e.line, e.col, perr)}
+		}
+		clauses = append(clauses, caseClause{
+			params:    params,
+			restParam: restParam,
+			body:      clause.items[1:],
+		})
+	}
+	return &value{
+		typ:         valLambda,
+		caseClauses: clauses,
+		closure:     envir,
 	}, nil
 }
 
