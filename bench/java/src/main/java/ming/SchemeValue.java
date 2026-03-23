@@ -81,7 +81,10 @@ public sealed interface SchemeValue {
         }
     }
 
-    record LambdaVal(java.util.List<String> params, java.util.List<SchemeValue> body, Environment env) implements SchemeValue {
+    record LambdaVal(java.util.List<String> params, String restParam, java.util.List<SchemeValue> body, Environment env) implements SchemeValue {
+        public LambdaVal(java.util.List<String> params, java.util.List<SchemeValue> body, Environment env) {
+            this(params, null, body, env);
+        }
         @Override public String display() { return "#<procedure>"; }
     }
 

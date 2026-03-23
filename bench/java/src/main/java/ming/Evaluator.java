@@ -49,6 +49,7 @@ public class Evaluator {
                     try {
                         return env.get(v.name());
                     } catch (EvalError e) {
+                        if (isBuiltin(v.name())) return new SchemeValue.SymbolVal(v.name());
                         throw withPos(e, v.line(), v.col());
                     }
                 }
@@ -162,12 +163,26 @@ public class Evaluator {
                         }
                     }
                     if (proc instanceof SchemeValue.LambdaVal lambda) {
-                        if (args.size() != lambda.params().size())
-                            throw withPos(new EvalError("wrong number of arguments: expected " + lambda.params().size() + ", got " + args.size()), list.line(), list.col());
+                        int nParams = lambda.params().size();
+                        boolean hasRest = lambda.restParam() != null;
+                        if (hasRest) {
+                            if (args.size() < nParams)
+                                throw withPos(new EvalError("wrong number of arguments: expected at least " + nParams + ", got " + args.size()), list.line(), list.col());
+                        } else {
+                            if (args.size() != nParams)
+                                throw withPos(new EvalError("wrong number of arguments: expected " + nParams + ", got " + args.size()), list.line(), list.col());
+                        }
                         Environment callEnv = new Environment(lambda.env());
                         try {
-                            for (int i = 0; i < lambda.params().size(); i++) {
+                            for (int i = 0; i < nParams; i++) {
                                 callEnv.define(lambda.params().get(i), eval(args.get(i), env));
+                            }
+                            if (hasRest) {
+                                SchemeValue restList = new SchemeValue.NilVal();
+                                for (int i = args.size() - 1; i >= nParams; i--) {
+                                    restList = new SchemeValue.PairVal(eval(args.get(i), env), restList);
+                                }
+                                callEnv.define(lambda.restParam(), restList);
                             }
                         } catch (EvalError e) {
                             throw withPos(e, list.line(), list.col());
@@ -199,13 +214,23 @@ public class Evaluator {
             if (!(nameVal instanceof SchemeValue.SymbolVal nameSym))
                 throw new EvalError("define: name must be a symbol");
             List<String> params = new ArrayList<>();
-            for (int i = 1; i < nameAndParams.elements().size(); i++) {
-                if (!(nameAndParams.elements().get(i) instanceof SchemeValue.SymbolVal p))
+            String restParam = null;
+            var elems = nameAndParams.elements();
+            for (int i = 1; i < elems.size(); i++) {
+                if (elems.get(i) instanceof SchemeValue.SymbolVal p && p.name().equals(".")) {
+                    if (i + 1 >= elems.size() || i + 2 < elems.size())
+                        throw new EvalError("define: invalid dot syntax");
+                    if (!(elems.get(i + 1) instanceof SchemeValue.SymbolVal restSym))
+                        throw new EvalError("define: rest parameter must be a symbol");
+                    restParam = restSym.name();
+                    break;
+                }
+                if (!(elems.get(i) instanceof SchemeValue.SymbolVal p))
                     throw new EvalError("define: parameter must be a symbol");
                 params.add(p.name());
             }
             List<SchemeValue> body = args.subList(1, args.size());
-            var lambda = new SchemeValue.LambdaVal(params, body, env);
+            var lambda = new SchemeValue.LambdaVal(params, restParam, body, env);
             env.define(nameSym.name(), lambda);
             return new SchemeValue.VoidVal();
         }
@@ -218,13 +243,23 @@ public class Evaluator {
         if (!(paramList instanceof SchemeValue.ListVal plist))
             throw new EvalError("lambda: params must be a list");
         List<String> params = new ArrayList<>();
-        for (var p : plist.elements()) {
-            if (!(p instanceof SchemeValue.SymbolVal sym))
+        String restParam = null;
+        var elems = plist.elements();
+        for (int i = 0; i < elems.size(); i++) {
+            if (elems.get(i) instanceof SchemeValue.SymbolVal sym && sym.name().equals(".")) {
+                if (i + 1 >= elems.size() || i + 2 < elems.size())
+                    throw new EvalError("lambda: invalid dot syntax");
+                if (!(elems.get(i + 1) instanceof SchemeValue.SymbolVal restSym))
+                    throw new EvalError("lambda: rest parameter must be a symbol");
+                restParam = restSym.name();
+                break;
+            }
+            if (!(elems.get(i) instanceof SchemeValue.SymbolVal sym))
                 throw new EvalError("lambda: parameter must be a symbol");
             params.add(sym.name());
         }
         List<SchemeValue> body = args.subList(1, args.size());
-        return new SchemeValue.LambdaVal(params, body, env);
+        return new SchemeValue.LambdaVal(params, restParam, body, env);
     }
 
     // Returns [expr, env] for the trampoline to continue with
@@ -342,7 +377,8 @@ public class Evaluator {
         "string-append", "string-length", "substring",
         "string->number", "number->string",
         "symbol->string", "string->symbol", "string-ref",
-        "string-set!", "string-copy"
+        "string-set!", "string-copy",
+        "apply"
     );
 
     private boolean isBuiltin(String name) {
@@ -547,6 +583,7 @@ public class Evaluator {
                 if (!(v instanceof SchemeValue.StringVal s)) throw new EvalError("string-copy: not a string");
                 yield s.copy();
             }
+            case "apply" -> evalApply(args, env);
             default -> throw new EvalError("unknown procedure: " + name);
         };
     }
@@ -652,6 +689,80 @@ public class Evaluator {
         String msg = e.getMessage();
         if (msg != null && msg.matches(".*\\d+:\\d+.*")) return e;
         return new EvalError(msg + " at " + line + ":" + col);
+    }
+
+    private SchemeValue evalApply(List<SchemeValue> args, Environment env) throws EvalError {
+        if (args.size() < 2) throw new EvalError("apply: needs at least 2 arguments");
+        SchemeValue proc = eval(args.getFirst(), env);
+        // Last arg must be a list; prefix args are prepended
+        SchemeValue lastArg = eval(args.getLast(), env);
+        // Collect prefix args (between proc and last)
+        List<SchemeValue> allArgs = new ArrayList<>();
+        for (int i = 1; i < args.size() - 1; i++) {
+            allArgs.add(eval(args.get(i), env));
+        }
+        // Flatten the last arg (a list) into allArgs
+        SchemeValue cur = lastArg;
+        while (cur instanceof SchemeValue.PairVal p) {
+            allArgs.add(p.car());
+            cur = p.cdr();
+        }
+        // Convert allArgs to SchemeValue literals (already evaluated) and call
+        // We need to apply proc to these already-evaluated args
+        // Build a synthetic call
+        if (proc instanceof SchemeValue.LambdaVal lambda) {
+            return applyLambda(lambda, allArgs);
+        }
+        if (proc instanceof SchemeValue.SymbolVal symProc) {
+            return applyBuiltinEvaluated(symProc.name(), allArgs);
+        }
+        // Check if proc is a builtin name retrieved from env
+        throw new EvalError("apply: not a procedure: " + proc.display());
+    }
+
+    private SchemeValue applyLambda(SchemeValue.LambdaVal lambda, List<SchemeValue> evaluatedArgs) throws EvalError {
+        int nParams = lambda.params().size();
+        boolean hasRest = lambda.restParam() != null;
+        if (hasRest) {
+            if (evaluatedArgs.size() < nParams)
+                throw new EvalError("wrong number of arguments: expected at least " + nParams + ", got " + evaluatedArgs.size());
+        } else {
+            if (evaluatedArgs.size() != nParams)
+                throw new EvalError("wrong number of arguments: expected " + nParams + ", got " + evaluatedArgs.size());
+        }
+        Environment callEnv = new Environment(lambda.env());
+        for (int i = 0; i < nParams; i++) {
+            callEnv.define(lambda.params().get(i), evaluatedArgs.get(i));
+        }
+        if (hasRest) {
+            SchemeValue restList = new SchemeValue.NilVal();
+            for (int i = evaluatedArgs.size() - 1; i >= nParams; i--) {
+                restList = new SchemeValue.PairVal(evaluatedArgs.get(i), restList);
+            }
+            callEnv.define(lambda.restParam(), restList);
+        }
+        SchemeValue result = null;
+        for (var bodyExpr : lambda.body()) {
+            result = eval(bodyExpr, callEnv);
+        }
+        return result;
+    }
+
+    private SchemeValue applyBuiltinEvaluated(String name, List<SchemeValue> evaluatedArgs) throws EvalError {
+        // Wrap evaluated args so they pass through eval unchanged (they're already values)
+        List<SchemeValue> wrappedArgs = evaluatedArgs; // self-evaluating values pass through eval
+        // Create a temporary env - we don't need it since args are already evaluated
+        // But applyBuiltin expects unevaluated args + env, so we use a trick:
+        // wrap each arg in a quote
+        List<SchemeValue> quotedArgs = new ArrayList<>();
+        for (var arg : evaluatedArgs) {
+            // Create (quote arg) list
+            var quoteList = new ArrayList<SchemeValue>();
+            quoteList.add(new SchemeValue.SymbolVal("quote"));
+            quoteList.add(arg);
+            quotedArgs.add(new SchemeValue.ListVal(quoteList));
+        }
+        return applyBuiltin(name, quotedArgs, globalEnv);
     }
 
     private boolean schemeEqual(SchemeValue a, SchemeValue b) {
