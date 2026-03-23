@@ -16,6 +16,7 @@ public sealed interface SchemeValue {
     record BuiltinVal(String name) implements SchemeValue {}
     record Thunk(SchemeValue expr, Environment env) implements SchemeValue {}
     record ContinuationVal(Continuation cont) implements SchemeValue {}
+    record SyntaxRulesVal(List<String> literals, List<SchemeValue> patterns, List<SchemeValue> templates, Environment defEnv) implements SchemeValue {}
 
     default SourcePos sourcePos() {
         return switch (this) {
@@ -29,6 +30,7 @@ public sealed interface SchemeValue {
             case BuiltinVal v -> SourcePos.NONE;
             case Thunk v -> SourcePos.NONE;
             case ContinuationVal v -> SourcePos.NONE;
+            case SyntaxRulesVal v -> SourcePos.NONE;
         };
     }
 
@@ -58,6 +60,7 @@ public sealed interface SchemeValue {
             case BuiltinVal v -> "#<procedure>";
             case Thunk v -> "#<thunk>";
             case ContinuationVal v -> "#<continuation>";
+            case SyntaxRulesVal v -> "#<macro>";
         };
     }
 
@@ -77,6 +80,7 @@ public sealed interface SchemeValue {
             }
             case Thunk v -> "#<thunk>";
             case ContinuationVal v -> "#<continuation>";
+            case SyntaxRulesVal v -> "#<macro>";
             default -> display();
         };
     }
