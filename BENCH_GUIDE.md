@@ -292,7 +292,7 @@ cargo xtask results                    # list results (with LANG column)
 cargo xtask tokens --all               # token usage + costs
 cargo xtask analyze --all              # request-level cost analysis
 cargo xtask watch                      # live dashboard
-cargo xtask verify                     # guile ground-truth checks
+cargo xtask verify                     # Chez Scheme ground-truth checks
 cargo xtask session-turns <run>        # per-level analysis
 cargo xtask compare <run1> <run2>      # side-by-side comparison
 ```
