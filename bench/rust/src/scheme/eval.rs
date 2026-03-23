@@ -2,6 +2,7 @@ use std::rc::Rc;
 use crate::scheme::env::Env;
 use crate::scheme::error::{ErrorKind, EvalError, Span};
 use crate::scheme::parser::{Expr, ExprKind};
+use crate::scheme::macros;
 use crate::scheme::value::{CapturedCont, Value};
 
 // ── continuation frames ──────────────────────────────────────
@@ -121,7 +122,19 @@ fn step_eval_list(
             "or" => return step_or(&elems[1..], env, k),
             "let" => return step_let(&elems[1..], env, k),
             "cond" => return step_cond(&elems[1..], env, k),
+            "define-syntax" => return step_define_syntax(&elems[1..], env),
             _ => {}
+        }
+        // Check for macro invocation
+        if let Some(Value::SyntaxRules {
+            ref literals,
+            ref rules,
+            ref def_env,
+        }) = env.get(name)
+        {
+            let (expanded, new_env) =
+                macros::expand_macro(literals, rules, def_env, &elems[1..], env, span)?;
+            return Ok(State::Eval(expanded, new_env));
         }
     }
     // Function call: evaluate function position first, then args.
@@ -360,6 +373,105 @@ fn step_cond(clauses: &[Expr], env: &Rc<Env>, k: &mut Vec<Frame>) -> Result<Stat
         }
     }
     Ok(State::Ret(Value::Void))
+}
+
+fn step_define_syntax(args: &[Expr], env: &Rc<Env>) -> Result<State, EvalError> {
+    if args.len() != 2 {
+        return Err(ErrorKind::BadSyntax {
+            form: "define-syntax".into(),
+            message: "expected (define-syntax name (syntax-rules ...))".into(),
+        }
+        .into());
+    }
+    let name = match &args[0].kind {
+        ExprKind::Symbol(s) => s.clone(),
+        _ => {
+            return Err(ErrorKind::BadSyntax {
+                form: "define-syntax".into(),
+                message: "name must be a symbol".into(),
+            }
+            .into())
+        }
+    };
+    let val = parse_syntax_rules(&args[1], env)?;
+    env.define(name, val);
+    Ok(State::Ret(Value::Void))
+}
+
+fn parse_syntax_rules(expr: &Expr, env: &Rc<Env>) -> Result<Value, EvalError> {
+    let elems = match &expr.kind {
+        ExprKind::List(e) => e,
+        _ => {
+            return Err(ErrorKind::BadSyntax {
+                form: "syntax-rules".into(),
+                message: "expected (syntax-rules ...)".into(),
+            }
+            .into())
+        }
+    };
+    if elems.is_empty() || !matches!(&elems[0].kind, ExprKind::Symbol(s) if s == "syntax-rules") {
+        return Err(ErrorKind::BadSyntax {
+            form: "define-syntax".into(),
+            message: "expected syntax-rules".into(),
+        }
+        .into());
+    }
+    if elems.len() < 2 {
+        return Err(ErrorKind::BadSyntax {
+            form: "syntax-rules".into(),
+            message: "missing literals list".into(),
+        }
+        .into());
+    }
+    let literals = match &elems[1].kind {
+        ExprKind::List(lits) => lits
+            .iter()
+            .map(|e| match &e.kind {
+                ExprKind::Symbol(s) => Ok(s.clone()),
+                _ => Err(EvalError::from(ErrorKind::BadSyntax {
+                    form: "syntax-rules".into(),
+                    message: "literal must be a symbol".into(),
+                })),
+            })
+            .collect::<Result<Vec<_>, _>>()?,
+        _ => {
+            return Err(ErrorKind::BadSyntax {
+                form: "syntax-rules".into(),
+                message: "expected literals list".into(),
+            }
+            .into())
+        }
+    };
+    let mut rules = Vec::new();
+    for clause in &elems[2..] {
+        match &clause.kind {
+            ExprKind::List(parts) if parts.len() == 2 => {
+                let pattern = match &parts[0].kind {
+                    ExprKind::List(pat) if !pat.is_empty() => pat[1..].to_vec(),
+                    _ => {
+                        return Err(ErrorKind::BadSyntax {
+                            form: "syntax-rules".into(),
+                            message: "pattern must be (name ...)".into(),
+                        }
+                        .into())
+                    }
+                };
+                rules.push((pattern, parts[1].clone()));
+            }
+            _ => {
+                return Err(ErrorKind::BadSyntax {
+                    form: "syntax-rules".into(),
+                    message: "each rule must be (pattern template)".into(),
+                }
+                .into())
+            }
+        }
+    }
+    Ok(Value::SyntaxRules {
+        literals,
+        rules,
+        def_env: Rc::clone(env),
+    })
 }
 
 // ── step_ret ─────────────────────────────────────────────────
@@ -655,6 +767,10 @@ fn step_apply(
             *k = frames.clone();
             Ok(State::Ret(val))
         }
+        Value::SyntaxRules { .. } => Err(ErrorKind::NotAProcedure {
+            value: "#<macro>".into(),
+        }
+        .into()),
         other => Err(ErrorKind::NotAProcedure {
             value: other.to_display_string(),
         }

@@ -33,6 +33,11 @@ pub enum Value {
         closure_env: Rc<Env>,
     },
     Continuation(CapturedCont),
+    SyntaxRules {
+        literals: Vec<String>,
+        rules: Vec<(Vec<Expr>, Expr)>,
+        def_env: Rc<Env>,
+    },
 }
 
 impl Value {
@@ -54,6 +59,7 @@ impl PartialEq for Value {
             (Value::Void, Value::Void) => true,
             (Value::Builtin(a), Value::Builtin(b)) => a == b,
             (Value::Continuation(_), Value::Continuation(_)) => false,
+            (Value::SyntaxRules { .. }, Value::SyntaxRules { .. }) => false,
             _ => false,
         }
     }
@@ -77,6 +83,7 @@ impl Value {
             Value::Builtin(name) => format!("#<procedure:{}>", name),
             Value::Lambda { .. } => "#<procedure>".into(),
             Value::Continuation(_) => "#<continuation>".into(),
+            Value::SyntaxRules { .. } => "#<macro>".into(),
         }
     }
 
@@ -89,6 +96,7 @@ impl Value {
                 format!("({})", inner.join(" "))
             }
             Value::Continuation(_) => "#<continuation>".into(),
+            Value::SyntaxRules { .. } => "#<macro>".into(),
             other => other.to_display_string(),
         }
     }

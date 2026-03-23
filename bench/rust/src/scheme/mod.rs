@@ -6,6 +6,7 @@ mod value;
 mod parser;
 mod env;
 mod eval;
+mod macros;
 
 use env::Env;
 use eval::eval_top_level;
