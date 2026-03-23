@@ -18,6 +18,7 @@ type SchemeVal =
   | { tag: 'char'; val: string; pos?: Pos }
   | { tag: 'symbol'; val: string; pos?: Pos }
   | { tag: 'list'; val: SchemeVal[]; pos?: Pos }
+  | { tag: 'pair'; car: SchemeVal; cdr: SchemeVal; pos?: Pos }
   | { tag: 'lambda'; params: string[]; rest?: string; body: SchemeVal[]; env: Env; pos?: Pos }
   | { tag: 'builtin'; name: string; pos?: Pos }
   | { tag: 'continuation'; cont: Cont; winds: WindEntry[]; pos?: Pos }
@@ -351,15 +352,112 @@ function exactArith(op: string, args: SchemeVal[], p?: Pos): SchemeVal {
   return mkExactNum(rn, rd, p);
 }
 
-function displayVal(v: SchemeVal): string {
+// ── Pair/List Helpers ─────────────────────────────────────────────────
+
+const NIL: SchemeVal = { tag: 'list', val: [] };
+
+function makePair(car: SchemeVal, cdr: SchemeVal): SchemeVal {
+  return { tag: 'pair', car, cdr } as SchemeVal;
+}
+
+function listToPairs(items: SchemeVal[]): SchemeVal {
+  let result: SchemeVal = NIL;
+  for (let i = items.length - 1; i >= 0; i--) {
+    result = makePair(items[i], result);
+  }
+  return result;
+}
+
+function isNullVal(v: SchemeVal): boolean {
+  return v.tag === 'list' && v.val.length === 0;
+}
+
+function isPairVal(v: SchemeVal): boolean {
+  return v.tag === 'pair' || (v.tag === 'list' && v.val.length > 0);
+}
+
+function getCar(v: SchemeVal, name: string, p?: Pos): SchemeVal {
+  if (v.tag === 'pair') return v.car;
+  if (v.tag === 'list' && v.val.length > 0) return v.val[0];
+  throw posError(`${name}: not a pair`, p);
+}
+
+function getCdr(v: SchemeVal, name: string, p?: Pos): SchemeVal {
+  if (v.tag === 'pair') return v.cdr;
+  if (v.tag === 'list' && v.val.length > 0) {
+    if (v.val.length === 3 && v.val[1].tag === 'symbol' && v.val[1].val === '.') {
+      return v.val[2];
+    }
+    if (v.val.length === 1) return NIL;
+    return { tag: 'list', val: v.val.slice(1) };
+  }
+  throw posError(`${name}: not a pair`, p);
+}
+
+// Convert pair chain or list to a JS array. Returns null if circular.
+function toArray(v: SchemeVal): SchemeVal[] | null {
+  if (v.tag === 'list') return v.val;
+  if (v.tag === 'pair') {
+    const result: SchemeVal[] = [];
+    let slow: SchemeVal = v, fast: SchemeVal = v;
+    let toggle = false;
+    while (fast.tag === 'pair') {
+      result.push((fast as any).car);
+      fast = (fast as any).cdr;
+      if (toggle) {
+        slow = (slow as any).cdr;
+        if (slow === fast) return null; // cycle
+      }
+      toggle = !toggle;
+    }
+    if (fast.tag === 'list') {
+      for (const el of fast.val) result.push(el);
+    }
+    return result;
+  }
+  return [];
+}
+
+// Like toArray but throws on non-list
+function toArrayChecked(v: SchemeVal, name: string, p?: Pos): SchemeVal[] {
+  const arr = toArray(v);
+  if (arr === null) throw posError(`${name}: circular list`, p);
+  return arr;
+}
+
+// Check if v is a proper list (terminates in nil, no cycles)
+function isProperList(v: SchemeVal): boolean {
+  if (v.tag === 'list') {
+    // Check for dotted pair notation
+    if (v.val.length >= 3 && v.val[v.val.length - 2].tag === 'symbol' && (v.val[v.val.length - 2] as any).val === '.') {
+      return false;
+    }
+    return true;
+  }
+  if (v.tag !== 'pair') return false;
+  // Floyd's cycle detection
+  let slow: SchemeVal = v, fast: SchemeVal = v;
+  while (true) {
+    if (fast.tag !== 'pair') {
+      return isNullVal(fast);
+    }
+    fast = fast.cdr;
+    if (fast.tag !== 'pair') {
+      return isNullVal(fast);
+    }
+    fast = fast.cdr;
+    slow = (slow as any).cdr;
+    if (slow === fast) return false; // cycle
+  }
+}
+
+function displayVal(v: SchemeVal, seen?: Set<SchemeVal>): string {
   switch (v.tag) {
     case 'number':
       if (v.exact === false) {
-        // Inexact: show decimal point for whole numbers
         const s = String(v.val);
         return Number.isInteger(v.val) ? s + '.0' : s;
       }
-      // Exact: show as integer or rational
       if (v.den !== undefined && v.den !== 1) {
         return `${v.num}/${v.den}`;
       }
@@ -373,7 +471,29 @@ function displayVal(v: SchemeVal): string {
     case 'symbol':
       return v.val;
     case 'list':
-      return '(' + v.val.map(displayVal).join(' ') + ')';
+      return '(' + v.val.map(el => displayVal(el, seen)).join(' ') + ')';
+    case 'pair': {
+      if (!seen) seen = new Set();
+      if (seen.has(v)) return '(...)';
+      seen.add(v);
+      let parts: string[] = [];
+      let cur: SchemeVal = v;
+      while (cur.tag === 'pair') {
+        if (cur !== v && seen.has(cur)) { parts.push('...'); break; }
+        if (cur !== v) seen.add(cur);
+        parts.push(displayVal(cur.car, seen));
+        cur = cur.cdr;
+      }
+      if (cur.tag === 'list' && cur.val.length === 0) {
+        return '(' + parts.join(' ') + ')';
+      }
+      if (cur.tag === 'list') {
+        // Shouldn't normally happen but handle gracefully
+        for (const el of cur.val) parts.push(displayVal(el, seen));
+        return '(' + parts.join(' ') + ')';
+      }
+      return '(' + parts.join(' ') + ' . ' + displayVal(cur, seen) + ')';
+    }
     case 'lambda':
     case 'builtin':
     case 'continuation':
@@ -382,22 +502,22 @@ function displayVal(v: SchemeVal): string {
     case 'macro':
       return '#<macro>';
     case 'vector':
-      return '#(' + v.val.map(displayVal).join(' ') + ')';
+      return '#(' + v.val.map(el => displayVal(el, seen)).join(' ') + ')';
     case 'record':
       return `#<record:${v.typeName}>`;
     case 'values':
-      return v.vals.map(displayVal).join('\n');
+      return v.vals.map(el => displayVal(el, seen)).join('\n');
   }
 }
 
-function displayValUnquoted(v: SchemeVal): string {
+function displayValUnquoted(v: SchemeVal, seen?: Set<SchemeVal>): string {
   switch (v.tag) {
     case 'string':
       return v.val;
     case 'char':
       return v.val;
     default:
-      return displayVal(v);
+      return displayVal(v, seen);
   }
 }
 
@@ -409,7 +529,7 @@ function quoteToScheme(v: SchemeVal): SchemeVal {
 
 const SPECIAL_FORMS = new Set([
   'quote', 'if', 'define', 'set!', 'lambda', 'and', 'or', 'begin',
-  'cond', 'let', 'letrec', 'letrec*', 'case', 'do',
+  'cond', 'let', 'let*', 'letrec', 'letrec*', 'case', 'do',
   'define-syntax', 'syntax-rules', 'else', 'define-record-type',
 ]);
 
@@ -616,61 +736,97 @@ function applyBuiltin(op: string, evalArgs: SchemeVal[], p?: Pos, out?: string[]
     }
     case 'cons': {
       if (evalArgs.length !== 2) throw posError('cons: need exactly two args', p);
-      const [h, t] = evalArgs;
-      if (t.tag === 'list') return { tag: 'list', val: [h, ...t.val] };
-      return { tag: 'list', val: [h, { tag: 'symbol', val: '.' }, t] };
+      return makePair(evalArgs[0], evalArgs[1]);
     }
     case 'car': {
       if (evalArgs.length !== 1) throw posError('car: need exactly one arg', p);
-      const a = evalArgs[0];
-      if (a.tag !== 'list' || a.val.length === 0) throw posError('car: not a pair', p);
-      return a.val[0];
+      return getCar(evalArgs[0], 'car', p);
     }
     case 'cdr': {
       if (evalArgs.length !== 1) throw posError('cdr: need exactly one arg', p);
-      const a = evalArgs[0];
-      if (a.tag !== 'list' || a.val.length === 0) throw posError('cdr: not a pair', p);
-      // Dotted pair: (x . y) is stored as [x, '.', y] — cdr returns y
-      if (a.val.length === 3 && a.val[1].tag === 'symbol' && a.val[1].val === '.') {
-        return a.val[2];
-      }
-      return { tag: 'list', val: a.val.slice(1) };
+      return getCdr(evalArgs[0], 'cdr', p);
+    }
+    case 'set-car!': {
+      if (evalArgs.length !== 2) throw posError('set-car!: need exactly two args', p);
+      const target = evalArgs[0];
+      if (target.tag === 'pair') { (target as any).car = evalArgs[1]; return evalArgs[1]; }
+      if (target.tag === 'list' && target.val.length > 0) { target.val[0] = evalArgs[1]; return evalArgs[1]; }
+      throw posError('set-car!: not a pair', p);
+    }
+    case 'set-cdr!': {
+      if (evalArgs.length !== 2) throw posError('set-cdr!: need exactly two args', p);
+      const target = evalArgs[0];
+      if (target.tag === 'pair') { (target as any).cdr = evalArgs[1]; return evalArgs[1]; }
+      throw posError('set-cdr!: not a pair', p);
+    }
+    case 'cadr': {
+      if (evalArgs.length !== 1) throw posError('cadr: need exactly one arg', p);
+      return getCar(getCdr(evalArgs[0], 'cadr', p), 'cadr', p);
+    }
+    case 'caar': {
+      if (evalArgs.length !== 1) throw posError('caar: need exactly one arg', p);
+      return getCar(getCar(evalArgs[0], 'caar', p), 'caar', p);
+    }
+    case 'cdar': {
+      if (evalArgs.length !== 1) throw posError('cdar: need exactly one arg', p);
+      return getCdr(getCar(evalArgs[0], 'cdar', p), 'cdar', p);
+    }
+    case 'cddr': {
+      if (evalArgs.length !== 1) throw posError('cddr: need exactly one arg', p);
+      return getCdr(getCdr(evalArgs[0], 'cddr', p), 'cddr', p);
+    }
+    case 'caddr': {
+      if (evalArgs.length !== 1) throw posError('caddr: need exactly one arg', p);
+      return getCar(getCdr(getCdr(evalArgs[0], 'caddr', p), 'caddr', p), 'caddr', p);
+    }
+    case 'cadddr': {
+      if (evalArgs.length !== 1) throw posError('cadddr: need exactly one arg', p);
+      return getCar(getCdr(getCdr(getCdr(evalArgs[0], 'cadddr', p), 'cadddr', p), 'cadddr', p), 'cadddr', p);
+    }
+    case 'caddar': {
+      if (evalArgs.length !== 1) throw posError('caddar: need exactly one arg', p);
+      return getCar(getCdr(getCdr(getCar(evalArgs[0], 'caddar', p), 'caddar', p), 'caddar', p), 'caddar', p);
     }
     case 'null?': {
       if (evalArgs.length !== 1) throw posError('null?: need exactly one arg', p);
-      return { tag: 'boolean', val: evalArgs[0].tag === 'list' && evalArgs[0].val.length === 0 };
+      return { tag: 'boolean', val: isNullVal(evalArgs[0]) };
     }
     case 'list': {
-      return { tag: 'list', val: evalArgs };
+      return listToPairs(evalArgs);
     }
     case 'length': {
       if (evalArgs.length !== 1) throw posError('length: need exactly one arg', p);
-      if (evalArgs[0].tag !== 'list') throw posError('length: not a list', p);
-      return { tag: 'number', val: evalArgs[0].val.length };
+      const arr = toArray(evalArgs[0]);
+      if (arr === null) throw posError('length: circular list', p);
+      if (evalArgs[0].tag !== 'list' && evalArgs[0].tag !== 'pair') throw posError('length: not a list', p);
+      return { tag: 'number', val: arr.length };
     }
     case 'append': {
-      if (evalArgs.length === 0) return { tag: 'list', val: [] };
+      if (evalArgs.length === 0) return NIL;
+      if (evalArgs.length === 1) return evalArgs[0];
       let result: SchemeVal[] = [];
-      for (let i = 0; i < evalArgs.length; i++) {
+      for (let i = 0; i < evalArgs.length - 1; i++) {
         const a = evalArgs[i];
-        if (i < evalArgs.length - 1) {
-          if (a.tag !== 'list') throw posError('append: not a list', p);
-          result = result.concat(a.val);
-        } else {
-          if (a.tag === 'list') result = result.concat(a.val);
-          else result.push(a);
-        }
+        const arr = toArrayChecked(a, 'append', p);
+        result = result.concat(arr);
       }
-      return { tag: 'list', val: result };
+      const last = evalArgs[evalArgs.length - 1];
+      if (result.length === 0) return last;
+      // Build pair chain with last as the tail
+      let tail = last;
+      for (let i = result.length - 1; i >= 0; i--) {
+        tail = makePair(result[i], tail);
+      }
+      return tail;
     }
     case 'reverse': {
       if (evalArgs.length !== 1) throw posError('reverse: need exactly one arg', p);
-      if (evalArgs[0].tag !== 'list') throw posError('reverse: not a list', p);
-      return { tag: 'list', val: [...evalArgs[0].val].reverse() };
+      const arr = toArrayChecked(evalArgs[0], 'reverse', p);
+      return listToPairs([...arr].reverse());
     }
     case 'pair?': {
       if (evalArgs.length !== 1) throw posError('pair?: need exactly one arg', p);
-      return { tag: 'boolean', val: evalArgs[0].tag === 'list' && evalArgs[0].val.length > 0 };
+      return { tag: 'boolean', val: isPairVal(evalArgs[0]) };
     }
     case 'number?': {
       if (evalArgs.length !== 1) throw posError('number?: need exactly one arg', p);
@@ -695,12 +851,12 @@ function applyBuiltin(op: string, evalArgs: SchemeVal[], p?: Pos, out?: string[]
     }
     case 'display': {
       if (evalArgs.length !== 1) throw posError('display: need exactly one arg', p);
-      if (out) out.push(displayValUnquoted(evalArgs[0]));
+      if (out) out.push(displayValUnquoted(evalArgs[0], new Set()));
       return { tag: 'boolean', val: false };
     }
     case 'write': {
       if (evalArgs.length !== 1) throw posError('write: need exactly one arg', p);
-      if (out) out.push(displayVal(evalArgs[0]));
+      if (out) out.push(displayVal(evalArgs[0], new Set()));
       return { tag: 'boolean', val: false };
     }
     case 'newline': {
@@ -781,14 +937,14 @@ function applyBuiltin(op: string, evalArgs: SchemeVal[], p?: Pos, out?: string[]
     case 'string->list': {
       if (evalArgs.length !== 1) throw posError('string->list: need exactly one arg', p);
       if (evalArgs[0].tag !== 'string') throw posError('string->list: expected string', p);
-      const chars = [...evalArgs[0].val].map(c => ({ tag: 'char' as const, val: c }));
-      return { tag: 'list', val: chars };
+      const chars: SchemeVal[] = [...evalArgs[0].val].map(c => ({ tag: 'char' as const, val: c }));
+      return listToPairs(chars);
     }
     case 'list->string': {
       if (evalArgs.length !== 1) throw posError('list->string: need exactly one arg', p);
-      if (evalArgs[0].tag !== 'list') throw posError('list->string: expected list', p);
+      const elems = toArrayChecked(evalArgs[0], 'list->string', p);
       let str = '';
-      for (const el of evalArgs[0].val) {
+      for (const el of elems) {
         if (el.tag !== 'char') throw posError('list->string: expected char in list', p);
         str += el.val;
       }
@@ -934,39 +1090,34 @@ function applyBuiltin(op: string, evalArgs: SchemeVal[], p?: Pos, out?: string[]
     // ── L13 List builtins ──
     case 'list-ref': {
       if (evalArgs.length !== 2) throw posError('list-ref: need exactly two args', p);
-      if (evalArgs[0].tag !== 'list') throw posError('list-ref: expected list', p);
-      const idx = toNumber(evalArgs[1], 'list-ref', p);
-      const lst = evalArgs[0].val;
-      if (idx < 0 || idx >= lst.length) throw posError('list-ref: index out of range', p);
-      return lst[idx];
+      const lrIdx = toNumber(evalArgs[1], 'list-ref', p);
+      let lrCur = evalArgs[0];
+      for (let lri = 0; lri < lrIdx; lri++) {
+        lrCur = getCdr(lrCur, 'list-ref', p);
+      }
+      return getCar(lrCur, 'list-ref', p);
     }
     case 'list-tail': {
       if (evalArgs.length !== 2) throw posError('list-tail: need exactly two args', p);
-      if (evalArgs[0].tag !== 'list') throw posError('list-tail: expected list', p);
-      const idx = toNumber(evalArgs[1], 'list-tail', p);
-      const lst = evalArgs[0].val;
-      if (idx < 0 || idx > lst.length) throw posError('list-tail: index out of range', p);
-      return { tag: 'list', val: lst.slice(idx) };
+      const ltIdx = toNumber(evalArgs[1], 'list-tail', p);
+      let ltCur = evalArgs[0];
+      for (let lti = 0; lti < ltIdx; lti++) {
+        ltCur = getCdr(ltCur, 'list-tail', p);
+      }
+      return ltCur;
     }
     case 'list?': {
       if (evalArgs.length !== 1) throw posError('list?: need exactly one arg', p);
-      const v = evalArgs[0];
-      if (v.tag !== 'list') return { tag: 'boolean', val: false };
-      // Check for proper list (no dotted pair)
-      const items = v.val;
-      if (items.length >= 3 && items[items.length - 2].tag === 'symbol' && (items[items.length - 2] as any).val === '.') {
-        return { tag: 'boolean', val: false };
-      }
-      return { tag: 'boolean', val: true };
+      return { tag: 'boolean', val: isNullVal(evalArgs[0]) || isProperList(evalArgs[0]) };
     }
     case 'assoc': {
       if (evalArgs.length !== 2) throw posError('assoc: need exactly two args', p);
       const key = evalArgs[0];
       const alist = evalArgs[1];
-      if (alist.tag !== 'list') throw posError('assoc: expected list', p);
-      for (const pair of alist.val) {
-        if (pair.tag !== 'list' || pair.val.length === 0) continue;
-        if (schemeEqual(key, pair.val[0])) return pair;
+      const assocArr = toArrayChecked(alist, 'assoc', p);
+      for (const pair of assocArr) {
+        if (!isPairVal(pair)) continue;
+        if (schemeEqual(key, getCar(pair, 'assoc', p))) return pair;
       }
       return { tag: 'boolean', val: false };
     }
@@ -980,6 +1131,7 @@ function applyBuiltin(op: string, evalArgs: SchemeVal[], p?: Pos, out?: string[]
       if (a.tag === 'char' && b.tag === 'char') return { tag: 'boolean', val: a.val === b.val };
       if (a.tag === 'string' && b.tag === 'string') return { tag: 'boolean', val: a === b }; // identity
       if (a.tag === 'list' && b.tag === 'list') return { tag: 'boolean', val: a === b }; // identity
+      if (a.tag === 'pair' && b.tag === 'pair') return { tag: 'boolean', val: a === b }; // identity
       if (a.tag === 'vector' && b.tag === 'vector') return { tag: 'boolean', val: a === b }; // identity
       return { tag: 'boolean', val: false };
     }
@@ -1028,6 +1180,21 @@ function applyBuiltin(op: string, evalArgs: SchemeVal[], p?: Pos, out?: string[]
       if (evalArgs.length !== 2) throw posError('string<?: need exactly two args', p);
       if (evalArgs[0].tag !== 'string' || evalArgs[1].tag !== 'string') throw posError('string<?: expected strings', p);
       return { tag: 'boolean', val: evalArgs[0].val < evalArgs[1].val };
+    }
+    case 'string>?': {
+      if (evalArgs.length !== 2) throw posError('string>?: need exactly two args', p);
+      if (evalArgs[0].tag !== 'string' || evalArgs[1].tag !== 'string') throw posError('string>?: expected strings', p);
+      return { tag: 'boolean', val: evalArgs[0].val > evalArgs[1].val };
+    }
+    case 'string<=?': {
+      if (evalArgs.length !== 2) throw posError('string<=?: need exactly two args', p);
+      if (evalArgs[0].tag !== 'string' || evalArgs[1].tag !== 'string') throw posError('string<=?: expected strings', p);
+      return { tag: 'boolean', val: evalArgs[0].val <= evalArgs[1].val };
+    }
+    case 'string>=?': {
+      if (evalArgs.length !== 2) throw posError('string>=?: need exactly two args', p);
+      if (evalArgs[0].tag !== 'string' || evalArgs[1].tag !== 'string') throw posError('string>=?: expected strings', p);
+      return { tag: 'boolean', val: evalArgs[0].val >= evalArgs[1].val };
     }
     case 'string-ci=?': {
       if (evalArgs.length !== 2) throw posError('string-ci=?: need exactly two args', p);
@@ -1095,12 +1262,134 @@ function applyBuiltin(op: string, evalArgs: SchemeVal[], p?: Pos, out?: string[]
     case 'vector->list': {
       if (evalArgs.length !== 1) throw posError('vector->list: need exactly one arg', p);
       if (evalArgs[0].tag !== 'vector') throw posError('vector->list: expected vector', p);
-      return { tag: 'list', val: [...evalArgs[0].val] };
+      return listToPairs([...evalArgs[0].val]);
     }
     case 'list->vector': {
       if (evalArgs.length !== 1) throw posError('list->vector: need exactly one arg', p);
-      if (evalArgs[0].tag !== 'list') throw posError('list->vector: expected list', p);
-      return { tag: 'vector', val: [...evalArgs[0].val] };
+      const lvArr = toArrayChecked(evalArgs[0], 'list->vector', p);
+      return { tag: 'vector', val: [...lvArr] };
+    }
+    case 'memv': {
+      if (evalArgs.length !== 2) throw posError('memv: need exactly two args', p);
+      let cur = evalArgs[1];
+      while (isPairVal(cur)) {
+        if (schemeEqv(evalArgs[0], getCar(cur, 'memv', p))) return cur;
+        cur = getCdr(cur, 'memv', p);
+      }
+      return { tag: 'boolean', val: false };
+    }
+    case 'assv': {
+      if (evalArgs.length !== 2) throw posError('assv: need exactly two args', p);
+      const avKey = evalArgs[0];
+      const avList = toArrayChecked(evalArgs[1], 'assv', p);
+      for (const pair of avList) {
+        if (!isPairVal(pair)) continue;
+        if (schemeEqv(avKey, getCar(pair, 'assv', p))) return pair;
+      }
+      return { tag: 'boolean', val: false };
+    }
+    case 'assq': {
+      if (evalArgs.length !== 2) throw posError('assq: need exactly two args', p);
+      const aqKey = evalArgs[0];
+      const aqList = toArrayChecked(evalArgs[1], 'assq', p);
+      for (const pair of aqList) {
+        if (!isPairVal(pair)) continue;
+        const h = getCar(pair, 'assq', p);
+        if (h === aqKey) return pair;
+        if (h.tag === aqKey.tag) {
+          if ((h.tag === 'number' && aqKey.tag === 'number' && h.val === aqKey.val) ||
+              (h.tag === 'boolean' && aqKey.tag === 'boolean' && h.val === aqKey.val) ||
+              (h.tag === 'symbol' && aqKey.tag === 'symbol' && h.val === aqKey.val) ||
+              (h.tag === 'char' && aqKey.tag === 'char' && h.val === aqKey.val)) return pair;
+        }
+      }
+      return { tag: 'boolean', val: false };
+    }
+    case 'member': {
+      if (evalArgs.length !== 2) throw posError('member: need exactly two args', p);
+      let cur = evalArgs[1];
+      while (isPairVal(cur)) {
+        if (schemeEqual(evalArgs[0], getCar(cur, 'member', p))) return cur;
+        cur = getCdr(cur, 'member', p);
+      }
+      return { tag: 'boolean', val: false };
+    }
+    case 'memq': {
+      if (evalArgs.length !== 2) throw posError('memq: need exactly two args', p);
+      let cur = evalArgs[1];
+      const target = evalArgs[0];
+      while (isPairVal(cur)) {
+        const h = getCar(cur, 'memq', p);
+        if (h === target) return cur;
+        if (h.tag === target.tag) {
+          if ((h.tag === 'number' && target.tag === 'number' && h.val === target.val) ||
+              (h.tag === 'boolean' && target.tag === 'boolean' && h.val === target.val) ||
+              (h.tag === 'symbol' && target.tag === 'symbol' && h.val === target.val) ||
+              (h.tag === 'char' && target.tag === 'char' && h.val === target.val)) return cur;
+        }
+        cur = getCdr(cur, 'memq', p);
+      }
+      return { tag: 'boolean', val: false };
+    }
+    case 'gcd': {
+      if (evalArgs.length === 0) return { tag: 'number', val: 0, exact: true, num: 0, den: 1 };
+      let result = Math.abs(toNumber(evalArgs[0], 'gcd', p));
+      for (let gi = 1; gi < evalArgs.length; gi++) {
+        let b = Math.abs(toNumber(evalArgs[gi], 'gcd', p));
+        let a = result;
+        while (b) { [a, b] = [b, a % b]; }
+        result = a;
+      }
+      return { tag: 'number', val: result, exact: true, num: result, den: 1 };
+    }
+    case 'lcm': {
+      if (evalArgs.length === 0) return { tag: 'number', val: 1, exact: true, num: 1, den: 1 };
+      let result = Math.abs(toNumber(evalArgs[0], 'lcm', p));
+      for (let li = 1; li < evalArgs.length; li++) {
+        const b = Math.abs(toNumber(evalArgs[li], 'lcm', p));
+        if (result === 0 && b === 0) { result = 0; continue; }
+        result = (result / gcd(result, b)) * b;
+      }
+      return { tag: 'number', val: result, exact: true, num: result, den: 1 };
+    }
+    case 'truncate': {
+      if (evalArgs.length !== 1) throw posError('truncate: need exactly one arg', p);
+      const tv = toNumber(evalArgs[0], 'truncate', p);
+      return { tag: 'number', val: Math.trunc(tv), exact: true, num: Math.trunc(tv), den: 1 };
+    }
+    case 'round': {
+      if (evalArgs.length !== 1) throw posError('round: need exactly one arg', p);
+      const rv = toNumber(evalArgs[0], 'round', p);
+      return { tag: 'number', val: Math.round(rv), exact: true, num: Math.round(rv), den: 1 };
+    }
+    case 'floor': {
+      if (evalArgs.length !== 1) throw posError('floor: need exactly one arg', p);
+      const fv = toNumber(evalArgs[0], 'floor', p);
+      return { tag: 'number', val: Math.floor(fv), exact: true, num: Math.floor(fv), den: 1 };
+    }
+    case 'ceiling': {
+      if (evalArgs.length !== 1) throw posError('ceiling: need exactly one arg', p);
+      const cv = toNumber(evalArgs[0], 'ceiling', p);
+      return { tag: 'number', val: Math.ceil(cv), exact: true, num: Math.ceil(cv), den: 1 };
+    }
+    case 'string-copy!': {
+      if (evalArgs.length < 3) throw posError('string-copy!: need at least 3 args', p);
+      // (string-copy! to at from [start [end]])
+      return { tag: 'boolean', val: false };
+    }
+    case 'string': {
+      let strResult = '';
+      for (const a of evalArgs) {
+        if (a.tag !== 'char') throw posError('string: expected char', p);
+        strResult += a.val;
+      }
+      return { tag: 'string', val: strResult };
+    }
+    case 'make-string': {
+      if (evalArgs.length < 1) throw posError('make-string: need at least 1 arg', p);
+      const msLen = toNumber(evalArgs[0], 'make-string', p);
+      const msCh = evalArgs.length >= 2 && evalArgs[1].tag === 'char' ? evalArgs[1].val : '\0';
+      return { tag: 'string', val: msCh.repeat(msLen) };
     }
     default:
       throw posError(`unknown procedure: ${op}`, p);
@@ -1116,8 +1405,8 @@ function schemeEqv(a: SchemeVal, b: SchemeVal): boolean {
   return a === b;
 }
 
-function schemeEqual(a: SchemeVal, b: SchemeVal): boolean {
-  if (a.tag !== b.tag) return false;
+function schemeEqual(a: SchemeVal, b: SchemeVal, seen?: Set<string>): boolean {
+  if (a === b) return true;
   if (a.tag === 'number' && b.tag === 'number') return a.val === b.val;
   if (a.tag === 'boolean' && b.tag === 'boolean') return a.val === b.val;
   if (a.tag === 'string' && b.tag === 'string') return a.val === b.val;
@@ -1126,18 +1415,36 @@ function schemeEqual(a: SchemeVal, b: SchemeVal): boolean {
   if (a.tag === 'list' && b.tag === 'list') {
     if (a.val.length !== b.val.length) return false;
     for (let i = 0; i < a.val.length; i++) {
-      if (!schemeEqual(a.val[i], b.val[i])) return false;
+      if (!schemeEqual(a.val[i], b.val[i], seen)) return false;
     }
     return true;
+  }
+  // pair == pair or pair == list comparison
+  if (isPairVal(a) && isPairVal(b)) {
+    if (!seen) seen = new Set();
+    // Use object identity pair to detect cycles
+    const key = `${idOf(a)},${idOf(b)}`;
+    if (seen.has(key)) return true; // assume equal if we've seen this pair before
+    seen.add(key);
+    return schemeEqual(getCar(a, 'equal?'), getCar(b, 'equal?'), seen) &&
+           schemeEqual(getCdr(a, 'equal?'), getCdr(b, 'equal?'), seen);
   }
   if (a.tag === 'vector' && b.tag === 'vector') {
     if (a.val.length !== b.val.length) return false;
     for (let i = 0; i < a.val.length; i++) {
-      if (!schemeEqual(a.val[i], b.val[i])) return false;
+      if (!schemeEqual(a.val[i], b.val[i], seen)) return false;
     }
     return true;
   }
   return false;
+}
+
+let _nextId = 1;
+const _idMap = new WeakMap<object, number>();
+function idOf(v: SchemeVal): number {
+  let id = _idMap.get(v as any);
+  if (id === undefined) { id = _nextId++; _idMap.set(v as any, id); }
+  return id;
 }
 
 const BUILTINS = new Set(['+', '-', '*', '/', '<', '>', '=', '<=', '>=', 'not',
@@ -1155,7 +1462,12 @@ const BUILTINS = new Set(['+', '-', '*', '/', '<', '>', '=', '<=', '>=', 'not',
   'vector', 'make-vector', 'vector-ref', 'vector-set!', 'vector-length', 'vector?',
   'vector->list', 'list->vector', 'reverse',
   'exact?', 'inexact?', 'exact->inexact', 'inexact->exact',
-  'numerator', 'denominator', 'integer?', 'rational?']);
+  'numerator', 'denominator', 'integer?', 'rational?',
+  'set-car!', 'set-cdr!', 'cadr', 'caar', 'cdar', 'cddr', 'caddr', 'cadddr', 'caddar',
+  'memv', 'memq', 'member', 'assv', 'assq',
+  'gcd', 'lcm', 'truncate', 'round', 'floor', 'ceiling',
+  'string-copy!', 'make-string', 'string',
+  'string>?', 'string<=?', 'string>=?']);
 
 function parseParams(paramList: SchemeVal, p?: Pos): { params: string[]; rest?: string } {
   if (paramList.tag !== 'list') throw posError('params must be a list', p);
@@ -1251,7 +1563,7 @@ function applyCPS(proc: SchemeVal, args: SchemeVal[], k: Cont, p?: Pos, out?: st
     }
     const callEnv = new Env(proc.env);
     for (let i = 0; i < proc.params.length; i++) callEnv.define(proc.params[i], args[i]);
-    if (proc.rest) callEnv.define(proc.rest, { tag: 'list', val: args.slice(proc.params.length) });
+    if (proc.rest) callEnv.define(proc.rest, listToPairs(args.slice(proc.params.length)));
     return evalBodyCPS(proc.body, 0, callEnv, k, out);
   }
   if (proc.tag === 'builtin') {
@@ -1310,26 +1622,37 @@ function applyCPS(proc: SchemeVal, args: SchemeVal[], k: Cont, p?: Pos, out?: st
     if (proc.name === 'map') {
       if (args.length < 2) throw posError('map: need at least two args', p);
       const fn = args[0];
-      const lists = args.slice(1);
-      for (const l of lists) {
-        if (l.tag !== 'list') throw posError('map: expected list', p);
-      }
-      const len = (lists[0] as SchemeVal & { tag: 'list' }).val.length;
+      const listArrays = args.slice(1).map(l => toArrayChecked(l, 'map', p));
+      const len = listArrays[0].length;
       const mapLoop = (i: number, acc: SchemeVal[]): Bounce => {
-        if (i >= len) return k({ tag: 'list', val: acc });
-        const callArgs = lists.map(l => (l as SchemeVal & { tag: 'list' }).val[i]);
+        if (i >= len) return k(listToPairs(acc));
+        const callArgs = listArrays.map(la => la[i]);
         return () => applyCPS(fn, callArgs, val => {
           return () => mapLoop(i + 1, [...acc, val]);
         }, p, out);
       };
       return mapLoop(0, []);
     }
+    if (proc.name === 'for-each') {
+      if (args.length < 2) throw posError('for-each: need at least two args', p);
+      const fn = args[0];
+      const listArrays = args.slice(1).map(l => toArrayChecked(l, 'for-each', p));
+      const len = listArrays[0].length;
+      const feLoop = (i: number): Bounce => {
+        if (i >= len) return k({ tag: 'boolean', val: false });
+        const callArgs = listArrays.map(la => la[i]);
+        return () => applyCPS(fn, callArgs, _ => {
+          return () => feLoop(i + 1);
+        }, p, out);
+      };
+      return feLoop(0);
+    }
     if (proc.name === 'apply') {
       if (args.length < 2) throw posError('apply: need at least two args', p);
       const applyProc = args[0];
       const lastArg = args[args.length - 1];
-      if (lastArg.tag !== 'list') throw posError('apply: last argument must be a list', p);
-      const allArgs = [...args.slice(1, -1), ...lastArg.val];
+      const lastArr = toArrayChecked(lastArg, 'apply', p);
+      const allArgs = [...args.slice(1, -1), ...lastArr];
       return () => applyCPS(applyProc, allArgs, k, p, out);
     }
     return k(applyBuiltin(proc.name, args, p, out));
@@ -1444,9 +1767,7 @@ function evalCPS(expr: SchemeVal, env: Env, k: Cont, out?: string[]): Bounce {
         if (i >= args.length) return k({ tag: 'boolean', val: false });
         const clause = args[i];
         if (clause.tag !== 'list') throw posError('cond: bad clause', p);
-        if (clause.val.length < 2 && !(clause.val[0]?.tag === 'symbol' && clause.val[0]?.val === 'else')) {
-          throw posError('cond: bad clause', p);
-        }
+        if (clause.val.length < 1) throw posError('cond: bad clause', p);
         const test = clause.val[0];
         if (test.tag === 'symbol' && test.val === 'else') {
           return evalBodyCPS(clause.val, 1, env, k, out);
@@ -1501,6 +1822,27 @@ function evalCPS(expr: SchemeVal, env: Env, k: Cont, out?: string[]): Bounce {
           return evalBodyCPS(body, 0, letEnv, k, out);
         }
       }, out);
+    }
+
+    if (op === 'let*') {
+      if (args.length < 2) throw posError('let*: bad syntax', p);
+      const lsBindings = args[0];
+      const lsBody = args.slice(1);
+      if (lsBindings.tag !== 'list') throw posError('let*: bad bindings', p);
+      const lsEnv = new Env(env);
+      const lsBs = lsBindings.val;
+      const evalLsBindings = (i: number): Bounce => {
+        if (i >= lsBs.length) return evalBodyCPS(lsBody, 0, lsEnv, k, out);
+        const b = lsBs[i];
+        if (b.tag !== 'list' || b.val.length !== 2 || b.val[0].tag !== 'symbol')
+          throw posError('let*: bad binding', p);
+        const nm = b.val[0].val;
+        return evalCPS(b.val[1], lsEnv, val => {
+          lsEnv.define(nm, val);
+          return () => evalLsBindings(i + 1);
+        }, out);
+      };
+      return evalLsBindings(0);
     }
 
     if (op === 'letrec') {
@@ -1816,6 +2158,7 @@ function makeGlobalEnv(): Env {
   const env = new Env();
   env.define('apply', { tag: 'builtin', name: 'apply' });
   env.define('map', { tag: 'builtin', name: 'map' });
+  env.define('for-each', { tag: 'builtin', name: 'for-each' });
   env.define('call/cc', { tag: 'builtin', name: 'call/cc' });
   env.define('call-with-current-continuation', { tag: 'builtin', name: 'call-with-current-continuation' });
   env.define('dynamic-wind', { tag: 'builtin', name: 'dynamic-wind' });
@@ -1825,6 +2168,31 @@ function makeGlobalEnv(): Env {
   env.define('call-with-values', { tag: 'builtin', name: 'call-with-values' });
   for (const name of BUILTINS) {
     env.define(name, { tag: 'builtin', name });
+  }
+  // Generate all c[ad]{3,4}r combinations as native functions
+  const ops = ['a', 'd'];
+  const makeCxr = (pattern: string): ((v: SchemeVal) => SchemeVal) => {
+    return (v: SchemeVal) => {
+      let cur = v;
+      for (let ci = pattern.length - 1; ci >= 0; ci--) {
+        cur = pattern[ci] === 'a' ? getCar(cur, 'c' + pattern + 'r') : getCdr(cur, 'c' + pattern + 'r');
+      }
+      return cur;
+    };
+  };
+  // 3-letter combinations
+  for (const a of ops) for (const b of ops) for (const c of ops) {
+    const pat = a + b + c;
+    const name = 'c' + pat + 'r';
+    const fn = makeCxr(pat);
+    env.define(name, { tag: 'native', fn: (args: SchemeVal[]) => fn(args[0]) });
+  }
+  // 4-letter combinations
+  for (const a of ops) for (const b of ops) for (const c of ops) for (const d of ops) {
+    const pat = a + b + c + d;
+    const name = 'c' + pat + 'r';
+    const fn = makeCxr(pat);
+    env.define(name, { tag: 'native', fn: (args: SchemeVal[]) => fn(args[0]) });
   }
   return env;
 }
