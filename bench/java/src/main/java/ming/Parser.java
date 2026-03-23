@@ -12,6 +12,15 @@ public class Parser {
         this.pos = 0;
     }
 
+    private SourcePos currentSourcePos() {
+        int line = 1, col = 1;
+        for (int i = 0; i < pos; i++) {
+            if (input.charAt(i) == '\n') { line++; col = 1; }
+            else col++;
+        }
+        return new SourcePos(line, col);
+    }
+
     public List<SchemeValue> parseAll() throws EvalError {
         List<SchemeValue> exprs = new ArrayList<>();
         skipWhitespace();
@@ -29,9 +38,10 @@ public class Parser {
         char c = input.charAt(pos);
 
         if (c == '\'') {
+            SourcePos sp = currentSourcePos();
             pos++; // skip quote char
             SchemeValue quoted = parseExpr();
-            return new SchemeValue.ListVal(List.of(new SchemeValue.SymbolVal("quote"), quoted));
+            return new SchemeValue.ListVal(List.of(new SchemeValue.SymbolVal("quote", sp), quoted), sp);
         } else if (c == '(') {
             return parseList();
         } else if (c == '"') {
@@ -44,6 +54,7 @@ public class Parser {
     }
 
     private SchemeValue parseList() throws EvalError {
+        SourcePos sp = currentSourcePos();
         pos++; // skip '('
         List<SchemeValue> elements = new ArrayList<>();
         skipWhitespace();
@@ -53,10 +64,11 @@ public class Parser {
         }
         if (pos >= input.length()) throw new EvalError("unterminated list");
         pos++; // skip ')'
-        return new SchemeValue.ListVal(elements);
+        return new SchemeValue.ListVal(elements, sp);
     }
 
     private SchemeValue parseString() throws EvalError {
+        SourcePos sp = currentSourcePos();
         pos++; // skip opening '"'
         var sb = new StringBuilder();
         while (pos < input.length() && input.charAt(pos) != '"') {
@@ -78,22 +90,24 @@ public class Parser {
         }
         if (pos >= input.length()) throw new EvalError("unterminated string");
         pos++; // skip closing '"'
-        return new SchemeValue.StringVal(sb.toString());
+        return new SchemeValue.StringVal(sb.toString(), sp);
     }
 
     private SchemeValue parseHash() throws EvalError {
+        SourcePos sp = currentSourcePos();
         pos++; // skip '#'
         if (pos >= input.length()) throw new EvalError("unexpected end after #");
         char c = input.charAt(pos);
         pos++;
         return switch (c) {
-            case 't' -> new SchemeValue.BoolVal(true);
-            case 'f' -> new SchemeValue.BoolVal(false);
+            case 't' -> new SchemeValue.BoolVal(true, sp);
+            case 'f' -> new SchemeValue.BoolVal(false, sp);
             default -> throw new EvalError("unknown hash literal: #" + c);
         };
     }
 
     private SchemeValue parseAtom() throws EvalError {
+        SourcePos sp = currentSourcePos();
         int start = pos;
         while (pos < input.length() && !isDelimiter(input.charAt(pos))) {
             pos++;
@@ -103,11 +117,11 @@ public class Parser {
 
         // Try integer
         try {
-            return new SchemeValue.IntVal(Long.parseLong(token));
+            return new SchemeValue.IntVal(Long.parseLong(token), sp);
         } catch (NumberFormatException ignored) {}
 
         // Otherwise it's a symbol
-        return new SchemeValue.SymbolVal(token);
+        return new SchemeValue.SymbolVal(token, sp);
     }
 
     private void skipWhitespace() {
