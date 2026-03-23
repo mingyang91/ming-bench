@@ -31,6 +31,14 @@ public sealed interface SchemeValue {
     }
     record CharVal(char value) implements SchemeValue {}
     record VoidVal() implements SchemeValue {}
+    final class VectorVal implements SchemeValue {
+        private final SchemeValue[] elements;
+        VectorVal(SchemeValue[] elements) { this.elements = elements; }
+        public SchemeValue get(int i) { return elements[i]; }
+        public void set(int i, SchemeValue v) { elements[i] = v; }
+        public int length() { return elements.length; }
+        public SchemeValue[] elements() { return elements; }
+    }
 
     @FunctionalInterface
     interface BuiltinFunc {
@@ -72,6 +80,15 @@ public sealed interface SchemeValue {
                 for (int i = 0; i < v.elements().size(); i++) {
                     if (i > 0) sb.append(' ');
                     sb.append(v.elements().get(i).display());
+                }
+                sb.append(')');
+                yield sb.toString();
+            }
+            case VectorVal v -> {
+                StringBuilder sb = new StringBuilder("#(");
+                for (int i = 0; i < v.length(); i++) {
+                    if (i > 0) sb.append(' ');
+                    sb.append(v.get(i).display());
                 }
                 sb.append(')');
                 yield sb.toString();

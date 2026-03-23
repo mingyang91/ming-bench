@@ -18,7 +18,7 @@ public class Evaluator {
 
     private static final Set<String> SPECIAL_FORMS = Set.of(
         "quote", "set!", "define", "lambda", "if", "begin", "cond", "and", "or",
-        "let", "define-syntax", "syntax-rules"
+        "let", "letrec", "letrec*", "case", "do", "define-syntax", "syntax-rules"
     );
 
     public String evalStr(String input) throws EvalError {
@@ -368,7 +368,90 @@ public class Evaluator {
                 return new SchemeValue.BoolVal(ca.value() == cb.value());
             if (a instanceof SchemeValue.NilVal && b instanceof SchemeValue.NilVal)
                 return new SchemeValue.BoolVal(true);
+            if (a instanceof SchemeValue.VoidVal && b instanceof SchemeValue.VoidVal)
+                return new SchemeValue.BoolVal(true);
             return new SchemeValue.BoolVal(a == b);
+        }));
+
+        env.define("eqv?", new SchemeValue.BuiltinVal("eqv?", args -> {
+            if (args.size() != 2) throw new EvalError("eqv? requires 2 arguments");
+            SchemeValue a = args.get(0), b = args.get(1);
+            if (a instanceof SchemeValue.SymbolVal sa && b instanceof SchemeValue.SymbolVal sb)
+                return new SchemeValue.BoolVal(sa.name().equals(sb.name()));
+            if (a instanceof SchemeValue.IntVal ia && b instanceof SchemeValue.IntVal ib)
+                return new SchemeValue.BoolVal(ia.value() == ib.value());
+            if (a instanceof SchemeValue.BoolVal ba && b instanceof SchemeValue.BoolVal bb)
+                return new SchemeValue.BoolVal(ba.value() == bb.value());
+            if (a instanceof SchemeValue.CharVal ca && b instanceof SchemeValue.CharVal cb)
+                return new SchemeValue.BoolVal(ca.value() == cb.value());
+            if (a instanceof SchemeValue.NilVal && b instanceof SchemeValue.NilVal)
+                return new SchemeValue.BoolVal(true);
+            return new SchemeValue.BoolVal(a == b);
+        }));
+
+        // Vector operations (L15)
+        env.define("vector", new SchemeValue.BuiltinVal("vector", args -> {
+            SchemeValue[] elems = args.toArray(new SchemeValue[0]);
+            return new SchemeValue.VectorVal(elems);
+        }));
+        env.define("make-vector", new SchemeValue.BuiltinVal("make-vector", args -> {
+            if (args.isEmpty()) throw new EvalError("make-vector requires at least 1 argument");
+            int len = (int) requireInt(args.get(0));
+            SchemeValue fill = args.size() > 1 ? args.get(1) : new SchemeValue.IntVal(0);
+            SchemeValue[] elems = new SchemeValue[len];
+            for (int i = 0; i < len; i++) elems[i] = fill;
+            return new SchemeValue.VectorVal(elems);
+        }));
+        env.define("vector-ref", new SchemeValue.BuiltinVal("vector-ref", args -> {
+            if (args.size() != 2) throw new EvalError("vector-ref requires 2 arguments");
+            if (!(args.get(0) instanceof SchemeValue.VectorVal v)) throw new EvalError("vector-ref: not a vector");
+            int idx = (int) requireInt(args.get(1));
+            return v.get(idx);
+        }));
+        env.define("vector-set!", new SchemeValue.BuiltinVal("vector-set!", args -> {
+            if (args.size() != 3) throw new EvalError("vector-set! requires 3 arguments");
+            if (!(args.get(0) instanceof SchemeValue.VectorVal v)) throw new EvalError("vector-set!: not a vector");
+            int idx = (int) requireInt(args.get(1));
+            v.set(idx, args.get(2));
+            return new SchemeValue.VoidVal();
+        }));
+        env.define("vector-length", new SchemeValue.BuiltinVal("vector-length", args -> {
+            if (args.size() != 1) throw new EvalError("vector-length requires 1 argument");
+            if (!(args.get(0) instanceof SchemeValue.VectorVal v)) throw new EvalError("vector-length: not a vector");
+            return new SchemeValue.IntVal(v.length());
+        }));
+        env.define("vector?", new SchemeValue.BuiltinVal("vector?", args ->
+            new SchemeValue.BoolVal(args.getFirst() instanceof SchemeValue.VectorVal)));
+        env.define("vector->list", new SchemeValue.BuiltinVal("vector->list", args -> {
+            if (args.size() != 1) throw new EvalError("vector->list requires 1 argument");
+            if (!(args.get(0) instanceof SchemeValue.VectorVal v)) throw new EvalError("vector->list: not a vector");
+            SchemeValue result = SchemeValue.NIL;
+            for (int i = v.length() - 1; i >= 0; i--) {
+                result = new SchemeValue.PairVal(v.get(i), result);
+            }
+            return result;
+        }));
+        env.define("list->vector", new SchemeValue.BuiltinVal("list->vector", args -> {
+            if (args.size() != 1) throw new EvalError("list->vector requires 1 argument");
+            List<SchemeValue> elems = new ArrayList<>();
+            SchemeValue cur = args.get(0);
+            while (cur instanceof SchemeValue.PairVal p) {
+                elems.add(p.car());
+                cur = p.cdr();
+            }
+            return new SchemeValue.VectorVal(elems.toArray(new SchemeValue[0]));
+        }));
+
+        // error (L15 sboyer needs it)
+        env.define("error", new SchemeValue.BuiltinVal("error", args -> {
+            StringBuilder msg = new StringBuilder("Error");
+            for (int i = 0; i < args.size(); i++) {
+                SchemeValue a = args.get(i);
+                if (a instanceof SchemeValue.BoolVal b && !b.value()) continue;
+                if (a instanceof SchemeValue.StringVal s) msg.append(s.value());
+                else msg.append(a.display());
+            }
+            throw new EvalError(msg.toString());
         }));
 
         // Character utilities (L13)
@@ -530,6 +613,7 @@ public class Evaluator {
             case SchemeValue.CpsBuiltinVal v -> k.apply(v);
             case SchemeValue.ContinuationVal v -> k.apply(v);
             case SchemeValue.SyntaxRulesVal v -> k.apply(v);
+            case SchemeValue.VectorVal v -> k.apply(v);
             case SchemeValue.SymbolVal v -> {
                 try {
                     yield k.apply(env.get(v.name()));
@@ -623,6 +707,10 @@ public class Evaluator {
                 yield evalOr(elems, 1, env, k);
             }
             case "let" -> evalLet(elems, env, pos, k);
+            case "letrec" -> evalLetrec(elems, env, pos, false, k);
+            case "letrec*" -> evalLetrec(elems, env, pos, true, k);
+            case "case" -> evalCase(elems, env, pos, k);
+            case "do" -> evalDo(elems, env, pos, k);
             case "define-syntax" -> evalDefineSyntax(elems, env, pos, k);
             default -> null; // not a special form
         };
@@ -846,6 +934,190 @@ public class Evaluator {
             letEnv.define(s.name(), val);
             return evalLetBindings(bindings, idx + 1, outerEnv, letEnv, body, k);
         }));
+    }
+
+    // ── letrec / letrec* ───────────────────────────────────────────────
+
+    private Bounce evalLetrec(List<SchemeValue> elems, Environment env, String pos,
+                               boolean isStar, SchemeValue.Cont k) {
+        if (elems.size() < 3)
+            return new Bounce.Err(new EvalError("letrec requires bindings and body at " + pos));
+        if (!(elems.get(1) instanceof SchemeValue.ListVal bindingsList))
+            return new Bounce.Err(new EvalError("letrec: expected bindings list"));
+        List<String> names = new ArrayList<>();
+        List<SchemeValue> initExprs = new ArrayList<>();
+        for (SchemeValue b : bindingsList.elements()) {
+            if (!(b instanceof SchemeValue.ListVal binding) || binding.elements().size() != 2)
+                return new Bounce.Err(new EvalError("letrec: invalid binding"));
+            if (!(binding.elements().get(0) instanceof SchemeValue.SymbolVal s))
+                return new Bounce.Err(new EvalError("letrec: expected symbol in binding"));
+            names.add(s.name());
+            initExprs.add(binding.elements().get(1));
+        }
+        List<SchemeValue> body = elems.subList(2, elems.size());
+        Environment letrecEnv = new Environment(env);
+        for (String name : names) {
+            letrecEnv.define(name, new SchemeValue.VoidVal());
+        }
+        if (isStar) {
+            return evalLetrecStarBindings(names, initExprs, 0, letrecEnv, body, k);
+        } else {
+            return evalInitExprs(initExprs, 0, new ArrayList<>(), letrecEnv, inits -> {
+                for (int i = 0; i < names.size(); i++) {
+                    letrecEnv.define(names.get(i), inits.get(i));
+                }
+                return evalBody(body, letrecEnv, k);
+            });
+        }
+    }
+
+    private Bounce evalLetrecStarBindings(List<String> names, List<SchemeValue> initExprs, int idx,
+                                           Environment env, List<SchemeValue> body, SchemeValue.Cont k) {
+        if (idx >= names.size()) return evalBody(body, env, k);
+        return new Bounce.More(() -> eval(initExprs.get(idx), env, val -> {
+            env.define(names.get(idx), val);
+            return evalLetrecStarBindings(names, initExprs, idx + 1, env, body, k);
+        }));
+    }
+
+    // ── case ─────────────────────────────────────────────────────────
+
+    private Bounce evalCase(List<SchemeValue> elems, Environment env, String pos, SchemeValue.Cont k) {
+        if (elems.size() < 2)
+            return new Bounce.Err(new EvalError("case requires key expression at " + pos));
+        return new Bounce.More(() -> eval(elems.get(1), env, keyVal ->
+            evalCaseClauses(elems, 2, keyVal, env, k)
+        ));
+    }
+
+    private Bounce evalCaseClauses(List<SchemeValue> elems, int idx, SchemeValue keyVal,
+                                    Environment env, SchemeValue.Cont k) {
+        if (idx >= elems.size()) return k.apply(new SchemeValue.VoidVal());
+        if (!(elems.get(idx) instanceof SchemeValue.ListVal clause))
+            return new Bounce.Err(new EvalError("case: expected clause"));
+        List<SchemeValue> parts = clause.elements();
+        if (parts.isEmpty()) return new Bounce.Err(new EvalError("case: empty clause"));
+        // Check for else clause
+        if (parts.getFirst() instanceof SchemeValue.SymbolVal s && s.name().equals("else")) {
+            if (parts.size() > 1) return evalSeqFrom(parts, 1, env, k);
+            return k.apply(new SchemeValue.VoidVal());
+        }
+        // Datums list
+        if (!(parts.getFirst() instanceof SchemeValue.ListVal datums))
+            return new Bounce.Err(new EvalError("case: expected datum list"));
+        boolean matched = false;
+        for (SchemeValue datum : datums.elements()) {
+            SchemeValue d = quoteDatum(datum);
+            if (schemeEqv(keyVal, d)) { matched = true; break; }
+        }
+        if (matched) {
+            if (parts.size() > 1) return evalSeqFrom(parts, 1, env, k);
+            return k.apply(new SchemeValue.VoidVal());
+        }
+        return evalCaseClauses(elems, idx + 1, keyVal, env, k);
+    }
+
+    private boolean schemeEqv(SchemeValue a, SchemeValue b) {
+        if (a instanceof SchemeValue.SymbolVal sa && b instanceof SchemeValue.SymbolVal sb)
+            return sa.name().equals(sb.name());
+        if (a instanceof SchemeValue.IntVal ia && b instanceof SchemeValue.IntVal ib)
+            return ia.value() == ib.value();
+        if (a instanceof SchemeValue.BoolVal ba && b instanceof SchemeValue.BoolVal bb)
+            return ba.value() == bb.value();
+        if (a instanceof SchemeValue.CharVal ca && b instanceof SchemeValue.CharVal cb)
+            return ca.value() == cb.value();
+        if (a instanceof SchemeValue.NilVal && b instanceof SchemeValue.NilVal)
+            return true;
+        return a == b;
+    }
+
+    // ── do ───────────────────────────────────────────────────────────
+
+    private Bounce evalDo(List<SchemeValue> elems, Environment env, String pos, SchemeValue.Cont k) {
+        // (do ((var init step) ...) (test expr ...) body ...)
+        if (elems.size() < 3)
+            return new Bounce.Err(new EvalError("do requires bindings and test at " + pos));
+        if (!(elems.get(1) instanceof SchemeValue.ListVal bindingsList))
+            return new Bounce.Err(new EvalError("do: expected bindings list"));
+        if (!(elems.get(2) instanceof SchemeValue.ListVal testClause))
+            return new Bounce.Err(new EvalError("do: expected test clause"));
+
+        List<String> varNames = new ArrayList<>();
+        List<SchemeValue> initExprs = new ArrayList<>();
+        List<SchemeValue> stepExprs = new ArrayList<>(); // null means no step
+        for (SchemeValue b : bindingsList.elements()) {
+            if (!(b instanceof SchemeValue.ListVal binding))
+                return new Bounce.Err(new EvalError("do: invalid binding"));
+            List<SchemeValue> bElems = binding.elements();
+            if (bElems.size() < 2 || bElems.size() > 3)
+                return new Bounce.Err(new EvalError("do: invalid binding"));
+            if (!(bElems.get(0) instanceof SchemeValue.SymbolVal s))
+                return new Bounce.Err(new EvalError("do: expected symbol in binding"));
+            varNames.add(s.name());
+            initExprs.add(bElems.get(1));
+            stepExprs.add(bElems.size() == 3 ? bElems.get(2) : null);
+        }
+
+        List<SchemeValue> testParts = testClause.elements();
+        if (testParts.isEmpty())
+            return new Bounce.Err(new EvalError("do: test clause must have at least test expression"));
+        SchemeValue testExpr = testParts.getFirst();
+        List<SchemeValue> resultExprs = testParts.subList(1, testParts.size());
+        List<SchemeValue> bodyExprs = elems.subList(3, elems.size());
+
+        // Evaluate init exprs in outer env
+        return evalInitExprs(initExprs, 0, new ArrayList<>(), env, inits -> {
+            Environment doEnv = new Environment(env);
+            for (int i = 0; i < varNames.size(); i++) {
+                doEnv.define(varNames.get(i), inits.get(i));
+            }
+            return doLoop(varNames, stepExprs, testExpr, resultExprs, bodyExprs, doEnv, k);
+        });
+    }
+
+    private Bounce doLoop(List<String> varNames, List<SchemeValue> stepExprs,
+                           SchemeValue testExpr, List<SchemeValue> resultExprs,
+                           List<SchemeValue> bodyExprs, Environment doEnv, SchemeValue.Cont k) {
+        return new Bounce.More(() -> eval(testExpr, doEnv, testVal -> {
+            if (testVal.isTruthy()) {
+                if (resultExprs.isEmpty()) return k.apply(new SchemeValue.VoidVal());
+                return evalSeqFrom(resultExprs, 0, doEnv, k);
+            }
+            // Execute body (for side effects)
+            Bounce afterBody;
+            if (bodyExprs.isEmpty()) {
+                afterBody = doStep(varNames, stepExprs, doEnv, testExpr, resultExprs, bodyExprs, k);
+            } else {
+                afterBody = evalSequence(bodyExprs, 0, doEnv, ignored ->
+                    doStep(varNames, stepExprs, doEnv, testExpr, resultExprs, bodyExprs, k)
+                );
+            }
+            return afterBody;
+        }));
+    }
+
+    private Bounce doStep(List<String> varNames, List<SchemeValue> stepExprs,
+                           Environment doEnv, SchemeValue testExpr,
+                           List<SchemeValue> resultExprs, List<SchemeValue> bodyExprs,
+                           SchemeValue.Cont k) {
+        // Evaluate all step exprs using current values (parallel)
+        List<SchemeValue> stepsToEval = new ArrayList<>();
+        List<Integer> stepIndices = new ArrayList<>();
+        for (int i = 0; i < stepExprs.size(); i++) {
+            if (stepExprs.get(i) != null) {
+                stepsToEval.add(stepExprs.get(i));
+                stepIndices.add(i);
+            }
+        }
+        if (stepsToEval.isEmpty()) {
+            return doLoop(varNames, stepExprs, testExpr, resultExprs, bodyExprs, doEnv, k);
+        }
+        return evalInitExprs(stepsToEval, 0, new ArrayList<>(), doEnv, stepVals -> {
+            for (int i = 0; i < stepIndices.size(); i++) {
+                doEnv.define(varNames.get(stepIndices.get(i)), stepVals.get(i));
+            }
+            return doLoop(varNames, stepExprs, testExpr, resultExprs, bodyExprs, doEnv, k);
+        });
     }
 
     // ── Lambda construction (no CPS needed — doesn't eval anything) ──
@@ -1097,6 +1369,13 @@ public class Evaluator {
             return true;
         if (a instanceof SchemeValue.PairVal pa && b instanceof SchemeValue.PairVal pb)
             return schemeEqual(pa.car(), pb.car()) && schemeEqual(pa.cdr(), pb.cdr());
+        if (a instanceof SchemeValue.VectorVal va && b instanceof SchemeValue.VectorVal vb) {
+            if (va.length() != vb.length()) return false;
+            for (int i = 0; i < va.length(); i++) {
+                if (!schemeEqual(va.get(i), vb.get(i))) return false;
+            }
+            return true;
+        }
         return false;
     }
 
