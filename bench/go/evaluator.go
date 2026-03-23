@@ -79,6 +79,14 @@ func evalList(expr *Value, env *Env) (*Value, error) {
 			return evalAnd(expr.Cdr, env)
 		case "or":
 			return evalOr(expr.Cdr, env)
+		case "define":
+			return evalDefine(expr.Cdr, env)
+		case "if":
+			return evalIf(expr.Cdr, env)
+		case "quote":
+			return expr.Cdr.Car, nil
+		case "lambda":
+			return evalLambda(expr.Cdr, env)
 		}
 	}
 
@@ -98,14 +106,96 @@ func evalList(expr *Value, env *Env) (*Value, error) {
 		return applyBuiltin(head, evaledArgs)
 	}
 
-	// User-defined function call (future levels)
+	// Evaluate head for user-defined procedures
 	fn, err := eval(head, env)
 	if err != nil {
 		return nil, err
 	}
-	_ = fn
 
-	return nil, &EvalError{Message: fmt.Sprintf("not a procedure: %s", head.Display())}
+	// Lambda application
+	if fn.Type == TypeLambda {
+		return applyLambda(fn, evaledArgs)
+	}
+
+	return nil, &EvalError{Message: fmt.Sprintf("not a procedure: %s", fn.Display())}
+}
+
+func evalDefine(args *Value, env *Env) (*Value, error) {
+	first := args.Car
+	if first.Type == TypeSymbol {
+		// (define x expr)
+		val, err := eval(args.Cdr.Car, env)
+		if err != nil {
+			return nil, err
+		}
+		env.set(first.StrVal, val)
+		return Void, nil
+	}
+	if first.Type == TypePair {
+		// (define (f params...) body...)
+		name := first.Car.StrVal
+		paramsList := listToSlice(first.Cdr)
+		params := make([]string, len(paramsList))
+		for i, p := range paramsList {
+			params[i] = p.StrVal
+		}
+		body := listToSlice(args.Cdr)
+		fn := &Value{
+			Type:       TypeLambda,
+			Params:     params,
+			Body:       body,
+			ClosureEnv: env,
+		}
+		env.set(name, fn)
+		return Void, nil
+	}
+	return nil, &EvalError{Message: "bad define syntax"}
+}
+
+func evalIf(args *Value, env *Env) (*Value, error) {
+	cond, err := eval(args.Car, env)
+	if err != nil {
+		return nil, err
+	}
+	if isTruthy(cond) {
+		return eval(args.Cdr.Car, env)
+	}
+	// else branch
+	if args.Cdr.Cdr.Type != TypeNull {
+		return eval(args.Cdr.Cdr.Car, env)
+	}
+	return Void, nil
+}
+
+func evalLambda(args *Value, env *Env) (*Value, error) {
+	paramsList := listToSlice(args.Car)
+	params := make([]string, len(paramsList))
+	for i, p := range paramsList {
+		params[i] = p.StrVal
+	}
+	body := listToSlice(args.Cdr)
+	return &Value{
+		Type:       TypeLambda,
+		Params:     params,
+		Body:       body,
+		ClosureEnv: env,
+	}, nil
+}
+
+func applyLambda(fn *Value, args []*Value) (*Value, error) {
+	localEnv := newEnv(fn.ClosureEnv)
+	for i, p := range fn.Params {
+		localEnv.set(p, args[i])
+	}
+	var result *Value
+	var err error
+	for _, bodyExpr := range fn.Body {
+		result, err = eval(bodyExpr, localEnv)
+		if err != nil {
+			return nil, err
+		}
+	}
+	return result, nil
 }
 
 func evalAnd(args *Value, env *Env) (*Value, error) {
@@ -269,7 +359,12 @@ func EvalStr(input string) (string, error) {
 		if err != nil {
 			return "", err
 		}
-		last = v
+		if v.Type != TypeVoid {
+			last = v
+		}
+	}
+	if last == nil {
+		return "", nil
 	}
 	return last.Display(), nil
 }
