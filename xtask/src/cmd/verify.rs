@@ -1,5 +1,53 @@
-use crate::model::{command_exists, fixtures_dir, load_tests_json, run_cmd_capture, Error, Result};
+use crate::model::{command_exists, fixtures_dir, load_tests_json, run_cmd_capture, Error, Result, TestEntry};
 use std::path::Path;
+
+fn check_test_result(
+    test: &TestEntry,
+    exit_code: i32,
+    actual: &str,
+    passed: &mut u32,
+    failed: &mut u32,
+    skipped: &mut u32,
+    errors: &mut Vec<String>,
+) {
+    match test.kind.as_str() {
+        "eval_str_ok" => {
+            let expected = test.expected.as_deref().unwrap_or("");
+            if exit_code != 0 {
+                *failed += 1;
+                errors.push(format!("  FAIL {}: chez error (exit {exit_code})", test.name));
+            } else if actual == expected {
+                *passed += 1;
+            } else {
+                *failed += 1;
+                errors.push(format!("  FAIL {}: expected '{expected}', got '{actual}'", test.name));
+            }
+        }
+        "eval_str_err" | "eval_str_err_with_position" => {
+            if exit_code != 0 {
+                *passed += 1;
+            } else {
+                *failed += 1;
+                errors.push(format!("  FAIL {}: expected error but got success: '{actual}'", test.name));
+            }
+        }
+        "eval_str_with_output" => {
+            let expected_output = test.expected_output.as_deref().unwrap_or("");
+            if exit_code != 0 {
+                *failed += 1;
+                errors.push(format!("  FAIL {}: chez error (exit {exit_code})", test.name));
+            } else if actual.contains(expected_output) {
+                *passed += 1;
+            } else {
+                *failed += 1;
+                errors.push(format!("  FAIL {}: expected output containing '{expected_output}', got '{actual}'", test.name));
+            }
+        }
+        _ => {
+            *skipped += 1;
+        }
+    }
+}
 
 /// Chez Scheme binary name (installed as `scheme` by default).
 const CHEZ_BIN: &str = "scheme";
@@ -56,13 +104,11 @@ fn run_fixture(
     let path_str = abs.to_string_lossy();
 
     // Shared reader helper
-    let reader = format!(
-        r#"(define (%read-all path)
+    let reader = r#"(define (%read-all path)
   (call-with-input-file path (lambda (p)
     (let loop ((acc '()))
       (let ((x (read p)))
-        (if (eof-object? x) (reverse acc) (loop (cons x acc))))))))"#
-    );
+        (if (eof-object? x) (reverse acc) (loop (cons x acc))))))))"#;
 
     let wrapper = match kind {
         "eval_str_ok" => {
@@ -96,7 +142,7 @@ fn run_fixture(
             CHEZ_BIN,
             "--quiet",
             "--script",
-            tmp.to_str().unwrap(),
+            tmp.to_str().expect("temp path is valid UTF-8"),
         ],
         cwd,
     );
@@ -162,58 +208,10 @@ pub fn run(level: Option<&str>) -> Result<()> {
         match result {
             Ok((exit_code, actual)) => {
                 let actual = actual.trim_end();
-                match test.kind.as_str() {
-                    "eval_str_ok" => {
-                        let expected = test.expected.as_deref().unwrap_or("");
-                        if exit_code != 0 {
-                            failed += 1;
-                            errors.push(format!(
-                                "  FAIL {}: chez error (exit {exit_code})",
-                                test.name
-                            ));
-                        } else if actual == expected {
-                            passed += 1;
-                        } else {
-                            failed += 1;
-                            errors.push(format!(
-                                "  FAIL {}: expected '{}', got '{actual}'",
-                                test.name, expected
-                            ));
-                        }
-                    }
-                    "eval_str_err" | "eval_str_err_with_position" => {
-                        if exit_code != 0 {
-                            passed += 1;
-                        } else {
-                            failed += 1;
-                            errors.push(format!(
-                                "  FAIL {}: expected error but got success: '{actual}'",
-                                test.name
-                            ));
-                        }
-                    }
-                    "eval_str_with_output" => {
-                        let expected_output = test.expected_output.as_deref().unwrap_or("");
-                        if exit_code != 0 {
-                            failed += 1;
-                            errors.push(format!(
-                                "  FAIL {}: chez error (exit {exit_code})",
-                                test.name
-                            ));
-                        } else if actual.contains(expected_output) {
-                            passed += 1;
-                        } else {
-                            failed += 1;
-                            errors.push(format!(
-                                "  FAIL {}: expected output containing '{}', got '{actual}'",
-                                test.name, expected_output
-                            ));
-                        }
-                    }
-                    _ => {
-                        skipped += 1;
-                    }
-                }
+                check_test_result(
+                    test, exit_code, actual,
+                    &mut passed, &mut failed, &mut skipped, &mut errors,
+                );
             }
             Err(_) => {
                 failed += 1;

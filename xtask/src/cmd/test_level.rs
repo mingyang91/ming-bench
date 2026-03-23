@@ -155,10 +155,8 @@ fn run_jvm_container(proj: &Path, jar: &Path, level: &str, lang_label: &str) -> 
     };
 
     let bench_mount = format!("{}:/bench:ro,Z", proj.join("bench").display());
-    let java_cmd = format!(
-        "timeout {timeout}s java -jar {} {level_arg}",
-        format!("/bench/{}", jar.strip_prefix(proj.join("bench")).unwrap_or(jar).display())
-    );
+    let jar_path = format!("/bench/{}", jar.strip_prefix(proj.join("bench")).unwrap_or(jar).display());
+    let java_cmd = format!("timeout {timeout}s java -jar {jar_path} {level_arg}");
 
     println!("Running {lang_label} tests (level {level}) in container...");
     let exit = run_cmd(

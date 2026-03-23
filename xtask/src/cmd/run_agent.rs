@@ -469,6 +469,80 @@ fn run_regression_fix(
     agent_exit
 }
 
+fn maybe_run_gate_cleanup(
+    args: &RunAgentArgs,
+    agent_workdir: &Path,
+    worktree_dir: &Path,
+    level_dir: &Path,
+    level: &str,
+) {
+    if !args.strategy.contains("quality-gate") {
+        return;
+    }
+    let gate_exit = run_quality_gate_cleanup(args, agent_workdir, worktree_dir, level_dir, level);
+    if gate_exit != 0 {
+        println!("Quality gate cleanup failed for level {level} (non-blocking)");
+    }
+}
+
+enum RegCheckOutcome {
+    NoPriorLevels,
+    Clean,
+    Fixed,
+    Broken,
+}
+
+fn check_and_fix_regressions(
+    args: &RunAgentArgs,
+    agent_workdir: &Path,
+    worktree_dir: &Path,
+    level_dir: &Path,
+    level: &str,
+    passed_levels: &[&str],
+    lang: &Lang,
+) -> Result<RegCheckOutcome> {
+    if passed_levels.is_empty() {
+        return Ok(RegCheckOutcome::NoPriorLevels);
+    }
+
+    println!();
+    println!(
+        "--- Regression check: L01..L{} ---",
+        passed_levels.last().expect("passed_levels is non-empty")
+    );
+    let regressions = regression_check(passed_levels, lang, worktree_dir)?;
+
+    if regressions.is_empty() {
+        println!("No regressions");
+        return Ok(RegCheckOutcome::Clean);
+    }
+
+    let regressed_names: Vec<&str> = regressions.iter().map(|(l, _)| l.as_str()).collect();
+    println!("WARNING: Regressions detected in: {}", regressed_names.join(", "));
+
+    let level_num: u32 = level.parse().unwrap_or(1);
+    let fix_turns = turns_for_level(level_num, args.max_turns);
+    println!("--- Regression fix pass ({fix_turns} turns) ---");
+    let _fix_exit = run_regression_fix(args, agent_workdir, level_dir, &regressions, level, fix_turns);
+
+    let mut all_check: Vec<&str> = passed_levels.to_vec();
+    all_check.push(level);
+    let still_broken = regression_check(&all_check, lang, worktree_dir)?;
+
+    if still_broken.is_empty() {
+        println!("Regressions fixed successfully");
+        commit_checkpoint(level, "REGFIX", 0, worktree_dir);
+        return Ok(RegCheckOutcome::Fixed);
+    }
+
+    let broken_names: Vec<&str> = still_broken.iter().map(|(l, _)| l.as_str()).collect();
+    println!("Regressions unfixed: {} — halting run", broken_names.join(", "));
+    let status_msg = format!("Level {level} REGRESSION (regressions in {})", broken_names.join(", "));
+    let _ = fs::write(level_dir.join("status.txt"), &status_msg);
+    commit_checkpoint(level, "REGRESSION", 0, worktree_dir);
+    Ok(RegCheckOutcome::Broken)
+}
+
 // ---------------------------------------------------------------------------
 // Level-by-level mode
 // ---------------------------------------------------------------------------
@@ -527,73 +601,17 @@ fn run_levels_mode(
         }
 
         // --- Step 1: Regression check (BEFORE quality gate) ---
-        if !passed_levels.is_empty() {
-            println!();
-            println!("--- Regression check: L01..L{} ---", passed_levels.last().unwrap());
-            let regressions = regression_check(&passed_levels, &lang, worktree_dir)?;
-
-            if !regressions.is_empty() {
-                let regressed_names: Vec<&str> =
-                    regressions.iter().map(|(l, _)| l.as_str()).collect();
-                println!(
-                    "WARNING: Regressions detected in: {}",
-                    regressed_names.join(", ")
-                );
-
-                // Fix-it pass — same turn budget as coding
-                let level_num: u32 = level.parse().unwrap_or(1);
-                let fix_turns = turns_for_level(level_num, args.max_turns);
-                println!(
-                    "--- Regression fix pass ({fix_turns} turns) ---"
-                );
-                let _fix_exit = run_regression_fix(
-                    args,
-                    agent_workdir,
-                    &level_dir,
-                    &regressions,
-                    level,
-                    fix_turns,
-                );
-
-                // Re-check all levels including current
-                let mut all_check: Vec<&str> = passed_levels.clone();
-                all_check.push(level);
-                let still_broken = regression_check(&all_check, &lang, worktree_dir)?;
-
-                if !still_broken.is_empty() {
-                    let broken_names: Vec<&str> =
-                        still_broken.iter().map(|(l, _)| l.as_str()).collect();
-                    println!(
-                        "Regressions unfixed: {} — halting run",
-                        broken_names.join(", ")
-                    );
-                    let status_msg = format!(
-                        "Level {level} REGRESSION (regressions in {})",
-                        broken_names.join(", ")
-                    );
-                    let _ = fs::write(level_dir.join("status.txt"), &status_msg);
-                    commit_checkpoint(level, "REGRESSION", result.1, worktree_dir);
-                    if let Some(last) = level_times.last_mut() {
-                        last.2 = "REGRESSION".to_string();
-                    }
-                    break;
-                }
-
-                println!("Regressions fixed successfully");
-                commit_checkpoint(level, "REGFIX", 0, worktree_dir);
-            } else {
-                println!("No regressions");
+        if let RegCheckOutcome::Broken = check_and_fix_regressions(
+            args, agent_workdir, worktree_dir, &level_dir, level, &passed_levels, &lang,
+        )? {
+            if let Some(last) = level_times.last_mut() {
+                last.2 = "REGRESSION".to_string();
             }
+            break;
         }
 
         // --- Step 2: Quality gate cleanup (AFTER regression is clean) ---
-        if args.strategy.contains("quality-gate") {
-            let gate_exit =
-                run_quality_gate_cleanup(args, agent_workdir, worktree_dir, &level_dir, level);
-            if gate_exit != 0 {
-                println!("Quality gate cleanup failed for level {level} (non-blocking)");
-            }
-        }
+        maybe_run_gate_cleanup(args, agent_workdir, worktree_dir, &level_dir, level);
 
         commit_checkpoint(level, &result.2, result.1, worktree_dir);
         passed_levels.push(level);

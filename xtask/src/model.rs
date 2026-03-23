@@ -399,6 +399,7 @@ pub struct TestEntry {
     #[serde(default)]
     pub expected_output: Option<String>,
     #[serde(default)]
+    #[allow(dead_code)]
     pub deprecated_after: Option<u32>,
 }
 
