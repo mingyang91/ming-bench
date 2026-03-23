@@ -8,6 +8,7 @@ public sealed interface SchemeValue {
     record StringVal(String value) implements SchemeValue {}
     record SymbolVal(String name) implements SchemeValue {}
     record ListVal(List<SchemeValue> elements) implements SchemeValue {}
+    record LambdaVal(List<String> params, List<SchemeValue> body, Environment env) implements SchemeValue {}
 
     default boolean isTruthy() {
         return !(this instanceof BoolVal b && !b.value());
@@ -29,6 +30,7 @@ public sealed interface SchemeValue {
                 sb.append(')');
                 yield sb.toString();
             }
+            case LambdaVal v -> "#<procedure>";
         };
     }
 }
