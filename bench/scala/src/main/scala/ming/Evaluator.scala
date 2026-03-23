@@ -48,29 +48,41 @@ object Evaluator:
     reg("symbol?", args => typeCheck(args, _.isInstanceOf[SSymbol]))
     env
 
+  private def withPos(pos: (Int, Int))(body: => SchemeValue): SchemeValue =
+    try body
+    catch
+      case e: EvalError if !e.getMessage.matches(".*\\d+:\\d+.*") =>
+        throw new EvalError(s"${e.getMessage} at ${pos._1}:${pos._2}")
+
   def eval(expr: SchemeValue, env: Environment): SchemeValue = expr match
-    case SInteger(_) | SBoolean(_) | SString(_) | SLambda(_, _, _) | SBuiltin(_, _) | SVoid | SNil | SPair(_, _) => expr
+    case SInteger(_) | SBoolean(_) | SString(_) | SLambda(_, _, _) | SBuiltin(_, _) | SVoid | SNil | SPair(_, _) =>
+      expr
     case SSymbol(name) => env.lookup(name)
-    case SList(Nil)    => throw new EvalError("empty application")
-    case SList(SSymbol(op) :: args) =>
-      op match
-        case "quote"  => evalQuote(args)
-        case "if"     => evalIf(args, env)
-        case "define" => evalDefine(args, env)
-        case "lambda" => evalLambda(args, env)
-        case "and"    => evalAnd(args, env)
-        case "or"     => evalOr(args, env)
-        case "let"    => evalLet(args, env)
-        case "begin"  => evalBegin(args, env)
-        case "cond"   => evalCond(args, env)
-        case _ =>
-          val proc       = eval(SSymbol(op), env)
-          val evaledArgs = args.map(a => eval(a, env))
-          applyProc(proc, evaledArgs)
-    case SList(head :: args) =>
-      val proc       = eval(head, env)
-      val evaledArgs = args.map(a => eval(a, env))
-      applyProc(proc, evaledArgs)
+    case SList(Nil, pos) =>
+      throw new EvalError(s"empty application at ${pos._1}:${pos._2}")
+    case SList(SSymbol(op) :: args, pos) =>
+      withPos(pos) {
+        op match
+          case "quote"  => evalQuote(args)
+          case "if"     => evalIf(args, env)
+          case "define" => evalDefine(args, env)
+          case "lambda" => evalLambda(args, env)
+          case "and"    => evalAnd(args, env)
+          case "or"     => evalOr(args, env)
+          case "let"    => evalLet(args, env)
+          case "begin"  => evalBegin(args, env)
+          case "cond"   => evalCond(args, env)
+          case _ =>
+            val proc       = eval(SSymbol(op), env)
+            val evaledArgs = args.map(a => eval(a, env))
+            applyProc(proc, evaledArgs)
+      }
+    case SList(head :: args, pos) =>
+      withPos(pos) {
+        val proc       = eval(head, env)
+        val evaledArgs = args.map(a => eval(a, env))
+        applyProc(proc, evaledArgs)
+      }
 
   private def applyProc(proc: SchemeValue, args: List[SchemeValue]): SchemeValue = proc match
     case SLambda(params, body, closure) =>
@@ -87,8 +99,8 @@ object Evaluator:
       case _             => throw new EvalError("quote: requires exactly 1 argument")
 
   private def quotify(v: SchemeValue): SchemeValue = v match
-    case SList(elems) => elems.foldRight(SNil: SchemeValue)((e, acc) => SPair(quotify(e), acc))
-    case other        => other
+    case SList(elems, _) => elems.foldRight(SNil: SchemeValue)((e, acc) => SPair(quotify(e), acc))
+    case other           => other
 
   private def evalIf(args: List[SchemeValue], env: Environment): SchemeValue =
     args match
@@ -103,7 +115,7 @@ object Evaluator:
       case SSymbol(name) :: value :: Nil =>
         env.define(name, eval(value, env))
         SVoid
-      case SList(SSymbol(name) :: params) :: body if body.nonEmpty =>
+      case SList(SSymbol(name) :: params, _) :: body if body.nonEmpty =>
         val paramNames = params.map {
           case SSymbol(n) => n
           case other      => throw new EvalError(s"define: expected parameter name, got ${other.display}")
@@ -114,7 +126,7 @@ object Evaluator:
 
   private def evalLambda(args: List[SchemeValue], env: Environment): SchemeValue =
     args match
-      case SList(params) :: body if body.nonEmpty =>
+      case SList(params, _) :: body if body.nonEmpty =>
         val paramNames = params.map {
           case SSymbol(n) => n
           case other      => throw new EvalError(s"lambda: expected parameter name, got ${other.display}")
@@ -186,19 +198,19 @@ object Evaluator:
 
   private def evalLet(args: List[SchemeValue], env: Environment): SchemeValue =
     args match
-      case SSymbol(name) :: SList(bindings) :: body if body.nonEmpty =>
+      case SSymbol(name) :: SList(bindings, _) :: body if body.nonEmpty =>
         val (paramNames, initVals) = bindings.map {
-          case SList(SSymbol(p) :: expr :: Nil) => (p, eval(expr, env))
-          case other                            => throw new EvalError(s"let: bad binding: ${other.display}")
+          case SList(SSymbol(p) :: expr :: Nil, _) => (p, eval(expr, env))
+          case other                               => throw new EvalError(s"let: bad binding: ${other.display}")
         }.unzip
         val localEnv = env.extend(Nil, Nil)
         val lambda   = SLambda(paramNames, body, localEnv)
         localEnv.define(name, lambda)
         applyProc(lambda, initVals)
-      case SList(bindings) :: body if body.nonEmpty =>
+      case SList(bindings, _) :: body if body.nonEmpty =>
         val (names, vals) = bindings.map {
-          case SList(SSymbol(name) :: expr :: Nil) => (name, eval(expr, env))
-          case other                               => throw new EvalError(s"let: bad binding: ${other.display}")
+          case SList(SSymbol(name) :: expr :: Nil, _) => (name, eval(expr, env))
+          case other                                  => throw new EvalError(s"let: bad binding: ${other.display}")
         }.unzip
         val localEnv = env.extend(names, vals)
         body.map(e => eval(e, localEnv)).last
@@ -211,10 +223,10 @@ object Evaluator:
   private def evalCond(args: List[SchemeValue], env: Environment): SchemeValue =
     args match
       case Nil => SVoid
-      case SList(SSymbol("else") :: body) :: Nil =>
+      case SList(SSymbol("else") :: body, _) :: Nil =>
         if body.isEmpty then throw new EvalError("cond: else clause must have body")
         body.map(e => eval(e, env)).last
-      case SList(test :: body) :: rest =>
+      case SList(test :: body, _) :: rest =>
         if isTruthy(eval(test, env)) then
           if body.isEmpty then eval(test, env)
           else body.map(e => eval(e, env)).last

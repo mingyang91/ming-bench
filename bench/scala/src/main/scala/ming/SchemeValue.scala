@@ -6,7 +6,7 @@ enum SchemeValue:
   case SBoolean(value: Boolean)
   case SString(value: String)
   case SSymbol(name: String)
-  case SList(elements: List[SchemeValue])
+  case SList(elements: List[SchemeValue], pos: (Int, Int) = (0, 0))
   case SPair(car: SchemeValue, cdr: SchemeValue)
   case SNil
   case SLambda(params: List[String], body: List[SchemeValue], closure: Environment)
@@ -18,7 +18,7 @@ enum SchemeValue:
     case SBoolean(v)      => if v then "#t" else "#f"
     case SString(v)       => "\"" + v + "\""
     case SSymbol(n)       => n
-    case SList(elems)     => "(" + elems.map(_.display).mkString(" ") + ")"
+    case SList(elems, _)  => "(" + elems.map(_.display).mkString(" ") + ")"
     case SNil             => "()"
     case SPair(_, _)      => displayPair(this)
     case SLambda(_, _, _) => "#<procedure>"
