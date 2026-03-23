@@ -26,7 +26,24 @@ object Macro:
     "apply",
     "define-syntax",
     "syntax-rules",
-    "else"
+    "else",
+    "guard",
+    "define-record-type",
+    "let*",
+    "letrec",
+    "letrec*",
+    "case",
+    "do",
+    "raise",
+    "with-exception-handler",
+    "dynamic-wind",
+    "call-with-values",
+    "values",
+    "syntax-case",
+    "syntax",
+    "with-syntax",
+    "map",
+    "for-each"
   )
 
   enum Binding:

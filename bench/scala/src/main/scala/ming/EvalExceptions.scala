@@ -14,6 +14,7 @@ private[ming] trait EvalExceptions:
   protected def doWindTransition(target: List[WindEntry], pos: Option[Pos], andThen: () => Bounce): Bounce
   protected def evalBody(exprs: List[Expr], env: Env, k: K): Bounce
   protected def eval(expr: Expr, env: Env, k: K): Bounce
+  protected def trampoline(thunk: => Bounce): Bounce
 
   /** Raise a Scheme exception: unwind to the nearest handler's wind stack, then invoke it. */
   protected def raiseException(value: Value, pos: Option[Pos]): Bounce =
@@ -74,7 +75,7 @@ private[ming] trait EvalExceptions:
       env,
       { result =>
         handlerStack = savedHandlers
-        k(result)
+        trampoline(k(result))
       }
     )
 

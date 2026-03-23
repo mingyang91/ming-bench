@@ -221,8 +221,9 @@ object Evaluator extends EvalForms with EvalWind with EvalExceptions with EvalSy
       case LambdaVal(params, restParam, body, closure) =>
         tailBody(body, closure.extendWithRest(params, restParam, values), k)
       case ContinuationVal(invoke) =>
-        if values.length != 1 then evalError("continuation: expected 1 argument", pos)
-        invoke(values.head)
+        values match
+          case single :: Nil => invoke(single)
+          case _             => invoke(ValuesVal(values))
       case BuiltinVal(name, _) if name == "call/cc" || name == "call-with-current-continuation" =>
         if values.length != 1 then evalError("call/cc: expected 1 argument", pos)
         val capturedWind = windStack
