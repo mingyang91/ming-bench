@@ -1,5 +1,6 @@
 use std::fmt;
 
+use crate::scheme::env::Env;
 use crate::scheme::value::Value;
 
 /// Source position in the input.
@@ -58,4 +59,19 @@ pub enum EvalError {
 
     #[error("raised exception")]
     SchemeRaise { value: Value },
+
+    /// Internal signal: a guard body's tail expression encountered another guard.
+    /// Used by eval_guard's trampoline to avoid deep recursion.
+    #[error("guard tail continue (internal signal)")]
+    GuardTailContinue(Box<GuardTailData>),
+}
+
+/// Data for the `GuardTailContinue` trampoline signal.
+#[derive(Debug, PartialEq)]
+pub struct GuardTailData {
+    pub expr: Value,
+    pub env: Env,
+    pub var_name: String,
+    pub clauses: Vec<Value>,
+    pub clause_env: Env,
 }

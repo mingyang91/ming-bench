@@ -2,7 +2,7 @@ use std::collections::{HashMap, HashSet};
 use std::rc::Rc;
 
 use crate::scheme::env::Env;
-use crate::scheme::error::{EvalError, Span};
+use crate::scheme::error::{EvalError, GuardTailData, Span};
 use crate::scheme::macros;
 use crate::scheme::macros::{Binding, PatternBindings};
 use crate::scheme::value::{make_rational, Mutability, RecordOp, SyntaxRules, Value};
@@ -413,6 +413,12 @@ fn handle_callcc(args: &[Value], span: Span, env: &Env) -> Result<Value, EvalErr
 }
 
 pub fn eval(expr: &Value, env: &Env) -> Result<Value, EvalError> {
+    eval_inner(expr, env, false)
+}
+
+/// Inner eval with guard_tail flag. When guard_tail is true, encountering a
+/// `guard` form returns GuardTailContinue instead of recursing into eval_guard.
+fn eval_inner(expr: &Value, env: &Env, guard_tail: bool) -> Result<Value, EvalError> {
     let mut current_expr = expr.clone();
     let mut current_env = env.clone();
 
@@ -663,6 +669,9 @@ pub fn eval(expr: &Value, env: &Env) -> Result<Value, EvalError> {
                             return eval_define_record_type(&elems[1..], list_span, &current_env);
                         }
                         "guard" => {
+                            if guard_tail {
+                                return eval_guard_tail(&elems[1..], list_span, &current_env);
+                            }
                             return eval_guard(&elems[1..], list_span, &current_env);
                         }
                         "syntax-case" => {
@@ -1077,14 +1086,11 @@ fn dispatch_call(func: Value, args: Vec<Value>, span: Span, env: &Env) -> Result
             Ok(TailAction::Result(apply_record_op(op, args, span)?))
         }
         Value::Continuation(id) => {
-            if args.len() != 1 {
-                return Err(EvalError::WrongArgCount {
-                    expected: "1".to_string(),
-                    got: args.len(),
-                    span,
-                });
-            }
-            Err(EvalError::ContinuationReturn { id, value: args.into_iter().next().expect("checked len") })
+            let value = match args.len() {
+                1 => args.into_iter().next().expect("checked len"),
+                _ => Value::Values(args),
+            };
+            Err(EvalError::ContinuationReturn { id, value })
         }
         other => Err(EvalError::NotAProcedure {
             value: other.to_string(),
@@ -1482,14 +1488,11 @@ fn call_with_args(func: &Value, args: &[Value], span: Span, env: &Env) -> Result
         }
         Value::Symbol(ref name, _) => apply_builtin(name, args, span, env),
         Value::Continuation(id) => {
-            if args.len() != 1 {
-                return Err(EvalError::WrongArgCount {
-                    expected: "1".to_string(),
-                    got: args.len(),
-                    span,
-                });
-            }
-            Err(EvalError::ContinuationReturn { id: *id, value: args[0].clone() })
+            let value = match args.len() {
+                1 => args[0].clone(),
+                _ => Value::Values(args.to_vec()),
+            };
+            Err(EvalError::ContinuationReturn { id: *id, value })
         }
         other => Err(EvalError::NotAProcedure {
             value: other.to_string(),
@@ -3701,8 +3704,9 @@ fn call_with_arg(func: &Value, arg: Value, span: Span, _env: &Env) -> Result<Val
     }
 }
 
-/// Evaluate `(guard (var clause ...) body ...)`.
-fn eval_guard(args: &[Value], form_span: Span, env: &Env) -> Result<Value, EvalError> {
+/// Parse `(guard (var clause ...) body ...)` arguments.
+/// Returns (var_name, clauses, body).
+fn parse_guard_form(args: &[Value], form_span: Span) -> Result<(String, Vec<Value>, Vec<Value>), EvalError> {
     if args.len() < 2 {
         return Err(EvalError::WrongArgCount {
             expected: "at least 2".to_string(),
@@ -3710,7 +3714,6 @@ fn eval_guard(args: &[Value], form_span: Span, env: &Env) -> Result<Value, EvalE
             span: form_span,
         });
     }
-    // First arg: (var clause1 clause2 ...)
     let Value::List(guard_spec, _) = &args[0] else {
         return Err(EvalError::TypeMismatch {
             expected: "guard clause list".to_string(),
@@ -3731,54 +3734,115 @@ fn eval_guard(args: &[Value], form_span: Span, env: &Env) -> Result<Value, EvalE
             span: guard_spec[0].span(),
         });
     };
-    let clauses = &guard_spec[1..];
-    let body = &args[1..];
+    let clauses = guard_spec[1..].to_vec();
+    let body = args[1..].to_vec();
+    Ok((var_name.clone(), clauses, body))
+}
 
-    // Evaluate body expressions
-    let body_result = eval_body(body, env);
+/// Evaluate guard clauses against a raised value.
+fn eval_guard_clauses(
+    var_name: &str,
+    clauses: &[Value],
+    raised: Value,
+    env: &Env,
+) -> Result<Value, EvalError> {
+    let clause_env = Env::with_parent(env);
+    clause_env.define(var_name.to_string(), raised.clone());
 
-    match body_result {
-        Ok(val) => Ok(val),
-        Err(EvalError::SchemeRaise { value }) => {
-            // Bind the raised value to var_name
-            let clause_env = Env::with_parent(env);
-            clause_env.define(var_name.clone(), value.clone());
-
-            // Try each clause
-            for clause in clauses {
-                let Value::List(parts, _) = clause else {
-                    return Err(EvalError::TypeMismatch {
-                        expected: "guard clause".to_string(),
-                        got: clause.to_string(),
-                        span: clause.span(),
-                    });
-                };
-                if parts.is_empty() {
-                    return Err(EvalError::Parse {
-                        message: "empty guard clause".to_string(),
-                        span: clause.span(),
-                    });
-                }
-                // Check for else clause
-                if matches!(&parts[0], Value::Symbol(s, _) if s == "else") {
-                    return eval_body(&parts[1..], &clause_env);
-                }
-                let test = eval(&parts[0], &clause_env)?;
-                if test.is_truthy() {
-                    if parts.len() == 1 {
-                        return Ok(test);
-                    }
-                    let mut last = Value::Void;
-                    for expr in &parts[1..] {
-                        last = eval(expr, &clause_env)?;
-                    }
-                    return Ok(last);
-                }
-            }
-            // No clause matched — re-raise
-            Err(EvalError::SchemeRaise { value })
+    for clause in clauses {
+        let Value::List(parts, _) = clause else {
+            return Err(EvalError::TypeMismatch {
+                expected: "guard clause".to_string(),
+                got: clause.to_string(),
+                span: clause.span(),
+            });
+        };
+        if parts.is_empty() {
+            return Err(EvalError::Parse {
+                message: "empty guard clause".to_string(),
+                span: clause.span(),
+            });
         }
-        Err(e) => Err(e),
+        // Check for else clause
+        if matches!(&parts[0], Value::Symbol(s, _) if s == "else") {
+            return eval_body(&parts[1..], &clause_env);
+        }
+        let test = eval(&parts[0], &clause_env)?;
+        if test.is_truthy() {
+            if parts.len() == 1 {
+                return Ok(test);
+            }
+            let mut last = Value::Void;
+            for expr in &parts[1..] {
+                last = eval(expr, &clause_env)?;
+            }
+            return Ok(last);
+        }
+    }
+    // No clause matched — re-raise
+    Err(EvalError::SchemeRaise { value: raised })
+}
+
+/// Produce a `GuardTailContinue` signal for a guard in tail position.
+fn eval_guard_tail(args: &[Value], form_span: Span, env: &Env) -> Result<Value, EvalError> {
+    let (var_name, clauses, body) = parse_guard_form(args, form_span)?;
+    for expr in &body[..body.len().saturating_sub(1)] {
+        match eval(expr, env) {
+            Ok(_) => {}
+            Err(EvalError::SchemeRaise { value }) => {
+                return eval_guard_clauses(&var_name, &clauses, value, env);
+            }
+            Err(e) => return Err(e),
+        }
+    }
+    let tail_expr = body.last().cloned().unwrap_or(Value::Void);
+    Err(EvalError::GuardTailContinue(Box::new(GuardTailData {
+        expr: tail_expr,
+        env: env.clone(),
+        var_name,
+        clauses,
+        clause_env: env.clone(),
+    })))
+}
+
+/// Evaluate `(guard (var clause ...) body ...)`.
+/// Uses a trampoline for TCO: when the tail body expression leads to another
+/// guard form, GuardTailContinue signals the loop to iterate instead of recurse.
+fn eval_guard(args: &[Value], form_span: Span, env: &Env) -> Result<Value, EvalError> {
+    let (var_name, clauses, body) = parse_guard_form(args, form_span)?;
+
+    // Evaluate non-tail body expressions
+    for expr in &body[..body.len().saturating_sub(1)] {
+        match eval(expr, env) {
+            Ok(_) => {}
+            Err(EvalError::SchemeRaise { value }) => {
+                return eval_guard_clauses(&var_name, &clauses, value, env);
+            }
+            Err(e) => return Err(e),
+        }
+    }
+
+    let mut tail_expr = body.last().cloned().unwrap_or(Value::Void);
+    let mut tail_env = env.clone();
+    let mut cur_var = var_name;
+    let mut cur_clauses = clauses;
+    let mut cur_clause_env = env.clone();
+
+    loop {
+        match eval_inner(&tail_expr, &tail_env, true) {
+            Ok(val) => return Ok(val),
+            Err(EvalError::SchemeRaise { value }) => {
+                return eval_guard_clauses(&cur_var, &cur_clauses, value, &cur_clause_env);
+            }
+            Err(EvalError::GuardTailContinue(data)) => {
+                tail_expr = data.expr;
+                tail_env = data.env;
+                cur_var = data.var_name;
+                cur_clauses = data.clauses;
+                cur_clause_env = data.clause_env;
+            }
+            Err(e) => return Err(e),
+        }
     }
 }
 
