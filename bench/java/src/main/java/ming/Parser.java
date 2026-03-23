@@ -32,6 +32,7 @@ public class Parser {
             case INTEGER -> { advance(); yield new SchemeValue.IntVal(Long.parseLong(tok.value())); }
             case BOOLEAN -> { advance(); yield new SchemeValue.BoolVal(tok.value().equals("true")); }
             case STRING -> { advance(); yield new SchemeValue.StringVal(tok.value()); }
+            case CHAR -> { advance(); yield new SchemeValue.CharVal(tok.value().charAt(0)); }
             case SYMBOL -> { advance(); yield new SchemeValue.SymbolVal(tok.value(), tok.line(), tok.col()); }
             case RPAREN -> throw new EvalError("Unexpected ) at " + tok.line() + ":" + tok.col());
             case EOF -> throw new EvalError("Unexpected end of input at " + tok.line() + ":" + tok.col());

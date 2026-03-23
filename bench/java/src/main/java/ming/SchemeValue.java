@@ -5,7 +5,15 @@ import java.util.List;
 public sealed interface SchemeValue {
     record IntVal(long value) implements SchemeValue {}
     record BoolVal(boolean value) implements SchemeValue {}
-    record StringVal(String value) implements SchemeValue {}
+    final class StringVal implements SchemeValue {
+        private final char[] chars;
+        StringVal(String value) { this.chars = value.toCharArray(); }
+        StringVal(char[] chars) { this.chars = chars; }
+        public String value() { return new String(chars); }
+        public char charAt(int i) { return chars[i]; }
+        public void setCharAt(int i, char c) { chars[i] = c; }
+        public int length() { return chars.length; }
+    }
     record SymbolVal(String name, int line, int col) implements SchemeValue {
         SymbolVal(String name) { this(name, 0, 0); }
     }

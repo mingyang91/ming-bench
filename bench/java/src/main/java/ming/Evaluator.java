@@ -220,7 +220,19 @@ public class Evaluator {
         env.define("string-ref", new SchemeValue.BuiltinVal("string-ref", args -> {
             if (!(args.get(0) instanceof SchemeValue.StringVal s)) throw new EvalError("string-ref: not a string");
             int idx = (int) requireInt(args.get(1));
-            return new SchemeValue.CharVal(s.value().charAt(idx));
+            return new SchemeValue.CharVal(s.charAt(idx));
+        }));
+        env.define("string-copy", new SchemeValue.BuiltinVal("string-copy", args -> {
+            if (!(args.getFirst() instanceof SchemeValue.StringVal s)) throw new EvalError("string-copy: not a string");
+            return new SchemeValue.StringVal(s.value());
+        }));
+        env.define("string-set!", new SchemeValue.BuiltinVal("string-set!", args -> {
+            if (args.size() != 3) throw new EvalError("string-set! requires 3 arguments");
+            if (!(args.get(0) instanceof SchemeValue.StringVal s)) throw new EvalError("string-set!: not a string");
+            int idx = (int) requireInt(args.get(1));
+            if (!(args.get(2) instanceof SchemeValue.CharVal c)) throw new EvalError("string-set!: not a character");
+            s.setCharAt(idx, c.value());
+            return new SchemeValue.VoidVal();
         }));
     }
 

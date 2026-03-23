@@ -5,7 +5,7 @@ import java.util.List;
 
 public class Tokenizer {
     public enum TokenType {
-        LPAREN, RPAREN, QUOTE, SYMBOL, INTEGER, BOOLEAN, STRING, EOF
+        LPAREN, RPAREN, QUOTE, SYMBOL, INTEGER, BOOLEAN, STRING, CHAR, EOF
     }
 
     public record Token(TokenType type, String value, int pos, int line, int col) {}
@@ -130,6 +130,26 @@ public class Tokenizer {
                 throw new EvalError("Unknown literal: " + sb);
             }
             return token(TokenType.BOOLEAN, "false", start);
+        }
+        if (c == '\\') {
+            pos++; // skip backslash
+            if (pos >= input.length()) throw new EvalError("Unexpected end after #\\");
+            char ch = input.charAt(pos);
+            // Named characters
+            if (Character.isLetter(ch)) {
+                int nameStart = pos;
+                while (pos < input.length() && !isDelimiter(input.charAt(pos))) pos++;
+                String name = input.substring(nameStart, pos);
+                if (name.length() == 1) return token(TokenType.CHAR, name, start);
+                return switch (name) {
+                    case "space" -> token(TokenType.CHAR, " ", start);
+                    case "newline" -> token(TokenType.CHAR, "\n", start);
+                    case "tab" -> token(TokenType.CHAR, "\t", start);
+                    default -> throw new EvalError("Unknown character name: " + name);
+                };
+            }
+            pos++;
+            return token(TokenType.CHAR, String.valueOf(ch), start);
         }
         throw new EvalError("Unknown # literal at position " + start);
     }
