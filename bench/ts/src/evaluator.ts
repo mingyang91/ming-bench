@@ -98,6 +98,14 @@ function parse(tokens: Token[], cur: { i: number }): SchemeVal {
 function parseAtom(token: string, pos: Pos): SchemeVal {
   if (token === '#t') return { tag: 'boolean', value: true, pos };
   if (token === '#f') return { tag: 'boolean', value: false, pos };
+  if (token.startsWith('#\\')) {
+    const charName = token.slice(2);
+    if (charName === 'space') return { tag: 'char', value: ' ', pos };
+    if (charName === 'newline') return { tag: 'char', value: '\n', pos };
+    if (charName === 'tab') return { tag: 'char', value: '\t', pos };
+    if (charName.length === 1) return { tag: 'char', value: charName, pos };
+    throw posError(`bad character literal: ${token}`, pos);
+  }
   if (token.startsWith('"') && token.endsWith('"')) {
     const inner = token.slice(1, -1).replace(/\\n/g, '\n').replace(/\\t/g, '\t').replace(/\\"/g, '"').replace(/\\\\/g, '\\');
     return { tag: 'string', value: inner, pos };
@@ -417,6 +425,22 @@ function makeGlobalEnv(output: string[] = []): Env {
     const idx = expectNumber(args[1], 'string-ref', p);
     if (idx < 0 || idx >= args[0].value.length) throw posError('string-ref: index out of range', p);
     return { tag: 'char', value: args[0].value[idx] };
+  });
+  defBuiltin('string-set!', (args, p) => {
+    if (args.length !== 3) throw posError('string-set!: need 3 arguments', p);
+    const str = args[0];
+    if (str.tag !== 'string') throw posError('string-set!: expected string', p);
+    const idx = expectNumber(args[1], 'string-set!', p);
+    const ch = args[2];
+    if (ch.tag !== 'char') throw posError('string-set!: expected char', p);
+    if (idx < 0 || idx >= str.value.length) throw posError('string-set!: index out of range', p);
+    (str as any).value = str.value.slice(0, idx) + ch.value + str.value.slice(idx + 1);
+    return { tag: 'void' };
+  });
+  defBuiltin('string-copy', (args, p) => {
+    if (args.length !== 1) throw posError('string-copy: need 1 argument', p);
+    if (args[0].tag !== 'string') throw posError('string-copy: expected string', p);
+    return { tag: 'string', value: args[0].value };
   });
 
   return env;
