@@ -89,6 +89,14 @@ function fracDiv(a: Frac, b: Frac): Frac {
 // ── Record type identity ──────────────────────────────────────────
 let recordTypeCounter = 0;
 
+// ── Step-limit support ────────────────────────────────────────────
+let stepLimit = 0;  // 0 = unlimited
+let stepCount = 0;
+
+function stepCheck(): void {
+  if (stepLimit > 0 && ++stepCount > stepLimit) throw new EvalError('step limit exceeded');
+}
+
 // ── CPS / Trampoline types ─────────────────────────────────────────
 
 type K = (val: SchemeVal) => TResult;
@@ -123,11 +131,13 @@ function runTrampoline(result: TResult): SchemeVal {
   return result.value;
 }
 
+
 // ── Environment ────────────────────────────────────────────────────
 
 class Env {
   private bindings: Map<string, SchemeVal> = new Map();
-  constructor(private parent: Env | null = null) {}
+  private parent: Env | null;
+  constructor(parent: Env | null = null) { this.parent = parent; }
 
   get(name: string): SchemeVal {
     const val = this.bindings.get(name);
@@ -1611,6 +1621,7 @@ function appendPairs(a: SchemeVal, b: SchemeVal): SchemeVal {
 }
 
 function evaluateCPS(expr: SchemeVal, env: Env, k: K): TResult {
+  stepCheck();
   if (expr.tag === 'symbol') {
     try {
       const val = env.get(expr.value);
@@ -2294,6 +2305,21 @@ export function evalStr(input: string): string {
   const env = makeGlobalEnv();
   const result = evaluateProgram(exprs, env);
   return display(result);
+}
+
+export function evalStrWithLimit(input: string, maxSteps: number): string {
+  const exprs = parse(input);
+  if (exprs.length === 0) throw new EvalError('empty input');
+  stepLimit = maxSteps;
+  stepCount = 0;
+  try {
+    const env = makeGlobalEnv();
+    const result = evaluateProgram(exprs, env);
+    return display(result);
+  } finally {
+    stepLimit = 0;
+    stepCount = 0;
+  }
 }
 
 export function evalStrWithOutput(input: string): { result: string; output: string } {

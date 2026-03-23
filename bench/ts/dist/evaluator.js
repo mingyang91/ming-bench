@@ -65,6 +65,13 @@ function fracDiv(a, b) {
 }
 // ── Record type identity ──────────────────────────────────────────
 let recordTypeCounter = 0;
+// ── Step-limit support ────────────────────────────────────────────
+let stepLimit = 0; // 0 = unlimited
+let stepCount = 0;
+function stepCheck() {
+    if (stepLimit > 0 && ++stepCount > stepLimit)
+        throw new EvalError('step limit exceeded');
+}
 function bounce(thunk) {
     return { done: false, thunk };
 }
@@ -93,11 +100,9 @@ function runTrampoline(result) {
 }
 // ── Environment ────────────────────────────────────────────────────
 class Env {
-    parent;
     bindings = new Map();
-    constructor(parent = null) {
-        this.parent = parent;
-    }
+    parent;
+    constructor(parent = null) { this.parent = parent; }
     get(name) {
         const val = this.bindings.get(name);
         if (val !== undefined)
@@ -1646,6 +1651,7 @@ function appendPairs(a, b) {
     return b; // improper list - just return b
 }
 function evaluateCPS(expr, env, k) {
+    stepCheck();
     if (expr.tag === 'symbol') {
         try {
             const val = env.get(expr.value);
@@ -2300,6 +2306,22 @@ export function evalStr(input) {
     const env = makeGlobalEnv();
     const result = evaluateProgram(exprs, env);
     return display(result);
+}
+export function evalStrWithLimit(input, maxSteps) {
+    const exprs = parse(input);
+    if (exprs.length === 0)
+        throw new EvalError('empty input');
+    stepLimit = maxSteps;
+    stepCount = 0;
+    try {
+        const env = makeGlobalEnv();
+        const result = evaluateProgram(exprs, env);
+        return display(result);
+    }
+    finally {
+        stepLimit = 0;
+        stepCount = 0;
+    }
 }
 export function evalStrWithOutput(input) {
     const exprs = parse(input);
