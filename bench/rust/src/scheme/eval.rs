@@ -423,6 +423,7 @@ fn step_eval_list(
             "letrec*" => return step_letrec_star(&elems[1..], env, k),
             "do" => return step_do(&elems[1..], env, k),
             "define-syntax" => return step_define_syntax(&elems[1..], env),
+            "define-record-type" => return step_define_record_type(&elems[1..], env),
             "guard" => return step_guard(&elems[1..], env, k, wind, handlers),
             _ => {}
         }
@@ -994,6 +995,119 @@ fn parse_syntax_rules(expr: &Expr, env: &Rc<Env>) -> Result<Value, EvalError> {
         rules,
         def_env: Rc::clone(env),
     })
+}
+
+// ── define-record-type ───────────────────────────────────────
+
+/// (define-record-type <name> (constructor field ...) predicate (field accessor) ...)
+fn step_define_record_type(args: &[Expr], env: &Rc<Env>) -> Result<State, EvalError> {
+    // Minimum: type-name, constructor, predicate, at least one field spec
+    if args.len() < 3 {
+        return Err(ErrorKind::BadSyntax {
+            form: "define-record-type".into(),
+            message: "expected (define-record-type <name> (constructor field ...) pred (field accessor) ...)".into(),
+        }.into());
+    }
+    // Type name
+    let type_name = match &args[0].kind {
+        ExprKind::Symbol(s) => s.clone(),
+        _ => return Err(ErrorKind::BadSyntax {
+            form: "define-record-type".into(),
+            message: "type name must be a symbol".into(),
+        }.into()),
+    };
+    // Constructor: (constructor-name field ...)
+    let (ctor_name, ctor_fields) = match &args[1].kind {
+        ExprKind::List(elems) if !elems.is_empty() => {
+            let name = match &elems[0].kind {
+                ExprKind::Symbol(s) => s.clone(),
+                _ => return Err(ErrorKind::BadSyntax {
+                    form: "define-record-type".into(),
+                    message: "constructor name must be a symbol".into(),
+                }.into()),
+            };
+            let fields: Vec<String> = elems[1..].iter().map(|e| match &e.kind {
+                ExprKind::Symbol(s) => Ok(s.clone()),
+                _ => Err(EvalError::from(ErrorKind::BadSyntax {
+                    form: "define-record-type".into(),
+                    message: "constructor field must be a symbol".into(),
+                })),
+            }).collect::<Result<Vec<_>, _>>()?;
+            (name, fields)
+        }
+        _ => return Err(ErrorKind::BadSyntax {
+            form: "define-record-type".into(),
+            message: "expected (constructor-name field ...)".into(),
+        }.into()),
+    };
+    // Predicate name
+    let pred_name = match &args[2].kind {
+        ExprKind::Symbol(s) => s.clone(),
+        _ => return Err(ErrorKind::BadSyntax {
+            form: "define-record-type".into(),
+            message: "predicate must be a symbol".into(),
+        }.into()),
+    };
+    // Field specs: (field-name accessor-name)
+    let mut field_accessors: Vec<(String, String)> = Vec::new();
+    for arg in &args[3..] {
+        match &arg.kind {
+            ExprKind::List(parts) if parts.len() == 2 => {
+                let field = match &parts[0].kind {
+                    ExprKind::Symbol(s) => s.clone(),
+                    _ => return Err(ErrorKind::BadSyntax {
+                        form: "define-record-type".into(),
+                        message: "field name must be a symbol".into(),
+                    }.into()),
+                };
+                let accessor = match &parts[1].kind {
+                    ExprKind::Symbol(s) => s.clone(),
+                    _ => return Err(ErrorKind::BadSyntax {
+                        form: "define-record-type".into(),
+                        message: "accessor name must be a symbol".into(),
+                    }.into()),
+                };
+                field_accessors.push((field, accessor));
+            }
+            _ => return Err(ErrorKind::BadSyntax {
+                form: "define-record-type".into(),
+                message: "field spec must be (field-name accessor-name)".into(),
+            }.into()),
+        }
+    }
+
+    // Create a unique type tag
+    let type_tag = Rc::new(());
+
+    // Define constructor
+    env.define(ctor_name, Value::RecordConstructor {
+        type_tag: Rc::clone(&type_tag),
+        type_name: type_name.clone(),
+        field_names: ctor_fields.clone(),
+    });
+
+    // Define predicate
+    env.define(pred_name, Value::RecordPredicate {
+        type_tag: Rc::clone(&type_tag),
+    });
+
+    // Define accessors - map field name to index in constructor field order
+    for (field, accessor) in &field_accessors {
+        let idx = ctor_fields.iter().position(|f| f == field).ok_or_else(|| {
+            EvalError::from(ErrorKind::BadSyntax {
+                form: "define-record-type".into(),
+                message: format!("field '{}' not in constructor", field),
+            })
+        })?;
+        env.define(accessor.clone(), Value::RecordAccessor {
+            type_tag: Rc::clone(&type_tag),
+            type_name: type_name.clone(),
+            field_name: field.clone(),
+            field_index: idx,
+        });
+    }
+
+    Ok(State::Ret(Value::Void))
 }
 
 // ── guard special form ───────────────────────────────────────
@@ -1885,55 +1999,49 @@ fn step_apply(
             }
         }
         Value::Continuation(captured) => {
+            apply_continuation(captured, args, env, k, wind, span, handlers)
+        }
+        Value::RecordConstructor { type_tag, type_name, field_names } => {
+            if args.len() != field_names.len() {
+                return Err(ErrorKind::WrongArgCount {
+                    expected: field_names.len(),
+                    got: args.len(),
+                }.into());
+            }
+            Ok(State::Ret(Value::Record {
+                type_tag,
+                type_name,
+                fields: args,
+            }))
+        }
+        Value::RecordPredicate { type_tag } => {
             if args.len() != 1 {
                 return Err(ErrorKind::WrongArgCount {
                     expected: 1,
                     got: args.len(),
+                }.into());
+            }
+            let result = match &args[0] {
+                Value::Record { type_tag: ref t, .. } => Rc::ptr_eq(&type_tag, t),
+                _ => false,
+            };
+            Ok(State::Ret(Value::Boolean(result)))
+        }
+        Value::RecordAccessor { type_tag, type_name, field_name: _, field_index } => {
+            if args.len() != 1 {
+                return Err(ErrorKind::WrongArgCount {
+                    expected: 1,
+                    got: args.len(),
+                }.into());
+            }
+            match &args[0] {
+                Value::Record { type_tag: ref t, fields, .. } if Rc::ptr_eq(&type_tag, t) => {
+                    Ok(State::Ret(fields[field_index].clone()))
                 }
-                .into());
-            }
-            let val = args.into_iter().next().expect("checked len");
-            let (target_frames, target_wind, target_handlers) = captured
-                .0
-                .downcast_ref::<(Vec<Frame>, Vec<WindEntry>, Vec<HandlerEntry>)>()
-                .expect("continuation frame type");
-
-            // Compute common prefix length between current and target wind stacks
-            let common_len = wind
-                .iter()
-                .zip(target_wind.iter())
-                .take_while(|(a, b)| a.id == b.id)
-                .count();
-
-            // Build wind operations: unwind current (innermost first), rewind target (outermost first)
-            let mut ops: Vec<WindOp> = Vec::new();
-            // Unwind: from innermost (end) to common prefix
-            for entry in wind[common_len..].iter().rev() {
-                ops.push(WindOp::CallOut(entry.out_thunk.clone()));
-            }
-            // Rewind: from common prefix to innermost
-            for entry in &target_wind[common_len..] {
-                ops.push(WindOp::CallInAndPush(entry.clone()));
-            }
-
-            // Restore target continuation stack and handlers
-            *k = target_frames.clone();
-            *handlers = target_handlers.clone();
-            // Truncate wind to common prefix (unwind ops will pop further as they run)
-            wind.truncate(common_len);
-
-            if ops.is_empty() {
-                Ok(State::Ret(val))
-            } else {
-                // Push WindTransfer frame onto the target stack and start processing
-                k.push(Frame::WindTransfer {
-                    ops,
-                    final_val: val,
-                    env: Rc::clone(env),
-                    span,
-                });
-                // Kick off by returning a dummy value to trigger WindTransfer processing
-                Ok(State::Ret(Value::Void))
+                other => Err(ErrorKind::TypeMismatch {
+                    expected: type_name,
+                    got: other.to_display_string(),
+                }.into()),
             }
         }
         Value::SyntaxRules { .. } => Err(ErrorKind::NotAProcedure {
@@ -1944,6 +2052,62 @@ fn step_apply(
             value: other.to_display_string(),
         }
         .into()),
+    }
+}
+
+fn apply_continuation(
+    captured: CapturedCont,
+    args: Vec<Value>,
+    env: &Rc<Env>,
+    k: &mut Vec<Frame>,
+    wind: &mut Vec<WindEntry>,
+    span: Span,
+    handlers: &mut Vec<HandlerEntry>,
+) -> Result<State, EvalError> {
+    if args.len() != 1 {
+        return Err(ErrorKind::WrongArgCount {
+            expected: 1,
+            got: args.len(),
+        }
+        .into());
+    }
+    let val = args.into_iter().next().expect("checked len");
+    let (target_frames, target_wind, target_handlers) = captured
+        .0
+        .downcast_ref::<(Vec<Frame>, Vec<WindEntry>, Vec<HandlerEntry>)>()
+        .expect("continuation frame type");
+
+    // Compute common prefix length between current and target wind stacks
+    let common_len = wind
+        .iter()
+        .zip(target_wind.iter())
+        .take_while(|(a, b)| a.id == b.id)
+        .count();
+
+    // Build wind operations: unwind current (innermost first), rewind target (outermost first)
+    let mut ops: Vec<WindOp> = Vec::new();
+    for entry in wind[common_len..].iter().rev() {
+        ops.push(WindOp::CallOut(entry.out_thunk.clone()));
+    }
+    for entry in &target_wind[common_len..] {
+        ops.push(WindOp::CallInAndPush(entry.clone()));
+    }
+
+    // Restore target continuation stack and handlers
+    *k = target_frames.clone();
+    *handlers = target_handlers.clone();
+    wind.truncate(common_len);
+
+    if ops.is_empty() {
+        Ok(State::Ret(val))
+    } else {
+        k.push(Frame::WindTransfer {
+            ops,
+            final_val: val,
+            env: Rc::clone(env),
+            span,
+        });
+        Ok(State::Ret(Value::Void))
     }
 }
 

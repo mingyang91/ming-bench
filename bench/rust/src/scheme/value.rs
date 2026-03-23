@@ -53,6 +53,29 @@ pub enum Value {
     },
     /// Multiple return values from `(values ...)`.
     MultipleValues(Vec<Value>),
+    /// A record instance created by `define-record-type`.
+    Record {
+        type_tag: Rc<()>,
+        type_name: String,
+        fields: Vec<Value>,
+    },
+    /// Record constructor procedure.
+    RecordConstructor {
+        type_tag: Rc<()>,
+        type_name: String,
+        field_names: Vec<String>,
+    },
+    /// Record type predicate.
+    RecordPredicate {
+        type_tag: Rc<()>,
+    },
+    /// Record field accessor.
+    RecordAccessor {
+        type_tag: Rc<()>,
+        type_name: String,
+        field_name: String,
+        field_index: usize,
+    },
 }
 
 impl Value {
@@ -85,6 +108,9 @@ impl PartialEq for Value {
             (Value::Continuation(_), Value::Continuation(_)) => false,
             (Value::SyntaxRules { .. }, Value::SyntaxRules { .. }) => false,
             (Value::MultipleValues(a), Value::MultipleValues(b)) => a == b,
+            (Value::Record { type_tag: ta, fields: fa, .. }, Value::Record { type_tag: tb, fields: fb, .. }) => {
+                Rc::ptr_eq(ta, tb) && fa == fb
+            }
             _ => false,
         }
     }
@@ -120,6 +146,12 @@ impl Value {
                 let inner: Vec<String> = vals.iter().map(|v| v.to_display_string()).collect();
                 format!("#<values: {}>", inner.join(" "))
             }
+            Value::Record { type_name, .. } => format!("#<record:{}>", type_name),
+            Value::RecordConstructor { type_name, .. } => format!("#<procedure:make-{}>", type_name),
+            Value::RecordPredicate { .. } => "#<procedure>".into(),
+            Value::RecordAccessor { type_name, field_name, .. } => {
+                format!("#<procedure:{}-{}>", type_name, field_name)
+            }
         }
     }
 
@@ -139,6 +171,8 @@ impl Value {
             Value::Continuation(_) => "#<continuation>".into(),
             Value::SyntaxRules { .. } => "#<macro>".into(),
             Value::MultipleValues(_) => self.to_display_string(),
+            Value::Record { .. } | Value::RecordConstructor { .. }
+            | Value::RecordPredicate { .. } | Value::RecordAccessor { .. } => self.to_display_string(),
             other => other.to_display_string(),
         }
     }
