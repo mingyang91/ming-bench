@@ -66,6 +66,9 @@ object Parser:
         case ')' =>
           result += Token(")", offsetToPos(input, i))
           i += 1
+        case '#' if i + 1 < input.length && input(i + 1) == '\'' =>
+          result += Token("#'", offsetToPos(input, i))
+          i += 2
         case '\'' =>
           result += Token("'", offsetToPos(input, i))
           i += 1
@@ -112,6 +115,9 @@ object Parser:
       case Token("'", pos) :: rest =>
         val (quoted, remaining) = parseExpr(rest)
         (ListVal(List(SymbolVal("quote", Some(pos)), quoted), Some(pos)), remaining)
+      case Token("#'", pos) :: rest =>
+        val (quoted, remaining) = parseExpr(rest)
+        (ListVal(List(SymbolVal("syntax-quote", Some(pos)), quoted), Some(pos)), remaining)
       case Token(text, pos) :: rest =>
         (parseAtom(text, pos), rest)
 

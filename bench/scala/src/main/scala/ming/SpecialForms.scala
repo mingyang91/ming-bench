@@ -111,6 +111,10 @@ object SpecialForms:
         }
         env.define(name, SyntaxRulesVal(name, literalNames, parsedRules, env))
         Void
+      case SymbolVal(name, _) :: transformerExpr :: Nil =>
+        val proc = Interpreter.eval(transformerExpr, env)
+        env.define(name, SyntaxTransformerVal(proc))
+        Void
       case _ => throw new EvalError(posMsg("define-syntax: bad syntax", pos))
 
   def evalQuote(args: List[SchemeValue], pos: Option[SourcePos]): SchemeValue =

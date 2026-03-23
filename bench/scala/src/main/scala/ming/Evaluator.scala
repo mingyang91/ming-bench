@@ -172,6 +172,7 @@ object Evaluator:
     if exprs.isEmpty then throw new EvalError("no expressions")
     val env = makeGlobalEnv(output)
     ContinuationManager.reset()
+    SyntaxCase.reset()
     val result =
       try evalExprsSequentially(exprs, env)
       catch case jump: ContinuationJump => handleContinuationJump(jump)
@@ -185,6 +186,7 @@ object Evaluator:
     if exprs.isEmpty then throw new EvalError("no expressions")
     val env = makeGlobalEnv(output)
     ContinuationManager.reset()
+    SyntaxCase.reset()
     val result =
       try evalExprsSequentially(exprs, env)
       catch case jump: ContinuationJump => handleContinuationJump(jump)

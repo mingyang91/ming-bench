@@ -106,7 +106,9 @@ object BuiltinsDefs:
       ("error", args => errorOp(args)),
       ("make-string", args => makeStringOp(args)),
       ("procedure?", args => procedureCheck(args)),
-      ("apply", args => applyOp(args))
+      ("apply", args => applyOp(args)),
+      ("syntax->datum", args => syntaxToDatumOp(args)),
+      ("datum->syntax", args => datumToSyntaxOp(args))
     )
 
   // --- Helper methods ---
@@ -264,6 +266,14 @@ object BuiltinsDefs:
         case _                                                 => false
       }
     )
+
+  private def syntaxToDatumOp(args: List[SchemeValue]): SchemeValue =
+    if args.length != 1 then throw new EvalError("syntax->datum: requires 1 argument")
+    args.head
+
+  private def datumToSyntaxOp(args: List[SchemeValue]): SchemeValue =
+    if args.length != 2 then throw new EvalError("datum->syntax: requires 2 arguments")
+    args(1)
 
   private def applyOp(args: List[SchemeValue]): SchemeValue =
     if args.length < 2 then throw new EvalError("apply: requires at least 2 arguments")

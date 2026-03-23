@@ -41,7 +41,7 @@ object Interpreter:
         case IntVal(_, _) | RationalVal(_, _, _) | DoubleVal(_, _) | BoolVal(_, _) | StringVal(_, _) |
             MutableStringVal(_, _) | CharVal(_, _) | PairVal(_, _) | MutablePairVal(_) | VectorVal(_, _) |
             LambdaVal(_, _, _, _) | BuiltinVal(_, _) | ContinuationVal(_, _, _, _, _, _, _) |
-            SyntaxRulesVal(_, _, _, _) | ValuesVal(_) | RecordVal(_, _, _) | Void =>
+            SyntaxRulesVal(_, _, _, _) | SyntaxTransformerVal(_) | ValuesVal(_) | RecordVal(_, _, _) | Void =>
           return curExpr
 
         // Symbol lookup
@@ -79,6 +79,15 @@ object Interpreter:
         case ListVal(SymbolVal("define-record-type", _) :: args, pos) =>
           return RecordForms.evalDefineRecordType(args, pos, curEnv)
 
+        case ListVal(SymbolVal("syntax-case", _) :: args, pos) =>
+          return SyntaxCase.evalSyntaxCase(args, pos, curEnv)
+
+        case ListVal(SymbolVal("syntax-quote", _) :: template :: Nil, _) =>
+          return SyntaxCase.evalSyntaxQuote(template)
+
+        case ListVal(SymbolVal("with-syntax", _) :: args, pos) =>
+          return SyntaxCase.evalWithSyntax(args, pos, curEnv)
+
         case ListVal(SymbolVal(name, _) :: args, pos) if tailCallForms.contains(name) =>
           dispatchTailForm(name, args, pos, curEnv) match
             case Done(v)          => return v
@@ -89,6 +98,8 @@ object Interpreter:
           curEnv.get(name) match
             case Some(SyntaxRulesVal(mn, lits, rules, defEnv)) =>
               curExpr = Macro.expand(mn, lits, rules, defEnv, curExpr)
+            case Some(SyntaxTransformerVal(proc)) =>
+              curExpr = applyProc(proc, List(curExpr), pos)
             case _ =>
               val args = curExpr.asInstanceOf[ListVal].elements.tail
               evalApplication(sym, args, pos, curEnv) match

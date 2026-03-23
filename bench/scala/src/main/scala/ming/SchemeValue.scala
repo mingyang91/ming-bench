@@ -27,6 +27,7 @@ enum SchemeValue:
     hasSameBodyFrame: Boolean
   )
   case SyntaxRulesVal(name: String, literals: Set[String], rules: List[(SchemeValue, SchemeValue)], defEnv: Environment)
+  case SyntaxTransformerVal(proc: SchemeValue)
   case ValuesVal(values: List[SchemeValue])
   case RecordVal(typeId: Long, typeName: String, fields: Array[SchemeValue])
   case Void
@@ -63,6 +64,7 @@ enum SchemeValue:
     case BuiltinVal(n, _)                     => s"#<builtin:$n>"
     case ContinuationVal(_, _, _, _, _, _, _) => "#<continuation>"
     case SyntaxRulesVal(_, _, _, _)           => "#<macro>"
+    case SyntaxTransformerVal(_)              => "#<macro>"
     case ValuesVal(vs)                        => vs.map(_.display).mkString(" ")
     case RecordVal(_, tn, fs)                 => s"#<record:$tn>"
     case Void                                 => ""

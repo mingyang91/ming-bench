@@ -24,7 +24,7 @@ object Macro:
       .nextOption()
       .getOrElse(throw new EvalError(s"$macroName: no matching pattern"))
 
-  private def matchForm(
+  private[ming] def matchForm(
     pattern: SchemeValue,
     input: SchemeValue,
     literals: Set[String],
@@ -35,7 +35,7 @@ object Macro:
         matchListElems(pElems, iElems, literals, macroName)
       case _ => None
 
-  private def matchElem(
+  private[ming] def matchElem(
     pattern: SchemeValue,
     input: SchemeValue,
     literals: Set[String],
@@ -56,7 +56,7 @@ object Macro:
       case (IntVal(a, _), IntVal(b, _)) if a == b   => Some(Map.empty)
       case _                                        => None
 
-  private def matchListElems(
+  private[ming] def matchListElems(
     pElems: List[SchemeValue],
     iElems: List[SchemeValue],
     literals: Set[String],
@@ -70,7 +70,7 @@ object Macro:
     if ellipsisIdx < 0 then matchFixed(pElems, iElems, literals, macroName)
     else matchWithEllipsis(pElems, iElems, ellipsisIdx, literals, macroName)
 
-  private def matchFixed(
+  private[ming] def matchFixed(
     pElems: List[SchemeValue],
     iElems: List[SchemeValue],
     literals: Set[String],
@@ -86,7 +86,7 @@ object Macro:
       i += 1
     Some(bindings)
 
-  private def matchWithEllipsis(
+  private[ming] def matchWithEllipsis(
     pElems: List[SchemeValue],
     iElems: List[SchemeValue],
     ellipsisIdx: Int,
@@ -141,7 +141,7 @@ object Macro:
 
     Some(bindings)
 
-  private def collectPatternVars(
+  private[ming] def collectPatternVars(
     pattern: SchemeValue,
     literals: Set[String],
     macroName: String
@@ -153,7 +153,7 @@ object Macro:
         elems.flatMap(collectPatternVars(_, literals, macroName)).toSet
       case _ => Set.empty
 
-  private def collectAllPatternVars(
+  private[ming] def collectAllPatternVars(
     pattern: SchemeValue,
     literals: Set[String],
     macroName: String
@@ -164,7 +164,7 @@ object Macro:
       case _ => collectPatternVars(pattern, literals, macroName)
 
   /** Expand a template, substituting pattern variables and applying hygiene. */
-  private def expandTemplate(
+  private[ming] def expandTemplate(
     template: SchemeValue,
     bindings: Bindings,
     defEnv: Environment,
@@ -179,16 +179,16 @@ object Macro:
       // Hygiene: free template variables resolve to definition-site values
       case SymbolVal(name, _) if !patternVars.contains(name) =>
         defEnv.get(name) match
-          case Some(_: SyntaxRulesVal) => template
-          case Some(value)             => value
-          case None                    => template
+          case Some(_: SyntaxRulesVal) | Some(_: SyntaxTransformerVal) => template
+          case Some(value)                                             => value
+          case None                                                    => template
 
       case ListVal(elems, pos) =>
         ListVal(expandListElems(elems, bindings, defEnv, patternVars), pos)
 
       case _ => template
 
-  private def expandListElems(
+  private[ming] def expandListElems(
     elems: List[SchemeValue],
     bindings: Bindings,
     defEnv: Environment,
@@ -226,11 +226,11 @@ object Macro:
         i += 1
     result.result()
 
-  private def isEllipsis(sv: SchemeValue): Boolean = sv match
+  private[ming] def isEllipsis(sv: SchemeValue): Boolean = sv match
     case SymbolVal("...", _) => true
     case _                   => false
 
-  private def collectTemplateVars(template: SchemeValue): Set[String] =
+  private[ming] def collectTemplateVars(template: SchemeValue): Set[String] =
     template match
       case SymbolVal(name, _) if name != "..." => Set(name)
       case ListVal(elems, _)                   => elems.flatMap(collectTemplateVars).toSet
