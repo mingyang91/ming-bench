@@ -1,3 +1,5 @@
+use crate::scheme::value::Span;
+
 /// Evaluation error type for the Scheme interpreter.
 #[derive(Debug, PartialEq, thiserror::Error)]
 pub enum EvalError {
@@ -18,4 +20,27 @@ pub enum EvalError {
 
     #[error("not a procedure: {value}")]
     NotAProcedure { value: String },
+
+    #[error("{line}:{col}: {inner}")]
+    WithPosition {
+        line: usize,
+        col: usize,
+        inner: Box<EvalError>,
+    },
+}
+
+impl EvalError {
+    pub fn at(self, span: Option<Span>) -> Self {
+        match span {
+            Some(s) => match self {
+                EvalError::WithPosition { .. } => self,
+                _ => EvalError::WithPosition {
+                    line: s.line,
+                    col: s.col,
+                    inner: Box::new(self),
+                },
+            },
+            None => self,
+        }
+    }
 }

@@ -3,7 +3,7 @@ use std::rc::Rc;
 
 use crate::scheme::env::Env;
 use crate::scheme::error::EvalError;
-use crate::scheme::value::Value;
+use crate::scheme::value::{Span, Value};
 
 const BUILTINS: &[&str] = &[
     "+", "-", "*", "/", "<", ">", "=", "<=", ">=", "not",
@@ -20,29 +20,34 @@ pub fn default_env() -> Rc<RefCell<Env>> {
 }
 
 pub fn eval(expr: &Value, env: &Rc<RefCell<Env>>) -> Result<Value, EvalError> {
+    let span = expr.span();
     match expr {
         Value::Int(_) | Value::Bool(_) | Value::String(_) | Value::Builtin(_) => Ok(expr.clone()),
         Value::Closure { .. } => Ok(expr.clone()),
-        Value::Symbol(name) => env.borrow().get(name),
-        Value::List(elems) => eval_list(elems, env),
+        Value::Symbol(name, _) => env.borrow().get(name).map_err(|e| e.at(span)),
+        Value::List(elems, _) => eval_list(elems, span, env),
         Value::Void => Ok(Value::Void),
     }
 }
 
-fn eval_list(elems: &[Value], env: &Rc<RefCell<Env>>) -> Result<Value, EvalError> {
+fn eval_list(
+    elems: &[Value],
+    span: Option<Span>,
+    env: &Rc<RefCell<Env>>,
+) -> Result<Value, EvalError> {
     if elems.is_empty() {
-        return Err(EvalError::Parse { msg: "empty application".into() });
+        return Err(EvalError::Parse { msg: "empty application".into() }.at(span));
     }
 
-    if let Value::Symbol(op) = &elems[0] {
+    if let Value::Symbol(op, _) = &elems[0] {
         match op.as_str() {
             "and" => return eval_and(&elems[1..], env),
             "or" => return eval_or(&elems[1..], env),
-            "if" => return eval_if(&elems[1..], env),
-            "define" => return eval_define(&elems[1..], env),
-            "lambda" => return eval_lambda(&elems[1..], env),
-            "quote" => return eval_quote(&elems[1..]),
-            "let" => return eval_let(&elems[1..], env),
+            "if" => return eval_if(&elems[1..], span, env),
+            "define" => return eval_define(&elems[1..], span, env),
+            "lambda" => return eval_lambda(&elems[1..], span, env),
+            "quote" => return eval_quote(&elems[1..], span),
+            "let" => return eval_let(&elems[1..], span, env),
             "begin" => return eval_begin(&elems[1..], env),
             "cond" => return eval_cond(&elems[1..], env),
             _ => {}
@@ -50,9 +55,12 @@ fn eval_list(elems: &[Value], env: &Rc<RefCell<Env>>) -> Result<Value, EvalError
     }
 
     let func = eval(&elems[0], env)?;
-    let args: Vec<Value> = elems[1..].iter().map(|e| eval(e, env)).collect::<Result<_, _>>()?;
+    let args: Vec<Value> = elems[1..]
+        .iter()
+        .map(|e| eval(e, env))
+        .collect::<Result<_, _>>()?;
 
-    apply(&func, &args)
+    apply(&func, &args).map_err(|e| e.at(span))
 }
 
 fn apply(func: &Value, args: &[Value]) -> Result<Value, EvalError> {
@@ -79,9 +87,13 @@ fn apply(func: &Value, args: &[Value]) -> Result<Value, EvalError> {
     }
 }
 
-fn eval_if(args: &[Value], env: &Rc<RefCell<Env>>) -> Result<Value, EvalError> {
+fn eval_if(
+    args: &[Value],
+    span: Option<Span>,
+    env: &Rc<RefCell<Env>>,
+) -> Result<Value, EvalError> {
     if args.len() < 2 || args.len() > 3 {
-        return Err(EvalError::Parse { msg: "if requires 2 or 3 arguments".into() });
+        return Err(EvalError::Parse { msg: "if requires 2 or 3 arguments".into() }.at(span));
     }
     let cond = eval(&args[0], env)?;
     if !is_false(&cond) {
@@ -93,39 +105,48 @@ fn eval_if(args: &[Value], env: &Rc<RefCell<Env>>) -> Result<Value, EvalError> {
     }
 }
 
-fn eval_define(args: &[Value], env: &Rc<RefCell<Env>>) -> Result<Value, EvalError> {
+fn eval_define(
+    args: &[Value],
+    span: Option<Span>,
+    env: &Rc<RefCell<Env>>,
+) -> Result<Value, EvalError> {
     if args.is_empty() {
-        return Err(EvalError::Parse { msg: "define requires arguments".into() });
+        return Err(EvalError::Parse { msg: "define requires arguments".into() }.at(span));
     }
     match &args[0] {
-        Value::Symbol(name) => {
+        Value::Symbol(name, _) => {
             if args.len() != 2 {
-                return Err(EvalError::Parse { msg: "define requires exactly 2 arguments".into() });
+                return Err(
+                    EvalError::Parse { msg: "define requires exactly 2 arguments".into() }
+                        .at(span),
+                );
             }
             let val = eval(&args[1], env)?;
             env.borrow_mut().define(name.clone(), val);
             Ok(Value::Void)
         }
-        Value::List(sig) => {
-            // (define (f params...) body...)
+        Value::List(sig, _) => {
             if sig.is_empty() {
-                return Err(EvalError::Parse { msg: "define: empty signature".into() });
+                return Err(EvalError::Parse { msg: "define: empty signature".into() }.at(span));
             }
-            let Value::Symbol(name) = &sig[0] else {
-                return Err(EvalError::Parse { msg: "define: expected function name".into() });
+            let Value::Symbol(name, _) = &sig[0] else {
+                return Err(
+                    EvalError::Parse { msg: "define: expected function name".into() }.at(span),
+                );
             };
             let params: Vec<String> = sig[1..]
                 .iter()
                 .map(|p| match p {
-                    Value::Symbol(s) => Ok(s.clone()),
+                    Value::Symbol(s, _) => Ok(s.clone()),
                     other => Err(EvalError::Parse {
                         msg: format!("define: expected parameter name, got {other}"),
-                    }),
+                    }
+                    .at(span)),
                 })
                 .collect::<Result<_, _>>()?;
             let body = args[1..].to_vec();
             if body.is_empty() {
-                return Err(EvalError::Parse { msg: "define: empty body".into() });
+                return Err(EvalError::Parse { msg: "define: empty body".into() }.at(span));
             }
             let closure = Value::Closure {
                 params,
@@ -137,24 +158,34 @@ fn eval_define(args: &[Value], env: &Rc<RefCell<Env>>) -> Result<Value, EvalErro
         }
         other => Err(EvalError::Parse {
             msg: format!("define: expected symbol or list, got {other}"),
-        }),
+        }
+        .at(span)),
     }
 }
 
-fn eval_lambda(args: &[Value], env: &Rc<RefCell<Env>>) -> Result<Value, EvalError> {
+fn eval_lambda(
+    args: &[Value],
+    span: Option<Span>,
+    env: &Rc<RefCell<Env>>,
+) -> Result<Value, EvalError> {
     if args.len() < 2 {
-        return Err(EvalError::Parse { msg: "lambda requires params and body".into() });
+        return Err(
+            EvalError::Parse { msg: "lambda requires params and body".into() }.at(span),
+        );
     }
-    let Value::List(param_list) = &args[0] else {
-        return Err(EvalError::Parse { msg: "lambda: expected parameter list".into() });
+    let Value::List(param_list, _) = &args[0] else {
+        return Err(
+            EvalError::Parse { msg: "lambda: expected parameter list".into() }.at(span),
+        );
     };
     let params: Vec<String> = param_list
         .iter()
         .map(|p| match p {
-            Value::Symbol(s) => Ok(s.clone()),
+            Value::Symbol(s, _) => Ok(s.clone()),
             other => Err(EvalError::Parse {
                 msg: format!("lambda: expected parameter name, got {other}"),
-            }),
+            }
+            .at(span)),
         })
         .collect::<Result<_, _>>()?;
     let body = args[1..].to_vec();
@@ -165,9 +196,9 @@ fn eval_lambda(args: &[Value], env: &Rc<RefCell<Env>>) -> Result<Value, EvalErro
     })
 }
 
-fn eval_quote(args: &[Value]) -> Result<Value, EvalError> {
+fn eval_quote(args: &[Value], span: Option<Span>) -> Result<Value, EvalError> {
     if args.len() != 1 {
-        return Err(EvalError::Parse { msg: "quote requires exactly 1 argument".into() });
+        return Err(EvalError::Parse { msg: "quote requires exactly 1 argument".into() }.at(span));
     }
     Ok(args[0].clone())
 }
@@ -198,29 +229,43 @@ fn eval_or(exprs: &[Value], env: &Rc<RefCell<Env>>) -> Result<Value, EvalError> 
     eval(&exprs[exprs.len() - 1], env)
 }
 
-fn eval_let(args: &[Value], env: &Rc<RefCell<Env>>) -> Result<Value, EvalError> {
+fn eval_let(
+    args: &[Value],
+    span: Option<Span>,
+    env: &Rc<RefCell<Env>>,
+) -> Result<Value, EvalError> {
     if args.len() < 2 {
-        return Err(EvalError::Parse { msg: "let requires bindings and body".into() });
+        return Err(EvalError::Parse { msg: "let requires bindings and body".into() }.at(span));
     }
     // Named let: (let name ((var init) ...) body ...)
-    if let Value::Symbol(name) = &args[0] {
+    if let Value::Symbol(name, _) = &args[0] {
         if args.len() < 3 {
-            return Err(EvalError::Parse { msg: "named let requires bindings and body".into() });
+            return Err(
+                EvalError::Parse { msg: "named let requires bindings and body".into() }.at(span),
+            );
         }
-        let Value::List(bindings) = &args[1] else {
-            return Err(EvalError::Parse { msg: "let: expected bindings list".into() });
+        let Value::List(bindings, _) = &args[1] else {
+            return Err(
+                EvalError::Parse { msg: "let: expected bindings list".into() }.at(span),
+            );
         };
         let mut params = Vec::new();
         let mut inits = Vec::new();
         for binding in bindings {
-            let Value::List(pair) = binding else {
-                return Err(EvalError::Parse { msg: "let: expected binding pair".into() });
+            let Value::List(pair, _) = binding else {
+                return Err(
+                    EvalError::Parse { msg: "let: expected binding pair".into() }.at(span),
+                );
             };
             if pair.len() != 2 {
-                return Err(EvalError::Parse { msg: "let: binding must have 2 elements".into() });
+                return Err(
+                    EvalError::Parse { msg: "let: binding must have 2 elements".into() }.at(span),
+                );
             }
-            let Value::Symbol(param) = &pair[0] else {
-                return Err(EvalError::Parse { msg: "let: expected variable name".into() });
+            let Value::Symbol(param, _) = &pair[0] else {
+                return Err(
+                    EvalError::Parse { msg: "let: expected variable name".into() }.at(span),
+                );
             };
             params.push(param.clone());
             inits.push(eval(&pair[1], env)?);
@@ -244,19 +289,23 @@ fn eval_let(args: &[Value], env: &Rc<RefCell<Env>>) -> Result<Value, EvalError> 
         }
         return Ok(result);
     }
-    let Value::List(bindings) = &args[0] else {
-        return Err(EvalError::Parse { msg: "let: expected bindings list".into() });
+    let Value::List(bindings, _) = &args[0] else {
+        return Err(EvalError::Parse { msg: "let: expected bindings list".into() }.at(span));
     };
     let let_env = Env::with_parent(env);
     for binding in bindings {
-        let Value::List(pair) = binding else {
-            return Err(EvalError::Parse { msg: "let: expected binding pair".into() });
+        let Value::List(pair, _) = binding else {
+            return Err(EvalError::Parse { msg: "let: expected binding pair".into() }.at(span));
         };
         if pair.len() != 2 {
-            return Err(EvalError::Parse { msg: "let: binding must have 2 elements".into() });
+            return Err(
+                EvalError::Parse { msg: "let: binding must have 2 elements".into() }.at(span),
+            );
         }
-        let Value::Symbol(name) = &pair[0] else {
-            return Err(EvalError::Parse { msg: "let: expected variable name".into() });
+        let Value::Symbol(name, _) = &pair[0] else {
+            return Err(
+                EvalError::Parse { msg: "let: expected variable name".into() }.at(span),
+            );
         };
         let val = eval(&pair[1], env)?;
         let_env.borrow_mut().define(name.clone(), val);
@@ -278,13 +327,13 @@ fn eval_begin(args: &[Value], env: &Rc<RefCell<Env>>) -> Result<Value, EvalError
 
 fn eval_cond(clauses: &[Value], env: &Rc<RefCell<Env>>) -> Result<Value, EvalError> {
     for clause in clauses {
-        let Value::List(parts) = clause else {
+        let Value::List(parts, _) = clause else {
             return Err(EvalError::Parse { msg: "cond: expected clause".into() });
         };
         if parts.is_empty() {
             return Err(EvalError::Parse { msg: "cond: empty clause".into() });
         }
-        if let Value::Symbol(s) = &parts[0] {
+        if let Value::Symbol(s, _) = &parts[0] {
             if s == "else" {
                 let mut result = Value::Void;
                 for expr in &parts[1..] {
@@ -372,10 +421,10 @@ fn apply_builtin(name: &str, args: &[Value]) -> Result<Value, EvalError> {
                 return Err(EvalError::WrongArgCount { expected: 2, got: args.len() });
             }
             match &args[1] {
-                Value::List(rest) => {
+                Value::List(rest, _) => {
                     let mut new_list = vec![args[0].clone()];
                     new_list.extend(rest.iter().cloned());
-                    Ok(Value::List(new_list))
+                    Ok(Value::List(new_list, None))
                 }
                 _ => Err(EvalError::TypeMismatch {
                     expected: "list".into(),
@@ -388,7 +437,7 @@ fn apply_builtin(name: &str, args: &[Value]) -> Result<Value, EvalError> {
                 return Err(EvalError::WrongArgCount { expected: 1, got: args.len() });
             }
             match &args[0] {
-                Value::List(elems) if !elems.is_empty() => Ok(elems[0].clone()),
+                Value::List(elems, _) if !elems.is_empty() => Ok(elems[0].clone()),
                 _ => Err(EvalError::TypeMismatch {
                     expected: "pair".into(),
                     got: format!("{}", args[0]),
@@ -400,7 +449,9 @@ fn apply_builtin(name: &str, args: &[Value]) -> Result<Value, EvalError> {
                 return Err(EvalError::WrongArgCount { expected: 1, got: args.len() });
             }
             match &args[0] {
-                Value::List(elems) if !elems.is_empty() => Ok(Value::List(elems[1..].to_vec())),
+                Value::List(elems, _) if !elems.is_empty() => {
+                    Ok(Value::List(elems[1..].to_vec(), None))
+                }
                 _ => Err(EvalError::TypeMismatch {
                     expected: "pair".into(),
                     got: format!("{}", args[0]),
@@ -411,20 +462,20 @@ fn apply_builtin(name: &str, args: &[Value]) -> Result<Value, EvalError> {
             if args.len() != 1 {
                 return Err(EvalError::WrongArgCount { expected: 1, got: args.len() });
             }
-            Ok(Value::Bool(matches!(&args[0], Value::List(v) if v.is_empty())))
+            Ok(Value::Bool(matches!(&args[0], Value::List(v, _) if v.is_empty())))
         }
-        "list" => Ok(Value::List(args.to_vec())),
+        "list" => Ok(Value::List(args.to_vec(), None)),
         "append" => {
             if args.len() != 2 {
                 return Err(EvalError::WrongArgCount { expected: 2, got: args.len() });
             }
             match (&args[0], &args[1]) {
-                (Value::List(a), Value::List(b)) => {
+                (Value::List(a, _), Value::List(b, _)) => {
                     let mut result = a.clone();
                     result.extend(b.iter().cloned());
-                    Ok(Value::List(result))
+                    Ok(Value::List(result, None))
                 }
-                (Value::List(_), other) => Err(EvalError::TypeMismatch {
+                (Value::List(_, _), other) => Err(EvalError::TypeMismatch {
                     expected: "list".into(),
                     got: format!("{other}"),
                 }),
@@ -439,7 +490,7 @@ fn apply_builtin(name: &str, args: &[Value]) -> Result<Value, EvalError> {
                 return Err(EvalError::WrongArgCount { expected: 1, got: args.len() });
             }
             match &args[0] {
-                Value::List(elems) => Ok(Value::Int(elems.len() as i64)),
+                Value::List(elems, _) => Ok(Value::Int(elems.len() as i64)),
                 _ => Err(EvalError::TypeMismatch {
                     expected: "list".into(),
                     got: format!("{}", args[0]),
@@ -468,13 +519,13 @@ fn apply_builtin(name: &str, args: &[Value]) -> Result<Value, EvalError> {
             if args.len() != 1 {
                 return Err(EvalError::WrongArgCount { expected: 1, got: args.len() });
             }
-            Ok(Value::Bool(matches!(&args[0], Value::List(v) if !v.is_empty())))
+            Ok(Value::Bool(matches!(&args[0], Value::List(v, _) if !v.is_empty())))
         }
         "symbol?" => {
             if args.len() != 1 {
                 return Err(EvalError::WrongArgCount { expected: 1, got: args.len() });
             }
-            Ok(Value::Bool(matches!(&args[0], Value::Symbol(_))))
+            Ok(Value::Bool(matches!(&args[0], Value::Symbol(_, _))))
         }
         _ => Err(EvalError::UnboundVariable { name: name.into() }),
     }
