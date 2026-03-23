@@ -139,6 +139,25 @@ function tokenize(input) {
             col++;
             continue;
         }
+        if (ch === '`') {
+            tokens.push({ text: '`', pos: startPos });
+            i++;
+            col++;
+            continue;
+        }
+        if (ch === ',') {
+            if (i + 1 < input.length && input[i + 1] === '@') {
+                tokens.push({ text: ',@', pos: startPos });
+                i += 2;
+                col += 2;
+            }
+            else {
+                tokens.push({ text: ',', pos: startPos });
+                i++;
+                col++;
+            }
+            continue;
+        }
         if (ch === '#' && i + 1 < input.length && input[i + 1] === "'") {
             tokens.push({ text: "#'", pos: startPos });
             i += 2;
@@ -198,6 +217,21 @@ function parse(tokens, cur) {
         cur.i++;
         const quoted = parse(tokens, cur);
         return { tag: 'list', elements: [{ tag: 'symbol', value: 'quote', pos: tok.pos }, quoted], pos: tok.pos };
+    }
+    if (tok.text === '`') {
+        cur.i++;
+        const body = parse(tokens, cur);
+        return { tag: 'list', elements: [{ tag: 'symbol', value: 'quasiquote', pos: tok.pos }, body], pos: tok.pos };
+    }
+    if (tok.text === ',') {
+        cur.i++;
+        const body = parse(tokens, cur);
+        return { tag: 'list', elements: [{ tag: 'symbol', value: 'unquote', pos: tok.pos }, body], pos: tok.pos };
+    }
+    if (tok.text === ',@') {
+        cur.i++;
+        const body = parse(tokens, cur);
+        return { tag: 'list', elements: [{ tag: 'symbol', value: 'unquote-splicing', pos: tok.pos }, body], pos: tok.pos };
     }
     if (tok.text === "#'") {
         cur.i++;
@@ -579,6 +613,73 @@ function doWind(target, after) {
     return doUnwindStep(unwindCount);
 }
 let fuel = 0;
+// ── Quasiquote expansion ──────────────────────────────────────────
+function expandQQ(tmpl, env, k, depth) {
+    if (tmpl.tag === 'list' && tmpl.elements.length === 2) {
+        const h = tmpl.elements[0];
+        if (h.tag === 'symbol' && h.value === 'unquote') {
+            if (depth === 1)
+                return evalK(tmpl.elements[1], env, k);
+            return expandQQ(tmpl.elements[1], env, inner => {
+                return k({ tag: 'list', elements: [{ tag: 'symbol', value: 'unquote' }, inner] });
+            }, depth - 1);
+        }
+        if (h.tag === 'symbol' && h.value === 'quasiquote') {
+            return expandQQ(tmpl.elements[1], env, inner => {
+                return k({ tag: 'list', elements: [{ tag: 'symbol', value: 'quasiquote' }, inner] });
+            }, depth + 1);
+        }
+    }
+    if (tmpl.tag === 'list') {
+        const elems = tmpl.elements;
+        // Check for dotted pair: (a b . c) stored as [..., '.', last]
+        const dotIdx = elems.findIndex((e, i) => i > 0 && e.tag === 'symbol' && e.value === '.');
+        const hasDot = dotIdx !== -1 && dotIdx === elems.length - 2;
+        const mainElems = hasDot ? elems.slice(0, dotIdx) : elems;
+        const tailElem = hasDot ? elems[elems.length - 1] : null;
+        // Process list elements, handling unquote-splicing
+        const processElems = (i, acc) => {
+            if (i >= mainElems.length) {
+                if (tailElem) {
+                    return expandQQ(tailElem, env, tailVal => {
+                        let result = tailVal;
+                        for (let j = acc.length - 1; j >= 0; j--)
+                            result = makePair(acc[j], result);
+                        return k(result);
+                    }, depth);
+                }
+                return k(arrayToList(acc));
+            }
+            const el = mainElems[i];
+            if (el.tag === 'list' && el.elements.length === 2 &&
+                el.elements[0].tag === 'symbol' && el.elements[0].value === 'unquote-splicing') {
+                if (depth === 1) {
+                    return evalK(el.elements[1], env, spliced => {
+                        const splicedArr = listToArray(spliced);
+                        return processElems(i + 1, acc.concat(splicedArr));
+                    });
+                }
+                return expandQQ(el.elements[1], env, inner => {
+                    const newEl = { tag: 'list', elements: [{ tag: 'symbol', value: 'unquote-splicing' }, inner] };
+                    return processElems(i + 1, acc.concat([newEl]));
+                }, depth - 1);
+            }
+            return expandQQ(el, env, expanded => {
+                return processElems(i + 1, acc.concat([expanded]));
+            }, depth);
+        };
+        return processElems(0, []);
+    }
+    if (tmpl.tag === 'pair') {
+        return expandQQ(tmpl.car, env, qqCar => {
+            return expandQQ(tmpl.cdr, env, qqCdr => {
+                return k(makePair(qqCar, qqCdr));
+            }, depth);
+        }, depth);
+    }
+    // Atom — return as-is (like quote)
+    return k(quoteConvert(tmpl));
+}
 function evalK(expr, env, k) {
     if (++fuel > 500) {
         fuel = 0;
@@ -608,6 +709,10 @@ function evalK(expr, env, k) {
                 if (elems.length !== 2)
                     throw posError('quote: need 1 argument', expr.pos);
                 return k(quoteConvert(elems[1]));
+            case 'quasiquote':
+                if (elems.length !== 2)
+                    throw posError('quasiquote: need 1 argument', expr.pos);
+                return expandQQ(elems[1], env, k, 1);
             case 'if':
                 if (elems.length < 3 || elems.length > 4)
                     throw posError('if: bad syntax', expr.pos);
@@ -907,6 +1012,13 @@ function evalK(expr, env, k) {
                         if (isTruthy(test)) {
                             if (clause.elements.length === 1)
                                 return k(test);
+                            // Support (test => proc) arrow clause
+                            if (clause.elements.length === 3 &&
+                                clause.elements[1].tag === 'symbol' && clause.elements[1].value === '=>') {
+                                return evalK(clause.elements[2], env, proc => {
+                                    return applyK(proc, [test], k, clause.pos);
+                                });
+                            }
                             return evalSeqArr(clause.elements.slice(1), env, k);
                         }
                         return evalClauses(i + 1);
@@ -1344,8 +1456,8 @@ function applyK(proc, args, k, pos) {
             throw posError('map: need at least 2 arguments', pos);
         const fn = args[0];
         const lists = args.slice(1);
-        // Iterate through pair chains
-        let cursors = lists.slice();
+        // Iterate through pair chains — normalize list-tagged values to pair chains
+        let cursors = lists.map(l => l.tag === 'list' ? arrayToList(l.elements) : l);
         const results = [];
         const mapLoop = () => {
             // Check if any list is exhausted
@@ -1355,7 +1467,7 @@ function applyK(proc, args, k, pos) {
                 if (c.tag !== 'pair')
                     throw posError('map: expected list', pos);
             const fnArgs = cursors.map(c => c.car);
-            cursors = cursors.map(c => c.cdr);
+            cursors = cursors.map(c => { const d = c.cdr; return d.tag === 'list' ? arrayToList(d.elements) : d; });
             return applyK(fn, fnArgs, val => { results.push(val); return mapLoop(); }, pos);
         };
         return mapLoop();
@@ -1365,7 +1477,7 @@ function applyK(proc, args, k, pos) {
             throw posError('for-each: need at least 2 arguments', pos);
         const fn = args[0];
         const lists = args.slice(1);
-        let cursors = lists.slice();
+        let cursors = lists.map(l => l.tag === 'list' ? arrayToList(l.elements) : l);
         const forEachLoop = () => {
             if (cursors.some(c => isNull(c)))
                 return k({ tag: 'void' });
@@ -1373,7 +1485,7 @@ function applyK(proc, args, k, pos) {
                 if (c.tag !== 'pair')
                     throw posError('for-each: expected list', pos);
             const fnArgs = cursors.map(c => c.car);
-            cursors = cursors.map(c => c.cdr);
+            cursors = cursors.map(c => { const d = c.cdr; return d.tag === 'list' ? arrayToList(d.elements) : d; });
             return applyK(fn, fnArgs, _ => forEachLoop(), pos);
         };
         return forEachLoop();
@@ -1612,16 +1724,22 @@ function makeGlobalEnv(output = []) {
         }
         return { tag: 'number', value: r };
     });
-    defBuiltin('<', (args, p) => { if (args.length !== 2)
-        throw posError('<: need 2 arguments', p); return { tag: 'boolean', value: numericFloat(args[0], '<', p) < numericFloat(args[1], '<', p) }; });
-    defBuiltin('>', (args, p) => { if (args.length !== 2)
-        throw posError('>: need 2 arguments', p); return { tag: 'boolean', value: numericFloat(args[0], '>', p) > numericFloat(args[1], '>', p) }; });
-    defBuiltin('=', (args, p) => { if (args.length !== 2)
-        throw posError('=: need 2 arguments', p); return { tag: 'boolean', value: numericFloat(args[0], '=', p) === numericFloat(args[1], '=', p) }; });
-    defBuiltin('<=', (args, p) => { if (args.length !== 2)
-        throw posError('<=: need 2 arguments', p); return { tag: 'boolean', value: numericFloat(args[0], '<=', p) <= numericFloat(args[1], '<=', p) }; });
-    defBuiltin('>=', (args, p) => { if (args.length !== 2)
-        throw posError('>=: need 2 arguments', p); return { tag: 'boolean', value: numericFloat(args[0], '>=', p) >= numericFloat(args[1], '>=', p) }; });
+    const defChainCmp = (name, cmp) => {
+        defBuiltin(name, (args, p) => {
+            if (args.length < 2)
+                throw posError(`${name}: need at least 2 arguments`, p);
+            for (let i = 0; i < args.length - 1; i++) {
+                if (!cmp(numericFloat(args[i], name, p), numericFloat(args[i + 1], name, p)))
+                    return { tag: 'boolean', value: false };
+            }
+            return { tag: 'boolean', value: true };
+        });
+    };
+    defChainCmp('<', (a, b) => a < b);
+    defChainCmp('>', (a, b) => a > b);
+    defChainCmp('=', (a, b) => a === b);
+    defChainCmp('<=', (a, b) => a <= b);
+    defChainCmp('>=', (a, b) => a >= b);
     defBuiltin('not', (args, p) => { if (args.length !== 1)
         throw posError('not: need 1 argument', p); return { tag: 'boolean', value: !isTruthy(args[0]) }; });
     // Pair / List operations
