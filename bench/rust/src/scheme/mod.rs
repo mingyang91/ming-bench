@@ -827,6 +827,19 @@ fn eval(expr: &Expr, env: &Env) -> Result<Value, EvalError> {
                         "define" => return eval_define(&cur_expr, &items[1..], &cur_env),
                         "quote" => return eval_quote(&cur_expr, &items[1..]),
                         "lambda" => return eval_lambda(&cur_expr, &items[1..], &cur_env),
+                        "set!" => {
+                            let args = &items[1..];
+                            if args.len() != 2 {
+                                return Err(cur_expr.wrap_err(EvalError::BadSyntax("set! requires exactly 2 arguments".into())));
+                            }
+                            let name = match &args[0].kind {
+                                ExprKind::Symbol(n) => n.clone(),
+                                _ => return Err(cur_expr.wrap_err(EvalError::BadSyntax("set!: first argument must be a variable".into()))),
+                            };
+                            let val = eval(&args[1], &cur_env)?;
+                            env_update(&cur_env, &name, val).map_err(|e| cur_expr.wrap_err(e))?;
+                            return Ok(Value::Void);
+                        }
                         "string-set!" => return eval_string_set(&cur_expr, &items[1..], &cur_env),
                         "if" => {
                             let args = &items[1..];
