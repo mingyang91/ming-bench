@@ -41,7 +41,7 @@ object Interpreter:
         case IntVal(_, _) | RationalVal(_, _, _) | DoubleVal(_, _) | BoolVal(_, _) | StringVal(_, _) |
             MutableStringVal(_, _) | CharVal(_, _) | PairVal(_, _) | VectorVal(_, _) | LambdaVal(_, _, _, _) |
             BuiltinVal(_, _) | ContinuationVal(_, _, _, _, _, _, _) | SyntaxRulesVal(_, _, _, _) | ValuesVal(_) |
-            Void =>
+            RecordVal(_, _, _) | Void =>
           return curExpr
 
         // Symbol lookup
@@ -75,6 +75,9 @@ object Interpreter:
 
         case ListVal(SymbolVal("guard", _) :: args, pos) =>
           return WindException.evalGuard(args, pos, curEnv)
+
+        case ListVal(SymbolVal("define-record-type", _) :: args, pos) =>
+          return RecordForms.evalDefineRecordType(args, pos, curEnv)
 
         case ListVal(SymbolVal(name, _) :: args, pos) if tailCallForms.contains(name) =>
           dispatchTailForm(name, args, pos, curEnv) match

@@ -27,6 +27,7 @@ enum SchemeValue:
   )
   case SyntaxRulesVal(name: String, literals: Set[String], rules: List[(SchemeValue, SchemeValue)], defEnv: Environment)
   case ValuesVal(values: List[SchemeValue])
+  case RecordVal(typeId: Long, typeName: String, fields: Array[SchemeValue])
   case Void
 
   /** Get the source position of this value, if any. */
@@ -61,6 +62,7 @@ enum SchemeValue:
     case ContinuationVal(_, _, _, _, _, _, _) => "#<continuation>"
     case SyntaxRulesVal(_, _, _, _)           => "#<macro>"
     case ValuesVal(vs)                        => vs.map(_.display).mkString(" ")
+    case RecordVal(_, tn, fs)                 => s"#<record:$tn>"
     case Void                                 => ""
 
   /** Format for `display` — strings are unquoted. */
