@@ -28,7 +28,7 @@ func newMatchResult() *matchResult {
 	}
 }
 
-// evalDefineSyntax handles (define-syntax name (syntax-rules ...))
+// evalDefineSyntax handles (define-syntax name (syntax-rules ...)) and (define-syntax name (lambda ...))
 func (ip *interp) evalDefineSyntax(e *expr, envir *env) (*value, error) {
 	if len(e.items) != 3 {
 		return nil, &EvalError{Message: fmt.Sprintf("%d:%d: define-syntax: bad syntax", e.line, e.col)}
@@ -38,9 +38,26 @@ func (ip *interp) evalDefineSyntax(e *expr, envir *env) (*value, error) {
 		return nil, &EvalError{Message: fmt.Sprintf("%d:%d: define-syntax: expected symbol", e.line, e.col)}
 	}
 	sr := e.items[2]
+
+	// Lambda-based transformer (syntax-case macros)
+	if sr.kind == "list" && len(sr.items) >= 1 &&
+		sr.items[0].kind == "symbol" && sr.items[0].sval == "lambda" {
+		transformerVal, err := ip.eval(sr, envir)
+		if err != nil {
+			return nil, err
+		}
+		macro := &value{
+			typ:              valMacro,
+			macroTransformer: transformerVal,
+			macroDefEnv:      envir,
+		}
+		envir.set(name.sval, macro)
+		return voidVal, nil
+	}
+
 	if sr.kind != "list" || len(sr.items) < 2 ||
 		sr.items[0].kind != "symbol" || sr.items[0].sval != "syntax-rules" {
-		return nil, &EvalError{Message: fmt.Sprintf("%d:%d: define-syntax: expected syntax-rules", e.line, e.col)}
+		return nil, &EvalError{Message: fmt.Sprintf("%d:%d: define-syntax: expected syntax-rules or lambda", e.line, e.col)}
 	}
 
 	// Parse literals list

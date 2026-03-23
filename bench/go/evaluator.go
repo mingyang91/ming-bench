@@ -30,6 +30,7 @@ const (
 	valFloat
 	valRational
 	valRecord
+	valSyntax // wraps an *expr (syntax object)
 )
 
 type value struct {
@@ -73,6 +74,10 @@ type value struct {
 	// record fields
 	recType   *recordType
 	recFields []*value
+	// syntax object (wraps an *expr)
+	syntaxExpr *expr
+	// macro transformer (lambda-based, for syntax-case macros)
+	macroTransformer *value
 }
 
 // recordType holds metadata for a define-record-type
@@ -225,6 +230,8 @@ func (v *value) String() string {
 		return fmt.Sprintf("%d/%d", v.num, v.den)
 	case valRecord:
 		return fmt.Sprintf("#<%s>", v.recType.name)
+	case valSyntax:
+		return "#<syntax>"
 	}
 	return ""
 }
@@ -373,6 +380,14 @@ func tokenize(input string) []token {
 			continue
 		}
 
+		// Syntax template shorthand #'
+		if ch == '#' && i+1 < n && runes[i+1] == '\'' {
+			tokens = append(tokens, token{"#'", line, col})
+			i += 2
+			col += 2
+			continue
+		}
+
 		// Quote shorthand
 		if ch == '\'' {
 			tokens = append(tokens, token{"'", line, col})
@@ -459,6 +474,15 @@ func parseExpr(tokens []token, pos int) (*expr, int, error) {
 		return &expr{kind: "list", items: []*expr{{kind: "symbol", sval: "quote", line: tok.line, col: tok.col}, e}, line: tok.line, col: tok.col}, newpos, nil
 	}
 
+	// Syntax template shorthand: #'expr → (syntax expr)
+	if tok.text == "#'" {
+		e, newpos, err := parseExpr(tokens, pos+1)
+		if err != nil {
+			return nil, 0, err
+		}
+		return &expr{kind: "list", items: []*expr{{kind: "symbol", sval: "syntax", line: tok.line, col: tok.col}, e}, line: tok.line, col: tok.col}, newpos, nil
+	}
+
 	// String literal
 	if len(tok.text) >= 2 && tok.text[0] == '"' && tok.text[len(tok.text)-1] == '"' {
 		return &expr{kind: "string", sval: tok.text[1 : len(tok.text)-1], line: tok.line, col: tok.col}, pos + 1, nil
@@ -524,6 +548,10 @@ func parseExpr(tokens []token, pos int) (*expr, int, error) {
 type env struct {
 	bindings map[string]*value
 	parent   *env
+	// syntax-case context for #' template expansion
+	syntaxBindings *matchResult
+	syntaxDefEnv   *env
+	syntaxPatVars  map[string]bool
 }
 
 func newEnv(parent *env) *env {
@@ -867,6 +895,15 @@ func (ip *interp) eval(e *expr, envir *env) (*value, error) {
 
 				case "with-exception-handler":
 					return ip.evalWithExceptionHandler(e, envir)
+
+				case "syntax-case":
+					return ip.evalSyntaxCase(e, envir)
+
+				case "syntax":
+					return ip.evalSyntax(e, envir)
+
+				case "with-syntax":
+					return ip.evalWithSyntax(e, envir)
 				}
 
 				// Check for macro expansion
@@ -875,6 +912,14 @@ func (ip *interp) eval(e *expr, envir *env) (*value, error) {
 					macroLookupEnv = head.envRef
 				}
 				if mv, ok := macroLookupEnv.get(head.sval); ok && mv.typ == valMacro {
+					if mv.macroTransformer != nil {
+						expanded, expandErr := ip.applySyntaxTransformer(mv, e)
+						if expandErr != nil {
+							return nil, expandErr
+						}
+						e = expanded
+						continue
+					}
 					expanded, expandErr := expandMacro(mv, e, head.sval)
 					if expandErr != nil {
 						return nil, expandErr
@@ -3404,6 +3449,27 @@ func makeGlobalEnv(ip *interp) *env {
 	callccVal := &value{typ: valBuiltin, sval: "call/cc", isCallCC: true}
 	e.set("call/cc", callccVal)
 	e.set("call-with-current-continuation", callccVal)
+
+	// syntax->datum: unwrap a syntax object to a plain value
+	e.set("syntax->datum", makeBuiltin("syntax->datum", func(args []*value, line, col int) (*value, error) {
+		if len(args) != 1 {
+			return nil, &EvalError{Message: fmt.Sprintf("%d:%d: syntax->datum: expected 1 argument", line, col)}
+		}
+		if args[0].typ != valSyntax {
+			return nil, &EvalError{Message: fmt.Sprintf("%d:%d: syntax->datum: expected syntax object", line, col)}
+		}
+		return exprToValue(args[0].syntaxExpr), nil
+	}))
+
+	// datum->syntax: wrap a value as a syntax object with lexical context
+	e.set("datum->syntax", makeBuiltin("datum->syntax", func(args []*value, line, col int) (*value, error) {
+		if len(args) != 2 {
+			return nil, &EvalError{Message: fmt.Sprintf("%d:%d: datum->syntax: expected 2 arguments", line, col)}
+		}
+		// First arg is a syntax object (for lexical context), second is a datum
+		datum := args[1]
+		return &value{typ: valSyntax, syntaxExpr: valueToExpr(datum)}, nil
+	}))
 
 	return e
 }
