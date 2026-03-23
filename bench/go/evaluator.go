@@ -3867,7 +3867,7 @@ func EvalStrWithOutput(input string) (result string, output string, err error) {
 	}
 	r := ""
 	if last != nil {
-		r = last.String()
+		r = last.displayString()
 	}
 	return r, ip.output.String(), nil
 }

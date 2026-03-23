@@ -1,12 +1,15 @@
 package ming
 
-import "fmt"
+import (
+	"fmt"
+	"sync/atomic"
+)
 
-var macroGensymCounter int
+var macroGensymCounter int64
 
 func macroGensym(base string) string {
-	macroGensymCounter++
-	return fmt.Sprintf("%s__%d", base, macroGensymCounter)
+	n := atomic.AddInt64(&macroGensymCounter, 1)
+	return fmt.Sprintf("%s__%d", base, n)
 }
 
 // syntaxRule represents one pattern-template pair in syntax-rules.
