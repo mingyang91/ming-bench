@@ -112,6 +112,31 @@ pub fn eval(expr: &Value, env: &Env) -> Result<Value, EvalError> {
                             }
                         }
                         "define" => return eval_define(&elems[1..], list_span, &current_env),
+                        "set!" => {
+                            let args = &elems[1..];
+                            if args.len() != 2 {
+                                return Err(EvalError::WrongArgCount {
+                                    expected: "2".to_string(),
+                                    got: args.len(),
+                                    span: list_span,
+                                });
+                            }
+                            let Value::Symbol(name, sym_span) = &args[0] else {
+                                return Err(EvalError::TypeMismatch {
+                                    expected: "symbol".to_string(),
+                                    got: args[0].to_string(),
+                                    span: args[0].span(),
+                                });
+                            };
+                            let val = eval(&args[1], &current_env)?;
+                            if !current_env.set(name, val) {
+                                return Err(EvalError::UnboundVariable {
+                                    name: name.clone(),
+                                    span: *sym_span,
+                                });
+                            }
+                            return Ok(Value::Void);
+                        }
                         "quote" => return eval_quote(&elems[1..], list_span),
                         "lambda" => return eval_lambda(&elems[1..], list_span, &current_env),
                         "let" => {

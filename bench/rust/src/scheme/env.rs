@@ -63,4 +63,18 @@ impl Env {
     pub fn define(&self, name: String, value: Value) {
         self.inner.borrow_mut().bindings.insert(name, value);
     }
+
+    /// Mutate an existing binding. Walks the environment chain.
+    /// Returns `true` if the binding was found and updated, `false` if unbound.
+    pub fn set(&self, name: &str, value: Value) -> bool {
+        let mut inner = self.inner.borrow_mut();
+        if inner.bindings.contains_key(name) {
+            inner.bindings.insert(name.to_string(), value);
+            return true;
+        }
+        match &inner.parent {
+            Some(parent) => parent.set(name, value),
+            None => false,
+        }
+    }
 }
