@@ -106,7 +106,7 @@ fn match_single(
         Value::Rational(an, ad) => matches!(input, Value::Rational(bn, bd) if an == bn && ad == bd),
         Value::String(a) => matches!(input, Value::String(b) if a == b),
         Value::Char(a) => matches!(input, Value::Char(b) if a == b),
-        Value::Pair(_, _) | Value::Builtin(_) | Value::Closure { .. }
+        Value::Pair(_) | Value::Builtin(_) | Value::Closure { .. }
         | Value::Continuation(_) | Value::SyntaxRules { .. }
         | Value::Vector(_) | Value::Values(_) | Value::Record { .. }
         | Value::Void => false,
@@ -124,7 +124,7 @@ fn is_ellipsis(val: &Value) -> bool {
 const SPECIAL_FORMS: &[&str] = &[
     "if", "define", "lambda", "quote", "let", "begin", "cond", "set!",
     "and", "or", "define-syntax", "syntax-rules", "string-set!",
-    "letrec", "letrec*", "case", "do",
+    "let*", "letrec", "letrec*", "case", "do",
 ];
 
 fn expand_template(
@@ -197,7 +197,7 @@ fn expand_template(
         }
         Value::Int(_) | Value::Float(_) | Value::Rational(_, _)
         | Value::Bool(_) | Value::String(_) | Value::Char(_)
-        | Value::Pair(_, _) | Value::Builtin(_) | Value::Closure { .. }
+        | Value::Pair(_) | Value::Builtin(_) | Value::Closure { .. }
         | Value::Continuation(_) | Value::SyntaxRules { .. }
         | Value::Vector(_) | Value::Values(_) | Value::Record { .. }
         | Value::Void => Ok(template.clone()),
@@ -223,7 +223,7 @@ fn find_ellipsis_var(template: &Value, bindings: &HashMap<String, Binding>) -> O
         }
         Value::Int(_) | Value::Float(_) | Value::Rational(_, _)
         | Value::Bool(_) | Value::String(_) | Value::Char(_)
-        | Value::Pair(_, _) | Value::Builtin(_) | Value::Closure { .. }
+        | Value::Pair(_) | Value::Builtin(_) | Value::Closure { .. }
         | Value::Continuation(_) | Value::SyntaxRules { .. }
         | Value::Vector(_) | Value::Values(_) | Value::Record { .. }
         | Value::Void => None,

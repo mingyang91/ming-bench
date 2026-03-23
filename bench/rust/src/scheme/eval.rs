@@ -32,6 +32,13 @@ const BUILTINS: &[&str] = &[
     "values", "call-with-values",
     "exact?", "inexact?", "exact->inexact", "inexact->exact",
     "numerator", "denominator", "rational?", "integer?",
+    "set-car!", "set-cdr!",
+    "for-each", "assq", "assv", "memq", "member",
+    "cadr", "cddr", "caar", "cdar", "caddr", "cdddr", "caaar", "caddar",
+    "gcd", "lcm", "error", "procedure?",
+    "truncate", "floor", "ceiling", "round",
+    "make-string", "string",
+    "string>?", "string<=?", "string>=?",
 ];
 
 pub fn default_env() -> Rc<RefCell<Env>> {
@@ -122,6 +129,17 @@ enum Frame {
         lists: Vec<Vec<Value>>,
         results: Vec<Value>,
         span: Option<Span>,
+    },
+    ForEach {
+        func: Value,
+        lists: Vec<Vec<Value>>,
+        span: Option<Span>,
+    },
+    LetStarBind {
+        name: String,
+        remaining: Vec<(String, Value)>,
+        body: Vec<Value>,
+        env: Rc<RefCell<Env>>,
     },
     LetrecBindings {
         names: Vec<String>,
@@ -324,7 +342,7 @@ impl Machine {
             Value::Int(_) | Value::Float(_) | Value::Rational(_, _)
             | Value::Bool(_) | Value::String(_)
             | Value::Char(_) | Value::Builtin(_) | Value::Void
-            | Value::Closure { .. } | Value::Pair(_, _) | Value::Continuation(_)
+            | Value::Closure { .. } | Value::Pair(_) | Value::Continuation(_)
             | Value::SyntaxRules { .. } | Value::Vector(_)
             | Value::Values(_) | Value::Record { .. } => Ok(Control::Continue(expr)),
             Value::Symbol(ref name, _) => env
@@ -360,11 +378,33 @@ impl Machine {
                 "set!" => return self.sf_set(&elems[1..], span, env),
                 "string-set!" => return self.sf_string_set(&elems[1..], span, env),
                 "define-syntax" => return self.sf_define_syntax(&elems[1..], span, env),
+                "let*" => return self.sf_let_star(&elems[1..], span, env),
                 "letrec" => return self.sf_letrec(&elems[1..], span, env, false),
                 "letrec*" => return self.sf_letrec(&elems[1..], span, env, true),
                 "case" => return self.sf_case(&elems[1..], span, env),
                 "do" => return self.sf_do(&elems[1..], span, env),
                 "guard" => return self.sf_guard(&elems[1..], span, env),
+                "when" => {
+                    if elems.len() < 3 {
+                        return Err(EvalError::Parse {
+                            msg: "when requires test and body".into(),
+                        }.at(span));
+                    }
+                    // (when test body ...) => (if test (begin body ...) void)
+                    let test = elems[1].clone();
+                    let body = elems[2..].to_vec();
+                    self.kont.push(Frame::If {
+                        then_expr: Value::List(
+                            std::iter::once(Value::Symbol("begin".into(), None))
+                                .chain(body)
+                                .collect(),
+                            None,
+                        ),
+                        else_expr: None,
+                        env: Rc::clone(env),
+                    });
+                    return Ok(Control::Eval(test, Rc::clone(env)));
+                }
                 "define-record-type" => return self.sf_define_record_type(&elems[1..], span, env),
                 _ => {}
             }
@@ -527,36 +567,12 @@ impl Machine {
                 Ok(Control::Eval(char_expr, env))
             }
             Frame::StringSetChar { var_name, index, env, span } => {
-                let Value::Char(ch) = val else {
-                    return Err(EvalError::TypeMismatch {
-                        expected: "char".into(), got: format!("{val}"),
-                    }.at(span));
-                };
-                let current = env.borrow().get(&var_name).map_err(|e| e.at(span))?;
-                let Value::String(s) = current else {
-                    return Err(EvalError::TypeMismatch {
-                        expected: "string".into(), got: format!("{current}"),
-                    }.at(span));
-                };
-                let idx = index as usize;
-                let mut chars: Vec<char> = s.chars().collect();
-                if idx >= chars.len() {
-                    return Err(EvalError::TypeMismatch {
-                        expected: format!("index in range 0..{}", chars.len()),
-                        got: format!("{idx}"),
-                    }.at(span));
-                }
-                chars[idx] = ch;
-                let new_string: String = chars.into_iter().collect();
-                env.borrow_mut()
-                    .set(&var_name, Value::String(new_string))
-                    .map_err(|e| e.at(span))?;
-                Ok(Control::Continue(Value::Void))
+                apply_string_set_char(val, var_name, index, &env, span)
             }
             Frame::Map { func, lists, mut results, span } => {
                 results.push(val);
                 if lists[0].is_empty() {
-                    Ok(Control::Continue(Value::List(results, None)))
+                    Ok(Control::Continue(Value::list_from_vec(results)))
                 } else {
                     let mut next_args = Vec::with_capacity(lists.len());
                     let mut remaining = Vec::with_capacity(lists.len());
@@ -568,6 +584,36 @@ impl Machine {
                         func: func.clone(), lists: remaining, results, span,
                     });
                     Ok(Control::Apply(func, next_args, span))
+                }
+            }
+            Frame::ForEach { func, lists, span } => {
+                // Ignore return value, just proceed to next iteration
+                if lists[0].is_empty() {
+                    Ok(Control::Continue(Value::Void))
+                } else {
+                    let mut next_args = Vec::with_capacity(lists.len());
+                    let mut remaining = Vec::with_capacity(lists.len());
+                    for mut lst in lists {
+                        next_args.push(lst.remove(0));
+                        remaining.push(lst);
+                    }
+                    self.kont.push(Frame::ForEach {
+                        func: func.clone(), lists: remaining, span,
+                    });
+                    Ok(Control::Apply(func, next_args, span))
+                }
+            }
+            Frame::LetStarBind { name, mut remaining, body, env } => {
+                env.borrow_mut().define(name, val);
+                if remaining.is_empty() {
+                    self.eval_body_in(&body, &env)
+                } else {
+                    let (next_name, next_expr) = remaining.remove(0);
+                    let eval_env = Rc::clone(&env);
+                    self.kont.push(Frame::LetStarBind {
+                        name: next_name, remaining, body, env,
+                    });
+                    Ok(Control::Eval(next_expr, eval_env))
                 }
             }
             Frame::LetrecBindings {
@@ -825,12 +871,12 @@ impl Machine {
                 let func = args[0].clone();
                 let mut lists: Vec<Vec<Value>> = Vec::with_capacity(args.len() - 1);
                 for arg in &args[1..] {
-                    let Value::List(elems, _) = arg else {
+                    let Some(elems) = value_to_vec(arg) else {
                         return Err(EvalError::TypeMismatch {
                             expected: "list".into(), got: format!("{arg}"),
                         }.at(span));
                     };
-                    lists.push(elems.clone());
+                    lists.push(elems);
                 }
                 if lists[0].is_empty() {
                     return Ok(Control::Continue(Value::List(Vec::new(), None)));
@@ -847,19 +893,48 @@ impl Machine {
                 });
                 Ok(Control::Apply(func, first_args, span))
             }
+            "for-each" => {
+                if args.len() < 2 {
+                    return Err(EvalError::WrongArgCount {
+                        expected: 2, got: args.len(),
+                    }.at(span));
+                }
+                let func = args[0].clone();
+                let mut lists: Vec<Vec<Value>> = Vec::with_capacity(args.len() - 1);
+                for arg in &args[1..] {
+                    let Some(elems) = value_to_vec(arg) else {
+                        return Err(EvalError::TypeMismatch {
+                            expected: "list".into(), got: format!("{arg}"),
+                        }.at(span));
+                    };
+                    lists.push(elems);
+                }
+                if lists[0].is_empty() {
+                    return Ok(Control::Continue(Value::Void));
+                }
+                let mut first_args = Vec::with_capacity(lists.len());
+                let mut remaining = Vec::with_capacity(lists.len());
+                for mut lst in lists {
+                    first_args.push(lst.remove(0));
+                    remaining.push(lst);
+                }
+                self.kont.push(Frame::ForEach {
+                    func: func.clone(), lists: remaining, span,
+                });
+                Ok(Control::Apply(func, first_args, span))
+            }
             "apply" => {
                 if args.len() < 2 {
                     return Err(EvalError::WrongArgCount {
                         expected: 2, got: args.len(),
                     }.at(span));
                 }
-                let Value::List(ref tail_args, _) = args[args.len() - 1] else {
+                let Some(tail_args) = value_to_vec(&args[args.len() - 1]) else {
                     return Err(EvalError::TypeMismatch {
                         expected: "list".into(),
                         got: format!("{}", args[args.len() - 1]),
                     }.at(span));
                 };
-                let tail_args = tail_args.clone();
                 let new_func = args[0].clone();
                 let mut all_args: Vec<Value> = args[1..args.len() - 1].to_vec();
                 all_args.extend(tail_args);
@@ -1055,7 +1130,7 @@ impl Machine {
             }
             Value::Int(_) | Value::Float(_) | Value::Rational(_, _)
             | Value::Bool(_) | Value::String(_) | Value::Char(_)
-            | Value::Builtin(_) | Value::Closure { .. } | Value::Pair(_, _)
+            | Value::Builtin(_) | Value::Closure { .. } | Value::Pair(_)
             | Value::Continuation(_) | Value::SyntaxRules { .. }
             | Value::Vector(_) | Value::Values(_) | Value::Record { .. }
             | Value::Void => {
@@ -1263,6 +1338,66 @@ impl Machine {
             env: Rc::clone(env), span,
         });
         Ok(Control::Eval(args[1].clone(), Rc::clone(env)))
+    }
+
+    fn sf_let_star(
+        &mut self, args: &[Value], span: Option<Span>, env: &Rc<RefCell<Env>>,
+    ) -> Result<Control, EvalError> {
+        if args.len() < 2 {
+            return Err(EvalError::Parse {
+                msg: "let* requires bindings and body".into(),
+            }.at(span));
+        }
+        let Value::List(bindings_list, _) = &args[0] else {
+            return Err(EvalError::Parse {
+                msg: "let*: expected bindings list".into(),
+            }.at(span));
+        };
+        let let_env = Env::with_parent(env);
+        let body = args[1..].to_vec();
+        if bindings_list.is_empty() {
+            return self.eval_body_in(&body, &let_env);
+        }
+        // Parse all binding pairs
+        let mut binding_pairs = Vec::new();
+        for binding in bindings_list {
+            let Value::List(pair, _) = binding else {
+                return Err(EvalError::Parse {
+                    msg: "let*: expected binding pair".into(),
+                }.at(span));
+            };
+            if pair.len() != 2 {
+                return Err(EvalError::Parse {
+                    msg: "let*: binding must have 2 elements".into(),
+                }.at(span));
+            }
+            let Value::Symbol(name, _) = &pair[0] else {
+                return Err(EvalError::Parse {
+                    msg: "let*: expected variable name".into(),
+                }.at(span));
+            };
+            binding_pairs.push((name.clone(), pair[1].clone()));
+        }
+        // Evaluate sequentially: each binding visible to the next
+        let (first_name, first_expr) = binding_pairs.remove(0);
+        if binding_pairs.is_empty() {
+            // Only one binding: evaluate it, define, then body
+            self.kont.push(Frame::LetStarBind {
+                name: first_name,
+                remaining: Vec::new(),
+                body,
+                env: let_env,
+            });
+            Ok(Control::Eval(first_expr, Rc::clone(env)))
+        } else {
+            self.kont.push(Frame::LetStarBind {
+                name: first_name,
+                remaining: binding_pairs,
+                body,
+                env: Rc::clone(&let_env),
+            });
+            Ok(Control::Eval(first_expr, Rc::clone(env)))
+        }
     }
 
     fn sf_letrec(
@@ -1877,7 +2012,7 @@ fn make_literal(val: Value) -> Value {
     match val {
         Value::Int(_) | Value::Float(_) | Value::Rational(_, _)
         | Value::Bool(_) | Value::String(_) | Value::Char(_)
-        | Value::Builtin(_) | Value::Closure { .. } | Value::Pair(_, _)
+        | Value::Builtin(_) | Value::Closure { .. } | Value::Pair(_)
         | Value::Continuation(_) | Value::SyntaxRules { .. }
         | Value::Vector(_) | Value::Values(_) | Value::Record { .. }
         | Value::Void => val,
@@ -1991,21 +2126,7 @@ fn require_ints(args: &[Value]) -> Result<Vec<i64>, EvalError> {
 }
 
 fn display_value(val: &Value) -> String {
-    match val {
-        Value::String(s) => s.clone(),
-        Value::Char(c) => c.to_string(),
-        Value::Vector(elems) => {
-            let borrowed = elems.borrow();
-            let mut s = "#(".to_string();
-            for (i, elem) in borrowed.iter().enumerate() {
-                if i > 0 { s.push(' '); }
-                s.push_str(&display_value(elem));
-            }
-            s.push(')');
-            s
-        }
-        other => other.to_string(),
-    }
+    crate::scheme::value::display_value_inner(val)
 }
 
 // ---------------------------------------------------------------------------
@@ -2020,7 +2141,8 @@ fn apply_builtin(
     match name {
         "+" | "-" | "*" | "/" | "abs" | "modulo" | "remainder" | "quotient"
         | "min" | "max" | "expt" | "zero?" | "positive?" | "negative?"
-        | "odd?" | "even?" => apply_numeric_builtin(name, args),
+        | "odd?" | "even?"
+        | "truncate" | "floor" | "ceiling" | "round" => apply_numeric_builtin(name, args),
         "<" => compare_nums(args, |a, b| a < b),
         ">" => compare_nums(args, |a, b| a > b),
         "=" => compare_nums(args, |a, b| a == b),
@@ -2032,7 +2154,9 @@ fn apply_builtin(
             }
             Ok(Value::Bool(is_false(&args[0])))
         }
-        "cons" | "car" | "cdr" | "null?" | "list" | "append" | "reverse" | "length" =>
+        "cons" | "car" | "cdr" | "null?" | "list" | "append" | "reverse" | "length"
+        | "set-car!" | "set-cdr!" | "assq" | "assv" | "memq" | "member"
+        | "cadr" | "cddr" | "caar" | "cdar" | "caddr" | "cdddr" | "caaar" | "caddar" =>
             apply_list_builtin(name, args),
         "string?" => Ok(Value::Bool(args.len() == 1 && matches!(&args[0], Value::String(_)))),
         "number?" => Ok(Value::Bool(args.len() == 1 && matches!(&args[0], Value::Int(_) | Value::Float(_) | Value::Rational(_, _)))),
@@ -2116,7 +2240,7 @@ fn apply_builtin(
             if args.len() != 1 {
                 return Err(EvalError::WrongArgCount { expected: 1, got: args.len() });
             }
-            Ok(Value::Bool(matches!(&args[0], Value::List(v, _) if !v.is_empty()) || matches!(&args[0], Value::Pair(_, _))))
+            Ok(Value::Bool(matches!(&args[0], Value::List(v, _) if !v.is_empty()) || matches!(&args[0], Value::Pair(_))))
         }
         "symbol?" => {
             if args.len() != 1 {
@@ -2164,6 +2288,7 @@ fn apply_builtin(
                 (Value::Char(a), Value::Char(b)) => a == b,
                 (Value::List(a, _), Value::List(b, _)) => a.is_empty() && b.is_empty(),
                 (Value::Vector(a), Value::Vector(b)) => Rc::ptr_eq(a, b),
+                (Value::Pair(a), Value::Pair(b)) => Rc::ptr_eq(a, b),
                 (Value::Void, Value::Void) => true,
                 _ => false,
             };
@@ -2177,10 +2302,12 @@ fn apply_builtin(
         }
         "char-alphabetic?" | "char-numeric?" | "char-upcase" | "char-downcase"
         | "char=?" | "char<?" | "string=?" | "string<?" | "string-ci=?"
-        | "string-upcase" | "string-downcase" => apply_char_string_cmp_builtin(name, args),
+        | "string-upcase" | "string-downcase"
+        | "string>?" | "string<=?" | "string>=?" => apply_char_string_cmp_builtin(name, args),
         "string-append" | "string-length" | "substring" | "string->number"
         | "number->string" | "symbol->string" | "string->symbol" | "string-ref"
-        | "string-copy" | "string->list" | "list->string" => apply_string_builtin(name, args),
+        | "string-copy" | "string->list" | "list->string"
+        | "make-string" | "string" => apply_string_builtin(name, args),
         "char->integer" => {
             if args.len() != 1 {
                 return Err(EvalError::WrongArgCount { expected: 1, got: args.len() });
@@ -2216,6 +2343,7 @@ fn apply_builtin(
                 (Value::Int(a), Value::Int(b)) => a == b,
                 (Value::Char(a), Value::Char(b)) => a == b,
                 (Value::List(a, _), Value::List(b, _)) => a.is_empty() && b.is_empty(),
+                (Value::Pair(a), Value::Pair(b)) => Rc::ptr_eq(a, b),
                 (Value::Void, Value::Void) => true,
                 _ => false,
             };
@@ -2223,8 +2351,115 @@ fn apply_builtin(
         }
         "vector" | "make-vector" | "vector-ref" | "vector-set!" | "vector-length"
         | "vector?" | "vector->list" | "list->vector" => apply_vector_builtin(name, args),
+        "gcd" => {
+            if args.len() != 2 {
+                return Err(EvalError::WrongArgCount { expected: 2, got: args.len() });
+            }
+            let a = match &args[0] {
+                Value::Int(n) => *n,
+                other => return Err(EvalError::TypeMismatch {
+                    expected: "integer".into(), got: format!("{other}"),
+                }),
+            };
+            let b = match &args[1] {
+                Value::Int(n) => *n,
+                other => return Err(EvalError::TypeMismatch {
+                    expected: "integer".into(), got: format!("{other}"),
+                }),
+            };
+            fn gcd_impl(mut a: i64, mut b: i64) -> i64 {
+                a = a.abs();
+                b = b.abs();
+                while b != 0 {
+                    let t = b;
+                    b = a % b;
+                    a = t;
+                }
+                a
+            }
+            Ok(Value::Int(gcd_impl(a, b)))
+        }
+        "lcm" => {
+            if args.len() != 2 {
+                return Err(EvalError::WrongArgCount { expected: 2, got: args.len() });
+            }
+            let a = match &args[0] {
+                Value::Int(n) => *n,
+                other => return Err(EvalError::TypeMismatch {
+                    expected: "integer".into(), got: format!("{other}"),
+                }),
+            };
+            let b = match &args[1] {
+                Value::Int(n) => *n,
+                other => return Err(EvalError::TypeMismatch {
+                    expected: "integer".into(), got: format!("{other}"),
+                }),
+            };
+            fn gcd_impl2(mut a: i64, mut b: i64) -> i64 {
+                a = a.abs();
+                b = b.abs();
+                while b != 0 {
+                    let t = b;
+                    b = a % b;
+                    a = t;
+                }
+                a
+            }
+            let g = gcd_impl2(a, b);
+            let result = if g == 0 { 0 } else { (a / g * b).abs() };
+            Ok(Value::Int(result))
+        }
+        "error" => {
+            if args.is_empty() {
+                return Err(EvalError::Raised { value: "error".into() });
+            }
+            let msg = format!("{}", args[0]);
+            Err(EvalError::Raised { value: msg })
+        }
+        "procedure?" => {
+            if args.len() != 1 {
+                return Err(EvalError::WrongArgCount { expected: 1, got: args.len() });
+            }
+            let result = matches!(&args[0], Value::Builtin(_) | Value::Closure { .. } | Value::Continuation(_));
+            Ok(Value::Bool(result))
+        }
         _ => Err(EvalError::UnboundVariable { name: name.into() }),
     }
+}
+
+/// Convert a value to a Vec if it's a proper list (List or pair chain).
+fn value_to_vec(val: &Value) -> Option<Vec<Value>> {
+    val.to_vec()
+}
+
+fn apply_string_set_char(
+    val: Value, var_name: String, index: i64, env: &Rc<RefCell<Env>>, span: Option<Span>,
+) -> Result<Control, EvalError> {
+    let Value::Char(ch) = val else {
+        return Err(EvalError::TypeMismatch {
+            expected: "char".into(), got: format!("{val}"),
+        }.at(span));
+    };
+    let current = env.borrow().get(&var_name).map_err(|e| e.at(span))?;
+    let Value::String(s) = current else {
+        return Err(EvalError::TypeMismatch {
+            expected: "string".into(), got: format!("{current}"),
+        }.at(span));
+    };
+    let idx = index as usize;
+    let mut chars: Vec<char> = s.chars().collect();
+    if idx >= chars.len() {
+        return Err(EvalError::TypeMismatch {
+            expected: format!("index in range 0..{}", chars.len()),
+            got: format!("{idx}"),
+        }.at(span));
+    }
+    chars[idx] = ch;
+    let new_string: String = chars.into_iter().collect();
+    env.borrow_mut()
+        .set(&var_name, Value::String(new_string))
+        .map_err(|e| e.at(span))?;
+    Ok(Control::Continue(Value::Void))
 }
 
 fn apply_list_builtin(name: &str, args: &[Value]) -> Result<Value, EvalError> {
@@ -2233,17 +2468,7 @@ fn apply_list_builtin(name: &str, args: &[Value]) -> Result<Value, EvalError> {
             if args.len() != 2 {
                 return Err(EvalError::WrongArgCount { expected: 2, got: args.len() });
             }
-            match &args[1] {
-                Value::List(rest, _) => {
-                    let mut new_list = vec![args[0].clone()];
-                    new_list.extend(rest.iter().cloned());
-                    Ok(Value::List(new_list, None))
-                }
-                _ => Ok(Value::Pair(
-                    Box::new(args[0].clone()),
-                    Box::new(args[1].clone()),
-                )),
-            }
+            Ok(Value::cons(args[0].clone(), args[1].clone()))
         }
         "car" => {
             if args.len() != 1 {
@@ -2251,7 +2476,7 @@ fn apply_list_builtin(name: &str, args: &[Value]) -> Result<Value, EvalError> {
             }
             match &args[0] {
                 Value::List(elems, _) if !elems.is_empty() => Ok(elems[0].clone()),
-                Value::Pair(a, _) => Ok(a.as_ref().clone()),
+                Value::Pair(cell) => Ok(cell.borrow().0.clone()),
                 _ => Err(EvalError::TypeMismatch {
                     expected: "pair".into(), got: format!("{}", args[0]),
                 }),
@@ -2265,7 +2490,7 @@ fn apply_list_builtin(name: &str, args: &[Value]) -> Result<Value, EvalError> {
                 Value::List(elems, _) if !elems.is_empty() => {
                     Ok(Value::List(elems[1..].to_vec(), None))
                 }
-                Value::Pair(_, b) => Ok(b.as_ref().clone()),
+                Value::Pair(cell) => Ok(cell.borrow().1.clone()),
                 _ => Err(EvalError::TypeMismatch {
                     expected: "pair".into(), got: format!("{}", args[0]),
                 }),
@@ -2277,56 +2502,67 @@ fn apply_list_builtin(name: &str, args: &[Value]) -> Result<Value, EvalError> {
             }
             Ok(Value::Bool(matches!(&args[0], Value::List(v, _) if v.is_empty())))
         }
-        "list" => Ok(Value::List(args.to_vec(), None)),
+        "list" => Ok(Value::list_from_vec(args.to_vec())),
         "append" => {
-            if args.len() != 2 {
-                return Err(EvalError::WrongArgCount { expected: 2, got: args.len() });
+            if args.is_empty() {
+                return Ok(Value::List(vec![], None));
             }
-            match (&args[0], &args[1]) {
-                (Value::List(a, _), Value::List(b, _)) => {
-                    let mut result = a.clone();
-                    result.extend(b.iter().cloned());
-                    Ok(Value::List(result, None))
+            if args.len() == 1 {
+                return Ok(args[0].clone());
+            }
+            // Collect all but the last into a flat vec, then append the last
+            let mut result = Vec::new();
+            for arg in &args[..args.len() - 1] {
+                let Some(elems) = value_to_vec(arg) else {
+                    return Err(EvalError::TypeMismatch {
+                        expected: "list".into(), got: format!("{arg}"),
+                    });
+                };
+                result.extend(elems);
+            }
+            let last = &args[args.len() - 1];
+            // If last is a proper list, extend; otherwise build improper list
+            if let Some(tail_elems) = value_to_vec(last) {
+                result.extend(tail_elems);
+                Ok(Value::list_from_vec(result))
+            } else {
+                // Build pair chain ending in the non-list last value
+                let mut acc = last.clone();
+                for item in result.into_iter().rev() {
+                    acc = Value::cons(item, acc);
                 }
-                (Value::List(_, _), other) => Err(EvalError::TypeMismatch {
-                    expected: "list".into(), got: format!("{other}"),
-                }),
-                (other, _) => Err(EvalError::TypeMismatch {
-                    expected: "list".into(), got: format!("{other}"),
-                }),
+                Ok(acc)
             }
         }
         "reverse" => {
             if args.len() != 1 {
                 return Err(EvalError::WrongArgCount { expected: 1, got: args.len() });
             }
-            match &args[0] {
-                Value::List(elems, _) => {
-                    let mut rev = elems.clone();
-                    rev.reverse();
-                    Ok(Value::List(rev, None))
-                }
-                other => Err(EvalError::TypeMismatch {
-                    expected: "list".into(), got: format!("{other}"),
-                }),
-            }
+            let Some(elems) = value_to_vec(&args[0]) else {
+                return Err(EvalError::TypeMismatch {
+                    expected: "list".into(), got: format!("{}", args[0]),
+                });
+            };
+            let mut rev = elems;
+            rev.reverse();
+            Ok(Value::list_from_vec(rev))
         }
         "length" => {
             if args.len() != 1 {
                 return Err(EvalError::WrongArgCount { expected: 1, got: args.len() });
             }
-            match &args[0] {
-                Value::List(elems, _) => Ok(Value::Int(elems.len() as i64)),
-                other => Err(EvalError::TypeMismatch {
-                    expected: "list".into(), got: format!("{other}"),
-                }),
-            }
+            let Some(elems) = value_to_vec(&args[0]) else {
+                return Err(EvalError::TypeMismatch {
+                    expected: "list".into(), got: format!("{}", args[0]),
+                });
+            };
+            Ok(Value::Int(elems.len() as i64))
         }
         "list-ref" => {
             if args.len() != 2 {
                 return Err(EvalError::WrongArgCount { expected: 2, got: args.len() });
             }
-            let Value::List(elems, _) = &args[0] else {
+            let Some(elems) = value_to_vec(&args[0]) else {
                 return Err(EvalError::TypeMismatch {
                     expected: "list".into(), got: format!("{}", args[0]),
                 });
@@ -2346,51 +2582,143 @@ fn apply_list_builtin(name: &str, args: &[Value]) -> Result<Value, EvalError> {
             if args.len() != 2 {
                 return Err(EvalError::WrongArgCount { expected: 2, got: args.len() });
             }
-            let Value::List(elems, _) = &args[0] else {
-                return Err(EvalError::TypeMismatch {
-                    expected: "list".into(), got: format!("{}", args[0]),
-                });
-            };
             let Value::Int(idx) = &args[1] else {
                 return Err(EvalError::TypeMismatch {
                     expected: "integer".into(), got: format!("{}", args[1]),
                 });
             };
             let idx = *idx as usize;
-            if idx > elems.len() {
-                return Err(EvalError::TypeMismatch {
-                    expected: format!("index in range 0..={}", elems.len()),
-                    got: format!("{idx}"),
-                });
+            // Walk the structure directly to preserve pair identity
+            let mut cur = args[0].clone();
+            for _ in 0..idx {
+                cur = match cur {
+                    Value::List(elems, _) if !elems.is_empty() => {
+                        Value::List(elems[1..].to_vec(), None)
+                    }
+                    Value::Pair(ref cell) => cell.borrow().1.clone(),
+                    _ => return Err(EvalError::TypeMismatch {
+                        expected: "list".into(), got: format!("{cur}"),
+                    }),
+                };
             }
-            Ok(Value::List(elems[idx..].to_vec(), None))
+            Ok(cur)
         }
         "list?" => {
             if args.len() != 1 {
                 return Err(EvalError::WrongArgCount { expected: 1, got: args.len() });
             }
-            Ok(Value::Bool(matches!(&args[0], Value::List(_, _))))
+            let is_list = match &args[0] {
+                Value::List(_, _) => true,
+                Value::Pair(_) => value_to_vec(&args[0]).is_some(),
+                _ => false,
+            };
+            Ok(Value::Bool(is_list))
         }
         "assoc" => {
             if args.len() != 2 {
                 return Err(EvalError::WrongArgCount { expected: 2, got: args.len() });
             }
-            let Value::List(alist, _) = &args[1] else {
+            let Some(alist) = value_to_vec(&args[1]) else {
                 return Err(EvalError::TypeMismatch {
                     expected: "list".into(), got: format!("{}", args[1]),
                 });
             };
-            for entry in alist {
-                let Value::List(pair, _) = entry else {
-                    return Err(EvalError::TypeMismatch {
-                        expected: "pair".into(), got: format!("{entry}"),
-                    });
-                };
-                if !pair.is_empty() && pair[0] == args[0] {
-                    return Ok(entry.clone());
+            for entry in &alist {
+                if let Some(key) = entry.car() {
+                    if key == args[0] {
+                        return Ok(entry.clone());
+                    }
                 }
             }
             Ok(Value::Bool(false))
+        }
+        "set-car!" => {
+            if args.len() != 2 {
+                return Err(EvalError::WrongArgCount { expected: 2, got: args.len() });
+            }
+            let Value::Pair(cell) = &args[0] else {
+                return Err(EvalError::TypeMismatch {
+                    expected: "pair".into(), got: format!("{}", args[0]),
+                });
+            };
+            cell.borrow_mut().0 = args[1].clone();
+            Ok(Value::Void)
+        }
+        "set-cdr!" => {
+            if args.len() != 2 {
+                return Err(EvalError::WrongArgCount { expected: 2, got: args.len() });
+            }
+            let Value::Pair(cell) = &args[0] else {
+                return Err(EvalError::TypeMismatch {
+                    expected: "pair".into(), got: format!("{}", args[0]),
+                });
+            };
+            cell.borrow_mut().1 = args[1].clone();
+            Ok(Value::Void)
+        }
+        "assq" => {
+            if args.len() != 2 {
+                return Err(EvalError::WrongArgCount { expected: 2, got: args.len() });
+            }
+            let Some(alist) = value_to_vec(&args[1]) else {
+                return Err(EvalError::TypeMismatch {
+                    expected: "list".into(), got: format!("{}", args[1]),
+                });
+            };
+            for entry in &alist {
+                if let Some(key) = entry.car() {
+                    let is_eq = match (&args[0], &key) {
+                        (Value::Symbol(a, _), Value::Symbol(b, _)) => a == b,
+                        (Value::Bool(a), Value::Bool(b)) => a == b,
+                        (Value::Int(a), Value::Int(b)) => a == b,
+                        (Value::Char(a), Value::Char(b)) => a == b,
+                        (Value::List(a, _), Value::List(b, _)) => a.is_empty() && b.is_empty(),
+                        (Value::Pair(a), Value::Pair(b)) => Rc::ptr_eq(a, b),
+                        (Value::Vector(a), Value::Vector(b)) => Rc::ptr_eq(a, b),
+                        (Value::Void, Value::Void) => true,
+                        _ => false,
+                    };
+                    if is_eq {
+                        return Ok(entry.clone());
+                    }
+                }
+            }
+            Ok(Value::Bool(false))
+        }
+        "assv" => {
+            if args.len() != 2 {
+                return Err(EvalError::WrongArgCount { expected: 2, got: args.len() });
+            }
+            let Some(alist) = value_to_vec(&args[1]) else {
+                return Err(EvalError::TypeMismatch {
+                    expected: "list".into(), got: format!("{}", args[1]),
+                });
+            };
+            for entry in &alist {
+                if let Some(key) = entry.car() {
+                    // eqv? semantics
+                    let is_eqv = match (&args[0], &key) {
+                        (Value::Symbol(a, _), Value::Symbol(b, _)) => a == b,
+                        (Value::Bool(a), Value::Bool(b)) => a == b,
+                        (Value::Int(a), Value::Int(b)) => a == b,
+                        (Value::Float(a), Value::Float(b)) => a == b,
+                        (Value::Char(a), Value::Char(b)) => a == b,
+                        (Value::List(a, _), Value::List(b, _)) => a.is_empty() && b.is_empty(),
+                        (Value::Pair(a), Value::Pair(b)) => Rc::ptr_eq(a, b),
+                        (Value::Vector(a), Value::Vector(b)) => Rc::ptr_eq(a, b),
+                        (Value::Void, Value::Void) => true,
+                        _ => false,
+                    };
+                    if is_eqv {
+                        return Ok(entry.clone());
+                    }
+                }
+            }
+            Ok(Value::Bool(false))
+        }
+        "memq" | "member" | "cadr" | "cddr" | "caar" | "cdar"
+        | "caddr" | "cdddr" | "caaar" | "caddar" => {
+            apply_list_search_builtin(name, args)
         }
         other => Err(EvalError::UnboundVariable { name: other.into() }),
     }
@@ -2486,18 +2814,18 @@ fn apply_vector_builtin(name: &str, args: &[Value]) -> Result<Value, EvalError> 
                     expected: "vector".into(), got: format!("{}", args[0]),
                 });
             };
-            Ok(Value::List(elems.borrow().clone(), None))
+            Ok(Value::list_from_vec(elems.borrow().clone()))
         }
         "list->vector" => {
             if args.len() != 1 {
                 return Err(EvalError::WrongArgCount { expected: 1, got: args.len() });
             }
-            let Value::List(elems, _) = &args[0] else {
+            let Some(elems) = value_to_vec(&args[0]) else {
                 return Err(EvalError::TypeMismatch {
                     expected: "list".into(), got: format!("{}", args[0]),
                 });
             };
-            Ok(Value::Vector(Rc::new(RefCell::new(elems.clone()))))
+            Ok(Value::Vector(Rc::new(RefCell::new(elems))))
         }
         _ => Err(EvalError::UnboundVariable { name: name.into() }),
     }
@@ -2768,6 +3096,72 @@ fn apply_numeric_builtin(name: &str, args: &[Value]) -> Result<Value, EvalError>
             };
             Ok(Value::Bool(n % 2 == 0))
         }
+        "truncate" => {
+            if args.len() != 1 {
+                return Err(EvalError::WrongArgCount { expected: 1, got: args.len() });
+            }
+            match &args[0] {
+                Value::Int(n) => Ok(Value::Int(*n)),
+                Value::Float(f) => Ok(Value::Float(f.trunc())),
+                Value::Rational(n, d) => Ok(Value::Int(n / d)),
+                other => Err(EvalError::TypeMismatch {
+                    expected: "number".into(), got: format!("{other}"),
+                }),
+            }
+        }
+        "floor" => {
+            if args.len() != 1 {
+                return Err(EvalError::WrongArgCount { expected: 1, got: args.len() });
+            }
+            match &args[0] {
+                Value::Int(n) => Ok(Value::Int(*n)),
+                Value::Float(f) => Ok(Value::Float(f.floor())),
+                Value::Rational(n, d) => {
+                    let q = n / d;
+                    if (n % d != 0) && ((*n < 0) != (*d < 0)) {
+                        Ok(Value::Int(q - 1))
+                    } else {
+                        Ok(Value::Int(q))
+                    }
+                }
+                other => Err(EvalError::TypeMismatch {
+                    expected: "number".into(), got: format!("{other}"),
+                }),
+            }
+        }
+        "ceiling" => {
+            if args.len() != 1 {
+                return Err(EvalError::WrongArgCount { expected: 1, got: args.len() });
+            }
+            match &args[0] {
+                Value::Int(n) => Ok(Value::Int(*n)),
+                Value::Float(f) => Ok(Value::Float(f.ceil())),
+                Value::Rational(n, d) => {
+                    let q = n / d;
+                    if n % d != 0 && ((*n > 0) == (*d > 0)) {
+                        Ok(Value::Int(q + 1))
+                    } else {
+                        Ok(Value::Int(q))
+                    }
+                }
+                other => Err(EvalError::TypeMismatch {
+                    expected: "number".into(), got: format!("{other}"),
+                }),
+            }
+        }
+        "round" => {
+            if args.len() != 1 {
+                return Err(EvalError::WrongArgCount { expected: 1, got: args.len() });
+            }
+            match &args[0] {
+                Value::Int(n) => Ok(Value::Int(*n)),
+                Value::Float(f) => Ok(Value::Float(f.round())),
+                Value::Rational(n, d) => Ok(Value::Int((*n as f64 / *d as f64).round() as i64)),
+                other => Err(EvalError::TypeMismatch {
+                    expected: "number".into(), got: format!("{other}"),
+                }),
+            }
+        }
         _ => Err(EvalError::UnboundVariable { name: name.into() }),
     }
 }
@@ -2881,6 +3275,54 @@ fn apply_char_string_cmp_builtin(name: &str, args: &[Value]) -> Result<Value, Ev
                 });
             };
             Ok(Value::Bool(a < b))
+        }
+        "string>?" => {
+            if args.len() != 2 {
+                return Err(EvalError::WrongArgCount { expected: 2, got: args.len() });
+            }
+            let Value::String(a) = &args[0] else {
+                return Err(EvalError::TypeMismatch {
+                    expected: "string".into(), got: format!("{}", args[0]),
+                });
+            };
+            let Value::String(b) = &args[1] else {
+                return Err(EvalError::TypeMismatch {
+                    expected: "string".into(), got: format!("{}", args[1]),
+                });
+            };
+            Ok(Value::Bool(a > b))
+        }
+        "string<=?" => {
+            if args.len() != 2 {
+                return Err(EvalError::WrongArgCount { expected: 2, got: args.len() });
+            }
+            let Value::String(a) = &args[0] else {
+                return Err(EvalError::TypeMismatch {
+                    expected: "string".into(), got: format!("{}", args[0]),
+                });
+            };
+            let Value::String(b) = &args[1] else {
+                return Err(EvalError::TypeMismatch {
+                    expected: "string".into(), got: format!("{}", args[1]),
+                });
+            };
+            Ok(Value::Bool(a <= b))
+        }
+        "string>=?" => {
+            if args.len() != 2 {
+                return Err(EvalError::WrongArgCount { expected: 2, got: args.len() });
+            }
+            let Value::String(a) = &args[0] else {
+                return Err(EvalError::TypeMismatch {
+                    expected: "string".into(), got: format!("{}", args[0]),
+                });
+            };
+            let Value::String(b) = &args[1] else {
+                return Err(EvalError::TypeMismatch {
+                    expected: "string".into(), got: format!("{}", args[1]),
+                });
+            };
+            Ok(Value::Bool(a >= b))
         }
         "string-ci=?" => {
             if args.len() != 2 {
@@ -3067,7 +3509,7 @@ fn apply_string_builtin(name: &str, args: &[Value]) -> Result<Value, EvalError> 
                 });
             };
             let chars: Vec<Value> = s.chars().map(Value::Char).collect();
-            Ok(Value::List(chars, None))
+            Ok(Value::list_from_vec(chars))
         }
         "list->string" => {
             if args.len() != 1 {
@@ -3075,20 +3517,8 @@ fn apply_string_builtin(name: &str, args: &[Value]) -> Result<Value, EvalError> 
             }
             let elems = match &args[0] {
                 Value::List(elems, _) => elems.clone(),
-                Value::Pair(_, _) => {
-                    let mut elems = Vec::new();
-                    let mut cur = args[0].clone();
-                    loop {
-                        match cur {
-                            Value::Pair(car, cdr) => {
-                                elems.push(*car);
-                                cur = *cdr;
-                            }
-                            Value::List(ref items, _) if items.is_empty() => break,
-                            _ => break,
-                        }
-                    }
-                    elems
+                Value::Pair(_) => {
+                    args[0].to_vec().unwrap_or_default()
                 }
                 other => return Err(EvalError::TypeMismatch {
                     expected: "list".into(), got: format!("{other}"),
@@ -3105,6 +3535,39 @@ fn apply_string_builtin(name: &str, args: &[Value]) -> Result<Value, EvalError> 
             }
             Ok(Value::String(result))
         }
+        "string" => {
+            let mut result = String::new();
+            for arg in args {
+                let Value::Char(c) = arg else {
+                    return Err(EvalError::TypeMismatch {
+                        expected: "char".into(), got: format!("{arg}"),
+                    });
+                };
+                result.push(*c);
+            }
+            Ok(Value::String(result))
+        }
+        "make-string" => {
+            if args.is_empty() || args.len() > 2 {
+                return Err(EvalError::WrongArgCount { expected: 1, got: args.len() });
+            }
+            let Value::Int(len) = &args[0] else {
+                return Err(EvalError::TypeMismatch {
+                    expected: "integer".into(), got: format!("{}", args[0]),
+                });
+            };
+            let ch = if args.len() == 2 {
+                let Value::Char(c) = &args[1] else {
+                    return Err(EvalError::TypeMismatch {
+                        expected: "char".into(), got: format!("{}", args[1]),
+                    });
+                };
+                *c
+            } else {
+                '\0'
+            };
+            Ok(Value::String(std::iter::repeat_n(ch, *len as usize).collect()))
+        }
         other => Err(EvalError::UnboundVariable { name: other.into() }),
     }
 }
@@ -3118,4 +3581,123 @@ fn compare_nums(args: &[Value], cmp: fn(f64, f64) -> bool) -> Result<Value, Eval
         .collect::<Result<_, _>>()?;
     let result = nums.windows(2).all(|w| cmp(w[0], w[1]));
     Ok(Value::Bool(result))
+}
+
+fn is_eq_identity(a: &Value, b: &Value) -> bool {
+    match (a, b) {
+        (Value::Symbol(x, _), Value::Symbol(y, _)) => x == y,
+        (Value::Bool(x), Value::Bool(y)) => x == y,
+        (Value::Int(x), Value::Int(y)) => x == y,
+        (Value::Char(x), Value::Char(y)) => x == y,
+        (Value::Pair(x), Value::Pair(y)) => Rc::ptr_eq(x, y),
+        (Value::Vector(x), Value::Vector(y)) => Rc::ptr_eq(x, y),
+        _ => false,
+    }
+}
+
+fn apply_list_search_builtin(name: &str, args: &[Value]) -> Result<Value, EvalError> {
+    match name {
+        "memq" => {
+            if args.len() != 2 {
+                return Err(EvalError::WrongArgCount { expected: 2, got: args.len() });
+            }
+            let mut cur = args[1].clone();
+            loop {
+                match cur {
+                    Value::List(ref elems, _) if elems.is_empty() => return Ok(Value::Bool(false)),
+                    Value::List(ref elems, _) => {
+                        if is_eq_identity(&args[0], &elems[0]) {
+                            return Ok(cur);
+                        }
+                        cur = Value::List(elems[1..].to_vec(), None);
+                    }
+                    Value::Pair(ref cell) => {
+                        let (car, cdr) = {
+                            let b = cell.borrow();
+                            (b.0.clone(), b.1.clone())
+                        };
+                        if is_eq_identity(&args[0], &car) {
+                            return Ok(cur);
+                        }
+                        cur = cdr;
+                    }
+                    _ => return Ok(Value::Bool(false)),
+                }
+            }
+        }
+        "member" => {
+            if args.len() != 2 {
+                return Err(EvalError::WrongArgCount { expected: 2, got: args.len() });
+            }
+            let mut cur = args[1].clone();
+            loop {
+                match cur {
+                    Value::List(ref elems, _) if elems.is_empty() => return Ok(Value::Bool(false)),
+                    Value::List(ref elems, _) => {
+                        if elems[0] == args[0] {
+                            return Ok(cur);
+                        }
+                        cur = Value::List(elems[1..].to_vec(), None);
+                    }
+                    Value::Pair(ref cell) => {
+                        let (car, cdr) = {
+                            let b = cell.borrow();
+                            (b.0.clone(), b.1.clone())
+                        };
+                        if car == args[0] {
+                            return Ok(cur);
+                        }
+                        cur = cdr;
+                    }
+                    _ => return Ok(Value::Bool(false)),
+                }
+            }
+        }
+        "cadr" => {
+            if args.len() != 1 { return Err(EvalError::WrongArgCount { expected: 1, got: args.len() }); }
+            let d = apply_list_builtin("cdr", args)?;
+            apply_list_builtin("car", &[d])
+        }
+        "cddr" => {
+            if args.len() != 1 { return Err(EvalError::WrongArgCount { expected: 1, got: args.len() }); }
+            let d = apply_list_builtin("cdr", args)?;
+            apply_list_builtin("cdr", &[d])
+        }
+        "caar" => {
+            if args.len() != 1 { return Err(EvalError::WrongArgCount { expected: 1, got: args.len() }); }
+            let a = apply_list_builtin("car", args)?;
+            apply_list_builtin("car", &[a])
+        }
+        "cdar" => {
+            if args.len() != 1 { return Err(EvalError::WrongArgCount { expected: 1, got: args.len() }); }
+            let a = apply_list_builtin("car", args)?;
+            apply_list_builtin("cdr", &[a])
+        }
+        "caddr" => {
+            if args.len() != 1 { return Err(EvalError::WrongArgCount { expected: 1, got: args.len() }); }
+            let d = apply_list_builtin("cdr", args)?;
+            let dd = apply_list_builtin("cdr", &[d])?;
+            apply_list_builtin("car", &[dd])
+        }
+        "cdddr" => {
+            if args.len() != 1 { return Err(EvalError::WrongArgCount { expected: 1, got: args.len() }); }
+            let d = apply_list_builtin("cdr", args)?;
+            let dd = apply_list_builtin("cdr", &[d])?;
+            apply_list_builtin("cdr", &[dd])
+        }
+        "caaar" => {
+            if args.len() != 1 { return Err(EvalError::WrongArgCount { expected: 1, got: args.len() }); }
+            let a = apply_list_builtin("car", args)?;
+            let aa = apply_list_builtin("car", &[a])?;
+            apply_list_builtin("car", &[aa])
+        }
+        "caddar" => {
+            if args.len() != 1 { return Err(EvalError::WrongArgCount { expected: 1, got: args.len() }); }
+            let a = apply_list_builtin("car", args)?;
+            let da = apply_list_builtin("cdr", &[a])?;
+            let dda = apply_list_builtin("cdr", &[da])?;
+            apply_list_builtin("car", &[dda])
+        }
+        other => Err(EvalError::UnboundVariable { name: other.into() }),
+    }
 }
