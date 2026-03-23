@@ -5,7 +5,8 @@ import { EvalError } from './evalError.js';
 interface Pos { line: number; col: number }
 
 type SchemeVal =
-  | { tag: 'number'; value: number; pos?: Pos }
+  | { tag: 'number'; value: number; exact?: boolean; pos?: Pos }
+  | { tag: 'rational'; num: number; den: number; pos?: Pos }
   | { tag: 'boolean'; value: boolean; pos?: Pos }
   | { tag: 'string'; value: string; pos?: Pos }
   | { tag: 'symbol'; value: string; pos?: Pos }
@@ -20,6 +21,66 @@ type SchemeVal =
   | { tag: 'vector'; value: SchemeVal[]; pos?: Pos }
   | { tag: 'syntax'; literals: string[]; rules: { pattern: SchemeVal; template: SchemeVal }[]; defEnv: Env; pos?: Pos }
   | { tag: 'values'; values: SchemeVal[]; pos?: Pos };
+
+// ── Rational / Exact number helpers ───────────────────────────────
+
+function gcd(a: number, b: number): number {
+  a = Math.abs(a); b = Math.abs(b);
+  while (b) { const t = b; b = a % b; a = t; }
+  return a;
+}
+
+function makeRational(num: number, den: number): SchemeVal {
+  if (den === 0) throw new EvalError('division by zero');
+  if (den < 0) { num = -num; den = -den; }
+  const g = gcd(num, den);
+  num = num / g; den = den / g;
+  if (den === 1) return { tag: 'number', value: num, exact: true };
+  return { tag: 'rational', num, den };
+}
+
+function isNumeric(v: SchemeVal): boolean {
+  return v.tag === 'number' || v.tag === 'rational';
+}
+
+function isExact(v: SchemeVal): boolean {
+  if (v.tag === 'rational') return true;
+  if (v.tag === 'number') {
+    if (v.exact !== undefined) return v.exact;
+    return Number.isInteger(v.value);
+  }
+  return false;
+}
+
+function toFloat(v: SchemeVal): number {
+  if (v.tag === 'rational') return v.num / v.den;
+  if (v.tag === 'number') return v.value;
+  throw new EvalError('expected number');
+}
+
+type Frac = { num: number; den: number };
+
+function toFrac(v: SchemeVal): Frac {
+  if (v.tag === 'rational') return { num: v.num, den: v.den };
+  if (v.tag === 'number') return { num: v.value, den: 1 };
+  throw new EvalError('expected number');
+}
+
+function fracAdd(a: Frac, b: Frac): Frac {
+  return { num: a.num * b.den + b.num * a.den, den: a.den * b.den };
+}
+
+function fracSub(a: Frac, b: Frac): Frac {
+  return { num: a.num * b.den - b.num * a.den, den: a.den * b.den };
+}
+
+function fracMul(a: Frac, b: Frac): Frac {
+  return { num: a.num * b.num, den: a.den * b.den };
+}
+
+function fracDiv(a: Frac, b: Frac): Frac {
+  return { num: a.num * b.den, den: a.den * b.num };
+}
 
 // ── CPS / Trampoline types ─────────────────────────────────────────
 
@@ -193,8 +254,16 @@ function parseAtom(tok: string): SchemeVal {
     const inner = tok.slice(1, -1).replace(/\\n/g, '\n').replace(/\\t/g, '\t').replace(/\\"/g, '"').replace(/\\\\/g, '\\');
     return { tag: 'string', value: inner };
   }
+  // Rational literal: n/d (e.g., 1/3, -5/2)
+  const ratMatch = tok.match(/^(-?\d+)\/(\d+)$/);
+  if (ratMatch) {
+    const n = parseInt(ratMatch[1], 10);
+    const d = parseInt(ratMatch[2], 10);
+    return makeRational(n, d);
+  }
   const num = Number(tok);
   if (!isNaN(num) && tok !== '') {
+    if (tok.includes('.')) return { tag: 'number', value: num, exact: false };
     return { tag: 'number', value: num };
   }
   return { tag: 'symbol', value: tok };
@@ -251,8 +320,14 @@ function isTruthy(val: SchemeVal): boolean {
 }
 
 function expectNumber(val: SchemeVal, op: string): number {
-  if (val.tag !== 'number') throw new EvalError(`${op}: expected number`);
-  return val.value;
+  if (val.tag === 'number') return val.value;
+  if (val.tag === 'rational') return val.num / val.den;
+  throw new EvalError(`${op}: expected number`);
+}
+
+function expectNumeric(val: SchemeVal, op: string): SchemeVal {
+  if (val.tag === 'number' || val.tag === 'rational') return val;
+  throw new EvalError(`${op}: expected number`);
 }
 
 function parseDotParams(paramExprs: SchemeVal[]): { params: string[]; rest?: string } {
@@ -344,8 +419,8 @@ function matchPattern(pattern: SchemeVal, input: SchemeVal, literals: string[], 
     return true;
   }
 
+  if (isNumeric(pattern) && isNumeric(input)) return toFloat(pattern) === toFloat(input);
   if (pattern.tag === input.tag) {
-    if (pattern.tag === 'number' && input.tag === 'number') return pattern.value === input.value;
     if (pattern.tag === 'boolean' && input.tag === 'boolean') return pattern.value === input.value;
   }
 
@@ -454,10 +529,14 @@ function expandMacro(transformer: SchemeVal & { tag: 'syntax' }, inputExpr: Sche
 // ── Equality helpers ────────────────────────────────────────────────
 
 function schemeEq(a: SchemeVal, b: SchemeVal): boolean {
+  if (a.tag === 'number' && b.tag === 'number') return a.value === b.value;
+  if (a.tag === 'rational' && b.tag === 'rational') return a.num === b.num && a.den === b.den;
+  if ((a.tag === 'number' || a.tag === 'rational') && (b.tag === 'number' || b.tag === 'rational')) {
+    return toFloat(a) === toFloat(b);
+  }
   if (a.tag !== b.tag) return false;
   if (a.tag === 'nil') return true;
   if (a.tag === 'boolean' && b.tag === 'boolean') return a.value === b.value;
-  if (a.tag === 'number' && b.tag === 'number') return a.value === b.value;
   if (a.tag === 'symbol' && b.tag === 'symbol') return a.value === b.value;
   if (a.tag === 'char' && b.tag === 'char') return a.value === b.value;
   if (a.tag === 'string' && b.tag === 'string') return a.value === b.value;
@@ -487,7 +566,17 @@ function makeGlobalEnv(): Env {
     env.define(name, { tag: 'builtin', name, fn });
   }
 
+  function hasRational(args: SchemeVal[]): boolean {
+    for (let i = 0; i < args.length; i++) if (args[i].tag === 'rational') return true;
+    return false;
+  }
+
   defBuiltin('+', (args) => {
+    if (hasRational(args)) {
+      let r: Frac = { num: 0, den: 1 };
+      for (const a of args) { expectNumeric(a, '+'); r = fracAdd(r, toFrac(a)); }
+      return makeRational(r.num, r.den);
+    }
     let sum = 0;
     for (const a of args) sum += expectNumber(a, '+');
     return { tag: 'number', value: sum };
@@ -495,6 +584,12 @@ function makeGlobalEnv(): Env {
 
   defBuiltin('-', (args) => {
     if (args.length < 1) throw new EvalError('-: need at least 1 argument');
+    if (hasRational(args)) {
+      if (args.length === 1) { const f = toFrac(args[0]); return makeRational(-f.num, f.den); }
+      let r = toFrac(args[0]);
+      for (let i = 1; i < args.length; i++) { expectNumeric(args[i], '-'); r = fracSub(r, toFrac(args[i])); }
+      return makeRational(r.num, r.den);
+    }
     if (args.length === 1) return { tag: 'number', value: -expectNumber(args[0], '-') };
     let result = expectNumber(args[0], '-');
     for (let i = 1; i < args.length; i++) result -= expectNumber(args[i], '-');
@@ -502,6 +597,11 @@ function makeGlobalEnv(): Env {
   });
 
   defBuiltin('*', (args) => {
+    if (hasRational(args)) {
+      let r: Frac = { num: 1, den: 1 };
+      for (const a of args) { expectNumeric(a, '*'); r = fracMul(r, toFrac(a)); }
+      return makeRational(r.num, r.den);
+    }
     let prod = 1;
     for (const a of args) prod *= expectNumber(a, '*');
     return { tag: 'number', value: prod };
@@ -509,13 +609,24 @@ function makeGlobalEnv(): Env {
 
   defBuiltin('/', (args) => {
     if (args.length < 2) throw new EvalError('/: need at least 2 arguments');
-    let result = expectNumber(args[0], '/');
-    for (let i = 1; i < args.length; i++) {
-      const d = expectNumber(args[i], '/');
-      if (d === 0) throw new EvalError('division by zero');
-      result = Math.trunc(result / d);
+    // Exact division for all exact args (integers or rationals)
+    if (args.every(a => isExact(a))) {
+      let r = toFrac(args[0]);
+      for (let i = 1; i < args.length; i++) {
+        expectNumeric(args[i], '/');
+        const d = toFrac(args[i]);
+        if (d.num === 0) throw new EvalError('division by zero');
+        r = fracDiv(r, d);
+      }
+      return makeRational(r.num, r.den);
     }
-    return { tag: 'number', value: result };
+    let result = toFloat(args[0]);
+    for (let i = 1; i < args.length; i++) {
+      const d = toFloat(args[i]);
+      if (d === 0) throw new EvalError('division by zero');
+      result /= d;
+    }
+    return { tag: 'number', value: result, exact: false };
   });
 
   defBuiltin('<', (args) => ({ tag: 'boolean', value: expectNumber(args[0], '<') < expectNumber(args[1], '<') }));
@@ -583,7 +694,41 @@ function makeGlobalEnv(): Env {
   defBuiltin('values', (_args) => { throw new EvalError('values: internal error'); });
   defBuiltin('call-with-values', (_args) => { throw new EvalError('call-with-values: internal error'); });
 
-  defBuiltin('number?', (args) => ({ tag: 'boolean', value: args[0].tag === 'number' }));
+  defBuiltin('number?', (args) => ({ tag: 'boolean', value: isNumeric(args[0]) }));
+  defBuiltin('integer?', (args) => {
+    const v = args[0];
+    if (v.tag === 'rational') return { tag: 'boolean', value: false }; // already simplified, den>1
+    if (v.tag === 'number') return { tag: 'boolean', value: Number.isInteger(v.value) };
+    return { tag: 'boolean', value: false };
+  });
+  defBuiltin('rational?', (args) => ({ tag: 'boolean', value: isNumeric(args[0]) && isExact(args[0]) }));
+  defBuiltin('exact?', (args) => ({ tag: 'boolean', value: isNumeric(args[0]) && isExact(args[0]) }));
+  defBuiltin('inexact?', (args) => ({ tag: 'boolean', value: isNumeric(args[0]) && !isExact(args[0]) }));
+  defBuiltin('exact->inexact', (args) => {
+    expectNumeric(args[0], 'exact->inexact');
+    return { tag: 'number', value: toFloat(args[0]), exact: false };
+  });
+  defBuiltin('inexact->exact', (args) => {
+    expectNumeric(args[0], 'inexact->exact');
+    const f = toFloat(args[0]);
+    // Convert float to rational via continued fraction / simple approach
+    if (Number.isInteger(f)) return { tag: 'number', value: f, exact: true };
+    // Use power-of-2 denominator approach for binary floats
+    const den = 2 ** 53;
+    const num = Math.round(f * den);
+    return makeRational(num, den);
+  });
+  defBuiltin('numerator', (args) => {
+    const v = expectNumeric(args[0], 'numerator');
+    if (v.tag === 'rational') return { tag: 'number', value: v.num, exact: true };
+    if (v.tag === 'number') return { tag: 'number', value: v.value, exact: true };
+    throw new EvalError('numerator: expected number');
+  });
+  defBuiltin('denominator', (args) => {
+    const v = expectNumeric(args[0], 'denominator');
+    if (v.tag === 'rational') return { tag: 'number', value: v.den, exact: true };
+    return { tag: 'number', value: 1, exact: true };
+  });
   defBuiltin('string?', (args) => ({ tag: 'boolean', value: args[0].tag === 'string' }));
   defBuiltin('boolean?', (args) => ({ tag: 'boolean', value: args[0].tag === 'boolean' }));
   defBuiltin('pair?', (args) => ({ tag: 'boolean', value: args[0].tag === 'pair' }));
@@ -631,8 +776,8 @@ function makeGlobalEnv(): Env {
     return { tag: 'number', value: n };
   });
   defBuiltin('number->string', (args) => {
-    if (args[0].tag !== 'number') throw new EvalError('number->string: expected number');
-    return { tag: 'string', value: String(args[0].value) };
+    if (!isNumeric(args[0])) throw new EvalError('number->string: expected number');
+    return { tag: 'string', value: writeVal(args[0]) };
   });
   defBuiltin('symbol->string', (args) => {
     if (args[0].tag !== 'symbol') throw new EvalError('symbol->string: expected symbol');
@@ -1446,7 +1591,13 @@ function displayVal(val: SchemeVal): string {
 
 function writeVal(val: SchemeVal): string {
   switch (val.tag) {
-    case 'number': return String(val.value);
+    case 'number': {
+      if (val.exact === false && Number.isInteger(val.value)) {
+        return val.value.toFixed(1);
+      }
+      return String(val.value);
+    }
+    case 'rational': return `${val.num}/${val.den}`;
     case 'boolean': return val.value ? '#t' : '#f';
     case 'string': return `"${val.value}"`;
     case 'symbol': return val.value;
