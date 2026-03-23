@@ -134,6 +134,10 @@ Benefits:
 | L21-L23 | Pair Mutation/syntax-case/Final Integration | 90 |
 | L24-L25 | Tech-debt: case-lambda/procedure? | 60 |
 | L26     | Real-world integration stress        | 90 |
+| L27     | Step-limited eval (surprise)         | 90 |
+| L28     | Concurrency + perf stress (surprise) | 90 |
+
+**Surprise levels (L27-L28):** Hidden from agents until L26 passes. The orchestrator injects test files from `bench/hidden/` into the worktree. L27 requires `eval_str_with_limit` — tests whether eval has a central dispatch loop (trampoline = easy, recursive = hard). L28 requires thread-safe eval + performance stress tests.
 
 Override with `--max-turns N`. Quality-gate cleanup pass: 15 turns. Regression fix-it pass: same tiered budget as coding pass.
 

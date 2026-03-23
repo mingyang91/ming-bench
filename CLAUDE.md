@@ -54,9 +54,10 @@ Each language has a self-contained directory under `bench/`:
 | Scala | `bench/scala/` | sbt | munit | `ming-jvm` |
 
 **Shared resources:**
-- `bench/SPEC.md` — Language-agnostic interpreter specification (26 levels)
+- `bench/SPEC.md` — Language-agnostic interpreter specification (26 visible levels)
 - `bench/fixtures/*.scm` — Test fixture files (Scheme source code)
 - `bench/tests.json` — Test manifest mapping test names to fixtures and expected values
+- `bench/hidden/` — Surprise levels L27-L28 (injected by orchestrator after L26 passes, invisible to agents)
 
 **Per-language test harnesses** read `tests.json` + fixtures at test time. Rust keeps its original `include_str!()` pattern with a symlink to shared fixtures.
 
@@ -112,6 +113,10 @@ Output token safety caps (by level tier):
 | L21-L23 | Pair Mutation/syntax-case/Final Integration | 500K |
 | L24-L25 | Tech-debt: case-lambda/procedure? | 100K |
 | L26     | Real-world integration stress | 500K |
+| L27     | Step-limited eval (surprise) | 500K |
+| L28     | Concurrency + perf stress (surprise) | 500K |
+
+**Surprise levels (L27-L28):** Hidden from agents until L26 passes. Content lives in `bench/hidden/`. The orchestrator injects test files, fixtures, and SPEC text into the agent's worktree after L26, then launches new agent sessions. Agents see only L01-L26 in SPEC.md and tests.json — no hint of concurrency or step limiting. This tests accumulated tech debt: L27 punishes recursive eval (must add step counter), L28 punishes shared mutable state (must be thread-safe).
 
 These are circuit breakers, not performance targets — set generously so legitimate work never hits them. Only dead loops or stuck agents should trigger. The orchestrator monitors output tokens in real-time (polling session.jsonl for Claude, JSONL stdout for Codex) and sends SIGTERM when the cap is exceeded. A safety-net turn limit of 200 is always passed. Override per-level cap with `--max-tokens N`.
 

@@ -1,6 +1,6 @@
 # MING — Ming Interpreter Nurture Gauntlet
 
-A benchmark framework for measuring how **prompt engineering strategies** affect coding agent performance. Agents build a Scheme interpreter from scratch — 240+ tests across 26 difficulty levels, from basic arithmetic to first-class continuations, hygienic macros, and exact arithmetic. Supports **5 languages**: Rust, Go, Java, TypeScript, and Scala.
+A benchmark framework for measuring how **prompt engineering strategies** affect coding agent performance. Agents build a Scheme interpreter from scratch — 240+ tests across 26 visible levels (+ 2 hidden surprise levels), from basic arithmetic to first-class continuations, hygienic macros, and exact arithmetic. Supports **5 languages**: Rust, Go, Java, TypeScript, and Scala.
 
 ## Why This Exists
 
@@ -132,6 +132,8 @@ All containers: 1 CPU, 256 PIDs. OOM or timeout = test failure. This prevents ag
 | 26 | **Real-world integration** | 2 | 1000+ line programs — **stress-tests all features at scale** |
 
 **Level design philosophy:** Levels are ordered to maximize tech-debt exposure. L06 plants mutable strings, then L14 (8 levels later) reverses the requirement. L24-L25 force restructuring of core infrastructure (closures, callable type unification) established 10-20 levels earlier. L26 hits the agent with real-world programs (1000+ lines) that exercise all features simultaneously — maximum distance from when features were first implemented.
+
+**Surprise levels (L27-L28):** After L26, two hidden levels are injected that the agent had no prior knowledge of. L27 requires `eval_str_with_limit` (step-limited evaluation) — trivial for trampoline architectures, painful for recursive eval. L28 requires thread-safe `eval_str` + performance stress — punishes shared mutable state and excessive cloning. Content lives in `bench/hidden/`.
 
 ## Tooling
 
