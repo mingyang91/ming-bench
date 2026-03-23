@@ -95,6 +95,19 @@ object Builtins:
             }
         ),
         (
+          "reverse",
+          args =>
+            if args.length != 1 then throw new EvalError("reverse: expected 1 argument")
+            var acc: Value = NilVal
+            var cur        = args.head
+            while cur match
+                case PairVal(h, t) => acc = PairVal(h, acc); cur = t; true
+                case NilVal        => false
+                case _             => throw new EvalError("reverse: not a proper list")
+            do ()
+            acc
+        ),
+        (
           "eq?",
           args =>
             if args.length != 2 then throw new EvalError("eq?: expected 2 arguments")
@@ -230,26 +243,9 @@ object Builtins:
     val result = nums.zip(nums.tail).forall((a, b) => op(a, b))
     BoolVal(result)
 
-  private[ming] def eqCheck(a: Value, b: Value): Boolean =
-    (a, b) match
-      case (IntVal(x), IntVal(y))       => x == y
-      case (BoolVal(x), BoolVal(y))     => x == y
-      case (SymbolVal(x), SymbolVal(y)) => x == y
-      case (CharVal(x), CharVal(y))     => x == y
-      case (NilVal, NilVal)             => true
-      case (VoidVal, VoidVal)           => true
-      case _                            => a eq b
-
-  /** eqv? — same as eq? for our value representation. */
-  private[ming] def eqvCheck(a: Value, b: Value): Boolean = eqCheck(a, b)
-
-  private[ming] def equalCheck(a: Value, b: Value): Boolean =
-    (a, b) match
-      case (PairVal(a1, a2), PairVal(b1, b2)) => equalCheck(a1, b1) && equalCheck(a2, b2)
-      case (StrVal(x), StrVal(y))             => java.util.Arrays.equals(x, y)
-      case (VectorVal(x), VectorVal(y)) =>
-        x.length == y.length && x.indices.forall(i => equalCheck(x(i), y(i)))
-      case _ => eqCheck(a, b)
+  private[ming] def eqCheck(a: Value, b: Value): Boolean    = Equality.eqCheck(a, b)
+  private[ming] def eqvCheck(a: Value, b: Value): Boolean   = Equality.eqvCheck(a, b)
+  private[ming] def equalCheck(a: Value, b: Value): Boolean = Equality.equalCheck(a, b)
 
   private def isProperList(v: Value): Boolean =
     v match

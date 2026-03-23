@@ -6,7 +6,7 @@ import EvalHelpers.{evalError, evalLambda, evalQuote, parseParams, valueToList}
 import scala.compiletime.uninitialized
 
 /** CPS interpreter with trampoline for tail calls and first-class continuations. */
-object Evaluator extends EvalForms:
+object Evaluator extends EvalForms with EvalWind:
   type K = Value => Bounce
 
   // Depth counter for amortized trampolining
@@ -15,6 +15,10 @@ object Evaluator extends EvalForms:
 
   // Pending returns for body-restart continuations
   private val pendingReturns = new java.util.IdentityHashMap[Expr, Value]()
+
+  // dynamic-wind support
+  case class WindEntry(inThunk: Value, outThunk: Value)
+  protected var windStack: List[WindEntry] = Nil
 
   // Current body context, captured by call/cc for body-restart
   private var bodyRemaining: List[Expr] = Nil
@@ -52,6 +56,7 @@ object Evaluator extends EvalForms:
   def evalStr(input: String): String =
     depth = 0
     pendingReturns.clear()
+    windStack = Nil
     val exprs = Parser.parseAll(input)
     if exprs.isEmpty then throw new EvalError("empty input")
     val env = makeGlobalEnv()
@@ -60,6 +65,7 @@ object Evaluator extends EvalForms:
   def evalStrWithOutput(input: String): (String, String) =
     depth = 0
     pendingReturns.clear()
+    windStack = Nil
     val exprs = Parser.parseAll(input)
     if exprs.isEmpty then throw new EvalError("empty input")
     val output = new StringBuilder
@@ -75,6 +81,7 @@ object Evaluator extends EvalForms:
     env.define("call-with-current-continuation", BuiltinVal("call-with-current-continuation", dummy))
     env.define("apply", BuiltinVal("apply", dummy))
     env.define("map", BuiltinVal("map", dummy))
+    env.define("dynamic-wind", BuiltinVal("dynamic-wind", dummy))
     env
 
   protected def evalBody(exprs: List[Expr], env: Env, k: K): Bounce =
@@ -174,7 +181,7 @@ object Evaluator extends EvalForms:
       case SList(head :: args, pos) =>
         eval(head, env, proc => evalArgs(args, env, values => applyProc(proc, values, pos, k)))
 
-  private def applyProc(proc: Value, values: List[Value], pos: Option[Pos], k: K): Bounce =
+  protected def applyProc(proc: Value, values: List[Value], pos: Option[Pos], k: K): Bounce =
     proc match
       case LambdaVal(params, restParam, body, closure) =>
         val localEnv = closure.extendWithRest(params, restParam, values)
@@ -187,8 +194,13 @@ object Evaluator extends EvalForms:
       // call/cc used as a value — CPS escape continuation
       case BuiltinVal(name, _) if name == "call/cc" || name == "call-with-current-continuation" =>
         if values.length != 1 then evalError("call/cc: expected 1 argument", pos)
-        val contVal = ContinuationVal(v => Bounce.More(() => k(v)))
+        val capturedWind = windStack
+        val contVal      = ContinuationVal(v => doWindTransition(capturedWind, pos, () => k(v)))
         applyProc(values.head, List(contVal), pos, k)
+
+      case BuiltinVal("dynamic-wind", _) =>
+        if values.length != 3 then evalError("dynamic-wind: expected 3 arguments", pos)
+        applyDynamicWind(values(0), values(1), values(2), pos, k)
 
       case BuiltinVal("apply", _) => applyBuiltinApply(values, pos, k)
       case BuiltinVal("map", _)   => applyBuiltinMap(values, pos, k)
@@ -204,34 +216,6 @@ object Evaluator extends EvalForms:
 
       case _ => evalError("not a procedure", pos)
 
-  private def applyBuiltinApply(args: List[Value], pos: Option[Pos], k: K): Bounce =
-    if args.length < 2 then evalError("apply: expected at least 2 arguments", pos)
-    val proc       = args.head
-    val prefixArgs = args.slice(1, args.length - 1).toList
-    val trailing   = valueToList(args.last)
-    applyProc(proc, prefixArgs ++ trailing, pos, k)
-
-  private def applyBuiltinMap(args: List[Value], pos: Option[Pos], k: K): Bounce =
-    if args.length < 2 then evalError("map: expected at least 2 arguments", pos)
-    val proc  = args.head
-    val lists = args.tail.map(EvalHelpers.valueToList)
-    mapLoop(proc, lists, Nil, pos, k)
-
-  private def mapLoop(
-    proc: Value,
-    lists: List[List[Value]],
-    acc: List[Value],
-    pos: Option[Pos],
-    k: K
-  ): Bounce =
-    if lists.head.isEmpty then
-      val result = acc.reverse.foldRight(Value.NilVal: Value)((v, t) => Value.PairVal(v, t))
-      k(result)
-    else
-      val heads = lists.map(_.head)
-      val tails = lists.map(_.tail)
-      applyProc(proc, heads, pos, v => trampoline(mapLoop(proc, tails, v :: acc, pos, k)))
-
   /** call/cc as special form — hybrid: CPS for escape, body-restart for reentrant. */
   private def evalCallCc(callccExpr: Expr, procExpr: Expr, env: Env, pos: Option[Pos], k: K): Bounce =
     val pending = pendingReturns.remove(callccExpr)
@@ -240,6 +224,7 @@ object Evaluator extends EvalForms:
       val capturedRemaining = bodyRemaining
       val capturedEnv       = bodyEnvRef
       val capturedK         = bodyK
+      val capturedWind      = windStack
       val cpsK              = k
       var active            = true
       eval(
@@ -249,10 +234,15 @@ object Evaluator extends EvalForms:
           val contVal = ContinuationVal { v =>
             if active then
               active = false
-              Bounce.More(() => cpsK(v))
+              doWindTransition(capturedWind, pos, () => cpsK(v))
             else
-              pendingReturns.put(callccExpr, v)
-              tailBody(capturedRemaining, capturedEnv, capturedK)
+              doWindTransition(
+                capturedWind,
+                pos,
+                () =>
+                  pendingReturns.put(callccExpr, v)
+                  tailBody(capturedRemaining, capturedEnv, capturedK)
+              )
           }
           applyProc(
             proc,
