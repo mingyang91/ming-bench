@@ -23,6 +23,7 @@ const (
 	valBuiltin
 	valChar
 	valContinuation
+	valMacro
 )
 
 type value struct {
@@ -48,6 +49,10 @@ type value struct {
 	contLetEnv  *env  // the let's local environment
 	// call/cc marker
 	isCallCC bool
+	// macro fields
+	macroRules    []syntaxRule
+	macroLiterals []string
+	macroDefEnv   *env
 }
 
 var voidVal = &value{typ: valVoid}
@@ -255,6 +260,7 @@ type expr struct {
 	items  []*expr
 	line   int
 	col    int
+	envRef *env // hygienic macro: resolve symbol in this env instead of current
 }
 
 func parse(tokens []token) ([]*expr, error) {
@@ -430,7 +436,11 @@ func (ip *interp) eval(e *expr, envir *env) (*value, error) {
 			runes := []rune(e.sval)
 			return charVal(runes[0]), nil
 		case "symbol":
-			v, ok := envir.get(e.sval)
+			lookupEnv := envir
+			if e.envRef != nil {
+				lookupEnv = e.envRef
+			}
+			v, ok := lookupEnv.get(e.sval)
 			if !ok {
 				return nil, &EvalError{Message: fmt.Sprintf("%d:%d: unbound variable: %s", e.line, e.col, e.sval)}
 			}
@@ -582,6 +592,23 @@ func (ip *interp) eval(e *expr, envir *env) (*value, error) {
 					if !found {
 						return voidVal, nil
 					}
+					continue
+
+				case "define-syntax":
+					return ip.evalDefineSyntax(e, envir)
+				}
+
+				// Check for macro expansion
+				macroLookupEnv := envir
+				if head.envRef != nil {
+					macroLookupEnv = head.envRef
+				}
+				if mv, ok := macroLookupEnv.get(head.sval); ok && mv.typ == valMacro {
+					expanded, expandErr := expandMacro(mv, e, head.sval)
+					if expandErr != nil {
+						return nil, expandErr
+					}
+					e = expanded
 					continue
 				}
 			}
