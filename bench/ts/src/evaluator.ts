@@ -449,185 +449,187 @@ const BUILTINS = new Set(['+', '-', '*', '/', '<', '>', '=', '<=', '>=', 'not',
   'symbol->string', 'string->symbol', 'string-ref', 'string-copy', 'string-set!']);
 
 function evalExpr(expr: SchemeVal, env: Env, out?: string[]): SchemeVal {
-  const p = expr.pos;
-  if (expr.tag === 'number' || expr.tag === 'boolean' || expr.tag === 'string' || expr.tag === 'char') {
-    return expr;
-  }
-  if (expr.tag === 'symbol') {
-    return env.get(expr.val, p);
-  }
-  if (expr.tag === 'list') {
-    const items = expr.val;
-    if (items.length === 0) throw posError('empty application', p);
-    const head = items[0];
+  // Trampoline loop for TCO
+  while (true) {
+    const p = expr.pos;
+    if (expr.tag === 'number' || expr.tag === 'boolean' || expr.tag === 'string' || expr.tag === 'char') {
+      return expr;
+    }
+    if (expr.tag === 'symbol') {
+      return env.get(expr.val, p);
+    }
+    if (expr.tag === 'list') {
+      const items = expr.val;
+      if (items.length === 0) throw posError('empty application', p);
+      const head = items[0];
 
-    if (head.tag === 'symbol') {
-      const op = head.val;
-      const args = items.slice(1);
+      if (head.tag === 'symbol') {
+        const op = head.val;
+        const args = items.slice(1);
 
-      // special forms
-      if (op === 'quote') {
-        if (args.length !== 1) throw posError('quote: need exactly one arg', p);
-        return quoteToScheme(args[0]);
-      }
-
-      if (op === 'if') {
-        if (args.length < 2 || args.length > 3) throw posError('if: bad syntax', p);
-        const cond = evalExpr(args[0], env, out);
-        if (isTruthy(cond)) return evalExpr(args[1], env, out);
-        if (args.length === 3) return evalExpr(args[2], env, out);
-        return { tag: 'boolean', val: false };
-      }
-
-      if (op === 'define') {
-        if (args.length < 2) throw posError('define: bad syntax', p);
-        const target = args[0];
-        if (target.tag === 'symbol') {
-          const val = evalExpr(args[1], env, out);
-          env.define(target.val, val);
-          return val;
+        // special forms
+        if (op === 'quote') {
+          if (args.length !== 1) throw posError('quote: need exactly one arg', p);
+          return quoteToScheme(args[0]);
         }
-        if (target.tag === 'list' && target.val.length > 0 && target.val[0].tag === 'symbol') {
-          const name = target.val[0].val;
-          const params = target.val.slice(1).map(pm => {
-            if (pm.tag !== 'symbol') throw posError('define: bad parameter', p);
+
+        if (op === 'if') {
+          if (args.length < 2 || args.length > 3) throw posError('if: bad syntax', p);
+          const cond = evalExpr(args[0], env, out);
+          if (isTruthy(cond)) { expr = args[1]; continue; }
+          if (args.length === 3) { expr = args[2]; continue; }
+          return { tag: 'boolean', val: false };
+        }
+
+        if (op === 'define') {
+          if (args.length < 2) throw posError('define: bad syntax', p);
+          const target = args[0];
+          if (target.tag === 'symbol') {
+            const val = evalExpr(args[1], env, out);
+            env.define(target.val, val);
+            return val;
+          }
+          if (target.tag === 'list' && target.val.length > 0 && target.val[0].tag === 'symbol') {
+            const name = target.val[0].val;
+            const params = target.val.slice(1).map(pm => {
+              if (pm.tag !== 'symbol') throw posError('define: bad parameter', p);
+              return pm.val;
+            });
+            const body = args.slice(1);
+            const lambda: SchemeVal = { tag: 'lambda', params, body, env };
+            env.define(name, lambda);
+            return lambda;
+          }
+          throw posError('define: bad syntax', p);
+        }
+
+        if (op === 'lambda') {
+          if (args.length < 2) throw posError('lambda: bad syntax', p);
+          const paramList = args[0];
+          if (paramList.tag !== 'list') throw posError('lambda: params must be a list', p);
+          const params = paramList.val.map(pm => {
+            if (pm.tag !== 'symbol') throw posError('lambda: bad parameter', p);
             return pm.val;
           });
           const body = args.slice(1);
-          const lambda: SchemeVal = { tag: 'lambda', params, body, env };
-          env.define(name, lambda);
-          return lambda;
+          return { tag: 'lambda', params, body, env };
         }
-        throw posError('define: bad syntax', p);
-      }
 
-      if (op === 'lambda') {
-        if (args.length < 2) throw posError('lambda: bad syntax', p);
-        const paramList = args[0];
-        if (paramList.tag !== 'list') throw posError('lambda: params must be a list', p);
-        const params = paramList.val.map(pm => {
-          if (pm.tag !== 'symbol') throw posError('lambda: bad parameter', p);
-          return pm.val;
-        });
-        const body = args.slice(1);
-        return { tag: 'lambda', params, body, env };
-      }
-
-      if (op === 'and') {
-        if (args.length === 0) return { tag: 'boolean', val: true };
-        let result: SchemeVal = { tag: 'boolean', val: true };
-        for (const a of args) {
-          result = evalExpr(a, env, out);
-          if (!isTruthy(result)) return result;
-        }
-        return result;
-      }
-
-      if (op === 'let') {
-        if (args.length < 2) throw posError('let: bad syntax', p);
-        let name: string | null = null;
-        let bindingsExpr: SchemeVal;
-        let body: SchemeVal[];
-        if (args[0].tag === 'symbol') {
-          name = args[0].val;
-          if (args.length < 3) throw posError('let: bad syntax', p);
-          bindingsExpr = args[1];
-          body = args.slice(2);
-        } else {
-          bindingsExpr = args[0];
-          body = args.slice(1);
-        }
-        if (bindingsExpr.tag !== 'list') throw posError('let: bad bindings', p);
-        const paramNames: string[] = [];
-        const initVals: SchemeVal[] = [];
-        for (const b of bindingsExpr.val) {
-          if (b.tag !== 'list' || b.val.length !== 2 || b.val[0].tag !== 'symbol')
-            throw posError('let: bad binding', p);
-          paramNames.push(b.val[0].val);
-          initVals.push(evalExpr(b.val[1], env, out));
-        }
-        if (name !== null) {
-          const letEnv = new Env(env);
-          const lambda: SchemeVal = { tag: 'lambda', params: paramNames, body, env: letEnv };
-          letEnv.define(name, lambda);
-          const callEnv = new Env(letEnv);
-          for (let i = 0; i < paramNames.length; i++) callEnv.define(paramNames[i], initVals[i]);
-          let result: SchemeVal = { tag: 'boolean', val: false };
-          for (const b of body) result = evalExpr(b, callEnv, out);
-          return result;
-        } else {
-          const letEnv = new Env(env);
-          for (let i = 0; i < paramNames.length; i++) letEnv.define(paramNames[i], initVals[i]);
-          let result: SchemeVal = { tag: 'boolean', val: false };
-          for (const b of body) result = evalExpr(b, letEnv, out);
-          return result;
-        }
-      }
-
-      if (op === 'begin') {
-        let result: SchemeVal = { tag: 'boolean', val: false };
-        for (const a of args) result = evalExpr(a, env, out);
-        return result;
-      }
-
-      if (op === 'cond') {
-        for (const clause of args) {
-          if (clause.tag !== 'list' || clause.val.length < 2) throw posError('cond: bad clause', p);
-          const test = clause.val[0];
-          if (test.tag === 'symbol' && test.val === 'else') {
-            let result: SchemeVal = { tag: 'boolean', val: false };
-            for (let i = 1; i < clause.val.length; i++) result = evalExpr(clause.val[i], env, out);
-            return result;
+        if (op === 'and') {
+          if (args.length === 0) return { tag: 'boolean', val: true };
+          for (let i = 0; i < args.length - 1; i++) {
+            const result = evalExpr(args[i], env, out);
+            if (!isTruthy(result)) return result;
           }
-          const cond = evalExpr(test, env, out);
-          if (isTruthy(cond)) {
-            let result: SchemeVal = cond;
-            for (let i = 1; i < clause.val.length; i++) result = evalExpr(clause.val[i], env, out);
-            return result;
+          expr = args[args.length - 1]; continue;
+        }
+
+        if (op === 'let') {
+          if (args.length < 2) throw posError('let: bad syntax', p);
+          let name: string | null = null;
+          let bindingsExpr: SchemeVal;
+          let body: SchemeVal[];
+          if (args[0].tag === 'symbol') {
+            name = args[0].val;
+            if (args.length < 3) throw posError('let: bad syntax', p);
+            bindingsExpr = args[1];
+            body = args.slice(2);
+          } else {
+            bindingsExpr = args[0];
+            body = args.slice(1);
+          }
+          if (bindingsExpr.tag !== 'list') throw posError('let: bad bindings', p);
+          const paramNames: string[] = [];
+          const initVals: SchemeVal[] = [];
+          for (const b of bindingsExpr.val) {
+            if (b.tag !== 'list' || b.val.length !== 2 || b.val[0].tag !== 'symbol')
+              throw posError('let: bad binding', p);
+            paramNames.push(b.val[0].val);
+            initVals.push(evalExpr(b.val[1], env, out));
+          }
+          if (name !== null) {
+            const letEnv = new Env(env);
+            const lambda: SchemeVal = { tag: 'lambda', params: paramNames, body, env: letEnv };
+            letEnv.define(name, lambda);
+            const callEnv = new Env(letEnv);
+            for (let i = 0; i < paramNames.length; i++) callEnv.define(paramNames[i], initVals[i]);
+            for (let i = 0; i < body.length - 1; i++) evalExpr(body[i], callEnv, out);
+            expr = body[body.length - 1]; env = callEnv; continue;
+          } else {
+            const letEnv = new Env(env);
+            for (let i = 0; i < paramNames.length; i++) letEnv.define(paramNames[i], initVals[i]);
+            for (let i = 0; i < body.length - 1; i++) evalExpr(body[i], letEnv, out);
+            expr = body[body.length - 1]; env = letEnv; continue;
           }
         }
-        return { tag: 'boolean', val: false };
-      }
 
-      if (op === 'or') {
-        if (args.length === 0) return { tag: 'boolean', val: false };
-        let result: SchemeVal = { tag: 'boolean', val: false };
-        for (const a of args) {
-          result = evalExpr(a, env, out);
-          if (isTruthy(result)) return result;
+        if (op === 'begin') {
+          if (args.length === 0) return { tag: 'boolean', val: false };
+          for (let i = 0; i < args.length - 1; i++) evalExpr(args[i], env, out);
+          expr = args[args.length - 1]; continue;
         }
-        return result;
+
+        if (op === 'cond') {
+          let found = false;
+          for (const clause of args) {
+            if (clause.tag !== 'list' || clause.val.length < 2) throw posError('cond: bad clause', p);
+            const test = clause.val[0];
+            if (test.tag === 'symbol' && test.val === 'else') {
+              for (let i = 1; i < clause.val.length - 1; i++) evalExpr(clause.val[i], env, out);
+              expr = clause.val[clause.val.length - 1]; found = true; break;
+            }
+            const condVal = evalExpr(test, env, out);
+            if (isTruthy(condVal)) {
+              if (clause.val.length === 1) return condVal;
+              for (let i = 1; i < clause.val.length - 1; i++) evalExpr(clause.val[i], env, out);
+              expr = clause.val[clause.val.length - 1]; found = true; break;
+            }
+          }
+          if (found) continue;
+          return { tag: 'boolean', val: false };
+        }
+
+        if (op === 'or') {
+          if (args.length === 0) return { tag: 'boolean', val: false };
+          for (let i = 0; i < args.length - 1; i++) {
+            const result = evalExpr(args[i], env, out);
+            if (isTruthy(result)) return result;
+          }
+          expr = args[args.length - 1]; continue;
+        }
+
+        // builtin procedures
+        if (BUILTINS.has(op)) {
+          const evalArgs = args.map(a => evalExpr(a, env, out));
+          return applyBuiltin(op, evalArgs, p, out);
+        }
       }
 
-      // builtin procedures
-      if (BUILTINS.has(op)) {
-        const evalArgs = args.map(a => evalExpr(a, env, out));
-        return applyBuiltin(op, evalArgs, p, out);
+      // general application: evaluate head and args
+      const proc = evalExpr(head, env, out);
+      const evalArgs = items.slice(1).map(a => evalExpr(a, env, out));
+
+      if (proc.tag === 'lambda') {
+        if (evalArgs.length !== proc.params.length) {
+          throw posError(`wrong number of arguments: expected ${proc.params.length}, got ${evalArgs.length}`, p);
+        }
+        const callEnv = new Env(proc.env);
+        for (let i = 0; i < proc.params.length; i++) {
+          callEnv.define(proc.params[i], evalArgs[i]);
+        }
+        // TCO: evaluate all but last body expr, then loop on last
+        for (let i = 0; i < proc.body.length - 1; i++) {
+          evalExpr(proc.body[i], callEnv, out);
+        }
+        expr = proc.body[proc.body.length - 1];
+        env = callEnv;
+        continue;
       }
+
+      throw posError('not a procedure', p);
     }
-
-    // general application: evaluate head and args
-    const proc = evalExpr(head, env, out);
-    const evalArgs = items.slice(1).map(a => evalExpr(a, env, out));
-
-    if (proc.tag === 'lambda') {
-      if (evalArgs.length !== proc.params.length) {
-        throw posError(`wrong number of arguments: expected ${proc.params.length}, got ${evalArgs.length}`, p);
-      }
-      const callEnv = new Env(proc.env);
-      for (let i = 0; i < proc.params.length; i++) {
-        callEnv.define(proc.params[i], evalArgs[i]);
-      }
-      let result: SchemeVal = { tag: 'boolean', val: false };
-      for (const bodyExpr of proc.body) {
-        result = evalExpr(bodyExpr, callEnv, out);
-      }
-      return result;
-    }
-
-    throw posError('not a procedure', p);
+    throw posError('cannot evaluate', p);
   }
-  throw posError('cannot evaluate', p);
 }
 
 function makeGlobalEnv(): Env {
