@@ -56,7 +56,7 @@ public sealed interface SchemeValue {
     interface Cont {
         Bounce apply(SchemeValue value);
     }
-    record ContinuationVal(Cont k) implements SchemeValue {}
+    record ContinuationVal(Cont k, Object windState) implements SchemeValue {}
 
     record SyntaxRulesVal(List<String> literals, List<SchemeValue> patterns,
                            List<SchemeValue> templates, Environment defEnv) implements SchemeValue {}

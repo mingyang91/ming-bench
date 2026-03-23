@@ -12,6 +12,17 @@ public class Evaluator {
     private final StringBuilder outputBuffer = new StringBuilder();
     private int gensymCounter = 0;
 
+    // dynamic-wind support
+    static class WindRecord {
+        final SchemeValue inThunk;
+        final SchemeValue outThunk;
+        WindRecord(SchemeValue inThunk, SchemeValue outThunk) {
+            this.inThunk = inThunk;
+            this.outThunk = outThunk;
+        }
+    }
+    private final List<WindRecord> windStack = new ArrayList<>();
+
     private String gensym(String prefix) {
         return prefix + "__" + (gensymCounter++);
     }
@@ -173,6 +184,17 @@ public class Evaluator {
             SchemeValue result = args.getLast();
             for (int i = args.size() - 2; i >= 0; i--) {
                 result = appendTwo(args.get(i), result);
+            }
+            return result;
+        }));
+
+        env.define("reverse", new SchemeValue.BuiltinVal("reverse", args -> {
+            if (args.size() != 1) throw new EvalError("reverse requires exactly 1 argument");
+            SchemeValue lst = args.getFirst();
+            SchemeValue result = SchemeValue.NIL;
+            while (lst instanceof SchemeValue.PairVal p) {
+                result = new SchemeValue.PairVal(p.car(), result);
+                lst = p.cdr();
             }
             return result;
         }));
@@ -590,11 +612,35 @@ public class Evaluator {
         SchemeValue.CpsBuiltinFunc callccFunc = (args, k) -> {
             if (args.size() != 1) return new Bounce.Err(new EvalError("call/cc requires 1 argument"));
             SchemeValue f = args.getFirst();
-            SchemeValue cont = new SchemeValue.ContinuationVal(k);
+            SchemeValue cont = new SchemeValue.ContinuationVal(k, new ArrayList<>(windStack));
             return applyProc(f, List.of(cont), "call/cc", k);
         };
         env.define("call/cc", new SchemeValue.CpsBuiltinVal("call/cc", callccFunc));
         env.define("call-with-current-continuation", new SchemeValue.CpsBuiltinVal("call-with-current-continuation", callccFunc));
+
+        // dynamic-wind
+        env.define("dynamic-wind", new SchemeValue.CpsBuiltinVal("dynamic-wind", (args, k) -> {
+            if (args.size() != 3) return new Bounce.Err(new EvalError("dynamic-wind requires 3 arguments"));
+            SchemeValue inThunk = args.get(0);
+            SchemeValue bodyThunk = args.get(1);
+            SchemeValue outThunk = args.get(2);
+            WindRecord wr = new WindRecord(inThunk, outThunk);
+            // Call in-thunk
+            return applyProc(inThunk, List.of(), "dynamic-wind", inResult -> {
+                // Push wind record
+                windStack.add(wr);
+                // Call body-thunk
+                return applyProc(bodyThunk, List.of(), "dynamic-wind", bodyResult -> {
+                    // Pop wind record
+                    windStack.remove(windStack.size() - 1);
+                    // Call out-thunk
+                    return applyProc(outThunk, List.of(), "dynamic-wind", outResult ->
+                        // Return body's value
+                        k.apply(bodyResult)
+                    );
+                });
+            });
+        }));
     }
 
     // ── CPS eval ──────────────────────────────────────────────────────
@@ -792,10 +838,52 @@ public class Evaluator {
             if (args.size() != 1) {
                 return new Bounce.Err(new EvalError("continuation requires exactly 1 argument at " + pos));
             }
-            // Invoke the captured continuation — caller's k is discarded
-            return contVal.k().apply(args.getFirst());
+            SchemeValue val = args.getFirst();
+            @SuppressWarnings("unchecked")
+            List<WindRecord> targetWinds = (List<WindRecord>) contVal.windState();
+            if (targetWinds == null) {
+                return contVal.k().apply(val);
+            }
+            // Do wind transition then invoke continuation
+            return doWindTransition(targetWinds, val, contVal.k());
         }
         return new Bounce.Err(new EvalError("Not a procedure: " + proc.display() + " at " + pos));
+    }
+
+    // ── dynamic-wind transition ─────────────────────────────────────
+
+    private Bounce doWindTransition(List<WindRecord> target, SchemeValue val, SchemeValue.Cont k) {
+        // Find common prefix length (by identity)
+        int common = 0;
+        int minLen = Math.min(windStack.size(), target.size());
+        while (common < minLen && windStack.get(common) == target.get(common)) {
+            common++;
+        }
+        // Unwind from current, then rewind to target
+        return doUnwind(common, target, val, k);
+    }
+
+    private Bounce doUnwind(int commonLen, List<WindRecord> target, SchemeValue val, SchemeValue.Cont k) {
+        if (windStack.size() <= commonLen) {
+            // Done unwinding, start rewinding
+            return doRewind(target, commonLen, val, k);
+        }
+        WindRecord wr = windStack.remove(windStack.size() - 1);
+        return applyProc(wr.outThunk, List.of(), "dynamic-wind", ignored ->
+            doUnwind(commonLen, target, val, k)
+        );
+    }
+
+    private Bounce doRewind(List<WindRecord> target, int idx, SchemeValue val, SchemeValue.Cont k) {
+        if (idx >= target.size()) {
+            // Done rewinding, invoke continuation
+            return k.apply(val);
+        }
+        WindRecord wr = target.get(idx);
+        return applyProc(wr.inThunk, List.of(), "dynamic-wind", ignored -> {
+            windStack.add(wr);
+            return doRewind(target, idx + 1, val, k);
+        });
     }
 
     // ── Special form helpers ──────────────────────────────────────────
