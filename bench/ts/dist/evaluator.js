@@ -194,7 +194,8 @@ function parseParams(elements, errPos) {
 let gensymCounter = 0;
 function gensym(base) { return `##${base}_${gensymCounter++}`; }
 const SPECIAL_FORMS = new Set([
-    'quote', 'if', 'define', 'lambda', 'set!', 'begin', 'let', 'cond', 'and', 'or', 'define-syntax',
+    'quote', 'if', 'define', 'lambda', 'set!', 'begin', 'let', 'letrec', 'letrec*',
+    'case', 'do', 'cond', 'and', 'or', 'define-syntax',
 ]);
 function matchPattern(pattern, args, literals) {
     const bindings = new Map();
@@ -472,6 +473,143 @@ function evalK(expr, env, k) {
                 };
                 return evalBindings(0);
             }
+            case 'letrec': {
+                if (elems.length < 3)
+                    throw posError('letrec: bad syntax', expr.pos);
+                const bindings = elems[1];
+                if (bindings.tag !== 'list')
+                    throw posError('letrec: bindings must be a list', expr.pos);
+                const letrecEnv = new Env(env);
+                const names = [];
+                const initExprs = [];
+                for (const b of bindings.elements) {
+                    if (b.tag !== 'list' || b.elements.length !== 2 || b.elements[0].tag !== 'symbol')
+                        throw posError('letrec: bad binding', expr.pos);
+                    names.push(b.elements[0].value);
+                    initExprs.push(b.elements[1]);
+                    letrecEnv.set(b.elements[0].value, { tag: 'void' });
+                }
+                return evalList(initExprs, letrecEnv, vals => {
+                    for (let i = 0; i < names.length; i++)
+                        letrecEnv.set(names[i], vals[i]);
+                    return evalSeq(elems, 2, letrecEnv, k);
+                });
+            }
+            case 'letrec*': {
+                if (elems.length < 3)
+                    throw posError('letrec*: bad syntax', expr.pos);
+                const bindings = elems[1];
+                if (bindings.tag !== 'list')
+                    throw posError('letrec*: bindings must be a list', expr.pos);
+                const letrecStarEnv = new Env(env);
+                for (const b of bindings.elements) {
+                    if (b.tag !== 'list' || b.elements.length !== 2 || b.elements[0].tag !== 'symbol')
+                        throw posError('letrec*: bad binding', expr.pos);
+                    letrecStarEnv.set(b.elements[0].value, { tag: 'void' });
+                }
+                const evalLetrecStarBindings = (i) => {
+                    if (i >= bindings.elements.length)
+                        return evalSeq(elems, 2, letrecStarEnv, k);
+                    const b = bindings.elements[i];
+                    const name = b.elements[0];
+                    const initExpr = b.elements[1];
+                    return evalK(initExpr, letrecStarEnv, val => {
+                        letrecStarEnv.set(name.value, val);
+                        return evalLetrecStarBindings(i + 1);
+                    });
+                };
+                return evalLetrecStarBindings(0);
+            }
+            case 'case': {
+                if (elems.length < 2)
+                    throw posError('case: bad syntax', expr.pos);
+                return evalK(elems[1], env, keyVal => {
+                    const evalCaseClauses = (i) => {
+                        if (i >= elems.length)
+                            return k({ tag: 'void' });
+                        const clause = elems[i];
+                        if (clause.tag !== 'list' || clause.elements.length < 2)
+                            throw posError('case: bad clause', expr.pos);
+                        if (clause.elements[0].tag === 'symbol' && clause.elements[0].value === 'else') {
+                            return evalSeqArr(clause.elements.slice(1), env, k);
+                        }
+                        if (clause.elements[0].tag !== 'list')
+                            throw posError('case: datums must be a list', expr.pos);
+                        const datums = clause.elements[0].elements;
+                        let matched = false;
+                        for (const datum of datums) {
+                            if (schemeEqv(keyVal, datum)) {
+                                matched = true;
+                                break;
+                            }
+                        }
+                        if (matched)
+                            return evalSeqArr(clause.elements.slice(1), env, k);
+                        return evalCaseClauses(i + 1);
+                    };
+                    return evalCaseClauses(2);
+                });
+            }
+            case 'do': {
+                if (elems.length < 3)
+                    throw posError('do: bad syntax', expr.pos);
+                const varSpecs = elems[1];
+                if (varSpecs.tag !== 'list')
+                    throw posError('do: var specs must be a list', expr.pos);
+                const testClause = elems[2];
+                if (testClause.tag !== 'list' || testClause.elements.length < 1)
+                    throw posError('do: bad test clause', expr.pos);
+                const bodyExprs = elems.slice(3);
+                const varNames = [];
+                const initExprs = [];
+                const stepExprs = [];
+                for (const spec of varSpecs.elements) {
+                    if (spec.tag !== 'list' || spec.elements.length < 2 || spec.elements[0].tag !== 'symbol')
+                        throw posError('do: bad var spec', expr.pos);
+                    varNames.push(spec.elements[0].value);
+                    initExprs.push(spec.elements[1]);
+                    stepExprs.push(spec.elements.length >= 3 ? spec.elements[2] : null);
+                }
+                return evalList(initExprs, env, initVals => {
+                    const doEnv = new Env(env);
+                    for (let i = 0; i < varNames.length; i++)
+                        doEnv.set(varNames[i], initVals[i]);
+                    const doLoop = () => {
+                        return evalK(testClause.elements[0], doEnv, testResult => {
+                            if (isTruthy(testResult)) {
+                                if (testClause.elements.length > 1) {
+                                    return evalSeqArr(testClause.elements.slice(1), doEnv, k);
+                                }
+                                return k({ tag: 'void' });
+                            }
+                            const afterBody = () => {
+                                // Evaluate all step expressions with current values (parallel)
+                                const stepsToEval = [];
+                                const stepIndices = [];
+                                for (let i = 0; i < stepExprs.length; i++) {
+                                    if (stepExprs[i] !== null) {
+                                        stepsToEval.push(stepExprs[i]);
+                                        stepIndices.push(i);
+                                    }
+                                }
+                                if (stepsToEval.length === 0)
+                                    return bounce(doLoop);
+                                return evalList(stepsToEval, doEnv, stepVals => {
+                                    for (let j = 0; j < stepIndices.length; j++) {
+                                        doEnv.set(varNames[stepIndices[j]], stepVals[j]);
+                                    }
+                                    return bounce(doLoop);
+                                });
+                            };
+                            if (bodyExprs.length > 0) {
+                                return evalSeqArr(bodyExprs, doEnv, _ => afterBody());
+                            }
+                            return afterBody();
+                        });
+                    };
+                    return doLoop();
+                });
+            }
             case 'cond': {
                 const evalClauses = (i) => {
                     if (i >= elems.length)
@@ -661,6 +799,18 @@ function applyK(proc, args, k, pos) {
     throw posError('not a procedure', pos);
 }
 // ── Helpers ────────────────────────────────────────────────────────
+function schemeEqv(a, b) {
+    if (a.tag !== b.tag)
+        return false;
+    switch (a.tag) {
+        case 'number': return a.value === b.value;
+        case 'boolean': return a.value === b.value;
+        case 'symbol': return a.value === b.value;
+        case 'char': return a.value === b.value;
+        case 'void': return true;
+        default: return a === b;
+    }
+}
 function schemeEqual(a, b) {
     if (a.tag !== b.tag)
         return false;
@@ -676,6 +826,12 @@ function schemeEqual(a, b) {
             if (a.elements.length !== bList.elements.length)
                 return false;
             return a.elements.every((e, i) => schemeEqual(e, bList.elements[i]));
+        }
+        case 'vector': {
+            const bVec = b;
+            if (a.elements.length !== bVec.elements.length)
+                return false;
+            return a.elements.every((e, i) => schemeEqual(e, bVec.elements[i]));
         }
         default: return a === b;
     }
@@ -760,7 +916,17 @@ function makeGlobalEnv(output = []) {
             throw posError('cdr: need 1 argument', p);
         if (args[0].tag !== 'list' || args[0].elements.length === 0)
             throw posError('cdr: not a pair', p);
-        return { tag: 'list', elements: args[0].elements.slice(1) };
+        const elems = args[0].elements;
+        // Dotted pair: (a . b) stored as [a, '.', b]
+        if (elems.length === 3 && elems[1].tag === 'symbol' && elems[1].value === '.') {
+            return elems[2];
+        }
+        // Dotted list with more elements: (a b . c) stored as [a, b, '.', c]
+        const penult = elems[elems.length - 2];
+        if (elems.length >= 4 && penult.tag === 'symbol' && penult.value === '.') {
+            return { tag: 'list', elements: elems.slice(1) };
+        }
+        return { tag: 'list', elements: elems.slice(1) };
     });
     defBuiltin('null?', (args, p) => {
         if (args.length !== 1)
@@ -960,6 +1126,75 @@ function makeGlobalEnv(output = []) {
             throw posError('equal?: need 2 arguments', p);
         return { tag: 'boolean', value: schemeEqual(args[0], args[1]) };
     });
+    defBuiltin('eqv?', (args, p) => {
+        if (args.length !== 2)
+            throw posError('eqv?: need 2 arguments', p);
+        return { tag: 'boolean', value: schemeEqv(args[0], args[1]) };
+    });
+    // Vector operations
+    defBuiltin('vector', args => ({ tag: 'vector', elements: [...args] }));
+    defBuiltin('make-vector', (args, p) => {
+        if (args.length < 1 || args.length > 2)
+            throw posError('make-vector: need 1-2 arguments', p);
+        const n = expectNumber(args[0], 'make-vector', p);
+        const fill = args.length === 2 ? args[1] : { tag: 'number', value: 0 };
+        const elements = new Array(n);
+        for (let i = 0; i < n; i++)
+            elements[i] = fill;
+        return { tag: 'vector', elements };
+    });
+    defBuiltin('vector-ref', (args, p) => {
+        if (args.length !== 2)
+            throw posError('vector-ref: need 2 arguments', p);
+        if (args[0].tag !== 'vector')
+            throw posError('vector-ref: expected vector', p);
+        const idx = expectNumber(args[1], 'vector-ref', p);
+        if (idx < 0 || idx >= args[0].elements.length)
+            throw posError('vector-ref: index out of range', p);
+        return args[0].elements[idx];
+    });
+    defBuiltin('vector-set!', (args, p) => {
+        if (args.length !== 3)
+            throw posError('vector-set!: need 3 arguments', p);
+        if (args[0].tag !== 'vector')
+            throw posError('vector-set!: expected vector', p);
+        const idx = expectNumber(args[1], 'vector-set!', p);
+        if (idx < 0 || idx >= args[0].elements.length)
+            throw posError('vector-set!: index out of range', p);
+        args[0].elements[idx] = args[2];
+        return { tag: 'void' };
+    });
+    defBuiltin('vector-length', (args, p) => {
+        if (args.length !== 1)
+            throw posError('vector-length: need 1 argument', p);
+        if (args[0].tag !== 'vector')
+            throw posError('vector-length: expected vector', p);
+        return { tag: 'number', value: args[0].elements.length };
+    });
+    defBuiltin('vector?', (args, p) => {
+        if (args.length !== 1)
+            throw posError('vector?: need 1 argument', p);
+        return { tag: 'boolean', value: args[0].tag === 'vector' };
+    });
+    defBuiltin('vector->list', (args, p) => {
+        if (args.length !== 1)
+            throw posError('vector->list: need 1 argument', p);
+        if (args[0].tag !== 'vector')
+            throw posError('vector->list: expected vector', p);
+        return { tag: 'list', elements: [...args[0].elements] };
+    });
+    defBuiltin('list->vector', (args, p) => {
+        if (args.length !== 1)
+            throw posError('list->vector: need 1 argument', p);
+        if (args[0].tag !== 'list')
+            throw posError('list->vector: expected list', p);
+        return { tag: 'vector', elements: [...args[0].elements] };
+    });
+    // error
+    defBuiltin('error', (args, p) => {
+        const msg = args.map(a => a.tag === 'string' ? a.value : displayVal(a)).join(' ');
+        throw posError(msg, p);
+    });
     // Numeric utilities
     defBuiltin('abs', (args, p) => {
         if (args.length !== 1)
@@ -1108,6 +1343,7 @@ function displayVal(val) {
         case 'symbol': return val.value;
         case 'char': return `#\\${val.value === ' ' ? 'space' : val.value === '\n' ? 'newline' : val.value}`;
         case 'list': return `(${val.elements.map(displayVal).join(' ')})`;
+        case 'vector': return `#(${val.elements.map(displayVal).join(' ')})`;
         case 'void': return '';
         case 'lambda': return '#<procedure>';
         case 'builtin': return '#<procedure>';
@@ -1123,6 +1359,7 @@ function displayForDisplay(val) {
     switch (val.tag) {
         case 'string': return val.value;
         case 'list': return `(${val.elements.map(displayForDisplay).join(' ')})`;
+        case 'vector': return `#(${val.elements.map(displayForDisplay).join(' ')})`;
         case 'char': return val.value;
         default: return displayVal(val);
     }
