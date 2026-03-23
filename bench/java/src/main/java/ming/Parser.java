@@ -28,7 +28,11 @@ public class Parser {
 
         char c = input.charAt(pos);
 
-        if (c == '(') {
+        if (c == '\'') {
+            pos++; // skip quote char
+            SchemeValue quoted = parseExpr();
+            return new SchemeValue.ListVal(List.of(new SchemeValue.SymbolVal("quote"), quoted));
+        } else if (c == '(') {
             return parseList();
         } else if (c == '"') {
             return parseString();
@@ -121,6 +125,6 @@ public class Parser {
     }
 
     private boolean isDelimiter(char c) {
-        return Character.isWhitespace(c) || c == '(' || c == ')' || c == '"' || c == ';';
+        return Character.isWhitespace(c) || c == '(' || c == ')' || c == '"' || c == ';' || c == '\'';
     }
 }
