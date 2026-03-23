@@ -44,6 +44,8 @@ enum Value {
         def_env: Env,
     },
     Vector(std::rc::Rc<std::cell::RefCell<Vec<Value>>>),
+    /// Multiple return values from `values`.
+    Values(Vec<Value>),
 }
 
 thread_local! {
@@ -101,6 +103,10 @@ impl Value {
                 let items = v.borrow();
                 let inner: Vec<String> = items.iter().map(|v| v.display()).collect();
                 format!("#({})", inner.join(" "))
+            }
+            Value::Values(vs) => {
+                let inner: Vec<String> = vs.iter().map(|v| v.display()).collect();
+                format!("#<values: {}>", inner.join(" "))
             }
         }
     }
@@ -544,6 +550,8 @@ fn is_builtin(name: &str) -> bool {
             | "raise"
             | "with-exception-handler"
             | "exit"
+            | "values"
+            | "call-with-values"
     )
 }
 
@@ -649,6 +657,8 @@ enum KontFrame {
     },
     /// Guard clause evaluation: test was evaluated, decide to return result or try next.
     GuardClause { body: Vec<Expr>, rest_clauses: Vec<Expr>, env: Env, exception: Value },
+    /// call-with-values: producer returned, now apply consumer to the values.
+    CallWithValues { consumer: Value, el: u32, ec: u32 },
 }
 
 /// What to do after unwinding for a raise.
@@ -1082,6 +1092,22 @@ fn apply_func(func: Value, args: Vec<Value>, kont: &mut Vec<KontFrame>, wind: &m
                 kont.push(KontFrame::RaiseUnwind { pending_outs, handler_action: action, exception });
                 Ok(Ctrl::Val(Value::Void)) // trigger the RaiseUnwind frame
             }
+        }
+        Value::Builtin(ref name) if name == "values" => {
+            match args.len() {
+                1 => Ok(Ctrl::Val(args.into_iter().next().unwrap())),
+                _ => Ok(Ctrl::Val(Value::Values(args))),
+            }
+        }
+        Value::Builtin(ref name) if name == "call-with-values" => {
+            if args.len() != 2 {
+                return Err(EvalError::Arity("call-with-values requires 2 arguments".into()).at(el, ec));
+            }
+            let mut args_iter = args.into_iter();
+            let producer = args_iter.next().unwrap();
+            let consumer = args_iter.next().unwrap();
+            kont.push(KontFrame::CallWithValues { consumer, el, ec });
+            apply_func(producer, vec![], kont, wind, el, ec)
         }
         Value::Builtin(ref name) if name == "exit" => {
             if args.len() != 1 {
@@ -2024,6 +2050,13 @@ fn run_cek(initial_ctrl: Ctrl, initial_kont: Vec<KontFrame>) -> Result<Value, Ev
                                     _ => return Err(EvalError::Type("guard: invalid clause".into())),
                                 }
                             }
+                        }
+                        KontFrame::CallWithValues { consumer, el, ec } => {
+                            let args = match val {
+                                Value::Values(vs) => vs,
+                                other => vec![other],
+                            };
+                            apply_func(consumer, args, &mut kont, &mut wind, el, ec)?
                         }
                     }
                 } else {
