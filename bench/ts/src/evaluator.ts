@@ -22,7 +22,8 @@ type SchemeVal =
   | { tag: 'builtin'; name: string; pos?: Pos }
   | { tag: 'continuation'; cont: Cont; winds: WindEntry[]; pos?: Pos }
   | { tag: 'macro'; rules: MacroRule[]; literals: Set<string>; defEnv: Env; pos?: Pos }
-  | { tag: 'vector'; val: SchemeVal[]; pos?: Pos };
+  | { tag: 'vector'; val: SchemeVal[]; pos?: Pos }
+  | { tag: 'values'; vals: SchemeVal[]; pos?: Pos };
 
 interface MacroRule {
   pattern: SchemeVal[];  // pattern elements (excluding macro name)
@@ -241,6 +242,8 @@ function displayVal(v: SchemeVal): string {
       return '#<macro>';
     case 'vector':
       return '#(' + v.val.map(displayVal).join(' ') + ')';
+    case 'values':
+      return v.vals.map(displayVal).join('\n');
   }
 }
 
@@ -1096,6 +1099,18 @@ function applyCPS(proc: SchemeVal, args: SchemeVal[], k: Cont, p?: Pos, out?: st
         return k(result);
       }, p, out);
     }
+    if (proc.name === 'values') {
+      if (args.length === 1) return k(args[0]);
+      return k({ tag: 'values', vals: args });
+    }
+    if (proc.name === 'call-with-values') {
+      if (args.length !== 2) throw posError('call-with-values: need exactly two args', p);
+      const [producer, consumer] = args;
+      return () => applyCPS(producer, [], result => {
+        const consumerArgs = (result.tag === 'values') ? result.vals : [result];
+        return () => applyCPS(consumer, consumerArgs, k, p, out);
+      }, p, out);
+    }
     if (proc.name === 'map') {
       if (args.length < 2) throw posError('map: need at least two args', p);
       const fn = args[0];
@@ -1561,6 +1576,8 @@ function makeGlobalEnv(): Env {
   env.define('dynamic-wind', { tag: 'builtin', name: 'dynamic-wind' });
   env.define('raise', { tag: 'builtin', name: 'raise' });
   env.define('with-exception-handler', { tag: 'builtin', name: 'with-exception-handler' });
+  env.define('values', { tag: 'builtin', name: 'values' });
+  env.define('call-with-values', { tag: 'builtin', name: 'call-with-values' });
   for (const name of BUILTINS) {
     env.define(name, { tag: 'builtin', name });
   }
