@@ -52,6 +52,10 @@ pub enum Value {
         rules: Vec<(Vec<Expr>, Expr)>,
         def_env: Rc<Env>,
     },
+    /// A syntax object wrapping a parsed expression (for syntax-case macros).
+    SyntaxObject(Expr),
+    /// A syntax-case macro transformer (wraps a Lambda).
+    SyntaxTransformer(Box<Value>),
     /// Multiple return values from `(values ...)`.
     MultipleValues(Vec<Value>),
     /// A record instance created by `define-record-type`.
@@ -119,6 +123,8 @@ impl PartialEq for Value {
             }
             (Value::Continuation(_), Value::Continuation(_)) => false,
             (Value::SyntaxRules { .. }, Value::SyntaxRules { .. }) => false,
+            (Value::SyntaxObject(_), Value::SyntaxObject(_)) => false,
+            (Value::SyntaxTransformer(_), Value::SyntaxTransformer(_)) => false,
             (Value::MultipleValues(a), Value::MultipleValues(b)) => a == b,
             (Value::Record { type_tag: ta, fields: fa, .. }, Value::Record { type_tag: tb, fields: fb, .. }) => {
                 Rc::ptr_eq(ta, tb) && fa == fb
@@ -154,6 +160,8 @@ impl Value {
             Value::Lambda { .. } => "#<procedure>".into(),
             Value::Continuation(_) => "#<continuation>".into(),
             Value::SyntaxRules { .. } => "#<macro>".into(),
+            Value::SyntaxObject(_) => "#<syntax>".into(),
+            Value::SyntaxTransformer(_) => "#<macro>".into(),
             Value::MultipleValues(vals) => {
                 let inner: Vec<String> = vals.iter().map(|v| v.to_display_string()).collect();
                 format!("#<values: {}>", inner.join(" "))
@@ -182,6 +190,8 @@ impl Value {
             Value::Pair(cell) => display_pair_chain(cell, Value::to_display_output),
             Value::Continuation(_) => "#<continuation>".into(),
             Value::SyntaxRules { .. } => "#<macro>".into(),
+            Value::SyntaxObject(_) => "#<syntax>".into(),
+            Value::SyntaxTransformer(_) => "#<macro>".into(),
             Value::MultipleValues(_) => self.to_display_string(),
             Value::Record { .. } | Value::RecordConstructor { .. }
             | Value::RecordPredicate { .. } | Value::RecordAccessor { .. } => self.to_display_string(),

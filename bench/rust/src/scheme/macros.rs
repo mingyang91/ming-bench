@@ -19,7 +19,7 @@ const KEYWORDS: &[&str] = &[
     "let", "cond", "define-syntax", "syntax-rules",
 ];
 
-enum Binding {
+pub enum Binding {
     One(Expr),
     Many(Vec<Expr>),
 }
@@ -351,4 +351,32 @@ fn collect_tvars(template: &Expr, out: &mut Vec<String>) {
         }
         _ => {}
     }
+}
+
+// ── syntax-case support ────────────────────────────────────
+
+/// Match a pattern (list of pattern elements) against input (list of input elements).
+/// Returns bindings if matched.
+pub fn syntax_case_match(
+    pattern: &[Expr],
+    input: &[Expr],
+    literals: &[String],
+) -> Option<HashMap<String, Binding>> {
+    let mut bindings = HashMap::new();
+    if match_seq(pattern, input, literals, &mut bindings) {
+        Some(bindings)
+    } else {
+        None
+    }
+}
+
+/// Substitute bindings into a template expression (no hygiene renaming).
+pub fn syntax_template_subst(
+    template: &Expr,
+    bindings: &HashMap<String, Binding>,
+    span: Span,
+) -> Expr {
+    let renames = HashMap::new();
+    let dummy_env = Env::empty_for_subst();
+    subst(template, bindings, &dummy_env, &renames, span)
 }

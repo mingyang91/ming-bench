@@ -80,6 +80,7 @@ impl Env {
             "current-input-port", "current-output-port",
             "input-port?", "output-port?",
             "read", "read-char", "peek-char", "eof-object?",
+            "syntax->datum", "datum->syntax",
         ] {
             bindings.insert(name.into(), Value::Builtin(name.into()));
         }
@@ -109,6 +110,15 @@ impl Env {
             Some(p) => Rc::clone(p),
             None => Rc::clone(this),
         }
+    }
+
+    /// Create a minimal empty env (no builtins). Used internally for syntax expansion.
+    pub fn empty_for_subst() -> Rc<Self> {
+        Rc::new(Self {
+            bindings: RefCell::new(HashMap::new()),
+            parent: None,
+            output: Rc::new(RefCell::new(String::new())),
+        })
     }
 
     pub fn get(&self, name: &str) -> Option<Value> {

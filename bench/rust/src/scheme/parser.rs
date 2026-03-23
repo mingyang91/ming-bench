@@ -179,6 +179,18 @@ impl Parser {
                     Ok(Expr { kind: ExprKind::Char(ch), span })
                 }
             }
+            '\'' => {
+                // #'expr — syntax template shorthand → (syntax-template expr)
+                self.advance(); // skip '\''
+                let inner = self.parse_expr()?;
+                Ok(Expr {
+                    kind: ExprKind::List(vec![
+                        Expr { kind: ExprKind::Symbol("syntax-template".into()), span },
+                        inner,
+                    ]),
+                    span,
+                })
+            }
             '(' => {
                 // #(...) vector literal — parse as (vector ...)
                 self.advance(); // skip '('

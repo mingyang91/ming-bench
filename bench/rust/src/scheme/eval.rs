@@ -331,6 +331,23 @@ enum Frame {
         env: Rc<Env>,
         span: Span,
     },
+    /// After evaluating define-syntax body (non-syntax-rules), store as SyntaxTransformer.
+    DefSyntax { name: String, env: Rc<Env> },
+    /// After syntax transformer returns, evaluate the resulting syntax object.
+    ExpandSyntax { call_env: Rc<Env> },
+    /// After evaluating syntax-case scrutinee, match patterns and eval body.
+    SyntaxCaseMatch {
+        literals: Vec<String>,
+        clauses: Vec<Expr>,
+        env: Rc<Env>,
+    },
+    /// After evaluating with-syntax binding expr, bind and continue.
+    WithSyntaxBind {
+        pattern: Expr,
+        rest_bindings: Vec<(Expr, Expr)>,
+        body: Vec<Expr>,
+        env: Rc<Env>,
+    },
 }
 
 /// CEK machine state.
@@ -436,9 +453,12 @@ fn step_eval_list(
             "letrec" => return step_letrec(&elems[1..], env, k),
             "letrec*" => return step_letrec_star(&elems[1..], env, k),
             "do" => return step_do(&elems[1..], env, k),
-            "define-syntax" => return step_define_syntax(&elems[1..], env),
+            "define-syntax" => return step_define_syntax(&elems[1..], env, k),
             "define-record-type" => return step_define_record_type(&elems[1..], env),
             "guard" => return step_guard(&elems[1..], env, k, wind, handlers),
+            "syntax-case" => return step_syntax_case(&elems[1..], env, k),
+            "syntax-template" => return step_syntax_template(&elems[1..], env),
+            "with-syntax" => return step_with_syntax(&elems[1..], env, k),
             _ => {}
         }
         // Check for macro invocation
@@ -451,6 +471,14 @@ fn step_eval_list(
             let (expanded, new_env) =
                 macros::expand_macro(literals, rules, def_env, &elems[1..], env, span)?;
             return Ok(State::Eval(expanded, new_env));
+        }
+        // Check for syntax-case macro transformer
+        if let Some(Value::SyntaxTransformer(ref transformer)) = env.get(name) {
+            let transformer = *transformer.clone();
+            let call_expr = Expr { kind: ExprKind::List(elems), span };
+            let stx = Value::SyntaxObject(call_expr);
+            k.push(Frame::ExpandSyntax { call_env: Rc::clone(env) });
+            return Ok(State::Apply(transformer, vec![stx], Rc::clone(env), span));
         }
     }
     // Function call: evaluate function position first, then args.
@@ -938,11 +966,11 @@ fn dispatch_case(
     Ok(State::Ret(Value::Void))
 }
 
-fn step_define_syntax(args: &[Expr], env: &Rc<Env>) -> Result<State, EvalError> {
+fn step_define_syntax(args: &[Expr], env: &Rc<Env>, k: &mut Vec<Frame>) -> Result<State, EvalError> {
     if args.len() != 2 {
         return Err(ErrorKind::BadSyntax {
             form: "define-syntax".into(),
-            message: "expected (define-syntax name (syntax-rules ...))".into(),
+            message: "expected (define-syntax name transformer)".into(),
         }
         .into());
     }
@@ -956,9 +984,21 @@ fn step_define_syntax(args: &[Expr], env: &Rc<Env>) -> Result<State, EvalError> 
             .into())
         }
     };
-    let val = parse_syntax_rules(&args[1], env)?;
-    env.define(name, val);
-    Ok(State::Ret(Value::Void))
+    // Try parsing as syntax-rules first
+    if let ExprKind::List(ref elems) = args[1].kind {
+        if !elems.is_empty() {
+            if let ExprKind::Symbol(ref s) = elems[0].kind {
+                if s == "syntax-rules" {
+                    let val = parse_syntax_rules(&args[1], env)?;
+                    env.define(name, val);
+                    return Ok(State::Ret(Value::Void));
+                }
+            }
+        }
+    }
+    // Not syntax-rules — evaluate the body expression (e.g., a lambda)
+    k.push(Frame::DefSyntax { name, env: Rc::clone(env) });
+    Ok(State::Eval(args[1].clone(), Rc::clone(env)))
 }
 
 fn parse_syntax_rules(expr: &Expr, env: &Rc<Env>) -> Result<Value, EvalError> {
@@ -1465,53 +1505,8 @@ fn step_ret(val: Value, frame: Frame, k: &mut Vec<Frame>, wind: &mut Vec<WindEnt
                 Ok(State::Eval(next_expr, env))
             }
         }
-        Frame::ForEachStep {
-            func,
-            lists,
-            index,
-            env,
-            span,
-        } => {
-            // discard val (side-effect only)
-            let next_index = index + 1;
-            if next_index >= lists[0].len() {
-                Ok(State::Ret(Value::Void))
-            } else {
-                let next_args: Vec<Value> = lists.iter().map(|l| l[next_index].clone()).collect();
-                k.push(Frame::ForEachStep {
-                    func: func.clone(),
-                    lists,
-                    index: next_index,
-                    env: Rc::clone(&env),
-                    span,
-                });
-                Ok(State::Apply(func, next_args, env, span))
-            }
-        }
-        Frame::MapStep {
-            func,
-            lists,
-            index,
-            mut results,
-            env,
-            span,
-        } => {
-            results.push(val);
-            let next_index = index + 1;
-            if next_index >= lists[0].len() {
-                Ok(State::Ret(Value::List(results)))
-            } else {
-                let next_args: Vec<Value> = lists.iter().map(|l| l[next_index].clone()).collect();
-                k.push(Frame::MapStep {
-                    func: func.clone(),
-                    lists,
-                    index: next_index,
-                    results,
-                    env: Rc::clone(&env),
-                    span,
-                });
-                Ok(State::Apply(func, next_args, env, span))
-            }
+        Frame::ForEachStep { .. } | Frame::MapStep { .. } => {
+            step_ret_iterate(val, frame, k)
         }
         Frame::CondTest {
             clause_body,
@@ -1551,6 +1546,67 @@ fn step_ret(val: Value, frame: Frame, k: &mut Vec<Frame>, wind: &mut Vec<WindEnt
             };
             Ok(State::Apply(consumer, call_args, env, span))
         }
+        Frame::DefSyntax { name, env } => {
+            env.define(name, Value::SyntaxTransformer(Box::new(val)));
+            Ok(State::Ret(Value::Void))
+        }
+        Frame::ExpandSyntax { call_env, .. } => {
+            match val {
+                Value::SyntaxObject(expr) => Ok(State::Eval(expr, call_env)),
+                other => Err(ErrorKind::BadSyntax {
+                    form: "syntax-case".into(),
+                    message: format!("transformer must return syntax, got {}", other.to_display_string()),
+                }.into()),
+            }
+        }
+        Frame::SyntaxCaseMatch { literals, clauses, env } => {
+            step_ret_syntax_case(val, &literals, &clauses, &env, k)
+        }
+        Frame::WithSyntaxBind { pattern, rest_bindings, body, env } => {
+            step_ret_with_syntax(val, &pattern, rest_bindings, body, &env, k)
+        }
+    }
+}
+
+// ── step_ret_iterate (for-each / map continuation frames) ────
+
+fn step_ret_iterate(val: Value, frame: Frame, k: &mut Vec<Frame>) -> Result<State, EvalError> {
+    match frame {
+        Frame::ForEachStep { func, lists, index, env, span } => {
+            let next_index = index + 1;
+            if next_index >= lists[0].len() {
+                Ok(State::Ret(Value::Void))
+            } else {
+                let next_args: Vec<Value> = lists.iter().map(|l| l[next_index].clone()).collect();
+                k.push(Frame::ForEachStep {
+                    func: func.clone(),
+                    lists,
+                    index: next_index,
+                    env: Rc::clone(&env),
+                    span,
+                });
+                Ok(State::Apply(func, next_args, env, span))
+            }
+        }
+        Frame::MapStep { func, lists, index, mut results, env, span } => {
+            results.push(val);
+            let next_index = index + 1;
+            if next_index >= lists[0].len() {
+                Ok(State::Ret(Value::List(results)))
+            } else {
+                let next_args: Vec<Value> = lists.iter().map(|l| l[next_index].clone()).collect();
+                k.push(Frame::MapStep {
+                    func: func.clone(),
+                    lists,
+                    index: next_index,
+                    results,
+                    env: Rc::clone(&env),
+                    span,
+                });
+                Ok(State::Apply(func, next_args, env, span))
+            }
+        }
+        _ => unreachable!("step_ret_iterate called with non-iterate frame"),
     }
 }
 
@@ -2138,8 +2194,12 @@ fn step_apply(
                 }.into()),
             }
         }
-        Value::SyntaxRules { .. } => Err(ErrorKind::NotAProcedure {
+        Value::SyntaxRules { .. } | Value::SyntaxTransformer(_) => Err(ErrorKind::NotAProcedure {
             value: "#<macro>".into(),
+        }
+        .into()),
+        Value::SyntaxObject(_) => Err(ErrorKind::NotAProcedure {
+            value: "#<syntax>".into(),
         }
         .into()),
         other => Err(ErrorKind::NotAProcedure {
@@ -2622,6 +2682,25 @@ fn apply_builtin(name: &str, args: &[Value], env: &Rc<Env>) -> Result<Value, Eva
             let mut elems = require_list(&args[0])?;
             elems.reverse();
             Ok(Value::list_from_vec(elems))
+        }
+        "syntax->datum" => {
+            if args.len() != 1 {
+                return Err(ErrorKind::WrongArgCount { expected: 1, got: args.len() }.into());
+            }
+            match &args[0] {
+                Value::SyntaxObject(expr) => expr_to_value(expr),
+                other => Err(ErrorKind::TypeMismatch {
+                    expected: "syntax object".into(),
+                    got: other.to_display_string(),
+                }.into()),
+            }
+        }
+        "datum->syntax" => {
+            if args.len() != 2 {
+                return Err(ErrorKind::WrongArgCount { expected: 2, got: args.len() }.into());
+            }
+            let datum_expr = value_to_expr(&args[1], Span::default());
+            Ok(Value::SyntaxObject(datum_expr))
         }
         _ => Err(ErrorKind::NotAProcedure {
             value: format!("#<procedure:{}>", name),
@@ -3902,4 +3981,324 @@ fn compare_nums(args: &[Value], cmp: impl Fn(f64, f64) -> bool) -> Result<Value,
         }
     }
     Ok(Value::Boolean(true))
+}
+
+// ── syntax-case support ─────────────────────────────────────
+
+/// Convert a Value back to an Expr (for datum->syntax).
+fn value_to_expr(val: &Value, span: Span) -> Expr {
+    match val {
+        Value::Integer(n) => Expr { kind: ExprKind::Integer(*n), span },
+        Value::Float(f) => Expr { kind: ExprKind::Float(*f), span },
+        Value::Rational(n, d) => Expr { kind: ExprKind::Rational(*n, *d), span },
+        Value::Boolean(b) => Expr { kind: ExprKind::Boolean(*b), span },
+        Value::Str(s, _) => Expr { kind: ExprKind::Str(s.borrow().clone()), span },
+        Value::Char(c) => Expr { kind: ExprKind::Char(*c), span },
+        Value::Symbol(s) => Expr { kind: ExprKind::Symbol(s.clone()), span },
+        Value::List(elems) => {
+            let exprs: Vec<Expr> = elems.iter().map(|e| value_to_expr(e, span)).collect();
+            Expr { kind: ExprKind::List(exprs), span }
+        }
+        // For anything else, create a symbol placeholder
+        _ => Expr { kind: ExprKind::Symbol(val.to_display_string()), span },
+    }
+}
+
+/// (syntax-case expr (literals) clause ...)
+fn step_syntax_case(args: &[Expr], env: &Rc<Env>, k: &mut Vec<Frame>) -> Result<State, EvalError> {
+    if args.len() < 3 {
+        return Err(ErrorKind::BadSyntax {
+            form: "syntax-case".into(),
+            message: "expected (syntax-case expr (literals) clause ...)".into(),
+        }.into());
+    }
+    // Parse literals
+    let literals = match &args[1].kind {
+        ExprKind::List(lits) => lits.iter().map(|e| match &e.kind {
+            ExprKind::Symbol(s) => Ok(s.clone()),
+            _ => Err(EvalError::from(ErrorKind::BadSyntax {
+                form: "syntax-case".into(),
+                message: "literal must be a symbol".into(),
+            })),
+        }).collect::<Result<Vec<_>, _>>()?,
+        _ => return Err(ErrorKind::BadSyntax {
+            form: "syntax-case".into(),
+            message: "expected literals list".into(),
+        }.into()),
+    };
+    let clauses = args[2..].to_vec();
+    // Evaluate the scrutinee expression
+    k.push(Frame::SyntaxCaseMatch { literals, clauses, env: Rc::clone(env) });
+    Ok(State::Eval(args[0].clone(), Rc::clone(env)))
+}
+
+/// After evaluating syntax-case scrutinee, match patterns.
+fn step_ret_syntax_case(
+    val: Value,
+    literals: &[String],
+    clauses: &[Expr],
+    env: &Rc<Env>,
+    _k: &mut Vec<Frame>,
+) -> Result<State, EvalError> {
+    let input_expr = match val {
+        Value::SyntaxObject(e) => e,
+        _ => return Err(ErrorKind::BadSyntax {
+            form: "syntax-case".into(),
+            message: format!("expected syntax object, got {}", val.to_display_string()),
+        }.into()),
+    };
+
+    let input_elems = match &input_expr.kind {
+        ExprKind::List(elems) => elems.as_slice(),
+        _ => std::slice::from_ref(&input_expr),
+    };
+
+    for clause in clauses {
+        let clause_elems = match &clause.kind {
+            ExprKind::List(e) => e,
+            _ => return Err(ErrorKind::BadSyntax {
+                form: "syntax-case".into(),
+                message: "clause must be a list".into(),
+            }.into()),
+        };
+        if clause_elems.len() < 2 {
+            return Err(ErrorKind::BadSyntax {
+                form: "syntax-case".into(),
+                message: "clause must have pattern and body".into(),
+            }.into());
+        }
+        let pattern_elems = match &clause_elems[0].kind {
+            ExprKind::List(p) => p.as_slice(),
+            _ => std::slice::from_ref(&clause_elems[0]),
+        };
+        let body = &clause_elems[clause_elems.len() - 1];
+
+        // Try matching
+        if let Some(bindings) = macros::syntax_case_match(pattern_elems, input_elems, literals) {
+            // Extend env with pattern bindings as SyntaxObjects
+            let mut names = Vec::new();
+            let mut values = Vec::new();
+            for (name, binding) in &bindings {
+                match binding {
+                    macros::Binding::One(expr) => {
+                        names.push(name.clone());
+                        values.push(Value::SyntaxObject(expr.clone()));
+                    }
+                    macros::Binding::Many(exprs) => {
+                        names.push(name.clone());
+                        values.push(Value::List(
+                            exprs.iter().map(|e| Value::SyntaxObject(e.clone())).collect(),
+                        ));
+                    }
+                }
+            }
+            let new_env = Env::extend(env, names, values);
+            return Ok(State::Eval(body.clone(), new_env));
+        }
+    }
+    Err(ErrorKind::BadSyntax {
+        form: "syntax-case".into(),
+        message: "no matching pattern".into(),
+    }.into())
+}
+
+/// (syntax-template template) — the #' form.
+/// Substitutes pattern variables (SyntaxObjects in env) into the template.
+fn step_syntax_template(args: &[Expr], env: &Rc<Env>) -> Result<State, EvalError> {
+    if args.len() != 1 {
+        return Err(ErrorKind::BadSyntax {
+            form: "syntax".into(),
+            message: "expected (syntax template)".into(),
+        }.into());
+    }
+    let template = &args[0];
+
+    // If template is a single symbol bound to a SyntaxObject, return it directly
+    if let ExprKind::Symbol(ref name) = template.kind {
+        if let Some(val) = env.get(name) {
+            if let Value::SyntaxObject(_) = val { return Ok(State::Ret(val)) }
+        }
+    }
+
+    // Build bindings map from env: collect symbols in template that are SyntaxObjects
+    let syms = collect_syntax_symbols(template);
+    let mut bindings = std::collections::HashMap::new();
+    for sym in &syms {
+        if let Some(val) = env.get(sym) {
+            match val {
+                Value::SyntaxObject(expr) => {
+                    bindings.insert(sym.clone(), macros::Binding::One(expr));
+                }
+                Value::List(elems) if !elems.is_empty() && elems.iter().all(|e| matches!(e, Value::SyntaxObject(_))) => {
+                    let exprs: Vec<Expr> = elems.iter().map(|e| match e {
+                        Value::SyntaxObject(expr) => expr.clone(),
+                        _ => unreachable!(),
+                    }).collect();
+                    bindings.insert(sym.clone(), macros::Binding::Many(exprs));
+                }
+                _ => {}
+            }
+        }
+    }
+
+    let expanded = macros::syntax_template_subst(template, &bindings, template.span);
+    Ok(State::Ret(Value::SyntaxObject(expanded)))
+}
+
+/// Collect all symbol names used in a template expression.
+fn collect_syntax_symbols(expr: &Expr) -> Vec<String> {
+    let mut out = Vec::new();
+    collect_syntax_symbols_inner(expr, &mut out);
+    out
+}
+
+fn collect_syntax_symbols_inner(expr: &Expr, out: &mut Vec<String>) {
+    match &expr.kind {
+        ExprKind::Symbol(s) if s != "..." => {
+            if !out.contains(s) {
+                out.push(s.clone());
+            }
+        }
+        ExprKind::List(elems) => {
+            for e in elems {
+                collect_syntax_symbols_inner(e, out);
+            }
+        }
+        _ => {}
+    }
+}
+
+/// (with-syntax ((pattern expr) ...) body ...)
+fn step_with_syntax(args: &[Expr], env: &Rc<Env>, k: &mut Vec<Frame>) -> Result<State, EvalError> {
+    if args.len() < 2 {
+        return Err(ErrorKind::BadSyntax {
+            form: "with-syntax".into(),
+            message: "expected (with-syntax ((pat expr) ...) body ...)".into(),
+        }.into());
+    }
+    let bindings_list = match &args[0].kind {
+        ExprKind::List(b) => b,
+        _ => return Err(ErrorKind::BadSyntax {
+            form: "with-syntax".into(),
+            message: "expected bindings list".into(),
+        }.into()),
+    };
+    let body = args[1..].to_vec();
+
+    // Parse binding pairs
+    let mut binding_pairs: Vec<(Expr, Expr)> = Vec::new();
+    for binding in bindings_list {
+        match &binding.kind {
+            ExprKind::List(parts) if parts.len() == 2 => {
+                binding_pairs.push((parts[0].clone(), parts[1].clone()));
+            }
+            _ => return Err(ErrorKind::BadSyntax {
+                form: "with-syntax".into(),
+                message: "each binding must be (pattern expr)".into(),
+            }.into()),
+        }
+    }
+
+    if binding_pairs.is_empty() {
+        // No bindings, just eval body
+        return Ok(begin_seq(&body, env, k));
+    }
+
+    let first_pattern = binding_pairs[0].0.clone();
+    let first_expr = binding_pairs[0].1.clone();
+    let rest = binding_pairs[1..].to_vec();
+
+    k.push(Frame::WithSyntaxBind {
+        pattern: first_pattern,
+        rest_bindings: rest,
+        body,
+        env: Rc::clone(env),
+    });
+    Ok(State::Eval(first_expr, Rc::clone(env)))
+}
+
+/// After evaluating a with-syntax binding expr, match and continue.
+fn step_ret_with_syntax(
+    val: Value,
+    pattern: &Expr,
+    rest_bindings: Vec<(Expr, Expr)>,
+    body: Vec<Expr>,
+    env: &Rc<Env>,
+    k: &mut Vec<Frame>,
+) -> Result<State, EvalError> {
+    let input_expr = match &val {
+        Value::SyntaxObject(e) => e.clone(),
+        _ => return Err(ErrorKind::BadSyntax {
+            form: "with-syntax".into(),
+            message: format!("expected syntax object, got {}", val.to_display_string()),
+        }.into()),
+    };
+
+    // Match pattern against the syntax object's expr
+    let (pattern_slice, input_slice);
+    let pattern_vec;
+    let input_vec;
+    match &pattern.kind {
+        ExprKind::List(p) => {
+            pattern_vec = p.clone();
+            pattern_slice = pattern_vec.as_slice();
+            match &input_expr.kind {
+                ExprKind::List(i) => {
+                    input_vec = i.clone();
+                    input_slice = input_vec.as_slice();
+                }
+                _ => {
+                    input_vec = vec![input_expr.clone()];
+                    input_slice = input_vec.as_slice();
+                }
+            }
+        }
+        _ => {
+            // Single symbol pattern — match against entire expr
+            pattern_vec = vec![pattern.clone()];
+            pattern_slice = pattern_vec.as_slice();
+            input_vec = vec![input_expr];
+            input_slice = input_vec.as_slice();
+        }
+    }
+
+    if let Some(bindings) = macros::syntax_case_match(pattern_slice, input_slice, &[]) {
+        let mut names = Vec::new();
+        let mut values = Vec::new();
+        for (name, binding) in &bindings {
+            match binding {
+                macros::Binding::One(expr) => {
+                    names.push(name.clone());
+                    values.push(Value::SyntaxObject(expr.clone()));
+                }
+                macros::Binding::Many(exprs) => {
+                    names.push(name.clone());
+                    values.push(Value::List(
+                        exprs.iter().map(|e| Value::SyntaxObject(e.clone())).collect(),
+                    ));
+                }
+            }
+        }
+        let new_env = Env::extend(env, names, values);
+
+        if rest_bindings.is_empty() {
+            Ok(begin_seq(&body, &new_env, k))
+        } else {
+            let next_pattern = rest_bindings[0].0.clone();
+            let next_expr = rest_bindings[0].1.clone();
+            let remaining = rest_bindings[1..].to_vec();
+            k.push(Frame::WithSyntaxBind {
+                pattern: next_pattern,
+                rest_bindings: remaining,
+                body,
+                env: new_env.clone(),
+            });
+            Ok(State::Eval(next_expr, new_env))
+        }
+    } else {
+        Err(ErrorKind::BadSyntax {
+            form: "with-syntax".into(),
+            message: "pattern match failed".into(),
+        }.into())
+    }
 }
