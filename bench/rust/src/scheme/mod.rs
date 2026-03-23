@@ -229,7 +229,27 @@ fn expr_to_value(expr: &Expr) -> Value {
 fn is_builtin(name: &str) -> bool {
     matches!(
         name,
-        "+" | "-" | "*" | "/" | "<" | ">" | "=" | "<=" | ">=" | "not"
+        "+" | "-"
+            | "*"
+            | "/"
+            | "<"
+            | ">"
+            | "="
+            | "<="
+            | ">="
+            | "not"
+            | "cons"
+            | "car"
+            | "cdr"
+            | "null?"
+            | "list"
+            | "length"
+            | "append"
+            | "string?"
+            | "number?"
+            | "boolean?"
+            | "pair?"
+            | "symbol?"
     )
 }
 
@@ -377,6 +397,143 @@ fn eval(expr: &Expr, env: &Env) -> Result<Value, EvalError> {
                         }
                         return Ok(result);
                     }
+                    "let" => {
+                        if items.len() < 3 {
+                            return Err(EvalError::Arity(
+                                "let requires at least 2 arguments".into(),
+                            ));
+                        }
+                        // Named let: (let name ((var init) ...) body ...)
+                        if let Expr::Symbol(loop_name) = &items[1] {
+                            let bindings = match &items[2] {
+                                Expr::List(bs) => bs,
+                                _ => {
+                                    return Err(EvalError::Type(
+                                        "let: expected bindings list".into(),
+                                    ))
+                                }
+                            };
+                            let mut params = Vec::new();
+                            let mut init_vals = Vec::new();
+                            for b in bindings {
+                                match b {
+                                    Expr::List(pair) if pair.len() == 2 => {
+                                        if let Expr::Symbol(s) = &pair[0] {
+                                            params.push(s.clone());
+                                            init_vals.push(eval(&pair[1], env)?);
+                                        } else {
+                                            return Err(EvalError::Type(
+                                                "let: expected symbol".into(),
+                                            ));
+                                        }
+                                    }
+                                    _ => {
+                                        return Err(EvalError::Type(
+                                            "let: invalid binding".into(),
+                                        ))
+                                    }
+                                }
+                            }
+                            let body = items[3..].to_vec();
+                            let loop_lambda = Value::Lambda {
+                                params: params.clone(),
+                                body,
+                                env: env.clone(),
+                            };
+                            let local_env = new_env(Some(env.clone()));
+                            env_set(&local_env, loop_name.clone(), loop_lambda.clone());
+                            // Update the lambda's env to include itself
+                            if let Value::Lambda {
+                                params: p,
+                                body: b,
+                                ..
+                            } = loop_lambda
+                            {
+                                let self_lambda = Value::Lambda {
+                                    params: p,
+                                    body: b,
+                                    env: local_env.clone(),
+                                };
+                                env_set(&local_env, loop_name.clone(), self_lambda);
+                            }
+                            // Call the loop with initial values
+                            let func = env_get(&local_env, loop_name).unwrap();
+                            return apply(func, init_vals);
+                        }
+                        // Regular let: (let ((var init) ...) body ...)
+                        let bindings = match &items[1] {
+                            Expr::List(bs) => bs,
+                            _ => {
+                                return Err(EvalError::Type(
+                                    "let: expected bindings list".into(),
+                                ))
+                            }
+                        };
+                        let local_env = new_env(Some(env.clone()));
+                        for b in bindings {
+                            match b {
+                                Expr::List(pair) if pair.len() == 2 => {
+                                    if let Expr::Symbol(s) = &pair[0] {
+                                        let val = eval(&pair[1], env)?;
+                                        env_set(&local_env, s.clone(), val);
+                                    } else {
+                                        return Err(EvalError::Type(
+                                            "let: expected symbol".into(),
+                                        ));
+                                    }
+                                }
+                                _ => {
+                                    return Err(EvalError::Type(
+                                        "let: invalid binding".into(),
+                                    ))
+                                }
+                            }
+                        }
+                        let mut result = Value::Void;
+                        for expr in &items[2..] {
+                            result = eval(expr, &local_env)?;
+                        }
+                        return Ok(result);
+                    }
+                    "begin" => {
+                        let mut result = Value::Void;
+                        for expr in &items[1..] {
+                            result = eval(expr, env)?;
+                        }
+                        return Ok(result);
+                    }
+                    "cond" => {
+                        for clause in &items[1..] {
+                            match clause {
+                                Expr::List(parts) if !parts.is_empty() => {
+                                    // Check for else clause
+                                    if let Expr::Symbol(s) = &parts[0] {
+                                        if s == "else" {
+                                            let mut result = Value::Void;
+                                            for expr in &parts[1..] {
+                                                result = eval(expr, env)?;
+                                            }
+                                            return Ok(result);
+                                        }
+                                    }
+                                    let test = eval(&parts[0], env)?;
+                                    if test.is_truthy() {
+                                        let mut result = test;
+                                        for expr in &parts[1..] {
+                                            result = eval(expr, env)?;
+                                        }
+                                        return Ok(result);
+                                    }
+                                }
+                                _ => {
+                                    return Err(EvalError::Type(
+                                        "cond: invalid clause".into(),
+                                    ))
+                                }
+                            }
+                        }
+                        return Ok(Value::Void);
+                    }
                     _ => {} // fall through to procedure call
                 }
             }
@@ -477,6 +634,100 @@ fn eval_builtin(op: &str, args: &[Value]) -> Result<Value, EvalError> {
                 return Err(EvalError::Arity("not requires 1 argument".into()));
             }
             Ok(Value::Boolean(!args[0].is_truthy()))
+        }
+        "cons" => {
+            if args.len() != 2 {
+                return Err(EvalError::Arity("cons requires 2 arguments".into()));
+            }
+            match &args[1] {
+                Value::List(tail) => {
+                    let mut new_list = vec![args[0].clone()];
+                    new_list.extend(tail.iter().cloned());
+                    Ok(Value::List(new_list))
+                }
+                _ => {
+                    // Improper pair - represent as 2-element list for now
+                    Ok(Value::List(vec![args[0].clone(), args[1].clone()]))
+                }
+            }
+        }
+        "car" => {
+            if args.len() != 1 {
+                return Err(EvalError::Arity("car requires 1 argument".into()));
+            }
+            match &args[0] {
+                Value::List(items) if !items.is_empty() => Ok(items[0].clone()),
+                _ => Err(EvalError::Type("car: not a pair".into())),
+            }
+        }
+        "cdr" => {
+            if args.len() != 1 {
+                return Err(EvalError::Arity("cdr requires 1 argument".into()));
+            }
+            match &args[0] {
+                Value::List(items) if !items.is_empty() => {
+                    Ok(Value::List(items[1..].to_vec()))
+                }
+                _ => Err(EvalError::Type("cdr: not a pair".into())),
+            }
+        }
+        "null?" => {
+            if args.len() != 1 {
+                return Err(EvalError::Arity("null? requires 1 argument".into()));
+            }
+            Ok(Value::Boolean(matches!(&args[0], Value::List(items) if items.is_empty())))
+        }
+        "list" => Ok(Value::List(args.to_vec())),
+        "length" => {
+            if args.len() != 1 {
+                return Err(EvalError::Arity("length requires 1 argument".into()));
+            }
+            match &args[0] {
+                Value::List(items) => Ok(Value::Integer(items.len() as i64)),
+                _ => Err(EvalError::Type("length: not a list".into())),
+            }
+        }
+        "append" => {
+            let mut result = Vec::new();
+            for a in args {
+                match a {
+                    Value::List(items) => result.extend(items.iter().cloned()),
+                    _ => return Err(EvalError::Type("append: not a list".into())),
+                }
+            }
+            Ok(Value::List(result))
+        }
+        "string?" => {
+            if args.len() != 1 {
+                return Err(EvalError::Arity("string? requires 1 argument".into()));
+            }
+            Ok(Value::Boolean(matches!(&args[0], Value::Str(_))))
+        }
+        "number?" => {
+            if args.len() != 1 {
+                return Err(EvalError::Arity("number? requires 1 argument".into()));
+            }
+            Ok(Value::Boolean(matches!(&args[0], Value::Integer(_))))
+        }
+        "boolean?" => {
+            if args.len() != 1 {
+                return Err(EvalError::Arity("boolean? requires 1 argument".into()));
+            }
+            Ok(Value::Boolean(matches!(&args[0], Value::Boolean(_))))
+        }
+        "pair?" => {
+            if args.len() != 1 {
+                return Err(EvalError::Arity("pair? requires 1 argument".into()));
+            }
+            Ok(Value::Boolean(
+                matches!(&args[0], Value::List(items) if !items.is_empty()),
+            ))
+        }
+        "symbol?" => {
+            if args.len() != 1 {
+                return Err(EvalError::Arity("symbol? requires 1 argument".into()));
+            }
+            Ok(Value::Boolean(matches!(&args[0], Value::Symbol(_))))
         }
         _ => Err(EvalError::UnboundVariable(op.to_string())),
     }
