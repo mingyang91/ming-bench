@@ -6,8 +6,12 @@ public sealed interface SchemeValue {
     record IntVal(long value) implements SchemeValue {}
     record BoolVal(boolean value) implements SchemeValue {}
     record StringVal(String value) implements SchemeValue {}
-    record SymbolVal(String name) implements SchemeValue {}
-    record ListVal(List<SchemeValue> elements) implements SchemeValue {}
+    record SymbolVal(String name, int line, int col) implements SchemeValue {
+        SymbolVal(String name) { this(name, 0, 0); }
+    }
+    record ListVal(List<SchemeValue> elements, int line, int col) implements SchemeValue {
+        ListVal(List<SchemeValue> elements) { this(elements, 0, 0); }
+    }
     record PairVal(SchemeValue car, SchemeValue cdr) implements SchemeValue {}
     record NilVal() implements SchemeValue {}
     record LambdaVal(List<String> params, List<SchemeValue> body, Environment env) implements SchemeValue {}

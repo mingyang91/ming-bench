@@ -161,24 +161,29 @@ public class Evaluator {
             case SchemeValue.PairVal v -> v;
             case SchemeValue.LambdaVal v -> v;
             case SchemeValue.BuiltinVal v -> v;
-            case SchemeValue.SymbolVal v -> env.get(v.name());
-            case SchemeValue.ListVal v -> evalList(v.elements(), env);
+            case SchemeValue.SymbolVal v -> {
+                try { yield env.get(v.name()); }
+                catch (EvalError e) { throw new EvalError("Unbound variable: " + v.name() + " at " + v.line() + ":" + v.col()); }
+            }
+            case SchemeValue.ListVal v -> evalList(v, env);
         };
     }
 
-    private SchemeValue evalList(List<SchemeValue> elems, Environment env) throws EvalError {
-        if (elems.isEmpty()) throw new EvalError("Empty application");
+    private SchemeValue evalList(SchemeValue.ListVal listVal, Environment env) throws EvalError {
+        List<SchemeValue> elems = listVal.elements();
+        String pos = listVal.line() + ":" + listVal.col();
+        if (elems.isEmpty()) throw new EvalError("Empty application at " + pos);
         SchemeValue head = elems.getFirst();
         if (head instanceof SchemeValue.SymbolVal sym) {
             String name = sym.name();
             switch (name) {
                 case "and": return evalAnd(elems, env);
                 case "or": return evalOr(elems, env);
-                case "if": return evalIf(elems, env);
-                case "define": return evalDefine(elems, env);
-                case "quote": return evalQuote(elems);
-                case "lambda": return evalLambda(elems, env);
-                case "let": return evalLet(elems, env);
+                case "if": return evalIf(elems, env, pos);
+                case "define": return evalDefine(elems, env, pos);
+                case "quote": return evalQuote(elems, pos);
+                case "lambda": return evalLambda(elems, env, pos);
+                case "let": return evalLet(elems, env, pos);
                 case "begin": return evalBegin(elems, env);
                 case "cond": return evalCond(elems, env);
                 default: break;
@@ -190,16 +195,24 @@ public class Evaluator {
         for (int i = 1; i < elems.size(); i++) {
             args.add(eval(elems.get(i), env));
         }
-        return apply(proc, args);
+        return apply(proc, args, pos);
     }
 
-    private SchemeValue apply(SchemeValue proc, List<SchemeValue> args) throws EvalError {
+    private SchemeValue apply(SchemeValue proc, List<SchemeValue> args, String pos) throws EvalError {
         if (proc instanceof SchemeValue.BuiltinVal builtin) {
-            return builtin.func().apply(args);
+            try {
+                return builtin.func().apply(args);
+            } catch (EvalError e) {
+                String msg = e.getMessage();
+                if (!msg.matches(".*\\d+:\\d+.*")) {
+                    throw new EvalError(msg + " at " + pos);
+                }
+                throw e;
+            }
         }
         if (proc instanceof SchemeValue.LambdaVal lambda) {
             if (lambda.params().size() != args.size()) {
-                throw new EvalError("Expected " + lambda.params().size() + " arguments, got " + args.size());
+                throw new EvalError("Expected " + lambda.params().size() + " arguments, got " + args.size() + " at " + pos);
             }
             Environment callEnv = new Environment(lambda.env());
             for (int i = 0; i < lambda.params().size(); i++) {
@@ -211,11 +224,11 @@ public class Evaluator {
             }
             return result;
         }
-        throw new EvalError("Not a procedure: " + proc.display());
+        throw new EvalError("Not a procedure: " + proc.display() + " at " + pos);
     }
 
-    private SchemeValue evalIf(List<SchemeValue> elems, Environment env) throws EvalError {
-        if (elems.size() < 3 || elems.size() > 4) throw new EvalError("if requires 2 or 3 arguments");
+    private SchemeValue evalIf(List<SchemeValue> elems, Environment env, String pos) throws EvalError {
+        if (elems.size() < 3 || elems.size() > 4) throw new EvalError("if requires 2 or 3 arguments at " + pos);
         SchemeValue cond = eval(elems.get(1), env);
         if (cond.isTruthy()) {
             return eval(elems.get(2), env);
@@ -225,8 +238,8 @@ public class Evaluator {
         return new SchemeValue.VoidVal();
     }
 
-    private SchemeValue evalDefine(List<SchemeValue> elems, Environment env) throws EvalError {
-        if (elems.size() < 3) throw new EvalError("define requires at least 2 arguments");
+    private SchemeValue evalDefine(List<SchemeValue> elems, Environment env, String pos) throws EvalError {
+        if (elems.size() < 3) throw new EvalError("define requires at least 2 arguments at " + pos);
         SchemeValue target = elems.get(1);
         if (target instanceof SchemeValue.SymbolVal sym) {
             SchemeValue val = eval(elems.get(2), env);
@@ -253,8 +266,8 @@ public class Evaluator {
         throw new EvalError("define: invalid syntax");
     }
 
-    private SchemeValue evalQuote(List<SchemeValue> elems) throws EvalError {
-        if (elems.size() != 2) throw new EvalError("quote requires exactly 1 argument");
+    private SchemeValue evalQuote(List<SchemeValue> elems, String pos) throws EvalError {
+        if (elems.size() != 2) throw new EvalError("quote requires exactly 1 argument at " + pos);
         return quoteDatum(elems.get(1));
     }
 
@@ -271,8 +284,8 @@ public class Evaluator {
         return v;
     }
 
-    private SchemeValue evalLambda(List<SchemeValue> elems, Environment env) throws EvalError {
-        if (elems.size() < 3) throw new EvalError("lambda requires parameters and body");
+    private SchemeValue evalLambda(List<SchemeValue> elems, Environment env, String pos) throws EvalError {
+        if (elems.size() < 3) throw new EvalError("lambda requires parameters and body at " + pos);
         SchemeValue paramSpec = elems.get(1);
         if (!(paramSpec instanceof SchemeValue.ListVal paramList)) {
             throw new EvalError("lambda: expected parameter list");
@@ -288,8 +301,8 @@ public class Evaluator {
         return new SchemeValue.LambdaVal(params, body, env);
     }
 
-    private SchemeValue evalLet(List<SchemeValue> elems, Environment env) throws EvalError {
-        if (elems.size() < 3) throw new EvalError("let requires bindings and body");
+    private SchemeValue evalLet(List<SchemeValue> elems, Environment env, String pos) throws EvalError {
+        if (elems.size() < 3) throw new EvalError("let requires bindings and body at " + pos);
         // Named let: (let name ((var init) ...) body...)
         if (elems.get(1) instanceof SchemeValue.SymbolVal nameSym) {
             if (elems.size() < 4) throw new EvalError("named let requires bindings and body");
@@ -313,7 +326,7 @@ public class Evaluator {
             Environment letEnv = new Environment(env);
             SchemeValue.LambdaVal lambda = new SchemeValue.LambdaVal(params, body, letEnv);
             letEnv.define(name, lambda);
-            return apply(lambda, inits);
+            return apply(lambda, inits, pos);
         }
         // Regular let: (let ((var init) ...) body...)
         if (!(elems.get(1) instanceof SchemeValue.ListVal bindingsList)) {
@@ -393,5 +406,11 @@ public class Evaluator {
     private long requireInt(SchemeValue val) throws EvalError {
         if (val instanceof SchemeValue.IntVal iv) return iv.value();
         throw new EvalError("Expected integer, got: " + val.display());
+    }
+
+    private static String posOf(SchemeValue v) {
+        if (v instanceof SchemeValue.ListVal l) return l.line() + ":" + l.col();
+        if (v instanceof SchemeValue.SymbolVal s) return s.line() + ":" + s.col();
+        return "0:0";
     }
 }

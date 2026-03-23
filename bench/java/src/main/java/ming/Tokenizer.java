@@ -8,7 +8,7 @@ public class Tokenizer {
         LPAREN, RPAREN, QUOTE, SYMBOL, INTEGER, BOOLEAN, STRING, EOF
     }
 
-    public record Token(TokenType type, String value, int pos) {}
+    public record Token(TokenType type, String value, int pos, int line, int col) {}
 
     private final String input;
     private int pos;
@@ -16,6 +16,20 @@ public class Tokenizer {
     public Tokenizer(String input) {
         this.input = input;
         this.pos = 0;
+    }
+
+    private int[] lineCol(int offset) {
+        int line = 1, col = 1;
+        for (int i = 0; i < offset && i < input.length(); i++) {
+            if (input.charAt(i) == '\n') { line++; col = 1; }
+            else { col++; }
+        }
+        return new int[]{line, col};
+    }
+
+    private Token token(TokenType type, String value, int start) {
+        int[] lc = lineCol(start);
+        return new Token(type, value, start, lc[0], lc[1]);
     }
 
     public List<Token> tokenize() throws EvalError {
@@ -26,13 +40,13 @@ public class Tokenizer {
 
             char c = input.charAt(pos);
             if (c == '\'') {
-                tokens.add(new Token(TokenType.QUOTE, "'", pos));
+                tokens.add(token(TokenType.QUOTE, "'", pos));
                 pos++;
             } else if (c == '(') {
-                tokens.add(new Token(TokenType.LPAREN, "(", pos));
+                tokens.add(token(TokenType.LPAREN, "(", pos));
                 pos++;
             } else if (c == ')') {
-                tokens.add(new Token(TokenType.RPAREN, ")", pos));
+                tokens.add(token(TokenType.RPAREN, ")", pos));
                 pos++;
             } else if (c == '"') {
                 tokens.add(readString());
@@ -42,7 +56,7 @@ public class Tokenizer {
                 tokens.add(readAtom());
             }
         }
-        tokens.add(new Token(TokenType.EOF, "", pos));
+        tokens.add(token(TokenType.EOF, "", pos));
         return tokens;
     }
 
@@ -82,7 +96,7 @@ public class Tokenizer {
         }
         if (pos >= input.length()) throw new EvalError("Unterminated string");
         pos++; // skip closing quote
-        return new Token(TokenType.STRING, sb.toString(), start);
+        return token(TokenType.STRING, sb.toString(), start);
     }
 
     private Token readHash() throws EvalError {
@@ -100,10 +114,10 @@ public class Tokenizer {
                     sb.append(input.charAt(pos));
                     pos++;
                 }
-                if (sb.toString().equals("#true")) return new Token(TokenType.BOOLEAN, "true", start);
+                if (sb.toString().equals("#true")) return token(TokenType.BOOLEAN, "true", start);
                 throw new EvalError("Unknown literal: " + sb);
             }
-            return new Token(TokenType.BOOLEAN, "true", start);
+            return token(TokenType.BOOLEAN, "true", start);
         } else if (c == 'f') {
             pos++;
             if (pos < input.length() && !isDelimiter(input.charAt(pos))) {
@@ -112,10 +126,10 @@ public class Tokenizer {
                     sb.append(input.charAt(pos));
                     pos++;
                 }
-                if (sb.toString().equals("#false")) return new Token(TokenType.BOOLEAN, "false", start);
+                if (sb.toString().equals("#false")) return token(TokenType.BOOLEAN, "false", start);
                 throw new EvalError("Unknown literal: " + sb);
             }
-            return new Token(TokenType.BOOLEAN, "false", start);
+            return token(TokenType.BOOLEAN, "false", start);
         }
         throw new EvalError("Unknown # literal at position " + start);
     }
@@ -131,9 +145,9 @@ public class Tokenizer {
         // Check if integer
         try {
             Long.parseLong(val);
-            return new Token(TokenType.INTEGER, val, start);
+            return token(TokenType.INTEGER, val, start);
         } catch (NumberFormatException e) {
-            return new Token(TokenType.SYMBOL, val, start);
+            return token(TokenType.SYMBOL, val, start);
         }
     }
 

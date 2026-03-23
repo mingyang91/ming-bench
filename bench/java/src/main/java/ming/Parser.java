@@ -26,29 +26,29 @@ public class Parser {
             case QUOTE -> {
                 advance();
                 SchemeValue quoted = parseExpr();
-                yield new SchemeValue.ListVal(List.of(new SchemeValue.SymbolVal("quote"), quoted));
+                yield new SchemeValue.ListVal(List.of(new SchemeValue.SymbolVal("quote", tok.line(), tok.col()), quoted), tok.line(), tok.col());
             }
             case LPAREN -> parseList();
             case INTEGER -> { advance(); yield new SchemeValue.IntVal(Long.parseLong(tok.value())); }
             case BOOLEAN -> { advance(); yield new SchemeValue.BoolVal(tok.value().equals("true")); }
             case STRING -> { advance(); yield new SchemeValue.StringVal(tok.value()); }
-            case SYMBOL -> { advance(); yield new SchemeValue.SymbolVal(tok.value()); }
-            case RPAREN -> throw new EvalError("Unexpected )");
-            case EOF -> throw new EvalError("Unexpected end of input");
+            case SYMBOL -> { advance(); yield new SchemeValue.SymbolVal(tok.value(), tok.line(), tok.col()); }
+            case RPAREN -> throw new EvalError("Unexpected ) at " + tok.line() + ":" + tok.col());
+            case EOF -> throw new EvalError("Unexpected end of input at " + tok.line() + ":" + tok.col());
         };
     }
 
     private SchemeValue parseList() throws EvalError {
-        advance(); // skip (
+        Tokenizer.Token open = advance(); // skip (
         List<SchemeValue> elements = new ArrayList<>();
         while (peek().type() != Tokenizer.TokenType.RPAREN) {
             if (peek().type() == Tokenizer.TokenType.EOF) {
-                throw new EvalError("Unterminated list");
+                throw new EvalError("Unterminated list at " + open.line() + ":" + open.col());
             }
             elements.add(parseExpr());
         }
         advance(); // skip )
-        return new SchemeValue.ListVal(elements);
+        return new SchemeValue.ListVal(elements, open.line(), open.col());
     }
 
     private Tokenizer.Token peek() {
