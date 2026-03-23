@@ -18,12 +18,16 @@ fn output_take() -> String {
     OUTPUT_BUF.with(|buf| buf.borrow_mut().split_off(0))
 }
 
+fn make_string(s: std::string::String) -> Value {
+    Value::String(Rc::new(RefCell::new(s)))
+}
+
 /// A Scheme runtime value.
 #[derive(Clone)]
 enum Value {
     Integer(i64),
     Boolean(bool),
-    String(String),
+    String(Rc<RefCell<std::string::String>>),
     Char(char),
     List(Vec<Value>),
     Pair(Box<Value>, Box<Value>),
@@ -42,7 +46,7 @@ impl std::fmt::Debug for Value {
         match self {
             Value::Integer(n) => write!(f, "Integer({n})"),
             Value::Boolean(b) => write!(f, "Boolean({b})"),
-            Value::String(s) => write!(f, "String({s:?})"),
+            Value::String(s) => write!(f, "String({:?})", s.borrow()),
             Value::Char(c) => write!(f, "Char({c:?})"),
             Value::List(l) => write!(f, "List({l:?})"),
             Value::Pair(a, b) => write!(f, "Pair({a:?}, {b:?})"),
@@ -59,7 +63,7 @@ impl PartialEq for Value {
         match (self, other) {
             (Value::Integer(a), Value::Integer(b)) => a == b,
             (Value::Boolean(a), Value::Boolean(b)) => a == b,
-            (Value::String(a), Value::String(b)) => a == b,
+            (Value::String(a), Value::String(b)) => *a.borrow() == *b.borrow(),
             (Value::Char(a), Value::Char(b)) => a == b,
             (Value::List(a), Value::List(b)) => a == b,
             (Value::Pair(a1, b1), Value::Pair(a2, b2)) => a1 == a2 && b1 == b2,
@@ -74,7 +78,7 @@ impl Value {
     /// Format for `display` — strings without quotes, chars as raw character.
     fn display_fmt(&self, out: &mut String) {
         match self {
-            Value::String(s) => out.push_str(s),
+            Value::String(s) => out.push_str(&s.borrow()),
             Value::Char(c) => out.push(*c),
             _ => out.push_str(&self.to_string()),
         }
@@ -87,7 +91,7 @@ impl std::fmt::Display for Value {
             Value::Integer(n) => write!(f, "{n}"),
             Value::Boolean(true) => write!(f, "#t"),
             Value::Boolean(false) => write!(f, "#f"),
-            Value::String(s) => write!(f, "\"{}\"", s),
+            Value::String(s) => write!(f, "\"{}\"", s.borrow()),
             Value::Char(c) => write!(f, "#\\{c}"),
             Value::List(elems) => {
                 write!(f, "(")?;
@@ -138,6 +142,7 @@ enum ExprKind {
     Integer(i64),
     Boolean(bool),
     Str(String),
+    Char(char),
     Symbol(String),
     List(Vec<Expr>),
 }
@@ -146,7 +151,8 @@ fn expr_to_value(expr: &Expr) -> Value {
     match &expr.kind {
         ExprKind::Integer(n) => Value::Integer(*n),
         ExprKind::Boolean(b) => Value::Boolean(*b),
-        ExprKind::Str(s) => Value::String(s.clone()),
+        ExprKind::Str(s) => make_string(s.clone()),
+        ExprKind::Char(c) => Value::Char(*c),
         ExprKind::Symbol(s) => Value::Symbol(s.clone()),
         ExprKind::List(elems) => Value::List(elems.iter().map(expr_to_value).collect()),
     }
@@ -220,6 +226,8 @@ fn default_env() -> Env {
         ("symbol->string", builtin_symbol_to_string),
         ("string->symbol", builtin_string_to_symbol),
         ("string-ref", builtin_string_ref),
+        ("string-copy", builtin_string_copy),
+        ("string-set!", builtin_string_set),
     ];
     for &(name, func) in builtins {
         env_set(&env, name.to_string(), Value::Builtin(name.to_string(), func));
@@ -394,6 +402,16 @@ fn parse_atom(token: &str) -> ExprKind {
         ExprKind::Boolean(true)
     } else if token == "#f" {
         ExprKind::Boolean(false)
+    } else if token.starts_with("#\\") {
+        let rest = &token[2..];
+        let c = match rest {
+            "space" => ' ',
+            "newline" => '\n',
+            "tab" => '\t',
+            s if s.len() == 1 => s.chars().next().unwrap(),
+            _ => rest.chars().next().unwrap_or('?'),
+        };
+        ExprKind::Char(c)
     } else if token.starts_with('"') && token.ends_with('"') {
         ExprKind::Str(token[1..token.len() - 1].to_string())
     } else if let Ok(n) = token.parse::<i64>() {
@@ -413,7 +431,8 @@ fn eval_inner(expr: &Expr, env: &Env) -> Result<Value, EvalError> {
     match &expr.kind {
         ExprKind::Integer(n) => Ok(Value::Integer(*n)),
         ExprKind::Boolean(b) => Ok(Value::Boolean(*b)),
-        ExprKind::Str(s) => Ok(Value::String(s.clone())),
+        ExprKind::Str(s) => Ok(make_string(s.clone())),
+        ExprKind::Char(c) => Ok(Value::Char(*c)),
         ExprKind::Symbol(name) => {
             env_get(env, name).ok_or_else(|| EvalError::UnboundVariable(name.clone()))
         }
@@ -857,14 +876,14 @@ fn builtin_newline(args: &[Value]) -> Result<Value, EvalError> {
 }
 
 fn builtin_string_append(args: &[Value]) -> Result<Value, EvalError> {
-    let mut result = String::new();
+    let mut result = std::string::String::new();
     for arg in args {
         match arg {
-            Value::String(s) => result.push_str(s),
+            Value::String(s) => result.push_str(&s.borrow()),
             _ => return Err(EvalError::Type("string-append: expected string".into())),
         }
     }
-    Ok(Value::String(result))
+    Ok(make_string(result))
 }
 
 fn builtin_string_length(args: &[Value]) -> Result<Value, EvalError> {
@@ -872,7 +891,7 @@ fn builtin_string_length(args: &[Value]) -> Result<Value, EvalError> {
         return Err(EvalError::Arity("string-length expects 1 argument".into()));
     }
     match &args[0] {
-        Value::String(s) => Ok(Value::Integer(s.len() as i64)),
+        Value::String(s) => Ok(Value::Integer(s.borrow().len() as i64)),
         _ => Err(EvalError::Type("string-length: expected string".into())),
     }
 }
@@ -883,12 +902,13 @@ fn builtin_substring(args: &[Value]) -> Result<Value, EvalError> {
     }
     match (&args[0], &args[1], &args[2]) {
         (Value::String(s), Value::Integer(start), Value::Integer(end)) => {
+            let s = s.borrow();
             let start = *start as usize;
             let end = *end as usize;
             if start > end || end > s.len() {
                 return Err(EvalError::Type("substring: index out of range".into()));
             }
-            Ok(Value::String(s[start..end].to_string()))
+            Ok(make_string(s[start..end].to_string()))
         }
         _ => Err(EvalError::Type("substring: expected string and two integers".into())),
     }
@@ -899,7 +919,7 @@ fn builtin_string_to_number(args: &[Value]) -> Result<Value, EvalError> {
         return Err(EvalError::Arity("string->number expects 1 argument".into()));
     }
     match &args[0] {
-        Value::String(s) => match s.parse::<i64>() {
+        Value::String(s) => match s.borrow().parse::<i64>() {
             Ok(n) => Ok(Value::Integer(n)),
             Err(_) => Ok(Value::Boolean(false)),
         },
@@ -912,7 +932,7 @@ fn builtin_number_to_string(args: &[Value]) -> Result<Value, EvalError> {
         return Err(EvalError::Arity("number->string expects 1 argument".into()));
     }
     match &args[0] {
-        Value::Integer(n) => Ok(Value::String(n.to_string())),
+        Value::Integer(n) => Ok(make_string(n.to_string())),
         _ => Err(EvalError::Type("number->string: expected number".into())),
     }
 }
@@ -922,7 +942,7 @@ fn builtin_symbol_to_string(args: &[Value]) -> Result<Value, EvalError> {
         return Err(EvalError::Arity("symbol->string expects 1 argument".into()));
     }
     match &args[0] {
-        Value::Symbol(s) => Ok(Value::String(s.clone())),
+        Value::Symbol(s) => Ok(make_string(s.clone())),
         _ => Err(EvalError::Type("symbol->string: expected symbol".into())),
     }
 }
@@ -932,7 +952,7 @@ fn builtin_string_to_symbol(args: &[Value]) -> Result<Value, EvalError> {
         return Err(EvalError::Arity("string->symbol expects 1 argument".into()));
     }
     match &args[0] {
-        Value::String(s) => Ok(Value::Symbol(s.clone())),
+        Value::String(s) => Ok(Value::Symbol(s.borrow().clone())),
         _ => Err(EvalError::Type("string->symbol: expected string".into())),
     }
 }
@@ -944,11 +964,46 @@ fn builtin_string_ref(args: &[Value]) -> Result<Value, EvalError> {
     match (&args[0], &args[1]) {
         (Value::String(s), Value::Integer(idx)) => {
             let idx = *idx as usize;
-            s.chars().nth(idx)
+            s.borrow().chars().nth(idx)
                 .map(Value::Char)
                 .ok_or_else(|| EvalError::Type("string-ref: index out of range".into()))
         }
         _ => Err(EvalError::Type("string-ref: expected string and integer".into())),
+    }
+}
+
+fn builtin_string_copy(args: &[Value]) -> Result<Value, EvalError> {
+    if args.len() != 1 {
+        return Err(EvalError::Arity("string-copy expects 1 argument".into()));
+    }
+    match &args[0] {
+        Value::String(s) => Ok(make_string(s.borrow().clone())),
+        _ => Err(EvalError::Type("string-copy: expected string".into())),
+    }
+}
+
+fn builtin_string_set(args: &[Value]) -> Result<Value, EvalError> {
+    if args.len() != 3 {
+        return Err(EvalError::Arity("string-set! expects 3 arguments".into()));
+    }
+    match (&args[0], &args[1], &args[2]) {
+        (Value::String(s), Value::Integer(idx), Value::Char(c)) => {
+            let idx = *idx as usize;
+            let mut borrowed = s.borrow_mut();
+            let len = borrowed.len();
+            if idx >= len {
+                return Err(EvalError::Type("string-set!: index out of range".into()));
+            }
+            // Safe for ASCII; for full Unicode we work char-by-char
+            let mut chars: Vec<char> = borrowed.chars().collect();
+            if idx >= chars.len() {
+                return Err(EvalError::Type("string-set!: index out of range".into()));
+            }
+            chars[idx] = *c;
+            *borrowed = chars.into_iter().collect();
+            Ok(Value::Void)
+        }
+        _ => Err(EvalError::Type("string-set!: expected string, integer, and char".into())),
     }
 }
 
