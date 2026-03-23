@@ -10,6 +10,7 @@ private[ming] trait EvalDo:
   protected def evalBody(exprs: List[Expr], env: Env, k: Value => Bounce): Bounce
   protected def tailBody(exprs: List[Expr], env: Env, k: Value => Bounce): Bounce
   protected def trampoline(thunk: => Bounce): Bounce
+  protected def applyProc(proc: Value, values: List[Value], pos: Option[Pos], k: Value => Bounce): Bounce
 
   protected def evalArgs(args: List[Expr], env: Env, k: List[Value] => Bounce): Bounce =
     args match

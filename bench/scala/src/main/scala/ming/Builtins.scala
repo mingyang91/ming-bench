@@ -94,9 +94,11 @@ object Builtins:
         (
           "append",
           args =>
-            args.foldRight(NilVal: Value) { (lst, acc) =>
-              appendList(lst, acc)
-            }
+            if args.isEmpty then NilVal
+            else
+              args.init.foldRight(args.last) { (lst, acc) =>
+                appendList(lst, acc)
+              }
         ),
         (
           "reverse",

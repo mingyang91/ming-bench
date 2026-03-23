@@ -26,12 +26,20 @@ private[ming] object EvalHelpers:
     case Sym(s, _)    => SymbolVal(s)
     case SList(elems, _) =>
       elems.foldRight(NilVal: Value)((e, acc) => Pair(exprToValue(e), acc))
+    case DottedList(heads, tail, _) =>
+      heads.foldRight(exprToValue(tail))((e, acc) => Pair(exprToValue(e), acc))
 
   def evalLambda(args: List[Expr], env: Env, pos: Option[Pos]): Value =
     args match
       case SList(params, _) :: body if body.nonEmpty =>
         val (paramNames, restParam) = parseParams(params, "lambda", pos)
         LambdaVal(paramNames, restParam, body, env)
+      case DottedList(params, Sym(restName, _), _) :: body if body.nonEmpty =>
+        val paramNames = params.map {
+          case Sym(p, _) => p
+          case _         => evalError("lambda: non-symbol parameter", pos)
+        }
+        LambdaVal(paramNames, Some(restName), body, env)
       case Sym(restName, _) :: body if body.nonEmpty =>
         LambdaVal(Nil, Some(restName), body, env)
       case _ => evalError("lambda: bad syntax", pos)

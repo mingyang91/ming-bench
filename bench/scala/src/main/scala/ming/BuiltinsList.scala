@@ -70,81 +70,32 @@ object BuiltinsList:
       )
     )
 
-  private def cxrOps: List[(String, List[Value] => Value)] =
-    List(
-      (
-        "cddr",
-        args =>
-          if args.length != 1 then throw new EvalError("cddr: expected 1 argument")
-          args.head match
-            case PairVal(c1) =>
-              c1.cdr match
-                case PairVal(c2) => c2.cdr
-                case _           => throw new EvalError("cddr: not enough pairs")
-            case _ => throw new EvalError("cddr: not a pair")
-      ),
-      (
-        "cadr",
-        args =>
-          if args.length != 1 then throw new EvalError("cadr: expected 1 argument")
-          args.head match
-            case PairVal(c1) =>
-              c1.cdr match
-                case PairVal(c2) => c2.car
-                case _           => throw new EvalError("cadr: not enough pairs")
-            case _ => throw new EvalError("cadr: not a pair")
-      ),
-      (
-        "caar",
-        args =>
-          if args.length != 1 then throw new EvalError("caar: expected 1 argument")
-          args.head match
-            case PairVal(c1) =>
-              c1.car match
-                case PairVal(c2) => c2.car
-                case _           => throw new EvalError("caar: not a pair")
-            case _ => throw new EvalError("caar: not a pair")
-      ),
-      (
-        "cdar",
-        args =>
-          if args.length != 1 then throw new EvalError("cdar: expected 1 argument")
-          args.head match
-            case PairVal(c1) =>
-              c1.car match
-                case PairVal(c2) => c2.cdr
-                case _           => throw new EvalError("cdar: not a pair")
-            case _ => throw new EvalError("cdar: not a pair")
-      ),
-      (
-        "caddr",
-        args =>
-          if args.length != 1 then throw new EvalError("caddr: expected 1 argument")
-          args.head match
-            case PairVal(c1) =>
-              c1.cdr match
-                case PairVal(c2) =>
-                  c2.cdr match
-                    case PairVal(c3) => c3.car
-                    case _           => throw new EvalError("caddr: not enough pairs")
-                case _ => throw new EvalError("caddr: not enough pairs")
-            case _ => throw new EvalError("caddr: not a pair")
-      ),
-      (
-        "cdddr",
-        args =>
-          if args.length != 1 then throw new EvalError("cdddr: expected 1 argument")
-          args.head match
-            case PairVal(c1) =>
-              c1.cdr match
-                case PairVal(c2) =>
-                  c2.cdr match
-                    case PairVal(c3) => c3.cdr
-                    case _           => throw new EvalError("cdddr: not enough pairs")
-                case _ => throw new EvalError("cdddr: not enough pairs")
-            case _ => throw new EvalError("cdddr: not a pair")
-      )
+  private def applyCxr(name: String, ops: String, v: Value): Value =
+    var cur = v
+    var i   = ops.length - 1
+    while i >= 0 do
+      cur match
+        case PairVal(cell) =>
+          cur = if ops(i) == 'a' then cell.car else cell.cdr
+        case _ => throw new EvalError(s"$name: not a pair")
+      i -= 1
+    cur
+
+  private def makeCxr(name: String): (String, List[Value] => Value) =
+    val ops = name.substring(1, name.length - 1) // strip 'c' and 'r'
+    (
+      name,
+      args =>
+        if args.length != 1 then throw new EvalError(s"$name: expected 1 argument")
+        applyCxr(name, ops, args.head)
     )
+
+  private def cxrOps: List[(String, List[Value] => Value)] =
+    val ads    = List("a", "d")
+    val depth2 = for a <- ads; b <- ads yield s"c${a}${b}r"
+    val depth3 = for a <- ads; b <- ads; c <- ads yield s"c${a}${b}${c}r"
+    val depth4 = for a <- ads; b <- ads; c <- ads; d <- ads yield s"c${a}${b}${c}${d}r"
+    (depth2 ++ depth3 ++ depth4).map(makeCxr)
 
   /** Cycle-safe proper list check using Floyd's tortoise-and-hare. */
   private def isProperList(v: Value): Boolean =

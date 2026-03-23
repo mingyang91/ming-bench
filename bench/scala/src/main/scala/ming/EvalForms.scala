@@ -26,6 +26,13 @@ private[ming] trait EvalForms extends EvalDo:
         val (paramNames, restParam) = parseParams(params, "define", pos)
         env.define(name, LambdaVal(paramNames, restParam, body, env))
         k(BoolVal(true))
+      case DottedList(Sym(name, _) :: params, Sym(restName, _), _) :: body if body.nonEmpty =>
+        val paramNames = params.map {
+          case Sym(p, _) => p
+          case _         => evalError("define: non-symbol parameter", pos)
+        }
+        env.define(name, LambdaVal(paramNames, Some(restName), body, env))
+        k(BoolVal(true))
       case _ => evalError("define: bad syntax", pos)
 
   protected def evalLetCps(
@@ -80,9 +87,17 @@ private[ming] trait EvalForms extends EvalDo:
     k: Value => Bounce
   ): Bounce =
     clauses match
-      case Nil => evalError("cond: no matching clause", pos)
+      case Nil => k(Value.VoidVal)
       case SList(Sym("else", _) :: body, _) :: Nil =>
         evalBody(body, env, k)
+      case SList(test :: Sym("=>", _) :: proc :: Nil, clausePos) :: rest =>
+        eval(
+          test,
+          env,
+          tv =>
+            if tv.isTruthy then eval(proc, env, pv => applyProc(pv, List(tv), clausePos, k))
+            else evalCondCps(rest, env, pos, k)
+        )
       case SList(test :: body, _) :: rest =>
         eval(
           test,

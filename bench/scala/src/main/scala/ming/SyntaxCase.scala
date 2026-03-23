@@ -29,6 +29,25 @@ object SyntaxCase:
             valueToProperList(input) match
               case Some(elems) => matchPatternList(pElems, elems, literals)
               case None        => None
+      case Expr.DottedList(pHeads, pTail, _) =>
+        valueToProperList(input) match
+          case Some(elems) if elems.length >= pHeads.length =>
+            val (headInputs, tailInputs) = elems.splitAt(pHeads.length)
+            val tailValue                = tailInputs.foldRight(NilVal: Value)((e, acc) => Pair(e, acc))
+            for
+              hb <- matchPatternList(pHeads, headInputs, literals)
+              tb <- matchPattern(pTail, tailValue, literals)
+            yield hb ++ tb
+          case _ =>
+            val (heads, tail) = collectImproperList(input)
+            if heads.length >= pHeads.length then
+              val (headInputs, extraInputs) = heads.splitAt(pHeads.length)
+              val tailValue                 = extraInputs.foldRight(tail)((e, acc) => Pair(e, acc))
+              for
+                hb <- matchPatternList(pHeads, headInputs, literals)
+                tb <- matchPattern(pTail, tailValue, literals)
+              yield hb ++ tb
+            else None
       case Expr.Num(n, _) =>
         input match
           case IntVal(n2) if n == n2 => Some(Map.empty)
@@ -94,6 +113,10 @@ object SyntaxCase:
           case None => SymbolVal(name)
       case Expr.SList(elems, _) =>
         expandTemplateList(elems, bindings, defEnv, useEnv)
+      case Expr.DottedList(heads, tail, _) =>
+        val headValues = expandTemplateListToList(heads, bindings, defEnv, useEnv)
+        val tailValue  = instantiateTemplate(tail, bindings, defEnv, useEnv)
+        headValues.foldRight(tailValue)((v, acc) => Pair(v, acc))
       case Expr.Num(n, _)    => IntVal(n)
       case Expr.Bool(b, _)   => BoolVal(b)
       case Expr.Str(s, _)    => StrVal(s.toCharArray)
@@ -158,6 +181,8 @@ object SyntaxCase:
           case _                         => Set.empty
       case Expr.SList(elems, _) =>
         elems.flatMap(findEllipsisVars(_, bindings)).toSet
+      case Expr.DottedList(heads, tail, _) =>
+        heads.flatMap(findEllipsisVars(_, bindings)).toSet ++ findEllipsisVars(tail, bindings)
       case _ => Set.empty
 
   /** Convert a Value to a proper list of Values, if possible. */
@@ -167,6 +192,13 @@ object SyntaxCase:
       case PairVal(cell) =>
         valueToProperList(cell.cdr).map(cell.car :: _)
       case _ => None
+
+  private def collectImproperList(v: Value): (List[Value], Value) =
+    v match
+      case PairVal(cell) =>
+        val (heads, tail) = collectImproperList(cell.cdr)
+        (cell.car :: heads, tail)
+      case other => (Nil, other)
 
   /** Convert a Value back to an Expr for evaluation. */
   def valueToExpr(v: Value): Expr =
@@ -182,6 +214,8 @@ object SyntaxCase:
       case PairVal(_) =>
         valueToProperList(v) match
           case Some(elems) => Expr.SList(elems.map(valueToExpr))
-          case None        => throw new EvalError("syntax-case: cannot convert improper list to expression")
+          case None =>
+            val (heads, tail) = collectImproperList(v)
+            Expr.DottedList(heads.map(valueToExpr), valueToExpr(tail))
       case VoidVal => Expr.SList(List(Expr.Sym("void")))
       case _       => throw new EvalError(s"syntax-case: cannot convert ${v.display} to expression")

@@ -35,7 +35,7 @@ object Parser:
     (sb.toString, i)
 
   private def isAtomChar(ch: Char): Boolean =
-    !ch.isWhitespace && ch != '(' && ch != ')' && ch != '"' && ch != ';' && ch != '\''
+    !ch.isWhitespace && ch != '(' && ch != ')' && ch != '"' && ch != ';' && ch != '\'' && ch != '`' && ch != ','
 
   private def tokenize(input: String): List[Token] =
     val result    = scala.collection.mutable.ListBuffer.empty[Token]
@@ -60,6 +60,15 @@ object Parser:
           i += 1
         case '\'' =>
           result += Token("'", Pos(line, i - lineStart + 1))
+          i += 1
+        case '`' =>
+          result += Token("`", Pos(line, i - lineStart + 1))
+          i += 1
+        case ',' if i + 1 < input.length && input(i + 1) == '@' =>
+          result += Token(",@", Pos(line, i - lineStart + 1))
+          i += 2
+        case ',' =>
+          result += Token(",", Pos(line, i - lineStart + 1))
           i += 1
         case '#' if i + 1 < input.length && input(i + 1) == '\'' =>
           result += Token("#'", Pos(line, i - lineStart + 1))
@@ -94,6 +103,18 @@ object Parser:
         val (quoted, remaining) = parseOne(rest)
         val syntaxExpr          = SList(Sym("syntax", Some(pos)) :: quoted :: Nil, Some(pos))
         parseTokens(remaining, syntaxExpr :: acc)
+      case Token("`", pos) :: rest =>
+        val (quoted, remaining) = parseOne(rest)
+        val qqExpr              = SList(Sym("quasiquote", Some(pos)) :: quoted :: Nil, Some(pos))
+        parseTokens(remaining, qqExpr :: acc)
+      case Token(",", pos) :: rest =>
+        val (quoted, remaining) = parseOne(rest)
+        val uqExpr              = SList(Sym("unquote", Some(pos)) :: quoted :: Nil, Some(pos))
+        parseTokens(remaining, uqExpr :: acc)
+      case Token(",@", pos) :: rest =>
+        val (quoted, remaining) = parseOne(rest)
+        val usExpr              = SList(Sym("unquote-splicing", Some(pos)) :: quoted :: Nil, Some(pos))
+        parseTokens(remaining, usExpr :: acc)
       case Token(text, pos) :: rest =>
         parseTokens(rest, parseAtom(text, pos) :: acc)
 
@@ -108,6 +129,15 @@ object Parser:
       case Token("#'", pos) :: rest =>
         val (quoted, remaining) = parseOne(rest)
         (SList(Sym("syntax", Some(pos)) :: quoted :: Nil, Some(pos)), remaining)
+      case Token("`", pos) :: rest =>
+        val (quoted, remaining) = parseOne(rest)
+        (SList(Sym("quasiquote", Some(pos)) :: quoted :: Nil, Some(pos)), remaining)
+      case Token(",", pos) :: rest =>
+        val (quoted, remaining) = parseOne(rest)
+        (SList(Sym("unquote", Some(pos)) :: quoted :: Nil, Some(pos)), remaining)
+      case Token(",@", pos) :: rest =>
+        val (quoted, remaining) = parseOne(rest)
+        (SList(Sym("unquote-splicing", Some(pos)) :: quoted :: Nil, Some(pos)), remaining)
       case Token(text, pos) :: rest =>
         (parseAtom(text, pos), rest)
 
@@ -115,6 +145,12 @@ object Parser:
     tokens match
       case Nil                   => throw new EvalError("unexpected end of input")
       case Token(")", _) :: rest => (SList(acc.reverse, Some(listPos)), rest)
+      case Token(".", dotPos) :: rest =>
+        if acc.isEmpty then throw new EvalError(s"unexpected dot [${dotPos}]")
+        val (tail, remaining) = parseOne(rest)
+        remaining match
+          case Token(")", _) :: rest2 => (DottedList(acc.reverse, tail, Some(listPos)), rest2)
+          case _                      => throw new EvalError(s"expected ) after dotted pair tail [${dotPos}]")
       case _ =>
         val (expr, remaining) = parseOne(tokens)
         parseList(remaining, expr :: acc, listPos)
