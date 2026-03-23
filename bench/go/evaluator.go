@@ -157,6 +157,26 @@ func Eval(expr Expr, env *Env) (SchemeValue, error) {
 					expr = args[len(args)-1]
 					continue
 
+				case "set!":
+					if len(e.Elements) != 3 {
+						line, col := e.Pos()
+						return nil, &EvalError{Message: fmt.Sprintf("%d:%d: set!: bad syntax", line, col)}
+					}
+					sym, ok := e.Elements[1].(*SymbolExpr)
+					if !ok {
+						line, col := e.Elements[1].Pos()
+						return nil, &EvalError{Message: fmt.Sprintf("%d:%d: set!: not a variable", line, col)}
+					}
+					val, err := Eval(e.Elements[2], env)
+					if err != nil {
+						return nil, err
+					}
+					if !env.SetExisting(sym.Name, val) {
+						line, col := sym.Pos()
+						return nil, &EvalError{Message: fmt.Sprintf("%d:%d: set!: variable %s is not bound", line, col, sym.Name)}
+					}
+					return &SchemeVoid{}, nil
+
 				case "define":
 					return evalDefine(e, env)
 
