@@ -425,6 +425,11 @@ type windEntry struct {
 	outThunk *value
 }
 
+// schemeRaise is panicked when (raise val) is called.
+type schemeRaise struct {
+	val *value
+}
+
 // continuationJump is panicked when a continuation is invoked.
 type continuationJump struct {
 	contExpr  *expr  // the call/cc expression to replay from
@@ -669,6 +674,12 @@ func (ip *interp) eval(e *expr, envir *env) (*value, error) {
 
 				case "dynamic-wind":
 					return ip.evalDynamicWind(e, envir)
+
+				case "guard":
+					return ip.evalGuard(e, envir)
+
+				case "with-exception-handler":
+					return ip.evalWithExceptionHandler(e, envir)
 				}
 
 				// Check for macro expansion
@@ -859,17 +870,21 @@ func (ip *interp) evalDynamicWind(e *expr, envir *env) (*value, error) {
 	// Push wind entry
 	ip.windStack = append(ip.windStack, windEntry{inThunk: inThunk, outThunk: outThunk})
 
-	// Run body-thunk, catching continuation jumps to run out-thunk
+	// Run body-thunk, catching continuation jumps and raises to run out-thunk
 	var result *value
 	var bodyErr error
 	var jump *continuationJump
+	var raised *schemeRaise
 
 	func() {
 		defer func() {
 			if r := recover(); r != nil {
-				if j, ok := r.(*continuationJump); ok {
+				switch j := r.(type) {
+				case *continuationJump:
 					jump = j
-				} else {
+				case *schemeRaise:
+					raised = j
+				default:
 					panic(r)
 				}
 			}
@@ -887,11 +902,158 @@ func (ip *interp) evalDynamicWind(e *expr, envir *env) (*value, error) {
 	}
 
 	if jump != nil {
-		// Re-panic after running out-thunk
 		panic(jump)
+	}
+	if raised != nil {
+		panic(raised)
 	}
 
 	return result, bodyErr
+}
+
+// evalGuard implements (guard (var clause ...) body ...).
+func (ip *interp) evalGuard(e *expr, envir *env) (*value, error) {
+	if len(e.items) < 3 {
+		return nil, &EvalError{Message: fmt.Sprintf("%d:%d: guard: bad syntax", e.line, e.col)}
+	}
+	clauseList := e.items[1]
+	if clauseList.kind != "list" || len(clauseList.items) < 1 {
+		return nil, &EvalError{Message: fmt.Sprintf("%d:%d: guard: bad syntax", e.line, e.col)}
+	}
+	varName := clauseList.items[0].sval
+	clauses := clauseList.items[1:]
+	body := e.items[2:]
+
+	// Evaluate body, catching schemeRaise
+	var result *value
+	var bodyErr error
+	var raised *schemeRaise
+
+	func() {
+		defer func() {
+			if r := recover(); r != nil {
+				if sr, ok := r.(*schemeRaise); ok {
+					raised = sr
+				} else {
+					panic(r)
+				}
+			}
+		}()
+		for _, be := range body[:len(body)-1] {
+			_, bodyErr = ip.eval(be, envir)
+			if bodyErr != nil {
+				return
+			}
+		}
+		result, bodyErr = ip.eval(body[len(body)-1], envir)
+	}()
+
+	if bodyErr != nil {
+		return nil, bodyErr
+	}
+
+	if raised == nil {
+		return result, nil
+	}
+
+	// Exception was raised — bind var and test clauses
+	guardEnv := newEnv(envir)
+	guardEnv.set(varName, raised.val)
+
+	for _, clause := range clauses {
+		if clause.kind != "list" || len(clause.items) < 2 {
+			return nil, &EvalError{Message: fmt.Sprintf("%d:%d: guard: bad clause", e.line, e.col)}
+		}
+		if clause.items[0].kind == "symbol" && clause.items[0].sval == "else" {
+			clauseBody := clause.items[1:]
+			for _, ce := range clauseBody[:len(clauseBody)-1] {
+				_, err := ip.eval(ce, guardEnv)
+				if err != nil {
+					return nil, err
+				}
+			}
+			return ip.eval(clauseBody[len(clauseBody)-1], guardEnv)
+		}
+		test, err := ip.eval(clause.items[0], guardEnv)
+		if err != nil {
+			return nil, err
+		}
+		if test.isTruthy() {
+			clauseBody := clause.items[1:]
+			for _, ce := range clauseBody[:len(clauseBody)-1] {
+				_, err := ip.eval(ce, guardEnv)
+				if err != nil {
+					return nil, err
+				}
+			}
+			return ip.eval(clauseBody[len(clauseBody)-1], guardEnv)
+		}
+	}
+
+	// No clause matched and no else — re-raise
+	panic(raised)
+}
+
+// evalWithExceptionHandler implements (with-exception-handler handler thunk).
+func (ip *interp) evalWithExceptionHandler(e *expr, envir *env) (*value, error) {
+	if len(e.items) != 3 {
+		return nil, &EvalError{Message: fmt.Sprintf("%d:%d: with-exception-handler: expected 2 arguments", e.line, e.col)}
+	}
+
+	handler, err := ip.eval(e.items[1], envir)
+	if err != nil {
+		return nil, err
+	}
+	thunk, err := ip.eval(e.items[2], envir)
+	if err != nil {
+		return nil, err
+	}
+
+	// Run thunk, catching schemeRaise
+	var result *value
+	var thunkErr error
+	var raised *schemeRaise
+
+	func() {
+		defer func() {
+			if r := recover(); r != nil {
+				if sr, ok := r.(*schemeRaise); ok {
+					raised = sr
+				} else {
+					panic(r)
+				}
+			}
+		}()
+		result, thunkErr = ip.callThunk(thunk, e.line, e.col)
+	}()
+
+	if thunkErr != nil {
+		return nil, thunkErr
+	}
+
+	if raised == nil {
+		return result, nil
+	}
+
+	// Call handler with the raised value
+	if handler.typ == valLambda {
+		localEnv, bindErr := bindLambdaArgs(handler, []*value{raised.val}, e.line, e.col)
+		if bindErr != nil {
+			return nil, bindErr
+		}
+		var hResult *value
+		for _, bodyExpr := range handler.body {
+			var hErr error
+			hResult, hErr = ip.eval(bodyExpr, localEnv)
+			if hErr != nil {
+				return nil, hErr
+			}
+		}
+		return hResult, nil
+	} else if handler.typ == valBuiltin {
+		return handler.builtin([]*value{raised.val}, e.line, e.col)
+	}
+	return nil, &EvalError{Message: fmt.Sprintf("%d:%d: with-exception-handler: handler is not a procedure", e.line, e.col)}
 }
 
 func bindLambdaArgs(fn *value, args []*value, line, col int) (*env, error) {
@@ -2345,6 +2507,14 @@ func makeGlobalEnv(ip *interp) *env {
 			cur = cur.cdr
 		}
 		return &value{typ: valVector, vecval: elems}, nil
+	}))
+
+	// raise
+	e.set("raise", makeBuiltin("raise", func(args []*value, line, col int) (*value, error) {
+		if len(args) != 1 {
+			return nil, &EvalError{Message: fmt.Sprintf("%d:%d: raise: expected 1 argument", line, col)}
+		}
+		panic(&schemeRaise{val: args[0]})
 	}))
 
 	// call/cc as a first-class value
