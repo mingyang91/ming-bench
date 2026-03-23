@@ -1519,8 +1519,14 @@ public class Evaluator {
             return applyProc(args.get(0), List.of(captured), k);
         }
         if (proc instanceof Continuation cont) {
-            if (args.size() != 1) throw posError("continuation: expected 1 argument");
-            Object val = args.get(0);
+            Object val;
+            if (args.size() == 1) {
+                val = args.get(0);
+            } else if (args.isEmpty()) {
+                val = VOID;
+            } else {
+                val = new MultipleValues(args);
+            }
             return doWindTransition(windStack, cont.savedWind, () -> cont.k.apply(val));
         }
         if (proc instanceof Lambda lambda) {
@@ -2356,7 +2362,7 @@ public class Evaluator {
         final Object finalBody = body;
         Cont bodyK = result -> {
             handlerStack.remove(handlerStack.size() - 1);
-            return k.apply(result);
+            return new More(() -> k.apply(result));
         };
         return new More(() -> eval(finalBody, env, bodyK));
     }
