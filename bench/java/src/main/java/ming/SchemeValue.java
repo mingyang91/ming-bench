@@ -38,6 +38,10 @@ public sealed interface SchemeValue {
         @Override public String display() { return ""; }
     }
 
+    record LambdaVal(java.util.List<String> params, java.util.List<SchemeValue> body, Environment env) implements SchemeValue {
+        @Override public String display() { return "#<procedure>"; }
+    }
+
     String display();
 
     default boolean isTruthy() {
