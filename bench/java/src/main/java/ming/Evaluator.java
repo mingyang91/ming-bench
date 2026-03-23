@@ -273,6 +273,15 @@ public class Evaluator {
                                 if (elems.size() != 2) throw new EvalError("quote requires exactly 1 argument at " + pos);
                                 return quoteDatum(elems.get(1));
                             }
+                            case "set!": {
+                                if (elems.size() != 3) throw new EvalError("set! requires exactly 2 arguments at " + pos);
+                                if (!(elems.get(1) instanceof SchemeValue.SymbolVal sym2)) {
+                                    throw new EvalError("set!: expected symbol");
+                                }
+                                SchemeValue val = eval(elems.get(2), env);
+                                env.set(sym2.name(), val);
+                                return new SchemeValue.VoidVal();
+                            }
                             case "define": {
                                 return evalDefine(elems, env, pos);
                             }
