@@ -5,7 +5,7 @@ import java.util.List;
 
 public class Tokenizer {
     public enum TokenType {
-        LPAREN, RPAREN, SYMBOL, INTEGER, BOOLEAN, STRING, EOF
+        LPAREN, RPAREN, QUOTE, SYMBOL, INTEGER, BOOLEAN, STRING, EOF
     }
 
     public record Token(TokenType type, String value, int pos) {}
@@ -25,7 +25,10 @@ public class Tokenizer {
             if (pos >= input.length()) break;
 
             char c = input.charAt(pos);
-            if (c == '(') {
+            if (c == '\'') {
+                tokens.add(new Token(TokenType.QUOTE, "'", pos));
+                pos++;
+            } else if (c == '(') {
                 tokens.add(new Token(TokenType.LPAREN, "(", pos));
                 pos++;
             } else if (c == ')') {

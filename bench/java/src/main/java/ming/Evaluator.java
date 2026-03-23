@@ -40,6 +40,7 @@ public class Evaluator {
     }
 
     private void registerBuiltins(Environment env) {
+        // Arithmetic
         env.define("+", new SchemeValue.BuiltinVal("+", args -> {
             long sum = 0;
             for (SchemeValue arg : args) sum += requireInt(arg);
@@ -67,6 +68,8 @@ public class Evaluator {
             }
             return new SchemeValue.IntVal(result);
         }));
+
+        // Comparisons
         env.define("<", new SchemeValue.BuiltinVal("<", args ->
             new SchemeValue.BoolVal(requireInt(args.get(0)) < requireInt(args.get(1)))));
         env.define(">", new SchemeValue.BuiltinVal(">", args ->
@@ -75,8 +78,77 @@ public class Evaluator {
             new SchemeValue.BoolVal(requireInt(args.get(0)) == requireInt(args.get(1)))));
         env.define("<=", new SchemeValue.BuiltinVal("<=", args ->
             new SchemeValue.BoolVal(requireInt(args.get(0)) <= requireInt(args.get(1)))));
+        env.define(">=", new SchemeValue.BuiltinVal(">=", args ->
+            new SchemeValue.BoolVal(requireInt(args.get(0)) >= requireInt(args.get(1)))));
         env.define("not", new SchemeValue.BuiltinVal("not", args ->
             new SchemeValue.BoolVal(!args.getFirst().isTruthy())));
+
+        // Pairs and lists
+        env.define("cons", new SchemeValue.BuiltinVal("cons", args -> {
+            if (args.size() != 2) throw new EvalError("cons requires exactly 2 arguments");
+            return new SchemeValue.PairVal(args.get(0), args.get(1));
+        }));
+        env.define("car", new SchemeValue.BuiltinVal("car", args -> {
+            if (args.size() != 1) throw new EvalError("car requires exactly 1 argument");
+            if (args.getFirst() instanceof SchemeValue.PairVal p) return p.car();
+            throw new EvalError("car: not a pair: " + args.getFirst().display());
+        }));
+        env.define("cdr", new SchemeValue.BuiltinVal("cdr", args -> {
+            if (args.size() != 1) throw new EvalError("cdr requires exactly 1 argument");
+            if (args.getFirst() instanceof SchemeValue.PairVal p) return p.cdr();
+            throw new EvalError("cdr: not a pair: " + args.getFirst().display());
+        }));
+        env.define("null?", new SchemeValue.BuiltinVal("null?", args -> {
+            if (args.size() != 1) throw new EvalError("null? requires exactly 1 argument");
+            return new SchemeValue.BoolVal(args.getFirst() instanceof SchemeValue.NilVal);
+        }));
+        env.define("list", new SchemeValue.BuiltinVal("list", args -> {
+            SchemeValue result = SchemeValue.NIL;
+            for (int i = args.size() - 1; i >= 0; i--) {
+                result = new SchemeValue.PairVal(args.get(i), result);
+            }
+            return result;
+        }));
+        env.define("length", new SchemeValue.BuiltinVal("length", args -> {
+            if (args.size() != 1) throw new EvalError("length requires exactly 1 argument");
+            SchemeValue lst = args.getFirst();
+            long count = 0;
+            while (lst instanceof SchemeValue.PairVal p) {
+                count++;
+                lst = p.cdr();
+            }
+            return new SchemeValue.IntVal(count);
+        }));
+        env.define("append", new SchemeValue.BuiltinVal("append", args -> {
+            if (args.isEmpty()) return SchemeValue.NIL;
+            if (args.size() == 1) return args.getFirst();
+            // Append all lists
+            SchemeValue result = args.getLast();
+            for (int i = args.size() - 2; i >= 0; i--) {
+                result = appendTwo(args.get(i), result);
+            }
+            return result;
+        }));
+
+        // Type predicates
+        env.define("string?", new SchemeValue.BuiltinVal("string?", args ->
+            new SchemeValue.BoolVal(args.getFirst() instanceof SchemeValue.StringVal)));
+        env.define("number?", new SchemeValue.BuiltinVal("number?", args ->
+            new SchemeValue.BoolVal(args.getFirst() instanceof SchemeValue.IntVal)));
+        env.define("boolean?", new SchemeValue.BuiltinVal("boolean?", args ->
+            new SchemeValue.BoolVal(args.getFirst() instanceof SchemeValue.BoolVal)));
+        env.define("pair?", new SchemeValue.BuiltinVal("pair?", args ->
+            new SchemeValue.BoolVal(args.getFirst() instanceof SchemeValue.PairVal)));
+        env.define("symbol?", new SchemeValue.BuiltinVal("symbol?", args ->
+            new SchemeValue.BoolVal(args.getFirst() instanceof SchemeValue.SymbolVal)));
+    }
+
+    private SchemeValue appendTwo(SchemeValue a, SchemeValue b) throws EvalError {
+        if (a instanceof SchemeValue.NilVal) return b;
+        if (a instanceof SchemeValue.PairVal p) {
+            return new SchemeValue.PairVal(p.car(), appendTwo(p.cdr(), b));
+        }
+        throw new EvalError("append: not a proper list");
     }
 
     private SchemeValue eval(SchemeValue expr, Environment env) throws EvalError {
@@ -85,6 +157,8 @@ public class Evaluator {
             case SchemeValue.BoolVal v -> v;
             case SchemeValue.StringVal v -> v;
             case SchemeValue.VoidVal v -> v;
+            case SchemeValue.NilVal v -> v;
+            case SchemeValue.PairVal v -> v;
             case SchemeValue.LambdaVal v -> v;
             case SchemeValue.BuiltinVal v -> v;
             case SchemeValue.SymbolVal v -> env.get(v.name());
@@ -104,6 +178,9 @@ public class Evaluator {
                 case "define": return evalDefine(elems, env);
                 case "quote": return evalQuote(elems);
                 case "lambda": return evalLambda(elems, env);
+                case "let": return evalLet(elems, env);
+                case "begin": return evalBegin(elems, env);
+                case "cond": return evalCond(elems, env);
                 default: break;
             }
         }
@@ -152,12 +229,10 @@ public class Evaluator {
         if (elems.size() < 3) throw new EvalError("define requires at least 2 arguments");
         SchemeValue target = elems.get(1);
         if (target instanceof SchemeValue.SymbolVal sym) {
-            // (define x expr)
             SchemeValue val = eval(elems.get(2), env);
             env.define(sym.name(), val);
             return new SchemeValue.VoidVal();
         } else if (target instanceof SchemeValue.ListVal nameAndParams) {
-            // (define (f x y) body...)
             List<SchemeValue> parts = nameAndParams.elements();
             if (parts.isEmpty()) throw new EvalError("define: empty name list");
             if (!(parts.getFirst() instanceof SchemeValue.SymbolVal fnName)) {
@@ -180,7 +255,20 @@ public class Evaluator {
 
     private SchemeValue evalQuote(List<SchemeValue> elems) throws EvalError {
         if (elems.size() != 2) throw new EvalError("quote requires exactly 1 argument");
-        return elems.get(1);
+        return quoteDatum(elems.get(1));
+    }
+
+    /** Convert parsed syntax (ListVal) into runtime data (PairVal/NilVal). */
+    private SchemeValue quoteDatum(SchemeValue v) {
+        if (v instanceof SchemeValue.ListVal list) {
+            if (list.elements().isEmpty()) return SchemeValue.NIL;
+            SchemeValue result = SchemeValue.NIL;
+            for (int i = list.elements().size() - 1; i >= 0; i--) {
+                result = new SchemeValue.PairVal(quoteDatum(list.elements().get(i)), result);
+            }
+            return result;
+        }
+        return v;
     }
 
     private SchemeValue evalLambda(List<SchemeValue> elems, Environment env) throws EvalError {
@@ -198,6 +286,90 @@ public class Evaluator {
         }
         List<SchemeValue> body = elems.subList(2, elems.size());
         return new SchemeValue.LambdaVal(params, body, env);
+    }
+
+    private SchemeValue evalLet(List<SchemeValue> elems, Environment env) throws EvalError {
+        if (elems.size() < 3) throw new EvalError("let requires bindings and body");
+        // Named let: (let name ((var init) ...) body...)
+        if (elems.get(1) instanceof SchemeValue.SymbolVal nameSym) {
+            if (elems.size() < 4) throw new EvalError("named let requires bindings and body");
+            String name = nameSym.name();
+            if (!(elems.get(2) instanceof SchemeValue.ListVal bindingsList)) {
+                throw new EvalError("let: expected bindings list");
+            }
+            List<String> params = new ArrayList<>();
+            List<SchemeValue> inits = new ArrayList<>();
+            for (SchemeValue b : bindingsList.elements()) {
+                if (!(b instanceof SchemeValue.ListVal binding) || binding.elements().size() != 2) {
+                    throw new EvalError("let: invalid binding");
+                }
+                if (!(binding.elements().get(0) instanceof SchemeValue.SymbolVal s)) {
+                    throw new EvalError("let: expected symbol in binding");
+                }
+                params.add(s.name());
+                inits.add(eval(binding.elements().get(1), env));
+            }
+            List<SchemeValue> body = elems.subList(3, elems.size());
+            Environment letEnv = new Environment(env);
+            SchemeValue.LambdaVal lambda = new SchemeValue.LambdaVal(params, body, letEnv);
+            letEnv.define(name, lambda);
+            return apply(lambda, inits);
+        }
+        // Regular let: (let ((var init) ...) body...)
+        if (!(elems.get(1) instanceof SchemeValue.ListVal bindingsList)) {
+            throw new EvalError("let: expected bindings list");
+        }
+        Environment letEnv = new Environment(env);
+        for (SchemeValue b : bindingsList.elements()) {
+            if (!(b instanceof SchemeValue.ListVal binding) || binding.elements().size() != 2) {
+                throw new EvalError("let: invalid binding");
+            }
+            if (!(binding.elements().get(0) instanceof SchemeValue.SymbolVal s)) {
+                throw new EvalError("let: expected symbol in binding");
+            }
+            SchemeValue val = eval(binding.elements().get(1), env);
+            letEnv.define(s.name(), val);
+        }
+        SchemeValue result = new SchemeValue.VoidVal();
+        for (int i = 2; i < elems.size(); i++) {
+            result = eval(elems.get(i), letEnv);
+        }
+        return result;
+    }
+
+    private SchemeValue evalBegin(List<SchemeValue> elems, Environment env) throws EvalError {
+        SchemeValue result = new SchemeValue.VoidVal();
+        for (int i = 1; i < elems.size(); i++) {
+            result = eval(elems.get(i), env);
+        }
+        return result;
+    }
+
+    private SchemeValue evalCond(List<SchemeValue> elems, Environment env) throws EvalError {
+        for (int i = 1; i < elems.size(); i++) {
+            if (!(elems.get(i) instanceof SchemeValue.ListVal clause)) {
+                throw new EvalError("cond: expected clause");
+            }
+            List<SchemeValue> parts = clause.elements();
+            if (parts.isEmpty()) throw new EvalError("cond: empty clause");
+            // Check for else clause
+            if (parts.getFirst() instanceof SchemeValue.SymbolVal s && s.name().equals("else")) {
+                SchemeValue result = new SchemeValue.VoidVal();
+                for (int j = 1; j < parts.size(); j++) {
+                    result = eval(parts.get(j), env);
+                }
+                return result;
+            }
+            SchemeValue test = eval(parts.getFirst(), env);
+            if (test.isTruthy()) {
+                SchemeValue result = test;
+                for (int j = 1; j < parts.size(); j++) {
+                    result = eval(parts.get(j), env);
+                }
+                return result;
+            }
+        }
+        return new SchemeValue.VoidVal();
     }
 
     private SchemeValue evalAnd(List<SchemeValue> elems, Environment env) throws EvalError {

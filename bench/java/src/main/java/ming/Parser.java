@@ -23,6 +23,11 @@ public class Parser {
     private SchemeValue parseExpr() throws EvalError {
         Tokenizer.Token tok = peek();
         return switch (tok.type()) {
+            case QUOTE -> {
+                advance();
+                SchemeValue quoted = parseExpr();
+                yield new SchemeValue.ListVal(List.of(new SchemeValue.SymbolVal("quote"), quoted));
+            }
             case LPAREN -> parseList();
             case INTEGER -> { advance(); yield new SchemeValue.IntVal(Long.parseLong(tok.value())); }
             case BOOLEAN -> { advance(); yield new SchemeValue.BoolVal(tok.value().equals("true")); }
