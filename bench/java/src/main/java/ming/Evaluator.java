@@ -676,6 +676,12 @@ public class Evaluator {
                         List<Object> lists = new ArrayList<>(args.subList(1, args.size()));
                         return cpsMap(mapFn, lists, k);
                     }
+                    if (proc instanceof String p && p.equals("for-each")) {
+                        if (args.size() < 2) throw posError("for-each: expected at least 2 arguments");
+                        Object feFn = args.get(0);
+                        List<Object> lists = new ArrayList<>(args.subList(1, args.size()));
+                        return cpsForEach(feFn, lists, k);
+                    }
                     if (proc instanceof String p && p.equals("dynamic-wind")) {
                         if (args.size() != 3) throw posError("dynamic-wind: expected 3 arguments");
                         return cpsDynamicWind(args.get(0), args.get(1), args.get(2), k);
@@ -1302,7 +1308,13 @@ public class Evaluator {
             "raise", "with-exception-handler",
             "values", "call-with-values",
             "exact?", "inexact?", "exact->inexact", "inexact->exact",
-            "numerator", "denominator", "integer?", "rational?"
+            "numerator", "denominator", "integer?", "rational?",
+            "set-car!", "set-cdr!", "for-each",
+            "cddr", "member", "assv",
+            "gcd", "lcm", "truncate", "round",
+            "make-string", "string",
+            "string>?", "string<=?", "string>=?",
+            "memv", "assq", "memq"
     );
 
     private boolean isPrimitive(String name) {
@@ -1620,9 +1632,7 @@ public class Evaluator {
             }
             case "list?" -> {
                 requireArgCount(args, 1, "list?");
-                Object lst = args.get(0);
-                while (lst instanceof Pair p) lst = p.cdr;
-                yield lst == NIL;
+                yield isList(args.get(0));
             }
             case "assoc" -> {
                 requireArgCount(args, 2, "assoc");
@@ -1675,6 +1685,150 @@ public class Evaluator {
                 int idx = (int) requireLong(args.get(1), "vector-set!");
                 v.set(idx, args.get(2));
                 yield VOID;
+            }
+            case "set-car!" -> {
+                requireArgCount(args, 2, "set-car!");
+                if (!(args.get(0) instanceof Pair p)) throw posError("set-car!: expected pair");
+                p.car = args.get(1);
+                yield VOID;
+            }
+            case "set-cdr!" -> {
+                requireArgCount(args, 2, "set-cdr!");
+                if (!(args.get(0) instanceof Pair p)) throw posError("set-cdr!: expected pair");
+                p.cdr = args.get(1);
+                yield VOID;
+            }
+            case "cddr" -> {
+                requireArgCount(args, 1, "cddr");
+                if (!(args.get(0) instanceof Pair p1)) throw posError("cddr: expected pair");
+                if (!(p1.cdr instanceof Pair p2)) throw posError("cddr: expected pair");
+                yield p2.cdr;
+            }
+            case "member" -> {
+                requireArgCount(args, 2, "member");
+                Object key = args.get(0);
+                Object lst = args.get(1);
+                while (lst instanceof Pair p) {
+                    if (schemeEqual(key, p.car)) yield (Object) lst;
+                    lst = p.cdr;
+                }
+                yield Boolean.FALSE;
+            }
+            case "assv" -> {
+                requireArgCount(args, 2, "assv");
+                Object key = args.get(0);
+                Object alist = args.get(1);
+                while (alist instanceof Pair p) {
+                    if (!(p.car instanceof Pair entry)) throw posError("assv: not an alist");
+                    if (schemeEqv(key, entry.car)) yield (Object) p.car;
+                    alist = p.cdr;
+                }
+                yield Boolean.FALSE;
+            }
+            case "assq" -> {
+                requireArgCount(args, 2, "assq");
+                Object key = args.get(0);
+                Object alist = args.get(1);
+                while (alist instanceof Pair p) {
+                    if (!(p.car instanceof Pair entry)) throw posError("assq: not an alist");
+                    if (key == entry.car) yield (Object) p.car;
+                    alist = p.cdr;
+                }
+                yield Boolean.FALSE;
+            }
+            case "memq" -> {
+                requireArgCount(args, 2, "memq");
+                Object key = args.get(0);
+                Object lst = args.get(1);
+                while (lst instanceof Pair p) {
+                    if (key == p.car) yield (Object) lst;
+                    lst = p.cdr;
+                }
+                yield Boolean.FALSE;
+            }
+            case "memv" -> {
+                requireArgCount(args, 2, "memv");
+                Object key = args.get(0);
+                Object lst = args.get(1);
+                while (lst instanceof Pair p) {
+                    if (schemeEqv(key, p.car)) yield (Object) lst;
+                    lst = p.cdr;
+                }
+                yield Boolean.FALSE;
+            }
+            case "gcd" -> {
+                if (args.isEmpty()) yield 0L;
+                long result = Math.abs(requireLong(args.get(0), "gcd"));
+                for (int i = 1; i < args.size(); i++) {
+                    long b = Math.abs(requireLong(args.get(i), "gcd"));
+                    while (b != 0) { long t = b; b = result % b; result = t; }
+                }
+                yield result;
+            }
+            case "lcm" -> {
+                if (args.isEmpty()) yield 1L;
+                long result = Math.abs(requireLong(args.get(0), "lcm"));
+                for (int i = 1; i < args.size(); i++) {
+                    long b = Math.abs(requireLong(args.get(i), "lcm"));
+                    if (result == 0 && b == 0) { result = 0; } else { result = result / gcdLong(result, b) * b; }
+                }
+                yield result;
+            }
+            case "truncate" -> {
+                requireArgCount(args, 1, "truncate");
+                Object v = args.get(0);
+                if (v instanceof Long) yield v;
+                if (v instanceof Double d) yield (long) d.doubleValue();
+                if (v instanceof Rational r) yield r.num / r.den;
+                throw posError("truncate: expected number");
+            }
+            case "round" -> {
+                requireArgCount(args, 1, "round");
+                Object v = args.get(0);
+                if (v instanceof Long) yield v;
+                if (v instanceof Double d) yield Math.round(d);
+                if (v instanceof Rational r) {
+                    long q = r.num / r.den;
+                    long rem = r.num % r.den;
+                    if (Math.abs(rem) * 2 > Math.abs(r.den)) yield r.num > 0 ? q + 1 : q - 1;
+                    else if (Math.abs(rem) * 2 == Math.abs(r.den)) yield (q % 2 == 0) ? q : (r.num > 0 ? q + 1 : q - 1);
+                    else yield q;
+                }
+                throw posError("round: expected number");
+            }
+            case "make-string" -> {
+                if (args.size() < 1 || args.size() > 2) throw posError("make-string: expected 1-2 arguments");
+                int len = (int) requireLong(args.get(0), "make-string");
+                char c = args.size() == 2 && args.get(1) instanceof SchemeChar sc ? sc.value() : ' ';
+                char[] chars = new char[len];
+                java.util.Arrays.fill(chars, c);
+                yield new SchemeString(new String(chars));
+            }
+            case "string" -> {
+                StringBuilder sb = new StringBuilder();
+                for (Object a : args) {
+                    if (!(a instanceof SchemeChar sc)) throw posError("string: expected char");
+                    sb.append(sc.value());
+                }
+                yield new SchemeString(sb.toString());
+            }
+            case "string>?" -> {
+                requireArgCount(args, 2, "string>?");
+                if (!(args.get(0) instanceof SchemeString a)) throw posError("string>?: expected string");
+                if (!(args.get(1) instanceof SchemeString b)) throw posError("string>?: expected string");
+                yield a.value().compareTo(b.value()) > 0;
+            }
+            case "string<=?" -> {
+                requireArgCount(args, 2, "string<=?");
+                if (!(args.get(0) instanceof SchemeString a)) throw posError("string<=?: expected string");
+                if (!(args.get(1) instanceof SchemeString b)) throw posError("string<=?: expected string");
+                yield a.value().compareTo(b.value()) <= 0;
+            }
+            case "string>=?" -> {
+                requireArgCount(args, 2, "string>=?");
+                if (!(args.get(0) instanceof SchemeString a)) throw posError("string>=?: expected string");
+                if (!(args.get(1) instanceof SchemeString b)) throw posError("string>=?: expected string");
+                yield a.value().compareTo(b.value()) >= 0;
             }
             case "vector-length" -> {
                 requireArgCount(args, 1, "vector-length");
@@ -1760,6 +1914,7 @@ public class Evaluator {
                 yield new SchemeString(s.value().toLowerCase());
             }
             case "map" -> throw posError("map: handled in eval");
+            case "for-each" -> throw posError("for-each: handled in eval");
             case "dynamic-wind" -> throw posError("dynamic-wind: handled in eval");
             case "raise" -> throw posError("raise: handled in eval");
             case "with-exception-handler" -> throw posError("with-exception-handler: handled in eval");
@@ -1793,6 +1948,22 @@ public class Evaluator {
             new More(() -> cpsMap(fn, cdrs, tailVal ->
                 k.apply(new Pair(headVal, tailVal))
             ))
+        ));
+    }
+
+    private Bounce cpsForEach(Object fn, List<Object> lists, Cont k) throws EvalError {
+        for (Object lst : lists) {
+            if (lst == NIL) return k.apply(VOID);
+        }
+        List<Object> cars = new ArrayList<>();
+        List<Object> cdrs = new ArrayList<>();
+        for (Object lst : lists) {
+            if (!(lst instanceof Pair p)) throw posError("for-each: expected list");
+            cars.add(p.car);
+            cdrs.add(p.cdr);
+        }
+        return new More(() -> applyProc(fn, cars, ignored ->
+            new More(() -> cpsForEach(fn, cdrs, k))
         ));
     }
 
@@ -2041,6 +2212,10 @@ public class Evaluator {
     }
 
     private boolean schemeEqual(Object a, Object b) {
+        return schemeEqualCycle(a, b, new java.util.IdentityHashMap<>());
+    }
+
+    private boolean schemeEqualCycle(Object a, Object b, java.util.IdentityHashMap<Object, Set<Object>> seen) {
         if (a == b) return true;
         if (a instanceof Long la && b instanceof Long lb) return la.equals(lb);
         if (a instanceof Double da && b instanceof Double db) return da.equals(db);
@@ -2049,15 +2224,39 @@ public class Evaluator {
         if (a instanceof String sa && b instanceof String sb) return sa.equals(sb);
         if (a instanceof SchemeString sa && b instanceof SchemeString sb) return sa.value().equals(sb.value());
         if (a instanceof SchemeChar ca && b instanceof SchemeChar cb) return ca.value() == cb.value();
-        if (a instanceof Pair pa && b instanceof Pair pb) return schemeEqual(pa.car, pb.car) && schemeEqual(pa.cdr, pb.cdr);
+        if (a instanceof Pair pa && b instanceof Pair pb) {
+            Set<Object> partners = seen.get(a);
+            if (partners != null && partners.contains(b)) return true;
+            if (partners == null) { partners = java.util.Collections.newSetFromMap(new java.util.IdentityHashMap<>()); seen.put(a, partners); }
+            partners.add(b);
+            return schemeEqualCycle(pa.car, pb.car, seen) && schemeEqualCycle(pa.cdr, pb.cdr, seen);
+        }
         if (a instanceof SchemeVector va && b instanceof SchemeVector vb) {
             if (va.length() != vb.length()) return false;
             for (int i = 0; i < va.length(); i++) {
-                if (!schemeEqual(va.ref(i), vb.ref(i))) return false;
+                if (!schemeEqualCycle(va.ref(i), vb.ref(i), seen)) return false;
             }
             return true;
         }
         return false;
+    }
+
+    private static long gcdLong(long a, long b) {
+        a = Math.abs(a); b = Math.abs(b);
+        while (b != 0) { long t = b; b = a % b; a = t; }
+        return a;
+    }
+
+    private boolean isList(Object obj) {
+        Object slow = obj, fast = obj;
+        while (true) {
+            if (!(fast instanceof Pair fp)) return fast == NIL;
+            fast = fp.cdr;
+            if (!(fast instanceof Pair fp2)) return fast == NIL;
+            fast = fp2.cdr;
+            slow = ((Pair) slow).cdr;
+            if (slow == fast) return false;
+        }
     }
 
     private boolean isFalse(Object val) {
@@ -2115,18 +2314,7 @@ public class Evaluator {
         }
         if (val == NIL) return "()";
         if (val instanceof Pair) {
-            StringBuilder sb = new StringBuilder("(");
-            Object cur = val;
-            boolean first = true;
-            while (cur instanceof Pair p) {
-                if (!first) sb.append(" ");
-                first = false;
-                sb.append(schemeToString(p.car));
-                cur = p.cdr;
-            }
-            if (cur != NIL) { sb.append(" . "); sb.append(schemeToString(cur)); }
-            sb.append(")");
-            return sb.toString();
+            return pairToString(val, new java.util.IdentityHashMap<>());
         }
         if (val instanceof List<?> list) {
             StringBuilder sb = new StringBuilder("(");
@@ -2144,6 +2332,32 @@ public class Evaluator {
         if (val == CALL_CC) return "#<procedure:call/cc>";
         if (val == VOID) return "#<void>";
         return val.toString();
+    }
+
+    private String pairToString(Object val, java.util.IdentityHashMap<Object, Boolean> seen) {
+        if (!(val instanceof Pair)) return schemeToString(val);
+        if (seen.containsKey(val)) return "(...)";
+        seen.put(val, Boolean.TRUE);
+        StringBuilder sb = new StringBuilder("(");
+        Object cur = val;
+        boolean first = true;
+        while (cur instanceof Pair p) {
+            if (!first) {
+                if (seen.containsKey(cur)) { sb.append(" . (...)"); break; }
+                seen.put(cur, Boolean.TRUE);
+                sb.append(" ");
+            }
+            first = false;
+            if (p.car instanceof Pair) {
+                sb.append(pairToString(p.car, seen));
+            } else {
+                sb.append(schemeToString(p.car));
+            }
+            cur = p.cdr;
+        }
+        if (cur != NIL && !(cur instanceof Pair)) { sb.append(" . "); sb.append(schemeToString(cur)); }
+        sb.append(")");
+        return sb.toString();
     }
 
     static class SchemeString {
