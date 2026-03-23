@@ -109,3 +109,8 @@ type SchemeVoid struct{}
 func (v *SchemeVoid) String() string {
 	return ""
 }
+
+// SchemeCallCC represents the call/cc procedure as a first-class value.
+type SchemeCallCC struct{}
+
+func (v *SchemeCallCC) String() string { return "#<procedure call/cc>" }

@@ -15,6 +15,10 @@ func TopEnv() *Env {
 	env.Set("display", &EnvBuiltinProc{Name: "display", Fn: builtinDisplay})
 	env.Set("write", &EnvBuiltinProc{Name: "write", Fn: builtinWrite})
 	env.Set("newline", &EnvBuiltinProc{Name: "newline", Fn: builtinNewline})
+	env.Set("apply", &EnvBuiltinProc{Name: "apply", Fn: builtinApplyEnv})
+	callcc := &SchemeCallCC{}
+	env.Set("call/cc", callcc)
+	env.Set("call-with-current-continuation", callcc)
 	return env
 }
 
@@ -37,12 +41,9 @@ func EvalStr(input string) (string, error) {
 	}
 
 	env := TopEnv()
-	var result SchemeValue
-	for _, expr := range exprs {
-		result, err = Eval(expr, env)
-		if err != nil {
-			return "", err
-		}
+	result, err := evalAllExprs(exprs, env)
+	if err != nil {
+		return "", err
 	}
 
 	return result.String(), nil
@@ -70,12 +71,9 @@ func EvalStrWithOutput(input string) (result string, output string, err error) {
 	var buf strings.Builder
 	env.Set("$$output$$", &outputPort{buf: &buf})
 
-	var res SchemeValue
-	for _, expr := range exprs {
-		res, err = Eval(expr, env)
-		if err != nil {
-			return "", "", err
-		}
+	res, err := evalAllExprs(exprs, env)
+	if err != nil {
+		return "", "", err
 	}
 
 	return res.String(), buf.String(), nil
@@ -87,6 +85,80 @@ type outputPort struct {
 }
 
 func (o *outputPort) String() string { return "#<output-port>" }
+
+// SchemeContinuation represents a captured continuation.
+type SchemeContinuation struct {
+	id         int64
+	callccExpr Expr
+	topExprIdx int
+	letInfo    *letSkipInfo
+}
+
+func (v *SchemeContinuation) String() string { return "#<continuation>" }
+
+type letSkipInfo struct {
+	letExpr *ListExpr
+	env     *Env
+}
+
+// contJumpError signals a continuation invocation.
+type contJumpError struct {
+	cont  *SchemeContinuation
+	value SchemeValue
+}
+
+func (e *contJumpError) Error() string { return "continuation jump" }
+
+// Internal context types stored in environment.
+type topIdxVal struct{ idx int }
+
+func (v *topIdxVal) String() string { return "" }
+
+type letCtxVal struct {
+	letExpr *ListExpr
+	env     *Env
+}
+
+func (v *letCtxVal) String() string { return "" }
+
+// contResumeInfo holds resumption state for a continuation.
+type contResumeInfo struct {
+	callccExpr Expr
+	value      SchemeValue
+}
+
+// Global state for continuation resumption.
+var activeContResume *contResumeInfo
+var activeLetSkip *letSkipInfo
+var contIDCounter int64
+
+// evalAllExprs evaluates a sequence of expressions with continuation jump support.
+func evalAllExprs(exprs []Expr, env *Env) (SchemeValue, error) {
+	activeContResume = nil
+	activeLetSkip = nil
+
+	var result SchemeValue
+	for i := 0; i < len(exprs); i++ {
+		env.Set("$$top-idx$$", &topIdxVal{idx: i})
+		var err error
+		result, err = Eval(exprs[i], env)
+		if err != nil {
+			if jump, ok := err.(*contJumpError); ok {
+				activeContResume = &contResumeInfo{
+					callccExpr: jump.cont.callccExpr,
+					value:      jump.value,
+				}
+				if jump.cont.letInfo != nil {
+					activeLetSkip = jump.cont.letInfo
+				}
+				i = jump.cont.topExprIdx - 1 // -1 because loop increments
+				continue
+			}
+			return nil, err
+		}
+	}
+	return result, nil
+}
 
 // Eval evaluates an expression in the given environment.
 // Uses a trampoline loop for tail call optimization.
@@ -287,6 +359,14 @@ func Eval(expr Expr, env *Env) (SchemeValue, error) {
 				expr = fn.Body[len(fn.Body)-1]
 				env = localEnv
 				continue
+			case *SchemeCallCC:
+				return evalCallCC(args, e, env)
+			case *SchemeContinuation:
+				if len(args) != 1 {
+					line, col := e.Pos()
+					return nil, &EvalError{Message: fmt.Sprintf("%d:%d: continuation expects 1 argument, got %d", line, col, len(args))}
+				}
+				return nil, &contJumpError{cont: fn, value: args[0]}
 			}
 
 			line, col := e.Pos()
@@ -391,6 +471,89 @@ func evalLambda(e *ListExpr, env *Env) (SchemeValue, error) {
 	}, nil
 }
 
+func nextContID() int64 {
+	contIDCounter++
+	return contIDCounter
+}
+
+func evalCallCC(args []SchemeValue, callExpr *ListExpr, env *Env) (SchemeValue, error) {
+	if len(args) != 1 {
+		line, col := callExpr.Pos()
+		return nil, &EvalError{Message: fmt.Sprintf("%d:%d: call/cc: requires exactly 1 argument", line, col)}
+	}
+	proc := args[0]
+
+	// Check if we're resuming a saved continuation
+	if activeContResume != nil && activeContResume.callccExpr == callExpr {
+		val := activeContResume.value
+		activeContResume = nil
+		return val, nil
+	}
+
+	// Get context for the continuation
+	topExprIdx := 0
+	if v, ok := env.Get("$$top-idx$$"); ok {
+		topExprIdx = v.(*topIdxVal).idx
+	}
+	var letInfo *letSkipInfo
+	if v, ok := env.Get("$$let-ctx$$"); ok {
+		ctx := v.(*letCtxVal)
+		letInfo = &letSkipInfo{letExpr: ctx.letExpr, env: ctx.env}
+	}
+
+	contID := nextContID()
+	cont := &SchemeContinuation{
+		id:         contID,
+		callccExpr: callExpr,
+		topExprIdx: topExprIdx,
+		letInfo:    letInfo,
+	}
+
+	// Call the procedure with the continuation
+	result, err := applyFunc(proc, []SchemeValue{cont}, callExpr, env)
+	if err != nil {
+		// Check for escape continuation (invoked during the lambda)
+		if jump, ok := err.(*contJumpError); ok && jump.cont.id == contID {
+			return jump.value, nil
+		}
+		return nil, err
+	}
+	return result, nil
+}
+
+func applyFunc(proc SchemeValue, args []SchemeValue, callExpr *ListExpr, env *Env) (SchemeValue, error) {
+	switch fn := proc.(type) {
+	case *BuiltinProc:
+		return fn.Fn(args, callExpr)
+	case *EnvBuiltinProc:
+		return fn.Fn(args, callExpr, env)
+	case *Lambda:
+		localEnv, err := bindLambdaArgs(fn, args, callExpr)
+		if err != nil {
+			return nil, err
+		}
+		var result SchemeValue
+		for _, bodyExpr := range fn.Body {
+			result, err = Eval(bodyExpr, localEnv)
+			if err != nil {
+				return nil, err
+			}
+		}
+		return result, nil
+	case *SchemeCallCC:
+		return evalCallCC(args, callExpr, env)
+	case *SchemeContinuation:
+		if len(args) != 1 {
+			line, col := callExpr.Pos()
+			return nil, &EvalError{Message: fmt.Sprintf("%d:%d: continuation expects 1 argument, got %d", line, col, len(args))}
+		}
+		return nil, &contJumpError{cont: fn, value: args[0]}
+	default:
+		line, col := callExpr.Pos()
+		return nil, &EvalError{Message: fmt.Sprintf("%d:%d: not a procedure", line, col)}
+	}
+}
+
 // parseParams extracts parameter names and optional rest parameter from a param list.
 // Handles dot notation: (x y . rest)
 func parseParams(elements []Expr, callExpr *ListExpr) ([]string, string, error) {
@@ -474,6 +637,31 @@ func listToSlice(v SchemeValue) ([]SchemeValue, bool) {
 // setupLet prepares the environment for a let form and returns the tail expression.
 // For named let, it sets up the recursive binding.
 func setupLet(e *ListExpr, env *Env) (Expr, *Env, error) {
+	// Check for continuation let-skip (resuming a saved continuation)
+	if activeLetSkip != nil && activeLetSkip.letExpr == e {
+		capturedEnv := activeLetSkip.env
+		activeLetSkip = nil
+
+		// Determine body expressions
+		var body []Expr
+		if _, ok := e.Elements[1].(*SymbolExpr); ok {
+			body = e.Elements[3:] // named let: (let name ((bindings)) body...)
+		} else {
+			body = e.Elements[2:] // regular let: (let ((bindings)) body...)
+		}
+
+		// Store let context for nested call/cc
+		capturedEnv.Set("$$let-ctx$$", &letCtxVal{letExpr: e, env: capturedEnv})
+
+		for _, b := range body[:len(body)-1] {
+			_, err := Eval(b, capturedEnv)
+			if err != nil {
+				return nil, nil, err
+			}
+		}
+		return body[len(body)-1], capturedEnv, nil
+	}
+
 	if len(e.Elements) < 3 {
 		line, col := e.Pos()
 		return nil, nil, &EvalError{Message: fmt.Sprintf("%d:%d: let: bad syntax", line, col)}
@@ -518,6 +706,7 @@ func setupLet(e *ListExpr, env *Env) (Expr, *Env, error) {
 		for i, p := range params {
 			localEnv.Set(p, inits[i])
 		}
+		localEnv.Set("$$let-ctx$$", &letCtxVal{letExpr: e, env: localEnv})
 		body := lam.Body
 		// Eval all but last, return last as tail
 		for _, bodyExpr := range body[:len(body)-1] {
@@ -553,6 +742,7 @@ func setupLet(e *ListExpr, env *Env) (Expr, *Env, error) {
 		}
 		localEnv.Set(s.Name, val)
 	}
+	localEnv.Set("$$let-ctx$$", &letCtxVal{letExpr: e, env: localEnv})
 	body := e.Elements[2:]
 	for _, bodyExpr := range body[:len(body)-1] {
 		_, err := Eval(bodyExpr, localEnv)
@@ -691,7 +881,6 @@ func init() {
 	builtins["string-ref"] = &BuiltinProc{Name: "string-ref", Fn: builtinStringRef}
 	builtins["string-copy"] = &BuiltinProc{Name: "string-copy", Fn: builtinStringCopy}
 	builtins["string-set!"] = &BuiltinProc{Name: "string-set!", Fn: builtinStringSet}
-	builtins["apply"] = &BuiltinProc{Name: "apply", Fn: builtinApply}
 }
 
 func builtinAdd(args []SchemeValue, callExpr *ListExpr) (SchemeValue, error) {
@@ -1257,7 +1446,7 @@ func builtinStringSet(args []SchemeValue, callExpr *ListExpr) (SchemeValue, erro
 	return &SchemeVoid{}, nil
 }
 
-func builtinApply(args []SchemeValue, callExpr *ListExpr) (SchemeValue, error) {
+func builtinApplyEnv(args []SchemeValue, callExpr *ListExpr, env *Env) (SchemeValue, error) {
 	if len(args) < 2 {
 		line, col := callExpr.Pos()
 		return nil, &EvalError{Message: fmt.Sprintf("%d:%d: apply: requires at least 2 arguments", line, col)}
@@ -1275,28 +1464,5 @@ func builtinApply(args []SchemeValue, callExpr *ListExpr) (SchemeValue, error) {
 	allArgs = append(allArgs, args[1:len(args)-1]...)
 	allArgs = append(allArgs, tailArgs...)
 
-	switch proc := fn.(type) {
-	case *BuiltinProc:
-		return proc.Fn(allArgs, callExpr)
-	case *EnvBuiltinProc:
-		// EnvBuiltinProc needs an env - we don't have one here, but apply on display/write is unusual
-		// Pass nil env; display/write look up $$output$$ from their env param
-		return proc.Fn(allArgs, callExpr, nil)
-	case *Lambda:
-		localEnv, err := bindLambdaArgs(proc, allArgs, callExpr)
-		if err != nil {
-			return nil, err
-		}
-		var result SchemeValue
-		for _, bodyExpr := range proc.Body {
-			result, err = Eval(bodyExpr, localEnv)
-			if err != nil {
-				return nil, err
-			}
-		}
-		return result, nil
-	default:
-		line, col := callExpr.Pos()
-		return nil, &EvalError{Message: fmt.Sprintf("%d:%d: apply: first argument must be a procedure", line, col)}
-	}
+	return applyFunc(fn, allArgs, callExpr, env)
 }
