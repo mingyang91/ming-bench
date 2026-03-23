@@ -424,11 +424,11 @@ function expandMacro(
       const renames = new Map<string, string>();
       collectTemplateSymbols(rule.template, patVars, renames);
       const expanded = instantiateTemplate(rule.template, bindings, renames);
-      const evalEnv = new Env(callEnv);
+      // Set gensym bindings directly in callEnv so defines propagate correctly
       for (const [origName, gensymName] of renames) {
-        try { evalEnv.set(gensymName, macro.defEnv.get(origName)); } catch (_) { /* not bound */ }
+        try { callEnv.set(gensymName, macro.defEnv.get(origName)); } catch (_) { /* not bound */ }
       }
-      return { expanded, evalEnv };
+      return { expanded, evalEnv: callEnv };
     }
   }
   throw posError('no matching syntax-rules pattern', pos);
@@ -885,7 +885,7 @@ function evalK(expr: SchemeVal, env: Env, k: Kont): Bounce {
 
         return evalSeqArr(gBodyExprs, env, bodyVal => {
           exHandlers.pop();
-          return guardK(bodyVal);
+          return bounce(() => guardK(bodyVal));
         });
       }
 
@@ -1175,7 +1175,8 @@ function applyK(proc: SchemeVal, args: SchemeVal[], k: Kont, pos?: Pos): Bounce 
   }
 
   if (proc.tag === 'continuation') {
-    return proc.fn(args.length > 0 ? args[0] : { tag: 'void' });
+    if (args.length <= 1) return proc.fn(args.length > 0 ? args[0] : { tag: 'void' });
+    return proc.fn({ tag: 'values', elements: args });
   }
 
   if (proc.tag === 'builtin' && proc.name === 'dynamic-wind') {
