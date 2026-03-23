@@ -28,6 +28,7 @@ const BUILTINS: &[&str] = &[
     "vector", "make-vector", "vector-ref", "vector-set!", "vector-length",
     "vector?", "vector->list", "list->vector",
     "dynamic-wind",
+    "raise", "with-exception-handler",
 ];
 
 pub fn default_env() -> Rc<RefCell<Env>> {
@@ -153,6 +154,30 @@ enum Frame {
         cont_id: usize,
         value: Value,
     },
+    /// Guard body completed normally — pop handler, yield value
+    GuardDone,
+    /// with-exception-handler thunk completed normally — pop handler, yield value
+    WithExceptionHandlerDone,
+    /// Evaluating guard clause tests (cond-like)
+    GuardClauseTest {
+        exception_value: Value,
+        body: Vec<Value>,
+        remaining_clauses: Vec<Value>,
+        env: Rc<RefCell<Env>>,
+    },
+    /// Unwinding dynamic-wind during guard exception handling
+    GuardUnwind {
+        pending_push: Option<Winder>,
+        remaining: Vec<(Value, Option<Winder>)>,
+        guard_var: String,
+        exception_value: Value,
+        guard_clauses: Vec<Value>,
+        guard_env: Rc<RefCell<Env>>,
+        target_kont: Kont,
+        target_winders: Vec<Winder>,
+    },
+    /// Handler returned from non-continuable raise — error
+    RaiseHandlerReturn,
 }
 
 #[derive(Debug, Clone)]
@@ -169,12 +194,13 @@ enum Control {
 }
 
 // Persistent (shared) continuation stack — capturing is O(1) via Rc clone.
+#[derive(Debug)]
 struct KontNode {
     frame: Frame,
     rest: Option<Rc<KontNode>>,
 }
 
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 struct Kont(Option<Rc<KontNode>>);
 
 impl Kont {
@@ -213,6 +239,20 @@ impl Kont {
     }
 }
 
+#[derive(Clone)]
+enum ExHandler {
+    Guard {
+        var: String,
+        clauses: Vec<Value>,
+        env: Rc<RefCell<Env>>,
+        saved_kont: Kont,
+        saved_winders: Vec<Winder>,
+    },
+    Procedure {
+        handler: Value,
+    },
+}
+
 struct Machine {
     kont: Kont,
     saved_conts: Vec<Kont>,
@@ -221,6 +261,7 @@ struct Machine {
     winder_counter: usize,
     output: Rc<RefCell<String>>,
     gensym_counter: usize,
+    exception_handlers: Vec<ExHandler>,
 }
 
 impl Machine {
@@ -233,6 +274,7 @@ impl Machine {
             winder_counter: 0,
             output,
             gensym_counter: 0,
+            exception_handlers: Vec::new(),
         }
     }
 
@@ -310,6 +352,7 @@ impl Machine {
                 "letrec*" => return self.sf_letrec(&elems[1..], span, env, true),
                 "case" => return self.sf_case(&elems[1..], span, env),
                 "do" => return self.sf_do(&elems[1..], span, env),
+                "guard" => return self.sf_guard(&elems[1..], span, env),
                 _ => {}
             }
 
@@ -581,6 +624,53 @@ impl Machine {
                     self.restore_continuation(value)
                 }
             }
+            Frame::GuardDone => {
+                self.exception_handlers.pop();
+                Ok(Control::Continue(val))
+            }
+            Frame::WithExceptionHandlerDone => {
+                self.exception_handlers.pop();
+                Ok(Control::Continue(val))
+            }
+            Frame::GuardClauseTest { exception_value, body, remaining_clauses, env } => {
+                if !is_false(&val) {
+                    if body.is_empty() {
+                        Ok(Control::Continue(val))
+                    } else {
+                        self.eval_body_in(&body, &env)
+                    }
+                } else {
+                    self.dispatch_guard_clause(exception_value, &remaining_clauses, &env)
+                }
+            }
+            Frame::GuardUnwind {
+                pending_push, mut remaining,
+                guard_var, exception_value, guard_clauses, guard_env,
+                target_kont, target_winders,
+            } => {
+                if let Some(w) = pending_push {
+                    self.winders.push(w);
+                }
+                if let Some((thunk, push)) = remaining.first().cloned() {
+                    remaining.remove(0);
+                    self.kont.push(Frame::GuardUnwind {
+                        pending_push: push,
+                        remaining,
+                        guard_var, exception_value, guard_clauses, guard_env,
+                        target_kont, target_winders,
+                    });
+                    Ok(Control::Apply(thunk, vec![], None))
+                } else {
+                    self.kont = target_kont;
+                    self.winders = target_winders;
+                    self.start_guard_clauses(guard_var, exception_value, &guard_clauses, &guard_env)
+                }
+            }
+            Frame::RaiseHandlerReturn => {
+                Err(EvalError::Raised {
+                    value: "handler returned from non-continuable exception".into(),
+                })
+            }
         }
     }
 
@@ -754,6 +844,28 @@ impl Machine {
                 let mut all_args: Vec<Value> = args[1..args.len() - 1].to_vec();
                 all_args.extend(tail_args);
                 Ok(Control::Apply(new_func, all_args, span))
+            }
+            "raise" => {
+                if args.len() != 1 {
+                    return Err(EvalError::WrongArgCount {
+                        expected: 1, got: args.len(),
+                    }.at(span));
+                }
+                let val = args.into_iter().next().expect("checked len");
+                self.handle_raise(val, span)
+            }
+            "with-exception-handler" => {
+                if args.len() != 2 {
+                    return Err(EvalError::WrongArgCount {
+                        expected: 2, got: args.len(),
+                    }.at(span));
+                }
+                let mut it = args.into_iter();
+                let handler = it.next().expect("checked len");
+                let thunk = it.next().expect("checked len");
+                self.exception_handlers.push(ExHandler::Procedure { handler });
+                self.kont.push(Frame::WithExceptionHandlerDone);
+                Ok(Control::Apply(thunk, vec![], span))
             }
             _ => {
                 let result = apply_builtin(name, &args, &self.output)
@@ -1399,6 +1511,144 @@ impl Machine {
         };
         env.borrow_mut().define(name.clone(), syntax);
         Ok(Control::Continue(Value::Void))
+    }
+
+    // --- Exception handling ---
+
+    fn sf_guard(
+        &mut self,
+        args: &[Value],
+        span: Option<Span>,
+        env: &Rc<RefCell<Env>>,
+    ) -> Result<Control, EvalError> {
+        if args.len() < 2 {
+            return Err(EvalError::Parse {
+                msg: "guard requires variable/clauses and body".into(),
+            }.at(span));
+        }
+        let Value::List(header, _) = &args[0] else {
+            return Err(EvalError::Parse {
+                msg: "guard: expected (variable clause ...)".into(),
+            }.at(span));
+        };
+        if header.is_empty() {
+            return Err(EvalError::Parse {
+                msg: "guard: expected variable name".into(),
+            }.at(span));
+        }
+        let Value::Symbol(var, _) = &header[0] else {
+            return Err(EvalError::Parse {
+                msg: "guard: expected variable name".into(),
+            }.at(span));
+        };
+        let clauses = header[1..].to_vec();
+        let body = args[1..].to_vec();
+
+        let saved_kont = self.kont.clone();
+        let saved_winders = self.winders.clone();
+
+        self.exception_handlers.push(ExHandler::Guard {
+            var: var.clone(),
+            clauses,
+            env: Rc::clone(env),
+            saved_kont,
+            saved_winders,
+        });
+
+        self.kont.push(Frame::GuardDone);
+        self.eval_body_in(&body, env)
+    }
+
+    fn handle_raise(
+        &mut self,
+        val: Value,
+        span: Option<Span>,
+    ) -> Result<Control, EvalError> {
+        let handler = self.exception_handlers.pop();
+        match handler {
+            None => Err(EvalError::Raised { value: format!("{val}") }),
+            Some(ExHandler::Procedure { handler: handler_proc }) => {
+                self.kont.push(Frame::RaiseHandlerReturn);
+                Ok(Control::Apply(handler_proc, vec![val], span))
+            }
+            Some(ExHandler::Guard {
+                var, clauses, env, saved_kont, saved_winders,
+            }) => {
+                let common = self.winders.iter().zip(saved_winders.iter())
+                    .take_while(|(a, b)| a.id == b.id)
+                    .count();
+                let need_unwind = self.winders.len() > common;
+                let need_rewind = saved_winders.len() > common;
+
+                if !need_unwind && !need_rewind {
+                    self.kont = saved_kont;
+                    self.winders = saved_winders;
+                    self.start_guard_clauses(var, val, &clauses, &env)
+                } else {
+                    let mut actions: Vec<(Value, Option<Winder>)> = Vec::new();
+                    for w in self.winders[common..].iter().rev() {
+                        actions.push((w.out_thunk.clone(), None));
+                    }
+                    self.winders.truncate(common);
+                    for w in &saved_winders[common..] {
+                        actions.push((w.in_thunk.clone(), Some(w.clone())));
+                    }
+                    let (first_thunk, first_push) = actions.remove(0);
+                    self.kont.push(Frame::GuardUnwind {
+                        pending_push: first_push,
+                        remaining: actions,
+                        guard_var: var,
+                        exception_value: val,
+                        guard_clauses: clauses,
+                        guard_env: env,
+                        target_kont: saved_kont,
+                        target_winders: saved_winders,
+                    });
+                    Ok(Control::Apply(first_thunk, vec![], span))
+                }
+            }
+        }
+    }
+
+    fn start_guard_clauses(
+        &mut self,
+        var: String,
+        exception_val: Value,
+        clauses: &[Value],
+        env: &Rc<RefCell<Env>>,
+    ) -> Result<Control, EvalError> {
+        let guard_env = Env::with_parent(env);
+        guard_env.borrow_mut().define(var, exception_val.clone());
+        self.dispatch_guard_clause(exception_val, clauses, &guard_env)
+    }
+
+    fn dispatch_guard_clause(
+        &mut self,
+        exception_val: Value,
+        clauses: &[Value],
+        env: &Rc<RefCell<Env>>,
+    ) -> Result<Control, EvalError> {
+        if clauses.is_empty() {
+            return self.handle_raise(exception_val, None);
+        }
+        let Value::List(parts, _) = &clauses[0] else {
+            return Err(EvalError::Parse { msg: "guard: expected clause".into() });
+        };
+        if parts.is_empty() {
+            return Err(EvalError::Parse { msg: "guard: empty clause".into() });
+        }
+        if let Value::Symbol(s, _) = &parts[0] {
+            if s == "else" {
+                return self.eval_body_in(&parts[1..], env);
+            }
+        }
+        self.kont.push(Frame::GuardClauseTest {
+            exception_value: exception_val,
+            body: parts[1..].to_vec(),
+            remaining_clauses: clauses[1..].to_vec(),
+            env: Rc::clone(env),
+        });
+        Ok(Control::Eval(parts[0].clone(), Rc::clone(env)))
     }
 }
 

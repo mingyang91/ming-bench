@@ -24,6 +24,9 @@ pub enum EvalError {
     #[error("string is immutable")]
     ImmutableString,
 
+    #[error("unhandled exception: {value}")]
+    Raised { value: String },
+
     #[error("{line}:{col}: {inner}")]
     WithPosition {
         line: usize,
