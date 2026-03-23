@@ -25,6 +25,7 @@ pub enum Value {
         body: Vec<Value>,
         env: Rc<RefCell<Env>>,
     },
+    Pair(Box<Value>, Box<Value>),
     Continuation(usize),
     SyntaxRules {
         literals: Vec<String>,
@@ -39,8 +40,8 @@ impl Value {
         match self {
             Value::Symbol(_, span) | Value::List(_, span) => *span,
             Value::Int(_) | Value::Bool(_) | Value::String(_) | Value::Char(_)
-            | Value::Builtin(_) | Value::Closure { .. } | Value::Continuation(_)
-            | Value::SyntaxRules { .. } | Value::Void => None,
+            | Value::Builtin(_) | Value::Closure { .. } | Value::Pair(_, _)
+            | Value::Continuation(_) | Value::SyntaxRules { .. } | Value::Void => None,
         }
     }
 }
@@ -57,6 +58,7 @@ impl PartialEq for Value {
             (Value::Builtin(a), Value::Builtin(b)) => a == b,
             (Value::Void, Value::Void) => true,
             (Value::Closure { .. }, Value::Closure { .. }) => false,
+            (Value::Pair(a1, a2), Value::Pair(b1, b2)) => a1 == b1 && a2 == b2,
             (Value::Continuation(a), Value::Continuation(b)) => a == b,
             (Value::SyntaxRules { .. }, Value::SyntaxRules { .. }) => false,
             (Value::Int(_), _)
@@ -65,6 +67,7 @@ impl PartialEq for Value {
             | (Value::Char(_), _)
             | (Value::Symbol(_, _), _)
             | (Value::List(_, _), _)
+            | (Value::Pair(_, _), _)
             | (Value::Builtin(_), _)
             | (Value::Closure { .. }, _)
             | (Value::Continuation(_), _)
@@ -81,6 +84,9 @@ impl fmt::Display for Value {
             Value::Bool(true) => write!(f, "#t"),
             Value::Bool(false) => write!(f, "#f"),
             Value::String(s) => write!(f, "\"{s}\""),
+            Value::Char(' ') => write!(f, "#\\space"),
+            Value::Char('\n') => write!(f, "#\\newline"),
+            Value::Char('\t') => write!(f, "#\\tab"),
             Value::Char(c) => write!(f, "#\\{c}"),
             Value::Symbol(s, _) => write!(f, "{s}"),
             Value::List(elems, _) => {
@@ -93,6 +99,7 @@ impl fmt::Display for Value {
                 }
                 write!(f, ")")
             }
+            Value::Pair(a, b) => write!(f, "({a} . {b})"),
             Value::Builtin(name) => write!(f, "#<procedure:{name}>"),
             Value::Closure { .. } => write!(f, "#<procedure>"),
             Value::Continuation(_) => write!(f, "#<continuation>"),

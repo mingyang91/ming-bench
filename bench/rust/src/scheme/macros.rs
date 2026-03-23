@@ -104,8 +104,8 @@ fn match_single(
         Value::Int(a) => matches!(input, Value::Int(b) if a == b),
         Value::String(a) => matches!(input, Value::String(b) if a == b),
         Value::Char(a) => matches!(input, Value::Char(b) if a == b),
-        Value::Builtin(_) | Value::Closure { .. } | Value::Continuation(_)
-        | Value::SyntaxRules { .. } | Value::Void => false,
+        Value::Pair(_, _) | Value::Builtin(_) | Value::Closure { .. }
+        | Value::Continuation(_) | Value::SyntaxRules { .. } | Value::Void => false,
     }
 }
 
@@ -191,8 +191,8 @@ fn expand_template(
             Ok(Value::List(result, *span))
         }
         Value::Int(_) | Value::Bool(_) | Value::String(_) | Value::Char(_)
-        | Value::Builtin(_) | Value::Closure { .. } | Value::Continuation(_)
-        | Value::SyntaxRules { .. } | Value::Void => Ok(template.clone()),
+        | Value::Pair(_, _) | Value::Builtin(_) | Value::Closure { .. }
+        | Value::Continuation(_) | Value::SyntaxRules { .. } | Value::Void => Ok(template.clone()),
     }
 }
 
@@ -214,7 +214,7 @@ fn find_ellipsis_var(template: &Value, bindings: &HashMap<String, Binding>) -> O
             None
         }
         Value::Int(_) | Value::Bool(_) | Value::String(_) | Value::Char(_)
-        | Value::Builtin(_) | Value::Closure { .. } | Value::Continuation(_)
-        | Value::SyntaxRules { .. } | Value::Void => None,
+        | Value::Pair(_, _) | Value::Builtin(_) | Value::Closure { .. }
+        | Value::Continuation(_) | Value::SyntaxRules { .. } | Value::Void => None,
     }
 }
