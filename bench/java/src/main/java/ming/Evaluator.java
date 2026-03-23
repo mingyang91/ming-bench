@@ -892,6 +892,8 @@ public class Evaluator {
             "symbol->string", "string->symbol",
             "string-ref", "char?",
             "string-set!", "string-copy",
+            "string->list", "list->string",
+            "char->integer", "integer->char",
             "apply", "procedure?",
             "call/cc", "call-with-current-continuation",
             "abs", "modulo", "remainder", "quotient", "min", "max", "expt",
@@ -1050,6 +1052,7 @@ public class Evaluator {
                 if (!(args.get(0) instanceof SchemeString s)) throw posError("string-set!: expected string");
                 int idx = (int) requireLong(args.get(1), "string-set!");
                 if (!(args.get(2) instanceof SchemeChar c)) throw posError("string-set!: expected char");
+                if (idx < 0 || idx >= s.length()) throw posError("string-set!: index out of range");
                 s.setChar(idx, c.value());
                 yield VOID;
             }
@@ -1057,6 +1060,37 @@ public class Evaluator {
                 requireArgCount(args, 1, "string-copy");
                 if (!(args.get(0) instanceof SchemeString s)) throw posError("string-copy: expected string");
                 yield new SchemeString(s.value());
+            }
+            case "string->list" -> {
+                requireArgCount(args, 1, "string->list");
+                if (!(args.get(0) instanceof SchemeString s)) throw posError("string->list: expected string");
+                Object result = NIL;
+                String str = s.value();
+                for (int i = str.length() - 1; i >= 0; i--) {
+                    result = new Pair(new SchemeChar(str.charAt(i)), result);
+                }
+                yield result;
+            }
+            case "list->string" -> {
+                requireArgCount(args, 1, "list->string");
+                StringBuilder sb = new StringBuilder();
+                Object lst = args.get(0);
+                while (lst instanceof Pair p) {
+                    if (!(p.car instanceof SchemeChar c)) throw posError("list->string: expected char in list");
+                    sb.append(c.value());
+                    lst = p.cdr;
+                }
+                yield new SchemeString(sb.toString());
+            }
+            case "char->integer" -> {
+                requireArgCount(args, 1, "char->integer");
+                if (!(args.get(0) instanceof SchemeChar c)) throw posError("char->integer: expected char");
+                yield (long) c.value();
+            }
+            case "integer->char" -> {
+                requireArgCount(args, 1, "integer->char");
+                long n = requireLong(args.get(0), "integer->char");
+                yield new SchemeChar((char) n);
             }
             case "abs" -> {
                 requireArgCount(args, 1, "abs");
