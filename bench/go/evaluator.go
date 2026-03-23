@@ -1011,6 +1011,50 @@ func compareInts(args []*value, op func(int64, int64) bool, name string, line, c
 	return boolVal(true), nil
 }
 
+func schemeEq(a, b *value) bool {
+	if a.typ != b.typ {
+		return false
+	}
+	switch a.typ {
+	case valInt:
+		return a.ival == b.ival
+	case valBool:
+		return a.bval == b.bval
+	case valSymbol:
+		return a.sval == b.sval
+	case valChar:
+		return a.cval == b.cval
+	case valNil:
+		return true
+	default:
+		return a == b // pointer identity
+	}
+}
+
+func schemeEqual(a, b *value) bool {
+	if a.typ != b.typ {
+		return false
+	}
+	switch a.typ {
+	case valInt:
+		return a.ival == b.ival
+	case valBool:
+		return a.bval == b.bval
+	case valString:
+		return a.sval == b.sval
+	case valSymbol:
+		return a.sval == b.sval
+	case valChar:
+		return a.cval == b.cval
+	case valNil:
+		return true
+	case valPair:
+		return schemeEqual(a.car, b.car) && schemeEqual(a.cdr, b.cdr)
+	default:
+		return a == b
+	}
+}
+
 // ---------- Top-level ----------
 
 func makeBuiltin(name string, fn func(args []*value, line, col int) (*value, error)) *value {
@@ -1393,6 +1437,357 @@ func makeGlobalEnv(ip *interp) *env {
 			return nil, &EvalError{Message: fmt.Sprintf("%d:%d: string-ref: index out of range", line, col)}
 		}
 		return charVal(runes[idx]), nil
+	}))
+
+	// eq? — pointer/identity equality
+	e.set("eq?", makeBuiltin("eq?", func(args []*value, line, col int) (*value, error) {
+		if len(args) != 2 {
+			return nil, &EvalError{Message: fmt.Sprintf("%d:%d: eq?: expected 2 arguments", line, col)}
+		}
+		return boolVal(schemeEq(args[0], args[1])), nil
+	}))
+
+	// equal? — deep structural equality
+	e.set("equal?", makeBuiltin("equal?", func(args []*value, line, col int) (*value, error) {
+		if len(args) != 2 {
+			return nil, &EvalError{Message: fmt.Sprintf("%d:%d: equal?: expected 2 arguments", line, col)}
+		}
+		return boolVal(schemeEqual(args[0], args[1])), nil
+	}))
+
+	// map — supports multiple list arguments
+	e.set("map", makeBuiltin("map", func(args []*value, line, col int) (*value, error) {
+		if len(args) < 2 {
+			return nil, &EvalError{Message: fmt.Sprintf("%d:%d: map: expected at least 2 arguments", line, col)}
+		}
+		fn := args[0]
+		lists := args[1:]
+		// Collect current pointers
+		curs := make([]*value, len(lists))
+		copy(curs, lists)
+		var result []*value
+		for {
+			// Check if any list is exhausted
+			allPair := true
+			for _, c := range curs {
+				if c.typ != valPair {
+					allPair = false
+					break
+				}
+			}
+			if !allPair {
+				break
+			}
+			// Collect car of each list
+			fnArgs := make([]*value, len(curs))
+			for i, c := range curs {
+				fnArgs[i] = c.car
+			}
+			// Apply fn
+			var v *value
+			var err error
+			if fn.typ == valLambda {
+				localEnv, bindErr := bindLambdaArgs(fn, fnArgs, line, col)
+				if bindErr != nil {
+					return nil, bindErr
+				}
+				for _, bodyExpr := range fn.body[:len(fn.body)-1] {
+					_, err = ip.eval(bodyExpr, localEnv)
+					if err != nil {
+						return nil, err
+					}
+				}
+				v, err = ip.eval(fn.body[len(fn.body)-1], localEnv)
+			} else if fn.typ == valBuiltin {
+				v, err = fn.builtin(fnArgs, line, col)
+			} else {
+				return nil, &EvalError{Message: fmt.Sprintf("%d:%d: map: not a procedure", line, col)}
+			}
+			if err != nil {
+				return nil, err
+			}
+			result = append(result, v)
+			// Advance all pointers
+			for i, c := range curs {
+				curs[i] = c.cdr
+			}
+		}
+		// Build list from result
+		out := nilVal
+		for i := len(result) - 1; i >= 0; i-- {
+			out = &value{typ: valPair, car: result[i], cdr: out}
+		}
+		return out, nil
+	}))
+
+	// abs
+	e.set("abs", makeBuiltin("abs", func(args []*value, line, col int) (*value, error) {
+		if len(args) != 1 || args[0].typ != valInt {
+			return nil, &EvalError{Message: fmt.Sprintf("%d:%d: abs: expected number", line, col)}
+		}
+		n := args[0].ival
+		if n < 0 {
+			n = -n
+		}
+		return intVal(n), nil
+	}))
+
+	// modulo — result takes sign of divisor
+	e.set("modulo", makeBuiltin("modulo", func(args []*value, line, col int) (*value, error) {
+		if len(args) != 2 || args[0].typ != valInt || args[1].typ != valInt {
+			return nil, &EvalError{Message: fmt.Sprintf("%d:%d: modulo: expected 2 numbers", line, col)}
+		}
+		if args[1].ival == 0 {
+			return nil, &EvalError{Message: fmt.Sprintf("%d:%d: modulo: division by zero", line, col)}
+		}
+		a, b := args[0].ival, args[1].ival
+		r := a % b
+		if r != 0 && (r > 0) != (b > 0) {
+			r += b
+		}
+		return intVal(r), nil
+	}))
+
+	// remainder — result takes sign of dividend
+	e.set("remainder", makeBuiltin("remainder", func(args []*value, line, col int) (*value, error) {
+		if len(args) != 2 || args[0].typ != valInt || args[1].typ != valInt {
+			return nil, &EvalError{Message: fmt.Sprintf("%d:%d: remainder: expected 2 numbers", line, col)}
+		}
+		if args[1].ival == 0 {
+			return nil, &EvalError{Message: fmt.Sprintf("%d:%d: remainder: division by zero", line, col)}
+		}
+		return intVal(args[0].ival % args[1].ival), nil
+	}))
+
+	// quotient — truncated integer division
+	e.set("quotient", makeBuiltin("quotient", func(args []*value, line, col int) (*value, error) {
+		if len(args) != 2 || args[0].typ != valInt || args[1].typ != valInt {
+			return nil, &EvalError{Message: fmt.Sprintf("%d:%d: quotient: expected 2 numbers", line, col)}
+		}
+		if args[1].ival == 0 {
+			return nil, &EvalError{Message: fmt.Sprintf("%d:%d: quotient: division by zero", line, col)}
+		}
+		return intVal(args[0].ival / args[1].ival), nil
+	}))
+
+	// min, max — variadic
+	e.set("min", makeBuiltin("min", func(args []*value, line, col int) (*value, error) {
+		if len(args) == 0 {
+			return nil, &EvalError{Message: fmt.Sprintf("%d:%d: min: expected at least 1 argument", line, col)}
+		}
+		m := args[0].ival
+		for _, a := range args[1:] {
+			if a.ival < m {
+				m = a.ival
+			}
+		}
+		return intVal(m), nil
+	}))
+
+	e.set("max", makeBuiltin("max", func(args []*value, line, col int) (*value, error) {
+		if len(args) == 0 {
+			return nil, &EvalError{Message: fmt.Sprintf("%d:%d: max: expected at least 1 argument", line, col)}
+		}
+		m := args[0].ival
+		for _, a := range args[1:] {
+			if a.ival > m {
+				m = a.ival
+			}
+		}
+		return intVal(m), nil
+	}))
+
+	// expt — integer exponentiation
+	e.set("expt", makeBuiltin("expt", func(args []*value, line, col int) (*value, error) {
+		if len(args) != 2 || args[0].typ != valInt || args[1].typ != valInt {
+			return nil, &EvalError{Message: fmt.Sprintf("%d:%d: expt: expected 2 numbers", line, col)}
+		}
+		base, exp := args[0].ival, args[1].ival
+		result := int64(1)
+		for i := int64(0); i < exp; i++ {
+			result *= base
+		}
+		return intVal(result), nil
+	}))
+
+	// zero?, positive?, negative?
+	e.set("zero?", makeBuiltin("zero?", func(args []*value, line, col int) (*value, error) {
+		if len(args) != 1 || args[0].typ != valInt {
+			return nil, &EvalError{Message: fmt.Sprintf("%d:%d: zero?: expected number", line, col)}
+		}
+		return boolVal(args[0].ival == 0), nil
+	}))
+
+	e.set("positive?", makeBuiltin("positive?", func(args []*value, line, col int) (*value, error) {
+		if len(args) != 1 || args[0].typ != valInt {
+			return nil, &EvalError{Message: fmt.Sprintf("%d:%d: positive?: expected number", line, col)}
+		}
+		return boolVal(args[0].ival > 0), nil
+	}))
+
+	e.set("negative?", makeBuiltin("negative?", func(args []*value, line, col int) (*value, error) {
+		if len(args) != 1 || args[0].typ != valInt {
+			return nil, &EvalError{Message: fmt.Sprintf("%d:%d: negative?: expected number", line, col)}
+		}
+		return boolVal(args[0].ival < 0), nil
+	}))
+
+	// odd?, even?
+	e.set("odd?", makeBuiltin("odd?", func(args []*value, line, col int) (*value, error) {
+		if len(args) != 1 || args[0].typ != valInt {
+			return nil, &EvalError{Message: fmt.Sprintf("%d:%d: odd?: expected number", line, col)}
+		}
+		return boolVal(args[0].ival%2 != 0), nil
+	}))
+
+	e.set("even?", makeBuiltin("even?", func(args []*value, line, col int) (*value, error) {
+		if len(args) != 1 || args[0].typ != valInt {
+			return nil, &EvalError{Message: fmt.Sprintf("%d:%d: even?: expected number", line, col)}
+		}
+		return boolVal(args[0].ival%2 == 0), nil
+	}))
+
+	// list-ref
+	e.set("list-ref", makeBuiltin("list-ref", func(args []*value, line, col int) (*value, error) {
+		if len(args) != 2 || args[1].typ != valInt {
+			return nil, &EvalError{Message: fmt.Sprintf("%d:%d: list-ref: bad arguments", line, col)}
+		}
+		idx := int(args[1].ival)
+		cur := args[0]
+		for i := 0; i < idx; i++ {
+			if cur.typ != valPair {
+				return nil, &EvalError{Message: fmt.Sprintf("%d:%d: list-ref: index out of range", line, col)}
+			}
+			cur = cur.cdr
+		}
+		if cur.typ != valPair {
+			return nil, &EvalError{Message: fmt.Sprintf("%d:%d: list-ref: index out of range", line, col)}
+		}
+		return cur.car, nil
+	}))
+
+	// list-tail
+	e.set("list-tail", makeBuiltin("list-tail", func(args []*value, line, col int) (*value, error) {
+		if len(args) != 2 || args[1].typ != valInt {
+			return nil, &EvalError{Message: fmt.Sprintf("%d:%d: list-tail: bad arguments", line, col)}
+		}
+		idx := int(args[1].ival)
+		cur := args[0]
+		for i := 0; i < idx; i++ {
+			if cur.typ != valPair {
+				return nil, &EvalError{Message: fmt.Sprintf("%d:%d: list-tail: index out of range", line, col)}
+			}
+			cur = cur.cdr
+		}
+		return cur, nil
+	}))
+
+	// list?
+	e.set("list?", makeBuiltin("list?", func(args []*value, line, col int) (*value, error) {
+		if len(args) != 1 {
+			return nil, &EvalError{Message: fmt.Sprintf("%d:%d: list?: expected 1 argument", line, col)}
+		}
+		cur := args[0]
+		for cur.typ == valPair {
+			cur = cur.cdr
+		}
+		return boolVal(cur.typ == valNil), nil
+	}))
+
+	// assoc — uses equal?
+	e.set("assoc", makeBuiltin("assoc", func(args []*value, line, col int) (*value, error) {
+		if len(args) != 2 {
+			return nil, &EvalError{Message: fmt.Sprintf("%d:%d: assoc: expected 2 arguments", line, col)}
+		}
+		key := args[0]
+		cur := args[1]
+		for cur.typ == valPair {
+			pair := cur.car
+			if pair.typ == valPair && schemeEqual(pair.car, key) {
+				return pair, nil
+			}
+			cur = cur.cdr
+		}
+		return boolVal(false), nil
+	}))
+
+	// Character predicates and operations
+	e.set("char-alphabetic?", makeBuiltin("char-alphabetic?", func(args []*value, line, col int) (*value, error) {
+		if len(args) != 1 || args[0].typ != valChar {
+			return nil, &EvalError{Message: fmt.Sprintf("%d:%d: char-alphabetic?: expected char", line, col)}
+		}
+		return boolVal(unicode.IsLetter(args[0].cval)), nil
+	}))
+
+	e.set("char-numeric?", makeBuiltin("char-numeric?", func(args []*value, line, col int) (*value, error) {
+		if len(args) != 1 || args[0].typ != valChar {
+			return nil, &EvalError{Message: fmt.Sprintf("%d:%d: char-numeric?: expected char", line, col)}
+		}
+		return boolVal(unicode.IsDigit(args[0].cval)), nil
+	}))
+
+	e.set("char-upcase", makeBuiltin("char-upcase", func(args []*value, line, col int) (*value, error) {
+		if len(args) != 1 || args[0].typ != valChar {
+			return nil, &EvalError{Message: fmt.Sprintf("%d:%d: char-upcase: expected char", line, col)}
+		}
+		return charVal(unicode.ToUpper(args[0].cval)), nil
+	}))
+
+	e.set("char-downcase", makeBuiltin("char-downcase", func(args []*value, line, col int) (*value, error) {
+		if len(args) != 1 || args[0].typ != valChar {
+			return nil, &EvalError{Message: fmt.Sprintf("%d:%d: char-downcase: expected char", line, col)}
+		}
+		return charVal(unicode.ToLower(args[0].cval)), nil
+	}))
+
+	e.set("char=?", makeBuiltin("char=?", func(args []*value, line, col int) (*value, error) {
+		if len(args) != 2 || args[0].typ != valChar || args[1].typ != valChar {
+			return nil, &EvalError{Message: fmt.Sprintf("%d:%d: char=?: expected 2 chars", line, col)}
+		}
+		return boolVal(args[0].cval == args[1].cval), nil
+	}))
+
+	e.set("char<?", makeBuiltin("char<?", func(args []*value, line, col int) (*value, error) {
+		if len(args) != 2 || args[0].typ != valChar || args[1].typ != valChar {
+			return nil, &EvalError{Message: fmt.Sprintf("%d:%d: char<?: expected 2 chars", line, col)}
+		}
+		return boolVal(args[0].cval < args[1].cval), nil
+	}))
+
+	// String comparison
+	e.set("string=?", makeBuiltin("string=?", func(args []*value, line, col int) (*value, error) {
+		if len(args) != 2 || args[0].typ != valString || args[1].typ != valString {
+			return nil, &EvalError{Message: fmt.Sprintf("%d:%d: string=?: expected 2 strings", line, col)}
+		}
+		return boolVal(args[0].sval == args[1].sval), nil
+	}))
+
+	e.set("string<?", makeBuiltin("string<?", func(args []*value, line, col int) (*value, error) {
+		if len(args) != 2 || args[0].typ != valString || args[1].typ != valString {
+			return nil, &EvalError{Message: fmt.Sprintf("%d:%d: string<?: expected 2 strings", line, col)}
+		}
+		return boolVal(args[0].sval < args[1].sval), nil
+	}))
+
+	e.set("string-ci=?", makeBuiltin("string-ci=?", func(args []*value, line, col int) (*value, error) {
+		if len(args) != 2 || args[0].typ != valString || args[1].typ != valString {
+			return nil, &EvalError{Message: fmt.Sprintf("%d:%d: string-ci=?: expected 2 strings", line, col)}
+		}
+		return boolVal(strings.EqualFold(args[0].sval, args[1].sval)), nil
+	}))
+
+	e.set("string-upcase", makeBuiltin("string-upcase", func(args []*value, line, col int) (*value, error) {
+		if len(args) != 1 || args[0].typ != valString {
+			return nil, &EvalError{Message: fmt.Sprintf("%d:%d: string-upcase: expected string", line, col)}
+		}
+		return strVal(strings.ToUpper(args[0].sval)), nil
+	}))
+
+	e.set("string-downcase", makeBuiltin("string-downcase", func(args []*value, line, col int) (*value, error) {
+		if len(args) != 1 || args[0].typ != valString {
+			return nil, &EvalError{Message: fmt.Sprintf("%d:%d: string-downcase: expected string", line, col)}
+		}
+		return strVal(strings.ToLower(args[0].sval)), nil
 	}))
 
 	// call/cc as a first-class value
