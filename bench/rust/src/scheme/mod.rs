@@ -5,6 +5,20 @@ pub use error::EvalError;
 use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicU64, Ordering};
 
+/// A dynamic-wind entry tracking in/out thunks for the current dynamic extent.
+#[derive(Clone, Debug)]
+struct WindEntry {
+    id: u64,
+    in_thunk: Value,
+    out_thunk: Value,
+}
+
+static WIND_ID_COUNTER: AtomicU64 = AtomicU64::new(0);
+
+fn next_wind_id() -> u64 {
+    WIND_ID_COUNTER.fetch_add(1, Ordering::Relaxed)
+}
+
 /// A Scheme value.
 #[derive(Debug, Clone)]
 enum Value {
@@ -23,7 +37,7 @@ enum Value {
         env: Env,
     },
     Builtin(String),
-    Continuation(Vec<KontFrame>),
+    Continuation(Vec<KontFrame>, Vec<WindEntry>),
     Macro {
         literals: Vec<String>,
         rules: Vec<(Expr, Expr)>,
@@ -81,7 +95,7 @@ impl Value {
             Value::Void => "#<void>".to_string(),
             Value::Lambda { .. } => "#<procedure>".to_string(),
             Value::Builtin(_) => "#<procedure>".to_string(),
-            Value::Continuation(_) => "#<continuation>".to_string(),
+            Value::Continuation(..) => "#<continuation>".to_string(),
             Value::Macro { .. } => "#<macro>".to_string(),
             Value::Vector(v) => {
                 let items = v.borrow();
@@ -525,6 +539,8 @@ fn is_builtin(name: &str) -> bool {
             | "for-each"
             | "procedure?"
             | "integer?"
+            | "dynamic-wind"
+            | "reverse"
     )
 }
 
@@ -604,6 +620,20 @@ enum KontFrame {
     },
     /// Case: key was evaluated, match against clauses.
     CaseKey { clauses: Vec<Expr>, env: Env, el: u32, ec: u32 },
+    /// dynamic-wind: in-thunk returned, now push wind entry and run body.
+    DynWindBody { in_thunk: Value, body_thunk: Value, out_thunk: Value, wind_id: u64, el: u32, ec: u32 },
+    /// dynamic-wind: body returned, now pop wind entry and run out-thunk.
+    DynWindOut { wind_id: u64, el: u32, ec: u32 },
+    /// dynamic-wind: out-thunk returned, return the saved body result.
+    DynWindDone { body_result: Value },
+    /// Wind transfer during continuation invocation.
+    WindTransfer {
+        pending_outs: Vec<Value>,
+        pending_ins: Vec<WindEntry>,
+        target_kont: Vec<KontFrame>,
+        target_wind: Vec<WindEntry>,
+        value: Value,
+    },
 }
 
 /// Control state of the CEK machine.
@@ -895,7 +925,7 @@ fn expand_macro(
 }
 
 /// Apply a function value to evaluated arguments within the CEK machine.
-fn apply_func(func: Value, args: Vec<Value>, kont: &mut Vec<KontFrame>, el: u32, ec: u32) -> Result<Ctrl, EvalError> {
+fn apply_func(func: Value, args: Vec<Value>, kont: &mut Vec<KontFrame>, wind: &mut Vec<WindEntry>, el: u32, ec: u32) -> Result<Ctrl, EvalError> {
     match func {
         Value::Lambda { params, rest_param, body, env } => {
             bind_lambda_args(&params, &rest_param, &args, &env, el, ec)?;
@@ -917,9 +947,28 @@ fn apply_func(func: Value, args: Vec<Value>, kont: &mut Vec<KontFrame>, el: u32,
             if args.len() != 1 {
                 return Err(EvalError::Arity("call/cc requires 1 argument".into()).at(el, ec));
             }
-            let cont_val = Value::Continuation(kont.clone());
+            let cont_val = Value::Continuation(kont.clone(), wind.clone());
             let f = args.into_iter().next().unwrap();
-            apply_func(f, vec![cont_val], kont, el, ec)
+            apply_func(f, vec![cont_val], kont, wind, el, ec)
+        }
+        Value::Builtin(ref name) if name == "dynamic-wind" => {
+            if args.len() != 3 {
+                return Err(EvalError::Arity("dynamic-wind requires 3 arguments".into()).at(el, ec));
+            }
+            let in_thunk = args[0].clone();
+            let body_thunk = args[1].clone();
+            let out_thunk = args[2].clone();
+            let wind_id = next_wind_id();
+            kont.push(KontFrame::DynWindBody {
+                in_thunk: in_thunk.clone(),
+                body_thunk,
+                out_thunk,
+                wind_id,
+                el,
+                ec,
+            });
+            // Call in-thunk; when it returns, DynWindBody will handle the rest
+            apply_func(in_thunk, vec![], kont, wind, el, ec)
         }
         Value::Builtin(ref name) if name == "map" => {
             if args.len() < 2 {
@@ -988,18 +1037,46 @@ fn apply_func(func: Value, args: Vec<Value>, kont: &mut Vec<KontFrame>, el: u32,
             };
             let mut all_args: Vec<Value> = args[1..args.len() - 1].to_vec();
             all_args.extend(tail_args);
-            apply_func(func, all_args, kont, el, ec)
+            apply_func(func, all_args, kont, wind, el, ec)
         }
         Value::Builtin(ref name) => {
             let result = eval_builtin(name, &args).map_err(|e| e.at(el, ec))?;
             Ok(Ctrl::Val(result))
         }
-        Value::Continuation(saved) => {
+        Value::Continuation(saved_kont, saved_wind) => {
             if args.len() != 1 {
                 return Err(EvalError::Arity("continuation requires 1 argument".into()).at(el, ec));
             }
-            *kont = saved;
-            Ok(Ctrl::Val(args.into_iter().next().unwrap()))
+            let value = args.into_iter().next().unwrap();
+            // Compute common prefix length between current and saved wind stacks
+            let common_len = wind.iter().zip(saved_wind.iter())
+                .take_while(|(a, b)| a.id == b.id)
+                .count();
+            let need_unwind = wind.len() > common_len;
+            let need_rewind = saved_wind.len() > common_len;
+            if !need_unwind && !need_rewind {
+                // No winding needed, just restore
+                *kont = saved_kont;
+                *wind = saved_wind;
+                Ok(Ctrl::Val(value))
+            } else {
+                // Collect out-thunks to call (innermost first = reverse order from common_len..)
+                let pending_outs: Vec<Value> = wind[common_len..].iter().rev()
+                    .map(|e| e.out_thunk.clone()).collect();
+                // Collect wind entries to rewind (outermost first = order from common_len..)
+                let pending_ins: Vec<WindEntry> = saved_wind[common_len..].to_vec();
+                // Truncate wind to common prefix before starting unwind
+                wind.truncate(common_len);
+                kont.push(KontFrame::WindTransfer {
+                    pending_outs,
+                    pending_ins,
+                    target_kont: saved_kont,
+                    target_wind: saved_wind,
+                    value: value.clone(),
+                });
+                // Start by calling the first out-thunk (or in-thunk if no outs)
+                Ok(Ctrl::Val(value))
+            }
         }
         _ => Err(EvalError::Type("not a procedure".into()).at(el, ec)),
     }
@@ -1009,6 +1086,7 @@ fn apply_func(func: Value, args: Vec<Value>, kont: &mut Vec<KontFrame>, el: u32,
 fn run_cek(initial_ctrl: Ctrl, initial_kont: Vec<KontFrame>) -> Result<Value, EvalError> {
     let mut ctrl = initial_ctrl;
     let mut kont = initial_kont;
+    let mut wind: Vec<WindEntry> = Vec::new();
 
     loop {
         ctrl = match ctrl {
@@ -1542,7 +1620,7 @@ fn run_cek(initial_ctrl: Ctrl, initial_kont: Vec<KontFrame>) -> Result<Value, Ev
                         KontFrame::EvalFunc { mut arg_exprs, env, el, ec } => {
                             // val is the evaluated function; now evaluate args right-to-left
                             if arg_exprs.is_empty() {
-                                apply_func(val, vec![], &mut kont, el, ec)?
+                                apply_func(val, vec![], &mut kont, &mut wind, el, ec)?
                             } else {
                                 let last = arg_exprs.pop().unwrap();
                                 kont.push(KontFrame::EvalArg { func: val, remaining: arg_exprs, done: vec![], env: env.clone(), el, ec });
@@ -1553,7 +1631,7 @@ fn run_cek(initial_ctrl: Ctrl, initial_kont: Vec<KontFrame>) -> Result<Value, Ev
                             done.push(val);
                             if remaining.is_empty() {
                                 done.reverse();
-                                apply_func(func, done, &mut kont, el, ec)?
+                                apply_func(func, done, &mut kont, &mut wind, el, ec)?
                             } else {
                                 let next = remaining.pop().unwrap();
                                 kont.push(KontFrame::EvalArg { func, remaining, done, env: env.clone(), el, ec });
@@ -1646,8 +1724,8 @@ fn run_cek(initial_ctrl: Ctrl, initial_kont: Vec<KontFrame>) -> Result<Value, Ev
                         }
                         KontFrame::CallCC { el, ec } => {
                             // val is the function to call with the continuation
-                            let cont_val = Value::Continuation(kont.clone());
-                            apply_func(val, vec![cont_val], &mut kont, el, ec)?
+                            let cont_val = Value::Continuation(kont.clone(), wind.clone());
+                            apply_func(val, vec![cont_val], &mut kont, &mut wind, el, ec)?
                         }
                         KontFrame::LetrecBind { names, current_idx, mut values, mut remaining_inits, body, env, sequential } => {
                             if sequential {
@@ -1706,6 +1784,58 @@ fn run_cek(initial_ctrl: Ctrl, initial_kont: Vec<KontFrame>) -> Result<Value, Ev
                                 }
                             }
                             result
+                        }
+                        KontFrame::DynWindBody { in_thunk, body_thunk, out_thunk, wind_id, el, ec } => {
+                            // in-thunk just returned; push wind entry and call body
+                            wind.push(WindEntry { id: wind_id, in_thunk, out_thunk });
+                            kont.push(KontFrame::DynWindOut { wind_id, el, ec });
+                            apply_func(body_thunk, vec![], &mut kont, &mut wind, el, ec)?
+                        }
+                        KontFrame::DynWindOut { wind_id, el, ec } => {
+                            // body just returned; pop wind entry and call out-thunk
+                            let body_result = val;
+                            if let Some(pos) = wind.iter().rposition(|e| e.id == wind_id) {
+                                let entry = wind.remove(pos);
+                                kont.push(KontFrame::DynWindDone { body_result });
+                                apply_func(entry.out_thunk, vec![], &mut kont, &mut wind, el, ec)?
+                            } else {
+                                Ctrl::Val(body_result)
+                            }
+                        }
+                        KontFrame::DynWindDone { body_result } => {
+                            // out-thunk returned; return the saved body result
+                            Ctrl::Val(body_result)
+                        }
+                        KontFrame::WindTransfer { mut pending_outs, mut pending_ins, target_kont, target_wind, value } => {
+                            // Process wind transfer: first call out-thunks (innermost first), then in-thunks
+                            if !pending_outs.is_empty() {
+                                let out_thunk = pending_outs.remove(0);
+                                kont.push(KontFrame::WindTransfer {
+                                    pending_outs,
+                                    pending_ins,
+                                    target_kont,
+                                    target_wind,
+                                    value,
+                                });
+                                apply_func(out_thunk, vec![], &mut kont, &mut wind, 0, 0)?
+                            } else if !pending_ins.is_empty() {
+                                let entry = pending_ins.remove(0);
+                                let in_thunk = entry.in_thunk.clone();
+                                wind.push(entry);
+                                kont.push(KontFrame::WindTransfer {
+                                    pending_outs: vec![],
+                                    pending_ins,
+                                    target_kont,
+                                    target_wind,
+                                    value,
+                                });
+                                apply_func(in_thunk, vec![], &mut kont, &mut wind, 0, 0)?
+                            } else {
+                                // All winding done; restore target
+                                kont = target_kont;
+                                wind = target_wind;
+                                Ctrl::Val(value)
+                            }
                         }
                     }
                 } else {
@@ -1890,6 +2020,19 @@ fn eval_builtin(op: &str, args: &[Value]) -> Result<Value, EvalError> {
                 }
             }
             Ok(Value::List(result))
+        }
+        "reverse" => {
+            if args.len() != 1 {
+                return Err(EvalError::Arity("reverse requires 1 argument".into()));
+            }
+            match &args[0] {
+                Value::List(items) => {
+                    let mut rev = items.clone();
+                    rev.reverse();
+                    Ok(Value::List(rev))
+                }
+                _ => Err(EvalError::Type("reverse: not a list".into())),
+            }
         }
         "string?" => {
             if args.len() != 1 {
@@ -2493,7 +2636,7 @@ fn eval_builtin(op: &str, args: &[Value]) -> Result<Value, EvalError> {
             if args.len() != 1 {
                 return Err(EvalError::Arity("procedure? requires 1 argument".into()));
             }
-            Ok(Value::Boolean(matches!(&args[0], Value::Lambda { .. } | Value::Builtin(_) | Value::Continuation(_))))
+            Ok(Value::Boolean(matches!(&args[0], Value::Lambda { .. } | Value::Builtin(_) | Value::Continuation(..))))
         }
         "integer?" => {
             if args.len() != 1 {
