@@ -92,8 +92,23 @@ fn skip_whitespace(input: &[u8], pos: usize) -> usize {
     i
 }
 
+/// Compute (line, col) from byte offset. Both 1-based.
+fn line_col(input: &[u8], offset: usize) -> (u32, u32) {
+    let mut line = 1u32;
+    let mut col = 1u32;
+    for &b in &input[..offset.min(input.len())] {
+        if b == b'\n' {
+            line += 1;
+            col = 1;
+        } else {
+            col += 1;
+        }
+    }
+    (line, col)
+}
+
 #[derive(Debug, Clone)]
-enum Expr {
+enum ExprKind {
     Integer(i64),
     Boolean(bool),
     Str(String),
@@ -101,28 +116,56 @@ enum Expr {
     List(Vec<Expr>),
 }
 
+#[derive(Debug, Clone)]
+struct Expr {
+    kind: ExprKind,
+    line: u32,
+    col: u32,
+}
+
+impl Expr {
+    fn new(kind: ExprKind, line: u32, col: u32) -> Self {
+        Expr { kind, line, col }
+    }
+}
+
 fn parse_expr(input: &[u8], pos: usize) -> Result<(Expr, usize), EvalError> {
     let i = skip_whitespace(input, pos);
     if i >= input.len() {
         return Err(EvalError::Parse("unexpected end of input".into()));
     }
+    let (l, c) = line_col(input, i);
 
     match input[i] {
         b'(' => parse_list(input, i),
         b'\'' => {
             let (expr, next) = parse_expr(input, i + 1)?;
-            Ok((Expr::List(vec![Expr::Symbol("quote".into()), expr]), next))
+            Ok((
+                Expr::new(
+                    ExprKind::List(vec![
+                        Expr::new(ExprKind::Symbol("quote".into()), l, c),
+                        expr,
+                    ]),
+                    l,
+                    c,
+                ),
+                next,
+            ))
         }
         b'"' => parse_string(input, i),
         b'#' => {
             if i + 1 < input.len() {
                 match input[i + 1] {
-                    b't' => Ok((Expr::Boolean(true), i + 2)),
-                    b'f' => Ok((Expr::Boolean(false), i + 2)),
-                    _ => Err(EvalError::Parse("unexpected character after #".into())),
+                    b't' => Ok((Expr::new(ExprKind::Boolean(true), l, c), i + 2)),
+                    b'f' => Ok((Expr::new(ExprKind::Boolean(false), l, c), i + 2)),
+                    _ => Err(EvalError::Parse(format!(
+                        "{l}:{c}: unexpected character after #"
+                    ))),
                 }
             } else {
-                Err(EvalError::Parse("unexpected end after #".into()))
+                Err(EvalError::Parse(format!(
+                    "{l}:{c}: unexpected end after #"
+                )))
             }
         }
         _ => parse_atom(input, i),
@@ -130,6 +173,7 @@ fn parse_expr(input: &[u8], pos: usize) -> Result<(Expr, usize), EvalError> {
 }
 
 fn parse_string(input: &[u8], pos: usize) -> Result<(Expr, usize), EvalError> {
+    let (l, c) = line_col(input, pos);
     let mut i = pos + 1;
     let mut s = String::new();
     while i < input.len() && input[i] != b'"' {
@@ -140,9 +184,9 @@ fn parse_string(input: &[u8], pos: usize) -> Result<(Expr, usize), EvalError> {
                 b't' => s.push('\t'),
                 b'\\' => s.push('\\'),
                 b'"' => s.push('"'),
-                c => {
+                ch => {
                     s.push('\\');
-                    s.push(c as char);
+                    s.push(ch as char);
                 }
             }
         } else {
@@ -151,21 +195,22 @@ fn parse_string(input: &[u8], pos: usize) -> Result<(Expr, usize), EvalError> {
         i += 1;
     }
     if i >= input.len() {
-        return Err(EvalError::Parse("unterminated string".into()));
+        return Err(EvalError::Parse(format!("{l}:{c}: unterminated string")));
     }
-    Ok((Expr::Str(s), i + 1))
+    Ok((Expr::new(ExprKind::Str(s), l, c), i + 1))
 }
 
 fn parse_list(input: &[u8], pos: usize) -> Result<(Expr, usize), EvalError> {
+    let (l, c) = line_col(input, pos);
     let mut i = pos + 1;
     let mut items = Vec::new();
     loop {
         i = skip_whitespace(input, i);
         if i >= input.len() {
-            return Err(EvalError::Parse("unterminated list".into()));
+            return Err(EvalError::Parse(format!("{l}:{c}: unterminated list")));
         }
         if input[i] == b')' {
-            return Ok((Expr::List(items), i + 1));
+            return Ok((Expr::new(ExprKind::List(items), l, c), i + 1));
         }
         let (expr, next) = parse_expr(input, i)?;
         items.push(expr);
@@ -178,21 +223,22 @@ fn is_symbol_char(b: u8) -> bool {
 }
 
 fn parse_atom(input: &[u8], pos: usize) -> Result<(Expr, usize), EvalError> {
+    let (l, c) = line_col(input, pos);
     let mut i = pos;
     while i < input.len() && is_symbol_char(input[i]) {
         i += 1;
     }
     if i == pos {
         return Err(EvalError::Parse(format!(
-            "unexpected character: {}",
+            "{l}:{c}: unexpected character: {}",
             input[pos] as char
         )));
     }
     let token = std::str::from_utf8(&input[pos..i]).unwrap();
     if let Ok(n) = token.parse::<i64>() {
-        return Ok((Expr::Integer(n), i));
+        return Ok((Expr::new(ExprKind::Integer(n), l, c), i));
     }
-    Ok((Expr::Symbol(token.to_string()), i))
+    Ok((Expr::new(ExprKind::Symbol(token.to_string()), l, c), i))
 }
 
 fn parse_all(input: &str) -> Result<Vec<Expr>, EvalError> {
@@ -217,12 +263,12 @@ fn parse_all(input: &str) -> Result<Vec<Expr>, EvalError> {
 // --- Evaluator ---
 
 fn expr_to_value(expr: &Expr) -> Value {
-    match expr {
-        Expr::Integer(n) => Value::Integer(*n),
-        Expr::Boolean(b) => Value::Boolean(*b),
-        Expr::Str(s) => Value::Str(s.clone()),
-        Expr::Symbol(s) => Value::Symbol(s.clone()),
-        Expr::List(items) => Value::List(items.iter().map(expr_to_value).collect()),
+    match &expr.kind {
+        ExprKind::Integer(n) => Value::Integer(*n),
+        ExprKind::Boolean(b) => Value::Boolean(*b),
+        ExprKind::Str(s) => Value::Str(s.clone()),
+        ExprKind::Symbol(s) => Value::Symbol(s.clone()),
+        ExprKind::List(items) => Value::List(items.iter().map(expr_to_value).collect()),
     }
 }
 
@@ -254,33 +300,38 @@ fn is_builtin(name: &str) -> bool {
 }
 
 fn eval(expr: &Expr, env: &Env) -> Result<Value, EvalError> {
-    match expr {
-        Expr::Integer(n) => Ok(Value::Integer(*n)),
-        Expr::Boolean(b) => Ok(Value::Boolean(*b)),
-        Expr::Str(s) => Ok(Value::Str(s.clone())),
-        Expr::Symbol(name) => {
+    let (el, ec) = (expr.line, expr.col);
+    match &expr.kind {
+        ExprKind::Integer(n) => Ok(Value::Integer(*n)),
+        ExprKind::Boolean(b) => Ok(Value::Boolean(*b)),
+        ExprKind::Str(s) => Ok(Value::Str(s.clone())),
+        ExprKind::Symbol(name) => {
             if is_builtin(name) {
-                // Return a marker so builtins can be passed as values
                 return Ok(Value::Symbol(name.clone()));
             }
-            env_get(env, name).ok_or_else(|| EvalError::UnboundVariable(name.clone()))
+            env_get(env, name)
+                .ok_or_else(|| EvalError::UnboundVariable(name.clone()).at(el, ec))
         }
-        Expr::List(items) => {
+        ExprKind::List(items) => {
             if items.is_empty() {
                 return Ok(Value::List(vec![]));
             }
             // Special forms
-            if let Expr::Symbol(op) = &items[0] {
+            if let ExprKind::Symbol(op) = &items[0].kind {
                 match op.as_str() {
                     "quote" => {
                         if items.len() != 2 {
-                            return Err(EvalError::Arity("quote requires 1 argument".into()));
+                            return Err(EvalError::Arity("quote requires 1 argument".into())
+                                .at(el, ec));
                         }
                         return Ok(expr_to_value(&items[1]));
                     }
                     "if" => {
                         if items.len() < 3 || items.len() > 4 {
-                            return Err(EvalError::Arity("if requires 2 or 3 arguments".into()));
+                            return Err(EvalError::Arity(
+                                "if requires 2 or 3 arguments".into(),
+                            )
+                            .at(el, ec));
                         }
                         let cond = eval(&items[1], env)?;
                         return if cond.is_truthy() {
@@ -295,35 +346,39 @@ fn eval(expr: &Expr, env: &Env) -> Result<Value, EvalError> {
                         if items.len() < 3 {
                             return Err(EvalError::Arity(
                                 "define requires at least 2 arguments".into(),
-                            ));
+                            )
+                            .at(el, ec));
                         }
-                        match &items[1] {
-                            Expr::Symbol(name) => {
+                        match &items[1].kind {
+                            ExprKind::Symbol(name) => {
                                 let val = eval(&items[2], env)?;
                                 env_set(env, name.clone(), val);
                                 return Ok(Value::Void);
                             }
-                            Expr::List(sig) => {
+                            ExprKind::List(sig) => {
                                 if sig.is_empty() {
                                     return Err(EvalError::Parse(
                                         "define: empty signature".into(),
-                                    ));
+                                    )
+                                    .at(el, ec));
                                 }
-                                let name = match &sig[0] {
-                                    Expr::Symbol(s) => s.clone(),
+                                let name = match &sig[0].kind {
+                                    ExprKind::Symbol(s) => s.clone(),
                                     _ => {
                                         return Err(EvalError::Type(
                                             "define: expected symbol".into(),
-                                        ))
+                                        )
+                                        .at(el, ec))
                                     }
                                 };
                                 let params: Vec<String> = sig[1..]
                                     .iter()
-                                    .map(|e| match e {
-                                        Expr::Symbol(s) => Ok(s.clone()),
+                                    .map(|e| match &e.kind {
+                                        ExprKind::Symbol(s) => Ok(s.clone()),
                                         _ => Err(EvalError::Type(
                                             "expected symbol in params".into(),
-                                        )),
+                                        )
+                                        .at(el, ec)),
                                     })
                                     .collect::<Result<_, _>>()?;
                                 let body = items[2..].to_vec();
@@ -338,7 +393,8 @@ fn eval(expr: &Expr, env: &Env) -> Result<Value, EvalError> {
                             _ => {
                                 return Err(EvalError::Type(
                                     "define: expected symbol or list".into(),
-                                ))
+                                )
+                                .at(el, ec))
                             }
                         }
                     }
@@ -346,22 +402,25 @@ fn eval(expr: &Expr, env: &Env) -> Result<Value, EvalError> {
                         if items.len() < 3 {
                             return Err(EvalError::Arity(
                                 "lambda requires at least 2 arguments".into(),
-                            ));
+                            )
+                            .at(el, ec));
                         }
-                        let params = match &items[1] {
-                            Expr::List(param_exprs) => param_exprs
+                        let params = match &items[1].kind {
+                            ExprKind::List(param_exprs) => param_exprs
                                 .iter()
-                                .map(|e| match e {
-                                    Expr::Symbol(s) => Ok(s.clone()),
+                                .map(|e| match &e.kind {
+                                    ExprKind::Symbol(s) => Ok(s.clone()),
                                     _ => Err(EvalError::Type(
                                         "expected symbol in params".into(),
-                                    )),
+                                    )
+                                    .at(el, ec)),
                                 })
                                 .collect::<Result<Vec<_>, _>>()?,
                             _ => {
                                 return Err(EvalError::Type(
                                     "lambda: expected parameter list".into(),
-                                ))
+                                )
+                                .at(el, ec))
                             }
                         };
                         let body = items[2..].to_vec();
@@ -401,36 +460,40 @@ fn eval(expr: &Expr, env: &Env) -> Result<Value, EvalError> {
                         if items.len() < 3 {
                             return Err(EvalError::Arity(
                                 "let requires at least 2 arguments".into(),
-                            ));
+                            )
+                            .at(el, ec));
                         }
                         // Named let: (let name ((var init) ...) body ...)
-                        if let Expr::Symbol(loop_name) = &items[1] {
-                            let bindings = match &items[2] {
-                                Expr::List(bs) => bs,
+                        if let ExprKind::Symbol(loop_name) = &items[1].kind {
+                            let bindings = match &items[2].kind {
+                                ExprKind::List(bs) => bs,
                                 _ => {
                                     return Err(EvalError::Type(
                                         "let: expected bindings list".into(),
-                                    ))
+                                    )
+                                    .at(el, ec))
                                 }
                             };
                             let mut params = Vec::new();
                             let mut init_vals = Vec::new();
                             for b in bindings {
-                                match b {
-                                    Expr::List(pair) if pair.len() == 2 => {
-                                        if let Expr::Symbol(s) = &pair[0] {
+                                match &b.kind {
+                                    ExprKind::List(pair) if pair.len() == 2 => {
+                                        if let ExprKind::Symbol(s) = &pair[0].kind {
                                             params.push(s.clone());
                                             init_vals.push(eval(&pair[1], env)?);
                                         } else {
                                             return Err(EvalError::Type(
                                                 "let: expected symbol".into(),
-                                            ));
+                                            )
+                                            .at(el, ec));
                                         }
                                     }
                                     _ => {
                                         return Err(EvalError::Type(
                                             "let: invalid binding".into(),
-                                        ))
+                                        )
+                                        .at(el, ec))
                                     }
                                 }
                             }
@@ -442,7 +505,6 @@ fn eval(expr: &Expr, env: &Env) -> Result<Value, EvalError> {
                             };
                             let local_env = new_env(Some(env.clone()));
                             env_set(&local_env, loop_name.clone(), loop_lambda.clone());
-                            // Update the lambda's env to include itself
                             if let Value::Lambda {
                                 params: p,
                                 body: b,
@@ -456,62 +518,63 @@ fn eval(expr: &Expr, env: &Env) -> Result<Value, EvalError> {
                                 };
                                 env_set(&local_env, loop_name.clone(), self_lambda);
                             }
-                            // Call the loop with initial values
                             let func = env_get(&local_env, loop_name).unwrap();
-                            return apply(func, init_vals);
+                            return apply(func, init_vals).map_err(|e| e.at(el, ec));
                         }
                         // Regular let: (let ((var init) ...) body ...)
-                        let bindings = match &items[1] {
-                            Expr::List(bs) => bs,
+                        let bindings = match &items[1].kind {
+                            ExprKind::List(bs) => bs,
                             _ => {
                                 return Err(EvalError::Type(
                                     "let: expected bindings list".into(),
-                                ))
+                                )
+                                .at(el, ec))
                             }
                         };
                         let local_env = new_env(Some(env.clone()));
                         for b in bindings {
-                            match b {
-                                Expr::List(pair) if pair.len() == 2 => {
-                                    if let Expr::Symbol(s) = &pair[0] {
+                            match &b.kind {
+                                ExprKind::List(pair) if pair.len() == 2 => {
+                                    if let ExprKind::Symbol(s) = &pair[0].kind {
                                         let val = eval(&pair[1], env)?;
                                         env_set(&local_env, s.clone(), val);
                                     } else {
                                         return Err(EvalError::Type(
                                             "let: expected symbol".into(),
-                                        ));
+                                        )
+                                        .at(el, ec));
                                     }
                                 }
                                 _ => {
                                     return Err(EvalError::Type(
                                         "let: invalid binding".into(),
-                                    ))
+                                    )
+                                    .at(el, ec))
                                 }
                             }
                         }
                         let mut result = Value::Void;
-                        for expr in &items[2..] {
-                            result = eval(expr, &local_env)?;
+                        for e in &items[2..] {
+                            result = eval(e, &local_env)?;
                         }
                         return Ok(result);
                     }
                     "begin" => {
                         let mut result = Value::Void;
-                        for expr in &items[1..] {
-                            result = eval(expr, env)?;
+                        for e in &items[1..] {
+                            result = eval(e, env)?;
                         }
                         return Ok(result);
                     }
                     "cond" => {
                         for clause in &items[1..] {
-                            match clause {
-                                Expr::List(parts) if !parts.is_empty() => {
-                                    // Check for else clause
-                                    if let Expr::Symbol(s) = &parts[0] {
+                            match &clause.kind {
+                                ExprKind::List(parts) if !parts.is_empty() => {
+                                    if let ExprKind::Symbol(s) = &parts[0].kind {
                                         if s == "else" {
                                             let mut result = Value::Void;
-                                            for expr in &parts[1..] {
-                                                result = eval(expr, env)?;
+                                            for e in &parts[1..] {
+                                                result = eval(e, env)?;
                                             }
                                             return Ok(result);
                                         }
@@ -519,8 +582,8 @@ fn eval(expr: &Expr, env: &Env) -> Result<Value, EvalError> {
                                     let test = eval(&parts[0], env)?;
                                     if test.is_truthy() {
                                         let mut result = test;
-                                        for expr in &parts[1..] {
-                                            result = eval(expr, env)?;
+                                        for e in &parts[1..] {
+                                            result = eval(e, env)?;
                                         }
                                         return Ok(result);
                                     }
@@ -528,7 +591,8 @@ fn eval(expr: &Expr, env: &Env) -> Result<Value, EvalError> {
                                 _ => {
                                     return Err(EvalError::Type(
                                         "cond: invalid clause".into(),
-                                    ))
+                                    )
+                                    .at(el, ec))
                                 }
                             }
                         }
@@ -543,7 +607,7 @@ fn eval(expr: &Expr, env: &Env) -> Result<Value, EvalError> {
                 .iter()
                 .map(|a| eval(a, env))
                 .collect::<Result<_, _>>()?;
-            apply(func, args)
+            apply(func, args).map_err(|e| e.at(el, ec))
         }
     }
 }
@@ -610,7 +674,7 @@ fn eval_builtin(op: &str, args: &[Value]) -> Result<Value, EvalError> {
             let first = as_integer(&args[0])?;
             if args.len() == 1 {
                 if first == 0 {
-                    return Err(EvalError::DivisionByZero);
+                    return Err(EvalError::DivisionByZero(String::new()));
                 }
                 return Ok(Value::Integer(1 / first));
             }
@@ -618,7 +682,7 @@ fn eval_builtin(op: &str, args: &[Value]) -> Result<Value, EvalError> {
             for a in &args[1..] {
                 let d = as_integer(a)?;
                 if d == 0 {
-                    return Err(EvalError::DivisionByZero);
+                    return Err(EvalError::DivisionByZero(String::new()));
                 }
                 result /= d;
             }
