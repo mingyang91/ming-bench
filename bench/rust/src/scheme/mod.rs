@@ -541,6 +541,9 @@ fn is_builtin(name: &str) -> bool {
             | "integer?"
             | "dynamic-wind"
             | "reverse"
+            | "raise"
+            | "with-exception-handler"
+            | "exit"
     )
 }
 
@@ -634,6 +637,25 @@ enum KontFrame {
         target_wind: Vec<WindEntry>,
         value: Value,
     },
+    /// with-exception-handler: marks handler boundary in kont stack.
+    ExceptionHandler { handler: Value },
+    /// guard: marks guard boundary in kont stack; when exception is caught, evaluate clauses.
+    GuardHandler { var: String, clauses: Vec<Expr>, env: Env },
+    /// Raise unwinding: calling out-thunks before handling exception.
+    RaiseUnwind {
+        pending_outs: Vec<Value>,
+        handler_action: RaiseAction,
+        exception: Value,
+    },
+    /// Guard clause evaluation: test was evaluated, decide to return result or try next.
+    GuardClause { body: Vec<Expr>, rest_clauses: Vec<Expr>, env: Env, exception: Value },
+}
+
+/// What to do after unwinding for a raise.
+#[derive(Clone, Debug)]
+enum RaiseAction {
+    CallHandler { handler: Value },
+    EvalGuard { var: String, clauses: Vec<Expr>, env: Env },
 }
 
 /// Control state of the CEK machine.
@@ -653,6 +675,29 @@ fn eval_body(body: &[Expr], env: Env, kont: &mut Vec<KontFrame>) -> Ctrl {
     } else {
         kont.push(KontFrame::Seq { rest: body[1..].to_vec(), env: env.clone() });
         Ctrl::Eval(body[0].clone(), env)
+    }
+}
+
+/// Start evaluating guard clauses with exception bound to var.
+fn eval_guard_clauses(exception: Value, var: &str, clauses: &[Expr], env: &Env, kont: &mut Vec<KontFrame>) -> Result<Ctrl, EvalError> {
+    let guard_env = new_env(Some(env.clone()));
+    env_set(&guard_env, var.to_string(), exception.clone());
+    if clauses.is_empty() {
+        return Err(EvalError::Type(format!("guard: no matching clause for {}", exception.display())));
+    }
+    match &clauses[0].kind {
+        ExprKind::List(parts) if !parts.is_empty() => {
+            let is_else = matches!(&parts[0].kind, ExprKind::Symbol(ref s) if s == "else");
+            if is_else {
+                Ok(eval_body(&parts[1..], guard_env, kont))
+            } else {
+                let body = parts[1..].to_vec();
+                let rest = clauses[1..].to_vec();
+                kont.push(KontFrame::GuardClause { body, rest_clauses: rest, env: guard_env.clone(), exception });
+                Ok(Ctrl::Eval(parts[0].clone(), guard_env))
+            }
+        }
+        _ => Err(EvalError::Type("guard: invalid clause".into())),
     }
 }
 
@@ -693,6 +738,7 @@ fn is_special_form(name: &str) -> bool {
             | "let" | "let*" | "begin" | "cond" | "string-set!" | "call/cc"
             | "call-with-current-continuation" | "define-syntax" | "syntax-rules"
             | "letrec" | "letrec*" | "case" | "do" | "when" | "unless"
+            | "guard"
     )
 }
 
@@ -970,6 +1016,82 @@ fn apply_func(func: Value, args: Vec<Value>, kont: &mut Vec<KontFrame>, wind: &m
             // Call in-thunk; when it returns, DynWindBody will handle the rest
             apply_func(in_thunk, vec![], kont, wind, el, ec)
         }
+        Value::Builtin(ref name) if name == "with-exception-handler" => {
+            if args.len() != 2 {
+                return Err(EvalError::Arity("with-exception-handler requires 2 arguments".into()).at(el, ec));
+            }
+            let handler = args[0].clone();
+            let thunk = args[1].clone();
+            kont.push(KontFrame::ExceptionHandler { handler });
+            apply_func(thunk, vec![], kont, wind, el, ec)
+        }
+        Value::Builtin(ref name) if name == "raise" => {
+            if args.len() != 1 {
+                return Err(EvalError::Arity("raise requires 1 argument".into()).at(el, ec));
+            }
+            let exception = args.into_iter().next().unwrap();
+            // Search kont stack for nearest exception handler or guard handler
+            let mut handler_idx = None;
+            for (i, frame) in kont.iter().enumerate().rev() {
+                match frame {
+                    KontFrame::ExceptionHandler { .. } | KontFrame::GuardHandler { .. } => {
+                        handler_idx = Some(i);
+                        break;
+                    }
+                    _ => {}
+                }
+            }
+            let idx = match handler_idx {
+                Some(i) => i,
+                None => return Err(EvalError::Type(format!("unhandled exception: {}", exception.display())).at(el, ec)),
+            };
+            let frame = kont.remove(idx);
+            // Count wind entries that need unwinding: wind entries added after the handler
+            // We need to figure out how many wind entries existed when the handler was installed.
+            // Count DynWindOut frames between idx and top of kont to determine wind depth.
+            let mut wind_at_handler = wind.len();
+            for frame in kont[idx..].iter() {
+                match frame {
+                    KontFrame::DynWindOut { .. } => { wind_at_handler -= 1; }
+                    KontFrame::DynWindBody { .. } => { wind_at_handler -= 1; }
+                    _ => {}
+                }
+            }
+            // Truncate kont to the handler position
+            kont.truncate(idx);
+            // Collect out-thunks to call (innermost first)
+            let pending_outs: Vec<Value> = wind[wind_at_handler..].iter().rev()
+                .map(|e| e.out_thunk.clone()).collect();
+            wind.truncate(wind_at_handler);
+            let action = match frame {
+                KontFrame::ExceptionHandler { handler } => RaiseAction::CallHandler { handler },
+                KontFrame::GuardHandler { var, clauses, env } => RaiseAction::EvalGuard { var, clauses, env },
+                _ => unreachable!(),
+            };
+            if pending_outs.is_empty() {
+                // No unwinding needed, proceed directly
+                match action {
+                    RaiseAction::CallHandler { handler } => {
+                        apply_func(handler, vec![exception], kont, wind, el, ec)
+                    }
+                    RaiseAction::EvalGuard { var, clauses, env } => {
+                        eval_guard_clauses(exception, &var, &clauses, &env, kont)
+                    }
+                }
+            } else {
+                kont.push(KontFrame::RaiseUnwind { pending_outs, handler_action: action, exception });
+                Ok(Ctrl::Val(Value::Void)) // trigger the RaiseUnwind frame
+            }
+        }
+        Value::Builtin(ref name) if name == "exit" => {
+            if args.len() != 1 {
+                return Err(EvalError::Arity("exit requires 1 argument".into()).at(el, ec));
+            }
+            let val = args.into_iter().next().unwrap();
+            kont.clear();
+            wind.clear();
+            Ok(Ctrl::Val(val))
+        }
         Value::Builtin(ref name) if name == "map" => {
             if args.len() < 2 {
                 return Err(EvalError::Arity("map requires at least 2 arguments".into()).at(el, ec));
@@ -1098,13 +1220,11 @@ fn run_cek(initial_ctrl: Ctrl, initial_kont: Vec<KontFrame>) -> Result<Value, Ev
                     ExprKind::Str(s) => Ctrl::Val(Value::Str(s)),
                     ExprKind::Char(c) => Ctrl::Val(Value::Char(c)),
                     ExprKind::Symbol(ref name) => {
-                        if is_builtin(name) {
-                            Ctrl::Val(Value::Builtin(name.clone()))
-                        } else {
-                            match env_get(&env, name) {
-                                Some(v) => Ctrl::Val(v),
-                                None => return Err(EvalError::UnboundVariable(name.clone()).at(el, ec)),
-                            }
+                        // Check environment first so local bindings shadow builtins
+                        match env_get(&env, name) {
+                            Some(v) => Ctrl::Val(v),
+                            None if is_builtin(name) => Ctrl::Val(Value::Builtin(name.clone())),
+                            None => return Err(EvalError::UnboundVariable(name.clone()).at(el, ec)),
                         }
                     }
                     ExprKind::List(items) => {
@@ -1561,6 +1681,24 @@ fn run_cek(initial_ctrl: Ctrl, initial_kont: Vec<KontFrame>) -> Result<Value, Ev
                                     ]), el, ec);
                                     Ctrl::Eval(if_expr, env)
                                 }
+                                Some("guard") => {
+                                    // (guard (var clause ...) body ...)
+                                    if items.len() < 3 {
+                                        return Err(EvalError::Arity("guard requires at least 2 arguments".into()).at(el, ec));
+                                    }
+                                    let clauses_expr = match &items[1].kind {
+                                        ExprKind::List(parts) if !parts.is_empty() => parts,
+                                        _ => return Err(EvalError::Type("guard: expected (var clause ...) list".into()).at(el, ec)),
+                                    };
+                                    let var = match &clauses_expr[0].kind {
+                                        ExprKind::Symbol(s) => s.clone(),
+                                        _ => return Err(EvalError::Type("guard: expected variable name".into()).at(el, ec)),
+                                    };
+                                    let clauses = clauses_expr[1..].to_vec();
+                                    let body = items[2..].to_vec();
+                                    kont.push(KontFrame::GuardHandler { var, clauses, env: env.clone() });
+                                    eval_body(&body, env, &mut kont)
+                                }
                                 _ => {
                                     // Check for macro invocation
                                     if let Some(ref name) = op_name {
@@ -1835,6 +1973,56 @@ fn run_cek(initial_ctrl: Ctrl, initial_kont: Vec<KontFrame>) -> Result<Value, Ev
                                 kont = target_kont;
                                 wind = target_wind;
                                 Ctrl::Val(value)
+                            }
+                        }
+                        KontFrame::ExceptionHandler { .. } => {
+                            // Thunk returned normally; just pass value through
+                            Ctrl::Val(val)
+                        }
+                        KontFrame::GuardHandler { .. } => {
+                            // Body returned normally; just pass value through
+                            Ctrl::Val(val)
+                        }
+                        KontFrame::RaiseUnwind { mut pending_outs, handler_action, exception } => {
+                            if !pending_outs.is_empty() {
+                                let out_thunk = pending_outs.remove(0);
+                                kont.push(KontFrame::RaiseUnwind { pending_outs, handler_action, exception });
+                                apply_func(out_thunk, vec![], &mut kont, &mut wind, 0, 0)?
+                            } else {
+                                match handler_action {
+                                    RaiseAction::CallHandler { handler } => {
+                                        apply_func(handler, vec![exception], &mut kont, &mut wind, 0, 0)?
+                                    }
+                                    RaiseAction::EvalGuard { var, clauses, env } => {
+                                        eval_guard_clauses(exception, &var, &clauses, &env, &mut kont)?
+                                    }
+                                }
+                            }
+                        }
+                        KontFrame::GuardClause { body, rest_clauses, env, exception } => {
+                            if val.is_truthy() {
+                                if body.is_empty() {
+                                    Ctrl::Val(val)
+                                } else {
+                                    eval_body(&body, env, &mut kont)
+                                }
+                            } else if rest_clauses.is_empty() {
+                                return Err(EvalError::Type(format!("guard: no matching clause for {}", exception.display())));
+                            } else {
+                                match &rest_clauses[0].kind {
+                                    ExprKind::List(parts) if !parts.is_empty() => {
+                                        let is_else = matches!(&parts[0].kind, ExprKind::Symbol(ref s) if s == "else");
+                                        if is_else {
+                                            eval_body(&parts[1..], env, &mut kont)
+                                        } else {
+                                            let body = parts[1..].to_vec();
+                                            let rest = rest_clauses[1..].to_vec();
+                                            kont.push(KontFrame::GuardClause { body, rest_clauses: rest, env: env.clone(), exception });
+                                            Ctrl::Eval(parts[0].clone(), env)
+                                        }
+                                    }
+                                    _ => return Err(EvalError::Type("guard: invalid clause".into())),
+                                }
                             }
                         }
                     }
