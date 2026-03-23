@@ -1383,7 +1383,14 @@ function applyCPS(proc: SchemeVal, args: SchemeVal[], k: K, pos?: Pos): TResult 
   }
 
   if (proc.tag === 'continuation') {
-    const val = args[0] || VOID;
+    let val: SchemeVal;
+    if (args.length === 1) {
+      val = args[0];
+    } else if (args.length === 0) {
+      val = VOID;
+    } else {
+      val = { tag: 'values', values: args };
+    }
     return callK(proc.k, val);
   }
 

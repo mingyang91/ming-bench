@@ -1415,7 +1415,16 @@ function applyCPS(proc, args, k, pos) {
         return evaluateSeqCPS(proc.body, 0, callEnv, k);
     }
     if (proc.tag === 'continuation') {
-        const val = args[0] || VOID;
+        let val;
+        if (args.length === 1) {
+            val = args[0];
+        }
+        else if (args.length === 0) {
+            val = VOID;
+        }
+        else {
+            val = { tag: 'values', values: args };
+        }
         return callK(proc.k, val);
     }
     throw new EvalError(`${posStr(pos)}not a procedure`);
