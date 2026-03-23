@@ -18,61 +18,73 @@ class Env {
         this.bindings.set(name, val);
     }
 }
-// ── Parser ─────────────────────────────────────────────────────────
 function tokenize(input) {
     const tokens = [];
     let i = 0;
+    let line = 1;
+    let col = 1;
+    function advance() {
+        if (input[i] === '\n') {
+            line++;
+            col = 1;
+        }
+        else {
+            col++;
+        }
+        i++;
+    }
     while (i < input.length) {
         const ch = input[i];
         if (ch === ' ' || ch === '\t' || ch === '\n' || ch === '\r') {
-            i++;
+            advance();
             continue;
         }
         if (ch === ';') {
             while (i < input.length && input[i] !== '\n')
-                i++;
+                advance();
             continue;
         }
+        const startPos = { line, col };
         if (ch === '(' || ch === ')') {
-            tokens.push(ch);
-            i++;
+            tokens.push({ text: ch, pos: startPos });
+            advance();
             continue;
         }
         if (ch === "'") {
-            tokens.push("'");
-            i++;
+            tokens.push({ text: "'", pos: startPos });
+            advance();
             continue;
         }
         if (ch === '"') {
             let s = '"';
-            i++;
+            advance();
             while (i < input.length && input[i] !== '"') {
                 if (input[i] === '\\') {
                     s += input[i];
-                    i++;
+                    advance();
                     if (i < input.length) {
                         s += input[i];
-                        i++;
+                        advance();
                     }
                     continue;
                 }
                 s += input[i];
-                i++;
+                advance();
             }
             if (i < input.length) {
                 s += '"';
-                i++;
+                advance();
             }
-            tokens.push(s);
+            tokens.push({ text: s, pos: startPos });
             continue;
         }
         let atom = '';
         while (i < input.length && !("() \t\n\r;'".includes(input[i]))) {
             atom += input[i];
-            i++;
+            advance();
         }
         if (atom.length > 0)
-            tokens.push(atom);
+            tokens.push({ text: atom, pos: startPos });
     }
     return tokens;
 }
@@ -80,25 +92,27 @@ function parseTokens(tokens, pos) {
     if (pos >= tokens.length)
         throw new EvalError('unexpected end of input');
     const tok = tokens[pos];
-    if (tok === "'") {
+    if (tok.text === "'") {
         const [val, next] = parseTokens(tokens, pos + 1);
-        return [{ tag: 'list', value: [{ tag: 'symbol', value: 'quote' }, val] }, next];
+        return [{ tag: 'list', value: [{ tag: 'symbol', value: 'quote', pos: tok.pos }, val], pos: tok.pos }, next];
     }
-    if (tok === '(') {
+    if (tok.text === '(') {
         const items = [];
         pos++;
-        while (pos < tokens.length && tokens[pos] !== ')') {
+        while (pos < tokens.length && tokens[pos].text !== ')') {
             const [val, next] = parseTokens(tokens, pos);
             items.push(val);
             pos = next;
         }
         if (pos >= tokens.length)
             throw new EvalError('missing closing paren');
-        return [{ tag: 'list', value: items }, pos + 1];
+        return [{ tag: 'list', value: items, pos: tok.pos }, pos + 1];
     }
-    if (tok === ')')
+    if (tok.text === ')')
         throw new EvalError('unexpected )');
-    return [parseAtom(tok), pos + 1];
+    const atom = parseAtom(tok.text);
+    atom.pos = tok.pos;
+    return [atom, pos + 1];
 }
 function parseAtom(tok) {
     if (tok === '#t')
@@ -116,17 +130,20 @@ function parseAtom(tok) {
     return { tag: 'symbol', value: tok };
 }
 function parse(input) {
-    const tokens = tokenize(input);
+    const toks = tokenize(input);
     const exprs = [];
     let pos = 0;
-    while (pos < tokens.length) {
-        const [val, next] = parseTokens(tokens, pos);
+    while (pos < toks.length) {
+        const [val, next] = parseTokens(toks, pos);
         exprs.push(val);
         pos = next;
     }
     return exprs;
 }
 // ── Evaluator ──────────────────────────────────────────────────────
+function posStr(p) {
+    return p ? `${p.line}:${p.col}: ` : '';
+}
 const NIL = { tag: 'nil' };
 function listToPairs(items) {
     let result = NIL;
@@ -248,14 +265,22 @@ function makeGlobalEnv() {
 }
 function evaluate(expr, env) {
     if (expr.tag === 'symbol') {
-        return env.get(expr.value);
+        try {
+            return env.get(expr.value);
+        }
+        catch (e) {
+            if (e instanceof EvalError && expr.pos) {
+                throw new EvalError(`${posStr(expr.pos)}${e.message}`);
+            }
+            throw e;
+        }
     }
     if (expr.tag !== 'list') {
         return expr; // self-evaluating
     }
     const items = expr.value;
     if (items.length === 0)
-        throw new EvalError('empty application');
+        throw new EvalError(`${posStr(expr.pos)}empty application`);
     const head = items[0];
     if (head.tag === 'symbol') {
         const op = head.value;
@@ -264,6 +289,8 @@ function evaluate(expr, env) {
             return astToPairs(items[1]);
         }
         if (op === 'if') {
+            if (items.length < 3)
+                throw new EvalError(`${posStr(expr.pos)}if: bad syntax`);
             const cond = evaluate(items[1], env);
             if (isTruthy(cond)) {
                 return evaluate(items[2], env);
@@ -274,6 +301,8 @@ function evaluate(expr, env) {
             return { tag: 'void' };
         }
         if (op === 'define') {
+            if (items.length < 3)
+                throw new EvalError(`${posStr(expr.pos)}define: bad syntax`);
             if (items[1].tag === 'list') {
                 // (define (f params...) body...)
                 const nameAndParams = items[1].value;
@@ -389,7 +418,15 @@ function evaluate(expr, env) {
     const proc = evaluate(head, env);
     const args = items.slice(1).map(a => evaluate(a, env));
     if (proc.tag === 'builtin') {
-        return proc.fn(args);
+        try {
+            return proc.fn(args);
+        }
+        catch (e) {
+            if (e instanceof EvalError && expr.pos && !e.message.match(/^\d+:/)) {
+                throw new EvalError(`${posStr(expr.pos)}${e.message}`);
+            }
+            throw e;
+        }
     }
     if (proc.tag === 'lambda') {
         const callEnv = new Env(proc.env);
@@ -402,7 +439,7 @@ function evaluate(expr, env) {
         }
         return result;
     }
-    throw new EvalError('not a procedure');
+    throw new EvalError(`${posStr(expr.pos)}not a procedure`);
 }
 // ── Display ────────────────────────────────────────────────────────
 function display(val) {
