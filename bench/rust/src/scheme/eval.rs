@@ -199,7 +199,7 @@ pub fn eval(expr: &Value, env: &Env) -> Result<Value, EvalError> {
                     | "assoc" | "map" | "eq?" | "eqv?" | "equal?"
                     | "vector" | "make-vector" | "vector-ref" | "vector-set!"
                     | "vector-length" | "vector?" | "vector->list" | "list->vector"
-                    | "apply"
+                    | "apply" | "dynamic-wind" | "reverse"
                     | "call/cc" | "call-with-current-continuation" => Ok(current_expr.clone()),
                     _ => Err(EvalError::UnboundVariable {
                         name: name.clone(),
@@ -1019,6 +1019,8 @@ fn apply_builtin(name: &str, args: &[Value], span: Span, env: &Env) -> Result<Va
         "string-ci=?" => builtin_string_ci_eq(args, span),
         "string-upcase" => builtin_string_upcase(args, span),
         "string-downcase" => builtin_string_downcase(args, span),
+        "dynamic-wind" => builtin_dynamic_wind(args, span, env),
+        "reverse" => builtin_reverse(args, span),
         _ => Err(EvalError::UnboundVariable {
             name: name.to_string(),
             span,
@@ -1026,6 +1028,63 @@ fn apply_builtin(name: &str, args: &[Value], span: Span, env: &Env) -> Result<Va
     }
 }
 
+
+/// Call a zero-argument thunk (closure).
+fn call_thunk(thunk: &Value, span: Span, _env: &Env) -> Result<Value, EvalError> {
+    match thunk {
+        Value::Closure {
+            ref params,
+            ref rest_param,
+            ref body,
+            env: ref closure_env,
+        } => {
+            let local_env = bind_closure_args(params, rest_param, &[], closure_env, span)?;
+            eval(body, &local_env)
+        }
+        other => Err(EvalError::TypeMismatch {
+            expected: "procedure".to_string(),
+            got: other.to_string(),
+            span: other.span(),
+        }),
+    }
+}
+
+fn builtin_reverse(args: &[Value], span: Span) -> Result<Value, EvalError> {
+    if args.len() != 1 {
+        return Err(EvalError::WrongArgCount {
+            expected: "1".to_string(),
+            got: args.len(),
+            span,
+        });
+    }
+    let Value::List(elems, _) = &args[0] else {
+        return Err(EvalError::TypeMismatch {
+            expected: "list".to_string(),
+            got: args[0].to_string(),
+            span: args[0].span(),
+        });
+    };
+    let reversed: Vec<Value> = elems.iter().rev().cloned().collect();
+    Ok(Value::list(reversed))
+}
+
+fn builtin_dynamic_wind(args: &[Value], span: Span, env: &Env) -> Result<Value, EvalError> {
+    if args.len() != 3 {
+        return Err(EvalError::WrongArgCount {
+            expected: "3".to_string(),
+            got: args.len(),
+            span,
+        });
+    }
+    let in_thunk = &args[0];
+    let body_thunk = &args[1];
+    let out_thunk = &args[2];
+
+    call_thunk(in_thunk, span, env)?;
+    let body_result = call_thunk(body_thunk, span, env);
+    call_thunk(out_thunk, span, env)?;
+    body_result
+}
 
 fn eval_define(args: &[Value], form_span: Span, env: &Env) -> Result<Value, EvalError> {
     if args.len() < 2 {
