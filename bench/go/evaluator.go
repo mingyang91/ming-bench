@@ -1,6 +1,10 @@
 package ming
 
-import "fmt"
+import (
+	"fmt"
+	"strconv"
+	"strings"
+)
 
 // evalErr creates an EvalError with position info from an expression.
 func evalErr(expr *Value, msg string) *EvalError {
@@ -442,7 +446,7 @@ func compareInts(args []*Value, cmp func(int64, int64) bool) (*Value, error) {
 }
 
 // builtinEnv creates the top-level environment with builtin procedure names.
-func builtinEnv() *Env {
+func builtinEnv(out *strings.Builder) *Env {
 	env := newEnv(nil)
 	builtinDefs := map[string]func([]*Value) (*Value, error){
 		"+":   func(args []*Value) (*Value, error) { return applyBuiltin("+", args) },
@@ -548,6 +552,97 @@ func builtinEnv() *Env {
 			}
 			return makeBool(args[0].Type == TypeSymbol), nil
 		},
+		"display": func(args []*Value) (*Value, error) {
+			if len(args) != 1 {
+				return nil, &EvalError{Message: "'display' expects exactly one argument"}
+			}
+			out.WriteString(args[0].DisplayPlain())
+			return voidValue, nil
+		},
+		"write": func(args []*Value) (*Value, error) {
+			if len(args) != 1 {
+				return nil, &EvalError{Message: "'write' expects exactly one argument"}
+			}
+			out.WriteString(args[0].WriteRepr())
+			return voidValue, nil
+		},
+		"newline": func(args []*Value) (*Value, error) {
+			out.WriteString("\n")
+			return voidValue, nil
+		},
+		"string-append": func(args []*Value) (*Value, error) {
+			var sb strings.Builder
+			for _, a := range args {
+				if a.Type != TypeString {
+					return nil, &EvalError{Message: "'string-append' expects strings"}
+				}
+				sb.WriteString(a.Str)
+			}
+			return makeString(sb.String()), nil
+		},
+		"string-length": func(args []*Value) (*Value, error) {
+			if len(args) != 1 || args[0].Type != TypeString {
+				return nil, &EvalError{Message: "'string-length' expects a string"}
+			}
+			return makeInt(int64(len([]rune(args[0].Str)))), nil
+		},
+		"substring": func(args []*Value) (*Value, error) {
+			if len(args) != 3 || args[0].Type != TypeString || args[1].Type != TypeInteger || args[2].Type != TypeInteger {
+				return nil, &EvalError{Message: "'substring' expects a string and two integers"}
+			}
+			runes := []rune(args[0].Str)
+			start := int(args[1].Int)
+			end := int(args[2].Int)
+			if start < 0 || end > len(runes) || start > end {
+				return nil, &EvalError{Message: "'substring' index out of range"}
+			}
+			return makeString(string(runes[start:end])), nil
+		},
+		"string->number": func(args []*Value) (*Value, error) {
+			if len(args) != 1 || args[0].Type != TypeString {
+				return nil, &EvalError{Message: "'string->number' expects a string"}
+			}
+			n, err := strconv.ParseInt(args[0].Str, 10, 64)
+			if err != nil {
+				return makeBool(false), nil
+			}
+			return makeInt(n), nil
+		},
+		"number->string": func(args []*Value) (*Value, error) {
+			if len(args) != 1 || args[0].Type != TypeInteger {
+				return nil, &EvalError{Message: "'number->string' expects a number"}
+			}
+			return makeString(strconv.FormatInt(args[0].Int, 10)), nil
+		},
+		"symbol->string": func(args []*Value) (*Value, error) {
+			if len(args) != 1 || args[0].Type != TypeSymbol {
+				return nil, &EvalError{Message: "'symbol->string' expects a symbol"}
+			}
+			return makeString(args[0].Str), nil
+		},
+		"string->symbol": func(args []*Value) (*Value, error) {
+			if len(args) != 1 || args[0].Type != TypeString {
+				return nil, &EvalError{Message: "'string->symbol' expects a string"}
+			}
+			return makeSymbol(args[0].Str), nil
+		},
+		"string-ref": func(args []*Value) (*Value, error) {
+			if len(args) != 2 || args[0].Type != TypeString || args[1].Type != TypeInteger {
+				return nil, &EvalError{Message: "'string-ref' expects a string and an integer"}
+			}
+			runes := []rune(args[0].Str)
+			idx := int(args[1].Int)
+			if idx < 0 || idx >= len(runes) {
+				return nil, &EvalError{Message: "'string-ref' index out of range"}
+			}
+			return makeChar(runes[idx]), nil
+		},
+		"char?": func(args []*Value) (*Value, error) {
+			if len(args) != 1 {
+				return nil, &EvalError{Message: "'char?' expects exactly one argument"}
+			}
+			return makeBool(args[0].Type == TypeChar), nil
+		},
 	}
 	for name, fn := range builtinDefs {
 		env.set(name, makeBuiltin(name, fn))
@@ -558,35 +653,41 @@ func builtinEnv() *Env {
 // EvalStr evaluates one or more Scheme expressions and returns the string
 // representation of the last result.
 func EvalStr(input string) (string, error) {
-	exprs, err := readAll(input)
-	if err != nil {
-		if ee, ok := err.(*EvalError); ok {
-			return "", ee
-		}
-		return "", &EvalError{Message: err.Error()}
-	}
-	if len(exprs) == 0 {
-		return "", &EvalError{Message: "no expressions"}
-	}
-
-	env := builtinEnv()
-	var result *Value
-	for _, expr := range exprs {
-		result, err = eval(expr, env)
-		if err != nil {
-			return "", err
-		}
-	}
-
-	if result.Type == TypeVoid {
-		return "", nil
-	}
-	return result.Display(), nil
+	r, _, err := evalWithOutput(input)
+	return r, err
 }
 
 // EvalStrWithOutput evaluates Scheme expressions and returns both the result
 // string and any captured output from display/write/newline.
 func EvalStrWithOutput(input string) (result string, output string, err error) {
-	r, err := EvalStr(input)
-	return r, "", err
+	return evalWithOutput(input)
+}
+
+func evalWithOutput(input string) (string, string, error) {
+	exprs, err := readAll(input)
+	if err != nil {
+		if ee, ok := err.(*EvalError); ok {
+			return "", "", ee
+		}
+		return "", "", &EvalError{Message: err.Error()}
+	}
+	if len(exprs) == 0 {
+		return "", "", &EvalError{Message: "no expressions"}
+	}
+
+	var out strings.Builder
+	env := builtinEnv(&out)
+	var result *Value
+	for _, expr := range exprs {
+		result, err = eval(expr, env)
+		if err != nil {
+			return "", "", err
+		}
+	}
+
+	r := ""
+	if result.Type != TypeVoid {
+		r = result.Display()
+	}
+	return r, out.String(), nil
 }

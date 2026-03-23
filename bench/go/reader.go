@@ -20,6 +20,7 @@ const (
 	TypeVoid
 	TypeLambda
 	TypeBuiltin
+	TypeChar
 )
 
 // Value represents a Scheme value.
@@ -48,6 +49,7 @@ func makeInt(n int64) *Value    { return &Value{Type: TypeInteger, Int: n} }
 func makeBool(b bool) *Value    { return &Value{Type: TypeBoolean, Bool: b} }
 func makeString(s string) *Value { return &Value{Type: TypeString, Str: s} }
 func makeSymbol(s string) *Value { return &Value{Type: TypeSymbol, Str: s} }
+func makeChar(c rune) *Value     { return &Value{Type: TypeChar, Int: int64(c)} }
 func makePair(car, cdr *Value) *Value {
 	return &Value{Type: TypePair, Car: car, Cdr: cdr}
 }
@@ -75,9 +77,28 @@ func (v *Value) Display() string {
 		return "#<procedure>"
 	case TypeBuiltin:
 		return fmt.Sprintf("#<builtin %s>", v.Str)
+	case TypeChar:
+		return fmt.Sprintf("#\\%c", rune(v.Int))
 	default:
 		return ""
 	}
+}
+
+// DisplayPlain returns the display representation (no quotes on strings).
+func (v *Value) DisplayPlain() string {
+	switch v.Type {
+	case TypeString:
+		return v.Str
+	case TypeChar:
+		return string(rune(v.Int))
+	default:
+		return v.Display()
+	}
+}
+
+// WriteRepr returns the write representation (strings quoted).
+func (v *Value) WriteRepr() string {
+	return v.Display()
 }
 
 func displayList(v *Value) string {
