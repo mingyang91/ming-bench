@@ -6,6 +6,13 @@ use crate::scheme::env::Env;
 use crate::scheme::error::Span;
 
 #[derive(Debug, Clone)]
+pub struct SyntaxRules {
+    pub literals: Vec<String>,
+    pub rules: Vec<(Value, Value)>,
+    pub def_env: Env,
+}
+
+#[derive(Debug, Clone)]
 pub enum Value {
     Integer(i64, Span),
     Boolean(bool, Span),
@@ -20,6 +27,7 @@ pub enum Value {
         env: Env,
     },
     Continuation(u64),
+    Macro(SyntaxRules),
     Void,
 }
 
@@ -64,6 +72,7 @@ impl fmt::Display for Value {
             }
             Value::Closure { .. } => write!(f, "#<procedure>"),
             Value::Continuation(_) => write!(f, "#<continuation>"),
+            Value::Macro(_) => write!(f, "#<macro>"),
             Value::Void => write!(f, "#<void>"),
         }
     }
@@ -86,7 +95,13 @@ impl Value {
                 out.push(')');
                 out
             }
-            other => other.to_string(),
+            Value::Integer(_, _)
+            | Value::Boolean(_, _)
+            | Value::Symbol(_, _)
+            | Value::Closure { .. }
+            | Value::Continuation(_)
+            | Value::Macro(_)
+            | Value::Void => self.to_string(),
         }
     }
 }
@@ -102,6 +117,7 @@ impl Value {
             | Value::List(_, s) => *s,
             Value::Closure { .. } => Span::default(),
             Value::Continuation(_) => Span::default(),
+            Value::Macro(_) => Span::default(),
             Value::Void => Span::default(),
         }
     }

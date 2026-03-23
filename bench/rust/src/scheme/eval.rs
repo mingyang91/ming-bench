@@ -1,5 +1,6 @@
 use crate::scheme::env::Env;
 use crate::scheme::error::{EvalError, Span};
+use crate::scheme::macros;
 use crate::scheme::value::Value;
 
 /// Evaluate non-tail expressions of `and`. Returns `Some(value)` for short-circuit, `None` for tail.
@@ -153,7 +154,8 @@ pub fn eval(expr: &Value, env: &Env) -> Result<Value, EvalError> {
             | Value::String(_, _)
             | Value::Char(_, _)
             | Value::Closure { .. }
-            | Value::Continuation(_) => return Ok(current_expr),
+            | Value::Continuation(_)
+            | Value::Macro(_) => return Ok(current_expr),
             Value::Symbol(name, span) => {
                 if let Some(val) = current_env.get(name) {
                     return Ok(val);
@@ -306,7 +308,16 @@ pub fn eval(expr: &Value, env: &Env) -> Result<Value, EvalError> {
                                 }
                             }
                         }
-                        _ => {}
+                        "define-syntax" => {
+                            return eval_define_syntax(&elems[1..], list_span, &current_env);
+                        }
+                        _ => {
+                            // Check for macro application
+                            if let Some(Value::Macro(ref sr)) = current_env.get(name) {
+                                current_expr = macros::expand_macro(sr, elems)?;
+                                continue;
+                            }
+                        }
                     }
                 }
 
@@ -721,6 +732,90 @@ fn eval_define(args: &[Value], form_span: Span, env: &Env) -> Result<Value, Eval
             span: other.span(),
         }),
     }
+}
+
+fn eval_define_syntax(args: &[Value], form_span: Span, env: &Env) -> Result<Value, EvalError> {
+    if args.len() != 2 {
+        return Err(EvalError::WrongArgCount {
+            expected: "2".to_string(),
+            got: args.len(),
+            span: form_span,
+        });
+    }
+    let Value::Symbol(name, _) = &args[0] else {
+        return Err(EvalError::TypeMismatch {
+            expected: "symbol".to_string(),
+            got: args[0].to_string(),
+            span: args[0].span(),
+        });
+    };
+    let Value::List(sr_elems, _) = &args[1] else {
+        return Err(EvalError::TypeMismatch {
+            expected: "syntax-rules form".to_string(),
+            got: args[1].to_string(),
+            span: args[1].span(),
+        });
+    };
+    if sr_elems.is_empty() {
+        return Err(EvalError::Parse {
+            message: "empty syntax-rules".to_string(),
+            span: form_span,
+        });
+    }
+    let Value::Symbol(sr_keyword, _) = &sr_elems[0] else {
+        return Err(EvalError::Parse {
+            message: "expected syntax-rules".to_string(),
+            span: sr_elems[0].span(),
+        });
+    };
+    if sr_keyword != "syntax-rules" {
+        return Err(EvalError::Parse {
+            message: format!("expected syntax-rules, got {sr_keyword}"),
+            span: sr_elems[0].span(),
+        });
+    }
+    let Value::List(literals_list, _) = &sr_elems[1] else {
+        return Err(EvalError::TypeMismatch {
+            expected: "literals list".to_string(),
+            got: sr_elems[1].to_string(),
+            span: sr_elems[1].span(),
+        });
+    };
+    let literals: Vec<String> = literals_list
+        .iter()
+        .filter_map(|v| {
+            if let Value::Symbol(s, _) = v {
+                Some(s.clone())
+            } else {
+                None
+            }
+        })
+        .collect();
+    let mut rules = Vec::new();
+    for rule in &sr_elems[2..] {
+        let Value::List(rule_parts, _) = rule else {
+            return Err(EvalError::TypeMismatch {
+                expected: "syntax rule".to_string(),
+                got: rule.to_string(),
+                span: rule.span(),
+            });
+        };
+        if rule_parts.len() != 2 {
+            return Err(EvalError::WrongArgCount {
+                expected: "2".to_string(),
+                got: rule_parts.len(),
+                span: rule.span(),
+            });
+        }
+        rules.push((rule_parts[0].clone(), rule_parts[1].clone()));
+    }
+    let syntax_rules = crate::scheme::value::SyntaxRules {
+        literals,
+        rules,
+        def_env: env.clone(),
+    };
+    env.define(name.clone(), Value::Macro(syntax_rules));
+    Ok(Value::Void)
 }
 
 fn eval_quote(args: &[Value], form_span: Span) -> Result<Value, EvalError> {

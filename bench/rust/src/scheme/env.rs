@@ -167,6 +167,14 @@ impl Env {
         id
     }
 
+    /// Generate a unique symbol name for macro hygiene.
+    pub fn gensym(&self, prefix: &str) -> String {
+        let mut store = self.cont_store.borrow_mut();
+        let id = store.next_id;
+        store.next_id += 1;
+        format!("{prefix}__{id}")
+    }
+
     /// Find replay data for a continuation that matches the given env.
     pub(crate) fn get_replay_for_env(&self, cont_id: u64, target_env: &Env) -> Option<ReplayLevel> {
         let store = self.cont_store.borrow();
