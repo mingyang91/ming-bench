@@ -226,6 +226,37 @@ public class Evaluator {
             if (!(args.getFirst() instanceof SchemeValue.StringVal s)) throw new EvalError("string-copy: not a string");
             return new SchemeValue.StringVal(s.value());
         }));
+        // apply
+        env.define("apply", new SchemeValue.BuiltinVal("apply", args -> {
+            if (args.size() < 2) throw new EvalError("apply requires at least 2 arguments");
+            SchemeValue proc = args.getFirst();
+            // Collect prefix args + flatten last arg (must be a list)
+            List<SchemeValue> callArgs = new ArrayList<>();
+            for (int i = 1; i < args.size() - 1; i++) {
+                callArgs.add(args.get(i));
+            }
+            SchemeValue last = args.getLast();
+            while (last instanceof SchemeValue.PairVal p) {
+                callArgs.add(p.car());
+                last = p.cdr();
+            }
+            if (!(last instanceof SchemeValue.NilVal)) {
+                throw new EvalError("apply: last argument must be a proper list");
+            }
+            if (proc instanceof SchemeValue.BuiltinVal builtin) {
+                return builtin.func().apply(callArgs);
+            }
+            if (proc instanceof SchemeValue.LambdaVal lambda) {
+                Environment callEnv = applyLambdaEnv(lambda, callArgs, "apply");
+                SchemeValue result = null;
+                for (SchemeValue bodyExpr : lambda.body()) {
+                    result = eval(bodyExpr, callEnv);
+                }
+                return result;
+            }
+            throw new EvalError("apply: not a procedure");
+        }));
+
         env.define("string-set!", new SchemeValue.BuiltinVal("string-set!", args -> {
             if (args.size() != 3) throw new EvalError("string-set! requires 3 arguments");
             if (!(args.get(0) instanceof SchemeValue.StringVal s)) throw new EvalError("string-set!: not a string");
@@ -434,13 +465,7 @@ public class Evaluator {
                         }
                     }
                     if (proc instanceof SchemeValue.LambdaVal lambda) {
-                        if (lambda.params().size() != args.size()) {
-                            throw new EvalError("Expected " + lambda.params().size() + " arguments, got " + args.size() + " at " + pos);
-                        }
-                        Environment callEnv = new Environment(lambda.env());
-                        for (int i = 0; i < lambda.params().size(); i++) {
-                            callEnv.define(lambda.params().get(i), args.get(i));
-                        }
+                        Environment callEnv = applyLambdaEnv(lambda, args, pos);
                         for (int i = 0; i < lambda.body().size() - 1; i++) {
                             eval(lambda.body().get(i), callEnv);
                         }
@@ -468,14 +493,23 @@ public class Evaluator {
                 throw new EvalError("define: expected symbol as function name");
             }
             List<String> params = new ArrayList<>();
+            String restParam = null;
             for (int i = 1; i < parts.size(); i++) {
+                if (parts.get(i) instanceof SchemeValue.SymbolVal p && p.name().equals(".")) {
+                    if (i + 1 >= parts.size()) throw new EvalError("define: expected symbol after dot");
+                    if (!(parts.get(i + 1) instanceof SchemeValue.SymbolVal rest)) {
+                        throw new EvalError("define: expected symbol after dot");
+                    }
+                    restParam = rest.name();
+                    break;
+                }
                 if (!(parts.get(i) instanceof SchemeValue.SymbolVal p)) {
                     throw new EvalError("define: expected symbol as parameter");
                 }
                 params.add(p.name());
             }
             List<SchemeValue> body = elems.subList(2, elems.size());
-            SchemeValue.LambdaVal lambda = new SchemeValue.LambdaVal(params, body, env);
+            SchemeValue.LambdaVal lambda = new SchemeValue.LambdaVal(params, restParam, body, env);
             env.define(fnName.name(), lambda);
             return new SchemeValue.VoidVal();
         }
@@ -502,14 +536,49 @@ public class Evaluator {
             throw new EvalError("lambda: expected parameter list");
         }
         List<String> params = new ArrayList<>();
-        for (SchemeValue p : paramList.elements()) {
-            if (!(p instanceof SchemeValue.SymbolVal sym)) {
+        String restParam = null;
+        List<SchemeValue> pElems = paramList.elements();
+        for (int i = 0; i < pElems.size(); i++) {
+            if (pElems.get(i) instanceof SchemeValue.SymbolVal sym && sym.name().equals(".")) {
+                if (i + 1 >= pElems.size()) throw new EvalError("lambda: expected symbol after dot");
+                if (!(pElems.get(i + 1) instanceof SchemeValue.SymbolVal rest)) {
+                    throw new EvalError("lambda: expected symbol after dot");
+                }
+                restParam = rest.name();
+                break;
+            }
+            if (!(pElems.get(i) instanceof SchemeValue.SymbolVal sym)) {
                 throw new EvalError("lambda: expected symbol as parameter");
             }
             params.add(sym.name());
         }
         List<SchemeValue> body = elems.subList(2, elems.size());
-        return new SchemeValue.LambdaVal(params, body, env);
+        return new SchemeValue.LambdaVal(params, restParam, body, env);
+    }
+
+    private Environment applyLambdaEnv(SchemeValue.LambdaVal lambda, List<SchemeValue> args, String pos) throws EvalError {
+        int required = lambda.params().size();
+        if (lambda.restParam() != null) {
+            if (args.size() < required) {
+                throw new EvalError("Expected at least " + required + " arguments, got " + args.size() + " at " + pos);
+            }
+        } else {
+            if (args.size() != required) {
+                throw new EvalError("Expected " + required + " arguments, got " + args.size() + " at " + pos);
+            }
+        }
+        Environment callEnv = new Environment(lambda.env());
+        for (int i = 0; i < required; i++) {
+            callEnv.define(lambda.params().get(i), args.get(i));
+        }
+        if (lambda.restParam() != null) {
+            SchemeValue rest = SchemeValue.NIL;
+            for (int i = args.size() - 1; i >= required; i--) {
+                rest = new SchemeValue.PairVal(args.get(i), rest);
+            }
+            callEnv.define(lambda.restParam(), rest);
+        }
+        return callEnv;
     }
 
     private long requireInt(SchemeValue val) throws EvalError {

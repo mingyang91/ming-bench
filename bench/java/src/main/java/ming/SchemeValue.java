@@ -22,7 +22,11 @@ public sealed interface SchemeValue {
     }
     record PairVal(SchemeValue car, SchemeValue cdr) implements SchemeValue {}
     record NilVal() implements SchemeValue {}
-    record LambdaVal(List<String> params, List<SchemeValue> body, Environment env) implements SchemeValue {}
+    record LambdaVal(List<String> params, String restParam, List<SchemeValue> body, Environment env) implements SchemeValue {
+        LambdaVal(List<String> params, List<SchemeValue> body, Environment env) {
+            this(params, null, body, env);
+        }
+    }
     record CharVal(char value) implements SchemeValue {}
     record VoidVal() implements SchemeValue {}
 
