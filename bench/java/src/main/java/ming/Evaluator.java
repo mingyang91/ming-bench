@@ -29,11 +29,12 @@ public class Evaluator {
     private int windCounter = 0;
 
     private int gensymCounter = 0;
+    private int recordTypeCounter = 0;
 
     private static final Set<String> SPECIAL_FORMS = Set.of(
         "define", "if", "quote", "lambda", "let", "begin", "cond", "set!",
         "and", "or", "define-syntax", "syntax-rules",
-        "letrec", "letrec*", "case", "do", "guard"
+        "letrec", "letrec*", "case", "do", "guard", "define-record-type"
     );
 
     private static final String[] BUILTIN_NAMES = {
@@ -239,6 +240,7 @@ public class Evaluator {
             case SchemeValue.ValuesVal v -> v;
             case SchemeValue.RationalVal v -> v;
             case SchemeValue.DoubleVal v -> v;
+            case SchemeValue.RecordVal v -> v;
             case SchemeValue.Thunk v -> v; // pass through
             case SchemeValue.SymbolVal v -> {
                 try {
@@ -281,6 +283,7 @@ public class Evaluator {
                 case "case" -> { return evalCaseTail(args, env, pos); }
                 case "do" -> { return evalDo(args, env, pos); }
                 case "guard" -> { return evalGuard(args, env, pos); }
+                case "define-record-type" -> { return evalDefineRecordType(args, env, pos); }
                 default -> {
                     SchemeValue builtinResult = tryBuiltin(op, args, env, pos);
                     if (builtinResult != null) return builtinResult;
@@ -561,6 +564,10 @@ public class Evaluator {
             case "inexact->exact" -> builtinInexactToExact(args, env, pos);
             case "numerator" -> builtinNumerator(args, env, pos);
             case "denominator" -> builtinDenominator(args, env, pos);
+            // L20: record builtins
+            case "__make-record__" -> builtinMakeRecord(args, env, pos);
+            case "__record-type?__" -> builtinRecordTypeQ(args, env, pos);
+            case "__record-ref__" -> builtinRecordRef(args, env, pos);
             default -> null;
         };
     }
@@ -2662,5 +2669,206 @@ public class Evaluator {
             }
         }
         return null;
+    }
+
+    // --- L20: Record builtins ---
+
+    private SchemeValue builtinMakeRecord(List<SchemeValue> args, Environment env, SourcePos pos) throws EvalError {
+        // (__make-record__ typeId typeName field-values...)
+        if (args.size() < 2) throw posError(pos, "__make-record__: need typeId and typeName");
+        SchemeValue tidVal = eval(args.get(0), env);
+        SchemeValue tnameVal = eval(args.get(1), env);
+        int tid = (int) ((SchemeValue.IntVal) tidVal).value();
+        String tname = ((SchemeValue.StringVal) tnameVal).value();
+        String[] fieldNames = new String[args.size() - 2];
+        SchemeValue[] fieldValues = new SchemeValue[args.size() - 2];
+        for (int i = 2; i < args.size(); i++) {
+            fieldValues[i - 2] = eval(args.get(i), env);
+            fieldNames[i - 2] = "";
+        }
+        return new SchemeValue.RecordVal(tname, tid, fieldNames, fieldValues, pos);
+    }
+
+    private SchemeValue builtinRecordTypeQ(List<SchemeValue> args, Environment env, SourcePos pos) throws EvalError {
+        // (__record-type?__ typeId value)
+        if (args.size() != 2) throw posError(pos, "__record-type?__: need typeId and value");
+        SchemeValue tidVal = eval(args.get(0), env);
+        SchemeValue val = eval(args.get(1), env);
+        int tid = (int) ((SchemeValue.IntVal) tidVal).value();
+        if (val instanceof SchemeValue.RecordVal rec && rec.typeId() == tid) {
+            return new SchemeValue.BoolVal(true, pos);
+        }
+        return new SchemeValue.BoolVal(false, pos);
+    }
+
+    private SchemeValue builtinRecordRef(List<SchemeValue> args, Environment env, SourcePos pos) throws EvalError {
+        // (__record-ref__ typeId fieldIndex value)
+        if (args.size() != 3) throw posError(pos, "__record-ref__: need typeId, fieldIndex, value");
+        SchemeValue tidVal = eval(args.get(0), env);
+        SchemeValue idxVal = eval(args.get(1), env);
+        SchemeValue val = eval(args.get(2), env);
+        int tid = (int) ((SchemeValue.IntVal) tidVal).value();
+        int idx = (int) ((SchemeValue.IntVal) idxVal).value();
+        if (!(val instanceof SchemeValue.RecordVal rec) || rec.typeId() != tid) {
+            throw posError(pos, "record accessor: expected record of correct type");
+        }
+        return rec.fieldValues()[idx];
+    }
+
+    // --- L20: define-record-type ---
+
+    private SchemeValue evalDefineRecordType(List<SchemeValue> args, Environment env, SourcePos pos) throws EvalError {
+        // (define-record-type <name> (constructor field ...) predicate (field accessor) ...)
+        if (args.size() < 3) throw posError(pos, "define-record-type: insufficient arguments");
+
+        // 1. Type name
+        if (!(args.get(0) instanceof SchemeValue.SymbolVal typeSym))
+            throw posError(pos, "define-record-type: type name must be a symbol");
+        String typeName = typeSym.name();
+        int typeId = recordTypeCounter++;
+
+        // 2. Constructor: (constructor-name field-name ...)
+        if (!(args.get(1) instanceof SchemeValue.ListVal ctorList) || ctorList.elements().isEmpty())
+            throw posError(pos, "define-record-type: constructor must be (name field ...)");
+        if (!(ctorList.elements().get(0) instanceof SchemeValue.SymbolVal ctorNameSym))
+            throw posError(pos, "define-record-type: constructor name must be a symbol");
+        String ctorName = ctorNameSym.name();
+        List<String> ctorFields = new ArrayList<>();
+        for (int i = 1; i < ctorList.elements().size(); i++) {
+            if (!(ctorList.elements().get(i) instanceof SchemeValue.SymbolVal fSym))
+                throw posError(pos, "define-record-type: constructor field must be a symbol");
+            ctorFields.add(fSym.name());
+        }
+
+        // 3. Predicate
+        if (!(args.get(2) instanceof SchemeValue.SymbolVal predSym))
+            throw posError(pos, "define-record-type: predicate must be a symbol");
+        String predName = predSym.name();
+
+        // 4. Field specs: (field-name accessor-name) ...
+        // Build a mapping from field name to its index in the constructor
+        String[] fieldNames = ctorFields.toArray(new String[0]);
+
+        // Parse field accessors
+        Map<String, Integer> fieldIndex = new java.util.HashMap<>();
+        for (int i = 0; i < fieldNames.length; i++) {
+            fieldIndex.put(fieldNames[i], i);
+        }
+
+        // Define constructor
+        final int tid = typeId;
+        final String tname = typeName;
+        final String[] fnames = fieldNames;
+        final int arity = ctorFields.size();
+
+        env.define(ctorName, new SchemeValue.BuiltinVal(ctorName));
+
+        // We need custom builtins. Let's register them via lambdas in the environment.
+        // Constructor: creates a RecordVal
+        List<String> ctorParams = new ArrayList<>(ctorFields);
+        // Build a lambda body that creates the record
+        // Actually, easier to just define as a LambdaVal that we handle specially,
+        // or define builtins inline. Let's use a simpler approach: define Java lambdas as LambdaVals.
+
+        // Actually the cleanest approach: define constructor, predicate, and accessors as LambdaVals
+        // whose bodies we handle in eval. But that's complex. Let's just add special builtins.
+
+        // Simplest: register named builtins and handle them in tryBuiltin or a record-specific handler.
+        // But tryBuiltin is a big switch. Let's use LambdaVals with special environments.
+
+        // Best approach: define them as regular lambdas that close over the typeId/fieldNames.
+        // We'll create wrapper lambdas in the environment.
+
+        // Constructor lambda
+        {
+            // Create a lambda: (lambda (f1 f2 ...) <creates-record>)
+            // We can't easily embed Java logic in a lambda body, so let's use a different approach:
+            // Store a special "record constructor" value that we recognize during application.
+
+            // Let's create a special BuiltinVal naming pattern and handle in applyBuiltin.
+            // Actually, let's just use environment-captured closures with a thunk trick.
+
+            // Simplest working approach: override apply to handle record constructors.
+            // We'll define a "RecordCtorVal" approach, but to avoid modifying SchemeValue further,
+            // let's store metadata in the Environment and use BuiltinVal with unique names.
+
+            // Actually, the cleanest minimal approach: create LambdaVal closures that construct records.
+            // The body will be a special marker we detect.
+
+            // Let me just define them properly using a callback pattern via the environment.
+        }
+
+        // OK, let me take a pragmatic approach: define record operations as LambdaVal with
+        // a body that is a special internal form.
+
+        // Constructor
+        Environment ctorEnv = new Environment(env);
+        ctorEnv.define("__record_type_id__", new SchemeValue.IntVal(tid, SourcePos.NONE));
+        ctorEnv.define("__record_type_name__", new SchemeValue.StringVal(tname, SourcePos.NONE));
+
+        // We'll use a special approach: store record info and handle via BuiltinVal matching.
+        // Let me just use unique builtin names like "__record_ctor_0__" and dispatch in tryBuiltin.
+
+        // Actually the SIMPLEST approach: use the environment to define lambdas that call back to Java.
+        // Since we can't easily do that with the current architecture, let me add a RecordCtorVal,
+        // RecordPredVal, RecordAccessorVal to SchemeValue. But sealed interface means we need to add them.
+
+        // The pragmatic approach is to create wrapper closures that use internal symbols.
+        // Let's define __make-record__ as a builtin.
+
+        // Let me just add a few record-specific builtins and handle them.
+        // Internal builtins: __make-record__, __record-type?__, __record-ref__
+
+        // Register constructor
+        String internalCtorName = "__record_ctor_" + tid + "__";
+        List<String> lambdaParams = new ArrayList<>(ctorFields);
+        // Body: (__make-record__ typeId typeName f1 f2 ...)
+        List<SchemeValue> makeArgs = new ArrayList<>();
+        makeArgs.add(new SchemeValue.SymbolVal("__make-record__", SourcePos.NONE));
+        makeArgs.add(new SchemeValue.IntVal(tid, SourcePos.NONE));
+        makeArgs.add(new SchemeValue.StringVal(tname, SourcePos.NONE));
+        for (String f : ctorFields) {
+            makeArgs.add(new SchemeValue.SymbolVal(f, SourcePos.NONE));
+        }
+        SchemeValue ctorBody = new SchemeValue.ListVal(makeArgs, SourcePos.NONE);
+        SchemeValue ctorLambda = new SchemeValue.LambdaVal(lambdaParams, null, List.of(ctorBody), env);
+        env.define(ctorName, ctorLambda);
+
+        // Register predicate
+        String predParam = "__pred_arg__";
+        List<SchemeValue> predArgs = new ArrayList<>();
+        predArgs.add(new SchemeValue.SymbolVal("__record-type?__", SourcePos.NONE));
+        predArgs.add(new SchemeValue.IntVal(tid, SourcePos.NONE));
+        predArgs.add(new SchemeValue.SymbolVal(predParam, SourcePos.NONE));
+        SchemeValue predBody = new SchemeValue.ListVal(predArgs, SourcePos.NONE);
+        SchemeValue predLambda = new SchemeValue.LambdaVal(List.of(predParam), null, List.of(predBody), env);
+        env.define(predName, predLambda);
+
+        // Register field accessors
+        for (int i = 3; i < args.size(); i++) {
+            if (!(args.get(i) instanceof SchemeValue.ListVal fieldSpec) || fieldSpec.elements().size() < 2)
+                throw posError(pos, "define-record-type: field spec must be (field-name accessor)");
+            if (!(fieldSpec.elements().get(0) instanceof SchemeValue.SymbolVal fieldNameSym))
+                throw posError(pos, "define-record-type: field name must be a symbol");
+            if (!(fieldSpec.elements().get(1) instanceof SchemeValue.SymbolVal accessorSym))
+                throw posError(pos, "define-record-type: accessor must be a symbol");
+
+            String fieldName = fieldNameSym.name();
+            String accessorName = accessorSym.name();
+            int idx = fieldIndex.getOrDefault(fieldName, -1);
+            if (idx == -1) throw posError(pos, "define-record-type: unknown field " + fieldName);
+
+            String accParam = "__acc_arg__";
+            List<SchemeValue> accArgs = new ArrayList<>();
+            accArgs.add(new SchemeValue.SymbolVal("__record-ref__", SourcePos.NONE));
+            accArgs.add(new SchemeValue.IntVal(tid, SourcePos.NONE));
+            accArgs.add(new SchemeValue.IntVal(idx, SourcePos.NONE));
+            accArgs.add(new SchemeValue.SymbolVal(accParam, SourcePos.NONE));
+            SchemeValue accBody = new SchemeValue.ListVal(accArgs, SourcePos.NONE);
+            SchemeValue accLambda = new SchemeValue.LambdaVal(List.of(accParam), null, List.of(accBody), env);
+            env.define(accessorName, accLambda);
+        }
+
+        return new SchemeValue.BoolVal(true, SourcePos.NONE);
     }
 }

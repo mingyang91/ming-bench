@@ -23,6 +23,7 @@ public sealed interface SchemeValue {
     record ValuesVal(List<SchemeValue> values) implements SchemeValue {}
     record RationalVal(long num, long den, SourcePos pos) implements SchemeValue {}
     record DoubleVal(double value, SourcePos pos) implements SchemeValue {}
+    record RecordVal(String typeName, int typeId, String[] fieldNames, SchemeValue[] fieldValues, SourcePos pos) implements SchemeValue {}
 
     default SourcePos sourcePos() {
         return switch (this) {
@@ -42,6 +43,7 @@ public sealed interface SchemeValue {
             case ValuesVal v -> SourcePos.NONE;
             case RationalVal v -> v.pos();
             case DoubleVal v -> v.pos();
+            case RecordVal v -> v.pos();
         };
     }
 
@@ -85,6 +87,7 @@ public sealed interface SchemeValue {
                 sb.append(')');
                 yield sb.toString();
             }
+            case RecordVal v -> "#<record:" + v.typeName() + ">";
         };
     }
 
