@@ -211,6 +211,10 @@ enum Value {
         field_name: String,
         field_index: usize,
     },
+    CaseLambda {
+        clauses: Vec<(Vec<String>, Option<String>, Vec<Expr>)>,
+        env: Env,
+    },
 }
 
 impl std::fmt::Debug for Value {
@@ -246,6 +250,7 @@ impl std::fmt::Debug for Value {
             Value::RecordConstructor { type_name, .. } => write!(f, "RecordConstructor({type_name})"),
             Value::RecordPredicate { type_id, .. } => write!(f, "RecordPredicate({type_id})"),
             Value::RecordAccessor { field_name, .. } => write!(f, "RecordAccessor({field_name})"),
+            Value::CaseLambda { .. } => write!(f, "CaseLambda(...)"),
             Value::SyntaxObject(_) => write!(f, "SyntaxObject(...)"),
             Value::MacroTransformer(_) => write!(f, "MacroTransformer(...)"),
         }
@@ -398,7 +403,7 @@ impl std::fmt::Display for Value {
                 }
                 write!(f, ")")
             }
-            Value::Lambda { .. } | Value::Builtin(..) | Value::CallCC | Value::DynamicWind | Value::SchemeApply | Value::Raise | Value::WithExceptionHandler | Value::Continuation(..) | Value::SchemeValues | Value::CallWithValues => write!(f, "#<procedure>"),
+            Value::Lambda { .. } | Value::Builtin(..) | Value::CallCC | Value::DynamicWind | Value::SchemeApply | Value::Raise | Value::WithExceptionHandler | Value::Continuation(..) | Value::SchemeValues | Value::CallWithValues | Value::CaseLambda { .. } => write!(f, "#<procedure>"),
             Value::Macro { .. } | Value::MacroTransformer(_) => write!(f, "#<macro>"),
             Value::SyntaxObject(_) => write!(f, "#<syntax>"),
             Value::MultipleValues(_) => write!(f, "#<values>"),
@@ -1029,7 +1034,7 @@ fn match_one(pat: &Expr, form: &Expr, literals: &[String], bindings: &mut HashMa
 }
 
 const SPECIAL_FORMS: &[&str] = &[
-    "if", "define", "lambda", "let", "let*", "letrec", "letrec*",
+    "if", "define", "lambda", "case-lambda", "let", "let*", "letrec", "letrec*",
     "set!", "begin", "quote", "and", "or", "cond", "case", "do", "when",
     "define-syntax", "syntax-rules", "syntax-case", "syntax", "with-syntax",
     "define-record-type",
@@ -1278,6 +1283,7 @@ fn step_eval(expr: Expr, env: Env, stack: &mut Vec<Frame>) -> Result<Act, EvalEr
                     }
                     "define" => return sf_define(&elems[1..], env, stack),
                     "lambda" => return eval_lambda(&elems[1..], &env).map(Act::Ret),
+                    "case-lambda" => return eval_case_lambda(&elems[1..], &env).map(Act::Ret),
                     "set!" => {
                         if elems.len() != 3 {
                             return Err(EvalError::Arity("set! expects 2 arguments".into()));
@@ -1815,6 +1821,28 @@ fn step_apply(func: Value, args: Vec<Value>, stack: &mut Vec<Frame>) -> Result<A
             }
             sf_seq(&body, local, stack)
         }
+        Value::CaseLambda { clauses, env } => {
+            for (params, rest_param, body) in &clauses {
+                let matches = if let Some(_) = rest_param {
+                    args.len() >= params.len()
+                } else {
+                    args.len() == params.len()
+                };
+                if matches {
+                    let local = new_env(Some(env.clone()));
+                    for (p, a) in params.iter().zip(&args) {
+                        env_set(&local, p.clone(), a.clone());
+                    }
+                    if let Some(rest) = rest_param {
+                        env_set(&local, rest.clone(), slice_to_list(&args[params.len()..]));
+                    }
+                    return sf_seq(body, local, stack);
+                }
+            }
+            Err(EvalError::Arity(format!(
+                "no matching case-lambda clause for {} arguments", args.len()
+            )))
+        }
         Value::Builtin(_, f) => f(&args).map(Act::Ret),
         Value::RecordConstructor { type_id, type_name, ctor_fields, field_names } => {
             if args.len() != ctor_fields.len() {
@@ -2016,6 +2044,28 @@ fn eval_lambda(args: &[Expr], env: &Env) -> Result<Value, EvalError> {
         body,
         env: env.clone(),
     })
+}
+
+fn eval_case_lambda(args: &[Expr], env: &Env) -> Result<Value, EvalError> {
+    let mut clauses = Vec::new();
+    for clause in args {
+        match &clause.kind {
+            ExprKind::List(elems) => {
+                if elems.len() < 2 {
+                    return Err(EvalError::Parse("case-lambda clause requires params and body".into()));
+                }
+                let (params, rest_param) = match &elems[0].kind {
+                    ExprKind::List(pelems) => parse_params(pelems)?,
+                    ExprKind::Symbol(s) => (vec![], Some(s.clone())),
+                    _ => return Err(EvalError::Type("case-lambda: expected parameter list".into())),
+                };
+                let body = elems[1..].to_vec();
+                clauses.push((params, rest_param, body));
+            }
+            _ => return Err(EvalError::Parse("case-lambda: expected clause list".into())),
+        }
+    }
+    Ok(Value::CaseLambda { clauses, env: env.clone() })
 }
 
 fn is_scheme_raise(e: &EvalError) -> bool {
@@ -2662,7 +2712,7 @@ fn builtin_type_pred(args: &[Value], name: &str) -> Result<Value, EvalError> {
         "symbol?" => matches!(&args[0], Value::Symbol(_)),
         "char?" => matches!(&args[0], Value::Char(_)),
         "vector?" => matches!(&args[0], Value::Vector(_)),
-        "procedure?" => matches!(&args[0], Value::Lambda { .. } | Value::Builtin(..) | Value::CallCC | Value::DynamicWind | Value::SchemeApply | Value::Continuation(..) | Value::SchemeValues | Value::CallWithValues | Value::RecordConstructor { .. } | Value::RecordPredicate { .. } | Value::RecordAccessor { .. }),
+        "procedure?" => matches!(&args[0], Value::Lambda { .. } | Value::Builtin(..) | Value::CallCC | Value::DynamicWind | Value::SchemeApply | Value::Continuation(..) | Value::SchemeValues | Value::CallWithValues | Value::RecordConstructor { .. } | Value::RecordPredicate { .. } | Value::RecordAccessor { .. } | Value::CaseLambda { .. }),
         _ => false,
     };
     Ok(Value::Boolean(result))
