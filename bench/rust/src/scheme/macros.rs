@@ -102,6 +102,8 @@ fn match_single(
         }
         Value::Bool(a) => matches!(input, Value::Bool(b) if a == b),
         Value::Int(a) => matches!(input, Value::Int(b) if a == b),
+        Value::Float(a) => matches!(input, Value::Float(b) if a == b),
+        Value::Rational(an, ad) => matches!(input, Value::Rational(bn, bd) if an == bn && ad == bd),
         Value::String(a) => matches!(input, Value::String(b) if a == b),
         Value::Char(a) => matches!(input, Value::Char(b) if a == b),
         Value::Pair(_, _) | Value::Builtin(_) | Value::Closure { .. }
@@ -192,7 +194,8 @@ fn expand_template(
             }
             Ok(Value::List(result, *span))
         }
-        Value::Int(_) | Value::Bool(_) | Value::String(_) | Value::Char(_)
+        Value::Int(_) | Value::Float(_) | Value::Rational(_, _)
+        | Value::Bool(_) | Value::String(_) | Value::Char(_)
         | Value::Pair(_, _) | Value::Builtin(_) | Value::Closure { .. }
         | Value::Continuation(_) | Value::SyntaxRules { .. }
         | Value::Vector(_) | Value::Values(_) | Value::Void => Ok(template.clone()),
@@ -216,7 +219,8 @@ fn find_ellipsis_var(template: &Value, bindings: &HashMap<String, Binding>) -> O
             }
             None
         }
-        Value::Int(_) | Value::Bool(_) | Value::String(_) | Value::Char(_)
+        Value::Int(_) | Value::Float(_) | Value::Rational(_, _)
+        | Value::Bool(_) | Value::String(_) | Value::Char(_)
         | Value::Pair(_, _) | Value::Builtin(_) | Value::Closure { .. }
         | Value::Continuation(_) | Value::SyntaxRules { .. }
         | Value::Vector(_) | Value::Values(_) | Value::Void => None,

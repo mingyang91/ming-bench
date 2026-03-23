@@ -13,6 +13,8 @@ pub struct Span {
 #[derive(Debug, Clone)]
 pub enum Value {
     Int(i64),
+    Float(f64),
+    Rational(i64, i64),
     Bool(bool),
     String(String),
     Char(char),
@@ -41,7 +43,8 @@ impl Value {
     pub fn span(&self) -> Option<Span> {
         match self {
             Value::Symbol(_, span) | Value::List(_, span) => *span,
-            Value::Int(_) | Value::Bool(_) | Value::String(_) | Value::Char(_)
+            Value::Int(_) | Value::Float(_) | Value::Rational(_, _)
+            | Value::Bool(_) | Value::String(_) | Value::Char(_)
             | Value::Builtin(_) | Value::Closure { .. } | Value::Pair(_, _)
             | Value::Continuation(_) | Value::SyntaxRules { .. }
             | Value::Vector(_) | Value::Values(_) | Value::Void => None,
@@ -53,6 +56,8 @@ impl PartialEq for Value {
     fn eq(&self, other: &Self) -> bool {
         match (self, other) {
             (Value::Int(a), Value::Int(b)) => a == b,
+            (Value::Float(a), Value::Float(b)) => a == b,
+            (Value::Rational(an, ad), Value::Rational(bn, bd)) => an == bn && ad == bd,
             (Value::Bool(a), Value::Bool(b)) => a == b,
             (Value::String(a), Value::String(b)) => a == b,
             (Value::Char(a), Value::Char(b)) => a == b,
@@ -67,6 +72,8 @@ impl PartialEq for Value {
             (Value::Vector(a), Value::Vector(b)) => *a.borrow() == *b.borrow(),
             (Value::Values(a), Value::Values(b)) => a == b,
             (Value::Int(_), _)
+            | (Value::Float(_), _)
+            | (Value::Rational(_, _), _)
             | (Value::Bool(_), _)
             | (Value::String(_), _)
             | (Value::Char(_), _)
@@ -88,6 +95,14 @@ impl fmt::Display for Value {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Value::Int(n) => write!(f, "{n}"),
+            Value::Float(v) => {
+                if *v == v.floor() && v.is_finite() {
+                    write!(f, "{v:.1}")
+                } else {
+                    write!(f, "{v}")
+                }
+            }
+            Value::Rational(n, d) => write!(f, "{n}/{d}"),
             Value::Bool(true) => write!(f, "#t"),
             Value::Bool(false) => write!(f, "#f"),
             Value::String(s) => write!(f, "\"{s}\""),

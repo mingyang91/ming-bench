@@ -27,6 +27,8 @@ enum TokenKind {
     Quote,
     Symbol(String),
     Int(i64),
+    Float(f64),
+    Rational(i64, i64),
     Bool(bool),
     Str(String),
     Char(char),
@@ -172,6 +174,10 @@ fn tokenize(input: &str) -> Result<Vec<Token>, EvalError> {
                 let word: String = chars[start..i].iter().collect();
                 if let Ok(n) = word.parse::<i64>() {
                     tokens.push(Token { kind: TokenKind::Int(n), line, col: start_col });
+                } else if let Some(kind) = try_parse_rational(&word) {
+                    tokens.push(Token { kind, line, col: start_col });
+                } else if let Some(kind) = try_parse_float(&word) {
+                    tokens.push(Token { kind, line, col: start_col });
                 } else {
                     tokens.push(Token { kind: TokenKind::Symbol(word), line, col: start_col });
                 }
@@ -189,6 +195,8 @@ fn parse_expr(tokens: &[Token], pos: usize) -> Result<(Value, usize), EvalError>
     let span = Span { line: token.line, col: token.col };
     match &token.kind {
         TokenKind::Int(n) => Ok((Value::Int(*n), pos + 1)),
+        TokenKind::Float(f) => Ok((Value::Float(*f), pos + 1)),
+        TokenKind::Rational(n, d) => Ok((make_rational_value(*n, *d), pos + 1)),
         TokenKind::Bool(b) => Ok((Value::Bool(*b), pos + 1)),
         TokenKind::Str(s) => Ok((Value::String(s.clone()), pos + 1)),
         TokenKind::Char(c) => Ok((Value::Char(*c), pos + 1)),
@@ -218,4 +226,54 @@ fn parse_expr(tokens: &[Token], pos: usize) -> Result<(Value, usize), EvalError>
         }
         TokenKind::RParen => Err(EvalError::Parse { msg: "unexpected ')'".into() }),
     }
+}
+
+fn gcd(a: i64, b: i64) -> i64 {
+    let (mut a, mut b) = (a.abs(), b.abs());
+    while b != 0 {
+        let t = b;
+        b = a % b;
+        a = t;
+    }
+    a
+}
+
+fn make_rational_value(n: i64, d: i64) -> Value {
+    let sign = if d < 0 { -1 } else { 1 };
+    let n = n * sign;
+    let d = d.abs();
+    let g = gcd(n.abs(), d);
+    let n = n / g;
+    let d = d / g;
+    if d == 1 { Value::Int(n) } else { Value::Rational(n, d) }
+}
+
+fn try_parse_rational(word: &str) -> Option<TokenKind> {
+    let (neg, rest) = if let Some(stripped) = word.strip_prefix('-') {
+        (true, stripped)
+    } else if let Some(stripped) = word.strip_prefix('+') {
+        (false, stripped)
+    } else {
+        (false, word)
+    };
+    let parts: Vec<&str> = rest.splitn(2, '/').collect();
+    if parts.len() != 2 {
+        return None;
+    }
+    let n = parts[0].parse::<i64>().ok()?;
+    let d = parts[1].parse::<i64>().ok()?;
+    if d == 0 {
+        return None;
+    }
+    let n = if neg { -n } else { n };
+    Some(TokenKind::Rational(n, d))
+}
+
+fn try_parse_float(word: &str) -> Option<TokenKind> {
+    // Must contain a dot to be a float literal
+    if !word.contains('.') {
+        return None;
+    }
+    let f = word.parse::<f64>().ok()?;
+    Some(TokenKind::Float(f))
 }
