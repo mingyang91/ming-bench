@@ -29,6 +29,7 @@ const (
 	valMultipleValues
 	valFloat
 	valRational
+	valRecord
 )
 
 type value struct {
@@ -69,6 +70,15 @@ type value struct {
 	vecval []*value
 	// multiple values
 	multiVals []*value
+	// record fields
+	recType   *recordType
+	recFields []*value
+}
+
+// recordType holds metadata for a define-record-type
+type recordType struct {
+	name       string   // e.g., "<point>"
+	fieldNames []string // field names in constructor order
 }
 
 var voidVal = &value{typ: valVoid}
@@ -213,6 +223,8 @@ func (v *value) String() string {
 		return s
 	case valRational:
 		return fmt.Sprintf("%d/%d", v.num, v.den)
+	case valRecord:
+		return fmt.Sprintf("#<%s>", v.recType.name)
 	}
 	return ""
 }
@@ -799,6 +811,9 @@ func (ip *interp) eval(e *expr, envir *env) (*value, error) {
 				case "define-syntax":
 					return ip.evalDefineSyntax(e, envir)
 
+				case "define-record-type":
+					return ip.evalDefineRecordType(e, envir)
+
 				case "dynamic-wind":
 					return ip.evalDynamicWind(e, envir)
 
@@ -1287,6 +1302,109 @@ func (ip *interp) evalDefine(e *expr, envir *env) (*value, error) {
 		return nil, err
 	}
 	envir.set(target.sval, val)
+	return voidVal, nil
+}
+
+// evalDefineRecordType implements R7RS define-record-type.
+// (define-record-type <name> (constructor field ...) predicate (field accessor) ...)
+func (ip *interp) evalDefineRecordType(e *expr, envir *env) (*value, error) {
+	if len(e.items) < 5 {
+		return nil, &EvalError{Message: fmt.Sprintf("%d:%d: define-record-type: bad syntax", e.line, e.col)}
+	}
+
+	// 1. Type name (e.g., <point>)
+	typeName := e.items[1].sval
+
+	// 2. Constructor clause: (make-point x y)
+	ctorExpr := e.items[2]
+	if ctorExpr.kind != "list" || len(ctorExpr.items) < 1 {
+		return nil, &EvalError{Message: fmt.Sprintf("%d:%d: define-record-type: bad constructor", e.line, e.col)}
+	}
+	ctorName := ctorExpr.items[0].sval
+	ctorFields := make([]string, len(ctorExpr.items)-1)
+	for i, f := range ctorExpr.items[1:] {
+		ctorFields[i] = f.sval
+	}
+
+	// 3. Predicate name
+	predName := e.items[3].sval
+
+	// 4. Field clauses: (field accessor) ...
+	// Build a map from field name -> accessor name
+	type fieldDef struct {
+		name     string
+		accessor string
+	}
+	var fields []fieldDef
+	for _, clause := range e.items[4:] {
+		if clause.kind != "list" || len(clause.items) < 2 {
+			return nil, &EvalError{Message: fmt.Sprintf("%d:%d: define-record-type: bad field spec", e.line, e.col)}
+		}
+		fields = append(fields, fieldDef{
+			name:     clause.items[0].sval,
+			accessor: clause.items[1].sval,
+		})
+	}
+
+	// Create record type metadata
+	rt := &recordType{
+		name:       typeName,
+		fieldNames: ctorFields,
+	}
+
+	// Build field-name -> index map
+	fieldIndex := make(map[string]int)
+	for i, fn := range ctorFields {
+		fieldIndex[fn] = i
+	}
+
+	// Define constructor
+	nFields := len(ctorFields)
+	envir.set(ctorName, &value{
+		typ: valBuiltin,
+		builtin: func(args []*value, line, col int) (*value, error) {
+			if len(args) != nFields {
+				return nil, &EvalError{Message: fmt.Sprintf("%d:%d: %s: expected %d arguments, got %d", line, col, ctorName, nFields, len(args))}
+			}
+			fv := make([]*value, nFields)
+			copy(fv, args)
+			return &value{typ: valRecord, recType: rt, recFields: fv}, nil
+		},
+	})
+
+	// Define predicate
+	envir.set(predName, &value{
+		typ: valBuiltin,
+		builtin: func(args []*value, line, col int) (*value, error) {
+			if len(args) != 1 {
+				return nil, &EvalError{Message: fmt.Sprintf("%d:%d: %s: expected 1 argument", line, col, predName)}
+			}
+			return boolVal(args[0].typ == valRecord && args[0].recType == rt), nil
+		},
+	})
+
+	// Define accessors
+	for _, fd := range fields {
+		idx, ok := fieldIndex[fd.name]
+		if !ok {
+			return nil, &EvalError{Message: fmt.Sprintf("%d:%d: define-record-type: field %s not in constructor", e.line, e.col, fd.name)}
+		}
+		accName := fd.accessor
+		fieldIdx := idx
+		envir.set(accName, &value{
+			typ: valBuiltin,
+			builtin: func(args []*value, line, col int) (*value, error) {
+				if len(args) != 1 {
+					return nil, &EvalError{Message: fmt.Sprintf("%d:%d: %s: expected 1 argument", line, col, accName)}
+				}
+				if args[0].typ != valRecord || args[0].recType != rt {
+					return nil, &EvalError{Message: fmt.Sprintf("%d:%d: %s: not a %s", line, col, accName, typeName)}
+				}
+				return args[0].recFields[fieldIdx], nil
+			},
+		})
+	}
+
 	return voidVal, nil
 }
 
