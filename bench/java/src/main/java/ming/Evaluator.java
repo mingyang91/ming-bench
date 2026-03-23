@@ -179,6 +179,11 @@ public class Evaluator {
         }
     }
 
+    private static class CaseLambda {
+        final List<Lambda> clauses;
+        CaseLambda(List<Lambda> clauses) { this.clauses = clauses; }
+    }
+
     // --- Macro support ---
 
     private static class SyntaxRulesMacro {
@@ -588,6 +593,51 @@ public class Evaluator {
                             body = beginBody;
                         }
                         return k.apply(new Lambda(params, restParam, body, env));
+                    }
+                    case "case-lambda" -> {
+                        if (list.size() < 2) throw posError("case-lambda: bad syntax");
+                        List<Lambda> clauses = new ArrayList<>();
+                        for (int ci = 1; ci < list.size(); ci++) {
+                            Object clauseObj = list.get(ci);
+                            if (clauseObj instanceof Located lc) clauseObj = lc.value();
+                            if (!(clauseObj instanceof List<?> clause) || clause.size() < 2)
+                                throw posError("case-lambda: bad clause");
+                            Object paramsExpr = clause.get(0);
+                            if (paramsExpr instanceof Located lp) paramsExpr = lp.value();
+                            List<String> params = new ArrayList<>();
+                            String restParam = null;
+                            if (paramsExpr instanceof List<?> paramList) {
+                                for (int pi = 0; pi < paramList.size(); pi++) {
+                                    Object p = paramList.get(pi);
+                                    if (p instanceof Located lpp) p = lpp.value();
+                                    if (!(p instanceof String ps)) throw posError("case-lambda: parameter must be a symbol");
+                                    if (ps.equals(".")) {
+                                        if (pi + 1 >= paramList.size()) throw posError("case-lambda: missing rest parameter after dot");
+                                        Object rp = paramList.get(pi + 1);
+                                        if (rp instanceof Located lrp) rp = lrp.value();
+                                        if (!(rp instanceof String rps)) throw posError("case-lambda: rest parameter must be a symbol");
+                                        restParam = rps;
+                                        break;
+                                    }
+                                    params.add(ps);
+                                }
+                            } else if (paramsExpr instanceof String restOnly) {
+                                restParam = restOnly;
+                            } else {
+                                throw posError("case-lambda: parameters must be a list or symbol");
+                            }
+                            Object body;
+                            if (clause.size() == 2) {
+                                body = clause.get(1);
+                            } else {
+                                List<Object> beginBody = new ArrayList<>();
+                                beginBody.add("begin");
+                                for (int i = 1; i < clause.size(); i++) beginBody.add(clause.get(i));
+                                body = beginBody;
+                            }
+                            clauses.add(new Lambda(params, restParam, body, env));
+                        }
+                        return k.apply(new CaseLambda(clauses));
                     }
                     case "and" -> {
                         if (list.size() == 1) return k.apply(Boolean.TRUE);
@@ -1529,6 +1579,18 @@ public class Evaluator {
             }
             return doWindTransition(windStack, cont.savedWind, () -> cont.k.apply(val));
         }
+        if (proc instanceof CaseLambda cl) {
+            Lambda matched = null;
+            for (Lambda clause : cl.clauses) {
+                if (clause.restParam != null) {
+                    if (args.size() >= clause.params.size()) { matched = clause; break; }
+                } else {
+                    if (args.size() == clause.params.size()) { matched = clause; break; }
+                }
+            }
+            if (matched == null) throw posError("case-lambda: no matching clause for " + args.size() + " arguments");
+            return applyProc(matched, args, k);
+        }
         if (proc instanceof Lambda lambda) {
             if (lambda.restParam != null) {
                 if (args.size() < lambda.params.size())
@@ -1725,7 +1787,7 @@ public class Evaluator {
             case "procedure?" -> {
                 requireArgCount(args, 1, "procedure?");
                 Object a = args.get(0);
-                yield a instanceof Lambda || a instanceof Continuation || a == CALL_CC || a instanceof NativeProc || (a instanceof String s && isPrimitive(s));
+                yield a instanceof Lambda || a instanceof CaseLambda || a instanceof Continuation || a == CALL_CC || a instanceof NativeProc || (a instanceof String s && isPrimitive(s));
             }
             case "display" -> {
                 requireArgCount(args, 1, "display");
