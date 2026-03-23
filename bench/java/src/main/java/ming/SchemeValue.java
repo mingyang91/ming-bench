@@ -17,11 +17,13 @@ public sealed interface SchemeValue {
         @Override public String display() { return "\"" + value + "\""; }
     }
 
-    record SymbolVal(String name) implements SchemeValue {
+    record SymbolVal(String name, int line, int col) implements SchemeValue {
+        public SymbolVal(String name) { this(name, 0, 0); }
         @Override public String display() { return name; }
     }
 
-    record ListVal(List<SchemeValue> elements) implements SchemeValue {
+    record ListVal(List<SchemeValue> elements, int line, int col) implements SchemeValue {
+        public ListVal(List<SchemeValue> elements) { this(elements, 0, 0); }
         @Override public String display() {
             if (elements.isEmpty()) return "()";
             var sb = new StringBuilder("(");

@@ -36,18 +36,20 @@ public class Parser {
         } else if (c == '#') {
             return parseHash();
         } else if (c == '\'') {
+            int[] lc = lineCol(pos);
             pos++;
             var quoted = parseExpr();
             var elems = new ArrayList<SchemeValue>();
-            elems.add(new SchemeValue.SymbolVal("quote"));
+            elems.add(new SchemeValue.SymbolVal("quote", lc[0], lc[1]));
             elems.add(quoted);
-            return new SchemeValue.ListVal(elems);
+            return new SchemeValue.ListVal(elems, lc[0], lc[1]);
         } else {
             return parseAtom();
         }
     }
 
     private SchemeValue parseList() throws EvalError {
+        int[] lc = lineCol(pos);
         pos++; // skip '('
         var elems = new ArrayList<SchemeValue>();
         while (true) {
@@ -55,7 +57,7 @@ public class Parser {
             if (pos >= input.length()) throw new EvalError("unterminated list");
             if (input.charAt(pos) == ')') {
                 pos++;
-                return new SchemeValue.ListVal(elems);
+                return new SchemeValue.ListVal(elems, lc[0], lc[1]);
             }
             elems.add(parseExpr());
         }
@@ -109,6 +111,7 @@ public class Parser {
     }
 
     private SchemeValue parseAtom() throws EvalError {
+        int[] lc = lineCol(pos);
         int start = pos;
         while (pos < input.length() && isSymbolChar(input.charAt(pos))) {
             pos++;
@@ -121,7 +124,7 @@ public class Parser {
             return new SchemeValue.IntVal(Long.parseLong(token));
         } catch (NumberFormatException ignored) {}
 
-        return new SchemeValue.SymbolVal(token);
+        return new SchemeValue.SymbolVal(token, lc[0], lc[1]);
     }
 
     private void skipWhitespaceAndComments() {
@@ -139,5 +142,18 @@ public class Parser {
 
     private boolean isSymbolChar(char c) {
         return !Character.isWhitespace(c) && c != '(' && c != ')' && c != '"' && c != ';';
+    }
+
+    private int[] lineCol(int position) {
+        int line = 1, col = 1;
+        for (int i = 0; i < position && i < input.length(); i++) {
+            if (input.charAt(i) == '\n') {
+                line++;
+                col = 1;
+            } else {
+                col++;
+            }
+        }
+        return new int[]{line, col};
     }
 }

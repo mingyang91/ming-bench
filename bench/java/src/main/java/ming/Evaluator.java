@@ -31,12 +31,26 @@ public class Evaluator {
             case SchemeValue.NilVal v -> v;
             case SchemeValue.PairVal v -> v;
             case SchemeValue.LambdaVal v -> v;
-            case SchemeValue.SymbolVal v -> env.get(v.name());
+            case SchemeValue.SymbolVal v -> {
+                try {
+                    yield env.get(v.name());
+                } catch (EvalError e) {
+                    throw withPos(e, v.line(), v.col());
+                }
+            }
             case SchemeValue.ListVal list -> evalList(list, env);
         };
     }
 
     private SchemeValue evalList(SchemeValue.ListVal list, Environment env) throws EvalError {
+        try {
+            return evalListInner(list, env);
+        } catch (EvalError e) {
+            throw withPos(e, list.line(), list.col());
+        }
+    }
+
+    private SchemeValue evalListInner(SchemeValue.ListVal list, Environment env) throws EvalError {
         if (list.elements().isEmpty()) throw new EvalError("empty application");
 
         var first = list.elements().getFirst();
@@ -491,6 +505,13 @@ public class Evaluator {
     private SchemeValue typePred(List<SchemeValue> args, Environment env, Class<? extends SchemeValue> type) throws EvalError {
         if (args.size() != 1) throw new EvalError("type predicate: needs exactly 1 argument");
         return new SchemeValue.BoolVal(type.isInstance(eval(args.getFirst(), env)));
+    }
+
+    private static EvalError withPos(EvalError e, int line, int col) {
+        if (line == 0 && col == 0) return e;
+        String msg = e.getMessage();
+        if (msg != null && msg.matches(".*\\d+:\\d+.*")) return e;
+        return new EvalError(msg + " at " + line + ":" + col);
     }
 
     private boolean schemeEqual(SchemeValue a, SchemeValue b) {
