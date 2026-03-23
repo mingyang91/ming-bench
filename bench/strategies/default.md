@@ -30,12 +30,6 @@ cargo xtask test all  # test all levels (300s timeout)
 
 - **Implement levels in order (L1 → L26).** Each level builds on the previous.
 - **After implementing each level, run its tests before moving on.**
-- **Do not skip ahead.** Later levels depend on earlier ones being correct.
 - **If a level's tests fail, fix them before proceeding.**
-- **Rely on the provided level tests as the source of truth.**
-
-## Problem-Solving Approach
-
-- **Code first, debug from test output.** Write a working first attempt based on your understanding, then iterate from test failures. Do not mentally simulate test cases before writing code — let the test runner do that work.
-- **One failing test = one targeted fix.** When tests fail, read the error output and fix the specific failure. Do not re-analyze the entire design.
-- **Budget your planning.** For any single feature, your plan should fit in a few paragraphs. If you're tracing through execution step-by-step in your head, stop and write code instead.
+- **Code first, debug from test output.** Don't mentally simulate — let the test runner do that.
+- **Maximum 10 turns of reading before first code change.** If you haven't written or edited a file by turn 10, your analysis is too deep — write a first attempt and iterate from test failures. Tests are the source of truth, not mental simulation.
