@@ -20,7 +20,8 @@ type SchemeVal =
   | { tag: 'void'; pos?: Pos }
   | { tag: 'vector'; value: SchemeVal[]; pos?: Pos }
   | { tag: 'syntax'; literals: string[]; rules: { pattern: SchemeVal; template: SchemeVal }[]; defEnv: Env; pos?: Pos }
-  | { tag: 'values'; values: SchemeVal[]; pos?: Pos };
+  | { tag: 'values'; values: SchemeVal[]; pos?: Pos }
+  | { tag: 'record'; type: number; fields: Map<string, SchemeVal>; pos?: Pos };
 
 // ── Rational / Exact number helpers ───────────────────────────────
 
@@ -81,6 +82,9 @@ function fracMul(a: Frac, b: Frac): Frac {
 function fracDiv(a: Frac, b: Frac): Frac {
   return { num: a.num * b.den, den: a.den * b.num };
 }
+
+// ── Record type identity ──────────────────────────────────────────
+let recordTypeCounter = 0;
 
 // ── CPS / Trampoline types ─────────────────────────────────────────
 
@@ -1548,6 +1552,48 @@ function evaluateCPS(expr: SchemeVal, env: Env, k: K): TResult {
       });
     }
 
+    if (op === 'define-record-type') {
+      // (define-record-type <name> (constructor field-name ...) predicate (field-name accessor) ...)
+      const constructorSpec = (items[2] as { tag: 'list'; value: SchemeVal[] }).value;
+      const constructorName = (constructorSpec[0] as { tag: 'symbol'; value: string }).value;
+      const constructorFields = constructorSpec.slice(1).map(f => (f as { tag: 'symbol'; value: string }).value);
+      const predicateName = (items[3] as { tag: 'symbol'; value: string }).value;
+      const typeId = recordTypeCounter++;
+
+      // Field accessors: (field-name accessor) pairs starting at items[4]
+      const fieldAccessors: { field: string; accessor: string }[] = [];
+      for (let i = 4; i < items.length; i++) {
+        const spec = (items[i] as { tag: 'list'; value: SchemeVal[] }).value;
+        const field = (spec[0] as { tag: 'symbol'; value: string }).value;
+        const accessor = (spec[1] as { tag: 'symbol'; value: string }).value;
+        fieldAccessors.push({ field, accessor });
+      }
+
+      // Define constructor
+      env.define(constructorName, { tag: 'builtin', name: constructorName, fn: (args) => {
+        const fields = new Map<string, SchemeVal>();
+        for (let i = 0; i < constructorFields.length; i++) {
+          fields.set(constructorFields[i], args[i]);
+        }
+        return { tag: 'record', type: typeId, fields };
+      }});
+
+      // Define predicate
+      env.define(predicateName, { tag: 'builtin', name: predicateName, fn: (args) => {
+        return { tag: 'boolean', value: args[0].tag === 'record' && args[0].type === typeId };
+      }});
+
+      // Define accessors
+      for (const fa of fieldAccessors) {
+        env.define(fa.accessor, { tag: 'builtin', name: fa.accessor, fn: (args) => {
+          if (args[0].tag !== 'record') throw new EvalError(`${fa.accessor}: not a record`);
+          return args[0].fields.get(fa.field)!;
+        }});
+      }
+
+      return callK(k, VOID);
+    }
+
     // Check for macro application
     try {
       const headVal = env.get(op);
@@ -1629,6 +1675,7 @@ function writeVal(val: SchemeVal): string {
     case 'void': return '';
     case 'syntax': return '#<syntax>';
     case 'values': return val.values.map(writeVal).join('\n');
+    case 'record': return '#<record>';
   }
 }
 
@@ -1639,6 +1686,7 @@ const display = writeVal;
 function evaluateProgram(exprs: SchemeVal[], env: Env): SchemeVal {
   windStack = [];
   exHandlerStack = [];
+  recordTypeCounter = 0;
   const topK: K = (val) => done(val);
   const result = evaluateSeqCPS(exprs, 0, env, topK);
   return runTrampoline(result);

@@ -63,6 +63,8 @@ function fracMul(a, b) {
 function fracDiv(a, b) {
     return { num: a.num * b.den, den: a.den * b.num };
 }
+// ── Record type identity ──────────────────────────────────────────
+let recordTypeCounter = 0;
 function bounce(thunk) {
     return { done: false, thunk };
 }
@@ -1548,6 +1550,43 @@ function evaluateCPS(expr, env, k) {
                 return callK(k, result);
             });
         }
+        if (op === 'define-record-type') {
+            // (define-record-type <name> (constructor field-name ...) predicate (field-name accessor) ...)
+            const constructorSpec = items[2].value;
+            const constructorName = constructorSpec[0].value;
+            const constructorFields = constructorSpec.slice(1).map(f => f.value);
+            const predicateName = items[3].value;
+            const typeId = recordTypeCounter++;
+            // Field accessors: (field-name accessor) pairs starting at items[4]
+            const fieldAccessors = [];
+            for (let i = 4; i < items.length; i++) {
+                const spec = items[i].value;
+                const field = spec[0].value;
+                const accessor = spec[1].value;
+                fieldAccessors.push({ field, accessor });
+            }
+            // Define constructor
+            env.define(constructorName, { tag: 'builtin', name: constructorName, fn: (args) => {
+                    const fields = new Map();
+                    for (let i = 0; i < constructorFields.length; i++) {
+                        fields.set(constructorFields[i], args[i]);
+                    }
+                    return { tag: 'record', type: typeId, fields };
+                } });
+            // Define predicate
+            env.define(predicateName, { tag: 'builtin', name: predicateName, fn: (args) => {
+                    return { tag: 'boolean', value: args[0].tag === 'record' && args[0].type === typeId };
+                } });
+            // Define accessors
+            for (const fa of fieldAccessors) {
+                env.define(fa.accessor, { tag: 'builtin', name: fa.accessor, fn: (args) => {
+                        if (args[0].tag !== 'record')
+                            throw new EvalError(`${fa.accessor}: not a record`);
+                        return args[0].fields.get(fa.field);
+                    } });
+            }
+            return callK(k, VOID);
+        }
         // Check for macro application
         try {
             const headVal = env.get(op);
@@ -1620,6 +1659,7 @@ function writeVal(val) {
         case 'void': return '';
         case 'syntax': return '#<syntax>';
         case 'values': return val.values.map(writeVal).join('\n');
+        case 'record': return '#<record>';
     }
 }
 const display = writeVal;
@@ -1627,6 +1667,7 @@ const display = writeVal;
 function evaluateProgram(exprs, env) {
     windStack = [];
     exHandlerStack = [];
+    recordTypeCounter = 0;
     const topK = (val) => done(val);
     const result = evaluateSeqCPS(exprs, 0, env, topK);
     return runTrampoline(result);
