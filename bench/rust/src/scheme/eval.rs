@@ -121,19 +121,11 @@ fn eval_define(args: &[Expr], env: &Rc<Env>) -> Result<Value, EvalError> {
                     message: "function name must be a symbol".into(),
                 }.into()),
             };
-            let params: Vec<String> = name_and_params[1..]
-                .iter()
-                .map(|e| match &e.kind {
-                    ExprKind::Symbol(s) => Ok(s.clone()),
-                    _ => Err(EvalError::from(ErrorKind::BadSyntax {
-                        form: "define".into(),
-                        message: "parameter must be a symbol".into(),
-                    })),
-                })
-                .collect::<Result<Vec<_>, _>>()?;
+            let (params, rest_param) = parse_params(&name_and_params[1..], "define")?;
             let body = args[1..].to_vec();
             let lambda = Value::Lambda {
                 params,
+                rest_param,
                 body,
                 closure_env: Rc::clone(env),
             };
@@ -202,18 +194,11 @@ fn eval_lambda(args: &[Expr], env: &Rc<Env>) -> Result<Value, EvalError> {
             message: "expected (lambda (params) body...)".into(),
         }.into());
     }
-    let params = match &args[0].kind {
-        ExprKind::List(param_exprs) => {
-            param_exprs
-                .iter()
-                .map(|e| match &e.kind {
-                    ExprKind::Symbol(s) => Ok(s.clone()),
-                    _ => Err(EvalError::from(ErrorKind::BadSyntax {
-                        form: "lambda".into(),
-                        message: "parameter must be a symbol".into(),
-                    })),
-                })
-                .collect::<Result<Vec<_>, _>>()?
+    let (params, rest_param) = match &args[0].kind {
+        ExprKind::List(param_exprs) => parse_params(param_exprs, "lambda")?,
+        ExprKind::Symbol(s) => {
+            // (lambda args body...) — single rest param
+            (Vec::new(), Some(s.clone()))
         }
         _ => return Err(ErrorKind::BadSyntax {
             form: "lambda".into(),
@@ -223,9 +208,46 @@ fn eval_lambda(args: &[Expr], env: &Rc<Env>) -> Result<Value, EvalError> {
     let body = args[1..].to_vec();
     Ok(Value::Lambda {
         params,
+        rest_param,
         body,
         closure_env: Rc::clone(env),
     })
+}
+
+/// Parse a parameter list, handling dot notation for rest params.
+/// Returns (required_params, rest_param).
+fn parse_params(param_exprs: &[Expr], form: &str) -> Result<(Vec<String>, Option<String>), EvalError> {
+    let mut params = Vec::new();
+    let mut rest_param = None;
+    let mut i = 0;
+    while i < param_exprs.len() {
+        match &param_exprs[i].kind {
+            ExprKind::Symbol(s) if s == "." => {
+                // Next element is the rest param
+                if i + 1 >= param_exprs.len() || i + 2 != param_exprs.len() {
+                    return Err(ErrorKind::BadSyntax {
+                        form: form.into(),
+                        message: "expected exactly one parameter after dot".into(),
+                    }.into());
+                }
+                match &param_exprs[i + 1].kind {
+                    ExprKind::Symbol(rest) => rest_param = Some(rest.clone()),
+                    _ => return Err(ErrorKind::BadSyntax {
+                        form: form.into(),
+                        message: "rest parameter must be a symbol".into(),
+                    }.into()),
+                }
+                break;
+            }
+            ExprKind::Symbol(s) => params.push(s.clone()),
+            _ => return Err(ErrorKind::BadSyntax {
+                form: form.into(),
+                message: "parameter must be a symbol".into(),
+            }.into()),
+        }
+        i += 1;
+    }
+    Ok((params, rest_param))
 }
 
 fn eval_and_tail(exprs: &[Expr], env: &Rc<Env>) -> Result<Trampoline, EvalError> {
@@ -301,12 +323,14 @@ fn eval_let_tail(args: &[Expr], env: &Rc<Env>) -> Result<Trampoline, EvalError> 
         let body = args[2..].to_vec();
         let lambda = Value::Lambda {
             params: params.clone(),
+            rest_param: None,
             body,
             closure_env: Rc::clone(env),
         };
         let func_env = Env::extend(env, vec![name.clone()], vec![lambda]);
         let recursive_lambda = Value::Lambda {
             params,
+            rest_param: None,
             body: args[2..].to_vec(),
             closure_env: Rc::clone(&func_env),
         };
@@ -396,21 +420,66 @@ fn eval_cond_tail(clauses: &[Expr], env: &Rc<Env>) -> Result<Trampoline, EvalErr
 
 fn apply_function_tail(func: &Value, args: &[Value], env: &Rc<Env>) -> Result<Trampoline, EvalError> {
     match func {
-        Value::Builtin(name) => apply_builtin(name, args, env).map(Trampoline::Done),
-        Value::Lambda { params, body, closure_env } => {
-            if args.len() != params.len() {
-                return Err(ErrorKind::WrongArgCount {
-                    expected: params.len(),
-                    got: args.len(),
-                }.into());
+        Value::Builtin(name) => {
+            if name == "apply" {
+                return apply_apply_tail(args, env);
             }
-            let local_env = Env::extend(closure_env, params.clone(), args.to_vec());
+            apply_builtin(name, args, env).map(Trampoline::Done)
+        }
+        Value::Lambda { params, rest_param, body, closure_env } => {
+            let mut names = params.clone();
+            let mut vals;
+            match rest_param {
+                Some(rest) => {
+                    if args.len() < params.len() {
+                        return Err(ErrorKind::WrongArgCount {
+                            expected: params.len(),
+                            got: args.len(),
+                        }.into());
+                    }
+                    vals = args[..params.len()].to_vec();
+                    names.push(rest.clone());
+                    vals.push(Value::List(args[params.len()..].to_vec()));
+                }
+                None => {
+                    if args.len() != params.len() {
+                        return Err(ErrorKind::WrongArgCount {
+                            expected: params.len(),
+                            got: args.len(),
+                        }.into());
+                    }
+                    vals = args.to_vec();
+                }
+            }
+            let local_env = Env::extend(closure_env, names, vals);
             eval_body_tail(body, &local_env)
         }
         other => Err(ErrorKind::NotAProcedure {
             value: other.to_display_string(),
         }.into()),
     }
+}
+
+/// Implement (apply fn arg1 ... argN list)
+fn apply_apply_tail(args: &[Value], env: &Rc<Env>) -> Result<Trampoline, EvalError> {
+    if args.len() < 2 {
+        return Err(ErrorKind::WrongArgCount {
+            expected: 2,
+            got: args.len(),
+        }.into());
+    }
+    let func = &args[0];
+    let last = &args[args.len() - 1];
+    let tail_list = match last {
+        Value::List(elems) => elems.clone(),
+        other => return Err(ErrorKind::TypeMismatch {
+            expected: "list".into(),
+            got: other.to_display_string(),
+        }.into()),
+    };
+    let mut all_args: Vec<Value> = args[1..args.len() - 1].to_vec();
+    all_args.extend(tail_list);
+    apply_function_tail(func, &all_args, env)
 }
 
 fn apply_builtin(name: &str, args: &[Value], env: &Rc<Env>) -> Result<Value, EvalError> {

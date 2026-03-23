@@ -24,7 +24,7 @@ impl Env {
             "+", "-", "*", "/", "<", ">", "=", "<=", ">=", "not",
             "cons", "car", "cdr", "null?", "list", "length", "append",
             "string?", "number?", "boolean?", "pair?", "symbol?",
-            "display", "write", "newline",
+            "display", "write", "newline", "apply",
             "string-append", "string-length", "substring",
             "string->number", "number->string",
             "symbol->string", "string->symbol",

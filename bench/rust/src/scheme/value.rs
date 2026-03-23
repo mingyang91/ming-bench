@@ -17,6 +17,7 @@ pub enum Value {
     Builtin(String),
     Lambda {
         params: Vec<String>,
+        rest_param: Option<String>,
         body: Vec<Expr>,
         closure_env: Rc<Env>,
     },
