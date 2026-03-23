@@ -4,6 +4,9 @@ import { EvalError } from './evalError.js';
 
 interface Pos { line: number; col: number }
 
+type Cont = (val: SchemeVal) => Bounce;
+type Bounce = SchemeVal | (() => Bounce);
+
 type SchemeVal =
   | { tag: 'number'; val: number; pos?: Pos }
   | { tag: 'boolean'; val: boolean; pos?: Pos }
@@ -12,7 +15,8 @@ type SchemeVal =
   | { tag: 'symbol'; val: string; pos?: Pos }
   | { tag: 'list'; val: SchemeVal[]; pos?: Pos }
   | { tag: 'lambda'; params: string[]; rest?: string; body: SchemeVal[]; env: Env; pos?: Pos }
-  | { tag: 'builtin'; name: string; pos?: Pos };
+  | { tag: 'builtin'; name: string; pos?: Pos }
+  | { tag: 'continuation'; cont: Cont; pos?: Pos };
 
 interface Token { text: string; pos: Pos }
 
@@ -185,7 +189,7 @@ function parse(input: string): SchemeVal[] {
   return exprs;
 }
 
-// ── Evaluator ──────────────────────────────────────────────────────
+// ── Helpers ─────────────────────────────────────────────────────────
 
 function fmtPos(p?: Pos): string {
   return p ? `${p.line}:${p.col}: ` : '';
@@ -219,8 +223,8 @@ function displayVal(v: SchemeVal): string {
     case 'list':
       return '(' + v.val.map(displayVal).join(' ') + ')';
     case 'lambda':
-      return '#<procedure>';
     case 'builtin':
+    case 'continuation':
       return '#<procedure>';
   }
 }
@@ -231,8 +235,6 @@ function displayValUnquoted(v: SchemeVal): string {
       return v.val;
     case 'char':
       return v.val;
-    case 'builtin':
-      return displayVal(v);
     default:
       return displayVal(v);
   }
@@ -241,6 +243,8 @@ function displayValUnquoted(v: SchemeVal): string {
 function quoteToScheme(v: SchemeVal): SchemeVal {
   return v;
 }
+
+// ── Builtins ────────────────────────────────────────────────────────
 
 function applyBuiltin(op: string, evalArgs: SchemeVal[], p?: Pos, out?: string[]): SchemeVal {
   switch (op) {
@@ -362,7 +366,8 @@ function applyBuiltin(op: string, evalArgs: SchemeVal[], p?: Pos, out?: string[]
     }
     case 'procedure?': {
       if (evalArgs.length !== 1) throw posError('procedure?: need exactly one arg', p);
-      return { tag: 'boolean', val: evalArgs[0].tag === 'lambda' || evalArgs[0].tag === 'builtin' };
+      const t = evalArgs[0].tag;
+      return { tag: 'boolean', val: t === 'lambda' || t === 'builtin' || t === 'continuation' };
     }
     case 'display': {
       if (evalArgs.length !== 1) throw posError('display: need exactly one arg', p);
@@ -483,263 +488,280 @@ function parseParams(paramList: SchemeVal, p?: Pos): { params: string[]; rest?: 
   return { params };
 }
 
-function applyLambda(proc: SchemeVal & { tag: 'lambda' }, evalArgs: SchemeVal[], p?: Pos, out?: string[]): { expr: SchemeVal; env: Env } {
-  if (proc.rest) {
-    if (evalArgs.length < proc.params.length) {
-      throw posError(`wrong number of arguments: expected at least ${proc.params.length}, got ${evalArgs.length}`, p);
-    }
-  } else {
-    if (evalArgs.length !== proc.params.length) {
-      throw posError(`wrong number of arguments: expected ${proc.params.length}, got ${evalArgs.length}`, p);
-    }
+// ── CPS Evaluator with Trampoline ───────────────────────────────────
+
+function trampoline(bounce: Bounce): SchemeVal {
+  while (typeof bounce === 'function') {
+    bounce = (bounce as () => Bounce)();
   }
-  const callEnv = new Env(proc.env);
-  for (let i = 0; i < proc.params.length; i++) {
-    callEnv.define(proc.params[i], evalArgs[i]);
-  }
-  if (proc.rest) {
-    callEnv.define(proc.rest, { tag: 'list', val: evalArgs.slice(proc.params.length) });
-  }
-  for (let i = 0; i < proc.body.length - 1; i++) {
-    evalExpr(proc.body[i], callEnv, out);
-  }
-  return { expr: proc.body[proc.body.length - 1], env: callEnv };
+  return bounce as SchemeVal;
 }
 
-function schemeApply(proc: SchemeVal, evalArgs: SchemeVal[], p?: Pos, out?: string[]): SchemeVal {
+function evalListCPS(exprs: SchemeVal[], env: Env, k: (vals: SchemeVal[]) => Bounce, out?: string[]): Bounce {
+  // Evaluate right-to-left (valid per R7RS: argument evaluation order is unspecified).
+  // This ensures call/cc captures pending left-sibling evaluations in the continuation,
+  // so variables like `count` are re-read fresh when the continuation is re-invoked.
+  const loop = (i: number, acc: SchemeVal[]): Bounce => {
+    if (i < 0) return k(acc);
+    return evalCPS(exprs[i], env, v => {
+      const next = acc.length === 0 ? [v] : [v, ...acc];
+      return () => loop(i - 1, next);
+    }, out);
+  };
+  return loop(exprs.length - 1, []);
+}
+
+function evalBodyCPS(exprs: SchemeVal[], idx: number, env: Env, k: Cont, out?: string[]): Bounce {
+  if (idx >= exprs.length) return k({ tag: 'boolean', val: false });
+  if (idx === exprs.length - 1) return evalCPS(exprs[idx], env, k, out);
+  return evalCPS(exprs[idx], env, _ => () => evalBodyCPS(exprs, idx + 1, env, k, out), out);
+}
+
+function applyCPS(proc: SchemeVal, args: SchemeVal[], k: Cont, p?: Pos, out?: string[]): Bounce {
+  if (proc.tag === 'continuation') {
+    if (args.length !== 1) throw posError('continuation: need exactly one arg', p);
+    return () => proc.cont(args[0]);
+  }
   if (proc.tag === 'lambda') {
-    const { expr, env } = applyLambda(proc, evalArgs, p);
-    return evalExpr(expr, env, out);
+    if (proc.rest) {
+      if (args.length < proc.params.length)
+        throw posError(`wrong number of arguments: expected at least ${proc.params.length}, got ${args.length}`, p);
+    } else {
+      if (args.length !== proc.params.length)
+        throw posError(`wrong number of arguments: expected ${proc.params.length}, got ${args.length}`, p);
+    }
+    const callEnv = new Env(proc.env);
+    for (let i = 0; i < proc.params.length; i++) callEnv.define(proc.params[i], args[i]);
+    if (proc.rest) callEnv.define(proc.rest, { tag: 'list', val: args.slice(proc.params.length) });
+    return evalBodyCPS(proc.body, 0, callEnv, k, out);
   }
   if (proc.tag === 'builtin') {
-    if (proc.name === 'apply') {
-      return doApply(evalArgs, p, out);
+    if (proc.name === 'call/cc' || proc.name === 'call-with-current-continuation') {
+      if (args.length !== 1) throw posError(`${proc.name}: need exactly one arg`, p);
+      const contVal: SchemeVal = { tag: 'continuation', cont: k };
+      return () => applyCPS(args[0], [contVal], k, p, out);
     }
-    return applyBuiltin(proc.name, evalArgs, p, out);
+    if (proc.name === 'apply') {
+      if (args.length < 2) throw posError('apply: need at least two args', p);
+      const applyProc = args[0];
+      const lastArg = args[args.length - 1];
+      if (lastArg.tag !== 'list') throw posError('apply: last argument must be a list', p);
+      const allArgs = [...args.slice(1, -1), ...lastArg.val];
+      return () => applyCPS(applyProc, allArgs, k, p, out);
+    }
+    return k(applyBuiltin(proc.name, args, p, out));
   }
   throw posError('not a procedure', p);
 }
 
-function doApply(args: SchemeVal[], p?: Pos, out?: string[]): SchemeVal {
-  if (args.length < 2) throw posError('apply: need at least two args', p);
-  const proc = args[0];
-  const lastArg = args[args.length - 1];
-  if (lastArg.tag !== 'list') throw posError('apply: last argument must be a list', p);
-  const prefixArgs = args.slice(1, -1);
-  const allArgs = [...prefixArgs, ...lastArg.val];
-  return schemeApply(proc, allArgs, p, out);
-}
+function evalCPS(expr: SchemeVal, env: Env, k: Cont, out?: string[]): Bounce {
+  const p = expr.pos;
 
-function evalExpr(expr: SchemeVal, env: Env, out?: string[]): SchemeVal {
-  // Trampoline loop for TCO
-  while (true) {
-    const p = expr.pos;
-    if (expr.tag === 'number' || expr.tag === 'boolean' || expr.tag === 'string' || expr.tag === 'char') {
-      return expr;
-    }
-    if (expr.tag === 'symbol') {
-      return env.get(expr.val, p);
-    }
-    if (expr.tag === 'list') {
-      const items = expr.val;
-      if (items.length === 0) throw posError('empty application', p);
-      const head = items[0];
-
-      if (head.tag === 'symbol') {
-        const op = head.val;
-        const args = items.slice(1);
-
-        // special forms
-        if (op === 'quote') {
-          if (args.length !== 1) throw posError('quote: need exactly one arg', p);
-          return quoteToScheme(args[0]);
-        }
-
-        if (op === 'if') {
-          if (args.length < 2 || args.length > 3) throw posError('if: bad syntax', p);
-          const cond = evalExpr(args[0], env, out);
-          if (isTruthy(cond)) { expr = args[1]; continue; }
-          if (args.length === 3) { expr = args[2]; continue; }
-          return { tag: 'boolean', val: false };
-        }
-
-        if (op === 'define') {
-          if (args.length < 2) throw posError('define: bad syntax', p);
-          const target = args[0];
-          if (target.tag === 'symbol') {
-            const val = evalExpr(args[1], env, out);
-            env.define(target.val, val);
-            return val;
-          }
-          if (target.tag === 'list' && target.val.length > 0 && target.val[0].tag === 'symbol') {
-            const name = target.val[0].val;
-            const paramListVal: SchemeVal = { tag: 'list', val: target.val.slice(1) };
-            const { params, rest } = parseParams(paramListVal, p);
-            const body = args.slice(1);
-            const lambda: SchemeVal = { tag: 'lambda', params, rest, body, env };
-            env.define(name, lambda);
-            return lambda;
-          }
-          throw posError('define: bad syntax', p);
-        }
-
-        if (op === 'set!') {
-          if (args.length !== 2) throw posError('set!: bad syntax', p);
-          if (args[0].tag !== 'symbol') throw posError('set!: first arg must be a symbol', p);
-          const val = evalExpr(args[1], env, out);
-          env.set(args[0].val, val, p);
-          return val;
-        }
-
-        if (op === 'lambda') {
-          if (args.length < 2) throw posError('lambda: bad syntax', p);
-          const { params, rest } = parseParams(args[0], p);
-          const body = args.slice(1);
-          return { tag: 'lambda', params, rest, body, env };
-        }
-
-        if (op === 'and') {
-          if (args.length === 0) return { tag: 'boolean', val: true };
-          for (let i = 0; i < args.length - 1; i++) {
-            const result = evalExpr(args[i], env, out);
-            if (!isTruthy(result)) return result;
-          }
-          expr = args[args.length - 1]; continue;
-        }
-
-        if (op === 'let') {
-          if (args.length < 2) throw posError('let: bad syntax', p);
-          let name: string | null = null;
-          let bindingsExpr: SchemeVal;
-          let body: SchemeVal[];
-          if (args[0].tag === 'symbol') {
-            name = args[0].val;
-            if (args.length < 3) throw posError('let: bad syntax', p);
-            bindingsExpr = args[1];
-            body = args.slice(2);
-          } else {
-            bindingsExpr = args[0];
-            body = args.slice(1);
-          }
-          if (bindingsExpr.tag !== 'list') throw posError('let: bad bindings', p);
-          const paramNames: string[] = [];
-          const initVals: SchemeVal[] = [];
-          for (const b of bindingsExpr.val) {
-            if (b.tag !== 'list' || b.val.length !== 2 || b.val[0].tag !== 'symbol')
-              throw posError('let: bad binding', p);
-            paramNames.push(b.val[0].val);
-            initVals.push(evalExpr(b.val[1], env, out));
-          }
-          if (name !== null) {
-            const letEnv = new Env(env);
-            const lambda: SchemeVal = { tag: 'lambda', params: paramNames, body, env: letEnv };
-            letEnv.define(name, lambda);
-            const callEnv = new Env(letEnv);
-            for (let i = 0; i < paramNames.length; i++) callEnv.define(paramNames[i], initVals[i]);
-            for (let i = 0; i < body.length - 1; i++) evalExpr(body[i], callEnv, out);
-            expr = body[body.length - 1]; env = callEnv; continue;
-          } else {
-            const letEnv = new Env(env);
-            for (let i = 0; i < paramNames.length; i++) letEnv.define(paramNames[i], initVals[i]);
-            for (let i = 0; i < body.length - 1; i++) evalExpr(body[i], letEnv, out);
-            expr = body[body.length - 1]; env = letEnv; continue;
-          }
-        }
-
-        if (op === 'begin') {
-          if (args.length === 0) return { tag: 'boolean', val: false };
-          for (let i = 0; i < args.length - 1; i++) evalExpr(args[i], env, out);
-          expr = args[args.length - 1]; continue;
-        }
-
-        if (op === 'cond') {
-          let found = false;
-          for (const clause of args) {
-            if (clause.tag !== 'list' || clause.val.length < 2) throw posError('cond: bad clause', p);
-            const test = clause.val[0];
-            if (test.tag === 'symbol' && test.val === 'else') {
-              for (let i = 1; i < clause.val.length - 1; i++) evalExpr(clause.val[i], env, out);
-              expr = clause.val[clause.val.length - 1]; found = true; break;
-            }
-            const condVal = evalExpr(test, env, out);
-            if (isTruthy(condVal)) {
-              if (clause.val.length === 1) return condVal;
-              for (let i = 1; i < clause.val.length - 1; i++) evalExpr(clause.val[i], env, out);
-              expr = clause.val[clause.val.length - 1]; found = true; break;
-            }
-          }
-          if (found) continue;
-          return { tag: 'boolean', val: false };
-        }
-
-        if (op === 'or') {
-          if (args.length === 0) return { tag: 'boolean', val: false };
-          for (let i = 0; i < args.length - 1; i++) {
-            const result = evalExpr(args[i], env, out);
-            if (isTruthy(result)) return result;
-          }
-          expr = args[args.length - 1]; continue;
-        }
-
-        // builtin procedures
-        if (BUILTINS.has(op)) {
-          const evalArgs = args.map(a => evalExpr(a, env, out));
-          return applyBuiltin(op, evalArgs, p, out);
-        }
-      }
-
-      // general application: evaluate head and args
-      const proc = evalExpr(head, env, out);
-      const evalArgs = items.slice(1).map(a => evalExpr(a, env, out));
-
-      if (proc.tag === 'lambda') {
-        const result = applyLambda(proc, evalArgs, p, out);
-        expr = result.expr;
-        env = result.env;
-        continue;
-      }
-
-      if (proc.tag === 'builtin') {
-        if (proc.name === 'apply') {
-          return doApply(evalArgs, p, out);
-        }
-        return applyBuiltin(proc.name, evalArgs, p, out);
-      }
-
-      throw posError('not a procedure', p);
-    }
-    throw posError('cannot evaluate', p);
+  if (expr.tag === 'number' || expr.tag === 'boolean' || expr.tag === 'string' || expr.tag === 'char') {
+    return k(expr);
   }
+
+  if (expr.tag === 'symbol') {
+    return k(env.get(expr.val, p));
+  }
+
+  if (expr.tag !== 'list') throw posError('cannot evaluate', p);
+
+  const items = expr.val;
+  if (items.length === 0) throw posError('empty application', p);
+  const head = items[0];
+  const args = items.slice(1);
+
+  if (head.tag === 'symbol') {
+    const op = head.val;
+
+    if (op === 'quote') {
+      if (args.length !== 1) throw posError('quote: need exactly one arg', p);
+      return k(quoteToScheme(args[0]));
+    }
+
+    if (op === 'if') {
+      if (args.length < 2 || args.length > 3) throw posError('if: bad syntax', p);
+      return evalCPS(args[0], env, condVal => {
+        if (isTruthy(condVal)) return () => evalCPS(args[1], env, k, out);
+        if (args.length === 3) return () => evalCPS(args[2], env, k, out);
+        return k({ tag: 'boolean', val: false });
+      }, out);
+    }
+
+    if (op === 'define') {
+      if (args.length < 2) throw posError('define: bad syntax', p);
+      const target = args[0];
+      if (target.tag === 'symbol') {
+        return evalCPS(args[1], env, val => {
+          env.define(target.val, val);
+          return k(val);
+        }, out);
+      }
+      if (target.tag === 'list' && target.val.length > 0 && target.val[0].tag === 'symbol') {
+        const name = target.val[0].val;
+        const paramListVal: SchemeVal = { tag: 'list', val: target.val.slice(1) };
+        const { params, rest } = parseParams(paramListVal, p);
+        const body = args.slice(1);
+        const lambda: SchemeVal = { tag: 'lambda', params, rest, body, env };
+        env.define(name, lambda);
+        return k(lambda);
+      }
+      throw posError('define: bad syntax', p);
+    }
+
+    if (op === 'set!') {
+      if (args.length !== 2) throw posError('set!: bad syntax', p);
+      if (args[0].tag !== 'symbol') throw posError('set!: first arg must be a symbol', p);
+      const setName = args[0].val;
+      return evalCPS(args[1], env, val => {
+        env.set(setName, val, p);
+        return k(val);
+      }, out);
+    }
+
+    if (op === 'lambda') {
+      if (args.length < 2) throw posError('lambda: bad syntax', p);
+      const { params, rest } = parseParams(args[0], p);
+      const body = args.slice(1);
+      return k({ tag: 'lambda', params, rest, body, env });
+    }
+
+    if (op === 'and') {
+      if (args.length === 0) return k({ tag: 'boolean', val: true });
+      const evalAnd = (i: number): Bounce => {
+        if (i === args.length - 1) return evalCPS(args[i], env, k, out);
+        return evalCPS(args[i], env, val => {
+          if (!isTruthy(val)) return k(val);
+          return () => evalAnd(i + 1);
+        }, out);
+      };
+      return evalAnd(0);
+    }
+
+    if (op === 'or') {
+      if (args.length === 0) return k({ tag: 'boolean', val: false });
+      const evalOr = (i: number): Bounce => {
+        if (i === args.length - 1) return evalCPS(args[i], env, k, out);
+        return evalCPS(args[i], env, val => {
+          if (isTruthy(val)) return k(val);
+          return () => evalOr(i + 1);
+        }, out);
+      };
+      return evalOr(0);
+    }
+
+    if (op === 'begin') {
+      if (args.length === 0) return k({ tag: 'boolean', val: false });
+      return evalBodyCPS(args, 0, env, k, out);
+    }
+
+    if (op === 'cond') {
+      const evalCond = (i: number): Bounce => {
+        if (i >= args.length) return k({ tag: 'boolean', val: false });
+        const clause = args[i];
+        if (clause.tag !== 'list') throw posError('cond: bad clause', p);
+        if (clause.val.length < 2 && !(clause.val[0]?.tag === 'symbol' && clause.val[0]?.val === 'else')) {
+          throw posError('cond: bad clause', p);
+        }
+        const test = clause.val[0];
+        if (test.tag === 'symbol' && test.val === 'else') {
+          return evalBodyCPS(clause.val, 1, env, k, out);
+        }
+        return evalCPS(test, env, condVal => {
+          if (isTruthy(condVal)) {
+            if (clause.val.length === 1) return k(condVal);
+            return evalBodyCPS(clause.val, 1, env, k, out);
+          }
+          return () => evalCond(i + 1);
+        }, out);
+      };
+      return evalCond(0);
+    }
+
+    if (op === 'let') {
+      if (args.length < 2) throw posError('let: bad syntax', p);
+      let name: string | null = null;
+      let bindingsExpr: SchemeVal;
+      let body: SchemeVal[];
+      if (args[0].tag === 'symbol') {
+        name = args[0].val;
+        if (args.length < 3) throw posError('let: bad syntax', p);
+        bindingsExpr = args[1];
+        body = args.slice(2);
+      } else {
+        bindingsExpr = args[0];
+        body = args.slice(1);
+      }
+      if (bindingsExpr.tag !== 'list') throw posError('let: bad bindings', p);
+
+      const paramNames: string[] = [];
+      const initExprs: SchemeVal[] = [];
+      for (const b of bindingsExpr.val) {
+        if (b.tag !== 'list' || b.val.length !== 2 || b.val[0].tag !== 'symbol')
+          throw posError('let: bad binding', p);
+        paramNames.push(b.val[0].val);
+        initExprs.push(b.val[1]);
+      }
+
+      return evalListCPS(initExprs, env, initVals => {
+        if (name !== null) {
+          const letEnv = new Env(env);
+          const lambda: SchemeVal = { tag: 'lambda', params: paramNames, body, env: letEnv };
+          letEnv.define(name, lambda);
+          const callEnv = new Env(letEnv);
+          for (let i = 0; i < paramNames.length; i++) callEnv.define(paramNames[i], initVals[i]);
+          return evalBodyCPS(body, 0, callEnv, k, out);
+        } else {
+          const letEnv = new Env(env);
+          for (let i = 0; i < paramNames.length; i++) letEnv.define(paramNames[i], initVals[i]);
+          return evalBodyCPS(body, 0, letEnv, k, out);
+        }
+      }, out);
+    }
+
+    // Builtin shortcut (not call/cc — those go through general application)
+    if (BUILTINS.has(op)) {
+      return evalListCPS(args, env, evalArgs => {
+        return k(applyBuiltin(op, evalArgs, p, out));
+      }, out);
+    }
+  }
+
+  // General application: evaluate head and args, then apply
+  return evalCPS(head, env, proc => {
+    return evalListCPS(items.slice(1), env, evalArgs => {
+      return () => applyCPS(proc, evalArgs, k, p, out);
+    }, out);
+  }, out);
 }
+
+// ── Global Environment ──────────────────────────────────────────────
 
 function makeGlobalEnv(): Env {
   const env = new Env();
   env.define('apply', { tag: 'builtin', name: 'apply' });
+  env.define('call/cc', { tag: 'builtin', name: 'call/cc' });
+  env.define('call-with-current-continuation', { tag: 'builtin', name: 'call-with-current-continuation' });
   for (const name of BUILTINS) {
     env.define(name, { tag: 'builtin', name });
   }
   return env;
 }
 
-/**
- * Evaluate one or more Scheme expressions and return the string
- * representation of the last result.
- */
+// ── Public API ──────────────────────────────────────────────────────
+
 export function evalStr(input: string): string {
   const exprs = parse(input);
   if (exprs.length === 0) throw new EvalError('no expressions');
   const env = makeGlobalEnv();
   let result: SchemeVal | undefined;
   for (const expr of exprs) {
-    result = evalExpr(expr, env);
+    result = trampoline(evalCPS(expr, env, v => v));
   }
   return displayVal(result!);
 }
 
-/**
- * Evaluate Scheme expressions and return both the result string
- * and any captured output from display/write/newline.
- */
 export function evalStrWithOutput(input: string): { result: string; output: string } {
   const exprs = parse(input);
   if (exprs.length === 0) throw new EvalError('no expressions');
@@ -747,7 +769,7 @@ export function evalStrWithOutput(input: string): { result: string; output: stri
   const out: string[] = [];
   let result: SchemeVal | undefined;
   for (const expr of exprs) {
-    result = evalExpr(expr, env, out);
+    result = trampoline(evalCPS(expr, env, v => v, out));
   }
   return { result: displayVal(result!), output: out.join('') };
 }
