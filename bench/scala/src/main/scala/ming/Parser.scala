@@ -2,6 +2,9 @@ package ming
 
 import SchemeValue.*
 
+/** Token with source position. */
+case class Token(text: String, pos: SourcePos)
+
 /** Recursive-descent parser for Scheme expressions. */
 object Parser:
 
@@ -35,8 +38,21 @@ object Parser:
     sb += '"'
     (sb.toString, i)
 
-  private def tokenize(input: String): List[String] =
-    val result = scala.collection.mutable.ListBuffer.empty[String]
+  /** Compute (line, col) from a character offset. Both 1-based. */
+  private def offsetToPos(input: String, offset: Int): SourcePos =
+    var line = 1
+    var col  = 1
+    var i    = 0
+    while i < offset && i < input.length do
+      if input(i) == '\n' then
+        line += 1
+        col = 1
+      else col += 1
+      i += 1
+    SourcePos(line, col)
+
+  private def tokenize(input: String): List[Token] =
+    val result = scala.collection.mutable.ListBuffer.empty[Token]
     var i      = 0
     while i < input.length do
       input(i) match
@@ -45,63 +61,66 @@ object Parser:
         case ';' =>
           while i < input.length && input(i) != '\n' do i += 1
         case '(' =>
-          result += "("
+          result += Token("(", offsetToPos(input, i))
           i += 1
         case ')' =>
-          result += ")"
+          result += Token(")", offsetToPos(input, i))
           i += 1
         case '\'' =>
-          result += "'"
+          result += Token("'", offsetToPos(input, i))
           i += 1
         case '"' =>
+          val pos         = offsetToPos(input, i)
           val (tok, next) = scanString(input, i + 1)
-          result += tok
+          result += Token(tok, pos)
           i = next
         case _ =>
-          val sb = new StringBuilder
+          val pos = offsetToPos(input, i)
+          val sb  = new StringBuilder
           while i < input.length && !input(i).isWhitespace &&
             input(i) != '(' && input(i) != ')' && input(i) != '"' && input(i) != ';'
           do
             sb += input(i)
             i += 1
-          result += sb.toString
+          result += Token(sb.toString, pos)
     end while
     result.toList
 
   private def parseAll(
-    tokens: List[String]
-  ): (List[SchemeValue], List[String]) =
+    tokens: List[Token]
+  ): (List[SchemeValue], List[Token]) =
     tokens match
-      case Nil      => (Nil, Nil)
-      case ")" :: _ => (Nil, tokens)
+      case Nil                => (Nil, Nil)
+      case Token(")", _) :: _ => (Nil, tokens)
       case _ =>
         val (expr, rest)      = parseExpr(tokens)
         val (more, remaining) = parseAll(rest)
         (expr :: more, remaining)
 
   private def parseExpr(
-    tokens: List[String]
-  ): (SchemeValue, List[String]) =
+    tokens: List[Token]
+  ): (SchemeValue, List[Token]) =
     tokens match
       case Nil => throw new EvalError("unexpected end of input")
-      case "(" :: rest =>
+      case Token("(", pos) :: rest =>
         val (elements, afterList) = parseAll(rest)
         afterList match
-          case ")" :: remaining => (ListVal(elements), remaining)
-          case _                => throw new EvalError("missing closing parenthesis")
-      case ")" :: _ =>
+          case Token(")", _) :: remaining => (ListVal(elements, Some(pos)), remaining)
+          case _                          => throw new EvalError("missing closing parenthesis")
+      case Token(")", _) :: _ =>
         throw new EvalError("unexpected )")
-      case "'" :: rest =>
+      case Token("'", pos) :: rest =>
         val (quoted, remaining) = parseExpr(rest)
-        (ListVal(List(SymbolVal("quote"), quoted)), remaining)
-      case token :: rest =>
-        (parseAtom(token), rest)
+        (ListVal(List(SymbolVal("quote", Some(pos)), quoted), Some(pos)), remaining)
+      case Token(text, pos) :: rest =>
+        (parseAtom(text, pos), rest)
 
-  private def parseAtom(token: String): SchemeValue =
-    if token == "#t" then BoolVal(true)
-    else if token == "#f" then BoolVal(false)
-    else if token.startsWith("\"") && token.endsWith("\"") then StringVal(token.substring(1, token.length - 1))
+  private def parseAtom(token: String, pos: SourcePos): SchemeValue =
+    if token == "#t" then BoolVal(true, Some(pos))
+    else if token == "#f" then BoolVal(false, Some(pos))
+    else if token.startsWith("\"") && token.endsWith("\"") then
+      StringVal(token.substring(1, token.length - 1), Some(pos))
     else
       token.toLongOption match
-        case Some(n) => IntVal(n)
-        case None    => SymbolVal(token)
+        case Some(n) => IntVal(n, Some(pos))
+        case None    => SymbolVal(token, Some(pos))
