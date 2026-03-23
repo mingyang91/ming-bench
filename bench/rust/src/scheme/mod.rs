@@ -19,7 +19,11 @@ fn output_take() -> String {
 }
 
 fn make_string(s: std::string::String) -> Value {
-    Value::String(Rc::new(RefCell::new(s)))
+    Value::String(Rc::new(RefCell::new(s)), false)
+}
+
+fn make_immutable_string(s: std::string::String) -> Value {
+    Value::String(Rc::new(RefCell::new(s)), true)
 }
 
 /// A Scheme runtime value.
@@ -27,7 +31,7 @@ fn make_string(s: std::string::String) -> Value {
 enum Value {
     Integer(i64),
     Boolean(bool),
-    String(Rc<RefCell<std::string::String>>),
+    String(Rc<RefCell<std::string::String>>, bool),
     Char(char),
     List(Vec<Value>),
     Pair(Box<Value>, Box<Value>),
@@ -55,7 +59,7 @@ impl std::fmt::Debug for Value {
         match self {
             Value::Integer(n) => write!(f, "Integer({n})"),
             Value::Boolean(b) => write!(f, "Boolean({b})"),
-            Value::String(s) => write!(f, "String({:?})", s.borrow()),
+            Value::String(s, _) => write!(f, "String({:?})", s.borrow()),
             Value::Char(c) => write!(f, "Char({c:?})"),
             Value::List(l) => write!(f, "List({l:?})"),
             Value::Pair(a, b) => write!(f, "Pair({a:?}, {b:?})"),
@@ -76,7 +80,7 @@ impl PartialEq for Value {
         match (self, other) {
             (Value::Integer(a), Value::Integer(b)) => a == b,
             (Value::Boolean(a), Value::Boolean(b)) => a == b,
-            (Value::String(a), Value::String(b)) => *a.borrow() == *b.borrow(),
+            (Value::String(a, _), Value::String(b, _)) => *a.borrow() == *b.borrow(),
             (Value::Char(a), Value::Char(b)) => a == b,
             (Value::List(a), Value::List(b)) => a == b,
             (Value::Pair(a1, b1), Value::Pair(a2, b2)) => a1 == a2 && b1 == b2,
@@ -93,7 +97,7 @@ impl Value {
     /// Format for `display` — strings without quotes, chars as raw character.
     fn display_fmt(&self, out: &mut String) {
         match self {
-            Value::String(s) => out.push_str(&s.borrow()),
+            Value::String(s, _) => out.push_str(&s.borrow()),
             Value::Char(c) => out.push(*c),
             Value::Macro { .. } => out.push_str("#<macro>"),
             _ => out.push_str(&self.to_string()),
@@ -107,7 +111,7 @@ impl std::fmt::Display for Value {
             Value::Integer(n) => write!(f, "{n}"),
             Value::Boolean(true) => write!(f, "#t"),
             Value::Boolean(false) => write!(f, "#f"),
-            Value::String(s) => write!(f, "\"{}\"", s.borrow()),
+            Value::String(s, _) => write!(f, "\"{}\"", s.borrow()),
             Value::Char(c) => write!(f, "#\\{c}"),
             Value::List(elems) => {
                 write!(f, "(")?;
@@ -168,7 +172,7 @@ fn expr_to_value(expr: &Expr) -> Value {
     match &expr.kind {
         ExprKind::Integer(n) => Value::Integer(*n),
         ExprKind::Boolean(b) => Value::Boolean(*b),
-        ExprKind::Str(s) => make_string(s.clone()),
+        ExprKind::Str(s) => make_immutable_string(s.clone()),
         ExprKind::Char(c) => Value::Char(*c),
         ExprKind::Symbol(s) => Value::Symbol(s.clone()),
         ExprKind::List(elems) => Value::List(elems.iter().map(expr_to_value).collect()),
@@ -257,6 +261,10 @@ fn default_env() -> Env {
         ("string-ref", builtin_string_ref),
         ("string-copy", builtin_string_copy),
         ("string-set!", builtin_string_set),
+        ("string->list", builtin_string_to_list),
+        ("list->string", builtin_list_to_string),
+        ("char->integer", builtin_char_to_integer),
+        ("integer->char", builtin_integer_to_char),
         ("eq?", builtin_eq),
         ("equal?", builtin_equal),
         ("abs", builtin_abs),
@@ -782,7 +790,7 @@ fn step_eval(expr: Expr, env: Env, stack: &mut Vec<Frame>) -> Result<Act, EvalEr
     match &expr.kind {
         ExprKind::Integer(n) => Ok(Act::Ret(Value::Integer(*n))),
         ExprKind::Boolean(b) => Ok(Act::Ret(Value::Boolean(*b))),
-        ExprKind::Str(s) => Ok(Act::Ret(make_string(s.clone()))),
+        ExprKind::Str(s) => Ok(Act::Ret(make_immutable_string(s.clone()))),
         ExprKind::Char(c) => Ok(Act::Ret(Value::Char(*c))),
         ExprKind::Symbol(name) => env_get(&env, name)
             .map(Act::Ret)
@@ -1331,7 +1339,7 @@ fn builtin_type_pred(args: &[Value], name: &str) -> Result<Value, EvalError> {
         return Err(EvalError::Arity(format!("{name} expects 1 argument")));
     }
     let result = match name {
-        "string?" => matches!(&args[0], Value::String(_)),
+        "string?" => matches!(&args[0], Value::String(_, _)),
         "number?" => matches!(&args[0], Value::Integer(_)),
         "boolean?" => matches!(&args[0], Value::Boolean(_)),
         "pair?" => matches!(&args[0], Value::List(l) if !l.is_empty()) || matches!(&args[0], Value::Pair(..)),
@@ -1427,7 +1435,7 @@ fn builtin_string_append(args: &[Value]) -> Result<Value, EvalError> {
     let mut result = std::string::String::new();
     for arg in args {
         match arg {
-            Value::String(s) => result.push_str(&s.borrow()),
+            Value::String(s, _) => result.push_str(&s.borrow()),
             _ => return Err(EvalError::Type("string-append: expected string".into())),
         }
     }
@@ -1439,7 +1447,7 @@ fn builtin_string_length(args: &[Value]) -> Result<Value, EvalError> {
         return Err(EvalError::Arity("string-length expects 1 argument".into()));
     }
     match &args[0] {
-        Value::String(s) => Ok(Value::Integer(s.borrow().len() as i64)),
+        Value::String(s, _) => Ok(Value::Integer(s.borrow().len() as i64)),
         _ => Err(EvalError::Type("string-length: expected string".into())),
     }
 }
@@ -1449,7 +1457,7 @@ fn builtin_substring(args: &[Value]) -> Result<Value, EvalError> {
         return Err(EvalError::Arity("substring expects 3 arguments".into()));
     }
     match (&args[0], &args[1], &args[2]) {
-        (Value::String(s), Value::Integer(start), Value::Integer(end)) => {
+        (Value::String(s, _), Value::Integer(start), Value::Integer(end)) => {
             let s = s.borrow();
             let start = *start as usize;
             let end = *end as usize;
@@ -1467,7 +1475,7 @@ fn builtin_string_to_number(args: &[Value]) -> Result<Value, EvalError> {
         return Err(EvalError::Arity("string->number expects 1 argument".into()));
     }
     match &args[0] {
-        Value::String(s) => match s.borrow().parse::<i64>() {
+        Value::String(s, _) => match s.borrow().parse::<i64>() {
             Ok(n) => Ok(Value::Integer(n)),
             Err(_) => Ok(Value::Boolean(false)),
         },
@@ -1500,7 +1508,7 @@ fn builtin_string_to_symbol(args: &[Value]) -> Result<Value, EvalError> {
         return Err(EvalError::Arity("string->symbol expects 1 argument".into()));
     }
     match &args[0] {
-        Value::String(s) => Ok(Value::Symbol(s.borrow().clone())),
+        Value::String(s, _) => Ok(Value::Symbol(s.borrow().clone())),
         _ => Err(EvalError::Type("string->symbol: expected string".into())),
     }
 }
@@ -1510,7 +1518,7 @@ fn builtin_string_ref(args: &[Value]) -> Result<Value, EvalError> {
         return Err(EvalError::Arity("string-ref expects 2 arguments".into()));
     }
     match (&args[0], &args[1]) {
-        (Value::String(s), Value::Integer(idx)) => {
+        (Value::String(s, _), Value::Integer(idx)) => {
             let idx = *idx as usize;
             s.borrow().chars().nth(idx)
                 .map(Value::Char)
@@ -1525,7 +1533,7 @@ fn builtin_string_copy(args: &[Value]) -> Result<Value, EvalError> {
         return Err(EvalError::Arity("string-copy expects 1 argument".into()));
     }
     match &args[0] {
-        Value::String(s) => Ok(make_string(s.borrow().clone())),
+        Value::String(s, _) => Ok(make_string(s.borrow().clone())),
         _ => Err(EvalError::Type("string-copy: expected string".into())),
     }
 }
@@ -1535,14 +1543,16 @@ fn builtin_string_set(args: &[Value]) -> Result<Value, EvalError> {
         return Err(EvalError::Arity("string-set! expects 3 arguments".into()));
     }
     match (&args[0], &args[1], &args[2]) {
-        (Value::String(s), Value::Integer(idx), Value::Char(c)) => {
+        (Value::String(s, immutable), Value::Integer(idx), Value::Char(c)) => {
+            if *immutable {
+                return Err(EvalError::Type("string-set!: strings are immutable".into()));
+            }
             let idx = *idx as usize;
             let mut borrowed = s.borrow_mut();
-            let len = borrowed.len();
-            if idx >= len {
+            if idx >= borrowed.len() {
                 return Err(EvalError::Type("string-set!: index out of range".into()));
             }
-            // Safe for ASCII; for full Unicode we work char-by-char
+            // Replace the character at position idx
             let mut chars: Vec<char> = borrowed.chars().collect();
             if idx >= chars.len() {
                 return Err(EvalError::Type("string-set!: index out of range".into()));
@@ -1551,7 +1561,63 @@ fn builtin_string_set(args: &[Value]) -> Result<Value, EvalError> {
             *borrowed = chars.into_iter().collect();
             Ok(Value::Void)
         }
-        _ => Err(EvalError::Type("string-set!: expected string, integer, and char".into())),
+        _ => Err(EvalError::Type("string-set!: expected string, integer, char".into())),
+    }
+}
+
+fn builtin_string_to_list(args: &[Value]) -> Result<Value, EvalError> {
+    if args.len() != 1 {
+        return Err(EvalError::Arity("string->list expects 1 argument".into()));
+    }
+    match &args[0] {
+        Value::String(s, _) => {
+            let chars: Vec<Value> = s.borrow().chars().map(Value::Char).collect();
+            Ok(Value::List(chars))
+        }
+        _ => Err(EvalError::Type("string->list: expected string".into())),
+    }
+}
+
+fn builtin_list_to_string(args: &[Value]) -> Result<Value, EvalError> {
+    if args.len() != 1 {
+        return Err(EvalError::Arity("list->string expects 1 argument".into()));
+    }
+    match &args[0] {
+        Value::List(items) => {
+            let mut s = String::new();
+            for item in items {
+                match item {
+                    Value::Char(c) => s.push(*c),
+                    _ => return Err(EvalError::Type("list->string: expected list of characters".into())),
+                }
+            }
+            Ok(make_string(s))
+        }
+        _ => Err(EvalError::Type("list->string: expected list".into())),
+    }
+}
+
+fn builtin_char_to_integer(args: &[Value]) -> Result<Value, EvalError> {
+    if args.len() != 1 {
+        return Err(EvalError::Arity("char->integer expects 1 argument".into()));
+    }
+    match &args[0] {
+        Value::Char(c) => Ok(Value::Integer(*c as i64)),
+        _ => Err(EvalError::Type("char->integer: expected char".into())),
+    }
+}
+
+fn builtin_integer_to_char(args: &[Value]) -> Result<Value, EvalError> {
+    if args.len() != 1 {
+        return Err(EvalError::Arity("integer->char expects 1 argument".into()));
+    }
+    match &args[0] {
+        Value::Integer(n) => {
+            let c = char::from_u32(*n as u32)
+                .ok_or_else(|| EvalError::Type("integer->char: invalid code point".into()))?;
+            Ok(Value::Char(c))
+        }
+        _ => Err(EvalError::Type("integer->char: expected integer".into())),
     }
 }
 
@@ -1758,7 +1824,7 @@ fn builtin_char_lt(args: &[Value]) -> Result<Value, EvalError> {
 fn builtin_string_eq(args: &[Value]) -> Result<Value, EvalError> {
     if args.len() != 2 { return Err(EvalError::Arity("string=? expects 2 arguments".into())); }
     match (&args[0], &args[1]) {
-        (Value::String(a), Value::String(b)) => Ok(Value::Boolean(*a.borrow() == *b.borrow())),
+        (Value::String(a, _), Value::String(b, _)) => Ok(Value::Boolean(*a.borrow() == *b.borrow())),
         _ => Err(EvalError::Type("string=?: expected strings".into())),
     }
 }
@@ -1766,7 +1832,7 @@ fn builtin_string_eq(args: &[Value]) -> Result<Value, EvalError> {
 fn builtin_string_lt(args: &[Value]) -> Result<Value, EvalError> {
     if args.len() != 2 { return Err(EvalError::Arity("string<? expects 2 arguments".into())); }
     match (&args[0], &args[1]) {
-        (Value::String(a), Value::String(b)) => Ok(Value::Boolean(*a.borrow() < *b.borrow())),
+        (Value::String(a, _), Value::String(b, _)) => Ok(Value::Boolean(*a.borrow() < *b.borrow())),
         _ => Err(EvalError::Type("string<?: expected strings".into())),
     }
 }
@@ -1774,7 +1840,7 @@ fn builtin_string_lt(args: &[Value]) -> Result<Value, EvalError> {
 fn builtin_string_ci_eq(args: &[Value]) -> Result<Value, EvalError> {
     if args.len() != 2 { return Err(EvalError::Arity("string-ci=? expects 2 arguments".into())); }
     match (&args[0], &args[1]) {
-        (Value::String(a), Value::String(b)) => Ok(Value::Boolean(a.borrow().to_lowercase() == b.borrow().to_lowercase())),
+        (Value::String(a, _), Value::String(b, _)) => Ok(Value::Boolean(a.borrow().to_lowercase() == b.borrow().to_lowercase())),
         _ => Err(EvalError::Type("string-ci=?: expected strings".into())),
     }
 }
@@ -1782,7 +1848,7 @@ fn builtin_string_ci_eq(args: &[Value]) -> Result<Value, EvalError> {
 fn builtin_string_upcase(args: &[Value]) -> Result<Value, EvalError> {
     if args.len() != 1 { return Err(EvalError::Arity("string-upcase expects 1 argument".into())); }
     match &args[0] {
-        Value::String(s) => Ok(make_string(s.borrow().to_uppercase())),
+        Value::String(s, _) => Ok(make_string(s.borrow().to_uppercase())),
         _ => Err(EvalError::Type("string-upcase: expected string".into())),
     }
 }
@@ -1790,7 +1856,7 @@ fn builtin_string_upcase(args: &[Value]) -> Result<Value, EvalError> {
 fn builtin_string_downcase(args: &[Value]) -> Result<Value, EvalError> {
     if args.len() != 1 { return Err(EvalError::Arity("string-downcase expects 1 argument".into())); }
     match &args[0] {
-        Value::String(s) => Ok(make_string(s.borrow().to_lowercase())),
+        Value::String(s, _) => Ok(make_string(s.borrow().to_lowercase())),
         _ => Err(EvalError::Type("string-downcase: expected string".into())),
     }
 }
