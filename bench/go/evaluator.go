@@ -65,8 +65,8 @@ func makeBuiltin(name string, fn func([]*Value) (*Value, error)) *Value {
 	return &Value{Type: TypeBuiltin, Str: name, BuiltinFunc: fn}
 }
 
-func makeLambda(params []string, body []*Value, closure *Env) *Value {
-	return &Value{Type: TypeLambda, Params: params, Body: body, Closure: closure}
+func makeLambda(params []string, restParam string, body []*Value, closure *Env) *Value {
+	return &Value{Type: TypeLambda, Params: params, RestParam: restParam, Body: body, Closure: closure}
 }
 
 // tailCall is a sentinel used by the trampoline to indicate a tail call.
@@ -161,12 +161,9 @@ func evalList(expr *Value, env *Env) (*tailCall, *Value, error) {
 
 	// TCO: if applying a lambda, return a tail call
 	if fn.Type == TypeLambda {
-		if len(evalArgs) != len(fn.Params) {
-			return nil, nil, &EvalError{Message: fmt.Sprintf("expected %d arguments, got %d", len(fn.Params), len(evalArgs))}
-		}
-		localEnv := newEnv(fn.Closure)
-		for i, p := range fn.Params {
-			localEnv.set(p, evalArgs[i])
+		localEnv, err := bindLambdaArgs(fn, evalArgs)
+		if err != nil {
+			return nil, nil, err
 		}
 		// Evaluate all but last body expression, then tail-call the last
 		for i := 0; i < len(fn.Body)-1; i++ {
@@ -207,13 +204,9 @@ func evalDefine(args *Value, env *Env, expr *Value) (*Value, error) {
 	if target.Type == TypePair {
 		// (define (f params...) body...)
 		name := target.Car.Str
-		paramList := listToSlice(target.Cdr)
-		params := make([]string, len(paramList))
-		for i, p := range paramList {
-			params[i] = p.Str
-		}
+		params, restParam := parseParams(target.Cdr)
 		body := listToSlice(args.Cdr)
-		env.set(name, makeLambda(params, body, env))
+		env.set(name, makeLambda(params, restParam, body, env))
 		return voidValue, nil
 	}
 	return nil, evalErr(expr, "bad define syntax")
@@ -252,14 +245,28 @@ func evalIf(args *Value, env *Env, expr *Value) (*tailCall, *Value, error) {
 	return nil, voidValue, nil
 }
 
-func evalLambda(args *Value, env *Env) (*Value, error) {
-	paramList := listToSlice(args.Car)
-	params := make([]string, len(paramList))
-	for i, p := range paramList {
-		params[i] = p.Str
+// parseParams extracts fixed params and optional rest param from a parameter spec.
+// The spec can be: a proper list (x y), a dotted list (x y . rest), or a single symbol.
+func parseParams(paramSpec *Value) (params []string, restParam string) {
+	if paramSpec.Type == TypeSymbol {
+		// (lambda args body) — all args go to rest
+		return nil, paramSpec.Str
 	}
+	cur := paramSpec
+	for cur.Type == TypePair {
+		params = append(params, cur.Car.Str)
+		cur = cur.Cdr
+	}
+	if cur.Type == TypeSymbol {
+		restParam = cur.Str
+	}
+	return
+}
+
+func evalLambda(args *Value, env *Env) (*Value, error) {
+	params, restParam := parseParams(args.Car)
 	body := listToSlice(args.Cdr)
-	return makeLambda(params, body, env), nil
+	return makeLambda(params, restParam, body, env), nil
 }
 
 func evalAnd(args *Value, env *Env) (*tailCall, *Value, error) {
@@ -322,7 +329,7 @@ func evalLet(args *Value, env *Env) (*tailCall, *Value, error) {
 		}
 		bodySlice := listToSlice(body)
 		localEnv := newEnv(env)
-		lambda := makeLambda(params, bodySlice, localEnv)
+		lambda := makeLambda(params, "", bodySlice, localEnv)
 		localEnv.set(name, lambda)
 		// Set up env and tail-call into the body
 		callEnv := newEnv(localEnv)
@@ -406,20 +413,41 @@ func evalCond(args *Value, env *Env) (*tailCall, *Value, error) {
 
 // applyProc calls a procedure (builtin or lambda) with evaluated arguments.
 // Used only for non-tail-call positions now.
+// bindLambdaArgs creates a new env with lambda params bound to args.
+func bindLambdaArgs(fn *Value, args []*Value) (*Env, error) {
+	if fn.RestParam == "" {
+		if len(args) != len(fn.Params) {
+			return nil, &EvalError{Message: fmt.Sprintf("expected %d arguments, got %d", len(fn.Params), len(args))}
+		}
+	} else {
+		if len(args) < len(fn.Params) {
+			return nil, &EvalError{Message: fmt.Sprintf("expected at least %d arguments, got %d", len(fn.Params), len(args))}
+		}
+	}
+	localEnv := newEnv(fn.Closure)
+	for i, p := range fn.Params {
+		localEnv.set(p, args[i])
+	}
+	if fn.RestParam != "" {
+		rest := nullValue
+		for i := len(args) - 1; i >= len(fn.Params); i-- {
+			rest = makePair(args[i], rest)
+		}
+		localEnv.set(fn.RestParam, rest)
+	}
+	return localEnv, nil
+}
+
 func applyProc(fn *Value, args []*Value) (*Value, error) {
 	switch fn.Type {
 	case TypeBuiltin:
 		return fn.BuiltinFunc(args)
 	case TypeLambda:
-		if len(args) != len(fn.Params) {
-			return nil, &EvalError{Message: fmt.Sprintf("expected %d arguments, got %d", len(fn.Params), len(args))}
-		}
-		localEnv := newEnv(fn.Closure)
-		for i, p := range fn.Params {
-			localEnv.set(p, args[i])
+		localEnv, err := bindLambdaArgs(fn, args)
+		if err != nil {
+			return nil, err
 		}
 		var result *Value
-		var err error
 		for _, bodyExpr := range fn.Body {
 			result, err = eval(bodyExpr, localEnv)
 			if err != nil {
@@ -747,6 +775,26 @@ func builtinEnv(out *strings.Builder) *Env {
 				return nil, &EvalError{Message: "'char?' expects exactly one argument"}
 			}
 			return makeBool(args[0].Type == TypeChar), nil
+		},
+		"apply": func(args []*Value) (*Value, error) {
+			if len(args) < 2 {
+				return nil, &EvalError{Message: "'apply' expects at least two arguments"}
+			}
+			fn := args[0]
+			// Last arg must be a list; prefix args are prepended
+			lastArg := args[len(args)-1]
+			var callArgs []*Value
+			// Prefix args (between fn and the last list)
+			for i := 1; i < len(args)-1; i++ {
+				callArgs = append(callArgs, args[i])
+			}
+			// Flatten the last argument (must be a list)
+			cur := lastArg
+			for cur.Type == TypePair {
+				callArgs = append(callArgs, cur.Car)
+				cur = cur.Cdr
+			}
+			return applyProc(fn, callArgs)
 		},
 	}
 	for name, fn := range builtinDefs {

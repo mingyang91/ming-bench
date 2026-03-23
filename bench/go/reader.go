@@ -32,9 +32,10 @@ type Value struct {
 	Car     *Value
 	Cdr     *Value
 	// Lambda fields
-	Params  []string
-	Body    []*Value
-	Closure *Env
+	Params    []string
+	RestParam string // variadic rest parameter name (empty if none)
+	Body      []*Value
+	Closure   *Env
 	// Builtin function
 	BuiltinFunc func([]*Value) (*Value, error)
 	// Source position
@@ -220,6 +221,26 @@ func (r *reader) readList() (*Value, error) {
 			r.next()
 			// Build list from items
 			result := nullValue
+			for i := len(items) - 1; i >= 0; i-- {
+				result = makePair(items[i], result)
+			}
+			return result, nil
+		}
+		// Check for dot notation
+		if r.peek() == '.' && r.pos+1 < len(r.input) && isDelimiter(r.input[r.pos+1]) {
+			r.next() // consume '.'
+			r.skipWhitespaceAndComments()
+			cdr, err := r.readExpr()
+			if err != nil {
+				return nil, err
+			}
+			r.skipWhitespaceAndComments()
+			if r.atEnd() || r.peek() != ')' {
+				return nil, &EvalError{Message: "expected ')' after dotted pair", Line: r.line, Col: r.col}
+			}
+			r.next() // consume ')'
+			// Build dotted list
+			result := cdr
 			for i := len(items) - 1; i >= 0; i-- {
 				result = makePair(items[i], result)
 			}
