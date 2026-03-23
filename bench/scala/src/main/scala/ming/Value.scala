@@ -4,7 +4,7 @@ package ming
 enum Value:
   case IntVal(n: Long)
   case BoolVal(b: Boolean)
-  case StrVal(s: String)
+  case StrVal(chars: Array[Char])
   case PairVal(car: Value, cdr: Value)
   case NilVal
   case SymbolVal(name: String)
@@ -15,7 +15,7 @@ enum Value:
   def display: String = this match
     case IntVal(n)           => n.toString
     case BoolVal(b)          => if b then "#t" else "#f"
-    case StrVal(s)           => s"\"$s\""
+    case StrVal(chars)       => s"\"${new String(chars)}\""
     case NilVal              => "()"
     case SymbolVal(name)     => name
     case PairVal(_, _)       => displayList(this)
@@ -25,8 +25,8 @@ enum Value:
 
   /** Display without quotes (for `display` builtin). */
   def displayNoQuotes: String = this match
-    case StrVal(s) => s
-    case other     => other.display
+    case StrVal(chars) => new String(chars)
+    case other         => other.display
 
   def isTruthy: Boolean = this match
     case BoolVal(false) => false

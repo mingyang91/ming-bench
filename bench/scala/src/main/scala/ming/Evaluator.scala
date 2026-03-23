@@ -41,7 +41,8 @@ object Evaluator:
   private def eval(expr: Expr, env: Env): Value = expr match
     case Num(n, _)                            => IntVal(n)
     case Bool(b, _)                           => BoolVal(b)
-    case Str(s, _)                            => StrVal(s)
+    case Str(s, _)                            => StrVal(s.toCharArray)
+    case Chr(c, _)                            => CharVal(c)
     case Sym(name, pos)                       => env.lookup(name, pos)
     case SList(Nil, pos)                      => evalError("empty application", pos)
     case SList(Sym("if", _) :: args, pos)     => evalIf(args, env, pos)
@@ -91,7 +92,8 @@ object Evaluator:
   private def exprToValue(expr: Expr): Value = expr match
     case Num(n, _)  => IntVal(n)
     case Bool(b, _) => BoolVal(b)
-    case Str(s, _)  => StrVal(s)
+    case Str(s, _)  => StrVal(s.toCharArray)
+    case Chr(c, _)  => CharVal(c)
     case Sym(s, _)  => SymbolVal(s)
     case SList(elems, _) =>
       elems.foldRight(NilVal: Value)((e, acc) => PairVal(exprToValue(e), acc))

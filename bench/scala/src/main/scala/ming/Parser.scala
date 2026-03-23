@@ -112,8 +112,19 @@ object Parser:
   private def parseAtom(token: String, pos: Pos): Expr =
     if token == "#t" then Bool(true, Some(pos))
     else if token == "#f" then Bool(false, Some(pos))
+    else if token.startsWith("#\\") then parseCharLiteral(token, pos)
     else if token.startsWith("\"") && token.endsWith("\"") then Str(token.substring(1, token.length - 1), Some(pos))
     else
       token.toLongOption match
         case Some(n) => Num(n, Some(pos))
         case None    => Sym(token, Some(pos))
+
+  private def parseCharLiteral(token: String, pos: Pos): Expr =
+    val name = token.substring(2)
+    val ch = name match
+      case "space"            => ' '
+      case "newline"          => '\n'
+      case "tab"              => '\t'
+      case s if s.length == 1 => s.charAt(0)
+      case _                  => throw new EvalError(s"unknown character name: $name")
+    Chr(ch, Some(pos))

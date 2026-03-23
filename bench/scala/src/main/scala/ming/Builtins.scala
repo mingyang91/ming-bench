@@ -8,7 +8,8 @@ object Builtins:
   def register(env: Env, output: StringBuilder): Unit =
     registerArithmetic(env)
     registerListOps(env)
-    registerStringOps(env, output)
+    registerIOOps(env, output)
+    registerStringOps(env)
 
   private def define(env: Env, entries: List[(String, List[Value] => Value)]): Unit =
     entries.foreach((name, fn) => env.define(name, BuiltinVal(name, fn)))
@@ -100,7 +101,7 @@ object Builtins:
       )
     )
 
-  private def registerStringOps(env: Env, output: StringBuilder): Unit =
+  private def registerIOOps(env: Env, output: StringBuilder): Unit =
     define(
       env,
       List(
@@ -124,30 +125,37 @@ object Builtins:
             if args.nonEmpty then throw new EvalError("newline: expected 0 arguments")
             output.append("\n")
             BoolVal(true)
-        ),
+        )
+      )
+    )
+
+  private def registerStringOps(env: Env): Unit =
+    define(
+      env,
+      List(
         (
           "string-append",
           args =>
             val strs = args.map {
-              case StrVal(s) => s
-              case other     => throw new EvalError(s"string-append: not a string: ${other.display}")
+              case StrVal(chars) => new String(chars)
+              case other         => throw new EvalError(s"string-append: not a string: ${other.display}")
             }
-            StrVal(strs.mkString)
+            StrVal(strs.mkString.toCharArray)
         ),
         (
           "string-length",
           args =>
             if args.length != 1 then throw new EvalError("string-length: expected 1 argument")
             args.head match
-              case StrVal(s) => IntVal(s.length.toLong)
-              case other     => throw new EvalError(s"string-length: not a string: ${other.display}")
+              case StrVal(chars) => IntVal(chars.length.toLong)
+              case other         => throw new EvalError(s"string-length: not a string: ${other.display}")
         ),
         (
           "substring",
           args =>
             args match
-              case StrVal(s) :: IntVal(start) :: IntVal(end) :: Nil =>
-                StrVal(s.substring(start.toInt, end.toInt))
+              case StrVal(chars) :: IntVal(start) :: IntVal(end) :: Nil =>
+                StrVal(java.util.Arrays.copyOfRange(chars, start.toInt, end.toInt))
               case _ => throw new EvalError("substring: expected (string, start, end)")
         ),
         (
@@ -155,7 +163,8 @@ object Builtins:
           args =>
             if args.length != 1 then throw new EvalError("string->number: expected 1 argument")
             args.head match
-              case StrVal(s) =>
+              case StrVal(chars) =>
+                val s = new String(chars)
                 try IntVal(s.toLong)
                 catch case _: NumberFormatException => BoolVal(false)
               case other => throw new EvalError(s"string->number: not a string: ${other.display}")
@@ -165,7 +174,7 @@ object Builtins:
           args =>
             if args.length != 1 then throw new EvalError("number->string: expected 1 argument")
             args.head match
-              case IntVal(n) => StrVal(n.toString)
+              case IntVal(n) => StrVal(n.toString.toCharArray)
               case other     => throw new EvalError(s"number->string: not a number: ${other.display}")
         ),
         (
@@ -173,7 +182,7 @@ object Builtins:
           args =>
             if args.length != 1 then throw new EvalError("symbol->string: expected 1 argument")
             args.head match
-              case SymbolVal(name) => StrVal(name)
+              case SymbolVal(name) => StrVal(name.toCharArray)
               case other           => throw new EvalError(s"symbol->string: not a symbol: ${other.display}")
         ),
         (
@@ -181,15 +190,32 @@ object Builtins:
           args =>
             if args.length != 1 then throw new EvalError("string->symbol: expected 1 argument")
             args.head match
-              case StrVal(s) => SymbolVal(s)
-              case other     => throw new EvalError(s"string->symbol: not a string: ${other.display}")
+              case StrVal(chars) => SymbolVal(new String(chars))
+              case other         => throw new EvalError(s"string->symbol: not a string: ${other.display}")
         ),
         (
           "string-ref",
           args =>
             args match
-              case StrVal(s) :: IntVal(idx) :: Nil => CharVal(s.charAt(idx.toInt))
-              case _                               => throw new EvalError("string-ref: expected (string, index)")
+              case StrVal(chars) :: IntVal(idx) :: Nil => CharVal(chars(idx.toInt))
+              case _                                   => throw new EvalError("string-ref: expected (string, index)")
+        ),
+        (
+          "string-copy",
+          args =>
+            if args.length != 1 then throw new EvalError("string-copy: expected 1 argument")
+            args.head match
+              case StrVal(chars) => StrVal(chars.clone())
+              case other         => throw new EvalError(s"string-copy: not a string: ${other.display}")
+        ),
+        (
+          "string-set!",
+          args =>
+            args match
+              case StrVal(chars) :: IntVal(idx) :: CharVal(c) :: Nil =>
+                chars(idx.toInt) = c
+                BoolVal(true)
+              case _ => throw new EvalError("string-set!: expected (string, index, char)")
         )
       )
     )
