@@ -33,7 +33,7 @@ public class Evaluator {
     private static final Set<String> SPECIAL_FORMS = Set.of(
         "define", "if", "quote", "lambda", "let", "begin", "cond", "set!",
         "and", "or", "define-syntax", "syntax-rules",
-        "letrec", "letrec*", "case", "do"
+        "letrec", "letrec*", "case", "do", "guard"
     );
 
     private static final String[] BUILTIN_NAMES = {
@@ -62,7 +62,9 @@ public class Evaluator {
         "vector", "make-vector", "vector-ref", "vector-set!", "vector-length", "vector?",
         "vector->list", "list->vector",
         // L16 builtins
-        "dynamic-wind", "reverse"
+        "dynamic-wind", "reverse",
+        // L17 builtins
+        "raise", "with-exception-handler"
     };
 
     {
@@ -273,6 +275,7 @@ public class Evaluator {
                 case "letrec*" -> { return evalLetrecTail(args, env, pos, true); }
                 case "case" -> { return evalCaseTail(args, env, pos); }
                 case "do" -> { return evalDo(args, env, pos); }
+                case "guard" -> { return evalGuard(args, env, pos); }
                 default -> {
                     SchemeValue builtinResult = tryBuiltin(op, args, env, pos);
                     if (builtinResult != null) return builtinResult;
@@ -535,6 +538,8 @@ public class Evaluator {
             // L16 builtins
             case "dynamic-wind" -> builtinDynamicWind(args, env, pos);
             case "reverse" -> builtinReverse(args, env, pos);
+            // L17: raise and with-exception-handler are handled via applyBuiltinEvaled
+            // (not here) so that local definitions can shadow them
             default -> null;
         };
     }
@@ -1031,6 +1036,12 @@ public class Evaluator {
             windStack.removeLast();
             evalContinuation(applyTail(outThunk, List.of(), pos));
             throw cr;
+        } catch (SchemeRaise sr) {
+            // Exception raised: clean up and propagate
+            contStack.pop(); // remove WindExitFrame
+            windStack.removeLast();
+            evalContinuation(applyTail(outThunk, List.of(), pos));
+            throw sr;
         }
 
         // Normal exit: clean up
@@ -1078,6 +1089,87 @@ public class Evaluator {
         var reversed = new ArrayList<>(lst.elements());
         java.util.Collections.reverse(reversed);
         return new SchemeValue.ListVal(reversed, SourcePos.NONE);
+    }
+
+    // --- L17: raise, guard, with-exception-handler ---
+
+    private SchemeValue builtinRaise(List<SchemeValue> args, Environment env, SourcePos pos) throws EvalError {
+        if (args.size() != 1) throw posError(pos, "raise: need exactly 1 argument");
+        SchemeValue val = eval(args.getFirst(), env);
+        throw new SchemeRaise(val);
+    }
+
+    private SchemeValue builtinWithExceptionHandler(List<SchemeValue> args, Environment env, SourcePos pos) throws EvalError {
+        if (args.size() != 2) throw posError(pos, "with-exception-handler: need exactly 2 arguments");
+        SchemeValue handler = eval(args.get(0), env);
+        SchemeValue thunk = eval(args.get(1), env);
+        try {
+            return evalContinuation(applyTail(thunk, List.of(), pos));
+        } catch (SchemeRaise sr) {
+            return evalContinuation(applyTail(handler, List.of(sr.value), pos));
+        }
+    }
+
+    /**
+     * (guard (var clause ...) body ...)
+     * Evaluate body. If it raises, bind var to raised value and evaluate clauses like cond.
+     * If no clause matches and no else, re-raise.
+     */
+    private SchemeValue evalGuard(List<SchemeValue> args, Environment env, SourcePos pos) throws EvalError {
+        if (args.size() < 2) throw posError(pos, "guard: need clauses and body");
+        SchemeValue clauseSpec = args.getFirst();
+        if (!(clauseSpec instanceof SchemeValue.ListVal clauseList) || clauseList.elements().size() < 2)
+            throw posError(pos, "guard: invalid clause specification");
+
+        List<SchemeValue> clauseElems = clauseList.elements();
+        if (!(clauseElems.getFirst() instanceof SchemeValue.SymbolVal varSym))
+            throw posError(pos, "guard: first element must be a variable name");
+
+        String varName = varSym.name();
+        List<SchemeValue> clauses = clauseElems.subList(1, clauseElems.size());
+        List<SchemeValue> body = args.subList(1, args.size());
+
+        // Evaluate body expressions
+        try {
+            SchemeValue result = null;
+            for (SchemeValue expr : body) {
+                result = eval(expr, env);
+            }
+            return result;
+        } catch (SchemeRaise sr) {
+            // Bind the raised value to the variable and evaluate clauses
+            Environment guardEnv = new Environment(env);
+            guardEnv.define(varName, sr.value);
+
+            for (SchemeValue clause : clauses) {
+                if (!(clause instanceof SchemeValue.ListVal cl) || cl.elements().isEmpty())
+                    throw posError(pos, "guard: invalid clause");
+                List<SchemeValue> clElems = cl.elements();
+
+                // Check for else clause
+                if (clElems.getFirst() instanceof SchemeValue.SymbolVal s && s.name().equals("else")) {
+                    SchemeValue result = null;
+                    for (int i = 1; i < clElems.size(); i++) {
+                        result = eval(clElems.get(i), guardEnv);
+                    }
+                    return result;
+                }
+
+                // Evaluate test
+                SchemeValue test = eval(clElems.getFirst(), guardEnv);
+                if (test.isTruthy()) {
+                    if (clElems.size() == 1) return test;
+                    SchemeValue result = null;
+                    for (int i = 1; i < clElems.size(); i++) {
+                        result = eval(clElems.get(i), guardEnv);
+                    }
+                    return result;
+                }
+            }
+
+            // No clause matched, re-raise
+            throw sr;
+        }
     }
 
     /** Resolve a value that may be a Thunk (trampoline). Used after applyTail. */
@@ -1556,6 +1648,20 @@ public class Evaluator {
                 var reversed = new ArrayList<>(lst.elements());
                 java.util.Collections.reverse(reversed);
                 yield new SchemeValue.ListVal(reversed, SourcePos.NONE);
+            }
+            case "raise" -> {
+                if (args.size() != 1) throw posError(pos, "raise: need exactly 1 argument");
+                throw new SchemeRaise(args.getFirst());
+            }
+            case "with-exception-handler" -> {
+                if (args.size() != 2) throw posError(pos, "with-exception-handler: need exactly 2 arguments");
+                SchemeValue handler = args.get(0);
+                SchemeValue thunk = args.get(1);
+                try {
+                    yield evalContinuation(applyTail(thunk, List.of(), pos));
+                } catch (SchemeRaise sr) {
+                    yield evalContinuation(applyTail(handler, List.of(sr.value), pos));
+                }
             }
             default -> throw posError(pos, "unknown builtin: " + name);
         };
