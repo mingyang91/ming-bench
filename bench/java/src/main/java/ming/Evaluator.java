@@ -8,6 +8,8 @@ import java.util.List;
  * Agents implement this class.
  */
 public class Evaluator {
+    private final StringBuilder outputBuffer = new StringBuilder();
+
     /**
      * Evaluate one or more Scheme expressions and return the string
      * representation of the last result.
@@ -30,7 +32,17 @@ public class Evaluator {
      * and any captured output from display/write/newline.
      */
     public EvalResult evalStrWithOutput(String input) throws EvalError {
-        throw new EvalError("not implemented");
+        outputBuffer.setLength(0);
+        var tokens = new Tokenizer(input).tokenize();
+        var exprs = new Parser(tokens).parseAll();
+        if (exprs.isEmpty()) throw new EvalError("No expressions");
+        Environment env = createGlobalEnv();
+        SchemeValue result = null;
+        for (SchemeValue expr : exprs) {
+            result = eval(expr, env);
+        }
+        String resultStr = (result instanceof SchemeValue.VoidVal) ? "#<void>" : result.display();
+        return new EvalResult(resultStr, outputBuffer.toString());
     }
 
     private Environment createGlobalEnv() {
@@ -141,6 +153,75 @@ public class Evaluator {
             new SchemeValue.BoolVal(args.getFirst() instanceof SchemeValue.PairVal)));
         env.define("symbol?", new SchemeValue.BuiltinVal("symbol?", args ->
             new SchemeValue.BoolVal(args.getFirst() instanceof SchemeValue.SymbolVal)));
+        env.define("char?", new SchemeValue.BuiltinVal("char?", args ->
+            new SchemeValue.BoolVal(args.getFirst() instanceof SchemeValue.CharVal)));
+
+        // I/O
+        env.define("display", new SchemeValue.BuiltinVal("display", args -> {
+            if (args.size() != 1) throw new EvalError("display requires exactly 1 argument");
+            SchemeValue val = args.getFirst();
+            if (val instanceof SchemeValue.StringVal s) {
+                outputBuffer.append(s.value());
+            } else if (val instanceof SchemeValue.CharVal c) {
+                outputBuffer.append(c.value());
+            } else {
+                outputBuffer.append(val.display());
+            }
+            return new SchemeValue.VoidVal();
+        }));
+        env.define("write", new SchemeValue.BuiltinVal("write", args -> {
+            if (args.size() != 1) throw new EvalError("write requires exactly 1 argument");
+            outputBuffer.append(args.getFirst().display());
+            return new SchemeValue.VoidVal();
+        }));
+        env.define("newline", new SchemeValue.BuiltinVal("newline", args -> {
+            outputBuffer.append('\n');
+            return new SchemeValue.VoidVal();
+        }));
+
+        // String operations
+        env.define("string-append", new SchemeValue.BuiltinVal("string-append", args -> {
+            StringBuilder sb = new StringBuilder();
+            for (SchemeValue arg : args) {
+                if (!(arg instanceof SchemeValue.StringVal s)) throw new EvalError("string-append: not a string");
+                sb.append(s.value());
+            }
+            return new SchemeValue.StringVal(sb.toString());
+        }));
+        env.define("string-length", new SchemeValue.BuiltinVal("string-length", args -> {
+            if (!(args.getFirst() instanceof SchemeValue.StringVal s)) throw new EvalError("string-length: not a string");
+            return new SchemeValue.IntVal(s.value().length());
+        }));
+        env.define("substring", new SchemeValue.BuiltinVal("substring", args -> {
+            if (!(args.get(0) instanceof SchemeValue.StringVal s)) throw new EvalError("substring: not a string");
+            int start = (int) requireInt(args.get(1));
+            int end = (int) requireInt(args.get(2));
+            return new SchemeValue.StringVal(s.value().substring(start, end));
+        }));
+        env.define("string->number", new SchemeValue.BuiltinVal("string->number", args -> {
+            if (!(args.getFirst() instanceof SchemeValue.StringVal s)) throw new EvalError("string->number: not a string");
+            try {
+                return new SchemeValue.IntVal(Long.parseLong(s.value()));
+            } catch (NumberFormatException e) {
+                return new SchemeValue.BoolVal(false);
+            }
+        }));
+        env.define("number->string", new SchemeValue.BuiltinVal("number->string", args -> {
+            return new SchemeValue.StringVal(String.valueOf(requireInt(args.getFirst())));
+        }));
+        env.define("symbol->string", new SchemeValue.BuiltinVal("symbol->string", args -> {
+            if (!(args.getFirst() instanceof SchemeValue.SymbolVal s)) throw new EvalError("symbol->string: not a symbol");
+            return new SchemeValue.StringVal(s.name());
+        }));
+        env.define("string->symbol", new SchemeValue.BuiltinVal("string->symbol", args -> {
+            if (!(args.getFirst() instanceof SchemeValue.StringVal s)) throw new EvalError("string->symbol: not a string");
+            return new SchemeValue.SymbolVal(s.value());
+        }));
+        env.define("string-ref", new SchemeValue.BuiltinVal("string-ref", args -> {
+            if (!(args.get(0) instanceof SchemeValue.StringVal s)) throw new EvalError("string-ref: not a string");
+            int idx = (int) requireInt(args.get(1));
+            return new SchemeValue.CharVal(s.value().charAt(idx));
+        }));
     }
 
     private SchemeValue appendTwo(SchemeValue a, SchemeValue b) throws EvalError {
@@ -156,6 +237,7 @@ public class Evaluator {
             case SchemeValue.IntVal v -> v;
             case SchemeValue.BoolVal v -> v;
             case SchemeValue.StringVal v -> v;
+            case SchemeValue.CharVal v -> v;
             case SchemeValue.VoidVal v -> v;
             case SchemeValue.NilVal v -> v;
             case SchemeValue.PairVal v -> v;

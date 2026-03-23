@@ -15,6 +15,7 @@ public sealed interface SchemeValue {
     record PairVal(SchemeValue car, SchemeValue cdr) implements SchemeValue {}
     record NilVal() implements SchemeValue {}
     record LambdaVal(List<String> params, List<SchemeValue> body, Environment env) implements SchemeValue {}
+    record CharVal(char value) implements SchemeValue {}
     record VoidVal() implements SchemeValue {}
 
     @FunctionalInterface
@@ -46,6 +47,7 @@ public sealed interface SchemeValue {
                 sb.append(')');
                 yield sb.toString();
             }
+            case CharVal v -> "#\\" + (v.value() == ' ' ? "space" : v.value() == '\n' ? "newline" : String.valueOf(v.value()));
             case LambdaVal v -> "#<procedure>";
             case VoidVal v -> "#<void>";
             case BuiltinVal v -> "#<procedure:" + v.name() + ">";
