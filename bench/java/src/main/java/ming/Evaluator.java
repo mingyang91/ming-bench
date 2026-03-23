@@ -150,6 +150,12 @@ public class Evaluator {
 
         void define(String name, Object value) { bindings.put(name, value); }
 
+        Set<String> allNames() {
+            Set<String> names = new HashSet<>(bindings.keySet());
+            if (parent != null) names.addAll(parent.allNames());
+            return names;
+        }
+
         boolean set(String name, Object value) {
             if (bindings.containsKey(name)) { bindings.put(name, value); return true; }
             if (parent != null) return parent.set(name, value);
@@ -189,6 +195,23 @@ public class Evaluator {
         }
     }
 
+    // syntax-case transformer: wraps a procedure (Lambda) used as macro transformer
+    private static class SyntaxCaseTransformer {
+        final Object transformer; // Lambda or NativeProc
+        final Env defEnv;
+        final Set<String> defTimeNames; // snapshot of defined names at macro definition time
+        SyntaxCaseTransformer(Object transformer, Env defEnv, Set<String> defTimeNames) {
+            this.transformer = transformer;
+            this.defEnv = defEnv;
+            this.defTimeNames = defTimeNames;
+        }
+    }
+
+    // Key for storing pattern bindings in environment during syntax-case expansion
+    private static final String SYNTAX_BINDINGS_KEY = "##syntax-bindings##";
+    private static final String SYNTAX_DEF_ENV_KEY = "##syntax-def-env##";
+    private static final String SYNTAX_DEF_NAMES_KEY = "##syntax-def-names##";
+
     private static class EnvRef {
         final String name;
         final Env env;
@@ -222,7 +245,8 @@ public class Evaluator {
     private static final java.util.Set<String> SPECIAL_FORMS = java.util.Set.of(
         "define", "if", "quote", "lambda", "and", "or", "let", "let*", "begin",
         "set!", "cond", "define-syntax", "syntax-rules",
-        "letrec", "letrec*", "case", "do", "guard", "define-record-type"
+        "letrec", "letrec*", "case", "do", "guard", "define-record-type",
+        "syntax-case", "syntax", "with-syntax"
     );
 
     private Object unwrapLoc(Object o) {
@@ -321,6 +345,10 @@ public class Evaluator {
                         }
                         col += (ci - i);
                         i = ci;
+                    } else if (next == '\'') {
+                        // #' is syntax-quote shorthand
+                        tokens.add(new Token("#'", line, startCol));
+                        i += 2; col += 2;
                     } else {
                         throw new EvalError(line + ":" + col + ": unknown token: #" + next);
                     }
@@ -383,6 +411,13 @@ public class Evaluator {
             quoteExpr.add("quote");
             quoteExpr.add(quoted);
             return new Located(quoteExpr, tok.line(), tok.col());
+        }
+        if (tok.value().equals("#'")) {
+            Object syntaxed = parse(tokens, pos);
+            List<Object> syntaxExpr = new ArrayList<>();
+            syntaxExpr.add("syntax");
+            syntaxExpr.add(syntaxed);
+            return new Located(syntaxExpr, tok.line(), tok.col());
         }
         if (tok.value().equals("(")) {
             List<Object> list = new ArrayList<>();
@@ -612,40 +647,61 @@ public class Evaluator {
                         Object transformer = list.get(2);
                         if (transformer instanceof Located lt) transformer = lt.value();
                         if (!(transformer instanceof List<?> transExpr) || transExpr.size() < 2)
-                            throw posError("define-syntax: expected syntax-rules");
+                            throw posError("define-syntax: bad transformer");
                         Object transHead = transExpr.get(0);
                         if (transHead instanceof Located lth) transHead = lth.value();
-                        if (!(transHead instanceof String th && th.equals("syntax-rules")))
-                            throw posError("define-syntax: expected syntax-rules");
-                        Object literalsObj = transExpr.get(1);
-                        if (literalsObj instanceof Located ll) literalsObj = ll.value();
-                        if (!(literalsObj instanceof List<?> literalsList))
-                            throw posError("syntax-rules: expected literals list");
-                        List<String> literals = new ArrayList<>();
-                        for (Object l : literalsList) {
-                            if (l instanceof Located ll2) l = ll2.value();
-                            if (!(l instanceof String ls)) throw posError("syntax-rules: literal must be a symbol");
-                            literals.add(ls);
+                        if (transHead instanceof String th && th.equals("syntax-rules")) {
+                            // syntax-rules form
+                            Object literalsObj = transExpr.get(1);
+                            if (literalsObj instanceof Located ll) literalsObj = ll.value();
+                            if (!(literalsObj instanceof List<?> literalsList))
+                                throw posError("syntax-rules: expected literals list");
+                            List<String> literals = new ArrayList<>();
+                            for (Object l : literalsList) {
+                                if (l instanceof Located ll2) l = ll2.value();
+                                if (!(l instanceof String ls)) throw posError("syntax-rules: literal must be a symbol");
+                                literals.add(ls);
+                            }
+                            List<List<Object>> patterns = new ArrayList<>();
+                            List<Object> templates = new ArrayList<>();
+                            for (int i = 2; i < transExpr.size(); i++) {
+                                Object clause = transExpr.get(i);
+                                if (clause instanceof Located lc) clause = lc.value();
+                                if (!(clause instanceof List<?> clauseList) || clauseList.size() != 2)
+                                    throw posError("syntax-rules: bad clause");
+                                Object pattern = clauseList.get(0);
+                                if (pattern instanceof Located lp) pattern = lp.value();
+                                if (!(pattern instanceof List<?> patList))
+                                    throw posError("syntax-rules: pattern must be a list");
+                                @SuppressWarnings("unchecked")
+                                List<Object> typedPatList = (List<Object>) patList;
+                                patterns.add(typedPatList);
+                                templates.add(clauseList.get(1));
+                            }
+                            env.define(macroName, new SyntaxRulesMacro(literals, patterns, templates, env));
+                            return k.apply(VOID);
+                        } else if (transHead instanceof String th && th.equals("lambda")) {
+                            // lambda transformer for syntax-case macros
+                            final String fMacroName = macroName;
+                            final Env defEnv = env;
+                            final Object fTransformer = transformer;
+                            final Set<String> defTimeNames = env.allNames();
+                            return new More(() -> eval(fTransformer, env, transformerProc -> {
+                                defEnv.define(fMacroName, new SyntaxCaseTransformer(transformerProc, defEnv, defTimeNames));
+                                return k.apply(VOID);
+                            }));
+                        } else {
+                            throw posError("define-syntax: expected syntax-rules or lambda");
                         }
-                        List<List<Object>> patterns = new ArrayList<>();
-                        List<Object> templates = new ArrayList<>();
-                        for (int i = 2; i < transExpr.size(); i++) {
-                            Object clause = transExpr.get(i);
-                            if (clause instanceof Located lc) clause = lc.value();
-                            if (!(clause instanceof List<?> clauseList) || clauseList.size() != 2)
-                                throw posError("syntax-rules: bad clause");
-                            Object pattern = clauseList.get(0);
-                            if (pattern instanceof Located lp) pattern = lp.value();
-                            if (!(pattern instanceof List<?> patList))
-                                throw posError("syntax-rules: pattern must be a list");
-                            @SuppressWarnings("unchecked")
-                            List<Object> typedPatList = (List<Object>) patList;
-                            patterns.add(typedPatList);
-                            templates.add(clauseList.get(1));
-                        }
-                        final String fMacroName = macroName;
-                        env.define(fMacroName, new SyntaxRulesMacro(literals, patterns, templates, env));
-                        return k.apply(VOID);
+                    }
+                    case "syntax-case" -> {
+                        return evalSyntaxCase(list, env, k);
+                    }
+                    case "syntax" -> {
+                        return evalSyntaxTemplate(list, env, k);
+                    }
+                    case "with-syntax" -> {
+                        return evalWithSyntax(list, env, k);
                     }
                 }
 
@@ -654,6 +710,16 @@ public class Evaluator {
                 if (macroVal instanceof SyntaxRulesMacro macro) {
                     Object expanded = expandMacro(macro, list);
                     return new More(() -> eval(expanded, env, k));
+                }
+                if (macroVal instanceof SyntaxCaseTransformer sct) {
+                    // Store the defEnv and defTimeNames for hygiene before calling transformer
+                    if (sct.transformer instanceof Lambda lam) {
+                        lam.closure.define(SYNTAX_DEF_ENV_KEY, sct.defEnv);
+                        lam.closure.define(SYNTAX_DEF_NAMES_KEY, sct.defTimeNames);
+                    }
+                    return new More(() -> applyProc(sct.transformer, List.of(list), expanded -> {
+                        return new More(() -> eval(expanded, env, k));
+                    }));
                 }
             }
 
@@ -1171,7 +1237,7 @@ public class Evaluator {
                 literals.contains(sym) || sym.equals("...") ||
                 renaming.containsKey(sym) || PRIMITIVES.contains(sym)) return;
             Object val = defEnv.lookup(sym);
-            if (val instanceof SyntaxRulesMacro) {
+            if (val instanceof SyntaxRulesMacro || val instanceof SyntaxCaseTransformer) {
                 return; // keep macro names as-is for recognition
             } else if (val != null) {
                 renaming.put(sym, new EnvRef(sym, defEnv));
@@ -1179,6 +1245,11 @@ public class Evaluator {
                 renaming.put(sym, gensym(sym));
             }
         } else if (template instanceof List<?> list) {
+            // Skip inside quote forms — quoted symbols should not be renamed
+            if (!list.isEmpty()) {
+                Object head = unwrapLoc(list.get(0));
+                if (head instanceof String s && s.equals("quote")) return;
+            }
             for (Object elem : list) {
                 collectHygieneRenames(elem, patVars, literals, defEnv, renaming);
             }
@@ -1234,6 +1305,209 @@ public class Evaluator {
             for (Object elem : list) vars.addAll(findEllipsisVars(elem, bindings));
         }
         return vars;
+    }
+
+    // --- syntax-case support ---
+
+    // (syntax-case expr (literals) clause ...)
+    // clause = (pattern body) or (pattern fender body)
+    private Bounce evalSyntaxCase(List<?> list, Env env, Cont k) throws EvalError {
+        if (list.size() < 3) throw posError("syntax-case: bad syntax");
+        Object exprForm = list.get(1);
+        Object literalsObj = list.get(2);
+        if (literalsObj instanceof Located ll) literalsObj = ll.value();
+        if (!(literalsObj instanceof List<?> literalsList))
+            throw posError("syntax-case: expected literals list");
+        List<String> literals = new ArrayList<>();
+        for (Object l : literalsList) {
+            if (l instanceof Located ll2) l = ll2.value();
+            if (l instanceof String ls) literals.add(ls);
+        }
+        // Evaluate the expression
+        return new More(() -> eval(exprForm, env, inputVal -> {
+            // inputVal is the syntax object (in our impl, a Java List or value)
+            // Try each clause
+            return trySyntaxCaseClauses(list, 3, inputVal, literals, env, k);
+        }));
+    }
+
+    private Bounce trySyntaxCaseClauses(List<?> list, int clauseIdx, Object input,
+                                         List<String> literals, Env env, Cont k) throws EvalError {
+        if (clauseIdx >= list.size()) throw posError("syntax-case: no matching pattern");
+        Object clause = list.get(clauseIdx);
+        if (clause instanceof Located lc) clause = lc.value();
+        if (!(clause instanceof List<?> clauseList) || clauseList.size() < 2)
+            throw posError("syntax-case: bad clause");
+
+        Object pattern = clauseList.get(0);
+        if (pattern instanceof Located lp) pattern = lp.value();
+
+        // Try to match pattern
+        Map<String, Object> bindings = null;
+        if (pattern instanceof List<?> patList && input instanceof List<?> inputList) {
+            @SuppressWarnings("unchecked")
+            List<Object> typedPatList = (List<Object>) patList;
+            bindings = matchPattern(typedPatList, inputList, literals);
+        }
+
+        if (bindings != null) {
+            // Determine body (might have fender)
+            Object body;
+            if (clauseList.size() == 3) {
+                // (pattern fender body) - evaluate fender first
+                Object fender = clauseList.get(1);
+                body = clauseList.get(2);
+                // Create env with pattern bindings for fender evaluation
+                Env clauseEnv = new Env(env);
+                // Store pattern bindings for use by (syntax ...) templates
+                @SuppressWarnings("unchecked")
+                Map<String, Object> existingBindings = (Map<String, Object>) env.lookup(SYNTAX_BINDINGS_KEY);
+                Map<String, Object> mergedBindings = existingBindings != null ? new HashMap<>(existingBindings) : new HashMap<>();
+                mergedBindings.putAll(bindings);
+                clauseEnv.define(SYNTAX_BINDINGS_KEY, mergedBindings);
+                // Also store def env for hygiene
+                Object existingDefEnv = env.lookup(SYNTAX_DEF_ENV_KEY);
+                if (existingDefEnv == null) clauseEnv.define(SYNTAX_DEF_ENV_KEY, env);
+                else clauseEnv.define(SYNTAX_DEF_ENV_KEY, existingDefEnv);
+
+                final Object fBody = body;
+                final Map<String, Object> fBindings = bindings;
+                final int nextClause = clauseIdx + 1;
+                return new More(() -> eval(fender, clauseEnv, fenderVal -> {
+                    if (!isFalse(fenderVal)) {
+                        return new More(() -> eval(fBody, clauseEnv, k));
+                    } else {
+                        return trySyntaxCaseClauses(list, nextClause, input, literals, env, k);
+                    }
+                }));
+            } else {
+                // (pattern body)
+                body = clauseList.get(1);
+                Env clauseEnv = new Env(env);
+                @SuppressWarnings("unchecked")
+                Map<String, Object> existingBindings = (Map<String, Object>) env.lookup(SYNTAX_BINDINGS_KEY);
+                Map<String, Object> mergedBindings = existingBindings != null ? new HashMap<>(existingBindings) : new HashMap<>();
+                mergedBindings.putAll(bindings);
+                clauseEnv.define(SYNTAX_BINDINGS_KEY, mergedBindings);
+                Object existingDefEnv = env.lookup(SYNTAX_DEF_ENV_KEY);
+                if (existingDefEnv == null) clauseEnv.define(SYNTAX_DEF_ENV_KEY, env);
+                else clauseEnv.define(SYNTAX_DEF_ENV_KEY, existingDefEnv);
+
+                final Object fBody = body;
+                return new More(() -> eval(fBody, clauseEnv, k));
+            }
+        } else {
+            return trySyntaxCaseClauses(list, clauseIdx + 1, input, literals, env, k);
+        }
+    }
+
+    // (syntax template) - expand template using pattern variable bindings from syntax-case
+    private Bounce evalSyntaxTemplate(List<?> list, Env env, Cont k) throws EvalError {
+        if (list.size() != 2) throw posError("syntax: bad syntax");
+        Object template = list.get(1);
+
+        @SuppressWarnings("unchecked")
+        Map<String, Object> bindings = (Map<String, Object>) env.lookup(SYNTAX_BINDINGS_KEY);
+        if (bindings == null) bindings = new HashMap<>();
+
+        Env defEnv = null;
+        Object defEnvObj = env.lookup(SYNTAX_DEF_ENV_KEY);
+        if (defEnvObj instanceof Env e) defEnv = e;
+        if (defEnv == null) defEnv = env;
+
+        // Hygiene: rename free variables in template
+        Set<String> patVars = bindings.keySet();
+        Map<String, Object> renaming = new HashMap<>();
+
+        @SuppressWarnings("unchecked")
+        Set<String> defTimeNames = (Set<String>) env.lookup(SYNTAX_DEF_NAMES_KEY);
+        collectSyntaxCaseRenames(template, patVars, defEnv, defTimeNames, renaming);
+
+        Object expanded = expandTemplate(template, bindings, renaming);
+        return k.apply(expanded);
+    }
+
+    // Collect renames for syntax-case templates
+    // Only renames identifiers that were defined at macro definition time → EnvRef
+    // Unknown identifiers are left as-is (resolved at expansion eval time)
+    private void collectSyntaxCaseRenames(Object template, Set<String> patVars,
+                                           Env defEnv, Set<String> defTimeNames,
+                                           Map<String, Object> renaming) {
+        template = unwrapLoc(template);
+        if (template instanceof String sym) {
+            if (patVars.contains(sym) || SPECIAL_FORMS.contains(sym) ||
+                sym.equals("...") || renaming.containsKey(sym) ||
+                PRIMITIVES.contains(sym)) return;
+            if (defTimeNames != null && defTimeNames.contains(sym)) {
+                // Was defined at macro definition time → reference via EnvRef
+                renaming.put(sym, new EnvRef(sym, defEnv));
+            }
+            // else: leave as-is, resolved at eval time
+        } else if (template instanceof List<?> list) {
+            if (!list.isEmpty()) {
+                Object head = unwrapLoc(list.get(0));
+                if (head instanceof String s && s.equals("quote")) return;
+            }
+            for (Object elem : list) {
+                collectSyntaxCaseRenames(elem, patVars, defEnv, defTimeNames, renaming);
+            }
+        }
+    }
+
+    // (with-syntax ((pat expr) ...) body ...)
+    private Bounce evalWithSyntax(List<?> list, Env env, Cont k) throws EvalError {
+        if (list.size() < 3) throw posError("with-syntax: bad syntax");
+        Object bindingsObj = list.get(1);
+        if (bindingsObj instanceof Located lb) bindingsObj = lb.value();
+        if (!(bindingsObj instanceof List<?> bindingsList))
+            throw posError("with-syntax: expected bindings list");
+
+        // Evaluate each binding expression and add to syntax bindings
+        @SuppressWarnings("unchecked")
+        Map<String, Object> existingBindings = (Map<String, Object>) env.lookup(SYNTAX_BINDINGS_KEY);
+        Map<String, Object> newBindings = existingBindings != null ? new HashMap<>(existingBindings) : new HashMap<>();
+
+        return evalWithSyntaxBindings(bindingsList, 0, newBindings, list, env, k);
+    }
+
+    private Bounce evalWithSyntaxBindings(List<?> bindingsList, int idx,
+                                           Map<String, Object> syntaxBindings,
+                                           List<?> form, Env env, Cont k) throws EvalError {
+        if (idx >= bindingsList.size()) {
+            // All bindings evaluated, now eval body
+            Env bodyEnv = new Env(env);
+            bodyEnv.define(SYNTAX_BINDINGS_KEY, syntaxBindings);
+            Object existingDefEnv = env.lookup(SYNTAX_DEF_ENV_KEY);
+            if (existingDefEnv == null) bodyEnv.define(SYNTAX_DEF_ENV_KEY, env);
+            else bodyEnv.define(SYNTAX_DEF_ENV_KEY, existingDefEnv);
+
+            // Evaluate body forms sequentially
+            return evalSequence(form, 2, bodyEnv, k);
+        }
+        Object binding = bindingsList.get(idx);
+        if (binding instanceof Located lb) binding = lb.value();
+        if (!(binding instanceof List<?> blist) || blist.size() != 2)
+            throw posError("with-syntax: bad binding");
+        Object nameObj = blist.get(0);
+        if (nameObj instanceof Located ln) nameObj = ln.value();
+        if (!(nameObj instanceof String name))
+            throw posError("with-syntax: pattern must be a symbol");
+        Object expr = blist.get(1);
+        final String fName = name;
+        return new More(() -> eval(expr, env, val -> {
+            syntaxBindings.put(fName, val);
+            return evalWithSyntaxBindings(bindingsList, idx + 1, syntaxBindings, form, env, k);
+        }));
+    }
+
+    private Bounce evalSequence(List<?> forms, int start, Env env, Cont k) throws EvalError {
+        if (start >= forms.size()) return k.apply(VOID);
+        if (start == forms.size() - 1) {
+            return new More(() -> eval(forms.get(start), env, k));
+        }
+        return new More(() -> eval(forms.get(start), env, ignored -> {
+            return evalSequence(forms, start + 1, env, k);
+        }));
     }
 
     // --- Procedure application (CPS) ---
@@ -1314,7 +1588,8 @@ public class Evaluator {
             "gcd", "lcm", "truncate", "round",
             "make-string", "string",
             "string>?", "string<=?", "string>=?",
-            "memv", "assq", "memq"
+            "memv", "assq", "memq",
+            "syntax->datum", "datum->syntax"
     );
 
     private boolean isPrimitive(String name) {
@@ -1926,6 +2201,17 @@ public class Evaluator {
                 Object result = NIL;
                 while (lst instanceof Pair p) { result = new Pair(p.car, result); lst = p.cdr; }
                 yield result;
+            }
+            case "syntax->datum" -> {
+                requireArgCount(args, 1, "syntax->datum");
+                Object datum = args.get(0);
+                while (datum instanceof Located l) datum = l.value();
+                yield datum;
+            }
+            case "datum->syntax" -> {
+                requireArgCount(args, 2, "datum->syntax");
+                // In our simplified implementation, just return the datum (2nd arg)
+                yield args.get(1);
             }
             default -> throw posError("unbound variable: " + proc);
         };
