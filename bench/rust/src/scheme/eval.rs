@@ -1,22 +1,23 @@
+use std::rc::Rc;
 use crate::scheme::env::Env;
 use crate::scheme::error::EvalError;
 use crate::scheme::parser::Expr;
 use crate::scheme::value::Value;
 
 /// Evaluate a parsed expression in the given environment.
-pub fn eval_expr(expr: &Expr, env: &Env) -> Result<Value, EvalError> {
+pub fn eval_expr(expr: &Expr, env: &Rc<Env>) -> Result<Value, EvalError> {
     match expr {
         Expr::Integer(n) => Ok(Value::Integer(*n)),
         Expr::Boolean(b) => Ok(Value::Boolean(*b)),
         Expr::Str(s) => Ok(Value::Str(s.clone())),
-        Expr::Symbol(name) => env.get(name).cloned().ok_or_else(|| EvalError::UnboundVariable {
+        Expr::Symbol(name) => env.get(name).ok_or_else(|| EvalError::UnboundVariable {
             name: name.clone(),
         }),
         Expr::List(elems) => eval_list(elems, env),
     }
 }
 
-fn eval_list(elems: &[Expr], env: &Env) -> Result<Value, EvalError> {
+fn eval_list(elems: &[Expr], env: &Rc<Env>) -> Result<Value, EvalError> {
     if elems.is_empty() {
         return Ok(Value::List(Vec::new()));
     }
@@ -26,6 +27,10 @@ fn eval_list(elems: &[Expr], env: &Env) -> Result<Value, EvalError> {
         match name.as_str() {
             "and" => return eval_and(&elems[1..], env),
             "or" => return eval_or(&elems[1..], env),
+            "if" => return eval_if(&elems[1..], env),
+            "define" => return eval_define(&elems[1..], env),
+            "quote" => return eval_quote(&elems[1..]),
+            "lambda" => return eval_lambda(&elems[1..], env),
             _ => {}
         }
     }
@@ -36,10 +41,147 @@ fn eval_list(elems: &[Expr], env: &Env) -> Result<Value, EvalError> {
         .map(|e| eval_expr(e, env))
         .collect::<Result<Vec<_>, _>>()?;
 
-    apply_builtin(&func, &args)
+    apply_function(&func, &args)
 }
 
-fn eval_and(exprs: &[Expr], env: &Env) -> Result<Value, EvalError> {
+fn eval_if(args: &[Expr], env: &Rc<Env>) -> Result<Value, EvalError> {
+    if args.len() < 2 || args.len() > 3 {
+        return Err(EvalError::BadSyntax {
+            form: "if".into(),
+            message: "expected 2 or 3 arguments".into(),
+        });
+    }
+    let cond = eval_expr(&args[0], env)?;
+    if cond.is_truthy() {
+        eval_expr(&args[1], env)
+    } else if args.len() == 3 {
+        eval_expr(&args[2], env)
+    } else {
+        Ok(Value::Void)
+    }
+}
+
+fn eval_define(args: &[Expr], env: &Rc<Env>) -> Result<Value, EvalError> {
+    if args.is_empty() {
+        return Err(EvalError::BadSyntax {
+            form: "define".into(),
+            message: "missing name".into(),
+        });
+    }
+    match &args[0] {
+        // (define x expr)
+        Expr::Symbol(name) => {
+            if args.len() != 2 {
+                return Err(EvalError::BadSyntax {
+                    form: "define".into(),
+                    message: "expected (define name expr)".into(),
+                });
+            }
+            let val = eval_expr(&args[1], env)?;
+            env.define(name.clone(), val);
+            Ok(Value::Void)
+        }
+        // (define (f params...) body...)
+        Expr::List(name_and_params) => {
+            if name_and_params.is_empty() {
+                return Err(EvalError::BadSyntax {
+                    form: "define".into(),
+                    message: "missing function name".into(),
+                });
+            }
+            let name = match &name_and_params[0] {
+                Expr::Symbol(s) => s.clone(),
+                _ => return Err(EvalError::BadSyntax {
+                    form: "define".into(),
+                    message: "function name must be a symbol".into(),
+                }),
+            };
+            let params: Vec<String> = name_and_params[1..]
+                .iter()
+                .map(|e| match e {
+                    Expr::Symbol(s) => Ok(s.clone()),
+                    _ => Err(EvalError::BadSyntax {
+                        form: "define".into(),
+                        message: "parameter must be a symbol".into(),
+                    }),
+                })
+                .collect::<Result<Vec<_>, _>>()?;
+            let body = args[1..].to_vec();
+            let lambda = Value::Lambda {
+                params,
+                body,
+                closure_env: Rc::clone(env),
+            };
+            env.define(name, lambda);
+            Ok(Value::Void)
+        }
+        _ => Err(EvalError::BadSyntax {
+            form: "define".into(),
+            message: "invalid define syntax".into(),
+        }),
+    }
+}
+
+fn eval_quote(args: &[Expr]) -> Result<Value, EvalError> {
+    if args.len() != 1 {
+        return Err(EvalError::BadSyntax {
+            form: "quote".into(),
+            message: "expected 1 argument".into(),
+        });
+    }
+    expr_to_value(&args[0])
+}
+
+fn expr_to_value(expr: &Expr) -> Result<Value, EvalError> {
+    match expr {
+        Expr::Integer(n) => Ok(Value::Integer(*n)),
+        Expr::Boolean(b) => Ok(Value::Boolean(*b)),
+        Expr::Str(s) => Ok(Value::Str(s.clone())),
+        Expr::Symbol(s) => Ok(Value::Symbol(s.clone())),
+        Expr::List(elems) => {
+            let vals: Vec<Value> = elems
+                .iter()
+                .map(expr_to_value)
+                .collect::<Result<Vec<_>, _>>()?;
+            Ok(Value::List(vals))
+        }
+    }
+}
+
+fn eval_lambda(args: &[Expr], env: &Rc<Env>) -> Result<Value, EvalError> {
+    if args.len() < 2 {
+        return Err(EvalError::BadSyntax {
+            form: "lambda".into(),
+            message: "expected (lambda (params) body...)".into(),
+        });
+    }
+    let params = match &args[0] {
+        Expr::List(param_exprs) => {
+            param_exprs
+                .iter()
+                .map(|e| match e {
+                    Expr::Symbol(s) => Ok(s.clone()),
+                    _ => Err(EvalError::BadSyntax {
+                        form: "lambda".into(),
+                        message: "parameter must be a symbol".into(),
+                    }),
+                })
+                .collect::<Result<Vec<_>, _>>()?
+        }
+        _ => return Err(EvalError::BadSyntax {
+            form: "lambda".into(),
+            message: "expected parameter list".into(),
+        }),
+    };
+    let body = args[1..].to_vec();
+    Ok(Value::Lambda {
+        params,
+        body,
+        closure_env: Rc::clone(env),
+    })
+}
+
+fn eval_and(exprs: &[Expr], env: &Rc<Env>) -> Result<Value, EvalError> {
     if exprs.is_empty() {
         return Ok(Value::Boolean(true));
     }
@@ -52,7 +194,7 @@ fn eval_and(exprs: &[Expr], env: &Env) -> Result<Value, EvalError> {
     eval_expr(&exprs[exprs.len() - 1], env)
 }
 
-fn eval_or(exprs: &[Expr], env: &Env) -> Result<Value, EvalError> {
+fn eval_or(exprs: &[Expr], env: &Rc<Env>) -> Result<Value, EvalError> {
     if exprs.is_empty() {
         return Ok(Value::Boolean(false));
     }
@@ -65,16 +207,30 @@ fn eval_or(exprs: &[Expr], env: &Env) -> Result<Value, EvalError> {
     eval_expr(&exprs[exprs.len() - 1], env)
 }
 
-fn apply_builtin(func: &Value, args: &[Value]) -> Result<Value, EvalError> {
-    let name = match func {
-        Value::Builtin(name) => name.as_str(),
-        other => {
-            return Err(EvalError::NotAProcedure {
-                value: other.to_display_string(),
-            });
+pub fn apply_function(func: &Value, args: &[Value]) -> Result<Value, EvalError> {
+    match func {
+        Value::Builtin(name) => apply_builtin(name, args),
+        Value::Lambda { params, body, closure_env } => {
+            if args.len() != params.len() {
+                return Err(EvalError::WrongArgCount {
+                    expected: params.len(),
+                    got: args.len(),
+                });
+            }
+            let local_env = Env::extend(closure_env, params.clone(), args.to_vec());
+            let mut result = Value::Void;
+            for expr in body {
+                result = eval_expr(expr, &local_env)?;
+            }
+            Ok(result)
         }
-    };
+        other => Err(EvalError::NotAProcedure {
+            value: other.to_display_string(),
+        }),
+    }
+}
 
+fn apply_builtin(name: &str, args: &[Value]) -> Result<Value, EvalError> {
     match name {
         "+" => arith_variadic(args, 0, |a, b| Ok(a + b)),
         "-" => {

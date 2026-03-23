@@ -1,7 +1,10 @@
 use std::fmt;
+use std::rc::Rc;
+use crate::scheme::env::Env;
+use crate::scheme::parser::Expr;
 
 /// A Scheme value.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone)]
 pub enum Value {
     Integer(i64),
     Boolean(bool),
@@ -10,6 +13,26 @@ pub enum Value {
     List(Vec<Value>),
     Void,
     Builtin(String),
+    Lambda {
+        params: Vec<String>,
+        body: Vec<Expr>,
+        closure_env: Rc<Env>,
+    },
+}
+
+impl PartialEq for Value {
+    fn eq(&self, other: &Self) -> bool {
+        match (self, other) {
+            (Value::Integer(a), Value::Integer(b)) => a == b,
+            (Value::Boolean(a), Value::Boolean(b)) => a == b,
+            (Value::Str(a), Value::Str(b)) => a == b,
+            (Value::Symbol(a), Value::Symbol(b)) => a == b,
+            (Value::List(a), Value::List(b)) => a == b,
+            (Value::Void, Value::Void) => true,
+            (Value::Builtin(a), Value::Builtin(b)) => a == b,
+            _ => false,
+        }
+    }
 }
 
 impl Value {
@@ -27,6 +50,7 @@ impl Value {
             }
             Value::Void => "".into(),
             Value::Builtin(name) => format!("#<procedure:{}>", name),
+            Value::Lambda { .. } => "#<procedure>".into(),
         }
     }
 

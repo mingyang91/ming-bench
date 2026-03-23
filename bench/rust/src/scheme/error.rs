@@ -18,4 +18,7 @@ pub enum EvalError {
 
     #[error("not a procedure: {value}")]
     NotAProcedure { value: String },
+
+    #[error("bad syntax in {form}: {message}")]
+    BadSyntax { form: String, message: String },
 }
