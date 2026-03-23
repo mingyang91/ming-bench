@@ -32,9 +32,10 @@ type value struct {
 	car    *value
 	cdr    *value
 	// lambda fields
-	params []string
-	body   []*expr
-	closure *env
+	params    []string
+	restParam string // "" if none, otherwise the name of the rest parameter
+	body      []*expr
+	closure   *env
 	// char
 	cval rune
 	// builtin function
@@ -571,12 +572,9 @@ func eval(e *expr, envir *env) (*value, error) {
 
 			// TCO: inline lambda application
 			if fn.typ == valLambda {
-				if len(args) != len(fn.params) {
-					return nil, &EvalError{Message: fmt.Sprintf("%d:%d: wrong number of arguments: expected %d, got %d", e.line, e.col, len(fn.params), len(args))}
-				}
-				localEnv := newEnv(fn.closure)
-				for i, p := range fn.params {
-					localEnv.set(p, args[i])
+				localEnv, bindErr := bindLambdaArgs(fn, args, e.line, e.col)
+				if bindErr != nil {
+					return nil, bindErr
 				}
 				// Eval all body exprs except last, then tail-call last
 				for _, bodyExpr := range fn.body[:len(fn.body)-1] {
@@ -596,6 +594,30 @@ func eval(e *expr, envir *env) (*value, error) {
 	}
 }
 
+func bindLambdaArgs(fn *value, args []*value, line, col int) (*env, error) {
+	if fn.restParam == "" {
+		if len(args) != len(fn.params) {
+			return nil, &EvalError{Message: fmt.Sprintf("%d:%d: wrong number of arguments: expected %d, got %d", line, col, len(fn.params), len(args))}
+		}
+	} else {
+		if len(args) < len(fn.params) {
+			return nil, &EvalError{Message: fmt.Sprintf("%d:%d: wrong number of arguments: expected at least %d, got %d", line, col, len(fn.params), len(args))}
+		}
+	}
+	localEnv := newEnv(fn.closure)
+	for i, p := range fn.params {
+		localEnv.set(p, args[i])
+	}
+	if fn.restParam != "" {
+		rest := nilVal
+		for i := len(args) - 1; i >= len(fn.params); i-- {
+			rest = &value{typ: valPair, car: args[i], cdr: rest}
+		}
+		localEnv.set(fn.restParam, rest)
+	}
+	return localEnv, nil
+}
+
 func applyFunc(fn *value, args []*value, callExpr *expr) (*value, error) {
 	line, col := callExpr.line, callExpr.col
 
@@ -613,21 +635,24 @@ func evalDefine(e *expr, env *env) (*value, error) {
 	}
 	target := e.items[1]
 
-	// (define (f params...) body...)
+	// (define (f params...) body...) or (define (f x . rest) body...)
 	if target.kind == "list" {
 		if len(target.items) == 0 {
 			return nil, &EvalError{Message: fmt.Sprintf("%d:%d: define: bad syntax", e.line, e.col)}
 		}
 		name := target.items[0].sval
-		params := make([]string, len(target.items)-1)
-		for i, p := range target.items[1:] {
-			params[i] = p.sval
+		// Build a fake param list expr from target.items[1:]
+		paramListExpr := &expr{kind: "list", items: target.items[1:], line: target.line, col: target.col}
+		params, restParam, perr := parseLambdaParams(paramListExpr)
+		if perr != nil {
+			return nil, &EvalError{Message: fmt.Sprintf("%d:%d: define: %s", e.line, e.col, perr)}
 		}
 		fn := &value{
-			typ:     valLambda,
-			params:  params,
-			body:    e.items[2:],
-			closure: env,
+			typ:       valLambda,
+			params:    params,
+			restParam: restParam,
+			body:      e.items[2:],
+			closure:   env,
 		}
 		env.set(name, fn)
 		return voidVal, nil
@@ -646,23 +671,49 @@ func evalDefine(e *expr, env *env) (*value, error) {
 }
 
 
+func parseLambdaParams(paramExpr *expr) (params []string, restParam string, err error) {
+	if paramExpr.kind == "symbol" {
+		// (lambda args body) — single rest param capturing all args
+		return nil, paramExpr.sval, nil
+	}
+	if paramExpr.kind != "list" {
+		return nil, "", fmt.Errorf("bad parameter list")
+	}
+	// Check for dot notation: (a b . rest)
+	for i, p := range paramExpr.items {
+		if p.kind == "symbol" && p.sval == "." {
+			if i+1 != len(paramExpr.items)-1 {
+				return nil, "", fmt.Errorf("bad dotted parameter list")
+			}
+			// params before dot, rest after
+			for _, pp := range paramExpr.items[:i] {
+				params = append(params, pp.sval)
+			}
+			restParam = paramExpr.items[i+1].sval
+			return params, restParam, nil
+		}
+	}
+	params = make([]string, len(paramExpr.items))
+	for i, p := range paramExpr.items {
+		params[i] = p.sval
+	}
+	return params, "", nil
+}
+
 func evalLambda(e *expr, env *env) (*value, error) {
 	if len(e.items) < 3 {
 		return nil, &EvalError{Message: fmt.Sprintf("%d:%d: lambda: bad syntax", e.line, e.col)}
 	}
-	paramExpr := e.items[1]
-	if paramExpr.kind != "list" {
-		return nil, &EvalError{Message: fmt.Sprintf("%d:%d: lambda: bad parameter list", e.line, e.col)}
-	}
-	params := make([]string, len(paramExpr.items))
-	for i, p := range paramExpr.items {
-		params[i] = p.sval
+	params, restParam, perr := parseLambdaParams(e.items[1])
+	if perr != nil {
+		return nil, &EvalError{Message: fmt.Sprintf("%d:%d: lambda: %s", e.line, e.col, perr)}
 	}
 	return &value{
-		typ:     valLambda,
-		params:  params,
-		body:    e.items[2:],
-		closure: env,
+		typ:       valLambda,
+		params:    params,
+		restParam: restParam,
+		body:      e.items[2:],
+		closure:   env,
 	}, nil
 }
 
@@ -941,6 +992,47 @@ func makeGlobalEnv(ip *interp) *env {
 			}
 		}
 		return result, nil
+	}))
+
+	// apply
+	e.set("apply", makeBuiltin("apply", func(args []*value, line, col int) (*value, error) {
+		if len(args) < 2 {
+			return nil, &EvalError{Message: fmt.Sprintf("%d:%d: apply: expected at least 2 arguments", line, col)}
+		}
+		fn := args[0]
+		// Last arg must be a list; prefix args are prepended
+		lastArg := args[len(args)-1]
+		var fnArgs []*value
+		// Collect prefix args (between fn and the final list)
+		for _, a := range args[1 : len(args)-1] {
+			fnArgs = append(fnArgs, a)
+		}
+		// Unpack the final list
+		cur := lastArg
+		for cur.typ == valPair {
+			fnArgs = append(fnArgs, cur.car)
+			cur = cur.cdr
+		}
+		if fn.typ == valLambda {
+			localEnv, bindErr := bindLambdaArgs(fn, fnArgs, line, col)
+			if bindErr != nil {
+				return nil, bindErr
+			}
+			// Evaluate body
+			var result *value
+			for _, bodyExpr := range fn.body {
+				var err error
+				result, err = eval(bodyExpr, localEnv)
+				if err != nil {
+					return nil, err
+				}
+			}
+			return result, nil
+		}
+		if fn.typ == valBuiltin {
+			return fn.builtin(fnArgs, line, col)
+		}
+		return nil, &EvalError{Message: fmt.Sprintf("%d:%d: apply: not a procedure", line, col)}
 	}))
 
 	// Type predicates
