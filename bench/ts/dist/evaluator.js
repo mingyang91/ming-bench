@@ -2330,5 +2330,5 @@ export function evalStrWithOutput(input) {
     outputBuffer = '';
     const env = makeGlobalEnv();
     const result = evaluateProgram(exprs, env);
-    return { result: display(result), output: outputBuffer };
+    return { result: displayVal(result), output: outputBuffer };
 }
