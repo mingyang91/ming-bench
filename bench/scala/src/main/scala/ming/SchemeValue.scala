@@ -9,6 +9,7 @@ enum SchemeValue:
   case ListVal(elements: List[SchemeValue], pos: Option[SourcePos] = None)
   case PairVal(car: SchemeValue, cdr: SchemeValue)
   case LambdaVal(params: List[String], body: List[SchemeValue], closure: Environment)
+  case CharVal(value: Char, pos: Option[SourcePos] = None)
   case BuiltinVal(name: String, func: List[SchemeValue] => SchemeValue)
   case Void
 
@@ -19,18 +20,30 @@ enum SchemeValue:
     case StringVal(_, p) => p
     case SymbolVal(_, p) => p
     case ListVal(_, p)   => p
+    case CharVal(_, p)   => p
     case _               => None
 
+  /** Format for `write` — strings are quoted. */
   def display: String = this match
     case IntVal(n, _)       => n.toString
     case BoolVal(b, _)      => if b then "#t" else "#f"
     case StringVal(s, _)    => s"\"$s\""
     case SymbolVal(n, _)    => n
+    case CharVal(c, _)      => s"#\\$c"
     case ListVal(es, _)     => s"(${es.map(_.display).mkString(" ")})"
     case PairVal(_, _)      => displayPair(this)
     case LambdaVal(_, _, _) => "#<procedure>"
     case BuiltinVal(n, _)   => s"#<builtin:$n>"
     case Void               => ""
+
+  /** Format for `display` — strings are unquoted. */
+  def displayOutput: String = this match
+    case StringVal(s, _) => s
+    case CharVal(c, _)   => c.toString
+    case _               => display
+
+  /** Format for display inside a list (used by displayPair). */
+  private def displayListElement: String = display
 
   def isTruthy: Boolean = this match
     case BoolVal(false, _) => false

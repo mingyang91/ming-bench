@@ -13,8 +13,8 @@ object Interpreter:
 
   def eval(expr: SchemeValue, env: Environment): SchemeValue =
     expr match
-      case IntVal(_, _) | BoolVal(_, _) | StringVal(_, _) | PairVal(_, _) | LambdaVal(_, _, _) | BuiltinVal(_, _) |
-          Void =>
+      case IntVal(_, _) | BoolVal(_, _) | StringVal(_, _) | CharVal(_, _) | PairVal(_, _) | LambdaVal(_, _, _) |
+          BuiltinVal(_, _) | Void =>
         expr
       case SymbolVal(name, pos) =>
         env.get(name).getOrElse(throw new EvalError(posMsg(s"unbound variable: $name", pos)))
@@ -170,105 +170,3 @@ object Interpreter:
           else body.map(eval(_, env)).last
         else evalCond(rest, env)
       case _ => throw new EvalError("cond: bad clause")
-
-  // --- Builtin operations (exposed for Evaluator to wire into global env) ---
-
-  def arith(
-    args: List[SchemeValue],
-    op: (Long, Long) => Long,
-    identity: Long
-  ): SchemeValue =
-    IntVal(args.foldLeft(identity) {
-      case (acc, IntVal(n, _)) => op(acc, n)
-      case _                   => throw new EvalError("arithmetic: expected number")
-    })
-
-  def subtractOp(args: List[SchemeValue]): SchemeValue =
-    args match
-      case Nil                 => throw new EvalError("-: requires at least 1 argument")
-      case IntVal(n, _) :: Nil => IntVal(-n)
-      case IntVal(first, _) :: rest =>
-        IntVal(rest.foldLeft(first) {
-          case (acc, IntVal(n, _)) => acc - n
-          case _                   => throw new EvalError("-: expected number")
-        })
-      case _ => throw new EvalError("-: expected number")
-
-  def divideOp(args: List[SchemeValue]): SchemeValue =
-    args match
-      case Nil => throw new EvalError("/: requires at least 1 argument")
-      case IntVal(first, _) :: rest =>
-        IntVal(rest.foldLeft(first) {
-          case (acc, IntVal(n, _)) =>
-            if n == 0 then throw new EvalError("division by zero")
-            acc / n
-          case _ => throw new EvalError("/: expected number")
-        })
-      case _ => throw new EvalError("/: expected number")
-
-  def compare(
-    args: List[SchemeValue],
-    cmp: (Long, Long) => Boolean
-  ): SchemeValue =
-    args match
-      case IntVal(a, _) :: IntVal(b, _) :: Nil => BoolVal(cmp(a, b))
-      case _                                   => throw new EvalError("comparison: expected 2 numbers")
-
-  def notOp(args: List[SchemeValue]): SchemeValue =
-    args match
-      case v :: Nil => BoolVal(!v.isTruthy)
-      case _        => throw new EvalError("not: requires 1 argument")
-
-  def consOp(args: List[SchemeValue]): SchemeValue =
-    args match
-      case car :: cdr :: Nil =>
-        cdr match
-          case ListVal(es, _) => ListVal(car :: es)
-          case _              => PairVal(car, cdr)
-      case _ => throw new EvalError("cons: requires 2 arguments")
-
-  def carOp(args: List[SchemeValue]): SchemeValue =
-    args match
-      case PairVal(car, _) :: Nil       => car
-      case ListVal(head :: _, _) :: Nil => head
-      case ListVal(Nil, _) :: Nil       => throw new EvalError("car: empty list")
-      case _ :: Nil                     => throw new EvalError("car: not a pair")
-      case _                            => throw new EvalError("car: requires 1 argument")
-
-  def cdrOp(args: List[SchemeValue]): SchemeValue =
-    args match
-      case PairVal(_, cdr) :: Nil       => cdr
-      case ListVal(_ :: tail, _) :: Nil => ListVal(tail)
-      case ListVal(Nil, _) :: Nil       => throw new EvalError("cdr: empty list")
-      case _ :: Nil                     => throw new EvalError("cdr: not a pair")
-      case _                            => throw new EvalError("cdr: requires 1 argument")
-
-  def nullCheck(args: List[SchemeValue]): SchemeValue =
-    args match
-      case ListVal(Nil, _) :: Nil => BoolVal(true)
-      case _ :: Nil               => BoolVal(false)
-      case _                      => throw new EvalError("null?: requires 1 argument")
-
-  def lengthOp(args: List[SchemeValue]): SchemeValue =
-    args match
-      case ListVal(es, _) :: Nil => IntVal(es.length.toLong)
-      case _                     => throw new EvalError("length: expected list")
-
-  def typeCheck(args: List[SchemeValue], pred: SchemeValue => Boolean): SchemeValue =
-    args match
-      case v :: Nil => BoolVal(pred(v))
-      case _        => throw new EvalError("type predicate: requires 1 argument")
-
-  def appendOp(args: List[SchemeValue]): SchemeValue =
-    args.foldRight(ListVal(Nil): SchemeValue) {
-      case (ListVal(es, _), ListVal(acc, _)) => ListVal(es ++ acc)
-      case (ListVal(es, _), acc)             => es.foldRight(acc)((e, a) => consOp(List(e, a)))
-      case (other, _)                        => throw new EvalError("append: expected list")
-    }
-
-  def pairCheck(args: List[SchemeValue]): SchemeValue =
-    args match
-      case PairVal(_, _) :: Nil      => BoolVal(true)
-      case ListVal(_ :: _, _) :: Nil => BoolVal(true)
-      case _ :: Nil                  => BoolVal(false)
-      case _                         => throw new EvalError("pair?: requires 1 argument")

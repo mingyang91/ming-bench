@@ -5,31 +5,43 @@ import SchemeValue.*
 /** Scheme interpreter entry point. Agents implement this object. */
 object Evaluator:
 
-  private def makeGlobalEnv(): Environment =
+  private def makeGlobalEnv(output: StringBuilder): Environment =
     val env = Environment()
     val builtins: List[(String, List[SchemeValue] => SchemeValue)] = List(
-      ("+", args => Interpreter.arith(args, _ + _, 0)),
-      ("*", args => Interpreter.arith(args, _ * _, 1)),
-      ("-", args => Interpreter.subtractOp(args)),
-      ("/", args => Interpreter.divideOp(args)),
-      ("<", args => Interpreter.compare(args, _ < _)),
-      (">", args => Interpreter.compare(args, _ > _)),
-      ("=", args => Interpreter.compare(args, _ == _)),
-      ("<=", args => Interpreter.compare(args, _ <= _)),
-      (">=", args => Interpreter.compare(args, _ >= _)),
-      ("not", args => Interpreter.notOp(args)),
-      ("cons", args => Interpreter.consOp(args)),
-      ("car", args => Interpreter.carOp(args)),
-      ("cdr", args => Interpreter.cdrOp(args)),
-      ("null?", args => Interpreter.nullCheck(args)),
+      ("+", args => Builtins.arith(args, _ + _, 0)),
+      ("*", args => Builtins.arith(args, _ * _, 1)),
+      ("-", args => Builtins.subtractOp(args)),
+      ("/", args => Builtins.divideOp(args)),
+      ("<", args => Builtins.compare(args, _ < _)),
+      (">", args => Builtins.compare(args, _ > _)),
+      ("=", args => Builtins.compare(args, _ == _)),
+      ("<=", args => Builtins.compare(args, _ <= _)),
+      (">=", args => Builtins.compare(args, _ >= _)),
+      ("not", args => Builtins.notOp(args)),
+      ("cons", args => Builtins.consOp(args)),
+      ("car", args => Builtins.carOp(args)),
+      ("cdr", args => Builtins.cdrOp(args)),
+      ("null?", args => Builtins.nullCheck(args)),
       ("list", args => ListVal(args)),
-      ("length", args => Interpreter.lengthOp(args)),
-      ("string?", args => Interpreter.typeCheck(args, _.isInstanceOf[StringVal])),
-      ("number?", args => Interpreter.typeCheck(args, _.isInstanceOf[IntVal])),
-      ("boolean?", args => Interpreter.typeCheck(args, _.isInstanceOf[BoolVal])),
-      ("pair?", args => Interpreter.pairCheck(args)),
-      ("symbol?", args => Interpreter.typeCheck(args, _.isInstanceOf[SymbolVal])),
-      ("append", args => Interpreter.appendOp(args))
+      ("length", args => Builtins.lengthOp(args)),
+      ("string?", args => Builtins.typeCheck(args, _.isInstanceOf[StringVal])),
+      ("number?", args => Builtins.typeCheck(args, _.isInstanceOf[IntVal])),
+      ("boolean?", args => Builtins.typeCheck(args, _.isInstanceOf[BoolVal])),
+      ("pair?", args => Builtins.pairCheck(args)),
+      ("symbol?", args => Builtins.typeCheck(args, _.isInstanceOf[SymbolVal])),
+      ("char?", args => Builtins.typeCheck(args, _.isInstanceOf[CharVal])),
+      ("append", args => Builtins.appendOp(args)),
+      ("display", args => Builtins.displayOp(args, output)),
+      ("write", args => Builtins.writeOp(args, output)),
+      ("newline", args => Builtins.newlineOp(args, output)),
+      ("string-append", args => Builtins.stringAppendOp(args)),
+      ("string-length", args => Builtins.stringLengthOp(args)),
+      ("substring", args => Builtins.substringOp(args)),
+      ("string->number", args => Builtins.stringToNumberOp(args)),
+      ("number->string", args => Builtins.numberToStringOp(args)),
+      ("symbol->string", args => Builtins.symbolToStringOp(args)),
+      ("string->symbol", args => Builtins.stringToSymbolOp(args)),
+      ("string-ref", args => Builtins.stringRefOp(args))
     )
     builtins.foreach { (name, func) =>
       env.define(name, BuiltinVal(name, func))
@@ -39,9 +51,10 @@ object Evaluator:
   /** Evaluate one or more Scheme expressions and return the string representation of the last result.
     */
   def evalStr(input: String): String =
-    val exprs = Parser.parse(input)
+    val output = StringBuilder()
+    val exprs  = Parser.parse(input)
     if exprs.isEmpty then throw new EvalError("no expressions")
-    val env     = makeGlobalEnv()
+    val env     = makeGlobalEnv(output)
     val results = exprs.map(Interpreter.eval(_, env))
     val last    = results.last
     last match
@@ -51,4 +64,13 @@ object Evaluator:
   /** Evaluate Scheme expressions and return both the result string and any captured output from display/write/newline.
     */
   def evalStrWithOutput(input: String): (String, String) =
-    (evalStr(input), "")
+    val output = StringBuilder()
+    val exprs  = Parser.parse(input)
+    if exprs.isEmpty then throw new EvalError("no expressions")
+    val env     = makeGlobalEnv(output)
+    val results = exprs.map(Interpreter.eval(_, env))
+    val last    = results.last
+    val result = last match
+      case Void => ""
+      case _    => last.display
+    (result, output.toString)
