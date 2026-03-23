@@ -192,6 +192,10 @@ enum Value {
     },
     DynBuiltin(Rc<dyn Fn(&[Value]) -> Result<Value, EvalError>>),
     MacroTransformer { proc: Box<Value>, def_env: Env },
+    CaseLambda {
+        clauses: Vec<(Vec<String>, Option<String>, Vec<Expr>)>, // (params, rest_param, body)
+        env: Env,
+    },
     Syntax(Box<Expr>),
     SyntaxList(Vec<Expr>),
 }
@@ -221,6 +225,7 @@ impl std::fmt::Debug for Value {
             Value::Record { type_name, fields, .. } => write!(f, "Record({}, {:?})", type_name, fields),
             Value::DynBuiltin(_) => write!(f, "DynBuiltin"),
             Value::MacroTransformer { .. } => write!(f, "MacroTransformer"),
+            Value::CaseLambda { .. } => write!(f, "CaseLambda"),
             Value::Syntax(_) => write!(f, "Syntax"),
             Value::SyntaxList(_) => write!(f, "SyntaxList"),
         }
@@ -296,7 +301,7 @@ impl Value {
                 let inner: Vec<String> = v.borrow().iter().map(|v| v.display()).collect();
                 format!("#({})", inner.join(" "))
             }
-            Value::Lambda { .. } | Value::Builtin(_) | Value::DynBuiltin(_) | Value::CallCC | Value::Macro { .. } | Value::MacroTransformer { .. } => "#<procedure>".to_string(),
+            Value::Lambda { .. } | Value::CaseLambda { .. } | Value::Builtin(_) | Value::DynBuiltin(_) | Value::CallCC | Value::Macro { .. } | Value::MacroTransformer { .. } => "#<procedure>".to_string(),
             Value::Continuation(_) => "#<continuation>".to_string(),
             Value::Void => "".to_string(),
             Value::Values(_) => "".to_string(),
@@ -665,6 +670,7 @@ fn eval_inner(expr: &Expr, env: &Env) -> Result<Trampoline, EvalError> {
                     "let*" => return eval_letrec_star_tc(&elems[1..], env, span),
                     "define-syntax" => return eval_define_syntax(&elems[1..], env, span).map(Trampoline::Done),
                     "define-record-type" => return eval_define_record_type(&elems[1..], env, span).map(Trampoline::Done),
+                    "case-lambda" => return eval_case_lambda(&elems[1..], env, span).map(Trampoline::Done),
                     "raise" if env_get(env, "raise").is_none() => {
                         if elems.len() != 2 {
                             return Err(EvalError::Arity("raise requires 1 argument".into()).with_position(span.line, span.col));
@@ -826,6 +832,29 @@ fn apply_tc(func: &Value, args: &[Value]) -> Result<Trampoline, EvalError> {
                 }
                 unreachable!()
             }
+        }
+        Value::CaseLambda { clauses, env } => {
+            // Find matching clause by arity
+            for (params, rest_param, body) in clauses {
+                let matches = if rest_param.is_some() {
+                    args.len() >= params.len()
+                } else {
+                    args.len() == params.len()
+                };
+                if matches {
+                    // Delegate to Lambda apply
+                    let lambda = Value::Lambda {
+                        params: params.clone(),
+                        rest_param: rest_param.clone(),
+                        body: body.clone(),
+                        env: env.clone(),
+                    };
+                    return apply_tc(&lambda, args);
+                }
+            }
+            Err(EvalError::Arity(format!(
+                "case-lambda: no matching clause for {} arguments", args.len()
+            )))
         }
         Value::Builtin(f) => f(args).map(Trampoline::Done),
         Value::DynBuiltin(f) => f(args).map(Trampoline::Done),
@@ -1000,6 +1029,29 @@ fn eval_lambda(args: &[Expr], env: &Env, span: Span) -> Result<Value, EvalError>
         body: args[1..].to_vec(),
         env: env.clone(),
     })
+}
+
+fn eval_case_lambda(args: &[Expr], env: &Env, span: Span) -> Result<Value, EvalError> {
+    if args.is_empty() {
+        return Err(EvalError::Arity("case-lambda requires at least one clause".into()).with_position(span.line, span.col));
+    }
+    let mut clauses = Vec::new();
+    for clause in args {
+        match &clause.kind {
+            ExprKind::List(elems) => {
+                if elems.len() < 2 {
+                    return Err(EvalError::Parse("case-lambda: clause requires params and body".into()).with_position(span.line, span.col));
+                }
+                let (params, rest_param) = match &elems[0].kind {
+                    ExprKind::List(param_exprs) => parse_param_list(param_exprs, span)?,
+                    _ => return Err(EvalError::Parse("case-lambda: expected parameter list".into()).with_position(span.line, span.col)),
+                };
+                clauses.push((params, rest_param, elems[1..].to_vec()));
+            }
+            _ => return Err(EvalError::Parse("case-lambda: expected clause".into()).with_position(span.line, span.col)),
+        }
+    }
+    Ok(Value::CaseLambda { clauses, env: env.clone() })
 }
 
 fn eval_and_tc(args: &[Expr], env: &Env) -> Result<Trampoline, EvalError> {
@@ -1871,6 +1923,7 @@ fn is_special_form(name: &str) -> bool {
         | "define-syntax" | "syntax-rules" | "letrec" | "letrec*" | "case" | "do"
         | "vector-set!" | "let*" | "raise" | "guard" | "with-exception-handler"
         | "define-record-type" | "syntax-case" | "syntax" | "with-syntax"
+        | "case-lambda"
     )
 }
 
@@ -3084,7 +3137,7 @@ fn builtin_string_downcase(args: &[Value]) -> Result<Value, EvalError> {
 
 fn builtin_is_procedure(args: &[Value]) -> Result<Value, EvalError> {
     if args.len() != 1 { return Err(EvalError::Arity("procedure? requires 1 argument".into())); }
-    Ok(Value::Boolean(matches!(&args[0], Value::Lambda { .. } | Value::Builtin(_) | Value::DynBuiltin(_) | Value::CallCC | Value::Continuation(_))))
+    Ok(Value::Boolean(matches!(&args[0], Value::Lambda { .. } | Value::CaseLambda { .. } | Value::Builtin(_) | Value::DynBuiltin(_) | Value::CallCC | Value::Continuation(_))))
 }
 
 // L14: char/integer conversion
