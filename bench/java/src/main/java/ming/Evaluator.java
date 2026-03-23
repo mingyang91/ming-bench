@@ -180,11 +180,47 @@ public class Evaluator {
                 if (i + 1 < len) {
                     char next = input.charAt(i + 1);
                     if (next == 't') {
-                        tokens.add(new Token(Boolean.TRUE, line, startCol));
-                        i += 2; col += 2;
+                        // Check it's not a longer token like #true
+                        if (i + 2 >= len || isDelimiter(input.charAt(i + 2))) {
+                            tokens.add(new Token(Boolean.TRUE, line, startCol));
+                            i += 2; col += 2;
+                        } else {
+                            throw new EvalError(line + ":" + col + ": unknown token: #" + next);
+                        }
                     } else if (next == 'f') {
-                        tokens.add(new Token(Boolean.FALSE, line, startCol));
-                        i += 2; col += 2;
+                        if (i + 2 >= len || isDelimiter(input.charAt(i + 2))) {
+                            tokens.add(new Token(Boolean.FALSE, line, startCol));
+                            i += 2; col += 2;
+                        } else {
+                            throw new EvalError(line + ":" + col + ": unknown token: #" + next);
+                        }
+                    } else if (next == '\\') {
+                        // Character literal: #\<char> or #\space, #\newline, etc.
+                        if (i + 2 >= len) throw new EvalError(line + ":" + col + ": unexpected end of input in character literal");
+                        // Read the character name
+                        int start = i + 2;
+                        int ci = start;
+                        // If next char is a letter, read a full word (for named chars like #\space)
+                        if (Character.isLetter(input.charAt(ci))) {
+                            while (ci < len && Character.isLetter(input.charAt(ci))) ci++;
+                            String charName = input.substring(start, ci);
+                            if (charName.length() == 1) {
+                                tokens.add(new Token(new SchemeChar(charName.charAt(0)), line, startCol));
+                            } else {
+                                tokens.add(new Token(switch (charName) {
+                                    case "space" -> new SchemeChar(' ');
+                                    case "newline" -> new SchemeChar('\n');
+                                    case "tab" -> new SchemeChar('\t');
+                                    default -> throw new EvalError(line + ":" + col + ": unknown character name: " + charName);
+                                }, line, startCol));
+                            }
+                        } else {
+                            // Single non-letter char like #\( or #\)
+                            tokens.add(new Token(new SchemeChar(input.charAt(ci)), line, startCol));
+                            ci++;
+                        }
+                        col += (ci - i);
+                        i = ci;
                     } else {
                         throw new EvalError(line + ":" + col + ": unknown token: #" + next);
                     }
@@ -211,6 +247,10 @@ public class Evaluator {
             }
         }
         return tokens;
+    }
+
+    private boolean isDelimiter(char c) {
+        return Character.isWhitespace(c) || c == '(' || c == ')' || c == '"' || c == ';';
     }
 
     // --- Parser ---
@@ -273,7 +313,7 @@ public class Evaluator {
             return eval(loc.value(), env);
         }
 
-        if (expr instanceof Long || expr instanceof Boolean || expr instanceof SchemeString) {
+        if (expr instanceof Long || expr instanceof Boolean || expr instanceof SchemeString || expr instanceof SchemeChar) {
             return expr;
         }
         if (expr instanceof String sym) {
@@ -560,7 +600,8 @@ public class Evaluator {
             "string-append", "string-length", "substring",
             "string->number", "number->string",
             "symbol->string", "string->symbol",
-            "string-ref", "char?"
+            "string-ref", "char?",
+            "string-set!", "string-copy"
     );
 
     private boolean isPrimitive(String name) {
@@ -751,7 +792,20 @@ public class Evaluator {
                 requireArgCount(args, 2, "string-ref");
                 if (!(args.get(0) instanceof SchemeString s)) throw posError("string-ref: expected string");
                 int idx = (int) requireLong(args.get(1), "string-ref");
-                yield new SchemeChar(s.value().charAt(idx));
+                yield new SchemeChar(s.charAt(idx));
+            }
+            case "string-set!" -> {
+                requireArgCount(args, 3, "string-set!");
+                if (!(args.get(0) instanceof SchemeString s)) throw posError("string-set!: expected string");
+                int idx = (int) requireLong(args.get(1), "string-set!");
+                if (!(args.get(2) instanceof SchemeChar c)) throw posError("string-set!: expected char");
+                s.setChar(idx, c.value());
+                yield VOID;
+            }
+            case "string-copy" -> {
+                requireArgCount(args, 1, "string-copy");
+                if (!(args.get(0) instanceof SchemeString s)) throw posError("string-copy: expected string");
+                yield new SchemeString(s.value());
             }
             default -> throw posError("unbound variable: " + proc);
         };
@@ -823,8 +877,19 @@ public class Evaluator {
         return val.toString();
     }
 
-    // Internal type for Scheme strings (to distinguish from symbols which are Java Strings)
-    record SchemeString(String value) {}
+    // Internal type for Scheme strings (mutable for string-set!)
+    static class SchemeString {
+        private char[] chars;
+        SchemeString(String value) { this.chars = value.toCharArray(); }
+        String value() { return new String(chars); }
+        int length() { return chars.length; }
+        char charAt(int i) { return chars[i]; }
+        void setChar(int i, char c) { chars[i] = c; }
+        @Override public boolean equals(Object o) {
+            return o instanceof SchemeString s && java.util.Arrays.equals(chars, s.chars);
+        }
+        @Override public int hashCode() { return java.util.Arrays.hashCode(chars); }
+    }
 
     // Internal type for Scheme characters
     record SchemeChar(char value) {}
