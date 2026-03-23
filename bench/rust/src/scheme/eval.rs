@@ -158,11 +158,12 @@ struct Machine {
     kont: Kont,
     saved_conts: Vec<Kont>,
     output: Rc<RefCell<String>>,
+    gensym_counter: usize,
 }
 
 impl Machine {
     fn new(output: Rc<RefCell<String>>) -> Self {
-        Machine { kont: Kont::new(), saved_conts: Vec::new(), output }
+        Machine { kont: Kont::new(), saved_conts: Vec::new(), output, gensym_counter: 0 }
     }
 
     fn run(&mut self, exprs: &[Value], env: &Rc<RefCell<Env>>) -> Result<Value, EvalError> {
@@ -200,7 +201,8 @@ impl Machine {
         match expr {
             Value::Int(_) | Value::Bool(_) | Value::String(_)
             | Value::Char(_) | Value::Builtin(_) | Value::Void
-            | Value::Closure { .. } | Value::Continuation(_) => Ok(Control::Continue(expr)),
+            | Value::Closure { .. } | Value::Continuation(_)
+            | Value::SyntaxRules { .. } => Ok(Control::Continue(expr)),
             Value::Symbol(ref name, _) => env
                 .borrow()
                 .get(name)
@@ -233,7 +235,25 @@ impl Machine {
                 "cond" => return self.sf_cond(&elems[1..], env),
                 "set!" => return self.sf_set(&elems[1..], span, env),
                 "string-set!" => return self.sf_string_set(&elems[1..], span, env),
+                "define-syntax" => return self.sf_define_syntax(&elems[1..], span, env),
                 _ => {}
+            }
+
+            // Check if head is a macro (syntax-rules)
+            // Extract SyntaxRules data before calling expand, to drop the env borrow
+            let macro_data = env.borrow().get(op).ok().and_then(|val| {
+                if let Value::SyntaxRules { literals, rules, def_env } = val {
+                    Some((literals, rules, def_env))
+                } else {
+                    None
+                }
+            });
+            if let Some((literals, rules, def_env)) = macro_data {
+                let expanded = crate::scheme::macros::expand_syntax_rules(
+                    &literals, &rules, &elems, &def_env, env,
+                    &mut self.gensym_counter,
+                )?;
+                return Ok(Control::Eval(expanded, Rc::clone(env)));
             }
         }
 
@@ -605,7 +625,7 @@ impl Machine {
             }
             Value::Int(_) | Value::Bool(_) | Value::String(_) | Value::Char(_)
             | Value::Builtin(_) | Value::Closure { .. } | Value::Continuation(_)
-            | Value::Void => {
+            | Value::SyntaxRules { .. } | Value::Void => {
                 Err(EvalError::Parse {
                     msg: format!("define: expected symbol or list, got {}", args[0]),
                 }.at(span))
@@ -813,6 +833,74 @@ impl Machine {
         });
         Ok(Control::Eval(args[1].clone(), Rc::clone(env)))
     }
+
+    fn sf_define_syntax(
+        &mut self, args: &[Value], span: Option<Span>, env: &Rc<RefCell<Env>>,
+    ) -> Result<Control, EvalError> {
+        if args.len() != 2 {
+            return Err(EvalError::Parse {
+                msg: "define-syntax requires 2 arguments".into(),
+            }.at(span));
+        }
+        let Value::Symbol(name, _) = &args[0] else {
+            return Err(EvalError::Parse {
+                msg: "define-syntax: expected name".into(),
+            }.at(span));
+        };
+        let Value::List(sr_elems, _) = &args[1] else {
+            return Err(EvalError::Parse {
+                msg: "define-syntax: expected syntax-rules expression".into(),
+            }.at(span));
+        };
+        if sr_elems.is_empty() {
+            return Err(EvalError::Parse {
+                msg: "define-syntax: empty transformer".into(),
+            }.at(span));
+        }
+        let is_syntax_rules = matches!(&sr_elems[0], Value::Symbol(s, _) if s == "syntax-rules");
+        if !is_syntax_rules {
+            return Err(EvalError::Parse {
+                msg: "define-syntax: expected syntax-rules".into(),
+            }.at(span));
+        }
+        if sr_elems.len() < 2 {
+            return Err(EvalError::Parse {
+                msg: "syntax-rules: expected literals list".into(),
+            }.at(span));
+        }
+        let Value::List(literals_list, _) = &sr_elems[1] else {
+            return Err(EvalError::Parse {
+                msg: "syntax-rules: expected literals list".into(),
+            }.at(span));
+        };
+        let literals: Vec<String> = literals_list
+            .iter()
+            .filter_map(|v| {
+                if let Value::Symbol(s, _) = v { Some(s.clone()) } else { None }
+            })
+            .collect();
+        let mut rules = Vec::new();
+        for clause in &sr_elems[2..] {
+            let Value::List(parts, _) = clause else {
+                return Err(EvalError::Parse {
+                    msg: "syntax-rules: clause must be a list".into(),
+                }.at(span));
+            };
+            if parts.len() != 2 {
+                return Err(EvalError::Parse {
+                    msg: "syntax-rules: clause must have pattern and template".into(),
+                }.at(span));
+            }
+            rules.push((parts[0].clone(), parts[1].clone()));
+        }
+        let syntax = Value::SyntaxRules {
+            literals,
+            rules,
+            def_env: Rc::clone(env),
+        };
+        env.borrow_mut().define(name.clone(), syntax);
+        Ok(Control::Continue(Value::Void))
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -839,7 +927,7 @@ fn make_literal(val: Value) -> Value {
     match val {
         Value::Int(_) | Value::Bool(_) | Value::String(_) | Value::Char(_)
         | Value::Builtin(_) | Value::Closure { .. } | Value::Continuation(_)
-        | Value::Void => val,
+        | Value::SyntaxRules { .. } | Value::Void => val,
         Value::Symbol(_, _) | Value::List(_, _) => Value::List(
             vec![Value::Symbol("quote".into(), None), val],
             None,
@@ -1009,7 +1097,8 @@ fn apply_builtin(
                 }
                 Value::Int(_) | Value::Bool(_) | Value::String(_) | Value::Char(_)
                 | Value::Symbol(_, _) | Value::Builtin(_) | Value::Closure { .. }
-                | Value::Continuation(_) | Value::Void => Err(EvalError::TypeMismatch {
+                | Value::Continuation(_) | Value::SyntaxRules { .. }
+                | Value::Void => Err(EvalError::TypeMismatch {
                     expected: "list".into(), got: format!("{}", args[1]),
                 }),
             }
@@ -1022,7 +1111,8 @@ fn apply_builtin(
                 Value::List(elems, _) if !elems.is_empty() => Ok(elems[0].clone()),
                 Value::List(_, _) | Value::Int(_) | Value::Bool(_) | Value::String(_)
                 | Value::Char(_) | Value::Symbol(_, _) | Value::Builtin(_)
-                | Value::Closure { .. } | Value::Continuation(_) | Value::Void => {
+                | Value::Closure { .. } | Value::Continuation(_)
+                | Value::SyntaxRules { .. } | Value::Void => {
                     Err(EvalError::TypeMismatch {
                         expected: "pair".into(), got: format!("{}", args[0]),
                     })
@@ -1039,7 +1129,8 @@ fn apply_builtin(
                 }
                 Value::List(_, _) | Value::Int(_) | Value::Bool(_) | Value::String(_)
                 | Value::Char(_) | Value::Symbol(_, _) | Value::Builtin(_)
-                | Value::Closure { .. } | Value::Continuation(_) | Value::Void => {
+                | Value::Closure { .. } | Value::Continuation(_)
+                | Value::SyntaxRules { .. } | Value::Void => {
                     Err(EvalError::TypeMismatch {
                         expected: "pair".into(), got: format!("{}", args[0]),
                     })

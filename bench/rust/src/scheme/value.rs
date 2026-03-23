@@ -26,6 +26,11 @@ pub enum Value {
         env: Rc<RefCell<Env>>,
     },
     Continuation(usize),
+    SyntaxRules {
+        literals: Vec<String>,
+        rules: Vec<(Value, Value)>,
+        def_env: Rc<RefCell<Env>>,
+    },
     Void,
 }
 
@@ -35,7 +40,7 @@ impl Value {
             Value::Symbol(_, span) | Value::List(_, span) => *span,
             Value::Int(_) | Value::Bool(_) | Value::String(_) | Value::Char(_)
             | Value::Builtin(_) | Value::Closure { .. } | Value::Continuation(_)
-            | Value::Void => None,
+            | Value::SyntaxRules { .. } | Value::Void => None,
         }
     }
 }
@@ -53,6 +58,7 @@ impl PartialEq for Value {
             (Value::Void, Value::Void) => true,
             (Value::Closure { .. }, Value::Closure { .. }) => false,
             (Value::Continuation(a), Value::Continuation(b)) => a == b,
+            (Value::SyntaxRules { .. }, Value::SyntaxRules { .. }) => false,
             (Value::Int(_), _)
             | (Value::Bool(_), _)
             | (Value::String(_), _)
@@ -62,6 +68,7 @@ impl PartialEq for Value {
             | (Value::Builtin(_), _)
             | (Value::Closure { .. }, _)
             | (Value::Continuation(_), _)
+            | (Value::SyntaxRules { .. }, _)
             | (Value::Void, _) => false,
         }
     }
@@ -89,6 +96,7 @@ impl fmt::Display for Value {
             Value::Builtin(name) => write!(f, "#<procedure:{name}>"),
             Value::Closure { .. } => write!(f, "#<procedure>"),
             Value::Continuation(_) => write!(f, "#<continuation>"),
+            Value::SyntaxRules { .. } => write!(f, "#<syntax>"),
             Value::Void => write!(f, ""),
         }
     }
