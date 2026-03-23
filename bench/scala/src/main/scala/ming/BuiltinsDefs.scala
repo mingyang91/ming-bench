@@ -18,23 +18,23 @@ object BuiltinsDefs:
       ("min", args => BuiltinsExt.minOp(args)),
       ("max", args => BuiltinsExt.maxOp(args)),
       ("expt", args => BuiltinsExt.exptOp(args)),
-      ("zero?", args => zeroCheck(args)),
-      ("positive?", args => positiveCheck(args)),
-      ("negative?", args => negativeCheck(args)),
-      ("odd?", args => oddCheck(args)),
-      ("even?", args => evenCheck(args)),
+      ("zero?", args => BuiltinsDefsNumeric.zeroCheck(args)),
+      ("positive?", args => BuiltinsDefsNumeric.positiveCheck(args)),
+      ("negative?", args => BuiltinsDefsNumeric.negativeCheck(args)),
+      ("odd?", args => BuiltinsDefsNumeric.oddCheck(args)),
+      ("even?", args => BuiltinsDefsNumeric.evenCheck(args)),
       ("exact?", args => Builtins.typeCheck(args, Rational.isExact)),
       ("inexact?", args => Builtins.typeCheck(args, Rational.isInexact)),
-      ("integer?", args => Builtins.typeCheck(args, isIntegerVal)),
-      ("rational?", args => Builtins.typeCheck(args, isRationalVal)),
-      ("gcd", args => gcdOp(args)),
-      ("lcm", args => lcmOp(args)),
-      ("truncate", args => truncateOp(args)),
-      ("round", args => roundOp(args)),
-      ("exact->inexact", args => exactToInexactOp(args)),
-      ("inexact->exact", args => inexactToExactOp(args)),
-      ("numerator", args => numeratorOp(args)),
-      ("denominator", args => denominatorOp(args))
+      ("integer?", args => Builtins.typeCheck(args, BuiltinsDefsNumeric.isIntegerVal)),
+      ("rational?", args => Builtins.typeCheck(args, BuiltinsDefsNumeric.isRationalVal)),
+      ("gcd", args => BuiltinsDefsNumeric.gcdOp(args)),
+      ("lcm", args => BuiltinsDefsNumeric.lcmOp(args)),
+      ("truncate", args => BuiltinsDefsNumeric.truncateOp(args)),
+      ("round", args => BuiltinsDefsNumeric.roundOp(args)),
+      ("exact->inexact", args => BuiltinsDefsNumeric.exactToInexactOp(args)),
+      ("inexact->exact", args => BuiltinsDefsNumeric.inexactToExactOp(args)),
+      ("numerator", args => BuiltinsDefsNumeric.numeratorOp(args)),
+      ("denominator", args => BuiltinsDefsNumeric.denominatorOp(args))
     )
 
   private def cxrBuiltins: List[(String, List[SchemeValue] => SchemeValue)] =
@@ -78,6 +78,9 @@ object BuiltinsDefs:
       ("map", args => BuiltinsExt.mapOp(args)),
       ("reverse", args => BuiltinsExt.reverseOp(args)),
       ("member", args => BuiltinsExt.memberOp(args)),
+      ("memq", args => memqOp(args)),
+      ("memv", args => memvOp(args)),
+      ("assq", args => assqOp(args)),
       ("assv", args => assvOp(args)),
       ("for-each", args => BuiltinsExt.forEachOp(args)),
       ("char-alphabetic?", args => BuiltinsCharStr.charAlphabeticCheck(args)),
@@ -122,110 +125,47 @@ object BuiltinsDefs:
       i += 1
     v
 
-  private def isIntegerVal(v: SchemeValue): Boolean = v match
-    case _: IntVal => true
-    case _         => false
-
-  private def isRationalVal(v: SchemeValue): Boolean = v match
-    case _: IntVal | _: RationalVal => true
-    case _                          => false
-
-  private def zeroCheck(args: List[SchemeValue]): SchemeValue =
+  private def memqOp(args: List[SchemeValue]): SchemeValue =
     args match
-      case IntVal(n, _) :: Nil => BoolVal(n == 0)
-      case _                   => throw new EvalError("zero?: expected 1 number")
+      case key :: lst :: Nil =>
+        var cur = lst
+        while true do
+          cur match
+            case ListVal(Nil, _)                                           => return BoolVal(false)
+            case ListVal(h :: _, _) if Builtins.schemeEq(key, h)           => return cur
+            case ListVal(_ :: t, p)                                        => cur = ListVal(t, p)
+            case MutablePairVal(cells) if Builtins.schemeEq(key, cells(0)) => return cur
+            case MutablePairVal(cells)                                     => cur = cells(1)
+            case _                                                         => return BoolVal(false)
+        BoolVal(false)
+      case _ => throw new EvalError("memq: requires 2 arguments")
 
-  private def positiveCheck(args: List[SchemeValue]): SchemeValue =
+  private def memvOp(args: List[SchemeValue]): SchemeValue =
     args match
-      case IntVal(n, _) :: Nil => BoolVal(n > 0)
-      case _                   => throw new EvalError("positive?: expected 1 number")
+      case key :: lst :: Nil =>
+        var cur = lst
+        while true do
+          cur match
+            case ListVal(Nil, _)                                            => return BoolVal(false)
+            case ListVal(h :: _, _) if Builtins.schemeEqv(key, h)           => return cur
+            case ListVal(_ :: t, p)                                         => cur = ListVal(t, p)
+            case MutablePairVal(cells) if Builtins.schemeEqv(key, cells(0)) => return cur
+            case MutablePairVal(cells)                                      => cur = cells(1)
+            case _                                                          => return BoolVal(false)
+        BoolVal(false)
+      case _ => throw new EvalError("memv: requires 2 arguments")
 
-  private def negativeCheck(args: List[SchemeValue]): SchemeValue =
+  private def assqOp(args: List[SchemeValue]): SchemeValue =
     args match
-      case IntVal(n, _) :: Nil => BoolVal(n < 0)
-      case _                   => throw new EvalError("negative?: expected 1 number")
-
-  private def oddCheck(args: List[SchemeValue]): SchemeValue =
-    args match
-      case IntVal(n, _) :: Nil => BoolVal(n % 2 != 0)
-      case _                   => throw new EvalError("odd?: expected 1 number")
-
-  private def evenCheck(args: List[SchemeValue]): SchemeValue =
-    args match
-      case IntVal(n, _) :: Nil => BoolVal(n % 2 == 0)
-      case _                   => throw new EvalError("even?: expected 1 number")
-
-  private def gcdOp(args: List[SchemeValue]): SchemeValue =
-    if args.isEmpty then IntVal(0)
-    else
-      val result = args
-        .map {
-          case IntVal(n, _) => math.abs(n)
-          case _            => throw new EvalError("gcd: expected integer")
-        }
-        .reduce { (a, b) =>
-          var x = a; var y = b
-          while y != 0 do
-            val t = y
-            y = x % y
-            x = t
-          x
-        }
-      IntVal(result)
-
-  private def lcmOp(args: List[SchemeValue]): SchemeValue =
-    if args.isEmpty then IntVal(1)
-    else
-      val nums = args.map {
-        case IntVal(n, _) => math.abs(n)
-        case _            => throw new EvalError("lcm: expected integer")
-      }
-      val result = nums.reduce { (a, b) =>
-        if a == 0 || b == 0 then 0L
-        else
-          var x = a; var y = b
-          while y != 0 do
-            val t = y
-            y = x % y
-            x = t
-          a / x * b
-      }
-      IntVal(result)
-
-  private def truncateOp(args: List[SchemeValue]): SchemeValue =
-    args match
-      case IntVal(n, _) :: Nil    => IntVal(n)
-      case DoubleVal(d, _) :: Nil => IntVal(d.toLong)
-      case _                      => throw new EvalError("truncate: expected 1 number")
-
-  private def roundOp(args: List[SchemeValue]): SchemeValue =
-    args match
-      case IntVal(n, _) :: Nil    => IntVal(n)
-      case DoubleVal(d, _) :: Nil => IntVal(math.round(d))
-      case _                      => throw new EvalError("round: expected 1 number")
-
-  private def exactToInexactOp(args: List[SchemeValue]): SchemeValue =
-    args match
-      case v :: Nil if Rational.isNumeric(v) => DoubleVal(Rational.toDouble(v))
-      case _                                 => throw new EvalError("exact->inexact: expected 1 number")
-
-  private def inexactToExactOp(args: List[SchemeValue]): SchemeValue =
-    args match
-      case DoubleVal(d, _) :: Nil          => Rational.doubleToExact(d)
-      case v :: Nil if Rational.isExact(v) => v
-      case _                               => throw new EvalError("inexact->exact: expected 1 number")
-
-  private def numeratorOp(args: List[SchemeValue]): SchemeValue =
-    args match
-      case IntVal(n, _) :: Nil         => IntVal(n)
-      case RationalVal(n, _, _) :: Nil => IntVal(n)
-      case _                           => throw new EvalError("numerator: expected exact number")
-
-  private def denominatorOp(args: List[SchemeValue]): SchemeValue =
-    args match
-      case IntVal(_, _) :: Nil         => IntVal(1)
-      case RationalVal(_, d, _) :: Nil => IntVal(d)
-      case _                           => throw new EvalError("denominator: expected exact number")
+      case key :: lst :: Nil =>
+        val elems = Builtins.toScalaList(lst)
+        elems
+          .collectFirst {
+            case entry @ MutablePairVal(cells) if Builtins.schemeEq(key, cells(0)) => entry
+            case entry @ ListVal(k :: _, _) if Builtins.schemeEq(key, k)           => entry
+          }
+          .getOrElse(BoolVal(false))
+      case _ => throw new EvalError("assq: requires 2 arguments")
 
   private def assvOp(args: List[SchemeValue]): SchemeValue =
     args match

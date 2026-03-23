@@ -61,6 +61,9 @@ object Interpreter:
           case ListVal(SymbolVal("quote", _) :: args, pos) =>
             return SpecialForms.evalQuote(args, pos)
 
+          case ListVal(SymbolVal("quasiquote", _) :: template :: Nil, pos) =>
+            return Quasiquote.eval(template, curEnv)
+
           case ListVal(SymbolVal("lambda", _) :: args, pos) =>
             return SpecialForms.evalLambda(args, pos, curEnv)
 
@@ -143,11 +146,11 @@ object Interpreter:
       case "or"      => evalOr(args, env)
       case "let"     => SpecialForms.evalLet(args, pos, env)
       case "cond"    => SpecialForms.evalCond(args, env)
-      case "letrec"  => SpecialForms.evalLetrec(args, pos, env)
-      case "letrec*" => SpecialForms.evalLetrecStar(args, pos, env)
-      case "case"    => SpecialForms.evalCase(args, pos, env)
+      case "letrec"  => SpecialFormsLet.evalLetrec(args, pos, env)
+      case "letrec*" => SpecialFormsLet.evalLetrecStar(args, pos, env)
+      case "case"    => SpecialFormsLet.evalCase(args, pos, env)
       case "do"      => IterationForms.evalDo(args, pos, env)
-      case "let*"    => SpecialForms.evalLetStar(args, pos, env)
+      case "let*"    => SpecialFormsLet.evalLetStar(args, pos, env)
       case _         => throw new AssertionError(s"unreachable: $name")
 
   private def evalIf(args: List[SchemeValue], pos: Option[SourcePos], env: Environment): EvalResult =

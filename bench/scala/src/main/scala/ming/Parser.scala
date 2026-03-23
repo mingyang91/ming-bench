@@ -69,8 +69,20 @@ object Parser:
         case '#' if i + 1 < input.length && input(i + 1) == '\'' =>
           result += Token("#'", offsetToPos(input, i))
           i += 2
+        case '#' if i + 1 < input.length && input(i + 1) == '(' =>
+          result += Token("#(", offsetToPos(input, i))
+          i += 2
         case '\'' =>
           result += Token("'", offsetToPos(input, i))
+          i += 1
+        case '`' =>
+          result += Token("`", offsetToPos(input, i))
+          i += 1
+        case ',' if i + 1 < input.length && input(i + 1) == '@' =>
+          result += Token(",@", offsetToPos(input, i))
+          i += 2
+        case ',' =>
+          result += Token(",", offsetToPos(input, i))
           i += 1
         case '"' =>
           val pos         = offsetToPos(input, i)
@@ -81,7 +93,9 @@ object Parser:
           val pos = offsetToPos(input, i)
           val sb  = new StringBuilder
           while i < input.length && !input(i).isWhitespace &&
-            input(i) != '(' && input(i) != ')' && input(i) != '"' && input(i) != ';'
+            input(i) != '(' && input(i) != ')' && input(i) != '"' &&
+            input(i) != ';' && input(i) != '\'' && input(i) != '`' &&
+            input(i) != ','
           do
             sb += input(i)
             i += 1
@@ -95,6 +109,7 @@ object Parser:
     tokens match
       case Nil                => (Nil, Nil)
       case Token(")", _) :: _ => (Nil, tokens)
+      case Token(".", _) :: _ => (Nil, tokens) // dot terminates element collection
       case _ =>
         val (expr, rest)      = parseExpr(tokens)
         val (more, remaining) = parseAll(rest)
@@ -106,20 +121,58 @@ object Parser:
     tokens match
       case Nil => throw new EvalError("unexpected end of input")
       case Token("(", pos) :: rest =>
+        parseList(rest, pos)
+      case Token("#(", pos) :: rest =>
         val (elements, afterList) = parseAll(rest)
         afterList match
-          case Token(")", _) :: remaining => (ListVal(elements, Some(pos)), remaining)
-          case _                          => throw new EvalError("missing closing parenthesis")
+          case Token(")", _) :: remaining =>
+            val vec = BuiltinsVector.vectorOp(elements)
+            (vec, remaining)
+          case _ => throw new EvalError("missing closing parenthesis for vector")
       case Token(")", _) :: _ =>
         throw new EvalError("unexpected )")
       case Token("'", pos) :: rest =>
         val (quoted, remaining) = parseExpr(rest)
         (ListVal(List(SymbolVal("quote", Some(pos)), quoted), Some(pos)), remaining)
+      case Token("`", pos) :: rest =>
+        val (quoted, remaining) = parseExpr(rest)
+        (ListVal(List(SymbolVal("quasiquote", Some(pos)), quoted), Some(pos)), remaining)
+      case Token(",@", pos) :: rest =>
+        val (quoted, remaining) = parseExpr(rest)
+        (ListVal(List(SymbolVal("unquote-splicing", Some(pos)), quoted), Some(pos)), remaining)
+      case Token(",", pos) :: rest =>
+        val (quoted, remaining) = parseExpr(rest)
+        (ListVal(List(SymbolVal("unquote", Some(pos)), quoted), Some(pos)), remaining)
       case Token("#'", pos) :: rest =>
         val (quoted, remaining) = parseExpr(rest)
         (ListVal(List(SymbolVal("syntax-quote", Some(pos)), quoted), Some(pos)), remaining)
       case Token(text, pos) :: rest =>
         (parseAtom(text, pos), rest)
+
+  /** Parse a list, handling dotted pair syntax. */
+  private def parseList(
+    tokens: List[Token],
+    pos: SourcePos
+  ): (SchemeValue, List[Token]) =
+    // Collect elements before potential dot
+    val (elements, afterElems) = parseAll(tokens)
+    afterElems match
+      case Token(")", _) :: remaining =>
+        // Regular list, no dot
+        (ListVal(elements, Some(pos)), remaining)
+      case Token(".", _) :: rest =>
+        // Dotted pair: (a b . c)
+        val (tail, afterTail) = parseExpr(rest)
+        afterTail match
+          case Token(")", _) :: remaining =>
+            if elements.isEmpty then (tail, remaining)
+            else
+              val result = elements.foldRight(tail) { (elem, acc) =>
+                MutablePairVal(Array(elem, acc))
+              }
+              (result, remaining)
+          case _ => throw new EvalError("missing closing parenthesis after dot")
+      case _ => throw new EvalError("missing closing parenthesis")
 
   private def parseAtom(token: String, pos: SourcePos): SchemeValue =
     if token == "#t" then BoolVal(true, Some(pos))
@@ -155,3 +208,11 @@ object Parser:
         case "newline" => CharVal('\n', Some(pos))
         case "tab"     => CharVal('\t', Some(pos))
         case _         => throw new EvalError(s"unknown character name: $token")
+
+  /** Convert a value (ListVal or MutablePairVal chain) to a flat list + optional tail. */
+  def toListAndTail(v: SchemeValue): (List[SchemeValue], Option[SchemeValue]) = v match
+    case ListVal(elems, _) => (elems, None)
+    case MutablePairVal(cells) =>
+      val (rest, tail) = toListAndTail(cells(1))
+      (cells(0) :: rest, tail)
+    case other => (Nil, Some(other))
