@@ -1,8 +1,19 @@
+use std::any::Any;
 use std::cell::RefCell;
 use std::fmt;
 use std::rc::Rc;
 use crate::scheme::env::Env;
 use crate::scheme::parser::Expr;
+
+/// Opaque wrapper for a captured continuation stack.
+#[derive(Clone)]
+pub struct CapturedCont(pub Rc<dyn Any>);
+
+impl fmt::Debug for CapturedCont {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "#<continuation>")
+    }
+}
 
 /// A Scheme value.
 #[derive(Debug, Clone)]
@@ -21,6 +32,7 @@ pub enum Value {
         body: Vec<Expr>,
         closure_env: Rc<Env>,
     },
+    Continuation(CapturedCont),
 }
 
 impl Value {
@@ -41,6 +53,7 @@ impl PartialEq for Value {
             (Value::List(a), Value::List(b)) => a == b,
             (Value::Void, Value::Void) => true,
             (Value::Builtin(a), Value::Builtin(b)) => a == b,
+            (Value::Continuation(_), Value::Continuation(_)) => false,
             _ => false,
         }
     }
@@ -63,6 +76,7 @@ impl Value {
             Value::Void => "".into(),
             Value::Builtin(name) => format!("#<procedure:{}>", name),
             Value::Lambda { .. } => "#<procedure>".into(),
+            Value::Continuation(_) => "#<continuation>".into(),
         }
     }
 
@@ -74,6 +88,7 @@ impl Value {
                 let inner: Vec<String> = elems.iter().map(|v| v.to_display_output()).collect();
                 format!("({})", inner.join(" "))
             }
+            Value::Continuation(_) => "#<continuation>".into(),
             other => other.to_display_string(),
         }
     }

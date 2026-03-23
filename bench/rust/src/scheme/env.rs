@@ -29,6 +29,7 @@ impl Env {
             "string->number", "number->string",
             "symbol->string", "string->symbol",
             "string-ref", "string-copy", "string-set!", "char?",
+            "call/cc", "call-with-current-continuation",
         ] {
             bindings.insert(name.into(), Value::Builtin(name.into()));
         }

@@ -8,7 +8,7 @@ mod env;
 mod eval;
 
 use env::Env;
-use eval::eval_expr;
+use eval::eval_top_level;
 use parser::Parser;
 
 /// Evaluate one or more Scheme expressions and return the string
@@ -16,10 +16,7 @@ use parser::Parser;
 pub fn eval_str(input: &str) -> Result<String, EvalError> {
     let exprs = Parser::new(input).parse_all()?;
     let env = Env::default_env();
-    let mut result = value::Value::Void;
-    for expr in exprs {
-        result = eval_expr(&expr, &env)?;
-    }
+    let result = eval_top_level(&exprs, &env)?;
     match result {
         value::Value::Void => Ok("".into()),
         other => Ok(other.to_display_string()),
@@ -32,10 +29,7 @@ pub fn eval_str_with_output(input: &str) -> Result<(String, String), EvalError> 
     let exprs = Parser::new(input).parse_all()?;
     let output_buf = std::rc::Rc::new(std::cell::RefCell::new(String::new()));
     let env = Env::default_env_with_output(output_buf);
-    let mut result = value::Value::Void;
-    for expr in exprs {
-        result = eval_expr(&expr, &env)?;
-    }
+    let result = eval_top_level(&exprs, &env)?;
     let output = env.take_output();
     let result_str = match result {
         value::Value::Void => String::new(),
