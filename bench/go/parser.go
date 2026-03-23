@@ -124,6 +124,14 @@ func Tokenize(input string) ([]Token, error) {
 			continue
 		}
 
+		// Syntax quote shorthand #'
+		if ch == '#' && i+1 < len(input) && input[i+1] == '\'' {
+			tokens = append(tokens, Token{Type: TokenSymbol, Value: "#'", Line: line, Col: col})
+			i += 2
+			col += 2
+			continue
+		}
+
 		// Number or symbol starting with - or +
 		if isSymbolChar(ch) || ch == '+' || ch == '-' {
 			startCol := col
@@ -348,6 +356,20 @@ func (p *Parser) ParseExpr() (Expr, error) {
 
 	case TokenSymbol:
 		p.next()
+		if tok.Value == "#'" {
+			inner, err := p.ParseExpr()
+			if err != nil {
+				return nil, err
+			}
+			return &ListExpr{
+				Elements: []Expr{
+					&SymbolExpr{Name: "syntax", Line: tok.Line, Col: tok.Col},
+					inner,
+				},
+				Line: tok.Line,
+				Col:  tok.Col,
+			}, nil
+		}
 		return &SymbolExpr{Name: tok.Value, Line: tok.Line, Col: tok.Col}, nil
 
 	case TokenQuote:

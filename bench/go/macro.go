@@ -29,7 +29,7 @@ func gensym(base string) string {
 	return fmt.Sprintf("%s$$%d", base, id)
 }
 
-// evalDefineSyntax handles (define-syntax name (syntax-rules (literals...) rules...))
+// evalDefineSyntax handles (define-syntax name (syntax-rules ...)) or (define-syntax name (lambda (stx) ...))
 func evalDefineSyntax(e *ListExpr, env *Env) (SchemeValue, error) {
 	if len(e.Elements) != 3 {
 		line, col := e.Pos()
@@ -45,13 +45,34 @@ func evalDefineSyntax(e *ListExpr, env *Env) (SchemeValue, error) {
 	srExpr, ok := e.Elements[2].(*ListExpr)
 	if !ok || len(srExpr.Elements) < 2 {
 		line, col := e.Pos()
-		return nil, &EvalError{Message: fmt.Sprintf("%d:%d: define-syntax: expected syntax-rules", line, col)}
+		return nil, &EvalError{Message: fmt.Sprintf("%d:%d: define-syntax: expected syntax-rules or lambda", line, col)}
 	}
 
 	srSym, ok := srExpr.Elements[0].(*SymbolExpr)
-	if !ok || srSym.Name != "syntax-rules" {
+	if !ok {
 		line, col := e.Pos()
-		return nil, &EvalError{Message: fmt.Sprintf("%d:%d: define-syntax: expected syntax-rules", line, col)}
+		return nil, &EvalError{Message: fmt.Sprintf("%d:%d: define-syntax: expected syntax-rules or lambda", line, col)}
+	}
+
+	// Handle lambda transformer
+	if srSym.Name == "lambda" {
+		val, err := Eval(srExpr, env)
+		if err != nil {
+			return nil, err
+		}
+		lam, ok := val.(*Lambda)
+		if !ok {
+			line, col := e.Pos()
+			return nil, &EvalError{Message: fmt.Sprintf("%d:%d: define-syntax: lambda did not produce a procedure", line, col)}
+		}
+		transformer := &SchemeSyntaxTransformer{Transformer: lam, DefEnv: env}
+		env.Set(nameSym.Name, transformer)
+		return &SchemeVoid{}, nil
+	}
+
+	if srSym.Name != "syntax-rules" {
+		line, col := e.Pos()
+		return nil, &EvalError{Message: fmt.Sprintf("%d:%d: define-syntax: expected syntax-rules or lambda", line, col)}
 	}
 
 	// Parse literals
@@ -249,6 +270,7 @@ var specialForms = map[string]bool{
 	"lambda": true, "cond": true, "and": true, "or": true, "quote": true,
 	"define-syntax": true, "syntax-rules": true, "let*": true, "letrec": true,
 	"letrec*": true, "case": true, "do": true,
+	"syntax-case": true, "syntax": true, "with-syntax": true,
 }
 
 func isSpecialForm(name string) bool {

@@ -359,6 +359,15 @@ func Eval(expr Expr, env *Env) (SchemeValue, error) {
 				case "define-syntax":
 					return evalDefineSyntax(e, env)
 
+				case "syntax-case":
+					return evalSyntaxCase(e, env)
+
+				case "syntax":
+					return evalSyntaxTemplate(e, env)
+
+				case "with-syntax":
+					return evalWithSyntax(e, env)
+
 				case "letrec":
 					newExpr, newEnv, err := setupLetrec(e, env, false)
 					if err != nil {
@@ -460,6 +469,15 @@ func Eval(expr Expr, env *Env) (SchemeValue, error) {
 				if v, ok := env.Get(sym.Name); ok {
 					if macro, ok := v.(*SchemeMacro); ok {
 						expanded, enrichedEnv, err := expandMacro(macro, e, env)
+						if err != nil {
+							return nil, err
+						}
+						expr = expanded
+						env = enrichedEnv
+						continue
+					}
+					if transformer, ok := v.(*SchemeSyntaxTransformer); ok {
+						expanded, enrichedEnv, err := expandSyntaxTransformer(transformer, e, env)
 						if err != nil {
 							return nil, err
 						}
@@ -1081,6 +1099,8 @@ func init() {
 	builtins["number->string"] = &BuiltinProc{Name: "number->string", Fn: builtinNumberToString}
 	builtins["symbol->string"] = &BuiltinProc{Name: "symbol->string", Fn: builtinSymbolToString}
 	builtins["string->symbol"] = &BuiltinProc{Name: "string->symbol", Fn: builtinStringToSymbol}
+	builtins["syntax->datum"] = &BuiltinProc{Name: "syntax->datum", Fn: builtinSyntaxToDatum}
+	builtins["datum->syntax"] = &BuiltinProc{Name: "datum->syntax", Fn: builtinDatumToSyntax}
 	builtins["string-ref"] = &BuiltinProc{Name: "string-ref", Fn: builtinStringRef}
 	builtins["string-copy"] = &BuiltinProc{Name: "string-copy", Fn: builtinStringCopy}
 	builtins["string-set!"] = &BuiltinProc{Name: "string-set!", Fn: builtinStringSet}
@@ -1699,6 +1719,27 @@ func builtinStringToSymbol(args []SchemeValue, callExpr *ListExpr) (SchemeValue,
 		return nil, &EvalError{Message: fmt.Sprintf("%d:%d: string->symbol: expected string", line, col)}
 	}
 	return &SchemeSymbol{Name: s.Value}, nil
+}
+
+// syntax->datum: In our simple implementation, syntax objects ARE datums (SchemeValues),
+// so this is essentially identity. But if input is a symbol wrapping a syntax object we just return it.
+func builtinSyntaxToDatum(args []SchemeValue, callExpr *ListExpr) (SchemeValue, error) {
+	if len(args) != 1 {
+		line, col := callExpr.Pos()
+		return nil, &EvalError{Message: fmt.Sprintf("%d:%d: syntax->datum: requires exactly 1 argument", line, col)}
+	}
+	return args[0], nil
+}
+
+// datum->syntax: Takes a template-id and a datum, returns the datum as a syntax object.
+// In our simple implementation, this is essentially identity — the template-id is used for
+// lexical context but we handle that at the macro expansion level.
+func builtinDatumToSyntax(args []SchemeValue, callExpr *ListExpr) (SchemeValue, error) {
+	if len(args) != 2 {
+		line, col := callExpr.Pos()
+		return nil, &EvalError{Message: fmt.Sprintf("%d:%d: datum->syntax: requires exactly 2 arguments", line, col)}
+	}
+	return args[1], nil
 }
 
 func builtinStringRef(args []SchemeValue, callExpr *ListExpr) (SchemeValue, error) {
