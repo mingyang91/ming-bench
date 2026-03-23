@@ -1,19 +1,23 @@
 use std::rc::Rc;
 use crate::scheme::env::Env;
-use crate::scheme::error::EvalError;
-use crate::scheme::parser::Expr;
+use crate::scheme::error::{ErrorKind, EvalError};
+use crate::scheme::parser::{Expr, ExprKind};
 use crate::scheme::value::Value;
 
 /// Evaluate a parsed expression in the given environment.
 pub fn eval_expr(expr: &Expr, env: &Rc<Env>) -> Result<Value, EvalError> {
-    match expr {
-        Expr::Integer(n) => Ok(Value::Integer(*n)),
-        Expr::Boolean(b) => Ok(Value::Boolean(*b)),
-        Expr::Str(s) => Ok(Value::Str(s.clone())),
-        Expr::Symbol(name) => env.get(name).ok_or_else(|| EvalError::UnboundVariable {
-            name: name.clone(),
+    eval_expr_inner(expr, env).map_err(|e| e.with_span(expr.span))
+}
+
+fn eval_expr_inner(expr: &Expr, env: &Rc<Env>) -> Result<Value, EvalError> {
+    match &expr.kind {
+        ExprKind::Integer(n) => Ok(Value::Integer(*n)),
+        ExprKind::Boolean(b) => Ok(Value::Boolean(*b)),
+        ExprKind::Str(s) => Ok(Value::Str(s.clone())),
+        ExprKind::Symbol(name) => env.get(name).ok_or_else(|| {
+            ErrorKind::UnboundVariable { name: name.clone() }.into()
         }),
-        Expr::List(elems) => eval_list(elems, env),
+        ExprKind::List(elems) => eval_list(elems, env),
     }
 }
 
@@ -23,7 +27,7 @@ fn eval_list(elems: &[Expr], env: &Rc<Env>) -> Result<Value, EvalError> {
     }
 
     // Check for special forms first
-    if let Expr::Symbol(name) = &elems[0] {
+    if let ExprKind::Symbol(name) = &elems[0].kind {
         match name.as_str() {
             "and" => return eval_and(&elems[1..], env),
             "or" => return eval_or(&elems[1..], env),
@@ -49,10 +53,10 @@ fn eval_list(elems: &[Expr], env: &Rc<Env>) -> Result<Value, EvalError> {
 
 fn eval_if(args: &[Expr], env: &Rc<Env>) -> Result<Value, EvalError> {
     if args.len() < 2 || args.len() > 3 {
-        return Err(EvalError::BadSyntax {
+        return Err(ErrorKind::BadSyntax {
             form: "if".into(),
             message: "expected 2 or 3 arguments".into(),
-        });
+        }.into());
     }
     let cond = eval_expr(&args[0], env)?;
     if cond.is_truthy() {
@@ -66,47 +70,47 @@ fn eval_if(args: &[Expr], env: &Rc<Env>) -> Result<Value, EvalError> {
 
 fn eval_define(args: &[Expr], env: &Rc<Env>) -> Result<Value, EvalError> {
     if args.is_empty() {
-        return Err(EvalError::BadSyntax {
+        return Err(ErrorKind::BadSyntax {
             form: "define".into(),
             message: "missing name".into(),
-        });
+        }.into());
     }
-    match &args[0] {
+    match &args[0].kind {
         // (define x expr)
-        Expr::Symbol(name) => {
+        ExprKind::Symbol(name) => {
             if args.len() != 2 {
-                return Err(EvalError::BadSyntax {
+                return Err(ErrorKind::BadSyntax {
                     form: "define".into(),
                     message: "expected (define name expr)".into(),
-                });
+                }.into());
             }
             let val = eval_expr(&args[1], env)?;
             env.define(name.clone(), val);
             Ok(Value::Void)
         }
         // (define (f params...) body...)
-        Expr::List(name_and_params) => {
+        ExprKind::List(name_and_params) => {
             if name_and_params.is_empty() {
-                return Err(EvalError::BadSyntax {
+                return Err(ErrorKind::BadSyntax {
                     form: "define".into(),
                     message: "missing function name".into(),
-                });
+                }.into());
             }
-            let name = match &name_and_params[0] {
-                Expr::Symbol(s) => s.clone(),
-                _ => return Err(EvalError::BadSyntax {
+            let name = match &name_and_params[0].kind {
+                ExprKind::Symbol(s) => s.clone(),
+                _ => return Err(ErrorKind::BadSyntax {
                     form: "define".into(),
                     message: "function name must be a symbol".into(),
-                }),
+                }.into()),
             };
             let params: Vec<String> = name_and_params[1..]
                 .iter()
-                .map(|e| match e {
-                    Expr::Symbol(s) => Ok(s.clone()),
-                    _ => Err(EvalError::BadSyntax {
+                .map(|e| match &e.kind {
+                    ExprKind::Symbol(s) => Ok(s.clone()),
+                    _ => Err(EvalError::from(ErrorKind::BadSyntax {
                         form: "define".into(),
                         message: "parameter must be a symbol".into(),
-                    }),
+                    })),
                 })
                 .collect::<Result<Vec<_>, _>>()?;
             let body = args[1..].to_vec();
@@ -118,30 +122,30 @@ fn eval_define(args: &[Expr], env: &Rc<Env>) -> Result<Value, EvalError> {
             env.define(name, lambda);
             Ok(Value::Void)
         }
-        _ => Err(EvalError::BadSyntax {
+        _ => Err(ErrorKind::BadSyntax {
             form: "define".into(),
             message: "invalid define syntax".into(),
-        }),
+        }.into()),
     }
 }
 
 fn eval_quote(args: &[Expr]) -> Result<Value, EvalError> {
     if args.len() != 1 {
-        return Err(EvalError::BadSyntax {
+        return Err(ErrorKind::BadSyntax {
             form: "quote".into(),
             message: "expected 1 argument".into(),
-        });
+        }.into());
     }
     expr_to_value(&args[0])
 }
 
 fn expr_to_value(expr: &Expr) -> Result<Value, EvalError> {
-    match expr {
-        Expr::Integer(n) => Ok(Value::Integer(*n)),
-        Expr::Boolean(b) => Ok(Value::Boolean(*b)),
-        Expr::Str(s) => Ok(Value::Str(s.clone())),
-        Expr::Symbol(s) => Ok(Value::Symbol(s.clone())),
-        Expr::List(elems) => {
+    match &expr.kind {
+        ExprKind::Integer(n) => Ok(Value::Integer(*n)),
+        ExprKind::Boolean(b) => Ok(Value::Boolean(*b)),
+        ExprKind::Str(s) => Ok(Value::Str(s.clone())),
+        ExprKind::Symbol(s) => Ok(Value::Symbol(s.clone())),
+        ExprKind::List(elems) => {
             let vals: Vec<Value> = elems
                 .iter()
                 .map(expr_to_value)
@@ -153,28 +157,28 @@ fn expr_to_value(expr: &Expr) -> Result<Value, EvalError> {
 
 fn eval_lambda(args: &[Expr], env: &Rc<Env>) -> Result<Value, EvalError> {
     if args.len() < 2 {
-        return Err(EvalError::BadSyntax {
+        return Err(ErrorKind::BadSyntax {
             form: "lambda".into(),
             message: "expected (lambda (params) body...)".into(),
-        });
+        }.into());
     }
-    let params = match &args[0] {
-        Expr::List(param_exprs) => {
+    let params = match &args[0].kind {
+        ExprKind::List(param_exprs) => {
             param_exprs
                 .iter()
-                .map(|e| match e {
-                    Expr::Symbol(s) => Ok(s.clone()),
-                    _ => Err(EvalError::BadSyntax {
+                .map(|e| match &e.kind {
+                    ExprKind::Symbol(s) => Ok(s.clone()),
+                    _ => Err(EvalError::from(ErrorKind::BadSyntax {
                         form: "lambda".into(),
                         message: "parameter must be a symbol".into(),
-                    }),
+                    })),
                 })
                 .collect::<Result<Vec<_>, _>>()?
         }
-        _ => return Err(EvalError::BadSyntax {
+        _ => return Err(ErrorKind::BadSyntax {
             form: "lambda".into(),
             message: "expected parameter list".into(),
-        }),
+        }.into()),
     };
     let body = args[1..].to_vec();
     Ok(Value::Lambda {
@@ -212,46 +216,46 @@ fn eval_or(exprs: &[Expr], env: &Rc<Env>) -> Result<Value, EvalError> {
 
 fn eval_let(args: &[Expr], env: &Rc<Env>) -> Result<Value, EvalError> {
     if args.is_empty() {
-        return Err(EvalError::BadSyntax {
+        return Err(ErrorKind::BadSyntax {
             form: "let".into(),
             message: "missing bindings".into(),
-        });
+        }.into());
     }
     // Named let: (let name ((var init) ...) body...)
-    if let Expr::Symbol(name) = &args[0] {
+    if let ExprKind::Symbol(name) = &args[0].kind {
         if args.len() < 3 {
-            return Err(EvalError::BadSyntax {
+            return Err(ErrorKind::BadSyntax {
                 form: "let".into(),
                 message: "expected (let name ((var init) ...) body...)".into(),
-            });
+            }.into());
         }
-        let bindings_expr = match &args[1] {
-            Expr::List(b) => b,
-            _ => return Err(EvalError::BadSyntax {
+        let bindings_expr = match &args[1].kind {
+            ExprKind::List(b) => b,
+            _ => return Err(ErrorKind::BadSyntax {
                 form: "let".into(),
                 message: "bindings must be a list".into(),
-            }),
+            }.into()),
         };
         let mut params = Vec::new();
         let mut init_vals = Vec::new();
         for binding in bindings_expr {
-            match binding {
-                Expr::List(pair) if pair.len() == 2 => {
-                    match &pair[0] {
-                        Expr::Symbol(var) => {
+            match &binding.kind {
+                ExprKind::List(pair) if pair.len() == 2 => {
+                    match &pair[0].kind {
+                        ExprKind::Symbol(var) => {
                             params.push(var.clone());
                             init_vals.push(eval_expr(&pair[1], env)?);
                         }
-                        _ => return Err(EvalError::BadSyntax {
+                        _ => return Err(ErrorKind::BadSyntax {
                             form: "let".into(),
                             message: "binding name must be a symbol".into(),
-                        }),
+                        }.into()),
                     }
                 }
-                _ => return Err(EvalError::BadSyntax {
+                _ => return Err(ErrorKind::BadSyntax {
                     form: "let".into(),
                     message: "each binding must be (var init)".into(),
-                }),
+                }.into()),
             }
         }
         let body = args[2..].to_vec();
@@ -272,39 +276,39 @@ fn eval_let(args: &[Expr], env: &Rc<Env>) -> Result<Value, EvalError> {
         return apply_function(&recursive_lambda, &init_vals);
     }
     // Regular let: (let ((var init) ...) body...)
-    let bindings_expr = match &args[0] {
-        Expr::List(b) => b,
-        _ => return Err(EvalError::BadSyntax {
+    let bindings_expr = match &args[0].kind {
+        ExprKind::List(b) => b,
+        _ => return Err(ErrorKind::BadSyntax {
             form: "let".into(),
             message: "bindings must be a list".into(),
-        }),
+        }.into()),
     };
     if args.len() < 2 {
-        return Err(EvalError::BadSyntax {
+        return Err(ErrorKind::BadSyntax {
             form: "let".into(),
             message: "missing body".into(),
-        });
+        }.into());
     }
     let mut names = Vec::new();
     let mut vals = Vec::new();
     for binding in bindings_expr {
-        match binding {
-            Expr::List(pair) if pair.len() == 2 => {
-                match &pair[0] {
-                    Expr::Symbol(var) => {
+        match &binding.kind {
+            ExprKind::List(pair) if pair.len() == 2 => {
+                match &pair[0].kind {
+                    ExprKind::Symbol(var) => {
                         names.push(var.clone());
                         vals.push(eval_expr(&pair[1], env)?);
                     }
-                    _ => return Err(EvalError::BadSyntax {
+                    _ => return Err(ErrorKind::BadSyntax {
                         form: "let".into(),
                         message: "binding name must be a symbol".into(),
-                    }),
+                    }.into()),
                 }
             }
-            _ => return Err(EvalError::BadSyntax {
+            _ => return Err(ErrorKind::BadSyntax {
                 form: "let".into(),
                 message: "each binding must be (var init)".into(),
-            }),
+            }.into()),
         }
     }
     let local_env = Env::extend(env, names, vals);
@@ -325,10 +329,10 @@ fn eval_begin(args: &[Expr], env: &Rc<Env>) -> Result<Value, EvalError> {
 
 fn eval_cond(clauses: &[Expr], env: &Rc<Env>) -> Result<Value, EvalError> {
     for clause in clauses {
-        match clause {
-            Expr::List(elems) if !elems.is_empty() => {
+        match &clause.kind {
+            ExprKind::List(elems) if !elems.is_empty() => {
                 // Check for else clause
-                if let Expr::Symbol(s) = &elems[0] {
+                if let ExprKind::Symbol(s) = &elems[0].kind {
                     if s == "else" {
                         let mut result = Value::Void;
                         for expr in &elems[1..] {
@@ -348,10 +352,10 @@ fn eval_cond(clauses: &[Expr], env: &Rc<Env>) -> Result<Value, EvalError> {
                     return Ok(result);
                 }
             }
-            _ => return Err(EvalError::BadSyntax {
+            _ => return Err(ErrorKind::BadSyntax {
                 form: "cond".into(),
                 message: "each clause must be a list".into(),
-            }),
+            }.into()),
         }
     }
     Ok(Value::Void)
@@ -362,10 +366,10 @@ pub fn apply_function(func: &Value, args: &[Value]) -> Result<Value, EvalError> 
         Value::Builtin(name) => apply_builtin(name, args),
         Value::Lambda { params, body, closure_env } => {
             if args.len() != params.len() {
-                return Err(EvalError::WrongArgCount {
+                return Err(ErrorKind::WrongArgCount {
                     expected: params.len(),
                     got: args.len(),
-                });
+                }.into());
             }
             let local_env = Env::extend(closure_env, params.clone(), args.to_vec());
             let mut result = Value::Void;
@@ -374,9 +378,9 @@ pub fn apply_function(func: &Value, args: &[Value]) -> Result<Value, EvalError> 
             }
             Ok(result)
         }
-        other => Err(EvalError::NotAProcedure {
+        other => Err(ErrorKind::NotAProcedure {
             value: other.to_display_string(),
-        }),
+        }.into()),
     }
 }
 
@@ -385,7 +389,7 @@ fn apply_builtin(name: &str, args: &[Value]) -> Result<Value, EvalError> {
         "+" => arith_variadic(args, 0, |a, b| Ok(a + b)),
         "-" => {
             if args.is_empty() {
-                return Err(EvalError::WrongArgCount { expected: 1, got: 0 });
+                return Err(ErrorKind::WrongArgCount { expected: 1, got: 0 }.into());
             }
             if args.len() == 1 {
                 let n = require_int(&args[0])?;
@@ -403,12 +407,12 @@ fn apply_builtin(name: &str, args: &[Value]) -> Result<Value, EvalError> {
         "*" => arith_variadic(args, 1, |a, b| Ok(a * b)),
         "/" => {
             if args.is_empty() {
-                return Err(EvalError::WrongArgCount { expected: 1, got: 0 });
+                return Err(ErrorKind::WrongArgCount { expected: 1, got: 0 }.into());
             }
             let first = require_int(&args[0])?;
             if args.len() == 1 {
                 if first == 0 {
-                    return Err(EvalError::DivisionByZero);
+                    return Err(ErrorKind::DivisionByZero.into());
                 }
                 return Ok(Value::Integer(1 / first));
             }
@@ -416,7 +420,7 @@ fn apply_builtin(name: &str, args: &[Value]) -> Result<Value, EvalError> {
             for arg in &args[1..] {
                 let n = require_int(arg)?;
                 if n == 0 {
-                    return Err(EvalError::DivisionByZero);
+                    return Err(ErrorKind::DivisionByZero.into());
                 }
                 result /= n;
             }
@@ -429,13 +433,13 @@ fn apply_builtin(name: &str, args: &[Value]) -> Result<Value, EvalError> {
         ">=" => compare_nums(args, |a, b| a >= b),
         "not" => {
             if args.len() != 1 {
-                return Err(EvalError::WrongArgCount { expected: 1, got: args.len() });
+                return Err(ErrorKind::WrongArgCount { expected: 1, got: args.len() }.into());
             }
             Ok(Value::Boolean(!args[0].is_truthy()))
         }
         "cons" => {
             if args.len() != 2 {
-                return Err(EvalError::WrongArgCount { expected: 2, got: args.len() });
+                return Err(ErrorKind::WrongArgCount { expected: 2, got: args.len() }.into());
             }
             match &args[1] {
                 Value::List(tail) => {
@@ -444,53 +448,51 @@ fn apply_builtin(name: &str, args: &[Value]) -> Result<Value, EvalError> {
                     Ok(Value::List(new_list))
                 }
                 _ => {
-                    // Dotted pair - for now represent as a 2-element list
-                    // (will need Pair type for proper dotted pairs later)
                     Ok(Value::List(vec![args[0].clone(), args[1].clone()]))
                 }
             }
         }
         "car" => {
             if args.len() != 1 {
-                return Err(EvalError::WrongArgCount { expected: 1, got: args.len() });
+                return Err(ErrorKind::WrongArgCount { expected: 1, got: args.len() }.into());
             }
             match &args[0] {
                 Value::List(elems) if !elems.is_empty() => Ok(elems[0].clone()),
-                _ => Err(EvalError::TypeMismatch {
+                _ => Err(ErrorKind::TypeMismatch {
                     expected: "pair".into(),
                     got: args[0].to_display_string(),
-                }),
+                }.into()),
             }
         }
         "cdr" => {
             if args.len() != 1 {
-                return Err(EvalError::WrongArgCount { expected: 1, got: args.len() });
+                return Err(ErrorKind::WrongArgCount { expected: 1, got: args.len() }.into());
             }
             match &args[0] {
                 Value::List(elems) if !elems.is_empty() => Ok(Value::List(elems[1..].to_vec())),
-                _ => Err(EvalError::TypeMismatch {
+                _ => Err(ErrorKind::TypeMismatch {
                     expected: "pair".into(),
                     got: args[0].to_display_string(),
-                }),
+                }.into()),
             }
         }
         "null?" => {
             if args.len() != 1 {
-                return Err(EvalError::WrongArgCount { expected: 1, got: args.len() });
+                return Err(ErrorKind::WrongArgCount { expected: 1, got: args.len() }.into());
             }
             Ok(Value::Boolean(matches!(&args[0], Value::List(elems) if elems.is_empty())))
         }
         "list" => Ok(Value::List(args.to_vec())),
         "length" => {
             if args.len() != 1 {
-                return Err(EvalError::WrongArgCount { expected: 1, got: args.len() });
+                return Err(ErrorKind::WrongArgCount { expected: 1, got: args.len() }.into());
             }
             match &args[0] {
                 Value::List(elems) => Ok(Value::Integer(elems.len() as i64)),
-                _ => Err(EvalError::TypeMismatch {
+                _ => Err(ErrorKind::TypeMismatch {
                     expected: "list".into(),
                     got: args[0].to_display_string(),
-                }),
+                }.into()),
             }
         }
         "append" => {
@@ -498,57 +500,57 @@ fn apply_builtin(name: &str, args: &[Value]) -> Result<Value, EvalError> {
             for arg in args {
                 match arg {
                     Value::List(elems) => result.extend(elems.iter().cloned()),
-                    _ => return Err(EvalError::TypeMismatch {
+                    _ => return Err(ErrorKind::TypeMismatch {
                         expected: "list".into(),
                         got: arg.to_display_string(),
-                    }),
+                    }.into()),
                 }
             }
             Ok(Value::List(result))
         }
         "string?" => {
             if args.len() != 1 {
-                return Err(EvalError::WrongArgCount { expected: 1, got: args.len() });
+                return Err(ErrorKind::WrongArgCount { expected: 1, got: args.len() }.into());
             }
             Ok(Value::Boolean(matches!(&args[0], Value::Str(_))))
         }
         "number?" => {
             if args.len() != 1 {
-                return Err(EvalError::WrongArgCount { expected: 1, got: args.len() });
+                return Err(ErrorKind::WrongArgCount { expected: 1, got: args.len() }.into());
             }
             Ok(Value::Boolean(matches!(&args[0], Value::Integer(_))))
         }
         "boolean?" => {
             if args.len() != 1 {
-                return Err(EvalError::WrongArgCount { expected: 1, got: args.len() });
+                return Err(ErrorKind::WrongArgCount { expected: 1, got: args.len() }.into());
             }
             Ok(Value::Boolean(matches!(&args[0], Value::Boolean(_))))
         }
         "pair?" => {
             if args.len() != 1 {
-                return Err(EvalError::WrongArgCount { expected: 1, got: args.len() });
+                return Err(ErrorKind::WrongArgCount { expected: 1, got: args.len() }.into());
             }
             Ok(Value::Boolean(matches!(&args[0], Value::List(elems) if !elems.is_empty())))
         }
         "symbol?" => {
             if args.len() != 1 {
-                return Err(EvalError::WrongArgCount { expected: 1, got: args.len() });
+                return Err(ErrorKind::WrongArgCount { expected: 1, got: args.len() }.into());
             }
             Ok(Value::Boolean(matches!(&args[0], Value::Symbol(_))))
         }
-        _ => Err(EvalError::NotAProcedure {
+        _ => Err(ErrorKind::NotAProcedure {
             value: format!("#<procedure:{}>", name),
-        }),
+        }.into()),
     }
 }
 
 fn require_int(val: &Value) -> Result<i64, EvalError> {
     match val {
         Value::Integer(n) => Ok(*n),
-        other => Err(EvalError::TypeMismatch {
+        other => Err(ErrorKind::TypeMismatch {
             expected: "integer".into(),
             got: other.to_display_string(),
-        }),
+        }.into()),
     }
 }
 
@@ -567,7 +569,7 @@ fn arith_variadic(
 
 fn compare_nums(args: &[Value], cmp: impl Fn(i64, i64) -> bool) -> Result<Value, EvalError> {
     if args.len() < 2 {
-        return Err(EvalError::WrongArgCount { expected: 2, got: args.len() });
+        return Err(ErrorKind::WrongArgCount { expected: 2, got: args.len() }.into());
     }
     for pair in args.windows(2) {
         let a = require_int(&pair[0])?;

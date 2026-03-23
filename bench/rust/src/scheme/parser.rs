@@ -1,8 +1,8 @@
-use crate::scheme::EvalError;
+use crate::scheme::error::{ErrorKind, EvalError, Span};
 
-/// An S-expression (parsed but not yet evaluated).
+/// The kind of an S-expression node.
 #[derive(Debug, Clone, PartialEq)]
-pub enum Expr {
+pub enum ExprKind {
     Integer(i64),
     Boolean(bool),
     Str(String),
@@ -10,9 +10,18 @@ pub enum Expr {
     List(Vec<Expr>),
 }
 
+/// A parsed S-expression with source position.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Expr {
+    pub kind: ExprKind,
+    pub span: Span,
+}
+
 pub struct Parser {
     chars: Vec<char>,
     pos: usize,
+    line: usize,
+    col: usize,
 }
 
 impl Parser {
@@ -20,6 +29,8 @@ impl Parser {
         Self {
             chars: input.chars().collect(),
             pos: 0,
+            line: 1,
+            col: 1,
         }
     }
 
@@ -35,12 +46,33 @@ impl Parser {
         Ok(exprs)
     }
 
+    fn current_span(&self) -> Span {
+        Span { line: self.line, col: self.col }
+    }
+
+    fn advance(&mut self) {
+        if self.pos < self.chars.len() {
+            if self.chars[self.pos] == '\n' {
+                self.line += 1;
+                self.col = 1;
+            } else {
+                self.col += 1;
+            }
+            self.pos += 1;
+        }
+    }
+
+    fn err(&self, message: impl Into<String>) -> EvalError {
+        EvalError::new(
+            ErrorKind::Parse { message: message.into() },
+            self.current_span(),
+        )
+    }
+
     fn parse_expr(&mut self) -> Result<Expr, EvalError> {
         self.skip_whitespace_and_comments();
         if self.pos >= self.chars.len() {
-            return Err(EvalError::Parse {
-                message: "unexpected end of input".into(),
-            });
+            return Err(self.err("unexpected end of input"));
         }
 
         match self.chars[self.pos] {
@@ -53,30 +85,30 @@ impl Parser {
     }
 
     fn parse_list(&mut self) -> Result<Expr, EvalError> {
-        self.pos += 1; // skip '('
+        let span = self.current_span();
+        self.advance(); // skip '('
         let mut elems = Vec::new();
         loop {
             self.skip_whitespace_and_comments();
             if self.pos >= self.chars.len() {
-                return Err(EvalError::Parse {
-                    message: "unclosed parenthesis".into(),
-                });
+                return Err(self.err("unclosed parenthesis"));
             }
             if self.chars[self.pos] == ')' {
-                self.pos += 1;
-                return Ok(Expr::List(elems));
+                self.advance();
+                return Ok(Expr { kind: ExprKind::List(elems), span });
             }
             elems.push(self.parse_expr()?);
         }
     }
 
     fn parse_string(&mut self) -> Result<Expr, EvalError> {
-        self.pos += 1; // skip opening '"'
+        let span = self.current_span();
+        self.advance(); // skip opening '"'
         let mut s = String::new();
         while self.pos < self.chars.len() {
             let ch = self.chars[self.pos];
             if ch == '\\' && self.pos + 1 < self.chars.len() {
-                self.pos += 1;
+                self.advance();
                 match self.chars[self.pos] {
                     'n' => s.push('\n'),
                     't' => s.push('\t'),
@@ -87,77 +119,82 @@ impl Parser {
                         s.push(other);
                     }
                 }
-                self.pos += 1;
+                self.advance();
             } else if ch == '"' {
-                self.pos += 1;
-                return Ok(Expr::Str(s));
+                self.advance();
+                return Ok(Expr { kind: ExprKind::Str(s), span });
             } else {
                 s.push(ch);
-                self.pos += 1;
+                self.advance();
             }
         }
-        Err(EvalError::Parse {
-            message: "unclosed string".into(),
-        })
+        Err(self.err("unclosed string"))
     }
 
     fn parse_hash(&mut self) -> Result<Expr, EvalError> {
-        self.pos += 1; // skip '#'
+        let span = self.current_span();
+        self.advance(); // skip '#'
         if self.pos >= self.chars.len() {
-            return Err(EvalError::Parse {
-                message: "unexpected end after #".into(),
-            });
+            return Err(self.err("unexpected end after #"));
         }
         match self.chars[self.pos] {
             't' => {
-                self.pos += 1;
-                Ok(Expr::Boolean(true))
+                self.advance();
+                Ok(Expr { kind: ExprKind::Boolean(true), span })
             }
             'f' => {
-                self.pos += 1;
-                Ok(Expr::Boolean(false))
+                self.advance();
+                Ok(Expr { kind: ExprKind::Boolean(false), span })
             }
-            other => Err(EvalError::Parse {
-                message: format!("unexpected character after #: {other}"),
-            }),
+            other => Err(EvalError::new(
+                ErrorKind::Parse {
+                    message: format!("unexpected character after #: {other}"),
+                },
+                span,
+            )),
         }
     }
 
     fn parse_quote(&mut self) -> Result<Expr, EvalError> {
-        self.pos += 1; // skip '\''
+        let span = self.current_span();
+        self.advance(); // skip '\''
         let inner = self.parse_expr()?;
-        Ok(Expr::List(vec![Expr::Symbol("quote".into()), inner]))
+        Ok(Expr {
+            kind: ExprKind::List(vec![
+                Expr { kind: ExprKind::Symbol("quote".into()), span },
+                inner,
+            ]),
+            span,
+        })
     }
 
     fn parse_atom(&mut self) -> Result<Expr, EvalError> {
+        let span = self.current_span();
         let start = self.pos;
         while self.pos < self.chars.len() && !is_delimiter(self.chars[self.pos]) {
-            self.pos += 1;
+            self.advance();
         }
         let token: String = self.chars[start..self.pos].iter().collect();
         if token.is_empty() {
-            return Err(EvalError::Parse {
-                message: "empty token".into(),
-            });
+            return Err(self.err("empty token"));
         }
 
         // Try integer
         if let Ok(n) = token.parse::<i64>() {
-            return Ok(Expr::Integer(n));
+            return Ok(Expr { kind: ExprKind::Integer(n), span });
         }
 
         // Otherwise it's a symbol
-        Ok(Expr::Symbol(token))
+        Ok(Expr { kind: ExprKind::Symbol(token), span })
     }
 
     fn skip_whitespace_and_comments(&mut self) {
         while self.pos < self.chars.len() {
             if self.chars[self.pos].is_whitespace() {
-                self.pos += 1;
+                self.advance();
             } else if self.chars[self.pos] == ';' {
-                // Skip to end of line
                 while self.pos < self.chars.len() && self.chars[self.pos] != '\n' {
-                    self.pos += 1;
+                    self.advance();
                 }
             } else {
                 break;

@@ -1,6 +1,15 @@
-/// Evaluation error type for the Scheme interpreter.
+use std::fmt;
+
+/// Source position (1-based line and column).
+#[derive(Debug, Clone, Copy, PartialEq, Default)]
+pub struct Span {
+    pub line: usize,
+    pub col: usize,
+}
+
+/// Classification of evaluation errors.
 #[derive(Debug, PartialEq, thiserror::Error)]
-pub enum EvalError {
+pub enum ErrorKind {
     #[error("parse error: {message}")]
     Parse { message: String },
 
@@ -21,4 +30,43 @@ pub enum EvalError {
 
     #[error("bad syntax in {form}: {message}")]
     BadSyntax { form: String, message: String },
+}
+
+/// Evaluation error with optional source position.
+#[derive(Debug, PartialEq)]
+pub struct EvalError {
+    pub kind: ErrorKind,
+    pub span: Span,
+}
+
+impl EvalError {
+    pub fn new(kind: ErrorKind, span: Span) -> Self {
+        Self { kind, span }
+    }
+
+    /// Attach a span if this error has no position yet.
+    pub fn with_span(mut self, span: Span) -> Self {
+        if self.span.line == 0 {
+            self.span = span;
+        }
+        self
+    }
+}
+
+impl fmt::Display for EvalError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        if self.span.line > 0 {
+            write!(f, "{}:{}: {}", self.span.line, self.span.col, self.kind)
+        } else {
+            write!(f, "{}", self.kind)
+        }
+    }
+}
+
+impl std::error::Error for EvalError {}
+
+impl From<ErrorKind> for EvalError {
+    fn from(kind: ErrorKind) -> Self {
+        Self { kind, span: Span::default() }
+    }
 }
