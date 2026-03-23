@@ -17,7 +17,19 @@ object Evaluator:
       ("=", args => Interpreter.compare(args, _ == _)),
       ("<=", args => Interpreter.compare(args, _ <= _)),
       (">=", args => Interpreter.compare(args, _ >= _)),
-      ("not", args => Interpreter.notOp(args))
+      ("not", args => Interpreter.notOp(args)),
+      ("cons", args => Interpreter.consOp(args)),
+      ("car", args => Interpreter.carOp(args)),
+      ("cdr", args => Interpreter.cdrOp(args)),
+      ("null?", args => Interpreter.nullCheck(args)),
+      ("list", args => ListVal(args)),
+      ("length", args => Interpreter.lengthOp(args)),
+      ("string?", args => Interpreter.typeCheck(args, _.isInstanceOf[StringVal])),
+      ("number?", args => Interpreter.typeCheck(args, _.isInstanceOf[IntVal])),
+      ("boolean?", args => Interpreter.typeCheck(args, _.isInstanceOf[BoolVal])),
+      ("pair?", args => Interpreter.pairCheck(args)),
+      ("symbol?", args => Interpreter.typeCheck(args, _.isInstanceOf[SymbolVal])),
+      ("append", args => Interpreter.appendOp(args))
     )
     builtins.foreach { (name, func) =>
       env.define(name, BuiltinVal(name, func))
