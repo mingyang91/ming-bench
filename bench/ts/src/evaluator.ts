@@ -17,7 +17,8 @@ type SchemeVal =
   | { tag: 'lambda'; params: string[]; rest?: string; body: SchemeVal[]; env: Env; pos?: Pos }
   | { tag: 'builtin'; name: string; pos?: Pos }
   | { tag: 'continuation'; cont: Cont; pos?: Pos }
-  | { tag: 'macro'; rules: MacroRule[]; literals: Set<string>; defEnv: Env; pos?: Pos };
+  | { tag: 'macro'; rules: MacroRule[]; literals: Set<string>; defEnv: Env; pos?: Pos }
+  | { tag: 'vector'; val: SchemeVal[]; pos?: Pos };
 
 interface MacroRule {
   pattern: SchemeVal[];  // pattern elements (excluding macro name)
@@ -234,6 +235,8 @@ function displayVal(v: SchemeVal): string {
       return '#<procedure>';
     case 'macro':
       return '#<macro>';
+    case 'vector':
+      return '#(' + v.val.map(displayVal).join(' ') + ')';
   }
 }
 
@@ -256,7 +259,8 @@ function quoteToScheme(v: SchemeVal): SchemeVal {
 
 const SPECIAL_FORMS = new Set([
   'quote', 'if', 'define', 'set!', 'lambda', 'and', 'or', 'begin',
-  'cond', 'let', 'define-syntax', 'syntax-rules', 'else',
+  'cond', 'let', 'letrec', 'letrec*', 'case', 'do',
+  'define-syntax', 'syntax-rules', 'else',
 ]);
 
 let gensymCounter = 0;
@@ -483,6 +487,10 @@ function applyBuiltin(op: string, evalArgs: SchemeVal[], p?: Pos, out?: string[]
       if (evalArgs.length !== 1) throw posError('cdr: need exactly one arg', p);
       const a = evalArgs[0];
       if (a.tag !== 'list' || a.val.length === 0) throw posError('cdr: not a pair', p);
+      // Dotted pair: (x . y) is stored as [x, '.', y] — cdr returns y
+      if (a.val.length === 3 && a.val[1].tag === 'symbol' && a.val[1].val === '.') {
+        return a.val[2];
+      }
       return { tag: 'list', val: a.val.slice(1) };
     }
     case 'null?': {
@@ -769,6 +777,7 @@ function applyBuiltin(op: string, evalArgs: SchemeVal[], p?: Pos, out?: string[]
       if (a.tag === 'char' && b.tag === 'char') return { tag: 'boolean', val: a.val === b.val };
       if (a.tag === 'string' && b.tag === 'string') return { tag: 'boolean', val: a === b }; // identity
       if (a.tag === 'list' && b.tag === 'list') return { tag: 'boolean', val: a === b }; // identity
+      if (a.tag === 'vector' && b.tag === 'vector') return { tag: 'boolean', val: a === b }; // identity
       return { tag: 'boolean', val: false };
     }
     case 'equal?': {
@@ -832,9 +841,76 @@ function applyBuiltin(op: string, evalArgs: SchemeVal[], p?: Pos, out?: string[]
       if (evalArgs[0].tag !== 'string') throw posError('string-downcase: expected string', p);
       return { tag: 'string', val: evalArgs[0].val.toLowerCase() };
     }
+    case 'eqv?': {
+      if (evalArgs.length !== 2) throw posError('eqv?: need exactly two args', p);
+      const [a, b] = evalArgs;
+      if (a.tag !== b.tag) return { tag: 'boolean', val: false };
+      if (a.tag === 'number' && b.tag === 'number') return { tag: 'boolean', val: a.val === b.val };
+      if (a.tag === 'boolean' && b.tag === 'boolean') return { tag: 'boolean', val: a.val === b.val };
+      if (a.tag === 'symbol' && b.tag === 'symbol') return { tag: 'boolean', val: a.val === b.val };
+      if (a.tag === 'char' && b.tag === 'char') return { tag: 'boolean', val: a.val === b.val };
+      if (a.tag === 'string' && b.tag === 'string') return { tag: 'boolean', val: a === b };
+      if (a.tag === 'list' && b.tag === 'list') return { tag: 'boolean', val: a === b };
+      if (a.tag === 'vector' && b.tag === 'vector') return { tag: 'boolean', val: a === b };
+      return { tag: 'boolean', val: false };
+    }
+    case 'vector': {
+      return { tag: 'vector', val: [...evalArgs] };
+    }
+    case 'make-vector': {
+      if (evalArgs.length < 1 || evalArgs.length > 2) throw posError('make-vector: need 1-2 args', p);
+      const n = toNumber(evalArgs[0], 'make-vector', p);
+      const fill: SchemeVal = evalArgs.length === 2 ? evalArgs[1] : { tag: 'number', val: 0 };
+      const arr: SchemeVal[] = [];
+      for (let i = 0; i < n; i++) arr.push(fill);
+      return { tag: 'vector', val: arr };
+    }
+    case 'vector-ref': {
+      if (evalArgs.length !== 2) throw posError('vector-ref: need exactly two args', p);
+      if (evalArgs[0].tag !== 'vector') throw posError('vector-ref: expected vector', p);
+      const idx = toNumber(evalArgs[1], 'vector-ref', p);
+      if (idx < 0 || idx >= evalArgs[0].val.length) throw posError('vector-ref: index out of range', p);
+      return evalArgs[0].val[idx];
+    }
+    case 'vector-set!': {
+      if (evalArgs.length !== 3) throw posError('vector-set!: need exactly three args', p);
+      if (evalArgs[0].tag !== 'vector') throw posError('vector-set!: expected vector', p);
+      const setIdx = toNumber(evalArgs[1], 'vector-set!', p);
+      if (setIdx < 0 || setIdx >= evalArgs[0].val.length) throw posError('vector-set!: index out of range', p);
+      evalArgs[0].val[setIdx] = evalArgs[2];
+      return { tag: 'boolean', val: false };
+    }
+    case 'vector-length': {
+      if (evalArgs.length !== 1) throw posError('vector-length: need exactly one arg', p);
+      if (evalArgs[0].tag !== 'vector') throw posError('vector-length: expected vector', p);
+      return { tag: 'number', val: evalArgs[0].val.length };
+    }
+    case 'vector?': {
+      if (evalArgs.length !== 1) throw posError('vector?: need exactly one arg', p);
+      return { tag: 'boolean', val: evalArgs[0].tag === 'vector' };
+    }
+    case 'vector->list': {
+      if (evalArgs.length !== 1) throw posError('vector->list: need exactly one arg', p);
+      if (evalArgs[0].tag !== 'vector') throw posError('vector->list: expected vector', p);
+      return { tag: 'list', val: [...evalArgs[0].val] };
+    }
+    case 'list->vector': {
+      if (evalArgs.length !== 1) throw posError('list->vector: need exactly one arg', p);
+      if (evalArgs[0].tag !== 'list') throw posError('list->vector: expected list', p);
+      return { tag: 'vector', val: [...evalArgs[0].val] };
+    }
     default:
       throw posError(`unknown procedure: ${op}`, p);
   }
+}
+
+function schemeEqv(a: SchemeVal, b: SchemeVal): boolean {
+  if (a.tag !== b.tag) return false;
+  if (a.tag === 'number' && b.tag === 'number') return a.val === b.val;
+  if (a.tag === 'boolean' && b.tag === 'boolean') return a.val === b.val;
+  if (a.tag === 'symbol' && b.tag === 'symbol') return a.val === b.val;
+  if (a.tag === 'char' && b.tag === 'char') return a.val === b.val;
+  return a === b;
 }
 
 function schemeEqual(a: SchemeVal, b: SchemeVal): boolean {
@@ -845,6 +921,13 @@ function schemeEqual(a: SchemeVal, b: SchemeVal): boolean {
   if (a.tag === 'char' && b.tag === 'char') return a.val === b.val;
   if (a.tag === 'symbol' && b.tag === 'symbol') return a.val === b.val;
   if (a.tag === 'list' && b.tag === 'list') {
+    if (a.val.length !== b.val.length) return false;
+    for (let i = 0; i < a.val.length; i++) {
+      if (!schemeEqual(a.val[i], b.val[i])) return false;
+    }
+    return true;
+  }
+  if (a.tag === 'vector' && b.tag === 'vector') {
     if (a.val.length !== b.val.length) return false;
     for (let i = 0; i < a.val.length; i++) {
       if (!schemeEqual(a.val[i], b.val[i])) return false;
@@ -862,10 +945,12 @@ const BUILTINS = new Set(['+', '-', '*', '/', '<', '>', '=', '<=', '>=', 'not',
   'symbol->string', 'string->symbol', 'string-ref', 'string-copy', 'string-set!',
   'abs', 'modulo', 'remainder', 'quotient', 'min', 'max', 'expt',
   'zero?', 'positive?', 'negative?', 'odd?', 'even?',
-  'list-ref', 'list-tail', 'list?', 'assoc', 'eq?', 'equal?',
+  'list-ref', 'list-tail', 'list?', 'assoc', 'eq?', 'equal?', 'eqv?',
   'char-alphabetic?', 'char-numeric?', 'char-upcase', 'char-downcase', 'char=?', 'char<?',
   'string=?', 'string<?', 'string-ci=?', 'string-upcase', 'string-downcase',
-  'string->list', 'list->string', 'char->integer', 'integer->char']);
+  'string->list', 'list->string', 'char->integer', 'integer->char',
+  'vector', 'make-vector', 'vector-ref', 'vector-set!', 'vector-length', 'vector?',
+  'vector->list', 'list->vector']);
 
 function parseParams(paramList: SchemeVal, p?: Pos): { params: string[]; rest?: string } {
   if (paramList.tag !== 'list') throw posError('params must be a list', p);
@@ -1134,6 +1219,137 @@ function evalCPS(expr: SchemeVal, env: Env, k: Cont, out?: string[]): Bounce {
           for (let i = 0; i < paramNames.length; i++) letEnv.define(paramNames[i], initVals[i]);
           return evalBodyCPS(body, 0, letEnv, k, out);
         }
+      }, out);
+    }
+
+    if (op === 'letrec') {
+      if (args.length < 2) throw posError('letrec: bad syntax', p);
+      const bindingsExpr = args[0];
+      const body = args.slice(1);
+      if (bindingsExpr.tag !== 'list') throw posError('letrec: bad bindings', p);
+      const letEnv = new Env(env);
+      const paramNames: string[] = [];
+      const initExprs: SchemeVal[] = [];
+      for (const b of bindingsExpr.val) {
+        if (b.tag !== 'list' || b.val.length !== 2 || b.val[0].tag !== 'symbol')
+          throw posError('letrec: bad binding', p);
+        paramNames.push(b.val[0].val);
+        initExprs.push(b.val[1]);
+        letEnv.define(b.val[0].val, { tag: 'boolean', val: false });
+      }
+      return evalListCPS(initExprs, letEnv, initVals => {
+        for (let i = 0; i < paramNames.length; i++) letEnv.set(paramNames[i], initVals[i]);
+        return evalBodyCPS(body, 0, letEnv, k, out);
+      }, out);
+    }
+
+    if (op === 'letrec*') {
+      if (args.length < 2) throw posError('letrec*: bad syntax', p);
+      const bindingsExpr = args[0];
+      const body = args.slice(1);
+      if (bindingsExpr.tag !== 'list') throw posError('letrec*: bad bindings', p);
+      const letEnv = new Env(env);
+      for (const b of bindingsExpr.val) {
+        if (b.tag !== 'list' || b.val.length !== 2 || b.val[0].tag !== 'symbol')
+          throw posError('letrec*: bad binding', p);
+        letEnv.define(b.val[0].val, { tag: 'boolean', val: false });
+      }
+      const bindings = bindingsExpr.val;
+      const evalBindings = (i: number): Bounce => {
+        if (i >= bindings.length) return evalBodyCPS(body, 0, letEnv, k, out);
+        const b = bindings[i];
+        if (b.tag !== 'list') throw posError('letrec*: bad binding', p);
+        const name = (b.val[0] as SchemeVal & { tag: 'symbol' }).val;
+        return evalCPS(b.val[1], letEnv, val => {
+          letEnv.set(name, val);
+          return () => evalBindings(i + 1);
+        }, out);
+      };
+      return evalBindings(0);
+    }
+
+    if (op === 'case') {
+      if (args.length < 1) throw posError('case: bad syntax', p);
+      const keyExpr = args[0];
+      const clauses = args.slice(1);
+      return evalCPS(keyExpr, env, keyVal => {
+        const evalClauses = (i: number): Bounce => {
+          if (i >= clauses.length) return k({ tag: 'boolean', val: false });
+          const clause = clauses[i];
+          if (clause.tag !== 'list' || clause.val.length < 2)
+            throw posError('case: bad clause', p);
+          const datums = clause.val[0];
+          if (datums.tag === 'symbol' && datums.val === 'else') {
+            return evalBodyCPS(clause.val, 1, env, k, out);
+          }
+          if (datums.tag !== 'list') throw posError('case: expected datum list', p);
+          for (const d of datums.val) {
+            if (schemeEqv(keyVal, d)) {
+              return evalBodyCPS(clause.val, 1, env, k, out);
+            }
+          }
+          return () => evalClauses(i + 1);
+        };
+        return evalClauses(0);
+      }, out);
+    }
+
+    if (op === 'do') {
+      if (args.length < 2) throw posError('do: bad syntax', p);
+      const varSpecs = args[0];
+      const testClause = args[1];
+      const commands = args.slice(2);
+      if (varSpecs.tag !== 'list') throw posError('do: bad variable specs', p);
+      if (testClause.tag !== 'list' || testClause.val.length < 1)
+        throw posError('do: bad test clause', p);
+
+      const varNames: string[] = [];
+      const initExprs: SchemeVal[] = [];
+      const stepExprs: (SchemeVal | null)[] = [];
+      for (const spec of varSpecs.val) {
+        if (spec.tag !== 'list' || spec.val.length < 2 || spec.val.length > 3 || spec.val[0].tag !== 'symbol')
+          throw posError('do: bad variable spec', p);
+        varNames.push(spec.val[0].val);
+        initExprs.push(spec.val[1]);
+        stepExprs.push(spec.val.length === 3 ? spec.val[2] : null);
+      }
+
+      const testExpr = testClause.val[0];
+      const resultExprs = testClause.val.slice(1);
+
+      return evalListCPS(initExprs, env, initVals => {
+        const doEnv = new Env(env);
+        for (let i = 0; i < varNames.length; i++) doEnv.define(varNames[i], initVals[i]);
+
+        const doLoop = (): Bounce => {
+          return evalCPS(testExpr, doEnv, testVal => {
+            if (isTruthy(testVal)) {
+              if (resultExprs.length === 0) return k({ tag: 'boolean', val: false });
+              return evalBodyCPS(resultExprs, 0, doEnv, k, out);
+            }
+            // Execute commands (body)
+            const runCommands = (ci: number): Bounce => {
+              if (ci >= commands.length) {
+                // Evaluate all step expressions with current values, then update
+                const stepsToEval: { idx: number; expr: SchemeVal }[] = [];
+                for (let i = 0; i < varNames.length; i++) {
+                  if (stepExprs[i] !== null) stepsToEval.push({ idx: i, expr: stepExprs[i]! });
+                }
+                if (stepsToEval.length === 0) return () => doLoop();
+                const stepExprList = stepsToEval.map(s => s.expr);
+                return evalListCPS(stepExprList, doEnv, stepVals => {
+                  for (let j = 0; j < stepsToEval.length; j++) {
+                    doEnv.set(varNames[stepsToEval[j].idx], stepVals[j]);
+                  }
+                  return () => doLoop();
+                }, out);
+              }
+              return evalCPS(commands[ci], doEnv, _ => () => runCommands(ci + 1), out);
+            };
+            return runCommands(0);
+          }, out);
+        };
+        return doLoop();
       }, out);
     }
 
