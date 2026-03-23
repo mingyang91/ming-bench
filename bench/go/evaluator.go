@@ -100,6 +100,9 @@ func Eval(expr Expr, env *Env) (SchemeValue, error) {
 	case *StringExpr:
 		return &SchemeString{Value: e.Value}, nil
 
+	case *CharExpr:
+		return &SchemeChar{Value: e.Value}, nil
+
 	case *SymbolExpr:
 		if v, ok := env.Get(e.Name); ok {
 			return v, nil
@@ -425,6 +428,8 @@ func init() {
 	builtins["symbol->string"] = &BuiltinProc{Name: "symbol->string", Fn: builtinSymbolToString}
 	builtins["string->symbol"] = &BuiltinProc{Name: "string->symbol", Fn: builtinStringToSymbol}
 	builtins["string-ref"] = &BuiltinProc{Name: "string-ref", Fn: builtinStringRef}
+	builtins["string-copy"] = &BuiltinProc{Name: "string-copy", Fn: builtinStringCopy}
+	builtins["string-set!"] = &BuiltinProc{Name: "string-set!", Fn: builtinStringSet}
 }
 
 func builtinAdd(args []SchemeValue, callExpr *ListExpr) (SchemeValue, error) {
@@ -1071,4 +1076,47 @@ func builtinStringRef(args []SchemeValue, callExpr *ListExpr) (SchemeValue, erro
 		return nil, &EvalError{Message: fmt.Sprintf("%d:%d: string-ref: index out of range", line, col)}
 	}
 	return &SchemeChar{Value: runes[idx.Value]}, nil
+}
+
+func builtinStringCopy(args []SchemeValue, callExpr *ListExpr) (SchemeValue, error) {
+	if len(args) != 1 {
+		line, col := callExpr.Pos()
+		return nil, &EvalError{Message: fmt.Sprintf("%d:%d: string-copy: requires exactly 1 argument", line, col)}
+	}
+	s, ok := args[0].(*SchemeString)
+	if !ok {
+		line, col := callExpr.Pos()
+		return nil, &EvalError{Message: fmt.Sprintf("%d:%d: string-copy: expected string", line, col)}
+	}
+	return &SchemeString{Value: s.Value}, nil
+}
+
+func builtinStringSet(args []SchemeValue, callExpr *ListExpr) (SchemeValue, error) {
+	if len(args) != 3 {
+		line, col := callExpr.Pos()
+		return nil, &EvalError{Message: fmt.Sprintf("%d:%d: string-set!: requires exactly 3 arguments", line, col)}
+	}
+	s, ok := args[0].(*SchemeString)
+	if !ok {
+		line, col := callExpr.Pos()
+		return nil, &EvalError{Message: fmt.Sprintf("%d:%d: string-set!: expected string", line, col)}
+	}
+	idx, ok := args[1].(*SchemeInt)
+	if !ok {
+		line, col := callExpr.Pos()
+		return nil, &EvalError{Message: fmt.Sprintf("%d:%d: string-set!: expected number", line, col)}
+	}
+	ch, ok := args[2].(*SchemeChar)
+	if !ok {
+		line, col := callExpr.Pos()
+		return nil, &EvalError{Message: fmt.Sprintf("%d:%d: string-set!: expected char", line, col)}
+	}
+	runes := []rune(s.Value)
+	if idx.Value < 0 || idx.Value >= int64(len(runes)) {
+		line, col := callExpr.Pos()
+		return nil, &EvalError{Message: fmt.Sprintf("%d:%d: string-set!: index out of range", line, col)}
+	}
+	runes[idx.Value] = ch.Value
+	s.Value = string(runes)
+	return &SchemeVoid{}, nil
 }

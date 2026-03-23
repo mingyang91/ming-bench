@@ -18,6 +18,7 @@ const (
 	TokenString
 	TokenSymbol
 	TokenQuote
+	TokenChar
 	TokenEOF
 )
 
@@ -143,6 +144,28 @@ func Tokenize(input string) ([]Token, error) {
 				continue
 			}
 
+			// Check for character literals #\x, #\space, #\newline, #\tab
+			if strings.HasPrefix(word, `#\`) {
+				charName := word[2:]
+				var r rune
+				switch charName {
+				case "space":
+					r = ' '
+				case "newline":
+					r = '\n'
+				case "tab":
+					r = '\t'
+				default:
+					runes := []rune(charName)
+					if len(runes) != 1 {
+						return nil, fmt.Errorf("%d:%d: invalid character literal '%s'", line, startCol, word)
+					}
+					r = runes[0]
+				}
+				tokens = append(tokens, Token{Type: TokenChar, Value: string(r), Line: line, Col: startCol})
+				continue
+			}
+
 			// Check for number
 			if n, err := strconv.ParseInt(word, 10, 64); err == nil {
 				_ = n
@@ -199,6 +222,13 @@ type StringExpr struct {
 }
 
 func (e *StringExpr) Pos() (int, int) { return e.Line, e.Col }
+
+type CharExpr struct {
+	Value    rune
+	Line, Col int
+}
+
+func (e *CharExpr) Pos() (int, int) { return e.Line, e.Col }
 
 type SymbolExpr struct {
 	Name     string
@@ -264,6 +294,11 @@ func (p *Parser) ParseExpr() (Expr, error) {
 	case TokenString:
 		p.next()
 		return &StringExpr{Value: tok.Value, Line: tok.Line, Col: tok.Col}, nil
+
+	case TokenChar:
+		p.next()
+		runes := []rune(tok.Value)
+		return &CharExpr{Value: runes[0], Line: tok.Line, Col: tok.Col}, nil
 
 	case TokenSymbol:
 		p.next()
