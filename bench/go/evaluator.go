@@ -954,13 +954,16 @@ func (ip *interp) eval(e *expr, envir *env) (*value, error) {
 
 			// Continuation invocation
 			if fn.typ == valContinuation {
-				if len(args) != 1 {
-					return nil, &EvalError{Message: fmt.Sprintf("%d:%d: continuation: expected 1 argument", e.line, e.col)}
+				var jumpVal *value
+				if len(args) == 1 {
+					jumpVal = args[0]
+				} else {
+					jumpVal = &value{typ: valMultipleValues, multiVals: args}
 				}
 				panic(&continuationJump{
 					contExpr: fn.contExpr,
 					contIdx:  fn.contIdx,
-					val:      args[0],
+					val:      jumpVal,
 					letStack: fn.contLetStack,
 				})
 			}
@@ -1340,13 +1343,16 @@ func applyFunc(fn *value, args []*value, callExpr *expr) (*value, error) {
 	case valBuiltin:
 		return fn.builtin(args, line, col)
 	case valContinuation:
-		if len(args) != 1 {
-			return nil, &EvalError{Message: fmt.Sprintf("%d:%d: continuation: expected 1 argument", line, col)}
+		var jumpVal *value
+		if len(args) == 1 {
+			jumpVal = args[0]
+		} else {
+			jumpVal = &value{typ: valMultipleValues, multiVals: args}
 		}
 		panic(&continuationJump{
 			contExpr: fn.contExpr,
 			contIdx:  fn.contIdx,
-			val:      args[0],
+			val:      jumpVal,
 			letStack: fn.contLetStack,
 		})
 	default:
