@@ -42,6 +42,7 @@ enum Value:
   case VectorVal(elems: Array[Value])
   case VoidVal
   case ValuesVal(values: List[Value])
+  case RecordVal(tag: String, fields: Array[Value])
 
   def display: String = this match
     case IntVal(n)             => n.toString
@@ -60,6 +61,7 @@ enum Value:
     case VectorVal(elems)      => elems.map(_.display).mkString("#(", " ", ")")
     case VoidVal               => "#<void>"
     case ValuesVal(_)          => "#<values>"
+    case RecordVal(tag, _)     => s"#<record:$tag>"
 
   /** Display without quotes (for `display` builtin). */
   def displayNoQuotes: String = this match

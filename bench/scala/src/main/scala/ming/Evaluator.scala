@@ -179,6 +179,9 @@ object Evaluator extends EvalForms with EvalWind with EvalExceptions:
             evalGuard(variable, clauses, body, env, pos, k)
           case _ => evalError("guard: bad syntax", pos)
 
+      case SList(Sym("define-record-type", _) :: args, pos) =>
+        evalDefineRecordType(args, env, pos, k)
+
       case SList(Sym("define-syntax", _) :: Sym(name, _) :: SList(Sym("syntax-rules", _) :: srArgs, _) :: Nil, pos) =>
         val (literals, rules) = Macro.parseSyntaxRules(srArgs, pos)
         env.define(name, Value.MacroVal(literals, rules, env))
@@ -194,7 +197,6 @@ object Evaluator extends EvalForms with EvalWind with EvalExceptions:
         val expanded                                = Macro.expand(name, args, literals, rules, defEnv, env, pos)
         tailEval(expanded, env, k)
 
-      // General function application
       case SList(head :: args, pos) =>
         eval(head, env, proc => evalArgs(args, env, values => applyProc(proc, values, pos, k)))
 
