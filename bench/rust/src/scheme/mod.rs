@@ -132,6 +132,7 @@ enum ExprKind {
     Boolean(bool),
     Str(String),
     Symbol(String),
+    Char(char),
     List(Vec<Expr>),
 }
 
@@ -177,6 +178,41 @@ fn parse_expr(input: &[u8], pos: usize) -> Result<(Expr, usize), EvalError> {
                 match input[i + 1] {
                     b't' => Ok((Expr::new(ExprKind::Boolean(true), l, c), i + 2)),
                     b'f' => Ok((Expr::new(ExprKind::Boolean(false), l, c), i + 2)),
+                    b'\\' => {
+                        // Character literal: #\x, #\space, #\newline, #\tab
+                        if i + 2 >= input.len() {
+                            return Err(EvalError::Parse(format!(
+                                "{l}:{c}: unexpected end after #\\"
+                            )));
+                        }
+                        let start = i + 2;
+                        let mut end = start;
+                        while end < input.len() && input[end].is_ascii_alphabetic() {
+                            end += 1;
+                        }
+                        if end == start {
+                            // Single non-alpha char like #\( or #\)
+                            let ch = input[start] as char;
+                            Ok((Expr::new(ExprKind::Char(ch), l, c), start + 1))
+                        } else {
+                            let name = std::str::from_utf8(&input[start..end]).unwrap();
+                            if name.len() == 1 {
+                                Ok((Expr::new(ExprKind::Char(name.chars().next().unwrap()), l, c), end))
+                            } else {
+                                let ch = match name.to_lowercase().as_str() {
+                                    "space" => ' ',
+                                    "newline" => '\n',
+                                    "tab" => '\t',
+                                    _ => {
+                                        return Err(EvalError::Parse(format!(
+                                            "{l}:{c}: unknown character name: {name}"
+                                        )))
+                                    }
+                                };
+                                Ok((Expr::new(ExprKind::Char(ch), l, c), end))
+                            }
+                        }
+                    }
                     _ => Err(EvalError::Parse(format!(
                         "{l}:{c}: unexpected character after #"
                     ))),
@@ -287,6 +323,7 @@ fn expr_to_value(expr: &Expr) -> Value {
         ExprKind::Boolean(b) => Value::Boolean(*b),
         ExprKind::Str(s) => Value::Str(s.clone()),
         ExprKind::Symbol(s) => Value::Symbol(s.clone()),
+        ExprKind::Char(c) => Value::Char(*c),
         ExprKind::List(items) => Value::List(items.iter().map(expr_to_value).collect()),
     }
 }
@@ -326,6 +363,7 @@ fn is_builtin(name: &str) -> bool {
             | "symbol->string"
             | "string->symbol"
             | "string-ref"
+            | "string-copy"
             | "char?"
     )
 }
@@ -336,6 +374,7 @@ fn eval(expr: &Expr, env: &Env) -> Result<Value, EvalError> {
         ExprKind::Integer(n) => Ok(Value::Integer(*n)),
         ExprKind::Boolean(b) => Ok(Value::Boolean(*b)),
         ExprKind::Str(s) => Ok(Value::Str(s.clone())),
+        ExprKind::Char(c) => Ok(Value::Char(*c)),
         ExprKind::Symbol(name) => {
             if is_builtin(name) {
                 return Ok(Value::Symbol(name.clone()));
@@ -589,6 +628,67 @@ fn eval(expr: &Expr, env: &Env) -> Result<Value, EvalError> {
                             result = eval(e, &local_env)?;
                         }
                         return Ok(result);
+                    }
+                    "string-set!" => {
+                        if items.len() != 4 {
+                            return Err(EvalError::Arity(
+                                "string-set! requires 3 arguments".into(),
+                            )
+                            .at(el, ec));
+                        }
+                        // Evaluate the string variable name
+                        let var_name = match &items[1].kind {
+                            ExprKind::Symbol(s) => s.clone(),
+                            _ => {
+                                return Err(EvalError::Type(
+                                    "string-set!: first argument must be a variable".into(),
+                                )
+                                .at(el, ec))
+                            }
+                        };
+                        let idx = as_integer(&eval(&items[2], env)?)? as usize;
+                        let ch = match eval(&items[3], env)? {
+                            Value::Char(c) => c,
+                            _ => {
+                                return Err(EvalError::Type(
+                                    "string-set!: third argument must be a character".into(),
+                                )
+                                .at(el, ec))
+                            }
+                        };
+                        // Mutate the string in the environment
+                        fn env_mutate_string(
+                            env: &Env,
+                            name: &str,
+                            idx: usize,
+                            ch: char,
+                        ) -> Result<(), EvalError> {
+                            let mut inner = env.borrow_mut();
+                            if let Some(val) = inner.bindings.get_mut(name) {
+                                if let Value::Str(ref mut s) = val {
+                                    let mut chars: Vec<char> = s.chars().collect();
+                                    if idx >= chars.len() {
+                                        return Err(EvalError::Type(
+                                            "string-set!: index out of range".into(),
+                                        ));
+                                    }
+                                    chars[idx] = ch;
+                                    *s = chars.into_iter().collect();
+                                    return Ok(());
+                                }
+                                return Err(EvalError::Type(
+                                    "string-set!: not a string".into(),
+                                ));
+                            }
+                            drop(inner);
+                            let inner = env.borrow();
+                            if let Some(ref parent) = inner.parent {
+                                return env_mutate_string(parent, name, idx, ch);
+                            }
+                            Err(EvalError::UnboundVariable(name.to_string()))
+                        }
+                        env_mutate_string(env, &var_name, idx, ch)?;
+                        return Ok(Value::Void);
                     }
                     "begin" => {
                         let mut result = Value::Void;
@@ -927,6 +1027,15 @@ fn eval_builtin(op: &str, args: &[Value]) -> Result<Value, EvalError> {
             Ok(Value::Char(s.chars().nth(idx).ok_or_else(|| {
                 EvalError::Type("string-ref: index out of range".into())
             })?))
+        }
+        "string-copy" => {
+            if args.len() != 1 {
+                return Err(EvalError::Arity("string-copy requires 1 argument".into()));
+            }
+            match &args[0] {
+                Value::Str(s) => Ok(Value::Str(s.clone())),
+                _ => Err(EvalError::Type("string-copy: not a string".into())),
+            }
         }
         "char?" => {
             if args.len() != 1 {
