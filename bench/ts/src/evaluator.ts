@@ -12,7 +12,7 @@ let currentWinds: WindEntry[] = [];
 let exceptionHandlerStack: ((val: SchemeVal) => Bounce)[] = [];
 
 type SchemeVal =
-  | { tag: 'number'; val: number; pos?: Pos }
+  | { tag: 'number'; val: number; exact?: boolean; num?: number; den?: number; pos?: Pos }
   | { tag: 'boolean'; val: boolean; pos?: Pos }
   | { tag: 'string'; val: string; immutable?: boolean; pos?: Pos }
   | { tag: 'char'; val: string; pos?: Pos }
@@ -184,7 +184,17 @@ function parseAtom(tok: Token): SchemeVal {
     throw new EvalError(`unknown character literal: ${tok.text}`);
   }
   if (/^-?\d+$/.test(tok.text)) {
-    return { tag: 'number', val: parseInt(tok.text, 10), pos: p };
+    const n = parseInt(tok.text, 10);
+    return { tag: 'number', val: n, exact: true, num: n, den: 1, pos: p };
+  }
+  // Rational literal: n/d
+  if (/^-?\d+\/\d+$/.test(tok.text)) {
+    const [ns, ds] = tok.text.split('/');
+    return mkExactNum(parseInt(ns, 10), parseInt(ds, 10), p);
+  }
+  // Float literal
+  if (/^-?(\d+\.\d*|\.\d+)([eE][+-]?\d+)?$/.test(tok.text) || /^-?\d+[eE][+-]?\d+$/.test(tok.text)) {
+    return mkInexactNum(parseFloat(tok.text), p);
   }
   return { tag: 'symbol', val: tok.text, pos: p };
 }
@@ -220,10 +230,138 @@ function toNumber(v: SchemeVal, op: string, p?: Pos): number {
   return v.val;
 }
 
+// ── Rational/Exact helpers ──────────────────────────────────────────
+
+function gcd(a: number, b: number): number {
+  a = Math.abs(a); b = Math.abs(b);
+  while (b) { [a, b] = [b, a % b]; }
+  return a;
+}
+
+function isExact(v: SchemeVal): boolean {
+  return v.tag === 'number' && v.exact !== false;
+}
+
+function numOf(v: SchemeVal): number {
+  if (v.tag !== 'number') return 0;
+  if (v.num !== undefined) return v.num;
+  return v.val;
+}
+
+function denOf(v: SchemeVal): number {
+  if (v.tag !== 'number') return 1;
+  if (v.den !== undefined) return v.den;
+  return 1;
+}
+
+function mkExactNum(num: number, den: number, pos?: Pos): SchemeVal {
+  if (den < 0) { num = -num; den = -den; }
+  const g = gcd(Math.abs(num), den);
+  num = num / g;
+  den = den / g;
+  return { tag: 'number', val: num / den, exact: true, num, den, pos };
+}
+
+function mkInexactNum(val: number, pos?: Pos): SchemeVal {
+  return { tag: 'number', val, exact: false, pos };
+}
+
+function floatToRational(x: number): [number, number] {
+  if (Number.isInteger(x)) return [x, 1];
+  // Multiply by powers of 2 until integer (works for binary fractions)
+  let den = 1;
+  let num = x;
+  for (let i = 0; i < 53 && !Number.isInteger(num); i++) {
+    den *= 2;
+    num = x * den;
+  }
+  num = Math.round(num);
+  const g = gcd(Math.abs(num), den);
+  return [num / g, den / g];
+}
+
+function exactArith(op: string, args: SchemeVal[], p?: Pos): SchemeVal {
+  const allExact = args.every(a => isExact(a));
+  if (!allExact) {
+    // Inexact: use regular float arithmetic
+    let vals = args.map(a => (a as any).val as number);
+    let r: number;
+    switch (op) {
+      case '+': r = vals.reduce((a, b) => a + b, 0); break;
+      case '-':
+        if (vals.length === 1) r = -vals[0];
+        else r = vals.slice(1).reduce((a, b) => a - b, vals[0]);
+        break;
+      case '*': r = vals.reduce((a, b) => a * b, 1); break;
+      case '/':
+        r = vals[0];
+        for (let i = 1; i < vals.length; i++) {
+          if (vals[i] === 0) throw posError('division by zero', p);
+          r /= vals[i];
+        }
+        break;
+      default: r = 0;
+    }
+    return mkInexactNum(r, p);
+  }
+  // Exact rational arithmetic
+  let rn: number, rd: number;
+  switch (op) {
+    case '+':
+      rn = 0; rd = 1;
+      for (const a of args) {
+        const an = numOf(a), ad = denOf(a);
+        rn = rn * ad + an * rd;
+        rd = rd * ad;
+      }
+      break;
+    case '-':
+      if (args.length === 1) {
+        rn = -numOf(args[0]); rd = denOf(args[0]);
+      } else {
+        rn = numOf(args[0]); rd = denOf(args[0]);
+        for (let i = 1; i < args.length; i++) {
+          const an = numOf(args[i]), ad = denOf(args[i]);
+          rn = rn * ad - an * rd;
+          rd = rd * ad;
+        }
+      }
+      break;
+    case '*':
+      rn = 1; rd = 1;
+      for (const a of args) {
+        rn *= numOf(a);
+        rd *= denOf(a);
+      }
+      break;
+    case '/':
+      rn = numOf(args[0]); rd = denOf(args[0]);
+      for (let i = 1; i < args.length; i++) {
+        const an = numOf(args[i]), ad = denOf(args[i]);
+        if (an === 0) throw posError('division by zero', p);
+        rn *= ad;
+        rd *= an;
+      }
+      break;
+    default:
+      rn = 0; rd = 1;
+  }
+  return mkExactNum(rn, rd, p);
+}
+
 function displayVal(v: SchemeVal): string {
   switch (v.tag) {
     case 'number':
-      return String(v.val);
+      if (v.exact === false) {
+        // Inexact: show decimal point for whole numbers
+        const s = String(v.val);
+        return Number.isInteger(v.val) ? s + '.0' : s;
+      }
+      // Exact: show as integer or rational
+      if (v.den !== undefined && v.den !== 1) {
+        return `${v.num}/${v.den}`;
+      }
+      return String(v.num !== undefined ? v.num : v.val);
     case 'boolean':
       return v.val ? '#t' : '#f';
     case 'string':
@@ -428,31 +566,24 @@ function expandMacro(macro: SchemeVal & { tag: 'macro' }, form: SchemeVal[], env
 function applyBuiltin(op: string, evalArgs: SchemeVal[], p?: Pos, out?: string[]): SchemeVal {
   switch (op) {
     case '+': {
-      let sum = 0;
-      for (const a of evalArgs) sum += toNumber(a, '+', p);
-      return { tag: 'number', val: sum };
+      for (const a of evalArgs) toNumber(a, '+', p);
+      if (evalArgs.length === 0) return mkExactNum(0, 1, p);
+      return exactArith('+', evalArgs, p);
     }
     case '-': {
       if (evalArgs.length === 0) throw posError('-: need at least one arg', p);
-      if (evalArgs.length === 1) return { tag: 'number', val: -toNumber(evalArgs[0], '-', p) };
-      let result = toNumber(evalArgs[0], '-', p);
-      for (let i = 1; i < evalArgs.length; i++) result -= toNumber(evalArgs[i], '-', p);
-      return { tag: 'number', val: result };
+      for (const a of evalArgs) toNumber(a, '-', p);
+      return exactArith('-', evalArgs, p);
     }
     case '*': {
-      let prod = 1;
-      for (const a of evalArgs) prod *= toNumber(a, '*', p);
-      return { tag: 'number', val: prod };
+      for (const a of evalArgs) toNumber(a, '*', p);
+      if (evalArgs.length === 0) return mkExactNum(1, 1, p);
+      return exactArith('*', evalArgs, p);
     }
     case '/': {
       if (evalArgs.length < 2) throw posError('/: need at least two args', p);
-      let result = toNumber(evalArgs[0], '/', p);
-      for (let i = 1; i < evalArgs.length; i++) {
-        const d = toNumber(evalArgs[i], '/', p);
-        if (d === 0) throw posError('division by zero', p);
-        result = Math.trunc(result / d);
-      }
-      return { tag: 'number', val: result };
+      for (const a of evalArgs) toNumber(a, '/', p);
+      return exactArith('/', evalArgs, p);
     }
     case '<': {
       if (evalArgs.length !== 2) throw posError('<: need exactly two args', p);
@@ -596,14 +727,16 @@ function applyBuiltin(op: string, evalArgs: SchemeVal[], p?: Pos, out?: string[]
     case 'string->number': {
       if (evalArgs.length !== 1) throw posError('string->number: need exactly one arg', p);
       if (evalArgs[0].tag !== 'string') throw posError('string->number: expected string', p);
-      const n = Number(evalArgs[0].val);
+      const s = evalArgs[0].val;
+      const n = Number(s);
       if (isNaN(n)) return { tag: 'boolean', val: false };
-      return { tag: 'number', val: n };
+      if (/^-?\d+$/.test(s)) return mkExactNum(n, 1, p);
+      return mkInexactNum(n, p);
     }
     case 'number->string': {
       if (evalArgs.length !== 1) throw posError('number->string: need exactly one arg', p);
       if (evalArgs[0].tag !== 'number') throw posError('number->string: expected number', p);
-      return { tag: 'string', val: String(evalArgs[0].val) };
+      return { tag: 'string', val: displayVal(evalArgs[0]) };
     }
     case 'symbol->string': {
       if (evalArgs.length !== 1) throw posError('symbol->string: need exactly one arg', p);
@@ -659,7 +792,8 @@ function applyBuiltin(op: string, evalArgs: SchemeVal[], p?: Pos, out?: string[]
     case 'char->integer': {
       if (evalArgs.length !== 1) throw posError('char->integer: need exactly one arg', p);
       if (evalArgs[0].tag !== 'char') throw posError('char->integer: expected char', p);
-      return { tag: 'number', val: evalArgs[0].val.codePointAt(0)! };
+      const cp = evalArgs[0].val.codePointAt(0)!;
+      return mkExactNum(cp, 1, p);
     }
     case 'integer->char': {
       if (evalArgs.length !== 1) throw posError('integer->char: need exactly one arg', p);
@@ -739,6 +873,58 @@ function applyBuiltin(op: string, evalArgs: SchemeVal[], p?: Pos, out?: string[]
     case 'even?': {
       if (evalArgs.length !== 1) throw posError('even?: need exactly one arg', p);
       return { tag: 'boolean', val: toNumber(evalArgs[0], 'even?', p) % 2 === 0 };
+    }
+    // ── L19 Exact/Rational builtins ──
+    case 'exact?': {
+      if (evalArgs.length !== 1) throw posError('exact?: need exactly one arg', p);
+      if (evalArgs[0].tag !== 'number') return { tag: 'boolean', val: false };
+      return { tag: 'boolean', val: isExact(evalArgs[0]) };
+    }
+    case 'inexact?': {
+      if (evalArgs.length !== 1) throw posError('inexact?: need exactly one arg', p);
+      if (evalArgs[0].tag !== 'number') return { tag: 'boolean', val: false };
+      return { tag: 'boolean', val: !isExact(evalArgs[0]) };
+    }
+    case 'exact->inexact': {
+      if (evalArgs.length !== 1) throw posError('exact->inexact: need exactly one arg', p);
+      if (evalArgs[0].tag !== 'number') throw posError('exact->inexact: expected number', p);
+      return mkInexactNum(evalArgs[0].val, p);
+    }
+    case 'inexact->exact': {
+      if (evalArgs.length !== 1) throw posError('inexact->exact: need exactly one arg', p);
+      if (evalArgs[0].tag !== 'number') throw posError('inexact->exact: expected number', p);
+      const [rn, rd] = floatToRational(evalArgs[0].val);
+      return mkExactNum(rn, rd, p);
+    }
+    case 'numerator': {
+      if (evalArgs.length !== 1) throw posError('numerator: need exactly one arg', p);
+      if (evalArgs[0].tag !== 'number') throw posError('numerator: expected number', p);
+      const v = evalArgs[0];
+      if (isExact(v)) {
+        return mkExactNum(numOf(v), 1, p);
+      }
+      const [fn] = floatToRational(v.val);
+      return mkInexactNum(fn, p);
+    }
+    case 'denominator': {
+      if (evalArgs.length !== 1) throw posError('denominator: need exactly one arg', p);
+      if (evalArgs[0].tag !== 'number') throw posError('denominator: expected number', p);
+      const v = evalArgs[0];
+      if (isExact(v)) {
+        return mkExactNum(denOf(v), 1, p);
+      }
+      const [, fd] = floatToRational(v.val);
+      return mkInexactNum(fd, p);
+    }
+    case 'integer?': {
+      if (evalArgs.length !== 1) throw posError('integer?: need exactly one arg', p);
+      if (evalArgs[0].tag !== 'number') return { tag: 'boolean', val: false };
+      return { tag: 'boolean', val: Number.isInteger(evalArgs[0].val) };
+    }
+    case 'rational?': {
+      if (evalArgs.length !== 1) throw posError('rational?: need exactly one arg', p);
+      if (evalArgs[0].tag !== 'number') return { tag: 'boolean', val: false };
+      return { tag: 'boolean', val: isExact(evalArgs[0]) };
     }
     // ── L13 List builtins ──
     case 'list-ref': {
@@ -962,7 +1148,9 @@ const BUILTINS = new Set(['+', '-', '*', '/', '<', '>', '=', '<=', '>=', 'not',
   'string=?', 'string<?', 'string-ci=?', 'string-upcase', 'string-downcase',
   'string->list', 'list->string', 'char->integer', 'integer->char',
   'vector', 'make-vector', 'vector-ref', 'vector-set!', 'vector-length', 'vector?',
-  'vector->list', 'list->vector', 'reverse']);
+  'vector->list', 'list->vector', 'reverse',
+  'exact?', 'inexact?', 'exact->inexact', 'inexact->exact',
+  'numerator', 'denominator', 'integer?', 'rational?']);
 
 function parseParams(paramList: SchemeVal, p?: Pos): { params: string[]; rest?: string } {
   if (paramList.tag !== 'list') throw posError('params must be a list', p);
