@@ -49,7 +49,53 @@ object Evaluator:
     builtins.foreach { (name, func) =>
       env.define(name, BuiltinVal(name, func))
     }
+    val callccFn = callccBuiltin()
+    env.define("call/cc", callccFn)
+    env.define("call-with-current-continuation", callccFn)
     env
+
+  /** Create the call/cc builtin function. */
+  private def callccBuiltin(): SchemeValue =
+    BuiltinVal(
+      "call/cc",
+      args =>
+        if args.length != 1 then throw new EvalError("call/cc: requires 1 argument")
+        val pending = ContinuationManager.pendingReturn
+        if pending.isDefined then
+          ContinuationManager.pendingReturn = None
+          pending.get
+        else
+          val contId = ContinuationManager.freshId()
+          val ctx    = ContinuationManager.bodyContext
+          val cont   = ContinuationVal(contId, ctx.exprs, ctx.env)
+          val proc   = args.head
+          try Interpreter.applyProc(proc, List(cont))
+          catch
+            case jump: ContinuationJump if jump.contId == contId =>
+              jump.value
+    )
+
+  /** Evaluate expressions sequentially, setting body context for each. */
+  private def evalExprsSequentially(exprs: List[SchemeValue], env: Environment): SchemeValue =
+    var result: SchemeValue = Void
+    var remaining           = exprs
+    while remaining.nonEmpty do
+      ContinuationManager.bodyContext = BodyContext(remaining, env)
+      result = Interpreter.eval(remaining.head, env)
+      remaining = remaining.tail
+    result
+
+  /** Handle a ContinuationJump by re-evaluating the continuation's saved body. */
+  private def handleContinuationJump(jump: ContinuationJump): SchemeValue =
+    try
+      ContinuationManager.pendingReturn = Some(jump.value)
+      evalExprsSequentially(jump.bodyExprs, jump.bodyEnv)
+    catch case jump2: ContinuationJump => handleContinuationJump(jump2)
+
+  private def formatResult(value: SchemeValue): String =
+    value match
+      case Void => ""
+      case _    => value.display
 
   /** Evaluate one or more Scheme expressions and return the string representation of the last result.
     */
@@ -57,12 +103,12 @@ object Evaluator:
     val output = StringBuilder()
     val exprs  = Parser.parse(input)
     if exprs.isEmpty then throw new EvalError("no expressions")
-    val env     = makeGlobalEnv(output)
-    val results = exprs.map(Interpreter.eval(_, env))
-    val last    = results.last
-    last match
-      case Void => ""
-      case _    => last.display
+    val env = makeGlobalEnv(output)
+    ContinuationManager.reset()
+    val result =
+      try evalExprsSequentially(exprs, env)
+      catch case jump: ContinuationJump => handleContinuationJump(jump)
+    formatResult(result)
 
   /** Evaluate Scheme expressions and return both the result string and any captured output from display/write/newline.
     */
@@ -70,10 +116,9 @@ object Evaluator:
     val output = StringBuilder()
     val exprs  = Parser.parse(input)
     if exprs.isEmpty then throw new EvalError("no expressions")
-    val env     = makeGlobalEnv(output)
-    val results = exprs.map(Interpreter.eval(_, env))
-    val last    = results.last
-    val result = last match
-      case Void => ""
-      case _    => last.display
-    (result, output.toString)
+    val env = makeGlobalEnv(output)
+    ContinuationManager.reset()
+    val result =
+      try evalExprsSequentially(exprs, env)
+      catch case jump: ContinuationJump => handleContinuationJump(jump)
+    (formatResult(result), output.toString)

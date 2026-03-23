@@ -22,8 +22,10 @@ object Interpreter:
   private[ming] def evalBodyInit(body: List[SchemeValue], env: Environment): Unit =
     var remaining = body
     while remaining.tail.nonEmpty do
+      ContinuationManager.bodyContext = BodyContext(remaining, env)
       eval(remaining.head, env)
       remaining = remaining.tail
+    if remaining.nonEmpty then ContinuationManager.bodyContext = BodyContext(remaining, env)
 
   def eval(expr0: SchemeValue, env0: Environment): SchemeValue =
     var curExpr: SchemeValue = expr0
@@ -33,7 +35,7 @@ object Interpreter:
       curExpr match
         // Self-evaluating
         case IntVal(_, _) | BoolVal(_, _) | StringVal(_, _) | MutableStringVal(_, _) | CharVal(_, _) | PairVal(_, _) |
-            LambdaVal(_, _, _, _) | BuiltinVal(_, _) | Void =>
+            LambdaVal(_, _, _, _) | BuiltinVal(_, _) | ContinuationVal(_, _, _) | Void =>
           return curExpr
 
         // Symbol lookup
@@ -111,6 +113,9 @@ object Interpreter:
             if callPos.isDefined && !e.getMessage.matches(".*\\d+:\\d+.*") then
               throw new EvalError(posMsg(e.getMessage, callPos))
             else throw e
+      case ContinuationVal(contId, bodyExprs, bodyEnv) =>
+        if args.length != 1 then throw new EvalError(posMsg("continuation: requires 1 argument", callPos))
+        throw new ContinuationJump(contId, args.head, bodyExprs, bodyEnv)
       case _ =>
         throw new EvalError(posMsg("not a procedure", callPos))
 
@@ -135,9 +140,12 @@ object Interpreter:
     closure: Environment,
     callPos: Option[SourcePos]
   ): SchemeValue =
+    val savedCtx = ContinuationManager.bodyContext
     val childEnv = bindParams(params, restParam, args, closure, callPos)
-    evalBodyInit(body, childEnv)
-    eval(body.last, childEnv)
+    try
+      evalBodyInit(body, childEnv)
+      eval(body.last, childEnv)
+    finally ContinuationManager.bodyContext = savedCtx
 
   private def bindParams(
     params: List[String],
@@ -217,5 +225,8 @@ object Interpreter:
             if pos.isDefined && !e.getMessage.matches(".*\\d+:\\d+.*") then
               throw new EvalError(posMsg(e.getMessage, pos))
             else throw e
+      case ContinuationVal(contId, bodyExprs, bodyEnv) =>
+        if evaledArgs.length != 1 then throw new EvalError(posMsg("continuation: requires 1 argument", pos))
+        throw new ContinuationJump(contId, evaledArgs.head, bodyExprs, bodyEnv)
       case _ =>
         throw new EvalError(posMsg("not a procedure", pos))
