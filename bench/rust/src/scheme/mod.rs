@@ -13,6 +13,7 @@ enum Value {
     Integer(i64),
     Boolean(bool),
     Str(String),
+    Symbol(String),
     List(Vec<Value>),
     Lambda {
         params: Vec<String>,
@@ -29,6 +30,7 @@ impl std::fmt::Debug for Value {
             Value::Integer(n) => write!(f, "Integer({})", n),
             Value::Boolean(b) => write!(f, "Boolean({})", b),
             Value::Str(s) => write!(f, "Str({})", s),
+            Value::Symbol(s) => write!(f, "Symbol({})", s),
             Value::List(l) => write!(f, "List({:?})", l),
             Value::Lambda { params, .. } => write!(f, "Lambda({:?})", params),
             Value::Builtin(_) => write!(f, "Builtin"),
@@ -44,6 +46,7 @@ impl Value {
             Value::Boolean(true) => "#t".to_string(),
             Value::Boolean(false) => "#f".to_string(),
             Value::Str(s) => format!("\"{}\"", s),
+            Value::Symbol(s) => s.clone(),
             Value::List(items) => {
                 let inner: Vec<String> = items.iter().map(|v| v.display()).collect();
                 format!("({})", inner.join(" "))
@@ -227,6 +230,9 @@ fn eval(expr: &Expr, env: &Env) -> Result<Value, EvalError> {
                     "lambda" => return eval_lambda(&elems[1..], env),
                     "and" => return eval_and(&elems[1..], env),
                     "or" => return eval_or(&elems[1..], env),
+                    "let" => return eval_let(&elems[1..], env),
+                    "begin" => return eval_begin(&elems[1..], env),
+                    "cond" => return eval_cond(&elems[1..], env),
                     _ => {}
                 }
             }
@@ -324,7 +330,7 @@ fn expr_to_value(expr: &Expr) -> Value {
         Expr::Integer(n) => Value::Integer(*n),
         Expr::Boolean(b) => Value::Boolean(*b),
         Expr::Str(s) => Value::Str(s.clone()),
-        Expr::Symbol(s) => Value::Str(s.clone()),
+        Expr::Symbol(s) => Value::Symbol(s.clone()),
         Expr::List(items) => Value::List(items.iter().map(expr_to_value).collect()),
     }
 }
@@ -373,6 +379,108 @@ fn eval_or(args: &[Expr], env: &Env) -> Result<Value, EvalError> {
         }
     }
     Ok(result)
+}
+
+fn eval_let(args: &[Expr], env: &Env) -> Result<Value, EvalError> {
+    if args.len() < 2 {
+        return Err(EvalError::Arity("let requires bindings and body".into()));
+    }
+    // Named let: (let name ((var init) ...) body ...)
+    if let Expr::Symbol(name) = &args[0] {
+        let bindings_expr = match &args[1] {
+            Expr::List(b) => b,
+            _ => return Err(EvalError::Parse("let: expected bindings list".into())),
+        };
+        let mut params = Vec::new();
+        let mut inits = Vec::new();
+        for b in bindings_expr {
+            match b {
+                Expr::List(pair) if pair.len() == 2 => {
+                    if let Expr::Symbol(s) = &pair[0] {
+                        params.push(s.clone());
+                        inits.push(eval(&pair[1], env)?);
+                    } else {
+                        return Err(EvalError::Parse("let: expected variable name".into()));
+                    }
+                }
+                _ => return Err(EvalError::Parse("let: expected (var init) pair".into())),
+            }
+        }
+        let local = new_env(Some(env.clone()));
+        let lambda = Value::Lambda {
+            params: params.clone(),
+            body: args[2..].to_vec(),
+            env: local.clone(),
+        };
+        env_set(&local, name.clone(), lambda);
+        for (p, v) in params.iter().zip(&inits) {
+            env_set(&local, p.clone(), v.clone());
+        }
+        let mut result = Value::Void;
+        for expr in &args[2..] {
+            result = eval(expr, &local)?;
+        }
+        return Ok(result);
+    }
+    let bindings_expr = match &args[0] {
+        Expr::List(b) => b,
+        _ => return Err(EvalError::Parse("let: expected bindings list".into())),
+    };
+    let local = new_env(Some(env.clone()));
+    for b in bindings_expr {
+        match b {
+            Expr::List(pair) if pair.len() == 2 => {
+                if let Expr::Symbol(s) = &pair[0] {
+                    let val = eval(&pair[1], env)?;
+                    env_set(&local, s.clone(), val);
+                } else {
+                    return Err(EvalError::Parse("let: expected variable name".into()));
+                }
+            }
+            _ => return Err(EvalError::Parse("let: expected (var init) pair".into())),
+        }
+    }
+    let mut result = Value::Void;
+    for expr in &args[1..] {
+        result = eval(expr, &local)?;
+    }
+    Ok(result)
+}
+
+fn eval_begin(args: &[Expr], env: &Env) -> Result<Value, EvalError> {
+    let mut result = Value::Void;
+    for expr in args {
+        result = eval(expr, env)?;
+    }
+    Ok(result)
+}
+
+fn eval_cond(args: &[Expr], env: &Env) -> Result<Value, EvalError> {
+    for clause in args {
+        match clause {
+            Expr::List(parts) if !parts.is_empty() => {
+                if let Expr::Symbol(s) = &parts[0] {
+                    if s == "else" {
+                        let mut result = Value::Void;
+                        for expr in &parts[1..] {
+                            result = eval(expr, env)?;
+                        }
+                        return Ok(result);
+                    }
+                }
+                let test = eval(&parts[0], env)?;
+                if test.is_truthy() {
+                    let mut result = test;
+                    for expr in &parts[1..] {
+                        result = eval(expr, env)?;
+                    }
+                    return Ok(result);
+                }
+            }
+            _ => return Err(EvalError::Parse("cond: expected clause".into())),
+        }
+    }
+    Ok(Value::Void)
 }
 
 // ---------- Builtins ----------
@@ -427,6 +535,97 @@ fn builtin_eq(args: &[Value]) -> Result<Value, EvalError> { cmp_op(args, |a, b| 
 fn builtin_le(args: &[Value]) -> Result<Value, EvalError> { cmp_op(args, |a, b| a <= b) }
 fn builtin_ge(args: &[Value]) -> Result<Value, EvalError> { cmp_op(args, |a, b| a >= b) }
 
+fn builtin_cons(args: &[Value]) -> Result<Value, EvalError> {
+    if args.len() != 2 {
+        return Err(EvalError::Arity("cons requires 2 arguments".into()));
+    }
+    match &args[1] {
+        Value::List(tail) => {
+            let mut new_list = vec![args[0].clone()];
+            new_list.extend(tail.iter().cloned());
+            Ok(Value::List(new_list))
+        }
+        _ => Err(EvalError::Type("cons: second argument must be a list".into())),
+    }
+}
+
+fn builtin_car(args: &[Value]) -> Result<Value, EvalError> {
+    if args.len() != 1 {
+        return Err(EvalError::Arity("car requires 1 argument".into()));
+    }
+    match &args[0] {
+        Value::List(items) if !items.is_empty() => Ok(items[0].clone()),
+        _ => Err(EvalError::Type("car: expected non-empty list".into())),
+    }
+}
+
+fn builtin_cdr(args: &[Value]) -> Result<Value, EvalError> {
+    if args.len() != 1 {
+        return Err(EvalError::Arity("cdr requires 1 argument".into()));
+    }
+    match &args[0] {
+        Value::List(items) if !items.is_empty() => Ok(Value::List(items[1..].to_vec())),
+        _ => Err(EvalError::Type("cdr: expected non-empty list".into())),
+    }
+}
+
+fn builtin_null(args: &[Value]) -> Result<Value, EvalError> {
+    if args.len() != 1 {
+        return Err(EvalError::Arity("null? requires 1 argument".into()));
+    }
+    Ok(Value::Boolean(matches!(&args[0], Value::List(items) if items.is_empty())))
+}
+
+fn builtin_list(args: &[Value]) -> Result<Value, EvalError> {
+    Ok(Value::List(args.to_vec()))
+}
+
+fn builtin_length(args: &[Value]) -> Result<Value, EvalError> {
+    if args.len() != 1 {
+        return Err(EvalError::Arity("length requires 1 argument".into()));
+    }
+    match &args[0] {
+        Value::List(items) => Ok(Value::Integer(items.len() as i64)),
+        _ => Err(EvalError::Type("length: expected list".into())),
+    }
+}
+
+fn builtin_append(args: &[Value]) -> Result<Value, EvalError> {
+    let mut result = Vec::new();
+    for a in args {
+        match a {
+            Value::List(items) => result.extend(items.iter().cloned()),
+            _ => return Err(EvalError::Type("append: expected list".into())),
+        }
+    }
+    Ok(Value::List(result))
+}
+
+fn builtin_is_string(args: &[Value]) -> Result<Value, EvalError> {
+    if args.len() != 1 { return Err(EvalError::Arity("string? requires 1 argument".into())); }
+    Ok(Value::Boolean(matches!(&args[0], Value::Str(_))))
+}
+
+fn builtin_is_number(args: &[Value]) -> Result<Value, EvalError> {
+    if args.len() != 1 { return Err(EvalError::Arity("number? requires 1 argument".into())); }
+    Ok(Value::Boolean(matches!(&args[0], Value::Integer(_))))
+}
+
+fn builtin_is_boolean(args: &[Value]) -> Result<Value, EvalError> {
+    if args.len() != 1 { return Err(EvalError::Arity("boolean? requires 1 argument".into())); }
+    Ok(Value::Boolean(matches!(&args[0], Value::Boolean(_))))
+}
+
+fn builtin_is_pair(args: &[Value]) -> Result<Value, EvalError> {
+    if args.len() != 1 { return Err(EvalError::Arity("pair? requires 1 argument".into())); }
+    Ok(Value::Boolean(matches!(&args[0], Value::List(items) if !items.is_empty())))
+}
+
+fn builtin_is_symbol(args: &[Value]) -> Result<Value, EvalError> {
+    if args.len() != 1 { return Err(EvalError::Arity("symbol? requires 1 argument".into())); }
+    Ok(Value::Boolean(matches!(&args[0], Value::Symbol(_))))
+}
+
 fn builtin_not(args: &[Value]) -> Result<Value, EvalError> {
     if args.len() != 1 {
         return Err(EvalError::Arity("not requires 1 argument".into()));
@@ -462,6 +661,18 @@ fn make_global_env() -> Env {
         ("<=", builtin_le),
         (">=", builtin_ge),
         ("not", builtin_not),
+        ("cons", builtin_cons),
+        ("car", builtin_car),
+        ("cdr", builtin_cdr),
+        ("null?", builtin_null),
+        ("list", builtin_list),
+        ("length", builtin_length),
+        ("append", builtin_append),
+        ("string?", builtin_is_string),
+        ("number?", builtin_is_number),
+        ("boolean?", builtin_is_boolean),
+        ("pair?", builtin_is_pair),
+        ("symbol?", builtin_is_symbol),
     ];
     for (name, f) in builtins {
         env_set(&env, name.to_string(), Value::Builtin(*f));
