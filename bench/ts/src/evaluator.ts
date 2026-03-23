@@ -13,7 +13,7 @@ type SchemeVal =
   | { tag: 'list'; value: SchemeVal[]; pos?: Pos }
   | { tag: 'pair'; car: SchemeVal; cdr: SchemeVal; pos?: Pos }
   | { tag: 'nil'; pos?: Pos }
-  | { tag: 'lambda'; params: string[]; body: SchemeVal[]; env: Env; pos?: Pos }
+  | { tag: 'lambda'; params: string[]; rest?: string; body: SchemeVal[]; env: Env; pos?: Pos }
   | { tag: 'builtin'; name: string; fn: (args: SchemeVal[]) => SchemeVal; pos?: Pos }
   | { tag: 'void'; pos?: Pos };
 
@@ -292,6 +292,30 @@ function makeGlobalEnv(): Env {
     return result;
   });
 
+  defBuiltin('apply', (args) => {
+    const proc = args[0];
+    const lastArg = args[args.length - 1];
+    const prefixArgs = args.slice(1, args.length - 1);
+    const tailArgs = pairsToArray(lastArg);
+    const allArgs = [...prefixArgs, ...tailArgs];
+    if (proc.tag === 'builtin') return proc.fn(allArgs);
+    if (proc.tag === 'lambda') {
+      const callEnv = new Env(proc.env);
+      for (let i = 0; i < proc.params.length; i++) {
+        callEnv.define(proc.params[i], allArgs[i]);
+      }
+      if (proc.rest) {
+        callEnv.define(proc.rest, listToPairs(allArgs.slice(proc.params.length)));
+      }
+      let result: SchemeVal = { tag: 'void' };
+      for (const bodyExpr of proc.body) {
+        result = evaluate(bodyExpr, callEnv);
+      }
+      return result;
+    }
+    throw new EvalError('apply: not a procedure');
+  });
+
   defBuiltin('number?', (args) => ({ tag: 'boolean', value: args[0].tag === 'number' }));
   defBuiltin('string?', (args) => ({ tag: 'boolean', value: args[0].tag === 'string' }));
   defBuiltin('boolean?', (args) => ({ tag: 'boolean', value: args[0].tag === 'boolean' }));
@@ -368,6 +392,16 @@ class TailCall {
   constructor(public expr: SchemeVal, public env: Env) {}
 }
 
+function parseDotParams(paramExprs: SchemeVal[]): { params: string[]; rest?: string } {
+  const dotIdx = paramExprs.findIndex(p => p.tag === 'symbol' && p.value === '.');
+  if (dotIdx >= 0) {
+    const params = paramExprs.slice(0, dotIdx).map(p => (p as { tag: 'symbol'; value: string }).value);
+    const rest = (paramExprs[dotIdx + 1] as { tag: 'symbol'; value: string }).value;
+    return { params, rest };
+  }
+  return { params: paramExprs.map(p => (p as { tag: 'symbol'; value: string }).value) };
+}
+
 function evaluate(startExpr: SchemeVal, startEnv: Env): SchemeVal {
   let expr = startExpr;
   let env = startEnv;
@@ -414,12 +448,12 @@ function evaluate(startExpr: SchemeVal, startEnv: Env): SchemeVal {
     if (op === 'define') {
       if (items.length < 3) throw new EvalError(`${posStr(expr.pos)}define: bad syntax`);
       if (items[1].tag === 'list') {
-        // (define (f params...) body...)
+        // (define (f params...) body...) or (define (f params... . rest) body...)
         const nameAndParams = items[1].value;
         const name = (nameAndParams[0] as { tag: 'symbol'; value: string }).value;
-        const params = nameAndParams.slice(1).map(p => (p as { tag: 'symbol'; value: string }).value);
+        const { params, rest } = parseDotParams(nameAndParams.slice(1));
         const body = items.slice(2);
-        env.define(name, { tag: 'lambda', params, body, env });
+        env.define(name, { tag: 'lambda', params, rest, body, env });
         return { tag: 'void' };
       }
       // (define x expr)
@@ -431,11 +465,14 @@ function evaluate(startExpr: SchemeVal, startEnv: Env): SchemeVal {
 
     if (op === 'lambda') {
       const paramList = items[1];
-      const params = (paramList as { tag: 'list'; value: SchemeVal[] }).value.map(
-        p => (p as { tag: 'symbol'; value: string }).value
-      );
+      if (paramList.tag === 'symbol') {
+        // (lambda args body...) — all args as rest
+        const body = items.slice(2);
+        return { tag: 'lambda', params: [], rest: paramList.value, body, env };
+      }
+      const { params, rest } = parseDotParams((paramList as { tag: 'list'; value: SchemeVal[] }).value);
       const body = items.slice(2);
-      return { tag: 'lambda', params, body, env };
+      return { tag: 'lambda', params, rest, body, env };
     }
 
     if (op === 'and') {
@@ -576,6 +613,9 @@ function evaluate(startExpr: SchemeVal, startEnv: Env): SchemeVal {
     const callEnv = new Env(proc.env);
     for (let i = 0; i < proc.params.length; i++) {
       callEnv.define(proc.params[i], args[i]);
+    }
+    if (proc.rest) {
+      callEnv.define(proc.rest, listToPairs(args.slice(proc.params.length)));
     }
     // TCO: tail call on last body expr
     for (let i = 0; i < proc.body.length - 1; i++) {

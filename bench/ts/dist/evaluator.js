@@ -279,6 +279,30 @@ function makeGlobalEnv() {
         }
         return result;
     });
+    defBuiltin('apply', (args) => {
+        const proc = args[0];
+        const lastArg = args[args.length - 1];
+        const prefixArgs = args.slice(1, args.length - 1);
+        const tailArgs = pairsToArray(lastArg);
+        const allArgs = [...prefixArgs, ...tailArgs];
+        if (proc.tag === 'builtin')
+            return proc.fn(allArgs);
+        if (proc.tag === 'lambda') {
+            const callEnv = new Env(proc.env);
+            for (let i = 0; i < proc.params.length; i++) {
+                callEnv.define(proc.params[i], allArgs[i]);
+            }
+            if (proc.rest) {
+                callEnv.define(proc.rest, listToPairs(allArgs.slice(proc.params.length)));
+            }
+            let result = { tag: 'void' };
+            for (const bodyExpr of proc.body) {
+                result = evaluate(bodyExpr, callEnv);
+            }
+            return result;
+        }
+        throw new EvalError('apply: not a procedure');
+    });
     defBuiltin('number?', (args) => ({ tag: 'boolean', value: args[0].tag === 'number' }));
     defBuiltin('string?', (args) => ({ tag: 'boolean', value: args[0].tag === 'string' }));
     defBuiltin('boolean?', (args) => ({ tag: 'boolean', value: args[0].tag === 'boolean' }));
@@ -365,6 +389,15 @@ class TailCall {
         this.env = env;
     }
 }
+function parseDotParams(paramExprs) {
+    const dotIdx = paramExprs.findIndex(p => p.tag === 'symbol' && p.value === '.');
+    if (dotIdx >= 0) {
+        const params = paramExprs.slice(0, dotIdx).map(p => p.value);
+        const rest = paramExprs[dotIdx + 1].value;
+        return { params, rest };
+    }
+    return { params: paramExprs.map(p => p.value) };
+}
 function evaluate(startExpr, startEnv) {
     let expr = startExpr;
     let env = startEnv;
@@ -412,12 +445,12 @@ function evaluate(startExpr, startEnv) {
                 if (items.length < 3)
                     throw new EvalError(`${posStr(expr.pos)}define: bad syntax`);
                 if (items[1].tag === 'list') {
-                    // (define (f params...) body...)
+                    // (define (f params...) body...) or (define (f params... . rest) body...)
                     const nameAndParams = items[1].value;
                     const name = nameAndParams[0].value;
-                    const params = nameAndParams.slice(1).map(p => p.value);
+                    const { params, rest } = parseDotParams(nameAndParams.slice(1));
                     const body = items.slice(2);
-                    env.define(name, { tag: 'lambda', params, body, env });
+                    env.define(name, { tag: 'lambda', params, rest, body, env });
                     return { tag: 'void' };
                 }
                 // (define x expr)
@@ -428,9 +461,14 @@ function evaluate(startExpr, startEnv) {
             }
             if (op === 'lambda') {
                 const paramList = items[1];
-                const params = paramList.value.map(p => p.value);
+                if (paramList.tag === 'symbol') {
+                    // (lambda args body...) — all args as rest
+                    const body = items.slice(2);
+                    return { tag: 'lambda', params: [], rest: paramList.value, body, env };
+                }
+                const { params, rest } = parseDotParams(paramList.value);
                 const body = items.slice(2);
-                return { tag: 'lambda', params, body, env };
+                return { tag: 'lambda', params, rest, body, env };
             }
             if (op === 'and') {
                 if (items.length === 1)
@@ -580,6 +618,9 @@ function evaluate(startExpr, startEnv) {
             const callEnv = new Env(proc.env);
             for (let i = 0; i < proc.params.length; i++) {
                 callEnv.define(proc.params[i], args[i]);
+            }
+            if (proc.rest) {
+                callEnv.define(proc.rest, listToPairs(args.slice(proc.params.length)));
             }
             // TCO: tail call on last body expr
             for (let i = 0; i < proc.body.length - 1; i++) {
