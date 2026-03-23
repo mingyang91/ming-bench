@@ -3,6 +3,8 @@ package ming
 /** AST / runtime value for the Scheme interpreter. */
 enum SchemeValue:
   case IntVal(value: Long, pos: Option[SourcePos] = None)
+  case RationalVal(num: Long, den: Long, pos: Option[SourcePos] = None)
+  case DoubleVal(value: Double, pos: Option[SourcePos] = None)
   case BoolVal(value: Boolean, pos: Option[SourcePos] = None)
   case StringVal(value: String, pos: Option[SourcePos] = None)
   case SymbolVal(name: String, pos: Option[SourcePos] = None)
@@ -30,6 +32,8 @@ enum SchemeValue:
   /** Get the source position of this value, if any. */
   def sourcePos: Option[SourcePos] = this match
     case IntVal(_, p)           => p
+    case RationalVal(_, _, p)   => p
+    case DoubleVal(_, p)        => p
     case BoolVal(_, p)          => p
     case StringVal(_, p)        => p
     case SymbolVal(_, p)        => p
@@ -42,6 +46,8 @@ enum SchemeValue:
   /** Format for `write` — strings are quoted. */
   def display: String = this match
     case IntVal(n, _)                         => n.toString
+    case RationalVal(n, d, _)                 => s"$n/$d"
+    case DoubleVal(d, _)                      => Rational.formatDouble(d)
     case BoolVal(b, _)                        => if b then "#t" else "#f"
     case StringVal(s, _)                      => s"\"$s\""
     case MutableStringVal(cs, _)              => s"\"${String(cs)}\""

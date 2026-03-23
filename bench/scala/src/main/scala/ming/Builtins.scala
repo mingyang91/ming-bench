@@ -5,46 +5,81 @@ import SchemeValue.*
 /** Core builtin procedure implementations for the Scheme interpreter. */
 object Builtins:
 
-  def arith(
-    args: List[SchemeValue],
-    op: (Long, Long) => Long,
-    identity: Long
-  ): SchemeValue =
-    IntVal(args.foldLeft(identity) {
-      case (acc, IntVal(n, _)) => op(acc, n)
-      case _                   => throw new EvalError("arithmetic: expected number")
-    })
+  def addOp(args: List[SchemeValue]): SchemeValue =
+    if args.isEmpty then return IntVal(0)
+    if Rational.hasInexact(args) then DoubleVal(args.foldLeft(0.0)((acc, v) => acc + Rational.toDouble(v)))
+    else
+      val (num, den) = args.foldLeft((0L, 1L)) { case ((an, ad), v) =>
+        val (bn, bd) = Rational.toRational(v)
+        (an * bd + bn * ad, ad * bd)
+      }
+      Rational.make(num, den)
+
+  def mulOp(args: List[SchemeValue]): SchemeValue =
+    if args.isEmpty then return IntVal(1)
+    if Rational.hasInexact(args) then DoubleVal(args.foldLeft(1.0)((acc, v) => acc * Rational.toDouble(v)))
+    else
+      val (num, den) = args.foldLeft((1L, 1L)) { case ((an, ad), v) =>
+        val (bn, bd) = Rational.toRational(v)
+        (an * bn, ad * bd)
+      }
+      Rational.make(num, den)
 
   def subtractOp(args: List[SchemeValue]): SchemeValue =
     args match
-      case Nil                 => throw new EvalError("-: requires at least 1 argument")
-      case IntVal(n, _) :: Nil => IntVal(-n)
-      case IntVal(first, _) :: rest =>
-        IntVal(rest.foldLeft(first) {
-          case (acc, IntVal(n, _)) => acc - n
-          case _                   => throw new EvalError("-: expected number")
-        })
-      case _ => throw new EvalError("-: expected number")
+      case Nil => throw new EvalError("-: requires at least 1 argument")
+      case v :: Nil =>
+        if Rational.isInexact(v) then DoubleVal(-Rational.toDouble(v))
+        else
+          val (n, d) = Rational.toRational(v)
+          Rational.make(-n, d)
+      case first :: rest =>
+        if Rational.hasInexact(args) then
+          DoubleVal(rest.foldLeft(Rational.toDouble(first))((acc, v) => acc - Rational.toDouble(v)))
+        else
+          val (fn, fd) = Rational.toRational(first)
+          val (rn, rd) = rest.foldLeft((fn, fd)) { case ((an, ad), v) =>
+            val (bn, bd) = Rational.toRational(v)
+            (an * bd - bn * ad, ad * bd)
+          }
+          Rational.make(rn, rd)
 
   def divideOp(args: List[SchemeValue]): SchemeValue =
     args match
       case Nil => throw new EvalError("/: requires at least 1 argument")
-      case IntVal(first, _) :: rest =>
-        IntVal(rest.foldLeft(first) {
-          case (acc, IntVal(n, _)) =>
-            if n == 0 then throw new EvalError("division by zero")
-            acc / n
-          case _ => throw new EvalError("/: expected number")
-        })
-      case _ => throw new EvalError("/: expected number")
+      case first :: rest if rest.isEmpty =>
+        if Rational.isInexact(first) then
+          val d = Rational.toDouble(first)
+          if d == 0.0 then throw new EvalError("division by zero")
+          DoubleVal(1.0 / d)
+        else
+          val (n, d) = Rational.toRational(first)
+          if n == 0 then throw new EvalError("division by zero")
+          Rational.make(d, n)
+      case first :: rest =>
+        if Rational.hasInexact(args) then
+          DoubleVal(rest.foldLeft(Rational.toDouble(first)) { (acc, v) =>
+            val d = Rational.toDouble(v)
+            if d == 0.0 then throw new EvalError("division by zero")
+            acc / d
+          })
+        else
+          val (fn, fd) = Rational.toRational(first)
+          val (rn, rd) = rest.foldLeft((fn, fd)) { case ((an, ad), v) =>
+            val (bn, bd) = Rational.toRational(v)
+            if bn == 0 then throw new EvalError("division by zero")
+            (an * bd, ad * bn)
+          }
+          Rational.make(rn, rd)
 
   def compare(
     args: List[SchemeValue],
-    cmp: (Long, Long) => Boolean
+    cmp: (Double, Double) => Boolean
   ): SchemeValue =
     args match
-      case IntVal(a, _) :: IntVal(b, _) :: Nil => BoolVal(cmp(a, b))
-      case _                                   => throw new EvalError("comparison: expected 2 numbers")
+      case a :: b :: Nil if Rational.isNumeric(a) && Rational.isNumeric(b) =>
+        BoolVal(cmp(Rational.toDouble(a), Rational.toDouble(b)))
+      case _ => throw new EvalError("comparison: expected 2 numbers")
 
   def notOp(args: List[SchemeValue]): SchemeValue =
     args match
@@ -158,13 +193,15 @@ object Builtins:
   private[ming] def schemeEqv(a: SchemeValue, b: SchemeValue): Boolean = schemeEq(a, b)
 
   private def schemeEq(a: SchemeValue, b: SchemeValue): Boolean = (a, b) match
-    case (IntVal(x, _), IntVal(y, _))       => x == y
-    case (BoolVal(x, _), BoolVal(y, _))     => x == y
-    case (SymbolVal(x, _), SymbolVal(y, _)) => x == y
-    case (CharVal(x, _), CharVal(y, _))     => x == y
-    case (ListVal(Nil, _), ListVal(Nil, _)) => true
-    case (Void, Void)                       => true
-    case _                                  => a eq b // reference equality
+    case (IntVal(x, _), IntVal(y, _))                     => x == y
+    case (RationalVal(xn, xd, _), RationalVal(yn, yd, _)) => xn == yn && xd == yd
+    case (DoubleVal(x, _), DoubleVal(y, _))               => x == y
+    case (BoolVal(x, _), BoolVal(y, _))                   => x == y
+    case (SymbolVal(x, _), SymbolVal(y, _))               => x == y
+    case (CharVal(x, _), CharVal(y, _))                   => x == y
+    case (ListVal(Nil, _), ListVal(Nil, _))               => true
+    case (Void, Void)                                     => true
+    case _                                                => a eq b // reference equality
 
   def equalCheck(args: List[SchemeValue]): SchemeValue =
     args match
@@ -175,12 +212,14 @@ object Builtins:
     a: SchemeValue,
     b: SchemeValue
   ): Boolean = (a, b) match
-    case (IntVal(x, _), IntVal(y, _))       => x == y
-    case (BoolVal(x, _), BoolVal(y, _))     => x == y
-    case (SymbolVal(x, _), SymbolVal(y, _)) => x == y
-    case (StringVal(x, _), StringVal(y, _)) => x == y
-    case (CharVal(x, _), CharVal(y, _))     => x == y
-    case (ListVal(Nil, _), ListVal(Nil, _)) => true
+    case (IntVal(x, _), IntVal(y, _))                     => x == y
+    case (RationalVal(xn, xd, _), RationalVal(yn, yd, _)) => xn == yn && xd == yd
+    case (DoubleVal(x, _), DoubleVal(y, _))               => x == y
+    case (BoolVal(x, _), BoolVal(y, _))                   => x == y
+    case (SymbolVal(x, _), SymbolVal(y, _))               => x == y
+    case (StringVal(x, _), StringVal(y, _))               => x == y
+    case (CharVal(x, _), CharVal(y, _))                   => x == y
+    case (ListVal(Nil, _), ListVal(Nil, _))               => true
     case (ListVal(xs, _), ListVal(ys, _)) =>
       xs.length == ys.length && xs.zip(ys).forall((a, b) => schemeEqual(a, b))
     case (PairVal(a1, d1), PairVal(a2, d2)) =>

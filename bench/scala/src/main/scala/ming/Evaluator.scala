@@ -7,8 +7,8 @@ object Evaluator:
 
   private def coreBuiltins(output: StringBuilder): List[(String, List[SchemeValue] => SchemeValue)] =
     List(
-      ("+", args => Builtins.arith(args, _ + _, 0)),
-      ("*", args => Builtins.arith(args, _ * _, 1)),
+      ("+", args => Builtins.addOp(args)),
+      ("*", args => Builtins.mulOp(args)),
       ("-", args => Builtins.subtractOp(args)),
       ("/", args => Builtins.divideOp(args)),
       ("<", args => Builtins.compare(args, _ < _)),
@@ -24,7 +24,7 @@ object Evaluator:
       ("list", args => ListVal(args)),
       ("length", args => Builtins.lengthOp(args)),
       ("string?", args => Builtins.typeCheck(args, v => v.isInstanceOf[StringVal] || v.isInstanceOf[MutableStringVal])),
-      ("number?", args => Builtins.typeCheck(args, _.isInstanceOf[IntVal])),
+      ("number?", args => Builtins.typeCheck(args, Rational.isNumeric)),
       ("boolean?", args => Builtins.typeCheck(args, _.isInstanceOf[BoolVal])),
       ("pair?", args => Builtins.pairCheck(args)),
       ("symbol?", args => Builtins.typeCheck(args, _.isInstanceOf[SymbolVal])),
@@ -96,8 +96,59 @@ object Evaluator:
       ("vector-length", args => BuiltinsVector.vectorLengthOp(args)),
       ("vector?", args => BuiltinsVector.vectorCheck(args)),
       ("vector->list", args => BuiltinsVector.vectorToListOp(args)),
-      ("list->vector", args => BuiltinsVector.listToVectorOp(args))
+      ("list->vector", args => BuiltinsVector.listToVectorOp(args)),
+      ("exact?", args => Builtins.typeCheck(args, Rational.isExact)),
+      ("inexact?", args => Builtins.typeCheck(args, Rational.isInexact)),
+      (
+        "integer?",
+        args =>
+          Builtins.typeCheck(
+            args,
+            {
+              case _: IntVal => true
+              case _         => false
+            }
+          )
+      ),
+      (
+        "rational?",
+        args =>
+          Builtins.typeCheck(
+            args,
+            {
+              case _: IntVal | _: RationalVal => true
+              case _                          => false
+            }
+          )
+      ),
+      ("exact->inexact", args => exactToInexactOp(args)),
+      ("inexact->exact", args => inexactToExactOp(args)),
+      ("numerator", args => numeratorOp(args)),
+      ("denominator", args => denominatorOp(args))
     )
+
+  private def exactToInexactOp(args: List[SchemeValue]): SchemeValue =
+    args match
+      case v :: Nil if Rational.isNumeric(v) => DoubleVal(Rational.toDouble(v))
+      case _                                 => throw new EvalError("exact->inexact: expected 1 number")
+
+  private def inexactToExactOp(args: List[SchemeValue]): SchemeValue =
+    args match
+      case DoubleVal(d, _) :: Nil          => Rational.doubleToExact(d)
+      case v :: Nil if Rational.isExact(v) => v
+      case _                               => throw new EvalError("inexact->exact: expected 1 number")
+
+  private def numeratorOp(args: List[SchemeValue]): SchemeValue =
+    args match
+      case IntVal(n, _) :: Nil         => IntVal(n)
+      case RationalVal(n, _, _) :: Nil => IntVal(n)
+      case _                           => throw new EvalError("numerator: expected exact number")
+
+  private def denominatorOp(args: List[SchemeValue]): SchemeValue =
+    args match
+      case IntVal(_, _) :: Nil         => IntVal(1)
+      case RationalVal(_, d, _) :: Nil => IntVal(d)
+      case _                           => throw new EvalError("denominator: expected exact number")
 
   private def makeGlobalEnv(output: StringBuilder): Environment =
     val env = Environment()

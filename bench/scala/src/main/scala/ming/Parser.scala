@@ -124,7 +124,21 @@ object Parser:
     else
       token.toLongOption match
         case Some(n) => IntVal(n, Some(pos))
+        case None    => parseRationalOrFloat(token, pos)
+
+  private def parseRationalOrFloat(token: String, pos: SourcePos): SchemeValue =
+    val slashIdx = token.indexOf('/')
+    if slashIdx > 0 then
+      val numStr = token.substring(0, slashIdx)
+      val denStr = token.substring(slashIdx + 1)
+      (numStr.toLongOption, denStr.toLongOption) match
+        case (Some(n), Some(d)) => Rational.make(n, d, Some(pos))
+        case _                  => SymbolVal(token, Some(pos))
+    else if token.contains('.') then
+      token.toDoubleOption match
+        case Some(d) => DoubleVal(d, Some(pos))
         case None    => SymbolVal(token, Some(pos))
+    else SymbolVal(token, Some(pos))
 
   private def parseCharLiteral(token: String, pos: SourcePos): SchemeValue =
     val name = token.substring(2)

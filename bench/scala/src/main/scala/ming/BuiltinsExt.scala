@@ -5,8 +5,6 @@ import SchemeValue.*
 /** Extended builtin operations: strings, numerics, chars, list utilities. */
 object BuiltinsExt:
 
-  // --- String operations ---
-
   def stringAppendOp(args: List[SchemeValue]): SchemeValue =
     val sb = StringBuilder()
     args.foreach {
@@ -36,8 +34,10 @@ object BuiltinsExt:
 
   def numberToStringOp(args: List[SchemeValue]): SchemeValue =
     args match
-      case IntVal(n, _) :: Nil => StringVal(n.toString)
-      case _                   => throw new EvalError("number->string: expected number")
+      case IntVal(n, _) :: Nil         => StringVal(n.toString)
+      case RationalVal(n, d, _) :: Nil => StringVal(s"$n/$d")
+      case DoubleVal(d, _) :: Nil      => StringVal(Rational.formatDouble(d))
+      case _                           => throw new EvalError("number->string: expected number")
 
   def symbolToStringOp(args: List[SchemeValue]): SchemeValue =
     args match
@@ -75,8 +75,6 @@ object BuiltinsExt:
       case MutableStringVal(cs, _) :: Nil => MutableStringVal(cs.clone())
       case _                              => throw new EvalError("string-copy: expected string")
 
-  // --- String/Char conversions (L14) ---
-
   def stringToListOp(args: List[SchemeValue]): SchemeValue =
     args match
       case StringVal(s, _) :: Nil =>
@@ -103,8 +101,6 @@ object BuiltinsExt:
     args match
       case IntVal(n, _) :: Nil => CharVal(n.toChar)
       case _                   => throw new EvalError("integer->char: expected integer")
-
-  // --- Numeric utilities (L13) ---
 
   def absOp(args: List[SchemeValue]): SchemeValue =
     args match
