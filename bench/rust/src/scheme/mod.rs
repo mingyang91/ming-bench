@@ -923,32 +923,41 @@ fn eval_cond_tc(args: &[Expr], env: &Env) -> Result<Trampoline, EvalError> {
 
 fn eval_string_set(args: &[Expr], env: &Env, span: Span) -> Result<Value, EvalError> {
     if args.len() != 3 {
-        return Err(EvalError::Arity("string-set! requires 3 arguments".into()).with_position(span.line, span.col));
+        return Err(EvalError::Arity("string-set! requires 3 arguments".into()));
     }
-    let name = match &args[0].kind {
-        ExprKind::Symbol(s) => s.clone(),
-        _ => return Err(EvalError::Type("string-set!: first argument must be a variable".into()).with_position(span.line, span.col)),
-    };
+    // String literals are immutable
+    if matches!(args[0].kind, ExprKind::Str(_)) {
+        return Err(EvalError::Runtime("string-set!: strings are immutable".into()).with_position(span.line, span.col));
+    }
     let idx_val = eval(&args[1], env)?;
-    let idx = as_int(&idx_val)? as usize;
-    let char_val = eval(&args[2], env)?;
-    let c = match char_val {
-        Value::Char(c) => c,
-        _ => return Err(EvalError::Type("string-set!: third argument must be a char".into()).with_position(span.line, span.col)),
+    let ch_val = eval(&args[2], env)?;
+    let idx = match idx_val {
+        Value::Integer(n) => n as usize,
+        _ => return Err(EvalError::Type("string-set!: expected integer index".into())),
     };
-    let current = env_get(env, &name).ok_or_else(|| EvalError::UnboundVariable(name.clone()))?;
-    match current {
-        Value::Str(mut s) => {
-            if idx >= s.len() {
-                return Err(EvalError::Runtime("string-set!: index out of range".into()).with_position(span.line, span.col));
-            }
-            // Replace char at byte index (assuming ASCII-compatible)
-            let bytes = unsafe { s.as_bytes_mut() };
-            bytes[idx] = c as u8;
-            env_update(env, &name, Value::Str(s))?;
-            Ok(Value::Void)
+    let ch = match ch_val {
+        Value::Char(c) => c,
+        _ => return Err(EvalError::Type("string-set!: expected char".into())),
+    };
+    // The first arg must be a symbol referencing a mutable string variable
+    if let ExprKind::Symbol(ref name) = args[0].kind {
+        let s = match env_get(env, name) {
+            Some(Value::Str(s)) => s,
+            Some(_) => return Err(EvalError::Type("string-set!: expected string".into())),
+            None => return Err(EvalError::UnboundVariable(name.clone())),
+        };
+        let mut chars: Vec<char> = s.chars().collect();
+        if idx >= chars.len() {
+            return Err(EvalError::Runtime("string-set!: index out of range".into()));
         }
-        _ => Err(EvalError::Type("string-set!: expected string".into()).with_position(span.line, span.col)),
+        chars[idx] = ch;
+        let new_s: String = chars.into_iter().collect();
+        env_update(env, name, Value::Str(new_s))
+            .map_err(|e| e.with_position(span.line, span.col))?;
+        Ok(Value::Void)
+    } else {
+        // Non-symbol, non-literal expression (e.g. function call result) — can't mutate
+        Err(EvalError::Runtime("string-set!: strings are immutable".into()).with_position(span.line, span.col))
     }
 }
 
@@ -1790,6 +1799,67 @@ fn builtin_is_procedure(args: &[Value]) -> Result<Value, EvalError> {
     Ok(Value::Boolean(matches!(&args[0], Value::Lambda { .. } | Value::Builtin(_) | Value::CallCC | Value::Continuation(_))))
 }
 
+// L14: char/integer conversion
+fn builtin_char_to_integer(args: &[Value]) -> Result<Value, EvalError> {
+    if args.len() != 1 { return Err(EvalError::Arity("char->integer requires 1 argument".into())); }
+    match &args[0] {
+        Value::Char(c) => Ok(Value::Integer(*c as i64)),
+        _ => Err(EvalError::Type("char->integer: expected char".into())),
+    }
+}
+
+fn builtin_integer_to_char(args: &[Value]) -> Result<Value, EvalError> {
+    if args.len() != 1 { return Err(EvalError::Arity("integer->char requires 1 argument".into())); }
+    match &args[0] {
+        Value::Integer(n) => {
+            let c = char::from_u32(*n as u32)
+                .ok_or_else(|| EvalError::Runtime(format!("integer->char: invalid code point {}", n)))?;
+            Ok(Value::Char(c))
+        }
+        _ => Err(EvalError::Type("integer->char: expected integer".into())),
+    }
+}
+
+// L14: string/list conversion
+fn builtin_string_to_list(args: &[Value]) -> Result<Value, EvalError> {
+    if args.len() != 1 { return Err(EvalError::Arity("string->list requires 1 argument".into())); }
+    match &args[0] {
+        Value::Str(s) => {
+            let chars: Vec<Value> = s.chars().map(Value::Char).collect();
+            Ok(Value::List(chars))
+        }
+        _ => Err(EvalError::Type("string->list: expected string".into())),
+    }
+}
+
+fn builtin_list_to_string(args: &[Value]) -> Result<Value, EvalError> {
+    if args.len() != 1 { return Err(EvalError::Arity("list->string requires 1 argument".into())); }
+    let mut s = String::new();
+    fn collect_chars(val: &Value, s: &mut String) -> Result<(), EvalError> {
+        match val {
+            Value::List(items) => {
+                for item in items {
+                    match item {
+                        Value::Char(c) => s.push(*c),
+                        _ => return Err(EvalError::Type("list->string: list must contain only chars".into())),
+                    }
+                }
+            }
+            Value::Pair(car, cdr) => {
+                match car.as_ref() {
+                    Value::Char(c) => s.push(*c),
+                    _ => return Err(EvalError::Type("list->string: list must contain only chars".into())),
+                }
+                collect_chars(cdr.as_ref(), s)?;
+            }
+            _ => return Err(EvalError::Type("list->string: expected proper list".into())),
+        }
+        Ok(())
+    }
+    collect_chars(&args[0], &mut s)?;
+    Ok(Value::Str(s))
+}
+
 fn make_global_env() -> Env {
     let env = new_env(None);
     let builtins: &[(&str, BuiltinFn)] = &[
@@ -1865,6 +1935,12 @@ fn make_global_env() -> Env {
         ("string-downcase", builtin_string_downcase),
         // L13: misc
         ("procedure?", builtin_is_procedure),
+        // L14: char/integer conversion
+        ("char->integer", builtin_char_to_integer),
+        ("integer->char", builtin_integer_to_char),
+        // L14: string/list conversion
+        ("string->list", builtin_string_to_list),
+        ("list->string", builtin_list_to_string),
     ];
     for (name, f) in builtins {
         env_set(&env, name.to_string(), Value::Builtin(*f));
