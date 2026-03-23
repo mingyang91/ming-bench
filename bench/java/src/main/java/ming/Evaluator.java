@@ -424,11 +424,17 @@ public class Evaluator {
         "string?", "number?", "boolean?", "pair?", "symbol?", "char?",
         "zero?", "positive?", "negative?", "abs", "min", "max",
         "equal?", "eq?", "modulo", "remainder", "even?", "odd?",
+        "quotient", "expt",
+        "list-ref", "list-tail", "list?", "assoc", "map",
         "display", "write", "newline",
         "string-append", "string-length", "substring",
         "string->number", "number->string",
         "symbol->string", "string->symbol", "string-ref",
         "string-set!", "string-copy",
+        "char-alphabetic?", "char-numeric?",
+        "char-upcase", "char-downcase", "char=?", "char<?",
+        "string=?", "string<?", "string-ci=?",
+        "string-upcase", "string-downcase",
         "apply", "call/cc", "call-with-current-continuation"
     );
 
@@ -561,6 +567,129 @@ public class Evaluator {
             case "odd?" -> {
                 if (a.size() != 1) throw new EvalError("odd?: needs exactly 1 argument");
                 yield k.apply(new SchemeValue.BoolVal(asInt(a.getFirst()) % 2 != 0));
+            }
+            case "quotient" -> {
+                if (a.size() != 2) throw new EvalError("quotient: needs exactly 2 arguments");
+                long x = asInt(a.get(0)), y = asInt(a.get(1));
+                if (y == 0) throw new EvalError("division by zero");
+                long q = x / y; // Java truncates toward zero
+                yield k.apply(new SchemeValue.IntVal(q));
+            }
+            case "expt" -> {
+                if (a.size() != 2) throw new EvalError("expt: needs exactly 2 arguments");
+                long base = asInt(a.get(0)), exp = asInt(a.get(1));
+                long result = 1;
+                for (long i = 0; i < exp; i++) result *= base;
+                yield k.apply(new SchemeValue.IntVal(result));
+            }
+            case "list-ref" -> {
+                if (a.size() != 2) throw new EvalError("list-ref: needs exactly 2 arguments");
+                long idx = asInt(a.get(1));
+                SchemeValue cur = a.get(0);
+                for (long i = 0; i < idx; i++) {
+                    if (!(cur instanceof SchemeValue.PairVal p)) throw new EvalError("list-ref: index out of range");
+                    cur = p.cdr();
+                }
+                if (!(cur instanceof SchemeValue.PairVal p)) throw new EvalError("list-ref: index out of range");
+                yield k.apply(p.car());
+            }
+            case "list-tail" -> {
+                if (a.size() != 2) throw new EvalError("list-tail: needs exactly 2 arguments");
+                long idx = asInt(a.get(1));
+                SchemeValue cur = a.get(0);
+                for (long i = 0; i < idx; i++) {
+                    if (!(cur instanceof SchemeValue.PairVal p)) throw new EvalError("list-tail: index out of range");
+                    cur = p.cdr();
+                }
+                yield k.apply(cur);
+            }
+            case "list?" -> {
+                if (a.size() != 1) throw new EvalError("list?: needs exactly 1 argument");
+                SchemeValue cur = a.getFirst();
+                boolean proper = true;
+                while (cur instanceof SchemeValue.PairVal p) cur = p.cdr();
+                if (!(cur instanceof SchemeValue.NilVal)) proper = false;
+                yield k.apply(new SchemeValue.BoolVal(proper));
+            }
+            case "assoc" -> {
+                if (a.size() != 2) throw new EvalError("assoc: needs exactly 2 arguments");
+                SchemeValue key = a.get(0);
+                SchemeValue lst = a.get(1);
+                SchemeValue result = new SchemeValue.BoolVal(false);
+                while (lst instanceof SchemeValue.PairVal p) {
+                    if (p.car() instanceof SchemeValue.PairVal entry && schemeEqual(entry.car(), key)) {
+                        result = entry;
+                        break;
+                    }
+                    lst = p.cdr();
+                }
+                yield k.apply(result);
+            }
+            case "map" -> {
+                if (a.size() < 2) throw new EvalError("map: needs at least 2 arguments");
+                SchemeValue proc = a.get(0);
+                List<SchemeValue> lists = a.subList(1, a.size());
+                yield mapLoop(proc, lists, k);
+            }
+            case "char-alphabetic?" -> {
+                if (a.size() != 1) throw new EvalError("char-alphabetic?: needs exactly 1 argument");
+                if (!(a.getFirst() instanceof SchemeValue.CharVal c)) throw new EvalError("char-alphabetic?: not a character");
+                yield k.apply(new SchemeValue.BoolVal(Character.isLetter(c.value())));
+            }
+            case "char-numeric?" -> {
+                if (a.size() != 1) throw new EvalError("char-numeric?: needs exactly 1 argument");
+                if (!(a.getFirst() instanceof SchemeValue.CharVal c)) throw new EvalError("char-numeric?: not a character");
+                yield k.apply(new SchemeValue.BoolVal(Character.isDigit(c.value())));
+            }
+            case "char-upcase" -> {
+                if (a.size() != 1) throw new EvalError("char-upcase: needs exactly 1 argument");
+                if (!(a.getFirst() instanceof SchemeValue.CharVal c)) throw new EvalError("char-upcase: not a character");
+                yield k.apply(new SchemeValue.CharVal(Character.toUpperCase(c.value())));
+            }
+            case "char-downcase" -> {
+                if (a.size() != 1) throw new EvalError("char-downcase: needs exactly 1 argument");
+                if (!(a.getFirst() instanceof SchemeValue.CharVal c)) throw new EvalError("char-downcase: not a character");
+                yield k.apply(new SchemeValue.CharVal(Character.toLowerCase(c.value())));
+            }
+            case "char=?" -> {
+                if (a.size() != 2) throw new EvalError("char=?: needs exactly 2 arguments");
+                if (!(a.get(0) instanceof SchemeValue.CharVal c1)) throw new EvalError("char=?: not a character");
+                if (!(a.get(1) instanceof SchemeValue.CharVal c2)) throw new EvalError("char=?: not a character");
+                yield k.apply(new SchemeValue.BoolVal(c1.value() == c2.value()));
+            }
+            case "char<?" -> {
+                if (a.size() != 2) throw new EvalError("char<?: needs exactly 2 arguments");
+                if (!(a.get(0) instanceof SchemeValue.CharVal c1)) throw new EvalError("char<?: not a character");
+                if (!(a.get(1) instanceof SchemeValue.CharVal c2)) throw new EvalError("char<?: not a character");
+                yield k.apply(new SchemeValue.BoolVal(c1.value() < c2.value()));
+            }
+            case "string=?" -> {
+                if (a.size() != 2) throw new EvalError("string=?: needs exactly 2 arguments");
+                if (!(a.get(0) instanceof SchemeValue.StringVal s1)) throw new EvalError("string=?: not a string");
+                if (!(a.get(1) instanceof SchemeValue.StringVal s2)) throw new EvalError("string=?: not a string");
+                yield k.apply(new SchemeValue.BoolVal(s1.value().equals(s2.value())));
+            }
+            case "string<?" -> {
+                if (a.size() != 2) throw new EvalError("string<?: needs exactly 2 arguments");
+                if (!(a.get(0) instanceof SchemeValue.StringVal s1)) throw new EvalError("string<?: not a string");
+                if (!(a.get(1) instanceof SchemeValue.StringVal s2)) throw new EvalError("string<?: not a string");
+                yield k.apply(new SchemeValue.BoolVal(s1.value().compareTo(s2.value()) < 0));
+            }
+            case "string-ci=?" -> {
+                if (a.size() != 2) throw new EvalError("string-ci=?: needs exactly 2 arguments");
+                if (!(a.get(0) instanceof SchemeValue.StringVal s1)) throw new EvalError("string-ci=?: not a string");
+                if (!(a.get(1) instanceof SchemeValue.StringVal s2)) throw new EvalError("string-ci=?: not a string");
+                yield k.apply(new SchemeValue.BoolVal(s1.value().equalsIgnoreCase(s2.value())));
+            }
+            case "string-upcase" -> {
+                if (a.size() != 1) throw new EvalError("string-upcase: needs exactly 1 argument");
+                if (!(a.getFirst() instanceof SchemeValue.StringVal s)) throw new EvalError("string-upcase: not a string");
+                yield k.apply(new SchemeValue.StringVal(s.value().toUpperCase()));
+            }
+            case "string-downcase" -> {
+                if (a.size() != 1) throw new EvalError("string-downcase: needs exactly 1 argument");
+                if (!(a.getFirst() instanceof SchemeValue.StringVal s)) throw new EvalError("string-downcase: not a string");
+                yield k.apply(new SchemeValue.StringVal(s.value().toLowerCase()));
             }
             case "display" -> {
                 if (a.size() != 1) throw new EvalError("display: needs exactly 1 argument");
@@ -838,6 +967,26 @@ public class Evaluator {
             for (var elem : list.elements())
                 collectIntroducedSymbols(elem, patternVars, gensymMap);
         }
+    }
+
+    // --- Map helper ---
+
+    private Bounce mapLoop(SchemeValue proc, List<SchemeValue> lists, Cont k) {
+        // Check if any list is nil (done)
+        for (var lst : lists) {
+            if (lst instanceof SchemeValue.NilVal) return k.apply(new SchemeValue.NilVal());
+        }
+        // Extract cars and cdrs
+        List<SchemeValue> cars = new ArrayList<>();
+        List<SchemeValue> cdrs = new ArrayList<>();
+        for (var lst : lists) {
+            if (!(lst instanceof SchemeValue.PairVal p)) throw new EvalError("map: not a proper list");
+            cars.add(p.car());
+            cdrs.add(p.cdr());
+        }
+        return new Bounce.More(() -> applyProc(proc, cars, head ->
+            new Bounce.More(() -> mapLoop(proc, cdrs, tail ->
+                k.apply(new SchemeValue.PairVal(head, tail))))));
     }
 
     // --- Helpers ---
