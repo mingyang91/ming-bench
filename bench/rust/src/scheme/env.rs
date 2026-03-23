@@ -49,6 +49,37 @@ impl Env {
             "values", "call-with-values",
             "exact?", "inexact?", "exact->inexact", "inexact->exact",
             "numerator", "denominator", "rational?", "integer?",
+            "set-car!", "set-cdr!",
+            // c[ad]{2}r
+            "caar", "cadr", "cdar", "cddr",
+            // c[ad]{3}r
+            "caaar", "caadr", "cadar", "caddr", "cdaar", "cdadr", "cddar", "cdddr",
+            // c[ad]{4}r
+            "caaaar", "caaadr", "caadar", "caaddr", "cadaar", "cadadr", "caddar", "cadddr",
+            "cdaaar", "cdaadr", "cdadar", "cdaddr", "cddaar", "cddadr", "cdddar", "cddddr",
+            "for-each", "member", "memq", "memv", "assq", "assv",
+            "procedure?", "complex?", "real?",
+            // char predicates and comparisons
+            "char-lower-case?", "char-upper-case?", "char-whitespace?",
+            "char<=?", "char>=?", "char>?",
+            "char-ci=?", "char-ci<?", "char-ci>?", "char-ci<=?", "char-ci>=?",
+            // string comparisons
+            "string>?", "string>=?", "string<=?",
+            "string-ci<?", "string-ci>?", "string-ci<=?", "string-ci>=?",
+            // math
+            "floor", "ceiling", "round", "truncate",
+            "sqrt", "sin", "cos", "tan", "asin", "acos", "atan", "exp", "log",
+            "gcd", "lcm",
+            // string constructors
+            "make-string", "string",
+            // I/O
+            "write-char",
+            "call-with-input-file", "call-with-output-file",
+            "open-input-file", "open-output-file",
+            "close-input-port", "close-output-port",
+            "current-input-port", "current-output-port",
+            "input-port?", "output-port?",
+            "read", "read-char", "peek-char", "eof-object?",
         ] {
             bindings.insert(name.into(), Value::Builtin(name.into()));
         }

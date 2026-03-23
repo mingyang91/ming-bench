@@ -1,5 +1,6 @@
 use std::any::Any;
 use std::cell::RefCell;
+use std::collections::HashSet;
 use std::fmt;
 use std::rc::Rc;
 use crate::scheme::env::Env;
@@ -46,6 +47,8 @@ pub enum Value {
     Vector(Rc<RefCell<Vec<Value>>>),
     /// A dotted pair (improper list): (a . b) where b is not a list.
     DottedPair(Box<Value>, Box<Value>),
+    /// A mutable cons cell with shared identity.
+    Pair(Rc<RefCell<(Value, Value)>>),
     SyntaxRules {
         literals: Vec<String>,
         rules: Vec<(Vec<Expr>, Expr)>,
@@ -105,6 +108,18 @@ impl PartialEq for Value {
             (Value::Void, Value::Void) => true,
             (Value::Builtin(a), Value::Builtin(b)) => a == b,
             (Value::DottedPair(a1, b1), Value::DottedPair(a2, b2)) => a1 == a2 && b1 == b2,
+            (Value::Pair(a), Value::Pair(b)) => {
+                if Rc::ptr_eq(a, b) { return true; }
+                let ab = a.borrow();
+                let bb = b.borrow();
+                ab.0 == bb.0 && ab.1 == bb.1
+            }
+            (Value::Pair(_), Value::List(_)) | (Value::List(_), Value::Pair(_)) => {
+                match (self.to_vec(), other.to_vec()) {
+                    (Some(a), Some(b)) => a == b,
+                    _ => false,
+                }
+            }
             (Value::Continuation(_), Value::Continuation(_)) => false,
             (Value::SyntaxRules { .. }, Value::SyntaxRules { .. }) => false,
             (Value::MultipleValues(a), Value::MultipleValues(b)) => a == b,
@@ -137,6 +152,7 @@ impl Value {
                 format!("#({})", inner.join(" "))
             }
             Value::DottedPair(a, b) => format!("({} . {})", a.to_display_string(), b.to_display_string()),
+            Value::Pair(cell) => display_pair_chain(cell, Value::to_display_string),
             Value::Void => "".into(),
             Value::Builtin(name) => format!("#<procedure:{}>", name),
             Value::Lambda { .. } => "#<procedure>".into(),
@@ -168,6 +184,7 @@ impl Value {
                 format!("#({})", inner.join(" "))
             }
             Value::DottedPair(a, b) => format!("({} . {})", a.to_display_output(), b.to_display_output()),
+            Value::Pair(cell) => display_pair_chain(cell, Value::to_display_output),
             Value::Continuation(_) => "#<continuation>".into(),
             Value::SyntaxRules { .. } => "#<macro>".into(),
             Value::MultipleValues(_) => self.to_display_string(),
@@ -186,6 +203,99 @@ impl Value {
 impl fmt::Display for Value {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(f, "{}", self.to_display_string())
+    }
+}
+
+impl Value {
+    /// Create a new mutable cons cell (Pair).
+    pub fn make_pair(car: Value, cdr: Value) -> Value {
+        Value::Pair(Rc::new(RefCell::new((car, cdr))))
+    }
+
+    /// Create a proper list from a vec of values as a Pair chain ending in empty List.
+    pub fn list_from_vec(elems: Vec<Value>) -> Value {
+        let mut result = Value::List(Vec::new());
+        for elem in elems.into_iter().rev() {
+            result = Value::make_pair(elem, result);
+        }
+        result
+    }
+
+    /// Flatten this value to a Vec if it's a proper list (List or Pair chain).
+    /// Returns None for improper lists or cycles.
+    pub fn to_vec(&self) -> Option<Vec<Value>> {
+        match self {
+            Value::List(v) => Some(v.clone()),
+            Value::Pair(_) => {
+                let mut result = Vec::new();
+                let mut current = self.clone();
+                let mut seen = HashSet::new();
+                loop {
+                    match current {
+                        Value::List(v) => {
+                            result.extend(v);
+                            return Some(result);
+                        }
+                        Value::Pair(ref cell) => {
+                            let ptr = Rc::as_ptr(cell) as usize;
+                            if !seen.insert(ptr) {
+                                return None; // cycle
+                            }
+                            let (car, cdr) = {
+                                let b = cell.borrow();
+                                (b.0.clone(), b.1.clone())
+                            };
+                            result.push(car);
+                            current = cdr;
+                        }
+                        _ => return None, // improper
+                    }
+                }
+            }
+            _ => None,
+        }
+    }
+}
+
+/// Display a Pair chain with cycle detection.
+fn display_pair_chain(cell: &Rc<RefCell<(Value, Value)>>, f: fn(&Value) -> String) -> String {
+    let mut parts = Vec::new();
+    let mut seen = HashSet::new();
+    let mut dot_tail: Option<String> = None;
+    let mut cur_cell = Rc::clone(cell);
+
+    loop {
+        let ptr = Rc::as_ptr(&cur_cell) as usize;
+        if !seen.insert(ptr) {
+            break; // cycle detected — stop
+        }
+        let (car, cdr) = {
+            let b = cur_cell.borrow();
+            (b.0.clone(), b.1.clone())
+        };
+        parts.push(f(&car));
+        match cdr {
+            Value::Pair(next) => {
+                cur_cell = next;
+            }
+            Value::List(v) if v.is_empty() => break,
+            Value::List(v) => {
+                for elem in &v {
+                    parts.push(f(elem));
+                }
+                break;
+            }
+            other => {
+                dot_tail = Some(f(&other));
+                break;
+            }
+        }
+    }
+
+    if let Some(tail) = dot_tail {
+        format!("({} . {})", parts.join(" "), tail)
+    } else {
+        format!("({})", parts.join(" "))
     }
 }
 
