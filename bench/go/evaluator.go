@@ -69,6 +69,17 @@ func makeLambda(params []string, restParam string, body []*Value, closure *Env) 
 	return &Value{Type: TypeLambda, Params: params, RestParam: restParam, Body: body, Closure: closure}
 }
 
+// continuationEscape is panicked when a continuation is invoked.
+type continuationEscape struct {
+	val    *Value
+	tag    *[0]byte
+	// restFn evaluates the remaining computation with the given value.
+	// For reentrant continuations, this is set by callCC to evaluate
+	// the remaining body expressions in the captured environment,
+	// then the remaining top-level expressions.
+	restFn func(*Value) (*Value, error)
+}
+
 // tailCall is a sentinel used by the trampoline to indicate a tail call.
 type tailCall struct {
 	expr *Value
@@ -76,7 +87,7 @@ type tailCall struct {
 }
 
 // eval evaluates a single expression in the given environment.
-// Uses a trampoline loop for TCO.
+// Uses a trampoline loop for TCO and handles call/cc parking.
 func eval(expr *Value, env *Env) (*Value, error) {
 	for {
 		switch expr.Type {
@@ -157,6 +168,16 @@ func evalList(expr *Value, env *Env) (*tailCall, *Value, error) {
 			return nil, nil, err
 		}
 		evalArgs[i] = v
+	}
+
+	// Continuation application
+	if fn.Type == TypeContinuation {
+		if len(evalArgs) != 1 {
+			return nil, nil, &EvalError{Message: "continuation expects exactly one argument"}
+		}
+		fn.ContFunc(evalArgs[0])
+		// unreachable
+		return nil, nil, nil
 	}
 
 	// TCO: if applying a lambda, return a tail call
@@ -455,6 +476,13 @@ func applyProc(fn *Value, args []*Value) (*Value, error) {
 			}
 		}
 		return result, nil
+	case TypeContinuation:
+		if len(args) != 1 {
+			return nil, &EvalError{Message: "continuation expects exactly one argument"}
+		}
+		fn.ContFunc(args[0])
+		// ContFunc panics, so this is unreachable
+		return nil, &EvalError{Message: "unreachable"}
 	default:
 		return nil, &EvalError{Message: fmt.Sprintf("not a procedure: %s", fn.Display())}
 	}
@@ -559,8 +587,42 @@ func compareInts(args []*Value, cmp func(int64, int64) bool) (*Value, error) {
 	return makeBool(true), nil
 }
 
+// callCCBuiltin implements call-with-current-continuation.
+// Uses panic/recover for in-scope non-local exit.
+// For reentrant calls, the panic propagates to evalWithOutput which
+// calls the continuation's restFn.
+func callCCBuiltin(fn *Value) (*Value, error) {
+	tag := new([0]byte)
+
+	cont := &Value{
+		Type: TypeContinuation,
+		Str:  "continuation",
+	}
+	cont.ContFunc = func(val *Value) {
+		panic(continuationEscape{val: val, tag: tag, restFn: cont.RestFn})
+	}
+
+	var result *Value
+	var resultErr error
+	func() {
+		defer func() {
+			if r := recover(); r != nil {
+				if ce, ok := r.(continuationEscape); ok && ce.tag == tag {
+					result = ce.val
+					return
+				}
+				panic(r)
+			}
+		}()
+		result, resultErr = applyProc(fn, []*Value{cont})
+	}()
+
+	return result, resultErr
+}
+
+
 // builtinEnv creates the top-level environment with builtin procedure names.
-func builtinEnv(out *strings.Builder) *Env {
+func builtinEnv(out *strings.Builder, exprIdx *int) *Env {
 	env := newEnv(nil)
 	builtinDefs := map[string]func([]*Value) (*Value, error){
 		"+":   func(args []*Value) (*Value, error) { return applyBuiltin("+", args) },
@@ -776,26 +838,31 @@ func builtinEnv(out *strings.Builder) *Env {
 			}
 			return makeBool(args[0].Type == TypeChar), nil
 		},
-		"apply": func(args []*Value) (*Value, error) {
-			if len(args) < 2 {
-				return nil, &EvalError{Message: "'apply' expects at least two arguments"}
-			}
-			fn := args[0]
-			// Last arg must be a list; prefix args are prepended
-			lastArg := args[len(args)-1]
-			var callArgs []*Value
-			// Prefix args (between fn and the last list)
-			for i := 1; i < len(args)-1; i++ {
-				callArgs = append(callArgs, args[i])
-			}
-			// Flatten the last argument (must be a list)
-			cur := lastArg
-			for cur.Type == TypePair {
-				callArgs = append(callArgs, cur.Car)
-				cur = cur.Cdr
-			}
-			return applyProc(fn, callArgs)
-		},
+	}
+	ccFn := func(args []*Value) (*Value, error) {
+		if len(args) != 1 {
+			return nil, &EvalError{Message: "'call/cc' expects exactly one argument"}
+		}
+		return callCCBuiltin(args[0], exprIdx)
+	}
+	builtinDefs["call/cc"] = ccFn
+	builtinDefs["call-with-current-continuation"] = ccFn
+	builtinDefs["apply"] = func(args []*Value) (*Value, error) {
+		if len(args) < 2 {
+			return nil, &EvalError{Message: "'apply' expects at least two arguments"}
+		}
+		fn := args[0]
+		lastArg := args[len(args)-1]
+		var callArgs []*Value
+		for i := 1; i < len(args)-1; i++ {
+			callArgs = append(callArgs, args[i])
+		}
+		cur := lastArg
+		for cur.Type == TypePair {
+			callArgs = append(callArgs, cur.Car)
+			cur = cur.Cdr
+		}
+		return applyProc(fn, callArgs)
 	}
 	for name, fn := range builtinDefs {
 		env.set(name, makeBuiltin(name, fn))
@@ -829,17 +896,52 @@ func evalWithOutput(input string) (string, string, error) {
 	}
 
 	var out strings.Builder
-	env := builtinEnv(&out)
+	callCCStashes = make(map[int]*stashSlot)
+	callCCCounter = 0
+	exprIdx := 0
+	env := builtinEnv(&out, &exprIdx)
+
 	var result *Value
-	for _, expr := range exprs {
-		result, err = eval(expr, env)
+	for exprIdx < len(exprs) {
+		var escaped *continuationEscape
+
+		func() {
+			defer func() {
+				if r := recover(); r != nil {
+					if ce, ok := r.(continuationEscape); ok {
+									escaped = &ce
+						return
+					}
+					if e, ok := r.(error); ok {
+						err = e
+					} else {
+						err = &EvalError{Message: fmt.Sprintf("%v", r)}
+					}
+				}
+			}()
+			result, err = eval(exprs[exprIdx], env)
+		}()
+
 		if err != nil {
 			return "", "", err
 		}
+
+		if escaped != nil {
+			// A reentrant continuation was invoked.
+			// Set the stash so callCC returns the escaped value on replay.
+			escaped.stash.val = escaped.val
+			// Reset counter so callCC IDs match on replay.
+			callCCCounter = 0
+			// Replay from the expression containing the call/cc.
+			exprIdx = escaped.exprIdx
+			continue
+		}
+
+		exprIdx++
 	}
 
 	r := ""
-	if result.Type != TypeVoid {
+	if result != nil && result.Type != TypeVoid {
 		r = result.Display()
 	}
 	return r, out.String(), nil

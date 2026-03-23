@@ -21,6 +21,7 @@ const (
 	TypeLambda
 	TypeBuiltin
 	TypeChar
+	TypeContinuation
 )
 
 // Value represents a Scheme value.
@@ -38,6 +39,10 @@ type Value struct {
 	Closure   *Env
 	// Builtin function
 	BuiltinFunc func([]*Value) (*Value, error)
+	// Continuation function
+	ContFunc func(*Value)
+	// RestFn evaluates the remaining computation. Set lazily after callCC returns.
+	RestFn func(*Value) (*Value, error)
 	// Source position
 	Line int
 	Col  int
@@ -80,6 +85,8 @@ func (v *Value) Display() string {
 		return fmt.Sprintf("#<builtin %s>", v.Str)
 	case TypeChar:
 		return fmt.Sprintf("#\\%c", rune(v.Int))
+	case TypeContinuation:
+		return "#<continuation>"
 	default:
 		return ""
 	}
