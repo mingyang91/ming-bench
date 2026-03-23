@@ -16,4 +16,7 @@ public sealed interface ContFrame {
 
     /** Context frame for set!: after value is computed, set the variable. */
     record SetFrame(String name, Environment env) implements ContFrame {}
+
+    /** Context frame for dynamic-wind: when reached during replay, call out-thunk and pop wind stack. */
+    record WindExitFrame(WindRecord windRecord) implements ContFrame {}
 }

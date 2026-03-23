@@ -24,6 +24,10 @@ public class Evaluator {
     /** Continuation stack: tracks remaining computation frames for call/cc capture. */
     private final Deque<ContFrame> contStack = new ArrayDeque<>();
 
+    // --- dynamic-wind state ---
+    private final List<WindRecord> windStack = new ArrayList<>();
+    private int windCounter = 0;
+
     private int gensymCounter = 0;
 
     private static final Set<String> SPECIAL_FORMS = Set.of(
@@ -56,7 +60,9 @@ public class Evaluator {
         // L15 builtins
         "eqv?",
         "vector", "make-vector", "vector-ref", "vector-set!", "vector-length", "vector?",
-        "vector->list", "list->vector"
+        "vector->list", "list->vector",
+        // L16 builtins
+        "dynamic-wind", "reverse"
     };
 
     {
@@ -110,13 +116,17 @@ public class Evaluator {
     private SchemeValue handleContinuation(ContinuationReturn cr) throws EvalError {
         while (true) {
             try {
+                // Perform wind transition before replay
+                performWindTransition(cr.cont.windStackSnapshot);
+
                 // Restore contStack from snapshot (innermost first in list)
                 contStack.clear();
                 var snapshot = cr.cont.contStackSnapshot;
                 for (int i = snapshot.size() - 1; i >= 0; i--) {
                     contStack.push(snapshot.get(i));
                 }
-                return resumeFromContStack(cr.value, cr.cont.callccId);
+                SchemeValue result = resumeFromContStack(cr.value, cr.cont.callccId);
+                return result;
             } catch (ContinuationReturn cr2) {
                 cr = cr2;
             }
@@ -167,6 +177,10 @@ public class Evaluator {
                 df.env().define(df.name(), result);
             } else if (frame instanceof ContFrame.SetFrame sf) {
                 sf.env().set(sf.name(), result);
+            } else if (frame instanceof ContFrame.WindExitFrame wf) {
+                // Dynamic-wind body exited during replay: call out-thunk and pop wind record
+                windStack.removeLast();
+                evalContinuation(applyTail(wf.windRecord().outThunk, List.of(), SourcePos.NONE));
             }
         }
 
@@ -518,6 +532,9 @@ public class Evaluator {
             case "vector?" -> builtinVectorQ(args, env, pos);
             case "vector->list" -> builtinVectorToList(args, env, pos);
             case "list->vector" -> builtinListToVector(args, env, pos);
+            // L16 builtins
+            case "dynamic-wind" -> builtinDynamicWind(args, env, pos);
+            case "reverse" -> builtinReverse(args, env, pos);
             default -> null;
         };
     }
@@ -972,15 +989,95 @@ public class Evaluator {
         }
 
         // Normal execution: capture continuation and call the procedure
-        Continuation cont = new Continuation(myId, contStack);
+        Continuation cont = new Continuation(myId, contStack, windStack);
         SchemeValue contVal = new SchemeValue.ContinuationVal(cont);
 
         try {
             return evalContinuation(applyTail(proc, List.of(contVal), pos));
         } catch (ContinuationReturn cr) {
-            if (cr.cont == cont) return cr.value; // escape: continuation invoked from lambda body
+            if (cr.cont == cont) {
+                performWindTransition(cont.windStackSnapshot);
+                return cr.value;
+            }
             throw cr; // not our continuation, propagate
         }
+    }
+
+    // --- L16: dynamic-wind ---
+
+    private SchemeValue builtinDynamicWind(List<SchemeValue> args, Environment env, SourcePos pos) throws EvalError {
+        if (args.size() != 3) throw posError(pos, "dynamic-wind: need exactly 3 arguments");
+        SchemeValue inThunk = eval(args.get(0), env);
+        SchemeValue bodyThunk = eval(args.get(1), env);
+        SchemeValue outThunk = eval(args.get(2), env);
+        return dynamicWindEvaled(inThunk, bodyThunk, outThunk, pos);
+    }
+
+    private SchemeValue dynamicWindEvaled(SchemeValue inThunk, SchemeValue bodyThunk, SchemeValue outThunk, SourcePos pos) throws EvalError {
+        // Call in-thunk
+        evalContinuation(applyTail(inThunk, List.of(), pos));
+
+        // Push wind record and exit frame for continuation replay
+        WindRecord wr = new WindRecord(++windCounter, inThunk, outThunk);
+        windStack.add(wr);
+        contStack.push(new ContFrame.WindExitFrame(wr));
+
+        SchemeValue result;
+        try {
+            result = evalContinuation(applyTail(bodyThunk, List.of(), pos));
+        } catch (ContinuationReturn cr) {
+            // Non-local exit: clean up and propagate
+            contStack.pop(); // remove WindExitFrame
+            windStack.removeLast();
+            evalContinuation(applyTail(outThunk, List.of(), pos));
+            throw cr;
+        }
+
+        // Normal exit: clean up
+        contStack.pop(); // remove WindExitFrame
+        windStack.removeLast();
+        evalContinuation(applyTail(outThunk, List.of(), pos));
+        return result;
+    }
+
+    /**
+     * Transition the wind stack from current state to target state.
+     * Calls out-thunks for extents being left (innermost first),
+     * then in-thunks for extents being entered (outermost first).
+     */
+    private void performWindTransition(List<WindRecord> target) throws EvalError {
+        // Find common prefix length by matching wind record IDs
+        int common = 0;
+        int minLen = Math.min(windStack.size(), target.size());
+        while (common < minLen && windStack.get(common).id == target.get(common).id) {
+            common++;
+        }
+
+        // Unwind: call out-thunks from innermost to common prefix
+        for (int i = windStack.size() - 1; i >= common; i--) {
+            WindRecord wr = windStack.get(i);
+            evalContinuation(applyTail(wr.outThunk, List.of(), SourcePos.NONE));
+        }
+        // Remove unwound records
+        while (windStack.size() > common) {
+            windStack.removeLast();
+        }
+
+        // Rewind: call in-thunks from common prefix to target
+        for (int i = common; i < target.size(); i++) {
+            WindRecord wr = target.get(i);
+            evalContinuation(applyTail(wr.inThunk, List.of(), SourcePos.NONE));
+            windStack.add(wr);
+        }
+    }
+
+    private SchemeValue builtinReverse(List<SchemeValue> args, Environment env, SourcePos pos) throws EvalError {
+        if (args.size() != 1) throw posError(pos, "reverse: need exactly 1 argument");
+        SchemeValue val = eval(args.getFirst(), env);
+        if (!(val instanceof SchemeValue.ListVal lst)) throw posError(pos, "reverse: not a list");
+        var reversed = new ArrayList<>(lst.elements());
+        java.util.Collections.reverse(reversed);
+        return new SchemeValue.ListVal(reversed, SourcePos.NONE);
     }
 
     /** Resolve a value that may be a Thunk (trampoline). Used after applyTail. */
@@ -1183,12 +1280,15 @@ public class Evaluator {
                     replayValue = null;
                     yield val;
                 }
-                Continuation cont = new Continuation(myId, contStack);
+                Continuation cont = new Continuation(myId, contStack, windStack);
                 SchemeValue contVal = new SchemeValue.ContinuationVal(cont);
                 try {
                     yield evalContinuation(applyTail(proc, List.of(contVal), pos));
                 } catch (ContinuationReturn cr) {
-                    if (cr.cont == cont) yield cr.value;
+                    if (cr.cont == cont) {
+                        performWindTransition(cont.windStackSnapshot);
+                        yield cr.value;
+                    }
                     throw cr;
                 }
             }
@@ -1444,6 +1544,18 @@ public class Evaluator {
                 if (args.size() != 1) throw posError(pos, "list->vector: need exactly 1 argument");
                 if (!(args.get(0) instanceof SchemeValue.ListVal lst)) throw posError(pos, "list->vector: not a list");
                 yield new SchemeValue.VectorVal(lst.elements().toArray(new SchemeValue[0]), SourcePos.NONE);
+            }
+            // L16 builtins
+            case "dynamic-wind" -> {
+                if (args.size() != 3) throw posError(pos, "dynamic-wind: need exactly 3 arguments");
+                yield dynamicWindEvaled(args.get(0), args.get(1), args.get(2), pos);
+            }
+            case "reverse" -> {
+                if (args.size() != 1) throw posError(pos, "reverse: need exactly 1 argument");
+                if (!(args.get(0) instanceof SchemeValue.ListVal lst)) throw posError(pos, "reverse: not a list");
+                var reversed = new ArrayList<>(lst.elements());
+                java.util.Collections.reverse(reversed);
+                yield new SchemeValue.ListVal(reversed, SourcePos.NONE);
             }
             default -> throw posError(pos, "unknown builtin: " + name);
         };
