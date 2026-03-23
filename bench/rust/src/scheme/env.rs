@@ -41,6 +41,9 @@ impl Env {
             "char=?", "char<?",
             "string=?", "string<?", "string-ci=?",
             "string-upcase", "string-downcase",
+            "eqv?",
+            "vector", "make-vector", "vector-ref", "vector-set!",
+            "vector-length", "vector?", "vector->list", "list->vector",
         ] {
             bindings.insert(name.into(), Value::Builtin(name.into()));
         }
@@ -62,6 +65,14 @@ impl Env {
             parent: Some(Rc::clone(parent)),
             output: Rc::clone(&parent.output),
         })
+    }
+
+    /// Return the parent environment, or self if there is no parent.
+    pub fn parent_or_self(this: &Rc<Env>) -> Rc<Env> {
+        match &this.parent {
+            Some(p) => Rc::clone(p),
+            None => Rc::clone(this),
+        }
     }
 
     pub fn get(&self, name: &str) -> Option<Value> {

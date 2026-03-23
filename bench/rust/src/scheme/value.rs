@@ -40,6 +40,8 @@ pub enum Value {
         closure_env: Rc<Env>,
     },
     Continuation(CapturedCont),
+    /// A fixed-size mutable vector.
+    Vector(Rc<RefCell<Vec<Value>>>),
     /// A dotted pair (improper list): (a . b) where b is not a list.
     DottedPair(Box<Value>, Box<Value>),
     SyntaxRules {
@@ -70,6 +72,7 @@ impl PartialEq for Value {
             (Value::Symbol(a), Value::Symbol(b)) => a == b,
             (Value::Char(a), Value::Char(b)) => a == b,
             (Value::List(a), Value::List(b)) => a == b,
+            (Value::Vector(a), Value::Vector(b)) => *a.borrow() == *b.borrow(),
             (Value::Void, Value::Void) => true,
             (Value::Builtin(a), Value::Builtin(b)) => a == b,
             (Value::DottedPair(a1, b1), Value::DottedPair(a2, b2)) => a1 == a2 && b1 == b2,
@@ -94,6 +97,10 @@ impl Value {
                 let inner: Vec<String> = elems.iter().map(|v| v.to_display_string()).collect();
                 format!("({})", inner.join(" "))
             }
+            Value::Vector(v) => {
+                let inner: Vec<String> = v.borrow().iter().map(|e| e.to_display_string()).collect();
+                format!("#({})", inner.join(" "))
+            }
             Value::DottedPair(a, b) => format!("({} . {})", a.to_display_string(), b.to_display_string()),
             Value::Void => "".into(),
             Value::Builtin(name) => format!("#<procedure:{}>", name),
@@ -110,6 +117,10 @@ impl Value {
             Value::List(elems) => {
                 let inner: Vec<String> = elems.iter().map(|v| v.to_display_output()).collect();
                 format!("({})", inner.join(" "))
+            }
+            Value::Vector(v) => {
+                let inner: Vec<String> = v.borrow().iter().map(|e| e.to_display_output()).collect();
+                format!("#({})", inner.join(" "))
             }
             Value::DottedPair(a, b) => format!("({} . {})", a.to_display_output(), b.to_display_output()),
             Value::Continuation(_) => "#<continuation>".into(),

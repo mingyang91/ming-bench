@@ -177,6 +177,24 @@ impl Parser {
                     Ok(Expr { kind: ExprKind::Char(ch), span })
                 }
             }
+            '(' => {
+                // #(...) vector literal — parse as (vector ...)
+                self.advance(); // skip '('
+                let mut elems = Vec::new();
+                loop {
+                    self.skip_whitespace_and_comments();
+                    if self.pos >= self.chars.len() {
+                        return Err(self.err("unclosed vector literal"));
+                    }
+                    if self.chars[self.pos] == ')' {
+                        self.advance();
+                        let mut list_elems = vec![Expr { kind: ExprKind::Symbol("vector".into()), span }];
+                        list_elems.extend(elems);
+                        return Ok(Expr { kind: ExprKind::List(list_elems), span });
+                    }
+                    elems.push(self.parse_expr()?);
+                }
+            }
             other => Err(EvalError::new(
                 ErrorKind::Parse {
                     message: format!("unexpected character after #: {other}"),

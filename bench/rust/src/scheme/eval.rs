@@ -1,3 +1,4 @@
+use std::cell::RefCell;
 use std::rc::Rc;
 use crate::scheme::env::Env;
 use crate::scheme::error::{ErrorKind, EvalError, Span};
@@ -36,6 +37,35 @@ enum Frame {
         env: Rc<Env>,
     },
     CondTest { clause_body: Vec<Expr>, rest_clauses: Vec<Expr>, env: Rc<Env> },
+    CaseKey { clauses: Vec<Expr>, env: Rc<Env> },
+    DoInit {
+        var_names: Vec<String>,
+        done_vals: Vec<Value>,
+        rest_inits: Vec<Expr>,
+        step_exprs: Vec<Option<Expr>>,
+        test: Expr,
+        result_exprs: Vec<Expr>,
+        body: Vec<Expr>,
+        env: Rc<Env>,
+    },
+    DoTest {
+        vars: Vec<String>,
+        step_exprs: Vec<Option<Expr>>,
+        test: Expr,
+        result_exprs: Vec<Expr>,
+        body: Vec<Expr>,
+        env: Rc<Env>,
+    },
+    DoStep {
+        vars: Vec<String>,
+        step_exprs: Vec<Option<Expr>>,
+        test: Expr,
+        result_exprs: Vec<Expr>,
+        body: Vec<Expr>,
+        done_vals: Vec<Value>,
+        rest_indices: Vec<usize>,
+        env: Rc<Env>,
+    },
     MapStep {
         func: Value,
         lists: Vec<Vec<Value>>,
@@ -130,6 +160,10 @@ fn step_eval_list(
             "or" => return step_or(&elems[1..], env, k),
             "let" => return step_let(&elems[1..], env, k),
             "cond" => return step_cond(&elems[1..], env, k),
+            "case" => return step_case(&elems[1..], env, k),
+            "letrec" => return step_letrec(&elems[1..], env, k),
+            "letrec*" => return step_letrec_star(&elems[1..], env, k),
+            "do" => return step_do(&elems[1..], env, k),
             "define-syntax" => return step_define_syntax(&elems[1..], env),
             _ => {}
         }
@@ -380,6 +414,227 @@ fn step_cond(clauses: &[Expr], env: &Rc<Env>, k: &mut Vec<Frame>) -> Result<Stat
             }
         }
     }
+    Ok(State::Ret(Value::Void))
+}
+
+fn step_case(args: &[Expr], env: &Rc<Env>, k: &mut Vec<Frame>) -> Result<State, EvalError> {
+    if args.is_empty() {
+        return Err(ErrorKind::BadSyntax {
+            form: "case".into(),
+            message: "missing key expression".into(),
+        }
+        .into());
+    }
+    let clauses = args[1..].to_vec();
+    k.push(Frame::CaseKey {
+        clauses,
+        env: Rc::clone(env),
+    });
+    Ok(State::Eval(args[0].clone(), Rc::clone(env)))
+}
+
+fn step_letrec(args: &[Expr], env: &Rc<Env>, k: &mut Vec<Frame>) -> Result<State, EvalError> {
+    if args.len() < 2 {
+        return Err(ErrorKind::BadSyntax {
+            form: "letrec".into(),
+            message: "expected (letrec ((var init) ...) body...)".into(),
+        }
+        .into());
+    }
+    let bindings = parse_let_bindings(&args[0])?;
+    let body = args[1..].to_vec();
+    let names: Vec<String> = bindings.iter().map(|(n, _)| n.clone()).collect();
+    let voids: Vec<Value> = vec![Value::Void; names.len()];
+    let letrec_env = Env::extend(env, names, voids);
+    if bindings.is_empty() {
+        return Ok(begin_seq(&body, &letrec_env, k));
+    }
+    // Build a sequence: (set! name1 init1) (set! name2 init2) ... body...
+    let mut seq_exprs: Vec<Expr> = Vec::new();
+    for (name, init) in &bindings {
+        let span = init.span;
+        seq_exprs.push(Expr {
+            kind: ExprKind::List(vec![
+                Expr { kind: ExprKind::Symbol("set!".into()), span },
+                Expr { kind: ExprKind::Symbol(name.clone()), span },
+                init.clone(),
+            ]),
+            span,
+        });
+    }
+    seq_exprs.extend(body);
+    Ok(begin_seq(&seq_exprs, &letrec_env, k))
+}
+
+fn step_letrec_star(args: &[Expr], env: &Rc<Env>, k: &mut Vec<Frame>) -> Result<State, EvalError> {
+    if args.len() < 2 {
+        return Err(ErrorKind::BadSyntax {
+            form: "letrec*".into(),
+            message: "expected (letrec* ((var init) ...) body...)".into(),
+        }
+        .into());
+    }
+    let bindings = parse_let_bindings(&args[0])?;
+    let body = args[1..].to_vec();
+    // Create env with all names bound to Void, then sequentially evaluate and define
+    let names: Vec<String> = bindings.iter().map(|(n, _)| n.clone()).collect();
+    let voids: Vec<Value> = vec![Value::Void; names.len()];
+    let letrec_env = Env::extend(env, names, voids);
+    if bindings.is_empty() {
+        return Ok(begin_seq(&body, &letrec_env, k));
+    }
+    // Use Seq + Def frames to evaluate each init and define it sequentially
+    // Build a sequence of define expressions in the letrec_env
+    let mut seq_exprs: Vec<Expr> = Vec::new();
+    for (name, init) in &bindings {
+        // (set! name init)
+        let span = init.span;
+        seq_exprs.push(Expr {
+            kind: ExprKind::List(vec![
+                Expr { kind: ExprKind::Symbol("set!".into()), span },
+                Expr { kind: ExprKind::Symbol(name.clone()), span },
+                init.clone(),
+            ]),
+            span,
+        });
+    }
+    // Add body expressions
+    seq_exprs.extend(body);
+    Ok(begin_seq(&seq_exprs, &letrec_env, k))
+}
+
+fn step_do(args: &[Expr], env: &Rc<Env>, k: &mut Vec<Frame>) -> Result<State, EvalError> {
+    if args.len() < 2 {
+        return Err(ErrorKind::BadSyntax {
+            form: "do".into(),
+            message: "expected (do ((var init step) ...) (test expr ...) body...)".into(),
+        }
+        .into());
+    }
+    let var_clauses = match &args[0].kind {
+        ExprKind::List(clauses) => clauses,
+        _ => {
+            return Err(ErrorKind::BadSyntax {
+                form: "do".into(),
+                message: "variable clauses must be a list".into(),
+            }
+            .into())
+        }
+    };
+    let mut var_names = Vec::new();
+    let mut init_exprs = Vec::new();
+    let mut step_exprs: Vec<Option<Expr>> = Vec::new();
+    for clause in var_clauses {
+        match &clause.kind {
+            ExprKind::List(parts) if parts.len() >= 2 && parts.len() <= 3 => {
+                let name = match &parts[0].kind {
+                    ExprKind::Symbol(s) => s.clone(),
+                    _ => {
+                        return Err(ErrorKind::BadSyntax {
+                            form: "do".into(),
+                            message: "variable name must be a symbol".into(),
+                        }
+                        .into())
+                    }
+                };
+                var_names.push(name);
+                init_exprs.push(parts[1].clone());
+                step_exprs.push(parts.get(2).cloned());
+            }
+            _ => {
+                return Err(ErrorKind::BadSyntax {
+                    form: "do".into(),
+                    message: "each variable clause must be (var init) or (var init step)"
+                        .into(),
+                }
+                .into())
+            }
+        }
+    }
+    let test_clause = match &args[1].kind {
+        ExprKind::List(parts) if !parts.is_empty() => parts,
+        _ => {
+            return Err(ErrorKind::BadSyntax {
+                form: "do".into(),
+                message: "test clause must be (test expr ...)".into(),
+            }
+            .into())
+        }
+    };
+    let test = test_clause[0].clone();
+    let result_exprs = test_clause[1..].to_vec();
+    let body = args[2..].to_vec();
+
+    if init_exprs.is_empty() {
+        let do_env = Env::extend(env, Vec::new(), Vec::new());
+        k.push(Frame::DoTest {
+            vars: var_names,
+            step_exprs,
+            test: test.clone(),
+            result_exprs,
+            body,
+            env: Rc::clone(&do_env),
+        });
+        return Ok(State::Eval(test, Rc::clone(&do_env)));
+    }
+    let first = init_exprs[0].clone();
+    let rest_inits = init_exprs[1..].to_vec();
+    k.push(Frame::DoInit {
+        var_names,
+        done_vals: Vec::new(),
+        rest_inits,
+        step_exprs,
+        test,
+        result_exprs,
+        body,
+        env: Rc::clone(env),
+    });
+    Ok(State::Eval(first, Rc::clone(env)))
+}
+
+fn dispatch_case(
+    key: Value,
+    clauses: &[Expr],
+    env: &Rc<Env>,
+    k: &mut Vec<Frame>,
+) -> Result<State, EvalError> {
+    for clause in clauses {
+        match &clause.kind {
+            ExprKind::List(elems) if elems.len() >= 2 => {
+                // Check for else clause
+                if let ExprKind::Symbol(s) = &elems[0].kind {
+                    if s == "else" {
+                        return Ok(begin_seq(&elems[1..], env, k));
+                    }
+                }
+                // Check datum list
+                let datums = match &elems[0].kind {
+                    ExprKind::List(d) => d,
+                    _ => {
+                        return Err(ErrorKind::BadSyntax {
+                            form: "case".into(),
+                            message: "each clause datum must be a list".into(),
+                        }
+                        .into())
+                    }
+                };
+                for datum in datums {
+                    let datum_val = expr_to_value(datum)?;
+                    if scheme_eqv(&key, &datum_val) {
+                        return Ok(begin_seq(&elems[1..], env, k));
+                    }
+                }
+            }
+            _ => {
+                return Err(ErrorKind::BadSyntax {
+                    form: "case".into(),
+                    message: "invalid case clause".into(),
+                }
+                .into())
+            }
+        }
+    }
+    // No match, no else
     Ok(State::Ret(Value::Void))
 }
 
@@ -715,6 +970,198 @@ fn step_ret(val: Value, frame: Frame, k: &mut Vec<Frame>) -> Result<State, EvalE
                 step_cond(&rest_clauses, &env, k)
             }
         }
+        Frame::CaseKey { clauses, env } => {
+            // val is the key; dispatch through clauses using eqv?
+            dispatch_case(val, &clauses, &env, k)
+        }
+        Frame::DoInit { .. }
+        | Frame::DoTest { .. }
+        | Frame::DoStep { .. } => step_ret_do(val, frame, k),
+    }
+}
+
+// ── step_ret_do (do-loop continuation frames) ──────────────
+
+fn step_ret_do(val: Value, frame: Frame, k: &mut Vec<Frame>) -> Result<State, EvalError> {
+    match frame {
+        Frame::DoInit {
+            var_names,
+            mut done_vals,
+            rest_inits,
+            step_exprs,
+            test,
+            result_exprs,
+            body,
+            env,
+        } => {
+            done_vals.push(val);
+            if rest_inits.is_empty() {
+                let do_env = Env::extend(&env, var_names.clone(), done_vals);
+                k.push(Frame::DoTest {
+                    vars: var_names,
+                    step_exprs,
+                    test: test.clone(),
+                    result_exprs,
+                    body,
+                    env: Rc::clone(&do_env),
+                });
+                Ok(State::Eval(test, Rc::clone(&do_env)))
+            } else {
+                let mut rest_inits = rest_inits;
+                let next = rest_inits.remove(0);
+                k.push(Frame::DoInit {
+                    var_names,
+                    done_vals,
+                    rest_inits,
+                    step_exprs,
+                    test,
+                    result_exprs,
+                    body,
+                    env: Rc::clone(&env),
+                });
+                Ok(State::Eval(next, env))
+            }
+        }
+        Frame::DoTest {
+            vars,
+            step_exprs,
+            test,
+            result_exprs,
+            body,
+            env,
+        } => {
+            if val.is_truthy() {
+                if result_exprs.is_empty() {
+                    Ok(State::Ret(Value::Void))
+                } else {
+                    Ok(begin_seq(&result_exprs, &env, k))
+                }
+            } else {
+                let step_indices: Vec<usize> = step_exprs
+                    .iter()
+                    .enumerate()
+                    .filter_map(|(i, s)| s.as_ref().map(|_| i))
+                    .collect();
+                if step_indices.is_empty() {
+                    if !body.is_empty() {
+                        k.push(Frame::DoTest {
+                            vars,
+                            step_exprs,
+                            test: test.clone(),
+                            result_exprs,
+                            body: body.clone(),
+                            env: Rc::clone(&env),
+                        });
+                        let mut all = body;
+                        all.push(test);
+                        Ok(begin_seq(&all, &env, k))
+                    } else {
+                        k.push(Frame::DoTest {
+                            vars,
+                            step_exprs,
+                            test: test.clone(),
+                            result_exprs,
+                            body,
+                            env: Rc::clone(&env),
+                        });
+                        Ok(State::Eval(test, env))
+                    }
+                } else {
+                    let first_idx = step_indices[0];
+                    let first_step = step_exprs[first_idx]
+                        .clone()
+                        .expect("filtered by step_indices");
+                    let remaining_indices = step_indices[1..].to_vec();
+                    if !body.is_empty() {
+                        k.push(Frame::DoStep {
+                            vars,
+                            step_exprs,
+                            test,
+                            result_exprs,
+                            body: body.clone(),
+                            done_vals: Vec::new(),
+                            rest_indices: remaining_indices,
+                            env: Rc::clone(&env),
+                        });
+                        let mut all = body;
+                        all.push(first_step);
+                        Ok(begin_seq(&all, &env, k))
+                    } else {
+                        k.push(Frame::DoStep {
+                            vars,
+                            step_exprs,
+                            test,
+                            result_exprs,
+                            body,
+                            done_vals: Vec::new(),
+                            rest_indices: remaining_indices,
+                            env: Rc::clone(&env),
+                        });
+                        Ok(State::Eval(first_step, env))
+                    }
+                }
+            }
+        }
+        Frame::DoStep {
+            vars,
+            step_exprs,
+            test,
+            result_exprs,
+            body,
+            mut done_vals,
+            rest_indices,
+            env,
+        } => {
+            done_vals.push(val);
+            if rest_indices.is_empty() {
+                let mut new_vals: Vec<Value> = Vec::with_capacity(vars.len());
+                let mut step_val_iter = done_vals.into_iter();
+                for (i, var) in vars.iter().enumerate() {
+                    if step_exprs[i].is_some() {
+                        new_vals.push(
+                            step_val_iter.next().expect("step val count matches"),
+                        );
+                    } else {
+                        new_vals.push(
+                            env.get(var).expect("do var bound in env"),
+                        );
+                    }
+                }
+                let parent = Env::parent_or_self(&env);
+                let new_env = Env::extend(
+                    &parent,
+                    vars.clone(),
+                    new_vals,
+                );
+                k.push(Frame::DoTest {
+                    vars,
+                    step_exprs,
+                    test: test.clone(),
+                    result_exprs,
+                    body,
+                    env: Rc::clone(&new_env),
+                });
+                Ok(State::Eval(test, new_env))
+            } else {
+                let mut rest_indices = rest_indices;
+                let next_idx = rest_indices.remove(0);
+                let next_step = step_exprs[next_idx]
+                    .clone()
+                    .expect("filtered by step_indices");
+                k.push(Frame::DoStep {
+                    vars,
+                    step_exprs,
+                    test,
+                    result_exprs,
+                    body,
+                    done_vals,
+                    rest_indices,
+                    env: Rc::clone(&env),
+                });
+                Ok(State::Eval(next_step, env))
+            }
+        }
+        _ => unreachable!("step_ret_do called with non-Do frame"),
     }
 }
 
@@ -1123,6 +1570,123 @@ fn apply_builtin(name: &str, args: &[Value], env: &Rc<Env>) -> Result<Value, Eva
                 return Err(ErrorKind::WrongArgCount { expected: 2, got: args.len() }.into());
             }
             Ok(Value::Boolean(args[0] == args[1]))
+        }
+        "eqv?" => {
+            if args.len() != 2 {
+                return Err(ErrorKind::WrongArgCount { expected: 2, got: args.len() }.into());
+            }
+            Ok(Value::Boolean(scheme_eqv(&args[0], &args[1])))
+        }
+        "vector" => {
+            Ok(Value::Vector(Rc::new(RefCell::new(args.to_vec()))))
+        }
+        "make-vector" => {
+            if args.is_empty() || args.len() > 2 {
+                return Err(ErrorKind::WrongArgCount { expected: 1, got: args.len() }.into());
+            }
+            let len = require_int(&args[0])? as usize;
+            let fill = if args.len() == 2 {
+                args[1].clone()
+            } else {
+                Value::Integer(0)
+            };
+            Ok(Value::Vector(Rc::new(RefCell::new(vec![fill; len]))))
+        }
+        "vector-ref" => {
+            if args.len() != 2 {
+                return Err(ErrorKind::WrongArgCount { expected: 2, got: args.len() }.into());
+            }
+            let vec_ref = match &args[0] {
+                Value::Vector(v) => v,
+                other => {
+                    return Err(ErrorKind::TypeMismatch {
+                        expected: "vector".into(),
+                        got: other.to_display_string(),
+                    }
+                    .into())
+                }
+            };
+            let idx = require_int(&args[1])? as usize;
+            let v = vec_ref.borrow();
+            if idx >= v.len() {
+                return Err(ErrorKind::TypeMismatch {
+                    expected: "valid vector index".into(),
+                    got: format!("index {} for vector of length {}", idx, v.len()),
+                }
+                .into());
+            }
+            Ok(v[idx].clone())
+        }
+        "vector-set!" => {
+            if args.len() != 3 {
+                return Err(ErrorKind::WrongArgCount { expected: 3, got: args.len() }.into());
+            }
+            let vec_ref = match &args[0] {
+                Value::Vector(v) => v,
+                other => {
+                    return Err(ErrorKind::TypeMismatch {
+                        expected: "vector".into(),
+                        got: other.to_display_string(),
+                    }
+                    .into())
+                }
+            };
+            let idx = require_int(&args[1])? as usize;
+            let mut v = vec_ref.borrow_mut();
+            if idx >= v.len() {
+                return Err(ErrorKind::TypeMismatch {
+                    expected: "valid vector index".into(),
+                    got: format!("index {} for vector of length {}", idx, v.len()),
+                }
+                .into());
+            }
+            v[idx] = args[2].clone();
+            Ok(Value::Void)
+        }
+        "vector-length" => {
+            if args.len() != 1 {
+                return Err(ErrorKind::WrongArgCount { expected: 1, got: args.len() }.into());
+            }
+            match &args[0] {
+                Value::Vector(v) => Ok(Value::Integer(v.borrow().len() as i64)),
+                other => Err(ErrorKind::TypeMismatch {
+                    expected: "vector".into(),
+                    got: other.to_display_string(),
+                }
+                .into()),
+            }
+        }
+        "vector?" => {
+            if args.len() != 1 {
+                return Err(ErrorKind::WrongArgCount { expected: 1, got: args.len() }.into());
+            }
+            Ok(Value::Boolean(matches!(&args[0], Value::Vector(_))))
+        }
+        "vector->list" => {
+            if args.len() != 1 {
+                return Err(ErrorKind::WrongArgCount { expected: 1, got: args.len() }.into());
+            }
+            match &args[0] {
+                Value::Vector(v) => Ok(Value::List(v.borrow().clone())),
+                other => Err(ErrorKind::TypeMismatch {
+                    expected: "vector".into(),
+                    got: other.to_display_string(),
+                }
+                .into()),
+            }
+        }
+        "list->vector" => {
+            if args.len() != 1 {
+                return Err(ErrorKind::WrongArgCount { expected: 1, got: args.len() }.into());
+            }
+            match &args[0] {
+                Value::List(l) => Ok(Value::Vector(Rc::new(RefCell::new(l.clone())))),
+                other => Err(ErrorKind::TypeMismatch {
+                    expected: "list".into(),
+                    got: other.to_display_string(),
+                }
+                .into()),
+            }
         }
         _ => Err(ErrorKind::NotAProcedure {
             value: format!("#<procedure:{}>", name),
@@ -1893,7 +2457,24 @@ fn scheme_eq(a: &Value, b: &Value) -> bool {
         (Value::Char(x), Value::Char(y)) => x == y,
         (Value::List(x), Value::List(y)) => x.is_empty() && y.is_empty(),
         (Value::Void, Value::Void) => true,
-        (Value::Str(x, _), Value::Str(y, _)) => std::rc::Rc::ptr_eq(x, y),
+        (Value::Str(x, _), Value::Str(y, _)) => Rc::ptr_eq(x, y),
+        (Value::Vector(x), Value::Vector(y)) => Rc::ptr_eq(x, y),
+        (Value::Builtin(x), Value::Builtin(y)) => x == y,
+        _ => false,
+    }
+}
+
+/// Scheme `eqv?` — like eq? but compares numbers and characters by value.
+fn scheme_eqv(a: &Value, b: &Value) -> bool {
+    match (a, b) {
+        (Value::Integer(x), Value::Integer(y)) => x == y,
+        (Value::Boolean(x), Value::Boolean(y)) => x == y,
+        (Value::Symbol(x), Value::Symbol(y)) => x == y,
+        (Value::Char(x), Value::Char(y)) => x == y,
+        (Value::List(x), Value::List(y)) => x.is_empty() && y.is_empty(),
+        (Value::Void, Value::Void) => true,
+        (Value::Str(x, _), Value::Str(y, _)) => Rc::ptr_eq(x, y),
+        (Value::Vector(x), Value::Vector(y)) => Rc::ptr_eq(x, y),
         (Value::Builtin(x), Value::Builtin(y)) => x == y,
         _ => false,
     }
