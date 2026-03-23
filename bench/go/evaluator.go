@@ -351,6 +351,12 @@ func eval(e *expr, env *env) (*value, error) {
 				return quoteExpr(e.items[1]), nil
 			case "lambda":
 				return evalLambda(e, env)
+			case "let":
+				return evalLet(e, env)
+			case "begin":
+				return evalBegin(e.items[1:], env)
+			case "cond":
+				return evalCond(e, env)
 			}
 		}
 
@@ -512,6 +518,107 @@ func evalLambda(e *expr, env *env) (*value, error) {
 	}, nil
 }
 
+func evalLet(e *expr, env *env) (*value, error) {
+	// (let ((x 1) (y 2)) body...) or named let: (let name ((x 1)) body...)
+	if len(e.items) < 3 {
+		return nil, &EvalError{Message: fmt.Sprintf("%d:%d: let: bad syntax", e.line, e.col)}
+	}
+
+	idx := 1
+	var name string
+
+	// Named let: (let loop ((i 0)) body...)
+	if e.items[1].kind == "symbol" {
+		if len(e.items) < 4 {
+			return nil, &EvalError{Message: fmt.Sprintf("%d:%d: let: bad syntax", e.line, e.col)}
+		}
+		name = e.items[1].sval
+		idx = 2
+	}
+
+	bindingsExpr := e.items[idx]
+	body := e.items[idx+1:]
+
+	if bindingsExpr.kind != "list" {
+		return nil, &EvalError{Message: fmt.Sprintf("%d:%d: let: bad syntax", e.line, e.col)}
+	}
+
+	params := make([]string, len(bindingsExpr.items))
+	vals := make([]*value, len(bindingsExpr.items))
+	for i, b := range bindingsExpr.items {
+		if b.kind != "list" || len(b.items) != 2 {
+			return nil, &EvalError{Message: fmt.Sprintf("%d:%d: let: bad binding", e.line, e.col)}
+		}
+		params[i] = b.items[0].sval
+		v, err := eval(b.items[1], env)
+		if err != nil {
+			return nil, err
+		}
+		vals[i] = v
+	}
+
+	localEnv := newEnv(env)
+	for i, p := range params {
+		localEnv.set(p, vals[i])
+	}
+
+	if name != "" {
+		// Named let: bind the name to a lambda for recursion
+		fn := &value{
+			typ:     valLambda,
+			params:  params,
+			body:    body,
+			closure: localEnv,
+		}
+		localEnv.set(name, fn)
+	}
+
+	var result *value
+	var err error
+	for _, b := range body {
+		result, err = eval(b, localEnv)
+		if err != nil {
+			return nil, err
+		}
+	}
+	return result, nil
+}
+
+func evalBegin(exprs []*expr, env *env) (*value, error) {
+	if len(exprs) == 0 {
+		return voidVal, nil
+	}
+	var result *value
+	var err error
+	for _, e := range exprs {
+		result, err = eval(e, env)
+		if err != nil {
+			return nil, err
+		}
+	}
+	return result, nil
+}
+
+func evalCond(e *expr, env *env) (*value, error) {
+	for _, clause := range e.items[1:] {
+		if clause.kind != "list" || len(clause.items) < 2 {
+			return nil, &EvalError{Message: fmt.Sprintf("%d:%d: cond: bad clause", e.line, e.col)}
+		}
+		// else clause
+		if clause.items[0].kind == "symbol" && clause.items[0].sval == "else" {
+			return evalBegin(clause.items[1:], env)
+		}
+		test, err := eval(clause.items[0], env)
+		if err != nil {
+			return nil, err
+		}
+		if test.isTruthy() {
+			return evalBegin(clause.items[1:], env)
+		}
+	}
+	return voidVal, nil
+}
+
 func quoteExpr(e *expr) *value {
 	switch e.kind {
 	case "int":
@@ -643,6 +750,118 @@ func makeGlobalEnv() *env {
 			return nil, &EvalError{Message: fmt.Sprintf("%d:%d: not: expected 1 argument", line, col)}
 		}
 		return boolVal(!args[0].isTruthy()), nil
+	}))
+
+	// List operations
+	e.set("cons", makeBuiltin("cons", func(args []*value, line, col int) (*value, error) {
+		if len(args) != 2 {
+			return nil, &EvalError{Message: fmt.Sprintf("%d:%d: cons: expected 2 arguments", line, col)}
+		}
+		return &value{typ: valPair, car: args[0], cdr: args[1]}, nil
+	}))
+
+	e.set("car", makeBuiltin("car", func(args []*value, line, col int) (*value, error) {
+		if len(args) != 1 || args[0].typ != valPair {
+			return nil, &EvalError{Message: fmt.Sprintf("%d:%d: car: expected pair", line, col)}
+		}
+		return args[0].car, nil
+	}))
+
+	e.set("cdr", makeBuiltin("cdr", func(args []*value, line, col int) (*value, error) {
+		if len(args) != 1 || args[0].typ != valPair {
+			return nil, &EvalError{Message: fmt.Sprintf("%d:%d: cdr: expected pair", line, col)}
+		}
+		return args[0].cdr, nil
+	}))
+
+	e.set("null?", makeBuiltin("null?", func(args []*value, line, col int) (*value, error) {
+		if len(args) != 1 {
+			return nil, &EvalError{Message: fmt.Sprintf("%d:%d: null?: expected 1 argument", line, col)}
+		}
+		return boolVal(args[0].typ == valNil), nil
+	}))
+
+	e.set("list", makeBuiltin("list", func(args []*value, line, col int) (*value, error) {
+		result := nilVal
+		for i := len(args) - 1; i >= 0; i-- {
+			result = &value{typ: valPair, car: args[i], cdr: result}
+		}
+		return result, nil
+	}))
+
+	e.set("length", makeBuiltin("length", func(args []*value, line, col int) (*value, error) {
+		if len(args) != 1 {
+			return nil, &EvalError{Message: fmt.Sprintf("%d:%d: length: expected 1 argument", line, col)}
+		}
+		count := int64(0)
+		cur := args[0]
+		for cur.typ == valPair {
+			count++
+			cur = cur.cdr
+		}
+		return intVal(count), nil
+	}))
+
+	e.set("append", makeBuiltin("append", func(args []*value, line, col int) (*value, error) {
+		if len(args) == 0 {
+			return nilVal, nil
+		}
+		if len(args) == 1 {
+			return args[0], nil
+		}
+		// Append all lists
+		result := args[len(args)-1]
+		for i := len(args) - 2; i >= 0; i-- {
+			lst := args[i]
+			// Collect elements of lst
+			var elems []*value
+			cur := lst
+			for cur.typ == valPair {
+				elems = append(elems, cur.car)
+				cur = cur.cdr
+			}
+			// Build from right
+			for j := len(elems) - 1; j >= 0; j-- {
+				result = &value{typ: valPair, car: elems[j], cdr: result}
+			}
+		}
+		return result, nil
+	}))
+
+	// Type predicates
+	e.set("string?", makeBuiltin("string?", func(args []*value, line, col int) (*value, error) {
+		if len(args) != 1 {
+			return nil, &EvalError{Message: fmt.Sprintf("%d:%d: string?: expected 1 argument", line, col)}
+		}
+		return boolVal(args[0].typ == valString), nil
+	}))
+
+	e.set("number?", makeBuiltin("number?", func(args []*value, line, col int) (*value, error) {
+		if len(args) != 1 {
+			return nil, &EvalError{Message: fmt.Sprintf("%d:%d: number?: expected 1 argument", line, col)}
+		}
+		return boolVal(args[0].typ == valInt), nil
+	}))
+
+	e.set("boolean?", makeBuiltin("boolean?", func(args []*value, line, col int) (*value, error) {
+		if len(args) != 1 {
+			return nil, &EvalError{Message: fmt.Sprintf("%d:%d: boolean?: expected 1 argument", line, col)}
+		}
+		return boolVal(args[0].typ == valBool), nil
+	}))
+
+	e.set("pair?", makeBuiltin("pair?", func(args []*value, line, col int) (*value, error) {
+		if len(args) != 1 {
+			return nil, &EvalError{Message: fmt.Sprintf("%d:%d: pair?: expected 1 argument", line, col)}
+		}
+		return boolVal(args[0].typ == valPair), nil
+	}))
+
+	e.set("symbol?", makeBuiltin("symbol?", func(args []*value, line, col int) (*value, error) {
+		if len(args) != 1 {
+			return nil, &EvalError{Message: fmt.Sprintf("%d:%d: symbol?: expected 1 argument", line, col)}
+		}
+		return boolVal(args[0].typ == valSymbol), nil
 	}))
 
 	return e
