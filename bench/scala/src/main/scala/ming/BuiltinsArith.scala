@@ -137,6 +137,14 @@ private[ming] object BuiltinsArith:
         ("number?", args => typePred(args, isNumeric)),
         ("boolean?", args => typePred(args, _.isInstanceOf[BoolVal])),
         ("pair?", args => typePred(args, _.isInstanceOf[PairVal])),
+        (
+          "procedure?",
+          args =>
+            typePred(
+              args,
+              v => v.isInstanceOf[LambdaVal] || v.isInstanceOf[BuiltinVal] || v.isInstanceOf[ContinuationVal]
+            )
+        ),
         ("symbol?", args => typePred(args, _.isInstanceOf[SymbolVal])),
         ("char?", args => typePred(args, _.isInstanceOf[CharVal])),
         (

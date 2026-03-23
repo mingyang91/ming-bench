@@ -97,6 +97,30 @@ object BuiltinsChar:
               case _ => throw new EvalError("string-ci=?: not strings")
         ),
         (
+          "string>?",
+          args =>
+            if args.length != 2 then throw new EvalError("string>?: expected 2 arguments")
+            (args(0), args(1)) match
+              case (StrVal(a), StrVal(b)) => BoolVal(new String(a).compareTo(new String(b)) > 0)
+              case _                      => throw new EvalError("string>?: not strings")
+        ),
+        (
+          "string<=?",
+          args =>
+            if args.length != 2 then throw new EvalError("string<=?: expected 2 arguments")
+            (args(0), args(1)) match
+              case (StrVal(a), StrVal(b)) => BoolVal(new String(a).compareTo(new String(b)) <= 0)
+              case _                      => throw new EvalError("string<=?: not strings")
+        ),
+        (
+          "string>=?",
+          args =>
+            if args.length != 2 then throw new EvalError("string>=?: expected 2 arguments")
+            (args(0), args(1)) match
+              case (StrVal(a), StrVal(b)) => BoolVal(new String(a).compareTo(new String(b)) >= 0)
+              case _                      => throw new EvalError("string>=?: not strings")
+        ),
+        (
           "string-upcase",
           args =>
             if args.length != 1 then throw new EvalError("string-upcase: expected 1 argument")

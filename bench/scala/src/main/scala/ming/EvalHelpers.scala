@@ -25,7 +25,7 @@ private[ming] object EvalHelpers:
     case Chr(c, _)    => CharVal(c)
     case Sym(s, _)    => SymbolVal(s)
     case SList(elems, _) =>
-      elems.foldRight(NilVal: Value)((e, acc) => PairVal(exprToValue(e), acc))
+      elems.foldRight(NilVal: Value)((e, acc) => Pair(exprToValue(e), acc))
 
   def evalLambda(args: List[Expr], env: Env, pos: Option[Pos]): Value =
     args match
@@ -61,6 +61,6 @@ private[ming] object EvalHelpers:
 
   def valueToList(v: Value): List[Value] =
     v match
-      case NilVal            => Nil
-      case PairVal(car, cdr) => car :: valueToList(cdr)
-      case _                 => throw new EvalError("apply: last argument must be a list")
+      case NilVal        => Nil
+      case PairVal(cell) => cell.car :: valueToList(cell.cdr)
+      case _             => throw new EvalError("apply: last argument must be a list")

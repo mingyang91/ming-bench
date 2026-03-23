@@ -31,7 +31,7 @@ enum Value:
   case FloatVal(d: Double)
   case BoolVal(b: Boolean)
   case StrVal(chars: Array[Char])
-  case PairVal(car: Value, cdr: Value)
+  case PairVal(cell: PairCell)
   case NilVal
   case SymbolVal(name: String)
   case LambdaVal(params: List[String], restParam: Option[String], body: List[Expr], closure: Env)
@@ -52,7 +52,7 @@ enum Value:
     case StrVal(chars)         => s"\"${new String(chars)}\""
     case NilVal                => "()"
     case SymbolVal(name)       => name
-    case PairVal(_, _)         => displayList(this)
+    case PairVal(_)            => displayList(this)
     case LambdaVal(_, _, _, _) => "#<procedure>"
     case BuiltinVal(name, _)   => s"#<procedure:$name>"
     case CharVal(c)            => s"#\\$c"
@@ -77,16 +77,25 @@ enum Value:
     else d.toString
 
   private def displayList(v: Value): String =
-    val sb      = new StringBuilder("(")
+    val sb = new StringBuilder("(")
+    val seen = java.util.Collections.newSetFromMap(
+      new java.util.IdentityHashMap[PairCell, java.lang.Boolean]()
+    )
     var current = v
     var first   = true
     while current match
-        case PairVal(car, cdr) =>
-          if !first then sb.append(" ")
-          first = false
-          sb.append(car.display)
-          current = cdr
-          true
+        case PairVal(cell) =>
+          if seen.contains(cell) then
+            if !first then sb.append(" ")
+            sb.append("...")
+            false
+          else
+            seen.add(cell)
+            if !first then sb.append(" ")
+            first = false
+            sb.append(cell.car.display)
+            current = cell.cdr
+            true
         case NilVal =>
           false
         case other =>

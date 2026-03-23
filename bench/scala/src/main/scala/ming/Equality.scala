@@ -21,9 +21,23 @@ object Equality:
   def eqvCheck(a: Value, b: Value): Boolean = eqCheck(a, b)
 
   def equalCheck(a: Value, b: Value): Boolean =
+    val seen = java.util.Collections.newSetFromMap(
+      new java.util.IdentityHashMap[PairCell, java.lang.Boolean]()
+    )
+    equalRec(a, b, seen)
+
+  private def equalRec(
+    a: Value,
+    b: Value,
+    seen: java.util.Set[PairCell]
+  ): Boolean =
     (a, b) match
-      case (PairVal(a1, a2), PairVal(b1, b2)) => equalCheck(a1, b1) && equalCheck(a2, b2)
-      case (StrVal(x), StrVal(y))             => java.util.Arrays.equals(x, y)
+      case (PairVal(ca), PairVal(cb)) =>
+        if seen.contains(ca) || seen.contains(cb) then true
+        else
+          seen.add(ca); seen.add(cb)
+          equalRec(ca.car, cb.car, seen) && equalRec(ca.cdr, cb.cdr, seen)
+      case (StrVal(x), StrVal(y)) => java.util.Arrays.equals(x, y)
       case (VectorVal(x), VectorVal(y)) =>
-        x.length == y.length && x.indices.forall(i => equalCheck(x(i), y(i)))
+        x.length == y.length && x.indices.forall(i => equalRec(x(i), y(i), seen))
       case _ => eqCheck(a, b)

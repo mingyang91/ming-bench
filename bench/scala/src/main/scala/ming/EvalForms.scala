@@ -88,7 +88,9 @@ private[ming] trait EvalForms extends EvalDo:
           test,
           env,
           tv =>
-            if tv.isTruthy then evalBody(body, env, k)
+            if tv.isTruthy then
+              if body.isEmpty then k(tv) // (cond (test)) — return test value
+              else evalBody(body, env, k)
             else evalCondCps(rest, env, pos, k)
         )
       case _ => evalError("cond: bad syntax", pos)

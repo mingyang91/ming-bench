@@ -9,23 +9,17 @@ import scala.compiletime.uninitialized
 object Evaluator extends EvalForms with EvalWind with EvalExceptions:
   type K = Value => Bounce
 
-  // Depth counter for amortized trampolining
-  private var depth    = 0
-  private val MaxDepth = 128
-
-  // Pending returns for body-restart continuations
+  private var depth          = 0 // amortized trampolining
+  private val MaxDepth       = 128
   private val pendingReturns = new java.util.IdentityHashMap[Expr, Value]()
 
-  // dynamic-wind support
   case class WindEntry(inThunk: Value, outThunk: Value)
   protected var windStack: List[WindEntry] = Nil
 
-  // exception handler stack for raise/guard/with-exception-handler
   case class HandlerEntry(handler: Value => Bounce, windAtInstall: List[WindEntry])
   protected var handlerStack: List[HandlerEntry] = Nil
 
-  // Current body context, captured by call/cc for body-restart
-  private var bodyRemaining: List[Expr] = Nil
+  private var bodyRemaining: List[Expr] = Nil // call/cc body-restart context
   private var bodyEnvRef: Env           = uninitialized
   private var bodyK: K                  = uninitialized
 
@@ -91,6 +85,7 @@ object Evaluator extends EvalForms with EvalWind with EvalExceptions:
     env.define("raise", BuiltinVal("raise", dummy))
     env.define("with-exception-handler", BuiltinVal("with-exception-handler", dummy))
     env.define("call-with-values", BuiltinVal("call-with-values", dummy))
+    env.define("for-each", BuiltinVal("for-each", dummy))
     env
 
   protected def evalBody(exprs: List[Expr], env: Env, k: K): Bounce =
@@ -221,8 +216,9 @@ object Evaluator extends EvalForms with EvalWind with EvalExceptions:
         if values.length != 3 then evalError("dynamic-wind: expected 3 arguments", pos)
         applyDynamicWind(values(0), values(1), values(2), pos, k)
 
-      case BuiltinVal("apply", _) => applyBuiltinApply(values, pos, k)
-      case BuiltinVal("map", _)   => applyBuiltinMap(values, pos, k)
+      case BuiltinVal("apply", _)    => applyBuiltinApply(values, pos, k)
+      case BuiltinVal("map", _)      => applyBuiltinMap(values, pos, k)
+      case BuiltinVal("for-each", _) => applyBuiltinForEach(values, pos, k)
 
       case BuiltinVal("call-with-values", _) =>
         if values.length != 2 then evalError("call-with-values: expected 2 arguments", pos)

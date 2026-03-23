@@ -47,7 +47,7 @@ class Env(
         if values.length < names.length then
           throw new EvalError(s"expected at least ${names.length} arguments, got ${values.length}")
         val (required, extra) = values.splitAt(names.length)
-        val restList          = extra.foldRight(Value.NilVal: Value)((v, acc) => Value.PairVal(v, acc))
+        val restList          = extra.foldRight(Value.NilVal: Value)((v, acc) => Pair(v, acc))
         val bindings          = mutable.Map.from(names.zip(required))
         bindings(rest) = restList
         Env(bindings, Some(this))

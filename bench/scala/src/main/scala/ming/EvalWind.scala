@@ -90,9 +90,27 @@ private[ming] trait EvalWind:
     k: K
   ): Bounce =
     if lists.head.isEmpty then
-      val result = acc.reverse.foldRight(Value.NilVal: Value)((v, t) => Value.PairVal(v, t))
+      val result = acc.reverse.foldRight(Value.NilVal: Value)((v, t) => Pair(v, t))
       k(result)
     else
       val heads = lists.map(_.head)
       val tails = lists.map(_.tail)
       applyProc(proc, heads, pos, v => trampoline(mapLoop(proc, tails, v :: acc, pos, k)))
+
+  protected def applyBuiltinForEach(args: List[Value], pos: Option[Pos], k: K): Bounce =
+    if args.length < 2 then EvalHelpers.evalError("for-each: expected at least 2 arguments", pos)
+    val proc  = args.head
+    val lists = args.tail.map(EvalHelpers.valueToList)
+    forEachLoop(proc, lists, pos, k)
+
+  private def forEachLoop(
+    proc: Value,
+    lists: List[List[Value]],
+    pos: Option[Pos],
+    k: K
+  ): Bounce =
+    if lists.head.isEmpty then k(Value.VoidVal)
+    else
+      val heads = lists.map(_.head)
+      val tails = lists.map(_.tail)
+      applyProc(proc, heads, pos, _ => trampoline(forEachLoop(proc, tails, pos, k)))

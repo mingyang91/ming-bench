@@ -11,6 +11,7 @@ object BuiltinsExt:
   def register(env: Env): Unit =
     registerStringOps(env)
     registerNumericUtils(env)
+    BuiltinsExtra.register(env)
     BuiltinsVector.register(env)
     BuiltinsChar.register(env)
 
@@ -137,7 +138,7 @@ object BuiltinsExt:
           if args.length != 1 then throw new EvalError("string->list: expected 1 argument")
           args.head match
             case StrVal(chars) =>
-              chars.foldRight(NilVal: Value)((c, acc) => PairVal(CharVal(c), acc))
+              chars.foldRight(NilVal: Value)((c, acc) => Pair(CharVal(c), acc))
             case other => throw new EvalError(s"string->list: not a string: ${other.display}")
       ),
       (

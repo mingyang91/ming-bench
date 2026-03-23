@@ -65,7 +65,7 @@ object BuiltinsVector:
             if args.length != 1 then throw new EvalError("vector->list: expected 1 argument")
             args.head match
               case VectorVal(elems) =>
-                elems.foldRight(NilVal: Value)((v, acc) => PairVal(v, acc))
+                elems.foldRight(NilVal: Value)((v, acc) => Pair(v, acc))
               case _ => throw new EvalError("vector->list: not a vector")
         ),
         (
