@@ -5,8 +5,9 @@ import java.util.List;
 public sealed interface SchemeValue {
     record IntVal(long value, SourcePos pos) implements SchemeValue {}
     record BoolVal(boolean value, SourcePos pos) implements SchemeValue {}
-    record StringVal(char[] chars, SourcePos pos) implements SchemeValue {
-        StringVal(String value, SourcePos pos) { this(value.toCharArray(), pos); }
+    record StringVal(char[] chars, boolean mutable, SourcePos pos) implements SchemeValue {
+        StringVal(String value, SourcePos pos) { this(value.toCharArray(), false, pos); }
+        StringVal(String value, boolean mutable, SourcePos pos) { this(value.toCharArray(), mutable, pos); }
         String value() { return new String(chars); }
     }
     record SymbolVal(String name, SourcePos pos) implements SchemeValue {}

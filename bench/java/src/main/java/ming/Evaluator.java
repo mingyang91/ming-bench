@@ -49,7 +49,9 @@ public class Evaluator {
         "list-ref", "list-tail", "list?", "assoc",
         "char-alphabetic?", "char-numeric?", "char-upcase", "char-downcase",
         "char=?", "char<?",
-        "string=?", "string<?", "string-ci=?", "string-upcase", "string-downcase"
+        "string=?", "string<?", "string-ci=?", "string-upcase", "string-downcase",
+        // L14 builtins
+        "string->list", "list->string", "char->integer", "integer->char"
     };
 
     {
@@ -491,6 +493,11 @@ public class Evaluator {
             case "string-ci=?" -> builtinStringCmp(args, env, pos, (a, b) -> a.equalsIgnoreCase(b));
             case "string-upcase" -> builtinStringCase(args, env, pos, true);
             case "string-downcase" -> builtinStringCase(args, env, pos, false);
+            // L14 builtins
+            case "string->list" -> builtinStringToList(args, env, pos);
+            case "list->string" -> builtinListToString(args, env, pos);
+            case "char->integer" -> builtinCharToInteger(args, env, pos);
+            case "integer->char" -> builtinIntegerToChar(args, env, pos);
             default -> null;
         };
     }
@@ -853,9 +860,11 @@ public class Evaluator {
         if (args.size() != 3) throw posError(pos, "string-set!: need exactly 3 arguments");
         SchemeValue val = eval(args.get(0), env);
         if (!(val instanceof SchemeValue.StringVal s)) throw posError(pos, "string-set!: not a string");
+        if (!s.mutable()) throw posError(pos, "string-set!: strings are immutable");
         int idx = (int) requireInt(eval(args.get(1), env), pos);
         SchemeValue charVal = eval(args.get(2), env);
         if (!(charVal instanceof SchemeValue.CharVal c)) throw posError(pos, "string-set!: not a character");
+        if (idx < 0 || idx >= s.chars().length) throw posError(pos, "string-set!: index out of range");
         s.chars()[idx] = c.value();
         return new SchemeValue.BoolVal(false, SourcePos.NONE); // void
     }
@@ -864,7 +873,47 @@ public class Evaluator {
         if (args.size() != 1) throw posError(pos, "string-copy: need exactly 1 argument");
         SchemeValue val = eval(args.getFirst(), env);
         if (!(val instanceof SchemeValue.StringVal s)) throw posError(pos, "string-copy: not a string");
-        return new SchemeValue.StringVal(s.value(), SourcePos.NONE);
+        return new SchemeValue.StringVal(s.value(), true, SourcePos.NONE);
+    }
+
+    // --- L14 builtins ---
+
+    private SchemeValue builtinStringToList(List<SchemeValue> args, Environment env, SourcePos pos) throws EvalError {
+        if (args.size() != 1) throw posError(pos, "string->list: need exactly 1 argument");
+        SchemeValue val = eval(args.getFirst(), env);
+        if (!(val instanceof SchemeValue.StringVal s)) throw posError(pos, "string->list: not a string");
+        List<SchemeValue> chars = new java.util.ArrayList<>();
+        for (char c : s.chars()) {
+            chars.add(new SchemeValue.CharVal(c, SourcePos.NONE));
+        }
+        return new SchemeValue.ListVal(chars, SourcePos.NONE);
+    }
+
+    private SchemeValue builtinListToString(List<SchemeValue> args, Environment env, SourcePos pos) throws EvalError {
+        if (args.size() != 1) throw posError(pos, "list->string: need exactly 1 argument");
+        SchemeValue val = eval(args.getFirst(), env);
+        if (!(val instanceof SchemeValue.ListVal lst)) throw posError(pos, "list->string: not a list");
+        char[] chars = new char[lst.elements().size()];
+        for (int i = 0; i < lst.elements().size(); i++) {
+            if (!(lst.elements().get(i) instanceof SchemeValue.CharVal c))
+                throw posError(pos, "list->string: element is not a character");
+            chars[i] = c.value();
+        }
+        return new SchemeValue.StringVal(chars, false, SourcePos.NONE);
+    }
+
+    private SchemeValue builtinCharToInteger(List<SchemeValue> args, Environment env, SourcePos pos) throws EvalError {
+        if (args.size() != 1) throw posError(pos, "char->integer: need exactly 1 argument");
+        SchemeValue val = eval(args.getFirst(), env);
+        if (!(val instanceof SchemeValue.CharVal c)) throw posError(pos, "char->integer: not a character");
+        return new SchemeValue.IntVal(c.value(), SourcePos.NONE);
+    }
+
+    private SchemeValue builtinIntegerToChar(List<SchemeValue> args, Environment env, SourcePos pos) throws EvalError {
+        if (args.size() != 1) throw posError(pos, "integer->char: need exactly 1 argument");
+        SchemeValue val = eval(args.getFirst(), env);
+        long n = requireInt(val, pos);
+        return new SchemeValue.CharVal((char) n, SourcePos.NONE);
     }
 
     // --- L09 builtins ---
@@ -1069,15 +1118,17 @@ public class Evaluator {
             case "string-set!" -> {
                 if (args.size() != 3) throw posError(pos, "string-set!: need exactly 3 arguments");
                 if (!(args.get(0) instanceof SchemeValue.StringVal s)) throw posError(pos, "string-set!: not a string");
+                if (!s.mutable()) throw posError(pos, "string-set!: strings are immutable");
                 int idx = (int) requireInt(args.get(1), pos);
                 if (!(args.get(2) instanceof SchemeValue.CharVal c)) throw posError(pos, "string-set!: not a character");
+                if (idx < 0 || idx >= s.chars().length) throw posError(pos, "string-set!: index out of range");
                 s.chars()[idx] = c.value();
-                yield new SchemeValue.BoolVal(false, SourcePos.NONE);
+                yield new SchemeValue.BoolVal(false, SourcePos.NONE); // void
             }
             case "string-copy" -> {
                 if (args.size() != 1) throw posError(pos, "string-copy: need exactly 1 argument");
                 if (!(args.getFirst() instanceof SchemeValue.StringVal s)) throw posError(pos, "string-copy: not a string");
-                yield new SchemeValue.StringVal(s.value(), SourcePos.NONE);
+                yield new SchemeValue.StringVal(s.value(), true, SourcePos.NONE);
             }
             case "string?" -> typePredEvaled(args, SchemeValue.StringVal.class, pos);
             case "number?" -> typePredEvaled(args, SchemeValue.IntVal.class, pos);
@@ -1294,6 +1345,35 @@ public class Evaluator {
                 if (args.size() != 1) throw posError(pos, "string-downcase: need exactly 1 argument");
                 if (!(args.get(0) instanceof SchemeValue.StringVal s)) throw posError(pos, "string-downcase: not a string");
                 yield new SchemeValue.StringVal(s.value().toLowerCase(), SourcePos.NONE);
+            }
+            // L14 builtins
+            case "string->list" -> {
+                if (args.size() != 1) throw posError(pos, "string->list: need exactly 1 argument");
+                if (!(args.get(0) instanceof SchemeValue.StringVal s)) throw posError(pos, "string->list: not a string");
+                List<SchemeValue> chars = new java.util.ArrayList<>();
+                for (char c : s.chars()) chars.add(new SchemeValue.CharVal(c, SourcePos.NONE));
+                yield new SchemeValue.ListVal(chars, SourcePos.NONE);
+            }
+            case "list->string" -> {
+                if (args.size() != 1) throw posError(pos, "list->string: need exactly 1 argument");
+                if (!(args.get(0) instanceof SchemeValue.ListVal lst)) throw posError(pos, "list->string: not a list");
+                char[] cs = new char[lst.elements().size()];
+                for (int i = 0; i < lst.elements().size(); i++) {
+                    if (!(lst.elements().get(i) instanceof SchemeValue.CharVal cv))
+                        throw posError(pos, "list->string: element is not a character");
+                    cs[i] = cv.value();
+                }
+                yield new SchemeValue.StringVal(cs, false, SourcePos.NONE);
+            }
+            case "char->integer" -> {
+                if (args.size() != 1) throw posError(pos, "char->integer: need exactly 1 argument");
+                if (!(args.get(0) instanceof SchemeValue.CharVal c)) throw posError(pos, "char->integer: not a character");
+                yield new SchemeValue.IntVal(c.value(), SourcePos.NONE);
+            }
+            case "integer->char" -> {
+                if (args.size() != 1) throw posError(pos, "integer->char: need exactly 1 argument");
+                long n = requireInt(args.get(0), pos);
+                yield new SchemeValue.CharVal((char) n, SourcePos.NONE);
             }
             default -> throw posError(pos, "unknown builtin: " + name);
         };
