@@ -9,6 +9,8 @@ pub enum EvalError {
     Type(String),
     #[error("arity error: {0}")]
     Arity(String),
+    #[error("scheme raise")]
+    SchemeRaise,
     #[error("{inner} at {line}:{col}")]
     WithPosition {
         inner: Box<EvalError>,

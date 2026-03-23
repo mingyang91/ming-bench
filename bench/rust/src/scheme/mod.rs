@@ -10,6 +10,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 thread_local! {
     static OUTPUT_BUF: RefCell<String> = RefCell::new(String::new());
     static WIND_STACK: RefCell<Vec<WindEntry>> = RefCell::new(Vec::new());
+    static RAISED_VALUE: RefCell<Option<Value>> = RefCell::new(None);
 }
 
 static WIND_ID_COUNTER: AtomicUsize = AtomicUsize::new(0);
@@ -27,6 +28,10 @@ fn wind_stack_snapshot() -> Vec<WindEntry> {
 
 fn wind_stack_reset() {
     WIND_STACK.with(|ws| ws.borrow_mut().clear());
+}
+
+fn raised_value_reset() {
+    RAISED_VALUE.with(|rv| *rv.borrow_mut() = None);
 }
 
 fn output_write(s: &str) {
@@ -66,6 +71,8 @@ enum Value {
     CallCC,
     DynamicWind,
     SchemeApply,
+    Raise,
+    WithExceptionHandler,
     Continuation(Rc<Vec<Frame>>, Rc<Vec<WindEntry>>),
     Vector(Rc<RefCell<Vec<Value>>>),
     Macro {
@@ -91,6 +98,8 @@ impl std::fmt::Debug for Value {
             Value::CallCC => write!(f, "CallCC"),
             Value::DynamicWind => write!(f, "DynamicWind"),
             Value::SchemeApply => write!(f, "SchemeApply"),
+            Value::Raise => write!(f, "Raise"),
+            Value::WithExceptionHandler => write!(f, "WithExceptionHandler"),
             Value::Continuation(..) => write!(f, "Continuation(...)"),
             Value::Vector(v) => write!(f, "Vector({:?})", v.borrow()),
             Value::Macro { .. } => write!(f, "Macro(...)"),
@@ -113,6 +122,8 @@ impl PartialEq for Value {
             (Value::CallCC, Value::CallCC) => true,
             (Value::DynamicWind, Value::DynamicWind) => true,
             (Value::SchemeApply, Value::SchemeApply) => true,
+            (Value::Raise, Value::Raise) => true,
+            (Value::WithExceptionHandler, Value::WithExceptionHandler) => true,
             _ => false,
         }
     }
@@ -178,7 +189,7 @@ impl std::fmt::Display for Value {
                 }
                 write!(f, ")")
             }
-            Value::Lambda { .. } | Value::Builtin(..) | Value::CallCC | Value::DynamicWind | Value::SchemeApply | Value::Continuation(..) => write!(f, "#<procedure>"),
+            Value::Lambda { .. } | Value::Builtin(..) | Value::CallCC | Value::DynamicWind | Value::SchemeApply | Value::Raise | Value::WithExceptionHandler | Value::Continuation(..) => write!(f, "#<procedure>"),
             Value::Macro { .. } => write!(f, "#<macro>"),
         }
     }
@@ -349,6 +360,8 @@ fn default_env() -> Env {
     env_set(&env, "call/cc".to_string(), Value::CallCC);
     env_set(&env, "call-with-current-continuation".to_string(), Value::CallCC);
     env_set(&env, "dynamic-wind".to_string(), Value::DynamicWind);
+    env_set(&env, "raise".to_string(), Value::Raise);
+    env_set(&env, "with-exception-handler".to_string(), Value::WithExceptionHandler);
     // Install Scheme-level prelude (map, etc.)
     let prelude = r#"
 (define (__map1 f lst)
@@ -847,6 +860,11 @@ enum Frame {
     DynamicWindAfterBody { out_thunk: Value },
     DynamicWindAfterOut { result: Value },
     WindTransition { actions: Vec<WindAction>, value: Value },
+    Guard { var: String, clauses: Vec<Expr>, env: Env },
+    ExceptionHandler { handler: Value },
+    RaiseHandlerReturn { raised_value: Value },
+    GuardTest { raised_value: Value, body: Vec<Expr>, rest: Vec<Expr>, env: Env },
+    GuardClauseEval { clauses: Vec<Expr>, raised_value: Value, env: Env },
 }
 
 enum Act {
@@ -867,17 +885,25 @@ fn eval_top(exprs: &[Expr], env: &Env) -> Result<Value, EvalError> {
     let mut last_line = 0usize;
     let mut last_col = 0usize;
     loop {
-        act = match act {
+        let result = match act {
             Act::Ev(e, env) => {
                 last_line = e.line;
                 last_col = e.col;
-                step_eval(e, env, &mut stack).map_err(|e| e.at(last_line, last_col))?
+                step_eval(e, env, &mut stack)
             }
             Act::Ret(val) => match stack.pop() {
-                Some(frame) => step_ret(val, frame, &mut stack).map_err(|e| e.at(last_line, last_col))?,
+                Some(frame) => step_ret(val, frame, &mut stack),
                 None => return Ok(val),
             },
-            Act::Ap(func, args) => step_apply(func, args, &mut stack).map_err(|e| e.at(last_line, last_col))?,
+            Act::Ap(func, args) => step_apply(func, args, &mut stack),
+        };
+        act = match result {
+            Ok(next_act) => next_act,
+            Err(e) if is_scheme_raise(&e) => {
+                let raised_val = RAISED_VALUE.with(|rv| rv.borrow_mut().take().unwrap());
+                handle_raise(&mut stack, raised_val).map_err(|e| e.at(last_line, last_col))?
+            }
+            Err(e) => return Err(e.at(last_line, last_col)),
         };
     }
 }
@@ -940,6 +966,7 @@ fn step_eval(expr: Expr, env: Env, stack: &mut Vec<Frame>) -> Result<Act, EvalEr
                     "case" => return sf_case(&elems[1..], env, stack),
                     "do" => return sf_do(&elems[1..], env, stack),
                     "when" => return sf_when(&elems[1..], env, stack),
+                    "guard" => return sf_guard(&elems[1..], env, stack),
                     "define-syntax" => {
                         if elems.len() != 3 {
                             return Err(EvalError::Arity("define-syntax expects 2 arguments".into()));
@@ -1210,6 +1237,34 @@ fn step_ret(val: Value, frame: Frame, stack: &mut Vec<Frame>) -> Result<Act, Eva
                 }
             }
         }
+        Frame::Guard { .. } => {
+            // Body completed normally; return body's value
+            Ok(Act::Ret(val))
+        }
+        Frame::ExceptionHandler { .. } => {
+            // Thunk completed normally; discard handler, return value
+            Ok(Act::Ret(val))
+        }
+        Frame::RaiseHandlerReturn { raised_value } => {
+            // Handler returned normally without escaping; re-raise
+            RAISED_VALUE.with(|rv| *rv.borrow_mut() = Some(raised_value));
+            Err(EvalError::SchemeRaise)
+        }
+        Frame::GuardTest { raised_value, body, rest, env } => {
+            if val != Value::Boolean(false) {
+                if body.is_empty() {
+                    Ok(Act::Ret(val))
+                } else {
+                    sf_seq(&body, env, stack)
+                }
+            } else {
+                eval_guard_clauses_inner(&rest, raised_value, env, stack)
+            }
+        }
+        Frame::GuardClauseEval { clauses, raised_value, env } => {
+            // Wind transitions completed; now evaluate guard clauses
+            eval_guard_clauses_inner(&clauses, raised_value, env, stack)
+        }
     }
 }
 
@@ -1259,6 +1314,22 @@ fn step_apply(func: Value, args: Vec<Value>, stack: &mut Vec<Frame>) -> Result<A
             let call_in = in_thunk.clone();
             stack.push(Frame::DynamicWindAfterIn { body_thunk, out_thunk, in_thunk, wind_id });
             Ok(Act::Ap(call_in, vec![]))
+        }
+        Value::Raise => {
+            if args.len() != 1 {
+                return Err(EvalError::Arity("raise expects 1 argument".into()));
+            }
+            RAISED_VALUE.with(|rv| *rv.borrow_mut() = Some(args.into_iter().next().unwrap()));
+            Err(EvalError::SchemeRaise)
+        }
+        Value::WithExceptionHandler => {
+            if args.len() != 2 {
+                return Err(EvalError::Arity("with-exception-handler expects 2 arguments".into()));
+            }
+            let handler = args[0].clone();
+            let thunk = args[1].clone();
+            stack.push(Frame::ExceptionHandler { handler });
+            Ok(Act::Ap(thunk, vec![]))
         }
         Value::SchemeApply => {
             if args.len() < 2 {
@@ -1372,6 +1443,120 @@ fn eval_lambda(args: &[Expr], env: &Env) -> Result<Value, EvalError> {
         body,
         env: env.clone(),
     })
+}
+
+fn is_scheme_raise(e: &EvalError) -> bool {
+    match e {
+        EvalError::SchemeRaise => true,
+        EvalError::WithPosition { inner, .. } => is_scheme_raise(inner),
+        _ => false,
+    }
+}
+
+fn handle_raise(stack: &mut Vec<Frame>, raised_val: Value) -> Result<Act, EvalError> {
+    // Search stack from top for nearest Guard or ExceptionHandler
+    let mut handler_idx = None;
+    for i in (0..stack.len()).rev() {
+        match &stack[i] {
+            Frame::Guard { .. } | Frame::ExceptionHandler { .. } => {
+                handler_idx = Some(i);
+                break;
+            }
+            _ => {}
+        }
+    }
+
+    let idx = match handler_idx {
+        Some(i) => i,
+        None => return Err(EvalError::Type(format!("unhandled exception: {}", raised_val))),
+    };
+
+    let is_guard = matches!(&stack[idx], Frame::Guard { .. });
+
+    if !is_guard {
+        // ExceptionHandler: remove it, call handler with stack intact
+        let frame = stack.remove(idx);
+        let handler = match frame {
+            Frame::ExceptionHandler { handler } => handler,
+            _ => unreachable!(),
+        };
+        stack.push(Frame::RaiseHandlerReturn { raised_value: raised_val.clone() });
+        Ok(Act::Ap(handler, vec![raised_val]))
+    } else {
+        // Guard: pop all frames above and including Guard, collect wind unwinds
+        let mut out_thunks = Vec::new();
+        while stack.len() > idx + 1 {
+            let frame = stack.pop().unwrap();
+            if let Frame::DynamicWindAfterBody { out_thunk } = frame {
+                out_thunks.push(out_thunk);
+            }
+        }
+        // Pop the Guard frame itself
+        let guard_frame = stack.pop().unwrap();
+        let (var, clauses, env) = match guard_frame {
+            Frame::Guard { var, clauses, env } => (var, clauses, env),
+            _ => unreachable!(),
+        };
+
+        let guard_env = new_env(Some(env));
+        env_set(&guard_env, var, raised_val.clone());
+
+        if out_thunks.is_empty() {
+            eval_guard_clauses_inner(&clauses, raised_val, guard_env, stack)
+        } else {
+            stack.push(Frame::GuardClauseEval { clauses, raised_value: raised_val, env: guard_env });
+            let actions: Vec<WindAction> = out_thunks.into_iter().map(WindAction::Unwind).collect();
+            stack.push(Frame::WindTransition { actions, value: Value::Void });
+            Ok(Act::Ret(Value::Void))
+        }
+    }
+}
+
+fn eval_guard_clauses_inner(clauses: &[Expr], raised_value: Value, env: Env, stack: &mut Vec<Frame>) -> Result<Act, EvalError> {
+    if clauses.is_empty() {
+        // No clause matched; re-raise
+        RAISED_VALUE.with(|rv| *rv.borrow_mut() = Some(raised_value));
+        return Err(EvalError::SchemeRaise);
+    }
+    match &clauses[0].kind {
+        ExprKind::List(parts) if !parts.is_empty() => {
+            if let ExprKind::Symbol(s) = &parts[0].kind {
+                if s == "else" {
+                    return sf_seq(&parts[1..], env, stack);
+                }
+            }
+            stack.push(Frame::GuardTest {
+                raised_value,
+                body: parts[1..].to_vec(),
+                rest: clauses[1..].to_vec(),
+                env: env.clone(),
+            });
+            Ok(Act::Ev(parts[0].clone(), env))
+        }
+        _ => Err(EvalError::Type("guard: invalid clause".into())),
+    }
+}
+
+fn sf_guard(args: &[Expr], env: Env, stack: &mut Vec<Frame>) -> Result<Act, EvalError> {
+    if args.is_empty() {
+        return Err(EvalError::Arity("guard requires arguments".into()));
+    }
+    let guard_spec = match &args[0].kind {
+        ExprKind::List(spec) => spec,
+        _ => return Err(EvalError::Type("guard: expected (var clause ...)".into())),
+    };
+    if guard_spec.is_empty() {
+        return Err(EvalError::Type("guard: expected variable".into()));
+    }
+    let var = match &guard_spec[0].kind {
+        ExprKind::Symbol(s) => s.clone(),
+        _ => return Err(EvalError::Type("guard: expected symbol as variable".into())),
+    };
+    let clauses = guard_spec[1..].to_vec();
+    let body = args[1..].to_vec();
+
+    stack.push(Frame::Guard { var, clauses, env: env.clone() });
+    sf_seq(&body, env, stack)
 }
 
 fn sf_define(args: &[Expr], env: Env, stack: &mut Vec<Frame>) -> Result<Act, EvalError> {
@@ -2418,6 +2603,7 @@ fn builtin_memq(args: &[Value]) -> Result<Value, EvalError> {
 /// representation of the last result.
 pub fn eval_str(input: &str) -> Result<String, EvalError> {
     wind_stack_reset();
+    raised_value_reset();
     let mut parser = Parser::new(input);
     let exprs = parser.parse_all()?;
     if exprs.is_empty() {
@@ -2434,6 +2620,7 @@ pub fn eval_str_with_output(input: &str) -> Result<(String, String), EvalError> 
     // Clear any stale state
     output_take();
     wind_stack_reset();
+    raised_value_reset();
     let mut parser = Parser::new(input);
     let exprs = parser.parse_all()?;
     if exprs.is_empty() {
