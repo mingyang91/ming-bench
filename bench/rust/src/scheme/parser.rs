@@ -17,6 +17,7 @@ pub fn parse(input: &str) -> Result<Vec<Value>, EvalError> {
 enum Token {
     LParen,
     RParen,
+    Quote,
     Symbol(String),
     Int(i64),
     Bool(bool),
@@ -70,6 +71,10 @@ fn tokenize(input: &str) -> Result<Vec<Token>, EvalError> {
                 }
                 i += 1; // closing quote
                 tokens.push(Token::String(s));
+            }
+            '\'' => {
+                tokens.push(Token::Quote);
+                i += 1;
             }
             '#' => {
                 if i + 1 < chars.len() {
@@ -132,6 +137,10 @@ fn parse_expr(tokens: &[Token], pos: usize) -> Result<(Value, usize), EvalError>
                 i = next;
             }
             Err(EvalError::Parse { msg: "unclosed parenthesis".into() })
+        }
+        Token::Quote => {
+            let (inner, next) = parse_expr(tokens, pos + 1)?;
+            Ok((Value::List(vec![Value::Symbol("quote".into()), inner]), next))
         }
         Token::RParen => Err(EvalError::Parse { msg: "unexpected ')'".into() }),
     }
