@@ -6,8 +6,10 @@ import java.util.List;
 public class Evaluator {
 
     private final Environment globalEnv = new Environment();
+    private StringBuilder outputBuffer = new StringBuilder();
 
     public String evalStr(String input) throws EvalError {
+        outputBuffer.setLength(0);
         var parser = new Parser(input);
         List<SchemeValue> exprs = parser.parseAll();
         if (exprs.isEmpty()) throw new EvalError("no expressions");
@@ -19,7 +21,15 @@ public class Evaluator {
     }
 
     public EvalResult evalStrWithOutput(String input) throws EvalError {
-        throw new EvalError("not implemented");
+        outputBuffer.setLength(0);
+        var parser = new Parser(input);
+        List<SchemeValue> exprs = parser.parseAll();
+        if (exprs.isEmpty()) throw new EvalError("no expressions");
+        SchemeValue result = null;
+        for (SchemeValue expr : exprs) {
+            result = eval(expr, globalEnv);
+        }
+        return new EvalResult(result.display(), outputBuffer.toString());
     }
 
     private static EvalError posError(SourcePos pos, String msg) {
@@ -32,6 +42,7 @@ public class Evaluator {
             case SchemeValue.BoolVal v -> v;
             case SchemeValue.StringVal v -> v;
             case SchemeValue.LambdaVal v -> v;
+            case SchemeValue.CharVal v -> v;
             case SchemeValue.SymbolVal v -> {
                 try {
                     yield env.lookup(v.name());
@@ -192,6 +203,19 @@ public class Evaluator {
             case "boolean?" -> typePred(args, env, SchemeValue.BoolVal.class, pos);
             case "pair?" -> builtinPairQ(args, env, pos);
             case "symbol?" -> typePred(args, env, SchemeValue.SymbolVal.class, pos);
+            case "char?" -> typePred(args, env, SchemeValue.CharVal.class, pos);
+            // L05 builtins
+            case "display" -> builtinDisplay(args, env, pos);
+            case "write" -> builtinWrite(args, env, pos);
+            case "newline" -> builtinNewline(args, pos);
+            case "string-append" -> builtinStringAppend(args, env, pos);
+            case "string-length" -> builtinStringLength(args, env, pos);
+            case "substring" -> builtinSubstring(args, env, pos);
+            case "string->number" -> builtinStringToNumber(args, env, pos);
+            case "number->string" -> builtinNumberToString(args, env, pos);
+            case "symbol->string" -> builtinSymbolToString(args, env, pos);
+            case "string->symbol" -> builtinStringToSymbol(args, env, pos);
+            case "string-ref" -> builtinStringRef(args, env, pos);
             default -> null;
         };
     }
@@ -437,6 +461,93 @@ public class Evaluator {
         if (args.size() != 1) throw posError(pos, "type predicate: need exactly 1 argument");
         SchemeValue val = eval(args.getFirst(), env);
         return new SchemeValue.BoolVal(type.isInstance(val), SourcePos.NONE);
+    }
+
+    // --- L05 builtins ---
+
+    private SchemeValue builtinDisplay(List<SchemeValue> args, Environment env, SourcePos pos) throws EvalError {
+        if (args.size() != 1) throw posError(pos, "display: need exactly 1 argument");
+        SchemeValue val = eval(args.getFirst(), env);
+        outputBuffer.append(val.displayOutput());
+        return new SchemeValue.BoolVal(false, SourcePos.NONE); // void
+    }
+
+    private SchemeValue builtinWrite(List<SchemeValue> args, Environment env, SourcePos pos) throws EvalError {
+        if (args.size() != 1) throw posError(pos, "write: need exactly 1 argument");
+        SchemeValue val = eval(args.getFirst(), env);
+        outputBuffer.append(val.display());
+        return new SchemeValue.BoolVal(false, SourcePos.NONE); // void
+    }
+
+    private SchemeValue builtinNewline(List<SchemeValue> args, SourcePos pos) throws EvalError {
+        if (!args.isEmpty()) throw posError(pos, "newline: takes no arguments");
+        outputBuffer.append('\n');
+        return new SchemeValue.BoolVal(false, SourcePos.NONE); // void
+    }
+
+    private SchemeValue builtinStringAppend(List<SchemeValue> args, Environment env, SourcePos pos) throws EvalError {
+        var sb = new StringBuilder();
+        for (SchemeValue arg : args) {
+            SchemeValue val = eval(arg, env);
+            if (!(val instanceof SchemeValue.StringVal s)) throw posError(pos, "string-append: not a string");
+            sb.append(s.value());
+        }
+        return new SchemeValue.StringVal(sb.toString(), SourcePos.NONE);
+    }
+
+    private SchemeValue builtinStringLength(List<SchemeValue> args, Environment env, SourcePos pos) throws EvalError {
+        if (args.size() != 1) throw posError(pos, "string-length: need exactly 1 argument");
+        SchemeValue val = eval(args.getFirst(), env);
+        if (!(val instanceof SchemeValue.StringVal s)) throw posError(pos, "string-length: not a string");
+        return new SchemeValue.IntVal(s.value().length(), SourcePos.NONE);
+    }
+
+    private SchemeValue builtinSubstring(List<SchemeValue> args, Environment env, SourcePos pos) throws EvalError {
+        if (args.size() != 3) throw posError(pos, "substring: need exactly 3 arguments");
+        SchemeValue val = eval(args.get(0), env);
+        if (!(val instanceof SchemeValue.StringVal s)) throw posError(pos, "substring: not a string");
+        int start = (int) requireInt(eval(args.get(1), env), pos);
+        int end = (int) requireInt(eval(args.get(2), env), pos);
+        return new SchemeValue.StringVal(s.value().substring(start, end), SourcePos.NONE);
+    }
+
+    private SchemeValue builtinStringToNumber(List<SchemeValue> args, Environment env, SourcePos pos) throws EvalError {
+        if (args.size() != 1) throw posError(pos, "string->number: need exactly 1 argument");
+        SchemeValue val = eval(args.getFirst(), env);
+        if (!(val instanceof SchemeValue.StringVal s)) throw posError(pos, "string->number: not a string");
+        try {
+            return new SchemeValue.IntVal(Long.parseLong(s.value()), SourcePos.NONE);
+        } catch (NumberFormatException e) {
+            return new SchemeValue.BoolVal(false, SourcePos.NONE);
+        }
+    }
+
+    private SchemeValue builtinNumberToString(List<SchemeValue> args, Environment env, SourcePos pos) throws EvalError {
+        if (args.size() != 1) throw posError(pos, "number->string: need exactly 1 argument");
+        SchemeValue val = eval(args.getFirst(), env);
+        return new SchemeValue.StringVal(String.valueOf(requireInt(val, pos)), SourcePos.NONE);
+    }
+
+    private SchemeValue builtinSymbolToString(List<SchemeValue> args, Environment env, SourcePos pos) throws EvalError {
+        if (args.size() != 1) throw posError(pos, "symbol->string: need exactly 1 argument");
+        SchemeValue val = eval(args.getFirst(), env);
+        if (!(val instanceof SchemeValue.SymbolVal s)) throw posError(pos, "symbol->string: not a symbol");
+        return new SchemeValue.StringVal(s.name(), SourcePos.NONE);
+    }
+
+    private SchemeValue builtinStringToSymbol(List<SchemeValue> args, Environment env, SourcePos pos) throws EvalError {
+        if (args.size() != 1) throw posError(pos, "string->symbol: need exactly 1 argument");
+        SchemeValue val = eval(args.getFirst(), env);
+        if (!(val instanceof SchemeValue.StringVal s)) throw posError(pos, "string->symbol: not a string");
+        return new SchemeValue.SymbolVal(s.value(), SourcePos.NONE);
+    }
+
+    private SchemeValue builtinStringRef(List<SchemeValue> args, Environment env, SourcePos pos) throws EvalError {
+        if (args.size() != 2) throw posError(pos, "string-ref: need exactly 2 arguments");
+        SchemeValue val = eval(args.get(0), env);
+        if (!(val instanceof SchemeValue.StringVal s)) throw posError(pos, "string-ref: not a string");
+        int idx = (int) requireInt(eval(args.get(1), env), pos);
+        return new SchemeValue.CharVal(s.value().charAt(idx), SourcePos.NONE);
     }
 
     private long requireInt(SchemeValue v, SourcePos pos) throws EvalError {

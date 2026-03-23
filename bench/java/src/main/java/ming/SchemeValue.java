@@ -9,6 +9,7 @@ public sealed interface SchemeValue {
     record SymbolVal(String name, SourcePos pos) implements SchemeValue {}
     record ListVal(List<SchemeValue> elements, SourcePos pos) implements SchemeValue {}
     record LambdaVal(List<String> params, List<SchemeValue> body, Environment env) implements SchemeValue {}
+    record CharVal(char value, SourcePos pos) implements SchemeValue {}
 
     default SourcePos sourcePos() {
         return switch (this) {
@@ -18,6 +19,7 @@ public sealed interface SchemeValue {
             case SymbolVal v -> v.pos();
             case ListVal v -> v.pos();
             case LambdaVal v -> SourcePos.NONE;
+            case CharVal v -> v.pos();
         };
     }
 
@@ -25,6 +27,7 @@ public sealed interface SchemeValue {
         return !(this instanceof BoolVal b && !b.value());
     }
 
+    /** Write representation (strings quoted). */
     default String display() {
         return switch (this) {
             case IntVal v -> String.valueOf(v.value());
@@ -42,6 +45,25 @@ public sealed interface SchemeValue {
                 yield sb.toString();
             }
             case LambdaVal v -> "#<procedure>";
+            case CharVal v -> "#\\" + v.value();
+        };
+    }
+
+    /** Display representation (strings unquoted). */
+    default String displayOutput() {
+        return switch (this) {
+            case StringVal v -> v.value();
+            case ListVal v -> {
+                if (v.elements().isEmpty()) yield "()";
+                var sb = new StringBuilder("(");
+                for (int i = 0; i < v.elements().size(); i++) {
+                    if (i > 0) sb.append(' ');
+                    sb.append(v.elements().get(i).displayOutput());
+                }
+                sb.append(')');
+                yield sb.toString();
+            }
+            default -> display();
         };
     }
 }
