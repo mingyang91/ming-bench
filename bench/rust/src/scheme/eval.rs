@@ -186,7 +186,13 @@ pub fn eval(expr: &Value, env: &Env) -> Result<Value, EvalError> {
                     | "string->number" | "number->string"
                     | "symbol->string" | "string->symbol"
                     | "string-ref" | "string-set!" | "string-copy"
-                    | "char?" | "apply"
+                    | "char?" | "char-alphabetic?" | "char-numeric?"
+                    | "char-upcase" | "char-downcase" | "char=?" | "char<?"
+                    | "string=?" | "string<?" | "string-ci=?"
+                    | "string-upcase" | "string-downcase"
+                    | "expt" | "list-ref" | "list-tail" | "list?"
+                    | "assoc" | "map" | "eq?" | "equal?"
+                    | "apply"
                     | "call/cc" | "call-with-current-continuation" => Ok(current_expr.clone()),
                     _ => Err(EvalError::UnboundVariable {
                         name: name.clone(),
@@ -683,6 +689,25 @@ fn apply_builtin(name: &str, args: &[Value], span: Span, env: &Env) -> Result<Va
         "string-set!" => builtin_string_set(args, span),
         "string-copy" => builtin_string_copy(args, span),
         "char?" => Ok(Value::bool(matches!(args, [Value::Char(_, _)]))),
+        "expt" => builtin_expt(args, span),
+        "list-ref" => builtin_list_ref(args, span),
+        "list-tail" => builtin_list_tail(args, span),
+        "list?" => builtin_list_pred(args, span),
+        "assoc" => builtin_assoc(args, span),
+        "map" => builtin_map(args, span, env),
+        "eq?" => builtin_eq(args, span),
+        "equal?" => builtin_equal(args, span),
+        "char-alphabetic?" => builtin_char_alphabetic(args, span),
+        "char-numeric?" => builtin_char_numeric(args, span),
+        "char-upcase" => builtin_char_upcase(args, span),
+        "char-downcase" => builtin_char_downcase(args, span),
+        "char=?" => builtin_char_eq(args, span),
+        "char<?" => builtin_char_lt(args, span),
+        "string=?" => builtin_string_eq(args, span),
+        "string<?" => builtin_string_lt(args, span),
+        "string-ci=?" => builtin_string_ci_eq(args, span),
+        "string-upcase" => builtin_string_upcase(args, span),
+        "string-downcase" => builtin_string_downcase(args, span),
         _ => Err(EvalError::UnboundVariable {
             name: name.to_string(),
             span,
@@ -1485,4 +1510,451 @@ fn builtin_string_copy(args: &[Value], span: Span) -> Result<Value, EvalError> {
         });
     };
     Ok(Value::string(s.borrow().clone()))
+}
+
+fn builtin_expt(args: &[Value], span: Span) -> Result<Value, EvalError> {
+    let nums = require_integers(args)?;
+    if nums.len() != 2 {
+        return Err(EvalError::WrongArgCount {
+            expected: "2".to_string(),
+            got: nums.len(),
+            span,
+        });
+    }
+    let base = nums[0];
+    let exp = nums[1];
+    if exp < 0 {
+        return Ok(Value::int(0)); // integer division truncates
+    }
+    Ok(Value::int(base.pow(exp as u32)))
+}
+
+fn builtin_list_ref(args: &[Value], span: Span) -> Result<Value, EvalError> {
+    if args.len() != 2 {
+        return Err(EvalError::WrongArgCount {
+            expected: "2".to_string(),
+            got: args.len(),
+            span,
+        });
+    }
+    let Value::List(elems, _) = &args[0] else {
+        return Err(EvalError::TypeMismatch {
+            expected: "list".to_string(),
+            got: format!("{}", args[0]),
+            span: args[0].span(),
+        });
+    };
+    let Value::Integer(idx, _) = &args[1] else {
+        return Err(EvalError::TypeMismatch {
+            expected: "integer".to_string(),
+            got: format!("{}", args[1]),
+            span: args[1].span(),
+        });
+    };
+    let idx = *idx as usize;
+    elems.get(idx).cloned().ok_or_else(|| EvalError::TypeMismatch {
+        expected: "valid index".to_string(),
+        got: format!("index {idx} out of bounds"),
+        span,
+    })
+}
+
+fn builtin_list_tail(args: &[Value], span: Span) -> Result<Value, EvalError> {
+    if args.len() != 2 {
+        return Err(EvalError::WrongArgCount {
+            expected: "2".to_string(),
+            got: args.len(),
+            span,
+        });
+    }
+    let Value::List(elems, _) = &args[0] else {
+        return Err(EvalError::TypeMismatch {
+            expected: "list".to_string(),
+            got: format!("{}", args[0]),
+            span: args[0].span(),
+        });
+    };
+    let Value::Integer(idx, _) = &args[1] else {
+        return Err(EvalError::TypeMismatch {
+            expected: "integer".to_string(),
+            got: format!("{}", args[1]),
+            span: args[1].span(),
+        });
+    };
+    let idx = *idx as usize;
+    if idx > elems.len() {
+        return Err(EvalError::TypeMismatch {
+            expected: "valid index".to_string(),
+            got: format!("index {idx} out of bounds"),
+            span,
+        });
+    }
+    Ok(Value::list(elems[idx..].to_vec()))
+}
+
+fn builtin_list_pred(args: &[Value], span: Span) -> Result<Value, EvalError> {
+    if args.len() != 1 {
+        return Err(EvalError::WrongArgCount {
+            expected: "1".to_string(),
+            got: args.len(),
+            span,
+        });
+    }
+    let is_list = match &args[0] {
+        Value::List(elems, _) => {
+            // A proper list has no dot notation
+            // Our representation: improper pairs are [a, ".", b]
+            !elems.iter().any(|e| matches!(e, Value::Symbol(s, _) if s == "."))
+        }
+        _ => false,
+    };
+    Ok(Value::bool(is_list))
+}
+
+fn values_equal(a: &Value, b: &Value) -> bool {
+    match (a, b) {
+        (Value::Integer(x, _), Value::Integer(y, _)) => x == y,
+        (Value::Boolean(x, _), Value::Boolean(y, _)) => x == y,
+        (Value::String(x, _), Value::String(y, _)) => *x.borrow() == *y.borrow(),
+        (Value::Symbol(x, _), Value::Symbol(y, _)) => x == y,
+        (Value::Char(x, _), Value::Char(y, _)) => x == y,
+        (Value::List(xs, _), Value::List(ys, _)) => {
+            xs.len() == ys.len() && xs.iter().zip(ys.iter()).all(|(a, b)| values_equal(a, b))
+        }
+        _ => false,
+    }
+}
+
+fn builtin_assoc(args: &[Value], span: Span) -> Result<Value, EvalError> {
+    if args.len() != 2 {
+        return Err(EvalError::WrongArgCount {
+            expected: "2".to_string(),
+            got: args.len(),
+            span,
+        });
+    }
+    let key = &args[0];
+    let Value::List(alist, _) = &args[1] else {
+        return Err(EvalError::TypeMismatch {
+            expected: "list".to_string(),
+            got: format!("{}", args[1]),
+            span: args[1].span(),
+        });
+    };
+    for entry in alist {
+        let Value::List(pair, _) = entry else {
+            return Err(EvalError::TypeMismatch {
+                expected: "pair".to_string(),
+                got: format!("{entry}"),
+                span: entry.span(),
+            });
+        };
+        if !pair.is_empty() && values_equal(key, &pair[0]) {
+            return Ok(entry.clone());
+        }
+    }
+    Ok(Value::bool(false))
+}
+
+fn builtin_map(args: &[Value], span: Span, env: &Env) -> Result<Value, EvalError> {
+    if args.len() < 2 {
+        return Err(EvalError::WrongArgCount {
+            expected: "at least 2".to_string(),
+            got: args.len(),
+            span,
+        });
+    }
+    let func = &args[0];
+    let lists: Vec<&Vec<Value>> = args[1..]
+        .iter()
+        .map(|a| match a {
+            Value::List(elems, _) => Ok(elems),
+            other => Err(EvalError::TypeMismatch {
+                expected: "list".to_string(),
+                got: format!("{other}"),
+                span: other.span(),
+            }),
+        })
+        .collect::<Result<_, _>>()?;
+
+    if lists.is_empty() {
+        return Ok(Value::list(Vec::new()));
+    }
+    let len = lists[0].len();
+    let mut results = Vec::with_capacity(len);
+    for i in 0..len {
+        let call_args: Vec<Value> = lists.iter().map(|l| l[i].clone()).collect();
+        let call_expr = Value::list(
+            std::iter::once(func.clone())
+                .chain(call_args.into_iter().map(|a| {
+                    Value::list(vec![Value::symbol("quote".to_string()), a])
+                }))
+                .collect(),
+        );
+        results.push(eval(&call_expr, env)?);
+    }
+    Ok(Value::list(results))
+}
+
+fn builtin_eq(args: &[Value], span: Span) -> Result<Value, EvalError> {
+    if args.len() != 2 {
+        return Err(EvalError::WrongArgCount {
+            expected: "2".to_string(),
+            got: args.len(),
+            span,
+        });
+    }
+    let result = match (&args[0], &args[1]) {
+        (Value::Integer(a, _), Value::Integer(b, _)) => a == b,
+        (Value::Boolean(a, _), Value::Boolean(b, _)) => a == b,
+        (Value::Symbol(a, _), Value::Symbol(b, _)) => a == b,
+        (Value::Char(a, _), Value::Char(b, _)) => a == b,
+        (Value::List(a, _), Value::List(b, _)) if a.is_empty() && b.is_empty() => true,
+        _ => false,
+    };
+    Ok(Value::bool(result))
+}
+
+fn builtin_equal(args: &[Value], span: Span) -> Result<Value, EvalError> {
+    if args.len() != 2 {
+        return Err(EvalError::WrongArgCount {
+            expected: "2".to_string(),
+            got: args.len(),
+            span,
+        });
+    }
+    Ok(Value::bool(values_equal(&args[0], &args[1])))
+}
+
+fn builtin_char_alphabetic(args: &[Value], span: Span) -> Result<Value, EvalError> {
+    if args.len() != 1 {
+        return Err(EvalError::WrongArgCount {
+            expected: "1".to_string(),
+            got: args.len(),
+            span,
+        });
+    }
+    let Value::Char(c, _) = &args[0] else {
+        return Err(EvalError::TypeMismatch {
+            expected: "char".to_string(),
+            got: format!("{}", args[0]),
+            span: args[0].span(),
+        });
+    };
+    Ok(Value::bool(c.is_alphabetic()))
+}
+
+fn builtin_char_numeric(args: &[Value], span: Span) -> Result<Value, EvalError> {
+    if args.len() != 1 {
+        return Err(EvalError::WrongArgCount {
+            expected: "1".to_string(),
+            got: args.len(),
+            span,
+        });
+    }
+    let Value::Char(c, _) = &args[0] else {
+        return Err(EvalError::TypeMismatch {
+            expected: "char".to_string(),
+            got: format!("{}", args[0]),
+            span: args[0].span(),
+        });
+    };
+    Ok(Value::bool(c.is_ascii_digit()))
+}
+
+fn builtin_char_upcase(args: &[Value], span: Span) -> Result<Value, EvalError> {
+    if args.len() != 1 {
+        return Err(EvalError::WrongArgCount {
+            expected: "1".to_string(),
+            got: args.len(),
+            span,
+        });
+    }
+    let Value::Char(c, _) = &args[0] else {
+        return Err(EvalError::TypeMismatch {
+            expected: "char".to_string(),
+            got: format!("{}", args[0]),
+            span: args[0].span(),
+        });
+    };
+    Ok(Value::Char(c.to_ascii_uppercase(), Span::default()))
+}
+
+fn builtin_char_downcase(args: &[Value], span: Span) -> Result<Value, EvalError> {
+    if args.len() != 1 {
+        return Err(EvalError::WrongArgCount {
+            expected: "1".to_string(),
+            got: args.len(),
+            span,
+        });
+    }
+    let Value::Char(c, _) = &args[0] else {
+        return Err(EvalError::TypeMismatch {
+            expected: "char".to_string(),
+            got: format!("{}", args[0]),
+            span: args[0].span(),
+        });
+    };
+    Ok(Value::Char(c.to_ascii_lowercase(), Span::default()))
+}
+
+fn builtin_char_eq(args: &[Value], span: Span) -> Result<Value, EvalError> {
+    if args.len() != 2 {
+        return Err(EvalError::WrongArgCount {
+            expected: "2".to_string(),
+            got: args.len(),
+            span,
+        });
+    }
+    let Value::Char(a, _) = &args[0] else {
+        return Err(EvalError::TypeMismatch {
+            expected: "char".to_string(),
+            got: format!("{}", args[0]),
+            span: args[0].span(),
+        });
+    };
+    let Value::Char(b, _) = &args[1] else {
+        return Err(EvalError::TypeMismatch {
+            expected: "char".to_string(),
+            got: format!("{}", args[1]),
+            span: args[1].span(),
+        });
+    };
+    Ok(Value::bool(a == b))
+}
+
+fn builtin_char_lt(args: &[Value], span: Span) -> Result<Value, EvalError> {
+    if args.len() != 2 {
+        return Err(EvalError::WrongArgCount {
+            expected: "2".to_string(),
+            got: args.len(),
+            span,
+        });
+    }
+    let Value::Char(a, _) = &args[0] else {
+        return Err(EvalError::TypeMismatch {
+            expected: "char".to_string(),
+            got: format!("{}", args[0]),
+            span: args[0].span(),
+        });
+    };
+    let Value::Char(b, _) = &args[1] else {
+        return Err(EvalError::TypeMismatch {
+            expected: "char".to_string(),
+            got: format!("{}", args[1]),
+            span: args[1].span(),
+        });
+    };
+    Ok(Value::bool(a < b))
+}
+
+fn builtin_string_eq(args: &[Value], span: Span) -> Result<Value, EvalError> {
+    if args.len() != 2 {
+        return Err(EvalError::WrongArgCount {
+            expected: "2".to_string(),
+            got: args.len(),
+            span,
+        });
+    }
+    let Value::String(a, _) = &args[0] else {
+        return Err(EvalError::TypeMismatch {
+            expected: "string".to_string(),
+            got: format!("{}", args[0]),
+            span: args[0].span(),
+        });
+    };
+    let Value::String(b, _) = &args[1] else {
+        return Err(EvalError::TypeMismatch {
+            expected: "string".to_string(),
+            got: format!("{}", args[1]),
+            span: args[1].span(),
+        });
+    };
+    Ok(Value::bool(*a.borrow() == *b.borrow()))
+}
+
+fn builtin_string_lt(args: &[Value], span: Span) -> Result<Value, EvalError> {
+    if args.len() != 2 {
+        return Err(EvalError::WrongArgCount {
+            expected: "2".to_string(),
+            got: args.len(),
+            span,
+        });
+    }
+    let Value::String(a, _) = &args[0] else {
+        return Err(EvalError::TypeMismatch {
+            expected: "string".to_string(),
+            got: format!("{}", args[0]),
+            span: args[0].span(),
+        });
+    };
+    let Value::String(b, _) = &args[1] else {
+        return Err(EvalError::TypeMismatch {
+            expected: "string".to_string(),
+            got: format!("{}", args[1]),
+            span: args[1].span(),
+        });
+    };
+    Ok(Value::bool(*a.borrow() < *b.borrow()))
+}
+
+fn builtin_string_ci_eq(args: &[Value], span: Span) -> Result<Value, EvalError> {
+    if args.len() != 2 {
+        return Err(EvalError::WrongArgCount {
+            expected: "2".to_string(),
+            got: args.len(),
+            span,
+        });
+    }
+    let Value::String(a, _) = &args[0] else {
+        return Err(EvalError::TypeMismatch {
+            expected: "string".to_string(),
+            got: format!("{}", args[0]),
+            span: args[0].span(),
+        });
+    };
+    let Value::String(b, _) = &args[1] else {
+        return Err(EvalError::TypeMismatch {
+            expected: "string".to_string(),
+            got: format!("{}", args[1]),
+            span: args[1].span(),
+        });
+    };
+    Ok(Value::bool(a.borrow().to_lowercase() == b.borrow().to_lowercase()))
+}
+
+fn builtin_string_upcase(args: &[Value], span: Span) -> Result<Value, EvalError> {
+    if args.len() != 1 {
+        return Err(EvalError::WrongArgCount {
+            expected: "1".to_string(),
+            got: args.len(),
+            span,
+        });
+    }
+    let Value::String(s, _) = &args[0] else {
+        return Err(EvalError::TypeMismatch {
+            expected: "string".to_string(),
+            got: format!("{}", args[0]),
+            span: args[0].span(),
+        });
+    };
+    Ok(Value::string(s.borrow().to_uppercase()))
+}
+
+fn builtin_string_downcase(args: &[Value], span: Span) -> Result<Value, EvalError> {
+    if args.len() != 1 {
+        return Err(EvalError::WrongArgCount {
+            expected: "1".to_string(),
+            got: args.len(),
+            span,
+        });
+    }
+    let Value::String(s, _) = &args[0] else {
+        return Err(EvalError::TypeMismatch {
+            expected: "string".to_string(),
+            got: format!("{}", args[0]),
+            span: args[0].span(),
+        });
+    };
+    Ok(Value::string(s.borrow().to_lowercase()))
 }
