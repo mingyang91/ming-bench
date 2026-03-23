@@ -89,17 +89,61 @@ object BuiltinsExt:
           args =>
             if args.length != 1 then throw new EvalError("string-copy: expected 1 argument")
             args.head match
-              case StrVal(chars) => StrVal(chars.clone())
-              case other         => throw new EvalError(s"string-copy: not a string: ${other.display}")
+              case StrVal(chars) =>
+                val copy = chars.clone()
+                Value.markStringMutable(copy)
+                StrVal(copy)
+              case other => throw new EvalError(s"string-copy: not a string: ${other.display}")
         ),
         (
           "string-set!",
           args =>
+            if args.length != 3 then throw new EvalError("string-set!: expected 3 arguments")
             args match
               case StrVal(chars) :: IntVal(idx) :: CharVal(c) :: Nil =>
-                chars(idx.toInt) = c
-                BoolVal(true)
+                if !Value.isStringMutable(chars) then
+                  throw new EvalError("string-set!: strings are immutable")
+                val i = idx.toInt
+                if i < 0 || i >= chars.length then
+                  throw new EvalError(s"string-set!: index $i out of range [0, ${chars.length})")
+                chars(i) = c
+                NilVal
               case _ => throw new EvalError("string-set!: expected (string, index, char)")
+        ),
+        (
+          "string->list",
+          args =>
+            if args.length != 1 then throw new EvalError("string->list: expected 1 argument")
+            args.head match
+              case StrVal(chars) =>
+                chars.foldRight(NilVal: Value)((c, acc) => PairVal(CharVal(c), acc))
+              case other => throw new EvalError(s"string->list: not a string: ${other.display}")
+        ),
+        (
+          "list->string",
+          args =>
+            if args.length != 1 then throw new EvalError("list->string: expected 1 argument")
+            val chars = EvalHelpers.valueToList(args.head).map {
+              case CharVal(c) => c
+              case other      => throw new EvalError(s"list->string: not a char: ${other.display}")
+            }
+            StrVal(chars.toArray)
+        ),
+        (
+          "char->integer",
+          args =>
+            if args.length != 1 then throw new EvalError("char->integer: expected 1 argument")
+            args.head match
+              case CharVal(c) => IntVal(c.toLong)
+              case _          => throw new EvalError("char->integer: not a char")
+        ),
+        (
+          "integer->char",
+          args =>
+            if args.length != 1 then throw new EvalError("integer->char: expected 1 argument")
+            args.head match
+              case IntVal(n) => CharVal(n.toChar)
+              case _         => throw new EvalError("integer->char: not a number")
         )
       )
     )

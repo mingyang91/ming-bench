@@ -1,5 +1,13 @@
 package ming
 
+object Value:
+  /** Identity set tracking which char arrays are mutable (from string-copy). */
+  private val mutableStrings: java.util.Set[Array[Char]] =
+    java.util.Collections.newSetFromMap(new java.util.IdentityHashMap[Array[Char], java.lang.Boolean]())
+
+  def markStringMutable(chars: Array[Char]): Unit = mutableStrings.add(chars)
+  def isStringMutable(chars: Array[Char]): Boolean = mutableStrings.contains(chars)
+
 /** Runtime Scheme value. */
 enum Value:
   case IntVal(n: Long)
