@@ -18,6 +18,7 @@ enum Token {
     LParen,
     RParen,
     Quote,
+    SyntaxQuote,
     Symbol(String),
     Integer(i64),
     Rational(i64, i64),
@@ -108,6 +109,11 @@ fn tokenize(input: &str) -> Result<Vec<(Token, Span)>, EvalError> {
                 let start_span = Span::new(line, col);
                 if i + 1 < chars.len() {
                     match chars[i + 1] {
+                        '\'' => {
+                            tokens.push((Token::SyntaxQuote, start_span));
+                            i += 2;
+                            col += 2;
+                        }
                         't' => {
                             tokens.push((Token::Boolean(true), start_span));
                             i += 2;
@@ -265,6 +271,16 @@ fn parse_expr(tokens: &[(Token, Span)], pos: usize) -> Result<(Value, usize), Ev
             Ok((
                 Value::List(
                     vec![Value::Symbol("quote".to_string(), *span), inner],
+                    *span,
+                ),
+                next,
+            ))
+        }
+        Token::SyntaxQuote => {
+            let (inner, next) = parse_expr(tokens, pos + 1)?;
+            Ok((
+                Value::List(
+                    vec![Value::Symbol("syntax".to_string(), *span), inner],
                     *span,
                 ),
                 next,

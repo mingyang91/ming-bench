@@ -1,10 +1,11 @@
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::rc::Rc;
 
 use crate::scheme::env::Env;
 use crate::scheme::error::{EvalError, Span};
 use crate::scheme::macros;
-use crate::scheme::value::{make_rational, Mutability, RecordOp, Value};
+use crate::scheme::macros::{Binding, PatternBindings};
+use crate::scheme::value::{make_rational, Mutability, RecordOp, SyntaxRules, Value};
 
 // ── Pair/List helpers ──────────────────────────────────────────────────────
 
@@ -467,7 +468,8 @@ pub fn eval(expr: &Value, env: &Env) -> Result<Value, EvalError> {
                     | "for-each" | "assq" | "assv" | "memq" | "memv" | "member"
                     | "gcd" | "lcm" | "procedure?" | "round" | "truncate"
                     | "make-string" | "string"
-                    | "string>?" | "string>=?" | "string<=?" => Ok(current_expr.clone()),
+                    | "string>?" | "string>=?" | "string<=?"
+                    | "syntax->datum" | "datum->syntax" => Ok(current_expr.clone()),
                     _ => {
                         // cxr compositions (caar, cadr, cddr, caaaar, etc.)
                         if name.starts_with('c') && name.ends_with('r') && name.len() >= 3 {
@@ -663,10 +665,19 @@ pub fn eval(expr: &Value, env: &Env) -> Result<Value, EvalError> {
                         "guard" => {
                             return eval_guard(&elems[1..], list_span, &current_env);
                         }
+                        "syntax-case" => {
+                            return eval_syntax_case(elems, list_span, &current_env);
+                        }
+                        "syntax" => {
+                            return eval_syntax_template(&elems[1..], list_span, &current_env);
+                        }
+                        "with-syntax" => {
+                            return eval_with_syntax(&elems[1..], list_span, &current_env);
+                        }
                         _ => {
                             // Check for macro application
                             if let Some(Value::Macro(ref sr)) = current_env.get(name) {
-                                current_expr = macros::expand_macro(sr, elems)?;
+                                current_expr = expand_macro_application(sr, elems, list_span, &current_env)?;
                                 continue;
                             }
                         }
@@ -1027,6 +1038,25 @@ fn assemble_apply_args(args: &[Value], span: Span) -> Result<(Value, Vec<Value>)
     Ok((func, full_args))
 }
 
+/// Expand a macro application, handling both syntax-case transformers and syntax-rules.
+fn expand_macro_application(
+    sr: &SyntaxRules,
+    elems: &[Value],
+    list_span: Span,
+    env: &Env,
+) -> Result<Value, EvalError> {
+    if let Some(ref transformer) = sr.transformer {
+        let input = Value::List(elems.to_vec(), list_span);
+        let func: Value = transformer.as_ref().clone();
+        let expanded = match dispatch_call(func, vec![input], list_span, env)? {
+            TailAction::Result(v) => v,
+            TailAction::TailCall(expr, tc_env) => eval(&expr, &tc_env)?,
+        };
+        return Ok(expanded);
+    }
+    macros::expand_macro(sr, elems)
+}
+
 /// Dispatch a function call, returning a tail action for closures.
 fn dispatch_call(func: Value, args: Vec<Value>, span: Span, env: &Env) -> Result<TailAction, EvalError> {
     match func {
@@ -1355,6 +1385,27 @@ fn apply_builtin(name: &str, args: &[Value], span: Span, env: &Env) -> Result<Va
         "string>?" => builtin_string_gt(args, span),
         "string>=?" => builtin_string_ge(args, span),
         "string<=?" => builtin_string_le(args, span),
+        "syntax->datum" => {
+            if args.len() != 1 {
+                return Err(EvalError::WrongArgCount {
+                    expected: "1".to_string(),
+                    got: args.len(),
+                    span,
+                });
+            }
+            Ok(args[0].clone())
+        }
+        "datum->syntax" => {
+            if args.len() != 2 {
+                return Err(EvalError::WrongArgCount {
+                    expected: "2".to_string(),
+                    got: args.len(),
+                    span,
+                });
+            }
+            // Return the datum (second arg) — lexical context from first arg is handled by env chain
+            Ok(args[1].clone())
+        }
         _ => {
             // Try cxr composition (caar, cadr, cddr, caaaar, etc.)
             if name.starts_with('c') && name.ends_with('r') && name.len() >= 3 {
@@ -1736,26 +1787,40 @@ fn eval_define_syntax(args: &[Value], form_span: Span, env: &Env) -> Result<Valu
     };
     let Value::List(sr_elems, _) = &args[1] else {
         return Err(EvalError::TypeMismatch {
-            expected: "syntax-rules form".to_string(),
+            expected: "syntax-rules or lambda form".to_string(),
             got: args[1].to_string(),
             span: args[1].span(),
         });
     };
     if sr_elems.is_empty() {
         return Err(EvalError::Parse {
-            message: "empty syntax-rules".to_string(),
+            message: "empty syntax transformer".to_string(),
             span: form_span,
         });
     }
     let Value::Symbol(sr_keyword, _) = &sr_elems[0] else {
         return Err(EvalError::Parse {
-            message: "expected syntax-rules".to_string(),
+            message: "expected syntax-rules or lambda".to_string(),
             span: sr_elems[0].span(),
         });
     };
+
+    // Handle (define-syntax name (lambda (stx) body)) for syntax-case macros
+    if sr_keyword == "lambda" {
+        let transformer = eval_lambda(&sr_elems[1..], form_span, env)?;
+        let syntax_rules = crate::scheme::value::SyntaxRules {
+            literals: Vec::new(),
+            rules: Vec::new(),
+            def_env: env.clone(),
+            transformer: Some(Box::new(transformer)),
+        };
+        env.define(name.clone(), Value::Macro(syntax_rules));
+        return Ok(Value::Void);
+    }
+
     if sr_keyword != "syntax-rules" {
         return Err(EvalError::Parse {
-            message: format!("expected syntax-rules, got {sr_keyword}"),
+            message: format!("expected syntax-rules or lambda, got {sr_keyword}"),
             span: sr_elems[0].span(),
         });
     }
@@ -1798,9 +1863,288 @@ fn eval_define_syntax(args: &[Value], form_span: Span, env: &Env) -> Result<Valu
         literals,
         rules,
         def_env: env.clone(),
+        transformer: None,
     };
     env.define(name.clone(), Value::Macro(syntax_rules));
     Ok(Value::Void)
+}
+
+// ── syntax-case support ───────────────────────────────────────────────────
+
+/// Evaluate (syntax-case expr (literals) clause ...)
+fn eval_syntax_case(elems: &[Value], form_span: Span, env: &Env) -> Result<Value, EvalError> {
+    // elems[0] = "syntax-case", elems[1] = expr, elems[2] = (literals), elems[3..] = clauses
+    if elems.len() < 4 {
+        return Err(EvalError::WrongArgCount {
+            expected: "at least 3 (after syntax-case)".to_string(),
+            got: elems.len() - 1,
+            span: form_span,
+        });
+    }
+    let input = eval(&elems[1], env)?;
+    let input_elems = match &input {
+        Value::List(elems, _) => elems.clone(),
+        other => vec![other.clone()],
+    };
+
+    // Parse literals list
+    let Value::List(lit_list, _) = &elems[2] else {
+        return Err(EvalError::TypeMismatch {
+            expected: "literals list".to_string(),
+            got: elems[2].to_string(),
+            span: elems[2].span(),
+        });
+    };
+    let literals: Vec<String> = lit_list
+        .iter()
+        .filter_map(|v| if let Value::Symbol(s, _) = v { Some(s.clone()) } else { None })
+        .collect();
+
+    for clause in &elems[3..] {
+        let Value::List(parts, _) = clause else { continue };
+        let (pattern, fender, output_expr) = match parts.len() {
+            2 => (&parts[0], None, &parts[1]),
+            3 => (&parts[0], Some(&parts[1]), &parts[2]),
+            _ => continue,
+        };
+
+        let Value::List(pat_elems, _) = pattern else { continue };
+        if pat_elems.is_empty() || input_elems.is_empty() {
+            continue;
+        }
+
+        let mut bindings = PatternBindings::new();
+        // Match: skip the first element of pattern (the _ or keyword placeholder)
+        if !macros::match_list(&pat_elems[1..], &input_elems[1..], &literals, &mut bindings) {
+            continue;
+        }
+
+        // Create child env with pattern bindings
+        let child_env = Env::with_parent(env);
+        let mut pvar_names = Vec::new();
+        let mut evar_names = Vec::new();
+        for (name, binding) in &bindings {
+            match binding {
+                Binding::Single(v) => {
+                    child_env.define(name.clone(), v.clone());
+                    pvar_names.push(name.clone());
+                }
+                Binding::Ellipsis(vs) => {
+                    child_env.define(name.clone(), Value::list(vs.clone()));
+                    pvar_names.push(name.clone());
+                    evar_names.push(name.clone());
+                }
+            }
+        }
+
+        // Check fender if present
+        if let Some(fender_expr) = fender {
+            let fender_result = eval(fender_expr, &child_env)?;
+            if !fender_result.is_truthy() {
+                continue;
+            }
+        }
+
+        // Store pattern variable metadata for (syntax ...) form
+        child_env.define(
+            "__sc_pvars__".to_string(),
+            Value::list(pvar_names.iter().map(|s| Value::symbol(s.clone())).collect()),
+        );
+        child_env.define(
+            "__sc_evars__".to_string(),
+            Value::list(evar_names.iter().map(|s| Value::symbol(s.clone())).collect()),
+        );
+
+        return eval(output_expr, &child_env);
+    }
+
+    Err(EvalError::Parse {
+        message: "no matching syntax-case pattern".to_string(),
+        span: form_span,
+    })
+}
+
+/// Read pattern variable names from environment metadata
+fn get_sc_var_names(env: &Env, key: &str) -> Vec<String> {
+    env.get(key)
+        .and_then(|v| {
+            if let Value::List(elems, _) = v {
+                Some(
+                    elems
+                        .iter()
+                        .filter_map(|e| {
+                            if let Value::Symbol(s, _) = e {
+                                Some(s.clone())
+                            } else {
+                                None
+                            }
+                        })
+                        .collect(),
+                )
+            } else {
+                None
+            }
+        })
+        .unwrap_or_default()
+}
+
+/// Evaluate (syntax template) — template expansion with pattern variable substitution
+fn eval_syntax_template(args: &[Value], form_span: Span, env: &Env) -> Result<Value, EvalError> {
+    if args.len() != 1 {
+        return Err(EvalError::WrongArgCount {
+            expected: "1".to_string(),
+            got: args.len(),
+            span: form_span,
+        });
+    }
+    let template = &args[0];
+
+    let pvar_names = get_sc_var_names(env, "__sc_pvars__");
+    let evar_names = get_sc_var_names(env, "__sc_evars__");
+
+    // If it's just a pattern variable symbol, return its value directly
+    if let Value::Symbol(name, _) = template {
+        if pvar_names.contains(name) {
+            if let Some(val) = env.get(name) {
+                return Ok(val);
+            }
+        }
+    }
+
+    // Build PatternBindings from env
+    let mut bindings = PatternBindings::new();
+    for name in &pvar_names {
+        if let Some(val) = env.get(name) {
+            if evar_names.contains(name) {
+                if let Value::List(elems, _) = val {
+                    bindings.insert(name.clone(), Binding::Ellipsis(elems));
+                }
+            } else {
+                bindings.insert(name.clone(), Binding::Single(val));
+            }
+        }
+    }
+
+    // Collect introduced bindings for hygiene
+    let introduced = macros::collect_introduced_bindings(template, &pvar_names);
+    let mut gensym_map = HashMap::new();
+    for name in &introduced {
+        gensym_map.insert(name.clone(), env.gensym(name));
+    }
+
+    Ok(macros::expand_template(
+        template, &bindings, env, &gensym_map, &pvar_names,
+    ))
+}
+
+/// Define bindings from a pattern match into the environment and track pattern/ellipsis variable names.
+fn define_pattern_bindings(
+    bindings: &PatternBindings,
+    env: &Env,
+    pvar_names: &mut Vec<String>,
+    evar_names: &mut Vec<String>,
+) {
+    for (name, binding) in bindings {
+        match binding {
+            Binding::Single(v) => {
+                env.define(name.clone(), v.clone());
+            }
+            Binding::Ellipsis(vs) => {
+                env.define(name.clone(), Value::list(vs.clone()));
+                if !evar_names.contains(name) {
+                    evar_names.push(name.clone());
+                }
+            }
+        }
+        if !pvar_names.contains(name) {
+            pvar_names.push(name.clone());
+        }
+    }
+}
+
+/// Evaluate (with-syntax ((pattern expr) ...) body ...)
+fn eval_with_syntax(args: &[Value], form_span: Span, env: &Env) -> Result<Value, EvalError> {
+    if args.len() < 2 {
+        return Err(EvalError::WrongArgCount {
+            expected: "at least 2".to_string(),
+            got: args.len(),
+            span: form_span,
+        });
+    }
+    let Value::List(binding_list, _) = &args[0] else {
+        return Err(EvalError::TypeMismatch {
+            expected: "binding list".to_string(),
+            got: args[0].to_string(),
+            span: args[0].span(),
+        });
+    };
+
+    // Start with existing pattern variable metadata from enclosing syntax-case
+    let mut pvar_names = get_sc_var_names(env, "__sc_pvars__");
+    let mut evar_names = get_sc_var_names(env, "__sc_evars__");
+
+    let child_env = Env::with_parent(env);
+
+    // Copy existing pattern variable bindings to child env
+    for name in &pvar_names {
+        if let Some(val) = env.get(name) {
+            child_env.define(name.clone(), val);
+        }
+    }
+
+    // Process each (pattern expr) binding
+    for binding in binding_list {
+        let Value::List(pair, _) = binding else {
+            return Err(EvalError::TypeMismatch {
+                expected: "binding pair".to_string(),
+                got: binding.to_string(),
+                span: binding.span(),
+            });
+        };
+        if pair.len() != 2 {
+            return Err(EvalError::WrongArgCount {
+                expected: "2".to_string(),
+                got: pair.len(),
+                span: binding.span(),
+            });
+        }
+        let val = eval(&pair[1], env)?;
+
+        // Simple pattern: just a symbol
+        if let Value::Symbol(name, _) = &pair[0] {
+            child_env.define(name.clone(), val);
+            if !pvar_names.contains(name) {
+                pvar_names.push(name.clone());
+            }
+        } else if let Value::List(pat_elems, _) = &pair[0] {
+            // Complex pattern — use match_list for destructuring
+            let val_elems = match &val {
+                Value::List(elems, _) => elems.clone(),
+                other => vec![other.clone()],
+            };
+            let mut bindings = PatternBindings::new();
+            if macros::match_list(pat_elems, &val_elems, &[], &mut bindings) {
+                define_pattern_bindings(&bindings, &child_env, &mut pvar_names, &mut evar_names);
+            }
+        }
+    }
+
+    // Update metadata
+    child_env.define(
+        "__sc_pvars__".to_string(),
+        Value::list(pvar_names.iter().map(|s| Value::symbol(s.clone())).collect()),
+    );
+    child_env.define(
+        "__sc_evars__".to_string(),
+        Value::list(evar_names.iter().map(|s| Value::symbol(s.clone())).collect()),
+    );
+
+    // Evaluate body
+    let body = &args[1..];
+    if body.len() == 1 {
+        return eval(&body[0], &child_env);
+    }
+    eval_body(body, &child_env)
 }
 
 fn eval_quote(args: &[Value], form_span: Span) -> Result<Value, EvalError> {

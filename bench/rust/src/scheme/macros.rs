@@ -5,12 +5,12 @@ use crate::scheme::error::{EvalError, Span};
 use crate::scheme::value::{SyntaxRules, Value};
 
 #[derive(Debug, Clone)]
-enum Binding {
+pub(crate) enum Binding {
     Single(Value),
     Ellipsis(Vec<Value>),
 }
 
-type PatternBindings = HashMap<String, Binding>;
+pub(crate) type PatternBindings = HashMap<String, Binding>;
 
 /// Expand a macro application. `input` is the full list elements including macro name.
 pub(crate) fn expand_macro(
@@ -51,7 +51,7 @@ pub(crate) fn expand_macro(
     })
 }
 
-fn collect_pattern_vars(patterns: &[Value], literals: &[String]) -> Vec<String> {
+pub(crate) fn collect_pattern_vars(patterns: &[Value], literals: &[String]) -> Vec<String> {
     let mut vars = Vec::new();
     for p in patterns {
         collect_pattern_vars_inner(p, literals, &mut vars);
@@ -88,7 +88,7 @@ fn collect_pattern_vars_inner(pattern: &Value, literals: &[String], vars: &mut V
     }
 }
 
-fn match_list(
+pub(crate) fn match_list(
     patterns: &[Value],
     inputs: &[Value],
     literals: &[String],
@@ -187,7 +187,7 @@ fn match_pattern(
     }
 }
 
-fn expand_template(
+pub(crate) fn expand_template(
     template: &Value,
     bindings: &PatternBindings,
     def_env: &Env,
@@ -323,7 +323,7 @@ fn template_symbols(template: &Value) -> Vec<String> {
     }
 }
 
-fn collect_introduced_bindings(template: &Value, pattern_vars: &[String]) -> Vec<String> {
+pub(crate) fn collect_introduced_bindings(template: &Value, pattern_vars: &[String]) -> Vec<String> {
     let Value::List(elems, _) = template else {
         return vec![];
     };
@@ -363,7 +363,7 @@ fn collect_let_bindings(bindings_list: &[Value], pattern_vars: &[String], introd
     }
 }
 
-fn is_special_form(name: &str) -> bool {
+pub(crate) fn is_special_form(name: &str) -> bool {
     matches!(
         name,
         "if" | "define"
@@ -378,6 +378,9 @@ fn is_special_form(name: &str) -> bool {
             | "not"
             | "define-syntax"
             | "syntax-rules"
+            | "syntax-case"
+            | "syntax"
+            | "with-syntax"
             | "let*"
             | "letrec"
             | "letrec*"
@@ -387,7 +390,7 @@ fn is_special_form(name: &str) -> bool {
     )
 }
 
-fn is_builtin(name: &str) -> bool {
+pub(crate) fn is_builtin(name: &str) -> bool {
     matches!(
         name,
         "+" | "-"
@@ -486,5 +489,7 @@ fn is_builtin(name: &str) -> bool {
             | "cdddr"
             | "caddar"
             | "cadddr"
+            | "syntax->datum"
+            | "datum->syntax"
     )
 }

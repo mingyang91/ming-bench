@@ -17,6 +17,8 @@ pub struct SyntaxRules {
     pub literals: Vec<String>,
     pub rules: Vec<(Value, Value)>,
     pub def_env: Env,
+    /// For syntax-case macros: the transformer closure
+    pub transformer: Option<Box<Value>>,
 }
 
 #[derive(Debug, Clone)]
