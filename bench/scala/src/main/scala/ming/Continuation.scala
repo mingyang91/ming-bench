@@ -16,6 +16,10 @@ class ContinuationJump(
 ) extends Throwable:
   override def fillInStackTrace(): Throwable = this
 
+/** Thrown when `raise` is called in Scheme. */
+class SchemeRaise(val value: SchemeValue) extends Throwable:
+  override def fillInStackTrace(): Throwable = this
+
 /** Manages continuation state during evaluation. */
 object ContinuationManager:
   var bodyContext: BodyContext                    = BodyContext(Nil, Environment())

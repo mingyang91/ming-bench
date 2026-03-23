@@ -72,6 +72,9 @@ object Interpreter:
         case ListVal(SymbolVal("define-syntax", _) :: args, pos) =>
           return SpecialForms.evalDefineSyntax(args, pos, curEnv)
 
+        case ListVal(SymbolVal("guard", _) :: args, pos) =>
+          return WindException.evalGuard(args, pos, curEnv)
+
         case ListVal(SymbolVal(name, _) :: args, pos) if tailCallForms.contains(name) =>
           dispatchTailForm(name, args, pos, curEnv) match
             case Done(v)          => return v

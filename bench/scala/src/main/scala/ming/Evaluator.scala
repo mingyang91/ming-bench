@@ -95,8 +95,9 @@ object Evaluator:
       ("vector?", args => BuiltinsVector.vectorCheck(args)),
       ("vector->list", args => BuiltinsVector.vectorToListOp(args)),
       ("list->vector", args => BuiltinsVector.listToVectorOp(args)),
-      // L16 - dynamic-wind
-      ("dynamic-wind", args => dynamicWindOp(args))
+      ("dynamic-wind", args => WindException.dynamicWindOp(args)),
+      ("raise", args => WindException.raiseOp(args)),
+      ("with-exception-handler", args => WindException.withExceptionHandlerOp(args))
     )
     builtins.foreach { (name, func) =>
       env.define(name, BuiltinVal(name, func))
@@ -105,51 +106,6 @@ object Evaluator:
     env.define("call/cc", callccFn)
     env.define("call-with-current-continuation", callccFn)
     env
-
-  /** Transition wind stack from current to target, calling out/in thunks. */
-  private def doWindTransition(target: List[(SchemeValue, SchemeValue)]): Unit =
-    val current = ContinuationManager.windStack
-    if current eq target then return
-    val currentLen = current.length
-    val targetLen  = target.length
-    // Find common tail by reference equality
-    var c = current
-    var t = target
-    if currentLen > targetLen then
-      var i = 0
-      while i < currentLen - targetLen do
-        c = c.tail; i += 1
-    else
-      var i = 0
-      while i < targetLen - currentLen do
-        t = t.tail; i += 1
-    while !(c eq t) do
-      c = c.tail; t = t.tail
-    val commonLen = c.length
-    // Unwind: call out-thunks from innermost to outermost
-    for _ <- 0 until (currentLen - commonLen) do
-      val frame = ContinuationManager.windStack.head
-      ContinuationManager.windStack = ContinuationManager.windStack.tail
-      Interpreter.applyProc(frame._2, Nil)
-    // Rewind: call in-thunks from outermost to innermost
-    val rewindFrames = target.take(targetLen - commonLen).reverse
-    for frame <- rewindFrames do
-      Interpreter.applyProc(frame._1, Nil)
-      ContinuationManager.windStack = frame :: ContinuationManager.windStack
-
-  /** Implement dynamic-wind: in-thunk, body-thunk, out-thunk. */
-  private def dynamicWindOp(args: List[SchemeValue]): SchemeValue =
-    if args.length != 3 then throw new EvalError("dynamic-wind: requires 3 arguments")
-    val inThunk   = args(0)
-    val bodyThunk = args(1)
-    val outThunk  = args(2)
-    Interpreter.applyProc(inThunk, Nil)
-    val frame = (inThunk, outThunk)
-    ContinuationManager.windStack = frame :: ContinuationManager.windStack
-    val result = Interpreter.applyProc(bodyThunk, Nil)
-    ContinuationManager.windStack = ContinuationManager.windStack.tail
-    Interpreter.applyProc(outThunk, Nil)
-    result
 
   /** Create the call/cc builtin function. */
   private def callccBuiltin(): SchemeValue =
@@ -175,7 +131,7 @@ object Evaluator:
           try Interpreter.applyProc(proc, List(cont))
           catch
             case jump: ContinuationJump if jump.contId == contId =>
-              doWindTransition(savedWind)
+              WindException.doWindTransition(savedWind)
               ContinuationManager.contextStack = savedStack
               jump.value
     )
