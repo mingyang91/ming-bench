@@ -961,11 +961,8 @@ export function evalStr(input: string): string {
   const exprs = parse(input);
   if (exprs.length === 0) throw new EvalError('no expressions');
   const env = makeGlobalEnv();
-  let result: SchemeVal | undefined;
-  for (const expr of exprs) {
-    result = trampoline(evalCPS(expr, env, v => v));
-  }
-  return displayVal(result!);
+  const result = trampoline(evalBodyCPS(exprs, 0, env, v => v));
+  return displayVal(result);
 }
 
 export function evalStrWithOutput(input: string): { result: string; output: string } {
@@ -973,9 +970,6 @@ export function evalStrWithOutput(input: string): { result: string; output: stri
   if (exprs.length === 0) throw new EvalError('no expressions');
   const env = makeGlobalEnv();
   const out: string[] = [];
-  let result: SchemeVal | undefined;
-  for (const expr of exprs) {
-    result = trampoline(evalCPS(expr, env, v => v, out));
-  }
-  return { result: displayVal(result!), output: out.join('') };
+  const result = trampoline(evalBodyCPS(exprs, 0, env, v => v, out));
+  return { result: displayVal(result), output: out.join('') };
 }
