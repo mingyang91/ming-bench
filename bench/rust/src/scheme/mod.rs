@@ -11,6 +11,7 @@ enum Value {
     Boolean(bool),
     Str(String),
     Symbol(String),
+    Char(char),
     List(Vec<Value>),
     Void,
     Lambda {
@@ -20,6 +21,10 @@ enum Value {
     },
 }
 
+thread_local! {
+    static OUTPUT_BUFFER: std::cell::RefCell<String> = std::cell::RefCell::new(String::new());
+}
+
 impl Value {
     fn display(&self) -> String {
         match self {
@@ -27,6 +32,7 @@ impl Value {
             Value::Boolean(true) => "#t".to_string(),
             Value::Boolean(false) => "#f".to_string(),
             Value::Str(s) => format!("\"{}\"", s),
+            Value::Char(c) => format!("#\\{}", c),
             Value::Symbol(s) => s.clone(),
             Value::List(items) => {
                 let inner: Vec<String> = items.iter().map(|v| v.display()).collect();
@@ -34,6 +40,19 @@ impl Value {
             }
             Value::Void => "#<void>".to_string(),
             Value::Lambda { .. } => "#<procedure>".to_string(),
+        }
+    }
+
+    /// Display without quotes (for `display`).
+    fn display_write(&self, write_mode: bool) -> String {
+        match self {
+            Value::Str(s) if write_mode => format!("\"{}\"", s),
+            Value::Str(s) => s.clone(),
+            Value::List(items) => {
+                let inner: Vec<String> = items.iter().map(|v| v.display_write(write_mode)).collect();
+                format!("({})", inner.join(" "))
+            }
+            _ => self.display(),
         }
     }
 
@@ -296,6 +315,18 @@ fn is_builtin(name: &str) -> bool {
             | "boolean?"
             | "pair?"
             | "symbol?"
+            | "display"
+            | "write"
+            | "newline"
+            | "string-append"
+            | "string-length"
+            | "substring"
+            | "string->number"
+            | "number->string"
+            | "symbol->string"
+            | "string->symbol"
+            | "string-ref"
+            | "char?"
     )
 }
 
@@ -793,6 +824,116 @@ fn eval_builtin(op: &str, args: &[Value]) -> Result<Value, EvalError> {
             }
             Ok(Value::Boolean(matches!(&args[0], Value::Symbol(_))))
         }
+        "display" => {
+            if args.len() != 1 {
+                return Err(EvalError::Arity("display requires 1 argument".into()));
+            }
+            let text = args[0].display_write(false);
+            OUTPUT_BUFFER.with(|buf| buf.borrow_mut().push_str(&text));
+            Ok(Value::Void)
+        }
+        "write" => {
+            if args.len() != 1 {
+                return Err(EvalError::Arity("write requires 1 argument".into()));
+            }
+            let text = args[0].display_write(true);
+            OUTPUT_BUFFER.with(|buf| buf.borrow_mut().push_str(&text));
+            Ok(Value::Void)
+        }
+        "newline" => {
+            if !args.is_empty() {
+                return Err(EvalError::Arity("newline requires 0 arguments".into()));
+            }
+            OUTPUT_BUFFER.with(|buf| buf.borrow_mut().push('\n'));
+            Ok(Value::Void)
+        }
+        "string-append" => {
+            let mut result = String::new();
+            for a in args {
+                match a {
+                    Value::Str(s) => result.push_str(s),
+                    _ => return Err(EvalError::Type("string-append: not a string".into())),
+                }
+            }
+            Ok(Value::Str(result))
+        }
+        "string-length" => {
+            if args.len() != 1 {
+                return Err(EvalError::Arity("string-length requires 1 argument".into()));
+            }
+            match &args[0] {
+                Value::Str(s) => Ok(Value::Integer(s.len() as i64)),
+                _ => Err(EvalError::Type("string-length: not a string".into())),
+            }
+        }
+        "substring" => {
+            if args.len() != 3 {
+                return Err(EvalError::Arity("substring requires 3 arguments".into()));
+            }
+            let s = match &args[0] {
+                Value::Str(s) => s,
+                _ => return Err(EvalError::Type("substring: not a string".into())),
+            };
+            let start = as_integer(&args[1])? as usize;
+            let end = as_integer(&args[2])? as usize;
+            Ok(Value::Str(s[start..end].to_string()))
+        }
+        "string->number" => {
+            if args.len() != 1 {
+                return Err(EvalError::Arity("string->number requires 1 argument".into()));
+            }
+            match &args[0] {
+                Value::Str(s) => match s.parse::<i64>() {
+                    Ok(n) => Ok(Value::Integer(n)),
+                    Err(_) => Ok(Value::Boolean(false)),
+                },
+                _ => Err(EvalError::Type("string->number: not a string".into())),
+            }
+        }
+        "number->string" => {
+            if args.len() != 1 {
+                return Err(EvalError::Arity("number->string requires 1 argument".into()));
+            }
+            let n = as_integer(&args[0])?;
+            Ok(Value::Str(n.to_string()))
+        }
+        "symbol->string" => {
+            if args.len() != 1 {
+                return Err(EvalError::Arity("symbol->string requires 1 argument".into()));
+            }
+            match &args[0] {
+                Value::Symbol(s) => Ok(Value::Str(s.clone())),
+                _ => Err(EvalError::Type("symbol->string: not a symbol".into())),
+            }
+        }
+        "string->symbol" => {
+            if args.len() != 1 {
+                return Err(EvalError::Arity("string->symbol requires 1 argument".into()));
+            }
+            match &args[0] {
+                Value::Str(s) => Ok(Value::Symbol(s.clone())),
+                _ => Err(EvalError::Type("string->symbol: not a string".into())),
+            }
+        }
+        "string-ref" => {
+            if args.len() != 2 {
+                return Err(EvalError::Arity("string-ref requires 2 arguments".into()));
+            }
+            let s = match &args[0] {
+                Value::Str(s) => s,
+                _ => return Err(EvalError::Type("string-ref: not a string".into())),
+            };
+            let idx = as_integer(&args[1])? as usize;
+            Ok(Value::Char(s.chars().nth(idx).ok_or_else(|| {
+                EvalError::Type("string-ref: index out of range".into())
+            })?))
+        }
+        "char?" => {
+            if args.len() != 1 {
+                return Err(EvalError::Arity("char? requires 1 argument".into()));
+            }
+            Ok(Value::Boolean(matches!(&args[0], Value::Char(_))))
+        }
         _ => Err(EvalError::UnboundVariable(op.to_string())),
     }
 }
@@ -835,8 +976,16 @@ pub fn eval_str(input: &str) -> Result<String, EvalError> {
 
 /// Evaluate Scheme expressions, returning both the result value and
 /// any output produced by `display`, `write`, or `newline`.
-pub fn eval_str_with_output(_input: &str) -> Result<(String, String), EvalError> {
-    todo!()
+pub fn eval_str_with_output(input: &str) -> Result<(String, String), EvalError> {
+    OUTPUT_BUFFER.with(|buf| buf.borrow_mut().clear());
+    let exprs = parse_all(input)?;
+    let env = new_env(None);
+    let mut result = Value::Void;
+    for expr in &exprs {
+        result = eval(expr, &env)?;
+    }
+    let output = OUTPUT_BUFFER.with(|buf| buf.borrow().clone());
+    Ok((result.display(), output))
 }
 
 #[cfg(test)]
