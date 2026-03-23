@@ -78,6 +78,7 @@ fn collect_pattern_vars_inner(pattern: &Value, literals: &[String], vars: &mut V
         | Value::Closure { .. }
         | Value::Continuation(_)
         | Value::Macro(_)
+        | Value::Values(_)
         | Value::Void => {}
     }
 }
@@ -171,6 +172,7 @@ fn match_pattern(
         | Value::Closure { .. }
         | Value::Continuation(_)
         | Value::Macro(_)
+        | Value::Values(_)
         | Value::Void => false,
     }
 }
@@ -225,6 +227,7 @@ fn expand_template(
         | Value::Closure { .. }
         | Value::Continuation(_)
         | Value::Macro(_)
+        | Value::Values(_)
         | Value::Void => template.clone(),
     }
 }
@@ -295,6 +298,7 @@ fn template_symbols(template: &Value) -> Vec<String> {
         | Value::Closure { .. }
         | Value::Continuation(_)
         | Value::Macro(_)
+        | Value::Values(_)
         | Value::Void => vec![],
     }
 }

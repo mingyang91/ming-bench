@@ -36,6 +36,7 @@ pub enum Value {
     },
     Continuation(u64),
     Macro(SyntaxRules),
+    Values(Vec<Value>),
     Void,
 }
 
@@ -54,6 +55,7 @@ impl PartialEq for Value {
             }
             (Value::Vector(a, _), Value::Vector(b, _)) => *a.borrow() == *b.borrow(),
             (Value::Continuation(a), Value::Continuation(b)) => a == b,
+            (Value::Values(a), Value::Values(b)) => a == b,
             (Value::Void, Value::Void) => true,
             _ => false,
         }
@@ -93,6 +95,7 @@ impl fmt::Display for Value {
             Value::Closure { .. } => write!(f, "#<procedure>"),
             Value::Continuation(_) => write!(f, "#<continuation>"),
             Value::Macro(_) => write!(f, "#<macro>"),
+            Value::Values(_) => write!(f, "#<values>"),
             Value::Void => write!(f, "#<void>"),
         }
     }
@@ -133,6 +136,7 @@ impl Value {
             | Value::Closure { .. }
             | Value::Continuation(_)
             | Value::Macro(_)
+            | Value::Values(_)
             | Value::Void => self.to_string(),
         }
     }
@@ -151,6 +155,7 @@ impl Value {
             Value::Closure { .. } => Span::default(),
             Value::Continuation(_) => Span::default(),
             Value::Macro(_) => Span::default(),
+            Value::Values(_) => Span::default(),
             Value::Void => Span::default(),
         }
     }

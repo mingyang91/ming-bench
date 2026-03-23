@@ -172,7 +172,8 @@ pub fn eval(expr: &Value, env: &Env) -> Result<Value, EvalError> {
             | Value::Vector(_, _)
             | Value::Closure { .. }
             | Value::Continuation(_)
-            | Value::Macro(_) => return Ok(current_expr),
+            | Value::Macro(_)
+            | Value::Values(_) => return Ok(current_expr),
             Value::Symbol(name, span) => {
                 if let Some(val) = current_env.get(name) {
                     return Ok(val);
@@ -201,7 +202,8 @@ pub fn eval(expr: &Value, env: &Env) -> Result<Value, EvalError> {
                     | "vector-length" | "vector?" | "vector->list" | "list->vector"
                     | "apply" | "dynamic-wind" | "reverse"
                     | "call/cc" | "call-with-current-continuation"
-                    | "raise" | "with-exception-handler" => Ok(current_expr.clone()),
+                    | "raise" | "with-exception-handler"
+                    | "values" | "call-with-values" => Ok(current_expr.clone()),
                     _ => Err(EvalError::UnboundVariable {
                         name: name.clone(),
                         span: *span,
@@ -1027,6 +1029,8 @@ fn apply_builtin(name: &str, args: &[Value], span: Span, env: &Env) -> Result<Va
         "reverse" => builtin_reverse(args, span),
         "raise" => builtin_raise(args, span),
         "with-exception-handler" => builtin_with_exception_handler(args, span, env),
+        "values" => builtin_values(args),
+        "call-with-values" => builtin_call_with_values(args, span, env),
         _ => Err(EvalError::UnboundVariable {
             name: name.to_string(),
             span,
@@ -1050,6 +1054,60 @@ fn call_thunk(thunk: &Value, span: Span, _env: &Env) -> Result<Value, EvalError>
         other => Err(EvalError::TypeMismatch {
             expected: "procedure".to_string(),
             got: other.to_string(),
+            span: other.span(),
+        }),
+    }
+}
+
+fn builtin_values(args: &[Value]) -> Result<Value, EvalError> {
+    match args.len() {
+        1 => Ok(args[0].clone()),
+        _ => Ok(Value::Values(args.to_vec())),
+    }
+}
+
+fn builtin_call_with_values(args: &[Value], span: Span, env: &Env) -> Result<Value, EvalError> {
+    if args.len() != 2 {
+        return Err(EvalError::WrongArgCount {
+            expected: "2".to_string(),
+            got: args.len(),
+            span,
+        });
+    }
+    let producer = &args[0];
+    let consumer = &args[1];
+    let produced = call_thunk(producer, span, env)?;
+    let consumer_args = match produced {
+        Value::Values(vals) => vals,
+        single => vec![single],
+    };
+    call_with_args(consumer, &consumer_args, span, env)
+}
+
+fn call_with_args(func: &Value, args: &[Value], span: Span, env: &Env) -> Result<Value, EvalError> {
+    match func {
+        Value::Closure {
+            ref params,
+            ref rest_param,
+            ref body,
+            env: ref closure_env,
+        } => {
+            let local_env = bind_closure_args(params, rest_param, args, closure_env, span)?;
+            eval(body, &local_env)
+        }
+        Value::Symbol(ref name, _) => apply_builtin(name, args, span, env),
+        Value::Continuation(id) => {
+            if args.len() != 1 {
+                return Err(EvalError::WrongArgCount {
+                    expected: "1".to_string(),
+                    got: args.len(),
+                    span,
+                });
+            }
+            Err(EvalError::ContinuationReturn { id: *id, value: args[0].clone() })
+        }
+        other => Err(EvalError::NotAProcedure {
+            value: other.to_string(),
             span: other.span(),
         }),
     }
