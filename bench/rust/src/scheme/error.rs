@@ -12,4 +12,10 @@ pub enum EvalError {
     DivisionByZero,
     #[error("arity mismatch: {0}")]
     Arity(String),
+    #[error("{source} at {line}:{col}")]
+    WithPosition {
+        source: Box<EvalError>,
+        line: usize,
+        col: usize,
+    },
 }
