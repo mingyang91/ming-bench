@@ -273,13 +273,9 @@ func Eval(expr Expr, env *Env) (SchemeValue, error) {
 				return fn.Fn(args, e, env)
 			case *Lambda:
 				// TCO: lambda application is tail call
-				if len(args) != len(fn.Params) {
-					line, col := e.Pos()
-					return nil, &EvalError{Message: fmt.Sprintf("%d:%d: wrong number of arguments: expected %d, got %d", line, col, len(fn.Params), len(args))}
-				}
-				localEnv := NewEnv(fn.Env)
-				for i, p := range fn.Params {
-					localEnv.Set(p, args[i])
+				localEnv, err := bindLambdaArgs(fn, args, e)
+				if err != nil {
+					return nil, err
 				}
 				// Evaluate all but last body expr, then tail-call the last
 				for _, bodyExpr := range fn.Body[:len(fn.Body)-1] {
@@ -304,9 +300,10 @@ func Eval(expr Expr, env *Env) (SchemeValue, error) {
 
 // Lambda is a user-defined closure.
 type Lambda struct {
-	Params []string
-	Body   []Expr
-	Env    *Env
+	Params    []string
+	RestParam string // empty if no rest param
+	Body      []Expr
+	Env       *Env
 }
 
 func (l *Lambda) String() string {
@@ -330,7 +327,7 @@ func evalDefine(e *ListExpr, env *Env) (SchemeValue, error) {
 		return &SchemeVoid{}, nil
 
 	case *ListExpr:
-		// (define (f params...) body...)
+		// (define (f params...) body...) or (define (f x . rest) body...)
 		if len(target.Elements) == 0 {
 			line, col := e.Pos()
 			return nil, &EvalError{Message: fmt.Sprintf("%d:%d: define: bad syntax", line, col)}
@@ -340,19 +337,15 @@ func evalDefine(e *ListExpr, env *Env) (SchemeValue, error) {
 			line, col := e.Pos()
 			return nil, &EvalError{Message: fmt.Sprintf("%d:%d: define: bad syntax", line, col)}
 		}
-		params := make([]string, len(target.Elements)-1)
-		for i, p := range target.Elements[1:] {
-			ps, ok := p.(*SymbolExpr)
-			if !ok {
-				line, col := e.Pos()
-				return nil, &EvalError{Message: fmt.Sprintf("%d:%d: define: bad syntax", line, col)}
-			}
-			params[i] = ps.Name
+		params, restParam, err := parseParams(target.Elements[1:], e)
+		if err != nil {
+			return nil, err
 		}
 		lam := &Lambda{
-			Params: params,
-			Body:   e.Elements[2:],
-			Env:    env,
+			Params:    params,
+			RestParam: restParam,
+			Body:      e.Elements[2:],
+			Env:       env,
 		}
 		env.Set(nameSym.Name, lam)
 		return &SchemeVoid{}, nil
@@ -370,27 +363,112 @@ func evalLambda(e *ListExpr, env *Env) (SchemeValue, error) {
 		return nil, &EvalError{Message: fmt.Sprintf("%d:%d: lambda: bad syntax", line, col)}
 	}
 
+	// (lambda args body...) — single symbol means all-rest
+	if sym, ok := e.Elements[1].(*SymbolExpr); ok {
+		return &Lambda{
+			RestParam: sym.Name,
+			Body:      e.Elements[2:],
+			Env:       env,
+		}, nil
+	}
+
 	paramList, ok := e.Elements[1].(*ListExpr)
 	if !ok {
 		line, col := e.Pos()
 		return nil, &EvalError{Message: fmt.Sprintf("%d:%d: lambda: bad syntax", line, col)}
 	}
 
-	params := make([]string, len(paramList.Elements))
-	for i, p := range paramList.Elements {
-		ps, ok := p.(*SymbolExpr)
-		if !ok {
-			line, col := e.Pos()
-			return nil, &EvalError{Message: fmt.Sprintf("%d:%d: lambda: bad syntax", line, col)}
-		}
-		params[i] = ps.Name
+	params, restParam, err := parseParams(paramList.Elements, e)
+	if err != nil {
+		return nil, err
 	}
 
 	return &Lambda{
-		Params: params,
-		Body:   e.Elements[2:],
-		Env:    env,
+		Params:    params,
+		RestParam: restParam,
+		Body:      e.Elements[2:],
+		Env:       env,
 	}, nil
+}
+
+// parseParams extracts parameter names and optional rest parameter from a param list.
+// Handles dot notation: (x y . rest)
+func parseParams(elements []Expr, callExpr *ListExpr) ([]string, string, error) {
+	var params []string
+	var restParam string
+	for i, p := range elements {
+		ps, ok := p.(*SymbolExpr)
+		if !ok {
+			line, col := callExpr.Pos()
+			return nil, "", &EvalError{Message: fmt.Sprintf("%d:%d: bad syntax", line, col)}
+		}
+		if ps.Name == "." {
+			// Next element is rest param, must be last
+			if i+2 != len(elements) {
+				line, col := callExpr.Pos()
+				return nil, "", &EvalError{Message: fmt.Sprintf("%d:%d: bad syntax", line, col)}
+			}
+			rs, ok := elements[i+1].(*SymbolExpr)
+			if !ok {
+				line, col := callExpr.Pos()
+				return nil, "", &EvalError{Message: fmt.Sprintf("%d:%d: bad syntax", line, col)}
+			}
+			restParam = rs.Name
+			break
+		}
+		params = append(params, ps.Name)
+	}
+	return params, restParam, nil
+}
+
+// bindLambdaArgs creates a new env binding lambda params to args, handling rest params.
+func bindLambdaArgs(fn *Lambda, args []SchemeValue, callExpr *ListExpr) (*Env, error) {
+	if fn.RestParam == "" {
+		if len(args) != len(fn.Params) {
+			line, col := callExpr.Pos()
+			return nil, &EvalError{Message: fmt.Sprintf("%d:%d: wrong number of arguments: expected %d, got %d", line, col, len(fn.Params), len(args))}
+		}
+	} else {
+		if len(args) < len(fn.Params) {
+			line, col := callExpr.Pos()
+			return nil, &EvalError{Message: fmt.Sprintf("%d:%d: wrong number of arguments: expected at least %d, got %d", line, col, len(fn.Params), len(args))}
+		}
+	}
+	localEnv := NewEnv(fn.Env)
+	for i, p := range fn.Params {
+		localEnv.Set(p, args[i])
+	}
+	if fn.RestParam != "" {
+		rest := args[len(fn.Params):]
+		localEnv.Set(fn.RestParam, sliceToList(rest))
+	}
+	return localEnv, nil
+}
+
+// sliceToList converts a Go slice of SchemeValues into a Scheme proper list.
+func sliceToList(vals []SchemeValue) SchemeValue {
+	var result SchemeValue = &SchemeEmpty{}
+	for i := len(vals) - 1; i >= 0; i-- {
+		result = &SchemePair{Car: vals[i], Cdr: result}
+	}
+	return result
+}
+
+// listToSlice converts a Scheme proper list to a Go slice.
+func listToSlice(v SchemeValue) ([]SchemeValue, bool) {
+	var result []SchemeValue
+	cur := v
+	for {
+		switch c := cur.(type) {
+		case *SchemePair:
+			result = append(result, c.Car)
+			cur = c.Cdr
+		case *SchemeEmpty:
+			return result, true
+		default:
+			return nil, false
+		}
+	}
 }
 
 // setupLet prepares the environment for a let form and returns the tail expression.
@@ -613,6 +691,7 @@ func init() {
 	builtins["string-ref"] = &BuiltinProc{Name: "string-ref", Fn: builtinStringRef}
 	builtins["string-copy"] = &BuiltinProc{Name: "string-copy", Fn: builtinStringCopy}
 	builtins["string-set!"] = &BuiltinProc{Name: "string-set!", Fn: builtinStringSet}
+	builtins["apply"] = &BuiltinProc{Name: "apply", Fn: builtinApply}
 }
 
 func builtinAdd(args []SchemeValue, callExpr *ListExpr) (SchemeValue, error) {
@@ -1176,4 +1255,48 @@ func builtinStringSet(args []SchemeValue, callExpr *ListExpr) (SchemeValue, erro
 	runes[idx.Value] = ch.Value
 	s.Value = string(runes)
 	return &SchemeVoid{}, nil
+}
+
+func builtinApply(args []SchemeValue, callExpr *ListExpr) (SchemeValue, error) {
+	if len(args) < 2 {
+		line, col := callExpr.Pos()
+		return nil, &EvalError{Message: fmt.Sprintf("%d:%d: apply: requires at least 2 arguments", line, col)}
+	}
+	fn := args[0]
+	// Last arg must be a list; prefix args are prepended
+	lastArg := args[len(args)-1]
+	tailArgs, ok := listToSlice(lastArg)
+	if !ok {
+		line, col := callExpr.Pos()
+		return nil, &EvalError{Message: fmt.Sprintf("%d:%d: apply: last argument must be a list", line, col)}
+	}
+	// Combine prefix args + tail list
+	var allArgs []SchemeValue
+	allArgs = append(allArgs, args[1:len(args)-1]...)
+	allArgs = append(allArgs, tailArgs...)
+
+	switch proc := fn.(type) {
+	case *BuiltinProc:
+		return proc.Fn(allArgs, callExpr)
+	case *EnvBuiltinProc:
+		// EnvBuiltinProc needs an env - we don't have one here, but apply on display/write is unusual
+		// Pass nil env; display/write look up $$output$$ from their env param
+		return proc.Fn(allArgs, callExpr, nil)
+	case *Lambda:
+		localEnv, err := bindLambdaArgs(proc, allArgs, callExpr)
+		if err != nil {
+			return nil, err
+		}
+		var result SchemeValue
+		for _, bodyExpr := range proc.Body {
+			result, err = Eval(bodyExpr, localEnv)
+			if err != nil {
+				return nil, err
+			}
+		}
+		return result, nil
+	default:
+		line, col := callExpr.Pos()
+		return nil, &EvalError{Message: fmt.Sprintf("%d:%d: apply: first argument must be a procedure", line, col)}
+	}
 }
