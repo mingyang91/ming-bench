@@ -4,6 +4,15 @@ import (
 	"fmt"
 )
 
+// TopEnv creates a new top-level environment with builtins.
+func TopEnv() *Env {
+	env := NewEnv(nil)
+	for name, proc := range builtins {
+		env.Set(name, proc)
+	}
+	return env
+}
+
 // EvalStr evaluates one or more Scheme expressions and returns the string
 // representation of the last result.
 func EvalStr(input string) (string, error) {
@@ -22,9 +31,10 @@ func EvalStr(input string) (string, error) {
 		return "", &EvalError{Message: "no expressions"}
 	}
 
+	env := TopEnv()
 	var result SchemeValue
 	for _, expr := range exprs {
-		result, err = Eval(expr)
+		result, err = Eval(expr, env)
 		if err != nil {
 			return "", err
 		}
@@ -40,8 +50,8 @@ func EvalStrWithOutput(input string) (result string, output string, err error) {
 	return r, "", err
 }
 
-// Eval evaluates an expression and returns a SchemeValue.
-func Eval(expr Expr) (SchemeValue, error) {
+// Eval evaluates an expression in the given environment.
+func Eval(expr Expr, env *Env) (SchemeValue, error) {
 	switch e := expr.(type) {
 	case *NumberExpr:
 		return &SchemeInt{Value: e.Value}, nil
@@ -53,8 +63,8 @@ func Eval(expr Expr) (SchemeValue, error) {
 		return &SchemeString{Value: e.Value}, nil
 
 	case *SymbolExpr:
-		if b, ok := builtins[e.Name]; ok {
-			return b, nil
+		if v, ok := env.Get(e.Name); ok {
+			return v, nil
 		}
 		line, col := e.Pos()
 		return nil, &EvalError{Message: fmt.Sprintf("%d:%d: unbound variable '%s'", line, col, e.Name)}
@@ -69,14 +79,26 @@ func Eval(expr Expr) (SchemeValue, error) {
 		if sym, ok := e.Elements[0].(*SymbolExpr); ok {
 			switch sym.Name {
 			case "and":
-				return evalAnd(e.Elements[1:])
+				return evalAnd(e.Elements[1:], env)
 			case "or":
-				return evalOr(e.Elements[1:])
+				return evalOr(e.Elements[1:], env)
+			case "define":
+				return evalDefine(e, env)
+			case "if":
+				return evalIf(e, env)
+			case "quote":
+				if len(e.Elements) != 2 {
+					line, col := e.Pos()
+					return nil, &EvalError{Message: fmt.Sprintf("%d:%d: quote: requires exactly 1 argument", line, col)}
+				}
+				return quoteExpr(e.Elements[1]), nil
+			case "lambda":
+				return evalLambda(e, env)
 			}
 		}
 
 		// Evaluate operator
-		op, err := Eval(e.Elements[0])
+		op, err := Eval(e.Elements[0], env)
 		if err != nil {
 			return nil, err
 		}
@@ -84,15 +106,18 @@ func Eval(expr Expr) (SchemeValue, error) {
 		// Evaluate arguments
 		args := make([]SchemeValue, len(e.Elements)-1)
 		for i, arg := range e.Elements[1:] {
-			args[i], err = Eval(arg)
+			args[i], err = Eval(arg, env)
 			if err != nil {
 				return nil, err
 			}
 		}
 
-		// Apply built-in procedures
-		if builtin, ok := op.(*BuiltinProc); ok {
-			return builtin.Fn(args, e)
+		// Apply
+		switch fn := op.(type) {
+		case *BuiltinProc:
+			return fn.Fn(args, e)
+		case *Lambda:
+			return applyLambda(fn, args, e)
 		}
 
 		line, col := e.Pos()
@@ -100,6 +125,160 @@ func Eval(expr Expr) (SchemeValue, error) {
 
 	default:
 		return nil, &EvalError{Message: "unknown expression type"}
+	}
+}
+
+// Lambda is a user-defined closure.
+type Lambda struct {
+	Params []string
+	Body   []Expr
+	Env    *Env
+}
+
+func (l *Lambda) String() string {
+	return "#<procedure>"
+}
+
+func evalDefine(e *ListExpr, env *Env) (SchemeValue, error) {
+	if len(e.Elements) < 3 {
+		line, col := e.Pos()
+		return nil, &EvalError{Message: fmt.Sprintf("%d:%d: define: bad syntax", line, col)}
+	}
+
+	switch target := e.Elements[1].(type) {
+	case *SymbolExpr:
+		// (define x expr)
+		val, err := Eval(e.Elements[2], env)
+		if err != nil {
+			return nil, err
+		}
+		env.Set(target.Name, val)
+		return &SchemeVoid{}, nil
+
+	case *ListExpr:
+		// (define (f params...) body...)
+		if len(target.Elements) == 0 {
+			line, col := e.Pos()
+			return nil, &EvalError{Message: fmt.Sprintf("%d:%d: define: bad syntax", line, col)}
+		}
+		nameSym, ok := target.Elements[0].(*SymbolExpr)
+		if !ok {
+			line, col := e.Pos()
+			return nil, &EvalError{Message: fmt.Sprintf("%d:%d: define: bad syntax", line, col)}
+		}
+		params := make([]string, len(target.Elements)-1)
+		for i, p := range target.Elements[1:] {
+			ps, ok := p.(*SymbolExpr)
+			if !ok {
+				line, col := e.Pos()
+				return nil, &EvalError{Message: fmt.Sprintf("%d:%d: define: bad syntax", line, col)}
+			}
+			params[i] = ps.Name
+		}
+		lam := &Lambda{
+			Params: params,
+			Body:   e.Elements[2:],
+			Env:    env,
+		}
+		env.Set(nameSym.Name, lam)
+		return &SchemeVoid{}, nil
+
+	default:
+		line, col := e.Pos()
+		return nil, &EvalError{Message: fmt.Sprintf("%d:%d: define: bad syntax", line, col)}
+	}
+}
+
+func evalIf(e *ListExpr, env *Env) (SchemeValue, error) {
+	if len(e.Elements) < 3 || len(e.Elements) > 4 {
+		line, col := e.Pos()
+		return nil, &EvalError{Message: fmt.Sprintf("%d:%d: if: bad syntax", line, col)}
+	}
+
+	cond, err := Eval(e.Elements[1], env)
+	if err != nil {
+		return nil, err
+	}
+
+	if isTruthy(cond) {
+		return Eval(e.Elements[2], env)
+	}
+	if len(e.Elements) == 4 {
+		return Eval(e.Elements[3], env)
+	}
+	return &SchemeVoid{}, nil
+}
+
+func evalLambda(e *ListExpr, env *Env) (SchemeValue, error) {
+	if len(e.Elements) < 3 {
+		line, col := e.Pos()
+		return nil, &EvalError{Message: fmt.Sprintf("%d:%d: lambda: bad syntax", line, col)}
+	}
+
+	paramList, ok := e.Elements[1].(*ListExpr)
+	if !ok {
+		line, col := e.Pos()
+		return nil, &EvalError{Message: fmt.Sprintf("%d:%d: lambda: bad syntax", line, col)}
+	}
+
+	params := make([]string, len(paramList.Elements))
+	for i, p := range paramList.Elements {
+		ps, ok := p.(*SymbolExpr)
+		if !ok {
+			line, col := e.Pos()
+			return nil, &EvalError{Message: fmt.Sprintf("%d:%d: lambda: bad syntax", line, col)}
+		}
+		params[i] = ps.Name
+	}
+
+	return &Lambda{
+		Params: params,
+		Body:   e.Elements[2:],
+		Env:    env,
+	}, nil
+}
+
+func applyLambda(fn *Lambda, args []SchemeValue, callExpr *ListExpr) (SchemeValue, error) {
+	if len(args) != len(fn.Params) {
+		line, col := callExpr.Pos()
+		return nil, &EvalError{Message: fmt.Sprintf("%d:%d: wrong number of arguments: expected %d, got %d", line, col, len(fn.Params), len(args))}
+	}
+
+	localEnv := NewEnv(fn.Env)
+	for i, p := range fn.Params {
+		localEnv.Set(p, args[i])
+	}
+
+	var result SchemeValue
+	var err error
+	for _, bodyExpr := range fn.Body {
+		result, err = Eval(bodyExpr, localEnv)
+		if err != nil {
+			return nil, err
+		}
+	}
+	return result, nil
+}
+
+// quoteExpr converts a parsed Expr into a SchemeValue without evaluation.
+func quoteExpr(expr Expr) SchemeValue {
+	switch e := expr.(type) {
+	case *NumberExpr:
+		return &SchemeInt{Value: e.Value}
+	case *BoolExpr:
+		return &SchemeBool{Value: e.Value}
+	case *StringExpr:
+		return &SchemeString{Value: e.Value}
+	case *SymbolExpr:
+		return &SchemeSymbol{Name: e.Name}
+	case *ListExpr:
+		elems := make([]SchemeValue, len(e.Elements))
+		for i, el := range e.Elements {
+			elems[i] = quoteExpr(el)
+		}
+		return &SchemeList{Elements: elems}
+	default:
+		return &SchemeVoid{}
 	}
 }
 
@@ -121,11 +300,11 @@ func isTruthy(v SchemeValue) bool {
 	return true
 }
 
-func evalAnd(exprs []Expr) (SchemeValue, error) {
+func evalAnd(exprs []Expr, env *Env) (SchemeValue, error) {
 	var result SchemeValue = &SchemeBool{Value: true}
 	for _, expr := range exprs {
 		var err error
-		result, err = Eval(expr)
+		result, err = Eval(expr, env)
 		if err != nil {
 			return nil, err
 		}
@@ -136,11 +315,11 @@ func evalAnd(exprs []Expr) (SchemeValue, error) {
 	return result, nil
 }
 
-func evalOr(exprs []Expr) (SchemeValue, error) {
+func evalOr(exprs []Expr, env *Env) (SchemeValue, error) {
 	var result SchemeValue = &SchemeBool{Value: false}
 	for _, expr := range exprs {
 		var err error
-		result, err = Eval(expr)
+		result, err = Eval(expr, env)
 		if err != nil {
 			return nil, err
 		}
