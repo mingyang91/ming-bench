@@ -22,7 +22,8 @@ type SchemeVal =
   | { tag: 'callcc'; pos?: Pos }
   | { tag: 'macro'; literals: string[]; rules: SyntaxRule[]; defEnv: Env; pos?: Pos }
   | { tag: 'values'; elements: SchemeVal[]; pos?: Pos }
-  | { tag: 'rational'; num: number; den: number; pos?: Pos };
+  | { tag: 'rational'; num: number; den: number; pos?: Pos }
+  | { tag: 'record'; typeId: number; typeName: string; fields: Map<string, SchemeVal>; pos?: Pos };
 
 type SyntaxRule = { pattern: SchemeVal[]; template: SchemeVal };
 
@@ -162,6 +163,7 @@ function parseParams(elements: SchemeVal[], errPos?: Pos): { params: string[]; r
 // ── Macro Support ─────────────────────────────────────────────────
 
 let gensymCounter = 0;
+let recordTypeCounter = 0;
 function gensym(base: string): string { return `##${base}_${gensymCounter++}`; }
 
 const SPECIAL_FORMS = new Set([
@@ -723,6 +725,61 @@ function evalK(expr: SchemeVal, env: Env, k: Kont): Bounce {
           exHandlers.pop();
           return guardK(bodyVal);
         });
+      }
+
+      case 'define-record-type': {
+        // (define-record-type <name> (constructor field ...) predicate (field accessor) ...)
+        if (elems.length < 4) throw posError('define-record-type: bad syntax', expr.pos);
+        const rtName = elems[1];
+        if (rtName.tag !== 'symbol') throw posError('define-record-type: name must be symbol', expr.pos);
+        const ctorSpec = elems[2];
+        if (ctorSpec.tag !== 'list' || ctorSpec.elements.length < 1 || ctorSpec.elements[0].tag !== 'symbol')
+          throw posError('define-record-type: bad constructor spec', expr.pos);
+        const ctorName = ctorSpec.elements[0].value;
+        const ctorFields = ctorSpec.elements.slice(1).map(e => {
+          if (e.tag !== 'symbol') throw posError('define-record-type: field must be symbol', expr.pos);
+          return e.value;
+        });
+        const predSym = elems[3];
+        if (predSym.tag !== 'symbol') throw posError('define-record-type: predicate must be symbol', expr.pos);
+        const predName = predSym.value;
+        const typeId = recordTypeCounter++;
+
+        // Parse field accessors
+        const accessors: { field: string; accessor: string }[] = [];
+        for (let fi = 4; fi < elems.length; fi++) {
+          const fspec = elems[fi];
+          if (fspec.tag !== 'list' || fspec.elements.length < 2 ||
+              fspec.elements[0].tag !== 'symbol' || fspec.elements[1].tag !== 'symbol')
+            throw posError('define-record-type: bad field spec', expr.pos);
+          accessors.push({ field: fspec.elements[0].value, accessor: fspec.elements[1].value });
+        }
+
+        // Define constructor
+        env.set(ctorName, { tag: 'builtin', name: ctorName, fn: (args, p) => {
+          if (args.length !== ctorFields.length) throw posError(`${ctorName}: wrong number of arguments`, p);
+          const fields = new Map<string, SchemeVal>();
+          for (let i = 0; i < ctorFields.length; i++) fields.set(ctorFields[i], args[i]);
+          return { tag: 'record', typeId, typeName: rtName.value, fields };
+        }});
+
+        // Define predicate
+        env.set(predName, { tag: 'builtin', name: predName, fn: (args, p) => {
+          if (args.length !== 1) throw posError(`${predName}: need 1 argument`, p);
+          return { tag: 'boolean', value: args[0].tag === 'record' && args[0].typeId === typeId };
+        }});
+
+        // Define accessors
+        for (const { field, accessor } of accessors) {
+          env.set(accessor, { tag: 'builtin', name: accessor, fn: (args, p) => {
+            if (args.length !== 1) throw posError(`${accessor}: need 1 argument`, p);
+            if (args[0].tag !== 'record' || args[0].typeId !== typeId)
+              throw posError(`${accessor}: expected ${rtName.value}`, p);
+            return args[0].fields.get(field)!;
+          }});
+        }
+
+        return k({ tag: 'void' });
       }
 
       case 'define-syntax': {
@@ -1471,6 +1528,7 @@ function displayVal(val: SchemeVal): string {
     case 'callcc': return '#<procedure>';
     case 'macro': return '#<macro>';
     case 'values': return val.elements.map(displayVal).join('\n');
+    case 'record': return `#<${val.typeName}>`;
   }
 }
 
