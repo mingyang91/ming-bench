@@ -32,85 +32,95 @@ object Interpreter:
     if remaining.nonEmpty then ContinuationManager.bodyContext = BodyContext(remaining, env)
 
   def eval(expr0: SchemeValue, env0: Environment): SchemeValue =
-    var curExpr: SchemeValue = expr0
-    var curEnv: Environment  = env0
+    var curExpr: SchemeValue          = expr0
+    var curEnv: Environment           = env0
+    var guardFrames: List[GuardFrame] = Nil
 
     while true do
-      curExpr match
-        // Self-evaluating
-        case IntVal(_, _) | RationalVal(_, _, _) | DoubleVal(_, _) | BoolVal(_, _) | StringVal(_, _) |
-            MutableStringVal(_, _) | CharVal(_, _) | PairVal(_, _) | MutablePairVal(_) | VectorVal(_, _) |
-            LambdaVal(_, _, _, _) | BuiltinVal(_, _) | ContinuationVal(_, _, _, _, _, _, _) |
-            SyntaxRulesVal(_, _, _, _) | SyntaxTransformerVal(_) | ValuesVal(_) | RecordVal(_, _, _) | Void =>
-          return curExpr
+      try
+        curExpr match
+          // Self-evaluating
+          case IntVal(_, _) | RationalVal(_, _, _) | DoubleVal(_, _) | BoolVal(_, _) | StringVal(_, _) |
+              MutableStringVal(_, _) | CharVal(_, _) | PairVal(_, _) | MutablePairVal(_) | VectorVal(_, _) |
+              LambdaVal(_, _, _, _) | BuiltinVal(_, _) | ContinuationVal(_, _, _, _, _, _, _) |
+              SyntaxRulesVal(_, _, _, _) | SyntaxTransformerVal(_) | ValuesVal(_) | RecordVal(_, _, _) | Void =>
+            return curExpr
 
-        // Symbol lookup
-        case SymbolVal(name, pos) =>
-          return curEnv.get(name).getOrElse(throw new EvalError(posMsg(s"unbound variable: $name", pos)))
+          // Symbol lookup
+          case SymbolVal(name, pos) =>
+            return curEnv.get(name).getOrElse(throw new EvalError(posMsg(s"unbound variable: $name", pos)))
 
-        // Empty application
-        case ListVal(Nil, pos) =>
-          throw new EvalError(posMsg("empty application", pos))
+          // Empty application
+          case ListVal(Nil, pos) =>
+            throw new EvalError(posMsg("empty application", pos))
 
-        // Special forms
-        case ListVal(SymbolVal("define", _) :: args, pos) =>
-          return SpecialForms.evalDefine(args, pos, curEnv)
+          // Special forms
+          case ListVal(SymbolVal("define", _) :: args, pos) =>
+            return SpecialForms.evalDefine(args, pos, curEnv)
 
-        case ListVal(SymbolVal("quote", _) :: args, pos) =>
-          return SpecialForms.evalQuote(args, pos)
+          case ListVal(SymbolVal("quote", _) :: args, pos) =>
+            return SpecialForms.evalQuote(args, pos)
 
-        case ListVal(SymbolVal("lambda", _) :: args, pos) =>
-          return SpecialForms.evalLambda(args, pos, curEnv)
+          case ListVal(SymbolVal("lambda", _) :: args, pos) =>
+            return SpecialForms.evalLambda(args, pos, curEnv)
 
-        case ListVal(SymbolVal("set!", _) :: args, pos) =>
-          return SpecialForms.evalSet(args, pos, curEnv)
+          case ListVal(SymbolVal("set!", _) :: args, pos) =>
+            return SpecialForms.evalSet(args, pos, curEnv)
 
-        case ListVal(SymbolVal("begin", _) :: args, _) =>
-          if args.isEmpty then return Void
-          evalBodyInit(args, curEnv)
-          curExpr = args.last
+          case ListVal(SymbolVal("begin", _) :: args, _) =>
+            if args.isEmpty then return Void
+            evalBodyInit(args, curEnv)
+            curExpr = args.last
 
-        case ListVal(SymbolVal("define-syntax", _) :: args, pos) =>
-          return SpecialForms.evalDefineSyntax(args, pos, curEnv)
+          case ListVal(SymbolVal("define-syntax", _) :: args, pos) =>
+            return SpecialForms.evalDefineSyntax(args, pos, curEnv)
 
-        case ListVal(SymbolVal("guard", _) :: args, pos) =>
-          return WindException.evalGuard(args, pos, curEnv)
+          case ListVal(SymbolVal("guard", _) :: args, pos) =>
+            val (varName, clauses, body) = WindException.parseGuard(args)
+            guardFrames = GuardFrame(varName, clauses, curEnv) :: guardFrames
+            if body.length > 1 then evalBodyInit(body, curEnv)
+            curExpr = body.last
 
-        case ListVal(SymbolVal("define-record-type", _) :: args, pos) =>
-          return RecordForms.evalDefineRecordType(args, pos, curEnv)
+          case ListVal(SymbolVal("define-record-type", _) :: args, pos) =>
+            return RecordForms.evalDefineRecordType(args, pos, curEnv)
 
-        case ListVal(SymbolVal("syntax-case", _) :: args, pos) =>
-          return SyntaxCase.evalSyntaxCase(args, pos, curEnv)
+          case ListVal(SymbolVal("syntax-case", _) :: args, pos) =>
+            return SyntaxCase.evalSyntaxCase(args, pos, curEnv)
 
-        case ListVal(SymbolVal("syntax-quote", _) :: template :: Nil, _) =>
-          return SyntaxCase.evalSyntaxQuote(template)
+          case ListVal(SymbolVal("syntax-quote", _) :: template :: Nil, _) =>
+            return SyntaxCase.evalSyntaxQuote(template)
 
-        case ListVal(SymbolVal("with-syntax", _) :: args, pos) =>
-          return SyntaxCase.evalWithSyntax(args, pos, curEnv)
+          case ListVal(SymbolVal("with-syntax", _) :: args, pos) =>
+            return SyntaxCase.evalWithSyntax(args, pos, curEnv)
 
-        case ListVal(SymbolVal(name, _) :: args, pos) if tailCallForms.contains(name) =>
-          dispatchTailForm(name, args, pos, curEnv) match
-            case Done(v)          => return v
-            case TailCall(e, env) => curExpr = e; curEnv = env
+          case ListVal(SymbolVal(name, _) :: args, pos) if tailCallForms.contains(name) =>
+            dispatchTailForm(name, args, pos, curEnv) match
+              case Done(v)          => return v
+              case TailCall(e, env) => curExpr = e; curEnv = env
 
-        // Macro expansion
-        case ListVal((sym @ SymbolVal(name, _)) :: _, pos) =>
-          curEnv.get(name) match
-            case Some(SyntaxRulesVal(mn, lits, rules, defEnv)) =>
-              curExpr = Macro.expand(mn, lits, rules, defEnv, curExpr)
-            case Some(SyntaxTransformerVal(proc)) =>
-              curExpr = applyProc(proc, List(curExpr), pos)
-            case _ =>
-              val args = curExpr.asInstanceOf[ListVal].elements.tail
-              evalApplication(sym, args, pos, curEnv) match
-                case Done(v)          => return v
-                case TailCall(e, env) => curExpr = e; curEnv = env
+          // Macro expansion
+          case ListVal((sym @ SymbolVal(name, _)) :: _, pos) =>
+            curEnv.get(name) match
+              case Some(SyntaxRulesVal(mn, lits, rules, defEnv)) =>
+                curExpr = Macro.expand(mn, lits, rules, defEnv, curExpr)
+              case Some(SyntaxTransformerVal(proc)) =>
+                curExpr = applyProc(proc, List(curExpr), pos)
+              case _ =>
+                val args = curExpr.asInstanceOf[ListVal].elements.tail
+                evalApplication(sym, args, pos, curEnv) match
+                  case Done(v)          => return v
+                  case TailCall(e, env) => curExpr = e; curEnv = env
 
-        // Procedure application (non-symbol head)
-        case ListVal(head :: args, pos) =>
-          evalApplication(head, args, pos, curEnv) match
-            case Done(v)          => return v
-            case TailCall(e, env) => curExpr = e; curEnv = env
+          // Procedure application (non-symbol head)
+          case ListVal(head :: args, pos) =>
+            evalApplication(head, args, pos, curEnv) match
+              case Done(v)          => return v
+              case TailCall(e, env) => curExpr = e; curEnv = env
+      catch
+        case e: SchemeRaise =>
+          val result = WindException.tryGuardFrames(guardFrames, e)
+          guardFrames = result._1
+          return result._2
 
     // Unreachable but needed for type checker
     throw new AssertionError("unreachable")
@@ -153,8 +163,11 @@ object Interpreter:
               throw new EvalError(posMsg(e.getMessage, callPos))
             else throw e
       case ContinuationVal(contId, bodyExprs, bodyEnv, ctxStack, seqRem, seqE, hasSame) =>
-        if args.length != 1 then throw new EvalError(posMsg("continuation: requires 1 argument", callPos))
-        throw new ContinuationJump(contId, args.head, bodyExprs, bodyEnv, ctxStack, seqRem, seqE, hasSame)
+        val jumpValue = args match
+          case Nil           => Void
+          case single :: Nil => single
+          case multiple      => ValuesVal(multiple)
+        throw new ContinuationJump(contId, jumpValue, bodyExprs, bodyEnv, ctxStack, seqRem, seqE, hasSame)
       case _ =>
         throw new EvalError(posMsg("not a procedure", callPos))
 
@@ -265,7 +278,10 @@ object Interpreter:
               throw new EvalError(posMsg(e.getMessage, pos))
             else throw e
       case ContinuationVal(contId, bodyExprs, bodyEnv, ctxStack, seqRem, seqE, hasSame) =>
-        if evaledArgs.length != 1 then throw new EvalError(posMsg("continuation: requires 1 argument", pos))
-        throw new ContinuationJump(contId, evaledArgs.head, bodyExprs, bodyEnv, ctxStack, seqRem, seqE, hasSame)
+        val jumpValue = evaledArgs match
+          case Nil           => Void
+          case single :: Nil => single
+          case multiple      => ValuesVal(multiple)
+        throw new ContinuationJump(contId, jumpValue, bodyExprs, bodyEnv, ctxStack, seqRem, seqE, hasSame)
       case _ =>
         throw new EvalError(posMsg("not a procedure", pos))

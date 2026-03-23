@@ -2,6 +2,9 @@ package ming
 
 import SchemeValue.*
 
+/** Guard frame for trampoline-based guard handling. */
+private[ming] case class GuardFrame(varName: String, clauses: List[SchemeValue], env: Environment)
+
 /** Dynamic-wind, raise, with-exception-handler, and guard operations. */
 object WindException:
 
@@ -91,7 +94,16 @@ object WindException:
             evalGuardClauses(clauses, guardEnv, e)
       case _ => throw new EvalError("guard: bad syntax")
 
-  private def evalGuardClauses(
+  /** Parse a guard form's arguments, returning (varName, clauses, body). */
+  private[ming] def parseGuard(
+    args: List[SchemeValue]
+  ): (String, List[SchemeValue], List[SchemeValue]) =
+    args match
+      case ListVal(SymbolVal(varName, _) :: clauses, _) :: body if body.nonEmpty =>
+        (varName, clauses, body)
+      case _ => throw new EvalError("guard: bad syntax")
+
+  private[ming] def evalGuardClauses(
     clauses: List[SchemeValue],
     env: Environment,
     original: SchemeRaise
@@ -113,3 +125,19 @@ object WindException:
         case _ => throw new EvalError("guard: bad clause")
     // No clause matched, re-raise
     throw original
+
+  /** Try guard frames in order; return remaining frames and result, or re-raise. */
+  private[ming] def tryGuardFrames(
+    frames: List[GuardFrame],
+    initial: SchemeRaise
+  ): (List[GuardFrame], SchemeValue) =
+    var remaining = frames
+    var ex        = initial
+    while remaining.nonEmpty do
+      val frame = remaining.head
+      remaining = remaining.tail
+      val guardEnv = frame.env.child()
+      guardEnv.define(frame.varName, ex.value)
+      try return (remaining, evalGuardClauses(frame.clauses, guardEnv, ex))
+      catch case reRaise: SchemeRaise => ex = reRaise
+    throw ex
