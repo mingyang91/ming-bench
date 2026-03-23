@@ -98,6 +98,15 @@ public class Evaluator {
         void define(String name, Object value) {
             bindings.put(name, value);
         }
+
+        boolean set(String name, Object value) {
+            if (bindings.containsKey(name)) {
+                bindings.put(name, value);
+                return true;
+            }
+            if (parent != null) return parent.set(name, value);
+            return false;
+        }
     }
 
     // --- Lambda ---
@@ -464,6 +473,15 @@ public class Evaluator {
                             }
                             expr = list.get(list.size() - 1);
                             continue; // TCO for last expression
+                        }
+                        case "set!" -> {
+                            if (list.size() != 3) throw posError("set!: bad syntax");
+                            Object nameObj = list.get(1);
+                            if (nameObj instanceof Located ln) nameObj = ln.value();
+                            if (!(nameObj instanceof String name)) throw posError("set!: expected symbol");
+                            Object val = eval(list.get(2), env);
+                            if (!env.set(name, val)) throw posError("set!: unbound variable: " + name);
+                            return VOID;
                         }
                         case "cond" -> {
                             Object condTail = evalCondTail(list, env);
