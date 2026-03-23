@@ -29,6 +29,7 @@ pub enum Value {
     Symbol(String, Span),
     Char(char, Span),
     List(Vec<Value>, Span),
+    Pair(Rc<RefCell<(Value, Value)>>, Span),
     Vector(Rc<RefCell<Vec<Value>>>, Span),
     Closure {
         params: Vec<String>,
@@ -94,6 +95,7 @@ impl PartialEq for Value {
             (Value::Symbol(a, _), Value::Symbol(b, _)) => a == b,
             (Value::Char(a, _), Value::Char(b, _)) => a == b,
             (Value::List(a, _), Value::List(b, _)) => a == b,
+            (Value::Pair(a, _), Value::Pair(b, _)) => *a.borrow() == *b.borrow(),
             (Value::Closure { params: p1, rest_param: r1, body: b1, env: e1 },
              Value::Closure { params: p2, rest_param: r2, body: b2, env: e2 }) => {
                 p1 == p2 && r1 == r2 && b1 == b2 && e1 == e2
@@ -106,6 +108,50 @@ impl PartialEq for Value {
             (Value::Void, Value::Void) => true,
             _ => false,
         }
+    }
+}
+
+fn fmt_pair_tail(cdr: &Value, f: &mut fmt::Formatter<'_>, depth: usize) -> fmt::Result {
+    if depth > 10000 {
+        return write!(f, " ...");
+    }
+    match cdr {
+        Value::List(elems, _) if elems.is_empty() => Ok(()),
+        Value::List(elems, _) => {
+            // Flat list as cdr — print elements inline
+            for elem in elems {
+                write!(f, " {elem}")?;
+            }
+            Ok(())
+        }
+        Value::Pair(cell, _) => {
+            let borrowed = cell.borrow();
+            write!(f, " {}", borrowed.0)?;
+            fmt_pair_tail(&borrowed.1, f, depth + 1)
+        }
+        other => write!(f, " . {other}"),
+    }
+}
+
+fn display_pair_tail(cdr: &Value, depth: usize) -> String {
+    if depth > 10000 {
+        return " ...".to_string();
+    }
+    match cdr {
+        Value::List(elems, _) if elems.is_empty() => String::new(),
+        Value::List(elems, _) => {
+            let mut out = String::new();
+            for elem in elems {
+                out.push(' ');
+                out.push_str(&elem.display_string());
+            }
+            out
+        }
+        Value::Pair(cell, _) => {
+            let borrowed = cell.borrow();
+            format!(" {}{}", borrowed.0.display_string(), display_pair_tail(&borrowed.1, depth + 1))
+        }
+        other => format!(" . {}", other.display_string()),
     }
 }
 
@@ -134,6 +180,13 @@ impl fmt::Display for Value {
                     }
                     write!(f, "{elem}")?;
                 }
+                write!(f, ")")
+            }
+            Value::Pair(cell, _) => {
+                write!(f, "(")?;
+                let borrowed = cell.borrow();
+                write!(f, "{}", borrowed.0)?;
+                fmt_pair_tail(&borrowed.1, f, 0)?;
                 write!(f, ")")
             }
             Value::Vector(elems, _) => {
@@ -175,6 +228,10 @@ impl Value {
                 out.push(')');
                 out
             }
+            Value::Pair(cell, _) => {
+                let borrowed = cell.borrow();
+                format!("({}{})", borrowed.0.display_string(), display_pair_tail(&borrowed.1, 0))
+            }
             Value::Vector(elems, _) => {
                 let borrowed = elems.borrow();
                 let mut out = String::from("#(");
@@ -214,6 +271,7 @@ impl Value {
             | Value::Symbol(_, s)
             | Value::Char(_, s)
             | Value::List(_, s)
+            | Value::Pair(_, s)
             | Value::Vector(_, s) => *s,
             Value::Closure { .. } => Span::default(),
             Value::Continuation(_) => Span::default(),
@@ -253,5 +311,15 @@ impl Value {
     }
     pub fn vector(elems: Vec<Value>) -> Self {
         Value::Vector(Rc::new(RefCell::new(elems)), Span::default())
+    }
+    pub fn pair(car: Value, cdr: Value) -> Self {
+        Value::Pair(Rc::new(RefCell::new((car, cdr))), Span::default())
+    }
+    /// Build a proper list from a Vec as a chain of Pair cells ending in '().
+    pub fn pair_list(elems: Vec<Value>) -> Self {
+        elems
+            .into_iter()
+            .rev()
+            .fold(Value::list(Vec::new()), |acc, elem| Value::pair(elem, acc))
     }
 }

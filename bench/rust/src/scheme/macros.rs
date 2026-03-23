@@ -76,6 +76,7 @@ fn collect_pattern_vars_inner(pattern: &Value, literals: &[String], vars: &mut V
         | Value::Boolean(_, _)
         | Value::String(_, _, _)
         | Value::Char(_, _)
+        | Value::Pair(_, _)
         | Value::Vector(_, _)
         | Value::Closure { .. }
         | Value::Continuation(_)
@@ -174,6 +175,7 @@ fn match_pattern(
         Value::Boolean(a, _) => matches!(input, Value::Boolean(b, _) if a == b),
         Value::String(_, _, _)
         | Value::Char(_, _)
+        | Value::Pair(_, _)
         | Value::Vector(_, _)
         | Value::Closure { .. }
         | Value::Continuation(_)
@@ -233,6 +235,7 @@ fn expand_template(
         | Value::Boolean(_, _)
         | Value::String(_, _, _)
         | Value::Char(_, _)
+        | Value::Pair(_, _)
         | Value::Vector(_, _)
         | Value::Closure { .. }
         | Value::Continuation(_)
@@ -308,6 +311,7 @@ fn template_symbols(template: &Value) -> Vec<String> {
         | Value::Boolean(_, _)
         | Value::String(_, _, _)
         | Value::Char(_, _)
+        | Value::Pair(_, _)
         | Value::Vector(_, _)
         | Value::Closure { .. }
         | Value::Continuation(_)
@@ -464,5 +468,23 @@ fn is_builtin(name: &str) -> bool {
             | "string-ci=?"
             | "string-upcase"
             | "string-downcase"
+            | "set-car!"
+            | "set-cdr!"
+            | "for-each"
+            | "assq"
+            | "assv"
+            | "memq"
+            | "memv"
+            | "member"
+            | "caar"
+            | "cadr"
+            | "cdar"
+            | "cddr"
+            | "caaar"
+            | "caadr"
+            | "caddr"
+            | "cdddr"
+            | "caddar"
+            | "cadddr"
     )
 }
