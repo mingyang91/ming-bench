@@ -16,9 +16,16 @@ struct BodyFrame {
     env: Env,
 }
 
+#[derive(Clone)]
+struct Winder {
+    in_thunk: Value,
+    out_thunk: Value,
+}
+
 struct ContData {
     id: usize,
     frame: Option<BodyFrame>,
+    winders: Vec<Winder>,
 }
 
 thread_local! {
@@ -30,6 +37,7 @@ thread_local! {
     static CONT_RESULT_VALUE: RefCell<Option<Value>> = RefCell::new(None);
     /// Set of cont_ids whose call/cc is still on the call stack.
     static ACTIVE_CALLCC: RefCell<Vec<usize>> = RefCell::new(Vec::new());
+    static WINDERS: RefCell<Vec<Winder>> = RefCell::new(Vec::new());
 }
 
 /// Handle result from a non-tail body expression.
@@ -76,6 +84,7 @@ fn init_cont_state() {
     CONT_RETURN_VALUE.with(|v| *v.borrow_mut() = None);
     CONT_RESULT_VALUE.with(|v| *v.borrow_mut() = None);
     ACTIVE_CALLCC.with(|ac| ac.borrow_mut().clear());
+    WINDERS.with(|w| w.borrow_mut().clear());
 }
 
 /// Evaluate a body (sequence of expressions) for continuation replay.
@@ -105,8 +114,22 @@ fn replay_continuation(cont_data: &Rc<ContData>, initial_val: Value) -> Result<V
         .ok_or_else(|| EvalError::Runtime("continuation has no frame".into()))?;
     let mut val = initial_val;
     loop {
+        // Rewind: run in-thunks and push winders
+        for winder in &cont_data.winders {
+            apply_value(&winder.in_thunk, &[])?;
+            WINDERS.with(|w| w.borrow_mut().push(winder.clone()));
+        }
+
         CALLCC_OVERRIDE.with(|o| *o.borrow_mut() = Some(val));
-        match eval_body_for_replay(&frame.exprs, &frame.env) {
+        let result = eval_body_for_replay(&frame.exprs, &frame.env);
+
+        // Unwind: pop winders and run out-thunks (reverse order)
+        for winder in cont_data.winders.iter().rev() {
+            WINDERS.with(|w| w.borrow_mut().pop());
+            let _ = apply_value(&winder.out_thunk, &[]);
+        }
+
+        match result {
             Ok(v) => return Ok(v),
             Err(EvalError::ContinuationReturn { cont_id }) if cont_id == cont_data.id => {
                 // Same continuation invoked again — loop with new value
@@ -530,6 +553,28 @@ fn eval_inner(expr: &Expr, env: &Env) -> Result<Trampoline, EvalError> {
                     "do" => return eval_do(expr, &elems[1..], env, span),
                     "vector-set!" => return eval_vector_set(&elems[1..], env, span).map(Trampoline::Done),
                     "define-syntax" => return eval_define_syntax(&elems[1..], env, span).map(Trampoline::Done),
+                    "dynamic-wind" => {
+                        if elems.len() != 4 {
+                            return Err(EvalError::Arity("dynamic-wind requires 3 arguments".into()).with_position(span.line, span.col));
+                        }
+                        let in_thunk = eval(&elems[1], env)?;
+                        let body_thunk = eval(&elems[2], env)?;
+                        let out_thunk = eval(&elems[3], env)?;
+
+                        apply_value(&in_thunk, &[])?;
+
+                        WINDERS.with(|w| w.borrow_mut().push(Winder {
+                            in_thunk: in_thunk.clone(),
+                            out_thunk: out_thunk.clone(),
+                        }));
+
+                        let body_result = apply_value(&body_thunk, &[]);
+
+                        WINDERS.with(|w| w.borrow_mut().pop());
+                        apply_value(&out_thunk, &[])?;
+
+                        return body_result.map(Trampoline::Done);
+                    }
                     _ => {
                         // Check for macro application
                         if let Some(Value::Macro { literals, rules, def_env }) = env_get(env, op) {
@@ -618,7 +663,8 @@ fn apply_tc(func: &Value, args: &[Value]) -> Result<Trampoline, EvalError> {
 
             let id = NEXT_CONT_ID.with(|c| { let v = c.get(); c.set(v + 1); v });
             let frame = BODY_FRAMES.with(|bf| bf.borrow().last().cloned());
-            let cont_data = Rc::new(ContData { id, frame });
+            let winders = WINDERS.with(|w| w.borrow().clone());
+            let cont_data = Rc::new(ContData { id, frame, winders });
             CONT_REGISTRY.with(|cr| cr.borrow_mut().insert(id, cont_data.clone()));
 
             let cont_val = Value::Continuation(cont_data);
@@ -639,8 +685,17 @@ fn apply_tc(func: &Value, args: &[Value]) -> Result<Trampoline, EvalError> {
             if args.len() != 1 {
                 return Err(EvalError::Arity("continuation requires 1 argument".into()));
             }
-            CONT_RETURN_VALUE.with(|v| *v.borrow_mut() = Some(args[0].clone()));
-            Err(EvalError::ContinuationReturn { cont_id: cont_data.id })
+            let is_active = ACTIVE_CALLCC.with(|ac| ac.borrow().contains(&cont_data.id));
+            if is_active {
+                CONT_RETURN_VALUE.with(|v| *v.borrow_mut() = Some(args[0].clone()));
+                Err(EvalError::ContinuationReturn { cont_id: cont_data.id })
+            } else if !cont_data.winders.is_empty() {
+                // Escaped continuation with winders — replay to re-enter dynamic-wind extents
+                replay_continuation(cont_data, args[0].clone()).map(Trampoline::Done)
+            } else {
+                CONT_RETURN_VALUE.with(|v| *v.borrow_mut() = Some(args[0].clone()));
+                Err(EvalError::ContinuationReturn { cont_id: cont_data.id })
+            }
         }
         _ => Err(EvalError::Type("not a procedure".into())),
     }
@@ -2176,6 +2231,18 @@ fn builtin_list_to_vector(args: &[Value]) -> Result<Value, EvalError> {
     }
 }
 
+fn builtin_reverse(args: &[Value]) -> Result<Value, EvalError> {
+    if args.len() != 1 { return Err(EvalError::Arity("reverse requires 1 argument".into())); }
+    match &args[0] {
+        Value::List(l) => {
+            let mut rev = l.clone();
+            rev.reverse();
+            Ok(Value::List(rev))
+        }
+        _ => Err(EvalError::Type("reverse: expected list".into())),
+    }
+}
+
 fn make_global_env() -> Env {
     let env = new_env(None);
     let builtins: &[(&str, BuiltinFn)] = &[
@@ -2265,6 +2332,8 @@ fn make_global_env() -> Env {
         ("vector?", builtin_is_vector),
         ("vector->list", builtin_vector_to_list),
         ("list->vector", builtin_list_to_vector),
+        // L16: dynamic-wind helpers
+        ("reverse", builtin_reverse),
     ];
     for (name, f) in builtins {
         env_set(&env, name.to_string(), Value::Builtin(*f));
