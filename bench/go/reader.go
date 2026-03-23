@@ -18,6 +18,8 @@ const (
 	TypePair
 	TypeNull
 	TypeVoid
+	TypeLambda
+	TypeBuiltin
 )
 
 // Value represents a Scheme value.
@@ -28,6 +30,12 @@ type Value struct {
 	Str     string
 	Car     *Value
 	Cdr     *Value
+	// Lambda fields
+	Params  []string
+	Body    []*Value
+	Closure *Env
+	// Builtin function
+	BuiltinFunc func([]*Value) (*Value, error)
 }
 
 var voidValue = &Value{Type: TypeVoid}
@@ -60,6 +68,10 @@ func (v *Value) Display() string {
 		return displayList(v)
 	case TypeVoid:
 		return ""
+	case TypeLambda:
+		return "#<procedure>"
+	case TypeBuiltin:
+		return fmt.Sprintf("#<builtin %s>", v.Str)
 	default:
 		return ""
 	}

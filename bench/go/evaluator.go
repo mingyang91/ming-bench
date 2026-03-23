@@ -37,6 +37,14 @@ func listToSlice(v *Value) []*Value {
 	return result
 }
 
+func makeBuiltin(name string, fn func([]*Value) (*Value, error)) *Value {
+	return &Value{Type: TypeBuiltin, Str: name, BuiltinFunc: fn}
+}
+
+func makeLambda(params []string, body []*Value, closure *Env) *Value {
+	return &Value{Type: TypeLambda, Params: params, Body: body, Closure: closure}
+}
+
 // eval evaluates a single expression in the given environment.
 func eval(expr *Value, env *Env) (*Value, error) {
 	switch expr.Type {
@@ -68,6 +76,14 @@ func evalList(expr *Value, env *Env) (*Value, error) {
 			return evalAnd(args, env)
 		case "or":
 			return evalOr(args, env)
+		case "define":
+			return evalDefine(args, env)
+		case "if":
+			return evalIf(args, env)
+		case "quote":
+			return args.Car, nil
+		case "lambda":
+			return evalLambda(args, env)
 		}
 	}
 
@@ -88,7 +104,58 @@ func evalList(expr *Value, env *Env) (*Value, error) {
 		evalArgs[i] = v
 	}
 
-	return apply(fn, evalArgs)
+	return applyProc(fn, evalArgs)
+}
+
+func evalDefine(args *Value, env *Env) (*Value, error) {
+	target := args.Car
+	if target.Type == TypeSymbol {
+		// (define x expr)
+		val, err := eval(args.Cdr.Car, env)
+		if err != nil {
+			return nil, err
+		}
+		env.set(target.Str, val)
+		return voidValue, nil
+	}
+	if target.Type == TypePair {
+		// (define (f params...) body...)
+		name := target.Car.Str
+		paramList := listToSlice(target.Cdr)
+		params := make([]string, len(paramList))
+		for i, p := range paramList {
+			params[i] = p.Str
+		}
+		body := listToSlice(args.Cdr)
+		env.set(name, makeLambda(params, body, env))
+		return voidValue, nil
+	}
+	return nil, &EvalError{Message: "bad define syntax"}
+}
+
+func evalIf(args *Value, env *Env) (*Value, error) {
+	cond, err := eval(args.Car, env)
+	if err != nil {
+		return nil, err
+	}
+	if isTruthy(cond) {
+		return eval(args.Cdr.Car, env)
+	}
+	// else branch (if present)
+	if args.Cdr.Cdr.Type == TypePair {
+		return eval(args.Cdr.Cdr.Car, env)
+	}
+	return voidValue, nil
+}
+
+func evalLambda(args *Value, env *Env) (*Value, error) {
+	paramList := listToSlice(args.Car)
+	params := make([]string, len(paramList))
+	for i, p := range paramList {
+		params[i] = p.Str
+	}
+	body := listToSlice(args.Cdr)
+	return makeLambda(params, body, env), nil
 }
 
 func evalAnd(args *Value, env *Env) (*Value, error) {
@@ -125,12 +192,31 @@ func evalOr(args *Value, env *Env) (*Value, error) {
 	return result, nil
 }
 
-// apply calls a builtin function with evaluated arguments.
-func apply(fn *Value, args []*Value) (*Value, error) {
-	if fn.Type != TypeSymbol {
+// applyProc calls a procedure (builtin or lambda) with evaluated arguments.
+func applyProc(fn *Value, args []*Value) (*Value, error) {
+	switch fn.Type {
+	case TypeBuiltin:
+		return fn.BuiltinFunc(args)
+	case TypeLambda:
+		if len(args) != len(fn.Params) {
+			return nil, &EvalError{Message: fmt.Sprintf("expected %d arguments, got %d", len(fn.Params), len(args))}
+		}
+		localEnv := newEnv(fn.Closure)
+		for i, p := range fn.Params {
+			localEnv.set(p, args[i])
+		}
+		var result *Value
+		var err error
+		for _, bodyExpr := range fn.Body {
+			result, err = eval(bodyExpr, localEnv)
+			if err != nil {
+				return nil, err
+			}
+		}
+		return result, nil
+	default:
 		return nil, &EvalError{Message: fmt.Sprintf("not a procedure: %s", fn.Display())}
 	}
-	return applyBuiltin(fn.Str, args)
 }
 
 func applyBuiltin(name string, args []*Value) (*Value, error) {
@@ -235,9 +321,20 @@ func compareInts(args []*Value, cmp func(int64, int64) bool) (*Value, error) {
 // builtinEnv creates the top-level environment with builtin procedure names.
 func builtinEnv() *Env {
 	env := newEnv(nil)
-	builtins := []string{"+", "-", "*", "/", "<", ">", "=", "<=", ">=", "not"}
-	for _, name := range builtins {
-		env.set(name, makeSymbol(name))
+	builtinDefs := map[string]func([]*Value) (*Value, error){
+		"+":   func(args []*Value) (*Value, error) { return applyBuiltin("+", args) },
+		"-":   func(args []*Value) (*Value, error) { return applyBuiltin("-", args) },
+		"*":   func(args []*Value) (*Value, error) { return applyBuiltin("*", args) },
+		"/":   func(args []*Value) (*Value, error) { return applyBuiltin("/", args) },
+		"<":   func(args []*Value) (*Value, error) { return applyBuiltin("<", args) },
+		">":   func(args []*Value) (*Value, error) { return applyBuiltin(">", args) },
+		"=":   func(args []*Value) (*Value, error) { return applyBuiltin("=", args) },
+		"<=":  func(args []*Value) (*Value, error) { return applyBuiltin("<=", args) },
+		">=":  func(args []*Value) (*Value, error) { return applyBuiltin(">=", args) },
+		"not": func(args []*Value) (*Value, error) { return applyBuiltin("not", args) },
+	}
+	for name, fn := range builtinDefs {
+		env.set(name, makeBuiltin(name, fn))
 	}
 	return env
 }
