@@ -269,6 +269,7 @@ struct Machine {
     winder_counter: usize,
     output: Rc<RefCell<String>>,
     gensym_counter: usize,
+    record_type_counter: usize,
     exception_handlers: Vec<ExHandler>,
 }
 
@@ -282,6 +283,7 @@ impl Machine {
             winder_counter: 0,
             output,
             gensym_counter: 0,
+            record_type_counter: 0,
             exception_handlers: Vec::new(),
         }
     }
@@ -324,7 +326,7 @@ impl Machine {
             | Value::Char(_) | Value::Builtin(_) | Value::Void
             | Value::Closure { .. } | Value::Pair(_, _) | Value::Continuation(_)
             | Value::SyntaxRules { .. } | Value::Vector(_)
-            | Value::Values(_) => Ok(Control::Continue(expr)),
+            | Value::Values(_) | Value::Record { .. } => Ok(Control::Continue(expr)),
             Value::Symbol(ref name, _) => env
                 .borrow()
                 .get(name)
@@ -363,6 +365,7 @@ impl Machine {
                 "case" => return self.sf_case(&elems[1..], span, env),
                 "do" => return self.sf_do(&elems[1..], span, env),
                 "guard" => return self.sf_guard(&elems[1..], span, env),
+                "define-record-type" => return self.sf_define_record_type(&elems[1..], span, env),
                 _ => {}
             }
 
@@ -904,9 +907,46 @@ impl Machine {
                 Ok(Control::Apply(producer, vec![], span))
             }
             _ => {
-                let result = apply_builtin(name, &args, &self.output)
-                    .map_err(|e| e.at(span))?;
-                Ok(Control::Continue(result))
+                if let Some(rest) = name.strip_prefix("__record_ctor_") {
+                    let type_id: usize = rest.parse().expect("valid record type id");
+                    Ok(Control::Continue(Value::Record { type_id, fields: args }))
+                } else if let Some(rest) = name.strip_prefix("__record_pred_") {
+                    let type_id: usize = rest.parse().expect("valid record type id");
+                    if args.len() != 1 {
+                        return Err(EvalError::WrongArgCount {
+                            expected: 1, got: args.len(),
+                        }.at(span));
+                    }
+                    let is_match = matches!(&args[0], Value::Record { type_id: tid, .. } if *tid == type_id);
+                    Ok(Control::Continue(Value::Bool(is_match)))
+                } else if let Some(rest) = name.strip_prefix("__record_acc_") {
+                    // Format: __record_acc_{type_id}_{field_idx}
+                    let mut parts = rest.splitn(2, '_');
+                    let type_id: usize = parts.next().expect("type_id").parse().expect("valid type id");
+                    let field_idx: usize = parts.next().expect("field_idx").parse().expect("valid field idx");
+                    if args.len() != 1 {
+                        return Err(EvalError::WrongArgCount {
+                            expected: 1, got: args.len(),
+                        }.at(span));
+                    }
+                    let Value::Record { type_id: tid, ref fields } = args[0] else {
+                        return Err(EvalError::TypeMismatch {
+                            expected: "record".into(),
+                            got: format!("{}", args[0]),
+                        }.at(span));
+                    };
+                    if tid != type_id {
+                        return Err(EvalError::TypeMismatch {
+                            expected: "matching record type".into(),
+                            got: "different record type".into(),
+                        }.at(span));
+                    }
+                    Ok(Control::Continue(fields[field_idx].clone()))
+                } else {
+                    let result = apply_builtin(name, &args, &self.output)
+                        .map_err(|e| e.at(span))?;
+                    Ok(Control::Continue(result))
+                }
             }
         }
     }
@@ -1017,7 +1057,8 @@ impl Machine {
             | Value::Bool(_) | Value::String(_) | Value::Char(_)
             | Value::Builtin(_) | Value::Closure { .. } | Value::Pair(_, _)
             | Value::Continuation(_) | Value::SyntaxRules { .. }
-            | Value::Vector(_) | Value::Values(_) | Value::Void => {
+            | Value::Vector(_) | Value::Values(_) | Value::Record { .. }
+            | Value::Void => {
                 Err(EvalError::Parse {
                     msg: format!("define: expected symbol or list, got {}", args[0]),
                 }.at(span))
@@ -1550,6 +1591,129 @@ impl Machine {
         Ok(Control::Continue(Value::Void))
     }
 
+    // --- Record types ---
+
+    fn sf_define_record_type(
+        &mut self,
+        args: &[Value],
+        span: Option<Span>,
+        env: &Rc<RefCell<Env>>,
+    ) -> Result<Control, EvalError> {
+        // (define-record-type <name> (constructor field ...) predicate (field accessor) ...)
+        if args.len() < 3 {
+            return Err(EvalError::Parse {
+                msg: "define-record-type requires type name, constructor, predicate, and fields".into(),
+            }.at(span));
+        }
+        // Type name (ignored for now, we just need a unique id)
+        let Value::Symbol(_, _) = &args[0] else {
+            return Err(EvalError::Parse {
+                msg: "define-record-type: expected type name".into(),
+            }.at(span));
+        };
+
+        // Constructor: (make-foo field1 field2 ...)
+        let Value::List(ctor_elems, _) = &args[1] else {
+            return Err(EvalError::Parse {
+                msg: "define-record-type: expected constructor spec".into(),
+            }.at(span));
+        };
+        if ctor_elems.is_empty() {
+            return Err(EvalError::Parse {
+                msg: "define-record-type: empty constructor spec".into(),
+            }.at(span));
+        }
+        let Value::Symbol(ctor_name, _) = &ctor_elems[0] else {
+            return Err(EvalError::Parse {
+                msg: "define-record-type: expected constructor name".into(),
+            }.at(span));
+        };
+        let ctor_fields: Vec<String> = ctor_elems[1..].iter().map(|v| {
+            if let Value::Symbol(s, _) = v { s.clone() }
+            else { String::new() }
+        }).collect();
+
+        // Predicate
+        let Value::Symbol(pred_name, _) = &args[2] else {
+            return Err(EvalError::Parse {
+                msg: "define-record-type: expected predicate name".into(),
+            }.at(span));
+        };
+
+        // Field accessors: (field accessor) ...
+        let mut field_accessors: Vec<(String, String)> = Vec::new();
+        for field_spec in &args[3..] {
+            let Value::List(parts, _) = field_spec else {
+                return Err(EvalError::Parse {
+                    msg: "define-record-type: expected field spec (field accessor)".into(),
+                }.at(span));
+            };
+            if parts.len() < 2 {
+                return Err(EvalError::Parse {
+                    msg: "define-record-type: field spec must have field name and accessor".into(),
+                }.at(span));
+            }
+            let Value::Symbol(field_name, _) = &parts[0] else {
+                return Err(EvalError::Parse {
+                    msg: "define-record-type: expected field name".into(),
+                }.at(span));
+            };
+            let Value::Symbol(accessor_name, _) = &parts[1] else {
+                return Err(EvalError::Parse {
+                    msg: "define-record-type: expected accessor name".into(),
+                }.at(span));
+            };
+            field_accessors.push((field_name.clone(), accessor_name.clone()));
+        }
+
+        // Allocate a unique type id
+        let type_id = self.record_type_counter;
+        self.record_type_counter += 1;
+
+        // Build a mapping from field name to index in the ctor_fields order
+        let field_count = ctor_fields.len();
+
+        // Define constructor as a closure that creates a Record value
+        // We use a special builtin name to dispatch in apply_builtin_dispatch
+        let ctor_builtin_name = format!("__record_ctor_{type_id}");
+        env.borrow_mut().define(
+            ctor_name.clone(),
+            Value::Builtin(ctor_builtin_name.clone()),
+        );
+
+        // Define predicate
+        let pred_builtin_name = format!("__record_pred_{type_id}");
+        env.borrow_mut().define(
+            pred_name.clone(),
+            Value::Builtin(pred_builtin_name.clone()),
+        );
+
+        // Define accessors
+        for (field_name, accessor_name) in &field_accessors {
+            // Find the index of this field in the constructor field list
+            let idx = ctor_fields.iter().position(|f| f == field_name).ok_or_else(|| {
+                EvalError::Parse {
+                    msg: format!("define-record-type: field {field_name} not in constructor"),
+                }
+            })?;
+            let accessor_builtin_name = format!("__record_acc_{type_id}_{idx}");
+            env.borrow_mut().define(
+                accessor_name.clone(),
+                Value::Builtin(accessor_builtin_name),
+            );
+        }
+
+        // Store record type info for dispatch
+        // We use a convention: builtin names starting with __record_ are dispatched specially
+        // Store field_count for the constructor
+        env.borrow_mut().define(
+            format!("__record_meta_{type_id}"),
+            Value::Int(field_count as i64),
+        );
+
+        Ok(Control::Continue(Value::Void))
+    }
+
     // --- Exception handling ---
 
     fn sf_guard(
@@ -1715,7 +1879,8 @@ fn make_literal(val: Value) -> Value {
         | Value::Bool(_) | Value::String(_) | Value::Char(_)
         | Value::Builtin(_) | Value::Closure { .. } | Value::Pair(_, _)
         | Value::Continuation(_) | Value::SyntaxRules { .. }
-        | Value::Vector(_) | Value::Values(_) | Value::Void => val,
+        | Value::Vector(_) | Value::Values(_) | Value::Record { .. }
+        | Value::Void => val,
         Value::Symbol(_, _) | Value::List(_, _) => Value::List(
             vec![Value::Symbol("quote".into(), None), val],
             None,

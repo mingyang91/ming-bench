@@ -36,6 +36,10 @@ pub enum Value {
     },
     Vector(Rc<RefCell<Vec<Value>>>),
     Values(Vec<Value>),
+    Record {
+        type_id: usize,
+        fields: Vec<Value>,
+    },
     Void,
 }
 
@@ -47,7 +51,8 @@ impl Value {
             | Value::Bool(_) | Value::String(_) | Value::Char(_)
             | Value::Builtin(_) | Value::Closure { .. } | Value::Pair(_, _)
             | Value::Continuation(_) | Value::SyntaxRules { .. }
-            | Value::Vector(_) | Value::Values(_) | Value::Void => None,
+            | Value::Vector(_) | Value::Values(_) | Value::Record { .. }
+            | Value::Void => None,
         }
     }
 }
@@ -71,6 +76,8 @@ impl PartialEq for Value {
             (Value::SyntaxRules { .. }, Value::SyntaxRules { .. }) => false,
             (Value::Vector(a), Value::Vector(b)) => *a.borrow() == *b.borrow(),
             (Value::Values(a), Value::Values(b)) => a == b,
+            (Value::Record { type_id: a_id, fields: a_f },
+             Value::Record { type_id: b_id, fields: b_f }) => a_id == b_id && a_f == b_f,
             (Value::Int(_), _)
             | (Value::Float(_), _)
             | (Value::Rational(_, _), _)
@@ -86,6 +93,7 @@ impl PartialEq for Value {
             | (Value::SyntaxRules { .. }, _)
             | (Value::Vector(_), _)
             | (Value::Values(_), _)
+            | (Value::Record { .. }, _)
             | (Value::Void, _) => false,
         }
     }
@@ -146,6 +154,7 @@ impl fmt::Display for Value {
                 }
                 Ok(())
             }
+            Value::Record { .. } => write!(f, "#<record>"),
             Value::Void => write!(f, ""),
         }
     }
