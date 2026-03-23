@@ -886,7 +886,8 @@ public class Evaluator {
             "symbol->string", "string->symbol",
             "string-ref", "char?",
             "string-set!", "string-copy",
-            "apply", "procedure?"
+            "apply", "procedure?",
+            "call/cc", "call-with-current-continuation"
     );
 
     private boolean isPrimitive(String name) {
