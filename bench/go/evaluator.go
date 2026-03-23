@@ -39,6 +39,17 @@ func (e *Env) set(name string, v *Value) {
 	e.bindings[name] = v
 }
 
+func (e *Env) setExisting(name string, v *Value) bool {
+	if _, ok := e.bindings[name]; ok {
+		e.bindings[name] = v
+		return true
+	}
+	if e.parent != nil {
+		return e.parent.setExisting(name, v)
+	}
+	return false
+}
+
 // listToSlice converts a Scheme list to a Go slice.
 func listToSlice(v *Value) []*Value {
 	var result []*Value
@@ -125,6 +136,9 @@ func evalList(expr *Value, env *Env) (*tailCall, *Value, error) {
 			return evalBegin(args, env)
 		case "cond":
 			return evalCond(args, env)
+		case "set!":
+			v, err := evalSet(args, env, expr)
+			return nil, v, err
 		}
 	}
 
@@ -203,6 +217,21 @@ func evalDefine(args *Value, env *Env, expr *Value) (*Value, error) {
 		return voidValue, nil
 	}
 	return nil, evalErr(expr, "bad define syntax")
+}
+
+func evalSet(args *Value, env *Env, expr *Value) (*Value, error) {
+	name := args.Car
+	if name.Type != TypeSymbol {
+		return nil, evalErr(expr, "set!: first argument must be a symbol")
+	}
+	val, err := eval(args.Cdr.Car, env)
+	if err != nil {
+		return nil, err
+	}
+	if !env.setExisting(name.Str, val) {
+		return nil, evalErr(expr, fmt.Sprintf("set!: unbound variable '%s'", name.Str))
+	}
+	return voidValue, nil
 }
 
 func evalIf(args *Value, env *Env, expr *Value) (*tailCall, *Value, error) {
