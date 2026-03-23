@@ -4,55 +4,73 @@ use crate::scheme::error::{ErrorKind, EvalError};
 use crate::scheme::parser::{Expr, ExprKind};
 use crate::scheme::value::Value;
 
-/// Evaluate a parsed expression in the given environment.
+/// Trampoline result: either a final value or a tail call to continue.
+enum Trampoline {
+    Done(Value),
+    TailCall { expr: Expr, env: Rc<Env> },
+}
+
+/// Evaluate a parsed expression in the given environment (trampoline entry point).
 pub fn eval_expr(expr: &Expr, env: &Rc<Env>) -> Result<Value, EvalError> {
-    eval_expr_inner(expr, env).map_err(|e| e.with_span(expr.span))
+    let mut current = expr.clone();
+    let mut current_env = Rc::clone(env);
+    loop {
+        match eval_tail(&current, &current_env)? {
+            Trampoline::Done(val) => return Ok(val),
+            Trampoline::TailCall { expr: next, env: next_env } => {
+                current = next;
+                current_env = next_env;
+            }
+        }
+    }
 }
 
-fn eval_expr_inner(expr: &Expr, env: &Rc<Env>) -> Result<Value, EvalError> {
-    match &expr.kind {
-        ExprKind::Integer(n) => Ok(Value::Integer(*n)),
-        ExprKind::Boolean(b) => Ok(Value::Boolean(*b)),
-        ExprKind::Str(s) => Ok(Value::new_str(s.clone())),
-        ExprKind::Char(c) => Ok(Value::Char(*c)),
-        ExprKind::Symbol(name) => env.get(name).ok_or_else(|| {
-            ErrorKind::UnboundVariable { name: name.clone() }.into()
+/// Evaluate an expression, returning TailCall for tail positions.
+fn eval_tail(expr: &Expr, env: &Rc<Env>) -> Result<Trampoline, EvalError> {
+    let result = match &expr.kind {
+        ExprKind::Integer(n) => Ok(Trampoline::Done(Value::Integer(*n))),
+        ExprKind::Boolean(b) => Ok(Trampoline::Done(Value::Boolean(*b))),
+        ExprKind::Str(s) => Ok(Trampoline::Done(Value::new_str(s.clone()))),
+        ExprKind::Char(c) => Ok(Trampoline::Done(Value::Char(*c))),
+        ExprKind::Symbol(name) => env.get(name).map(Trampoline::Done).ok_or_else(|| {
+            EvalError::from(ErrorKind::UnboundVariable { name: name.clone() })
         }),
-        ExprKind::List(elems) => eval_list(elems, env),
-    }
+        ExprKind::List(elems) => eval_list_tail(elems, env),
+    };
+    result.map_err(|e| e.with_span(expr.span))
 }
 
-fn eval_list(elems: &[Expr], env: &Rc<Env>) -> Result<Value, EvalError> {
+fn eval_list_tail(elems: &[Expr], env: &Rc<Env>) -> Result<Trampoline, EvalError> {
     if elems.is_empty() {
-        return Ok(Value::List(Vec::new()));
+        return Ok(Trampoline::Done(Value::List(Vec::new())));
     }
 
-    // Check for special forms first
     if let ExprKind::Symbol(name) = &elems[0].kind {
         match name.as_str() {
-            "and" => return eval_and(&elems[1..], env),
-            "or" => return eval_or(&elems[1..], env),
-            "if" => return eval_if(&elems[1..], env),
-            "define" => return eval_define(&elems[1..], env),
-            "quote" => return eval_quote(&elems[1..]),
-            "lambda" => return eval_lambda(&elems[1..], env),
-            "let" => return eval_let(&elems[1..], env),
-            "begin" => return eval_begin(&elems[1..], env),
-            "cond" => return eval_cond(&elems[1..], env),
+            "and" => return eval_and_tail(&elems[1..], env),
+            "or" => return eval_or_tail(&elems[1..], env),
+            "if" => return eval_if_tail(&elems[1..], env),
+            "define" => return eval_define(&elems[1..], env).map(Trampoline::Done),
+            "quote" => return eval_quote(&elems[1..]).map(Trampoline::Done),
+            "lambda" => return eval_lambda(&elems[1..], env).map(Trampoline::Done),
+            "let" => return eval_let_tail(&elems[1..], env),
+            "begin" => return eval_begin_tail(&elems[1..], env),
+            "cond" => return eval_cond_tail(&elems[1..], env),
             _ => {}
         }
     }
 
+    // Function call
     let func = eval_expr(&elems[0], env)?;
     let args: Vec<Value> = elems[1..]
         .iter()
         .map(|e| eval_expr(e, env))
         .collect::<Result<Vec<_>, _>>()?;
 
-    apply_function(&func, &args, env)
+    apply_function_tail(&func, &args, env)
 }
 
-fn eval_if(args: &[Expr], env: &Rc<Env>) -> Result<Value, EvalError> {
+fn eval_if_tail(args: &[Expr], env: &Rc<Env>) -> Result<Trampoline, EvalError> {
     if args.len() < 2 || args.len() > 3 {
         return Err(ErrorKind::BadSyntax {
             form: "if".into(),
@@ -61,11 +79,11 @@ fn eval_if(args: &[Expr], env: &Rc<Env>) -> Result<Value, EvalError> {
     }
     let cond = eval_expr(&args[0], env)?;
     if cond.is_truthy() {
-        eval_expr(&args[1], env)
+        Ok(Trampoline::TailCall { expr: args[1].clone(), env: Rc::clone(env) })
     } else if args.len() == 3 {
-        eval_expr(&args[2], env)
+        Ok(Trampoline::TailCall { expr: args[2].clone(), env: Rc::clone(env) })
     } else {
-        Ok(Value::Void)
+        Ok(Trampoline::Done(Value::Void))
     }
 }
 
@@ -77,7 +95,6 @@ fn eval_define(args: &[Expr], env: &Rc<Env>) -> Result<Value, EvalError> {
         }.into());
     }
     match &args[0].kind {
-        // (define x expr)
         ExprKind::Symbol(name) => {
             if args.len() != 2 {
                 return Err(ErrorKind::BadSyntax {
@@ -89,7 +106,6 @@ fn eval_define(args: &[Expr], env: &Rc<Env>) -> Result<Value, EvalError> {
             env.define(name.clone(), val);
             Ok(Value::Void)
         }
-        // (define (f params...) body...)
         ExprKind::List(name_and_params) => {
             if name_and_params.is_empty() {
                 return Err(ErrorKind::BadSyntax {
@@ -190,33 +206,33 @@ fn eval_lambda(args: &[Expr], env: &Rc<Env>) -> Result<Value, EvalError> {
     })
 }
 
-fn eval_and(exprs: &[Expr], env: &Rc<Env>) -> Result<Value, EvalError> {
+fn eval_and_tail(exprs: &[Expr], env: &Rc<Env>) -> Result<Trampoline, EvalError> {
     if exprs.is_empty() {
-        return Ok(Value::Boolean(true));
+        return Ok(Trampoline::Done(Value::Boolean(true)));
     }
     for expr in &exprs[..exprs.len() - 1] {
         let val = eval_expr(expr, env)?;
         if !val.is_truthy() {
-            return Ok(val);
+            return Ok(Trampoline::Done(val));
         }
     }
-    eval_expr(&exprs[exprs.len() - 1], env)
+    Ok(Trampoline::TailCall { expr: exprs[exprs.len() - 1].clone(), env: Rc::clone(env) })
 }
 
-fn eval_or(exprs: &[Expr], env: &Rc<Env>) -> Result<Value, EvalError> {
+fn eval_or_tail(exprs: &[Expr], env: &Rc<Env>) -> Result<Trampoline, EvalError> {
     if exprs.is_empty() {
-        return Ok(Value::Boolean(false));
+        return Ok(Trampoline::Done(Value::Boolean(false)));
     }
     for expr in &exprs[..exprs.len() - 1] {
         let val = eval_expr(expr, env)?;
         if val.is_truthy() {
-            return Ok(val);
+            return Ok(Trampoline::Done(val));
         }
     }
-    eval_expr(&exprs[exprs.len() - 1], env)
+    Ok(Trampoline::TailCall { expr: exprs[exprs.len() - 1].clone(), env: Rc::clone(env) })
 }
 
-fn eval_let(args: &[Expr], env: &Rc<Env>) -> Result<Value, EvalError> {
+fn eval_let_tail(args: &[Expr], env: &Rc<Env>) -> Result<Trampoline, EvalError> {
     if args.is_empty() {
         return Err(ErrorKind::BadSyntax {
             form: "let".into(),
@@ -266,16 +282,14 @@ fn eval_let(args: &[Expr], env: &Rc<Env>) -> Result<Value, EvalError> {
             body,
             closure_env: Rc::clone(env),
         };
-        // Create env with the named function bound so it can recurse
-        let func_env = Env::extend(env, vec![name.clone()], vec![lambda.clone()]);
-        // Re-create lambda with func_env as closure so it sees itself
+        let func_env = Env::extend(env, vec![name.clone()], vec![lambda]);
         let recursive_lambda = Value::Lambda {
             params,
             body: args[2..].to_vec(),
             closure_env: Rc::clone(&func_env),
         };
         func_env.define(name.clone(), recursive_lambda.clone());
-        return apply_function(&recursive_lambda, &init_vals, env);
+        return apply_function_tail(&recursive_lambda, &init_vals, env);
     }
     // Regular let: (let ((var init) ...) body...)
     let bindings_expr = match &args[0].kind {
@@ -314,44 +328,39 @@ fn eval_let(args: &[Expr], env: &Rc<Env>) -> Result<Value, EvalError> {
         }
     }
     let local_env = Env::extend(env, names, vals);
-    let mut result = Value::Void;
-    for expr in &args[1..] {
-        result = eval_expr(expr, &local_env)?;
-    }
-    Ok(result)
+    eval_body_tail(&args[1..], &local_env)
 }
 
-fn eval_begin(args: &[Expr], env: &Rc<Env>) -> Result<Value, EvalError> {
-    let mut result = Value::Void;
-    for expr in args {
-        result = eval_expr(expr, env)?;
+/// Evaluate a sequence of body expressions, returning TailCall for the last.
+fn eval_body_tail(exprs: &[Expr], env: &Rc<Env>) -> Result<Trampoline, EvalError> {
+    if exprs.is_empty() {
+        return Ok(Trampoline::Done(Value::Void));
     }
-    Ok(result)
+    for expr in &exprs[..exprs.len() - 1] {
+        eval_expr(expr, env)?;
+    }
+    Ok(Trampoline::TailCall { expr: exprs[exprs.len() - 1].clone(), env: Rc::clone(env) })
 }
 
-fn eval_cond(clauses: &[Expr], env: &Rc<Env>) -> Result<Value, EvalError> {
+fn eval_begin_tail(args: &[Expr], env: &Rc<Env>) -> Result<Trampoline, EvalError> {
+    eval_body_tail(args, env)
+}
+
+fn eval_cond_tail(clauses: &[Expr], env: &Rc<Env>) -> Result<Trampoline, EvalError> {
     for clause in clauses {
         match &clause.kind {
             ExprKind::List(elems) if !elems.is_empty() => {
-                // Check for else clause
                 if let ExprKind::Symbol(s) = &elems[0].kind {
                     if s == "else" {
-                        let mut result = Value::Void;
-                        for expr in &elems[1..] {
-                            result = eval_expr(expr, env)?;
-                        }
-                        return Ok(result);
+                        return eval_body_tail(&elems[1..], env);
                     }
                 }
                 let test = eval_expr(&elems[0], env)?;
                 if test.is_truthy() {
-                    let mut result = test;
                     if elems.len() > 1 {
-                        for expr in &elems[1..] {
-                            result = eval_expr(expr, env)?;
-                        }
+                        return eval_body_tail(&elems[1..], env);
                     }
-                    return Ok(result);
+                    return Ok(Trampoline::Done(test));
                 }
             }
             _ => return Err(ErrorKind::BadSyntax {
@@ -360,12 +369,12 @@ fn eval_cond(clauses: &[Expr], env: &Rc<Env>) -> Result<Value, EvalError> {
             }.into()),
         }
     }
-    Ok(Value::Void)
+    Ok(Trampoline::Done(Value::Void))
 }
 
-pub fn apply_function(func: &Value, args: &[Value], env: &Rc<Env>) -> Result<Value, EvalError> {
+fn apply_function_tail(func: &Value, args: &[Value], env: &Rc<Env>) -> Result<Trampoline, EvalError> {
     match func {
-        Value::Builtin(name) => apply_builtin(name, args, env),
+        Value::Builtin(name) => apply_builtin(name, args, env).map(Trampoline::Done),
         Value::Lambda { params, body, closure_env } => {
             if args.len() != params.len() {
                 return Err(ErrorKind::WrongArgCount {
@@ -374,11 +383,7 @@ pub fn apply_function(func: &Value, args: &[Value], env: &Rc<Env>) -> Result<Val
                 }.into());
             }
             let local_env = Env::extend(closure_env, params.clone(), args.to_vec());
-            let mut result = Value::Void;
-            for expr in body {
-                result = eval_expr(expr, &local_env)?;
-            }
-            Ok(result)
+            eval_body_tail(body, &local_env)
         }
         other => Err(ErrorKind::NotAProcedure {
             value: other.to_display_string(),
