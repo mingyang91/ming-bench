@@ -155,15 +155,15 @@ func expandMacro(macro *SchemeMacro, callExpr *ListExpr, useEnv *Env) (Expr, *En
 			// Expand template
 			expanded := expandTemplate(rule.Template, bindings, renaming, callExpr)
 
-			// Create enriched environment with definition-site bindings for gensyms
-			enrichedEnv := NewEnv(useEnv)
+			// Inject definition-site bindings for gensyms directly into use-site env
+			// so that define forms in the expansion bind in the correct scope
 			for origName, gensymName := range renaming {
 				if val, ok := macro.DefEnv.Get(origName); ok {
-					enrichedEnv.Set(gensymName, val)
+					useEnv.Set(gensymName, val)
 				}
 			}
 
-			return expanded, enrichedEnv, nil
+			return expanded, useEnv, nil
 		}
 	}
 
@@ -271,6 +271,9 @@ var specialForms = map[string]bool{
 	"define-syntax": true, "syntax-rules": true, "let*": true, "letrec": true,
 	"letrec*": true, "case": true, "do": true,
 	"syntax-case": true, "syntax": true, "with-syntax": true,
+	"guard": true, "raise": true, "with-exception-handler": true,
+	"define-record-type": true, "dynamic-wind": true, "values": true,
+	"call-with-values": true, "call/cc": true, "call-with-current-continuation": true,
 }
 
 func isSpecialForm(name string) bool {

@@ -532,11 +532,13 @@ func Eval(expr Expr, env *Env) (SchemeValue, error) {
 			case *SchemeCallCC:
 				return evalCallCC(args, e, env)
 			case *SchemeContinuation:
-				if len(args) != 1 {
-					line, col := e.Pos()
-					return nil, &EvalError{Message: fmt.Sprintf("%d:%d: continuation expects 1 argument, got %d", line, col, len(args))}
+				if len(args) == 0 {
+					return nil, &contJumpError{cont: fn, value: &SchemeVoid{}}
+				} else if len(args) == 1 {
+					return nil, &contJumpError{cont: fn, value: args[0]}
+				} else {
+					return nil, &contJumpError{cont: fn, value: &SchemeMultipleValues{Values: args}}
 				}
-				return nil, &contJumpError{cont: fn, value: args[0]}
 			case *SchemeDynamicWind:
 				return applyFunc(fn, args, e, env)
 			}
@@ -719,11 +721,13 @@ func applyFunc(proc SchemeValue, args []SchemeValue, callExpr *ListExpr, env *En
 	case *SchemeCallCC:
 		return evalCallCC(args, callExpr, env)
 	case *SchemeContinuation:
-		if len(args) != 1 {
-			line, col := callExpr.Pos()
-			return nil, &EvalError{Message: fmt.Sprintf("%d:%d: continuation expects 1 argument, got %d", line, col, len(args))}
+		if len(args) == 0 {
+			return nil, &contJumpError{cont: fn, value: &SchemeVoid{}}
+		} else if len(args) == 1 {
+			return nil, &contJumpError{cont: fn, value: args[0]}
+		} else {
+			return nil, &contJumpError{cont: fn, value: &SchemeMultipleValues{Values: args}}
 		}
-		return nil, &contJumpError{cont: fn, value: args[0]}
 	case *SchemeDynamicWind:
 		if len(args) != 3 {
 			line, col := callExpr.Pos()
