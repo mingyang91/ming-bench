@@ -12,6 +12,9 @@ public class Evaluator {
     private final StringBuilder outputBuffer = new StringBuilder();
     private int gensymCounter = 0;
 
+    // exception handler stack
+    private final List<SchemeValue> handlerStack = new ArrayList<>();
+
     // dynamic-wind support
     static class WindRecord {
         final SchemeValue inThunk;
@@ -29,7 +32,7 @@ public class Evaluator {
 
     private static final Set<String> SPECIAL_FORMS = Set.of(
         "quote", "set!", "define", "lambda", "if", "begin", "cond", "and", "or",
-        "let", "letrec", "letrec*", "case", "do", "define-syntax", "syntax-rules"
+        "let", "letrec", "letrec*", "case", "do", "define-syntax", "syntax-rules", "guard"
     );
 
     public String evalStr(String input) throws EvalError {
@@ -641,6 +644,31 @@ public class Evaluator {
                 });
             });
         }));
+
+        // raise
+        env.define("raise", new SchemeValue.CpsBuiltinVal("raise", (args, k) -> {
+            if (args.size() != 1) return new Bounce.Err(new EvalError("raise requires 1 argument"));
+            SchemeValue val = args.getFirst();
+            if (handlerStack.isEmpty()) {
+                return new Bounce.Err(new EvalError("Unhandled exception: " + val.display()));
+            }
+            SchemeValue handler = handlerStack.remove(handlerStack.size() - 1);
+            return applyProc(handler, List.of(val), "raise", result ->
+                new Bounce.Err(new EvalError("exception handler returned for non-continuable exception"))
+            );
+        }));
+
+        // with-exception-handler
+        env.define("with-exception-handler", new SchemeValue.CpsBuiltinVal("with-exception-handler", (args, k) -> {
+            if (args.size() != 2) return new Bounce.Err(new EvalError("with-exception-handler requires 2 arguments"));
+            SchemeValue handler = args.get(0);
+            SchemeValue thunk = args.get(1);
+            handlerStack.add(handler);
+            return applyProc(thunk, List.of(), "with-exception-handler", result -> {
+                handlerStack.remove(handlerStack.size() - 1);
+                return k.apply(result);
+            });
+        }));
     }
 
     // ── CPS eval ──────────────────────────────────────────────────────
@@ -758,6 +786,7 @@ public class Evaluator {
             case "case" -> evalCase(elems, env, pos, k);
             case "do" -> evalDo(elems, env, pos, k);
             case "define-syntax" -> evalDefineSyntax(elems, env, pos, k);
+            case "guard" -> evalGuard(elems, env, pos, k);
             default -> null; // not a special form
         };
     }
@@ -884,6 +913,77 @@ public class Evaluator {
             windStack.add(wr);
             return doRewind(target, idx + 1, val, k);
         });
+    }
+
+    // ── guard ─────────────────────────────────────────────────────────
+
+    private Bounce evalGuard(List<SchemeValue> elems, Environment env, String pos, SchemeValue.Cont k) {
+        // (guard (var clause1 clause2 ...) body ...)
+        if (elems.size() < 3)
+            return new Bounce.Err(new EvalError("guard requires at least 2 arguments at " + pos));
+        if (!(elems.get(1) instanceof SchemeValue.ListVal clauseList) || clauseList.elements().size() < 2)
+            return new Bounce.Err(new EvalError("guard: invalid clause spec at " + pos));
+
+        String varName = ((SchemeValue.SymbolVal) clauseList.elements().getFirst()).name();
+        List<SchemeValue> clauses = clauseList.elements().subList(1, clauseList.elements().size());
+        List<SchemeValue> body = elems.subList(2, elems.size());
+
+        // Capture guard-site wind state for proper dynamic-wind interaction
+        List<WindRecord> guardWindState = new ArrayList<>(windStack);
+        SchemeValue.Cont guardK = k;
+        Environment guardEnv = env;
+
+        // Exception handler: on raise, transition back to guard context, then eval clauses
+        SchemeValue handler = new SchemeValue.CpsBuiltinVal("guard-handler", (args, raiseK) -> {
+            SchemeValue exnVal = args.getFirst();
+            // Wind back to guard's dynamic context (runs out-thunks)
+            return doWindTransition(guardWindState, exnVal, transitionedVal -> {
+                Environment clauseEnv = new Environment(guardEnv);
+                clauseEnv.define(varName, transitionedVal);
+                return evalGuardClauses(clauses, 0, clauseEnv, transitionedVal, guardK);
+            });
+        });
+
+        handlerStack.add(handler);
+        return evalBody(body, env, result -> {
+            handlerStack.remove(handlerStack.size() - 1);
+            return k.apply(result);
+        });
+    }
+
+    private Bounce evalGuardClauses(List<SchemeValue> clauses, int idx, Environment env,
+                                     SchemeValue exnVal, SchemeValue.Cont guardK) {
+        if (idx >= clauses.size()) {
+            // No clause matched, re-raise
+            if (handlerStack.isEmpty()) {
+                return new Bounce.Err(new EvalError("Unhandled exception: " + exnVal.display()));
+            }
+            SchemeValue nextHandler = handlerStack.remove(handlerStack.size() - 1);
+            return applyProc(nextHandler, List.of(exnVal), "guard-reraise", result ->
+                new Bounce.Err(new EvalError("exception handler returned for non-continuable exception"))
+            );
+        }
+
+        if (!(clauses.get(idx) instanceof SchemeValue.ListVal clauseList) || clauseList.elements().isEmpty())
+            return new Bounce.Err(new EvalError("guard: bad clause"));
+
+        List<SchemeValue> parts = clauseList.elements();
+
+        // Check for else clause
+        if (parts.getFirst() instanceof SchemeValue.SymbolVal s && s.name().equals("else")) {
+            return evalSequence(parts, 1, env, guardK);
+        }
+
+        // Evaluate test
+        return new Bounce.More(() -> eval(parts.getFirst(), env, testResult -> {
+            if (testResult.isTruthy()) {
+                if (parts.size() == 1) {
+                    return guardK.apply(testResult);
+                }
+                return evalSequence(parts, 1, env, guardK);
+            }
+            return evalGuardClauses(clauses, idx + 1, env, exnVal, guardK);
+        }));
     }
 
     // ── Special form helpers ──────────────────────────────────────────
