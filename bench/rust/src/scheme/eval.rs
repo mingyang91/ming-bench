@@ -2737,8 +2737,7 @@ fn apply_type_builtin(name: &str, args: &[Value]) -> Result<Value, EvalError> {
             Ok(Value::Boolean(matches!(
                 &args[0],
                 Value::List(elems) if !elems.is_empty()
-            ) || matches!(&args[0], Value::DottedPair(_, _))
-              || matches!(&args[0], Value::Pair(_))))
+            ) || matches!(&args[0], Value::Pair(_))))
         }
         "symbol?" => {
             if args.len() != 1 {
@@ -3344,7 +3343,7 @@ fn apply_char_cmp_builtin(name: &str, args: &[Value]) -> Result<Value, EvalError
             if args.len() != 2 {
                 return Err(ErrorKind::WrongArgCount { expected: 2, got: args.len() }.into());
             }
-            Ok(Value::Boolean(require_char(&args[0])?.to_ascii_lowercase() == require_char(&args[1])?.to_ascii_lowercase()))
+            Ok(Value::Boolean(require_char(&args[0])?.eq_ignore_ascii_case(&require_char(&args[1])?)))
         }
         "char-ci<?" => {
             if args.len() != 2 {
@@ -3814,7 +3813,6 @@ fn value_car(val: &Value) -> Result<Value, EvalError> {
     match val {
         Value::Pair(cell) => Ok(cell.borrow().0.clone()),
         Value::List(elems) if !elems.is_empty() => Ok(elems[0].clone()),
-        Value::DottedPair(a, _) => Ok(*a.clone()),
         _ => Err(ErrorKind::TypeMismatch {
             expected: "pair".into(),
             got: val.to_display_string(),
@@ -3827,7 +3825,6 @@ fn value_cdr(val: &Value) -> Result<Value, EvalError> {
     match val {
         Value::Pair(cell) => Ok(cell.borrow().1.clone()),
         Value::List(elems) if !elems.is_empty() => Ok(Value::List(elems[1..].to_vec())),
-        Value::DottedPair(_, b) => Ok(*b.clone()),
         _ => Err(ErrorKind::TypeMismatch {
             expected: "pair".into(),
             got: val.to_display_string(),

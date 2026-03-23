@@ -45,8 +45,6 @@ pub enum Value {
     Continuation(CapturedCont),
     /// A fixed-size mutable vector.
     Vector(Rc<RefCell<Vec<Value>>>),
-    /// A dotted pair (improper list): (a . b) where b is not a list.
-    DottedPair(Box<Value>, Box<Value>),
     /// A mutable cons cell with shared identity.
     Pair(Rc<RefCell<(Value, Value)>>),
     SyntaxRules {
@@ -107,7 +105,6 @@ impl PartialEq for Value {
             (Value::Vector(a), Value::Vector(b)) => *a.borrow() == *b.borrow(),
             (Value::Void, Value::Void) => true,
             (Value::Builtin(a), Value::Builtin(b)) => a == b,
-            (Value::DottedPair(a1, b1), Value::DottedPair(a2, b2)) => a1 == a2 && b1 == b2,
             (Value::Pair(a), Value::Pair(b)) => {
                 if Rc::ptr_eq(a, b) { return true; }
                 let ab = a.borrow();
@@ -151,7 +148,6 @@ impl Value {
                 let inner: Vec<String> = v.borrow().iter().map(|e| e.to_display_string()).collect();
                 format!("#({})", inner.join(" "))
             }
-            Value::DottedPair(a, b) => format!("({} . {})", a.to_display_string(), b.to_display_string()),
             Value::Pair(cell) => display_pair_chain(cell, Value::to_display_string),
             Value::Void => "".into(),
             Value::Builtin(name) => format!("#<procedure:{}>", name),
@@ -183,7 +179,6 @@ impl Value {
                 let inner: Vec<String> = v.borrow().iter().map(|e| e.to_display_output()).collect();
                 format!("#({})", inner.join(" "))
             }
-            Value::DottedPair(a, b) => format!("({} . {})", a.to_display_output(), b.to_display_output()),
             Value::Pair(cell) => display_pair_chain(cell, Value::to_display_output),
             Value::Continuation(_) => "#<continuation>".into(),
             Value::SyntaxRules { .. } => "#<macro>".into(),
