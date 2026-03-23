@@ -137,13 +137,13 @@ object Builtins:
 
   def evalStringAppend(args: List[SchemeValue]): SchemeValue =
     val parts = args.map {
-      case SString(s) => s
+      case SString(s) => s.toString
       case other =>
         throw new EvalError(
           s"string-append: expected string, got ${other.display}"
         )
     }
-    SString(parts.mkString)
+    SchemeValue.makeString(parts.mkString)
 
   def evalStringLength(args: List[SchemeValue]): SchemeValue =
     args match
@@ -156,13 +156,13 @@ object Builtins:
   def evalSubstring(args: List[SchemeValue]): SchemeValue =
     args match
       case SString(s) :: SInteger(start) :: SInteger(end) :: Nil =>
-        SString(s.substring(start.toInt, end.toInt))
+        SchemeValue.makeString(s.substring(start.toInt, end.toInt))
       case _ => throw new EvalError("substring: requires (string start end)")
 
   def evalStringToNumber(args: List[SchemeValue]): SchemeValue =
     args match
       case SString(s) :: Nil =>
-        s.toLongOption match
+        s.toString.toLongOption match
           case Some(n) => SInteger(n)
           case None    => SBoolean(false)
       case _ =>
@@ -172,7 +172,7 @@ object Builtins:
 
   def evalNumberToString(args: List[SchemeValue]): SchemeValue =
     args match
-      case SInteger(n) :: Nil => SString(n.toString)
+      case SInteger(n) :: Nil => SchemeValue.makeString(n.toString)
       case _ =>
         throw new EvalError(
           "number->string: requires exactly 1 number argument"
@@ -180,7 +180,7 @@ object Builtins:
 
   def evalSymbolToString(args: List[SchemeValue]): SchemeValue =
     args match
-      case SSymbol(n) :: Nil => SString(n)
+      case SSymbol(n) :: Nil => SchemeValue.makeString(n)
       case _ =>
         throw new EvalError(
           "symbol->string: requires exactly 1 symbol argument"
@@ -188,7 +188,7 @@ object Builtins:
 
   def evalStringToSymbol(args: List[SchemeValue]): SchemeValue =
     args match
-      case SString(s) :: Nil => SSymbol(s)
+      case SString(s) :: Nil => SSymbol(s.toString)
       case _ =>
         throw new EvalError(
           "string->symbol: requires exactly 1 string argument"
@@ -199,6 +199,21 @@ object Builtins:
       case SString(s) :: SInteger(i) :: Nil => SChar(s.charAt(i.toInt))
       case _ =>
         throw new EvalError("string-ref: requires (string index)")
+
+  def evalStringSet(args: List[SchemeValue]): SchemeValue =
+    args match
+      case SString(s) :: SInteger(i) :: SChar(c) :: Nil =>
+        s.setCharAt(i.toInt, c)
+        SVoid
+      case _ =>
+        throw new EvalError("string-set!: requires (string index char)")
+
+  def evalStringCopy(args: List[SchemeValue]): SchemeValue =
+    args match
+      case SString(s) :: Nil =>
+        SchemeValue.makeString(s.toString)
+      case _ =>
+        throw new EvalError("string-copy: requires exactly 1 string argument")
 
   def typeCheck(
     args: List[SchemeValue],

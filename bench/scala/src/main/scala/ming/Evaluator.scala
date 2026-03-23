@@ -66,6 +66,8 @@ object Evaluator:
     reg("symbol->string", Builtins.evalSymbolToString)
     reg("string->symbol", Builtins.evalStringToSymbol)
     reg("string-ref", Builtins.evalStringRef)
+    reg("string-set!", Builtins.evalStringSet)
+    reg("string-copy", Builtins.evalStringCopy)
     env
 
   private def withPos(pos: (Int, Int))(body: => SchemeValue): SchemeValue =

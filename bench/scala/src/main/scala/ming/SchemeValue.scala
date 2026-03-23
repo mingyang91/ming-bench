@@ -4,7 +4,7 @@ package ming
 enum SchemeValue:
   case SInteger(value: Long)
   case SBoolean(value: Boolean)
-  case SString(value: String)
+  case SString(value: StringBuilder)
   case SSymbol(name: String)
   case SList(elements: List[SchemeValue], pos: (Int, Int) = (0, 0))
   case SPair(car: SchemeValue, cdr: SchemeValue)
@@ -18,7 +18,7 @@ enum SchemeValue:
   def display: String = this match
     case SInteger(v)      => v.toString
     case SBoolean(v)      => if v then "#t" else "#f"
-    case SString(v)       => "\"" + v + "\""
+    case SString(v)       => "\"" + v.toString + "\""
     case SSymbol(n)       => n
     case SList(elems, _)  => "(" + elems.map(_.display).mkString(" ") + ")"
     case SNil             => "()"
@@ -30,7 +30,7 @@ enum SchemeValue:
 
   /** Display form — strings are unquoted. Used by Scheme `display`. */
   def displayForm: String = this match
-    case SString(v)  => v
+    case SString(v)  => v.toString
     case SPair(_, _) => formatPair(this, quoted = false)
     case _           => display
 
@@ -49,3 +49,6 @@ enum SchemeValue:
     loop(p, true)
     sb.append(")")
     sb.toString
+
+object SchemeValue:
+  def makeString(s: String): SchemeValue = SString(new StringBuilder(s))

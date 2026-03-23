@@ -71,6 +71,16 @@ object Parser:
       val (l, c) = lineCol(pos)
       buf += Token(input.substring(pos, pos + 2), l, c)
       pos + 2
+    else if next == '\\' then
+      val (l, c) = lineCol(pos)
+      if pos + 2 < input.length then
+        val charStart = pos + 2
+        var end       = charStart + 1
+        while end < input.length && input(end).isLetter do end += 1
+        val tok = input.substring(pos, end)
+        buf += Token(tok, l, c)
+        end
+      else throw new EvalError("incomplete character literal")
     else scanSymbol(input, pos, lineCol, buf)
 
   private def scanSymbol(
@@ -139,7 +149,8 @@ object Parser:
   private def parseAtom(token: String): SchemeValue =
     if token == "#t" then SBoolean(true)
     else if token == "#f" then SBoolean(false)
-    else if token.startsWith("\"") then SString(unescapeString(token.substring(1, token.length - 1)))
+    else if token.startsWith("#\\") then parseCharLiteral(token)
+    else if token.startsWith("\"") then SchemeValue.makeString(unescapeString(token.substring(1, token.length - 1)))
     else
       token.toLongOption match
         case Some(n) => SInteger(n)
