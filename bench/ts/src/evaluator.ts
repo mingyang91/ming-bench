@@ -157,7 +157,7 @@ function gensym(base: string): string { return `##${base}_${gensymCounter++}`; }
 
 const SPECIAL_FORMS = new Set([
   'quote', 'if', 'define', 'lambda', 'set!', 'begin', 'let', 'letrec', 'letrec*',
-  'case', 'do', 'cond', 'and', 'or', 'define-syntax',
+  'case', 'do', 'cond', 'and', 'or', 'define-syntax', 'guard',
 ]);
 
 function matchPattern(
@@ -303,6 +303,17 @@ function trampoline(b: Bounce): SchemeVal {
 
 type WindFrame = { inThunk: SchemeVal; outThunk: SchemeVal };
 let windStack: WindFrame[] = [];
+
+type ExHandler = { fn: (val: SchemeVal) => Bounce; savedWind: WindFrame[] };
+let exHandlers: ExHandler[] = [];
+
+function raiseValue(val: SchemeVal): Bounce {
+  if (exHandlers.length === 0) {
+    throw new EvalError(`unhandled exception: ${displayVal(val)}`);
+  }
+  const handler = exHandlers.pop()!;
+  return doWind(handler.savedWind, () => handler.fn(val));
+}
 
 function doWind(target: WindFrame[], after: () => Bounce): Bounce {
   let common = 0;
@@ -626,6 +637,49 @@ function evalK(expr: SchemeVal, env: Env, k: Kont): Bounce {
         return evalOrs(1);
       }
 
+      case 'guard': {
+        if (elems.length < 3) throw posError('guard: bad syntax', expr.pos);
+        const guardSpec = elems[1];
+        if (guardSpec.tag !== 'list' || guardSpec.elements.length < 1)
+          throw posError('guard: bad syntax', expr.pos);
+        const gVarSym = guardSpec.elements[0];
+        if (gVarSym.tag !== 'symbol') throw posError('guard: variable must be symbol', expr.pos);
+        const gVarName = gVarSym.value;
+        const gClauses = guardSpec.elements.slice(1);
+        const gBodyExprs = elems.slice(2);
+        const guardK = k;
+        const guardWind = [...windStack];
+
+        exHandlers.push({
+          fn: (exnVal) => {
+            const clauseEnv = new Env(env);
+            clauseEnv.set(gVarName, exnVal);
+            const testClauses = (ci: number): Bounce => {
+              if (ci >= gClauses.length) return raiseValue(exnVal);
+              const clause = gClauses[ci];
+              if (clause.tag !== 'list' || clause.elements.length < 2)
+                throw posError('guard: bad clause', expr.pos);
+              if (clause.elements[0].tag === 'symbol' && clause.elements[0].value === 'else') {
+                return doWind(guardWind, () => evalSeqArr(clause.elements.slice(1), clauseEnv, guardK));
+              }
+              return evalK(clause.elements[0], clauseEnv, testResult => {
+                if (isTruthy(testResult)) {
+                  return doWind(guardWind, () => evalSeqArr(clause.elements.slice(1), clauseEnv, guardK));
+                }
+                return testClauses(ci + 1);
+              });
+            };
+            return testClauses(0);
+          },
+          savedWind: [...windStack],
+        });
+
+        return evalSeqArr(gBodyExprs, env, bodyVal => {
+          exHandlers.pop();
+          return guardK(bodyVal);
+        });
+      }
+
       case 'define-syntax': {
         if (elems.length !== 3) throw posError('define-syntax: bad syntax', expr.pos);
         const name = elems[1];
@@ -735,6 +789,27 @@ function applyK(proc: SchemeVal, args: SchemeVal[], k: Kont, pos?: Pos): Bounce 
     }, pos);
   }
 
+  if (proc.tag === 'builtin' && proc.name === 'raise') {
+    if (args.length !== 1) throw posError('raise: need 1 argument', pos);
+    return raiseValue(args[0]);
+  }
+
+  if (proc.tag === 'builtin' && proc.name === 'with-exception-handler') {
+    if (args.length !== 2) throw posError('with-exception-handler: need 2 arguments', pos);
+    const [handlerProc, thunk] = args;
+    const savedWind = [...windStack];
+    exHandlers.push({
+      fn: (val) => applyK(handlerProc, [val], _ => {
+        throw new EvalError('exception handler returned from raise');
+      }, pos),
+      savedWind,
+    });
+    return applyK(thunk, [], bodyVal => {
+      exHandlers.pop();
+      return k(bodyVal);
+    }, pos);
+  }
+
   if (proc.tag === 'builtin' && proc.name === 'map') {
     if (args.length < 2) throw posError('map: need at least 2 arguments', pos);
     const fn = args[0];
@@ -841,6 +916,8 @@ function makeGlobalEnv(output: string[] = []): Env {
   // apply (handled specially in applyK, but needs a value in the env)
   env.set('apply', { tag: 'builtin', name: 'apply', fn: () => { throw new EvalError('internal: apply handled by applyK'); } });
   env.set('dynamic-wind', { tag: 'builtin', name: 'dynamic-wind', fn: () => { throw new EvalError('internal: dynamic-wind handled by applyK'); } });
+  env.set('raise', { tag: 'builtin', name: 'raise', fn: () => { throw new EvalError('internal: raise handled by applyK'); } });
+  env.set('with-exception-handler', { tag: 'builtin', name: 'with-exception-handler', fn: () => { throw new EvalError('internal: with-exception-handler handled by applyK'); } });
 
   defBuiltin('+', (args, p) => { let s = 0; for (const a of args) s += expectNumber(a, '+', p); return { tag: 'number', value: s }; });
   defBuiltin('-', (args, p) => {
@@ -1255,6 +1332,7 @@ export function evalStr(input: string): string {
   const exprs = parseAll(input);
   if (exprs.length === 0) throw new EvalError('no expressions');
   windStack = [];
+  exHandlers = [];
   const env = makeGlobalEnv();
   const result = trampoline(evalSeqArr(exprs, env, v => done(v)));
   return displayVal(result);
@@ -1264,6 +1342,7 @@ export function evalStrWithOutput(input: string): { result: string; output: stri
   const exprs = parseAll(input);
   if (exprs.length === 0) throw new EvalError('no expressions');
   windStack = [];
+  exHandlers = [];
   const output: string[] = [];
   const env = makeGlobalEnv(output);
   const result = trampoline(evalSeqArr(exprs, env, v => done(v)));
