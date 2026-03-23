@@ -109,7 +109,7 @@ fn match_single(
         Value::Pair(_) | Value::Builtin(_) | Value::Closure { .. }
         | Value::Continuation(_) | Value::SyntaxRules { .. }
         | Value::Vector(_) | Value::Values(_) | Value::Record { .. }
-        | Value::MacroTransformer { .. } | Value::Void => false,
+        | Value::MacroTransformer { .. } | Value::CaseLambda { .. } | Value::Void => false,
     }
 }
 
@@ -210,7 +210,7 @@ pub fn expand_template(
         | Value::Pair(_) | Value::Builtin(_) | Value::Closure { .. }
         | Value::Continuation(_) | Value::SyntaxRules { .. }
         | Value::Vector(_) | Value::Values(_) | Value::Record { .. }
-        | Value::MacroTransformer { .. } | Value::Void => Ok(template.clone()),
+        | Value::MacroTransformer { .. } | Value::CaseLambda { .. } | Value::Void => Ok(template.clone()),
     }
 }
 
@@ -236,6 +236,6 @@ pub fn find_ellipsis_var(template: &Value, bindings: &HashMap<String, Binding>) 
         | Value::Pair(_) | Value::Builtin(_) | Value::Closure { .. }
         | Value::Continuation(_) | Value::SyntaxRules { .. }
         | Value::Vector(_) | Value::Values(_) | Value::Record { .. }
-        | Value::MacroTransformer { .. } | Value::Void => None,
+        | Value::MacroTransformer { .. } | Value::CaseLambda { .. } | Value::Void => None,
     }
 }

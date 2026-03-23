@@ -382,7 +382,8 @@ impl Machine {
             | Value::Closure { .. } | Value::Pair(_) | Value::Continuation(_)
             | Value::SyntaxRules { .. } | Value::Vector(_)
             | Value::Values(_) | Value::Record { .. }
-            | Value::MacroTransformer { .. } => Ok(Control::Continue(expr)),
+            | Value::MacroTransformer { .. }
+            | Value::CaseLambda { .. } => Ok(Control::Continue(expr)),
             Value::Symbol(ref name, _) => env
                 .borrow()
                 .get(name)
@@ -409,6 +410,7 @@ impl Machine {
                 "if" => return self.sf_if(&elems[1..], span, env),
                 "define" => return self.sf_define(&elems[1..], span, env),
                 "lambda" => return sf_lambda(&elems[1..], span, env),
+                "case-lambda" => return sf_case_lambda(&elems[1..], span, env),
                 "quote" => return sf_quote(&elems[1..], span),
                 "let" => return self.sf_let(&elems[1..], span, env),
                 "begin" => return self.eval_body_in(&elems[1..], env),
@@ -899,6 +901,30 @@ impl Machine {
                 }
                 self.eval_body_in(&body, &call_env)
             }
+            Value::CaseLambda { clauses, env } => {
+                let arg_count = args.len();
+                let matched = clauses.iter().find(|(params, rest_param, _)| {
+                    match rest_param {
+                        Some(_) => arg_count >= params.len(),
+                        None => arg_count == params.len(),
+                    }
+                });
+                let Some((params, rest_param, body)) = matched else {
+                    return Err(EvalError::WrongArgCount {
+                        expected: clauses.first().map_or(0, |(p, _, _)| p.len()),
+                        got: arg_count,
+                    }.at(span));
+                };
+                let call_env = Env::with_parent(&env);
+                for (param, arg) in params.iter().zip(args.iter()) {
+                    call_env.borrow_mut().define(param.clone(), arg.clone());
+                }
+                if let Some(rest) = rest_param {
+                    let rest_args = Value::List(args[params.len()..].to_vec(), None);
+                    call_env.borrow_mut().define(rest.clone(), rest_args);
+                }
+                self.eval_body_in(body, &call_env)
+            }
             Value::Continuation(id) => {
                 let val = match args.len() {
                     0 => Value::Void,
@@ -1255,7 +1281,7 @@ impl Machine {
             | Value::Builtin(_) | Value::Closure { .. } | Value::Pair(_)
             | Value::Continuation(_) | Value::SyntaxRules { .. }
             | Value::Vector(_) | Value::Values(_) | Value::Record { .. }
-            | Value::MacroTransformer { .. } | Value::Void => {
+            | Value::MacroTransformer { .. } | Value::CaseLambda { .. } | Value::Void => {
                 Err(EvalError::Parse {
                     msg: format!("define: expected symbol or list, got {}", args[0]),
                 }.at(span))
@@ -2323,7 +2349,7 @@ fn make_literal(val: Value) -> Value {
         | Value::Builtin(_) | Value::Closure { .. } | Value::Pair(_)
         | Value::Continuation(_) | Value::SyntaxRules { .. }
         | Value::Vector(_) | Value::Values(_) | Value::Record { .. }
-        | Value::MacroTransformer { .. } | Value::Void => val,
+        | Value::MacroTransformer { .. } | Value::CaseLambda { .. } | Value::Void => val,
         Value::Symbol(_, _) | Value::List(_, _) => Value::List(
             vec![Value::Symbol("quote".into(), None), val],
             None,
@@ -2348,6 +2374,41 @@ fn sf_lambda(
     let body = args[1..].to_vec();
     Ok(Control::Continue(Value::Closure {
         params, rest_param, body, env: Rc::clone(env),
+    }))
+}
+
+fn sf_case_lambda(
+    args: &[Value], span: Option<Span>, env: &Rc<RefCell<Env>>,
+) -> Result<Control, EvalError> {
+    if args.is_empty() {
+        return Err(EvalError::Parse {
+            msg: "case-lambda requires at least one clause".into(),
+        }.at(span));
+    }
+    let mut clauses = Vec::new();
+    for clause in args {
+        let Value::List(elems, _) = clause else {
+            return Err(EvalError::Parse {
+                msg: "case-lambda: each clause must be a list".into(),
+            }.at(span));
+        };
+        if elems.is_empty() {
+            return Err(EvalError::Parse {
+                msg: "case-lambda: clause must have params and body".into(),
+            }.at(span));
+        }
+        let Value::List(param_list, _) = &elems[0] else {
+            return Err(EvalError::Parse {
+                msg: "case-lambda: expected parameter list".into(),
+            }.at(span));
+        };
+        let (params, rest_param) = parse_params(param_list, span, "case-lambda")?;
+        let body = elems[1..].to_vec();
+        clauses.push((params, rest_param, body));
+    }
+    Ok(Control::Continue(Value::CaseLambda {
+        clauses,
+        env: Rc::clone(env),
     }))
 }
 
@@ -2728,7 +2789,7 @@ fn apply_builtin(
             if args.len() != 1 {
                 return Err(EvalError::WrongArgCount { expected: 1, got: args.len() });
             }
-            let result = matches!(&args[0], Value::Builtin(_) | Value::Closure { .. } | Value::Continuation(_));
+            let result = matches!(&args[0], Value::Builtin(_) | Value::Closure { .. } | Value::CaseLambda { .. } | Value::Continuation(_));
             Ok(Value::Bool(result))
         }
         "syntax->datum" => {

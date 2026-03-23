@@ -46,6 +46,10 @@ pub enum Value {
         body: Vec<Value>,
         env: Rc<RefCell<Env>>,
     },
+    CaseLambda {
+        clauses: Vec<(Vec<String>, Option<String>, Vec<Value>)>,
+        env: Rc<RefCell<Env>>,
+    },
     Void,
 }
 
@@ -58,7 +62,7 @@ impl Value {
             | Value::Builtin(_) | Value::Closure { .. } | Value::Pair(_)
             | Value::Continuation(_) | Value::SyntaxRules { .. }
             | Value::Vector(_) | Value::Values(_) | Value::Record { .. }
-            | Value::MacroTransformer { .. } | Value::Void => None,
+            | Value::MacroTransformer { .. } | Value::CaseLambda { .. } | Value::Void => None,
         }
     }
 
@@ -152,6 +156,7 @@ impl PartialEq for Value {
             (Value::Builtin(a), Value::Builtin(b)) => a == b,
             (Value::Void, Value::Void) => true,
             (Value::Closure { .. }, Value::Closure { .. }) => false,
+            (Value::CaseLambda { .. }, Value::CaseLambda { .. }) => false,
             (Value::Pair(a), Value::Pair(b)) => {
                 if Rc::ptr_eq(a, b) {
                     return true;
@@ -221,6 +226,7 @@ impl PartialEq for Value {
             | (Value::Values(_), _)
             | (Value::Record { .. }, _)
             | (Value::MacroTransformer { .. }, _)
+            | (Value::CaseLambda { .. }, _)
             | (Value::Void, _) => false,
         }
     }
@@ -364,6 +370,7 @@ impl fmt::Display for Value {
             Value::Pair(cell) => fmt_pair(cell, f),
             Value::Builtin(name) => write!(f, "#<procedure:{name}>"),
             Value::Closure { .. } => write!(f, "#<procedure>"),
+            Value::CaseLambda { .. } => write!(f, "#<procedure>"),
             Value::Continuation(_) => write!(f, "#<continuation>"),
             Value::SyntaxRules { .. } => write!(f, "#<syntax>"),
             Value::Vector(elems) => {
