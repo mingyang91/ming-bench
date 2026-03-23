@@ -30,6 +30,9 @@ pub enum ErrorKind {
 
     #[error("bad syntax in {form}: {message}")]
     BadSyntax { form: String, message: String },
+
+    #[error("string is immutable")]
+    ImmutableString,
 }
 
 /// Evaluation error with optional source position.

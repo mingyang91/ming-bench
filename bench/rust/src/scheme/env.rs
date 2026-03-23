@@ -29,6 +29,7 @@ impl Env {
             "string->number", "number->string",
             "symbol->string", "string->symbol",
             "string-ref", "string-copy", "string-set!", "char?",
+            "string->list", "list->string", "char->integer", "integer->char",
             "call/cc", "call-with-current-continuation",
             "eq?", "equal?", "map",
             "abs", "modulo", "remainder", "quotient",

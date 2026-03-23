@@ -3,7 +3,7 @@ use crate::scheme::env::Env;
 use crate::scheme::error::{ErrorKind, EvalError, Span};
 use crate::scheme::parser::{Expr, ExprKind};
 use crate::scheme::macros;
-use crate::scheme::value::{CapturedCont, Value};
+use crate::scheme::value::{CapturedCont, StringMutability, Value};
 
 // ── continuation frames ──────────────────────────────────────
 
@@ -1040,7 +1040,8 @@ fn apply_builtin(name: &str, args: &[Value], env: &Rc<Env>) -> Result<Value, Eva
         }
         "string-append" | "string-length" | "substring" | "string->number"
         | "number->string" | "symbol->string" | "string->symbol" | "string-ref"
-        | "string-copy" | "string-set!" => apply_string_builtin(name, args),
+        | "string-copy" | "string-set!" | "string->list" | "list->string"
+        | "char->integer" | "integer->char" => apply_string_builtin(name, args),
         "not" => {
             if args.len() != 1 {
                 return Err(ErrorKind::WrongArgCount {
@@ -1055,7 +1056,7 @@ fn apply_builtin(name: &str, args: &[Value], env: &Rc<Env>) -> Result<Value, Eva
             if args.len() != 1 {
                 return Err(ErrorKind::WrongArgCount { expected: 1, got: args.len() }.into());
             }
-            Ok(Value::Boolean(matches!(&args[0], Value::Str(_))))
+            Ok(Value::Boolean(matches!(&args[0], Value::Str(_, _))))
         }
         "number?" => {
             if args.len() != 1 {
@@ -1578,7 +1579,7 @@ fn apply_string_builtin(name: &str, args: &[Value]) -> Result<Value, EvalError> 
             let mut result = String::new();
             for arg in args {
                 match arg {
-                    Value::Str(s) => result.push_str(&s.borrow()),
+                    Value::Str(s, _) => result.push_str(&s.borrow()),
                     other => {
                         return Err(ErrorKind::TypeMismatch {
                             expected: "string".into(),
@@ -1599,7 +1600,7 @@ fn apply_string_builtin(name: &str, args: &[Value]) -> Result<Value, EvalError> 
                 .into());
             }
             match &args[0] {
-                Value::Str(s) => Ok(Value::Integer(s.borrow().len() as i64)),
+                Value::Str(s, _) => Ok(Value::Integer(s.borrow().len() as i64)),
                 other => Err(ErrorKind::TypeMismatch {
                     expected: "string".into(),
                     got: other.to_display_string(),
@@ -1616,7 +1617,7 @@ fn apply_string_builtin(name: &str, args: &[Value]) -> Result<Value, EvalError> 
                 .into());
             }
             let s_ref = match &args[0] {
-                Value::Str(s) => s,
+                Value::Str(s, _) => s,
                 other => {
                     return Err(ErrorKind::TypeMismatch {
                         expected: "string".into(),
@@ -1646,7 +1647,7 @@ fn apply_string_builtin(name: &str, args: &[Value]) -> Result<Value, EvalError> 
                 .into());
             }
             match &args[0] {
-                Value::Str(s) => match s.borrow().parse::<i64>() {
+                Value::Str(s, _) => match s.borrow().parse::<i64>() {
                     Ok(n) => Ok(Value::Integer(n)),
                     Err(_) => Ok(Value::Boolean(false)),
                 },
@@ -1694,7 +1695,7 @@ fn apply_string_builtin(name: &str, args: &[Value]) -> Result<Value, EvalError> 
                 .into());
             }
             match &args[0] {
-                Value::Str(s) => Ok(Value::Symbol(s.borrow().clone())),
+                Value::Str(s, _) => Ok(Value::Symbol(s.borrow().clone())),
                 other => Err(ErrorKind::TypeMismatch {
                     expected: "string".into(),
                     got: other.to_display_string(),
@@ -1711,7 +1712,7 @@ fn apply_string_builtin(name: &str, args: &[Value]) -> Result<Value, EvalError> 
                 .into());
             }
             let s_ref = match &args[0] {
-                Value::Str(s) => s,
+                Value::Str(s, _) => s,
                 other => {
                     return Err(ErrorKind::TypeMismatch {
                         expected: "string".into(),
@@ -1740,7 +1741,7 @@ fn apply_string_builtin(name: &str, args: &[Value]) -> Result<Value, EvalError> 
                 .into());
             }
             match &args[0] {
-                Value::Str(s) => Ok(Value::new_str(s.borrow().clone())),
+                Value::Str(s, _) => Ok(Value::new_mutable_str(s.borrow().clone())),
                 other => Err(ErrorKind::TypeMismatch {
                     expected: "string".into(),
                     got: other.to_display_string(),
@@ -1750,46 +1751,98 @@ fn apply_string_builtin(name: &str, args: &[Value]) -> Result<Value, EvalError> 
         }
         "string-set!" => {
             if args.len() != 3 {
-                return Err(ErrorKind::WrongArgCount {
-                    expected: 3,
-                    got: args.len(),
-                }
-                .into());
+                return Err(ErrorKind::WrongArgCount { expected: 3, got: args.len() }.into());
             }
-            let s_ref = match &args[0] {
-                Value::Str(s) => s,
-                other => {
-                    return Err(ErrorKind::TypeMismatch {
-                        expected: "string".into(),
-                        got: other.to_display_string(),
+            match &args[0] {
+                Value::Str(s, StringMutability::Mutable) => {
+                    let idx = require_int(&args[1])? as usize;
+                    let ch = require_char(&args[2])?;
+                    let mut borrowed = s.borrow_mut();
+                    if idx >= borrowed.len() {
+                        return Err(ErrorKind::TypeMismatch {
+                            expected: "valid string index".into(),
+                            got: format!("index {} for string of length {}", idx, borrowed.len()),
+                        }
+                        .into());
                     }
-                    .into())
+                    // SAFETY: replacing a single byte with a single-byte char (ASCII assumption matching string-ref)
+                    // Safe because we work on bytes directly
+                    let bytes = unsafe { borrowed.as_bytes_mut() };
+                    bytes[idx] = ch as u8;
+                    Ok(Value::Void)
                 }
+                Value::Str(_, StringMutability::Immutable) => {
+                    Err(ErrorKind::ImmutableString.into())
+                }
+                other => Err(ErrorKind::TypeMismatch {
+                    expected: "string".into(),
+                    got: other.to_display_string(),
+                }
+                .into()),
+            }
+        }
+        "string->list" => {
+            if args.len() != 1 {
+                return Err(ErrorKind::WrongArgCount { expected: 1, got: args.len() }.into());
+            }
+            match &args[0] {
+                Value::Str(s, _) => {
+                    let chars: Vec<Value> = s.borrow().chars().map(Value::Char).collect();
+                    Ok(Value::List(chars))
+                }
+                other => Err(ErrorKind::TypeMismatch {
+                    expected: "string".into(),
+                    got: other.to_display_string(),
+                }.into()),
+            }
+        }
+        "list->string" => {
+            if args.len() != 1 {
+                return Err(ErrorKind::WrongArgCount { expected: 1, got: args.len() }.into());
+            }
+            let chars = match &args[0] {
+                Value::List(elems) => elems,
+                other => return Err(ErrorKind::TypeMismatch {
+                    expected: "list".into(),
+                    got: other.to_display_string(),
+                }.into()),
             };
-            let idx = require_int(&args[1])? as usize;
-            let ch = match &args[2] {
-                Value::Char(c) => *c,
-                other => {
-                    return Err(ErrorKind::TypeMismatch {
+            let mut s = String::with_capacity(chars.len());
+            for v in chars {
+                match v {
+                    Value::Char(c) => s.push(*c),
+                    other => return Err(ErrorKind::TypeMismatch {
                         expected: "char".into(),
                         got: other.to_display_string(),
-                    }
-                    .into())
+                    }.into()),
                 }
-            };
-            let mut s = s_ref.borrow_mut();
-            if idx >= s.len() {
-                return Err(ErrorKind::TypeMismatch {
-                    expected: "valid string index".into(),
-                    got: format!("index {} for string of length {}", idx, s.len()),
-                }
-                .into());
             }
-            // SAFETY: we verified idx is in bounds and we're replacing a single ASCII-range byte
-            unsafe {
-                s.as_bytes_mut()[idx] = ch as u8;
+            Ok(Value::new_str(s))
+        }
+        "char->integer" => {
+            if args.len() != 1 {
+                return Err(ErrorKind::WrongArgCount { expected: 1, got: args.len() }.into());
             }
-            Ok(Value::Void)
+            match &args[0] {
+                Value::Char(c) => Ok(Value::Integer(*c as i64)),
+                other => Err(ErrorKind::TypeMismatch {
+                    expected: "char".into(),
+                    got: other.to_display_string(),
+                }.into()),
+            }
+        }
+        "integer->char" => {
+            if args.len() != 1 {
+                return Err(ErrorKind::WrongArgCount { expected: 1, got: args.len() }.into());
+            }
+            let n = require_int(&args[0])?;
+            match char::from_u32(n as u32) {
+                Some(c) => Ok(Value::Char(c)),
+                None => Err(ErrorKind::TypeMismatch {
+                    expected: "valid Unicode code point".into(),
+                    got: format!("{}", n),
+                }.into()),
+            }
         }
         _ => Err(ErrorKind::NotAProcedure {
             value: format!("#<procedure:{}>", name),
@@ -1822,7 +1875,7 @@ fn require_char(val: &Value) -> Result<char, EvalError> {
 
 fn require_string(val: &Value) -> Result<&std::rc::Rc<std::cell::RefCell<String>>, EvalError> {
     match val {
-        Value::Str(s) => Ok(s),
+        Value::Str(s, _) => Ok(s),
         other => Err(ErrorKind::TypeMismatch {
             expected: "string".into(),
             got: other.to_display_string(),
@@ -1840,7 +1893,7 @@ fn scheme_eq(a: &Value, b: &Value) -> bool {
         (Value::Char(x), Value::Char(y)) => x == y,
         (Value::List(x), Value::List(y)) => x.is_empty() && y.is_empty(),
         (Value::Void, Value::Void) => true,
-        (Value::Str(x), Value::Str(y)) => std::rc::Rc::ptr_eq(x, y),
+        (Value::Str(x, _), Value::Str(y, _)) => std::rc::Rc::ptr_eq(x, y),
         (Value::Builtin(x), Value::Builtin(y)) => x == y,
         _ => false,
     }
