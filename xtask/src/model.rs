@@ -423,9 +423,9 @@ pub fn fixtures_dir() -> PathBuf {
 // Level constants
 // ---------------------------------------------------------------------------
 
-pub const LEVELS: [&str; 27] = [
+pub const LEVELS: [&str; 28] = [
     "01", "02", "03", "04", "05", "06", "07", "08", "09", "10", "11", "12", "13", "14", "15", "16",
-    "17", "18", "19", "20", "21", "22", "23", "24", "25", "26", "27",
+    "17", "18", "19", "20", "21", "22", "23", "24", "25", "26", "27", "28",
 ];
 
 // ---------------------------------------------------------------------------
@@ -461,6 +461,7 @@ pub fn turns_for_level(level_num: u32, max_turns: Option<u32>) -> u32 {
         24..=25 => 60, // tech-debt: case-lambda, procedure?
         26 => 90,      // real-world integration stress
         27 => 90,      // concurrent evaluation (thread safety)
+        28 => 90,      // performance & memory stress
         _ => 75,
     }
 }

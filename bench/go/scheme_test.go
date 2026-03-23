@@ -291,3 +291,101 @@ func TestL27ConcurrentStress(t *testing.T) {
 		}
 	}
 }
+
+// ===== State isolation tests (sequential) =====
+
+func TestL27SequentialStateLeak(t *testing.T) {
+	skipIfBelowL27(t)
+	r1, err := EvalStr("(begin (define x 42) x)")
+	if err != nil {
+		t.Fatalf("first eval failed: %v", err)
+	}
+	if r1 != "42" {
+		t.Fatalf("expected \"42\", got %q", r1)
+	}
+	// x must not leak to next EvalStr call
+	_, err2 := EvalStr("x")
+	if err2 == nil {
+		t.Fatal("variable 'x' leaked between independent EvalStr calls")
+	}
+}
+
+func TestL27SequentialOutputLeak(t *testing.T) {
+	skipIfBelowL27(t)
+	_, out1, err1 := EvalStrWithOutput(`(display "aaa")`)
+	if err1 != nil {
+		t.Fatalf("first eval failed: %v", err1)
+	}
+	_, out2, err2 := EvalStrWithOutput(`(display "bbb")`)
+	if err2 != nil {
+		t.Fatalf("second eval failed: %v", err2)
+	}
+	if out1 != "aaa" {
+		t.Fatalf("expected output \"aaa\", got %q", out1)
+	}
+	if out2 != "bbb" {
+		t.Fatalf("output buffer leaked: expected \"bbb\", got %q", out2)
+	}
+}
+
+func TestL27ConcurrentCallccCollision(t *testing.T) {
+	skipIfBelowL27(t)
+	const n = 8
+	ch := make(chan struct {
+		val string
+		err error
+	}, n)
+	for i := 0; i < n; i++ {
+		go func() {
+			val, err := EvalStr(`(let ((count 0))
+				(set! count (+ count (call/cc (lambda (k) (k 10)))))
+				count)`)
+			ch <- struct {
+				val string
+				err error
+			}{val, err}
+		}()
+	}
+	for i := 0; i < n; i++ {
+		r := <-ch
+		if r.err != nil {
+			t.Fatalf("unexpected error: %v", r.err)
+		}
+		if r.val != "10" {
+			t.Fatalf("expected \"10\", got %q", r.val)
+		}
+	}
+}
+
+func TestL27ConcurrentMacroHygiene(t *testing.T) {
+	skipIfBelowL27(t)
+	const n = 4
+	ch := make(chan struct {
+		val string
+		err error
+	}, n)
+	for i := 0; i < n; i++ {
+		go func() {
+			val, err := EvalStr(`(begin
+				(define-syntax my-swap!
+					(syntax-rules ()
+						((_ a b) (let ((tmp a)) (set! a b) (set! b tmp)))))
+				(let ((x 1) (y 2))
+					(my-swap! x y)
+					(list x y)))`)
+			ch <- struct {
+				val string
+				err error
+			}{val, err}
+		}()
+	}
+	for i := 0; i < n; i++ {
+		r := <-ch
+		if r.err != nil {
+			t.Fatalf("unexpected error: %v", r.err)
+		}
+		if r.val != "(2 1)" {
+			t.Fatalf("expected \"(2 1)\", got %q", r.val)
+		}
+	}
+}

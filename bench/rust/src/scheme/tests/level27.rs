@@ -103,3 +103,86 @@ fn test_l27_concurrent_stress() {
         assert_eq!(result, Ok(format!("{i}")));
     }
 }
+
+// ===== State isolation tests (sequential — no threading needed) =====
+
+#[test]
+fn test_l27_sequential_state_leak() {
+    if bench_level() > 0 && bench_level() < 27 {
+        return;
+    }
+    // First call defines x, second call must NOT see it
+    let r1 = eval_str("(begin (define x 42) x)");
+    assert_eq!(r1, Ok("42".into()));
+
+    // x must not leak to the next eval_str call
+    let r2 = eval_str("x");
+    assert!(r2.is_err(), "variable 'x' leaked between independent eval_str calls");
+}
+
+#[test]
+fn test_l27_sequential_output_leak() {
+    if bench_level() > 0 && bench_level() < 27 {
+        return;
+    }
+    let (_, out1) = eval_str_with_output("(display \"aaa\")").expect("eval failed");
+    let (_, out2) = eval_str_with_output("(display \"bbb\")").expect("eval failed");
+    assert_eq!(out1, "aaa");
+    assert_eq!(out2, "bbb", "output buffer leaked between eval_str_with_output calls");
+}
+
+// ===== Concurrent continuation/macro collision tests =====
+
+#[test]
+fn test_l27_concurrent_callcc_collision() {
+    if bench_level() > 0 && bench_level() < 27 {
+        return;
+    }
+    // 8 threads all use call/cc simultaneously — if continuation IDs
+    // are a global counter, results may corrupt across threads
+    let handles: Vec<_> = (0..8)
+        .map(|_| {
+            std::thread::spawn(|| {
+                eval_str(
+                    "(let ((count 0))
+                       (set! count (+ count (call/cc (lambda (k) (k 10)))))
+                       count)",
+                )
+            })
+        })
+        .collect();
+
+    for h in handles {
+        let result = h.join().expect("thread panicked");
+        assert_eq!(result, Ok("10".into()));
+    }
+}
+
+#[test]
+fn test_l27_concurrent_macro_hygiene() {
+    if bench_level() > 0 && bench_level() < 27 {
+        return;
+    }
+    // 4 threads expand macros with gensym — if gensym counter is global,
+    // symbol collisions cause incorrect variable capture
+    let handles: Vec<_> = (0..4)
+        .map(|_| {
+            std::thread::spawn(|| {
+                eval_str(
+                    "(begin
+                       (define-syntax my-swap!
+                         (syntax-rules ()
+                           ((_ a b) (let ((tmp a)) (set! a b) (set! b tmp)))))
+                       (let ((x 1) (y 2))
+                         (my-swap! x y)
+                         (list x y)))",
+                )
+            })
+        })
+        .collect();
+
+    for h in handles {
+        let result = h.join().expect("thread panicked");
+        assert_eq!(result, Ok("(2 1)".into()));
+    }
+}

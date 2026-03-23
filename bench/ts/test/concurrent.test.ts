@@ -108,4 +108,62 @@ describe.skipIf(shouldSkip)('Level 27: Concurrent Evaluation', () => {
       expect(r.result).toBe(String(i));
     });
   });
+
+  // ===== State isolation tests (sequential — no workers needed) =====
+
+  test('l27_sequential_state_leak', () => {
+    // Import evalStr directly for sequential tests (same thread)
+    const { evalStr: localEvalStr } = require('../src/evaluator.js');
+    const r1 = localEvalStr('(begin (define x 42) x)');
+    expect(r1).toBe('42');
+
+    // x must not leak to next evalStr call
+    expect(() => localEvalStr('x')).toThrow();
+  });
+
+  test('l27_sequential_output_leak', () => {
+    const { evalStrWithOutput: localEvalStrWithOutput } = require('../src/evaluator.js');
+    const r1 = localEvalStrWithOutput('(display "aaa")');
+    const r2 = localEvalStrWithOutput('(display "bbb")');
+    expect(r1.output).toBe('aaa');
+    expect(r2.output).toBe('bbb');
+  });
+
+  // ===== Concurrent continuation/macro collision tests =====
+
+  test('l27_concurrent_callcc_collision', async () => {
+    const promises = Array.from({ length: 8 }, () =>
+      evalInWorker(
+        `(let ((count 0))
+           (set! count (+ count (call/cc (lambda (k) (k 10)))))
+           count)`
+      )
+    );
+
+    const results = await Promise.all(promises);
+    results.forEach((r) => {
+      expect(r.error).toBeUndefined();
+      expect(r.result).toBe('10');
+    });
+  });
+
+  test('l27_concurrent_macro_hygiene', async () => {
+    const promises = Array.from({ length: 4 }, () =>
+      evalInWorker(
+        `(begin
+           (define-syntax my-swap!
+             (syntax-rules ()
+               ((_ a b) (let ((tmp a)) (set! a b) (set! b tmp)))))
+           (let ((x 1) (y 2))
+             (my-swap! x y)
+             (list x y)))`
+      )
+    );
+
+    const results = await Promise.all(promises);
+    results.forEach((r) => {
+      expect(r.error).toBeUndefined();
+      expect(r.result).toBe('(2 1)');
+    });
+  });
 });

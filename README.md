@@ -151,7 +151,7 @@ cargo xtask session-tools results/<run> --summary
 cargo xtask session-turns results/<run>
 cargo xtask session-dump results/<run> --text
 cargo xtask watch                          # live dashboard of running agents
-cargo xtask verify                         # ground-truth check against Guile
+cargo xtask verify                         # ground-truth check against Chez Scheme
 ```
 
 ### Agent Orchestration
@@ -241,4 +241,4 @@ See [BENCH_GUIDE.md](BENCH_GUIDE.md) for the full supervisor reference.
 
 ## Ground Truth
 
-Test expected values are verified against Guile Scheme. Run `cargo xtask verify` to re-check. The shared test manifest (`bench/tests.json`) and fixture files (`bench/fixtures/`) are the canonical source — all language test harnesses read from them.
+Test expected values are verified against Chez Scheme. Run `cargo xtask verify` to re-check. The shared test manifest (`bench/tests.json`) and fixture files (`bench/fixtures/`) are the canonical source — all language test harnesses read from them.

@@ -32,7 +32,7 @@ cargo xtask results              # tabular summary of all runs
 cargo xtask tokens --all         # token usage and cost estimates
 cargo xtask analyze --all        # request-level cost analysis
 cargo xtask watch                # live dashboard of running agents
-cargo xtask verify               # ground-truth check against Guile
+cargo xtask verify               # ground-truth check against Chez Scheme
 cargo xtask session-turns <run>  # per-level turn/time/token analysis
 cargo xtask session-stats <run>  # quick overview of a run
 cargo xtask session-dump <run>   # dump session content (--thinking, --text, --tools)

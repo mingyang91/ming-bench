@@ -111,4 +111,80 @@ class ConcurrencyTest {
         }
         pool.shutdown();
     }
+
+    // ===== State isolation tests (sequential) =====
+
+    @Test
+    void testL27SequentialStateLeak() throws Exception {
+        skipIfBelowLevel();
+        Interpreter interp = new Interpreter();
+        String r1 = interp.evalStr("(begin (define x 42) x)");
+        assertEquals("42", r1);
+
+        // x must not leak to next eval_str call
+        Interpreter interp2 = new Interpreter();
+        assertThrows(EvalError.class, () -> interp2.evalStr("x"),
+            "variable 'x' leaked between independent evalStr calls");
+    }
+
+    @Test
+    void testL27SequentialOutputLeak() throws Exception {
+        skipIfBelowLevel();
+        Interpreter i1 = new Interpreter();
+        Interpreter.EvalResult r1 = i1.evalStrWithOutput("(display \"aaa\")");
+        Interpreter i2 = new Interpreter();
+        Interpreter.EvalResult r2 = i2.evalStrWithOutput("(display \"bbb\")");
+        assertEquals("aaa", r1.output());
+        assertEquals("bbb", r2.output(), "output buffer leaked between evalStrWithOutput calls");
+    }
+
+    // ===== Concurrent continuation/macro collision tests =====
+
+    @Test
+    void testL27ConcurrentCallccCollision() throws Exception {
+        skipIfBelowLevel();
+        ExecutorService pool = Executors.newFixedThreadPool(8);
+        List<Future<String>> futures = new ArrayList<>();
+
+        for (int i = 0; i < 8; i++) {
+            futures.add(pool.submit(() -> {
+                Interpreter interp = new Interpreter();
+                return interp.evalStr(
+                    "(let ((count 0))" +
+                    "  (set! count (+ count (call/cc (lambda (k) (k 10)))))" +
+                    "  count)");
+            }));
+        }
+
+        for (Future<String> f : futures) {
+            assertEquals("10", f.get(30, TimeUnit.SECONDS));
+        }
+        pool.shutdown();
+    }
+
+    @Test
+    void testL27ConcurrentMacroHygiene() throws Exception {
+        skipIfBelowLevel();
+        ExecutorService pool = Executors.newFixedThreadPool(4);
+        List<Future<String>> futures = new ArrayList<>();
+
+        for (int i = 0; i < 4; i++) {
+            futures.add(pool.submit(() -> {
+                Interpreter interp = new Interpreter();
+                return interp.evalStr(
+                    "(begin" +
+                    "  (define-syntax my-swap!" +
+                    "    (syntax-rules ()" +
+                    "      ((_ a b) (let ((tmp a)) (set! a b) (set! b tmp)))))" +
+                    "  (let ((x 1) (y 2))" +
+                    "    (my-swap! x y)" +
+                    "    (list x y)))");
+            }));
+        }
+
+        for (Future<String> f : futures) {
+            assertEquals("(2 1)", f.get(30, TimeUnit.SECONDS));
+        }
+        pool.shutdown();
+    }
 }
