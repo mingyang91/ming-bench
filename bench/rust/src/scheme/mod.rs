@@ -2,11 +2,98 @@ pub mod error;
 
 pub use error::EvalError;
 
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
 use std::rc::Rc;
 
 type BuiltinFn = fn(&[Value]) -> Result<Value, EvalError>;
+
+// ---------- Continuation support ----------
+
+#[derive(Clone)]
+struct BodyFrame {
+    exprs: Vec<Expr>,
+    env: Env,
+}
+
+struct ContData {
+    id: usize,
+    frame: Option<BodyFrame>,
+}
+
+thread_local! {
+    static NEXT_CONT_ID: Cell<usize> = Cell::new(0);
+    static CALLCC_OVERRIDE: RefCell<Option<Value>> = RefCell::new(None);
+    static BODY_FRAMES: RefCell<Vec<BodyFrame>> = RefCell::new(Vec::new());
+    static CONT_REGISTRY: RefCell<HashMap<usize, Rc<ContData>>> = RefCell::new(HashMap::new());
+    static CONT_RETURN_VALUE: RefCell<Option<Value>> = RefCell::new(None);
+    static CONT_RESULT_VALUE: RefCell<Option<Value>> = RefCell::new(None);
+}
+
+fn push_body_frame(exprs: &[Expr], env: &Env) {
+    BODY_FRAMES.with(|bf| {
+        bf.borrow_mut().push(BodyFrame {
+            exprs: exprs.to_vec(),
+            env: env.clone(),
+        });
+    });
+}
+
+fn pop_body_frame() {
+    BODY_FRAMES.with(|bf| { bf.borrow_mut().pop(); });
+}
+
+fn init_cont_state() {
+    NEXT_CONT_ID.with(|c| c.set(0));
+    CALLCC_OVERRIDE.with(|o| *o.borrow_mut() = None);
+    BODY_FRAMES.with(|bf| bf.borrow_mut().clear());
+    CONT_REGISTRY.with(|cr| cr.borrow_mut().clear());
+    CONT_RETURN_VALUE.with(|v| *v.borrow_mut() = None);
+    CONT_RESULT_VALUE.with(|v| *v.borrow_mut() = None);
+}
+
+/// Evaluate a body (sequence of expressions) for continuation replay.
+/// Does NOT use TailCall — all expressions are fully evaluated.
+fn eval_body_for_replay(body: &[Expr], env: &Env) -> Result<Value, EvalError> {
+    let mut last = Value::Void;
+    for (i, expr) in body.iter().enumerate() {
+        push_body_frame(&body[i..], env);
+        match eval(expr, env) {
+            Ok(v) => {
+                pop_body_frame();
+                last = v;
+            }
+            Err(e) => {
+                pop_body_frame();
+                return Err(e);
+            }
+        }
+    }
+    Ok(last)
+}
+
+/// Replay a continuation: set override, re-evaluate from the captured frame.
+/// Loops to handle the same continuation being invoked again (reentrant).
+fn replay_continuation(cont_data: &Rc<ContData>, initial_val: Value) -> Result<Value, EvalError> {
+    let frame = cont_data.frame.as_ref()
+        .ok_or_else(|| EvalError::Runtime("continuation has no frame".into()))?;
+    let mut val = initial_val;
+    loop {
+        CALLCC_OVERRIDE.with(|o| *o.borrow_mut() = Some(val));
+        match eval_body_for_replay(&frame.exprs, &frame.env) {
+            Ok(v) => return Ok(v),
+            Err(EvalError::ContinuationReturn { cont_id }) if cont_id == cont_data.id => {
+                // Same continuation invoked again — loop with new value
+                val = CONT_RETURN_VALUE.with(|v| v.borrow_mut().take().unwrap());
+                continue;
+            }
+            Err(EvalError::ContinuationResult) => {
+                return Ok(CONT_RESULT_VALUE.with(|v| v.borrow_mut().take().unwrap()));
+            }
+            Err(e) => return Err(e),
+        }
+    }
+}
 
 thread_local! {
     static OUTPUT_BUF: RefCell<String> = RefCell::new(String::new());
@@ -31,6 +118,8 @@ enum Value {
     },
     Char(char),
     Builtin(BuiltinFn),
+    CallCC,
+    Continuation(Rc<ContData>),
     Void,
 }
 
@@ -45,6 +134,8 @@ impl std::fmt::Debug for Value {
             Value::Lambda { params, .. } => write!(f, "Lambda({:?})", params),
             Value::Char(c) => write!(f, "Char({})", c),
             Value::Builtin(_) => write!(f, "Builtin"),
+            Value::CallCC => write!(f, "CallCC"),
+            Value::Continuation(_) => write!(f, "Continuation"),
             Value::Void => write!(f, "Void"),
         }
     }
@@ -63,7 +154,8 @@ impl Value {
                 let inner: Vec<String> = items.iter().map(|v| v.display()).collect();
                 format!("({})", inner.join(" "))
             }
-            Value::Lambda { .. } | Value::Builtin(_) => "#<procedure>".to_string(),
+            Value::Lambda { .. } | Value::Builtin(_) | Value::CallCC => "#<procedure>".to_string(),
+            Value::Continuation(_) => "#<continuation>".to_string(),
             Value::Void => "".to_string(),
         }
     }
@@ -409,13 +501,21 @@ fn apply_tc(func: &Value, args: &[Value]) -> Result<Trampoline, EvalError> {
                 }
                 let rest = Value::List(args[params.len()..].to_vec());
                 env_set(&local, rp.clone(), rest);
-                for expr in &body[..body.len() - 1] {
-                    eval(expr, &local)?;
+                for (i, expr) in body.iter().enumerate() {
+                    push_body_frame(&body[i..], &local);
+                    if i < body.len() - 1 {
+                        let r = eval(expr, &local);
+                        pop_body_frame();
+                        r?;
+                    } else {
+                        pop_body_frame();
+                        return Ok(Trampoline::TailCall {
+                            expr: expr.clone(),
+                            env: local,
+                        });
+                    }
                 }
-                Ok(Trampoline::TailCall {
-                    expr: body.last().unwrap().clone(),
-                    env: local,
-                })
+                unreachable!()
             } else {
                 if args.len() != params.len() {
                     return Err(EvalError::Arity(format!(
@@ -426,16 +526,57 @@ fn apply_tc(func: &Value, args: &[Value]) -> Result<Trampoline, EvalError> {
                 for (p, a) in params.iter().zip(args) {
                     env_set(&local, p.clone(), a.clone());
                 }
-                for expr in &body[..body.len() - 1] {
-                    eval(expr, &local)?;
+                for (i, expr) in body.iter().enumerate() {
+                    push_body_frame(&body[i..], &local);
+                    if i < body.len() - 1 {
+                        let r = eval(expr, &local);
+                        pop_body_frame();
+                        r?;
+                    } else {
+                        pop_body_frame();
+                        return Ok(Trampoline::TailCall {
+                            expr: expr.clone(),
+                            env: local,
+                        });
+                    }
                 }
-                Ok(Trampoline::TailCall {
-                    expr: body.last().unwrap().clone(),
-                    env: local,
-                })
+                unreachable!()
             }
         }
         Value::Builtin(f) => f(args).map(Trampoline::Done),
+        Value::CallCC => {
+            if args.len() != 1 {
+                return Err(EvalError::Arity("call/cc requires 1 argument".into()));
+            }
+            // Check for override (re-entry from saved continuation)
+            let override_val = CALLCC_OVERRIDE.with(|o| o.borrow_mut().take());
+            if let Some(val) = override_val {
+                return Ok(Trampoline::Done(val));
+            }
+
+            let id = NEXT_CONT_ID.with(|c| { let v = c.get(); c.set(v + 1); v });
+            let frame = BODY_FRAMES.with(|bf| bf.borrow().last().cloned());
+            let cont_data = Rc::new(ContData { id, frame });
+            CONT_REGISTRY.with(|cr| cr.borrow_mut().insert(id, cont_data.clone()));
+
+            let cont_val = Value::Continuation(cont_data);
+
+            match apply_value(&args[0], &[cont_val]) {
+                Ok(v) => Ok(Trampoline::Done(v)),
+                Err(EvalError::ContinuationReturn { cont_id }) if cont_id == id => {
+                    let val = CONT_RETURN_VALUE.with(|v| v.borrow_mut().take().unwrap());
+                    Ok(Trampoline::Done(val))
+                }
+                Err(e) => Err(e),
+            }
+        }
+        Value::Continuation(cont_data) => {
+            if args.len() != 1 {
+                return Err(EvalError::Arity("continuation requires 1 argument".into()));
+            }
+            CONT_RETURN_VALUE.with(|v| *v.borrow_mut() = Some(args[0].clone()));
+            Err(EvalError::ContinuationReturn { cont_id: cont_data.id })
+        }
         _ => Err(EvalError::Type("not a procedure".into())),
     }
 }
@@ -617,13 +758,21 @@ fn eval_let_tc(args: &[Expr], env: &Env, span: Span) -> Result<Trampoline, EvalE
             env_set(&local, p.clone(), v.clone());
         }
         let body = &args[2..];
-        for expr in &body[..body.len() - 1] {
-            eval(expr, &local)?;
+        for (i, expr) in body.iter().enumerate() {
+            push_body_frame(&body[i..], &local);
+            if i < body.len() - 1 {
+                let r = eval(expr, &local);
+                pop_body_frame();
+                r?;
+            } else {
+                pop_body_frame();
+                return Ok(Trampoline::TailCall {
+                    expr: expr.clone(),
+                    env: local,
+                });
+            }
         }
-        return Ok(Trampoline::TailCall {
-            expr: body.last().unwrap().clone(),
-            env: local,
-        });
+        unreachable!();
     }
     let bindings_expr = match &args[0].kind {
         ExprKind::List(b) => b,
@@ -644,23 +793,39 @@ fn eval_let_tc(args: &[Expr], env: &Env, span: Span) -> Result<Trampoline, EvalE
         }
     }
     let body = &args[1..];
-    for expr in &body[..body.len() - 1] {
-        eval(expr, &local)?;
+    for (i, expr) in body.iter().enumerate() {
+        push_body_frame(&body[i..], &local);
+        if i < body.len() - 1 {
+            let r = eval(expr, &local);
+            pop_body_frame();
+            r?;
+        } else {
+            pop_body_frame();
+            return Ok(Trampoline::TailCall {
+                expr: expr.clone(),
+                env: local,
+            });
+        }
     }
-    Ok(Trampoline::TailCall {
-        expr: body.last().unwrap().clone(),
-        env: local,
-    })
+    Ok(Trampoline::Done(Value::Void))
 }
 
 fn eval_begin_tc(args: &[Expr], env: &Env) -> Result<Trampoline, EvalError> {
     if args.is_empty() {
         return Ok(Trampoline::Done(Value::Void));
     }
-    for expr in &args[..args.len() - 1] {
-        eval(expr, env)?;
+    for (i, expr) in args.iter().enumerate() {
+        push_body_frame(&args[i..], env);
+        if i < args.len() - 1 {
+            let r = eval(expr, env);
+            pop_body_frame();
+            r?;
+        } else {
+            pop_body_frame();
+            return Ok(Trampoline::TailCall { expr: expr.clone(), env: env.clone() });
+        }
     }
-    Ok(Trampoline::TailCall { expr: args.last().unwrap().clone(), env: env.clone() })
+    unreachable!()
 }
 
 fn eval_cond_tc(args: &[Expr], env: &Env) -> Result<Trampoline, EvalError> {
@@ -1040,33 +1205,80 @@ fn make_global_env() -> Env {
     for (name, f) in builtins {
         env_set(&env, name.to_string(), Value::Builtin(*f));
     }
+    env_set(&env, "call/cc".to_string(), Value::CallCC);
+    env_set(&env, "call-with-current-continuation".to_string(), Value::CallCC);
     env
+}
+
+fn eval_top_level(exprs: &[Expr], env: &Env) -> Result<Value, EvalError> {
+    let mut last = Value::Void;
+    for (i, expr) in exprs.iter().enumerate() {
+        push_body_frame(&exprs[i..], env);
+        match eval(expr, env) {
+            Ok(v) => {
+                pop_body_frame();
+                last = v;
+            }
+            Err(e) => {
+                pop_body_frame();
+                return Err(e);
+            }
+        }
+    }
+    Ok(last)
 }
 
 /// Evaluate one or more Scheme expressions and return the string
 /// representation of the last result.
 pub fn eval_str(input: &str) -> Result<String, EvalError> {
+    init_cont_state();
     let exprs = parse(input)?;
     let env = make_global_env();
-    let mut last = Value::Void;
-    for expr in &exprs {
-        last = eval(expr, &env)?;
+    match eval_top_level(&exprs, &env) {
+        Ok(v) => Ok(v.display()),
+        Err(EvalError::ContinuationReturn { cont_id }) => {
+            let val = CONT_RETURN_VALUE.with(|v| v.borrow_mut().take().unwrap());
+            let cont = CONT_REGISTRY.with(|cr| cr.borrow().get(&cont_id).cloned());
+            if let Some(cont_data) = cont {
+                let result = replay_continuation(&cont_data, val)?;
+                Ok(result.display())
+            } else {
+                Err(EvalError::Runtime("unhandled continuation".into()))
+            }
+        }
+        Err(EvalError::ContinuationResult) => {
+            let v = CONT_RESULT_VALUE.with(|v| v.borrow_mut().take().unwrap());
+            Ok(v.display())
+        }
+        Err(e) => Err(e),
     }
-    Ok(last.display())
 }
 
 /// Evaluate Scheme expressions, returning both the result value and
 /// any output produced by `display`, `write`, or `newline`.
 pub fn eval_str_with_output(input: &str) -> Result<(String, String), EvalError> {
+    init_cont_state();
     OUTPUT_BUF.with(|buf| buf.borrow_mut().clear());
     let exprs = parse(input)?;
     let env = make_global_env();
-    let mut last = Value::Void;
-    for expr in &exprs {
-        last = eval(expr, &env)?;
-    }
+    let result = match eval_top_level(&exprs, &env) {
+        Ok(v) => v,
+        Err(EvalError::ContinuationReturn { cont_id }) => {
+            let val = CONT_RETURN_VALUE.with(|v| v.borrow_mut().take().unwrap());
+            let cont = CONT_REGISTRY.with(|cr| cr.borrow().get(&cont_id).cloned());
+            if let Some(cont_data) = cont {
+                replay_continuation(&cont_data, val)?
+            } else {
+                return Err(EvalError::Runtime("unhandled continuation".into()));
+            }
+        }
+        Err(EvalError::ContinuationResult) => {
+            CONT_RESULT_VALUE.with(|v| v.borrow_mut().take().unwrap())
+        }
+        Err(e) => return Err(e),
+    };
     let output = OUTPUT_BUF.with(|buf| buf.borrow().clone());
-    Ok((last.display(), output))
+    Ok((result.display(), output))
 }
 
 #[cfg(test)]
