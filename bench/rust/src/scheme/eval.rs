@@ -91,6 +91,7 @@ fn eval_list(
             "let" => return eval_let(&elems[1..], span, env, output),
             "begin" => return eval_begin(&elems[1..], env, output),
             "cond" => return eval_cond(&elems[1..], env, output),
+            "set!" => return eval_set(&elems[1..], span, env, output),
             "string-set!" => return eval_string_set(&elems[1..], span, env, output),
             _ => {}
         }
@@ -225,6 +226,25 @@ fn eval_define(
         }
         .at(span)),
     }
+}
+
+fn eval_set(
+    args: &[Value],
+    span: Option<Span>,
+    env: &Rc<RefCell<Env>>,
+    output: &Rc<RefCell<String>>,
+) -> Result<Trampoline, EvalError> {
+    if args.len() != 2 {
+        return Err(EvalError::Parse { msg: "set! requires exactly 2 arguments".into() }.at(span));
+    }
+    let Value::Symbol(name, _) = &args[0] else {
+        return Err(
+            EvalError::Parse { msg: "set!: first argument must be a symbol".into() }.at(span),
+        );
+    };
+    let val = eval(&args[1], env, output)?;
+    env.borrow_mut().set(name, val)?;
+    Ok(Trampoline::Done(Value::Void))
 }
 
 fn eval_lambda(
