@@ -25,7 +25,8 @@ type SchemeVal =
   | { tag: 'syntaxTransformer'; proc: SchemeVal; defEnv: Env; pos?: Pos }
   | { tag: 'values'; elements: SchemeVal[]; pos?: Pos }
   | { tag: 'rational'; num: number; den: number; pos?: Pos }
-  | { tag: 'record'; typeId: number; typeName: string; fields: Map<string, SchemeVal>; pos?: Pos };
+  | { tag: 'record'; typeId: number; typeName: string; fields: Map<string, SchemeVal>; pos?: Pos }
+  | { tag: 'caseLambda'; clauses: { params: string[]; restParam?: string; body: SchemeVal[] }[]; env: Env; pos?: Pos };
 
 type SyntaxRule = { pattern: SchemeVal[]; template: SchemeVal };
 
@@ -247,7 +248,7 @@ function gensym(base: string): string { return `##${base}_${gensymCounter++}`; }
 const SPECIAL_FORMS = new Set([
   'quote', 'if', 'define', 'lambda', 'set!', 'begin', 'let', 'let*', 'letrec', 'letrec*',
   'case', 'do', 'cond', 'and', 'or', 'define-syntax', 'guard',
-  'syntax-case', 'syntax', 'with-syntax',
+  'syntax-case', 'syntax', 'with-syntax', 'case-lambda',
 ]);
 
 function matchPattern(
@@ -596,6 +597,25 @@ function evalK(expr: SchemeVal, env: Env, k: Kont): Bounce {
         if (paramList.tag !== 'list') throw posError('lambda: params must be a list', expr.pos);
         const { params, restParam } = parseParams(paramList.elements, expr.pos);
         return k({ tag: 'lambda', params, restParam, body: elems.slice(2), env });
+      }
+
+      case 'case-lambda': {
+        if (elems.length < 2) throw posError('case-lambda: bad syntax', expr.pos);
+        const clauses: { params: string[]; restParam?: string; body: SchemeVal[] }[] = [];
+        for (let i = 1; i < elems.length; i++) {
+          const clause = elems[i];
+          if (clause.tag !== 'list' || clause.elements.length < 2) throw posError('case-lambda: bad clause', expr.pos);
+          const paramList = clause.elements[0];
+          if (paramList.tag === 'symbol') {
+            clauses.push({ params: [], restParam: paramList.value, body: clause.elements.slice(1) });
+          } else if (paramList.tag === 'list') {
+            const { params, restParam } = parseParams(paramList.elements, expr.pos);
+            clauses.push({ params, restParam, body: clause.elements.slice(1) });
+          } else {
+            throw posError('case-lambda: bad params', expr.pos);
+          }
+        }
+        return k({ tag: 'caseLambda', clauses, env, pos: expr.pos });
       }
 
       case 'set!': {
@@ -1275,6 +1295,26 @@ function applyK(proc: SchemeVal, args: SchemeVal[], k: Kont, pos?: Pos): Bounce 
     return bounce(() => evalSeqArr(proc.body, callEnv, k));
   }
 
+  if (proc.tag === 'caseLambda') {
+    for (const clause of proc.clauses) {
+      if (clause.restParam) {
+        if (args.length >= clause.params.length) {
+          const callEnv = new Env(proc.env);
+          for (let i = 0; i < clause.params.length; i++) callEnv.set(clause.params[i], args[i]);
+          callEnv.set(clause.restParam, arrayToList(args.slice(clause.params.length)));
+          return bounce(() => evalSeqArr(clause.body, callEnv, k));
+        }
+      } else {
+        if (args.length === clause.params.length) {
+          const callEnv = new Env(proc.env);
+          for (let i = 0; i < clause.params.length; i++) callEnv.set(clause.params[i], args[i]);
+          return bounce(() => evalSeqArr(clause.body, callEnv, k));
+        }
+      }
+    }
+    throw posError('case-lambda: no matching clause for ' + args.length + ' arguments', pos);
+  }
+
   if (proc.tag === 'builtin') {
     return k(proc.fn(args, pos));
   }
@@ -1545,7 +1585,7 @@ function makeGlobalEnv(output: string[] = []): Env {
   defBuiltin('procedure?', (args, p) => {
     if (args.length !== 1) throw posError('procedure?: need 1 argument', p);
     const t = args[0].tag;
-    return { tag: 'boolean', value: t === 'lambda' || t === 'builtin' || t === 'continuation' || t === 'callcc' };
+    return { tag: 'boolean', value: t === 'lambda' || t === 'builtin' || t === 'continuation' || t === 'callcc' || t === 'caseLambda' };
   });
 
   // Output
@@ -2042,6 +2082,7 @@ function displayVal(val: SchemeVal, seen?: Set<SchemeVal>): string {
     case 'builtin': return '#<procedure>';
     case 'continuation': return '#<procedure>';
     case 'callcc': return '#<procedure>';
+    case 'caseLambda': return '#<procedure>';
     case 'macro': return '#<macro>';
     case 'syntaxTransformer': return '#<syntax-transformer>';
     case 'values': return val.elements.map(e => displayVal(e, seen)).join('\n');
