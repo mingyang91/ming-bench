@@ -195,13 +195,34 @@ public class Evaluator {
         EnvRef(String name, Env env) { this.name = name; this.env = env; }
     }
 
+    // --- Records (define-record-type) ---
+
+    private static class RecordType {
+        final String name;
+        RecordType(String name) { this.name = name; }
+    }
+
+    private static class SchemeRecord {
+        final RecordType type;
+        final Object[] fields;
+        SchemeRecord(RecordType type, Object[] fields) {
+            this.type = type;
+            this.fields = fields;
+        }
+    }
+
+    @FunctionalInterface
+    private interface NativeProc {
+        Object apply(List<Object> args) throws EvalError;
+    }
+
     private int gensymCounter = 0;
     private String gensym(String base) { return base + "##" + (gensymCounter++); }
 
     private static final java.util.Set<String> SPECIAL_FORMS = java.util.Set.of(
         "define", "if", "quote", "lambda", "and", "or", "let", "let*", "begin",
         "set!", "cond", "define-syntax", "syntax-rules",
-        "letrec", "letrec*", "case", "do", "guard"
+        "letrec", "letrec*", "case", "do", "guard", "define-record-type"
     );
 
     private Object unwrapLoc(Object o) {
@@ -579,6 +600,9 @@ public class Evaluator {
                     }
                     case "guard" -> {
                         return evalGuard(list, env, k);
+                    }
+                    case "define-record-type" -> {
+                        return evalDefineRecordType(list, env, k);
                     }
                     case "define-syntax" -> {
                         if (list.size() != 3) throw posError("define-syntax: bad syntax");
@@ -1240,6 +1264,9 @@ public class Evaluator {
             }
             return new More(() -> eval(lambda.body, callEnv, k));
         }
+        if (proc instanceof NativeProc np) {
+            return k.apply(np.apply(args));
+        }
         if (proc instanceof String p && isPrimitive(p)) {
             return k.apply(applyPrimitive(p, args));
         }
@@ -1405,7 +1432,7 @@ public class Evaluator {
             case "procedure?" -> {
                 requireArgCount(args, 1, "procedure?");
                 Object a = args.get(0);
-                yield a instanceof Lambda || a instanceof Continuation || a == CALL_CC || (a instanceof String s && isPrimitive(s));
+                yield a instanceof Lambda || a instanceof Continuation || a == CALL_CC || a instanceof NativeProc || (a instanceof String s && isPrimitive(s));
             }
             case "display" -> {
                 requireArgCount(args, 1, "display");
@@ -1929,6 +1956,84 @@ public class Evaluator {
         return new Object[]{proc, newArgs};
     }
 
+    private Bounce evalDefineRecordType(List<?> list, Env env, Cont k) throws EvalError {
+        // (define-record-type <name> (constructor field ...) predicate (field accessor) ...)
+        if (list.size() < 4) throw posError("define-record-type: bad syntax");
+        // Type name (ignored as a binding, just used for identity)
+        Object typeName = unwrapLoc(list.get(1));
+        if (!(typeName instanceof String rtName)) throw posError("define-record-type: expected type name");
+
+        // Constructor spec: (constructor-name field ...)
+        Object ctorSpec = unwrapLoc(list.get(2));
+        if (!(ctorSpec instanceof List<?> ctorList) || ctorList.isEmpty())
+            throw posError("define-record-type: expected constructor spec");
+        String ctorName = null;
+        List<String> ctorFields = new ArrayList<>();
+        for (int i = 0; i < ctorList.size(); i++) {
+            Object el = unwrapLoc(ctorList.get(i));
+            if (!(el instanceof String s)) throw posError("define-record-type: expected symbol in constructor");
+            if (i == 0) ctorName = s;
+            else ctorFields.add(s);
+        }
+
+        // Predicate name
+        Object predObj = unwrapLoc(list.get(3));
+        if (!(predObj instanceof String predName)) throw posError("define-record-type: expected predicate name");
+
+        // Field specs: (field-name accessor-name) ...
+        // Build mapping from field name to index in ctorFields
+        Map<String, Integer> fieldIndex = new HashMap<>();
+        for (int i = 0; i < ctorFields.size(); i++) {
+            fieldIndex.put(ctorFields.get(i), i);
+        }
+
+        RecordType rt = new RecordType(rtName);
+        int numFields = ctorFields.size();
+
+        // Define constructor
+        env.define(ctorName, (NativeProc) args -> {
+            if (args.size() != numFields)
+                throw posError(rtName + " constructor: expected " + numFields + " arguments, got " + args.size());
+            return new SchemeRecord(rt, args.toArray(new Object[0]));
+        });
+
+        // Define predicate
+        env.define(predName, (NativeProc) args -> {
+            if (args.size() != 1) throw posError(predName + ": expected 1 argument");
+            return args.get(0) instanceof SchemeRecord sr && sr.type == rt;
+        });
+
+        // Define accessors
+        for (int i = 4; i < list.size(); i++) {
+            Object fieldSpec = unwrapLoc(list.get(i));
+            if (!(fieldSpec instanceof List<?> fsList) || fsList.size() < 2)
+                throw posError("define-record-type: bad field spec");
+            String fieldName = null;
+            Object fn = unwrapLoc(fsList.get(0));
+            if (fn instanceof String s) fieldName = s;
+            else throw posError("define-record-type: expected field name");
+
+            String accessorName = null;
+            Object an = unwrapLoc(fsList.get(1));
+            if (an instanceof String s2) accessorName = s2;
+            else throw posError("define-record-type: expected accessor name");
+
+            Integer idx = fieldIndex.get(fieldName);
+            if (idx == null) throw posError("define-record-type: unknown field " + fieldName);
+
+            final int fieldIdx = idx;
+            final String accName = accessorName;
+            env.define(accName, (NativeProc) args -> {
+                if (args.size() != 1) throw posError(accName + ": expected 1 argument");
+                if (!(args.get(0) instanceof SchemeRecord sr && sr.type == rt))
+                    throw posError(accName + ": not a " + rtName);
+                return sr.fields[fieldIdx];
+            });
+        }
+
+        return k.apply(VOID);
+    }
+
     private Object appendTwo(Object a, Object b) throws EvalError {
         if (a == NIL) return b;
         if (!(a instanceof Pair p)) throw posError("append: not a proper list");
@@ -2032,6 +2137,8 @@ public class Evaluator {
             sb.append(")");
             return sb.toString();
         }
+        if (val instanceof SchemeRecord sr) return "#<record:" + sr.type.name + ">";
+        if (val instanceof NativeProc) return "#<procedure>";
         if (val instanceof Lambda) return "#<procedure>";
         if (val instanceof Continuation) return "#<continuation>";
         if (val == CALL_CC) return "#<procedure:call/cc>";
