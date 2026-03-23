@@ -245,91 +245,204 @@ public class Evaluator {
     }
 
     private SchemeValue eval(SchemeValue expr, Environment env) throws EvalError {
-        return switch (expr) {
-            case SchemeValue.IntVal v -> v;
-            case SchemeValue.BoolVal v -> v;
-            case SchemeValue.StringVal v -> v;
-            case SchemeValue.CharVal v -> v;
-            case SchemeValue.VoidVal v -> v;
-            case SchemeValue.NilVal v -> v;
-            case SchemeValue.PairVal v -> v;
-            case SchemeValue.LambdaVal v -> v;
-            case SchemeValue.BuiltinVal v -> v;
-            case SchemeValue.SymbolVal v -> {
-                try { yield env.get(v.name()); }
-                catch (EvalError e) { throw new EvalError("Unbound variable: " + v.name() + " at " + v.line() + ":" + v.col()); }
-            }
-            case SchemeValue.ListVal v -> evalList(v, env);
-        };
-    }
-
-    private SchemeValue evalList(SchemeValue.ListVal listVal, Environment env) throws EvalError {
-        List<SchemeValue> elems = listVal.elements();
-        String pos = listVal.line() + ":" + listVal.col();
-        if (elems.isEmpty()) throw new EvalError("Empty application at " + pos);
-        SchemeValue head = elems.getFirst();
-        if (head instanceof SchemeValue.SymbolVal sym) {
-            String name = sym.name();
-            switch (name) {
-                case "and": return evalAnd(elems, env);
-                case "or": return evalOr(elems, env);
-                case "if": return evalIf(elems, env, pos);
-                case "define": return evalDefine(elems, env, pos);
-                case "quote": return evalQuote(elems, pos);
-                case "lambda": return evalLambda(elems, env, pos);
-                case "let": return evalLet(elems, env, pos);
-                case "begin": return evalBegin(elems, env);
-                case "cond": return evalCond(elems, env);
-                default: break;
-            }
-        }
-        // Procedure call: evaluate all, then apply
-        SchemeValue proc = eval(head, env);
-        List<SchemeValue> args = new ArrayList<>();
-        for (int i = 1; i < elems.size(); i++) {
-            args.add(eval(elems.get(i), env));
-        }
-        return apply(proc, args, pos);
-    }
-
-    private SchemeValue apply(SchemeValue proc, List<SchemeValue> args, String pos) throws EvalError {
-        if (proc instanceof SchemeValue.BuiltinVal builtin) {
-            try {
-                return builtin.func().apply(args);
-            } catch (EvalError e) {
-                String msg = e.getMessage();
-                if (!msg.matches(".*\\d+:\\d+.*")) {
-                    throw new EvalError(msg + " at " + pos);
+        while (true) {
+            switch (expr) {
+                case SchemeValue.IntVal v -> { return v; }
+                case SchemeValue.BoolVal v -> { return v; }
+                case SchemeValue.StringVal v -> { return v; }
+                case SchemeValue.CharVal v -> { return v; }
+                case SchemeValue.VoidVal v -> { return v; }
+                case SchemeValue.NilVal v -> { return v; }
+                case SchemeValue.PairVal v -> { return v; }
+                case SchemeValue.LambdaVal v -> { return v; }
+                case SchemeValue.BuiltinVal v -> { return v; }
+                case SchemeValue.SymbolVal v -> {
+                    try { return env.get(v.name()); }
+                    catch (EvalError e) { throw new EvalError("Unbound variable: " + v.name() + " at " + v.line() + ":" + v.col()); }
                 }
-                throw e;
-            }
-        }
-        if (proc instanceof SchemeValue.LambdaVal lambda) {
-            if (lambda.params().size() != args.size()) {
-                throw new EvalError("Expected " + lambda.params().size() + " arguments, got " + args.size() + " at " + pos);
-            }
-            Environment callEnv = new Environment(lambda.env());
-            for (int i = 0; i < lambda.params().size(); i++) {
-                callEnv.define(lambda.params().get(i), args.get(i));
-            }
-            SchemeValue result = null;
-            for (SchemeValue bodyExpr : lambda.body()) {
-                result = eval(bodyExpr, callEnv);
-            }
-            return result;
-        }
-        throw new EvalError("Not a procedure: " + proc.display() + " at " + pos);
-    }
+                case SchemeValue.ListVal listVal -> {
+                    List<SchemeValue> elems = listVal.elements();
+                    String pos = listVal.line() + ":" + listVal.col();
+                    if (elems.isEmpty()) throw new EvalError("Empty application at " + pos);
+                    SchemeValue head = elems.getFirst();
 
-    private SchemeValue evalIf(List<SchemeValue> elems, Environment env, String pos) throws EvalError {
-        if (elems.size() < 3 || elems.size() > 4) throw new EvalError("if requires 2 or 3 arguments at " + pos);
-        SchemeValue cond = eval(elems.get(1), env);
-        if (cond.isTruthy()) {
-            return eval(elems.get(2), env);
-        } else if (elems.size() == 4) {
-            return eval(elems.get(3), env);
+                    // Special forms
+                    if (head instanceof SchemeValue.SymbolVal sym) {
+                        switch (sym.name()) {
+                            case "quote": {
+                                if (elems.size() != 2) throw new EvalError("quote requires exactly 1 argument at " + pos);
+                                return quoteDatum(elems.get(1));
+                            }
+                            case "define": {
+                                return evalDefine(elems, env, pos);
+                            }
+                            case "lambda": {
+                                return evalLambda(elems, env, pos);
+                            }
+                            case "if": {
+                                if (elems.size() < 3 || elems.size() > 4) throw new EvalError("if requires 2 or 3 arguments at " + pos);
+                                SchemeValue cond = eval(elems.get(1), env);
+                                if (cond.isTruthy()) {
+                                    expr = elems.get(2); // TCO
+                                    continue;
+                                } else if (elems.size() == 4) {
+                                    expr = elems.get(3); // TCO
+                                    continue;
+                                }
+                                return new SchemeValue.VoidVal();
+                            }
+                            case "begin": {
+                                for (int i = 1; i < elems.size() - 1; i++) {
+                                    eval(elems.get(i), env);
+                                }
+                                if (elems.size() > 1) {
+                                    expr = elems.getLast(); // TCO
+                                    continue;
+                                }
+                                return new SchemeValue.VoidVal();
+                            }
+                            case "cond": {
+                                boolean matched = false;
+                                for (int i = 1; i < elems.size(); i++) {
+                                    if (!(elems.get(i) instanceof SchemeValue.ListVal clause)) {
+                                        throw new EvalError("cond: expected clause");
+                                    }
+                                    List<SchemeValue> parts = clause.elements();
+                                    if (parts.isEmpty()) throw new EvalError("cond: empty clause");
+                                    boolean isElse = parts.getFirst() instanceof SchemeValue.SymbolVal s && s.name().equals("else");
+                                    if (isElse || eval(parts.getFirst(), env).isTruthy()) {
+                                        for (int j = 1; j < parts.size() - 1; j++) {
+                                            eval(parts.get(j), env);
+                                        }
+                                        if (parts.size() > 1) {
+                                            expr = parts.getLast(); // TCO
+                                            matched = true;
+                                            break;
+                                        }
+                                        return isElse ? new SchemeValue.VoidVal() : eval(parts.getFirst(), env);
+                                    }
+                                }
+                                if (matched) continue;
+                                return new SchemeValue.VoidVal();
+                            }
+                            case "and": {
+                                if (elems.size() == 1) return new SchemeValue.BoolVal(true);
+                                for (int i = 1; i < elems.size() - 1; i++) {
+                                    SchemeValue result = eval(elems.get(i), env);
+                                    if (!result.isTruthy()) return result;
+                                }
+                                expr = elems.getLast(); // TCO
+                                continue;
+                            }
+                            case "or": {
+                                if (elems.size() == 1) return new SchemeValue.BoolVal(false);
+                                for (int i = 1; i < elems.size() - 1; i++) {
+                                    SchemeValue result = eval(elems.get(i), env);
+                                    if (result.isTruthy()) return result;
+                                }
+                                expr = elems.getLast(); // TCO
+                                continue;
+                            }
+                            case "let": {
+                                if (elems.size() < 3) throw new EvalError("let requires bindings and body at " + pos);
+                                // Named let: (let name ((var init) ...) body...)
+                                if (elems.get(1) instanceof SchemeValue.SymbolVal nameSym) {
+                                    if (elems.size() < 4) throw new EvalError("named let requires bindings and body");
+                                    String name = nameSym.name();
+                                    if (!(elems.get(2) instanceof SchemeValue.ListVal bindingsList)) {
+                                        throw new EvalError("let: expected bindings list");
+                                    }
+                                    List<String> params = new ArrayList<>();
+                                    List<SchemeValue> inits = new ArrayList<>();
+                                    for (SchemeValue b : bindingsList.elements()) {
+                                        if (!(b instanceof SchemeValue.ListVal binding) || binding.elements().size() != 2) {
+                                            throw new EvalError("let: invalid binding");
+                                        }
+                                        if (!(binding.elements().get(0) instanceof SchemeValue.SymbolVal s)) {
+                                            throw new EvalError("let: expected symbol in binding");
+                                        }
+                                        params.add(s.name());
+                                        inits.add(eval(binding.elements().get(1), env));
+                                    }
+                                    List<SchemeValue> body = elems.subList(3, elems.size());
+                                    Environment letEnv = new Environment(env);
+                                    SchemeValue.LambdaVal lambda = new SchemeValue.LambdaVal(params, body, letEnv);
+                                    letEnv.define(name, lambda);
+                                    // Apply with TCO: set up env and tail-call last body expr
+                                    Environment callEnv = new Environment(lambda.env());
+                                    for (int i = 0; i < params.size(); i++) {
+                                        callEnv.define(params.get(i), inits.get(i));
+                                    }
+                                    for (int i = 0; i < body.size() - 1; i++) {
+                                        eval(body.get(i), callEnv);
+                                    }
+                                    expr = body.getLast(); // TCO
+                                    env = callEnv;
+                                    continue;
+                                }
+                                // Regular let: (let ((var init) ...) body...)
+                                if (!(elems.get(1) instanceof SchemeValue.ListVal bindingsList)) {
+                                    throw new EvalError("let: expected bindings list");
+                                }
+                                Environment letEnv = new Environment(env);
+                                for (SchemeValue b : bindingsList.elements()) {
+                                    if (!(b instanceof SchemeValue.ListVal binding) || binding.elements().size() != 2) {
+                                        throw new EvalError("let: invalid binding");
+                                    }
+                                    if (!(binding.elements().get(0) instanceof SchemeValue.SymbolVal s)) {
+                                        throw new EvalError("let: expected symbol in binding");
+                                    }
+                                    SchemeValue val = eval(binding.elements().get(1), env);
+                                    letEnv.define(s.name(), val);
+                                }
+                                for (int i = 2; i < elems.size() - 1; i++) {
+                                    eval(elems.get(i), letEnv);
+                                }
+                                expr = elems.getLast(); // TCO
+                                env = letEnv;
+                                continue;
+                            }
+                            default: break;
+                        }
+                    }
+
+                    // Procedure call: evaluate all, then apply
+                    SchemeValue proc = eval(head, env);
+                    List<SchemeValue> args = new ArrayList<>();
+                    for (int i = 1; i < elems.size(); i++) {
+                        args.add(eval(elems.get(i), env));
+                    }
+                    // Inline apply with TCO for lambdas
+                    if (proc instanceof SchemeValue.BuiltinVal builtin) {
+                        try {
+                            return builtin.func().apply(args);
+                        } catch (EvalError e) {
+                            String msg = e.getMessage();
+                            if (!msg.matches(".*\\d+:\\d+.*")) {
+                                throw new EvalError(msg + " at " + pos);
+                            }
+                            throw e;
+                        }
+                    }
+                    if (proc instanceof SchemeValue.LambdaVal lambda) {
+                        if (lambda.params().size() != args.size()) {
+                            throw new EvalError("Expected " + lambda.params().size() + " arguments, got " + args.size() + " at " + pos);
+                        }
+                        Environment callEnv = new Environment(lambda.env());
+                        for (int i = 0; i < lambda.params().size(); i++) {
+                            callEnv.define(lambda.params().get(i), args.get(i));
+                        }
+                        for (int i = 0; i < lambda.body().size() - 1; i++) {
+                            eval(lambda.body().get(i), callEnv);
+                        }
+                        expr = lambda.body().getLast(); // TCO
+                        env = callEnv;
+                        continue;
+                    }
+                    throw new EvalError("Not a procedure: " + proc.display() + " at " + pos);
+                }
+            }
         }
-        return new SchemeValue.VoidVal();
     }
 
     private SchemeValue evalDefine(List<SchemeValue> elems, Environment env, String pos) throws EvalError {
@@ -360,11 +473,6 @@ public class Evaluator {
         throw new EvalError("define: invalid syntax");
     }
 
-    private SchemeValue evalQuote(List<SchemeValue> elems, String pos) throws EvalError {
-        if (elems.size() != 2) throw new EvalError("quote requires exactly 1 argument at " + pos);
-        return quoteDatum(elems.get(1));
-    }
-
     /** Convert parsed syntax (ListVal) into runtime data (PairVal/NilVal). */
     private SchemeValue quoteDatum(SchemeValue v) {
         if (v instanceof SchemeValue.ListVal list) {
@@ -393,108 +501,6 @@ public class Evaluator {
         }
         List<SchemeValue> body = elems.subList(2, elems.size());
         return new SchemeValue.LambdaVal(params, body, env);
-    }
-
-    private SchemeValue evalLet(List<SchemeValue> elems, Environment env, String pos) throws EvalError {
-        if (elems.size() < 3) throw new EvalError("let requires bindings and body at " + pos);
-        // Named let: (let name ((var init) ...) body...)
-        if (elems.get(1) instanceof SchemeValue.SymbolVal nameSym) {
-            if (elems.size() < 4) throw new EvalError("named let requires bindings and body");
-            String name = nameSym.name();
-            if (!(elems.get(2) instanceof SchemeValue.ListVal bindingsList)) {
-                throw new EvalError("let: expected bindings list");
-            }
-            List<String> params = new ArrayList<>();
-            List<SchemeValue> inits = new ArrayList<>();
-            for (SchemeValue b : bindingsList.elements()) {
-                if (!(b instanceof SchemeValue.ListVal binding) || binding.elements().size() != 2) {
-                    throw new EvalError("let: invalid binding");
-                }
-                if (!(binding.elements().get(0) instanceof SchemeValue.SymbolVal s)) {
-                    throw new EvalError("let: expected symbol in binding");
-                }
-                params.add(s.name());
-                inits.add(eval(binding.elements().get(1), env));
-            }
-            List<SchemeValue> body = elems.subList(3, elems.size());
-            Environment letEnv = new Environment(env);
-            SchemeValue.LambdaVal lambda = new SchemeValue.LambdaVal(params, body, letEnv);
-            letEnv.define(name, lambda);
-            return apply(lambda, inits, pos);
-        }
-        // Regular let: (let ((var init) ...) body...)
-        if (!(elems.get(1) instanceof SchemeValue.ListVal bindingsList)) {
-            throw new EvalError("let: expected bindings list");
-        }
-        Environment letEnv = new Environment(env);
-        for (SchemeValue b : bindingsList.elements()) {
-            if (!(b instanceof SchemeValue.ListVal binding) || binding.elements().size() != 2) {
-                throw new EvalError("let: invalid binding");
-            }
-            if (!(binding.elements().get(0) instanceof SchemeValue.SymbolVal s)) {
-                throw new EvalError("let: expected symbol in binding");
-            }
-            SchemeValue val = eval(binding.elements().get(1), env);
-            letEnv.define(s.name(), val);
-        }
-        SchemeValue result = new SchemeValue.VoidVal();
-        for (int i = 2; i < elems.size(); i++) {
-            result = eval(elems.get(i), letEnv);
-        }
-        return result;
-    }
-
-    private SchemeValue evalBegin(List<SchemeValue> elems, Environment env) throws EvalError {
-        SchemeValue result = new SchemeValue.VoidVal();
-        for (int i = 1; i < elems.size(); i++) {
-            result = eval(elems.get(i), env);
-        }
-        return result;
-    }
-
-    private SchemeValue evalCond(List<SchemeValue> elems, Environment env) throws EvalError {
-        for (int i = 1; i < elems.size(); i++) {
-            if (!(elems.get(i) instanceof SchemeValue.ListVal clause)) {
-                throw new EvalError("cond: expected clause");
-            }
-            List<SchemeValue> parts = clause.elements();
-            if (parts.isEmpty()) throw new EvalError("cond: empty clause");
-            // Check for else clause
-            if (parts.getFirst() instanceof SchemeValue.SymbolVal s && s.name().equals("else")) {
-                SchemeValue result = new SchemeValue.VoidVal();
-                for (int j = 1; j < parts.size(); j++) {
-                    result = eval(parts.get(j), env);
-                }
-                return result;
-            }
-            SchemeValue test = eval(parts.getFirst(), env);
-            if (test.isTruthy()) {
-                SchemeValue result = test;
-                for (int j = 1; j < parts.size(); j++) {
-                    result = eval(parts.get(j), env);
-                }
-                return result;
-            }
-        }
-        return new SchemeValue.VoidVal();
-    }
-
-    private SchemeValue evalAnd(List<SchemeValue> elems, Environment env) throws EvalError {
-        SchemeValue result = new SchemeValue.BoolVal(true);
-        for (int i = 1; i < elems.size(); i++) {
-            result = eval(elems.get(i), env);
-            if (!result.isTruthy()) return result;
-        }
-        return result;
-    }
-
-    private SchemeValue evalOr(List<SchemeValue> elems, Environment env) throws EvalError {
-        SchemeValue result = new SchemeValue.BoolVal(false);
-        for (int i = 1; i < elems.size(); i++) {
-            result = eval(elems.get(i), env);
-            if (result.isTruthy()) return result;
-        }
-        return result;
     }
 
     private long requireInt(SchemeValue val) throws EvalError {
