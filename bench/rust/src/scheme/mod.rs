@@ -350,6 +350,8 @@ enum ExprKind {
     Char(char),
     Symbol(String),
     List(Vec<Expr>),
+    /// An improper list: (a b . c) — elements are the proper part, last is the tail.
+    DottedList(Vec<Expr>, Box<Expr>),
     /// A literal value injected by macro expansion (bypasses env lookup).
     Literal(Value),
 }
@@ -418,7 +420,7 @@ fn tokenize(input: &str) -> Vec<Token> {
     while i < chars.len() {
         match chars[i] {
             '\n' => { line += 1; col = 1; i += 1; }
-            ' ' | '\t' | '\r' => { col += 1; i += 1; }
+            ' ' | '\t' | '\r' | '\x0c' => { col += 1; i += 1; }
             ';' => {
                 while i < chars.len() && chars[i] != '\n' {
                     i += 1; col += 1;
@@ -427,6 +429,16 @@ fn tokenize(input: &str) -> Vec<Token> {
             '(' => { tokens.push(Token { text: "(".into(), span: Span { line, col } }); col += 1; i += 1; }
             ')' => { tokens.push(Token { text: ")".into(), span: Span { line, col } }); col += 1; i += 1; }
             '\'' => { tokens.push(Token { text: "'".into(), span: Span { line, col } }); col += 1; i += 1; }
+            '`' => { tokens.push(Token { text: "`".into(), span: Span { line, col } }); col += 1; i += 1; }
+            ',' => {
+                if i + 1 < chars.len() && chars[i + 1] == '@' {
+                    tokens.push(Token { text: ",@".into(), span: Span { line, col } });
+                    col += 2; i += 2;
+                } else {
+                    tokens.push(Token { text: ",".into(), span: Span { line, col } });
+                    col += 1; i += 1;
+                }
+            }
             '"' => {
                 let start_col = col;
                 let start_line = line;
@@ -461,7 +473,7 @@ fn tokenize(input: &str) -> Vec<Token> {
             _ => {
                 let start_col = col;
                 let start = i;
-                while i < chars.len() && !matches!(chars[i], ' ' | '\t' | '\n' | '\r' | '(' | ')' | ';' | '\'') {
+                while i < chars.len() && !matches!(chars[i], ' ' | '\t' | '\n' | '\r' | '\x0c' | '(' | ')' | ';' | '\'' | '`' | ',' | '"') {
                     i += 1; col += 1;
                 }
                 tokens.push(Token { text: chars[start..i].iter().collect(), span: Span { line, col: start_col } });
@@ -480,20 +492,58 @@ fn parse_tokens(tokens: &[Token], pos: &mut usize) -> Result<Expr, EvalError> {
         let span = tok.span;
         *pos += 1;
         let mut list = Vec::new();
+        let mut dotted_tail = None;
         while *pos < tokens.len() && tokens[*pos].text != ")" {
+            // Check for dot notation: (a b . c)
+            if tokens[*pos].text == "." && !list.is_empty() {
+                *pos += 1; // skip the dot
+                if *pos >= tokens.len() || tokens[*pos].text == ")" {
+                    return Err(EvalError::Parse("expected element after dot".into()));
+                }
+                dotted_tail = Some(Box::new(parse_tokens(tokens, pos)?));
+                break;
+            }
             list.push(parse_tokens(tokens, pos)?);
         }
         if *pos >= tokens.len() {
             return Err(EvalError::Parse("missing closing parenthesis".into()));
         }
         *pos += 1;
-        Ok(Expr { kind: ExprKind::List(list), span })
+        if let Some(tail) = dotted_tail {
+            Ok(Expr { kind: ExprKind::DottedList(list, tail), span })
+        } else {
+            Ok(Expr { kind: ExprKind::List(list), span })
+        }
     } else if tok.text == "'" {
         let span = tok.span;
         *pos += 1;
         let inner = parse_tokens(tokens, pos)?;
         Ok(Expr { kind: ExprKind::List(vec![
             Expr { kind: ExprKind::Symbol("quote".into()), span },
+            inner,
+        ]), span })
+    } else if tok.text == "`" {
+        let span = tok.span;
+        *pos += 1;
+        let inner = parse_tokens(tokens, pos)?;
+        Ok(Expr { kind: ExprKind::List(vec![
+            Expr { kind: ExprKind::Symbol("quasiquote".into()), span },
+            inner,
+        ]), span })
+    } else if tok.text == "," {
+        let span = tok.span;
+        *pos += 1;
+        let inner = parse_tokens(tokens, pos)?;
+        Ok(Expr { kind: ExprKind::List(vec![
+            Expr { kind: ExprKind::Symbol("unquote".into()), span },
+            inner,
+        ]), span })
+    } else if tok.text == ",@" {
+        let span = tok.span;
+        *pos += 1;
+        let inner = parse_tokens(tokens, pos)?;
+        Ok(Expr { kind: ExprKind::List(vec![
+            Expr { kind: ExprKind::Symbol("unquote-splicing".into()), span },
             inner,
         ]), span })
     } else if tok.text == "#'" {
@@ -610,6 +660,13 @@ fn eval_inner(expr: &Expr, env: &Env) -> Result<Trampoline, EvalError> {
                 .map(Trampoline::Done)
                 .ok_or_else(|| EvalError::UnboundVariable(name.clone()))
         }
+        ExprKind::DottedList(items, tail) => {
+            // In eval context, treat dotted list as a regular list (flatten items + tail)
+            let mut all = items.clone();
+            all.push(*tail.clone());
+            let combined = Expr { kind: ExprKind::List(all), span };
+            return eval_inner(&combined, env);
+        }
         ExprKind::List(elems) => {
             if elems.is_empty() {
                 return Err(EvalError::Parse("empty application".into()).with_position(span.line, span.col));
@@ -620,6 +677,7 @@ fn eval_inner(expr: &Expr, env: &Env) -> Result<Trampoline, EvalError> {
                     "define" => return eval_define(&elems[1..], env, span).map(Trampoline::Done),
                     "if" => return eval_if_tc(&elems[1..], env, span),
                     "quote" => return eval_quote(&elems[1..], span).map(Trampoline::Done),
+                    "quasiquote" => return eval_quasiquote(&elems[1..], env, span).map(Trampoline::Done),
                     "lambda" => return eval_lambda(&elems[1..], env, span).map(Trampoline::Done),
                     "and" => return eval_and_tc(&elems[1..], env),
                     "or" => return eval_or_tc(&elems[1..], env),
@@ -954,6 +1012,35 @@ fn eval_define(args: &[Expr], env: &Env, span: Span) -> Result<Value, EvalError>
             env_set(env, name, lambda);
             Ok(Value::Void)
         }
+        ExprKind::DottedList(sig, rest) => {
+            // (define (name params... . rest) body)
+            if sig.is_empty() {
+                return Err(EvalError::Parse("define: empty signature".into()).with_position(span.line, span.col));
+            }
+            let name = match &sig[0].kind {
+                ExprKind::Symbol(n) => n.clone(),
+                _ => return Err(EvalError::Parse("define: expected function name".into()).with_position(span.line, span.col)),
+            };
+            let rest_name = match &rest.kind {
+                ExprKind::Symbol(n) => n.clone(),
+                _ => return Err(EvalError::Parse("define: expected rest parameter name".into()).with_position(span.line, span.col)),
+            };
+            let mut params = Vec::new();
+            for p in &sig[1..] {
+                match &p.kind {
+                    ExprKind::Symbol(s) => params.push(s.clone()),
+                    _ => return Err(EvalError::Parse("define: expected parameter name".into()).with_position(span.line, span.col)),
+                }
+            }
+            let lambda = Value::Lambda {
+                params,
+                rest_param: Some(rest_name),
+                body: args[1..].to_vec(),
+                env: env.clone(),
+            };
+            env_set(env, name, lambda);
+            Ok(Value::Void)
+        }
         _ => Err(EvalError::Parse("define: expected symbol or list".into()).with_position(span.line, span.col)),
     }
 }
@@ -972,6 +1059,104 @@ fn eval_if_tc(args: &[Expr], env: &Env, span: Span) -> Result<Trampoline, EvalEr
     }
 }
 
+fn eval_quasiquote(args: &[Expr], env: &Env, span: Span) -> Result<Value, EvalError> {
+    if args.len() != 1 {
+        return Err(EvalError::Arity("quasiquote requires 1 argument".into()).with_position(span.line, span.col));
+    }
+    qq_expand(&args[0], env, 0)
+}
+
+fn qq_expand(expr: &Expr, env: &Env, depth: usize) -> Result<Value, EvalError> {
+    match &expr.kind {
+        ExprKind::List(elems) if !elems.is_empty() => {
+            if let ExprKind::Symbol(s) = &elems[0].kind {
+                if s == "unquote" {
+                    if depth == 0 {
+                        if elems.len() != 2 {
+                            return Err(EvalError::Arity("unquote requires 1 argument".into()));
+                        }
+                        return eval(&elems[1], env);
+                    } else {
+                        // Nested unquote: decrease depth
+                        let inner = qq_expand(&elems[1], env, depth - 1)?;
+                        return Ok(Value::List(vec![Value::Symbol("unquote".into()), inner]));
+                    }
+                }
+                if s == "quasiquote" {
+                    if elems.len() != 2 {
+                        return Err(EvalError::Arity("quasiquote requires 1 argument".into()));
+                    }
+                    let inner = qq_expand(&elems[1], env, depth + 1)?;
+                    return Ok(Value::List(vec![Value::Symbol("quasiquote".into()), inner]));
+                }
+            }
+            // Process list elements, handling unquote-splicing
+            qq_expand_list(elems, env, depth)
+        }
+        ExprKind::DottedList(items, tail) => {
+            if let ExprKind::Symbol(s) = &items[0].kind {
+                if s == "unquote" && items.len() == 1 && depth == 0 {
+                    // (unquote . x) — treat as (unquote x) where x is the tail
+                    return eval(&Expr { kind: (**tail).kind.clone(), span: tail.span }, env);
+                }
+            }
+            // Build improper list from quasiquoted parts
+            let tail_val = qq_expand(tail, env, depth)?;
+            let mut result = tail_val;
+            for item in items.iter().rev() {
+                // Check for unquote-splicing
+                if let ExprKind::List(sub) = &item.kind {
+                    if sub.len() == 2 {
+                        if let ExprKind::Symbol(s) = &sub[0].kind {
+                            if s == "unquote-splicing" && depth == 0 {
+                                let spliced = eval(&sub[1], env)?;
+                                // Append spliced list to result
+                                let elems = value_to_vec(&spliced).unwrap_or_default();
+                                for e in elems.into_iter().rev() {
+                                    result = Value::Pair(Rc::new(RefCell::new((e, result))));
+                                }
+                                continue;
+                            }
+                        }
+                    }
+                }
+                let expanded = qq_expand(item, env, depth)?;
+                result = Value::Pair(Rc::new(RefCell::new((expanded, result))));
+            }
+            Ok(result)
+        }
+        _ => Ok(expr_to_value(expr)),
+    }
+}
+
+fn qq_expand_list(elems: &[Expr], env: &Env, depth: usize) -> Result<Value, EvalError> {
+    let mut result = Vec::new();
+    for elem in elems {
+        if let ExprKind::List(sub) = &elem.kind {
+            if sub.len() == 2 {
+                if let ExprKind::Symbol(s) = &sub[0].kind {
+                    if s == "unquote-splicing" {
+                        if depth == 0 {
+                            let spliced = eval(&sub[1], env)?;
+                            match spliced {
+                                Value::List(items) => result.extend(items),
+                                Value::Pair(_) => {
+                                    let items = value_to_vec(&spliced).unwrap_or_default();
+                                    result.extend(items);
+                                }
+                                _ => return Err(EvalError::Type("unquote-splicing: expected list".into())),
+                            }
+                            continue;
+                        }
+                    }
+                }
+            }
+        }
+        result.push(qq_expand(elem, env, depth)?);
+    }
+    Ok(Value::List(result))
+}
+
 fn eval_quote(args: &[Expr], span: Span) -> Result<Value, EvalError> {
     if args.len() != 1 {
         return Err(EvalError::Arity("quote requires 1 argument".into()).with_position(span.line, span.col));
@@ -987,6 +1172,15 @@ fn expr_to_value(expr: &Expr) -> Value {
         ExprKind::Char(c) => Value::Char(*c),
         ExprKind::Symbol(s) => Value::Symbol(s.clone()),
         ExprKind::List(items) => Value::List(items.iter().map(expr_to_value).collect()),
+        ExprKind::DottedList(items, tail) => {
+            let tail_val = expr_to_value(tail);
+            // Build from the right: (a b . c) => (cons a (cons b c))
+            let mut result = tail_val;
+            for item in items.iter().rev() {
+                result = Value::Pair(Rc::new(RefCell::new((expr_to_value(item), result))));
+            }
+            result
+        }
         ExprKind::Literal(v) => v.clone(),
     }
 }
@@ -1021,6 +1215,24 @@ fn eval_lambda(args: &[Expr], env: &Env, span: Span) -> Result<Value, EvalError>
     }
     let (params, rest_param) = match &args[0].kind {
         ExprKind::List(param_exprs) => parse_param_list(param_exprs, span)?,
+        ExprKind::DottedList(param_exprs, rest) => {
+            let mut params = Vec::new();
+            for p in param_exprs {
+                match &p.kind {
+                    ExprKind::Symbol(s) => params.push(s.clone()),
+                    _ => return Err(EvalError::Parse("lambda: expected parameter name".into()).with_position(span.line, span.col)),
+                }
+            }
+            let rest_name = match &rest.kind {
+                ExprKind::Symbol(s) => s.clone(),
+                _ => return Err(EvalError::Parse("lambda: expected rest parameter name".into()).with_position(span.line, span.col)),
+            };
+            (params, Some(rest_name))
+        }
+        ExprKind::Symbol(s) => {
+            // (lambda args body) — all args as rest parameter
+            (vec![], Some(s.clone()))
+        }
         _ => return Err(EvalError::Parse("lambda: expected parameter list".into()).with_position(span.line, span.col)),
     };
     Ok(Value::Lambda {
@@ -1044,6 +1256,21 @@ fn eval_case_lambda(args: &[Expr], env: &Env, span: Span) -> Result<Value, EvalE
                 }
                 let (params, rest_param) = match &elems[0].kind {
                     ExprKind::List(param_exprs) => parse_param_list(param_exprs, span)?,
+                    ExprKind::DottedList(param_exprs, rest) => {
+                        let mut params = Vec::new();
+                        for p in param_exprs {
+                            match &p.kind {
+                                ExprKind::Symbol(s) => params.push(s.clone()),
+                                _ => return Err(EvalError::Parse("case-lambda: expected parameter name".into()).with_position(span.line, span.col)),
+                            }
+                        }
+                        let rest_name = match &rest.kind {
+                            ExprKind::Symbol(s) => s.clone(),
+                            _ => return Err(EvalError::Parse("case-lambda: expected rest parameter name".into()).with_position(span.line, span.col)),
+                        };
+                        (params, Some(rest_name))
+                    }
+                    ExprKind::Symbol(s) => (vec![], Some(s.clone())),
                     _ => return Err(EvalError::Parse("case-lambda: expected parameter list".into()).with_position(span.line, span.col)),
                 };
                 clauses.push((params, rest_param, elems[1..].to_vec()));
@@ -1207,6 +1434,15 @@ fn eval_cond_tc(args: &[Expr], env: &Env) -> Result<Trampoline, EvalError> {
                 }
                 let test = eval(&parts[0], env)?;
                 if test.is_truthy() {
+                    // Check for => syntax: (test => proc)
+                    if parts.len() == 3 {
+                        if let ExprKind::Symbol(arrow) = &parts[1].kind {
+                            if arrow == "=>" {
+                                let proc = eval(&parts[2], env)?;
+                                return apply_tc(&proc, &[test]);
+                            }
+                        }
+                    }
                     if parts.len() == 1 {
                         return Ok(Trampoline::Done(test));
                     }
@@ -2916,7 +3152,7 @@ fn builtin_is_list(args: &[Value]) -> Result<Value, EvalError> {
                     for _ in 0..2 {
                         let next = match &fast {
                             Value::Pair(p) => p.borrow().1.clone(),
-                            Value::List(items) if items.is_empty() => return true,
+                            Value::List(_) => return true,
                             _ => return false,
                         };
                         fast = next;
@@ -3399,6 +3635,122 @@ fn builtin_member(args: &[Value]) -> Result<Value, EvalError> {
     }
 }
 
+fn builtin_memq(args: &[Value]) -> Result<Value, EvalError> {
+    if args.len() != 2 { return Err(EvalError::Arity("memq requires 2 arguments".into())); }
+    let key = &args[0];
+    let mut current = args[1].clone();
+    loop {
+        match &current {
+            Value::Pair(p) => {
+                let inner = p.borrow();
+                let matches = match (&inner.0, key) {
+                    (Value::Symbol(a), Value::Symbol(b)) => a == b,
+                    (Value::Boolean(a), Value::Boolean(b)) => a == b,
+                    (Value::Integer(a), Value::Integer(b)) => a == b,
+                    (Value::Char(a), Value::Char(b)) => a == b,
+                    (Value::List(a), Value::List(b)) => a.is_empty() && b.is_empty(),
+                    (Value::Pair(a), Value::Pair(b)) => Rc::ptr_eq(a, b),
+                    (Value::Vector(a), Value::Vector(b)) => Rc::ptr_eq(a, b),
+                    (Value::Void, Value::Void) => true,
+                    _ => false,
+                };
+                if matches {
+                    drop(inner);
+                    return Ok(current.clone());
+                }
+                let next = inner.1.clone();
+                drop(inner);
+                current = next;
+            }
+            Value::List(items) if items.is_empty() => return Ok(Value::Boolean(false)),
+            Value::List(items) => {
+                for (i, item) in items.iter().enumerate() {
+                    let matches = match (item, key) {
+                        (Value::Symbol(a), Value::Symbol(b)) => a == b,
+                        (Value::Boolean(a), Value::Boolean(b)) => a == b,
+                        (Value::Integer(a), Value::Integer(b)) => a == b,
+                        (Value::Char(a), Value::Char(b)) => a == b,
+                        (Value::List(a), Value::List(b)) => a.is_empty() && b.is_empty(),
+                        (Value::Pair(a), Value::Pair(b)) => Rc::ptr_eq(a, b),
+                        (Value::Vector(a), Value::Vector(b)) => Rc::ptr_eq(a, b),
+                        (Value::Void, Value::Void) => true,
+                        _ => false,
+                    };
+                    if matches {
+                        return Ok(Value::List(items[i..].to_vec()));
+                    }
+                }
+                return Ok(Value::Boolean(false));
+            }
+            _ => return Ok(Value::Boolean(false)),
+        }
+    }
+}
+
+fn builtin_memv(args: &[Value]) -> Result<Value, EvalError> {
+    if args.len() != 2 { return Err(EvalError::Arity("memv requires 2 arguments".into())); }
+    let key = &args[0];
+    let mut current = args[1].clone();
+    loop {
+        match &current {
+            Value::Pair(p) => {
+                let inner = p.borrow();
+                if eqv_match(&inner.0, key) {
+                    drop(inner);
+                    return Ok(current.clone());
+                }
+                let next = inner.1.clone();
+                drop(inner);
+                current = next;
+            }
+            Value::List(items) if items.is_empty() => return Ok(Value::Boolean(false)),
+            Value::List(items) => {
+                for (i, item) in items.iter().enumerate() {
+                    if eqv_match(item, key) {
+                        return Ok(Value::List(items[i..].to_vec()));
+                    }
+                }
+                return Ok(Value::Boolean(false));
+            }
+            _ => return Ok(Value::Boolean(false)),
+        }
+    }
+}
+
+fn builtin_assq(args: &[Value]) -> Result<Value, EvalError> {
+    if args.len() != 2 { return Err(EvalError::Arity("assq requires 2 arguments".into())); }
+    let key = &args[0];
+    match value_to_vec(&args[1]) {
+        Some(alist) => {
+            for item in &alist {
+                let car = match item {
+                    Value::Pair(p) => Some(p.borrow().0.clone()),
+                    Value::List(items) if !items.is_empty() => Some(items[0].clone()),
+                    _ => None,
+                };
+                if let Some(k) = car {
+                    let matches = match (&k, key) {
+                        (Value::Symbol(a), Value::Symbol(b)) => a == b,
+                        (Value::Boolean(a), Value::Boolean(b)) => a == b,
+                        (Value::Integer(a), Value::Integer(b)) => a == b,
+                        (Value::Char(a), Value::Char(b)) => a == b,
+                        (Value::List(a), Value::List(b)) => a.is_empty() && b.is_empty(),
+                        (Value::Pair(a), Value::Pair(b)) => Rc::ptr_eq(a, b),
+                        (Value::Vector(a), Value::Vector(b)) => Rc::ptr_eq(a, b),
+                        (Value::Void, Value::Void) => true,
+                        _ => false,
+                    };
+                    if matches {
+                        return Ok(item.clone());
+                    }
+                }
+            }
+            Ok(Value::Boolean(false))
+        }
+        None => Err(EvalError::Type("assq: expected list".into())),
+    }
+}
+
 fn builtin_assv(args: &[Value]) -> Result<Value, EvalError> {
     if args.len() != 2 { return Err(EvalError::Arity("assv requires 2 arguments".into())); }
     let key = &args[0];
@@ -3639,6 +3991,9 @@ fn make_global_env() -> Env {
         ("cdddr", builtin_cdddr),
         ("cadddr", builtin_cadddr),
         ("member", builtin_member),
+        ("memq", builtin_memq),
+        ("memv", builtin_memv),
+        ("assq", builtin_assq),
         ("assv", builtin_assv),
         ("gcd", builtin_gcd),
         ("lcm", builtin_lcm),
