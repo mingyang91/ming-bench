@@ -9,7 +9,7 @@ object Builtins:
     registerArithmetic(env)
     registerListOps(env)
     registerListUtils(env)
-    registerTypePredicates(env)
+    BuiltinsArith.registerTypePredicates(env)
     registerIOOps(env, output)
     registerValues(env)
     BuiltinsExt.register(env)
@@ -18,11 +18,12 @@ object Builtins:
     entries.foreach((name, fn) => env.define(name, BuiltinVal(name, fn)))
 
   private def registerArithmetic(env: Env): Unit =
+    import BuiltinsArith.*
     define(
       env,
       List(
-        ("+", args => arith(args, 0L, _ + _)),
-        ("*", args => arith(args, 1L, _ * _)),
+        ("+", args => arithAdd(args)),
+        ("*", args => arithMul(args)),
         ("-", args => subtractOp(args)),
         ("/", args => divideOp(args)),
         ("<", args => compareOp(args, _ < _)),
@@ -164,19 +165,6 @@ object Builtins:
       )
     )
 
-  private def registerTypePredicates(env: Env): Unit =
-    define(
-      env,
-      List(
-        ("string?", args => typePred(args, _.isInstanceOf[StrVal])),
-        ("number?", args => typePred(args, _.isInstanceOf[IntVal])),
-        ("boolean?", args => typePred(args, _.isInstanceOf[BoolVal])),
-        ("pair?", args => typePred(args, _.isInstanceOf[PairVal])),
-        ("symbol?", args => typePred(args, _.isInstanceOf[SymbolVal])),
-        ("char?", args => typePred(args, _.isInstanceOf[CharVal]))
-      )
-    )
-
   private def registerIOOps(env: Env, output: StringBuilder): Unit =
     define(
       env,
@@ -224,39 +212,6 @@ object Builtins:
       case NilVal        => tail
       case PairVal(h, t) => PairVal(h, appendList(t, tail))
       case _             => throw new EvalError("append: not a proper list")
-
-  private def typePred(args: List[Value], pred: Value => Boolean): Value =
-    if args.length != 1 then throw new EvalError("type predicate: expected 1 argument")
-    BoolVal(pred(args.head))
-
-  private[ming] def requireInts(args: List[Value]): List[Long] =
-    args.map {
-      case IntVal(n) => n
-      case other     => throw new EvalError(s"expected number, got ${other.display}")
-    }
-
-  private def arith(args: List[Value], identity: Long, op: (Long, Long) => Long): Value =
-    val nums = requireInts(args)
-    IntVal(nums.foldLeft(identity)(op))
-
-  private def subtractOp(args: List[Value]): Value =
-    val nums = requireInts(args)
-    nums match
-      case Nil       => IntVal(0)
-      case n :: Nil  => IntVal(-n)
-      case n :: rest => IntVal(rest.foldLeft(n)(_ - _))
-
-  private def divideOp(args: List[Value]): Value =
-    val nums = requireInts(args)
-    nums match
-      case Nil       => throw new EvalError("/: need at least 1 argument")
-      case n :: Nil  => IntVal(1 / n)
-      case n :: rest => IntVal(rest.foldLeft(n)(_ / _))
-
-  private def compareOp(args: List[Value], op: (Long, Long) => Boolean): Value =
-    val nums   = requireInts(args)
-    val result = nums.zip(nums.tail).forall((a, b) => op(a, b))
-    BoolVal(result)
 
   private def isProperList(v: Value): Boolean =
     v match

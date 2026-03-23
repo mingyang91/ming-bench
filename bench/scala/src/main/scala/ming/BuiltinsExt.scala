@@ -188,14 +188,14 @@ object BuiltinsExt:
         (
           "min",
           args =>
-            val nums = Builtins.requireInts(args)
+            val nums = BuiltinsArith.requireInts(args)
             if nums.isEmpty then throw new EvalError("min: expected at least 1 argument")
             IntVal(nums.min)
         ),
         (
           "max",
           args =>
-            val nums = Builtins.requireInts(args)
+            val nums = BuiltinsArith.requireInts(args)
             if nums.isEmpty then throw new EvalError("max: expected at least 1 argument")
             IntVal(nums.max)
         ),

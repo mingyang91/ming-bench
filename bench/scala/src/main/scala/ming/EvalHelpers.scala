@@ -17,11 +17,13 @@ private[ming] object EvalHelpers:
       case _           => evalError("quote: expected 1 argument", pos)
 
   def exprToValue(expr: Expr): Value = expr match
-    case Num(n, _)  => IntVal(n)
-    case Bool(b, _) => BoolVal(b)
-    case Str(s, _)  => StrVal(s.toCharArray)
-    case Chr(c, _)  => CharVal(c)
-    case Sym(s, _)  => SymbolVal(s)
+    case Num(n, _)    => IntVal(n)
+    case Rat(n, d, _) => Value.makeRational(n, d)
+    case Flt(d, _)    => FloatVal(d)
+    case Bool(b, _)   => BoolVal(b)
+    case Str(s, _)    => StrVal(s.toCharArray)
+    case Chr(c, _)    => CharVal(c)
+    case Sym(s, _)    => SymbolVal(s)
     case SList(elems, _) =>
       elems.foldRight(NilVal: Value)((e, acc) => PairVal(exprToValue(e), acc))
 

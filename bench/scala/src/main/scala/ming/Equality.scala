@@ -7,13 +7,15 @@ object Equality:
 
   def eqCheck(a: Value, b: Value): Boolean =
     (a, b) match
-      case (IntVal(x), IntVal(y))       => x == y
-      case (BoolVal(x), BoolVal(y))     => x == y
-      case (SymbolVal(x), SymbolVal(y)) => x == y
-      case (CharVal(x), CharVal(y))     => x == y
-      case (NilVal, NilVal)             => true
-      case (VoidVal, VoidVal)           => true
-      case _                            => a eq b
+      case (IntVal(x), IntVal(y))                     => x == y
+      case (RationalVal(n1, d1), RationalVal(n2, d2)) => n1 == n2 && d1 == d2
+      case (FloatVal(x), FloatVal(y))                 => x == y
+      case (BoolVal(x), BoolVal(y))                   => x == y
+      case (SymbolVal(x), SymbolVal(y))               => x == y
+      case (CharVal(x), CharVal(y))                   => x == y
+      case (NilVal, NilVal)                           => true
+      case (VoidVal, VoidVal)                         => true
+      case _                                          => a eq b
 
   /** eqv? — same as eq? for our value representation. */
   def eqvCheck(a: Value, b: Value): Boolean = eqCheck(a, b)

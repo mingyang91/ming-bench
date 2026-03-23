@@ -106,6 +106,8 @@ object Evaluator extends EvalForms with EvalWind with EvalExceptions:
   protected def eval(expr: Expr, env: Env, k: K): Bounce =
     expr match
       case Num(n, _)       => k(IntVal(n))
+      case Rat(n, d, _)    => k(Value.makeRational(n, d))
+      case Flt(d, _)       => k(FloatVal(d))
       case Bool(b, _)      => k(BoolVal(b))
       case Str(s, _)       => k(StrVal(s.toCharArray))
       case Chr(c, _)       => k(CharVal(c))

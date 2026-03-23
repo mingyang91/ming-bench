@@ -9,9 +9,26 @@ object Value:
   def markStringMutable(chars: Array[Char]): Unit  = mutableStrings.add(chars)
   def isStringMutable(chars: Array[Char]): Boolean = mutableStrings.contains(chars)
 
+  private def gcd(a: Long, b: Long): Long =
+    val aa = Math.abs(a)
+    val bb = Math.abs(b)
+    if bb == 0 then aa else gcd(bb, aa % bb)
+
+  /** Create a normalized rational or integer value. */
+  def makeRational(num: Long, den: Long): Value =
+    if den == 0 then throw new EvalError("division by zero")
+    val sign = if den < 0 then -1L else 1L
+    val g    = gcd(Math.abs(num), Math.abs(den))
+    val n    = sign * num / g
+    val d    = sign * den / g
+    if d == 1L then Value.IntVal(n)
+    else Value.RationalVal(n, d)
+
 /** Runtime Scheme value. */
 enum Value:
   case IntVal(n: Long)
+  case RationalVal(num: Long, den: Long)
+  case FloatVal(d: Double)
   case BoolVal(b: Boolean)
   case StrVal(chars: Array[Char])
   case PairVal(car: Value, cdr: Value)
@@ -28,6 +45,8 @@ enum Value:
 
   def display: String = this match
     case IntVal(n)             => n.toString
+    case RationalVal(n, d)     => s"$n/$d"
+    case FloatVal(d)           => formatFloat(d)
     case BoolVal(b)            => if b then "#t" else "#f"
     case StrVal(chars)         => s"\"${new String(chars)}\""
     case NilVal                => "()"
@@ -50,6 +69,10 @@ enum Value:
   def isTruthy: Boolean = this match
     case BoolVal(false) => false
     case _              => true
+
+  private def formatFloat(d: Double): String =
+    if d == d.toLong.toDouble && !d.isInfinite then s"${d.toLong}.0"
+    else d.toString
 
   private def displayList(v: Value): String =
     val sb      = new StringBuilder("(")
