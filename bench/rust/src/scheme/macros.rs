@@ -126,6 +126,9 @@ pub const SPECIAL_FORMS: &[&str] = &[
     "and", "or", "define-syntax", "syntax-rules", "string-set!",
     "let*", "letrec", "letrec*", "case", "do",
     "syntax-case", "syntax", "with-syntax",
+    "guard", "define-record-type", "when", "unless",
+    "raise", "values", "call-with-values", "call/cc", "call-with-current-continuation",
+    "dynamic-wind",
 ];
 
 pub fn expand_template(

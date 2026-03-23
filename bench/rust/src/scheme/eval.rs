@@ -900,12 +900,11 @@ impl Machine {
                 self.eval_body_in(&body, &call_env)
             }
             Value::Continuation(id) => {
-                if args.len() != 1 {
-                    return Err(EvalError::WrongArgCount {
-                        expected: 1, got: args.len(),
-                    }.at(span));
-                }
-                let val = args.into_iter().next().expect("checked len");
+                let val = match args.len() {
+                    0 => Value::Void,
+                    1 => args.into_iter().next().expect("checked len"),
+                    _ => Value::Values(args),
+                };
                 let target_winders = &self.saved_winders[id];
                 // Find common prefix length
                 let common = self.winders.iter().zip(target_winders.iter())
