@@ -17,6 +17,7 @@ pub fn parse(input: &str) -> Result<Vec<Value>, EvalError> {
 enum Token {
     LParen,
     RParen,
+    Quote,
     Symbol(String),
     Integer(i64),
     Boolean(bool),
@@ -31,6 +32,10 @@ fn tokenize(input: &str) -> Result<Vec<Token>, EvalError> {
     while i < chars.len() {
         match chars[i] {
             ' ' | '\t' | '\n' | '\r' => i += 1,
+            '\'' => {
+                tokens.push(Token::Quote);
+                i += 1;
+            }
             ';' => {
                 while i < chars.len() && chars[i] != '\n' {
                     i += 1;
@@ -143,6 +148,13 @@ fn parse_expr(tokens: &[Token], pos: usize) -> Result<(Value, usize), EvalError>
                 elems.push(expr);
                 i = next;
             }
+        }
+        Token::Quote => {
+            let (inner, next) = parse_expr(tokens, pos + 1)?;
+            Ok((
+                Value::List(vec![Value::Symbol("quote".to_string()), inner]),
+                next,
+            ))
         }
         Token::RParen => Err(EvalError::Parse {
             message: "unexpected )".to_string(),
