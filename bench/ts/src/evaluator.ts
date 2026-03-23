@@ -17,6 +17,7 @@ type SchemeVal =
   | { tag: 'builtin'; name: string; fn: (args: SchemeVal[]) => SchemeVal; pos?: Pos }
   | { tag: 'continuation'; k: K; pos?: Pos }
   | { tag: 'void'; pos?: Pos }
+  | { tag: 'vector'; value: SchemeVal[]; pos?: Pos }
   | { tag: 'syntax'; literals: string[]; rules: { pattern: SchemeVal; template: SchemeVal }[]; defEnv: Env; pos?: Pos };
 
 // ── CPS / Trampoline types ─────────────────────────────────────────
@@ -449,6 +450,33 @@ function expandMacro(transformer: SchemeVal & { tag: 'syntax' }, inputExpr: Sche
   return null;
 }
 
+// ── Equality helpers ────────────────────────────────────────────────
+
+function schemeEq(a: SchemeVal, b: SchemeVal): boolean {
+  if (a.tag !== b.tag) return false;
+  if (a.tag === 'nil') return true;
+  if (a.tag === 'boolean' && b.tag === 'boolean') return a.value === b.value;
+  if (a.tag === 'number' && b.tag === 'number') return a.value === b.value;
+  if (a.tag === 'symbol' && b.tag === 'symbol') return a.value === b.value;
+  if (a.tag === 'char' && b.tag === 'char') return a.value === b.value;
+  if (a.tag === 'string' && b.tag === 'string') return a.value === b.value;
+  return a === b;
+}
+
+function schemeEqual(a: SchemeVal, b: SchemeVal): boolean {
+  if (a.tag === 'pair' && b.tag === 'pair') {
+    return schemeEqual(a.car, b.car) && schemeEqual(a.cdr, b.cdr);
+  }
+  if (a.tag === 'vector' && b.tag === 'vector') {
+    if (a.value.length !== b.value.length) return false;
+    for (let i = 0; i < a.value.length; i++) {
+      if (!schemeEqual(a.value[i], b.value[i])) return false;
+    }
+    return true;
+  }
+  return schemeEq(a, b);
+}
+
 // ── Global Environment ─────────────────────────────────────────────
 
 function makeGlobalEnv(): Env {
@@ -630,26 +658,40 @@ function makeGlobalEnv(): Env {
     return { tag: 'char', value: String.fromCodePoint(n) };
   });
 
-  // eq? / eqv? / equal?
-  function schemeEq(a: SchemeVal, b: SchemeVal): boolean {
-    if (a.tag !== b.tag) return false;
-    if (a.tag === 'nil') return true;
-    if (a.tag === 'boolean' && b.tag === 'boolean') return a.value === b.value;
-    if (a.tag === 'number' && b.tag === 'number') return a.value === b.value;
-    if (a.tag === 'symbol' && b.tag === 'symbol') return a.value === b.value;
-    if (a.tag === 'char' && b.tag === 'char') return a.value === b.value;
-    if (a.tag === 'string' && b.tag === 'string') return a.value === b.value;
-    return a === b;
-  }
-  function schemeEqual(a: SchemeVal, b: SchemeVal): boolean {
-    if (a.tag === 'pair' && b.tag === 'pair') {
-      return schemeEqual(a.car, b.car) && schemeEqual(a.cdr, b.cdr);
-    }
-    return schemeEq(a, b);
-  }
   defBuiltin('eq?', (args) => ({ tag: 'boolean', value: schemeEq(args[0], args[1]) }));
   defBuiltin('eqv?', (args) => ({ tag: 'boolean', value: schemeEq(args[0], args[1]) }));
   defBuiltin('equal?', (args) => ({ tag: 'boolean', value: schemeEqual(args[0], args[1]) }));
+
+  // Vector operations
+  defBuiltin('vector', (args) => ({ tag: 'vector', value: [...args] }));
+  defBuiltin('make-vector', (args) => {
+    const len = expectNumber(args[0], 'make-vector');
+    const fill = args.length > 1 ? args[1] : { tag: 'number' as const, value: 0 };
+    return { tag: 'vector', value: Array(len).fill(fill) };
+  });
+  defBuiltin('vector-ref', (args) => {
+    if (args[0].tag !== 'vector') throw new EvalError('vector-ref: expected vector');
+    const idx = expectNumber(args[1], 'vector-ref');
+    return args[0].value[idx];
+  });
+  defBuiltin('vector-set!', (args) => {
+    if (args[0].tag !== 'vector') throw new EvalError('vector-set!: expected vector');
+    const idx = expectNumber(args[1], 'vector-set!');
+    args[0].value[idx] = args[2];
+    return VOID;
+  });
+  defBuiltin('vector-length', (args) => {
+    if (args[0].tag !== 'vector') throw new EvalError('vector-length: expected vector');
+    return { tag: 'number', value: args[0].value.length };
+  });
+  defBuiltin('vector?', (args) => ({ tag: 'boolean', value: args[0].tag === 'vector' }));
+  defBuiltin('vector->list', (args) => {
+    if (args[0].tag !== 'vector') throw new EvalError('vector->list: expected vector');
+    return listToPairs(args[0].value);
+  });
+  defBuiltin('list->vector', (args) => {
+    return { tag: 'vector', value: pairsToArray(args[0]) };
+  });
 
   // map (supports multiple lists)
   defBuiltin('map', (args) => {
@@ -1053,6 +1095,149 @@ function evaluateCPS(expr: SchemeVal, env: Env, k: K): TResult {
       return callK(k, VOID);
     }
 
+    if (op === 'letrec') {
+      const bindings = (items[1] as { tag: 'list'; value: SchemeVal[] }).value;
+      const body = items.slice(2);
+      const letEnv = new Env(env);
+      // Define all variables first (as undefined placeholders)
+      const names: string[] = [];
+      const initExprs: SchemeVal[] = [];
+      for (const b of bindings) {
+        const bv = (b as { tag: 'list'; value: SchemeVal[] }).value;
+        const name = (bv[0] as { tag: 'symbol'; value: string }).value;
+        names.push(name);
+        initExprs.push(bv[1]);
+        letEnv.define(name, VOID);
+      }
+      // Evaluate all init expressions in letEnv, then set
+      function evalLetrecBindings(idx: number): TResult {
+        if (idx >= names.length) return evaluateSeqCPS(body, 0, letEnv, k);
+        return evaluateCPS(initExprs[idx], letEnv, (val) => {
+          letEnv.define(names[idx], val);
+          return evalLetrecBindings(idx + 1);
+        });
+      }
+      return evalLetrecBindings(0);
+    }
+
+    if (op === 'letrec*') {
+      const bindings = (items[1] as { tag: 'list'; value: SchemeVal[] }).value;
+      const body = items.slice(2);
+      const letEnv = new Env(env);
+      // Define all variables first
+      for (const b of bindings) {
+        const bv = (b as { tag: 'list'; value: SchemeVal[] }).value;
+        const name = (bv[0] as { tag: 'symbol'; value: string }).value;
+        letEnv.define(name, VOID);
+      }
+      // Evaluate sequentially, each becoming visible
+      function evalLetrecStarBindings(idx: number): TResult {
+        if (idx >= bindings.length) return evaluateSeqCPS(body, 0, letEnv, k);
+        const bv = (bindings[idx] as { tag: 'list'; value: SchemeVal[] }).value;
+        const name = (bv[0] as { tag: 'symbol'; value: string }).value;
+        return evaluateCPS(bv[1], letEnv, (val) => {
+          letEnv.define(name, val);
+          return evalLetrecStarBindings(idx + 1);
+        });
+      }
+      return evalLetrecStarBindings(0);
+    }
+
+    if (op === 'case') {
+      return evaluateCPS(items[1], env, (keyVal) => {
+        function evalCaseClauses(idx: number): TResult {
+          if (idx >= items.length) return callK(k, VOID);
+          const clause = (items[idx] as { tag: 'list'; value: SchemeVal[] }).value;
+          if (clause[0].tag === 'symbol' && clause[0].value === 'else') {
+            return evaluateSeqCPS(clause, 1, env, k);
+          }
+          const datums = (clause[0] as { tag: 'list'; value: SchemeVal[] }).value;
+          for (const d of datums) {
+            const datum = astToPairs(d);
+            if (schemeEq(keyVal, datum)) {
+              return evaluateSeqCPS(clause, 1, env, k);
+            }
+          }
+          return evalCaseClauses(idx + 1);
+        }
+        return evalCaseClauses(2);
+      });
+    }
+
+    if (op === 'do') {
+      // (do ((var init step) ...) (test expr ...) body ...)
+      const varSpecs = (items[1] as { tag: 'list'; value: SchemeVal[] }).value;
+      const testClause = (items[2] as { tag: 'list'; value: SchemeVal[] }).value;
+      const bodyExprs = items.slice(3);
+
+      const names: string[] = [];
+      const initExprs: SchemeVal[] = [];
+      const stepExprs: (SchemeVal | null)[] = [];
+
+      for (const spec of varSpecs) {
+        const sv = (spec as { tag: 'list'; value: SchemeVal[] }).value;
+        names.push((sv[0] as { tag: 'symbol'; value: string }).value);
+        initExprs.push(sv[1]);
+        stepExprs.push(sv.length > 2 ? sv[2] : null);
+      }
+
+      // Evaluate init expressions
+      return evaluateArgsCPS(initExprs, 0, env, [], (initVals) => {
+        const doEnv = new Env(env);
+        for (let i = 0; i < names.length; i++) {
+          doEnv.define(names[i], initVals[i]);
+        }
+
+        function doLoop(): TResult {
+          return evaluateCPS(testClause[0], doEnv, (testVal) => {
+            if (isTruthy(testVal)) {
+              // Test true: evaluate result expressions
+              if (testClause.length > 1) {
+                return evaluateSeqCPS(testClause, 1, doEnv, k);
+              }
+              return callK(k, VOID);
+            }
+            // Test false: evaluate body, then step
+            function afterBody(): TResult {
+              // Evaluate all step expressions with current values
+              const stepsToEval: { idx: number; expr: SchemeVal }[] = [];
+              for (let i = 0; i < names.length; i++) {
+                if (stepExprs[i] !== null) {
+                  stepsToEval.push({ idx: i, expr: stepExprs[i]! });
+                }
+              }
+              if (stepsToEval.length === 0) return bounce(doLoop);
+
+              // Evaluate all steps, collecting results
+              const stepVals: SchemeVal[] = new Array(names.length);
+              function evalSteps(si: number): TResult {
+                if (si >= stepsToEval.length) {
+                  // Apply all step results
+                  for (const s of stepsToEval) {
+                    doEnv.define(names[s.idx], stepVals[s.idx]);
+                  }
+                  return bounce(doLoop);
+                }
+                const { idx, expr } = stepsToEval[si];
+                return evaluateCPS(expr, doEnv, (val) => {
+                  stepVals[idx] = val;
+                  return evalSteps(si + 1);
+                });
+              }
+              return evalSteps(0);
+            }
+
+            if (bodyExprs.length > 0) {
+              return evaluateSeqCPS(bodyExprs, 0, doEnv, (_) => afterBody());
+            }
+            return afterBody();
+          });
+        }
+
+        return doLoop();
+      });
+    }
+
     // Check for macro application
     try {
       const headVal = env.get(op);
@@ -1111,6 +1296,7 @@ function writeVal(val: SchemeVal): string {
       s += ')';
       return s;
     }
+    case 'vector': return `#(${val.value.map(writeVal).join(' ')})`;
     case 'lambda': return '#<procedure>';
     case 'builtin': return `#<builtin:${val.name}>`;
     case 'continuation': return '#<continuation>';
