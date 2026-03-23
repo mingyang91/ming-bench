@@ -17,6 +17,7 @@ const (
 	TokenBool
 	TokenString
 	TokenSymbol
+	TokenQuote
 	TokenEOF
 )
 
@@ -66,6 +67,14 @@ func Tokenize(input string) ([]Token, error) {
 		}
 		if ch == ')' {
 			tokens = append(tokens, Token{Type: TokenRParen, Value: ")", Line: line, Col: col})
+			i++
+			col++
+			continue
+		}
+
+		// Quote shorthand
+		if ch == '\'' {
+			tokens = append(tokens, Token{Type: TokenQuote, Value: "'", Line: line, Col: col})
 			i++
 			col++
 			continue
@@ -259,6 +268,21 @@ func (p *Parser) ParseExpr() (Expr, error) {
 	case TokenSymbol:
 		p.next()
 		return &SymbolExpr{Name: tok.Value, Line: tok.Line, Col: tok.Col}, nil
+
+	case TokenQuote:
+		p.next()
+		inner, err := p.ParseExpr()
+		if err != nil {
+			return nil, err
+		}
+		return &ListExpr{
+			Elements: []Expr{
+				&SymbolExpr{Name: "quote", Line: tok.Line, Col: tok.Col},
+				inner,
+			},
+			Line: tok.Line,
+			Col:  tok.Col,
+		}, nil
 
 	case TokenLParen:
 		p.next() // consume '('

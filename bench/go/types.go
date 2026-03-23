@@ -57,6 +57,36 @@ func (v *SchemeList) String() string {
 	return "(" + strings.Join(parts, " ") + ")"
 }
 
+// SchemeEmpty represents the empty list '().
+type SchemeEmpty struct{}
+
+func (v *SchemeEmpty) String() string {
+	return "()"
+}
+
+// SchemePair is a cons cell.
+type SchemePair struct {
+	Car SchemeValue
+	Cdr SchemeValue
+}
+
+func (v *SchemePair) String() string {
+	var parts []string
+	cur := SchemeValue(v)
+	for {
+		switch c := cur.(type) {
+		case *SchemePair:
+			parts = append(parts, c.Car.String())
+			cur = c.Cdr
+		case *SchemeEmpty:
+			return "(" + strings.Join(parts, " ") + ")"
+		default:
+			// dotted pair
+			return "(" + strings.Join(parts, " ") + " . " + cur.String() + ")"
+		}
+	}
+}
+
 type SchemeVoid struct{}
 
 func (v *SchemeVoid) String() string {

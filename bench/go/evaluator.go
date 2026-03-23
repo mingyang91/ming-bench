@@ -94,6 +94,12 @@ func Eval(expr Expr, env *Env) (SchemeValue, error) {
 				return quoteExpr(e.Elements[1]), nil
 			case "lambda":
 				return evalLambda(e, env)
+			case "let":
+				return evalLet(e, env)
+			case "begin":
+				return evalBegin(e.Elements[1:], env)
+			case "cond":
+				return evalCond(e, env)
 			}
 		}
 
@@ -272,11 +278,11 @@ func quoteExpr(expr Expr) SchemeValue {
 	case *SymbolExpr:
 		return &SchemeSymbol{Name: e.Name}
 	case *ListExpr:
-		elems := make([]SchemeValue, len(e.Elements))
-		for i, el := range e.Elements {
-			elems[i] = quoteExpr(el)
+		var result SchemeValue = &SchemeEmpty{}
+		for i := len(e.Elements) - 1; i >= 0; i-- {
+			result = &SchemePair{Car: quoteExpr(e.Elements[i]), Cdr: result}
 		}
-		return &SchemeList{Elements: elems}
+		return result
 	default:
 		return &SchemeVoid{}
 	}
@@ -358,6 +364,18 @@ func init() {
 	builtins["<="] = &BuiltinProc{Name: "<=", Fn: builtinLE}
 	builtins[">="] = &BuiltinProc{Name: ">=", Fn: builtinGE}
 	builtins["not"] = &BuiltinProc{Name: "not", Fn: builtinNot}
+	builtins["cons"] = &BuiltinProc{Name: "cons", Fn: builtinCons}
+	builtins["car"] = &BuiltinProc{Name: "car", Fn: builtinCar}
+	builtins["cdr"] = &BuiltinProc{Name: "cdr", Fn: builtinCdr}
+	builtins["null?"] = &BuiltinProc{Name: "null?", Fn: builtinNullQ}
+	builtins["pair?"] = &BuiltinProc{Name: "pair?", Fn: builtinPairQ}
+	builtins["list"] = &BuiltinProc{Name: "list", Fn: builtinList}
+	builtins["length"] = &BuiltinProc{Name: "length", Fn: builtinLength}
+	builtins["append"] = &BuiltinProc{Name: "append", Fn: builtinAppend}
+	builtins["number?"] = &BuiltinProc{Name: "number?", Fn: builtinNumberQ}
+	builtins["string?"] = &BuiltinProc{Name: "string?", Fn: builtinStringQ}
+	builtins["boolean?"] = &BuiltinProc{Name: "boolean?", Fn: builtinBooleanQ}
+	builtins["symbol?"] = &BuiltinProc{Name: "symbol?", Fn: builtinSymbolQ}
 }
 
 func builtinAdd(args []SchemeValue, callExpr *ListExpr) (SchemeValue, error) {
@@ -508,10 +526,280 @@ func builtinGE(args []SchemeValue, callExpr *ListExpr) (SchemeValue, error) {
 	return &SchemeBool{Value: true}, nil
 }
 
+func evalLet(e *ListExpr, env *Env) (SchemeValue, error) {
+	if len(e.Elements) < 3 {
+		line, col := e.Pos()
+		return nil, &EvalError{Message: fmt.Sprintf("%d:%d: let: bad syntax", line, col)}
+	}
+
+	// Named let: (let name ((var init) ...) body...)
+	if sym, ok := e.Elements[1].(*SymbolExpr); ok {
+		if len(e.Elements) < 4 {
+			line, col := e.Pos()
+			return nil, &EvalError{Message: fmt.Sprintf("%d:%d: let: bad syntax", line, col)}
+		}
+		bindingsList, ok := e.Elements[2].(*ListExpr)
+		if !ok {
+			line, col := e.Pos()
+			return nil, &EvalError{Message: fmt.Sprintf("%d:%d: let: bad syntax", line, col)}
+		}
+		params := make([]string, len(bindingsList.Elements))
+		inits := make([]SchemeValue, len(bindingsList.Elements))
+		for i, b := range bindingsList.Elements {
+			pair, ok := b.(*ListExpr)
+			if !ok || len(pair.Elements) != 2 {
+				line, col := e.Pos()
+				return nil, &EvalError{Message: fmt.Sprintf("%d:%d: let: bad syntax", line, col)}
+			}
+			ps, ok := pair.Elements[0].(*SymbolExpr)
+			if !ok {
+				line, col := e.Pos()
+				return nil, &EvalError{Message: fmt.Sprintf("%d:%d: let: bad syntax", line, col)}
+			}
+			params[i] = ps.Name
+			val, err := Eval(pair.Elements[1], env)
+			if err != nil {
+				return nil, err
+			}
+			inits[i] = val
+		}
+		lam := &Lambda{Params: params, Body: e.Elements[3:], Env: env}
+		loopEnv := NewEnv(env)
+		loopEnv.Set(sym.Name, lam)
+		lam.Env = loopEnv
+		localEnv := NewEnv(loopEnv)
+		for i, p := range params {
+			localEnv.Set(p, inits[i])
+		}
+		var result SchemeValue
+		var err error
+		for _, bodyExpr := range lam.Body {
+			result, err = Eval(bodyExpr, localEnv)
+			if err != nil {
+				return nil, err
+			}
+		}
+		return result, nil
+	}
+
+	// Regular let: (let ((var init) ...) body...)
+	bindingsList, ok := e.Elements[1].(*ListExpr)
+	if !ok {
+		line, col := e.Pos()
+		return nil, &EvalError{Message: fmt.Sprintf("%d:%d: let: bad syntax", line, col)}
+	}
+
+	localEnv := NewEnv(env)
+	for _, b := range bindingsList.Elements {
+		pair, ok := b.(*ListExpr)
+		if !ok || len(pair.Elements) != 2 {
+			line, col := e.Pos()
+			return nil, &EvalError{Message: fmt.Sprintf("%d:%d: let: bad syntax", line, col)}
+		}
+		sym, ok := pair.Elements[0].(*SymbolExpr)
+		if !ok {
+			line, col := e.Pos()
+			return nil, &EvalError{Message: fmt.Sprintf("%d:%d: let: bad syntax", line, col)}
+		}
+		val, err := Eval(pair.Elements[1], env)
+		if err != nil {
+			return nil, err
+		}
+		localEnv.Set(sym.Name, val)
+	}
+
+	var result SchemeValue
+	var err error
+	for _, bodyExpr := range e.Elements[2:] {
+		result, err = Eval(bodyExpr, localEnv)
+		if err != nil {
+			return nil, err
+		}
+	}
+	return result, nil
+}
+
+func evalBegin(exprs []Expr, env *Env) (SchemeValue, error) {
+	var result SchemeValue = &SchemeVoid{}
+	var err error
+	for _, expr := range exprs {
+		result, err = Eval(expr, env)
+		if err != nil {
+			return nil, err
+		}
+	}
+	return result, nil
+}
+
+func evalCond(e *ListExpr, env *Env) (SchemeValue, error) {
+	for _, clause := range e.Elements[1:] {
+		cl, ok := clause.(*ListExpr)
+		if !ok || len(cl.Elements) < 2 {
+			line, col := e.Pos()
+			return nil, &EvalError{Message: fmt.Sprintf("%d:%d: cond: bad syntax", line, col)}
+		}
+		// Check for else clause
+		if sym, ok := cl.Elements[0].(*SymbolExpr); ok && sym.Name == "else" {
+			return evalBegin(cl.Elements[1:], env)
+		}
+		cond, err := Eval(cl.Elements[0], env)
+		if err != nil {
+			return nil, err
+		}
+		if isTruthy(cond) {
+			return evalBegin(cl.Elements[1:], env)
+		}
+	}
+	return &SchemeVoid{}, nil
+}
+
 func builtinNot(args []SchemeValue, callExpr *ListExpr) (SchemeValue, error) {
 	if len(args) != 1 {
 		line, col := callExpr.Pos()
 		return nil, &EvalError{Message: fmt.Sprintf("%d:%d: not: requires exactly 1 argument", line, col)}
 	}
 	return &SchemeBool{Value: !isTruthy(args[0])}, nil
+}
+
+func builtinCons(args []SchemeValue, callExpr *ListExpr) (SchemeValue, error) {
+	if len(args) != 2 {
+		line, col := callExpr.Pos()
+		return nil, &EvalError{Message: fmt.Sprintf("%d:%d: cons: requires exactly 2 arguments", line, col)}
+	}
+	return &SchemePair{Car: args[0], Cdr: args[1]}, nil
+}
+
+func builtinCar(args []SchemeValue, callExpr *ListExpr) (SchemeValue, error) {
+	if len(args) != 1 {
+		line, col := callExpr.Pos()
+		return nil, &EvalError{Message: fmt.Sprintf("%d:%d: car: requires exactly 1 argument", line, col)}
+	}
+	p, ok := args[0].(*SchemePair)
+	if !ok {
+		line, col := callExpr.Pos()
+		return nil, &EvalError{Message: fmt.Sprintf("%d:%d: car: expected pair", line, col)}
+	}
+	return p.Car, nil
+}
+
+func builtinCdr(args []SchemeValue, callExpr *ListExpr) (SchemeValue, error) {
+	if len(args) != 1 {
+		line, col := callExpr.Pos()
+		return nil, &EvalError{Message: fmt.Sprintf("%d:%d: cdr: requires exactly 1 argument", line, col)}
+	}
+	p, ok := args[0].(*SchemePair)
+	if !ok {
+		line, col := callExpr.Pos()
+		return nil, &EvalError{Message: fmt.Sprintf("%d:%d: cdr: expected pair", line, col)}
+	}
+	return p.Cdr, nil
+}
+
+func builtinNullQ(args []SchemeValue, callExpr *ListExpr) (SchemeValue, error) {
+	if len(args) != 1 {
+		line, col := callExpr.Pos()
+		return nil, &EvalError{Message: fmt.Sprintf("%d:%d: null?: requires exactly 1 argument", line, col)}
+	}
+	_, isEmpty := args[0].(*SchemeEmpty)
+	return &SchemeBool{Value: isEmpty}, nil
+}
+
+func builtinPairQ(args []SchemeValue, callExpr *ListExpr) (SchemeValue, error) {
+	if len(args) != 1 {
+		line, col := callExpr.Pos()
+		return nil, &EvalError{Message: fmt.Sprintf("%d:%d: pair?: requires exactly 1 argument", line, col)}
+	}
+	_, isPair := args[0].(*SchemePair)
+	return &SchemeBool{Value: isPair}, nil
+}
+
+func builtinList(args []SchemeValue, callExpr *ListExpr) (SchemeValue, error) {
+	var result SchemeValue = &SchemeEmpty{}
+	for i := len(args) - 1; i >= 0; i-- {
+		result = &SchemePair{Car: args[i], Cdr: result}
+	}
+	return result, nil
+}
+
+func builtinLength(args []SchemeValue, callExpr *ListExpr) (SchemeValue, error) {
+	if len(args) != 1 {
+		line, col := callExpr.Pos()
+		return nil, &EvalError{Message: fmt.Sprintf("%d:%d: length: requires exactly 1 argument", line, col)}
+	}
+	var count int64
+	cur := args[0]
+	for {
+		switch c := cur.(type) {
+		case *SchemePair:
+			count++
+			cur = c.Cdr
+		case *SchemeEmpty:
+			return &SchemeInt{Value: count}, nil
+		default:
+			line, col := callExpr.Pos()
+			return nil, &EvalError{Message: fmt.Sprintf("%d:%d: length: expected list", line, col)}
+		}
+	}
+}
+
+func builtinAppend(args []SchemeValue, callExpr *ListExpr) (SchemeValue, error) {
+	if len(args) == 0 {
+		return &SchemeEmpty{}, nil
+	}
+	if len(args) == 1 {
+		return args[0], nil
+	}
+	// Append all lists
+	result := args[len(args)-1]
+	for i := len(args) - 2; i >= 0; i-- {
+		result = appendList(args[i], result)
+	}
+	return result, nil
+}
+
+func appendList(lst, tail SchemeValue) SchemeValue {
+	switch l := lst.(type) {
+	case *SchemeEmpty:
+		return tail
+	case *SchemePair:
+		return &SchemePair{Car: l.Car, Cdr: appendList(l.Cdr, tail)}
+	default:
+		return tail
+	}
+}
+
+func builtinNumberQ(args []SchemeValue, callExpr *ListExpr) (SchemeValue, error) {
+	if len(args) != 1 {
+		line, col := callExpr.Pos()
+		return nil, &EvalError{Message: fmt.Sprintf("%d:%d: number?: requires exactly 1 argument", line, col)}
+	}
+	_, ok := args[0].(*SchemeInt)
+	return &SchemeBool{Value: ok}, nil
+}
+
+func builtinStringQ(args []SchemeValue, callExpr *ListExpr) (SchemeValue, error) {
+	if len(args) != 1 {
+		line, col := callExpr.Pos()
+		return nil, &EvalError{Message: fmt.Sprintf("%d:%d: string?: requires exactly 1 argument", line, col)}
+	}
+	_, ok := args[0].(*SchemeString)
+	return &SchemeBool{Value: ok}, nil
+}
+
+func builtinBooleanQ(args []SchemeValue, callExpr *ListExpr) (SchemeValue, error) {
+	if len(args) != 1 {
+		line, col := callExpr.Pos()
+		return nil, &EvalError{Message: fmt.Sprintf("%d:%d: boolean?: requires exactly 1 argument", line, col)}
+	}
+	_, ok := args[0].(*SchemeBool)
+	return &SchemeBool{Value: ok}, nil
+}
+
+func builtinSymbolQ(args []SchemeValue, callExpr *ListExpr) (SchemeValue, error) {
+	if len(args) != 1 {
+		line, col := callExpr.Pos()
+		return nil, &EvalError{Message: fmt.Sprintf("%d:%d: symbol?: requires exactly 1 argument", line, col)}
+	}
+	_, ok := args[0].(*SchemeSymbol)
+	return &SchemeBool{Value: ok}, nil
 }
