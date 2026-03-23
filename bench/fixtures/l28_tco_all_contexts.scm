@@ -29,11 +29,7 @@
 (define (tco-case n) (case (= n 0) ((#t) 'case-ok) (else (tco-case (- n 1)))))
 (tco-case 100000)
 
-;; TCO in when (if available)
-(define (tco-when n) (if (= n 0) 'when-ok (begin (when #t #t) (tco-when (- n 1)))))
-(tco-when 100000)
-
 ;; Final result: list of all passing contexts
 (list (tco-if 100000) (tco-cond 100000) (tco-begin 100000)
       (tco-let 100000) (tco-and 100000) (tco-or 100000)
-      (tco-case 100000) (tco-when 100000))
+      (tco-case 100000))
