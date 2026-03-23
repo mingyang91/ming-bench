@@ -42,9 +42,24 @@ public class Evaluator {
     @FunctionalInterface private interface Cont { Bounce apply(Object value) throws EvalError; }
     @FunctionalInterface private interface ArgsCont { Bounce apply(List<Object> args) throws EvalError; }
 
+    private static class WindEntry {
+        final Object inThunk;
+        final Object outThunk;
+        WindEntry(Object inThunk, Object outThunk) {
+            this.inThunk = inThunk;
+            this.outThunk = outThunk;
+        }
+    }
+
+    private List<WindEntry> windStack = new ArrayList<>();
+
     private static class Continuation {
         final Cont k;
-        Continuation(Cont k) { this.k = k; }
+        final List<WindEntry> savedWind;
+        Continuation(Cont k, List<WindEntry> savedWind) {
+            this.k = k;
+            this.savedWind = savedWind;
+        }
     }
 
     private static final Object CALL_CC = new Object() {
@@ -595,6 +610,10 @@ public class Evaluator {
                         List<Object> lists = new ArrayList<>(args.subList(1, args.size()));
                         return cpsMap(mapFn, lists, k);
                     }
+                    if (proc instanceof String p && p.equals("dynamic-wind")) {
+                        if (args.size() != 3) throw posError("dynamic-wind: expected 3 arguments");
+                        return cpsDynamicWind(args.get(0), args.get(1), args.get(2), k);
+                    }
                     return applyProc(proc, args, k);
                 });
             }));
@@ -1122,12 +1141,13 @@ public class Evaluator {
     private Bounce applyProc(Object proc, List<Object> args, Cont k) throws EvalError {
         if (proc == CALL_CC) {
             if (args.size() != 1) throw posError("call/cc: expected 1 argument");
-            Continuation captured = new Continuation(k);
+            Continuation captured = new Continuation(k, new ArrayList<>(windStack));
             return applyProc(args.get(0), List.of(captured), k);
         }
         if (proc instanceof Continuation cont) {
             if (args.size() != 1) throw posError("continuation: expected 1 argument");
-            return cont.k.apply(args.get(0));
+            Object val = args.get(0);
+            return doWindTransition(windStack, cont.savedWind, () -> cont.k.apply(val));
         }
         if (proc instanceof Lambda lambda) {
             if (lambda.restParam != null) {
@@ -1181,7 +1201,7 @@ public class Evaluator {
             "char-alphabetic?", "char-numeric?", "char-upcase", "char-downcase",
             "char=?", "char<?",
             "string=?", "string<?", "string-ci=?", "string-upcase", "string-downcase",
-            "map"
+            "map", "dynamic-wind", "reverse"
     );
 
     private boolean isPrimitive(String name) {
@@ -1581,6 +1601,14 @@ public class Evaluator {
                 yield new SchemeString(s.value().toLowerCase());
             }
             case "map" -> throw posError("map: handled in eval");
+            case "dynamic-wind" -> throw posError("dynamic-wind: handled in eval");
+            case "reverse" -> {
+                requireArgCount(args, 1, "reverse");
+                Object lst = args.get(0);
+                Object result = NIL;
+                while (lst instanceof Pair p) { result = new Pair(p.car, result); lst = p.cdr; }
+                yield result;
+            }
             default -> throw posError("unbound variable: " + proc);
         };
     }
@@ -1603,6 +1631,61 @@ public class Evaluator {
                 k.apply(new Pair(headVal, tailVal))
             ))
         ));
+    }
+
+    private Bounce cpsDynamicWind(Object inThunk, Object bodyThunk, Object outThunk, Cont k) throws EvalError {
+        // 1. Call in-thunk
+        return new More(() -> applyProc(inThunk, List.of(), inResult -> {
+            // 2. Push wind entry
+            WindEntry entry = new WindEntry(inThunk, outThunk);
+            windStack.add(entry);
+            // 3. Call body-thunk
+            return new More(() -> applyProc(bodyThunk, List.of(), bodyResult -> {
+                // 4. Pop wind entry
+                windStack.remove(windStack.size() - 1);
+                // 5. Call out-thunk
+                return new More(() -> applyProc(outThunk, List.of(), outResult -> {
+                    // 6. Return body result
+                    return k.apply(bodyResult);
+                }));
+            }));
+        }));
+    }
+
+    private Bounce doWindTransition(List<WindEntry> from, List<WindEntry> to, Thunk after) throws EvalError {
+        // Find common prefix length (by identity)
+        int commonLen = 0;
+        int minLen = Math.min(from.size(), to.size());
+        while (commonLen < minLen && from.get(commonLen) == to.get(commonLen)) {
+            commonLen++;
+        }
+        // Unwind: run out-thunks for from[commonLen..end] in reverse order
+        // Then rewind: run in-thunks for to[commonLen..end] in order
+        return doUnwind(from, from.size() - 1, commonLen, to, after);
+    }
+
+    private Bounce doUnwind(List<WindEntry> from, int idx, int commonLen, List<WindEntry> to, Thunk after) throws EvalError {
+        if (idx < commonLen) {
+            // Done unwinding, start rewinding
+            windStack = new ArrayList<>(to.subList(0, commonLen));
+            return doRewind(to, commonLen, after);
+        }
+        WindEntry entry = from.get(idx);
+        windStack = new ArrayList<>(from.subList(0, idx));
+        return new More(() -> applyProc(entry.outThunk, List.of(), ignored ->
+            doUnwind(from, idx - 1, commonLen, to, after)));
+    }
+
+    private Bounce doRewind(List<WindEntry> to, int idx, Thunk after) throws EvalError {
+        if (idx >= to.size()) {
+            // Done rewinding, execute the continuation
+            return after.run();
+        }
+        WindEntry entry = to.get(idx);
+        return new More(() -> applyProc(entry.inThunk, List.of(), ignored -> {
+            windStack.add(entry);
+            return doRewind(to, idx + 1, after);
+        }));
     }
 
     private Object[] handleApply(List<Object> args) throws EvalError {
