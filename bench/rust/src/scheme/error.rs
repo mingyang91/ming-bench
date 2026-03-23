@@ -21,6 +21,9 @@ pub enum EvalError {
     #[error("not a procedure: {value}")]
     NotAProcedure { value: String },
 
+    #[error("string is immutable")]
+    ImmutableString,
+
     #[error("{line}:{col}: {inner}")]
     WithPosition {
         line: usize,

@@ -14,6 +14,8 @@ const BUILTINS: &[&str] = &[
     "string->number", "number->string",
     "symbol->string", "string->symbol",
     "string-ref", "string-copy",
+    "string->list", "list->string",
+    "char->integer", "integer->char",
     "apply", "map",
     "call/cc", "call-with-current-continuation",
     "eq?", "abs", "modulo", "remainder", "quotient", "min", "max", "expt",
@@ -408,23 +410,6 @@ impl Machine {
                 });
                 Ok(Control::Eval(char_expr, env))
             }
-            Frame::Map { func, lists, mut results, span } => {
-                results.push(val);
-                if lists[0].is_empty() {
-                    Ok(Control::Continue(Value::List(results, None)))
-                } else {
-                    let mut next_args = Vec::with_capacity(lists.len());
-                    let mut remaining = Vec::with_capacity(lists.len());
-                    for mut lst in lists {
-                        next_args.push(lst.remove(0));
-                        remaining.push(lst);
-                    }
-                    self.kont.push(Frame::Map {
-                        func: func.clone(), lists: remaining, results, span,
-                    });
-                    Ok(Control::Apply(func, next_args, span))
-                }
-            }
             Frame::StringSetChar { var_name, index, env, span } => {
                 let Value::Char(ch) = val else {
                     return Err(EvalError::TypeMismatch {
@@ -451,6 +436,23 @@ impl Machine {
                     .set(&var_name, Value::String(new_string))
                     .map_err(|e| e.at(span))?;
                 Ok(Control::Continue(Value::Void))
+            }
+            Frame::Map { func, lists, mut results, span } => {
+                results.push(val);
+                if lists[0].is_empty() {
+                    Ok(Control::Continue(Value::List(results, None)))
+                } else {
+                    let mut next_args = Vec::with_capacity(lists.len());
+                    let mut remaining = Vec::with_capacity(lists.len());
+                    for mut lst in lists {
+                        next_args.push(lst.remove(0));
+                        remaining.push(lst);
+                    }
+                    self.kont.push(Frame::Map {
+                        func: func.clone(), lists: remaining, results, span,
+                    });
+                    Ok(Control::Apply(func, next_args, span))
+                }
             }
         }
     }
@@ -883,9 +885,7 @@ impl Machine {
             return Err(EvalError::WrongArgCount { expected: 3, got: args.len() }.at(span));
         }
         let Value::Symbol(var_name, _) = &args[0] else {
-            return Err(EvalError::TypeMismatch {
-                expected: "symbol".into(), got: format!("{}", args[0]),
-            }.at(span));
+            return Err(EvalError::ImmutableString.at(span));
         };
         self.kont.push(Frame::StringSetIdx {
             var_name: var_name.clone(), char_expr: args[2].clone(),
@@ -1330,7 +1330,32 @@ fn apply_builtin(
         | "string-upcase" | "string-downcase" => apply_char_string_cmp_builtin(name, args),
         "string-append" | "string-length" | "substring" | "string->number"
         | "number->string" | "symbol->string" | "string->symbol" | "string-ref"
-        | "string-copy" => apply_string_builtin(name, args),
+        | "string-copy" | "string->list" | "list->string" => apply_string_builtin(name, args),
+        "char->integer" => {
+            if args.len() != 1 {
+                return Err(EvalError::WrongArgCount { expected: 1, got: args.len() });
+            }
+            let Value::Char(c) = &args[0] else {
+                return Err(EvalError::TypeMismatch {
+                    expected: "char".into(), got: format!("{}", args[0]),
+                });
+            };
+            Ok(Value::Int(*c as i64))
+        }
+        "integer->char" => {
+            if args.len() != 1 {
+                return Err(EvalError::WrongArgCount { expected: 1, got: args.len() });
+            }
+            let Value::Int(n) = &args[0] else {
+                return Err(EvalError::TypeMismatch {
+                    expected: "integer".into(), got: format!("{}", args[0]),
+                });
+            };
+            let c = char::from_u32(*n as u32).ok_or_else(|| EvalError::TypeMismatch {
+                expected: "valid Unicode code point".into(), got: format!("{n}"),
+            })?;
+            Ok(Value::Char(c))
+        }
         _ => Err(EvalError::UnboundVariable { name: name.into() }),
     }
 }
@@ -1772,6 +1797,54 @@ fn apply_string_builtin(name: &str, args: &[Value]) -> Result<Value, EvalError> 
                 got: format!("{idx}"),
             })?;
             Ok(Value::Char(ch))
+        }
+        "string->list" => {
+            if args.len() != 1 {
+                return Err(EvalError::WrongArgCount { expected: 1, got: args.len() });
+            }
+            let Value::String(s) = &args[0] else {
+                return Err(EvalError::TypeMismatch {
+                    expected: "string".into(), got: format!("{}", args[0]),
+                });
+            };
+            let chars: Vec<Value> = s.chars().map(Value::Char).collect();
+            Ok(Value::List(chars, None))
+        }
+        "list->string" => {
+            if args.len() != 1 {
+                return Err(EvalError::WrongArgCount { expected: 1, got: args.len() });
+            }
+            let elems = match &args[0] {
+                Value::List(elems, _) => elems.clone(),
+                Value::Pair(_, _) => {
+                    let mut elems = Vec::new();
+                    let mut cur = args[0].clone();
+                    loop {
+                        match cur {
+                            Value::Pair(car, cdr) => {
+                                elems.push(*car);
+                                cur = *cdr;
+                            }
+                            Value::List(ref items, _) if items.is_empty() => break,
+                            _ => break,
+                        }
+                    }
+                    elems
+                }
+                other => return Err(EvalError::TypeMismatch {
+                    expected: "list".into(), got: format!("{other}"),
+                }),
+            };
+            let mut result = String::new();
+            for v in &elems {
+                let Value::Char(c) = v else {
+                    return Err(EvalError::TypeMismatch {
+                        expected: "char".into(), got: format!("{v}"),
+                    });
+                };
+                result.push(*c);
+            }
+            Ok(Value::String(result))
         }
         other => Err(EvalError::UnboundVariable { name: other.into() }),
     }
