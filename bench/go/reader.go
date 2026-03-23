@@ -278,6 +278,31 @@ func (r *reader) readHash() (*Value, error) {
 		return makeBool(true), nil
 	case 'f':
 		return makeBool(false), nil
+	case '\\':
+		// Character literal: #\x or #\space, #\newline, etc.
+		if r.atEnd() {
+			return nil, &EvalError{Message: "unexpected end of input in character literal", Line: r.line, Col: r.col}
+		}
+		c := r.next()
+		// Check for named characters
+		if !r.atEnd() && !isDelimiter(r.peek()) {
+			// Multi-character name like #\space, #\newline
+			name := string(c)
+			for !r.atEnd() && !isDelimiter(r.peek()) {
+				name += string(r.next())
+			}
+			switch strings.ToLower(name) {
+			case "space":
+				return makeChar(' '), nil
+			case "newline":
+				return makeChar('\n'), nil
+			case "tab":
+				return makeChar('\t'), nil
+			default:
+				return nil, &EvalError{Message: fmt.Sprintf("unknown character name: #\\%s", name), Line: r.line, Col: r.col}
+			}
+		}
+		return makeChar(c), nil
 	default:
 		return nil, &EvalError{Message: fmt.Sprintf("unknown hash literal: #%c", ch), Line: r.line, Col: r.col}
 	}

@@ -61,7 +61,7 @@ func makeLambda(params []string, body []*Value, closure *Env) *Value {
 // eval evaluates a single expression in the given environment.
 func eval(expr *Value, env *Env) (*Value, error) {
 	switch expr.Type {
-	case TypeInteger, TypeBoolean, TypeString:
+	case TypeInteger, TypeBoolean, TypeString, TypeChar:
 		return expr, nil
 	case TypeSymbol:
 		v, ok := env.get(expr.Str)
@@ -636,6 +636,25 @@ func builtinEnv(out *strings.Builder) *Env {
 				return nil, &EvalError{Message: "'string-ref' index out of range"}
 			}
 			return makeChar(runes[idx]), nil
+		},
+		"string-copy": func(args []*Value) (*Value, error) {
+			if len(args) != 1 || args[0].Type != TypeString {
+				return nil, &EvalError{Message: "'string-copy' expects a string"}
+			}
+			return makeString(args[0].Str), nil
+		},
+		"string-set!": func(args []*Value) (*Value, error) {
+			if len(args) != 3 || args[0].Type != TypeString || args[1].Type != TypeInteger || args[2].Type != TypeChar {
+				return nil, &EvalError{Message: "'string-set!' expects a string, an integer, and a character"}
+			}
+			runes := []rune(args[0].Str)
+			idx := int(args[1].Int)
+			if idx < 0 || idx >= len(runes) {
+				return nil, &EvalError{Message: "'string-set!' index out of range"}
+			}
+			runes[idx] = rune(args[2].Int)
+			args[0].Str = string(runes)
+			return voidValue, nil
 		},
 		"char?": func(args []*Value) (*Value, error) {
 			if len(args) != 1 {
