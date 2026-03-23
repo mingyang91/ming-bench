@@ -335,7 +335,7 @@ const SPECIAL_FORMS = new Set([
     'if', 'define', 'lambda', 'and', 'or', 'let', 'let*', 'begin',
     'set!', 'string-set!', 'cond', 'quote', 'define-syntax',
     'syntax-case', 'syntax', 'with-syntax', 'letrec', 'letrec*',
-    'case', 'do', 'guard', 'define-record-type',
+    'case', 'do', 'guard', 'define-record-type', 'case-lambda',
 ]);
 let syntaxCaseStack = [];
 let macroUseSiteEnvStack = [];
@@ -990,7 +990,7 @@ function makeGlobalEnv() {
     });
     defBuiltin('procedure?', (args) => ({
         tag: 'boolean',
-        value: args[0].tag === 'lambda' || args[0].tag === 'builtin' || args[0].tag === 'continuation',
+        value: args[0].tag === 'lambda' || args[0].tag === 'builtin' || args[0].tag === 'continuation' || args[0].tag === 'caseLambda',
     }));
     // L13: Numeric utilities
     defBuiltin('abs', (args) => ({ tag: 'number', value: Math.abs(expectNumber(args[0], 'abs')) }));
@@ -1414,6 +1414,30 @@ function applyCPS(proc, args, k, pos) {
         }
         return evaluateSeqCPS(proc.body, 0, callEnv, k);
     }
+    if (proc.tag === 'caseLambda') {
+        for (const clause of proc.clauses) {
+            if (clause.rest !== undefined) {
+                if (args.length >= clause.params.length) {
+                    const callEnv = new Env(proc.env);
+                    for (let i = 0; i < clause.params.length; i++) {
+                        callEnv.define(clause.params[i], args[i]);
+                    }
+                    callEnv.define(clause.rest, listToPairs(args.slice(clause.params.length)));
+                    return evaluateSeqCPS(clause.body, 0, callEnv, k);
+                }
+            }
+            else {
+                if (args.length === clause.params.length) {
+                    const callEnv = new Env(proc.env);
+                    for (let i = 0; i < clause.params.length; i++) {
+                        callEnv.define(clause.params[i], args[i]);
+                    }
+                    return evaluateSeqCPS(clause.body, 0, callEnv, k);
+                }
+            }
+        }
+        throw new EvalError(`${posStr(pos)}case-lambda: no matching clause for ${args.length} arguments`);
+    }
     if (proc.tag === 'continuation') {
         let val;
         if (args.length === 1) {
@@ -1494,6 +1518,20 @@ function evaluateCPS(expr, env, k) {
             const { params, rest } = parseDotParams(paramList.value);
             const lam = { tag: 'lambda', params, rest, body: items.slice(2), env };
             return callK(k, lam);
+        }
+        if (op === 'case-lambda') {
+            const clauses = items.slice(1).map(clause => {
+                if (clause.tag !== 'list')
+                    throw new EvalError('case-lambda: bad clause');
+                const paramList = clause.value[0];
+                const body = clause.value.slice(1);
+                if (paramList.tag === 'symbol') {
+                    return { params: [], rest: paramList.value, body };
+                }
+                const { params, rest } = parseDotParams(paramList.value);
+                return { params, rest, body };
+            });
+            return callK(k, { tag: 'caseLambda', clauses, env });
         }
         if (op === 'and') {
             if (items.length === 1)
@@ -2011,6 +2049,7 @@ function writeVal(val, seen) {
         }
         case 'vector': return `#(${val.value.map(v => writeVal(v, seen)).join(' ')})`;
         case 'lambda': return '#<procedure>';
+        case 'caseLambda': return '#<procedure>';
         case 'builtin': return `#<builtin:${val.name}>`;
         case 'continuation': return '#<continuation>';
         case 'void': return '';
