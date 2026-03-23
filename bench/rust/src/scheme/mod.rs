@@ -179,6 +179,7 @@ enum Value {
         def_env: Env,
     },
     Void,
+    Values(Vec<Value>),
 }
 
 impl std::fmt::Debug for Value {
@@ -198,6 +199,7 @@ impl std::fmt::Debug for Value {
             Value::Continuation(_) => write!(f, "Continuation"),
             Value::Macro { .. } => write!(f, "Macro"),
             Value::Void => write!(f, "Void"),
+            Value::Values(vs) => write!(f, "Values({:?})", vs),
         }
     }
 }
@@ -228,6 +230,7 @@ impl Value {
             Value::Lambda { .. } | Value::Builtin(_) | Value::CallCC | Value::Macro { .. } => "#<procedure>".to_string(),
             Value::Continuation(_) => "#<continuation>".to_string(),
             Value::Void => "".to_string(),
+            Value::Values(_) => "".to_string(),
         }
     }
 
@@ -585,6 +588,27 @@ fn eval_inner(expr: &Expr, env: &Env) -> Result<Trampoline, EvalError> {
                         return result.map(Trampoline::Done);
                     }
                     "guard" => return eval_guard(&elems[1..], env, span),
+                    "values" => {
+                        let vals: Result<Vec<Value>, _> = elems[1..].iter().map(|a| eval(a, env)).collect();
+                        let vals = vals?;
+                        return Ok(Trampoline::Done(match vals.len() {
+                            1 => vals.into_iter().next().unwrap(),
+                            _ => Value::Values(vals),
+                        }));
+                    }
+                    "call-with-values" => {
+                        if elems.len() != 3 {
+                            return Err(EvalError::Arity("call-with-values requires 2 arguments".into()).with_position(span.line, span.col));
+                        }
+                        let producer = eval(&elems[1], env)?;
+                        let consumer = eval(&elems[2], env)?;
+                        let produced = apply_value(&producer, &[])?;
+                        let args = match produced {
+                            Value::Values(vs) => vs,
+                            other => vec![other],
+                        };
+                        return apply_tc(&consumer, &args);
+                    }
                     "dynamic-wind" => {
                         if elems.len() != 4 {
                             return Err(EvalError::Arity("dynamic-wind requires 3 arguments".into()).with_position(span.line, span.col));
