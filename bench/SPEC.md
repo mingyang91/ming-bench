@@ -107,3 +107,12 @@ Combined use of all features: dynamic-wind + guard for resource cleanup on excep
 ### Level 26 — Real-World Integration Stress
 All features from L1-L25 are exercised together by large (1000+ line) real-world Scheme programs. No new language features — this level tests whether your interpreter handles real code at scale. Programs include a type inferencer (dynamic, ~2,300 lines) and a complete macro expander (alexpander, ~1,950 lines) that stress closures, continuations, mutation, vectors, and macros simultaneously.
 
+
+### Level 27 — Step-Limited Evaluation
+Implement `eval_str_with_limit(input, max_steps)` that evaluates Scheme code with a step budget. Each "step" is one eval dispatch (one expression evaluated). If the budget is exhausted, return an error. This tests whether your evaluator has a central dispatch loop — trampoline-based interpreters add one counter check; deeply recursive interpreters must thread the counter through every call site.
+
+Tests:
+- Normal evaluation within budget succeeds.
+- Infinite loops (`(let loop () (loop))`) are caught within the step limit.
+- Finite loops that exceed a small budget return a step-limit error.
+- The step counter must be precise enough that the same program always exhausts at the same limit (±10% tolerance for non-deterministic dispatch).

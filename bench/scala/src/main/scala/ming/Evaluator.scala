@@ -178,6 +178,22 @@ object Evaluator:
       catch case jump: ContinuationJump => handleContinuationJump(jump)
     formatResult(result)
 
+  /** Evaluate with a step limit. Throws EvalError if budget is exhausted. */
+  def evalStrWithLimit(input: String, maxSteps: Int): String =
+    val output = StringBuilder()
+    val exprs  = Parser.parse(input)
+    if exprs.isEmpty then throw new EvalError("no expressions")
+    val env = makeGlobalEnv(output)
+    ContinuationManager.reset()
+    SyntaxCase.reset()
+    Interpreter.setStepLimit(maxSteps)
+    try
+      val result =
+        try evalExprsSequentially(exprs, env)
+        catch case jump: ContinuationJump => handleContinuationJump(jump)
+      formatResult(result)
+    finally Interpreter.clearStepLimit()
+
   /** Evaluate Scheme expressions and return both the result string and any captured output from display/write/newline.
     */
   def evalStrWithOutput(input: String): (String, String) =
