@@ -573,6 +573,12 @@ public class Evaluator {
                         List<Object> newArgs = (List<Object>) applyResult[1];
                         return applyProc(applyResult[0], newArgs, k);
                     }
+                    if (proc instanceof String p && p.equals("map")) {
+                        if (args.size() < 2) throw posError("map: expected at least 2 arguments");
+                        Object mapFn = args.get(0);
+                        List<Object> lists = new ArrayList<>(args.subList(1, args.size()));
+                        return cpsMap(mapFn, lists, k);
+                    }
                     return applyProc(proc, args, k);
                 });
             }));
@@ -887,7 +893,15 @@ public class Evaluator {
             "string-ref", "char?",
             "string-set!", "string-copy",
             "apply", "procedure?",
-            "call/cc", "call-with-current-continuation"
+            "call/cc", "call-with-current-continuation",
+            "abs", "modulo", "remainder", "quotient", "min", "max", "expt",
+            "zero?", "positive?", "negative?", "odd?", "even?",
+            "list-ref", "list-tail", "list?", "assoc",
+            "equal?", "eq?",
+            "char-alphabetic?", "char-numeric?", "char-upcase", "char-downcase",
+            "char=?", "char<?",
+            "string=?", "string<?", "string-ci=?", "string-upcase", "string-downcase",
+            "map"
     );
 
     private boolean isPrimitive(String name) {
@@ -1044,8 +1058,187 @@ public class Evaluator {
                 if (!(args.get(0) instanceof SchemeString s)) throw posError("string-copy: expected string");
                 yield new SchemeString(s.value());
             }
+            case "abs" -> {
+                requireArgCount(args, 1, "abs");
+                yield Math.abs(requireLong(args.get(0), "abs"));
+            }
+            case "modulo" -> {
+                requireArgCount(args, 2, "modulo");
+                long a = requireLong(args.get(0), "modulo");
+                long b = requireLong(args.get(1), "modulo");
+                yield Math.floorMod(a, b);
+            }
+            case "remainder" -> {
+                requireArgCount(args, 2, "remainder");
+                long a = requireLong(args.get(0), "remainder");
+                long b = requireLong(args.get(1), "remainder");
+                yield a % b;
+            }
+            case "quotient" -> {
+                requireArgCount(args, 2, "quotient");
+                long a = requireLong(args.get(0), "quotient");
+                long b = requireLong(args.get(1), "quotient");
+                long q = a / b;
+                // truncate toward zero (Java default for long division)
+                yield q;
+            }
+            case "min" -> {
+                if (args.isEmpty()) throw posError("min: expected at least 1 argument");
+                long result = requireLong(args.get(0), "min");
+                for (int i = 1; i < args.size(); i++) result = Math.min(result, requireLong(args.get(i), "min"));
+                yield result;
+            }
+            case "max" -> {
+                if (args.isEmpty()) throw posError("max: expected at least 1 argument");
+                long result = requireLong(args.get(0), "max");
+                for (int i = 1; i < args.size(); i++) result = Math.max(result, requireLong(args.get(i), "max"));
+                yield result;
+            }
+            case "expt" -> {
+                requireArgCount(args, 2, "expt");
+                long base = requireLong(args.get(0), "expt");
+                long exp = requireLong(args.get(1), "expt");
+                long result = 1;
+                for (long i = 0; i < exp; i++) result *= base;
+                yield result;
+            }
+            case "zero?" -> { requireArgCount(args, 1, "zero?"); yield requireLong(args.get(0), "zero?") == 0; }
+            case "positive?" -> { requireArgCount(args, 1, "positive?"); yield requireLong(args.get(0), "positive?") > 0; }
+            case "negative?" -> { requireArgCount(args, 1, "negative?"); yield requireLong(args.get(0), "negative?") < 0; }
+            case "odd?" -> { requireArgCount(args, 1, "odd?"); yield requireLong(args.get(0), "odd?") % 2 != 0; }
+            case "even?" -> { requireArgCount(args, 1, "even?"); yield requireLong(args.get(0), "even?") % 2 == 0; }
+            case "list-ref" -> {
+                requireArgCount(args, 2, "list-ref");
+                Object lst = args.get(0);
+                int idx = (int) requireLong(args.get(1), "list-ref");
+                for (int i = 0; i < idx; i++) {
+                    if (!(lst instanceof Pair p)) throw posError("list-ref: index out of range");
+                    lst = p.cdr;
+                }
+                if (!(lst instanceof Pair p)) throw posError("list-ref: index out of range");
+                yield p.car;
+            }
+            case "list-tail" -> {
+                requireArgCount(args, 2, "list-tail");
+                Object lst = args.get(0);
+                int idx = (int) requireLong(args.get(1), "list-tail");
+                for (int i = 0; i < idx; i++) {
+                    if (!(lst instanceof Pair p)) throw posError("list-tail: index out of range");
+                    lst = p.cdr;
+                }
+                yield lst;
+            }
+            case "list?" -> {
+                requireArgCount(args, 1, "list?");
+                Object lst = args.get(0);
+                while (lst instanceof Pair p) lst = p.cdr;
+                yield lst == NIL;
+            }
+            case "assoc" -> {
+                requireArgCount(args, 2, "assoc");
+                Object key = args.get(0);
+                Object alist = args.get(1);
+                while (alist instanceof Pair p) {
+                    if (!(p.car instanceof Pair entry)) throw posError("assoc: not an alist");
+                    if (schemeEqual(key, entry.car)) yield (Object) p.car;
+                    alist = p.cdr;
+                }
+                yield Boolean.FALSE;
+            }
+            case "equal?" -> {
+                requireArgCount(args, 2, "equal?");
+                yield schemeEqual(args.get(0), args.get(1));
+            }
+            case "eq?" -> {
+                requireArgCount(args, 2, "eq?");
+                Object a = args.get(0), b = args.get(1);
+                if (a instanceof Long la && b instanceof Long lb) yield la.equals(lb);
+                if (a instanceof String && b instanceof String) yield a.equals(b);
+                yield a == b;
+            }
+            case "char-alphabetic?" -> {
+                requireArgCount(args, 1, "char-alphabetic?");
+                if (!(args.get(0) instanceof SchemeChar c)) throw posError("char-alphabetic?: expected char");
+                yield Character.isLetter(c.value());
+            }
+            case "char-numeric?" -> {
+                requireArgCount(args, 1, "char-numeric?");
+                if (!(args.get(0) instanceof SchemeChar c)) throw posError("char-numeric?: expected char");
+                yield Character.isDigit(c.value());
+            }
+            case "char-upcase" -> {
+                requireArgCount(args, 1, "char-upcase");
+                if (!(args.get(0) instanceof SchemeChar c)) throw posError("char-upcase: expected char");
+                yield new SchemeChar(Character.toUpperCase(c.value()));
+            }
+            case "char-downcase" -> {
+                requireArgCount(args, 1, "char-downcase");
+                if (!(args.get(0) instanceof SchemeChar c)) throw posError("char-downcase: expected char");
+                yield new SchemeChar(Character.toLowerCase(c.value()));
+            }
+            case "char=?" -> {
+                requireArgCount(args, 2, "char=?");
+                if (!(args.get(0) instanceof SchemeChar a)) throw posError("char=?: expected char");
+                if (!(args.get(1) instanceof SchemeChar b)) throw posError("char=?: expected char");
+                yield a.value() == b.value();
+            }
+            case "char<?" -> {
+                requireArgCount(args, 2, "char<?");
+                if (!(args.get(0) instanceof SchemeChar a)) throw posError("char<?: expected char");
+                if (!(args.get(1) instanceof SchemeChar b)) throw posError("char<?: expected char");
+                yield a.value() < b.value();
+            }
+            case "string=?" -> {
+                requireArgCount(args, 2, "string=?");
+                if (!(args.get(0) instanceof SchemeString a)) throw posError("string=?: expected string");
+                if (!(args.get(1) instanceof SchemeString b)) throw posError("string=?: expected string");
+                yield a.value().equals(b.value());
+            }
+            case "string<?" -> {
+                requireArgCount(args, 2, "string<?");
+                if (!(args.get(0) instanceof SchemeString a)) throw posError("string<?: expected string");
+                if (!(args.get(1) instanceof SchemeString b)) throw posError("string<?: expected string");
+                yield a.value().compareTo(b.value()) < 0;
+            }
+            case "string-ci=?" -> {
+                requireArgCount(args, 2, "string-ci=?");
+                if (!(args.get(0) instanceof SchemeString a)) throw posError("string-ci=?: expected string");
+                if (!(args.get(1) instanceof SchemeString b)) throw posError("string-ci=?: expected string");
+                yield a.value().equalsIgnoreCase(b.value());
+            }
+            case "string-upcase" -> {
+                requireArgCount(args, 1, "string-upcase");
+                if (!(args.get(0) instanceof SchemeString s)) throw posError("string-upcase: expected string");
+                yield new SchemeString(s.value().toUpperCase());
+            }
+            case "string-downcase" -> {
+                requireArgCount(args, 1, "string-downcase");
+                if (!(args.get(0) instanceof SchemeString s)) throw posError("string-downcase: expected string");
+                yield new SchemeString(s.value().toLowerCase());
+            }
+            case "map" -> throw posError("map: handled in eval");
             default -> throw posError("unbound variable: " + proc);
         };
+    }
+
+    private Bounce cpsMap(Object fn, List<Object> lists, Cont k) throws EvalError {
+        // Check if any list is empty
+        for (Object lst : lists) {
+            if (lst == NIL) return k.apply(NIL);
+        }
+        // Extract cars and cdrs
+        List<Object> cars = new ArrayList<>();
+        List<Object> cdrs = new ArrayList<>();
+        for (Object lst : lists) {
+            if (!(lst instanceof Pair p)) throw posError("map: expected list");
+            cars.add(p.car);
+            cdrs.add(p.cdr);
+        }
+        return new More(() -> applyProc(fn, cars, headVal ->
+            new More(() -> cpsMap(fn, cdrs, tailVal ->
+                k.apply(new Pair(headVal, tailVal))
+            ))
+        ));
     }
 
     private Object[] handleApply(List<Object> args) throws EvalError {
@@ -1064,6 +1257,17 @@ public class Evaluator {
         if (a == NIL) return b;
         if (!(a instanceof Pair p)) throw posError("append: not a proper list");
         return new Pair(p.car, appendTwo(p.cdr, b));
+    }
+
+    private boolean schemeEqual(Object a, Object b) {
+        if (a == b) return true;
+        if (a instanceof Long la && b instanceof Long lb) return la.equals(lb);
+        if (a instanceof Boolean ba && b instanceof Boolean bb) return ba.equals(bb);
+        if (a instanceof String sa && b instanceof String sb) return sa.equals(sb);
+        if (a instanceof SchemeString sa && b instanceof SchemeString sb) return sa.value().equals(sb.value());
+        if (a instanceof SchemeChar ca && b instanceof SchemeChar cb) return ca.value() == cb.value();
+        if (a instanceof Pair pa && b instanceof Pair pb) return schemeEqual(pa.car, pb.car) && schemeEqual(pa.cdr, pb.cdr);
+        return false;
     }
 
     private boolean isFalse(Object val) {
@@ -1093,7 +1297,14 @@ public class Evaluator {
         if (val instanceof Long l) return l.toString();
         if (val instanceof Boolean b) return b ? "#t" : "#f";
         if (val instanceof SchemeString s) return "\"" + s.value() + "\"";
-        if (val instanceof SchemeChar c) return "#\\" + c.value();
+        if (val instanceof SchemeChar c) {
+            return switch (c.value()) {
+                case ' ' -> "#\\space";
+                case '\n' -> "#\\newline";
+                case '\t' -> "#\\tab";
+                default -> "#\\" + c.value();
+            };
+        }
         if (val == NIL) return "()";
         if (val instanceof Pair) {
             StringBuilder sb = new StringBuilder("(");
