@@ -149,6 +149,26 @@ fn match_one(
             ExprKind::List(ielems) => match_seq(pelems, ielems, literals, bindings),
             _ => false,
         },
+        ExprKind::DottedList(pelems, tail_pat) => {
+            // Match a dotted list pattern like (a b . rest)
+            // Input must be a list with at least pelems.len() elements
+            match &inp.kind {
+                ExprKind::List(ielems) if ielems.len() >= pelems.len() => {
+                    for (p, i) in pelems.iter().zip(ielems.iter()) {
+                        if !match_one(p, i, literals, bindings) {
+                            return false;
+                        }
+                    }
+                    let rest_elems: Vec<Expr> = ielems[pelems.len()..].to_vec();
+                    let rest_expr = Expr {
+                        kind: ExprKind::List(rest_elems),
+                        span: inp.span,
+                    };
+                    match_one(tail_pat, &rest_expr, literals, bindings)
+                }
+                _ => false,
+            }
+        }
         ExprKind::Boolean(b) => matches!(&inp.kind, ExprKind::Boolean(b2) if b == b2),
         ExprKind::Integer(n) => matches!(&inp.kind, ExprKind::Integer(n2) if n == n2),
         ExprKind::Float(f) => matches!(&inp.kind, ExprKind::Float(f2) if f == f2),
@@ -173,6 +193,12 @@ fn collect_pvars(pat: &Expr, literals: &[String], out: &mut Vec<String>) {
             for e in elems {
                 collect_pvars(e, literals, out);
             }
+        }
+        ExprKind::DottedList(elems, tail) => {
+            for e in elems {
+                collect_pvars(e, literals, out);
+            }
+            collect_pvars(tail, literals, out);
         }
         _ => {}
     }
@@ -238,6 +264,12 @@ fn classify_symbols(
                 classify_symbols(e, bindings, def_env, free_vars, introduced);
             }
         }
+        ExprKind::DottedList(elems, tail) => {
+            for e in elems {
+                classify_symbols(e, bindings, def_env, free_vars, introduced);
+            }
+            classify_symbols(tail, bindings, def_env, free_vars, introduced);
+        }
         _ => {}
     }
 }
@@ -282,6 +314,16 @@ fn subst(
             }
             Expr {
                 kind: ExprKind::List(result),
+                span: template.span,
+            }
+        }
+        ExprKind::DottedList(elems, tail) => {
+            let new_elems: Vec<Expr> = elems.iter()
+                .map(|e| subst(e, bindings, def_env, renames, span))
+                .collect();
+            let new_tail = subst(tail, bindings, def_env, renames, span);
+            Expr {
+                kind: ExprKind::DottedList(new_elems, Box::new(new_tail)),
                 span: template.span,
             }
         }
@@ -344,6 +386,12 @@ fn collect_tvars(template: &Expr, out: &mut Vec<String>) {
             for e in elems {
                 collect_tvars(e, out);
             }
+        }
+        ExprKind::DottedList(elems, tail) => {
+            for e in elems {
+                collect_tvars(e, out);
+            }
+            collect_tvars(tail, out);
         }
         _ => {}
     }

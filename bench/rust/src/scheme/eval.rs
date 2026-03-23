@@ -206,6 +206,17 @@ enum HandlerEntry {
     },
 }
 
+/// Element in a quasiquote template being built.
+#[derive(Clone)]
+enum QQElement {
+    /// A literal value (already resolved).
+    Literal(Value),
+    /// An unquote expression that needs evaluation.
+    Unquote(Expr),
+    /// An unquote-splicing expression that needs evaluation.
+    Splice(Expr),
+}
+
 /// A frame on the explicit continuation stack (CEK machine).
 #[derive(Clone)]
 enum Frame {
@@ -241,7 +252,27 @@ enum Frame {
         env: Rc<Env>,
     },
     CondTest { clause_body: Vec<Expr>, rest_clauses: Vec<Expr>, env: Rc<Env> },
+    /// `(cond (test => proc))` — test was truthy, now evaluate proc and apply to test_val.
+    CondArrow { test_val: Value, env: Rc<Env> },
     CaseKey { clauses: Vec<Expr>, env: Rc<Env> },
+    /// Building a quasiquoted list: `done` values accumulated, `rest` templates remaining.
+    QuasiquoteList {
+        done: Vec<Value>,
+        rest: Vec<QQElement>,
+        env: Rc<Env>,
+        span: Span,
+        is_dotted: bool,
+        dotted_tail: Option<Box<Expr>>,
+    },
+    /// Awaiting the result of a spliced expression in a quasiquote list.
+    QuasiquoteSplice {
+        done: Vec<Value>,
+        rest: Vec<QQElement>,
+        env: Rc<Env>,
+        span: Span,
+        is_dotted: bool,
+        dotted_tail: Option<Box<Expr>>,
+    },
     DoInit {
         var_names: Vec<String>,
         done_vals: Vec<Value>,
@@ -422,6 +453,10 @@ fn step_eval(expr: Expr, env: &Rc<Env>, k: &mut Vec<Frame>, wind: &[WindEntry], 
             .map(State::Ret)
             .ok_or_else(|| EvalError::from(ErrorKind::UnboundVariable { name })),
         ExprKind::List(elems) => step_eval_list(elems, env, k, span, wind, handlers),
+        ExprKind::DottedList(_, _) => Err(ErrorKind::BadSyntax {
+            form: "eval".into(),
+            message: "dotted list is not a valid expression".into(),
+        }.into()),
     };
     result.map_err(|e| e.with_span(span))
 }
@@ -443,6 +478,7 @@ fn step_eval_list(
             "define" => return step_define(&elems[1..], env, k),
             "set!" => return step_set_bang(&elems[1..], env, k),
             "quote" => return eval_quote(&elems[1..]).map(State::Ret),
+            "quasiquote" => return step_quasiquote(&elems[1..], env, k),
             "lambda" => return eval_lambda(&elems[1..], env).map(State::Ret),
             "case-lambda" => return eval_case_lambda(&elems[1..], env).map(State::Ret),
             "begin" => return step_begin(&elems[1..], env, k),
@@ -1551,6 +1587,15 @@ fn step_ret(val: Value, frame: Frame, k: &mut Vec<Frame>, wind: &mut Vec<WindEnt
             env,
         } => {
             if val.is_truthy() {
+                // Check for (test => proc) arrow syntax
+                if clause_body.len() == 2 {
+                    if let ExprKind::Symbol(s) = &clause_body[0].kind {
+                        if s == "=>" {
+                            k.push(Frame::CondArrow { test_val: val, env: Rc::clone(&env) });
+                            return Ok(State::Eval(clause_body[1].clone(), env));
+                        }
+                    }
+                }
                 if clause_body.is_empty() {
                     Ok(State::Ret(val))
                 } else {
@@ -1559,6 +1604,10 @@ fn step_ret(val: Value, frame: Frame, k: &mut Vec<Frame>, wind: &mut Vec<WindEnt
             } else {
                 step_cond(&rest_clauses, &env, k)
             }
+        }
+        Frame::CondArrow { test_val, env } => {
+            // val is the proc, apply it to test_val
+            Ok(State::Apply(val, vec![test_val], env, Span::default()))
         }
         Frame::CaseKey { clauses, env } => {
             // val is the key; dispatch through clauses using eqv?
@@ -2395,6 +2444,15 @@ fn expr_to_value(expr: &Expr) -> Result<Value, EvalError> {
                 .collect::<Result<Vec<_>, _>>()?;
             Ok(Value::List(vals))
         }
+        ExprKind::DottedList(elems, tail) => {
+            let tail_val = expr_to_value(tail)?;
+            let mut result = tail_val;
+            for elem in elems.iter().rev() {
+                let car = expr_to_value(elem)?;
+                result = Value::make_pair(car, result);
+            }
+            Ok(result)
+        }
     }
 }
 
@@ -2807,6 +2865,17 @@ fn apply_builtin(name: &str, args: &[Value], env: &Rc<Env>) -> Result<Value, Eva
             }
             let datum_expr = value_to_expr(&args[1], Span::default());
             Ok(Value::SyntaxObject(datum_expr))
+        }
+        "error" => {
+            if args.is_empty() {
+                return Err(ErrorKind::UserRaise { value: "error".into() }.into());
+            }
+            let mut msg = args[0].to_display_output();
+            for irritant in &args[1..] {
+                msg.push(' ');
+                msg.push_str(&irritant.to_display_string());
+            }
+            Err(ErrorKind::UserRaise { value: msg }.into())
         }
         _ => Err(ErrorKind::NotAProcedure {
             value: format!("#<procedure:{}>", name),

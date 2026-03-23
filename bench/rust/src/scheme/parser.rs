@@ -11,6 +11,8 @@ pub enum ExprKind {
     Char(char),
     Symbol(String),
     List(Vec<Expr>),
+    /// Dotted pair notation: `(a b . c)` → DottedList([a, b], c)
+    DottedList(Vec<Expr>, Box<Expr>),
 }
 
 /// A parsed S-expression with source position.
@@ -83,6 +85,8 @@ impl Parser {
             '"' => self.parse_string(),
             '#' => self.parse_hash(),
             '\'' => self.parse_quote(),
+            '`' => self.parse_quasiquote(),
+            ',' => self.parse_unquote(),
             _ => self.parse_atom(),
         }
     }
@@ -99,6 +103,22 @@ impl Parser {
             if self.chars[self.pos] == ')' {
                 self.advance();
                 return Ok(Expr { kind: ExprKind::List(elems), span });
+            }
+            // Check for dotted pair: `. expr)`
+            if self.chars[self.pos] == '.' && self.pos + 1 < self.chars.len()
+                && is_delimiter(self.chars[self.pos + 1])
+            {
+                self.advance(); // skip '.'
+                if elems.is_empty() {
+                    return Err(self.err("dot at start of list"));
+                }
+                let tail = self.parse_expr()?;
+                self.skip_whitespace_and_comments();
+                if self.pos >= self.chars.len() || self.chars[self.pos] != ')' {
+                    return Err(self.err("expected ) after dot tail"));
+                }
+                self.advance(); // skip ')'
+                return Ok(Expr { kind: ExprKind::DottedList(elems, Box::new(tail)), span });
             }
             elems.push(self.parse_expr()?);
         }
@@ -229,6 +249,44 @@ impl Parser {
             ]),
             span,
         })
+    }
+
+    fn parse_quasiquote(&mut self) -> Result<Expr, EvalError> {
+        let span = self.current_span();
+        self.advance(); // skip '`'
+        let inner = self.parse_expr()?;
+        Ok(Expr {
+            kind: ExprKind::List(vec![
+                Expr { kind: ExprKind::Symbol("quasiquote".into()), span },
+                inner,
+            ]),
+            span,
+        })
+    }
+
+    fn parse_unquote(&mut self) -> Result<Expr, EvalError> {
+        let span = self.current_span();
+        self.advance(); // skip ','
+        if self.pos < self.chars.len() && self.chars[self.pos] == '@' {
+            self.advance(); // skip '@'
+            let inner = self.parse_expr()?;
+            Ok(Expr {
+                kind: ExprKind::List(vec![
+                    Expr { kind: ExprKind::Symbol("unquote-splicing".into()), span },
+                    inner,
+                ]),
+                span,
+            })
+        } else {
+            let inner = self.parse_expr()?;
+            Ok(Expr {
+                kind: ExprKind::List(vec![
+                    Expr { kind: ExprKind::Symbol("unquote".into()), span },
+                    inner,
+                ]),
+                span,
+            })
+        }
     }
 
     fn parse_atom(&mut self) -> Result<Expr, EvalError> {

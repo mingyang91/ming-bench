@@ -81,6 +81,8 @@ impl Env {
             "input-port?", "output-port?",
             "read", "read-char", "peek-char", "eof-object?",
             "syntax->datum", "datum->syntax",
+            // Error
+            "error",
         ] {
             bindings.insert(name.into(), Value::Builtin(name.into()));
         }
