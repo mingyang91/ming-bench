@@ -1,5 +1,7 @@
 use std::fmt;
 
+use crate::scheme::env::Env;
+
 #[derive(Debug, Clone, PartialEq)]
 pub enum Value {
     Integer(i64),
@@ -7,6 +9,11 @@ pub enum Value {
     String(String),
     Symbol(String),
     List(Vec<Value>),
+    Closure {
+        params: Vec<String>,
+        body: Box<Value>,
+        env: Env,
+    },
     Void,
 }
 
@@ -28,6 +35,7 @@ impl fmt::Display for Value {
                 }
                 write!(f, ")")
             }
+            Value::Closure { .. } => write!(f, "#<procedure>"),
             Value::Void => write!(f, "#<void>"),
         }
     }
