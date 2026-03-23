@@ -7,6 +7,7 @@ use std::collections::HashMap;
 use std::rc::Rc;
 
 type VectorRef = Rc<RefCell<Vec<Value>>>;
+type WindEntry = Rc<(Value, Value)>; // (in-thunk, out-thunk)
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 static GENSYM_COUNTER: AtomicUsize = AtomicUsize::new(0);
@@ -18,6 +19,13 @@ fn gensym(base: &str) -> String {
 
 thread_local! {
     static OUTPUT_BUFFER: RefCell<String> = RefCell::new(String::new());
+    static WIND_STACK: RefCell<Vec<WindEntry>> = RefCell::new(Vec::new());
+}
+
+#[derive(Clone)]
+enum WindOp {
+    Unwind(Value),               // pop wind stack, call out-thunk
+    Rewind(Value, WindEntry),    // call in-thunk, then push wind entry
 }
 
 #[derive(Clone)]
@@ -38,7 +46,8 @@ enum Value {
     Void,
     Builtin(&'static str, fn(&[Value]) -> Result<Value, EvalError>),
     CallCC,
-    Continuation(Rc<Kont>),
+    DynamicWind,
+    Continuation(Rc<Kont>, Vec<WindEntry>),
     Vector(VectorRef),
     Macro {
         literals: Vec<String>,
@@ -62,7 +71,8 @@ impl std::fmt::Debug for Value {
             Value::Void => write!(f, "Void"),
             Value::Builtin(name, _) => write!(f, "Builtin({})", name),
             Value::CallCC => write!(f, "CallCC"),
-            Value::Continuation(_) => write!(f, "#<continuation>"),
+            Value::DynamicWind => write!(f, "DynamicWind"),
+            Value::Continuation(..) => write!(f, "#<continuation>"),
             Value::Macro { .. } => write!(f, "#<macro>"),
         }
     }
@@ -131,7 +141,7 @@ impl Value {
                 out.push(')');
                 out
             }
-            Value::Lambda { .. } | Value::Builtin(_, _) | Value::CallCC | Value::Continuation(_) => {
+            Value::Lambda { .. } | Value::Builtin(_, _) | Value::CallCC | Value::DynamicWind | Value::Continuation(..) => {
                 "#<procedure>".to_string()
             }
             Value::Void => "#<void>".to_string(),
@@ -317,6 +327,16 @@ enum Kont {
     StringSetChar { form: Expr, var_name: String, idx: usize, env: Env, next: Rc<Kont> },
     LetrecBind { letrec_env: Env, remaining: Vec<(String, Expr)>, body: Vec<Expr>, next: Rc<Kont> },
     CaseKey { form: Expr, clauses: Vec<Expr>, env: Env, next: Rc<Kont> },
+    // dynamic-wind: after in-thunk returns, push wind entry, call body
+    DynamicWindRunBody { body_thunk: Value, out_thunk: Value, wind_entry: WindEntry, next: Rc<Kont> },
+    // dynamic-wind: after body returns, pop wind entry, call out-thunk
+    DynamicWindRunOut { out_thunk: Value, next: Rc<Kont> },
+    // dynamic-wind: after out-thunk returns, restore body value
+    DynamicWindFinish { body_value: Value, next: Rc<Kont> },
+    // continuation transfer: chain of wind operations
+    WindChain { remaining: Vec<WindOp>, cont_value: Value, target_kont: Rc<Kont> },
+    // continuation transfer: after rewind in-thunk, push entry and continue
+    WindChainPush { wind_entry: WindEntry, remaining: Vec<WindOp>, cont_value: Value, target_kont: Rc<Kont> },
 }
 
 impl std::fmt::Debug for Kont {
@@ -502,6 +522,24 @@ fn builtin_append(args: &[Value]) -> Result<Value, EvalError> {
         }
     }
     Ok(result)
+}
+
+fn builtin_reverse(args: &[Value]) -> Result<Value, EvalError> {
+    if args.len() != 1 {
+        return Err(EvalError::Arity("reverse requires exactly 1 argument".into()));
+    }
+    let mut result = Value::Nil;
+    let mut cur = &args[0];
+    loop {
+        match cur {
+            Value::Nil => return Ok(result),
+            Value::Pair(car, cdr) => {
+                result = Value::Pair(Rc::new(Value::clone(car)), Rc::new(result));
+                cur = cdr;
+            }
+            _ => return Err(EvalError::Type("reverse: not a proper list".into())),
+        }
+    }
 }
 
 fn builtin_number_pred(args: &[Value]) -> Result<Value, EvalError> {
@@ -1156,6 +1194,7 @@ fn default_env() -> Env {
         ("symbol?", builtin_symbol_pred),
         ("char?", builtin_char_pred),
         ("append", builtin_append),
+        ("reverse", builtin_reverse),
         ("display", builtin_display),
         ("write", builtin_write),
         ("newline", builtin_newline),
@@ -1224,6 +1263,7 @@ fn default_env() -> Env {
     }
     env_set(&env, "call/cc".to_string(), Value::CallCC);
     env_set(&env, "call-with-current-continuation".to_string(), Value::CallCC);
+    env_set(&env, "dynamic-wind".to_string(), Value::DynamicWind);
     env
 }
 
@@ -1799,6 +1839,45 @@ fn eval_body_state(body: &[Expr], env: Env, kont: &mut Rc<Kont>) -> State {
     }
 }
 
+fn dummy_form() -> Expr {
+    Expr::new(ExprKind::Symbol("dynamic-wind".into()), 0, 0)
+}
+
+fn start_wind_chain(
+    remaining: Vec<WindOp>,
+    cont_value: Value,
+    target_kont: Rc<Kont>,
+    kont: &mut Rc<Kont>,
+    form: &Expr,
+) -> Result<State, EvalError> {
+    if remaining.is_empty() {
+        *kont = target_kont;
+        return Ok(State::Apply(cont_value));
+    }
+    let op = remaining[0].clone();
+    let rest = remaining[1..].to_vec();
+    match op {
+        WindOp::Unwind(out_thunk) => {
+            WIND_STACK.with(|ws| ws.borrow_mut().pop());
+            *kont = Rc::new(Kont::WindChain {
+                remaining: rest,
+                cont_value,
+                target_kont,
+            });
+            apply_function(out_thunk, vec![], form, kont)
+        }
+        WindOp::Rewind(in_thunk, entry) => {
+            *kont = Rc::new(Kont::WindChainPush {
+                wind_entry: entry,
+                remaining: rest,
+                cont_value,
+                target_kont,
+            });
+            apply_function(in_thunk, vec![], form, kont)
+        }
+    }
+}
+
 fn apply_function(func: Value, args: Vec<Value>, form: &Expr, kont: &mut Rc<Kont>) -> Result<State, EvalError> {
     match func {
         Value::Builtin("map", _) => {
@@ -1886,16 +1965,55 @@ fn apply_function(func: Value, args: Vec<Value>, form: &Expr, kont: &mut Rc<Kont
             if args.len() != 1 {
                 return Err(form.wrap_err(EvalError::Arity("call/cc requires exactly 1 argument".into())));
             }
-            let cont_value = Value::Continuation(kont.clone());
+            let winds = WIND_STACK.with(|ws| ws.borrow().clone());
+            let cont_value = Value::Continuation(kont.clone(), winds);
             let proc = args.into_iter().next().unwrap();
             apply_function(proc, vec![cont_value], form, kont)
         }
-        Value::Continuation(saved_kont) => {
+        Value::DynamicWind => {
+            if args.len() != 3 {
+                return Err(form.wrap_err(EvalError::Arity("dynamic-wind requires exactly 3 arguments".into())));
+            }
+            let mut it = args.into_iter();
+            let in_thunk = it.next().unwrap();
+            let body_thunk = it.next().unwrap();
+            let out_thunk = it.next().unwrap();
+            let wind_entry: WindEntry = Rc::new((in_thunk.clone(), out_thunk.clone()));
+            *kont = Rc::new(Kont::DynamicWindRunBody {
+                body_thunk,
+                out_thunk,
+                wind_entry,
+                next: kont.clone(),
+            });
+            // Call in-thunk (zero args)
+            apply_function(in_thunk, vec![], form, kont)
+        }
+        Value::Continuation(saved_kont, saved_winds) => {
             if args.len() != 1 {
                 return Err(form.wrap_err(EvalError::Arity("continuation requires exactly 1 argument".into())));
             }
-            *kont = saved_kont;
-            Ok(State::Apply(args.into_iter().next().unwrap()))
+            let value = args.into_iter().next().unwrap();
+            let current_winds = WIND_STACK.with(|ws| ws.borrow().clone());
+            // Find common prefix length (by Rc identity)
+            let common_len = current_winds.iter().zip(saved_winds.iter())
+                .take_while(|(a, b)| Rc::ptr_eq(a, b))
+                .count();
+            // Build wind operations: unwind current (inner to outer), rewind target (outer to inner)
+            let mut ops = Vec::new();
+            // Unwind: from innermost to outermost (reverse order from common_len+1 to end)
+            for i in (common_len..current_winds.len()).rev() {
+                ops.push(WindOp::Unwind(current_winds[i].1.clone()));
+            }
+            // Rewind: from outermost to innermost
+            for i in common_len..saved_winds.len() {
+                ops.push(WindOp::Rewind(saved_winds[i].0.clone(), saved_winds[i].clone()));
+            }
+            if ops.is_empty() {
+                *kont = saved_kont;
+                Ok(State::Apply(value))
+            } else {
+                start_wind_chain(ops, value, saved_kont, kont, form)
+            }
         }
         _ => Err(form.wrap_err(EvalError::Type(format!(
             "not a procedure: {}",
@@ -2680,6 +2798,42 @@ fn eval_cek(initial_expr: Expr, initial_env: Env, initial_kont: Rc<Kont>) -> Res
                         }
                         result_state.unwrap_or(State::Apply(Value::Void))
                     }
+
+                    Kont::DynamicWindRunBody { body_thunk, out_thunk, wind_entry, next } => {
+                        // in-thunk finished; push wind entry and call body
+                        WIND_STACK.with(|ws| ws.borrow_mut().push(wind_entry));
+                        kont = Rc::new(Kont::DynamicWindRunOut { out_thunk, next });
+                        let form = dummy_form();
+                        apply_function(body_thunk, vec![], &form, &mut kont)?
+                    }
+
+                    Kont::DynamicWindRunOut { out_thunk, next } => {
+                        // body finished; pop wind entry, save body value, call out-thunk
+                        WIND_STACK.with(|ws| ws.borrow_mut().pop());
+                        let body_value = value;
+                        kont = Rc::new(Kont::DynamicWindFinish { body_value, next });
+                        let form = dummy_form();
+                        apply_function(out_thunk, vec![], &form, &mut kont)?
+                    }
+
+                    Kont::DynamicWindFinish { body_value, next } => {
+                        // out-thunk finished; return body value
+                        kont = next;
+                        State::Apply(body_value)
+                    }
+
+                    Kont::WindChain { remaining, cont_value, target_kont } => {
+                        // previous thunk finished (value ignored); continue chain
+                        let form = dummy_form();
+                        start_wind_chain(remaining, cont_value, target_kont, &mut kont, &form)?
+                    }
+
+                    Kont::WindChainPush { wind_entry, remaining, cont_value, target_kont } => {
+                        // in-thunk finished; push wind entry, continue chain
+                        WIND_STACK.with(|ws| ws.borrow_mut().push(wind_entry));
+                        let form = dummy_form();
+                        start_wind_chain(remaining, cont_value, target_kont, &mut kont, &form)?
+                    }
                 };
             }
         }
@@ -2689,6 +2843,7 @@ fn eval_cek(initial_expr: Expr, initial_env: Env, initial_kont: Rc<Kont>) -> Res
 // --- Public API ---
 
 pub fn eval_str(input: &str) -> Result<String, EvalError> {
+    WIND_STACK.with(|ws| ws.borrow_mut().clear());
     let exprs = parse(input)?;
     if exprs.is_empty() {
         return Ok(Value::Boolean(false).display());
@@ -2716,6 +2871,7 @@ pub fn eval_str(input: &str) -> Result<String, EvalError> {
 
 pub fn eval_str_with_output(input: &str) -> Result<(String, String), EvalError> {
     OUTPUT_BUFFER.with(|buf| buf.borrow_mut().clear());
+    WIND_STACK.with(|ws| ws.borrow_mut().clear());
     let exprs = parse(input)?;
     if exprs.is_empty() {
         let output = OUTPUT_BUFFER.with(|buf| buf.borrow().clone());
