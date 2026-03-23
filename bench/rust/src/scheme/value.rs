@@ -33,6 +33,7 @@ pub enum Value {
         def_env: Rc<RefCell<Env>>,
     },
     Vector(Rc<RefCell<Vec<Value>>>),
+    Values(Vec<Value>),
     Void,
 }
 
@@ -43,7 +44,7 @@ impl Value {
             Value::Int(_) | Value::Bool(_) | Value::String(_) | Value::Char(_)
             | Value::Builtin(_) | Value::Closure { .. } | Value::Pair(_, _)
             | Value::Continuation(_) | Value::SyntaxRules { .. }
-            | Value::Vector(_) | Value::Void => None,
+            | Value::Vector(_) | Value::Values(_) | Value::Void => None,
         }
     }
 }
@@ -64,6 +65,7 @@ impl PartialEq for Value {
             (Value::Continuation(a), Value::Continuation(b)) => a == b,
             (Value::SyntaxRules { .. }, Value::SyntaxRules { .. }) => false,
             (Value::Vector(a), Value::Vector(b)) => *a.borrow() == *b.borrow(),
+            (Value::Values(a), Value::Values(b)) => a == b,
             (Value::Int(_), _)
             | (Value::Bool(_), _)
             | (Value::String(_), _)
@@ -76,6 +78,7 @@ impl PartialEq for Value {
             | (Value::Continuation(_), _)
             | (Value::SyntaxRules { .. }, _)
             | (Value::Vector(_), _)
+            | (Value::Values(_), _)
             | (Value::Void, _) => false,
         }
     }
@@ -118,6 +121,15 @@ impl fmt::Display for Value {
                     write!(f, "{elem}")?;
                 }
                 write!(f, ")")
+            }
+            Value::Values(vals) => {
+                for (i, v) in vals.iter().enumerate() {
+                    if i > 0 {
+                        writeln!(f)?;
+                    }
+                    write!(f, "{v}")?;
+                }
+                Ok(())
             }
             Value::Void => write!(f, ""),
         }

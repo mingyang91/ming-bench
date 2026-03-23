@@ -29,6 +29,7 @@ const BUILTINS: &[&str] = &[
     "vector?", "vector->list", "list->vector",
     "dynamic-wind",
     "raise", "with-exception-handler",
+    "values", "call-with-values",
 ];
 
 pub fn default_env() -> Rc<RefCell<Env>> {
@@ -178,6 +179,11 @@ enum Frame {
     },
     /// Handler returned from non-continuable raise — error
     RaiseHandlerReturn,
+    /// call-with-values: producer returned, now apply consumer
+    CallWithValues {
+        consumer: Value,
+        span: Option<Span>,
+    },
 }
 
 #[derive(Debug, Clone)]
@@ -314,7 +320,8 @@ impl Machine {
             Value::Int(_) | Value::Bool(_) | Value::String(_)
             | Value::Char(_) | Value::Builtin(_) | Value::Void
             | Value::Closure { .. } | Value::Pair(_, _) | Value::Continuation(_)
-            | Value::SyntaxRules { .. } | Value::Vector(_) => Ok(Control::Continue(expr)),
+            | Value::SyntaxRules { .. } | Value::Vector(_)
+            | Value::Values(_) => Ok(Control::Continue(expr)),
             Value::Symbol(ref name, _) => env
                 .borrow()
                 .get(name)
@@ -671,6 +678,13 @@ impl Machine {
                     value: "handler returned from non-continuable exception".into(),
                 })
             }
+            Frame::CallWithValues { consumer, span } => {
+                let args = match val {
+                    Value::Values(vs) => vs,
+                    other => vec![other],
+                };
+                Ok(Control::Apply(consumer, args, span))
+            }
         }
     }
 
@@ -867,6 +881,25 @@ impl Machine {
                 self.kont.push(Frame::WithExceptionHandlerDone);
                 Ok(Control::Apply(thunk, vec![], span))
             }
+            "values" => {
+                if args.len() == 1 {
+                    Ok(Control::Continue(args.into_iter().next().expect("checked len")))
+                } else {
+                    Ok(Control::Continue(Value::Values(args)))
+                }
+            }
+            "call-with-values" => {
+                if args.len() != 2 {
+                    return Err(EvalError::WrongArgCount {
+                        expected: 2, got: args.len(),
+                    }.at(span));
+                }
+                let mut it = args.into_iter();
+                let producer = it.next().expect("checked len");
+                let consumer = it.next().expect("checked len");
+                self.kont.push(Frame::CallWithValues { consumer, span });
+                Ok(Control::Apply(producer, vec![], span))
+            }
             _ => {
                 let result = apply_builtin(name, &args, &self.output)
                     .map_err(|e| e.at(span))?;
@@ -980,7 +1013,7 @@ impl Machine {
             Value::Int(_) | Value::Bool(_) | Value::String(_) | Value::Char(_)
             | Value::Builtin(_) | Value::Closure { .. } | Value::Pair(_, _)
             | Value::Continuation(_) | Value::SyntaxRules { .. }
-            | Value::Vector(_) | Value::Void => {
+            | Value::Vector(_) | Value::Values(_) | Value::Void => {
                 Err(EvalError::Parse {
                     msg: format!("define: expected symbol or list, got {}", args[0]),
                 }.at(span))
@@ -1677,7 +1710,7 @@ fn make_literal(val: Value) -> Value {
         Value::Int(_) | Value::Bool(_) | Value::String(_) | Value::Char(_)
         | Value::Builtin(_) | Value::Closure { .. } | Value::Pair(_, _)
         | Value::Continuation(_) | Value::SyntaxRules { .. }
-        | Value::Vector(_) | Value::Void => val,
+        | Value::Vector(_) | Value::Values(_) | Value::Void => val,
         Value::Symbol(_, _) | Value::List(_, _) => Value::List(
             vec![Value::Symbol("quote".into(), None), val],
             None,
