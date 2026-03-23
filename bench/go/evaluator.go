@@ -301,6 +301,28 @@ func parseExpr(tokens []token, pos int) (*expr, int, error) {
 		return &expr{kind: "string", sval: tok.text[1 : len(tok.text)-1], line: tok.line, col: tok.col}, pos + 1, nil
 	}
 
+	// Character literal
+	if len(tok.text) >= 3 && tok.text[0] == '#' && tok.text[1] == '\\' {
+		rest := tok.text[2:]
+		var c rune
+		switch rest {
+		case "space":
+			c = ' '
+		case "newline":
+			c = '\n'
+		case "tab":
+			c = '\t'
+		default:
+			runes := []rune(rest)
+			if len(runes) == 1 {
+				c = runes[0]
+			} else {
+				return nil, 0, &EvalError{Message: fmt.Sprintf("%d:%d: bad character literal: %s", tok.line, tok.col, tok.text)}
+			}
+		}
+		return &expr{kind: "char", line: tok.line, col: tok.col, sval: string(c)}, pos + 1, nil
+	}
+
 	// Boolean
 	if tok.text == "#t" || tok.text == "#true" {
 		return &expr{kind: "bool", bval: true, line: tok.line, col: tok.col}, pos + 1, nil
@@ -359,6 +381,9 @@ func eval(e *expr, env *env) (*value, error) {
 		return boolVal(e.bval), nil
 	case "string":
 		return strVal(e.sval), nil
+	case "char":
+		runes := []rune(e.sval)
+		return charVal(runes[0]), nil
 	case "symbol":
 		v, ok := env.get(e.sval)
 		if !ok {
@@ -665,6 +690,9 @@ func quoteExpr(e *expr) *value {
 		return boolVal(e.bval)
 	case "string":
 		return strVal(e.sval)
+	case "char":
+		runes := []rune(e.sval)
+		return charVal(runes[0])
 	case "symbol":
 		return symVal(e.sval)
 	case "list":
@@ -993,6 +1021,27 @@ func makeGlobalEnv(ip *interp) *env {
 			return nil, &EvalError{Message: fmt.Sprintf("%d:%d: string->symbol: expected string", line, col)}
 		}
 		return symVal(args[0].sval), nil
+	}))
+
+	e.set("string-copy", makeBuiltin("string-copy", func(args []*value, line, col int) (*value, error) {
+		if len(args) != 1 || args[0].typ != valString {
+			return nil, &EvalError{Message: fmt.Sprintf("%d:%d: string-copy: expected string", line, col)}
+		}
+		return strVal(args[0].sval), nil
+	}))
+
+	e.set("string-set!", makeBuiltin("string-set!", func(args []*value, line, col int) (*value, error) {
+		if len(args) != 3 || args[0].typ != valString || args[1].typ != valInt || args[2].typ != valChar {
+			return nil, &EvalError{Message: fmt.Sprintf("%d:%d: string-set!: bad arguments", line, col)}
+		}
+		runes := []rune(args[0].sval)
+		idx := int(args[1].ival)
+		if idx < 0 || idx >= len(runes) {
+			return nil, &EvalError{Message: fmt.Sprintf("%d:%d: string-set!: index out of range", line, col)}
+		}
+		runes[idx] = args[2].cval
+		args[0].sval = string(runes)
+		return voidVal, nil
 	}))
 
 	e.set("string-ref", makeBuiltin("string-ref", func(args []*value, line, col int) (*value, error) {
