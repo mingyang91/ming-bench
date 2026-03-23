@@ -149,6 +149,14 @@ function parseAtom(tok: Token): SchemeVal {
     });
     return { tag: 'string', val: inner, pos: p };
   }
+  if (tok.text.startsWith('#\\')) {
+    const rest = tok.text.slice(2);
+    if (rest === 'space') return { tag: 'char', val: ' ', pos: p };
+    if (rest === 'newline') return { tag: 'char', val: '\n', pos: p };
+    if (rest === 'tab') return { tag: 'char', val: '\t', pos: p };
+    if (rest.length === 1) return { tag: 'char', val: rest, pos: p };
+    throw new EvalError(`unknown character literal: ${tok.text}`);
+  }
   if (/^-?\d+$/.test(tok.text)) {
     return { tag: 'number', val: parseInt(tok.text, 10), pos: p };
   }
@@ -408,6 +416,22 @@ function applyBuiltin(op: string, evalArgs: SchemeVal[], p?: Pos, out?: string[]
       if (idx < 0 || idx >= str.length) throw posError('string-ref: index out of range', p);
       return { tag: 'char', val: str[idx] };
     }
+    case 'string-copy': {
+      if (evalArgs.length !== 1) throw posError('string-copy: need exactly one arg', p);
+      if (evalArgs[0].tag !== 'string') throw posError('string-copy: expected string', p);
+      return { tag: 'string', val: evalArgs[0].val };
+    }
+    case 'string-set!': {
+      if (evalArgs.length !== 3) throw posError('string-set!: need exactly three args', p);
+      const target = evalArgs[0];
+      if (target.tag !== 'string') throw posError('string-set!: expected string', p);
+      const idx = toNumber(evalArgs[1], 'string-set!', p);
+      if (evalArgs[2].tag !== 'char') throw posError('string-set!: expected char', p);
+      const s = target.val;
+      if (idx < 0 || idx >= s.length) throw posError('string-set!: index out of range', p);
+      target.val = s.substring(0, idx) + evalArgs[2].val + s.substring(idx + 1);
+      return { tag: 'boolean', val: false };
+    }
     case 'char?': {
       if (evalArgs.length !== 1) throw posError('char?: need exactly one arg', p);
       return { tag: 'boolean', val: evalArgs[0].tag === 'char' };
@@ -422,11 +446,11 @@ const BUILTINS = new Set(['+', '-', '*', '/', '<', '>', '=', '<=', '>=', 'not',
   'pair?', 'number?', 'string?', 'boolean?', 'symbol?', 'procedure?', 'char?',
   'display', 'write', 'newline',
   'string-append', 'string-length', 'substring', 'string->number', 'number->string',
-  'symbol->string', 'string->symbol', 'string-ref']);
+  'symbol->string', 'string->symbol', 'string-ref', 'string-copy', 'string-set!']);
 
 function evalExpr(expr: SchemeVal, env: Env, out?: string[]): SchemeVal {
   const p = expr.pos;
-  if (expr.tag === 'number' || expr.tag === 'boolean' || expr.tag === 'string') {
+  if (expr.tag === 'number' || expr.tag === 'boolean' || expr.tag === 'string' || expr.tag === 'char') {
     return expr;
   }
   if (expr.tag === 'symbol') {
