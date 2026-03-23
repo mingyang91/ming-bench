@@ -1,5 +1,5 @@
 use crate::scheme::error::{EvalError, Span};
-use crate::scheme::value::Value;
+use crate::scheme::value::{make_rational, Value};
 
 pub fn parse(input: &str) -> Result<Vec<Value>, EvalError> {
     let tokens = tokenize(input)?;
@@ -20,6 +20,8 @@ enum Token {
     Quote,
     Symbol(String),
     Integer(i64),
+    Rational(i64, i64),
+    Float(f64),
     Boolean(bool),
     String(String),
     Char(char),
@@ -184,6 +186,10 @@ fn tokenize(input: &str) -> Result<Vec<(Token, Span)>, EvalError> {
                 let word: String = chars[start..i].iter().collect();
                 if let Ok(n) = word.parse::<i64>() {
                     tokens.push((Token::Integer(n), start_span));
+                } else if let Some(tok) = try_parse_rational(&word) {
+                    tokens.push((tok, start_span));
+                } else if let Some(tok) = try_parse_float(&word) {
+                    tokens.push((tok, start_span));
                 } else {
                     tokens.push((Token::Symbol(word), start_span));
                 }
@@ -191,6 +197,27 @@ fn tokenize(input: &str) -> Result<Vec<(Token, Span)>, EvalError> {
         }
     }
     Ok(tokens)
+}
+
+fn try_parse_rational(word: &str) -> Option<Token> {
+    let slash_pos = word.find('/')?;
+    if slash_pos == 0 || slash_pos == word.len() - 1 {
+        return None;
+    }
+    let numer = word[..slash_pos].parse::<i64>().ok()?;
+    let denom = word[slash_pos + 1..].parse::<i64>().ok()?;
+    if denom == 0 {
+        return None;
+    }
+    Some(Token::Rational(numer, denom))
+}
+
+fn try_parse_float(word: &str) -> Option<Token> {
+    if !word.contains('.') {
+        return None;
+    }
+    let f = word.parse::<f64>().ok()?;
+    Some(Token::Float(f))
 }
 
 fn parse_expr(tokens: &[(Token, Span)], pos: usize) -> Result<(Value, usize), EvalError> {
@@ -206,6 +233,8 @@ fn parse_expr(tokens: &[(Token, Span)], pos: usize) -> Result<(Value, usize), Ev
     let (token, span) = &tokens[pos];
     match token {
         Token::Integer(n) => Ok((Value::Integer(*n, *span), pos + 1)),
+        Token::Rational(n, d) => Ok((make_rational(*n, *d, *span), pos + 1)),
+        Token::Float(f) => Ok((Value::Float(*f, *span), pos + 1)),
         Token::Boolean(b) => Ok((Value::Boolean(*b, *span), pos + 1)),
         Token::String(s) => {
             Ok((Value::immutable_string(s.clone(), *span), pos + 1))

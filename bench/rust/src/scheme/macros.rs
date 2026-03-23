@@ -71,6 +71,8 @@ fn collect_pattern_vars_inner(pattern: &Value, literals: &[String], vars: &mut V
         }
         Value::Symbol(_, _)
         | Value::Integer(_, _)
+        | Value::Rational(_, _, _)
+        | Value::Float(_, _)
         | Value::Boolean(_, _)
         | Value::String(_, _, _)
         | Value::Char(_, _)
@@ -165,6 +167,8 @@ fn match_pattern(
             match_list(pelems, ielems, literals, bindings)
         }
         Value::Integer(a, _) => matches!(input, Value::Integer(b, _) if a == b),
+        Value::Rational(an, ad, _) => matches!(input, Value::Rational(bn, bd, _) if an == bn && ad == bd),
+        Value::Float(a, _) => matches!(input, Value::Float(b, _) if a == b),
         Value::Boolean(a, _) => matches!(input, Value::Boolean(b, _) if a == b),
         Value::String(_, _, _)
         | Value::Char(_, _)
@@ -220,6 +224,8 @@ fn expand_template(
             Value::List(expanded, *span)
         }
         Value::Integer(_, _)
+        | Value::Rational(_, _, _)
+        | Value::Float(_, _)
         | Value::Boolean(_, _)
         | Value::String(_, _, _)
         | Value::Char(_, _)
@@ -291,6 +297,8 @@ fn template_symbols(template: &Value) -> Vec<String> {
         Value::List(elems, _) => elems.iter().flat_map(template_symbols).collect(),
         Value::Symbol(_, _)
         | Value::Integer(_, _)
+        | Value::Rational(_, _, _)
+        | Value::Float(_, _)
         | Value::Boolean(_, _)
         | Value::String(_, _, _)
         | Value::Char(_, _)
