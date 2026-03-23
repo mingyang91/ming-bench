@@ -3400,7 +3400,7 @@ func makeGlobalEnv(ip *interp) *env {
 			return nil, &EvalError{Message: fmt.Sprintf("%d:%d: procedure?: expected 1 argument", line, col)}
 		}
 		t := args[0].typ
-		return boolVal(t == valLambda || t == valBuiltin), nil
+		return boolVal(t == valLambda || t == valBuiltin || t == valContinuation), nil
 	}))
 
 	// gcd
