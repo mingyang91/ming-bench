@@ -148,6 +148,12 @@ enum Frame {
         raised_val: Value,
         env: Rc<Env>,
     },
+    /// After producer thunk returns in call-with-values, call consumer with results.
+    CallWithValuesConsumer {
+        consumer: Value,
+        env: Rc<Env>,
+        span: Span,
+    },
 }
 
 /// CEK machine state.
@@ -1173,6 +1179,13 @@ fn step_ret(val: Value, frame: Frame, k: &mut Vec<Frame>, wind: &mut Vec<WindEnt
         | Frame::GuardClauseDispatch { .. } => {
             step_ret_wind(val, frame, k, wind, handlers)
         }
+        Frame::CallWithValuesConsumer { consumer, env, span } => {
+            let call_args = match val {
+                Value::MultipleValues(vs) => vs,
+                single => vec![single],
+            };
+            Ok(State::Apply(consumer, call_args, env, span))
+        }
     }
 }
 
@@ -1641,6 +1654,30 @@ fn step_apply(
                     }
                     .into())
                 }
+            }
+            "values" => {
+                match args.len() {
+                    1 => Ok(State::Ret(args.into_iter().next().expect("checked len"))),
+                    _ => Ok(State::Ret(Value::MultipleValues(args))),
+                }
+            }
+            "call-with-values" => {
+                if args.len() != 2 {
+                    return Err(ErrorKind::WrongArgCount {
+                        expected: 2,
+                        got: args.len(),
+                    }
+                    .into());
+                }
+                let mut args = args;
+                let producer = args.remove(0);
+                let consumer = args.remove(0);
+                k.push(Frame::CallWithValuesConsumer {
+                    consumer,
+                    env: Rc::clone(env),
+                    span,
+                });
+                Ok(State::Apply(producer, Vec::new(), Rc::clone(env), span))
             }
             "with-exception-handler" => {
                 if args.len() != 2 {

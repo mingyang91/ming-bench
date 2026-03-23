@@ -46,6 +46,7 @@ impl Env {
             "vector-length", "vector?", "vector->list", "list->vector",
             "dynamic-wind", "reverse",
             "raise", "with-exception-handler",
+            "values", "call-with-values",
         ] {
             bindings.insert(name.into(), Value::Builtin(name.into()));
         }

@@ -49,6 +49,8 @@ pub enum Value {
         rules: Vec<(Vec<Expr>, Expr)>,
         def_env: Rc<Env>,
     },
+    /// Multiple return values from `(values ...)`.
+    MultipleValues(Vec<Value>),
 }
 
 impl Value {
@@ -78,6 +80,7 @@ impl PartialEq for Value {
             (Value::DottedPair(a1, b1), Value::DottedPair(a2, b2)) => a1 == a2 && b1 == b2,
             (Value::Continuation(_), Value::Continuation(_)) => false,
             (Value::SyntaxRules { .. }, Value::SyntaxRules { .. }) => false,
+            (Value::MultipleValues(a), Value::MultipleValues(b)) => a == b,
             _ => false,
         }
     }
@@ -107,6 +110,10 @@ impl Value {
             Value::Lambda { .. } => "#<procedure>".into(),
             Value::Continuation(_) => "#<continuation>".into(),
             Value::SyntaxRules { .. } => "#<macro>".into(),
+            Value::MultipleValues(vals) => {
+                let inner: Vec<String> = vals.iter().map(|v| v.to_display_string()).collect();
+                format!("#<values: {}>", inner.join(" "))
+            }
         }
     }
 
@@ -125,6 +132,7 @@ impl Value {
             Value::DottedPair(a, b) => format!("({} . {})", a.to_display_output(), b.to_display_output()),
             Value::Continuation(_) => "#<continuation>".into(),
             Value::SyntaxRules { .. } => "#<macro>".into(),
+            Value::MultipleValues(_) => self.to_display_string(),
             other => other.to_display_string(),
         }
     }
