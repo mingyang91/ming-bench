@@ -319,6 +319,24 @@ func Eval(expr Expr, env *Env) (SchemeValue, error) {
 					expr = newExpr
 					env = newEnv
 					continue
+
+				case "define-syntax":
+					return evalDefineSyntax(e, env)
+				}
+			}
+
+			// Check for macro application
+			if sym, ok := e.Elements[0].(*SymbolExpr); ok {
+				if v, ok := env.Get(sym.Name); ok {
+					if macro, ok := v.(*SchemeMacro); ok {
+						expanded, enrichedEnv, err := expandMacro(macro, e, env)
+						if err != nil {
+							return nil, err
+						}
+						expr = expanded
+						env = enrichedEnv
+						continue
+					}
 				}
 			}
 
