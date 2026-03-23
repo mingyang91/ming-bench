@@ -438,8 +438,8 @@ pub const SAFETY_MAX_TURNS: u32 = 200;
 /// Token poll interval in seconds for the monitor thread.
 pub const TOKEN_POLL_INTERVAL_SECS: u64 = 5;
 
-/// Quality-gate cleanup pass token budget.
-pub const GATE_CLEANUP_TOKEN_BUDGET: u64 = 5_000;
+/// Quality-gate cleanup pass safety cap.
+pub const GATE_CLEANUP_TOKEN_BUDGET: u64 = 50_000;
 
 /// Default turn limit for a given level number (kept as a fallback for
 /// agents without token monitoring, e.g. OpenCode).
@@ -464,37 +464,38 @@ pub fn turns_for_level(level_num: u32, max_turns: Option<u32>) -> u32 {
     }
 }
 
-/// Output-token budget for a given level. Primary enforcement mechanism.
+/// Output-token safety cap for a given level.
 ///
-/// Derived from observed successful runs (~2x typical output tokens):
-///   L01-L03 (foundation)                          → 25K
-///   L04-L06 (error quality, strings, mutable)     → 25K
-///   L07-L09 (TCO, set!, variadic)                 → 20K
-///   L10-L12 (call/cc, macros, integration)        → 150K
-///   L13-L14 (builtins, string immutability)       → 30K
-///   L15     (equality, letrec, case, vectors, do) → 40K
-///   L16-L18 (dynamic-wind, guard, values)         → 60K
-///   L19-L20 (exact arith, records)                → 50K
-///   L21-L23 (pair mutation, syntax-case, final)   → 100K
-///   L24-L25 (tech-debt)                           → 15K
-///   L26     (real-world integration stress)        → 60K
+/// These are NOT performance targets — they're circuit breakers to prevent
+/// dead-loop runaway from burning the bill. Set generously so legitimate
+/// work never hits them. Only infinite loops or stuck agents should trigger.
+///
+///   L01-L06 (foundation, errors, strings)         → 100K
+///   L07-L09 (TCO, set!, variadic)                 → 100K
+///   L10-L12 (call/cc, macros, integration)        → 500K
+///   L13-L14 (builtins, string immutability)       → 100K
+///   L15     (equality, letrec, case, vectors, do) → 200K
+///   L16-L18 (dynamic-wind, guard, values)         → 200K
+///   L19-L20 (exact arith, records)                → 200K
+///   L21-L23 (pair mutation, syntax-case, final)   → 500K
+///   L24-L25 (tech-debt)                           → 100K
+///   L26     (real-world integration stress)        → 500K
 pub fn output_tokens_for_level(level_num: u32, max_tokens: Option<u64>) -> u64 {
     if let Some(t) = max_tokens {
         return t;
     }
     match level_num {
-        1..=3 => 25_000,
-        4..=6 => 25_000,
-        7..=9 => 20_000,
-        10..=12 => 150_000,
-        13..=14 => 30_000,
-        15 => 40_000,
-        16..=18 => 60_000,
-        19..=20 => 50_000,
-        21..=23 => 100_000,
-        24..=25 => 15_000,
-        26 => 60_000,
-        _ => 50_000,
+        1..=6 => 100_000,
+        7..=9 => 100_000,
+        10..=12 => 500_000,
+        13..=14 => 100_000,
+        15 => 200_000,
+        16..=18 => 200_000,
+        19..=20 => 200_000,
+        21..=23 => 500_000,
+        24..=25 => 100_000,
+        26 => 500_000,
+        _ => 200_000,
     }
 }
 

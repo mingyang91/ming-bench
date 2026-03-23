@@ -98,29 +98,28 @@ Session analysis tools parse Claude Code JSONL sessions from `results/`. The sha
 - **`/compare` skill** — Guides narrative analysis: runs compare, identifies struggle levels, reads thinking blocks, produces verdict.
 - **`/compliance` skill** — Analyzes whether an agent followed its strategy rules.
 
-Output token budgets (by level tier):
+Output token safety caps (by level tier):
 
-| Levels | Tier | Token Budget |
-|--------|------|-------------|
-| L01-L03 | Foundation | 25,000 |
-| L04-L06 | Error/Strings/Mutable | 25,000 |
-| L07-L09 | TCO/set!/Variadic | 20,000 |
-| L10-L12 | call/cc/Macros/Integration | 150,000 |
-| L13-L14 | Builtins/String Immutability | 30,000 |
-| L15 | Equality/Letrec/Case/Vectors/Do | 40,000 |
-| L16-L18 | dynamic-wind/guard/values | 60,000 |
-| L19-L20 | Rationals/Records | 50,000 |
-| L21-L23 | Pair Mutation/syntax-case/Final Integration | 100,000 |
-| L24-L25 | Tech-debt: case-lambda/procedure? | 15,000 |
-| L26     | Real-world integration stress | 60,000 |
+| Levels | Tier | Safety Cap |
+|--------|------|-----------|
+| L01-L06 | Foundation/Error/Strings | 100K |
+| L07-L09 | TCO/set!/Variadic | 100K |
+| L10-L12 | call/cc/Macros/Integration | 500K |
+| L13-L14 | Builtins/String Immutability | 100K |
+| L15 | Equality/Letrec/Case/Vectors/Do | 200K |
+| L16-L18 | dynamic-wind/guard/values | 200K |
+| L19-L20 | Rationals/Records | 200K |
+| L21-L23 | Pair Mutation/syntax-case/Final Integration | 500K |
+| L24-L25 | Tech-debt: case-lambda/procedure? | 100K |
+| L26     | Real-world integration stress | 500K |
 
-Budget enforcement: the orchestrator monitors output tokens in real-time (polling session.jsonl for Claude, JSONL stdout for Codex) and sends SIGTERM when the budget is exceeded. A safety-net turn limit of 200 is always passed to prevent runaway sessions. Override per-level budget with `--max-tokens N`.
+These are circuit breakers, not performance targets — set generously so legitimate work never hits them. Only dead loops or stuck agents should trigger. The orchestrator monitors output tokens in real-time (polling session.jsonl for Claude, JSONL stdout for Codex) and sends SIGTERM when the cap is exceeded. A safety-net turn limit of 200 is always passed. Override per-level cap with `--max-tokens N`.
 
 Failed levels auto-retry up to 2 times if the failure was infrastructure (timeout/529/crash), not budget exhaustion.
 
-**Regression checking:** After each level passes (before quality gate cleanup), the orchestrator re-runs all previously-passed levels against the current code. If any regress (e.g., L14 breaking L06's `string-set!`), a fix-it agent pass is launched with the **same tiered token budget as the coding pass**. If the fix-it pass fails to resolve the regressions, the run halts with `REGRESSION` status. Checkpoints: `REGFIX` (regressions fixed), `REGRESSION` (halted).
+**Regression checking:** After each level passes (before quality gate cleanup), the orchestrator re-runs all previously-passed levels against the current code. If any regress (e.g., L14 breaking L06's `string-set!`), a fix-it agent pass is launched with the **same tiered token cap as the coding pass**. If the fix-it pass fails to resolve the regressions, the run halts with `REGRESSION` status. Checkpoints: `REGFIX` (regressions fixed), `REGRESSION` (halted).
 
-**Quality-gate cleanup:** After regression check passes, quality-gate levels get an additional 5,000-token cleanup pass with `cargo xtask test --gate`. The agent never sees clippy during coding — the orchestrator controls when quality checks run.
+**Quality-gate cleanup:** After regression check passes, quality-gate levels get an additional cleanup pass (50K token cap) with `cargo xtask test --gate`. The agent never sees clippy during coding — the orchestrator controls when quality checks run.
 
 ## Key Conventions
 
