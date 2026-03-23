@@ -190,7 +190,7 @@ function parseParams(elements, errPos) {
         throw posError('param must be symbol', errPos); return p.value; });
     return { params, restParam: last.value };
 }
-// ── Evaluator ──────────────────────────────────────────────────────
+// ── CPS Evaluator ──────────────────────────────────────────────────
 function isTruthy(val) {
     return !(val.tag === 'boolean' && val.value === false);
 }
@@ -199,215 +199,277 @@ function expectNumber(val, op, p) {
         throw posError(`${op}: expected number`, p);
     return val.value;
 }
-function evaluate(initExpr, initEnv) {
-    let expr = initExpr;
-    let env = initEnv;
-    for (;;) {
-        if (expr.tag === 'number' || expr.tag === 'boolean' || expr.tag === 'string')
-            return expr;
-        if (expr.tag === 'symbol')
-            return env.get(expr.value, expr.pos);
-        if (expr.tag !== 'list')
-            return expr;
-        const elems = expr.elements;
-        if (elems.length === 0)
-            throw posError('empty application', expr.pos);
-        const head = elems[0];
-        // Special forms
-        if (head.tag === 'symbol') {
-            switch (head.value) {
-                case 'quote':
-                    if (elems.length !== 2)
-                        throw posError('quote: need 1 argument', expr.pos);
-                    return elems[1];
-                case 'if': {
-                    if (elems.length < 3 || elems.length > 4)
-                        throw posError('if: bad syntax', expr.pos);
-                    const cond = evaluate(elems[1], env);
-                    if (isTruthy(cond)) {
-                        expr = elems[2];
-                        continue;
-                    }
-                    if (elems.length === 4) {
-                        expr = elems[3];
-                        continue;
-                    }
-                    return { tag: 'void' };
-                }
-                case 'define': {
-                    if (elems.length < 3)
-                        throw posError('define: bad syntax', expr.pos);
-                    const target = elems[1];
-                    if (target.tag === 'symbol') {
-                        env.set(target.value, evaluate(elems[2], env));
-                        return { tag: 'void' };
-                    }
-                    if (target.tag === 'list' && target.elements.length > 0 && target.elements[0].tag === 'symbol') {
-                        const fnName = target.elements[0].value;
-                        const { params, restParam } = parseParams(target.elements.slice(1), expr.pos);
-                        env.set(fnName, { tag: 'lambda', params, restParam, body: elems.slice(2), env });
-                        return { tag: 'void' };
-                    }
+function done(v) { return { done: true, value: v }; }
+function bounce(thunk) { return { done: false, thunk }; }
+function trampoline(b) {
+    while (!b.done)
+        b = b.thunk();
+    return b.value;
+}
+let fuel = 0;
+function evalK(expr, env, k) {
+    if (++fuel > 500) {
+        fuel = 0;
+        return bounce(() => evalK(expr, env, k));
+    }
+    switch (expr.tag) {
+        case 'number':
+        case 'boolean':
+        case 'string':
+        case 'char':
+        case 'void':
+            return k(expr);
+        case 'symbol':
+            return k(env.get(expr.value, expr.pos));
+        case 'list':
+            break;
+        default:
+            return k(expr);
+    }
+    const elems = expr.elements;
+    if (elems.length === 0)
+        throw posError('empty application', expr.pos);
+    const head = elems[0];
+    if (head.tag === 'symbol') {
+        switch (head.value) {
+            case 'quote':
+                if (elems.length !== 2)
+                    throw posError('quote: need 1 argument', expr.pos);
+                return k(elems[1]);
+            case 'if':
+                if (elems.length < 3 || elems.length > 4)
+                    throw posError('if: bad syntax', expr.pos);
+                return evalK(elems[1], env, cond => {
+                    if (isTruthy(cond))
+                        return evalK(elems[2], env, k);
+                    if (elems.length === 4)
+                        return evalK(elems[3], env, k);
+                    return k({ tag: 'void' });
+                });
+            case 'define': {
+                if (elems.length < 3)
                     throw posError('define: bad syntax', expr.pos);
+                const target = elems[1];
+                if (target.tag === 'symbol') {
+                    return evalK(elems[2], env, val => {
+                        env.set(target.value, val);
+                        return k({ tag: 'void' });
+                    });
                 }
-                case 'lambda': {
-                    if (elems.length < 3)
-                        throw posError('lambda: bad syntax', expr.pos);
-                    const paramList = elems[1];
-                    if (paramList.tag === 'symbol') {
-                        // (lambda args body...) — all args as rest
-                        return { tag: 'lambda', params: [], restParam: paramList.value, body: elems.slice(2), env };
-                    }
-                    if (paramList.tag !== 'list')
-                        throw posError('lambda: params must be a list', expr.pos);
-                    const { params, restParam } = parseParams(paramList.elements, expr.pos);
-                    return { tag: 'lambda', params, restParam, body: elems.slice(2), env };
+                if (target.tag === 'list' && target.elements.length > 0 && target.elements[0].tag === 'symbol') {
+                    const fnName = target.elements[0].value;
+                    const { params, restParam } = parseParams(target.elements.slice(1), expr.pos);
+                    env.set(fnName, { tag: 'lambda', params, restParam, body: elems.slice(2), env });
+                    return k({ tag: 'void' });
                 }
-                case 'let': {
-                    if (elems.length < 3)
+                throw posError('define: bad syntax', expr.pos);
+            }
+            case 'lambda': {
+                if (elems.length < 3)
+                    throw posError('lambda: bad syntax', expr.pos);
+                const paramList = elems[1];
+                if (paramList.tag === 'symbol') {
+                    return k({ tag: 'lambda', params: [], restParam: paramList.value, body: elems.slice(2), env });
+                }
+                if (paramList.tag !== 'list')
+                    throw posError('lambda: params must be a list', expr.pos);
+                const { params, restParam } = parseParams(paramList.elements, expr.pos);
+                return k({ tag: 'lambda', params, restParam, body: elems.slice(2), env });
+            }
+            case 'set!': {
+                if (elems.length !== 3)
+                    throw posError('set!: bad syntax', expr.pos);
+                const target = elems[1];
+                if (target.tag !== 'symbol')
+                    throw posError('set!: target must be a symbol', expr.pos);
+                return evalK(elems[2], env, val => {
+                    env.mutate(target.value, val, expr.pos);
+                    return k({ tag: 'void' });
+                });
+            }
+            case 'begin':
+                if (elems.length === 1)
+                    return k({ tag: 'void' });
+                return evalSeq(elems, 1, env, k);
+            case 'let': {
+                if (elems.length < 3)
+                    throw posError('let: bad syntax', expr.pos);
+                // Named let
+                if (elems[1].tag === 'symbol') {
+                    const loopName = elems[1].value;
+                    if (elems.length < 4)
                         throw posError('let: bad syntax', expr.pos);
-                    // Named let: (let name ((var init) ...) body ...)
-                    if (elems[1].tag === 'symbol') {
-                        const loopName = elems[1].value;
-                        if (elems.length < 4)
-                            throw posError('let: bad syntax', expr.pos);
-                        const bindingList = elems[2];
-                        if (bindingList.tag !== 'list')
-                            throw posError('let: bindings must be a list', expr.pos);
-                        const paramNames = [];
-                        const initExprs = [];
-                        for (const b of bindingList.elements) {
-                            if (b.tag !== 'list' || b.elements.length !== 2 || b.elements[0].tag !== 'symbol')
-                                throw posError('let: bad binding', expr.pos);
-                            paramNames.push(b.elements[0].value);
-                            initExprs.push(b.elements[1]);
-                        }
-                        const body = elems.slice(3);
-                        const loopLambda = { tag: 'lambda', params: paramNames, body, env };
-                        const letEnv = new Env(env);
-                        letEnv.set(loopName, loopLambda);
-                        loopLambda.env = letEnv;
-                        const args = initExprs.map(e => evaluate(e, env));
+                    const bindingList = elems[2];
+                    if (bindingList.tag !== 'list')
+                        throw posError('let: bindings must be a list', expr.pos);
+                    const paramNames = [];
+                    const initExprs = [];
+                    for (const b of bindingList.elements) {
+                        if (b.tag !== 'list' || b.elements.length !== 2 || b.elements[0].tag !== 'symbol')
+                            throw posError('let: bad binding', expr.pos);
+                        paramNames.push(b.elements[0].value);
+                        initExprs.push(b.elements[1]);
+                    }
+                    const bodyExprs = elems.slice(3);
+                    const loopLambda = { tag: 'lambda', params: paramNames, body: bodyExprs, env };
+                    const letEnv = new Env(env);
+                    letEnv.set(loopName, loopLambda);
+                    loopLambda.env = letEnv;
+                    return evalList(initExprs, env, args => {
                         const callEnv = new Env(letEnv);
                         for (let i = 0; i < paramNames.length; i++)
                             callEnv.set(paramNames[i], args[i]);
-                        for (let i = 0; i < body.length - 1; i++)
-                            evaluate(body[i], callEnv);
-                        expr = body[body.length - 1];
-                        env = callEnv;
-                        continue;
+                        return evalSeqArr(bodyExprs, callEnv, k);
+                    });
+                }
+                // Regular let
+                const bindings = elems[1];
+                if (bindings.tag !== 'list')
+                    throw posError('let: bindings must be a list', expr.pos);
+                const letEnv = new Env(env);
+                const evalBindings = (i) => {
+                    if (i >= bindings.elements.length) {
+                        return evalSeq(elems, 2, letEnv, k);
                     }
-                    // Regular let: (let ((var init) ...) body ...)
-                    const bindings = elems[1];
-                    if (bindings.tag !== 'list')
-                        throw posError('let: bindings must be a list', expr.pos);
-                    const letEnv2 = new Env(env);
-                    for (const b of bindings.elements) {
-                        if (b.tag !== 'list' || b.elements.length !== 2 || b.elements[0].tag !== 'symbol')
-                            throw posError('let: bad binding', expr.pos);
-                        letEnv2.set(b.elements[0].value, evaluate(b.elements[1], env));
+                    const b = bindings.elements[i];
+                    if (b.tag !== 'list' || b.elements.length !== 2 || b.elements[0].tag !== 'symbol')
+                        throw posError('let: bad binding', expr.pos);
+                    const bindName = b.elements[0].value;
+                    return evalK(b.elements[1], env, val => {
+                        letEnv.set(bindName, val);
+                        return evalBindings(i + 1);
+                    });
+                };
+                return evalBindings(0);
+            }
+            case 'cond': {
+                const evalClauses = (i) => {
+                    if (i >= elems.length)
+                        return k({ tag: 'void' });
+                    const clause = elems[i];
+                    if (clause.tag !== 'list' || clause.elements.length < 2)
+                        throw posError('cond: bad clause', expr.pos);
+                    if (clause.elements[0].tag === 'symbol' && clause.elements[0].value === 'else') {
+                        return evalSeqArr(clause.elements.slice(1), env, k);
                     }
-                    for (let i = 2; i < elems.length - 1; i++)
-                        evaluate(elems[i], letEnv2);
-                    expr = elems[elems.length - 1];
-                    env = letEnv2;
-                    continue;
-                }
-                case 'set!': {
-                    if (elems.length !== 3)
-                        throw posError('set!: bad syntax', expr.pos);
-                    const target = elems[1];
-                    if (target.tag !== 'symbol')
-                        throw posError('set!: target must be a symbol', expr.pos);
-                    const val = evaluate(elems[2], env);
-                    env.mutate(target.value, val, expr.pos);
-                    return { tag: 'void' };
-                }
-                case 'begin': {
-                    if (elems.length === 1)
-                        return { tag: 'void' };
-                    for (let i = 1; i < elems.length - 1; i++)
-                        evaluate(elems[i], env);
-                    expr = elems[elems.length - 1];
-                    continue;
-                }
-                case 'cond': {
-                    let matched = false;
-                    for (let i = 1; i < elems.length; i++) {
-                        const clause = elems[i];
-                        if (clause.tag !== 'list' || clause.elements.length < 2)
-                            throw posError('cond: bad clause', expr.pos);
-                        if (clause.elements[0].tag === 'symbol' && clause.elements[0].value === 'else') {
-                            for (let j = 1; j < clause.elements.length - 1; j++)
-                                evaluate(clause.elements[j], env);
-                            expr = clause.elements[clause.elements.length - 1];
-                            matched = true;
-                            break;
-                        }
-                        const test = evaluate(clause.elements[0], env);
-                        if (isTruthy(test)) {
-                            for (let j = 1; j < clause.elements.length - 1; j++)
-                                evaluate(clause.elements[j], env);
-                            expr = clause.elements[clause.elements.length - 1];
-                            matched = true;
-                            break;
-                        }
-                    }
-                    if (matched)
-                        continue;
-                    return { tag: 'void' };
-                }
-                case 'and': {
-                    if (elems.length === 1)
-                        return { tag: 'boolean', value: true };
-                    for (let i = 1; i < elems.length - 1; i++) {
-                        const result = evaluate(elems[i], env);
-                        if (!isTruthy(result))
-                            return result;
-                    }
-                    expr = elems[elems.length - 1];
-                    continue;
-                }
-                case 'or': {
-                    if (elems.length === 1)
-                        return { tag: 'boolean', value: false };
-                    for (let i = 1; i < elems.length - 1; i++) {
-                        const result = evaluate(elems[i], env);
-                        if (isTruthy(result))
-                            return result;
-                    }
-                    expr = elems[elems.length - 1];
-                    continue;
-                }
+                    return evalK(clause.elements[0], env, test => {
+                        if (isTruthy(test))
+                            return evalSeqArr(clause.elements.slice(1), env, k);
+                        return evalClauses(i + 1);
+                    });
+                };
+                return evalClauses(1);
+            }
+            case 'and': {
+                if (elems.length === 1)
+                    return k({ tag: 'boolean', value: true });
+                const evalAnds = (i) => {
+                    if (i === elems.length - 1)
+                        return evalK(elems[i], env, k);
+                    return evalK(elems[i], env, val => {
+                        if (!isTruthy(val))
+                            return k(val);
+                        return evalAnds(i + 1);
+                    });
+                };
+                return evalAnds(1);
+            }
+            case 'or': {
+                if (elems.length === 1)
+                    return k({ tag: 'boolean', value: false });
+                const evalOrs = (i) => {
+                    if (i === elems.length - 1)
+                        return evalK(elems[i], env, k);
+                    return evalK(elems[i], env, val => {
+                        if (isTruthy(val))
+                            return k(val);
+                        return evalOrs(i + 1);
+                    });
+                };
+                return evalOrs(1);
             }
         }
-        // Function application
-        const proc = evaluate(head, env);
-        const args = elems.slice(1).map(e => evaluate(e, env));
-        if (proc.tag === 'lambda') {
-            if (proc.restParam) {
-                if (args.length < proc.params.length)
-                    throw posError('wrong number of arguments', expr.pos);
-            }
-            else {
-                if (args.length !== proc.params.length)
-                    throw posError('wrong number of arguments', expr.pos);
-            }
-            const callEnv = new Env(proc.env);
-            for (let i = 0; i < proc.params.length; i++)
-                callEnv.set(proc.params[i], args[i]);
-            if (proc.restParam)
-                callEnv.set(proc.restParam, { tag: 'list', elements: args.slice(proc.params.length) });
-            for (let i = 0; i < proc.body.length - 1; i++)
-                evaluate(proc.body[i], callEnv);
-            expr = proc.body[proc.body.length - 1];
-            env = callEnv;
-            continue;
-        }
-        if (proc.tag === 'builtin')
-            return proc.fn(args, expr.pos);
-        throw posError('not a procedure', expr.pos);
     }
+    // Function application: evaluate head, then args, then apply
+    return evalK(head, env, proc => evalList(elems.slice(1), env, args => applyK(proc, args, k, expr.pos)));
+}
+// Evaluate a sequence of expressions from elems[start..], return last value
+function evalSeq(elems, start, env, k) {
+    if (start >= elems.length)
+        return k({ tag: 'void' });
+    const loop = (i) => {
+        if (i === elems.length - 1)
+            return evalK(elems[i], env, k);
+        return evalK(elems[i], env, _ => loop(i + 1));
+    };
+    return loop(start);
+}
+// Same but for a standalone array
+function evalSeqArr(exprs, env, k) {
+    if (exprs.length === 0)
+        return k({ tag: 'void' });
+    const loop = (i) => {
+        if (i === exprs.length - 1)
+            return evalK(exprs[i], env, k);
+        return evalK(exprs[i], env, _ => loop(i + 1));
+    };
+    return loop(0);
+}
+// Evaluate a list of expressions left-to-right, collect results
+function evalList(exprs, env, k) {
+    const n = exprs.length;
+    const results = new Array(n);
+    const loop = (i) => {
+        if (i < 0)
+            return k(results);
+        return evalK(exprs[i], env, val => {
+            results[i] = val;
+            return loop(i - 1);
+        });
+    };
+    return loop(n - 1);
+}
+// Apply a procedure to arguments in CPS
+function applyK(proc, args, k, pos) {
+    if (proc.tag === 'callcc') {
+        if (args.length !== 1)
+            throw posError('call/cc: need 1 argument', pos);
+        const kontVal = { tag: 'continuation', fn: k };
+        return applyK(args[0], [kontVal], k, pos);
+    }
+    if (proc.tag === 'continuation') {
+        return proc.fn(args.length > 0 ? args[0] : { tag: 'void' });
+    }
+    if (proc.tag === 'builtin' && proc.name === 'apply') {
+        if (args.length < 2)
+            throw posError('apply: need at least 2 arguments', pos);
+        const fn = args[0];
+        const lastArg = args[args.length - 1];
+        if (lastArg.tag !== 'list')
+            throw posError('apply: last argument must be a list', pos);
+        const allArgs = [...args.slice(1, -1), ...lastArg.elements];
+        return applyK(fn, allArgs, k, pos);
+    }
+    if (proc.tag === 'lambda') {
+        if (proc.restParam) {
+            if (args.length < proc.params.length)
+                throw posError('wrong number of arguments', pos);
+        }
+        else {
+            if (args.length !== proc.params.length)
+                throw posError('wrong number of arguments', pos);
+        }
+        const callEnv = new Env(proc.env);
+        for (let i = 0; i < proc.params.length; i++)
+            callEnv.set(proc.params[i], args[i]);
+        if (proc.restParam)
+            callEnv.set(proc.restParam, { tag: 'list', elements: args.slice(proc.params.length) });
+        return bounce(() => evalSeqArr(proc.body, callEnv, k));
+    }
+    if (proc.tag === 'builtin') {
+        return k(proc.fn(args, pos));
+    }
+    throw posError('not a procedure', pos);
 }
 // ── Builtins ──────────────────────────────────────────────────────
 function makeGlobalEnv(output = []) {
@@ -415,6 +477,11 @@ function makeGlobalEnv(output = []) {
     function defBuiltin(name, fn) {
         env.set(name, { tag: 'builtin', name, fn });
     }
+    // call/cc
+    env.set('call/cc', { tag: 'callcc' });
+    env.set('call-with-current-continuation', { tag: 'callcc' });
+    // apply (handled specially in applyK, but needs a value in the env)
+    env.set('apply', { tag: 'builtin', name: 'apply', fn: () => { throw new EvalError('internal: apply handled by applyK'); } });
     defBuiltin('+', (args, p) => { let s = 0; for (const a of args)
         s += expectNumber(a, '+', p); return { tag: 'number', value: s }; });
     defBuiltin('-', (args, p) => {
@@ -498,38 +565,6 @@ function makeGlobalEnv(output = []) {
         }
         return { tag: 'list', elements: result };
     });
-    // Apply
-    defBuiltin('apply', (args, p) => {
-        if (args.length < 2)
-            throw posError('apply: need at least 2 arguments', p);
-        const fn = args[0];
-        const lastArg = args[args.length - 1];
-        if (lastArg.tag !== 'list')
-            throw posError('apply: last argument must be a list', p);
-        const allArgs = [...args.slice(1, -1), ...lastArg.elements];
-        if (fn.tag === 'lambda') {
-            if (fn.restParam) {
-                if (allArgs.length < fn.params.length)
-                    throw posError('wrong number of arguments', p);
-            }
-            else {
-                if (allArgs.length !== fn.params.length)
-                    throw posError('wrong number of arguments', p);
-            }
-            const callEnv = new Env(fn.env);
-            for (let i = 0; i < fn.params.length; i++)
-                callEnv.set(fn.params[i], allArgs[i]);
-            if (fn.restParam)
-                callEnv.set(fn.restParam, { tag: 'list', elements: allArgs.slice(fn.params.length) });
-            let result = { tag: 'void' };
-            for (const bodyExpr of fn.body)
-                result = evaluate(bodyExpr, callEnv);
-            return result;
-        }
-        if (fn.tag === 'builtin')
-            return fn.fn(allArgs, p);
-        throw posError('apply: not a procedure', p);
-    });
     // Type predicates
     defBuiltin('number?', (args, p) => { if (args.length !== 1)
         throw posError('number?: need 1 argument', p); return { tag: 'boolean', value: args[0].tag === 'number' }; });
@@ -543,6 +578,12 @@ function makeGlobalEnv(output = []) {
         throw posError('symbol?: need 1 argument', p); return { tag: 'boolean', value: args[0].tag === 'symbol' }; });
     defBuiltin('char?', (args, p) => { if (args.length !== 1)
         throw posError('char?: need 1 argument', p); return { tag: 'boolean', value: args[0].tag === 'char' }; });
+    defBuiltin('procedure?', (args, p) => {
+        if (args.length !== 1)
+            throw posError('procedure?: need 1 argument', p);
+        const t = args[0].tag;
+        return { tag: 'boolean', value: t === 'lambda' || t === 'builtin' || t === 'continuation' || t === 'callcc' };
+    });
     // Output
     defBuiltin('display', (args, p) => {
         if (args.length !== 1)
@@ -655,6 +696,8 @@ function displayVal(val) {
         case 'void': return '';
         case 'lambda': return '#<procedure>';
         case 'builtin': return '#<procedure>';
+        case 'continuation': return '#<procedure>';
+        case 'callcc': return '#<procedure>';
     }
 }
 function writeVal(val) {
@@ -674,9 +717,7 @@ export function evalStr(input) {
     if (exprs.length === 0)
         throw new EvalError('no expressions');
     const env = makeGlobalEnv();
-    let result = { tag: 'void' };
-    for (const expr of exprs)
-        result = evaluate(expr, env);
+    const result = trampoline(evalSeqArr(exprs, env, v => done(v)));
     return displayVal(result);
 }
 export function evalStrWithOutput(input) {
@@ -685,8 +726,6 @@ export function evalStrWithOutput(input) {
         throw new EvalError('no expressions');
     const output = [];
     const env = makeGlobalEnv(output);
-    let result = { tag: 'void' };
-    for (const expr of exprs)
-        result = evaluate(expr, env);
+    const result = trampoline(evalSeqArr(exprs, env, v => done(v)));
     return { result: displayVal(result), output: output.join('') };
 }
