@@ -238,12 +238,84 @@ function applyBuiltin(op: string, evalArgs: SchemeVal[]): SchemeVal {
       if (evalArgs.length !== 1) throw new EvalError('not: need exactly one arg');
       return { tag: 'boolean', val: !isTruthy(evalArgs[0]) };
     }
+    case 'cons': {
+      if (evalArgs.length !== 2) throw new EvalError('cons: need exactly two args');
+      const [h, t] = evalArgs;
+      if (t.tag === 'list') return { tag: 'list', val: [h, ...t.val] };
+      // dotted pair — store as 2-element tagged list for now
+      return { tag: 'list', val: [h, { tag: 'symbol', val: '.' }, t] };
+    }
+    case 'car': {
+      if (evalArgs.length !== 1) throw new EvalError('car: need exactly one arg');
+      const a = evalArgs[0];
+      if (a.tag !== 'list' || a.val.length === 0) throw new EvalError('car: not a pair');
+      return a.val[0];
+    }
+    case 'cdr': {
+      if (evalArgs.length !== 1) throw new EvalError('cdr: need exactly one arg');
+      const a = evalArgs[0];
+      if (a.tag !== 'list' || a.val.length === 0) throw new EvalError('cdr: not a pair');
+      return { tag: 'list', val: a.val.slice(1) };
+    }
+    case 'null?': {
+      if (evalArgs.length !== 1) throw new EvalError('null?: need exactly one arg');
+      return { tag: 'boolean', val: evalArgs[0].tag === 'list' && evalArgs[0].val.length === 0 };
+    }
+    case 'list': {
+      return { tag: 'list', val: evalArgs };
+    }
+    case 'length': {
+      if (evalArgs.length !== 1) throw new EvalError('length: need exactly one arg');
+      if (evalArgs[0].tag !== 'list') throw new EvalError('length: not a list');
+      return { tag: 'number', val: evalArgs[0].val.length };
+    }
+    case 'append': {
+      if (evalArgs.length === 0) return { tag: 'list', val: [] };
+      let result: SchemeVal[] = [];
+      for (let i = 0; i < evalArgs.length; i++) {
+        const a = evalArgs[i];
+        if (i < evalArgs.length - 1) {
+          if (a.tag !== 'list') throw new EvalError('append: not a list');
+          result = result.concat(a.val);
+        } else {
+          if (a.tag === 'list') result = result.concat(a.val);
+          else result.push(a);
+        }
+      }
+      return { tag: 'list', val: result };
+    }
+    case 'pair?': {
+      if (evalArgs.length !== 1) throw new EvalError('pair?: need exactly one arg');
+      return { tag: 'boolean', val: evalArgs[0].tag === 'list' && evalArgs[0].val.length > 0 };
+    }
+    case 'number?': {
+      if (evalArgs.length !== 1) throw new EvalError('number?: need exactly one arg');
+      return { tag: 'boolean', val: evalArgs[0].tag === 'number' };
+    }
+    case 'string?': {
+      if (evalArgs.length !== 1) throw new EvalError('string?: need exactly one arg');
+      return { tag: 'boolean', val: evalArgs[0].tag === 'string' };
+    }
+    case 'boolean?': {
+      if (evalArgs.length !== 1) throw new EvalError('boolean?: need exactly one arg');
+      return { tag: 'boolean', val: evalArgs[0].tag === 'boolean' };
+    }
+    case 'symbol?': {
+      if (evalArgs.length !== 1) throw new EvalError('symbol?: need exactly one arg');
+      return { tag: 'boolean', val: evalArgs[0].tag === 'symbol' };
+    }
+    case 'procedure?': {
+      if (evalArgs.length !== 1) throw new EvalError('procedure?: need exactly one arg');
+      return { tag: 'boolean', val: evalArgs[0].tag === 'lambda' };
+    }
     default:
       throw new EvalError(`unknown procedure: ${op}`);
   }
 }
 
-const BUILTINS = new Set(['+', '-', '*', '/', '<', '>', '=', '<=', '>=', 'not']);
+const BUILTINS = new Set(['+', '-', '*', '/', '<', '>', '=', '<=', '>=', 'not',
+  'cons', 'car', 'cdr', 'null?', 'list', 'length', 'append',
+  'pair?', 'number?', 'string?', 'boolean?', 'symbol?', 'procedure?']);
 
 function evalExpr(expr: SchemeVal, env: Env): SchemeVal {
   if (expr.tag === 'number' || expr.tag === 'boolean' || expr.tag === 'string') {
@@ -319,6 +391,75 @@ function evalExpr(expr: SchemeVal, env: Env): SchemeVal {
           if (!isTruthy(result)) return result;
         }
         return result;
+      }
+
+      if (op === 'let') {
+        // (let ((x 1) (y 2)) body...) or named let (let name ((x 1)) body...)
+        if (args.length < 2) throw new EvalError('let: bad syntax');
+        let name: string | null = null;
+        let bindingsExpr: SchemeVal;
+        let body: SchemeVal[];
+        if (args[0].tag === 'symbol') {
+          // named let
+          name = args[0].val;
+          if (args.length < 3) throw new EvalError('let: bad syntax');
+          bindingsExpr = args[1];
+          body = args.slice(2);
+        } else {
+          bindingsExpr = args[0];
+          body = args.slice(1);
+        }
+        if (bindingsExpr.tag !== 'list') throw new EvalError('let: bad bindings');
+        const paramNames: string[] = [];
+        const initVals: SchemeVal[] = [];
+        for (const b of bindingsExpr.val) {
+          if (b.tag !== 'list' || b.val.length !== 2 || b.val[0].tag !== 'symbol')
+            throw new EvalError('let: bad binding');
+          paramNames.push(b.val[0].val);
+          initVals.push(evalExpr(b.val[1], env));
+        }
+        if (name !== null) {
+          // named let: create a recursive lambda
+          const letEnv = new Env(env);
+          const lambda: SchemeVal = { tag: 'lambda', params: paramNames, body, env: letEnv };
+          letEnv.define(name, lambda);
+          const callEnv = new Env(letEnv);
+          for (let i = 0; i < paramNames.length; i++) callEnv.define(paramNames[i], initVals[i]);
+          let result: SchemeVal = { tag: 'boolean', val: false };
+          for (const b of body) result = evalExpr(b, callEnv);
+          return result;
+        } else {
+          const letEnv = new Env(env);
+          for (let i = 0; i < paramNames.length; i++) letEnv.define(paramNames[i], initVals[i]);
+          let result: SchemeVal = { tag: 'boolean', val: false };
+          for (const b of body) result = evalExpr(b, letEnv);
+          return result;
+        }
+      }
+
+      if (op === 'begin') {
+        let result: SchemeVal = { tag: 'boolean', val: false };
+        for (const a of args) result = evalExpr(a, env);
+        return result;
+      }
+
+      if (op === 'cond') {
+        for (const clause of args) {
+          if (clause.tag !== 'list' || clause.val.length < 2) throw new EvalError('cond: bad clause');
+          const test = clause.val[0];
+          if (test.tag === 'symbol' && test.val === 'else') {
+            let result: SchemeVal = { tag: 'boolean', val: false };
+            for (let i = 1; i < clause.val.length; i++) result = evalExpr(clause.val[i], env);
+            return result;
+          }
+          const cond = evalExpr(test, env);
+          if (isTruthy(cond)) {
+            let result: SchemeVal = cond;
+            for (let i = 1; i < clause.val.length; i++) result = evalExpr(clause.val[i], env);
+            return result;
+          }
+        }
+        return { tag: 'boolean', val: false };
       }
 
       if (op === 'or') {
