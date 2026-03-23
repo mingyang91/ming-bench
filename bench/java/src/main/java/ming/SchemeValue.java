@@ -1,6 +1,9 @@
 package ming;
 
+import java.util.Collections;
+import java.util.IdentityHashMap;
 import java.util.List;
+import java.util.Set;
 
 public sealed interface SchemeValue {
     record IntVal(long value, SourcePos pos) implements SchemeValue {}
@@ -18,12 +21,75 @@ public sealed interface SchemeValue {
     record Thunk(SchemeValue expr, Environment env) implements SchemeValue {}
     record ContinuationVal(Continuation cont) implements SchemeValue {}
     record SyntaxRulesVal(List<String> literals, List<SchemeValue> patterns, List<SchemeValue> templates, Environment defEnv) implements SchemeValue {}
-    record PairVal(SchemeValue car, SchemeValue cdr, SourcePos pos) implements SchemeValue {}
+
+    /** Mutable pair (cons cell). car and cdr can be mutated via set-car!/set-cdr!. */
+    final class PairVal implements SchemeValue {
+        SchemeValue car;
+        SchemeValue cdr;
+        private final SourcePos pos;
+
+        PairVal(SchemeValue car, SchemeValue cdr, SourcePos pos) {
+            this.car = car;
+            this.cdr = cdr;
+            this.pos = pos;
+        }
+
+        SchemeValue car() { return car; }
+        SchemeValue cdr() { return cdr; }
+        SourcePos pos() { return pos; }
+
+        private static final ThreadLocal<Set<PairVal>> DISPLAY_GUARD =
+            ThreadLocal.withInitial(() -> Collections.newSetFromMap(new IdentityHashMap<>()));
+
+        private String formatList(boolean writeMode) {
+            var seen = DISPLAY_GUARD.get();
+            boolean isRoot = seen.isEmpty();
+            if (!seen.add(this)) return "...";
+            try {
+                var sb = new StringBuilder("(");
+                sb.append(writeMode ? car.display() : car.displayOutput());
+                SchemeValue tail = cdr;
+                while (tail instanceof PairVal p) {
+                    if (!seen.add(p)) { sb.append(" ..."); break; }
+                    sb.append(' ').append(writeMode ? p.car.display() : p.car.displayOutput());
+                    tail = p.cdr;
+                }
+                if (tail instanceof ListVal lst && lst.elements().isEmpty()) {
+                    // proper list end
+                } else if (!(tail instanceof PairVal)) {
+                    sb.append(" . ").append(writeMode ? tail.display() : tail.displayOutput());
+                }
+                sb.append(')');
+                return sb.toString();
+            } finally {
+                if (isRoot) seen.clear();
+            }
+        }
+
+        @Override
+        public String display() { return formatList(true); }
+
+        @Override
+        public String displayOutput() { return formatList(false); }
+    }
+
     record VectorVal(SchemeValue[] elements, SourcePos pos) implements SchemeValue {}
     record ValuesVal(List<SchemeValue> values) implements SchemeValue {}
     record RationalVal(long num, long den, SourcePos pos) implements SchemeValue {}
     record DoubleVal(double value, SourcePos pos) implements SchemeValue {}
     record RecordVal(String typeName, int typeId, String[] fieldNames, SchemeValue[] fieldValues, SourcePos pos) implements SchemeValue {}
+
+    /** Nil (empty list) singleton. */
+    ListVal NIL = new ListVal(List.of(), SourcePos.NONE);
+
+    /** Build a proper list (PairVal chain terminated by NIL) from Java list elements. */
+    static SchemeValue makeList(List<SchemeValue> elements) {
+        SchemeValue result = NIL;
+        for (int i = elements.size() - 1; i >= 0; i--) {
+            result = new PairVal(elements.get(i), result, SourcePos.NONE);
+        }
+        return result;
+    }
 
     default SourcePos sourcePos() {
         return switch (this) {
@@ -77,7 +143,7 @@ public sealed interface SchemeValue {
             case ContinuationVal v -> "#<continuation>";
             case SyntaxRulesVal v -> "#<macro>";
             case ValuesVal v -> "#<values>";
-            case PairVal v -> "(" + v.car().display() + " . " + v.cdr().display() + ")";
+            case PairVal v -> v.display(); // delegated to PairVal's override
             case VectorVal v -> {
                 var sb = new StringBuilder("#(");
                 for (int i = 0; i < v.elements().length; i++) {
@@ -109,7 +175,7 @@ public sealed interface SchemeValue {
             case ContinuationVal v -> "#<continuation>";
             case SyntaxRulesVal v -> "#<macro>";
             case ValuesVal v -> "#<values>";
-            case PairVal v -> "(" + v.car().displayOutput() + " . " + v.cdr().displayOutput() + ")";
+            case PairVal v -> v.displayOutput(); // delegated to PairVal's override
             case VectorVal v -> {
                 var sb = new StringBuilder("#(");
                 for (int i = 0; i < v.elements().length; i++) {

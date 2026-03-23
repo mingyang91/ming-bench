@@ -32,7 +32,7 @@ public class Evaluator {
     private int recordTypeCounter = 0;
 
     private static final Set<String> SPECIAL_FORMS = Set.of(
-        "define", "if", "quote", "lambda", "let", "begin", "cond", "set!",
+        "define", "if", "quote", "lambda", "let", "let*", "begin", "cond", "set!",
         "and", "or", "define-syntax", "syntax-rules",
         "letrec", "letrec*", "case", "do", "guard", "define-record-type"
     );
@@ -67,7 +67,10 @@ public class Evaluator {
         // L17 builtins
         "raise", "with-exception-handler",
         // L18 builtins
-        "values", "call-with-values"
+        "values", "call-with-values",
+        // L21 builtins
+        "set-car!", "set-cdr!", "for-each", "error", "procedure?",
+        "caar", "cadr", "cdar", "cddr", "caddr", "member", "assv"
     };
 
     {
@@ -268,10 +271,11 @@ public class Evaluator {
                 case "if" -> { return evalIfTail(args, env, pos); }
                 case "quote" -> {
                     if (args.size() != 1) throw posError(pos, "quote: need exactly one argument");
-                    return args.getFirst();
+                    return quoteConvert(args.getFirst());
                 }
                 case "lambda" -> { return evalLambda(args, env, pos); }
                 case "let" -> { return evalLetTail(args, env, pos, listVal); }
+                case "let*" -> { return evalLetStarTail(args, env, pos); }
                 case "begin" -> { return evalBeginTail(args, env, pos); }
                 case "cond" -> { return evalCondTail(args, env, pos); }
                 case "set!" -> { return evalSet(args, env, pos); }
@@ -417,7 +421,7 @@ public class Evaluator {
             }
             if (lambda.restParam() != null) {
                 List<SchemeValue> rest = args.subList(lambda.params().size(), args.size());
-                callEnv.define(lambda.restParam(), new SchemeValue.ListVal(new ArrayList<>(rest), SourcePos.NONE));
+                callEnv.define(lambda.restParam(), SchemeValue.makeList(new ArrayList<>(rest)));
             }
             // Evaluate all but the last body expression
             for (int i = 0; i < lambda.body().size() - 1; i++) {
@@ -568,8 +572,95 @@ public class Evaluator {
             case "__make-record__" -> builtinMakeRecord(args, env, pos);
             case "__record-type?__" -> builtinRecordTypeQ(args, env, pos);
             case "__record-ref__" -> builtinRecordRef(args, env, pos);
+            // L21: pair mutation
+            case "set-car!" -> {
+                if (args.size() != 2) throw posError(pos, "set-car!: need exactly 2 arguments");
+                SchemeValue target = eval(args.get(0), env);
+                SchemeValue val = eval(args.get(1), env);
+                if (!(target instanceof SchemeValue.PairVal pair)) throw posError(pos, "set-car!: not a pair");
+                pair.car = val;
+                yield new SchemeValue.BoolVal(false, SourcePos.NONE);
+            }
+            case "set-cdr!" -> {
+                if (args.size() != 2) throw posError(pos, "set-cdr!: need exactly 2 arguments");
+                SchemeValue target = eval(args.get(0), env);
+                SchemeValue val = eval(args.get(1), env);
+                if (!(target instanceof SchemeValue.PairVal pair)) throw posError(pos, "set-cdr!: not a pair");
+                pair.cdr = val;
+                yield new SchemeValue.BoolVal(false, SourcePos.NONE);
+            }
+            case "for-each" -> {
+                if (args.size() < 2) throw posError(pos, "for-each: need procedure and at least one list");
+                SchemeValue proc = eval(args.get(0), env);
+                List<List<SchemeValue>> lists = new ArrayList<>();
+                for (int i = 1; i < args.size(); i++) {
+                    lists.add(schemeListToJava(eval(args.get(i), env)));
+                }
+                int len = lists.get(0).size();
+                for (int i = 0; i < len; i++) {
+                    List<SchemeValue> mapArgs = new ArrayList<>();
+                    for (List<SchemeValue> lst : lists) mapArgs.add(lst.get(i));
+                    evalContinuation(applyTail(proc, mapArgs, pos));
+                }
+                yield new SchemeValue.BoolVal(false, SourcePos.NONE);
+            }
+            case "error" -> {
+                if (args.isEmpty()) throw posError(pos, "error: need at least 1 argument");
+                SchemeValue msg = eval(args.get(0), env);
+                String msgStr = msg instanceof SchemeValue.StringVal s ? s.value() : msg.display();
+                var sb = new StringBuilder(msgStr);
+                for (int i = 1; i < args.size(); i++) {
+                    sb.append(" ").append(eval(args.get(i), env).display());
+                }
+                throw new SchemeRaise(new SchemeValue.StringVal(sb.toString(), SourcePos.NONE));
+            }
+            case "procedure?" -> {
+                if (args.size() != 1) throw posError(pos, "procedure?: need exactly 1 argument");
+                SchemeValue val = eval(args.get(0), env);
+                yield new SchemeValue.BoolVal(isProcedure(val), SourcePos.NONE);
+            }
+            case "caar" -> { yield schemeCar(schemeCar(eval(args.get(0), env), pos), pos); }
+            case "cadr" -> { yield schemeCar(schemeCdr(eval(args.get(0), env), pos), pos); }
+            case "cdar" -> { yield schemeCdr(schemeCar(eval(args.get(0), env), pos), pos); }
+            case "cddr" -> { yield schemeCdr(schemeCdr(eval(args.get(0), env), pos), pos); }
+            case "caddr" -> { yield schemeCar(schemeCdr(schemeCdr(eval(args.get(0), env), pos), pos), pos); }
+            case "member" -> {
+                if (args.size() != 2) throw posError(pos, "member: need exactly 2 arguments");
+                SchemeValue key = eval(args.get(0), env);
+                SchemeValue lst = eval(args.get(1), env);
+                SchemeValue current = lst;
+                while (current instanceof SchemeValue.PairVal p) {
+                    if (schemeEqual(key, p.car())) yield current;
+                    current = p.cdr();
+                }
+                yield new SchemeValue.BoolVal(false, SourcePos.NONE);
+            }
+            case "assv" -> {
+                if (args.size() != 2) throw posError(pos, "assv: need exactly 2 arguments");
+                SchemeValue key = eval(args.get(0), env);
+                SchemeValue val = eval(args.get(1), env);
+                for (SchemeValue entry : schemeListToJava(val)) {
+                    if (entry instanceof SchemeValue.PairVal pair) {
+                        if (schemeEqv(key, pair.car())) yield entry;
+                    }
+                }
+                yield new SchemeValue.BoolVal(false, SourcePos.NONE);
+            }
             default -> null;
         };
+    }
+
+    private static SchemeValue schemeCar(SchemeValue val, SourcePos pos) throws EvalError {
+        if (val instanceof SchemeValue.PairVal p) return p.car();
+        if (val instanceof SchemeValue.ListVal lst && !lst.elements().isEmpty()) return lst.elements().getFirst();
+        throw posError(pos, "car: not a pair");
+    }
+
+    private static SchemeValue schemeCdr(SchemeValue val, SourcePos pos) throws EvalError {
+        if (val instanceof SchemeValue.PairVal p) return p.cdr();
+        if (val instanceof SchemeValue.ListVal lst && !lst.elements().isEmpty())
+            return new SchemeValue.ListVal(lst.elements().subList(1, lst.elements().size()), SourcePos.NONE);
+        throw posError(pos, "cdr: not a pair");
     }
 
     @FunctionalInterface
@@ -771,6 +862,32 @@ public class Evaluator {
         return new SchemeValue.Thunk(args.getLast(), letEnv);
     }
 
+    /** let* with sequential bindings and TCO on last expression. */
+    private SchemeValue evalLetStarTail(List<SchemeValue> args, Environment env, SourcePos pos) throws EvalError {
+        if (args.size() < 2) throw posError(pos, "let*: need bindings and body");
+        SchemeValue bindingsExpr = args.getFirst();
+        if (!(bindingsExpr instanceof SchemeValue.ListVal bindingsList))
+            throw posError(pos, "let*: bindings must be a list");
+
+        Environment letEnv = new Environment(env);
+        for (SchemeValue b : bindingsList.elements()) {
+            if (!(b instanceof SchemeValue.ListVal pair) || pair.elements().size() != 2)
+                throw posError(pos, "let*: invalid binding");
+            if (!(pair.elements().getFirst() instanceof SchemeValue.SymbolVal s))
+                throw posError(pos, "let*: binding name must be a symbol");
+            SchemeValue val = eval(pair.elements().get(1), letEnv);
+            letEnv.define(s.name(), val);
+        }
+
+        for (int i = 1; i < args.size() - 1; i++) {
+            contStack.push(new ContFrame.BodyFrame(args.get(i),
+                    args.subList(i + 1, args.size()), letEnv, callccCounter));
+            eval(args.get(i), letEnv);
+            contStack.pop();
+        }
+        return new SchemeValue.Thunk(args.getLast(), letEnv);
+    }
+
     /** Begin with TCO on last expression. */
     private SchemeValue evalBeginTail(List<SchemeValue> args, Environment env, SourcePos pos) throws EvalError {
         if (args.isEmpty()) throw posError(pos, "begin: need at least one expression");
@@ -823,32 +940,23 @@ public class Evaluator {
         if (args.size() != 2) throw posError(pos, "cons: need exactly 2 arguments");
         SchemeValue a = eval(args.get(0), env);
         SchemeValue b = eval(args.get(1), env);
-        if (b instanceof SchemeValue.ListVal lst) {
-            var newElems = new ArrayList<SchemeValue>();
-            newElems.add(a);
-            newElems.addAll(lst.elements());
-            return new SchemeValue.ListVal(newElems, SourcePos.NONE);
-        }
         return new SchemeValue.PairVal(a, b, SourcePos.NONE);
     }
 
     private SchemeValue builtinCar(List<SchemeValue> args, Environment env, SourcePos pos) throws EvalError {
         if (args.size() != 1) throw posError(pos, "car: need exactly 1 argument");
         SchemeValue val = eval(args.getFirst(), env);
-        if (val instanceof SchemeValue.ListVal lst && !lst.elements().isEmpty()) {
-            return lst.elements().getFirst();
-        }
         if (val instanceof SchemeValue.PairVal pair) return pair.car();
+        if (val instanceof SchemeValue.ListVal lst && !lst.elements().isEmpty()) return lst.elements().getFirst();
         throw posError(pos, "car: not a pair");
     }
 
     private SchemeValue builtinCdr(List<SchemeValue> args, Environment env, SourcePos pos) throws EvalError {
         if (args.size() != 1) throw posError(pos, "cdr: need exactly 1 argument");
         SchemeValue val = eval(args.getFirst(), env);
-        if (val instanceof SchemeValue.ListVal lst && !lst.elements().isEmpty()) {
-            return new SchemeValue.ListVal(lst.elements().subList(1, lst.elements().size()), SourcePos.NONE);
-        }
         if (val instanceof SchemeValue.PairVal pair) return pair.cdr();
+        if (val instanceof SchemeValue.ListVal lst && !lst.elements().isEmpty())
+            return new SchemeValue.ListVal(lst.elements().subList(1, lst.elements().size()), SourcePos.NONE);
         throw posError(pos, "cdr: not a pair");
     }
 
@@ -863,41 +971,38 @@ public class Evaluator {
         for (SchemeValue arg : args) {
             elems.add(eval(arg, env));
         }
-        return new SchemeValue.ListVal(elems, SourcePos.NONE);
+        return SchemeValue.makeList(elems);
     }
 
     private SchemeValue builtinLength(List<SchemeValue> args, Environment env, SourcePos pos) throws EvalError {
         if (args.size() != 1) throw posError(pos, "length: need exactly 1 argument");
         SchemeValue val = eval(args.getFirst(), env);
-        if (val instanceof SchemeValue.ListVal lst) {
-            return new SchemeValue.IntVal(lst.elements().size(), SourcePos.NONE);
-        }
+        if (val instanceof SchemeValue.ListVal lst) return new SchemeValue.IntVal(lst.elements().size(), SourcePos.NONE);
+        if (val instanceof SchemeValue.PairVal) return new SchemeValue.IntVal(schemeListToJava(val).size(), SourcePos.NONE);
         throw posError(pos, "length: not a list");
     }
 
     private SchemeValue builtinAppend(List<SchemeValue> args, Environment env, SourcePos pos) throws EvalError {
-        if (args.size() == 0) return new SchemeValue.ListVal(List.of(), SourcePos.NONE);
+        if (args.size() == 0) return SchemeValue.NIL;
         List<SchemeValue> result = new ArrayList<>();
         for (int i = 0; i < args.size() - 1; i++) {
             SchemeValue val = eval(args.get(i), env);
-            if (!(val instanceof SchemeValue.ListVal lst))
-                throw posError(pos, "append: not a list");
-            result.addAll(lst.elements());
+            result.addAll(schemeListToJava(val));
         }
         SchemeValue last = eval(args.getLast(), env);
-        if (last instanceof SchemeValue.ListVal lst) {
-            result.addAll(lst.elements());
-            return new SchemeValue.ListVal(result, SourcePos.NONE);
+        if (result.isEmpty()) return last;
+        // Build chain: result elements followed by last as tail
+        SchemeValue tail = last;
+        for (int i = result.size() - 1; i >= 0; i--) {
+            tail = new SchemeValue.PairVal(result.get(i), tail, SourcePos.NONE);
         }
-        throw posError(pos, "append: last argument must be a list");
+        return tail;
     }
 
     private SchemeValue builtinPairQ(List<SchemeValue> args, Environment env, SourcePos pos) throws EvalError {
         if (args.size() != 1) throw posError(pos, "pair?: need exactly 1 argument");
         SchemeValue val = eval(args.getFirst(), env);
-        return new SchemeValue.BoolVal(
-            (val instanceof SchemeValue.ListVal lst && !lst.elements().isEmpty()) || val instanceof SchemeValue.PairVal,
-            SourcePos.NONE);
+        return new SchemeValue.BoolVal(val instanceof SchemeValue.PairVal, SourcePos.NONE);
     }
 
     private SchemeValue typePred(List<SchemeValue> args, Environment env, Class<? extends SchemeValue> type, SourcePos pos) throws EvalError {
@@ -1025,16 +1130,16 @@ public class Evaluator {
         for (char c : s.chars()) {
             chars.add(new SchemeValue.CharVal(c, SourcePos.NONE));
         }
-        return new SchemeValue.ListVal(chars, SourcePos.NONE);
+        return SchemeValue.makeList(chars);
     }
 
     private SchemeValue builtinListToString(List<SchemeValue> args, Environment env, SourcePos pos) throws EvalError {
         if (args.size() != 1) throw posError(pos, "list->string: need exactly 1 argument");
         SchemeValue val = eval(args.getFirst(), env);
-        if (!(val instanceof SchemeValue.ListVal lst)) throw posError(pos, "list->string: not a list");
-        char[] chars = new char[lst.elements().size()];
-        for (int i = 0; i < lst.elements().size(); i++) {
-            if (!(lst.elements().get(i) instanceof SchemeValue.CharVal c))
+        List<SchemeValue> elems = schemeListToJava(val);
+        char[] chars = new char[elems.size()];
+        for (int i = 0; i < elems.size(); i++) {
+            if (!(elems.get(i) instanceof SchemeValue.CharVal c))
                 throw posError(pos, "list->string: element is not a character");
             chars[i] = c.value();
         }
@@ -1060,17 +1165,13 @@ public class Evaluator {
     private SchemeValue builtinApply(List<SchemeValue> args, Environment env, SourcePos pos) throws EvalError {
         if (args.size() < 2) throw posError(pos, "apply: need at least 2 arguments");
         SchemeValue proc = eval(args.getFirst(), env);
-        // Evaluate all arguments
         List<SchemeValue> evaledMiddle = new ArrayList<>();
         for (int i = 1; i < args.size() - 1; i++) {
             evaledMiddle.add(eval(args.get(i), env));
         }
         SchemeValue lastArg = eval(args.getLast(), env);
-        if (!(lastArg instanceof SchemeValue.ListVal lst))
-            throw posError(pos, "apply: last argument must be a list");
-        // Combine prefix args with the list
         List<SchemeValue> allArgs = new ArrayList<>(evaledMiddle);
-        allArgs.addAll(lst.elements());
+        allArgs.addAll(schemeListToJava(lastArg));
         return applyTail(proc, allArgs, pos);
     }
 
@@ -1182,10 +1283,9 @@ public class Evaluator {
     private SchemeValue builtinReverse(List<SchemeValue> args, Environment env, SourcePos pos) throws EvalError {
         if (args.size() != 1) throw posError(pos, "reverse: need exactly 1 argument");
         SchemeValue val = eval(args.getFirst(), env);
-        if (!(val instanceof SchemeValue.ListVal lst)) throw posError(pos, "reverse: not a list");
-        var reversed = new ArrayList<>(lst.elements());
-        java.util.Collections.reverse(reversed);
-        return new SchemeValue.ListVal(reversed, SourcePos.NONE);
+        var elems = schemeListToJava(val);
+        java.util.Collections.reverse(elems);
+        return SchemeValue.makeList(elems);
     }
 
     // --- L17: raise, guard, with-exception-handler ---
@@ -1317,48 +1417,44 @@ public class Evaluator {
             }
             case "cons" -> {
                 if (args.size() != 2) throw posError(pos, "cons: need exactly 2 arguments");
-                SchemeValue a = args.get(0), b = args.get(1);
-                if (b instanceof SchemeValue.ListVal lst) {
-                    var ne = new ArrayList<SchemeValue>();
-                    ne.add(a); ne.addAll(lst.elements());
-                    yield new SchemeValue.ListVal(ne, SourcePos.NONE);
-                }
-                yield new SchemeValue.PairVal(a, b, SourcePos.NONE);
+                yield new SchemeValue.PairVal(args.get(0), args.get(1), SourcePos.NONE);
             }
             case "car" -> {
                 if (args.size() != 1) throw posError(pos, "car: need exactly 1 argument");
+                if (args.getFirst() instanceof SchemeValue.PairVal pair) yield pair.car();
                 if (args.getFirst() instanceof SchemeValue.ListVal lst && !lst.elements().isEmpty())
                     yield lst.elements().getFirst();
-                if (args.getFirst() instanceof SchemeValue.PairVal pair) yield pair.car();
                 throw posError(pos, "car: not a pair");
             }
             case "cdr" -> {
                 if (args.size() != 1) throw posError(pos, "cdr: need exactly 1 argument");
+                if (args.getFirst() instanceof SchemeValue.PairVal pair) yield pair.cdr();
                 if (args.getFirst() instanceof SchemeValue.ListVal lst && !lst.elements().isEmpty())
                     yield new SchemeValue.ListVal(lst.elements().subList(1, lst.elements().size()), SourcePos.NONE);
-                if (args.getFirst() instanceof SchemeValue.PairVal pair) yield pair.cdr();
                 throw posError(pos, "cdr: not a pair");
             }
             case "null?" -> {
                 if (args.size() != 1) throw posError(pos, "null?: need exactly 1 argument");
                 yield new SchemeValue.BoolVal(args.getFirst() instanceof SchemeValue.ListVal lst && lst.elements().isEmpty(), SourcePos.NONE);
             }
-            case "list" -> new SchemeValue.ListVal(new ArrayList<>(args), SourcePos.NONE);
+            case "list" -> SchemeValue.makeList(new ArrayList<>(args));
             case "length" -> {
                 if (args.size() != 1) throw posError(pos, "length: need exactly 1 argument");
-                if (args.getFirst() instanceof SchemeValue.ListVal lst)
-                    yield new SchemeValue.IntVal(lst.elements().size(), SourcePos.NONE);
-                throw posError(pos, "length: not a list");
+                yield new SchemeValue.IntVal(schemeListToJava(args.getFirst()).size(), SourcePos.NONE);
             }
             case "append" -> {
-                if (args.isEmpty()) yield new SchemeValue.ListVal(List.of(), SourcePos.NONE);
+                if (args.isEmpty()) yield SchemeValue.NIL;
                 var result = new ArrayList<SchemeValue>();
-                for (int i = 0; i < args.size(); i++) {
-                    if (!(args.get(i) instanceof SchemeValue.ListVal lst))
-                        throw posError(pos, "append: not a list");
-                    result.addAll(lst.elements());
+                for (int i = 0; i < args.size() - 1; i++) {
+                    result.addAll(schemeListToJava(args.get(i)));
                 }
-                yield new SchemeValue.ListVal(result, SourcePos.NONE);
+                SchemeValue last = args.getLast();
+                if (result.isEmpty()) yield last;
+                SchemeValue tail = last;
+                for (int i = result.size() - 1; i >= 0; i--) {
+                    tail = new SchemeValue.PairVal(result.get(i), tail, SourcePos.NONE);
+                }
+                yield tail;
             }
             case "display" -> {
                 if (args.size() != 1) throw posError(pos, "display: need exactly 1 argument");
@@ -1443,9 +1539,7 @@ public class Evaluator {
             case "boolean?" -> typePredEvaled(args, SchemeValue.BoolVal.class, pos);
             case "pair?" -> {
                 if (args.size() != 1) throw posError(pos, "pair?: need exactly 1 argument");
-                yield new SchemeValue.BoolVal(
-                    (args.getFirst() instanceof SchemeValue.ListVal lst && !lst.elements().isEmpty()) || args.getFirst() instanceof SchemeValue.PairVal,
-                    SourcePos.NONE);
+                yield new SchemeValue.BoolVal(args.getFirst() instanceof SchemeValue.PairVal, SourcePos.NONE);
             }
             case "symbol?" -> typePredEvaled(args, SchemeValue.SymbolVal.class, pos);
             case "char?" -> typePredEvaled(args, SchemeValue.CharVal.class, pos);
@@ -1454,10 +1548,8 @@ public class Evaluator {
                 SchemeValue proc = args.getFirst();
                 List<SchemeValue> middle = args.subList(1, args.size() - 1);
                 SchemeValue lastArg = args.getLast();
-                if (!(lastArg instanceof SchemeValue.ListVal lst))
-                    throw posError(pos, "apply: last argument must be a list");
                 var allArgs = new ArrayList<SchemeValue>(middle);
-                allArgs.addAll(lst.elements());
+                allArgs.addAll(schemeListToJava(lastArg));
                 yield applyTail(proc, allArgs, pos);
             }
             case "call/cc", "call-with-current-continuation" -> {
@@ -1497,9 +1589,7 @@ public class Evaluator {
                 SchemeValue proc = args.get(0);
                 List<List<SchemeValue>> lists = new ArrayList<>();
                 for (int i = 1; i < args.size(); i++) {
-                    if (!(args.get(i) instanceof SchemeValue.ListVal lst))
-                        throw posError(pos, "map: not a list");
-                    lists.add(lst.elements());
+                    lists.add(schemeListToJava(args.get(i)));
                 }
                 int len = lists.get(0).size();
                 List<SchemeValue> result = new ArrayList<>();
@@ -1508,7 +1598,7 @@ public class Evaluator {
                     for (List<SchemeValue> lst : lists) mapArgs.add(lst.get(i));
                     result.add(evalContinuation(applyTail(proc, mapArgs, pos)));
                 }
-                yield new SchemeValue.ListVal(result, SourcePos.NONE);
+                yield SchemeValue.makeList(result);
             }
             // L13 builtins
             case "abs" -> {
@@ -1571,28 +1661,38 @@ public class Evaluator {
             }
             case "list-ref" -> {
                 if (args.size() != 2) throw posError(pos, "list-ref: need exactly 2 arguments");
-                if (!(args.get(0) instanceof SchemeValue.ListVal lst)) throw posError(pos, "list-ref: not a list");
                 int idx = (int) requireInt(args.get(1), pos);
-                yield lst.elements().get(idx);
+                SchemeValue current = args.get(0);
+                for (int i = 0; i < idx; i++) {
+                    if (current instanceof SchemeValue.PairVal p) current = p.cdr();
+                    else throw posError(pos, "list-ref: index out of range");
+                }
+                if (current instanceof SchemeValue.PairVal p) yield p.car();
+                if (current instanceof SchemeValue.ListVal lst && !lst.elements().isEmpty()) yield lst.elements().getFirst();
+                throw posError(pos, "list-ref: index out of range");
             }
             case "list-tail" -> {
                 if (args.size() != 2) throw posError(pos, "list-tail: need exactly 2 arguments");
-                if (!(args.get(0) instanceof SchemeValue.ListVal lst)) throw posError(pos, "list-tail: not a list");
                 int idx = (int) requireInt(args.get(1), pos);
-                yield new SchemeValue.ListVal(new ArrayList<>(lst.elements().subList(idx, lst.elements().size())), SourcePos.NONE);
+                SchemeValue current = args.get(0);
+                for (int i = 0; i < idx; i++) {
+                    if (current instanceof SchemeValue.PairVal p) current = p.cdr();
+                    else throw posError(pos, "list-tail: index out of range");
+                }
+                yield current;
             }
             case "list?" -> {
                 if (args.size() != 1) throw posError(pos, "list?: need exactly 1 argument");
-                yield new SchemeValue.BoolVal(args.get(0) instanceof SchemeValue.ListVal, SourcePos.NONE);
+                yield new SchemeValue.BoolVal(isProperList(args.get(0)), SourcePos.NONE);
             }
             case "assoc" -> {
                 if (args.size() != 2) throw posError(pos, "assoc: need exactly 2 arguments");
                 SchemeValue key = args.get(0);
-                if (!(args.get(1) instanceof SchemeValue.ListVal alist)) throw posError(pos, "assoc: not a list");
-                for (SchemeValue entry : alist.elements()) {
-                    if (entry instanceof SchemeValue.ListVal pair && !pair.elements().isEmpty()) {
-                        if (schemeEqual(key, pair.elements().get(0)))
-                            yield pair;
+                for (SchemeValue entry : schemeListToJava(args.get(1))) {
+                    if (entry instanceof SchemeValue.PairVal pair) {
+                        if (schemeEqual(key, pair.car())) yield pair;
+                    } else if (entry instanceof SchemeValue.ListVal pair && !pair.elements().isEmpty()) {
+                        if (schemeEqual(key, pair.elements().get(0))) yield pair;
                     }
                 }
                 yield new SchemeValue.BoolVal(false, SourcePos.NONE);
@@ -1663,14 +1763,14 @@ public class Evaluator {
                 if (!(args.get(0) instanceof SchemeValue.StringVal s)) throw posError(pos, "string->list: not a string");
                 List<SchemeValue> chars = new java.util.ArrayList<>();
                 for (char c : s.chars()) chars.add(new SchemeValue.CharVal(c, SourcePos.NONE));
-                yield new SchemeValue.ListVal(chars, SourcePos.NONE);
+                yield SchemeValue.makeList(chars);
             }
             case "list->string" -> {
                 if (args.size() != 1) throw posError(pos, "list->string: need exactly 1 argument");
-                if (!(args.get(0) instanceof SchemeValue.ListVal lst)) throw posError(pos, "list->string: not a list");
-                char[] cs = new char[lst.elements().size()];
-                for (int i = 0; i < lst.elements().size(); i++) {
-                    if (!(lst.elements().get(i) instanceof SchemeValue.CharVal cv))
+                List<SchemeValue> elems = schemeListToJava(args.get(0));
+                char[] cs = new char[elems.size()];
+                for (int i = 0; i < elems.size(); i++) {
+                    if (!(elems.get(i) instanceof SchemeValue.CharVal cv))
                         throw posError(pos, "list->string: element is not a character");
                     cs[i] = cv.value();
                 }
@@ -1729,12 +1829,11 @@ public class Evaluator {
                 if (!(args.get(0) instanceof SchemeValue.VectorVal v)) throw posError(pos, "vector->list: not a vector");
                 List<SchemeValue> lst = new ArrayList<>();
                 for (SchemeValue e : v.elements()) lst.add(e);
-                yield new SchemeValue.ListVal(lst, SourcePos.NONE);
+                yield SchemeValue.makeList(lst);
             }
             case "list->vector" -> {
                 if (args.size() != 1) throw posError(pos, "list->vector: need exactly 1 argument");
-                if (!(args.get(0) instanceof SchemeValue.ListVal lst)) throw posError(pos, "list->vector: not a list");
-                yield new SchemeValue.VectorVal(lst.elements().toArray(new SchemeValue[0]), SourcePos.NONE);
+                yield new SchemeValue.VectorVal(schemeListToJava(args.get(0)).toArray(new SchemeValue[0]), SourcePos.NONE);
             }
             // L16 builtins
             case "dynamic-wind" -> {
@@ -1743,10 +1842,9 @@ public class Evaluator {
             }
             case "reverse" -> {
                 if (args.size() != 1) throw posError(pos, "reverse: need exactly 1 argument");
-                if (!(args.get(0) instanceof SchemeValue.ListVal lst)) throw posError(pos, "reverse: not a list");
-                var reversed = new ArrayList<>(lst.elements());
-                java.util.Collections.reverse(reversed);
-                yield new SchemeValue.ListVal(reversed, SourcePos.NONE);
+                var elems = schemeListToJava(args.get(0));
+                java.util.Collections.reverse(elems);
+                yield SchemeValue.makeList(elems);
             }
             case "raise" -> {
                 if (args.size() != 1) throw posError(pos, "raise: need exactly 1 argument");
@@ -1825,6 +1923,71 @@ public class Evaluator {
                 if (v instanceof SchemeValue.IntVal) yield new SchemeValue.IntVal(1, SourcePos.NONE);
                 if (v instanceof SchemeValue.RationalVal r) yield new SchemeValue.IntVal(r.den(), SourcePos.NONE);
                 throw posError(pos, "denominator: not a rational number");
+            }
+            // L21: pair mutation
+            case "set-car!" -> {
+                if (args.size() != 2) throw posError(pos, "set-car!: need exactly 2 arguments");
+                if (!(args.get(0) instanceof SchemeValue.PairVal pair)) throw posError(pos, "set-car!: not a pair");
+                pair.car = args.get(1);
+                yield new SchemeValue.BoolVal(false, SourcePos.NONE);
+            }
+            case "set-cdr!" -> {
+                if (args.size() != 2) throw posError(pos, "set-cdr!: need exactly 2 arguments");
+                if (!(args.get(0) instanceof SchemeValue.PairVal pair)) throw posError(pos, "set-cdr!: not a pair");
+                pair.cdr = args.get(1);
+                yield new SchemeValue.BoolVal(false, SourcePos.NONE);
+            }
+            case "for-each" -> {
+                if (args.size() < 2) throw posError(pos, "for-each: need procedure and at least one list");
+                SchemeValue proc = args.get(0);
+                List<List<SchemeValue>> lists = new ArrayList<>();
+                for (int i = 1; i < args.size(); i++) {
+                    lists.add(schemeListToJava(args.get(i)));
+                }
+                int len = lists.get(0).size();
+                for (int i = 0; i < len; i++) {
+                    List<SchemeValue> mapArgs = new ArrayList<>();
+                    for (List<SchemeValue> lst : lists) mapArgs.add(lst.get(i));
+                    evalContinuation(applyTail(proc, mapArgs, pos));
+                }
+                yield new SchemeValue.BoolVal(false, SourcePos.NONE);
+            }
+            case "error" -> {
+                if (args.isEmpty()) throw posError(pos, "error: need at least 1 argument");
+                String msgStr = args.get(0) instanceof SchemeValue.StringVal s ? s.value() : args.get(0).display();
+                var sb = new StringBuilder(msgStr);
+                for (int i = 1; i < args.size(); i++) {
+                    sb.append(" ").append(args.get(i).display());
+                }
+                throw new SchemeRaise(new SchemeValue.StringVal(sb.toString(), SourcePos.NONE));
+            }
+            case "procedure?" -> {
+                if (args.size() != 1) throw posError(pos, "procedure?: need exactly 1 argument");
+                yield new SchemeValue.BoolVal(isProcedure(args.get(0)), SourcePos.NONE);
+            }
+            case "caar" -> schemeCar(schemeCar(args.get(0), pos), pos);
+            case "cadr" -> schemeCar(schemeCdr(args.get(0), pos), pos);
+            case "cdar" -> schemeCdr(schemeCar(args.get(0), pos), pos);
+            case "cddr" -> schemeCdr(schemeCdr(args.get(0), pos), pos);
+            case "caddr" -> schemeCar(schemeCdr(schemeCdr(args.get(0), pos), pos), pos);
+            case "member" -> {
+                if (args.size() != 2) throw posError(pos, "member: need exactly 2 arguments");
+                SchemeValue key = args.get(0);
+                SchemeValue current = args.get(1);
+                while (current instanceof SchemeValue.PairVal p) {
+                    if (schemeEqual(key, p.car())) yield current;
+                    current = p.cdr();
+                }
+                yield new SchemeValue.BoolVal(false, SourcePos.NONE);
+            }
+            case "assv" -> {
+                if (args.size() != 2) throw posError(pos, "assv: need exactly 2 arguments");
+                for (SchemeValue entry : schemeListToJava(args.get(1))) {
+                    if (entry instanceof SchemeValue.PairVal pair) {
+                        if (schemeEqv(args.get(0), pair.car())) yield entry;
+                    }
+                }
+                yield new SchemeValue.BoolVal(false, SourcePos.NONE);
             }
             default -> throw posError(pos, "unknown builtin: " + name);
         };
@@ -2018,26 +2181,7 @@ public class Evaluator {
     // --- L12 builtins ---
 
     private boolean schemeEqual(SchemeValue a, SchemeValue b) {
-        if (isNumeric(a) && isNumeric(b)) return toDouble(a) == toDouble(b);
-        if (a instanceof SchemeValue.BoolVal ab && b instanceof SchemeValue.BoolVal bb) return ab.value() == bb.value();
-        if (a instanceof SchemeValue.StringVal as && b instanceof SchemeValue.StringVal bs) return as.value().equals(bs.value());
-        if (a instanceof SchemeValue.SymbolVal as && b instanceof SchemeValue.SymbolVal bs) return as.name().equals(bs.name());
-        if (a instanceof SchemeValue.CharVal ac && b instanceof SchemeValue.CharVal bc) return ac.value() == bc.value();
-        if (a instanceof SchemeValue.ListVal al && b instanceof SchemeValue.ListVal bl) {
-            if (al.elements().size() != bl.elements().size()) return false;
-            for (int i = 0; i < al.elements().size(); i++) {
-                if (!schemeEqual(al.elements().get(i), bl.elements().get(i))) return false;
-            }
-            return true;
-        }
-        if (a instanceof SchemeValue.VectorVal av && b instanceof SchemeValue.VectorVal bv) {
-            if (av.elements().length != bv.elements().length) return false;
-            for (int i = 0; i < av.elements().length; i++) {
-                if (!schemeEqual(av.elements()[i], bv.elements()[i])) return false;
-            }
-            return true;
-        }
-        return a == b;
+        return schemeEqualDepth(a, b, 0);
     }
 
     private boolean schemeEq(SchemeValue a, SchemeValue b) {
@@ -2047,6 +2191,9 @@ public class Evaluator {
         if (a instanceof SchemeValue.DoubleVal ad && b instanceof SchemeValue.DoubleVal bd) return ad.value() == bd.value();
         if (a instanceof SchemeValue.BoolVal ab && b instanceof SchemeValue.BoolVal bb) return ab.value() == bb.value();
         if (a instanceof SchemeValue.CharVal ac && b instanceof SchemeValue.CharVal bc) return ac.value() == bc.value();
+        // nil == nil
+        if (a instanceof SchemeValue.ListVal al && al.elements().isEmpty() &&
+            b instanceof SchemeValue.ListVal bl && bl.elements().isEmpty()) return true;
         return a == b;
     }
 
@@ -2068,8 +2215,7 @@ public class Evaluator {
         List<List<SchemeValue>> lists = new ArrayList<>();
         for (int i = 1; i < args.size(); i++) {
             SchemeValue val = eval(args.get(i), env);
-            if (!(val instanceof SchemeValue.ListVal lst)) throw posError(pos, "map: not a list");
-            lists.add(lst.elements());
+            lists.add(schemeListToJava(val));
         }
         int len = lists.get(0).size();
         List<SchemeValue> result = new ArrayList<>();
@@ -2078,7 +2224,7 @@ public class Evaluator {
             for (List<SchemeValue> lst : lists) mapArgs.add(lst.get(i));
             result.add(evalContinuation(applyTail(proc, mapArgs, pos)));
         }
-        return new SchemeValue.ListVal(result, SourcePos.NONE);
+        return SchemeValue.makeList(result);
     }
 
     // --- L13 builtins ---
@@ -2140,32 +2286,47 @@ public class Evaluator {
     private SchemeValue builtinListRef(List<SchemeValue> args, Environment env, SourcePos pos) throws EvalError {
         if (args.size() != 2) throw posError(pos, "list-ref: need exactly 2 arguments");
         SchemeValue val = eval(args.get(0), env);
-        if (!(val instanceof SchemeValue.ListVal lst)) throw posError(pos, "list-ref: not a list");
         int idx = (int) requireInt(eval(args.get(1), env), pos);
-        return lst.elements().get(idx);
+        SchemeValue current = val;
+        for (int i = 0; i < idx; i++) {
+            if (current instanceof SchemeValue.PairVal p) current = p.cdr();
+            else if (current instanceof SchemeValue.ListVal lst && !lst.elements().isEmpty())
+                current = new SchemeValue.ListVal(lst.elements().subList(1, lst.elements().size()), SourcePos.NONE);
+            else throw posError(pos, "list-ref: index out of range");
+        }
+        if (current instanceof SchemeValue.PairVal p) return p.car();
+        if (current instanceof SchemeValue.ListVal lst && !lst.elements().isEmpty()) return lst.elements().getFirst();
+        throw posError(pos, "list-ref: index out of range");
     }
 
     private SchemeValue builtinListTail(List<SchemeValue> args, Environment env, SourcePos pos) throws EvalError {
         if (args.size() != 2) throw posError(pos, "list-tail: need exactly 2 arguments");
         SchemeValue val = eval(args.get(0), env);
-        if (!(val instanceof SchemeValue.ListVal lst)) throw posError(pos, "list-tail: not a list");
         int idx = (int) requireInt(eval(args.get(1), env), pos);
-        return new SchemeValue.ListVal(new ArrayList<>(lst.elements().subList(idx, lst.elements().size())), SourcePos.NONE);
+        SchemeValue current = val;
+        for (int i = 0; i < idx; i++) {
+            if (current instanceof SchemeValue.PairVal p) current = p.cdr();
+            else if (current instanceof SchemeValue.ListVal lst && !lst.elements().isEmpty())
+                current = new SchemeValue.ListVal(lst.elements().subList(1, lst.elements().size()), SourcePos.NONE);
+            else throw posError(pos, "list-tail: index out of range");
+        }
+        return current;
     }
 
     private SchemeValue builtinListQ(List<SchemeValue> args, Environment env, SourcePos pos) throws EvalError {
         if (args.size() != 1) throw posError(pos, "list?: need exactly 1 argument");
         SchemeValue val = eval(args.get(0), env);
-        return new SchemeValue.BoolVal(val instanceof SchemeValue.ListVal, SourcePos.NONE);
+        return new SchemeValue.BoolVal(isProperList(val), SourcePos.NONE);
     }
 
     private SchemeValue builtinAssoc(List<SchemeValue> args, Environment env, SourcePos pos) throws EvalError {
         if (args.size() != 2) throw posError(pos, "assoc: need exactly 2 arguments");
         SchemeValue key = eval(args.get(0), env);
         SchemeValue val = eval(args.get(1), env);
-        if (!(val instanceof SchemeValue.ListVal alist)) throw posError(pos, "assoc: not a list");
-        for (SchemeValue entry : alist.elements()) {
-            if (entry instanceof SchemeValue.ListVal pair && !pair.elements().isEmpty()) {
+        for (SchemeValue entry : schemeListToJava(val)) {
+            if (entry instanceof SchemeValue.PairVal pair) {
+                if (schemeEqual(key, pair.car())) return pair;
+            } else if (entry instanceof SchemeValue.ListVal pair && !pair.elements().isEmpty()) {
                 if (schemeEqual(key, pair.elements().get(0))) return pair;
             }
         }
@@ -2372,6 +2533,9 @@ public class Evaluator {
         if (a instanceof SchemeValue.BoolVal ab && b instanceof SchemeValue.BoolVal bb) return ab.value() == bb.value();
         if (a instanceof SchemeValue.SymbolVal as && b instanceof SchemeValue.SymbolVal bs) return as.name().equals(bs.name());
         if (a instanceof SchemeValue.CharVal ac && b instanceof SchemeValue.CharVal bc) return ac.value() == bc.value();
+        // nil == nil
+        if (a instanceof SchemeValue.ListVal al && al.elements().isEmpty() &&
+            b instanceof SchemeValue.ListVal bl && bl.elements().isEmpty()) return true;
         return a == b;
     }
 
@@ -2435,14 +2599,13 @@ public class Evaluator {
         if (!(val instanceof SchemeValue.VectorVal v)) throw posError(pos, "vector->list: not a vector");
         List<SchemeValue> list = new ArrayList<>();
         for (SchemeValue e : v.elements()) list.add(e);
-        return new SchemeValue.ListVal(list, SourcePos.NONE);
+        return SchemeValue.makeList(list);
     }
 
     private SchemeValue builtinListToVector(List<SchemeValue> args, Environment env, SourcePos pos) throws EvalError {
         if (args.size() != 1) throw posError(pos, "list->vector: need exactly 1 argument");
         SchemeValue val = eval(args.getFirst(), env);
-        if (!(val instanceof SchemeValue.ListVal lst)) throw posError(pos, "list->vector: not a list");
-        return new SchemeValue.VectorVal(lst.elements().toArray(new SchemeValue[0]), SourcePos.NONE);
+        return new SchemeValue.VectorVal(schemeListToJava(val).toArray(new SchemeValue[0]), SourcePos.NONE);
     }
 
     // --- L11: Hygienic Macros ---
@@ -2870,5 +3033,83 @@ public class Evaluator {
         }
 
         return new SchemeValue.BoolVal(true, SourcePos.NONE);
+    }
+
+    // --- L21: Pair Mutation helpers ---
+
+    /** Convert a PairVal chain or ListVal to a Java list of elements. */
+    private static List<SchemeValue> schemeListToJava(SchemeValue val) {
+        if (val instanceof SchemeValue.ListVal lst) return new ArrayList<>(lst.elements());
+        var result = new ArrayList<SchemeValue>();
+        SchemeValue current = val;
+        while (current instanceof SchemeValue.PairVal p) {
+            result.add(p.car());
+            current = p.cdr();
+        }
+        return result;
+    }
+
+    /** Recursively convert quoted ListVals to PairVal chains for runtime use. */
+    private static SchemeValue quoteConvert(SchemeValue val) {
+        if (val instanceof SchemeValue.ListVal lst) {
+            if (lst.elements().isEmpty()) return val; // nil stays
+            SchemeValue result = SchemeValue.NIL;
+            for (int i = lst.elements().size() - 1; i >= 0; i--) {
+                result = new SchemeValue.PairVal(quoteConvert(lst.elements().get(i)), result, SourcePos.NONE);
+            }
+            return result;
+        }
+        if (val instanceof SchemeValue.PairVal pair) {
+            return new SchemeValue.PairVal(quoteConvert(pair.car()), quoteConvert(pair.cdr()), pair.pos());
+        }
+        return val;
+    }
+
+    /** Check if value is a proper list (nil or PairVal chain ending in nil). Uses tortoise-and-hare. */
+    private static boolean isProperList(SchemeValue val) {
+        if (val instanceof SchemeValue.ListVal lst) return lst.elements().isEmpty() || true;
+        SchemeValue slow = val, fast = val;
+        while (fast instanceof SchemeValue.PairVal fp) {
+            fast = fp.cdr();
+            if (fast instanceof SchemeValue.ListVal fl && fl.elements().isEmpty()) return true;
+            if (!(fast instanceof SchemeValue.PairVal fp2)) return false;
+            fast = fp2.cdr();
+            if (!(slow instanceof SchemeValue.PairVal sp)) return false;
+            slow = sp.cdr();
+            if (slow == fast) return false; // cycle detected
+        }
+        return fast instanceof SchemeValue.ListVal fl && fl.elements().isEmpty();
+    }
+
+    private boolean schemeEqualDepth(SchemeValue a, SchemeValue b, int depth) {
+        if (depth > 10000) return true; // cycle guard
+        if (a == b) return true;
+        if (isNumeric(a) && isNumeric(b)) return toDouble(a) == toDouble(b);
+        if (a instanceof SchemeValue.BoolVal ab && b instanceof SchemeValue.BoolVal bb) return ab.value() == bb.value();
+        if (a instanceof SchemeValue.StringVal as && b instanceof SchemeValue.StringVal bs) return as.value().equals(bs.value());
+        if (a instanceof SchemeValue.SymbolVal as && b instanceof SchemeValue.SymbolVal bs) return as.name().equals(bs.name());
+        if (a instanceof SchemeValue.CharVal ac && b instanceof SchemeValue.CharVal bc) return ac.value() == bc.value();
+        if (a instanceof SchemeValue.PairVal ap && b instanceof SchemeValue.PairVal bp) {
+            return schemeEqualDepth(ap.car(), bp.car(), depth + 1) && schemeEqualDepth(ap.cdr(), bp.cdr(), depth + 1);
+        }
+        if (a instanceof SchemeValue.ListVal al && b instanceof SchemeValue.ListVal bl) {
+            if (al.elements().size() != bl.elements().size()) return false;
+            for (int i = 0; i < al.elements().size(); i++) {
+                if (!schemeEqualDepth(al.elements().get(i), bl.elements().get(i), depth + 1)) return false;
+            }
+            return true;
+        }
+        if (a instanceof SchemeValue.VectorVal av && b instanceof SchemeValue.VectorVal bv) {
+            if (av.elements().length != bv.elements().length) return false;
+            for (int i = 0; i < av.elements().length; i++) {
+                if (!schemeEqualDepth(av.elements()[i], bv.elements()[i], depth + 1)) return false;
+            }
+            return true;
+        }
+        return a == b;
+    }
+
+    private static boolean isProcedure(SchemeValue v) {
+        return v instanceof SchemeValue.LambdaVal || v instanceof SchemeValue.BuiltinVal || v instanceof SchemeValue.ContinuationVal;
     }
 }
