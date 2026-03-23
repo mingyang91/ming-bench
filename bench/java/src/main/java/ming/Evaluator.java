@@ -621,6 +621,30 @@ public class Evaluator {
         env.define("call/cc", new SchemeValue.CpsBuiltinVal("call/cc", callccFunc));
         env.define("call-with-current-continuation", new SchemeValue.CpsBuiltinVal("call-with-current-continuation", callccFunc));
 
+        // values: single value is transparent, 0 or 2+ values wrapped in ValuesVal
+        env.define("values", new SchemeValue.CpsBuiltinVal("values", (args, k) -> {
+            if (args.size() == 1) {
+                return k.apply(args.getFirst());
+            }
+            return k.apply(new SchemeValue.ValuesVal(new ArrayList<>(args)));
+        }));
+
+        // call-with-values: (call-with-values producer consumer)
+        env.define("call-with-values", new SchemeValue.CpsBuiltinVal("call-with-values", (args, k) -> {
+            if (args.size() != 2) return new Bounce.Err(new EvalError("call-with-values requires 2 arguments"));
+            SchemeValue producer = args.get(0);
+            SchemeValue consumer = args.get(1);
+            return applyProc(producer, List.of(), "call-with-values", produced -> {
+                List<SchemeValue> consumerArgs;
+                if (produced instanceof SchemeValue.ValuesVal mv) {
+                    consumerArgs = mv.values();
+                } else {
+                    consumerArgs = List.of(produced);
+                }
+                return applyProc(consumer, consumerArgs, "call-with-values", k);
+            });
+        }));
+
         // dynamic-wind
         env.define("dynamic-wind", new SchemeValue.CpsBuiltinVal("dynamic-wind", (args, k) -> {
             if (args.size() != 3) return new Bounce.Err(new EvalError("dynamic-wind requires 3 arguments"));
@@ -687,6 +711,7 @@ public class Evaluator {
             case SchemeValue.CpsBuiltinVal v -> k.apply(v);
             case SchemeValue.ContinuationVal v -> k.apply(v);
             case SchemeValue.SyntaxRulesVal v -> k.apply(v);
+            case SchemeValue.ValuesVal v -> k.apply(v);
             case SchemeValue.VectorVal v -> k.apply(v);
             case SchemeValue.SymbolVal v -> {
                 try {
