@@ -63,7 +63,9 @@ func eval(expr *Value, env *Env) (*Value, error) {
 // isBuiltin checks if a symbol name is a built-in procedure.
 func isBuiltin(name string) bool {
 	switch name {
-	case "+", "-", "*", "/", "<", ">", "=", "<=", ">=", "not":
+	case "+", "-", "*", "/", "<", ">", "=", "<=", ">=", "not",
+		"cons", "car", "cdr", "null?", "list", "length", "append",
+		"string?", "number?", "boolean?", "pair?", "symbol?":
 		return true
 	}
 	return false
@@ -87,6 +89,12 @@ func evalList(expr *Value, env *Env) (*Value, error) {
 			return expr.Cdr.Car, nil
 		case "lambda":
 			return evalLambda(expr.Cdr, env)
+		case "let":
+			return evalLet(expr.Cdr, env)
+		case "begin":
+			return evalBegin(expr.Cdr, env)
+		case "cond":
+			return evalCond(expr.Cdr, env)
 		}
 	}
 
@@ -196,6 +204,113 @@ func applyLambda(fn *Value, args []*Value) (*Value, error) {
 		}
 	}
 	return result, nil
+}
+
+func evalLet(args *Value, env *Env) (*Value, error) {
+	first := args.Car
+	// Named let: (let name ((var init) ...) body...)
+	if first.Type == TypeSymbol {
+		name := first.StrVal
+		bindings := listToSlice(args.Cdr.Car)
+		body := listToSlice(args.Cdr.Cdr)
+		params := make([]string, len(bindings))
+		inits := make([]*Value, len(bindings))
+		for i, b := range bindings {
+			pair := listToSlice(b)
+			params[i] = pair[0].StrVal
+			v, err := eval(pair[1], env)
+			if err != nil {
+				return nil, err
+			}
+			inits[i] = v
+		}
+		// Create lambda for the loop
+		fn := &Value{
+			Type:       TypeLambda,
+			Params:     params,
+			Body:       body,
+			ClosureEnv: env,
+		}
+		// Bind the name in the lambda's closure so it can recurse
+		loopEnv := newEnv(env)
+		loopEnv.set(name, fn)
+		fn.ClosureEnv = loopEnv
+		return applyLambda(fn, inits)
+	}
+	// Regular let: (let ((var init) ...) body...)
+	bindings := listToSlice(first)
+	localEnv := newEnv(env)
+	for _, b := range bindings {
+		pair := listToSlice(b)
+		v, err := eval(pair[1], env)
+		if err != nil {
+			return nil, err
+		}
+		localEnv.set(pair[0].StrVal, v)
+	}
+	body := listToSlice(args.Cdr)
+	var result *Value
+	var err error
+	for _, expr := range body {
+		result, err = eval(expr, localEnv)
+		if err != nil {
+			return nil, err
+		}
+	}
+	return result, nil
+}
+
+func evalBegin(args *Value, env *Env) (*Value, error) {
+	items := listToSlice(args)
+	var result *Value
+	var err error
+	for _, item := range items {
+		result, err = eval(item, env)
+		if err != nil {
+			return nil, err
+		}
+	}
+	if result == nil {
+		return Void, nil
+	}
+	return result, nil
+}
+
+func evalCond(args *Value, env *Env) (*Value, error) {
+	clauses := listToSlice(args)
+	for _, clause := range clauses {
+		items := listToSlice(clause)
+		// Check for else clause
+		if items[0].Type == TypeSymbol && items[0].StrVal == "else" {
+			var result *Value
+			var err error
+			for _, expr := range items[1:] {
+				result, err = eval(expr, env)
+				if err != nil {
+					return nil, err
+				}
+			}
+			return result, nil
+		}
+		test, err := eval(items[0], env)
+		if err != nil {
+			return nil, err
+		}
+		if isTruthy(test) {
+			if len(items) == 1 {
+				return test, nil
+			}
+			var result *Value
+			for _, expr := range items[1:] {
+				result, err = eval(expr, env)
+				if err != nil {
+					return nil, err
+				}
+			}
+			return result, nil
+		}
+	}
+	return Void, nil
 }
 
 func evalAnd(args *Value, env *Env) (*Value, error) {
@@ -319,6 +434,99 @@ func applyBuiltin(head *Value, args []*Value) (*Value, error) {
 			return nil, &EvalError{Message: "not requires exactly one argument"}
 		}
 		return NewBool(!isTruthy(args[0])), nil
+
+	case "cons":
+		if len(args) != 2 {
+			return nil, &EvalError{Message: "cons requires exactly two arguments"}
+		}
+		return NewPair(args[0], args[1]), nil
+
+	case "car":
+		if len(args) != 1 || args[0].Type != TypePair {
+			return nil, &EvalError{Message: "car requires a pair"}
+		}
+		return args[0].Car, nil
+
+	case "cdr":
+		if len(args) != 1 || args[0].Type != TypePair {
+			return nil, &EvalError{Message: "cdr requires a pair"}
+		}
+		return args[0].Cdr, nil
+
+	case "null?":
+		if len(args) != 1 {
+			return nil, &EvalError{Message: "null? requires exactly one argument"}
+		}
+		return NewBool(args[0].Type == TypeNull), nil
+
+	case "list":
+		result := Null
+		for i := len(args) - 1; i >= 0; i-- {
+			result = NewPair(args[i], result)
+		}
+		return result, nil
+
+	case "length":
+		if len(args) != 1 {
+			return nil, &EvalError{Message: "length requires exactly one argument"}
+		}
+		count := int64(0)
+		cur := args[0]
+		for cur.Type == TypePair {
+			count++
+			cur = cur.Cdr
+		}
+		return NewInt(count), nil
+
+	case "append":
+		if len(args) == 0 {
+			return Null, nil
+		}
+		result := args[len(args)-1]
+		for i := len(args) - 2; i >= 0; i-- {
+			lst := args[i]
+			// collect elements then prepend
+			var elems []*Value
+			cur := lst
+			for cur.Type == TypePair {
+				elems = append(elems, cur.Car)
+				cur = cur.Cdr
+			}
+			for j := len(elems) - 1; j >= 0; j-- {
+				result = NewPair(elems[j], result)
+			}
+		}
+		return result, nil
+
+	case "string?":
+		if len(args) != 1 {
+			return nil, &EvalError{Message: "string? requires exactly one argument"}
+		}
+		return NewBool(args[0].Type == TypeString), nil
+
+	case "number?":
+		if len(args) != 1 {
+			return nil, &EvalError{Message: "number? requires exactly one argument"}
+		}
+		return NewBool(args[0].Type == TypeInteger), nil
+
+	case "boolean?":
+		if len(args) != 1 {
+			return nil, &EvalError{Message: "boolean? requires exactly one argument"}
+		}
+		return NewBool(args[0].Type == TypeBoolean), nil
+
+	case "pair?":
+		if len(args) != 1 {
+			return nil, &EvalError{Message: "pair? requires exactly one argument"}
+		}
+		return NewBool(args[0].Type == TypePair), nil
+
+	case "symbol?":
+		if len(args) != 1 {
+			return nil, &EvalError{Message: "symbol? requires exactly one argument"}
+		}
+		return NewBool(args[0].Type == TypeSymbol), nil
 	}
 
 	return nil, &EvalError{Message: fmt.Sprintf("unbound variable: %s", name)}
