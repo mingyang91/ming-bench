@@ -84,6 +84,12 @@ func evalList(expr *Value, env *Env) (*Value, error) {
 			return args.Car, nil
 		case "lambda":
 			return evalLambda(args, env)
+		case "let":
+			return evalLet(args, env)
+		case "begin":
+			return evalBegin(args, env)
+		case "cond":
+			return evalCond(args, env)
 		}
 	}
 
@@ -190,6 +196,99 @@ func evalOr(args *Value, env *Env) (*Value, error) {
 		cur = cur.Cdr
 	}
 	return result, nil
+}
+
+func evalLet(args *Value, env *Env) (*Value, error) {
+	// Named let: (let name ((var init) ...) body ...)
+	if args.Car.Type == TypeSymbol {
+		name := args.Car.Str
+		bindings := args.Cdr.Car
+		body := args.Cdr.Cdr
+
+		var params []string
+		var inits []*Value
+		cur := bindings
+		for cur.Type == TypePair {
+			b := cur.Car
+			params = append(params, b.Car.Str)
+			val, err := eval(b.Cdr.Car, env)
+			if err != nil {
+				return nil, err
+			}
+			inits = append(inits, val)
+			cur = cur.Cdr
+		}
+		bodySlice := listToSlice(body)
+		localEnv := newEnv(env)
+		lambda := makeLambda(params, bodySlice, localEnv)
+		localEnv.set(name, lambda)
+		return applyProc(lambda, inits)
+	}
+
+	// Regular let: (let ((var init) ...) body ...)
+	bindings := args.Car
+	body := args.Cdr
+	localEnv := newEnv(env)
+	cur := bindings
+	for cur.Type == TypePair {
+		binding := cur.Car
+		name := binding.Car.Str
+		val, err := eval(binding.Cdr.Car, env)
+		if err != nil {
+			return nil, err
+		}
+		localEnv.set(name, val)
+		cur = cur.Cdr
+	}
+	var result *Value
+	var err error
+	bodyCur := body
+	for bodyCur.Type == TypePair {
+		result, err = eval(bodyCur.Car, localEnv)
+		if err != nil {
+			return nil, err
+		}
+		bodyCur = bodyCur.Cdr
+	}
+	return result, nil
+}
+
+func evalBegin(args *Value, env *Env) (*Value, error) {
+	var result *Value = voidValue
+	var err error
+	cur := args
+	for cur.Type == TypePair {
+		result, err = eval(cur.Car, env)
+		if err != nil {
+			return nil, err
+		}
+		cur = cur.Cdr
+	}
+	return result, nil
+}
+
+func evalCond(args *Value, env *Env) (*Value, error) {
+	cur := args
+	for cur.Type == TypePair {
+		clause := cur.Car
+		test := clause.Car
+		// else clause
+		if test.Type == TypeSymbol && test.Str == "else" {
+			return evalBegin(clause.Cdr, env)
+		}
+		val, err := eval(test, env)
+		if err != nil {
+			return nil, err
+		}
+		if isTruthy(val) {
+			if clause.Cdr.Type == TypeNull {
+				return val, nil
+			}
+			return evalBegin(clause.Cdr, env)
+		}
+		cur = cur.Cdr
+	}
+	return voidValue, nil
 }
 
 // applyProc calls a procedure (builtin or lambda) with evaluated arguments.
@@ -332,6 +431,99 @@ func builtinEnv() *Env {
 		"<=":  func(args []*Value) (*Value, error) { return applyBuiltin("<=", args) },
 		">=":  func(args []*Value) (*Value, error) { return applyBuiltin(">=", args) },
 		"not": func(args []*Value) (*Value, error) { return applyBuiltin("not", args) },
+		"cons": func(args []*Value) (*Value, error) {
+			if len(args) != 2 {
+				return nil, &EvalError{Message: "'cons' expects exactly two arguments"}
+			}
+			return makePair(args[0], args[1]), nil
+		},
+		"car": func(args []*Value) (*Value, error) {
+			if len(args) != 1 || args[0].Type != TypePair {
+				return nil, &EvalError{Message: "'car' expects a pair"}
+			}
+			return args[0].Car, nil
+		},
+		"cdr": func(args []*Value) (*Value, error) {
+			if len(args) != 1 || args[0].Type != TypePair {
+				return nil, &EvalError{Message: "'cdr' expects a pair"}
+			}
+			return args[0].Cdr, nil
+		},
+		"null?": func(args []*Value) (*Value, error) {
+			if len(args) != 1 {
+				return nil, &EvalError{Message: "'null?' expects exactly one argument"}
+			}
+			return makeBool(args[0].Type == TypeNull), nil
+		},
+		"list": func(args []*Value) (*Value, error) {
+			result := nullValue
+			for i := len(args) - 1; i >= 0; i-- {
+				result = makePair(args[i], result)
+			}
+			return result, nil
+		},
+		"length": func(args []*Value) (*Value, error) {
+			if len(args) != 1 {
+				return nil, &EvalError{Message: "'length' expects exactly one argument"}
+			}
+			count := int64(0)
+			cur := args[0]
+			for cur.Type == TypePair {
+				count++
+				cur = cur.Cdr
+			}
+			return makeInt(count), nil
+		},
+		"string?": func(args []*Value) (*Value, error) {
+			if len(args) != 1 {
+				return nil, &EvalError{Message: "'string?' expects exactly one argument"}
+			}
+			return makeBool(args[0].Type == TypeString), nil
+		},
+		"number?": func(args []*Value) (*Value, error) {
+			if len(args) != 1 {
+				return nil, &EvalError{Message: "'number?' expects exactly one argument"}
+			}
+			return makeBool(args[0].Type == TypeInteger), nil
+		},
+		"boolean?": func(args []*Value) (*Value, error) {
+			if len(args) != 1 {
+				return nil, &EvalError{Message: "'boolean?' expects exactly one argument"}
+			}
+			return makeBool(args[0].Type == TypeBoolean), nil
+		},
+		"pair?": func(args []*Value) (*Value, error) {
+			if len(args) != 1 {
+				return nil, &EvalError{Message: "'pair?' expects exactly one argument"}
+			}
+			return makeBool(args[0].Type == TypePair), nil
+		},
+		"append": func(args []*Value) (*Value, error) {
+			if len(args) == 0 {
+				return nullValue, nil
+			}
+			// append all lists together
+			result := args[len(args)-1]
+			for i := len(args) - 2; i >= 0; i-- {
+				cur := args[i]
+				// collect elements of this list
+				var elems []*Value
+				for cur.Type == TypePair {
+					elems = append(elems, cur.Car)
+					cur = cur.Cdr
+				}
+				for j := len(elems) - 1; j >= 0; j-- {
+					result = makePair(elems[j], result)
+				}
+			}
+			return result, nil
+		},
+		"symbol?": func(args []*Value) (*Value, error) {
+			if len(args) != 1 {
+				return nil, &EvalError{Message: "'symbol?' expects exactly one argument"}
+			}
+			return makeBool(args[0].Type == TypeSymbol), nil
+		},
 	}
 	for name, fn := range builtinDefs {
 		env.set(name, makeBuiltin(name, fn))
