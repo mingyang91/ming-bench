@@ -93,7 +93,7 @@ fn is_proper_list(val: &Value) -> bool {
     fn step(v: &Value) -> Result<Value, bool> {
         match v {
             Value::Pair(cell, _) => Ok(cell.borrow().1.clone()),
-            Value::List(elems, _) if elems.is_empty() => Err(true),  // proper end
+            Value::List(_, _) => Err(true),  // any List (including non-empty) is proper
             _ => Err(false), // improper end
         }
     }
@@ -469,7 +469,7 @@ fn eval_inner(expr: &Value, env: &Env, guard_tail: bool) -> Result<Value, EvalEr
                     | "vector-length" | "vector?" | "vector->list" | "list->vector"
                     | "apply" | "dynamic-wind" | "reverse"
                     | "call/cc" | "call-with-current-continuation"
-                    | "raise" | "with-exception-handler"
+                    | "raise" | "error" | "with-exception-handler"
                     | "values" | "call-with-values"
                     | "set-car!" | "set-cdr!"
                     | "for-each" | "assq" | "assv" | "memq" | "memv" | "member"
@@ -572,6 +572,16 @@ fn eval_inner(expr: &Value, env: &Env, guard_tail: bool) -> Result<Value, EvalEr
                             return Ok(Value::Void);
                         }
                         "quote" => return eval_quote(&elems[1..], list_span),
+                        "quasiquote" => {
+                            if elems.len() != 2 {
+                                return Err(EvalError::WrongArgCount {
+                                    expected: "1".to_string(),
+                                    got: elems.len() - 1,
+                                    span: list_span,
+                                });
+                            }
+                            return eval_quasiquote(&elems[1], &current_env);
+                        }
                         "lambda" => return eval_lambda(&elems[1..], list_span, &current_env),
                         "case-lambda" => return eval_case_lambda(&elems[1..], list_span, &current_env),
                         "let" => {
@@ -866,6 +876,15 @@ fn eval_cond_tail(clauses: &[Value], env: &Env) -> Result<TailAction, EvalError>
         if test.is_truthy() {
             if parts.len() == 1 {
                 return Ok(TailAction::Result(test));
+            }
+            // Handle (test => proc) clause
+            if parts.len() == 3 {
+                if let Value::Symbol(ref arrow, _) = parts[1] {
+                    if arrow == "=>" {
+                        let proc = eval(&parts[2], env)?;
+                        return dispatch_call(proc, vec![test], Span::default(), env);
+                    }
+                }
             }
             for expr in &parts[1..parts.len() - 1] {
                 eval(expr, env)?;
@@ -1394,6 +1413,7 @@ fn apply_builtin(name: &str, args: &[Value], span: Span, env: &Env) -> Result<Va
         "dynamic-wind" => builtin_dynamic_wind(args, span, env),
         "reverse" => builtin_reverse(args, span),
         "raise" => builtin_raise(args, span),
+        "error" => builtin_error(args, span),
         "with-exception-handler" => builtin_with_exception_handler(args, span, env),
         "values" => builtin_values(args),
         "call-with-values" => builtin_call_with_values(args, span, env),
@@ -2183,6 +2203,112 @@ fn eval_quote(args: &[Value], form_span: Span) -> Result<Value, EvalError> {
         });
     }
     Ok(args[0].clone())
+}
+
+/// If `val` is `(unquote-splicing expr)`, return `Some(expr)`.
+fn as_unquote_splicing(val: &Value) -> Option<&Value> {
+    if let Value::List(inner, _) = val {
+        if inner.len() == 2 {
+            if let Value::Symbol(ref s, _) = inner[0] {
+                if s == "unquote-splicing" {
+                    return Some(&inner[1]);
+                }
+            }
+        }
+    }
+    None
+}
+
+fn eval_quasiquote(template: &Value, env: &Env) -> Result<Value, EvalError> {
+    match template {
+        Value::List(elems, span) => {
+            // Check for (unquote expr)
+            if elems.len() == 2 {
+                if let Value::Symbol(ref s, _) = elems[0] {
+                    if s == "unquote" {
+                        return eval(&elems[1], env);
+                    }
+                }
+            }
+            // Process list elements, handling unquote-splicing
+            let mut result = Vec::new();
+            for elem in elems {
+                if let Some(expr) = as_unquote_splicing(elem) {
+                    let val = eval(expr, env)?;
+                    result.extend(value_to_list_items(&val)?);
+                    continue;
+                }
+                result.push(eval_quasiquote(elem, env)?);
+            }
+            Ok(Value::List(result, *span))
+        }
+        Value::Pair(cell, span) => {
+            let (car, cdr) = {
+                let borrowed = cell.borrow();
+                (borrowed.0.clone(), borrowed.1.clone())
+            };
+            // Check for (unquote expr) as pair
+            if let Value::Symbol(ref s, _) = car {
+                if s == "unquote" {
+                    if let Value::Pair(cdr_cell, _) = &cdr {
+                        let inner = cdr_cell.borrow().0.clone();
+                        return eval(&inner, env);
+                    }
+                }
+            }
+            let new_car = eval_quasiquote(&car, env)?;
+            let new_cdr = eval_quasiquote(&cdr, env)?;
+            Ok(Value::Pair(
+                std::rc::Rc::new(std::cell::RefCell::new((new_car, new_cdr))),
+                *span,
+            ))
+        }
+        Value::Vector(elems, span) => {
+            let borrowed = elems.borrow();
+            let mut result = Vec::new();
+            for elem in borrowed.iter() {
+                if let Some(expr) = as_unquote_splicing(elem) {
+                    let val = eval(expr, env)?;
+                    result.extend(value_to_list_items(&val)?);
+                    continue;
+                }
+                result.push(eval_quasiquote(elem, env)?);
+            }
+            Ok(Value::Vector(
+                std::rc::Rc::new(std::cell::RefCell::new(result)),
+                *span,
+            ))
+        }
+        _ => Ok(template.clone()),
+    }
+}
+
+fn value_to_list_items(val: &Value) -> Result<Vec<Value>, EvalError> {
+    let mut items = Vec::new();
+    let mut current = val.clone();
+    loop {
+        match current {
+            Value::List(elems, _) => {
+                items.extend(elems);
+                return Ok(items);
+            }
+            Value::Pair(cell, _) => {
+                let (car, cdr) = {
+                    let borrowed = cell.borrow();
+                    (borrowed.0.clone(), borrowed.1.clone())
+                };
+                items.push(car);
+                current = cdr;
+            }
+            _ => {
+                return Err(EvalError::TypeMismatch {
+                    expected: "list".to_string(),
+                    got: val.to_string(),
+                    span: val.span(),
+                });
+            }
+        }
+    }
 }
 
 fn parse_params(param_list: &[Value]) -> Result<(Vec<String>, Option<String>), EvalError> {
@@ -3728,6 +3854,25 @@ fn builtin_raise(args: &[Value], span: Span) -> Result<Value, EvalError> {
     }
     Err(EvalError::SchemeRaise {
         value: args[0].clone(),
+    })
+}
+
+fn builtin_error(args: &[Value], span: Span) -> Result<Value, EvalError> {
+    if args.is_empty() {
+        return Err(EvalError::WrongArgCount {
+            expected: "at least 1".to_string(),
+            got: 0,
+            span,
+        });
+    }
+    // Build error message: first arg is message, rest are irritants
+    let mut msg = args[0].to_string();
+    for irritant in &args[1..] {
+        msg.push(' ');
+        msg.push_str(&irritant.to_string());
+    }
+    Err(EvalError::SchemeRaise {
+        value: Value::immutable_string(msg, span),
     })
 }
 

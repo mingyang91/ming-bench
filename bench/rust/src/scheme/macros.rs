@@ -69,6 +69,11 @@ fn collect_pattern_vars_inner(pattern: &Value, literals: &[String], vars: &mut V
                 collect_pattern_vars_inner(elem, literals, vars);
             }
         }
+        Value::Vector(elems, _) => {
+            for elem in elems.borrow().iter() {
+                collect_pattern_vars_inner(elem, literals, vars);
+            }
+        }
         Value::Symbol(_, _)
         | Value::Integer(_, _)
         | Value::Rational(_, _, _)
@@ -77,7 +82,6 @@ fn collect_pattern_vars_inner(pattern: &Value, literals: &[String], vars: &mut V
         | Value::String(_, _, _)
         | Value::Char(_, _)
         | Value::Pair(_, _)
-        | Value::Vector(_, _)
         | Value::Closure { .. }
         | Value::CaseLambda { .. }
         | Value::Continuation(_)
@@ -174,10 +178,17 @@ fn match_pattern(
         Value::Rational(an, ad, _) => matches!(input, Value::Rational(bn, bd, _) if an == bn && ad == bd),
         Value::Float(a, _) => matches!(input, Value::Float(b, _) if a == b),
         Value::Boolean(a, _) => matches!(input, Value::Boolean(b, _) if a == b),
+        Value::Vector(pelems, _) => {
+            let Value::Vector(ielems, _) = input else {
+                return false;
+            };
+            let pelems_borrowed = pelems.borrow();
+            let ielems_borrowed = ielems.borrow();
+            match_list(&pelems_borrowed, &ielems_borrowed, literals, bindings)
+        }
         Value::String(_, _, _)
         | Value::Char(_, _)
         | Value::Pair(_, _)
-        | Value::Vector(_, _)
         | Value::Closure { .. }
         | Value::CaseLambda { .. }
         | Value::Continuation(_)
@@ -231,6 +242,12 @@ pub(crate) fn expand_template(
                 expand_list_template(elems, bindings, def_env, gensym_map, pattern_vars);
             Value::List(expanded, *span)
         }
+        Value::Vector(elems, span) => {
+            let elems_borrowed = elems.borrow();
+            let expanded =
+                expand_list_template(&elems_borrowed, bindings, def_env, gensym_map, pattern_vars);
+            Value::Vector(std::rc::Rc::new(std::cell::RefCell::new(expanded)), *span)
+        }
         Value::Integer(_, _)
         | Value::Rational(_, _, _)
         | Value::Float(_, _)
@@ -238,7 +255,6 @@ pub(crate) fn expand_template(
         | Value::String(_, _, _)
         | Value::Char(_, _)
         | Value::Pair(_, _)
-        | Value::Vector(_, _)
         | Value::Closure { .. }
         | Value::CaseLambda { .. }
         | Value::Continuation(_)
@@ -307,6 +323,7 @@ fn template_symbols(template: &Value) -> Vec<String> {
     match template {
         Value::Symbol(name, _) if name != "..." => vec![name.clone()],
         Value::List(elems, _) => elems.iter().flat_map(template_symbols).collect(),
+        Value::Vector(elems, _) => elems.borrow().iter().flat_map(template_symbols).collect(),
         Value::Symbol(_, _)
         | Value::Integer(_, _)
         | Value::Rational(_, _, _)
@@ -315,7 +332,6 @@ fn template_symbols(template: &Value) -> Vec<String> {
         | Value::String(_, _, _)
         | Value::Char(_, _)
         | Value::Pair(_, _)
-        | Value::Vector(_, _)
         | Value::Closure { .. }
         | Value::CaseLambda { .. }
         | Value::Continuation(_)
@@ -495,5 +511,6 @@ pub(crate) fn is_builtin(name: &str) -> bool {
             | "cadddr"
             | "syntax->datum"
             | "datum->syntax"
+            | "error"
     )
 }

@@ -19,6 +19,10 @@ enum Token {
     RParen,
     Quote,
     SyntaxQuote,
+    Quasiquote,
+    Unquote,
+    UnquoteSplicing,
+    VectorOpen,
     Symbol(String),
     Integer(i64),
     Rational(i64, i64),
@@ -42,7 +46,7 @@ fn tokenize(input: &str) -> Result<Vec<(Token, Span)>, EvalError> {
                 line += 1;
                 col = 1;
             }
-            ' ' | '\t' | '\r' => {
+            ' ' | '\t' | '\r' | '\x0c' => {
                 i += 1;
                 col += 1;
             }
@@ -50,6 +54,23 @@ fn tokenize(input: &str) -> Result<Vec<(Token, Span)>, EvalError> {
                 tokens.push((Token::Quote, Span::new(line, col)));
                 i += 1;
                 col += 1;
+            }
+            '`' => {
+                tokens.push((Token::Quasiquote, Span::new(line, col)));
+                i += 1;
+                col += 1;
+            }
+            ',' => {
+                let start_span = Span::new(line, col);
+                if i + 1 < chars.len() && chars[i + 1] == '@' {
+                    tokens.push((Token::UnquoteSplicing, start_span));
+                    i += 2;
+                    col += 2;
+                } else {
+                    tokens.push((Token::Unquote, start_span));
+                    i += 1;
+                    col += 1;
+                }
             }
             ';' => {
                 while i < chars.len() && chars[i] != '\n' {
@@ -159,6 +180,11 @@ fn tokenize(input: &str) -> Result<Vec<(Token, Span)>, EvalError> {
                             tokens.push((Token::Char(c), start_span));
                             i = char_end;
                             col += consumed;
+                        }
+                        '(' => {
+                            tokens.push((Token::VectorOpen, start_span));
+                            i += 2;
+                            col += 2;
                         }
                         _ => {
                             return Err(EvalError::Parse {
@@ -271,6 +297,55 @@ fn parse_expr(tokens: &[(Token, Span)], pos: usize) -> Result<(Value, usize), Ev
             Ok((
                 Value::List(
                     vec![Value::Symbol("quote".to_string(), *span), inner],
+                    *span,
+                ),
+                next,
+            ))
+        }
+        Token::VectorOpen => {
+            let vec_span = *span;
+            let mut elems = Vec::new();
+            let mut i = pos + 1;
+            loop {
+                if i >= tokens.len() {
+                    return Err(EvalError::Parse {
+                        message: "unclosed vector literal".to_string(),
+                        span: vec_span,
+                    });
+                }
+                if matches!(tokens[i].0, Token::RParen) {
+                    return Ok((Value::Vector(std::rc::Rc::new(std::cell::RefCell::new(elems)), vec_span), i + 1));
+                }
+                let (expr, next) = parse_expr(tokens, i)?;
+                elems.push(expr);
+                i = next;
+            }
+        }
+        Token::Quasiquote => {
+            let (inner, next) = parse_expr(tokens, pos + 1)?;
+            Ok((
+                Value::List(
+                    vec![Value::Symbol("quasiquote".to_string(), *span), inner],
+                    *span,
+                ),
+                next,
+            ))
+        }
+        Token::Unquote => {
+            let (inner, next) = parse_expr(tokens, pos + 1)?;
+            Ok((
+                Value::List(
+                    vec![Value::Symbol("unquote".to_string(), *span), inner],
+                    *span,
+                ),
+                next,
+            ))
+        }
+        Token::UnquoteSplicing => {
+            let (inner, next) = parse_expr(tokens, pos + 1)?;
+            Ok((
+                Value::List(
+                    vec![Value::Symbol("unquote-splicing".to_string(), *span), inner],
                     *span,
                 ),
                 next,
