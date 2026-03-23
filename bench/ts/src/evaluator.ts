@@ -11,7 +11,8 @@ type SchemeVal =
   | { tag: 'char'; val: string; pos?: Pos }
   | { tag: 'symbol'; val: string; pos?: Pos }
   | { tag: 'list'; val: SchemeVal[]; pos?: Pos }
-  | { tag: 'lambda'; params: string[]; body: SchemeVal[]; env: Env; pos?: Pos };
+  | { tag: 'lambda'; params: string[]; rest?: string; body: SchemeVal[]; env: Env; pos?: Pos }
+  | { tag: 'builtin'; name: string; pos?: Pos };
 
 interface Token { text: string; pos: Pos }
 
@@ -219,6 +220,8 @@ function displayVal(v: SchemeVal): string {
       return '(' + v.val.map(displayVal).join(' ') + ')';
     case 'lambda':
       return '#<procedure>';
+    case 'builtin':
+      return '#<procedure>';
   }
 }
 
@@ -228,6 +231,8 @@ function displayValUnquoted(v: SchemeVal): string {
       return v.val;
     case 'char':
       return v.val;
+    case 'builtin':
+      return displayVal(v);
     default:
       return displayVal(v);
   }
@@ -357,7 +362,7 @@ function applyBuiltin(op: string, evalArgs: SchemeVal[], p?: Pos, out?: string[]
     }
     case 'procedure?': {
       if (evalArgs.length !== 1) throw posError('procedure?: need exactly one arg', p);
-      return { tag: 'boolean', val: evalArgs[0].tag === 'lambda' };
+      return { tag: 'boolean', val: evalArgs[0].tag === 'lambda' || evalArgs[0].tag === 'builtin' };
     }
     case 'display': {
       if (evalArgs.length !== 1) throw posError('display: need exactly one arg', p);
@@ -457,6 +462,74 @@ const BUILTINS = new Set(['+', '-', '*', '/', '<', '>', '=', '<=', '>=', 'not',
   'string-append', 'string-length', 'substring', 'string->number', 'number->string',
   'symbol->string', 'string->symbol', 'string-ref', 'string-copy', 'string-set!']);
 
+function parseParams(paramList: SchemeVal, p?: Pos): { params: string[]; rest?: string } {
+  if (paramList.tag !== 'list') throw posError('params must be a list', p);
+  const items = paramList.val;
+  const dotIdx = items.findIndex(x => x.tag === 'symbol' && x.val === '.');
+  if (dotIdx >= 0) {
+    if (dotIdx !== items.length - 2) throw posError('bad dot syntax in params', p);
+    const rest = items[items.length - 1];
+    if (rest.tag !== 'symbol') throw posError('rest param must be a symbol', p);
+    const params = items.slice(0, dotIdx).map(pm => {
+      if (pm.tag !== 'symbol') throw posError('bad parameter', p);
+      return pm.val;
+    });
+    return { params, rest: rest.val };
+  }
+  const params = items.map(pm => {
+    if (pm.tag !== 'symbol') throw posError('bad parameter', p);
+    return pm.val;
+  });
+  return { params };
+}
+
+function applyLambda(proc: SchemeVal & { tag: 'lambda' }, evalArgs: SchemeVal[], p?: Pos, out?: string[]): { expr: SchemeVal; env: Env } {
+  if (proc.rest) {
+    if (evalArgs.length < proc.params.length) {
+      throw posError(`wrong number of arguments: expected at least ${proc.params.length}, got ${evalArgs.length}`, p);
+    }
+  } else {
+    if (evalArgs.length !== proc.params.length) {
+      throw posError(`wrong number of arguments: expected ${proc.params.length}, got ${evalArgs.length}`, p);
+    }
+  }
+  const callEnv = new Env(proc.env);
+  for (let i = 0; i < proc.params.length; i++) {
+    callEnv.define(proc.params[i], evalArgs[i]);
+  }
+  if (proc.rest) {
+    callEnv.define(proc.rest, { tag: 'list', val: evalArgs.slice(proc.params.length) });
+  }
+  for (let i = 0; i < proc.body.length - 1; i++) {
+    evalExpr(proc.body[i], callEnv, out);
+  }
+  return { expr: proc.body[proc.body.length - 1], env: callEnv };
+}
+
+function schemeApply(proc: SchemeVal, evalArgs: SchemeVal[], p?: Pos, out?: string[]): SchemeVal {
+  if (proc.tag === 'lambda') {
+    const { expr, env } = applyLambda(proc, evalArgs, p);
+    return evalExpr(expr, env, out);
+  }
+  if (proc.tag === 'builtin') {
+    if (proc.name === 'apply') {
+      return doApply(evalArgs, p, out);
+    }
+    return applyBuiltin(proc.name, evalArgs, p, out);
+  }
+  throw posError('not a procedure', p);
+}
+
+function doApply(args: SchemeVal[], p?: Pos, out?: string[]): SchemeVal {
+  if (args.length < 2) throw posError('apply: need at least two args', p);
+  const proc = args[0];
+  const lastArg = args[args.length - 1];
+  if (lastArg.tag !== 'list') throw posError('apply: last argument must be a list', p);
+  const prefixArgs = args.slice(1, -1);
+  const allArgs = [...prefixArgs, ...lastArg.val];
+  return schemeApply(proc, allArgs, p, out);
+}
+
 function evalExpr(expr: SchemeVal, env: Env, out?: string[]): SchemeVal {
   // Trampoline loop for TCO
   while (true) {
@@ -500,12 +573,10 @@ function evalExpr(expr: SchemeVal, env: Env, out?: string[]): SchemeVal {
           }
           if (target.tag === 'list' && target.val.length > 0 && target.val[0].tag === 'symbol') {
             const name = target.val[0].val;
-            const params = target.val.slice(1).map(pm => {
-              if (pm.tag !== 'symbol') throw posError('define: bad parameter', p);
-              return pm.val;
-            });
+            const paramListVal: SchemeVal = { tag: 'list', val: target.val.slice(1) };
+            const { params, rest } = parseParams(paramListVal, p);
             const body = args.slice(1);
-            const lambda: SchemeVal = { tag: 'lambda', params, body, env };
+            const lambda: SchemeVal = { tag: 'lambda', params, rest, body, env };
             env.define(name, lambda);
             return lambda;
           }
@@ -522,14 +593,9 @@ function evalExpr(expr: SchemeVal, env: Env, out?: string[]): SchemeVal {
 
         if (op === 'lambda') {
           if (args.length < 2) throw posError('lambda: bad syntax', p);
-          const paramList = args[0];
-          if (paramList.tag !== 'list') throw posError('lambda: params must be a list', p);
-          const params = paramList.val.map(pm => {
-            if (pm.tag !== 'symbol') throw posError('lambda: bad parameter', p);
-            return pm.val;
-          });
+          const { params, rest } = parseParams(args[0], p);
           const body = args.slice(1);
-          return { tag: 'lambda', params, body, env };
+          return { tag: 'lambda', params, rest, body, env };
         }
 
         if (op === 'and') {
@@ -627,20 +693,17 @@ function evalExpr(expr: SchemeVal, env: Env, out?: string[]): SchemeVal {
       const evalArgs = items.slice(1).map(a => evalExpr(a, env, out));
 
       if (proc.tag === 'lambda') {
-        if (evalArgs.length !== proc.params.length) {
-          throw posError(`wrong number of arguments: expected ${proc.params.length}, got ${evalArgs.length}`, p);
-        }
-        const callEnv = new Env(proc.env);
-        for (let i = 0; i < proc.params.length; i++) {
-          callEnv.define(proc.params[i], evalArgs[i]);
-        }
-        // TCO: evaluate all but last body expr, then loop on last
-        for (let i = 0; i < proc.body.length - 1; i++) {
-          evalExpr(proc.body[i], callEnv, out);
-        }
-        expr = proc.body[proc.body.length - 1];
-        env = callEnv;
+        const result = applyLambda(proc, evalArgs, p, out);
+        expr = result.expr;
+        env = result.env;
         continue;
+      }
+
+      if (proc.tag === 'builtin') {
+        if (proc.name === 'apply') {
+          return doApply(evalArgs, p, out);
+        }
+        return applyBuiltin(proc.name, evalArgs, p, out);
       }
 
       throw posError('not a procedure', p);
@@ -650,7 +713,12 @@ function evalExpr(expr: SchemeVal, env: Env, out?: string[]): SchemeVal {
 }
 
 function makeGlobalEnv(): Env {
-  return new Env();
+  const env = new Env();
+  env.define('apply', { tag: 'builtin', name: 'apply' });
+  for (const name of BUILTINS) {
+    env.define(name, { tag: 'builtin', name });
+  }
+  return env;
 }
 
 /**
