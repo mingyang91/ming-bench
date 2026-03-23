@@ -423,6 +423,49 @@ fn parse_expr(input: &[u8], pos: usize) -> Result<(Expr, usize), EvalError> {
                 next,
             ))
         }
+        b'`' => {
+            let (expr, next) = parse_expr(input, i + 1)?;
+            Ok((
+                Expr::new(
+                    ExprKind::List(vec![
+                        Expr::new(ExprKind::Symbol("quasiquote".into()), l, c),
+                        expr,
+                    ]),
+                    l,
+                    c,
+                ),
+                next,
+            ))
+        }
+        b',' => {
+            if i + 1 < input.len() && input[i + 1] == b'@' {
+                let (expr, next) = parse_expr(input, i + 2)?;
+                Ok((
+                    Expr::new(
+                        ExprKind::List(vec![
+                            Expr::new(ExprKind::Symbol("unquote-splicing".into()), l, c),
+                            expr,
+                        ]),
+                        l,
+                        c,
+                    ),
+                    next,
+                ))
+            } else {
+                let (expr, next) = parse_expr(input, i + 1)?;
+                Ok((
+                    Expr::new(
+                        ExprKind::List(vec![
+                            Expr::new(ExprKind::Symbol("unquote".into()), l, c),
+                            expr,
+                        ]),
+                        l,
+                        c,
+                    ),
+                    next,
+                ))
+            }
+        }
         b'"' => parse_string(input, i),
         b'#' => {
             if i + 1 < input.len() {
@@ -631,6 +674,20 @@ fn expr_to_value(expr: &Expr) -> Value {
             if items.is_empty() {
                 Value::List(vec![])
             } else {
+                // Check for dotted pair notation: (a b . c)
+                // The dot is the second-to-last element
+                if items.len() >= 3 {
+                    if let ExprKind::Symbol(ref s) = items[items.len() - 2].kind {
+                        if s == "." {
+                            let tail = expr_to_value(&items[items.len() - 1]);
+                            let mut result = tail;
+                            for item in items[..items.len() - 2].iter().rev() {
+                                result = make_pair(expr_to_value(item), result);
+                            }
+                            return result;
+                        }
+                    }
+                }
                 list_from_vec(items.iter().map(expr_to_value).collect())
             }
         }
@@ -829,6 +886,8 @@ enum KontFrame {
     NamedLetBind { loop_name: String, all_params: Vec<String>, done_vals: Vec<Value>, remaining_inits: Vec<Expr>, body: Vec<Expr>, outer: Env },
     /// Cond: test was evaluated; decide whether to run body or try next clause.
     CondClause { body: Vec<Expr>, rest_clauses: Vec<Expr>, env: Env, el: u32, ec: u32 },
+    /// Cond =>: proc was evaluated; apply it to the test value.
+    CondArrow { test_val: Value, el: u32, ec: u32 },
     /// String-set!: index expression was evaluated.
     StrSetIdx { var: String, ch_expr: Expr, env: Env, el: u32, ec: u32 },
     /// String-set!: char expression was evaluated.
@@ -906,6 +965,103 @@ enum KontFrame {
 enum RaiseAction {
     CallHandler { handler: Value },
     EvalGuard { var: String, clauses: Vec<Expr>, env: Env },
+}
+
+/// Transform a quasiquote expression into equivalent code using cons/append/list.
+/// Returns an Expr that, when evaluated, produces the quasiquoted value.
+fn expand_quasiquote(expr: &Expr) -> Expr {
+    fn sym(s: &str, l: u32, c: u32) -> Expr { Expr::new(ExprKind::Symbol(s.into()), l, c) }
+    fn make_call(name: &str, args: Vec<Expr>, l: u32, c: u32) -> Expr {
+        let mut items = vec![sym(name, l, c)];
+        items.extend(args);
+        Expr::new(ExprKind::List(items), l, c)
+    }
+    fn quote_expr(e: &Expr) -> Expr {
+        Expr::new(ExprKind::List(vec![
+            Expr::new(ExprKind::Symbol("quote".into()), e.line, e.col),
+            e.clone(),
+        ]), e.line, e.col)
+    }
+
+    match &expr.kind {
+        ExprKind::List(items) if !items.is_empty() => {
+            // (unquote expr) → expr
+            if let ExprKind::Symbol(ref s) = items[0].kind {
+                if s == "unquote" && items.len() == 2 {
+                    return items[1].clone();
+                }
+            }
+
+            let (l, c) = (expr.line, expr.col);
+
+            // Check for dotted pair notation
+            let is_dotted = items.len() >= 3 && matches!(&items[items.len() - 2].kind, ExprKind::Symbol(ref s) if s == ".");
+
+            if is_dotted {
+                // (a b . c) → build with cons
+                let tail = expand_quasiquote(&items[items.len() - 1]);
+                let mut result = tail;
+                for item in items[..items.len() - 2].iter().rev() {
+                    // Check for unquote-splicing
+                    if let ExprKind::List(ref sub) = item.kind {
+                        if sub.len() == 2 {
+                            if let ExprKind::Symbol(ref s) = sub[0].kind {
+                                if s == "unquote-splicing" {
+                                    result = make_call("append", vec![sub[1].clone(), result], l, c);
+                                    continue;
+                                }
+                            }
+                        }
+                    }
+                    result = make_call("cons", vec![expand_quasiquote(item), result], l, c);
+                }
+                result
+            } else {
+                // Check if any element uses unquote-splicing
+                let has_splice = items.iter().any(|item| {
+                    if let ExprKind::List(ref sub) = item.kind {
+                        if sub.len() == 2 {
+                            if let ExprKind::Symbol(ref s) = sub[0].kind {
+                                return s == "unquote-splicing";
+                            }
+                        }
+                    }
+                    false
+                });
+
+                if has_splice {
+                    // Use append strategy: group consecutive non-splice items into (list ...) calls
+                    let mut segments: Vec<Expr> = Vec::new();
+                    let mut current_group: Vec<Expr> = Vec::new();
+                    for item in items {
+                        if let ExprKind::List(ref sub) = item.kind {
+                            if sub.len() == 2 {
+                                if let ExprKind::Symbol(ref s) = sub[0].kind {
+                                    if s == "unquote-splicing" {
+                                        if !current_group.is_empty() {
+                                            segments.push(make_call("list", std::mem::take(&mut current_group), l, c));
+                                        }
+                                        segments.push(sub[1].clone());
+                                        continue;
+                                    }
+                                }
+                            }
+                        }
+                        current_group.push(expand_quasiquote(item));
+                    }
+                    if !current_group.is_empty() {
+                        segments.push(make_call("list", current_group, l, c));
+                    }
+                    make_call("append", segments, l, c)
+                } else {
+                    // Simple list: use (list expanded-items...)
+                    let expanded: Vec<Expr> = items.iter().map(|i| expand_quasiquote(i)).collect();
+                    make_call("list", expanded, l, c)
+                }
+            }
+        }
+        _ => quote_expr(expr),
+    }
 }
 
 /// Control state of the CEK machine.
@@ -990,6 +1146,7 @@ fn is_special_form(name: &str) -> bool {
             | "letrec" | "letrec*" | "case" | "do" | "when" | "unless"
             | "guard" | "define-record-type"
             | "syntax-case" | "syntax" | "with-syntax" | "case-lambda"
+            | "quasiquote"
     )
 }
 
@@ -1552,6 +1709,13 @@ fn run_cek(initial_ctrl: Ctrl, initial_kont: Vec<KontFrame>) -> Result<Value, Ev
                                         return Err(EvalError::Arity("quote requires 1 argument".into()).at(el, ec));
                                     }
                                     Ctrl::Val(expr_to_value(&items[1]))
+                                }
+                                Some("quasiquote") => {
+                                    if items.len() != 2 {
+                                        return Err(EvalError::Arity("quasiquote requires 1 argument".into()).at(el, ec));
+                                    }
+                                    let expanded = expand_quasiquote(&items[1]);
+                                    Ctrl::Eval(expanded, env)
                                 }
                                 Some("if") => {
                                     if items.len() < 3 || items.len() > 4 {
@@ -2357,7 +2521,12 @@ fn run_cek(initial_ctrl: Ctrl, initial_kont: Vec<KontFrame>) -> Result<Value, Ev
                         }
                         KontFrame::CondClause { body, rest_clauses, env, el, ec } => {
                             if val.is_truthy() {
-                                if body.is_empty() {
+                                // Check for => syntax: (test => proc)
+                                if body.len() == 2 && matches!(&body[0].kind, ExprKind::Symbol(s) if s == "=>") {
+                                    // Evaluate proc, then apply it to the test result
+                                    kont.push(KontFrame::CondArrow { test_val: val, el, ec });
+                                    Ctrl::Eval(body[1].clone(), env)
+                                } else if body.is_empty() {
                                     Ctrl::Val(val)
                                 } else {
                                     eval_body(&body, env, &mut kont)
@@ -2367,6 +2536,10 @@ fn run_cek(initial_ctrl: Ctrl, initial_kont: Vec<KontFrame>) -> Result<Value, Ev
                             } else {
                                 eval_cond(&rest_clauses, env, el, ec, &mut kont)?
                             }
+                        }
+                        KontFrame::CondArrow { test_val, el, ec } => {
+                            // val is the proc, apply it to test_val
+                            apply_func(val, vec![test_val], &mut kont, &mut wind, el, ec)?
                         }
                         KontFrame::StrSetIdx { var, ch_expr, env, el, ec } => {
                             let idx = as_integer(&val).map_err(|e| e.at(el, ec))? as usize;
@@ -4033,11 +4206,23 @@ fn expr_to_datum(expr: &Expr) -> Value {
         ExprKind::Symbol(s) => Value::Symbol(s.clone()),
         ExprKind::Char(c) => Value::Char(*c),
         ExprKind::List(items) => {
-            let vals: Vec<Value> = items.iter().map(expr_to_datum).collect();
-            if vals.is_empty() {
+            if items.is_empty() {
                 Value::List(vec![])
             } else {
-                list_from_vec(vals)
+                // Handle dotted pair notation
+                if items.len() >= 3 {
+                    if let ExprKind::Symbol(ref s) = items[items.len() - 2].kind {
+                        if s == "." {
+                            let tail = expr_to_datum(&items[items.len() - 1]);
+                            let mut result = tail;
+                            for item in items[..items.len() - 2].iter().rev() {
+                                result = make_pair(expr_to_datum(item), result);
+                            }
+                            return result;
+                        }
+                    }
+                }
+                list_from_vec(items.iter().map(expr_to_datum).collect())
             }
         }
     }
@@ -4057,6 +4242,35 @@ fn datum_to_expr(val: &Value) -> Expr {
         Value::List(items) => {
             let exprs: Vec<Expr> = items.iter().map(datum_to_expr).collect();
             Expr::new(ExprKind::List(exprs), 0, 0)
+        }
+        Value::Pair(p) => {
+            // Convert pair to ExprKind::List with dot notation
+            let (car_val, cdr_val) = {
+                let inner = p.borrow();
+                (inner.0.clone(), inner.1.clone())
+            };
+            let mut items = vec![datum_to_expr(&car_val)];
+            let mut cur = cdr_val;
+            loop {
+                match cur {
+                    Value::Pair(p2) => {
+                        let (car2, cdr2) = {
+                            let inner2 = p2.borrow();
+                            (inner2.0.clone(), inner2.1.clone())
+                        };
+                        items.push(datum_to_expr(&car2));
+                        cur = cdr2;
+                    }
+                    Value::List(ref l) if l.is_empty() => {
+                        return Expr::new(ExprKind::List(items), 0, 0);
+                    }
+                    _ => {
+                        items.push(Expr::new(ExprKind::Symbol(".".into()), 0, 0));
+                        items.push(datum_to_expr(&cur));
+                        return Expr::new(ExprKind::List(items), 0, 0);
+                    }
+                }
+            }
         }
         _ => Expr::new(ExprKind::Symbol(val.display()), 0, 0),
     }
