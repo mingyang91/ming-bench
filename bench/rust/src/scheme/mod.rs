@@ -14,9 +14,14 @@ struct WindEntry {
 }
 
 static WIND_ID_COUNTER: AtomicU64 = AtomicU64::new(0);
+static RECORD_TYPE_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 fn next_wind_id() -> u64 {
     WIND_ID_COUNTER.fetch_add(1, Ordering::Relaxed)
+}
+
+fn next_record_type_id() -> u64 {
+    RECORD_TYPE_COUNTER.fetch_add(1, Ordering::Relaxed)
 }
 
 /// A Scheme value.
@@ -48,6 +53,14 @@ enum Value {
     Vector(std::rc::Rc<std::cell::RefCell<Vec<Value>>>),
     /// Multiple return values from `values`.
     Values(Vec<Value>),
+    /// Record instance: type_id, field values
+    Record { type_id: u64, fields: Vec<Value> },
+    /// Record constructor: type_id, type_name, field_names
+    RecordConstructor { type_id: u64, type_name: String, field_names: Vec<String> },
+    /// Record predicate: type_id
+    RecordPredicate { type_id: u64 },
+    /// Record accessor: type_id, type_name, field_index
+    RecordAccessor { type_id: u64, type_name: String, field_index: usize, field_name: String },
 }
 
 thread_local! {
@@ -115,6 +128,8 @@ impl Value {
                 let inner: Vec<String> = vs.iter().map(|v| v.display()).collect();
                 format!("#<values: {}>", inner.join(" "))
             }
+            Value::Record { .. } => "#<record>".to_string(),
+            Value::RecordConstructor { .. } | Value::RecordPredicate { .. } | Value::RecordAccessor { .. } => "#<procedure>".to_string(),
         }
     }
 
@@ -789,7 +804,7 @@ fn is_special_form(name: &str) -> bool {
             | "let" | "let*" | "begin" | "cond" | "string-set!" | "call/cc"
             | "call-with-current-continuation" | "define-syntax" | "syntax-rules"
             | "letrec" | "letrec*" | "case" | "do" | "when" | "unless"
-            | "guard"
+            | "guard" | "define-record-type"
     )
 }
 
@@ -1227,6 +1242,30 @@ fn apply_func(func: Value, args: Vec<Value>, kont: &mut Vec<KontFrame>, wind: &m
             let mut all_args: Vec<Value> = args[1..args.len() - 1].to_vec();
             all_args.extend(tail_args);
             apply_func(func, all_args, kont, wind, el, ec)
+        }
+        Value::RecordConstructor { type_id, ref type_name, ref field_names } => {
+            if args.len() != field_names.len() {
+                return Err(EvalError::Arity(format!("{}: expected {} arguments, got {}", type_name, field_names.len(), args.len())).at(el, ec));
+            }
+            Ok(Ctrl::Val(Value::Record { type_id, fields: args }))
+        }
+        Value::RecordPredicate { type_id } => {
+            if args.len() != 1 {
+                return Err(EvalError::Arity("record predicate requires 1 argument".into()).at(el, ec));
+            }
+            let result = matches!(&args[0], Value::Record { type_id: tid, .. } if *tid == type_id);
+            Ok(Ctrl::Val(Value::Boolean(result)))
+        }
+        Value::RecordAccessor { type_id, ref type_name, field_index, ref field_name } => {
+            if args.len() != 1 {
+                return Err(EvalError::Arity(format!("{}: requires 1 argument", field_name)).at(el, ec));
+            }
+            match &args[0] {
+                Value::Record { type_id: tid, fields } if *tid == type_id => {
+                    Ok(Ctrl::Val(fields[field_index].clone()))
+                }
+                _ => Err(EvalError::Type(format!("{}: expected record of type {}", field_name, type_name)).at(el, ec)),
+            }
         }
         Value::Builtin(ref name) => {
             let result = eval_builtin(name, &args).map_err(|e| e.at(el, ec))?;
@@ -1749,6 +1788,79 @@ fn run_cek(initial_ctrl: Ctrl, initial_kont: Vec<KontFrame>) -> Result<Value, Ev
                                         then_body,
                                     ]), el, ec);
                                     Ctrl::Eval(if_expr, env)
+                                }
+                                Some("define-record-type") => {
+                                    // (define-record-type <name> (constructor field...) pred? (field accessor) ...)
+                                    if items.len() < 4 {
+                                        return Err(EvalError::Arity("define-record-type requires at least 3 arguments".into()).at(el, ec));
+                                    }
+                                    // Parse type name (may be <name>)
+                                    let _type_name = match &items[1].kind {
+                                        ExprKind::Symbol(s) => s.clone(),
+                                        _ => return Err(EvalError::Type("define-record-type: expected type name".into()).at(el, ec)),
+                                    };
+                                    // Parse constructor: (ctor-name field ...)
+                                    let (ctor_name, ctor_fields) = match &items[2].kind {
+                                        ExprKind::List(parts) if !parts.is_empty() => {
+                                            let cname = match &parts[0].kind {
+                                                ExprKind::Symbol(s) => s.clone(),
+                                                _ => return Err(EvalError::Type("define-record-type: expected constructor name".into()).at(el, ec)),
+                                            };
+                                            let mut fields = Vec::new();
+                                            for p in &parts[1..] {
+                                                match &p.kind {
+                                                    ExprKind::Symbol(s) => fields.push(s.clone()),
+                                                    _ => return Err(EvalError::Type("define-record-type: expected field name".into()).at(el, ec)),
+                                                }
+                                            }
+                                            (cname, fields)
+                                        }
+                                        _ => return Err(EvalError::Type("define-record-type: expected constructor spec".into()).at(el, ec)),
+                                    };
+                                    // Parse predicate name
+                                    let pred_name = match &items[3].kind {
+                                        ExprKind::Symbol(s) => s.clone(),
+                                        _ => return Err(EvalError::Type("define-record-type: expected predicate name".into()).at(el, ec)),
+                                    };
+                                    // Parse field specs: (field-name accessor-name)
+                                    let mut field_accessors: Vec<(String, String)> = Vec::new();
+                                    for item in &items[4..] {
+                                        match &item.kind {
+                                            ExprKind::List(parts) if parts.len() >= 2 => {
+                                                let fname = match &parts[0].kind {
+                                                    ExprKind::Symbol(s) => s.clone(),
+                                                    _ => return Err(EvalError::Type("define-record-type: expected field name".into()).at(el, ec)),
+                                                };
+                                                let aname = match &parts[1].kind {
+                                                    ExprKind::Symbol(s) => s.clone(),
+                                                    _ => return Err(EvalError::Type("define-record-type: expected accessor name".into()).at(el, ec)),
+                                                };
+                                                field_accessors.push((fname, aname));
+                                            }
+                                            _ => return Err(EvalError::Type("define-record-type: expected field spec".into()).at(el, ec)),
+                                        }
+                                    }
+                                    let type_id = next_record_type_id();
+                                    // Define constructor
+                                    env_set(&env, ctor_name, Value::RecordConstructor {
+                                        type_id,
+                                        type_name: _type_name.clone(),
+                                        field_names: ctor_fields.clone(),
+                                    });
+                                    // Define predicate
+                                    env_set(&env, pred_name, Value::RecordPredicate { type_id });
+                                    // Define accessors
+                                    for (fname, aname) in &field_accessors {
+                                        let idx = ctor_fields.iter().position(|f| f == fname)
+                                            .ok_or_else(|| EvalError::Type(format!("define-record-type: field '{}' not in constructor", fname)).at(el, ec))?;
+                                        env_set(&env, aname.clone(), Value::RecordAccessor {
+                                            type_id,
+                                            type_name: _type_name.clone(),
+                                            field_index: idx,
+                                            field_name: fname.clone(),
+                                        });
+                                    }
+                                    Ctrl::Val(Value::Void)
                                 }
                                 Some("guard") => {
                                     // (guard (var clause ...) body ...)
