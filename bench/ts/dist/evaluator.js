@@ -547,6 +547,9 @@ function makeGlobalEnv() {
     // raise and with-exception-handler are handled specially in applyCPS
     defBuiltin('raise', (_args) => { throw new EvalError('raise: internal error'); });
     defBuiltin('with-exception-handler', (_args) => { throw new EvalError('with-exception-handler: internal error'); });
+    // values and call-with-values are handled specially in applyCPS
+    defBuiltin('values', (_args) => { throw new EvalError('values: internal error'); });
+    defBuiltin('call-with-values', (_args) => { throw new EvalError('call-with-values: internal error'); });
     defBuiltin('number?', (args) => ({ tag: 'boolean', value: args[0].tag === 'number' }));
     defBuiltin('string?', (args) => ({ tag: 'boolean', value: args[0].tag === 'string' }));
     defBuiltin('boolean?', (args) => ({ tag: 'boolean', value: args[0].tag === 'boolean' }));
@@ -1009,6 +1012,23 @@ function applyCPS(proc, args, k, pos) {
                 return callK(k, result);
             });
         }
+        // values: return multiple values (single value is transparent)
+        if (proc.name === 'values') {
+            if (args.length === 1) {
+                return callK(k, args[0]);
+            }
+            return callK(k, { tag: 'values', values: args });
+        }
+        // call-with-values: producer -> consumer
+        if (proc.name === 'call-with-values') {
+            const [producer, consumer] = args;
+            return applyCPS(producer, [], (produced) => {
+                if (produced.tag === 'values') {
+                    return applyCPS(consumer, produced.values, k);
+                }
+                return applyCPS(consumer, [produced], k);
+            });
+        }
         // apply: restructure args and delegate
         if (proc.name === 'apply') {
             const actualProc = args[0];
@@ -1422,6 +1442,7 @@ function writeVal(val) {
         case 'continuation': return '#<continuation>';
         case 'void': return '';
         case 'syntax': return '#<syntax>';
+        case 'values': return val.values.map(writeVal).join('\n');
     }
 }
 const display = writeVal;
