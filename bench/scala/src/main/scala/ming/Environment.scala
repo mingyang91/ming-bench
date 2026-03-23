@@ -12,4 +12,10 @@ class Environment(
   def define(name: String, value: SchemeValue): Unit =
     bindings(name) = value
 
+  def set(name: String, value: SchemeValue): Boolean =
+    if bindings.contains(name) then
+      bindings(name) = value
+      true
+    else parent.exists(_.set(name, value))
+
   def child(): Environment = Environment(scala.collection.mutable.Map.empty, Some(this))

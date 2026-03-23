@@ -59,6 +59,9 @@ object Interpreter:
         case ListVal(SymbolVal("lambda", _) :: args, pos) =>
           return evalLambda(args, pos, curEnv)
 
+        case ListVal(SymbolVal("set!", _) :: args, pos) =>
+          return evalSet(args, pos, curEnv)
+
         case ListVal(SymbolVal("begin", _) :: args, _) =>
           if args.isEmpty then return Void
           evalBodyInit(args, curEnv)
@@ -245,6 +248,14 @@ object Interpreter:
             else throw e
       case _ =>
         throw new EvalError(posMsg("not a procedure", pos))
+
+  private def evalSet(args: List[SchemeValue], pos: Option[SourcePos], env: Environment): SchemeValue =
+    args match
+      case SymbolVal(name, namePos) :: value :: Nil =>
+        val v = eval(value, env)
+        if !env.set(name, v) then throw new EvalError(posMsg(s"set!: unbound variable: $name", namePos.orElse(pos)))
+        Void
+      case _ => throw new EvalError(posMsg("set!: bad syntax", pos))
 
   private def evalDefine(args: List[SchemeValue], pos: Option[SourcePos], env: Environment): SchemeValue =
     args match
