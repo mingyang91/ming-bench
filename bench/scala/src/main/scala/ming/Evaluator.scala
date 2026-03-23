@@ -65,13 +65,19 @@ object Evaluator:
           ContinuationManager.pendingReturn = None
           pending.get
         else
-          val contId = ContinuationManager.freshId()
-          val ctx    = ContinuationManager.bodyContext
-          val cont   = ContinuationVal(contId, ctx.exprs, ctx.env)
-          val proc   = args.head
+          val contId     = ContinuationManager.freshId()
+          val ctx        = ContinuationManager.bodyContext
+          val ctxStack   = ContinuationManager.contextStack
+          val seqRem     = ContinuationManager.seqRemaining
+          val seqE       = ContinuationManager.seqEnv
+          val hasSame    = ContinuationManager.hasSameBodyFrame
+          val cont       = ContinuationVal(contId, ctx.exprs, ctx.env, ctxStack, seqRem, seqE, hasSame)
+          val proc       = args.head
+          val savedStack = ContinuationManager.contextStack
           try Interpreter.applyProc(proc, List(cont))
           catch
             case jump: ContinuationJump if jump.contId == contId =>
+              ContinuationManager.contextStack = savedStack
               jump.value
     )
 
@@ -80,16 +86,43 @@ object Evaluator:
     var result: SchemeValue = Void
     var remaining           = exprs
     while remaining.nonEmpty do
-      ContinuationManager.bodyContext = BodyContext(remaining, env)
+      ContinuationManager.seqRemaining = remaining
+      ContinuationManager.seqEnv = env
+      ContinuationManager.bodyContext = BodyContext(List(remaining.head), env)
       result = Interpreter.eval(remaining.head, env)
       remaining = remaining.tail
     result
 
-  /** Handle a ContinuationJump by re-evaluating the continuation's saved body. */
+  /** Check if an expression is a direct call/cc application. */
+  private def isDirectCallCc(expr: SchemeValue): Boolean = expr match
+    case SchemeValue.ListVal(SchemeValue.SymbolVal("call/cc", _) :: _, _)                        => true
+    case SchemeValue.ListVal(SchemeValue.SymbolVal("call-with-current-continuation", _) :: _, _) => true
+    case _                                                                                       => false
+
+  /** Handle a ContinuationJump by re-evaluating the continuation's saved context. */
   private def handleContinuationJump(jump: ContinuationJump): SchemeValue =
     try
       ContinuationManager.pendingReturn = Some(jump.value)
-      evalExprsSequentially(jump.bodyExprs, jump.bodyEnv)
+      if jump.seqRemaining.length > 1 then
+        // Multiple top-level expressions: replay from the top-level sequence.
+        // This makes values flow through enclosing expressions (e.g., define).
+        evalExprsSequentially(jump.seqRemaining, jump.seqEnv)
+      else
+        // Single top-level expression: replay inner body + context stack frames.
+        // Skip the same-body frame when bodyExprs is a direct call/cc expression,
+        // to avoid re-executing subsequent call/cc expressions in the same body.
+        val outerFrames =
+          if jump.hasSameBodyFrame && jump.contextStack.nonEmpty && isDirectCallCc(jump.bodyExprs.head) then
+            jump.contextStack.tail
+          else jump.contextStack
+        val allFrames           = BodyContext(jump.bodyExprs, jump.bodyEnv) :: outerFrames
+        var result: SchemeValue = Void
+        var remaining           = allFrames
+        while remaining.nonEmpty do
+          ContinuationManager.contextStack = remaining.tail
+          result = evalExprsSequentially(remaining.head.exprs, remaining.head.env)
+          remaining = remaining.tail
+        result
     catch case jump2: ContinuationJump => handleContinuationJump(jump2)
 
   private def formatResult(value: SchemeValue): String =
