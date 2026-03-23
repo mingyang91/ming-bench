@@ -43,7 +43,8 @@ object Evaluator:
       ("string->symbol", args => Builtins.stringToSymbolOp(args)),
       ("string-ref", args => Builtins.stringRefOp(args)),
       ("string-set!", args => Builtins.stringSetOp(args)),
-      ("string-copy", args => Builtins.stringCopyOp(args))
+      ("string-copy", args => Builtins.stringCopyOp(args)),
+      ("apply", args => Builtins.applyOp(args))
     )
     builtins.foreach { (name, func) =>
       env.define(name, BuiltinVal(name, func))

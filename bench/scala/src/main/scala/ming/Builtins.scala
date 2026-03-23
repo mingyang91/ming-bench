@@ -190,6 +190,16 @@ object Builtins:
         throw new EvalError("string-set!: string is immutable")
       case _ => throw new EvalError("string-set!: expected (mutable-string index char)")
 
+  def applyOp(args: List[SchemeValue]): SchemeValue =
+    if args.length < 2 then throw new EvalError("apply: requires at least 2 arguments")
+    val proc    = args.head
+    val lastArg = args.last
+    val tailList = lastArg match
+      case ListVal(es, _) => es
+      case _              => throw new EvalError("apply: last argument must be a list")
+    val prefixArgs = args.slice(1, args.length - 1)
+    Interpreter.applyProc(proc, prefixArgs ++ tailList)
+
   def stringCopyOp(args: List[SchemeValue]): SchemeValue =
     args match
       case StringVal(s, _) :: Nil         => MutableStringVal(s.toCharArray)

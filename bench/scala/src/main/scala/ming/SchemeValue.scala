@@ -8,7 +8,7 @@ enum SchemeValue:
   case SymbolVal(name: String, pos: Option[SourcePos] = None)
   case ListVal(elements: List[SchemeValue], pos: Option[SourcePos] = None)
   case PairVal(car: SchemeValue, cdr: SchemeValue)
-  case LambdaVal(params: List[String], body: List[SchemeValue], closure: Environment)
+  case LambdaVal(params: List[String], restParam: Option[String], body: List[SchemeValue], closure: Environment)
   case CharVal(value: Char, pos: Option[SourcePos] = None)
   case MutableStringVal(chars: Array[Char], pos: Option[SourcePos] = None)
   case BuiltinVal(name: String, func: List[SchemeValue] => SchemeValue)
@@ -35,7 +35,7 @@ enum SchemeValue:
     case CharVal(c, _)           => s"#\\$c"
     case ListVal(es, _)          => s"(${es.map(_.display).mkString(" ")})"
     case PairVal(_, _)           => displayPair(this)
-    case LambdaVal(_, _, _)      => "#<procedure>"
+    case LambdaVal(_, _, _, _)   => "#<procedure>"
     case BuiltinVal(n, _)        => s"#<builtin:$n>"
     case Void                    => ""
 
