@@ -357,198 +357,232 @@ function makeGlobalEnv() {
     });
     return env;
 }
-function evaluate(expr, env) {
-    if (expr.tag === 'symbol') {
-        try {
-            return env.get(expr.value);
-        }
-        catch (e) {
-            if (e instanceof EvalError && expr.pos) {
-                throw new EvalError(`${posStr(expr.pos)}${e.message}`);
-            }
-            throw e;
-        }
+class TailCall {
+    expr;
+    env;
+    constructor(expr, env) {
+        this.expr = expr;
+        this.env = env;
     }
-    if (expr.tag !== 'list') {
-        return expr; // self-evaluating
-    }
-    const items = expr.value;
-    if (items.length === 0)
-        throw new EvalError(`${posStr(expr.pos)}empty application`);
-    const head = items[0];
-    if (head.tag === 'symbol') {
-        const op = head.value;
-        // Special forms
-        if (op === 'quote') {
-            return astToPairs(items[1]);
-        }
-        if (op === 'if') {
-            if (items.length < 3)
-                throw new EvalError(`${posStr(expr.pos)}if: bad syntax`);
-            const cond = evaluate(items[1], env);
-            if (isTruthy(cond)) {
-                return evaluate(items[2], env);
+}
+function evaluate(startExpr, startEnv) {
+    let expr = startExpr;
+    let env = startEnv;
+    // Trampoline loop
+    trampoline: for (;;) {
+        if (expr.tag === 'symbol') {
+            try {
+                return env.get(expr.value);
             }
-            else if (items.length > 3) {
-                return evaluate(items[3], env);
+            catch (e) {
+                if (e instanceof EvalError && expr.pos) {
+                    throw new EvalError(`${posStr(expr.pos)}${e.message}`);
+                }
+                throw e;
             }
-            return { tag: 'void' };
         }
-        if (op === 'define') {
-            if (items.length < 3)
-                throw new EvalError(`${posStr(expr.pos)}define: bad syntax`);
-            if (items[1].tag === 'list') {
-                // (define (f params...) body...)
-                const nameAndParams = items[1].value;
-                const name = nameAndParams[0].value;
-                const params = nameAndParams.slice(1).map(p => p.value);
-                const body = items.slice(2);
-                env.define(name, { tag: 'lambda', params, body, env });
+        if (expr.tag !== 'list') {
+            return expr; // self-evaluating
+        }
+        const items = expr.value;
+        if (items.length === 0)
+            throw new EvalError(`${posStr(expr.pos)}empty application`);
+        const head = items[0];
+        if (head.tag === 'symbol') {
+            const op = head.value;
+            // Special forms
+            if (op === 'quote') {
+                return astToPairs(items[1]);
+            }
+            if (op === 'if') {
+                if (items.length < 3)
+                    throw new EvalError(`${posStr(expr.pos)}if: bad syntax`);
+                const cond = evaluate(items[1], env);
+                if (isTruthy(cond)) {
+                    expr = items[2];
+                    continue; // TCO
+                }
+                else if (items.length > 3) {
+                    expr = items[3];
+                    continue; // TCO
+                }
                 return { tag: 'void' };
             }
-            // (define x expr)
-            const name = items[1].value;
-            const val = evaluate(items[2], env);
-            env.define(name, val);
-            return { tag: 'void' };
-        }
-        if (op === 'lambda') {
-            const paramList = items[1];
-            const params = paramList.value.map(p => p.value);
-            const body = items.slice(2);
-            return { tag: 'lambda', params, body, env };
-        }
-        if (op === 'and') {
-            let result = { tag: 'boolean', value: true };
-            for (let i = 1; i < items.length; i++) {
-                result = evaluate(items[i], env);
-                if (!isTruthy(result))
-                    return result;
-            }
-            return result;
-        }
-        if (op === 'or') {
-            let result = { tag: 'boolean', value: false };
-            for (let i = 1; i < items.length; i++) {
-                result = evaluate(items[i], env);
-                if (isTruthy(result))
-                    return result;
-            }
-            return result;
-        }
-        if (op === 'let') {
-            // Named let: (let name ((var val) ...) body...)
-            if (items[1].tag === 'symbol') {
+            if (op === 'define') {
+                if (items.length < 3)
+                    throw new EvalError(`${posStr(expr.pos)}define: bad syntax`);
+                if (items[1].tag === 'list') {
+                    // (define (f params...) body...)
+                    const nameAndParams = items[1].value;
+                    const name = nameAndParams[0].value;
+                    const params = nameAndParams.slice(1).map(p => p.value);
+                    const body = items.slice(2);
+                    env.define(name, { tag: 'lambda', params, body, env });
+                    return { tag: 'void' };
+                }
+                // (define x expr)
                 const name = items[1].value;
-                const bindings = items[2].value;
-                const body = items.slice(3);
-                const params = [];
-                const inits = [];
+                const val = evaluate(items[2], env);
+                env.define(name, val);
+                return { tag: 'void' };
+            }
+            if (op === 'lambda') {
+                const paramList = items[1];
+                const params = paramList.value.map(p => p.value);
+                const body = items.slice(2);
+                return { tag: 'lambda', params, body, env };
+            }
+            if (op === 'and') {
+                if (items.length === 1)
+                    return { tag: 'boolean', value: true };
+                for (let i = 1; i < items.length - 1; i++) {
+                    const result = evaluate(items[i], env);
+                    if (!isTruthy(result))
+                        return result;
+                }
+                expr = items[items.length - 1];
+                continue; // TCO last
+            }
+            if (op === 'or') {
+                if (items.length === 1)
+                    return { tag: 'boolean', value: false };
+                for (let i = 1; i < items.length - 1; i++) {
+                    const result = evaluate(items[i], env);
+                    if (isTruthy(result))
+                        return result;
+                }
+                expr = items[items.length - 1];
+                continue; // TCO last
+            }
+            if (op === 'let') {
+                // Named let: (let name ((var val) ...) body...)
+                if (items[1].tag === 'symbol') {
+                    const name = items[1].value;
+                    const bindings = items[2].value;
+                    const body = items.slice(3);
+                    const params = [];
+                    const inits = [];
+                    for (const b of bindings) {
+                        const bv = b.value;
+                        params.push(bv[0].value);
+                        inits.push(bv[1]);
+                    }
+                    const letEnv = new Env(env);
+                    const lambda = { tag: 'lambda', params, body, env: letEnv };
+                    letEnv.define(name, lambda);
+                    const args = inits.map(i => evaluate(i, env));
+                    const callEnv = new Env(letEnv);
+                    for (let i = 0; i < params.length; i++) {
+                        callEnv.define(params[i], args[i]);
+                    }
+                    // TCO: evaluate body with tail call on last expr
+                    for (let i = 0; i < body.length - 1; i++) {
+                        evaluate(body[i], callEnv);
+                    }
+                    expr = body[body.length - 1];
+                    env = callEnv;
+                    continue;
+                }
+                // Regular let: (let ((var val) ...) body...)
+                const bindings = items[1].value;
+                const body = items.slice(2);
+                const letEnv = new Env(env);
                 for (const b of bindings) {
                     const bv = b.value;
-                    params.push(bv[0].value);
-                    inits.push(bv[1]);
+                    const name = bv[0].value;
+                    const val = evaluate(bv[1], env);
+                    letEnv.define(name, val);
                 }
-                const letEnv = new Env(env);
-                const lambda = { tag: 'lambda', params, body, env: letEnv };
-                letEnv.define(name, lambda);
-                const args = inits.map(i => evaluate(i, env));
-                const callEnv = new Env(letEnv);
-                for (let i = 0; i < params.length; i++) {
-                    callEnv.define(params[i], args[i]);
+                // TCO: tail call on last body expr
+                for (let i = 0; i < body.length - 1; i++) {
+                    evaluate(body[i], letEnv);
                 }
-                let result = { tag: 'void' };
-                for (const bodyExpr of body) {
-                    result = evaluate(bodyExpr, callEnv);
+                expr = body[body.length - 1];
+                env = letEnv;
+                continue;
+            }
+            if (op === 'begin') {
+                // TCO: tail call on last expr
+                for (let i = 1; i < items.length - 1; i++) {
+                    evaluate(items[i], env);
                 }
-                return result;
+                if (items.length > 1) {
+                    expr = items[items.length - 1];
+                    continue;
+                }
+                return { tag: 'void' };
             }
-            // Regular let: (let ((var val) ...) body...)
-            const bindings = items[1].value;
-            const body = items.slice(2);
-            const letEnv = new Env(env);
-            for (const b of bindings) {
-                const bv = b.value;
-                const name = bv[0].value;
-                const val = evaluate(bv[1], env);
-                letEnv.define(name, val);
+            if (op === 'string-set!') {
+                const varExpr = items[1];
+                if (varExpr.tag !== 'symbol')
+                    throw new EvalError(`${posStr(expr.pos)}string-set!: first argument must be a variable`);
+                const str = env.get(varExpr.value);
+                if (str.tag !== 'string')
+                    throw new EvalError(`${posStr(expr.pos)}string-set!: expected string`);
+                const idx = expectNumber(evaluate(items[2], env), 'string-set!');
+                const ch = evaluate(items[3], env);
+                if (ch.tag !== 'char')
+                    throw new EvalError(`${posStr(expr.pos)}string-set!: expected char`);
+                const newStr = str.value.substring(0, idx) + ch.value + str.value.substring(idx + 1);
+                env.set(varExpr.value, { tag: 'string', value: newStr });
+                return { tag: 'void' };
             }
-            let result = { tag: 'void' };
-            for (const bodyExpr of body) {
-                result = evaluate(bodyExpr, letEnv);
-            }
-            return result;
-        }
-        if (op === 'begin') {
-            let result = { tag: 'void' };
-            for (let i = 1; i < items.length; i++) {
-                result = evaluate(items[i], env);
-            }
-            return result;
-        }
-        if (op === 'string-set!') {
-            const varExpr = items[1];
-            if (varExpr.tag !== 'symbol')
-                throw new EvalError(`${posStr(expr.pos)}string-set!: first argument must be a variable`);
-            const str = env.get(varExpr.value);
-            if (str.tag !== 'string')
-                throw new EvalError(`${posStr(expr.pos)}string-set!: expected string`);
-            const idx = expectNumber(evaluate(items[2], env), 'string-set!');
-            const ch = evaluate(items[3], env);
-            if (ch.tag !== 'char')
-                throw new EvalError(`${posStr(expr.pos)}string-set!: expected char`);
-            const newStr = str.value.substring(0, idx) + ch.value + str.value.substring(idx + 1);
-            env.set(varExpr.value, { tag: 'string', value: newStr });
-            return { tag: 'void' };
-        }
-        if (op === 'cond') {
-            for (let i = 1; i < items.length; i++) {
-                const clause = items[i].value;
-                if (clause[0].tag === 'symbol' && clause[0].value === 'else') {
-                    let result = { tag: 'void' };
-                    for (let j = 1; j < clause.length; j++) {
-                        result = evaluate(clause[j], env);
+            if (op === 'cond') {
+                for (let i = 1; i < items.length; i++) {
+                    const clause = items[i].value;
+                    if (clause[0].tag === 'symbol' && clause[0].value === 'else') {
+                        for (let j = 1; j < clause.length - 1; j++) {
+                            evaluate(clause[j], env);
+                        }
+                        if (clause.length > 1) {
+                            expr = clause[clause.length - 1];
+                            continue trampoline;
+                        }
+                        return { tag: 'void' };
                     }
-                    return result;
-                }
-                const test = evaluate(clause[0], env);
-                if (isTruthy(test)) {
-                    let result = test;
-                    for (let j = 1; j < clause.length; j++) {
-                        result = evaluate(clause[j], env);
+                    const test = evaluate(clause[0], env);
+                    if (isTruthy(test)) {
+                        if (clause.length === 1)
+                            return test;
+                        for (let j = 1; j < clause.length - 1; j++) {
+                            evaluate(clause[j], env);
+                        }
+                        expr = clause[clause.length - 1];
+                        continue trampoline;
                     }
-                    return result;
                 }
+                return { tag: 'void' };
             }
-            return { tag: 'void' };
         }
-    }
-    // Function application
-    const proc = evaluate(head, env);
-    const args = items.slice(1).map(a => evaluate(a, env));
-    if (proc.tag === 'builtin') {
-        try {
-            return proc.fn(args);
-        }
-        catch (e) {
-            if (e instanceof EvalError && expr.pos && !e.message.match(/^\d+:/)) {
-                throw new EvalError(`${posStr(expr.pos)}${e.message}`);
+        // Function application
+        const proc = evaluate(head, env);
+        const args = items.slice(1).map(a => evaluate(a, env));
+        if (proc.tag === 'builtin') {
+            try {
+                return proc.fn(args);
             }
-            throw e;
+            catch (e) {
+                if (e instanceof EvalError && expr.pos && !e.message.match(/^\d+:/)) {
+                    throw new EvalError(`${posStr(expr.pos)}${e.message}`);
+                }
+                throw e;
+            }
         }
-    }
-    if (proc.tag === 'lambda') {
-        const callEnv = new Env(proc.env);
-        for (let i = 0; i < proc.params.length; i++) {
-            callEnv.define(proc.params[i], args[i]);
+        if (proc.tag === 'lambda') {
+            const callEnv = new Env(proc.env);
+            for (let i = 0; i < proc.params.length; i++) {
+                callEnv.define(proc.params[i], args[i]);
+            }
+            // TCO: tail call on last body expr
+            for (let i = 0; i < proc.body.length - 1; i++) {
+                evaluate(proc.body[i], callEnv);
+            }
+            expr = proc.body[proc.body.length - 1];
+            env = callEnv;
+            continue;
         }
-        let result = { tag: 'void' };
-        for (const bodyExpr of proc.body) {
-            result = evaluate(bodyExpr, callEnv);
-        }
-        return result;
-    }
-    throw new EvalError(`${posStr(expr.pos)}not a procedure`);
+        throw new EvalError(`${posStr(expr.pos)}not a procedure`);
+    } // end trampoline loop
 }
 // ── Output buffer ──────────────────────────────────────────────────
 let outputBuffer = '';

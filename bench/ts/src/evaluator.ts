@@ -364,7 +364,16 @@ function makeGlobalEnv(): Env {
   return env;
 }
 
-function evaluate(expr: SchemeVal, env: Env): SchemeVal {
+class TailCall {
+  constructor(public expr: SchemeVal, public env: Env) {}
+}
+
+function evaluate(startExpr: SchemeVal, startEnv: Env): SchemeVal {
+  let expr = startExpr;
+  let env = startEnv;
+
+  // Trampoline loop
+  trampoline: for (;;) {
   if (expr.tag === 'symbol') {
     try {
       return env.get(expr.value);
@@ -395,9 +404,9 @@ function evaluate(expr: SchemeVal, env: Env): SchemeVal {
       if (items.length < 3) throw new EvalError(`${posStr(expr.pos)}if: bad syntax`);
       const cond = evaluate(items[1], env);
       if (isTruthy(cond)) {
-        return evaluate(items[2], env);
+        expr = items[2]; continue; // TCO
       } else if (items.length > 3) {
-        return evaluate(items[3], env);
+        expr = items[3]; continue; // TCO
       }
       return { tag: 'void' };
     }
@@ -430,21 +439,21 @@ function evaluate(expr: SchemeVal, env: Env): SchemeVal {
     }
 
     if (op === 'and') {
-      let result: SchemeVal = { tag: 'boolean', value: true };
-      for (let i = 1; i < items.length; i++) {
-        result = evaluate(items[i], env);
+      if (items.length === 1) return { tag: 'boolean', value: true };
+      for (let i = 1; i < items.length - 1; i++) {
+        const result = evaluate(items[i], env);
         if (!isTruthy(result)) return result;
       }
-      return result;
+      expr = items[items.length - 1]; continue; // TCO last
     }
 
     if (op === 'or') {
-      let result: SchemeVal = { tag: 'boolean', value: false };
-      for (let i = 1; i < items.length; i++) {
-        result = evaluate(items[i], env);
+      if (items.length === 1) return { tag: 'boolean', value: false };
+      for (let i = 1; i < items.length - 1; i++) {
+        const result = evaluate(items[i], env);
         if (isTruthy(result)) return result;
       }
-      return result;
+      expr = items[items.length - 1]; continue; // TCO last
     }
 
     if (op === 'let') {
@@ -468,11 +477,11 @@ function evaluate(expr: SchemeVal, env: Env): SchemeVal {
         for (let i = 0; i < params.length; i++) {
           callEnv.define(params[i], args[i]);
         }
-        let result: SchemeVal = { tag: 'void' };
-        for (const bodyExpr of body) {
-          result = evaluate(bodyExpr, callEnv);
+        // TCO: evaluate body with tail call on last expr
+        for (let i = 0; i < body.length - 1; i++) {
+          evaluate(body[i], callEnv);
         }
-        return result;
+        expr = body[body.length - 1]; env = callEnv; continue;
       }
       // Regular let: (let ((var val) ...) body...)
       const bindings = (items[1] as { tag: 'list'; value: SchemeVal[] }).value;
@@ -484,19 +493,22 @@ function evaluate(expr: SchemeVal, env: Env): SchemeVal {
         const val = evaluate(bv[1], env);
         letEnv.define(name, val);
       }
-      let result: SchemeVal = { tag: 'void' };
-      for (const bodyExpr of body) {
-        result = evaluate(bodyExpr, letEnv);
+      // TCO: tail call on last body expr
+      for (let i = 0; i < body.length - 1; i++) {
+        evaluate(body[i], letEnv);
       }
-      return result;
+      expr = body[body.length - 1]; env = letEnv; continue;
     }
 
     if (op === 'begin') {
-      let result: SchemeVal = { tag: 'void' };
-      for (let i = 1; i < items.length; i++) {
-        result = evaluate(items[i], env);
+      // TCO: tail call on last expr
+      for (let i = 1; i < items.length - 1; i++) {
+        evaluate(items[i], env);
       }
-      return result;
+      if (items.length > 1) {
+        expr = items[items.length - 1]; continue;
+      }
+      return { tag: 'void' };
     }
 
     if (op === 'string-set!') {
@@ -516,19 +528,21 @@ function evaluate(expr: SchemeVal, env: Env): SchemeVal {
       for (let i = 1; i < items.length; i++) {
         const clause = (items[i] as { tag: 'list'; value: SchemeVal[] }).value;
         if (clause[0].tag === 'symbol' && clause[0].value === 'else') {
-          let result: SchemeVal = { tag: 'void' };
-          for (let j = 1; j < clause.length; j++) {
-            result = evaluate(clause[j], env);
+          for (let j = 1; j < clause.length - 1; j++) {
+            evaluate(clause[j], env);
           }
-          return result;
+          if (clause.length > 1) {
+            expr = clause[clause.length - 1]; continue trampoline;
+          }
+          return { tag: 'void' };
         }
         const test = evaluate(clause[0], env);
         if (isTruthy(test)) {
-          let result: SchemeVal = test;
-          for (let j = 1; j < clause.length; j++) {
-            result = evaluate(clause[j], env);
+          if (clause.length === 1) return test;
+          for (let j = 1; j < clause.length - 1; j++) {
+            evaluate(clause[j], env);
           }
-          return result;
+          expr = clause[clause.length - 1]; continue trampoline;
         }
       }
       return { tag: 'void' };
@@ -555,14 +569,15 @@ function evaluate(expr: SchemeVal, env: Env): SchemeVal {
     for (let i = 0; i < proc.params.length; i++) {
       callEnv.define(proc.params[i], args[i]);
     }
-    let result: SchemeVal = { tag: 'void' };
-    for (const bodyExpr of proc.body) {
-      result = evaluate(bodyExpr, callEnv);
+    // TCO: tail call on last body expr
+    for (let i = 0; i < proc.body.length - 1; i++) {
+      evaluate(proc.body[i], callEnv);
     }
-    return result;
+    expr = proc.body[proc.body.length - 1]; env = callEnv; continue;
   }
 
   throw new EvalError(`${posStr(expr.pos)}not a procedure`);
+  } // end trampoline loop
 }
 
 // ── Output buffer ──────────────────────────────────────────────────
