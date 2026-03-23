@@ -263,7 +263,7 @@ public class Evaluator {
         }));
         env.define("string-copy", new SchemeValue.BuiltinVal("string-copy", args -> {
             if (!(args.getFirst() instanceof SchemeValue.StringVal s)) throw new EvalError("string-copy: not a string");
-            return new SchemeValue.StringVal(s.value());
+            return new SchemeValue.StringVal(s.value().toCharArray());
         }));
 
         // Numeric utilities (L13)
@@ -436,10 +436,52 @@ public class Evaluator {
         env.define("string-set!", new SchemeValue.BuiltinVal("string-set!", args -> {
             if (args.size() != 3) throw new EvalError("string-set! requires 3 arguments");
             if (!(args.get(0) instanceof SchemeValue.StringVal s)) throw new EvalError("string-set!: not a string");
-            int idx = (int) requireInt(args.get(1));
-            if (!(args.get(2) instanceof SchemeValue.CharVal c)) throw new EvalError("string-set!: not a character");
+            if (!s.isMutable()) throw new EvalError("string-set!: string is immutable");
+            if (!(args.get(1) instanceof SchemeValue.IntVal n)) throw new EvalError("string-set!: not a number");
+            if (!(args.get(2) instanceof SchemeValue.CharVal c)) throw new EvalError("string-set!: not a char");
+            int idx = (int) n.value();
+            if (idx < 0 || idx >= s.length()) throw new EvalError("string-set!: index out of range");
             s.setCharAt(idx, c.value());
             return new SchemeValue.VoidVal();
+        }));
+
+        // string->list
+        env.define("string->list", new SchemeValue.BuiltinVal("string->list", args -> {
+            if (args.size() != 1) throw new EvalError("string->list requires 1 argument");
+            if (!(args.get(0) instanceof SchemeValue.StringVal s)) throw new EvalError("string->list: not a string");
+            SchemeValue result = new SchemeValue.NilVal();
+            String str = s.value();
+            for (int i = str.length() - 1; i >= 0; i--) {
+                result = new SchemeValue.PairVal(new SchemeValue.CharVal(str.charAt(i)), result);
+            }
+            return result;
+        }));
+
+        // list->string
+        env.define("list->string", new SchemeValue.BuiltinVal("list->string", args -> {
+            if (args.size() != 1) throw new EvalError("list->string requires 1 argument");
+            StringBuilder sb = new StringBuilder();
+            SchemeValue cur = args.get(0);
+            while (cur instanceof SchemeValue.PairVal p) {
+                if (!(p.car() instanceof SchemeValue.CharVal c)) throw new EvalError("list->string: not a character");
+                sb.append(c.value());
+                cur = p.cdr();
+            }
+            return new SchemeValue.StringVal(sb.toString());
+        }));
+
+        // char->integer
+        env.define("char->integer", new SchemeValue.BuiltinVal("char->integer", args -> {
+            if (args.size() != 1) throw new EvalError("char->integer requires 1 argument");
+            if (!(args.get(0) instanceof SchemeValue.CharVal c)) throw new EvalError("char->integer: not a character");
+            return new SchemeValue.IntVal((int) c.value());
+        }));
+
+        // integer->char
+        env.define("integer->char", new SchemeValue.BuiltinVal("integer->char", args -> {
+            if (args.size() != 1) throw new EvalError("integer->char requires 1 argument");
+            long code = requireInt(args.get(0));
+            return new SchemeValue.CharVal((char) code);
         }));
 
         // apply (CPS-aware: needs to forward continuation)

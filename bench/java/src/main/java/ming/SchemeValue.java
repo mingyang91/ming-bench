@@ -7,11 +7,13 @@ public sealed interface SchemeValue {
     record BoolVal(boolean value) implements SchemeValue {}
     final class StringVal implements SchemeValue {
         private final char[] chars;
-        StringVal(String value) { this.chars = value.toCharArray(); }
-        StringVal(char[] chars) { this.chars = chars; }
+        private final boolean mutable;
+        StringVal(String value) { this.chars = value.toCharArray(); this.mutable = false; }
+        StringVal(char[] chars) { this.chars = chars; this.mutable = true; }
         public String value() { return new String(chars); }
         public char charAt(int i) { return chars[i]; }
         public void setCharAt(int i, char c) { chars[i] = c; }
+        public boolean isMutable() { return mutable; }
         public int length() { return chars.length; }
     }
     record SymbolVal(String name, int line, int col) implements SchemeValue {
