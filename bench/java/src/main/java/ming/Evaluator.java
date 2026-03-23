@@ -64,7 +64,9 @@ public class Evaluator {
         // L16 builtins
         "dynamic-wind", "reverse",
         // L17 builtins
-        "raise", "with-exception-handler"
+        "raise", "with-exception-handler",
+        // L18 builtins
+        "values", "call-with-values"
     };
 
     {
@@ -234,6 +236,7 @@ public class Evaluator {
             case SchemeValue.SyntaxRulesVal v -> v;
             case SchemeValue.PairVal v -> v;
             case SchemeValue.VectorVal v -> v;
+            case SchemeValue.ValuesVal v -> v;
             case SchemeValue.Thunk v -> v; // pass through
             case SchemeValue.SymbolVal v -> {
                 try {
@@ -540,6 +543,13 @@ public class Evaluator {
             case "reverse" -> builtinReverse(args, env, pos);
             // L17: raise and with-exception-handler are handled via applyBuiltinEvaled
             // (not here) so that local definitions can shadow them
+            // L18 builtins
+            case "values" -> {
+                List<SchemeValue> vals = new ArrayList<>();
+                for (SchemeValue a : args) vals.add(eval(a, env));
+                if (vals.size() == 1) yield vals.getFirst();
+                yield new SchemeValue.ValuesVal(vals);
+            }
             default -> null;
         };
     }
@@ -1662,6 +1672,24 @@ public class Evaluator {
                 } catch (SchemeRaise sr) {
                     yield evalContinuation(applyTail(handler, List.of(sr.value), pos));
                 }
+            }
+            // L18 builtins
+            case "values" -> {
+                if (args.size() == 1) yield args.getFirst();
+                yield new SchemeValue.ValuesVal(args);
+            }
+            case "call-with-values" -> {
+                if (args.size() != 2) throw posError(pos, "call-with-values: need exactly 2 arguments");
+                SchemeValue producer = args.get(0);
+                SchemeValue consumer = args.get(1);
+                SchemeValue produced = evalContinuation(applyTail(producer, List.of(), pos));
+                List<SchemeValue> vals;
+                if (produced instanceof SchemeValue.ValuesVal mv) {
+                    vals = mv.values();
+                } else {
+                    vals = List.of(produced);
+                }
+                yield evalContinuation(applyTail(consumer, vals, pos));
             }
             default -> throw posError(pos, "unknown builtin: " + name);
         };

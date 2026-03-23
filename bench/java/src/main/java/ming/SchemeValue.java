@@ -20,6 +20,7 @@ public sealed interface SchemeValue {
     record SyntaxRulesVal(List<String> literals, List<SchemeValue> patterns, List<SchemeValue> templates, Environment defEnv) implements SchemeValue {}
     record PairVal(SchemeValue car, SchemeValue cdr, SourcePos pos) implements SchemeValue {}
     record VectorVal(SchemeValue[] elements, SourcePos pos) implements SchemeValue {}
+    record ValuesVal(List<SchemeValue> values) implements SchemeValue {}
 
     default SourcePos sourcePos() {
         return switch (this) {
@@ -36,6 +37,7 @@ public sealed interface SchemeValue {
             case SyntaxRulesVal v -> SourcePos.NONE;
             case PairVal v -> v.pos();
             case VectorVal v -> v.pos();
+            case ValuesVal v -> SourcePos.NONE;
         };
     }
 
@@ -66,6 +68,7 @@ public sealed interface SchemeValue {
             case Thunk v -> "#<thunk>";
             case ContinuationVal v -> "#<continuation>";
             case SyntaxRulesVal v -> "#<macro>";
+            case ValuesVal v -> "#<values>";
             case PairVal v -> "(" + v.car().display() + " . " + v.cdr().display() + ")";
             case VectorVal v -> {
                 var sb = new StringBuilder("#(");
@@ -96,6 +99,7 @@ public sealed interface SchemeValue {
             case Thunk v -> "#<thunk>";
             case ContinuationVal v -> "#<continuation>";
             case SyntaxRulesVal v -> "#<macro>";
+            case ValuesVal v -> "#<values>";
             case PairVal v -> "(" + v.car().displayOutput() + " . " + v.cdr().displayOutput() + ")";
             case VectorVal v -> {
                 var sb = new StringBuilder("#(");
