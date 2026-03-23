@@ -432,6 +432,7 @@ enum ExprKind {
     Char(char),
     Symbol(String),
     List(Vec<Expr>),
+    DottedList(Vec<Expr>, Box<Expr>),  // (a b . c) => elements=[a, b], tail=c
 }
 
 fn expr_to_value(expr: &Expr) -> Value {
@@ -451,6 +452,14 @@ fn expr_to_value(expr: &Expr) -> Value {
                 slice_to_list(&vals)
             }
         }
+        ExprKind::DottedList(elems, tail) => {
+            let tail_val = expr_to_value(tail);
+            let mut result = tail_val;
+            for item in elems.iter().rev() {
+                result = make_pair(expr_to_value(item), result);
+            }
+            result
+        }
     }
 }
 
@@ -467,9 +476,30 @@ fn value_to_expr(val: &Value) -> Result<Expr, EvalError> {
         Value::SyntaxObject(expr) => Ok((**expr).clone()),
         Value::List(l) if l.is_empty() => Ok(e(ExprKind::List(vec![]))),
         Value::Pair(_) => {
-            let items = value_to_vec(val)?;
-            let exprs: Result<Vec<_>, _> = items.iter().map(value_to_expr).collect();
-            Ok(e(ExprKind::List(exprs?)))
+            // Collect elements, handling both proper and improper lists
+            let mut elems = Vec::new();
+            let mut cur = val.clone();
+            loop {
+                match &cur {
+                    Value::List(l) if l.is_empty() => {
+                        let exprs: Result<Vec<_>, _> = elems.iter().map(value_to_expr).collect();
+                        return Ok(e(ExprKind::List(exprs?)));
+                    }
+                    Value::Pair(cell) => {
+                        let pair = cell.borrow();
+                        elems.push(pair.0.clone());
+                        let next = pair.1.clone();
+                        drop(pair);
+                        cur = next;
+                    }
+                    tail => {
+                        // Improper list
+                        let exprs: Result<Vec<_>, _> = elems.iter().map(value_to_expr).collect();
+                        let tail_expr = value_to_expr(tail)?;
+                        return Ok(e(ExprKind::DottedList(exprs?, Box::new(tail_expr))));
+                    }
+                }
+            }
         }
         _ => Err(EvalError::Type(format!("cannot convert to syntax: {}", val))),
     }
@@ -718,7 +748,7 @@ fn tokenize(input: &str) -> Vec<Token> {
                 line += 1;
                 col = 1;
             }
-            ' ' | '\t' | '\r' => {
+            ' ' | '\t' | '\r' | '\x0b' | '\x0c' => {
                 i += 1;
                 col += 1;
             }
@@ -737,6 +767,22 @@ fn tokenize(input: &str) -> Vec<Token> {
                 tokens.push(Token { text: "'".to_string(), line, col });
                 i += 1;
                 col += 1;
+            }
+            '`' => {
+                tokens.push(Token { text: "`".to_string(), line, col });
+                i += 1;
+                col += 1;
+            }
+            ',' => {
+                if i + 1 < chars.len() && chars[i + 1] == '@' {
+                    tokens.push(Token { text: ",@".to_string(), line, col });
+                    i += 2;
+                    col += 2;
+                } else {
+                    tokens.push(Token { text: ",".to_string(), line, col });
+                    i += 1;
+                    col += 1;
+                }
             }
             '"' => {
                 let tok_line = line;
@@ -785,7 +831,7 @@ fn tokenize(input: &str) -> Vec<Token> {
                     col += 2;
                 } else {
                     let mut tok = String::new();
-                    while i < chars.len() && !matches!(chars[i], ' ' | '\t' | '\n' | '\r' | '(' | ')') {
+                    while i < chars.len() && !matches!(chars[i], ' ' | '\t' | '\n' | '\r' | '\x0b' | '\x0c' | '(' | ')') {
                         tok.push(chars[i]);
                         i += 1;
                         col += 1;
@@ -796,7 +842,7 @@ fn tokenize(input: &str) -> Vec<Token> {
             _ => {
                 let tok_col = col;
                 let mut tok = String::new();
-                while i < chars.len() && !matches!(chars[i], ' ' | '\t' | '\n' | '\r' | '(' | ')' | '"' | ';') {
+                while i < chars.len() && !matches!(chars[i], ' ' | '\t' | '\n' | '\r' | '\x0b' | '\x0c' | '(' | ')' | '"' | ';') {
                     tok.push(chars[i]);
                     i += 1;
                     col += 1;
@@ -832,20 +878,81 @@ impl Parser {
         if text == "(" {
             self.pos += 1;
             let mut elems = Vec::new();
+            let mut is_dotted = false;
+            let mut tail: Option<Expr> = None;
             while self.pos < self.tokens.len() && self.tokens[self.pos].text != ")" {
-                elems.push(self.parse_expr()?);
+                if self.tokens[self.pos].text == "." && !elems.is_empty() {
+                    // Check if this is dotted pair syntax: look ahead for exactly one expr then )
+                    let saved_pos = self.pos;
+                    self.pos += 1; // skip "."
+                    if self.pos < self.tokens.len() && self.tokens[self.pos].text != ")" {
+                        let t = self.parse_expr()?;
+                        if self.pos < self.tokens.len() && self.tokens[self.pos].text == ")" {
+                            is_dotted = true;
+                            tail = Some(t);
+                            break;
+                        }
+                        // Not a dotted pair (more than one expr after dot) - put expr back
+                        // Actually this shouldn't happen in valid Scheme, treat as error
+                        // but for robustness, treat "." as a symbol
+                        elems.push(Expr { kind: ExprKind::Symbol(".".into()), line: self.tokens[saved_pos].line, col: self.tokens[saved_pos].col });
+                        elems.push(t);
+                    } else {
+                        // "." at end - treat as symbol
+                        elems.push(Expr { kind: ExprKind::Symbol(".".into()), line: self.tokens[saved_pos].line, col: self.tokens[saved_pos].col });
+                    }
+                } else {
+                    elems.push(self.parse_expr()?);
+                }
             }
             if self.pos >= self.tokens.len() {
                 return Err(EvalError::Parse("missing closing paren".into()));
             }
             self.pos += 1;
-            Ok(Expr { kind: ExprKind::List(elems), line, col })
+            if is_dotted {
+                Ok(Expr { kind: ExprKind::DottedList(elems, Box::new(tail.unwrap())), line, col })
+            } else {
+                Ok(Expr { kind: ExprKind::List(elems), line, col })
+            }
         } else if text == "'" {
             self.pos += 1;
             let inner = self.parse_expr()?;
             Ok(Expr {
                 kind: ExprKind::List(vec![
                     Expr { kind: ExprKind::Symbol("quote".into()), line, col },
+                    inner,
+                ]),
+                line,
+                col,
+            })
+        } else if text == "`" {
+            self.pos += 1;
+            let inner = self.parse_expr()?;
+            Ok(Expr {
+                kind: ExprKind::List(vec![
+                    Expr { kind: ExprKind::Symbol("quasiquote".into()), line, col },
+                    inner,
+                ]),
+                line,
+                col,
+            })
+        } else if text == "," {
+            self.pos += 1;
+            let inner = self.parse_expr()?;
+            Ok(Expr {
+                kind: ExprKind::List(vec![
+                    Expr { kind: ExprKind::Symbol("unquote".into()), line, col },
+                    inner,
+                ]),
+                line,
+                col,
+            })
+        } else if text == ",@" {
+            self.pos += 1;
+            let inner = self.parse_expr()?;
+            Ok(Expr {
+                kind: ExprKind::List(vec![
+                    Expr { kind: ExprKind::Symbol("unquote-splicing".into()), line, col },
                     inner,
                 ]),
                 line,
@@ -1035,7 +1142,7 @@ fn match_one(pat: &Expr, form: &Expr, literals: &[String], bindings: &mut HashMa
 
 const SPECIAL_FORMS: &[&str] = &[
     "if", "define", "lambda", "case-lambda", "let", "let*", "letrec", "letrec*",
-    "set!", "begin", "quote", "and", "or", "cond", "case", "do", "when",
+    "set!", "begin", "quote", "quasiquote", "and", "or", "cond", "case", "do", "when",
     "define-syntax", "syntax-rules", "syntax-case", "syntax", "with-syntax",
     "define-record-type",
 ];
@@ -1166,6 +1273,7 @@ enum Frame {
     Or(Vec<Expr>, Env),
     LetBind { var: String, remaining: Vec<(String, Expr)>, body: Vec<Expr>, outer_env: Env, local_env: Env },
     CondTest { body: Vec<Expr>, rest: Vec<Expr>, env: Env },
+    CondArrow { test_val: Value },
     CaseKey { clauses: Vec<Expr>, env: Env },
     DoTest {
         vars: Vec<String>,
@@ -1260,6 +1368,9 @@ fn step_eval(expr: Expr, env: Env, stack: &mut Vec<Frame>) -> Result<Act, EvalEr
         ExprKind::Symbol(name) => env_get(&env, name)
             .map(Act::Ret)
             .ok_or_else(|| EvalError::UnboundVariable(name.clone()).at(expr.line, expr.col)),
+        ExprKind::DottedList(_, _) => {
+            Err(EvalError::Type("cannot evaluate dotted list".into()).at(expr.line, expr.col))
+        }
         ExprKind::List(elems) if elems.is_empty() => {
             Err(EvalError::Parse("empty application".into()).at(expr.line, expr.col))
         }
@@ -1271,6 +1382,12 @@ fn step_eval(expr: Expr, env: Env, stack: &mut Vec<Frame>) -> Result<Act, EvalEr
                             return Err(EvalError::Arity("quote expects 1 argument".into()).at(expr.line, expr.col));
                         }
                         return Ok(Act::Ret(expr_to_value(&elems[1])));
+                    }
+                    "quasiquote" => {
+                        if elems.len() != 2 {
+                            return Err(EvalError::Arity("quasiquote expects 1 argument".into()).at(expr.line, expr.col));
+                        }
+                        return expand_quasiquote(&elems[1], env, stack);
                     }
                     "if" => {
                         let a = &elems[1..];
@@ -1554,12 +1671,25 @@ fn step_ret(val: Value, frame: Frame, stack: &mut Vec<Frame>) -> Result<Act, Eva
             if val != Value::Boolean(false) {
                 if body.is_empty() {
                     Ok(Act::Ret(val))
+                } else if body.len() == 2 {
+                    if let ExprKind::Symbol(s) = &body[0].kind {
+                        if s == "=>" {
+                            // (cond (test => proc)) — evaluate proc, then apply it to test result
+                            stack.push(Frame::CondArrow { test_val: val });
+                            return Ok(Act::Ev(body[1].clone(), env));
+                        }
+                    }
+                    sf_seq(&body, env, stack)
                 } else {
                     sf_seq(&body, env, stack)
                 }
             } else {
                 sf_cond_clauses(&rest, env, stack)
             }
+        }
+        Frame::CondArrow { test_val } => {
+            // val is the procedure; apply it to test_val
+            Ok(Act::Ap(val, vec![test_val]))
         }
         Frame::CaseKey { clauses, env } => {
             // val is the evaluated key; match against clauses
@@ -2031,6 +2161,20 @@ fn eval_lambda(args: &[Expr], env: &Env) -> Result<Value, EvalError> {
     }
     let (params, rest_param) = match &args[0].kind {
         ExprKind::List(elems) => parse_params(elems)?,
+        ExprKind::DottedList(elems, rest) => {
+            let mut params = Vec::new();
+            for p in elems {
+                match &p.kind {
+                    ExprKind::Symbol(s) => params.push(s.clone()),
+                    _ => return Err(EvalError::Type("lambda: expected symbol in params".into())),
+                }
+            }
+            let rest_param = match &rest.kind {
+                ExprKind::Symbol(s) => Some(s.clone()),
+                _ => return Err(EvalError::Type("lambda: expected symbol for rest param".into())),
+            };
+            (params, rest_param)
+        }
         ExprKind::Symbol(s) => {
             // (lambda args body) — all args collected as rest
             (vec![], Some(s.clone()))
@@ -2056,6 +2200,20 @@ fn eval_case_lambda(args: &[Expr], env: &Env) -> Result<Value, EvalError> {
                 }
                 let (params, rest_param) = match &elems[0].kind {
                     ExprKind::List(pelems) => parse_params(pelems)?,
+                    ExprKind::DottedList(pelems, rest) => {
+                        let mut params = Vec::new();
+                        for p in pelems {
+                            match &p.kind {
+                                ExprKind::Symbol(s) => params.push(s.clone()),
+                                _ => return Err(EvalError::Type("case-lambda: expected symbol".into())),
+                            }
+                        }
+                        let rp = match &rest.kind {
+                            ExprKind::Symbol(s) => Some(s.clone()),
+                            _ => return Err(EvalError::Type("case-lambda: expected rest symbol".into())),
+                        };
+                        (params, rp)
+                    }
                     ExprKind::Symbol(s) => (vec![], Some(s.clone())),
                     _ => return Err(EvalError::Type("case-lambda: expected parameter list".into())),
                 };
@@ -2203,6 +2361,30 @@ fn sf_define(args: &[Expr], env: Env, stack: &mut Vec<Frame>) -> Result<Act, Eva
                 _ => return Err(EvalError::Type("define: expected symbol as function name".into())),
             };
             let (params, rest_param) = parse_params(&sig[1..])?;
+            let body = args[1..].to_vec();
+            let lambda = Value::Lambda { params, rest_param, body, env: env.clone() };
+            env_set(&env, name, lambda);
+            Ok(Act::Ret(Value::Void))
+        }
+        ExprKind::DottedList(sig, rest) => {
+            if sig.is_empty() {
+                return Err(EvalError::Parse("define: empty signature".into()));
+            }
+            let name = match &sig[0].kind {
+                ExprKind::Symbol(s) => s.clone(),
+                _ => return Err(EvalError::Type("define: expected symbol as function name".into())),
+            };
+            let mut params = Vec::new();
+            for p in &sig[1..] {
+                match &p.kind {
+                    ExprKind::Symbol(s) => params.push(s.clone()),
+                    _ => return Err(EvalError::Type("define: expected symbol in params".into())),
+                }
+            }
+            let rest_param = match &rest.kind {
+                ExprKind::Symbol(s) => Some(s.clone()),
+                _ => return Err(EvalError::Type("define: expected symbol for rest param".into())),
+            };
             let body = args[1..].to_vec();
             let lambda = Value::Lambda { params, rest_param, body, env: env.clone() };
             env_set(&env, name, lambda);
@@ -2386,6 +2568,108 @@ fn sf_seq(exprs: &[Expr], env: Env, stack: &mut Vec<Frame>) -> Result<Act, EvalE
     }
     stack.push(Frame::Seq(exprs[1..].to_vec(), env.clone()));
     Ok(Act::Ev(exprs[0].clone(), env))
+}
+
+// ── Quasiquote ──
+
+fn expand_quasiquote(expr: &Expr, env: Env, stack: &mut Vec<Frame>) -> Result<Act, EvalError> {
+    // Transform quasiquote template into an expression, then evaluate it
+    let expanded = qq_expand(expr, 0);
+    Ok(Act::Ev(expanded, env))
+}
+
+fn qq_expand(expr: &Expr, depth: usize) -> Expr {
+    let e = |kind| Expr { kind, line: expr.line, col: expr.col };
+    let sym = |s: &str| Expr { kind: ExprKind::Symbol(s.to_string()), line: expr.line, col: expr.col };
+
+    match &expr.kind {
+        ExprKind::List(elems) if !elems.is_empty() => {
+            if let ExprKind::Symbol(s) = &elems[0].kind {
+                if s == "unquote" && elems.len() == 2 {
+                    if depth == 0 {
+                        return elems[1].clone();
+                    } else {
+                        // nested unquote: (list 'unquote <qq(e, depth-1)>)
+                        return e(ExprKind::List(vec![
+                            sym("list"),
+                            e(ExprKind::List(vec![sym("quote"), sym("unquote")])),
+                            qq_expand(&elems[1], depth - 1),
+                        ]));
+                    }
+                }
+                if s == "quasiquote" && elems.len() == 2 {
+                    // nested quasiquote
+                    return e(ExprKind::List(vec![
+                        sym("list"),
+                        e(ExprKind::List(vec![sym("quote"), sym("quasiquote")])),
+                        qq_expand(&elems[1], depth + 1),
+                    ]));
+                }
+            }
+            // Check for splicing and build with append
+            qq_expand_list(elems, &Value::List(vec![]), depth, expr)
+        }
+        ExprKind::DottedList(elems, tail) => {
+            // Build using cons/append for dotted lists
+            qq_expand_dotted(elems, tail, depth, expr)
+        }
+        _ => {
+            // Atom — quote it
+            e(ExprKind::List(vec![sym("quote"), expr.clone()]))
+        }
+    }
+}
+
+fn qq_expand_list(elems: &[Expr], _nil: &Value, depth: usize, ctx: &Expr) -> Expr {
+    let e = |kind| Expr { kind, line: ctx.line, col: ctx.col };
+    let sym = |s: &str| Expr { kind: ExprKind::Symbol(s.to_string()), line: ctx.line, col: ctx.col };
+
+    let mut parts: Vec<Expr> = Vec::new();
+    for elem in elems {
+        if let ExprKind::List(inner) = &elem.kind {
+            if inner.len() == 2 {
+                if let ExprKind::Symbol(s) = &inner[0].kind {
+                    if s == "unquote-splicing" && depth == 0 {
+                        parts.push(inner[1].clone());
+                        continue;
+                    }
+                }
+            }
+        }
+        // Wrap in (list <expanded>)
+        parts.push(e(ExprKind::List(vec![sym("list"), qq_expand(elem, depth)])));
+    }
+    // (append part1 part2 ... '())
+    let mut result = vec![sym("append")];
+    result.extend(parts);
+    result.push(e(ExprKind::List(vec![sym("quote"), e(ExprKind::List(vec![]))])));
+    e(ExprKind::List(result))
+}
+
+fn qq_expand_dotted(elems: &[Expr], tail: &Expr, depth: usize, ctx: &Expr) -> Expr {
+    let e = |kind| Expr { kind, line: ctx.line, col: ctx.col };
+    let sym = |s: &str| Expr { kind: ExprKind::Symbol(s.to_string()), line: ctx.line, col: ctx.col };
+
+    let mut parts: Vec<Expr> = Vec::new();
+    for elem in elems {
+        if let ExprKind::List(inner) = &elem.kind {
+            if inner.len() == 2 {
+                if let ExprKind::Symbol(s) = &inner[0].kind {
+                    if s == "unquote-splicing" && depth == 0 {
+                        parts.push(inner[1].clone());
+                        continue;
+                    }
+                }
+            }
+        }
+        parts.push(e(ExprKind::List(vec![sym("list"), qq_expand(elem, depth)])));
+    }
+    // tail: expand it
+    let tail_expanded = qq_expand(tail, depth);
+    let mut result = vec![sym("append")];
+    result.extend(parts);
+    result.push(tail_expanded);
+    e(ExprKind::List(result))
 }
 
 fn sf_cond(clauses: &[Expr], env: Env, stack: &mut Vec<Frame>) -> Result<Act, EvalError> {
@@ -2672,9 +2956,12 @@ fn builtin_append(args: &[Value]) -> Result<Value, EvalError> {
     if args.is_empty() {
         return Ok(Value::List(vec![]));
     }
-    // Collect all elements
+    if args.len() == 1 {
+        return Ok(args[0].clone());
+    }
+    // Collect all elements from all but the last argument
     let mut result = Vec::new();
-    for arg in args {
+    for arg in &args[..args.len() - 1] {
         let mut cur = arg.clone();
         loop {
             match &cur {
@@ -2690,7 +2977,13 @@ fn builtin_append(args: &[Value]) -> Result<Value, EvalError> {
             }
         }
     }
-    Ok(slice_to_list(&result))
+    // Last argument becomes the tail (can be any value)
+    let tail = args.last().unwrap().clone();
+    let mut out = tail;
+    for item in result.into_iter().rev() {
+        out = make_pair(item, out);
+    }
+    Ok(out)
 }
 
 fn builtin_type_pred(args: &[Value], name: &str) -> Result<Value, EvalError> {
@@ -3647,7 +3940,11 @@ fn builtin_error(args: &[Value]) -> Result<Value, EvalError> {
     if args.is_empty() {
         return Err(EvalError::Type("error".into()));
     }
-    let msg = args[0].to_string();
+    let mut msg = String::new();
+    for (i, a) in args.iter().enumerate() {
+        if i > 0 { msg.push(' '); }
+        msg.push_str(&a.to_string());
+    }
     Err(EvalError::Type(format!("error: {msg}")))
 }
 
