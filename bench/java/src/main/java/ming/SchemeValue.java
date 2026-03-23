@@ -15,10 +15,13 @@ public sealed interface SchemeValue {
 
     final class StringVal implements SchemeValue {
         private final char[] chars;
-        public StringVal(String value) { this.chars = value.toCharArray(); }
-        private StringVal(char[] chars) { this.chars = chars.clone(); }
+        private final boolean immutable;
+        public StringVal(String value) { this.chars = value.toCharArray(); this.immutable = false; }
+        public StringVal(String value, boolean immutable) { this.chars = value.toCharArray(); this.immutable = immutable; }
+        private StringVal(char[] chars) { this.chars = chars.clone(); this.immutable = false; }
         public String value() { return new String(chars); }
         public char charAt(int i) { return chars[i]; }
+        public boolean isImmutable() { return immutable; }
         public void setChar(int i, char c) { chars[i] = c; }
         public int length() { return chars.length; }
         public StringVal copy() { return new StringVal(chars); }

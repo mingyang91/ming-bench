@@ -431,6 +431,8 @@ public class Evaluator {
         "string->number", "number->string",
         "symbol->string", "string->symbol", "string-ref",
         "string-set!", "string-copy",
+        "string->list", "list->string",
+        "char->integer", "integer->char",
         "char-alphabetic?", "char-numeric?",
         "char-upcase", "char-downcase", "char=?", "char<?",
         "string=?", "string<?", "string-ci=?",
@@ -753,14 +755,46 @@ public class Evaluator {
             case "string-set!" -> {
                 if (a.size() != 3) throw new EvalError("string-set!: needs exactly 3 arguments");
                 if (!(a.get(0) instanceof SchemeValue.StringVal sv)) throw new EvalError("string-set!: not a string");
-                if (!(a.get(2) instanceof SchemeValue.CharVal c)) throw new EvalError("string-set!: not a character");
-                sv.setChar((int) asInt(a.get(1)), c.value());
+                if (sv.isImmutable()) throw new EvalError("string-set!: string is immutable");
+                int idx = (int) asInt(a.get(1));
+                if (!(a.get(2) instanceof SchemeValue.CharVal cv)) throw new EvalError("string-set!: not a char");
+                sv.setChar(idx, cv.value());
                 yield k.apply(new SchemeValue.VoidVal());
             }
             case "string-copy" -> {
                 if (a.size() != 1) throw new EvalError("string-copy: needs exactly 1 argument");
                 if (!(a.getFirst() instanceof SchemeValue.StringVal sv)) throw new EvalError("string-copy: not a string");
                 yield k.apply(sv.copy());
+            }
+            case "string->list" -> {
+                if (a.size() != 1) throw new EvalError("string->list: needs exactly 1 argument");
+                if (!(a.getFirst() instanceof SchemeValue.StringVal sv)) throw new EvalError("string->list: not a string");
+                String s = sv.value();
+                SchemeValue result = new SchemeValue.NilVal();
+                for (int i = s.length() - 1; i >= 0; i--) {
+                    result = new SchemeValue.PairVal(new SchemeValue.CharVal(s.charAt(i)), result);
+                }
+                yield k.apply(result);
+            }
+            case "list->string" -> {
+                if (a.size() != 1) throw new EvalError("list->string: needs exactly 1 argument");
+                var sb = new StringBuilder();
+                SchemeValue cur = a.getFirst();
+                while (cur instanceof SchemeValue.PairVal p) {
+                    if (!(p.car() instanceof SchemeValue.CharVal c)) throw new EvalError("list->string: not a character");
+                    sb.append(c.value());
+                    cur = p.cdr();
+                }
+                yield k.apply(new SchemeValue.StringVal(sb.toString()));
+            }
+            case "char->integer" -> {
+                if (a.size() != 1) throw new EvalError("char->integer: needs exactly 1 argument");
+                if (!(a.getFirst() instanceof SchemeValue.CharVal c)) throw new EvalError("char->integer: not a character");
+                yield k.apply(new SchemeValue.IntVal(c.value()));
+            }
+            case "integer->char" -> {
+                if (a.size() != 1) throw new EvalError("integer->char: needs exactly 1 argument");
+                yield k.apply(new SchemeValue.CharVal((char) asInt(a.getFirst())));
             }
             case "apply" -> {
                 if (a.size() < 2) throw new EvalError("apply: needs at least 2 arguments");

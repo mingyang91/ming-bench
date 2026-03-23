@@ -81,7 +81,7 @@ public class Parser {
                 }
             } else if (c == '"') {
                 pos++;
-                return new SchemeValue.StringVal(sb.toString());
+                return new SchemeValue.StringVal(sb.toString(), true);
             } else {
                 sb.append(c);
             }
