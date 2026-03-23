@@ -266,6 +266,172 @@ public class Evaluator {
             return new SchemeValue.StringVal(s.value());
         }));
 
+        // Numeric utilities (L13)
+        env.define("quotient", new SchemeValue.BuiltinVal("quotient", args -> {
+            if (args.size() != 2) throw new EvalError("quotient requires 2 arguments");
+            long a = requireInt(args.get(0));
+            long b = requireInt(args.get(1));
+            if (b == 0) throw new EvalError("Division by zero");
+            // Truncate toward zero (Java default for long division)
+            return new SchemeValue.IntVal(a / b);
+        }));
+        env.define("min", new SchemeValue.BuiltinVal("min", args -> {
+            if (args.isEmpty()) throw new EvalError("min requires at least 1 argument");
+            long result = requireInt(args.getFirst());
+            for (int i = 1; i < args.size(); i++) {
+                long v = requireInt(args.get(i));
+                if (v < result) result = v;
+            }
+            return new SchemeValue.IntVal(result);
+        }));
+        env.define("max", new SchemeValue.BuiltinVal("max", args -> {
+            if (args.isEmpty()) throw new EvalError("max requires at least 1 argument");
+            long result = requireInt(args.getFirst());
+            for (int i = 1; i < args.size(); i++) {
+                long v = requireInt(args.get(i));
+                if (v > result) result = v;
+            }
+            return new SchemeValue.IntVal(result);
+        }));
+        env.define("expt", new SchemeValue.BuiltinVal("expt", args -> {
+            if (args.size() != 2) throw new EvalError("expt requires 2 arguments");
+            long base = requireInt(args.get(0));
+            long exp = requireInt(args.get(1));
+            long result = 1;
+            for (long i = 0; i < exp; i++) result *= base;
+            return new SchemeValue.IntVal(result);
+        }));
+        env.define("zero?", new SchemeValue.BuiltinVal("zero?", args ->
+            new SchemeValue.BoolVal(requireInt(args.getFirst()) == 0)));
+        env.define("positive?", new SchemeValue.BuiltinVal("positive?", args ->
+            new SchemeValue.BoolVal(requireInt(args.getFirst()) > 0)));
+        env.define("negative?", new SchemeValue.BuiltinVal("negative?", args ->
+            new SchemeValue.BoolVal(requireInt(args.getFirst()) < 0)));
+        env.define("odd?", new SchemeValue.BuiltinVal("odd?", args ->
+            new SchemeValue.BoolVal(requireInt(args.getFirst()) % 2 != 0)));
+        env.define("even?", new SchemeValue.BuiltinVal("even?", args ->
+            new SchemeValue.BoolVal(requireInt(args.getFirst()) % 2 == 0)));
+
+        // List utilities (L13)
+        env.define("list-ref", new SchemeValue.BuiltinVal("list-ref", args -> {
+            if (args.size() != 2) throw new EvalError("list-ref requires 2 arguments");
+            SchemeValue lst = args.get(0);
+            int idx = (int) requireInt(args.get(1));
+            for (int i = 0; i < idx; i++) {
+                if (!(lst instanceof SchemeValue.PairVal p)) throw new EvalError("list-ref: index out of range");
+                lst = p.cdr();
+            }
+            if (!(lst instanceof SchemeValue.PairVal p)) throw new EvalError("list-ref: index out of range");
+            return p.car();
+        }));
+        env.define("list-tail", new SchemeValue.BuiltinVal("list-tail", args -> {
+            if (args.size() != 2) throw new EvalError("list-tail requires 2 arguments");
+            SchemeValue lst = args.get(0);
+            int idx = (int) requireInt(args.get(1));
+            for (int i = 0; i < idx; i++) {
+                if (!(lst instanceof SchemeValue.PairVal p)) throw new EvalError("list-tail: index out of range");
+                lst = p.cdr();
+            }
+            return lst;
+        }));
+        env.define("list?", new SchemeValue.BuiltinVal("list?", args -> {
+            SchemeValue v = args.getFirst();
+            while (v instanceof SchemeValue.PairVal p) v = p.cdr();
+            return new SchemeValue.BoolVal(v instanceof SchemeValue.NilVal);
+        }));
+        env.define("equal?", new SchemeValue.BuiltinVal("equal?", args -> {
+            if (args.size() != 2) throw new EvalError("equal? requires 2 arguments");
+            return new SchemeValue.BoolVal(schemeEqual(args.get(0), args.get(1)));
+        }));
+        env.define("assoc", new SchemeValue.BuiltinVal("assoc", args -> {
+            if (args.size() != 2) throw new EvalError("assoc requires 2 arguments");
+            SchemeValue key = args.get(0);
+            SchemeValue alist = args.get(1);
+            while (alist instanceof SchemeValue.PairVal p) {
+                if (p.car() instanceof SchemeValue.PairVal entry) {
+                    if (schemeEqual(entry.car(), key)) return p.car();
+                }
+                alist = p.cdr();
+            }
+            return new SchemeValue.BoolVal(false);
+        }));
+        env.define("eq?", new SchemeValue.BuiltinVal("eq?", args -> {
+            if (args.size() != 2) throw new EvalError("eq? requires 2 arguments");
+            SchemeValue a = args.get(0), b = args.get(1);
+            if (a instanceof SchemeValue.SymbolVal sa && b instanceof SchemeValue.SymbolVal sb)
+                return new SchemeValue.BoolVal(sa.name().equals(sb.name()));
+            if (a instanceof SchemeValue.IntVal ia && b instanceof SchemeValue.IntVal ib)
+                return new SchemeValue.BoolVal(ia.value() == ib.value());
+            if (a instanceof SchemeValue.BoolVal ba && b instanceof SchemeValue.BoolVal bb)
+                return new SchemeValue.BoolVal(ba.value() == bb.value());
+            if (a instanceof SchemeValue.CharVal ca && b instanceof SchemeValue.CharVal cb)
+                return new SchemeValue.BoolVal(ca.value() == cb.value());
+            if (a instanceof SchemeValue.NilVal && b instanceof SchemeValue.NilVal)
+                return new SchemeValue.BoolVal(true);
+            return new SchemeValue.BoolVal(a == b);
+        }));
+
+        // Character utilities (L13)
+        env.define("char-alphabetic?", new SchemeValue.BuiltinVal("char-alphabetic?", args -> {
+            if (!(args.getFirst() instanceof SchemeValue.CharVal c)) throw new EvalError("char-alphabetic?: not a char");
+            return new SchemeValue.BoolVal(Character.isLetter(c.value()));
+        }));
+        env.define("char-numeric?", new SchemeValue.BuiltinVal("char-numeric?", args -> {
+            if (!(args.getFirst() instanceof SchemeValue.CharVal c)) throw new EvalError("char-numeric?: not a char");
+            return new SchemeValue.BoolVal(Character.isDigit(c.value()));
+        }));
+        env.define("char-upcase", new SchemeValue.BuiltinVal("char-upcase", args -> {
+            if (!(args.getFirst() instanceof SchemeValue.CharVal c)) throw new EvalError("char-upcase: not a char");
+            return new SchemeValue.CharVal(Character.toUpperCase(c.value()));
+        }));
+        env.define("char-downcase", new SchemeValue.BuiltinVal("char-downcase", args -> {
+            if (!(args.getFirst() instanceof SchemeValue.CharVal c)) throw new EvalError("char-downcase: not a char");
+            return new SchemeValue.CharVal(Character.toLowerCase(c.value()));
+        }));
+        env.define("char=?", new SchemeValue.BuiltinVal("char=?", args -> {
+            if (!(args.get(0) instanceof SchemeValue.CharVal a) || !(args.get(1) instanceof SchemeValue.CharVal b))
+                throw new EvalError("char=?: not chars");
+            return new SchemeValue.BoolVal(a.value() == b.value());
+        }));
+        env.define("char<?", new SchemeValue.BuiltinVal("char<?", args -> {
+            if (!(args.get(0) instanceof SchemeValue.CharVal a) || !(args.get(1) instanceof SchemeValue.CharVal b))
+                throw new EvalError("char<?: not chars");
+            return new SchemeValue.BoolVal(a.value() < b.value());
+        }));
+
+        // String comparison utilities (L13)
+        env.define("string=?", new SchemeValue.BuiltinVal("string=?", args -> {
+            if (!(args.get(0) instanceof SchemeValue.StringVal a) || !(args.get(1) instanceof SchemeValue.StringVal b))
+                throw new EvalError("string=?: not strings");
+            return new SchemeValue.BoolVal(a.value().equals(b.value()));
+        }));
+        env.define("string<?", new SchemeValue.BuiltinVal("string<?", args -> {
+            if (!(args.get(0) instanceof SchemeValue.StringVal a) || !(args.get(1) instanceof SchemeValue.StringVal b))
+                throw new EvalError("string<?: not strings");
+            return new SchemeValue.BoolVal(a.value().compareTo(b.value()) < 0);
+        }));
+        env.define("string-ci=?", new SchemeValue.BuiltinVal("string-ci=?", args -> {
+            if (!(args.get(0) instanceof SchemeValue.StringVal a) || !(args.get(1) instanceof SchemeValue.StringVal b))
+                throw new EvalError("string-ci=?: not strings");
+            return new SchemeValue.BoolVal(a.value().equalsIgnoreCase(b.value()));
+        }));
+        env.define("string-upcase", new SchemeValue.BuiltinVal("string-upcase", args -> {
+            if (!(args.getFirst() instanceof SchemeValue.StringVal s)) throw new EvalError("string-upcase: not a string");
+            return new SchemeValue.StringVal(s.value().toUpperCase());
+        }));
+        env.define("string-downcase", new SchemeValue.BuiltinVal("string-downcase", args -> {
+            if (!(args.getFirst() instanceof SchemeValue.StringVal s)) throw new EvalError("string-downcase: not a string");
+            return new SchemeValue.StringVal(s.value().toLowerCase());
+        }));
+
+        // map (CPS-aware for multi-list support, L13)
+        env.define("map", new SchemeValue.CpsBuiltinVal("map", (args, k) -> {
+            if (args.size() < 2) return new Bounce.Err(new EvalError("map requires at least 2 arguments"));
+            SchemeValue proc = args.getFirst();
+            List<SchemeValue> lists = args.subList(1, args.size());
+            return mapLoop(proc, lists, new ArrayList<>(), k);
+        }));
+
         // string-set!
         env.define("string-set!", new SchemeValue.BuiltinVal("string-set!", args -> {
             if (args.size() != 3) throw new EvalError("string-set! requires 3 arguments");
@@ -872,6 +1038,53 @@ public class Evaluator {
                 collectFreeSymbols(elem, patternVars, result);
             }
         }
+    }
+
+    private boolean schemeEqual(SchemeValue a, SchemeValue b) {
+        if (a instanceof SchemeValue.IntVal ia && b instanceof SchemeValue.IntVal ib)
+            return ia.value() == ib.value();
+        if (a instanceof SchemeValue.BoolVal ba && b instanceof SchemeValue.BoolVal bb)
+            return ba.value() == bb.value();
+        if (a instanceof SchemeValue.StringVal sa && b instanceof SchemeValue.StringVal sb)
+            return sa.value().equals(sb.value());
+        if (a instanceof SchemeValue.SymbolVal sa && b instanceof SchemeValue.SymbolVal sb)
+            return sa.name().equals(sb.name());
+        if (a instanceof SchemeValue.CharVal ca && b instanceof SchemeValue.CharVal cb)
+            return ca.value() == cb.value();
+        if (a instanceof SchemeValue.NilVal && b instanceof SchemeValue.NilVal)
+            return true;
+        if (a instanceof SchemeValue.PairVal pa && b instanceof SchemeValue.PairVal pb)
+            return schemeEqual(pa.car(), pb.car()) && schemeEqual(pa.cdr(), pb.cdr());
+        return false;
+    }
+
+    private Bounce mapLoop(SchemeValue proc, List<SchemeValue> lists, List<SchemeValue> acc, SchemeValue.Cont k) {
+        // Check if any list is empty
+        for (SchemeValue lst : lists) {
+            if (lst instanceof SchemeValue.NilVal) {
+                // Build result list from acc
+                SchemeValue result = SchemeValue.NIL;
+                for (int i = acc.size() - 1; i >= 0; i--) {
+                    result = new SchemeValue.PairVal(acc.get(i), result);
+                }
+                return k.apply(result);
+            }
+        }
+        // Collect car of each list
+        List<SchemeValue> callArgs = new ArrayList<>(lists.size());
+        List<SchemeValue> nextLists = new ArrayList<>(lists.size());
+        for (SchemeValue lst : lists) {
+            if (!(lst instanceof SchemeValue.PairVal p)) {
+                return new Bounce.Err(new EvalError("map: not a proper list"));
+            }
+            callArgs.add(p.car());
+            nextLists.add(p.cdr());
+        }
+        return new Bounce.More(() -> applyProc(proc, callArgs, "map", val -> {
+            List<SchemeValue> newAcc = new ArrayList<>(acc);
+            newAcc.add(val);
+            return mapLoop(proc, nextLists, newAcc, k);
+        }));
     }
 
     private long requireInt(SchemeValue val) throws EvalError {
