@@ -144,6 +144,7 @@ enum Value {
     },
     Char(char),
     Pair(Box<Value>, Box<Value>),
+    Vector(Rc<RefCell<Vec<Value>>>),
     Builtin(BuiltinFn),
     CallCC,
     Continuation(Rc<ContData>),
@@ -164,6 +165,7 @@ impl std::fmt::Debug for Value {
             Value::Symbol(s) => write!(f, "Symbol({})", s),
             Value::List(l) => write!(f, "List({:?})", l),
             Value::Pair(a, b) => write!(f, "Pair({:?} . {:?})", a, b),
+            Value::Vector(v) => write!(f, "Vector({:?})", v.borrow()),
             Value::Lambda { params, .. } => write!(f, "Lambda({:?})", params),
             Value::Char(c) => write!(f, "Char({})", c),
             Value::Builtin(_) => write!(f, "Builtin"),
@@ -194,6 +196,10 @@ impl Value {
                 format!("({})", inner.join(" "))
             }
             Value::Pair(a, b) => format!("({} . {})", a.display(), b.display()),
+            Value::Vector(v) => {
+                let inner: Vec<String> = v.borrow().iter().map(|v| v.display()).collect();
+                format!("#({})", inner.join(" "))
+            }
             Value::Lambda { .. } | Value::Builtin(_) | Value::CallCC | Value::Macro { .. } => "#<procedure>".to_string(),
             Value::Continuation(_) => "#<continuation>".to_string(),
             Value::Void => "".to_string(),
@@ -518,6 +524,11 @@ fn eval_inner(expr: &Expr, env: &Env) -> Result<Trampoline, EvalError> {
                         return Ok(Trampoline::Done(Value::Void));
                     }
                     "string-set!" => return eval_string_set(&elems[1..], env, span).map(Trampoline::Done),
+                    "letrec" => return eval_letrec_tc(&elems[1..], env, span),
+                    "letrec*" => return eval_letrec_star_tc(&elems[1..], env, span),
+                    "case" => return eval_case_tc(&elems[1..], env, span),
+                    "do" => return eval_do(expr, &elems[1..], env, span),
+                    "vector-set!" => return eval_vector_set(&elems[1..], env, span).map(Trampoline::Done),
                     "define-syntax" => return eval_define_syntax(&elems[1..], env, span).map(Trampoline::Done),
                     _ => {
                         // Check for macro application
@@ -921,6 +932,247 @@ fn eval_cond_tc(args: &[Expr], env: &Env) -> Result<Trampoline, EvalError> {
     Ok(Trampoline::Done(Value::Void))
 }
 
+fn eval_letrec_tc(args: &[Expr], env: &Env, span: Span) -> Result<Trampoline, EvalError> {
+    if args.len() < 2 {
+        return Err(EvalError::Arity("letrec requires bindings and body".into()).with_position(span.line, span.col));
+    }
+    let bindings_expr = match &args[0].kind {
+        ExprKind::List(b) => b,
+        _ => return Err(EvalError::Parse("letrec: expected bindings list".into()).with_position(span.line, span.col)),
+    };
+    let local = new_env(Some(env.clone()));
+    // First pass: bind all variables to void so they're visible
+    let mut names = Vec::new();
+    for b in bindings_expr {
+        match &b.kind {
+            ExprKind::List(pair) if pair.len() == 2 => {
+                if let ExprKind::Symbol(s) = &pair[0].kind {
+                    names.push(s.clone());
+                    env_set(&local, s.clone(), Value::Void);
+                } else {
+                    return Err(EvalError::Parse("letrec: expected variable name".into()).with_position(span.line, span.col));
+                }
+            }
+            _ => return Err(EvalError::Parse("letrec: expected (var init) pair".into()).with_position(span.line, span.col)),
+        }
+    }
+    // Second pass: evaluate inits in the local env and update bindings
+    for (i, b) in bindings_expr.iter().enumerate() {
+        if let ExprKind::List(pair) = &b.kind {
+            let val = eval(&pair[1], &local)?;
+            env_set(&local, names[i].clone(), val);
+        }
+    }
+    let body = &args[1..];
+    for (i, expr) in body.iter().enumerate() {
+        push_body_frame(&body[i..], &local);
+        if i < body.len() - 1 {
+            let r = eval(expr, &local);
+            pop_body_frame();
+            catch_escaped_continuation(r)?;
+        } else {
+            pop_body_frame();
+            return Ok(Trampoline::TailCall { expr: expr.clone(), env: local });
+        }
+    }
+    Ok(Trampoline::Done(Value::Void))
+}
+
+fn eval_letrec_star_tc(args: &[Expr], env: &Env, span: Span) -> Result<Trampoline, EvalError> {
+    if args.len() < 2 {
+        return Err(EvalError::Arity("letrec* requires bindings and body".into()).with_position(span.line, span.col));
+    }
+    let bindings_expr = match &args[0].kind {
+        ExprKind::List(b) => b,
+        _ => return Err(EvalError::Parse("letrec*: expected bindings list".into()).with_position(span.line, span.col)),
+    };
+    let local = new_env(Some(env.clone()));
+    // Bind sequentially — each init can see previous bindings
+    for b in bindings_expr {
+        match &b.kind {
+            ExprKind::List(pair) if pair.len() == 2 => {
+                if let ExprKind::Symbol(s) = &pair[0].kind {
+                    let val = eval(&pair[1], &local)?;
+                    env_set(&local, s.clone(), val);
+                } else {
+                    return Err(EvalError::Parse("letrec*: expected variable name".into()).with_position(span.line, span.col));
+                }
+            }
+            _ => return Err(EvalError::Parse("letrec*: expected (var init) pair".into()).with_position(span.line, span.col)),
+        }
+    }
+    let body = &args[1..];
+    for (i, expr) in body.iter().enumerate() {
+        push_body_frame(&body[i..], &local);
+        if i < body.len() - 1 {
+            let r = eval(expr, &local);
+            pop_body_frame();
+            catch_escaped_continuation(r)?;
+        } else {
+            pop_body_frame();
+            return Ok(Trampoline::TailCall { expr: expr.clone(), env: local });
+        }
+    }
+    Ok(Trampoline::Done(Value::Void))
+}
+
+fn eqv_match(val: &Value, datum: &Value) -> bool {
+    match (val, datum) {
+        (Value::Symbol(a), Value::Symbol(b)) => a == b,
+        (Value::Boolean(a), Value::Boolean(b)) => a == b,
+        (Value::Integer(a), Value::Integer(b)) => a == b,
+        (Value::Char(a), Value::Char(b)) => a == b,
+        (Value::Str(a), Value::Str(b)) => a == b,
+        (Value::List(a), Value::List(b)) => a.is_empty() && b.is_empty(),
+        _ => false,
+    }
+}
+
+fn eval_case_tc(args: &[Expr], env: &Env, span: Span) -> Result<Trampoline, EvalError> {
+    if args.is_empty() {
+        return Err(EvalError::Arity("case requires at least a key expression".into()).with_position(span.line, span.col));
+    }
+    let key = eval(&args[0], env)?;
+    for clause in &args[1..] {
+        match &clause.kind {
+            ExprKind::List(parts) if !parts.is_empty() => {
+                // Check for else clause
+                if let ExprKind::Symbol(s) = &parts[0].kind {
+                    if s == "else" {
+                        if parts.len() == 1 {
+                            return Ok(Trampoline::Done(Value::Void));
+                        }
+                        for expr in &parts[1..parts.len() - 1] {
+                            eval(expr, env)?;
+                        }
+                        return Ok(Trampoline::TailCall {
+                            expr: parts.last().unwrap().clone(),
+                            env: env.clone(),
+                        });
+                    }
+                }
+                // First element is list of datums
+                let datums = match &parts[0].kind {
+                    ExprKind::List(d) => d,
+                    _ => return Err(EvalError::Parse("case: expected datum list".into()).with_position(span.line, span.col)),
+                };
+                let matched = datums.iter().any(|d| eqv_match(&key, &expr_to_value(d)));
+                if matched {
+                    if parts.len() == 1 {
+                        return Ok(Trampoline::Done(Value::Void));
+                    }
+                    for expr in &parts[1..parts.len() - 1] {
+                        eval(expr, env)?;
+                    }
+                    return Ok(Trampoline::TailCall {
+                        expr: parts.last().unwrap().clone(),
+                        env: env.clone(),
+                    });
+                }
+            }
+            _ => return Err(EvalError::Parse("case: expected clause".into()).with_position(span.line, span.col)),
+        }
+    }
+    Ok(Trampoline::Done(Value::Void))
+}
+
+fn eval_do(_full_expr: &Expr, args: &[Expr], env: &Env, span: Span) -> Result<Trampoline, EvalError> {
+    // (do ((var init step) ...) (test expr ...) body ...)
+    if args.len() < 2 {
+        return Err(EvalError::Arity("do requires variable bindings and test".into()).with_position(span.line, span.col));
+    }
+    let var_specs = match &args[0].kind {
+        ExprKind::List(v) => v,
+        _ => return Err(EvalError::Parse("do: expected variable list".into()).with_position(span.line, span.col)),
+    };
+    let test_clause = match &args[1].kind {
+        ExprKind::List(t) if !t.is_empty() => t,
+        _ => return Err(EvalError::Parse("do: expected test clause".into()).with_position(span.line, span.col)),
+    };
+    let body = &args[2..];
+
+    // Parse variable specs: (var init step?)
+    struct VarSpec {
+        name: String,
+        step: Option<Expr>,
+    }
+    let mut specs = Vec::new();
+    let local = new_env(Some(env.clone()));
+    for vs in var_specs {
+        match &vs.kind {
+            ExprKind::List(parts) if parts.len() >= 2 => {
+                let name = match &parts[0].kind {
+                    ExprKind::Symbol(s) => s.clone(),
+                    _ => return Err(EvalError::Parse("do: expected variable name".into()).with_position(span.line, span.col)),
+                };
+                let init = eval(&parts[1], env)?;
+                let step = if parts.len() >= 3 { Some(parts[2].clone()) } else { None };
+                env_set(&local, name.clone(), init);
+                specs.push(VarSpec { name, step });
+            }
+            _ => return Err(EvalError::Parse("do: expected (var init step)".into()).with_position(span.line, span.col)),
+        }
+    }
+
+    loop {
+        // Test
+        let test_val = eval(&test_clause[0], &local)?;
+        if test_val.is_truthy() {
+            // Evaluate test expressions and return last
+            if test_clause.len() == 1 {
+                return Ok(Trampoline::Done(Value::Void));
+            }
+            for expr in &test_clause[1..test_clause.len() - 1] {
+                eval(expr, &local)?;
+            }
+            return Ok(Trampoline::TailCall {
+                expr: test_clause.last().unwrap().clone(),
+                env: local,
+            });
+        }
+        // Evaluate body (for side effects)
+        for expr in body {
+            eval(expr, &local)?;
+        }
+        // Step: evaluate all steps with current values, then update in parallel
+        let new_vals: Vec<Option<Value>> = specs.iter().map(|s| {
+            match &s.step {
+                Some(step_expr) => eval(step_expr, &local).map(Some),
+                None => Ok(None),
+            }
+        }).collect::<Result<Vec<_>, _>>()?;
+        for (spec, new_val) in specs.iter().zip(new_vals) {
+            if let Some(v) = new_val {
+                env_set(&local, spec.name.clone(), v);
+            }
+        }
+    }
+}
+
+fn eval_vector_set(args: &[Expr], env: &Env, span: Span) -> Result<Value, EvalError> {
+    if args.len() != 3 {
+        return Err(EvalError::Arity("vector-set! requires 3 arguments".into()).with_position(span.line, span.col));
+    }
+    let vec_val = eval(&args[0], env)?;
+    let idx_val = eval(&args[1], env)?;
+    let new_val = eval(&args[2], env)?;
+    let idx = match idx_val {
+        Value::Integer(n) => n as usize,
+        _ => return Err(EvalError::Type("vector-set!: expected integer index".into()).with_position(span.line, span.col)),
+    };
+    match vec_val {
+        Value::Vector(v) => {
+            let mut inner = v.borrow_mut();
+            if idx >= inner.len() {
+                return Err(EvalError::Runtime("vector-set!: index out of range".into()).with_position(span.line, span.col));
+            }
+            inner[idx] = new_val;
+            Ok(Value::Void)
+        }
+        _ => Err(EvalError::Type("vector-set!: expected vector".into()).with_position(span.line, span.col)),
+    }
+}
+
 fn eval_string_set(args: &[Expr], env: &Env, span: Span) -> Result<Value, EvalError> {
     if args.len() != 3 {
         return Err(EvalError::Arity("string-set! requires 3 arguments".into()));
@@ -1109,7 +1361,8 @@ fn is_special_form(name: &str) -> bool {
     matches!(name,
         "define" | "if" | "quote" | "lambda" | "and" | "or" | "let" | "begin"
         | "cond" | "set!" | "display" | "write" | "newline" | "string-set!"
-        | "define-syntax" | "syntax-rules"
+        | "define-syntax" | "syntax-rules" | "letrec" | "letrec*" | "case" | "do"
+        | "vector-set!"
     )
 }
 
@@ -1644,6 +1897,11 @@ fn values_equal(a: &Value, b: &Value) -> bool {
             x.len() == y.len() && x.iter().zip(y.iter()).all(|(a, b)| values_equal(a, b))
         }
         (Value::Pair(a1, b1), Value::Pair(a2, b2)) => values_equal(a1, a2) && values_equal(b1, b2),
+        (Value::Vector(x), Value::Vector(y)) => {
+            let xb = x.borrow();
+            let yb = y.borrow();
+            xb.len() == yb.len() && xb.iter().zip(yb.iter()).all(|(a, b)| values_equal(a, b))
+        }
         _ => false,
     }
 }
@@ -1661,6 +1919,8 @@ fn builtin_eq_pred(args: &[Value]) -> Result<Value, EvalError> {
         (Value::Integer(a), Value::Integer(b)) => a == b,
         (Value::Char(a), Value::Char(b)) => a == b,
         (Value::List(a), Value::List(b)) => a.is_empty() && b.is_empty(),
+        (Value::Vector(a), Value::Vector(b)) => Rc::ptr_eq(a, b),
+        (Value::Void, Value::Void) => true,
         _ => false,
     };
     Ok(Value::Boolean(result))
@@ -1860,6 +2120,62 @@ fn builtin_list_to_string(args: &[Value]) -> Result<Value, EvalError> {
     Ok(Value::Str(s))
 }
 
+// L15: Vector builtins
+
+fn builtin_vector(args: &[Value]) -> Result<Value, EvalError> {
+    Ok(Value::Vector(Rc::new(RefCell::new(args.to_vec()))))
+}
+
+fn builtin_make_vector(args: &[Value]) -> Result<Value, EvalError> {
+    if args.len() < 1 || args.len() > 2 {
+        return Err(EvalError::Arity("make-vector requires 1 or 2 arguments".into()));
+    }
+    let len = as_int(&args[0])? as usize;
+    let fill = if args.len() == 2 { args[1].clone() } else { Value::Integer(0) };
+    Ok(Value::Vector(Rc::new(RefCell::new(vec![fill; len]))))
+}
+
+fn builtin_vector_ref(args: &[Value]) -> Result<Value, EvalError> {
+    if args.len() != 2 { return Err(EvalError::Arity("vector-ref requires 2 arguments".into())); }
+    match &args[0] {
+        Value::Vector(v) => {
+            let idx = as_int(&args[1])? as usize;
+            let inner = v.borrow();
+            inner.get(idx).cloned().ok_or_else(|| EvalError::Runtime("vector-ref: index out of range".into()))
+        }
+        _ => Err(EvalError::Type("vector-ref: expected vector".into())),
+    }
+}
+
+fn builtin_vector_length(args: &[Value]) -> Result<Value, EvalError> {
+    if args.len() != 1 { return Err(EvalError::Arity("vector-length requires 1 argument".into())); }
+    match &args[0] {
+        Value::Vector(v) => Ok(Value::Integer(v.borrow().len() as i64)),
+        _ => Err(EvalError::Type("vector-length: expected vector".into())),
+    }
+}
+
+fn builtin_is_vector(args: &[Value]) -> Result<Value, EvalError> {
+    if args.len() != 1 { return Err(EvalError::Arity("vector? requires 1 argument".into())); }
+    Ok(Value::Boolean(matches!(&args[0], Value::Vector(_))))
+}
+
+fn builtin_vector_to_list(args: &[Value]) -> Result<Value, EvalError> {
+    if args.len() != 1 { return Err(EvalError::Arity("vector->list requires 1 argument".into())); }
+    match &args[0] {
+        Value::Vector(v) => Ok(Value::List(v.borrow().clone())),
+        _ => Err(EvalError::Type("vector->list: expected vector".into())),
+    }
+}
+
+fn builtin_list_to_vector(args: &[Value]) -> Result<Value, EvalError> {
+    if args.len() != 1 { return Err(EvalError::Arity("list->vector requires 1 argument".into())); }
+    match &args[0] {
+        Value::List(l) => Ok(Value::Vector(Rc::new(RefCell::new(l.clone())))),
+        _ => Err(EvalError::Type("list->vector: expected list".into())),
+    }
+}
+
 fn make_global_env() -> Env {
     let env = new_env(None);
     let builtins: &[(&str, BuiltinFn)] = &[
@@ -1941,6 +2257,14 @@ fn make_global_env() -> Env {
         // L14: string/list conversion
         ("string->list", builtin_string_to_list),
         ("list->string", builtin_list_to_string),
+        // L15: vectors
+        ("vector", builtin_vector),
+        ("make-vector", builtin_make_vector),
+        ("vector-ref", builtin_vector_ref),
+        ("vector-length", builtin_vector_length),
+        ("vector?", builtin_is_vector),
+        ("vector->list", builtin_vector_to_list),
+        ("list->vector", builtin_list_to_vector),
     ];
     for (name, f) in builtins {
         env_set(&env, name.to_string(), Value::Builtin(*f));
