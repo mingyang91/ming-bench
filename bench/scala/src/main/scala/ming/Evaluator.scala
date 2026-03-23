@@ -67,6 +67,14 @@ object Evaluator:
           evalDefine(args, curEnv, pos)
           return BoolVal(true)
 
+        case SList(Sym("set!", _) :: args, pos) =>
+          args match
+            case Sym(name, _) :: valueExpr :: Nil =>
+              val v = eval(valueExpr, curEnv)
+              curEnv.set(name, v, pos)
+              return BoolVal(true)
+            case _ => evalError("set!: bad syntax", pos)
+
         case SList(Sym("quote", _) :: args, pos) =>
           return evalQuote(args, pos)
 
@@ -117,25 +125,30 @@ object Evaluator:
           return BoolVal(!eval(args.head, curEnv).isTruthy)
 
         case SList(head :: args, pos) =>
-          val proc   = eval(head, curEnv)
-          val values = args.map(eval(_, curEnv))
-          proc match
-            case LambdaVal(params, body, closure) =>
-              val localEnv = closure.extend(params, values)
-              body.init.foreach(eval(_, localEnv))
-              curExpr = body.last
-              curEnv = localEnv
-            case BuiltinVal(name, fn) =>
-              try return fn(values)
-              catch
-                case e: EvalError =>
-                  if e.getMessage.matches(".*\\d+:\\d+.*") then throw e
-                  else evalError(e.getMessage, pos)
-                case e: ArithmeticException =>
-                  evalError(e.getMessage, pos)
-            case _ => evalError("not a procedure", pos)
+          applyProc(eval(head, curEnv), args.map(eval(_, curEnv)), pos) match
+            case Left(value) => return value
+            case Right((expr, env)) =>
+              curExpr = expr
+              curEnv = env
     end while
     throw new AssertionError("unreachable")
+
+  /** Apply a procedure value to arguments. Returns Left for immediate result, Right for tail-call continuation. */
+  private def applyProc(proc: Value, values: List[Value], pos: Option[Pos]): Either[Value, (Expr, Env)] =
+    proc match
+      case LambdaVal(params, body, closure) =>
+        val localEnv = closure.extend(params, values)
+        body.init.foreach(eval(_, localEnv))
+        Right((body.last, localEnv))
+      case BuiltinVal(name, fn) =>
+        try Left(fn(values))
+        catch
+          case e: EvalError =>
+            if e.getMessage.matches(".*\\d+:\\d+.*") then throw e
+            else evalError(e.getMessage, pos)
+          case e: ArithmeticException =>
+            evalError(e.getMessage, pos)
+      case _ => evalError("not a procedure", pos)
 
   /** Find matching cond clause. Returns Left(value) for immediate result, or Right((expr, env)) for tail-position
     * continuation.
