@@ -24,6 +24,9 @@ const BUILTINS: &[&str] = &[
     "char-alphabetic?", "char-numeric?", "char-upcase", "char-downcase",
     "char=?", "char<?",
     "string=?", "string<?", "string-ci=?", "string-upcase", "string-downcase",
+    "eqv?",
+    "vector", "make-vector", "vector-ref", "vector-set!", "vector-length",
+    "vector?", "vector->list", "list->vector",
 ];
 
 pub fn default_env() -> Rc<RefCell<Env>> {
@@ -114,6 +117,17 @@ enum Frame {
         lists: Vec<Vec<Value>>,
         results: Vec<Value>,
         span: Option<Span>,
+    },
+    LetrecBindings {
+        names: Vec<String>,
+        done_values: Vec<Value>,
+        remaining_exprs: Vec<Value>,
+        body: Vec<Value>,
+        letrec_env: Rc<RefCell<Env>>,
+    },
+    CaseKey {
+        clauses: Vec<Value>,
+        env: Rc<RefCell<Env>>,
     },
 }
 
@@ -216,7 +230,7 @@ impl Machine {
             Value::Int(_) | Value::Bool(_) | Value::String(_)
             | Value::Char(_) | Value::Builtin(_) | Value::Void
             | Value::Closure { .. } | Value::Pair(_, _) | Value::Continuation(_)
-            | Value::SyntaxRules { .. } => Ok(Control::Continue(expr)),
+            | Value::SyntaxRules { .. } | Value::Vector(_) => Ok(Control::Continue(expr)),
             Value::Symbol(ref name, _) => env
                 .borrow()
                 .get(name)
@@ -250,6 +264,10 @@ impl Machine {
                 "set!" => return self.sf_set(&elems[1..], span, env),
                 "string-set!" => return self.sf_string_set(&elems[1..], span, env),
                 "define-syntax" => return self.sf_define_syntax(&elems[1..], span, env),
+                "letrec" => return self.sf_letrec(&elems[1..], span, env, false),
+                "letrec*" => return self.sf_letrec(&elems[1..], span, env, true),
+                "case" => return self.sf_case(&elems[1..], span, env),
+                "do" => return self.sf_do(&elems[1..], span, env),
                 _ => {}
             }
 
@@ -453,6 +471,29 @@ impl Machine {
                     });
                     Ok(Control::Apply(func, next_args, span))
                 }
+            }
+            Frame::LetrecBindings {
+                names, mut done_values, mut remaining_exprs, body, letrec_env,
+            } => {
+                done_values.push(val);
+                if remaining_exprs.is_empty() {
+                    // All inits evaluated, set bindings in env
+                    for (name, value) in names.iter().zip(done_values) {
+                        letrec_env.borrow_mut().set(name, value)
+                            .expect("letrec binding must exist");
+                    }
+                    self.eval_body_in(&body, &letrec_env)
+                } else {
+                    let next_expr = remaining_exprs.remove(0);
+                    self.kont.push(Frame::LetrecBindings {
+                        names, done_values, remaining_exprs, body,
+                        letrec_env: Rc::clone(&letrec_env),
+                    });
+                    Ok(Control::Eval(next_expr, letrec_env))
+                }
+            }
+            Frame::CaseKey { clauses, env } => {
+                self.dispatch_case(val, &clauses, &env)
             }
         }
     }
@@ -687,7 +728,8 @@ impl Machine {
             }
             Value::Int(_) | Value::Bool(_) | Value::String(_) | Value::Char(_)
             | Value::Builtin(_) | Value::Closure { .. } | Value::Pair(_, _)
-            | Value::Continuation(_) | Value::SyntaxRules { .. } | Value::Void => {
+            | Value::Continuation(_) | Value::SyntaxRules { .. }
+            | Value::Vector(_) | Value::Void => {
                 Err(EvalError::Parse {
                     msg: format!("define: expected symbol or list, got {}", args[0]),
                 }.at(span))
@@ -894,6 +936,264 @@ impl Machine {
         Ok(Control::Eval(args[1].clone(), Rc::clone(env)))
     }
 
+    fn sf_letrec(
+        &mut self,
+        args: &[Value],
+        span: Option<Span>,
+        env: &Rc<RefCell<Env>>,
+        is_star: bool,
+    ) -> Result<Control, EvalError> {
+        let form_name = if is_star { "letrec*" } else { "letrec" };
+        if args.len() < 2 {
+            return Err(EvalError::Parse {
+                msg: format!("{form_name} requires bindings and body"),
+            }.at(span));
+        }
+        let Value::List(bindings_list, _) = &args[0] else {
+            return Err(EvalError::Parse {
+                msg: format!("{form_name}: expected bindings list"),
+            }.at(span));
+        };
+        let mut names = Vec::new();
+        let mut init_exprs = Vec::new();
+        for binding in bindings_list {
+            let Value::List(pair, _) = binding else {
+                return Err(EvalError::Parse {
+                    msg: format!("{form_name}: expected binding pair"),
+                }.at(span));
+            };
+            if pair.len() != 2 {
+                return Err(EvalError::Parse {
+                    msg: format!("{form_name}: binding must have 2 elements"),
+                }.at(span));
+            }
+            let Value::Symbol(name, _) = &pair[0] else {
+                return Err(EvalError::Parse {
+                    msg: format!("{form_name}: expected variable name"),
+                }.at(span));
+            };
+            names.push(name.clone());
+            init_exprs.push(pair[1].clone());
+        }
+        let body = args[1..].to_vec();
+        let letrec_env = Env::with_parent(env);
+        // Pre-define all names as Void so init exprs can reference them
+        for name in &names {
+            letrec_env.borrow_mut().define(name.clone(), Value::Void);
+        }
+        if init_exprs.is_empty() {
+            return self.eval_body_in(&body, &letrec_env);
+        }
+        if is_star {
+            // letrec*: evaluate sequentially, setting each binding immediately
+            return self.eval_letrec_star(names, init_exprs, body, &letrec_env);
+        }
+        let mut remaining = init_exprs;
+        let first_expr = remaining.remove(0);
+        self.kont.push(Frame::LetrecBindings {
+            names,
+            done_values: Vec::new(),
+            remaining_exprs: remaining,
+            body,
+            letrec_env: Rc::clone(&letrec_env),
+        });
+        Ok(Control::Eval(first_expr, letrec_env))
+    }
+
+    fn eval_letrec_star(
+        &mut self,
+        names: Vec<String>,
+        init_exprs: Vec<Value>,
+        body: Vec<Value>,
+        env: &Rc<RefCell<Env>>,
+    ) -> Result<Control, EvalError> {
+        // Desugar letrec* into: (begin (set! name0 init0) (set! name1 init1) ... body...)
+        // All names are already defined as Void in env.
+        let mut full_body = Vec::new();
+        for (name, expr) in names.into_iter().zip(init_exprs) {
+            full_body.push(Value::List(vec![
+                Value::Symbol("set!".into(), None),
+                Value::Symbol(name, None),
+                expr,
+            ], None));
+        }
+        full_body.extend(body);
+        self.eval_body_in(&full_body, env)
+    }
+
+    fn sf_case(
+        &mut self,
+        args: &[Value],
+        span: Option<Span>,
+        env: &Rc<RefCell<Env>>,
+    ) -> Result<Control, EvalError> {
+        if args.is_empty() {
+            return Err(EvalError::Parse {
+                msg: "case requires at least a key expression".into(),
+            }.at(span));
+        }
+        let clauses = args[1..].to_vec();
+        self.kont.push(Frame::CaseKey {
+            clauses,
+            env: Rc::clone(env),
+        });
+        Ok(Control::Eval(args[0].clone(), Rc::clone(env)))
+    }
+
+    fn dispatch_case(
+        &mut self,
+        key: Value,
+        clauses: &[Value],
+        env: &Rc<RefCell<Env>>,
+    ) -> Result<Control, EvalError> {
+        for clause in clauses {
+            let Value::List(parts, _) = clause else {
+                return Err(EvalError::Parse { msg: "case: expected clause".into() });
+            };
+            if parts.is_empty() {
+                return Err(EvalError::Parse { msg: "case: empty clause".into() });
+            }
+            // Check for else clause
+            if let Value::Symbol(s, _) = &parts[0] {
+                if s == "else" {
+                    return self.eval_body_in(&parts[1..], env);
+                }
+            }
+            // Datum list: ((datum ...) expr ...)
+            let Value::List(datums, _) = &parts[0] else {
+                return Err(EvalError::Parse { msg: "case: expected datum list".into() });
+            };
+            for datum in datums {
+                if eqv(&key, datum) {
+                    return self.eval_body_in(&parts[1..], env);
+                }
+            }
+        }
+        // No match, no else — return void
+        Ok(Control::Continue(Value::Void))
+    }
+
+    fn sf_do(
+        &mut self,
+        args: &[Value],
+        span: Option<Span>,
+        env: &Rc<RefCell<Env>>,
+    ) -> Result<Control, EvalError> {
+        if args.len() < 2 {
+            return Err(EvalError::Parse {
+                msg: "do requires bindings, test, and optional body".into(),
+            }.at(span));
+        }
+        // Parse bindings: ((var init step?) ...)
+        let Value::List(bindings_list, _) = &args[0] else {
+            return Err(EvalError::Parse {
+                msg: "do: expected bindings list".into(),
+            }.at(span));
+        };
+        let mut loop_params = Vec::new();
+        let mut init_exprs = Vec::new();
+        let mut step_exprs = Vec::new();
+
+        for binding in bindings_list {
+            let Value::List(parts, _) = binding else {
+                return Err(EvalError::Parse {
+                    msg: "do: expected binding".into(),
+                }.at(span));
+            };
+            if parts.len() < 2 || parts.len() > 3 {
+                return Err(EvalError::Parse {
+                    msg: "do: binding must have 2 or 3 elements".into(),
+                }.at(span));
+            }
+            let Value::Symbol(name, _) = &parts[0] else {
+                return Err(EvalError::Parse {
+                    msg: "do: expected variable name".into(),
+                }.at(span));
+            };
+            loop_params.push(name.clone());
+            init_exprs.push(parts[1].clone());
+            // Step expr: if missing, variable keeps its value (use variable reference)
+            if parts.len() == 3 {
+                step_exprs.push(parts[2].clone());
+            } else {
+                step_exprs.push(Value::Symbol(name.clone(), None));
+            }
+        }
+
+        // Parse test clause: (test expr ...)
+        let Value::List(test_clause, _) = &args[1] else {
+            return Err(EvalError::Parse {
+                msg: "do: expected test clause".into(),
+            }.at(span));
+        };
+        if test_clause.is_empty() {
+            return Err(EvalError::Parse {
+                msg: "do: empty test clause".into(),
+            }.at(span));
+        }
+        let test_expr = test_clause[0].clone();
+        let result_exprs = test_clause[1..].to_vec();
+        let do_body = args[2..].to_vec();
+
+        // Desugar into named let:
+        // (let __do_loop ((var1 init1) (var2 init2) ...)
+        //   (if test
+        //     (begin result_exprs...)
+        //     (begin body... (__do_loop step1 step2 ...))))
+        let loop_name = "__do_loop";
+
+        // Build the recursive call: (__do_loop step1 step2 ...)
+        let mut recursive_call = vec![Value::Symbol(loop_name.into(), None)];
+        recursive_call.extend(step_exprs);
+
+        // Build the else branch: (begin body... (recursive-call))
+        let mut else_body = do_body;
+        else_body.push(Value::List(recursive_call, None));
+
+        // Build the if expression
+        let if_expr = if result_exprs.is_empty() {
+            Value::List(vec![
+                Value::Symbol("if".into(), None),
+                test_expr,
+                Value::Void,
+                Value::List(vec![Value::Symbol("begin".into(), None)]
+                    .into_iter().chain(else_body).collect(), None),
+            ], None)
+        } else {
+            let then_branch = if result_exprs.len() == 1 {
+                result_exprs[0].clone()
+            } else {
+                let mut begin = vec![Value::Symbol("begin".into(), None)];
+                begin.extend(result_exprs);
+                Value::List(begin, None)
+            };
+            Value::List(vec![
+                Value::Symbol("if".into(), None),
+                test_expr,
+                then_branch,
+                Value::List(vec![Value::Symbol("begin".into(), None)]
+                    .into_iter().chain(else_body).collect(), None),
+            ], None)
+        };
+
+        // Build named let bindings: ((var1 init1) (var2 init2) ...)
+        let let_bindings: Vec<Value> = loop_params.iter().zip(init_exprs)
+            .map(|(name, init)| Value::List(vec![
+                Value::Symbol(name.clone(), None), init,
+            ], None))
+            .collect();
+
+        // Build: (let __do_loop ((bindings...)) if_expr)
+        let named_let = Value::List(vec![
+            Value::Symbol("let".into(), None),
+            Value::Symbol(loop_name.into(), None),
+            Value::List(let_bindings, None),
+            if_expr,
+        ], None);
+
+        Ok(Control::Eval(named_let, Rc::clone(env)))
+    }
+
     fn sf_define_syntax(
         &mut self, args: &[Value], span: Option<Span>, env: &Rc<RefCell<Env>>,
     ) -> Result<Control, EvalError> {
@@ -987,7 +1287,8 @@ fn make_literal(val: Value) -> Value {
     match val {
         Value::Int(_) | Value::Bool(_) | Value::String(_) | Value::Char(_)
         | Value::Builtin(_) | Value::Closure { .. } | Value::Pair(_, _)
-        | Value::Continuation(_) | Value::SyntaxRules { .. } | Value::Void => val,
+        | Value::Continuation(_) | Value::SyntaxRules { .. }
+        | Value::Vector(_) | Value::Void => val,
         Value::Symbol(_, _) | Value::List(_, _) => Value::List(
             vec![Value::Symbol("quote".into(), None), val],
             None,
@@ -1072,6 +1373,18 @@ fn is_false(val: &Value) -> bool {
     matches!(val, Value::Bool(false))
 }
 
+fn eqv(a: &Value, b: &Value) -> bool {
+    match (a, b) {
+        (Value::Symbol(a, _), Value::Symbol(b, _)) => a == b,
+        (Value::Bool(a), Value::Bool(b)) => a == b,
+        (Value::Int(a), Value::Int(b)) => a == b,
+        (Value::Char(a), Value::Char(b)) => a == b,
+        (Value::List(a, _), Value::List(b, _)) => a.is_empty() && b.is_empty(),
+        (Value::Void, Value::Void) => true,
+        _ => false,
+    }
+}
+
 fn require_ints(args: &[Value]) -> Result<Vec<i64>, EvalError> {
     args.iter()
         .map(|a| match a {
@@ -1087,6 +1400,16 @@ fn display_value(val: &Value) -> String {
     match val {
         Value::String(s) => s.clone(),
         Value::Char(c) => c.to_string(),
+        Value::Vector(elems) => {
+            let borrowed = elems.borrow();
+            let mut s = "#(".to_string();
+            for (i, elem) in borrowed.iter().enumerate() {
+                if i > 0 { s.push(' '); }
+                s.push_str(&display_value(elem));
+            }
+            s.push(')');
+            s
+        }
         other => other.to_string(),
     }
 }
@@ -1315,6 +1638,8 @@ fn apply_builtin(
                 (Value::Int(a), Value::Int(b)) => a == b,
                 (Value::Char(a), Value::Char(b)) => a == b,
                 (Value::List(a, _), Value::List(b, _)) => a.is_empty() && b.is_empty(),
+                (Value::Vector(a), Value::Vector(b)) => Rc::ptr_eq(a, b),
+                (Value::Void, Value::Void) => true,
                 _ => false,
             };
             Ok(Value::Bool(result))
@@ -1355,6 +1680,130 @@ fn apply_builtin(
                 expected: "valid Unicode code point".into(), got: format!("{n}"),
             })?;
             Ok(Value::Char(c))
+        }
+        "eqv?" => {
+            if args.len() != 2 {
+                return Err(EvalError::WrongArgCount { expected: 2, got: args.len() });
+            }
+            let result = match (&args[0], &args[1]) {
+                (Value::Symbol(a, _), Value::Symbol(b, _)) => a == b,
+                (Value::Bool(a), Value::Bool(b)) => a == b,
+                (Value::Int(a), Value::Int(b)) => a == b,
+                (Value::Char(a), Value::Char(b)) => a == b,
+                (Value::List(a, _), Value::List(b, _)) => a.is_empty() && b.is_empty(),
+                (Value::Void, Value::Void) => true,
+                _ => false,
+            };
+            Ok(Value::Bool(result))
+        }
+        "vector" | "make-vector" | "vector-ref" | "vector-set!" | "vector-length"
+        | "vector?" | "vector->list" | "list->vector" => apply_vector_builtin(name, args),
+        _ => Err(EvalError::UnboundVariable { name: name.into() }),
+    }
+}
+
+fn apply_vector_builtin(name: &str, args: &[Value]) -> Result<Value, EvalError> {
+    match name {
+        "vector" => {
+            Ok(Value::Vector(Rc::new(RefCell::new(args.to_vec()))))
+        }
+        "make-vector" => {
+            if args.is_empty() || args.len() > 2 {
+                return Err(EvalError::WrongArgCount { expected: 1, got: args.len() });
+            }
+            let Value::Int(size) = &args[0] else {
+                return Err(EvalError::TypeMismatch {
+                    expected: "integer".into(), got: format!("{}", args[0]),
+                });
+            };
+            let fill = if args.len() == 2 { args[1].clone() } else { Value::Int(0) };
+            let elems = vec![fill; *size as usize];
+            Ok(Value::Vector(Rc::new(RefCell::new(elems))))
+        }
+        "vector-ref" => {
+            if args.len() != 2 {
+                return Err(EvalError::WrongArgCount { expected: 2, got: args.len() });
+            }
+            let Value::Vector(elems) = &args[0] else {
+                return Err(EvalError::TypeMismatch {
+                    expected: "vector".into(), got: format!("{}", args[0]),
+                });
+            };
+            let Value::Int(idx) = &args[1] else {
+                return Err(EvalError::TypeMismatch {
+                    expected: "integer".into(), got: format!("{}", args[1]),
+                });
+            };
+            let borrowed = elems.borrow();
+            let idx = *idx as usize;
+            borrowed.get(idx).cloned().ok_or_else(|| EvalError::TypeMismatch {
+                expected: format!("index in range 0..{}", borrowed.len()),
+                got: format!("{idx}"),
+            })
+        }
+        "vector-set!" => {
+            if args.len() != 3 {
+                return Err(EvalError::WrongArgCount { expected: 3, got: args.len() });
+            }
+            let Value::Vector(elems) = &args[0] else {
+                return Err(EvalError::TypeMismatch {
+                    expected: "vector".into(), got: format!("{}", args[0]),
+                });
+            };
+            let Value::Int(idx) = &args[1] else {
+                return Err(EvalError::TypeMismatch {
+                    expected: "integer".into(), got: format!("{}", args[1]),
+                });
+            };
+            let idx = *idx as usize;
+            let mut borrowed = elems.borrow_mut();
+            if idx >= borrowed.len() {
+                return Err(EvalError::TypeMismatch {
+                    expected: format!("index in range 0..{}", borrowed.len()),
+                    got: format!("{idx}"),
+                });
+            }
+            borrowed[idx] = args[2].clone();
+            Ok(Value::Void)
+        }
+        "vector-length" => {
+            if args.len() != 1 {
+                return Err(EvalError::WrongArgCount { expected: 1, got: args.len() });
+            }
+            let Value::Vector(elems) = &args[0] else {
+                return Err(EvalError::TypeMismatch {
+                    expected: "vector".into(), got: format!("{}", args[0]),
+                });
+            };
+            Ok(Value::Int(elems.borrow().len() as i64))
+        }
+        "vector?" => {
+            if args.len() != 1 {
+                return Err(EvalError::WrongArgCount { expected: 1, got: args.len() });
+            }
+            Ok(Value::Bool(matches!(&args[0], Value::Vector(_))))
+        }
+        "vector->list" => {
+            if args.len() != 1 {
+                return Err(EvalError::WrongArgCount { expected: 1, got: args.len() });
+            }
+            let Value::Vector(elems) = &args[0] else {
+                return Err(EvalError::TypeMismatch {
+                    expected: "vector".into(), got: format!("{}", args[0]),
+                });
+            };
+            Ok(Value::List(elems.borrow().clone(), None))
+        }
+        "list->vector" => {
+            if args.len() != 1 {
+                return Err(EvalError::WrongArgCount { expected: 1, got: args.len() });
+            }
+            let Value::List(elems, _) = &args[0] else {
+                return Err(EvalError::TypeMismatch {
+                    expected: "list".into(), got: format!("{}", args[0]),
+                });
+            };
+            Ok(Value::Vector(Rc::new(RefCell::new(elems.clone()))))
         }
         _ => Err(EvalError::UnboundVariable { name: name.into() }),
     }

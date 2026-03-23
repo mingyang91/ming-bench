@@ -32,6 +32,7 @@ pub enum Value {
         rules: Vec<(Value, Value)>,
         def_env: Rc<RefCell<Env>>,
     },
+    Vector(Rc<RefCell<Vec<Value>>>),
     Void,
 }
 
@@ -41,7 +42,8 @@ impl Value {
             Value::Symbol(_, span) | Value::List(_, span) => *span,
             Value::Int(_) | Value::Bool(_) | Value::String(_) | Value::Char(_)
             | Value::Builtin(_) | Value::Closure { .. } | Value::Pair(_, _)
-            | Value::Continuation(_) | Value::SyntaxRules { .. } | Value::Void => None,
+            | Value::Continuation(_) | Value::SyntaxRules { .. }
+            | Value::Vector(_) | Value::Void => None,
         }
     }
 }
@@ -61,6 +63,7 @@ impl PartialEq for Value {
             (Value::Pair(a1, a2), Value::Pair(b1, b2)) => a1 == b1 && a2 == b2,
             (Value::Continuation(a), Value::Continuation(b)) => a == b,
             (Value::SyntaxRules { .. }, Value::SyntaxRules { .. }) => false,
+            (Value::Vector(a), Value::Vector(b)) => *a.borrow() == *b.borrow(),
             (Value::Int(_), _)
             | (Value::Bool(_), _)
             | (Value::String(_), _)
@@ -72,6 +75,7 @@ impl PartialEq for Value {
             | (Value::Closure { .. }, _)
             | (Value::Continuation(_), _)
             | (Value::SyntaxRules { .. }, _)
+            | (Value::Vector(_), _)
             | (Value::Void, _) => false,
         }
     }
@@ -104,6 +108,17 @@ impl fmt::Display for Value {
             Value::Closure { .. } => write!(f, "#<procedure>"),
             Value::Continuation(_) => write!(f, "#<continuation>"),
             Value::SyntaxRules { .. } => write!(f, "#<syntax>"),
+            Value::Vector(elems) => {
+                write!(f, "#(")?;
+                let borrowed = elems.borrow();
+                for (i, elem) in borrowed.iter().enumerate() {
+                    if i > 0 {
+                        write!(f, " ")?;
+                    }
+                    write!(f, "{elem}")?;
+                }
+                write!(f, ")")
+            }
             Value::Void => write!(f, ""),
         }
     }
