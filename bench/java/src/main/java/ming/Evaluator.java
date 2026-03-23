@@ -216,6 +216,9 @@ public class Evaluator {
             case "symbol->string" -> builtinSymbolToString(args, env, pos);
             case "string->symbol" -> builtinStringToSymbol(args, env, pos);
             case "string-ref" -> builtinStringRef(args, env, pos);
+            // L06 builtins
+            case "string-set!" -> builtinStringSet(args, env, pos);
+            case "string-copy" -> builtinStringCopy(args, env, pos);
             default -> null;
         };
     }
@@ -548,6 +551,26 @@ public class Evaluator {
         if (!(val instanceof SchemeValue.StringVal s)) throw posError(pos, "string-ref: not a string");
         int idx = (int) requireInt(eval(args.get(1), env), pos);
         return new SchemeValue.CharVal(s.value().charAt(idx), SourcePos.NONE);
+    }
+
+    // --- L06 builtins ---
+
+    private SchemeValue builtinStringSet(List<SchemeValue> args, Environment env, SourcePos pos) throws EvalError {
+        if (args.size() != 3) throw posError(pos, "string-set!: need exactly 3 arguments");
+        SchemeValue val = eval(args.get(0), env);
+        if (!(val instanceof SchemeValue.StringVal s)) throw posError(pos, "string-set!: not a string");
+        int idx = (int) requireInt(eval(args.get(1), env), pos);
+        SchemeValue charVal = eval(args.get(2), env);
+        if (!(charVal instanceof SchemeValue.CharVal c)) throw posError(pos, "string-set!: not a character");
+        s.chars()[idx] = c.value();
+        return new SchemeValue.BoolVal(false, SourcePos.NONE); // void
+    }
+
+    private SchemeValue builtinStringCopy(List<SchemeValue> args, Environment env, SourcePos pos) throws EvalError {
+        if (args.size() != 1) throw posError(pos, "string-copy: need exactly 1 argument");
+        SchemeValue val = eval(args.getFirst(), env);
+        if (!(val instanceof SchemeValue.StringVal s)) throw posError(pos, "string-copy: not a string");
+        return new SchemeValue.StringVal(s.value(), SourcePos.NONE);
     }
 
     private long requireInt(SchemeValue v, SourcePos pos) throws EvalError {

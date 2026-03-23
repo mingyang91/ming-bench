@@ -102,6 +102,22 @@ public class Parser {
         return switch (c) {
             case 't' -> new SchemeValue.BoolVal(true, sp);
             case 'f' -> new SchemeValue.BoolVal(false, sp);
+            case '\\' -> {
+                if (pos >= input.length()) throw new EvalError("unexpected end after #\\");
+                // Check for named characters
+                int start = pos;
+                while (pos < input.length() && !isDelimiter(input.charAt(pos))) pos++;
+                String name = input.substring(start, pos);
+                if (name.length() == 1) {
+                    yield new SchemeValue.CharVal(name.charAt(0), sp);
+                }
+                yield switch (name) {
+                    case "space" -> new SchemeValue.CharVal(' ', sp);
+                    case "newline" -> new SchemeValue.CharVal('\n', sp);
+                    case "tab" -> new SchemeValue.CharVal('\t', sp);
+                    default -> throw new EvalError("unknown character name: " + name);
+                };
+            }
             default -> throw new EvalError("unknown hash literal: #" + c);
         };
     }

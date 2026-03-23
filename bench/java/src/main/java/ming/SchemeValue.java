@@ -5,7 +5,10 @@ import java.util.List;
 public sealed interface SchemeValue {
     record IntVal(long value, SourcePos pos) implements SchemeValue {}
     record BoolVal(boolean value, SourcePos pos) implements SchemeValue {}
-    record StringVal(String value, SourcePos pos) implements SchemeValue {}
+    record StringVal(char[] chars, SourcePos pos) implements SchemeValue {
+        StringVal(String value, SourcePos pos) { this(value.toCharArray(), pos); }
+        String value() { return new String(chars); }
+    }
     record SymbolVal(String name, SourcePos pos) implements SchemeValue {}
     record ListVal(List<SchemeValue> elements, SourcePos pos) implements SchemeValue {}
     record LambdaVal(List<String> params, List<SchemeValue> body, Environment env) implements SchemeValue {}
