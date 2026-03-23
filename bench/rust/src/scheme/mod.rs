@@ -10,7 +10,7 @@ thread_local! {
     static OUTPUT_BUFFER: RefCell<String> = RefCell::new(String::new());
 }
 
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 enum Value {
     Integer(i64),
     Boolean(bool),
@@ -27,6 +27,27 @@ enum Value {
     },
     Void,
     Builtin(&'static str, fn(&[Value]) -> Result<Value, EvalError>),
+    CallCC,
+    Continuation(Rc<Kont>),
+}
+
+impl std::fmt::Debug for Value {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Value::Integer(n) => write!(f, "Integer({})", n),
+            Value::Boolean(b) => write!(f, "Boolean({})", b),
+            Value::Str(s) => write!(f, "Str(\"{}\")", s),
+            Value::Char(c) => write!(f, "Char({:?})", c),
+            Value::Symbol(s) => write!(f, "Symbol({})", s),
+            Value::Pair(a, b) => write!(f, "Pair({:?}, {:?})", a, b),
+            Value::Nil => write!(f, "Nil"),
+            Value::Lambda { .. } => write!(f, "#<procedure>"),
+            Value::Void => write!(f, "Void"),
+            Value::Builtin(name, _) => write!(f, "Builtin({})", name),
+            Value::CallCC => write!(f, "CallCC"),
+            Value::Continuation(_) => write!(f, "#<continuation>"),
+        }
+    }
 }
 
 impl PartialEq for Value {
@@ -80,7 +101,9 @@ impl Value {
                 out.push(')');
                 out
             }
-            Value::Lambda { .. } | Value::Builtin(_, _) => "#<procedure>".to_string(),
+            Value::Lambda { .. } | Value::Builtin(_, _) | Value::CallCC | Value::Continuation(_) => {
+                "#<procedure>".to_string()
+            }
             Value::Void => "#<void>".to_string(),
         }
     }
@@ -214,6 +237,32 @@ fn env_update(env: &Env, name: &str, val: Value) -> Result<(), EvalError> {
             Some(p) => cur = p,
             None => return Err(EvalError::UnboundVariable(name.to_string())),
         }
+    }
+}
+
+// --- Continuation (CEK machine) ---
+
+#[derive(Clone)]
+enum Kont {
+    Done,
+    Define { name: String, env: Env, next: Rc<Kont> },
+    Set { form: Expr, name: String, env: Env, next: Rc<Kont> },
+    If { then_expr: Expr, else_expr: Option<Expr>, env: Env, next: Rc<Kont> },
+    Seq { remaining: Vec<Expr>, env: Env, next: Rc<Kont> },
+    And { remaining: Vec<Expr>, env: Env, next: Rc<Kont> },
+    Or { remaining: Vec<Expr>, env: Env, next: Rc<Kont> },
+    CondTest { form: Expr, body: Vec<Expr>, remaining_clauses: Vec<Expr>, env: Env, next: Rc<Kont> },
+    LetBind { form: Expr, eval_env: Env, done: Vec<(String, Value)>, current_name: String, remaining: Vec<(String, Expr)>, body: Vec<Expr>, next: Rc<Kont> },
+    NamedLetBind { form: Expr, loop_name: String, eval_env: Env, done: Vec<(String, Value)>, current_name: String, remaining: Vec<(String, Expr)>, body: Vec<Expr>, next: Rc<Kont> },
+    Operator { form: Expr, args: Vec<Expr>, env: Env, next: Rc<Kont> },
+    Arg { form: Expr, func: Value, collected: Vec<Value>, before_exprs: Vec<Expr>, env: Env, next: Rc<Kont> },
+    StringSetIdx { form: Expr, var_name: String, char_expr: Expr, env: Env, next: Rc<Kont> },
+    StringSetChar { form: Expr, var_name: String, idx: usize, env: Env, next: Rc<Kont> },
+}
+
+impl std::fmt::Debug for Kont {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "#<continuation>")
     }
 }
 
@@ -565,7 +614,6 @@ fn builtin_string_ref(args: &[Value]) -> Result<Value, EvalError> {
 }
 
 fn builtin_apply_placeholder(_args: &[Value]) -> Result<Value, EvalError> {
-    // This is handled specially in eval; should never be called directly
     Err(EvalError::Type("apply: internal error".into()))
 }
 
@@ -612,6 +660,8 @@ fn default_env() -> Env {
     for &(name, func) in builtins {
         env_set(&env, name.to_string(), Value::Builtin(name, func));
     }
+    env_set(&env, "call/cc".to_string(), Value::CallCC);
+    env_set(&env, "call-with-current-continuation".to_string(), Value::CallCC);
     env
 }
 
@@ -698,7 +748,6 @@ fn tokenize(input: &str) -> Vec<Token> {
                 i += 2; // skip #\
                 col += 2;
                 if i < chars.len() {
-                    // Check for named characters like #\space, #\newline
                     let ch_start = i;
                     if chars[i].is_alphabetic() {
                         while i < chars.len() && chars[i].is_alphabetic() {
@@ -812,370 +861,7 @@ fn parse(input: &str) -> Result<Vec<Expr>, EvalError> {
     Ok(exprs)
 }
 
-// --- Evaluator ---
-
-fn eval(expr: &Expr, env: &Env) -> Result<Value, EvalError> {
-    let mut cur_expr = expr.clone();
-    let mut cur_env = env.clone();
-
-    loop {
-        match cur_expr.kind.clone() {
-            ExprKind::Integer(n) => return Ok(Value::Integer(n)),
-            ExprKind::Boolean(b) => return Ok(Value::Boolean(b)),
-            ExprKind::Str(s) => return Ok(Value::Str(s)),
-            ExprKind::Char(c) => return Ok(Value::Char(c)),
-            ExprKind::Symbol(name) => return env_get(&cur_env, &name).map_err(|e| cur_expr.wrap_err(e)),
-            ExprKind::List(items) => {
-                if items.is_empty() {
-                    return Err(cur_expr.wrap_err(EvalError::BadSyntax("empty application".into())));
-                }
-                if let ExprKind::Symbol(ref op) = items[0].kind {
-                    match op.as_str() {
-                        "define" => return eval_define(&cur_expr, &items[1..], &cur_env),
-                        "quote" => return eval_quote(&cur_expr, &items[1..]),
-                        "lambda" => return eval_lambda(&cur_expr, &items[1..], &cur_env),
-                        "set!" => {
-                            let args = &items[1..];
-                            if args.len() != 2 {
-                                return Err(cur_expr.wrap_err(EvalError::BadSyntax("set! requires exactly 2 arguments".into())));
-                            }
-                            let name = match &args[0].kind {
-                                ExprKind::Symbol(n) => n.clone(),
-                                _ => return Err(cur_expr.wrap_err(EvalError::BadSyntax("set!: first argument must be a variable".into()))),
-                            };
-                            let val = eval(&args[1], &cur_env)?;
-                            env_update(&cur_env, &name, val).map_err(|e| cur_expr.wrap_err(e))?;
-                            return Ok(Value::Void);
-                        }
-                        "string-set!" => return eval_string_set(&cur_expr, &items[1..], &cur_env),
-                        "if" => {
-                            let args = &items[1..];
-                            if args.len() < 2 || args.len() > 3 {
-                                return Err(cur_expr.wrap_err(EvalError::BadSyntax("if: expected 2 or 3 parts".into())));
-                            }
-                            let cond = eval(&args[0], &cur_env)?;
-                            if cond.is_truthy() {
-                                cur_expr = args[1].clone();
-                            } else if args.len() == 3 {
-                                cur_expr = args[2].clone();
-                            } else {
-                                return Ok(Value::Void);
-                            }
-                            continue;
-                        }
-                        "begin" => {
-                            let args = &items[1..];
-                            if args.is_empty() {
-                                return Ok(Value::Void);
-                            }
-                            for e in &args[..args.len() - 1] {
-                                eval(e, &cur_env)?;
-                            }
-                            cur_expr = args[args.len() - 1].clone();
-                            continue;
-                        }
-                        "cond" => {
-                            let clauses = &items[1..];
-                            let mut tail = None;
-                            for clause in clauses {
-                                match &clause.kind {
-                                    ExprKind::List(citems) if !citems.is_empty() => {
-                                        let is_else = matches!(&citems[0].kind, ExprKind::Symbol(s) if s == "else");
-                                        if is_else {
-                                            if citems.len() == 1 {
-                                                return Ok(Value::Void);
-                                            }
-                                            for e in &citems[1..citems.len() - 1] {
-                                                eval(e, &cur_env)?;
-                                            }
-                                            tail = Some(citems[citems.len() - 1].clone());
-                                            break;
-                                        }
-                                        let test = eval(&citems[0], &cur_env)?;
-                                        if test.is_truthy() {
-                                            if citems.len() == 1 {
-                                                return Ok(test);
-                                            }
-                                            for e in &citems[1..citems.len() - 1] {
-                                                eval(e, &cur_env)?;
-                                            }
-                                            tail = Some(citems[citems.len() - 1].clone());
-                                            break;
-                                        }
-                                    }
-                                    _ => return Err(clause.wrap_err(EvalError::BadSyntax("cond: bad clause".into()))),
-                                }
-                            }
-                            match tail {
-                                Some(e) => { cur_expr = e; continue; }
-                                None => return Ok(Value::Void),
-                            }
-                        }
-                        "and" => {
-                            let args = &items[1..];
-                            if args.is_empty() {
-                                return Ok(Value::Boolean(true));
-                            }
-                            for a in &args[..args.len() - 1] {
-                                let result = eval(a, &cur_env)?;
-                                if !result.is_truthy() {
-                                    return Ok(result);
-                                }
-                            }
-                            cur_expr = args[args.len() - 1].clone();
-                            continue;
-                        }
-                        "or" => {
-                            let args = &items[1..];
-                            if args.is_empty() {
-                                return Ok(Value::Boolean(false));
-                            }
-                            for a in &args[..args.len() - 1] {
-                                let result = eval(a, &cur_env)?;
-                                if result.is_truthy() {
-                                    return Ok(result);
-                                }
-                            }
-                            cur_expr = args[args.len() - 1].clone();
-                            continue;
-                        }
-                        "let" => {
-                            let args = &items[1..];
-                            if args.len() < 2 {
-                                return Err(cur_expr.wrap_err(EvalError::BadSyntax("let: expected bindings and body".into())));
-                            }
-                            // Named let
-                            if let ExprKind::Symbol(name) = &args[0].kind {
-                                if args.len() < 3 {
-                                    return Err(cur_expr.wrap_err(EvalError::BadSyntax("let: expected bindings and body".into())));
-                                }
-                                let bindings = match &args[1].kind {
-                                    ExprKind::List(b) => b,
-                                    _ => return Err(cur_expr.wrap_err(EvalError::BadSyntax("let: expected binding list".into()))),
-                                };
-                                let mut param_names = Vec::new();
-                                let mut init_vals = Vec::new();
-                                for binding in bindings {
-                                    match &binding.kind {
-                                        ExprKind::List(pair) if pair.len() == 2 => {
-                                            let pname = match &pair[0].kind {
-                                                ExprKind::Symbol(s) => s.clone(),
-                                                _ => return Err(cur_expr.wrap_err(EvalError::BadSyntax("let: expected symbol".into()))),
-                                            };
-                                            init_vals.push(eval(&pair[1], &cur_env)?);
-                                            param_names.push(pname);
-                                        }
-                                        _ => return Err(cur_expr.wrap_err(EvalError::BadSyntax("let: bad binding".into()))),
-                                    }
-                                }
-                                let body = args[2..].to_vec();
-                                let local_env = new_env(Some(cur_env.clone()));
-                                let lambda = Value::Lambda {
-                                    params: param_names.clone(),
-                                    rest_param: None,
-                                    body,
-                                    env: local_env.clone(),
-                                };
-                                env_set(&local_env, name.clone(), lambda);
-                                for (p, v) in param_names.iter().zip(init_vals.iter()) {
-                                    env_set(&local_env, p.clone(), v.clone());
-                                }
-                                let body_exprs = &args[2..];
-                                if body_exprs.is_empty() {
-                                    return Ok(Value::Void);
-                                }
-                                for e in &body_exprs[..body_exprs.len() - 1] {
-                                    eval(e, &local_env)?;
-                                }
-                                cur_expr = body_exprs[body_exprs.len() - 1].clone();
-                                cur_env = local_env;
-                                continue;
-                            }
-                            // Regular let
-                            let bindings = match &args[0].kind {
-                                ExprKind::List(b) => b,
-                                _ => return Err(cur_expr.wrap_err(EvalError::BadSyntax("let: expected binding list".into()))),
-                            };
-                            let local_env = new_env(Some(cur_env.clone()));
-                            for binding in bindings {
-                                match &binding.kind {
-                                    ExprKind::List(pair) if pair.len() == 2 => {
-                                        let bname = match &pair[0].kind {
-                                            ExprKind::Symbol(s) => s.clone(),
-                                            _ => return Err(cur_expr.wrap_err(EvalError::BadSyntax("let: expected symbol in binding".into()))),
-                                        };
-                                        let val = eval(&pair[1], &cur_env)?;
-                                        env_set(&local_env, bname, val);
-                                    }
-                                    _ => return Err(cur_expr.wrap_err(EvalError::BadSyntax("let: bad binding".into()))),
-                                }
-                            }
-                            let body = &args[1..];
-                            if body.is_empty() {
-                                return Ok(Value::Void);
-                            }
-                            for e in &body[..body.len() - 1] {
-                                eval(e, &local_env)?;
-                            }
-                            cur_expr = body[body.len() - 1].clone();
-                            cur_env = local_env;
-                            continue;
-                        }
-                        _ => {}
-                    }
-                }
-                // Function application
-                let func = eval(&items[0], &cur_env)?;
-                let args: Result<Vec<Value>, _> =
-                    items[1..].iter().map(|a| eval(a, &cur_env)).collect();
-                let args = args?;
-                match func {
-                    Value::Builtin("apply", _) => {
-                        if args.len() < 2 {
-                            return Err(cur_expr.wrap_err(EvalError::Arity("apply: expected at least 2 arguments".into())));
-                        }
-                        let apply_func = args[0].clone();
-                        let last = &args[args.len() - 1];
-                        let mut final_args: Vec<Value> = args[1..args.len() - 1].to_vec();
-                        // Flatten the last argument (must be a list)
-                        let mut cur_list = last;
-                        loop {
-                            match cur_list {
-                                Value::Nil => break,
-                                Value::Pair(car, cdr) => {
-                                    final_args.push(*car.clone());
-                                    cur_list = cdr;
-                                }
-                                _ => return Err(cur_expr.wrap_err(EvalError::Type("apply: last argument must be a list".into()))),
-                            }
-                        }
-                        match apply_func {
-                            Value::Lambda { params, rest_param, body, env: closure_env } => {
-                                let local_env = bind_args(&cur_expr, &params, &rest_param, &final_args, closure_env)?;
-                                if body.is_empty() { return Ok(Value::Void); }
-                                for e in &body[..body.len() - 1] { eval(e, &local_env)?; }
-                                cur_expr = body[body.len() - 1].clone();
-                                cur_env = local_env;
-                                continue;
-                            }
-                            Value::Builtin(_, fp) => {
-                                return fp(&final_args).map_err(|e| cur_expr.wrap_err(e));
-                            }
-                            _ => return Err(cur_expr.wrap_err(EvalError::Type("apply: first argument must be a procedure".into()))),
-                        }
-                    }
-                    Value::Lambda { params, rest_param, body, env: closure_env } => {
-                        let local_env = bind_args(&cur_expr, &params, &rest_param, &args, closure_env)?;
-                        if body.is_empty() {
-                            return Ok(Value::Void);
-                        }
-                        for e in &body[..body.len() - 1] {
-                            eval(e, &local_env)?;
-                        }
-                        cur_expr = body[body.len() - 1].clone();
-                        cur_env = local_env;
-                        continue;
-                    }
-                    Value::Builtin(_, func_ptr) => {
-                        return func_ptr(&args).map_err(|e| cur_expr.wrap_err(e));
-                    }
-                    _ => {
-                        return Err(cur_expr.wrap_err(EvalError::Type(format!(
-                            "not a procedure: {}",
-                            func.display()
-                        ))));
-                    }
-                }
-            }
-        }
-    }
-}
-
-fn bind_args(form: &Expr, params: &[String], rest_param: &Option<String>, args: &[Value], closure_env: Env) -> Result<Env, EvalError> {
-    if let Some(ref _rp) = rest_param {
-        if args.len() < params.len() {
-            return Err(form.wrap_err(EvalError::Arity(format!(
-                "expected at least {} arguments, got {}",
-                params.len(), args.len()
-            ))));
-        }
-    } else if args.len() != params.len() {
-        return Err(form.wrap_err(EvalError::Arity(format!(
-            "expected {} arguments, got {}",
-            params.len(), args.len()
-        ))));
-    }
-    let local_env = new_env(Some(closure_env));
-    for (p, a) in params.iter().zip(args.iter()) {
-        env_set(&local_env, p.clone(), a.clone());
-    }
-    if let Some(ref rp) = rest_param {
-        let rest = builtin_list(&args[params.len()..]).unwrap();
-        env_set(&local_env, rp.clone(), rest);
-    }
-    Ok(local_env)
-}
-
-fn eval_define(form: &Expr, args: &[Expr], env: &Env) -> Result<Value, EvalError> {
-    if args.is_empty() {
-        return Err(form.wrap_err(EvalError::BadSyntax("define: missing name".into())));
-    }
-    match &args[0].kind {
-        ExprKind::Symbol(name) => {
-            if args.len() != 2 {
-                return Err(form.wrap_err(EvalError::BadSyntax("define: expected 2 parts".into())));
-            }
-            let val = eval(&args[1], env)?;
-            env_set(env, name.clone(), val);
-            Ok(Value::Void)
-        }
-        ExprKind::List(sig) => {
-            if sig.is_empty() {
-                return Err(form.wrap_err(EvalError::BadSyntax("define: empty signature".into())));
-            }
-            let name = match &sig[0].kind {
-                ExprKind::Symbol(n) => n.clone(),
-                _ => return Err(form.wrap_err(EvalError::BadSyntax("define: expected symbol".into()))),
-            };
-            let (params, rest_param) = parse_params(form, &sig[1..])?;
-            let body = args[1..].to_vec();
-            let lambda = Value::Lambda {
-                params,
-                rest_param,
-                body,
-                env: env.clone(),
-            };
-            env_set(env, name, lambda);
-            Ok(Value::Void)
-        }
-        _ => Err(form.wrap_err(EvalError::BadSyntax("define: bad syntax".into()))),
-    }
-}
-
-fn eval_quote(form: &Expr, args: &[Expr]) -> Result<Value, EvalError> {
-    if args.len() != 1 {
-        return Err(form.wrap_err(EvalError::BadSyntax("quote: expected 1 argument".into())));
-    }
-    expr_to_value(&args[0])
-}
-
-fn expr_to_value(expr: &Expr) -> Result<Value, EvalError> {
-    match &expr.kind {
-        ExprKind::Integer(n) => Ok(Value::Integer(*n)),
-        ExprKind::Boolean(b) => Ok(Value::Boolean(*b)),
-        ExprKind::Str(s) => Ok(Value::Str(s.clone())),
-        ExprKind::Char(c) => Ok(Value::Char(*c)),
-        ExprKind::Symbol(s) => Ok(Value::Symbol(s.clone())),
-        ExprKind::List(items) => {
-            let mut result = Value::Nil;
-            for item in items.iter().rev() {
-                let v = expr_to_value(item)?;
-                result = Value::Pair(Box::new(v), Box::new(result));
-            }
-            Ok(result)
-        }
-    }
-}
+// --- Helpers ---
 
 fn parse_params(form: &Expr, param_exprs: &[Expr]) -> Result<(Vec<String>, Option<String>), EvalError> {
     let mut params = Vec::new();
@@ -1213,7 +899,6 @@ fn eval_lambda(form: &Expr, args: &[Expr], env: &Env) -> Result<Value, EvalError
     let (params, rest_param) = match &args[0].kind {
         ExprKind::List(param_exprs) => parse_params(form, param_exprs)?,
         ExprKind::Symbol(s) => {
-            // (lambda args body) — single symbol catches all args
             (Vec::new(), Some(s.clone()))
         }
         _ => {
@@ -1230,53 +915,707 @@ fn eval_lambda(form: &Expr, args: &[Expr], env: &Env) -> Result<Value, EvalError
     })
 }
 
-fn eval_string_set(form: &Expr, args: &[Expr], env: &Env) -> Result<Value, EvalError> {
-    if args.len() != 3 {
-        return Err(form.wrap_err(EvalError::Arity("string-set! requires exactly 3 arguments".into())));
+fn eval_quote(form: &Expr, args: &[Expr]) -> Result<Value, EvalError> {
+    if args.len() != 1 {
+        return Err(form.wrap_err(EvalError::BadSyntax("quote: expected 1 argument".into())));
     }
-    let var_name = match &args[0].kind {
-        ExprKind::Symbol(name) => name.clone(),
-        _ => return Err(form.wrap_err(EvalError::Type("string-set!: first argument must be a variable".into()))),
-    };
-    let idx = eval(&args[1], env)?.as_integer()? as usize;
-    let ch = match eval(&args[2], env)? {
-        Value::Char(c) => c,
-        _ => return Err(form.wrap_err(EvalError::Type("string-set!: third argument must be a character".into()))),
-    };
-    let s = env_get(env, &var_name).map_err(|e| form.wrap_err(e))?;
-    match s {
-        Value::Str(mut string) => {
-            let mut chars: Vec<char> = string.chars().collect();
-            if idx >= chars.len() {
-                return Err(form.wrap_err(EvalError::Type("string-set!: index out of bounds".into())));
+    expr_to_value(&args[0])
+}
+
+fn expr_to_value(expr: &Expr) -> Result<Value, EvalError> {
+    match &expr.kind {
+        ExprKind::Integer(n) => Ok(Value::Integer(*n)),
+        ExprKind::Boolean(b) => Ok(Value::Boolean(*b)),
+        ExprKind::Str(s) => Ok(Value::Str(s.clone())),
+        ExprKind::Char(c) => Ok(Value::Char(*c)),
+        ExprKind::Symbol(s) => Ok(Value::Symbol(s.clone())),
+        ExprKind::List(items) => {
+            let mut result = Value::Nil;
+            for item in items.iter().rev() {
+                let v = expr_to_value(item)?;
+                result = Value::Pair(Box::new(v), Box::new(result));
             }
-            chars[idx] = ch;
-            string = chars.into_iter().collect();
-            env_update(env, &var_name, Value::Str(string)).map_err(|e| form.wrap_err(e))?;
-            Ok(Value::Void)
+            Ok(result)
         }
-        _ => Err(form.wrap_err(EvalError::Type("string-set!: expected string".into()))),
     }
 }
 
+fn bind_args(form: &Expr, params: &[String], rest_param: &Option<String>, args: &[Value], closure_env: Env) -> Result<Env, EvalError> {
+    if let Some(ref _rp) = rest_param {
+        if args.len() < params.len() {
+            return Err(form.wrap_err(EvalError::Arity(format!(
+                "expected at least {} arguments, got {}",
+                params.len(), args.len()
+            ))));
+        }
+    } else if args.len() != params.len() {
+        return Err(form.wrap_err(EvalError::Arity(format!(
+            "expected {} arguments, got {}",
+            params.len(), args.len()
+        ))));
+    }
+    let local_env = new_env(Some(closure_env));
+    for (p, a) in params.iter().zip(args.iter()) {
+        env_set(&local_env, p.clone(), a.clone());
+    }
+    if let Some(ref rp) = rest_param {
+        let rest = builtin_list(&args[params.len()..]).unwrap();
+        env_set(&local_env, rp.clone(), rest);
+    }
+    Ok(local_env)
+}
+
+fn parse_let_bindings(form: &Expr, bindings: &[Expr]) -> Result<Vec<(String, Expr)>, EvalError> {
+    let mut result = Vec::new();
+    for binding in bindings {
+        match &binding.kind {
+            ExprKind::List(pair) if pair.len() == 2 => {
+                let name = match &pair[0].kind {
+                    ExprKind::Symbol(s) => s.clone(),
+                    _ => return Err(form.wrap_err(EvalError::BadSyntax("let: expected symbol".into()))),
+                };
+                result.push((name, pair[1].clone()));
+            }
+            _ => return Err(form.wrap_err(EvalError::BadSyntax("let: bad binding".into()))),
+        }
+    }
+    Ok(result)
+}
+
+// --- CEK Machine ---
+
+enum State {
+    Eval(Expr, Env),
+    Apply(Value),
+}
+
+fn start_cond_clauses(form: &Expr, clauses: &[Expr], env: &Env, kont: &mut Rc<Kont>) -> Result<State, EvalError> {
+    if clauses.is_empty() {
+        return Ok(State::Apply(Value::Void));
+    }
+    let clause = &clauses[0];
+    match &clause.kind {
+        ExprKind::List(citems) if !citems.is_empty() => {
+            let is_else = matches!(&citems[0].kind, ExprKind::Symbol(s) if s == "else");
+            if is_else {
+                let body = &citems[1..];
+                Ok(eval_body_state(body, env.clone(), kont))
+            } else {
+                let body = citems[1..].to_vec();
+                let remaining = clauses[1..].to_vec();
+                *kont = Rc::new(Kont::CondTest {
+                    form: form.clone(),
+                    body,
+                    remaining_clauses: remaining,
+                    env: env.clone(),
+                    next: kont.clone(),
+                });
+                Ok(State::Eval(citems[0].clone(), env.clone()))
+            }
+        }
+        _ => Err(clause.wrap_err(EvalError::BadSyntax("cond: bad clause".into()))),
+    }
+}
+
+fn eval_body_state(body: &[Expr], env: Env, kont: &mut Rc<Kont>) -> State {
+    if body.is_empty() {
+        State::Apply(Value::Void)
+    } else if body.len() == 1 {
+        State::Eval(body[0].clone(), env)
+    } else {
+        *kont = Rc::new(Kont::Seq {
+            remaining: body[1..].to_vec(),
+            env: env.clone(),
+            next: kont.clone(),
+        });
+        State::Eval(body[0].clone(), env)
+    }
+}
+
+fn apply_function(func: Value, args: Vec<Value>, form: &Expr, kont: &mut Rc<Kont>) -> Result<State, EvalError> {
+    match func {
+        Value::Builtin("apply", _) => {
+            if args.len() < 2 {
+                return Err(form.wrap_err(EvalError::Arity("apply: expected at least 2 arguments".into())));
+            }
+            let actual_func = args[0].clone();
+            let last = &args[args.len() - 1];
+            let mut final_args: Vec<Value> = args[1..args.len() - 1].to_vec();
+            let mut cur_list = last;
+            loop {
+                match cur_list {
+                    Value::Nil => break,
+                    Value::Pair(car, cdr) => {
+                        final_args.push(*car.clone());
+                        cur_list = cdr;
+                    }
+                    _ => return Err(form.wrap_err(EvalError::Type("apply: last argument must be a list".into()))),
+                }
+            }
+            apply_function(actual_func, final_args, form, kont)
+        }
+        Value::Lambda { params, rest_param, body, env } => {
+            let local_env = bind_args(form, &params, &rest_param, &args, env)?;
+            Ok(eval_body_state(&body, local_env, kont))
+        }
+        Value::Builtin(_, fp) => {
+            let result = fp(&args).map_err(|e| form.wrap_err(e))?;
+            Ok(State::Apply(result))
+        }
+        Value::CallCC => {
+            if args.len() != 1 {
+                return Err(form.wrap_err(EvalError::Arity("call/cc requires exactly 1 argument".into())));
+            }
+            let cont_value = Value::Continuation(kont.clone());
+            let proc = args.into_iter().next().unwrap();
+            apply_function(proc, vec![cont_value], form, kont)
+        }
+        Value::Continuation(saved_kont) => {
+            if args.len() != 1 {
+                return Err(form.wrap_err(EvalError::Arity("continuation requires exactly 1 argument".into())));
+            }
+            *kont = saved_kont;
+            Ok(State::Apply(args.into_iter().next().unwrap()))
+        }
+        _ => Err(form.wrap_err(EvalError::Type(format!(
+            "not a procedure: {}",
+            func.display()
+        )))),
+    }
+}
+
+fn eval_cek(initial_expr: Expr, initial_env: Env, initial_kont: Rc<Kont>) -> Result<Value, EvalError> {
+    let mut state = State::Eval(initial_expr, initial_env);
+    let mut kont = initial_kont;
+
+    loop {
+        match state {
+            State::Eval(expr, env) => {
+                state = match expr.kind.clone() {
+                    ExprKind::Integer(n) => State::Apply(Value::Integer(n)),
+                    ExprKind::Boolean(b) => State::Apply(Value::Boolean(b)),
+                    ExprKind::Str(s) => State::Apply(Value::Str(s)),
+                    ExprKind::Char(c) => State::Apply(Value::Char(c)),
+                    ExprKind::Symbol(name) => {
+                        let val = env_get(&env, &name).map_err(|e| expr.wrap_err(e))?;
+                        State::Apply(val)
+                    }
+                    ExprKind::List(items) => {
+                        if items.is_empty() {
+                            return Err(expr.wrap_err(EvalError::BadSyntax("empty application".into())));
+                        }
+
+                        // Check for special forms
+                        let is_special = matches!(&items[0].kind, ExprKind::Symbol(ref s)
+                            if matches!(s.as_str(), "define" | "quote" | "lambda" | "set!" |
+                                "if" | "begin" | "cond" | "and" | "or" | "let" | "string-set!"));
+
+                        if is_special {
+                            if let ExprKind::Symbol(ref op) = items[0].kind {
+                                match op.as_str() {
+                                    "define" => {
+                                        let args = &items[1..];
+                                        if args.is_empty() {
+                                            return Err(expr.wrap_err(EvalError::BadSyntax("define: missing name".into())));
+                                        }
+                                        match &args[0].kind {
+                                            ExprKind::Symbol(name) => {
+                                                if args.len() != 2 {
+                                                    return Err(expr.wrap_err(EvalError::BadSyntax("define: expected 2 parts".into())));
+                                                }
+                                                kont = Rc::new(Kont::Define { name: name.clone(), env: env.clone(), next: kont });
+                                                State::Eval(args[1].clone(), env)
+                                            }
+                                            ExprKind::List(sig) => {
+                                                if sig.is_empty() {
+                                                    return Err(expr.wrap_err(EvalError::BadSyntax("define: empty signature".into())));
+                                                }
+                                                let name = match &sig[0].kind {
+                                                    ExprKind::Symbol(n) => n.clone(),
+                                                    _ => return Err(expr.wrap_err(EvalError::BadSyntax("define: expected symbol".into()))),
+                                                };
+                                                let (params, rest_param) = parse_params(&expr, &sig[1..])?;
+                                                let body = args[1..].to_vec();
+                                                let lambda = Value::Lambda { params, rest_param, body, env: env.clone() };
+                                                env_set(&env, name, lambda);
+                                                State::Apply(Value::Void)
+                                            }
+                                            _ => return Err(expr.wrap_err(EvalError::BadSyntax("define: bad syntax".into()))),
+                                        }
+                                    }
+                                    "quote" => {
+                                        let val = eval_quote(&expr, &items[1..])?;
+                                        State::Apply(val)
+                                    }
+                                    "lambda" => {
+                                        let val = eval_lambda(&expr, &items[1..], &env)?;
+                                        State::Apply(val)
+                                    }
+                                    "set!" => {
+                                        let args = &items[1..];
+                                        if args.len() != 2 {
+                                            return Err(expr.wrap_err(EvalError::BadSyntax("set! requires exactly 2 arguments".into())));
+                                        }
+                                        let name = match &args[0].kind {
+                                            ExprKind::Symbol(n) => n.clone(),
+                                            _ => return Err(expr.wrap_err(EvalError::BadSyntax("set!: first argument must be a variable".into()))),
+                                        };
+                                        kont = Rc::new(Kont::Set { form: expr.clone(), name, env: env.clone(), next: kont });
+                                        State::Eval(args[1].clone(), env)
+                                    }
+                                    "if" => {
+                                        let args = &items[1..];
+                                        if args.len() < 2 || args.len() > 3 {
+                                            return Err(expr.wrap_err(EvalError::BadSyntax("if: expected 2 or 3 parts".into())));
+                                        }
+                                        kont = Rc::new(Kont::If {
+                                            then_expr: args[1].clone(),
+                                            else_expr: args.get(2).cloned(),
+                                            env: env.clone(),
+                                            next: kont,
+                                        });
+                                        State::Eval(args[0].clone(), env)
+                                    }
+                                    "begin" => {
+                                        let args = &items[1..];
+                                        eval_body_state(args, env, &mut kont)
+                                    }
+                                    "cond" => {
+                                        start_cond_clauses(&expr, &items[1..], &env, &mut kont)?
+                                    }
+                                    "and" => {
+                                        let args = &items[1..];
+                                        if args.is_empty() {
+                                            State::Apply(Value::Boolean(true))
+                                        } else if args.len() == 1 {
+                                            State::Eval(args[0].clone(), env)
+                                        } else {
+                                            kont = Rc::new(Kont::And {
+                                                remaining: args[1..].to_vec(),
+                                                env: env.clone(),
+                                                next: kont,
+                                            });
+                                            State::Eval(args[0].clone(), env)
+                                        }
+                                    }
+                                    "or" => {
+                                        let args = &items[1..];
+                                        if args.is_empty() {
+                                            State::Apply(Value::Boolean(false))
+                                        } else if args.len() == 1 {
+                                            State::Eval(args[0].clone(), env)
+                                        } else {
+                                            kont = Rc::new(Kont::Or {
+                                                remaining: args[1..].to_vec(),
+                                                env: env.clone(),
+                                                next: kont,
+                                            });
+                                            State::Eval(args[0].clone(), env)
+                                        }
+                                    }
+                                    "let" => {
+                                        let args = &items[1..];
+                                        if args.len() < 2 {
+                                            return Err(expr.wrap_err(EvalError::BadSyntax("let: expected bindings and body".into())));
+                                        }
+                                        // Named let
+                                        if let ExprKind::Symbol(ref loop_name) = args[0].kind {
+                                            if args.len() < 3 {
+                                                return Err(expr.wrap_err(EvalError::BadSyntax("let: expected bindings and body".into())));
+                                            }
+                                            let bindings_expr = match &args[1].kind {
+                                                ExprKind::List(b) => b,
+                                                _ => return Err(expr.wrap_err(EvalError::BadSyntax("let: expected binding list".into()))),
+                                            };
+                                            let parsed = parse_let_bindings(&expr, bindings_expr)?;
+                                            let body = args[2..].to_vec();
+                                            if parsed.is_empty() {
+                                                let local_env = new_env(Some(env.clone()));
+                                                let lambda = Value::Lambda { params: vec![], rest_param: None, body: body.clone(), env: local_env.clone() };
+                                                env_set(&local_env, loop_name.clone(), lambda);
+                                                eval_body_state(&body, local_env, &mut kont)
+                                            } else {
+                                                let (first_name, first_expr) = parsed[0].clone();
+                                                let remaining = parsed[1..].to_vec();
+                                                kont = Rc::new(Kont::NamedLetBind {
+                                                    form: expr.clone(),
+                                                    loop_name: loop_name.clone(),
+                                                    eval_env: env.clone(),
+                                                    done: Vec::new(),
+                                                    current_name: first_name,
+                                                    remaining,
+                                                    body,
+                                                    next: kont,
+                                                });
+                                                State::Eval(first_expr, env)
+                                            }
+                                        } else {
+                                            // Regular let
+                                            let bindings_expr = match &args[0].kind {
+                                                ExprKind::List(b) => b,
+                                                _ => return Err(expr.wrap_err(EvalError::BadSyntax("let: expected binding list".into()))),
+                                            };
+                                            let parsed = parse_let_bindings(&expr, bindings_expr)?;
+                                            let body = args[1..].to_vec();
+                                            if parsed.is_empty() {
+                                                let local_env = new_env(Some(env.clone()));
+                                                eval_body_state(&body, local_env, &mut kont)
+                                            } else {
+                                                let (first_name, first_expr) = parsed[0].clone();
+                                                let remaining = parsed[1..].to_vec();
+                                                kont = Rc::new(Kont::LetBind {
+                                                    form: expr.clone(),
+                                                    eval_env: env.clone(),
+                                                    done: Vec::new(),
+                                                    current_name: first_name,
+                                                    remaining,
+                                                    body,
+                                                    next: kont,
+                                                });
+                                                State::Eval(first_expr, env)
+                                            }
+                                        }
+                                    }
+                                    "string-set!" => {
+                                        let args = &items[1..];
+                                        if args.len() != 3 {
+                                            return Err(expr.wrap_err(EvalError::Arity("string-set! requires exactly 3 arguments".into())));
+                                        }
+                                        let var_name = match &args[0].kind {
+                                            ExprKind::Symbol(name) => name.clone(),
+                                            _ => return Err(expr.wrap_err(EvalError::Type("string-set!: first argument must be a variable".into()))),
+                                        };
+                                        kont = Rc::new(Kont::StringSetIdx {
+                                            form: expr.clone(),
+                                            var_name,
+                                            char_expr: args[2].clone(),
+                                            env: env.clone(),
+                                            next: kont,
+                                        });
+                                        State::Eval(args[1].clone(), env)
+                                    }
+                                    _ => unreachable!(),
+                                }
+                            } else {
+                                unreachable!()
+                            }
+                        } else {
+                            // Function application
+                            if items.len() == 1 {
+                                // No args - eval operator then apply with empty args
+                                kont = Rc::new(Kont::Operator {
+                                    form: expr.clone(),
+                                    args: vec![],
+                                    env: env.clone(),
+                                    next: kont,
+                                });
+                                State::Eval(items[0].clone(), env)
+                            } else {
+                                kont = Rc::new(Kont::Operator {
+                                    form: expr.clone(),
+                                    args: items[1..].to_vec(),
+                                    env: env.clone(),
+                                    next: kont,
+                                });
+                                State::Eval(items[0].clone(), env)
+                            }
+                        }
+                    }
+                };
+            }
+            State::Apply(value) => {
+                // Take ownership of current continuation
+                let old_kont = std::mem::replace(&mut kont, Rc::new(Kont::Done));
+                let k = match Rc::try_unwrap(old_kont) {
+                    Ok(k) => k,
+                    Err(rc) => (*rc).clone(),
+                };
+
+                state = match k {
+                    Kont::Done => return Ok(value),
+
+                    Kont::Define { name, env, next } => {
+                        env_set(&env, name, value);
+                        kont = next;
+                        State::Apply(Value::Void)
+                    }
+
+                    Kont::Set { form, name, env, next } => {
+                        env_update(&env, &name, value).map_err(|e| form.wrap_err(e))?;
+                        kont = next;
+                        State::Apply(Value::Void)
+                    }
+
+                    Kont::If { then_expr, else_expr, env, next } => {
+                        kont = next;
+                        if value.is_truthy() {
+                            State::Eval(then_expr, env)
+                        } else if let Some(e) = else_expr {
+                            State::Eval(e, env)
+                        } else {
+                            State::Apply(Value::Void)
+                        }
+                    }
+
+                    Kont::Seq { remaining, env, next } => {
+                        // Discard value, evaluate remaining
+                        if remaining.len() == 1 {
+                            kont = next;
+                            State::Eval(remaining.into_iter().next().unwrap(), env)
+                        } else {
+                            let first = remaining[0].clone();
+                            kont = Rc::new(Kont::Seq {
+                                remaining: remaining[1..].to_vec(),
+                                env: env.clone(),
+                                next,
+                            });
+                            State::Eval(first, env)
+                        }
+                    }
+
+                    Kont::And { remaining, env, next } => {
+                        if !value.is_truthy() {
+                            kont = next;
+                            State::Apply(value)
+                        } else if remaining.len() == 1 {
+                            kont = next;
+                            State::Eval(remaining.into_iter().next().unwrap(), env)
+                        } else {
+                            let first = remaining[0].clone();
+                            kont = Rc::new(Kont::And {
+                                remaining: remaining[1..].to_vec(),
+                                env: env.clone(),
+                                next,
+                            });
+                            State::Eval(first, env)
+                        }
+                    }
+
+                    Kont::Or { remaining, env, next } => {
+                        if value.is_truthy() {
+                            kont = next;
+                            State::Apply(value)
+                        } else if remaining.len() == 1 {
+                            kont = next;
+                            State::Eval(remaining.into_iter().next().unwrap(), env)
+                        } else {
+                            let first = remaining[0].clone();
+                            kont = Rc::new(Kont::Or {
+                                remaining: remaining[1..].to_vec(),
+                                env: env.clone(),
+                                next,
+                            });
+                            State::Eval(first, env)
+                        }
+                    }
+
+                    Kont::CondTest { form, body, remaining_clauses, env, next } => {
+                        if value.is_truthy() {
+                            if body.is_empty() {
+                                kont = next;
+                                State::Apply(value)
+                            } else {
+                                kont = next;
+                                eval_body_state(&body, env, &mut kont)
+                            }
+                        } else {
+                            kont = next;
+                            start_cond_clauses(&form, &remaining_clauses, &env, &mut kont)?
+                        }
+                    }
+
+                    Kont::Operator { form, args, env, next } => {
+                        let func = value;
+                        kont = next;
+                        if args.is_empty() {
+                            apply_function(func, vec![], &form, &mut kont)?
+                        } else {
+                            // Evaluate arguments right-to-left so that continuations
+                            // captured by call/cc re-evaluate preceding arguments
+                            let last_idx = args.len() - 1;
+                            let last_expr = args[last_idx].clone();
+                            let before = args[..last_idx].to_vec();
+                            kont = Rc::new(Kont::Arg {
+                                form,
+                                func,
+                                collected: Vec::new(),
+                                before_exprs: before,
+                                env: env.clone(),
+                                next: kont,
+                            });
+                            State::Eval(last_expr, env)
+                        }
+                    }
+
+                    Kont::Arg { form, func, mut collected, mut before_exprs, env, next } => {
+                        collected.push(value);
+                        if before_exprs.is_empty() {
+                            // All args collected (in reverse order). Reverse for correct order.
+                            collected.reverse();
+                            kont = next;
+                            apply_function(func, collected, &form, &mut kont)?
+                        } else {
+                            // Evaluate the rightmost remaining expression
+                            let next_expr = before_exprs.pop().unwrap();
+                            kont = Rc::new(Kont::Arg {
+                                form,
+                                func,
+                                collected,
+                                before_exprs,
+                                env: env.clone(),
+                                next,
+                            });
+                            State::Eval(next_expr, env)
+                        }
+                    }
+
+                    Kont::LetBind { form, eval_env, mut done, current_name, remaining, body, next } => {
+                        done.push((current_name, value));
+                        if remaining.is_empty() {
+                            let local_env = new_env(Some(eval_env));
+                            for (n, v) in done {
+                                env_set(&local_env, n, v);
+                            }
+                            kont = next;
+                            eval_body_state(&body, local_env, &mut kont)
+                        } else {
+                            let (next_name, next_expr) = remaining[0].clone();
+                            kont = Rc::new(Kont::LetBind {
+                                form,
+                                eval_env: eval_env.clone(),
+                                done,
+                                current_name: next_name,
+                                remaining: remaining[1..].to_vec(),
+                                body,
+                                next,
+                            });
+                            State::Eval(next_expr, eval_env)
+                        }
+                    }
+
+                    Kont::NamedLetBind { form, loop_name, eval_env, mut done, current_name, remaining, body, next } => {
+                        done.push((current_name, value));
+                        if remaining.is_empty() {
+                            let local_env = new_env(Some(eval_env));
+                            let param_names: Vec<String> = done.iter().map(|(n, _)| n.clone()).collect();
+                            let lambda = Value::Lambda {
+                                params: param_names,
+                                rest_param: None,
+                                body: body.clone(),
+                                env: local_env.clone(),
+                            };
+                            env_set(&local_env, loop_name, lambda);
+                            for (n, v) in done {
+                                env_set(&local_env, n, v);
+                            }
+                            kont = next;
+                            eval_body_state(&body, local_env, &mut kont)
+                        } else {
+                            let (next_name, next_expr) = remaining[0].clone();
+                            kont = Rc::new(Kont::NamedLetBind {
+                                form,
+                                loop_name,
+                                eval_env: eval_env.clone(),
+                                done,
+                                current_name: next_name,
+                                remaining: remaining[1..].to_vec(),
+                                body,
+                                next,
+                            });
+                            State::Eval(next_expr, eval_env)
+                        }
+                    }
+
+                    Kont::StringSetIdx { form, var_name, char_expr, env, next } => {
+                        let idx = value.as_integer().map_err(|e| form.wrap_err(e))? as usize;
+                        kont = Rc::new(Kont::StringSetChar {
+                            form,
+                            var_name,
+                            idx,
+                            env: env.clone(),
+                            next,
+                        });
+                        State::Eval(char_expr, env)
+                    }
+
+                    Kont::StringSetChar { form, var_name, idx, env, next } => {
+                        let ch = match value {
+                            Value::Char(c) => c,
+                            _ => return Err(form.wrap_err(EvalError::Type("string-set!: third argument must be a character".into()))),
+                        };
+                        let s = env_get(&env, &var_name).map_err(|e| form.wrap_err(e))?;
+                        match s {
+                            Value::Str(string) => {
+                                let mut chars: Vec<char> = string.chars().collect();
+                                if idx >= chars.len() {
+                                    return Err(form.wrap_err(EvalError::Type("string-set!: index out of bounds".into())));
+                                }
+                                chars[idx] = ch;
+                                let new_string: String = chars.into_iter().collect();
+                                env_update(&env, &var_name, Value::Str(new_string)).map_err(|e| form.wrap_err(e))?;
+                                kont = next;
+                                State::Apply(Value::Void)
+                            }
+                            _ => return Err(form.wrap_err(EvalError::Type("string-set!: expected string".into()))),
+                        }
+                    }
+                };
+            }
+        }
+    }
+}
+
+// --- Public API ---
+
 pub fn eval_str(input: &str) -> Result<String, EvalError> {
     let exprs = parse(input)?;
-    let env = default_env();
-    let mut result = Value::Boolean(false);
-    for expr in &exprs {
-        result = eval(expr, &env)?;
+    if exprs.is_empty() {
+        return Ok(Value::Boolean(false).display());
     }
-    Ok(result.display())
+    let env = default_env();
+    let done = Rc::new(Kont::Done);
+    // Wrap all exprs as a sequence: evaluate each, return last
+    if exprs.len() == 1 {
+        let result = eval_cek(exprs.into_iter().next().unwrap(), env, done)?;
+        Ok(result.display())
+    } else {
+        let mut kont = done;
+        let mut iter = exprs.into_iter();
+        let first = iter.next().unwrap();
+        let remaining: Vec<Expr> = iter.collect();
+        kont = Rc::new(Kont::Seq {
+            remaining,
+            env: env.clone(),
+            next: kont,
+        });
+        let result = eval_cek(first, env, kont)?;
+        Ok(result.display())
+    }
 }
 
 pub fn eval_str_with_output(input: &str) -> Result<(String, String), EvalError> {
     OUTPUT_BUFFER.with(|buf| buf.borrow_mut().clear());
     let exprs = parse(input)?;
-    let env = default_env();
-    let mut result = Value::Boolean(false);
-    for expr in &exprs {
-        result = eval(expr, &env)?;
+    if exprs.is_empty() {
+        let output = OUTPUT_BUFFER.with(|buf| buf.borrow().clone());
+        return Ok((Value::Boolean(false).display(), output));
     }
+    let env = default_env();
+    let done = Rc::new(Kont::Done);
+    let result = if exprs.len() == 1 {
+        eval_cek(exprs.into_iter().next().unwrap(), env, done)?
+    } else {
+        let mut kont = done;
+        let mut iter = exprs.into_iter();
+        let first = iter.next().unwrap();
+        let remaining: Vec<Expr> = iter.collect();
+        kont = Rc::new(Kont::Seq {
+            remaining,
+            env: env.clone(),
+            next: kont,
+        });
+        eval_cek(first, env, kont)?
+    };
     let output = OUTPUT_BUFFER.with(|buf| buf.borrow().clone());
     Ok((result.display(), output))
 }
