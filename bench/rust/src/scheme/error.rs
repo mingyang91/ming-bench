@@ -33,6 +33,9 @@ pub enum ErrorKind {
 
     #[error("string is immutable")]
     ImmutableString,
+
+    #[error("unhandled exception: {value}")]
+    UserRaise { value: String },
 }
 
 /// Evaluation error with optional source position.

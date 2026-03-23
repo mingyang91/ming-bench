@@ -25,6 +25,22 @@ enum WindOp {
     CallInAndPush(WindEntry),
 }
 
+/// An exception handler entry.
+#[derive(Clone)]
+enum HandlerEntry {
+    /// Installed by `with-exception-handler`.
+    WithExceptionHandler { handler: Value },
+    /// Installed by `guard`.
+    Guard {
+        var: String,
+        clauses: Vec<Expr>,
+        env: Rc<Env>,
+        guard_k: Vec<Frame>,
+        guard_wind: Vec<WindEntry>,
+        guard_handlers: Vec<HandlerEntry>,
+    },
+}
+
 /// A frame on the explicit continuation stack (CEK machine).
 #[derive(Clone)]
 enum Frame {
@@ -116,6 +132,22 @@ enum Frame {
         env: Rc<Env>,
         span: Span,
     },
+    /// Pop exception handler when guard/with-exception-handler body returns normally.
+    PopHandler,
+    /// After guard wind transfer completes, test guard clauses.
+    GuardClauseTest {
+        var: String,
+        raised_val: Value,
+        clauses: Vec<Expr>,
+        env: Rc<Env>,
+    },
+    /// After evaluating a guard clause test, dispatch on result.
+    GuardClauseDispatch {
+        clause_body: Vec<Expr>,
+        rest_clauses: Vec<Expr>,
+        raised_val: Value,
+        env: Rc<Env>,
+    },
 }
 
 /// CEK machine state.
@@ -135,8 +167,9 @@ pub fn eval_top_level(exprs: &[Expr], env: &Rc<Env>) -> Result<Value, EvalError>
     let mut k: Vec<Frame> = Vec::new();
     let mut wind: Vec<WindEntry> = Vec::new();
     let mut wind_id: u64 = 0;
+    let mut handlers: Vec<HandlerEntry> = Vec::new();
     let mut state = begin_seq(exprs, env, &mut k);
-    run_loop(&mut state, &mut k, &mut wind, &mut wind_id)
+    run_loop(&mut state, &mut k, &mut wind, &mut wind_id, &mut handlers)
 }
 
 // ── main loop ────────────────────────────────────────────────
@@ -146,16 +179,17 @@ fn run_loop(
     k: &mut Vec<Frame>,
     wind: &mut Vec<WindEntry>,
     wind_id: &mut u64,
+    handlers: &mut Vec<HandlerEntry>,
 ) -> Result<Value, EvalError> {
     loop {
         *state = match std::mem::replace(state, State::Ret(Value::Void)) {
-            State::Eval(expr, env) => step_eval(expr, &env, k)?,
+            State::Eval(expr, env) => step_eval(expr, &env, k, wind, handlers)?,
             State::Apply(func, args, env, span) => {
-                step_apply(func, args, &env, k, wind, wind_id, span)
+                step_apply(func, args, &env, k, (wind, wind_id), span, handlers)
                     .map_err(|e| e.with_span(span))?
             }
             State::Ret(val) => match k.pop() {
-                Some(frame) => step_ret(val, frame, k, wind)?,
+                Some(frame) => step_ret(val, frame, k, wind, handlers)?,
                 None => return Ok(val),
             },
         };
@@ -173,7 +207,7 @@ fn begin_seq(exprs: &[Expr], env: &Rc<Env>, k: &mut Vec<Frame>) -> State {
 
 // ── step_eval ────────────────────────────────────────────────
 
-fn step_eval(expr: Expr, env: &Rc<Env>, k: &mut Vec<Frame>) -> Result<State, EvalError> {
+fn step_eval(expr: Expr, env: &Rc<Env>, k: &mut Vec<Frame>, wind: &[WindEntry], handlers: &mut Vec<HandlerEntry>) -> Result<State, EvalError> {
     let span = expr.span;
     let result = match expr.kind {
         ExprKind::Integer(n) => Ok(State::Ret(Value::Integer(n))),
@@ -184,7 +218,7 @@ fn step_eval(expr: Expr, env: &Rc<Env>, k: &mut Vec<Frame>) -> Result<State, Eva
             .get(&name)
             .map(State::Ret)
             .ok_or_else(|| EvalError::from(ErrorKind::UnboundVariable { name })),
-        ExprKind::List(elems) => step_eval_list(elems, env, k, span),
+        ExprKind::List(elems) => step_eval_list(elems, env, k, span, wind, handlers),
     };
     result.map_err(|e| e.with_span(span))
 }
@@ -194,6 +228,8 @@ fn step_eval_list(
     env: &Rc<Env>,
     k: &mut Vec<Frame>,
     span: Span,
+    wind: &[WindEntry],
+    handlers: &mut Vec<HandlerEntry>,
 ) -> Result<State, EvalError> {
     if elems.is_empty() {
         return Ok(State::Ret(Value::List(Vec::new())));
@@ -215,6 +251,7 @@ fn step_eval_list(
             "letrec*" => return step_letrec_star(&elems[1..], env, k),
             "do" => return step_do(&elems[1..], env, k),
             "define-syntax" => return step_define_syntax(&elems[1..], env),
+            "guard" => return step_guard(&elems[1..], env, k, wind, handlers),
             _ => {}
         }
         // Check for macro invocation
@@ -787,9 +824,109 @@ fn parse_syntax_rules(expr: &Expr, env: &Rc<Env>) -> Result<Value, EvalError> {
     })
 }
 
+// ── guard special form ───────────────────────────────────────
+
+fn step_guard(
+    args: &[Expr],
+    env: &Rc<Env>,
+    k: &mut Vec<Frame>,
+    wind: &[WindEntry],
+    handlers: &mut Vec<HandlerEntry>,
+) -> Result<State, EvalError> {
+    if args.len() < 2 {
+        return Err(ErrorKind::BadSyntax {
+            form: "guard".into(),
+            message: "expected (guard (var clause ...) body ...)".into(),
+        }
+        .into());
+    }
+    let header = match &args[0].kind {
+        ExprKind::List(elems) if elems.len() >= 2 => elems,
+        _ => {
+            return Err(ErrorKind::BadSyntax {
+                form: "guard".into(),
+                message: "expected (guard (var clause ...) body ...)".into(),
+            }
+            .into())
+        }
+    };
+    let var = match &header[0].kind {
+        ExprKind::Symbol(s) => s.clone(),
+        _ => {
+            return Err(ErrorKind::BadSyntax {
+                form: "guard".into(),
+                message: "guard variable must be a symbol".into(),
+            }
+            .into())
+        }
+    };
+    let clauses = header[1..].to_vec();
+    let body = args[1..].to_vec();
+
+    // Save guard continuation state (before pushing PopHandler)
+    let guard_k = k.clone();
+    let guard_wind = wind.to_vec();
+    let guard_handlers = handlers.clone();
+
+    // Push PopHandler so normal body return pops the handler
+    k.push(Frame::PopHandler);
+
+    // Install guard handler
+    handlers.push(HandlerEntry::Guard {
+        var,
+        clauses,
+        env: Rc::clone(env),
+        guard_k,
+        guard_wind,
+        guard_handlers,
+    });
+
+    // Evaluate body
+    if body.is_empty() {
+        Ok(State::Ret(Value::Void))
+    } else {
+        Ok(begin_seq(&body, env, k))
+    }
+}
+
+fn step_guard_clauses(
+    raised_val: &Value,
+    clauses: &[Expr],
+    env: &Rc<Env>,
+    k: &mut Vec<Frame>,
+) -> Result<State, EvalError> {
+    if clauses.is_empty() {
+        return Err(ErrorKind::UserRaise {
+            value: raised_val.to_display_string(),
+        }
+        .into());
+    }
+    match &clauses[0].kind {
+        ExprKind::List(elems) if !elems.is_empty() => {
+            if let ExprKind::Symbol(s) = &elems[0].kind {
+                if s == "else" {
+                    return Ok(begin_seq(&elems[1..], env, k));
+                }
+            }
+            k.push(Frame::GuardClauseDispatch {
+                clause_body: elems[1..].to_vec(),
+                rest_clauses: clauses[1..].to_vec(),
+                raised_val: raised_val.clone(),
+                env: Rc::clone(env),
+            });
+            Ok(State::Eval(elems[0].clone(), Rc::clone(env)))
+        }
+        _ => Err(ErrorKind::BadSyntax {
+            form: "guard".into(),
+            message: "invalid guard clause".into(),
+        }
+        .into()),
+    }
+}
+
 // ── step_ret ─────────────────────────────────────────────────
 
-fn step_ret(val: Value, frame: Frame, k: &mut Vec<Frame>, wind: &mut Vec<WindEntry>) -> Result<State, EvalError> {
+fn step_ret(val: Value, frame: Frame, k: &mut Vec<Frame>, wind: &mut Vec<WindEntry>, handlers: &mut Vec<HandlerEntry>) -> Result<State, EvalError> {
     match frame {
         Frame::CallFunc { arg_exprs, env, span } => {
             if arg_exprs.is_empty() {
@@ -1027,6 +1164,28 @@ fn step_ret(val: Value, frame: Frame, k: &mut Vec<Frame>, wind: &mut Vec<WindEnt
         Frame::DoInit { .. }
         | Frame::DoTest { .. }
         | Frame::DoStep { .. } => step_ret_do(val, frame, k),
+        Frame::DynamicWindAfterIn { .. }
+        | Frame::DynamicWindAfterBody { .. }
+        | Frame::DynamicWindAfterOut { .. }
+        | Frame::WindTransfer { .. }
+        | Frame::PopHandler
+        | Frame::GuardClauseTest { .. }
+        | Frame::GuardClauseDispatch { .. } => {
+            step_ret_wind(val, frame, k, wind, handlers)
+        }
+    }
+}
+
+// ── step_ret_wind (dynamic-wind / guard continuation frames) ─
+
+fn step_ret_wind(
+    val: Value,
+    frame: Frame,
+    k: &mut Vec<Frame>,
+    wind: &mut Vec<WindEntry>,
+    handlers: &mut Vec<HandlerEntry>,
+) -> Result<State, EvalError> {
+    match frame {
         Frame::DynamicWindAfterIn {
             body_thunk,
             out_thunk,
@@ -1077,29 +1236,39 @@ fn step_ret(val: Value, frame: Frame, k: &mut Vec<Frame>, wind: &mut Vec<WindEnt
                     }
                     WindOp::CallInAndPush(entry) => {
                         let in_thunk = entry.in_thunk.clone();
-                        // After in-thunk returns, push wind entry, then continue transfer
                         k.push(Frame::WindTransfer {
                             ops,
                             final_val,
                             env: Rc::clone(&env),
                             span,
                         });
-                        // We need to push the wind entry after the in-thunk runs.
-                        // Use DynamicWindAfterIn with a dummy body that just returns void,
-                        // but actually we just need a simple "push wind entry" frame.
-                        // Let's push a special marker: we'll push the entry onto wind
-                        // right before calling the in-thunk's continuation.
-                        // Simplest: push the entry now (before in-thunk runs).
-                        // R7RS says in-thunk is called when entering the extent,
-                        // so the entry should be active after in-thunk completes.
-                        // For simplicity and correctness with the test cases,
-                        // push entry after in-thunk returns by using a helper frame.
                         wind.push(entry);
                         Ok(State::Apply(in_thunk, Vec::new(), env, span))
                     }
                 }
             }
         }
+        Frame::PopHandler => {
+            handlers.pop();
+            Ok(State::Ret(val))
+        }
+        Frame::GuardClauseTest { var, raised_val, clauses, env } => {
+            // Ignore val (from wind transfer); test guard clauses
+            let guard_env = Env::extend(&env, vec![var], vec![raised_val.clone()]);
+            step_guard_clauses(&raised_val, &clauses, &guard_env, k)
+        }
+        Frame::GuardClauseDispatch { clause_body, rest_clauses, raised_val, env } => {
+            if val.is_truthy() {
+                if clause_body.is_empty() {
+                    Ok(State::Ret(val))
+                } else {
+                    Ok(begin_seq(&clause_body, &env, k))
+                }
+            } else {
+                step_guard_clauses(&raised_val, &rest_clauses, &env, k)
+            }
+        }
+        _ => unreachable!("step_ret_wind called with non-wind frame"),
     }
 }
 
@@ -1295,10 +1464,11 @@ fn step_apply(
     args: Vec<Value>,
     env: &Rc<Env>,
     k: &mut Vec<Frame>,
-    wind: &mut Vec<WindEntry>,
-    wind_id: &mut u64,
+    wind_state: (&mut Vec<WindEntry>, &mut u64),
     span: Span,
+    handlers: &mut Vec<HandlerEntry>,
 ) -> Result<State, EvalError> {
+    let (wind, wind_id) = wind_state;
     match func {
         Value::Builtin(ref name) => match name.as_str() {
             "apply" => {
@@ -1371,7 +1541,7 @@ fn step_apply(
                     .into());
                 }
                 let proc = args.into_iter().next().expect("checked len");
-                let captured = CapturedCont(Rc::new((k.clone(), wind.clone())));
+                let captured = CapturedCont(Rc::new((k.clone(), wind.clone(), handlers.clone())));
                 let cont_val = Value::Continuation(captured);
                 Ok(State::Apply(proc, vec![cont_val], Rc::clone(env), span))
             }
@@ -1403,6 +1573,96 @@ fn step_apply(
                 // Call in-thunk with no args
                 Ok(State::Apply(in_thunk, Vec::new(), Rc::clone(env), span))
             }
+            "raise" => {
+                if args.len() != 1 {
+                    return Err(ErrorKind::WrongArgCount {
+                        expected: 1,
+                        got: args.len(),
+                    }
+                    .into());
+                }
+                let raised_val = args.into_iter().next().expect("checked len");
+                if let Some(handler_entry) = handlers.pop() {
+                    match handler_entry {
+                        HandlerEntry::WithExceptionHandler { handler } => {
+                            Ok(State::Apply(handler, vec![raised_val], Rc::clone(env), span))
+                        }
+                        HandlerEntry::Guard {
+                            var,
+                            clauses,
+                            env: guard_env,
+                            guard_k,
+                            guard_wind,
+                            guard_handlers,
+                        } => {
+                            // Compute wind transfer ops
+                            let common_len = wind
+                                .iter()
+                                .zip(guard_wind.iter())
+                                .take_while(|(a, b)| a.id == b.id)
+                                .count();
+                            let mut ops: Vec<WindOp> = Vec::new();
+                            for entry in wind[common_len..].iter().rev() {
+                                ops.push(WindOp::CallOut(entry.out_thunk.clone()));
+                            }
+                            for entry in &guard_wind[common_len..] {
+                                ops.push(WindOp::CallInAndPush(entry.clone()));
+                            }
+
+                            // Restore to guard point
+                            *k = guard_k;
+                            wind.truncate(common_len);
+                            *handlers = guard_handlers;
+
+                            // Push clause test frame (will be reached after wind transfer)
+                            k.push(Frame::GuardClauseTest {
+                                var,
+                                raised_val,
+                                clauses,
+                                env: guard_env,
+                            });
+
+                            if ops.is_empty() {
+                                Ok(State::Ret(Value::Void))
+                            } else {
+                                k.push(Frame::WindTransfer {
+                                    ops,
+                                    final_val: Value::Void,
+                                    env: Rc::clone(env),
+                                    span,
+                                });
+                                Ok(State::Ret(Value::Void))
+                            }
+                        }
+                    }
+                } else {
+                    Err(ErrorKind::UserRaise {
+                        value: raised_val.to_display_string(),
+                    }
+                    .into())
+                }
+            }
+            "with-exception-handler" => {
+                if args.len() != 2 {
+                    return Err(ErrorKind::WrongArgCount {
+                        expected: 2,
+                        got: args.len(),
+                    }
+                    .into());
+                }
+                let mut args = args;
+                let handler = args.remove(0);
+                let thunk = args.remove(0);
+
+                // Push PopHandler frame so handler is removed when thunk returns
+                k.push(Frame::PopHandler);
+
+                // Install handler
+                handlers.push(HandlerEntry::WithExceptionHandler { handler });
+
+                // Call thunk
+                Ok(State::Apply(thunk, Vec::new(), Rc::clone(env), span))
+            }
             _ => {
                 let result = apply_builtin(name, &args, env)?;
                 Ok(State::Ret(result))
@@ -1430,9 +1690,9 @@ fn step_apply(
                 .into());
             }
             let val = args.into_iter().next().expect("checked len");
-            let (target_frames, target_wind) = captured
+            let (target_frames, target_wind, target_handlers) = captured
                 .0
-                .downcast_ref::<(Vec<Frame>, Vec<WindEntry>)>()
+                .downcast_ref::<(Vec<Frame>, Vec<WindEntry>, Vec<HandlerEntry>)>()
                 .expect("continuation frame type");
 
             // Compute common prefix length between current and target wind stacks
@@ -1453,8 +1713,9 @@ fn step_apply(
                 ops.push(WindOp::CallInAndPush(entry.clone()));
             }
 
-            // Restore target continuation stack
+            // Restore target continuation stack and handlers
             *k = target_frames.clone();
+            *handlers = target_handlers.clone();
             // Truncate wind to common prefix (unwind ops will pop further as they run)
             wind.truncate(common_len);
 
