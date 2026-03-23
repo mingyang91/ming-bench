@@ -157,6 +157,8 @@ fn output_write(s: &str) {
 #[derive(Clone)]
 enum Value {
     Integer(i64),
+    Float(f64),
+    Rational(i64, i64), // numerator, denominator (den > 0, gcd(n,d) = 1)
     Boolean(bool),
     Str(String),
     Symbol(String),
@@ -186,6 +188,8 @@ impl std::fmt::Debug for Value {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Value::Integer(n) => write!(f, "Integer({})", n),
+            Value::Float(v) => write!(f, "Float({})", v),
+            Value::Rational(n, d) => write!(f, "Rational({}/{})", n, d),
             Value::Boolean(b) => write!(f, "Boolean({})", b),
             Value::Str(s) => write!(f, "Str({})", s),
             Value::Symbol(s) => write!(f, "Symbol({})", s),
@@ -208,6 +212,11 @@ impl Value {
     fn display(&self) -> String {
         match self {
             Value::Integer(n) => n.to_string(),
+            Value::Float(f) => {
+                let s = format!("{}", f);
+                if f.is_finite() && !s.contains('.') { format!("{}.0", s) } else { s }
+            }
+            Value::Rational(n, d) => format!("{}/{}", n, d),
             Value::Boolean(true) => "#t".to_string(),
             Value::Boolean(false) => "#f".to_string(),
             Value::Str(s) => format!("\"{}\"", s),
@@ -449,6 +458,23 @@ fn parse_atom(token: &str, span: Span) -> Expr {
         ExprKind::Str(token[1..token.len()-1].to_string())
     } else if let Ok(n) = token.parse::<i64>() {
         ExprKind::Integer(n)
+    } else if token.contains('.') {
+        if let Ok(f) = token.parse::<f64>() {
+            ExprKind::Literal(Value::Float(f))
+        } else {
+            ExprKind::Symbol(token.to_string())
+        }
+    } else if let Some(slash) = token.find('/') {
+        if slash > 0 && slash < token.len() - 1 {
+            if let (Ok(n), Ok(d)) = (token[..slash].parse::<i64>(), token[slash+1..].parse::<i64>()) {
+                if d != 0 {
+                    match make_rational(n, d) {
+                        Value::Integer(i) => ExprKind::Integer(i),
+                        v => ExprKind::Literal(v),
+                    }
+                } else { ExprKind::Symbol(token.to_string()) }
+            } else { ExprKind::Symbol(token.to_string()) }
+        } else { ExprKind::Symbol(token.to_string()) }
     } else {
         ExprKind::Symbol(token.to_string())
     };
@@ -1132,6 +1158,8 @@ fn eqv_match(val: &Value, datum: &Value) -> bool {
         (Value::Symbol(a), Value::Symbol(b)) => a == b,
         (Value::Boolean(a), Value::Boolean(b)) => a == b,
         (Value::Integer(a), Value::Integer(b)) => a == b,
+        (Value::Float(a), Value::Float(b)) => a == b,
+        (Value::Rational(n1, d1), Value::Rational(n2, d2)) => n1 == n2 && d1 == d2,
         (Value::Char(a), Value::Char(b)) => a == b,
         (Value::Str(a), Value::Str(b)) => a == b,
         (Value::List(a), Value::List(b)) => a.is_empty() && b.is_empty(),
@@ -1632,6 +1660,43 @@ fn collect_ellipsis_vars_inner(template: &Expr, bindings: &HashMap<String, PatBi
     }
 }
 
+// ---------- Numeric helpers ----------
+
+fn gcd(mut a: i64, mut b: i64) -> i64 {
+    a = a.abs(); b = b.abs();
+    while b != 0 { let t = b; b = a % b; a = t; }
+    a
+}
+
+fn make_rational(n: i64, d: i64) -> Value {
+    assert!(d != 0);
+    let (n, d) = if d < 0 { (-n, -d) } else { (n, d) };
+    let g = gcd(n, d);
+    let (n, d) = (n / g, d / g);
+    if d == 1 { Value::Integer(n) } else { Value::Rational(n, d) }
+}
+
+fn to_f64(v: &Value) -> Result<f64, EvalError> {
+    match v {
+        Value::Integer(n) => Ok(*n as f64),
+        Value::Float(f) => Ok(*f),
+        Value::Rational(n, d) => Ok(*n as f64 / *d as f64),
+        _ => Err(EvalError::Type("expected number".into())),
+    }
+}
+
+fn to_exact(v: &Value) -> Result<(i64, i64), EvalError> {
+    match v {
+        Value::Integer(n) => Ok((*n, 1)),
+        Value::Rational(n, d) => Ok((*n, *d)),
+        _ => Err(EvalError::Type("expected exact number".into())),
+    }
+}
+
+fn has_inexact(args: &[Value]) -> bool {
+    args.iter().any(|a| matches!(a, Value::Float(_)))
+}
+
 // ---------- Builtins ----------
 
 fn as_int(v: &Value) -> Result<i64, EvalError> {
@@ -1642,40 +1707,91 @@ fn as_int(v: &Value) -> Result<i64, EvalError> {
 }
 
 fn builtin_add(args: &[Value]) -> Result<Value, EvalError> {
-    let mut sum: i64 = 0;
-    for a in args { sum += as_int(a)?; }
-    Ok(Value::Integer(sum))
+    if has_inexact(args) {
+        let mut sum = 0.0_f64;
+        for a in args { sum += to_f64(a)?; }
+        Ok(Value::Float(sum))
+    } else {
+        let mut n: i64 = 0;
+        let mut d: i64 = 1;
+        for a in args {
+            let (an, ad) = to_exact(a)?;
+            n = n * ad + an * d;
+            d *= ad;
+            let g = gcd(n, d);
+            n /= g; d /= g;
+        }
+        Ok(make_rational(n, d))
+    }
 }
 
 fn builtin_sub(args: &[Value]) -> Result<Value, EvalError> {
     if args.is_empty() {
         return Err(EvalError::Arity("- requires at least 1 argument".into()));
     }
-    if args.len() == 1 {
-        return Ok(Value::Integer(-as_int(&args[0])?));
+    if has_inexact(args) {
+        if args.len() == 1 { return Ok(Value::Float(-to_f64(&args[0])?)); }
+        let mut r = to_f64(&args[0])?;
+        for a in &args[1..] { r -= to_f64(a)?; }
+        Ok(Value::Float(r))
+    } else {
+        if args.len() == 1 {
+            let (n, d) = to_exact(&args[0])?;
+            return Ok(make_rational(-n, d));
+        }
+        let (mut n, mut d) = to_exact(&args[0])?;
+        for a in &args[1..] {
+            let (an, ad) = to_exact(a)?;
+            n = n * ad - an * d;
+            d *= ad;
+            let g = gcd(n, d);
+            n /= g; d /= g;
+        }
+        Ok(make_rational(n, d))
     }
-    let mut r = as_int(&args[0])?;
-    for a in &args[1..] { r -= as_int(a)?; }
-    Ok(Value::Integer(r))
 }
 
 fn builtin_mul(args: &[Value]) -> Result<Value, EvalError> {
-    let mut prod: i64 = 1;
-    for a in args { prod *= as_int(a)?; }
-    Ok(Value::Integer(prod))
+    if has_inexact(args) {
+        let mut prod = 1.0_f64;
+        for a in args { prod *= to_f64(a)?; }
+        Ok(Value::Float(prod))
+    } else {
+        let mut n: i64 = 1;
+        let mut d: i64 = 1;
+        for a in args {
+            let (an, ad) = to_exact(a)?;
+            n *= an; d *= ad;
+            let g = gcd(n, d);
+            n /= g; d /= g;
+        }
+        Ok(make_rational(n, d))
+    }
 }
 
 fn builtin_div(args: &[Value]) -> Result<Value, EvalError> {
     if args.len() < 2 {
         return Err(EvalError::Arity("/ requires at least 2 arguments".into()));
     }
-    let mut r = as_int(&args[0])?;
-    for a in &args[1..] {
-        let d = as_int(a)?;
-        if d == 0 { return Err(EvalError::Runtime("division by zero".into())); }
-        r /= d;
+    if has_inexact(args) {
+        let mut r = to_f64(&args[0])?;
+        for a in &args[1..] {
+            let dv = to_f64(a)?;
+            if dv == 0.0 { return Err(EvalError::Runtime("division by zero".into())); }
+            r /= dv;
+        }
+        Ok(Value::Float(r))
+    } else {
+        let (mut n, mut d) = to_exact(&args[0])?;
+        for a in &args[1..] {
+            let (an, ad) = to_exact(a)?;
+            if an == 0 { return Err(EvalError::Runtime("division by zero".into())); }
+            n *= ad; d *= an;
+            let g = gcd(n, d);
+            n /= g; d /= g;
+        }
+        Ok(make_rational(n, d))
     }
-    Ok(Value::Integer(r))
 }
 
 fn builtin_lt(args: &[Value]) -> Result<Value, EvalError> { cmp_op(args, |a, b| a < b) }
@@ -1759,7 +1875,7 @@ fn builtin_is_string(args: &[Value]) -> Result<Value, EvalError> {
 
 fn builtin_is_number(args: &[Value]) -> Result<Value, EvalError> {
     if args.len() != 1 { return Err(EvalError::Arity("number? requires 1 argument".into())); }
-    Ok(Value::Boolean(matches!(&args[0], Value::Integer(_))))
+    Ok(Value::Boolean(matches!(&args[0], Value::Integer(_) | Value::Float(_) | Value::Rational(_, _))))
 }
 
 fn builtin_is_boolean(args: &[Value]) -> Result<Value, EvalError> {
@@ -1834,6 +1950,8 @@ fn builtin_number_to_string(args: &[Value]) -> Result<Value, EvalError> {
     if args.len() != 1 { return Err(EvalError::Arity("number->string requires 1 argument".into())); }
     match &args[0] {
         Value::Integer(n) => Ok(Value::Str(n.to_string())),
+        Value::Float(_) => Ok(Value::Str(args[0].display())),
+        Value::Rational(n, d) => Ok(Value::Str(format!("{}/{}", n, d))),
         _ => Err(EvalError::Type("number->string: expected number".into())),
     }
 }
@@ -1872,13 +1990,13 @@ fn builtin_string_ref(args: &[Value]) -> Result<Value, EvalError> {
     Ok(Value::Char(s.chars().nth(idx).unwrap()))
 }
 
-fn cmp_op(args: &[Value], f: impl Fn(i64, i64) -> bool) -> Result<Value, EvalError> {
+fn cmp_op(args: &[Value], f: impl Fn(f64, f64) -> bool) -> Result<Value, EvalError> {
     if args.len() < 2 {
         return Err(EvalError::Arity("comparison requires at least 2 arguments".into()));
     }
-    let mut prev = as_int(&args[0])?;
+    let mut prev = to_f64(&args[0])?;
     for a in &args[1..] {
-        let curr = as_int(a)?;
+        let curr = to_f64(a)?;
         if !f(prev, curr) {
             return Ok(Value::Boolean(false));
         }
@@ -2060,6 +2178,8 @@ fn builtin_is_list(args: &[Value]) -> Result<Value, EvalError> {
 fn values_equal(a: &Value, b: &Value) -> bool {
     match (a, b) {
         (Value::Integer(x), Value::Integer(y)) => x == y,
+        (Value::Float(x), Value::Float(y)) => x == y,
+        (Value::Rational(n1, d1), Value::Rational(n2, d2)) => n1 == n2 && d1 == d2,
         (Value::Boolean(x), Value::Boolean(y)) => x == y,
         (Value::Str(x), Value::Str(y)) => x == y,
         (Value::Symbol(x), Value::Symbol(y)) => x == y,
@@ -2088,6 +2208,8 @@ fn builtin_eq_pred(args: &[Value]) -> Result<Value, EvalError> {
         (Value::Symbol(a), Value::Symbol(b)) => a == b,
         (Value::Boolean(a), Value::Boolean(b)) => a == b,
         (Value::Integer(a), Value::Integer(b)) => a == b,
+        (Value::Float(a), Value::Float(b)) => a == b,
+        (Value::Rational(n1, d1), Value::Rational(n2, d2)) => n1 == n2 && d1 == d2,
         (Value::Char(a), Value::Char(b)) => a == b,
         (Value::List(a), Value::List(b)) => a.is_empty() && b.is_empty(),
         (Value::Vector(a), Value::Vector(b)) => Rc::ptr_eq(a, b),
@@ -2359,6 +2481,87 @@ fn builtin_reverse(args: &[Value]) -> Result<Value, EvalError> {
     }
 }
 
+// ---------- L19: Exact/Rational builtins ----------
+
+fn builtin_is_exact(args: &[Value]) -> Result<Value, EvalError> {
+    if args.len() != 1 { return Err(EvalError::Arity("exact? requires 1 argument".into())); }
+    Ok(Value::Boolean(matches!(&args[0], Value::Integer(_) | Value::Rational(_, _))))
+}
+
+fn builtin_is_inexact(args: &[Value]) -> Result<Value, EvalError> {
+    if args.len() != 1 { return Err(EvalError::Arity("inexact? requires 1 argument".into())); }
+    Ok(Value::Boolean(matches!(&args[0], Value::Float(_))))
+}
+
+fn builtin_exact_to_inexact(args: &[Value]) -> Result<Value, EvalError> {
+    if args.len() != 1 { return Err(EvalError::Arity("exact->inexact requires 1 argument".into())); }
+    Ok(Value::Float(to_f64(&args[0])?))
+}
+
+fn builtin_inexact_to_exact(args: &[Value]) -> Result<Value, EvalError> {
+    if args.len() != 1 { return Err(EvalError::Arity("inexact->exact requires 1 argument".into())); }
+    match &args[0] {
+        Value::Integer(n) => Ok(Value::Integer(*n)),
+        Value::Rational(n, d) => Ok(Value::Rational(*n, *d)),
+        Value::Float(f) => {
+            if f.fract() == 0.0 && f.is_finite() {
+                return Ok(Value::Integer(*f as i64));
+            }
+            // Continued fraction algorithm to find exact rational
+            let mut p0: i64 = 0; let mut q0: i64 = 1;
+            let mut p1: i64 = 1; let mut q1: i64 = 0;
+            let mut x = *f;
+            for _ in 0..64 {
+                let a = x.floor() as i64;
+                let p2 = a * p1 + p0;
+                let q2 = a * q1 + q0;
+                if q2 != 0 && (p2 as f64 / q2 as f64 - *f).abs() < 1e-10 {
+                    return Ok(make_rational(p2, q2));
+                }
+                p0 = p1; q0 = q1;
+                p1 = p2; q1 = q2;
+                let frac = x - a as f64;
+                if frac.abs() < 1e-15 { break; }
+                x = 1.0 / frac;
+            }
+            Ok(make_rational(p1, q1))
+        }
+        _ => Err(EvalError::Type("inexact->exact: expected number".into())),
+    }
+}
+
+fn builtin_numerator(args: &[Value]) -> Result<Value, EvalError> {
+    if args.len() != 1 { return Err(EvalError::Arity("numerator requires 1 argument".into())); }
+    match &args[0] {
+        Value::Integer(n) => Ok(Value::Integer(*n)),
+        Value::Rational(n, _) => Ok(Value::Integer(*n)),
+        _ => Err(EvalError::Type("numerator: expected rational".into())),
+    }
+}
+
+fn builtin_denominator(args: &[Value]) -> Result<Value, EvalError> {
+    if args.len() != 1 { return Err(EvalError::Arity("denominator requires 1 argument".into())); }
+    match &args[0] {
+        Value::Integer(_) => Ok(Value::Integer(1)),
+        Value::Rational(_, d) => Ok(Value::Integer(*d)),
+        _ => Err(EvalError::Type("denominator: expected rational".into())),
+    }
+}
+
+fn builtin_is_integer(args: &[Value]) -> Result<Value, EvalError> {
+    if args.len() != 1 { return Err(EvalError::Arity("integer? requires 1 argument".into())); }
+    Ok(Value::Boolean(match &args[0] {
+        Value::Integer(_) => true,
+        Value::Float(f) => f.fract() == 0.0,
+        _ => false,
+    }))
+}
+
+fn builtin_is_rational(args: &[Value]) -> Result<Value, EvalError> {
+    if args.len() != 1 { return Err(EvalError::Arity("rational? requires 1 argument".into())); }
+    Ok(Value::Boolean(matches!(&args[0], Value::Integer(_) | Value::Rational(_, _))))
+}
+
 fn make_global_env() -> Env {
     let env = new_env(None);
     let builtins: &[(&str, BuiltinFn)] = &[
@@ -2450,6 +2653,15 @@ fn make_global_env() -> Env {
         ("list->vector", builtin_list_to_vector),
         // L16: dynamic-wind helpers
         ("reverse", builtin_reverse),
+        // L19: exact/rational
+        ("exact?", builtin_is_exact),
+        ("inexact?", builtin_is_inexact),
+        ("exact->inexact", builtin_exact_to_inexact),
+        ("inexact->exact", builtin_inexact_to_exact),
+        ("numerator", builtin_numerator),
+        ("denominator", builtin_denominator),
+        ("integer?", builtin_is_integer),
+        ("rational?", builtin_is_rational),
     ];
     for (name, f) in builtins {
         env_set(&env, name.to_string(), Value::Builtin(*f));
