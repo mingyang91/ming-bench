@@ -24,19 +24,49 @@ pub fn default_env() -> Rc<RefCell<Env>> {
     env
 }
 
+/// Trampoline: either a final value or a tail call to bounce.
+enum Trampoline {
+    Done(Value),
+    Bounce { expr: Value, env: Rc<RefCell<Env>> },
+}
+
 pub fn eval(
     expr: &Value,
     env: &Rc<RefCell<Env>>,
     output: &Rc<RefCell<String>>,
 ) -> Result<Value, EvalError> {
+    let mut current_expr = expr.clone();
+    let mut current_env = Rc::clone(env);
+
+    loop {
+        match eval_inner(&current_expr, &current_env, output)? {
+            Trampoline::Done(val) => return Ok(val),
+            Trampoline::Bounce { expr: next_expr, env: next_env } => {
+                current_expr = next_expr;
+                current_env = next_env;
+            }
+        }
+    }
+}
+
+/// Core eval that returns a Trampoline — tail positions return Bounce instead of recursing.
+fn eval_inner(
+    expr: &Value,
+    env: &Rc<RefCell<Env>>,
+    output: &Rc<RefCell<String>>,
+) -> Result<Trampoline, EvalError> {
     let span = expr.span();
     match expr {
         Value::Int(_) | Value::Bool(_) | Value::String(_)
-        | Value::Char(_) | Value::Builtin(_) => Ok(expr.clone()),
-        Value::Closure { .. } => Ok(expr.clone()),
-        Value::Symbol(name, _) => env.borrow().get(name).map_err(|e| e.at(span)),
+        | Value::Char(_) | Value::Builtin(_) => Ok(Trampoline::Done(expr.clone())),
+        Value::Closure { .. } => Ok(Trampoline::Done(expr.clone())),
+        Value::Symbol(name, _) => env
+            .borrow()
+            .get(name)
+            .map(Trampoline::Done)
+            .map_err(|e| e.at(span)),
         Value::List(elems, _) => eval_list(elems, span, env, output),
-        Value::Void => Ok(Value::Void),
+        Value::Void => Ok(Trampoline::Done(Value::Void)),
     }
 }
 
@@ -45,7 +75,7 @@ fn eval_list(
     span: Option<Span>,
     env: &Rc<RefCell<Env>>,
     output: &Rc<RefCell<String>>,
-) -> Result<Value, EvalError> {
+) -> Result<Trampoline, EvalError> {
     if elems.is_empty() {
         return Err(EvalError::Parse { msg: "empty application".into() }.at(span));
     }
@@ -75,13 +105,14 @@ fn eval_list(
     apply(&func, &args, output).map_err(|e| e.at(span))
 }
 
+/// Apply a function. For closures, returns a Bounce for TCO.
 fn apply(
     func: &Value,
     args: &[Value],
     output: &Rc<RefCell<String>>,
-) -> Result<Value, EvalError> {
+) -> Result<Trampoline, EvalError> {
     match func {
-        Value::Builtin(ref name) => apply_builtin(name, args, output),
+        Value::Builtin(ref name) => apply_builtin(name, args, output).map(Trampoline::Done),
         Value::Closure { params, body, env } => {
             if args.len() != params.len() {
                 return Err(EvalError::WrongArgCount {
@@ -93,14 +124,28 @@ fn apply(
             for (param, arg) in params.iter().zip(args.iter()) {
                 call_env.borrow_mut().define(param.clone(), arg.clone());
             }
-            let mut result = Value::Void;
-            for expr in body {
-                result = eval(expr, &call_env, output)?;
-            }
-            Ok(result)
+            eval_body(body, &call_env, output)
         }
         other => Err(EvalError::NotAProcedure { value: other.to_string() }),
     }
+}
+
+/// Evaluate a body sequence: eval all but last eagerly, return last as Bounce for TCO.
+fn eval_body(
+    body: &[Value],
+    env: &Rc<RefCell<Env>>,
+    output: &Rc<RefCell<String>>,
+) -> Result<Trampoline, EvalError> {
+    if body.is_empty() {
+        return Ok(Trampoline::Done(Value::Void));
+    }
+    for expr in &body[..body.len() - 1] {
+        eval(expr, env, output)?;
+    }
+    Ok(Trampoline::Bounce {
+        expr: body[body.len() - 1].clone(),
+        env: Rc::clone(env),
+    })
 }
 
 fn eval_if(
@@ -108,17 +153,17 @@ fn eval_if(
     span: Option<Span>,
     env: &Rc<RefCell<Env>>,
     output: &Rc<RefCell<String>>,
-) -> Result<Value, EvalError> {
+) -> Result<Trampoline, EvalError> {
     if args.len() < 2 || args.len() > 3 {
         return Err(EvalError::Parse { msg: "if requires 2 or 3 arguments".into() }.at(span));
     }
     let cond = eval(&args[0], env, output)?;
     if !is_false(&cond) {
-        eval(&args[1], env, output)
+        Ok(Trampoline::Bounce { expr: args[1].clone(), env: Rc::clone(env) })
     } else if args.len() == 3 {
-        eval(&args[2], env, output)
+        Ok(Trampoline::Bounce { expr: args[2].clone(), env: Rc::clone(env) })
     } else {
-        Ok(Value::Void)
+        Ok(Trampoline::Done(Value::Void))
     }
 }
 
@@ -127,7 +172,7 @@ fn eval_define(
     span: Option<Span>,
     env: &Rc<RefCell<Env>>,
     output: &Rc<RefCell<String>>,
-) -> Result<Value, EvalError> {
+) -> Result<Trampoline, EvalError> {
     if args.is_empty() {
         return Err(EvalError::Parse { msg: "define requires arguments".into() }.at(span));
     }
@@ -141,7 +186,7 @@ fn eval_define(
             }
             let val = eval(&args[1], env, output)?;
             env.borrow_mut().define(name.clone(), val);
-            Ok(Value::Void)
+            Ok(Trampoline::Done(Value::Void))
         }
         Value::List(sig, _) => {
             if sig.is_empty() {
@@ -172,7 +217,7 @@ fn eval_define(
                 env: Rc::clone(env),
             };
             env.borrow_mut().define(name.clone(), closure);
-            Ok(Value::Void)
+            Ok(Trampoline::Done(Value::Void))
         }
         Value::Int(_) | Value::Bool(_) | Value::String(_) | Value::Char(_)
         | Value::Builtin(_) | Value::Closure { .. } | Value::Void => Err(EvalError::Parse {
@@ -186,7 +231,7 @@ fn eval_lambda(
     args: &[Value],
     span: Option<Span>,
     env: &Rc<RefCell<Env>>,
-) -> Result<Value, EvalError> {
+) -> Result<Trampoline, EvalError> {
     if args.len() < 2 {
         return Err(
             EvalError::Parse { msg: "lambda requires params and body".into() }.at(span),
@@ -208,52 +253,58 @@ fn eval_lambda(
         })
         .collect::<Result<_, _>>()?;
     let body = args[1..].to_vec();
-    Ok(Value::Closure {
+    Ok(Trampoline::Done(Value::Closure {
         params,
         body,
         env: Rc::clone(env),
-    })
+    }))
 }
 
-fn eval_quote(args: &[Value], span: Option<Span>) -> Result<Value, EvalError> {
+fn eval_quote(args: &[Value], span: Option<Span>) -> Result<Trampoline, EvalError> {
     if args.len() != 1 {
         return Err(EvalError::Parse { msg: "quote requires exactly 1 argument".into() }.at(span));
     }
-    Ok(args[0].clone())
+    Ok(Trampoline::Done(args[0].clone()))
 }
 
 fn eval_and(
     exprs: &[Value],
     env: &Rc<RefCell<Env>>,
     output: &Rc<RefCell<String>>,
-) -> Result<Value, EvalError> {
+) -> Result<Trampoline, EvalError> {
     if exprs.is_empty() {
-        return Ok(Value::Bool(true));
+        return Ok(Trampoline::Done(Value::Bool(true)));
     }
     for expr in &exprs[..exprs.len() - 1] {
         let val = eval(expr, env, output)?;
         if is_false(&val) {
-            return Ok(val);
+            return Ok(Trampoline::Done(val));
         }
     }
-    eval(&exprs[exprs.len() - 1], env, output)
+    Ok(Trampoline::Bounce {
+        expr: exprs[exprs.len() - 1].clone(),
+        env: Rc::clone(env),
+    })
 }
 
 fn eval_or(
     exprs: &[Value],
     env: &Rc<RefCell<Env>>,
     output: &Rc<RefCell<String>>,
-) -> Result<Value, EvalError> {
+) -> Result<Trampoline, EvalError> {
     if exprs.is_empty() {
-        return Ok(Value::Bool(false));
+        return Ok(Trampoline::Done(Value::Bool(false)));
     }
     for expr in &exprs[..exprs.len() - 1] {
         let val = eval(expr, env, output)?;
         if !is_false(&val) {
-            return Ok(val);
+            return Ok(Trampoline::Done(val));
         }
     }
-    eval(&exprs[exprs.len() - 1], env, output)
+    Ok(Trampoline::Bounce {
+        expr: exprs[exprs.len() - 1].clone(),
+        env: Rc::clone(env),
+    })
 }
 
 fn eval_let(
@@ -261,7 +312,7 @@ fn eval_let(
     span: Option<Span>,
     env: &Rc<RefCell<Env>>,
     output: &Rc<RefCell<String>>,
-) -> Result<Value, EvalError> {
+) -> Result<Trampoline, EvalError> {
     if args.len() < 2 {
         return Err(EvalError::Parse { msg: "let requires bindings and body".into() }.at(span));
     }
@@ -310,12 +361,7 @@ fn eval_let(
         for (param, init) in params.iter().zip(inits.iter()) {
             call_env.borrow_mut().define(param.clone(), init.clone());
         }
-        let body = &args[2..];
-        let mut result = Value::Void;
-        for expr in body {
-            result = eval(expr, &call_env, output)?;
-        }
-        return Ok(result);
+        return eval_body(&args[2..], &call_env, output);
     }
     let Value::List(bindings, _) = &args[0] else {
         return Err(EvalError::Parse { msg: "let: expected bindings list".into() }.at(span));
@@ -338,30 +384,22 @@ fn eval_let(
         let val = eval(&pair[1], env, output)?;
         let_env.borrow_mut().define(name.clone(), val);
     }
-    let mut result = Value::Void;
-    for expr in &args[1..] {
-        result = eval(expr, &let_env, output)?;
-    }
-    Ok(result)
+    eval_body(&args[1..], &let_env, output)
 }
 
 fn eval_begin(
     args: &[Value],
     env: &Rc<RefCell<Env>>,
     output: &Rc<RefCell<String>>,
-) -> Result<Value, EvalError> {
-    let mut result = Value::Void;
-    for expr in args {
-        result = eval(expr, env, output)?;
-    }
-    Ok(result)
+) -> Result<Trampoline, EvalError> {
+    eval_body(args, env, output)
 }
 
 fn eval_cond(
     clauses: &[Value],
     env: &Rc<RefCell<Env>>,
     output: &Rc<RefCell<String>>,
-) -> Result<Value, EvalError> {
+) -> Result<Trampoline, EvalError> {
     for clause in clauses {
         let Value::List(parts, _) = clause else {
             return Err(EvalError::Parse { msg: "cond: expected clause".into() });
@@ -371,23 +409,18 @@ fn eval_cond(
         }
         if let Value::Symbol(s, _) = &parts[0] {
             if s == "else" {
-                let mut result = Value::Void;
-                for expr in &parts[1..] {
-                    result = eval(expr, env, output)?;
-                }
-                return Ok(result);
+                return eval_body(&parts[1..], env, output);
             }
         }
         let test = eval(&parts[0], env, output)?;
         if !is_false(&test) {
-            let mut result = test;
-            for expr in &parts[1..] {
-                result = eval(expr, env, output)?;
+            if parts.len() == 1 {
+                return Ok(Trampoline::Done(test));
             }
-            return Ok(result);
+            return eval_body(&parts[1..], env, output);
         }
     }
-    Ok(Value::Void)
+    Ok(Trampoline::Done(Value::Void))
 }
 
 fn eval_string_set(
@@ -395,7 +428,7 @@ fn eval_string_set(
     span: Option<Span>,
     env: &Rc<RefCell<Env>>,
     output: &Rc<RefCell<String>>,
-) -> Result<Value, EvalError> {
+) -> Result<Trampoline, EvalError> {
     if args.len() != 3 {
         return Err(EvalError::WrongArgCount { expected: 3, got: args.len() }.at(span));
     }
@@ -444,7 +477,7 @@ fn eval_string_set(
     env.borrow_mut()
         .set(var_name, Value::String(new_string))
         .map_err(|e| e.at(span))?;
-    Ok(Value::Void)
+    Ok(Trampoline::Done(Value::Void))
 }
 
 fn is_false(val: &Value) -> bool {
