@@ -6,12 +6,25 @@ use std::cell::RefCell;
 use std::collections::HashMap;
 use std::rc::Rc;
 
+thread_local! {
+    static OUTPUT_BUF: RefCell<String> = RefCell::new(String::new());
+}
+
+fn output_write(s: &str) {
+    OUTPUT_BUF.with(|buf| buf.borrow_mut().push_str(s));
+}
+
+fn output_take() -> String {
+    OUTPUT_BUF.with(|buf| buf.borrow_mut().split_off(0))
+}
+
 /// A Scheme runtime value.
 #[derive(Clone)]
 enum Value {
     Integer(i64),
     Boolean(bool),
     String(String),
+    Char(char),
     List(Vec<Value>),
     Pair(Box<Value>, Box<Value>),
     Symbol(String),
@@ -30,6 +43,7 @@ impl std::fmt::Debug for Value {
             Value::Integer(n) => write!(f, "Integer({n})"),
             Value::Boolean(b) => write!(f, "Boolean({b})"),
             Value::String(s) => write!(f, "String({s:?})"),
+            Value::Char(c) => write!(f, "Char({c:?})"),
             Value::List(l) => write!(f, "List({l:?})"),
             Value::Pair(a, b) => write!(f, "Pair({a:?}, {b:?})"),
             Value::Symbol(s) => write!(f, "Symbol({s})"),
@@ -46,11 +60,23 @@ impl PartialEq for Value {
             (Value::Integer(a), Value::Integer(b)) => a == b,
             (Value::Boolean(a), Value::Boolean(b)) => a == b,
             (Value::String(a), Value::String(b)) => a == b,
+            (Value::Char(a), Value::Char(b)) => a == b,
             (Value::List(a), Value::List(b)) => a == b,
             (Value::Pair(a1, b1), Value::Pair(a2, b2)) => a1 == a2 && b1 == b2,
             (Value::Symbol(a), Value::Symbol(b)) => a == b,
             (Value::Void, Value::Void) => true,
             _ => false,
+        }
+    }
+}
+
+impl Value {
+    /// Format for `display` — strings without quotes, chars as raw character.
+    fn display_fmt(&self, out: &mut String) {
+        match self {
+            Value::String(s) => out.push_str(s),
+            Value::Char(c) => out.push(*c),
+            _ => out.push_str(&self.to_string()),
         }
     }
 }
@@ -62,6 +88,7 @@ impl std::fmt::Display for Value {
             Value::Boolean(true) => write!(f, "#t"),
             Value::Boolean(false) => write!(f, "#f"),
             Value::String(s) => write!(f, "\"{}\"", s),
+            Value::Char(c) => write!(f, "#\\{c}"),
             Value::List(elems) => {
                 write!(f, "(")?;
                 for (i, e) in elems.iter().enumerate() {
@@ -181,6 +208,18 @@ fn default_env() -> Env {
         ("boolean?", |a| builtin_type_pred(a, "boolean?")),
         ("pair?", |a| builtin_type_pred(a, "pair?")),
         ("symbol?", |a| builtin_type_pred(a, "symbol?")),
+        ("char?", |a| builtin_type_pred(a, "char?")),
+        ("display", builtin_display),
+        ("write", builtin_write),
+        ("newline", builtin_newline),
+        ("string-append", builtin_string_append),
+        ("string-length", builtin_string_length),
+        ("substring", builtin_substring),
+        ("string->number", builtin_string_to_number),
+        ("number->string", builtin_number_to_string),
+        ("symbol->string", builtin_symbol_to_string),
+        ("string->symbol", builtin_string_to_symbol),
+        ("string-ref", builtin_string_ref),
     ];
     for &(name, func) in builtins {
         env_set(&env, name.to_string(), Value::Builtin(name.to_string(), func));
@@ -730,6 +769,7 @@ fn builtin_type_pred(args: &[Value], name: &str) -> Result<Value, EvalError> {
         "boolean?" => matches!(&args[0], Value::Boolean(_)),
         "pair?" => matches!(&args[0], Value::List(l) if !l.is_empty()) || matches!(&args[0], Value::Pair(..)),
         "symbol?" => matches!(&args[0], Value::Symbol(_)),
+        "char?" => matches!(&args[0], Value::Char(_)),
         _ => false,
     };
     Ok(Value::Boolean(result))
@@ -790,6 +830,128 @@ fn cmp_op(args: &[Value], op: fn(i64, i64) -> bool) -> Result<Value, EvalError> 
     Ok(Value::Boolean(result))
 }
 
+fn builtin_display(args: &[Value]) -> Result<Value, EvalError> {
+    if args.len() != 1 {
+        return Err(EvalError::Arity("display expects 1 argument".into()));
+    }
+    let mut s = String::new();
+    args[0].display_fmt(&mut s);
+    output_write(&s);
+    Ok(Value::Void)
+}
+
+fn builtin_write(args: &[Value]) -> Result<Value, EvalError> {
+    if args.len() != 1 {
+        return Err(EvalError::Arity("write expects 1 argument".into()));
+    }
+    output_write(&args[0].to_string());
+    Ok(Value::Void)
+}
+
+fn builtin_newline(args: &[Value]) -> Result<Value, EvalError> {
+    if !args.is_empty() {
+        return Err(EvalError::Arity("newline expects 0 arguments".into()));
+    }
+    output_write("\n");
+    Ok(Value::Void)
+}
+
+fn builtin_string_append(args: &[Value]) -> Result<Value, EvalError> {
+    let mut result = String::new();
+    for arg in args {
+        match arg {
+            Value::String(s) => result.push_str(s),
+            _ => return Err(EvalError::Type("string-append: expected string".into())),
+        }
+    }
+    Ok(Value::String(result))
+}
+
+fn builtin_string_length(args: &[Value]) -> Result<Value, EvalError> {
+    if args.len() != 1 {
+        return Err(EvalError::Arity("string-length expects 1 argument".into()));
+    }
+    match &args[0] {
+        Value::String(s) => Ok(Value::Integer(s.len() as i64)),
+        _ => Err(EvalError::Type("string-length: expected string".into())),
+    }
+}
+
+fn builtin_substring(args: &[Value]) -> Result<Value, EvalError> {
+    if args.len() != 3 {
+        return Err(EvalError::Arity("substring expects 3 arguments".into()));
+    }
+    match (&args[0], &args[1], &args[2]) {
+        (Value::String(s), Value::Integer(start), Value::Integer(end)) => {
+            let start = *start as usize;
+            let end = *end as usize;
+            if start > end || end > s.len() {
+                return Err(EvalError::Type("substring: index out of range".into()));
+            }
+            Ok(Value::String(s[start..end].to_string()))
+        }
+        _ => Err(EvalError::Type("substring: expected string and two integers".into())),
+    }
+}
+
+fn builtin_string_to_number(args: &[Value]) -> Result<Value, EvalError> {
+    if args.len() != 1 {
+        return Err(EvalError::Arity("string->number expects 1 argument".into()));
+    }
+    match &args[0] {
+        Value::String(s) => match s.parse::<i64>() {
+            Ok(n) => Ok(Value::Integer(n)),
+            Err(_) => Ok(Value::Boolean(false)),
+        },
+        _ => Err(EvalError::Type("string->number: expected string".into())),
+    }
+}
+
+fn builtin_number_to_string(args: &[Value]) -> Result<Value, EvalError> {
+    if args.len() != 1 {
+        return Err(EvalError::Arity("number->string expects 1 argument".into()));
+    }
+    match &args[0] {
+        Value::Integer(n) => Ok(Value::String(n.to_string())),
+        _ => Err(EvalError::Type("number->string: expected number".into())),
+    }
+}
+
+fn builtin_symbol_to_string(args: &[Value]) -> Result<Value, EvalError> {
+    if args.len() != 1 {
+        return Err(EvalError::Arity("symbol->string expects 1 argument".into()));
+    }
+    match &args[0] {
+        Value::Symbol(s) => Ok(Value::String(s.clone())),
+        _ => Err(EvalError::Type("symbol->string: expected symbol".into())),
+    }
+}
+
+fn builtin_string_to_symbol(args: &[Value]) -> Result<Value, EvalError> {
+    if args.len() != 1 {
+        return Err(EvalError::Arity("string->symbol expects 1 argument".into()));
+    }
+    match &args[0] {
+        Value::String(s) => Ok(Value::Symbol(s.clone())),
+        _ => Err(EvalError::Type("string->symbol: expected string".into())),
+    }
+}
+
+fn builtin_string_ref(args: &[Value]) -> Result<Value, EvalError> {
+    if args.len() != 2 {
+        return Err(EvalError::Arity("string-ref expects 2 arguments".into()));
+    }
+    match (&args[0], &args[1]) {
+        (Value::String(s), Value::Integer(idx)) => {
+            let idx = *idx as usize;
+            s.chars().nth(idx)
+                .map(Value::Char)
+                .ok_or_else(|| EvalError::Type("string-ref: index out of range".into()))
+        }
+        _ => Err(EvalError::Type("string-ref: expected string and integer".into())),
+    }
+}
+
 /// Evaluate one or more Scheme expressions and return the string
 /// representation of the last result.
 pub fn eval_str(input: &str) -> Result<String, EvalError> {
@@ -809,8 +971,20 @@ pub fn eval_str(input: &str) -> Result<String, EvalError> {
 /// Evaluate Scheme expressions, returning both the result value and
 /// any output produced by `display`, `write`, or `newline`.
 pub fn eval_str_with_output(input: &str) -> Result<(String, String), EvalError> {
-    let result = eval_str(input)?;
-    Ok((result, String::new()))
+    // Clear any stale output
+    output_take();
+    let mut parser = Parser::new(input);
+    let exprs = parser.parse_all()?;
+    if exprs.is_empty() {
+        return Err(EvalError::Parse("no expressions".into()));
+    }
+    let env = default_env();
+    let mut result = Value::Void;
+    for expr in &exprs {
+        result = eval(expr, &env)?;
+    }
+    let output = output_take();
+    Ok((result.to_string(), output))
 }
 
 #[cfg(test)]
