@@ -11,6 +11,7 @@ type SchemeVal =
   | { tag: 'symbol'; value: string; pos?: Pos }
   | { tag: 'list'; elements: SchemeVal[]; pos?: Pos }
   | { tag: 'void'; pos?: Pos }
+  | { tag: 'char'; value: string; pos?: Pos }
   | { tag: 'lambda'; params: string[]; body: SchemeVal[]; env: Env; pos?: Pos }
   | { tag: 'builtin'; name: string; fn: (args: SchemeVal[], callPos?: Pos) => SchemeVal; pos?: Pos };
 
@@ -281,7 +282,7 @@ function evaluate(expr: SchemeVal, env: Env): SchemeVal {
 
 // ── Builtins ──────────────────────────────────────────────────────
 
-function makeGlobalEnv(): Env {
+function makeGlobalEnv(output: string[] = []): Env {
   const env = new Env();
 
   function defBuiltin(name: string, fn: (args: SchemeVal[], p?: Pos) => SchemeVal) {
@@ -353,6 +354,70 @@ function makeGlobalEnv(): Env {
   defBuiltin('boolean?', (args, p) => { if (args.length !== 1) throw posError('boolean?: need 1 argument', p); return { tag: 'boolean', value: args[0].tag === 'boolean' }; });
   defBuiltin('pair?', (args, p) => { if (args.length !== 1) throw posError('pair?: need 1 argument', p); return { tag: 'boolean', value: args[0].tag === 'list' && args[0].elements.length > 0 }; });
   defBuiltin('symbol?', (args, p) => { if (args.length !== 1) throw posError('symbol?: need 1 argument', p); return { tag: 'boolean', value: args[0].tag === 'symbol' }; });
+  defBuiltin('char?', (args, p) => { if (args.length !== 1) throw posError('char?: need 1 argument', p); return { tag: 'boolean', value: args[0].tag === 'char' }; });
+
+  // Output
+  defBuiltin('display', (args, p) => {
+    if (args.length !== 1) throw posError('display: need 1 argument', p);
+    output.push(displayForDisplay(args[0]));
+    return { tag: 'void' };
+  });
+  defBuiltin('write', (args, p) => {
+    if (args.length !== 1) throw posError('write: need 1 argument', p);
+    output.push(writeVal(args[0]));
+    return { tag: 'void' };
+  });
+  defBuiltin('newline', (args, p) => {
+    if (args.length !== 0) throw posError('newline: need 0 arguments', p);
+    output.push('\n');
+    return { tag: 'void' };
+  });
+
+  // String operations
+  defBuiltin('string-append', (args, p) => {
+    let result = '';
+    for (const a of args) {
+      if (a.tag !== 'string') throw posError('string-append: expected string', p);
+      result += a.value;
+    }
+    return { tag: 'string', value: result };
+  });
+  defBuiltin('string-length', (args, p) => {
+    if (args.length !== 1 || args[0].tag !== 'string') throw posError('string-length: expected string', p);
+    return { tag: 'number', value: args[0].value.length };
+  });
+  defBuiltin('substring', (args, p) => {
+    if (args.length !== 3) throw posError('substring: need 3 arguments', p);
+    if (args[0].tag !== 'string') throw posError('substring: expected string', p);
+    const start = expectNumber(args[1], 'substring', p);
+    const end = expectNumber(args[2], 'substring', p);
+    return { tag: 'string', value: args[0].value.slice(start, end) };
+  });
+  defBuiltin('string->number', (args, p) => {
+    if (args.length !== 1 || args[0].tag !== 'string') throw posError('string->number: expected string', p);
+    const n = Number(args[0].value);
+    if (isNaN(n)) return { tag: 'boolean', value: false };
+    return { tag: 'number', value: n };
+  });
+  defBuiltin('number->string', (args, p) => {
+    if (args.length !== 1) throw posError('number->string: need 1 argument', p);
+    return { tag: 'string', value: String(expectNumber(args[0], 'number->string', p)) };
+  });
+  defBuiltin('symbol->string', (args, p) => {
+    if (args.length !== 1 || args[0].tag !== 'symbol') throw posError('symbol->string: expected symbol', p);
+    return { tag: 'string', value: args[0].value };
+  });
+  defBuiltin('string->symbol', (args, p) => {
+    if (args.length !== 1 || args[0].tag !== 'string') throw posError('string->symbol: expected string', p);
+    return { tag: 'symbol', value: args[0].value };
+  });
+  defBuiltin('string-ref', (args, p) => {
+    if (args.length !== 2) throw posError('string-ref: need 2 arguments', p);
+    if (args[0].tag !== 'string') throw posError('string-ref: expected string', p);
+    const idx = expectNumber(args[1], 'string-ref', p);
+    if (idx < 0 || idx >= args[0].value.length) throw posError('string-ref: index out of range', p);
+    return { tag: 'char', value: args[0].value[idx] };
+  });
 
   return env;
 }
@@ -365,10 +430,24 @@ function displayVal(val: SchemeVal): string {
     case 'boolean': return val.value ? '#t' : '#f';
     case 'string': return `"${val.value}"`;
     case 'symbol': return val.value;
+    case 'char': return `#\\${val.value === ' ' ? 'space' : val.value === '\n' ? 'newline' : val.value}`;
     case 'list': return `(${val.elements.map(displayVal).join(' ')})`;
     case 'void': return '';
     case 'lambda': return '#<procedure>';
     case 'builtin': return '#<procedure>';
+  }
+}
+
+function writeVal(val: SchemeVal): string {
+  return displayVal(val);
+}
+
+function displayForDisplay(val: SchemeVal): string {
+  switch (val.tag) {
+    case 'string': return val.value;
+    case 'list': return `(${val.elements.map(displayForDisplay).join(' ')})`;
+    case 'char': return val.value;
+    default: return displayVal(val);
   }
 }
 
@@ -384,5 +463,11 @@ export function evalStr(input: string): string {
 }
 
 export function evalStrWithOutput(input: string): { result: string; output: string } {
-  return { result: evalStr(input), output: '' };
+  const exprs = parseAll(input);
+  if (exprs.length === 0) throw new EvalError('no expressions');
+  const output: string[] = [];
+  const env = makeGlobalEnv(output);
+  let result: SchemeVal = { tag: 'void' };
+  for (const expr of exprs) result = evaluate(expr, env);
+  return { result: displayVal(result), output: output.join('') };
 }
