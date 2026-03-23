@@ -11,6 +11,7 @@ enum Value:
   case LambdaVal(params: List[String], restParam: Option[String], body: List[Expr], closure: Env)
   case BuiltinVal(name: String, fn: List[Value] => Value)
   case CharVal(c: Char)
+  case ContinuationVal(k: Value => Bounce)
 
   def display: String = this match
     case IntVal(n)             => n.toString
@@ -22,6 +23,7 @@ enum Value:
     case LambdaVal(_, _, _, _) => "#<procedure>"
     case BuiltinVal(name, _)   => s"#<procedure:$name>"
     case CharVal(c)            => s"#\\$c"
+    case ContinuationVal(_)    => "#<continuation>"
 
   /** Display without quotes (for `display` builtin). */
   def displayNoQuotes: String = this match
