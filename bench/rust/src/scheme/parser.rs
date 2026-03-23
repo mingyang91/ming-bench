@@ -22,6 +22,7 @@ enum Token {
     Integer(i64),
     Boolean(bool),
     String(String),
+    Char(char),
 }
 
 fn tokenize(input: &str) -> Result<Vec<(Token, Span)>, EvalError> {
@@ -115,6 +116,42 @@ fn tokenize(input: &str) -> Result<Vec<(Token, Span)>, EvalError> {
                             i += 2;
                             col += 2;
                         }
+                        '\\' => {
+                            // Character literal: #\x or #\space, #\newline, etc.
+                            if i + 2 >= chars.len() {
+                                return Err(EvalError::Parse {
+                                    message: "unexpected end of input in character literal".to_string(),
+                                    span: start_span,
+                                });
+                            }
+                            // Read the character name
+                            let char_start = i + 2;
+                            let mut char_end = char_start + 1;
+                            // Check if it's a named character (alphabetic chars following)
+                            while char_end < chars.len()
+                                && chars[char_end].is_alphabetic()
+                                && char_end > char_start
+                            {
+                                char_end += 1;
+                            }
+                            let char_name: String = chars[char_start..char_end].iter().collect();
+                            let c = match char_name.as_str() {
+                                "space" => ' ',
+                                "newline" => '\n',
+                                "tab" => '\t',
+                                s if s.len() == 1 => s.chars().next().expect("single char"),
+                                other => {
+                                    return Err(EvalError::Parse {
+                                        message: format!("unknown character name: {other}"),
+                                        span: start_span,
+                                    });
+                                }
+                            };
+                            let consumed = char_end - i;
+                            tokens.push((Token::Char(c), start_span));
+                            i = char_end;
+                            col += consumed;
+                        }
                         _ => {
                             return Err(EvalError::Parse {
                                 message: format!(
@@ -170,8 +207,15 @@ fn parse_expr(tokens: &[(Token, Span)], pos: usize) -> Result<(Value, usize), Ev
     match token {
         Token::Integer(n) => Ok((Value::Integer(*n, *span), pos + 1)),
         Token::Boolean(b) => Ok((Value::Boolean(*b, *span), pos + 1)),
-        Token::String(s) => Ok((Value::String(s.clone(), *span), pos + 1)),
+        Token::String(s) => {
+            let mut val = Value::string(s.clone());
+            if let Value::String(_, ref mut sp) = val {
+                *sp = *span;
+            }
+            Ok((val, pos + 1))
+        }
         Token::Symbol(s) => Ok((Value::Symbol(s.clone(), *span), pos + 1)),
+        Token::Char(c) => Ok((Value::Char(*c, *span), pos + 1)),
         Token::LParen => {
             let list_span = *span;
             let mut elems = Vec::new();
