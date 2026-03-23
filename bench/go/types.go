@@ -30,7 +30,8 @@ func (v *SchemeBool) String() string {
 }
 
 type SchemeString struct {
-	Value string
+	Value   string
+	Mutable bool
 }
 
 func (v *SchemeString) String() string {

@@ -923,6 +923,11 @@ func init() {
 	builtins["string-ref"] = &BuiltinProc{Name: "string-ref", Fn: builtinStringRef}
 	builtins["string-copy"] = &BuiltinProc{Name: "string-copy", Fn: builtinStringCopy}
 	builtins["string-set!"] = &BuiltinProc{Name: "string-set!", Fn: builtinStringSet}
+	// L14 string immutability + char/integer conversion
+	builtins["string->list"] = &BuiltinProc{Name: "string->list", Fn: builtinStringToList}
+	builtins["list->string"] = &BuiltinProc{Name: "list->string", Fn: builtinListToString}
+	builtins["char->integer"] = &BuiltinProc{Name: "char->integer", Fn: builtinCharToInteger}
+	builtins["integer->char"] = &BuiltinProc{Name: "integer->char", Fn: builtinIntegerToChar}
 	// L13 numeric
 	builtins["abs"] = &BuiltinProc{Name: "abs", Fn: builtinAbs}
 	builtins["modulo"] = &BuiltinProc{Name: "modulo", Fn: builtinModulo}
@@ -1488,37 +1493,104 @@ func builtinStringCopy(args []SchemeValue, callExpr *ListExpr) (SchemeValue, err
 		line, col := callExpr.Pos()
 		return nil, &EvalError{Message: fmt.Sprintf("%d:%d: string-copy: expected string", line, col)}
 	}
-	return &SchemeString{Value: s.Value}, nil
+	return &SchemeString{Value: s.Value, Mutable: true}, nil
 }
 
 func builtinStringSet(args []SchemeValue, callExpr *ListExpr) (SchemeValue, error) {
+	line, col := callExpr.Pos()
 	if len(args) != 3 {
-		line, col := callExpr.Pos()
 		return nil, &EvalError{Message: fmt.Sprintf("%d:%d: string-set!: requires exactly 3 arguments", line, col)}
 	}
 	s, ok := args[0].(*SchemeString)
 	if !ok {
-		line, col := callExpr.Pos()
 		return nil, &EvalError{Message: fmt.Sprintf("%d:%d: string-set!: expected string", line, col)}
+	}
+	if !s.Mutable {
+		return nil, &EvalError{Message: fmt.Sprintf("%d:%d: string-set!: strings are immutable", line, col)}
 	}
 	idx, ok := args[1].(*SchemeInt)
 	if !ok {
-		line, col := callExpr.Pos()
-		return nil, &EvalError{Message: fmt.Sprintf("%d:%d: string-set!: expected number", line, col)}
+		return nil, &EvalError{Message: fmt.Sprintf("%d:%d: string-set!: expected integer index", line, col)}
 	}
 	ch, ok := args[2].(*SchemeChar)
 	if !ok {
-		line, col := callExpr.Pos()
-		return nil, &EvalError{Message: fmt.Sprintf("%d:%d: string-set!: expected char", line, col)}
+		return nil, &EvalError{Message: fmt.Sprintf("%d:%d: string-set!: expected character", line, col)}
 	}
 	runes := []rune(s.Value)
-	if idx.Value < 0 || idx.Value >= int64(len(runes)) {
-		line, col := callExpr.Pos()
+	i := int(idx.Value)
+	if i < 0 || i >= len(runes) {
 		return nil, &EvalError{Message: fmt.Sprintf("%d:%d: string-set!: index out of range", line, col)}
 	}
-	runes[idx.Value] = ch.Value
+	runes[i] = ch.Value
 	s.Value = string(runes)
 	return &SchemeVoid{}, nil
+}
+
+func builtinStringToList(args []SchemeValue, callExpr *ListExpr) (SchemeValue, error) {
+	if len(args) != 1 {
+		line, col := callExpr.Pos()
+		return nil, &EvalError{Message: fmt.Sprintf("%d:%d: string->list: requires exactly 1 argument", line, col)}
+	}
+	s, ok := args[0].(*SchemeString)
+	if !ok {
+		line, col := callExpr.Pos()
+		return nil, &EvalError{Message: fmt.Sprintf("%d:%d: string->list: expected string", line, col)}
+	}
+	var result SchemeValue = &SchemeEmpty{}
+	runes := []rune(s.Value)
+	for i := len(runes) - 1; i >= 0; i-- {
+		result = &SchemePair{Car: &SchemeChar{Value: runes[i]}, Cdr: result}
+	}
+	return result, nil
+}
+
+func builtinListToString(args []SchemeValue, callExpr *ListExpr) (SchemeValue, error) {
+	if len(args) != 1 {
+		line, col := callExpr.Pos()
+		return nil, &EvalError{Message: fmt.Sprintf("%d:%d: list->string: requires exactly 1 argument", line, col)}
+	}
+	var runes []rune
+	cur := args[0]
+	for {
+		pair, ok := cur.(*SchemePair)
+		if !ok {
+			break
+		}
+		ch, ok := pair.Car.(*SchemeChar)
+		if !ok {
+			line, col := callExpr.Pos()
+			return nil, &EvalError{Message: fmt.Sprintf("%d:%d: list->string: expected list of characters", line, col)}
+		}
+		runes = append(runes, ch.Value)
+		cur = pair.Cdr
+	}
+	return &SchemeString{Value: string(runes), Mutable: true}, nil
+}
+
+func builtinCharToInteger(args []SchemeValue, callExpr *ListExpr) (SchemeValue, error) {
+	if len(args) != 1 {
+		line, col := callExpr.Pos()
+		return nil, &EvalError{Message: fmt.Sprintf("%d:%d: char->integer: requires exactly 1 argument", line, col)}
+	}
+	ch, ok := args[0].(*SchemeChar)
+	if !ok {
+		line, col := callExpr.Pos()
+		return nil, &EvalError{Message: fmt.Sprintf("%d:%d: char->integer: expected character", line, col)}
+	}
+	return &SchemeInt{Value: int64(ch.Value)}, nil
+}
+
+func builtinIntegerToChar(args []SchemeValue, callExpr *ListExpr) (SchemeValue, error) {
+	if len(args) != 1 {
+		line, col := callExpr.Pos()
+		return nil, &EvalError{Message: fmt.Sprintf("%d:%d: integer->char: requires exactly 1 argument", line, col)}
+	}
+	n, ok := args[0].(*SchemeInt)
+	if !ok {
+		line, col := callExpr.Pos()
+		return nil, &EvalError{Message: fmt.Sprintf("%d:%d: integer->char: expected integer", line, col)}
+	}
+	return &SchemeChar{Value: rune(n.Value)}, nil
 }
 
 func builtinMapEnv(args []SchemeValue, callExpr *ListExpr, env *Env) (SchemeValue, error) {
