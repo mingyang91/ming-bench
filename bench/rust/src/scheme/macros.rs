@@ -79,6 +79,7 @@ fn collect_pattern_vars_inner(pattern: &Value, literals: &[String], vars: &mut V
         | Value::Pair(_, _)
         | Value::Vector(_, _)
         | Value::Closure { .. }
+        | Value::CaseLambda { .. }
         | Value::Continuation(_)
         | Value::Macro(_)
         | Value::Values(_)
@@ -178,6 +179,7 @@ fn match_pattern(
         | Value::Pair(_, _)
         | Value::Vector(_, _)
         | Value::Closure { .. }
+        | Value::CaseLambda { .. }
         | Value::Continuation(_)
         | Value::Macro(_)
         | Value::Values(_)
@@ -238,6 +240,7 @@ pub(crate) fn expand_template(
         | Value::Pair(_, _)
         | Value::Vector(_, _)
         | Value::Closure { .. }
+        | Value::CaseLambda { .. }
         | Value::Continuation(_)
         | Value::Macro(_)
         | Value::Values(_)
@@ -314,6 +317,7 @@ fn template_symbols(template: &Value) -> Vec<String> {
         | Value::Pair(_, _)
         | Value::Vector(_, _)
         | Value::Closure { .. }
+        | Value::CaseLambda { .. }
         | Value::Continuation(_)
         | Value::Macro(_)
         | Value::Values(_)

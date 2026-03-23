@@ -22,6 +22,13 @@ pub struct SyntaxRules {
 }
 
 #[derive(Debug, Clone)]
+pub struct CaseLambdaClause {
+    pub params: Vec<String>,
+    pub rest_param: Option<String>,
+    pub body: Value,
+}
+
+#[derive(Debug, Clone)]
 pub enum Value {
     Integer(i64, Span),
     Rational(i64, i64, Span), // numerator, denominator (always simplified, denom > 0)
@@ -37,6 +44,10 @@ pub enum Value {
         params: Vec<String>,
         rest_param: Option<String>,
         body: Box<Value>,
+        env: Env,
+    },
+    CaseLambda {
+        clauses: Vec<CaseLambdaClause>,
         env: Env,
     },
     Continuation(u64),
@@ -102,6 +113,7 @@ impl PartialEq for Value {
              Value::Closure { params: p2, rest_param: r2, body: b2, env: e2 }) => {
                 p1 == p2 && r1 == r2 && b1 == b2 && e1 == e2
             }
+            (Value::CaseLambda { .. }, Value::CaseLambda { .. }) => false,
             (Value::Vector(a, _), Value::Vector(b, _)) => *a.borrow() == *b.borrow(),
             (Value::Continuation(a), Value::Continuation(b)) => a == b,
             (Value::Values(a), Value::Values(b)) => a == b,
@@ -203,6 +215,7 @@ impl fmt::Display for Value {
                 write!(f, ")")
             }
             Value::Closure { .. } => write!(f, "#<procedure>"),
+            Value::CaseLambda { .. } => write!(f, "#<procedure>"),
             Value::Continuation(_) => write!(f, "#<continuation>"),
             Value::Macro(_) => write!(f, "#<macro>"),
             Value::Values(_) => write!(f, "#<values>"),
@@ -252,6 +265,7 @@ impl Value {
             | Value::Boolean(_, _)
             | Value::Symbol(_, _)
             | Value::Closure { .. }
+            | Value::CaseLambda { .. }
             | Value::Continuation(_)
             | Value::Macro(_)
             | Value::Values(_)
@@ -276,6 +290,7 @@ impl Value {
             | Value::Pair(_, s)
             | Value::Vector(_, s) => *s,
             Value::Closure { .. } => Span::default(),
+            Value::CaseLambda { .. } => Span::default(),
             Value::Continuation(_) => Span::default(),
             Value::Macro(_) => Span::default(),
             Value::Values(_) => Span::default(),

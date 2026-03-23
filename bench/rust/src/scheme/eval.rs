@@ -5,7 +5,7 @@ use crate::scheme::env::Env;
 use crate::scheme::error::{EvalError, GuardTailData, Span};
 use crate::scheme::macros;
 use crate::scheme::macros::{Binding, PatternBindings};
-use crate::scheme::value::{make_rational, Mutability, RecordOp, SyntaxRules, Value};
+use crate::scheme::value::{make_rational, CaseLambdaClause, Mutability, RecordOp, SyntaxRules, Value};
 
 // ── Pair/List helpers ──────────────────────────────────────────────────────
 
@@ -433,6 +433,7 @@ fn eval_inner(expr: &Value, env: &Env, guard_tail: bool) -> Result<Value, EvalEr
             | Value::Pair(_, _)
             | Value::Vector(_, _)
             | Value::Closure { .. }
+            | Value::CaseLambda { .. }
             | Value::Continuation(_)
             | Value::Macro(_)
             | Value::Values(_)
@@ -572,6 +573,7 @@ fn eval_inner(expr: &Value, env: &Env, guard_tail: bool) -> Result<Value, EvalEr
                         }
                         "quote" => return eval_quote(&elems[1..], list_span),
                         "lambda" => return eval_lambda(&elems[1..], list_span, &current_env),
+                        "case-lambda" => return eval_case_lambda(&elems[1..], list_span, &current_env),
                         "let" => {
                             let args = &elems[1..];
                             if args.len() < 2 {
@@ -1082,6 +1084,28 @@ fn dispatch_call(func: Value, args: Vec<Value>, span: Span, env: &Env) -> Result
             let local_env = bind_closure_args(params, rest_param, &args, closure_env, span)?;
             Ok(TailAction::TailCall(*body.clone(), local_env))
         }
+        Value::CaseLambda { ref clauses, env: ref closure_env } => {
+            let clause = clauses.iter().find(|c| {
+                if c.rest_param.is_some() {
+                    args.len() >= c.params.len()
+                } else {
+                    args.len() == c.params.len()
+                }
+            }).ok_or_else(|| EvalError::WrongArgCount {
+                expected: clauses.iter()
+                    .map(|c| if c.rest_param.is_some() {
+                        format!("at least {}", c.params.len())
+                    } else {
+                        c.params.len().to_string()
+                    })
+                    .collect::<Vec<_>>()
+                    .join(" or "),
+                got: args.len(),
+                span,
+            })?;
+            let local_env = bind_closure_args(&clause.params, &clause.rest_param, &args, closure_env, span)?;
+            Ok(TailAction::TailCall(clause.body.clone(), local_env))
+        }
         Value::RecordProcedure(ref op) => {
             Ok(TailAction::Result(apply_record_op(op, args, span)?))
         }
@@ -1383,7 +1407,7 @@ fn apply_builtin(name: &str, args: &[Value], span: Span, env: &Env) -> Result<Va
         "member" => builtin_member(args, span),
         "gcd" => builtin_gcd(args, span),
         "lcm" => builtin_lcm(args, span),
-        "procedure?" => Ok(Value::bool(matches!(args, [Value::Closure { .. }] | [Value::Symbol(_, _)] | [Value::RecordProcedure(_)] | [Value::Continuation(_)]))),
+        "procedure?" => Ok(Value::bool(matches!(args, [Value::Closure { .. }] | [Value::CaseLambda { .. }] | [Value::Symbol(_, _)] | [Value::RecordProcedure(_)] | [Value::Continuation(_)]))),
         "round" => builtin_round(args, span),
         "truncate" => builtin_truncate(args, span),
         "make-string" => builtin_make_string(args, span),
@@ -2229,6 +2253,54 @@ fn eval_lambda(args: &[Value], form_span: Span, env: &Env) -> Result<Value, Eval
         params,
         rest_param,
         body: Box::new(body),
+        env: env.clone(),
+    })
+}
+
+fn eval_case_lambda(args: &[Value], form_span: Span, env: &Env) -> Result<Value, EvalError> {
+    if args.is_empty() {
+        return Err(EvalError::WrongArgCount {
+            expected: "at least 1".to_string(),
+            got: 0,
+            span: form_span,
+        });
+    }
+    let mut clauses = Vec::new();
+    for clause_expr in args {
+        let Value::List(clause_elems, _) = clause_expr else {
+            return Err(EvalError::TypeMismatch {
+                expected: "clause".to_string(),
+                got: clause_expr.to_string(),
+                span: clause_expr.span(),
+            });
+        };
+        if clause_elems.len() < 2 {
+            return Err(EvalError::Parse {
+                message: "case-lambda clause needs params and body".to_string(),
+                span: clause_expr.span(),
+            });
+        }
+        let Value::List(param_list, _) = &clause_elems[0] else {
+            return Err(EvalError::TypeMismatch {
+                expected: "parameter list".to_string(),
+                got: clause_elems[0].to_string(),
+                span: clause_elems[0].span(),
+            });
+        };
+        let (params, rest_param) = parse_params(param_list)?;
+        let body = if clause_elems.len() == 2 {
+            clause_elems[1].clone()
+        } else {
+            Value::list(
+                std::iter::once(Value::symbol("begin".to_string()))
+                    .chain(clause_elems[1..].iter().cloned())
+                    .collect(),
+            )
+        };
+        clauses.push(CaseLambdaClause { params, rest_param, body });
+    }
+    Ok(Value::CaseLambda {
+        clauses,
         env: env.clone(),
     })
 }
