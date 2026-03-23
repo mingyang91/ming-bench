@@ -2,7 +2,8 @@ pub mod error;
 
 pub use error::EvalError;
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
+use std::sync::atomic::{AtomicU64, Ordering};
 
 /// A Scheme value.
 #[derive(Debug, Clone)]
@@ -22,6 +23,11 @@ enum Value {
     },
     Builtin(String),
     Continuation(Vec<KontFrame>),
+    Macro {
+        literals: Vec<String>,
+        rules: Vec<(Expr, Expr)>,
+        def_env: Env,
+    },
 }
 
 thread_local! {
@@ -45,6 +51,7 @@ impl Value {
             Value::Lambda { .. } => "#<procedure>".to_string(),
             Value::Builtin(_) => "#<procedure>".to_string(),
             Value::Continuation(_) => "#<continuation>".to_string(),
+            Value::Macro { .. } => "#<macro>".to_string(),
         }
     }
 
@@ -57,6 +64,7 @@ impl Value {
                 let inner: Vec<String> = items.iter().map(|v| v.display_write(write_mode)).collect();
                 format!("({})", inner.join(" "))
             }
+            Value::Macro { .. } => self.display(),
             _ => self.display(),
         }
     }
@@ -498,6 +506,252 @@ fn eval_cond(clauses: &[Expr], env: Env, el: u32, ec: u32, kont: &mut Vec<KontFr
     }
 }
 
+// --- Hygienic Macros ---
+
+static GENSYM_COUNTER: AtomicU64 = AtomicU64::new(0);
+
+fn gensym(base: &str) -> String {
+    let n = GENSYM_COUNTER.fetch_add(1, Ordering::Relaxed);
+    format!("{}__macro_{}", base, n)
+}
+
+fn is_special_form(name: &str) -> bool {
+    matches!(
+        name,
+        "quote" | "if" | "define" | "set!" | "lambda" | "and" | "or"
+            | "let" | "begin" | "cond" | "string-set!" | "call/cc"
+            | "call-with-current-continuation" | "define-syntax" | "syntax-rules"
+    )
+}
+
+fn parse_syntax_rules(expr: &Expr, el: u32, ec: u32) -> Result<(Vec<String>, Vec<(Expr, Expr)>), EvalError> {
+    let items = match &expr.kind {
+        ExprKind::List(items) => items,
+        _ => return Err(EvalError::Parse("expected syntax-rules".into()).at(el, ec)),
+    };
+    if items.len() < 2 {
+        return Err(EvalError::Parse("syntax-rules: too few parts".into()).at(el, ec));
+    }
+    match &items[0].kind {
+        ExprKind::Symbol(s) if s == "syntax-rules" => {}
+        _ => return Err(EvalError::Parse("expected syntax-rules".into()).at(el, ec)),
+    }
+    let literals = match &items[1].kind {
+        ExprKind::List(lits) => {
+            let mut ls = Vec::new();
+            for l in lits {
+                match &l.kind {
+                    ExprKind::Symbol(s) => ls.push(s.clone()),
+                    _ => return Err(EvalError::Parse("literal must be identifier".into()).at(el, ec)),
+                }
+            }
+            ls
+        }
+        _ => return Err(EvalError::Parse("expected literals list".into()).at(el, ec)),
+    };
+    let mut rules = Vec::new();
+    for item in &items[2..] {
+        match &item.kind {
+            ExprKind::List(pair) if pair.len() == 2 => {
+                rules.push((pair[0].clone(), pair[1].clone()));
+            }
+            _ => return Err(EvalError::Parse("syntax rule must be (pattern template)".into()).at(el, ec)),
+        }
+    }
+    Ok((literals, rules))
+}
+
+fn macro_match_pattern(
+    pattern: &[Expr],
+    input: &[Expr],
+    literals: &[String],
+    bindings: &mut HashMap<String, Vec<Expr>>,
+    ellipsis_vars: &mut HashSet<String>,
+) -> bool {
+    let mut pi = 0;
+    let mut ii = 0;
+    while pi < pattern.len() {
+        let has_ellipsis = pi + 1 < pattern.len()
+            && matches!(&pattern[pi + 1].kind, ExprKind::Symbol(ref s) if s == "...");
+        if has_ellipsis {
+            let var_name = match &pattern[pi].kind {
+                ExprKind::Symbol(s) if !literals.contains(s) => s.clone(),
+                _ => return false,
+            };
+            let remaining_pats = pattern.len() - pi - 2;
+            let available = if input.len() >= ii + remaining_pats {
+                input.len() - ii - remaining_pats
+            } else {
+                return false;
+            };
+            let matched: Vec<Expr> = input[ii..ii + available].to_vec();
+            ellipsis_vars.insert(var_name.clone());
+            bindings.insert(var_name, matched);
+            ii += available;
+            pi += 2;
+        } else {
+            if ii >= input.len() {
+                return false;
+            }
+            match &pattern[pi].kind {
+                ExprKind::Symbol(s) if literals.contains(s) => {
+                    if !matches!(&input[ii].kind, ExprKind::Symbol(ref t) if t == s) {
+                        return false;
+                    }
+                    pi += 1;
+                    ii += 1;
+                }
+                ExprKind::Symbol(s) if s == "_" => {
+                    pi += 1;
+                    ii += 1;
+                }
+                ExprKind::Symbol(s) => {
+                    bindings.insert(s.clone(), vec![input[ii].clone()]);
+                    pi += 1;
+                    ii += 1;
+                }
+                ExprKind::List(sub_pat) => {
+                    if let ExprKind::List(ref sub_inp) = input[ii].kind {
+                        if !macro_match_pattern(sub_pat, sub_inp, literals, bindings, ellipsis_vars) {
+                            return false;
+                        }
+                    } else {
+                        return false;
+                    }
+                    pi += 1;
+                    ii += 1;
+                }
+                _ => {
+                    pi += 1;
+                    ii += 1;
+                }
+            }
+        }
+    }
+    ii == input.len()
+}
+
+fn collect_ellipsis_vars_in(expr: &Expr, evars: &HashSet<String>, found: &mut Vec<String>) {
+    match &expr.kind {
+        ExprKind::Symbol(s) if evars.contains(s.as_str()) => {
+            if !found.contains(s) {
+                found.push(s.clone());
+            }
+        }
+        ExprKind::List(items) => {
+            for item in items {
+                collect_ellipsis_vars_in(item, evars, found);
+            }
+        }
+        _ => {}
+    }
+}
+
+fn instantiate_template(
+    template: &Expr,
+    bindings: &HashMap<String, Vec<Expr>>,
+    ellipsis_vars: &HashSet<String>,
+    rename_map: &mut HashMap<String, String>,
+    def_env: &Env,
+    use_env: &Env,
+) -> Result<Expr, EvalError> {
+    let (l, c) = (template.line, template.col);
+    match &template.kind {
+        ExprKind::Symbol(s) if s == "..." => Ok(template.clone()),
+        ExprKind::Symbol(s) => {
+            if let Some(vals) = bindings.get(s) {
+                if vals.len() == 1 {
+                    Ok(vals[0].clone())
+                } else {
+                    Ok(template.clone())
+                }
+            } else if is_special_form(s) || is_builtin(s) {
+                Ok(template.clone())
+            } else {
+                let renamed = rename_map
+                    .entry(s.clone())
+                    .or_insert_with(|| gensym(s))
+                    .clone();
+                if let Some(val) = env_get(def_env, s) {
+                    env_set(use_env, renamed.clone(), val);
+                }
+                Ok(Expr::new(ExprKind::Symbol(renamed), l, c))
+            }
+        }
+        ExprKind::List(items) => {
+            let mut result = Vec::new();
+            let mut i = 0;
+            while i < items.len() {
+                if i + 1 < items.len()
+                    && matches!(&items[i + 1].kind, ExprKind::Symbol(ref s) if s == "...")
+                {
+                    let mut found = Vec::new();
+                    collect_ellipsis_vars_in(&items[i], ellipsis_vars, &mut found);
+                    if found.is_empty() {
+                        i += 2;
+                        continue;
+                    }
+                    let count = bindings.get(&found[0]).map(|v| v.len()).unwrap_or(0);
+                    for j in 0..count {
+                        let mut sub_bindings = bindings.clone();
+                        for var in &found {
+                            if let Some(vals) = bindings.get(var) {
+                                if j < vals.len() {
+                                    sub_bindings.insert(var.clone(), vec![vals[j].clone()]);
+                                }
+                            }
+                        }
+                        let expanded = instantiate_template(
+                            &items[i],
+                            &sub_bindings,
+                            ellipsis_vars,
+                            rename_map,
+                            def_env,
+                            use_env,
+                        )?;
+                        result.push(expanded);
+                    }
+                    i += 2;
+                } else {
+                    let expanded = instantiate_template(
+                        &items[i], bindings, ellipsis_vars, rename_map, def_env, use_env,
+                    )?;
+                    result.push(expanded);
+                    i += 1;
+                }
+            }
+            Ok(Expr::new(ExprKind::List(result), l, c))
+        }
+        _ => Ok(template.clone()),
+    }
+}
+
+fn expand_macro(
+    input: &[Expr],
+    literals: &[String],
+    rules: &[(Expr, Expr)],
+    def_env: &Env,
+    use_env: &Env,
+    el: u32,
+    ec: u32,
+) -> Result<Expr, EvalError> {
+    for (pattern, template) in rules {
+        let pat_items = match &pattern.kind {
+            ExprKind::List(items) => items,
+            _ => continue,
+        };
+        let pat_args = if pat_items.len() > 1 { &pat_items[1..] } else { &[] as &[Expr] };
+        let input_args = if input.len() > 1 { &input[1..] } else { &[] as &[Expr] };
+        let mut bindings = HashMap::new();
+        let mut evars = HashSet::new();
+        if macro_match_pattern(pat_args, input_args, literals, &mut bindings, &mut evars) {
+            let mut rename_map = HashMap::new();
+            return instantiate_template(template, &bindings, &evars, &mut rename_map, def_env, use_env);
+        }
+    }
+    Err(EvalError::Parse("no matching syntax rule".into()).at(el, ec))
+}
+
 /// Apply a function value to evaluated arguments within the CEK machine.
 fn apply_func(func: Value, args: Vec<Value>, kont: &mut Vec<KontFrame>, el: u32, ec: u32) -> Result<Ctrl, EvalError> {
     match func {
@@ -780,12 +1034,36 @@ fn run_cek(initial_ctrl: Ctrl, initial_kont: Vec<KontFrame>) -> Result<Value, Ev
                                     kont.push(KontFrame::CallCC { el, ec });
                                     Ctrl::Eval(items[1].clone(), env)
                                 }
+                                Some("define-syntax") => {
+                                    if items.len() != 3 {
+                                        return Err(EvalError::Arity("define-syntax requires 2 arguments".into()).at(el, ec));
+                                    }
+                                    let name = match &items[1].kind {
+                                        ExprKind::Symbol(s) => s.clone(),
+                                        _ => return Err(EvalError::Type("define-syntax: expected symbol".into()).at(el, ec)),
+                                    };
+                                    let (literals, rules) = parse_syntax_rules(&items[2], el, ec)?;
+                                    env_set(&env, name, Value::Macro { literals, rules, def_env: env.clone() });
+                                    Ctrl::Val(Value::Void)
+                                }
                                 _ => {
-                                    // Procedure call: eval function, then args right-to-left
-                                    let func_expr = items[0].clone();
-                                    let arg_exprs = items[1..].to_vec();
-                                    kont.push(KontFrame::EvalFunc { arg_exprs, env: env.clone(), el, ec });
-                                    Ctrl::Eval(func_expr, env)
+                                    // Check for macro invocation
+                                    if let Some(ref name) = op_name {
+                                        if let Some(Value::Macro { literals, rules, def_env }) = env_get(&env, name) {
+                                            let expanded = expand_macro(&items, &literals, &rules, &def_env, &env, el, ec)?;
+                                            Ctrl::Eval(expanded, env)
+                                        } else {
+                                            let func_expr = items[0].clone();
+                                            let arg_exprs = items[1..].to_vec();
+                                            kont.push(KontFrame::EvalFunc { arg_exprs, env: env.clone(), el, ec });
+                                            Ctrl::Eval(func_expr, env)
+                                        }
+                                    } else {
+                                        let func_expr = items[0].clone();
+                                        let arg_exprs = items[1..].to_vec();
+                                        kont.push(KontFrame::EvalFunc { arg_exprs, env: env.clone(), el, ec });
+                                        Ctrl::Eval(func_expr, env)
+                                    }
                                 }
                             }
                         }
