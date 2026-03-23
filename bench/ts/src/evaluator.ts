@@ -602,6 +602,33 @@ function makeGlobalEnv(): Env {
     if (args[0].tag !== 'string') throw new EvalError('string-copy: expected string');
     return { tag: 'string', value: args[0].value };
   });
+  defBuiltin('string->list', (args) => {
+    if (args[0].tag !== 'string') throw new EvalError('string->list: expected string');
+    const chars: SchemeVal[] = Array.from(args[0].value).map(c => ({ tag: 'char' as const, value: c }));
+    let result: SchemeVal = NIL;
+    for (let i = chars.length - 1; i >= 0; i--) {
+      result = { tag: 'pair', car: chars[i], cdr: result };
+    }
+    return result;
+  });
+  defBuiltin('list->string', (args) => {
+    let node = args[0];
+    let str = '';
+    while (node.tag === 'pair') {
+      if (node.car.tag !== 'char') throw new EvalError('list->string: expected list of chars');
+      str += node.car.value;
+      node = node.cdr;
+    }
+    return { tag: 'string', value: str };
+  });
+  defBuiltin('char->integer', (args) => {
+    if (args[0].tag !== 'char') throw new EvalError('char->integer: expected char');
+    return { tag: 'number', value: args[0].value.codePointAt(0)! };
+  });
+  defBuiltin('integer->char', (args) => {
+    const n = expectNumber(args[0], 'integer->char');
+    return { tag: 'char', value: String.fromCodePoint(n) };
+  });
 
   // eq? / eqv? / equal?
   function schemeEq(a: SchemeVal, b: SchemeVal): boolean {
