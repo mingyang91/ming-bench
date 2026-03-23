@@ -132,7 +132,8 @@ public class Evaluator {
         "display", "write", "newline",
         "string-append", "string-length", "substring",
         "string->number", "number->string",
-        "symbol->string", "string->symbol", "string-ref"
+        "symbol->string", "string->symbol", "string-ref",
+        "string-set!", "string-copy"
     );
 
     private boolean isBuiltin(String name) {
@@ -279,7 +280,7 @@ public class Evaluator {
                 if (args.size() != 1) throw new EvalError("string-length: needs exactly 1 argument");
                 var v = eval(args.getFirst(), env);
                 if (!(v instanceof SchemeValue.StringVal s)) throw new EvalError("string-length: not a string");
-                yield new SchemeValue.IntVal(s.value().length());
+                yield new SchemeValue.IntVal(s.length());
             }
             case "substring" -> {
                 if (args.size() != 3) throw new EvalError("substring: needs exactly 3 arguments");
@@ -320,9 +321,25 @@ public class Evaluator {
                 var v = eval(args.get(0), env);
                 if (!(v instanceof SchemeValue.StringVal s)) throw new EvalError("string-ref: not a string");
                 int idx = (int) asInt(eval(args.get(1), env));
-                yield new SchemeValue.CharVal(s.value().charAt(idx));
+                yield new SchemeValue.CharVal(s.charAt(idx));
             }
             case "char?" -> typePred(args, env, SchemeValue.CharVal.class);
+            case "string-set!" -> {
+                if (args.size() != 3) throw new EvalError("string-set!: needs exactly 3 arguments");
+                var v = eval(args.get(0), env);
+                if (!(v instanceof SchemeValue.StringVal s)) throw new EvalError("string-set!: not a string");
+                int idx = (int) asInt(eval(args.get(1), env));
+                var ch = eval(args.get(2), env);
+                if (!(ch instanceof SchemeValue.CharVal c)) throw new EvalError("string-set!: not a character");
+                s.setChar(idx, c.value());
+                yield new SchemeValue.VoidVal();
+            }
+            case "string-copy" -> {
+                if (args.size() != 1) throw new EvalError("string-copy: needs exactly 1 argument");
+                var v = eval(args.getFirst(), env);
+                if (!(v instanceof SchemeValue.StringVal s)) throw new EvalError("string-copy: not a string");
+                yield s.copy();
+            }
             default -> throw new EvalError("unknown procedure: " + name);
         };
     }

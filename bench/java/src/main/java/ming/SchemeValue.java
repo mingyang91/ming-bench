@@ -13,8 +13,16 @@ public sealed interface SchemeValue {
         @Override public String display() { return value ? "#t" : "#f"; }
     }
 
-    record StringVal(String value) implements SchemeValue {
-        @Override public String display() { return "\"" + value + "\""; }
+    final class StringVal implements SchemeValue {
+        private final char[] chars;
+        public StringVal(String value) { this.chars = value.toCharArray(); }
+        private StringVal(char[] chars) { this.chars = chars.clone(); }
+        public String value() { return new String(chars); }
+        public char charAt(int i) { return chars[i]; }
+        public void setChar(int i, char c) { chars[i] = c; }
+        public int length() { return chars.length; }
+        public StringVal copy() { return new StringVal(chars); }
+        @Override public String display() { return "\"" + new String(chars) + "\""; }
     }
 
     record SymbolVal(String name, int line, int col) implements SchemeValue {

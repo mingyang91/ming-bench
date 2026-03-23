@@ -107,6 +107,29 @@ public class Parser {
             }
             return new SchemeValue.BoolVal(false);
         }
+        if (next == '\\') {
+            pos += 2; // skip #\
+            if (pos >= input.length()) throw new EvalError("unexpected end of character literal");
+            // Named characters
+            if (pos + 4 <= input.length() && input.substring(pos, pos + 5).equals("space") &&
+                (pos + 5 >= input.length() || !isSymbolChar(input.charAt(pos + 5)))) {
+                pos += 5;
+                return new SchemeValue.CharVal(' ');
+            }
+            if (pos + 6 <= input.length() && input.substring(pos, pos + 7).equals("newline") &&
+                (pos + 7 >= input.length() || !isSymbolChar(input.charAt(pos + 7)))) {
+                pos += 7;
+                return new SchemeValue.CharVal('\n');
+            }
+            if (pos + 2 <= input.length() && input.substring(pos, pos + 3).equals("tab") &&
+                (pos + 3 >= input.length() || !isSymbolChar(input.charAt(pos + 3)))) {
+                pos += 3;
+                return new SchemeValue.CharVal('\t');
+            }
+            char ch = input.charAt(pos);
+            pos++;
+            return new SchemeValue.CharVal(ch);
+        }
         throw new EvalError("unexpected #" + next);
     }
 
