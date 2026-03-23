@@ -248,6 +248,7 @@ var specialForms = map[string]bool{
 	"if": true, "let": true, "begin": true, "set!": true, "define": true,
 	"lambda": true, "cond": true, "and": true, "or": true, "quote": true,
 	"define-syntax": true, "syntax-rules": true, "let*": true, "letrec": true,
+	"letrec*": true, "case": true, "do": true,
 }
 
 func isSpecialForm(name string) bool {

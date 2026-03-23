@@ -329,6 +329,56 @@ func Eval(expr Expr, env *Env) (SchemeValue, error) {
 
 				case "define-syntax":
 					return evalDefineSyntax(e, env)
+
+				case "letrec":
+					newExpr, newEnv, err := setupLetrec(e, env, false)
+					if err != nil {
+						return nil, err
+					}
+					expr = newExpr
+					env = newEnv
+					continue
+
+				case "letrec*":
+					newExpr, newEnv, err := setupLetrec(e, env, true)
+					if err != nil {
+						return nil, err
+					}
+					expr = newExpr
+					env = newEnv
+					continue
+
+				case "case":
+					newExpr, done, result, err := evalCase(e, env)
+					if err != nil {
+						return nil, err
+					}
+					if done {
+						return result, nil
+					}
+					expr = newExpr
+					continue
+
+				case "do":
+					newExpr, newEnv, err := evalDo(e, env)
+					if err != nil {
+						return nil, err
+					}
+					if newExpr == nil {
+						return &SchemeVoid{}, nil
+					}
+					expr = newExpr
+					env = newEnv
+					continue
+
+				case "let*":
+					newExpr, newEnv, err := setupLetStar(e, env)
+					if err != nil {
+						return nil, err
+					}
+					expr = newExpr
+					env = newEnv
+					continue
 				}
 			}
 
@@ -961,6 +1011,17 @@ func init() {
 	builtins["string-ci=?"] = &BuiltinProc{Name: "string-ci=?", Fn: builtinStringCiEqQ}
 	builtins["string-upcase"] = &BuiltinProc{Name: "string-upcase", Fn: builtinStringUpcase}
 	builtins["string-downcase"] = &BuiltinProc{Name: "string-downcase", Fn: builtinStringDowncase}
+	// L15
+	builtins["eqv?"] = &BuiltinProc{Name: "eqv?", Fn: builtinEqvQ}
+	builtins["vector"] = &BuiltinProc{Name: "vector", Fn: builtinVector}
+	builtins["make-vector"] = &BuiltinProc{Name: "make-vector", Fn: builtinMakeVector}
+	builtins["vector-ref"] = &BuiltinProc{Name: "vector-ref", Fn: builtinVectorRef}
+	builtins["vector-set!"] = &BuiltinProc{Name: "vector-set!", Fn: builtinVectorSet}
+	builtins["vector-length"] = &BuiltinProc{Name: "vector-length", Fn: builtinVectorLength}
+	builtins["vector?"] = &BuiltinProc{Name: "vector?", Fn: builtinVectorQ}
+	builtins["vector->list"] = &BuiltinProc{Name: "vector->list", Fn: builtinVectorToList}
+	builtins["list->vector"] = &BuiltinProc{Name: "list->vector", Fn: builtinListToVector}
+	builtins["error"] = &BuiltinProc{Name: "error", Fn: builtinError}
 }
 
 func builtinAdd(args []SchemeValue, callExpr *ListExpr) (SchemeValue, error) {
@@ -1941,6 +2002,20 @@ func schemeEqual(a, b SchemeValue) bool {
 			return false
 		}
 		return schemeEqual(av.Car, bv.Car) && schemeEqual(av.Cdr, bv.Cdr)
+	case *SchemeVector:
+		bv, ok := b.(*SchemeVector)
+		if !ok {
+			return false
+		}
+		if len(av.Elements) != len(bv.Elements) {
+			return false
+		}
+		for i := range av.Elements {
+			if !schemeEqual(av.Elements[i], bv.Elements[i]) {
+				return false
+			}
+		}
+		return true
 	default:
 		return a == b // pointer equality for everything else
 	}
@@ -2180,4 +2255,441 @@ func builtinStringDowncase(args []SchemeValue, callExpr *ListExpr) (SchemeValue,
 		return nil, &EvalError{Message: fmt.Sprintf("%d:%d: string-downcase: expected string", line, col)}
 	}
 	return &SchemeString{Value: strings.ToLower(s.Value)}, nil
+}
+
+// --- L15: letrec, letrec*, case, do, let*, vectors ---
+
+// setupLetrec handles both letrec and letrec*.
+// In letrec, all bindings see the same env (init with void, then set!).
+// In letrec*, bindings are evaluated sequentially in the shared env.
+func setupLetrec(e *ListExpr, env *Env, star bool) (Expr, *Env, error) {
+	if len(e.Elements) < 3 {
+		line, col := e.Pos()
+		return nil, nil, &EvalError{Message: fmt.Sprintf("%d:%d: letrec: bad syntax", line, col)}
+	}
+	bindingsList, ok := e.Elements[1].(*ListExpr)
+	if !ok {
+		line, col := e.Pos()
+		return nil, nil, &EvalError{Message: fmt.Sprintf("%d:%d: letrec: bad syntax", line, col)}
+	}
+	localEnv := NewEnv(env)
+	// First pass: bind all names to void
+	names := make([]string, len(bindingsList.Elements))
+	initExprs := make([]Expr, len(bindingsList.Elements))
+	for i, b := range bindingsList.Elements {
+		pair, ok := b.(*ListExpr)
+		if !ok || len(pair.Elements) != 2 {
+			line, col := e.Pos()
+			return nil, nil, &EvalError{Message: fmt.Sprintf("%d:%d: letrec: bad syntax", line, col)}
+		}
+		s, ok := pair.Elements[0].(*SymbolExpr)
+		if !ok {
+			line, col := e.Pos()
+			return nil, nil, &EvalError{Message: fmt.Sprintf("%d:%d: letrec: bad syntax", line, col)}
+		}
+		names[i] = s.Name
+		initExprs[i] = pair.Elements[1]
+		localEnv.Set(s.Name, &SchemeVoid{})
+	}
+	// Second pass: evaluate init expressions
+	if star {
+		// letrec*: evaluate sequentially, each sees previous bindings
+		for i, initExpr := range initExprs {
+			val, err := Eval(initExpr, localEnv)
+			if err != nil {
+				return nil, nil, err
+			}
+			localEnv.Set(names[i], val)
+		}
+	} else {
+		// letrec: evaluate all in the shared env, then bind
+		vals := make([]SchemeValue, len(initExprs))
+		for i, initExpr := range initExprs {
+			val, err := Eval(initExpr, localEnv)
+			if err != nil {
+				return nil, nil, err
+			}
+			vals[i] = val
+		}
+		for i, name := range names {
+			localEnv.Set(name, vals[i])
+		}
+	}
+	body := e.Elements[2:]
+	for _, bodyExpr := range body[:len(body)-1] {
+		_, err := Eval(bodyExpr, localEnv)
+		if err != nil {
+			return nil, nil, err
+		}
+	}
+	return body[len(body)-1], localEnv, nil
+}
+
+// setupLetStar handles (let* ((var init) ...) body...)
+func setupLetStar(e *ListExpr, env *Env) (Expr, *Env, error) {
+	if len(e.Elements) < 3 {
+		line, col := e.Pos()
+		return nil, nil, &EvalError{Message: fmt.Sprintf("%d:%d: let*: bad syntax", line, col)}
+	}
+	bindingsList, ok := e.Elements[1].(*ListExpr)
+	if !ok {
+		line, col := e.Pos()
+		return nil, nil, &EvalError{Message: fmt.Sprintf("%d:%d: let*: bad syntax", line, col)}
+	}
+	localEnv := NewEnv(env)
+	for _, b := range bindingsList.Elements {
+		pair, ok := b.(*ListExpr)
+		if !ok || len(pair.Elements) != 2 {
+			line, col := e.Pos()
+			return nil, nil, &EvalError{Message: fmt.Sprintf("%d:%d: let*: bad syntax", line, col)}
+		}
+		s, ok := pair.Elements[0].(*SymbolExpr)
+		if !ok {
+			line, col := e.Pos()
+			return nil, nil, &EvalError{Message: fmt.Sprintf("%d:%d: let*: bad syntax", line, col)}
+		}
+		val, err := Eval(pair.Elements[1], localEnv)
+		if err != nil {
+			return nil, nil, err
+		}
+		localEnv.Set(s.Name, val)
+	}
+	body := e.Elements[2:]
+	for _, bodyExpr := range body[:len(body)-1] {
+		_, err := Eval(bodyExpr, localEnv)
+		if err != nil {
+			return nil, nil, err
+		}
+	}
+	return body[len(body)-1], localEnv, nil
+}
+
+// evalCase handles (case key ((datum ...) expr ...) ... (else expr ...))
+// Returns (tailExpr, done, result, error).
+func evalCase(e *ListExpr, env *Env) (Expr, bool, SchemeValue, error) {
+	if len(e.Elements) < 3 {
+		line, col := e.Pos()
+		return nil, false, nil, &EvalError{Message: fmt.Sprintf("%d:%d: case: bad syntax", line, col)}
+	}
+	key, err := Eval(e.Elements[1], env)
+	if err != nil {
+		return nil, false, nil, err
+	}
+	for _, clause := range e.Elements[2:] {
+		cl, ok := clause.(*ListExpr)
+		if !ok || len(cl.Elements) < 1 {
+			line, col := e.Pos()
+			return nil, false, nil, &EvalError{Message: fmt.Sprintf("%d:%d: case: bad syntax", line, col)}
+		}
+		// Check for else clause
+		if sym, ok := cl.Elements[0].(*SymbolExpr); ok && sym.Name == "else" {
+			body := cl.Elements[1:]
+			if len(body) == 0 {
+				return nil, true, &SchemeVoid{}, nil
+			}
+			for _, b := range body[:len(body)-1] {
+				_, err := Eval(b, env)
+				if err != nil {
+					return nil, false, nil, err
+				}
+			}
+			return body[len(body)-1], false, nil, nil
+		}
+		// Datum list: ((datum ...) expr ...)
+		datums, ok := cl.Elements[0].(*ListExpr)
+		if !ok {
+			line, col := e.Pos()
+			return nil, false, nil, &EvalError{Message: fmt.Sprintf("%d:%d: case: bad syntax", line, col)}
+		}
+		matched := false
+		for _, d := range datums.Elements {
+			dv := quoteExpr(d)
+			if schemeEqv(key, dv) {
+				matched = true
+				break
+			}
+		}
+		if matched {
+			body := cl.Elements[1:]
+			if len(body) == 0 {
+				return nil, true, &SchemeVoid{}, nil
+			}
+			for _, b := range body[:len(body)-1] {
+				_, err := Eval(b, env)
+				if err != nil {
+					return nil, false, nil, err
+				}
+			}
+			return body[len(body)-1], false, nil, nil
+		}
+	}
+	// No match, no else: return void
+	return nil, true, &SchemeVoid{}, nil
+}
+
+// schemeEqv implements eqv? comparison.
+func schemeEqv(a, b SchemeValue) bool {
+	switch av := a.(type) {
+	case *SchemeInt:
+		bv, ok := b.(*SchemeInt)
+		return ok && av.Value == bv.Value
+	case *SchemeBool:
+		bv, ok := b.(*SchemeBool)
+		return ok && av.Value == bv.Value
+	case *SchemeChar:
+		bv, ok := b.(*SchemeChar)
+		return ok && av.Value == bv.Value
+	case *SchemeSymbol:
+		bv, ok := b.(*SchemeSymbol)
+		return ok && av.Name == bv.Name
+	case *SchemeEmpty:
+		_, ok := b.(*SchemeEmpty)
+		return ok
+	default:
+		return a == b
+	}
+}
+
+// evalDo handles (do ((var init step) ...) (test expr ...) body ...)
+func evalDo(e *ListExpr, env *Env) (Expr, *Env, error) {
+	if len(e.Elements) < 3 {
+		line, col := e.Pos()
+		return nil, nil, &EvalError{Message: fmt.Sprintf("%d:%d: do: bad syntax", line, col)}
+	}
+	varList, ok := e.Elements[1].(*ListExpr)
+	if !ok {
+		line, col := e.Pos()
+		return nil, nil, &EvalError{Message: fmt.Sprintf("%d:%d: do: bad syntax", line, col)}
+	}
+	testClause, ok := e.Elements[2].(*ListExpr)
+	if !ok || len(testClause.Elements) < 1 {
+		line, col := e.Pos()
+		return nil, nil, &EvalError{Message: fmt.Sprintf("%d:%d: do: bad syntax", line, col)}
+	}
+	body := e.Elements[3:]
+
+	// Parse variable specs
+	type doVar struct {
+		name    string
+		step    Expr // nil if no step
+		hasStep bool
+	}
+	vars := make([]doVar, len(varList.Elements))
+	localEnv := NewEnv(env)
+
+	for i, v := range varList.Elements {
+		spec, ok := v.(*ListExpr)
+		if !ok || len(spec.Elements) < 2 || len(spec.Elements) > 3 {
+			line, col := e.Pos()
+			return nil, nil, &EvalError{Message: fmt.Sprintf("%d:%d: do: bad variable spec", line, col)}
+		}
+		nameSym, ok := spec.Elements[0].(*SymbolExpr)
+		if !ok {
+			line, col := e.Pos()
+			return nil, nil, &EvalError{Message: fmt.Sprintf("%d:%d: do: bad variable spec", line, col)}
+		}
+		initVal, err := Eval(spec.Elements[1], env)
+		if err != nil {
+			return nil, nil, err
+		}
+		vars[i].name = nameSym.Name
+		if len(spec.Elements) == 3 {
+			vars[i].step = spec.Elements[2]
+			vars[i].hasStep = true
+		}
+		localEnv.Set(nameSym.Name, initVal)
+	}
+
+	// Iteration loop
+	for {
+		// Test
+		testVal, err := Eval(testClause.Elements[0], localEnv)
+		if err != nil {
+			return nil, nil, err
+		}
+		if isTruthy(testVal) {
+			// Test is true: evaluate expr... and return last
+			exprs := testClause.Elements[1:]
+			if len(exprs) == 0 {
+				return nil, nil, nil // will be handled: return void
+			}
+			for _, ex := range exprs[:len(exprs)-1] {
+				_, err := Eval(ex, localEnv)
+				if err != nil {
+					return nil, nil, err
+				}
+			}
+			return exprs[len(exprs)-1], localEnv, nil
+		}
+
+		// Execute body
+		for _, b := range body {
+			_, err := Eval(b, localEnv)
+			if err != nil {
+				return nil, nil, err
+			}
+		}
+
+		// Parallel step: evaluate all steps using current values, then update
+		newVals := make([]SchemeValue, len(vars))
+		for i, v := range vars {
+			if v.hasStep {
+				val, err := Eval(v.step, localEnv)
+				if err != nil {
+					return nil, nil, err
+				}
+				newVals[i] = val
+			}
+		}
+		for i, v := range vars {
+			if v.hasStep {
+				localEnv.Set(v.name, newVals[i])
+			}
+		}
+	}
+}
+
+// --- L15 vector builtins ---
+
+func builtinVector(args []SchemeValue, callExpr *ListExpr) (SchemeValue, error) {
+	elems := make([]SchemeValue, len(args))
+	copy(elems, args)
+	return &SchemeVector{Elements: elems}, nil
+}
+
+func builtinMakeVector(args []SchemeValue, callExpr *ListExpr) (SchemeValue, error) {
+	if len(args) < 1 || len(args) > 2 {
+		line, col := callExpr.Pos()
+		return nil, &EvalError{Message: fmt.Sprintf("%d:%d: make-vector: requires 1-2 arguments", line, col)}
+	}
+	n, ok := args[0].(*SchemeInt)
+	if !ok {
+		line, col := callExpr.Pos()
+		return nil, &EvalError{Message: fmt.Sprintf("%d:%d: make-vector: expected number", line, col)}
+	}
+	var fill SchemeValue = &SchemeInt{Value: 0}
+	if len(args) == 2 {
+		fill = args[1]
+	}
+	elems := make([]SchemeValue, n.Value)
+	for i := range elems {
+		elems[i] = fill
+	}
+	return &SchemeVector{Elements: elems}, nil
+}
+
+func builtinVectorRef(args []SchemeValue, callExpr *ListExpr) (SchemeValue, error) {
+	if len(args) != 2 {
+		line, col := callExpr.Pos()
+		return nil, &EvalError{Message: fmt.Sprintf("%d:%d: vector-ref: requires exactly 2 arguments", line, col)}
+	}
+	v, ok := args[0].(*SchemeVector)
+	if !ok {
+		line, col := callExpr.Pos()
+		return nil, &EvalError{Message: fmt.Sprintf("%d:%d: vector-ref: expected vector", line, col)}
+	}
+	idx, ok := args[1].(*SchemeInt)
+	if !ok {
+		line, col := callExpr.Pos()
+		return nil, &EvalError{Message: fmt.Sprintf("%d:%d: vector-ref: expected number", line, col)}
+	}
+	i := idx.Value
+	if i < 0 || i >= int64(len(v.Elements)) {
+		line, col := callExpr.Pos()
+		return nil, &EvalError{Message: fmt.Sprintf("%d:%d: vector-ref: index out of range", line, col)}
+	}
+	return v.Elements[i], nil
+}
+
+func builtinVectorSet(args []SchemeValue, callExpr *ListExpr) (SchemeValue, error) {
+	if len(args) != 3 {
+		line, col := callExpr.Pos()
+		return nil, &EvalError{Message: fmt.Sprintf("%d:%d: vector-set!: requires exactly 3 arguments", line, col)}
+	}
+	v, ok := args[0].(*SchemeVector)
+	if !ok {
+		line, col := callExpr.Pos()
+		return nil, &EvalError{Message: fmt.Sprintf("%d:%d: vector-set!: expected vector", line, col)}
+	}
+	idx, ok := args[1].(*SchemeInt)
+	if !ok {
+		line, col := callExpr.Pos()
+		return nil, &EvalError{Message: fmt.Sprintf("%d:%d: vector-set!: expected number", line, col)}
+	}
+	i := idx.Value
+	if i < 0 || i >= int64(len(v.Elements)) {
+		line, col := callExpr.Pos()
+		return nil, &EvalError{Message: fmt.Sprintf("%d:%d: vector-set!: index out of range", line, col)}
+	}
+	v.Elements[i] = args[2]
+	return &SchemeVoid{}, nil
+}
+
+func builtinVectorLength(args []SchemeValue, callExpr *ListExpr) (SchemeValue, error) {
+	if len(args) != 1 {
+		line, col := callExpr.Pos()
+		return nil, &EvalError{Message: fmt.Sprintf("%d:%d: vector-length: requires exactly 1 argument", line, col)}
+	}
+	v, ok := args[0].(*SchemeVector)
+	if !ok {
+		line, col := callExpr.Pos()
+		return nil, &EvalError{Message: fmt.Sprintf("%d:%d: vector-length: expected vector", line, col)}
+	}
+	return &SchemeInt{Value: int64(len(v.Elements))}, nil
+}
+
+func builtinVectorQ(args []SchemeValue, callExpr *ListExpr) (SchemeValue, error) {
+	if len(args) != 1 {
+		line, col := callExpr.Pos()
+		return nil, &EvalError{Message: fmt.Sprintf("%d:%d: vector?: requires exactly 1 argument", line, col)}
+	}
+	_, ok := args[0].(*SchemeVector)
+	return &SchemeBool{Value: ok}, nil
+}
+
+func builtinVectorToList(args []SchemeValue, callExpr *ListExpr) (SchemeValue, error) {
+	if len(args) != 1 {
+		line, col := callExpr.Pos()
+		return nil, &EvalError{Message: fmt.Sprintf("%d:%d: vector->list: requires exactly 1 argument", line, col)}
+	}
+	v, ok := args[0].(*SchemeVector)
+	if !ok {
+		line, col := callExpr.Pos()
+		return nil, &EvalError{Message: fmt.Sprintf("%d:%d: vector->list: expected vector", line, col)}
+	}
+	return sliceToList(v.Elements), nil
+}
+
+func builtinListToVector(args []SchemeValue, callExpr *ListExpr) (SchemeValue, error) {
+	if len(args) != 1 {
+		line, col := callExpr.Pos()
+		return nil, &EvalError{Message: fmt.Sprintf("%d:%d: list->vector: requires exactly 1 argument", line, col)}
+	}
+	elems, ok := listToSlice(args[0])
+	if !ok {
+		line, col := callExpr.Pos()
+		return nil, &EvalError{Message: fmt.Sprintf("%d:%d: list->vector: expected list", line, col)}
+	}
+	result := make([]SchemeValue, len(elems))
+	copy(result, elems)
+	return &SchemeVector{Elements: result}, nil
+}
+
+func builtinEqvQ(args []SchemeValue, callExpr *ListExpr) (SchemeValue, error) {
+	if len(args) != 2 {
+		line, col := callExpr.Pos()
+		return nil, &EvalError{Message: fmt.Sprintf("%d:%d: eqv?: requires exactly 2 arguments", line, col)}
+	}
+	return &SchemeBool{Value: schemeEqv(args[0], args[1])}, nil
+}
+
+func builtinError(args []SchemeValue, callExpr *ListExpr) (SchemeValue, error) {
+	line, col := callExpr.Pos()
+	var msg strings.Builder
+	msg.WriteString("error")
+	for _, a := range args {
+		msg.WriteString(" ")
+		msg.WriteString(displayValue(a))
+	}
+	return nil, &EvalError{Message: fmt.Sprintf("%d:%d: %s", line, col, msg.String())}
 }

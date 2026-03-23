@@ -111,6 +111,19 @@ func (v *SchemeVoid) String() string {
 	return ""
 }
 
+// SchemeVector is a fixed-size mutable array.
+type SchemeVector struct {
+	Elements []SchemeValue
+}
+
+func (v *SchemeVector) String() string {
+	parts := make([]string, len(v.Elements))
+	for i, e := range v.Elements {
+		parts[i] = e.String()
+	}
+	return "#(" + strings.Join(parts, " ") + ")"
+}
+
 // SchemeCallCC represents the call/cc procedure as a first-class value.
 type SchemeCallCC struct{}
 
