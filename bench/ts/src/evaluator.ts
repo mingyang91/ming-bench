@@ -9,6 +9,7 @@ type Bounce = SchemeVal | (() => Bounce);
 
 interface WindEntry { inThunk: SchemeVal; outThunk: SchemeVal; }
 let currentWinds: WindEntry[] = [];
+let exceptionHandlerStack: ((val: SchemeVal) => Bounce)[] = [];
 
 type SchemeVal =
   | { tag: 'number'; val: number; pos?: Pos }
@@ -1073,6 +1074,28 @@ function applyCPS(proc: SchemeVal, args: SchemeVal[], k: Cont, p?: Pos, out?: st
         }, p, out);
       }, p, out);
     }
+    if (proc.name === 'raise') {
+      if (args.length !== 1) throw posError('raise: need exactly one arg', p);
+      if (exceptionHandlerStack.length === 0) {
+        throw new EvalError(`unhandled exception: ${displayVal(args[0])}`);
+      }
+      const handler = exceptionHandlerStack.pop()!;
+      return () => handler(args[0]);
+    }
+    if (proc.name === 'with-exception-handler') {
+      if (args.length !== 2) throw posError('with-exception-handler: need exactly two args', p);
+      const [handlerProc, thunk] = args;
+      const cpsHandler = (exnVal: SchemeVal): Bounce => {
+        return () => applyCPS(handlerProc, [exnVal], _ => {
+          throw new EvalError('raise: handler returned');
+        }, p, out);
+      };
+      exceptionHandlerStack.push(cpsHandler);
+      return () => applyCPS(thunk, [], result => {
+        exceptionHandlerStack.pop();
+        return k(result);
+      }, p, out);
+    }
     if (proc.name === 'map') {
       if (args.length < 2) throw posError('map: need at least two args', p);
       const fn = args[0];
@@ -1428,6 +1451,79 @@ function evalCPS(expr: SchemeVal, env: Env, k: Cont, out?: string[]): Bounce {
       return k(macroVal);
     }
 
+    if (op === 'guard') {
+      if (args.length < 2) throw posError('guard: bad syntax', p);
+      const guardSpec = args[0];
+      if (guardSpec.tag !== 'list' || guardSpec.val.length < 1)
+        throw posError('guard: bad syntax', p);
+      const varSym = guardSpec.val[0];
+      if (varSym.tag !== 'symbol') throw posError('guard: expected variable', p);
+      const clauses = guardSpec.val.slice(1);
+      const body = args.slice(1);
+
+      const guardWinds = [...currentWinds];
+
+      const handler = (exnVal: SchemeVal): Bounce => {
+        // Unwind dynamic-winds back to guard point
+        const targetWinds = guardWinds;
+        let common = 0;
+        while (common < currentWinds.length && common < targetWinds.length
+               && currentWinds[common] === targetWinds[common]) {
+          common++;
+        }
+        const toUnwind = currentWinds.slice(common).reverse();
+
+        const doUnwind = (i: number): Bounce => {
+          if (i >= toUnwind.length) {
+            currentWinds = [...targetWinds];
+            return () => evalGuardClauses();
+          }
+          currentWinds = currentWinds.slice(0, currentWinds.length - 1);
+          return () => applyCPS(toUnwind[i].outThunk, [], _ => () => doUnwind(i + 1), p, out);
+        };
+
+        const evalGuardClauses = (): Bounce => {
+          const clauseEnv = new Env(env);
+          clauseEnv.define(varSym.val, exnVal);
+
+          const tryClause = (i: number): Bounce => {
+            if (i >= clauses.length) {
+              // No clause matched, re-raise
+              if (exceptionHandlerStack.length === 0) {
+                throw new EvalError(`unhandled exception: ${displayVal(exnVal)}`);
+              }
+              const prevHandler = exceptionHandlerStack.pop()!;
+              return () => prevHandler(exnVal);
+            }
+            const clause = clauses[i];
+            if (clause.tag !== 'list' || clause.val.length < 1)
+              throw posError('guard: bad clause', p);
+            const test = clause.val[0];
+            if (test.tag === 'symbol' && test.val === 'else') {
+              if (clause.val.length < 2) return k({ tag: 'boolean', val: false });
+              return evalBodyCPS(clause.val, 1, clauseEnv, k, out);
+            }
+            return evalCPS(test, clauseEnv, condVal => {
+              if (isTruthy(condVal)) {
+                if (clause.val.length < 2) return k(condVal);
+                return evalBodyCPS(clause.val, 1, clauseEnv, k, out);
+              }
+              return () => tryClause(i + 1);
+            }, out);
+          };
+          return tryClause(0);
+        };
+
+        return doUnwind(0);
+      };
+
+      exceptionHandlerStack.push(handler);
+      return evalBodyCPS(body, 0, env, bodyVal => {
+        exceptionHandlerStack.pop();
+        return k(bodyVal);
+      }, out);
+    }
+
     // Check for macro application
     {
       let macroVal: SchemeVal | undefined;
@@ -1463,6 +1559,8 @@ function makeGlobalEnv(): Env {
   env.define('call/cc', { tag: 'builtin', name: 'call/cc' });
   env.define('call-with-current-continuation', { tag: 'builtin', name: 'call-with-current-continuation' });
   env.define('dynamic-wind', { tag: 'builtin', name: 'dynamic-wind' });
+  env.define('raise', { tag: 'builtin', name: 'raise' });
+  env.define('with-exception-handler', { tag: 'builtin', name: 'with-exception-handler' });
   for (const name of BUILTINS) {
     env.define(name, { tag: 'builtin', name });
   }
@@ -1475,6 +1573,7 @@ export function evalStr(input: string): string {
   const exprs = parse(input);
   if (exprs.length === 0) throw new EvalError('no expressions');
   currentWinds = [];
+  exceptionHandlerStack = [];
   const env = makeGlobalEnv();
   const result = trampoline(evalBodyCPS(exprs, 0, env, v => v));
   return displayVal(result);
@@ -1484,6 +1583,7 @@ export function evalStrWithOutput(input: string): { result: string; output: stri
   const exprs = parse(input);
   if (exprs.length === 0) throw new EvalError('no expressions');
   currentWinds = [];
+  exceptionHandlerStack = [];
   const env = makeGlobalEnv();
   const out: string[] = [];
   const result = trampoline(evalBodyCPS(exprs, 0, env, v => v, out));
