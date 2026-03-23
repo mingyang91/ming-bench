@@ -421,20 +421,37 @@ fn parse_atom(token: &str) -> ExprKind {
     }
 }
 
-// ── Evaluator ──
+// ── Evaluator (trampoline-based for TCO) ──
 
-fn eval(expr: &Expr, env: &Env) -> Result<Value, EvalError> {
-    eval_inner(expr, env).map_err(|e| e.at(expr.line, expr.col))
+enum Trampoline {
+    Done(Value),
+    Bounce(Expr, Env),
 }
 
-fn eval_inner(expr: &Expr, env: &Env) -> Result<Value, EvalError> {
+fn eval(expr: &Expr, env: &Env) -> Result<Value, EvalError> {
+    let mut cur_expr = expr.clone();
+    let mut cur_env = env.clone();
+    loop {
+        match eval_tail(&cur_expr, &cur_env).map_err(|e| e.at(cur_expr.line, cur_expr.col))? {
+            Trampoline::Done(v) => return Ok(v),
+            Trampoline::Bounce(e, env) => {
+                cur_expr = e;
+                cur_env = env;
+            }
+        }
+    }
+}
+
+fn eval_tail(expr: &Expr, env: &Env) -> Result<Trampoline, EvalError> {
     match &expr.kind {
-        ExprKind::Integer(n) => Ok(Value::Integer(*n)),
-        ExprKind::Boolean(b) => Ok(Value::Boolean(*b)),
-        ExprKind::Str(s) => Ok(make_string(s.clone())),
-        ExprKind::Char(c) => Ok(Value::Char(*c)),
+        ExprKind::Integer(n) => Ok(Trampoline::Done(Value::Integer(*n))),
+        ExprKind::Boolean(b) => Ok(Trampoline::Done(Value::Boolean(*b))),
+        ExprKind::Str(s) => Ok(Trampoline::Done(make_string(s.clone()))),
+        ExprKind::Char(c) => Ok(Trampoline::Done(Value::Char(*c))),
         ExprKind::Symbol(name) => {
-            env_get(env, name).ok_or_else(|| EvalError::UnboundVariable(name.clone()))
+            env_get(env, name)
+                .map(Trampoline::Done)
+                .ok_or_else(|| EvalError::UnboundVariable(name.clone()))
         }
         ExprKind::List(elems) => {
             if elems.is_empty() {
@@ -443,15 +460,15 @@ fn eval_inner(expr: &Expr, env: &Env) -> Result<Value, EvalError> {
             // Check for special forms
             if let ExprKind::Symbol(name) = &elems[0].kind {
                 match name.as_str() {
-                    "quote" => return eval_quote(&elems[1..]),
-                    "if" => return eval_if(&elems[1..], env),
-                    "define" => return eval_define(&elems[1..], env),
-                    "lambda" => return eval_lambda(&elems[1..], env),
-                    "and" => return eval_and(&elems[1..], env),
-                    "or" => return eval_or(&elems[1..], env),
-                    "let" => return eval_let(&elems[1..], env),
-                    "begin" => return eval_begin(&elems[1..], env),
-                    "cond" => return eval_cond(&elems[1..], env),
+                    "quote" => return eval_quote(&elems[1..]).map(Trampoline::Done),
+                    "if" => return eval_if_tail(&elems[1..], env),
+                    "define" => return eval_define(&elems[1..], env).map(Trampoline::Done),
+                    "lambda" => return eval_lambda(&elems[1..], env).map(Trampoline::Done),
+                    "and" => return eval_and_tail(&elems[1..], env),
+                    "or" => return eval_or_tail(&elems[1..], env),
+                    "let" => return eval_let_tail(&elems[1..], env),
+                    "begin" => return eval_begin_tail(&elems[1..], env),
+                    "cond" => return eval_cond_tail(&elems[1..], env),
                     _ => {}
                 }
             }
@@ -459,7 +476,7 @@ fn eval_inner(expr: &Expr, env: &Env) -> Result<Value, EvalError> {
             let func = eval(&elems[0], env)?;
             let args: Result<Vec<Value>, _> = elems[1..].iter().map(|e| eval(e, env)).collect();
             let args = args?;
-            apply(&func, &args)
+            apply_tail(&func, &args)
         }
     }
 }
@@ -471,17 +488,17 @@ fn eval_quote(args: &[Expr]) -> Result<Value, EvalError> {
     Ok(expr_to_value(&args[0]))
 }
 
-fn eval_if(args: &[Expr], env: &Env) -> Result<Value, EvalError> {
+fn eval_if_tail(args: &[Expr], env: &Env) -> Result<Trampoline, EvalError> {
     if args.len() < 2 || args.len() > 3 {
         return Err(EvalError::Arity("if expects 2 or 3 arguments".into()));
     }
     let cond = eval(&args[0], env)?;
     if cond != Value::Boolean(false) {
-        eval(&args[1], env)
+        Ok(Trampoline::Bounce(args[1].clone(), env.clone()))
     } else if args.len() == 3 {
-        eval(&args[2], env)
+        Ok(Trampoline::Bounce(args[2].clone(), env.clone()))
     } else {
-        Ok(Value::Void)
+        Ok(Trampoline::Done(Value::Void))
     }
 }
 
@@ -549,28 +566,33 @@ fn eval_lambda(args: &[Expr], env: &Env) -> Result<Value, EvalError> {
     })
 }
 
-fn eval_and(exprs: &[Expr], env: &Env) -> Result<Value, EvalError> {
-    let mut result = Value::Boolean(true);
-    for expr in exprs {
-        result = eval(expr, env)?;
-        if result == Value::Boolean(false) {
-            return Ok(Value::Boolean(false));
+fn eval_and_tail(exprs: &[Expr], env: &Env) -> Result<Trampoline, EvalError> {
+    if exprs.is_empty() {
+        return Ok(Trampoline::Done(Value::Boolean(true)));
+    }
+    for expr in &exprs[..exprs.len() - 1] {
+        let val = eval(expr, env)?;
+        if val == Value::Boolean(false) {
+            return Ok(Trampoline::Done(Value::Boolean(false)));
         }
     }
-    Ok(result)
+    Ok(Trampoline::Bounce(exprs.last().unwrap().clone(), env.clone()))
 }
 
-fn eval_or(exprs: &[Expr], env: &Env) -> Result<Value, EvalError> {
-    for expr in exprs {
+fn eval_or_tail(exprs: &[Expr], env: &Env) -> Result<Trampoline, EvalError> {
+    if exprs.is_empty() {
+        return Ok(Trampoline::Done(Value::Boolean(false)));
+    }
+    for expr in &exprs[..exprs.len() - 1] {
         let val = eval(expr, env)?;
         if val != Value::Boolean(false) {
-            return Ok(val);
+            return Ok(Trampoline::Done(val));
         }
     }
-    Ok(Value::Boolean(false))
+    Ok(Trampoline::Bounce(exprs.last().unwrap().clone(), env.clone()))
 }
 
-fn eval_let(args: &[Expr], env: &Env) -> Result<Value, EvalError> {
+fn eval_let_tail(args: &[Expr], env: &Env) -> Result<Trampoline, EvalError> {
     if args.is_empty() {
         return Err(EvalError::Arity("let requires bindings and body".into()));
     }
@@ -609,11 +631,7 @@ fn eval_let(args: &[Expr], env: &Env) -> Result<Value, EvalError> {
         for (param, init) in params.iter().zip(&inits) {
             env_set(&local_env, param.clone(), init.clone());
         }
-        let mut result = Value::Void;
-        for expr in &body {
-            result = eval(expr, &local_env)?;
-        }
-        return Ok(result);
+        return eval_body_tail(&body, &local_env);
     }
     // Regular let: (let ((var init) ...) body ...)
     let bindings = match &args[0].kind {
@@ -634,50 +652,48 @@ fn eval_let(args: &[Expr], env: &Env) -> Result<Value, EvalError> {
             _ => return Err(EvalError::Type("let: invalid binding".into())),
         }
     }
-    let mut result = Value::Void;
-    for expr in &args[1..] {
-        result = eval(expr, &local_env)?;
-    }
-    Ok(result)
+    eval_body_tail(&args[1..], &local_env)
 }
 
-fn eval_begin(args: &[Expr], env: &Env) -> Result<Value, EvalError> {
-    let mut result = Value::Void;
-    for expr in args {
-        result = eval(expr, env)?;
+/// Evaluate a body (sequence of exprs) with TCO on the last one.
+fn eval_body_tail(body: &[Expr], env: &Env) -> Result<Trampoline, EvalError> {
+    if body.is_empty() {
+        return Ok(Trampoline::Done(Value::Void));
     }
-    Ok(result)
+    for expr in &body[..body.len() - 1] {
+        eval(expr, env)?;
+    }
+    Ok(Trampoline::Bounce(body.last().unwrap().clone(), env.clone()))
 }
 
-fn eval_cond(clauses: &[Expr], env: &Env) -> Result<Value, EvalError> {
+fn eval_begin_tail(args: &[Expr], env: &Env) -> Result<Trampoline, EvalError> {
+    eval_body_tail(args, env)
+}
+
+fn eval_cond_tail(clauses: &[Expr], env: &Env) -> Result<Trampoline, EvalError> {
     for clause in clauses {
         match &clause.kind {
             ExprKind::List(parts) if !parts.is_empty() => {
                 if let ExprKind::Symbol(s) = &parts[0].kind {
                     if s == "else" {
-                        let mut result = Value::Void;
-                        for expr in &parts[1..] {
-                            result = eval(expr, env)?;
-                        }
-                        return Ok(result);
+                        return eval_body_tail(&parts[1..], env);
                     }
                 }
                 let test = eval(&parts[0], env)?;
                 if test != Value::Boolean(false) {
-                    let mut result = test;
-                    for expr in &parts[1..] {
-                        result = eval(expr, env)?;
+                    if parts.len() == 1 {
+                        return Ok(Trampoline::Done(test));
                     }
-                    return Ok(result);
+                    return eval_body_tail(&parts[1..], env);
                 }
             }
             _ => return Err(EvalError::Type("cond: invalid clause".into())),
         }
     }
-    Ok(Value::Void)
+    Ok(Trampoline::Done(Value::Void))
 }
 
-fn apply(func: &Value, args: &[Value]) -> Result<Value, EvalError> {
+fn apply_tail(func: &Value, args: &[Value]) -> Result<Trampoline, EvalError> {
     match func {
         Value::Lambda { params, body, env } => {
             if args.len() != params.len() {
@@ -689,13 +705,9 @@ fn apply(func: &Value, args: &[Value]) -> Result<Value, EvalError> {
             for (param, arg) in params.iter().zip(args) {
                 env_set(&local_env, param.clone(), arg.clone());
             }
-            let mut result = Value::Void;
-            for expr in body {
-                result = eval(expr, &local_env)?;
-            }
-            Ok(result)
+            eval_body_tail(body, &local_env)
         }
-        Value::Builtin(_, func) => func(args),
+        Value::Builtin(_, func) => func(args).map(Trampoline::Done),
         _ => Err(EvalError::Type(format!("not a procedure: {func}"))),
     }
 }
