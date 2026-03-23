@@ -261,6 +261,72 @@ function makeGlobalEnv() {
     defBuiltin('boolean?', (args) => ({ tag: 'boolean', value: args[0].tag === 'boolean' }));
     defBuiltin('pair?', (args) => ({ tag: 'boolean', value: args[0].tag === 'pair' }));
     defBuiltin('symbol?', (args) => ({ tag: 'boolean', value: args[0].tag === 'symbol' }));
+    defBuiltin('char?', (args) => ({ tag: 'boolean', value: args[0].tag === 'char' }));
+    // Display / Write / Newline
+    defBuiltin('display', (args) => {
+        outputBuffer += displayVal(args[0]);
+        return { tag: 'void' };
+    });
+    defBuiltin('write', (args) => {
+        outputBuffer += writeVal(args[0]);
+        return { tag: 'void' };
+    });
+    defBuiltin('newline', (_args) => {
+        outputBuffer += '\n';
+        return { tag: 'void' };
+    });
+    // String operations
+    defBuiltin('string-append', (args) => {
+        let result = '';
+        for (const a of args) {
+            if (a.tag !== 'string')
+                throw new EvalError('string-append: expected string');
+            result += a.value;
+        }
+        return { tag: 'string', value: result };
+    });
+    defBuiltin('string-length', (args) => {
+        if (args[0].tag !== 'string')
+            throw new EvalError('string-length: expected string');
+        return { tag: 'number', value: args[0].value.length };
+    });
+    defBuiltin('substring', (args) => {
+        if (args[0].tag !== 'string')
+            throw new EvalError('substring: expected string');
+        const s = args[0].value;
+        const start = expectNumber(args[1], 'substring');
+        const end = expectNumber(args[2], 'substring');
+        return { tag: 'string', value: s.slice(start, end) };
+    });
+    defBuiltin('string->number', (args) => {
+        if (args[0].tag !== 'string')
+            throw new EvalError('string->number: expected string');
+        const n = Number(args[0].value);
+        if (isNaN(n))
+            return { tag: 'boolean', value: false };
+        return { tag: 'number', value: n };
+    });
+    defBuiltin('number->string', (args) => {
+        if (args[0].tag !== 'number')
+            throw new EvalError('number->string: expected number');
+        return { tag: 'string', value: String(args[0].value) };
+    });
+    defBuiltin('symbol->string', (args) => {
+        if (args[0].tag !== 'symbol')
+            throw new EvalError('symbol->string: expected symbol');
+        return { tag: 'string', value: args[0].value };
+    });
+    defBuiltin('string->symbol', (args) => {
+        if (args[0].tag !== 'string')
+            throw new EvalError('string->symbol: expected string');
+        return { tag: 'symbol', value: args[0].value };
+    });
+    defBuiltin('string-ref', (args) => {
+        if (args[0].tag !== 'string')
+            throw new EvalError('string-ref: expected string');
+        const idx = expectNumber(args[1], 'string-ref');
+        return { tag: 'char', value: args[0].value[idx] };
+    });
     return env;
 }
 function evaluate(expr, env) {
@@ -441,24 +507,35 @@ function evaluate(expr, env) {
     }
     throw new EvalError(`${posStr(expr.pos)}not a procedure`);
 }
-// ── Display ────────────────────────────────────────────────────────
-function display(val) {
+// ── Output buffer ──────────────────────────────────────────────────
+let outputBuffer = '';
+// ── Display / Write formatting ─────────────────────────────────────
+/** display format: strings without quotes */
+function displayVal(val) {
+    switch (val.tag) {
+        case 'string': return val.value;
+        default: return writeVal(val);
+    }
+}
+/** write format: strings with quotes (also used as default formatter) */
+function writeVal(val) {
     switch (val.tag) {
         case 'number': return String(val.value);
         case 'boolean': return val.value ? '#t' : '#f';
         case 'string': return `"${val.value}"`;
         case 'symbol': return val.value;
-        case 'list': return `(${val.value.map(display).join(' ')})`;
+        case 'char': return `#\\${val.value}`;
+        case 'list': return `(${val.value.map(writeVal).join(' ')})`;
         case 'nil': return '()';
         case 'pair': {
-            let s = '(' + display(val.car);
+            let s = '(' + writeVal(val.car);
             let cur = val.cdr;
             while (cur.tag === 'pair') {
-                s += ' ' + display(cur.car);
+                s += ' ' + writeVal(cur.car);
                 cur = cur.cdr;
             }
             if (cur.tag !== 'nil') {
-                s += ' . ' + display(cur);
+                s += ' . ' + writeVal(cur);
             }
             s += ')';
             return s;
@@ -468,6 +545,8 @@ function display(val) {
         case 'void': return '';
     }
 }
+// Keep old name as alias for writeVal (used in evalStr)
+const display = writeVal;
 // ── Public API ─────────────────────────────────────────────────────
 export function evalStr(input) {
     const exprs = parse(input);
@@ -481,5 +560,14 @@ export function evalStr(input) {
     return display(result);
 }
 export function evalStrWithOutput(input) {
-    throw new EvalError('not implemented');
+    const exprs = parse(input);
+    if (exprs.length === 0)
+        throw new EvalError('empty input');
+    outputBuffer = '';
+    const env = makeGlobalEnv();
+    let result = { tag: 'void' };
+    for (const expr of exprs) {
+        result = evaluate(expr, env);
+    }
+    return { result: display(result), output: outputBuffer };
 }
