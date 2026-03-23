@@ -85,6 +85,11 @@ enum Value {
     Syntax(Expr),
     /// Macro transformer procedure (lambda-based macro from syntax-case)
     MacroTransformer(Box<Value>),
+    /// case-lambda: multiple clauses with different arities
+    CaseLambda {
+        clauses: Vec<(Vec<String>, Option<String>, Vec<Expr>)>, // (params, rest_param, body)
+        env: Env,
+    },
 }
 
 thread_local! {
@@ -157,7 +162,7 @@ impl Value {
                 format!("({})", parts.join(" "))
             }
             Value::Void => "#<void>".to_string(),
-            Value::Lambda { .. } => "#<procedure>".to_string(),
+            Value::Lambda { .. } | Value::CaseLambda { .. } => "#<procedure>".to_string(),
             Value::Builtin(_) => "#<procedure>".to_string(),
             Value::Continuation(..) => "#<continuation>".to_string(),
             Value::Macro { .. } => "#<macro>".to_string(),
@@ -984,7 +989,7 @@ fn is_special_form(name: &str) -> bool {
             | "call-with-current-continuation" | "define-syntax" | "syntax-rules"
             | "letrec" | "letrec*" | "case" | "do" | "when" | "unless"
             | "guard" | "define-record-type"
-            | "syntax-case" | "syntax" | "with-syntax"
+            | "syntax-case" | "syntax" | "with-syntax" | "case-lambda"
     )
 }
 
@@ -1242,6 +1247,32 @@ fn apply_func(func: Value, args: Vec<Value>, kont: &mut Vec<KontFrame>, wind: &m
                 env_set(&local_env, rest.clone(), list_from_vec(rest_args));
             }
             Ok(eval_body(&body, local_env, kont))
+        }
+        Value::CaseLambda { clauses, env } => {
+            let nargs = args.len();
+            for (params, rest_param, body) in &clauses {
+                let matches = if rest_param.is_some() {
+                    nargs >= params.len()
+                } else {
+                    nargs == params.len()
+                };
+                if matches {
+                    let local_env = new_env(Some(env));
+                    for (p, a) in params.iter().zip(&args) {
+                        env_set(&local_env, p.clone(), a.clone());
+                    }
+                    if let Some(ref rest) = rest_param {
+                        let rest_args = if args.len() > params.len() {
+                            args[params.len()..].to_vec()
+                        } else {
+                            Vec::new()
+                        };
+                        env_set(&local_env, rest.clone(), list_from_vec(rest_args));
+                    }
+                    return Ok(eval_body(body, local_env, kont));
+                }
+            }
+            Err(EvalError::Arity(format!("case-lambda: no matching clause for {} arguments", nargs)).at(el, ec))
         }
         Value::Builtin(ref name) if name == "call/cc" || name == "call-with-current-continuation" => {
             if args.len() != 1 {
@@ -1578,6 +1609,26 @@ fn run_cek(initial_ctrl: Ctrl, initial_kont: Vec<KontFrame>) -> Result<Value, Ev
                                     };
                                     let body = items[2..].to_vec();
                                     Ctrl::Val(Value::Lambda { params, rest_param, body, env })
+                                }
+                                Some("case-lambda") => {
+                                    let mut clauses = Vec::new();
+                                    for clause_expr in &items[1..] {
+                                        let clause_items = match &clause_expr.kind {
+                                            ExprKind::List(items) => items,
+                                            _ => return Err(EvalError::Type("case-lambda: expected clause list".into()).at(el, ec)),
+                                        };
+                                        if clause_items.is_empty() {
+                                            return Err(EvalError::Type("case-lambda: empty clause".into()).at(el, ec));
+                                        }
+                                        let (params, rest_param) = match &clause_items[0].kind {
+                                            ExprKind::List(param_exprs) => parse_params(param_exprs, el, ec)?,
+                                            ExprKind::Symbol(s) => (Vec::new(), Some(s.clone())),
+                                            _ => return Err(EvalError::Type("case-lambda: expected parameter list".into()).at(el, ec)),
+                                        };
+                                        let body = clause_items[1..].to_vec();
+                                        clauses.push((params, rest_param, body));
+                                    }
+                                    Ctrl::Val(Value::CaseLambda { clauses, env })
                                 }
                                 Some("and") => {
                                     if items.len() == 1 {
@@ -3583,7 +3634,7 @@ fn eval_builtin(op: &str, args: &[Value]) -> Result<Value, EvalError> {
             if args.len() != 1 {
                 return Err(EvalError::Arity("procedure? requires 1 argument".into()));
             }
-            Ok(Value::Boolean(matches!(&args[0], Value::Lambda { .. } | Value::Builtin(_) | Value::Continuation(..))))
+            Ok(Value::Boolean(matches!(&args[0], Value::Lambda { .. } | Value::CaseLambda { .. } | Value::Builtin(_) | Value::Continuation(..))))
         }
         "integer?" => {
             if args.len() != 1 {
