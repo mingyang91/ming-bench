@@ -649,6 +649,274 @@ fn builtin_apply_placeholder(_args: &[Value]) -> Result<Value, EvalError> {
     Err(EvalError::Type("apply: internal error".into()))
 }
 
+// --- L13: Numeric utilities ---
+
+fn builtin_abs(args: &[Value]) -> Result<Value, EvalError> {
+    if args.len() != 1 { return Err(EvalError::Arity("abs requires exactly 1 argument".into())); }
+    Ok(Value::Integer(args[0].as_integer()?.abs()))
+}
+
+fn builtin_modulo(args: &[Value]) -> Result<Value, EvalError> {
+    if args.len() != 2 { return Err(EvalError::Arity("modulo requires exactly 2 arguments".into())); }
+    let a = args[0].as_integer()?;
+    let b = args[1].as_integer()?;
+    if b == 0 { return Err(EvalError::DivisionByZero); }
+    Ok(Value::Integer(((a % b) + b) % b))
+}
+
+fn builtin_remainder(args: &[Value]) -> Result<Value, EvalError> {
+    if args.len() != 2 { return Err(EvalError::Arity("remainder requires exactly 2 arguments".into())); }
+    let a = args[0].as_integer()?;
+    let b = args[1].as_integer()?;
+    if b == 0 { return Err(EvalError::DivisionByZero); }
+    Ok(Value::Integer(a % b))
+}
+
+fn builtin_quotient(args: &[Value]) -> Result<Value, EvalError> {
+    if args.len() != 2 { return Err(EvalError::Arity("quotient requires exactly 2 arguments".into())); }
+    let a = args[0].as_integer()?;
+    let b = args[1].as_integer()?;
+    if b == 0 { return Err(EvalError::DivisionByZero); }
+    Ok(Value::Integer(a / b))
+}
+
+fn builtin_min(args: &[Value]) -> Result<Value, EvalError> {
+    if args.is_empty() { return Err(EvalError::Arity("min requires at least 1 argument".into())); }
+    let mut result = args[0].as_integer()?;
+    for a in &args[1..] { let v = a.as_integer()?; if v < result { result = v; } }
+    Ok(Value::Integer(result))
+}
+
+fn builtin_max(args: &[Value]) -> Result<Value, EvalError> {
+    if args.is_empty() { return Err(EvalError::Arity("max requires at least 1 argument".into())); }
+    let mut result = args[0].as_integer()?;
+    for a in &args[1..] { let v = a.as_integer()?; if v > result { result = v; } }
+    Ok(Value::Integer(result))
+}
+
+fn builtin_expt(args: &[Value]) -> Result<Value, EvalError> {
+    if args.len() != 2 { return Err(EvalError::Arity("expt requires exactly 2 arguments".into())); }
+    let base = args[0].as_integer()?;
+    let exp = args[1].as_integer()?;
+    if exp < 0 { return Ok(Value::Integer(0)); }
+    Ok(Value::Integer(base.pow(exp as u32)))
+}
+
+fn builtin_zero_pred(args: &[Value]) -> Result<Value, EvalError> {
+    if args.len() != 1 { return Err(EvalError::Arity("zero? requires exactly 1 argument".into())); }
+    Ok(Value::Boolean(args[0].as_integer()? == 0))
+}
+
+fn builtin_positive_pred(args: &[Value]) -> Result<Value, EvalError> {
+    if args.len() != 1 { return Err(EvalError::Arity("positive? requires exactly 1 argument".into())); }
+    Ok(Value::Boolean(args[0].as_integer()? > 0))
+}
+
+fn builtin_negative_pred(args: &[Value]) -> Result<Value, EvalError> {
+    if args.len() != 1 { return Err(EvalError::Arity("negative? requires exactly 1 argument".into())); }
+    Ok(Value::Boolean(args[0].as_integer()? < 0))
+}
+
+fn builtin_odd_pred(args: &[Value]) -> Result<Value, EvalError> {
+    if args.len() != 1 { return Err(EvalError::Arity("odd? requires exactly 1 argument".into())); }
+    Ok(Value::Boolean(args[0].as_integer()? % 2 != 0))
+}
+
+fn builtin_even_pred(args: &[Value]) -> Result<Value, EvalError> {
+    if args.len() != 1 { return Err(EvalError::Arity("even? requires exactly 1 argument".into())); }
+    Ok(Value::Boolean(args[0].as_integer()? % 2 == 0))
+}
+
+// --- L13: List utilities ---
+
+fn builtin_list_ref(args: &[Value]) -> Result<Value, EvalError> {
+    if args.len() != 2 { return Err(EvalError::Arity("list-ref requires exactly 2 arguments".into())); }
+    let idx = args[1].as_integer()? as usize;
+    let mut cur = &args[0];
+    for _ in 0..idx {
+        match cur {
+            Value::Pair(_, cdr) => cur = cdr,
+            _ => return Err(EvalError::Type("list-ref: index out of range".into())),
+        }
+    }
+    match cur {
+        Value::Pair(car, _) => Ok(*car.clone()),
+        _ => Err(EvalError::Type("list-ref: index out of range".into())),
+    }
+}
+
+fn builtin_list_tail(args: &[Value]) -> Result<Value, EvalError> {
+    if args.len() != 2 { return Err(EvalError::Arity("list-tail requires exactly 2 arguments".into())); }
+    let idx = args[1].as_integer()? as usize;
+    let mut cur = &args[0];
+    for _ in 0..idx {
+        match cur {
+            Value::Pair(_, cdr) => cur = cdr,
+            _ => return Err(EvalError::Type("list-tail: index out of range".into())),
+        }
+    }
+    Ok(cur.clone())
+}
+
+fn builtin_list_pred(args: &[Value]) -> Result<Value, EvalError> {
+    if args.len() != 1 { return Err(EvalError::Arity("list? requires exactly 1 argument".into())); }
+    let mut cur = &args[0];
+    loop {
+        match cur {
+            Value::Nil => return Ok(Value::Boolean(true)),
+            Value::Pair(_, cdr) => cur = cdr,
+            _ => return Ok(Value::Boolean(false)),
+        }
+    }
+}
+
+fn builtin_assoc(args: &[Value]) -> Result<Value, EvalError> {
+    if args.len() != 2 { return Err(EvalError::Arity("assoc requires exactly 2 arguments".into())); }
+    let key = &args[0];
+    let mut cur = &args[1];
+    loop {
+        match cur {
+            Value::Nil => return Ok(Value::Boolean(false)),
+            Value::Pair(car, cdr) => {
+                if let Value::Pair(pair_car, _) = car.as_ref() {
+                    if values_equal(key, pair_car) {
+                        return Ok(*car.clone());
+                    }
+                }
+                cur = cdr;
+            }
+            _ => return Err(EvalError::Type("assoc: not a proper list".into())),
+        }
+    }
+}
+
+fn builtin_eq_pred(args: &[Value]) -> Result<Value, EvalError> {
+    if args.len() != 2 { return Err(EvalError::Arity("eq? requires exactly 2 arguments".into())); }
+    let result = match (&args[0], &args[1]) {
+        (Value::Integer(a), Value::Integer(b)) => a == b,
+        (Value::Boolean(a), Value::Boolean(b)) => a == b,
+        (Value::Symbol(a), Value::Symbol(b)) => a == b,
+        (Value::Char(a), Value::Char(b)) => a == b,
+        (Value::Nil, Value::Nil) => true,
+        _ => false,
+    };
+    Ok(Value::Boolean(result))
+}
+
+fn values_equal(a: &Value, b: &Value) -> bool {
+    match (a, b) {
+        (Value::Integer(x), Value::Integer(y)) => x == y,
+        (Value::Boolean(x), Value::Boolean(y)) => x == y,
+        (Value::Symbol(x), Value::Symbol(y)) => x == y,
+        (Value::Char(x), Value::Char(y)) => x == y,
+        (Value::Str(x), Value::Str(y)) => x == y,
+        (Value::Nil, Value::Nil) => true,
+        (Value::Pair(a1, a2), Value::Pair(b1, b2)) => values_equal(a1, b1) && values_equal(a2, b2),
+        _ => false,
+    }
+}
+
+fn builtin_equal_pred(args: &[Value]) -> Result<Value, EvalError> {
+    if args.len() != 2 { return Err(EvalError::Arity("equal? requires exactly 2 arguments".into())); }
+    Ok(Value::Boolean(values_equal(&args[0], &args[1])))
+}
+
+fn builtin_map_placeholder(_args: &[Value]) -> Result<Value, EvalError> {
+    Err(EvalError::Type("map: internal error".into()))
+}
+
+// --- L13: Character utilities ---
+
+fn builtin_char_alphabetic(args: &[Value]) -> Result<Value, EvalError> {
+    if args.len() != 1 { return Err(EvalError::Arity("char-alphabetic? requires exactly 1 argument".into())); }
+    match &args[0] {
+        Value::Char(c) => Ok(Value::Boolean(c.is_alphabetic())),
+        _ => Err(EvalError::Type("char-alphabetic?: expected char".into())),
+    }
+}
+
+fn builtin_char_numeric(args: &[Value]) -> Result<Value, EvalError> {
+    if args.len() != 1 { return Err(EvalError::Arity("char-numeric? requires exactly 1 argument".into())); }
+    match &args[0] {
+        Value::Char(c) => Ok(Value::Boolean(c.is_ascii_digit())),
+        _ => Err(EvalError::Type("char-numeric?: expected char".into())),
+    }
+}
+
+fn builtin_char_upcase(args: &[Value]) -> Result<Value, EvalError> {
+    if args.len() != 1 { return Err(EvalError::Arity("char-upcase requires exactly 1 argument".into())); }
+    match &args[0] {
+        Value::Char(c) => Ok(Value::Char(c.to_ascii_uppercase())),
+        _ => Err(EvalError::Type("char-upcase: expected char".into())),
+    }
+}
+
+fn builtin_char_downcase(args: &[Value]) -> Result<Value, EvalError> {
+    if args.len() != 1 { return Err(EvalError::Arity("char-downcase requires exactly 1 argument".into())); }
+    match &args[0] {
+        Value::Char(c) => Ok(Value::Char(c.to_ascii_lowercase())),
+        _ => Err(EvalError::Type("char-downcase: expected char".into())),
+    }
+}
+
+fn builtin_char_eq(args: &[Value]) -> Result<Value, EvalError> {
+    if args.len() != 2 { return Err(EvalError::Arity("char=? requires exactly 2 arguments".into())); }
+    match (&args[0], &args[1]) {
+        (Value::Char(a), Value::Char(b)) => Ok(Value::Boolean(a == b)),
+        _ => Err(EvalError::Type("char=?: expected chars".into())),
+    }
+}
+
+fn builtin_char_lt(args: &[Value]) -> Result<Value, EvalError> {
+    if args.len() != 2 { return Err(EvalError::Arity("char<? requires exactly 2 arguments".into())); }
+    match (&args[0], &args[1]) {
+        (Value::Char(a), Value::Char(b)) => Ok(Value::Boolean(a < b)),
+        _ => Err(EvalError::Type("char<?: expected chars".into())),
+    }
+}
+
+// --- L13: String utilities ---
+
+fn builtin_string_eq(args: &[Value]) -> Result<Value, EvalError> {
+    if args.len() != 2 { return Err(EvalError::Arity("string=? requires exactly 2 arguments".into())); }
+    match (&args[0], &args[1]) {
+        (Value::Str(a), Value::Str(b)) => Ok(Value::Boolean(a == b)),
+        _ => Err(EvalError::Type("string=?: expected strings".into())),
+    }
+}
+
+fn builtin_string_lt(args: &[Value]) -> Result<Value, EvalError> {
+    if args.len() != 2 { return Err(EvalError::Arity("string<? requires exactly 2 arguments".into())); }
+    match (&args[0], &args[1]) {
+        (Value::Str(a), Value::Str(b)) => Ok(Value::Boolean(a < b)),
+        _ => Err(EvalError::Type("string<?: expected strings".into())),
+    }
+}
+
+fn builtin_string_ci_eq(args: &[Value]) -> Result<Value, EvalError> {
+    if args.len() != 2 { return Err(EvalError::Arity("string-ci=? requires exactly 2 arguments".into())); }
+    match (&args[0], &args[1]) {
+        (Value::Str(a), Value::Str(b)) => Ok(Value::Boolean(a.to_lowercase() == b.to_lowercase())),
+        _ => Err(EvalError::Type("string-ci=?: expected strings".into())),
+    }
+}
+
+fn builtin_string_upcase(args: &[Value]) -> Result<Value, EvalError> {
+    if args.len() != 1 { return Err(EvalError::Arity("string-upcase requires exactly 1 argument".into())); }
+    match &args[0] {
+        Value::Str(s) => Ok(Value::Str(s.to_uppercase())),
+        _ => Err(EvalError::Type("string-upcase: expected string".into())),
+    }
+}
+
+fn builtin_string_downcase(args: &[Value]) -> Result<Value, EvalError> {
+    if args.len() != 1 { return Err(EvalError::Arity("string-downcase requires exactly 1 argument".into())); }
+    match &args[0] {
+        Value::Str(s) => Ok(Value::Str(s.to_lowercase())),
+        _ => Err(EvalError::Type("string-downcase: expected string".into())),
+    }
+}
+
 fn default_env() -> Env {
     let env = new_env(None);
     let builtins: &[(&'static str, fn(&[Value]) -> Result<Value, EvalError>)] = &[
@@ -688,6 +956,40 @@ fn default_env() -> Env {
         ("string-ref", builtin_string_ref),
         ("string-copy", builtin_string_copy),
         ("apply", builtin_apply_placeholder),
+        // L13: numeric
+        ("abs", builtin_abs),
+        ("modulo", builtin_modulo),
+        ("remainder", builtin_remainder),
+        ("quotient", builtin_quotient),
+        ("min", builtin_min),
+        ("max", builtin_max),
+        ("expt", builtin_expt),
+        ("zero?", builtin_zero_pred),
+        ("positive?", builtin_positive_pred),
+        ("negative?", builtin_negative_pred),
+        ("odd?", builtin_odd_pred),
+        ("even?", builtin_even_pred),
+        // L13: list
+        ("list-ref", builtin_list_ref),
+        ("list-tail", builtin_list_tail),
+        ("list?", builtin_list_pred),
+        ("assoc", builtin_assoc),
+        ("eq?", builtin_eq_pred),
+        ("equal?", builtin_equal_pred),
+        ("map", builtin_map_placeholder),
+        // L13: char
+        ("char-alphabetic?", builtin_char_alphabetic),
+        ("char-numeric?", builtin_char_numeric),
+        ("char-upcase", builtin_char_upcase),
+        ("char-downcase", builtin_char_downcase),
+        ("char=?", builtin_char_eq),
+        ("char<?", builtin_char_lt),
+        // L13: string
+        ("string=?", builtin_string_eq),
+        ("string<?", builtin_string_lt),
+        ("string-ci=?", builtin_string_ci_eq),
+        ("string-upcase", builtin_string_upcase),
+        ("string-downcase", builtin_string_downcase),
     ];
     for &(name, func) in builtins {
         env_set(&env, name.to_string(), Value::Builtin(name, func));
@@ -1271,6 +1573,59 @@ fn eval_body_state(body: &[Expr], env: Env, kont: &mut Rc<Kont>) -> State {
 
 fn apply_function(func: Value, args: Vec<Value>, form: &Expr, kont: &mut Rc<Kont>) -> Result<State, EvalError> {
     match func {
+        Value::Builtin("map", _) => {
+            if args.len() < 2 {
+                return Err(form.wrap_err(EvalError::Arity("map: expected procedure and at least one list".into())));
+            }
+            let proc = args[0].clone();
+            let lists = &args[1..];
+            // Collect all lists into vectors of elements
+            let mut iters: Vec<Vec<Value>> = Vec::new();
+            for list in lists {
+                let mut elems = Vec::new();
+                let mut cur = list;
+                loop {
+                    match cur {
+                        Value::Nil => break,
+                        Value::Pair(car, cdr) => {
+                            elems.push(*car.clone());
+                            cur = cdr;
+                        }
+                        _ => return Err(form.wrap_err(EvalError::Type("map: expected list".into()))),
+                    }
+                }
+                iters.push(elems);
+            }
+            let len = iters[0].len();
+            for iter in &iters {
+                if iter.len() != len {
+                    return Err(form.wrap_err(EvalError::Arity("map: lists must have same length".into())));
+                }
+            }
+            // Apply proc to each set of elements
+            let mut results = Vec::new();
+            for i in 0..len {
+                let call_args: Vec<Value> = iters.iter().map(|v| v[i].clone()).collect();
+                let result = match &proc {
+                    Value::Builtin(_, fp) => fp(&call_args).map_err(|e| form.wrap_err(e))?,
+                    Value::Lambda { params, rest_param, body, env } => {
+                        let local_env = bind_args(form, params, rest_param, &call_args, env.clone())?;
+                        let mut r = Value::Void;
+                        for expr in body {
+                            r = eval_cek(expr.clone(), local_env.clone(), Rc::new(Kont::Done))?;
+                        }
+                        r
+                    }
+                    _ => return Err(form.wrap_err(EvalError::Type("map: first argument must be a procedure".into()))),
+                };
+                results.push(result);
+            }
+            let mut result = Value::Nil;
+            for v in results.into_iter().rev() {
+                result = Value::Pair(Box::new(v), Box::new(result));
+            }
+            Ok(State::Apply(result))
+        }
         Value::Builtin("apply", _) => {
             if args.len() < 2 {
                 return Err(form.wrap_err(EvalError::Arity("apply: expected at least 2 arguments".into())));
