@@ -68,17 +68,14 @@ object Evaluator extends EvalForms:
     (result.display, output.toString)
 
   private def makeGlobalEnv(output: StringBuilder = new StringBuilder): Env =
-    val env = Env()
-    Builtins.register(env, output)
-    registerSpecials(env)
-    env
-
-  private def registerSpecials(env: Env): Unit =
+    val env                         = Env()
     val dummy: List[Value] => Value = _ => throw new EvalError("internal: direct call to special")
+    Builtins.register(env, output)
     env.define("call/cc", BuiltinVal("call/cc", dummy))
     env.define("call-with-current-continuation", BuiltinVal("call-with-current-continuation", dummy))
     env.define("apply", BuiltinVal("apply", dummy))
     env.define("map", BuiltinVal("map", dummy))
+    env
 
   protected def evalBody(exprs: List[Expr], env: Env, k: K): Bounce =
     bodyRemaining = exprs
@@ -115,7 +112,7 @@ object Evaluator extends EvalForms:
               env,
               cv =>
                 if cv.isTruthy then tailEval(thenB, env, k)
-                else k(BoolVal(false))
+                else k(VoidVal)
             )
           case _ => evalError("if: bad syntax", pos)
 
@@ -140,25 +137,23 @@ object Evaluator extends EvalForms:
       case SList(Sym("lambda", _) :: args, pos) =>
         k(evalLambda(args, env, pos))
 
-      case SList(Sym("let", _) :: args, pos) =>
-        evalLetCps(args, env, pos, k)
+      case SList(Sym("let", _) :: args, pos)     => evalLetCps(args, env, pos, k)
+      case SList(Sym("let*", _) :: args, pos)    => evalLetStarCps(args, env, pos, k)
+      case SList(Sym("letrec", _) :: args, pos)  => evalLetrecCps(args, env, pos, k)
+      case SList(Sym("letrec*", _) :: args, pos) => evalLetrecStarCps(args, env, pos, k)
+
+      case SList(Sym("case", _) :: keyExpr :: clauses, pos) =>
+        eval(keyExpr, env, keyVal => evalCaseCps(keyVal, clauses, env, pos, k))
+
+      case SList(Sym("do", _) :: args, pos) => evalDoCps(args, env, pos, k)
 
       case SList(Sym("begin", _) :: args, pos) =>
         if args.isEmpty then evalError("begin: empty", pos)
         evalBody(args, env, k)
 
-      case SList(Sym("cond", _) :: clauses, pos) =>
-        evalCondCps(clauses, env, pos, k)
-
-      case SList(Sym("and", _) :: args, _) =>
-        evalAndCps(args, env, k)
-
-      case SList(Sym("or", _) :: args, _) =>
-        evalOrCps(args, env, k)
-
-      case SList(Sym("not", _) :: args, _) =>
-        if args.length != 1 then throw new EvalError("not: expected 1 argument")
-        eval(args.head, env, v => k(BoolVal(!v.isTruthy)))
+      case SList(Sym("cond", _) :: clauses, pos) => evalCondCps(clauses, env, pos, k)
+      case SList(Sym("and", _) :: args, _)       => evalAndCps(args, env, k)
+      case SList(Sym("or", _) :: args, _)        => evalOrCps(args, env, k)
 
       case SList(Sym("define-syntax", _) :: Sym(name, _) :: SList(Sym("syntax-rules", _) :: srArgs, _) :: Nil, pos) =>
         val (literals, rules) = Macro.parseSyntaxRules(srArgs, pos)
@@ -179,19 +174,6 @@ object Evaluator extends EvalForms:
       case SList(head :: args, pos) =>
         eval(head, env, proc => evalArgs(args, env, values => applyProc(proc, values, pos, k)))
 
-  private def evalArgs(args: List[Expr], env: Env, k: List[Value] => Bounce): Bounce =
-    args match
-      case Nil => k(Nil)
-      case head :: tail =>
-        eval(
-          head,
-          env,
-          v =>
-            depth += 1
-            if depth >= MaxDepth then Bounce.More(() => evalArgs(tail, env, vs => k(v :: vs)))
-            else evalArgs(tail, env, vs => k(v :: vs))
-        )
-
   private def applyProc(proc: Value, values: List[Value], pos: Option[Pos], k: K): Bounce =
     proc match
       case LambdaVal(params, restParam, body, closure) =>
@@ -208,11 +190,8 @@ object Evaluator extends EvalForms:
         val contVal = ContinuationVal(v => Bounce.More(() => k(v)))
         applyProc(values.head, List(contVal), pos, k)
 
-      case BuiltinVal("apply", _) =>
-        applyBuiltinApply(values, pos, k)
-
-      case BuiltinVal("map", _) =>
-        applyBuiltinMap(values, pos, k)
+      case BuiltinVal("apply", _) => applyBuiltinApply(values, pos, k)
+      case BuiltinVal("map", _)   => applyBuiltinMap(values, pos, k)
 
       case BuiltinVal(name, fn) =>
         try k(fn(values))
@@ -251,15 +230,7 @@ object Evaluator extends EvalForms:
     else
       val heads = lists.map(_.head)
       val tails = lists.map(_.tail)
-      applyProc(
-        proc,
-        heads,
-        pos,
-        v =>
-          depth += 1
-          if depth >= MaxDepth then Bounce.More(() => mapLoop(proc, tails, v :: acc, pos, k))
-          else mapLoop(proc, tails, v :: acc, pos, k)
-      )
+      applyProc(proc, heads, pos, v => trampoline(mapLoop(proc, tails, v :: acc, pos, k)))
 
   /** call/cc as special form — hybrid: CPS for escape, body-restart for reentrant. */
   private def evalCallCc(callccExpr: Expr, procExpr: Expr, env: Env, pos: Option[Pos], k: K): Bounce =

@@ -5,11 +5,7 @@ import Expr.*
 import EvalHelpers.{evalError, parseParams}
 
 /** CPS form evaluators (define, let, cond, and, or) mixed into Evaluator. */
-private[ming] trait EvalForms:
-  protected def eval(expr: Expr, env: Env, k: Value => Bounce): Bounce
-  protected def evalBody(exprs: List[Expr], env: Env, k: Value => Bounce): Bounce
-  protected def tailBody(exprs: List[Expr], env: Env, k: Value => Bounce): Bounce
-  protected def trampoline(thunk: => Bounce): Bounce
+private[ming] trait EvalForms extends EvalDo:
 
   protected def evalDefineCps(
     args: List[Expr],
@@ -96,6 +92,95 @@ private[ming] trait EvalForms:
             else evalCondCps(rest, env, pos, k)
         )
       case _ => evalError("cond: bad syntax", pos)
+
+  protected def evalLetStarCps(
+    args: List[Expr],
+    env: Env,
+    pos: Option[Pos],
+    k: Value => Bounce
+  ): Bounce =
+    args match
+      case SList(bindings, _) :: body if body.nonEmpty =>
+        val localEnv = env.extend(Nil, Nil)
+        evalLetStarBindings(bindings, localEnv, pos, () => tailBody(body, localEnv, k))
+      case _ => evalError("let*: bad syntax", pos)
+
+  private def evalLetStarBindings(
+    bindings: List[Expr],
+    env: Env,
+    pos: Option[Pos],
+    k: () => Bounce
+  ): Bounce =
+    bindings match
+      case Nil => k()
+      case SList(Sym(name, _) :: valExpr :: Nil, _) :: rest =>
+        eval(
+          valExpr,
+          env,
+          { v =>
+            env.define(name, v)
+            trampoline(evalLetStarBindings(rest, env, pos, k))
+          }
+        )
+      case _ => evalError("let*: bad binding", pos)
+
+  protected def evalLetrecCps(
+    args: List[Expr],
+    env: Env,
+    pos: Option[Pos],
+    k: Value => Bounce
+  ): Bounce =
+    args match
+      case SList(bindings, _) :: body if body.nonEmpty =>
+        val localEnv = env.extend(Nil, Nil)
+        val names = bindings.map {
+          case SList(Sym(name, _) :: _ :: Nil, _) => name
+          case _                                  => evalError("letrec: bad binding", pos)
+        }
+        names.foreach(n => localEnv.define(n, VoidVal))
+        val valExprs = bindings.map {
+          case SList(_ :: valExpr :: Nil, _) => valExpr
+          case _                             => evalError("letrec: bad binding", pos)
+        }
+        evalLetrecBindings(names, valExprs, localEnv, pos, () => tailBody(body, localEnv, k))
+      case _ => evalError("letrec: bad syntax", pos)
+
+  private def evalLetrecBindings(
+    names: List[String],
+    valExprs: List[Expr],
+    env: Env,
+    pos: Option[Pos],
+    k: () => Bounce
+  ): Bounce =
+    (names, valExprs) match
+      case (Nil, Nil) => k()
+      case (name :: restN, valExpr :: restV) =>
+        eval(
+          valExpr,
+          env,
+          { v =>
+            env.define(name, v)
+            trampoline(evalLetrecBindings(restN, restV, env, pos, k))
+          }
+        )
+      case _ => evalError("letrec: internal error", pos)
+
+  protected def evalLetrecStarCps(
+    args: List[Expr],
+    env: Env,
+    pos: Option[Pos],
+    k: Value => Bounce
+  ): Bounce =
+    args match
+      case SList(bindings, _) :: body if body.nonEmpty =>
+        val localEnv = env.extend(Nil, Nil)
+        val names = bindings.map {
+          case SList(Sym(name, _) :: _ :: Nil, _) => name
+          case _                                  => evalError("letrec*: bad binding", pos)
+        }
+        names.foreach(n => localEnv.define(n, VoidVal))
+        evalLetStarBindings(bindings, localEnv, pos, () => tailBody(body, localEnv, k))
+      case _ => evalError("letrec*: bad syntax", pos)
 
   protected def evalAndCps(args: List[Expr], env: Env, k: Value => Bounce): Bounce =
     args match

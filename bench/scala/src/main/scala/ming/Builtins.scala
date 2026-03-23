@@ -8,6 +8,7 @@ object Builtins:
   def register(env: Env, output: StringBuilder): Unit =
     registerArithmetic(env)
     registerListOps(env)
+    registerListUtils(env)
     registerTypePredicates(env)
     registerIOOps(env, output)
     BuiltinsExt.register(env)
@@ -100,11 +101,24 @@ object Builtins:
             BoolVal(eqCheck(args(0), args(1)))
         ),
         (
+          "eqv?",
+          args =>
+            if args.length != 2 then throw new EvalError("eqv?: expected 2 arguments")
+            BoolVal(eqvCheck(args(0), args(1)))
+        ),
+        (
           "equal?",
           args =>
             if args.length != 2 then throw new EvalError("equal?: expected 2 arguments")
             BoolVal(equalCheck(args(0), args(1)))
-        ),
+        )
+      )
+    )
+
+  private def registerListUtils(env: Env): Unit =
+    define(
+      env,
+      List(
         (
           "list?",
           args =>
@@ -223,13 +237,19 @@ object Builtins:
       case (SymbolVal(x), SymbolVal(y)) => x == y
       case (CharVal(x), CharVal(y))     => x == y
       case (NilVal, NilVal)             => true
+      case (VoidVal, VoidVal)           => true
       case _                            => a eq b
+
+  /** eqv? — same as eq? for our value representation. */
+  private[ming] def eqvCheck(a: Value, b: Value): Boolean = eqCheck(a, b)
 
   private[ming] def equalCheck(a: Value, b: Value): Boolean =
     (a, b) match
       case (PairVal(a1, a2), PairVal(b1, b2)) => equalCheck(a1, b1) && equalCheck(a2, b2)
       case (StrVal(x), StrVal(y))             => java.util.Arrays.equals(x, y)
-      case _                                  => eqCheck(a, b)
+      case (VectorVal(x), VectorVal(y)) =>
+        x.length == y.length && x.indices.forall(i => equalCheck(x(i), y(i)))
+      case _ => eqCheck(a, b)
 
   private def isProperList(v: Value): Boolean =
     v match

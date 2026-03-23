@@ -11,6 +11,7 @@ object BuiltinsExt:
   def register(env: Env): Unit =
     registerStringOps(env)
     registerNumericUtils(env)
+    BuiltinsVector.register(env)
     BuiltinsChar.register(env)
 
   private def registerStringOps(env: Env): Unit =
