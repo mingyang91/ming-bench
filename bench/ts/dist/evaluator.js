@@ -190,6 +190,136 @@ function parseParams(elements, errPos) {
         throw posError('param must be symbol', errPos); return p.value; });
     return { params, restParam: last.value };
 }
+// ── Macro Support ─────────────────────────────────────────────────
+let gensymCounter = 0;
+function gensym(base) { return `##${base}_${gensymCounter++}`; }
+const SPECIAL_FORMS = new Set([
+    'quote', 'if', 'define', 'lambda', 'set!', 'begin', 'let', 'cond', 'and', 'or', 'define-syntax',
+]);
+function matchPattern(pattern, args, literals) {
+    const bindings = new Map();
+    let pi = 0, ai = 0;
+    while (pi < pattern.length) {
+        const nextPat = pi + 1 < pattern.length ? pattern[pi + 1] : undefined;
+        if (nextPat && nextPat.tag === 'symbol' && nextPat.value === '...') {
+            const varPat = pattern[pi];
+            if (varPat.tag !== 'symbol')
+                return null;
+            const remainingFixed = pattern.length - pi - 2;
+            const available = args.length - ai - remainingFixed;
+            if (available < 0)
+                return null;
+            bindings.set(varPat.value, args.slice(ai, ai + available));
+            ai += available;
+            pi += 2;
+        }
+        else {
+            if (ai >= args.length)
+                return null;
+            const pat = pattern[pi];
+            if (pat.tag === 'symbol') {
+                if (literals.includes(pat.value)) {
+                    const arg = args[ai];
+                    if (arg.tag !== 'symbol' || arg.value !== pat.value)
+                        return null;
+                }
+                else {
+                    bindings.set(pat.value, args[ai]);
+                }
+            }
+            else {
+                return null;
+            }
+            pi++;
+            ai++;
+        }
+    }
+    if (ai !== args.length)
+        return null;
+    return bindings;
+}
+function findEllipsisVar(template, bindings) {
+    if (template.tag === 'symbol') {
+        const val = bindings.get(template.value);
+        if (val !== undefined && Array.isArray(val))
+            return template.value;
+        return null;
+    }
+    if (template.tag === 'list') {
+        for (const elem of template.elements) {
+            const found = findEllipsisVar(elem, bindings);
+            if (found)
+                return found;
+        }
+    }
+    return null;
+}
+function instantiateTemplate(template, bindings, renames) {
+    if (template.tag === 'symbol') {
+        const bound = bindings.get(template.value);
+        if (bound !== undefined && !Array.isArray(bound))
+            return bound;
+        const renamed = renames.get(template.value);
+        if (renamed !== undefined)
+            return { tag: 'symbol', value: renamed };
+        return template;
+    }
+    if (template.tag === 'list') {
+        const result = [];
+        for (let i = 0; i < template.elements.length; i++) {
+            const nextTpl = i + 1 < template.elements.length ? template.elements[i + 1] : undefined;
+            if (nextTpl && nextTpl.tag === 'symbol' && nextTpl.value === '...') {
+                const elem = template.elements[i];
+                const listVar = findEllipsisVar(elem, bindings);
+                if (listVar) {
+                    const listVals = bindings.get(listVar);
+                    for (const val of listVals) {
+                        const singleBindings = new Map(bindings);
+                        singleBindings.set(listVar, val);
+                        result.push(instantiateTemplate(elem, singleBindings, renames));
+                    }
+                }
+                i++; // skip ellipsis
+            }
+            else {
+                result.push(instantiateTemplate(template.elements[i], bindings, renames));
+            }
+        }
+        return { tag: 'list', elements: result };
+    }
+    return template;
+}
+function collectTemplateSymbols(template, patVars, renames) {
+    if (template.tag === 'symbol' && !patVars.has(template.value) &&
+        !SPECIAL_FORMS.has(template.value) && !renames.has(template.value) &&
+        template.value !== '...') {
+        renames.set(template.value, gensym(template.value));
+    }
+    if (template.tag === 'list') {
+        for (const elem of template.elements)
+            collectTemplateSymbols(elem, patVars, renames);
+    }
+}
+function expandMacro(macro, args, callEnv, pos) {
+    for (const rule of macro.rules) {
+        const bindings = matchPattern(rule.pattern, args, macro.literals);
+        if (bindings !== null) {
+            const patVars = new Set(bindings.keys());
+            const renames = new Map();
+            collectTemplateSymbols(rule.template, patVars, renames);
+            const expanded = instantiateTemplate(rule.template, bindings, renames);
+            const evalEnv = new Env(callEnv);
+            for (const [origName, gensymName] of renames) {
+                try {
+                    evalEnv.set(gensymName, macro.defEnv.get(origName));
+                }
+                catch (_) { /* not bound */ }
+            }
+            return { expanded, evalEnv };
+        }
+    }
+    throw posError('no matching syntax-rules pattern', pos);
+}
 // ── CPS Evaluator ──────────────────────────────────────────────────
 function isTruthy(val) {
     return !(val.tag === 'boolean' && val.value === false);
@@ -388,6 +518,47 @@ function evalK(expr, env, k) {
                 };
                 return evalOrs(1);
             }
+            case 'define-syntax': {
+                if (elems.length !== 3)
+                    throw posError('define-syntax: bad syntax', expr.pos);
+                const name = elems[1];
+                if (name.tag !== 'symbol')
+                    throw posError('define-syntax: name must be symbol', expr.pos);
+                const transformer = elems[2];
+                if (transformer.tag !== 'list' || transformer.elements.length < 2 ||
+                    transformer.elements[0].tag !== 'symbol' || transformer.elements[0].value !== 'syntax-rules')
+                    throw posError('define-syntax: expected syntax-rules', expr.pos);
+                const litList = transformer.elements[1];
+                if (litList.tag !== 'list')
+                    throw posError('syntax-rules: literals must be list', expr.pos);
+                const literals = litList.elements.map(e => {
+                    if (e.tag !== 'symbol')
+                        throw posError('syntax-rules: literal must be symbol', expr.pos);
+                    return e.value;
+                });
+                const rules = [];
+                for (let i = 2; i < transformer.elements.length; i++) {
+                    const clause = transformer.elements[i];
+                    if (clause.tag !== 'list' || clause.elements.length !== 2)
+                        throw posError('syntax-rules: bad clause', expr.pos);
+                    const pat = clause.elements[0];
+                    if (pat.tag !== 'list')
+                        throw posError('syntax-rules: pattern must be list', expr.pos);
+                    rules.push({ pattern: pat.elements.slice(1), template: clause.elements[1] });
+                }
+                env.set(name.value, { tag: 'macro', literals, rules, defEnv: env });
+                return k({ tag: 'void' });
+            }
+        }
+        // Check for macro application
+        let macroVal;
+        try {
+            macroVal = env.get(head.value);
+        }
+        catch (_) { /* unbound */ }
+        if (macroVal && macroVal.tag === 'macro') {
+            const { expanded, evalEnv } = expandMacro(macroVal, elems.slice(1), env, expr.pos);
+            return evalK(expanded, evalEnv, k);
         }
     }
     // Function application: evaluate head, then args, then apply
@@ -698,6 +869,7 @@ function displayVal(val) {
         case 'builtin': return '#<procedure>';
         case 'continuation': return '#<procedure>';
         case 'callcc': return '#<procedure>';
+        case 'macro': return '#<macro>';
     }
 }
 function writeVal(val) {
