@@ -3514,7 +3514,7 @@ func builtinProcedureQ(args []SchemeValue, callExpr *ListExpr) (SchemeValue, err
 		return nil, &EvalError{Message: fmt.Sprintf("%d:%d: procedure?: requires exactly 1 argument", line, col)}
 	}
 	switch args[0].(type) {
-	case *Lambda, *BuiltinProc, *EnvBuiltinProc, *SchemeCallCC, *SchemeDynamicWind, *SchemeCaseLambda:
+	case *Lambda, *BuiltinProc, *EnvBuiltinProc, *SchemeCallCC, *SchemeDynamicWind, *SchemeCaseLambda, *SchemeContinuation:
 		return &SchemeBool{Value: true}, nil
 	default:
 		return &SchemeBool{Value: false}, nil
