@@ -13,6 +13,7 @@ public sealed interface SchemeValue {
     record ListVal(List<SchemeValue> elements, SourcePos pos) implements SchemeValue {}
     record LambdaVal(List<String> params, List<SchemeValue> body, Environment env) implements SchemeValue {}
     record CharVal(char value, SourcePos pos) implements SchemeValue {}
+    record Thunk(SchemeValue expr, Environment env) implements SchemeValue {}
 
     default SourcePos sourcePos() {
         return switch (this) {
@@ -23,6 +24,7 @@ public sealed interface SchemeValue {
             case ListVal v -> v.pos();
             case LambdaVal v -> SourcePos.NONE;
             case CharVal v -> v.pos();
+            case Thunk v -> SourcePos.NONE;
         };
     }
 
@@ -49,6 +51,7 @@ public sealed interface SchemeValue {
             }
             case LambdaVal v -> "#<procedure>";
             case CharVal v -> "#\\" + v.value();
+            case Thunk v -> "#<thunk>";
         };
     }
 
@@ -66,6 +69,7 @@ public sealed interface SchemeValue {
                 sb.append(')');
                 yield sb.toString();
             }
+            case Thunk v -> "#<thunk>";
             default -> display();
         };
     }

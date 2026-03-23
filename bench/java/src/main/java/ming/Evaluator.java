@@ -36,13 +36,28 @@ public class Evaluator {
         return new EvalError(pos + ": " + msg);
     }
 
+    /** Evaluate with trampoline — resolves Thunks iteratively for TCO. */
     private SchemeValue eval(SchemeValue expr, Environment env) throws EvalError {
+        while (true) {
+            SchemeValue result = evalInner(expr, env);
+            if (result instanceof SchemeValue.Thunk t) {
+                expr = t.expr();
+                env = t.env();
+            } else {
+                return result;
+            }
+        }
+    }
+
+    /** Single-step eval. Returns Thunk for tail positions. */
+    private SchemeValue evalInner(SchemeValue expr, Environment env) throws EvalError {
         return switch (expr) {
             case SchemeValue.IntVal v -> v;
             case SchemeValue.BoolVal v -> v;
             case SchemeValue.StringVal v -> v;
             case SchemeValue.LambdaVal v -> v;
             case SchemeValue.CharVal v -> v;
+            case SchemeValue.Thunk v -> v; // pass through
             case SchemeValue.SymbolVal v -> {
                 try {
                     yield env.lookup(v.name());
@@ -66,15 +81,17 @@ public class Evaluator {
 
             switch (op) {
                 case "define" -> { return evalDefine(args, env, pos); }
-                case "if" -> { return evalIf(args, env, pos); }
+                case "if" -> { return evalIfTail(args, env, pos); }
                 case "quote" -> {
                     if (args.size() != 1) throw posError(pos, "quote: need exactly one argument");
                     return args.getFirst();
                 }
                 case "lambda" -> { return evalLambda(args, env, pos); }
-                case "let" -> { return evalLet(args, env, pos); }
-                case "begin" -> { return evalBegin(args, env, pos); }
-                case "cond" -> { return evalCond(args, env, pos); }
+                case "let" -> { return evalLetTail(args, env, pos); }
+                case "begin" -> { return evalBeginTail(args, env, pos); }
+                case "cond" -> { return evalCondTail(args, env, pos); }
+                case "and" -> { return andTail(args, env); }
+                case "or" -> { return orTail(args, env); }
                 default -> {
                     SchemeValue builtinResult = tryBuiltin(op, args, env, pos);
                     if (builtinResult != null) return builtinResult;
@@ -89,7 +106,7 @@ public class Evaluator {
         for (SchemeValue arg : args) {
             evaledArgs.add(eval(arg, env));
         }
-        return apply(proc, evaledArgs, pos);
+        return applyTail(proc, evaledArgs, pos);
     }
 
     private SchemeValue evalDefine(List<SchemeValue> args, Environment env, SourcePos pos) throws EvalError {
@@ -120,13 +137,14 @@ public class Evaluator {
         throw posError(pos, "define: invalid syntax");
     }
 
-    private SchemeValue evalIf(List<SchemeValue> args, Environment env, SourcePos pos) throws EvalError {
+    /** If with tail-call: returns Thunk for the chosen branch. */
+    private SchemeValue evalIfTail(List<SchemeValue> args, Environment env, SourcePos pos) throws EvalError {
         if (args.size() < 2 || args.size() > 3) throw posError(pos, "if: need 2 or 3 arguments");
         SchemeValue cond = eval(args.get(0), env);
         if (cond.isTruthy()) {
-            return eval(args.get(1), env);
+            return new SchemeValue.Thunk(args.get(1), env);
         } else if (args.size() == 3) {
-            return eval(args.get(2), env);
+            return new SchemeValue.Thunk(args.get(2), env);
         }
         return new SchemeValue.BoolVal(false, SourcePos.NONE);
     }
@@ -147,7 +165,8 @@ public class Evaluator {
         return new SchemeValue.LambdaVal(params, body, env);
     }
 
-    private SchemeValue apply(SchemeValue proc, List<SchemeValue> args, SourcePos pos) throws EvalError {
+    /** Apply with tail-call: returns Thunk for the last body expression. */
+    private SchemeValue applyTail(SchemeValue proc, List<SchemeValue> args, SourcePos pos) throws EvalError {
         if (proc instanceof SchemeValue.LambdaVal lambda) {
             if (args.size() != lambda.params().size())
                 throw posError(pos, "wrong number of arguments: expected " + lambda.params().size() + ", got " + args.size());
@@ -155,11 +174,12 @@ public class Evaluator {
             for (int i = 0; i < lambda.params().size(); i++) {
                 callEnv.define(lambda.params().get(i), args.get(i));
             }
-            SchemeValue result = null;
-            for (SchemeValue expr : lambda.body()) {
-                result = eval(expr, callEnv);
+            // Evaluate all but the last body expression
+            for (int i = 0; i < lambda.body().size() - 1; i++) {
+                eval(lambda.body().get(i), callEnv);
             }
-            return result;
+            // Return Thunk for the last body expression (TCO)
+            return new SchemeValue.Thunk(lambda.body().getLast(), callEnv);
         }
         throw posError(pos, "not a procedure: " + proc.display());
     }
@@ -188,8 +208,6 @@ public class Evaluator {
             case "<=" -> compare(args, (a, b) -> a <= b, env, pos);
             case ">=" -> compare(args, (a, b) -> a >= b, env, pos);
             case "not" -> not(args, env, pos);
-            case "and" -> and(args, env);
-            case "or" -> or(args, env);
             // L03 builtins
             case "cons" -> builtinCons(args, env, pos);
             case "car" -> builtinCar(args, env, pos);
@@ -270,27 +288,32 @@ public class Evaluator {
         return new SchemeValue.BoolVal(!eval(args.getFirst(), env).isTruthy(), SourcePos.NONE);
     }
 
-    private SchemeValue and(List<SchemeValue> args, Environment env) throws EvalError {
-        SchemeValue result = new SchemeValue.BoolVal(true, SourcePos.NONE);
-        for (SchemeValue arg : args) {
-            result = eval(arg, env);
+    /** and with TCO on last expression. */
+    private SchemeValue andTail(List<SchemeValue> args, Environment env) throws EvalError {
+        if (args.isEmpty()) return new SchemeValue.BoolVal(true, SourcePos.NONE);
+        for (int i = 0; i < args.size() - 1; i++) {
+            SchemeValue result = eval(args.get(i), env);
             if (!result.isTruthy()) return result;
         }
-        return result;
+        // Tail position: return Thunk for last arg
+        return new SchemeValue.Thunk(args.getLast(), env);
     }
 
-    private SchemeValue or(List<SchemeValue> args, Environment env) throws EvalError {
-        SchemeValue result = new SchemeValue.BoolVal(false, SourcePos.NONE);
-        for (SchemeValue arg : args) {
-            result = eval(arg, env);
+    /** or with TCO on last expression. */
+    private SchemeValue orTail(List<SchemeValue> args, Environment env) throws EvalError {
+        if (args.isEmpty()) return new SchemeValue.BoolVal(false, SourcePos.NONE);
+        for (int i = 0; i < args.size() - 1; i++) {
+            SchemeValue result = eval(args.get(i), env);
             if (result.isTruthy()) return result;
         }
-        return result;
+        // Tail position: return Thunk for last arg
+        return new SchemeValue.Thunk(args.getLast(), env);
     }
 
     // --- L03 special forms ---
 
-    private SchemeValue evalLet(List<SchemeValue> args, Environment env, SourcePos pos) throws EvalError {
+    /** Let with TCO on last body expression. */
+    private SchemeValue evalLetTail(List<SchemeValue> args, Environment env, SourcePos pos) throws EvalError {
         if (args.size() < 2) throw posError(pos, "let: need bindings and body");
 
         // Named let: (let name ((var init) ...) body...)
@@ -320,7 +343,7 @@ public class Evaluator {
             for (SchemeValue init : inits) {
                 evaledInits.add(eval(init, env));
             }
-            return apply(lambda, evaledInits, pos);
+            return applyTail(lambda, evaledInits, pos);
         }
 
         // Regular let: (let ((var init) ...) body...)
@@ -338,23 +361,24 @@ public class Evaluator {
             letEnv.define(s.name(), val);
         }
 
-        SchemeValue result = null;
-        for (int i = 1; i < args.size(); i++) {
-            result = eval(args.get(i), letEnv);
+        // Eval all but last, return Thunk for last (TCO)
+        for (int i = 1; i < args.size() - 1; i++) {
+            eval(args.get(i), letEnv);
         }
-        return result;
+        return new SchemeValue.Thunk(args.getLast(), letEnv);
     }
 
-    private SchemeValue evalBegin(List<SchemeValue> args, Environment env, SourcePos pos) throws EvalError {
+    /** Begin with TCO on last expression. */
+    private SchemeValue evalBeginTail(List<SchemeValue> args, Environment env, SourcePos pos) throws EvalError {
         if (args.isEmpty()) throw posError(pos, "begin: need at least one expression");
-        SchemeValue result = null;
-        for (SchemeValue arg : args) {
-            result = eval(arg, env);
+        for (int i = 0; i < args.size() - 1; i++) {
+            eval(args.get(i), env);
         }
-        return result;
+        return new SchemeValue.Thunk(args.getLast(), env);
     }
 
-    private SchemeValue evalCond(List<SchemeValue> args, Environment env, SourcePos pos) throws EvalError {
+    /** Cond with TCO on matching clause body. */
+    private SchemeValue evalCondTail(List<SchemeValue> args, Environment env, SourcePos pos) throws EvalError {
         for (SchemeValue clause : args) {
             if (!(clause instanceof SchemeValue.ListVal clauseList) || clauseList.elements().isEmpty())
                 throw posError(pos, "cond: invalid clause");
@@ -362,20 +386,20 @@ public class Evaluator {
             SchemeValue test = elems.getFirst();
 
             if (test instanceof SchemeValue.SymbolVal sym && sym.name().equals("else")) {
-                SchemeValue result = null;
-                for (int i = 1; i < elems.size(); i++) {
-                    result = eval(elems.get(i), env);
+                if (elems.size() == 1) return new SchemeValue.BoolVal(false, SourcePos.NONE);
+                for (int i = 1; i < elems.size() - 1; i++) {
+                    eval(elems.get(i), env);
                 }
-                return result;
+                return new SchemeValue.Thunk(elems.getLast(), env);
             }
 
             SchemeValue testVal = eval(test, env);
             if (testVal.isTruthy()) {
-                SchemeValue result = testVal;
-                for (int i = 1; i < elems.size(); i++) {
-                    result = eval(elems.get(i), env);
+                if (elems.size() == 1) return testVal;
+                for (int i = 1; i < elems.size() - 1; i++) {
+                    eval(elems.get(i), env);
                 }
-                return result;
+                return new SchemeValue.Thunk(elems.getLast(), env);
             }
         }
         return new SchemeValue.BoolVal(false, SourcePos.NONE);
