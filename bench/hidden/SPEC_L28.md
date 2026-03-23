@@ -1,0 +1,2 @@
+### Level 28 — Performance & Memory Stress
+Tests that the interpreter handles large-scale computation within the container's 1GB / 30s limits. No new language features — this level tests whether your implementation's architecture scales. Fixtures include: 1M cons cell allocation pressure, 100 nested call/cc captures, 50-argument macro expansion stress, 1M-iteration TCO in all tail contexts (if/cond/begin/let/and/or/case/when), 50 nested let bindings with deep lookup, and 10K-char string construction via repeated `string-append`.

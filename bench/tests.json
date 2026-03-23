@@ -1658,47 +1658,5 @@
     "fixture": "l26_realworld_alexpander.scm",
     "kind": "eval_str_ok",
     "expected": "#t"
-  },
-  {
-    "name": "l28_memory_pressure",
-    "level": 28,
-    "fixture": "l28_memory_pressure.scm",
-    "kind": "eval_str_ok",
-    "expected": "done"
-  },
-  {
-    "name": "l28_deep_callcc_chain",
-    "level": 28,
-    "fixture": "l28_deep_callcc_chain.scm",
-    "kind": "eval_str_ok",
-    "expected": "100"
-  },
-  {
-    "name": "l28_macro_expansion_stress",
-    "level": 28,
-    "fixture": "l28_macro_expansion_stress.scm",
-    "kind": "eval_str_ok",
-    "expected": "1275"
-  },
-  {
-    "name": "l28_tco_all_contexts",
-    "level": 28,
-    "fixture": "l28_tco_all_contexts.scm",
-    "kind": "eval_str_ok",
-    "expected": "(if-ok cond-ok begin-ok let-ok and-ok or-ok case-ok)"
-  },
-  {
-    "name": "l28_large_env_chain",
-    "level": 28,
-    "fixture": "l28_large_env_chain.scm",
-    "kind": "eval_str_ok",
-    "expected": "49"
-  },
-  {
-    "name": "l28_string_heavy",
-    "level": 28,
-    "fixture": "l28_string_heavy.scm",
-    "kind": "eval_str_ok",
-    "expected": "10000"
   }
 ]

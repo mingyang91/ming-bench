@@ -37,7 +37,7 @@ cargo xtask test all --lang scala   # test all levels (300s timeout)
 
 ## Development Strategy
 
-- **Implement levels in order (L1 → L28).** Each level builds on the previous.
+- **Implement levels in order (L1 → L26).** Each level builds on the previous.
 - **After implementing each level, run its tests before moving on.**
 - **If a level's tests fail, fix them before proceeding.**
 - **Code first, debug from test output.** Don't mentally simulate — let the test runner do that.

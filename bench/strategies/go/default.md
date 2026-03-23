@@ -28,7 +28,7 @@ cargo xtask test all --lang go   # test all levels (300s timeout)
 
 ## Development Strategy
 
-- **Implement levels in order (L1 → L28).** Each level builds on the previous.
+- **Implement levels in order (L1 → L26).** Each level builds on the previous.
 - **After implementing each level, run its tests before moving on.**
 - **Do not skip ahead.** Later levels depend on earlier ones being correct.
 - **If a level's tests fail, fix them before proceeding.**

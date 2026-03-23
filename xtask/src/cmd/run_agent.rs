@@ -36,7 +36,7 @@ pub struct RunAgentArgs {
 }
 
 const DEFAULT_PROMPT: &str = "Implement the Scheme interpreter by following CLAUDE.md exactly.
-Work through levels 1 through 28 in order.
+Work through levels 1 through 26 in order.
 After implementing each level, run cargo xtask test NN to verify.
 Fix failures before proceeding. Do not skip levels.";
 
