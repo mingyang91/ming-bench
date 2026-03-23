@@ -4,7 +4,7 @@ import scala.concurrent._
 import scala.concurrent.duration._
 import scala.concurrent.ExecutionContext.Implicits.global
 
-// Level 27: Concurrent Evaluation
+// Level 28: Concurrent Evaluation
 // evalStr must be safe for concurrent use from multiple threads.
 class ConcurrencySpec extends munit.FunSuite:
 
@@ -13,10 +13,10 @@ class ConcurrencySpec extends munit.FunSuite:
 
   private def skipIfBelow(): Unit =
     val level = benchLevel
-    if level > 0 && level < 27 then
-      assume(false, "Skipping: BENCH_LEVEL < 27")
+    if level > 0 && level < 28 then
+      assume(false, "Skipping: BENCH_LEVEL < 28")
 
-  test("l27_concurrent_independent_eval") {
+  test("l28_concurrent_independent_eval") {
     skipIfBelow()
     val futures = (0 until 8).map { i =>
       Future {
@@ -31,7 +31,7 @@ class ConcurrencySpec extends munit.FunSuite:
     }
   }
 
-  test("l27_concurrent_output_isolation") {
+  test("l28_concurrent_output_isolation") {
     skipIfBelow()
     val futures = (0 until 4).map { i =>
       Future {
@@ -47,7 +47,7 @@ class ConcurrencySpec extends munit.FunSuite:
     }
   }
 
-  test("l27_concurrent_closures_and_mutation") {
+  test("l28_concurrent_closures_and_mutation") {
     skipIfBelow()
     val futures = (0 until 4).map { _ =>
       Future {
@@ -63,7 +63,7 @@ class ConcurrencySpec extends munit.FunSuite:
     results.foreach(r => assertEquals(r, "3"))
   }
 
-  test("l27_concurrent_stress") {
+  test("l28_concurrent_stress") {
     skipIfBelow()
     val futures = (0 until 16).map { i =>
       Future {
@@ -80,7 +80,7 @@ class ConcurrencySpec extends munit.FunSuite:
 
   // ===== State isolation tests (sequential) =====
 
-  test("l27_sequential_state_leak") {
+  test("l28_sequential_state_leak") {
     skipIfBelow()
     val r1 = Evaluator.evalStr("(begin (define x 42) x)")
     assertEquals(r1, "42")
@@ -90,7 +90,7 @@ class ConcurrencySpec extends munit.FunSuite:
     assert(caught != null, "variable 'x' leaked between independent evalStr calls")
   }
 
-  test("l27_sequential_output_leak") {
+  test("l28_sequential_output_leak") {
     skipIfBelow()
     val (_, out1) = Evaluator.evalStrWithOutput("""(display "aaa")""")
     val (_, out2) = Evaluator.evalStrWithOutput("""(display "bbb")""")
@@ -100,7 +100,7 @@ class ConcurrencySpec extends munit.FunSuite:
 
   // ===== Concurrent continuation/macro collision tests =====
 
-  test("l27_concurrent_callcc_collision") {
+  test("l28_concurrent_callcc_collision") {
     skipIfBelow()
     val futures = (0 until 8).map { _ =>
       Future {
@@ -115,7 +115,7 @@ class ConcurrencySpec extends munit.FunSuite:
     results.foreach(r => assertEquals(r, "10"))
   }
 
-  test("l27_concurrent_macro_hygiene") {
+  test("l28_concurrent_macro_hygiene") {
     skipIfBelow()
     val futures = (0 until 4).map { _ =>
       Future {

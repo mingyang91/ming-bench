@@ -4,7 +4,7 @@ import path from 'node:path';
 import fs from 'node:fs';
 
 const benchLevel = process.env.BENCH_LEVEL ? parseInt(process.env.BENCH_LEVEL, 10) : undefined;
-const shouldSkip = benchLevel !== undefined && benchLevel < 27;
+const shouldSkip = benchLevel !== undefined && benchLevel < 28;
 
 // Helper: run evalStr in a Worker thread and get the result
 function evalInWorker(code: string): Promise<{ result?: string; output?: string; error?: string }> {
@@ -51,8 +51,8 @@ function evalInWorker(code: string): Promise<{ result?: string; output?: string;
   });
 }
 
-describe.skipIf(shouldSkip)('Level 27: Concurrent Evaluation', () => {
-  test('l27_concurrent_independent_eval', async () => {
+describe.skipIf(shouldSkip)('Level 28: Concurrent Evaluation', () => {
+  test('l28_concurrent_independent_eval', async () => {
     const promises = Array.from({ length: 8 }, (_, i) =>
       evalInWorker(
         `(let loop ((n 1000) (acc 0)) (if (= n 0) acc (loop (- n 1) (+ acc ${i}))))`
@@ -66,7 +66,7 @@ describe.skipIf(shouldSkip)('Level 27: Concurrent Evaluation', () => {
     });
   });
 
-  test('l27_concurrent_output_isolation', async () => {
+  test('l28_concurrent_output_isolation', async () => {
     const promises = Array.from({ length: 4 }, (_, i) =>
       evalInWorker(
         `(begin (display "thread${i}") (display " ") (display "done${i}") "ok")`
@@ -81,7 +81,7 @@ describe.skipIf(shouldSkip)('Level 27: Concurrent Evaluation', () => {
     });
   });
 
-  test('l27_concurrent_closures_and_mutation', async () => {
+  test('l28_concurrent_closures_and_mutation', async () => {
     const code = `(let ((count 0))
       (define (inc!) (set! count (+ count 1)) count)
       (inc!) (inc!) (inc!)
@@ -95,7 +95,7 @@ describe.skipIf(shouldSkip)('Level 27: Concurrent Evaluation', () => {
     });
   });
 
-  test('l27_concurrent_stress', async () => {
+  test('l28_concurrent_stress', async () => {
     const promises = Array.from({ length: 16 }, (_, i) =>
       evalInWorker(
         `(let ((x ${i})) (define (f n) (if (= n 0) x (f (- n 1)))) (f 100))`
@@ -111,7 +111,7 @@ describe.skipIf(shouldSkip)('Level 27: Concurrent Evaluation', () => {
 
   // ===== State isolation tests (sequential — no workers needed) =====
 
-  test('l27_sequential_state_leak', () => {
+  test('l28_sequential_state_leak', () => {
     // Import evalStr directly for sequential tests (same thread)
     const { evalStr: localEvalStr } = require('../src/evaluator.js');
     const r1 = localEvalStr('(begin (define x 42) x)');
@@ -121,7 +121,7 @@ describe.skipIf(shouldSkip)('Level 27: Concurrent Evaluation', () => {
     expect(() => localEvalStr('x')).toThrow();
   });
 
-  test('l27_sequential_output_leak', () => {
+  test('l28_sequential_output_leak', () => {
     const { evalStrWithOutput: localEvalStrWithOutput } = require('../src/evaluator.js');
     const r1 = localEvalStrWithOutput('(display "aaa")');
     const r2 = localEvalStrWithOutput('(display "bbb")');
@@ -131,7 +131,7 @@ describe.skipIf(shouldSkip)('Level 27: Concurrent Evaluation', () => {
 
   // ===== Concurrent continuation/macro collision tests =====
 
-  test('l27_concurrent_callcc_collision', async () => {
+  test('l28_concurrent_callcc_collision', async () => {
     const promises = Array.from({ length: 8 }, () =>
       evalInWorker(
         `(let ((count 0))
@@ -147,7 +147,7 @@ describe.skipIf(shouldSkip)('Level 27: Concurrent Evaluation', () => {
     });
   });
 
-  test('l27_concurrent_macro_hygiene', async () => {
+  test('l28_concurrent_macro_hygiene', async () => {
     const promises = Array.from({ length: 4 }, () =>
       evalInWorker(
         `(begin

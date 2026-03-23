@@ -665,8 +665,8 @@ fn run_levels_mode(
 /// Hidden levels that test tech debt accumulated during L01-L26.
 /// The agent has no prior knowledge of these requirements.
 const SURPRISE_LEVELS: &[(&str, &str)] = &[
-    ("27", "Concurrent Evaluation"),
-    ("28", "Performance & Memory Stress"),
+    ("27", "Step-Limited Evaluation"),
+    ("28", "Concurrent Evaluation & Performance Stress"),
 ];
 
 /// Inject hidden test files into the agent's worktree and run surprise levels.
@@ -745,54 +745,58 @@ fn inject_surprise_level(
 ) -> Result<()> {
     let bench_dir = worktree_dir.join("bench");
 
-    // --- L27: language-specific test files ---
-    if level == "27" {
+    // --- L27: step-limited eval test files ---
+    // --- L28: concurrency + performance test files + fixtures ---
+    // Both levels inject language-specific test files.
+    if level == "27" || level == "28" {
+        let level_tag = format!("level{level}");
         match lang {
             Lang::Rust => {
-                // Copy level27.rs and add mod declaration
-                let src = hidden_dir.join("rust/level27.rs");
-                let dst = bench_dir.join("rust/src/scheme/tests/level27.rs");
+                let src = hidden_dir.join(format!("rust/{level_tag}.rs"));
+                let dst = bench_dir.join(format!("rust/src/scheme/tests/{level_tag}.rs"));
                 if src.is_file() {
                     let _ = fs::copy(&src, &dst);
-                    // Append mod declaration to mod.rs
                     let mod_rs = bench_dir.join("rust/src/scheme/tests/mod.rs");
                     if let Ok(mut content) = fs::read_to_string(&mod_rs) {
-                        if !content.contains("mod level27") {
-                            content.push_str("\n// Level 27 (concurrent eval) — injected as surprise level.\nmod level27;\n");
+                        let mod_decl = format!("mod {level_tag};");
+                        if !content.contains(&mod_decl) {
+                            content.push_str(&format!(
+                                "\n// L{level} — injected as surprise level.\n{mod_decl}\n"
+                            ));
                             let _ = fs::write(&mod_rs, content);
                         }
                     }
                 }
             }
             Lang::Java => {
-                // Copy L27Tests.java as a standalone main class (not JUnit)
-                let src = hidden_dir.join("java/L27Tests.java");
-                let dst = bench_dir.join("java/src/main/java/ming/L27Tests.java");
+                let src = hidden_dir.join(format!("java/L{level}Tests.java"));
+                let dst = bench_dir.join(format!("java/src/main/java/ming/L{level}Tests.java"));
                 if src.is_file() {
                     let _ = fs::create_dir_all(dst.parent().expect("has parent"));
                     let _ = fs::copy(&src, &dst);
-                    // Force clean so shadowJar includes the new class
                     let _ = run_cmd("./gradlew", &["clean"], &bench_dir.join("java"));
                 }
             }
             Lang::Scala => {
-                let src = hidden_dir.join("scala/ConcurrencySpec.scala");
-                let dst = bench_dir.join("scala/src/test/scala/ming/ConcurrencySpec.scala");
+                let src = hidden_dir.join(format!("scala/Level{level}Spec.scala"));
+                let dst = bench_dir.join(format!(
+                    "scala/src/test/scala/ming/Level{level}Spec.scala"
+                ));
                 if src.is_file() {
                     let _ = fs::create_dir_all(dst.parent().expect("has parent"));
                     let _ = fs::copy(&src, &dst);
                 }
             }
             Lang::Go => {
-                let src = hidden_dir.join("go/concurrency_test.go");
-                let dst = bench_dir.join("go/concurrency_test.go");
+                let src = hidden_dir.join(format!("go/{level_tag}_test.go"));
+                let dst = bench_dir.join(format!("go/{level_tag}_test.go"));
                 if src.is_file() {
                     let _ = fs::copy(&src, &dst);
                 }
             }
             Lang::TypeScript => {
-                let src = hidden_dir.join("ts/concurrent.test.ts");
-                let dst = bench_dir.join("ts/test/concurrent.test.ts");
+                let src = hidden_dir.join(format!("ts/{level_tag}.test.ts"));
+                let dst = bench_dir.join(format!("ts/test/{level_tag}.test.ts"));
                 if src.is_file() {
                     let _ = fs::create_dir_all(dst.parent().expect("has parent"));
                     let _ = fs::copy(&src, &dst);
@@ -801,7 +805,7 @@ fn inject_surprise_level(
         }
     }
 
-    // --- L28: fixtures + tests.json entries ---
+    // --- L28 also needs: fixtures + tests.json entries ---
     if level == "28" {
         // Copy L28 fixtures
         let fixtures_src = hidden_dir.join("fixtures");

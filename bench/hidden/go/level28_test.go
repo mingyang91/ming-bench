@@ -5,19 +5,19 @@ import (
 	"testing"
 )
 
-// ===== Level 27: Concurrent Evaluation =====
+// ===== Level 28: Concurrent Evaluation =====
 // eval_str must be safe for concurrent use from multiple goroutines.
 
-func skipIfBelowL27(t *testing.T) {
+func skipIfBelowL28(t *testing.T) {
 	t.Helper()
 	level := benchLevel()
-	if level > 0 && level < 27 {
-		t.Skip("Skipping: BENCH_LEVEL < 27")
+	if level > 0 && level < 28 {
+		t.Skip("Skipping: BENCH_LEVEL < 28")
 	}
 }
 
-func TestL27ConcurrentIndependentEval(t *testing.T) {
-	skipIfBelowL27(t)
+func TestL28ConcurrentIndependentEval(t *testing.T) {
+	skipIfBelowL28(t)
 	const n = 8
 	type result struct {
 		idx int
@@ -44,8 +44,8 @@ func TestL27ConcurrentIndependentEval(t *testing.T) {
 	}
 }
 
-func TestL27ConcurrentOutputIsolation(t *testing.T) {
-	skipIfBelowL27(t)
+func TestL28ConcurrentOutputIsolation(t *testing.T) {
+	skipIfBelowL28(t)
 	const n = 4
 	type result struct {
 		idx    int
@@ -76,8 +76,8 @@ func TestL27ConcurrentOutputIsolation(t *testing.T) {
 	}
 }
 
-func TestL27ConcurrentClosuresAndMutation(t *testing.T) {
-	skipIfBelowL27(t)
+func TestL28ConcurrentClosuresAndMutation(t *testing.T) {
+	skipIfBelowL28(t)
 	const n = 4
 	ch := make(chan struct {
 		val string
@@ -106,8 +106,8 @@ func TestL27ConcurrentClosuresAndMutation(t *testing.T) {
 	}
 }
 
-func TestL27ConcurrentStress(t *testing.T) {
-	skipIfBelowL27(t)
+func TestL28ConcurrentStress(t *testing.T) {
+	skipIfBelowL28(t)
 	const n = 16
 	type result struct {
 		idx int
@@ -136,8 +136,8 @@ func TestL27ConcurrentStress(t *testing.T) {
 
 // ===== State isolation tests (sequential) =====
 
-func TestL27SequentialStateLeak(t *testing.T) {
-	skipIfBelowL27(t)
+func TestL28SequentialStateLeak(t *testing.T) {
+	skipIfBelowL28(t)
 	r1, err := EvalStr("(begin (define x 42) x)")
 	if err != nil {
 		t.Fatalf("first eval failed: %v", err)
@@ -151,8 +151,8 @@ func TestL27SequentialStateLeak(t *testing.T) {
 	}
 }
 
-func TestL27SequentialOutputLeak(t *testing.T) {
-	skipIfBelowL27(t)
+func TestL28SequentialOutputLeak(t *testing.T) {
+	skipIfBelowL28(t)
 	_, out1, err1 := EvalStrWithOutput(`(display "aaa")`)
 	if err1 != nil {
 		t.Fatalf("first eval failed: %v", err1)
@@ -169,8 +169,8 @@ func TestL27SequentialOutputLeak(t *testing.T) {
 	}
 }
 
-func TestL27ConcurrentCallccCollision(t *testing.T) {
-	skipIfBelowL27(t)
+func TestL28ConcurrentCallccCollision(t *testing.T) {
+	skipIfBelowL28(t)
 	const n = 8
 	ch := make(chan struct {
 		val string
@@ -198,8 +198,8 @@ func TestL27ConcurrentCallccCollision(t *testing.T) {
 	}
 }
 
-func TestL27ConcurrentMacroHygiene(t *testing.T) {
-	skipIfBelowL27(t)
+func TestL28ConcurrentMacroHygiene(t *testing.T) {
+	skipIfBelowL28(t)
 	const n = 4
 	ch := make(chan struct {
 		val string
