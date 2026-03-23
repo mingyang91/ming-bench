@@ -25,6 +25,7 @@ pub enum Value {
         body: Vec<Value>,
         env: Rc<RefCell<Env>>,
     },
+    Continuation(usize),
     Void,
 }
 
@@ -33,7 +34,8 @@ impl Value {
         match self {
             Value::Symbol(_, span) | Value::List(_, span) => *span,
             Value::Int(_) | Value::Bool(_) | Value::String(_) | Value::Char(_)
-            | Value::Builtin(_) | Value::Closure { .. } | Value::Void => None,
+            | Value::Builtin(_) | Value::Closure { .. } | Value::Continuation(_)
+            | Value::Void => None,
         }
     }
 }
@@ -50,6 +52,7 @@ impl PartialEq for Value {
             (Value::Builtin(a), Value::Builtin(b)) => a == b,
             (Value::Void, Value::Void) => true,
             (Value::Closure { .. }, Value::Closure { .. }) => false,
+            (Value::Continuation(a), Value::Continuation(b)) => a == b,
             (Value::Int(_), _)
             | (Value::Bool(_), _)
             | (Value::String(_), _)
@@ -58,6 +61,7 @@ impl PartialEq for Value {
             | (Value::List(_, _), _)
             | (Value::Builtin(_), _)
             | (Value::Closure { .. }, _)
+            | (Value::Continuation(_), _)
             | (Value::Void, _) => false,
         }
     }
@@ -84,6 +88,7 @@ impl fmt::Display for Value {
             }
             Value::Builtin(name) => write!(f, "#<procedure:{name}>"),
             Value::Closure { .. } => write!(f, "#<procedure>"),
+            Value::Continuation(_) => write!(f, "#<continuation>"),
             Value::Void => write!(f, ""),
         }
     }

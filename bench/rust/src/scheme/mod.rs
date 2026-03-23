@@ -22,10 +22,7 @@ pub fn eval_str_with_output(input: &str) -> Result<(String, String), EvalError> 
     let exprs = parser::parse(input)?;
     let env = eval::default_env();
     let output = Rc::new(RefCell::new(String::new()));
-    let mut last = value::Value::Void;
-    for expr in &exprs {
-        last = eval::eval(expr, &env, &output)?;
-    }
+    let last = eval::eval_program(&exprs, &env, &output)?;
     let output_str = output.borrow().clone();
     Ok((last.to_string(), output_str))
 }
