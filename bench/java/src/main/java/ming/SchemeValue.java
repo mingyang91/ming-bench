@@ -36,6 +36,18 @@ public sealed interface SchemeValue {
     }
     record BuiltinVal(String name, BuiltinFunc func) implements SchemeValue {}
 
+    @FunctionalInterface
+    interface CpsBuiltinFunc {
+        Bounce apply(List<SchemeValue> args, Cont k);
+    }
+    record CpsBuiltinVal(String name, CpsBuiltinFunc func) implements SchemeValue {}
+
+    @FunctionalInterface
+    interface Cont {
+        Bounce apply(SchemeValue value);
+    }
+    record ContinuationVal(Cont k) implements SchemeValue {}
+
     static SchemeValue NIL = new NilVal();
 
     default boolean isTruthy() {
@@ -63,6 +75,8 @@ public sealed interface SchemeValue {
             case LambdaVal v -> "#<procedure>";
             case VoidVal v -> "#<void>";
             case BuiltinVal v -> "#<procedure:" + v.name() + ">";
+            case CpsBuiltinVal v -> "#<procedure:" + v.name() + ">";
+            case ContinuationVal v -> "#<procedure>";
         };
     }
 
