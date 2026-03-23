@@ -544,6 +544,8 @@ const SPECIAL_FORMS = new Set([
   'quote', 'if', 'define', 'set!', 'lambda', 'and', 'or', 'begin',
   'cond', 'let', 'let*', 'letrec', 'letrec*', 'case', 'do',
   'define-syntax', 'syntax-rules', 'syntax-case', 'syntax', 'with-syntax', 'else', 'define-record-type',
+  'guard', 'dynamic-wind', 'when', 'unless', 'call-with-values', 'call/cc', 'call-with-current-continuation',
+  'values', 'with-exception-handler', 'raise', 'raise-continuable',
 ]);
 
 let gensymCounter = 0;
@@ -1543,8 +1545,8 @@ function evalBodyCPS(exprs: SchemeVal[], idx: number, env: Env, k: Cont, out?: s
 
 function applyCPS(proc: SchemeVal, args: SchemeVal[], k: Cont, p?: Pos, out?: string[]): Bounce {
   if (proc.tag === 'continuation') {
-    if (args.length !== 1) throw posError('continuation: need exactly one arg', p);
-    const val = args[0];
+    const val: SchemeVal = args.length === 1 ? args[0] : { tag: 'values', vals: args };
+
     const targetWinds = proc.winds;
     // Find common prefix
     let common = 0;
@@ -2263,7 +2265,7 @@ function evalCPS(expr: SchemeVal, env: Env, k: Cont, out?: string[]): Bounce {
       exceptionHandlerStack.push(handler);
       return evalBodyCPS(body, 0, env, bodyVal => {
         exceptionHandlerStack.pop();
-        return k(bodyVal);
+        return () => k(bodyVal);
       }, out);
     }
 
