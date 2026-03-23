@@ -2,6 +2,7 @@ package ming
 
 import (
 	"fmt"
+	"math"
 	"strconv"
 	"strings"
 	"unicode"
@@ -26,6 +27,8 @@ const (
 	valMacro
 	valVector
 	valMultipleValues
+	valFloat
+	valRational
 )
 
 type value struct {
@@ -40,6 +43,11 @@ type value struct {
 	restParam string // "" if none, otherwise the name of the rest parameter
 	body      []*expr
 	closure   *env
+	// float
+	fval float64
+	// rational (num/den, always simplified, den > 0)
+	num int64
+	den int64
 	// char
 	cval rune
 	// builtin function
@@ -73,6 +81,91 @@ func symVal(s string) *value  { return &value{typ: valSymbol, sval: s} }
 
 func (v *value) isTruthy() bool {
 	return !(v.typ == valBool && !v.bval)
+}
+
+func floatVal(f float64) *value { return &value{typ: valFloat, fval: f} }
+
+func gcd(a, b int64) int64 {
+	if a < 0 {
+		a = -a
+	}
+	if b < 0 {
+		b = -b
+	}
+	for b != 0 {
+		a, b = b, a%b
+	}
+	return a
+}
+
+func ratVal(n, d int64) *value {
+	if d < 0 {
+		n, d = -n, -d
+	}
+	g := gcd(n, d)
+	n, d = n/g, d/g
+	if d == 1 {
+		return intVal(n)
+	}
+	return &value{typ: valRational, num: n, den: d}
+}
+
+func isNumeric(v *value) bool {
+	return v.typ == valInt || v.typ == valFloat || v.typ == valRational
+}
+
+// toFloat converts any numeric value to float64
+func toFloat(v *value) float64 {
+	switch v.typ {
+	case valInt:
+		return float64(v.ival)
+	case valFloat:
+		return v.fval
+	case valRational:
+		return float64(v.num) / float64(v.den)
+	}
+	return 0
+}
+
+// toRational converts int or rational to (num, den) pair; returns ok=false for float
+func toRational(v *value) (int64, int64, bool) {
+	switch v.typ {
+	case valInt:
+		return v.ival, 1, true
+	case valRational:
+		return v.num, v.den, true
+	}
+	return 0, 0, false
+}
+
+func isExact(v *value) bool {
+	return v.typ == valInt || v.typ == valRational
+}
+
+// floatToRational converts a float64 to a numerator/denominator pair
+func floatToRational(f float64) (int64, int64) {
+	if f == math.Trunc(f) {
+		return int64(f), 1
+	}
+	// Multiply by powers of 10 to clear decimal
+	neg := f < 0
+	if neg {
+		f = -f
+	}
+	d := int64(1)
+	for i := 0; i < 16; i++ {
+		if f == math.Trunc(f) {
+			break
+		}
+		f *= 10
+		d *= 10
+	}
+	n := int64(math.Round(f))
+	if neg {
+		n = -n
+	}
+	g := gcd(n, d)
+	return n / g, d / g
 }
 
 func charVal(c rune) *value { return &value{typ: valChar, cval: c} }
@@ -111,6 +204,15 @@ func (v *value) String() string {
 		}
 		buf.WriteByte(')')
 		return buf.String()
+	case valFloat:
+		s := strconv.FormatFloat(v.fval, 'f', -1, 64)
+		// Ensure there's a decimal point
+		if !strings.Contains(s, ".") {
+			s += ".0"
+		}
+		return s
+	case valRational:
+		return fmt.Sprintf("%d/%d", v.num, v.den)
 	}
 	return ""
 }
@@ -272,10 +374,12 @@ func tokenize(input string) []token {
 // ---------- Parser ----------
 
 type expr struct {
-	kind   string // "int", "bool", "string", "symbol", "list"
+	kind   string // "int", "bool", "string", "symbol", "list", "float", "rational"
 	ival   int64
 	bval   bool
 	sval   string
+	fval   float64
+	ival2  int64 // denominator for rational
 	items  []*expr
 	line   int
 	col    int
@@ -372,6 +476,22 @@ func parseExpr(tokens []token, pos int) (*expr, int, error) {
 		return &expr{kind: "int", ival: n, line: tok.line, col: tok.col}, pos + 1, nil
 	}
 
+	// Rational literal: digits/digits (e.g., 1/3, -6/4)
+	if idx := strings.Index(tok.text, "/"); idx > 0 && idx < len(tok.text)-1 {
+		numStr := tok.text[:idx]
+		denStr := tok.text[idx+1:]
+		if n, err1 := strconv.ParseInt(numStr, 10, 64); err1 == nil {
+			if d, err2 := strconv.ParseInt(denStr, 10, 64); err2 == nil && d != 0 {
+				return &expr{kind: "rational", ival: n, ival2: d, line: tok.line, col: tok.col}, pos + 1, nil
+			}
+		}
+	}
+
+	// Float literal
+	if f, err := strconv.ParseFloat(tok.text, 64); err == nil {
+		return &expr{kind: "float", fval: f, line: tok.line, col: tok.col}, pos + 1, nil
+	}
+
 	// Symbol
 	return &expr{kind: "symbol", sval: tok.text, line: tok.line, col: tok.col}, pos + 1, nil
 }
@@ -465,6 +585,10 @@ func (ip *interp) eval(e *expr, envir *env) (*value, error) {
 		switch e.kind {
 		case "int":
 			return intVal(e.ival), nil
+		case "float":
+			return floatVal(e.fval), nil
+		case "rational":
+			return ratVal(e.ival, e.ival2), nil
 		case "bool":
 			return boolVal(e.bval), nil
 		case "string":
@@ -1508,6 +1632,10 @@ func schemeEqv(a, b *value) bool {
 		return a.cval == b.cval
 	case valNil:
 		return true
+	case valFloat:
+		return a.fval == b.fval
+	case valRational:
+		return a.num == b.num && a.den == b.den
 	default:
 		return a == b
 	}
@@ -1517,6 +1645,10 @@ func quoteExpr(e *expr) *value {
 	switch e.kind {
 	case "int":
 		return intVal(e.ival)
+	case "float":
+		return floatVal(e.fval)
+	case "rational":
+		return ratVal(e.ival, e.ival2)
 	case "bool":
 		return boolVal(e.bval)
 	case "string":
@@ -1545,10 +1677,21 @@ func compareInts(args []*value, op func(int64, int64) bool, name string, line, c
 		return nil, &EvalError{Message: fmt.Sprintf("%d:%d: %s: expected at least 2 arguments", line, col, name)}
 	}
 	for i := 0; i < len(args)-1; i++ {
-		if args[i].typ != valInt || args[i+1].typ != valInt {
+		if !isNumeric(args[i]) || !isNumeric(args[i+1]) {
 			return nil, &EvalError{Message: fmt.Sprintf("%d:%d: %s: expected number", line, col, name)}
 		}
-		if !op(args[i].ival, args[i+1].ival) {
+		fa := toFloat(args[i])
+		fb := toFloat(args[i+1])
+		// Map float comparison to the int64 op via -1/0/1
+		var cmp int64
+		if fa < fb {
+			cmp = -1
+		} else if fa > fb {
+			cmp = 1
+		} else {
+			cmp = 0
+		}
+		if !op(cmp, 0) {
 			return boolVal(false), nil
 		}
 	}
@@ -1615,69 +1758,184 @@ func makeBuiltin(name string, fn func(args []*value, line, col int) (*value, err
 	return &value{typ: valBuiltin, sval: name, builtin: fn}
 }
 
+// hasInexact checks if any arg is inexact (float)
+func hasInexact(args []*value) bool {
+	for _, a := range args {
+		if a.typ == valFloat {
+			return true
+		}
+	}
+	return false
+}
+
+func numAdd(args []*value) *value {
+	if len(args) == 0 {
+		return intVal(0)
+	}
+	if hasInexact(args) {
+		sum := 0.0
+		for _, a := range args {
+			sum += toFloat(a)
+		}
+		return floatVal(sum)
+	}
+	// All exact
+	n, d := int64(0), int64(1)
+	for _, a := range args {
+		an, ad, _ := toRational(a)
+		n = n*ad + an*d
+		d = d * ad
+		g := gcd(n, d)
+		n, d = n/g, d/g
+	}
+	if d < 0 {
+		n, d = -n, -d
+	}
+	if d == 1 {
+		return intVal(n)
+	}
+	return &value{typ: valRational, num: n, den: d}
+}
+
+func numSub(args []*value) *value {
+	if len(args) == 1 {
+		a := args[0]
+		switch a.typ {
+		case valInt:
+			return intVal(-a.ival)
+		case valFloat:
+			return floatVal(-a.fval)
+		case valRational:
+			return &value{typ: valRational, num: -a.num, den: a.den}
+		}
+	}
+	if hasInexact(args) {
+		result := toFloat(args[0])
+		for _, a := range args[1:] {
+			result -= toFloat(a)
+		}
+		return floatVal(result)
+	}
+	n, d, _ := toRational(args[0])
+	for _, a := range args[1:] {
+		an, ad, _ := toRational(a)
+		n = n*ad - an*d
+		d = d * ad
+		g := gcd(n, d)
+		n, d = n/g, d/g
+	}
+	if d < 0 {
+		n, d = -n, -d
+	}
+	if d == 1 {
+		return intVal(n)
+	}
+	return &value{typ: valRational, num: n, den: d}
+}
+
+func numMul(args []*value) *value {
+	if len(args) == 0 {
+		return intVal(1)
+	}
+	if hasInexact(args) {
+		result := 1.0
+		for _, a := range args {
+			result *= toFloat(a)
+		}
+		return floatVal(result)
+	}
+	n, d := int64(1), int64(1)
+	for _, a := range args {
+		an, ad, _ := toRational(a)
+		n *= an
+		d *= ad
+		g := gcd(n, d)
+		n, d = n/g, d/g
+	}
+	if d < 0 {
+		n, d = -n, -d
+	}
+	if d == 1 {
+		return intVal(n)
+	}
+	return &value{typ: valRational, num: n, den: d}
+}
+
+func numDiv(args []*value, line, col int) (*value, error) {
+	if hasInexact(args) {
+		result := toFloat(args[0])
+		for _, a := range args[1:] {
+			f := toFloat(a)
+			if f == 0 {
+				return nil, &EvalError{Message: fmt.Sprintf("%d:%d: /: division by zero", line, col)}
+			}
+			result /= f
+		}
+		return floatVal(result), nil
+	}
+	n, d, _ := toRational(args[0])
+	for _, a := range args[1:] {
+		an, ad, _ := toRational(a)
+		if an == 0 {
+			return nil, &EvalError{Message: fmt.Sprintf("%d:%d: /: division by zero", line, col)}
+		}
+		n = n * ad
+		d = d * an
+		g := gcd(n, d)
+		n, d = n/g, d/g
+	}
+	if d < 0 {
+		n, d = -n, -d
+	}
+	if d == 1 {
+		return intVal(n), nil
+	}
+	return &value{typ: valRational, num: n, den: d}, nil
+}
+
 func makeGlobalEnv(ip *interp) *env {
 	e := newEnv(nil)
 
 	e.set("+", makeBuiltin("+", func(args []*value, line, col int) (*value, error) {
-		sum := int64(0)
 		for _, a := range args {
-			if a.typ != valInt {
+			if !isNumeric(a) {
 				return nil, &EvalError{Message: fmt.Sprintf("%d:%d: +: expected number", line, col)}
 			}
-			sum += a.ival
 		}
-		return intVal(sum), nil
+		return numAdd(args), nil
 	}))
 
 	e.set("-", makeBuiltin("-", func(args []*value, line, col int) (*value, error) {
 		if len(args) == 0 {
 			return nil, &EvalError{Message: fmt.Sprintf("%d:%d: -: expected at least 1 argument", line, col)}
 		}
-		if args[0].typ != valInt {
-			return nil, &EvalError{Message: fmt.Sprintf("%d:%d: -: expected number", line, col)}
-		}
-		if len(args) == 1 {
-			return intVal(-args[0].ival), nil
-		}
-		result := args[0].ival
-		for _, a := range args[1:] {
-			if a.typ != valInt {
+		for _, a := range args {
+			if !isNumeric(a) {
 				return nil, &EvalError{Message: fmt.Sprintf("%d:%d: -: expected number", line, col)}
 			}
-			result -= a.ival
 		}
-		return intVal(result), nil
+		return numSub(args), nil
 	}))
 
 	e.set("*", makeBuiltin("*", func(args []*value, line, col int) (*value, error) {
-		product := int64(1)
 		for _, a := range args {
-			if a.typ != valInt {
+			if !isNumeric(a) {
 				return nil, &EvalError{Message: fmt.Sprintf("%d:%d: *: expected number", line, col)}
 			}
-			product *= a.ival
 		}
-		return intVal(product), nil
+		return numMul(args), nil
 	}))
 
 	e.set("/", makeBuiltin("/", func(args []*value, line, col int) (*value, error) {
 		if len(args) < 2 {
 			return nil, &EvalError{Message: fmt.Sprintf("%d:%d: /: expected at least 2 arguments", line, col)}
 		}
-		if args[0].typ != valInt {
-			return nil, &EvalError{Message: fmt.Sprintf("%d:%d: /: expected number", line, col)}
-		}
-		result := args[0].ival
-		for _, a := range args[1:] {
-			if a.typ != valInt {
+		for _, a := range args {
+			if !isNumeric(a) {
 				return nil, &EvalError{Message: fmt.Sprintf("%d:%d: /: expected number", line, col)}
 			}
-			if a.ival == 0 {
-				return nil, &EvalError{Message: fmt.Sprintf("%d:%d: /: division by zero", line, col)}
-			}
-			result /= a.ival
 		}
-		return intVal(result), nil
+		return numDiv(args, line, col)
 	}))
 
 	e.set("<", makeBuiltin("<", func(args []*value, line, col int) (*value, error) {
@@ -1857,7 +2115,104 @@ func makeGlobalEnv(ip *interp) *env {
 		if len(args) != 1 {
 			return nil, &EvalError{Message: fmt.Sprintf("%d:%d: number?: expected 1 argument", line, col)}
 		}
-		return boolVal(args[0].typ == valInt), nil
+		return boolVal(isNumeric(args[0])), nil
+	}))
+
+	e.set("integer?", makeBuiltin("integer?", func(args []*value, line, col int) (*value, error) {
+		if len(args) != 1 {
+			return nil, &EvalError{Message: fmt.Sprintf("%d:%d: integer?: expected 1 argument", line, col)}
+		}
+		switch args[0].typ {
+		case valInt:
+			return boolVal(true), nil
+		case valRational:
+			// e.g., 4/2 simplifies to int, but if it's still rational, den != 1
+			return boolVal(false), nil
+		case valFloat:
+			f := args[0].fval
+			return boolVal(f == math.Trunc(f) && !math.IsInf(f, 0) && !math.IsNaN(f)), nil
+		}
+		return boolVal(false), nil
+	}))
+
+	e.set("rational?", makeBuiltin("rational?", func(args []*value, line, col int) (*value, error) {
+		if len(args) != 1 {
+			return nil, &EvalError{Message: fmt.Sprintf("%d:%d: rational?: expected 1 argument", line, col)}
+		}
+		return boolVal(args[0].typ == valInt || args[0].typ == valRational), nil
+	}))
+
+	e.set("exact?", makeBuiltin("exact?", func(args []*value, line, col int) (*value, error) {
+		if len(args) != 1 {
+			return nil, &EvalError{Message: fmt.Sprintf("%d:%d: exact?: expected 1 argument", line, col)}
+		}
+		return boolVal(isExact(args[0])), nil
+	}))
+
+	e.set("inexact?", makeBuiltin("inexact?", func(args []*value, line, col int) (*value, error) {
+		if len(args) != 1 {
+			return nil, &EvalError{Message: fmt.Sprintf("%d:%d: inexact?: expected 1 argument", line, col)}
+		}
+		return boolVal(args[0].typ == valFloat), nil
+	}))
+
+	e.set("exact->inexact", makeBuiltin("exact->inexact", func(args []*value, line, col int) (*value, error) {
+		if len(args) != 1 || !isNumeric(args[0]) {
+			return nil, &EvalError{Message: fmt.Sprintf("%d:%d: exact->inexact: expected number", line, col)}
+		}
+		return floatVal(toFloat(args[0])), nil
+	}))
+
+	e.set("inexact->exact", makeBuiltin("inexact->exact", func(args []*value, line, col int) (*value, error) {
+		if len(args) != 1 || !isNumeric(args[0]) {
+			return nil, &EvalError{Message: fmt.Sprintf("%d:%d: inexact->exact: expected number", line, col)}
+		}
+		if isExact(args[0]) {
+			return args[0], nil
+		}
+		// Convert float to rational
+		f := args[0].fval
+		// Use the standard approach: multiply out the decimal
+		if f == math.Trunc(f) {
+			return intVal(int64(f)), nil
+		}
+		// Convert via fraction approximation
+		n, d := floatToRational(f)
+		return ratVal(n, d), nil
+	}))
+
+	e.set("numerator", makeBuiltin("numerator", func(args []*value, line, col int) (*value, error) {
+		if len(args) != 1 || !isNumeric(args[0]) {
+			return nil, &EvalError{Message: fmt.Sprintf("%d:%d: numerator: expected number", line, col)}
+		}
+		switch args[0].typ {
+		case valInt:
+			return args[0], nil
+		case valRational:
+			return intVal(args[0].num), nil
+		case valFloat:
+			n, d := floatToRational(args[0].fval)
+			g := gcd(n, d)
+			return floatVal(float64(n / g)), nil
+		}
+		return nil, &EvalError{Message: fmt.Sprintf("%d:%d: numerator: expected number", line, col)}
+	}))
+
+	e.set("denominator", makeBuiltin("denominator", func(args []*value, line, col int) (*value, error) {
+		if len(args) != 1 || !isNumeric(args[0]) {
+			return nil, &EvalError{Message: fmt.Sprintf("%d:%d: denominator: expected number", line, col)}
+		}
+		switch args[0].typ {
+		case valInt:
+			return intVal(1), nil
+		case valRational:
+			return intVal(args[0].den), nil
+		case valFloat:
+			n, d := floatToRational(args[0].fval)
+			g := gcd(n, d)
+			return floatVal(float64(d / g)), nil
+		}
+		return nil, &EvalError{Message: fmt.Sprintf("%d:%d: denominator: expected number", line, col)}
 	}))
 
 	e.set("boolean?", makeBuiltin("boolean?", func(args []*value, line, col int) (*value, error) {
