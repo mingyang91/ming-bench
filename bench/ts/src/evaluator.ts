@@ -31,6 +31,15 @@ class Env {
   define(name: string, val: SchemeVal): void {
     this.bindings.set(name, val);
   }
+
+  set(name: string, val: SchemeVal, pos?: Pos): void {
+    if (this.bindings.has(name)) {
+      this.bindings.set(name, val);
+      return;
+    }
+    if (this.parent) { this.parent.set(name, val, pos); return; }
+    throw posError(`unbound variable: ${name}`, pos);
+  }
 }
 
 // ── Parser ─────────────────────────────────────────────────────────
@@ -501,6 +510,14 @@ function evalExpr(expr: SchemeVal, env: Env, out?: string[]): SchemeVal {
             return lambda;
           }
           throw posError('define: bad syntax', p);
+        }
+
+        if (op === 'set!') {
+          if (args.length !== 2) throw posError('set!: bad syntax', p);
+          if (args[0].tag !== 'symbol') throw posError('set!: first arg must be a symbol', p);
+          const val = evalExpr(args[1], env, out);
+          env.set(args[0].val, val, p);
+          return val;
         }
 
         if (op === 'lambda') {
