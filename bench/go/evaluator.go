@@ -19,6 +19,8 @@ const (
 	valPair
 	valNil // empty list
 	valVoid
+	valLambda
+	valBuiltin
 )
 
 type value struct {
@@ -28,6 +30,12 @@ type value struct {
 	sval   string
 	car    *value
 	cdr    *value
+	// lambda fields
+	params []string
+	body   []*expr
+	closure *env
+	// builtin function
+	builtin func(args []*value, line, col int) (*value, error)
 }
 
 var voidVal = &value{typ: valVoid}
@@ -332,6 +340,17 @@ func eval(e *expr, env *env) (*value, error) {
 				return evalAnd(e.items[1:], env)
 			case "or":
 				return evalOr(e.items[1:], env)
+			case "define":
+				return evalDefine(e, env)
+			case "if":
+				return evalIf(e, env)
+			case "quote":
+				if len(e.items) != 2 {
+					return nil, &EvalError{Message: fmt.Sprintf("%d:%d: quote: expected 1 argument", e.line, e.col)}
+				}
+				return quoteExpr(e.items[1]), nil
+			case "lambda":
+				return evalLambda(e, env)
 			}
 		}
 
@@ -340,7 +359,6 @@ func eval(e *expr, env *env) (*value, error) {
 		if err != nil {
 			return nil, err
 		}
-		_ = fn
 
 		// Evaluate arguments
 		args := make([]*value, len(e.items)-1)
@@ -352,7 +370,7 @@ func eval(e *expr, env *env) (*value, error) {
 			args[i] = v
 		}
 
-		return applyBuiltin(head, fn, args, e)
+		return applyFunc(fn, args, e)
 	}
 	return nil, &EvalError{Message: fmt.Sprintf("%d:%d: unknown expression type", e.line, e.col)}
 }
@@ -391,92 +409,131 @@ func evalOr(exprs []*expr, env *env) (*value, error) {
 	return boolVal(false), nil
 }
 
-func applyBuiltin(head *expr, fn *value, args []*value, callExpr *expr) (*value, error) {
-	if fn.typ != valSymbol {
-		return nil, &EvalError{Message: fmt.Sprintf("%d:%d: not a procedure", callExpr.line, callExpr.col)}
-	}
-
-	name := fn.sval
+func applyFunc(fn *value, args []*value, callExpr *expr) (*value, error) {
 	line, col := callExpr.line, callExpr.col
 
-	switch name {
-	case "+":
-		sum := int64(0)
-		for _, a := range args {
-			if a.typ != valInt {
-				return nil, &EvalError{Message: fmt.Sprintf("%d:%d: +: expected number", line, col)}
+	switch fn.typ {
+	case valBuiltin:
+		return fn.builtin(args, line, col)
+	case valLambda:
+		if len(args) != len(fn.params) {
+			return nil, &EvalError{Message: fmt.Sprintf("%d:%d: wrong number of arguments: expected %d, got %d", line, col, len(fn.params), len(args))}
+		}
+		localEnv := newEnv(fn.closure)
+		for i, p := range fn.params {
+			localEnv.set(p, args[i])
+		}
+		var result *value
+		var err error
+		for _, bodyExpr := range fn.body {
+			result, err = eval(bodyExpr, localEnv)
+			if err != nil {
+				return nil, err
 			}
-			sum += a.ival
 		}
-		return intVal(sum), nil
+		return result, nil
+	default:
+		return nil, &EvalError{Message: fmt.Sprintf("%d:%d: not a procedure", line, col)}
+	}
+}
 
-	case "-":
-		if len(args) == 0 {
-			return nil, &EvalError{Message: fmt.Sprintf("%d:%d: -: expected at least 1 argument", line, col)}
-		}
-		if args[0].typ != valInt {
-			return nil, &EvalError{Message: fmt.Sprintf("%d:%d: -: expected number", line, col)}
-		}
-		if len(args) == 1 {
-			return intVal(-args[0].ival), nil
-		}
-		result := args[0].ival
-		for _, a := range args[1:] {
-			if a.typ != valInt {
-				return nil, &EvalError{Message: fmt.Sprintf("%d:%d: -: expected number", line, col)}
-			}
-			result -= a.ival
-		}
-		return intVal(result), nil
+func evalDefine(e *expr, env *env) (*value, error) {
+	if len(e.items) < 3 {
+		return nil, &EvalError{Message: fmt.Sprintf("%d:%d: define: bad syntax", e.line, e.col)}
+	}
+	target := e.items[1]
 
-	case "*":
-		product := int64(1)
-		for _, a := range args {
-			if a.typ != valInt {
-				return nil, &EvalError{Message: fmt.Sprintf("%d:%d: *: expected number", line, col)}
-			}
-			product *= a.ival
+	// (define (f params...) body...)
+	if target.kind == "list" {
+		if len(target.items) == 0 {
+			return nil, &EvalError{Message: fmt.Sprintf("%d:%d: define: bad syntax", e.line, e.col)}
 		}
-		return intVal(product), nil
-
-	case "/":
-		if len(args) < 2 {
-			return nil, &EvalError{Message: fmt.Sprintf("%d:%d: /: expected at least 2 arguments", line, col)}
+		name := target.items[0].sval
+		params := make([]string, len(target.items)-1)
+		for i, p := range target.items[1:] {
+			params[i] = p.sval
 		}
-		if args[0].typ != valInt {
-			return nil, &EvalError{Message: fmt.Sprintf("%d:%d: /: expected number", line, col)}
+		fn := &value{
+			typ:     valLambda,
+			params:  params,
+			body:    e.items[2:],
+			closure: env,
 		}
-		result := args[0].ival
-		for _, a := range args[1:] {
-			if a.typ != valInt {
-				return nil, &EvalError{Message: fmt.Sprintf("%d:%d: /: expected number", line, col)}
-			}
-			if a.ival == 0 {
-				return nil, &EvalError{Message: fmt.Sprintf("%d:%d: /: division by zero", line, col)}
-			}
-			result /= a.ival
-		}
-		return intVal(result), nil
-
-	case "<":
-		return compareInts(args, func(a, b int64) bool { return a < b }, "<", line, col)
-	case ">":
-		return compareInts(args, func(a, b int64) bool { return a > b }, ">", line, col)
-	case "=":
-		return compareInts(args, func(a, b int64) bool { return a == b }, "=", line, col)
-	case "<=":
-		return compareInts(args, func(a, b int64) bool { return a <= b }, "<=", line, col)
-	case ">=":
-		return compareInts(args, func(a, b int64) bool { return a >= b }, ">=", line, col)
-
-	case "not":
-		if len(args) != 1 {
-			return nil, &EvalError{Message: fmt.Sprintf("%d:%d: not: expected 1 argument", line, col)}
-		}
-		return boolVal(!args[0].isTruthy()), nil
+		env.set(name, fn)
+		return voidVal, nil
 	}
 
-	return nil, &EvalError{Message: fmt.Sprintf("%d:%d: unbound variable: %s", line, col, name)}
+	// (define x expr)
+	if target.kind != "symbol" {
+		return nil, &EvalError{Message: fmt.Sprintf("%d:%d: define: bad syntax", e.line, e.col)}
+	}
+	val, err := eval(e.items[2], env)
+	if err != nil {
+		return nil, err
+	}
+	env.set(target.sval, val)
+	return voidVal, nil
+}
+
+func evalIf(e *expr, env *env) (*value, error) {
+	if len(e.items) < 3 || len(e.items) > 4 {
+		return nil, &EvalError{Message: fmt.Sprintf("%d:%d: if: bad syntax", e.line, e.col)}
+	}
+	cond, err := eval(e.items[1], env)
+	if err != nil {
+		return nil, err
+	}
+	if cond.isTruthy() {
+		return eval(e.items[2], env)
+	}
+	if len(e.items) == 4 {
+		return eval(e.items[3], env)
+	}
+	return voidVal, nil
+}
+
+func evalLambda(e *expr, env *env) (*value, error) {
+	if len(e.items) < 3 {
+		return nil, &EvalError{Message: fmt.Sprintf("%d:%d: lambda: bad syntax", e.line, e.col)}
+	}
+	paramExpr := e.items[1]
+	if paramExpr.kind != "list" {
+		return nil, &EvalError{Message: fmt.Sprintf("%d:%d: lambda: bad parameter list", e.line, e.col)}
+	}
+	params := make([]string, len(paramExpr.items))
+	for i, p := range paramExpr.items {
+		params[i] = p.sval
+	}
+	return &value{
+		typ:     valLambda,
+		params:  params,
+		body:    e.items[2:],
+		closure: env,
+	}, nil
+}
+
+func quoteExpr(e *expr) *value {
+	switch e.kind {
+	case "int":
+		return intVal(e.ival)
+	case "bool":
+		return boolVal(e.bval)
+	case "string":
+		return strVal(e.sval)
+	case "symbol":
+		return symVal(e.sval)
+	case "list":
+		if len(e.items) == 0 {
+			return nilVal
+		}
+		// Build proper list from items
+		result := nilVal
+		for i := len(e.items) - 1; i >= 0; i-- {
+			result = &value{typ: valPair, car: quoteExpr(e.items[i]), cdr: result}
+		}
+		return result
+	}
+	return nilVal
 }
 
 func compareInts(args []*value, op func(int64, int64) bool, name string, line, col int) (*value, error) {
@@ -496,13 +553,98 @@ func compareInts(args []*value, op func(int64, int64) bool, name string, line, c
 
 // ---------- Top-level ----------
 
+func makeBuiltin(name string, fn func(args []*value, line, col int) (*value, error)) *value {
+	return &value{typ: valBuiltin, sval: name, builtin: fn}
+}
+
 func makeGlobalEnv() *env {
 	e := newEnv(nil)
-	// Builtins are stored as symbol values that match their name
-	builtins := []string{"+", "-", "*", "/", "<", ">", "=", "<=", ">=", "not"}
-	for _, b := range builtins {
-		e.set(b, symVal(b))
-	}
+
+	e.set("+", makeBuiltin("+", func(args []*value, line, col int) (*value, error) {
+		sum := int64(0)
+		for _, a := range args {
+			if a.typ != valInt {
+				return nil, &EvalError{Message: fmt.Sprintf("%d:%d: +: expected number", line, col)}
+			}
+			sum += a.ival
+		}
+		return intVal(sum), nil
+	}))
+
+	e.set("-", makeBuiltin("-", func(args []*value, line, col int) (*value, error) {
+		if len(args) == 0 {
+			return nil, &EvalError{Message: fmt.Sprintf("%d:%d: -: expected at least 1 argument", line, col)}
+		}
+		if args[0].typ != valInt {
+			return nil, &EvalError{Message: fmt.Sprintf("%d:%d: -: expected number", line, col)}
+		}
+		if len(args) == 1 {
+			return intVal(-args[0].ival), nil
+		}
+		result := args[0].ival
+		for _, a := range args[1:] {
+			if a.typ != valInt {
+				return nil, &EvalError{Message: fmt.Sprintf("%d:%d: -: expected number", line, col)}
+			}
+			result -= a.ival
+		}
+		return intVal(result), nil
+	}))
+
+	e.set("*", makeBuiltin("*", func(args []*value, line, col int) (*value, error) {
+		product := int64(1)
+		for _, a := range args {
+			if a.typ != valInt {
+				return nil, &EvalError{Message: fmt.Sprintf("%d:%d: *: expected number", line, col)}
+			}
+			product *= a.ival
+		}
+		return intVal(product), nil
+	}))
+
+	e.set("/", makeBuiltin("/", func(args []*value, line, col int) (*value, error) {
+		if len(args) < 2 {
+			return nil, &EvalError{Message: fmt.Sprintf("%d:%d: /: expected at least 2 arguments", line, col)}
+		}
+		if args[0].typ != valInt {
+			return nil, &EvalError{Message: fmt.Sprintf("%d:%d: /: expected number", line, col)}
+		}
+		result := args[0].ival
+		for _, a := range args[1:] {
+			if a.typ != valInt {
+				return nil, &EvalError{Message: fmt.Sprintf("%d:%d: /: expected number", line, col)}
+			}
+			if a.ival == 0 {
+				return nil, &EvalError{Message: fmt.Sprintf("%d:%d: /: division by zero", line, col)}
+			}
+			result /= a.ival
+		}
+		return intVal(result), nil
+	}))
+
+	e.set("<", makeBuiltin("<", func(args []*value, line, col int) (*value, error) {
+		return compareInts(args, func(a, b int64) bool { return a < b }, "<", line, col)
+	}))
+	e.set(">", makeBuiltin(">", func(args []*value, line, col int) (*value, error) {
+		return compareInts(args, func(a, b int64) bool { return a > b }, ">", line, col)
+	}))
+	e.set("=", makeBuiltin("=", func(args []*value, line, col int) (*value, error) {
+		return compareInts(args, func(a, b int64) bool { return a == b }, "=", line, col)
+	}))
+	e.set("<=", makeBuiltin("<=", func(args []*value, line, col int) (*value, error) {
+		return compareInts(args, func(a, b int64) bool { return a <= b }, "<=", line, col)
+	}))
+	e.set(">=", makeBuiltin(">=", func(args []*value, line, col int) (*value, error) {
+		return compareInts(args, func(a, b int64) bool { return a >= b }, ">=", line, col)
+	}))
+
+	e.set("not", makeBuiltin("not", func(args []*value, line, col int) (*value, error) {
+		if len(args) != 1 {
+			return nil, &EvalError{Message: fmt.Sprintf("%d:%d: not: expected 1 argument", line, col)}
+		}
+		return boolVal(!args[0].isTruthy()), nil
+	}))
+
 	return e
 }
 
