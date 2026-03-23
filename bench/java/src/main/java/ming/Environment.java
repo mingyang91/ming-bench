@@ -24,4 +24,16 @@ public class Environment {
     public void define(String name, SchemeValue value) {
         bindings.put(name, value);
     }
+
+    public void set(String name, SchemeValue value) throws EvalError {
+        if (bindings.containsKey(name)) {
+            bindings.put(name, value);
+            return;
+        }
+        if (parent != null) {
+            parent.set(name, value);
+            return;
+        }
+        throw new EvalError("unbound variable: " + name);
+    }
 }
