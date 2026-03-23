@@ -17,6 +17,17 @@ class Env {
     define(name, val) {
         this.bindings.set(name, val);
     }
+    set(name, val) {
+        if (this.bindings.has(name)) {
+            this.bindings.set(name, val);
+            return;
+        }
+        if (this.parent) {
+            this.parent.set(name, val);
+            return;
+        }
+        throw new EvalError(`set!: unbound variable: ${name}`);
+    }
 }
 function tokenize(input) {
     const tokens = [];
@@ -119,6 +130,18 @@ function parseAtom(tok) {
         return { tag: 'boolean', value: true };
     if (tok === '#f')
         return { tag: 'boolean', value: false };
+    if (tok.startsWith('#\\')) {
+        const charName = tok.slice(2);
+        if (charName === 'space')
+            return { tag: 'char', value: ' ' };
+        if (charName === 'newline')
+            return { tag: 'char', value: '\n' };
+        if (charName === 'tab')
+            return { tag: 'char', value: '\t' };
+        if (charName.length === 1)
+            return { tag: 'char', value: charName };
+        throw new EvalError(`unknown character name: ${tok}`);
+    }
     if (tok.startsWith('"') && tok.endsWith('"')) {
         const inner = tok.slice(1, -1).replace(/\\n/g, '\n').replace(/\\t/g, '\t').replace(/\\"/g, '"').replace(/\\\\/g, '\\');
         return { tag: 'string', value: inner };
@@ -327,6 +350,11 @@ function makeGlobalEnv() {
         const idx = expectNumber(args[1], 'string-ref');
         return { tag: 'char', value: args[0].value[idx] };
     });
+    defBuiltin('string-copy', (args) => {
+        if (args[0].tag !== 'string')
+            throw new EvalError('string-copy: expected string');
+        return { tag: 'string', value: args[0].value };
+    });
     return env;
 }
 function evaluate(expr, env) {
@@ -457,6 +485,21 @@ function evaluate(expr, env) {
                 result = evaluate(items[i], env);
             }
             return result;
+        }
+        if (op === 'string-set!') {
+            const varExpr = items[1];
+            if (varExpr.tag !== 'symbol')
+                throw new EvalError(`${posStr(expr.pos)}string-set!: first argument must be a variable`);
+            const str = env.get(varExpr.value);
+            if (str.tag !== 'string')
+                throw new EvalError(`${posStr(expr.pos)}string-set!: expected string`);
+            const idx = expectNumber(evaluate(items[2], env), 'string-set!');
+            const ch = evaluate(items[3], env);
+            if (ch.tag !== 'char')
+                throw new EvalError(`${posStr(expr.pos)}string-set!: expected char`);
+            const newStr = str.value.substring(0, idx) + ch.value + str.value.substring(idx + 1);
+            env.set(varExpr.value, { tag: 'string', value: newStr });
+            return { tag: 'void' };
         }
         if (op === 'cond') {
             for (let i = 1; i < items.length; i++) {
