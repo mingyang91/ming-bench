@@ -11,4 +11,19 @@ pub enum EvalError {
     Arity(String),
     #[error("runtime error: {0}")]
     Runtime(String),
+    #[error("{msg} at {line}:{col}")]
+    Positioned { msg: String, line: usize, col: usize },
+}
+
+impl EvalError {
+    pub fn with_position(self, line: usize, col: usize) -> EvalError {
+        match self {
+            EvalError::Positioned { .. } => self,
+            other => EvalError::Positioned {
+                msg: other.to_string(),
+                line,
+                col,
+            },
+        }
+    }
 }
