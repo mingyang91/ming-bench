@@ -306,65 +306,117 @@ public class Evaluator {
 
     @SuppressWarnings("unchecked")
     private Object eval(Object expr, Env env) throws EvalError {
-        // Unwrap Located to get position context
-        if (expr instanceof Located loc) {
-            errLine = loc.line();
-            errCol = loc.col();
-            return eval(loc.value(), env);
-        }
-
-        if (expr instanceof Long || expr instanceof Boolean || expr instanceof SchemeString || expr instanceof SchemeChar) {
-            return expr;
-        }
-        if (expr instanceof String sym) {
-            if (isPrimitive(sym)) {
-                return sym;
-            }
-            Object val = env.lookup(sym);
-            if (val == null) {
-                throw posError("unbound variable: " + sym);
-            }
-            return val;
-        }
-        if (expr instanceof List<?> list) {
-            if (list.isEmpty()) {
-                throw posError("empty application");
-            }
-            Object head = list.get(0);
-
-            // Check for special form names (unwrap Located if needed)
-            String formName = null;
-            if (head instanceof Located locHead) {
-                if (locHead.value() instanceof String s) formName = s;
-            } else if (head instanceof String s) {
-                formName = s;
+        while (true) {
+            // Unwrap Located to get position context
+            if (expr instanceof Located loc) {
+                errLine = loc.line();
+                errCol = loc.col();
+                expr = loc.value();
+                continue;
             }
 
-            // Special forms
-            if (formName != null) {
-                switch (formName) {
-                    case "define" -> {
-                        if (list.size() < 3) throw posError("define: bad syntax");
-                        Object target = list.get(1);
-                        if (target instanceof Located lt) target = lt.value();
-                        if (target instanceof String name) {
-                            Object val = eval(list.get(2), env);
-                            env.define(name, val);
+            if (expr instanceof Long || expr instanceof Boolean || expr instanceof SchemeString || expr instanceof SchemeChar) {
+                return expr;
+            }
+            if (expr instanceof String sym) {
+                if (isPrimitive(sym)) {
+                    return sym;
+                }
+                Object val = env.lookup(sym);
+                if (val == null) {
+                    throw posError("unbound variable: " + sym);
+                }
+                return val;
+            }
+            if (expr instanceof List<?> list) {
+                if (list.isEmpty()) {
+                    throw posError("empty application");
+                }
+                Object head = list.get(0);
+
+                // Check for special form names (unwrap Located if needed)
+                String formName = null;
+                if (head instanceof Located locHead) {
+                    if (locHead.value() instanceof String s) formName = s;
+                } else if (head instanceof String s) {
+                    formName = s;
+                }
+
+                // Special forms
+                if (formName != null) {
+                    switch (formName) {
+                        case "define" -> {
+                            if (list.size() < 3) throw posError("define: bad syntax");
+                            Object target = list.get(1);
+                            if (target instanceof Located lt) target = lt.value();
+                            if (target instanceof String name) {
+                                Object val = eval(list.get(2), env);
+                                env.define(name, val);
+                                return VOID;
+                            } else if (target instanceof List<?> sig) {
+                                String fname = null;
+                                Object first = sig.isEmpty() ? null : sig.get(0);
+                                if (first instanceof Located lf) first = lf.value();
+                                if (first instanceof String s) fname = s;
+                                if (fname == null) {
+                                    throw posError("define: bad syntax");
+                                }
+                                List<String> params = new ArrayList<>();
+                                for (int i = 1; i < sig.size(); i++) {
+                                    Object p = sig.get(i);
+                                    if (p instanceof Located lp) p = lp.value();
+                                    if (!(p instanceof String ps)) {
+                                        throw posError("define: parameter must be a symbol");
+                                    }
+                                    params.add(ps);
+                                }
+                                Object body;
+                                if (list.size() == 3) {
+                                    body = list.get(2);
+                                } else {
+                                    List<Object> beginBody = new ArrayList<>();
+                                    beginBody.add("begin");
+                                    for (int i = 2; i < list.size(); i++) {
+                                        beginBody.add(list.get(i));
+                                    }
+                                    body = beginBody;
+                                }
+                                Lambda lambda = new Lambda(params, body, env);
+                                env.define(fname, lambda);
+                                return VOID;
+                            }
+                            throw posError("define: bad syntax");
+                        }
+                        case "if" -> {
+                            if (list.size() < 3 || list.size() > 4) {
+                                throw posError("if: bad syntax");
+                            }
+                            Object cond = eval(list.get(1), env);
+                            if (!isFalse(cond)) {
+                                expr = list.get(2);
+                                continue; // TCO
+                            } else if (list.size() == 4) {
+                                expr = list.get(3);
+                                continue; // TCO
+                            }
                             return VOID;
-                        } else if (target instanceof List<?> sig) {
-                            String fname = null;
-                            Object first = sig.isEmpty() ? null : sig.get(0);
-                            if (first instanceof Located lf) first = lf.value();
-                            if (first instanceof String s) fname = s;
-                            if (fname == null) {
-                                throw posError("define: bad syntax");
+                        }
+                        case "quote" -> {
+                            if (list.size() != 2) throw posError("quote: expected 1 argument");
+                            return listToScheme(list.get(1));
+                        }
+                        case "lambda" -> {
+                            if (list.size() < 3) throw posError("lambda: bad syntax");
+                            Object paramsExpr = list.get(1);
+                            if (paramsExpr instanceof Located lp) paramsExpr = lp.value();
+                            if (!(paramsExpr instanceof List<?> paramList)) {
+                                throw posError("lambda: parameters must be a list");
                             }
                             List<String> params = new ArrayList<>();
-                            for (int i = 1; i < sig.size(); i++) {
-                                Object p = sig.get(i);
-                                if (p instanceof Located lp) p = lp.value();
+                            for (Object p : paramList) {
+                                if (p instanceof Located lpp) p = lpp.value();
                                 if (!(p instanceof String ps)) {
-                                    throw posError("define: parameter must be a symbol");
+                                    throw posError("lambda: parameter must be a symbol");
                                 }
                                 params.add(ps);
                             }
@@ -379,124 +431,85 @@ public class Evaluator {
                                 }
                                 body = beginBody;
                             }
-                            Lambda lambda = new Lambda(params, body, env);
-                            env.define(fname, lambda);
-                            return VOID;
+                            return new Lambda(params, body, env);
                         }
-                        throw posError("define: bad syntax");
-                    }
-                    case "if" -> {
-                        if (list.size() < 3 || list.size() > 4) {
-                            throw posError("if: bad syntax");
-                        }
-                        Object cond = eval(list.get(1), env);
-                        if (!isFalse(cond)) {
-                            return eval(list.get(2), env);
-                        } else if (list.size() == 4) {
-                            return eval(list.get(3), env);
-                        }
-                        return VOID;
-                    }
-                    case "quote" -> {
-                        if (list.size() != 2) throw posError("quote: expected 1 argument");
-                        return listToScheme(list.get(1));
-                    }
-                    case "lambda" -> {
-                        if (list.size() < 3) throw posError("lambda: bad syntax");
-                        Object paramsExpr = list.get(1);
-                        if (paramsExpr instanceof Located lp) paramsExpr = lp.value();
-                        if (!(paramsExpr instanceof List<?> paramList)) {
-                            throw posError("lambda: parameters must be a list");
-                        }
-                        List<String> params = new ArrayList<>();
-                        for (Object p : paramList) {
-                            if (p instanceof Located lpp) p = lpp.value();
-                            if (!(p instanceof String ps)) {
-                                throw posError("lambda: parameter must be a symbol");
+                        case "and" -> {
+                            if (list.size() == 1) return Boolean.TRUE;
+                            for (int i = 1; i < list.size() - 1; i++) {
+                                Object result = eval(list.get(i), env);
+                                if (isFalse(result)) return result;
                             }
-                            params.add(ps);
+                            expr = list.get(list.size() - 1);
+                            continue; // TCO for last expression
                         }
-                        Object body;
-                        if (list.size() == 3) {
-                            body = list.get(2);
-                        } else {
-                            List<Object> beginBody = new ArrayList<>();
-                            beginBody.add("begin");
-                            for (int i = 2; i < list.size(); i++) {
-                                beginBody.add(list.get(i));
+                        case "or" -> {
+                            if (list.size() == 1) return Boolean.FALSE;
+                            for (int i = 1; i < list.size() - 1; i++) {
+                                Object result = eval(list.get(i), env);
+                                if (!isFalse(result)) return result;
                             }
-                            body = beginBody;
+                            expr = list.get(list.size() - 1);
+                            continue; // TCO for last expression
                         }
-                        return new Lambda(params, body, env);
-                    }
-                    case "and" -> {
-                        Object result = Boolean.TRUE;
-                        for (int i = 1; i < list.size(); i++) {
-                            result = eval(list.get(i), env);
-                            if (isFalse(result)) return result;
+                        case "let" -> {
+                            Object[] letResult = prepareLet(list, env);
+                            expr = letResult[0];
+                            env = (Env) letResult[1];
+                            continue; // TCO
                         }
-                        return result;
-                    }
-                    case "or" -> {
-                        Object result = Boolean.FALSE;
-                        for (int i = 1; i < list.size(); i++) {
-                            result = eval(list.get(i), env);
-                            if (!isFalse(result)) return result;
+                        case "begin" -> {
+                            if (list.size() == 1) return VOID;
+                            for (int i = 1; i < list.size() - 1; i++) {
+                                eval(list.get(i), env);
+                            }
+                            expr = list.get(list.size() - 1);
+                            continue; // TCO for last expression
                         }
-                        return result;
-                    }
-                    case "let" -> {
-                        return evalLet(list, env);
-                    }
-                    case "begin" -> {
-                        Object result = VOID;
-                        for (int i = 1; i < list.size(); i++) {
-                            result = eval(list.get(i), env);
+                        case "cond" -> {
+                            Object condTail = evalCondTail(list, env);
+                            if (condTail == null) return VOID;
+                            if (condTail instanceof Evaluated ev) return ev.value;
+                            expr = condTail;
+                            continue; // TCO
                         }
-                        return result;
-                    }
-                    case "cond" -> {
-                        return evalCond(list, env);
                     }
                 }
-            }
 
-            // Procedure call
-            Object proc = eval(head, env);
-            List<Object> args = new ArrayList<>();
-            for (int i = 1; i < list.size(); i++) {
-                args.add(eval(list.get(i), env));
+                // Procedure call
+                Object proc = eval(head, env);
+                List<Object> args = new ArrayList<>();
+                for (int i = 1; i < list.size(); i++) {
+                    args.add(eval(list.get(i), env));
+                }
+                // Restore position to the call site for error reporting
+                if (head instanceof Located lh) {
+                    errLine = lh.line();
+                    errCol = lh.col();
+                }
+                // TCO for lambda calls
+                if (proc instanceof Lambda lambda) {
+                    if (args.size() != lambda.params.size()) {
+                        throw posError("wrong number of arguments: expected " + lambda.params.size() + ", got " + args.size());
+                    }
+                    Env callEnv = new Env(lambda.closure);
+                    for (int i = 0; i < lambda.params.size(); i++) {
+                        callEnv.define(lambda.params.get(i), args.get(i));
+                    }
+                    expr = lambda.body;
+                    env = callEnv;
+                    continue; // TCO
+                }
+                if (proc instanceof String p && isPrimitive(p)) {
+                    return applyPrimitive(p, args);
+                }
+                throw posError("not a procedure: " + schemeToString(proc));
             }
-            // Restore position to the call site for error reporting
-            if (head instanceof Located lh) {
-                errLine = lh.line();
-                errCol = lh.col();
-            }
-            return apply(proc, args);
+            throw posError("cannot evaluate: " + expr);
         }
-        throw posError("cannot evaluate: " + expr);
     }
 
-    private Object apply(Object proc, List<Object> args) throws EvalError {
-        if (proc instanceof Lambda lambda) {
-            if (args.size() != lambda.params.size()) {
-                throw posError("wrong number of arguments: expected " + lambda.params.size() + ", got " + args.size());
-            }
-            Env callEnv = new Env(lambda.closure);
-            for (int i = 0; i < lambda.params.size(); i++) {
-                callEnv.define(lambda.params.get(i), args.get(i));
-            }
-            return eval(lambda.body, callEnv);
-        }
-        if (proc instanceof String p && isPrimitive(p)) {
-            return applyPrimitive(p, args);
-        }
-        throw posError("not a procedure: " + schemeToString(proc));
-    }
-
-    private Object evalLet(List<?> list, Env env) throws EvalError {
-        // (let ((x 1) (y 2)) body...)
-        // (let name ((x 1) (y 2)) body...)  -- named let
+    // Returns [body, env] for TCO continuation, sets up let bindings
+    private Object[] prepareLet(List<?> list, Env env) throws EvalError {
         int idx = 1;
         String name = null;
         Object nameCandidate = list.get(1);
@@ -525,12 +538,10 @@ public class Evaluator {
             paramNames.add(pname);
             initExprs.add(binding.get(1));
         }
-        // Evaluate init expressions in outer env
         List<Object> initVals = new ArrayList<>();
         for (Object e : initExprs) {
             initVals.add(eval(e, env));
         }
-        // Build body
         Object body;
         if (list.size() - idx - 1 == 1) {
             body = list.get(idx + 1);
@@ -543,24 +554,30 @@ public class Evaluator {
             body = beginBody;
         }
         if (name != null) {
-            // Named let: create a lambda and bind it to name, then call it
             Env letEnv = new Env(env);
             Lambda lambda = new Lambda(paramNames, body, letEnv);
             letEnv.define(name, lambda);
             for (int i = 0; i < paramNames.size(); i++) {
                 letEnv.define(paramNames.get(i), initVals.get(i));
             }
-            return eval(body, letEnv);
+            return new Object[]{body, letEnv};
         } else {
             Env letEnv = new Env(env);
             for (int i = 0; i < paramNames.size(); i++) {
                 letEnv.define(paramNames.get(i), initVals.get(i));
             }
-            return eval(body, letEnv);
+            return new Object[]{body, letEnv};
         }
     }
 
-    private Object evalCond(List<?> list, Env env) throws EvalError {
+    // Sentinel wrapper for already-evaluated values returned from cond
+    private static class Evaluated {
+        final Object value;
+        Evaluated(Object value) { this.value = value; }
+    }
+
+    // Returns tail expression for TCO, Evaluated for already-computed values, or null for VOID
+    private Object evalCondTail(List<?> list, Env env) throws EvalError {
         for (int i = 1; i < list.size(); i++) {
             Object clauseObj = list.get(i);
             if (clauseObj instanceof Located lc) clauseObj = lc.value();
@@ -568,28 +585,25 @@ public class Evaluator {
                 throw posError("cond: bad clause");
             }
             Object test = clause.get(0);
-            // Check for else
             Object testVal2 = test;
             if (testVal2 instanceof Located lt) testVal2 = lt.value();
             if (testVal2 instanceof String s && s.equals("else")) {
-                // else clause - evaluate body
-                Object result = VOID;
-                for (int j = 1; j < clause.size(); j++) {
-                    result = eval(clause.get(j), env);
+                if (clause.size() == 1) return new Evaluated(Boolean.TRUE);
+                for (int j = 1; j < clause.size() - 1; j++) {
+                    eval(clause.get(j), env);
                 }
-                return result;
+                return clause.get(clause.size() - 1);
             }
             Object testVal = eval(test, env);
             if (!isFalse(testVal)) {
-                if (clause.size() == 1) return testVal;
-                Object result = VOID;
-                for (int j = 1; j < clause.size(); j++) {
-                    result = eval(clause.get(j), env);
+                if (clause.size() == 1) return new Evaluated(testVal);
+                for (int j = 1; j < clause.size() - 1; j++) {
+                    eval(clause.get(j), env);
                 }
-                return result;
+                return clause.get(clause.size() - 1);
             }
         }
-        return VOID;
+        return null;
     }
 
     private static final java.util.Set<String> PRIMITIVES = java.util.Set.of(
