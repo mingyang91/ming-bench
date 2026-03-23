@@ -23,7 +23,8 @@ type SchemeVal =
   | { tag: 'values'; values: SchemeVal[]; pos?: Pos }
   | { tag: 'record'; type: number; fields: Map<string, SchemeVal>; pos?: Pos }
   | { tag: 'syntaxTransformer'; proc: SchemeVal; defEnv: Env; pos?: Pos }
-  | { tag: 'syntaxObj'; datum: SchemeVal; pos?: Pos };
+  | { tag: 'syntaxObj'; datum: SchemeVal; pos?: Pos }
+  | { tag: 'caseLambda'; clauses: { params: string[]; rest?: string; body: SchemeVal[] }[]; env: Env; pos?: Pos };
 
 // ── Rational / Exact number helpers ───────────────────────────────
 
@@ -366,7 +367,7 @@ const SPECIAL_FORMS = new Set([
   'if', 'define', 'lambda', 'and', 'or', 'let', 'let*', 'begin',
   'set!', 'string-set!', 'cond', 'quote', 'define-syntax',
   'syntax-case', 'syntax', 'with-syntax', 'letrec', 'letrec*',
-  'case', 'do', 'guard', 'define-record-type',
+  'case', 'do', 'guard', 'define-record-type', 'case-lambda',
 ]);
 
 // ── syntax-case dynamic context ────────────────────────────────────
@@ -980,7 +981,7 @@ function makeGlobalEnv(): Env {
 
   defBuiltin('procedure?', (args) => ({
     tag: 'boolean',
-    value: args[0].tag === 'lambda' || args[0].tag === 'builtin' || args[0].tag === 'continuation',
+    value: args[0].tag === 'lambda' || args[0].tag === 'builtin' || args[0].tag === 'continuation' || args[0].tag === 'caseLambda',
   }));
 
   // L13: Numeric utilities
@@ -1382,6 +1383,30 @@ function applyCPS(proc: SchemeVal, args: SchemeVal[], k: K, pos?: Pos): TResult 
     return evaluateSeqCPS(proc.body, 0, callEnv, k);
   }
 
+  if (proc.tag === 'caseLambda') {
+    for (const clause of proc.clauses) {
+      if (clause.rest !== undefined) {
+        if (args.length >= clause.params.length) {
+          const callEnv = new Env(proc.env);
+          for (let i = 0; i < clause.params.length; i++) {
+            callEnv.define(clause.params[i], args[i]);
+          }
+          callEnv.define(clause.rest, listToPairs(args.slice(clause.params.length)));
+          return evaluateSeqCPS(clause.body, 0, callEnv, k);
+        }
+      } else {
+        if (args.length === clause.params.length) {
+          const callEnv = new Env(proc.env);
+          for (let i = 0; i < clause.params.length; i++) {
+            callEnv.define(clause.params[i], args[i]);
+          }
+          return evaluateSeqCPS(clause.body, 0, callEnv, k);
+        }
+      }
+    }
+    throw new EvalError(`${posStr(pos)}case-lambda: no matching clause for ${args.length} arguments`);
+  }
+
   if (proc.tag === 'continuation') {
     let val: SchemeVal;
     if (args.length === 1) {
@@ -1464,6 +1489,20 @@ function evaluateCPS(expr: SchemeVal, env: Env, k: K): TResult {
       const { params, rest } = parseDotParams((paramList as { tag: 'list'; value: SchemeVal[] }).value);
       const lam: SchemeVal = { tag: 'lambda', params, rest, body: items.slice(2), env };
       return callK(k, lam);
+    }
+
+    if (op === 'case-lambda') {
+      const clauses = items.slice(1).map(clause => {
+        if (clause.tag !== 'list') throw new EvalError('case-lambda: bad clause');
+        const paramList = clause.value[0];
+        const body = clause.value.slice(1);
+        if (paramList.tag === 'symbol') {
+          return { params: [] as string[], rest: paramList.value, body };
+        }
+        const { params, rest } = parseDotParams((paramList as { tag: 'list'; value: SchemeVal[] }).value);
+        return { params, rest, body };
+      });
+      return callK(k, { tag: 'caseLambda', clauses, env });
     }
 
     if (op === 'and') {
@@ -2004,6 +2043,7 @@ function writeVal(val: SchemeVal, seen?: Set<SchemeVal>): string {
     }
     case 'vector': return `#(${val.value.map(v => writeVal(v, seen)).join(' ')})`;
     case 'lambda': return '#<procedure>';
+    case 'caseLambda': return '#<procedure>';
     case 'builtin': return `#<builtin:${val.name}>`;
     case 'continuation': return '#<continuation>';
     case 'void': return '';
