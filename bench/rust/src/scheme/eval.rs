@@ -1,3 +1,5 @@
+use std::rc::Rc;
+
 use crate::scheme::env::Env;
 use crate::scheme::error::{EvalError, Span};
 use crate::scheme::macros;
@@ -167,6 +169,7 @@ pub fn eval(expr: &Value, env: &Env) -> Result<Value, EvalError> {
             | Value::Boolean(_, _)
             | Value::String(_, _, _)
             | Value::Char(_, _)
+            | Value::Vector(_, _)
             | Value::Closure { .. }
             | Value::Continuation(_)
             | Value::Macro(_) => return Ok(current_expr),
@@ -193,7 +196,9 @@ pub fn eval(expr: &Value, env: &Env) -> Result<Value, EvalError> {
                     | "string=?" | "string<?" | "string-ci=?"
                     | "string-upcase" | "string-downcase"
                     | "expt" | "list-ref" | "list-tail" | "list?"
-                    | "assoc" | "map" | "eq?" | "equal?"
+                    | "assoc" | "map" | "eq?" | "eqv?" | "equal?"
+                    | "vector" | "make-vector" | "vector-ref" | "vector-set!"
+                    | "vector-length" | "vector?" | "vector->list" | "list->vector"
                     | "apply"
                     | "call/cc" | "call-with-current-continuation" => Ok(current_expr.clone()),
                     _ => Err(EvalError::UnboundVariable {
@@ -309,6 +314,49 @@ pub fn eval(expr: &Value, env: &Env) -> Result<Value, EvalError> {
                             }
                             return eval_body(body, &new_env);
                         }
+                        "let*" => {
+                            match eval_let_star(&elems[1..], list_span, &current_env)? {
+                                TailAction::Result(v) => return Ok(v),
+                                TailAction::TailCall(expr, env) => {
+                                    current_expr = expr;
+                                    current_env = env;
+                                    continue;
+                                }
+                            }
+                        }
+                        "letrec" => {
+                            match eval_letrec(&elems[1..], list_span, &current_env)? {
+                                TailAction::Result(v) => return Ok(v),
+                                TailAction::TailCall(expr, env) => {
+                                    current_expr = expr;
+                                    current_env = env;
+                                    continue;
+                                }
+                            }
+                        }
+                        "letrec*" => {
+                            match eval_letrec_star(&elems[1..], list_span, &current_env)? {
+                                TailAction::Result(v) => return Ok(v),
+                                TailAction::TailCall(expr, env) => {
+                                    current_expr = expr;
+                                    current_env = env;
+                                    continue;
+                                }
+                            }
+                        }
+                        "case" => {
+                            match eval_case_tail(&elems[1..], list_span, &current_env)? {
+                                TailAction::Result(v) => return Ok(v),
+                                TailAction::TailCall(expr, env) => {
+                                    current_expr = expr;
+                                    current_env = env;
+                                    continue;
+                                }
+                            }
+                        }
+                        "do" => {
+                            return eval_do(&elems[1..], list_span, &current_env);
+                        }
                         "begin" => {
                             let exprs = &elems[1..];
                             if exprs.is_empty() {
@@ -351,94 +399,20 @@ pub fn eval(expr: &Value, env: &Env) -> Result<Value, EvalError> {
                     .collect::<Result<_, _>>()?;
 
                 // Handle apply: (apply fn prefix... arg-list)
-                if matches!(op, Value::Symbol(ref name, _) if name == "apply") {
-                    if args.len() < 2 {
-                        return Err(EvalError::WrongArgCount {
-                            expected: "at least 2".to_string(),
-                            got: args.len(),
-                            span: list_span,
-                        });
-                    }
-                    let func = args[0].clone();
-                    let last = &args[args.len() - 1];
-                    let Value::List(tail_list, _) = last else {
-                        return Err(EvalError::TypeMismatch {
-                            expected: "list".to_string(),
-                            got: last.to_string(),
-                            span: last.span(),
-                        });
-                    };
-                    let mut full_args: Vec<Value> = args[1..args.len() - 1].to_vec();
-                    full_args.extend(tail_list.iter().cloned());
-
-                    // Re-dispatch with the assembled args
-                    match func {
-                        Value::Symbol(ref bname, _) if bname == "call/cc" || bname == "call-with-current-continuation" => {
-                            return handle_callcc(&full_args, list_span, &current_env);
-                        }
-                        Value::Symbol(ref bname, _) => return apply_builtin(bname, &full_args, list_span, &current_env),
-                        Value::Closure {
-                            ref params,
-                            ref rest_param,
-                            ref body,
-                            env: ref closure_env,
-                        } => {
-                            let local_env = bind_closure_args(params, rest_param, &full_args, closure_env, list_span)?;
-                            current_expr = *body.clone();
-                            current_env = local_env;
-                            continue;
-                        }
-                        Value::Continuation(id) => {
-                            if full_args.len() != 1 {
-                                return Err(EvalError::WrongArgCount {
-                                    expected: "1".to_string(),
-                                    got: full_args.len(),
-                                    span: list_span,
-                                });
-                            }
-                            return Err(EvalError::ContinuationReturn { id, value: full_args.into_iter().next().expect("checked len") });
-                        }
-                        other => {
-                            return Err(EvalError::NotAProcedure {
-                                value: other.to_string(),
-                                span: other.span(),
-                            });
-                        }
-                    }
-                }
+                let (func, call_args) = if matches!(op, Value::Symbol(ref name, _) if name == "apply") {
+                    let (func, assembled) = assemble_apply_args(&args, list_span)?;
+                    (func, assembled)
+                } else {
+                    (op, args)
+                };
 
                 // Function application (including call/cc and continuations)
-                match op {
-                    Value::Symbol(ref name, _) if name == "call/cc" || name == "call-with-current-continuation" => {
-                        return handle_callcc(&args, list_span, &current_env);
-                    }
-                    Value::Symbol(ref name, _) => return apply_builtin(name, &args, list_span, &current_env),
-                    Value::Closure {
-                        ref params,
-                        ref rest_param,
-                        ref body,
-                        env: ref closure_env,
-                    } => {
-                        let local_env = bind_closure_args(params, rest_param, &args, closure_env, list_span)?;
-                        current_expr = *body.clone();
-                        current_env = local_env;
+                match dispatch_call(func, call_args, list_span, &current_env)? {
+                    TailAction::Result(v) => return Ok(v),
+                    TailAction::TailCall(expr, env) => {
+                        current_expr = expr;
+                        current_env = env;
                         continue;
-                    }
-                    Value::Continuation(id) => {
-                        if args.len() != 1 {
-                            return Err(EvalError::WrongArgCount {
-                                expected: "1".to_string(),
-                                got: args.len(),
-                                span: list_span,
-                            });
-                        }
-                        return Err(EvalError::ContinuationReturn { id, value: args[0].clone() });
-                    }
-                    other => {
-                        return Err(EvalError::NotAProcedure {
-                            value: other.to_string(),
-                            span: other.span(),
-                        });
                     }
                 }
             }
@@ -598,6 +572,328 @@ fn eval_cond_tail(clauses: &[Value], env: &Env) -> Result<TailAction, EvalError>
     Ok(TailAction::Result(Value::Void))
 }
 
+/// Parse a single binding pair `(var init)` from a let/letrec form.
+fn parse_binding(binding: &Value) -> Result<(&str, &Value), EvalError> {
+    let Value::List(pair, _) = binding else {
+        return Err(EvalError::TypeMismatch {
+            expected: "binding pair".to_string(),
+            got: binding.to_string(),
+            span: binding.span(),
+        });
+    };
+    if pair.len() != 2 {
+        return Err(EvalError::WrongArgCount {
+            expected: "2".to_string(),
+            got: pair.len(),
+            span: binding.span(),
+        });
+    }
+    let Value::Symbol(var, _) = &pair[0] else {
+        return Err(EvalError::TypeMismatch {
+            expected: "symbol".to_string(),
+            got: pair[0].to_string(),
+            span: pair[0].span(),
+        });
+    };
+    Ok((var.as_str(), &pair[1]))
+}
+
+/// Require at least 2 args and extract the binding list from the first arg.
+fn require_let_args(args: &[Value], form_span: Span) -> Result<&[Value], EvalError> {
+    if args.len() < 2 {
+        return Err(EvalError::WrongArgCount {
+            expected: "at least 2".to_string(),
+            got: args.len(),
+            span: form_span,
+        });
+    }
+    let Value::List(bindings, _) = &args[0] else {
+        return Err(EvalError::TypeMismatch {
+            expected: "binding list".to_string(),
+            got: args[0].to_string(),
+            span: args[0].span(),
+        });
+    };
+    Ok(bindings)
+}
+
+/// Evaluate `let*` form, returning a tail action for the body.
+fn eval_let_star(args: &[Value], form_span: Span, env: &Env) -> Result<TailAction, EvalError> {
+    let bindings = require_let_args(args, form_span)?;
+    let local_env = Env::with_parent(env);
+    for binding in bindings {
+        let (var, init) = parse_binding(binding)?;
+        let val = eval(init, &local_env)?;
+        local_env.define(var.to_string(), val);
+    }
+    let body = &args[1..];
+    if body.len() == 1 {
+        return Ok(TailAction::TailCall(body[0].clone(), local_env));
+    }
+    Ok(TailAction::Result(eval_body(body, &local_env)?))
+}
+
+/// Evaluate `letrec` form, returning a tail action for the body.
+fn eval_letrec(args: &[Value], form_span: Span, env: &Env) -> Result<TailAction, EvalError> {
+    let bindings = require_let_args(args, form_span)?;
+    let local_env = Env::with_parent(env);
+    let mut var_names = Vec::new();
+    let mut init_exprs = Vec::new();
+    for binding in bindings {
+        let (var, init) = parse_binding(binding)?;
+        var_names.push(var.to_string());
+        init_exprs.push(init.clone());
+        local_env.define(var.to_string(), Value::Void);
+    }
+    for (name, init) in var_names.iter().zip(init_exprs.iter()) {
+        let val = eval(init, &local_env)?;
+        local_env.set(name, val);
+    }
+    let body = &args[1..];
+    if body.len() == 1 {
+        return Ok(TailAction::TailCall(body[0].clone(), local_env));
+    }
+    Ok(TailAction::Result(eval_body(body, &local_env)?))
+}
+
+/// Evaluate `letrec*` form, returning a tail action for the body.
+fn eval_letrec_star(args: &[Value], form_span: Span, env: &Env) -> Result<TailAction, EvalError> {
+    let bindings = require_let_args(args, form_span)?;
+    let local_env = Env::with_parent(env);
+    for binding in bindings {
+        let (var, init) = parse_binding(binding)?;
+        let val = eval(init, &local_env)?;
+        local_env.define(var.to_string(), val);
+    }
+    let body = &args[1..];
+    if body.len() == 1 {
+        return Ok(TailAction::TailCall(body[0].clone(), local_env));
+    }
+    Ok(TailAction::Result(eval_body(body, &local_env)?))
+}
+
+/// Evaluate `case` form, returning a tail action.
+fn eval_case_tail(args: &[Value], form_span: Span, env: &Env) -> Result<TailAction, EvalError> {
+    if args.is_empty() {
+        return Err(EvalError::WrongArgCount {
+            expected: "at least 1".to_string(),
+            got: 0,
+            span: form_span,
+        });
+    }
+    let key = eval(&args[0], env)?;
+    for clause in &args[1..] {
+        let Value::List(parts, _) = clause else {
+            return Err(EvalError::TypeMismatch {
+                expected: "case clause".to_string(),
+                got: clause.to_string(),
+                span: clause.span(),
+            });
+        };
+        if parts.is_empty() {
+            return Err(EvalError::Parse {
+                message: "empty case clause".to_string(),
+                span: clause.span(),
+            });
+        }
+        if let Value::Symbol(s, _) = &parts[0] {
+            if s == "else" {
+                for expr in &parts[1..parts.len() - 1] {
+                    eval(expr, env)?;
+                }
+                if parts.len() > 1 {
+                    return Ok(TailAction::TailCall(parts[parts.len() - 1].clone(), env.clone()));
+                }
+                return Ok(TailAction::Result(Value::Void));
+            }
+        }
+        let Value::List(datums, _) = &parts[0] else {
+            return Err(EvalError::TypeMismatch {
+                expected: "datum list".to_string(),
+                got: parts[0].to_string(),
+                span: parts[0].span(),
+            });
+        };
+        let matched = datums.iter().any(|d| eqv_match(&key, d));
+        if matched {
+            for expr in &parts[1..parts.len() - 1] {
+                eval(expr, env)?;
+            }
+            if parts.len() > 1 {
+                return Ok(TailAction::TailCall(parts[parts.len() - 1].clone(), env.clone()));
+            }
+            return Ok(TailAction::Result(Value::Void));
+        }
+    }
+    Ok(TailAction::Result(Value::Void))
+}
+
+/// Assemble args for `(apply fn prefix... arg-list)`.
+fn assemble_apply_args(args: &[Value], span: Span) -> Result<(Value, Vec<Value>), EvalError> {
+    if args.len() < 2 {
+        return Err(EvalError::WrongArgCount {
+            expected: "at least 2".to_string(),
+            got: args.len(),
+            span,
+        });
+    }
+    let func = args[0].clone();
+    let last = &args[args.len() - 1];
+    let Value::List(tail_list, _) = last else {
+        return Err(EvalError::TypeMismatch {
+            expected: "list".to_string(),
+            got: last.to_string(),
+            span: last.span(),
+        });
+    };
+    let mut full_args: Vec<Value> = args[1..args.len() - 1].to_vec();
+    full_args.extend(tail_list.iter().cloned());
+    Ok((func, full_args))
+}
+
+/// Dispatch a function call, returning a tail action for closures.
+fn dispatch_call(func: Value, args: Vec<Value>, span: Span, env: &Env) -> Result<TailAction, EvalError> {
+    match func {
+        Value::Symbol(ref name, _) if name == "call/cc" || name == "call-with-current-continuation" => {
+            Ok(TailAction::Result(handle_callcc(&args, span, env)?))
+        }
+        Value::Symbol(ref name, _) => Ok(TailAction::Result(apply_builtin(name, &args, span, env)?)),
+        Value::Closure {
+            ref params,
+            ref rest_param,
+            ref body,
+            env: ref closure_env,
+        } => {
+            let local_env = bind_closure_args(params, rest_param, &args, closure_env, span)?;
+            Ok(TailAction::TailCall(*body.clone(), local_env))
+        }
+        Value::Continuation(id) => {
+            if args.len() != 1 {
+                return Err(EvalError::WrongArgCount {
+                    expected: "1".to_string(),
+                    got: args.len(),
+                    span,
+                });
+            }
+            Err(EvalError::ContinuationReturn { id, value: args.into_iter().next().expect("checked len") })
+        }
+        other => Err(EvalError::NotAProcedure {
+            value: other.to_string(),
+            span: other.span(),
+        }),
+    }
+}
+
+fn eqv_match(key: &Value, datum: &Value) -> bool {
+    match (key, datum) {
+        (Value::Integer(a, _), Value::Integer(b, _)) => a == b,
+        (Value::Boolean(a, _), Value::Boolean(b, _)) => a == b,
+        (Value::Symbol(a, _), Value::Symbol(b, _)) => a == b,
+        (Value::Char(a, _), Value::Char(b, _)) => a == b,
+        _ => false,
+    }
+}
+
+fn eval_do(args: &[Value], form_span: Span, env: &Env) -> Result<Value, EvalError> {
+    if args.len() < 2 {
+        return Err(EvalError::WrongArgCount {
+            expected: "at least 2".to_string(),
+            got: args.len(),
+            span: form_span,
+        });
+    }
+    let Value::List(var_specs, _) = &args[0] else {
+        return Err(EvalError::TypeMismatch {
+            expected: "variable specs".to_string(),
+            got: args[0].to_string(),
+            span: args[0].span(),
+        });
+    };
+    let Value::List(test_clause, _) = &args[1] else {
+        return Err(EvalError::TypeMismatch {
+            expected: "test clause".to_string(),
+            got: args[1].to_string(),
+            span: args[1].span(),
+        });
+    };
+    if test_clause.is_empty() {
+        return Err(EvalError::Parse {
+            message: "empty do test clause".to_string(),
+            span: args[1].span(),
+        });
+    }
+    let body = &args[2..];
+
+    let mut var_names = Vec::new();
+    let mut step_exprs: Vec<Option<Value>> = Vec::new();
+
+    let do_env = Env::with_parent(env);
+    for spec in var_specs {
+        let Value::List(parts, _) = spec else {
+            return Err(EvalError::TypeMismatch {
+                expected: "variable spec".to_string(),
+                got: spec.to_string(),
+                span: spec.span(),
+            });
+        };
+        if parts.len() < 2 || parts.len() > 3 {
+            return Err(EvalError::WrongArgCount {
+                expected: "2 or 3".to_string(),
+                got: parts.len(),
+                span: spec.span(),
+            });
+        }
+        let Value::Symbol(var, _) = &parts[0] else {
+            return Err(EvalError::TypeMismatch {
+                expected: "symbol".to_string(),
+                got: parts[0].to_string(),
+                span: parts[0].span(),
+            });
+        };
+        let init = eval(&parts[1], env)?;
+        do_env.define(var.clone(), init);
+        var_names.push(var.clone());
+        if parts.len() == 3 {
+            step_exprs.push(Some(parts[2].clone()));
+        } else {
+            step_exprs.push(None);
+        }
+    }
+
+    loop {
+        let test_result = eval(&test_clause[0], &do_env)?;
+        if test_result.is_truthy() {
+            let result_exprs = &test_clause[1..];
+            if result_exprs.is_empty() {
+                return Ok(Value::Void);
+            }
+            let mut last = Value::Void;
+            for expr in result_exprs {
+                last = eval(expr, &do_env)?;
+            }
+            return Ok(last);
+        }
+
+        for expr in body {
+            eval(expr, &do_env)?;
+        }
+
+        let new_vals: Vec<Option<Value>> = step_exprs
+            .iter()
+            .map(|step| match step {
+                Some(expr) => eval(expr, &do_env).map(Some),
+                None => Ok(None),
+            })
+            .collect::<Result<_, _>>()?;
+
+        for (name, new_val) in var_names.iter().zip(new_vals.into_iter()) {
+            if let Some(val) = new_val {
+                do_env.set(name, val);
+            }
+        }
+    }
+}
+
 fn apply_builtin(name: &str, args: &[Value], span: Span, env: &Env) -> Result<Value, EvalError> {
     match name {
         "+" => arith_add(args),
@@ -702,7 +998,16 @@ fn apply_builtin(name: &str, args: &[Value], span: Span, env: &Env) -> Result<Va
         "assoc" => builtin_assoc(args, span),
         "map" => builtin_map(args, span, env),
         "eq?" => builtin_eq(args, span),
+        "eqv?" => builtin_eqv(args, span),
         "equal?" => builtin_equal(args, span),
+        "vector" => Ok(Value::vector(args.to_vec())),
+        "make-vector" => builtin_make_vector(args, span),
+        "vector-ref" => builtin_vector_ref(args, span),
+        "vector-set!" => builtin_vector_set(args, span),
+        "vector-length" => builtin_vector_length(args, span),
+        "vector?" => Ok(Value::bool(matches!(args, [Value::Vector(_, _)]))),
+        "vector->list" => builtin_vector_to_list(args, span),
+        "list->vector" => builtin_list_to_vector(args, span),
         "char-alphabetic?" => builtin_char_alphabetic(args, span),
         "char-numeric?" => builtin_char_numeric(args, span),
         "char-upcase" => builtin_char_upcase(args, span),
@@ -1096,6 +1401,14 @@ fn builtin_cdr(args: &[Value], form_span: Span) -> Result<Value, EvalError> {
     }
     match &args[0] {
         Value::List(elems, _) if !elems.is_empty() => {
+            // Improper pair (a . b) stored as [a, ".", b] — cdr returns b
+            if elems.len() == 3 {
+                if let Value::Symbol(s, _) = &elems[1] {
+                    if s == "." {
+                        return Ok(elems[2].clone());
+                    }
+                }
+            }
             Ok(Value::list(elems[1..].to_vec()))
         }
         _ => Err(EvalError::TypeMismatch {
@@ -1720,6 +2033,11 @@ fn values_equal(a: &Value, b: &Value) -> bool {
         (Value::List(xs, _), Value::List(ys, _)) => {
             xs.len() == ys.len() && xs.iter().zip(ys.iter()).all(|(a, b)| values_equal(a, b))
         }
+        (Value::Vector(xs, _), Value::Vector(ys, _)) => {
+            let xb = xs.borrow();
+            let yb = ys.borrow();
+            xb.len() == yb.len() && xb.iter().zip(yb.iter()).all(|(a, b)| values_equal(a, b))
+        }
         _ => false,
     }
 }
@@ -1809,6 +2127,29 @@ fn builtin_eq(args: &[Value], span: Span) -> Result<Value, EvalError> {
         (Value::Symbol(a, _), Value::Symbol(b, _)) => a == b,
         (Value::Char(a, _), Value::Char(b, _)) => a == b,
         (Value::List(a, _), Value::List(b, _)) if a.is_empty() && b.is_empty() => true,
+        (Value::Vector(a, _), Value::Vector(b, _)) => Rc::ptr_eq(a, b),
+        (Value::String(a, _, _), Value::String(b, _, _)) => Rc::ptr_eq(a, b),
+        (Value::Void, Value::Void) => true,
+        _ => false,
+    };
+    Ok(Value::bool(result))
+}
+
+fn builtin_eqv(args: &[Value], span: Span) -> Result<Value, EvalError> {
+    if args.len() != 2 {
+        return Err(EvalError::WrongArgCount {
+            expected: "2".to_string(),
+            got: args.len(),
+            span,
+        });
+    }
+    let result = match (&args[0], &args[1]) {
+        (Value::Integer(a, _), Value::Integer(b, _)) => a == b,
+        (Value::Boolean(a, _), Value::Boolean(b, _)) => a == b,
+        (Value::Symbol(a, _), Value::Symbol(b, _)) => a == b,
+        (Value::Char(a, _), Value::Char(b, _)) => a == b,
+        (Value::List(a, _), Value::List(b, _)) if a.is_empty() && b.is_empty() => true,
+        (Value::Void, Value::Void) => true,
         _ => false,
     };
     Ok(Value::bool(result))
@@ -2056,4 +2397,148 @@ fn builtin_string_downcase(args: &[Value], span: Span) -> Result<Value, EvalErro
         });
     };
     Ok(Value::string(s.borrow().to_lowercase()))
+}
+
+fn builtin_make_vector(args: &[Value], span: Span) -> Result<Value, EvalError> {
+    if args.is_empty() || args.len() > 2 {
+        return Err(EvalError::WrongArgCount {
+            expected: "1 or 2".to_string(),
+            got: args.len(),
+            span,
+        });
+    }
+    let Value::Integer(n, _) = &args[0] else {
+        return Err(EvalError::TypeMismatch {
+            expected: "integer".to_string(),
+            got: args[0].to_string(),
+            span: args[0].span(),
+        });
+    };
+    let fill = if args.len() == 2 {
+        args[1].clone()
+    } else {
+        Value::int(0)
+    };
+    Ok(Value::vector(vec![fill; *n as usize]))
+}
+
+fn builtin_vector_ref(args: &[Value], span: Span) -> Result<Value, EvalError> {
+    if args.len() != 2 {
+        return Err(EvalError::WrongArgCount {
+            expected: "2".to_string(),
+            got: args.len(),
+            span,
+        });
+    }
+    let Value::Vector(v, _) = &args[0] else {
+        return Err(EvalError::TypeMismatch {
+            expected: "vector".to_string(),
+            got: args[0].to_string(),
+            span: args[0].span(),
+        });
+    };
+    let Value::Integer(idx, _) = &args[1] else {
+        return Err(EvalError::TypeMismatch {
+            expected: "integer".to_string(),
+            got: args[1].to_string(),
+            span: args[1].span(),
+        });
+    };
+    let borrowed = v.borrow();
+    let idx = *idx as usize;
+    borrowed.get(idx).cloned().ok_or_else(|| EvalError::TypeMismatch {
+        expected: "valid index".to_string(),
+        got: format!("index {idx} out of bounds"),
+        span,
+    })
+}
+
+fn builtin_vector_set(args: &[Value], span: Span) -> Result<Value, EvalError> {
+    if args.len() != 3 {
+        return Err(EvalError::WrongArgCount {
+            expected: "3".to_string(),
+            got: args.len(),
+            span,
+        });
+    }
+    let Value::Vector(v, _) = &args[0] else {
+        return Err(EvalError::TypeMismatch {
+            expected: "vector".to_string(),
+            got: args[0].to_string(),
+            span: args[0].span(),
+        });
+    };
+    let Value::Integer(idx, _) = &args[1] else {
+        return Err(EvalError::TypeMismatch {
+            expected: "integer".to_string(),
+            got: args[1].to_string(),
+            span: args[1].span(),
+        });
+    };
+    let idx = *idx as usize;
+    let mut borrowed = v.borrow_mut();
+    if idx >= borrowed.len() {
+        return Err(EvalError::TypeMismatch {
+            expected: "valid index".to_string(),
+            got: format!("index {idx} out of bounds"),
+            span,
+        });
+    }
+    borrowed[idx] = args[2].clone();
+    drop(borrowed);
+    Ok(Value::Void)
+}
+
+fn builtin_vector_length(args: &[Value], span: Span) -> Result<Value, EvalError> {
+    if args.len() != 1 {
+        return Err(EvalError::WrongArgCount {
+            expected: "1".to_string(),
+            got: args.len(),
+            span,
+        });
+    }
+    let Value::Vector(v, _) = &args[0] else {
+        return Err(EvalError::TypeMismatch {
+            expected: "vector".to_string(),
+            got: args[0].to_string(),
+            span: args[0].span(),
+        });
+    };
+    Ok(Value::int(v.borrow().len() as i64))
+}
+
+fn builtin_vector_to_list(args: &[Value], span: Span) -> Result<Value, EvalError> {
+    if args.len() != 1 {
+        return Err(EvalError::WrongArgCount {
+            expected: "1".to_string(),
+            got: args.len(),
+            span,
+        });
+    }
+    let Value::Vector(v, _) = &args[0] else {
+        return Err(EvalError::TypeMismatch {
+            expected: "vector".to_string(),
+            got: args[0].to_string(),
+            span: args[0].span(),
+        });
+    };
+    Ok(Value::list(v.borrow().clone()))
+}
+
+fn builtin_list_to_vector(args: &[Value], span: Span) -> Result<Value, EvalError> {
+    if args.len() != 1 {
+        return Err(EvalError::WrongArgCount {
+            expected: "1".to_string(),
+            got: args.len(),
+            span,
+        });
+    }
+    let Value::List(elems, _) = &args[0] else {
+        return Err(EvalError::TypeMismatch {
+            expected: "list".to_string(),
+            got: args[0].to_string(),
+            span: args[0].span(),
+        });
+    };
+    Ok(Value::vector(elems.clone()))
 }

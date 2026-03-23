@@ -74,6 +74,7 @@ fn collect_pattern_vars_inner(pattern: &Value, literals: &[String], vars: &mut V
         | Value::Boolean(_, _)
         | Value::String(_, _, _)
         | Value::Char(_, _)
+        | Value::Vector(_, _)
         | Value::Closure { .. }
         | Value::Continuation(_)
         | Value::Macro(_)
@@ -166,6 +167,7 @@ fn match_pattern(
         Value::Boolean(a, _) => matches!(input, Value::Boolean(b, _) if a == b),
         Value::String(_, _, _)
         | Value::Char(_, _)
+        | Value::Vector(_, _)
         | Value::Closure { .. }
         | Value::Continuation(_)
         | Value::Macro(_)
@@ -219,6 +221,7 @@ fn expand_template(
         | Value::Boolean(_, _)
         | Value::String(_, _, _)
         | Value::Char(_, _)
+        | Value::Vector(_, _)
         | Value::Closure { .. }
         | Value::Continuation(_)
         | Value::Macro(_)
@@ -288,6 +291,7 @@ fn template_symbols(template: &Value) -> Vec<String> {
         | Value::Boolean(_, _)
         | Value::String(_, _, _)
         | Value::Char(_, _)
+        | Value::Vector(_, _)
         | Value::Closure { .. }
         | Value::Continuation(_)
         | Value::Macro(_)
@@ -352,6 +356,9 @@ fn is_special_form(name: &str) -> bool {
             | "syntax-rules"
             | "let*"
             | "letrec"
+            | "letrec*"
+            | "case"
+            | "do"
             | "else"
     )
 }
@@ -407,5 +414,35 @@ fn is_builtin(name: &str) -> bool {
             | "apply"
             | "call/cc"
             | "call-with-current-continuation"
+            | "eqv?"
+            | "equal?"
+            | "eq?"
+            | "map"
+            | "list-ref"
+            | "list-tail"
+            | "list?"
+            | "assoc"
+            | "expt"
+            | "vector"
+            | "make-vector"
+            | "vector-ref"
+            | "vector-set!"
+            | "vector-length"
+            | "vector?"
+            | "vector->list"
+            | "list->vector"
+            | "string->list"
+            | "list->string"
+            | "char-alphabetic?"
+            | "char-numeric?"
+            | "char-upcase"
+            | "char-downcase"
+            | "char=?"
+            | "char<?"
+            | "string=?"
+            | "string<?"
+            | "string-ci=?"
+            | "string-upcase"
+            | "string-downcase"
     )
 }

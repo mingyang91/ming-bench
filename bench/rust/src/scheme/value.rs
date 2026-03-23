@@ -27,6 +27,7 @@ pub enum Value {
     Symbol(String, Span),
     Char(char, Span),
     List(Vec<Value>, Span),
+    Vector(Rc<RefCell<Vec<Value>>>, Span),
     Closure {
         params: Vec<String>,
         rest_param: Option<String>,
@@ -51,6 +52,7 @@ impl PartialEq for Value {
              Value::Closure { params: p2, rest_param: r2, body: b2, env: e2 }) => {
                 p1 == p2 && r1 == r2 && b1 == b2 && e1 == e2
             }
+            (Value::Vector(a, _), Value::Vector(b, _)) => *a.borrow() == *b.borrow(),
             (Value::Continuation(a), Value::Continuation(b)) => a == b,
             (Value::Void, Value::Void) => true,
             _ => false,
@@ -70,6 +72,17 @@ impl fmt::Display for Value {
             Value::List(elems, _) => {
                 write!(f, "(")?;
                 for (i, elem) in elems.iter().enumerate() {
+                    if i > 0 {
+                        write!(f, " ")?;
+                    }
+                    write!(f, "{elem}")?;
+                }
+                write!(f, ")")
+            }
+            Value::Vector(elems, _) => {
+                write!(f, "#(")?;
+                let borrowed = elems.borrow();
+                for (i, elem) in borrowed.iter().enumerate() {
                     if i > 0 {
                         write!(f, " ")?;
                     }
@@ -102,6 +115,18 @@ impl Value {
                 out.push(')');
                 out
             }
+            Value::Vector(elems, _) => {
+                let borrowed = elems.borrow();
+                let mut out = String::from("#(");
+                for (i, elem) in borrowed.iter().enumerate() {
+                    if i > 0 {
+                        out.push(' ');
+                    }
+                    out.push_str(&elem.display_string());
+                }
+                out.push(')');
+                out
+            }
             Value::Integer(_, _)
             | Value::Boolean(_, _)
             | Value::Symbol(_, _)
@@ -121,7 +146,8 @@ impl Value {
             | Value::String(_, _, s)
             | Value::Symbol(_, s)
             | Value::Char(_, s)
-            | Value::List(_, s) => *s,
+            | Value::List(_, s)
+            | Value::Vector(_, s) => *s,
             Value::Closure { .. } => Span::default(),
             Value::Continuation(_) => Span::default(),
             Value::Macro(_) => Span::default(),
@@ -151,5 +177,8 @@ impl Value {
     }
     pub fn list(elems: Vec<Value>) -> Self {
         Value::List(elems, Span::default())
+    }
+    pub fn vector(elems: Vec<Value>) -> Self {
+        Value::Vector(Rc::new(RefCell::new(elems)), Span::default())
     }
 }
