@@ -39,7 +39,21 @@ pub enum Value {
     Continuation(u64),
     Macro(SyntaxRules),
     Values(Vec<Value>),
+    Record {
+        type_id: u64,
+        type_name: String,
+        fields: Vec<Value>,
+    },
+    RecordProcedure(RecordOp),
     Void,
+}
+
+/// Operations on record types, stored as callable values.
+#[derive(Debug, Clone)]
+pub enum RecordOp {
+    Constructor { type_id: u64, type_name: String, field_count: usize },
+    Predicate { type_id: u64 },
+    Accessor { type_id: u64, field_index: usize, accessor_name: String },
 }
 
 fn gcd(mut a: i64, mut b: i64) -> i64 {
@@ -87,6 +101,8 @@ impl PartialEq for Value {
             (Value::Vector(a, _), Value::Vector(b, _)) => *a.borrow() == *b.borrow(),
             (Value::Continuation(a), Value::Continuation(b)) => a == b,
             (Value::Values(a), Value::Values(b)) => a == b,
+            (Value::Record { type_id: ta, fields: fa, .. },
+             Value::Record { type_id: tb, fields: fb, .. }) => ta == tb && fa == fb,
             (Value::Void, Value::Void) => true,
             _ => false,
         }
@@ -135,6 +151,8 @@ impl fmt::Display for Value {
             Value::Continuation(_) => write!(f, "#<continuation>"),
             Value::Macro(_) => write!(f, "#<macro>"),
             Value::Values(_) => write!(f, "#<values>"),
+            Value::Record { type_name, .. } => write!(f, "#<record:{type_name}>"),
+            Value::RecordProcedure(_) => write!(f, "#<procedure>"),
             Value::Void => write!(f, "#<void>"),
         }
     }
@@ -178,6 +196,8 @@ impl Value {
             | Value::Continuation(_)
             | Value::Macro(_)
             | Value::Values(_)
+            | Value::Record { .. }
+            | Value::RecordProcedure(_)
             | Value::Void => self.to_string(),
         }
     }
@@ -199,6 +219,8 @@ impl Value {
             Value::Continuation(_) => Span::default(),
             Value::Macro(_) => Span::default(),
             Value::Values(_) => Span::default(),
+            Value::Record { .. } => Span::default(),
+            Value::RecordProcedure(_) => Span::default(),
             Value::Void => Span::default(),
         }
     }

@@ -3,7 +3,7 @@ use std::rc::Rc;
 use crate::scheme::env::Env;
 use crate::scheme::error::{EvalError, Span};
 use crate::scheme::macros;
-use crate::scheme::value::{make_rational, Mutability, Value};
+use crate::scheme::value::{make_rational, Mutability, RecordOp, Value};
 
 /// Numeric tower: exact integers, exact rationals, inexact floats.
 #[derive(Debug, Clone, Copy)]
@@ -301,7 +301,9 @@ pub fn eval(expr: &Value, env: &Env) -> Result<Value, EvalError> {
             | Value::Closure { .. }
             | Value::Continuation(_)
             | Value::Macro(_)
-            | Value::Values(_) => return Ok(current_expr),
+            | Value::Values(_)
+            | Value::Record { .. }
+            | Value::RecordProcedure(_) => return Ok(current_expr),
             Value::Symbol(name, span) => {
                 if let Some(val) = current_env.get(name) {
                     return Ok(val);
@@ -513,6 +515,9 @@ pub fn eval(expr: &Value, env: &Env) -> Result<Value, EvalError> {
                         }
                         "define-syntax" => {
                             return eval_define_syntax(&elems[1..], list_span, &current_env);
+                        }
+                        "define-record-type" => {
+                            return eval_define_record_type(&elems[1..], list_span, &current_env);
                         }
                         "guard" => {
                             return eval_guard(&elems[1..], list_span, &current_env);
@@ -902,6 +907,9 @@ fn dispatch_call(func: Value, args: Vec<Value>, span: Span, env: &Env) -> Result
         } => {
             let local_env = bind_closure_args(params, rest_param, &args, closure_env, span)?;
             Ok(TailAction::TailCall(*body.clone(), local_env))
+        }
+        Value::RecordProcedure(ref op) => {
+            Ok(TailAction::Result(apply_record_op(op, args, span)?))
         }
         Value::Continuation(id) => {
             if args.len() != 1 {
@@ -1367,6 +1375,190 @@ fn eval_define(args: &[Value], form_span: Span, env: &Env) -> Result<Value, Eval
             got: other.to_string(),
             span: other.span(),
         }),
+    }
+}
+
+fn eval_define_record_type(args: &[Value], form_span: Span, env: &Env) -> Result<Value, EvalError> {
+    // (define-record-type <name> (constructor field-names...) predicate (field accessor)...)
+    if args.len() < 3 {
+        return Err(EvalError::WrongArgCount {
+            expected: "at least 3".to_string(),
+            got: args.len(),
+            span: form_span,
+        });
+    }
+    let Value::Symbol(type_name, _) = &args[0] else {
+        return Err(EvalError::TypeMismatch {
+            expected: "symbol".to_string(),
+            got: args[0].to_string(),
+            span: args[0].span(),
+        });
+    };
+    // Constructor: (make-foo field1 field2 ...)
+    let Value::List(ctor_elems, _) = &args[1] else {
+        return Err(EvalError::TypeMismatch {
+            expected: "constructor spec".to_string(),
+            got: args[1].to_string(),
+            span: args[1].span(),
+        });
+    };
+    if ctor_elems.is_empty() {
+        return Err(EvalError::Parse {
+            message: "empty constructor spec".to_string(),
+            span: form_span,
+        });
+    }
+    let Value::Symbol(ctor_name, _) = &ctor_elems[0] else {
+        return Err(EvalError::TypeMismatch {
+            expected: "symbol".to_string(),
+            got: ctor_elems[0].to_string(),
+            span: ctor_elems[0].span(),
+        });
+    };
+    let ctor_fields: Vec<String> = ctor_elems[1..]
+        .iter()
+        .map(|v| match v {
+            Value::Symbol(s, _) => Ok(s.clone()),
+            other => Err(EvalError::TypeMismatch {
+                expected: "symbol".to_string(),
+                got: other.to_string(),
+                span: other.span(),
+            }),
+        })
+        .collect::<Result<_, _>>()?;
+
+    // Predicate
+    let Value::Symbol(pred_name, _) = &args[2] else {
+        return Err(EvalError::TypeMismatch {
+            expected: "symbol".to_string(),
+            got: args[2].to_string(),
+            span: args[2].span(),
+        });
+    };
+
+    // Generate a unique type ID
+    let type_id = env.capture_continuation(); // reuse the ID counter
+
+    // Field accessors: (field-name accessor-name) ...
+    let field_specs = &args[3..];
+    // Build a mapping: field-name -> index (based on constructor field order)
+    let field_index_map: std::collections::HashMap<&str, usize> = ctor_fields
+        .iter()
+        .enumerate()
+        .map(|(i, name)| (name.as_str(), i))
+        .collect();
+
+    // Define constructor
+    env.define(
+        ctor_name.clone(),
+        Value::RecordProcedure(RecordOp::Constructor {
+            type_id,
+            type_name: type_name.clone(),
+            field_count: ctor_fields.len(),
+        }),
+    );
+
+    // Define predicate
+    env.define(
+        pred_name.clone(),
+        Value::RecordProcedure(RecordOp::Predicate { type_id }),
+    );
+
+    // Define accessors
+    for spec in field_specs {
+        let Value::List(spec_elems, _) = spec else {
+            return Err(EvalError::TypeMismatch {
+                expected: "field spec (name accessor)".to_string(),
+                got: spec.to_string(),
+                span: spec.span(),
+            });
+        };
+        if spec_elems.len() < 2 {
+            return Err(EvalError::WrongArgCount {
+                expected: "at least 2".to_string(),
+                got: spec_elems.len(),
+                span: spec.span(),
+            });
+        }
+        let Value::Symbol(field_name, _) = &spec_elems[0] else {
+            return Err(EvalError::TypeMismatch {
+                expected: "symbol".to_string(),
+                got: spec_elems[0].to_string(),
+                span: spec_elems[0].span(),
+            });
+        };
+        let Value::Symbol(accessor_name, _) = &spec_elems[1] else {
+            return Err(EvalError::TypeMismatch {
+                expected: "symbol".to_string(),
+                got: spec_elems[1].to_string(),
+                span: spec_elems[1].span(),
+            });
+        };
+        let Some(&idx) = field_index_map.get(field_name.as_str()) else {
+            return Err(EvalError::Parse {
+                message: format!("field {field_name} not in constructor"),
+                span: spec_elems[0].span(),
+            });
+        };
+        env.define(
+            accessor_name.clone(),
+            Value::RecordProcedure(RecordOp::Accessor {
+                type_id,
+                field_index: idx,
+                accessor_name: accessor_name.clone(),
+            }),
+        );
+    }
+
+    Ok(Value::Void)
+}
+
+fn apply_record_op(op: &RecordOp, args: Vec<Value>, span: Span) -> Result<Value, EvalError> {
+    match op {
+        RecordOp::Constructor { type_id, type_name, field_count } => {
+            if args.len() != *field_count {
+                return Err(EvalError::WrongArgCount {
+                    expected: field_count.to_string(),
+                    got: args.len(),
+                    span,
+                });
+            }
+            Ok(Value::Record {
+                type_id: *type_id,
+                type_name: type_name.clone(),
+                fields: args,
+            })
+        }
+        RecordOp::Predicate { type_id } => {
+            if args.len() != 1 {
+                return Err(EvalError::WrongArgCount {
+                    expected: "1".to_string(),
+                    got: args.len(),
+                    span,
+                });
+            }
+            let is_match = matches!(&args[0], Value::Record { type_id: tid, .. } if tid == type_id);
+            Ok(Value::bool(is_match))
+        }
+        RecordOp::Accessor { type_id, field_index, accessor_name } => {
+            if args.len() != 1 {
+                return Err(EvalError::WrongArgCount {
+                    expected: "1".to_string(),
+                    got: args.len(),
+                    span,
+                });
+            }
+            match &args[0] {
+                Value::Record { type_id: tid, fields, .. } if tid == type_id => {
+                    Ok(fields[*field_index].clone())
+                }
+                other => Err(EvalError::TypeMismatch {
+                    expected: format!("record for accessor {accessor_name}"),
+                    got: other.to_string(),
+                    span,
+                }),
+            }
+        }
     }
 }
 
