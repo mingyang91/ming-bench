@@ -158,6 +158,23 @@ public class Parser {
             return new SchemeValue.IntVal(Long.parseLong(token));
         } catch (NumberFormatException ignored) {}
 
+        // Try rational: num/den
+        int slashIdx = token.indexOf('/');
+        if (slashIdx > 0 && slashIdx < token.length() - 1) {
+            try {
+                long num = Long.parseLong(token.substring(0, slashIdx));
+                long den = Long.parseLong(token.substring(slashIdx + 1));
+                return SchemeValue.makeRational(num, den);
+            } catch (NumberFormatException ignored) {}
+        }
+
+        // Try floating-point
+        if (token.indexOf('.') >= 0) {
+            try {
+                return new SchemeValue.DoubleVal(Double.parseDouble(token));
+            } catch (NumberFormatException ignored) {}
+        }
+
         return new SchemeValue.SymbolVal(token, lc[0], lc[1]);
     }
 

@@ -9,6 +9,29 @@ public sealed interface SchemeValue {
         @Override public String display() { return Long.toString(value); }
     }
 
+    record RatVal(long num, long den) implements SchemeValue {
+        @Override public String display() { return num + "/" + den; }
+    }
+
+    record DoubleVal(double value) implements SchemeValue {
+        @Override public String display() { return Double.toString(value); }
+    }
+
+    static long gcd(long a, long b) {
+        a = Math.abs(a); b = Math.abs(b);
+        while (b != 0) { long t = b; b = a % b; a = t; }
+        return a;
+    }
+
+    static SchemeValue makeRational(long num, long den) {
+        if (den == 0) throw new EvalError("division by zero");
+        if (den < 0) { num = -num; den = -den; }
+        long g = gcd(num == 0 ? 0 : Math.abs(num), den);
+        if (g > 1) { num /= g; den /= g; }
+        if (den == 1) return new IntVal(num);
+        return new RatVal(num, den);
+    }
+
     record BoolVal(boolean value) implements SchemeValue {
         @Override public String display() { return value ? "#t" : "#f"; }
     }
@@ -154,6 +177,17 @@ public sealed interface SchemeValue {
             return sb.toString();
         }
         return display();
+    }
+
+    static double toDouble(SchemeValue v) {
+        if (v instanceof IntVal i) return (double) i.value();
+        if (v instanceof RatVal r) return (double) r.num() / (double) r.den();
+        if (v instanceof DoubleVal d) return d.value();
+        throw new EvalError("not a number: " + v.display());
+    }
+
+    static boolean isNumber(SchemeValue v) {
+        return v instanceof IntVal || v instanceof RatVal || v instanceof DoubleVal;
     }
 
     default boolean isTruthy() {

@@ -130,6 +130,8 @@ public class Evaluator {
     private Bounce eval(SchemeValue expr, Environment env, Cont k) {
         return switch (expr) {
             case SchemeValue.IntVal v -> k.apply(v);
+            case SchemeValue.RatVal v -> k.apply(v);
+            case SchemeValue.DoubleVal v -> k.apply(v);
             case SchemeValue.BoolVal v -> k.apply(v);
             case SchemeValue.StringVal v -> k.apply(v);
             case SchemeValue.VoidVal v -> k.apply(v);
@@ -706,7 +708,9 @@ public class Evaluator {
         "apply", "call/cc", "call-with-current-continuation",
         "dynamic-wind", "reverse",
         "raise", "with-exception-handler",
-        "values", "call-with-values"
+        "values", "call-with-values",
+        "exact?", "inexact?", "exact->inexact", "inexact->exact",
+        "numerator", "denominator", "rational?", "integer?"
     );
 
     private boolean isBuiltin(String name) { return BUILTINS.contains(name); }
@@ -714,34 +718,49 @@ public class Evaluator {
     private Bounce applyBuiltin(String name, List<SchemeValue> a, Cont k) {
         return switch (name) {
             case "+" -> {
-                long s = 0; for (var x : a) s += asInt(x);
-                yield k.apply(new SchemeValue.IntVal(s));
+                if (a.isEmpty()) yield k.apply(new SchemeValue.IntVal(0));
+                if (allInts(a)) { long s = 0; for (var x : a) s += ((SchemeValue.IntVal)x).value(); yield k.apply(new SchemeValue.IntVal(s)); }
+                if (hasDouble(a)) { double s = 0; for (var x : a) s += SchemeValue.toDouble(x); yield k.apply(new SchemeValue.DoubleVal(s)); }
+                long num = 0, den = 1;
+                for (var x : a) { long[] r = toRat(x); num = num * r[1] + r[0] * den; den = den * r[1]; long g = SchemeValue.gcd(Math.abs(num), den); num /= g; den /= g; }
+                yield k.apply(SchemeValue.makeRational(num, den));
             }
             case "-" -> {
                 if (a.isEmpty()) throw new EvalError("-: needs at least 1 argument");
-                if (a.size() == 1) yield k.apply(new SchemeValue.IntVal(-asInt(a.getFirst())));
-                long r = asInt(a.getFirst());
-                for (int i = 1; i < a.size(); i++) r -= asInt(a.get(i));
-                yield k.apply(new SchemeValue.IntVal(r));
+                if (allInts(a)) { long r = ((SchemeValue.IntVal)a.getFirst()).value(); if (a.size()==1) yield k.apply(new SchemeValue.IntVal(-r)); for (int i=1;i<a.size();i++) r -= ((SchemeValue.IntVal)a.get(i)).value(); yield k.apply(new SchemeValue.IntVal(r)); }
+                if (hasDouble(a)) { double r = SchemeValue.toDouble(a.getFirst()); if (a.size()==1) yield k.apply(new SchemeValue.DoubleVal(-r)); for (int i=1;i<a.size();i++) r -= SchemeValue.toDouble(a.get(i)); yield k.apply(new SchemeValue.DoubleVal(r)); }
+                long[] first = toRat(a.getFirst());
+                long num = first[0], den = first[1];
+                if (a.size() == 1) yield k.apply(SchemeValue.makeRational(-num, den));
+                for (int i = 1; i < a.size(); i++) { long[] r = toRat(a.get(i)); num = num * r[1] - r[0] * den; den = den * r[1]; long g = SchemeValue.gcd(Math.abs(num), den); num /= g; den /= g; }
+                yield k.apply(SchemeValue.makeRational(num, den));
             }
             case "*" -> {
-                long r = 1; for (var x : a) r *= asInt(x);
-                yield k.apply(new SchemeValue.IntVal(r));
+                if (allInts(a)) { long r = 1; for (var x : a) r *= ((SchemeValue.IntVal)x).value(); yield k.apply(new SchemeValue.IntVal(r)); }
+                if (hasDouble(a)) { double r = 1; for (var x : a) r *= SchemeValue.toDouble(x); yield k.apply(new SchemeValue.DoubleVal(r)); }
+                long num = 1, den = 1;
+                for (var x : a) { long[] r = toRat(x); num *= r[0]; den *= r[1]; long g = SchemeValue.gcd(Math.abs(num), den); num /= g; den /= g; }
+                yield k.apply(SchemeValue.makeRational(num, den));
             }
             case "/" -> {
                 if (a.isEmpty()) throw new EvalError("/: needs at least 1 argument");
-                long r = asInt(a.getFirst());
-                for (int i = 1; i < a.size(); i++) {
-                    long d = asInt(a.get(i)); if (d == 0) throw new EvalError("division by zero");
-                    r /= d;
+                if (hasDouble(a)) {
+                    double r = SchemeValue.toDouble(a.getFirst());
+                    if (a.size() == 1) { if (r == 0) throw new EvalError("division by zero"); yield k.apply(new SchemeValue.DoubleVal(1.0 / r)); }
+                    for (int i = 1; i < a.size(); i++) { double d = SchemeValue.toDouble(a.get(i)); if (d == 0) throw new EvalError("division by zero"); r /= d; }
+                    yield k.apply(new SchemeValue.DoubleVal(r));
                 }
-                yield k.apply(new SchemeValue.IntVal(r));
+                long[] first = toRat(a.getFirst());
+                long num = first[0], den = first[1];
+                if (a.size() == 1) { if (num == 0) throw new EvalError("division by zero"); yield k.apply(SchemeValue.makeRational(den, num)); }
+                for (int i = 1; i < a.size(); i++) { long[] r = toRat(a.get(i)); if (r[0] == 0) throw new EvalError("division by zero"); num *= r[1]; den *= r[0]; long g = SchemeValue.gcd(Math.abs(num), Math.abs(den)); num /= g; den /= g; }
+                yield k.apply(SchemeValue.makeRational(num, den));
             }
-            case "<" -> cmpOp(a, (x, y) -> x < y, k);
-            case ">" -> cmpOp(a, (x, y) -> x > y, k);
-            case "=" -> cmpOp(a, (x, y) -> x == y, k);
-            case "<=" -> cmpOp(a, (x, y) -> x <= y, k);
-            case ">=" -> cmpOp(a, (x, y) -> x >= y, k);
+            case "<" -> numCmpOp(a, (x, y) -> x < y, k);
+            case ">" -> numCmpOp(a, (x, y) -> x > y, k);
+            case "=" -> numCmpOp(a, (x, y) -> x == y, k);
+            case "<=" -> numCmpOp(a, (x, y) -> x <= y, k);
+            case ">=" -> numCmpOp(a, (x, y) -> x >= y, k);
             case "not" -> {
                 if (a.size() != 1) throw new EvalError("not: needs exactly 1 argument");
                 yield k.apply(new SchemeValue.BoolVal(!a.getFirst().isTruthy()));
@@ -794,7 +813,10 @@ public class Evaluator {
                 yield k.apply(rev);
             }
             case "string?" -> typePred(a, SchemeValue.StringVal.class, k);
-            case "number?" -> typePred(a, SchemeValue.IntVal.class, k);
+            case "number?" -> {
+                if (a.size() != 1) throw new EvalError("number?: needs exactly 1 argument");
+                yield k.apply(new SchemeValue.BoolVal(SchemeValue.isNumber(a.getFirst())));
+            }
             case "boolean?" -> typePred(a, SchemeValue.BoolVal.class, k);
             case "pair?" -> typePred(a, SchemeValue.PairVal.class, k);
             case "symbol?" -> typePred(a, SchemeValue.SymbolVal.class, k);
@@ -1017,14 +1039,16 @@ public class Evaluator {
             case "string->number" -> {
                 if (a.size() != 1) throw new EvalError("string->number: needs exactly 1 argument");
                 if (!(a.getFirst() instanceof SchemeValue.StringVal sv)) throw new EvalError("string->number: not a string");
-                SchemeValue r2;
-                try { r2 = new SchemeValue.IntVal(Long.parseLong(sv.value())); }
-                catch (NumberFormatException e) { r2 = new SchemeValue.BoolVal(false); }
+                SchemeValue r2 = new SchemeValue.BoolVal(false);
+                String str = sv.value();
+                try { r2 = new SchemeValue.IntVal(Long.parseLong(str)); } catch (NumberFormatException e) {
+                    try { r2 = new SchemeValue.DoubleVal(Double.parseDouble(str)); } catch (NumberFormatException e2) {}
+                }
                 yield k.apply(r2);
             }
             case "number->string" -> {
                 if (a.size() != 1) throw new EvalError("number->string: needs exactly 1 argument");
-                yield k.apply(new SchemeValue.StringVal(Long.toString(asInt(a.getFirst()))));
+                yield k.apply(new SchemeValue.StringVal(a.getFirst().display()));
             }
             case "symbol->string" -> {
                 if (a.size() != 1) throw new EvalError("symbol->string: needs exactly 1 argument");
@@ -1179,6 +1203,63 @@ public class Evaluator {
                     }
                     return applyProc(consumer, List.of(produced), k);
                 });
+            }
+            case "exact?" -> {
+                if (a.size() != 1) throw new EvalError("exact?: needs exactly 1 argument");
+                var v = a.getFirst();
+                yield k.apply(new SchemeValue.BoolVal(v instanceof SchemeValue.IntVal || v instanceof SchemeValue.RatVal));
+            }
+            case "inexact?" -> {
+                if (a.size() != 1) throw new EvalError("inexact?: needs exactly 1 argument");
+                yield k.apply(new SchemeValue.BoolVal(a.getFirst() instanceof SchemeValue.DoubleVal));
+            }
+            case "exact->inexact" -> {
+                if (a.size() != 1) throw new EvalError("exact->inexact: needs exactly 1 argument");
+                yield k.apply(new SchemeValue.DoubleVal(SchemeValue.toDouble(a.getFirst())));
+            }
+            case "inexact->exact" -> {
+                if (a.size() != 1) throw new EvalError("inexact->exact: needs exactly 1 argument");
+                var v = a.getFirst();
+                if (v instanceof SchemeValue.IntVal || v instanceof SchemeValue.RatVal) yield k.apply(v);
+                if (v instanceof SchemeValue.DoubleVal dv) {
+                    double d = dv.value();
+                    if (d == Math.floor(d) && !Double.isInfinite(d)) yield k.apply(new SchemeValue.IntVal((long) d));
+                    // Convert binary fraction to rational
+                    long bits = Double.doubleToLongBits(Math.abs(d));
+                    long significand = (bits & 0x000fffffffffffffL) | 0x0010000000000000L;
+                    int biasedExp = (int) ((bits >> 52) & 0x7ff);
+                    int exp = biasedExp - 1023 - 52;
+                    long rNum = d < 0 ? -significand : significand;
+                    if (exp >= 0) yield k.apply(new SchemeValue.IntVal(rNum << exp));
+                    yield k.apply(SchemeValue.makeRational(rNum, 1L << (-exp)));
+                }
+                throw new EvalError("inexact->exact: not a number");
+            }
+            case "numerator" -> {
+                if (a.size() != 1) throw new EvalError("numerator: needs exactly 1 argument");
+                var v = a.getFirst();
+                if (v instanceof SchemeValue.IntVal i) yield k.apply(new SchemeValue.IntVal(i.value()));
+                if (v instanceof SchemeValue.RatVal r) yield k.apply(new SchemeValue.IntVal(r.num()));
+                throw new EvalError("numerator: not a rational number");
+            }
+            case "denominator" -> {
+                if (a.size() != 1) throw new EvalError("denominator: needs exactly 1 argument");
+                var v = a.getFirst();
+                if (v instanceof SchemeValue.IntVal) yield k.apply(new SchemeValue.IntVal(1));
+                if (v instanceof SchemeValue.RatVal r) yield k.apply(new SchemeValue.IntVal(r.den()));
+                throw new EvalError("denominator: not a rational number");
+            }
+            case "rational?" -> {
+                if (a.size() != 1) throw new EvalError("rational?: needs exactly 1 argument");
+                var v = a.getFirst();
+                yield k.apply(new SchemeValue.BoolVal(v instanceof SchemeValue.IntVal || v instanceof SchemeValue.RatVal));
+            }
+            case "integer?" -> {
+                if (a.size() != 1) throw new EvalError("integer?: needs exactly 1 argument");
+                var v = a.getFirst();
+                if (v instanceof SchemeValue.IntVal) yield k.apply(new SchemeValue.BoolVal(true));
+                if (v instanceof SchemeValue.DoubleVal dv) yield k.apply(new SchemeValue.BoolVal(dv.value() == Math.floor(dv.value()) && !Double.isInfinite(dv.value())));
+                yield k.apply(new SchemeValue.BoolVal(false));
             }
             case "dynamic-wind" -> {
                 if (a.size() != 3) throw new EvalError("dynamic-wind: needs exactly 3 arguments");
@@ -1444,6 +1525,12 @@ public class Evaluator {
         throw new EvalError("expected number, got " + v.display());
     }
 
+    private long[] toRat(SchemeValue v) {
+        if (v instanceof SchemeValue.IntVal i) return new long[]{i.value(), 1};
+        if (v instanceof SchemeValue.RatVal r) return new long[]{r.num(), r.den()};
+        throw new EvalError("expected exact number, got " + v.display());
+    }
+
     @FunctionalInterface interface LongCmp { boolean test(long a, long b); }
 
     private Bounce cmpOp(List<SchemeValue> a, LongCmp cmp, Cont k) {
@@ -1455,6 +1542,38 @@ public class Evaluator {
             prev = cur;
         }
         return k.apply(new SchemeValue.BoolVal(true));
+    }
+
+    @FunctionalInterface interface DoubleCmp { boolean test(double a, double b); }
+
+    private Bounce numCmpOp(List<SchemeValue> a, DoubleCmp cmp, Cont k) {
+        if (a.size() < 2) throw new EvalError("comparison needs at least 2 arguments");
+        if (allInts(a)) {
+            long prev = ((SchemeValue.IntVal)a.getFirst()).value();
+            for (int i = 1; i < a.size(); i++) {
+                long cur = ((SchemeValue.IntVal)a.get(i)).value();
+                if (!cmp.test(prev, cur)) return k.apply(new SchemeValue.BoolVal(false));
+                prev = cur;
+            }
+            return k.apply(new SchemeValue.BoolVal(true));
+        }
+        double prev = SchemeValue.toDouble(a.getFirst());
+        for (int i = 1; i < a.size(); i++) {
+            double cur = SchemeValue.toDouble(a.get(i));
+            if (!cmp.test(prev, cur)) return k.apply(new SchemeValue.BoolVal(false));
+            prev = cur;
+        }
+        return k.apply(new SchemeValue.BoolVal(true));
+    }
+
+    private static boolean allInts(List<SchemeValue> a) {
+        for (var x : a) if (!(x instanceof SchemeValue.IntVal)) return false;
+        return true;
+    }
+
+    private static boolean hasDouble(List<SchemeValue> a) {
+        for (var x : a) if (x instanceof SchemeValue.DoubleVal) return true;
+        return false;
     }
 
     private Bounce typePred(List<SchemeValue> a, Class<? extends SchemeValue> type, Cont k) {
@@ -1480,6 +1599,7 @@ public class Evaluator {
     }
 
     private boolean schemeEqual(SchemeValue a, SchemeValue b) {
+        if (SchemeValue.isNumber(a) && SchemeValue.isNumber(b)) return SchemeValue.toDouble(a) == SchemeValue.toDouble(b);
         if (a instanceof SchemeValue.IntVal ia && b instanceof SchemeValue.IntVal ib) return ia.value() == ib.value();
         if (a instanceof SchemeValue.BoolVal ba && b instanceof SchemeValue.BoolVal bb) return ba.value() == bb.value();
         if (a instanceof SchemeValue.StringVal sa && b instanceof SchemeValue.StringVal sb) return sa.value().equals(sb.value());
@@ -1499,6 +1619,8 @@ public class Evaluator {
     }
 
     private boolean schemeEqv(SchemeValue a, SchemeValue b) {
+        if (a instanceof SchemeValue.RatVal ra && b instanceof SchemeValue.RatVal rb) return ra.num() == rb.num() && ra.den() == rb.den();
+        if (a instanceof SchemeValue.DoubleVal da && b instanceof SchemeValue.DoubleVal db) return da.value() == db.value();
         if (a instanceof SchemeValue.IntVal ia && b instanceof SchemeValue.IntVal ib) return ia.value() == ib.value();
         if (a instanceof SchemeValue.BoolVal ba && b instanceof SchemeValue.BoolVal bb) return ba.value() == bb.value();
         if (a instanceof SchemeValue.SymbolVal sa && b instanceof SchemeValue.SymbolVal sb) return sa.name().equals(sb.name());
