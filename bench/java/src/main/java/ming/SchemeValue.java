@@ -95,6 +95,12 @@ public sealed interface SchemeValue {
         @Override public String display() { return "#<continuation>"; }
     }
 
+    record MacroVal(java.util.List<String> literals,
+                    java.util.List<java.util.List<SchemeValue>> rules,
+                    Environment defEnv) implements SchemeValue {
+        @Override public String display() { return "#<macro>"; }
+    }
+
     String display();
 
     /** Format for Scheme's display (no quotes on strings, chars as raw chars) */
