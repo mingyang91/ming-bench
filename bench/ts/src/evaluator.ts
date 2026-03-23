@@ -8,6 +8,7 @@ type SchemeVal =
   | { tag: 'number'; val: number; pos?: Pos }
   | { tag: 'boolean'; val: boolean; pos?: Pos }
   | { tag: 'string'; val: string; pos?: Pos }
+  | { tag: 'char'; val: string; pos?: Pos }
   | { tag: 'symbol'; val: string; pos?: Pos }
   | { tag: 'list'; val: SchemeVal[]; pos?: Pos }
   | { tag: 'lambda'; params: string[]; body: SchemeVal[]; env: Env; pos?: Pos };
@@ -193,6 +194,8 @@ function displayVal(v: SchemeVal): string {
       return v.val ? '#t' : '#f';
     case 'string':
       return `"${v.val}"`;
+    case 'char':
+      return `#\\${v.val}`;
     case 'symbol':
       return v.val;
     case 'list':
@@ -202,11 +205,22 @@ function displayVal(v: SchemeVal): string {
   }
 }
 
+function displayValUnquoted(v: SchemeVal): string {
+  switch (v.tag) {
+    case 'string':
+      return v.val;
+    case 'char':
+      return v.val;
+    default:
+      return displayVal(v);
+  }
+}
+
 function quoteToScheme(v: SchemeVal): SchemeVal {
   return v;
 }
 
-function applyBuiltin(op: string, evalArgs: SchemeVal[], p?: Pos): SchemeVal {
+function applyBuiltin(op: string, evalArgs: SchemeVal[], p?: Pos, out?: string[]): SchemeVal {
   switch (op) {
     case '+': {
       let sum = 0;
@@ -328,6 +342,76 @@ function applyBuiltin(op: string, evalArgs: SchemeVal[], p?: Pos): SchemeVal {
       if (evalArgs.length !== 1) throw posError('procedure?: need exactly one arg', p);
       return { tag: 'boolean', val: evalArgs[0].tag === 'lambda' };
     }
+    case 'display': {
+      if (evalArgs.length !== 1) throw posError('display: need exactly one arg', p);
+      if (out) out.push(displayValUnquoted(evalArgs[0]));
+      return { tag: 'boolean', val: false };
+    }
+    case 'write': {
+      if (evalArgs.length !== 1) throw posError('write: need exactly one arg', p);
+      if (out) out.push(displayVal(evalArgs[0]));
+      return { tag: 'boolean', val: false };
+    }
+    case 'newline': {
+      if (evalArgs.length !== 0) throw posError('newline: no arguments expected', p);
+      if (out) out.push('\n');
+      return { tag: 'boolean', val: false };
+    }
+    case 'string-append': {
+      let result = '';
+      for (const a of evalArgs) {
+        if (a.tag !== 'string') throw posError('string-append: expected string', p);
+        result += a.val;
+      }
+      return { tag: 'string', val: result };
+    }
+    case 'string-length': {
+      if (evalArgs.length !== 1) throw posError('string-length: need exactly one arg', p);
+      if (evalArgs[0].tag !== 'string') throw posError('string-length: expected string', p);
+      return { tag: 'number', val: evalArgs[0].val.length };
+    }
+    case 'substring': {
+      if (evalArgs.length !== 3) throw posError('substring: need exactly three args', p);
+      if (evalArgs[0].tag !== 'string') throw posError('substring: expected string', p);
+      const s = evalArgs[0].val;
+      const start = toNumber(evalArgs[1], 'substring', p);
+      const end = toNumber(evalArgs[2], 'substring', p);
+      return { tag: 'string', val: s.slice(start, end) };
+    }
+    case 'string->number': {
+      if (evalArgs.length !== 1) throw posError('string->number: need exactly one arg', p);
+      if (evalArgs[0].tag !== 'string') throw posError('string->number: expected string', p);
+      const n = Number(evalArgs[0].val);
+      if (isNaN(n)) return { tag: 'boolean', val: false };
+      return { tag: 'number', val: n };
+    }
+    case 'number->string': {
+      if (evalArgs.length !== 1) throw posError('number->string: need exactly one arg', p);
+      if (evalArgs[0].tag !== 'number') throw posError('number->string: expected number', p);
+      return { tag: 'string', val: String(evalArgs[0].val) };
+    }
+    case 'symbol->string': {
+      if (evalArgs.length !== 1) throw posError('symbol->string: need exactly one arg', p);
+      if (evalArgs[0].tag !== 'symbol') throw posError('symbol->string: expected symbol', p);
+      return { tag: 'string', val: evalArgs[0].val };
+    }
+    case 'string->symbol': {
+      if (evalArgs.length !== 1) throw posError('string->symbol: need exactly one arg', p);
+      if (evalArgs[0].tag !== 'string') throw posError('string->symbol: expected string', p);
+      return { tag: 'symbol', val: evalArgs[0].val };
+    }
+    case 'string-ref': {
+      if (evalArgs.length !== 2) throw posError('string-ref: need exactly two args', p);
+      if (evalArgs[0].tag !== 'string') throw posError('string-ref: expected string', p);
+      const idx = toNumber(evalArgs[1], 'string-ref', p);
+      const str = evalArgs[0].val;
+      if (idx < 0 || idx >= str.length) throw posError('string-ref: index out of range', p);
+      return { tag: 'char', val: str[idx] };
+    }
+    case 'char?': {
+      if (evalArgs.length !== 1) throw posError('char?: need exactly one arg', p);
+      return { tag: 'boolean', val: evalArgs[0].tag === 'char' };
+    }
     default:
       throw posError(`unknown procedure: ${op}`, p);
   }
@@ -335,9 +419,12 @@ function applyBuiltin(op: string, evalArgs: SchemeVal[], p?: Pos): SchemeVal {
 
 const BUILTINS = new Set(['+', '-', '*', '/', '<', '>', '=', '<=', '>=', 'not',
   'cons', 'car', 'cdr', 'null?', 'list', 'length', 'append',
-  'pair?', 'number?', 'string?', 'boolean?', 'symbol?', 'procedure?']);
+  'pair?', 'number?', 'string?', 'boolean?', 'symbol?', 'procedure?', 'char?',
+  'display', 'write', 'newline',
+  'string-append', 'string-length', 'substring', 'string->number', 'number->string',
+  'symbol->string', 'string->symbol', 'string-ref']);
 
-function evalExpr(expr: SchemeVal, env: Env): SchemeVal {
+function evalExpr(expr: SchemeVal, env: Env, out?: string[]): SchemeVal {
   const p = expr.pos;
   if (expr.tag === 'number' || expr.tag === 'boolean' || expr.tag === 'string') {
     return expr;
@@ -362,9 +449,9 @@ function evalExpr(expr: SchemeVal, env: Env): SchemeVal {
 
       if (op === 'if') {
         if (args.length < 2 || args.length > 3) throw posError('if: bad syntax', p);
-        const cond = evalExpr(args[0], env);
-        if (isTruthy(cond)) return evalExpr(args[1], env);
-        if (args.length === 3) return evalExpr(args[2], env);
+        const cond = evalExpr(args[0], env, out);
+        if (isTruthy(cond)) return evalExpr(args[1], env, out);
+        if (args.length === 3) return evalExpr(args[2], env, out);
         return { tag: 'boolean', val: false };
       }
 
@@ -372,7 +459,7 @@ function evalExpr(expr: SchemeVal, env: Env): SchemeVal {
         if (args.length < 2) throw posError('define: bad syntax', p);
         const target = args[0];
         if (target.tag === 'symbol') {
-          const val = evalExpr(args[1], env);
+          const val = evalExpr(args[1], env, out);
           env.define(target.val, val);
           return val;
         }
@@ -406,7 +493,7 @@ function evalExpr(expr: SchemeVal, env: Env): SchemeVal {
         if (args.length === 0) return { tag: 'boolean', val: true };
         let result: SchemeVal = { tag: 'boolean', val: true };
         for (const a of args) {
-          result = evalExpr(a, env);
+          result = evalExpr(a, env, out);
           if (!isTruthy(result)) return result;
         }
         return result;
@@ -433,7 +520,7 @@ function evalExpr(expr: SchemeVal, env: Env): SchemeVal {
           if (b.tag !== 'list' || b.val.length !== 2 || b.val[0].tag !== 'symbol')
             throw posError('let: bad binding', p);
           paramNames.push(b.val[0].val);
-          initVals.push(evalExpr(b.val[1], env));
+          initVals.push(evalExpr(b.val[1], env, out));
         }
         if (name !== null) {
           const letEnv = new Env(env);
@@ -442,20 +529,20 @@ function evalExpr(expr: SchemeVal, env: Env): SchemeVal {
           const callEnv = new Env(letEnv);
           for (let i = 0; i < paramNames.length; i++) callEnv.define(paramNames[i], initVals[i]);
           let result: SchemeVal = { tag: 'boolean', val: false };
-          for (const b of body) result = evalExpr(b, callEnv);
+          for (const b of body) result = evalExpr(b, callEnv, out);
           return result;
         } else {
           const letEnv = new Env(env);
           for (let i = 0; i < paramNames.length; i++) letEnv.define(paramNames[i], initVals[i]);
           let result: SchemeVal = { tag: 'boolean', val: false };
-          for (const b of body) result = evalExpr(b, letEnv);
+          for (const b of body) result = evalExpr(b, letEnv, out);
           return result;
         }
       }
 
       if (op === 'begin') {
         let result: SchemeVal = { tag: 'boolean', val: false };
-        for (const a of args) result = evalExpr(a, env);
+        for (const a of args) result = evalExpr(a, env, out);
         return result;
       }
 
@@ -465,13 +552,13 @@ function evalExpr(expr: SchemeVal, env: Env): SchemeVal {
           const test = clause.val[0];
           if (test.tag === 'symbol' && test.val === 'else') {
             let result: SchemeVal = { tag: 'boolean', val: false };
-            for (let i = 1; i < clause.val.length; i++) result = evalExpr(clause.val[i], env);
+            for (let i = 1; i < clause.val.length; i++) result = evalExpr(clause.val[i], env, out);
             return result;
           }
-          const cond = evalExpr(test, env);
+          const cond = evalExpr(test, env, out);
           if (isTruthy(cond)) {
             let result: SchemeVal = cond;
-            for (let i = 1; i < clause.val.length; i++) result = evalExpr(clause.val[i], env);
+            for (let i = 1; i < clause.val.length; i++) result = evalExpr(clause.val[i], env, out);
             return result;
           }
         }
@@ -482,7 +569,7 @@ function evalExpr(expr: SchemeVal, env: Env): SchemeVal {
         if (args.length === 0) return { tag: 'boolean', val: false };
         let result: SchemeVal = { tag: 'boolean', val: false };
         for (const a of args) {
-          result = evalExpr(a, env);
+          result = evalExpr(a, env, out);
           if (isTruthy(result)) return result;
         }
         return result;
@@ -490,14 +577,14 @@ function evalExpr(expr: SchemeVal, env: Env): SchemeVal {
 
       // builtin procedures
       if (BUILTINS.has(op)) {
-        const evalArgs = args.map(a => evalExpr(a, env));
-        return applyBuiltin(op, evalArgs, p);
+        const evalArgs = args.map(a => evalExpr(a, env, out));
+        return applyBuiltin(op, evalArgs, p, out);
       }
     }
 
     // general application: evaluate head and args
-    const proc = evalExpr(head, env);
-    const evalArgs = items.slice(1).map(a => evalExpr(a, env));
+    const proc = evalExpr(head, env, out);
+    const evalArgs = items.slice(1).map(a => evalExpr(a, env, out));
 
     if (proc.tag === 'lambda') {
       if (evalArgs.length !== proc.params.length) {
@@ -509,7 +596,7 @@ function evalExpr(expr: SchemeVal, env: Env): SchemeVal {
       }
       let result: SchemeVal = { tag: 'boolean', val: false };
       for (const bodyExpr of proc.body) {
-        result = evalExpr(bodyExpr, callEnv);
+        result = evalExpr(bodyExpr, callEnv, out);
       }
       return result;
     }
@@ -543,6 +630,13 @@ export function evalStr(input: string): string {
  * and any captured output from display/write/newline.
  */
 export function evalStrWithOutput(input: string): { result: string; output: string } {
-  const result = evalStr(input);
-  return { result, output: '' };
+  const exprs = parse(input);
+  if (exprs.length === 0) throw new EvalError('no expressions');
+  const env = makeGlobalEnv();
+  const out: string[] = [];
+  let result: SchemeVal | undefined;
+  for (const expr of exprs) {
+    result = evalExpr(expr, env, out);
+  }
+  return { result: displayVal(result!), output: out.join('') };
 }
