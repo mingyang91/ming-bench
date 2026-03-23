@@ -17,6 +17,7 @@ public sealed interface SchemeValue {
     record Thunk(SchemeValue expr, Environment env) implements SchemeValue {}
     record ContinuationVal(Continuation cont) implements SchemeValue {}
     record SyntaxRulesVal(List<String> literals, List<SchemeValue> patterns, List<SchemeValue> templates, Environment defEnv) implements SchemeValue {}
+    record PairVal(SchemeValue car, SchemeValue cdr, SourcePos pos) implements SchemeValue {}
 
     default SourcePos sourcePos() {
         return switch (this) {
@@ -31,6 +32,7 @@ public sealed interface SchemeValue {
             case Thunk v -> SourcePos.NONE;
             case ContinuationVal v -> SourcePos.NONE;
             case SyntaxRulesVal v -> SourcePos.NONE;
+            case PairVal v -> v.pos();
         };
     }
 
@@ -61,6 +63,7 @@ public sealed interface SchemeValue {
             case Thunk v -> "#<thunk>";
             case ContinuationVal v -> "#<continuation>";
             case SyntaxRulesVal v -> "#<macro>";
+            case PairVal v -> "(" + v.car().display() + " . " + v.cdr().display() + ")";
         };
     }
 
@@ -81,6 +84,7 @@ public sealed interface SchemeValue {
             case Thunk v -> "#<thunk>";
             case ContinuationVal v -> "#<continuation>";
             case SyntaxRulesVal v -> "#<macro>";
+            case PairVal v -> "(" + v.car().displayOutput() + " . " + v.cdr().displayOutput() + ")";
             default -> display();
         };
     }
