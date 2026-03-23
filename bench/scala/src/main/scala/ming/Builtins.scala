@@ -8,10 +8,11 @@ object Builtins:
   def register(env: Env, output: StringBuilder): Unit =
     registerArithmetic(env)
     registerListOps(env)
+    registerTypePredicates(env)
     registerIOOps(env, output)
-    registerStringOps(env)
+    BuiltinsExt.register(env)
 
-  private def define(env: Env, entries: List[(String, List[Value] => Value)]): Unit =
+  private[ming] def define(env: Env, entries: List[(String, List[Value] => Value)]): Unit =
     entries.foreach((name, fn) => env.define(name, BuiltinVal(name, fn)))
 
   private def registerArithmetic(env: Env): Unit =
@@ -92,6 +93,53 @@ object Builtins:
               appendList(lst, acc)
             }
         ),
+        (
+          "eq?",
+          args =>
+            if args.length != 2 then throw new EvalError("eq?: expected 2 arguments")
+            BoolVal(eqCheck(args(0), args(1)))
+        ),
+        (
+          "equal?",
+          args =>
+            if args.length != 2 then throw new EvalError("equal?: expected 2 arguments")
+            BoolVal(equalCheck(args(0), args(1)))
+        ),
+        (
+          "list?",
+          args =>
+            if args.length != 1 then throw new EvalError("list?: expected 1 argument")
+            BoolVal(isProperList(args.head))
+        ),
+        (
+          "list-ref",
+          args =>
+            if args.length != 2 then throw new EvalError("list-ref: expected 2 arguments")
+            args(1) match
+              case IntVal(idx) => listRef(args(0), idx.toInt)
+              case _           => throw new EvalError("list-ref: index must be a number")
+        ),
+        (
+          "list-tail",
+          args =>
+            if args.length != 2 then throw new EvalError("list-tail: expected 2 arguments")
+            args(1) match
+              case IntVal(idx) => listTail(args(0), idx.toInt)
+              case _           => throw new EvalError("list-tail: index must be a number")
+        ),
+        (
+          "assoc",
+          args =>
+            if args.length != 2 then throw new EvalError("assoc: expected 2 arguments")
+            assocLookup(args(0), args(1))
+        )
+      )
+    )
+
+  private def registerTypePredicates(env: Env): Unit =
+    define(
+      env,
+      List(
         ("string?", args => typePred(args, _.isInstanceOf[StrVal])),
         ("number?", args => typePred(args, _.isInstanceOf[IntVal])),
         ("boolean?", args => typePred(args, _.isInstanceOf[BoolVal])),
@@ -129,97 +177,6 @@ object Builtins:
       )
     )
 
-  private def registerStringOps(env: Env): Unit =
-    define(
-      env,
-      List(
-        (
-          "string-append",
-          args =>
-            val strs = args.map {
-              case StrVal(chars) => new String(chars)
-              case other         => throw new EvalError(s"string-append: not a string: ${other.display}")
-            }
-            StrVal(strs.mkString.toCharArray)
-        ),
-        (
-          "string-length",
-          args =>
-            if args.length != 1 then throw new EvalError("string-length: expected 1 argument")
-            args.head match
-              case StrVal(chars) => IntVal(chars.length.toLong)
-              case other         => throw new EvalError(s"string-length: not a string: ${other.display}")
-        ),
-        (
-          "substring",
-          args =>
-            args match
-              case StrVal(chars) :: IntVal(start) :: IntVal(end) :: Nil =>
-                StrVal(java.util.Arrays.copyOfRange(chars, start.toInt, end.toInt))
-              case _ => throw new EvalError("substring: expected (string, start, end)")
-        ),
-        (
-          "string->number",
-          args =>
-            if args.length != 1 then throw new EvalError("string->number: expected 1 argument")
-            args.head match
-              case StrVal(chars) =>
-                val s = new String(chars)
-                try IntVal(s.toLong)
-                catch case _: NumberFormatException => BoolVal(false)
-              case other => throw new EvalError(s"string->number: not a string: ${other.display}")
-        ),
-        (
-          "number->string",
-          args =>
-            if args.length != 1 then throw new EvalError("number->string: expected 1 argument")
-            args.head match
-              case IntVal(n) => StrVal(n.toString.toCharArray)
-              case other     => throw new EvalError(s"number->string: not a number: ${other.display}")
-        ),
-        (
-          "symbol->string",
-          args =>
-            if args.length != 1 then throw new EvalError("symbol->string: expected 1 argument")
-            args.head match
-              case SymbolVal(name) => StrVal(name.toCharArray)
-              case other           => throw new EvalError(s"symbol->string: not a symbol: ${other.display}")
-        ),
-        (
-          "string->symbol",
-          args =>
-            if args.length != 1 then throw new EvalError("string->symbol: expected 1 argument")
-            args.head match
-              case StrVal(chars) => SymbolVal(new String(chars))
-              case other         => throw new EvalError(s"string->symbol: not a string: ${other.display}")
-        ),
-        (
-          "string-ref",
-          args =>
-            args match
-              case StrVal(chars) :: IntVal(idx) :: Nil => CharVal(chars(idx.toInt))
-              case _                                   => throw new EvalError("string-ref: expected (string, index)")
-        ),
-        (
-          "string-copy",
-          args =>
-            if args.length != 1 then throw new EvalError("string-copy: expected 1 argument")
-            args.head match
-              case StrVal(chars) => StrVal(chars.clone())
-              case other         => throw new EvalError(s"string-copy: not a string: ${other.display}")
-        ),
-        (
-          "string-set!",
-          args =>
-            args match
-              case StrVal(chars) :: IntVal(idx) :: CharVal(c) :: Nil =>
-                chars(idx.toInt) = c
-                BoolVal(true)
-              case _ => throw new EvalError("string-set!: expected (string, index, char)")
-        )
-      )
-    )
-
   private def appendList(lst: Value, tail: Value): Value =
     lst match
       case NilVal        => tail
@@ -230,7 +187,7 @@ object Builtins:
     if args.length != 1 then throw new EvalError("type predicate: expected 1 argument")
     BoolVal(pred(args.head))
 
-  private def requireInts(args: List[Value]): List[Long] =
+  private[ming] def requireInts(args: List[Value]): List[Long] =
     args.map {
       case IntVal(n) => n
       case other     => throw new EvalError(s"expected number, got ${other.display}")
@@ -258,3 +215,57 @@ object Builtins:
     val nums   = requireInts(args)
     val result = nums.zip(nums.tail).forall((a, b) => op(a, b))
     BoolVal(result)
+
+  private[ming] def eqCheck(a: Value, b: Value): Boolean =
+    (a, b) match
+      case (IntVal(x), IntVal(y))       => x == y
+      case (BoolVal(x), BoolVal(y))     => x == y
+      case (SymbolVal(x), SymbolVal(y)) => x == y
+      case (CharVal(x), CharVal(y))     => x == y
+      case (NilVal, NilVal)             => true
+      case _                            => a eq b
+
+  private[ming] def equalCheck(a: Value, b: Value): Boolean =
+    (a, b) match
+      case (PairVal(a1, a2), PairVal(b1, b2)) => equalCheck(a1, b1) && equalCheck(a2, b2)
+      case (StrVal(x), StrVal(y))             => java.util.Arrays.equals(x, y)
+      case _                                  => eqCheck(a, b)
+
+  private def isProperList(v: Value): Boolean =
+    v match
+      case NilVal          => true
+      case PairVal(_, cdr) => isProperList(cdr)
+      case _               => false
+
+  private def listRef(lst: Value, idx: Int): Value =
+    if idx < 0 then throw new EvalError("list-ref: index out of range")
+    var cur = lst
+    var i   = idx
+    while i > 0 do
+      cur match
+        case PairVal(_, cdr) => cur = cdr; i -= 1
+        case _               => throw new EvalError("list-ref: index out of range")
+    cur match
+      case PairVal(car, _) => car
+      case _               => throw new EvalError("list-ref: index out of range")
+
+  private def listTail(lst: Value, idx: Int): Value =
+    if idx < 0 then throw new EvalError("list-tail: index out of range")
+    var cur = lst
+    var i   = idx
+    while i > 0 do
+      cur match
+        case PairVal(_, cdr) => cur = cdr; i -= 1
+        case _               => throw new EvalError("list-tail: index out of range")
+    cur
+
+  private def assocLookup(key: Value, alist: Value): Value =
+    var cur = alist
+    while true do
+      cur match
+        case PairVal(pair @ PairVal(k, _), rest) =>
+          if equalCheck(key, k) then return pair
+          cur = rest
+        case NilVal => return BoolVal(false)
+        case _      => throw new EvalError("assoc: not a proper alist")
+    throw new AssertionError("unreachable")

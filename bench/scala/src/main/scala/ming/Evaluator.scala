@@ -78,6 +78,7 @@ object Evaluator extends EvalForms:
     env.define("call/cc", BuiltinVal("call/cc", dummy))
     env.define("call-with-current-continuation", BuiltinVal("call-with-current-continuation", dummy))
     env.define("apply", BuiltinVal("apply", dummy))
+    env.define("map", BuiltinVal("map", dummy))
 
   protected def evalBody(exprs: List[Expr], env: Env, k: K): Bounce =
     bodyRemaining = exprs
@@ -210,6 +211,9 @@ object Evaluator extends EvalForms:
       case BuiltinVal("apply", _) =>
         applyBuiltinApply(values, pos, k)
 
+      case BuiltinVal("map", _) =>
+        applyBuiltinMap(values, pos, k)
+
       case BuiltinVal(name, fn) =>
         try k(fn(values))
         catch
@@ -227,6 +231,35 @@ object Evaluator extends EvalForms:
     val prefixArgs = args.slice(1, args.length - 1).toList
     val trailing   = valueToList(args.last)
     applyProc(proc, prefixArgs ++ trailing, pos, k)
+
+  private def applyBuiltinMap(args: List[Value], pos: Option[Pos], k: K): Bounce =
+    if args.length < 2 then evalError("map: expected at least 2 arguments", pos)
+    val proc  = args.head
+    val lists = args.tail.map(EvalHelpers.valueToList)
+    mapLoop(proc, lists, Nil, pos, k)
+
+  private def mapLoop(
+    proc: Value,
+    lists: List[List[Value]],
+    acc: List[Value],
+    pos: Option[Pos],
+    k: K
+  ): Bounce =
+    if lists.head.isEmpty then
+      val result = acc.reverse.foldRight(Value.NilVal: Value)((v, t) => Value.PairVal(v, t))
+      k(result)
+    else
+      val heads = lists.map(_.head)
+      val tails = lists.map(_.tail)
+      applyProc(
+        proc,
+        heads,
+        pos,
+        v =>
+          depth += 1
+          if depth >= MaxDepth then Bounce.More(() => mapLoop(proc, tails, v :: acc, pos, k))
+          else mapLoop(proc, tails, v :: acc, pos, k)
+      )
 
   /** call/cc as special form — hybrid: CPS for escape, body-restart for reentrant. */
   private def evalCallCc(callccExpr: Expr, procExpr: Expr, env: Env, pos: Option[Pos], k: K): Bounce =
