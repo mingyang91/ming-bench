@@ -1328,13 +1328,13 @@ fn eval_cek(initial_expr: Expr, initial_env: Env, initial_kont: Rc<Kont>) -> Res
     loop {
         match state {
             State::Eval(expr, env) => {
-                state = match expr.kind.clone() {
-                    ExprKind::Integer(n) => State::Apply(Value::Integer(n)),
-                    ExprKind::Boolean(b) => State::Apply(Value::Boolean(b)),
-                    ExprKind::Str(s) => State::Apply(Value::Str(s)),
-                    ExprKind::Char(c) => State::Apply(Value::Char(c)),
+                state = match &expr.kind {
+                    ExprKind::Integer(n) => State::Apply(Value::Integer(*n)),
+                    ExprKind::Boolean(b) => State::Apply(Value::Boolean(*b)),
+                    ExprKind::Str(s) => State::Apply(Value::Str(s.clone())),
+                    ExprKind::Char(c) => State::Apply(Value::Char(*c)),
                     ExprKind::Symbol(name) => {
-                        let val = env_get(&env, &name).map_err(|e| expr.wrap_err(e))?;
+                        let val = env_get(&env, name).map_err(|e| expr.wrap_err(e))?;
                         State::Apply(val)
                     }
                     ExprKind::List(items) => {
@@ -1582,30 +1582,50 @@ fn eval_cek(initial_expr: Expr, initial_env: Env, initial_kont: Rc<Kont>) -> Res
                                 unreachable!()
                             }
                         } else {
-                            // Not a special form: check for macro, then function application
-                            if let Some(Value::Macro { literals, rules, def_env }) = env_get_macro(&env, s) {
+                            // Not a special form: single lookup for macro or function
+                            let resolved = env_get(&env, s).ok();
+                            if let Some(Value::Macro { literals, rules, def_env }) = resolved {
                                 let (expanded, eval_env) = expand_macro(&items, &expr, &literals, &rules, &def_env, &env)?;
                                 State::Eval(expanded, eval_env)
+                            } else if let Some(func) = resolved {
+                                // Already resolved the operator — skip Operator kont + symbol re-eval
+                                if items.len() == 1 {
+                                    apply_function(func, vec![], &expr, &mut kont)?
+                                } else {
+                                    let args = &items[1..];
+                                    let last_idx = args.len() - 1;
+                                    let last_expr = args[last_idx].clone();
+                                    let before = args[..last_idx].to_vec();
+                                    kont = Rc::new(Kont::Arg {
+                                        form: expr.clone(),
+                                        func,
+                                        collected: Vec::new(),
+                                        before_exprs: before,
+                                        env: env.clone(),
+                                        next: kont,
+                                    });
+                                    State::Eval(last_expr, env)
+                                }
                             } else {
-                            // Function application
-                            if items.len() == 1 {
-                                kont = Rc::new(Kont::Operator {
-                                    form: expr.clone(),
-                                    args: vec![],
-                                    env: env.clone(),
-                                    next: kont,
-                                });
-                                State::Eval(items[0].clone(), env)
-                            } else {
-                                kont = Rc::new(Kont::Operator {
-                                    form: expr.clone(),
-                                    args: items[1..].to_vec(),
-                                    env: env.clone(),
-                                    next: kont,
-                                });
-                                State::Eval(items[0].clone(), env)
+                                // Symbol not found — defer to normal eval which will produce error
+                                if items.len() == 1 {
+                                    kont = Rc::new(Kont::Operator {
+                                        form: expr.clone(),
+                                        args: vec![],
+                                        env: env.clone(),
+                                        next: kont,
+                                    });
+                                    State::Eval(items[0].clone(), env)
+                                } else {
+                                    kont = Rc::new(Kont::Operator {
+                                        form: expr.clone(),
+                                        args: items[1..].to_vec(),
+                                        env: env.clone(),
+                                        next: kont,
+                                    });
+                                    State::Eval(items[0].clone(), env)
+                                }
                             }
-                            } // close: macro check else
                         } // close: is_special else
                         } else {
                             // Non-symbol in operator position: function application
