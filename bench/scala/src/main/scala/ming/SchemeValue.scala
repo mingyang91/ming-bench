@@ -13,6 +13,7 @@ enum SchemeValue:
   case MutableStringVal(chars: Array[Char], pos: Option[SourcePos] = None)
   case BuiltinVal(name: String, func: List[SchemeValue] => SchemeValue)
   case ContinuationVal(contId: Long, bodyExprs: List[SchemeValue], bodyEnv: Environment)
+  case SyntaxRulesVal(name: String, literals: Set[String], rules: List[(SchemeValue, SchemeValue)], defEnv: Environment)
   case Void
 
   /** Get the source position of this value, if any. */
@@ -28,18 +29,19 @@ enum SchemeValue:
 
   /** Format for `write` — strings are quoted. */
   def display: String = this match
-    case IntVal(n, _)             => n.toString
-    case BoolVal(b, _)            => if b then "#t" else "#f"
-    case StringVal(s, _)          => s"\"$s\""
-    case MutableStringVal(cs, _)  => s"\"${String(cs)}\""
-    case SymbolVal(n, _)          => n
-    case CharVal(c, _)            => s"#\\$c"
-    case ListVal(es, _)           => s"(${es.map(_.display).mkString(" ")})"
-    case PairVal(_, _)            => displayPair(this)
-    case LambdaVal(_, _, _, _)    => "#<procedure>"
-    case BuiltinVal(n, _)         => s"#<builtin:$n>"
-    case ContinuationVal(_, _, _) => "#<continuation>"
-    case Void                     => ""
+    case IntVal(n, _)               => n.toString
+    case BoolVal(b, _)              => if b then "#t" else "#f"
+    case StringVal(s, _)            => s"\"$s\""
+    case MutableStringVal(cs, _)    => s"\"${String(cs)}\""
+    case SymbolVal(n, _)            => n
+    case CharVal(c, _)              => s"#\\$c"
+    case ListVal(es, _)             => s"(${es.map(_.display).mkString(" ")})"
+    case PairVal(_, _)              => displayPair(this)
+    case LambdaVal(_, _, _, _)      => "#<procedure>"
+    case BuiltinVal(n, _)           => s"#<builtin:$n>"
+    case ContinuationVal(_, _, _)   => "#<continuation>"
+    case SyntaxRulesVal(_, _, _, _) => "#<macro>"
+    case Void                       => ""
 
   /** Format for `display` — strings are unquoted. */
   def displayOutput: String = this match

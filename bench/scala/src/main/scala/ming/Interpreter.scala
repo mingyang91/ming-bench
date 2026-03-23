@@ -35,7 +35,7 @@ object Interpreter:
       curExpr match
         // Self-evaluating
         case IntVal(_, _) | BoolVal(_, _) | StringVal(_, _) | MutableStringVal(_, _) | CharVal(_, _) | PairVal(_, _) |
-            LambdaVal(_, _, _, _) | BuiltinVal(_, _) | ContinuationVal(_, _, _) | Void =>
+            LambdaVal(_, _, _, _) | BuiltinVal(_, _) | ContinuationVal(_, _, _) | SyntaxRulesVal(_, _, _, _) | Void =>
           return curExpr
 
         // Symbol lookup
@@ -89,7 +89,21 @@ object Interpreter:
             case Done(v)          => return v
             case TailCall(e, env) => curExpr = e; curEnv = env
 
-        // Procedure application
+        case ListVal(SymbolVal("define-syntax", _) :: args, pos) =>
+          return SpecialForms.evalDefineSyntax(args, pos, curEnv)
+
+        // Macro expansion
+        case ListVal((sym @ SymbolVal(name, _)) :: _, pos) =>
+          curEnv.get(name) match
+            case Some(SyntaxRulesVal(mn, lits, rules, defEnv)) =>
+              curExpr = Macro.expand(mn, lits, rules, defEnv, curExpr)
+            case _ =>
+              val args = curExpr.asInstanceOf[ListVal].elements.tail
+              evalApplication(sym, args, pos, curEnv) match
+                case Done(v)          => return v
+                case TailCall(e, env) => curExpr = e; curEnv = env
+
+        // Procedure application (non-symbol head)
         case ListVal(head :: args, pos) =>
           evalApplication(head, args, pos, curEnv) match
             case Done(v)          => return v

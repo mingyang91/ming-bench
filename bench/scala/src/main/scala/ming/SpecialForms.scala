@@ -98,6 +98,21 @@ object SpecialForms:
         Void
       case _ => throw new EvalError(posMsg("define: bad syntax", pos))
 
+  def evalDefineSyntax(args: List[SchemeValue], pos: Option[SourcePos], env: Environment): SchemeValue =
+    args match
+      case SymbolVal(name, _) :: ListVal(SymbolVal("syntax-rules", _) :: ListVal(literals, _) :: rules, _) :: Nil =>
+        val literalNames = literals.map {
+          case SymbolVal(n, _) => n
+          case _               => throw new EvalError(posMsg("syntax-rules: expected literal name", pos))
+        }.toSet
+        val parsedRules = rules.map {
+          case ListVal(pattern :: template :: Nil, _) => (pattern, template)
+          case _                                      => throw new EvalError(posMsg("syntax-rules: bad rule", pos))
+        }
+        env.define(name, SyntaxRulesVal(name, literalNames, parsedRules, env))
+        Void
+      case _ => throw new EvalError(posMsg("define-syntax: bad syntax", pos))
+
   def evalQuote(args: List[SchemeValue], pos: Option[SourcePos]): SchemeValue =
     args match
       case expr :: Nil => expr
