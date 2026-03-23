@@ -229,6 +229,11 @@ object BuiltinsExt:
     }
     ListVal(result)
 
+  def reverseOp(args: List[SchemeValue]): SchemeValue =
+    args match
+      case ListVal(es, _) :: Nil => ListVal(es.reverse)
+      case _                     => throw new EvalError("reverse: expected 1 list")
+
   // --- Character utilities (L13) ---
 
   def charAlphabeticCheck(args: List[SchemeValue]): SchemeValue =

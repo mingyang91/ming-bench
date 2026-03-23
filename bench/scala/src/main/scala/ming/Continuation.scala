@@ -18,13 +18,14 @@ class ContinuationJump(
 
 /** Manages continuation state during evaluation. */
 object ContinuationManager:
-  var bodyContext: BodyContext           = BodyContext(Nil, Environment())
-  var contextStack: List[BodyContext]    = Nil
-  var seqRemaining: List[SchemeValue]    = Nil
-  var seqEnv: Environment                = Environment()
-  var hasSameBodyFrame: Boolean          = false
-  var pendingReturn: Option[SchemeValue] = None
-  private var nextId: Long               = 0
+  var bodyContext: BodyContext                    = BodyContext(Nil, Environment())
+  var contextStack: List[BodyContext]             = Nil
+  var seqRemaining: List[SchemeValue]             = Nil
+  var seqEnv: Environment                         = Environment()
+  var hasSameBodyFrame: Boolean                   = false
+  var pendingReturn: Option[SchemeValue]          = None
+  var windStack: List[(SchemeValue, SchemeValue)] = Nil
+  private var nextId: Long                        = 0
 
   def freshId(): Long =
     val id = nextId
@@ -39,3 +40,4 @@ object ContinuationManager:
     seqRemaining = Nil
     seqEnv = Environment()
     hasSameBodyFrame = false
+    windStack = Nil
