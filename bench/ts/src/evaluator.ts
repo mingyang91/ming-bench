@@ -29,7 +29,8 @@ type SchemeVal =
   | { tag: 'vector'; val: SchemeVal[]; pos?: Pos }
   | { tag: 'values'; vals: SchemeVal[]; pos?: Pos }
   | { tag: 'record'; typeId: symbol; typeName: string; fields: Map<string, SchemeVal>; pos?: Pos }
-  | { tag: 'native'; fn: (args: SchemeVal[], p?: Pos) => SchemeVal; pos?: Pos };
+  | { tag: 'native'; fn: (args: SchemeVal[], p?: Pos) => SchemeVal; pos?: Pos }
+  | { tag: 'case-lambda'; clauses: { params: string[]; rest?: string; body: SchemeVal[] }[]; env: Env; pos?: Pos };
 
 interface MacroRule {
   pattern: SchemeVal[];  // pattern elements (excluding macro name)
@@ -510,6 +511,7 @@ function displayVal(v: SchemeVal, seen?: Set<SchemeVal>): string {
     case 'builtin':
     case 'continuation':
     case 'native':
+    case 'case-lambda':
       return '#<procedure>';
     case 'macro':
     case 'transformer-macro':
@@ -541,7 +543,7 @@ function quoteToScheme(v: SchemeVal): SchemeVal {
 // ── Hygienic Macros ─────────────────────────────────────────────────
 
 const SPECIAL_FORMS = new Set([
-  'quote', 'if', 'define', 'set!', 'lambda', 'and', 'or', 'begin',
+  'quote', 'if', 'define', 'set!', 'lambda', 'case-lambda', 'and', 'or', 'begin',
   'cond', 'let', 'let*', 'letrec', 'letrec*', 'case', 'do',
   'define-syntax', 'syntax-rules', 'syntax-case', 'syntax', 'with-syntax', 'else', 'define-record-type',
   'guard', 'dynamic-wind', 'when', 'unless', 'call-with-values', 'call/cc', 'call-with-current-continuation',
@@ -862,7 +864,7 @@ function applyBuiltin(op: string, evalArgs: SchemeVal[], p?: Pos, out?: string[]
     case 'procedure?': {
       if (evalArgs.length !== 1) throw posError('procedure?: need exactly one arg', p);
       const t = evalArgs[0].tag;
-      return { tag: 'boolean', val: t === 'lambda' || t === 'builtin' || t === 'continuation' };
+      return { tag: 'boolean', val: t === 'lambda' || t === 'builtin' || t === 'continuation' || t === 'case-lambda' };
     }
     case 'display': {
       if (evalArgs.length !== 1) throw posError('display: need exactly one arg', p);
@@ -1590,6 +1592,25 @@ function applyCPS(proc: SchemeVal, args: SchemeVal[], k: Cont, p?: Pos, out?: st
     if (proc.rest) callEnv.define(proc.rest, listToPairs(args.slice(proc.params.length)));
     return evalBodyCPS(proc.body, 0, callEnv, k, out);
   }
+  if (proc.tag === 'case-lambda') {
+    for (const clause of proc.clauses) {
+      if (clause.rest) {
+        if (args.length >= clause.params.length) {
+          const callEnv = new Env(proc.env);
+          for (let i = 0; i < clause.params.length; i++) callEnv.define(clause.params[i], args[i]);
+          callEnv.define(clause.rest, listToPairs(args.slice(clause.params.length)));
+          return evalBodyCPS(clause.body, 0, callEnv, k, out);
+        }
+      } else {
+        if (args.length === clause.params.length) {
+          const callEnv = new Env(proc.env);
+          for (let i = 0; i < clause.params.length; i++) callEnv.define(clause.params[i], args[i]);
+          return evalBodyCPS(clause.body, 0, callEnv, k, out);
+        }
+      }
+    }
+    throw posError(`case-lambda: no matching clause for ${args.length} arguments`, p);
+  }
   if (proc.tag === 'builtin') {
     if (proc.name === 'call/cc' || proc.name === 'call-with-current-continuation') {
       if (args.length !== 1) throw posError(`${proc.name}: need exactly one arg`, p);
@@ -1755,6 +1776,18 @@ function evalCPS(expr: SchemeVal, env: Env, k: Cont, out?: string[]): Bounce {
       const { params, rest } = parseParams(args[0], p);
       const body = args.slice(1);
       return k({ tag: 'lambda', params, rest, body, env });
+    }
+
+    if (op === 'case-lambda') {
+      if (args.length === 0) throw posError('case-lambda: need at least one clause', p);
+      const clauses = args.map(clause => {
+        if (clause.tag !== 'list' || clause.val.length < 2)
+          throw posError('case-lambda: bad clause', p);
+        const { params, rest } = parseParams(clause.val[0], p);
+        const body = clause.val.slice(1);
+        return { params, rest, body };
+      });
+      return k({ tag: 'case-lambda', clauses, env, pos: p });
     }
 
     if (op === 'and') {
