@@ -15,6 +15,7 @@ public sealed interface SchemeValue {
     record CharVal(char value, SourcePos pos) implements SchemeValue {}
     record BuiltinVal(String name) implements SchemeValue {}
     record Thunk(SchemeValue expr, Environment env) implements SchemeValue {}
+    record ContinuationVal(Continuation cont) implements SchemeValue {}
 
     default SourcePos sourcePos() {
         return switch (this) {
@@ -27,6 +28,7 @@ public sealed interface SchemeValue {
             case CharVal v -> v.pos();
             case BuiltinVal v -> SourcePos.NONE;
             case Thunk v -> SourcePos.NONE;
+            case ContinuationVal v -> SourcePos.NONE;
         };
     }
 
@@ -55,6 +57,7 @@ public sealed interface SchemeValue {
             case CharVal v -> "#\\" + v.value();
             case BuiltinVal v -> "#<procedure>";
             case Thunk v -> "#<thunk>";
+            case ContinuationVal v -> "#<continuation>";
         };
     }
 
@@ -73,6 +76,7 @@ public sealed interface SchemeValue {
                 yield sb.toString();
             }
             case Thunk v -> "#<thunk>";
+            case ContinuationVal v -> "#<continuation>";
             default -> display();
         };
     }

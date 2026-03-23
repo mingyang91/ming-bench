@@ -1,12 +1,29 @@
 package ming;
 
 import java.util.ArrayList;
+import java.util.IdentityHashMap;
 import java.util.List;
+import java.util.Map;
 
 public class Evaluator {
 
     private final Environment globalEnv = new Environment();
     private StringBuilder outputBuffer = new StringBuilder();
+
+    // --- call/cc replay state ---
+    /** Counter incremented each time call/cc is invoked. */
+    private int callccCounter = 0;
+    /** During replay: maps callccId → value to return. */
+    private int replayTargetId = -1;
+    private SchemeValue replayValue = null;
+    /** During replay: let-expression → captured environment (reuse instead of re-creating). */
+    private Map<SchemeValue, Environment> replayLetEnvMap = null;
+    /** Tracks let-expression → environment during normal evaluation (for capture). */
+    private final Map<SchemeValue, Environment> letEnvTracker = new IdentityHashMap<>();
+    /** Current top-level expression index (for continuation capture). */
+    private int currentExprIndex = 0;
+    /** Current top-level expression list (for continuation capture). */
+    private List<SchemeValue> currentTopLevelExprs = null;
 
     private static final String[] BUILTIN_NAMES = {
         "+", "-", "*", "/", "<", ">", "=", "<=", ">=", "not",
@@ -16,7 +33,8 @@ public class Evaluator {
         "string-append", "string-length", "substring",
         "string->number", "number->string", "symbol->string", "string->symbol",
         "string-ref", "string-set!", "string-copy",
-        "apply"
+        "apply",
+        "call/cc", "call-with-current-continuation"
     };
 
     {
@@ -30,10 +48,7 @@ public class Evaluator {
         var parser = new Parser(input);
         List<SchemeValue> exprs = parser.parseAll();
         if (exprs.isEmpty()) throw new EvalError("no expressions");
-        SchemeValue result = null;
-        for (SchemeValue expr : exprs) {
-            result = eval(expr, globalEnv);
-        }
+        SchemeValue result = evalTopLevel(exprs, 0);
         return result.display();
     }
 
@@ -42,11 +57,39 @@ public class Evaluator {
         var parser = new Parser(input);
         List<SchemeValue> exprs = parser.parseAll();
         if (exprs.isEmpty()) throw new EvalError("no expressions");
-        SchemeValue result = null;
-        for (SchemeValue expr : exprs) {
-            result = eval(expr, globalEnv);
-        }
+        SchemeValue result = evalTopLevel(exprs, 0);
         return new EvalResult(result.display(), outputBuffer.toString());
+    }
+
+    /**
+     * Evaluate top-level expressions with continuation replay support.
+     * When a saved continuation is invoked, ContinuationReturn is caught here
+     * and we replay from the captured expression index.
+     */
+    private SchemeValue evalTopLevel(List<SchemeValue> exprs, int startIndex) throws EvalError {
+        currentTopLevelExprs = exprs;
+        int idx = startIndex;
+        while (true) {
+            try {
+                SchemeValue result = null;
+                for (int i = idx; i < exprs.size(); i++) {
+                    currentExprIndex = i;
+                    result = eval(exprs.get(i), globalEnv);
+                }
+                // Clear replay state
+                replayTargetId = -1;
+                replayValue = null;
+                replayLetEnvMap = null;
+                return result;
+            } catch (ContinuationReturn cr) {
+                // Set up replay: re-evaluate from the captured expression index
+                callccCounter = 0;
+                replayTargetId = cr.cont.callccId;
+                replayValue = cr.value;
+                replayLetEnvMap = cr.cont.letEnvMap;
+                idx = cr.cont.exprIndex;
+            }
+        }
     }
 
     private static EvalError posError(SourcePos pos, String msg) {
@@ -75,6 +118,7 @@ public class Evaluator {
             case SchemeValue.LambdaVal v -> v;
             case SchemeValue.CharVal v -> v;
             case SchemeValue.BuiltinVal v -> v;
+            case SchemeValue.ContinuationVal v -> v;
             case SchemeValue.Thunk v -> v; // pass through
             case SchemeValue.SymbolVal v -> {
                 try {
@@ -105,7 +149,7 @@ public class Evaluator {
                     return args.getFirst();
                 }
                 case "lambda" -> { return evalLambda(args, env, pos); }
-                case "let" -> { return evalLetTail(args, env, pos); }
+                case "let" -> { return evalLetTail(args, env, pos, listVal); }
                 case "begin" -> { return evalBeginTail(args, env, pos); }
                 case "cond" -> { return evalCondTail(args, env, pos); }
                 case "set!" -> { return evalSet(args, env, pos); }
@@ -241,6 +285,10 @@ public class Evaluator {
             // Return Thunk for the last body expression (TCO)
             return new SchemeValue.Thunk(lambda.body().getLast(), callEnv);
         }
+        if (proc instanceof SchemeValue.ContinuationVal contVal) {
+            if (args.size() != 1) throw posError(pos, "continuation: need exactly 1 argument");
+            throw new ContinuationReturn(contVal.cont(), args.getFirst());
+        }
         if (proc instanceof SchemeValue.BuiltinVal builtin) {
             return applyBuiltinEvaled(builtin.name(), args, pos);
         }
@@ -302,6 +350,8 @@ public class Evaluator {
             case "string-copy" -> builtinStringCopy(args, env, pos);
             // L09 builtins
             case "apply" -> builtinApply(args, env, pos);
+            // L10 builtins
+            case "call/cc", "call-with-current-continuation" -> builtinCallCC(args, env, pos);
             default -> null;
         };
     }
@@ -378,7 +428,7 @@ public class Evaluator {
     // --- L03 special forms ---
 
     /** Let with TCO on last body expression. */
-    private SchemeValue evalLetTail(List<SchemeValue> args, Environment env, SourcePos pos) throws EvalError {
+    private SchemeValue evalLetTail(List<SchemeValue> args, Environment env, SourcePos pos, SchemeValue.ListVal letExpr) throws EvalError {
         if (args.size() < 2) throw posError(pos, "let: need bindings and body");
 
         // Named let: (let name ((var init) ...) body...)
@@ -408,10 +458,22 @@ public class Evaluator {
             for (SchemeValue init : inits) {
                 evaledInits.add(eval(init, env));
             }
+            letEnvTracker.put(letExpr, letEnv);
             return applyTail(lambda, evaledInits, pos);
         }
 
         // Regular let: (let ((var init) ...) body...)
+        // Check if we should reuse a captured environment during replay
+        if (replayLetEnvMap != null && replayLetEnvMap.containsKey(letExpr)) {
+            Environment letEnv = replayLetEnvMap.get(letExpr);
+            // Skip binding evaluation — reuse the captured mutable environment
+            // Eval all but last, return Thunk for last (TCO)
+            for (int i = 1; i < args.size() - 1; i++) {
+                eval(args.get(i), letEnv);
+            }
+            return new SchemeValue.Thunk(args.getLast(), letEnv);
+        }
+
         SchemeValue bindingsExpr = args.getFirst();
         if (!(bindingsExpr instanceof SchemeValue.ListVal bindingsList))
             throw posError(pos, "let: bindings must be a list");
@@ -425,6 +487,9 @@ public class Evaluator {
             SchemeValue val = eval(pair.elements().get(1), env);
             letEnv.define(s.name(), val);
         }
+
+        // Track this let environment for potential call/cc capture
+        letEnvTracker.put(letExpr, letEnv);
 
         // Eval all but last, return Thunk for last (TCO)
         for (int i = 1; i < args.size() - 1; i++) {
@@ -681,6 +746,44 @@ public class Evaluator {
         return applyTail(proc, allArgs, pos);
     }
 
+    // --- L10 builtins ---
+
+    private SchemeValue builtinCallCC(List<SchemeValue> args, Environment env, SourcePos pos) throws EvalError {
+        if (args.size() != 1) throw posError(pos, "call/cc: need exactly 1 argument");
+        SchemeValue proc = eval(args.getFirst(), env);
+
+        int myId = ++callccCounter;
+
+        // Check if we're replaying this call/cc
+        if (replayTargetId == myId && replayValue != null) {
+            SchemeValue val = replayValue;
+            replayTargetId = -1;
+            replayValue = null;
+            replayLetEnvMap = null;
+            return val;
+        }
+
+        // Normal execution: capture continuation and call the procedure
+        Continuation cont = new Continuation(myId, currentExprIndex,
+                currentTopLevelExprs, globalEnv, letEnvTracker);
+        SchemeValue contVal = new SchemeValue.ContinuationVal(cont);
+
+        try {
+            return evalContinuation(applyTail(proc, List.of(contVal), pos));
+        } catch (ContinuationReturn cr) {
+            if (cr.cont == cont) return cr.value; // escape: continuation invoked from lambda body
+            throw cr; // not our continuation, propagate
+        }
+    }
+
+    /** Resolve a value that may be a Thunk (trampoline). Used after applyTail. */
+    private SchemeValue evalContinuation(SchemeValue result) throws EvalError {
+        while (result instanceof SchemeValue.Thunk t) {
+            result = evalInner(t.expr(), t.env());
+        }
+        return result;
+    }
+
     /** Call a builtin by name with already-evaluated arguments. */
     private SchemeValue applyBuiltinEvaled(String name, List<SchemeValue> args, SourcePos pos) throws EvalError {
         return switch (name) {
@@ -855,6 +958,28 @@ public class Evaluator {
                 var allArgs = new ArrayList<SchemeValue>(middle);
                 allArgs.addAll(lst.elements());
                 yield applyTail(proc, allArgs, pos);
+            }
+            case "call/cc", "call-with-current-continuation" -> {
+                if (args.size() != 1) throw posError(pos, "call/cc: need exactly 1 argument");
+                SchemeValue proc = args.getFirst();
+                int myId = ++callccCounter;
+                // Check replay
+                if (replayTargetId == myId && replayValue != null) {
+                    SchemeValue val = replayValue;
+                    replayTargetId = -1;
+                    replayValue = null;
+                    replayLetEnvMap = null;
+                    yield val;
+                }
+                Continuation cont = new Continuation(myId, currentExprIndex,
+                        currentTopLevelExprs, globalEnv, letEnvTracker);
+                SchemeValue contVal = new SchemeValue.ContinuationVal(cont);
+                try {
+                    yield evalContinuation(applyTail(proc, List.of(contVal), pos));
+                } catch (ContinuationReturn cr) {
+                    if (cr.cont == cont) yield cr.value;
+                    throw cr;
+                }
             }
             default -> throw posError(pos, "unknown builtin: " + name);
         };
