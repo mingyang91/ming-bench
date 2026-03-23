@@ -1,3 +1,6 @@
+use std::cell::RefCell;
+use std::rc::Rc;
+
 use crate::scheme::error::EvalError;
 use crate::scheme::value::{Span, Value};
 
@@ -24,7 +27,11 @@ struct Token {
 enum TokenKind {
     LParen,
     RParen,
+    HashLParen,
     Quote,
+    Quasiquote,
+    Unquote,
+    UnquoteSplicing,
     Syntax,
     Symbol(String),
     Int(i64),
@@ -49,7 +56,7 @@ fn tokenize(input: &str) -> Result<Vec<Token>, EvalError> {
                 line += 1;
                 col = 1;
             }
-            ' ' | '\t' | '\r' => {
+            ' ' | '\t' | '\r' | '\x0c' => {
                 i += 1;
                 col += 1;
             }
@@ -110,6 +117,22 @@ fn tokenize(input: &str) -> Result<Vec<Token>, EvalError> {
                 i += 1;
                 col += 1;
             }
+            '`' => {
+                tokens.push(Token { kind: TokenKind::Quasiquote, line, col });
+                i += 1;
+                col += 1;
+            }
+            ',' => {
+                if i + 1 < chars.len() && chars[i + 1] == '@' {
+                    tokens.push(Token { kind: TokenKind::UnquoteSplicing, line, col });
+                    i += 2;
+                    col += 2;
+                } else {
+                    tokens.push(Token { kind: TokenKind::Unquote, line, col });
+                    i += 1;
+                    col += 1;
+                }
+            }
             '#' => {
                 let tok_line = line;
                 let tok_col = col;
@@ -157,6 +180,11 @@ fn tokenize(input: &str) -> Result<Vec<Token>, EvalError> {
                                 }
                             };
                             tokens.push(Token { kind: TokenKind::Char(ch), line: tok_line, col: tok_col });
+                        }
+                        '(' => {
+                            tokens.push(Token { kind: TokenKind::HashLParen, line: tok_line, col: tok_col });
+                            i += 2;
+                            col += 2;
                         }
                         _ => {
                             return Err(EvalError::Parse {
@@ -214,6 +242,22 @@ fn parse_expr(tokens: &[Token], pos: usize) -> Result<(Value, usize), EvalError>
                 if matches!(tokens[i].kind, TokenKind::RParen) {
                     return Ok((Value::List(elems, Some(span)), i + 1));
                 }
+                // Check for dotted pair: (a b . c)
+                if matches!(&tokens[i].kind, TokenKind::Symbol(s) if s == ".") {
+                    i += 1; // skip the dot
+                    let (cdr_val, next) = parse_expr(tokens, i)?;
+                    i = next;
+                    if i >= tokens.len() || !matches!(tokens[i].kind, TokenKind::RParen) {
+                        return Err(EvalError::Parse {
+                            msg: "expected ')' after dotted pair cdr".into(),
+                        });
+                    }
+                    // Build the improper list: (a b . c) => Pair(a, Pair(b, c))
+                    let result = elems.into_iter().rev().fold(cdr_val, |acc, elem| {
+                        Value::Pair(Rc::new(RefCell::new((elem, acc))))
+                    });
+                    return Ok((result, i + 1));
+                }
                 let (expr, next) = parse_expr(tokens, i)?;
                 elems.push(expr);
                 i = next;
@@ -235,6 +279,49 @@ fn parse_expr(tokens: &[Token], pos: usize) -> Result<(Value, usize), EvalError>
             Ok((
                 Value::List(
                     vec![Value::Symbol("syntax".into(), Some(span)), inner],
+                    Some(span),
+                ),
+                next,
+            ))
+        }
+        TokenKind::HashLParen => {
+            let mut elems = Vec::new();
+            let mut i = pos + 1;
+            while i < tokens.len() {
+                if matches!(tokens[i].kind, TokenKind::RParen) {
+                    return Ok((Value::Vector(Rc::new(RefCell::new(elems))), i + 1));
+                }
+                let (expr, next) = parse_expr(tokens, i)?;
+                elems.push(expr);
+                i = next;
+            }
+            Err(EvalError::Parse { msg: "unclosed vector literal".into() })
+        }
+        TokenKind::Quasiquote => {
+            let (inner, next) = parse_expr(tokens, pos + 1)?;
+            Ok((
+                Value::List(
+                    vec![Value::Symbol("quasiquote".into(), Some(span)), inner],
+                    Some(span),
+                ),
+                next,
+            ))
+        }
+        TokenKind::Unquote => {
+            let (inner, next) = parse_expr(tokens, pos + 1)?;
+            Ok((
+                Value::List(
+                    vec![Value::Symbol("unquote".into(), Some(span)), inner],
+                    Some(span),
+                ),
+                next,
+            ))
+        }
+        TokenKind::UnquoteSplicing => {
+            let (inner, next) = parse_expr(tokens, pos + 1)?;
+            Ok((
+                Value::List(
+                    vec![Value::Symbol("unquote-splicing".into(), Some(span)), inner],
                     Some(span),
                 ),
                 next,

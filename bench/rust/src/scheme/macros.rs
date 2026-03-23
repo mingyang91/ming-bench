@@ -106,9 +106,17 @@ fn match_single(
         Value::Rational(an, ad) => matches!(input, Value::Rational(bn, bd) if an == bn && ad == bd),
         Value::String(a) => matches!(input, Value::String(b) if a == b),
         Value::Char(a) => matches!(input, Value::Char(b) if a == b),
+        Value::Vector(pat_elems) => {
+            let Value::Vector(inp_elems) = input else {
+                return false;
+            };
+            let pat_vec = pat_elems.borrow();
+            let inp_vec = inp_elems.borrow();
+            match_pattern(&pat_vec, &inp_vec, literals, bindings)
+        }
         Value::Pair(_) | Value::Builtin(_) | Value::Closure { .. }
         | Value::Continuation(_) | Value::SyntaxRules { .. }
-        | Value::Vector(_) | Value::Values(_) | Value::Record { .. }
+        | Value::Values(_) | Value::Record { .. }
         | Value::MacroTransformer { .. } | Value::CaseLambda { .. } | Value::Void => false,
     }
 }
@@ -205,11 +213,44 @@ pub fn expand_template(
             }
             Ok(Value::List(result, *span))
         }
+        Value::Vector(elems_cell) => {
+            let elems = elems_cell.borrow();
+            let mut result = Vec::new();
+            let mut i = 0;
+            while i < elems.len() {
+                if i + 1 < elems.len() && is_ellipsis(&elems[i + 1]) {
+                    let sub = &elems[i];
+                    let items = find_ellipsis_var(sub, bindings)
+                        .and_then(|var| match bindings.get(&var) {
+                            Some(Binding::List(items)) => Some((var, items.clone())),
+                            _ => None,
+                        });
+                    if let Some((var_name, items)) = items {
+                        for item in &items {
+                            let mut sub_bindings = bindings.clone();
+                            sub_bindings.insert(var_name.clone(), Binding::Single(item.clone()));
+                            result.push(expand_template(
+                                sub, &sub_bindings, literals,
+                                def_env, use_env, counter, gensyms,
+                            )?);
+                        }
+                    }
+                    i += 2;
+                } else {
+                    result.push(expand_template(
+                        &elems[i], bindings, literals,
+                        def_env, use_env, counter, gensyms,
+                    )?);
+                    i += 1;
+                }
+            }
+            Ok(Value::Vector(Rc::new(RefCell::new(result))))
+        }
         Value::Int(_) | Value::Float(_) | Value::Rational(_, _)
         | Value::Bool(_) | Value::String(_) | Value::Char(_)
         | Value::Pair(_) | Value::Builtin(_) | Value::Closure { .. }
         | Value::Continuation(_) | Value::SyntaxRules { .. }
-        | Value::Vector(_) | Value::Values(_) | Value::Record { .. }
+        | Value::Values(_) | Value::Record { .. }
         | Value::MacroTransformer { .. } | Value::CaseLambda { .. } | Value::Void => Ok(template.clone()),
     }
 }
@@ -231,11 +272,20 @@ pub fn find_ellipsis_var(template: &Value, bindings: &HashMap<String, Binding>) 
             }
             None
         }
+        Value::Vector(elems_cell) => {
+            let elems = elems_cell.borrow();
+            for elem in elems.iter() {
+                if let Some(var) = find_ellipsis_var(elem, bindings) {
+                    return Some(var);
+                }
+            }
+            None
+        }
         Value::Int(_) | Value::Float(_) | Value::Rational(_, _)
         | Value::Bool(_) | Value::String(_) | Value::Char(_)
         | Value::Pair(_) | Value::Builtin(_) | Value::Closure { .. }
         | Value::Continuation(_) | Value::SyntaxRules { .. }
-        | Value::Vector(_) | Value::Values(_) | Value::Record { .. }
+        | Value::Values(_) | Value::Record { .. }
         | Value::MacroTransformer { .. } | Value::CaseLambda { .. } | Value::Void => None,
     }
 }

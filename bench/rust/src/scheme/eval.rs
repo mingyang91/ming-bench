@@ -35,7 +35,7 @@ const BUILTINS: &[&str] = &[
     "exact?", "inexact?", "exact->inexact", "inexact->exact",
     "numerator", "denominator", "rational?", "integer?",
     "set-car!", "set-cdr!",
-    "for-each", "assq", "assv", "memq", "member",
+    "for-each", "assq", "assv", "memq", "memv", "member",
     "cadr", "cddr", "caar", "cdar", "caddr", "cdddr", "caaar", "caddar",
     "gcd", "lcm", "error", "procedure?",
     "truncate", "floor", "ceiling", "round",
@@ -98,6 +98,9 @@ enum Frame {
         body: Vec<Value>,
         remaining_clauses: Vec<Value>,
         env: Rc<RefCell<Env>>,
+    },
+    CondArrow {
+        test_result: Value,
     },
     LetBindings {
         done: Vec<(String, Value)>,
@@ -412,6 +415,15 @@ impl Machine {
                 "lambda" => return sf_lambda(&elems[1..], span, env),
                 "case-lambda" => return sf_case_lambda(&elems[1..], span, env),
                 "quote" => return sf_quote(&elems[1..], span),
+                "quasiquote" => {
+                    if elems.len() != 2 {
+                        return Err(EvalError::Parse {
+                            msg: "quasiquote requires exactly 1 argument".into(),
+                        }.at(span));
+                    }
+                    let expanded = expand_quasiquote(&elems[1], 0);
+                    return Ok(Control::Eval(expanded, Rc::clone(env)));
+                }
                 "let" => return self.sf_let(&elems[1..], span, env),
                 "begin" => return self.eval_body_in(&elems[1..], env),
                 "cond" => return self.sf_cond(&elems[1..], env),
@@ -563,12 +575,22 @@ impl Machine {
                 if !is_false(&val) {
                     if body.is_empty() {
                         Ok(Control::Continue(val))
+                    } else if body.len() == 2
+                        && matches!(&body[0], Value::Symbol(s, _) if s == "=>")
+                    {
+                        // (cond (test => proc)) — apply proc to test result
+                        self.kont.push(Frame::CondArrow { test_result: val });
+                        Ok(Control::Eval(body[1].clone(), env))
                     } else {
                         self.eval_body_in(&body, &env)
                     }
                 } else {
                     self.start_cond(&remaining_clauses, &env)
                 }
+            }
+            Frame::CondArrow { test_result } => {
+                // val is the proc, apply it to test_result
+                self.apply_func(val, vec![test_result], None)
             }
             Frame::LetBindings { mut done, current_name, mut remaining, body, outer_env } => {
                 done.push((current_name, val));
@@ -1276,9 +1298,29 @@ impl Machine {
                 env.borrow_mut().define(name.clone(), closure);
                 Ok(Control::Continue(Value::Void))
             }
+            Value::Pair(cell) => {
+                // (define (name . rest) body) — function with only rest param
+                let (car, cdr) = {
+                    let b = cell.borrow();
+                    (b.0.clone(), b.1.clone())
+                };
+                // Extract name and parameters from the pair structure
+                let (name, params, rest_param) = extract_define_pair_sig(&car, &cdr, span)?;
+                let body = args[1..].to_vec();
+                if body.is_empty() {
+                    return Err(EvalError::Parse {
+                        msg: "define: empty body".into(),
+                    }.at(span));
+                }
+                let closure = Value::Closure {
+                    params, rest_param, body, env: Rc::clone(env),
+                };
+                env.borrow_mut().define(name, closure);
+                Ok(Control::Continue(Value::Void))
+            }
             Value::Int(_) | Value::Float(_) | Value::Rational(_, _)
             | Value::Bool(_) | Value::String(_) | Value::Char(_)
-            | Value::Builtin(_) | Value::Closure { .. } | Value::Pair(_)
+            | Value::Builtin(_) | Value::Closure { .. }
             | Value::Continuation(_) | Value::SyntaxRules { .. }
             | Value::Vector(_) | Value::Values(_) | Value::Record { .. }
             | Value::MacroTransformer { .. } | Value::CaseLambda { .. } | Value::Void => {
@@ -2365,12 +2407,22 @@ fn sf_lambda(
             msg: "lambda requires params and body".into(),
         }.at(span));
     }
-    let Value::List(param_list, _) = &args[0] else {
-        return Err(EvalError::Parse {
+    let (params, rest_param) = match &args[0] {
+        Value::List(param_list, _) => parse_params(param_list, span, "lambda")?,
+        Value::Symbol(name, _) => (vec![], Some(name.clone())),
+        Value::Pair(cell) => {
+            let (car, cdr) = {
+                let b = cell.borrow();
+                (b.0.clone(), b.1.clone())
+            };
+            let (name, mut p, r) = extract_define_pair_sig(&car, &cdr, span)?;
+            p.insert(0, name);
+            (p, r)
+        }
+        _ => return Err(EvalError::Parse {
             msg: "lambda: expected parameter list".into(),
-        }.at(span));
+        }.at(span)),
     };
-    let (params, rest_param) = parse_params(param_list, span, "lambda")?;
     let body = args[1..].to_vec();
     Ok(Control::Continue(Value::Closure {
         params, rest_param, body, env: Rc::clone(env),
@@ -2397,12 +2449,29 @@ fn sf_case_lambda(
                 msg: "case-lambda: clause must have params and body".into(),
             }.at(span));
         }
-        let Value::List(param_list, _) = &elems[0] else {
-            return Err(EvalError::Parse {
+        let (params, rest_param) = match &elems[0] {
+            Value::List(param_list, _) => parse_params(param_list, span, "case-lambda")?,
+            Value::Symbol(name, _) => (vec![], Some(name.clone())),
+            Value::Pair(cell) => {
+                let (car, cdr) = {
+                    let b = cell.borrow();
+                    (b.0.clone(), b.1.clone())
+                };
+                let (_, p, r) = extract_define_pair_sig(&car, &cdr, span)?;
+                // Prepend the car as first param
+                let Value::Symbol(first, _) = &car else {
+                    return Err(EvalError::Parse {
+                        msg: "case-lambda: expected parameter name".into(),
+                    }.at(span));
+                };
+                let mut params = vec![first.clone()];
+                params.extend(p);
+                (params, r)
+            }
+            _ => return Err(EvalError::Parse {
                 msg: "case-lambda: expected parameter list".into(),
-            }.at(span));
+            }.at(span)),
         };
-        let (params, rest_param) = parse_params(param_list, span, "case-lambda")?;
         let body = elems[1..].to_vec();
         clauses.push((params, rest_param, body));
     }
@@ -2412,6 +2481,106 @@ fn sf_case_lambda(
     }))
 }
 
+fn is_splicing_unquote(val: &Value) -> bool {
+    let Value::List(inner, _) = val else { return false };
+    inner.len() == 2 && matches!(&inner[0], Value::Symbol(s, _) if s == "unquote-splicing")
+}
+
+/// Expand quasiquote template into evaluable code.
+/// `depth` tracks nesting: 0 = outermost quasiquote.
+fn expand_quasiquote(template: &Value, depth: usize) -> Value {
+    match template {
+        Value::List(elems, span) if !elems.is_empty() => {
+            // Check for (unquote expr) at this depth
+            if let Value::Symbol(s, _) = &elems[0] {
+                if s == "unquote" && elems.len() == 2 {
+                    if depth == 0 {
+                        return elems[1].clone();
+                    }
+                    // Nested unquote — decrease depth
+                    let inner = expand_quasiquote(&elems[1], depth - 1);
+                    return Value::List(
+                        vec![Value::Symbol("list".into(), None),
+                             Value::List(vec![Value::Symbol("quote".into(), None),
+                                              Value::Symbol("unquote".into(), None)], None),
+                             inner],
+                        *span,
+                    );
+                }
+                if s == "quasiquote" && elems.len() == 2 {
+                    // Nested quasiquote — increase depth
+                    let inner = expand_quasiquote(&elems[1], depth + 1);
+                    return Value::List(
+                        vec![Value::Symbol("list".into(), None),
+                             Value::List(vec![Value::Symbol("quote".into(), None),
+                                              Value::Symbol("quasiquote".into(), None)], None),
+                             inner],
+                        *span,
+                    );
+                }
+            }
+            // General list: build with append to handle splicing
+            let mut parts = Vec::new();
+            for elem in elems {
+                if depth == 0 && is_splicing_unquote(elem) {
+                    if let Value::List(inner, _) = elem {
+                        parts.push(inner[1].clone());
+                        continue;
+                    }
+                }
+                let expanded = expand_quasiquote(elem, depth);
+                parts.push(Value::List(
+                    vec![Value::Symbol("list".into(), None), expanded],
+                    None,
+                ));
+            }
+            if parts.len() == 1 {
+                parts.into_iter().next().expect("single part")
+            } else {
+                let mut result = vec![Value::Symbol("append".into(), None)];
+                result.extend(parts);
+                Value::List(result, *span)
+            }
+        }
+        Value::Pair(cell) => {
+            let (car, cdr) = {
+                let b = cell.borrow();
+                (b.0.clone(), b.1.clone())
+            };
+            // Check for (unquote expr) as a pair
+            if let Value::Symbol(s, _) = &car {
+                if s == "unquote"
+                    && depth == 0 {
+                        if let Value::Pair(inner_cell) = &cdr {
+                            let b = inner_cell.borrow();
+                            return b.0.clone();
+                        }
+                    }
+            }
+            let exp_car = expand_quasiquote(&car, depth);
+            let exp_cdr = expand_quasiquote(&cdr, depth);
+            Value::List(
+                vec![Value::Symbol("cons".into(), None), exp_car, exp_cdr],
+                None,
+            )
+        }
+        Value::Vector(elems_cell) => {
+            let elems = elems_cell.borrow();
+            let list_form = Value::List(elems.to_vec(), None);
+            let expanded = expand_quasiquote(&list_form, depth);
+            Value::List(
+                vec![Value::Symbol("list->vector".into(), None), expanded],
+                None,
+            )
+        }
+        // Atoms are self-quoting
+        _ => Value::List(
+            vec![Value::Symbol("quote".into(), None), template.clone()],
+            None,
+        ),
+    }
+}
+
 fn sf_quote(args: &[Value], span: Option<Span>) -> Result<Control, EvalError> {
     if args.len() != 1 {
         return Err(EvalError::Parse {
@@ -2419,6 +2588,49 @@ fn sf_quote(args: &[Value], span: Option<Span>) -> Result<Control, EvalError> {
         }.at(span));
     }
     Ok(Control::Continue(args[0].clone()))
+}
+
+/// Extract function name, params, and rest param from a dotted-pair define signature.
+/// Handles (name . rest) and (name p1 p2 ... . rest)
+fn extract_define_pair_sig(
+    car: &Value, cdr: &Value, span: Option<Span>,
+) -> Result<(String, Vec<String>, Option<String>), EvalError> {
+    let Value::Symbol(name, _) = car else {
+        return Err(EvalError::Parse {
+            msg: format!("define: expected function name, got {car}"),
+        }.at(span));
+    };
+    // Walk the cdr to collect params and rest
+    let mut params = Vec::new();
+    let mut current = cdr.clone();
+    loop {
+        match current {
+            Value::Pair(cell) => {
+                let (c, d) = {
+                    let b = cell.borrow();
+                    (b.0.clone(), b.1.clone())
+                };
+                let Value::Symbol(param, _) = c else {
+                    return Err(EvalError::Parse {
+                        msg: format!("define: expected parameter name, got {c}"),
+                    }.at(span));
+                };
+                params.push(param);
+                current = d;
+            }
+            Value::Symbol(rest, _) => {
+                return Ok((name.clone(), params, Some(rest)));
+            }
+            Value::List(elems, _) if elems.is_empty() => {
+                return Ok((name.clone(), params, None));
+            }
+            other => {
+                return Err(EvalError::Parse {
+                    msg: format!("define: unexpected in parameter list: {other}"),
+                }.at(span));
+            }
+        }
+    }
 }
 
 fn parse_params(
@@ -2524,7 +2736,7 @@ fn apply_builtin(
             Ok(Value::Bool(is_false(&args[0])))
         }
         "cons" | "car" | "cdr" | "null?" | "list" | "append" | "reverse" | "length"
-        | "set-car!" | "set-cdr!" | "assq" | "assv" | "memq" | "member"
+        | "set-car!" | "set-cdr!" | "assq" | "assv" | "memq" | "memv" | "member"
         | "cadr" | "cddr" | "caar" | "cdar" | "caddr" | "cdddr" | "caaar" | "caddar" =>
             apply_list_builtin(name, args),
         "string?" => Ok(Value::Bool(args.len() == 1 && matches!(&args[0], Value::String(_)))),
@@ -2720,69 +2932,15 @@ fn apply_builtin(
         }
         "vector" | "make-vector" | "vector-ref" | "vector-set!" | "vector-length"
         | "vector?" | "vector->list" | "list->vector" => apply_vector_builtin(name, args),
-        "gcd" => {
-            if args.len() != 2 {
-                return Err(EvalError::WrongArgCount { expected: 2, got: args.len() });
-            }
-            let a = match &args[0] {
-                Value::Int(n) => *n,
-                other => return Err(EvalError::TypeMismatch {
-                    expected: "integer".into(), got: format!("{other}"),
-                }),
-            };
-            let b = match &args[1] {
-                Value::Int(n) => *n,
-                other => return Err(EvalError::TypeMismatch {
-                    expected: "integer".into(), got: format!("{other}"),
-                }),
-            };
-            fn gcd_impl(mut a: i64, mut b: i64) -> i64 {
-                a = a.abs();
-                b = b.abs();
-                while b != 0 {
-                    let t = b;
-                    b = a % b;
-                    a = t;
-                }
-                a
-            }
-            Ok(Value::Int(gcd_impl(a, b)))
-        }
-        "lcm" => {
-            if args.len() != 2 {
-                return Err(EvalError::WrongArgCount { expected: 2, got: args.len() });
-            }
-            let a = match &args[0] {
-                Value::Int(n) => *n,
-                other => return Err(EvalError::TypeMismatch {
-                    expected: "integer".into(), got: format!("{other}"),
-                }),
-            };
-            let b = match &args[1] {
-                Value::Int(n) => *n,
-                other => return Err(EvalError::TypeMismatch {
-                    expected: "integer".into(), got: format!("{other}"),
-                }),
-            };
-            fn gcd_impl2(mut a: i64, mut b: i64) -> i64 {
-                a = a.abs();
-                b = b.abs();
-                while b != 0 {
-                    let t = b;
-                    b = a % b;
-                    a = t;
-                }
-                a
-            }
-            let g = gcd_impl2(a, b);
-            let result = if g == 0 { 0 } else { (a / g * b).abs() };
-            Ok(Value::Int(result))
-        }
+        "gcd" | "lcm" => apply_gcd_lcm(name, args),
         "error" => {
             if args.is_empty() {
                 return Err(EvalError::Raised { value: "error".into() });
             }
-            let msg = format!("{}", args[0]);
+            let mut msg = format!("{}", args[0]);
+            for arg in &args[1..] {
+                msg.push_str(&format!(" {arg}"));
+            }
             Err(EvalError::Raised { value: msg })
         }
         "procedure?" => {
@@ -2806,6 +2964,43 @@ fn apply_builtin(
                 return Err(EvalError::WrongArgCount { expected: 2, got: args.len() });
             }
             Ok(args[1].clone())
+        }
+        _ => Err(EvalError::UnboundVariable { name: name.into() }),
+    }
+}
+
+fn apply_gcd_lcm(name: &str, args: &[Value]) -> Result<Value, EvalError> {
+    if args.len() != 2 {
+        return Err(EvalError::WrongArgCount { expected: 2, got: args.len() });
+    }
+    let a = match &args[0] {
+        Value::Int(n) => *n,
+        other => return Err(EvalError::TypeMismatch {
+            expected: "integer".into(), got: format!("{other}"),
+        }),
+    };
+    let b = match &args[1] {
+        Value::Int(n) => *n,
+        other => return Err(EvalError::TypeMismatch {
+            expected: "integer".into(), got: format!("{other}"),
+        }),
+    };
+    fn gcd_impl(mut a: i64, mut b: i64) -> i64 {
+        a = a.abs();
+        b = b.abs();
+        while b != 0 {
+            let t = b;
+            b = a % b;
+            a = t;
+        }
+        a
+    }
+    match name {
+        "gcd" => Ok(Value::Int(gcd_impl(a, b))),
+        "lcm" => {
+            let g = gcd_impl(a, b);
+            let result = if g == 0 { 0 } else { (a / g * b).abs() };
+            Ok(Value::Int(result))
         }
         _ => Err(EvalError::UnboundVariable { name: name.into() }),
     }
@@ -3100,7 +3295,7 @@ fn apply_list_builtin(name: &str, args: &[Value]) -> Result<Value, EvalError> {
             }
             Ok(Value::Bool(false))
         }
-        "memq" | "member" | "cadr" | "cddr" | "caar" | "cdar"
+        "memq" | "memv" | "member" | "cadr" | "cddr" | "caar" | "cdar"
         | "caddr" | "cdddr" | "caaar" | "caddar" => {
             apply_list_search_builtin(name, args)
         }
@@ -3967,6 +4162,19 @@ fn compare_nums(args: &[Value], cmp: fn(f64, f64) -> bool) -> Result<Value, Eval
     Ok(Value::Bool(result))
 }
 
+fn is_eqv(a: &Value, b: &Value) -> bool {
+    match (a, b) {
+        (Value::Symbol(x, _), Value::Symbol(y, _)) => x == y,
+        (Value::Bool(x), Value::Bool(y)) => x == y,
+        (Value::Int(x), Value::Int(y)) => x == y,
+        (Value::Char(x), Value::Char(y)) => x == y,
+        (Value::List(a, _), Value::List(b, _)) => a.is_empty() && b.is_empty(),
+        (Value::Pair(x), Value::Pair(y)) => Rc::ptr_eq(x, y),
+        (Value::Void, Value::Void) => true,
+        _ => false,
+    }
+}
+
 fn is_eq_identity(a: &Value, b: &Value) -> bool {
     match (a, b) {
         (Value::Symbol(x, _), Value::Symbol(y, _)) => x == y,
@@ -4001,6 +4209,34 @@ fn apply_list_search_builtin(name: &str, args: &[Value]) -> Result<Value, EvalEr
                             (b.0.clone(), b.1.clone())
                         };
                         if is_eq_identity(&args[0], &car) {
+                            return Ok(cur);
+                        }
+                        cur = cdr;
+                    }
+                    _ => return Ok(Value::Bool(false)),
+                }
+            }
+        }
+        "memv" => {
+            if args.len() != 2 {
+                return Err(EvalError::WrongArgCount { expected: 2, got: args.len() });
+            }
+            let mut cur = args[1].clone();
+            loop {
+                match cur {
+                    Value::List(ref elems, _) if elems.is_empty() => return Ok(Value::Bool(false)),
+                    Value::List(ref elems, _) => {
+                        if is_eqv(&args[0], &elems[0]) {
+                            return Ok(cur);
+                        }
+                        cur = Value::List(elems[1..].to_vec(), None);
+                    }
+                    Value::Pair(ref cell) => {
+                        let (car, cdr) = {
+                            let b = cell.borrow();
+                            (b.0.clone(), b.1.clone())
+                        };
+                        if is_eqv(&args[0], &car) {
                             return Ok(cur);
                         }
                         cur = cdr;
