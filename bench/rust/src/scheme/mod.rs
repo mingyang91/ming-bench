@@ -144,6 +144,7 @@ enum ExprKind {
     Integer(i64),
     Boolean(bool),
     Str(String),
+    Char(char),
     Symbol(String),
     List(Vec<Expr>),
 }
@@ -195,6 +196,24 @@ fn env_get(env: &Env, name: &str) -> Result<Value, EvalError> {
 
 fn env_set(env: &Env, name: String, val: Value) {
     env.borrow_mut().bindings.insert(name, val);
+}
+
+fn env_update(env: &Env, name: &str, val: Value) -> Result<(), EvalError> {
+    let mut cur = env.clone();
+    loop {
+        {
+            let mut inner = cur.borrow_mut();
+            if inner.bindings.contains_key(name) {
+                inner.bindings.insert(name.to_string(), val);
+                return Ok(());
+            }
+        }
+        let parent = cur.borrow().parent.clone();
+        match parent {
+            Some(p) => cur = p,
+            None => return Err(EvalError::UnboundVariable(name.to_string())),
+        }
+    }
 }
 
 // --- Builtins ---
@@ -519,6 +538,16 @@ fn builtin_string_to_symbol(args: &[Value]) -> Result<Value, EvalError> {
     }
 }
 
+fn builtin_string_copy(args: &[Value]) -> Result<Value, EvalError> {
+    if args.len() != 1 {
+        return Err(EvalError::Arity("string-copy requires exactly 1 argument".into()));
+    }
+    match &args[0] {
+        Value::Str(s) => Ok(Value::Str(s.clone())),
+        _ => Err(EvalError::Type("string-copy: expected string".into())),
+    }
+}
+
 fn builtin_string_ref(args: &[Value]) -> Result<Value, EvalError> {
     if args.len() != 2 {
         return Err(EvalError::Arity("string-ref requires exactly 2 arguments".into()));
@@ -571,6 +600,7 @@ fn default_env() -> Env {
         ("symbol->string", builtin_symbol_to_string),
         ("string->symbol", builtin_string_to_symbol),
         ("string-ref", builtin_string_ref),
+        ("string-copy", builtin_string_copy),
     ];
     for &(name, func) in builtins {
         env_set(&env, name.to_string(), Value::Builtin(name, func));
@@ -656,6 +686,30 @@ fn tokenize(input: &str) -> Vec<Token> {
                 }
                 tokens.push(Token { text: s, line: start_line, col: start_col });
             }
+            '#' if i + 1 < chars.len() && chars[i + 1] == '\\' => {
+                let start_col = col;
+                i += 2; // skip #\
+                col += 2;
+                if i < chars.len() {
+                    // Check for named characters like #\space, #\newline
+                    let ch_start = i;
+                    if chars[i].is_alphabetic() {
+                        while i < chars.len() && chars[i].is_alphabetic() {
+                            i += 1;
+                            col += 1;
+                        }
+                        let name = &chars[ch_start..i];
+                        let name_str: String = name.iter().collect();
+                        let tok = format!("#\\{}", name_str);
+                        tokens.push(Token { text: tok, line, col: start_col });
+                    } else {
+                        let tok = format!("#\\{}", chars[i]);
+                        i += 1;
+                        col += 1;
+                        tokens.push(Token { text: tok, line, col: start_col });
+                    }
+                }
+            }
             '#' if i + 1 < chars.len() && (chars[i + 1] == 't' || chars[i + 1] == 'f') => {
                 let start_col = col;
                 let mut tok = String::from('#');
@@ -721,6 +775,17 @@ fn parse_tokens(tokens: &[Token], pos: &mut usize) -> Result<Expr, EvalError> {
         *pos += 1;
         let inner = &token.text[1..token.text.len() - 1];
         Ok(Expr::new(ExprKind::Str(inner.to_string()), tline, tcol))
+    } else if token.text.starts_with("#\\") {
+        *pos += 1;
+        let char_name = &token.text[2..];
+        let ch = match char_name {
+            "space" => ' ',
+            "newline" => '\n',
+            "tab" => '\t',
+            s if s.len() == 1 => s.chars().next().unwrap(),
+            _ => return Err(EvalError::Parse(format!("unknown character: {}", token.text))),
+        };
+        Ok(Expr::new(ExprKind::Char(ch), tline, tcol))
     } else if let Ok(n) = token.text.parse::<i64>() {
         *pos += 1;
         Ok(Expr::new(ExprKind::Integer(n), tline, tcol))
@@ -747,6 +812,7 @@ fn eval(expr: &Expr, env: &Env) -> Result<Value, EvalError> {
         ExprKind::Integer(n) => Ok(Value::Integer(*n)),
         ExprKind::Boolean(b) => Ok(Value::Boolean(*b)),
         ExprKind::Str(s) => Ok(Value::Str(s.clone())),
+        ExprKind::Char(c) => Ok(Value::Char(*c)),
         ExprKind::Symbol(name) => env_get(env, name).map_err(|e| expr.wrap_err(e)),
         ExprKind::List(items) => {
             if items.is_empty() {
@@ -764,6 +830,7 @@ fn eval(expr: &Expr, env: &Env) -> Result<Value, EvalError> {
                     "cond" => return eval_cond(&items[1..], env),
                     "and" => return eval_and(&items[1..], env),
                     "or" => return eval_or(&items[1..], env),
+                    "string-set!" => return eval_string_set(expr, &items[1..], env),
                     _ => {}
                 }
             }
@@ -876,6 +943,7 @@ fn expr_to_value(expr: &Expr) -> Result<Value, EvalError> {
         ExprKind::Integer(n) => Ok(Value::Integer(*n)),
         ExprKind::Boolean(b) => Ok(Value::Boolean(*b)),
         ExprKind::Str(s) => Ok(Value::Str(s.clone())),
+        ExprKind::Char(c) => Ok(Value::Char(*c)),
         ExprKind::Symbol(s) => Ok(Value::Symbol(s.clone())),
         ExprKind::List(items) => {
             let mut result = Value::Nil;
@@ -990,6 +1058,35 @@ fn eval_let(form: &Expr, args: &[Expr], env: &Env) -> Result<Value, EvalError> {
         result = eval(e, &local_env)?;
     }
     Ok(result)
+}
+
+fn eval_string_set(form: &Expr, args: &[Expr], env: &Env) -> Result<Value, EvalError> {
+    if args.len() != 3 {
+        return Err(form.wrap_err(EvalError::Arity("string-set! requires exactly 3 arguments".into())));
+    }
+    let var_name = match &args[0].kind {
+        ExprKind::Symbol(name) => name.clone(),
+        _ => return Err(form.wrap_err(EvalError::Type("string-set!: first argument must be a variable".into()))),
+    };
+    let idx = eval(&args[1], env)?.as_integer()? as usize;
+    let ch = match eval(&args[2], env)? {
+        Value::Char(c) => c,
+        _ => return Err(form.wrap_err(EvalError::Type("string-set!: third argument must be a character".into()))),
+    };
+    let s = env_get(env, &var_name).map_err(|e| form.wrap_err(e))?;
+    match s {
+        Value::Str(mut string) => {
+            let mut chars: Vec<char> = string.chars().collect();
+            if idx >= chars.len() {
+                return Err(form.wrap_err(EvalError::Type("string-set!: index out of bounds".into())));
+            }
+            chars[idx] = ch;
+            string = chars.into_iter().collect();
+            env_update(env, &var_name, Value::Str(string)).map_err(|e| form.wrap_err(e))?;
+            Ok(Value::Void)
+        }
+        _ => Err(form.wrap_err(EvalError::Type("string-set!: expected string".into()))),
+    }
 }
 
 fn eval_begin(args: &[Expr], env: &Env) -> Result<Value, EvalError> {
