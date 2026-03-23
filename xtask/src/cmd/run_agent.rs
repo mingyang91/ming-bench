@@ -533,14 +533,27 @@ fn check_and_fix_regressions(
     let regressed_names: Vec<&str> = regressions.iter().map(|(l, _)| l.as_str()).collect();
     println!("WARNING: Regressions detected in: {}", regressed_names.join(", "));
 
-    let level_num: u32 = level.parse().unwrap_or(1);
+    let level_num: u32 = level.parse().expect("level should be a number");
     let fix_budget = output_tokens_for_level(level_num, args.max_tokens);
     println!("--- Regression fix pass ({fix_budget} output tokens) ---");
     let _fix_exit = run_regression_fix(args, agent_workdir, level_dir, &regressions, level, fix_budget);
 
-    let mut all_check: Vec<&str> = passed_levels.to_vec();
-    all_check.push(level);
-    let still_broken = regression_check(&all_check, lang, worktree_dir)?;
+    // Only re-test the originally regressed levels + the current level (not ALL passed levels).
+    // This avoids flaky timeouts on unrelated levels and is faster.
+    let regressed_level_ids: Vec<&str> = regressions
+        .iter()
+        .map(|(l, _)| l.strip_prefix('L').unwrap_or(l.as_str()))
+        .collect();
+    let mut verify_levels: Vec<&str> = regressed_level_ids;
+    verify_levels.push(level);
+    verify_levels.sort();
+    verify_levels.dedup();
+
+    println!(
+        "--- Post-fix verify: {} ---",
+        verify_levels.iter().map(|l| format!("L{l}")).collect::<Vec<_>>().join(", ")
+    );
+    let still_broken = regression_check(&verify_levels, lang, worktree_dir)?;
 
     if still_broken.is_empty() {
         println!("Regressions fixed successfully");
@@ -1528,7 +1541,7 @@ fn build_level_prompt(level: &str, worktree_dir: &Path, results_dir: &Path) -> S
     append_file_listing(&mut summary, &worktree_dir.join("bench/rust/src/scheme"));
 
     summary.push_str("\nLevels already passing:\n");
-    let level_num: u32 = level.parse().unwrap_or(1);
+    let level_num: u32 = level.parse().expect("level should be a number");
     for prev_num in 1..level_num {
         let prev = format!("{prev_num:02}");
         let status_file = results_dir.join(format!("L{prev}/status.txt"));
