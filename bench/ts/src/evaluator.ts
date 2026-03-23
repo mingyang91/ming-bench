@@ -301,6 +301,35 @@ function trampoline(b: Bounce): SchemeVal {
   return b.value;
 }
 
+type WindFrame = { inThunk: SchemeVal; outThunk: SchemeVal };
+let windStack: WindFrame[] = [];
+
+function doWind(target: WindFrame[], after: () => Bounce): Bounce {
+  let common = 0;
+  while (common < windStack.length && common < target.length && windStack[common] === target[common]) {
+    common++;
+  }
+  const unwindCount = windStack.length - common;
+  const rewindFrames = target.slice(common);
+
+  const doUnwindStep = (remaining: number): Bounce => {
+    if (remaining <= 0) return doRewindStep(0);
+    const frame = windStack[windStack.length - 1];
+    windStack.pop();
+    return applyK(frame.outThunk, [], _ => doUnwindStep(remaining - 1));
+  };
+
+  const doRewindStep = (i: number): Bounce => {
+    if (i >= rewindFrames.length) return after();
+    return applyK(rewindFrames[i].inThunk, [], _ => {
+      windStack.push(rewindFrames[i]);
+      return doRewindStep(i + 1);
+    });
+  };
+
+  return doUnwindStep(unwindCount);
+}
+
 let fuel = 0;
 
 function evalK(expr: SchemeVal, env: Env, k: Kont): Bounce {
@@ -680,12 +709,30 @@ function evalList(exprs: SchemeVal[], env: Env, k: (vals: SchemeVal[]) => Bounce
 function applyK(proc: SchemeVal, args: SchemeVal[], k: Kont, pos?: Pos): Bounce {
   if (proc.tag === 'callcc') {
     if (args.length !== 1) throw posError('call/cc: need 1 argument', pos);
-    const kontVal: SchemeVal = { tag: 'continuation', fn: k };
+    const savedWind = [...windStack];
+    const originalK = k;
+    const kontFn: Kont = (val) => {
+      return doWind(savedWind, () => originalK(val));
+    };
+    const kontVal: SchemeVal = { tag: 'continuation', fn: kontFn };
     return applyK(args[0], [kontVal], k, pos);
   }
 
   if (proc.tag === 'continuation') {
     return proc.fn(args.length > 0 ? args[0] : { tag: 'void' });
+  }
+
+  if (proc.tag === 'builtin' && proc.name === 'dynamic-wind') {
+    if (args.length !== 3) throw posError('dynamic-wind: need 3 arguments', pos);
+    const [inThunk, bodyThunk, outThunk] = args;
+    const frame: WindFrame = { inThunk, outThunk };
+    return applyK(inThunk, [], _ => {
+      windStack.push(frame);
+      return applyK(bodyThunk, [], bodyVal => {
+        windStack.pop();
+        return applyK(outThunk, [], _ => k(bodyVal), pos);
+      }, pos);
+    }, pos);
   }
 
   if (proc.tag === 'builtin' && proc.name === 'map') {
@@ -793,6 +840,7 @@ function makeGlobalEnv(output: string[] = []): Env {
 
   // apply (handled specially in applyK, but needs a value in the env)
   env.set('apply', { tag: 'builtin', name: 'apply', fn: () => { throw new EvalError('internal: apply handled by applyK'); } });
+  env.set('dynamic-wind', { tag: 'builtin', name: 'dynamic-wind', fn: () => { throw new EvalError('internal: dynamic-wind handled by applyK'); } });
 
   defBuiltin('+', (args, p) => { let s = 0; for (const a of args) s += expectNumber(a, '+', p); return { tag: 'number', value: s }; });
   defBuiltin('-', (args, p) => {
@@ -861,6 +909,11 @@ function makeGlobalEnv(output: string[] = []): Env {
       result.push(...a.elements);
     }
     return { tag: 'list', elements: result };
+  });
+
+  defBuiltin('reverse', (args, p) => {
+    if (args.length !== 1 || args[0].tag !== 'list') throw posError('reverse: need a list', p);
+    return { tag: 'list', elements: [...args[0].elements].reverse() };
   });
 
   // Type predicates
@@ -1201,6 +1254,7 @@ function displayForDisplay(val: SchemeVal): string {
 export function evalStr(input: string): string {
   const exprs = parseAll(input);
   if (exprs.length === 0) throw new EvalError('no expressions');
+  windStack = [];
   const env = makeGlobalEnv();
   const result = trampoline(evalSeqArr(exprs, env, v => done(v)));
   return displayVal(result);
@@ -1209,6 +1263,7 @@ export function evalStr(input: string): string {
 export function evalStrWithOutput(input: string): { result: string; output: string } {
   const exprs = parseAll(input);
   if (exprs.length === 0) throw new EvalError('no expressions');
+  windStack = [];
   const output: string[] = [];
   const env = makeGlobalEnv(output);
   const result = trampoline(evalSeqArr(exprs, env, v => done(v)));
