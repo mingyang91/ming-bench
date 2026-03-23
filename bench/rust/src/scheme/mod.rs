@@ -102,6 +102,7 @@ enum ExprKind {
     Integer(i64),
     Boolean(bool),
     Str(String),
+    Char(char),
     Symbol(String),
     List(Vec<Expr>),
 }
@@ -136,6 +137,21 @@ fn env_get(env: &Env, name: &str) -> Option<Value> {
 
 fn env_set(env: &Env, name: String, val: Value) {
     env.borrow_mut().bindings.insert(name, val);
+}
+
+fn env_update(env: &Env, name: &str, val: Value) -> Result<(), EvalError> {
+    let has_key = env.borrow().bindings.contains_key(name);
+    if has_key {
+        env.borrow_mut().bindings.insert(name.to_string(), val);
+        Ok(())
+    } else {
+        let parent = env.borrow().parent.clone();
+        if let Some(ref p) = parent {
+            env_update(p, name, val)
+        } else {
+            Err(EvalError::UnboundVariable(name.to_string()))
+        }
+    }
 }
 
 // ---------- Parser ----------
@@ -238,11 +254,27 @@ fn parse_tokens(tokens: &[Token], pos: &mut usize) -> Result<Expr, EvalError> {
     }
 }
 
+fn parse_char_literal(name: &str) -> Option<char> {
+    match name {
+        "space" => Some(' '),
+        "newline" => Some('\n'),
+        "tab" => Some('\t'),
+        _ if name.len() == 1 => Some(name.chars().next().unwrap()),
+        _ => None,
+    }
+}
+
 fn parse_atom(token: &str, span: Span) -> Expr {
     let kind = if token == "#t" {
         ExprKind::Boolean(true)
     } else if token == "#f" {
         ExprKind::Boolean(false)
+    } else if token.starts_with("#\\") {
+        let name = &token[2..];
+        match parse_char_literal(name) {
+            Some(c) => ExprKind::Char(c),
+            None => ExprKind::Symbol(token.to_string()),
+        }
     } else if token.starts_with('"') && token.ends_with('"') {
         ExprKind::Str(token[1..token.len()-1].to_string())
     } else if let Ok(n) = token.parse::<i64>() {
@@ -271,6 +303,7 @@ fn eval(expr: &Expr, env: &Env) -> Result<Value, EvalError> {
         ExprKind::Integer(n) => Ok(Value::Integer(*n)),
         ExprKind::Boolean(b) => Ok(Value::Boolean(*b)),
         ExprKind::Str(s) => Ok(Value::Str(s.clone())),
+        ExprKind::Char(c) => Ok(Value::Char(*c)),
         ExprKind::Symbol(name) => {
             env_get(env, name).ok_or_else(|| EvalError::UnboundVariable(name.clone()))
         }
@@ -313,6 +346,7 @@ fn eval(expr: &Expr, env: &Env) -> Result<Value, EvalError> {
                         output_write("\n");
                         return Ok(Value::Void);
                     }
+                    "string-set!" => return eval_string_set(&elems[1..], env, span),
                     _ => {}
                 }
             }
@@ -411,6 +445,7 @@ fn expr_to_value(expr: &Expr) -> Value {
         ExprKind::Integer(n) => Value::Integer(*n),
         ExprKind::Boolean(b) => Value::Boolean(*b),
         ExprKind::Str(s) => Value::Str(s.clone()),
+        ExprKind::Char(c) => Value::Char(*c),
         ExprKind::Symbol(s) => Value::Symbol(s.clone()),
         ExprKind::List(items) => Value::List(items.iter().map(expr_to_value).collect()),
     }
@@ -562,6 +597,37 @@ fn eval_cond(args: &[Expr], env: &Env) -> Result<Value, EvalError> {
         }
     }
     Ok(Value::Void)
+}
+
+fn eval_string_set(args: &[Expr], env: &Env, span: Span) -> Result<Value, EvalError> {
+    if args.len() != 3 {
+        return Err(EvalError::Arity("string-set! requires 3 arguments".into()).with_position(span.line, span.col));
+    }
+    let name = match &args[0].kind {
+        ExprKind::Symbol(s) => s.clone(),
+        _ => return Err(EvalError::Type("string-set!: first argument must be a variable".into()).with_position(span.line, span.col)),
+    };
+    let idx_val = eval(&args[1], env)?;
+    let idx = as_int(&idx_val)? as usize;
+    let char_val = eval(&args[2], env)?;
+    let c = match char_val {
+        Value::Char(c) => c,
+        _ => return Err(EvalError::Type("string-set!: third argument must be a char".into()).with_position(span.line, span.col)),
+    };
+    let current = env_get(env, &name).ok_or_else(|| EvalError::UnboundVariable(name.clone()))?;
+    match current {
+        Value::Str(mut s) => {
+            if idx >= s.len() {
+                return Err(EvalError::Runtime("string-set!: index out of range".into()).with_position(span.line, span.col));
+            }
+            // Replace char at byte index (assuming ASCII-compatible)
+            let bytes = unsafe { s.as_bytes_mut() };
+            bytes[idx] = c as u8;
+            env_update(env, &name, Value::Str(s))?;
+            Ok(Value::Void)
+        }
+        _ => Err(EvalError::Type("string-set!: expected string".into()).with_position(span.line, span.col)),
+    }
 }
 
 // ---------- Builtins ----------
@@ -784,6 +850,14 @@ fn builtin_string_to_symbol(args: &[Value]) -> Result<Value, EvalError> {
     }
 }
 
+fn builtin_string_copy(args: &[Value]) -> Result<Value, EvalError> {
+    if args.len() != 1 { return Err(EvalError::Arity("string-copy requires 1 argument".into())); }
+    match &args[0] {
+        Value::Str(s) => Ok(Value::Str(s.clone())),
+        _ => Err(EvalError::Type("string-copy: expected string".into())),
+    }
+}
+
 fn builtin_string_ref(args: &[Value]) -> Result<Value, EvalError> {
     if args.len() != 2 { return Err(EvalError::Arity("string-ref requires 2 arguments".into())); }
     let s = match &args[0] { Value::Str(s) => s, _ => return Err(EvalError::Type("string-ref: expected string".into())) };
@@ -843,6 +917,7 @@ fn make_global_env() -> Env {
         ("symbol->string", builtin_symbol_to_string),
         ("string->symbol", builtin_string_to_symbol),
         ("string-ref", builtin_string_ref),
+        ("string-copy", builtin_string_copy),
     ];
     for (name, f) in builtins {
         env_set(&env, name.to_string(), Value::Builtin(*f));
