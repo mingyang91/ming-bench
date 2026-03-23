@@ -20,8 +20,8 @@ class ContinuationJump(
 class SchemeRaise(val value: SchemeValue) extends Throwable:
   override def fillInStackTrace(): Throwable = this
 
-/** Manages continuation state during evaluation. */
-object ContinuationManager:
+/** Thread-local holder for continuation manager state. */
+private[ming] class ContinuationState:
   var bodyContext: BodyContext                    = BodyContext(Nil, Environment())
   var contextStack: List[BodyContext]             = Nil
   var seqRemaining: List[SchemeValue]             = Nil
@@ -29,19 +29,43 @@ object ContinuationManager:
   var hasSameBodyFrame: Boolean                   = false
   var pendingReturn: Option[SchemeValue]          = None
   var windStack: List[(SchemeValue, SchemeValue)] = Nil
-  private var nextId: Long                        = 0
+  var nextId: Long                                = 0
+
+/** Manages continuation state during evaluation — thread-safe via ThreadLocal. */
+object ContinuationManager:
+  private val local: ThreadLocal[ContinuationState] =
+    ThreadLocal.withInitial(() => ContinuationState())
+
+  private def st: ContinuationState = local.get()
+
+  def bodyContext: BodyContext                          = st.bodyContext
+  def bodyContext_=(v: BodyContext): Unit               = st.bodyContext = v
+  def contextStack: List[BodyContext]                   = st.contextStack
+  def contextStack_=(v: List[BodyContext]): Unit        = st.contextStack = v
+  def seqRemaining: List[SchemeValue]                   = st.seqRemaining
+  def seqRemaining_=(v: List[SchemeValue]): Unit        = st.seqRemaining = v
+  def seqEnv: Environment                               = st.seqEnv
+  def seqEnv_=(v: Environment): Unit                    = st.seqEnv = v
+  def hasSameBodyFrame: Boolean                         = st.hasSameBodyFrame
+  def hasSameBodyFrame_=(v: Boolean): Unit              = st.hasSameBodyFrame = v
+  def pendingReturn: Option[SchemeValue]                = st.pendingReturn
+  def pendingReturn_=(v: Option[SchemeValue]): Unit     = st.pendingReturn = v
+  def windStack: List[(SchemeValue, SchemeValue)]       = st.windStack
+  def windStack_=(v: List[(SchemeValue, SchemeValue)]): Unit = st.windStack = v
 
   def freshId(): Long =
-    val id = nextId
-    nextId += 1
+    val s  = st
+    val id = s.nextId
+    s.nextId += 1
     id
 
   def reset(): Unit =
-    pendingReturn = None
-    nextId = 0
-    bodyContext = BodyContext(Nil, Environment())
-    contextStack = Nil
-    seqRemaining = Nil
-    seqEnv = Environment()
-    hasSameBodyFrame = false
-    windStack = Nil
+    val s = st
+    s.pendingReturn = None
+    s.nextId = 0
+    s.bodyContext = BodyContext(Nil, Environment())
+    s.contextStack = Nil
+    s.seqRemaining = Nil
+    s.seqEnv = Environment()
+    s.hasSameBodyFrame = false
+    s.windStack = Nil

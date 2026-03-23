@@ -5,17 +5,20 @@ import SchemeValue.*
 /** Core eval logic with trampoline-based TCO. */
 object Interpreter:
 
-  // Step-limiting support: -1 means unlimited
-  private var stepLimit: Int = -1
-  private var stepCount: Int = 0
+  // Step-limiting support: -1 means unlimited (thread-local for concurrency)
+  private class StepState(var limit: Int = -1, var count: Int = 0)
+  private val stepState: ThreadLocal[StepState] =
+    ThreadLocal.withInitial(() => StepState())
 
   private[ming] def setStepLimit(limit: Int): Unit =
-    stepLimit = limit
-    stepCount = 0
+    val s = stepState.get()
+    s.limit = limit
+    s.count = 0
 
   private[ming] def clearStepLimit(): Unit =
-    stepLimit = -1
-    stepCount = 0
+    val s = stepState.get()
+    s.limit = -1
+    s.count = 0
 
   /** Result of a special form: either a final value or a tail-call continuation. */
   private[ming] enum EvalResult:
@@ -49,9 +52,10 @@ object Interpreter:
     var guardFrames: List[GuardFrame] = Nil
 
     while true do
-      if stepLimit >= 0 then
-        stepCount += 1
-        if stepCount > stepLimit then throw new EvalError("step limit exceeded")
+      val ss = stepState.get()
+      if ss.limit >= 0 then
+        ss.count += 1
+        if ss.count > ss.limit then throw new EvalError("step limit exceeded")
       try
         curExpr match
           // Self-evaluating

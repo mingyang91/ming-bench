@@ -9,11 +9,15 @@ object SyntaxCase:
     * resolve free variables to definition-site values — they stay as symbols for use-site resolution. This provides
     * proper hygiene for introduced binding names.
     */
-  private val emptyEnv: Environment                              = Environment()
-  private var bindingsStack: List[(Macro.Bindings, Set[String])] = Nil
+  private val emptyEnv: Environment = Environment()
+  private val bindingsStackLocal: ThreadLocal[List[(Macro.Bindings, Set[String])]] =
+    ThreadLocal.withInitial(() => Nil)
+
+  private def bindingsStack: List[(Macro.Bindings, Set[String])]        = bindingsStackLocal.get()
+  private def bindingsStack_=(v: List[(Macro.Bindings, Set[String])]): Unit = bindingsStackLocal.set(v)
 
   def reset(): Unit =
-    bindingsStack = Nil
+    bindingsStackLocal.set(Nil)
 
   /** Evaluate (syntax-case expr (literals) clause ...). */
   def evalSyntaxCase(

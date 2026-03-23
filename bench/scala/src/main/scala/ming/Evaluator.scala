@@ -164,6 +164,11 @@ object Evaluator:
       case Void => ""
       case _    => value.display
 
+  private def formatResultUnquoted(value: SchemeValue): String =
+    value match
+      case Void => ""
+      case _    => value.displayOutput
+
   /** Evaluate one or more Scheme expressions and return the string representation of the last result.
     */
   def evalStr(input: String): String =
@@ -206,4 +211,4 @@ object Evaluator:
     val result =
       try evalExprsSequentially(exprs, env)
       catch case jump: ContinuationJump => handleContinuationJump(jump)
-    (formatResult(result), output.toString)
+    (formatResultUnquoted(result), output.toString)
