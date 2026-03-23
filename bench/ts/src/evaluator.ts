@@ -8,6 +8,8 @@ type SchemeVal =
   | { tag: 'string'; value: string }
   | { tag: 'symbol'; value: string }
   | { tag: 'list'; value: SchemeVal[] }
+  | { tag: 'pair'; car: SchemeVal; cdr: SchemeVal }
+  | { tag: 'nil' }
   | { tag: 'lambda'; params: string[]; body: SchemeVal[]; env: Env }
   | { tag: 'builtin'; name: string; fn: (args: SchemeVal[]) => SchemeVal }
   | { tag: 'void' };
@@ -138,6 +140,33 @@ function parse(input: string): SchemeVal[] {
 
 // ── Evaluator ──────────────────────────────────────────────────────
 
+const NIL: SchemeVal = { tag: 'nil' };
+
+function listToPairs(items: SchemeVal[]): SchemeVal {
+  let result: SchemeVal = NIL;
+  for (let i = items.length - 1; i >= 0; i--) {
+    result = { tag: 'pair', car: items[i], cdr: result };
+  }
+  return result;
+}
+
+function astToPairs(val: SchemeVal): SchemeVal {
+  if (val.tag === 'list') {
+    return listToPairs(val.value.map(astToPairs));
+  }
+  return val;
+}
+
+function pairsToArray(val: SchemeVal): SchemeVal[] {
+  const result: SchemeVal[] = [];
+  let cur = val;
+  while (cur.tag === 'pair') {
+    result.push(cur.car);
+    cur = cur.cdr;
+  }
+  return result;
+}
+
 function isTruthy(val: SchemeVal): boolean {
   return !(val.tag === 'boolean' && val.value === false);
 }
@@ -193,6 +222,42 @@ function makeGlobalEnv(): Env {
 
   defBuiltin('not', (args) => ({ tag: 'boolean', value: !isTruthy(args[0]) }));
 
+  defBuiltin('cons', (args) => ({ tag: 'pair', car: args[0], cdr: args[1] }));
+  defBuiltin('car', (args) => {
+    if (args[0].tag !== 'pair') throw new EvalError('car: not a pair');
+    return args[0].car;
+  });
+  defBuiltin('cdr', (args) => {
+    if (args[0].tag !== 'pair') throw new EvalError('cdr: not a pair');
+    return args[0].cdr;
+  });
+  defBuiltin('null?', (args) => ({ tag: 'boolean', value: args[0].tag === 'nil' }));
+  defBuiltin('list', (args) => listToPairs(args));
+  defBuiltin('length', (args) => {
+    let len = 0;
+    let cur = args[0];
+    while (cur.tag === 'pair') { len++; cur = cur.cdr; }
+    return { tag: 'number', value: len };
+  });
+  defBuiltin('append', (args) => {
+    if (args.length === 0) return NIL;
+    if (args.length === 1) return args[0];
+    let result = args[args.length - 1];
+    for (let i = args.length - 2; i >= 0; i--) {
+      const elems = pairsToArray(args[i]);
+      for (let j = elems.length - 1; j >= 0; j--) {
+        result = { tag: 'pair', car: elems[j], cdr: result };
+      }
+    }
+    return result;
+  });
+
+  defBuiltin('number?', (args) => ({ tag: 'boolean', value: args[0].tag === 'number' }));
+  defBuiltin('string?', (args) => ({ tag: 'boolean', value: args[0].tag === 'string' }));
+  defBuiltin('boolean?', (args) => ({ tag: 'boolean', value: args[0].tag === 'boolean' }));
+  defBuiltin('pair?', (args) => ({ tag: 'boolean', value: args[0].tag === 'pair' }));
+  defBuiltin('symbol?', (args) => ({ tag: 'boolean', value: args[0].tag === 'symbol' }));
+
   return env;
 }
 
@@ -213,7 +278,7 @@ function evaluate(expr: SchemeVal, env: Env): SchemeVal {
 
     // Special forms
     if (op === 'quote') {
-      return items[1];
+      return astToPairs(items[1]);
     }
 
     if (op === 'if') {
@@ -269,6 +334,80 @@ function evaluate(expr: SchemeVal, env: Env): SchemeVal {
       }
       return result;
     }
+
+    if (op === 'let') {
+      // Named let: (let name ((var val) ...) body...)
+      if (items[1].tag === 'symbol') {
+        const name = items[1].value;
+        const bindings = (items[2] as { tag: 'list'; value: SchemeVal[] }).value;
+        const body = items.slice(3);
+        const params: string[] = [];
+        const inits: SchemeVal[] = [];
+        for (const b of bindings) {
+          const bv = (b as { tag: 'list'; value: SchemeVal[] }).value;
+          params.push((bv[0] as { tag: 'symbol'; value: string }).value);
+          inits.push(bv[1]);
+        }
+        const letEnv = new Env(env);
+        const lambda: SchemeVal = { tag: 'lambda', params, body, env: letEnv };
+        letEnv.define(name, lambda);
+        const args = inits.map(i => evaluate(i, env));
+        const callEnv = new Env(letEnv);
+        for (let i = 0; i < params.length; i++) {
+          callEnv.define(params[i], args[i]);
+        }
+        let result: SchemeVal = { tag: 'void' };
+        for (const bodyExpr of body) {
+          result = evaluate(bodyExpr, callEnv);
+        }
+        return result;
+      }
+      // Regular let: (let ((var val) ...) body...)
+      const bindings = (items[1] as { tag: 'list'; value: SchemeVal[] }).value;
+      const body = items.slice(2);
+      const letEnv = new Env(env);
+      for (const b of bindings) {
+        const bv = (b as { tag: 'list'; value: SchemeVal[] }).value;
+        const name = (bv[0] as { tag: 'symbol'; value: string }).value;
+        const val = evaluate(bv[1], env);
+        letEnv.define(name, val);
+      }
+      let result: SchemeVal = { tag: 'void' };
+      for (const bodyExpr of body) {
+        result = evaluate(bodyExpr, letEnv);
+      }
+      return result;
+    }
+
+    if (op === 'begin') {
+      let result: SchemeVal = { tag: 'void' };
+      for (let i = 1; i < items.length; i++) {
+        result = evaluate(items[i], env);
+      }
+      return result;
+    }
+
+    if (op === 'cond') {
+      for (let i = 1; i < items.length; i++) {
+        const clause = (items[i] as { tag: 'list'; value: SchemeVal[] }).value;
+        if (clause[0].tag === 'symbol' && clause[0].value === 'else') {
+          let result: SchemeVal = { tag: 'void' };
+          for (let j = 1; j < clause.length; j++) {
+            result = evaluate(clause[j], env);
+          }
+          return result;
+        }
+        const test = evaluate(clause[0], env);
+        if (isTruthy(test)) {
+          let result: SchemeVal = test;
+          for (let j = 1; j < clause.length; j++) {
+            result = evaluate(clause[j], env);
+          }
+          return result;
+        }
+      }
+      return { tag: 'void' };
+    }
   }
 
   // Function application
@@ -303,6 +442,20 @@ function display(val: SchemeVal): string {
     case 'string': return `"${val.value}"`;
     case 'symbol': return val.value;
     case 'list': return `(${val.value.map(display).join(' ')})`;
+    case 'nil': return '()';
+    case 'pair': {
+      let s = '(' + display(val.car);
+      let cur: SchemeVal = val.cdr;
+      while (cur.tag === 'pair') {
+        s += ' ' + display(cur.car);
+        cur = cur.cdr;
+      }
+      if (cur.tag !== 'nil') {
+        s += ' . ' + display(cur);
+      }
+      s += ')';
+      return s;
+    }
     case 'lambda': return '#<procedure>';
     case 'builtin': return `#<builtin:${val.name}>`;
     case 'void': return '';
