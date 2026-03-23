@@ -20,7 +20,7 @@ public class Evaluator {
         "if", "define", "lambda", "quote", "begin", "let", "let*", "set!",
         "cond", "and", "or", "call/cc", "call-with-current-continuation",
         "define-syntax", "else", "syntax-rules",
-        "letrec", "letrec*", "case", "do"
+        "letrec", "letrec*", "case", "do", "guard"
     );
 
     // --- CPS + Trampoline infrastructure ---
@@ -47,6 +47,18 @@ public class Evaluator {
         }
     }
 
+    private static final class SchemeRaise extends RuntimeException {
+        final SchemeValue value;
+        SchemeRaise(SchemeValue value) {
+            super(null, null, true, false);
+            this.value = value;
+        }
+    }
+
+    // --- exception handler infrastructure ---
+    record HandlerFrame(Cont onRaise, List<WindFrame> savedWind) {}
+    private final List<HandlerFrame> handlerStack = new ArrayList<>();
+
     private SchemeValue trampoline(Bounce b) {
         while (true) {
             try {
@@ -56,8 +68,34 @@ public class Evaluator {
                 }
             } catch (ContinuationReturn cr) {
                 b = cr.bounce;
+            } catch (SchemeRaise sr) {
+                if (handlerStack.isEmpty()) {
+                    throw new EvalError("unhandled exception: " + sr.value.display());
+                }
+                HandlerFrame frame = handlerStack.removeLast();
+                // Wind transition from current context to handler's saved context
+                int common = 0;
+                int minLen = Math.min(windStack.size(), frame.savedWind().size());
+                while (common < minLen && windStack.get(common) == frame.savedWind().get(common)) common++;
+                List<SchemeValue> thunks = new ArrayList<>();
+                for (int i = windStack.size() - 1; i >= common; i--)
+                    thunks.add(windStack.get(i).outThunk());
+                for (int i = common; i < frame.savedWind().size(); i++)
+                    thunks.add(frame.savedWind().get(i).inThunk());
+                windStack.clear();
+                windStack.addAll(frame.savedWind());
+                b = runWindThenHandler(thunks, 0, sr.value, frame.onRaise());
             }
         }
+    }
+
+    private Bounce runWindThenHandler(List<SchemeValue> thunks, int idx,
+                                       SchemeValue exnVal, Cont handler) {
+        if (idx >= thunks.size()) {
+            return handler.apply(exnVal);
+        }
+        return new Bounce.More(() -> applyProc(thunks.get(idx), List.of(),
+            _v -> runWindThenHandler(thunks, idx + 1, exnVal, handler)));
     }
 
     // --- Public API ---
@@ -146,6 +184,7 @@ public class Evaluator {
                     case "or" -> evalOr(args, 0, env, k);
                     case "call/cc", "call-with-current-continuation" -> evalCallCC(args, env, k);
                     case "define-syntax" -> evalDefineSyntax(args, env, k);
+                    case "guard" -> evalGuard(args, env, k);
                     default -> {
                         // Check if this is a macro call
                         SchemeValue macroVal = null;
@@ -529,6 +568,52 @@ public class Evaluator {
         }));
     }
 
+    private Bounce evalGuard(List<SchemeValue> args, Environment env, Cont k) {
+        if (args.size() < 2) throw new EvalError("guard: needs variable/clauses and body");
+        if (!(args.get(0) instanceof SchemeValue.ListVal clauseList) || clauseList.elements().size() < 2)
+            throw new EvalError("guard: invalid clause list");
+        if (!(clauseList.elements().get(0) instanceof SchemeValue.SymbolVal varSym))
+            throw new EvalError("guard: variable must be a symbol");
+        String varName = varSym.name();
+        List<SchemeValue> clauses = clauseList.elements().subList(1, clauseList.elements().size());
+        List<SchemeValue> body = args.subList(1, args.size());
+
+        List<WindFrame> savedWind = new ArrayList<>(windStack);
+        handlerStack.add(new HandlerFrame(
+            exnVal -> {
+                Environment guardEnv = new Environment(env);
+                guardEnv.define(varName, exnVal);
+                return evalGuardClauses(clauses, guardEnv, k, exnVal);
+            },
+            savedWind
+        ));
+        return evalSeq(body, env, result -> {
+            handlerStack.removeLast();
+            return k.apply(result);
+        });
+    }
+
+    private Bounce evalGuardClauses(List<SchemeValue> clauses, Environment env,
+                                     Cont k, SchemeValue exnVal) {
+        if (clauses.isEmpty()) throw new SchemeRaise(exnVal);
+        var clause = clauses.getFirst();
+        if (!(clause instanceof SchemeValue.ListVal cl) || cl.elements().isEmpty())
+            throw new EvalError("guard: invalid clause");
+        var test = cl.elements().getFirst();
+        if (test instanceof SchemeValue.SymbolVal sym && sym.name().equals("else")) {
+            if (cl.elements().size() == 1) return k.apply(new SchemeValue.VoidVal());
+            return evalSeq(cl.elements().subList(1, cl.elements().size()), env, k);
+        }
+        var rest = clauses.subList(1, clauses.size());
+        return new Bounce.More(() -> eval(test, env, testVal -> {
+            if (testVal.isTruthy()) {
+                if (cl.elements().size() == 1) return k.apply(testVal);
+                return evalSeq(cl.elements().subList(1, cl.elements().size()), env, k);
+            }
+            return evalGuardClauses(rest, env, k, exnVal);
+        }));
+    }
+
     // --- Procedure call ---
 
     private Bounce evalCall(SchemeValue first, List<SchemeValue> argExprs,
@@ -618,7 +703,8 @@ public class Evaluator {
         "vector", "make-vector", "vector-ref", "vector-set!",
         "vector-length", "vector?", "vector->list", "list->vector",
         "apply", "call/cc", "call-with-current-continuation",
-        "dynamic-wind", "reverse"
+        "dynamic-wind", "reverse",
+        "raise", "with-exception-handler"
     );
 
     private boolean isBuiltin(String name) { return BUILTINS.contains(name); }
@@ -1056,6 +1142,26 @@ public class Evaluator {
                 var savedWind = new ArrayList<>(windStack);
                 var contVal = new SchemeValue.ContinuationVal(k, savedWind);
                 yield applyProc(a.getFirst(), List.of(contVal), k);
+            }
+            case "raise" -> {
+                if (a.size() != 1) throw new EvalError("raise: needs exactly 1 argument");
+                throw new SchemeRaise(a.getFirst());
+            }
+            case "with-exception-handler" -> {
+                if (a.size() != 2) throw new EvalError("with-exception-handler: needs exactly 2 arguments");
+                SchemeValue handlerProc = a.get(0);
+                SchemeValue thunk = a.get(1);
+                var frame = new HandlerFrame(
+                    exnVal -> applyProc(handlerProc, List.of(exnVal), result -> {
+                        throw new EvalError("exception handler returned from raise");
+                    }),
+                    new ArrayList<>(windStack)
+                );
+                handlerStack.add(frame);
+                yield applyProc(thunk, List.of(), result -> {
+                    handlerStack.removeLast();
+                    return k.apply(result);
+                });
             }
             case "dynamic-wind" -> {
                 if (a.size() != 3) throw new EvalError("dynamic-wind: needs exactly 3 arguments");
