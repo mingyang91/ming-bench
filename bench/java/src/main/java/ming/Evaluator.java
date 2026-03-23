@@ -1,8 +1,9 @@
 package ming;
 
+import java.util.ArrayDeque;
 import java.util.ArrayList;
+import java.util.Deque;
 import java.util.HashSet;
-import java.util.IdentityHashMap;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
@@ -13,20 +14,15 @@ public class Evaluator {
     private final Environment globalEnv = new Environment();
     private StringBuilder outputBuffer = new StringBuilder();
 
-    // --- call/cc replay state ---
+    // --- call/cc state ---
     /** Counter incremented each time call/cc is invoked. */
     private int callccCounter = 0;
-    /** During replay: maps callccId → value to return. */
+    /** During replay: the call/cc ID to match. */
     private int replayTargetId = -1;
+    /** During replay: the value to return from call/cc. */
     private SchemeValue replayValue = null;
-    /** During replay: let-expression → captured environment (reuse instead of re-creating). */
-    private Map<SchemeValue, Environment> replayLetEnvMap = null;
-    /** Tracks let-expression → environment during normal evaluation (for capture). */
-    private final Map<SchemeValue, Environment> letEnvTracker = new IdentityHashMap<>();
-    /** Current top-level expression index (for continuation capture). */
-    private int currentExprIndex = 0;
-    /** Current top-level expression list (for continuation capture). */
-    private List<SchemeValue> currentTopLevelExprs = null;
+    /** Continuation stack: tracks remaining computation frames for call/cc capture. */
+    private final Deque<ContFrame> contStack = new ArrayDeque<>();
 
     private int gensymCounter = 0;
 
@@ -72,34 +68,108 @@ public class Evaluator {
     }
 
     /**
-     * Evaluate top-level expressions with continuation replay support.
+     * Evaluate top-level expressions with continuation support.
      * When a saved continuation is invoked, ContinuationReturn is caught here
-     * and we replay from the captured expression index.
+     * and we resume from the captured continuation stack.
      */
     private SchemeValue evalTopLevel(List<SchemeValue> exprs, int startIndex) throws EvalError {
-        currentTopLevelExprs = exprs;
-        int idx = startIndex;
+        try {
+            SchemeValue result = null;
+            for (int i = startIndex; i < exprs.size(); i++) {
+                contStack.push(new ContFrame.BodyFrame(exprs.get(i),
+                        exprs.subList(i + 1, exprs.size()), globalEnv, callccCounter));
+                result = eval(exprs.get(i), globalEnv);
+                contStack.pop();
+            }
+            return result;
+        } catch (ContinuationReturn cr) {
+            return handleContinuation(cr);
+        }
+    }
+
+    /**
+     * Handle a ContinuationReturn by restoring the continuation stack and resuming.
+     * Loops to handle chains of continuation invocations.
+     */
+    private SchemeValue handleContinuation(ContinuationReturn cr) throws EvalError {
         while (true) {
             try {
-                SchemeValue result = null;
-                for (int i = idx; i < exprs.size(); i++) {
-                    currentExprIndex = i;
-                    result = eval(exprs.get(i), globalEnv);
+                // Restore contStack from snapshot (innermost first in list)
+                contStack.clear();
+                var snapshot = cr.cont.contStackSnapshot;
+                for (int i = snapshot.size() - 1; i >= 0; i--) {
+                    contStack.push(snapshot.get(i));
                 }
-                // Clear replay state
-                replayTargetId = -1;
-                replayValue = null;
-                replayLetEnvMap = null;
-                return result;
-            } catch (ContinuationReturn cr) {
-                // Set up replay: re-evaluate from the captured expression index
-                callccCounter = 0;
-                replayTargetId = cr.cont.callccId;
-                replayValue = cr.value;
-                replayLetEnvMap = cr.cont.letEnvMap;
-                idx = cr.cont.exprIndex;
+                return resumeFromContStack(cr.value, cr.cont.callccId);
+            } catch (ContinuationReturn cr2) {
+                cr = cr2;
             }
         }
+    }
+
+    /**
+     * Resume from a continuation stack after a continuation is invoked.
+     * 1. Find and replay the innermost BodyFrame (discarding context frames above it)
+     * 2. Evaluate remaining body expressions
+     * 3. Process outer frames (DefineFrame/SetFrame apply side effects, BodyFrame evaluate remaining)
+     */
+    private SchemeValue resumeFromContStack(SchemeValue value, int callccId) throws EvalError {
+        // Discard frames above the innermost BodyFrame
+        while (!contStack.isEmpty() && !(contStack.peek() instanceof ContFrame.BodyFrame)) {
+            contStack.pop();
+        }
+
+        if (contStack.isEmpty()) {
+            return value;
+        }
+
+        // Pop and replay the innermost BodyFrame
+        ContFrame.BodyFrame bodyFrame = (ContFrame.BodyFrame) contStack.pop();
+
+        callccCounter = bodyFrame.callccCounterBefore();
+        replayTargetId = callccId;
+        replayValue = value;
+
+        SchemeValue result = eval(bodyFrame.currentExpr(), bodyFrame.env());
+
+        replayTargetId = -1;
+        replayValue = null;
+
+        // Evaluate remaining body expressions from this frame
+        if (!bodyFrame.remaining().isEmpty()) {
+            result = evalRemainingBody(bodyFrame.remaining(), bodyFrame.env());
+        }
+
+        // Process outer frames
+        while (!contStack.isEmpty()) {
+            ContFrame frame = contStack.pop();
+            if (frame instanceof ContFrame.BodyFrame bf) {
+                if (!bf.remaining().isEmpty()) {
+                    result = evalRemainingBody(bf.remaining(), bf.env());
+                }
+            } else if (frame instanceof ContFrame.DefineFrame df) {
+                df.env().define(df.name(), result);
+            } else if (frame instanceof ContFrame.SetFrame sf) {
+                sf.env().set(sf.name(), result);
+            }
+        }
+
+        return result;
+    }
+
+    /**
+     * Evaluate a sequence of body expressions, pushing contStack frames for each.
+     * Returns the result of the last expression.
+     */
+    private SchemeValue evalRemainingBody(List<SchemeValue> remaining, Environment env) throws EvalError {
+        SchemeValue result = null;
+        for (int i = 0; i < remaining.size(); i++) {
+            contStack.push(new ContFrame.BodyFrame(remaining.get(i),
+                    remaining.subList(i + 1, remaining.size()), env, callccCounter));
+            result = eval(remaining.get(i), env);
+            contStack.pop();
+        }
+        return result;
     }
 
     private static EvalError posError(SourcePos pos, String msg) {
@@ -197,7 +267,9 @@ public class Evaluator {
         SchemeValue target = args.getFirst();
 
         if (target instanceof SchemeValue.SymbolVal sym) {
+            contStack.push(new ContFrame.DefineFrame(sym.name(), env));
             SchemeValue val = eval(args.get(1), env);
+            contStack.pop();
             env.define(sym.name(), val);
             return val;
         } else if (target instanceof SchemeValue.ListVal nameAndParams) {
@@ -233,7 +305,9 @@ public class Evaluator {
         if (args.size() != 2) throw posError(pos, "set!: need exactly 2 arguments");
         if (!(args.getFirst() instanceof SchemeValue.SymbolVal sym))
             throw posError(pos, "set!: first argument must be a symbol");
+        contStack.push(new ContFrame.SetFrame(sym.name(), env));
         SchemeValue val = eval(args.get(1), env);
+        contStack.pop();
         try {
             env.set(sym.name(), val);
         } catch (EvalError e) {
@@ -300,7 +374,10 @@ public class Evaluator {
             }
             // Evaluate all but the last body expression
             for (int i = 0; i < lambda.body().size() - 1; i++) {
+                contStack.push(new ContFrame.BodyFrame(lambda.body().get(i),
+                        lambda.body().subList(i + 1, lambda.body().size()), callEnv, callccCounter));
                 eval(lambda.body().get(i), callEnv);
+                contStack.pop();
             }
             // Return Thunk for the last body expression (TCO)
             return new SchemeValue.Thunk(lambda.body().getLast(), callEnv);
@@ -478,22 +555,10 @@ public class Evaluator {
             for (SchemeValue init : inits) {
                 evaledInits.add(eval(init, env));
             }
-            letEnvTracker.put(letExpr, letEnv);
             return applyTail(lambda, evaledInits, pos);
         }
 
         // Regular let: (let ((var init) ...) body...)
-        // Check if we should reuse a captured environment during replay
-        if (replayLetEnvMap != null && replayLetEnvMap.containsKey(letExpr)) {
-            Environment letEnv = replayLetEnvMap.get(letExpr);
-            // Skip binding evaluation — reuse the captured mutable environment
-            // Eval all but last, return Thunk for last (TCO)
-            for (int i = 1; i < args.size() - 1; i++) {
-                eval(args.get(i), letEnv);
-            }
-            return new SchemeValue.Thunk(args.getLast(), letEnv);
-        }
-
         SchemeValue bindingsExpr = args.getFirst();
         if (!(bindingsExpr instanceof SchemeValue.ListVal bindingsList))
             throw posError(pos, "let: bindings must be a list");
@@ -508,12 +573,12 @@ public class Evaluator {
             letEnv.define(s.name(), val);
         }
 
-        // Track this let environment for potential call/cc capture
-        letEnvTracker.put(letExpr, letEnv);
-
         // Eval all but last, return Thunk for last (TCO)
         for (int i = 1; i < args.size() - 1; i++) {
+            contStack.push(new ContFrame.BodyFrame(args.get(i),
+                    args.subList(i + 1, args.size()), letEnv, callccCounter));
             eval(args.get(i), letEnv);
+            contStack.pop();
         }
         return new SchemeValue.Thunk(args.getLast(), letEnv);
     }
@@ -522,7 +587,10 @@ public class Evaluator {
     private SchemeValue evalBeginTail(List<SchemeValue> args, Environment env, SourcePos pos) throws EvalError {
         if (args.isEmpty()) throw posError(pos, "begin: need at least one expression");
         for (int i = 0; i < args.size() - 1; i++) {
+            contStack.push(new ContFrame.BodyFrame(args.get(i),
+                    args.subList(i + 1, args.size()), env, callccCounter));
             eval(args.get(i), env);
+            contStack.pop();
         }
         return new SchemeValue.Thunk(args.getLast(), env);
     }
@@ -538,7 +606,10 @@ public class Evaluator {
             if (test instanceof SchemeValue.SymbolVal sym && sym.name().equals("else")) {
                 if (elems.size() == 1) return new SchemeValue.BoolVal(false, SourcePos.NONE);
                 for (int i = 1; i < elems.size() - 1; i++) {
+                    contStack.push(new ContFrame.BodyFrame(elems.get(i),
+                            elems.subList(i + 1, elems.size()), env, callccCounter));
                     eval(elems.get(i), env);
+                    contStack.pop();
                 }
                 return new SchemeValue.Thunk(elems.getLast(), env);
             }
@@ -547,7 +618,10 @@ public class Evaluator {
             if (testVal.isTruthy()) {
                 if (elems.size() == 1) return testVal;
                 for (int i = 1; i < elems.size() - 1; i++) {
+                    contStack.push(new ContFrame.BodyFrame(elems.get(i),
+                            elems.subList(i + 1, elems.size()), env, callccCounter));
                     eval(elems.get(i), env);
+                    contStack.pop();
                 }
                 return new SchemeValue.Thunk(elems.getLast(), env);
             }
@@ -775,17 +849,15 @@ public class Evaluator {
         int myId = ++callccCounter;
 
         // Check if we're replaying this call/cc
-        if (replayTargetId == myId && replayValue != null) {
+        if (replayTargetId == myId) {
             SchemeValue val = replayValue;
             replayTargetId = -1;
             replayValue = null;
-            replayLetEnvMap = null;
             return val;
         }
 
         // Normal execution: capture continuation and call the procedure
-        Continuation cont = new Continuation(myId, currentExprIndex,
-                currentTopLevelExprs, globalEnv, letEnvTracker);
+        Continuation cont = new Continuation(myId, contStack);
         SchemeValue contVal = new SchemeValue.ContinuationVal(cont);
 
         try {
@@ -984,15 +1056,13 @@ public class Evaluator {
                 SchemeValue proc = args.getFirst();
                 int myId = ++callccCounter;
                 // Check replay
-                if (replayTargetId == myId && replayValue != null) {
+                if (replayTargetId == myId) {
                     SchemeValue val = replayValue;
                     replayTargetId = -1;
                     replayValue = null;
-                    replayLetEnvMap = null;
                     yield val;
                 }
-                Continuation cont = new Continuation(myId, currentExprIndex,
-                        currentTopLevelExprs, globalEnv, letEnvTracker);
+                Continuation cont = new Continuation(myId, contStack);
                 SchemeValue contVal = new SchemeValue.ContinuationVal(cont);
                 try {
                     yield evalContinuation(applyTail(proc, List.of(contVal), pos));

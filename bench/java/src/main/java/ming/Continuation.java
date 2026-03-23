@@ -1,39 +1,23 @@
 package ming;
 
-import java.util.IdentityHashMap;
+import java.util.ArrayList;
+import java.util.Deque;
 import java.util.List;
-import java.util.Map;
 
 /**
  * Represents a captured continuation for call/cc.
- * Stores enough state to replay from the top-level expression containing
- * the call/cc, preserving let-environments for mutable state.
+ * Stores a snapshot of the continuation stack (remaining computation frames)
+ * and the call/cc ID for replay matching.
  */
 public class Continuation {
     /** Which call/cc invocation this is (for counter-based matching during replay). */
     final int callccId;
 
-    /** Index of the top-level expression containing this call/cc. */
-    final int exprIndex;
+    /** Snapshot of the continuation stack at capture time. */
+    final List<ContFrame> contStackSnapshot;
 
-    /** All top-level expressions (for evaluating remaining ones after replay). */
-    final List<SchemeValue> allExprs;
-
-    /** The global environment. */
-    final Environment globalEnv;
-
-    /**
-     * Map from let-expression (by identity) to its environment.
-     * During replay, these environments are reused instead of re-created.
-     */
-    final Map<SchemeValue, Environment> letEnvMap;
-
-    Continuation(int callccId, int exprIndex, List<SchemeValue> allExprs,
-                 Environment globalEnv, Map<SchemeValue, Environment> letEnvMap) {
+    Continuation(int callccId, Deque<ContFrame> contStack) {
         this.callccId = callccId;
-        this.exprIndex = exprIndex;
-        this.allExprs = allExprs;
-        this.globalEnv = globalEnv;
-        this.letEnvMap = new IdentityHashMap<>(letEnvMap);
+        this.contStackSnapshot = new ArrayList<>(contStack);
     }
 }
