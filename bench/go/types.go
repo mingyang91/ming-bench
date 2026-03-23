@@ -96,11 +96,20 @@ type SchemePair struct {
 func (v *SchemePair) String() string {
 	var parts []string
 	cur := SchemeValue(v)
+	slow := cur
+	step := 0
 	for {
 		switch c := cur.(type) {
 		case *SchemePair:
 			parts = append(parts, c.Car.String())
 			cur = c.Cdr
+			step++
+			if step%2 == 0 {
+				slow = slow.(*SchemePair).Cdr
+				if slow == cur {
+					return "(" + strings.Join(parts, " ") + " ...)"
+				}
+			}
 		case *SchemeEmpty:
 			return "(" + strings.Join(parts, " ") + ")"
 		default:

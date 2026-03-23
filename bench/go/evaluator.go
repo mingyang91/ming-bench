@@ -19,6 +19,7 @@ func TopEnv() *Env {
 	env.Set("newline", &EnvBuiltinProc{Name: "newline", Fn: builtinNewline})
 	env.Set("apply", &EnvBuiltinProc{Name: "apply", Fn: builtinApplyEnv})
 	env.Set("map", &EnvBuiltinProc{Name: "map", Fn: builtinMapEnv})
+	env.Set("for-each", &EnvBuiltinProc{Name: "for-each", Fn: builtinForEachEnv})
 	callcc := &SchemeCallCC{}
 	env.Set("call/cc", callcc)
 	env.Set("call-with-current-continuation", callcc)
@@ -950,7 +951,7 @@ func setupLet(e *ListExpr, env *Env) (Expr, *Env, error) {
 func setupCond(e *ListExpr, env *Env) (Expr, *Env, bool, SchemeValue, error) {
 	for _, clause := range e.Elements[1:] {
 		cl, ok := clause.(*ListExpr)
-		if !ok || len(cl.Elements) < 2 {
+		if !ok || len(cl.Elements) < 1 {
 			line, col := e.Pos()
 			return nil, nil, false, nil, &EvalError{Message: fmt.Sprintf("%d:%d: cond: bad syntax", line, col)}
 		}
@@ -969,6 +970,10 @@ func setupCond(e *ListExpr, env *Env) (Expr, *Env, bool, SchemeValue, error) {
 			return nil, nil, false, nil, err
 		}
 		if isTruthy(cond) {
+			// Single-expression clause: (cond (test)) returns test value
+			if len(cl.Elements) == 1 {
+				return nil, nil, true, cond, nil
+			}
 			body := cl.Elements[1:]
 			for _, b := range body[:len(body)-1] {
 				_, err := Eval(b, env)
@@ -1137,6 +1142,34 @@ func init() {
 	builtins["vector->list"] = &BuiltinProc{Name: "vector->list", Fn: builtinVectorToList}
 	builtins["list->vector"] = &BuiltinProc{Name: "list->vector", Fn: builtinListToVector}
 	builtins["error"] = &BuiltinProc{Name: "error", Fn: builtinError}
+	// L21 pair mutation
+	builtins["set-car!"] = &BuiltinProc{Name: "set-car!", Fn: builtinSetCar}
+	builtins["set-cdr!"] = &BuiltinProc{Name: "set-cdr!", Fn: builtinSetCdr}
+	// cxr helpers — register all standard c[ad]{2,4}r combinations
+	for _, name := range []string{
+		"caar", "cadr", "cdar", "cddr",
+		"caaar", "caadr", "cadar", "caddr", "cdaar", "cdadr", "cddar", "cdddr",
+		"caaaar", "caaadr", "caadar", "caaddr", "cadaar", "cadadr", "caddar", "cadddr",
+		"cdaaar", "cdaadr", "cdadar", "cdaddr", "cddaar", "cddadr", "cdddar", "cddddr",
+	} {
+		builtins[name] = &BuiltinProc{Name: name, Fn: makeCxr(name)}
+	}
+	// L21 extras needed by real-world tests
+	builtins["procedure?"] = &BuiltinProc{Name: "procedure?", Fn: builtinProcedureQ}
+	builtins["gcd"] = &BuiltinProc{Name: "gcd", Fn: builtinGCD}
+	builtins["lcm"] = &BuiltinProc{Name: "lcm", Fn: builtinLCM}
+	builtins["truncate"] = &BuiltinProc{Name: "truncate", Fn: builtinTruncate}
+	builtins["round"] = &BuiltinProc{Name: "round", Fn: builtinRound}
+	builtins["make-string"] = &BuiltinProc{Name: "make-string", Fn: builtinMakeString}
+	builtins["string"] = &BuiltinProc{Name: "string", Fn: builtinStringConstructor}
+	builtins["string>?"] = &BuiltinProc{Name: "string>?", Fn: builtinStringGtQ}
+	builtins["string<=?"] = &BuiltinProc{Name: "string<=?", Fn: builtinStringLeQ}
+	builtins["string>=?"] = &BuiltinProc{Name: "string>=?", Fn: builtinStringGeQ}
+	builtins["memq"] = &BuiltinProc{Name: "memq", Fn: builtinMemq}
+	builtins["memv"] = &BuiltinProc{Name: "memv", Fn: builtinMemv}
+	builtins["member"] = &BuiltinProc{Name: "member", Fn: builtinMember}
+	builtins["assq"] = &BuiltinProc{Name: "assq", Fn: builtinAssq}
+	builtins["assv"] = &BuiltinProc{Name: "assv", Fn: builtinAssv}
 }
 
 func builtinAdd(args []SchemeValue, callExpr *ListExpr) (SchemeValue, error) {
@@ -2210,14 +2243,27 @@ func builtinListQ(args []SchemeValue, callExpr *ListExpr) (SchemeValue, error) {
 		line, col := callExpr.Pos()
 		return nil, &EvalError{Message: fmt.Sprintf("%d:%d: list?: requires exactly 1 argument", line, col)}
 	}
-	cur := args[0]
+	// Tortoise-and-hare cycle detection
+	slow := args[0]
+	fast := args[0]
 	for {
-		switch c := cur.(type) {
-		case *SchemeEmpty:
-			return &SchemeBool{Value: true}, nil
-		case *SchemePair:
-			cur = c.Cdr
-		default:
+		// Advance fast two steps
+		fp, ok := fast.(*SchemePair)
+		if !ok {
+			_, isEmpty := fast.(*SchemeEmpty)
+			return &SchemeBool{Value: isEmpty}, nil
+		}
+		fast = fp.Cdr
+		fp2, ok := fast.(*SchemePair)
+		if !ok {
+			_, isEmpty := fast.(*SchemeEmpty)
+			return &SchemeBool{Value: isEmpty}, nil
+		}
+		fast = fp2.Cdr
+		// Advance slow one step
+		slow = slow.(*SchemePair).Cdr
+		// If they meet, there's a cycle
+		if slow == fast {
 			return &SchemeBool{Value: false}, nil
 		}
 	}
@@ -2283,32 +2329,34 @@ func builtinEqualQ(args []SchemeValue, callExpr *ListExpr) (SchemeValue, error) 
 	return &SchemeBool{Value: schemeEqual(args[0], args[1])}, nil
 }
 
+func schemeEq(a, b SchemeValue) bool {
+	switch av := a.(type) {
+	case *SchemeSymbol:
+		bv, ok := b.(*SchemeSymbol)
+		return ok && av.Name == bv.Name
+	case *SchemeBool:
+		bv, ok := b.(*SchemeBool)
+		return ok && av.Value == bv.Value
+	case *SchemeInt:
+		bv, ok := b.(*SchemeInt)
+		return ok && av.Value == bv.Value
+	case *SchemeChar:
+		bv, ok := b.(*SchemeChar)
+		return ok && av.Value == bv.Value
+	case *SchemeEmpty:
+		_, ok := b.(*SchemeEmpty)
+		return ok
+	default:
+		return a == b
+	}
+}
+
 func builtinEqQ(args []SchemeValue, callExpr *ListExpr) (SchemeValue, error) {
 	if len(args) != 2 {
 		line, col := callExpr.Pos()
 		return nil, &EvalError{Message: fmt.Sprintf("%d:%d: eq?: requires exactly 2 arguments", line, col)}
 	}
-	a, b := args[0], args[1]
-	// eq? is identity/pointer equality, but for symbols, bools, empty, and small ints we compare by value
-	switch av := a.(type) {
-	case *SchemeSymbol:
-		bv, ok := b.(*SchemeSymbol)
-		return &SchemeBool{Value: ok && av.Name == bv.Name}, nil
-	case *SchemeBool:
-		bv, ok := b.(*SchemeBool)
-		return &SchemeBool{Value: ok && av.Value == bv.Value}, nil
-	case *SchemeInt:
-		bv, ok := b.(*SchemeInt)
-		return &SchemeBool{Value: ok && av.Value == bv.Value}, nil
-	case *SchemeChar:
-		bv, ok := b.(*SchemeChar)
-		return &SchemeBool{Value: ok && av.Value == bv.Value}, nil
-	case *SchemeEmpty:
-		_, ok := b.(*SchemeEmpty)
-		return &SchemeBool{Value: ok}, nil
-	default:
-		return &SchemeBool{Value: a == b}, nil
-	}
+	return &SchemeBool{Value: schemeEq(args[0], args[1])}, nil
 }
 
 func builtinAssoc(args []SchemeValue, callExpr *ListExpr) (SchemeValue, error) {
@@ -3219,4 +3267,415 @@ func evalDefineRecordType(e *ListExpr, env *Env) (SchemeValue, error) {
 	}
 
 	return &SchemeVoid{}, nil
+}
+
+// --- L21: cxr helpers ---
+
+func makeCxr(name string) func([]SchemeValue, *ListExpr) (SchemeValue, error) {
+	// Parse the a/d pattern from the name (e.g., "cadr" -> "ad")
+	ops := name[1 : len(name)-1] // strip leading 'c' and trailing 'r'
+	return func(args []SchemeValue, callExpr *ListExpr) (SchemeValue, error) {
+		if len(args) != 1 {
+			line, col := callExpr.Pos()
+			return nil, &EvalError{Message: fmt.Sprintf("%d:%d: %s: requires exactly 1 argument", line, col, name)}
+		}
+		v := args[0]
+		// Apply ops right-to-left
+		for i := len(ops) - 1; i >= 0; i-- {
+			p, ok := v.(*SchemePair)
+			if !ok {
+				line, col := callExpr.Pos()
+				return nil, &EvalError{Message: fmt.Sprintf("%d:%d: %s: expected pair", line, col, name)}
+			}
+			if ops[i] == 'a' {
+				v = p.Car
+			} else {
+				v = p.Cdr
+			}
+		}
+		return v, nil
+	}
+}
+
+// --- L21: set-car!, set-cdr! ---
+
+func builtinSetCar(args []SchemeValue, callExpr *ListExpr) (SchemeValue, error) {
+	if len(args) != 2 {
+		line, col := callExpr.Pos()
+		return nil, &EvalError{Message: fmt.Sprintf("%d:%d: set-car!: requires exactly 2 arguments", line, col)}
+	}
+	p, ok := args[0].(*SchemePair)
+	if !ok {
+		line, col := callExpr.Pos()
+		return nil, &EvalError{Message: fmt.Sprintf("%d:%d: set-car!: expected pair", line, col)}
+	}
+	p.Car = args[1]
+	return &SchemeVoid{}, nil
+}
+
+func builtinSetCdr(args []SchemeValue, callExpr *ListExpr) (SchemeValue, error) {
+	if len(args) != 2 {
+		line, col := callExpr.Pos()
+		return nil, &EvalError{Message: fmt.Sprintf("%d:%d: set-cdr!: requires exactly 2 arguments", line, col)}
+	}
+	p, ok := args[0].(*SchemePair)
+	if !ok {
+		line, col := callExpr.Pos()
+		return nil, &EvalError{Message: fmt.Sprintf("%d:%d: set-cdr!: expected pair", line, col)}
+	}
+	p.Cdr = args[1]
+	return &SchemeVoid{}, nil
+}
+
+// --- L21: for-each ---
+
+func builtinForEachEnv(args []SchemeValue, callExpr *ListExpr, env *Env) (SchemeValue, error) {
+	if len(args) < 2 {
+		line, col := callExpr.Pos()
+		return nil, &EvalError{Message: fmt.Sprintf("%d:%d: for-each: requires at least 2 arguments", line, col)}
+	}
+	fn := args[0]
+	lists := make([][]SchemeValue, len(args)-1)
+	for i := 1; i < len(args); i++ {
+		elems, ok := listToSlice(args[i])
+		if !ok {
+			line, col := callExpr.Pos()
+			return nil, &EvalError{Message: fmt.Sprintf("%d:%d: for-each: expected list", line, col)}
+		}
+		lists[i-1] = elems
+	}
+	if len(lists) == 0 {
+		return &SchemeVoid{}, nil
+	}
+	n := len(lists[0])
+	for _, l := range lists[1:] {
+		if len(l) != n {
+			line, col := callExpr.Pos()
+			return nil, &EvalError{Message: fmt.Sprintf("%d:%d: for-each: lists must have same length", line, col)}
+		}
+	}
+	for i := 0; i < n; i++ {
+		fnArgs := make([]SchemeValue, len(lists))
+		for j := range lists {
+			fnArgs[j] = lists[j][i]
+		}
+		_, err := applyFunc(fn, fnArgs, callExpr, env)
+		if err != nil {
+			return nil, err
+		}
+	}
+	return &SchemeVoid{}, nil
+}
+
+// --- L21: procedure? ---
+
+func builtinProcedureQ(args []SchemeValue, callExpr *ListExpr) (SchemeValue, error) {
+	if len(args) != 1 {
+		line, col := callExpr.Pos()
+		return nil, &EvalError{Message: fmt.Sprintf("%d:%d: procedure?: requires exactly 1 argument", line, col)}
+	}
+	switch args[0].(type) {
+	case *Lambda, *BuiltinProc, *EnvBuiltinProc, *SchemeCallCC, *SchemeDynamicWind:
+		return &SchemeBool{Value: true}, nil
+	default:
+		return &SchemeBool{Value: false}, nil
+	}
+}
+
+// --- L21: gcd, lcm ---
+
+func intGCD(a, b int64) int64 {
+	if a < 0 {
+		a = -a
+	}
+	if b < 0 {
+		b = -b
+	}
+	for b != 0 {
+		a, b = b, a%b
+	}
+	return a
+}
+
+func builtinGCD(args []SchemeValue, callExpr *ListExpr) (SchemeValue, error) {
+	if len(args) == 0 {
+		return &SchemeInt{Value: 0}, nil
+	}
+	result := toInt64(args[0])
+	for _, a := range args[1:] {
+		result = intGCD(result, toInt64(a))
+	}
+	if result < 0 {
+		result = -result
+	}
+	return &SchemeInt{Value: result}, nil
+}
+
+func builtinLCM(args []SchemeValue, callExpr *ListExpr) (SchemeValue, error) {
+	if len(args) == 0 {
+		return &SchemeInt{Value: 1}, nil
+	}
+	result := toInt64(args[0])
+	if result < 0 {
+		result = -result
+	}
+	for _, a := range args[1:] {
+		b := toInt64(a)
+		if b < 0 {
+			b = -b
+		}
+		if result == 0 || b == 0 {
+			result = 0
+		} else {
+			result = result / intGCD(result, b) * b
+		}
+	}
+	return &SchemeInt{Value: result}, nil
+}
+
+func toInt64(v SchemeValue) int64 {
+	switch x := v.(type) {
+	case *SchemeInt:
+		return x.Value
+	case *SchemeFloat:
+		return int64(x.Value)
+	case *SchemeRational:
+		return x.Num / x.Den
+	}
+	return 0
+}
+
+// --- L21: truncate, round ---
+
+func builtinTruncate(args []SchemeValue, callExpr *ListExpr) (SchemeValue, error) {
+	if len(args) != 1 {
+		line, col := callExpr.Pos()
+		return nil, &EvalError{Message: fmt.Sprintf("%d:%d: truncate: requires exactly 1 argument", line, col)}
+	}
+	switch v := args[0].(type) {
+	case *SchemeInt:
+		return v, nil
+	case *SchemeFloat:
+		return &SchemeFloat{Value: math.Trunc(v.Value)}, nil
+	case *SchemeRational:
+		return &SchemeInt{Value: v.Num / v.Den}, nil
+	default:
+		line, col := callExpr.Pos()
+		return nil, &EvalError{Message: fmt.Sprintf("%d:%d: truncate: expected number", line, col)}
+	}
+}
+
+func builtinRound(args []SchemeValue, callExpr *ListExpr) (SchemeValue, error) {
+	if len(args) != 1 {
+		line, col := callExpr.Pos()
+		return nil, &EvalError{Message: fmt.Sprintf("%d:%d: round: requires exactly 1 argument", line, col)}
+	}
+	switch v := args[0].(type) {
+	case *SchemeInt:
+		return v, nil
+	case *SchemeFloat:
+		return &SchemeFloat{Value: math.RoundToEven(v.Value)}, nil
+	case *SchemeRational:
+		return &SchemeInt{Value: int64(math.RoundToEven(float64(v.Num) / float64(v.Den)))}, nil
+	default:
+		line, col := callExpr.Pos()
+		return nil, &EvalError{Message: fmt.Sprintf("%d:%d: round: expected number", line, col)}
+	}
+}
+
+// --- L21: make-string, string (constructor) ---
+
+func builtinMakeString(args []SchemeValue, callExpr *ListExpr) (SchemeValue, error) {
+	if len(args) < 1 || len(args) > 2 {
+		line, col := callExpr.Pos()
+		return nil, &EvalError{Message: fmt.Sprintf("%d:%d: make-string: requires 1 or 2 arguments", line, col)}
+	}
+	n, ok := args[0].(*SchemeInt)
+	if !ok {
+		line, col := callExpr.Pos()
+		return nil, &EvalError{Message: fmt.Sprintf("%d:%d: make-string: expected integer", line, col)}
+	}
+	ch := ' '
+	if len(args) == 2 {
+		c, ok := args[1].(*SchemeChar)
+		if !ok {
+			line, col := callExpr.Pos()
+			return nil, &EvalError{Message: fmt.Sprintf("%d:%d: make-string: expected char", line, col)}
+		}
+		ch = c.Value
+	}
+	return &SchemeString{Value: strings.Repeat(string(ch), int(n.Value)), Mutable: true}, nil
+}
+
+func builtinStringConstructor(args []SchemeValue, callExpr *ListExpr) (SchemeValue, error) {
+	var sb strings.Builder
+	for _, a := range args {
+		c, ok := a.(*SchemeChar)
+		if !ok {
+			line, col := callExpr.Pos()
+			return nil, &EvalError{Message: fmt.Sprintf("%d:%d: string: expected char", line, col)}
+		}
+		sb.WriteRune(c.Value)
+	}
+	return &SchemeString{Value: sb.String(), Mutable: true}, nil
+}
+
+// --- L21: string>?, string<=?, string>=? ---
+
+func builtinStringGtQ(args []SchemeValue, callExpr *ListExpr) (SchemeValue, error) {
+	if len(args) != 2 {
+		line, col := callExpr.Pos()
+		return nil, &EvalError{Message: fmt.Sprintf("%d:%d: string>?: requires exactly 2 arguments", line, col)}
+	}
+	a, ok1 := args[0].(*SchemeString)
+	b, ok2 := args[1].(*SchemeString)
+	if !ok1 || !ok2 {
+		line, col := callExpr.Pos()
+		return nil, &EvalError{Message: fmt.Sprintf("%d:%d: string>?: expected strings", line, col)}
+	}
+	return &SchemeBool{Value: a.Value > b.Value}, nil
+}
+
+func builtinStringLeQ(args []SchemeValue, callExpr *ListExpr) (SchemeValue, error) {
+	if len(args) != 2 {
+		line, col := callExpr.Pos()
+		return nil, &EvalError{Message: fmt.Sprintf("%d:%d: string<=?: requires exactly 2 arguments", line, col)}
+	}
+	a, ok1 := args[0].(*SchemeString)
+	b, ok2 := args[1].(*SchemeString)
+	if !ok1 || !ok2 {
+		line, col := callExpr.Pos()
+		return nil, &EvalError{Message: fmt.Sprintf("%d:%d: string<=?: expected strings", line, col)}
+	}
+	return &SchemeBool{Value: a.Value <= b.Value}, nil
+}
+
+func builtinStringGeQ(args []SchemeValue, callExpr *ListExpr) (SchemeValue, error) {
+	if len(args) != 2 {
+		line, col := callExpr.Pos()
+		return nil, &EvalError{Message: fmt.Sprintf("%d:%d: string>=?: requires exactly 2 arguments", line, col)}
+	}
+	a, ok1 := args[0].(*SchemeString)
+	b, ok2 := args[1].(*SchemeString)
+	if !ok1 || !ok2 {
+		line, col := callExpr.Pos()
+		return nil, &EvalError{Message: fmt.Sprintf("%d:%d: string>=?: expected strings", line, col)}
+	}
+	return &SchemeBool{Value: a.Value >= b.Value}, nil
+}
+
+// --- L21: memq, memv, member ---
+
+func builtinMemq(args []SchemeValue, callExpr *ListExpr) (SchemeValue, error) {
+	if len(args) != 2 {
+		line, col := callExpr.Pos()
+		return nil, &EvalError{Message: fmt.Sprintf("%d:%d: memq: requires exactly 2 arguments", line, col)}
+	}
+	obj := args[0]
+	cur := args[1]
+	for {
+		switch c := cur.(type) {
+		case *SchemePair:
+			if schemeEq(obj, c.Car) {
+				return c, nil
+			}
+			cur = c.Cdr
+		case *SchemeEmpty:
+			return &SchemeBool{Value: false}, nil
+		default:
+			return &SchemeBool{Value: false}, nil
+		}
+	}
+}
+
+func builtinMemv(args []SchemeValue, callExpr *ListExpr) (SchemeValue, error) {
+	if len(args) != 2 {
+		line, col := callExpr.Pos()
+		return nil, &EvalError{Message: fmt.Sprintf("%d:%d: memv: requires exactly 2 arguments", line, col)}
+	}
+	obj := args[0]
+	cur := args[1]
+	for {
+		switch c := cur.(type) {
+		case *SchemePair:
+			if schemeEqv(obj, c.Car) {
+				return c, nil
+			}
+			cur = c.Cdr
+		case *SchemeEmpty:
+			return &SchemeBool{Value: false}, nil
+		default:
+			return &SchemeBool{Value: false}, nil
+		}
+	}
+}
+
+func builtinMember(args []SchemeValue, callExpr *ListExpr) (SchemeValue, error) {
+	if len(args) != 2 {
+		line, col := callExpr.Pos()
+		return nil, &EvalError{Message: fmt.Sprintf("%d:%d: member: requires exactly 2 arguments", line, col)}
+	}
+	obj := args[0]
+	cur := args[1]
+	for {
+		switch c := cur.(type) {
+		case *SchemePair:
+			if schemeEqual(obj, c.Car) {
+				return c, nil
+			}
+			cur = c.Cdr
+		case *SchemeEmpty:
+			return &SchemeBool{Value: false}, nil
+		default:
+			return &SchemeBool{Value: false}, nil
+		}
+	}
+}
+
+// --- L21: assq, assv ---
+
+func builtinAssq(args []SchemeValue, callExpr *ListExpr) (SchemeValue, error) {
+	if len(args) != 2 {
+		line, col := callExpr.Pos()
+		return nil, &EvalError{Message: fmt.Sprintf("%d:%d: assq: requires exactly 2 arguments", line, col)}
+	}
+	key := args[0]
+	cur := args[1]
+	for {
+		switch c := cur.(type) {
+		case *SchemePair:
+			pair, ok := c.Car.(*SchemePair)
+			if ok && schemeEq(key, pair.Car) {
+				return pair, nil
+			}
+			cur = c.Cdr
+		case *SchemeEmpty:
+			return &SchemeBool{Value: false}, nil
+		default:
+			return &SchemeBool{Value: false}, nil
+		}
+	}
+}
+
+func builtinAssv(args []SchemeValue, callExpr *ListExpr) (SchemeValue, error) {
+	if len(args) != 2 {
+		line, col := callExpr.Pos()
+		return nil, &EvalError{Message: fmt.Sprintf("%d:%d: assv: requires exactly 2 arguments", line, col)}
+	}
+	key := args[0]
+	cur := args[1]
+	for {
+		switch c := cur.(type) {
+		case *SchemePair:
+			pair, ok := c.Car.(*SchemePair)
+			if ok && schemeEqv(key, pair.Car) {
+				return pair, nil
+			}
+			cur = c.Cdr
+		case *SchemeEmpty:
+			return &SchemeBool{Value: false}, nil
+		default:
+			return &SchemeBool{Value: false}, nil
+		}
+	}
 }
