@@ -623,9 +623,208 @@ function applyBuiltin(op: string, evalArgs: SchemeVal[], p?: Pos, out?: string[]
       if (evalArgs.length !== 1) throw posError('char?: need exactly one arg', p);
       return { tag: 'boolean', val: evalArgs[0].tag === 'char' };
     }
+    // ── L13 Numeric builtins ──
+    case 'abs': {
+      if (evalArgs.length !== 1) throw posError('abs: need exactly one arg', p);
+      return { tag: 'number', val: Math.abs(toNumber(evalArgs[0], 'abs', p)) };
+    }
+    case 'modulo': {
+      if (evalArgs.length !== 2) throw posError('modulo: need exactly two args', p);
+      const a = toNumber(evalArgs[0], 'modulo', p);
+      const b = toNumber(evalArgs[1], 'modulo', p);
+      if (b === 0) throw posError('modulo: division by zero', p);
+      return { tag: 'number', val: ((a % b) + b) % b };
+    }
+    case 'remainder': {
+      if (evalArgs.length !== 2) throw posError('remainder: need exactly two args', p);
+      const a = toNumber(evalArgs[0], 'remainder', p);
+      const b = toNumber(evalArgs[1], 'remainder', p);
+      if (b === 0) throw posError('remainder: division by zero', p);
+      return { tag: 'number', val: a % b };
+    }
+    case 'quotient': {
+      if (evalArgs.length !== 2) throw posError('quotient: need exactly two args', p);
+      const a = toNumber(evalArgs[0], 'quotient', p);
+      const b = toNumber(evalArgs[1], 'quotient', p);
+      if (b === 0) throw posError('quotient: division by zero', p);
+      return { tag: 'number', val: Math.trunc(a / b) };
+    }
+    case 'min': {
+      if (evalArgs.length === 0) throw posError('min: need at least one arg', p);
+      let m = toNumber(evalArgs[0], 'min', p);
+      for (let i = 1; i < evalArgs.length; i++) {
+        const v = toNumber(evalArgs[i], 'min', p);
+        if (v < m) m = v;
+      }
+      return { tag: 'number', val: m };
+    }
+    case 'max': {
+      if (evalArgs.length === 0) throw posError('max: need at least one arg', p);
+      let m = toNumber(evalArgs[0], 'max', p);
+      for (let i = 1; i < evalArgs.length; i++) {
+        const v = toNumber(evalArgs[i], 'max', p);
+        if (v > m) m = v;
+      }
+      return { tag: 'number', val: m };
+    }
+    case 'expt': {
+      if (evalArgs.length !== 2) throw posError('expt: need exactly two args', p);
+      const base = toNumber(evalArgs[0], 'expt', p);
+      const exp = toNumber(evalArgs[1], 'expt', p);
+      return { tag: 'number', val: Math.pow(base, exp) };
+    }
+    case 'zero?': {
+      if (evalArgs.length !== 1) throw posError('zero?: need exactly one arg', p);
+      return { tag: 'boolean', val: toNumber(evalArgs[0], 'zero?', p) === 0 };
+    }
+    case 'positive?': {
+      if (evalArgs.length !== 1) throw posError('positive?: need exactly one arg', p);
+      return { tag: 'boolean', val: toNumber(evalArgs[0], 'positive?', p) > 0 };
+    }
+    case 'negative?': {
+      if (evalArgs.length !== 1) throw posError('negative?: need exactly one arg', p);
+      return { tag: 'boolean', val: toNumber(evalArgs[0], 'negative?', p) < 0 };
+    }
+    case 'odd?': {
+      if (evalArgs.length !== 1) throw posError('odd?: need exactly one arg', p);
+      return { tag: 'boolean', val: Math.abs(toNumber(evalArgs[0], 'odd?', p)) % 2 === 1 };
+    }
+    case 'even?': {
+      if (evalArgs.length !== 1) throw posError('even?: need exactly one arg', p);
+      return { tag: 'boolean', val: toNumber(evalArgs[0], 'even?', p) % 2 === 0 };
+    }
+    // ── L13 List builtins ──
+    case 'list-ref': {
+      if (evalArgs.length !== 2) throw posError('list-ref: need exactly two args', p);
+      if (evalArgs[0].tag !== 'list') throw posError('list-ref: expected list', p);
+      const idx = toNumber(evalArgs[1], 'list-ref', p);
+      const lst = evalArgs[0].val;
+      if (idx < 0 || idx >= lst.length) throw posError('list-ref: index out of range', p);
+      return lst[idx];
+    }
+    case 'list-tail': {
+      if (evalArgs.length !== 2) throw posError('list-tail: need exactly two args', p);
+      if (evalArgs[0].tag !== 'list') throw posError('list-tail: expected list', p);
+      const idx = toNumber(evalArgs[1], 'list-tail', p);
+      const lst = evalArgs[0].val;
+      if (idx < 0 || idx > lst.length) throw posError('list-tail: index out of range', p);
+      return { tag: 'list', val: lst.slice(idx) };
+    }
+    case 'list?': {
+      if (evalArgs.length !== 1) throw posError('list?: need exactly one arg', p);
+      const v = evalArgs[0];
+      if (v.tag !== 'list') return { tag: 'boolean', val: false };
+      // Check for proper list (no dotted pair)
+      const items = v.val;
+      if (items.length >= 3 && items[items.length - 2].tag === 'symbol' && (items[items.length - 2] as any).val === '.') {
+        return { tag: 'boolean', val: false };
+      }
+      return { tag: 'boolean', val: true };
+    }
+    case 'assoc': {
+      if (evalArgs.length !== 2) throw posError('assoc: need exactly two args', p);
+      const key = evalArgs[0];
+      const alist = evalArgs[1];
+      if (alist.tag !== 'list') throw posError('assoc: expected list', p);
+      for (const pair of alist.val) {
+        if (pair.tag !== 'list' || pair.val.length === 0) continue;
+        if (schemeEqual(key, pair.val[0])) return pair;
+      }
+      return { tag: 'boolean', val: false };
+    }
+    case 'eq?': {
+      if (evalArgs.length !== 2) throw posError('eq?: need exactly two args', p);
+      const [a, b] = evalArgs;
+      if (a.tag !== b.tag) return { tag: 'boolean', val: false };
+      if (a.tag === 'number' && b.tag === 'number') return { tag: 'boolean', val: a.val === b.val };
+      if (a.tag === 'boolean' && b.tag === 'boolean') return { tag: 'boolean', val: a.val === b.val };
+      if (a.tag === 'symbol' && b.tag === 'symbol') return { tag: 'boolean', val: a.val === b.val };
+      if (a.tag === 'char' && b.tag === 'char') return { tag: 'boolean', val: a.val === b.val };
+      if (a.tag === 'string' && b.tag === 'string') return { tag: 'boolean', val: a === b }; // identity
+      if (a.tag === 'list' && b.tag === 'list') return { tag: 'boolean', val: a === b }; // identity
+      return { tag: 'boolean', val: false };
+    }
+    case 'equal?': {
+      if (evalArgs.length !== 2) throw posError('equal?: need exactly two args', p);
+      return { tag: 'boolean', val: schemeEqual(evalArgs[0], evalArgs[1]) };
+    }
+    // ── L13 Char builtins ──
+    case 'char-alphabetic?': {
+      if (evalArgs.length !== 1) throw posError('char-alphabetic?: need exactly one arg', p);
+      if (evalArgs[0].tag !== 'char') throw posError('char-alphabetic?: expected char', p);
+      return { tag: 'boolean', val: /^[a-zA-Z]$/.test(evalArgs[0].val) };
+    }
+    case 'char-numeric?': {
+      if (evalArgs.length !== 1) throw posError('char-numeric?: need exactly one arg', p);
+      if (evalArgs[0].tag !== 'char') throw posError('char-numeric?: expected char', p);
+      return { tag: 'boolean', val: /^[0-9]$/.test(evalArgs[0].val) };
+    }
+    case 'char-upcase': {
+      if (evalArgs.length !== 1) throw posError('char-upcase: need exactly one arg', p);
+      if (evalArgs[0].tag !== 'char') throw posError('char-upcase: expected char', p);
+      return { tag: 'char', val: evalArgs[0].val.toUpperCase() };
+    }
+    case 'char-downcase': {
+      if (evalArgs.length !== 1) throw posError('char-downcase: need exactly one arg', p);
+      if (evalArgs[0].tag !== 'char') throw posError('char-downcase: expected char', p);
+      return { tag: 'char', val: evalArgs[0].val.toLowerCase() };
+    }
+    case 'char=?': {
+      if (evalArgs.length !== 2) throw posError('char=?: need exactly two args', p);
+      if (evalArgs[0].tag !== 'char' || evalArgs[1].tag !== 'char') throw posError('char=?: expected chars', p);
+      return { tag: 'boolean', val: evalArgs[0].val === evalArgs[1].val };
+    }
+    case 'char<?': {
+      if (evalArgs.length !== 2) throw posError('char<?: need exactly two args', p);
+      if (evalArgs[0].tag !== 'char' || evalArgs[1].tag !== 'char') throw posError('char<?: expected chars', p);
+      return { tag: 'boolean', val: evalArgs[0].val.charCodeAt(0) < evalArgs[1].val.charCodeAt(0) };
+    }
+    // ── L13 String builtins ──
+    case 'string=?': {
+      if (evalArgs.length !== 2) throw posError('string=?: need exactly two args', p);
+      if (evalArgs[0].tag !== 'string' || evalArgs[1].tag !== 'string') throw posError('string=?: expected strings', p);
+      return { tag: 'boolean', val: evalArgs[0].val === evalArgs[1].val };
+    }
+    case 'string<?': {
+      if (evalArgs.length !== 2) throw posError('string<?: need exactly two args', p);
+      if (evalArgs[0].tag !== 'string' || evalArgs[1].tag !== 'string') throw posError('string<?: expected strings', p);
+      return { tag: 'boolean', val: evalArgs[0].val < evalArgs[1].val };
+    }
+    case 'string-ci=?': {
+      if (evalArgs.length !== 2) throw posError('string-ci=?: need exactly two args', p);
+      if (evalArgs[0].tag !== 'string' || evalArgs[1].tag !== 'string') throw posError('string-ci=?: expected strings', p);
+      return { tag: 'boolean', val: evalArgs[0].val.toLowerCase() === evalArgs[1].val.toLowerCase() };
+    }
+    case 'string-upcase': {
+      if (evalArgs.length !== 1) throw posError('string-upcase: need exactly one arg', p);
+      if (evalArgs[0].tag !== 'string') throw posError('string-upcase: expected string', p);
+      return { tag: 'string', val: evalArgs[0].val.toUpperCase() };
+    }
+    case 'string-downcase': {
+      if (evalArgs.length !== 1) throw posError('string-downcase: need exactly one arg', p);
+      if (evalArgs[0].tag !== 'string') throw posError('string-downcase: expected string', p);
+      return { tag: 'string', val: evalArgs[0].val.toLowerCase() };
+    }
     default:
       throw posError(`unknown procedure: ${op}`, p);
   }
+}
+
+function schemeEqual(a: SchemeVal, b: SchemeVal): boolean {
+  if (a.tag !== b.tag) return false;
+  if (a.tag === 'number' && b.tag === 'number') return a.val === b.val;
+  if (a.tag === 'boolean' && b.tag === 'boolean') return a.val === b.val;
+  if (a.tag === 'string' && b.tag === 'string') return a.val === b.val;
+  if (a.tag === 'char' && b.tag === 'char') return a.val === b.val;
+  if (a.tag === 'symbol' && b.tag === 'symbol') return a.val === b.val;
+  if (a.tag === 'list' && b.tag === 'list') {
+    if (a.val.length !== b.val.length) return false;
+    for (let i = 0; i < a.val.length; i++) {
+      if (!schemeEqual(a.val[i], b.val[i])) return false;
+    }
+    return true;
+  }
+  return false;
 }
 
 const BUILTINS = new Set(['+', '-', '*', '/', '<', '>', '=', '<=', '>=', 'not',
@@ -633,7 +832,12 @@ const BUILTINS = new Set(['+', '-', '*', '/', '<', '>', '=', '<=', '>=', 'not',
   'pair?', 'number?', 'string?', 'boolean?', 'symbol?', 'procedure?', 'char?',
   'display', 'write', 'newline',
   'string-append', 'string-length', 'substring', 'string->number', 'number->string',
-  'symbol->string', 'string->symbol', 'string-ref', 'string-copy', 'string-set!']);
+  'symbol->string', 'string->symbol', 'string-ref', 'string-copy', 'string-set!',
+  'abs', 'modulo', 'remainder', 'quotient', 'min', 'max', 'expt',
+  'zero?', 'positive?', 'negative?', 'odd?', 'even?',
+  'list-ref', 'list-tail', 'list?', 'assoc', 'eq?', 'equal?',
+  'char-alphabetic?', 'char-numeric?', 'char-upcase', 'char-downcase', 'char=?', 'char<?',
+  'string=?', 'string<?', 'string-ci=?', 'string-upcase', 'string-downcase']);
 
 function parseParams(paramList: SchemeVal, p?: Pos): { params: string[]; rest?: string } {
   if (paramList.tag !== 'list') throw posError('params must be a list', p);
@@ -708,6 +912,23 @@ function applyCPS(proc: SchemeVal, args: SchemeVal[], k: Cont, p?: Pos, out?: st
       if (args.length !== 1) throw posError(`${proc.name}: need exactly one arg`, p);
       const contVal: SchemeVal = { tag: 'continuation', cont: k };
       return () => applyCPS(args[0], [contVal], k, p, out);
+    }
+    if (proc.name === 'map') {
+      if (args.length < 2) throw posError('map: need at least two args', p);
+      const fn = args[0];
+      const lists = args.slice(1);
+      for (const l of lists) {
+        if (l.tag !== 'list') throw posError('map: expected list', p);
+      }
+      const len = (lists[0] as SchemeVal & { tag: 'list' }).val.length;
+      const mapLoop = (i: number, acc: SchemeVal[]): Bounce => {
+        if (i >= len) return k({ tag: 'list', val: acc });
+        const callArgs = lists.map(l => (l as SchemeVal & { tag: 'list' }).val[i]);
+        return () => applyCPS(fn, callArgs, val => {
+          return () => mapLoop(i + 1, [...acc, val]);
+        }, p, out);
+      };
+      return mapLoop(0, []);
     }
     if (proc.name === 'apply') {
       if (args.length < 2) throw posError('apply: need at least two args', p);
@@ -947,6 +1168,7 @@ function evalCPS(expr: SchemeVal, env: Env, k: Cont, out?: string[]): Bounce {
 function makeGlobalEnv(): Env {
   const env = new Env();
   env.define('apply', { tag: 'builtin', name: 'apply' });
+  env.define('map', { tag: 'builtin', name: 'map' });
   env.define('call/cc', { tag: 'builtin', name: 'call/cc' });
   env.define('call-with-current-continuation', { tag: 'builtin', name: 'call-with-current-continuation' });
   for (const name of BUILTINS) {
