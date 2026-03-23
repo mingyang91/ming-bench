@@ -21,7 +21,8 @@ type SchemeVal =
   | { tag: 'continuation'; fn: Kont; pos?: Pos }
   | { tag: 'callcc'; pos?: Pos }
   | { tag: 'macro'; literals: string[]; rules: SyntaxRule[]; defEnv: Env; pos?: Pos }
-  | { tag: 'values'; elements: SchemeVal[]; pos?: Pos };
+  | { tag: 'values'; elements: SchemeVal[]; pos?: Pos }
+  | { tag: 'rational'; num: number; den: number; pos?: Pos };
 
 type SyntaxRule = { pattern: SchemeVal[]; template: SchemeVal };
 
@@ -125,6 +126,13 @@ function parseAtom(token: string, pos: Pos): SchemeVal {
   if (token.startsWith('"') && token.endsWith('"')) {
     const inner = token.slice(1, -1).replace(/\\n/g, '\n').replace(/\\t/g, '\t').replace(/\\"/g, '"').replace(/\\\\/g, '\\');
     return { tag: 'string', value: inner, pos };
+  }
+  // Rational literal: e.g. 1/3, -5/2
+  const ratMatch = token.match(/^(-?\d+)\/(\d+)$/);
+  if (ratMatch) {
+    const rn = parseInt(ratMatch[1], 10);
+    const rd = parseInt(ratMatch[2], 10);
+    if (rd !== 0) return makeRational(rn, rd, pos);
   }
   const num = Number(token);
   if (!isNaN(num) && token !== '') return { tag: 'number', value: num, pos };
@@ -290,8 +298,44 @@ function isTruthy(val: SchemeVal): boolean {
 }
 
 function expectNumber(val: SchemeVal, op: string, p?: Pos): number {
-  if (val.tag !== 'number') throw posError(`${op}: expected number`, p);
-  return val.value;
+  if (val.tag === 'number') return val.value;
+  if (val.tag === 'rational') return val.num / val.den;
+  throw posError(`${op}: expected number`, p);
+}
+
+function gcd(a: number, b: number): number {
+  a = Math.abs(a); b = Math.abs(b);
+  while (b) { [a, b] = [b, a % b]; }
+  return a;
+}
+
+function makeRational(num: number, den: number, pos?: Pos): SchemeVal {
+  if (den === 0) throw posError('division by zero', pos);
+  if (den < 0) { num = -num; den = -den; }
+  const g = gcd(Math.abs(num), den);
+  num = num / g; den = den / g;
+  if (den === 1) return { tag: 'number', value: num, pos };
+  return { tag: 'rational', num, den, pos };
+}
+
+function isExactNum(v: SchemeVal): boolean {
+  return v.tag === 'rational' || (v.tag === 'number' && Number.isInteger(v.value) && (v as any).exact !== false);
+}
+
+function toRatParts(v: SchemeVal): [number, number] {
+  if (v.tag === 'rational') return [v.num, v.den];
+  if (v.tag === 'number') return [v.value, 1];
+  throw new EvalError('not a number');
+}
+
+function numericFloat(v: SchemeVal, op: string, p?: Pos): number {
+  if (v.tag === 'number') return v.value;
+  if (v.tag === 'rational') return v.num / v.den;
+  throw posError(`${op}: expected number`, p);
+}
+
+function isNumericVal(v: SchemeVal): boolean {
+  return v.tag === 'number' || v.tag === 'rational';
 }
 
 function done(v: SchemeVal): Bounce { return { done: true, value: v }; }
@@ -866,21 +910,33 @@ function applyK(proc: SchemeVal, args: SchemeVal[], k: Kont, pos?: Pos): Bounce 
 // ── Helpers ────────────────────────────────────────────────────────
 
 function schemeEqv(a: SchemeVal, b: SchemeVal): boolean {
-  if (a.tag !== b.tag) return false;
+  if (a.tag !== b.tag) {
+    if ((a.tag === 'number' || a.tag === 'rational') && (b.tag === 'number' || b.tag === 'rational')) {
+      return numericFloat(a, 'eqv?') === numericFloat(b, 'eqv?');
+    }
+    return false;
+  }
   switch (a.tag) {
     case 'number': return a.value === (b as typeof a).value;
-    case 'boolean': return a.value === (b as typeof a).value;
-    case 'symbol': return a.value === (b as typeof a).value;
-    case 'char': return a.value === (b as typeof a).value;
+    case 'rational': return a.num === (b as Extract<SchemeVal, {tag:'rational'}>).num && a.den === (b as Extract<SchemeVal, {tag:'rational'}>).den;
+    case 'boolean': return a.value === (b as Extract<SchemeVal, {tag:'boolean'}>).value;
+    case 'symbol': return a.value === (b as Extract<SchemeVal, {tag:'symbol'}>).value;
+    case 'char': return a.value === (b as Extract<SchemeVal, {tag:'char'}>).value;
     case 'void': return true;
     default: return a === b;
   }
 }
 
 function schemeEqual(a: SchemeVal, b: SchemeVal): boolean {
-  if (a.tag !== b.tag) return false;
+  if (a.tag !== b.tag) {
+    if ((a.tag === 'number' || a.tag === 'rational') && (b.tag === 'number' || b.tag === 'rational')) {
+      return numericFloat(a, 'equal?') === numericFloat(b, 'equal?');
+    }
+    return false;
+  }
   switch (a.tag) {
     case 'number': return a.value === (b as typeof a).value;
+    case 'rational': return a.num === (b as Extract<SchemeVal, {tag:'rational'}>).num && a.den === (b as Extract<SchemeVal, {tag:'rational'}>).den;
     case 'boolean': return a.value === (b as typeof a).value;
     case 'string': return a.value === (b as typeof a).value;
     case 'symbol': return a.value === (b as typeof a).value;
@@ -934,26 +990,55 @@ function makeGlobalEnv(output: string[] = []): Env {
   } });
   env.set('call-with-values', { tag: 'builtin', name: 'call-with-values', fn: () => { throw new EvalError('internal: call-with-values handled by applyK'); } });
 
-  defBuiltin('+', (args, p) => { let s = 0; for (const a of args) s += expectNumber(a, '+', p); return { tag: 'number', value: s }; });
+  defBuiltin('+', (args, p) => {
+    for (const a of args) if (!isNumericVal(a)) throw posError('+: expected number', p);
+    if (args.every(isExactNum)) {
+      let n = 0, d = 1;
+      for (const a of args) { const [an, ad] = toRatParts(a); n = n * ad + an * d; d = d * ad; }
+      return makeRational(n, d, p);
+    }
+    let s = 0; for (const a of args) s += numericFloat(a, '+', p); return { tag: 'number', value: s };
+  });
   defBuiltin('-', (args, p) => {
     if (args.length === 0) throw posError('-: need at least 1 argument', p);
-    if (args.length === 1) return { tag: 'number', value: -expectNumber(args[0], '-', p) };
-    let r = expectNumber(args[0], '-', p);
-    for (let i = 1; i < args.length; i++) r -= expectNumber(args[i], '-', p);
+    for (const a of args) if (!isNumericVal(a)) throw posError('-: expected number', p);
+    if (args.every(isExactNum)) {
+      if (args.length === 1) { const [n, d] = toRatParts(args[0]); return makeRational(-n, d, p); }
+      let [n, d] = toRatParts(args[0]);
+      for (let i = 1; i < args.length; i++) { const [an, ad] = toRatParts(args[i]); n = n * ad - an * d; d = d * ad; }
+      return makeRational(n, d, p);
+    }
+    if (args.length === 1) return { tag: 'number', value: -numericFloat(args[0], '-', p) };
+    let r = numericFloat(args[0], '-', p);
+    for (let i = 1; i < args.length; i++) r -= numericFloat(args[i], '-', p);
     return { tag: 'number', value: r };
   });
-  defBuiltin('*', (args, p) => { let s = 1; for (const a of args) s *= expectNumber(a, '*', p); return { tag: 'number', value: s }; });
+  defBuiltin('*', (args, p) => {
+    for (const a of args) if (!isNumericVal(a)) throw posError('*: expected number', p);
+    if (args.every(isExactNum)) {
+      let n = 1, d = 1;
+      for (const a of args) { const [an, ad] = toRatParts(a); n *= an; d *= ad; }
+      return makeRational(n, d, p);
+    }
+    let s = 1; for (const a of args) s *= numericFloat(a, '*', p); return { tag: 'number', value: s };
+  });
   defBuiltin('/', (args, p) => {
     if (args.length < 2) throw posError('/: need at least 2 arguments', p);
-    let r = expectNumber(args[0], '/', p);
-    for (let i = 1; i < args.length; i++) { const d = expectNumber(args[i], '/', p); if (d === 0) throw posError('division by zero', p); r = Math.trunc(r / d); }
+    for (const a of args) if (!isNumericVal(a)) throw posError('/: expected number', p);
+    if (args.every(isExactNum)) {
+      let [n, d] = toRatParts(args[0]);
+      for (let i = 1; i < args.length; i++) { const [an, ad] = toRatParts(args[i]); if (an === 0) throw posError('division by zero', p); n *= ad; d *= an; }
+      return makeRational(n, d, p);
+    }
+    let r = numericFloat(args[0], '/', p);
+    for (let i = 1; i < args.length; i++) { const dv = numericFloat(args[i], '/', p); if (dv === 0) throw posError('division by zero', p); r /= dv; }
     return { tag: 'number', value: r };
   });
-  defBuiltin('<', (args, p) => { if (args.length !== 2) throw posError('<: need 2 arguments', p); return { tag: 'boolean', value: expectNumber(args[0], '<', p) < expectNumber(args[1], '<', p) }; });
-  defBuiltin('>', (args, p) => { if (args.length !== 2) throw posError('>: need 2 arguments', p); return { tag: 'boolean', value: expectNumber(args[0], '>', p) > expectNumber(args[1], '>', p) }; });
-  defBuiltin('=', (args, p) => { if (args.length !== 2) throw posError('=: need 2 arguments', p); return { tag: 'boolean', value: expectNumber(args[0], '=', p) === expectNumber(args[1], '=', p) }; });
-  defBuiltin('<=', (args, p) => { if (args.length !== 2) throw posError('<=: need 2 arguments', p); return { tag: 'boolean', value: expectNumber(args[0], '<=', p) <= expectNumber(args[1], '<=', p) }; });
-  defBuiltin('>=', (args, p) => { if (args.length !== 2) throw posError('>=: need 2 arguments', p); return { tag: 'boolean', value: expectNumber(args[0], '>=', p) >= expectNumber(args[1], '>=', p) }; });
+  defBuiltin('<', (args, p) => { if (args.length !== 2) throw posError('<: need 2 arguments', p); return { tag: 'boolean', value: numericFloat(args[0], '<', p) < numericFloat(args[1], '<', p) }; });
+  defBuiltin('>', (args, p) => { if (args.length !== 2) throw posError('>: need 2 arguments', p); return { tag: 'boolean', value: numericFloat(args[0], '>', p) > numericFloat(args[1], '>', p) }; });
+  defBuiltin('=', (args, p) => { if (args.length !== 2) throw posError('=: need 2 arguments', p); return { tag: 'boolean', value: numericFloat(args[0], '=', p) === numericFloat(args[1], '=', p) }; });
+  defBuiltin('<=', (args, p) => { if (args.length !== 2) throw posError('<=: need 2 arguments', p); return { tag: 'boolean', value: numericFloat(args[0], '<=', p) <= numericFloat(args[1], '<=', p) }; });
+  defBuiltin('>=', (args, p) => { if (args.length !== 2) throw posError('>=: need 2 arguments', p); return { tag: 'boolean', value: numericFloat(args[0], '>=', p) >= numericFloat(args[1], '>=', p) }; });
   defBuiltin('not', (args, p) => { if (args.length !== 1) throw posError('not: need 1 argument', p); return { tag: 'boolean', value: !isTruthy(args[0]) }; });
 
   // List operations
@@ -1009,7 +1094,7 @@ function makeGlobalEnv(output: string[] = []): Env {
   });
 
   // Type predicates
-  defBuiltin('number?', (args, p) => { if (args.length !== 1) throw posError('number?: need 1 argument', p); return { tag: 'boolean', value: args[0].tag === 'number' }; });
+  defBuiltin('number?', (args, p) => { if (args.length !== 1) throw posError('number?: need 1 argument', p); return { tag: 'boolean', value: args[0].tag === 'number' || args[0].tag === 'rational' }; });
   defBuiltin('string?', (args, p) => { if (args.length !== 1) throw posError('string?: need 1 argument', p); return { tag: 'boolean', value: args[0].tag === 'string' }; });
   defBuiltin('boolean?', (args, p) => { if (args.length !== 1) throw posError('boolean?: need 1 argument', p); return { tag: 'boolean', value: args[0].tag === 'boolean' }; });
   defBuiltin('pair?', (args, p) => { if (args.length !== 1) throw posError('pair?: need 1 argument', p); return { tag: 'boolean', value: args[0].tag === 'list' && args[0].elements.length > 0 }; });
@@ -1252,6 +1337,63 @@ function makeGlobalEnv(output: string[] = []): Env {
   defBuiltin('odd?', (args, p) => { if (args.length !== 1) throw posError('odd?: need 1 argument', p); return { tag: 'boolean', value: Math.abs(expectNumber(args[0], 'odd?', p)) % 2 === 1 }; });
   defBuiltin('even?', (args, p) => { if (args.length !== 1) throw posError('even?: need 1 argument', p); return { tag: 'boolean', value: expectNumber(args[0], 'even?', p) % 2 === 0 }; });
 
+  // Exact/inexact predicates and conversions
+  defBuiltin('exact?', (args, p) => {
+    if (args.length !== 1) throw posError('exact?: need 1 argument', p);
+    return { tag: 'boolean', value: isExactNum(args[0]) };
+  });
+  defBuiltin('inexact?', (args, p) => {
+    if (args.length !== 1) throw posError('inexact?: need 1 argument', p);
+    const v = args[0];
+    return { tag: 'boolean', value: v.tag === 'number' && !Number.isInteger(v.value) };
+  });
+  defBuiltin('rational?', (args, p) => {
+    if (args.length !== 1) throw posError('rational?: need 1 argument', p);
+    return { tag: 'boolean', value: isExactNum(args[0]) };
+  });
+  defBuiltin('integer?', (args, p) => {
+    if (args.length !== 1) throw posError('integer?: need 1 argument', p);
+    const v = args[0];
+    if (v.tag === 'number') return { tag: 'boolean', value: Number.isInteger(v.value) };
+    if (v.tag === 'rational') return { tag: 'boolean', value: v.den === 1 };
+    return { tag: 'boolean', value: false };
+  });
+  defBuiltin('exact->inexact', (args, p) => {
+    if (args.length !== 1) throw posError('exact->inexact: need 1 argument', p);
+    const v = args[0];
+    const f = numericFloat(v, 'exact->inexact', p);
+    return { tag: 'number', value: f, exact: false } as any;
+  });
+  defBuiltin('inexact->exact', (args, p) => {
+    if (args.length !== 1) throw posError('inexact->exact: need 1 argument', p);
+    const v = args[0];
+    const f = numericFloat(v, 'inexact->exact', p);
+    // Convert float to rational via continued fraction approximation
+    if (Number.isInteger(f)) return { tag: 'number', value: f };
+    // Use a simple approach: multiply by power of 2 to get integer ratio
+    const eps = 1e-10;
+    let bestNum = Math.round(f), bestDen = 1;
+    for (let d = 1; d <= 1000000; d++) {
+      const n = Math.round(f * d);
+      if (Math.abs(n / d - f) < eps) { bestNum = n; bestDen = d; break; }
+    }
+    return makeRational(bestNum, bestDen, p);
+  });
+  defBuiltin('numerator', (args, p) => {
+    if (args.length !== 1) throw posError('numerator: need 1 argument', p);
+    const v = args[0];
+    if (v.tag === 'rational') return { tag: 'number', value: v.num };
+    if (v.tag === 'number' && Number.isInteger(v.value)) return { tag: 'number', value: v.value };
+    throw posError('numerator: expected exact number', p);
+  });
+  defBuiltin('denominator', (args, p) => {
+    if (args.length !== 1) throw posError('denominator: need 1 argument', p);
+    const v = args[0];
+    if (v.tag === 'rational') return { tag: 'number', value: v.den };
+    if (v.tag === 'number' && Number.isInteger(v.value)) return { tag: 'number', value: 1 };
+    throw posError('denominator: expected exact number', p);
+  });
+
   // List utilities
   defBuiltin('list-ref', (args, p) => {
     if (args.length !== 2) throw posError('list-ref: need 2 arguments', p);
@@ -1311,7 +1453,11 @@ function makeGlobalEnv(output: string[] = []): Env {
 
 function displayVal(val: SchemeVal): string {
   switch (val.tag) {
-    case 'number': return String(val.value);
+    case 'number': {
+      if ((val as any).exact === false && Number.isInteger(val.value)) return val.value.toFixed(1);
+      return String(val.value);
+    }
+    case 'rational': return `${val.num}/${val.den}`;
     case 'boolean': return val.value ? '#t' : '#f';
     case 'string': return `"${val.value}"`;
     case 'symbol': return val.value;
