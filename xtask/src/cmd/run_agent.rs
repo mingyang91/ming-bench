@@ -387,8 +387,7 @@ fn run_full_mode(
 // Regression checking
 // ---------------------------------------------------------------------------
 
-/// Maximum turns for a regression-fix agent pass.
-const REGRESSION_FIX_TURNS: u32 = 15;
+// Regression fix turns now use turns_for_level() — same budget as coding.
 
 /// Run all previously-passed levels against the current worktree code.
 /// Returns a list of (level_label, test_output) for any that now fail.
@@ -443,6 +442,7 @@ fn run_regression_fix(
     level_dir: &Path,
     regressions: &[(String, String)],
     current_level: &str,
+    turns: u32,
 ) -> i32 {
     let prompt = build_regression_prompt(regressions, current_level, &args.lang);
     let regression_uuid = uuid_v4();
@@ -454,7 +454,7 @@ fn run_regression_fix(
         &prompt,
         &regression_uuid,
         &output_file,
-        Some(REGRESSION_FIX_TURNS),
+        Some(turns),
         args.model.as_deref(),
     );
 
@@ -520,14 +520,13 @@ fn run_levels_mode(
         agent_exit = result.0;
         level_times.push((format!("L{level}"), result.1, result.2.clone()));
 
-        commit_checkpoint(level, &result.2, result.1, worktree_dir);
-
         if result.2 == "FAILED" {
+            commit_checkpoint(level, &result.2, result.1, worktree_dir);
             println!("Level {level} FAILED — stopping");
             break;
         }
 
-        // --- Regression check: re-run all prior levels ---
+        // --- Step 1: Regression check (BEFORE quality gate) ---
         if !passed_levels.is_empty() {
             println!();
             println!("--- Regression check: L01..L{} ---", passed_levels.last().unwrap());
@@ -541,9 +540,11 @@ fn run_levels_mode(
                     regressed_names.join(", ")
                 );
 
-                // Fix-it pass
+                // Fix-it pass — same turn budget as coding
+                let level_num: u32 = level.parse().unwrap_or(1);
+                let fix_turns = turns_for_level(level_num, args.max_turns);
                 println!(
-                    "--- Regression fix pass ({REGRESSION_FIX_TURNS} turns) ---"
+                    "--- Regression fix pass ({fix_turns} turns) ---"
                 );
                 let _fix_exit = run_regression_fix(
                     args,
@@ -551,6 +552,7 @@ fn run_levels_mode(
                     &level_dir,
                     &regressions,
                     level,
+                    fix_turns,
                 );
 
                 // Re-check all levels including current
@@ -571,7 +573,6 @@ fn run_levels_mode(
                     );
                     let _ = fs::write(level_dir.join("status.txt"), &status_msg);
                     commit_checkpoint(level, "REGRESSION", result.1, worktree_dir);
-                    // Update level_times to reflect regression status
                     if let Some(last) = level_times.last_mut() {
                         last.2 = "REGRESSION".to_string();
                     }
@@ -585,6 +586,16 @@ fn run_levels_mode(
             }
         }
 
+        // --- Step 2: Quality gate cleanup (AFTER regression is clean) ---
+        if args.strategy.contains("quality-gate") {
+            let gate_exit =
+                run_quality_gate_cleanup(args, agent_workdir, worktree_dir, &level_dir, level);
+            if gate_exit != 0 {
+                println!("Quality gate cleanup failed for level {level} (non-blocking)");
+            }
+        }
+
+        commit_checkpoint(level, &result.2, result.1, worktree_dir);
         passed_levels.push(level);
     }
 
@@ -680,12 +691,9 @@ fn run_single_level(
 
         capture_session(&args.agent, &level_uuid, &output_file, level_dir);
 
-        let mut test_exit = run_level_tests(worktree_dir, level, &args.lang);
+        let test_exit = run_level_tests(worktree_dir, level, &args.lang);
 
-        if test_exit == 0 && args.strategy.contains("quality-gate") {
-            test_exit =
-                run_quality_gate_cleanup(args, agent_workdir, worktree_dir, level_dir, level);
-        }
+        // Quality gate cleanup moved to run_levels_mode() — after regression check.
 
         if test_exit == 0 {
             // Success

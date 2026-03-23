@@ -436,7 +436,7 @@ pub const LEVELS: [&str; 26] = [
 /// Tiers based on difficulty (v2 reordered):
 ///   L01-L03 (foundation)                       → 45 turns
 ///   L04-L06 (error quality, strings, mutable)  → 30 turns
-///   L07-L09 (TCO, set!, variadic)              → 45 turns
+///   L07-L09 (TCO, set!, variadic)              → 60 turns
 ///   L10-L12 (call/cc, macros, integration)     → 90 turns
 ///   L13     (builtin grab bag)                 → 45 turns
 ///   L14     (string immutability req-change)   → 45 turns
@@ -453,7 +453,7 @@ pub fn turns_for_level(level_num: u32, max_turns: Option<u32>) -> u32 {
     match level_num {
         1..=3 => 45,
         4..=6 => 30,   // error quality, strings, mutable strings
-        7..=9 => 45,   // TCO, set!, variadic
+        7..=9 => 60,   // TCO, set!, variadic (architecturally hard)
         10..=12 => 90, // call/cc, macros, integration
         13..=14 => 45, // builtins, string immutability (req change)
         15 => 60,      // equality, letrec, case, vectors

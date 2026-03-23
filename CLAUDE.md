@@ -104,7 +104,7 @@ Turn limits (by level tier):
 |--------|------|-------|
 | L01-L03 | Foundation | 45 |
 | L04-L06 | Error/Strings/Mutable | 30 |
-| L07-L09 | TCO/set!/Variadic | 45 |
+| L07-L09 | TCO/set!/Variadic | 60 |
 | L10-L12 | call/cc/Macros/Integration | 90 |
 | L13-L14 | Builtins/String Immutability | 45 |
 | L15 | Equality/Letrec/Case/Vectors/Do | 60 |
@@ -114,9 +114,11 @@ Turn limits (by level tier):
 | L24-L25 | Tech-debt: case-lambda/procedure? | 60 |
 | L26     | Real-world integration stress        | 90 |
 
-Quality-gate levels get an additional 15-turn cleanup pass. Failed levels auto-retry up to 2 times if the failure was infrastructure (timeout/529/crash), not turns exhaustion.
+Failed levels auto-retry up to 2 times if the failure was infrastructure (timeout/529/crash), not turns exhaustion.
 
-**Regression checking:** After each level passes, the orchestrator re-runs all previously-passed levels against the current code. If any regress (e.g., L14 breaking L06's `string-set!`), a 15-turn fix-it agent pass is launched. If the fix-it pass fails to resolve the regressions, the run halts with `REGRESSION` status. Checkpoints: `REGFIX` (regressions fixed), `REGRESSION` (halted).
+**Regression checking:** After each level passes (before quality gate cleanup), the orchestrator re-runs all previously-passed levels against the current code. If any regress (e.g., L14 breaking L06's `string-set!`), a fix-it agent pass is launched with the **same tiered turn budget as the coding pass** (e.g., 60 turns for L07-L09, 90 for L10-L12). If the fix-it pass fails to resolve the regressions, the run halts with `REGRESSION` status. Checkpoints: `REGFIX` (regressions fixed), `REGRESSION` (halted).
+
+**Quality-gate cleanup:** After regression check passes, quality-gate levels get an additional 15-turn cleanup pass with `cargo xtask test --gate`. The agent never sees clippy during coding — the orchestrator controls when quality checks run.
 
 ## Key Conventions
 
