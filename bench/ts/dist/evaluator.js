@@ -864,6 +864,15 @@ function applyK(proc, args, k, pos) {
             return k(bodyVal);
         }, pos);
     }
+    if (proc.tag === 'builtin' && proc.name === 'call-with-values') {
+        if (args.length !== 2)
+            throw posError('call-with-values: need 2 arguments', pos);
+        const [producer, consumer] = args;
+        return applyK(producer, [], producerVal => {
+            const consumerArgs = producerVal.tag === 'values' ? producerVal.elements : [producerVal];
+            return applyK(consumer, consumerArgs, k, pos);
+        }, pos);
+    }
     if (proc.tag === 'builtin' && proc.name === 'map') {
         if (args.length < 2)
             throw posError('map: need at least 2 arguments', pos);
@@ -975,6 +984,12 @@ function makeGlobalEnv(output = []) {
     env.set('dynamic-wind', { tag: 'builtin', name: 'dynamic-wind', fn: () => { throw new EvalError('internal: dynamic-wind handled by applyK'); } });
     env.set('raise', { tag: 'builtin', name: 'raise', fn: () => { throw new EvalError('internal: raise handled by applyK'); } });
     env.set('with-exception-handler', { tag: 'builtin', name: 'with-exception-handler', fn: () => { throw new EvalError('internal: with-exception-handler handled by applyK'); } });
+    env.set('values', { tag: 'builtin', name: 'values', fn: (args) => {
+            if (args.length === 1)
+                return args[0];
+            return { tag: 'values', elements: args };
+        } });
+    env.set('call-with-values', { tag: 'builtin', name: 'call-with-values', fn: () => { throw new EvalError('internal: call-with-values handled by applyK'); } });
     defBuiltin('+', (args, p) => { let s = 0; for (const a of args)
         s += expectNumber(a, '+', p); return { tag: 'number', value: s }; });
     defBuiltin('-', (args, p) => {
@@ -1473,6 +1488,7 @@ function displayVal(val) {
         case 'continuation': return '#<procedure>';
         case 'callcc': return '#<procedure>';
         case 'macro': return '#<macro>';
+        case 'values': return val.elements.map(displayVal).join('\n');
     }
 }
 function writeVal(val) {
