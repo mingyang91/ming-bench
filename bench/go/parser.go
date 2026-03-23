@@ -21,6 +21,16 @@ const (
 	TypeLambda
 )
 
+// Pos represents a source position (1-based line and column).
+type Pos struct {
+	Line int
+	Col  int
+}
+
+func (p Pos) String() string {
+	return fmt.Sprintf("%d:%d", p.Line, p.Col)
+}
+
 type Value struct {
 	Type    ValueType
 	IntVal  int64
@@ -29,9 +39,11 @@ type Value struct {
 	Car     *Value
 	Cdr     *Value
 	// Lambda fields
-	Params []string
-	Body   []*Value
+	Params     []string
+	Body       []*Value
 	ClosureEnv *Env
+	// Source position
+	SrcPos Pos
 }
 
 var Void = &Value{Type: TypeVoid}
@@ -86,10 +98,28 @@ func displayList(v *Value) string {
 type parser struct {
 	input []rune
 	pos   int
+	line  int
+	col   int
+}
+
+func (p *parser) curPos() Pos {
+	return Pos{Line: p.line, Col: p.col}
+}
+
+func (p *parser) advance() {
+	if p.pos < len(p.input) {
+		if p.input[p.pos] == '\n' {
+			p.line++
+			p.col = 1
+		} else {
+			p.col++
+		}
+		p.pos++
+	}
 }
 
 func parse(input string) ([]*Value, error) {
-	p := &parser{input: []rune(input), pos: 0}
+	p := &parser{input: []rune(input), pos: 0, line: 1, col: 1}
 	var exprs []*Value
 	for {
 		p.skipWhitespaceAndComments()
@@ -108,10 +138,10 @@ func parse(input string) ([]*Value, error) {
 func (p *parser) skipWhitespaceAndComments() {
 	for p.pos < len(p.input) {
 		if unicode.IsSpace(p.input[p.pos]) {
-			p.pos++
+			p.advance()
 		} else if p.input[p.pos] == ';' {
 			for p.pos < len(p.input) && p.input[p.pos] != '\n' {
-				p.pos++
+				p.advance()
 			}
 		} else {
 			break
@@ -122,7 +152,7 @@ func (p *parser) skipWhitespaceAndComments() {
 func (p *parser) parseExpr() (*Value, error) {
 	p.skipWhitespaceAndComments()
 	if p.pos >= len(p.input) {
-		return nil, fmt.Errorf("unexpected end of input")
+		return nil, fmt.Errorf("unexpected end of input at %s", p.curPos())
 	}
 
 	ch := p.input[p.pos]
@@ -131,12 +161,17 @@ func (p *parser) parseExpr() (*Value, error) {
 		return p.parseList()
 	}
 	if ch == '\'' {
-		p.pos++
+		pos := p.curPos()
+		p.advance()
 		expr, err := p.parseExpr()
 		if err != nil {
 			return nil, err
 		}
-		return NewPair(NewSymbol("quote"), NewPair(expr, Null)), nil
+		q := NewSymbol("quote")
+		q.SrcPos = pos
+		v := NewPair(q, NewPair(expr, Null))
+		v.SrcPos = pos
+		return v, nil
 	}
 	if ch == '"' {
 		return p.parseString()
@@ -149,20 +184,24 @@ func (p *parser) parseExpr() (*Value, error) {
 }
 
 func (p *parser) parseList() (*Value, error) {
-	p.pos++ // skip '('
+	pos := p.curPos()
+	p.advance() // skip '('
 	var items []*Value
 	for {
 		p.skipWhitespaceAndComments()
 		if p.pos >= len(p.input) {
-			return nil, fmt.Errorf("unexpected end of input: unclosed '('")
+			return nil, fmt.Errorf("unexpected end of input at %s: unclosed '('", pos)
 		}
 		if p.input[p.pos] == ')' {
-			p.pos++
+			p.advance()
 			// Build list from items
 			result := Null
 			for i := len(items) - 1; i >= 0; i-- {
-				result = NewPair(items[i], result)
+				r := NewPair(items[i], result)
+				r.SrcPos = items[i].SrcPos
+				result = r
 			}
+			result.SrcPos = pos
 			return result, nil
 		}
 		expr, err := p.parseExpr()
@@ -174,14 +213,15 @@ func (p *parser) parseList() (*Value, error) {
 }
 
 func (p *parser) parseString() (*Value, error) {
-	p.pos++ // skip opening "
+	pos := p.curPos()
+	p.advance() // skip opening "
 	var buf []rune
 	for p.pos < len(p.input) {
 		ch := p.input[p.pos]
 		if ch == '\\' {
-			p.pos++
+			p.advance()
 			if p.pos >= len(p.input) {
-				return nil, fmt.Errorf("unexpected end of string")
+				return nil, fmt.Errorf("unexpected end of string at %s", pos)
 			}
 			esc := p.input[p.pos]
 			switch esc {
@@ -196,54 +236,66 @@ func (p *parser) parseString() (*Value, error) {
 			default:
 				buf = append(buf, '\\', esc)
 			}
-			p.pos++
+			p.advance()
 			continue
 		}
 		if ch == '"' {
-			p.pos++
-			return NewString(string(buf)), nil
+			p.advance()
+			v := NewString(string(buf))
+			v.SrcPos = pos
+			return v, nil
 		}
 		buf = append(buf, ch)
-		p.pos++
+		p.advance()
 	}
-	return nil, fmt.Errorf("unterminated string")
+	return nil, fmt.Errorf("unterminated string at %s", pos)
 }
 
 func (p *parser) parseHash() (*Value, error) {
-	p.pos++ // skip '#'
+	pos := p.curPos()
+	p.advance() // skip '#'
 	if p.pos >= len(p.input) {
-		return nil, fmt.Errorf("unexpected end of input after #")
+		return nil, fmt.Errorf("unexpected end of input at %s after #", pos)
 	}
 	ch := p.input[p.pos]
-	p.pos++
+	p.advance()
 	switch ch {
 	case 't':
-		return NewBool(true), nil
+		v := NewBool(true)
+		v.SrcPos = pos
+		return v, nil
 	case 'f':
-		return NewBool(false), nil
+		v := NewBool(false)
+		v.SrcPos = pos
+		return v, nil
 	}
-	return nil, fmt.Errorf("unknown hash literal: #%c", ch)
+	return nil, fmt.Errorf("unknown hash literal at %s: #%c", pos, ch)
 }
 
 func (p *parser) parseAtom() (*Value, error) {
+	pos := p.curPos()
 	start := p.pos
 	for p.pos < len(p.input) {
 		ch := p.input[p.pos]
 		if unicode.IsSpace(ch) || ch == '(' || ch == ')' || ch == '"' || ch == ';' {
 			break
 		}
-		p.pos++
+		p.advance()
 	}
 	token := string(p.input[start:p.pos])
 	if token == "" {
-		return nil, fmt.Errorf("unexpected character: %c", p.input[start])
+		return nil, fmt.Errorf("unexpected character at %s: %c", pos, p.input[start])
 	}
 
 	// Try integer
 	if n, err := strconv.ParseInt(token, 10, 64); err == nil {
-		return NewInt(n), nil
+		v := NewInt(n)
+		v.SrcPos = pos
+		return v, nil
 	}
 
 	// Symbol
-	return NewSymbol(strings.ToLower(token)), nil
+	v := NewSymbol(strings.ToLower(token))
+	v.SrcPos = pos
+	return v, nil
 }

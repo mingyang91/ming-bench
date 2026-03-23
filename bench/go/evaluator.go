@@ -49,11 +49,11 @@ func eval(expr *Value, env *Env) (*Value, error) {
 	case TypeSymbol:
 		v, ok := env.get(expr.StrVal)
 		if !ok {
-			return nil, &EvalError{Message: fmt.Sprintf("unbound variable: %s", expr.StrVal)}
+			return nil, &EvalError{Message: fmt.Sprintf("unbound variable: %s at %s", expr.StrVal, expr.SrcPos)}
 		}
 		return v, nil
 	case TypeNull:
-		return nil, &EvalError{Message: "empty application"}
+		return nil, &EvalError{Message: fmt.Sprintf("empty application at %s", expr.SrcPos)}
 	case TypePair:
 		return evalList(expr, env)
 	}
@@ -111,7 +111,7 @@ func evalList(expr *Value, env *Env) (*Value, error) {
 
 	// Built-in procedure call
 	if head.Type == TypeSymbol && isBuiltin(head.StrVal) {
-		return applyBuiltin(head, evaledArgs)
+		return applyBuiltin(head, evaledArgs, expr.SrcPos)
 	}
 
 	// Evaluate head for user-defined procedures
@@ -125,7 +125,7 @@ func evalList(expr *Value, env *Env) (*Value, error) {
 		return applyLambda(fn, evaledArgs)
 	}
 
-	return nil, &EvalError{Message: fmt.Sprintf("not a procedure: %s", fn.Display())}
+	return nil, &EvalError{Message: fmt.Sprintf("not a procedure: %s at %s", fn.Display(), expr.SrcPos)}
 }
 
 func evalDefine(args *Value, env *Env) (*Value, error) {
@@ -353,9 +353,9 @@ func isTruthy(v *Value) bool {
 	return !(v.Type == TypeBoolean && !v.BoolVal)
 }
 
-func applyBuiltin(head *Value, args []*Value) (*Value, error) {
+func applyBuiltin(head *Value, args []*Value, pos Pos) (*Value, error) {
 	if head.Type != TypeSymbol {
-		return nil, &EvalError{Message: fmt.Sprintf("not a procedure: %s", head.Display())}
+		return nil, &EvalError{Message: fmt.Sprintf("not a procedure: %s at %s", head.Display(), pos)}
 	}
 	name := head.StrVal
 
@@ -364,7 +364,7 @@ func applyBuiltin(head *Value, args []*Value) (*Value, error) {
 		sum := int64(0)
 		for _, a := range args {
 			if a.Type != TypeInteger {
-				return nil, &EvalError{Message: "expected number"}
+				return nil, &EvalError{Message: fmt.Sprintf("expected number at %s", pos)}
 			}
 			sum += a.IntVal
 		}
@@ -372,10 +372,10 @@ func applyBuiltin(head *Value, args []*Value) (*Value, error) {
 
 	case "-":
 		if len(args) == 0 {
-			return nil, &EvalError{Message: "- requires at least one argument"}
+			return nil, &EvalError{Message: fmt.Sprintf("- requires at least one argument at %s", pos)}
 		}
 		if args[0].Type != TypeInteger {
-			return nil, &EvalError{Message: "expected number"}
+			return nil, &EvalError{Message: fmt.Sprintf("expected number at %s", pos)}
 		}
 		if len(args) == 1 {
 			return NewInt(-args[0].IntVal), nil
@@ -383,7 +383,7 @@ func applyBuiltin(head *Value, args []*Value) (*Value, error) {
 		result := args[0].IntVal
 		for _, a := range args[1:] {
 			if a.Type != TypeInteger {
-				return nil, &EvalError{Message: "expected number"}
+				return nil, &EvalError{Message: fmt.Sprintf("expected number at %s", pos)}
 			}
 			result -= a.IntVal
 		}
@@ -393,7 +393,7 @@ func applyBuiltin(head *Value, args []*Value) (*Value, error) {
 		product := int64(1)
 		for _, a := range args {
 			if a.Type != TypeInteger {
-				return nil, &EvalError{Message: "expected number"}
+				return nil, &EvalError{Message: fmt.Sprintf("expected number at %s", pos)}
 			}
 			product *= a.IntVal
 		}
@@ -401,18 +401,18 @@ func applyBuiltin(head *Value, args []*Value) (*Value, error) {
 
 	case "/":
 		if len(args) < 2 {
-			return nil, &EvalError{Message: "/ requires at least two arguments"}
+			return nil, &EvalError{Message: fmt.Sprintf("/ requires at least two arguments at %s", pos)}
 		}
 		if args[0].Type != TypeInteger {
-			return nil, &EvalError{Message: "expected number"}
+			return nil, &EvalError{Message: fmt.Sprintf("expected number at %s", pos)}
 		}
 		result := args[0].IntVal
 		for _, a := range args[1:] {
 			if a.Type != TypeInteger {
-				return nil, &EvalError{Message: "expected number"}
+				return nil, &EvalError{Message: fmt.Sprintf("expected number at %s", pos)}
 			}
 			if a.IntVal == 0 {
-				return nil, &EvalError{Message: "division by zero"}
+				return nil, &EvalError{Message: fmt.Sprintf("division by zero at %s", pos)}
 			}
 			result /= a.IntVal
 		}
@@ -431,31 +431,31 @@ func applyBuiltin(head *Value, args []*Value) (*Value, error) {
 
 	case "not":
 		if len(args) != 1 {
-			return nil, &EvalError{Message: "not requires exactly one argument"}
+			return nil, &EvalError{Message: fmt.Sprintf("not requires exactly one argument at %s", pos)}
 		}
 		return NewBool(!isTruthy(args[0])), nil
 
 	case "cons":
 		if len(args) != 2 {
-			return nil, &EvalError{Message: "cons requires exactly two arguments"}
+			return nil, &EvalError{Message: fmt.Sprintf("cons requires exactly two arguments at %s", pos)}
 		}
 		return NewPair(args[0], args[1]), nil
 
 	case "car":
 		if len(args) != 1 || args[0].Type != TypePair {
-			return nil, &EvalError{Message: "car requires a pair"}
+			return nil, &EvalError{Message: fmt.Sprintf("car requires a pair at %s", pos)}
 		}
 		return args[0].Car, nil
 
 	case "cdr":
 		if len(args) != 1 || args[0].Type != TypePair {
-			return nil, &EvalError{Message: "cdr requires a pair"}
+			return nil, &EvalError{Message: fmt.Sprintf("cdr requires a pair at %s", pos)}
 		}
 		return args[0].Cdr, nil
 
 	case "null?":
 		if len(args) != 1 {
-			return nil, &EvalError{Message: "null? requires exactly one argument"}
+			return nil, &EvalError{Message: fmt.Sprintf("null? requires exactly one argument at %s", pos)}
 		}
 		return NewBool(args[0].Type == TypeNull), nil
 
@@ -468,7 +468,7 @@ func applyBuiltin(head *Value, args []*Value) (*Value, error) {
 
 	case "length":
 		if len(args) != 1 {
-			return nil, &EvalError{Message: "length requires exactly one argument"}
+			return nil, &EvalError{Message: fmt.Sprintf("length requires exactly one argument at %s", pos)}
 		}
 		count := int64(0)
 		cur := args[0]
@@ -500,13 +500,13 @@ func applyBuiltin(head *Value, args []*Value) (*Value, error) {
 
 	case "string?":
 		if len(args) != 1 {
-			return nil, &EvalError{Message: "string? requires exactly one argument"}
+			return nil, &EvalError{Message: fmt.Sprintf("string? requires exactly one argument at %s", pos)}
 		}
 		return NewBool(args[0].Type == TypeString), nil
 
 	case "number?":
 		if len(args) != 1 {
-			return nil, &EvalError{Message: "number? requires exactly one argument"}
+			return nil, &EvalError{Message: fmt.Sprintf("number? requires exactly one argument at %s", pos)}
 		}
 		return NewBool(args[0].Type == TypeInteger), nil
 
@@ -538,7 +538,7 @@ func compareInts(args []*Value, cmp func(int64, int64) bool) (*Value, error) {
 	}
 	for _, a := range args {
 		if a.Type != TypeInteger {
-			return nil, &EvalError{Message: "expected number"}
+			return nil, &EvalError{Message: fmt.Sprintf("expected number at %s", pos)}
 		}
 	}
 	for i := 0; i < len(args)-1; i++ {
