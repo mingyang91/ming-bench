@@ -48,6 +48,8 @@ type value struct {
 	contLetStack []letCtx // stack of enclosing let contexts at capture time
 	// call/cc marker
 	isCallCC bool
+	// mutable flag (e.g., strings from string-copy)
+	mutable bool
 	// macro fields
 	macroRules    []syntaxRule
 	macroLiterals []string
@@ -1410,12 +1412,17 @@ func makeGlobalEnv(ip *interp) *env {
 		if len(args) != 1 || args[0].typ != valString {
 			return nil, &EvalError{Message: fmt.Sprintf("%d:%d: string-copy: expected string", line, col)}
 		}
-		return strVal(args[0].sval), nil
+		v := strVal(args[0].sval)
+		v.mutable = true
+		return v, nil
 	}))
 
 	e.set("string-set!", makeBuiltin("string-set!", func(args []*value, line, col int) (*value, error) {
 		if len(args) != 3 || args[0].typ != valString || args[1].typ != valInt || args[2].typ != valChar {
 			return nil, &EvalError{Message: fmt.Sprintf("%d:%d: string-set!: bad arguments", line, col)}
+		}
+		if !args[0].mutable {
+			return nil, &EvalError{Message: fmt.Sprintf("%d:%d: string-set!: strings are immutable", line, col)}
 		}
 		runes := []rune(args[0].sval)
 		idx := int(args[1].ival)
@@ -1437,6 +1444,51 @@ func makeGlobalEnv(ip *interp) *env {
 			return nil, &EvalError{Message: fmt.Sprintf("%d:%d: string-ref: index out of range", line, col)}
 		}
 		return charVal(runes[idx]), nil
+	}))
+
+	e.set("string->list", makeBuiltin("string->list", func(args []*value, line, col int) (*value, error) {
+		if len(args) != 1 || args[0].typ != valString {
+			return nil, &EvalError{Message: fmt.Sprintf("%d:%d: string->list: expected string", line, col)}
+		}
+		runes := []rune(args[0].sval)
+		result := nilVal
+		for i := len(runes) - 1; i >= 0; i-- {
+			result = &value{typ: valPair, car: charVal(runes[i]), cdr: result}
+		}
+		return result, nil
+	}))
+
+	e.set("list->string", makeBuiltin("list->string", func(args []*value, line, col int) (*value, error) {
+		if len(args) != 1 {
+			return nil, &EvalError{Message: fmt.Sprintf("%d:%d: list->string: expected 1 argument", line, col)}
+		}
+		var buf strings.Builder
+		cur := args[0]
+		for cur.typ == valPair {
+			if cur.car.typ != valChar {
+				return nil, &EvalError{Message: fmt.Sprintf("%d:%d: list->string: expected list of chars", line, col)}
+			}
+			buf.WriteRune(cur.car.cval)
+			cur = cur.cdr
+		}
+		if cur.typ != valNil {
+			return nil, &EvalError{Message: fmt.Sprintf("%d:%d: list->string: expected proper list", line, col)}
+		}
+		return strVal(buf.String()), nil
+	}))
+
+	e.set("char->integer", makeBuiltin("char->integer", func(args []*value, line, col int) (*value, error) {
+		if len(args) != 1 || args[0].typ != valChar {
+			return nil, &EvalError{Message: fmt.Sprintf("%d:%d: char->integer: expected char", line, col)}
+		}
+		return intVal(int64(args[0].cval)), nil
+	}))
+
+	e.set("integer->char", makeBuiltin("integer->char", func(args []*value, line, col int) (*value, error) {
+		if len(args) != 1 || args[0].typ != valInt {
+			return nil, &EvalError{Message: fmt.Sprintf("%d:%d: integer->char: expected integer", line, col)}
+		}
+		return charVal(rune(args[0].ival)), nil
 	}))
 
 	// eq? — pointer/identity equality
