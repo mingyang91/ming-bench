@@ -529,11 +529,21 @@ function makeGlobalEnv() {
         }
         return result;
     });
+    defBuiltin('reverse', (args) => {
+        const elems = pairsToArray(args[0]);
+        let result = NIL;
+        for (const e of elems) {
+            result = { tag: 'pair', car: e, cdr: result };
+        }
+        return result;
+    });
     // apply is handled specially in applyCPS — this is just a placeholder so it's a first-class value
     defBuiltin('apply', (_args) => { throw new EvalError('apply: internal error — should be handled by applyCPS'); });
     // call/cc is handled specially in applyCPS
     defBuiltin('call/cc', (_args) => { throw new EvalError('call/cc: internal error'); });
     env.define('call-with-current-continuation', env.get('call/cc'));
+    // dynamic-wind is handled specially in applyCPS
+    defBuiltin('dynamic-wind', (_args) => { throw new EvalError('dynamic-wind: internal error'); });
     defBuiltin('number?', (args) => ({ tag: 'boolean', value: args[0].tag === 'number' }));
     defBuiltin('string?', (args) => ({ tag: 'boolean', value: args[0].tag === 'string' }));
     defBuiltin('boolean?', (args) => ({ tag: 'boolean', value: args[0].tag === 'boolean' }));
@@ -893,12 +903,64 @@ function evaluateLetBindingsCPS(bindings, idx, outerEnv, letEnv, body, k) {
         return evaluateLetBindingsCPS(bindings, idx + 1, outerEnv, letEnv, body, k);
     });
 }
+function doWindShift(from, to, then) {
+    // Find common prefix length (by identity)
+    let common = 0;
+    const minLen = Math.min(from.length, to.length);
+    for (let i = 0; i < minLen; i++) {
+        if (from[i] === to[i])
+            common++;
+        else
+            break;
+    }
+    // Unwind: call out-thunks from innermost to common
+    function unwind(idx) {
+        if (idx < common)
+            return rewind(common);
+        const entry = from[idx];
+        windStack.pop();
+        return applyCPS(entry.outThunk, [], (_) => unwind(idx - 1));
+    }
+    // Rewind: call in-thunks from common to target
+    function rewind(idx) {
+        if (idx >= to.length)
+            return then();
+        const entry = to[idx];
+        return applyCPS(entry.inThunk, [], (_) => {
+            windStack.push(entry);
+            return rewind(idx + 1);
+        });
+    }
+    if (from.length > common)
+        return unwind(from.length - 1);
+    return rewind(common);
+}
 function applyCPS(proc, args, k, pos) {
     if (proc.tag === 'builtin') {
-        // call/cc: capture current continuation
+        // call/cc: capture current continuation and wind stack
         if (proc.name === 'call/cc') {
-            const contVal = { tag: 'continuation', k };
+            const savedWind = [...windStack];
+            const savedK = k;
+            const contK = (val) => {
+                const currentWind = [...windStack];
+                return doWindShift(currentWind, savedWind, () => callK(savedK, val));
+            };
+            const contVal = { tag: 'continuation', k: contK };
             return applyCPS(args[0], [contVal], k);
+        }
+        // dynamic-wind: in-thunk, body-thunk, out-thunk
+        if (proc.name === 'dynamic-wind') {
+            const [inThunk, bodyThunk, outThunk] = args;
+            const entry = { inThunk, outThunk };
+            return applyCPS(inThunk, [], (_) => {
+                windStack.push(entry);
+                return applyCPS(bodyThunk, [], (bodyResult) => {
+                    windStack.pop();
+                    return applyCPS(outThunk, [], (_) => {
+                        return callK(k, bodyResult);
+                    });
+                });
+            });
         }
         // apply: restructure args and delegate
         if (proc.name === 'apply') {
@@ -1246,6 +1308,7 @@ function evaluateCPS(expr, env, k) {
 }
 // ── Output buffer ──────────────────────────────────────────────────
 let outputBuffer = '';
+let windStack = [];
 // ── Display / Write formatting ─────────────────────────────────────
 function displayVal(val) {
     switch (val.tag) {
@@ -1294,7 +1357,7 @@ function writeVal(val) {
 const display = writeVal;
 // ── Public API ─────────────────────────────────────────────────────
 function evaluateProgram(exprs, env) {
-    // Evaluate all expressions in sequence using CPS, then run the trampoline
+    windStack = [];
     const topK = (val) => done(val);
     const result = evaluateSeqCPS(exprs, 0, env, topK);
     return runTrampoline(result);
