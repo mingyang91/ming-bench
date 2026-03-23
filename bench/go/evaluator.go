@@ -22,6 +22,7 @@ const (
 	valLambda
 	valBuiltin
 	valChar
+	valContinuation
 )
 
 type value struct {
@@ -40,6 +41,13 @@ type value struct {
 	cval rune
 	// builtin function
 	builtin func(args []*value, line, col int) (*value, error)
+	// continuation fields
+	contExpr    *expr // the call/cc expression (for replay matching)
+	contIdx     int   // top-level expression index
+	contLetExpr *expr // enclosing let expression (if any)
+	contLetEnv  *env  // the let's local environment
+	// call/cc marker
+	isCallCC bool
 }
 
 var voidVal = &value{typ: valVoid}
@@ -77,6 +85,8 @@ func (v *value) String() string {
 		return ""
 	case valChar:
 		return formatChar(v.cval)
+	case valContinuation:
+		return "#<continuation>"
 	}
 	return ""
 }
@@ -378,15 +388,36 @@ func (e *env) setExisting(name string, v *value) bool {
 	return false
 }
 
+// ---------- Continuations ----------
+
+// continuationJump is panicked when a continuation is invoked.
+type continuationJump struct {
+	contExpr    *expr  // the call/cc expression to replay from
+	contIdx     int    // top-level expression index to replay from
+	val         *value // value to deliver to the continuation
+	contLetExpr *expr  // enclosing let expression (if any)
+	contLetEnv  *env   // the let's local environment (to preserve mutations)
+}
+
 // ---------- Interpreter ----------
 
 type interp struct {
-	output strings.Builder
+	output      strings.Builder
+	exprs       []*expr // all top-level expressions
+	exprIdx     int     // current top-level expression index
+	replayExpr  *expr   // if non-nil, the call/cc expr to short-circuit
+	replayValue *value  // value to return from the replayed call/cc
+	// Let environment tracking for continuation capture
+	currentLetExpr *expr // enclosing let expression (innermost)
+	currentLetEnv  *env  // that let's local environment
+	// Replay: reuse let environment instead of re-initializing bindings
+	replayLetExpr *expr
+	replayLetEnv  *env
 }
 
 // ---------- Evaluator ----------
 
-func eval(e *expr, envir *env) (*value, error) {
+func (ip *interp) eval(e *expr, envir *env) (*value, error) {
 	for {
 		switch e.kind {
 		case "int":
@@ -418,7 +449,7 @@ func eval(e *expr, envir *env) (*value, error) {
 						return boolVal(true), nil
 					}
 					for _, ae := range exprs[:len(exprs)-1] {
-						v, err := eval(ae, envir)
+						v, err := ip.eval(ae, envir)
 						if err != nil {
 							return nil, err
 						}
@@ -435,7 +466,7 @@ func eval(e *expr, envir *env) (*value, error) {
 						return boolVal(false), nil
 					}
 					for _, oe := range exprs[:len(exprs)-1] {
-						v, err := eval(oe, envir)
+						v, err := ip.eval(oe, envir)
 						if err != nil {
 							return nil, err
 						}
@@ -447,14 +478,14 @@ func eval(e *expr, envir *env) (*value, error) {
 					continue
 
 				case "define":
-					return evalDefine(e, envir)
+					return ip.evalDefine(e, envir)
 
 				case "set!":
 					if len(e.items) != 3 {
 						return nil, &EvalError{Message: fmt.Sprintf("%d:%d: set!: bad syntax", e.line, e.col)}
 					}
 					name := e.items[1].sval
-					val, err := eval(e.items[2], envir)
+					val, err := ip.eval(e.items[2], envir)
 					if err != nil {
 						return nil, err
 					}
@@ -467,7 +498,7 @@ func eval(e *expr, envir *env) (*value, error) {
 					if len(e.items) < 3 || len(e.items) > 4 {
 						return nil, &EvalError{Message: fmt.Sprintf("%d:%d: if: bad syntax", e.line, e.col)}
 					}
-					cond, err := eval(e.items[1], envir)
+					cond, err := ip.eval(e.items[1], envir)
 					if err != nil {
 						return nil, err
 					}
@@ -491,7 +522,7 @@ func eval(e *expr, envir *env) (*value, error) {
 					return evalLambda(e, envir)
 
 				case "let":
-					newE, newEnvir, err := setupLet(e, envir)
+					newE, newEnvir, err := ip.setupLet(e, envir)
 					if err != nil {
 						return nil, err
 					}
@@ -505,7 +536,7 @@ func eval(e *expr, envir *env) (*value, error) {
 						return voidVal, nil
 					}
 					for _, be := range exprs[:len(exprs)-1] {
-						_, err := eval(be, envir)
+						_, err := ip.eval(be, envir)
 						if err != nil {
 							return nil, err
 						}
@@ -522,7 +553,7 @@ func eval(e *expr, envir *env) (*value, error) {
 						if clause.items[0].kind == "symbol" && clause.items[0].sval == "else" {
 							body := clause.items[1:]
 							for _, be := range body[:len(body)-1] {
-								_, err := eval(be, envir)
+								_, err := ip.eval(be, envir)
 								if err != nil {
 									return nil, err
 								}
@@ -531,14 +562,14 @@ func eval(e *expr, envir *env) (*value, error) {
 							found = true
 							break
 						}
-						test, err := eval(clause.items[0], envir)
+						test, err := ip.eval(clause.items[0], envir)
 						if err != nil {
 							return nil, err
 						}
 						if test.isTruthy() {
 							body := clause.items[1:]
 							for _, be := range body[:len(body)-1] {
-								_, err := eval(be, envir)
+								_, err := ip.eval(be, envir)
 								if err != nil {
 									return nil, err
 								}
@@ -556,18 +587,40 @@ func eval(e *expr, envir *env) (*value, error) {
 			}
 
 			// Function call
-			fn, err := eval(head, envir)
+			fn, err := ip.eval(head, envir)
 			if err != nil {
 				return nil, err
 			}
 
 			args := make([]*value, len(e.items)-1)
 			for i, arg := range e.items[1:] {
-				v, err := eval(arg, envir)
+				v, err := ip.eval(arg, envir)
 				if err != nil {
 					return nil, err
 				}
 				args[i] = v
+			}
+
+			// call/cc: handle specially
+			if fn.isCallCC {
+				if len(args) != 1 {
+					return nil, &EvalError{Message: fmt.Sprintf("%d:%d: call/cc: expected 1 argument", e.line, e.col)}
+				}
+				return ip.handleCallCC(args[0], e)
+			}
+
+			// Continuation invocation
+			if fn.typ == valContinuation {
+				if len(args) != 1 {
+					return nil, &EvalError{Message: fmt.Sprintf("%d:%d: continuation: expected 1 argument", e.line, e.col)}
+				}
+				panic(&continuationJump{
+					contExpr:    fn.contExpr,
+					contIdx:     fn.contIdx,
+					val:         args[0],
+					contLetExpr: fn.contLetExpr,
+					contLetEnv:  fn.contLetEnv,
+				})
 			}
 
 			// TCO: inline lambda application
@@ -578,7 +631,7 @@ func eval(e *expr, envir *env) (*value, error) {
 				}
 				// Eval all body exprs except last, then tail-call last
 				for _, bodyExpr := range fn.body[:len(fn.body)-1] {
-					_, err := eval(bodyExpr, localEnv)
+					_, err := ip.eval(bodyExpr, localEnv)
 					if err != nil {
 						return nil, err
 					}
@@ -592,6 +645,67 @@ func eval(e *expr, envir *env) (*value, error) {
 		}
 		return nil, &EvalError{Message: fmt.Sprintf("%d:%d: unknown expression type", e.line, e.col)}
 	}
+}
+
+// handleCallCC implements call/cc. It captures a continuation and calls proc with it.
+func (ip *interp) handleCallCC(proc *value, e *expr) (*value, error) {
+	// Check for replay: if this is the call/cc we're replaying, return the value
+	if ip.replayExpr == e {
+		val := ip.replayValue
+		ip.replayExpr = nil
+		ip.replayValue = nil
+		return val, nil
+	}
+
+	// Create continuation value
+	cont := &value{
+		typ:         valContinuation,
+		contExpr:    e,
+		contIdx:     ip.exprIdx,
+		contLetExpr: ip.currentLetExpr,
+		contLetEnv:  ip.currentLetEnv,
+	}
+
+	// Call proc(cont) with escape recovery
+	var result *value
+	var resultErr error
+
+	func() {
+		defer func() {
+			if r := recover(); r != nil {
+				if jump, ok := r.(*continuationJump); ok && jump.contExpr == e {
+					// Escape: this continuation was invoked within its dynamic extent
+					result = jump.val
+					resultErr = nil
+				} else {
+					panic(r) // not our continuation, re-panic
+				}
+			}
+		}()
+
+		// Apply proc to cont
+		if proc.typ == valLambda {
+			localEnv, bindErr := bindLambdaArgs(proc, []*value{cont}, e.line, e.col)
+			if bindErr != nil {
+				resultErr = bindErr
+				return
+			}
+			for _, bodyExpr := range proc.body[:len(proc.body)-1] {
+				_, err := ip.eval(bodyExpr, localEnv)
+				if err != nil {
+					resultErr = err
+					return
+				}
+			}
+			result, resultErr = ip.eval(proc.body[len(proc.body)-1], localEnv)
+		} else if proc.typ == valBuiltin {
+			result, resultErr = proc.builtin([]*value{cont}, e.line, e.col)
+		} else {
+			resultErr = &EvalError{Message: fmt.Sprintf("%d:%d: call/cc: not a procedure", e.line, e.col)}
+		}
+	}()
+
+	return result, resultErr
 }
 
 func bindLambdaArgs(fn *value, args []*value, line, col int) (*env, error) {
@@ -624,12 +738,23 @@ func applyFunc(fn *value, args []*value, callExpr *expr) (*value, error) {
 	switch fn.typ {
 	case valBuiltin:
 		return fn.builtin(args, line, col)
+	case valContinuation:
+		if len(args) != 1 {
+			return nil, &EvalError{Message: fmt.Sprintf("%d:%d: continuation: expected 1 argument", line, col)}
+		}
+		panic(&continuationJump{
+			contExpr:    fn.contExpr,
+			contIdx:     fn.contIdx,
+			val:         args[0],
+			contLetExpr: fn.contLetExpr,
+			contLetEnv:  fn.contLetEnv,
+		})
 	default:
 		return nil, &EvalError{Message: fmt.Sprintf("%d:%d: not a procedure", line, col)}
 	}
 }
 
-func evalDefine(e *expr, env *env) (*value, error) {
+func (ip *interp) evalDefine(e *expr, envir *env) (*value, error) {
 	if len(e.items) < 3 {
 		return nil, &EvalError{Message: fmt.Sprintf("%d:%d: define: bad syntax", e.line, e.col)}
 	}
@@ -652,9 +777,9 @@ func evalDefine(e *expr, env *env) (*value, error) {
 			params:    params,
 			restParam: restParam,
 			body:      e.items[2:],
-			closure:   env,
+			closure:   envir,
 		}
-		env.set(name, fn)
+		envir.set(name, fn)
 		return voidVal, nil
 	}
 
@@ -662,14 +787,13 @@ func evalDefine(e *expr, env *env) (*value, error) {
 	if target.kind != "symbol" {
 		return nil, &EvalError{Message: fmt.Sprintf("%d:%d: define: bad syntax", e.line, e.col)}
 	}
-	val, err := eval(e.items[2], env)
+	val, err := ip.eval(e.items[2], envir)
 	if err != nil {
 		return nil, err
 	}
-	env.set(target.sval, val)
+	envir.set(target.sval, val)
 	return voidVal, nil
 }
-
 
 func parseLambdaParams(paramExpr *expr) (params []string, restParam string, err error) {
 	if paramExpr.kind == "symbol" {
@@ -700,7 +824,7 @@ func parseLambdaParams(paramExpr *expr) (params []string, restParam string, err 
 	return params, "", nil
 }
 
-func evalLambda(e *expr, env *env) (*value, error) {
+func evalLambda(e *expr, envir *env) (*value, error) {
 	if len(e.items) < 3 {
 		return nil, &EvalError{Message: fmt.Sprintf("%d:%d: lambda: bad syntax", e.line, e.col)}
 	}
@@ -713,12 +837,12 @@ func evalLambda(e *expr, env *env) (*value, error) {
 		params:    params,
 		restParam: restParam,
 		body:      e.items[2:],
-		closure:   env,
+		closure:   envir,
 	}, nil
 }
 
 // setupLet prepares the let environment and returns the tail expression to evaluate.
-func setupLet(e *expr, envir *env) (tailExpr *expr, tailEnv *env, err error) {
+func (ip *interp) setupLet(e *expr, envir *env) (tailExpr *expr, tailEnv *env, err error) {
 	if len(e.items) < 3 {
 		return nil, nil, &EvalError{Message: fmt.Sprintf("%d:%d: let: bad syntax", e.line, e.col)}
 	}
@@ -741,46 +865,67 @@ func setupLet(e *expr, envir *env) (tailExpr *expr, tailEnv *env, err error) {
 		return nil, nil, &EvalError{Message: fmt.Sprintf("%d:%d: let: bad syntax", e.line, e.col)}
 	}
 
-	params := make([]string, len(bindingsExpr.items))
-	vals := make([]*value, len(bindingsExpr.items))
-	for i, b := range bindingsExpr.items {
-		if b.kind != "list" || len(b.items) != 2 {
-			return nil, nil, &EvalError{Message: fmt.Sprintf("%d:%d: let: bad binding", e.line, e.col)}
+	// Check if we should reuse a saved environment (continuation replay)
+	var localEnv *env
+	if ip.replayLetExpr == e {
+		localEnv = ip.replayLetEnv
+		ip.replayLetExpr = nil
+		ip.replayLetEnv = nil
+	} else {
+		params := make([]string, len(bindingsExpr.items))
+		vals := make([]*value, len(bindingsExpr.items))
+		for i, b := range bindingsExpr.items {
+			if b.kind != "list" || len(b.items) != 2 {
+				return nil, nil, &EvalError{Message: fmt.Sprintf("%d:%d: let: bad binding", e.line, e.col)}
+			}
+			params[i] = b.items[0].sval
+			v, err := ip.eval(b.items[1], envir)
+			if err != nil {
+				return nil, nil, err
+			}
+			vals[i] = v
 		}
-		params[i] = b.items[0].sval
-		v, err := eval(b.items[1], envir)
-		if err != nil {
-			return nil, nil, err
-		}
-		vals[i] = v
-	}
 
-	localEnv := newEnv(envir)
-	for i, p := range params {
-		localEnv.set(p, vals[i])
+		localEnv = newEnv(envir)
+		for i, p := range params {
+			localEnv.set(p, vals[i])
+		}
 	}
 
 	if name != "" {
+		// For named let during replay, we need to get params from bindings
+		var namedParams []string
+		for _, b := range bindingsExpr.items {
+			namedParams = append(namedParams, b.items[0].sval)
+		}
 		fn := &value{
 			typ:     valLambda,
-			params:  params,
+			params:  namedParams,
 			body:    body,
 			closure: localEnv,
 		}
 		localEnv.set(name, fn)
 	}
 
+	// Track let context for continuation capture
+	prevLetExpr, prevLetEnv := ip.currentLetExpr, ip.currentLetEnv
+	ip.currentLetExpr = e
+	ip.currentLetEnv = localEnv
+
 	// Eval all body exprs except last
 	for _, b := range body[:len(body)-1] {
-		_, err := eval(b, localEnv)
+		_, err := ip.eval(b, localEnv)
 		if err != nil {
+			ip.currentLetExpr, ip.currentLetEnv = prevLetExpr, prevLetEnv
 			return nil, nil, err
 		}
 	}
 
+	// Keep let context for tail expression (it may contain call/cc)
+	// It will be overwritten by the next body-level construct or reset at top level
+
 	return body[len(body)-1], localEnv, nil
 }
-
 
 func quoteExpr(e *expr) *value {
 	switch e.kind {
@@ -1013,6 +1158,18 @@ func makeGlobalEnv(ip *interp) *env {
 			fnArgs = append(fnArgs, cur.car)
 			cur = cur.cdr
 		}
+		if fn.typ == valContinuation {
+			if len(fnArgs) != 1 {
+				return nil, &EvalError{Message: fmt.Sprintf("%d:%d: apply: continuation expects 1 argument", line, col)}
+			}
+			panic(&continuationJump{
+				contExpr:    fn.contExpr,
+				contIdx:     fn.contIdx,
+				val:         fnArgs[0],
+				contLetExpr: fn.contLetExpr,
+				contLetEnv:  fn.contLetEnv,
+			})
+		}
 		if fn.typ == valLambda {
 			localEnv, bindErr := bindLambdaArgs(fn, fnArgs, line, col)
 			if bindErr != nil {
@@ -1022,7 +1179,7 @@ func makeGlobalEnv(ip *interp) *env {
 			var result *value
 			for _, bodyExpr := range fn.body {
 				var err error
-				result, err = eval(bodyExpr, localEnv)
+				result, err = ip.eval(bodyExpr, localEnv)
 				if err != nil {
 					return nil, err
 				}
@@ -1197,6 +1354,11 @@ func makeGlobalEnv(ip *interp) *env {
 		return charVal(runes[idx]), nil
 	}))
 
+	// call/cc as a first-class value
+	callccVal := &value{typ: valBuiltin, sval: "call/cc", isCallCC: true}
+	e.set("call/cc", callccVal)
+	e.set("call-with-current-continuation", callccVal)
+
 	return e
 }
 
@@ -1211,13 +1373,57 @@ func evalInput(input string) (last *value, ip *interp, err error) {
 	}
 
 	ip = &interp{}
-	env := makeGlobalEnv(ip)
-	for _, e := range exprs {
-		last, err = eval(e, env)
+	ip.exprs = exprs
+	globalEnv := makeGlobalEnv(ip)
+
+	startIdx := 0
+
+	for {
+		var jumpCaught *continuationJump
+
+		func() {
+			defer func() {
+				if r := recover(); r != nil {
+					if jump, ok := r.(*continuationJump); ok {
+						jumpCaught = jump
+					} else {
+						panic(r)
+					}
+				}
+			}()
+
+			for i := startIdx; i < len(exprs); i++ {
+				ip.exprIdx = i
+				last, err = ip.eval(exprs[i], globalEnv)
+				if err != nil {
+					return
+				}
+			}
+		}()
+
 		if err != nil {
 			return nil, nil, err
 		}
+
+		if jumpCaught != nil {
+			// Reentrant continuation: replay from the saved expression index
+			ip.replayExpr = jumpCaught.contExpr
+			ip.replayValue = jumpCaught.val
+			startIdx = jumpCaught.contIdx
+			// If the continuation was inside a let, preserve that let's environment
+			if jumpCaught.contLetExpr != nil {
+				ip.replayLetExpr = jumpCaught.contLetExpr
+				ip.replayLetEnv = jumpCaught.contLetEnv
+			}
+			// Reset let tracking for the new evaluation
+			ip.currentLetExpr = nil
+			ip.currentLetEnv = nil
+			continue
+		}
+
+		break
 	}
+
 	return last, ip, nil
 }
 
