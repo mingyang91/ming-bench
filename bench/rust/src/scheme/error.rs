@@ -27,6 +27,9 @@ pub enum EvalError {
     #[error("unhandled exception: {value}")]
     Raised { value: String },
 
+    #[error("step limit exceeded: {limit} steps")]
+    StepLimitExceeded { limit: u64 },
+
     #[error("{line}:{col}: {inner}")]
     WithPosition {
         line: usize,

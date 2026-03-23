@@ -17,6 +17,16 @@ pub fn eval_str(input: &str) -> Result<String, EvalError> {
     Ok(result)
 }
 
+/// Evaluate with a step limit. Each eval dispatch counts as one step.
+/// Exceeding the limit returns an error.
+pub fn eval_str_with_limit(input: &str, max_steps: u64) -> Result<String, EvalError> {
+    let exprs = parser::parse(input)?;
+    let env = eval::default_env();
+    let output = Rc::new(RefCell::new(String::new()));
+    let last = eval::eval_program_with_limit(&exprs, &env, &output, max_steps)?;
+    Ok(last.to_string())
+}
+
 /// Evaluate Scheme expressions, returning both the result value and
 /// any output produced by `display`, `write`, or `newline`.
 pub fn eval_str_with_output(input: &str) -> Result<(String, String), EvalError> {

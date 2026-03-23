@@ -327,6 +327,10 @@ struct Machine {
     syntax_bindings_stack: Vec<SyntaxBindings>,
     /// Stack of use-site envs for active macro transformer invocations.
     macro_use_envs: Vec<Rc<RefCell<Env>>>,
+    /// Optional step limit for bounded evaluation.
+    step_limit: Option<u64>,
+    /// Steps taken so far.
+    steps: u64,
 }
 
 impl Machine {
@@ -343,6 +347,8 @@ impl Machine {
             exception_handlers: Vec::new(),
             syntax_bindings_stack: Vec::new(),
             macro_use_envs: Vec::new(),
+            step_limit: None,
+            steps: 0,
         }
     }
 
@@ -361,6 +367,12 @@ impl Machine {
         };
 
         loop {
+            if let Some(limit) = self.step_limit {
+                self.steps += 1;
+                if self.steps > limit {
+                    return Err(EvalError::StepLimitExceeded { limit });
+                }
+            }
             control = match control {
                 Control::Eval(expr, env) => self.step_eval(expr, &env)?,
                 Control::Continue(val) => {
@@ -2374,6 +2386,17 @@ pub fn eval_program(
     output: &Rc<RefCell<String>>,
 ) -> Result<Value, EvalError> {
     let mut machine = Machine::new(Rc::clone(output));
+    machine.run(exprs, env)
+}
+
+pub fn eval_program_with_limit(
+    exprs: &[Value],
+    env: &Rc<RefCell<Env>>,
+    output: &Rc<RefCell<String>>,
+    max_steps: u64,
+) -> Result<Value, EvalError> {
+    let mut machine = Machine::new(Rc::clone(output));
+    machine.step_limit = Some(max_steps);
     machine.run(exprs, env)
 }
 
