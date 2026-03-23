@@ -7,6 +7,7 @@ pub use error::EvalError;
 use builtins::{call_builtin, is_builtin};
 use parser::Parser;
 use std::collections::HashMap;
+use std::rc::Rc;
 
 /// A Scheme value.
 #[derive(Debug, Clone)]
@@ -14,11 +15,12 @@ pub(crate) enum Value {
     Integer(i64),
     Boolean(bool),
     SchemeString(String),
+    Symbol(String),
     List(Vec<Value>),
     Lambda {
         params: Vec<String>,
-        body: Vec<Expr>,
-        env: Env,
+        body: Rc<[Expr]>,
+        env: Rc<Env>,
     },
     Builtin(String),
 }
@@ -29,6 +31,7 @@ impl PartialEq for Value {
             (Value::Integer(a), Value::Integer(b)) => a == b,
             (Value::Boolean(a), Value::Boolean(b)) => a == b,
             (Value::SchemeString(a), Value::SchemeString(b)) => a == b,
+            (Value::Symbol(a), Value::Symbol(b)) => a == b,
             (Value::List(a), Value::List(b)) => a == b,
             (Value::Builtin(a), Value::Builtin(b)) => a == b,
             _ => false,
@@ -43,6 +46,7 @@ impl Value {
             Value::Boolean(true) => "#t".to_string(),
             Value::Boolean(false) => "#f".to_string(),
             Value::SchemeString(s) => format!("\"{}\"", s),
+            Value::Symbol(s) => s.clone(),
             Value::List(items) => {
                 let inner: Vec<String> = items.iter().map(|v| v.display()).collect();
                 format!("({})", inner.join(" "))
@@ -81,7 +85,7 @@ pub(crate) enum Expr {
 #[derive(Debug, Clone)]
 pub(crate) struct Env {
     bindings: HashMap<String, Value>,
-    parent: Option<Box<Env>>,
+    parent: Option<Rc<Env>>,
 }
 
 impl Env {
@@ -92,10 +96,10 @@ impl Env {
         }
     }
 
-    fn with_parent(parent: &Env) -> Self {
+    fn child(parent: Rc<Env>) -> Self {
         Self {
             bindings: HashMap::new(),
-            parent: Some(Box::new(parent.clone())),
+            parent: Some(parent),
         }
     }
 
@@ -112,6 +116,10 @@ impl Env {
     fn define(&mut self, name: String, val: Value) {
         self.bindings.insert(name, val);
     }
+
+    fn into_rc(self) -> Rc<Env> {
+        Rc::new(self)
+    }
 }
 
 // --- Evaluator ---
@@ -121,7 +129,7 @@ fn quote_expr(expr: &Expr) -> Value {
         Expr::Integer(n) => Value::Integer(*n),
         Expr::Boolean(b) => Value::Boolean(*b),
         Expr::SchemeString(s) => Value::SchemeString(s.clone()),
-        Expr::Symbol(s) => Value::SchemeString(s.clone()),
+        Expr::Symbol(s) => Value::Symbol(s.clone()),
         Expr::List(items) => {
             Value::List(items.iter().map(quote_expr).collect())
         }
@@ -168,6 +176,9 @@ fn eval_application(items: &[Expr], env: &mut Env) -> Result<Value, EvalError> {
             "lambda" => return eval_lambda(args_exprs, env),
             "and" => return eval_and(args_exprs, env),
             "or" => return eval_or(args_exprs, env),
+            "let" => return eval_let(args_exprs, env),
+            "begin" => return eval_begin(args_exprs, env),
+            "cond" => return eval_cond(args_exprs, env),
             _ => {}
         }
     }
@@ -202,7 +213,7 @@ fn apply(callable: &Value, args: &[Value], name: Option<&str>) -> Result<Value, 
                     ),
                 });
             }
-            let mut call_env = Env::with_parent(env);
+            let mut call_env = Env::child(env.clone().into_rc());
             // Inject self-reference for recursion
             if let Some(fn_name) = name {
                 call_env.define(fn_name.to_string(), callable.clone());
@@ -210,9 +221,65 @@ fn apply(callable: &Value, args: &[Value], name: Option<&str>) -> Result<Value, 
             for (param, arg) in params.iter().zip(args.iter()) {
                 call_env.define(param.clone(), arg.clone());
             }
-            let mut result = Value::Boolean(false);
+            // Separate internal defines from body expressions
+            let mut internal_defines = Vec::new();
+            let mut body_exprs = Vec::new();
             for expr in body {
-                result = eval(expr, &mut call_env)?;
+                if let Expr::List(items) = expr {
+                    if let Some(Expr::Symbol(s)) = items.first() {
+                        if s == "define" {
+                            if let Some(def_name) = extract_define_name(items) {
+                                internal_defines.push(def_name);
+                            }
+                            // Still add to body_exprs — we'll eval defines first
+                        }
+                    }
+                }
+                body_exprs.push(expr);
+            }
+            // Pre-define all internal names as placeholders
+            for def_name in &internal_defines {
+                call_env.define(def_name.clone(), Value::Boolean(false));
+            }
+            // Evaluate all define forms
+            for expr in &body_exprs {
+                if let Expr::List(items) = expr {
+                    if let Some(Expr::Symbol(s)) = items.first() {
+                        if s == "define" {
+                            eval(expr, &mut call_env)?;
+                        }
+                    }
+                }
+            }
+            // Patch all defined lambdas with the complete env
+            if !internal_defines.is_empty() {
+                for def_name in &internal_defines {
+                    if let Some(Value::Lambda {
+                        params,
+                        body: lbody,
+                        ..
+                    }) = call_env.get(def_name)
+                    {
+                        let patched = Value::Lambda {
+                            params,
+                            body: lbody,
+                            env: call_env.clone(),
+                        };
+                        call_env.define(def_name.clone(), patched);
+                    }
+                }
+            }
+            // Evaluate non-define body expressions
+            let mut result = Value::Boolean(false);
+            for expr in &body_exprs {
+                let is_define = if let Expr::List(items) = expr {
+                    matches!(items.first(), Some(Expr::Symbol(s)) if s == "define")
+                } else {
+                    false
+                };
+                if !is_define {
+                    result = eval(expr, &mut call_env)?;
+                }
             }
             Ok(result)
         }
@@ -220,6 +287,21 @@ fn apply(callable: &Value, args: &[Value], name: Option<&str>) -> Result<Value, 
         _ => Err(EvalError::Type {
             message: format!("not a procedure: {}", callable.display()),
         }),
+    }
+}
+
+fn extract_define_name(items: &[Expr]) -> Option<String> {
+    // items[0] is "define"
+    match items.get(1) {
+        Some(Expr::Symbol(name)) => Some(name.clone()),
+        Some(Expr::List(sig)) => {
+            if let Some(Expr::Symbol(name)) = sig.first() {
+                Some(name.clone())
+            } else {
+                None
+            }
+        }
+        _ => None,
     }
 }
 
@@ -376,6 +458,150 @@ fn eval_or(exprs: &[Expr], env: &mut Env) -> Result<Value, EvalError> {
         }
     }
     Ok(result)
+}
+
+fn eval_let(args: &[Expr], env: &mut Env) -> Result<Value, EvalError> {
+    if args.is_empty() {
+        return Err(EvalError::Arity {
+            message: "let requires at least 2 arguments".to_string(),
+        });
+    }
+    // Named let: (let name ((var init) ...) body...)
+    if let Expr::Symbol(name) = &args[0] {
+        if args.len() < 3 {
+            return Err(EvalError::Arity {
+                message: "named let requires bindings and body".to_string(),
+            });
+        }
+        let bindings_expr = match &args[1] {
+            Expr::List(b) => b,
+            _ => {
+                return Err(EvalError::Type {
+                    message: "let: expected bindings list".to_string(),
+                })
+            }
+        };
+        let mut params = Vec::new();
+        let mut init_vals = Vec::new();
+        for b in bindings_expr {
+            match b {
+                Expr::List(pair) if pair.len() == 2 => {
+                    match &pair[0] {
+                        Expr::Symbol(s) => params.push(s.clone()),
+                        _ => {
+                            return Err(EvalError::Type {
+                                message: "let: expected symbol in binding".to_string(),
+                            })
+                        }
+                    }
+                    init_vals.push(eval(&pair[1], env)?);
+                }
+                _ => {
+                    return Err(EvalError::Type {
+                        message: "let: malformed binding".to_string(),
+                    })
+                }
+            }
+        }
+        let body: Vec<Expr> = args[2..].to_vec();
+        let lambda = Value::Lambda {
+            params: params.clone(),
+            body,
+            env: env.clone(),
+        };
+        // Create env with the named function bound to itself
+        let mut call_env = Env::child(env.clone().into_rc());
+        call_env.define(name.clone(), lambda.clone());
+        // Re-create lambda with env that contains self-reference
+        let recursive_lambda = Value::Lambda {
+            params,
+            body: args[2..].to_vec(),
+            env: call_env.clone(),
+        };
+        call_env.define(name.clone(), recursive_lambda.clone());
+        // Apply with init values
+        return apply(&recursive_lambda, &init_vals, Some(name));
+    }
+    // Regular let: (let ((var init) ...) body...)
+    let bindings_expr = match &args[0] {
+        Expr::List(b) => b,
+        _ => {
+            return Err(EvalError::Type {
+                message: "let: expected bindings list".to_string(),
+            })
+        }
+    };
+    let mut let_env = Env::child(env.clone().into_rc());
+    for b in bindings_expr {
+        match b {
+            Expr::List(pair) if pair.len() == 2 => {
+                let name = match &pair[0] {
+                    Expr::Symbol(s) => s.clone(),
+                    _ => {
+                        return Err(EvalError::Type {
+                            message: "let: expected symbol in binding".to_string(),
+                        })
+                    }
+                };
+                let val = eval(&pair[1], env)?;
+                let_env.define(name, val);
+            }
+            _ => {
+                return Err(EvalError::Type {
+                    message: "let: malformed binding".to_string(),
+                })
+            }
+        }
+    }
+    let mut result = Value::Boolean(false);
+    for expr in &args[1..] {
+        result = eval(expr, &mut let_env)?;
+    }
+    Ok(result)
+}
+
+fn eval_begin(args: &[Expr], env: &mut Env) -> Result<Value, EvalError> {
+    let mut result = Value::Boolean(false);
+    for expr in args {
+        result = eval(expr, env)?;
+    }
+    Ok(result)
+}
+
+fn eval_cond(clauses: &[Expr], env: &mut Env) -> Result<Value, EvalError> {
+    for clause in clauses {
+        match clause {
+            Expr::List(parts) if !parts.is_empty() => {
+                // Check for else clause
+                if let Expr::Symbol(s) = &parts[0] {
+                    if s == "else" {
+                        let mut result = Value::Boolean(false);
+                        for expr in &parts[1..] {
+                            result = eval(expr, env)?;
+                        }
+                        return Ok(result);
+                    }
+                }
+                let test = eval(&parts[0], env)?;
+                if test.is_truthy() {
+                    if parts.len() == 1 {
+                        return Ok(test);
+                    }
+                    let mut result = Value::Boolean(false);
+                    for expr in &parts[1..] {
+                        result = eval(expr, env)?;
+                    }
+                    return Ok(result);
+                }
+            }
+            _ => {
+                return Err(EvalError::Type {
+                    message: "cond: malformed clause".to_string(),
+                })
+            }
+        }
+    }
+    Ok(Value::Boolean(false))
 }
 
 /// Evaluate one or more Scheme expressions and return the string
