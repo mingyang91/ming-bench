@@ -75,6 +75,35 @@ object BuiltinsExt:
       case MutableStringVal(cs, _) :: Nil => MutableStringVal(cs.clone())
       case _                              => throw new EvalError("string-copy: expected string")
 
+  // --- String/Char conversions (L14) ---
+
+  def stringToListOp(args: List[SchemeValue]): SchemeValue =
+    args match
+      case StringVal(s, _) :: Nil =>
+        ListVal(s.toList.map(c => CharVal(c)))
+      case MutableStringVal(cs, _) :: Nil =>
+        ListVal(cs.toList.map(c => CharVal(c)))
+      case _ => throw new EvalError("string->list: expected string")
+
+  def listToStringOp(args: List[SchemeValue]): SchemeValue =
+    args match
+      case ListVal(elems, _) :: Nil =>
+        val chars = elems.map:
+          case CharVal(c, _) => c
+          case other         => throw new EvalError(s"list->string: expected char, got ${other.display}")
+        StringVal(String(chars.toArray))
+      case _ => throw new EvalError("list->string: expected list")
+
+  def charToIntegerOp(args: List[SchemeValue]): SchemeValue =
+    args match
+      case CharVal(c, _) :: Nil => IntVal(c.toLong)
+      case _                    => throw new EvalError("char->integer: expected char")
+
+  def integerToCharOp(args: List[SchemeValue]): SchemeValue =
+    args match
+      case IntVal(n, _) :: Nil => CharVal(n.toChar)
+      case _                   => throw new EvalError("integer->char: expected integer")
+
   // --- Numeric utilities (L13) ---
 
   def absOp(args: List[SchemeValue]): SchemeValue =

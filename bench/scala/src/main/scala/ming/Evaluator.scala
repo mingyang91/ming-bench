@@ -44,6 +44,10 @@ object Evaluator:
       ("string-ref", args => BuiltinsExt.stringRefOp(args)),
       ("string-set!", args => BuiltinsExt.stringSetOp(args)),
       ("string-copy", args => BuiltinsExt.stringCopyOp(args)),
+      ("string->list", args => BuiltinsExt.stringToListOp(args)),
+      ("list->string", args => BuiltinsExt.listToStringOp(args)),
+      ("char->integer", args => BuiltinsExt.charToIntegerOp(args)),
+      ("integer->char", args => BuiltinsExt.integerToCharOp(args)),
       ("apply", args => Builtins.applyOp(args)),
       // L13 - Numeric utilities
       ("abs", args => BuiltinsExt.absOp(args)),
