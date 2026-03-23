@@ -79,7 +79,7 @@ function tokenize(input: string): Token[] {
   };
   while (i < input.length) {
     const ch = input[i];
-    if (ch === ' ' || ch === '\t' || ch === '\n' || ch === '\r') {
+    if (ch === ' ' || ch === '\t' || ch === '\n' || ch === '\r' || ch === '\f' || ch === '\v') {
       advance();
       continue;
     }
@@ -90,6 +90,21 @@ function tokenize(input: string): Token[] {
     if (ch === '\'') {
       tokens.push({ text: "'", pos: { line, col } });
       advance();
+      continue;
+    }
+    if (ch === '`') {
+      tokens.push({ text: "`", pos: { line, col } });
+      advance();
+      continue;
+    }
+    if (ch === ',') {
+      if (i + 1 < input.length && input[i + 1] === '@') {
+        tokens.push({ text: ",@", pos: { line, col } });
+        advance(); advance();
+      } else {
+        tokens.push({ text: ",", pos: { line, col } });
+        advance();
+      }
       continue;
     }
     if (ch === '#' && i + 1 < input.length && input[i + 1] === '\'') {
@@ -134,10 +149,14 @@ function tokenize(input: string): Token[] {
       input[i] !== '\t' &&
       input[i] !== '\n' &&
       input[i] !== '\r' &&
+      input[i] !== '\f' &&
+      input[i] !== '\v' &&
       input[i] !== '(' &&
       input[i] !== ')' &&
       input[i] !== ';' &&
-      input[i] !== '\''
+      input[i] !== '\'' &&
+      input[i] !== '`' &&
+      input[i] !== ','
     ) {
       atom += input[i];
       advance();
@@ -159,6 +178,18 @@ function parseTokens(tokens: Token[], pos: number): [SchemeVal, number] {
   if (tok.text === "#'") {
     const [val, next] = parseTokens(tokens, pos + 1);
     return [{ tag: 'list', val: [{ tag: 'symbol', val: 'syntax', pos: tok.pos }, val], pos: tok.pos }, next];
+  }
+  if (tok.text === '`') {
+    const [val, next] = parseTokens(tokens, pos + 1);
+    return [{ tag: 'list', val: [{ tag: 'symbol', val: 'quasiquote', pos: tok.pos }, val], pos: tok.pos }, next];
+  }
+  if (tok.text === ',') {
+    const [val, next] = parseTokens(tokens, pos + 1);
+    return [{ tag: 'list', val: [{ tag: 'symbol', val: 'unquote', pos: tok.pos }, val], pos: tok.pos }, next];
+  }
+  if (tok.text === ',@') {
+    const [val, next] = parseTokens(tokens, pos + 1);
+    return [{ tag: 'list', val: [{ tag: 'symbol', val: 'unquote-splicing', pos: tok.pos }, val], pos: tok.pos }, next];
   }
   if (tok.text === '(') {
     const items: SchemeVal[] = [];
@@ -452,11 +483,11 @@ function isProperList(v: SchemeVal): boolean {
   let slow: SchemeVal = v, fast: SchemeVal = v;
   while (true) {
     if (fast.tag !== 'pair') {
-      return isNullVal(fast);
+      return isNullVal(fast) || (fast.tag === 'list' && isProperList(fast));
     }
     fast = fast.cdr;
     if (fast.tag !== 'pair') {
-      return isNullVal(fast);
+      return isNullVal(fast) || (fast.tag === 'list' && isProperList(fast));
     }
     fast = fast.cdr;
     slow = (slow as any).cdr;
@@ -543,7 +574,7 @@ function quoteToScheme(v: SchemeVal): SchemeVal {
 // ── Hygienic Macros ─────────────────────────────────────────────────
 
 const SPECIAL_FORMS = new Set([
-  'quote', 'if', 'define', 'set!', 'lambda', 'case-lambda', 'and', 'or', 'begin',
+  'quote', 'quasiquote', 'if', 'define', 'set!', 'lambda', 'case-lambda', 'and', 'or', 'begin',
   'cond', 'let', 'let*', 'letrec', 'letrec*', 'case', 'do',
   'define-syntax', 'syntax-rules', 'syntax-case', 'syntax', 'with-syntax', 'else', 'define-record-type',
   'guard', 'dynamic-wind', 'when', 'unless', 'call-with-values', 'call/cc', 'call-with-current-continuation',
@@ -728,24 +759,39 @@ function applyBuiltin(op: string, evalArgs: SchemeVal[], p?: Pos, out?: string[]
       return exactArith('/', evalArgs, p);
     }
     case '<': {
-      if (evalArgs.length !== 2) throw posError('<: need exactly two args', p);
-      return { tag: 'boolean', val: toNumber(evalArgs[0], '<', p) < toNumber(evalArgs[1], '<', p) };
+      if (evalArgs.length < 2) throw posError('<: need at least two args', p);
+      for (let ci = 0; ci < evalArgs.length - 1; ci++) {
+        if (!(toNumber(evalArgs[ci], '<', p) < toNumber(evalArgs[ci + 1], '<', p))) return { tag: 'boolean', val: false };
+      }
+      return { tag: 'boolean', val: true };
     }
     case '>': {
-      if (evalArgs.length !== 2) throw posError('>: need exactly two args', p);
-      return { tag: 'boolean', val: toNumber(evalArgs[0], '>', p) > toNumber(evalArgs[1], '>', p) };
+      if (evalArgs.length < 2) throw posError('>: need at least two args', p);
+      for (let ci = 0; ci < evalArgs.length - 1; ci++) {
+        if (!(toNumber(evalArgs[ci], '>', p) > toNumber(evalArgs[ci + 1], '>', p))) return { tag: 'boolean', val: false };
+      }
+      return { tag: 'boolean', val: true };
     }
     case '=': {
-      if (evalArgs.length !== 2) throw posError('=: need exactly two args', p);
-      return { tag: 'boolean', val: toNumber(evalArgs[0], '=', p) === toNumber(evalArgs[1], '=', p) };
+      if (evalArgs.length < 2) throw posError('=: need at least two args', p);
+      for (let ci = 0; ci < evalArgs.length - 1; ci++) {
+        if (toNumber(evalArgs[ci], '=', p) !== toNumber(evalArgs[ci + 1], '=', p)) return { tag: 'boolean', val: false };
+      }
+      return { tag: 'boolean', val: true };
     }
     case '<=': {
-      if (evalArgs.length !== 2) throw posError('<=: need exactly two args', p);
-      return { tag: 'boolean', val: toNumber(evalArgs[0], '<=', p) <= toNumber(evalArgs[1], '<=', p) };
+      if (evalArgs.length < 2) throw posError('<=: need at least two args', p);
+      for (let ci = 0; ci < evalArgs.length - 1; ci++) {
+        if (!(toNumber(evalArgs[ci], '<=', p) <= toNumber(evalArgs[ci + 1], '<=', p))) return { tag: 'boolean', val: false };
+      }
+      return { tag: 'boolean', val: true };
     }
     case '>=': {
-      if (evalArgs.length !== 2) throw posError('>=: need exactly two args', p);
-      return { tag: 'boolean', val: toNumber(evalArgs[0], '>=', p) >= toNumber(evalArgs[1], '>=', p) };
+      if (evalArgs.length < 2) throw posError('>=: need at least two args', p);
+      for (let ci = 0; ci < evalArgs.length - 1; ci++) {
+        if (!(toNumber(evalArgs[ci], '>=', p) >= toNumber(evalArgs[ci + 1], '>=', p))) return { tag: 'boolean', val: false };
+      }
+      return { tag: 'boolean', val: true };
     }
     case 'not': {
       if (evalArgs.length !== 1) throw posError('not: need exactly one arg', p);
@@ -1416,6 +1462,11 @@ function applyBuiltin(op: string, evalArgs: SchemeVal[], p?: Pos, out?: string[]
       if (evalArgs.length !== 2) throw posError('datum->syntax: need exactly 2 args', p);
       return evalArgs[1]; // In our representation, just return the datum
     }
+    case 'error': {
+      if (evalArgs.length < 1) throw posError('error: need at least 1 arg', p);
+      const parts = evalArgs.map(a => displayVal(a));
+      throw new EvalError(parts.join(' '));
+    }
     default:
       throw posError(`unknown procedure: ${op}`, p);
   }
@@ -1493,7 +1544,7 @@ const BUILTINS = new Set(['+', '-', '*', '/', '<', '>', '=', '<=', '>=', 'not',
   'gcd', 'lcm', 'truncate', 'round', 'floor', 'ceiling',
   'string-copy!', 'make-string', 'string',
   'string>?', 'string<=?', 'string>=?',
-  'syntax->datum', 'datum->syntax']);
+  'syntax->datum', 'datum->syntax', 'error']);
 
 function parseParams(paramList: SchemeVal, p?: Pos): { params: string[]; rest?: string } {
   if (paramList.tag !== 'list') throw posError('params must be a list', p);
@@ -1705,6 +1756,90 @@ function applyCPS(proc: SchemeVal, args: SchemeVal[], k: Cont, p?: Pos, out?: st
   throw posError('not a procedure', p);
 }
 
+// ── Quasiquote ──────────────────────────────────────────────────────
+
+function qqExpand(tmpl: SchemeVal, env: Env, k: Cont, p?: Pos, out?: string[]): Bounce {
+  // Atom: return as-is
+  if (tmpl.tag !== 'list' && tmpl.tag !== 'pair') return k(tmpl);
+
+  // Check for (unquote x)
+  if (tmpl.tag === 'list' && tmpl.val.length === 2 &&
+      tmpl.val[0].tag === 'symbol' && tmpl.val[0].val === 'unquote') {
+    return evalCPS(tmpl.val[1], env, k, out);
+  }
+
+  // List/pair: process elements, handling splicing
+  if (tmpl.tag === 'list') {
+    const items = tmpl.val;
+    // Check for dotted pair: (a b . c)
+    const dotIdx = items.findIndex(x => x.tag === 'symbol' && x.val === '.');
+    if (dotIdx >= 0 && dotIdx === items.length - 2) {
+      // Dotted list: expand head elements and tail
+      const headItems = items.slice(0, dotIdx);
+      const tailTmpl = items[items.length - 1];
+      return qqExpandList(headItems, 0, env, p, out, headResult => {
+        return qqExpand(tailTmpl, env, tailVal => {
+          // Build pair chain from headResult ending with tailVal
+          let result: SchemeVal = tailVal;
+          for (let qi = headResult.length - 1; qi >= 0; qi--) {
+            result = { tag: 'pair', car: headResult[qi], cdr: result };
+          }
+          return k(result);
+        }, p, out);
+      });
+    }
+    return qqExpandList(items, 0, env, p, out, resultItems => {
+      return k({ tag: 'list', val: resultItems, pos: tmpl.pos });
+    });
+  }
+
+  // pair tag
+  if (tmpl.tag === 'pair') {
+    // Check if car is (unquote-splicing ...)
+    if (tmpl.car.tag === 'list' && tmpl.car.val.length === 2 &&
+        tmpl.car.val[0].tag === 'symbol' && tmpl.car.val[0].val === 'unquote-splicing') {
+      return evalCPS(tmpl.car.val[1], env, splicedVal => {
+        return qqExpand(tmpl.cdr, env, cdrVal => {
+          // Append splicedVal to cdrVal
+          const splicedArr = toArray(splicedVal) || [];
+          let result: SchemeVal = cdrVal;
+          for (let qi = splicedArr.length - 1; qi >= 0; qi--) {
+            result = { tag: 'pair', car: splicedArr[qi], cdr: result };
+          }
+          return k(result);
+        }, p, out);
+      }, out);
+    }
+    return qqExpand(tmpl.car, env, carVal => {
+      return qqExpand(tmpl.cdr, env, cdrVal => {
+        return k({ tag: 'pair', car: carVal, cdr: cdrVal });
+      }, p, out);
+    }, p, out);
+  }
+
+  return k(tmpl);
+}
+
+function qqExpandList(items: SchemeVal[], idx: number, env: Env, p: Pos | undefined, out: string[] | undefined, k: (result: SchemeVal[]) => Bounce): Bounce {
+  if (idx >= items.length) return k([]);
+  const item = items[idx];
+  // Check for (unquote-splicing x)
+  if (item.tag === 'list' && item.val.length === 2 &&
+      item.val[0].tag === 'symbol' && item.val[0].val === 'unquote-splicing') {
+    return evalCPS(item.val[1], env, splicedVal => {
+      const splicedArr = toArray(splicedVal) || [];
+      return () => qqExpandList(items, idx + 1, env, p, out, restItems => {
+        return k([...splicedArr, ...restItems]);
+      });
+    }, out);
+  }
+  return qqExpand(item, env, expandedItem => {
+    return () => qqExpandList(items, idx + 1, env, p, out, restItems => {
+      return k([expandedItem, ...restItems]);
+    });
+  }, p, out);
+}
+
 function evalCPS(expr: SchemeVal, env: Env, k: Cont, out?: string[]): Bounce {
   const p = expr.pos;
 
@@ -1729,6 +1864,11 @@ function evalCPS(expr: SchemeVal, env: Env, k: Cont, out?: string[]): Bounce {
     if (op === 'quote') {
       if (args.length !== 1) throw posError('quote: need exactly one arg', p);
       return k(quoteToScheme(args[0]));
+    }
+
+    if (op === 'quasiquote') {
+      if (args.length !== 1) throw posError('quasiquote: need exactly one arg', p);
+      return qqExpand(args[0], env, k, p, out);
     }
 
     if (op === 'if') {
@@ -1832,6 +1972,11 @@ function evalCPS(expr: SchemeVal, env: Env, k: Cont, out?: string[]): Bounce {
         return evalCPS(test, env, condVal => {
           if (isTruthy(condVal)) {
             if (clause.val.length === 1) return k(condVal);
+            if (clause.val.length === 3 && clause.val[1].tag === 'symbol' && clause.val[1].val === '=>') {
+              return evalCPS(clause.val[2], env, proc => {
+                return applyCPS(proc, [condVal], k, p, out);
+              }, out);
+            }
             return evalBodyCPS(clause.val, 1, env, k, out);
           }
           return () => evalCond(i + 1);
