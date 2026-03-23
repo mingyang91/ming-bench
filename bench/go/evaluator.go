@@ -43,10 +43,9 @@ type value struct {
 	// builtin function
 	builtin func(args []*value, line, col int) (*value, error)
 	// continuation fields
-	contExpr    *expr // the call/cc expression (for replay matching)
-	contIdx     int   // top-level expression index
-	contLetExpr *expr // enclosing let expression (if any)
-	contLetEnv  *env  // the let's local environment
+	contExpr     *expr    // the call/cc expression (for replay matching)
+	contIdx      int      // top-level expression index
+	contLetStack []letCtx // stack of enclosing let contexts at capture time
 	// call/cc marker
 	isCallCC bool
 	// macro fields
@@ -396,13 +395,19 @@ func (e *env) setExisting(name string, v *value) bool {
 
 // ---------- Continuations ----------
 
+// letCtx tracks a let expression, its environment, and the body index being evaluated.
+type letCtx struct {
+	expr    *expr
+	env     *env
+	bodyIdx int
+}
+
 // continuationJump is panicked when a continuation is invoked.
 type continuationJump struct {
-	contExpr    *expr  // the call/cc expression to replay from
-	contIdx     int    // top-level expression index to replay from
-	val         *value // value to deliver to the continuation
-	contLetExpr *expr  // enclosing let expression (if any)
-	contLetEnv  *env   // the let's local environment (to preserve mutations)
+	contExpr *expr  // the call/cc expression to replay from
+	contIdx  int    // top-level expression index to replay from
+	val      *value // value to deliver to the continuation
+	letStack []letCtx // stack of enclosing let contexts at capture time
 }
 
 // ---------- Interpreter ----------
@@ -413,12 +418,10 @@ type interp struct {
 	exprIdx     int     // current top-level expression index
 	replayExpr  *expr   // if non-nil, the call/cc expr to short-circuit
 	replayValue *value  // value to return from the replayed call/cc
-	// Let environment tracking for continuation capture
-	currentLetExpr *expr // enclosing let expression (innermost)
-	currentLetEnv  *env  // that let's local environment
-	// Replay: reuse let environment instead of re-initializing bindings
-	replayLetExpr *expr
-	replayLetEnv  *env
+	// Let environment stack for continuation capture
+	letStack []letCtx
+	// Replay: stack of let contexts to match during replay
+	replayLetStack []letCtx
 }
 
 // ---------- Evaluator ----------
@@ -642,11 +645,10 @@ func (ip *interp) eval(e *expr, envir *env) (*value, error) {
 					return nil, &EvalError{Message: fmt.Sprintf("%d:%d: continuation: expected 1 argument", e.line, e.col)}
 				}
 				panic(&continuationJump{
-					contExpr:    fn.contExpr,
-					contIdx:     fn.contIdx,
-					val:         args[0],
-					contLetExpr: fn.contLetExpr,
-					contLetEnv:  fn.contLetEnv,
+					contExpr: fn.contExpr,
+					contIdx:  fn.contIdx,
+					val:      args[0],
+					letStack: fn.contLetStack,
 				})
 			}
 
@@ -684,13 +686,15 @@ func (ip *interp) handleCallCC(proc *value, e *expr) (*value, error) {
 		return val, nil
 	}
 
-	// Create continuation value
+	// Create continuation value — capture the current let stack
+	savedLetStack := make([]letCtx, len(ip.letStack))
+	copy(savedLetStack, ip.letStack)
+
 	cont := &value{
-		typ:         valContinuation,
-		contExpr:    e,
-		contIdx:     ip.exprIdx,
-		contLetExpr: ip.currentLetExpr,
-		contLetEnv:  ip.currentLetEnv,
+		typ:      valContinuation,
+		contExpr: e,
+		contIdx:  ip.exprIdx,
+		contLetStack: savedLetStack,
 	}
 
 	// Call proc(cont) with escape recovery
@@ -770,11 +774,10 @@ func applyFunc(fn *value, args []*value, callExpr *expr) (*value, error) {
 			return nil, &EvalError{Message: fmt.Sprintf("%d:%d: continuation: expected 1 argument", line, col)}
 		}
 		panic(&continuationJump{
-			contExpr:    fn.contExpr,
-			contIdx:     fn.contIdx,
-			val:         args[0],
-			contLetExpr: fn.contLetExpr,
-			contLetEnv:  fn.contLetEnv,
+			contExpr: fn.contExpr,
+			contIdx:  fn.contIdx,
+			val:      args[0],
+			letStack: fn.contLetStack,
 		})
 	default:
 		return nil, &EvalError{Message: fmt.Sprintf("%d:%d: not a procedure", line, col)}
@@ -894,11 +897,17 @@ func (ip *interp) setupLet(e *expr, envir *env) (tailExpr *expr, tailEnv *env, e
 
 	// Check if we should reuse a saved environment (continuation replay)
 	var localEnv *env
-	if ip.replayLetExpr == e {
-		localEnv = ip.replayLetEnv
-		ip.replayLetExpr = nil
-		ip.replayLetEnv = nil
-	} else {
+	skipToIdx := -1 // body index to skip to during replay (-1 = no skip)
+	replayMatch := false
+	if len(ip.replayLetStack) > 0 && ip.replayLetStack[0].expr == e {
+		// Match only the outermost let on the replay stack.
+		// Inner lets (e.g., inside function bodies) should re-initialize.
+		localEnv = ip.replayLetStack[0].env
+		skipToIdx = ip.replayLetStack[0].bodyIdx
+		ip.replayLetStack = nil // consumed — inner lets evaluate normally
+		replayMatch = true
+	}
+	if !replayMatch {
 		params := make([]string, len(bindingsExpr.items))
 		vals := make([]*value, len(bindingsExpr.items))
 		for i, b := range bindingsExpr.items {
@@ -934,22 +943,28 @@ func (ip *interp) setupLet(e *expr, envir *env) (tailExpr *expr, tailEnv *env, e
 		localEnv.set(name, fn)
 	}
 
-	// Track let context for continuation capture
-	prevLetExpr, prevLetEnv := ip.currentLetExpr, ip.currentLetEnv
-	ip.currentLetExpr = e
-	ip.currentLetEnv = localEnv
+	// Push let context for continuation capture
+	ip.letStack = append(ip.letStack, letCtx{expr: e, env: localEnv, bodyIdx: 0})
+	stackIdx := len(ip.letStack) - 1
 
 	// Eval all body exprs except last
-	for _, b := range body[:len(body)-1] {
+	for i, b := range body[:len(body)-1] {
+		ip.letStack[stackIdx].bodyIdx = i
+		if skipToIdx > 0 && i < skipToIdx {
+			continue // skip body expressions before the replay target
+		}
 		_, err := ip.eval(b, localEnv)
 		if err != nil {
-			ip.currentLetExpr, ip.currentLetEnv = prevLetExpr, prevLetEnv
+			ip.letStack = ip.letStack[:stackIdx]
 			return nil, nil, err
 		}
 	}
 
-	// Keep let context for tail expression (it may contain call/cc)
-	// It will be overwritten by the next body-level construct or reset at top level
+	// Set body index for tail expression
+	ip.letStack[stackIdx].bodyIdx = len(body) - 1
+
+	// Pop let context (will be re-pushed if needed by tail eval)
+	ip.letStack = ip.letStack[:stackIdx]
 
 	return body[len(body)-1], localEnv, nil
 }
@@ -1190,11 +1205,10 @@ func makeGlobalEnv(ip *interp) *env {
 				return nil, &EvalError{Message: fmt.Sprintf("%d:%d: apply: continuation expects 1 argument", line, col)}
 			}
 			panic(&continuationJump{
-				contExpr:    fn.contExpr,
-				contIdx:     fn.contIdx,
-				val:         fnArgs[0],
-				contLetExpr: fn.contLetExpr,
-				contLetEnv:  fn.contLetEnv,
+				contExpr: fn.contExpr,
+				contIdx:  fn.contIdx,
+				val:      fnArgs[0],
+				letStack: fn.contLetStack,
 			})
 		}
 		if fn.typ == valLambda {
@@ -1437,14 +1451,10 @@ func evalInput(input string) (last *value, ip *interp, err error) {
 			ip.replayExpr = jumpCaught.contExpr
 			ip.replayValue = jumpCaught.val
 			startIdx = jumpCaught.contIdx
-			// If the continuation was inside a let, preserve that let's environment
-			if jumpCaught.contLetExpr != nil {
-				ip.replayLetExpr = jumpCaught.contLetExpr
-				ip.replayLetEnv = jumpCaught.contLetEnv
-			}
+			// Restore the let stack for replay (skip body exprs before call/cc)
+			ip.replayLetStack = jumpCaught.letStack
 			// Reset let tracking for the new evaluation
-			ip.currentLetExpr = nil
-			ip.currentLetEnv = nil
+			ip.letStack = nil
 			continue
 		}
 
