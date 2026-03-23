@@ -44,9 +44,10 @@ type value struct {
 	// builtin function
 	builtin func(args []*value, line, col int) (*value, error)
 	// continuation fields
-	contExpr     *expr    // the call/cc expression (for replay matching)
-	contIdx      int      // top-level expression index
-	contLetStack []letCtx // stack of enclosing let contexts at capture time
+	contExpr      *expr    // the call/cc expression (for replay matching)
+	contIdx       int      // top-level expression index
+	contLetStack  []letCtx // stack of enclosing let contexts at capture time
+	contWindStack []windEntry // dynamic-wind stack at capture time
 	// call/cc marker
 	isCallCC bool
 	// mutable flag (e.g., strings from string-copy)
@@ -418,12 +419,19 @@ type letCtx struct {
 	bodyIdx int
 }
 
+// windEntry tracks a dynamic-wind in/out thunk pair.
+type windEntry struct {
+	inThunk  *value
+	outThunk *value
+}
+
 // continuationJump is panicked when a continuation is invoked.
 type continuationJump struct {
-	contExpr *expr  // the call/cc expression to replay from
-	contIdx  int    // top-level expression index to replay from
-	val      *value // value to deliver to the continuation
-	letStack []letCtx // stack of enclosing let contexts at capture time
+	contExpr  *expr  // the call/cc expression to replay from
+	contIdx   int    // top-level expression index to replay from
+	val       *value // value to deliver to the continuation
+	letStack  []letCtx // stack of enclosing let contexts at capture time
+	windStack []windEntry // dynamic-wind stack at capture time
 }
 
 // ---------- Interpreter ----------
@@ -438,6 +446,8 @@ type interp struct {
 	letStack []letCtx
 	// Replay: stack of let contexts to match during replay
 	replayLetStack []letCtx
+	// Dynamic-wind stack
+	windStack []windEntry
 }
 
 // ---------- Evaluator ----------
@@ -656,6 +666,9 @@ func (ip *interp) eval(e *expr, envir *env) (*value, error) {
 
 				case "define-syntax":
 					return ip.evalDefineSyntax(e, envir)
+
+				case "dynamic-wind":
+					return ip.evalDynamicWind(e, envir)
 				}
 
 				// Check for macro expansion
@@ -743,15 +756,18 @@ func (ip *interp) handleCallCC(proc *value, e *expr) (*value, error) {
 		return val, nil
 	}
 
-	// Create continuation value — capture the current let stack
+	// Create continuation value — capture the current let stack and wind stack
 	savedLetStack := make([]letCtx, len(ip.letStack))
 	copy(savedLetStack, ip.letStack)
+	savedWindStack := make([]windEntry, len(ip.windStack))
+	copy(savedWindStack, ip.windStack)
 
 	cont := &value{
-		typ:      valContinuation,
-		contExpr: e,
-		contIdx:  ip.exprIdx,
-		contLetStack: savedLetStack,
+		typ:           valContinuation,
+		contExpr:      e,
+		contIdx:       ip.exprIdx,
+		contLetStack:  savedLetStack,
+		contWindStack: savedWindStack,
 	}
 
 	// Call proc(cont) with escape recovery
@@ -794,6 +810,88 @@ func (ip *interp) handleCallCC(proc *value, e *expr) (*value, error) {
 	}()
 
 	return result, resultErr
+}
+
+// callThunk calls a zero-argument procedure.
+func (ip *interp) callThunk(thunk *value, line, col int) (*value, error) {
+	if thunk.typ == valLambda {
+		localEnv := newEnv(thunk.closure)
+		var result *value
+		var err error
+		for _, bodyExpr := range thunk.body {
+			result, err = ip.eval(bodyExpr, localEnv)
+			if err != nil {
+				return nil, err
+			}
+		}
+		return result, nil
+	} else if thunk.typ == valBuiltin {
+		return thunk.builtin(nil, line, col)
+	}
+	return nil, &EvalError{Message: fmt.Sprintf("%d:%d: dynamic-wind: not a procedure", line, col)}
+}
+
+// evalDynamicWind implements (dynamic-wind in-thunk body-thunk out-thunk).
+func (ip *interp) evalDynamicWind(e *expr, envir *env) (*value, error) {
+	if len(e.items) != 4 {
+		return nil, &EvalError{Message: fmt.Sprintf("%d:%d: dynamic-wind: expected 3 arguments", e.line, e.col)}
+	}
+
+	inThunk, err := ip.eval(e.items[1], envir)
+	if err != nil {
+		return nil, err
+	}
+	bodyThunk, err := ip.eval(e.items[2], envir)
+	if err != nil {
+		return nil, err
+	}
+	outThunk, err := ip.eval(e.items[3], envir)
+	if err != nil {
+		return nil, err
+	}
+
+	// Run in-thunk
+	_, err = ip.callThunk(inThunk, e.line, e.col)
+	if err != nil {
+		return nil, err
+	}
+
+	// Push wind entry
+	ip.windStack = append(ip.windStack, windEntry{inThunk: inThunk, outThunk: outThunk})
+
+	// Run body-thunk, catching continuation jumps to run out-thunk
+	var result *value
+	var bodyErr error
+	var jump *continuationJump
+
+	func() {
+		defer func() {
+			if r := recover(); r != nil {
+				if j, ok := r.(*continuationJump); ok {
+					jump = j
+				} else {
+					panic(r)
+				}
+			}
+		}()
+		result, bodyErr = ip.callThunk(bodyThunk, e.line, e.col)
+	}()
+
+	// Pop wind entry
+	ip.windStack = ip.windStack[:len(ip.windStack)-1]
+
+	// Run out-thunk
+	_, err = ip.callThunk(outThunk, e.line, e.col)
+	if err != nil {
+		return nil, err
+	}
+
+	if jump != nil {
+		// Re-panic after running out-thunk
+		panic(jump)
+	}
+
+	return result, bodyErr
 }
 
 func bindLambdaArgs(fn *value, args []*value, line, col int) (*env, error) {
@@ -1495,6 +1593,19 @@ func makeGlobalEnv(ip *interp) *env {
 		return result, nil
 	}))
 
+	e.set("reverse", makeBuiltin("reverse", func(args []*value, line, col int) (*value, error) {
+		if len(args) != 1 {
+			return nil, &EvalError{Message: fmt.Sprintf("%d:%d: reverse: expected 1 argument", line, col)}
+		}
+		result := nilVal
+		cur := args[0]
+		for cur.typ == valPair {
+			result = &value{typ: valPair, car: cur.car, cdr: result}
+			cur = cur.cdr
+		}
+		return result, nil
+	}))
+
 	// apply
 	e.set("apply", makeBuiltin("apply", func(args []*value, line, col int) (*value, error) {
 		if len(args) < 2 {
@@ -1522,7 +1633,8 @@ func makeGlobalEnv(ip *interp) *env {
 				contExpr: fn.contExpr,
 				contIdx:  fn.contIdx,
 				val:      fnArgs[0],
-				letStack: fn.contLetStack,
+				letStack:  fn.contLetStack,
+			windStack: fn.contWindStack,
 			})
 		}
 		if fn.typ == valLambda {
@@ -2287,6 +2399,18 @@ func evalInput(input string) (last *value, ip *interp, err error) {
 		}
 
 		if jumpCaught != nil {
+			// Run in-thunks for the target wind stack (rewinding)
+			targetWind := jumpCaught.windStack
+			for i := 0; i < len(targetWind); i++ {
+				_, windErr := ip.callThunk(targetWind[i].inThunk, 0, 0)
+				if windErr != nil {
+					return nil, nil, windErr
+				}
+			}
+			// Restore wind stack
+			ip.windStack = make([]windEntry, len(targetWind))
+			copy(ip.windStack, targetWind)
+
 			// Reentrant continuation: replay from the saved expression index
 			ip.replayExpr = jumpCaught.contExpr
 			ip.replayValue = jumpCaught.val
