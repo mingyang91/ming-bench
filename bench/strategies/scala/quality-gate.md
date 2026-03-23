@@ -200,61 +200,13 @@ No hidden side effects.
 
 ### Functional Style
 
-- **Prefer collection pipelines for transforms.** Use `map`, `filter`, `foldLeft`, `collect`, `flatMap` instead of accumulator patterns.
+**Think FP first.** For each operation, consider the functional approach before reaching for mutation or imperative loops. Use the FP version when it's clear and concise. Fall back to imperative when the FP version obscures intent or adds significant complexity.
 
-  ```scala
-  // Bad — mutable accumulator
-  val buf = ListBuffer[Result]()
-  for item <- items do buf += process(item)
-  buf.toList
-
-  // Good — pipeline
-  items.map(process)
-  ```
-
-- **Prefer pattern matching on `List` over index-driven loops.**
-
-  ```scala
-  // Bad — index loop
-  var i = 0
-  while i < nodes.length do
-    nodes(i) match { ... }
-    i += 1
-
-  // Good — structural recursion
-  @tailrec
-  def walk(nodes: List[Node], acc: Result[Unit]): Result[Unit] = nodes match
-    case Nil          => acc
-    case head :: tail => process(head) match
-      case r @ Left(_) => r
-      case Right(_)    => walk(tail, acc)
-  ```
-
-- **Prefer folds for recursive data construction.**
-
-  ```scala
-  // Bad — mutable loop
-  var node: Tree = Tree.Empty
-  for item <- items.reverse do
-    node = Tree.Branch(item, node)
-
-  // Good — fold
-  val node = items.foldRight(Tree.Empty: Tree)(Tree.Branch(_, _))
-  ```
-
-- **Prefer declarative matching over flag variables.**
-
-  ```scala
-  // Bad — mutable flag
-  var found: Option[Value] = None
-  for entry <- entries do
-    if entry.matches(key) then found = Some(entry.value)
-
-  // Good — collectFirst
-  val found = entries.collectFirst { case e if e.matches(key) => e.value }
-  ```
-
-- **Prefer recursion over iteration.** Express loops as `@tailrec` recursive functions rather than mutable loop variables. Recursion makes termination conditions and state flow explicit.
+- **Prefer collection pipelines for transforms** — `map`, `filter`, `foldLeft`, `collect`, `flatMap` over accumulator patterns.
+- **Prefer pattern matching on `List`** over index-driven loops.
+- **Prefer folds** for recursive data construction.
+- **Prefer `collectFirst` / `find`** over flag variables.
+- **Prefer recursion** over mutable loop variables when termination logic is non-trivial.
 
 ### Match Expression Discipline
 
