@@ -572,6 +572,7 @@ fn parse(input: &str) -> Result<Vec<Expr>, EvalError> {
 enum Trampoline {
     Done(Value),
     TailCall { expr: Expr, env: Env },
+    Guard { var_name: String, clauses: Vec<Expr>, body: Vec<Expr>, env: Env, span: Span },
 }
 
 fn eval(expr: &Expr, env: &Env) -> Result<Value, EvalError> {
@@ -583,6 +584,9 @@ fn eval(expr: &Expr, env: &Env) -> Result<Value, EvalError> {
             Trampoline::TailCall { expr: e, env: en } => {
                 current_expr = e;
                 current_env = en;
+            }
+            Trampoline::Guard { var_name, clauses, body, env, span } => {
+                return eval_guard_loop(var_name, clauses, body, env, span);
             }
         }
     }
@@ -856,18 +860,23 @@ fn apply_tc(func: &Value, args: &[Value]) -> Result<Trampoline, EvalError> {
             result
         }
         Value::Continuation(cont_data) => {
-            if args.len() != 1 {
-                return Err(EvalError::Arity("continuation requires 1 argument".into()));
+            if args.is_empty() {
+                return Err(EvalError::Arity("continuation requires at least 1 argument".into()));
             }
+            let val = if args.len() == 1 {
+                args[0].clone()
+            } else {
+                Value::Values(args.to_vec())
+            };
             let is_active = ACTIVE_CALLCC.with(|ac| ac.borrow().contains(&cont_data.id));
             if is_active {
-                CONT_RETURN_VALUE.with(|v| *v.borrow_mut() = Some(args[0].clone()));
+                CONT_RETURN_VALUE.with(|v| *v.borrow_mut() = Some(val));
                 Err(EvalError::ContinuationReturn { cont_id: cont_data.id })
             } else if !cont_data.winders.is_empty() {
                 // Escaped continuation with winders — replay to re-enter dynamic-wind extents
-                replay_continuation(cont_data, args[0].clone()).map(Trampoline::Done)
+                replay_continuation(cont_data, val).map(Trampoline::Done)
             } else {
-                CONT_RETURN_VALUE.with(|v| *v.borrow_mut() = Some(args[0].clone()));
+                CONT_RETURN_VALUE.with(|v| *v.borrow_mut() = Some(val));
                 Err(EvalError::ContinuationReturn { cont_id: cont_data.id })
             }
         }
@@ -879,6 +888,9 @@ fn apply_value(func: &Value, args: &[Value]) -> Result<Value, EvalError> {
     match apply_tc(func, args)? {
         Trampoline::Done(v) => Ok(v),
         Trampoline::TailCall { expr, env } => eval(&expr, &env),
+        Trampoline::Guard { var_name, clauses, body, env, span } => {
+            eval_guard_loop(var_name, clauses, body, env, span)
+        }
     }
 }
 
@@ -1320,51 +1332,91 @@ fn eval_guard(args: &[Expr], env: &Env, span: Span) -> Result<Trampoline, EvalEr
         ExprKind::Symbol(s) => s.clone(),
         _ => return Err(EvalError::Parse("guard: expected variable name".into()).with_position(span.line, span.col)),
     };
-    let clauses = &clauses_expr[1..];
-    let body = &args[1..];
+    let clauses = clauses_expr[1..].to_vec();
+    let body = args[1..].to_vec();
 
-    // Evaluate body, catching SchemeException
-    let body_env = new_env(Some(env.clone()));
-    let mut body_result = Ok(Value::Void);
-    for expr in body {
-        match eval(expr, &body_env) {
-            Ok(v) => body_result = Ok(v),
-            Err(EvalError::SchemeException(exn)) => {
-                // Exception raised — try clauses
-                let clause_env = new_env(Some(env.clone()));
-                env_set(&clause_env, var_name.clone(), exn.clone());
-                for clause in clauses {
-                    match &clause.kind {
-                        ExprKind::List(celems) if celems.len() >= 2 => {
-                            if let ExprKind::Symbol(s) = &celems[0].kind {
-                                if s == "else" {
-                                    // else clause — evaluate handler expressions
-                                    let mut result = Value::Void;
-                                    for handler_expr in &celems[1..] {
-                                        result = eval(handler_expr, &clause_env)?;
-                                    }
-                                    return Ok(Trampoline::Done(result));
-                                }
-                            }
-                            let test = eval(&celems[0], &clause_env)?;
-                            if test.is_truthy() {
-                                let mut result = Value::Void;
-                                for handler_expr in &celems[1..] {
-                                    result = eval(handler_expr, &clause_env)?;
-                                }
-                                return Ok(Trampoline::Done(result));
-                            }
+    Ok(Trampoline::Guard { var_name, clauses, body, env: env.clone(), span })
+}
+
+/// Evaluate guard clauses against an exception value, returning the matched result.
+fn eval_guard_clauses(var_name: &str, clauses: &[Expr], env: &Env, exn: Value, span: Span) -> Result<Value, EvalError> {
+    let clause_env = new_env(Some(env.clone()));
+    env_set(&clause_env, var_name.to_string(), exn.clone());
+    for clause in clauses {
+        match &clause.kind {
+            ExprKind::List(celems) if celems.len() >= 2 => {
+                if let ExprKind::Symbol(s) = &celems[0].kind {
+                    if s == "else" {
+                        let mut result = Value::Void;
+                        for handler_expr in &celems[1..] {
+                            result = eval(handler_expr, &clause_env)?;
                         }
-                        _ => return Err(EvalError::Parse("guard: invalid clause".into()).with_position(span.line, span.col)),
+                        return Ok(result);
                     }
                 }
-                // No clause matched — re-raise
-                return Err(EvalError::SchemeException(exn));
+                let test = eval(&celems[0], &clause_env)?;
+                if test.is_truthy() {
+                    let mut result = Value::Void;
+                    for handler_expr in &celems[1..] {
+                        result = eval(handler_expr, &clause_env)?;
+                    }
+                    return Ok(result);
+                }
             }
-            Err(e) => return Err(e),
+            _ => return Err(EvalError::Parse("guard: invalid clause".into()).with_position(span.line, span.col)),
         }
     }
-    Ok(Trampoline::Done(body_result?))
+    // No clause matched — re-raise
+    Err(EvalError::SchemeException(exn))
+}
+
+/// Iteratively evaluate guard bodies, handling tail calls without stack growth.
+fn eval_guard_loop(mut var_name: String, mut clauses: Vec<Expr>, mut body: Vec<Expr>, mut env: Env, mut span: Span) -> Result<Value, EvalError> {
+    'guard: loop {
+        let body_env = new_env(Some(env.clone()));
+
+        // Evaluate all body exprs except the last
+        for expr in &body[..body.len().saturating_sub(1)] {
+            match eval(expr, &body_env) {
+                Ok(_) => {}
+                Err(EvalError::SchemeException(exn)) => {
+                    return eval_guard_clauses(&var_name, &clauses, &env, exn, span);
+                }
+                Err(e) => return Err(e),
+            }
+        }
+
+        // Last body expression — resolve via inline trampoline
+        let last = match body.last() {
+            Some(e) => e.clone(),
+            None => return Ok(Value::Void),
+        };
+        let mut current_expr = last;
+        let mut current_env: Env = body_env;
+
+        loop {
+            match eval_inner(&current_expr, &current_env) {
+                Ok(Trampoline::Done(v)) => return Ok(v),
+                Ok(Trampoline::TailCall { expr: e, env: en }) => {
+                    current_expr = e;
+                    current_env = en;
+                }
+                Ok(Trampoline::Guard { var_name: v, clauses: c, body: b, env: e, span: s }) => {
+                    // Nested/recursive guard — restart outer loop iteratively
+                    var_name = v;
+                    clauses = c;
+                    body = b;
+                    env = e;
+                    span = s;
+                    continue 'guard;
+                }
+                Err(EvalError::SchemeException(exn)) => {
+                    return eval_guard_clauses(&var_name, &clauses, &env, exn, span);
+                }
+                Err(e) => return Err(e),
+            }
+        }
+    }
 }
 
 fn eval_do(_full_expr: &Expr, args: &[Expr], env: &Env, span: Span) -> Result<Trampoline, EvalError> {
