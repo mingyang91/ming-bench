@@ -258,7 +258,9 @@ func printList(v *value) string {
 	var buf strings.Builder
 	buf.WriteByte('(')
 	cur := v
+	slow := v
 	first := true
+	step := 0
 	for cur.typ == valPair {
 		if !first {
 			buf.WriteByte(' ')
@@ -266,6 +268,15 @@ func printList(v *value) string {
 		buf.WriteString(cur.car.String())
 		first = false
 		cur = cur.cdr
+		step++
+		if step%2 == 0 {
+			slow = slow.cdr
+			if slow == cur {
+				buf.WriteString(" ...")
+				buf.WriteByte(')')
+				return buf.String()
+			}
+		}
 	}
 	if cur.typ != valNil {
 		buf.WriteString(" . ")
@@ -730,7 +741,7 @@ func (ip *interp) eval(e *expr, envir *env) (*value, error) {
 				case "cond":
 					found := false
 					for _, clause := range e.items[1:] {
-						if clause.kind != "list" || len(clause.items) < 2 {
+						if clause.kind != "list" || len(clause.items) < 1 {
 							return nil, &EvalError{Message: fmt.Sprintf("%d:%d: cond: bad clause", e.line, e.col)}
 						}
 						if clause.items[0].kind == "symbol" && clause.items[0].sval == "else" {
@@ -750,6 +761,10 @@ func (ip *interp) eval(e *expr, envir *env) (*value, error) {
 							return nil, err
 						}
 						if test.isTruthy() {
+							if len(clause.items) == 1 {
+								// (cond (test)) — return test value
+								return test, nil
+							}
 							body := clause.items[1:]
 							for _, be := range body[:len(body)-1] {
 								_, err := ip.eval(be, envir)
@@ -765,6 +780,36 @@ func (ip *interp) eval(e *expr, envir *env) (*value, error) {
 					if !found {
 						return voidVal, nil
 					}
+					continue
+
+				case "let*":
+					if len(e.items) < 3 {
+						return nil, &EvalError{Message: fmt.Sprintf("%d:%d: let*: bad syntax", e.line, e.col)}
+					}
+					bindingsExpr := e.items[1]
+					if bindingsExpr.kind != "list" {
+						return nil, &EvalError{Message: fmt.Sprintf("%d:%d: let*: bad syntax", e.line, e.col)}
+					}
+					localEnv := newEnv(envir)
+					for _, b := range bindingsExpr.items {
+						if b.kind != "list" || len(b.items) != 2 {
+							return nil, &EvalError{Message: fmt.Sprintf("%d:%d: let*: bad binding", e.line, e.col)}
+						}
+						v, err := ip.eval(b.items[1], localEnv)
+						if err != nil {
+							return nil, err
+						}
+						localEnv.set(b.items[0].sval, v)
+					}
+					body := e.items[2:]
+					for _, be := range body[:len(body)-1] {
+						_, err := ip.eval(be, localEnv)
+						if err != nil {
+							return nil, err
+						}
+					}
+					e = body[len(body)-1]
+					envir = localEnv
 					continue
 
 				case "letrec":
@@ -1836,7 +1881,17 @@ func schemeEq(a, b *value) bool {
 	}
 }
 
+type equalPair struct{ a, b *value }
+
 func schemeEqual(a, b *value) bool {
+	seen := make(map[equalPair]bool)
+	return schemeEqualRec(a, b, seen)
+}
+
+func schemeEqualRec(a, b *value, seen map[equalPair]bool) bool {
+	if a == b {
+		return true
+	}
 	if a.typ != b.typ {
 		return false
 	}
@@ -1854,13 +1909,18 @@ func schemeEqual(a, b *value) bool {
 	case valNil:
 		return true
 	case valPair:
-		return schemeEqual(a.car, b.car) && schemeEqual(a.cdr, b.cdr)
+		key := equalPair{a, b}
+		if seen[key] {
+			return true // assume equal for cycles
+		}
+		seen[key] = true
+		return schemeEqualRec(a.car, b.car, seen) && schemeEqualRec(a.cdr, b.cdr, seen)
 	case valVector:
 		if len(a.vecval) != len(b.vecval) {
 			return false
 		}
 		for i := range a.vecval {
-			if !schemeEqual(a.vecval[i], b.vecval[i]) {
+			if !schemeEqualRec(a.vecval[i], b.vecval[i], seen) {
 				return false
 			}
 		}
@@ -2773,16 +2833,25 @@ func makeGlobalEnv(ip *interp) *env {
 		return cur, nil
 	}))
 
-	// list?
+	// list? — with tortoise-and-hare cycle detection
 	e.set("list?", makeBuiltin("list?", func(args []*value, line, col int) (*value, error) {
 		if len(args) != 1 {
 			return nil, &EvalError{Message: fmt.Sprintf("%d:%d: list?: expected 1 argument", line, col)}
 		}
-		cur := args[0]
-		for cur.typ == valPair {
-			cur = cur.cdr
+		slow := args[0]
+		fast := args[0]
+		for fast.typ == valPair {
+			fast = fast.cdr
+			if fast.typ != valPair {
+				break
+			}
+			fast = fast.cdr
+			slow = slow.cdr
+			if slow == fast {
+				return boolVal(false), nil // cycle detected
+			}
 		}
-		return boolVal(cur.typ == valNil), nil
+		return boolVal(fast.typ == valNil), nil
 	}))
 
 	// assoc — uses equal?
@@ -3046,6 +3115,289 @@ func makeGlobalEnv(ip *interp) *env {
 
 		// Call consumer with produced values
 		return ip.applyProc(consumer, consumerArgs, line, col)
+	}))
+
+	// cxr helpers
+	cxrHelper := func(name string, ops string) {
+		e.set(name, makeBuiltin(name, func(args []*value, line, col int) (*value, error) {
+			if len(args) != 1 {
+				return nil, &EvalError{Message: fmt.Sprintf("%d:%d: %s: expected 1 argument", line, col, name)}
+			}
+			v := args[0]
+			for i := len(ops) - 1; i >= 0; i-- {
+				if v.typ != valPair {
+					return nil, &EvalError{Message: fmt.Sprintf("%d:%d: %s: not a pair", line, col, name)}
+				}
+				if ops[i] == 'a' {
+					v = v.car
+				} else {
+					v = v.cdr
+				}
+			}
+			return v, nil
+		}))
+	}
+	cxrHelper("caar", "aa")
+	cxrHelper("cadr", "ad")
+	cxrHelper("cdar", "da")
+	cxrHelper("cddr", "dd")
+	cxrHelper("caddr", "add")
+	cxrHelper("cadddr", "addd")
+	cxrHelper("caaar", "aaa")
+	cxrHelper("caadr", "aad")
+	cxrHelper("cadar", "ada")
+	cxrHelper("caaddr", "aadd")
+	cxrHelper("cadaar", "adaa")
+	cxrHelper("cadadr", "adad")
+	cxrHelper("caddar", "adda")
+	cxrHelper("cdaar", "daa")
+	cxrHelper("cdadr", "dad")
+	cxrHelper("cddar", "dda")
+	cxrHelper("cdddr", "ddd")
+	cxrHelper("caaaar", "aaaa")
+	cxrHelper("caaadr", "aaad")
+	cxrHelper("caadar", "aada")
+	cxrHelper("cdaaar", "daaa")
+	cxrHelper("cdaadr", "daad")
+	cxrHelper("cdadar", "dada")
+	cxrHelper("cdaddr", "dadd")
+	cxrHelper("cddaar", "ddaa")
+	cxrHelper("cddadr", "ddad")
+	cxrHelper("cdddar", "ddda")
+	cxrHelper("cddddr", "dddd")
+
+	// assv (uses eqv?)
+	e.set("assv", makeBuiltin("assv", func(args []*value, line, col int) (*value, error) {
+		if len(args) != 2 {
+			return nil, &EvalError{Message: fmt.Sprintf("%d:%d: assv: expected 2 arguments", line, col)}
+		}
+		key := args[0]
+		cur := args[1]
+		for cur.typ == valPair {
+			pair := cur.car
+			if pair.typ == valPair && schemeEqv(pair.car, key) {
+				return pair, nil
+			}
+			cur = cur.cdr
+		}
+		return boolVal(false), nil
+	}))
+
+	// member (uses equal?)
+	e.set("member", makeBuiltin("member", func(args []*value, line, col int) (*value, error) {
+		if len(args) != 2 {
+			return nil, &EvalError{Message: fmt.Sprintf("%d:%d: member: expected 2 arguments", line, col)}
+		}
+		obj := args[0]
+		cur := args[1]
+		for cur.typ == valPair {
+			if schemeEqual(obj, cur.car) {
+				return cur, nil
+			}
+			cur = cur.cdr
+		}
+		return boolVal(false), nil
+	}))
+
+	// set-car!
+	e.set("set-car!", makeBuiltin("set-car!", func(args []*value, line, col int) (*value, error) {
+		if len(args) != 2 {
+			return nil, &EvalError{Message: fmt.Sprintf("%d:%d: set-car!: expected 2 arguments", line, col)}
+		}
+		if args[0].typ != valPair {
+			return nil, &EvalError{Message: fmt.Sprintf("%d:%d: set-car!: not a pair", line, col)}
+		}
+		args[0].car = args[1]
+		return voidVal, nil
+	}))
+
+	// set-cdr!
+	e.set("set-cdr!", makeBuiltin("set-cdr!", func(args []*value, line, col int) (*value, error) {
+		if len(args) != 2 {
+			return nil, &EvalError{Message: fmt.Sprintf("%d:%d: set-cdr!: expected 2 arguments", line, col)}
+		}
+		if args[0].typ != valPair {
+			return nil, &EvalError{Message: fmt.Sprintf("%d:%d: set-cdr!: not a pair", line, col)}
+		}
+		args[0].cdr = args[1]
+		return voidVal, nil
+	}))
+
+	// for-each — like map but discards results
+	e.set("for-each", makeBuiltin("for-each", func(args []*value, line, col int) (*value, error) {
+		if len(args) < 2 {
+			return nil, &EvalError{Message: fmt.Sprintf("%d:%d: for-each: expected at least 2 arguments", line, col)}
+		}
+		fn := args[0]
+		lists := args[1:]
+		curs := make([]*value, len(lists))
+		copy(curs, lists)
+		for {
+			allPair := true
+			for _, c := range curs {
+				if c.typ != valPair {
+					allPair = false
+					break
+				}
+			}
+			if !allPair {
+				break
+			}
+			fnArgs := make([]*value, len(curs))
+			for i, c := range curs {
+				fnArgs[i] = c.car
+			}
+			var err error
+			if fn.typ == valLambda {
+				localEnv, bindErr := bindLambdaArgs(fn, fnArgs, line, col)
+				if bindErr != nil {
+					return nil, bindErr
+				}
+				for _, bodyExpr := range fn.body {
+					_, err = ip.eval(bodyExpr, localEnv)
+					if err != nil {
+						return nil, err
+					}
+				}
+			} else if fn.typ == valBuiltin {
+				_, err = fn.builtin(fnArgs, line, col)
+			} else {
+				return nil, &EvalError{Message: fmt.Sprintf("%d:%d: for-each: not a procedure", line, col)}
+			}
+			if err != nil {
+				return nil, err
+			}
+			for i, c := range curs {
+				curs[i] = c.cdr
+			}
+		}
+		return voidVal, nil
+	}))
+
+	// procedure?
+	e.set("procedure?", makeBuiltin("procedure?", func(args []*value, line, col int) (*value, error) {
+		if len(args) != 1 {
+			return nil, &EvalError{Message: fmt.Sprintf("%d:%d: procedure?: expected 1 argument", line, col)}
+		}
+		t := args[0].typ
+		return boolVal(t == valLambda || t == valBuiltin), nil
+	}))
+
+	// gcd
+	e.set("gcd", makeBuiltin("gcd", func(args []*value, line, col int) (*value, error) {
+		if len(args) == 0 {
+			return intVal(0), nil
+		}
+		result := args[0].ival
+		if result < 0 {
+			result = -result
+		}
+		for _, a := range args[1:] {
+			result = gcd(result, a.ival)
+		}
+		return intVal(result), nil
+	}))
+
+	// lcm
+	e.set("lcm", makeBuiltin("lcm", func(args []*value, line, col int) (*value, error) {
+		if len(args) == 0 {
+			return intVal(1), nil
+		}
+		result := args[0].ival
+		if result < 0 {
+			result = -result
+		}
+		for _, a := range args[1:] {
+			b := a.ival
+			if b < 0 {
+				b = -b
+			}
+			if result == 0 || b == 0 {
+				result = 0
+			} else {
+				result = result / gcd(result, b) * b
+			}
+		}
+		return intVal(result), nil
+	}))
+
+	// truncate
+	e.set("truncate", makeBuiltin("truncate", func(args []*value, line, col int) (*value, error) {
+		if len(args) != 1 {
+			return nil, &EvalError{Message: fmt.Sprintf("%d:%d: truncate: expected 1 argument", line, col)}
+		}
+		switch args[0].typ {
+		case valInt:
+			return args[0], nil
+		case valFloat:
+			return intVal(int64(args[0].fval)), nil
+		default:
+			return nil, &EvalError{Message: fmt.Sprintf("%d:%d: truncate: expected number", line, col)}
+		}
+	}))
+
+	// round
+	e.set("round", makeBuiltin("round", func(args []*value, line, col int) (*value, error) {
+		if len(args) != 1 {
+			return nil, &EvalError{Message: fmt.Sprintf("%d:%d: round: expected 1 argument", line, col)}
+		}
+		switch args[0].typ {
+		case valInt:
+			return args[0], nil
+		case valFloat:
+			return intVal(int64(math.RoundToEven(args[0].fval))), nil
+		default:
+			return nil, &EvalError{Message: fmt.Sprintf("%d:%d: round: expected number", line, col)}
+		}
+	}))
+
+	// make-string
+	e.set("make-string", makeBuiltin("make-string", func(args []*value, line, col int) (*value, error) {
+		if len(args) < 1 || len(args) > 2 {
+			return nil, &EvalError{Message: fmt.Sprintf("%d:%d: make-string: expected 1-2 arguments", line, col)}
+		}
+		n := int(args[0].ival)
+		ch := ' '
+		if len(args) == 2 && args[1].typ == valChar {
+			ch = args[1].cval
+		}
+		return &value{typ: valString, sval: strings.Repeat(string(ch), n), mutable: true}, nil
+	}))
+
+	// string (creates string from chars)
+	e.set("string", makeBuiltin("string", func(args []*value, line, col int) (*value, error) {
+		var buf strings.Builder
+		for _, a := range args {
+			if a.typ != valChar {
+				return nil, &EvalError{Message: fmt.Sprintf("%d:%d: string: expected char arguments", line, col)}
+			}
+			buf.WriteRune(a.cval)
+		}
+		return strVal(buf.String()), nil
+	}))
+
+	// string>?
+	e.set("string>?", makeBuiltin("string>?", func(args []*value, line, col int) (*value, error) {
+		if len(args) != 2 || args[0].typ != valString || args[1].typ != valString {
+			return nil, &EvalError{Message: fmt.Sprintf("%d:%d: string>?: expected 2 strings", line, col)}
+		}
+		return boolVal(args[0].sval > args[1].sval), nil
+	}))
+
+	// string<=?
+	e.set("string<=?", makeBuiltin("string<=?", func(args []*value, line, col int) (*value, error) {
+		if len(args) != 2 || args[0].typ != valString || args[1].typ != valString {
+			return nil, &EvalError{Message: fmt.Sprintf("%d:%d: string<=?: expected 2 strings", line, col)}
+		}
+		return boolVal(args[0].sval <= args[1].sval), nil
+	}))
+
+	// string>=?
+	e.set("string>=?", makeBuiltin("string>=?", func(args []*value, line, col int) (*value, error) {
+		if len(args) != 2 || args[0].typ != valString || args[1].typ != valString {
+			return nil, &EvalError{Message: fmt.Sprintf("%d:%d: string>=?: expected 2 strings", line, col)}
+		}
+		return boolVal(args[0].sval >= args[1].sval), nil
 	}))
 
 	// call/cc as a first-class value
