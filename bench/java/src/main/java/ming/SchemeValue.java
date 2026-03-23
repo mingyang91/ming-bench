@@ -63,11 +63,44 @@ public sealed interface SchemeValue {
         @Override public String display() { return ""; }
     }
 
+    record CharVal(char value) implements SchemeValue {
+        @Override public String display() {
+            return switch (value) {
+                case ' ' -> "#\\space";
+                case '\n' -> "#\\newline";
+                default -> "#\\" + value;
+            };
+        }
+    }
+
     record LambdaVal(java.util.List<String> params, java.util.List<SchemeValue> body, Environment env) implements SchemeValue {
         @Override public String display() { return "#<procedure>"; }
     }
 
     String display();
+
+    /** Format for Scheme's display (no quotes on strings, chars as raw chars) */
+    default String displayOutput() {
+        if (this instanceof StringVal s) return s.value();
+        if (this instanceof CharVal c) return String.valueOf(c.value());
+        if (this instanceof PairVal p) {
+            var sb = new StringBuilder("(");
+            sb.append(p.car().displayOutput());
+            SchemeValue current = p.cdr();
+            while (current instanceof PairVal pp) {
+                sb.append(' ');
+                sb.append(pp.car().displayOutput());
+                current = pp.cdr();
+            }
+            if (!(current instanceof NilVal)) {
+                sb.append(" . ");
+                sb.append(current.displayOutput());
+            }
+            sb.append(')');
+            return sb.toString();
+        }
+        return display();
+    }
 
     default boolean isTruthy() {
         return !(this instanceof BoolVal b && !b.value());

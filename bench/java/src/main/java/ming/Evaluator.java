@@ -5,6 +5,7 @@ import java.util.List;
 
 public class Evaluator {
     private final Environment globalEnv = new Environment();
+    private StringBuilder outputBuffer;
 
     public String evalStr(String input) throws EvalError {
         var parser = new Parser(input);
@@ -19,7 +20,18 @@ public class Evaluator {
     }
 
     public EvalResult evalStrWithOutput(String input) throws EvalError {
-        throw new EvalError("not implemented");
+        outputBuffer = new StringBuilder();
+        var parser = new Parser(input);
+        List<SchemeValue> exprs = parser.parseAll();
+        if (exprs.isEmpty()) throw new EvalError("empty input");
+
+        SchemeValue result = null;
+        for (var expr : exprs) {
+            result = eval(expr, globalEnv);
+        }
+        String output = outputBuffer.toString();
+        outputBuffer = null;
+        return new EvalResult(result.display(), output);
     }
 
     private SchemeValue eval(SchemeValue expr, Environment env) throws EvalError {
@@ -30,6 +42,7 @@ public class Evaluator {
             case SchemeValue.VoidVal v -> v;
             case SchemeValue.NilVal v -> v;
             case SchemeValue.PairVal v -> v;
+            case SchemeValue.CharVal v -> v;
             case SchemeValue.LambdaVal v -> v;
             case SchemeValue.SymbolVal v -> {
                 try {
@@ -113,9 +126,13 @@ public class Evaluator {
     private static final java.util.Set<String> BUILTINS = java.util.Set.of(
         "+", "-", "*", "/", "<", ">", "=", "<=", ">=", "not", "and", "or",
         "cons", "car", "cdr", "null?", "list", "length", "append",
-        "string?", "number?", "boolean?", "pair?", "symbol?",
+        "string?", "number?", "boolean?", "pair?", "symbol?", "char?",
         "zero?", "positive?", "negative?", "abs", "min", "max",
-        "equal?", "eq?", "modulo", "remainder", "even?", "odd?"
+        "equal?", "eq?", "modulo", "remainder", "even?", "odd?",
+        "display", "write", "newline",
+        "string-append", "string-length", "substring",
+        "string->number", "number->string",
+        "symbol->string", "string->symbol", "string-ref"
     );
 
     private boolean isBuiltin(String name) {
@@ -233,6 +250,79 @@ public class Evaluator {
                 if (args.size() != 1) throw new EvalError("odd?: needs exactly 1 argument");
                 yield new SchemeValue.BoolVal(asInt(eval(args.getFirst(), env)) % 2 != 0);
             }
+            case "display" -> {
+                if (args.size() != 1) throw new EvalError("display: needs exactly 1 argument");
+                var v = eval(args.getFirst(), env);
+                if (outputBuffer != null) outputBuffer.append(v.displayOutput());
+                yield new SchemeValue.VoidVal();
+            }
+            case "write" -> {
+                if (args.size() != 1) throw new EvalError("write: needs exactly 1 argument");
+                var v = eval(args.getFirst(), env);
+                if (outputBuffer != null) outputBuffer.append(v.display());
+                yield new SchemeValue.VoidVal();
+            }
+            case "newline" -> {
+                if (outputBuffer != null) outputBuffer.append('\n');
+                yield new SchemeValue.VoidVal();
+            }
+            case "string-append" -> {
+                var sb = new StringBuilder();
+                for (var arg : args) {
+                    var v = eval(arg, env);
+                    if (!(v instanceof SchemeValue.StringVal s)) throw new EvalError("string-append: not a string");
+                    sb.append(s.value());
+                }
+                yield new SchemeValue.StringVal(sb.toString());
+            }
+            case "string-length" -> {
+                if (args.size() != 1) throw new EvalError("string-length: needs exactly 1 argument");
+                var v = eval(args.getFirst(), env);
+                if (!(v instanceof SchemeValue.StringVal s)) throw new EvalError("string-length: not a string");
+                yield new SchemeValue.IntVal(s.value().length());
+            }
+            case "substring" -> {
+                if (args.size() != 3) throw new EvalError("substring: needs exactly 3 arguments");
+                var v = eval(args.get(0), env);
+                if (!(v instanceof SchemeValue.StringVal s)) throw new EvalError("substring: not a string");
+                int start = (int) asInt(eval(args.get(1), env));
+                int end = (int) asInt(eval(args.get(2), env));
+                yield new SchemeValue.StringVal(s.value().substring(start, end));
+            }
+            case "string->number" -> {
+                if (args.size() != 1) throw new EvalError("string->number: needs exactly 1 argument");
+                var v = eval(args.getFirst(), env);
+                if (!(v instanceof SchemeValue.StringVal s)) throw new EvalError("string->number: not a string");
+                try {
+                    yield new SchemeValue.IntVal(Long.parseLong(s.value()));
+                } catch (NumberFormatException e) {
+                    yield new SchemeValue.BoolVal(false);
+                }
+            }
+            case "number->string" -> {
+                if (args.size() != 1) throw new EvalError("number->string: needs exactly 1 argument");
+                yield new SchemeValue.StringVal(Long.toString(asInt(eval(args.getFirst(), env))));
+            }
+            case "symbol->string" -> {
+                if (args.size() != 1) throw new EvalError("symbol->string: needs exactly 1 argument");
+                var v = eval(args.getFirst(), env);
+                if (!(v instanceof SchemeValue.SymbolVal sym)) throw new EvalError("symbol->string: not a symbol");
+                yield new SchemeValue.StringVal(sym.name());
+            }
+            case "string->symbol" -> {
+                if (args.size() != 1) throw new EvalError("string->symbol: needs exactly 1 argument");
+                var v = eval(args.getFirst(), env);
+                if (!(v instanceof SchemeValue.StringVal s)) throw new EvalError("string->symbol: not a string");
+                yield new SchemeValue.SymbolVal(s.value());
+            }
+            case "string-ref" -> {
+                if (args.size() != 2) throw new EvalError("string-ref: needs exactly 2 arguments");
+                var v = eval(args.get(0), env);
+                if (!(v instanceof SchemeValue.StringVal s)) throw new EvalError("string-ref: not a string");
+                int idx = (int) asInt(eval(args.get(1), env));
+                yield new SchemeValue.CharVal(s.value().charAt(idx));
+            }
+            case "char?" -> typePred(args, env, SchemeValue.CharVal.class);
             default -> throw new EvalError("unknown procedure: " + name);
         };
     }
