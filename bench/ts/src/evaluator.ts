@@ -23,7 +23,9 @@ type SchemeVal =
   | { tag: 'continuation'; cont: Cont; winds: WindEntry[]; pos?: Pos }
   | { tag: 'macro'; rules: MacroRule[]; literals: Set<string>; defEnv: Env; pos?: Pos }
   | { tag: 'vector'; val: SchemeVal[]; pos?: Pos }
-  | { tag: 'values'; vals: SchemeVal[]; pos?: Pos };
+  | { tag: 'values'; vals: SchemeVal[]; pos?: Pos }
+  | { tag: 'record'; typeId: symbol; typeName: string; fields: Map<string, SchemeVal>; pos?: Pos }
+  | { tag: 'native'; fn: (args: SchemeVal[], p?: Pos) => SchemeVal; pos?: Pos };
 
 interface MacroRule {
   pattern: SchemeVal[];  // pattern elements (excluding macro name)
@@ -375,11 +377,14 @@ function displayVal(v: SchemeVal): string {
     case 'lambda':
     case 'builtin':
     case 'continuation':
+    case 'native':
       return '#<procedure>';
     case 'macro':
       return '#<macro>';
     case 'vector':
       return '#(' + v.val.map(displayVal).join(' ') + ')';
+    case 'record':
+      return `#<record:${v.typeName}>`;
     case 'values':
       return v.vals.map(displayVal).join('\n');
   }
@@ -405,7 +410,7 @@ function quoteToScheme(v: SchemeVal): SchemeVal {
 const SPECIAL_FORMS = new Set([
   'quote', 'if', 'define', 'set!', 'lambda', 'and', 'or', 'begin',
   'cond', 'let', 'letrec', 'letrec*', 'case', 'do',
-  'define-syntax', 'syntax-rules', 'else',
+  'define-syntax', 'syntax-rules', 'else', 'define-record-type',
 ]);
 
 let gensymCounter = 0;
@@ -1233,6 +1238,9 @@ function applyCPS(proc: SchemeVal, args: SchemeVal[], k: Cont, p?: Pos, out?: st
     };
     return doUnwind(0);
   }
+  if (proc.tag === 'native') {
+    return k(proc.fn(args, p));
+  }
   if (proc.tag === 'lambda') {
     if (proc.rest) {
       if (args.length < proc.params.length)
@@ -1652,6 +1660,55 @@ function evalCPS(expr: SchemeVal, env: Env, k: Cont, out?: string[]): Bounce {
       const macroVal: SchemeVal = { tag: 'macro', rules, literals, defEnv: env };
       env.define(macroName, macroVal);
       return k(macroVal);
+    }
+
+    if (op === 'define-record-type') {
+      // (define-record-type <name> (ctor field ...) pred? (field accessor) ...)
+      if (args.length < 3) throw posError('define-record-type: bad syntax', p);
+      const typeId = Symbol('record-type');
+      const typeName = args[0].tag === 'symbol' ? args[0].val : '';
+      const ctorSpec = args[1];
+      if (ctorSpec.tag !== 'list' || ctorSpec.val.length < 1)
+        throw posError('define-record-type: bad constructor spec', p);
+      const ctorName = ctorSpec.val[0].tag === 'symbol' ? ctorSpec.val[0].val : '';
+      const ctorFields = ctorSpec.val.slice(1).map(f => {
+        if (f.tag !== 'symbol') throw posError('define-record-type: field must be symbol', p);
+        return f.val;
+      });
+      const predName = args[2].tag === 'symbol' ? args[2].val : '';
+
+      // Constructor
+      env.define(ctorName, { tag: 'native', fn: (cArgs: SchemeVal[]) => {
+        if (cArgs.length !== ctorFields.length)
+          throw posError(`${ctorName}: expected ${ctorFields.length} args, got ${cArgs.length}`, p);
+        const fields = new Map<string, SchemeVal>();
+        for (let i = 0; i < ctorFields.length; i++) fields.set(ctorFields[i], cArgs[i]);
+        return { tag: 'record' as const, typeId, typeName, fields };
+      }});
+
+      // Predicate
+      env.define(predName, { tag: 'native', fn: (cArgs: SchemeVal[]) => {
+        if (cArgs.length !== 1) throw posError(`${predName}: expected 1 arg`, p);
+        return { tag: 'boolean' as const, val: cArgs[0].tag === 'record' && cArgs[0].typeId === typeId };
+      }});
+
+      // Field accessors
+      for (let i = 3; i < args.length; i++) {
+        const spec = args[i];
+        if (spec.tag !== 'list' || spec.val.length < 2)
+          throw posError('define-record-type: bad field spec', p);
+        const fieldName = spec.val[0].tag === 'symbol' ? spec.val[0].val : '';
+        const accessorName = spec.val[1].tag === 'symbol' ? spec.val[1].val : '';
+        env.define(accessorName, { tag: 'native', fn: ((fn: string) => (cArgs: SchemeVal[]) => {
+          if (cArgs.length !== 1) throw posError(`${accessorName}: expected 1 arg`, p);
+          const rec = cArgs[0];
+          if (rec.tag !== 'record' || rec.typeId !== typeId)
+            throw posError(`${accessorName}: not a ${typeName}`, p);
+          return rec.fields.get(fn)!;
+        })(fieldName) });
+      }
+
+      return k({ tag: 'boolean', val: false });
     }
 
     if (op === 'guard') {
