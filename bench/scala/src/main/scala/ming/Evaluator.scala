@@ -9,7 +9,9 @@ object Evaluator:
   def evalStr(input: String): String =
     val exprs = Parser.parse(input)
     if exprs.isEmpty then throw new EvalError("no expressions")
-    exprs.map(eval).last.display
+    val env     = defaultEnv()
+    val results = exprs.map(e => eval(e, env))
+    results.filter(_ != SVoid).lastOption.getOrElse(SVoid).display
 
   /** Evaluate Scheme expressions and return both the result string and any captured output from display/write/newline.
     */
@@ -17,63 +19,125 @@ object Evaluator:
     val result = evalStr(input)
     (result, "")
 
-  private def eval(expr: SchemeValue): SchemeValue = expr match
-    case SInteger(_) | SBoolean(_) | SString(_) => expr
-    case SSymbol(name)                          => throw new EvalError(s"unbound variable: $name")
-    case SList(Nil)                             => throw new EvalError("empty application")
-    case SList(SSymbol(op) :: args)             => evalBuiltin(op, args)
-    case SList(head :: _)                       => throw new EvalError(s"not a procedure: ${head.display}")
+  private def defaultEnv(): Environment =
+    val env = Environment.empty
+    def reg(name: String, fn: List[SchemeValue] => SchemeValue): Unit =
+      env.define(name, SBuiltin(name, fn))
 
-  private def evalBuiltin(op: String, args: List[SchemeValue]): SchemeValue = op match
-    case "+"   => evalAdd(args)
-    case "-"   => evalSub(args)
-    case "*"   => evalMul(args)
-    case "/"   => evalDiv(args)
-    case "<"   => evalCompare(args, _ < _)
-    case ">"   => evalCompare(args, _ > _)
-    case "="   => evalCompare(args, _ == _)
-    case "<="  => evalCompare(args, _ <= _)
-    case ">="  => evalCompare(args, _ >= _)
-    case "not" => evalNot(args)
-    case "and" => evalAnd(args)
-    case "or"  => evalOr(args)
-    case _     => throw new EvalError(s"unknown procedure: $op")
+    reg("+", evalAdd)
+    reg("-", evalSub)
+    reg("*", evalMul)
+    reg("/", evalDiv)
+    reg("<", args => evalCompare(args, _ < _))
+    reg(">", args => evalCompare(args, _ > _))
+    reg("=", args => evalCompare(args, _ == _))
+    reg("<=", args => evalCompare(args, _ <= _))
+    reg(">=", args => evalCompare(args, _ >= _))
+    reg("not", evalNot)
+    env
+
+  def eval(expr: SchemeValue, env: Environment): SchemeValue = expr match
+    case SInteger(_) | SBoolean(_) | SString(_) | SLambda(_, _, _) | SBuiltin(_, _) | SVoid => expr
+    case SSymbol(name)                                                                      => env.lookup(name)
+    case SList(Nil) => throw new EvalError("empty application")
+    case SList(SSymbol(op) :: args) =>
+      op match
+        case "quote"  => evalQuote(args)
+        case "if"     => evalIf(args, env)
+        case "define" => evalDefine(args, env)
+        case "lambda" => evalLambda(args, env)
+        case "and"    => evalAnd(args, env)
+        case "or"     => evalOr(args, env)
+        case _ =>
+          val proc       = eval(SSymbol(op), env)
+          val evaledArgs = args.map(a => eval(a, env))
+          applyProc(proc, evaledArgs)
+    case SList(head :: args) =>
+      val proc       = eval(head, env)
+      val evaledArgs = args.map(a => eval(a, env))
+      applyProc(proc, evaledArgs)
+
+  private def applyProc(proc: SchemeValue, args: List[SchemeValue]): SchemeValue = proc match
+    case SLambda(params, body, closure) =>
+      if params.length != args.length then
+        throw new EvalError(s"expected ${params.length} arguments, got ${args.length}")
+      val localEnv = closure.extend(params, args)
+      body.map(e => eval(e, localEnv)).last
+    case SBuiltin(_, fn) => fn(args)
+    case other           => throw new EvalError(s"not a procedure: ${other.display}")
+
+  private def evalQuote(args: List[SchemeValue]): SchemeValue =
+    args match
+      case single :: Nil => single
+      case _             => throw new EvalError("quote: requires exactly 1 argument")
+
+  private def evalIf(args: List[SchemeValue], env: Environment): SchemeValue =
+    args match
+      case cond :: thenBranch :: elseBranch :: Nil =>
+        if isTruthy(eval(cond, env)) then eval(thenBranch, env) else eval(elseBranch, env)
+      case cond :: thenBranch :: Nil =>
+        if isTruthy(eval(cond, env)) then eval(thenBranch, env) else SVoid
+      case _ => throw new EvalError("if: bad syntax")
+
+  private def evalDefine(args: List[SchemeValue], env: Environment): SchemeValue =
+    args match
+      case SSymbol(name) :: value :: Nil =>
+        env.define(name, eval(value, env))
+        SVoid
+      case SList(SSymbol(name) :: params) :: body if body.nonEmpty =>
+        val paramNames = params.map {
+          case SSymbol(n) => n
+          case other      => throw new EvalError(s"define: expected parameter name, got ${other.display}")
+        }
+        env.define(name, SLambda(paramNames, body, env))
+        SVoid
+      case _ => throw new EvalError("define: bad syntax")
+
+  private def evalLambda(args: List[SchemeValue], env: Environment): SchemeValue =
+    args match
+      case SList(params) :: body if body.nonEmpty =>
+        val paramNames = params.map {
+          case SSymbol(n) => n
+          case other      => throw new EvalError(s"lambda: expected parameter name, got ${other.display}")
+        }
+        SLambda(paramNames, body, env)
+      case _ => throw new EvalError("lambda: bad syntax")
 
   private def asInteger(v: SchemeValue): Long = v match
     case SInteger(n) => n
     case other       => throw new EvalError(s"expected number, got ${other.display}")
 
   private def evalAdd(args: List[SchemeValue]): SchemeValue =
-    SInteger(args.map(a => asInteger(eval(a))).sum)
+    SInteger(args.map(asInteger).sum)
 
   private def evalSub(args: List[SchemeValue]): SchemeValue =
     args match
       case Nil           => throw new EvalError("-: requires at least 1 argument")
-      case single :: Nil => SInteger(-asInteger(eval(single)))
+      case single :: Nil => SInteger(-asInteger(single))
       case first :: rest =>
-        val firstVal = asInteger(eval(first))
-        SInteger(rest.foldLeft(firstVal)((acc, a) => acc - asInteger(eval(a))))
+        val firstVal = asInteger(first)
+        SInteger(rest.foldLeft(firstVal)((acc, a) => acc - asInteger(a)))
 
   private def evalMul(args: List[SchemeValue]): SchemeValue =
-    SInteger(args.map(a => asInteger(eval(a))).product)
+    SInteger(args.map(asInteger).product)
 
   private def evalDiv(args: List[SchemeValue]): SchemeValue =
     args match
       case Nil => throw new EvalError("/: requires at least 1 argument")
       case single :: Nil =>
-        val v = asInteger(eval(single))
+        val v = asInteger(single)
         if v == 0 then throw new EvalError("division by zero")
         SInteger(1 / v)
       case first :: rest =>
-        val firstVal = asInteger(eval(first))
+        val firstVal = asInteger(first)
         SInteger(rest.foldLeft(firstVal) { (acc, a) =>
-          val v = asInteger(eval(a))
+          val v = asInteger(a)
           if v == 0 then throw new EvalError("division by zero")
           acc / v
         })
 
   private def evalCompare(args: List[SchemeValue], cmp: (Long, Long) => Boolean): SchemeValue =
-    val vals = args.map(a => asInteger(eval(a)))
+    val vals = args.map(asInteger)
     SBoolean(vals.zip(vals.tail).forall((a, b) => cmp(a, b)))
 
   private def isTruthy(v: SchemeValue): Boolean = v match
@@ -82,23 +146,21 @@ object Evaluator:
 
   private def evalNot(args: List[SchemeValue]): SchemeValue =
     args match
-      case single :: Nil => SBoolean(!isTruthy(eval(single)))
+      case single :: Nil => SBoolean(!isTruthy(single))
       case _             => throw new EvalError(s"not: requires exactly 1 argument")
 
-  @scala.annotation.tailrec
-  private def evalAnd(args: List[SchemeValue]): SchemeValue =
+  private def evalAnd(args: List[SchemeValue], env: Environment): SchemeValue =
     args match
       case Nil         => SBoolean(true)
-      case last :: Nil => eval(last)
+      case last :: Nil => eval(last, env)
       case head :: rest =>
-        val v = eval(head)
-        if !isTruthy(v) then v else evalAnd(rest)
+        val v = eval(head, env)
+        if !isTruthy(v) then v else evalAnd(rest, env)
 
-  @scala.annotation.tailrec
-  private def evalOr(args: List[SchemeValue]): SchemeValue =
+  private def evalOr(args: List[SchemeValue], env: Environment): SchemeValue =
     args match
       case Nil         => SBoolean(false)
-      case last :: Nil => eval(last)
+      case last :: Nil => eval(last, env)
       case head :: rest =>
-        val v = eval(head)
-        if isTruthy(v) then v else evalOr(rest)
+        val v = eval(head, env)
+        if isTruthy(v) then v else evalOr(rest, env)
