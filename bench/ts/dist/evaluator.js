@@ -611,6 +611,24 @@ function applyK(proc, args, k, pos) {
     if (proc.tag === 'continuation') {
         return proc.fn(args.length > 0 ? args[0] : { tag: 'void' });
     }
+    if (proc.tag === 'builtin' && proc.name === 'map') {
+        if (args.length < 2)
+            throw posError('map: need at least 2 arguments', pos);
+        const fn = args[0];
+        const lists = args.slice(1);
+        for (const l of lists)
+            if (l.tag !== 'list')
+                throw posError('map: expected list', pos);
+        const len = lists[0].elements.length;
+        const results = [];
+        const mapLoop = (i) => {
+            if (i >= len)
+                return k({ tag: 'list', elements: results });
+            const fnArgs = lists.map(l => l.elements[i]);
+            return applyK(fn, fnArgs, val => { results.push(val); return mapLoop(i + 1); }, pos);
+        };
+        return mapLoop(0);
+    }
     if (proc.tag === 'builtin' && proc.name === 'apply') {
         if (args.length < 2)
             throw posError('apply: need at least 2 arguments', pos);
@@ -641,6 +659,36 @@ function applyK(proc, args, k, pos) {
         return k(proc.fn(args, pos));
     }
     throw posError('not a procedure', pos);
+}
+// ── Helpers ────────────────────────────────────────────────────────
+function schemeEqual(a, b) {
+    if (a.tag !== b.tag)
+        return false;
+    switch (a.tag) {
+        case 'number': return a.value === b.value;
+        case 'boolean': return a.value === b.value;
+        case 'string': return a.value === b.value;
+        case 'symbol': return a.value === b.value;
+        case 'char': return a.value === b.value;
+        case 'void': return true;
+        case 'list': {
+            const bList = b;
+            if (a.elements.length !== bList.elements.length)
+                return false;
+            return a.elements.every((e, i) => schemeEqual(e, bList.elements[i]));
+        }
+        default: return a === b;
+    }
+}
+function expectChar(val, op, p) {
+    if (val.tag !== 'char')
+        throw posError(`${op}: expected char`, p);
+    return val.value;
+}
+function expectString(val, op, p) {
+    if (val.tag !== 'string')
+        throw posError(`${op}: expected string`, p);
+    return val.value;
 }
 // ── Builtins ──────────────────────────────────────────────────────
 function makeGlobalEnv(output = []) {
@@ -853,6 +901,164 @@ function makeGlobalEnv(output = []) {
             throw posError('string-copy: expected string', p);
         return { tag: 'string', value: args[0].value };
     });
+    // eq? / equal?
+    defBuiltin('eq?', (args, p) => {
+        if (args.length !== 2)
+            throw posError('eq?: need 2 arguments', p);
+        const [a, b] = args;
+        if (a.tag !== b.tag)
+            return { tag: 'boolean', value: false };
+        switch (a.tag) {
+            case 'number': return { tag: 'boolean', value: a.value === b.value };
+            case 'boolean': return { tag: 'boolean', value: a.value === b.value };
+            case 'symbol': return { tag: 'boolean', value: a.value === b.value };
+            case 'char': return { tag: 'boolean', value: a.value === b.value };
+            case 'void': return { tag: 'boolean', value: true };
+            default: return { tag: 'boolean', value: a === b };
+        }
+    });
+    defBuiltin('equal?', (args, p) => {
+        if (args.length !== 2)
+            throw posError('equal?: need 2 arguments', p);
+        return { tag: 'boolean', value: schemeEqual(args[0], args[1]) };
+    });
+    // Numeric utilities
+    defBuiltin('abs', (args, p) => {
+        if (args.length !== 1)
+            throw posError('abs: need 1 argument', p);
+        return { tag: 'number', value: Math.abs(expectNumber(args[0], 'abs', p)) };
+    });
+    defBuiltin('modulo', (args, p) => {
+        if (args.length !== 2)
+            throw posError('modulo: need 2 arguments', p);
+        const a = expectNumber(args[0], 'modulo', p);
+        const b = expectNumber(args[1], 'modulo', p);
+        return { tag: 'number', value: ((a % b) + b) % b };
+    });
+    defBuiltin('remainder', (args, p) => {
+        if (args.length !== 2)
+            throw posError('remainder: need 2 arguments', p);
+        const a = expectNumber(args[0], 'remainder', p);
+        const b = expectNumber(args[1], 'remainder', p);
+        return { tag: 'number', value: a % b };
+    });
+    defBuiltin('quotient', (args, p) => {
+        if (args.length !== 2)
+            throw posError('quotient: need 2 arguments', p);
+        const a = expectNumber(args[0], 'quotient', p);
+        const b = expectNumber(args[1], 'quotient', p);
+        return { tag: 'number', value: Math.trunc(a / b) };
+    });
+    defBuiltin('min', (args, p) => {
+        if (args.length < 1)
+            throw posError('min: need at least 1 argument', p);
+        let m = expectNumber(args[0], 'min', p);
+        for (let i = 1; i < args.length; i++) {
+            const v = expectNumber(args[i], 'min', p);
+            if (v < m)
+                m = v;
+        }
+        return { tag: 'number', value: m };
+    });
+    defBuiltin('max', (args, p) => {
+        if (args.length < 1)
+            throw posError('max: need at least 1 argument', p);
+        let m = expectNumber(args[0], 'max', p);
+        for (let i = 1; i < args.length; i++) {
+            const v = expectNumber(args[i], 'max', p);
+            if (v > m)
+                m = v;
+        }
+        return { tag: 'number', value: m };
+    });
+    defBuiltin('expt', (args, p) => {
+        if (args.length !== 2)
+            throw posError('expt: need 2 arguments', p);
+        const base = expectNumber(args[0], 'expt', p);
+        const exp = expectNumber(args[1], 'expt', p);
+        return { tag: 'number', value: Math.pow(base, exp) };
+    });
+    // Numeric predicates
+    defBuiltin('zero?', (args, p) => { if (args.length !== 1)
+        throw posError('zero?: need 1 argument', p); return { tag: 'boolean', value: expectNumber(args[0], 'zero?', p) === 0 }; });
+    defBuiltin('positive?', (args, p) => { if (args.length !== 1)
+        throw posError('positive?: need 1 argument', p); return { tag: 'boolean', value: expectNumber(args[0], 'positive?', p) > 0 }; });
+    defBuiltin('negative?', (args, p) => { if (args.length !== 1)
+        throw posError('negative?: need 1 argument', p); return { tag: 'boolean', value: expectNumber(args[0], 'negative?', p) < 0 }; });
+    defBuiltin('odd?', (args, p) => { if (args.length !== 1)
+        throw posError('odd?: need 1 argument', p); return { tag: 'boolean', value: Math.abs(expectNumber(args[0], 'odd?', p)) % 2 === 1 }; });
+    defBuiltin('even?', (args, p) => { if (args.length !== 1)
+        throw posError('even?: need 1 argument', p); return { tag: 'boolean', value: expectNumber(args[0], 'even?', p) % 2 === 0 }; });
+    // List utilities
+    defBuiltin('list-ref', (args, p) => {
+        if (args.length !== 2)
+            throw posError('list-ref: need 2 arguments', p);
+        if (args[0].tag !== 'list')
+            throw posError('list-ref: expected list', p);
+        const idx = expectNumber(args[1], 'list-ref', p);
+        if (idx < 0 || idx >= args[0].elements.length)
+            throw posError('list-ref: index out of range', p);
+        return args[0].elements[idx];
+    });
+    defBuiltin('list-tail', (args, p) => {
+        if (args.length !== 2)
+            throw posError('list-tail: need 2 arguments', p);
+        if (args[0].tag !== 'list')
+            throw posError('list-tail: expected list', p);
+        const idx = expectNumber(args[1], 'list-tail', p);
+        return { tag: 'list', elements: args[0].elements.slice(idx) };
+    });
+    defBuiltin('list?', (args, p) => {
+        if (args.length !== 1)
+            throw posError('list?: need 1 argument', p);
+        const v = args[0];
+        if (v.tag !== 'list')
+            return { tag: 'boolean', value: false };
+        for (const e of v.elements) {
+            if (e.tag === 'symbol' && e.value === '.')
+                return { tag: 'boolean', value: false };
+        }
+        return { tag: 'boolean', value: true };
+    });
+    defBuiltin('assoc', (args, p) => {
+        if (args.length !== 2)
+            throw posError('assoc: need 2 arguments', p);
+        const key = args[0];
+        const alist = args[1];
+        if (alist.tag !== 'list')
+            throw posError('assoc: expected list', p);
+        for (const entry of alist.elements) {
+            if (entry.tag === 'list' && entry.elements.length >= 1 && schemeEqual(key, entry.elements[0]))
+                return entry;
+        }
+        return { tag: 'boolean', value: false };
+    });
+    // map (CPS-aware, handled in applyK)
+    env.set('map', { tag: 'builtin', name: 'map', fn: () => { throw new EvalError('internal: map handled by applyK'); } });
+    // Character operations
+    defBuiltin('char-alphabetic?', (args, p) => { if (args.length !== 1)
+        throw posError('char-alphabetic?: need 1 argument', p); const c = expectChar(args[0], 'char-alphabetic?', p); return { tag: 'boolean', value: /^[a-zA-Z]$/.test(c) }; });
+    defBuiltin('char-numeric?', (args, p) => { if (args.length !== 1)
+        throw posError('char-numeric?: need 1 argument', p); const c = expectChar(args[0], 'char-numeric?', p); return { tag: 'boolean', value: /^[0-9]$/.test(c) }; });
+    defBuiltin('char-upcase', (args, p) => { if (args.length !== 1)
+        throw posError('char-upcase: need 1 argument', p); return { tag: 'char', value: expectChar(args[0], 'char-upcase', p).toUpperCase() }; });
+    defBuiltin('char-downcase', (args, p) => { if (args.length !== 1)
+        throw posError('char-downcase: need 1 argument', p); return { tag: 'char', value: expectChar(args[0], 'char-downcase', p).toLowerCase() }; });
+    defBuiltin('char=?', (args, p) => { if (args.length !== 2)
+        throw posError('char=?: need 2 arguments', p); return { tag: 'boolean', value: expectChar(args[0], 'char=?', p) === expectChar(args[1], 'char=?', p) }; });
+    defBuiltin('char<?', (args, p) => { if (args.length !== 2)
+        throw posError('char<?: need 2 arguments', p); return { tag: 'boolean', value: expectChar(args[0], 'char<?', p) < expectChar(args[1], 'char<?', p) }; });
+    // String comparison operations
+    defBuiltin('string=?', (args, p) => { if (args.length !== 2)
+        throw posError('string=?: need 2 arguments', p); return { tag: 'boolean', value: expectString(args[0], 'string=?', p) === expectString(args[1], 'string=?', p) }; });
+    defBuiltin('string<?', (args, p) => { if (args.length !== 2)
+        throw posError('string<?: need 2 arguments', p); return { tag: 'boolean', value: expectString(args[0], 'string<?', p) < expectString(args[1], 'string<?', p) }; });
+    defBuiltin('string-ci=?', (args, p) => { if (args.length !== 2)
+        throw posError('string-ci=?: need 2 arguments', p); return { tag: 'boolean', value: expectString(args[0], 'string-ci=?', p).toLowerCase() === expectString(args[1], 'string-ci=?', p).toLowerCase() }; });
+    defBuiltin('string-upcase', (args, p) => { if (args.length !== 1)
+        throw posError('string-upcase: need 1 argument', p); return { tag: 'string', value: expectString(args[0], 'string-upcase', p).toUpperCase() }; });
+    defBuiltin('string-downcase', (args, p) => { if (args.length !== 1)
+        throw posError('string-downcase: need 1 argument', p); return { tag: 'string', value: expectString(args[0], 'string-downcase', p).toLowerCase() }; });
     return env;
 }
 // ── Display ────────────────────────────────────────────────────────
