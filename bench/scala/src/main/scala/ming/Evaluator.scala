@@ -3,19 +3,20 @@ package ming
 import Value.*
 import Expr.*
 
-/** Scheme interpreter entry point. Agents implement this object. */
+/** Scheme interpreter entry point. */
 object Evaluator:
 
-  /** Evaluate one or more Scheme expressions and return the string representation of the last result.
-    */
+  private def evalError(msg: String, pos: Option[Pos]): Nothing =
+    pos match
+      case Some(p) => throw new EvalError(s"$msg [$p]")
+      case None    => throw new EvalError(msg)
+
   def evalStr(input: String): String =
     val exprs = Parser.parseAll(input)
     if exprs.isEmpty then throw new EvalError("empty input")
     val env = makeGlobalEnv()
     evalSequence(exprs, env).display
 
-  /** Evaluate Scheme expressions and return both the result string and any captured output from display/write/newline.
-    */
   def evalStrWithOutput(input: String): (String, String) =
     val result = evalStr(input)
     (result, "")
@@ -108,29 +109,27 @@ object Evaluator:
         evalSequence(tail, env)
 
   private def eval(expr: Expr, env: Env): Value = expr match
-    case Num(n)                   => IntVal(n)
-    case Bool(b)                  => BoolVal(b)
-    case Str(s)                   => StrVal(s)
-    case Sym(name)                => env.lookup(name)
-    case SList(Nil)               => throw new EvalError("empty application")
-    case SList(Sym("if") :: args) => evalIf(args, env)
-    case SList(Sym("define") :: args) =>
-      evalDefine(args, env)
-      BoolVal(true)
-    case SList(Sym("quote") :: args)  => evalQuote(args)
-    case SList(Sym("lambda") :: args) => evalLambda(args, env)
-    case SList(Sym("let") :: args)    => evalLet(args, env)
-    case SList(Sym("begin") :: args)  => evalBegin(args, env)
-    case SList(Sym("cond") :: args)   => evalCond(args, env)
-    case SList(Sym("and") :: args)    => evalAnd(args, env)
-    case SList(Sym("or") :: args)     => evalOr(args, env)
-    case SList(Sym("not") :: args)    => evalNot(args, env)
-    case SList(head :: args) =>
+    case Num(n, _)                            => IntVal(n)
+    case Bool(b, _)                           => BoolVal(b)
+    case Str(s, _)                            => StrVal(s)
+    case Sym(name, pos)                       => env.lookup(name, pos)
+    case SList(Nil, pos)                      => evalError("empty application", pos)
+    case SList(Sym("if", _) :: args, pos)     => evalIf(args, env, pos)
+    case SList(Sym("define", _) :: args, pos) => evalDefine(args, env, pos); BoolVal(true)
+    case SList(Sym("quote", _) :: args, pos)  => evalQuote(args, pos)
+    case SList(Sym("lambda", _) :: args, pos) => evalLambda(args, env, pos)
+    case SList(Sym("let", _) :: args, pos)    => evalLet(args, env, pos)
+    case SList(Sym("begin", _) :: args, pos)  => evalBegin(args, env, pos)
+    case SList(Sym("cond", _) :: args, pos)   => evalCond(args, env, pos)
+    case SList(Sym("and", _) :: args, _)      => evalAnd(args, env)
+    case SList(Sym("or", _) :: args, _)       => evalOr(args, env)
+    case SList(Sym("not", _) :: args, _)      => evalNot(args, env)
+    case SList(head :: args, pos) =>
       val proc   = eval(head, env)
       val values = args.map(eval(_, env))
-      applyProc(proc, values)
+      applyProc(proc, values, pos)
 
-  private def evalIf(args: List[Expr], env: Env): Value =
+  private def evalIf(args: List[Expr], env: Env, pos: Option[Pos]): Value =
     args match
       case cond :: thenBranch :: elseBranch :: Nil =>
         if eval(cond, env).isTruthy then eval(thenBranch, env)
@@ -138,82 +137,80 @@ object Evaluator:
       case cond :: thenBranch :: Nil =>
         if eval(cond, env).isTruthy then eval(thenBranch, env)
         else BoolVal(false)
-      case _ => throw new EvalError("if: bad syntax")
+      case _ => evalError("if: bad syntax", pos)
 
-  private def evalDefine(args: List[Expr], env: Env): Unit =
+  private def evalDefine(args: List[Expr], env: Env, pos: Option[Pos]): Unit =
     args match
-      case Sym(name) :: valueExpr :: Nil =>
+      case Sym(name, _) :: valueExpr :: Nil =>
         val v = eval(valueExpr, env)
         env.define(name, v)
-      case SList(Sym(name) :: params) :: body if body.nonEmpty =>
+      case SList(Sym(name, _) :: params, _) :: body if body.nonEmpty =>
         val paramNames = params.map {
-          case Sym(p) => p
-          case _      => throw new EvalError("define: non-symbol parameter")
+          case Sym(p, _) => p
+          case _         => evalError("define: non-symbol parameter", pos)
         }
         val lambda = LambdaVal(paramNames, body, env)
         env.define(name, lambda)
-      case _ => throw new EvalError("define: bad syntax")
+      case _ => evalError("define: bad syntax", pos)
 
-  private def evalQuote(args: List[Expr]): Value =
+  private def evalQuote(args: List[Expr], pos: Option[Pos]): Value =
     args match
       case expr :: Nil => exprToValue(expr)
-      case _           => throw new EvalError("quote: expected 1 argument")
+      case _           => evalError("quote: expected 1 argument", pos)
 
   private def exprToValue(expr: Expr): Value = expr match
-    case Num(n)  => IntVal(n)
-    case Bool(b) => BoolVal(b)
-    case Str(s)  => StrVal(s)
-    case Sym(s)  => SymbolVal(s)
-    case SList(elems) =>
+    case Num(n, _)  => IntVal(n)
+    case Bool(b, _) => BoolVal(b)
+    case Str(s, _)  => StrVal(s)
+    case Sym(s, _)  => SymbolVal(s)
+    case SList(elems, _) =>
       elems.foldRight(NilVal: Value)((e, acc) => PairVal(exprToValue(e), acc))
 
-  private def evalLambda(args: List[Expr], env: Env): Value =
+  private def evalLambda(args: List[Expr], env: Env, pos: Option[Pos]): Value =
     args match
-      case SList(params) :: body if body.nonEmpty =>
+      case SList(params, _) :: body if body.nonEmpty =>
         val paramNames = params.map {
-          case Sym(p) => p
-          case _      => throw new EvalError("lambda: non-symbol parameter")
+          case Sym(p, _) => p
+          case _         => evalError("lambda: non-symbol parameter", pos)
         }
         LambdaVal(paramNames, body, env)
-      case _ => throw new EvalError("lambda: bad syntax")
+      case _ => evalError("lambda: bad syntax", pos)
 
-  private def evalLet(args: List[Expr], env: Env): Value =
+  private def evalLet(args: List[Expr], env: Env, pos: Option[Pos]): Value =
     args match
-      // Named let: (let name ((var init) ...) body ...)
-      case Sym(name) :: SList(bindings) :: body if body.nonEmpty =>
+      case Sym(name, _) :: SList(bindings, _) :: body if body.nonEmpty =>
         val pairs = bindings.map {
-          case SList(Sym(v) :: valExpr :: Nil) => (v, eval(valExpr, env))
-          case _                               => throw new EvalError("let: bad binding")
+          case SList(Sym(v, _) :: valExpr :: Nil, _) => (v, eval(valExpr, env))
+          case _                                     => evalError("let: bad binding", pos)
         }
         val paramNames = pairs.map(_._1)
         val initVals   = pairs.map(_._2)
         val localEnv   = env.extend(Nil, Nil)
         val lambda     = LambdaVal(paramNames, body, localEnv)
         localEnv.define(name, lambda)
-        applyProc(lambda, initVals)
-      // Regular let: (let ((var init) ...) body ...)
-      case SList(bindings) :: body if body.nonEmpty =>
+        applyProc(lambda, initVals, pos)
+      case SList(bindings, _) :: body if body.nonEmpty =>
         val pairs = bindings.map {
-          case SList(Sym(v) :: valExpr :: Nil) => (v, eval(valExpr, env))
-          case _                               => throw new EvalError("let: bad binding")
+          case SList(Sym(v, _) :: valExpr :: Nil, _) => (v, eval(valExpr, env))
+          case _                                     => evalError("let: bad binding", pos)
         }
         val localEnv = env.extend(pairs.map(_._1), pairs.map(_._2))
         evalSequence(body, localEnv)
-      case _ => throw new EvalError("let: bad syntax")
+      case _ => evalError("let: bad syntax", pos)
 
-  private def evalBegin(args: List[Expr], env: Env): Value =
-    if args.isEmpty then throw new EvalError("begin: empty")
+  private def evalBegin(args: List[Expr], env: Env, pos: Option[Pos]): Value =
+    if args.isEmpty then evalError("begin: empty", pos)
     evalSequence(args, env)
 
-  private def evalCond(clauses: List[Expr], env: Env): Value =
+  private def evalCond(clauses: List[Expr], env: Env, pos: Option[Pos]): Value =
     clauses match
-      case Nil => throw new EvalError("cond: no matching clause")
-      case SList(Sym("else") :: body) :: Nil =>
+      case Nil => evalError("cond: no matching clause", pos)
+      case SList(Sym("else", _) :: body, _) :: Nil =>
         evalSequence(body, env)
-      case SList(test :: body) :: rest =>
+      case SList(test :: body, _) :: rest =>
         if eval(test, env).isTruthy then evalSequence(body, env)
-        else evalCond(rest, env)
-      case _ => throw new EvalError("cond: bad syntax")
+        else evalCond(rest, env, pos)
+      case _ => evalError("cond: bad syntax", pos)
 
   private def appendList(lst: Value, tail: Value): Value =
     lst match
@@ -245,26 +242,20 @@ object Evaluator:
     if args.length != 1 then throw new EvalError("not: expected 1 argument")
     BoolVal(!eval(args.head, env).isTruthy)
 
-  private def applyProc(proc: Value, args: List[Value]): Value =
+  private def applyProc(proc: Value, args: List[Value], pos: Option[Pos] = None): Value =
     proc match
       case LambdaVal(params, body, closure) =>
         val localEnv = closure.extend(params, args)
         evalSequence(body, localEnv)
-      case BuiltinVal(_, fn) => fn(args)
-      case _                 => throw new EvalError("not a procedure")
-
-  private def applyPrimitive(op: String, args: List[Value]): Value =
-    op match
-      case "+"  => arith(args, 0L, _ + _)
-      case "*"  => arith(args, 1L, _ * _)
-      case "-"  => subtractOp(args)
-      case "/"  => divideOp(args)
-      case "<"  => compareOp(args, _ < _)
-      case ">"  => compareOp(args, _ > _)
-      case "="  => compareOp(args, _ == _)
-      case "<=" => compareOp(args, _ <= _)
-      case ">=" => compareOp(args, _ >= _)
-      case _    => throw new EvalError(s"unknown procedure: $op")
+      case BuiltinVal(name, fn) =>
+        try fn(args)
+        catch
+          case e: EvalError =>
+            if e.getMessage.matches(".*\\d+:\\d+.*") then throw e
+            else evalError(e.getMessage, pos)
+          case e: ArithmeticException =>
+            evalError(e.getMessage, pos)
+      case _ => evalError("not a procedure", pos)
 
   private def requireInts(args: List[Value]): List[Long] =
     args.map {

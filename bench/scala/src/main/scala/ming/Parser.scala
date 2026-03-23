@@ -2,8 +2,11 @@ package ming
 
 import Expr.*
 
-/** Recursive-descent S-expression parser. */
+/** Recursive-descent S-expression parser with source position tracking. */
 object Parser:
+
+  /** A token with its source position. */
+  private case class Token(text: String, pos: Pos)
 
   /** Parse all top-level expressions from input string. */
   def parseAll(input: String): List[Expr] =
@@ -34,74 +37,83 @@ object Parser:
   private def isAtomChar(ch: Char): Boolean =
     !ch.isWhitespace && ch != '(' && ch != ')' && ch != '"' && ch != ';' && ch != '\''
 
-  private def tokenize(input: String): List[String] =
-    val result = scala.collection.mutable.ListBuffer.empty[String]
-    var i      = 0
+  private def tokenize(input: String): List[Token] =
+    val result    = scala.collection.mutable.ListBuffer.empty[Token]
+    var i         = 0
+    var line      = 1
+    var lineStart = 0
     while i < input.length do
       input(i) match
+        case '\n' =>
+          i += 1
+          line += 1
+          lineStart = i
         case ch if ch.isWhitespace =>
           i += 1
         case ';' =>
           while i < input.length && input(i) != '\n' do i += 1
         case '(' =>
-          result += "("
+          result += Token("(", Pos(line, i - lineStart + 1))
           i += 1
         case ')' =>
-          result += ")"
+          result += Token(")", Pos(line, i - lineStart + 1))
           i += 1
         case '\'' =>
-          result += "'"
+          result += Token("'", Pos(line, i - lineStart + 1))
           i += 1
         case '"' =>
+          val col           = i - lineStart + 1
           val (tok, newPos) = scanString(input, i + 1)
-          result += tok
+          result += Token(tok, Pos(line, col))
           i = newPos
         case _ =>
+          val col   = i - lineStart + 1
           val start = i
           while i < input.length && isAtomChar(input(i)) do i += 1
-          result += input.substring(start, i)
+          result += Token(input.substring(start, i), Pos(line, col))
     result.toList
 
   // --- Parser ---
 
-  private def parseTokens(tokens: List[String], acc: List[Expr]): List[Expr] =
+  private def parseTokens(tokens: List[Token], acc: List[Expr]): List[Expr] =
     tokens match
       case Nil => acc
-      case "(" :: rest =>
-        val (expr, remaining) = parseList(rest, Nil)
+      case Token("(", pos) :: rest =>
+        val (expr, remaining) = parseList(rest, Nil, pos)
         parseTokens(remaining, expr :: acc)
-      case ")" :: _ =>
+      case Token(")", _) :: _ =>
         throw new EvalError("unexpected )")
-      case "'" :: rest =>
+      case Token("'", pos) :: rest =>
         val (quoted, remaining) = parseOne(rest)
-        parseTokens(remaining, SList(Sym("quote") :: quoted :: Nil) :: acc)
-      case token :: rest =>
-        parseTokens(rest, parseAtom(token) :: acc)
+        val quoteExpr           = SList(Sym("quote", Some(pos)) :: quoted :: Nil, Some(pos))
+        parseTokens(remaining, quoteExpr :: acc)
+      case Token(text, pos) :: rest =>
+        parseTokens(rest, parseAtom(text, pos) :: acc)
 
-  private def parseOne(tokens: List[String]): (Expr, List[String]) =
+  private def parseOne(tokens: List[Token]): (Expr, List[Token]) =
     tokens match
       case Nil => throw new EvalError("unexpected end of input")
-      case "(" :: rest =>
-        parseList(rest, Nil)
-      case "'" :: rest =>
+      case Token("(", pos) :: rest =>
+        parseList(rest, Nil, pos)
+      case Token("'", pos) :: rest =>
         val (quoted, remaining) = parseOne(rest)
-        (SList(Sym("quote") :: quoted :: Nil), remaining)
-      case token :: rest =>
-        (parseAtom(token), rest)
+        (SList(Sym("quote", Some(pos)) :: quoted :: Nil, Some(pos)), remaining)
+      case Token(text, pos) :: rest =>
+        (parseAtom(text, pos), rest)
 
-  private def parseList(tokens: List[String], acc: List[Expr]): (Expr, List[String]) =
+  private def parseList(tokens: List[Token], acc: List[Expr], listPos: Pos): (Expr, List[Token]) =
     tokens match
-      case Nil         => throw new EvalError("unexpected end of input")
-      case ")" :: rest => (SList(acc.reverse), rest)
+      case Nil                   => throw new EvalError("unexpected end of input")
+      case Token(")", _) :: rest => (SList(acc.reverse, Some(listPos)), rest)
       case _ =>
         val (expr, remaining) = parseOne(tokens)
-        parseList(remaining, expr :: acc)
+        parseList(remaining, expr :: acc, listPos)
 
-  private def parseAtom(token: String): Expr =
-    if token == "#t" then Bool(true)
-    else if token == "#f" then Bool(false)
-    else if token.startsWith("\"") && token.endsWith("\"") then Str(token.substring(1, token.length - 1))
+  private def parseAtom(token: String, pos: Pos): Expr =
+    if token == "#t" then Bool(true, Some(pos))
+    else if token == "#f" then Bool(false, Some(pos))
+    else if token.startsWith("\"") && token.endsWith("\"") then Str(token.substring(1, token.length - 1), Some(pos))
     else
       token.toLongOption match
-        case Some(n) => Num(n)
-        case None    => Sym(token)
+        case Some(n) => Num(n, Some(pos))
+        case None    => Sym(token, Some(pos))

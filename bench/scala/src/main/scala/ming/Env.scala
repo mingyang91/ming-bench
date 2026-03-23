@@ -8,13 +8,16 @@ class Env(
   private val parent: Option[Env] = None
 ):
 
-  def lookup(name: String): Value =
+  def lookup(name: String, pos: Option[Pos] = None): Value =
     bindings.get(name) match
       case Some(v) => v
       case None =>
         parent match
-          case Some(p) => p.lookup(name)
-          case None    => throw new EvalError(s"unbound variable: $name")
+          case Some(p) => p.lookup(name, pos)
+          case None =>
+            pos match
+              case Some(p) => throw new EvalError(s"unbound variable: $name [$p]")
+              case None    => throw new EvalError(s"unbound variable: $name")
 
   def define(name: String, value: Value): Unit =
     bindings(name) = value
