@@ -16,7 +16,8 @@ type SchemeVal =
   | { tag: 'lambda'; params: string[]; rest?: string; body: SchemeVal[]; env: Env; pos?: Pos }
   | { tag: 'builtin'; name: string; fn: (args: SchemeVal[]) => SchemeVal; pos?: Pos }
   | { tag: 'continuation'; k: K; pos?: Pos }
-  | { tag: 'void'; pos?: Pos };
+  | { tag: 'void'; pos?: Pos }
+  | { tag: 'syntax'; literals: string[]; rules: { pattern: SchemeVal; template: SchemeVal }[]; defEnv: Env; pos?: Pos };
 
 // ── CPS / Trampoline types ─────────────────────────────────────────
 
@@ -260,6 +261,192 @@ function parseDotParams(paramExprs: SchemeVal[]): { params: string[]; rest?: str
     return { params, rest };
   }
   return { params: paramExprs.map(p => (p as { tag: 'symbol'; value: string }).value) };
+}
+
+// ── Hygienic Macros (syntax-rules) ─────────────────────────────────
+
+let gensymCounter = 0;
+function gensym(base: string): string {
+  return `${base}__hyg_${++gensymCounter}`;
+}
+
+const SPECIAL_FORMS = new Set([
+  'if', 'define', 'lambda', 'and', 'or', 'let', 'begin',
+  'set!', 'string-set!', 'cond', 'quote', 'define-syntax',
+]);
+
+type PatternBindings = Map<string, SchemeVal | SchemeVal[]>;
+
+function collectPatternVars(pattern: SchemeVal, literals: string[], vars: Set<string>): void {
+  if (pattern.tag === 'symbol') {
+    if (!literals.includes(pattern.value) && pattern.value !== '_' && pattern.value !== '...') {
+      vars.add(pattern.value);
+    }
+  } else if (pattern.tag === 'list') {
+    for (const elem of pattern.value) {
+      if (elem.tag === 'symbol' && elem.value === '...') continue;
+      collectPatternVars(elem, literals, vars);
+    }
+  }
+}
+
+function matchPattern(pattern: SchemeVal, input: SchemeVal, literals: string[], bindings: PatternBindings): boolean {
+  if (pattern.tag === 'symbol') {
+    if (pattern.value === '_') return true;
+    if (pattern.value === '...') return false;
+    if (literals.includes(pattern.value)) {
+      return input.tag === 'symbol' && input.value === pattern.value;
+    }
+    bindings.set(pattern.value, input);
+    return true;
+  }
+
+  if (pattern.tag === 'list' && input.tag === 'list') {
+    const pats = pattern.value;
+    const inps = input.value;
+
+    const ellipsisIdx = pats.findIndex(p => p.tag === 'symbol' && p.value === '...');
+
+    if (ellipsisIdx >= 0) {
+      const beforePats = pats.slice(0, ellipsisIdx - 1);
+      const ellipsisPat = pats[ellipsisIdx - 1];
+      const afterPats = pats.slice(ellipsisIdx + 1);
+
+      if (inps.length < beforePats.length + afterPats.length) return false;
+
+      for (let i = 0; i < beforePats.length; i++) {
+        if (!matchPattern(beforePats[i], inps[i], literals, bindings)) return false;
+      }
+
+      const ellipsisVars = new Set<string>();
+      collectPatternVars(ellipsisPat, literals, ellipsisVars);
+      for (const v of ellipsisVars) bindings.set(v, []);
+
+      const ellipsisCount = inps.length - beforePats.length - afterPats.length;
+      for (let i = 0; i < ellipsisCount; i++) {
+        const sub = new Map<string, SchemeVal | SchemeVal[]>();
+        if (!matchPattern(ellipsisPat, inps[beforePats.length + i], literals, sub)) return false;
+        for (const v of ellipsisVars) (bindings.get(v) as SchemeVal[]).push(sub.get(v) as SchemeVal);
+      }
+
+      for (let i = 0; i < afterPats.length; i++) {
+        if (!matchPattern(afterPats[i], inps[inps.length - afterPats.length + i], literals, bindings)) return false;
+      }
+      return true;
+    }
+
+    if (pats.length !== inps.length) return false;
+    for (let i = 0; i < pats.length; i++) {
+      if (!matchPattern(pats[i], inps[i], literals, bindings)) return false;
+    }
+    return true;
+  }
+
+  if (pattern.tag === input.tag) {
+    if (pattern.tag === 'number' && input.tag === 'number') return pattern.value === input.value;
+    if (pattern.tag === 'boolean' && input.tag === 'boolean') return pattern.value === input.value;
+  }
+
+  return false;
+}
+
+function collectTemplateEllipsisVars(tmpl: SchemeVal, bindings: PatternBindings, vars: Set<string>): void {
+  if (tmpl.tag === 'symbol' && bindings.has(tmpl.value) && Array.isArray(bindings.get(tmpl.value))) {
+    vars.add(tmpl.value);
+  } else if (tmpl.tag === 'list') {
+    for (const elem of tmpl.value) collectTemplateEllipsisVars(elem, bindings, vars);
+  }
+}
+
+function expandTemplate(tmpl: SchemeVal, bindings: PatternBindings, renames: Map<string, string>): SchemeVal {
+  if (tmpl.tag === 'symbol') {
+    const name = tmpl.value;
+    if (bindings.has(name)) {
+      const val = bindings.get(name)!;
+      if (Array.isArray(val)) throw new EvalError('syntax-rules: ellipsis variable used outside ellipsis context');
+      return val;
+    }
+    if (renames.has(name)) return { tag: 'symbol', value: renames.get(name)! };
+    return tmpl;
+  }
+
+  if (tmpl.tag === 'list') {
+    const result: SchemeVal[] = [];
+    const elems = tmpl.value;
+    for (let i = 0; i < elems.length; i++) {
+      const next = i + 1 < elems.length ? elems[i + 1] : null;
+      if (next && next.tag === 'symbol' && next.value === '...') {
+        const ellVars = new Set<string>();
+        collectTemplateEllipsisVars(elems[i], bindings, ellVars);
+        if (ellVars.size > 0) {
+          const firstVar = ellVars.values().next().value!;
+          const count = (bindings.get(firstVar) as SchemeVal[]).length;
+          for (let j = 0; j < count; j++) {
+            const sub = new Map(bindings);
+            for (const v of ellVars) sub.set(v, (bindings.get(v) as SchemeVal[])[j]);
+            result.push(expandTemplate(elems[i], sub, renames));
+          }
+        }
+        i++;
+        continue;
+      }
+      result.push(expandTemplate(elems[i], bindings, renames));
+    }
+    return { tag: 'list', value: result };
+  }
+
+  return tmpl;
+}
+
+function collectAllSymbols(tmpl: SchemeVal, syms: Set<string>): void {
+  if (tmpl.tag === 'symbol') syms.add(tmpl.value);
+  else if (tmpl.tag === 'list') {
+    for (const e of tmpl.value) collectAllSymbols(e, syms);
+  }
+}
+
+function expandMacro(transformer: SchemeVal & { tag: 'syntax' }, inputExpr: SchemeVal, useSiteEnv: Env): SchemeVal | null {
+  const inputItems = (inputExpr as { tag: 'list'; value: SchemeVal[] }).value;
+
+  for (const rule of transformer.rules) {
+    const patItems = (rule.pattern as { tag: 'list'; value: SchemeVal[] }).value;
+    const bindings: PatternBindings = new Map();
+
+    // Match arguments (skip first element = macro name in both pattern and input)
+    const patArgs: SchemeVal = { tag: 'list', value: patItems.slice(1) };
+    const inpArgs: SchemeVal = { tag: 'list', value: inputItems.slice(1) };
+
+    if (!matchPattern(patArgs, inpArgs, transformer.literals, bindings)) continue;
+
+    // Collect pattern variable names
+    const patVars = new Set<string>();
+    collectPatternVars(patArgs, transformer.literals, patVars);
+
+    // Collect all symbols in template
+    const tmplSyms = new Set<string>();
+    collectAllSymbols(rule.template, tmplSyms);
+
+    // Build rename map for hygienic expansion
+    const renames = new Map<string, string>();
+    for (const sym of tmplSyms) {
+      if (patVars.has(sym)) continue;
+      if (sym === '...') continue;
+      if (SPECIAL_FORMS.has(sym)) continue;
+      const renamed = gensym(sym);
+      renames.set(sym, renamed);
+      // Inject definition-site binding if available
+      try {
+        const defVal = transformer.defEnv.get(sym);
+        useSiteEnv.define(renamed, defVal);
+      } catch (_) {
+        // Not bound in def env — that's fine, it's a macro-introduced name
+      }
+    }
+
+    return expandTemplate(rule.template, bindings, renames);
+  }
+
+  return null;
 }
 
 // ── Global Environment ─────────────────────────────────────────────
@@ -669,6 +856,32 @@ function evaluateCPS(expr: SchemeVal, env: Env, k: K): TResult {
     if (op === 'cond') {
       return evaluateCondCPS(items, 1, env, k);
     }
+
+    if (op === 'define-syntax') {
+      const name = (items[1] as { tag: 'symbol'; value: string }).value;
+      const srExpr = items[2] as { tag: 'list'; value: SchemeVal[] };
+      const srItems = srExpr.value;
+      // (syntax-rules (literal ...) (pattern template) ...)
+      const literals = (srItems[1] as { tag: 'list'; value: SchemeVal[] }).value.map(
+        l => (l as { tag: 'symbol'; value: string }).value
+      );
+      const rules: { pattern: SchemeVal; template: SchemeVal }[] = [];
+      for (let i = 2; i < srItems.length; i++) {
+        const r = (srItems[i] as { tag: 'list'; value: SchemeVal[] }).value;
+        rules.push({ pattern: r[0], template: r[1] });
+      }
+      env.define(name, { tag: 'syntax', literals, rules, defEnv: env });
+      return callK(k, VOID);
+    }
+
+    // Check for macro application
+    try {
+      const headVal = env.get(op);
+      if (headVal.tag === 'syntax') {
+        const expanded = expandMacro(headVal, expr, env);
+        if (expanded) return evaluateCPS(expanded, env, k);
+      }
+    } catch (_) { /* not bound or not a macro */ }
   }
 
   // Function application: evaluate head, then args, then apply
@@ -718,6 +931,7 @@ function writeVal(val: SchemeVal): string {
     case 'builtin': return `#<builtin:${val.name}>`;
     case 'continuation': return '#<continuation>';
     case 'void': return '';
+    case 'syntax': return '#<syntax>';
   }
 }
 
