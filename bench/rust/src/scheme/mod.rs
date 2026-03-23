@@ -73,6 +73,9 @@ enum Value {
         rules: Vec<(Expr, Expr)>,
         def_env: Env,
     },
+    MultipleValues(Vec<Value>),
+    ValuesProc,
+    CallWithValues,
 }
 
 impl std::fmt::Debug for Value {
@@ -95,6 +98,9 @@ impl std::fmt::Debug for Value {
             Value::WithExceptionHandler => write!(f, "WithExceptionHandler"),
             Value::Continuation(..) => write!(f, "#<continuation>"),
             Value::Macro { .. } => write!(f, "#<macro>"),
+            Value::MultipleValues(vs) => write!(f, "MultipleValues({:?})", vs),
+            Value::ValuesProc => write!(f, "ValuesProc"),
+            Value::CallWithValues => write!(f, "CallWithValues"),
         }
     }
 }
@@ -112,6 +118,7 @@ impl PartialEq for Value {
             (Value::Vector(a), Value::Vector(b)) => Rc::ptr_eq(a, b),
             (Value::Void, Value::Void) => true,
             (Value::Macro { .. }, Value::Macro { .. }) => false,
+            (Value::MultipleValues(a), Value::MultipleValues(b)) => a == b,
             _ => false,
         }
     }
@@ -162,9 +169,10 @@ impl Value {
                 out.push(')');
                 out
             }
-            Value::Lambda { .. } | Value::Builtin(_, _) | Value::CallCC | Value::DynamicWind | Value::Continuation(..) | Value::Raise | Value::WithExceptionHandler => {
+            Value::Lambda { .. } | Value::Builtin(_, _) | Value::CallCC | Value::DynamicWind | Value::Continuation(..) | Value::Raise | Value::WithExceptionHandler | Value::ValuesProc | Value::CallWithValues => {
                 "#<procedure>".to_string()
             }
+            Value::MultipleValues(_) => "#<values>".to_string(),
             Value::Void => "#<void>".to_string(),
             Value::Macro { .. } => "#<macro>".to_string(),
         }
@@ -367,6 +375,8 @@ enum Kont {
     DispatchGuardClauses { exception: Value, clauses: Vec<Expr>, env: Env, next: Rc<Kont> },
     // after wind unwinding for raise, call handler with exception
     CallHandlerAfterWind { handler: Value, exception: Value, next: Rc<Kont> },
+    // call-with-values: after producer returns, call consumer with the values
+    CallWithValuesConsumer { consumer: Value, form: Expr, next: Rc<Kont> },
 }
 
 impl std::fmt::Debug for Kont {
@@ -1296,6 +1306,8 @@ fn default_env() -> Env {
     env_set(&env, "dynamic-wind".to_string(), Value::DynamicWind);
     env_set(&env, "raise".to_string(), Value::Raise);
     env_set(&env, "with-exception-handler".to_string(), Value::WithExceptionHandler);
+    env_set(&env, "values".to_string(), Value::ValuesProc);
+    env_set(&env, "call-with-values".to_string(), Value::CallWithValues);
     env
 }
 
@@ -2071,6 +2083,28 @@ fn apply_function(func: Value, args: Vec<Value>, form: &Expr, kont: &mut Rc<Kont
             });
             // Call in-thunk (zero args)
             apply_function(in_thunk, vec![], form, kont)
+        }
+        Value::ValuesProc => {
+            if args.len() == 1 {
+                Ok(State::Apply(args.into_iter().next().unwrap()))
+            } else {
+                Ok(State::Apply(Value::MultipleValues(args)))
+            }
+        }
+        Value::CallWithValues => {
+            if args.len() != 2 {
+                return Err(form.wrap_err(EvalError::Arity("call-with-values requires exactly 2 arguments".into())));
+            }
+            let mut it = args.into_iter();
+            let producer = it.next().unwrap();
+            let consumer = it.next().unwrap();
+            *kont = Rc::new(Kont::CallWithValuesConsumer {
+                consumer,
+                form: form.clone(),
+                next: kont.clone(),
+            });
+            // Call producer with no args
+            apply_function(producer, vec![], form, kont)
         }
         Value::Continuation(saved_kont, saved_winds) => {
             if args.len() != 1 {
@@ -2956,6 +2990,15 @@ fn eval_cek(initial_expr: Expr, initial_env: Env, initial_kont: Rc<Kont>) -> Res
                         EXCEPTION_HANDLERS.with(|eh| eh.borrow_mut().pop());
                         kont = next;
                         State::Apply(value)
+                    }
+
+                    Kont::CallWithValuesConsumer { consumer, form, next } => {
+                        kont = next;
+                        let call_args = match value {
+                            Value::MultipleValues(vs) => vs,
+                            single => vec![single],
+                        };
+                        apply_function(consumer, call_args, &form, &mut kont)?
                     }
 
                     Kont::GuardClauseTest { exception, body, remaining_clauses, env, next } => {
