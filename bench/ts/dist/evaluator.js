@@ -4,6 +4,57 @@ function posError(msg, pos) {
         return new EvalError(`${pos.line}:${pos.col}: ${msg}`);
     return new EvalError(msg);
 }
+// ── Pair / List Helpers ─────────────────────────────────────────────
+const EMPTY_LIST = { tag: 'list', elements: [] };
+function isNull(v) {
+    return v.tag === 'list' && v.elements.length === 0;
+}
+function makePair(car, cdr) {
+    return { tag: 'pair', car, cdr };
+}
+function arrayToList(arr) {
+    let result = EMPTY_LIST;
+    for (let i = arr.length - 1; i >= 0; i--) {
+        result = makePair(arr[i], result);
+    }
+    return result;
+}
+function listToArray(val) {
+    const result = [];
+    let cur = val;
+    while (cur.tag === 'pair') {
+        result.push(cur.car);
+        cur = cur.cdr;
+    }
+    return result;
+}
+function listLength(val) {
+    let n = 0;
+    let cur = val;
+    while (cur.tag === 'pair') {
+        n++;
+        cur = cur.cdr;
+    }
+    return n;
+}
+// Convert AST list nodes to runtime pair chains
+function quoteConvert(val) {
+    if (val.tag !== 'list')
+        return val;
+    if (val.elements.length === 0)
+        return EMPTY_LIST;
+    const elems = val.elements;
+    // Dotted pair: (a b . c) stored as [a, b, '.', c]
+    const dotIdx = elems.findIndex((e, i) => i > 0 && e.tag === 'symbol' && e.value === '.');
+    if (dotIdx !== -1 && dotIdx === elems.length - 2) {
+        let result = quoteConvert(elems[elems.length - 1]);
+        for (let i = dotIdx - 1; i >= 0; i--) {
+            result = makePair(quoteConvert(elems[i]), result);
+        }
+        return result;
+    }
+    return arrayToList(elems.map(quoteConvert));
+}
 // ── Environment ───────────────────────────────────────────────────
 class Env {
     parent;
@@ -203,7 +254,7 @@ let gensymCounter = 0;
 let recordTypeCounter = 0;
 function gensym(base) { return `##${base}_${gensymCounter++}`; }
 const SPECIAL_FORMS = new Set([
-    'quote', 'if', 'define', 'lambda', 'set!', 'begin', 'let', 'letrec', 'letrec*',
+    'quote', 'if', 'define', 'lambda', 'set!', 'begin', 'let', 'let*', 'letrec', 'letrec*',
     'case', 'do', 'cond', 'and', 'or', 'define-syntax', 'guard',
 ]);
 function matchPattern(pattern, args, literals) {
@@ -452,7 +503,7 @@ function evalK(expr, env, k) {
             case 'quote':
                 if (elems.length !== 2)
                     throw posError('quote: need 1 argument', expr.pos);
-                return k(elems[1]);
+                return k(quoteConvert(elems[1]));
             case 'if':
                 if (elems.length < 3 || elems.length > 4)
                     throw posError('if: bad syntax', expr.pos);
@@ -558,6 +609,27 @@ function evalK(expr, env, k) {
                     });
                 };
                 return evalBindings(0);
+            }
+            case 'let*': {
+                if (elems.length < 3)
+                    throw posError('let*: bad syntax', expr.pos);
+                const bindings = elems[1];
+                if (bindings.tag !== 'list')
+                    throw posError('let*: bindings must be a list', expr.pos);
+                const letStarEnv = new Env(env);
+                const evalLetStarBindings = (i) => {
+                    if (i >= bindings.elements.length)
+                        return evalSeq(elems, 2, letStarEnv, k);
+                    const b = bindings.elements[i];
+                    if (b.tag !== 'list' || b.elements.length !== 2 || b.elements[0].tag !== 'symbol')
+                        throw posError('let*: bad binding', expr.pos);
+                    const bName = b.elements[0].value;
+                    return evalK(b.elements[1], letStarEnv, val => {
+                        letStarEnv.set(bName, val);
+                        return evalLetStarBindings(i + 1);
+                    });
+                };
+                return evalLetStarBindings(0);
             }
             case 'letrec': {
                 if (elems.length < 3)
@@ -669,7 +741,6 @@ function evalK(expr, env, k) {
                                 return k({ tag: 'void' });
                             }
                             const afterBody = () => {
-                                // Evaluate all step expressions with current values (parallel)
                                 const stepsToEval = [];
                                 const stepIndices = [];
                                 for (let i = 0; i < stepExprs.length; i++) {
@@ -701,14 +772,17 @@ function evalK(expr, env, k) {
                     if (i >= elems.length)
                         return k({ tag: 'void' });
                     const clause = elems[i];
-                    if (clause.tag !== 'list' || clause.elements.length < 2)
+                    if (clause.tag !== 'list' || clause.elements.length < 1)
                         throw posError('cond: bad clause', expr.pos);
                     if (clause.elements[0].tag === 'symbol' && clause.elements[0].value === 'else') {
                         return evalSeqArr(clause.elements.slice(1), env, k);
                     }
                     return evalK(clause.elements[0], env, test => {
-                        if (isTruthy(test))
+                        if (isTruthy(test)) {
+                            if (clause.elements.length === 1)
+                                return k(test);
                             return evalSeqArr(clause.elements.slice(1), env, k);
+                        }
                         return evalClauses(i + 1);
                     });
                 };
@@ -786,7 +860,6 @@ function evalK(expr, env, k) {
                 });
             }
             case 'define-record-type': {
-                // (define-record-type <name> (constructor field ...) predicate (field accessor) ...)
                 if (elems.length < 4)
                     throw posError('define-record-type: bad syntax', expr.pos);
                 const rtName = elems[1];
@@ -806,7 +879,6 @@ function evalK(expr, env, k) {
                     throw posError('define-record-type: predicate must be symbol', expr.pos);
                 const predName = predSym.value;
                 const typeId = recordTypeCounter++;
-                // Parse field accessors
                 const accessors = [];
                 for (let fi = 4; fi < elems.length; fi++) {
                     const fspec = elems[fi];
@@ -815,7 +887,6 @@ function evalK(expr, env, k) {
                         throw posError('define-record-type: bad field spec', expr.pos);
                     accessors.push({ field: fspec.elements[0].value, accessor: fspec.elements[1].value });
                 }
-                // Define constructor
                 env.set(ctorName, { tag: 'builtin', name: ctorName, fn: (args, p) => {
                         if (args.length !== ctorFields.length)
                             throw posError(`${ctorName}: wrong number of arguments`, p);
@@ -824,13 +895,11 @@ function evalK(expr, env, k) {
                             fields.set(ctorFields[i], args[i]);
                         return { tag: 'record', typeId, typeName: rtName.value, fields };
                     } });
-                // Define predicate
                 env.set(predName, { tag: 'builtin', name: predName, fn: (args, p) => {
                         if (args.length !== 1)
                             throw posError(`${predName}: need 1 argument`, p);
                         return { tag: 'boolean', value: args[0].tag === 'record' && args[0].typeId === typeId };
                     } });
-                // Define accessors
                 for (const { field, accessor } of accessors) {
                     env.set(accessor, { tag: 'builtin', name: accessor, fn: (args, p) => {
                             if (args.length !== 1)
@@ -988,27 +1057,46 @@ function applyK(proc, args, k, pos) {
             throw posError('map: need at least 2 arguments', pos);
         const fn = args[0];
         const lists = args.slice(1);
-        for (const l of lists)
-            if (l.tag !== 'list')
-                throw posError('map: expected list', pos);
-        const len = lists[0].elements.length;
+        // Iterate through pair chains
+        let cursors = lists.slice();
         const results = [];
-        const mapLoop = (i) => {
-            if (i >= len)
-                return k({ tag: 'list', elements: results });
-            const fnArgs = lists.map(l => l.elements[i]);
-            return applyK(fn, fnArgs, val => { results.push(val); return mapLoop(i + 1); }, pos);
+        const mapLoop = () => {
+            // Check if any list is exhausted
+            if (cursors.some(c => isNull(c)))
+                return k(arrayToList(results));
+            for (const c of cursors)
+                if (c.tag !== 'pair')
+                    throw posError('map: expected list', pos);
+            const fnArgs = cursors.map(c => c.car);
+            cursors = cursors.map(c => c.cdr);
+            return applyK(fn, fnArgs, val => { results.push(val); return mapLoop(); }, pos);
         };
-        return mapLoop(0);
+        return mapLoop();
+    }
+    if (proc.tag === 'builtin' && proc.name === 'for-each') {
+        if (args.length < 2)
+            throw posError('for-each: need at least 2 arguments', pos);
+        const fn = args[0];
+        const lists = args.slice(1);
+        let cursors = lists.slice();
+        const forEachLoop = () => {
+            if (cursors.some(c => isNull(c)))
+                return k({ tag: 'void' });
+            for (const c of cursors)
+                if (c.tag !== 'pair')
+                    throw posError('for-each: expected list', pos);
+            const fnArgs = cursors.map(c => c.car);
+            cursors = cursors.map(c => c.cdr);
+            return applyK(fn, fnArgs, _ => forEachLoop(), pos);
+        };
+        return forEachLoop();
     }
     if (proc.tag === 'builtin' && proc.name === 'apply') {
         if (args.length < 2)
             throw posError('apply: need at least 2 arguments', pos);
         const fn = args[0];
         const lastArg = args[args.length - 1];
-        if (lastArg.tag !== 'list')
-            throw posError('apply: last argument must be a list', pos);
-        const allArgs = [...args.slice(1, -1), ...lastArg.elements];
+        const allArgs = [...args.slice(1, -1), ...listToArray(lastArg)];
         return applyK(fn, allArgs, k, pos);
     }
     if (proc.tag === 'lambda') {
@@ -1024,7 +1112,7 @@ function applyK(proc, args, k, pos) {
         for (let i = 0; i < proc.params.length; i++)
             callEnv.set(proc.params[i], args[i]);
         if (proc.restParam)
-            callEnv.set(proc.restParam, { tag: 'list', elements: args.slice(proc.params.length) });
+            callEnv.set(proc.restParam, arrayToList(args.slice(proc.params.length)));
         return bounce(() => evalSeqArr(proc.body, callEnv, k));
     }
     if (proc.tag === 'builtin') {
@@ -1034,6 +1122,8 @@ function applyK(proc, args, k, pos) {
 }
 // ── Helpers ────────────────────────────────────────────────────────
 function schemeEqv(a, b) {
+    if (a === b)
+        return true;
     if (a.tag !== b.tag) {
         if ((a.tag === 'number' || a.tag === 'rational') && (b.tag === 'number' || b.tag === 'rational')) {
             return numericFloat(a, 'eqv?') === numericFloat(b, 'eqv?');
@@ -1047,10 +1137,22 @@ function schemeEqv(a, b) {
         case 'symbol': return a.value === b.value;
         case 'char': return a.value === b.value;
         case 'void': return true;
-        default: return a === b;
+        default: return false;
     }
 }
-function schemeEqual(a, b) {
+function schemeEqual(a, b, visited) {
+    if (a === b)
+        return true;
+    if (a.tag === 'pair' && b.tag === 'pair') {
+        if (!visited)
+            visited = new Set();
+        // Track visited pairs by identity to handle cycles
+        const key = a;
+        if (visited.has(key))
+            return true; // assume equal to break cycle
+        visited.add(key);
+        return schemeEqual(a.car, b.car, visited) && schemeEqual(a.cdr, b.cdr, visited);
+    }
     if (a.tag !== b.tag) {
         if ((a.tag === 'number' || a.tag === 'rational') && (b.tag === 'number' || b.tag === 'rational')) {
             return numericFloat(a, 'equal?') === numericFloat(b, 'equal?');
@@ -1069,13 +1171,13 @@ function schemeEqual(a, b) {
             const bList = b;
             if (a.elements.length !== bList.elements.length)
                 return false;
-            return a.elements.every((e, i) => schemeEqual(e, bList.elements[i]));
+            return a.elements.every((e, i) => schemeEqual(e, bList.elements[i], visited));
         }
         case 'vector': {
             const bVec = b;
             if (a.elements.length !== bVec.elements.length)
                 return false;
-            return a.elements.every((e, i) => schemeEqual(e, bVec.elements[i]));
+            return a.elements.every((e, i) => schemeEqual(e, bVec.elements[i], visited));
         }
         default: return a === b;
     }
@@ -1099,7 +1201,7 @@ function makeGlobalEnv(output = []) {
     // call/cc
     env.set('call/cc', { tag: 'callcc' });
     env.set('call-with-current-continuation', { tag: 'callcc' });
-    // apply (handled specially in applyK, but needs a value in the env)
+    // CPS-aware builtins (handled in applyK, but need env entries)
     env.set('apply', { tag: 'builtin', name: 'apply', fn: () => { throw new EvalError('internal: apply handled by applyK'); } });
     env.set('dynamic-wind', { tag: 'builtin', name: 'dynamic-wind', fn: () => { throw new EvalError('internal: dynamic-wind handled by applyK'); } });
     env.set('raise', { tag: 'builtin', name: 'raise', fn: () => { throw new EvalError('internal: raise handled by applyK'); } });
@@ -1110,6 +1212,9 @@ function makeGlobalEnv(output = []) {
             return { tag: 'values', elements: args };
         } });
     env.set('call-with-values', { tag: 'builtin', name: 'call-with-values', fn: () => { throw new EvalError('internal: call-with-values handled by applyK'); } });
+    env.set('map', { tag: 'builtin', name: 'map', fn: () => { throw new EvalError('internal: map handled by applyK'); } });
+    env.set('for-each', { tag: 'builtin', name: 'for-each', fn: () => { throw new EvalError('internal: for-each handled by applyK'); } });
+    // Arithmetic
     defBuiltin('+', (args, p) => {
         for (const a of args)
             if (!isNumericVal(a))
@@ -1210,65 +1315,146 @@ function makeGlobalEnv(output = []) {
         throw posError('>=: need 2 arguments', p); return { tag: 'boolean', value: numericFloat(args[0], '>=', p) >= numericFloat(args[1], '>=', p) }; });
     defBuiltin('not', (args, p) => { if (args.length !== 1)
         throw posError('not: need 1 argument', p); return { tag: 'boolean', value: !isTruthy(args[0]) }; });
-    // List operations
+    // Pair / List operations
     defBuiltin('cons', (args, p) => {
         if (args.length !== 2)
             throw posError('cons: need 2 arguments', p);
-        const cdr = args[1];
-        if (cdr.tag === 'list')
-            return { tag: 'list', elements: [args[0], ...cdr.elements] };
-        return { tag: 'list', elements: [args[0], { tag: 'symbol', value: '.' }, cdr] };
+        return makePair(args[0], args[1]);
     });
     defBuiltin('car', (args, p) => {
         if (args.length !== 1)
             throw posError('car: need 1 argument', p);
-        if (args[0].tag !== 'list' || args[0].elements.length === 0)
+        if (args[0].tag !== 'pair')
             throw posError('car: not a pair', p);
-        return args[0].elements[0];
+        return args[0].car;
     });
     defBuiltin('cdr', (args, p) => {
         if (args.length !== 1)
             throw posError('cdr: need 1 argument', p);
-        if (args[0].tag !== 'list' || args[0].elements.length === 0)
+        if (args[0].tag !== 'pair')
             throw posError('cdr: not a pair', p);
-        const elems = args[0].elements;
-        // Dotted pair: (a . b) stored as [a, '.', b]
-        if (elems.length === 3 && elems[1].tag === 'symbol' && elems[1].value === '.') {
-            return elems[2];
+        return args[0].cdr;
+    });
+    defBuiltin('caar', (args, p) => {
+        if (args.length !== 1)
+            throw posError('caar: need 1 argument', p);
+        if (args[0].tag !== 'pair')
+            throw posError('caar: not a pair', p);
+        const inner = args[0].car;
+        if (inner.tag !== 'pair')
+            throw posError('caar: not a pair', p);
+        return inner.car;
+    });
+    defBuiltin('cadr', (args, p) => {
+        if (args.length !== 1)
+            throw posError('cadr: need 1 argument', p);
+        if (args[0].tag !== 'pair')
+            throw posError('cadr: not a pair', p);
+        const inner = args[0].cdr;
+        if (inner.tag !== 'pair')
+            throw posError('cadr: not a pair', p);
+        return inner.car;
+    });
+    defBuiltin('cdar', (args, p) => {
+        if (args.length !== 1)
+            throw posError('cdar: need 1 argument', p);
+        if (args[0].tag !== 'pair')
+            throw posError('cdar: not a pair', p);
+        const inner = args[0].car;
+        if (inner.tag !== 'pair')
+            throw posError('cdar: not a pair', p);
+        return inner.cdr;
+    });
+    defBuiltin('cddr', (args, p) => {
+        if (args.length !== 1)
+            throw posError('cddr: need 1 argument', p);
+        if (args[0].tag !== 'pair')
+            throw posError('cddr: not a pair', p);
+        const inner = args[0].cdr;
+        if (inner.tag !== 'pair')
+            throw posError('cddr: not a pair', p);
+        return inner.cdr;
+    });
+    defBuiltin('caddr', (args, p) => {
+        if (args.length !== 1)
+            throw posError('caddr: need 1 argument', p);
+        if (args[0].tag !== 'pair')
+            throw posError('caddr: not a pair', p);
+        const d = args[0].cdr;
+        if (d.tag !== 'pair')
+            throw posError('caddr: not a pair', p);
+        const dd = d.cdr;
+        if (dd.tag !== 'pair')
+            throw posError('caddr: not a pair', p);
+        return dd.car;
+    });
+    defBuiltin('cadddr', (args, p) => {
+        if (args.length !== 1)
+            throw posError('cadddr: need 1 argument', p);
+        if (args[0].tag !== 'pair')
+            throw posError('cadddr: not a pair', p);
+        let cur = args[0];
+        for (let i = 0; i < 3; i++) {
+            cur = cur.cdr;
+            if (cur.tag !== 'pair')
+                throw posError('cadddr: not a pair', p);
         }
-        // Dotted list with more elements: (a b . c) stored as [a, b, '.', c]
-        const penult = elems[elems.length - 2];
-        if (elems.length >= 4 && penult.tag === 'symbol' && penult.value === '.') {
-            return { tag: 'list', elements: elems.slice(1) };
-        }
-        return { tag: 'list', elements: elems.slice(1) };
+        return cur.car;
+    });
+    defBuiltin('set-car!', (args, p) => {
+        if (args.length !== 2)
+            throw posError('set-car!: need 2 arguments', p);
+        if (args[0].tag !== 'pair')
+            throw posError('set-car!: not a pair', p);
+        args[0].car = args[1];
+        return { tag: 'void' };
+    });
+    defBuiltin('set-cdr!', (args, p) => {
+        if (args.length !== 2)
+            throw posError('set-cdr!: need 2 arguments', p);
+        if (args[0].tag !== 'pair')
+            throw posError('set-cdr!: not a pair', p);
+        args[0].cdr = args[1];
+        return { tag: 'void' };
     });
     defBuiltin('null?', (args, p) => {
         if (args.length !== 1)
             throw posError('null?: need 1 argument', p);
-        return { tag: 'boolean', value: args[0].tag === 'list' && args[0].elements.length === 0 };
+        return { tag: 'boolean', value: isNull(args[0]) };
     });
     defBuiltin('list', args => {
-        return { tag: 'list', elements: args };
+        return arrayToList(args);
     });
     defBuiltin('length', (args, p) => {
-        if (args.length !== 1 || args[0].tag !== 'list')
-            throw posError('length: need a list', p);
-        return { tag: 'number', value: args[0].elements.length };
+        if (args.length !== 1)
+            throw posError('length: need 1 argument', p);
+        return { tag: 'number', value: listLength(args[0]) };
     });
-    defBuiltin('append', (args, p) => {
-        const result = [];
-        for (const a of args) {
-            if (a.tag !== 'list')
-                throw posError('append: not a list', p);
-            result.push(...a.elements);
+    defBuiltin('append', (args, _p) => {
+        if (args.length === 0)
+            return EMPTY_LIST;
+        if (args.length === 1)
+            return args[0];
+        // Copy all but last, chain onto last
+        let result = args[args.length - 1];
+        for (let i = args.length - 2; i >= 0; i--) {
+            const elems = listToArray(args[i]);
+            for (let j = elems.length - 1; j >= 0; j--) {
+                result = makePair(elems[j], result);
+            }
         }
-        return { tag: 'list', elements: result };
+        return result;
     });
     defBuiltin('reverse', (args, p) => {
-        if (args.length !== 1 || args[0].tag !== 'list')
-            throw posError('reverse: need a list', p);
-        return { tag: 'list', elements: [...args[0].elements].reverse() };
+        if (args.length !== 1)
+            throw posError('reverse: need 1 argument', p);
+        let result = EMPTY_LIST;
+        let cur = args[0];
+        while (cur.tag === 'pair') {
+            result = makePair(cur.car, result);
+            cur = cur.cdr;
+        }
+        return result;
     });
     // Type predicates
     defBuiltin('number?', (args, p) => { if (args.length !== 1)
@@ -1278,7 +1464,7 @@ function makeGlobalEnv(output = []) {
     defBuiltin('boolean?', (args, p) => { if (args.length !== 1)
         throw posError('boolean?: need 1 argument', p); return { tag: 'boolean', value: args[0].tag === 'boolean' }; });
     defBuiltin('pair?', (args, p) => { if (args.length !== 1)
-        throw posError('pair?: need 1 argument', p); return { tag: 'boolean', value: args[0].tag === 'list' && args[0].elements.length > 0 }; });
+        throw posError('pair?: need 1 argument', p); return { tag: 'boolean', value: args[0].tag === 'pair' }; });
     defBuiltin('symbol?', (args, p) => { if (args.length !== 1)
         throw posError('symbol?: need 1 argument', p); return { tag: 'boolean', value: args[0].tag === 'symbol' }; });
     defBuiltin('char?', (args, p) => { if (args.length !== 1)
@@ -1390,18 +1576,18 @@ function makeGlobalEnv(output = []) {
         for (const ch of args[0].value) {
             chars.push({ tag: 'char', value: ch });
         }
-        return { tag: 'list', elements: chars };
+        return arrayToList(chars);
     });
     defBuiltin('list->string', (args, p) => {
         if (args.length !== 1)
             throw posError('list->string: need 1 argument', p);
-        if (args[0].tag !== 'list')
-            throw posError('list->string: expected list', p);
         let s = '';
-        for (const item of args[0].elements) {
-            if (item.tag !== 'char')
+        let cur = args[0];
+        while (cur.tag === 'pair') {
+            if (cur.car.tag !== 'char')
                 throw posError('list->string: expected list of chars', p);
-            s += item.value;
+            s += cur.car.value;
+            cur = cur.cdr;
         }
         return { tag: 'string', value: s };
     });
@@ -1425,11 +1611,29 @@ function makeGlobalEnv(output = []) {
             throw posError('string-copy: expected string', p);
         return { tag: 'string', value: args[0].value, mutable: true };
     });
-    // eq? / equal?
+    defBuiltin('make-string', (args, p) => {
+        if (args.length < 1 || args.length > 2)
+            throw posError('make-string: need 1-2 arguments', p);
+        const n = expectNumber(args[0], 'make-string', p);
+        const ch = args.length === 2 ? expectChar(args[1], 'make-string', p) : ' ';
+        return { tag: 'string', value: ch.repeat(n), mutable: true };
+    });
+    defBuiltin('string', (args, p) => {
+        let s = '';
+        for (const a of args) {
+            if (a.tag !== 'char')
+                throw posError('string: expected char', p);
+            s += a.value;
+        }
+        return { tag: 'string', value: s };
+    });
+    // eq? / eqv? / equal?
     defBuiltin('eq?', (args, p) => {
         if (args.length !== 2)
             throw posError('eq?: need 2 arguments', p);
         const [a, b] = args;
+        if (a === b)
+            return { tag: 'boolean', value: true };
         if (a.tag !== b.tag)
             return { tag: 'boolean', value: false };
         switch (a.tag) {
@@ -1438,7 +1642,7 @@ function makeGlobalEnv(output = []) {
             case 'symbol': return { tag: 'boolean', value: a.value === b.value };
             case 'char': return { tag: 'boolean', value: a.value === b.value };
             case 'void': return { tag: 'boolean', value: true };
-            default: return { tag: 'boolean', value: a === b };
+            default: return { tag: 'boolean', value: false };
         }
     });
     defBuiltin('equal?', (args, p) => {
@@ -1501,14 +1705,12 @@ function makeGlobalEnv(output = []) {
             throw posError('vector->list: need 1 argument', p);
         if (args[0].tag !== 'vector')
             throw posError('vector->list: expected vector', p);
-        return { tag: 'list', elements: [...args[0].elements] };
+        return arrayToList([...args[0].elements]);
     });
     defBuiltin('list->vector', (args, p) => {
         if (args.length !== 1)
             throw posError('list->vector: need 1 argument', p);
-        if (args[0].tag !== 'list')
-            throw posError('list->vector: expected list', p);
-        return { tag: 'vector', elements: [...args[0].elements] };
+        return { tag: 'vector', elements: listToArray(args[0]) };
     });
     // error
     defBuiltin('error', (args, p) => {
@@ -1571,6 +1773,34 @@ function makeGlobalEnv(output = []) {
         const exp = expectNumber(args[1], 'expt', p);
         return { tag: 'number', value: Math.pow(base, exp) };
     });
+    defBuiltin('gcd', (args, p) => {
+        if (args.length === 0)
+            return { tag: 'number', value: 0 };
+        let result = Math.abs(expectNumber(args[0], 'gcd', p));
+        for (let i = 1; i < args.length; i++)
+            result = gcd(result, Math.abs(expectNumber(args[i], 'gcd', p)));
+        return { tag: 'number', value: result };
+    });
+    defBuiltin('lcm', (args, p) => {
+        if (args.length === 0)
+            return { tag: 'number', value: 1 };
+        let result = Math.abs(expectNumber(args[0], 'lcm', p));
+        for (let i = 1; i < args.length; i++) {
+            const b = Math.abs(expectNumber(args[i], 'lcm', p));
+            result = result === 0 && b === 0 ? 0 : Math.abs(result * b) / gcd(result, b);
+        }
+        return { tag: 'number', value: result };
+    });
+    defBuiltin('truncate', (args, p) => {
+        if (args.length !== 1)
+            throw posError('truncate: need 1 argument', p);
+        return { tag: 'number', value: Math.trunc(expectNumber(args[0], 'truncate', p)) };
+    });
+    defBuiltin('round', (args, p) => {
+        if (args.length !== 1)
+            throw posError('round: need 1 argument', p);
+        return { tag: 'number', value: Math.round(expectNumber(args[0], 'round', p)) };
+    });
     // Numeric predicates
     defBuiltin('zero?', (args, p) => { if (args.length !== 1)
         throw posError('zero?: need 1 argument', p); return { tag: 'boolean', value: expectNumber(args[0], 'zero?', p) === 0 }; });
@@ -1621,10 +1851,8 @@ function makeGlobalEnv(output = []) {
             throw posError('inexact->exact: need 1 argument', p);
         const v = args[0];
         const f = numericFloat(v, 'inexact->exact', p);
-        // Convert float to rational via continued fraction approximation
         if (Number.isInteger(f))
             return { tag: 'number', value: f };
-        // Use a simple approach: multiply by power of 2 to get integer ratio
         const eps = 1e-10;
         let bestNum = Math.round(f), bestDen = 1;
         for (let d = 1; d <= 1000000; d++) {
@@ -1661,48 +1889,135 @@ function makeGlobalEnv(output = []) {
     defBuiltin('list-ref', (args, p) => {
         if (args.length !== 2)
             throw posError('list-ref: need 2 arguments', p);
-        if (args[0].tag !== 'list')
-            throw posError('list-ref: expected list', p);
-        const idx = expectNumber(args[1], 'list-ref', p);
-        if (idx < 0 || idx >= args[0].elements.length)
+        let idx = expectNumber(args[1], 'list-ref', p);
+        let cur = args[0];
+        while (idx > 0 && cur.tag === 'pair') {
+            cur = cur.cdr;
+            idx--;
+        }
+        if (cur.tag !== 'pair')
             throw posError('list-ref: index out of range', p);
-        return args[0].elements[idx];
+        return cur.car;
     });
     defBuiltin('list-tail', (args, p) => {
         if (args.length !== 2)
             throw posError('list-tail: need 2 arguments', p);
-        if (args[0].tag !== 'list')
-            throw posError('list-tail: expected list', p);
-        const idx = expectNumber(args[1], 'list-tail', p);
-        return { tag: 'list', elements: args[0].elements.slice(idx) };
+        let idx = expectNumber(args[1], 'list-tail', p);
+        let cur = args[0];
+        while (idx > 0) {
+            if (cur.tag !== 'pair')
+                throw posError('list-tail: index out of range', p);
+            cur = cur.cdr;
+            idx--;
+        }
+        return cur;
     });
     defBuiltin('list?', (args, p) => {
         if (args.length !== 1)
             throw posError('list?: need 1 argument', p);
         const v = args[0];
-        if (v.tag !== 'list')
+        if (isNull(v))
+            return { tag: 'boolean', value: true };
+        if (v.tag !== 'pair')
             return { tag: 'boolean', value: false };
-        for (const e of v.elements) {
-            if (e.tag === 'symbol' && e.value === '.')
+        // Floyd's tortoise and hare for cycle detection
+        let slow = v;
+        let fast = v;
+        while (true) {
+            if (fast.tag !== 'pair')
+                return { tag: 'boolean', value: isNull(fast) };
+            fast = fast.cdr;
+            if (fast.tag !== 'pair')
+                return { tag: 'boolean', value: isNull(fast) };
+            fast = fast.cdr;
+            slow = slow.cdr;
+            if (slow === fast)
                 return { tag: 'boolean', value: false };
         }
-        return { tag: 'boolean', value: true };
     });
     defBuiltin('assoc', (args, p) => {
         if (args.length !== 2)
             throw posError('assoc: need 2 arguments', p);
         const key = args[0];
-        const alist = args[1];
-        if (alist.tag !== 'list')
-            throw posError('assoc: expected list', p);
-        for (const entry of alist.elements) {
-            if (entry.tag === 'list' && entry.elements.length >= 1 && schemeEqual(key, entry.elements[0]))
+        let cur = args[1];
+        while (cur.tag === 'pair') {
+            const entry = cur.car;
+            if (entry.tag === 'pair' && schemeEqual(key, entry.car))
                 return entry;
+            cur = cur.cdr;
         }
         return { tag: 'boolean', value: false };
     });
-    // map (CPS-aware, handled in applyK)
-    env.set('map', { tag: 'builtin', name: 'map', fn: () => { throw new EvalError('internal: map handled by applyK'); } });
+    defBuiltin('assv', (args, p) => {
+        if (args.length !== 2)
+            throw posError('assv: need 2 arguments', p);
+        const key = args[0];
+        let cur = args[1];
+        while (cur.tag === 'pair') {
+            const entry = cur.car;
+            if (entry.tag === 'pair' && schemeEqv(key, entry.car))
+                return entry;
+            cur = cur.cdr;
+        }
+        return { tag: 'boolean', value: false };
+    });
+    defBuiltin('member', (args, p) => {
+        if (args.length !== 2)
+            throw posError('member: need 2 arguments', p);
+        const obj = args[0];
+        let cur = args[1];
+        while (cur.tag === 'pair') {
+            if (schemeEqual(obj, cur.car))
+                return cur;
+            cur = cur.cdr;
+        }
+        return { tag: 'boolean', value: false };
+    });
+    defBuiltin('memq', (args, p) => {
+        if (args.length !== 2)
+            throw posError('memq: need 2 arguments', p);
+        const obj = args[0];
+        let cur = args[1];
+        while (cur.tag === 'pair') {
+            // eq? semantics
+            if (obj === cur.car)
+                return cur;
+            if (obj.tag === cur.car.tag) {
+                switch (obj.tag) {
+                    case 'number':
+                        if (obj.value === cur.car.value)
+                            return cur;
+                        break;
+                    case 'boolean':
+                        if (obj.value === cur.car.value)
+                            return cur;
+                        break;
+                    case 'symbol':
+                        if (obj.value === cur.car.value)
+                            return cur;
+                        break;
+                    case 'char':
+                        if (obj.value === cur.car.value)
+                            return cur;
+                        break;
+                }
+            }
+            cur = cur.cdr;
+        }
+        return { tag: 'boolean', value: false };
+    });
+    defBuiltin('memv', (args, p) => {
+        if (args.length !== 2)
+            throw posError('memv: need 2 arguments', p);
+        const obj = args[0];
+        let cur = args[1];
+        while (cur.tag === 'pair') {
+            if (schemeEqv(obj, cur.car))
+                return cur;
+            cur = cur.cdr;
+        }
+        return { tag: 'boolean', value: false };
+    });
     // Character operations
     defBuiltin('char-alphabetic?', (args, p) => { if (args.length !== 1)
         throw posError('char-alphabetic?: need 1 argument', p); const c = expectChar(args[0], 'char-alphabetic?', p); return { tag: 'boolean', value: /^[a-zA-Z]$/.test(c) }; });
@@ -1721,6 +2036,12 @@ function makeGlobalEnv(output = []) {
         throw posError('string=?: need 2 arguments', p); return { tag: 'boolean', value: expectString(args[0], 'string=?', p) === expectString(args[1], 'string=?', p) }; });
     defBuiltin('string<?', (args, p) => { if (args.length !== 2)
         throw posError('string<?: need 2 arguments', p); return { tag: 'boolean', value: expectString(args[0], 'string<?', p) < expectString(args[1], 'string<?', p) }; });
+    defBuiltin('string>?', (args, p) => { if (args.length !== 2)
+        throw posError('string>?: need 2 arguments', p); return { tag: 'boolean', value: expectString(args[0], 'string>?', p) > expectString(args[1], 'string>?', p) }; });
+    defBuiltin('string<=?', (args, p) => { if (args.length !== 2)
+        throw posError('string<=?: need 2 arguments', p); return { tag: 'boolean', value: expectString(args[0], 'string<=?', p) <= expectString(args[1], 'string<=?', p) }; });
+    defBuiltin('string>=?', (args, p) => { if (args.length !== 2)
+        throw posError('string>=?: need 2 arguments', p); return { tag: 'boolean', value: expectString(args[0], 'string>=?', p) >= expectString(args[1], 'string>=?', p) }; });
     defBuiltin('string-ci=?', (args, p) => { if (args.length !== 2)
         throw posError('string-ci=?: need 2 arguments', p); return { tag: 'boolean', value: expectString(args[0], 'string-ci=?', p).toLowerCase() === expectString(args[1], 'string-ci=?', p).toLowerCase() }; });
     defBuiltin('string-upcase', (args, p) => { if (args.length !== 1)
@@ -1730,7 +2051,7 @@ function makeGlobalEnv(output = []) {
     return env;
 }
 // ── Display ────────────────────────────────────────────────────────
-function displayVal(val) {
+function displayVal(val, seen) {
     switch (val.tag) {
         case 'number': {
             if (val.exact === false && Number.isInteger(val.value))
@@ -1742,28 +2063,76 @@ function displayVal(val) {
         case 'string': return `"${val.value}"`;
         case 'symbol': return val.value;
         case 'char': return `#\\${val.value === ' ' ? 'space' : val.value === '\n' ? 'newline' : val.value}`;
-        case 'list': return `(${val.elements.map(displayVal).join(' ')})`;
-        case 'vector': return `#(${val.elements.map(displayVal).join(' ')})`;
+        case 'list': return `(${val.elements.map(e => displayVal(e, seen)).join(' ')})`;
+        case 'pair': {
+            if (!seen)
+                seen = new Set();
+            if (seen.has(val))
+                return '(...)';
+            seen.add(val);
+            let result = '(' + displayVal(val.car, seen);
+            let cur = val.cdr;
+            while (cur.tag === 'pair') {
+                if (seen.has(cur)) {
+                    result += ' ...';
+                    cur = EMPTY_LIST;
+                    break;
+                }
+                seen.add(cur);
+                result += ' ' + displayVal(cur.car, seen);
+                cur = cur.cdr;
+            }
+            if (!isNull(cur)) {
+                result += ' . ' + displayVal(cur, seen);
+            }
+            result += ')';
+            return result;
+        }
+        case 'vector': return `#(${val.elements.map(e => displayVal(e, seen)).join(' ')})`;
         case 'void': return '';
         case 'lambda': return '#<procedure>';
         case 'builtin': return '#<procedure>';
         case 'continuation': return '#<procedure>';
         case 'callcc': return '#<procedure>';
         case 'macro': return '#<macro>';
-        case 'values': return val.elements.map(displayVal).join('\n');
+        case 'values': return val.elements.map(e => displayVal(e, seen)).join('\n');
         case 'record': return `#<${val.typeName}>`;
     }
 }
 function writeVal(val) {
     return displayVal(val);
 }
-function displayForDisplay(val) {
+function displayForDisplay(val, seen) {
     switch (val.tag) {
         case 'string': return val.value;
-        case 'list': return `(${val.elements.map(displayForDisplay).join(' ')})`;
-        case 'vector': return `#(${val.elements.map(displayForDisplay).join(' ')})`;
+        case 'pair': {
+            if (!seen)
+                seen = new Set();
+            if (seen.has(val))
+                return '(...)';
+            seen.add(val);
+            let result = '(' + displayForDisplay(val.car, seen);
+            let cur = val.cdr;
+            while (cur.tag === 'pair') {
+                if (seen.has(cur)) {
+                    result += ' ...';
+                    cur = EMPTY_LIST;
+                    break;
+                }
+                seen.add(cur);
+                result += ' ' + displayForDisplay(cur.car, seen);
+                cur = cur.cdr;
+            }
+            if (!isNull(cur)) {
+                result += ' . ' + displayForDisplay(cur, seen);
+            }
+            result += ')';
+            return result;
+        }
+        case 'list': return `(${val.elements.map(e => displayForDisplay(e, seen)).join(' ')})`;
+        case 'vector': return `#(${val.elements.map(e => displayForDisplay(e, seen)).join(' ')})`;
         case 'char': return val.value;
-        default: return displayVal(val);
+        default: return displayVal(val, seen);
     }
 }
 // ── Public API ─────────────────────────────────────────────────────
