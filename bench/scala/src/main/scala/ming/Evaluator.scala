@@ -6,7 +6,7 @@ import EvalHelpers.{evalError, evalLambda, evalQuote, parseParams, valueToList}
 import scala.compiletime.uninitialized
 
 /** CPS interpreter with trampoline for tail calls and first-class continuations. */
-object Evaluator extends EvalForms with EvalWind:
+object Evaluator extends EvalForms with EvalWind with EvalExceptions:
   type K = Value => Bounce
 
   // Depth counter for amortized trampolining
@@ -19,6 +19,10 @@ object Evaluator extends EvalForms with EvalWind:
   // dynamic-wind support
   case class WindEntry(inThunk: Value, outThunk: Value)
   protected var windStack: List[WindEntry] = Nil
+
+  // exception handler stack for raise/guard/with-exception-handler
+  case class HandlerEntry(handler: Value => Bounce, windAtInstall: List[WindEntry])
+  protected var handlerStack: List[HandlerEntry] = Nil
 
   // Current body context, captured by call/cc for body-restart
   private var bodyRemaining: List[Expr] = Nil
@@ -57,6 +61,7 @@ object Evaluator extends EvalForms with EvalWind:
     depth = 0
     pendingReturns.clear()
     windStack = Nil
+    handlerStack = Nil
     val exprs = Parser.parseAll(input)
     if exprs.isEmpty then throw new EvalError("empty input")
     val env = makeGlobalEnv()
@@ -66,6 +71,7 @@ object Evaluator extends EvalForms with EvalWind:
     depth = 0
     pendingReturns.clear()
     windStack = Nil
+    handlerStack = Nil
     val exprs = Parser.parseAll(input)
     if exprs.isEmpty then throw new EvalError("empty input")
     val output = new StringBuilder
@@ -82,6 +88,8 @@ object Evaluator extends EvalForms with EvalWind:
     env.define("apply", BuiltinVal("apply", dummy))
     env.define("map", BuiltinVal("map", dummy))
     env.define("dynamic-wind", BuiltinVal("dynamic-wind", dummy))
+    env.define("raise", BuiltinVal("raise", dummy))
+    env.define("with-exception-handler", BuiltinVal("with-exception-handler", dummy))
     env
 
   protected def evalBody(exprs: List[Expr], env: Env, k: K): Bounce =
@@ -162,6 +170,12 @@ object Evaluator extends EvalForms with EvalWind:
       case SList(Sym("and", _) :: args, _)       => evalAndCps(args, env, k)
       case SList(Sym("or", _) :: args, _)        => evalOrCps(args, env, k)
 
+      case SList(Sym("guard", _) :: args, pos) =>
+        args match
+          case SList(Sym(variable, _) :: clauses, _) :: body if body.nonEmpty =>
+            evalGuard(variable, clauses, body, env, pos, k)
+          case _ => evalError("guard: bad syntax", pos)
+
       case SList(Sym("define-syntax", _) :: Sym(name, _) :: SList(Sym("syntax-rules", _) :: srArgs, _) :: Nil, pos) =>
         val (literals, rules) = Macro.parseSyntaxRules(srArgs, pos)
         env.define(name, Value.MacroVal(literals, rules, env))
@@ -204,6 +218,14 @@ object Evaluator extends EvalForms with EvalWind:
 
       case BuiltinVal("apply", _) => applyBuiltinApply(values, pos, k)
       case BuiltinVal("map", _)   => applyBuiltinMap(values, pos, k)
+
+      case BuiltinVal("raise", _) =>
+        if values.length != 1 then evalError("raise: expected 1 argument", pos)
+        raiseException(values.head, pos)
+
+      case BuiltinVal("with-exception-handler", _) =>
+        if values.length != 2 then evalError("with-exception-handler: expected 2 arguments", pos)
+        evalWithExceptionHandler(values(0), values(1), pos, k)
 
       case BuiltinVal(name, fn) =>
         try k(fn(values))
