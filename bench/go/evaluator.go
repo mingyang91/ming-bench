@@ -30,6 +30,8 @@ func TopEnv() *Env {
 		return nil, &schemeRaiseError{value: args[0]}
 	}})
 	env.Set("with-exception-handler", &EnvBuiltinProc{Name: "with-exception-handler", Fn: builtinWithExceptionHandler})
+	env.Set("values", &BuiltinProc{Name: "values", Fn: builtinValues})
+	env.Set("call-with-values", &EnvBuiltinProc{Name: "call-with-values", Fn: builtinCallWithValues})
 	return env
 }
 
@@ -2817,6 +2819,37 @@ func builtinWithExceptionHandler(args []SchemeValue, callExpr *ListExpr, env *En
 		return nil, err
 	}
 	return result, nil
+}
+
+func builtinValues(args []SchemeValue, callExpr *ListExpr) (SchemeValue, error) {
+	if len(args) == 1 {
+		return args[0], nil
+	}
+	return &SchemeMultipleValues{Values: args}, nil
+}
+
+func builtinCallWithValues(args []SchemeValue, callExpr *ListExpr, env *Env) (SchemeValue, error) {
+	if len(args) != 2 {
+		line, col := callExpr.Pos()
+		return nil, &EvalError{Message: fmt.Sprintf("%d:%d: call-with-values: requires exactly 2 arguments", line, col)}
+	}
+	producer, consumer := args[0], args[1]
+
+	// Call producer with no arguments
+	result, err := applyFunc(producer, []SchemeValue{}, callExpr, env)
+	if err != nil {
+		return nil, err
+	}
+
+	// Unpack multiple values into consumer args
+	var consumerArgs []SchemeValue
+	if mv, ok := result.(*SchemeMultipleValues); ok {
+		consumerArgs = mv.Values
+	} else {
+		consumerArgs = []SchemeValue{result}
+	}
+
+	return applyFunc(consumer, consumerArgs, callExpr, env)
 }
 
 // evalGuard implements (guard (var clause...) body...)

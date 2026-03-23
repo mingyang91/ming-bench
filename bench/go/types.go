@@ -133,3 +133,15 @@ func (v *SchemeCallCC) String() string { return "#<procedure call/cc>" }
 type SchemeDynamicWind struct{}
 
 func (v *SchemeDynamicWind) String() string { return "#<procedure dynamic-wind>" }
+
+// SchemeMultipleValues wraps zero or more values returned by (values ...).
+type SchemeMultipleValues struct {
+	Values []SchemeValue
+}
+
+func (v *SchemeMultipleValues) String() string {
+	if len(v.Values) == 0 {
+		return ""
+	}
+	return v.Values[0].String()
+}
