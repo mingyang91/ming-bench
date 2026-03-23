@@ -80,6 +80,18 @@ object BuiltinsExtra:
       (
         "void",
         _ => VoidVal
+      ),
+      (
+        "syntax->datum",
+        args =>
+          if args.length != 1 then throw new EvalError("syntax->datum: expected 1 argument")
+          args.head
+      ),
+      (
+        "datum->syntax",
+        args =>
+          if args.length != 2 then throw new EvalError("datum->syntax: expected 2 arguments")
+          args(1)
       )
     )
 

@@ -43,6 +43,7 @@ enum Value:
   case VoidVal
   case ValuesVal(values: List[Value])
   case RecordVal(tag: String, fields: Array[Value])
+  case ProcMacroVal(transformer: Value, defEnv: Env)
 
   def display: String = this match
     case IntVal(n)             => n.toString
@@ -62,6 +63,7 @@ enum Value:
     case VoidVal               => "#<void>"
     case ValuesVal(_)          => "#<values>"
     case RecordVal(tag, _)     => s"#<record:$tag>"
+    case ProcMacroVal(_, _)    => "#<macro>"
 
   /** Display without quotes (for `display` builtin). */
   def displayNoQuotes: String = this match

@@ -61,6 +61,9 @@ object Parser:
         case '\'' =>
           result += Token("'", Pos(line, i - lineStart + 1))
           i += 1
+        case '#' if i + 1 < input.length && input(i + 1) == '\'' =>
+          result += Token("#'", Pos(line, i - lineStart + 1))
+          i += 2
         case '"' =>
           val col           = i - lineStart + 1
           val (tok, newPos) = scanString(input, i + 1)
@@ -87,6 +90,10 @@ object Parser:
         val (quoted, remaining) = parseOne(rest)
         val quoteExpr           = SList(Sym("quote", Some(pos)) :: quoted :: Nil, Some(pos))
         parseTokens(remaining, quoteExpr :: acc)
+      case Token("#'", pos) :: rest =>
+        val (quoted, remaining) = parseOne(rest)
+        val syntaxExpr          = SList(Sym("syntax", Some(pos)) :: quoted :: Nil, Some(pos))
+        parseTokens(remaining, syntaxExpr :: acc)
       case Token(text, pos) :: rest =>
         parseTokens(rest, parseAtom(text, pos) :: acc)
 
@@ -98,6 +105,9 @@ object Parser:
       case Token("'", pos) :: rest =>
         val (quoted, remaining) = parseOne(rest)
         (SList(Sym("quote", Some(pos)) :: quoted :: Nil, Some(pos)), remaining)
+      case Token("#'", pos) :: rest =>
+        val (quoted, remaining) = parseOne(rest)
+        (SList(Sym("syntax", Some(pos)) :: quoted :: Nil, Some(pos)), remaining)
       case Token(text, pos) :: rest =>
         (parseAtom(text, pos), rest)
 

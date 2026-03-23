@@ -6,12 +6,12 @@ import EvalHelpers.{evalError, evalLambda, evalQuote, parseParams, valueToList}
 import scala.compiletime.uninitialized
 
 /** CPS interpreter with trampoline for tail calls and first-class continuations. */
-object Evaluator extends EvalForms with EvalWind with EvalExceptions:
+object Evaluator extends EvalForms with EvalWind with EvalExceptions with EvalSyntaxCaseForms:
   type K = Value => Bounce
 
-  private var depth          = 0 // amortized trampolining
-  private val MaxDepth       = 128
-  private val pendingReturns = new java.util.IdentityHashMap[Expr, Value]()
+  private var depth            = 0 // amortized trampolining
+  private val MaxDepth         = 128
+  protected val pendingReturns = new java.util.IdentityHashMap[Expr, Value]()
 
   case class WindEntry(inThunk: Value, outThunk: Value)
   protected var windStack: List[WindEntry] = Nil
@@ -19,9 +19,13 @@ object Evaluator extends EvalForms with EvalWind with EvalExceptions:
   case class HandlerEntry(handler: Value => Bounce, windAtInstall: List[WindEntry])
   protected var handlerStack: List[HandlerEntry] = Nil
 
-  private var bodyRemaining: List[Expr] = Nil // call/cc body-restart context
-  private var bodyEnvRef: Env           = uninitialized
-  private var bodyK: K                  = uninitialized
+  protected var bodyRemaining: List[Expr] = Nil // call/cc body-restart context
+  protected var bodyEnvRef: Env           = uninitialized
+  protected var bodyK: K                  = uninitialized
+
+  // syntax-case: current bindings for the `syntax` form
+  protected var currentSyntaxBindings: Map[String, SyntaxCase.Binding] = Map.empty
+  protected var currentSyntaxEnvs: (Env, Env)                          = (Env(), Env())
 
   protected def trampoline(thunk: => Bounce): Bounce =
     depth += 1
@@ -100,196 +104,160 @@ object Evaluator extends EvalForms with EvalWind with EvalExceptions:
 
   protected def eval(expr: Expr, env: Env, k: K): Bounce =
     expr match
-      case Num(n, _)       => k(IntVal(n))
-      case Rat(n, d, _)    => k(Value.makeRational(n, d))
-      case Flt(d, _)       => k(FloatVal(d))
-      case Bool(b, _)      => k(BoolVal(b))
-      case Str(s, _)       => k(StrVal(s.toCharArray))
-      case Chr(c, _)       => k(CharVal(c))
-      case Sym(name, pos)  => k(env.lookup(name, pos))
-      case SList(Nil, pos) => evalError("empty application", pos)
-
-      case SList(Sym("if", _) :: args, pos) =>
-        args match
-          case cond :: thenB :: elseB :: Nil =>
-            eval(
-              cond,
-              env,
-              cv =>
-                if cv.isTruthy then tailEval(thenB, env, k)
-                else tailEval(elseB, env, k)
-            )
-          case cond :: thenB :: Nil =>
-            eval(
-              cond,
-              env,
-              cv =>
-                if cv.isTruthy then tailEval(thenB, env, k)
-                else k(VoidVal)
-            )
-          case _ => evalError("if: bad syntax", pos)
-
-      case SList(Sym("define", _) :: args, pos) =>
-        evalDefineCps(args, env, pos, k)
-
-      case SList(Sym("set!", _) :: args, pos) =>
-        args match
-          case Sym(name, _) :: valExpr :: Nil =>
-            eval(
-              valExpr,
-              env,
-              { v =>
-                env.set(name, v, pos); k(BoolVal(true))
-              }
-            )
-          case _ => evalError("set!: bad syntax", pos)
-
-      case SList(Sym("quote", _) :: args, pos) =>
-        k(evalQuote(args, pos))
-
-      case SList(Sym("lambda", _) :: args, pos) =>
-        k(evalLambda(args, env, pos))
-
+      case Num(n, _)                             => k(IntVal(n))
+      case Rat(n, d, _)                          => k(Value.makeRational(n, d))
+      case Flt(d, _)                             => k(FloatVal(d))
+      case Bool(b, _)                            => k(BoolVal(b))
+      case Str(s, _)                             => k(StrVal(s.toCharArray))
+      case Chr(c, _)                             => k(CharVal(c))
+      case Sym(name, pos)                        => k(env.lookup(name, pos))
+      case SList(Nil, pos)                       => evalError("empty application", pos)
+      case SList(Sym("if", _) :: args, pos)      => evalIf(args, env, pos, k)
+      case SList(Sym("define", _) :: args, pos)  => evalDefineCps(args, env, pos, k)
+      case SList(Sym("set!", _) :: args, pos)    => evalSetBang(args, env, pos, k)
+      case SList(Sym("quote", _) :: args, pos)   => k(evalQuote(args, pos))
+      case SList(Sym("lambda", _) :: args, pos)  => k(evalLambda(args, env, pos))
       case SList(Sym("let", _) :: args, pos)     => evalLetCps(args, env, pos, k)
       case SList(Sym("let*", _) :: args, pos)    => evalLetStarCps(args, env, pos, k)
       case SList(Sym("letrec", _) :: args, pos)  => evalLetrecCps(args, env, pos, k)
       case SList(Sym("letrec*", _) :: args, pos) => evalLetrecStarCps(args, env, pos, k)
-
       case SList(Sym("case", _) :: keyExpr :: clauses, pos) =>
         eval(keyExpr, env, keyVal => evalCaseCps(keyVal, clauses, env, pos, k))
-
-      case SList(Sym("do", _) :: args, pos) => evalDoCps(args, env, pos, k)
-
-      case SList(Sym("begin", _) :: args, pos) =>
-        if args.isEmpty then evalError("begin: empty", pos)
-        evalBody(args, env, k)
-
-      case SList(Sym("cond", _) :: clauses, pos) => evalCondCps(clauses, env, pos, k)
-      case SList(Sym("and", _) :: args, _)       => evalAndCps(args, env, k)
-      case SList(Sym("or", _) :: args, _)        => evalOrCps(args, env, k)
-
-      case SList(Sym("guard", _) :: args, pos) =>
-        args match
-          case SList(Sym(variable, _) :: clauses, _) :: body if body.nonEmpty =>
-            evalGuard(variable, clauses, body, env, pos, k)
-          case _ => evalError("guard: bad syntax", pos)
-
-      case SList(Sym("define-record-type", _) :: args, pos) =>
-        evalDefineRecordType(args, env, pos, k)
-
-      case SList(Sym("define-syntax", _) :: Sym(name, _) :: SList(Sym("syntax-rules", _) :: srArgs, _) :: Nil, pos) =>
-        val (literals, rules) = Macro.parseSyntaxRules(srArgs, pos)
-        env.define(name, Value.MacroVal(literals, rules, env))
-        k(BoolVal(true))
-
+      case SList(Sym("do", _) :: args, pos)                 => evalDoCps(args, env, pos, k)
+      case SList(Sym("begin", _) :: args, pos)              => evalBegin(args, pos, env, k)
+      case SList(Sym("cond", _) :: clauses, pos)            => evalCondCps(clauses, env, pos, k)
+      case SList(Sym("and", _) :: args, _)                  => evalAndCps(args, env, k)
+      case SList(Sym("or", _) :: args, _)                   => evalOrCps(args, env, k)
+      case SList(Sym("guard", _) :: args, pos)              => evalGuardForm(args, env, pos, k)
+      case SList(Sym("define-record-type", _) :: args, pos) => evalDefineRecordType(args, env, pos, k)
+      case SList(Sym("define-syntax", _) :: rest, pos)      => evalDefineSyntax(rest, env, pos, k)
+      case SList(Sym("syntax-case", _) :: scrutineeExpr :: SList(literals, _) :: clauses, pos) =>
+        eval(scrutineeExpr, env, scrutinee => evalSyntaxCaseClauses(scrutinee, literals, clauses, env, pos, k))
+      case SList(Sym("syntax", _) :: template :: Nil, _) =>
+        k(SyntaxCase.instantiateTemplate(template, currentSyntaxBindings, currentSyntaxEnvs._1, currentSyntaxEnvs._2))
+      case SList(Sym("with-syntax", _) :: SList(bindingExprs, _) :: body, pos) =>
+        evalWithSyntax(bindingExprs, body, env, pos, k)
       case callccExpr @ SList(Sym(name, _) :: procExpr :: Nil, pos)
           if name == "call/cc" || name == "call-with-current-continuation" =>
         evalCallCc(callccExpr, procExpr, env, pos, k)
-
-      // Macro expansion
-      case SList(Sym(name, symPos) :: args, pos) if env.lookupOption(name).exists(_.isInstanceOf[Value.MacroVal]) =>
-        val Value.MacroVal(literals, rules, defEnv) = env.lookup(name, symPos): @unchecked
-        val expanded                                = Macro.expand(name, args, literals, rules, defEnv, env, pos)
-        tailEval(expanded, env, k)
-
+      case SList(Sym(name, symPos) :: args, pos) if isMacro(name, env) =>
+        expandMacro(name, symPos, args, expr, env, pos, k)
       case SList(head :: args, pos) =>
         eval(head, env, proc => evalArgs(args, env, values => applyProc(proc, values, pos, k)))
+
+  private def evalIf(args: List[Expr], env: Env, pos: Option[Pos], k: K): Bounce =
+    args match
+      case cond :: thenB :: elseB :: Nil =>
+        eval(cond, env, cv => if cv.isTruthy then tailEval(thenB, env, k) else tailEval(elseB, env, k))
+      case cond :: thenB :: Nil =>
+        eval(cond, env, cv => if cv.isTruthy then tailEval(thenB, env, k) else k(VoidVal))
+      case _ => evalError("if: bad syntax", pos)
+
+  private def evalSetBang(args: List[Expr], env: Env, pos: Option[Pos], k: K): Bounce =
+    args match
+      case Sym(name, _) :: valExpr :: Nil =>
+        eval(
+          valExpr,
+          env,
+          { v =>
+            env.set(name, v, pos); k(BoolVal(true))
+          }
+        )
+      case _ => evalError("set!: bad syntax", pos)
+
+  private def evalBegin(args: List[Expr], pos: Option[Pos], env: Env, k: K): Bounce =
+    if args.isEmpty then evalError("begin: empty", pos)
+    evalBody(args, env, k)
+
+  private def evalGuardForm(args: List[Expr], env: Env, pos: Option[Pos], k: K): Bounce =
+    args match
+      case SList(Sym(variable, _) :: clauses, _) :: body if body.nonEmpty =>
+        evalGuard(variable, clauses, body, env, pos, k)
+      case _ => evalError("guard: bad syntax", pos)
+
+  private def evalDefineSyntax(rest: List[Expr], env: Env, pos: Option[Pos], k: K): Bounce =
+    rest match
+      case Sym(name, _) :: SList(Sym("syntax-rules", _) :: srArgs, _) :: Nil =>
+        val (literals, rules) = Macro.parseSyntaxRules(srArgs, pos)
+        env.define(name, Value.MacroVal(literals, rules, env))
+        k(BoolVal(true))
+      case Sym(name, _) :: transformerExpr :: Nil =>
+        eval(
+          transformerExpr,
+          env,
+          { transformer =>
+            env.define(name, Value.ProcMacroVal(transformer, env))
+            k(BoolVal(true))
+          }
+        )
+      case _ => evalError("define-syntax: bad syntax", pos)
+
+  private def isMacro(name: String, env: Env): Boolean =
+    env.lookupOption(name).exists(v => v.isInstanceOf[Value.MacroVal] || v.isInstanceOf[Value.ProcMacroVal])
+
+  private def expandMacro(
+    name: String,
+    symPos: Option[Pos],
+    args: List[Expr],
+    expr: Expr,
+    env: Env,
+    pos: Option[Pos],
+    k: K
+  ): Bounce =
+    env.lookup(name, symPos) match
+      case Value.MacroVal(literals, rules, defEnv) =>
+        tailEval(Macro.expand(name, args, literals, rules, defEnv, env, pos), env, k)
+      case Value.ProcMacroVal(transformer, _) =>
+        applyProc(
+          transformer,
+          List(EvalHelpers.exprToValue(expr)),
+          pos,
+          resultValue => tailEval(SyntaxCase.valueToExpr(resultValue), env, k)
+        )
+      case _ => evalError(s"$name: not a macro", pos)
 
   protected def applyProc(proc: Value, values: List[Value], pos: Option[Pos], k: K): Bounce =
     proc match
       case LambdaVal(params, restParam, body, closure) =>
-        val localEnv = closure.extendWithRest(params, restParam, values)
-        tailBody(body, localEnv, k)
-
+        tailBody(body, closure.extendWithRest(params, restParam, values), k)
       case ContinuationVal(invoke) =>
         if values.length != 1 then evalError("continuation: expected 1 argument", pos)
         invoke(values.head)
-
-      // call/cc used as a value — CPS escape continuation
       case BuiltinVal(name, _) if name == "call/cc" || name == "call-with-current-continuation" =>
         if values.length != 1 then evalError("call/cc: expected 1 argument", pos)
         val capturedWind = windStack
-        val contVal      = ContinuationVal(v => doWindTransition(capturedWind, pos, () => k(v)))
-        applyProc(values.head, List(contVal), pos, k)
-
+        applyProc(values.head, List(ContinuationVal(v => doWindTransition(capturedWind, pos, () => k(v)))), pos, k)
       case BuiltinVal("dynamic-wind", _) =>
         if values.length != 3 then evalError("dynamic-wind: expected 3 arguments", pos)
         applyDynamicWind(values(0), values(1), values(2), pos, k)
-
-      case BuiltinVal("apply", _)    => applyBuiltinApply(values, pos, k)
-      case BuiltinVal("map", _)      => applyBuiltinMap(values, pos, k)
-      case BuiltinVal("for-each", _) => applyBuiltinForEach(values, pos, k)
-
-      case BuiltinVal("call-with-values", _) =>
-        if values.length != 2 then evalError("call-with-values: expected 2 arguments", pos)
-        val producer = values(0)
-        val consumer = values(1)
-        applyProc(
-          producer,
-          Nil,
-          pos,
-          result =>
-            val args = result match
-              case ValuesVal(vs) => vs
-              case single        => List(single)
-            applyProc(consumer, args, pos, k)
-        )
-
+      case BuiltinVal("apply", _)            => applyBuiltinApply(values, pos, k)
+      case BuiltinVal("map", _)              => applyBuiltinMap(values, pos, k)
+      case BuiltinVal("for-each", _)         => applyBuiltinForEach(values, pos, k)
+      case BuiltinVal("call-with-values", _) => applyCallWithValues(values, pos, k)
       case BuiltinVal("raise", _) =>
         if values.length != 1 then evalError("raise: expected 1 argument", pos)
         raiseException(values.head, pos)
-
       case BuiltinVal("with-exception-handler", _) =>
         if values.length != 2 then evalError("with-exception-handler: expected 2 arguments", pos)
         evalWithExceptionHandler(values(0), values(1), pos, k)
-
       case BuiltinVal(name, fn) =>
         try k(fn(values))
         catch
           case e: EvalError =>
             if e.getMessage.matches(".*\\d+:\\d+.*") then throw e
             else evalError(e.getMessage, pos)
-          case e: ArithmeticException =>
-            evalError(e.getMessage, pos)
-
+          case e: ArithmeticException => evalError(e.getMessage, pos)
       case _ => evalError("not a procedure", pos)
 
-  /** call/cc as special form — hybrid: CPS for escape, body-restart for reentrant. */
-  private def evalCallCc(callccExpr: Expr, procExpr: Expr, env: Env, pos: Option[Pos], k: K): Bounce =
-    val pending = pendingReturns.remove(callccExpr)
-    if pending != null then k(pending)
-    else
-      val capturedRemaining = bodyRemaining
-      val capturedEnv       = bodyEnvRef
-      val capturedK         = bodyK
-      val capturedWind      = windStack
-      val cpsK              = k
-      var active            = true
-      eval(
-        procExpr,
-        env,
-        { proc =>
-          val contVal = ContinuationVal { v =>
-            if active then
-              active = false
-              doWindTransition(capturedWind, pos, () => cpsK(v))
-            else
-              doWindTransition(
-                capturedWind,
-                pos,
-                () =>
-                  pendingReturns.put(callccExpr, v)
-                  tailBody(capturedRemaining, capturedEnv, capturedK)
-              )
-          }
-          applyProc(
-            proc,
-            List(contVal),
-            pos,
-            { procResult =>
-              active = false
-              k(procResult)
-            }
-          )
-        }
-      )
+  private def applyCallWithValues(values: List[Value], pos: Option[Pos], k: K): Bounce =
+    if values.length != 2 then evalError("call-with-values: expected 2 arguments", pos)
+    applyProc(
+      values(0),
+      Nil,
+      pos,
+      result =>
+        val args = result match
+          case ValuesVal(vs) => vs
+          case single        => List(single)
+        applyProc(values(1), args, pos, k)
+    )
