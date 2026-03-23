@@ -71,8 +71,8 @@ Combined use of continuations, macros, mutation, and tail calls.
 ### Level 14 — String Immutability (R7RS)
 Strings are now immutable. `string-set!` must raise an error. Use `string->list` and `list->string` for character-level transformations. `string-copy` still works (returns an immutable copy). `char->integer` and `integer->char` convert between characters and their integer code points.
 
-### Level 15 — Deep Equality, Letrec, Case & Vectors
-`equal?` compares values recursively. Works on numbers, strings, booleans, symbols, lists, and nested structures. `letrec` and `letrec*`. All bindings in `letrec` are mutually visible. `letrec*` bindings are visible sequentially. `case` dispatches on datum equality (`eqv?`). Also requires `eqv?` builtin. `vector`, `make-vector`, `vector-ref`, `vector-set!`, `vector-length`, `vector?`. Fixed-size mutable arrays. `vector->list` and `list->vector` for conversion.
+### Level 15 — Deep Equality, Letrec, Case, Vectors & Do
+`equal?` compares values recursively. Works on numbers, strings, booleans, symbols, lists, and nested structures. `letrec` and `letrec*`. All bindings in `letrec` are mutually visible. `letrec*` bindings are visible sequentially. `case` dispatches on datum equality (`eqv?`). Also requires `eqv?` builtin. `vector`, `make-vector`, `vector-ref`, `vector-set!`, `vector-length`, `vector?`. Fixed-size mutable arrays. `vector->list` and `list->vector` for conversion. `(do ((var init step) ...) (test expr ...) body ...)` is an iteration construct. Variables are bound to their init values, then on each iteration all step expressions are evaluated using the *previous* iteration's values (parallel update, like `let` not `let*`). When test is true, the expr values are evaluated and the last is returned. Variables with no step expression keep their value across iterations.
 
 ### Level 16 — dynamic-wind
 `dynamic-wind` takes three thunks: in-thunk, body-thunk, out-thunk. The in-thunk runs before the body, the out-thunk runs after — even on non-local exit via `call/cc`. On continuation re-entry, the in-thunk fires again. Nested `dynamic-wind` must unwind/rewind in the correct order. `dynamic-wind` returns the body's value.
@@ -104,8 +104,5 @@ Combined use of all features: dynamic-wind + guard for resource cleanup on excep
 ### Level 25 — procedure? on all callable types
 `procedure?` must return `#t` for every callable value: regular lambdas, `case-lambda` procedures (from L24), builtin procedures, and continuations captured by `call/cc`. It returns `#f` for all non-callable values (numbers, strings, booleans, lists, vectors, etc.).
 
-### Level 26 — do Loops
-`(do ((var init step) ...) (test expr ...) body ...)` is an iteration construct. Variables are bound to their init values, then on each iteration all step expressions are evaluated using the *previous* iteration's values (parallel update, like `let` not `let*`). When test is true, the expr values are evaluated and the last is returned. Variables with no step expression keep their value across iterations.
-
-### Level 27 — Real-World Integration Stress
-All features from L1-L26 are exercised together by large (1000+ line) real-world Scheme programs. No new language features — this level tests whether your interpreter handles real code at scale. Programs include a complete macro expander (alexpander, ~1,950 lines) that stress closures, continuations, mutation, vectors, and macros simultaneously.
+### Level 26 — Real-World Integration Stress
+All features from L1-L25 are exercised together by large (1000+ line) real-world Scheme programs. No new language features — this level tests whether your interpreter handles real code at scale. Programs include a type inferencer (dynamic, ~2,300 lines) and a complete macro expander (alexpander, ~1,950 lines) that stress closures, continuations, mutation, vectors, and macros simultaneously.

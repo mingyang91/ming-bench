@@ -1,6 +1,6 @@
 # MING — Ming Interpreter Nurture Gauntlet
 
-A benchmark framework for measuring how **prompt engineering strategies** affect coding agent performance. Agents build a Scheme interpreter from scratch — 240+ tests across 27 difficulty levels, from basic arithmetic to first-class continuations, hygienic macros, and exact arithmetic. Supports **5 languages**: Rust, Go, Java, TypeScript, and Scala.
+A benchmark framework for measuring how **prompt engineering strategies** affect coding agent performance. Agents build a Scheme interpreter from scratch — 240+ tests across 26 difficulty levels, from basic arithmetic to first-class continuations, hygienic macros, and exact arithmetic. Supports **5 languages**: Rust, Go, Java, TypeScript, and Scala.
 
 ## Why This Exists
 
@@ -8,7 +8,7 @@ Coding agents (Claude Code, Codex, OpenCode, etc.) can write working software, b
 
 > **Does adding structure to agent instructions — quality gates, code style rules, modular architecture enforcement — improve outcomes compared to minimal "just do it" prompts?**
 
-The task is deliberately chosen to stress-test this: a Scheme interpreter requires the agent to make hundreds of architectural decisions (data representation, evaluation strategy, environment model, continuation implementation) over 27 progressively harder levels. Bad early decisions compound. Good structure should help.
+The task is deliberately chosen to stress-test this: a Scheme interpreter requires the agent to make hundreds of architectural decisions (data representation, evaluation strategy, environment model, continuation implementation) over 26 progressively harder levels. Bad early decisions compound. Good structure should help.
 
 Multi-language support adds another dimension: **does language choice affect agent performance on the same algorithmic task?**
 
@@ -18,7 +18,7 @@ Multi-language support adds another dimension: **does language choice affect age
 
 The agent receives:
 - A function signature (language-specific): `evalStr(input) → result`
-- 240+ test cases across 27 levels (each test loads Scheme code from a `.scm` fixture file)
+- 240+ test cases across 26 levels (each test loads Scheme code from a `.scm` fixture file)
 - Instructions in `CLAUDE.md` (the only file the agent reads for guidance)
 
 The agent implements a complete Scheme interpreter from scratch — lexer, parser, environment, evaluator, tail-call optimization, continuations, and hygienic macros. No starter code. No external parsing libraries.
@@ -85,7 +85,7 @@ Per-language strategies live in `bench/strategies/{lang}/`. The orchestrator pic
 
 Each agent run uses one of two modes:
 
-- **Full mode** — one agent session tackles all 27 levels. Simpler, but if the agent gets stuck it burns budget.
+- **Full mode** — one agent session tackles all 26 levels. Simpler, but if the agent gets stuck it burns budget.
 - **Levels mode** — orchestrator runs a fresh agent per level. After each level passes, all prior levels are re-run to catch regressions. If regressions are detected, a 15-turn fix-it pass is launched; if unfixable, the run halts. Per-level session data for granular analysis.
 
 ### Sandboxed Testing
@@ -118,21 +118,20 @@ All containers: 1 CPU, 256 PIDs. OOM or timeout = test failure. This prevents ag
 | 12 | **Integration** | 5 | call/cc + macros + mutation + TCO combined |
 | 13 | Numeric/char/string utilities | 25 | `abs`, `modulo`, `min`/`max`, `char-upcase`, `string=?` |
 | 14 | String immutability (R7RS) | 4 | **Requirement change** — `string-set!` now errors (8 levels after L06) |
-| 15 | Equality, letrec, case, vectors | 17 | `equal?`, `letrec`/`letrec*`, `case`, `vector` |
+| 15 | Equality, letrec, case, vectors, do | 22 | `equal?`, `letrec`/`letrec*`, `case`, `vector`, `do` |
 | 16 | dynamic-wind | 6 | Resource cleanup on non-local exit |
 | 17 | guard & raise | 6 | Exception signaling and catching |
 | 18 | values & call-with-values | 6 | Multi-value returns |
 | 19 | **Exact arithmetic** | 8 | Rationals, cross-tower comparison |
 | 20 | define-record-type | 5 | R7RS records with disjoint types |
-| 21 | **Pair mutation** | 5 | `set-car!`/`set-cdr!`, circular list detection |
+| 21 | **Pair mutation** | 6 | `set-car!`/`set-cdr!`, circular list detection |
 | 22 | **syntax-case** | 5 | Advanced macro system with guards |
 | 23 | **Final integration** | 8 | All features combined |
 | 24 | **case-lambda** | 5 | Multi-arity closures — **forces closure restructure** |
 | 25 | **procedure?** | 5 | Must return `#t` for all callable types (lambda, case-lambda, builtins, continuations) |
-| 26 | **do loops** | 5 | Iteration with parallel step — **tests env model** |
-| 27 | **Real-world integration** | 1 | 1000+ line macro expander — **stress-tests all features at scale** |
+| 26 | **Real-world integration** | 2 | 1000+ line programs — **stress-tests all features at scale** |
 
-**Level design philosophy:** Levels are ordered to maximize tech-debt exposure. L06 plants mutable strings, then L14 (8 levels later) reverses the requirement. L24-L26 force restructuring of core infrastructure (closures, procedure naming, callable type unification, eval loop) established 10-20 levels earlier. L27 hits the agent with real-world programs (1000+ lines) that exercise all features simultaneously — maximum distance from when features were first implemented.
+**Level design philosophy:** Levels are ordered to maximize tech-debt exposure. L06 plants mutable strings, then L14 (8 levels later) reverses the requirement. L24-L25 force restructuring of core infrastructure (closures, callable type unification) established 10-20 levels earlier. L26 hits the agent with real-world programs (1000+ lines) that exercise all features simultaneously — maximum distance from when features were first implemented.
 
 ## Tooling
 

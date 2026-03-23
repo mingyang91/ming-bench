@@ -422,9 +422,9 @@ pub fn fixtures_dir() -> PathBuf {
 // Level constants
 // ---------------------------------------------------------------------------
 
-pub const LEVELS: [&str; 27] = [
+pub const LEVELS: [&str; 26] = [
     "01", "02", "03", "04", "05", "06", "07", "08", "09", "10", "11", "12", "13", "14", "15", "16",
-    "17", "18", "19", "20", "21", "22", "23", "24", "25", "26", "27",
+    "17", "18", "19", "20", "21", "22", "23", "24", "25", "26",
 ];
 
 // ---------------------------------------------------------------------------
@@ -440,12 +440,12 @@ pub const LEVELS: [&str; 27] = [
 ///   L10-L12 (call/cc, macros, integration)     → 90 turns
 ///   L13     (builtin grab bag)                 → 45 turns
 ///   L14     (string immutability req-change)   → 45 turns
-///   L15     (equality, letrec, case, vectors)  → 60 turns
-///   L16-L18 (dynamic-wind, guard, values)      → 60 turns
-///   L19-L20 (exact arith, records)             → 75 turns
+///   L15     (equality, letrec, case, vectors, do) → 60 turns
+///   L16-L18 (dynamic-wind, guard, values)         → 60 turns
+///   L19-L20 (exact arith, records)                → 75 turns
 ///   L21-L23 (pair mutation, syntax-case, integration) → 90 turns
-///   L24-L26 (tech-debt: case-lambda, procedure?, do) → 60 turns
-///   L27     (real-world integration stress)           → 90 turns
+///   L24-L25 (tech-debt: case-lambda, procedure?)  → 60 turns
+///   L26     (real-world integration stress)        → 90 turns
 pub fn turns_for_level(level_num: u32, max_turns: Option<u32>) -> u32 {
     if let Some(t) = max_turns {
         return t;
@@ -460,8 +460,8 @@ pub fn turns_for_level(level_num: u32, max_turns: Option<u32>) -> u32 {
         16..=18 => 60, // dynamic-wind, guard, values
         19..=20 => 75, // exact arith, records
         21..=23 => 90, // pair mutation, syntax-case, final integration
-        24..=26 => 60, // tech-debt: case-lambda, procedure?, do
-        27 => 90,      // real-world integration stress
+        24..=25 => 60, // tech-debt: case-lambda, procedure?
+        26 => 90,      // real-world integration stress
         _ => 75,
     }
 }

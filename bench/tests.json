@@ -1520,9 +1520,9 @@
     "expected": "#t"
   },
   {
-    "name": "l15_realworld_scheme_eval",
-    "level": 15,
-    "fixture": "l15_realworld_scheme_eval.scm",
+    "name": "l21_realworld_scheme_eval",
+    "level": 21,
+    "fixture": "l21_realworld_scheme_eval.scm",
     "kind": "eval_str_ok",
     "expected": "#t"
   },
@@ -1541,9 +1541,9 @@
     "expected": "#t"
   },
   {
-    "name": "l21_realworld_dynamic",
-    "level": 21,
-    "fixture": "l21_realworld_dynamic.scm",
+    "name": "l26_realworld_dynamic",
+    "level": 26,
+    "fixture": "l26_realworld_dynamic.scm",
     "kind": "eval_str_ok",
     "expected": "#t"
   },
@@ -1618,44 +1618,44 @@
     "expected": "#t"
   },
   {
-    "name": "l26_do_basic",
-    "level": 26,
-    "fixture": "l26_do_basic.scm",
+    "name": "l15_do_basic",
+    "level": 15,
+    "fixture": "l15_do_basic.scm",
     "kind": "eval_str_ok",
     "expected": "10"
   },
   {
-    "name": "l26_do_parallel_step",
-    "level": 26,
-    "fixture": "l26_do_parallel_step.scm",
+    "name": "l15_do_parallel_step",
+    "level": 15,
+    "fixture": "l15_do_parallel_step.scm",
     "kind": "eval_str_ok",
     "expected": "#t"
   },
   {
-    "name": "l26_do_fibonacci",
-    "level": 26,
-    "fixture": "l26_do_fibonacci.scm",
+    "name": "l15_do_fibonacci",
+    "level": 15,
+    "fixture": "l15_do_fibonacci.scm",
     "kind": "eval_str_ok",
     "expected": "#t"
   },
   {
-    "name": "l26_do_no_step",
-    "level": 26,
-    "fixture": "l26_do_no_step.scm",
+    "name": "l15_do_no_step",
+    "level": 15,
+    "fixture": "l15_do_no_step.scm",
     "kind": "eval_str_ok",
     "expected": "#t"
   },
   {
-    "name": "l26_do_vector_fill",
-    "level": 26,
-    "fixture": "l26_do_vector_fill.scm",
+    "name": "l15_do_vector_fill",
+    "level": 15,
+    "fixture": "l15_do_vector_fill.scm",
     "kind": "eval_str_ok",
     "expected": "#(0 1 4 9 16)"
   },
   {
-    "name": "l27_realworld_alexpander",
-    "level": 27,
-    "fixture": "l27_realworld_alexpander.scm",
+    "name": "l26_realworld_alexpander",
+    "level": 26,
+    "fixture": "l26_realworld_alexpander.scm",
     "kind": "eval_str_ok",
     "expected": "#t"
   }
