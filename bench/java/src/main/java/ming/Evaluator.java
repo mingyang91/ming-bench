@@ -113,11 +113,13 @@ public class Evaluator {
 
     private static class Lambda {
         final List<String> params;
+        final String restParam; // null if no rest parameter
         final Object body;
         final Env closure;
 
-        Lambda(List<String> params, Object body, Env closure) {
+        Lambda(List<String> params, String restParam, Object body, Env closure) {
             this.params = params;
+            this.restParam = restParam;
             this.body = body;
             this.closure = closure;
         }
@@ -371,11 +373,20 @@ public class Evaluator {
                                     throw posError("define: bad syntax");
                                 }
                                 List<String> params = new ArrayList<>();
+                                String restParam = null;
                                 for (int i = 1; i < sig.size(); i++) {
                                     Object p = sig.get(i);
                                     if (p instanceof Located lp) p = lp.value();
                                     if (!(p instanceof String ps)) {
                                         throw posError("define: parameter must be a symbol");
+                                    }
+                                    if (ps.equals(".")) {
+                                        if (i + 1 >= sig.size()) throw posError("define: missing rest parameter after dot");
+                                        Object rp = sig.get(i + 1);
+                                        if (rp instanceof Located lrp) rp = lrp.value();
+                                        if (!(rp instanceof String rps)) throw posError("define: rest parameter must be a symbol");
+                                        restParam = rps;
+                                        break;
                                     }
                                     params.add(ps);
                                 }
@@ -390,7 +401,7 @@ public class Evaluator {
                                     }
                                     body = beginBody;
                                 }
-                                Lambda lambda = new Lambda(params, body, env);
+                                Lambda lambda = new Lambda(params, restParam, body, env);
                                 env.define(fname, lambda);
                                 return VOID;
                             }
@@ -418,16 +429,30 @@ public class Evaluator {
                             if (list.size() < 3) throw posError("lambda: bad syntax");
                             Object paramsExpr = list.get(1);
                             if (paramsExpr instanceof Located lp) paramsExpr = lp.value();
-                            if (!(paramsExpr instanceof List<?> paramList)) {
-                                throw posError("lambda: parameters must be a list");
-                            }
                             List<String> params = new ArrayList<>();
-                            for (Object p : paramList) {
-                                if (p instanceof Located lpp) p = lpp.value();
-                                if (!(p instanceof String ps)) {
-                                    throw posError("lambda: parameter must be a symbol");
+                            String restParam = null;
+                            if (paramsExpr instanceof List<?> paramList) {
+                                for (int pi = 0; pi < paramList.size(); pi++) {
+                                    Object p = paramList.get(pi);
+                                    if (p instanceof Located lpp) p = lpp.value();
+                                    if (!(p instanceof String ps)) {
+                                        throw posError("lambda: parameter must be a symbol");
+                                    }
+                                    if (ps.equals(".")) {
+                                        if (pi + 1 >= paramList.size()) throw posError("lambda: missing rest parameter after dot");
+                                        Object rp = paramList.get(pi + 1);
+                                        if (rp instanceof Located lrp) rp = lrp.value();
+                                        if (!(rp instanceof String rps)) throw posError("lambda: rest parameter must be a symbol");
+                                        restParam = rps;
+                                        break;
+                                    }
+                                    params.add(ps);
                                 }
-                                params.add(ps);
+                            } else if (paramsExpr instanceof String restOnly) {
+                                // (lambda args body) - single symbol means all args go to rest
+                                restParam = restOnly;
+                            } else {
+                                throw posError("lambda: parameters must be a list or symbol");
                             }
                             Object body;
                             if (list.size() == 3) {
@@ -440,7 +465,7 @@ public class Evaluator {
                                 }
                                 body = beginBody;
                             }
-                            return new Lambda(params, body, env);
+                            return new Lambda(params, restParam, body, env);
                         }
                         case "and" -> {
                             if (list.size() == 1) return Boolean.TRUE;
@@ -504,14 +529,35 @@ public class Evaluator {
                     errLine = lh.line();
                     errCol = lh.col();
                 }
+                // Handle apply
+                if (proc instanceof String p && p.equals("apply")) {
+                    Object[] applyResult = handleApply(args);
+                    proc = applyResult[0];
+                    @SuppressWarnings("unchecked")
+                    List<Object> newArgs = (List<Object>) applyResult[1];
+                    args = newArgs;
+                }
                 // TCO for lambda calls
                 if (proc instanceof Lambda lambda) {
-                    if (args.size() != lambda.params.size()) {
-                        throw posError("wrong number of arguments: expected " + lambda.params.size() + ", got " + args.size());
+                    if (lambda.restParam != null) {
+                        if (args.size() < lambda.params.size()) {
+                            throw posError("wrong number of arguments: expected at least " + lambda.params.size() + ", got " + args.size());
+                        }
+                    } else {
+                        if (args.size() != lambda.params.size()) {
+                            throw posError("wrong number of arguments: expected " + lambda.params.size() + ", got " + args.size());
+                        }
                     }
                     Env callEnv = new Env(lambda.closure);
                     for (int i = 0; i < lambda.params.size(); i++) {
                         callEnv.define(lambda.params.get(i), args.get(i));
+                    }
+                    if (lambda.restParam != null) {
+                        Object rest = NIL;
+                        for (int i = args.size() - 1; i >= lambda.params.size(); i--) {
+                            rest = new Pair(args.get(i), rest);
+                        }
+                        callEnv.define(lambda.restParam, rest);
                     }
                     expr = lambda.body;
                     env = callEnv;
@@ -573,7 +619,7 @@ public class Evaluator {
         }
         if (name != null) {
             Env letEnv = new Env(env);
-            Lambda lambda = new Lambda(paramNames, body, letEnv);
+            Lambda lambda = new Lambda(paramNames, null, body, letEnv);
             letEnv.define(name, lambda);
             for (int i = 0; i < paramNames.size(); i++) {
                 letEnv.define(paramNames.get(i), initVals.get(i));
@@ -633,7 +679,8 @@ public class Evaluator {
             "string->number", "number->string",
             "symbol->string", "string->symbol",
             "string-ref", "char?",
-            "string-set!", "string-copy"
+            "string-set!", "string-copy",
+            "apply"
     );
 
     private boolean isPrimitive(String name) {
@@ -841,6 +888,26 @@ public class Evaluator {
             }
             default -> throw posError("unbound variable: " + proc);
         };
+    }
+
+    // Returns [proc, argsList] for apply
+    private Object[] handleApply(List<Object> args) throws EvalError {
+        if (args.size() < 2) throw posError("apply: expected at least 2 arguments");
+        Object proc = args.get(0);
+        // Last arg must be a list; prefix args are prepended
+        Object lastArg = args.get(args.size() - 1);
+        List<Object> newArgs = new ArrayList<>();
+        for (int i = 1; i < args.size() - 1; i++) {
+            newArgs.add(args.get(i));
+        }
+        // Flatten the last argument (a Scheme list) into newArgs
+        Object cur = lastArg;
+        while (cur instanceof Pair p) {
+            newArgs.add(p.car);
+            cur = p.cdr;
+        }
+        if (cur != NIL) throw posError("apply: last argument must be a proper list");
+        return new Object[]{proc, newArgs};
     }
 
     private Object appendTwo(Object a, Object b) throws EvalError {
