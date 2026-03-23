@@ -643,7 +643,199 @@ fn run_levels_mode(
         passed_levels.push(level);
     }
 
+    // --- Surprise levels: inject L27-L28 after L26 passes ---
+    if passed_levels.len() == LEVELS.len() && !INTERRUPTED.load(Ordering::Relaxed) {
+        let proj = project_dir();
+        let surprise_levels = run_surprise_levels(
+            args, agent_workdir, worktree_dir, results_dir, &proj, &lang,
+            &mut passed_levels, &mut level_times, &mut agent_exit,
+        )?;
+        if !surprise_levels {
+            println!("Surprise levels: not all passed");
+        }
+    }
+
     Ok((agent_exit, level_times))
+}
+
+// ---------------------------------------------------------------------------
+// Surprise levels (L27-L28) — injected after L26 passes
+// ---------------------------------------------------------------------------
+
+/// Hidden levels that test tech debt accumulated during L01-L26.
+/// The agent has no prior knowledge of these requirements.
+const SURPRISE_LEVELS: &[(&str, &str)] = &[
+    ("27", "Concurrent Evaluation"),
+    ("28", "Performance & Memory Stress"),
+];
+
+/// Inject hidden test files into the agent's worktree and run surprise levels.
+fn run_surprise_levels(
+    args: &RunAgentArgs,
+    agent_workdir: &Path,
+    worktree_dir: &Path,
+    results_dir: &Path,
+    proj: &Path,
+    lang: &Lang,
+    _passed_levels: &mut Vec<&str>,
+    level_times: &mut Vec<(String, i64, String)>,
+    agent_exit: &mut i32,
+) -> Result<bool> {
+    let hidden_dir = proj.join("bench/hidden");
+    if !hidden_dir.is_dir() {
+        println!("No hidden levels found at {}", hidden_dir.display());
+        return Ok(false);
+    }
+
+    println!();
+    println!("=== SURPRISE: Hidden levels unlocked after L26 ===");
+
+    for &(level, name) in SURPRISE_LEVELS {
+        if INTERRUPTED.load(Ordering::Relaxed) {
+            break;
+        }
+
+        println!();
+        println!("--- Injecting L{level}: {name} ---");
+
+        // Inject test files and fixtures for this level
+        inject_surprise_level(level, lang, worktree_dir, &hidden_dir)?;
+
+        // Append spec text to SPEC.md in the worktree
+        let spec_file = hidden_dir.join(format!("SPEC_L{level}.md"));
+        if spec_file.is_file() {
+            let spec_text = fs::read_to_string(&spec_file).unwrap_or_default();
+            let worktree_spec = worktree_dir.join("bench/SPEC.md");
+            if let Ok(mut existing) = fs::read_to_string(&worktree_spec) {
+                existing.push('\n');
+                existing.push_str(&spec_text);
+                let _ = fs::write(&worktree_spec, existing);
+            }
+        }
+
+        let level_dir = results_dir.join(format!("L{level}"));
+        if should_skip_level(args.resume, &level_dir, level) {
+            // leaked: need 'static lifetime for passed_levels
+            // just skip tracking for surprise levels
+            continue;
+        }
+
+        let result = run_single_level(args, agent_workdir, worktree_dir, &level_dir, level)?;
+        *agent_exit = result.0;
+        level_times.push((format!("L{level}"), result.1, result.2.clone()));
+
+        if result.2 == "FAILED" {
+            commit_checkpoint(level, &result.2, result.1, worktree_dir);
+            println!("Surprise L{level} FAILED — stopping");
+            return Ok(false);
+        }
+
+        commit_checkpoint(level, &result.2, result.1, worktree_dir);
+    }
+
+    Ok(true)
+}
+
+/// Copy hidden test files into the agent's worktree for a surprise level.
+fn inject_surprise_level(
+    level: &str,
+    lang: &Lang,
+    worktree_dir: &Path,
+    hidden_dir: &Path,
+) -> Result<()> {
+    let bench_dir = worktree_dir.join("bench");
+
+    // --- L27: language-specific test files ---
+    if level == "27" {
+        match lang {
+            Lang::Rust => {
+                // Copy level27.rs and add mod declaration
+                let src = hidden_dir.join("rust/level27.rs");
+                let dst = bench_dir.join("rust/src/scheme/tests/level27.rs");
+                if src.is_file() {
+                    let _ = fs::copy(&src, &dst);
+                    // Append mod declaration to mod.rs
+                    let mod_rs = bench_dir.join("rust/src/scheme/tests/mod.rs");
+                    if let Ok(mut content) = fs::read_to_string(&mod_rs) {
+                        if !content.contains("mod level27") {
+                            content.push_str("\n// Level 27 (concurrent eval) — injected as surprise level.\nmod level27;\n");
+                            let _ = fs::write(&mod_rs, content);
+                        }
+                    }
+                }
+            }
+            Lang::Java => {
+                let src = hidden_dir.join("java/ConcurrencyTest.java");
+                let dst = bench_dir.join("java/src/test/java/ming/ConcurrencyTest.java");
+                if src.is_file() {
+                    let _ = fs::create_dir_all(dst.parent().expect("has parent"));
+                    let _ = fs::copy(&src, &dst);
+                }
+            }
+            Lang::Scala => {
+                let src = hidden_dir.join("scala/ConcurrencySpec.scala");
+                let dst = bench_dir.join("scala/src/test/scala/ming/ConcurrencySpec.scala");
+                if src.is_file() {
+                    let _ = fs::create_dir_all(dst.parent().expect("has parent"));
+                    let _ = fs::copy(&src, &dst);
+                }
+            }
+            Lang::Go => {
+                let src = hidden_dir.join("go/concurrency_test.go");
+                let dst = bench_dir.join("go/concurrency_test.go");
+                if src.is_file() {
+                    let _ = fs::copy(&src, &dst);
+                }
+            }
+            Lang::TypeScript => {
+                let src = hidden_dir.join("ts/concurrent.test.ts");
+                let dst = bench_dir.join("ts/test/concurrent.test.ts");
+                if src.is_file() {
+                    let _ = fs::create_dir_all(dst.parent().expect("has parent"));
+                    let _ = fs::copy(&src, &dst);
+                }
+            }
+        }
+    }
+
+    // --- L28: fixtures + tests.json entries ---
+    if level == "28" {
+        // Copy L28 fixtures
+        let fixtures_src = hidden_dir.join("fixtures");
+        let fixtures_dst = bench_dir.join("fixtures");
+        if fixtures_src.is_dir() {
+            for entry in fs::read_dir(&fixtures_src).into_iter().flatten() {
+                if let Ok(entry) = entry {
+                    let name = entry.file_name();
+                    let _ = fs::copy(entry.path(), fixtures_dst.join(&name));
+                }
+            }
+        }
+
+        // Append L28 test entries to tests.json
+        let extra_tests_path = hidden_dir.join("tests_l28.json");
+        let tests_json_path = bench_dir.join("tests.json");
+        if extra_tests_path.is_file() && tests_json_path.is_file() {
+            if let (Ok(main_str), Ok(extra_str)) = (
+                fs::read_to_string(&tests_json_path),
+                fs::read_to_string(&extra_tests_path),
+            ) {
+                // Parse both as JSON arrays and merge
+                if let (Ok(mut main_arr), Ok(extra_arr)) = (
+                    serde_json::from_str::<Vec<serde_json::Value>>(&main_str),
+                    serde_json::from_str::<Vec<serde_json::Value>>(&extra_str),
+                ) {
+                    main_arr.extend(extra_arr);
+                    if let Ok(merged) = serde_json::to_string_pretty(&main_arr) {
+                        let _ = fs::write(&tests_json_path, merged);
+                    }
+                }
+            }
+        }
+    }
+
+    println!("Injected L{level} test files into worktree");
+    Ok(())
 }
 
 fn should_skip_level(resume: bool, level_dir: &Path, level: &str) -> bool {
