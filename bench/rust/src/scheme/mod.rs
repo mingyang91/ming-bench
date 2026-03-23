@@ -368,6 +368,18 @@ fn eval_inner(expr: &Expr, env: &Env) -> Result<Trampoline, EvalError> {
                         output_write("\n");
                         return Ok(Trampoline::Done(Value::Void));
                     }
+                    "set!" => {
+                        if elems.len() != 3 {
+                            return Err(EvalError::Arity("set! requires 2 arguments".into()).with_position(span.line, span.col));
+                        }
+                        let name = match &elems[1].kind {
+                            ExprKind::Symbol(s) => s.clone(),
+                            _ => return Err(EvalError::Parse("set!: expected symbol".into()).with_position(span.line, span.col)),
+                        };
+                        let val = eval(&elems[2], env)?;
+                        env_update(env, &name, val)?;
+                        return Ok(Trampoline::Done(Value::Void));
+                    }
                     "string-set!" => return eval_string_set(&elems[1..], env, span).map(Trampoline::Done),
                     _ => {}
                 }
