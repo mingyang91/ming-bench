@@ -37,7 +37,7 @@ public class Evaluator {
     }
 
     private static final Set<String> SPECIAL_FORMS = Set.of(
-        "quote", "set!", "define", "lambda", "if", "begin", "cond", "and", "or",
+        "quote", "quasiquote", "set!", "define", "lambda", "if", "begin", "cond", "and", "or",
         "let", "let*", "letrec", "letrec*", "case", "do", "define-syntax", "syntax-rules", "guard",
         "define-record-type", "syntax-case", "syntax", "with-syntax", "case-lambda"
     );
@@ -573,6 +573,26 @@ public class Evaluator {
             }
             return new SchemeValue.BoolVal(false);
         }));
+        env.define("memq", new SchemeValue.BuiltinVal("memq", args -> {
+            if (args.size() != 2) throw new EvalError("memq requires 2 arguments");
+            SchemeValue obj = args.get(0);
+            SchemeValue lst = args.get(1);
+            while (lst instanceof SchemeValue.PairVal p) {
+                if (eqv(p.car(), obj)) return lst;
+                lst = p.cdr();
+            }
+            return new SchemeValue.BoolVal(false);
+        }));
+        env.define("memv", new SchemeValue.BuiltinVal("memv", args -> {
+            if (args.size() != 2) throw new EvalError("memv requires 2 arguments");
+            SchemeValue obj = args.get(0);
+            SchemeValue lst = args.get(1);
+            while (lst instanceof SchemeValue.PairVal p) {
+                if (eqv(p.car(), obj)) return lst;
+                lst = p.cdr();
+            }
+            return new SchemeValue.BoolVal(false);
+        }));
         env.define("eq?", new SchemeValue.BuiltinVal("eq?", args -> {
             if (args.size() != 2) throw new EvalError("eq? requires 2 arguments");
             SchemeValue a = args.get(0), b = args.get(1);
@@ -1045,6 +1065,11 @@ public class Evaluator {
                     yield new Bounce.Err(new EvalError("quote requires exactly 1 argument at " + pos));
                 yield k.apply(quoteDatum(elems.get(1)));
             }
+            case "quasiquote" -> {
+                if (elems.size() != 2)
+                    yield new Bounce.Err(new EvalError("quasiquote requires exactly 1 argument at " + pos));
+                yield evalQuasiquote(elems.get(1), env, k);
+            }
             case "set!" -> {
                 if (elems.size() != 3)
                     yield new Bounce.Err(new EvalError("set! requires exactly 2 arguments at " + pos));
@@ -1478,6 +1503,71 @@ public class Evaluator {
         }
     }
 
+    private Bounce evalQuasiquote(SchemeValue tmpl, Environment env, SchemeValue.Cont k) {
+        // (unquote expr) → eval expr
+        if (tmpl instanceof SchemeValue.ListVal list && list.elements().size() == 2
+                && list.elements().getFirst() instanceof SchemeValue.SymbolVal s && s.name().equals("unquote")) {
+            return new Bounce.More(() -> eval(list.elements().get(1), env, k));
+        }
+        // A list — process elements, handling unquote-splicing
+        if (tmpl instanceof SchemeValue.ListVal list) {
+            List<SchemeValue> elems = list.elements();
+            if (elems.isEmpty()) return k.apply(SchemeValue.NIL);
+            // Check for dotted pair notation: (a b . c)
+            int dotIdx = -1;
+            for (int i = 0; i < elems.size(); i++) {
+                if (elems.get(i) instanceof SchemeValue.SymbolVal sym && sym.name().equals(".")) {
+                    dotIdx = i;
+                    break;
+                }
+            }
+            if (dotIdx >= 0 && dotIdx == elems.size() - 2) {
+                // Dotted pair: process elements before dot, then cdr is last element
+                return qqBuildList(elems.subList(0, dotIdx), 0, env, prefix ->
+                    evalQuasiquote(elems.get(elems.size() - 1), env, tail -> {
+                        try {
+                            return k.apply(appendScheme(prefix, tail));
+                        } catch (EvalError e) {
+                            return new Bounce.Err(e);
+                        }
+                    }));
+            }
+            return qqBuildList(elems, 0, env, result -> k.apply(result));
+        }
+        // Atom — quote it
+        return k.apply(quoteDatum(tmpl));
+    }
+
+    // Build a list from quasiquoted elements, handling unquote-splicing
+    private Bounce qqBuildList(List<SchemeValue> elems, int idx, Environment env, SchemeValue.Cont k) {
+        if (idx >= elems.size()) return k.apply(SchemeValue.NIL);
+        SchemeValue elem = elems.get(idx);
+        // Check for (unquote-splicing expr)
+        if (elem instanceof SchemeValue.ListVal sl && sl.elements().size() == 2
+                && sl.elements().getFirst() instanceof SchemeValue.SymbolVal s && s.name().equals("unquote-splicing")) {
+            return new Bounce.More(() -> eval(sl.elements().get(1), env, spliced ->
+                new Bounce.More(() -> qqBuildList(elems, idx + 1, env, rest -> {
+                    try {
+                        return k.apply(appendScheme(spliced, rest));
+                    } catch (EvalError e) {
+                        return new Bounce.Err(e);
+                    }
+                }))));
+        }
+        return new Bounce.More(() -> evalQuasiquote(elem, env, car ->
+            new Bounce.More(() -> qqBuildList(elems, idx + 1, env, cdr ->
+                k.apply(new SchemeValue.PairVal(car, cdr))))));
+    }
+
+    // Append two scheme values (first must be a proper list or nil)
+    private SchemeValue appendScheme(SchemeValue a, SchemeValue b) throws EvalError {
+        if (a instanceof SchemeValue.NilVal) return b;
+        if (a instanceof SchemeValue.PairVal p) {
+            return new SchemeValue.PairVal(p.car(), appendScheme(p.cdr(), b));
+        }
+        throw new EvalError("unquote-splicing: expected list");
+    }
+
     private Bounce evalCond(List<SchemeValue> elems, int idx, Environment env, SchemeValue.Cont k) {
         if (idx >= elems.size()) return k.apply(new SchemeValue.VoidVal());
         if (!(elems.get(idx) instanceof SchemeValue.ListVal clause))
@@ -1491,6 +1581,11 @@ public class Evaluator {
         }
         return new Bounce.More(() -> eval(parts.getFirst(), env, testVal -> {
             if (testVal.isTruthy()) {
+                // Handle (cond (test => proc) ...) syntax
+                if (parts.size() == 3 && parts.get(1) instanceof SchemeValue.SymbolVal s && s.name().equals("=>")) {
+                    return new Bounce.More(() -> eval(parts.get(2), env, proc ->
+                        applyProc(proc, List.of(testVal), "cond=>", k)));
+                }
                 if (parts.size() > 1) return evalSeqFrom(parts, 1, env, k);
                 return k.apply(testVal);
             }
@@ -1791,22 +1886,27 @@ public class Evaluator {
     private SchemeValue buildLambda(List<SchemeValue> elems, Environment env, String pos) throws EvalError {
         if (elems.size() < 3) throw new EvalError("lambda requires parameters and body at " + pos);
         SchemeValue paramSpec = elems.get(1);
+        // (lambda x body) — single symbol means all args as rest
+        if (paramSpec instanceof SchemeValue.SymbolVal sym) {
+            List<SchemeValue> body = elems.subList(2, elems.size());
+            return new SchemeValue.LambdaVal(List.of(), sym.name(), body, env);
+        }
         if (!(paramSpec instanceof SchemeValue.ListVal paramList))
             throw new EvalError("lambda: expected parameter list");
         List<String> params = new ArrayList<>();
         String restParam = null;
         List<SchemeValue> pElems = paramList.elements();
         for (int i = 0; i < pElems.size(); i++) {
-            if (pElems.get(i) instanceof SchemeValue.SymbolVal sym && sym.name().equals(".")) {
+            if (pElems.get(i) instanceof SchemeValue.SymbolVal s && s.name().equals(".")) {
                 if (i + 1 >= pElems.size()) throw new EvalError("lambda: expected symbol after dot");
                 if (!(pElems.get(i + 1) instanceof SchemeValue.SymbolVal rest))
                     throw new EvalError("lambda: expected symbol after dot");
                 restParam = rest.name();
                 break;
             }
-            if (!(pElems.get(i) instanceof SchemeValue.SymbolVal sym))
+            if (!(pElems.get(i) instanceof SchemeValue.SymbolVal s))
                 throw new EvalError("lambda: expected symbol as parameter");
-            params.add(sym.name());
+            params.add(s.name());
         }
         List<SchemeValue> body = elems.subList(2, elems.size());
         return new SchemeValue.LambdaVal(params, restParam, body, env);
@@ -1842,9 +1942,26 @@ public class Evaluator {
     private SchemeValue quoteDatum(SchemeValue v) {
         if (v instanceof SchemeValue.ListVal list) {
             if (list.elements().isEmpty()) return SchemeValue.NIL;
+            List<SchemeValue> elems = list.elements();
+            // Handle dotted pair notation: (a b . c) -> last two positions are ". c"
+            int dotIdx = -1;
+            for (int i = 0; i < elems.size(); i++) {
+                if (elems.get(i) instanceof SchemeValue.SymbolVal s && s.name().equals(".")) {
+                    dotIdx = i;
+                    break;
+                }
+            }
+            if (dotIdx >= 0 && dotIdx == elems.size() - 2) {
+                // Dotted pair: build pairs for elements before dot, with last element as cdr
+                SchemeValue result = quoteDatum(elems.get(elems.size() - 1));
+                for (int i = dotIdx - 1; i >= 0; i--) {
+                    result = new SchemeValue.PairVal(quoteDatum(elems.get(i)), result);
+                }
+                return result;
+            }
             SchemeValue result = SchemeValue.NIL;
-            for (int i = list.elements().size() - 1; i >= 0; i--) {
-                result = new SchemeValue.PairVal(quoteDatum(list.elements().get(i)), result);
+            for (int i = elems.size() - 1; i >= 0; i--) {
+                result = new SchemeValue.PairVal(quoteDatum(elems.get(i)), result);
             }
             return result;
         }

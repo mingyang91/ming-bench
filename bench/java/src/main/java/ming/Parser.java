@@ -28,12 +28,42 @@ public class Parser {
                 SchemeValue quoted = parseExpr();
                 yield new SchemeValue.ListVal(List.of(new SchemeValue.SymbolVal("quote", tok.line(), tok.col()), quoted), tok.line(), tok.col());
             }
+            case QUASIQUOTE -> {
+                advance();
+                SchemeValue quoted = parseExpr();
+                yield new SchemeValue.ListVal(List.of(new SchemeValue.SymbolVal("quasiquote", tok.line(), tok.col()), quoted), tok.line(), tok.col());
+            }
+            case UNQUOTE -> {
+                advance();
+                SchemeValue quoted = parseExpr();
+                yield new SchemeValue.ListVal(List.of(new SchemeValue.SymbolVal("unquote", tok.line(), tok.col()), quoted), tok.line(), tok.col());
+            }
+            case UNQUOTE_SPLICING -> {
+                advance();
+                SchemeValue quoted = parseExpr();
+                yield new SchemeValue.ListVal(List.of(new SchemeValue.SymbolVal("unquote-splicing", tok.line(), tok.col()), quoted), tok.line(), tok.col());
+            }
             case SYNTAX_QUOTE -> {
                 advance();
                 SchemeValue quoted = parseExpr();
                 yield new SchemeValue.ListVal(List.of(new SchemeValue.SymbolVal("syntax", tok.line(), tok.col()), quoted), tok.line(), tok.col());
             }
             case LPAREN -> parseList();
+            case VECTOR_OPEN -> {
+                advance();
+                List<SchemeValue> elems = new ArrayList<>();
+                while (peek().type() != Tokenizer.TokenType.RPAREN) {
+                    if (peek().type() == Tokenizer.TokenType.EOF) {
+                        throw new EvalError("Unterminated vector literal at " + tok.line() + ":" + tok.col());
+                    }
+                    elems.add(parseExpr());
+                }
+                advance(); // skip )
+                List<SchemeValue> vectorCall = new ArrayList<>();
+                vectorCall.add(new SchemeValue.SymbolVal("vector", tok.line(), tok.col()));
+                vectorCall.addAll(elems);
+                yield new SchemeValue.ListVal(vectorCall, tok.line(), tok.col());
+            }
             case INTEGER -> { advance(); yield new SchemeValue.IntVal(Long.parseLong(tok.value())); }
             case RATIONAL -> {
                 advance();

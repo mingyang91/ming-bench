@@ -5,7 +5,7 @@ import java.util.List;
 
 public class Tokenizer {
     public enum TokenType {
-        LPAREN, RPAREN, QUOTE, SYNTAX_QUOTE, SYMBOL, INTEGER, RATIONAL, DOUBLE, BOOLEAN, STRING, CHAR, EOF
+        LPAREN, RPAREN, QUOTE, QUASIQUOTE, UNQUOTE, UNQUOTE_SPLICING, SYNTAX_QUOTE, VECTOR_OPEN, SYMBOL, INTEGER, RATIONAL, DOUBLE, BOOLEAN, STRING, CHAR, EOF
     }
 
     public record Token(TokenType type, String value, int pos, int line, int col) {}
@@ -50,6 +50,18 @@ public class Tokenizer {
                 pos++;
             } else if (c == '"') {
                 tokens.add(readString());
+            } else if (c == '`') {
+                tokens.add(token(TokenType.QUASIQUOTE, "`", pos));
+                pos++;
+            } else if (c == ',') {
+                int start = pos;
+                pos++;
+                if (pos < input.length() && input.charAt(pos) == '@') {
+                    pos++;
+                    tokens.add(token(TokenType.UNQUOTE_SPLICING, ",@", start));
+                } else {
+                    tokens.add(token(TokenType.UNQUOTE, ",", start));
+                }
             } else if (c == '#') {
                 tokens.add(readHash());
             } else {
@@ -107,6 +119,10 @@ public class Tokenizer {
         if (c == '\'') {
             pos++;
             return token(TokenType.SYNTAX_QUOTE, "#'", start);
+        }
+        if (c == '(') {
+            pos++;
+            return token(TokenType.VECTOR_OPEN, "#(", start);
         }
         if (c == 't') {
             pos++;
