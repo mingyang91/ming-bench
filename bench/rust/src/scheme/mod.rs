@@ -5,6 +5,7 @@ pub use error::EvalError;
 use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
 use std::rc::Rc;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 type BuiltinFn = fn(&[Value]) -> Result<Value, EvalError>;
 
@@ -182,7 +183,15 @@ enum Value {
     },
     Void,
     Values(Vec<Value>),
+    Record {
+        type_id: u64,
+        type_name: String,
+        fields: Vec<Value>,
+    },
+    DynBuiltin(Rc<dyn Fn(&[Value]) -> Result<Value, EvalError>>),
 }
+
+static RECORD_TYPE_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 impl std::fmt::Debug for Value {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -204,6 +213,8 @@ impl std::fmt::Debug for Value {
             Value::Macro { .. } => write!(f, "Macro"),
             Value::Void => write!(f, "Void"),
             Value::Values(vs) => write!(f, "Values({:?})", vs),
+            Value::Record { type_name, fields, .. } => write!(f, "Record({}, {:?})", type_name, fields),
+            Value::DynBuiltin(_) => write!(f, "DynBuiltin"),
         }
     }
 }
@@ -236,10 +247,11 @@ impl Value {
                 let inner: Vec<String> = v.borrow().iter().map(|v| v.display()).collect();
                 format!("#({})", inner.join(" "))
             }
-            Value::Lambda { .. } | Value::Builtin(_) | Value::CallCC | Value::Macro { .. } => "#<procedure>".to_string(),
+            Value::Lambda { .. } | Value::Builtin(_) | Value::DynBuiltin(_) | Value::CallCC | Value::Macro { .. } => "#<procedure>".to_string(),
             Value::Continuation(_) => "#<continuation>".to_string(),
             Value::Void => "".to_string(),
             Value::Values(_) => "".to_string(),
+            Value::Record { type_name, .. } => format!("#<{}>", type_name),
         }
     }
 
@@ -584,6 +596,7 @@ fn eval_inner(expr: &Expr, env: &Env) -> Result<Trampoline, EvalError> {
                     "do" => return eval_do(expr, &elems[1..], env, span),
                     "vector-set!" => return eval_vector_set(&elems[1..], env, span).map(Trampoline::Done),
                     "define-syntax" => return eval_define_syntax(&elems[1..], env, span).map(Trampoline::Done),
+                    "define-record-type" => return eval_define_record_type(&elems[1..], env, span).map(Trampoline::Done),
                     "raise" if env_get(env, "raise").is_none() => {
                         if elems.len() != 2 {
                             return Err(EvalError::Arity("raise requires 1 argument".into()).with_position(span.line, span.col));
@@ -733,6 +746,7 @@ fn apply_tc(func: &Value, args: &[Value]) -> Result<Trampoline, EvalError> {
             }
         }
         Value::Builtin(f) => f(args).map(Trampoline::Done),
+        Value::DynBuiltin(f) => f(args).map(Trampoline::Done),
         Value::CallCC => {
             if args.len() != 1 {
                 return Err(EvalError::Arity("call/cc requires 1 argument".into()));
@@ -1556,12 +1570,117 @@ fn expand_macro(
     Err(EvalError::Runtime("no matching macro pattern".into()))
 }
 
+// ---------- L20: define-record-type ----------
+
+fn eval_define_record_type(args: &[Expr], env: &Env, span: Span) -> Result<Value, EvalError> {
+    // (define-record-type <name> (constructor field...) predicate (field accessor)...)
+    if args.len() < 3 {
+        return Err(EvalError::Arity("define-record-type requires at least 3 arguments".into()).with_position(span.line, span.col));
+    }
+    let type_name = match &args[0].kind {
+        ExprKind::Symbol(s) => s.clone(),
+        _ => return Err(EvalError::Parse("define-record-type: expected type name".into()).with_position(span.line, span.col)),
+    };
+
+    // Parse constructor: (constructor-name field-name ...)
+    let (ctor_name, ctor_fields) = match &args[1].kind {
+        ExprKind::List(elems) if !elems.is_empty() => {
+            let name = match &elems[0].kind {
+                ExprKind::Symbol(s) => s.clone(),
+                _ => return Err(EvalError::Parse("define-record-type: expected constructor name".into()).with_position(span.line, span.col)),
+            };
+            let fields: Vec<String> = elems[1..].iter().map(|e| match &e.kind {
+                ExprKind::Symbol(s) => Ok(s.clone()),
+                _ => Err(EvalError::Parse("define-record-type: expected field name".into()).with_position(span.line, span.col)),
+            }).collect::<Result<_, _>>()?;
+            (name, fields)
+        }
+        _ => return Err(EvalError::Parse("define-record-type: expected constructor form".into()).with_position(span.line, span.col)),
+    };
+
+    // Parse predicate name
+    let pred_name = match &args[2].kind {
+        ExprKind::Symbol(s) => s.clone(),
+        _ => return Err(EvalError::Parse("define-record-type: expected predicate name".into()).with_position(span.line, span.col)),
+    };
+
+    // Parse field specs: (field-name accessor-name)
+    let mut field_accessors: Vec<(String, String)> = Vec::new();
+    for arg in &args[3..] {
+        match &arg.kind {
+            ExprKind::List(elems) if elems.len() >= 2 => {
+                let field = match &elems[0].kind {
+                    ExprKind::Symbol(s) => s.clone(),
+                    _ => return Err(EvalError::Parse("define-record-type: expected field name".into()).with_position(span.line, span.col)),
+                };
+                let accessor = match &elems[1].kind {
+                    ExprKind::Symbol(s) => s.clone(),
+                    _ => return Err(EvalError::Parse("define-record-type: expected accessor name".into()).with_position(span.line, span.col)),
+                };
+                field_accessors.push((field, accessor));
+            }
+            _ => return Err(EvalError::Parse("define-record-type: expected field spec".into()).with_position(span.line, span.col)),
+        }
+    }
+
+    // Allocate a unique type id
+    let type_id = RECORD_TYPE_COUNTER.fetch_add(1, Ordering::Relaxed);
+
+    // Build field-name-to-ctor-index map for accessor lookup
+    let ctor_field_map: HashMap<String, usize> = ctor_fields.iter().enumerate().map(|(i, f)| (f.clone(), i)).collect();
+
+    // Define constructor
+    let ctor_field_count = ctor_fields.len();
+    let ctor_type_name = type_name.clone();
+    env_set(env, ctor_name, Value::DynBuiltin(Rc::new(move |args: &[Value]| {
+        if args.len() != ctor_field_count {
+            return Err(EvalError::Arity(format!("record constructor expects {} arguments, got {}", ctor_field_count, args.len())));
+        }
+        Ok(Value::Record {
+            type_id,
+            type_name: ctor_type_name.clone(),
+            fields: args.to_vec(),
+        })
+    })));
+
+    // Define predicate
+    env_set(env, pred_name, Value::DynBuiltin(Rc::new(move |args: &[Value]| {
+        if args.len() != 1 {
+            return Err(EvalError::Arity("record predicate requires 1 argument".into()));
+        }
+        Ok(Value::Boolean(matches!(&args[0], Value::Record { type_id: tid, .. } if *tid == type_id)))
+    })));
+
+    // Define accessors
+    for (field_name, accessor_name) in &field_accessors {
+        let idx = match ctor_field_map.get(field_name) {
+            Some(&i) => i,
+            None => return Err(EvalError::Parse(format!("define-record-type: field {} not in constructor", field_name)).with_position(span.line, span.col)),
+        };
+        let acc_name = accessor_name.clone();
+        env_set(env, accessor_name.clone(), Value::DynBuiltin(Rc::new(move |args: &[Value]| {
+            if args.len() != 1 {
+                return Err(EvalError::Arity(format!("{} requires 1 argument", acc_name)));
+            }
+            match &args[0] {
+                Value::Record { type_id: tid, fields, .. } if *tid == type_id => {
+                    Ok(fields[idx].clone())
+                }
+                _ => Err(EvalError::Type(format!("{}: expected record of correct type", acc_name))),
+            }
+        })));
+    }
+
+    Ok(Value::Void)
+}
+
 fn is_special_form(name: &str) -> bool {
     matches!(name,
         "define" | "if" | "quote" | "lambda" | "and" | "or" | "let" | "begin"
         | "cond" | "set!" | "display" | "write" | "newline" | "string-set!"
         | "define-syntax" | "syntax-rules" | "letrec" | "letrec*" | "case" | "do"
         | "vector-set!" | "raise" | "guard" | "with-exception-handler"
+        | "define-record-type"
     )
 }
 
@@ -2349,7 +2468,7 @@ fn builtin_string_downcase(args: &[Value]) -> Result<Value, EvalError> {
 
 fn builtin_is_procedure(args: &[Value]) -> Result<Value, EvalError> {
     if args.len() != 1 { return Err(EvalError::Arity("procedure? requires 1 argument".into())); }
-    Ok(Value::Boolean(matches!(&args[0], Value::Lambda { .. } | Value::Builtin(_) | Value::CallCC | Value::Continuation(_))))
+    Ok(Value::Boolean(matches!(&args[0], Value::Lambda { .. } | Value::Builtin(_) | Value::DynBuiltin(_) | Value::CallCC | Value::Continuation(_))))
 }
 
 // L14: char/integer conversion
