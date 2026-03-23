@@ -9,6 +9,7 @@ pub enum Value {
     Boolean(bool, Span),
     String(String, Span),
     Symbol(String, Span),
+    Char(char, Span),
     List(Vec<Value>, Span),
     Closure {
         params: Vec<String>,
@@ -26,6 +27,7 @@ impl fmt::Display for Value {
             Value::Boolean(false, _) => write!(f, "#f"),
             Value::String(s, _) => write!(f, "\"{s}\""),
             Value::Symbol(s, _) => write!(f, "{s}"),
+            Value::Char(c, _) => write!(f, "#\\{c}"),
             Value::List(elems, _) => {
                 write!(f, "(")?;
                 for (i, elem) in elems.iter().enumerate() {
@@ -43,12 +45,35 @@ impl fmt::Display for Value {
 }
 
 impl Value {
+    /// Format for `display` — strings without quotes, chars as bare characters.
+    pub fn display_string(&self) -> String {
+        match self {
+            Value::String(s, _) => s.clone(),
+            Value::Char(c, _) => c.to_string(),
+            Value::List(elems, _) => {
+                let mut out = String::from("(");
+                for (i, elem) in elems.iter().enumerate() {
+                    if i > 0 {
+                        out.push(' ');
+                    }
+                    out.push_str(&elem.display_string());
+                }
+                out.push(')');
+                out
+            }
+            other => other.to_string(),
+        }
+    }
+}
+
+impl Value {
     pub fn span(&self) -> Span {
         match self {
             Value::Integer(_, s)
             | Value::Boolean(_, s)
             | Value::String(_, s)
             | Value::Symbol(_, s)
+            | Value::Char(_, s)
             | Value::List(_, s) => *s,
             Value::Closure { .. } => Span::default(),
             Value::Void => Span::default(),

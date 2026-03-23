@@ -7,6 +7,7 @@ use crate::scheme::value::Value;
 #[derive(Debug, Clone)]
 pub struct Env {
     inner: Rc<RefCell<EnvInner>>,
+    output: Rc<RefCell<String>>,
 }
 
 impl PartialEq for Env {
@@ -28,6 +29,7 @@ impl Env {
                 bindings: HashMap::new(),
                 parent: None,
             })),
+            output: Rc::new(RefCell::new(String::new())),
         }
     }
 
@@ -37,7 +39,16 @@ impl Env {
                 bindings: HashMap::new(),
                 parent: Some(parent.clone()),
             })),
+            output: parent.output.clone(),
         }
+    }
+
+    pub fn write_output(&self, s: &str) {
+        self.output.borrow_mut().push_str(s);
+    }
+
+    pub fn take_output(&self) -> String {
+        self.output.borrow_mut().split_off(0)
     }
 
     pub fn get(&self, name: &str) -> Option<Value> {

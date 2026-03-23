@@ -7,6 +7,7 @@ pub fn eval(expr: &Value, env: &Env) -> Result<Value, EvalError> {
         Value::Integer(_, _)
         | Value::Boolean(_, _)
         | Value::String(_, _)
+        | Value::Char(_, _)
         | Value::Closure { .. } => Ok(expr.clone()),
         Value::Symbol(name, span) => {
             if let Some(val) = env.get(name) {
@@ -18,7 +19,12 @@ pub fn eval(expr: &Value, env: &Env) -> Result<Value, EvalError> {
                     | "append" | "pair?" | "string?" | "number?" | "boolean?"
                     | "symbol?" | "zero?" | "positive?" | "negative?"
                     | "even?" | "odd?" | "abs" | "min" | "max" | "modulo"
-                    | "remainder" | "quotient" => Ok(expr.clone()),
+                    | "remainder" | "quotient"
+                    | "display" | "write" | "newline"
+                    | "string-append" | "string-length" | "substring"
+                    | "string->number" | "number->string"
+                    | "symbol->string" | "string->symbol"
+                    | "string-ref" | "char?" => Ok(expr.clone()),
                     _ => Err(EvalError::UnboundVariable {
                         name: name.clone(),
                         span: *span,
@@ -65,12 +71,12 @@ fn eval_list(elems: &[Value], list_span: Span, env: &Env) -> Result<Value, EvalE
         .map(|e| eval(e, env))
         .collect::<Result<_, _>>()?;
 
-    apply(&op, &args, list_span)
+    apply(&op, &args, list_span, env)
 }
 
-fn apply(op: &Value, args: &[Value], call_span: Span) -> Result<Value, EvalError> {
+fn apply(op: &Value, args: &[Value], call_span: Span, env: &Env) -> Result<Value, EvalError> {
     match op {
-        Value::Symbol(name, _) => apply_builtin(name, args, call_span),
+        Value::Symbol(name, _) => apply_builtin(name, args, call_span, env),
         Value::Closure {
             params,
             body,
@@ -96,7 +102,7 @@ fn apply(op: &Value, args: &[Value], call_span: Span) -> Result<Value, EvalError
     }
 }
 
-fn apply_builtin(name: &str, args: &[Value], span: Span) -> Result<Value, EvalError> {
+fn apply_builtin(name: &str, args: &[Value], span: Span, env: &Env) -> Result<Value, EvalError> {
     match name {
         "+" => arith_add(args),
         "-" => arith_sub(args, span),
@@ -175,6 +181,18 @@ fn apply_builtin(name: &str, args: &[Value], span: Span) -> Result<Value, EvalEr
         "modulo" => arith_modulo(args, span),
         "remainder" => arith_remainder(args, span),
         "quotient" => arith_div(args, span),
+        "display" => builtin_display(args, span, env),
+        "write" => builtin_write(args, span, env),
+        "newline" => builtin_newline(args, span, env),
+        "string-append" => builtin_string_append(args),
+        "string-length" => builtin_string_length(args, span),
+        "substring" => builtin_substring(args, span),
+        "string->number" => builtin_string_to_number(args, span),
+        "number->string" => builtin_number_to_string(args, span),
+        "symbol->string" => builtin_symbol_to_string(args, span),
+        "string->symbol" => builtin_string_to_symbol(args, span),
+        "string-ref" => builtin_string_ref(args, span),
+        "char?" => Ok(Value::bool(matches!(args, [Value::Char(_, _)]))),
         _ => Err(EvalError::UnboundVariable {
             name: name.to_string(),
             span,
@@ -799,4 +817,216 @@ fn arith_remainder(args: &[Value], form_span: Span) -> Result<Value, EvalError> 
         return Err(EvalError::DivisionByZero { span: form_span });
     }
     Ok(Value::int(nums[0] % nums[1]))
+}
+
+fn builtin_display(args: &[Value], span: Span, env: &Env) -> Result<Value, EvalError> {
+    if args.len() != 1 {
+        return Err(EvalError::WrongArgCount {
+            expected: "1".to_string(),
+            got: args.len(),
+            span,
+        });
+    }
+    env.write_output(&args[0].display_string());
+    Ok(Value::Void)
+}
+
+fn builtin_write(args: &[Value], span: Span, env: &Env) -> Result<Value, EvalError> {
+    if args.len() != 1 {
+        return Err(EvalError::WrongArgCount {
+            expected: "1".to_string(),
+            got: args.len(),
+            span,
+        });
+    }
+    env.write_output(&args[0].to_string());
+    Ok(Value::Void)
+}
+
+fn builtin_newline(args: &[Value], span: Span, env: &Env) -> Result<Value, EvalError> {
+    if !args.is_empty() {
+        return Err(EvalError::WrongArgCount {
+            expected: "0".to_string(),
+            got: args.len(),
+            span,
+        });
+    }
+    env.write_output("\n");
+    Ok(Value::Void)
+}
+
+fn builtin_string_append(args: &[Value]) -> Result<Value, EvalError> {
+    let mut result = String::new();
+    for arg in args {
+        match arg {
+            Value::String(s, _) => result.push_str(s),
+            other => {
+                return Err(EvalError::TypeMismatch {
+                    expected: "string".to_string(),
+                    got: format!("{other}"),
+                    span: other.span(),
+                });
+            }
+        }
+    }
+    Ok(Value::String(result, Span::default()))
+}
+
+fn builtin_string_length(args: &[Value], span: Span) -> Result<Value, EvalError> {
+    if args.len() != 1 {
+        return Err(EvalError::WrongArgCount {
+            expected: "1".to_string(),
+            got: args.len(),
+            span,
+        });
+    }
+    match &args[0] {
+        Value::String(s, _) => Ok(Value::int(s.chars().count() as i64)),
+        other => Err(EvalError::TypeMismatch {
+            expected: "string".to_string(),
+            got: format!("{other}"),
+            span: other.span(),
+        }),
+    }
+}
+
+fn builtin_substring(args: &[Value], span: Span) -> Result<Value, EvalError> {
+    if args.len() != 3 {
+        return Err(EvalError::WrongArgCount {
+            expected: "3".to_string(),
+            got: args.len(),
+            span,
+        });
+    }
+    let Value::String(s, _) = &args[0] else {
+        return Err(EvalError::TypeMismatch {
+            expected: "string".to_string(),
+            got: format!("{}", args[0]),
+            span: args[0].span(),
+        });
+    };
+    let Value::Integer(start, _) = &args[1] else {
+        return Err(EvalError::TypeMismatch {
+            expected: "integer".to_string(),
+            got: format!("{}", args[1]),
+            span: args[1].span(),
+        });
+    };
+    let Value::Integer(end, _) = &args[2] else {
+        return Err(EvalError::TypeMismatch {
+            expected: "integer".to_string(),
+            got: format!("{}", args[2]),
+            span: args[2].span(),
+        });
+    };
+    let chars: Vec<char> = s.chars().collect();
+    let start = *start as usize;
+    let end = *end as usize;
+    let sub: String = chars[start..end].iter().collect();
+    Ok(Value::String(sub, Span::default()))
+}
+
+fn builtin_string_to_number(args: &[Value], span: Span) -> Result<Value, EvalError> {
+    if args.len() != 1 {
+        return Err(EvalError::WrongArgCount {
+            expected: "1".to_string(),
+            got: args.len(),
+            span,
+        });
+    }
+    match &args[0] {
+        Value::String(s, _) => match s.parse::<i64>() {
+            Ok(n) => Ok(Value::int(n)),
+            Err(_) => Ok(Value::bool(false)),
+        },
+        other => Err(EvalError::TypeMismatch {
+            expected: "string".to_string(),
+            got: format!("{other}"),
+            span: other.span(),
+        }),
+    }
+}
+
+fn builtin_number_to_string(args: &[Value], span: Span) -> Result<Value, EvalError> {
+    if args.len() != 1 {
+        return Err(EvalError::WrongArgCount {
+            expected: "1".to_string(),
+            got: args.len(),
+            span,
+        });
+    }
+    match &args[0] {
+        Value::Integer(n, _) => Ok(Value::String(n.to_string(), Span::default())),
+        other => Err(EvalError::TypeMismatch {
+            expected: "number".to_string(),
+            got: format!("{other}"),
+            span: other.span(),
+        }),
+    }
+}
+
+fn builtin_symbol_to_string(args: &[Value], span: Span) -> Result<Value, EvalError> {
+    if args.len() != 1 {
+        return Err(EvalError::WrongArgCount {
+            expected: "1".to_string(),
+            got: args.len(),
+            span,
+        });
+    }
+    match &args[0] {
+        Value::Symbol(s, _) => Ok(Value::String(s.clone(), Span::default())),
+        other => Err(EvalError::TypeMismatch {
+            expected: "symbol".to_string(),
+            got: format!("{other}"),
+            span: other.span(),
+        }),
+    }
+}
+
+fn builtin_string_to_symbol(args: &[Value], span: Span) -> Result<Value, EvalError> {
+    if args.len() != 1 {
+        return Err(EvalError::WrongArgCount {
+            expected: "1".to_string(),
+            got: args.len(),
+            span,
+        });
+    }
+    match &args[0] {
+        Value::String(s, _) => Ok(Value::symbol(s.clone())),
+        other => Err(EvalError::TypeMismatch {
+            expected: "string".to_string(),
+            got: format!("{other}"),
+            span: other.span(),
+        }),
+    }
+}
+
+fn builtin_string_ref(args: &[Value], span: Span) -> Result<Value, EvalError> {
+    if args.len() != 2 {
+        return Err(EvalError::WrongArgCount {
+            expected: "2".to_string(),
+            got: args.len(),
+            span,
+        });
+    }
+    let Value::String(s, _) = &args[0] else {
+        return Err(EvalError::TypeMismatch {
+            expected: "string".to_string(),
+            got: format!("{}", args[0]),
+            span: args[0].span(),
+        });
+    };
+    let Value::Integer(idx, _) = &args[1] else {
+        return Err(EvalError::TypeMismatch {
+            expected: "integer".to_string(),
+            got: format!("{}", args[1]),
+            span: args[1].span(),
+        });
+    };
+    let c = s.chars().nth(*idx as usize).ok_or_else(|| EvalError::TypeMismatch {
+        expected: "valid index".to_string(),
+        got: format!("index {idx} out of bounds"),
+        span,
+    })?;
+    Ok(Value::Char(c, Span::default()))
 }
