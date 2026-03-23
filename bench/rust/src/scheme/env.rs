@@ -44,6 +44,7 @@ impl Env {
             "eqv?",
             "vector", "make-vector", "vector-ref", "vector-set!",
             "vector-length", "vector?", "vector->list", "list->vector",
+            "dynamic-wind", "reverse",
         ] {
             bindings.insert(name.into(), Value::Builtin(name.into()));
         }
