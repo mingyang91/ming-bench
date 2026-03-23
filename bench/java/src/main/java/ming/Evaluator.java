@@ -39,7 +39,7 @@ public class Evaluator {
     private static final Set<String> SPECIAL_FORMS = Set.of(
         "quote", "set!", "define", "lambda", "if", "begin", "cond", "and", "or",
         "let", "let*", "letrec", "letrec*", "case", "do", "define-syntax", "syntax-rules", "guard",
-        "define-record-type", "syntax-case", "syntax", "with-syntax"
+        "define-record-type", "syntax-case", "syntax", "with-syntax", "case-lambda"
     );
 
     public String evalStr(String input) throws EvalError {
@@ -316,7 +316,8 @@ public class Evaluator {
             new SchemeValue.BoolVal(args.getFirst() instanceof SchemeValue.LambdaVal
                 || args.getFirst() instanceof SchemeValue.BuiltinVal
                 || args.getFirst() instanceof SchemeValue.CpsBuiltinVal
-                || args.getFirst() instanceof SchemeValue.ContinuationVal)));
+                || args.getFirst() instanceof SchemeValue.ContinuationVal
+                || args.getFirst() instanceof SchemeValue.CaseLambdaVal)));
 
         // I/O
         env.define("display", new SchemeValue.BuiltinVal("display", args -> {
@@ -984,6 +985,7 @@ public class Evaluator {
             case SchemeValue.ValuesVal v -> k.apply(v);
             case SchemeValue.VectorVal v -> k.apply(v);
             case SchemeValue.RecordVal v -> k.apply(v);
+            case SchemeValue.CaseLambdaVal v -> k.apply(v);
             case SchemeValue.SymbolVal v -> {
                 try {
                     yield k.apply(env.get(v.name()));
@@ -1061,6 +1063,13 @@ public class Evaluator {
             case "lambda" -> {
                 try {
                     yield k.apply(buildLambda(elems, env, pos));
+                } catch (EvalError e) {
+                    yield new Bounce.Err(e);
+                }
+            }
+            case "case-lambda" -> {
+                try {
+                    yield k.apply(buildCaseLambda(elems, env, pos));
                 } catch (EvalError e) {
                     yield new Bounce.Err(e);
                 }
@@ -1174,6 +1183,31 @@ public class Evaluator {
             } catch (EvalError e) {
                 return new Bounce.Err(e);
             }
+        }
+        if (proc instanceof SchemeValue.CaseLambdaVal caseLambda) {
+            for (SchemeValue.LambdaVal clause : caseLambda.clauses()) {
+                int required = clause.params().size();
+                if (clause.restParam() != null) {
+                    if (args.size() >= required) {
+                        try {
+                            Environment callEnv = applyLambdaEnv(clause, args, pos);
+                            return evalBody(clause.body(), callEnv, k);
+                        } catch (EvalError e) {
+                            return new Bounce.Err(e);
+                        }
+                    }
+                } else {
+                    if (args.size() == required) {
+                        try {
+                            Environment callEnv = applyLambdaEnv(clause, args, pos);
+                            return evalBody(clause.body(), callEnv, k);
+                        } catch (EvalError e) {
+                            return new Bounce.Err(e);
+                        }
+                    }
+                }
+            }
+            return new Bounce.Err(new EvalError("case-lambda: no matching clause for " + args.size() + " arguments at " + pos));
         }
         if (proc instanceof SchemeValue.ContinuationVal contVal) {
             SchemeValue val;
@@ -1776,6 +1810,23 @@ public class Evaluator {
         }
         List<SchemeValue> body = elems.subList(2, elems.size());
         return new SchemeValue.LambdaVal(params, restParam, body, env);
+    }
+
+    private SchemeValue buildCaseLambda(List<SchemeValue> elems, Environment env, String pos) throws EvalError {
+        if (elems.size() < 2) throw new EvalError("case-lambda requires at least one clause at " + pos);
+        List<SchemeValue.LambdaVal> clauses = new ArrayList<>();
+        for (int i = 1; i < elems.size(); i++) {
+            if (!(elems.get(i) instanceof SchemeValue.ListVal clauseList))
+                throw new EvalError("case-lambda: clause must be a list at " + pos);
+            List<SchemeValue> cElems = clauseList.elements();
+            if (cElems.size() < 2) throw new EvalError("case-lambda: clause needs params and body at " + pos);
+            // Build a fake lambda form: (lambda params body...)
+            List<SchemeValue> lambdaForm = new ArrayList<>();
+            lambdaForm.add(new SchemeValue.SymbolVal("lambda"));
+            lambdaForm.addAll(cElems);
+            clauses.add((SchemeValue.LambdaVal) buildLambda(lambdaForm, env, pos));
+        }
+        return new SchemeValue.CaseLambdaVal(clauses);
     }
 
     // ── Helpers ───────────────────────────────────────────────────────

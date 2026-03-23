@@ -89,6 +89,8 @@ public sealed interface SchemeValue {
 
     record MacroTransformerVal(SchemeValue transformer, Environment defEnv) implements SchemeValue {}
 
+    record CaseLambdaVal(List<LambdaVal> clauses) implements SchemeValue {}
+
     record ValuesVal(List<SchemeValue> values) implements SchemeValue {}
 
     /** Unique identity token for a record type (compared by reference). */
@@ -146,6 +148,7 @@ public sealed interface SchemeValue {
             }
             case CharVal v -> "#\\" + (v.value() == ' ' ? "space" : v.value() == '\n' ? "newline" : String.valueOf(v.value()));
             case LambdaVal v -> "#<procedure>";
+            case CaseLambdaVal v -> "#<procedure>";
             case VoidVal v -> "#<void>";
             case BuiltinVal v -> "#<procedure:" + v.name() + ">";
             case CpsBuiltinVal v -> "#<procedure:" + v.name() + ">";
