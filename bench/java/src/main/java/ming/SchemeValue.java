@@ -127,6 +127,10 @@ public sealed interface SchemeValue {
         @Override public String display() { return "#<macro>"; }
     }
 
+    record ValuesVal(java.util.List<SchemeValue> values) implements SchemeValue {
+        @Override public String display() { return values.isEmpty() ? "" : values.getFirst().display(); }
+    }
+
     String display();
 
     /** Format for Scheme's display (no quotes on strings, chars as raw chars) */

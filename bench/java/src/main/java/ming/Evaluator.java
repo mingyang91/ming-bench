@@ -140,6 +140,7 @@ public class Evaluator {
             case SchemeValue.ContinuationVal v -> k.apply(v);
             case SchemeValue.MacroVal v -> k.apply(v);
             case SchemeValue.VectorVal v -> k.apply(v);
+            case SchemeValue.ValuesVal v -> k.apply(v);
             case SchemeValue.SymbolVal v -> {
                 try {
                     yield k.apply(env.get(v.name()));
@@ -704,7 +705,8 @@ public class Evaluator {
         "vector-length", "vector?", "vector->list", "list->vector",
         "apply", "call/cc", "call-with-current-continuation",
         "dynamic-wind", "reverse",
-        "raise", "with-exception-handler"
+        "raise", "with-exception-handler",
+        "values", "call-with-values"
     );
 
     private boolean isBuiltin(String name) { return BUILTINS.contains(name); }
@@ -1161,6 +1163,21 @@ public class Evaluator {
                 yield applyProc(thunk, List.of(), result -> {
                     handlerStack.removeLast();
                     return k.apply(result);
+                });
+            }
+            case "values" -> {
+                if (a.size() == 1) yield k.apply(a.getFirst());
+                yield k.apply(new SchemeValue.ValuesVal(a));
+            }
+            case "call-with-values" -> {
+                if (a.size() != 2) throw new EvalError("call-with-values: needs exactly 2 arguments");
+                SchemeValue producer = a.get(0);
+                SchemeValue consumer = a.get(1);
+                yield applyProc(producer, List.of(), produced -> {
+                    if (produced instanceof SchemeValue.ValuesVal mv) {
+                        return applyProc(consumer, mv.values(), k);
+                    }
+                    return applyProc(consumer, List.of(produced), k);
                 });
             }
             case "dynamic-wind" -> {
