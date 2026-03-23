@@ -76,6 +76,11 @@ public class Evaluator {
         }
     }
 
+    private static class MultipleValues {
+        final List<Object> values;
+        MultipleValues(List<Object> values) { this.values = values; }
+    }
+
     private static final Object CALL_CC = new Object() {
         @Override public String toString() { return "#<procedure:call/cc>"; }
     };
@@ -638,6 +643,24 @@ public class Evaluator {
                     if (proc instanceof String p && p.equals("with-exception-handler")) {
                         if (args.size() != 2) throw posError("with-exception-handler: expected 2 arguments");
                         return cpsWithExceptionHandler(args.get(0), args.get(1), k);
+                    }
+                    if (proc instanceof String p && p.equals("values")) {
+                        if (args.size() == 1) return k.apply(args.get(0));
+                        return k.apply(new MultipleValues(args));
+                    }
+                    if (proc instanceof String p && p.equals("call-with-values")) {
+                        if (args.size() != 2) throw posError("call-with-values: expected 2 arguments");
+                        Object producer = args.get(0);
+                        Object consumer = args.get(1);
+                        return applyProc(producer, List.of(), producerResult -> {
+                            List<Object> consumerArgs;
+                            if (producerResult instanceof MultipleValues mv) {
+                                consumerArgs = mv.values;
+                            } else {
+                                consumerArgs = List.of(producerResult);
+                            }
+                            return applyProc(consumer, consumerArgs, k);
+                        });
                     }
                     return applyProc(proc, args, k);
                 });
@@ -1227,7 +1250,8 @@ public class Evaluator {
             "char=?", "char<?",
             "string=?", "string<?", "string-ci=?", "string-upcase", "string-downcase",
             "map", "dynamic-wind", "reverse",
-            "raise", "with-exception-handler"
+            "raise", "with-exception-handler",
+            "values", "call-with-values"
     );
 
     private boolean isPrimitive(String name) {
@@ -1630,6 +1654,8 @@ public class Evaluator {
             case "dynamic-wind" -> throw posError("dynamic-wind: handled in eval");
             case "raise" -> throw posError("raise: handled in eval");
             case "with-exception-handler" -> throw posError("with-exception-handler: handled in eval");
+            case "values" -> throw posError("values: handled in eval");
+            case "call-with-values" -> throw posError("call-with-values: handled in eval");
             case "reverse" -> {
                 requireArgCount(args, 1, "reverse");
                 Object lst = args.get(0);
