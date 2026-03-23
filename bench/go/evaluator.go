@@ -22,6 +22,14 @@ func TopEnv() *Env {
 	env.Set("call/cc", callcc)
 	env.Set("call-with-current-continuation", callcc)
 	env.Set("dynamic-wind", &SchemeDynamicWind{})
+	env.Set("raise", &BuiltinProc{Name: "raise", Fn: func(args []SchemeValue, callExpr *ListExpr) (SchemeValue, error) {
+		if len(args) != 1 {
+			line, col := callExpr.Pos()
+			return nil, &EvalError{Message: fmt.Sprintf("%d:%d: raise: requires exactly 1 argument", line, col)}
+		}
+		return nil, &schemeRaiseError{value: args[0]}
+	}})
+	env.Set("with-exception-handler", &EnvBuiltinProc{Name: "with-exception-handler", Fn: builtinWithExceptionHandler})
 	return env
 }
 
@@ -111,6 +119,13 @@ type contJumpError struct {
 }
 
 func (e *contJumpError) Error() string { return "continuation jump" }
+
+// schemeRaiseError signals a Scheme raise (exception).
+type schemeRaiseError struct {
+	value SchemeValue
+}
+
+func (e *schemeRaiseError) Error() string { return "raise: " + e.value.String() }
 
 // Internal context type stored in environment for let-skip.
 type letCtxVal struct {
@@ -380,6 +395,48 @@ func Eval(expr Expr, env *Env) (SchemeValue, error) {
 					expr = newExpr
 					env = newEnv
 					continue
+
+				case "raise":
+					// Only treat as special form if not locally shadowed
+					if v, found := env.Get("raise"); found {
+						if _, isBuiltin := v.(*BuiltinProc); !isBuiltin {
+							break // fall through to normal application
+						}
+					}
+					if len(e.Elements) != 2 {
+						line, col := e.Pos()
+						return nil, &EvalError{Message: fmt.Sprintf("%d:%d: raise: requires exactly 1 argument", line, col)}
+					}
+					val, err := Eval(e.Elements[1], env)
+					if err != nil {
+						return nil, err
+					}
+					return nil, &schemeRaiseError{value: val}
+
+				case "with-exception-handler":
+					if len(e.Elements) != 3 {
+						line, col := e.Pos()
+						return nil, &EvalError{Message: fmt.Sprintf("%d:%d: with-exception-handler: requires exactly 2 arguments", line, col)}
+					}
+					handlerVal, err := Eval(e.Elements[1], env)
+					if err != nil {
+						return nil, err
+					}
+					thunkVal, err := Eval(e.Elements[2], env)
+					if err != nil {
+						return nil, err
+					}
+					result, err := applyFunc(thunkVal, []SchemeValue{}, e, env)
+					if err != nil {
+						if raiseErr, ok := err.(*schemeRaiseError); ok {
+							return applyFunc(handlerVal, []SchemeValue{raiseErr.value}, e, env)
+						}
+						return nil, err
+					}
+					return result, nil
+
+				case "guard":
+					return evalGuard(e, env)
 				}
 			}
 
@@ -2744,4 +2801,114 @@ func builtinError(args []SchemeValue, callExpr *ListExpr) (SchemeValue, error) {
 		msg.WriteString(displayValue(a))
 	}
 	return nil, &EvalError{Message: fmt.Sprintf("%d:%d: %s", line, col, msg.String())}
+}
+
+func builtinWithExceptionHandler(args []SchemeValue, callExpr *ListExpr, env *Env) (SchemeValue, error) {
+	if len(args) != 2 {
+		line, col := callExpr.Pos()
+		return nil, &EvalError{Message: fmt.Sprintf("%d:%d: with-exception-handler: requires exactly 2 arguments", line, col)}
+	}
+	handler, thunk := args[0], args[1]
+	result, err := applyFunc(thunk, []SchemeValue{}, callExpr, env)
+	if err != nil {
+		if raiseErr, ok := err.(*schemeRaiseError); ok {
+			return applyFunc(handler, []SchemeValue{raiseErr.value}, callExpr, env)
+		}
+		return nil, err
+	}
+	return result, nil
+}
+
+// evalGuard implements (guard (var clause...) body...)
+func evalGuard(e *ListExpr, env *Env) (SchemeValue, error) {
+	if len(e.Elements) < 3 {
+		line, col := e.Pos()
+		return nil, &EvalError{Message: fmt.Sprintf("%d:%d: guard: bad syntax", line, col)}
+	}
+
+	// Parse the clauses: (var clause1 clause2 ...)
+	clauseList, ok := e.Elements[1].(*ListExpr)
+	if !ok || len(clauseList.Elements) < 1 {
+		line, col := e.Pos()
+		return nil, &EvalError{Message: fmt.Sprintf("%d:%d: guard: bad syntax", line, col)}
+	}
+
+	varSym, ok := clauseList.Elements[0].(*SymbolExpr)
+	if !ok {
+		line, col := e.Pos()
+		return nil, &EvalError{Message: fmt.Sprintf("%d:%d: guard: bad syntax", line, col)}
+	}
+
+	clauses := clauseList.Elements[1:]
+	body := e.Elements[2:]
+
+	// Evaluate the body expressions
+	var result SchemeValue
+	var bodyErr error
+	for _, b := range body {
+		result, bodyErr = Eval(b, env)
+		if bodyErr != nil {
+			break
+		}
+	}
+
+	// If no exception, return the body result
+	if bodyErr == nil {
+		return result, nil
+	}
+
+	// Check if it's a raise error
+	raiseErr, isRaise := bodyErr.(*schemeRaiseError)
+	if !isRaise {
+		return nil, bodyErr
+	}
+
+	// Bind the exception value to the variable and test clauses
+	guardEnv := NewEnv(env)
+	guardEnv.Set(varSym.Name, raiseErr.value)
+
+	for _, clause := range clauses {
+		cl, ok := clause.(*ListExpr)
+		if !ok || len(cl.Elements) == 0 {
+			line, col := e.Pos()
+			return nil, &EvalError{Message: fmt.Sprintf("%d:%d: guard: bad clause", line, col)}
+		}
+
+		// Check for else clause
+		if sym, ok := cl.Elements[0].(*SymbolExpr); ok && sym.Name == "else" {
+			// Evaluate else body
+			var res SchemeValue
+			for _, expr := range cl.Elements[1:] {
+				var err error
+				res, err = Eval(expr, guardEnv)
+				if err != nil {
+					return nil, err
+				}
+			}
+			return res, nil
+		}
+
+		// Evaluate the test
+		testResult, err := Eval(cl.Elements[0], guardEnv)
+		if err != nil {
+			return nil, err
+		}
+		if isTruthy(testResult) {
+			// Evaluate the clause body
+			if len(cl.Elements) == 1 {
+				return testResult, nil
+			}
+			var res SchemeValue
+			for _, expr := range cl.Elements[1:] {
+				res, err = Eval(expr, guardEnv)
+				if err != nil {
+					return nil, err
+				}
+			}
+			return res, nil
+		}
+	}
+
+	// No clause matched, re-raise
+	return nil, raiseErr
 }
