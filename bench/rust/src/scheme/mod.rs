@@ -452,6 +452,10 @@ fn is_builtin(name: &str) -> bool {
             | "string->symbol"
             | "string-ref"
             | "string-copy"
+            | "string->list"
+            | "list->string"
+            | "char->integer"
+            | "integer->char"
             | "char?"
             | "apply"
             | "call/cc"
@@ -1167,9 +1171,18 @@ fn run_cek(initial_ctrl: Ctrl, initial_kont: Vec<KontFrame>) -> Result<Value, Ev
                                     }
                                     let var_name = match &items[1].kind {
                                         ExprKind::Symbol(s) => s.clone(),
-                                        _ => return Err(EvalError::Type("string-set!: first argument must be a variable".into()).at(el, ec)),
+                                        ExprKind::Str(_) => {
+                                            return Err(EvalError::Type("string-set!: strings are immutable".into()).at(el, ec));
+                                        }
+                                        _ => return Err(EvalError::Type("string-set!: first argument must be a string variable".into()).at(el, ec)),
                                     };
-                                    kont.push(KontFrame::StrSetIdx { var: var_name, ch_expr: items[3].clone(), env: env.clone(), el, ec });
+                                    kont.push(KontFrame::StrSetIdx {
+                                        var: var_name,
+                                        ch_expr: items[3].clone(),
+                                        env: env.clone(),
+                                        el,
+                                        ec,
+                                    });
                                     Ctrl::Eval(items[2].clone(), env)
                                 }
                                 Some("call/cc") | Some("call-with-current-continuation") => {
@@ -1685,6 +1698,69 @@ fn eval_builtin(op: &str, args: &[Value]) -> Result<Value, EvalError> {
             match &args[0] {
                 Value::Str(s) => Ok(Value::Str(s.clone())),
                 _ => Err(EvalError::Type("string-copy: not a string".into())),
+            }
+        }
+        "string->list" => {
+            if args.len() != 1 {
+                return Err(EvalError::Arity("string->list requires 1 argument".into()));
+            }
+            match &args[0] {
+                Value::Str(s) => {
+                    let chars: Vec<Value> = s.chars().map(Value::Char).collect();
+                    Ok(Value::List(chars))
+                }
+                _ => Err(EvalError::Type("string->list: not a string".into())),
+            }
+        }
+        "list->string" => {
+            if args.len() != 1 {
+                return Err(EvalError::Arity("list->string requires 1 argument".into()));
+            }
+            let items = match &args[0] {
+                Value::List(v) => v.clone(),
+                Value::Pair(..) => {
+                    let mut items = Vec::new();
+                    let mut cur = args[0].clone();
+                    loop {
+                        match cur {
+                            Value::Pair(car, cdr) => {
+                                items.push(*car);
+                                cur = *cdr;
+                            }
+                            Value::List(ref v) if v.is_empty() => break,
+                            _ => return Err(EvalError::Type("list->string: not a proper list".into())),
+                        }
+                    }
+                    items
+                }
+                _ => return Err(EvalError::Type("list->string: not a proper list".into())),
+            };
+            let mut s = String::new();
+            for item in &items {
+                match item {
+                    Value::Char(c) => s.push(*c),
+                    _ => return Err(EvalError::Type("list->string: element is not a character".into())),
+                }
+            }
+            Ok(Value::Str(s))
+        }
+        "char->integer" => {
+            if args.len() != 1 {
+                return Err(EvalError::Arity("char->integer requires 1 argument".into()));
+            }
+            match &args[0] {
+                Value::Char(c) => Ok(Value::Integer(*c as i64)),
+                _ => Err(EvalError::Type("char->integer: not a character".into())),
+            }
+        }
+        "integer->char" => {
+            if args.len() != 1 {
+                return Err(EvalError::Arity("integer->char requires 1 argument".into()));
+            }
+            let n = as_integer(&args[0])?;
+            match char::from_u32(n as u32) {
+                Some(c) => Ok(Value::Char(c)),
+                None => Err(EvalError::Type("integer->char: invalid code point".into())),
             }
         }
         "char?" => {
