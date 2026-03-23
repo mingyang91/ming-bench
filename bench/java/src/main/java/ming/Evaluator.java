@@ -1176,10 +1176,12 @@ public class Evaluator {
             }
         }
         if (proc instanceof SchemeValue.ContinuationVal contVal) {
-            if (args.size() != 1) {
-                return new Bounce.Err(new EvalError("continuation requires exactly 1 argument at " + pos));
+            SchemeValue val;
+            if (args.size() == 1) {
+                val = args.getFirst();
+            } else {
+                val = new SchemeValue.ValuesVal(args);
             }
-            SchemeValue val = args.getFirst();
             @SuppressWarnings("unchecked")
             List<WindRecord> targetWinds = (List<WindRecord>) contVal.windState();
             if (targetWinds == null) {
@@ -1259,7 +1261,7 @@ public class Evaluator {
         handlerStack.add(handler);
         return evalBody(body, env, result -> {
             handlerStack.remove(handlerStack.size() - 1);
-            return k.apply(result);
+            return new Bounce.More(() -> k.apply(result));
         });
     }
 
