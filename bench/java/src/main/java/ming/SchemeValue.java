@@ -1,6 +1,7 @@
 package ming;
 
 import java.util.List;
+import java.util.Map;
 
 public sealed interface SchemeValue {
     record IntVal(long value) implements SchemeValue {}
@@ -80,6 +81,25 @@ public sealed interface SchemeValue {
 
     record ValuesVal(List<SchemeValue> values) implements SchemeValue {}
 
+    /** Unique identity token for a record type (compared by reference). */
+    final class RecordTypeTag {
+        final String name;
+        final List<String> fieldNames;
+        RecordTypeTag(String name, List<String> fieldNames) {
+            this.name = name;
+            this.fieldNames = fieldNames;
+        }
+    }
+
+    final class RecordVal implements SchemeValue {
+        final RecordTypeTag tag;
+        final SchemeValue[] fields;
+        RecordVal(RecordTypeTag tag, SchemeValue[] fields) {
+            this.tag = tag;
+            this.fields = fields;
+        }
+    }
+
     static SchemeValue NIL = new NilVal();
 
     default boolean isTruthy() {
@@ -122,6 +142,7 @@ public sealed interface SchemeValue {
             case ContinuationVal v -> "#<procedure>";
             case SyntaxRulesVal v -> "#<syntax>";
             case ValuesVal v -> "#<values>";
+            case RecordVal v -> "#<record:" + v.tag.name + ">";
         };
     }
 
