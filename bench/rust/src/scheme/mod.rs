@@ -297,15 +297,37 @@ fn parse(input: &str) -> Result<Vec<Expr>, EvalError> {
 
 // ---------- Evaluator ----------
 
+/// Result of evaluation: either a final value or a tail call to trampoline.
+enum Trampoline {
+    Done(Value),
+    TailCall { expr: Expr, env: Env },
+}
+
 fn eval(expr: &Expr, env: &Env) -> Result<Value, EvalError> {
+    let mut current_expr = expr.clone();
+    let mut current_env = env.clone();
+    loop {
+        match eval_inner(&current_expr, &current_env)? {
+            Trampoline::Done(v) => return Ok(v),
+            Trampoline::TailCall { expr: e, env: en } => {
+                current_expr = e;
+                current_env = en;
+            }
+        }
+    }
+}
+
+fn eval_inner(expr: &Expr, env: &Env) -> Result<Trampoline, EvalError> {
     let span = expr.span;
     let result = match &expr.kind {
-        ExprKind::Integer(n) => Ok(Value::Integer(*n)),
-        ExprKind::Boolean(b) => Ok(Value::Boolean(*b)),
-        ExprKind::Str(s) => Ok(Value::Str(s.clone())),
-        ExprKind::Char(c) => Ok(Value::Char(*c)),
+        ExprKind::Integer(n) => Ok(Trampoline::Done(Value::Integer(*n))),
+        ExprKind::Boolean(b) => Ok(Trampoline::Done(Value::Boolean(*b))),
+        ExprKind::Str(s) => Ok(Trampoline::Done(Value::Str(s.clone()))),
+        ExprKind::Char(c) => Ok(Trampoline::Done(Value::Char(*c))),
         ExprKind::Symbol(name) => {
-            env_get(env, name).ok_or_else(|| EvalError::UnboundVariable(name.clone()))
+            env_get(env, name)
+                .map(Trampoline::Done)
+                .ok_or_else(|| EvalError::UnboundVariable(name.clone()))
         }
         ExprKind::List(elems) => {
             if elems.is_empty() {
@@ -314,22 +336,22 @@ fn eval(expr: &Expr, env: &Env) -> Result<Value, EvalError> {
             // Check for special forms
             if let ExprKind::Symbol(op) = &elems[0].kind {
                 match op.as_str() {
-                    "define" => return eval_define(&elems[1..], env, span),
-                    "if" => return eval_if(&elems[1..], env, span),
-                    "quote" => return eval_quote(&elems[1..], span),
-                    "lambda" => return eval_lambda(&elems[1..], env, span),
-                    "and" => return eval_and(&elems[1..], env),
-                    "or" => return eval_or(&elems[1..], env),
-                    "let" => return eval_let(&elems[1..], env, span),
-                    "begin" => return eval_begin(&elems[1..], env),
-                    "cond" => return eval_cond(&elems[1..], env),
+                    "define" => return eval_define(&elems[1..], env, span).map(Trampoline::Done),
+                    "if" => return eval_if_tc(&elems[1..], env, span),
+                    "quote" => return eval_quote(&elems[1..], span).map(Trampoline::Done),
+                    "lambda" => return eval_lambda(&elems[1..], env, span).map(Trampoline::Done),
+                    "and" => return eval_and_tc(&elems[1..], env),
+                    "or" => return eval_or_tc(&elems[1..], env),
+                    "let" => return eval_let_tc(&elems[1..], env, span),
+                    "begin" => return eval_begin_tc(&elems[1..], env),
+                    "cond" => return eval_cond_tc(&elems[1..], env),
                     "display" => {
                         if elems.len() != 2 {
                             return Err(EvalError::Arity("display requires 1 argument".into()).with_position(span.line, span.col));
                         }
                         let val = eval(&elems[1], env)?;
                         output_write(&val.display_output());
-                        return Ok(Value::Void);
+                        return Ok(Trampoline::Done(Value::Void));
                     }
                     "write" => {
                         if elems.len() != 2 {
@@ -337,29 +359,29 @@ fn eval(expr: &Expr, env: &Env) -> Result<Value, EvalError> {
                         }
                         let val = eval(&elems[1], env)?;
                         output_write(&val.write_output());
-                        return Ok(Value::Void);
+                        return Ok(Trampoline::Done(Value::Void));
                     }
                     "newline" => {
                         if elems.len() != 1 {
                             return Err(EvalError::Arity("newline requires 0 arguments".into()).with_position(span.line, span.col));
                         }
                         output_write("\n");
-                        return Ok(Value::Void);
+                        return Ok(Trampoline::Done(Value::Void));
                     }
-                    "string-set!" => return eval_string_set(&elems[1..], env, span),
+                    "string-set!" => return eval_string_set(&elems[1..], env, span).map(Trampoline::Done),
                     _ => {}
                 }
             }
             // Function application
             let func = eval(&elems[0], env)?;
             let args: Result<Vec<Value>, _> = elems[1..].iter().map(|a| eval(a, env)).collect();
-            apply(&func, &args?)
+            apply_tc(&func, &args?)
         }
     };
     result.map_err(|e| e.with_position(span.line, span.col))
 }
 
-fn apply(func: &Value, args: &[Value]) -> Result<Value, EvalError> {
+fn apply_tc(func: &Value, args: &[Value]) -> Result<Trampoline, EvalError> {
     match func {
         Value::Lambda { params, body, env } => {
             if args.len() != params.len() {
@@ -371,13 +393,16 @@ fn apply(func: &Value, args: &[Value]) -> Result<Value, EvalError> {
             for (p, a) in params.iter().zip(args) {
                 env_set(&local, p.clone(), a.clone());
             }
-            let mut result = Value::Void;
-            for expr in body {
-                result = eval(expr, &local)?;
+            // Eval all but last, then tail-call the last
+            for expr in &body[..body.len() - 1] {
+                eval(expr, &local)?;
             }
-            Ok(result)
+            Ok(Trampoline::TailCall {
+                expr: body.last().unwrap().clone(),
+                env: local,
+            })
         }
-        Value::Builtin(f) => f(args),
+        Value::Builtin(f) => f(args).map(Trampoline::Done),
         _ => Err(EvalError::Type("not a procedure".into())),
     }
 }
@@ -419,17 +444,17 @@ fn eval_define(args: &[Expr], env: &Env, span: Span) -> Result<Value, EvalError>
     }
 }
 
-fn eval_if(args: &[Expr], env: &Env, span: Span) -> Result<Value, EvalError> {
+fn eval_if_tc(args: &[Expr], env: &Env, span: Span) -> Result<Trampoline, EvalError> {
     if args.len() < 2 || args.len() > 3 {
         return Err(EvalError::Arity("if requires 2 or 3 arguments".into()).with_position(span.line, span.col));
     }
     let cond = eval(&args[0], env)?;
     if cond.is_truthy() {
-        eval(&args[1], env)
+        Ok(Trampoline::TailCall { expr: args[1].clone(), env: env.clone() })
     } else if args.len() == 3 {
-        eval(&args[2], env)
+        Ok(Trampoline::TailCall { expr: args[2].clone(), env: env.clone() })
     } else {
-        Ok(Value::Void)
+        Ok(Trampoline::Done(Value::Void))
     }
 }
 
@@ -475,29 +500,33 @@ fn eval_lambda(args: &[Expr], env: &Env, span: Span) -> Result<Value, EvalError>
     })
 }
 
-fn eval_and(args: &[Expr], env: &Env) -> Result<Value, EvalError> {
-    let mut result = Value::Boolean(true);
-    for a in args {
-        result = eval(a, env)?;
+fn eval_and_tc(args: &[Expr], env: &Env) -> Result<Trampoline, EvalError> {
+    if args.is_empty() {
+        return Ok(Trampoline::Done(Value::Boolean(true)));
+    }
+    for a in &args[..args.len() - 1] {
+        let result = eval(a, env)?;
         if !result.is_truthy() {
-            return Ok(result);
+            return Ok(Trampoline::Done(result));
         }
     }
-    Ok(result)
+    Ok(Trampoline::TailCall { expr: args.last().unwrap().clone(), env: env.clone() })
 }
 
-fn eval_or(args: &[Expr], env: &Env) -> Result<Value, EvalError> {
-    let mut result = Value::Boolean(false);
-    for a in args {
-        result = eval(a, env)?;
+fn eval_or_tc(args: &[Expr], env: &Env) -> Result<Trampoline, EvalError> {
+    if args.is_empty() {
+        return Ok(Trampoline::Done(Value::Boolean(false)));
+    }
+    for a in &args[..args.len() - 1] {
+        let result = eval(a, env)?;
         if result.is_truthy() {
-            return Ok(result);
+            return Ok(Trampoline::Done(result));
         }
     }
-    Ok(result)
+    Ok(Trampoline::TailCall { expr: args.last().unwrap().clone(), env: env.clone() })
 }
 
-fn eval_let(args: &[Expr], env: &Env, span: Span) -> Result<Value, EvalError> {
+fn eval_let_tc(args: &[Expr], env: &Env, span: Span) -> Result<Trampoline, EvalError> {
     if args.len() < 2 {
         return Err(EvalError::Arity("let requires bindings and body".into()).with_position(span.line, span.col));
     }
@@ -532,11 +561,14 @@ fn eval_let(args: &[Expr], env: &Env, span: Span) -> Result<Value, EvalError> {
         for (p, v) in params.iter().zip(&inits) {
             env_set(&local, p.clone(), v.clone());
         }
-        let mut result = Value::Void;
-        for expr in &args[2..] {
-            result = eval(expr, &local)?;
+        let body = &args[2..];
+        for expr in &body[..body.len() - 1] {
+            eval(expr, &local)?;
         }
-        return Ok(result);
+        return Ok(Trampoline::TailCall {
+            expr: body.last().unwrap().clone(),
+            env: local,
+        });
     }
     let bindings_expr = match &args[0].kind {
         ExprKind::List(b) => b,
@@ -556,47 +588,62 @@ fn eval_let(args: &[Expr], env: &Env, span: Span) -> Result<Value, EvalError> {
             _ => return Err(EvalError::Parse("let: expected (var init) pair".into()).with_position(span.line, span.col)),
         }
     }
-    let mut result = Value::Void;
-    for expr in &args[1..] {
-        result = eval(expr, &local)?;
+    let body = &args[1..];
+    for expr in &body[..body.len() - 1] {
+        eval(expr, &local)?;
     }
-    Ok(result)
+    Ok(Trampoline::TailCall {
+        expr: body.last().unwrap().clone(),
+        env: local,
+    })
 }
 
-fn eval_begin(args: &[Expr], env: &Env) -> Result<Value, EvalError> {
-    let mut result = Value::Void;
-    for expr in args {
-        result = eval(expr, env)?;
+fn eval_begin_tc(args: &[Expr], env: &Env) -> Result<Trampoline, EvalError> {
+    if args.is_empty() {
+        return Ok(Trampoline::Done(Value::Void));
     }
-    Ok(result)
+    for expr in &args[..args.len() - 1] {
+        eval(expr, env)?;
+    }
+    Ok(Trampoline::TailCall { expr: args.last().unwrap().clone(), env: env.clone() })
 }
 
-fn eval_cond(args: &[Expr], env: &Env) -> Result<Value, EvalError> {
+fn eval_cond_tc(args: &[Expr], env: &Env) -> Result<Trampoline, EvalError> {
     for clause in args {
         match &clause.kind {
             ExprKind::List(parts) if !parts.is_empty() => {
                 if let ExprKind::Symbol(s) = &parts[0].kind {
                     if s == "else" {
-                        let mut result = Value::Void;
-                        for expr in &parts[1..] {
-                            result = eval(expr, env)?;
+                        if parts.len() == 1 {
+                            return Ok(Trampoline::Done(Value::Void));
                         }
-                        return Ok(result);
+                        for expr in &parts[1..parts.len() - 1] {
+                            eval(expr, env)?;
+                        }
+                        return Ok(Trampoline::TailCall {
+                            expr: parts.last().unwrap().clone(),
+                            env: env.clone(),
+                        });
                     }
                 }
                 let test = eval(&parts[0], env)?;
                 if test.is_truthy() {
-                    let mut result = test;
-                    for expr in &parts[1..] {
-                        result = eval(expr, env)?;
+                    if parts.len() == 1 {
+                        return Ok(Trampoline::Done(test));
                     }
-                    return Ok(result);
+                    for expr in &parts[1..parts.len() - 1] {
+                        eval(expr, env)?;
+                    }
+                    return Ok(Trampoline::TailCall {
+                        expr: parts.last().unwrap().clone(),
+                        env: env.clone(),
+                    });
                 }
             }
             _ => return Err(EvalError::Parse("cond: expected clause".into())),
         }
     }
-    Ok(Value::Void)
+    Ok(Trampoline::Done(Value::Void))
 }
 
 fn eval_string_set(args: &[Expr], env: &Env, span: Span) -> Result<Value, EvalError> {
