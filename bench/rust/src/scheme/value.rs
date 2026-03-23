@@ -15,6 +15,7 @@ pub enum Value {
     List(Vec<Value>, Span),
     Closure {
         params: Vec<String>,
+        rest_param: Option<String>,
         body: Box<Value>,
         env: Env,
     },
@@ -30,9 +31,9 @@ impl PartialEq for Value {
             (Value::Symbol(a, _), Value::Symbol(b, _)) => a == b,
             (Value::Char(a, _), Value::Char(b, _)) => a == b,
             (Value::List(a, _), Value::List(b, _)) => a == b,
-            (Value::Closure { params: p1, body: b1, env: e1 },
-             Value::Closure { params: p2, body: b2, env: e2 }) => {
-                p1 == p2 && b1 == b2 && e1 == e2
+            (Value::Closure { params: p1, rest_param: r1, body: b1, env: e1 },
+             Value::Closure { params: p2, rest_param: r2, body: b2, env: e2 }) => {
+                p1 == p2 && r1 == r2 && b1 == b2 && e1 == e2
             }
             (Value::Void, Value::Void) => true,
             _ => false,

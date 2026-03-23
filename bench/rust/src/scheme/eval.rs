@@ -24,6 +24,42 @@ fn eval_or_prefix(exprs: &[Value], env: &Env) -> Result<Option<Value>, EvalError
     Ok(None)
 }
 
+/// Validate argument count and bind parameters for a closure call.
+/// Returns the local environment with all params (and rest param) bound.
+fn bind_closure_args(
+    params: &[String],
+    rest_param: &Option<String>,
+    args: &[Value],
+    closure_env: &Env,
+    span: Span,
+) -> Result<Env, EvalError> {
+    let min_args = params.len();
+    if rest_param.is_some() {
+        if args.len() < min_args {
+            return Err(EvalError::WrongArgCount {
+                expected: format!("at least {min_args}"),
+                got: args.len(),
+                span,
+            });
+        }
+    } else if args.len() != min_args {
+        return Err(EvalError::WrongArgCount {
+            expected: min_args.to_string(),
+            got: args.len(),
+            span,
+        });
+    }
+    let local_env = Env::with_parent(closure_env);
+    for (param, arg) in params.iter().zip(args.iter()) {
+        local_env.define(param.clone(), arg.clone());
+    }
+    if let Some(rest) = rest_param {
+        let rest_vals = args[min_args..].to_vec();
+        local_env.define(rest.clone(), Value::list(rest_vals));
+    }
+    Ok(local_env)
+}
+
 pub fn eval(expr: &Value, env: &Env) -> Result<Value, EvalError> {
     let mut current_expr = expr.clone();
     let mut current_env = env.clone();
@@ -51,7 +87,7 @@ pub fn eval(expr: &Value, env: &Env) -> Result<Value, EvalError> {
                     | "string->number" | "number->string"
                     | "symbol->string" | "string->symbol"
                     | "string-ref" | "string-set!" | "string-copy"
-                    | "char?" => Ok(current_expr.clone()),
+                    | "char?" | "apply" => Ok(current_expr.clone()),
                     _ => Err(EvalError::UnboundVariable {
                         name: name.clone(),
                         span: *span,
@@ -197,25 +233,62 @@ pub fn eval(expr: &Value, env: &Env) -> Result<Value, EvalError> {
                     .map(|e| eval(e, &current_env))
                     .collect::<Result<_, _>>()?;
 
+                // Handle apply: (apply fn prefix... arg-list)
+                if let Value::Symbol(ref name, _) = op {
+                    if name == "apply" {
+                        if args.len() < 2 {
+                            return Err(EvalError::WrongArgCount {
+                                expected: "at least 2".to_string(),
+                                got: args.len(),
+                                span: list_span,
+                            });
+                        }
+                        let func = args[0].clone();
+                        let last = &args[args.len() - 1];
+                        let Value::List(tail_list, _) = last else {
+                            return Err(EvalError::TypeMismatch {
+                                expected: "list".to_string(),
+                                got: last.to_string(),
+                                span: last.span(),
+                            });
+                        };
+                        let mut full_args: Vec<Value> = args[1..args.len() - 1].to_vec();
+                        full_args.extend(tail_list.iter().cloned());
+
+                        // Re-dispatch with the assembled args
+                        match func {
+                            Value::Symbol(ref bname, _) => return apply_builtin(bname, &full_args, list_span, &current_env),
+                            Value::Closure {
+                                ref params,
+                                ref rest_param,
+                                ref body,
+                                env: ref closure_env,
+                            } => {
+                                let local_env = bind_closure_args(params, rest_param, &full_args, closure_env, list_span)?;
+                                current_expr = *body.clone();
+                                current_env = local_env;
+                                continue;
+                            }
+                            other => {
+                                return Err(EvalError::NotAProcedure {
+                                    value: other.to_string(),
+                                    span: other.span(),
+                                });
+                            }
+                        }
+                    }
+                }
+
                 // Tail-call for closures
                 match op {
                     Value::Symbol(ref name, _) => return apply_builtin(name, &args, list_span, &current_env),
                     Value::Closure {
                         ref params,
+                        ref rest_param,
                         ref body,
                         env: ref closure_env,
                     } => {
-                        if params.len() != args.len() {
-                            return Err(EvalError::WrongArgCount {
-                                expected: params.len().to_string(),
-                                got: args.len(),
-                                span: list_span,
-                            });
-                        }
-                        let local_env = Env::with_parent(closure_env);
-                        for (param, arg) in params.iter().zip(args.iter()) {
-                            local_env.define(param.clone(), arg.clone());
-                        }
+                        let local_env = bind_closure_args(params, rest_param, &args, closure_env, list_span)?;
                         current_expr = *body.clone();
                         current_env = local_env;
                         continue;
@@ -293,6 +366,7 @@ fn setup_named_let(name: &str, args: &[Value], form_span: Span, env: &Env) -> Re
     let local_env = Env::with_parent(env);
     let closure = Value::Closure {
         params: params.clone(),
+        rest_param: None,
         body: Box::new(body.clone()),
         env: local_env.clone(),
     };
@@ -514,17 +588,7 @@ fn eval_define(args: &[Value], form_span: Span, env: &Env) -> Result<Value, Eval
                     span: elems[0].span(),
                 });
             };
-            let params: Vec<String> = elems[1..]
-                .iter()
-                .map(|e| match e {
-                    Value::Symbol(s, _) => Ok(s.clone()),
-                    other => Err(EvalError::TypeMismatch {
-                        expected: "symbol".to_string(),
-                        got: other.to_string(),
-                        span: other.span(),
-                    }),
-                })
-                .collect::<Result<_, _>>()?;
+            let (params, rest_param) = parse_params(&elems[1..])?;
             let body = if args.len() == 2 {
                 args[1].clone()
             } else {
@@ -536,6 +600,7 @@ fn eval_define(args: &[Value], form_span: Span, env: &Env) -> Result<Value, Eval
             };
             let closure = Value::Closure {
                 params,
+                rest_param,
                 body: Box::new(body),
                 env: env.clone(),
             };
@@ -561,6 +626,45 @@ fn eval_quote(args: &[Value], form_span: Span) -> Result<Value, EvalError> {
     Ok(args[0].clone())
 }
 
+fn parse_params(param_list: &[Value]) -> Result<(Vec<String>, Option<String>), EvalError> {
+    let mut params = Vec::new();
+    let mut rest_param = None;
+    let mut i = 0;
+    while i < param_list.len() {
+        match &param_list[i] {
+            Value::Symbol(s, _) if s == "." => {
+                if i + 1 >= param_list.len() {
+                    return Err(EvalError::Parse {
+                        message: "expected parameter after dot".to_string(),
+                        span: param_list[i].span(),
+                    });
+                }
+                let Value::Symbol(rest_name, _) = &param_list[i + 1] else {
+                    return Err(EvalError::TypeMismatch {
+                        expected: "symbol".to_string(),
+                        got: param_list[i + 1].to_string(),
+                        span: param_list[i + 1].span(),
+                    });
+                };
+                rest_param = Some(rest_name.clone());
+                break;
+            }
+            Value::Symbol(s, _) => {
+                params.push(s.clone());
+            }
+            other => {
+                return Err(EvalError::TypeMismatch {
+                    expected: "symbol".to_string(),
+                    got: other.to_string(),
+                    span: other.span(),
+                });
+            }
+        }
+        i += 1;
+    }
+    Ok((params, rest_param))
+}
+
 fn eval_lambda(args: &[Value], form_span: Span, env: &Env) -> Result<Value, EvalError> {
     if args.len() < 2 {
         return Err(EvalError::WrongArgCount {
@@ -576,17 +680,7 @@ fn eval_lambda(args: &[Value], form_span: Span, env: &Env) -> Result<Value, Eval
             span: args[0].span(),
         });
     };
-    let params: Vec<String> = param_list
-        .iter()
-        .map(|e| match e {
-            Value::Symbol(s, _) => Ok(s.clone()),
-            other => Err(EvalError::TypeMismatch {
-                expected: "symbol".to_string(),
-                got: other.to_string(),
-                span: other.span(),
-            }),
-        })
-        .collect::<Result<_, _>>()?;
+    let (params, rest_param) = parse_params(param_list)?;
     let body = if args.len() == 2 {
         args[1].clone()
     } else {
@@ -598,6 +692,7 @@ fn eval_lambda(args: &[Value], form_span: Span, env: &Env) -> Result<Value, Eval
     };
     Ok(Value::Closure {
         params,
+        rest_param,
         body: Box::new(body),
         env: env.clone(),
     })
