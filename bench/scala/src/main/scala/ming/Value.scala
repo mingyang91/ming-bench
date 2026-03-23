@@ -10,6 +10,7 @@ enum Value:
   case SymbolVal(name: String)
   case LambdaVal(params: List[String], body: List[Expr], closure: Env)
   case BuiltinVal(name: String, fn: List[Value] => Value)
+  case CharVal(c: Char)
 
   def display: String = this match
     case IntVal(n)           => n.toString
@@ -20,6 +21,12 @@ enum Value:
     case PairVal(_, _)       => displayList(this)
     case LambdaVal(_, _, _)  => "#<procedure>"
     case BuiltinVal(name, _) => s"#<procedure:$name>"
+    case CharVal(c)          => s"#\\$c"
+
+  /** Display without quotes (for `display` builtin). */
+  def displayNoQuotes: String = this match
+    case StrVal(s) => s
+    case other     => other.display
 
   def isTruthy: Boolean = this match
     case BoolVal(false) => false
