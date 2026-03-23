@@ -80,6 +80,9 @@ enum Value {
         rules: Vec<(Expr, Expr)>,
         def_env: Env,
     },
+    SchemeValues,
+    CallWithValues,
+    MultipleValues(Vec<Value>),
 }
 
 impl std::fmt::Debug for Value {
@@ -103,6 +106,9 @@ impl std::fmt::Debug for Value {
             Value::Continuation(..) => write!(f, "Continuation(...)"),
             Value::Vector(v) => write!(f, "Vector({:?})", v.borrow()),
             Value::Macro { .. } => write!(f, "Macro(...)"),
+            Value::SchemeValues => write!(f, "SchemeValues"),
+            Value::CallWithValues => write!(f, "CallWithValues"),
+            Value::MultipleValues(vs) => write!(f, "MultipleValues({vs:?})"),
         }
     }
 }
@@ -124,6 +130,8 @@ impl PartialEq for Value {
             (Value::SchemeApply, Value::SchemeApply) => true,
             (Value::Raise, Value::Raise) => true,
             (Value::WithExceptionHandler, Value::WithExceptionHandler) => true,
+            (Value::SchemeValues, Value::SchemeValues) => true,
+            (Value::CallWithValues, Value::CallWithValues) => true,
             _ => false,
         }
     }
@@ -137,6 +145,7 @@ impl Value {
             Value::Char(c) => out.push(*c),
             Value::Vector(_) => out.push_str(&self.to_string()),
             Value::Macro { .. } => out.push_str("#<macro>"),
+            Value::MultipleValues(_) => out.push_str("#<values>"),
             _ => out.push_str(&self.to_string()),
         }
     }
@@ -189,8 +198,9 @@ impl std::fmt::Display for Value {
                 }
                 write!(f, ")")
             }
-            Value::Lambda { .. } | Value::Builtin(..) | Value::CallCC | Value::DynamicWind | Value::SchemeApply | Value::Raise | Value::WithExceptionHandler | Value::Continuation(..) => write!(f, "#<procedure>"),
+            Value::Lambda { .. } | Value::Builtin(..) | Value::CallCC | Value::DynamicWind | Value::SchemeApply | Value::Raise | Value::WithExceptionHandler | Value::Continuation(..) | Value::SchemeValues | Value::CallWithValues => write!(f, "#<procedure>"),
             Value::Macro { .. } => write!(f, "#<macro>"),
+            Value::MultipleValues(_) => write!(f, "#<values>"),
         }
     }
 }
@@ -362,6 +372,8 @@ fn default_env() -> Env {
     env_set(&env, "dynamic-wind".to_string(), Value::DynamicWind);
     env_set(&env, "raise".to_string(), Value::Raise);
     env_set(&env, "with-exception-handler".to_string(), Value::WithExceptionHandler);
+    env_set(&env, "values".to_string(), Value::SchemeValues);
+    env_set(&env, "call-with-values".to_string(), Value::CallWithValues);
     // Install Scheme-level prelude (map, etc.)
     let prelude = r#"
 (define (__map1 f lst)
@@ -865,6 +877,7 @@ enum Frame {
     RaiseHandlerReturn { raised_value: Value },
     GuardTest { raised_value: Value, body: Vec<Expr>, rest: Vec<Expr>, env: Env },
     GuardClauseEval { clauses: Vec<Expr>, raised_value: Value, env: Env },
+    CallWithValuesConsumer { consumer: Value },
 }
 
 enum Act {
@@ -1265,6 +1278,13 @@ fn step_ret(val: Value, frame: Frame, stack: &mut Vec<Frame>) -> Result<Act, Eva
             // Wind transitions completed; now evaluate guard clauses
             eval_guard_clauses_inner(&clauses, raised_value, env, stack)
         }
+        Frame::CallWithValuesConsumer { consumer } => {
+            let args = match val {
+                Value::MultipleValues(vs) => vs,
+                other => vec![other],
+            };
+            Ok(Act::Ap(consumer, args))
+        }
     }
 }
 
@@ -1330,6 +1350,22 @@ fn step_apply(func: Value, args: Vec<Value>, stack: &mut Vec<Frame>) -> Result<A
             let thunk = args[1].clone();
             stack.push(Frame::ExceptionHandler { handler });
             Ok(Act::Ap(thunk, vec![]))
+        }
+        Value::SchemeValues => {
+            if args.len() == 1 {
+                Ok(Act::Ret(args.into_iter().next().unwrap()))
+            } else {
+                Ok(Act::Ret(Value::MultipleValues(args)))
+            }
+        }
+        Value::CallWithValues => {
+            if args.len() != 2 {
+                return Err(EvalError::Arity("call-with-values expects 2 arguments".into()));
+            }
+            let producer = args[0].clone();
+            let consumer = args[1].clone();
+            stack.push(Frame::CallWithValuesConsumer { consumer });
+            Ok(Act::Ap(producer, vec![]))
         }
         Value::SchemeApply => {
             if args.len() < 2 {
@@ -1990,7 +2026,7 @@ fn builtin_type_pred(args: &[Value], name: &str) -> Result<Value, EvalError> {
         "symbol?" => matches!(&args[0], Value::Symbol(_)),
         "char?" => matches!(&args[0], Value::Char(_)),
         "vector?" => matches!(&args[0], Value::Vector(_)),
-        "procedure?" => matches!(&args[0], Value::Lambda { .. } | Value::Builtin(..) | Value::CallCC | Value::DynamicWind | Value::SchemeApply | Value::Continuation(..)),
+        "procedure?" => matches!(&args[0], Value::Lambda { .. } | Value::Builtin(..) | Value::CallCC | Value::DynamicWind | Value::SchemeApply | Value::Continuation(..) | Value::SchemeValues | Value::CallWithValues),
         _ => false,
     };
     Ok(Value::Boolean(result))
