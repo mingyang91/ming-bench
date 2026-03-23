@@ -20,6 +20,23 @@ fn gensym(base: &str) -> String {
 thread_local! {
     static OUTPUT_BUFFER: RefCell<String> = RefCell::new(String::new());
     static WIND_STACK: RefCell<Vec<WindEntry>> = RefCell::new(Vec::new());
+    static EXCEPTION_HANDLERS: RefCell<Vec<ExceptionHandlerEntry>> = RefCell::new(Vec::new());
+}
+
+#[derive(Clone)]
+enum ExceptionHandlerEntry {
+    Guard {
+        var_name: String,
+        clauses: Vec<Expr>,
+        env: Env,
+        kont: Rc<Kont>,
+        winds: Vec<WindEntry>,
+    },
+    WithHandler {
+        handler: Value,
+        kont: Rc<Kont>,
+        winds: Vec<WindEntry>,
+    },
 }
 
 #[derive(Clone)]
@@ -47,6 +64,8 @@ enum Value {
     Builtin(&'static str, fn(&[Value]) -> Result<Value, EvalError>),
     CallCC,
     DynamicWind,
+    Raise,
+    WithExceptionHandler,
     Continuation(Rc<Kont>, Vec<WindEntry>),
     Vector(VectorRef),
     Macro {
@@ -72,6 +91,8 @@ impl std::fmt::Debug for Value {
             Value::Builtin(name, _) => write!(f, "Builtin({})", name),
             Value::CallCC => write!(f, "CallCC"),
             Value::DynamicWind => write!(f, "DynamicWind"),
+            Value::Raise => write!(f, "Raise"),
+            Value::WithExceptionHandler => write!(f, "WithExceptionHandler"),
             Value::Continuation(..) => write!(f, "#<continuation>"),
             Value::Macro { .. } => write!(f, "#<macro>"),
         }
@@ -141,7 +162,7 @@ impl Value {
                 out.push(')');
                 out
             }
-            Value::Lambda { .. } | Value::Builtin(_, _) | Value::CallCC | Value::DynamicWind | Value::Continuation(..) => {
+            Value::Lambda { .. } | Value::Builtin(_, _) | Value::CallCC | Value::DynamicWind | Value::Continuation(..) | Value::Raise | Value::WithExceptionHandler => {
                 "#<procedure>".to_string()
             }
             Value::Void => "#<void>".to_string(),
@@ -337,6 +358,15 @@ enum Kont {
     WindChain { remaining: Vec<WindOp>, cont_value: Value, target_kont: Rc<Kont> },
     // continuation transfer: after rewind in-thunk, push entry and continue
     WindChainPush { wind_entry: WindEntry, remaining: Vec<WindOp>, cont_value: Value, target_kont: Rc<Kont> },
+    // exception handling: pop handler when body completes normally
+    GuardCleanup { next: Rc<Kont> },
+    ExceptionHandlerCleanup { next: Rc<Kont> },
+    // guard clause dispatch: test clauses with exception bound
+    GuardClauseTest { exception: Value, body: Vec<Expr>, remaining_clauses: Vec<Expr>, env: Env, next: Rc<Kont> },
+    // after wind unwinding for raise, dispatch to guard clauses
+    DispatchGuardClauses { exception: Value, clauses: Vec<Expr>, env: Env, next: Rc<Kont> },
+    // after wind unwinding for raise, call handler with exception
+    CallHandlerAfterWind { handler: Value, exception: Value, next: Rc<Kont> },
 }
 
 impl std::fmt::Debug for Kont {
@@ -1264,6 +1294,8 @@ fn default_env() -> Env {
     env_set(&env, "call/cc".to_string(), Value::CallCC);
     env_set(&env, "call-with-current-continuation".to_string(), Value::CallCC);
     env_set(&env, "dynamic-wind".to_string(), Value::DynamicWind);
+    env_set(&env, "raise".to_string(), Value::Raise);
+    env_set(&env, "with-exception-handler".to_string(), Value::WithExceptionHandler);
     env
 }
 
@@ -1794,6 +1826,35 @@ fn expand_macro(items: &[Expr], expr: &Expr, literals: &[String], rules: &[(Expr
 enum State {
     Eval(Expr, Env),
     Apply(Value),
+    RaiseException(Value),
+}
+
+fn start_guard_clauses(exception: Value, clauses: &[Expr], env: &Env, kont: &mut Rc<Kont>, next: Rc<Kont>) -> Result<State, EvalError> {
+    if clauses.is_empty() {
+        return Ok(State::RaiseException(exception));
+    }
+    let clause = &clauses[0];
+    match &clause.kind {
+        ExprKind::List(citems) if !citems.is_empty() => {
+            let is_else = matches!(&citems[0].kind, ExprKind::Symbol(s) if s == "else");
+            if is_else {
+                *kont = next;
+                Ok(eval_body_state(&citems[1..], env.clone(), kont))
+            } else {
+                let body = citems[1..].to_vec();
+                let remaining = clauses[1..].to_vec();
+                *kont = Rc::new(Kont::GuardClauseTest {
+                    exception,
+                    body,
+                    remaining_clauses: remaining,
+                    env: env.clone(),
+                    next,
+                });
+                Ok(State::Eval(citems[0].clone(), env.clone()))
+            }
+        }
+        _ => Err(EvalError::BadSyntax("guard: bad clause".into())),
+    }
 }
 
 fn start_cond_clauses(form: &Expr, clauses: &[Expr], env: &Env, kont: &mut Rc<Kont>) -> Result<State, EvalError> {
@@ -1970,6 +2031,29 @@ fn apply_function(func: Value, args: Vec<Value>, form: &Expr, kont: &mut Rc<Kont
             let proc = args.into_iter().next().unwrap();
             apply_function(proc, vec![cont_value], form, kont)
         }
+        Value::Raise => {
+            if args.len() != 1 {
+                return Err(form.wrap_err(EvalError::Arity("raise requires exactly 1 argument".into())));
+            }
+            let exception = args.into_iter().next().unwrap();
+            Ok(State::RaiseException(exception))
+        }
+        Value::WithExceptionHandler => {
+            if args.len() != 2 {
+                return Err(form.wrap_err(EvalError::Arity("with-exception-handler requires exactly 2 arguments".into())));
+            }
+            let mut it = args.into_iter();
+            let handler = it.next().unwrap();
+            let thunk = it.next().unwrap();
+            let winds = WIND_STACK.with(|ws| ws.borrow().clone());
+            EXCEPTION_HANDLERS.with(|eh| eh.borrow_mut().push(ExceptionHandlerEntry::WithHandler {
+                handler,
+                kont: kont.clone(),
+                winds,
+            }));
+            *kont = Rc::new(Kont::ExceptionHandlerCleanup { next: kont.clone() });
+            apply_function(thunk, vec![], form, kont)
+        }
         Value::DynamicWind => {
             if args.len() != 3 {
                 return Err(form.wrap_err(EvalError::Arity("dynamic-wind requires exactly 3 arguments".into())));
@@ -2092,7 +2176,7 @@ fn eval_cek(initial_expr: Expr, initial_env: Env, initial_kont: Rc<Kont>) -> Res
                                 // Check for special forms first (avoid env lookup for perf)
                                 let is_special = matches!(s.as_str(), "define" | "quote" | "lambda" | "set!" |
                                     "if" | "begin" | "cond" | "and" | "or" | "let" | "string-set!" |
-                                    "letrec" | "letrec*" | "case" | "do");
+                                    "letrec" | "letrec*" | "case" | "do" | "guard");
 
                         if is_special {
                             if let ExprKind::Symbol(ref op) = items[0].kind {
@@ -2327,6 +2411,33 @@ fn eval_cek(initial_expr: Expr, initial_env: Env, initial_kont: Rc<Kont>) -> Res
                                             next: kont,
                                         });
                                         State::Eval(key_expr, env)
+                                    }
+                                    "guard" => {
+                                        // (guard (var clause ...) body ...)
+                                        let args = &items[1..];
+                                        if args.len() < 2 {
+                                            return Err(expr.wrap_err(EvalError::BadSyntax("guard: expected clauses and body".into())));
+                                        }
+                                        let clause_spec = match &args[0].kind {
+                                            ExprKind::List(v) if v.len() >= 2 => v,
+                                            _ => return Err(expr.wrap_err(EvalError::BadSyntax("guard: expected (var clause ...)".into()))),
+                                        };
+                                        let var_name = match &clause_spec[0].kind {
+                                            ExprKind::Symbol(s) => s.clone(),
+                                            _ => return Err(expr.wrap_err(EvalError::BadSyntax("guard: expected variable name".into()))),
+                                        };
+                                        let clauses = clause_spec[1..].to_vec();
+                                        let body = args[1..].to_vec();
+                                        let winds = WIND_STACK.with(|ws| ws.borrow().clone());
+                                        EXCEPTION_HANDLERS.with(|eh| eh.borrow_mut().push(ExceptionHandlerEntry::Guard {
+                                            var_name,
+                                            clauses,
+                                            env: env.clone(),
+                                            kont: kont.clone(),
+                                            winds,
+                                        }));
+                                        kont = Rc::new(Kont::GuardCleanup { next: kont });
+                                        eval_body_state(&body, env, &mut kont)
                                     }
                                     "do" => {
                                         // (do ((var init step) ...) (test expr ...) body ...)
@@ -2834,7 +2945,111 @@ fn eval_cek(initial_expr: Expr, initial_env: Env, initial_kont: Rc<Kont>) -> Res
                         let form = dummy_form();
                         start_wind_chain(remaining, cont_value, target_kont, &mut kont, &form)?
                     }
+
+                    Kont::GuardCleanup { next } => {
+                        EXCEPTION_HANDLERS.with(|eh| eh.borrow_mut().pop());
+                        kont = next;
+                        State::Apply(value)
+                    }
+
+                    Kont::ExceptionHandlerCleanup { next } => {
+                        EXCEPTION_HANDLERS.with(|eh| eh.borrow_mut().pop());
+                        kont = next;
+                        State::Apply(value)
+                    }
+
+                    Kont::GuardClauseTest { exception, body, remaining_clauses, env, next } => {
+                        if value.is_truthy() {
+                            if body.is_empty() {
+                                kont = next;
+                                State::Apply(value)
+                            } else {
+                                kont = next;
+                                eval_body_state(&body, env, &mut kont)
+                            }
+                        } else if remaining_clauses.is_empty() {
+                            // No clause matched, re-raise
+                            State::RaiseException(exception)
+                        } else {
+                            start_guard_clauses(exception, &remaining_clauses, &env, &mut kont, next)?
+                        }
+                    }
+
+                    Kont::DispatchGuardClauses { exception, clauses, env, next } => {
+                        // Wind unwinding complete, now evaluate guard clauses
+                        kont = next.clone();
+                        start_guard_clauses(exception, &clauses, &env, &mut kont, next)?
+                    }
+
+                    Kont::CallHandlerAfterWind { handler, exception, next } => {
+                        // Wind unwinding complete, call handler with exception
+                        kont = next;
+                        let form = dummy_form();
+                        apply_function(handler, vec![exception], &form, &mut kont)?
+                    }
                 };
+            }
+            State::RaiseException(exception) => {
+                let handler = EXCEPTION_HANDLERS.with(|eh| eh.borrow_mut().pop());
+                match handler {
+                    Some(ExceptionHandlerEntry::Guard { var_name, clauses, env, kont: saved_kont, winds: saved_winds }) => {
+                        let current_winds = WIND_STACK.with(|ws| ws.borrow().clone());
+                        let common_len = current_winds.iter().zip(saved_winds.iter())
+                            .take_while(|(a, b)| Rc::ptr_eq(a, b))
+                            .count();
+                        let mut ops = Vec::new();
+                        for i in (common_len..current_winds.len()).rev() {
+                            ops.push(WindOp::Unwind(current_winds[i].1.clone()));
+                        }
+                        for i in common_len..saved_winds.len() {
+                            ops.push(WindOp::Rewind(saved_winds[i].0.clone(), saved_winds[i].clone()));
+                        }
+                        let guard_env = new_env(Some(env));
+                        env_set(&guard_env, var_name, exception.clone());
+                        if ops.is_empty() {
+                            kont = saved_kont.clone();
+                            state = start_guard_clauses(exception, &clauses, &guard_env, &mut kont, saved_kont)?;
+                        } else {
+                            let target = Rc::new(Kont::DispatchGuardClauses {
+                                exception,
+                                clauses,
+                                env: guard_env,
+                                next: saved_kont,
+                            });
+                            let form = dummy_form();
+                            state = start_wind_chain(ops, Value::Void, target, &mut kont, &form)?;
+                        }
+                    }
+                    Some(ExceptionHandlerEntry::WithHandler { handler, kont: saved_kont, winds: saved_winds }) => {
+                        let current_winds = WIND_STACK.with(|ws| ws.borrow().clone());
+                        let common_len = current_winds.iter().zip(saved_winds.iter())
+                            .take_while(|(a, b)| Rc::ptr_eq(a, b))
+                            .count();
+                        let mut ops = Vec::new();
+                        for i in (common_len..current_winds.len()).rev() {
+                            ops.push(WindOp::Unwind(current_winds[i].1.clone()));
+                        }
+                        for i in common_len..saved_winds.len() {
+                            ops.push(WindOp::Rewind(saved_winds[i].0.clone(), saved_winds[i].clone()));
+                        }
+                        if ops.is_empty() {
+                            kont = saved_kont;
+                            let form = dummy_form();
+                            state = apply_function(handler, vec![exception], &form, &mut kont)?;
+                        } else {
+                            let target = Rc::new(Kont::CallHandlerAfterWind {
+                                handler,
+                                exception,
+                                next: saved_kont,
+                            });
+                            let form = dummy_form();
+                            state = start_wind_chain(ops, Value::Void, target, &mut kont, &form)?;
+                        }
+                    }
+                    None => {
+                        return Err(EvalError::Type(format!("unhandled exception: {}", exception.display())));
+                    }
+                }
             }
         }
     }
@@ -2844,6 +3059,7 @@ fn eval_cek(initial_expr: Expr, initial_env: Env, initial_kont: Rc<Kont>) -> Res
 
 pub fn eval_str(input: &str) -> Result<String, EvalError> {
     WIND_STACK.with(|ws| ws.borrow_mut().clear());
+    EXCEPTION_HANDLERS.with(|eh| eh.borrow_mut().clear());
     let exprs = parse(input)?;
     if exprs.is_empty() {
         return Ok(Value::Boolean(false).display());
@@ -2872,6 +3088,7 @@ pub fn eval_str(input: &str) -> Result<String, EvalError> {
 pub fn eval_str_with_output(input: &str) -> Result<(String, String), EvalError> {
     OUTPUT_BUFFER.with(|buf| buf.borrow_mut().clear());
     WIND_STACK.with(|ws| ws.borrow_mut().clear());
+    EXCEPTION_HANDLERS.with(|eh| eh.borrow_mut().clear());
     let exprs = parse(input)?;
     if exprs.is_empty() {
         let output = OUTPUT_BUFFER.with(|buf| buf.borrow().clone());
