@@ -29,6 +29,7 @@ enum TokenKind {
     Int(i64),
     Bool(bool),
     Str(String),
+    Char(char),
 }
 
 fn tokenize(input: &str) -> Result<Vec<Token>, EvalError> {
@@ -121,6 +122,34 @@ fn tokenize(input: &str) -> Result<Vec<Token>, EvalError> {
                             i += 2;
                             col += 2;
                         }
+                        '\\' => {
+                            i += 2;
+                            col += 2;
+                            if i >= chars.len() {
+                                return Err(EvalError::Parse { msg: "unexpected end after #\\".into() });
+                            }
+                            // Read the character name or single char
+                            let start = i;
+                            while i < chars.len()
+                                && !matches!(chars[i], ' ' | '\t' | '\n' | '\r' | '(' | ')' | ';' | '"')
+                            {
+                                i += 1;
+                                col += 1;
+                            }
+                            let name: String = chars[start..i].iter().collect();
+                            let ch = match name.as_str() {
+                                "space" => ' ',
+                                "newline" => '\n',
+                                "tab" => '\t',
+                                s if s.len() == 1 => s.chars().next().expect("single char"),
+                                other => {
+                                    return Err(EvalError::Parse {
+                                        msg: format!("unknown character name: {other}"),
+                                    });
+                                }
+                            };
+                            tokens.push(Token { kind: TokenKind::Char(ch), line: tok_line, col: tok_col });
+                        }
                         _ => {
                             return Err(EvalError::Parse {
                                 msg: format!("unexpected character after #: {}", chars[i + 1]),
@@ -162,6 +191,7 @@ fn parse_expr(tokens: &[Token], pos: usize) -> Result<(Value, usize), EvalError>
         TokenKind::Int(n) => Ok((Value::Int(*n), pos + 1)),
         TokenKind::Bool(b) => Ok((Value::Bool(*b), pos + 1)),
         TokenKind::Str(s) => Ok((Value::String(s.clone()), pos + 1)),
+        TokenKind::Char(c) => Ok((Value::Char(*c), pos + 1)),
         TokenKind::Symbol(s) => Ok((Value::Symbol(s.clone(), Some(span)), pos + 1)),
         TokenKind::LParen => {
             let mut elems = Vec::new();

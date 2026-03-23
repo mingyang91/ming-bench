@@ -39,4 +39,15 @@ impl Env {
     pub fn define(&mut self, name: String, value: Value) {
         self.bindings.insert(name, value);
     }
+
+    pub fn set(&mut self, name: &str, value: Value) -> Result<(), EvalError> {
+        if self.bindings.contains_key(name) {
+            self.bindings.insert(name.to_string(), value);
+            Ok(())
+        } else if let Some(ref parent) = self.parent {
+            parent.borrow_mut().set(name, value)
+        } else {
+            Err(EvalError::UnboundVariable { name: name.to_string() })
+        }
+    }
 }

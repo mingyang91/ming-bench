@@ -13,7 +13,7 @@ const BUILTINS: &[&str] = &[
     "string-append", "string-length", "substring",
     "string->number", "number->string",
     "symbol->string", "string->symbol",
-    "string-ref",
+    "string-ref", "string-copy",
 ];
 
 pub fn default_env() -> Rc<RefCell<Env>> {
@@ -61,6 +61,7 @@ fn eval_list(
             "let" => return eval_let(&elems[1..], span, env, output),
             "begin" => return eval_begin(&elems[1..], env, output),
             "cond" => return eval_cond(&elems[1..], env, output),
+            "string-set!" => return eval_string_set(&elems[1..], span, env, output),
             _ => {}
         }
     }
@@ -389,6 +390,63 @@ fn eval_cond(
     Ok(Value::Void)
 }
 
+fn eval_string_set(
+    args: &[Value],
+    span: Option<Span>,
+    env: &Rc<RefCell<Env>>,
+    output: &Rc<RefCell<String>>,
+) -> Result<Value, EvalError> {
+    if args.len() != 3 {
+        return Err(EvalError::WrongArgCount { expected: 3, got: args.len() }.at(span));
+    }
+    let Value::Symbol(var_name, _) = &args[0] else {
+        return Err(EvalError::TypeMismatch {
+            expected: "symbol".into(),
+            got: format!("{}", args[0]),
+        }
+        .at(span));
+    };
+    let idx_val = eval(&args[1], env, output)?;
+    let Value::Int(idx) = idx_val else {
+        return Err(EvalError::TypeMismatch {
+            expected: "integer".into(),
+            got: format!("{idx_val}"),
+        }
+        .at(span));
+    };
+    let char_val = eval(&args[2], env, output)?;
+    let Value::Char(ch) = char_val else {
+        return Err(EvalError::TypeMismatch {
+            expected: "char".into(),
+            got: format!("{char_val}"),
+        }
+        .at(span));
+    };
+    let current = env.borrow().get(var_name).map_err(|e| e.at(span))?;
+    let Value::String(s) = current else {
+        return Err(EvalError::TypeMismatch {
+            expected: "string".into(),
+            got: format!("{current}"),
+        }
+        .at(span));
+    };
+    let idx = idx as usize;
+    let mut chars: Vec<char> = s.chars().collect();
+    if idx >= chars.len() {
+        return Err(EvalError::TypeMismatch {
+            expected: format!("index in range 0..{}", chars.len()),
+            got: format!("{idx}"),
+        }
+        .at(span));
+    }
+    chars[idx] = ch;
+    let new_string: String = chars.into_iter().collect();
+    env.borrow_mut()
+        .set(var_name, Value::String(new_string))
+        .map_err(|e| e.at(span))?;
+    Ok(Value::Void)
+}
+
 fn is_false(val: &Value) -> bool {
     matches!(val, Value::Bool(false))
 }
@@ -607,9 +665,8 @@ fn apply_builtin(
             Ok(Value::Void)
         }
         "string-append" | "string-length" | "substring" | "string->number"
-        | "number->string" | "symbol->string" | "string->symbol" | "string-ref" => {
-            apply_string_builtin(name, args)
-        }
+        | "number->string" | "symbol->string" | "string->symbol" | "string-ref"
+        | "string-copy" => apply_string_builtin(name, args),
         _ => Err(EvalError::UnboundVariable { name: name.into() }),
     }
 }
@@ -718,6 +775,18 @@ fn apply_string_builtin(name: &str, args: &[Value]) -> Result<Value, EvalError> 
             }
             match &args[0] {
                 Value::String(s) => Ok(Value::Symbol(s.clone(), None)),
+                other => Err(EvalError::TypeMismatch {
+                    expected: "string".into(),
+                    got: format!("{other}"),
+                }),
+            }
+        }
+        "string-copy" => {
+            if args.len() != 1 {
+                return Err(EvalError::WrongArgCount { expected: 1, got: args.len() });
+            }
+            match &args[0] {
+                Value::String(s) => Ok(Value::String(s.clone())),
                 other => Err(EvalError::TypeMismatch {
                     expected: "string".into(),
                     got: format!("{other}"),
