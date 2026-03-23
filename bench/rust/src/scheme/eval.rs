@@ -2,18 +2,44 @@ use crate::scheme::env::Env;
 use crate::scheme::error::{EvalError, Span};
 use crate::scheme::value::Value;
 
+/// Evaluate non-tail expressions of `and`. Returns `Some(value)` for short-circuit, `None` for tail.
+fn eval_and_prefix(exprs: &[Value], env: &Env) -> Result<Option<Value>, EvalError> {
+    for expr in exprs {
+        let result = eval(expr, env)?;
+        if !result.is_truthy() {
+            return Ok(Some(result));
+        }
+    }
+    Ok(None)
+}
+
+/// Evaluate non-tail expressions of `or`. Returns `Some(value)` for short-circuit, `None` for tail.
+fn eval_or_prefix(exprs: &[Value], env: &Env) -> Result<Option<Value>, EvalError> {
+    for expr in exprs {
+        let result = eval(expr, env)?;
+        if result.is_truthy() {
+            return Ok(Some(result));
+        }
+    }
+    Ok(None)
+}
+
 pub fn eval(expr: &Value, env: &Env) -> Result<Value, EvalError> {
-    match expr {
-        Value::Integer(_, _)
-        | Value::Boolean(_, _)
-        | Value::String(_, _)
-        | Value::Char(_, _)
-        | Value::Closure { .. } => Ok(expr.clone()),
-        Value::Symbol(name, span) => {
-            if let Some(val) = env.get(name) {
-                Ok(val)
-            } else {
-                match name.as_str() {
+    let mut current_expr = expr.clone();
+    let mut current_env = env.clone();
+
+    loop {
+        match &current_expr {
+            Value::Integer(_, _)
+            | Value::Boolean(_, _)
+            | Value::String(_, _)
+            | Value::Char(_, _)
+            | Value::Closure { .. } => return Ok(current_expr),
+            Value::Symbol(name, span) => {
+                if let Some(val) = current_env.get(name) {
+                    return Ok(val);
+                }
+                return match name.as_str() {
                     "+" | "-" | "*" | "/" | "<" | ">" | "=" | "<=" | ">="
                     | "not" | "cons" | "car" | "cdr" | "null?" | "list" | "length"
                     | "append" | "pair?" | "string?" | "number?" | "boolean?"
@@ -25,82 +51,311 @@ pub fn eval(expr: &Value, env: &Env) -> Result<Value, EvalError> {
                     | "string->number" | "number->string"
                     | "symbol->string" | "string->symbol"
                     | "string-ref" | "string-set!" | "string-copy"
-                    | "char?" => Ok(expr.clone()),
+                    | "char?" => Ok(current_expr.clone()),
                     _ => Err(EvalError::UnboundVariable {
                         name: name.clone(),
                         span: *span,
                     }),
+                };
+            }
+            Value::List(elems, span) => {
+                let list_span = *span;
+                if elems.is_empty() {
+                    return Err(EvalError::Parse {
+                        message: "empty application".to_string(),
+                        span: list_span,
+                    });
+                }
+
+                let head = &elems[0];
+
+                // Check for special forms — handle tail positions inline
+                if let Value::Symbol(name, _) = head {
+                    match name.as_str() {
+                        "and" => {
+                            let exprs = &elems[1..];
+                            if exprs.is_empty() { return Ok(Value::bool(true)); }
+                            if let Some(v) = eval_and_prefix(&exprs[..exprs.len() - 1], &current_env)? {
+                                return Ok(v);
+                            }
+                            current_expr = exprs[exprs.len() - 1].clone();
+                            continue;
+                        }
+                        "or" => {
+                            let exprs = &elems[1..];
+                            if exprs.is_empty() { return Ok(Value::bool(false)); }
+                            if let Some(v) = eval_or_prefix(&exprs[..exprs.len() - 1], &current_env)? {
+                                return Ok(v);
+                            }
+                            current_expr = exprs[exprs.len() - 1].clone();
+                            continue;
+                        }
+                        "not" => return eval_not(&elems[1..], list_span, &current_env),
+                        "if" => {
+                            let args = &elems[1..];
+                            if args.len() < 2 || args.len() > 3 {
+                                return Err(EvalError::WrongArgCount {
+                                    expected: "2 or 3".to_string(),
+                                    got: args.len(),
+                                    span: list_span,
+                                });
+                            }
+                            let cond = eval(&args[0], &current_env)?;
+                            if cond.is_truthy() {
+                                current_expr = args[1].clone();
+                                continue;
+                            } else if args.len() == 3 {
+                                current_expr = args[2].clone();
+                                continue;
+                            } else {
+                                return Ok(Value::Void);
+                            }
+                        }
+                        "define" => return eval_define(&elems[1..], list_span, &current_env),
+                        "quote" => return eval_quote(&elems[1..], list_span),
+                        "lambda" => return eval_lambda(&elems[1..], list_span, &current_env),
+                        "let" => {
+                            let args = &elems[1..];
+                            if args.len() < 2 {
+                                return Err(EvalError::WrongArgCount {
+                                    expected: "at least 2".to_string(),
+                                    got: args.len(),
+                                    span: list_span,
+                                });
+                            }
+                            // Named let
+                            if let Value::Symbol(loop_name, _) = &args[0] {
+                                let (new_env, body) = setup_named_let(loop_name, &args[1..], list_span, &current_env)?;
+                                current_expr = body;
+                                current_env = new_env;
+                                continue;
+                            }
+                            // Regular let
+                            let new_env = setup_let(&args[0], list_span, &current_env)?;
+                            let body = &args[1..];
+                            for expr in &body[..body.len() - 1] {
+                                eval(expr, &new_env)?;
+                            }
+                            current_expr = body[body.len() - 1].clone();
+                            current_env = new_env;
+                            continue;
+                        }
+                        "begin" => {
+                            let exprs = &elems[1..];
+                            if exprs.is_empty() {
+                                return Ok(Value::Void);
+                            }
+                            for expr in &exprs[..exprs.len() - 1] {
+                                eval(expr, &current_env)?;
+                            }
+                            current_expr = exprs[exprs.len() - 1].clone();
+                            continue;
+                        }
+                        "cond" => {
+                            match eval_cond_tail(&elems[1..], &current_env)? {
+                                TailAction::Result(v) => return Ok(v),
+                                TailAction::TailCall(expr, env) => {
+                                    current_expr = expr;
+                                    current_env = env;
+                                    continue;
+                                }
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+
+                // Evaluate all elements (function application)
+                let op = eval(head, &current_env)?;
+                let args: Vec<Value> = elems[1..]
+                    .iter()
+                    .map(|e| eval(e, &current_env))
+                    .collect::<Result<_, _>>()?;
+
+                // Tail-call for closures
+                match op {
+                    Value::Symbol(ref name, _) => return apply_builtin(name, &args, list_span, &current_env),
+                    Value::Closure {
+                        ref params,
+                        ref body,
+                        env: ref closure_env,
+                    } => {
+                        if params.len() != args.len() {
+                            return Err(EvalError::WrongArgCount {
+                                expected: params.len().to_string(),
+                                got: args.len(),
+                                span: list_span,
+                            });
+                        }
+                        let local_env = Env::with_parent(closure_env);
+                        for (param, arg) in params.iter().zip(args.iter()) {
+                            local_env.define(param.clone(), arg.clone());
+                        }
+                        current_expr = *body.clone();
+                        current_env = local_env;
+                        continue;
+                    }
+                    other => {
+                        return Err(EvalError::NotAProcedure {
+                            value: other.to_string(),
+                            span: other.span(),
+                        });
+                    }
                 }
             }
+            Value::Void => return Ok(Value::Void),
         }
-        Value::List(elems, span) => eval_list(elems, *span, env),
-        Value::Void => Ok(Value::Void),
     }
 }
 
-fn eval_list(elems: &[Value], list_span: Span, env: &Env) -> Result<Value, EvalError> {
-    if elems.is_empty() {
-        return Err(EvalError::Parse {
-            message: "empty application".to_string(),
-            span: list_span,
+enum TailAction {
+    Result(Value),
+    TailCall(Value, Env),
+}
+
+/// Set up named let: returns (env, body_expr) for tail-call loop
+fn setup_named_let(name: &str, args: &[Value], form_span: Span, env: &Env) -> Result<(Env, Value), EvalError> {
+    if args.is_empty() {
+        return Err(EvalError::WrongArgCount {
+            expected: "at least 2".to_string(),
+            got: 1,
+            span: form_span,
         });
     }
-
-    let head = &elems[0];
-
-    // Check for special forms
-    if let Value::Symbol(name, _) = head {
-        match name.as_str() {
-            "and" => return eval_and(&elems[1..], env),
-            "or" => return eval_or(&elems[1..], env),
-            "not" => return eval_not(&elems[1..], list_span, env),
-            "if" => return eval_if(&elems[1..], list_span, env),
-            "define" => return eval_define(&elems[1..], list_span, env),
-            "quote" => return eval_quote(&elems[1..], list_span),
-            "lambda" => return eval_lambda(&elems[1..], list_span, env),
-            "let" => return eval_let(&elems[1..], list_span, env),
-            "begin" => return eval_begin(&elems[1..], env),
-            "cond" => return eval_cond(&elems[1..], env),
-            _ => {}
+    let Value::List(bindings, _) = &args[0] else {
+        return Err(EvalError::TypeMismatch {
+            expected: "binding list".to_string(),
+            got: args[0].to_string(),
+            span: args[0].span(),
+        });
+    };
+    let mut params = Vec::new();
+    let mut inits = Vec::new();
+    for binding in bindings {
+        let Value::List(pair, _) = binding else {
+            return Err(EvalError::TypeMismatch {
+                expected: "binding pair".to_string(),
+                got: binding.to_string(),
+                span: binding.span(),
+            });
+        };
+        if pair.len() != 2 {
+            return Err(EvalError::WrongArgCount {
+                expected: "2".to_string(),
+                got: pair.len(),
+                span: binding.span(),
+            });
         }
+        let Value::Symbol(var, _) = &pair[0] else {
+            return Err(EvalError::TypeMismatch {
+                expected: "symbol".to_string(),
+                got: pair[0].to_string(),
+                span: pair[0].span(),
+            });
+        };
+        params.push(var.clone());
+        inits.push(eval(&pair[1], env)?);
     }
-
-    // Evaluate all elements
-    let op = eval(head, env)?;
-    let args: Vec<Value> = elems[1..]
-        .iter()
-        .map(|e| eval(e, env))
-        .collect::<Result<_, _>>()?;
-
-    apply(&op, &args, list_span, env)
+    let body = if args.len() == 2 {
+        args[1].clone()
+    } else {
+        Value::list(
+            std::iter::once(Value::symbol("begin".to_string()))
+                .chain(args[1..].iter().cloned())
+                .collect(),
+        )
+    };
+    let local_env = Env::with_parent(env);
+    let closure = Value::Closure {
+        params: params.clone(),
+        body: Box::new(body.clone()),
+        env: local_env.clone(),
+    };
+    local_env.define(name.to_string(), closure);
+    for (param, init) in params.iter().zip(inits.iter()) {
+        local_env.define(param.clone(), init.clone());
+    }
+    Ok((local_env, body))
 }
 
-fn apply(op: &Value, args: &[Value], call_span: Span, env: &Env) -> Result<Value, EvalError> {
-    match op {
-        Value::Symbol(name, _) => apply_builtin(name, args, call_span, env),
-        Value::Closure {
-            params,
-            body,
-            env: closure_env,
-        } => {
-            if params.len() != args.len() {
-                return Err(EvalError::WrongArgCount {
-                    expected: params.len().to_string(),
-                    got: args.len(),
-                    span: call_span,
-                });
-            }
-            let local_env = Env::with_parent(closure_env);
-            for (param, arg) in params.iter().zip(args.iter()) {
-                local_env.define(param.clone(), arg.clone());
-            }
-            eval(body, &local_env)
+/// Set up regular let bindings, return the new env
+fn setup_let(bindings_expr: &Value, _form_span: Span, env: &Env) -> Result<Env, EvalError> {
+    let Value::List(bindings, _) = bindings_expr else {
+        return Err(EvalError::TypeMismatch {
+            expected: "binding list".to_string(),
+            got: bindings_expr.to_string(),
+            span: bindings_expr.span(),
+        });
+    };
+    let local_env = Env::with_parent(env);
+    for binding in bindings {
+        let Value::List(pair, _) = binding else {
+            return Err(EvalError::TypeMismatch {
+                expected: "binding pair".to_string(),
+                got: binding.to_string(),
+                span: binding.span(),
+            });
+        };
+        if pair.len() != 2 {
+            return Err(EvalError::WrongArgCount {
+                expected: "2".to_string(),
+                got: pair.len(),
+                span: binding.span(),
+            });
         }
-        other => Err(EvalError::NotAProcedure {
-            value: other.to_string(),
-            span: other.span(),
-        }),
+        let Value::Symbol(var, _) = &pair[0] else {
+            return Err(EvalError::TypeMismatch {
+                expected: "symbol".to_string(),
+                got: pair[0].to_string(),
+                span: pair[0].span(),
+            });
+        };
+        let val = eval(&pair[1], env)?;
+        local_env.define(var.clone(), val);
     }
+    Ok(local_env)
+}
+
+/// Evaluate cond, returning either a result or a tail-call action for the last expression
+fn eval_cond_tail(clauses: &[Value], env: &Env) -> Result<TailAction, EvalError> {
+    for clause in clauses {
+        let Value::List(parts, _) = clause else {
+            return Err(EvalError::TypeMismatch {
+                expected: "cond clause".to_string(),
+                got: clause.to_string(),
+                span: clause.span(),
+            });
+        };
+        if parts.is_empty() {
+            return Err(EvalError::Parse {
+                message: "empty cond clause".to_string(),
+                span: clause.span(),
+            });
+        }
+        // else clause
+        if let Value::Symbol(s, _) = &parts[0] {
+            if s == "else" {
+                for expr in &parts[1..parts.len() - 1] {
+                    eval(expr, env)?;
+                }
+                if parts.len() > 1 {
+                    return Ok(TailAction::TailCall(parts[parts.len() - 1].clone(), env.clone()));
+                }
+                return Ok(TailAction::Result(Value::Void));
+            }
+        }
+        let test = eval(&parts[0], env)?;
+        if test.is_truthy() {
+            if parts.len() == 1 {
+                return Ok(TailAction::Result(test));
+            }
+            for expr in &parts[1..parts.len() - 1] {
+                eval(expr, env)?;
+            }
+            return Ok(TailAction::TailCall(parts[parts.len() - 1].clone(), env.clone()));
+        }
+    }
+    Ok(TailAction::Result(Value::Void))
 }
 
 fn apply_builtin(name: &str, args: &[Value], span: Span, env: &Env) -> Result<Value, EvalError> {
@@ -203,23 +458,6 @@ fn apply_builtin(name: &str, args: &[Value], span: Span, env: &Env) -> Result<Va
     }
 }
 
-fn eval_if(args: &[Value], form_span: Span, env: &Env) -> Result<Value, EvalError> {
-    if args.len() < 2 || args.len() > 3 {
-        return Err(EvalError::WrongArgCount {
-            expected: "2 or 3".to_string(),
-            got: args.len(),
-            span: form_span,
-        });
-    }
-    let cond = eval(&args[0], env)?;
-    if cond.is_truthy() {
-        eval(&args[1], env)
-    } else if args.len() == 3 {
-        eval(&args[2], env)
-    } else {
-        Ok(Value::Void)
-    }
-}
 
 fn eval_define(args: &[Value], form_span: Span, env: &Env) -> Result<Value, EvalError> {
     if args.len() < 2 {
@@ -418,33 +656,6 @@ fn cmp_le(args: &[Value]) -> Result<Value, EvalError> {
     Ok(Value::bool(nums.windows(2).all(|w| w[0] <= w[1])))
 }
 
-fn eval_and(exprs: &[Value], env: &Env) -> Result<Value, EvalError> {
-    if exprs.is_empty() {
-        return Ok(Value::bool(true));
-    }
-    let mut result = Value::bool(true);
-    for expr in exprs {
-        result = eval(expr, env)?;
-        if !result.is_truthy() {
-            return Ok(result);
-        }
-    }
-    Ok(result)
-}
-
-fn eval_or(exprs: &[Value], env: &Env) -> Result<Value, EvalError> {
-    if exprs.is_empty() {
-        return Ok(Value::bool(false));
-    }
-    let mut result = Value::bool(false);
-    for expr in exprs {
-        result = eval(expr, env)?;
-        if result.is_truthy() {
-            return Ok(result);
-        }
-    }
-    Ok(result)
-}
 
 fn eval_not(args: &[Value], form_span: Span, env: &Env) -> Result<Value, EvalError> {
     if args.len() != 1 {
@@ -458,165 +669,6 @@ fn eval_not(args: &[Value], form_span: Span, env: &Env) -> Result<Value, EvalErr
     Ok(Value::bool(!val.is_truthy()))
 }
 
-fn eval_begin(exprs: &[Value], env: &Env) -> Result<Value, EvalError> {
-    let mut result = Value::Void;
-    for expr in exprs {
-        result = eval(expr, env)?;
-    }
-    Ok(result)
-}
-
-fn eval_let(args: &[Value], form_span: Span, env: &Env) -> Result<Value, EvalError> {
-    if args.len() < 2 {
-        return Err(EvalError::WrongArgCount {
-            expected: "at least 2".to_string(),
-            got: args.len(),
-            span: form_span,
-        });
-    }
-
-    // Named let: (let name ((var init) ...) body ...)
-    if let Value::Symbol(name, _) = &args[0] {
-        let Value::List(bindings, _) = &args[1] else {
-            return Err(EvalError::TypeMismatch {
-                expected: "binding list".to_string(),
-                got: args[1].to_string(),
-                span: args[1].span(),
-            });
-        };
-        let mut params = Vec::new();
-        let mut inits = Vec::new();
-        for binding in bindings {
-            let Value::List(pair, _) = binding else {
-                return Err(EvalError::TypeMismatch {
-                    expected: "binding pair".to_string(),
-                    got: binding.to_string(),
-                    span: binding.span(),
-                });
-            };
-            if pair.len() != 2 {
-                return Err(EvalError::WrongArgCount {
-                    expected: "2".to_string(),
-                    got: pair.len(),
-                    span: binding.span(),
-                });
-            }
-            let Value::Symbol(var, _) = &pair[0] else {
-                return Err(EvalError::TypeMismatch {
-                    expected: "symbol".to_string(),
-                    got: pair[0].to_string(),
-                    span: pair[0].span(),
-                });
-            };
-            params.push(var.clone());
-            inits.push(eval(&pair[1], env)?);
-        }
-        let body = if args.len() == 3 {
-            args[2].clone()
-        } else {
-            Value::list(
-                std::iter::once(Value::symbol("begin".to_string()))
-                    .chain(args[2..].iter().cloned())
-                    .collect(),
-            )
-        };
-        let local_env = Env::with_parent(env);
-        let closure = Value::Closure {
-            params: params.clone(),
-            body: Box::new(body),
-            env: local_env.clone(),
-        };
-        local_env.define(name.clone(), closure);
-        for (param, init) in params.iter().zip(inits.iter()) {
-            local_env.define(param.clone(), init.clone());
-        }
-        let mut result = Value::Void;
-        for expr in &args[2..] {
-            result = eval(expr, &local_env)?;
-        }
-        return Ok(result);
-    }
-
-    // Regular let: (let ((var init) ...) body ...)
-    let Value::List(bindings, _) = &args[0] else {
-        return Err(EvalError::TypeMismatch {
-            expected: "binding list".to_string(),
-            got: args[0].to_string(),
-            span: args[0].span(),
-        });
-    };
-    let local_env = Env::with_parent(env);
-    for binding in bindings {
-        let Value::List(pair, _) = binding else {
-            return Err(EvalError::TypeMismatch {
-                expected: "binding pair".to_string(),
-                got: binding.to_string(),
-                span: binding.span(),
-            });
-        };
-        if pair.len() != 2 {
-            return Err(EvalError::WrongArgCount {
-                expected: "2".to_string(),
-                got: pair.len(),
-                span: binding.span(),
-            });
-        }
-        let Value::Symbol(var, _) = &pair[0] else {
-            return Err(EvalError::TypeMismatch {
-                expected: "symbol".to_string(),
-                got: pair[0].to_string(),
-                span: pair[0].span(),
-            });
-        };
-        let val = eval(&pair[1], env)?;
-        local_env.define(var.clone(), val);
-    }
-    let mut result = Value::Void;
-    for expr in &args[1..] {
-        result = eval(expr, &local_env)?;
-    }
-    Ok(result)
-}
-
-fn eval_cond(clauses: &[Value], env: &Env) -> Result<Value, EvalError> {
-    for clause in clauses {
-        let Value::List(parts, _) = clause else {
-            return Err(EvalError::TypeMismatch {
-                expected: "cond clause".to_string(),
-                got: clause.to_string(),
-                span: clause.span(),
-            });
-        };
-        if parts.is_empty() {
-            return Err(EvalError::Parse {
-                message: "empty cond clause".to_string(),
-                span: clause.span(),
-            });
-        }
-        // else clause
-        if let Value::Symbol(s, _) = &parts[0] {
-            if s == "else" {
-                let mut result = Value::Void;
-                for expr in &parts[1..] {
-                    result = eval(expr, env)?;
-                }
-                return Ok(result);
-            }
-        }
-        let test = eval(&parts[0], env)?;
-        if test.is_truthy() {
-            if parts.len() == 1 {
-                return Ok(test);
-            }
-            let mut result = Value::Void;
-            for expr in &parts[1..] {
-                result = eval(expr, env)?;
-            }
-            return Ok(result);
-        }
-    }
-    Ok(Value::Void)
-}
 
 fn cmp_ge(args: &[Value]) -> Result<Value, EvalError> {
     let nums = require_integers(args)?;
