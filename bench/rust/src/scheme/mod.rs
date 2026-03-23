@@ -14,6 +14,7 @@ thread_local! {
 }
 
 static WIND_ID_COUNTER: AtomicUsize = AtomicUsize::new(0);
+static RECORD_TYPE_COUNTER: AtomicUsize = AtomicUsize::new(0);
 
 #[derive(Clone)]
 struct WindEntry {
@@ -126,6 +127,26 @@ enum Value {
     SchemeValues,
     CallWithValues,
     MultipleValues(Vec<Value>),
+    Record {
+        type_id: usize,
+        type_name: String,
+        field_names: Vec<String>,
+        fields: Vec<Value>,
+    },
+    RecordConstructor {
+        type_id: usize,
+        type_name: String,
+        ctor_fields: Vec<String>,
+        field_names: Vec<String>,
+    },
+    RecordPredicate {
+        type_id: usize,
+    },
+    RecordAccessor {
+        type_id: usize,
+        field_name: String,
+        field_index: usize,
+    },
 }
 
 impl std::fmt::Debug for Value {
@@ -154,6 +175,10 @@ impl std::fmt::Debug for Value {
             Value::SchemeValues => write!(f, "SchemeValues"),
             Value::CallWithValues => write!(f, "CallWithValues"),
             Value::MultipleValues(vs) => write!(f, "MultipleValues({vs:?})"),
+            Value::Record { type_name, .. } => write!(f, "Record({type_name})"),
+            Value::RecordConstructor { type_name, .. } => write!(f, "RecordConstructor({type_name})"),
+            Value::RecordPredicate { type_id, .. } => write!(f, "RecordPredicate({type_id})"),
+            Value::RecordAccessor { field_name, .. } => write!(f, "RecordAccessor({field_name})"),
         }
     }
 }
@@ -179,6 +204,7 @@ impl PartialEq for Value {
             (Value::WithExceptionHandler, Value::WithExceptionHandler) => true,
             (Value::SchemeValues, Value::SchemeValues) => true,
             (Value::CallWithValues, Value::CallWithValues) => true,
+            (Value::Record { type_id: a, fields: fa, .. }, Value::Record { type_id: b, fields: fb, .. }) => a == b && fa == fb,
             _ => false,
         }
     }
@@ -256,6 +282,8 @@ impl std::fmt::Display for Value {
             Value::Lambda { .. } | Value::Builtin(..) | Value::CallCC | Value::DynamicWind | Value::SchemeApply | Value::Raise | Value::WithExceptionHandler | Value::Continuation(..) | Value::SchemeValues | Value::CallWithValues => write!(f, "#<procedure>"),
             Value::Macro { .. } => write!(f, "#<macro>"),
             Value::MultipleValues(_) => write!(f, "#<values>"),
+            Value::Record { type_name, .. } => write!(f, "#<record:{type_name}>"),
+            Value::RecordConstructor { .. } | Value::RecordPredicate { .. } | Value::RecordAccessor { .. } => write!(f, "#<procedure>"),
         }
     }
 }
@@ -805,7 +833,7 @@ fn match_one(pat: &Expr, form: &Expr, literals: &[String], bindings: &mut HashMa
 const SPECIAL_FORMS: &[&str] = &[
     "if", "define", "lambda", "let", "let*", "letrec", "letrec*",
     "set!", "begin", "quote", "and", "or", "cond", "case", "do", "when",
-    "define-syntax", "syntax-rules",
+    "define-syntax", "syntax-rules", "define-record-type",
 ];
 
 fn expand_macro(
@@ -1063,6 +1091,7 @@ fn step_eval(expr: Expr, env: Env, stack: &mut Vec<Frame>) -> Result<Act, EvalEr
                     "do" => return sf_do(&elems[1..], env, stack),
                     "when" => return sf_when(&elems[1..], env, stack),
                     "guard" => return sf_guard(&elems[1..], env, stack),
+                    "define-record-type" => return sf_define_record_type(&elems[1..], &env),
                     "define-syntax" => {
                         if elems.len() != 3 {
                             return Err(EvalError::Arity("define-syntax expects 2 arguments".into()));
@@ -1398,6 +1427,41 @@ fn step_apply(func: Value, args: Vec<Value>, stack: &mut Vec<Frame>) -> Result<A
             sf_seq(&body, local, stack)
         }
         Value::Builtin(_, f) => f(&args).map(Act::Ret),
+        Value::RecordConstructor { type_id, type_name, ctor_fields, field_names } => {
+            if args.len() != ctor_fields.len() {
+                return Err(EvalError::Arity(format!(
+                    "{} constructor expects {} arguments, got {}", type_name, ctor_fields.len(), args.len()
+                )));
+            }
+            // Map constructor arg order to field order
+            let mut fields = vec![Value::Void; field_names.len()];
+            for (i, cf) in ctor_fields.iter().enumerate() {
+                if let Some(pos) = field_names.iter().position(|f| f == cf) {
+                    fields[pos] = args[i].clone();
+                } else {
+                    return Err(EvalError::Type(format!("unknown field: {cf}")));
+                }
+            }
+            Ok(Act::Ret(Value::Record { type_id, type_name, field_names, fields }))
+        }
+        Value::RecordPredicate { type_id } => {
+            if args.len() != 1 {
+                return Err(EvalError::Arity("record predicate expects 1 argument".into()));
+            }
+            let result = matches!(&args[0], Value::Record { type_id: tid, .. } if *tid == type_id);
+            Ok(Act::Ret(Value::Boolean(result)))
+        }
+        Value::RecordAccessor { type_id, field_name, field_index } => {
+            if args.len() != 1 {
+                return Err(EvalError::Arity("record accessor expects 1 argument".into()));
+            }
+            match &args[0] {
+                Value::Record { type_id: tid, fields, .. } if *tid == type_id => {
+                    Ok(Act::Ret(fields[field_index].clone()))
+                }
+                _ => Err(EvalError::Type(format!("accessor for field '{}': not a matching record", field_name))),
+            }
+        }
         Value::CallCC => {
             if args.len() != 1 {
                 return Err(EvalError::Arity("call/cc expects 1 argument".into()));
@@ -1706,6 +1770,83 @@ fn sf_define(args: &[Expr], env: Env, stack: &mut Vec<Frame>) -> Result<Act, Eva
         }
         _ => Err(EvalError::Type("define: expected symbol or list".into())),
     }
+}
+
+fn sf_define_record_type(args: &[Expr], env: &Env) -> Result<Act, EvalError> {
+    if args.len() < 3 {
+        return Err(EvalError::Arity("define-record-type requires at least 3 arguments".into()));
+    }
+
+    let type_name = match &args[0].kind {
+        ExprKind::Symbol(s) => s.clone(),
+        _ => return Err(EvalError::Type("define-record-type: expected type name symbol".into())),
+    };
+
+    let type_id = RECORD_TYPE_COUNTER.fetch_add(1, Ordering::SeqCst);
+
+    let (ctor_name, ctor_fields) = match &args[1].kind {
+        ExprKind::List(parts) if !parts.is_empty() => {
+            let name = match &parts[0].kind {
+                ExprKind::Symbol(s) => s.clone(),
+                _ => return Err(EvalError::Type("define-record-type: expected constructor name".into())),
+            };
+            let fields: Result<Vec<String>, _> = parts[1..].iter().map(|p| match &p.kind {
+                ExprKind::Symbol(s) => Ok(s.clone()),
+                _ => Err(EvalError::Type("define-record-type: expected field name".into())),
+            }).collect();
+            (name, fields?)
+        }
+        _ => return Err(EvalError::Type("define-record-type: expected constructor list".into())),
+    };
+
+    let pred_name = match &args[2].kind {
+        ExprKind::Symbol(s) => s.clone(),
+        _ => return Err(EvalError::Type("define-record-type: expected predicate name".into())),
+    };
+
+    let mut field_names = Vec::new();
+    let mut accessor_names = Vec::new();
+    for arg in &args[3..] {
+        match &arg.kind {
+            ExprKind::List(parts) if parts.len() >= 2 => {
+                let fname = match &parts[0].kind {
+                    ExprKind::Symbol(s) => s.clone(),
+                    _ => return Err(EvalError::Type("define-record-type: expected field name".into())),
+                };
+                let aname = match &parts[1].kind {
+                    ExprKind::Symbol(s) => s.clone(),
+                    _ => return Err(EvalError::Type("define-record-type: expected accessor name".into())),
+                };
+                field_names.push(fname);
+                accessor_names.push(aname);
+            }
+            _ => return Err(EvalError::Type("define-record-type: expected field spec (name accessor)".into())),
+        }
+    }
+
+    // Define constructor
+    env_set(env, ctor_name, Value::RecordConstructor {
+        type_id,
+        type_name: type_name.clone(),
+        ctor_fields: ctor_fields.clone(),
+        field_names: field_names.clone(),
+    });
+
+    // Define predicate
+    env_set(env, pred_name, Value::RecordPredicate { type_id });
+
+    // Define accessors
+    for (i, aname) in accessor_names.into_iter().enumerate() {
+        let field = field_names[i].clone();
+        // Find the index of this field in field_names
+        env_set(env, aname, Value::RecordAccessor {
+            type_id,
+            field_name: field,
+            field_index: i,
+        });
+    }
+
+    Ok(Act::Ret(Value::Void))
 }
 
 fn sf_and(args: &[Expr], env: Env, stack: &mut Vec<Frame>) -> Result<Act, EvalError> {
@@ -2118,7 +2259,7 @@ fn builtin_type_pred(args: &[Value], name: &str) -> Result<Value, EvalError> {
         "symbol?" => matches!(&args[0], Value::Symbol(_)),
         "char?" => matches!(&args[0], Value::Char(_)),
         "vector?" => matches!(&args[0], Value::Vector(_)),
-        "procedure?" => matches!(&args[0], Value::Lambda { .. } | Value::Builtin(..) | Value::CallCC | Value::DynamicWind | Value::SchemeApply | Value::Continuation(..) | Value::SchemeValues | Value::CallWithValues),
+        "procedure?" => matches!(&args[0], Value::Lambda { .. } | Value::Builtin(..) | Value::CallCC | Value::DynamicWind | Value::SchemeApply | Value::Continuation(..) | Value::SchemeValues | Value::CallWithValues | Value::RecordConstructor { .. } | Value::RecordPredicate { .. } | Value::RecordAccessor { .. }),
         _ => false,
     };
     Ok(Value::Boolean(result))
