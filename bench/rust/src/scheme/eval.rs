@@ -54,6 +54,7 @@ fn eval_list_tail(elems: &[Expr], env: &Rc<Env>) -> Result<Trampoline, EvalError
             "quote" => return eval_quote(&elems[1..]).map(Trampoline::Done),
             "lambda" => return eval_lambda(&elems[1..], env).map(Trampoline::Done),
             "let" => return eval_let_tail(&elems[1..], env),
+            "set!" => return eval_set(&elems[1..], env).map(Trampoline::Done),
             "begin" => return eval_begin_tail(&elems[1..], env),
             "cond" => return eval_cond_tail(&elems[1..], env),
             _ => {}
@@ -144,6 +145,27 @@ fn eval_define(args: &[Expr], env: &Rc<Env>) -> Result<Value, EvalError> {
             message: "invalid define syntax".into(),
         }.into()),
     }
+}
+
+fn eval_set(args: &[Expr], env: &Rc<Env>) -> Result<Value, EvalError> {
+    if args.len() != 2 {
+        return Err(ErrorKind::BadSyntax {
+            form: "set!".into(),
+            message: "expected (set! name expr)".into(),
+        }.into());
+    }
+    let name = match &args[0].kind {
+        ExprKind::Symbol(s) => s,
+        _ => return Err(ErrorKind::BadSyntax {
+            form: "set!".into(),
+            message: "first argument must be a symbol".into(),
+        }.into()),
+    };
+    let val = eval_expr(&args[1], env)?;
+    if !env.set(name, val) {
+        return Err(ErrorKind::UnboundVariable { name: name.clone() }.into());
+    }
+    Ok(Value::Void)
 }
 
 fn eval_quote(args: &[Expr]) -> Result<Value, EvalError> {

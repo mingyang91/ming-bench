@@ -66,6 +66,18 @@ impl Env {
         self.bindings.borrow_mut().insert(name, value);
     }
 
+    /// Mutate an existing binding (for set!). Returns false if unbound.
+    pub fn set(&self, name: &str, value: Value) -> bool {
+        if self.bindings.borrow().contains_key(name) {
+            self.bindings.borrow_mut().insert(name.to_string(), value);
+            true
+        } else if let Some(parent) = &self.parent {
+            parent.set(name, value)
+        } else {
+            false
+        }
+    }
+
     /// Write to the output buffer.
     pub fn write_output(&self, s: &str) {
         self.output.borrow_mut().push_str(s);
