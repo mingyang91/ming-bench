@@ -189,8 +189,28 @@ function tokenize(input: string): Token[] {
       advance(); advance();
       continue;
     }
+    if (ch === '#' && i + 1 < input.length && input[i + 1] === '(') {
+      tokens.push({ text: "#(", pos: startPos });
+      advance(); advance();
+      continue;
+    }
     if (ch === "'") {
       tokens.push({ text: "'", pos: startPos });
+      advance();
+      continue;
+    }
+    if (ch === '`') {
+      tokens.push({ text: '`', pos: startPos });
+      advance();
+      continue;
+    }
+    if (ch === ',' && i + 1 < input.length && input[i + 1] === '@') {
+      tokens.push({ text: ',@', pos: startPos });
+      advance(); advance();
+      continue;
+    }
+    if (ch === ',') {
+      tokens.push({ text: ',', pos: startPos });
       advance();
       continue;
     }
@@ -238,7 +258,19 @@ function parseTokens(tokens: Token[], pos: number): [SchemeVal, number] {
     const [val, next] = parseTokens(tokens, pos + 1);
     return [{ tag: 'list', value: [{ tag: 'symbol', value: 'quote', pos: tok.pos }, val], pos: tok.pos }, next];
   }
-  if (tok.text === '(') {
+  if (tok.text === '`') {
+    const [val, next] = parseTokens(tokens, pos + 1);
+    return [{ tag: 'list', value: [{ tag: 'symbol', value: 'quasiquote', pos: tok.pos }, val], pos: tok.pos }, next];
+  }
+  if (tok.text === ',@') {
+    const [val, next] = parseTokens(tokens, pos + 1);
+    return [{ tag: 'list', value: [{ tag: 'symbol', value: 'unquote-splicing', pos: tok.pos }, val], pos: tok.pos }, next];
+  }
+  if (tok.text === ',') {
+    const [val, next] = parseTokens(tokens, pos + 1);
+    return [{ tag: 'list', value: [{ tag: 'symbol', value: 'unquote', pos: tok.pos }, val], pos: tok.pos }, next];
+  }
+  if (tok.text === '#(') {
     const items: SchemeVal[] = [];
     pos++;
     while (pos < tokens.length && tokens[pos].text !== ')') {
@@ -247,6 +279,34 @@ function parseTokens(tokens: Token[], pos: number): [SchemeVal, number] {
       pos = next;
     }
     if (pos >= tokens.length) throw new EvalError('missing closing paren');
+    return [{ tag: 'vector', value: items, pos: tok.pos }, pos + 1];
+  }
+  if (tok.text === '(') {
+    const items: SchemeVal[] = [];
+    pos++;
+    let dotCdr: SchemeVal | null = null;
+    while (pos < tokens.length && tokens[pos].text !== ')') {
+      if (tokens[pos].text === '.' && pos + 1 < tokens.length && tokens[pos + 1].text !== ')') {
+        // Dotted pair notation: (a b . c)
+        pos++; // skip dot
+        const [cdr, next] = parseTokens(tokens, pos);
+        dotCdr = cdr;
+        pos = next;
+        break;
+      }
+      const [val, next] = parseTokens(tokens, pos);
+      items.push(val);
+      pos = next;
+    }
+    if (pos >= tokens.length) throw new EvalError('missing closing paren');
+    if (dotCdr !== null) {
+      // Build pair chain ending in dotCdr
+      let result = dotCdr;
+      for (let i = items.length - 1; i >= 0; i--) {
+        result = { tag: 'pair', car: items[i], cdr: result, pos: tok.pos };
+      }
+      return [result, pos + 1];
+    }
     return [{ tag: 'list', value: items, pos: tok.pos }, pos + 1];
   }
   if (tok.text === ')') throw new EvalError('unexpected )');
@@ -318,6 +378,12 @@ function astToPairs(val: SchemeVal): SchemeVal {
   if (val.tag === 'list') {
     return listToPairs(val.value.map(astToPairs));
   }
+  if (val.tag === 'pair') {
+    return { tag: 'pair', car: astToPairs(val.car), cdr: astToPairs(val.cdr) };
+  }
+  if (val.tag === 'vector') {
+    return { tag: 'vector', value: val.value.map(astToPairs) };
+  }
   return val;
 }
 
@@ -356,6 +422,23 @@ function parseDotParams(paramExprs: SchemeVal[]): { params: string[]; rest?: str
   return { params: paramExprs.map(p => (p as { tag: 'symbol'; value: string }).value) };
 }
 
+// Extract params from a pair-chain parameter list (from dotted pair parse)
+function parsePairParams(pairVal: SchemeVal): { params: string[]; rest?: string } {
+  const params: string[] = [];
+  let cur = pairVal;
+  while (cur.tag === 'pair') {
+    params.push((cur.car as { tag: 'symbol'; value: string }).value);
+    cur = cur.cdr;
+  }
+  if (cur.tag === 'symbol') {
+    return { params, rest: cur.value };
+  }
+  if (cur.tag === 'nil') {
+    return { params };
+  }
+  return { params };
+}
+
 // ── Hygienic Macros (syntax-rules) ─────────────────────────────────
 
 let gensymCounter = 0;
@@ -368,6 +451,7 @@ const SPECIAL_FORMS = new Set([
   'set!', 'string-set!', 'cond', 'quote', 'define-syntax',
   'syntax-case', 'syntax', 'with-syntax', 'letrec', 'letrec*',
   'case', 'do', 'guard', 'define-record-type', 'case-lambda',
+  'quasiquote', 'unquote', 'unquote-splicing',
 ]);
 
 // ── syntax-case dynamic context ────────────────────────────────────
@@ -1153,6 +1237,31 @@ function makeGlobalEnv(): Env {
     }
     return { tag: 'boolean', value: false };
   });
+  defBuiltin('memq', (args) => {
+    let cur = args[1];
+    while (cur.tag === 'pair') {
+      if (schemeEq(args[0], cur.car)) return cur;
+      cur = cur.cdr;
+    }
+    return { tag: 'boolean', value: false };
+  });
+  defBuiltin('memv', (args) => {
+    let cur = args[1];
+    while (cur.tag === 'pair') {
+      if (schemeEq(args[0], cur.car)) return cur;
+      cur = cur.cdr;
+    }
+    return { tag: 'boolean', value: false };
+  });
+  defBuiltin('assq', (args) => {
+    const key = args[0];
+    let cur = args[1];
+    while (cur.tag === 'pair') {
+      if (cur.car.tag === 'pair' && schemeEq(cur.car.car, key)) return cur.car;
+      cur = cur.cdr;
+    }
+    return { tag: 'boolean', value: false };
+  });
   defBuiltin('assv', (args) => {
     const key = args[0];
     let cur = args[1];
@@ -1212,6 +1321,12 @@ function evaluateCondCPS(clauses: SchemeVal[], idx: number, env: Env, k: K): TRe
   return evaluateCPS(clause[0], env, (test) => {
     if (isTruthy(test)) {
       if (clause.length === 1) return callK(k, test);
+      // (cond (test => proc)) — apply proc to test result
+      if (clause.length === 3 && clause[1].tag === 'symbol' && clause[1].value === '=>') {
+        return evaluateCPS(clause[2], env, (proc) => {
+          return applyCPS(proc, [test], k);
+        });
+      }
       return evaluateSeqCPS(clause, 1, env, k);
     }
     return evaluateCondCPS(clauses, idx + 1, env, k);
@@ -1422,6 +1537,79 @@ function applyCPS(proc: SchemeVal, args: SchemeVal[], k: K, pos?: Pos): TResult 
   throw new EvalError(`${posStr(pos)}not a procedure`);
 }
 
+// ── Quasiquote ──────────────────────────────────────────────────────
+
+function expandQuasiquoteCPS(tmpl: SchemeVal, env: Env, depth: number, k: K): TResult {
+  // (unquote x) at depth 0 → evaluate x
+  if (tmpl.tag === 'list' && tmpl.value.length === 2 &&
+      tmpl.value[0].tag === 'symbol' && tmpl.value[0].value === 'unquote') {
+    if (depth === 0) {
+      return evaluateCPS(tmpl.value[1], env, k);
+    }
+    return expandQuasiquoteCPS(tmpl.value[1], env, depth - 1, (val) => {
+      return callK(k, listToPairs([{ tag: 'symbol', value: 'unquote' }, val]));
+    });
+  }
+  // nested quasiquote
+  if (tmpl.tag === 'list' && tmpl.value.length === 2 &&
+      tmpl.value[0].tag === 'symbol' && tmpl.value[0].value === 'quasiquote') {
+    return expandQuasiquoteCPS(tmpl.value[1], env, depth + 1, (val) => {
+      return callK(k, listToPairs([{ tag: 'symbol', value: 'quasiquote' }, val]));
+    });
+  }
+  // list with potential splicing
+  if (tmpl.tag === 'list') {
+    return qqListCPS(tmpl.value, 0, env, depth, k);
+  }
+  // pair (dotted list from parser)
+  if (tmpl.tag === 'pair') {
+    // Check if it's (unquote-splicing x) represented as pair
+    if (tmpl.car.tag === 'symbol' && tmpl.car.value === 'unquote-splicing') {
+      // This shouldn't be at top level of quasiquote, but handle gracefully
+      return callK(k, astToPairs(tmpl));
+    }
+    return expandQuasiquoteCPS(tmpl.car, env, depth, (carVal) => {
+      return expandQuasiquoteCPS(tmpl.cdr, env, depth, (cdrVal) => {
+        return callK(k, { tag: 'pair', car: carVal, cdr: cdrVal });
+      });
+    });
+  }
+  // vector
+  if (tmpl.tag === 'vector') {
+    return qqListCPS(tmpl.value, 0, env, depth, (listResult) => {
+      return callK(k, { tag: 'vector', value: pairsToArray(listResult) });
+    });
+  }
+  // self-quoting (symbol, number, string, etc.)
+  return callK(k, astToPairs(tmpl));
+}
+
+function qqListCPS(elems: SchemeVal[], idx: number, env: Env, depth: number, k: K): TResult {
+  if (idx >= elems.length) return callK(k, NIL);
+  const elem = elems[idx];
+  // (unquote-splicing x) at depth 0 → evaluate x and splice
+  if (elem.tag === 'list' && elem.value.length === 2 &&
+      elem.value[0].tag === 'symbol' && elem.value[0].value === 'unquote-splicing' && depth === 0) {
+    return evaluateCPS(elem.value[1], env, (spliced) => {
+      return qqListCPS(elems, idx + 1, env, depth, (rest) => {
+        // Append spliced to rest
+        return callK(k, appendPairs(spliced, rest));
+      });
+    });
+  }
+  return expandQuasiquoteCPS(elem, env, depth, (val) => {
+    return qqListCPS(elems, idx + 1, env, depth, (rest) => {
+      return callK(k, { tag: 'pair', car: val, cdr: rest });
+    });
+  });
+}
+
+function appendPairs(a: SchemeVal, b: SchemeVal): SchemeVal {
+  if (a.tag === 'nil') return b;
+  if (a.tag === 'pair') return { tag: 'pair', car: a.car, cdr: appendPairs(a.cdr, b) };
+  return b; // improper list - just return b
+}
+
 function evaluateCPS(expr: SchemeVal, env: Env, k: K): TResult {
   if (expr.tag === 'symbol') {
     try {
@@ -1451,6 +1639,10 @@ function evaluateCPS(expr: SchemeVal, env: Env, k: K): TResult {
       return callK(k, quoted);
     }
 
+    if (op === 'quasiquote') {
+      return expandQuasiquoteCPS(items[1], env, 0, k);
+    }
+
     if (op === 'if') {
       if (items.length < 3) throw new EvalError(`${posStr(expr.pos)}if: bad syntax`);
       return evaluateCPS(items[1], env, (cond) => {
@@ -1473,6 +1665,22 @@ function evaluateCPS(expr: SchemeVal, env: Env, k: K): TResult {
         env.define(name, { tag: 'lambda', params, rest, body, env });
         return callK(k, VOID);
       }
+      if (items[1].tag === 'pair') {
+        // (define (name . rest) body) parsed as dotted pair
+        const nameAndParams = items[1];
+        let cur: SchemeVal = nameAndParams;
+        const allParams: SchemeVal[] = [];
+        while (cur.tag === 'pair') {
+          allParams.push(cur.car);
+          cur = cur.cdr;
+        }
+        const name = (allParams[0] as { tag: 'symbol'; value: string }).value;
+        const paramNames = allParams.slice(1).map(p => (p as { tag: 'symbol'; value: string }).value);
+        const restParam = cur.tag === 'symbol' ? cur.value : undefined;
+        const body = items.slice(2);
+        env.define(name, { tag: 'lambda', params: paramNames, rest: restParam, body, env });
+        return callK(k, VOID);
+      }
       const name = (items[1] as { tag: 'symbol'; value: string }).value;
       return evaluateCPS(items[2], env, (val) => {
         env.define(name, val);
@@ -1484,6 +1692,11 @@ function evaluateCPS(expr: SchemeVal, env: Env, k: K): TResult {
       const paramList = items[1];
       if (paramList.tag === 'symbol') {
         const lam: SchemeVal = { tag: 'lambda', params: [], rest: paramList.value, body: items.slice(2), env };
+        return callK(k, lam);
+      }
+      if (paramList.tag === 'pair') {
+        const { params, rest } = parsePairParams(paramList);
+        const lam: SchemeVal = { tag: 'lambda', params, rest, body: items.slice(2), env };
         return callK(k, lam);
       }
       const { params, rest } = parseDotParams((paramList as { tag: 'list'; value: SchemeVal[] }).value);
@@ -1498,6 +1711,10 @@ function evaluateCPS(expr: SchemeVal, env: Env, k: K): TResult {
         const body = clause.value.slice(1);
         if (paramList.tag === 'symbol') {
           return { params: [] as string[], rest: paramList.value, body };
+        }
+        if (paramList.tag === 'pair') {
+          const { params, rest } = parsePairParams(paramList);
+          return { params, rest, body };
         }
         const { params, rest } = parseDotParams((paramList as { tag: 'list'; value: SchemeVal[] }).value);
         return { params, rest, body };
