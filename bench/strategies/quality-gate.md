@@ -10,6 +10,7 @@ Implement a Scheme interpreter in Rust. Read `SPEC.md` for the full specificatio
 - Do NOT modify test functions
 - Allowed external crates: `thiserror`, `log`, `env_logger` (already in Cargo.toml). Do NOT add any others.
 - **No `thread_local!` or `std::thread_local`.** All state must be passed explicitly through function parameters.
+- **Local `let mut` is permitted.** Prefer immutable bindings, but `let mut` inside a function body is fine for loop control and local accumulation. Mutable state must never escape the function — don't return `&mut`, don't store in struct fields, don't pass as `&mut` to other functions. If mutation needs to be shared, use explicit shared-ownership types.
 - **NEVER run `cargo test` directly on the host.** Always use `cargo xtask test`. This rule has NO exceptions.
 
 ## Build & Test

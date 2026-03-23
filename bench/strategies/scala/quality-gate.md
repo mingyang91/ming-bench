@@ -10,7 +10,7 @@ Implement a Scheme interpreter in Scala 3. Read `SPEC.md` for the full specifica
 - You may create any additional Scala files under `src/main/scala/ming/`
 - Do NOT modify test files under `src/test/`
 - No external runtime dependencies — standard library only. Test dependencies (munit, Gson) are already in `build.mill`.
-- **No `var` anywhere.** Not at object level, not at class level, not inside methods. All state must be passed explicitly through function parameters or returned as values. Use recursion, `foldLeft`, or `Iterator` instead of mutable accumulators.
+- **No `var` at class/object/trait level.** `var` inside method bodies is permitted for loop control and local accumulation — but mutable state must never escape the function. Don't return mutable references, don't store `var` in fields, don't pass mutable state to other functions. If you can solve it immutably, do so. `var` is a last resort for local control flow, not a design tool.
 - **NEVER run `./mill ming.test` directly.** Always use `cargo xtask test --lang scala`. Direct test runs risk infinite loops and OOM. This rule has NO exceptions.
 
 ## Build & Test
@@ -61,24 +61,26 @@ cargo xtask test all --lang scala   # test all levels (300s timeout)
 
 The quality gate enforces structure mechanically; these rules are the design intent behind those checks. Follow them proactively — the gate is a safety net, not a substitute for judgment.
 
-### Pure Functional Programming
+### Immutable-First Programming
 
-**This codebase is purely functional. `var` is forbidden everywhere — no exceptions.**
+**Prefer immutable state. Use `var` only as a local last resort.**
 
-- All state flows through function parameters and return values.
-- Loops are expressed as recursion (with `@tailrec`) or collection pipelines (`foldLeft`, `map`, `flatMap`).
-- Accumulators are function parameters, not mutable locals.
-- Side effects (output capture, environment mutation) are modeled as explicit values threaded through the call chain, not as mutable state.
+- All shared state flows through function parameters and return values.
+- Prefer recursion (with `@tailrec`) or collection pipelines (`foldLeft`, `map`, `flatMap`) over mutable loops.
+- `var` inside a method body is acceptable for loop control and local accumulation when the immutable alternative is significantly more complex. Mutable state must not escape the method.
+- No `var` at class/object/trait level — ever.
 
 ```scala
-// FORBIDDEN — var anywhere
-var count = 0
-for item <- items do count += 1
-
-// REQUIRED — pure recursion or pipeline
+// Preferred — pure pipeline
 val count = items.length
-// or
-val count = items.foldLeft(0)((acc, _) => acc + 1)
+
+// Acceptable — local var for complex loop control
+var i = 0
+while i < tokens.length && tokens(i) != delimiter do i += 1
+
+// FORBIDDEN — var escaping method scope
+class Foo:
+  var state = 0  // NO: mutable field
 ```
 
 ### Pure State Machines
@@ -305,7 +307,7 @@ These limits are enforced by **scalafix** custom rules (`FileTooLong`, `MethodTo
 - **Where to assert:**
   - After lookup operations — key was actually bound
   - After structural operations — data invariants hold (e.g., non-empty after split)
-  - Trampoline / recursion — depth doesn't silently overflow
+  - Recursive loops — depth doesn't silently overflow
 - **Where NOT to assert:** User input validation (use typed errors), hot loops (use errors).
 
 ## Development Workflow
@@ -331,12 +333,12 @@ These lints are enforced by **scalafix** and **scalafmt** in a **separate cleanu
 
 | Denied pattern | Use instead |
 |---|---|
-| `var` (anywhere) | `val` + recursion, `foldLeft`, `Iterator`, parameter passing |
+| `var` at class/object/trait level | `val` + recursion, `foldLeft`, parameter passing. Local `var` in methods is OK. |
 | `.get` on `Option` (unsafe) | Pattern match, `.getOrElse(throw ...)`, or `.fold` |
 | `null` anywhere | `Option[T]`, `None`, or sentinel values |
 | `asInstanceOf[T]` | Pattern matching with typed cases |
 | Bare `catch { case _: Exception => }` | Typed error handling, never swallow exceptions |
-| `ListBuffer` / `ArrayBuffer` / `mutable.*` | `List`, `Vector`, `foldLeft`, `Iterator` |
+| `mutable.*` at class/object level | `List`, `Vector`, `foldLeft`. Local mutable collections in methods are OK. |
 
 ### Scalafmt (auto-fixable)
 
