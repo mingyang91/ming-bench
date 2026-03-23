@@ -90,6 +90,7 @@ public class Evaluator {
                 case "let" -> { return evalLetTail(args, env, pos); }
                 case "begin" -> { return evalBeginTail(args, env, pos); }
                 case "cond" -> { return evalCondTail(args, env, pos); }
+                case "set!" -> { return evalSet(args, env, pos); }
                 case "and" -> { return andTail(args, env); }
                 case "or" -> { return orTail(args, env); }
                 default -> {
@@ -135,6 +136,19 @@ public class Evaluator {
             return lambda;
         }
         throw posError(pos, "define: invalid syntax");
+    }
+
+    private SchemeValue evalSet(List<SchemeValue> args, Environment env, SourcePos pos) throws EvalError {
+        if (args.size() != 2) throw posError(pos, "set!: need exactly 2 arguments");
+        if (!(args.getFirst() instanceof SchemeValue.SymbolVal sym))
+            throw posError(pos, "set!: first argument must be a symbol");
+        SchemeValue val = eval(args.get(1), env);
+        try {
+            env.set(sym.name(), val);
+        } catch (EvalError e) {
+            throw posError(pos, "set!: unbound variable: " + sym.name());
+        }
+        return val;
     }
 
     /** If with tail-call: returns Thunk for the chosen branch. */
