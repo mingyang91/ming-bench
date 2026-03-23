@@ -19,6 +19,7 @@ public sealed interface SchemeValue {
     record ContinuationVal(Continuation cont) implements SchemeValue {}
     record SyntaxRulesVal(List<String> literals, List<SchemeValue> patterns, List<SchemeValue> templates, Environment defEnv) implements SchemeValue {}
     record PairVal(SchemeValue car, SchemeValue cdr, SourcePos pos) implements SchemeValue {}
+    record VectorVal(SchemeValue[] elements, SourcePos pos) implements SchemeValue {}
 
     default SourcePos sourcePos() {
         return switch (this) {
@@ -34,6 +35,7 @@ public sealed interface SchemeValue {
             case ContinuationVal v -> SourcePos.NONE;
             case SyntaxRulesVal v -> SourcePos.NONE;
             case PairVal v -> v.pos();
+            case VectorVal v -> v.pos();
         };
     }
 
@@ -65,6 +67,15 @@ public sealed interface SchemeValue {
             case ContinuationVal v -> "#<continuation>";
             case SyntaxRulesVal v -> "#<macro>";
             case PairVal v -> "(" + v.car().display() + " . " + v.cdr().display() + ")";
+            case VectorVal v -> {
+                var sb = new StringBuilder("#(");
+                for (int i = 0; i < v.elements().length; i++) {
+                    if (i > 0) sb.append(' ');
+                    sb.append(v.elements()[i].display());
+                }
+                sb.append(')');
+                yield sb.toString();
+            }
         };
     }
 
@@ -86,6 +97,15 @@ public sealed interface SchemeValue {
             case ContinuationVal v -> "#<continuation>";
             case SyntaxRulesVal v -> "#<macro>";
             case PairVal v -> "(" + v.car().displayOutput() + " . " + v.cdr().displayOutput() + ")";
+            case VectorVal v -> {
+                var sb = new StringBuilder("#(");
+                for (int i = 0; i < v.elements().length; i++) {
+                    if (i > 0) sb.append(' ');
+                    sb.append(v.elements()[i].displayOutput());
+                }
+                sb.append(')');
+                yield sb.toString();
+            }
             default -> display();
         };
     }

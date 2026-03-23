@@ -98,6 +98,19 @@ public class Parser {
         pos++; // skip '#'
         if (pos >= input.length()) throw new EvalError("unexpected end after #");
         char c = input.charAt(pos);
+        if (c == '(') {
+            // Vector literal #(...)
+            pos++; // skip '('
+            List<SchemeValue> elements = new ArrayList<>();
+            skipWhitespace();
+            while (pos < input.length() && input.charAt(pos) != ')') {
+                elements.add(parseExpr());
+                skipWhitespace();
+            }
+            if (pos >= input.length()) throw new EvalError("unterminated vector literal");
+            pos++; // skip ')'
+            return new SchemeValue.VectorVal(elements.toArray(new SchemeValue[0]), sp);
+        }
         pos++;
         return switch (c) {
             case 't' -> new SchemeValue.BoolVal(true, sp);
