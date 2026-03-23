@@ -28,7 +28,7 @@ impl Env {
             "string-append", "string-length", "substring",
             "string->number", "number->string",
             "symbol->string", "string->symbol",
-            "string-ref", "char?",
+            "string-ref", "string-copy", "string-set!", "char?",
         ] {
             bindings.insert(name.into(), Value::Builtin(name.into()));
         }

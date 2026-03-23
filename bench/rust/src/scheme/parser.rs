@@ -6,6 +6,7 @@ pub enum ExprKind {
     Integer(i64),
     Boolean(bool),
     Str(String),
+    Char(char),
     Symbol(String),
     List(Vec<Expr>),
 }
@@ -145,6 +146,36 @@ impl Parser {
             'f' => {
                 self.advance();
                 Ok(Expr { kind: ExprKind::Boolean(false), span })
+            }
+            '\\' => {
+                self.advance(); // skip '\'
+                if self.pos >= self.chars.len() {
+                    return Err(self.err("unexpected end after #\\"));
+                }
+                // Check for named characters (e.g., #\space, #\newline)
+                let start = self.pos;
+                if self.chars[self.pos].is_alphabetic() {
+                    while self.pos < self.chars.len() && !is_delimiter(self.chars[self.pos]) {
+                        self.advance();
+                    }
+                    let name: String = self.chars[start..self.pos].iter().collect();
+                    if name.len() == 1 {
+                        return Ok(Expr { kind: ExprKind::Char(name.chars().next().expect("single char")), span });
+                    }
+                    match name.as_str() {
+                        "space" => Ok(Expr { kind: ExprKind::Char(' '), span }),
+                        "newline" => Ok(Expr { kind: ExprKind::Char('\n'), span }),
+                        "tab" => Ok(Expr { kind: ExprKind::Char('\t'), span }),
+                        _ => Err(EvalError::new(
+                            ErrorKind::Parse { message: format!("unknown character name: {name}") },
+                            span,
+                        )),
+                    }
+                } else {
+                    let ch = self.chars[self.pos];
+                    self.advance();
+                    Ok(Expr { kind: ExprKind::Char(ch), span })
+                }
             }
             other => Err(EvalError::new(
                 ErrorKind::Parse {

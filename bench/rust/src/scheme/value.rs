@@ -1,3 +1,4 @@
+use std::cell::RefCell;
 use std::fmt;
 use std::rc::Rc;
 use crate::scheme::env::Env;
@@ -8,7 +9,7 @@ use crate::scheme::parser::Expr;
 pub enum Value {
     Integer(i64),
     Boolean(bool),
-    Str(String),
+    Str(Rc<RefCell<String>>),
     Symbol(String),
     Char(char),
     List(Vec<Value>),
@@ -21,12 +22,19 @@ pub enum Value {
     },
 }
 
+impl Value {
+    /// Convenience constructor for string values.
+    pub fn new_str(s: String) -> Self {
+        Value::Str(Rc::new(RefCell::new(s)))
+    }
+}
+
 impl PartialEq for Value {
     fn eq(&self, other: &Self) -> bool {
         match (self, other) {
             (Value::Integer(a), Value::Integer(b)) => a == b,
             (Value::Boolean(a), Value::Boolean(b)) => a == b,
-            (Value::Str(a), Value::Str(b)) => a == b,
+            (Value::Str(a), Value::Str(b)) => *a.borrow() == *b.borrow(),
             (Value::Symbol(a), Value::Symbol(b)) => a == b,
             (Value::Char(a), Value::Char(b)) => a == b,
             (Value::List(a), Value::List(b)) => a == b,
@@ -44,7 +52,7 @@ impl Value {
             Value::Integer(n) => n.to_string(),
             Value::Boolean(true) => "#t".into(),
             Value::Boolean(false) => "#f".into(),
-            Value::Str(s) => format!("\"{}\"", s),
+            Value::Str(s) => format!("\"{}\"", s.borrow()),
             Value::Symbol(s) => s.clone(),
             Value::Char(c) => format!("#\\{}", c),
             Value::List(elems) => {
@@ -60,7 +68,7 @@ impl Value {
     /// Display string for `display` — strings without quotes.
     pub fn to_display_output(&self) -> String {
         match self {
-            Value::Str(s) => s.clone(),
+            Value::Str(s) => s.borrow().clone(),
             Value::List(elems) => {
                 let inner: Vec<String> = elems.iter().map(|v| v.to_display_output()).collect();
                 format!("({})", inner.join(" "))

@@ -13,7 +13,8 @@ fn eval_expr_inner(expr: &Expr, env: &Rc<Env>) -> Result<Value, EvalError> {
     match &expr.kind {
         ExprKind::Integer(n) => Ok(Value::Integer(*n)),
         ExprKind::Boolean(b) => Ok(Value::Boolean(*b)),
-        ExprKind::Str(s) => Ok(Value::Str(s.clone())),
+        ExprKind::Str(s) => Ok(Value::new_str(s.clone())),
+        ExprKind::Char(c) => Ok(Value::Char(*c)),
         ExprKind::Symbol(name) => env.get(name).ok_or_else(|| {
             ErrorKind::UnboundVariable { name: name.clone() }.into()
         }),
@@ -143,7 +144,8 @@ fn expr_to_value(expr: &Expr) -> Result<Value, EvalError> {
     match &expr.kind {
         ExprKind::Integer(n) => Ok(Value::Integer(*n)),
         ExprKind::Boolean(b) => Ok(Value::Boolean(*b)),
-        ExprKind::Str(s) => Ok(Value::Str(s.clone())),
+        ExprKind::Str(s) => Ok(Value::new_str(s.clone())),
+        ExprKind::Char(c) => Ok(Value::Char(*c)),
         ExprKind::Symbol(s) => Ok(Value::Symbol(s.clone())),
         ExprKind::List(elems) => {
             let vals: Vec<Value> = elems
@@ -565,25 +567,36 @@ fn apply_builtin(name: &str, args: &[Value], env: &Rc<Env>) -> Result<Value, Eva
             env.write_output("\n");
             Ok(Value::Void)
         }
+        "string-append" | "string-length" | "substring" | "string->number"
+        | "number->string" | "symbol->string" | "string->symbol" | "string-ref"
+        | "string-copy" | "string-set!" => apply_string_builtin(name, args),
+        _ => Err(ErrorKind::NotAProcedure {
+            value: format!("#<procedure:{}>", name),
+        }.into()),
+    }
+}
+
+fn apply_string_builtin(name: &str, args: &[Value]) -> Result<Value, EvalError> {
+    match name {
         "string-append" => {
             let mut result = String::new();
             for arg in args {
                 match arg {
-                    Value::Str(s) => result.push_str(s),
+                    Value::Str(s) => result.push_str(&s.borrow()),
                     other => return Err(ErrorKind::TypeMismatch {
                         expected: "string".into(),
                         got: other.to_display_string(),
                     }.into()),
                 }
             }
-            Ok(Value::Str(result))
+            Ok(Value::new_str(result))
         }
         "string-length" => {
             if args.len() != 1 {
                 return Err(ErrorKind::WrongArgCount { expected: 1, got: args.len() }.into());
             }
             match &args[0] {
-                Value::Str(s) => Ok(Value::Integer(s.len() as i64)),
+                Value::Str(s) => Ok(Value::Integer(s.borrow().len() as i64)),
                 other => Err(ErrorKind::TypeMismatch {
                     expected: "string".into(),
                     got: other.to_display_string(),
@@ -594,13 +607,14 @@ fn apply_builtin(name: &str, args: &[Value], env: &Rc<Env>) -> Result<Value, Eva
             if args.len() != 3 {
                 return Err(ErrorKind::WrongArgCount { expected: 3, got: args.len() }.into());
             }
-            let s = match &args[0] {
+            let s_ref = match &args[0] {
                 Value::Str(s) => s,
                 other => return Err(ErrorKind::TypeMismatch {
                     expected: "string".into(),
                     got: other.to_display_string(),
                 }.into()),
             };
+            let s = s_ref.borrow();
             let start = require_int(&args[1])? as usize;
             let end = require_int(&args[2])? as usize;
             if start > s.len() || end > s.len() || start > end {
@@ -609,14 +623,14 @@ fn apply_builtin(name: &str, args: &[Value], env: &Rc<Env>) -> Result<Value, Eva
                     got: format!("start={}, end={}, length={}", start, end, s.len()),
                 }.into());
             }
-            Ok(Value::Str(s[start..end].to_string()))
+            Ok(Value::new_str(s[start..end].to_string()))
         }
         "string->number" => {
             if args.len() != 1 {
                 return Err(ErrorKind::WrongArgCount { expected: 1, got: args.len() }.into());
             }
             match &args[0] {
-                Value::Str(s) => match s.parse::<i64>() {
+                Value::Str(s) => match s.borrow().parse::<i64>() {
                     Ok(n) => Ok(Value::Integer(n)),
                     Err(_) => Ok(Value::Boolean(false)),
                 },
@@ -631,14 +645,14 @@ fn apply_builtin(name: &str, args: &[Value], env: &Rc<Env>) -> Result<Value, Eva
                 return Err(ErrorKind::WrongArgCount { expected: 1, got: args.len() }.into());
             }
             let n = require_int(&args[0])?;
-            Ok(Value::Str(n.to_string()))
+            Ok(Value::new_str(n.to_string()))
         }
         "symbol->string" => {
             if args.len() != 1 {
                 return Err(ErrorKind::WrongArgCount { expected: 1, got: args.len() }.into());
             }
             match &args[0] {
-                Value::Symbol(s) => Ok(Value::Str(s.clone())),
+                Value::Symbol(s) => Ok(Value::new_str(s.clone())),
                 other => Err(ErrorKind::TypeMismatch {
                     expected: "symbol".into(),
                     got: other.to_display_string(),
@@ -650,7 +664,7 @@ fn apply_builtin(name: &str, args: &[Value], env: &Rc<Env>) -> Result<Value, Eva
                 return Err(ErrorKind::WrongArgCount { expected: 1, got: args.len() }.into());
             }
             match &args[0] {
-                Value::Str(s) => Ok(Value::Symbol(s.clone())),
+                Value::Str(s) => Ok(Value::Symbol(s.borrow().clone())),
                 other => Err(ErrorKind::TypeMismatch {
                     expected: "string".into(),
                     got: other.to_display_string(),
@@ -661,13 +675,14 @@ fn apply_builtin(name: &str, args: &[Value], env: &Rc<Env>) -> Result<Value, Eva
             if args.len() != 2 {
                 return Err(ErrorKind::WrongArgCount { expected: 2, got: args.len() }.into());
             }
-            let s = match &args[0] {
+            let s_ref = match &args[0] {
                 Value::Str(s) => s,
                 other => return Err(ErrorKind::TypeMismatch {
                     expected: "string".into(),
                     got: other.to_display_string(),
                 }.into()),
             };
+            let s = s_ref.borrow();
             let idx = require_int(&args[1])? as usize;
             if idx >= s.len() {
                 return Err(ErrorKind::TypeMismatch {
@@ -676,6 +691,50 @@ fn apply_builtin(name: &str, args: &[Value], env: &Rc<Env>) -> Result<Value, Eva
                 }.into());
             }
             Ok(Value::Char(s.as_bytes()[idx] as char))
+        }
+        "string-copy" => {
+            if args.len() != 1 {
+                return Err(ErrorKind::WrongArgCount { expected: 1, got: args.len() }.into());
+            }
+            match &args[0] {
+                Value::Str(s) => Ok(Value::new_str(s.borrow().clone())),
+                other => Err(ErrorKind::TypeMismatch {
+                    expected: "string".into(),
+                    got: other.to_display_string(),
+                }.into()),
+            }
+        }
+        "string-set!" => {
+            if args.len() != 3 {
+                return Err(ErrorKind::WrongArgCount { expected: 3, got: args.len() }.into());
+            }
+            let s_ref = match &args[0] {
+                Value::Str(s) => s,
+                other => return Err(ErrorKind::TypeMismatch {
+                    expected: "string".into(),
+                    got: other.to_display_string(),
+                }.into()),
+            };
+            let idx = require_int(&args[1])? as usize;
+            let ch = match &args[2] {
+                Value::Char(c) => *c,
+                other => return Err(ErrorKind::TypeMismatch {
+                    expected: "char".into(),
+                    got: other.to_display_string(),
+                }.into()),
+            };
+            let mut s = s_ref.borrow_mut();
+            if idx >= s.len() {
+                return Err(ErrorKind::TypeMismatch {
+                    expected: "valid string index".into(),
+                    got: format!("index {} for string of length {}", idx, s.len()),
+                }.into());
+            }
+            // SAFETY: we verified idx is in bounds and we're replacing a single ASCII-range byte
+            unsafe {
+                s.as_bytes_mut()[idx] = ch as u8;
+            }
+            Ok(Value::Void)
         }
         _ => Err(ErrorKind::NotAProcedure {
             value: format!("#<procedure:{}>", name),
