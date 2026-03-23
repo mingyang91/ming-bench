@@ -315,6 +315,9 @@ func Eval(expr Expr, env *Env) (SchemeValue, error) {
 				case "lambda":
 					return evalLambda(e, env)
 
+				case "case-lambda":
+					return evalCaseLambda(e, env)
+
 				case "let":
 					// TCO: inline let so body tail is tail
 					newExpr, newEnv, err := setupLet(e, env)
@@ -529,6 +532,27 @@ func Eval(expr Expr, env *Env) (SchemeValue, error) {
 				expr = fn.Body[len(fn.Body)-1]
 				env = localEnv
 				continue
+			case *SchemeCaseLambda:
+				clause, err := matchCaseLambda(fn, len(args), e)
+				if err != nil {
+					return nil, err
+				}
+				localEnv, err := bindLambdaArgs(clause, args, e)
+				if err != nil {
+					return nil, err
+				}
+				for _, bodyExpr := range clause.Body[:len(clause.Body)-1] {
+					_, err := Eval(bodyExpr, localEnv)
+					if err != nil {
+						if jump, ok := err.(*contJumpError); ok && !activeCallCCIDs[jump.cont.id] {
+							return jump.value, nil
+						}
+						return nil, err
+					}
+				}
+				expr = clause.Body[len(clause.Body)-1]
+				env = localEnv
+				continue
 			case *SchemeCallCC:
 				return evalCallCC(args, e, env)
 			case *SchemeContinuation:
@@ -562,6 +586,32 @@ type Lambda struct {
 
 func (l *Lambda) String() string {
 	return "#<procedure>"
+}
+
+// SchemeCaseLambda represents a case-lambda with multiple arity clauses.
+type SchemeCaseLambda struct {
+	Clauses []*Lambda
+}
+
+func (cl *SchemeCaseLambda) String() string {
+	return "#<procedure>"
+}
+
+// matchCaseLambda finds the clause matching the given argument count.
+func matchCaseLambda(cl *SchemeCaseLambda, nargs int, callExpr *ListExpr) (*Lambda, error) {
+	for _, c := range cl.Clauses {
+		if c.RestParam != "" {
+			if nargs >= len(c.Params) {
+				return c, nil
+			}
+		} else {
+			if nargs == len(c.Params) {
+				return c, nil
+			}
+		}
+	}
+	line, col := callExpr.Pos()
+	return nil, &EvalError{Message: fmt.Sprintf("%d:%d: case-lambda: no matching clause for %d arguments", line, col, nargs)}
 }
 
 func evalDefine(e *ListExpr, env *Env) (SchemeValue, error) {
@@ -645,6 +695,44 @@ func evalLambda(e *ListExpr, env *Env) (SchemeValue, error) {
 	}, nil
 }
 
+func evalCaseLambda(e *ListExpr, env *Env) (SchemeValue, error) {
+	if len(e.Elements) < 2 {
+		line, col := e.Pos()
+		return nil, &EvalError{Message: fmt.Sprintf("%d:%d: case-lambda: bad syntax", line, col)}
+	}
+	var clauses []*Lambda
+	for _, clauseExpr := range e.Elements[1:] {
+		cl, ok := clauseExpr.(*ListExpr)
+		if !ok || len(cl.Elements) < 2 {
+			line, col := e.Pos()
+			return nil, &EvalError{Message: fmt.Sprintf("%d:%d: case-lambda: bad clause", line, col)}
+		}
+		// Parse params - could be a list or a single symbol (rest-only)
+		var params []string
+		var restParam string
+		switch p := cl.Elements[0].(type) {
+		case *ListExpr:
+			var err error
+			params, restParam, err = parseParams(p.Elements, e)
+			if err != nil {
+				return nil, err
+			}
+		case *SymbolExpr:
+			restParam = p.Name
+		default:
+			line, col := e.Pos()
+			return nil, &EvalError{Message: fmt.Sprintf("%d:%d: case-lambda: bad clause params", line, col)}
+		}
+		clauses = append(clauses, &Lambda{
+			Params:    params,
+			RestParam: restParam,
+			Body:      cl.Elements[1:],
+			Env:       env,
+		})
+	}
+	return &SchemeCaseLambda{Clauses: clauses}, nil
+}
+
 func nextContID() int64 {
 	contIDCounter++
 	return contIDCounter
@@ -718,6 +806,12 @@ func applyFunc(proc SchemeValue, args []SchemeValue, callExpr *ListExpr, env *En
 			}
 		}
 		return result, nil
+	case *SchemeCaseLambda:
+		clause, err := matchCaseLambda(fn, len(args), callExpr)
+		if err != nil {
+			return nil, err
+		}
+		return applyFunc(clause, args, callExpr, env)
 	case *SchemeCallCC:
 		return evalCallCC(args, callExpr, env)
 	case *SchemeContinuation:
@@ -3420,7 +3514,7 @@ func builtinProcedureQ(args []SchemeValue, callExpr *ListExpr) (SchemeValue, err
 		return nil, &EvalError{Message: fmt.Sprintf("%d:%d: procedure?: requires exactly 1 argument", line, col)}
 	}
 	switch args[0].(type) {
-	case *Lambda, *BuiltinProc, *EnvBuiltinProc, *SchemeCallCC, *SchemeDynamicWind:
+	case *Lambda, *BuiltinProc, *EnvBuiltinProc, *SchemeCallCC, *SchemeDynamicWind, *SchemeCaseLambda:
 		return &SchemeBool{Value: true}, nil
 	default:
 		return &SchemeBool{Value: false}, nil
