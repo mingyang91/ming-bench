@@ -34,6 +34,29 @@ public sealed interface SchemeValue {
         }
     }
 
+    record NilVal() implements SchemeValue {
+        @Override public String display() { return "()"; }
+    }
+
+    record PairVal(SchemeValue car, SchemeValue cdr) implements SchemeValue {
+        @Override public String display() {
+            var sb = new StringBuilder("(");
+            sb.append(car.display());
+            SchemeValue current = cdr;
+            while (current instanceof PairVal p) {
+                sb.append(' ');
+                sb.append(p.car().display());
+                current = p.cdr();
+            }
+            if (!(current instanceof NilVal)) {
+                sb.append(" . ");
+                sb.append(current.display());
+            }
+            sb.append(')');
+            return sb.toString();
+        }
+    }
+
     record VoidVal() implements SchemeValue {
         @Override public String display() { return ""; }
     }
