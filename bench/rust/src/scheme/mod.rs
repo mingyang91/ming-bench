@@ -98,6 +98,9 @@ thread_local! {
     static SYNTAX_BINDINGS: std::cell::RefCell<Vec<SyntaxBindingEntry>> = std::cell::RefCell::new(Vec::new());
     /// Stack of use-site environments for macro transformer hygiene.
     static MACRO_USE_ENV: std::cell::RefCell<Vec<Env>> = std::cell::RefCell::new(Vec::new());
+    /// Step counter for eval_str_with_limit. 0 means unlimited.
+    static STEP_LIMIT: std::cell::Cell<u64> = std::cell::Cell::new(0);
+    static STEP_COUNT: std::cell::Cell<u64> = std::cell::Cell::new(0);
 }
 
 struct SyntaxBindingEntry {
@@ -1676,6 +1679,19 @@ fn run_cek(initial_ctrl: Ctrl, initial_kont: Vec<KontFrame>) -> Result<Value, Ev
     let mut wind: Vec<WindEntry> = Vec::new();
 
     loop {
+        // Step limit check
+        let limit = STEP_LIMIT.with(|c| c.get());
+        if limit > 0 {
+            let count = STEP_COUNT.with(|c| {
+                let n = c.get() + 1;
+                c.set(n);
+                n
+            });
+            if count > limit {
+                return Err(EvalError::StepLimitExceeded);
+            }
+        }
+
         ctrl = match ctrl {
             Ctrl::Eval(expr, env) => {
                 let (el, ec) = (expr.line, expr.col);
@@ -4568,6 +4584,17 @@ pub fn eval_str_with_output(input: &str) -> Result<(String, String), EvalError> 
     let result = run_cek(ctrl, kont)?;
     let output = OUTPUT_BUFFER.with(|buf| buf.borrow().clone());
     Ok((result.display(), output))
+}
+
+/// Evaluate Scheme expressions with a step budget. Each CEK machine
+/// iteration counts as one step; exceeding `max_steps` returns an error.
+pub fn eval_str_with_limit(input: &str, max_steps: u64) -> Result<String, EvalError> {
+    STEP_LIMIT.with(|c| c.set(max_steps));
+    STEP_COUNT.with(|c| c.set(0));
+    let result = eval_str(input);
+    STEP_LIMIT.with(|c| c.set(0));
+    STEP_COUNT.with(|c| c.set(0));
+    result
 }
 
 #[cfg(test)]

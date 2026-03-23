@@ -11,6 +11,8 @@ pub enum EvalError {
     UnboundVariable(String),
     #[error("division by zero{0}")]
     DivisionByZero(String),
+    #[error("step limit exceeded")]
+    StepLimitExceeded,
 }
 
 impl EvalError {
@@ -27,6 +29,7 @@ impl EvalError {
             EvalError::DivisionByZero(_) => {
                 EvalError::DivisionByZero(format!(" at {pos}"))
             }
+            EvalError::StepLimitExceeded => EvalError::StepLimitExceeded,
         }
     }
 }
