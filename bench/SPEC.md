@@ -106,3 +106,6 @@ Combined use of all features: dynamic-wind + guard for resource cleanup on excep
 
 ### Level 26 — Real-World Integration Stress
 All features from L1-L25 are exercised together by large (1000+ line) real-world Scheme programs. No new language features — this level tests whether your interpreter handles real code at scale. Programs include a type inferencer (dynamic, ~2,300 lines) and a complete macro expander (alexpander, ~1,950 lines) that stress closures, continuations, mutation, vectors, and macros simultaneously.
+
+### Level 27 — Concurrent Evaluation
+`eval_str` must be safe for concurrent use from multiple threads. Independent evaluations must not interfere — each call gets its own environment, and output capture must be isolated per-call. No global mutable state. The interpreter does not need Scheme-level threading primitives; it must simply be reentrant. Tests spawn 4-16 threads calling `eval_str` in parallel with independent computations, closures with `set!` counters, and `display` output capture.

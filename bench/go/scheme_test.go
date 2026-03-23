@@ -162,3 +162,132 @@ func TestL20(t *testing.T) { runLevelTests(t, 20) }
 func TestL21(t *testing.T) { runLevelTests(t, 21) }
 func TestL22(t *testing.T) { runLevelTests(t, 22) }
 func TestL23(t *testing.T) { runLevelTests(t, 23) }
+
+// ===== Level 27: Concurrent Evaluation =====
+// eval_str must be safe for concurrent use from multiple goroutines.
+
+func skipIfBelowL27(t *testing.T) {
+	t.Helper()
+	level := benchLevel()
+	if level > 0 && level < 27 {
+		t.Skip("Skipping: BENCH_LEVEL < 27")
+	}
+}
+
+func TestL27ConcurrentIndependentEval(t *testing.T) {
+	skipIfBelowL27(t)
+	const n = 8
+	type result struct {
+		idx int
+		val string
+		err error
+	}
+	ch := make(chan result, n)
+	for i := 0; i < n; i++ {
+		go func(seed int) {
+			program := fmt.Sprintf("(let loop ((n 1000) (acc 0)) (if (= n 0) acc (loop (- n 1) (+ acc %d))))", seed)
+			val, err := EvalStr(program)
+			ch <- result{seed, val, err}
+		}(i)
+	}
+	for i := 0; i < n; i++ {
+		r := <-ch
+		if r.err != nil {
+			t.Fatalf("thread %d: unexpected error: %v", r.idx, r.err)
+		}
+		expected := fmt.Sprintf("%d", r.idx*1000)
+		if r.val != expected {
+			t.Fatalf("thread %d: expected %q, got %q", r.idx, expected, r.val)
+		}
+	}
+}
+
+func TestL27ConcurrentOutputIsolation(t *testing.T) {
+	skipIfBelowL27(t)
+	const n = 4
+	type result struct {
+		idx    int
+		val    string
+		output string
+		err    error
+	}
+	ch := make(chan result, n)
+	for i := 0; i < n; i++ {
+		go func(idx int) {
+			program := fmt.Sprintf(`(begin (display "thread%d") (display " ") (display "done%d") "ok")`, idx, idx)
+			val, output, err := EvalStrWithOutput(program)
+			ch <- result{idx, val, output, err}
+		}(i)
+	}
+	for i := 0; i < n; i++ {
+		r := <-ch
+		if r.err != nil {
+			t.Fatalf("thread %d: unexpected error: %v", r.idx, r.err)
+		}
+		if r.val != "ok" {
+			t.Fatalf("thread %d: expected \"ok\", got %q", r.idx, r.val)
+		}
+		expectedOutput := fmt.Sprintf("thread%d done%d", r.idx, r.idx)
+		if r.output != expectedOutput {
+			t.Fatalf("thread %d: expected output %q, got %q", r.idx, expectedOutput, r.output)
+		}
+	}
+}
+
+func TestL27ConcurrentClosuresAndMutation(t *testing.T) {
+	skipIfBelowL27(t)
+	const n = 4
+	ch := make(chan struct {
+		val string
+		err error
+	}, n)
+	for i := 0; i < n; i++ {
+		go func() {
+			val, err := EvalStr(`(let ((count 0))
+				(define (inc!) (set! count (+ count 1)) count)
+				(inc!) (inc!) (inc!)
+				count)`)
+			ch <- struct {
+				val string
+				err error
+			}{val, err}
+		}()
+	}
+	for i := 0; i < n; i++ {
+		r := <-ch
+		if r.err != nil {
+			t.Fatalf("unexpected error: %v", r.err)
+		}
+		if r.val != "3" {
+			t.Fatalf("expected \"3\", got %q", r.val)
+		}
+	}
+}
+
+func TestL27ConcurrentStress(t *testing.T) {
+	skipIfBelowL27(t)
+	const n = 16
+	type result struct {
+		idx int
+		val string
+		err error
+	}
+	ch := make(chan result, n)
+	for i := 0; i < n; i++ {
+		go func(idx int) {
+			program := fmt.Sprintf("(let ((x %d)) (define (f n) (if (= n 0) x (f (- n 1)))) (f 100))", idx)
+			val, err := EvalStr(program)
+			ch <- result{idx, val, err}
+		}(i)
+	}
+	for i := 0; i < n; i++ {
+		r := <-ch
+		if r.err != nil {
+			t.Fatalf("thread %d: unexpected error: %v", r.idx, r.err)
+		}
+		expected := fmt.Sprintf("%d", r.idx)
+		if r.val != expected {
+			t.Fatalf("thread %d: expected %q, got %q", r.idx, expected, r.val)
+		}
+	}
+}
