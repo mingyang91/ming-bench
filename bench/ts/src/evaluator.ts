@@ -10,7 +10,7 @@ type Kont = (val: SchemeVal) => Bounce;
 type SchemeVal =
   | { tag: 'number'; value: number; pos?: Pos }
   | { tag: 'boolean'; value: boolean; pos?: Pos }
-  | { tag: 'string'; value: string; pos?: Pos }
+  | { tag: 'string'; value: string; mutable?: boolean; pos?: Pos }
   | { tag: 'symbol'; value: string; pos?: Pos }
   | { tag: 'list'; elements: SchemeVal[]; pos?: Pos }
   | { tag: 'void'; pos?: Pos }
@@ -789,19 +789,48 @@ function makeGlobalEnv(output: string[] = []): Env {
   });
   defBuiltin('string-set!', (args, p) => {
     if (args.length !== 3) throw posError('string-set!: need 3 arguments', p);
-    const str = args[0];
-    if (str.tag !== 'string') throw posError('string-set!: expected string', p);
+    if (args[0].tag !== 'string') throw posError('string-set!: expected string', p);
+    if (!args[0].mutable) throw posError('string-set!: string is immutable', p);
     const idx = expectNumber(args[1], 'string-set!', p);
-    const ch = args[2];
-    if (ch.tag !== 'char') throw posError('string-set!: expected char', p);
-    if (idx < 0 || idx >= str.value.length) throw posError('string-set!: index out of range', p);
-    (str as any).value = str.value.slice(0, idx) + ch.value + str.value.slice(idx + 1);
-    return { tag: 'void' };
+    if (args[2].tag !== 'char') throw posError('string-set!: expected char', p);
+    const s = args[0].value;
+    if (idx < 0 || idx >= s.length) throw posError('string-set!: index out of range', p);
+    (args[0] as any).value = s.substring(0, idx) + args[2].value + s.substring(idx + 1);
+    return { tag: 'void' as const };
+  });
+  defBuiltin('string->list', (args, p) => {
+    if (args.length !== 1) throw posError('string->list: need 1 argument', p);
+    if (args[0].tag !== 'string') throw posError('string->list: expected string', p);
+    const chars: SchemeVal[] = [];
+    for (const ch of args[0].value) {
+      chars.push({ tag: 'char', value: ch });
+    }
+    return { tag: 'list', elements: chars };
+  });
+  defBuiltin('list->string', (args, p) => {
+    if (args.length !== 1) throw posError('list->string: need 1 argument', p);
+    if (args[0].tag !== 'list') throw posError('list->string: expected list', p);
+    let s = '';
+    for (const item of args[0].elements) {
+      if (item.tag !== 'char') throw posError('list->string: expected list of chars', p);
+      s += item.value;
+    }
+    return { tag: 'string', value: s };
+  });
+  defBuiltin('char->integer', (args, p) => {
+    if (args.length !== 1) throw posError('char->integer: need 1 argument', p);
+    if (args[0].tag !== 'char') throw posError('char->integer: expected char', p);
+    return { tag: 'number', value: args[0].value.codePointAt(0)! };
+  });
+  defBuiltin('integer->char', (args, p) => {
+    if (args.length !== 1) throw posError('integer->char: need 1 argument', p);
+    const n = expectNumber(args[0], 'integer->char', p);
+    return { tag: 'char', value: String.fromCodePoint(n) };
   });
   defBuiltin('string-copy', (args, p) => {
     if (args.length !== 1) throw posError('string-copy: need 1 argument', p);
     if (args[0].tag !== 'string') throw posError('string-copy: expected string', p);
-    return { tag: 'string', value: args[0].value };
+    return { tag: 'string', value: args[0].value, mutable: true };
   });
 
   // eq? / equal?
