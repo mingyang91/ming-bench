@@ -262,8 +262,8 @@ object BuiltinsDefs:
     Builtins.typeCheck(
       args,
       {
-        case _: LambdaVal | _: BuiltinVal | _: ContinuationVal => true
-        case _                                                 => false
+        case _: LambdaVal | _: CaseLambdaVal | _: BuiltinVal | _: ContinuationVal => true
+        case _                                                                    => false
       }
     )
 
@@ -284,4 +284,4 @@ object BuiltinsDefs:
       case MutablePairVal(_) => Builtins.toScalaList(lastArg)
       case _                 => throw new EvalError("apply: last argument must be a list")
     val prefixArgs = args.slice(1, args.length - 1)
-    Interpreter.applyProc(proc, prefixArgs ++ tailList)
+    ProcApply.applyProc(proc, prefixArgs ++ tailList)

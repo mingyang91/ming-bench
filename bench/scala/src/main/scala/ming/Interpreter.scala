@@ -42,7 +42,7 @@ object Interpreter:
           // Self-evaluating
           case IntVal(_, _) | RationalVal(_, _, _) | DoubleVal(_, _) | BoolVal(_, _) | StringVal(_, _) |
               MutableStringVal(_, _) | CharVal(_, _) | PairVal(_, _) | MutablePairVal(_) | VectorVal(_, _) |
-              LambdaVal(_, _, _, _) | BuiltinVal(_, _) | ContinuationVal(_, _, _, _, _, _, _) |
+              LambdaVal(_, _, _, _) | BuiltinVal(_, _) | ContinuationVal(_, _, _, _, _, _, _) | CaseLambdaVal(_, _) |
               SyntaxRulesVal(_, _, _, _) | SyntaxTransformerVal(_) | ValuesVal(_) | RecordVal(_, _, _) | Void =>
             return curExpr
 
@@ -63,6 +63,9 @@ object Interpreter:
 
           case ListVal(SymbolVal("lambda", _) :: args, pos) =>
             return SpecialForms.evalLambda(args, pos, curEnv)
+
+          case ListVal(SymbolVal("case-lambda", _) :: clauses, pos) =>
+            return SpecialForms.evalCaseLambda(clauses, pos, curEnv)
 
           case ListVal(SymbolVal("set!", _) :: args, pos) =>
             return SpecialForms.evalSet(args, pos, curEnv)
@@ -104,7 +107,7 @@ object Interpreter:
               case Some(SyntaxRulesVal(mn, lits, rules, defEnv)) =>
                 curExpr = Macro.expand(mn, lits, rules, defEnv, curExpr)
               case Some(SyntaxTransformerVal(proc)) =>
-                curExpr = applyProc(proc, List(curExpr), pos)
+                curExpr = ProcApply.applyProc(proc, List(curExpr), pos)
               case _ =>
                 val args = curExpr.asInstanceOf[ListVal].elements.tail
                 evalApplication(sym, args, pos, curEnv) match
@@ -143,87 +146,9 @@ object Interpreter:
       case "letrec"  => SpecialForms.evalLetrec(args, pos, env)
       case "letrec*" => SpecialForms.evalLetrecStar(args, pos, env)
       case "case"    => SpecialForms.evalCase(args, pos, env)
-      case "do"      => SpecialForms.evalDo(args, pos, env)
+      case "do"      => IterationForms.evalDo(args, pos, env)
       case "let*"    => SpecialForms.evalLetStar(args, pos, env)
       case _         => throw new AssertionError(s"unreachable: $name")
-
-  def applyProc(
-    proc: SchemeValue,
-    args: List[SchemeValue],
-    callPos: Option[SourcePos] = None
-  ): SchemeValue =
-    proc match
-      case LambdaVal(params, restParam, body, closure) =>
-        bindAndEvalBody(params, restParam, args, body, closure, callPos)
-      case BuiltinVal(_, func) =>
-        try func(args)
-        catch
-          case e: EvalError =>
-            if callPos.isDefined && !e.getMessage.matches(".*\\d+:\\d+.*") then
-              throw new EvalError(posMsg(e.getMessage, callPos))
-            else throw e
-      case ContinuationVal(contId, bodyExprs, bodyEnv, ctxStack, seqRem, seqE, hasSame) =>
-        val jumpValue = args match
-          case Nil           => Void
-          case single :: Nil => single
-          case multiple      => ValuesVal(multiple)
-        throw new ContinuationJump(contId, jumpValue, bodyExprs, bodyEnv, ctxStack, seqRem, seqE, hasSame)
-      case _ =>
-        throw new EvalError(posMsg("not a procedure", callPos))
-
-  /** Bind parameters (including rest param) and evaluate body with TCO on last expr. */
-  private def bindParamsAndTailCall(
-    params: List[String],
-    restParam: Option[String],
-    args: List[SchemeValue],
-    body: List[SchemeValue],
-    closure: Environment,
-    callPos: Option[SourcePos]
-  ): EvalResult =
-    val childEnv = bindParams(params, restParam, args, closure, callPos)
-    evalBodyInit(body, childEnv)
-    TailCall(body.last, childEnv)
-
-  private def bindAndEvalBody(
-    params: List[String],
-    restParam: Option[String],
-    args: List[SchemeValue],
-    body: List[SchemeValue],
-    closure: Environment,
-    callPos: Option[SourcePos]
-  ): SchemeValue =
-    val savedCtx = ContinuationManager.bodyContext
-    val childEnv = bindParams(params, restParam, args, closure, callPos)
-    try
-      evalBodyInit(body, childEnv)
-      eval(body.last, childEnv)
-    finally ContinuationManager.bodyContext = savedCtx
-
-  private def bindParams(
-    params: List[String],
-    restParam: Option[String],
-    args: List[SchemeValue],
-    closure: Environment,
-    callPos: Option[SourcePos]
-  ): Environment =
-    restParam match
-      case Some(rest) =>
-        if args.length < params.length then
-          throw new EvalError(
-            posMsg(s"wrong number of arguments: expected at least ${params.length}, got ${args.length}", callPos)
-          )
-        val childEnv = closure.child()
-        params.zip(args).foreach((p, v) => childEnv.define(p, v))
-        childEnv.define(rest, ListVal(args.drop(params.length)))
-        childEnv
-      case None =>
-        if args.length != params.length then
-          throw new EvalError(
-            posMsg(s"wrong number of arguments: expected ${params.length}, got ${args.length}", callPos)
-          )
-        val childEnv = closure.child()
-        params.zip(args).foreach((p, v) => childEnv.define(p, v))
-        childEnv
 
   private def evalIf(args: List[SchemeValue], pos: Option[SourcePos], env: Environment): EvalResult =
     args match
@@ -269,7 +194,10 @@ object Interpreter:
     val evaledArgs = args.map(eval(_, env))
     proc match
       case LambdaVal(params, restParam, body, closure) =>
-        bindParamsAndTailCall(params, restParam, evaledArgs, body, closure, pos)
+        ProcApply.bindParamsAndTailCall(params, restParam, evaledArgs, body, closure, pos)
+      case CaseLambdaVal(clauses, closure) =>
+        val (params, restParam, body) = ProcApply.matchCaseLambdaClause(clauses, evaledArgs.length, pos)
+        ProcApply.bindParamsAndTailCall(params, restParam, evaledArgs, body, closure, pos)
       case BuiltinVal(_, func) =>
         try Done(func(evaledArgs))
         catch

@@ -29,6 +29,7 @@ enum SchemeValue:
   case SyntaxRulesVal(name: String, literals: Set[String], rules: List[(SchemeValue, SchemeValue)], defEnv: Environment)
   case SyntaxTransformerVal(proc: SchemeValue)
   case ValuesVal(values: List[SchemeValue])
+  case CaseLambdaVal(clauses: List[(List[String], Option[String], List[SchemeValue])], closure: Environment)
   case RecordVal(typeId: Long, typeName: String, fields: Array[SchemeValue])
   case Void
 
@@ -61,6 +62,7 @@ enum SchemeValue:
     case PairVal(_, _)                        => displayPair(this)
     case MutablePairVal(_)                    => displayPairSafe(this)
     case LambdaVal(_, _, _, _)                => "#<procedure>"
+    case CaseLambdaVal(_, _)                  => "#<procedure>"
     case BuiltinVal(n, _)                     => s"#<builtin:$n>"
     case ContinuationVal(_, _, _, _, _, _, _) => "#<continuation>"
     case SyntaxRulesVal(_, _, _, _)           => "#<macro>"

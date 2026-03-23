@@ -79,11 +79,11 @@ object Evaluator:
   private def callWithValuesOp(args: List[SchemeValue]): SchemeValue =
     args match
       case producer :: consumer :: Nil =>
-        val produced = Interpreter.applyProc(producer, Nil)
+        val produced = ProcApply.applyProc(producer, Nil)
         val consumerArgs = produced match
           case ValuesVal(vs) => vs
           case single        => List(single)
-        Interpreter.applyProc(consumer, consumerArgs)
+        ProcApply.applyProc(consumer, consumerArgs)
       case _ => throw new EvalError("call-with-values: requires 2 arguments")
 
   /** Create the call/cc builtin function. */
@@ -107,7 +107,7 @@ object Evaluator:
           val proc       = args.head
           val savedStack = ContinuationManager.contextStack
           val savedWind  = ContinuationManager.windStack
-          try Interpreter.applyProc(proc, List(cont))
+          try ProcApply.applyProc(proc, List(cont))
           catch
             case jump: ContinuationJump if jump.contId == contId =>
               WindException.doWindTransition(savedWind)

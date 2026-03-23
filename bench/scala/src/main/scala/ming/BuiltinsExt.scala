@@ -233,7 +233,7 @@ object BuiltinsExt:
     if !lists.forall(_.length == len) then throw new EvalError("map: lists must have same length")
     val result = (0 until len).toList.map { i =>
       val elemArgs = lists.map(_(i))
-      Interpreter.applyProc(proc, elemArgs)
+      ProcApply.applyProc(proc, elemArgs)
     }
     schemeListFromScala(result)
 
@@ -246,7 +246,7 @@ object BuiltinsExt:
     var i = 0
     while i < len do
       val elemArgs = lists.map(_(i))
-      Interpreter.applyProc(proc, elemArgs)
+      ProcApply.applyProc(proc, elemArgs)
       i += 1
     Void
 

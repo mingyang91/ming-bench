@@ -32,11 +32,11 @@ object WindException:
     for _ <- 0 until (currentLen - commonLen) do
       val frame = ContinuationManager.windStack.head
       ContinuationManager.windStack = ContinuationManager.windStack.tail
-      Interpreter.applyProc(frame._2, Nil)
+      ProcApply.applyProc(frame._2, Nil)
     // Rewind: call in-thunks from outermost to innermost
     val rewindFrames = target.take(targetLen - commonLen).reverse
     for frame <- rewindFrames do
-      Interpreter.applyProc(frame._1, Nil)
+      ProcApply.applyProc(frame._1, Nil)
       ContinuationManager.windStack = frame :: ContinuationManager.windStack
 
   /** Implement dynamic-wind: in-thunk, body-thunk, out-thunk. */
@@ -45,18 +45,18 @@ object WindException:
     val inThunk   = args(0)
     val bodyThunk = args(1)
     val outThunk  = args(2)
-    Interpreter.applyProc(inThunk, Nil)
+    ProcApply.applyProc(inThunk, Nil)
     val frame = (inThunk, outThunk)
     ContinuationManager.windStack = frame :: ContinuationManager.windStack
     try
-      val result = Interpreter.applyProc(bodyThunk, Nil)
+      val result = ProcApply.applyProc(bodyThunk, Nil)
       ContinuationManager.windStack = ContinuationManager.windStack.tail
-      Interpreter.applyProc(outThunk, Nil)
+      ProcApply.applyProc(outThunk, Nil)
       result
     catch
       case e: SchemeRaise =>
         ContinuationManager.windStack = ContinuationManager.windStack.tail
-        Interpreter.applyProc(outThunk, Nil)
+        ProcApply.applyProc(outThunk, Nil)
         throw e
 
   /** Implement raise: throw a Scheme-level exception. */
@@ -69,10 +69,10 @@ object WindException:
     if args.length != 2 then throw new EvalError("with-exception-handler: requires 2 arguments")
     val handler = args(0)
     val thunk   = args(1)
-    try Interpreter.applyProc(thunk, Nil)
+    try ProcApply.applyProc(thunk, Nil)
     catch
       case e: SchemeRaise =>
-        Interpreter.applyProc(handler, List(e.value))
+        ProcApply.applyProc(handler, List(e.value))
 
   /** Evaluate a guard form: (guard (var clause ...) body ...). */
   private[ming] def evalGuard(
