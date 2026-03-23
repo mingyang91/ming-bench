@@ -449,6 +449,8 @@ func Eval(expr Expr, env *Env) (SchemeValue, error) {
 
 				case "guard":
 					return evalGuard(e, env)
+				case "define-record-type":
+					return evalDefineRecordType(e, env)
 				}
 			}
 
@@ -3091,4 +3093,130 @@ func evalGuard(e *ListExpr, env *Env) (SchemeValue, error) {
 
 	// No clause matched, re-raise
 	return nil, raiseErr
+}
+
+// evalDefineRecordType implements (define-record-type <name> (constructor field ...) predicate (field accessor) ...)
+func evalDefineRecordType(e *ListExpr, env *Env) (SchemeValue, error) {
+	// (define-record-type <name> (constructor field...) predicate (field accessor) ...)
+	// Minimum: type-name, constructor, predicate, at least 0 field specs
+	if len(e.Elements) < 4 {
+		line, col := e.Pos()
+		return nil, &EvalError{Message: fmt.Sprintf("%d:%d: define-record-type: bad syntax", line, col)}
+	}
+
+	// 1. Type name (ignored for runtime, just a tag)
+	typeSym, ok := e.Elements[1].(*SymbolExpr)
+	if !ok {
+		line, col := e.Elements[1].Pos()
+		return nil, &EvalError{Message: fmt.Sprintf("%d:%d: define-record-type: expected type name", line, col)}
+	}
+
+	// 2. Constructor clause: (constructor-name field ...)
+	ctorList, ok := e.Elements[2].(*ListExpr)
+	if !ok || len(ctorList.Elements) < 1 {
+		line, col := e.Elements[2].Pos()
+		return nil, &EvalError{Message: fmt.Sprintf("%d:%d: define-record-type: bad constructor clause", line, col)}
+	}
+	ctorName, ok := ctorList.Elements[0].(*SymbolExpr)
+	if !ok {
+		line, col := ctorList.Elements[0].Pos()
+		return nil, &EvalError{Message: fmt.Sprintf("%d:%d: define-record-type: constructor name must be a symbol", line, col)}
+	}
+	ctorFields := make([]string, len(ctorList.Elements)-1)
+	for i, fe := range ctorList.Elements[1:] {
+		fs, ok := fe.(*SymbolExpr)
+		if !ok {
+			line, col := fe.Pos()
+			return nil, &EvalError{Message: fmt.Sprintf("%d:%d: define-record-type: constructor field must be a symbol", line, col)}
+		}
+		ctorFields[i] = fs.Name
+	}
+
+	// 3. Predicate name
+	predSym, ok := e.Elements[3].(*SymbolExpr)
+	if !ok {
+		line, col := e.Elements[3].Pos()
+		return nil, &EvalError{Message: fmt.Sprintf("%d:%d: define-record-type: predicate must be a symbol", line, col)}
+	}
+
+	// 4. Field specs: (field-name accessor-name)
+	type fieldSpec struct {
+		name     string
+		accessor string
+	}
+	var fields []fieldSpec
+	for _, fe := range e.Elements[4:] {
+		fl, ok := fe.(*ListExpr)
+		if !ok || len(fl.Elements) < 2 {
+			line, col := fe.Pos()
+			return nil, &EvalError{Message: fmt.Sprintf("%d:%d: define-record-type: bad field spec", line, col)}
+		}
+		fname, ok := fl.Elements[0].(*SymbolExpr)
+		if !ok {
+			line, col := fl.Elements[0].Pos()
+			return nil, &EvalError{Message: fmt.Sprintf("%d:%d: define-record-type: field name must be a symbol", line, col)}
+		}
+		facc, ok := fl.Elements[1].(*SymbolExpr)
+		if !ok {
+			line, col := fl.Elements[1].Pos()
+			return nil, &EvalError{Message: fmt.Sprintf("%d:%d: define-record-type: accessor name must be a symbol", line, col)}
+		}
+		fields = append(fields, fieldSpec{name: fname.Name, accessor: facc.Name})
+	}
+
+	// Build field index map from constructor field order
+	fieldIndex := make(map[string]int)
+	for i, f := range ctorFields {
+		fieldIndex[f] = i
+	}
+
+	// Create runtime record type descriptor
+	rt := &SchemeRecordType{Name: typeSym.Name, FieldNames: ctorFields}
+
+	// Define constructor
+	nFields := len(ctorFields)
+	env.Set(ctorName.Name, &BuiltinProc{Name: ctorName.Name, Fn: func(args []SchemeValue, callExpr *ListExpr) (SchemeValue, error) {
+		if len(args) != nFields {
+			line, col := callExpr.Pos()
+			return nil, &EvalError{Message: fmt.Sprintf("%d:%d: %s: expected %d arguments, got %d", line, col, ctorName.Name, nFields, len(args))}
+		}
+		rec := &SchemeRecord{TypeID: rt, Fields: make([]SchemeValue, nFields)}
+		copy(rec.Fields, args)
+		return rec, nil
+	}})
+
+	// Define predicate
+	env.Set(predSym.Name, &BuiltinProc{Name: predSym.Name, Fn: func(args []SchemeValue, callExpr *ListExpr) (SchemeValue, error) {
+		if len(args) != 1 {
+			line, col := callExpr.Pos()
+			return nil, &EvalError{Message: fmt.Sprintf("%d:%d: %s: expected 1 argument", line, col, predSym.Name)}
+		}
+		rec, ok := args[0].(*SchemeRecord)
+		return &SchemeBool{Value: ok && rec.TypeID == rt}, nil
+	}})
+
+	// Define accessors
+	for _, fs := range fields {
+		idx, ok := fieldIndex[fs.name]
+		if !ok {
+			line, col := e.Pos()
+			return nil, &EvalError{Message: fmt.Sprintf("%d:%d: define-record-type: field %s not in constructor", line, col, fs.name)}
+		}
+		accName := fs.accessor
+		fieldIdx := idx
+		env.Set(accName, &BuiltinProc{Name: accName, Fn: func(args []SchemeValue, callExpr *ListExpr) (SchemeValue, error) {
+			if len(args) != 1 {
+				line, col := callExpr.Pos()
+				return nil, &EvalError{Message: fmt.Sprintf("%d:%d: %s: expected 1 argument", line, col, accName)}
+			}
+			rec, ok := args[0].(*SchemeRecord)
+			if !ok || rec.TypeID != rt {
+				line, col := callExpr.Pos()
+				return nil, &EvalError{Message: fmt.Sprintf("%d:%d: %s: not a %s record", line, col, accName, rt.Name)}
+			}
+			return rec.Fields[fieldIdx], nil
+		}})
+	}
+
+	return &SchemeVoid{}, nil
 }

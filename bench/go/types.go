@@ -156,6 +156,22 @@ type SchemeDynamicWind struct{}
 
 func (v *SchemeDynamicWind) String() string { return "#<procedure dynamic-wind>" }
 
+// SchemeRecord is an instance of a define-record-type.
+type SchemeRecord struct {
+	TypeID   *SchemeRecordType
+	Fields   []SchemeValue
+}
+
+func (v *SchemeRecord) String() string {
+	return fmt.Sprintf("#<record:%s>", v.TypeID.Name)
+}
+
+// SchemeRecordType is the runtime descriptor for a record type.
+type SchemeRecordType struct {
+	Name       string
+	FieldNames []string
+}
+
 // SchemeMultipleValues wraps zero or more values returned by (values ...).
 type SchemeMultipleValues struct {
 	Values []SchemeValue
