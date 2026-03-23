@@ -25,6 +25,7 @@ const (
 	valContinuation
 	valMacro
 	valVector
+	valMultipleValues
 )
 
 type value struct {
@@ -58,6 +59,8 @@ type value struct {
 	macroDefEnv   *env
 	// vector
 	vecval []*value
+	// multiple values
+	multiVals []*value
 }
 
 var voidVal = &value{typ: valVoid}
@@ -840,6 +843,27 @@ func (ip *interp) callThunk(thunk *value, line, col int) (*value, error) {
 		return thunk.builtin(nil, line, col)
 	}
 	return nil, &EvalError{Message: fmt.Sprintf("%d:%d: dynamic-wind: not a procedure", line, col)}
+}
+
+// applyProc calls a procedure (lambda or builtin) with the given arguments.
+func (ip *interp) applyProc(proc *value, args []*value, line, col int) (*value, error) {
+	if proc.typ == valLambda {
+		localEnv, err := bindLambdaArgs(proc, args, line, col)
+		if err != nil {
+			return nil, err
+		}
+		var result *value
+		for _, bodyExpr := range proc.body {
+			result, err = ip.eval(bodyExpr, localEnv)
+			if err != nil {
+				return nil, err
+			}
+		}
+		return result, nil
+	} else if proc.typ == valBuiltin {
+		return proc.builtin(args, line, col)
+	}
+	return nil, &EvalError{Message: fmt.Sprintf("%d:%d: call-with-values: not a procedure", line, col)}
 }
 
 // evalDynamicWind implements (dynamic-wind in-thunk body-thunk out-thunk).
@@ -2515,6 +2539,40 @@ func makeGlobalEnv(ip *interp) *env {
 			return nil, &EvalError{Message: fmt.Sprintf("%d:%d: raise: expected 1 argument", line, col)}
 		}
 		panic(&schemeRaise{val: args[0]})
+	}))
+
+	// values
+	e.set("values", makeBuiltin("values", func(args []*value, line, col int) (*value, error) {
+		if len(args) == 1 {
+			return args[0], nil
+		}
+		return &value{typ: valMultipleValues, multiVals: args}, nil
+	}))
+
+	// call-with-values
+	e.set("call-with-values", makeBuiltin("call-with-values", func(args []*value, line, col int) (*value, error) {
+		if len(args) != 2 {
+			return nil, &EvalError{Message: fmt.Sprintf("%d:%d: call-with-values: expected 2 arguments", line, col)}
+		}
+		producer := args[0]
+		consumer := args[1]
+
+		// Call producer with no arguments
+		produced, err := ip.applyProc(producer, nil, line, col)
+		if err != nil {
+			return nil, err
+		}
+
+		// Unpack multiple values
+		var consumerArgs []*value
+		if produced != nil && produced.typ == valMultipleValues {
+			consumerArgs = produced.multiVals
+		} else if produced != nil {
+			consumerArgs = []*value{produced}
+		}
+
+		// Call consumer with produced values
+		return ip.applyProc(consumer, consumerArgs, line, col)
 	}))
 
 	// call/cc as a first-class value
