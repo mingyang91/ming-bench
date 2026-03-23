@@ -13,7 +13,7 @@ use std::path::{Path, PathBuf};
 pub struct LevelAnalysis {
     pub label: String,
     pub turns: u32,
-    pub turn_limit: u32,
+    pub token_budget: u64,
     pub time_secs: u64,
     pub output_tokens: u64,
     pub test_runs: u32,
@@ -127,14 +127,14 @@ fn analyze_level(
     let output_tokens = level_output_tokens(run_dir, label, path, is_codex, totals);
     let test_runs = count_test_runs(&events);
     let friction = count_friction(&events);
-    let turn_limit = parse_level_num(label)
-        .map(|n| model::turns_for_level(n, None))
+    let token_budget = parse_level_num(label)
+        .map(|n| model::output_tokens_for_level(n, None))
         .unwrap_or(0);
 
     Ok(LevelAnalysis {
         label: label.to_string(),
         turns,
-        turn_limit,
+        token_budget,
         time_secs,
         output_tokens,
         test_runs,
@@ -315,66 +315,47 @@ pub fn run(run_arg: PathBuf) -> Result<()> {
     Ok(())
 }
 
+fn budget_pct(used: u64, budget: u64) -> String {
+    if budget > 0 {
+        format!("{}%", used * 100 / budget)
+    } else {
+        "\u{2014}".into()
+    }
+}
+
+fn budget_str(budget: u64) -> String {
+    if budget > 0 { fmt_comma(budget) } else { "\u{2014}".into() }
+}
+
 fn print_level_table(analysis: &RunAnalysis) {
     println!(
-        "{}{:<6} {:>5} {:>5} {:>7} {:>9} {:>5} {:>8}{}",
-        Color::BOLD,
-        "LEVEL",
-        "TURNS",
-        "LIMIT",
-        "TIME",
-        "OUTPUT",
-        "TESTS",
-        "FRICTION",
+        "{}{:<6} {:>5} {:>7} {:>9} {:>9} {:>5} {:>5} {:>8}{}",
+        Color::BOLD, "LEVEL", "TURNS", "TIME", "OUTPUT", "BUDGET", "%USE", "TESTS", "FRICTION",
         Color::RESET
     );
 
-    let mut total_turns: u32 = 0;
-    let mut total_time: u64 = 0;
-    let mut total_output: u64 = 0;
-    let mut total_tests: u32 = 0;
-    let mut total_friction: u32 = 0;
+    let (mut t_turns, mut t_time, mut t_out, mut t_bud, mut t_tests, mut t_fric) =
+        (0u32, 0u64, 0u64, 0u64, 0u32, 0u32);
 
-    for level in &analysis.levels {
-        let limit_str = if level.turn_limit > 0 {
-            level.turn_limit.to_string()
-        } else {
-            "\u{2014}".into()
-        };
-        let time_str = if level.time_secs > 0 {
-            fmt_duration(level.time_secs)
-        } else {
-            "--".into()
-        };
-
+    for lv in &analysis.levels {
+        let time = if lv.time_secs > 0 { fmt_duration(lv.time_secs) } else { "--".into() };
         println!(
-            "{:<6} {:>5} {:>5} {:>7} {:>9} {:>5} {:>8}",
-            level.label,
-            level.turns,
-            limit_str,
-            time_str,
-            fmt_comma(level.output_tokens),
-            level.test_runs,
-            level.friction
+            "{:<6} {:>5} {:>7} {:>9} {:>9} {:>5} {:>5} {:>8}",
+            lv.label, lv.turns, time, fmt_comma(lv.output_tokens),
+            budget_str(lv.token_budget), budget_pct(lv.output_tokens, lv.token_budget),
+            lv.test_runs, lv.friction
         );
-
-        total_turns += level.turns;
-        total_time += level.time_secs;
-        total_output += level.output_tokens;
-        total_tests += level.test_runs;
-        total_friction += level.friction;
+        t_turns += lv.turns;
+        t_time += lv.time_secs;
+        t_out += lv.output_tokens;
+        t_bud += lv.token_budget;
+        t_tests += lv.test_runs;
+        t_fric += lv.friction;
     }
 
     println!(
-        "{}{:<6} {:>5} {:>5} {:>7} {:>9} {:>5} {:>8}{}",
-        Color::BOLD,
-        "TOTAL",
-        total_turns,
-        "\u{2014}",
-        fmt_duration(total_time),
-        fmt_comma(total_output),
-        total_tests,
-        total_friction,
-        Color::RESET
+        "{}{:<6} {:>5} {:>7} {:>9} {:>9} {:>5} {:>5} {:>8}{}",
+        Color::BOLD, "TOTAL", t_turns, fmt_duration(t_time), fmt_comma(t_out),
+        fmt_comma(t_bud), budget_pct(t_out, t_bud), t_tests, t_fric, Color::RESET
     );
 }

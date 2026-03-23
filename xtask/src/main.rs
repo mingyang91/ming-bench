@@ -107,9 +107,12 @@ enum Commands {
         /// Mode: full (default) or levels
         #[arg(long, default_value = "full")]
         mode: String,
-        /// Max turns per session
+        /// Max turns per session (safety net, default 200)
         #[arg(long)]
         max_turns: Option<u32>,
+        /// Max output tokens per level (overrides tiered defaults)
+        #[arg(long)]
+        max_tokens: Option<u64>,
         /// Skip scoring after agent finishes
         #[arg(long)]
         skip_bench: bool,
@@ -222,6 +225,7 @@ fn dispatch(command: Commands) -> model::Result<()> {
         agent,
         mode,
         max_turns,
+        max_tokens,
         skip_bench,
         resume,
         from_level,
@@ -238,6 +242,7 @@ fn dispatch(command: Commands) -> model::Result<()> {
             agent,
             mode,
             max_turns,
+            max_tokens,
             skip_bench,
             resume,
             from_level,

@@ -1,17 +1,19 @@
 use crate::cmd::test_level;
 use crate::codex;
 use crate::model::{
-    compact_timestamp, iso_now, project_dir, run_cmd, run_cmd_capture, uuid_v4, write_meta, Error,
-    Lang, Result, LEVELS,
+    compact_timestamp, iso_now, output_tokens_for_level, project_dir, run_cmd, run_cmd_capture,
+    uuid_v4, write_meta, Error, Lang, Result, LEVELS, SAFETY_MAX_TURNS, TOKEN_POLL_INTERVAL_SECS,
 };
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
-use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
-use std::time::Instant;
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
+use std::time::{Duration, Instant};
 
 static INTERRUPTED: AtomicBool = AtomicBool::new(false);
 static CHILD_PID: AtomicU32 = AtomicU32::new(0);
+/// Running output-token total, updated by the token monitor thread.
+static TOKEN_TOTAL: AtomicU64 = AtomicU64::new(0);
 
 /// Per-level timing entry: (label, duration_s, status).
 type LevelTimes = Vec<(String, i64, String)>;
@@ -25,6 +27,7 @@ pub struct RunAgentArgs {
     pub agent: String,
     pub mode: String,
     pub max_turns: Option<u32>,
+    pub max_tokens: Option<u64>,
     pub skip_bench: bool,
     pub resume: bool,
     pub from_level: Option<String>,
@@ -359,6 +362,10 @@ fn run_full_mode(
     println!("=== Full run mode ===");
     let output_file = results_dir.join("agent-output.txt");
 
+    let budget = BudgetOpts {
+        token_budget: args.max_tokens,
+        level_dir: Some(results_dir.to_path_buf()),
+    };
     let agent_exit = launch_agent(
         &args.agent,
         agent_workdir,
@@ -367,6 +374,7 @@ fn run_full_mode(
         &output_file,
         args.max_turns,
         args.model.as_deref(),
+        &budget,
     );
 
     println!();
@@ -387,7 +395,7 @@ fn run_full_mode(
 // Regression checking
 // ---------------------------------------------------------------------------
 
-// Regression fix turns now use turns_for_level() — same budget as coding.
+// Regression fix uses output_tokens_for_level() — same budget as coding.
 
 /// Run all previously-passed levels against the current worktree code.
 /// Returns a list of (level_label, test_output) for any that now fail.
@@ -442,20 +450,25 @@ fn run_regression_fix(
     level_dir: &Path,
     regressions: &[(String, String)],
     current_level: &str,
-    turns: u32,
+    token_budget: u64,
 ) -> i32 {
     let prompt = build_regression_prompt(regressions, current_level, &args.lang);
     let regression_uuid = uuid_v4();
     let output_file = level_dir.join("agent-output-regression.txt");
 
+    let budget = BudgetOpts {
+        token_budget: Some(token_budget),
+        level_dir: Some(level_dir.to_path_buf()),
+    };
     let agent_exit = launch_agent(
         &args.agent,
         agent_workdir,
         &prompt,
         &regression_uuid,
         &output_file,
-        Some(turns),
+        None, // safety-net turns only
         args.model.as_deref(),
+        &budget,
     );
 
     capture_session_as(
@@ -521,9 +534,9 @@ fn check_and_fix_regressions(
     println!("WARNING: Regressions detected in: {}", regressed_names.join(", "));
 
     let level_num: u32 = level.parse().unwrap_or(1);
-    let fix_turns = turns_for_level(level_num, args.max_turns);
-    println!("--- Regression fix pass ({fix_turns} turns) ---");
-    let _fix_exit = run_regression_fix(args, agent_workdir, level_dir, &regressions, level, fix_turns);
+    let fix_budget = output_tokens_for_level(level_num, args.max_tokens);
+    println!("--- Regression fix pass ({fix_budget} output tokens) ---");
+    let _fix_exit = run_regression_fix(args, agent_workdir, level_dir, &regressions, level, fix_budget);
 
     let mut all_check: Vec<&str> = passed_levels.to_vec();
     all_check.push(level);
@@ -655,7 +668,12 @@ const MAX_INFRA_RETRIES: u32 = 2;
 
 /// Check whether the agent output indicates it ran out of turns (not retryable)
 /// vs an infrastructure failure like timeout/529/crash (retryable).
-fn agent_exhausted_turns(output_file: &Path) -> bool {
+fn agent_exhausted_budget(output_file: &Path, level_dir: &Path) -> bool {
+    // Check token-exhausted marker (written by monitor thread)
+    if level_dir.join("token-exhausted.txt").exists() {
+        return true;
+    }
+    // Fallback: check if Claude hit the safety-net turn limit
     fs::read_to_string(output_file)
         .map(|c| c.contains("Reached max turns"))
         .unwrap_or(false)
@@ -681,15 +699,15 @@ fn run_single_level(
 
         let level_num: u32 = level.parse().expect("level constant not a number");
         let level_uuid = uuid_v4();
-        let level_turns = turns_for_level(level_num, args.max_turns);
+        let token_budget = output_tokens_for_level(level_num, args.max_tokens);
         let output_file = level_dir.join("agent-output.txt");
 
         if attempt == 0 {
             println!();
-            println!("--- Level {level} (max {level_turns} turns) ---");
+            println!("--- Level {level} (budget {token_budget} output tokens) ---");
         } else {
             println!();
-            println!("--- Level {level} RETRY {attempt}/{MAX_INFRA_RETRIES} (max {level_turns} turns) ---");
+            println!("--- Level {level} RETRY {attempt}/{MAX_INFRA_RETRIES} (budget {token_budget} output tokens) ---");
         }
 
         let level_prompt = build_level_prompt(
@@ -697,14 +715,19 @@ fn run_single_level(
             worktree_dir,
             level_dir.parent().expect("level_dir has parent"),
         );
+        let budget = BudgetOpts {
+            token_budget: Some(token_budget),
+            level_dir: Some(level_dir.to_path_buf()),
+        };
         let agent_exit = launch_agent(
             &args.agent,
             agent_workdir,
             &level_prompt,
             &level_uuid,
             &output_file,
-            Some(level_turns),
+            None, // safety-net turns only
             args.model.as_deref(),
+            &budget,
         );
 
         capture_session(&args.agent, &level_uuid, &output_file, level_dir);
@@ -723,7 +746,7 @@ fn run_single_level(
         }
 
         // Failed — decide whether to retry
-        let exhausted = agent_exhausted_turns(&level_dir.join("agent-output.txt"));
+        let exhausted = agent_exhausted_budget(&level_dir.join("agent-output.txt"), level_dir);
         let should_stop = exhausted || attempt >= MAX_INFRA_RETRIES;
 
         if should_stop {
@@ -785,7 +808,8 @@ fn run_quality_gate_cleanup(
     level_dir: &Path,
     level: &str,
 ) -> i32 {
-    println!("--- Level {level} cleanup (max 15 turns) ---");
+    use crate::model::GATE_CLEANUP_TOKEN_BUDGET;
+    println!("--- Level {level} cleanup (budget {GATE_CLEANUP_TOKEN_BUDGET} output tokens) ---");
     let cleanup_uuid = uuid_v4();
     let cleanup_prompt = format!(
         "Level {level} tests pass. Fix any quality-gate warnings.\n\
@@ -793,14 +817,19 @@ fn run_quality_gate_cleanup(
         args.lang
     );
     let output_file = level_dir.join("agent-output-cleanup.txt");
+    let budget = BudgetOpts {
+        token_budget: Some(GATE_CLEANUP_TOKEN_BUDGET),
+        level_dir: Some(level_dir.to_path_buf()),
+    };
     let _cleanup_exit = launch_agent(
         &args.agent,
         agent_workdir,
         &cleanup_prompt,
         &cleanup_uuid,
         &output_file,
-        Some(15),
+        None, // safety-net turns only
         args.model.as_deref(),
+        &budget,
     );
     capture_session_as(
         &args.agent,
@@ -1051,6 +1080,15 @@ fn is_lock_held(lockfile: &Path) -> bool {
 // Agent launchers
 // ---------------------------------------------------------------------------
 
+/// Options for token-based budget enforcement.
+struct BudgetOpts {
+    /// Output token budget (None = unlimited).
+    token_budget: Option<u64>,
+    /// Path to write "token-exhausted.txt" marker if budget exceeded.
+    level_dir: Option<PathBuf>,
+}
+
+#[allow(clippy::too_many_arguments)]
 fn launch_agent(
     agent: &str,
     workdir: &Path,
@@ -1059,11 +1097,12 @@ fn launch_agent(
     output_file: &Path,
     max_turns: Option<u32>,
     model: Option<&str>,
+    budget: &BudgetOpts,
 ) -> i32 {
     let result = match agent {
-        "claude" => launch_claude(workdir, prompt, session_id, output_file, max_turns, model),
-        "codex" => launch_codex(workdir, prompt, output_file),
-        "opencode" => launch_opencode(workdir, prompt, output_file),
+        "claude" => launch_claude(workdir, prompt, session_id, output_file, max_turns, model, budget),
+        "codex" => launch_codex(workdir, prompt, output_file, budget),
+        "opencode" => launch_opencode(workdir, prompt, output_file, max_turns),
         _ => {
             eprintln!("ERROR: Unknown agent '{agent}'");
             return 1;
@@ -1086,29 +1125,40 @@ fn launch_claude(
     output_file: &Path,
     max_turns: Option<u32>,
     model: Option<&str>,
+    budget: &BudgetOpts,
 ) -> Result<i32> {
-    // Resolve claude to absolute path so it works under nohup / cron where
-    // ~/.local/bin and ~/.cargo/bin may not be in PATH.
     let claude_bin = resolve_agent_binary("claude")?;
 
+    let safety_turns = max_turns.unwrap_or(SAFETY_MAX_TURNS);
     let mut cmd_args: Vec<String> = vec![
         "-p".to_string(),
         "--session-id".to_string(),
         session_id.to_string(),
         "--dangerously-skip-permissions".to_string(),
+        "--max-turns".to_string(),
+        safety_turns.to_string(),
     ];
     if let Some(m) = model {
         cmd_args.push("--model".to_string());
         cmd_args.push(m.to_string());
     }
-    if let Some(t) = max_turns {
-        cmd_args.push("--max-turns".to_string());
-        cmd_args.push(t.to_string());
-    }
     cmd_args.push(prompt.to_string());
 
+    // Start token monitor for Claude (polls session.jsonl)
+    let monitor = budget.token_budget.map(|b| {
+        let sid = session_id.to_string();
+        let level_dir = budget.level_dir.clone();
+        TOKEN_TOTAL.store(0, Ordering::Relaxed);
+        std::thread::spawn(move || monitor_claude_tokens(&sid, b, level_dir.as_deref()))
+    });
+
     let args_ref: Vec<&str> = cmd_args.iter().map(|s| s.as_str()).collect();
-    run_agent_with_tee(&claude_bin, &args_ref, workdir, output_file)
+    let result = run_agent_with_tee(&claude_bin, &args_ref, workdir, output_file);
+
+    if let Some(handle) = monitor {
+        let _ = handle.join();
+    }
+    result
 }
 
 /// Resolve an agent binary name to an absolute path.
@@ -1136,17 +1186,50 @@ fn resolve_agent_binary(name: &str) -> Result<String> {
     })
 }
 
-fn launch_codex(workdir: &Path, prompt: &str, output_file: &Path) -> Result<i32> {
+fn launch_codex(
+    workdir: &Path,
+    prompt: &str,
+    output_file: &Path,
+    budget: &BudgetOpts,
+) -> Result<i32> {
+    // Use --json for structured JSONL output so we can monitor token usage
+    let json_flag = if budget.token_budget.is_some() {
+        " --json"
+    } else {
+        ""
+    };
     let script_cmd = format!(
-        "cd '{}' && codex exec --full-auto '{}'",
+        "cd '{}' && codex exec --full-auto{json_flag} '{}'",
         workdir.display(),
         prompt.replace('\'', "'\\''"),
     );
     let out_str = output_file.to_str().expect("output file path not utf8");
-    run_cmd("script", &["-qec", &script_cmd, out_str], workdir)
+
+    // Start token monitor for Codex (scans agent-output.txt for token_count events)
+    let monitor = budget.token_budget.map(|b| {
+        let out_path = output_file.to_path_buf();
+        let level_dir = budget.level_dir.clone();
+        TOKEN_TOTAL.store(0, Ordering::Relaxed);
+        std::thread::spawn(move || monitor_codex_tokens(&out_path, b, level_dir.as_deref()))
+    });
+
+    let result = run_cmd("script", &["-qec", &script_cmd, out_str], workdir);
+
+    if let Some(handle) = monitor {
+        let _ = handle.join();
+    }
+    result
 }
 
-fn launch_opencode(workdir: &Path, prompt: &str, output_file: &Path) -> Result<i32> {
+fn launch_opencode(
+    workdir: &Path,
+    prompt: &str,
+    output_file: &Path,
+    max_turns: Option<u32>,
+) -> Result<i32> {
+    // OpenCode has no structured token output — use turn-based fallback.
+    let turn_limit = max_turns.unwrap_or(SAFETY_MAX_TURNS);
+    eprintln!("NOTE: OpenCode uses turn-based limit ({turn_limit} turns) — no token monitoring");
     let script_cmd = format!(
         "cd '{}' && echo '{}' | opencode",
         workdir.display(),
@@ -1227,10 +1310,185 @@ fn run_agent_with_tee(cmd: &str, args: &[&str], workdir: &Path, output_file: &Pa
 }
 
 // ---------------------------------------------------------------------------
-// Level helpers
+// Token budget monitors
 // ---------------------------------------------------------------------------
 
-use crate::model::turns_for_level;
+/// Monitor Claude session.jsonl for output token usage.
+/// Polls `~/.claude/projects/*/<session_id>.jsonl` every N seconds.
+/// Sends SIGTERM to the child process when budget is exceeded.
+fn monitor_claude_tokens(session_id: &str, budget: u64, level_dir: Option<&Path>) {
+    let home = std::env::var("HOME").unwrap_or_default();
+    let projects_dir = PathBuf::from(&home).join(".claude/projects");
+
+    // Wait for session file to appear (up to 30s)
+    let jsonl_path = wait_for_session_file(&projects_dir, session_id, 30);
+    let Some(jsonl_path) = jsonl_path else {
+        eprintln!("WARNING: Token monitor could not find session JSONL for {session_id}");
+        return;
+    };
+
+    poll_token_file(
+        &jsonl_path,
+        budget,
+        level_dir,
+        extract_claude_output_tokens,
+    );
+}
+
+/// Monitor Codex JSONL output (written to agent-output.txt via --json flag).
+/// Looks for `token_count` events with `output_tokens`.
+fn monitor_codex_tokens(output_file: &Path, budget: u64, level_dir: Option<&Path>) {
+    // Wait for output file to appear (up to 30s)
+    let deadline = Instant::now() + Duration::from_secs(30);
+    while !output_file.exists() && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_secs(2));
+        if INTERRUPTED.load(Ordering::Relaxed) || CHILD_PID.load(Ordering::Relaxed) == 0 {
+            return;
+        }
+    }
+    if !output_file.exists() {
+        eprintln!(
+            "WARNING: Token monitor could not find Codex output at {}",
+            output_file.display()
+        );
+        return;
+    }
+
+    poll_token_file(
+        output_file,
+        budget,
+        level_dir,
+        extract_codex_output_tokens,
+    );
+}
+
+/// Generic poll loop: reads new lines from a file, calls `extractor` on each,
+/// accumulates output tokens, and kills the child when budget exceeded.
+fn poll_token_file<F>(path: &Path, budget: u64, level_dir: Option<&Path>, extractor: F)
+where
+    F: Fn(&str) -> u64,
+{
+    use std::io::{BufRead, BufReader, Seek, SeekFrom};
+
+    let mut offset: u64 = 0;
+    let poll = Duration::from_secs(TOKEN_POLL_INTERVAL_SECS);
+
+    loop {
+        std::thread::sleep(poll);
+
+        // Stop if child already exited
+        if CHILD_PID.load(Ordering::Relaxed) == 0 {
+            break;
+        }
+        if INTERRUPTED.load(Ordering::Relaxed) {
+            break;
+        }
+
+        // Read new lines from offset
+        let Ok(file) = fs::File::open(path) else {
+            continue;
+        };
+        let mut reader = BufReader::new(file);
+        if reader.seek(SeekFrom::Start(offset)).is_err() {
+            continue;
+        }
+
+        let mut new_tokens: u64 = 0;
+        let mut buf = String::new();
+        while reader.read_line(&mut buf).unwrap_or(0) > 0 {
+            new_tokens += extractor(buf.trim());
+            buf.clear();
+        }
+        offset = reader.stream_position().unwrap_or(offset);
+
+        if new_tokens == 0 {
+            continue;
+        }
+        let total = TOKEN_TOTAL.fetch_add(new_tokens, Ordering::Relaxed) + new_tokens;
+        if total < budget {
+            continue;
+        }
+        eprintln!("TOKEN BUDGET EXCEEDED: {total}/{budget} output tokens — sending SIGTERM");
+        if let Some(dir) = level_dir {
+            let msg = format!("Budget exceeded: {total}/{budget} output tokens");
+            let _ = fs::write(dir.join("token-exhausted.txt"), msg);
+        }
+        kill_child();
+        break;
+    }
+}
+
+fn kill_child() {
+    let pid = CHILD_PID.load(Ordering::Relaxed);
+    if pid != 0 {
+        let _ = Command::new("kill")
+            .args(["-TERM", &pid.to_string()])
+            .status();
+    }
+}
+
+fn wait_for_session_file(
+    projects_dir: &Path,
+    session_id: &str,
+    timeout_secs: u64,
+) -> Option<PathBuf> {
+    let deadline = Instant::now() + Duration::from_secs(timeout_secs);
+    let target = format!("{session_id}.jsonl");
+    loop {
+        if let Some(found) = find_session_in_projects(projects_dir, &target) {
+            return Some(found);
+        }
+        if Instant::now() >= deadline || INTERRUPTED.load(Ordering::Relaxed) {
+            return None;
+        }
+        std::thread::sleep(Duration::from_secs(2));
+    }
+}
+
+fn find_session_in_projects(projects_dir: &Path, target: &str) -> Option<PathBuf> {
+    let entries = fs::read_dir(projects_dir).ok()?;
+    for entry in entries.flatten() {
+        if !entry.path().is_dir() {
+            continue;
+        }
+        let candidate = entry.path().join(target);
+        if candidate.is_file() {
+            return Some(candidate);
+        }
+    }
+    None
+}
+
+/// Extract output_tokens from a Claude session JSONL line.
+/// Format: `{"message":{"usage":{"output_tokens":N,...},...},...}`
+fn extract_claude_output_tokens(line: &str) -> u64 {
+    let obj: serde_json::Value = match serde_json::from_str(line) {
+        Ok(v) => v,
+        Err(_) => return 0,
+    };
+    obj.pointer("/message/usage/output_tokens")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(0)
+}
+
+/// Extract output_tokens from a Codex JSONL line.
+/// Format: `{"type":"event_msg","payload":{"type":"token_count","output_tokens":N,...}}`
+fn extract_codex_output_tokens(line: &str) -> u64 {
+    let obj: serde_json::Value = match serde_json::from_str(line) {
+        Ok(v) => v,
+        Err(_) => return 0,
+    };
+    if obj.pointer("/payload/type").and_then(|v| v.as_str()) != Some("token_count") {
+        return 0;
+    }
+    obj.pointer("/payload/output_tokens")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(0)
+}
+
+// ---------------------------------------------------------------------------
+// Level helpers
+// ---------------------------------------------------------------------------
 
 fn append_file_listing(summary: &mut String, scheme_dir: &Path) {
     let Ok(entries) = fs::read_dir(scheme_dir) else {

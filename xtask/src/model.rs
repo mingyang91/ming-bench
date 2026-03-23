@@ -429,24 +429,21 @@ pub const LEVELS: [&str; 26] = [
 ];
 
 // ---------------------------------------------------------------------------
-// Turn limits
+// Turn limits (safety net only — primary budget is output tokens)
 // ---------------------------------------------------------------------------
 
-/// Default turn limit for a given level number.
-///
-/// Tiers based on difficulty (v2 reordered):
-///   L01-L03 (foundation)                       → 45 turns
-///   L04-L06 (error quality, strings, mutable)  → 30 turns
-///   L07-L09 (TCO, set!, variadic)              → 60 turns
-///   L10-L12 (call/cc, macros, integration)     → 90 turns
-///   L13     (builtin grab bag)                 → 45 turns
-///   L14     (string immutability req-change)   → 45 turns
-///   L15     (equality, letrec, case, vectors, do) → 60 turns
-///   L16-L18 (dynamic-wind, guard, values)         → 60 turns
-///   L19-L20 (exact arith, records)                → 75 turns
-///   L21-L23 (pair mutation, syntax-case, integration) → 90 turns
-///   L24-L25 (tech-debt: case-lambda, procedure?)  → 60 turns
-///   L26     (real-world integration stress)        → 90 turns
+/// Safety-net turn ceiling. The real budget is output tokens.
+pub const SAFETY_MAX_TURNS: u32 = 200;
+
+/// Token poll interval in seconds for the monitor thread.
+pub const TOKEN_POLL_INTERVAL_SECS: u64 = 5;
+
+/// Quality-gate cleanup pass token budget.
+pub const GATE_CLEANUP_TOKEN_BUDGET: u64 = 5_000;
+
+/// Default turn limit for a given level number (kept as a fallback for
+/// agents without token monitoring, e.g. OpenCode).
+#[allow(dead_code)]
 pub fn turns_for_level(level_num: u32, max_turns: Option<u32>) -> u32 {
     if let Some(t) = max_turns {
         return t;
@@ -464,6 +461,40 @@ pub fn turns_for_level(level_num: u32, max_turns: Option<u32>) -> u32 {
         24..=25 => 60, // tech-debt: case-lambda, procedure?
         26 => 90,      // real-world integration stress
         _ => 75,
+    }
+}
+
+/// Output-token budget for a given level. Primary enforcement mechanism.
+///
+/// Derived from observed successful runs (~2x typical output tokens):
+///   L01-L03 (foundation)                          → 25K
+///   L04-L06 (error quality, strings, mutable)     → 25K
+///   L07-L09 (TCO, set!, variadic)                 → 20K
+///   L10-L12 (call/cc, macros, integration)        → 150K
+///   L13-L14 (builtins, string immutability)       → 30K
+///   L15     (equality, letrec, case, vectors, do) → 40K
+///   L16-L18 (dynamic-wind, guard, values)         → 60K
+///   L19-L20 (exact arith, records)                → 50K
+///   L21-L23 (pair mutation, syntax-case, final)   → 100K
+///   L24-L25 (tech-debt)                           → 15K
+///   L26     (real-world integration stress)        → 60K
+pub fn output_tokens_for_level(level_num: u32, max_tokens: Option<u64>) -> u64 {
+    if let Some(t) = max_tokens {
+        return t;
+    }
+    match level_num {
+        1..=3 => 25_000,
+        4..=6 => 25_000,
+        7..=9 => 20_000,
+        10..=12 => 150_000,
+        13..=14 => 30_000,
+        15 => 40_000,
+        16..=18 => 60_000,
+        19..=20 => 50_000,
+        21..=23 => 100_000,
+        24..=25 => 15_000,
+        26 => 60_000,
+        _ => 50_000,
     }
 }
 
