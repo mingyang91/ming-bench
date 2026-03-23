@@ -125,7 +125,7 @@ Benefits:
 |--------|------|--------------|
 | L01-L03 | Foundation | 45 |
 | L04-L06 | Error/Strings/Mutable | 30 |
-| L07-L09 | TCO/set!/Variadic | 45 |
+| L07-L09 | TCO/set!/Variadic | 60 |
 | L10-L12 | call/cc/Macros/Integration | 90 |
 | L13-L14 | Builtins/String Immutability | 45 |
 | L15 | Equality/Letrec/Case/Vectors/Do | 60 |
@@ -135,7 +135,7 @@ Benefits:
 | L24-L25 | Tech-debt: case-lambda/procedure? | 60 |
 | L26     | Real-world integration stress        | 90 |
 
-Override with `--max-turns N`. Quality-gate cleanup pass: 15 turns. Regression fix-it pass: 15 turns.
+Override with `--max-turns N`. Quality-gate cleanup pass: 15 turns. Regression fix-it pass: same tiered budget as coding pass.
 
 ### Regression Checking
 
