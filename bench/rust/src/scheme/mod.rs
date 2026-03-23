@@ -189,6 +189,18 @@ fn env_set(env: &Env, name: String, val: Value) {
     env.borrow_mut().bindings.insert(name, val);
 }
 
+fn env_update(env: &Env, name: &str, val: Value) -> Result<(), EvalError> {
+    let mut inner = env.borrow_mut();
+    if inner.bindings.contains_key(name) {
+        inner.bindings.insert(name.to_string(), val);
+        Ok(())
+    } else if let Some(ref parent) = inner.parent {
+        env_update(parent, name, val)
+    } else {
+        Err(EvalError::UnboundVariable(name.to_string()))
+    }
+}
+
 fn default_env() -> Env {
     let env = new_env(None);
     let builtins: &[(&str, fn(&[Value]) -> Result<Value, EvalError>)] = &[
@@ -469,6 +481,18 @@ fn eval_tail(expr: &Expr, env: &Env) -> Result<Trampoline, EvalError> {
                     "let" => return eval_let_tail(&elems[1..], env),
                     "begin" => return eval_begin_tail(&elems[1..], env),
                     "cond" => return eval_cond_tail(&elems[1..], env),
+                    "set!" => {
+                        if elems.len() != 3 {
+                            return Err(EvalError::Arity("set! expects 2 arguments".into()));
+                        }
+                        let sym = match &elems[1].kind {
+                            ExprKind::Symbol(s) => s.clone(),
+                            _ => return Err(EvalError::Type("set! requires a symbol".into())),
+                        };
+                        let val = eval(&elems[2], env)?;
+                        env_update(env, &sym, val)?;
+                        return Ok(Trampoline::Done(Value::Void));
+                    }
                     _ => {}
                 }
             }
