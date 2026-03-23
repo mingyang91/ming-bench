@@ -2,7 +2,7 @@ package ming
 
 import SchemeValue.*
 
-/** Builtin procedure implementations for the Scheme interpreter. */
+/** Core builtin procedure implementations for the Scheme interpreter. */
 object Builtins:
 
   def arith(
@@ -86,7 +86,10 @@ object Builtins:
       case ListVal(es, _) :: Nil => IntVal(es.length.toLong)
       case _                     => throw new EvalError("length: expected list")
 
-  def typeCheck(args: List[SchemeValue], pred: SchemeValue => Boolean): SchemeValue =
+  def typeCheck(
+    args: List[SchemeValue],
+    pred: SchemeValue => Boolean
+  ): SchemeValue =
     args match
       case v :: Nil => BoolVal(pred(v))
       case _        => throw new EvalError("type predicate: requires 1 argument")
@@ -121,74 +124,13 @@ object Builtins:
         Void
       case _ => throw new EvalError("write: requires 1 argument")
 
-  def newlineOp(args: List[SchemeValue], output: StringBuilder): SchemeValue =
+  def newlineOp(
+    args: List[SchemeValue],
+    output: StringBuilder
+  ): SchemeValue =
     if args.nonEmpty then throw new EvalError("newline: requires 0 arguments")
     output.append("\n")
     Void
-
-  // --- String operations ---
-
-  def stringAppendOp(args: List[SchemeValue]): SchemeValue =
-    val sb = StringBuilder()
-    args.foreach {
-      case StringVal(s, _) => sb.append(s)
-      case _               => throw new EvalError("string-append: expected string")
-    }
-    StringVal(sb.toString)
-
-  def stringLengthOp(args: List[SchemeValue]): SchemeValue =
-    args match
-      case StringVal(s, _) :: Nil         => IntVal(s.length.toLong)
-      case MutableStringVal(cs, _) :: Nil => IntVal(cs.length.toLong)
-      case _                              => throw new EvalError("string-length: expected string")
-
-  def substringOp(args: List[SchemeValue]): SchemeValue =
-    args match
-      case StringVal(s, _) :: IntVal(start, _) :: IntVal(end, _) :: Nil =>
-        StringVal(s.substring(start.toInt, end.toInt))
-      case _ => throw new EvalError("substring: expected (string start end)")
-
-  def stringToNumberOp(args: List[SchemeValue]): SchemeValue =
-    args match
-      case StringVal(s, _) :: Nil =>
-        try IntVal(s.toLong)
-        catch case _: NumberFormatException => BoolVal(false)
-      case _ => throw new EvalError("string->number: expected string")
-
-  def numberToStringOp(args: List[SchemeValue]): SchemeValue =
-    args match
-      case IntVal(n, _) :: Nil => StringVal(n.toString)
-      case _                   => throw new EvalError("number->string: expected number")
-
-  def symbolToStringOp(args: List[SchemeValue]): SchemeValue =
-    args match
-      case SymbolVal(name, _) :: Nil => StringVal(name)
-      case _                         => throw new EvalError("symbol->string: expected symbol")
-
-  def stringToSymbolOp(args: List[SchemeValue]): SchemeValue =
-    args match
-      case StringVal(s, _) :: Nil => SymbolVal(s)
-      case _                      => throw new EvalError("string->symbol: expected string")
-
-  def stringRefOp(args: List[SchemeValue]): SchemeValue =
-    args match
-      case StringVal(s, _) :: IntVal(idx, _) :: Nil =>
-        if idx < 0 || idx >= s.length then throw new EvalError("string-ref: index out of bounds")
-        CharVal(s.charAt(idx.toInt))
-      case MutableStringVal(cs, _) :: IntVal(idx, _) :: Nil =>
-        if idx < 0 || idx >= cs.length then throw new EvalError("string-ref: index out of bounds")
-        CharVal(cs(idx.toInt))
-      case _ => throw new EvalError("string-ref: expected (string index)")
-
-  def stringSetOp(args: List[SchemeValue]): SchemeValue =
-    args match
-      case MutableStringVal(cs, _) :: IntVal(idx, _) :: CharVal(c, _) :: Nil =>
-        if idx < 0 || idx >= cs.length then throw new EvalError("string-set!: index out of bounds")
-        cs(idx.toInt) = c
-        Void
-      case StringVal(_, _) :: _ :: _ :: Nil =>
-        throw new EvalError("string-set!: string is immutable")
-      case _ => throw new EvalError("string-set!: expected (mutable-string index char)")
 
   def applyOp(args: List[SchemeValue]): SchemeValue =
     if args.length < 2 then throw new EvalError("apply: requires at least 2 arguments")
@@ -200,8 +142,40 @@ object Builtins:
     val prefixArgs = args.slice(1, args.length - 1)
     Interpreter.applyProc(proc, prefixArgs ++ tailList)
 
-  def stringCopyOp(args: List[SchemeValue]): SchemeValue =
+  // --- eq? and equal? ---
+
+  def eqCheck(args: List[SchemeValue]): SchemeValue =
     args match
-      case StringVal(s, _) :: Nil         => MutableStringVal(s.toCharArray)
-      case MutableStringVal(cs, _) :: Nil => MutableStringVal(cs.clone())
-      case _                              => throw new EvalError("string-copy: expected string")
+      case a :: b :: Nil => BoolVal(schemeEq(a, b))
+      case _             => throw new EvalError("eq?: requires 2 arguments")
+
+  private def schemeEq(a: SchemeValue, b: SchemeValue): Boolean = (a, b) match
+    case (IntVal(x, _), IntVal(y, _))       => x == y
+    case (BoolVal(x, _), BoolVal(y, _))     => x == y
+    case (SymbolVal(x, _), SymbolVal(y, _)) => x == y
+    case (CharVal(x, _), CharVal(y, _))     => x == y
+    case (ListVal(Nil, _), ListVal(Nil, _)) => true
+    case (Void, Void)                       => true
+    case _                                  => a eq b // reference equality
+
+  def equalCheck(args: List[SchemeValue]): SchemeValue =
+    args match
+      case a :: b :: Nil => BoolVal(schemeEqual(a, b))
+      case _             => throw new EvalError("equal?: requires 2 arguments")
+
+  private[ming] def schemeEqual(
+    a: SchemeValue,
+    b: SchemeValue
+  ): Boolean = (a, b) match
+    case (IntVal(x, _), IntVal(y, _))       => x == y
+    case (BoolVal(x, _), BoolVal(y, _))     => x == y
+    case (SymbolVal(x, _), SymbolVal(y, _)) => x == y
+    case (StringVal(x, _), StringVal(y, _)) => x == y
+    case (CharVal(x, _), CharVal(y, _))     => x == y
+    case (ListVal(Nil, _), ListVal(Nil, _)) => true
+    case (ListVal(xs, _), ListVal(ys, _)) =>
+      xs.length == ys.length && xs.zip(ys).forall((a, b) => schemeEqual(a, b))
+    case (PairVal(a1, d1), PairVal(a2, d2)) =>
+      schemeEqual(a1, a2) && schemeEqual(d1, d2)
+    case (Void, Void) => true
+    case _            => false
