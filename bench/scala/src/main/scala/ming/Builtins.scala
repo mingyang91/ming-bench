@@ -11,6 +11,7 @@ object Builtins:
     registerListUtils(env)
     registerTypePredicates(env)
     registerIOOps(env, output)
+    registerValues(env)
     BuiltinsExt.register(env)
 
   private[ming] def define(env: Env, entries: List[(String, List[Value] => Value)]): Unit =
@@ -111,19 +112,19 @@ object Builtins:
           "eq?",
           args =>
             if args.length != 2 then throw new EvalError("eq?: expected 2 arguments")
-            BoolVal(eqCheck(args(0), args(1)))
+            BoolVal(Equality.eqCheck(args(0), args(1)))
         ),
         (
           "eqv?",
           args =>
             if args.length != 2 then throw new EvalError("eqv?: expected 2 arguments")
-            BoolVal(eqvCheck(args(0), args(1)))
+            BoolVal(Equality.eqvCheck(args(0), args(1)))
         ),
         (
           "equal?",
           args =>
             if args.length != 2 then throw new EvalError("equal?: expected 2 arguments")
-            BoolVal(equalCheck(args(0), args(1)))
+            BoolVal(Equality.equalCheck(args(0), args(1)))
         )
       )
     )
@@ -204,6 +205,20 @@ object Builtins:
       )
     )
 
+  private def registerValues(env: Env): Unit =
+    define(
+      env,
+      List(
+        (
+          "values",
+          args =>
+            args match
+              case single :: Nil => single
+              case _             => ValuesVal(args)
+        )
+      )
+    )
+
   private def appendList(lst: Value, tail: Value): Value =
     lst match
       case NilVal        => tail
@@ -243,10 +258,6 @@ object Builtins:
     val result = nums.zip(nums.tail).forall((a, b) => op(a, b))
     BoolVal(result)
 
-  private[ming] def eqCheck(a: Value, b: Value): Boolean    = Equality.eqCheck(a, b)
-  private[ming] def eqvCheck(a: Value, b: Value): Boolean   = Equality.eqvCheck(a, b)
-  private[ming] def equalCheck(a: Value, b: Value): Boolean = Equality.equalCheck(a, b)
-
   private def isProperList(v: Value): Boolean =
     v match
       case NilVal          => true
@@ -280,7 +291,7 @@ object Builtins:
     while true do
       cur match
         case PairVal(pair @ PairVal(k, _), rest) =>
-          if equalCheck(key, k) then return pair
+          if Equality.equalCheck(key, k) then return pair
           cur = rest
         case NilVal => return BoolVal(false)
         case _      => throw new EvalError("assoc: not a proper alist")

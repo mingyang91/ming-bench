@@ -30,7 +30,7 @@ private[ming] trait EvalDo:
         evalBody(body, env, k)
       case SList(SList(datums, _) :: body, _) :: rest =>
         val matched = datums.exists { d =>
-          Builtins.eqvCheck(keyVal, EvalHelpers.exprToValue(d))
+          Equality.eqvCheck(keyVal, EvalHelpers.exprToValue(d))
         }
         if matched then
           if body.isEmpty then k(VoidVal)

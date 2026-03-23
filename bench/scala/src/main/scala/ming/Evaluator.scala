@@ -90,6 +90,7 @@ object Evaluator extends EvalForms with EvalWind with EvalExceptions:
     env.define("dynamic-wind", BuiltinVal("dynamic-wind", dummy))
     env.define("raise", BuiltinVal("raise", dummy))
     env.define("with-exception-handler", BuiltinVal("with-exception-handler", dummy))
+    env.define("call-with-values", BuiltinVal("call-with-values", dummy))
     env
 
   protected def evalBody(exprs: List[Expr], env: Env, k: K): Bounce =
@@ -218,6 +219,21 @@ object Evaluator extends EvalForms with EvalWind with EvalExceptions:
 
       case BuiltinVal("apply", _) => applyBuiltinApply(values, pos, k)
       case BuiltinVal("map", _)   => applyBuiltinMap(values, pos, k)
+
+      case BuiltinVal("call-with-values", _) =>
+        if values.length != 2 then evalError("call-with-values: expected 2 arguments", pos)
+        val producer = values(0)
+        val consumer = values(1)
+        applyProc(
+          producer,
+          Nil,
+          pos,
+          result =>
+            val args = result match
+              case ValuesVal(vs) => vs
+              case single        => List(single)
+            applyProc(consumer, args, pos, k)
+        )
 
       case BuiltinVal("raise", _) =>
         if values.length != 1 then evalError("raise: expected 1 argument", pos)

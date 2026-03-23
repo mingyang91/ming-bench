@@ -24,6 +24,7 @@ enum Value:
   case MacroVal(literals: List[String], rules: List[(List[Expr], Expr)], defEnv: Env)
   case VectorVal(elems: Array[Value])
   case VoidVal
+  case ValuesVal(values: List[Value])
 
   def display: String = this match
     case IntVal(n)             => n.toString
@@ -39,6 +40,7 @@ enum Value:
     case MacroVal(_, _, _)     => "#<macro>"
     case VectorVal(elems)      => elems.map(_.display).mkString("#(", " ", ")")
     case VoidVal               => "#<void>"
+    case ValuesVal(_)          => "#<values>"
 
   /** Display without quotes (for `display` builtin). */
   def displayNoQuotes: String = this match
