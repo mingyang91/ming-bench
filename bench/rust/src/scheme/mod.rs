@@ -38,6 +38,7 @@ thread_local! {
     /// Set of cont_ids whose call/cc is still on the call stack.
     static ACTIVE_CALLCC: RefCell<Vec<usize>> = RefCell::new(Vec::new());
     static WINDERS: RefCell<Vec<Winder>> = RefCell::new(Vec::new());
+    static EXCEPTION_HANDLERS: RefCell<Vec<Value>> = RefCell::new(Vec::new());
 }
 
 /// Handle result from a non-tail body expression.
@@ -85,6 +86,7 @@ fn init_cont_state() {
     CONT_RESULT_VALUE.with(|v| *v.borrow_mut() = None);
     ACTIVE_CALLCC.with(|ac| ac.borrow_mut().clear());
     WINDERS.with(|w| w.borrow_mut().clear());
+    EXCEPTION_HANDLERS.with(|h| h.borrow_mut().clear());
 }
 
 /// Evaluate a body (sequence of expressions) for continuation replay.
@@ -553,6 +555,36 @@ fn eval_inner(expr: &Expr, env: &Env) -> Result<Trampoline, EvalError> {
                     "do" => return eval_do(expr, &elems[1..], env, span),
                     "vector-set!" => return eval_vector_set(&elems[1..], env, span).map(Trampoline::Done),
                     "define-syntax" => return eval_define_syntax(&elems[1..], env, span).map(Trampoline::Done),
+                    "raise" if env_get(env, "raise").is_none() => {
+                        if elems.len() != 2 {
+                            return Err(EvalError::Arity("raise requires 1 argument".into()).with_position(span.line, span.col));
+                        }
+                        let val = eval(&elems[1], env)?;
+                        // Check if there's a with-exception-handler installed
+                        let handler = EXCEPTION_HANDLERS.with(|h| h.borrow().last().cloned());
+                        if let Some(handler) = handler {
+                            EXCEPTION_HANDLERS.with(|h| h.borrow_mut().pop());
+                            let result = apply_value(&handler, &[val.clone()]);
+                            EXCEPTION_HANDLERS.with(|h| h.borrow_mut().push(handler));
+                            match result {
+                                Ok(v) => return Ok(Trampoline::Done(v)),
+                                Err(e) => return Err(e),
+                            }
+                        }
+                        return Err(EvalError::SchemeException(val));
+                    }
+                    "with-exception-handler" => {
+                        if elems.len() != 3 {
+                            return Err(EvalError::Arity("with-exception-handler requires 2 arguments".into()).with_position(span.line, span.col));
+                        }
+                        let handler = eval(&elems[1], env)?;
+                        let thunk = eval(&elems[2], env)?;
+                        EXCEPTION_HANDLERS.with(|h| h.borrow_mut().push(handler));
+                        let result = apply_value(&thunk, &[]);
+                        EXCEPTION_HANDLERS.with(|h| h.borrow_mut().pop());
+                        return result.map(Trampoline::Done);
+                    }
+                    "guard" => return eval_guard(&elems[1..], env, span),
                     "dynamic-wind" => {
                         if elems.len() != 4 {
                             return Err(EvalError::Arity("dynamic-wind requires 3 arguments".into()).with_position(span.line, span.col));
@@ -1131,6 +1163,66 @@ fn eval_case_tc(args: &[Expr], env: &Env, span: Span) -> Result<Trampoline, Eval
     Ok(Trampoline::Done(Value::Void))
 }
 
+fn eval_guard(args: &[Expr], env: &Env, span: Span) -> Result<Trampoline, EvalError> {
+    // (guard (var clause ...) body ...)
+    if args.is_empty() {
+        return Err(EvalError::Arity("guard requires at least 2 arguments".into()).with_position(span.line, span.col));
+    }
+    let clauses_expr = match &args[0].kind {
+        ExprKind::List(elems) if !elems.is_empty() => elems,
+        _ => return Err(EvalError::Parse("guard: expected (var clause ...)".into()).with_position(span.line, span.col)),
+    };
+    let var_name = match &clauses_expr[0].kind {
+        ExprKind::Symbol(s) => s.clone(),
+        _ => return Err(EvalError::Parse("guard: expected variable name".into()).with_position(span.line, span.col)),
+    };
+    let clauses = &clauses_expr[1..];
+    let body = &args[1..];
+
+    // Evaluate body, catching SchemeException
+    let body_env = new_env(Some(env.clone()));
+    let mut body_result = Ok(Value::Void);
+    for expr in body {
+        match eval(expr, &body_env) {
+            Ok(v) => body_result = Ok(v),
+            Err(EvalError::SchemeException(exn)) => {
+                // Exception raised — try clauses
+                let clause_env = new_env(Some(env.clone()));
+                env_set(&clause_env, var_name.clone(), exn.clone());
+                for clause in clauses {
+                    match &clause.kind {
+                        ExprKind::List(celems) if celems.len() >= 2 => {
+                            if let ExprKind::Symbol(s) = &celems[0].kind {
+                                if s == "else" {
+                                    // else clause — evaluate handler expressions
+                                    let mut result = Value::Void;
+                                    for handler_expr in &celems[1..] {
+                                        result = eval(handler_expr, &clause_env)?;
+                                    }
+                                    return Ok(Trampoline::Done(result));
+                                }
+                            }
+                            let test = eval(&celems[0], &clause_env)?;
+                            if test.is_truthy() {
+                                let mut result = Value::Void;
+                                for handler_expr in &celems[1..] {
+                                    result = eval(handler_expr, &clause_env)?;
+                                }
+                                return Ok(Trampoline::Done(result));
+                            }
+                        }
+                        _ => return Err(EvalError::Parse("guard: invalid clause".into()).with_position(span.line, span.col)),
+                    }
+                }
+                // No clause matched — re-raise
+                return Err(EvalError::SchemeException(exn));
+            }
+            Err(e) => return Err(e),
+        }
+    }
+    Ok(Trampoline::Done(body_result?))
+}
+
 fn eval_do(_full_expr: &Expr, args: &[Expr], env: &Env, span: Span) -> Result<Trampoline, EvalError> {
     // (do ((var init step) ...) (test expr ...) body ...)
     if args.len() < 2 {
@@ -1417,7 +1509,7 @@ fn is_special_form(name: &str) -> bool {
         "define" | "if" | "quote" | "lambda" | "and" | "or" | "let" | "begin"
         | "cond" | "set!" | "display" | "write" | "newline" | "string-set!"
         | "define-syntax" | "syntax-rules" | "letrec" | "letrec*" | "case" | "do"
-        | "vector-set!"
+        | "vector-set!" | "raise" | "guard" | "with-exception-handler"
     )
 }
 

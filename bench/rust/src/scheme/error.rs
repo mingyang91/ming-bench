@@ -17,6 +17,8 @@ pub enum EvalError {
     ContinuationReturn { cont_id: usize },
     #[error("continuation result")]
     ContinuationResult,
+    #[error("scheme exception")]
+    SchemeException(super::Value),
 }
 
 impl PartialEq for EvalError {
@@ -42,6 +44,7 @@ impl EvalError {
             EvalError::Positioned { .. } => self,
             EvalError::ContinuationReturn { .. } => self,
             EvalError::ContinuationResult => self,
+            EvalError::SchemeException(_) => self,
             other => EvalError::Positioned {
                 msg: other.to_string(),
                 line,
