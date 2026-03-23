@@ -1442,10 +1442,11 @@ fn apply_func(func: Value, args: Vec<Value>, kont: &mut Vec<KontFrame>, wind: &m
             Ok(Ctrl::Val(result))
         }
         Value::Continuation(saved_kont, saved_wind) => {
-            if args.len() != 1 {
-                return Err(EvalError::Arity("continuation requires 1 argument".into()).at(el, ec));
-            }
-            let value = args.into_iter().next().unwrap();
+            let value = if args.len() == 1 {
+                args.into_iter().next().unwrap()
+            } else {
+                Value::Values(args)
+            };
             // Compute common prefix length between current and saved wind stacks
             let common_len = wind.iter().zip(saved_wind.iter())
                 .take_while(|(a, b)| a.id == b.id)
