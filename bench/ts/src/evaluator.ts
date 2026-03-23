@@ -7,6 +7,9 @@ interface Pos { line: number; col: number }
 type Cont = (val: SchemeVal) => Bounce;
 type Bounce = SchemeVal | (() => Bounce);
 
+interface WindEntry { inThunk: SchemeVal; outThunk: SchemeVal; }
+let currentWinds: WindEntry[] = [];
+
 type SchemeVal =
   | { tag: 'number'; val: number; pos?: Pos }
   | { tag: 'boolean'; val: boolean; pos?: Pos }
@@ -16,7 +19,7 @@ type SchemeVal =
   | { tag: 'list'; val: SchemeVal[]; pos?: Pos }
   | { tag: 'lambda'; params: string[]; rest?: string; body: SchemeVal[]; env: Env; pos?: Pos }
   | { tag: 'builtin'; name: string; pos?: Pos }
-  | { tag: 'continuation'; cont: Cont; pos?: Pos }
+  | { tag: 'continuation'; cont: Cont; winds: WindEntry[]; pos?: Pos }
   | { tag: 'macro'; rules: MacroRule[]; literals: Set<string>; defEnv: Env; pos?: Pos }
   | { tag: 'vector'; val: SchemeVal[]; pos?: Pos };
 
@@ -520,6 +523,11 @@ function applyBuiltin(op: string, evalArgs: SchemeVal[], p?: Pos, out?: string[]
       }
       return { tag: 'list', val: result };
     }
+    case 'reverse': {
+      if (evalArgs.length !== 1) throw posError('reverse: need exactly one arg', p);
+      if (evalArgs[0].tag !== 'list') throw posError('reverse: not a list', p);
+      return { tag: 'list', val: [...evalArgs[0].val].reverse() };
+    }
     case 'pair?': {
       if (evalArgs.length !== 1) throw posError('pair?: need exactly one arg', p);
       return { tag: 'boolean', val: evalArgs[0].tag === 'list' && evalArgs[0].val.length > 0 };
@@ -950,7 +958,7 @@ const BUILTINS = new Set(['+', '-', '*', '/', '<', '>', '=', '<=', '>=', 'not',
   'string=?', 'string<?', 'string-ci=?', 'string-upcase', 'string-downcase',
   'string->list', 'list->string', 'char->integer', 'integer->char',
   'vector', 'make-vector', 'vector-ref', 'vector-set!', 'vector-length', 'vector?',
-  'vector->list', 'list->vector']);
+  'vector->list', 'list->vector', 'reverse']);
 
 function parseParams(paramList: SchemeVal, p?: Pos): { params: string[]; rest?: string } {
   if (paramList.tag !== 'list') throw posError('params must be a list', p);
@@ -1005,7 +1013,33 @@ function evalBodyCPS(exprs: SchemeVal[], idx: number, env: Env, k: Cont, out?: s
 function applyCPS(proc: SchemeVal, args: SchemeVal[], k: Cont, p?: Pos, out?: string[]): Bounce {
   if (proc.tag === 'continuation') {
     if (args.length !== 1) throw posError('continuation: need exactly one arg', p);
-    return () => proc.cont(args[0]);
+    const val = args[0];
+    const targetWinds = proc.winds;
+    // Find common prefix
+    let common = 0;
+    while (common < currentWinds.length && common < targetWinds.length
+           && currentWinds[common] === targetWinds[common]) {
+      common++;
+    }
+    // Unwind current (innermost first), then rewind to target (outermost first)
+    const toUnwind = currentWinds.slice(common).reverse();
+    const toRewind = targetWinds.slice(common);
+    const doUnwind = (i: number): Bounce => {
+      if (i >= toUnwind.length) return () => doRewind(0);
+      currentWinds = currentWinds.slice(0, currentWinds.length - 1);
+      return () => applyCPS(toUnwind[i].outThunk, [], _ => () => doUnwind(i + 1), p, out);
+    };
+    const doRewind = (i: number): Bounce => {
+      if (i >= toRewind.length) {
+        currentWinds = [...targetWinds];
+        return () => proc.cont(val);
+      }
+      return () => applyCPS(toRewind[i].inThunk, [], _ => {
+        currentWinds = [...targetWinds.slice(0, common + i + 1)];
+        return () => doRewind(i + 1);
+      }, p, out);
+    };
+    return doUnwind(0);
   }
   if (proc.tag === 'lambda') {
     if (proc.rest) {
@@ -1023,8 +1057,21 @@ function applyCPS(proc: SchemeVal, args: SchemeVal[], k: Cont, p?: Pos, out?: st
   if (proc.tag === 'builtin') {
     if (proc.name === 'call/cc' || proc.name === 'call-with-current-continuation') {
       if (args.length !== 1) throw posError(`${proc.name}: need exactly one arg`, p);
-      const contVal: SchemeVal = { tag: 'continuation', cont: k };
+      const capturedWinds = [...currentWinds];
+      const contVal: SchemeVal = { tag: 'continuation', cont: k, winds: capturedWinds };
       return () => applyCPS(args[0], [contVal], k, p, out);
+    }
+    if (proc.name === 'dynamic-wind') {
+      if (args.length !== 3) throw posError('dynamic-wind: need exactly three args', p);
+      const [inThunk, bodyThunk, outThunk] = args;
+      const entry: WindEntry = { inThunk, outThunk };
+      return () => applyCPS(inThunk, [], _ => {
+        currentWinds = [...currentWinds, entry];
+        return () => applyCPS(bodyThunk, [], bodyResult => {
+          currentWinds = currentWinds.slice(0, -1);
+          return () => applyCPS(outThunk, [], _ => k(bodyResult), p, out);
+        }, p, out);
+      }, p, out);
     }
     if (proc.name === 'map') {
       if (args.length < 2) throw posError('map: need at least two args', p);
@@ -1415,6 +1462,7 @@ function makeGlobalEnv(): Env {
   env.define('map', { tag: 'builtin', name: 'map' });
   env.define('call/cc', { tag: 'builtin', name: 'call/cc' });
   env.define('call-with-current-continuation', { tag: 'builtin', name: 'call-with-current-continuation' });
+  env.define('dynamic-wind', { tag: 'builtin', name: 'dynamic-wind' });
   for (const name of BUILTINS) {
     env.define(name, { tag: 'builtin', name });
   }
@@ -1426,6 +1474,7 @@ function makeGlobalEnv(): Env {
 export function evalStr(input: string): string {
   const exprs = parse(input);
   if (exprs.length === 0) throw new EvalError('no expressions');
+  currentWinds = [];
   const env = makeGlobalEnv();
   const result = trampoline(evalBodyCPS(exprs, 0, env, v => v));
   return displayVal(result);
@@ -1434,6 +1483,7 @@ export function evalStr(input: string): string {
 export function evalStrWithOutput(input: string): { result: string; output: string } {
   const exprs = parse(input);
   if (exprs.length === 0) throw new EvalError('no expressions');
+  currentWinds = [];
   const env = makeGlobalEnv();
   const out: string[] = [];
   const result = trampoline(evalBodyCPS(exprs, 0, env, v => v, out));
