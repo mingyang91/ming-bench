@@ -405,6 +405,28 @@ func tokenize(input string) []token {
 			continue
 		}
 
+		// Quasiquote
+		if ch == '`' {
+			tokens = append(tokens, token{"`", line, col})
+			i++
+			col++
+			continue
+		}
+
+		// Unquote / unquote-splicing
+		if ch == ',' {
+			if i+1 < n && runes[i+1] == '@' {
+				tokens = append(tokens, token{",@", line, col})
+				i += 2
+				col += 2
+			} else {
+				tokens = append(tokens, token{",", line, col})
+				i++
+				col++
+			}
+			continue
+		}
+
 		// Atom (symbol, number, boolean)
 		startCol := col
 		start := i
@@ -428,6 +450,7 @@ type expr struct {
 	fval   float64
 	ival2  int64 // denominator for rational
 	items  []*expr
+	dotted bool // true if improper list: last item is cdr
 	line   int
 	col    int
 	envRef *env // hygienic macro: resolve symbol in this env instead of current
@@ -455,8 +478,24 @@ func parseExpr(tokens []token, pos int) (*expr, int, error) {
 
 	if tok.text == "(" {
 		var items []*expr
+		dotted := false
 		pos++
 		for pos < len(tokens) && tokens[pos].text != ")" {
+			if tokens[pos].text == "." {
+				// Dotted pair notation: (a b . c)
+				pos++ // skip "."
+				if pos >= len(tokens) || tokens[pos].text == ")" {
+					return nil, 0, &EvalError{Message: fmt.Sprintf("%d:%d: bad dotted pair", tok.line, tok.col)}
+				}
+				last, newpos, err := parseExpr(tokens, pos)
+				if err != nil {
+					return nil, 0, err
+				}
+				items = append(items, last)
+				dotted = true
+				pos = newpos
+				break
+			}
 			e, newpos, err := parseExpr(tokens, pos)
 			if err != nil {
 				return nil, 0, err
@@ -464,11 +503,11 @@ func parseExpr(tokens []token, pos int) (*expr, int, error) {
 			items = append(items, e)
 			pos = newpos
 		}
-		if pos >= len(tokens) {
+		if pos >= len(tokens) || tokens[pos].text != ")" {
 			return nil, 0, &EvalError{Message: fmt.Sprintf("%d:%d: unterminated list", tok.line, tok.col)}
 		}
 		pos++ // skip ")"
-		return &expr{kind: "list", items: items, line: tok.line, col: tok.col}, pos, nil
+		return &expr{kind: "list", items: items, dotted: dotted, line: tok.line, col: tok.col}, pos, nil
 	}
 
 	if tok.text == ")" {
@@ -481,6 +520,33 @@ func parseExpr(tokens []token, pos int) (*expr, int, error) {
 			return nil, 0, err
 		}
 		return &expr{kind: "list", items: []*expr{{kind: "symbol", sval: "quote", line: tok.line, col: tok.col}, e}, line: tok.line, col: tok.col}, newpos, nil
+	}
+
+	// Quasiquote: `expr → (quasiquote expr)
+	if tok.text == "`" {
+		e, newpos, err := parseExpr(tokens, pos+1)
+		if err != nil {
+			return nil, 0, err
+		}
+		return &expr{kind: "list", items: []*expr{{kind: "symbol", sval: "quasiquote", line: tok.line, col: tok.col}, e}, line: tok.line, col: tok.col}, newpos, nil
+	}
+
+	// Unquote: ,expr → (unquote expr)
+	if tok.text == "," {
+		e, newpos, err := parseExpr(tokens, pos+1)
+		if err != nil {
+			return nil, 0, err
+		}
+		return &expr{kind: "list", items: []*expr{{kind: "symbol", sval: "unquote", line: tok.line, col: tok.col}, e}, line: tok.line, col: tok.col}, newpos, nil
+	}
+
+	// Unquote-splicing: ,@expr → (unquote-splicing expr)
+	if tok.text == ",@" {
+		e, newpos, err := parseExpr(tokens, pos+1)
+		if err != nil {
+			return nil, 0, err
+		}
+		return &expr{kind: "list", items: []*expr{{kind: "symbol", sval: "unquote-splicing", line: tok.line, col: tok.col}, e}, line: tok.line, col: tok.col}, newpos, nil
 	}
 
 	// Syntax template shorthand: #'expr → (syntax expr)
@@ -749,6 +815,12 @@ func (ip *interp) eval(e *expr, envir *env) (*value, error) {
 					}
 					return quoteExpr(e.items[1]), nil
 
+				case "quasiquote":
+					if len(e.items) != 2 {
+						return nil, &EvalError{Message: fmt.Sprintf("%d:%d: quasiquote: expected 1 argument", e.line, e.col)}
+					}
+					return ip.evalQuasiquote(e.items[1], envir)
+
 				case "lambda":
 					return evalLambda(e, envir)
 
@@ -804,6 +876,14 @@ func (ip *interp) eval(e *expr, envir *env) (*value, error) {
 							if len(clause.items) == 1 {
 								// (cond (test)) — return test value
 								return test, nil
+							}
+							// (cond (test => proc)) — apply proc to test value
+							if len(clause.items) == 3 && clause.items[1].kind == "symbol" && clause.items[1].sval == "=>" {
+								proc, err := ip.eval(clause.items[2], envir)
+								if err != nil {
+									return nil, err
+								}
+								return ip.applyProc(proc, []*value{test}, clause.line, clause.col)
 							}
 							body := clause.items[1:]
 							for _, be := range body[:len(body)-1] {
@@ -1416,7 +1496,7 @@ func (ip *interp) evalDefine(e *expr, envir *env) (*value, error) {
 		}
 		name := target.items[0].sval
 		// Build a fake param list expr from target.items[1:]
-		paramListExpr := &expr{kind: "list", items: target.items[1:], line: target.line, col: target.col}
+		paramListExpr := &expr{kind: "list", items: target.items[1:], dotted: target.dotted, line: target.line, col: target.col}
 		params, restParam, perr := parseLambdaParams(paramListExpr)
 		if perr != nil {
 			return nil, &EvalError{Message: fmt.Sprintf("%d:%d: define: %s", e.line, e.col, perr)}
@@ -1556,12 +1636,19 @@ func parseLambdaParams(paramExpr *expr) (params []string, restParam string, err 
 		return nil, "", fmt.Errorf("bad parameter list")
 	}
 	// Check for dot notation: (a b . rest)
+	if paramExpr.dotted && len(paramExpr.items) >= 1 {
+		last := paramExpr.items[len(paramExpr.items)-1]
+		for _, pp := range paramExpr.items[:len(paramExpr.items)-1] {
+			params = append(params, pp.sval)
+		}
+		restParam = last.sval
+		return params, restParam, nil
+	}
 	for i, p := range paramExpr.items {
 		if p.kind == "symbol" && p.sval == "." {
 			if i+1 != len(paramExpr.items)-1 {
 				return nil, "", fmt.Errorf("bad dotted parameter list")
 			}
-			// params before dot, rest after
 			for _, pp := range paramExpr.items[:i] {
 				params = append(params, pp.sval)
 			}
@@ -1945,6 +2032,14 @@ func quoteExpr(e *expr) *value {
 		if len(e.items) == 0 {
 			return nilVal
 		}
+		if e.dotted {
+			// Improper list: last item is the cdr
+			result := quoteExpr(e.items[len(e.items)-1])
+			for i := len(e.items) - 2; i >= 0; i-- {
+				result = &value{typ: valPair, car: quoteExpr(e.items[i]), cdr: result}
+			}
+			return result
+		}
 		// Build proper list from items
 		result := nilVal
 		for i := len(e.items) - 1; i >= 0; i-- {
@@ -1953,6 +2048,95 @@ func quoteExpr(e *expr) *value {
 		return result
 	}
 	return nilVal
+}
+
+func (ip *interp) evalQuasiquote(e *expr, envir *env) (*value, error) {
+	return ip.qqExpand(e, envir, 0)
+}
+
+func (ip *interp) qqExpand(e *expr, envir *env, depth int) (*value, error) {
+	// Check for (unquote x)
+	if e.kind == "list" && len(e.items) == 2 && e.items[0].kind == "symbol" && e.items[0].sval == "unquote" {
+		if depth == 0 {
+			return ip.eval(e.items[1], envir)
+		}
+		// Nested quasiquote: decrement depth
+		inner, err := ip.qqExpand(e.items[1], envir, depth-1)
+		if err != nil {
+			return nil, err
+		}
+		return &value{typ: valPair, car: symVal("unquote"), cdr: &value{typ: valPair, car: inner, cdr: nilVal}}, nil
+	}
+
+	// Check for (quasiquote x) - nested
+	if e.kind == "list" && len(e.items) == 2 && e.items[0].kind == "symbol" && e.items[0].sval == "quasiquote" {
+		inner, err := ip.qqExpand(e.items[1], envir, depth+1)
+		if err != nil {
+			return nil, err
+		}
+		return &value{typ: valPair, car: symVal("quasiquote"), cdr: &value{typ: valPair, car: inner, cdr: nilVal}}, nil
+	}
+
+	if e.kind == "list" {
+		return ip.qqExpandList(e, envir, depth)
+	}
+
+	// Atoms: just quote them
+	return quoteExpr(e), nil
+}
+
+func (ip *interp) qqExpandList(e *expr, envir *env, depth int) (*value, error) {
+	if len(e.items) == 0 {
+		return nilVal, nil
+	}
+
+	// Collect expanded items, handling splicing
+	var parts []*value
+	for i, item := range e.items {
+		// Check for unquote-splicing
+		if item.kind == "list" && len(item.items) == 2 && item.items[0].kind == "symbol" && item.items[0].sval == "unquote-splicing" {
+			if depth == 0 {
+				val, err := ip.eval(item.items[1], envir)
+				if err != nil {
+					return nil, err
+				}
+				// Splice in the list
+				cur := val
+				for cur.typ == valPair {
+					parts = append(parts, cur.car)
+					cur = cur.cdr
+				}
+				continue
+			}
+		}
+
+		// For dotted lists, the last item is the cdr
+		if e.dotted && i == len(e.items)-1 {
+			tail, err := ip.qqExpand(item, envir, depth)
+			if err != nil {
+				return nil, err
+			}
+			// Build result with this tail
+			result := tail
+			for j := len(parts) - 1; j >= 0; j-- {
+				result = &value{typ: valPair, car: parts[j], cdr: result}
+			}
+			return result, nil
+		}
+
+		expanded, err := ip.qqExpand(item, envir, depth)
+		if err != nil {
+			return nil, err
+		}
+		parts = append(parts, expanded)
+	}
+
+	// Build proper list from parts
+	result := nilVal
+	for i := len(parts) - 1; i >= 0; i-- {
+		result = &value{typ: valPair, car: parts[i], cdr: result}
+	}
+	return result, nil
 }
 
 func compareInts(args []*value, op func(int64, int64) bool, name string, line, col int) (*value, error) {
@@ -3111,6 +3295,21 @@ func makeGlobalEnv(ip *interp) *env {
 		return boolVal(false), nil
 	}))
 
+	e.set("memv", makeBuiltin("memv", func(args []*value, line, col int) (*value, error) {
+		if len(args) != 2 {
+			return nil, &EvalError{Message: fmt.Sprintf("%d:%d: memv: expected 2 arguments", line, col)}
+		}
+		key := args[0]
+		cur := args[1]
+		for cur.typ == valPair {
+			if schemeEqv(cur.car, key) {
+				return cur, nil
+			}
+			cur = cur.cdr
+		}
+		return boolVal(false), nil
+	}))
+
 	// Vector operations
 	e.set("vector", makeBuiltin("vector", func(args []*value, line, col int) (*value, error) {
 		elems := make([]*value, len(args))
@@ -3196,6 +3395,17 @@ func makeGlobalEnv(ip *interp) *env {
 	}))
 
 	// raise
+	e.set("error", makeBuiltin("error", func(args []*value, line, col int) (*value, error) {
+		if len(args) < 1 {
+			return nil, &EvalError{Message: fmt.Sprintf("%d:%d: error: expected at least 1 argument", line, col)}
+		}
+		msg := args[0].displayString()
+		for _, a := range args[1:] {
+			msg += " " + a.String()
+		}
+		return nil, &EvalError{Message: msg}
+	}))
+
 	e.set("raise", makeBuiltin("raise", func(args []*value, line, col int) (*value, error) {
 		if len(args) != 1 {
 			return nil, &EvalError{Message: fmt.Sprintf("%d:%d: raise: expected 1 argument", line, col)}

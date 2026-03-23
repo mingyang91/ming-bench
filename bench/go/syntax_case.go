@@ -286,8 +286,9 @@ func pairToExpr(v *value) *expr {
 		cur = cur.cdr
 	}
 	if cur.typ != valNil {
-		// Improper list — not supported in expr, just append
+		// Improper list
 		items = append(items, valueToExpr(cur))
+		return &expr{kind: "list", items: items, dotted: true}
 	}
 	return &expr{kind: "list", items: items}
 }
@@ -317,7 +318,13 @@ func exprToValue(e *expr) *value {
 		if len(e.items) == 0 {
 			return nilVal
 		}
-		// Convert to a proper list
+		if e.dotted {
+			result := exprToValue(e.items[len(e.items)-1])
+			for i := len(e.items) - 2; i >= 0; i-- {
+				result = &value{typ: valPair, car: exprToValue(e.items[i]), cdr: result}
+			}
+			return result
+		}
 		result := nilVal
 		for i := len(e.items) - 1; i >= 0; i-- {
 			result = &value{typ: valPair, car: exprToValue(e.items[i]), cdr: result}
