@@ -21,7 +21,7 @@ object Evaluator:
       ("car", args => Builtins.carOp(args)),
       ("cdr", args => Builtins.cdrOp(args)),
       ("null?", args => Builtins.nullCheck(args)),
-      ("list", args => ListVal(args)),
+      ("list", args => if args.isEmpty then ListVal(Nil) else BuiltinsExt.schemeListFromScala(args)),
       ("length", args => Builtins.lengthOp(args)),
       ("string?", args => Builtins.typeCheck(args, v => v.isInstanceOf[StringVal] || v.isInstanceOf[MutableStringVal])),
       ("number?", args => Builtins.typeCheck(args, Rational.isNumeric)),
@@ -45,9 +45,10 @@ object Evaluator:
       ("string-copy", args => BuiltinsExt.stringCopyOp(args)),
       ("string->list", args => BuiltinsExt.stringToListOp(args)),
       ("list->string", args => BuiltinsExt.listToStringOp(args)),
-      ("char->integer", args => BuiltinsExt.charToIntegerOp(args)),
-      ("integer->char", args => BuiltinsExt.integerToCharOp(args)),
-      ("apply", args => Builtins.applyOp(args)),
+      ("char->integer", args => BuiltinsCharStr.charToIntegerOp(args)),
+      ("integer->char", args => BuiltinsCharStr.integerToCharOp(args)),
+      ("set-car!", args => Builtins.setCarOp(args)),
+      ("set-cdr!", args => Builtins.setCdrOp(args)),
       ("eq?", args => Builtins.eqCheck(args)),
       ("eqv?", args => Builtins.eqvCheck(args)),
       ("equal?", args => Builtins.equalCheck(args)),
@@ -58,101 +59,9 @@ object Evaluator:
       ("call-with-values", args => callWithValuesOp(args))
     )
 
-  private def extBuiltins: List[(String, List[SchemeValue] => SchemeValue)] =
-    List(
-      ("abs", args => BuiltinsExt.absOp(args)),
-      ("modulo", args => BuiltinsExt.moduloOp(args)),
-      ("remainder", args => BuiltinsExt.remainderOp(args)),
-      ("quotient", args => BuiltinsExt.quotientOp(args)),
-      ("min", args => BuiltinsExt.minOp(args)),
-      ("max", args => BuiltinsExt.maxOp(args)),
-      ("expt", args => BuiltinsExt.exptOp(args)),
-      ("zero?", args => BuiltinsExt.zeroCheck(args)),
-      ("positive?", args => BuiltinsExt.positiveCheck(args)),
-      ("negative?", args => BuiltinsExt.negativeCheck(args)),
-      ("odd?", args => BuiltinsExt.oddCheck(args)),
-      ("even?", args => BuiltinsExt.evenCheck(args)),
-      ("list-ref", args => BuiltinsExt.listRefOp(args)),
-      ("list-tail", args => BuiltinsExt.listTailOp(args)),
-      ("list?", args => BuiltinsExt.listCheck(args)),
-      ("assoc", args => BuiltinsExt.assocOp(args)),
-      ("map", args => BuiltinsExt.mapOp(args)),
-      ("reverse", args => BuiltinsExt.reverseOp(args)),
-      ("char-alphabetic?", args => BuiltinsExt.charAlphabeticCheck(args)),
-      ("char-numeric?", args => BuiltinsExt.charNumericCheck(args)),
-      ("char-upcase", args => BuiltinsExt.charUpcaseOp(args)),
-      ("char-downcase", args => BuiltinsExt.charDowncaseOp(args)),
-      ("char=?", args => BuiltinsExt.charEqualCheck(args)),
-      ("char<?", args => BuiltinsExt.charLessCheck(args)),
-      ("string=?", args => BuiltinsExt.stringEqualCheck(args)),
-      ("string<?", args => BuiltinsExt.stringLessCheck(args)),
-      ("string-ci=?", args => BuiltinsExt.stringCiEqualCheck(args)),
-      ("string-upcase", args => BuiltinsExt.stringUpcaseOp(args)),
-      ("string-downcase", args => BuiltinsExt.stringDowncaseOp(args)),
-      ("vector", args => BuiltinsVector.vectorOp(args)),
-      ("make-vector", args => BuiltinsVector.makeVectorOp(args)),
-      ("vector-ref", args => BuiltinsVector.vectorRefOp(args)),
-      ("vector-set!", args => BuiltinsVector.vectorSetOp(args)),
-      ("vector-length", args => BuiltinsVector.vectorLengthOp(args)),
-      ("vector?", args => BuiltinsVector.vectorCheck(args)),
-      ("vector->list", args => BuiltinsVector.vectorToListOp(args)),
-      ("list->vector", args => BuiltinsVector.listToVectorOp(args)),
-      ("exact?", args => Builtins.typeCheck(args, Rational.isExact)),
-      ("inexact?", args => Builtins.typeCheck(args, Rational.isInexact)),
-      (
-        "integer?",
-        args =>
-          Builtins.typeCheck(
-            args,
-            {
-              case _: IntVal => true
-              case _         => false
-            }
-          )
-      ),
-      (
-        "rational?",
-        args =>
-          Builtins.typeCheck(
-            args,
-            {
-              case _: IntVal | _: RationalVal => true
-              case _                          => false
-            }
-          )
-      ),
-      ("exact->inexact", args => exactToInexactOp(args)),
-      ("inexact->exact", args => inexactToExactOp(args)),
-      ("numerator", args => numeratorOp(args)),
-      ("denominator", args => denominatorOp(args))
-    )
-
-  private def exactToInexactOp(args: List[SchemeValue]): SchemeValue =
-    args match
-      case v :: Nil if Rational.isNumeric(v) => DoubleVal(Rational.toDouble(v))
-      case _                                 => throw new EvalError("exact->inexact: expected 1 number")
-
-  private def inexactToExactOp(args: List[SchemeValue]): SchemeValue =
-    args match
-      case DoubleVal(d, _) :: Nil          => Rational.doubleToExact(d)
-      case v :: Nil if Rational.isExact(v) => v
-      case _                               => throw new EvalError("inexact->exact: expected 1 number")
-
-  private def numeratorOp(args: List[SchemeValue]): SchemeValue =
-    args match
-      case IntVal(n, _) :: Nil         => IntVal(n)
-      case RationalVal(n, _, _) :: Nil => IntVal(n)
-      case _                           => throw new EvalError("numerator: expected exact number")
-
-  private def denominatorOp(args: List[SchemeValue]): SchemeValue =
-    args match
-      case IntVal(_, _) :: Nil         => IntVal(1)
-      case RationalVal(_, d, _) :: Nil => IntVal(d)
-      case _                           => throw new EvalError("denominator: expected exact number")
-
   private def makeGlobalEnv(output: StringBuilder): Environment =
     val env = Environment()
-    (coreBuiltins(output) ++ extBuiltins).foreach { (name, func) =>
+    (coreBuiltins(output) ++ BuiltinsDefs.all).foreach { (name, func) =>
       env.define(name, BuiltinVal(name, func))
     }
     val callccFn = callccBuiltin()

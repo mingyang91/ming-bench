@@ -88,14 +88,12 @@ object Builtins:
 
   def consOp(args: List[SchemeValue]): SchemeValue =
     args match
-      case car :: cdr :: Nil =>
-        cdr match
-          case ListVal(es, _) => ListVal(car :: es)
-          case _              => PairVal(car, cdr)
-      case _ => throw new EvalError("cons: requires 2 arguments")
+      case car :: cdr :: Nil => MutablePairVal(Array(car, cdr))
+      case _                 => throw new EvalError("cons: requires 2 arguments")
 
   def carOp(args: List[SchemeValue]): SchemeValue =
     args match
+      case MutablePairVal(cells) :: Nil => cells(0)
       case PairVal(car, _) :: Nil       => car
       case ListVal(head :: _, _) :: Nil => head
       case ListVal(Nil, _) :: Nil       => throw new EvalError("car: empty list")
@@ -104,6 +102,7 @@ object Builtins:
 
   def cdrOp(args: List[SchemeValue]): SchemeValue =
     args match
+      case MutablePairVal(cells) :: Nil => cells(1)
       case PairVal(_, cdr) :: Nil       => cdr
       case ListVal(_ :: tail, _) :: Nil => ListVal(tail)
       case ListVal(Nil, _) :: Nil       => throw new EvalError("cdr: empty list")
@@ -118,8 +117,9 @@ object Builtins:
 
   def lengthOp(args: List[SchemeValue]): SchemeValue =
     args match
-      case ListVal(es, _) :: Nil => IntVal(es.length.toLong)
-      case _                     => throw new EvalError("length: expected list")
+      case ListVal(es, _) :: Nil    => IntVal(es.length.toLong)
+      case MutablePairVal(_) :: Nil => IntVal(toScalaList(args.head).length.toLong)
+      case _                        => throw new EvalError("length: expected list")
 
   def typeCheck(
     args: List[SchemeValue],
@@ -130,14 +130,52 @@ object Builtins:
       case _        => throw new EvalError("type predicate: requires 1 argument")
 
   def appendOp(args: List[SchemeValue]): SchemeValue =
-    args.foldRight(ListVal(Nil): SchemeValue) {
-      case (ListVal(es, _), ListVal(acc, _)) => ListVal(es ++ acc)
-      case (ListVal(es, _), acc)             => es.foldRight(acc)((e, a) => consOp(List(e, a)))
-      case (other, _)                        => throw new EvalError("append: expected list")
+    if args.isEmpty then return ListVal(Nil)
+    args.foldRight(args.last: SchemeValue) { (elem, acc) =>
+      if elem eq acc then acc // last element - identity
+      else
+        val elems = toScalaList(elem)
+        elems.foldRight(acc)((e, a) => MutablePairVal(Array(e, a)))
     }
+
+  /** Convert a Scheme list (ListVal or MutablePairVal chain) to a Scala List. */
+  private[ming] def toScalaList(v: SchemeValue): List[SchemeValue] =
+    val buf     = scala.collection.mutable.ListBuffer[SchemeValue]()
+    var current = v
+    var done    = false
+    while !done do
+      current match
+        case MutablePairVal(cells) =>
+          buf += cells(0)
+          current = cells(1)
+        case ListVal(es, _) =>
+          buf ++= es
+          done = true
+        case PairVal(car, cdr) =>
+          buf += car
+          current = cdr
+        case _ => done = true
+    buf.toList
+
+  def setCarOp(args: List[SchemeValue]): SchemeValue =
+    args match
+      case MutablePairVal(cells) :: value :: Nil =>
+        cells(0) = value
+        Void
+      case _ :: _ :: Nil => throw new EvalError("set-car!: not a mutable pair")
+      case _             => throw new EvalError("set-car!: requires 2 arguments")
+
+  def setCdrOp(args: List[SchemeValue]): SchemeValue =
+    args match
+      case MutablePairVal(cells) :: value :: Nil =>
+        cells(1) = value
+        Void
+      case _ :: _ :: Nil => throw new EvalError("set-cdr!: not a mutable pair")
+      case _             => throw new EvalError("set-cdr!: requires 2 arguments")
 
   def pairCheck(args: List[SchemeValue]): SchemeValue =
     args match
+      case MutablePairVal(_) :: Nil  => BoolVal(true)
       case PairVal(_, _) :: Nil      => BoolVal(true)
       case ListVal(_ :: _, _) :: Nil => BoolVal(true)
       case _ :: Nil                  => BoolVal(false)
@@ -166,16 +204,6 @@ object Builtins:
     if args.nonEmpty then throw new EvalError("newline: requires 0 arguments")
     output.append("\n")
     Void
-
-  def applyOp(args: List[SchemeValue]): SchemeValue =
-    if args.length < 2 then throw new EvalError("apply: requires at least 2 arguments")
-    val proc    = args.head
-    val lastArg = args.last
-    val tailList = lastArg match
-      case ListVal(es, _) => es
-      case _              => throw new EvalError("apply: last argument must be a list")
-    val prefixArgs = args.slice(1, args.length - 1)
-    Interpreter.applyProc(proc, prefixArgs ++ tailList)
 
   // --- eq? and equal? ---
 
@@ -211,6 +239,12 @@ object Builtins:
   private[ming] def schemeEqual(
     a: SchemeValue,
     b: SchemeValue
+  ): Boolean = schemeEqualSafe(a, b, java.util.IdentityHashMap[AnyRef, java.util.IdentityHashMap[AnyRef, Boolean]]())
+
+  private def schemeEqualSafe(
+    a: SchemeValue,
+    b: SchemeValue,
+    seen: java.util.IdentityHashMap[AnyRef, java.util.IdentityHashMap[AnyRef, Boolean]]
   ): Boolean = (a, b) match
     case (IntVal(x, _), IntVal(y, _))                     => x == y
     case (RationalVal(xn, xd, _), RationalVal(yn, yd, _)) => xn == yn && xd == yd
@@ -220,11 +254,43 @@ object Builtins:
     case (StringVal(x, _), StringVal(y, _))               => x == y
     case (CharVal(x, _), CharVal(y, _))                   => x == y
     case (ListVal(Nil, _), ListVal(Nil, _))               => true
-    case (ListVal(xs, _), ListVal(ys, _)) =>
-      xs.length == ys.length && xs.zip(ys).forall((a, b) => schemeEqual(a, b))
-    case (PairVal(a1, d1), PairVal(a2, d2)) =>
-      schemeEqual(a1, a2) && schemeEqual(d1, d2)
+    case _ if isListLike(a) && isListLike(b) =>
+      val as    = toScalaList(a)
+      val bs    = toScalaList(b)
+      val aNull = isNullTerminated(a)
+      val bNull = isNullTerminated(b)
+      if aNull && bNull then as.length == bs.length && as.zip(bs).forall((x, y) => schemeEqualSafe(x, y, seen))
+      else if !aNull && !bNull then
+        as.length == bs.length &&
+        as.zip(bs).forall((x, y) => schemeEqualSafe(x, y, seen)) &&
+        schemeEqualSafe(lastCdr(a), lastCdr(b), seen)
+      else false
     case (VectorVal(xs, _), VectorVal(ys, _)) =>
-      xs.length == ys.length && xs.zip(ys).forall((a, b) => schemeEqual(a, b))
+      xs.length == ys.length && xs.zip(ys).forall((a, b) => schemeEqualSafe(a, b, seen))
     case (Void, Void) => true
-    case _            => false
+    case _            => a eq b
+
+  private def isListLike(v: SchemeValue): Boolean = v match
+    case MutablePairVal(_)  => true
+    case PairVal(_, _)      => true
+    case ListVal(_ :: _, _) => true
+    case _                  => false
+
+  private def isNullTerminated(v: SchemeValue): Boolean =
+    var current = v
+    while true do
+      current match
+        case MutablePairVal(cells) => current = cells(1)
+        case PairVal(_, cdr)       => current = cdr
+        case ListVal(es, _)        => return true
+        case _                     => return false
+    false
+
+  private def lastCdr(v: SchemeValue): SchemeValue =
+    var current = v
+    while true do
+      current match
+        case MutablePairVal(cells) => current = cells(1)
+        case PairVal(_, cdr)       => current = cdr
+        case _                     => return current
+    current

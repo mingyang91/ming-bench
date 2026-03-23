@@ -39,9 +39,9 @@ object Interpreter:
       curExpr match
         // Self-evaluating
         case IntVal(_, _) | RationalVal(_, _, _) | DoubleVal(_, _) | BoolVal(_, _) | StringVal(_, _) |
-            MutableStringVal(_, _) | CharVal(_, _) | PairVal(_, _) | VectorVal(_, _) | LambdaVal(_, _, _, _) |
-            BuiltinVal(_, _) | ContinuationVal(_, _, _, _, _, _, _) | SyntaxRulesVal(_, _, _, _) | ValuesVal(_) |
-            RecordVal(_, _, _) | Void =>
+            MutableStringVal(_, _) | CharVal(_, _) | PairVal(_, _) | MutablePairVal(_) | VectorVal(_, _) |
+            LambdaVal(_, _, _, _) | BuiltinVal(_, _) | ContinuationVal(_, _, _, _, _, _, _) |
+            SyntaxRulesVal(_, _, _, _) | ValuesVal(_) | RecordVal(_, _, _) | Void =>
           return curExpr
 
         // Symbol lookup

@@ -10,6 +10,7 @@ enum SchemeValue:
   case SymbolVal(name: String, pos: Option[SourcePos] = None)
   case ListVal(elements: List[SchemeValue], pos: Option[SourcePos] = None)
   case PairVal(car: SchemeValue, cdr: SchemeValue)
+  case MutablePairVal(cells: Array[SchemeValue])
   case LambdaVal(params: List[String], restParam: Option[String], body: List[SchemeValue], closure: Environment)
   case CharVal(value: Char, pos: Option[SourcePos] = None)
   case MutableStringVal(chars: Array[Char], pos: Option[SourcePos] = None)
@@ -57,6 +58,7 @@ enum SchemeValue:
     case VectorVal(es, _)                     => s"#(${es.map(_.display).mkString(" ")})"
     case ListVal(es, _)                       => s"(${es.map(_.display).mkString(" ")})"
     case PairVal(_, _)                        => displayPair(this)
+    case MutablePairVal(_)                    => displayPairSafe(this)
     case LambdaVal(_, _, _, _)                => "#<procedure>"
     case BuiltinVal(n, _)                     => s"#<builtin:$n>"
     case ContinuationVal(_, _, _, _, _, _, _) => "#<continuation>"
@@ -85,6 +87,39 @@ enum SchemeValue:
     var done    = false
     while !done do
       current match
+        case PairVal(car, cdr) =>
+          parts += car.display
+          current = cdr
+        case MutablePairVal(cells) =>
+          parts += cells(0).display
+          current = cells(1)
+        case ListVal(Nil, _) =>
+          done = true
+        case ListVal(es, _) =>
+          parts ++= es.map(_.display)
+          done = true
+        case other =>
+          parts += "."
+          parts += other.display
+          done = true
+    s"(${parts.mkString(" ")})"
+
+  /** Cycle-safe display for mutable pairs using identity-based visited set. */
+  private def displayPairSafe(p: SchemeValue): String =
+    val visited = java.util.IdentityHashMap[Array[SchemeValue], Boolean]()
+    val parts   = scala.collection.mutable.ListBuffer[String]()
+    var current = p
+    var done    = false
+    while !done do
+      current match
+        case MutablePairVal(cells) =>
+          if visited.containsKey(cells) then
+            parts += "..."
+            done = true
+          else
+            visited.put(cells, true)
+            parts += cells(0).display
+            current = cells(1)
         case PairVal(car, cdr) =>
           parts += car.display
           current = cdr

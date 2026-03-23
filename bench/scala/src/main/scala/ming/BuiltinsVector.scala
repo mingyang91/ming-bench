@@ -43,10 +43,10 @@ object BuiltinsVector:
 
   def vectorToListOp(args: List[SchemeValue]): SchemeValue =
     args match
-      case VectorVal(es, _) :: Nil => ListVal(es.toList)
+      case VectorVal(es, _) :: Nil => BuiltinsExt.schemeListFromScala(es.toList)
       case _                       => throw new EvalError("vector->list: expected vector")
 
   def listToVectorOp(args: List[SchemeValue]): SchemeValue =
     args match
-      case ListVal(es, _) :: Nil => VectorVal(es.toArray)
-      case _                     => throw new EvalError("list->vector: expected list")
+      case lst :: Nil => VectorVal(Builtins.toScalaList(lst).toArray)
+      case _          => throw new EvalError("list->vector: expected list")

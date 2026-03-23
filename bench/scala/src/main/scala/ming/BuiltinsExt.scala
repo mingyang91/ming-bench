@@ -85,22 +85,13 @@ object BuiltinsExt:
 
   def listToStringOp(args: List[SchemeValue]): SchemeValue =
     args match
-      case ListVal(elems, _) :: Nil =>
+      case lst :: Nil =>
+        val elems = Builtins.toScalaList(lst)
         val chars = elems.map:
           case CharVal(c, _) => c
           case other         => throw new EvalError(s"list->string: expected char, got ${other.display}")
         StringVal(String(chars.toArray))
       case _ => throw new EvalError("list->string: expected list")
-
-  def charToIntegerOp(args: List[SchemeValue]): SchemeValue =
-    args match
-      case CharVal(c, _) :: Nil => IntVal(c.toLong)
-      case _                    => throw new EvalError("char->integer: expected char")
-
-  def integerToCharOp(args: List[SchemeValue]): SchemeValue =
-    args match
-      case IntVal(n, _) :: Nil => CharVal(n.toChar)
-      case _                   => throw new EvalError("integer->char: expected integer")
 
   def absOp(args: List[SchemeValue]): SchemeValue =
     args match
@@ -149,45 +140,29 @@ object BuiltinsExt:
         IntVal(math.pow(base.toDouble, exp.toDouble).toLong)
       case _ => throw new EvalError("expt: expected 2 numbers")
 
-  def zeroCheck(args: List[SchemeValue]): SchemeValue =
-    args match
-      case IntVal(n, _) :: Nil => BoolVal(n == 0)
-      case _                   => throw new EvalError("zero?: expected 1 number")
-
-  def positiveCheck(args: List[SchemeValue]): SchemeValue =
-    args match
-      case IntVal(n, _) :: Nil => BoolVal(n > 0)
-      case _                   => throw new EvalError("positive?: expected 1 number")
-
-  def negativeCheck(args: List[SchemeValue]): SchemeValue =
-    args match
-      case IntVal(n, _) :: Nil => BoolVal(n < 0)
-      case _                   => throw new EvalError("negative?: expected 1 number")
-
-  def oddCheck(args: List[SchemeValue]): SchemeValue =
-    args match
-      case IntVal(n, _) :: Nil => BoolVal(n % 2 != 0)
-      case _                   => throw new EvalError("odd?: expected 1 number")
-
-  def evenCheck(args: List[SchemeValue]): SchemeValue =
-    args match
-      case IntVal(n, _) :: Nil => BoolVal(n % 2 == 0)
-      case _                   => throw new EvalError("even?: expected 1 number")
-
   // --- List utilities (L13) ---
 
   def listRefOp(args: List[SchemeValue]): SchemeValue =
     args match
-      case ListVal(es, _) :: IntVal(idx, _) :: Nil =>
-        if idx < 0 || idx >= es.length then throw new EvalError("list-ref: index out of bounds")
-        es(idx.toInt)
+      case lst :: IntVal(idx, _) :: Nil =>
+        val elems = Builtins.toScalaList(lst)
+        if idx < 0 || idx >= elems.length then throw new EvalError("list-ref: index out of bounds")
+        elems(idx.toInt)
       case _ => throw new EvalError("list-ref: expected (list index)")
 
   def listTailOp(args: List[SchemeValue]): SchemeValue =
     args match
-      case ListVal(es, _) :: IntVal(idx, _) :: Nil =>
-        if idx < 0 || idx > es.length then throw new EvalError("list-tail: index out of bounds")
-        ListVal(es.drop(idx.toInt))
+      case lst :: IntVal(idx, _) :: Nil =>
+        var current = lst
+        var i       = 0
+        while i < idx.toInt do
+          current = current match
+            case MutablePairVal(cells) => cells(1)
+            case ListVal(_ :: t, _)    => ListVal(t)
+            case PairVal(_, cdr)       => cdr
+            case _                     => throw new EvalError("list-tail: index out of bounds")
+          i += 1
+        current
       case _ => throw new EvalError("list-tail: expected (list index)")
 
   def listCheck(args: List[SchemeValue]): SchemeValue =
@@ -195,101 +170,110 @@ object BuiltinsExt:
       case v :: Nil => BoolVal(isProperList(v))
       case _        => throw new EvalError("list?: requires 1 argument")
 
-  private def isProperList(v: SchemeValue): Boolean = v match
-    case ListVal(_, _)   => true
-    case PairVal(_, cdr) => isProperList(cdr)
-    case _               => false
+  /** Cycle-safe proper list check using tortoise-and-hare algorithm. */
+  private def isProperList(v: SchemeValue): Boolean =
+    var slow  = v
+    var fast  = v
+    var first = true
+    while true do
+      if first then first = false
+      else slow = stepCdr(slow)
+      fast = stepCdr(fast)
+      fast match
+        case ListVal(Nil, _)                => return true
+        case ListVal(_, _)                  => return true
+        case _: MutablePairVal | _: PairVal => // continue
+        case _                              => return false
+      fast = stepCdr(fast)
+      fast match
+        case ListVal(Nil, _)                => return true
+        case ListVal(_, _)                  => return true
+        case _: MutablePairVal | _: PairVal => // continue
+        case _                              => return false
+      // Check if slow == fast (cycle detected)
+      (slow, fast) match
+        case (MutablePairVal(a), MutablePairVal(b)) if a eq b => return false
+        case _                                                => ()
+    false // unreachable
+
+  private def stepCdr(v: SchemeValue): SchemeValue = v match
+    case MutablePairVal(cells) => cells(1)
+    case PairVal(_, cdr)       => cdr
+    case ListVal(_ :: tail, _) => ListVal(tail)
+    case other                 => other
 
   def assocOp(args: List[SchemeValue]): SchemeValue =
     args match
-      case key :: ListVal(alist, _) :: Nil =>
-        alist
+      case key :: lst :: Nil =>
+        val elems = Builtins.toScalaList(lst)
+        elems
           .collectFirst {
-            case entry @ ListVal(k :: _, _) if Builtins.schemeEqual(key, k) => entry
+            case entry if isPairLike(entry) && Builtins.schemeEqual(key, pairCar(entry)) => entry
           }
           .getOrElse(BoolVal(false))
       case _ => throw new EvalError("assoc: expected (key alist)")
 
+  private def isPairLike(v: SchemeValue): Boolean = v match
+    case MutablePairVal(_)  => true
+    case PairVal(_, _)      => true
+    case ListVal(_ :: _, _) => true
+    case _                  => false
+
+  private def pairCar(v: SchemeValue): SchemeValue = v match
+    case MutablePairVal(cells) => cells(0)
+    case PairVal(car, _)       => car
+    case ListVal(h :: _, _)    => h
+    case _                     => throw new EvalError("car: not a pair")
+
   def mapOp(args: List[SchemeValue]): SchemeValue =
     if args.length < 2 then throw new EvalError("map: requires at least 2 arguments")
-    val proc = args.head
-    val lists = args.tail.map {
-      case ListVal(es, _) => es
-      case _              => throw new EvalError("map: expected list")
-    }
-    val len = lists.head.length
+    val proc  = args.head
+    val lists = args.tail.map(Builtins.toScalaList)
+    val len   = lists.head.length
     if !lists.forall(_.length == len) then throw new EvalError("map: lists must have same length")
     val result = (0 until len).toList.map { i =>
       val elemArgs = lists.map(_(i))
       Interpreter.applyProc(proc, elemArgs)
     }
-    ListVal(result)
+    schemeListFromScala(result)
+
+  def forEachOp(args: List[SchemeValue]): SchemeValue =
+    if args.length < 2 then throw new EvalError("for-each: requires at least 2 arguments")
+    val proc  = args.head
+    val lists = args.tail.map(Builtins.toScalaList)
+    val len   = lists.head.length
+    if !lists.forall(_.length == len) then throw new EvalError("for-each: lists must have same length")
+    var i = 0
+    while i < len do
+      val elemArgs = lists.map(_(i))
+      Interpreter.applyProc(proc, elemArgs)
+      i += 1
+    Void
 
   def reverseOp(args: List[SchemeValue]): SchemeValue =
     args match
-      case ListVal(es, _) :: Nil => ListVal(es.reverse)
-      case _                     => throw new EvalError("reverse: expected 1 list")
+      case v :: Nil =>
+        val elems = Builtins.toScalaList(v)
+        schemeListFromScala(elems.reverse)
+      case _ => throw new EvalError("reverse: expected 1 list")
 
-  // --- Character utilities (L13) ---
+  /** Build a mutable-pair chain from a Scala list. */
+  private[ming] def schemeListFromScala(elems: List[SchemeValue]): SchemeValue =
+    elems.foldRight(ListVal(Nil): SchemeValue)((e, acc) => MutablePairVal(Array(e, acc)))
 
-  def charAlphabeticCheck(args: List[SchemeValue]): SchemeValue =
+  def memberOp(args: List[SchemeValue]): SchemeValue =
     args match
-      case CharVal(c, _) :: Nil => BoolVal(c.isLetter)
-      case _                    => throw new EvalError("char-alphabetic?: expected 1 char")
-
-  def charNumericCheck(args: List[SchemeValue]): SchemeValue =
-    args match
-      case CharVal(c, _) :: Nil => BoolVal(c.isDigit)
-      case _                    => throw new EvalError("char-numeric?: expected 1 char")
-
-  def charUpcaseOp(args: List[SchemeValue]): SchemeValue =
-    args match
-      case CharVal(c, _) :: Nil => CharVal(c.toUpper)
-      case _                    => throw new EvalError("char-upcase: expected 1 char")
-
-  def charDowncaseOp(args: List[SchemeValue]): SchemeValue =
-    args match
-      case CharVal(c, _) :: Nil => CharVal(c.toLower)
-      case _                    => throw new EvalError("char-downcase: expected 1 char")
-
-  def charEqualCheck(args: List[SchemeValue]): SchemeValue =
-    args match
-      case CharVal(a, _) :: CharVal(b, _) :: Nil => BoolVal(a == b)
-      case _                                     => throw new EvalError("char=?: expected 2 chars")
-
-  def charLessCheck(args: List[SchemeValue]): SchemeValue =
-    args match
-      case CharVal(a, _) :: CharVal(b, _) :: Nil => BoolVal(a < b)
-      case _                                     => throw new EvalError("char<?: expected 2 chars")
-
-  // --- String comparison/case utilities (L13) ---
-
-  private def extractString(v: SchemeValue): String = v match
-    case StringVal(s, _)         => s
-    case MutableStringVal(cs, _) => String(cs)
-    case _                       => throw new EvalError("expected string")
-
-  def stringEqualCheck(args: List[SchemeValue]): SchemeValue =
-    args match
-      case a :: b :: Nil => BoolVal(extractString(a) == extractString(b))
-      case _             => throw new EvalError("string=?: expected 2 strings")
-
-  def stringLessCheck(args: List[SchemeValue]): SchemeValue =
-    args match
-      case a :: b :: Nil => BoolVal(extractString(a) < extractString(b))
-      case _             => throw new EvalError("string<?: expected 2 strings")
-
-  def stringCiEqualCheck(args: List[SchemeValue]): SchemeValue =
-    args match
-      case a :: b :: Nil => BoolVal(extractString(a).equalsIgnoreCase(extractString(b)))
-      case _             => throw new EvalError("string-ci=?: expected 2 strings")
-
-  def stringUpcaseOp(args: List[SchemeValue]): SchemeValue =
-    args match
-      case v :: Nil => StringVal(extractString(v).toUpperCase)
-      case _        => throw new EvalError("string-upcase: expected 1 string")
-
-  def stringDowncaseOp(args: List[SchemeValue]): SchemeValue =
-    args match
-      case v :: Nil => StringVal(extractString(v).toLowerCase)
-      case _        => throw new EvalError("string-downcase: expected 1 string")
+      case obj :: lst :: Nil =>
+        var current = lst
+        while true do
+          current match
+            case MutablePairVal(cells) =>
+              if Builtins.schemeEqual(obj, cells(0)) then return current
+              current = cells(1)
+            case ListVal(Nil, _) => return BoolVal(false)
+            case ListVal(h :: t, _) =>
+              if Builtins.schemeEqual(obj, h) then return current
+              current = ListVal(t)
+            case _ => return BoolVal(false)
+        BoolVal(false)
+      case _ => throw new EvalError("member: requires 2 arguments")
