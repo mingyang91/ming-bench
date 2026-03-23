@@ -8,22 +8,34 @@ use crate::scheme::value::Value;
 pub struct Env {
     bindings: RefCell<HashMap<String, Value>>,
     parent: Option<Rc<Env>>,
+    output: Rc<RefCell<String>>,
 }
 
 impl Env {
     /// Create the default top-level environment with builtins.
     pub fn default_env() -> Rc<Self> {
+        Self::default_env_with_output(Rc::new(RefCell::new(String::new())))
+    }
+
+    /// Create the default top-level environment with a shared output buffer.
+    pub fn default_env_with_output(output: Rc<RefCell<String>>) -> Rc<Self> {
         let mut bindings = HashMap::new();
         for name in [
             "+", "-", "*", "/", "<", ">", "=", "<=", ">=", "not",
             "cons", "car", "cdr", "null?", "list", "length", "append",
             "string?", "number?", "boolean?", "pair?", "symbol?",
+            "display", "write", "newline",
+            "string-append", "string-length", "substring",
+            "string->number", "number->string",
+            "symbol->string", "string->symbol",
+            "string-ref", "char?",
         ] {
             bindings.insert(name.into(), Value::Builtin(name.into()));
         }
         Rc::new(Self {
             bindings: RefCell::new(bindings),
             parent: None,
+            output,
         })
     }
 
@@ -36,6 +48,7 @@ impl Env {
         Rc::new(Self {
             bindings: RefCell::new(bindings),
             parent: Some(Rc::clone(parent)),
+            output: Rc::clone(&parent.output),
         })
     }
 
@@ -51,5 +64,15 @@ impl Env {
 
     pub fn define(&self, name: String, value: Value) {
         self.bindings.borrow_mut().insert(name, value);
+    }
+
+    /// Write to the output buffer.
+    pub fn write_output(&self, s: &str) {
+        self.output.borrow_mut().push_str(s);
+    }
+
+    /// Get the accumulated output.
+    pub fn take_output(&self) -> String {
+        self.output.borrow().clone()
     }
 }

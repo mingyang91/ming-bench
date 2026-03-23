@@ -10,6 +10,7 @@ pub enum Value {
     Boolean(bool),
     Str(String),
     Symbol(String),
+    Char(char),
     List(Vec<Value>),
     Void,
     Builtin(String),
@@ -27,6 +28,7 @@ impl PartialEq for Value {
             (Value::Boolean(a), Value::Boolean(b)) => a == b,
             (Value::Str(a), Value::Str(b)) => a == b,
             (Value::Symbol(a), Value::Symbol(b)) => a == b,
+            (Value::Char(a), Value::Char(b)) => a == b,
             (Value::List(a), Value::List(b)) => a == b,
             (Value::Void, Value::Void) => true,
             (Value::Builtin(a), Value::Builtin(b)) => a == b,
@@ -44,6 +46,7 @@ impl Value {
             Value::Boolean(false) => "#f".into(),
             Value::Str(s) => format!("\"{}\"", s),
             Value::Symbol(s) => s.clone(),
+            Value::Char(c) => format!("#\\{}", c),
             Value::List(elems) => {
                 let inner: Vec<String> = elems.iter().map(|v| v.to_display_string()).collect();
                 format!("({})", inner.join(" "))
@@ -51,6 +54,18 @@ impl Value {
             Value::Void => "".into(),
             Value::Builtin(name) => format!("#<procedure:{}>", name),
             Value::Lambda { .. } => "#<procedure>".into(),
+        }
+    }
+
+    /// Display string for `display` — strings without quotes.
+    pub fn to_display_output(&self) -> String {
+        match self {
+            Value::Str(s) => s.clone(),
+            Value::List(elems) => {
+                let inner: Vec<String> = elems.iter().map(|v| v.to_display_output()).collect();
+                format!("({})", inner.join(" "))
+            }
+            other => other.to_display_string(),
         }
     }
 

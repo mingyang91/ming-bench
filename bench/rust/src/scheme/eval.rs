@@ -48,7 +48,7 @@ fn eval_list(elems: &[Expr], env: &Rc<Env>) -> Result<Value, EvalError> {
         .map(|e| eval_expr(e, env))
         .collect::<Result<Vec<_>, _>>()?;
 
-    apply_function(&func, &args)
+    apply_function(&func, &args, env)
 }
 
 fn eval_if(args: &[Expr], env: &Rc<Env>) -> Result<Value, EvalError> {
@@ -273,7 +273,7 @@ fn eval_let(args: &[Expr], env: &Rc<Env>) -> Result<Value, EvalError> {
             closure_env: Rc::clone(&func_env),
         };
         func_env.define(name.clone(), recursive_lambda.clone());
-        return apply_function(&recursive_lambda, &init_vals);
+        return apply_function(&recursive_lambda, &init_vals, env);
     }
     // Regular let: (let ((var init) ...) body...)
     let bindings_expr = match &args[0].kind {
@@ -361,9 +361,9 @@ fn eval_cond(clauses: &[Expr], env: &Rc<Env>) -> Result<Value, EvalError> {
     Ok(Value::Void)
 }
 
-pub fn apply_function(func: &Value, args: &[Value]) -> Result<Value, EvalError> {
+pub fn apply_function(func: &Value, args: &[Value], env: &Rc<Env>) -> Result<Value, EvalError> {
     match func {
-        Value::Builtin(name) => apply_builtin(name, args),
+        Value::Builtin(name) => apply_builtin(name, args, env),
         Value::Lambda { params, body, closure_env } => {
             if args.len() != params.len() {
                 return Err(ErrorKind::WrongArgCount {
@@ -384,7 +384,7 @@ pub fn apply_function(func: &Value, args: &[Value]) -> Result<Value, EvalError> 
     }
 }
 
-fn apply_builtin(name: &str, args: &[Value]) -> Result<Value, EvalError> {
+fn apply_builtin(name: &str, args: &[Value], env: &Rc<Env>) -> Result<Value, EvalError> {
     match name {
         "+" => arith_variadic(args, 0, |a, b| Ok(a + b)),
         "-" => {
@@ -537,6 +537,145 @@ fn apply_builtin(name: &str, args: &[Value]) -> Result<Value, EvalError> {
                 return Err(ErrorKind::WrongArgCount { expected: 1, got: args.len() }.into());
             }
             Ok(Value::Boolean(matches!(&args[0], Value::Symbol(_))))
+        }
+        "char?" => {
+            if args.len() != 1 {
+                return Err(ErrorKind::WrongArgCount { expected: 1, got: args.len() }.into());
+            }
+            Ok(Value::Boolean(matches!(&args[0], Value::Char(_))))
+        }
+        "display" => {
+            if args.len() != 1 {
+                return Err(ErrorKind::WrongArgCount { expected: 1, got: args.len() }.into());
+            }
+            env.write_output(&args[0].to_display_output());
+            Ok(Value::Void)
+        }
+        "write" => {
+            if args.len() != 1 {
+                return Err(ErrorKind::WrongArgCount { expected: 1, got: args.len() }.into());
+            }
+            env.write_output(&args[0].to_display_string());
+            Ok(Value::Void)
+        }
+        "newline" => {
+            if !args.is_empty() {
+                return Err(ErrorKind::WrongArgCount { expected: 0, got: args.len() }.into());
+            }
+            env.write_output("\n");
+            Ok(Value::Void)
+        }
+        "string-append" => {
+            let mut result = String::new();
+            for arg in args {
+                match arg {
+                    Value::Str(s) => result.push_str(s),
+                    other => return Err(ErrorKind::TypeMismatch {
+                        expected: "string".into(),
+                        got: other.to_display_string(),
+                    }.into()),
+                }
+            }
+            Ok(Value::Str(result))
+        }
+        "string-length" => {
+            if args.len() != 1 {
+                return Err(ErrorKind::WrongArgCount { expected: 1, got: args.len() }.into());
+            }
+            match &args[0] {
+                Value::Str(s) => Ok(Value::Integer(s.len() as i64)),
+                other => Err(ErrorKind::TypeMismatch {
+                    expected: "string".into(),
+                    got: other.to_display_string(),
+                }.into()),
+            }
+        }
+        "substring" => {
+            if args.len() != 3 {
+                return Err(ErrorKind::WrongArgCount { expected: 3, got: args.len() }.into());
+            }
+            let s = match &args[0] {
+                Value::Str(s) => s,
+                other => return Err(ErrorKind::TypeMismatch {
+                    expected: "string".into(),
+                    got: other.to_display_string(),
+                }.into()),
+            };
+            let start = require_int(&args[1])? as usize;
+            let end = require_int(&args[2])? as usize;
+            if start > s.len() || end > s.len() || start > end {
+                return Err(ErrorKind::TypeMismatch {
+                    expected: "valid substring indices".into(),
+                    got: format!("start={}, end={}, length={}", start, end, s.len()),
+                }.into());
+            }
+            Ok(Value::Str(s[start..end].to_string()))
+        }
+        "string->number" => {
+            if args.len() != 1 {
+                return Err(ErrorKind::WrongArgCount { expected: 1, got: args.len() }.into());
+            }
+            match &args[0] {
+                Value::Str(s) => match s.parse::<i64>() {
+                    Ok(n) => Ok(Value::Integer(n)),
+                    Err(_) => Ok(Value::Boolean(false)),
+                },
+                other => Err(ErrorKind::TypeMismatch {
+                    expected: "string".into(),
+                    got: other.to_display_string(),
+                }.into()),
+            }
+        }
+        "number->string" => {
+            if args.len() != 1 {
+                return Err(ErrorKind::WrongArgCount { expected: 1, got: args.len() }.into());
+            }
+            let n = require_int(&args[0])?;
+            Ok(Value::Str(n.to_string()))
+        }
+        "symbol->string" => {
+            if args.len() != 1 {
+                return Err(ErrorKind::WrongArgCount { expected: 1, got: args.len() }.into());
+            }
+            match &args[0] {
+                Value::Symbol(s) => Ok(Value::Str(s.clone())),
+                other => Err(ErrorKind::TypeMismatch {
+                    expected: "symbol".into(),
+                    got: other.to_display_string(),
+                }.into()),
+            }
+        }
+        "string->symbol" => {
+            if args.len() != 1 {
+                return Err(ErrorKind::WrongArgCount { expected: 1, got: args.len() }.into());
+            }
+            match &args[0] {
+                Value::Str(s) => Ok(Value::Symbol(s.clone())),
+                other => Err(ErrorKind::TypeMismatch {
+                    expected: "string".into(),
+                    got: other.to_display_string(),
+                }.into()),
+            }
+        }
+        "string-ref" => {
+            if args.len() != 2 {
+                return Err(ErrorKind::WrongArgCount { expected: 2, got: args.len() }.into());
+            }
+            let s = match &args[0] {
+                Value::Str(s) => s,
+                other => return Err(ErrorKind::TypeMismatch {
+                    expected: "string".into(),
+                    got: other.to_display_string(),
+                }.into()),
+            };
+            let idx = require_int(&args[1])? as usize;
+            if idx >= s.len() {
+                return Err(ErrorKind::TypeMismatch {
+                    expected: "valid string index".into(),
+                    got: format!("index {} for string of length {}", idx, s.len()),
+                }.into());
+            }
+            Ok(Value::Char(s.as_bytes()[idx] as char))
         }
         _ => Err(ErrorKind::NotAProcedure {
             value: format!("#<procedure:{}>", name),
