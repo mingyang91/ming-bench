@@ -2,6 +2,7 @@ package ming
 
 import (
 	"fmt"
+	"strconv"
 	"strings"
 )
 
@@ -16,6 +17,27 @@ type SchemeInt struct {
 
 func (v *SchemeInt) String() string {
 	return fmt.Sprintf("%d", v.Value)
+}
+
+type SchemeRational struct {
+	Num int64
+	Den int64
+}
+
+func (v *SchemeRational) String() string {
+	return fmt.Sprintf("%d/%d", v.Num, v.Den)
+}
+
+type SchemeFloat struct {
+	Value float64
+}
+
+func (v *SchemeFloat) String() string {
+	s := strconv.FormatFloat(v.Value, 'g', -1, 64)
+	if !strings.Contains(s, ".") && !strings.Contains(s, "e") && !strings.Contains(s, "E") && !strings.Contains(s, "Inf") && !strings.Contains(s, "NaN") {
+		s += ".0"
+	}
+	return s
 }
 
 type SchemeBool struct {

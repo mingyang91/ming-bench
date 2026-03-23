@@ -2,6 +2,7 @@ package ming
 
 import (
 	"fmt"
+	"math"
 	"strconv"
 	"strings"
 	"unicode"
@@ -189,6 +190,15 @@ func Eval(expr Expr, env *Env) (SchemeValue, error) {
 		switch e := expr.(type) {
 		case *NumberExpr:
 			return &SchemeInt{Value: e.Value}, nil
+
+		case *FloatExpr:
+			return &SchemeFloat{Value: e.Value}, nil
+
+		case *RationalExpr:
+			if e.Den == 0 {
+				return nil, &EvalError{Message: "division by zero in rational literal"}
+			}
+			return makeRational(e.Num, e.Den), nil
 
 		case *BoolExpr:
 			return &SchemeBool{Value: e.Value}, nil
@@ -975,6 +985,10 @@ func quoteExpr(expr Expr) SchemeValue {
 	switch e := expr.(type) {
 	case *NumberExpr:
 		return &SchemeInt{Value: e.Value}
+	case *FloatExpr:
+		return &SchemeFloat{Value: e.Value}
+	case *RationalExpr:
+		return makeRational(e.Num, e.Den)
 	case *BoolExpr:
 		return &SchemeBool{Value: e.Value}
 	case *StringExpr:
@@ -1081,6 +1095,15 @@ func init() {
 	builtins["negative?"] = &BuiltinProc{Name: "negative?", Fn: builtinNegativeQ}
 	builtins["odd?"] = &BuiltinProc{Name: "odd?", Fn: builtinOddQ}
 	builtins["even?"] = &BuiltinProc{Name: "even?", Fn: builtinEvenQ}
+	// L19 rationals / exact-inexact
+	builtins["exact?"] = &BuiltinProc{Name: "exact?", Fn: builtinExactQ}
+	builtins["inexact?"] = &BuiltinProc{Name: "inexact?", Fn: builtinInexactQ}
+	builtins["exact->inexact"] = &BuiltinProc{Name: "exact->inexact", Fn: builtinExactToInexact}
+	builtins["inexact->exact"] = &BuiltinProc{Name: "inexact->exact", Fn: builtinInexactToExact}
+	builtins["numerator"] = &BuiltinProc{Name: "numerator", Fn: builtinNumerator}
+	builtins["denominator"] = &BuiltinProc{Name: "denominator", Fn: builtinDenominator}
+	builtins["integer?"] = &BuiltinProc{Name: "integer?", Fn: builtinIntegerQ}
+	builtins["rational?"] = &BuiltinProc{Name: "rational?", Fn: builtinRationalQ}
 	// L13 list
 	builtins["list-ref"] = &BuiltinProc{Name: "list-ref", Fn: builtinListRef}
 	builtins["list-tail"] = &BuiltinProc{Name: "list-tail", Fn: builtinListTail}
@@ -1115,15 +1138,15 @@ func init() {
 }
 
 func builtinAdd(args []SchemeValue, callExpr *ListExpr) (SchemeValue, error) {
-	nums, err := requireInts(args, "+", callExpr)
-	if err != nil {
-		return nil, err
+	var result SchemeValue = &SchemeInt{Value: 0}
+	for _, a := range args {
+		if !isNumber(a) {
+			line, col := callExpr.Pos()
+			return nil, &EvalError{Message: fmt.Sprintf("%d:%d: +: expected number, got %s", line, col, a.String())}
+		}
+		result = numAdd(result, a)
 	}
-	var sum int64
-	for _, n := range nums {
-		sum += n
-	}
-	return &SchemeInt{Value: sum}, nil
+	return result, nil
 }
 
 func builtinSub(args []SchemeValue, callExpr *ListExpr) (SchemeValue, error) {
@@ -1131,30 +1154,32 @@ func builtinSub(args []SchemeValue, callExpr *ListExpr) (SchemeValue, error) {
 		line, col := callExpr.Pos()
 		return nil, &EvalError{Message: fmt.Sprintf("%d:%d: -: requires at least 1 argument", line, col)}
 	}
-	nums, err := requireInts(args, "-", callExpr)
-	if err != nil {
-		return nil, err
+	for _, a := range args {
+		if !isNumber(a) {
+			line, col := callExpr.Pos()
+			return nil, &EvalError{Message: fmt.Sprintf("%d:%d: -: expected number, got %s", line, col, a.String())}
+		}
 	}
-	if len(nums) == 1 {
-		return &SchemeInt{Value: -nums[0]}, nil
+	if len(args) == 1 {
+		return numNeg(args[0]), nil
 	}
-	result := nums[0]
-	for _, n := range nums[1:] {
-		result -= n
+	result := args[0]
+	for _, a := range args[1:] {
+		result = numSub(result, a)
 	}
-	return &SchemeInt{Value: result}, nil
+	return result, nil
 }
 
 func builtinMul(args []SchemeValue, callExpr *ListExpr) (SchemeValue, error) {
-	nums, err := requireInts(args, "*", callExpr)
-	if err != nil {
-		return nil, err
+	var result SchemeValue = &SchemeInt{Value: 1}
+	for _, a := range args {
+		if !isNumber(a) {
+			line, col := callExpr.Pos()
+			return nil, &EvalError{Message: fmt.Sprintf("%d:%d: *: expected number, got %s", line, col, a.String())}
+		}
+		result = numMul(result, a)
 	}
-	var product int64 = 1
-	for _, n := range nums {
-		product *= n
-	}
-	return &SchemeInt{Value: product}, nil
+	return result, nil
 }
 
 func builtinDiv(args []SchemeValue, callExpr *ListExpr) (SchemeValue, error) {
@@ -1162,32 +1187,43 @@ func builtinDiv(args []SchemeValue, callExpr *ListExpr) (SchemeValue, error) {
 		line, col := callExpr.Pos()
 		return nil, &EvalError{Message: fmt.Sprintf("%d:%d: /: requires at least 2 arguments", line, col)}
 	}
-	nums, err := requireInts(args, "/", callExpr)
-	if err != nil {
-		return nil, err
+	for _, a := range args {
+		if !isNumber(a) {
+			line, col := callExpr.Pos()
+			return nil, &EvalError{Message: fmt.Sprintf("%d:%d: /: expected number, got %s", line, col, a.String())}
+		}
 	}
-	result := nums[0]
-	for _, n := range nums[1:] {
-		if n == 0 {
+	result := args[0]
+	for _, a := range args[1:] {
+		if numIsZero(a) {
 			line, col := callExpr.Pos()
 			return nil, &EvalError{Message: fmt.Sprintf("%d:%d: /: division by zero", line, col)}
 		}
-		result /= n
+		result = numDiv(result, a)
 	}
-	return &SchemeInt{Value: result}, nil
+	return result, nil
+}
+
+func requireNums(args []SchemeValue, name string, callExpr *ListExpr) error {
+	for _, a := range args {
+		if !isNumber(a) {
+			line, col := callExpr.Pos()
+			return &EvalError{Message: fmt.Sprintf("%d:%d: %s: expected number, got %s", line, col, name, a.String())}
+		}
+	}
+	return nil
 }
 
 func builtinLT(args []SchemeValue, callExpr *ListExpr) (SchemeValue, error) {
-	nums, err := requireInts(args, "<", callExpr)
-	if err != nil {
+	if err := requireNums(args, "<", callExpr); err != nil {
 		return nil, err
 	}
-	if len(nums) < 2 {
+	if len(args) < 2 {
 		line, col := callExpr.Pos()
 		return nil, &EvalError{Message: fmt.Sprintf("%d:%d: <: requires at least 2 arguments", line, col)}
 	}
-	for i := 0; i < len(nums)-1; i++ {
-		if !(nums[i] < nums[i+1]) {
+	for i := 0; i < len(args)-1; i++ {
+		if numCompare(args[i], args[i+1]) >= 0 {
 			return &SchemeBool{Value: false}, nil
 		}
 	}
@@ -1195,16 +1231,15 @@ func builtinLT(args []SchemeValue, callExpr *ListExpr) (SchemeValue, error) {
 }
 
 func builtinGT(args []SchemeValue, callExpr *ListExpr) (SchemeValue, error) {
-	nums, err := requireInts(args, ">", callExpr)
-	if err != nil {
+	if err := requireNums(args, ">", callExpr); err != nil {
 		return nil, err
 	}
-	if len(nums) < 2 {
+	if len(args) < 2 {
 		line, col := callExpr.Pos()
 		return nil, &EvalError{Message: fmt.Sprintf("%d:%d: >: requires at least 2 arguments", line, col)}
 	}
-	for i := 0; i < len(nums)-1; i++ {
-		if !(nums[i] > nums[i+1]) {
+	for i := 0; i < len(args)-1; i++ {
+		if numCompare(args[i], args[i+1]) <= 0 {
 			return &SchemeBool{Value: false}, nil
 		}
 	}
@@ -1212,16 +1247,15 @@ func builtinGT(args []SchemeValue, callExpr *ListExpr) (SchemeValue, error) {
 }
 
 func builtinEq(args []SchemeValue, callExpr *ListExpr) (SchemeValue, error) {
-	nums, err := requireInts(args, "=", callExpr)
-	if err != nil {
+	if err := requireNums(args, "=", callExpr); err != nil {
 		return nil, err
 	}
-	if len(nums) < 2 {
+	if len(args) < 2 {
 		line, col := callExpr.Pos()
 		return nil, &EvalError{Message: fmt.Sprintf("%d:%d: =: requires at least 2 arguments", line, col)}
 	}
-	for i := 0; i < len(nums)-1; i++ {
-		if nums[i] != nums[i+1] {
+	for i := 0; i < len(args)-1; i++ {
+		if !numEqual(args[i], args[i+1]) {
 			return &SchemeBool{Value: false}, nil
 		}
 	}
@@ -1229,16 +1263,15 @@ func builtinEq(args []SchemeValue, callExpr *ListExpr) (SchemeValue, error) {
 }
 
 func builtinLE(args []SchemeValue, callExpr *ListExpr) (SchemeValue, error) {
-	nums, err := requireInts(args, "<=", callExpr)
-	if err != nil {
+	if err := requireNums(args, "<=", callExpr); err != nil {
 		return nil, err
 	}
-	if len(nums) < 2 {
+	if len(args) < 2 {
 		line, col := callExpr.Pos()
 		return nil, &EvalError{Message: fmt.Sprintf("%d:%d: <=: requires at least 2 arguments", line, col)}
 	}
-	for i := 0; i < len(nums)-1; i++ {
-		if !(nums[i] <= nums[i+1]) {
+	for i := 0; i < len(args)-1; i++ {
+		if numCompare(args[i], args[i+1]) > 0 {
 			return &SchemeBool{Value: false}, nil
 		}
 	}
@@ -1246,16 +1279,15 @@ func builtinLE(args []SchemeValue, callExpr *ListExpr) (SchemeValue, error) {
 }
 
 func builtinGE(args []SchemeValue, callExpr *ListExpr) (SchemeValue, error) {
-	nums, err := requireInts(args, ">=", callExpr)
-	if err != nil {
+	if err := requireNums(args, ">=", callExpr); err != nil {
 		return nil, err
 	}
-	if len(nums) < 2 {
+	if len(args) < 2 {
 		line, col := callExpr.Pos()
 		return nil, &EvalError{Message: fmt.Sprintf("%d:%d: >=: requires at least 2 arguments", line, col)}
 	}
-	for i := 0; i < len(nums)-1; i++ {
-		if !(nums[i] >= nums[i+1]) {
+	for i := 0; i < len(args)-1; i++ {
+		if numCompare(args[i], args[i+1]) < 0 {
 			return &SchemeBool{Value: false}, nil
 		}
 	}
@@ -1404,8 +1436,7 @@ func builtinNumberQ(args []SchemeValue, callExpr *ListExpr) (SchemeValue, error)
 		line, col := callExpr.Pos()
 		return nil, &EvalError{Message: fmt.Sprintf("%d:%d: number?: requires exactly 1 argument", line, col)}
 	}
-	_, ok := args[0].(*SchemeInt)
-	return &SchemeBool{Value: ok}, nil
+	return &SchemeBool{Value: isNumber(args[0])}, nil
 }
 
 func builtinStringQ(args []SchemeValue, callExpr *ListExpr) (SchemeValue, error) {
@@ -1586,11 +1617,15 @@ func builtinStringToNumber(args []SchemeValue, callExpr *ListExpr) (SchemeValue,
 		line, col := callExpr.Pos()
 		return nil, &EvalError{Message: fmt.Sprintf("%d:%d: string->number: expected string", line, col)}
 	}
-	n, err := strconv.ParseInt(s.Value, 10, 64)
-	if err != nil {
-		return &SchemeBool{Value: false}, nil
+	// Try integer
+	if n, err := strconv.ParseInt(s.Value, 10, 64); err == nil {
+		return &SchemeInt{Value: n}, nil
 	}
-	return &SchemeInt{Value: n}, nil
+	// Try float
+	if f, err := strconv.ParseFloat(s.Value, 64); err == nil {
+		return &SchemeFloat{Value: f}, nil
+	}
+	return &SchemeBool{Value: false}, nil
 }
 
 func builtinNumberToString(args []SchemeValue, callExpr *ListExpr) (SchemeValue, error) {
@@ -1598,12 +1633,11 @@ func builtinNumberToString(args []SchemeValue, callExpr *ListExpr) (SchemeValue,
 		line, col := callExpr.Pos()
 		return nil, &EvalError{Message: fmt.Sprintf("%d:%d: number->string: requires exactly 1 argument", line, col)}
 	}
-	n, ok := args[0].(*SchemeInt)
-	if !ok {
+	if !isNumber(args[0]) {
 		line, col := callExpr.Pos()
 		return nil, &EvalError{Message: fmt.Sprintf("%d:%d: number->string: expected number", line, col)}
 	}
-	return &SchemeString{Value: strconv.FormatInt(n.Value, 10)}, nil
+	return &SchemeString{Value: args[0].String()}, nil
 }
 
 func builtinSymbolToString(args []SchemeValue, callExpr *ListExpr) (SchemeValue, error) {
@@ -1834,16 +1868,11 @@ func builtinAbs(args []SchemeValue, callExpr *ListExpr) (SchemeValue, error) {
 		line, col := callExpr.Pos()
 		return nil, &EvalError{Message: fmt.Sprintf("%d:%d: abs: requires exactly 1 argument", line, col)}
 	}
-	n, ok := args[0].(*SchemeInt)
-	if !ok {
+	if !isNumber(args[0]) {
 		line, col := callExpr.Pos()
 		return nil, &EvalError{Message: fmt.Sprintf("%d:%d: abs: expected number", line, col)}
 	}
-	v := n.Value
-	if v < 0 {
-		v = -v
-	}
-	return &SchemeInt{Value: v}, nil
+	return numAbs(args[0]), nil
 }
 
 func builtinModulo(args []SchemeValue, callExpr *ListExpr) (SchemeValue, error) {
@@ -1906,17 +1935,16 @@ func builtinMin(args []SchemeValue, callExpr *ListExpr) (SchemeValue, error) {
 		line, col := callExpr.Pos()
 		return nil, &EvalError{Message: fmt.Sprintf("%d:%d: min: requires at least 1 argument", line, col)}
 	}
-	nums, err := requireInts(args, "min", callExpr)
-	if err != nil {
+	if err := requireNums(args, "min", callExpr); err != nil {
 		return nil, err
 	}
-	m := nums[0]
-	for _, n := range nums[1:] {
-		if n < m {
-			m = n
+	m := args[0]
+	for _, a := range args[1:] {
+		if numCompare(a, m) < 0 {
+			m = a
 		}
 	}
-	return &SchemeInt{Value: m}, nil
+	return m, nil
 }
 
 func builtinMax(args []SchemeValue, callExpr *ListExpr) (SchemeValue, error) {
@@ -1924,34 +1952,41 @@ func builtinMax(args []SchemeValue, callExpr *ListExpr) (SchemeValue, error) {
 		line, col := callExpr.Pos()
 		return nil, &EvalError{Message: fmt.Sprintf("%d:%d: max: requires at least 1 argument", line, col)}
 	}
-	nums, err := requireInts(args, "max", callExpr)
-	if err != nil {
+	if err := requireNums(args, "max", callExpr); err != nil {
 		return nil, err
 	}
-	m := nums[0]
-	for _, n := range nums[1:] {
-		if n > m {
-			m = n
+	m := args[0]
+	for _, a := range args[1:] {
+		if numCompare(a, m) > 0 {
+			m = a
 		}
 	}
-	return &SchemeInt{Value: m}, nil
+	return m, nil
 }
 
 func builtinExpt(args []SchemeValue, callExpr *ListExpr) (SchemeValue, error) {
-	nums, err := requireInts(args, "expt", callExpr)
-	if err != nil {
-		return nil, err
-	}
-	if len(nums) != 2 {
+	if len(args) != 2 {
 		line, col := callExpr.Pos()
 		return nil, &EvalError{Message: fmt.Sprintf("%d:%d: expt: requires exactly 2 arguments", line, col)}
 	}
-	base, exp := nums[0], nums[1]
-	var result int64 = 1
-	for i := int64(0); i < exp; i++ {
-		result *= base
+	if err := requireNums(args, "expt", callExpr); err != nil {
+		return nil, err
 	}
-	return &SchemeInt{Value: result}, nil
+	// For integer exponents with exact base, compute exactly
+	if expInt, ok := args[1].(*SchemeInt); ok {
+		exp := expInt.Value
+		if exp >= 0 {
+			var result SchemeValue = &SchemeInt{Value: 1}
+			for i := int64(0); i < exp; i++ {
+				result = numMul(result, args[0])
+			}
+			return result, nil
+		}
+	}
+	// Fallback to float
+	af, _ := toFloat64(args[0])
+	bf, _ := toFloat64(args[1])
+	return &SchemeFloat{Value: math.Pow(af, bf)}, nil
 }
 
 func builtinZeroQ(args []SchemeValue, callExpr *ListExpr) (SchemeValue, error) {
@@ -1959,12 +1994,11 @@ func builtinZeroQ(args []SchemeValue, callExpr *ListExpr) (SchemeValue, error) {
 		line, col := callExpr.Pos()
 		return nil, &EvalError{Message: fmt.Sprintf("%d:%d: zero?: requires exactly 1 argument", line, col)}
 	}
-	n, ok := args[0].(*SchemeInt)
-	if !ok {
+	if !isNumber(args[0]) {
 		line, col := callExpr.Pos()
 		return nil, &EvalError{Message: fmt.Sprintf("%d:%d: zero?: expected number", line, col)}
 	}
-	return &SchemeBool{Value: n.Value == 0}, nil
+	return &SchemeBool{Value: numIsZero(args[0])}, nil
 }
 
 func builtinPositiveQ(args []SchemeValue, callExpr *ListExpr) (SchemeValue, error) {
@@ -1972,12 +2006,11 @@ func builtinPositiveQ(args []SchemeValue, callExpr *ListExpr) (SchemeValue, erro
 		line, col := callExpr.Pos()
 		return nil, &EvalError{Message: fmt.Sprintf("%d:%d: positive?: requires exactly 1 argument", line, col)}
 	}
-	n, ok := args[0].(*SchemeInt)
-	if !ok {
+	if !isNumber(args[0]) {
 		line, col := callExpr.Pos()
 		return nil, &EvalError{Message: fmt.Sprintf("%d:%d: positive?: expected number", line, col)}
 	}
-	return &SchemeBool{Value: n.Value > 0}, nil
+	return &SchemeBool{Value: numIsPositive(args[0])}, nil
 }
 
 func builtinNegativeQ(args []SchemeValue, callExpr *ListExpr) (SchemeValue, error) {
@@ -1985,12 +2018,11 @@ func builtinNegativeQ(args []SchemeValue, callExpr *ListExpr) (SchemeValue, erro
 		line, col := callExpr.Pos()
 		return nil, &EvalError{Message: fmt.Sprintf("%d:%d: negative?: requires exactly 1 argument", line, col)}
 	}
-	n, ok := args[0].(*SchemeInt)
-	if !ok {
+	if !isNumber(args[0]) {
 		line, col := callExpr.Pos()
 		return nil, &EvalError{Message: fmt.Sprintf("%d:%d: negative?: expected number", line, col)}
 	}
-	return &SchemeBool{Value: n.Value < 0}, nil
+	return &SchemeBool{Value: numIsNegative(args[0])}, nil
 }
 
 func builtinOddQ(args []SchemeValue, callExpr *ListExpr) (SchemeValue, error) {
@@ -2004,6 +2036,109 @@ func builtinOddQ(args []SchemeValue, callExpr *ListExpr) (SchemeValue, error) {
 		return nil, &EvalError{Message: fmt.Sprintf("%d:%d: odd?: expected number", line, col)}
 	}
 	return &SchemeBool{Value: n.Value%2 != 0}, nil
+}
+
+// --- L19 builtins ---
+
+func builtinExactQ(args []SchemeValue, callExpr *ListExpr) (SchemeValue, error) {
+	if len(args) != 1 {
+		line, col := callExpr.Pos()
+		return nil, &EvalError{Message: fmt.Sprintf("%d:%d: exact?: requires exactly 1 argument", line, col)}
+	}
+	return &SchemeBool{Value: isExact(args[0])}, nil
+}
+
+func builtinInexactQ(args []SchemeValue, callExpr *ListExpr) (SchemeValue, error) {
+	if len(args) != 1 {
+		line, col := callExpr.Pos()
+		return nil, &EvalError{Message: fmt.Sprintf("%d:%d: inexact?: requires exactly 1 argument", line, col)}
+	}
+	_, ok := args[0].(*SchemeFloat)
+	return &SchemeBool{Value: ok}, nil
+}
+
+func builtinExactToInexact(args []SchemeValue, callExpr *ListExpr) (SchemeValue, error) {
+	if len(args) != 1 {
+		line, col := callExpr.Pos()
+		return nil, &EvalError{Message: fmt.Sprintf("%d:%d: exact->inexact: requires exactly 1 argument", line, col)}
+	}
+	if !isNumber(args[0]) {
+		line, col := callExpr.Pos()
+		return nil, &EvalError{Message: fmt.Sprintf("%d:%d: exact->inexact: expected number", line, col)}
+	}
+	return exactToInexact(args[0]), nil
+}
+
+func builtinInexactToExact(args []SchemeValue, callExpr *ListExpr) (SchemeValue, error) {
+	if len(args) != 1 {
+		line, col := callExpr.Pos()
+		return nil, &EvalError{Message: fmt.Sprintf("%d:%d: inexact->exact: requires exactly 1 argument", line, col)}
+	}
+	if !isNumber(args[0]) {
+		line, col := callExpr.Pos()
+		return nil, &EvalError{Message: fmt.Sprintf("%d:%d: inexact->exact: expected number", line, col)}
+	}
+	return inexactToExact(args[0]), nil
+}
+
+func builtinNumerator(args []SchemeValue, callExpr *ListExpr) (SchemeValue, error) {
+	if len(args) != 1 {
+		line, col := callExpr.Pos()
+		return nil, &EvalError{Message: fmt.Sprintf("%d:%d: numerator: requires exactly 1 argument", line, col)}
+	}
+	switch n := args[0].(type) {
+	case *SchemeInt:
+		return n, nil
+	case *SchemeRational:
+		return &SchemeInt{Value: n.Num}, nil
+	default:
+		line, col := callExpr.Pos()
+		return nil, &EvalError{Message: fmt.Sprintf("%d:%d: numerator: expected rational number", line, col)}
+	}
+}
+
+func builtinDenominator(args []SchemeValue, callExpr *ListExpr) (SchemeValue, error) {
+	if len(args) != 1 {
+		line, col := callExpr.Pos()
+		return nil, &EvalError{Message: fmt.Sprintf("%d:%d: denominator: requires exactly 1 argument", line, col)}
+	}
+	switch args[0].(type) {
+	case *SchemeInt:
+		return &SchemeInt{Value: 1}, nil
+	case *SchemeRational:
+		return &SchemeInt{Value: args[0].(*SchemeRational).Den}, nil
+	default:
+		line, col := callExpr.Pos()
+		return nil, &EvalError{Message: fmt.Sprintf("%d:%d: denominator: expected rational number", line, col)}
+	}
+}
+
+func builtinIntegerQ(args []SchemeValue, callExpr *ListExpr) (SchemeValue, error) {
+	if len(args) != 1 {
+		line, col := callExpr.Pos()
+		return nil, &EvalError{Message: fmt.Sprintf("%d:%d: integer?: requires exactly 1 argument", line, col)}
+	}
+	switch n := args[0].(type) {
+	case *SchemeInt:
+		return &SchemeBool{Value: true}, nil
+	case *SchemeFloat:
+		return &SchemeBool{Value: n.Value == math.Floor(n.Value)}, nil
+	default:
+		return &SchemeBool{Value: false}, nil
+	}
+}
+
+func builtinRationalQ(args []SchemeValue, callExpr *ListExpr) (SchemeValue, error) {
+	if len(args) != 1 {
+		line, col := callExpr.Pos()
+		return nil, &EvalError{Message: fmt.Sprintf("%d:%d: rational?: requires exactly 1 argument", line, col)}
+	}
+	switch args[0].(type) {
+	case *SchemeInt, *SchemeRational:
+		return &SchemeBool{Value: true}, nil
+	default:
+		return &SchemeBool{Value: false}, nil
+	}
 }
 
 func builtinEvenQ(args []SchemeValue, callExpr *ListExpr) (SchemeValue, error) {
@@ -2091,6 +2226,12 @@ func schemeEqual(a, b SchemeValue) bool {
 	switch av := a.(type) {
 	case *SchemeInt:
 		bv, ok := b.(*SchemeInt)
+		return ok && av.Value == bv.Value
+	case *SchemeRational:
+		bv, ok := b.(*SchemeRational)
+		return ok && av.Num == bv.Num && av.Den == bv.Den
+	case *SchemeFloat:
+		bv, ok := b.(*SchemeFloat)
 		return ok && av.Value == bv.Value
 	case *SchemeBool:
 		bv, ok := b.(*SchemeBool)
@@ -2543,6 +2684,12 @@ func schemeEqv(a, b SchemeValue) bool {
 	switch av := a.(type) {
 	case *SchemeInt:
 		bv, ok := b.(*SchemeInt)
+		return ok && av.Value == bv.Value
+	case *SchemeRational:
+		bv, ok := b.(*SchemeRational)
+		return ok && av.Num == bv.Num && av.Den == bv.Den
+	case *SchemeFloat:
+		bv, ok := b.(*SchemeFloat)
 		return ok && av.Value == bv.Value
 	case *SchemeBool:
 		bv, ok := b.(*SchemeBool)

@@ -19,6 +19,8 @@ const (
 	TokenSymbol
 	TokenQuote
 	TokenChar
+	TokenFloat
+	TokenRational
 	TokenEOF
 )
 
@@ -173,6 +175,24 @@ func Tokenize(input string) ([]Token, error) {
 				continue
 			}
 
+			// Check for float literal (e.g., 1.5, .5, -0.3)
+			if _, err := strconv.ParseFloat(word, 64); err == nil && strings.ContainsAny(word, ".eE") {
+				tokens = append(tokens, Token{Type: TokenFloat, Value: word, Line: line, Col: startCol})
+				continue
+			}
+
+			// Check for rational literal (e.g., 1/3, -1/3)
+			if slashIdx := strings.Index(word, "/"); slashIdx > 0 && slashIdx < len(word)-1 {
+				numPart := word[:slashIdx]
+				denPart := word[slashIdx+1:]
+				if _, err1 := strconv.ParseInt(numPart, 10, 64); err1 == nil {
+					if _, err2 := strconv.ParseInt(denPart, 10, 64); err2 == nil {
+						tokens = append(tokens, Token{Type: TokenRational, Value: word, Line: line, Col: startCol})
+						continue
+					}
+				}
+			}
+
 			// It's a symbol
 			tokens = append(tokens, Token{Type: TokenSymbol, Value: word, Line: line, Col: startCol})
 			continue
@@ -208,6 +228,20 @@ type NumberExpr struct {
 }
 
 func (e *NumberExpr) Pos() (int, int) { return e.Line, e.Col }
+
+type FloatExpr struct {
+	Value     float64
+	Line, Col int
+}
+
+func (e *FloatExpr) Pos() (int, int) { return e.Line, e.Col }
+
+type RationalExpr struct {
+	Num, Den  int64
+	Line, Col int
+}
+
+func (e *RationalExpr) Pos() (int, int) { return e.Line, e.Col }
 
 type BoolExpr struct {
 	Value    bool
@@ -286,6 +320,18 @@ func (p *Parser) ParseExpr() (Expr, error) {
 		p.next()
 		n, _ := strconv.ParseInt(tok.Value, 10, 64)
 		return &NumberExpr{Value: n, Line: tok.Line, Col: tok.Col}, nil
+
+	case TokenFloat:
+		p.next()
+		f, _ := strconv.ParseFloat(tok.Value, 64)
+		return &FloatExpr{Value: f, Line: tok.Line, Col: tok.Col}, nil
+
+	case TokenRational:
+		p.next()
+		slashIdx := strings.Index(tok.Value, "/")
+		num, _ := strconv.ParseInt(tok.Value[:slashIdx], 10, 64)
+		den, _ := strconv.ParseInt(tok.Value[slashIdx+1:], 10, 64)
+		return &RationalExpr{Num: num, Den: den, Line: tok.Line, Col: tok.Col}, nil
 
 	case TokenBool:
 		p.next()
