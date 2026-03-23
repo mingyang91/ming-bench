@@ -21,6 +21,7 @@ pub enum Value {
     Builtin(String),
     Closure {
         params: Vec<String>,
+        rest_param: Option<String>,
         body: Vec<Value>,
         env: Rc<RefCell<Env>>,
     },
