@@ -11,10 +11,13 @@ use std::rc::Rc;
 pub use error::EvalError;
 
 /// Evaluate one or more Scheme expressions and return the string
-/// representation of the last result.
+/// representation of the last result (write-style: strings quoted).
 pub fn eval_str(input: &str) -> Result<String, EvalError> {
-    let (result, _) = eval_str_with_output(input)?;
-    Ok(result)
+    let exprs = parser::parse(input)?;
+    let env = eval::default_env();
+    let output = Rc::new(RefCell::new(String::new()));
+    let last = eval::eval_program(&exprs, &env, &output)?;
+    Ok(last.to_string())
 }
 
 /// Evaluate with a step limit. Each eval dispatch counts as one step.
@@ -27,15 +30,16 @@ pub fn eval_str_with_limit(input: &str, max_steps: u64) -> Result<String, EvalEr
     Ok(last.to_string())
 }
 
-/// Evaluate Scheme expressions, returning both the result value and
-/// any output produced by `display`, `write`, or `newline`.
+/// Evaluate Scheme expressions, returning both the result value
+/// (display-style: strings unquoted) and any output produced by
+/// `display`, `write`, or `newline`.
 pub fn eval_str_with_output(input: &str) -> Result<(String, String), EvalError> {
     let exprs = parser::parse(input)?;
     let env = eval::default_env();
     let output = Rc::new(RefCell::new(String::new()));
     let last = eval::eval_program(&exprs, &env, &output)?;
     let output_str = output.borrow().clone();
-    Ok((last.to_string(), output_str))
+    Ok((value::display_value_inner(&last), output_str))
 }
 
 #[cfg(test)]
