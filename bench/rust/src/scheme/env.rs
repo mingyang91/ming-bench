@@ -1,5 +1,5 @@
 use std::cell::RefCell;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::rc::Rc;
 
 use crate::scheme::value::Value;
@@ -23,6 +23,7 @@ struct ContStore {
     pending_return: Option<Value>,
     body_stack: Vec<BodyFrame>,
     registry: HashMap<u64, Vec<ReplayLevel>>,
+    active_callcc: HashSet<u64>,
 }
 
 impl ContStore {
@@ -32,6 +33,7 @@ impl ContStore {
             pending_return: None,
             body_stack: Vec::new(),
             registry: HashMap::new(),
+            active_callcc: HashSet::new(),
         }
     }
 }
@@ -184,5 +186,20 @@ impl Env {
                 .find(|l| l.env.same(target_env))
                 .cloned()
         })
+    }
+
+    /// Mark a call/cc continuation ID as active (its handle_callcc is on the stack).
+    pub(crate) fn mark_callcc_active(&self, id: u64) {
+        self.cont_store.borrow_mut().active_callcc.insert(id);
+    }
+
+    /// Unmark a call/cc continuation ID (handle_callcc has returned).
+    pub(crate) fn unmark_callcc_active(&self, id: u64) {
+        self.cont_store.borrow_mut().active_callcc.remove(&id);
+    }
+
+    /// Check if a continuation's call/cc is currently active on the stack.
+    pub(crate) fn is_callcc_active(&self, id: u64) -> bool {
+        self.cont_store.borrow().active_callcc.contains(&id)
     }
 }

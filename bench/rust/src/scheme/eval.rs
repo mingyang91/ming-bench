@@ -78,13 +78,21 @@ pub(crate) fn eval_body(exprs: &[Value], env: &Env) -> Result<Value, EvalError> 
                     i += 1;
                 }
                 Err(EvalError::ContinuationReturn { id, value }) => {
-                    env.pop_body_frame();
+                    if env.is_callcc_active(id) {
+                        // The call/cc handler is still on the stack — propagate
+                        env.pop_body_frame();
+                        return Err(EvalError::ContinuationReturn { id, value });
+                    }
+                    // call/cc has returned — try replay at this level
                     if let Some(replay) = env.get_replay_for_env(id, env) {
+                        env.pop_body_frame();
                         env.set_pending_return(value);
                         current_exprs = replay.exprs;
                         continue 'replay;
                     }
-                    return Err(EvalError::ContinuationReturn { id, value });
+                    // No replay match — absorb and continue with remaining exprs
+                    last = value;
+                    i += 1;
                 }
                 Err(e) => {
                     env.pop_body_frame();
@@ -117,9 +125,12 @@ fn handle_callcc(args: &[Value], span: Span, env: &Env) -> Result<Value, EvalErr
     let id = env.capture_continuation();
     let cont_val = Value::Continuation(id);
 
+    // Mark this call/cc as active on the stack
+    env.mark_callcc_active(id);
+
     // Call the function with the continuation
     let func = &args[0];
-    match func {
+    let result = match func {
         Value::Closure {
             ref params,
             ref rest_param,
@@ -140,7 +151,10 @@ fn handle_callcc(args: &[Value], span: Span, env: &Env) -> Result<Value, EvalErr
             got: other.to_string(),
             span: other.span(),
         }),
-    }
+    };
+
+    env.unmark_callcc_active(id);
+    result
 }
 
 pub fn eval(expr: &Value, env: &Env) -> Result<Value, EvalError> {
