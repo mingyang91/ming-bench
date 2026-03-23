@@ -6,11 +6,16 @@ use std::cell::RefCell;
 use std::collections::HashMap;
 use std::rc::Rc;
 
+thread_local! {
+    static OUTPUT_BUFFER: RefCell<String> = RefCell::new(String::new());
+}
+
 #[derive(Debug, Clone)]
 enum Value {
     Integer(i64),
     Boolean(bool),
     Str(String),
+    Char(char),
     Symbol(String),
     Pair(Box<Value>, Box<Value>),
     Nil,
@@ -29,6 +34,7 @@ impl PartialEq for Value {
             (Value::Integer(a), Value::Integer(b)) => a == b,
             (Value::Boolean(a), Value::Boolean(b)) => a == b,
             (Value::Str(a), Value::Str(b)) => a == b,
+            (Value::Char(a), Value::Char(b)) => a == b,
             (Value::Symbol(a), Value::Symbol(b)) => a == b,
             (Value::Nil, Value::Nil) => true,
             (Value::Pair(a1, a2), Value::Pair(b1, b2)) => a1 == b1 && a2 == b2,
@@ -45,6 +51,7 @@ impl Value {
             Value::Boolean(true) => "#t".to_string(),
             Value::Boolean(false) => "#f".to_string(),
             Value::Str(s) => format!("\"{}\"", s),
+            Value::Char(c) => format!("#\\{}", c),
             Value::Symbol(s) => s.clone(),
             Value::Nil => "()".to_string(),
             Value::Pair(_, _) => {
@@ -74,6 +81,37 @@ impl Value {
             }
             Value::Lambda { .. } | Value::Builtin(_, _) => "#<procedure>".to_string(),
             Value::Void => "#<void>".to_string(),
+        }
+    }
+
+    fn display_for_display(&self) -> String {
+        match self {
+            Value::Str(s) => s.clone(),
+            Value::Char(c) => c.to_string(),
+            Value::Pair(_, _) => {
+                let mut out = String::from("(");
+                let mut cur = self;
+                let mut first = true;
+                loop {
+                    match cur {
+                        Value::Pair(car, cdr) => {
+                            if !first { out.push(' '); }
+                            first = false;
+                            out.push_str(&car.display_for_display());
+                            cur = cdr;
+                        }
+                        Value::Nil => break,
+                        other => {
+                            out.push_str(" . ");
+                            out.push_str(&other.display_for_display());
+                            break;
+                        }
+                    }
+                }
+                out.push(')');
+                out
+            }
+            _ => self.display(),
         }
     }
 
@@ -373,6 +411,129 @@ fn builtin_symbol_pred(args: &[Value]) -> Result<Value, EvalError> {
     Ok(Value::Boolean(matches!(args[0], Value::Symbol(_))))
 }
 
+fn builtin_char_pred(args: &[Value]) -> Result<Value, EvalError> {
+    if args.len() != 1 {
+        return Err(EvalError::Arity("char? requires exactly 1 argument".into()));
+    }
+    Ok(Value::Boolean(matches!(args[0], Value::Char(_))))
+}
+
+fn builtin_display(args: &[Value]) -> Result<Value, EvalError> {
+    if args.len() != 1 {
+        return Err(EvalError::Arity("display requires exactly 1 argument".into()));
+    }
+    let s = args[0].display_for_display();
+    OUTPUT_BUFFER.with(|buf| buf.borrow_mut().push_str(&s));
+    Ok(Value::Void)
+}
+
+fn builtin_write(args: &[Value]) -> Result<Value, EvalError> {
+    if args.len() != 1 {
+        return Err(EvalError::Arity("write requires exactly 1 argument".into()));
+    }
+    let s = args[0].display();
+    OUTPUT_BUFFER.with(|buf| buf.borrow_mut().push_str(&s));
+    Ok(Value::Void)
+}
+
+fn builtin_newline(args: &[Value]) -> Result<Value, EvalError> {
+    if !args.is_empty() {
+        return Err(EvalError::Arity("newline requires 0 arguments".into()));
+    }
+    OUTPUT_BUFFER.with(|buf| buf.borrow_mut().push('\n'));
+    Ok(Value::Void)
+}
+
+fn builtin_string_append(args: &[Value]) -> Result<Value, EvalError> {
+    let mut result = String::new();
+    for a in args {
+        match a {
+            Value::Str(s) => result.push_str(s),
+            _ => return Err(EvalError::Type("string-append: expected string".into())),
+        }
+    }
+    Ok(Value::Str(result))
+}
+
+fn builtin_string_length(args: &[Value]) -> Result<Value, EvalError> {
+    if args.len() != 1 {
+        return Err(EvalError::Arity("string-length requires exactly 1 argument".into()));
+    }
+    match &args[0] {
+        Value::Str(s) => Ok(Value::Integer(s.len() as i64)),
+        _ => Err(EvalError::Type("string-length: expected string".into())),
+    }
+}
+
+fn builtin_substring(args: &[Value]) -> Result<Value, EvalError> {
+    if args.len() != 3 {
+        return Err(EvalError::Arity("substring requires exactly 3 arguments".into()));
+    }
+    let s = match &args[0] {
+        Value::Str(s) => s,
+        _ => return Err(EvalError::Type("substring: expected string".into())),
+    };
+    let start = args[1].as_integer()? as usize;
+    let end = args[2].as_integer()? as usize;
+    Ok(Value::Str(s[start..end].to_string()))
+}
+
+fn builtin_string_to_number(args: &[Value]) -> Result<Value, EvalError> {
+    if args.len() != 1 {
+        return Err(EvalError::Arity("string->number requires exactly 1 argument".into()));
+    }
+    match &args[0] {
+        Value::Str(s) => match s.parse::<i64>() {
+            Ok(n) => Ok(Value::Integer(n)),
+            Err(_) => Ok(Value::Boolean(false)),
+        },
+        _ => Err(EvalError::Type("string->number: expected string".into())),
+    }
+}
+
+fn builtin_number_to_string(args: &[Value]) -> Result<Value, EvalError> {
+    if args.len() != 1 {
+        return Err(EvalError::Arity("number->string requires exactly 1 argument".into()));
+    }
+    let n = args[0].as_integer()?;
+    Ok(Value::Str(n.to_string()))
+}
+
+fn builtin_symbol_to_string(args: &[Value]) -> Result<Value, EvalError> {
+    if args.len() != 1 {
+        return Err(EvalError::Arity("symbol->string requires exactly 1 argument".into()));
+    }
+    match &args[0] {
+        Value::Symbol(s) => Ok(Value::Str(s.clone())),
+        _ => Err(EvalError::Type("symbol->string: expected symbol".into())),
+    }
+}
+
+fn builtin_string_to_symbol(args: &[Value]) -> Result<Value, EvalError> {
+    if args.len() != 1 {
+        return Err(EvalError::Arity("string->symbol requires exactly 1 argument".into()));
+    }
+    match &args[0] {
+        Value::Str(s) => Ok(Value::Symbol(s.clone())),
+        _ => Err(EvalError::Type("string->symbol: expected string".into())),
+    }
+}
+
+fn builtin_string_ref(args: &[Value]) -> Result<Value, EvalError> {
+    if args.len() != 2 {
+        return Err(EvalError::Arity("string-ref requires exactly 2 arguments".into()));
+    }
+    let s = match &args[0] {
+        Value::Str(s) => s,
+        _ => return Err(EvalError::Type("string-ref: expected string".into())),
+    };
+    let idx = args[1].as_integer()? as usize;
+    match s.chars().nth(idx) {
+        Some(c) => Ok(Value::Char(c)),
+        None => Err(EvalError::Type("string-ref: index out of bounds".into())),
+    }
+}
+
 fn default_env() -> Env {
     let env = new_env(None);
     let builtins: &[(&'static str, fn(&[Value]) -> Result<Value, EvalError>)] = &[
@@ -397,7 +558,19 @@ fn default_env() -> Env {
         ("boolean?", builtin_boolean_pred),
         ("pair?", builtin_pair_pred),
         ("symbol?", builtin_symbol_pred),
+        ("char?", builtin_char_pred),
         ("append", builtin_append),
+        ("display", builtin_display),
+        ("write", builtin_write),
+        ("newline", builtin_newline),
+        ("string-append", builtin_string_append),
+        ("string-length", builtin_string_length),
+        ("substring", builtin_substring),
+        ("string->number", builtin_string_to_number),
+        ("number->string", builtin_number_to_string),
+        ("symbol->string", builtin_symbol_to_string),
+        ("string->symbol", builtin_string_to_symbol),
+        ("string-ref", builtin_string_ref),
     ];
     for &(name, func) in builtins {
         env_set(&env, name.to_string(), Value::Builtin(name, func));
@@ -890,9 +1063,16 @@ pub fn eval_str(input: &str) -> Result<String, EvalError> {
     Ok(result.display())
 }
 
-pub fn eval_str_with_output(_input: &str) -> Result<(String, String), EvalError> {
-    let result = eval_str(_input)?;
-    Ok((result, String::new()))
+pub fn eval_str_with_output(input: &str) -> Result<(String, String), EvalError> {
+    OUTPUT_BUFFER.with(|buf| buf.borrow_mut().clear());
+    let exprs = parse(input)?;
+    let env = default_env();
+    let mut result = Value::Boolean(false);
+    for expr in &exprs {
+        result = eval(expr, &env)?;
+    }
+    let output = OUTPUT_BUFFER.with(|buf| buf.borrow().clone());
+    Ok((result.display(), output))
 }
 
 #[cfg(test)]
