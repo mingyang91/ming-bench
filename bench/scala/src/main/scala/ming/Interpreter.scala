@@ -13,8 +13,8 @@ object Interpreter:
 
   def eval(expr: SchemeValue, env: Environment): SchemeValue =
     expr match
-      case IntVal(_, _) | BoolVal(_, _) | StringVal(_, _) | CharVal(_, _) | PairVal(_, _) | LambdaVal(_, _, _) |
-          BuiltinVal(_, _) | Void =>
+      case IntVal(_, _) | BoolVal(_, _) | StringVal(_, _) | MutableStringVal(_, _) | CharVal(_, _) | PairVal(_, _) |
+          LambdaVal(_, _, _) | BuiltinVal(_, _) | Void =>
         expr
       case SymbolVal(name, pos) =>
         env.get(name).getOrElse(throw new EvalError(posMsg(s"unbound variable: $name", pos)))

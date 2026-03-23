@@ -138,8 +138,9 @@ object Builtins:
 
   def stringLengthOp(args: List[SchemeValue]): SchemeValue =
     args match
-      case StringVal(s, _) :: Nil => IntVal(s.length.toLong)
-      case _                      => throw new EvalError("string-length: expected string")
+      case StringVal(s, _) :: Nil         => IntVal(s.length.toLong)
+      case MutableStringVal(cs, _) :: Nil => IntVal(cs.length.toLong)
+      case _                              => throw new EvalError("string-length: expected string")
 
   def substringOp(args: List[SchemeValue]): SchemeValue =
     args match
@@ -174,4 +175,23 @@ object Builtins:
       case StringVal(s, _) :: IntVal(idx, _) :: Nil =>
         if idx < 0 || idx >= s.length then throw new EvalError("string-ref: index out of bounds")
         CharVal(s.charAt(idx.toInt))
+      case MutableStringVal(cs, _) :: IntVal(idx, _) :: Nil =>
+        if idx < 0 || idx >= cs.length then throw new EvalError("string-ref: index out of bounds")
+        CharVal(cs(idx.toInt))
       case _ => throw new EvalError("string-ref: expected (string index)")
+
+  def stringSetOp(args: List[SchemeValue]): SchemeValue =
+    args match
+      case MutableStringVal(cs, _) :: IntVal(idx, _) :: CharVal(c, _) :: Nil =>
+        if idx < 0 || idx >= cs.length then throw new EvalError("string-set!: index out of bounds")
+        cs(idx.toInt) = c
+        Void
+      case StringVal(_, _) :: _ :: _ :: Nil =>
+        throw new EvalError("string-set!: string is immutable")
+      case _ => throw new EvalError("string-set!: expected (mutable-string index char)")
+
+  def stringCopyOp(args: List[SchemeValue]): SchemeValue =
+    args match
+      case StringVal(s, _) :: Nil         => MutableStringVal(s.toCharArray)
+      case MutableStringVal(cs, _) :: Nil => MutableStringVal(cs.clone())
+      case _                              => throw new EvalError("string-copy: expected string")

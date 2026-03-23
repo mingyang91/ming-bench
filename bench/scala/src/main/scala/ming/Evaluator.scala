@@ -24,7 +24,7 @@ object Evaluator:
       ("null?", args => Builtins.nullCheck(args)),
       ("list", args => ListVal(args)),
       ("length", args => Builtins.lengthOp(args)),
-      ("string?", args => Builtins.typeCheck(args, _.isInstanceOf[StringVal])),
+      ("string?", args => Builtins.typeCheck(args, v => v.isInstanceOf[StringVal] || v.isInstanceOf[MutableStringVal])),
       ("number?", args => Builtins.typeCheck(args, _.isInstanceOf[IntVal])),
       ("boolean?", args => Builtins.typeCheck(args, _.isInstanceOf[BoolVal])),
       ("pair?", args => Builtins.pairCheck(args)),
@@ -41,7 +41,9 @@ object Evaluator:
       ("number->string", args => Builtins.numberToStringOp(args)),
       ("symbol->string", args => Builtins.symbolToStringOp(args)),
       ("string->symbol", args => Builtins.stringToSymbolOp(args)),
-      ("string-ref", args => Builtins.stringRefOp(args))
+      ("string-ref", args => Builtins.stringRefOp(args)),
+      ("string-set!", args => Builtins.stringSetOp(args)),
+      ("string-copy", args => Builtins.stringCopyOp(args))
     )
     builtins.foreach { (name, func) =>
       env.define(name, BuiltinVal(name, func))

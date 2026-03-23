@@ -118,9 +118,20 @@ object Parser:
   private def parseAtom(token: String, pos: SourcePos): SchemeValue =
     if token == "#t" then BoolVal(true, Some(pos))
     else if token == "#f" then BoolVal(false, Some(pos))
+    else if token.startsWith("#\\") then parseCharLiteral(token, pos)
     else if token.startsWith("\"") && token.endsWith("\"") then
       StringVal(token.substring(1, token.length - 1), Some(pos))
     else
       token.toLongOption match
         case Some(n) => IntVal(n, Some(pos))
         case None    => SymbolVal(token, Some(pos))
+
+  private def parseCharLiteral(token: String, pos: SourcePos): SchemeValue =
+    val name = token.substring(2)
+    if name.length == 1 then CharVal(name.charAt(0), Some(pos))
+    else
+      name.toLowerCase match
+        case "space"   => CharVal(' ', Some(pos))
+        case "newline" => CharVal('\n', Some(pos))
+        case "tab"     => CharVal('\t', Some(pos))
+        case _         => throw new EvalError(s"unknown character name: $token")
